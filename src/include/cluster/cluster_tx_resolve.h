@@ -18,7 +18,9 @@
 #include "c.h"
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_uba.h"
+#include "common/relpath.h"
 #include "storage/bufpage.h"
+#include "storage/relfilelocator.h"
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -131,6 +133,19 @@ typedef struct ClusterTxLocator {
 StaticAssertDecl(sizeof(ClusterTxLocator) == 24,
 				 "R4 ClusterTxLocator must remain an exact 24-byte value");
 
+/* Optional process-local physical projection of an exact INSERT or UPDATE
+ * record. This is neither original FullXid provenance nor freeze permission;
+ * it is never serialized, cached as a terminal verdict, or accepted from a
+ * peer. An UPDATE names its replacement, not the old tuple in the header. */
+typedef struct ClusterTxCreationTarget {
+	RelFileLocator locator;
+	ForkNumber fork;
+	BlockNumber block;
+	OffsetNumber offset;
+	uint16 tuple_length; /* zero when the record has no replacement length */
+	bool valid;
+} ClusterTxCreationTarget;
+
 typedef struct ClusterTxResolution {
 	ClusterTxLocator locator_echo;
 	TransactionId top_xid;
@@ -144,6 +159,7 @@ typedef struct ClusterTxResolution {
 	ClusterTTSlotPhysicalLocator local_canonical;
 	uint32 local_canonical_generation;
 	bool local_canonical_valid;
+	ClusterTxCreationTarget local_creation_target;
 } ClusterTxResolution;
 
 /* A page-derived request carries TT_WRAP_INVALID until the origin reads the

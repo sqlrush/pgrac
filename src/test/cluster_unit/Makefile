@@ -6076,7 +6076,9 @@ CLUSTER_R4_RUNTIME_VIS_UBA_O = $(top_builddir)/src/backend/cluster/cluster_uba.o
 CLUSTER_MULTIXACT_CURRENT_O = $(top_builddir)/src/backend/cluster/cluster_multixact_current.o
 CLUSTER_MULTIXACT_CURRENT_WIRE_O = \
 	$(top_builddir)/src/backend/cluster/cluster_multixact_current_wire.o
-$(CLUSTER_R4_RUNTIME_VIS_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c
+$(CLUSTER_R4_RUNTIME_VIS_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c \
+		$(top_srcdir)/src/include/cluster/cluster_tx_resolve.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_record.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
 
 # Execute the exact local current-MX consumer with the real runtime sampler.
@@ -6092,6 +6094,8 @@ test_cluster_undo_pending_product.o: test_cluster_undo_pending_product.c \
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_tx_resolve.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
 		test_cluster_current_mx_local_sample.inc \
 		test_cluster_undo_pending_product.o \
 		$(CLUSTER_R4_RUNTIME_VIS_TEST_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O) \

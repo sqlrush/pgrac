@@ -39,6 +39,7 @@ typedef enum ClusterHeapFreezePageMatchV1 {
 
 #define CLUSTER_HEAP_FREEZE_NO_CARRIER_REQUEST UINT8_MAX
 #define CLUSTER_HEAP_FREEZE_NO_DATA_GROUP UINT8_MAX
+#define CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET UINT8_MAX
 
 /*
  * A request about one physical carrier, not a creator or terminal proof.
@@ -85,6 +86,8 @@ typedef struct ClusterHeapFreezeTupleInputV1
 	uint8 header_length;
 	uint8 itl_slot_index;
 	uint8 carrier_request_index;
+	/* Physical association only; never a row-freeze certificate. */
+	uint8 creation_target_proof_index;
 	bool has_carrier;
 	ClusterItlSlotData carrier;
 } ClusterHeapFreezeTupleInputV1;
@@ -266,6 +269,14 @@ cluster_heap_freeze_validate_conditional_apply_v1(
 extern ClusterHeapFreezeProofStatusV1
 cluster_heap_freeze_validate_carrier_cleanout_v1(
 	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *current_fence);
+
+/* Reset prior associations and bind only exact committed creation targets to
+ * their physical row/carrier in a complete, validated proof batch. No original
+ * FullXid, eligibility, final apply ownership or retention is implied. */
+extern uint16 cluster_heap_freeze_bind_creation_targets_v1(
+	ClusterHeapFreezePageBatchV1 *page,
 	const ClusterHeapFreezeProofBatchV1 *proofs,
 	const ClusterHeapFreezeFinalFenceV1 *current_fence);
 

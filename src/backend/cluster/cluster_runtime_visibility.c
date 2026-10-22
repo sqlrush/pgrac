@@ -43,6 +43,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "access/clog.h"
+#include "access/htup_details.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
 #include "access/twophase.h"
@@ -1945,6 +1946,71 @@ cluster_runtime_visibility_origin_data_copy(uint32 segment_id, uint8 owner, uint
 	return true;
 }
 
+/*
+ * Project only the final, exact DATA record already checked by the held plan.
+ * This process-local target does not establish original FullXid provenance,
+ * and failure here must not turn a valid transaction verdict into UNKNOWN.
+ */
+static void
+cluster_runtime_visibility_origin_creation_target(const char *record_bytes, size_t record_length,
+												  ClusterTxResolution *candidate)
+{
+	UndoRecordHeader record;
+	UndoItlHistoryTrailer history;
+	ClusterTxCreationTarget target = {0};
+	const char *payload;
+	uint16 body_length;
+
+	memset(&candidate->local_creation_target, 0, sizeof(candidate->local_creation_target));
+	if (candidate->outcome != CLUSTER_TX_COMMITTED || !candidate->local_canonical_valid
+		|| record_bytes == NULL || record_length < sizeof(record) || record_length > BLCKSZ)
+		return;
+	memcpy(&record, record_bytes, sizeof(record));
+	if (record.xid != candidate->locator_echo.xid
+		|| !RelFileNumberIsValid(record.target_locator.relNumber)
+		|| record.target_fork != MAIN_FORKNUM || record.target_block == InvalidBlockNumber
+		|| !OffsetNumberIsValid(record.target_offset)
+		|| record.target_offset > MaxHeapTuplesPerPage)
+		return;
+	payload = record_bytes + sizeof(record);
+	if (!cluster_undo_record_decode_payload(&record, payload, record_length - sizeof(record),
+											&body_length, &history))
+		return;
+
+	target.locator = record.target_locator;
+	target.fork = MAIN_FORKNUM;
+	switch (record.record_type) {
+	case UNDO_RECORD_INSERT: {
+		UndoInsertPayload insert;
+
+		memcpy(&insert, payload, sizeof(insert));
+		if (insert.inserted_tuple_len < SizeofHeapTupleHeader
+			|| insert.inserted_tuple_len > BLCKSZ - SizeOfPageHeaderData)
+			return;
+		target.block = record.target_block;
+		target.offset = record.target_offset;
+		target.tuple_length = insert.inserted_tuple_len;
+		break;
+	}
+	case UNDO_RECORD_UPDATE: {
+		UndoUpdatePayload update;
+
+		memcpy(&update, payload, sizeof(update));
+		/* The header names the old tuple; only the payload names its replacement. */
+		if (update.new_block == InvalidBlockNumber || !OffsetNumberIsValid(update.new_offset)
+			|| update.new_offset > MaxHeapTuplesPerPage)
+			return;
+		target.block = update.new_block;
+		target.offset = update.new_offset;
+		break;
+	}
+	default:
+		return;
+	}
+	target.valid = true;
+	candidate->local_creation_target = target;
+}
+
 static ClusterRuntimeVisibilityOriginStep
 cluster_runtime_visibility_origin_plan_freeze_data_internal(
 	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
@@ -2105,6 +2171,8 @@ cluster_runtime_visibility_origin_plan_freeze_data_internal(
 	plan_data->candidate.local_canonical_generation = generation.value;
 	plan_data->candidate.local_canonical_valid = true;
 	plan_data->canonical_root = *root;
+	cluster_runtime_visibility_origin_creation_target(plan_data->record_buf.data,
+													 plan_data->record_length, &plan_data->candidate);
 	cluster_runtime_visibility_terminal_publish(&plan_data->candidate, &plan_data->canonical_root,
 												 plan_data->candidate_recycled_abort);
 	*out = plan_data->candidate;
@@ -2421,6 +2489,8 @@ cluster_runtime_visibility_origin_plan_recheck_data_internal(
 		&& !cluster_runtime_visibility_origin_recycled_abort_sample(
 			&plan_data->canonical_locator, &plan_data->canonical_diagnostic))
 		goto failed;
+	cluster_runtime_visibility_origin_creation_target(record_buf.data, record_length,
+													 &plan_data->candidate);
 	cluster_runtime_visibility_terminal_publish(&plan_data->candidate, &plan_data->canonical_root,
 												 plan_data->candidate_recycled_abort);
 	*out = plan_data->candidate;
@@ -2905,6 +2975,7 @@ cluster_runtime_visibility_resolve_exact_origin_admitted(
 		memset(&out->local_canonical, 0, sizeof(out->local_canonical));
 		out->local_canonical_generation = 0;
 		out->local_canonical_valid = false;
+		memset(&out->local_creation_target, 0, sizeof(out->local_creation_target));
 		goto recheck;
 	}
 	logical.owner_instance = (uint8)((uint32)origin + 1);

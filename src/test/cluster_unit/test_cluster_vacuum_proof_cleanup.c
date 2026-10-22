@@ -58,7 +58,7 @@ volatile uint32 CritSectionCount;
 
 static RelationData relation;
 static LVRelState vacrel;
-static unsigned enters, leaves, debt, resolves, routes;
+static unsigned enters, leaves, debt, resolves, routes, target_bindings;
 static unsigned fail_resolve;
 static PGAlignedBlock resident_page;
 static unsigned repins, lock_attempts, page_checks, validations;
@@ -487,6 +487,18 @@ cluster_heap_freeze_validate_page_v1(const ClusterHeapFreezePageInputV1 *input,
 	return page_match;
 }
 
+
+uint16
+cluster_heap_freeze_bind_creation_targets_v1(ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs, const ClusterHeapFreezeFinalFenceV1 *fence)
+{
+	if (pin_held || content_locked || debt != 1 || page != &vacrel.shared_freeze_batch
+		|| proofs == NULL || fence == NULL)
+		abort();
+	target_bindings++;
+	return 0;
+}
+
 #include "test_cluster_vacuum_proof_cleanup.inc"
 
 static void
@@ -522,6 +534,9 @@ reset_fixture(void)
 	error_page_check = validation_under_lock = false;
 	page_match = CLUSTER_HEAP_FREEZE_PAGE_MATCHED;
 	vacrel.shared_freeze_batch.carrier_request_count = 1;
+	vacrel.shared_freeze_batch.tuple_count = 1;
+	vacrel.shared_freeze_batch.tuples[0].creation_target_proof_index = 0;
+	target_bindings = 0;
 	enters = leaves = debt = resolves = routes = fail_resolve = 0;
 	reject_admission = reject_route_after = unknown_outcome = false;
 	error_preflight = error_validate = guard_held = false;
@@ -1349,10 +1364,41 @@ UT_TEST(partial_proof_cannot_stamp_a_different_requested_locator)
 	check_local_cleanup_without_pcm_release("LPA");
 }
 
+
+UT_TEST(creation_binding_runs_after_local_release_before_admission_leave)
+{
+	reset_fixture();
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(target_bindings, 1);
+	UT_ASSERT_EQ(vacrel.shared_freeze_batch.tuples[0].creation_target_proof_index,
+		CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET);
+	UT_ASSERT_EQ(debt, 0);
+	UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+}
+
+UT_TEST(rejected_or_cleaned_collection_cannot_reuse_creation_indexes)
+{
+	for (int variant = 0; variant < 5; variant++) {
+		reset_fixture();
+		switch (variant) {
+		case 0: vacrel.shared_freeze_batch.carrier_request_count = 0; break;
+		case 1: reject_admission = true; break;
+		case 2: unknown_outcome = true; break;
+		case 3: page_match = CLUSTER_HEAP_FREEZE_PAGE_CHANGED; break;
+		case 4: setup_cleanout_page(); break;
+		}
+		(void)lazy_collect_shared_freeze_proofs(&vacrel, 1);
+		UT_ASSERT_EQ(target_bindings, 0);
+		UT_ASSERT_EQ(vacrel.shared_freeze_batch.tuples[0].creation_target_proof_index,
+			CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET);
+		UT_ASSERT_EQ(debt, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(46);
+	UT_PLAN(48);
 	UT_RUN(invalid_input_does_not_leave);
 	UT_RUN(rejected_admission_does_not_leave);
 	UT_RUN(normal_success_leaves_once);
@@ -1399,6 +1445,8 @@ main(void)
 	UT_RUN(partial_cleanout_hint_error_releases_ownership_before_admission);
 	UT_RUN(partial_cleanout_cancel_preserves_error_and_backend_reuse);
 	UT_RUN(partial_proof_cannot_stamp_a_different_requested_locator);
+	UT_RUN(creation_binding_runs_after_local_release_before_admission_leave);
+	UT_RUN(rejected_or_cleaned_collection_cannot_reuse_creation_indexes);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

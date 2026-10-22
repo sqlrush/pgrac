@@ -1816,6 +1816,13 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 	memset(&expected_fence, 0, sizeof(expected_fence));
 	memset(&current_fence, 0, sizeof(current_fence));
 	memset(&authority_before, 0, sizeof(authority_before));
+	if (vacrel != NULL)
+	{
+		for (uint16 index = 0;
+			 index < Min(vacrel->shared_freeze_batch.tuple_count, MaxHeapTuplesPerPage); index++)
+			vacrel->shared_freeze_batch.tuples[index].creation_target_proof_index =
+				CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET;
+	}
 
 	if (vacrel == NULL || vacrel->rel == NULL
 		|| vacrel->shared_freeze_batch.carrier_request_count == 0
@@ -1872,6 +1879,11 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 		status = lazy_recheck_shared_freeze_page(vacrel, recent_buffer,
 													 &authority_before, &admission,
 													 &proofs, &current_fence, &cleaned);
+		/* Inner cleanup has released the local content lock and pin. This is
+		 * only a physical association, never permission to freeze a row. */
+		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN && !cleaned)
+			(void) cluster_heap_freeze_bind_creation_targets_v1(
+				&vacrel->shared_freeze_batch, &proofs, &current_fence);
 		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
 			|| status == CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED)
 		{

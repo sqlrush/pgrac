@@ -81,6 +81,8 @@ VariableCache ShmemVariableCache = &test_variable_cache;
 
 static ClusterTxLocator test_origin_locator;
 static UndoRecordHeader test_origin_record;
+static char test_origin_payload[64];
+static size_t test_origin_payload_bytes;
 static int test_undo_read_calls;
 static int test_tt_exact_calls;
 static int test_tt_snapshot_calls;
@@ -1074,7 +1076,8 @@ cluster_cr_r4_extract_resident_record(const char resident_undo_page[BLCKSZ] pg_a
 	if (test_candidate_mutate_record_on_recheck && test_candidate_extract_calls == 2)
 		test_origin_record.payload_length++;
 	memcpy(record_out, &test_origin_record, sizeof(test_origin_record));
-	*record_length_out = sizeof(test_origin_record);
+	memcpy(record_out + sizeof(test_origin_record), test_origin_payload, test_origin_payload_bytes);
+	*record_length_out = sizeof(test_origin_record) + test_origin_payload_bytes;
 	*canonical_locator_out = *request_locator;
 	canonical_locator_out->tt_wrap = TEST_ORIGIN_WRAP;
 	return true;
@@ -1187,6 +1190,8 @@ cluster_gcs_block_r4_tx_resolve_fetch_and_wait(int32 origin_node, const ClusterT
 	memset(out, 0, sizeof(*out));
 	out->locator_echo = *locator;
 	out->outcome = test_remote_origin_outcome;
+	/* A peer must never supply an in-process creation projection. */
+	out->local_creation_target.valid = true;
 	*reason_out = test_remote_origin_outcome == CLUSTER_TX_UNKNOWN
 					  ? CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE
 					  : CLUSTER_TX_RESOLVE_NONE;
@@ -1207,6 +1212,8 @@ reset_exact_origin_fixture(void)
 	test_origin_locator.itl_slot_index = 2;
 
 	memset(&test_origin_record, 0, sizeof(test_origin_record));
+	memset(test_origin_payload, 0, sizeof(test_origin_payload));
+	test_origin_payload_bytes = 0;
 	test_origin_record.record_type = UNDO_RECORD_UPDATE;
 	test_origin_record.xid = TEST_ORIGIN_XID;
 	test_origin_record.origin_node_id = 0;
@@ -3759,6 +3766,7 @@ test_remote_origin_does_not_depend_on_foreign_residency(ClusterTxResolveMode mod
 		UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
 		UT_ASSERT_EQ(test_remote_origin_calls, 1);
 		UT_ASSERT_EQ(test_remote_origin_generation, UINT32_MAX);
+		UT_ASSERT(!resolution.local_creation_target.valid);
 		UT_ASSERT_EQ(test_regular_root_resolve_calls, 0);
 		UT_ASSERT_EQ(test_terminal_census_root_resolve_calls, 0);
 		UT_ASSERT_EQ(test_candidate_acquire_calls, 0);
@@ -6792,10 +6800,176 @@ UT_TEST(test_self_fresh_role_does_not_inherit_ordinary_abort_permission)
 	UT_ASSERT(!test_local_last_ordinary_single);
 }
 
+
+static void
+init_creation_record(uint16 type, bool same_segment)
+{
+	UndoInsertPayload insert = {0};
+	UndoUpdatePayload update = {0};
+	UndoDeletePayload deleted = {0};
+
+	reset_exact_origin_fixture();
+	test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+	test_origin_record.record_type = type;
+	test_origin_record.flags = UNDO_REC_FLAG_FIRST_IN_TX;
+	test_origin_record.target_locator = (RelFileLocator){1663, 42, 77};
+	test_origin_record.target_fork = MAIN_FORKNUM;
+	test_origin_record.target_block = 23;
+	test_origin_record.target_offset = 3;
+	if (same_segment)
+		test_origin_record.tt_slot_segment_id = TEST_RECORD_SEGMENT;
+	if (type == UNDO_RECORD_INSERT) {
+		insert.inserted_tuple_len = 60;
+		memcpy(test_origin_payload, &insert, sizeof(insert));
+		test_origin_payload_bytes = sizeof(insert);
+	} else if (type == UNDO_RECORD_UPDATE) {
+		update.new_block = 24;
+		update.new_offset = 4;
+		update.old_tuple_length = 1;
+		update.old_tuple_offset = sizeof(update);
+		memcpy(test_origin_payload, &update, sizeof(update));
+		test_origin_payload_bytes = sizeof(update) + 1;
+	} else {
+		deleted.full_tuple_length = 1;
+		deleted.full_tuple_offset = sizeof(deleted);
+		memcpy(test_origin_payload, &deleted, sizeof(deleted));
+		test_origin_payload_bytes = sizeof(deleted) + 1;
+	}
+	test_origin_record.payload_length = test_origin_payload_bytes;
+}
+
+/* Actual held-plan/data-recheck bodies; locks, storage and C1b remain doubles. */
+static void
+resolve_creation_record(bool same_segment, int drift, ClusterTxResolution *resolution)
+{
+	ClusterRuntimeVisibilityOriginPlan plan;
+	ClusterTxResolveReason reason;
+	ClusterSemanticAdmissionToken admission = {0};
+	ClusterUndoBlock0CurrentGuard data_guard = {0}, tt_guard = {0};
+	ClusterUndoBlock0ResolvedRoot data_root = {0}, tt_root = {0};
+	PGAlignedBlock page;
+
+	admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	admission.record_generation = 5;
+	admission.formation_epoch = test_formation_epoch;
+	admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	admission.entered = true;
+	data_root.intent = tt_root.intent = CLUSTER_UNDO_PATH_RUNTIME_SHARED;
+	data_root.root_id = 91;
+	tt_root.root_id = 92;
+	data_root.root_generation = tt_root.root_generation = 7;
+	UT_ASSERT_EQ(cluster_runtime_visibility_origin_plan_freeze_data_held(
+		&test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, NULL,
+		&data_guard, &data_root, &plan, resolution, &reason),
+		same_segment ? CLUSTER_RUNTIME_VISIBILITY_ORIGIN_COMPLETE
+					 : CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL);
+	if (!same_segment) {
+		UT_ASSERT(!resolution->local_creation_target.valid);
+		UT_ASSERT(cluster_runtime_visibility_origin_plan_sample_canonical_held(
+			&plan, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, &tt_guard, &tt_root, &reason));
+	}
+	switch (drift) {
+	case 1: test_candidate_mutate_record_on_recheck = true; break;
+	case 2: test_candidate_data_generation++; break;
+	case 3: data_root.root_generation++; break;
+	case 4: admission.formation_epoch++; break;
+	default: break;
+	}
+	UT_ASSERT_EQ(cluster_runtime_visibility_origin_plan_copy_data_held(
+		&plan, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, &data_guard,
+		&data_root, resolution, page.data, &reason),
+		drift == 0 ? CLUSTER_TX_COMMITTED : CLUSTER_TX_UNKNOWN);
+}
+
+UT_TEST(test_insert_creation_target_comes_from_final_exact_record)
+{
+	for (int same = 0; same < 2; same++) {
+		ClusterTxResolution resolution;
+		init_creation_record(UNDO_RECORD_INSERT, same);
+		/* Global relations legitimately have database OID zero. */
+		if (same)
+			test_origin_record.target_locator.dbOid = InvalidOid;
+		resolve_creation_record(same, 0, &resolution);
+		UT_ASSERT(resolution.local_creation_target.valid);
+		UT_ASSERT(RelFileLocatorEquals(resolution.local_creation_target.locator,
+									 test_origin_record.target_locator));
+		UT_ASSERT_EQ(resolution.local_creation_target.fork, MAIN_FORKNUM);
+		UT_ASSERT_EQ(resolution.local_creation_target.block, 23);
+		UT_ASSERT_EQ(resolution.local_creation_target.offset, 3);
+		UT_ASSERT_EQ(resolution.local_creation_target.tuple_length, 60);
+	}
+}
+
+UT_TEST(test_update_creation_target_names_replacement_not_old_tuple)
+{
+	for (int same = 0; same < 2; same++) {
+		ClusterTxResolution resolution;
+		init_creation_record(UNDO_RECORD_UPDATE, same);
+		resolve_creation_record(same, 0, &resolution);
+		UT_ASSERT(resolution.local_creation_target.valid);
+		UT_ASSERT_EQ(resolution.local_creation_target.block, 24);
+		UT_ASSERT_EQ(resolution.local_creation_target.offset, 4);
+		UT_ASSERT_EQ(resolution.local_creation_target.tuple_length, 0);
+	}
+}
+
+UT_TEST(test_noncreation_or_malformed_payload_keeps_verdict_without_target)
+{
+	for (int variant = 0; variant < 11; variant++) {
+		ClusterTxResolution resolution;
+		init_creation_record(variant == 0 ? UNDO_RECORD_DELETE : UNDO_RECORD_UPDATE, false);
+		switch (variant) {
+		case 1: {
+			UndoUpdatePayload update;
+			memcpy(&update, test_origin_payload, sizeof(update));
+			update.new_block = InvalidBlockNumber;
+			update.new_offset = InvalidOffsetNumber;
+			memcpy(test_origin_payload, &update, sizeof(update));
+			break;
+		}
+		case 2: test_origin_record.payload_length++; break;
+		case 3: test_origin_record.target_locator.relNumber = InvalidRelFileNumber; break;
+		case 4: test_origin_record.target_fork = FSM_FORKNUM; break;
+		case 5: test_origin_record.target_offset = MaxHeapTuplesPerPage + 1; break;
+		case 6: test_origin_record.target_block = InvalidBlockNumber; break;
+		case 7: {
+			UndoUpdatePayload update;
+			memcpy(&update, test_origin_payload, sizeof(update));
+			update.new_offset = MaxHeapTuplesPerPage + 1;
+			memcpy(test_origin_payload, &update, sizeof(update));
+			break;
+		}
+		case 8: test_origin_record.flags = 0; break;
+		case 9:
+			init_creation_record(UNDO_RECORD_INSERT, false);
+			((UndoInsertPayload *)test_origin_payload)->inserted_tuple_len = 1;
+			break;
+		case 10:
+			init_creation_record(UNDO_RECORD_INSERT, false);
+			((UndoInsertPayload *)test_origin_payload)->inserted_tuple_len = BLCKSZ;
+			break;
+		default: break;
+		}
+		resolve_creation_record(false, 0, &resolution);
+		UT_ASSERT_EQ(resolution.outcome, CLUSTER_TX_COMMITTED);
+		UT_ASSERT(!resolution.local_creation_target.valid);
+	}
+}
+
+UT_TEST(test_creation_target_is_not_exported_after_final_data_fence_drift)
+{
+	for (int drift = 1; drift <= 4; drift++) {
+		ClusterTxResolution resolution;
+		init_creation_record(UNDO_RECORD_INSERT, false);
+		resolve_creation_record(false, drift, &resolution);
+		UT_ASSERT(!resolution.local_creation_target.valid);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(188);
+	UT_PLAN(192);
 	UT_RUN(test_retained_active_identity_reaches_real_undo_pending);
 	UT_RUN(test_retained_undo_pending_requires_matching_active_tt_receipt);
 	UT_RUN(test_retained_undo_pending_guard_drift_cannot_publish);
@@ -6984,6 +7158,10 @@ main(void)
 	UT_RUN(test_exact_origin_memo_rechecks_each_data_carrier);
 	UT_RUN(test_exact_origin_memo_publishes_after_final_data_recheck);
 	UT_RUN(test_exact_origin_memo_hit_preserves_final_data_and_generation_fences);
+	UT_RUN(test_insert_creation_target_comes_from_final_exact_record);
+	UT_RUN(test_update_creation_target_names_replacement_not_old_tuple);
+	UT_RUN(test_noncreation_or_malformed_payload_keeps_verdict_without_target);
+	UT_RUN(test_creation_target_is_not_exported_after_final_data_fence_drift);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

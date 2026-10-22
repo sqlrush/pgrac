@@ -281,6 +281,7 @@ cluster_heap_freeze_prepare_page_v1(const ClusterHeapFreezePageInputV1 *input,
 		row->header_length = tuple->t_hoff;
 		row->itl_slot_index = tuple->t_itl_slot_idx;
 		row->carrier_request_index = CLUSTER_HEAP_FREEZE_NO_CARRIER_REQUEST;
+		row->creation_target_proof_index = CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET;
 		/* No raw-XID search: this carrier need not belong to the creator. */
 		if (slots != NULL && row->itl_slot_index < CLUSTER_ITL_INITRANS_DEFAULT) {
 			uint8 slot_index = row->itl_slot_index;
@@ -603,4 +604,67 @@ cluster_heap_freeze_validate_carrier_cleanout_v1(
 	const ClusterHeapFreezeFinalFenceV1 *current_fence)
 {
 	return freeze_validate_carrier_proofs(page, proofs, current_fence, false);
+}
+
+uint16
+cluster_heap_freeze_bind_creation_targets_v1(
+	ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *current_fence)
+{
+	uint16 bound;
+	uint16 matched = 0;
+
+	if (page == NULL)
+		return 0;
+	/* Rejection and replacement both retire the previous attempt's associations. */
+	bound = Min(page->tuple_count, MaxHeapTuplesPerPage);
+	for (uint16 index = 0; index < bound; index++)
+		page->tuples[index].creation_target_proof_index = CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET;
+	if (freeze_validate_carrier_proofs(page, proofs, current_fence, true)
+		!= CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+		|| page->page_lsn != current_fence->page_lsn
+		|| page->page_version != current_fence->page_version)
+		return 0;
+
+	for (uint16 index = 0; index < bound; index++)
+	{
+		ClusterHeapFreezeTupleInputV1 *tuple = &page->tuples[index];
+		const ClusterHeapFreezeCarrierRequestV1 *request;
+
+		if (!OffsetNumberIsValid(tuple->offset) || tuple->offset > MaxHeapTuplesPerPage
+			|| tuple->tuple_offset < SizeOfPageHeaderData
+			|| tuple->tuple_offset != MAXALIGN(tuple->tuple_offset)
+			|| tuple->tuple_length < SizeofHeapTupleHeader
+			|| tuple->header_length < SizeofHeapTupleHeader
+			|| tuple->header_length > tuple->tuple_length
+			|| (unsigned) tuple->tuple_offset + tuple->tuple_length
+				> BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE
+			|| !TransactionIdIsNormal(tuple->raw_xmin) || !tuple->has_carrier
+			|| tuple->carrier_request_index >= page->carrier_request_count)
+			continue;
+		request = &page->carrier_requests[tuple->carrier_request_index];
+		if (tuple->itl_slot_index != request->locator.itl_slot_index
+			|| memcmp(&tuple->carrier, &request->carrier, sizeof(tuple->carrier)) != 0)
+			continue;
+
+		for (uint8 proof_index = 0; proof_index < proofs->proof_count; proof_index++)
+		{
+			const ClusterHeapFreezeCanonicalProofV1 *proof = &proofs->proofs[proof_index];
+			const ClusterTxCreationTarget *target = &proof->resolution.local_creation_target;
+
+			if (!freeze_locator_equal_exact(&request->locator, &proof->requested_locator)
+				|| proof->resolution.outcome != CLUSTER_TX_COMMITTED
+				|| tuple->raw_xmin != proof->resolution.locator_echo.xid || !target->valid
+				|| !RelFileLocatorEquals(target->locator, page->identity.key.locator)
+				|| target->fork != MAIN_FORKNUM || target->block != page->block
+				|| target->offset != tuple->offset
+				|| (target->tuple_length != 0 && target->tuple_length != tuple->tuple_length))
+				continue;
+			tuple->creation_target_proof_index = proof_index;
+			matched++;
+			break;
+		}
+	}
+	return matched;
 }

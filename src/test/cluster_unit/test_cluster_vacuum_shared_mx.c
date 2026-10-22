@@ -2171,10 +2171,148 @@ UT_TEST(cleanout_subset_never_promotes_missing_canonical_evidence)
 				 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
 }
 
+
+static void
+init_creation_binding_fixture(ClusterHeapFreezePageBatchV1 *page,
+	ClusterHeapFreezeProofBatchV1 *proofs, ClusterHeapFreezeFinalFenceV1 *fence)
+{
+	init_subset_proof_fixture(page, proofs, fence);
+	page->carrier_request_count = 1;
+	page->page_lsn = fence->page_lsn;
+	page->page_version = fence->page_version;
+	page->tuple_count = 2;
+	for (int index = 0; index < 2; index++) {
+		ClusterHeapFreezeTupleInputV1 *tuple = &page->tuples[index];
+		tuple->offset = index + 1;
+		tuple->tuple_offset = BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE - (index + 1) * 64;
+		tuple->tuple_length = 60;
+		tuple->header_length = SizeofHeapTupleHeader;
+		tuple->raw_xmin = 77;
+		tuple->has_carrier = true;
+		tuple->carrier_request_index = 0;
+		tuple->itl_slot_index = 0;
+		tuple->carrier = page->carrier_requests[0].carrier;
+		/* A prior attempt must never survive rejection or replacement. */
+		tuple->creation_target_proof_index = 0;
+	}
+	proofs->proofs[0].resolution.local_creation_target = (ClusterTxCreationTarget){
+		.locator = page->identity.key.locator, .fork = MAIN_FORKNUM,
+		.block = page->block, .offset = 1, .tuple_length = 60, .valid = true};
+}
+
+UT_TEST(creation_binding_is_physical_even_with_equal_raw_xids_and_carriers)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+
+	init_creation_binding_fixture(&page, &proofs, &fence);
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 1);
+	UT_ASSERT_EQ(page.tuples[0].creation_target_proof_index, 0);
+	UT_ASSERT_EQ(page.tuples[1].creation_target_proof_index, CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET);
+	proofs.proofs[0].resolution.local_creation_target.offset = 2;
+	proofs.proofs[0].resolution.local_creation_target.tuple_length = 0;
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 1);
+	UT_ASSERT_EQ(page.tuples[0].creation_target_proof_index, CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET);
+	UT_ASSERT_EQ(page.tuples[1].creation_target_proof_index, 0);
+}
+
+UT_TEST(creation_binding_keeps_own_carrier_and_proof_order)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+	ClusterHeapFreezeCanonicalProofV1 swap;
+
+	init_creation_binding_fixture(&page, &proofs, &fence);
+	page.carrier_request_count = proofs.proof_count = 2;
+	page.carrier_requests[1] = page.carrier_requests[0];
+	page.carrier_requests[1].locator.itl_slot_index = 1;
+	proofs.proofs[1] = proofs.proofs[0];
+	proofs.proofs[1].requested_locator.itl_slot_index = 1;
+	proofs.proofs[1].resolution.locator_echo.itl_slot_index = 1;
+	proofs.proofs[1].resolution.local_creation_target.offset = 2;
+	page.tuples[1].carrier_request_index = 1;
+	page.tuples[1].itl_slot_index = 1;
+	swap = proofs.proofs[0];
+	proofs.proofs[0] = proofs.proofs[1];
+	proofs.proofs[1] = swap;
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 2);
+	UT_ASSERT_EQ(page.tuples[0].creation_target_proof_index, 1);
+	UT_ASSERT_EQ(page.tuples[1].creation_target_proof_index, 0);
+	/* Equal raw XID does not permit a row to borrow the other carrier's target. */
+	proofs.proofs[1].resolution.local_creation_target.offset = 2;
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 1);
+	UT_ASSERT_EQ(page.tuples[0].creation_target_proof_index, CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET);
+	for (unsigned byte = 0; byte < sizeof(ClusterItlSlotData); byte++) {
+		init_creation_binding_fixture(&page, &proofs, &fence);
+		((char *)&page.tuples[0].carrier)[byte] ^= 1;
+		UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 0);
+		UT_ASSERT_EQ(page.tuples[0].creation_target_proof_index, CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET);
+	}
+}
+
+UT_TEST(creation_binding_rejects_incomplete_or_changed_evidence_and_resets_rows)
+{
+	for (int variant = 0; variant < 19; variant++) {
+		ClusterHeapFreezePageBatchV1 page;
+		ClusterHeapFreezeProofBatchV1 proofs;
+		ClusterHeapFreezeFinalFenceV1 fence;
+		ClusterTxCreationTarget *target;
+		init_creation_binding_fixture(&page, &proofs, &fence);
+		target = &proofs.proofs[0].resolution.local_creation_target;
+		switch (variant) {
+		case 0: target->valid = false; break;
+		case 1: target->locator.spcOid++; break;
+		case 2: target->locator.dbOid++; break;
+		case 3: target->locator.relNumber++; break;
+		case 4: target->fork = FSM_FORKNUM; break;
+		case 5: target->block++; break;
+		case 6: target->offset = InvalidOffsetNumber; break;
+		case 7: target->tuple_length++; break;
+		case 8: page.tuples[0].raw_xmin++; break;
+		case 9: page.tuples[0].raw_xmin = FrozenTransactionId; break;
+		case 10: page.tuples[0].has_carrier = false; break;
+		case 11: page.tuples[0].carrier_request_index = CLUSTER_HEAP_FREEZE_NO_CARRIER_REQUEST; break;
+		case 12: page.tuples[0].itl_slot_index++; break;
+		case 13: page.tuples[0].tuple_offset = BLCKSZ; break;
+		case 14: page.tuples[0].header_length = 0; break;
+		case 15: fence.master_sequence++; break;
+		case 16: page.page_lsn++; break;
+		case 17: proofs.proofs[0].c1b_finalized = false; break;
+		case 18: page.carrier_request_count = 2; break;
+		}
+		UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 0);
+		UT_ASSERT_EQ(page.tuples[0].creation_target_proof_index, CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET);
+		UT_ASSERT_EQ(page.tuples[1].creation_target_proof_index, CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET);
+	}
+}
+
+UT_TEST(creation_binding_missing_or_malformed_batches_cannot_reuse_old_indexes)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(NULL, NULL, NULL), 0);
+	for (int variant = 0; variant < 4; variant++) {
+		init_creation_binding_fixture(&page, &proofs, &fence);
+		if (variant == 0)
+			proofs.proof_count = 0;
+		if (variant == 1)
+			proofs.proof_count = CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH + 1;
+		if (variant == 2)
+			page.tuple_count = MaxHeapTuplesPerPage + 1;
+		UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs,
+			variant == 3 ? NULL : &fence), 0);
+		UT_ASSERT_EQ(page.tuples[0].creation_target_proof_index, CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(67);
+	UT_PLAN(71);
 	UT_RUN(share_scan_preserves_every_reference_before_native_consumer);
 	UT_RUN(cleanup_scan_preserves_before_prune_and_freeze);
 	UT_RUN(raw_multi_value_never_selects_local_reader);
@@ -2242,6 +2380,10 @@ main(void)
 	UT_RUN(cleanout_subset_rejects_duplicate_or_unrequested_proofs);
 	UT_RUN(cleanout_subset_requires_the_same_final_current_fence);
 	UT_RUN(cleanout_subset_never_promotes_missing_canonical_evidence);
+	UT_RUN(creation_binding_is_physical_even_with_equal_raw_xids_and_carriers);
+	UT_RUN(creation_binding_keeps_own_carrier_and_proof_order);
+	UT_RUN(creation_binding_rejects_incomplete_or_changed_evidence_and_resets_rows);
+	UT_RUN(creation_binding_missing_or_malformed_batches_cannot_reuse_old_indexes);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
