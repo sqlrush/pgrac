@@ -9722,8 +9722,8 @@ test_cluster_cold_tx_start_boundary.inc: $(top_srcdir)/src/backend/access/transa
 	mv $@.tmp $@
 
 test_cluster_cold_tx_consumer.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
-	awk '/^cluster_cold_recovery_consume_loser_inputs_v1\(/ { print "static bool"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^cluster_cold_recovery_(stamp_c0|consume_loser_inputs)_v1\(/ { print "static bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_cold_tx_xid_maximum.inc: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_replay.c Makefile
@@ -9740,5 +9740,12 @@ test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_ow
         $(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
         $(top_srcdir)/src/include/cluster/cluster_undo_smgr.h \
         $(top_srcdir)/src/include/cluster/storage/cluster_undo_block0.h \
-        $(top_srcdir)/src/include/cluster/cluster_wal_writer.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
+        $(top_srcdir)/src/include/cluster/cluster_wal_writer.h \
+        $(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
+        $(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
+        $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+        $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
+        $(top_builddir)/src/common/libpgcommon_srv.a \
+        $(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@

@@ -253,6 +253,7 @@
 #include "cluster/cluster_inject.h"
 /* PGRAC: spec-3.18 D2b undo buffer pool checkpoint write-back flush. */
 #include "cluster/storage/cluster_undo_buf.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 /* PGRAC: spec-4.1 per-thread WAL routing page-header stamp. */
 #include "cluster/cluster_scn.h" /* PGRAC: xl_scn stamp (spec-4.5) */
 #include "cluster/cluster_wal_state.h" /* PGRAC: checkpoint redo / fpw sticky (spec-4.5) */
@@ -6657,10 +6658,96 @@ ClusterStartupInstalledWriterV1(ClusterWalWriterToken *writer, uint8 operation_u
 	return true;
 }
 
+/* Execute only the confirmed C0 candidate under the original source/target
+ * reservations and held FD. Every fallible preparation and ROOT check has
+ * finished before PRE_INSERT. The window itself uses local identity checks,
+ * native WAL, and the held descriptor, never another source/ROOT acquisition. */
+static bool
+cluster_cold_recovery_stamp_c0_v1(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdTopTxCensusEntryV1 *entry, const ClusterRecoveryTTAbortV1 *record,
+	ClusterUndoSmgrRecoveryStampV1 stamp)
+{
+	const ClusterColdTypedV1 *typed = ClusterColdRecoveryTxInputs(start);
+	ClusterRecoveryStampOwnerV1 owner = {0};
+	ClusterRecoveryStampHandleV1 window;
+	uint8 operation_uuid[16];
+	uint8 payload[CLUSTER_RECOVERY_TT_ABORT_BYTES];
+	uint32 participant = UINT32_MAX;
+	volatile bool completed = false;
+
+	if (typed == NULL || record == NULL || typed->replay_count == 0
+		|| typed->replay_count > typed->participant_count
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS)
+		return false;
+	for (uint32 i = 0; i < typed->replay_count; i++)
+	{
+		if (typed->participants[i].thread_id != record->target_thread)
+			continue;
+		if (participant != UINT32_MAX)
+			return false;
+		participant = i;
+	}
+	if (participant == UINT32_MAX
+		|| !ClusterStartupInstalledWriterV1(&owner.writer, operation_uuid)
+		|| !cluster_recovery_tt_abort_encode_v1(record, payload, sizeof(payload)))
+		return false;
+	owner.target = typed->sources[participant].claim;
+	owner.executor_pid = MyProcPid;
+	owner.executor_boot = owner.writer.ref.claim.identity.origin_owner_incarnation;
+	owner.recovery_serial = record->recovery_serial;
+	if (!cluster_recovery_stamp_prepare_v1(&owner, CLUSTER_RECOVERY_STAMP_C0,
+			payload, sizeof(payload), &window))
+		return false;
+
+	PG_TRY();
+	{
+		/* Only this branch proves that insertion and target mutation did not
+		 * begin. Once INSERTING is set, every refusal retains the responsibility. */
+		if (!ClusterColdRecoveryTxTopProofCurrent(start, entry)
+			|| !ClusterColdRecoveryTxEffectsCurrent(start))
+		{
+			if (!cluster_recovery_stamp_cancel_v1(&window))
+				(void)cluster_recovery_stamp_fail_v1(&window);
+		}
+		else
+		{
+			XLogRecPtr end;
+
+			START_CRIT_SECTION();
+			if (!cluster_recovery_stamp_inserting_v1(&window))
+				ereport(PANIC, (errmsg("could not begin cold recovery C0 insertion")));
+			XLogBeginInsert();
+			XLogRegisterData((char *)payload, sizeof(payload));
+			end = XLogInsert(RM_CLUSTER_UNDO_ID, XLOG_UNDO_RECOVERY_TT_ABORT);
+			if (!cluster_recovery_stamp_inserted_v1(&window, ProcLastRecPtr, end))
+				ereport(PANIC, (errmsg("could not record cold recovery C0 insertion")));
+			END_CRIT_SECTION();
+			XLogFlush(end);
+			if (ClusterColdRecoveryTxTopProofCurrent(start, entry)
+				&& ClusterColdRecoveryTxEffectsCurrent(start)
+				&& cluster_undo_smgr_recovery_abort_write_v1(stamp)
+				&& ClusterColdRecoveryTxTopProofCurrent(start, entry)
+				&& ClusterColdRecoveryTxEffectsCurrent(start)
+				&& cluster_recovery_stamp_durable_v1(&window)
+				&& cluster_recovery_stamp_clear_v1(&window))
+				completed = true;
+			else
+				(void)cluster_recovery_stamp_fail_v1(&window);
+		}
+	}
+	PG_CATCH();
+	{
+		(void)cluster_recovery_stamp_fail_v1(&window);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return completed;
+}
+
 /* Reacquire the original owner/source scope for every physical loser proved
- * by the pre-EOR census. Prepare and close its exact FD without writing:
- * TX_CLOSURE carries no C0, TT, checkpoint, DATA, reclamation or FullXid
- * authority.  An unproven ACTIVE remains explicit and is not consumed here. */
+ * by the pre-EOR census. All original proof/effects/endpoint/writer gates and
+ * exact target preparation precede execution. Unproven ACTIVE remains explicit;
+ * C0 completion grants no cleanup, checkpoint, reclamation or OPEN authority. */
 static bool
 cluster_cold_recovery_consume_loser_inputs_v1(
 	const struct ClusterRecoveryStartV1 *start)
@@ -6705,8 +6792,7 @@ cluster_cold_recovery_consume_loser_inputs_v1(
 			continue;
 		/* A physical loser is necessary but not sufficient: the consumer
 		 * accepts only the complete independently retained TopTxProof for
-		 * this exact old-ACTIVE entry.  This remains read-only input and
-		 * grants no C0, checkpoint or mutation authority. */
+		 * this exact old-ACTIVE entry before preparing its C0 execution. */
 		if (!ClusterColdRecoveryTxTopProofCurrent(start, entry))
 			return false;
 
@@ -6736,13 +6822,18 @@ cluster_cold_recovery_consume_loser_inputs_v1(
 			&& !cluster_undo_smgr_recovery_abort_prepare_tx_v1(inputs, &candidate.record, &stamp))
 			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			XLogEnsureRecordSpace(0, 1);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			result = cluster_wal_inputs_revalidate_v1(inputs);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			&& (!ClusterColdRecoveryTxC0Candidate(start, entry, &confirmed)
 				|| memcmp(&candidate.record, &confirmed.record, sizeof(candidate.record)) != 0))
 			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-		/* Preparation grants no C0 execution authority. Close before releasing
-		 * exclusion, including every post-I/O refusal path. */
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& !cluster_cold_recovery_stamp_c0_v1(start, entry, &confirmed.record, stamp))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		/* Close before releasing exclusion, including every post-I/O refusal.
+		 * The stamp owner independently retains every incomplete inserted C0. */
 		if (stamp.token != 0 && !cluster_undo_smgr_recovery_abort_close_v1(stamp))
 			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		cluster_undo_block0_release_reservation(&target);

@@ -770,8 +770,18 @@ cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 stamp)
 			goto refused;
 	}
 	/* An already-result observation must also become durable. */
-	if (pg_fsync(stage->fd) != 0)
-		goto refused;
+	if (pg_fsync(stage->fd) != 0) {
+		int save_errno = errno;
+
+		stage->failed = true;
+		cluster_undo_block0_header_write_unlock(acquired_slot);
+		errno = save_errno;
+		ereport(data_sync_elevel(ERROR),
+				(errcode_for_file_access(),
+				 errmsg("could not synchronize cold recovery C0 undo segment %u: %m",
+						header->segment_id)));
+		return false;
+	}
 	size = pg_pread(stage->fd, observed.data, BLCKSZ, 0);
 	cluster_undo_record_note_smgr_pread();
 	if (size != BLCKSZ || memcmp(observed.data, stage->after.data, BLCKSZ) != 0

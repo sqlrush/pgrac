@@ -9,6 +9,7 @@
 #define USE_PGRAC_CLUSTER 1
 #include "postgres.h"
 #include <fcntl.h>
+#include <setjmp.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include "cluster/cluster_undo_smgr.h"
@@ -45,6 +46,25 @@ static bool header_locked;
 static char tx_scope_storage;
 static bool tx_scope_current;
 static int tx_resolves;
+static jmp_buf report_jump;
+static bool report_armed, sync_retry;
+static int reported_level, sync_base_level;
+
+int
+data_sync_elevel(int elevel)
+{
+	sync_base_level = elevel;
+	return sync_retry ? elevel : PANIC;
+}
+
+static void
+test_report(int elevel)
+{
+	reported_level = elevel;
+	if (!report_armed)
+		abort();
+	longjmp(report_jump, 1);
+}
 
 bool
 cluster_wal_inputs_tx_abort_path_v1(ClusterWalInputsV1 *inputs,
@@ -198,7 +218,10 @@ io_close(int fd)
 #define pg_pwrite io_pwrite
 #define fstat io_fstat
 #define close io_close
+#undef ereport
+#define ereport(elevel, rest) test_report(elevel)
 #include "../../backend/cluster/storage/cluster_undo_smgr.c"
+#undef ereport
 #undef close
 #undef fstat
 #undef pg_pwrite
@@ -456,7 +479,7 @@ UT_TEST(test_changed_header_or_unlinked_file_is_sticky_refusal)
 }
 UT_TEST(test_io_refusal_never_becomes_durable_on_same_handle)
 {
-	for (int mode = 0; mode < 5; mode++) {
+	for (int mode = 0; mode < 4; mode++) {
 		ClusterUndoSmgrRecoveryStampV1 stamp;
 		reset_file(false);
 		if (!prepare(&stamp))
@@ -466,13 +489,38 @@ UT_TEST(test_io_refusal_never_becomes_durable_on_same_handle)
 		if (mode == 1)
 			write_short = true;
 		if (mode == 2)
-			sync_error = true;
-		if (mode == 3)
 			corrupt_postread = true;
-		if (mode == 4)
+		if (mode == 3)
 			stat_error = true;
 		UT_ASSERT(!cluster_undo_smgr_recovery_abort_write_v1(stamp));
 		read_short = write_short = sync_error = corrupt_postread = stat_error = false;
+		UT_ASSERT(!cluster_undo_smgr_recovery_abort_write_v1(stamp));
+		UT_ASSERT(cluster_undo_smgr_recovery_abort_close_v1(stamp));
+		UT_ASSERT_EQ(external_fds, 0);
+	}
+}
+UT_TEST(test_sync_failure_uses_native_severity_after_unlock_and_stays_failed)
+{
+	for (volatile int mode = 0; mode < 2; mode++) {
+		ClusterUndoSmgrRecoveryStampV1 stamp;
+		reset_file(false);
+		if (!prepare(&stamp))
+			continue;
+		sync_retry = mode != 0;
+		sync_base_level = reported_level = 0;
+		sync_error = report_armed = true;
+		if (setjmp(report_jump) == 0) {
+			(void)cluster_undo_smgr_recovery_abort_write_v1(stamp);
+			report_armed = false;
+			UT_ASSERT(false);
+		} else
+			report_armed = false;
+		UT_ASSERT_EQ(sync_base_level, ERROR);
+		UT_ASSERT_EQ(reported_level, sync_retry ? ERROR : PANIC);
+		UT_ASSERT(!header_locked);
+		UT_ASSERT_EQ(writes, 1);
+		UT_ASSERT_EQ(syncs, 1);
+		sync_error = false;
 		UT_ASSERT(!cluster_undo_smgr_recovery_abort_write_v1(stamp));
 		UT_ASSERT(cluster_undo_smgr_recovery_abort_close_v1(stamp));
 		UT_ASSERT_EQ(external_fds, 0);
@@ -536,7 +584,7 @@ main(void)
 		return 2;
 	snprintf(test_dir, sizeof(test_dir), "%s", dir);
 	snprintf(test_file, sizeof(test_file), "%s/seg_257.dat", dir);
-	UT_PLAN(9);
+	UT_PLAN(10);
 	UT_RUN(test_exact_durable_slot_preserves_whole_header_and_head);
 	UT_RUN(test_cold_prepare_uses_exact_tx_scope_without_redo_path_or_writes);
 	UT_RUN(test_cold_prepare_refuses_bad_scope_crc_before_image_and_releases_owner);
@@ -544,6 +592,7 @@ main(void)
 	UT_RUN(test_prepare_refusals_do_not_leak_or_write);
 	UT_RUN(test_changed_header_or_unlinked_file_is_sticky_refusal);
 	UT_RUN(test_io_refusal_never_becomes_durable_on_same_handle);
+	UT_RUN(test_sync_failure_uses_native_severity_after_unlock_and_stays_failed);
 	UT_RUN(test_owner_token_capacity_and_release);
 	UT_RUN(test_close_error_and_exit_release_do_not_publish_completion);
 	CurrentResourceOwner = (ResourceOwner)&owner_storage[0];

@@ -1,9 +1,10 @@
-/* Original Startup input resource and installed-writer predicate. Native
- * binding/fence, resource manager and memory are leaves; no WAL or I/O grant. */
+/* Actual Startup consumer and original shared stamp/checkpoint owner. Native
+ * binding/fence, WAL, storage and ResourceOwner services remain fixture leaves. */
 #define USE_PGRAC_CLUSTER 1
 #include "postgres.h"
 #include <setjmp.h>
 #include "access/xlog.h"
+#include "access/xloginsert.h"
 #include "access/xlogrecovery.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_guc.h"
@@ -12,12 +13,16 @@
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_block0.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 #include "../../../src/backend/cluster/cluster_control_root_private.h"
 #include "miscadmin.h"
 #include "postmaster/interrupt.h"
 #include "storage/ipc.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
+#include "../../backend/cluster/cluster_recovery_plan.c"
+#undef printf
+#undef fprintf
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
@@ -34,6 +39,7 @@ int MyProcPid;
 volatile uint32 CritSectionCount;
 volatile sig_atomic_t ShutdownRequestPending;
 bool cluster_enabled, cluster_shared_config;
+bool IsUnderPostmaster = true;
 ResourceOwner CurrentResourceOwner;
 MemoryContext TopMemoryContext;
 static ClusterWalStartupImage clusterStartupWriter;
@@ -62,12 +68,58 @@ static pg_on_exit_callback exit_callback;
 static jmp_buf fatal_jump;
 static bool fatal_armed;
 static const struct ClusterRecoveryStartV1 *destroy_probe;
+static ClusterRecoveryPlanShmem window_region;
+static bool found_window_region;
+static ClusterRecoveryStampCaptureV1 pre_cut, insert_cut, write_cut;
+static unsigned wal_capacity, wal_inserts, wal_flushes, stamp_writes;
+static bool stamp_write_ok, flush_error, write_error, invalidate_writer_on_capacity;
+static bool invalidate_writer_in_pre, invalidate_writer_on_flush, invalidate_writer_on_write;
+static uint8 wal_payload[CLUSTER_RECOVERY_TT_ABORT_BYTES];
+XLogRecPtr ProcLastRecPtr;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+void pg_re_throw(void)
+{
+	if (PG_exception_stack == NULL) abort();
+	siglongjmp(*PG_exception_stack, 1);
+}
+int s_lock(volatile slock_t *lock, const char *file, int line, const char *func)
+{
+	(void)lock; (void)file; (void)line; (void)func;
+	abort(); /* A retained slot lock is illegal in this single-thread fixture. */
+}
+void *ShmemInitStruct(const char *name, Size size, bool *found)
+{
+	if (strcmp(name, "pgrac recovery plan") != 0 || size != MAXALIGN(sizeof(window_region))) abort();
+	*found = found_window_region;
+	found_window_region = true;
+	return &window_region;
+}
+static void capture_pending(ClusterRecoveryStampCaptureV1 *cut)
+{
+	MyBackendType = B_CHECKPOINTER;
+	MyProcPid = 82;
+	UT_ASSERT(cluster_recovery_stamp_capture_v1(cut));
+	UT_ASSERT_EQ(cut->count, 1);
+	UT_ASSERT(!cut->caller_owned);
+	UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(cut), CLUSTER_RECOVERY_STAMP_PENDING);
+	MyBackendType = B_STARTUP;
+	MyProcPid = 81;
+}
 
 bool RecoveryInProgress(void) { return native_recovery; }
 uint64 cluster_qvotec_get_self_incarnation(void) { return owner_boot; }
 ClusterControlRootResult
 cluster_wal_writer_begin(TimeLineID timeline, ClusterWalWriterToken *out)
 {
+	if (window_region.thread_replay[2].stamp.phase == CLUSTER_RECOVERY_STAMP_PRE_INSERT) {
+		if (!pre_cut.captured) capture_pending(&pre_cut);
+		if (invalidate_writer_in_pre) {
+			invalidate_writer_in_pre = false;
+			observed_writer.epoch++;
+		}
+	}
 	memset(out, 0, sizeof(*out));
 	if (!writer_ok || timeline != observed_writer.ref.timeline)
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
@@ -198,6 +250,7 @@ ClusterControlRootResult
 cluster_wal_inputs_revalidate_v1(ClusterWalInputsV1 *inputs)
 {
 	if (inputs != (ClusterWalInputsV1 *)&scope_storage) abort();
+	UT_ASSERT_EQ(window_region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
 	scope_checks++;
 	return scope_checks == fail_scope_check
 		? CLUSTER_CONTROL_ROOT_STALE_TOKEN : CLUSTER_CONTROL_ROOT_OK_PRIMARY;
@@ -238,10 +291,90 @@ cluster_undo_smgr_recovery_abort_close_v1(ClusterUndoSmgrRecoveryStampV1 stamp)
 	return stamp_close_ok;
 }
 
+void XLogEnsureRecordSpace(int max_block_id, int ndatas)
+{
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(max_block_id, 0);
+	UT_ASSERT_EQ(ndatas, 1);
+	UT_ASSERT(stamp_live && reserved_target != NULL && scope_releases == 0);
+	UT_ASSERT_EQ(window_region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
+	wal_capacity++;
+	if (invalidate_writer_on_capacity) observed_writer.epoch++;
+}
+void XLogBeginInsert(void)
+{
+	UT_ASSERT_EQ(wal_capacity, 1);
+	UT_ASSERT_EQ(CritSectionCount, 1);
+	UT_ASSERT_EQ(scope_checks, 3);
+	UT_ASSERT_EQ(window_region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_INSERTING);
+	capture_pending(&insert_cut);
+}
+void XLogRegisterData(char *data, uint32 length)
+{
+	UT_ASSERT_EQ(length, sizeof(wal_payload));
+	memcpy(wal_payload, data, sizeof(wal_payload));
+}
+XLogRecPtr XLogInsert(RmgrId rmid, uint8 record_info)
+{
+	ClusterRecoveryTTAbortV1 record;
+	ClusterRecoveryStampSlotV1 *slot = &window_region.thread_replay[2].stamp;
+	UT_ASSERT_EQ(CritSectionCount, 1);
+	UT_ASSERT_EQ(rmid, RM_CLUSTER_UNDO_ID);
+	UT_ASSERT_EQ(record_info, XLOG_UNDO_RECOVERY_TT_ABORT);
+	UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_INSERTING);
+	UT_ASSERT(memcmp(slot->payload, wal_payload, sizeof(wal_payload)) == 0);
+	UT_ASSERT(cluster_recovery_tt_abort_decode_v1(wal_payload, sizeof(wal_payload), &record));
+	UT_ASSERT(memcmp(&record, &prepared_record, sizeof(record)) == 0);
+	UT_ASSERT_EQ(slot->handle.owner.writer.epoch, observed_writer.epoch);
+	UT_ASSERT_EQ(slot->handle.owner.target.identity.origin_thread_id, record.target_thread);
+	UT_ASSERT_EQ(slot->handle.owner.target.identity.origin_owner_incarnation, record.target_incarnation);
+	UT_ASSERT_EQ(slot->handle.owner.executor_pid, MyProcPid);
+	UT_ASSERT_EQ(slot->handle.owner.executor_boot, record.writer_incarnation);
+	UT_ASSERT_EQ(slot->handle.owner.recovery_serial, record.recovery_serial);
+	wal_inserts++;
+	ProcLastRecPtr = observed_writer.startup_first_lsn + 32;
+	return ProcLastRecPtr + 200;
+}
+void XLogFlush(XLogRecPtr end)
+{
+	ClusterRecoveryStampSlotV1 *slot = &window_region.thread_replay[2].stamp;
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(wal_inserts, 1);
+	UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+	UT_ASSERT_EQ(slot->record_start, ProcLastRecPtr);
+	UT_ASSERT_EQ(slot->record_end, end);
+	UT_ASSERT_EQ(stamp_writes, 0);
+	UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&insert_cut), CLUSTER_RECOVERY_STAMP_PENDING);
+	wal_flushes++;
+	if (invalidate_writer_on_flush) observed_writer.epoch++;
+	if (flush_error) pg_re_throw();
+}
+bool cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 stamp)
+{
+	UT_ASSERT(stamp_live && stamp.token == 91 && reserved_target != NULL && scope_releases == 0);
+	UT_ASSERT_EQ(wal_flushes, 1);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(window_region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+	capture_pending(&write_cut); /* Checkpoint is still pending during target I/O. */
+	stamp_writes++;
+	if (invalidate_writer_on_write) observed_writer.epoch++;
+	if (write_error) pg_re_throw();
+	return stamp_write_ok;
+}
+
 static void reset(void)
 {
 	if (reserved_target != NULL || stamp_live) abort();
 	if (exit_callback != NULL) exit_callback(0, (Datum)0);
+	found_window_region = false;
+	cluster_recovery_plan_shmem_init();
+	memset(&pre_cut, 0, sizeof(pre_cut));
+	memset(&insert_cut, 0, sizeof(insert_cut));
+	memset(&write_cut, 0, sizeof(write_cut));
+	wal_capacity = wal_inserts = wal_flushes = stamp_writes = 0;
+	stamp_write_ok = true;
+	flush_error = write_error = invalidate_writer_on_capacity = false;
+	invalidate_writer_in_pre = invalidate_writer_on_flush = invalidate_writer_on_write = false;
 	exit_callback = NULL;
 	destroy_probe = NULL;
 	memset(&typed, 0, sizeof(typed));
@@ -276,6 +409,10 @@ static void reset(void)
 	clusterStartupWriterInstalled = binding_ok = writer_ok = allocation_ok = true;
 	owner_boot = 17;
 	clusterStartupWriter.claim.identity.system_identifier = 91;
+	memset(clusterStartupWriter.claim.identity.storage_uuid, 1, 16);
+	memset(clusterStartupWriter.claim.identity.authority_uuid, 2, 16);
+	clusterStartupWriter.claim.identity.thread_claim_created_at = 100;
+	clusterStartupWriter.claim.identity.root_lineage_seq = 1;
 	clusterStartupWriter.claim.identity.origin_thread_id = 1;
 	clusterStartupWriter.claim.identity.origin_owner_incarnation = owner_boot;
 	clusterStartupWriter.database_incarnation = 2;
@@ -622,6 +759,8 @@ static void c0_subject(void)
 	typed.replay_count = 1;
 	typed.participants[0].thread_id = 2;
 	typed.participants[0].owner_incarnation = 29;
+	typed.sources[0].claim = observed_writer.ref.claim;
+	typed.sources[0].claim.identity.origin_node_id = 1;
 	typed.sources[0].claim.identity.origin_thread_id = 2;
 	typed.sources[0].claim.identity.origin_owner_incarnation = 29;
 	typed.sources[0].claim.claim_sha256[0] = 41;
@@ -765,7 +904,7 @@ UT_TEST(test_actual_startup_prepares_exact_fd_before_releasing_original_guards)
 	UT_ASSERT_EQ(census.entries[0].input.slot.status, TT_SLOT_ACTIVE);
 }
 
-UT_TEST(test_actual_startup_fd_failure_or_post_io_stale_releases_without_mutation)
+UT_TEST(test_actual_startup_fd_or_final_close_failure_balances_original_guards)
 {
 	for (unsigned fault = 0; fault < 4; fault++) {
 		c0_subject();
@@ -785,9 +924,102 @@ UT_TEST(test_actual_startup_fd_failure_or_post_io_stale_releases_without_mutatio
 	}
 }
 
+UT_TEST(test_actual_c0_insert_flush_stamp_completes_original_checkpoint_cut)
+{
+	ClusterRecoveryStampSlotV1 *slot = &window_region.thread_replay[2].stamp;
+	c0_subject();
+	UT_ASSERT(cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+	UT_ASSERT_EQ(wal_capacity, 1);
+	UT_ASSERT_EQ(wal_inserts, 1);
+	UT_ASSERT_EQ(wal_flushes, 1);
+	UT_ASSERT_EQ(stamp_writes, 1);
+	UT_ASSERT(pre_cut.captured && insert_cut.captured && write_cut.captured);
+	UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&pre_cut), CLUSTER_RECOVERY_STAMP_COMPLETE);
+	UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&insert_cut), CLUSTER_RECOVERY_STAMP_COMPLETE);
+	UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&write_cut), CLUSTER_RECOVERY_STAMP_COMPLETE);
+	UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_EMPTY);
+	UT_ASSERT(!slot->failed);
+	UT_ASSERT_EQ(stamp_closes, 1);
+	UT_ASSERT_EQ(target_releases, 1);
+	UT_ASSERT_EQ(scope_releases, 1);
+	/* Retained census is input, never overwritten to manufacture completion. */
+	UT_ASSERT_EQ(census.entries[0].input.slot.status, TT_SLOT_ACTIVE);
+}
+
+UT_TEST(test_before_insert_writer_drift_does_not_create_wal_or_target_mutation)
+{
+	for (unsigned fault = 0; fault < 2; fault++) {
+		c0_subject();
+		if (fault == 0) invalidate_writer_on_capacity = true;
+		else invalidate_writer_in_pre = true;
+		UT_ASSERT(!cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+		UT_ASSERT_EQ(wal_capacity, 1);
+		UT_ASSERT_EQ(wal_inserts, 0);
+		UT_ASSERT_EQ(stamp_writes, 0);
+		UT_ASSERT_EQ(window_region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
+		if (fault == 1) {
+			UT_ASSERT(pre_cut.captured);
+			UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&pre_cut), CLUSTER_RECOVERY_STAMP_COMPLETE);
+		}
+		UT_ASSERT_EQ(scope_releases, 1);
+	}
+}
+
+UT_TEST(test_post_insert_write_or_writer_failure_retains_failed_window)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterRecoveryStampSlotV1 *slot = &window_region.thread_replay[2].stamp;
+		c0_subject();
+		if (fault == 0) stamp_write_ok = false;
+		else if (fault == 1) invalidate_writer_on_flush = true;
+		else invalidate_writer_on_write = true;
+		UT_ASSERT(!cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+		UT_ASSERT_EQ(wal_inserts, 1);
+		UT_ASSERT_EQ(wal_flushes, 1);
+		UT_ASSERT_EQ(stamp_writes, fault == 1 ? 0 : 1);
+		UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+		UT_ASSERT(slot->failed);
+		UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&insert_cut), CLUSTER_RECOVERY_STAMP_INVALID);
+		UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&slot->handle));
+		UT_ASSERT(!cluster_recovery_stamp_clear_v1(&slot->handle));
+		UT_ASSERT_EQ(stamp_closes, 1);
+		UT_ASSERT_EQ(target_releases, 1);
+		UT_ASSERT_EQ(scope_releases, 1);
+	}
+}
+
+UT_TEST(test_post_insert_error_marks_debt_before_rethrow)
+{
+	for (unsigned fault = 0; fault < 2; fault++) {
+		volatile bool caught = false;
+		ClusterRecoveryStampSlotV1 *slot = &window_region.thread_replay[2].stamp;
+		c0_subject();
+		if (fault == 0) flush_error = true;
+		else write_error = true;
+		PG_TRY();
+		{
+			(void)cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+		UT_ASSERT(slot->failed);
+		UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&insert_cut), CLUSTER_RECOVERY_STAMP_INVALID);
+		UT_ASSERT(!cluster_recovery_stamp_clear_v1(&slot->handle));
+		/* Real FD/reservation ResourceOwner ERROR unwind is not exercised here;
+		 * discard only these external fixture leaves before the next case. */
+		stamp_live = false;
+		reserved_target = NULL;
+	}
+}
+
 int main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(24);
 	UT_RUN(test_original_owner_binds_complete_empty_census_after_done);
 	UT_RUN(test_native_owner_rejects_uninstalled_recovery_and_writer_drift);
 	UT_RUN(test_current_rechecks_owner_process_boot_and_exact_writer);
@@ -807,7 +1039,11 @@ int main(void)
 	UT_RUN(test_actual_startup_consumer_reserves_original_target_then_releases_before_scope);
 	UT_RUN(test_actual_startup_reservation_failure_or_stale_owner_preserves_active_and_releases);
 	UT_RUN(test_actual_startup_prepares_exact_fd_before_releasing_original_guards);
-	UT_RUN(test_actual_startup_fd_failure_or_post_io_stale_releases_without_mutation);
+	UT_RUN(test_actual_startup_fd_or_final_close_failure_balances_original_guards);
+	UT_RUN(test_actual_c0_insert_flush_stamp_completes_original_checkpoint_cut);
+	UT_RUN(test_before_insert_writer_drift_does_not_create_wal_or_target_mutation);
+	UT_RUN(test_post_insert_write_or_writer_failure_retains_failed_window);
+	UT_RUN(test_post_insert_error_marks_debt_before_rethrow);
 	reset();
 	if (allocations != frees) { fprintf(stderr, "unreleased start resources\n"); return 1; }
 	UT_DONE();
