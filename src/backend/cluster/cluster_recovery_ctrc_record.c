@@ -476,43 +476,62 @@ refused:
 }
 
 bool
-cluster_recovery_ctrc_bind_reference_v2(XLogReaderState *reader,
-										  uint64 database_incarnation, uint32 source_index,
-										  const uint8 source_identity_digest[32],
-										  const uint8 *raw_record, size_t raw_length,
-										  ClusterRecoveryCTRCBindReferenceV2 *out)
+cluster_recovery_ctrc_tt_reference_v2(XLogReaderState *reader,
+										uint64 database_incarnation, uint32 source_index,
+										const uint8 source_identity_digest[32],
+										const uint8 *raw_record, size_t raw_length,
+										ClusterRecoveryCTRCTTReferenceV2 *out)
 {
-	ClusterUndoDecoded bind;
-	ClusterRecoveryCTRCBindReferenceV2 reference = { 0 };
+	ClusterUndoDecoded decoded;
+	ClusterUndoDecodedKind kind;
+	ClusterRecoveryCTRCTTReferenceV2 reference = { 0 };
+	size_t payload_length;
 	uint8 *key = reference.key;
 	uint8 *atom = reference.evidence + 16;
 
 	if (out == NULL)
 		return false;
-	if (database_incarnation == 0 || raw_record == NULL
-		|| raw_length != CLUSTER_RECOVERY_CTRC_BIND_RAW_BYTES || reader == NULL
+	if (database_incarnation == 0 || raw_record == NULL || reader == NULL
 		|| reader->record == NULL || reader->system_identifier == 0
 		|| reader->cluster_expected_thread_id == 0 || reader->cluster_expected_thread_id > 128
 		|| reader->ReadRecPtr == InvalidXLogRecPtr || reader->EndRecPtr <= reader->ReadRecPtr
 		|| reader->record->lsn != reader->ReadRecPtr
 		|| reader->record->next_lsn != reader->EndRecPtr
 		|| XLogRecGetRmid(reader) != RM_CLUSTER_UNDO_ID
-		|| XLogRecGetInfo(reader) != XLOG_UNDO_TT_SLOT_BIND
 		|| XLogRecHasAnyBlockRefs(reader) || XLogRecHasPageVersionEdge(reader)
 		|| TransactionIdIsValid(XLogRecGetTopXid(reader))
-		|| XLogRecGetOrigin(reader) != InvalidRepOriginId
-		|| !cluster_undo_decode(reader, &bind) || !cluster_undo_inspect_pi(&bind)
-		|| bind.kind != CLUSTER_UNDO_KIND_TT_BIND
-		|| bind.instance != reader->cluster_expected_thread_id
-		|| bind.expected_generation == UINT32_MAX)
+		|| XLogRecGetOrigin(reader) != InvalidRepOriginId)
+		goto refused;
+	/* Only these original payloads carry an exact segment generation. */
+	switch (XLogRecGetInfo(reader)) {
+	case XLOG_UNDO_TT_SLOT_BIND:
+		payload_length = sizeof(xl_undo_tt_slot_bind);
+		kind = CLUSTER_UNDO_KIND_TT_BIND;
+		break;
+	case XLOG_UNDO_TT_SLOT_ABORT:
+		payload_length = sizeof(xl_undo_tt_slot_abort_exact);
+		kind = CLUSTER_UNDO_KIND_TT_ABORT;
+		break;
+	case XLOG_UNDO_TT_SLOT_CTRC_RELEASE:
+		payload_length = CLUSTER_UNDO_TT_CTRC_RELEASE_BYTES;
+		kind = CLUSTER_UNDO_KIND_TT_CTRC_RELEASE;
+		break;
+	default:
+		goto refused;
+	}
+	if (raw_length != SizeOfXLogRecord + SizeOfXLogRecordDataHeaderShort + payload_length
+		|| XLogRecGetDataLen(reader) != payload_length
+		|| !cluster_undo_decode(reader, &decoded) || !cluster_undo_inspect_pi(&decoded)
+		|| decoded.kind != kind || decoded.instance != reader->cluster_expected_thread_id
+		|| decoded.expected_generation == UINT32_MAX)
 		goto refused;
 	/* A decoded header alone does not bind the supplied complete raw record.
 	 * The header xid is evidence, separate from this one payload xid field. */
 	if (memcmp(raw_record, &reader->record->header, SizeOfXLogRecord) != 0
 		|| raw_record[SizeOfXLogRecord] != XLR_BLOCK_ID_DATA_SHORT
-		|| raw_record[SizeOfXLogRecord + 1] != sizeof(xl_undo_tt_slot_bind)
+		|| raw_record[SizeOfXLogRecord + 1] != payload_length
 		|| memcmp(raw_record + SizeOfXLogRecord + SizeOfXLogRecordDataHeaderShort,
-				  XLogRecGetData(reader), sizeof(xl_undo_tt_slot_bind)) != 0
+				  XLogRecGetData(reader), payload_length) != 0
 		|| !cluster_recovery_ctrc_record_hash_v2(source_identity_digest, reader->ReadRecPtr,
 												reader->EndRecPtr, raw_record, raw_length, key + 68))
 		goto refused;
@@ -520,12 +539,12 @@ cluster_recovery_ctrc_bind_reference_v2(XLogReaderState *reader,
 	/* T34 || U16(WAL carrier) || B(R56) || U64(offset) || U64(ordinal). */
 	cluster_undo_tt_ctrc_put_u64_le(key, reader->system_identifier);
 	cluster_undo_tt_ctrc_put_u64_le(key + 8, database_incarnation);
-	cluster_undo_tt_ctrc_put_u16_le(key + 16, bind.instance);
-	cluster_undo_tt_ctrc_put_u32_le(key + 18, bind.segment_id);
-	cluster_undo_tt_ctrc_put_u32_le(key + 22, bind.expected_generation);
-	cluster_undo_tt_ctrc_put_u16_le(key + 26, bind.slot_offset);
-	cluster_undo_tt_ctrc_put_u16_le(key + 28, bind.wrap);
-	cluster_undo_tt_ctrc_put_u32_le(key + 30, bind.xid);
+	cluster_undo_tt_ctrc_put_u16_le(key + 16, decoded.instance);
+	cluster_undo_tt_ctrc_put_u32_le(key + 18, decoded.segment_id);
+	cluster_undo_tt_ctrc_put_u32_le(key + 22, decoded.expected_generation);
+	cluster_undo_tt_ctrc_put_u16_le(key + 26, decoded.slot_offset);
+	cluster_undo_tt_ctrc_put_u16_le(key + 28, decoded.wrap);
+	cluster_undo_tt_ctrc_put_u32_le(key + 30, decoded.xid);
 	cluster_undo_tt_ctrc_put_u16_le(key + 34, 3);
 	cluster_undo_tt_ctrc_put_u64_le(key + 36, 56);
 	cluster_undo_tt_ctrc_put_u32_le(key + 44, source_index);
@@ -540,9 +559,36 @@ cluster_recovery_ctrc_bind_reference_v2(XLogReaderState *reader,
 	cluster_undo_tt_ctrc_put_u64_le(atom + 66, raw_length);
 	memcpy(atom + 74, raw_record, raw_length);
 	cluster_undo_tt_ctrc_put_u64_le(reference.evidence, 1);
-	cluster_undo_tt_ctrc_put_u64_le(reference.evidence + 8,
-								  CLUSTER_RECOVERY_CTRC_BIND_ATOM_BYTES);
+	cluster_undo_tt_ctrc_put_u64_le(reference.evidence + 8, 74 + raw_length);
+	reference.evidence_length = 16 + 74 + raw_length;
 	/* Consume all raw/source aliases before publishing the complete group. */
+	memcpy(out, &reference, sizeof(reference));
+	return true;
+
+refused:
+	memset(out, 0, sizeof(*out));
+	return false;
+}
+
+bool
+cluster_recovery_ctrc_bind_reference_v2(XLogReaderState *reader,
+										  uint64 database_incarnation, uint32 source_index,
+										  const uint8 source_identity_digest[32],
+										  const uint8 *raw_record, size_t raw_length,
+										  ClusterRecoveryCTRCBindReferenceV2 *out)
+{
+	ClusterRecoveryCTRCTTReferenceV2 tt;
+	ClusterRecoveryCTRCBindReferenceV2 reference;
+
+	if (out == NULL)
+		return false;
+	if (reader == NULL || reader->record == NULL
+		|| XLogRecGetInfo(reader) != XLOG_UNDO_TT_SLOT_BIND
+		|| !cluster_recovery_ctrc_tt_reference_v2(reader, database_incarnation, source_index,
+												source_identity_digest, raw_record, raw_length, &tt))
+		goto refused;
+	memcpy(reference.key, tt.key, sizeof(reference.key));
+	memcpy(reference.evidence, tt.evidence, sizeof(reference.evidence));
 	memcpy(out, &reference, sizeof(reference));
 	return true;
 

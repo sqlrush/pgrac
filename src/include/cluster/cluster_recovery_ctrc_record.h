@@ -178,6 +178,36 @@ extern bool cluster_recovery_ctrc_bind_reference_v2(XLogReaderState *reader,
 												 const uint8 *raw_record, size_t raw_length,
 												 ClusterRecoveryCTRCBindReferenceV2 *out);
 
+/* One original payload xid reference from BIND24, exact ABORT24 or the
+ * generation-bearing CTRC_RELEASE96. Evidence has its actual encoded length;
+ * the remaining bytes are zero. evidence_length is caller metadata, not part
+ * of the canonical evidence or graph hash. */
+#define CLUSTER_RECOVERY_CTRC_TT_RAW_MAX_BYTES 130
+#define CLUSTER_RECOVERY_CTRC_TT_ATOM_MAX_BYTES (74 + CLUSTER_RECOVERY_CTRC_TT_RAW_MAX_BYTES)
+#define CLUSTER_RECOVERY_CTRC_TT_EVIDENCE_MAX_BYTES (16 + CLUSTER_RECOVERY_CTRC_TT_ATOM_MAX_BYTES)
+typedef struct ClusterRecoveryCTRCTTReferenceV2 {
+	uint8 key[CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_KEY_BYTES];
+	uint8 evidence[CLUSTER_RECOVERY_CTRC_TT_EVIDENCE_MAX_BYTES];
+	size_t evidence_length;
+} ClusterRecoveryCTRCTTReferenceV2;
+
+/* Same original decoder/inspection, completed-reader, full raw/source and
+ * caller authority prerequisites as BIND above. Only exact short main-data
+ * shapes are accepted. Legacy ABORT, COMMIT and SET_HEAD lack a generation
+ * and refuse; a zero generation carried by an accepted payload is valid.
+ * Header xid is evidence only, not another inventoried field. This component
+ * does not supply graph completeness, semantic terminal/owner qualification,
+ * execution, release or a live caller. The existing BIND API remains BIND-only.
+ *
+ * Consume inputs before publishing the whole result; refusal clears *out.
+ * Unaligned raw/output and raw/source output aliases are supported, except
+ * overlap with reader-owned storage. No reader or shared-state mutation. */
+extern bool cluster_recovery_ctrc_tt_reference_v2(XLogReaderState *reader,
+											 uint64 database_incarnation, uint32 source_index,
+											 const uint8 source_identity_digest[32],
+											 const uint8 *raw_record, size_t raw_length,
+											 ClusterRecoveryCTRCTTReferenceV2 *out);
+
 typedef enum ClusterRecoveryCTRCTargetMatchV2 {
 	CLUSTER_RECOVERY_CTRC_TARGET_REFUSED = 0,
 	CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_BEFORE,

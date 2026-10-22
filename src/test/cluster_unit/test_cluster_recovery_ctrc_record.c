@@ -5,6 +5,7 @@
 #include "access/rmgr.h"
 #include "port/pg_crc32c.h"
 #include "cluster/cluster_recovery_ctrc_record.h"
+#include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "cluster/cluster_undo_segment_init.h"
@@ -3451,10 +3452,427 @@ UT_TEST(bind_header_xid_is_evidence_not_inventory)
 	XLogReaderFree(reader);
 }
 
+
+/* Generation-bearing original TT payloads share one singleton field shape.
+ * Expected bytes use the frozen transcript, not the production encoder. */
+static size_t
+tt_wire(NativeRaw *wire, unsigned kind, const xl_undo_tt_slot_bind *identity)
+{
+	size_t length = 58;
+
+	memset(wire, 0, sizeof(*wire));
+	wire->align.xl_rmid = RM_CLUSTER_UNDO_ID;
+	wire->align.xl_scn = 41;
+	wire->align.xl_xid = identity->xid + 1;
+	wire->bytes[32] = XLR_BLOCK_ID_DATA_SHORT;
+	wire->bytes[33] = 24;
+	if (kind == 0) {
+		wire->align.xl_info = XLOG_UNDO_TT_SLOT_BIND;
+		memcpy(wire->bytes + 34, identity, 24);
+	} else if (kind == 1) {
+		xl_undo_tt_slot_abort_exact abort = { 0 };
+
+		abort.segment_id = identity->segment_id;
+		abort.segment_generation = identity->segment_generation;
+		abort.xid = identity->xid;
+		abort.slot_offset = identity->slot_offset;
+		abort.wrap = identity->wrap;
+		abort.instance = identity->instance;
+		abort.format_version = CLUSTER_UNDO_TT_ABORT_EXACT_VERSION;
+		wire->align.xl_info = XLOG_UNDO_TT_SLOT_ABORT;
+		memcpy(wire->bytes + 34, &abort, 24);
+	} else {
+		xl_undo_tt_slot_ctrc_release_v1 release = { 0 };
+
+		release.segment_id = identity->segment_id;
+		release.segment_generation = identity->segment_generation;
+		release.xid = identity->xid;
+		release.cluster_epoch = 7;
+		release.root_id = 11;
+		release.root_generation = 13;
+		release.formation_epoch = 17;
+		release.admission_record_generation = 19;
+		release.seal_generation = 23;
+		release.touched_nodes_low = 5;
+		release.ack_set_digest[0] = 0x80;
+		release.ack_set_digest[15] = 7;
+		release.slot_offset = identity->slot_offset;
+		release.slot_wrap = identity->wrap;
+		release.owner_instance = identity->instance;
+		release.terminal_status = kind == 2 ? TT_SLOT_COMMITTED : TT_SLOT_ABORTED;
+		release.format_version = CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION;
+		release.flags = CLUSTER_UNDO_TT_CTRC_RELEASE_ALL_TOUCHED_ACKED;
+		if (!cluster_undo_tt_ctrc_release_encode(&release, wire->bytes + 34))
+			return 0;
+		wire->align.xl_info = XLOG_UNDO_TT_SLOT_CTRC_RELEASE;
+		wire->bytes[33] = 96;
+		length = 130;
+	}
+	native_crc(wire, length);
+	return length;
+}
+
+static bool
+tt_expected(const XLogReaderState *reader, uint64 dbinc, uint32 index,
+			const uint8 *source, const NativeRaw *wire, size_t length,
+			const xl_undo_tt_slot_bind *identity, ClusterRecoveryCTRCTTReferenceV2 *out)
+{
+	uint8 *key = out->key, *atom = out->evidence + 16;
+
+	memset(out, 0, sizeof(*out));
+	wal_atom_uint(key, SYSTEM_ID, 8);
+	wal_atom_uint(key + 8, dbinc, 8);
+	wal_atom_uint(key + 16, identity->instance, 2);
+	wal_atom_uint(key + 18, identity->segment_id, 4);
+	wal_atom_uint(key + 22, identity->segment_generation, 4);
+	wal_atom_uint(key + 26, identity->slot_offset, 2);
+	wal_atom_uint(key + 28, identity->wrap, 2);
+	wal_atom_uint(key + 30, identity->xid, 4);
+	wal_atom_uint(key + 34, 3, 2);
+	wal_atom_uint(key + 36, 56, 8);
+	wal_atom_uint(key + 44, index, 4);
+	wal_atom_uint(key + 48, reader->ReadRecPtr, 8);
+	wal_atom_uint(key + 56, reader->EndRecPtr, 8);
+	wal_atom_uint(key + 64, length, 4);
+	if (!reference_digest(source, reader->ReadRecPtr, reader->EndRecPtr, wire, length, key + 68))
+		return false;
+	wal_atom_uint(key + 100, 42, 8);
+	wal_atom_uint(out->evidence, 1, 8);
+	wal_atom_uint(out->evidence + 8, 74 + length, 8);
+	wal_atom_uint(atom, 1, 2);
+	wal_atom_uint(atom + 2, 56, 8);
+	memcpy(atom + 10, key + 44, 56);
+	wal_atom_uint(atom + 66, length, 8);
+	memcpy(atom + 74, wire->bytes, length);
+	out->evidence_length = 90 + length;
+	return true;
+}
+
+static bool
+tt_refused(XLogReaderState *reader, uint64 dbinc, const uint8 *source,
+		   const uint8 *raw, size_t length)
+{
+	uint8 guarded[sizeof(ClusterRecoveryCTRCTTReferenceV2) + 2];
+
+	memset(guarded, 0xa5, sizeof(guarded));
+	return !cluster_recovery_ctrc_tt_reference_v2(reader, dbinc, 7, source, raw, length,
+								 (ClusterRecoveryCTRCTTReferenceV2 *)(guarded + 1))
+		&& all_zero(guarded + 1, sizeof(guarded) - 2)
+		&& guarded[0] == 0xa5 && guarded[sizeof(guarded) - 1] == 0xa5;
+}
+
+UT_TEST(tt_canonical_generation_bearing_payloads)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		xl_undo_tt_slot_bind identity = bind_sample();
+		NativeRaw wire;
+		NativePages pages;
+		XLogReaderState *reader;
+		ClusterRecoveryCTRCTTReferenceV2 out, expected;
+		size_t length = tt_wire(&wire, kind, &identity);
+
+		UT_ASSERT_EQ(length, kind < 2 ? 58 : 130);
+		UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+		UT_ASSERT(tt_expected(reader, 99, 7, raw_source, &wire, length, &identity, &expected));
+		UT_ASSERT(cluster_recovery_ctrc_tt_reference_v2(reader, 99, 7, raw_source,
+												   wire.bytes, length, &out));
+		UT_ASSERT(memcmp(&out, &expected, sizeof(out)) == 0);
+		UT_ASSERT_EQ(out.evidence_length, kind < 2 ? 148 : 220);
+		UT_ASSERT_EQ(out.key[30], 0x78);
+		UT_ASSERT_EQ(out.key[100], 42);
+		UT_ASSERT(all_zero(out.key + 108, 8));
+		XLogReaderFree(reader);
+	}
+}
+
+UT_TEST(tt_actual_interval_and_source_domains)
+{
+	for (unsigned kind = 1; kind < 3; kind++) {
+		xl_undo_tt_slot_bind identity = bind_sample();
+		NativeRaw wire;
+		NativePages pages;
+		XLogReaderState *reader;
+		ClusterRecoveryCTRCTTReferenceV2 out, base, expected;
+		uint8 source[32];
+		size_t length = tt_wire(&wire, kind, &identity);
+
+		UT_ASSERT(native_read(&pages, &wire, length, true, &reader));
+		UT_ASSERT(pages.reads >= 2);
+		UT_ASSERT(reader->EndRecPtr > reader->ReadRecPtr + length);
+		UT_ASSERT(cluster_recovery_ctrc_tt_reference_v2(reader, 99, 0, raw_source,
+												   wire.bytes, length, &base));
+		memcpy(source, raw_source, 32);
+		source[31] ^= 0x80;
+		UT_ASSERT(tt_expected(reader, UINT64_MAX, UINT32_MAX, source, &wire, length,
+							  &identity, &expected));
+		UT_ASSERT(cluster_recovery_ctrc_tt_reference_v2(reader, UINT64_MAX, UINT32_MAX,
+												   source, wire.bytes, length, &out));
+		UT_ASSERT(memcmp(&out, &expected, sizeof(out)) == 0);
+		UT_ASSERT(memcmp(base.key + 68, out.key + 68, 32) != 0);
+		XLogReaderFree(reader);
+	}
+}
+
+UT_TEST(tt_original_payload_validation)
+{
+	/* Mutate original field encodings, then supply a valid full WAL CRC. */
+	for (unsigned kind = 1; kind < 3; kind++) {
+		const unsigned common_offsets[] = { 0, 4, 8 };
+		const unsigned abort_offsets[] = { 12, 14, 16, 17, 18, 20 };
+		const unsigned release_offsets[] = { 12, 16, 24, 32, 40, 48, 64, 72,
+											88, 90, 92, 93, 94, 95 };
+		unsigned count = kind == 1 ? 9 : 17;
+
+		for (unsigned i = 0; i < count; i++) {
+			xl_undo_tt_slot_bind identity = bind_sample();
+			NativeRaw wire;
+			NativePages pages;
+			XLogReaderState *reader;
+			size_t length = tt_wire(&wire, kind, &identity);
+			uint8 *payload = wire.bytes + 34;
+			unsigned offset = i < 3 ? common_offsets[i]
+				: kind == 1 ? abort_offsets[i - 3] : release_offsets[i - 3];
+
+			if (i < 3) memset(payload + offset, i == 1 ? 0xff : 0, 4);
+			else if (offset == (kind == 1 ? 12 : 88)) memset(payload + offset, 0xff, 2);
+			else if (offset == (kind == 1 ? 14 : 90)) memset(payload + offset, 0xff, 2);
+			else if (kind == 1) payload[offset] = offset == 18 || offset == 20 ? 1 : 0;
+			else if (offset == 64) payload[offset] = 1;
+			else if (offset == 72) memset(payload + offset, 0, 16);
+			else memset(payload + offset, 0, offset <= 48 ? (offset == 12 ? 4 : 8) : 1);
+			native_crc(&wire, length);
+			UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+			UT_ASSERT(tt_refused(reader, 99, raw_source, wire.bytes, length));
+			XLogReaderFree(reader);
+		}
+	}
+}
+
+UT_TEST(tt_records_without_generation_are_not_inferred)
+{
+	const uint8 opcodes[] = { XLOG_UNDO_TT_SLOT_ABORT, XLOG_UNDO_TT_SLOT_COMMIT,
+							 XLOG_UNDO_TT_SLOT_SET_HEAD };
+	const size_t lengths[] = { 16, 24, 32 };
+	xl_undo_tt_slot_bind identity = bind_sample();
+	xl_undo_tt_slot_abort legacy = { 0 };
+	xl_undo_tt_slot_commit commit = { 0 };
+	xl_undo_tt_slot_set_head head = { 0 };
+	const void *payloads[] = { &legacy, &commit, &head };
+
+	legacy.segment_id = identity.segment_id;
+	legacy.slot_offset = identity.slot_offset;
+	legacy.wrap = identity.wrap;
+	legacy.xid = identity.xid;
+	legacy.instance = identity.instance;
+	memcpy(&commit, &legacy, sizeof(legacy));
+	commit.commit_scn = 41;
+	memcpy(&head, &legacy, sizeof(legacy));
+	head.first_undo_block.raw[0] = identity.segment_id | (UINT64_C(9) << 32);
+	head.first_undo_block.raw[1] = identity.slot_offset;
+
+	for (unsigned i = 0; i < 4; i++) {
+		NativeRaw wire;
+		NativePages pages;
+		XLogReaderState *reader;
+		ClusterUndoDecoded decoded;
+		size_t length;
+
+		if (i < 3) {
+			memset(&wire, 0, sizeof(wire));
+			wire.align.xl_rmid = RM_CLUSTER_UNDO_ID;
+			wire.align.xl_info = opcodes[i];
+			wire.align.xl_scn = 41;
+			wire.bytes[32] = XLR_BLOCK_ID_DATA_SHORT;
+			wire.bytes[33] = lengths[i];
+			memcpy(wire.bytes + 34, payloads[i], lengths[i]);
+			length = 34 + lengths[i];
+			native_crc(&wire, length);
+		} else length = native_wire(&wire, golden, sizeof(golden), 0);
+		UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+		if (i < 3) {
+			UT_ASSERT(cluster_undo_decode(reader, &decoded));
+			UT_ASSERT(cluster_undo_inspect_pi(&decoded));
+		}
+		UT_ASSERT(tt_refused(reader, 99, raw_source, wire.bytes, length));
+		XLogReaderFree(reader);
+	}
+}
+
+UT_TEST(tt_complete_raw_binding)
+{
+	for (unsigned kind = 1; kind < 3; kind++) {
+		xl_undo_tt_slot_bind identity = bind_sample();
+		NativeRaw wire, changed;
+		NativePages pages;
+		XLogReaderState *reader;
+		size_t length = tt_wire(&wire, kind, &identity);
+
+		UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+		for (size_t i = 0; i < length; i++) {
+			changed = wire;
+			changed.bytes[i] ^= 1;
+			UT_ASSERT(tt_refused(reader, 99, raw_source, changed.bytes, length));
+		}
+		changed = wire;
+		changed.align.xl_scn++;
+		native_crc(&changed, length);
+		UT_ASSERT(tt_refused(reader, 99, raw_source, changed.bytes, length));
+		changed = wire;
+		changed.bytes[42] ^= 1;
+		native_crc(&changed, length);
+		UT_ASSERT(tt_refused(reader, 99, raw_source, changed.bytes, length));
+		/* Matching decoded bytes still require the complete raw CRC. */
+		changed.bytes[42] ^= 2;
+		reader->record->header = changed.align;
+		memcpy(XLogRecGetData(reader), changed.bytes + 34, length - 34);
+		UT_ASSERT(tt_refused(reader, 99, raw_source, changed.bytes, length));
+		XLogReaderFree(reader);
+	}
+}
+
+UT_TEST(tt_current_reader_bounds_and_frame)
+{
+	for (unsigned kind = 1; kind < 3; kind++) {
+		xl_undo_tt_slot_bind identity = bind_sample();
+		NativeRaw wire;
+		NativePages pages;
+		XLogReaderState *reader, saved;
+		size_t length = tt_wire(&wire, kind, &identity);
+		uint8 source[32] = { 0 };
+
+		UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+		UT_ASSERT(tt_refused(NULL, 99, raw_source, wire.bytes, length));
+		UT_ASSERT(tt_refused(reader, 0, raw_source, wire.bytes, length));
+		UT_ASSERT(tt_refused(reader, 99, NULL, wire.bytes, length));
+		UT_ASSERT(tt_refused(reader, 99, source, wire.bytes, length));
+		UT_ASSERT(tt_refused(reader, 99, raw_source, NULL, length));
+		for (size_t len = 0; len < length; len++)
+			UT_ASSERT(tt_refused(reader, 99, raw_source, wire.bytes, len));
+		UT_ASSERT(tt_refused(reader, 99, raw_source, wire.bytes, length + 1));
+		UT_ASSERT(tt_refused(reader, 99, raw_source, wire.bytes, SIZE_MAX));
+		UT_ASSERT(!cluster_recovery_ctrc_tt_reference_v2(reader, 99, 7, raw_source,
+													wire.bytes, length, NULL));
+		saved = *reader;
+		for (unsigned i = 0; i < 7; i++) {
+			*reader = saved;
+			if (i == 0) reader->record = NULL;
+			if (i == 1) reader->system_identifier = 0;
+			if (i == 2) reader->ReadRecPtr++;
+			if (i == 3) reader->EndRecPtr++;
+			if (i == 4) reader->cluster_expected_thread_id = 2;
+			if (i == 5) reader->cluster_expected_thread_id = 0;
+			if (i == 6) reader->cluster_expected_thread_id = 129;
+			UT_ASSERT(tt_refused(reader, 99, raw_source, wire.bytes, length));
+		}
+		*reader = saved;
+		XLogReaderFree(reader);
+		for (unsigned extra = NATIVE_BLOCK; extra <= NATIVE_EDGE; extra *= 2) {
+			NativeRaw extra_wire;
+			size_t extra_len = native_wire(&extra_wire, wire.bytes + 34, length - 34, extra);
+
+			extra_wire.align.xl_info = wire.align.xl_info;
+			native_crc(&extra_wire, extra_len);
+			UT_ASSERT(native_read(&pages, &extra_wire, extra_len, false, &reader));
+			UT_ASSERT(tt_refused(reader, 99, raw_source, extra_wire.bytes, extra_len));
+			XLogReaderFree(reader);
+		}
+		wire.align.xl_info |= XLR_SPECIAL_REL_UPDATE;
+		native_crc(&wire, length);
+		UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+		UT_ASSERT(tt_refused(reader, 99, raw_source, wire.bytes, length));
+		XLogReaderFree(reader);
+	}
+}
+
+UT_TEST(tt_unaligned_aliases_and_immutable_inputs)
+{
+	for (unsigned kind = 1; kind < 3; kind++) {
+		xl_undo_tt_slot_bind identity = bind_sample();
+		NativeRaw wire, saved_wire;
+		NativePages pages, saved_pages;
+		XLogReaderState *reader, saved_reader;
+		ClusterRecoveryCTRCTTReferenceV2 expected;
+		uint8 buffer[sizeof(expected) + 2];
+		size_t length = tt_wire(&wire, kind, &identity);
+
+		UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+		UT_ASSERT(tt_expected(reader, 99, 7, raw_source, &wire, length, &identity, &expected));
+		saved_wire = wire;
+		saved_pages = pages;
+		saved_reader = *reader;
+		memset(buffer, 0xa5, sizeof(buffer));
+		memcpy(buffer + 1, wire.bytes, length);
+		UT_ASSERT(cluster_recovery_ctrc_tt_reference_v2(reader, 99, 7, raw_source,
+			buffer + 1, length, (ClusterRecoveryCTRCTTReferenceV2 *)(buffer + 1)));
+		UT_ASSERT(memcmp(buffer + 1, &expected, sizeof(expected)) == 0);
+		UT_ASSERT(buffer[0] == 0xa5 && buffer[sizeof(buffer) - 1] == 0xa5);
+		memcpy(buffer + 1, raw_source, 32);
+		UT_ASSERT(cluster_recovery_ctrc_tt_reference_v2(reader, 99, 7, buffer + 1,
+			wire.bytes, length, (ClusterRecoveryCTRCTTReferenceV2 *)(buffer + 1)));
+		UT_ASSERT(memcmp(buffer + 1, &expected, sizeof(expected)) == 0);
+		UT_ASSERT(buffer[0] == 0xa5 && buffer[sizeof(buffer) - 1] == 0xa5);
+		UT_ASSERT(memcmp(&wire, &saved_wire, sizeof(wire)) == 0);
+		UT_ASSERT(memcmp(&pages, &saved_pages, sizeof(pages)) == 0);
+		UT_ASSERT(memcmp(reader, &saved_reader, sizeof(*reader)) == 0);
+		UT_ASSERT(memcmp(XLogRecGetData(reader), wire.bytes + 34, length - 34) == 0);
+		XLogReaderFree(reader);
+	}
+}
+
+UT_TEST(tt_bind_api_remains_bind_only)
+{
+	for (unsigned kind = 0; kind < 3; kind++) {
+		xl_undo_tt_slot_bind identity = bind_sample();
+		NativeRaw wire;
+		NativePages pages;
+		XLogReaderState *reader;
+		ClusterRecoveryCTRCTTReferenceV2 out;
+		ClusterRecoveryCTRCBindReferenceV2 bind;
+		size_t length = tt_wire(&wire, kind, &identity);
+
+		UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+		UT_ASSERT(cluster_recovery_ctrc_tt_reference_v2(reader, 99, 7, raw_source,
+												   wire.bytes, length, &out));
+		if (kind == 0) {
+			UT_ASSERT(cluster_recovery_ctrc_bind_reference_v2(reader, 99, 7, raw_source,
+													 wire.bytes, length, &bind));
+			UT_ASSERT(memcmp(bind.key, out.key, sizeof(bind.key)) == 0);
+			UT_ASSERT(memcmp(bind.evidence, out.evidence, sizeof(bind.evidence)) == 0);
+		} else UT_ASSERT(bind_refused(reader, 99, raw_source, wire.bytes, length));
+		XLogReaderFree(reader);
+	}
+}
+
+UT_TEST(tt_native_boundary_identities)
+{
+	for (unsigned kind = 1; kind < 3; kind++) {
+		for (unsigned boundary = 0; boundary < 2; boundary++) {
+			xl_undo_tt_slot_bind identity = bind_sample();
+			NativeRaw wire;
+			NativePages pages;
+			XLogReaderState *reader;
+			ClusterRecoveryCTRCTTReferenceV2 out, expected;
+			size_t length;
+
+			identity.segment_generation = boundary ? UINT32_MAX - 1 : 0;
+			identity.slot_offset = boundary ? TT_SLOTS_PER_SEGMENT - 1 : 0;
+			identity.wrap = boundary ? TT_WRAP_INVALID - 1 : 0;
+			identity.xid = boundary ? MaxTransactionId : FirstNormalTransactionId;
+			length = tt_wire(&wire, kind, &identity);
+			UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+			UT_ASSERT(tt_expected(reader, 1, 0, raw_source, &wire, length, &identity, &expected));
+			UT_ASSERT(cluster_recovery_ctrc_tt_reference_v2(reader, 1, 0, raw_source,
+													wire.bytes, length, &out));
+			UT_ASSERT(memcmp(&out, &expected, sizeof(out)) == 0);
+			XLogReaderFree(reader);
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(108);
+	UT_PLAN(117);
 	UT_RUN(golden_encoding);
 	UT_RUN(golden_decoding);
 	UT_RUN(unaligned_buffers);
@@ -3549,6 +3967,15 @@ main(void)
 	UT_RUN(bind_immutable_unaligned_and_aliases);
 	UT_RUN(bind_native_boundary_identities);
 	UT_RUN(bind_header_xid_is_evidence_not_inventory);
+	UT_RUN(tt_canonical_generation_bearing_payloads);
+	UT_RUN(tt_actual_interval_and_source_domains);
+	UT_RUN(tt_original_payload_validation);
+	UT_RUN(tt_records_without_generation_are_not_inferred);
+	UT_RUN(tt_complete_raw_binding);
+	UT_RUN(tt_current_reader_bounds_and_frame);
+	UT_RUN(tt_unaligned_aliases_and_immutable_inputs);
+	UT_RUN(tt_bind_api_remains_bind_only);
+	UT_RUN(tt_native_boundary_identities);
 	graph_alloc_tracking = true;
 	UT_RUN(graph_independent_golden_and_immutable);
 	UT_RUN(graph_all_node_edge_permutations);
