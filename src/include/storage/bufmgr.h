@@ -371,6 +371,8 @@ extern Buffer LockBufferForFreeSpaceMapPageInit(Buffer buffer);
 extern bool ConditionalLockBuffer(Buffer buffer);
 /* Read-only successful ConditionalLockBuffer() only; no PCM writer cleanup. */
 extern void ClusterUnlockReleaseBufferAfterConditionalRead(Buffer buffer);
+/* Conditional local X plus cluster_space_hint_begin/finish() publication only. */
+extern void ClusterUnlockReleaseBufferAfterConditionalHint(Buffer buffer);
 extern void LockBufferForCleanup(Buffer buffer);
 extern bool ConditionalLockBufferForCleanup(Buffer buffer);
 extern bool IsBufferCleanupOK(Buffer buffer);

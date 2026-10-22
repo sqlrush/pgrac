@@ -16,9 +16,12 @@
 #include "postgres.h"
 
 #include "cluster/cluster_heap_freeze.h"
+#include "cluster/cluster_itl_cleanout.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_space_storage.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
+#include "miscadmin.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
@@ -51,6 +54,7 @@ typedef struct LVRelState
 
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
+volatile uint32 CritSectionCount;
 
 static RelationData relation;
 static LVRelState vacrel;
@@ -72,6 +76,11 @@ static char cleanup_order[16];
 static unsigned cleanup_count;
 static pg_on_exit_callback exit_callback;
 static Datum exit_arg;
+static unsigned hint_begins, hint_finishes;
+static ClusterSpaceHintResult hint_result;
+static bool error_hint_begin, mismatch_requested_locator;
+static ClusterTxOutcome slot_outcomes[CLUSTER_ITL_INITRANS_DEFAULT];
+static SCN slot_scns[CLUSTER_ITL_INITRANS_DEFAULT];
 
 static void
 note_cleanup(char event)
@@ -238,7 +247,6 @@ cluster_tx_resolve_exact_admitted(const ClusterTxLocator *locator, ClusterTxReso
 	ClusterUndoBlock0CurrentGuard guard;
 	ClusterRuntimeCandidateCleanup cleanup;
 
-	(void)locator;
 	if (mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS || !admission->entered || debt != 1)
 		abort();
 	resolves++;
@@ -258,8 +266,11 @@ cluster_tx_resolve_exact_admitted(const ClusterTxLocator *locator, ClusterTxReso
 	PG_END_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
 								PointerGetDatum(&cleanup));
 	memset(out, 0, sizeof(*out));
+	out->locator_echo = *locator;
+	out->outcome = slot_outcomes[locator->itl_slot_index];
+	out->commit_scn = slot_scns[locator->itl_slot_index];
 	*reason = unknown_outcome ? CLUSTER_TX_RESOLVE_PROTOCOL : CLUSTER_TX_RESOLVE_NONE;
-	return unknown_outcome ? CLUSTER_TX_UNKNOWN : CLUSTER_TX_COMMITTED;
+	return unknown_outcome ? CLUSTER_TX_UNKNOWN : out->outcome;
 }
 
 bool
@@ -269,12 +280,12 @@ cluster_heap_freeze_build_canonical_proof_v1(
 	const ClusterHeapFreezeFinalFenceV1 *current, bool finalized,
 	bool authority_current, bool admission_current, ClusterHeapFreezeCanonicalProofV1 *out)
 {
-	(void)locator;
-	(void)resolution;
-
-	(void)finalized;
-
 	memset(out, 0, sizeof(*out));
+	out->requested_locator = *locator;
+	out->resolution = *resolution;
+	out->c1b_finalized = finalized;
+	if (mismatch_requested_locator && locator->itl_slot_index == 1)
+		out->requested_locator.tt_wrap = 3;
 	out->expected_fence = *expected;
 	out->current_fence = *current;
 	out->authority_current = authority_current;
@@ -412,6 +423,40 @@ fixture_buffer_page(Buffer buffer)
 #undef BufferGetPage
 #define BufferGetPage(buffer) fixture_buffer_page(buffer)
 
+/* SPACE/WAL are leaves: assert the caller's real ownership and balanced critical
+ * section.  No transport, storage durability or physical FPI is claimed. */
+ClusterSpaceHintResult
+cluster_space_hint_begin(Buffer buffer, RfPageProducerBatchV1 *batch)
+{
+	if (buffer != 1 || !pin_held || !content_locked || debt != 1 || CritSectionCount != 0)
+		abort();
+	hint_begins++;
+	if (error_hint_begin)
+		throw_error();
+	if (hint_result == CLUSTER_SPACE_HINT_VERSIONED)
+	{
+		memset(batch, 0, sizeof(*batch));
+		batch->prepared = batch->stamped = true;
+		batch->entry_count = 1;
+		CritSectionCount++;
+		((PageHeader)resident_page.data)->pd_block_scn++;
+	}
+	return hint_result;
+}
+
+void
+cluster_space_hint_finish(Buffer buffer, bool standard, const RfPageProducerBatchV1 *batch)
+{
+	if (buffer != 1 || !standard || !pin_held || !content_locked || debt != 1
+		|| CritSectionCount != 1 || !batch->prepared || !batch->stamped || batch->entry_count != 1)
+		abort();
+	hint_finishes++;
+	PageSetLSN((Page)resident_page.data, 102);
+	CritSectionCount--;
+}
+
+#include "test_cluster_vacuum_proof_cleanout.inc"
+
 ClusterHeapFreezePageMatchV1
 cluster_heap_freeze_validate_page_v1(const ClusterHeapFreezePageInputV1 *input,
 									 const ClusterSpaceIdentity *identity, BlockNumber block, Page page)
@@ -470,6 +515,15 @@ reset_fixture(void)
 	cleanup_count = 0;
 	cleanup_order[0] = '\0';
 	exit_callback = NULL;
+	hint_begins = hint_finishes = 0;
+	hint_result = CLUSTER_SPACE_HINT_VERSIONED;
+	error_hint_begin = mismatch_requested_locator = false;
+	CritSectionCount = 0;
+	for (unsigned index = 0; index < CLUSTER_ITL_INITRANS_DEFAULT; index++)
+	{
+		slot_outcomes[index] = CLUSTER_TX_COMMITTED;
+		slot_scns[index] = 200 + index;
+	}
 	PG_exception_stack = NULL;
 	error_context_stack = NULL;
 }
@@ -872,10 +926,246 @@ UT_TEST(cache_off_refused_local_lock_releases_only_pin)
 	check_local_cleanup_without_pcm_release("PA");
 }
 
+static ClusterItlSlotData *
+setup_cleanout_page(void)
+{
+	PageHeader header;
+	ClusterItlSlotData *slots;
+
+	reset_fixture();
+	cluster_gcs_block_local_cache = false;
+	remote_release_error = true;
+	header = (PageHeader)resident_page.data;
+	header->pd_lower = SizeOfPageHeaderData;
+	header->pd_special = BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE;
+	header->pd_upper = header->pd_special;
+	header->pd_flags |= PD_HAS_ITL;
+	memset(resident_page.data + header->pd_lower, 0xa5, header->pd_upper - header->pd_lower);
+	slots = ClusterPageGetItlSlots((Page)resident_page.data);
+	vacrel.shared_freeze_batch.carrier_request_count = 2;
+	for (uint8 index = 0; index < 2; index++)
+	{
+		ClusterHeapFreezeCarrierRequestV1 *request =
+			&vacrel.shared_freeze_batch.carrier_requests[index];
+
+		/* Same raw XID, different physical carriers and different proven SCNs. */
+		slots[index].xid = 47;
+		slots[index].wrap = 4 + index;
+		slots[index].flags = ITL_FLAG_ACTIVE;
+		slots[index].lock_count = 2 + index;
+		slots[index].undo_segment_head.raw[0] = 100 + index;
+		slots[index].undo_segment_head.raw[1] = 900 + index;
+		slots[index].write_scn = 80 + index;
+		slots[index].first_change_lsn = 70 + index;
+		request->carrier = slots[index];
+		request->locator.uba = slots[index].undo_segment_head;
+		request->locator.xid = slots[index].xid;
+		request->locator.tt_wrap = TT_WRAP_INVALID;
+		request->locator.itl_kind = slots[index].flags;
+		request->locator.itl_slot_index = index;
+	}
+	return slots;
+}
+
+static void
+expected_cleanout(PGAlignedBlock *expected, bool second)
+{
+	ClusterItlSlotData *slots;
+
+	memcpy(expected, &resident_page, sizeof(*expected));
+	slots = ClusterPageGetItlSlots((Page)expected->data);
+	slots[0].flags = ITL_FLAG_COMMITTED;
+	slots[0].commit_scn = slot_scns[0];
+	if (second)
+	{
+		slots[1].flags = ITL_FLAG_COMMITTED;
+		slots[1].commit_scn = slot_scns[1];
+	}
+	((PageHeader)expected->data)->pd_block_scn++;
+	PageSetLSN((Page)expected->data, 102);
+}
+
+UT_TEST(committed_carriers_use_one_versioned_hint_and_invalidate_saved_fence)
+{
+	PGAlignedBlock expected;
+	ClusterItlSlotData *slots = setup_cleanout_page();
+
+	slots[1].flags = ITL_FLAG_NEEDS_CLEANOUT;
+	slots[1].commit_scn = slot_scns[1];
+	vacrel.shared_freeze_batch.carrier_requests[1].carrier = slots[1];
+	vacrel.shared_freeze_batch.carrier_requests[1].locator.itl_kind = slots[1].flags;
+	expected_cleanout(&expected, true);
+	UT_ASSERT(!collect_catches_error());
+	UT_ASSERT_EQ(collected_status, CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(hint_begins, 1);
+	UT_ASSERT_EQ(hint_finishes, 1);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(memcmp(resident_page.data, expected.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proofs.proof_count, 2);
+	UT_ASSERT(!vacrel.shared_freeze_fence_valid);
+	check_local_cleanup_without_pcm_release("LPA");
+}
+
+UT_TEST(every_carrier_witness_byte_is_checked_before_first_stamp)
+{
+	for (unsigned byte = 0; byte < sizeof(ClusterItlSlotData); byte++)
+	{
+		PGAlignedBlock expected;
+		ClusterItlSlotData *slots = setup_cleanout_page();
+
+		((unsigned char *)&slots[1])[byte] ^= 1;
+		memcpy(&expected, &resident_page, sizeof(expected));
+		UT_ASSERT(!collect_catches_error());
+		UT_ASSERT_EQ(hint_begins, 0);
+		UT_ASSERT_EQ(hint_finishes, 0);
+		UT_ASSERT_EQ(memcmp(resident_page.data, expected.data, BLCKSZ), 0);
+		check_local_cleanup_without_pcm_release("LPA");
+	}
+}
+
+UT_TEST(requested_locator_must_match_exactly_before_any_stamp)
+{
+	PGAlignedBlock expected;
+
+	setup_cleanout_page();
+	mismatch_requested_locator = true;
+	memcpy(&expected, &resident_page, sizeof(expected));
+	UT_ASSERT(!collect_catches_error());
+	UT_ASSERT_EQ(hint_begins, 0);
+	UT_ASSERT_EQ(memcmp(resident_page.data, expected.data, BLCKSZ), 0);
+	check_local_cleanup_without_pcm_release("LPA");
+}
+
+UT_TEST(aborted_proof_cannot_stamp_a_committed_hint)
+{
+	PGAlignedBlock expected;
+
+	setup_cleanout_page();
+	slot_outcomes[1] = CLUSTER_TX_ABORTED;
+	expected_cleanout(&expected, false);
+	UT_ASSERT(!collect_catches_error());
+	UT_ASSERT_EQ(hint_begins, 1);
+	UT_ASSERT_EQ(hint_finishes, 1);
+	UT_ASSERT_EQ(memcmp(resident_page.data, expected.data, BLCKSZ), 0);
+	check_local_cleanup_without_pcm_release("LPA");
+}
+
+UT_TEST(non_data_or_ineligible_slots_keep_all_original_bytes)
+{
+	const uint8 flags[] = {ITL_FLAG_FREE, ITL_FLAG_COMMITTED, ITL_FLAG_ABORTED,
+		ITL_FLAG_LOCK_ONLY_ACTIVE, ITL_FLAG_LOCK_ONLY_COMMITTED,
+		ITL_FLAG_LOCK_ONLY_ABORTED, ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI,
+		ITL_FLAG_NEEDS_CLEANOUT};
+
+	for (unsigned index = 0; index < lengthof(flags); index++)
+	{
+		PGAlignedBlock expected;
+		ClusterItlSlotData *slots = setup_cleanout_page();
+
+		slots[1].flags = flags[index];
+		/* NEEDS_CLEANOUT with a different retained SCN must also be skipped. */
+		slots[1].commit_scn = 177;
+		vacrel.shared_freeze_batch.carrier_requests[1].carrier = slots[1];
+		vacrel.shared_freeze_batch.carrier_requests[1].locator.itl_kind = slots[1].flags;
+		expected_cleanout(&expected, false);
+		UT_ASSERT(!collect_catches_error());
+		UT_ASSERT_EQ(hint_begins, 1);
+		UT_ASSERT_EQ(hint_finishes, 1);
+		UT_ASSERT_EQ(memcmp(resident_page.data, expected.data, BLCKSZ), 0);
+		check_local_cleanup_without_pcm_release("LPA");
+	}
+}
+
+UT_TEST(no_eligible_carrier_does_not_start_hint_publication)
+{
+	PGAlignedBlock expected;
+
+	setup_cleanout_page();
+	slot_outcomes[0] = slot_outcomes[1] = CLUSTER_TX_ABORTED;
+	memcpy(&expected, &resident_page, sizeof(expected));
+	UT_ASSERT(!collect_catches_error());
+	UT_ASSERT_EQ(hint_begins, 0);
+	UT_ASSERT_EQ(hint_finishes, 0);
+	UT_ASSERT_EQ(memcmp(resident_page.data, expected.data, BLCKSZ), 0);
+	check_local_cleanup_without_pcm_release("LPA");
+}
+
+UT_TEST(shared_cleanout_has_no_native_or_cache_miss_fallback)
+{
+	const ClusterSpaceHintResult refused[] = {CLUSTER_SPACE_HINT_SKIPPED, CLUSTER_SPACE_HINT_NATIVE};
+
+	for (unsigned index = 0; index < lengthof(refused); index++)
+	{
+		PGAlignedBlock expected;
+
+		setup_cleanout_page();
+		hint_result = refused[index];
+		memcpy(&expected, &resident_page, sizeof(expected));
+		UT_ASSERT(!collect_catches_error());
+		UT_ASSERT_EQ(hint_begins, 1);
+		UT_ASSERT_EQ(hint_finishes, 0);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT_EQ(memcmp(resident_page.data, expected.data, BLCKSZ), 0);
+		check_local_cleanup_without_pcm_release("LPA");
+	}
+}
+
+UT_TEST(hint_begin_error_releases_pin_before_admission_without_remote_cleanup)
+{
+	PGAlignedBlock expected;
+
+	setup_cleanout_page();
+	error_hint_begin = true;
+	memcpy(&expected, &resident_page, sizeof(expected));
+	check_error_cleanup("LPA");
+	UT_ASSERT_EQ(hint_begins, 1);
+	UT_ASSERT_EQ(hint_finishes, 0);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(memcmp(resident_page.data, expected.data, BLCKSZ), 0);
+	check_local_cleanup_without_pcm_release("LPA");
+}
+
+UT_TEST(hint_begin_cancel_preserves_error_and_allows_backend_reuse)
+{
+	PGAlignedBlock expected;
+
+	setup_cleanout_page();
+	error_hint_begin = true;
+	inject_code = ERRCODE_QUERY_CANCELED;
+	check_error_cleanup("LPA");
+	check_local_cleanup_without_pcm_release("LPA");
+	if (pin_held || content_locked || debt != 0)
+		return;
+	error_hint_begin = false;
+	expected_cleanout(&expected, true);
+	UT_ASSERT(!collect_catches_error());
+	UT_ASSERT_EQ(hint_begins, 2);
+	UT_ASSERT_EQ(hint_finishes, 1);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(enters, 2);
+	UT_ASSERT_EQ(leaves, 2);
+	UT_ASSERT_EQ(memcmp(resident_page.data, expected.data, BLCKSZ), 0);
+	check_local_cleanup_without_pcm_release("LPALPA");
+}
+
+UT_TEST(changed_final_fence_does_not_start_cleanout)
+{
+	PGAlignedBlock expected;
+
+	setup_cleanout_page();
+	changed_holder = true;
+	memcpy(&expected, &resident_page, sizeof(expected));
+	UT_ASSERT(!collect_catches_error());
+	UT_ASSERT_EQ(collected_status, CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	UT_ASSERT_EQ(hint_begins, 0);
+	UT_ASSERT_EQ(memcmp(resident_page.data, expected.data, BLCKSZ), 0);
+	check_local_cleanup_without_pcm_release("LPA");
+}
+
 int
 main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(38);
 	UT_RUN(invalid_input_does_not_leave);
 	UT_RUN(rejected_admission_does_not_leave);
 	UT_RUN(normal_success_leaves_once);
@@ -904,6 +1194,16 @@ main(void)
 	UT_RUN(cache_off_validation_error_preserves_original_error);
 	UT_RUN(cache_off_page_cancel_preserves_error_and_backend_reuse);
 	UT_RUN(cache_off_refused_local_lock_releases_only_pin);
+	UT_RUN(committed_carriers_use_one_versioned_hint_and_invalidate_saved_fence);
+	UT_RUN(every_carrier_witness_byte_is_checked_before_first_stamp);
+	UT_RUN(requested_locator_must_match_exactly_before_any_stamp);
+	UT_RUN(aborted_proof_cannot_stamp_a_committed_hint);
+	UT_RUN(non_data_or_ineligible_slots_keep_all_original_bytes);
+	UT_RUN(no_eligible_carrier_does_not_start_hint_publication);
+	UT_RUN(shared_cleanout_has_no_native_or_cache_miss_fallback);
+	UT_RUN(hint_begin_error_releases_pin_before_admission_without_remote_cleanup);
+	UT_RUN(hint_begin_cancel_preserves_error_and_allows_backend_reuse);
+	UT_RUN(changed_final_fence_does_not_start_cleanout);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

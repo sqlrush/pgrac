@@ -9532,8 +9532,14 @@ test_cluster_vacuum_shared_mx.inc: $(top_srcdir)/src/backend/access/heap/vacuuml
 
 # Real admission/resident-page owners and inner guard cleanup, with injected errors.
 test_cluster_vacuum_proof_cleanup.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
-	awk '/^(lazy_recheck_shared_freeze_page|lazy_collect_shared_freeze_proofs)\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
+	awk '/^lazy_cleanout_shared_freeze_page\(/ { print "static bool"; emit=1; cleanout++ } \
+	     /^(lazy_recheck_shared_freeze_page|lazy_collect_shared_freeze_proofs)\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2 || cleanout > 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vacuum_proof_cleanout.inc: $(top_srcdir)/src/backend/cluster/cluster_itl_cleanout.c Makefile
+	awk '/^cluster_itl_cleanout_can_stamp\(/ && !found { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_vacuum_proof_guard.inc: $(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c Makefile
@@ -9545,8 +9551,8 @@ test_cluster_vacuum_proof_guard.inc: $(top_srcdir)/src/backend/cluster/cluster_r
 # Keep the parent reproducible: its two native wrappers precede the new pair.
 # The production caller links the new pair when present, so it cannot be stubbed.
 test_cluster_vacuum_proof_release.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
-	awk '/^(ReleaseBuffer|UnlockReleaseBuffer|ClusterUnlockReleaseBufferAfterConditionalRead)\(/ { print "void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found < 2 || found > 3) exit 1 }' $< > $@.tmp
+	awk '/^(ReleaseBuffer|UnlockReleaseBuffer|ClusterUnlockReleaseBufferAfterConditionalRead|ClusterUnlockReleaseBufferAfterConditionalHint)\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found < 2 || found > 4) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Actual generic-unlock cache-off decision; only the remote/mirror leaves vary.
@@ -9559,8 +9565,12 @@ test_cluster_vacuum_proof_unlock_tail.inc: $(top_srcdir)/src/backend/storage/buf
 
 test_cluster_vacuum_proof_cleanup: test_cluster_vacuum_proof_cleanup.c unit_test.h \
 		test_cluster_vacuum_proof_cleanup.inc test_cluster_vacuum_proof_guard.inc \
+		test_cluster_vacuum_proof_cleanout.inc \
 		test_cluster_vacuum_proof_release.inc test_cluster_vacuum_proof_unlock_tail.inc \
 		$(top_srcdir)/src/include/cluster/cluster_heap_freeze.h \
+		$(top_srcdir)/src/include/cluster/cluster_itl_cleanout.h \
+		$(top_srcdir)/src/include/cluster/cluster_space_storage.h \
+		$(top_srcdir)/src/include/miscadmin.h \
 		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
 		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_block0_current.h \

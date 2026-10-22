@@ -15576,6 +15576,23 @@ ClusterUnlockReleaseBufferAfterConditionalRead(Buffer buffer)
 }
 
 /*
+ * Pair ConditionalLockBuffer() with optional shared hint publication through
+ * cluster_space_hint_begin/finish().  That path independently requires current
+ * PCM-X write permission and a versioned SPACE publication context; it does not
+ * acquire PCM ownership or enter the writer ledger.  Release only this scope's
+ * native content lock and pin, including if hint preparation raises an ERROR.
+ * Pre-existing PCM ownership remains with its owner/revoker/eviction lifecycle.
+ * No synchronous PCM release may intervene before the native pin is returned.
+ */
+void
+ClusterUnlockReleaseBufferAfterConditionalHint(Buffer buffer)
+{
+	if (!BufferIsLocal(buffer))
+		LWLockRelease(BufferDescriptorGetContentLock(GetBufferDescriptor(buffer - 1)));
+	ReleaseBuffer(buffer);
+}
+
+/*
  * Verify that this backend is pinning the buffer exactly once.
  *
  * NOTE: Like in BufferIsPinned(), what we check here is that *this* backend

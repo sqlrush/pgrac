@@ -79,6 +79,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_heap_horizon.h"
 #include "cluster/cluster_heap_freeze.h"
+#include "cluster/cluster_itl_cleanout.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_semantic_activation.h"
@@ -1584,6 +1585,92 @@ lazy_validate_shared_freeze(LVRelState *vacrel, Page page, BlockNumber blkno)
 }
 
 /*
+ * Apply only optional delayed ITL cleanout after the canonical proof and final
+ * resident-page fence succeeded under local X.  Check every complete physical
+ * carrier before starting the versioned hint batch; no tuple or reference is
+ * retired here.  In particular, a missing SPACE publication context is not a
+ * reason to fall back to an unversioned shared-page write.
+ */
+static bool
+lazy_cleanout_shared_freeze_page(LVRelState *vacrel, Buffer buffer,
+							   const ClusterHeapFreezeProofBatchV1 *proofs)
+{
+	const ClusterHeapFreezePageBatchV1 *batch = &vacrel->shared_freeze_batch;
+	Page page = BufferGetPage(buffer);
+	PageHeader header = (PageHeader)page;
+	ClusterItlSlotData *slots;
+	bool stamp[CLUSTER_ITL_INITRANS_DEFAULT] = {false};
+	SCN commit_scns[CLUSTER_ITL_INITRANS_DEFAULT];
+	uint16 seen_slots = 0;
+	bool changed = false;
+	RfPageProducerBatchV1 hint_batch;
+
+	if (batch->carrier_request_count == 0
+		|| batch->carrier_request_count > CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH
+		|| proofs->proof_count != batch->carrier_request_count
+		|| !PageHasItl(page) || header->pd_special > BLCKSZ
+		|| header->pd_special < SizeOfPageHeaderData
+		|| BLCKSZ - header->pd_special
+			< sizeof(ClusterItlSlotData) * CLUSTER_ITL_INITRANS_DEFAULT)
+		return false;
+	slots = ClusterPageGetItlSlots(page);
+	for (uint8 index = 0; index < batch->carrier_request_count; index++)
+	{
+		const ClusterHeapFreezeCarrierRequestV1 *request = &batch->carrier_requests[index];
+		const ClusterTxResolution *resolution = NULL;
+		uint8 slot_index = request->locator.itl_slot_index;
+
+		if (slot_index >= CLUSTER_ITL_INITRANS_DEFAULT
+			|| (seen_slots & (1U << slot_index)) != 0
+			|| memcmp(&slots[slot_index], &request->carrier, sizeof(request->carrier)) != 0)
+			return false;
+		seen_slots |= 1U << slot_index;
+		for (uint8 proof_index = 0; proof_index < proofs->proof_count; proof_index++)
+		{
+			const ClusterHeapFreezeCanonicalProofV1 *proof = &proofs->proofs[proof_index];
+			const ClusterTxLocator *locator = &proof->requested_locator;
+
+			/* The requested wrap is an exact field, not a reply wildcard. */
+			if (locator->uba.raw[0] != request->locator.uba.raw[0]
+				|| locator->uba.raw[1] != request->locator.uba.raw[1]
+				|| locator->xid != request->locator.xid
+				|| locator->tt_wrap != request->locator.tt_wrap
+				|| locator->itl_kind != request->locator.itl_kind
+				|| locator->itl_slot_index != slot_index)
+				continue;
+			if (resolution != NULL)
+				return false;
+			resolution = &proof->resolution;
+		}
+		if (resolution == NULL)
+			return false;
+		if (resolution->outcome == CLUSTER_TX_COMMITTED
+			&& cluster_itl_cleanout_can_stamp(&slots[slot_index], request->carrier.xid,
+										 resolution->commit_scn))
+		{
+			stamp[slot_index] = true;
+			commit_scns[slot_index] = resolution->commit_scn;
+			changed = true;
+		}
+	}
+	if (!changed || cluster_space_hint_begin(buffer, &hint_batch) != CLUSTER_SPACE_HINT_VERSIONED)
+		return false;
+
+	/* The versioned begin entered the critical section.  No fallible work or
+	 * further rejection is allowed before finishing this single hint batch. */
+	for (uint8 slot_index = 0; slot_index < CLUSTER_ITL_INITRANS_DEFAULT; slot_index++)
+	{
+		if (stamp[slot_index])
+		{
+			slots[slot_index].commit_scn = commit_scns[slot_index];
+			slots[slot_index].flags = ITL_FLAG_COMMITTED;
+		}
+	}
+	cluster_space_hint_finish(buffer, true, &hint_batch);
+	return true;
+}
+
+/*
  * Recheck only the still-resident original buffer after proof.  The descriptor
  * number is an unowned hint until ReadRecentBuffer verifies its complete tag
  * and pins it; neither that operation nor ConditionalLockBuffer fetches a new
@@ -1591,8 +1678,8 @@ lazy_validate_shared_freeze(LVRelState *vacrel, Page page, BlockNumber blkno)
  * acquisition.  Release this ownership before the caller leaves admission,
  * including on ERROR/cancel.
  *
- * This is an evidence snapshot, not an enduring apply fence: no tuple changes
- * here, and a later apply must repeat its checks while it owns local X.  The
+ * Optional delayed ITL cleanout can consume this fence before local X is
+ * released.  It grants no tuple freeze or enduring apply permission.  The
  * captured SPACE identity is compared, not refreshed through storage I/O.
  */
 static ClusterHeapFreezeProofStatusV1
@@ -1600,11 +1687,14 @@ lazy_recheck_shared_freeze_page(LVRelState *vacrel, Buffer recent_buffer,
 							 const PcmAuthoritySnapshot *authority_before,
 							 const ClusterSemanticAdmissionToken *admission,
 							 ClusterHeapFreezeProofBatchV1 *proofs,
-							 ClusterHeapFreezeFinalFenceV1 *current_fence)
+							 ClusterHeapFreezeFinalFenceV1 *current_fence,
+							 bool *cleaned)
 {
 	ClusterHeapFreezeProofStatusV1 status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
 	volatile bool locked = false;
+	volatile bool hint_scope = false;
 
+	*cleaned = false;
 	if (recent_buffer <= InvalidBuffer || !vacrel->rel->rd_isvalid
 		|| !RelFileLocatorEquals(vacrel->rel->rd_locator, vacrel->identity.key.locator)
 		|| !ReadRecentBuffer(vacrel->rel->rd_locator, MAIN_FORKNUM,
@@ -1664,13 +1754,23 @@ lazy_recheck_shared_freeze_page(LVRelState *vacrel, Buffer recent_buffer,
 		}
 		status = cluster_heap_freeze_validate_conditional_apply_v1(
 			&vacrel->shared_freeze_batch, proofs, current_fence);
+		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN)
+		{
+			hint_scope = true;
+			*cleaned = lazy_cleanout_shared_freeze_page(vacrel, recent_buffer, proofs);
+		}
 
 recheck_done:;
 	}
 	PG_FINALLY();
 	{
 		if (locked)
-			ClusterUnlockReleaseBufferAfterConditionalRead(recent_buffer);
+		{
+			if (hint_scope)
+				ClusterUnlockReleaseBufferAfterConditionalHint(recent_buffer);
+			else
+				ClusterUnlockReleaseBufferAfterConditionalRead(recent_buffer);
+		}
 		else
 			ReleaseBuffer(recent_buffer);
 	}
@@ -1681,8 +1781,8 @@ recheck_done:;
 /*
  * Resolve every captured carrier through the terminal-census provider while
  * retaining one R4 admission, then recheck the resident page under local X.
- * This only prepares evidence: the page remains untouched and no permission
- * survives the release of the local ownership used for that recheck.
+ * Optional delayed ITL cleanout uses that same ownership.  No tuple-freeze
+ * permission survives its release, and a cleanout invalidates the saved fence.
  */
 static ClusterHeapFreezeProofStatusV1
 lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
@@ -1699,6 +1799,7 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 	uint64 master_before = 0;
 	SCN page_scn_before = InvalidScn;
 	bool route_before = false;
+	bool cleaned = false;
 
 	memset(&proofs, 0, sizeof(proofs));
 	memset(&admission, 0, sizeof(admission));
@@ -1758,14 +1859,14 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 
 		status = lazy_recheck_shared_freeze_page(vacrel, recent_buffer,
 													 &authority_before, &admission,
-													 &proofs, &current_fence);
+													 &proofs, &current_fence, &cleaned);
 		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
 			|| status == CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED)
 		{
 			vacrel->shared_freeze_proofs = proofs;
 			vacrel->shared_freeze_fence = current_fence;
 			vacrel->shared_freeze_fence_valid =
-				status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN;
+				status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN && !cleaned;
 		}
 
 admitted_done:;
