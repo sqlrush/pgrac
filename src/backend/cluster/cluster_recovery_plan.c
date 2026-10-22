@@ -686,6 +686,22 @@ stamp_snapshot(ClusterRecoveryStampSlotV1 *slot, ClusterRecoveryStampSlotV1 *out
 	SpinLockRelease(&slot->lock);
 }
 
+/* Read a snapshot, or call with the slot lock held. No codec or IO here. */
+static bool
+stamp_handle_matches(const ClusterRecoveryStampSlotV1 *slot,
+					 const ClusterRecoveryStampHandleV1 *handle)
+{
+	return stamp_state_shape(slot, handle->key.target_thread)
+		   && slot->phase != CLUSTER_RECOVERY_STAMP_EMPTY
+		   && slot->handle.key.slot_generation == handle->key.slot_generation
+		   && slot->handle.key.window_seq == handle->key.window_seq
+		   && slot->handle.key.target_thread == handle->key.target_thread
+		   && stamp_owner_equal(&slot->handle.owner, &handle->owner)
+		   && slot->handle.kind == handle->kind
+		   && slot->handle.payload_length == handle->payload_length
+		   && memcmp(slot->handle.payload, handle->payload, sizeof(handle->payload)) == 0;
+}
+
 bool
 cluster_recovery_stamp_prepare_v1(const ClusterRecoveryStampOwnerV1 *owner,
 								  ClusterRecoveryStampKindV1 kind, const uint8 *payload,
@@ -761,15 +777,7 @@ stamp_transition(const ClusterRecoveryStampHandleV1 *handle, ClusterRecoveryStam
 		return false;
 	slot = &replay->stamp;
 	SpinLockAcquire(&slot->lock);
-	if (!stamp_state_shape(slot, handle->key.target_thread)
-		|| slot->handle.key.slot_generation != handle->key.slot_generation
-		|| slot->handle.key.window_seq != handle->key.window_seq
-		|| slot->handle.key.target_thread != handle->key.target_thread
-		|| !stamp_owner_equal(&slot->handle.owner, &handle->owner)
-		|| slot->handle.kind != handle->kind
-		|| slot->handle.payload_length != handle->payload_length
-		|| memcmp(slot->handle.payload, handle->payload, sizeof(handle->payload)) != 0
-		|| slot->phase == CLUSTER_RECOVERY_STAMP_EMPTY)
+	if (!stamp_handle_matches(slot, handle))
 		goto done;
 	if (failed) {
 		slot->failed = true;
@@ -864,6 +872,45 @@ cluster_recovery_stamp_ctrc_insert_v2(const ClusterRecoveryStampHandleV1 *handle
 		return InvalidXLogRecPtr;
 	}
 	return end;
+}
+bool
+cluster_recovery_stamp_ctrc_flush_v2(const ClusterRecoveryStampHandleV1 *handle)
+{
+	ClusterThreadReplaySlot *replay;
+	ClusterRecoveryStampSlotV1 before, after;
+
+	if (!stamp_actor() || MyBackendType != B_STARTUP || CritSectionCount == 0 || handle == NULL
+		|| handle->owner.executor_pid != MyProcPid || handle->kind != CLUSTER_RECOVERY_STAMP_D0
+		|| handle->payload_length != CLUSTER_RECOVERY_CTRC_BYTES
+		|| (replay = cluster_thread_recovery_replay_slot(handle->key.target_thread)) == NULL)
+		return false;
+	stamp_snapshot(&replay->stamp, &before);
+	if (!stamp_handle_matches(&before, handle) || before.phase != CLUSTER_RECOVERY_STAMP_INSERTED
+		|| before.failed)
+		return false;
+
+	/* Keep native insertion/flush waits and errors intact. XLogFlush can
+	 * return without flushing when insertion is forbidden, so require both
+	 * the original writer and independent startup durable coverage. Never
+	 * carry a slot lock across these calls or change the inserted addresses. */
+	if (!XLogInsertAllowed()
+		|| cluster_wal_writer_check(&before.handle.owner.writer) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto failed;
+	XLogFlush(before.record_end);
+	if (!ClusterXLogStartupFlushCovers(before.record_end, before.handle.owner.writer.ref.timeline)
+		|| cluster_wal_writer_check(&before.handle.owner.writer) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto failed;
+	stamp_snapshot(&replay->stamp, &after);
+	if (!stamp_handle_matches(&after, &before.handle)
+		|| after.phase != CLUSTER_RECOVERY_STAMP_INSERTED || after.failed
+		|| after.record_start != before.record_start || after.record_end != before.record_end)
+		goto failed;
+	/* Target sync and postread are still owed; no durable/clear transition. */
+	return true;
+failed:
+	/* The saved exact operation cannot mark a different window failed. */
+	(void)cluster_recovery_stamp_fail_v1(&before.handle);
+	return false;
 }
 bool
 cluster_recovery_stamp_durable_v1(const ClusterRecoveryStampHandleV1 *handle)

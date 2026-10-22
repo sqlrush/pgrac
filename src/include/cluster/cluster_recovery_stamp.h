@@ -105,6 +105,15 @@ extern bool cluster_recovery_stamp_ctrc_inserted_v2(const ClusterRecoveryStampHa
  * full raw-record identity, nor any live production caller. */
 extern XLogRecPtr
 cluster_recovery_stamp_ctrc_insert_v2(const ClusterRecoveryStampHandleV1 *handle);
+/* Dormant original-startup D0 flush step, in the executor's critical section.
+ * Flushes the exact INSERTED window's actual end with its original writer,
+ * then independently checks native startup flush coverage and revalidates the
+ * writer/window. No slot lock is held across those calls. A matched failure
+ * is sticky; native errors retain the original post-insert responsibility.
+ * Success leaves INSERTED unchanged: target sync/postread and all other
+ * readiness/authority proofs are still required before DURABLE or clear.
+ * This is not a generic worker flush receipt or a live production caller. */
+extern bool cluster_recovery_stamp_ctrc_flush_v2(const ClusterRecoveryStampHandleV1 *handle);
 /* Only the original executor calls durable after real WAL flush and exact
  * target sync/postread. These APIs record completion, never prove it. */
 extern bool cluster_recovery_stamp_durable_v1(const ClusterRecoveryStampHandleV1 *handle);
