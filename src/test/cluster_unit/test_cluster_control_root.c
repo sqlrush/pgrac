@@ -137,6 +137,7 @@ static void (*test_checkpoint_x_hook)(void);
 static void (*test_checkpoint_published_hook)(void);
 static int test_recovery_checkpoint_scope_key;
 static bool test_recovery_checkpoint_current;
+static unsigned test_recovery_checkpoint_reads, test_recovery_checkpoint_revoke_at;
 static ClusterWalWriterToken test_recovery_checkpoint_writer;
 static void (*test_startup_sync_hook)(void);
 static unsigned test_startup_claim_syncs;
@@ -6396,7 +6397,8 @@ cluster_recovery_checkpoint_current_v1(const struct ClusterRecoveryCheckpointSco
 									 ClusterWalWriterToken *writer)
 {
 	memset(writer, 0, sizeof(*writer));
-	if (!test_recovery_checkpoint_current
+	if (++test_recovery_checkpoint_reads == test_recovery_checkpoint_revoke_at
+		|| !test_recovery_checkpoint_current
 		|| scope != (const struct ClusterRecoveryCheckpointScopeV1 *)&test_recovery_checkpoint_scope_key)
 		return false;
 	*writer = test_recovery_checkpoint_writer;
@@ -19686,12 +19688,89 @@ recovery_online_fixture(uint32 state, uint8 before[66048], ClusterControlRootIde
 	v2_write_roots(before);
 	test_serving = false;
 	test_recovery_checkpoint_current = true;
+	test_recovery_checkpoint_reads = test_recovery_checkpoint_revoke_at = 0;
 	memset(&test_recovery_checkpoint_writer, 0, sizeof(test_recovery_checkpoint_writer));
 	test_recovery_checkpoint_writer.ref = test_checkpoint_prefix_ref;
 	test_recovery_checkpoint_writer.epoch = test_epoch;
 	test_recovery_checkpoint_writer.startup_first_lsn = lower;
 	test_checkpoint_x_hook = test_checkpoint_published_hook = NULL;
 	return lower;
+}
+
+/* RED uses the real ordinary read; GREEN binds the explicit scoped entry.
+ * ROOT/claim/anchor storage is real, shared owner currentness is the leaf.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterControlRootResult
+recovery_online_read(ControlFileData *view)
+{
+	return cluster_control_root_v3_read_recovery_checkpoint_locked(
+		(const struct ClusterRecoveryCheckpointScopeV1 *)&test_recovery_checkpoint_scope_key, view);
+}
+
+UT_TEST(test_recovery_online_reads_selected_anchor_without_sql)
+{
+	for (uint32 state = CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED;
+		 state <= CLUSTER_CONTROL_ROOT_DATABASE_RECOVERING; state++) {
+		uint8 before[66048];
+		ClusterControlRootIdentity self;
+		ClusterControlRootFileToken token;
+		ControlRootImage root;
+		ControlFileData candidate, expected, view;
+
+		(void)recovery_online_fixture(state, before, &self, &candidate);
+		UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(&self, &root, &expected, &token), 0);
+		test_cf_mode = ShareLock;
+		test_checkpoint_outer_cf = true;
+		UT_ASSERT_EQ(recovery_online_read(&view), 0);
+		UT_ASSERT(memcmp(&view, &expected, sizeof(view)) == 0);
+		UT_ASSERT(!test_serving);
+		UT_ASSERT(cluster_control_root_v3_read_runtime_local_locked(&view) != 0);
+		UT_ASSERT(v2_zero(&view, sizeof(view)));
+		v2_assert_primary_unchanged(before);
+	}
+}
+
+UT_TEST(test_recovery_online_read_keeps_identity_fence_and_scope_guards)
+{
+	for (unsigned fault = 0; fault < 15; fault++) {
+		uint8 before[66048];
+		ClusterControlRootIdentity self;
+		ControlFileData candidate, view;
+
+		(void)recovery_online_fixture(CLUSTER_CONTROL_ROOT_DATABASE_RECOVERING, before,
+									  &self, &candidate);
+		test_cf_mode = ShareLock;
+		test_checkpoint_outer_cf = true;
+		switch (fault) {
+		case 0: test_recovery_checkpoint_current = false; break;
+		case 1: test_recovery_checkpoint_writer.epoch++; break;
+		case 2: test_recovery_checkpoint_writer.ref.claim.claim_sha256[0] ^= 1; break;
+		case 3: test_recovery_checkpoint_writer.ref.claim.database_incarnation++; break;
+		case 4: test_recovery_checkpoint_writer.ref.claim.max_config_generation++; break;
+		case 5: test_recovery_checkpoint_writer.ref.timeline++; break;
+		case 6: test_recovery_checkpoint_writer.ref.claim.identity.origin_owner_incarnation++; break;
+		case 7: test_member_state = CLUSTER_MEMBER_DEAD; break;
+		case 8: test_fence = false; break;
+		case 9: MyAuxProcType = NotAnAuxProcess; break;
+		case 10:
+			put_u32_le(before + 196, CLUSTER_CONTROL_ROOT_DATABASE_OPEN);
+			v2_checksums(before);
+			v2_write_roots(before);
+			break;
+		case 11:
+			put_u64_le(before + 232, UINT64_C(1) << cluster_node_id);
+			v2_checksums(before);
+			v2_write_roots(before);
+			break;
+		case 12: test_cf_clusterwide = false; break;
+		case 13: test_recovery_checkpoint_revoke_at = 2; break;
+		case 14: test_recovery_checkpoint_revoke_at = 3; break;
+		}
+		memset(&view, 0xa5, sizeof(view));
+		UT_ASSERT(recovery_online_read(&view) != 0);
+		UT_ASSERT(v2_zero(&view, sizeof(view)));
+		v2_assert_primary_unchanged(before);
+	}
 }
 
 static ClusterControlRootResult
@@ -23973,6 +24052,15 @@ main(int argc, char **argv)
 	if (argc > 1)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_RECOVERY_READ") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_recovery_online_reads_selected_anchor_without_sql);
+		UT_RUN(test_recovery_online_read_keeps_identity_fence_and_scope_guards);
+		UT_RUN(test_v3_runtime_pending_is_not_stale_or_a_usable_view);
+		UT_RUN(test_v3_runtime_retention_and_canonical_use_exact_new_root);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_RECOVERY_ONLINE") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_recovery_online_publishes_without_opening_sql);
@@ -24162,7 +24250,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(473);
+	UT_PLAN(475);
 	UT_RUN(test_cold_sync_retained_files_under_original_owner_without_cf);
 	UT_RUN(test_cold_sync_each_io_failure_root_race_and_error_discard_output);
 	UT_RUN(test_cold_sync_requires_exact_root_fsync_role_and_disjoint_output);
@@ -24359,6 +24447,8 @@ main(int argc, char **argv)
 	UT_RUN(test_v3_self_seal_keeps_dual_range_until_tail_is_sealed);
 	UT_RUN(test_v3_self_seal_rechecks_evidence_wal_and_root_under_cf_x);
 	UT_RUN(test_v3_checkpoint_publish_preserves_pending_and_real_wal_guards);
+	UT_RUN(test_recovery_online_reads_selected_anchor_without_sql);
+	UT_RUN(test_recovery_online_read_keeps_identity_fence_and_scope_guards);
 	UT_RUN(test_recovery_online_publishes_without_opening_sql);
 	UT_RUN(test_recovery_online_preserves_independent_owner_and_storage_guards);
 	UT_RUN(test_recovery_online_rechecks_scope_across_publication);

@@ -2474,7 +2474,38 @@ runtime_v2_owner_check(uint64 epoch, uint64 incarnation, bool admitted)
 }
 
 static ClusterControlRootResult
-read_runtime_local_version(ControlFileData *out, uint16 version)
+runtime_recovery_checkpoint_owner_check(
+	uint64 epoch, uint64 incarnation, const struct ClusterRecoveryCheckpointScopeV1 *scope,
+	const ClusterWalWriterToken *writer)
+{
+	ClusterWalWriterToken observed;
+
+	/* The original recovered owner replaces only SQL serving. Keep the
+	 * ordinary reader's independent identity, membership and fence checks.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (!AmCheckpointerProcess() || !cluster_shared_config || !cluster_enabled
+		|| !cluster_controlfile_shared_authority || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES || epoch == 0 || incarnation == 0
+		|| cluster_qvotec_get_self_incarnation() != incarnation
+		|| cluster_membership_get_state(cluster_node_id) != CLUSTER_MEMBER_MEMBER
+		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id) != incarnation
+		|| !cluster_wal_thread_dir_validated()
+		|| cluster_wal_thread_id() != (uint16)(cluster_node_id + 1)
+		|| cluster_reconfig_has_pending_prebump_stage() || !cluster_write_fence_allowed()
+		|| scope == NULL || writer == NULL
+		|| !cluster_recovery_checkpoint_current_v1(scope, &observed)
+		|| memcmp(&observed, writer, sizeof(observed)) != 0 || observed.epoch != epoch
+		|| observed.ref.claim.identity.origin_node_id != cluster_node_id
+		|| observed.ref.claim.identity.origin_thread_id != (uint16)(cluster_node_id + 1)
+		|| observed.ref.claim.identity.origin_owner_incarnation != incarnation
+		|| observed.ref.timeline == 0 || cluster_epoch_get_current() != epoch)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static ClusterControlRootResult
+read_runtime_local_version(ControlFileData *out, uint16 version,
+						   const struct ClusterRecoveryCheckpointScopeV1 *recovery_scope)
 {
 	ControlRootImage *root;
 	ControlFileData common, thread;
@@ -2482,6 +2513,7 @@ read_runtime_local_version(ControlFileData *out, uint16 version)
 	ClusterControlRootFileToken token;
 	ClusterControlRootResult result;
 	ClusterControlRootResult owner_result;
+	ClusterWalWriterToken recovery_writer;
 	uint8 storage_uuid[16];
 	uint64 epoch, incarnation, sysid;
 	int node;
@@ -2498,7 +2530,14 @@ read_runtime_local_version(ControlFileData *out, uint16 version)
 	node = cluster_node_id;
 	epoch = cluster_epoch_get_current();
 	incarnation = cluster_qvotec_get_self_incarnation();
-	result = runtime_v2_owner_check(epoch, incarnation, false);
+	if (recovery_scope != NULL) {
+		if (version != CONTROL_ROOT_HEADER_VERSION_V3
+			|| !cluster_recovery_checkpoint_current_v1(recovery_scope, &recovery_writer))
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		result = runtime_recovery_checkpoint_owner_check(epoch, incarnation, recovery_scope,
+														 &recovery_writer);
+	} else
+		result = runtime_v2_owner_check(epoch, incarnation, false);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (!current_storage_uuid(storage_uuid))
@@ -2513,9 +2552,28 @@ read_runtime_local_version(ControlFileData *out, uint16 version)
 		goto done;
 	if (!root->present[node]
 		|| root->header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
-		|| root->header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_OPEN
-		|| root->records[node].lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
-		|| (root->header.v2.serving[node / 64] & (UINT64_C(1) << (node % 64))) == 0) {
+		|| root->records[node].lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN) {
+		result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+		goto done;
+	}
+	if (recovery_scope != NULL) {
+		if ((root->header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED
+			 && root->header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_RECOVERING)
+			|| (root->header.v2.serving[node / 64] & (UINT64_C(1) << (node % 64))) != 0) {
+			result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+			goto done;
+		}
+		if (!cluster_control_root_identity_equal(&root->records[node].identity,
+												   &recovery_writer.ref.claim.identity)
+			|| root->records[node].checkpoint_tli != recovery_writer.ref.timeline
+			|| root->header.v2.database_incarnation != recovery_writer.ref.claim.database_incarnation
+			|| root->header.v2.config_generation != recovery_writer.ref.claim.max_config_generation
+			|| memcmp(root->refs[node].claim_sha256, recovery_writer.ref.claim.claim_sha256, 32) != 0) {
+			result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+			goto done;
+		}
+	} else if (root->header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_OPEN
+			   || (root->header.v2.serving[node / 64] & (UINT64_C(1) << (node % 64))) == 0) {
 		result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
 		goto done;
 	}
@@ -2531,7 +2589,10 @@ read_runtime_local_version(ControlFileData *out, uint16 version)
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		goto done;
-	owner_result = runtime_v2_owner_check(epoch, incarnation, false);
+	owner_result = recovery_scope != NULL
+					   ? runtime_recovery_checkpoint_owner_check(epoch, incarnation, recovery_scope,
+																 &recovery_writer)
+					   : runtime_v2_owner_check(epoch, incarnation, false);
 	if (owner_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		result = owner_result;
 		goto done;
@@ -2545,7 +2606,7 @@ done:
 ClusterControlRootResult
 cluster_control_root_v2_read_runtime_local_locked(ControlFileData *out)
 {
-	return read_runtime_local_version(out, CONTROL_ROOT_HEADER_VERSION_V2);
+	return read_runtime_local_version(out, CONTROL_ROOT_HEADER_VERSION_V2, NULL);
 }
 
 /*
@@ -3430,7 +3491,19 @@ cluster_control_root_v2_stop_phase_read(uint16 thread, uint64 admitted_incarnati
 ClusterControlRootResult
 cluster_control_root_v3_read_runtime_local_locked(ControlFileData *out)
 {
-	return read_runtime_local_version(out, CONTROL_ROOT_HEADER_VERSION_V3);
+	return read_runtime_local_version(out, CONTROL_ROOT_HEADER_VERSION_V3, NULL);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_read_recovery_checkpoint_locked(
+	const struct ClusterRecoveryCheckpointScopeV1 *scope, ControlFileData *out)
+{
+	if (scope == NULL) {
+		if (out != NULL)
+			memset(out, 0, sizeof(*out));
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	}
+	return read_runtime_local_version(out, CONTROL_ROOT_HEADER_VERSION_V3, scope);
 }
 
 ClusterControlRootResult

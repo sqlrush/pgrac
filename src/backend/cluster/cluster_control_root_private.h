@@ -577,6 +577,9 @@ extern ClusterControlRootResult cluster_control_root_v3_checkpoint_publish(
  * common MOUNTED/RECOVERING and local serving=0; not CLEAN/first creation,
  * shutdown, C0 execution or semantic OPEN authority. Caller owns the scope. */
 struct ClusterRecoveryCheckpointScopeV1;
+/* Borrowed CF-S/X and exact recovered owner; never an ordinary serving read. */
+extern ClusterControlRootResult cluster_control_root_v3_read_recovery_checkpoint_locked(
+	const struct ClusterRecoveryCheckpointScopeV1 *scope, ControlFileData *out);
 extern ClusterControlRootResult cluster_control_root_v3_recovery_checkpoint_publish(
 	const struct ClusterRecoveryCheckpointScopeV1 *scope, const ClusterControlRootIdentity *self,
 	const ControlFileData *thread_control, XLogRecPtr checkpoint_end,
