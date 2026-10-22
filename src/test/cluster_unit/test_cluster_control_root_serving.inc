@@ -14,6 +14,17 @@ static ClusterRecoveryCheckpointObservationV1 serving_recovery_owner;
 static unsigned serving_recovery_reads, serving_recovery_change_at, serving_recovery_fault;
 static ClusterNormalStartState serving_normal_start_state = CLUSTER_NORMAL_START_UNCLASSIFIED;
 
+static void
+test_recovered_checkpoint_owner_fixture(const ClusterWalSourceRef *ref, uint64 epoch)
+{
+	memset(&serving_recovery_owner, 0, sizeof(serving_recovery_owner));
+	serving_recovery_owner.slot_generation = 4;
+	serving_recovery_owner.owner.writer.ref = *ref;
+	serving_recovery_owner.owner.writer.epoch = epoch;
+	serving_recovery_owner.owner.owner_boot = cluster_qvotec_get_self_incarnation();
+	serving_recovery_observed = true;
+}
+
 ClusterNormalStartState
 cluster_semantic_normal_start_state(void)
 {

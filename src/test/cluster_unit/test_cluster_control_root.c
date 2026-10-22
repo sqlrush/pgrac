@@ -136,6 +136,8 @@ volatile sig_atomic_t InterruptPending;
 static TimeLineID test_flush_tli;
 static void (*test_checkpoint_x_hook)(void);
 static void (*test_checkpoint_published_hook)(void);
+static void test_recovered_checkpoint_owner_fixture(const ClusterWalSourceRef *ref,
+																			 uint64 epoch);
 static int test_recovery_checkpoint_scope_key;
 static bool test_recovery_checkpoint_current;
 static unsigned test_recovery_checkpoint_reads, test_recovery_checkpoint_revoke_at;
@@ -646,6 +648,7 @@ static int test_walr_end_calls = 0;
 static bool test_walr_sealed_required;
 static bool test_walr_sealed_current = true;
 static bool test_walr_recovered_strict, test_walr_owner_active;
+static uint64 test_recovered_writer_epoch;
 static bool test_walr_set_partial_failure, test_walr_set_stale_after_primary;
 static uint16 test_walr_set_count;
 static ClusterControlRootReadToken test_walr_set_roots[CLUSTER_MAX_NODES];
@@ -1907,6 +1910,7 @@ wipe_root_files(void)
 	test_walr_sealed_required = false;
 	test_walr_sealed_current = true;
 	test_walr_recovered_strict = test_walr_owner_active = false;
+	test_recovered_writer_epoch = 0;
 	test_walr_set_partial_failure = test_walr_set_stale_after_primary = false;
 	test_walr_set_count = 0;
 	test_walr_set_calls = test_walr_set_current_calls = test_walr_end_order = 0;
@@ -6486,6 +6490,15 @@ cluster_wal_thread_initialized_writer_matches(const ClusterWalSourceRef *expecte
 		   && memcmp(expected, &current, sizeof(current)) == 0;
 }
 
+bool
+cluster_wal_thread_recovered_writer_matches(const ClusterWalSourceRef *expected, uint64 epoch)
+{
+	ClusterWalSourceRef current;
+	return expected != NULL && epoch != 0 && test_recovered_writer_epoch == epoch
+		   && cluster_wal_thread_current_v2_ref(&current)
+		   && memcmp(expected, &current, sizeof(current)) == 0;
+}
+
 static void v2_checkpoint_append_noop(void);
 
 static void
@@ -8966,7 +8979,12 @@ v3_recovered_reserve_fixture(uint8 before[66048], ControlRootImage *root,
 															 expected),
 				 0);
 	test_cf_mode = test_actual_cf = NoLock;
+	test_checkpoint_prefix_ref.claim.identity.origin_node_id = cluster_node_id;
+	test_checkpoint_prefix_ref.claim.identity.origin_thread_id = cluster_node_id + 1;
+	test_checkpoint_prefix_ref.claim.identity.origin_owner_incarnation = test_self_incarnation;
+	test_recovered_writer_epoch = test_epoch;
 	test_walr_recovered_strict = true;
+	test_recovered_checkpoint_owner_fixture(&test_checkpoint_prefix_ref, test_epoch);
 }
 
 static void
@@ -9039,6 +9057,25 @@ UT_TEST(test_recovered_reserve_mixed_roster_uses_actual_checkpoint)
 UT_TEST(test_recovered_reserve_all_complete_without_clean_exit_ack)
 {
 	v3_recovered_reserve_success(true);
+}
+
+UT_TEST(test_recovered_reserve_requires_published_writer_observation)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	ClusterControlRootIdentity self;
+	ClusterControlRootFileToken expected;
+	ClusterControlRootFileToken token;
+
+	v3_recovered_reserve_fixture(before, &root, &self, &expected, true);
+	if (ut_current_failed)
+		return;
+
+	test_recovered_writer_epoch = 0;
+	memset(&token, 0xa5, sizeof(token));
+	UT_ASSERT_NE(cluster_control_root_v3_reserve_recovered(&self, &expected, &token), 0);
+	UT_ASSERT(v2_zero(&token, sizeof(token)));
+	v2_assert_primary_unchanged(before);
 }
 
 static void
@@ -24793,10 +24830,11 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_RECOVERED_RESERVE") != NULL) {
-		UT_PLAN(8);
+		UT_PLAN(9);
 		UT_RUN(test_v3_reserve_clean_publishes_all_sparse_targets_without_serving);
 		UT_RUN(test_recovered_reserve_mixed_roster_uses_actual_checkpoint);
 		UT_RUN(test_recovered_reserve_all_complete_without_clean_exit_ack);
+		UT_RUN(test_recovered_reserve_requires_published_writer_observation);
 		UT_RUN(test_recovered_reserve_releases_partial_cohort_once);
 		UT_RUN(test_recovered_reserve_refuses_cohort_loss_before_cas);
 		UT_RUN(test_recovered_reserve_withholds_token_after_published_cut_loss);
@@ -25007,7 +25045,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(475);
+	UT_PLAN(476);
 	UT_RUN(test_cold_sync_retained_files_under_original_owner_without_cf);
 	UT_RUN(test_cold_sync_each_io_failure_root_race_and_error_discard_output);
 	UT_RUN(test_cold_sync_requires_exact_root_fsync_role_and_disjoint_output);

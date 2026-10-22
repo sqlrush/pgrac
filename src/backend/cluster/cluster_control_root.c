@@ -5861,6 +5861,21 @@ startup_complete_formation(const ControlRootImage *root,
 						   == root->records[node].identity.origin_owner_incarnation)))
 			return false;
 	}
+	if (kind == CLUSTER_WAL_STARTUP_RECOVERED) {
+		ClusterRecoveryCheckpointObservationV1 observed;
+
+		if (!cluster_recovery_checkpoint_observe_v1(&observed)
+			|| observed.slot_generation == 0 || observed.slot_generation == UINT64_MAX
+			|| observed.owner.owner_boot != cluster_qvotec_get_self_incarnation()
+			|| observed.owner.writer.epoch != formation->local_epoch
+			|| observed.owner.writer.ref.claim.identity.origin_node_id != cluster_node_id
+			|| observed.owner.writer.ref.claim.identity.origin_thread_id != cluster_node_id + 1
+			|| observed.owner.writer.ref.claim.identity.origin_owner_incarnation
+			   != observed.owner.owner_boot
+			|| !cluster_wal_thread_recovered_writer_matches(&observed.owner.writer.ref,
+													   observed.owner.writer.epoch))
+			return false;
+	}
 	return startup_owner_for_input(root->header.system_identifier, formation->local_epoch,
 								   cluster_qvotec_get_self_incarnation(),
 								   root->header.v2.configured, kind);
