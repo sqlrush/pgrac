@@ -4645,10 +4645,311 @@ UT_TEST(data_inventory_unaligned_output_inputs_and_aliases)
 	UT_ASSERT(storage[0] == 0xa5 && storage[sizeof(storage) - 1] == 0xa5);
 }
 
+
+/* Independent Python struct.pack golden: three original source indexes, three
+ * effect IDs; both source and ordinal ordering differ from native numeric sort. */
+static const uint8 owner_key_golden[258] = {
+	0x07, 0x00, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0x77,
+	0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x63, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x01, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x05, 0x00, 0x09, 0x00, 0x02, 0x01, 0x40, 0x00, 0x03, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+	0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x01, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x3a, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3a, 0x00, 0x00, 0x00,
+	0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99,
+	0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99,
+	0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x09, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03,
+	0x02, 0x01, 0x08, 0x27, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x65, 0x01,
+	0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+	0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
+	0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x02, 0x00,
+	0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x08, 0x07, 0x06, 0x05,
+	0x04, 0x03, 0x02, 0x01, 0x08, 0x27, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+	0x65, 0x01, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+	0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14,
+	0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+	0x02, 0x00, 0x01, 0x00, 0x00, 0x00,
+};
+
+typedef struct OwnerKeyFixture {
+	ClusterRecoveryCTRCOwnerScopeV2 scope;
+	uint32 sources[3];
+	ClusterRecoveryCTRCOwnerEffectV2 effects[3];
+} OwnerKeyFixture;
+
+static void
+owner_key_fixture(OwnerKeyFixture *f)
+{
+	memset(f, 0, sizeof(*f));
+	f->scope.transaction = (ClusterRecoveryTxnKey){
+		.system_identifier = SYSTEM_ID, .database_incarnation = 99,
+		.origin_node_id = 1, .segment_id = 257, .segment_generation = 0,
+		.slot_offset = 5, .slot_wrap = 9, .xid = 0x400102
+	};
+	f->scope.owner_family = 7;
+	f->scope.source_indexes = f->sources;
+	f->scope.source_count = lengthof(f->sources);
+	f->scope.effects = f->effects;
+	f->scope.effect_count = lengthof(f->effects);
+	f->sources[0] = 1; f->sources[1] = 256; f->sources[2] = 65536;
+	f->effects[0].record = (ClusterRecoveryCTRCReferenceV2){
+		.source_index = 1, .start = UINT64_C(0x0102030405060708),
+		.end = UINT64_C(0x0102030405062708), .raw_length = 357
+	};
+	for (unsigned i = 0; i < 32; i++)
+		f->effects[0].record.raw_record_sha256[i] = i + 1;
+	f->effects[0].component_kind = 2;
+	f->effects[0].component_ordinal = 1;
+	f->effects[1] = f->effects[0];
+	f->effects[1].component_ordinal = 256;
+	f->effects[2].record = (ClusterRecoveryCTRCReferenceV2){
+		.source_index = 65536, .start = 8192, .end = 8250, .raw_length = 58
+	};
+	memset(f->effects[2].record.raw_record_sha256, 0x99, 32);
+	f->effects[2].component_kind = 9;
+}
+
+static bool
+owner_key_refused(const ClusterRecoveryCTRCOwnerScopeV2 *scope, size_t length)
+{
+	uint8 out[260];
+
+	memset(out, 0xa5, sizeof(out));
+	return !cluster_recovery_ctrc_owner_key_v2(scope, out + 1, length)
+		&& all_zero(out + 1, Min(length, (size_t)60)) && out[0] == 0xa5
+		&& out[Min(length, (size_t)60) + 1] == 0xa5 && graph_alloc_live == 0;
+}
+
+UT_TEST(owner_key_independent_golden_and_immutable)
+{
+	OwnerKeyFixture f, saved;
+	uint8 out[258];
+
+	owner_key_fixture(&f);
+	memcpy(&saved, &f, sizeof(f));
+	UT_ASSERT(cluster_recovery_ctrc_owner_key_v2(&f.scope, out, sizeof(out)));
+	UT_ASSERT(memcmp(out, owner_key_golden, sizeof(out)) == 0);
+	UT_ASSERT(memcmp(&f, &saved, sizeof(f)) == 0 && graph_alloc_live == 0);
+}
+
+UT_TEST(owner_key_complete_encoded_byte_sort)
+{
+	static const unsigned permutations[6][3] = {
+		{0,1,2}, {0,2,1}, {1,0,2}, {1,2,0}, {2,0,1}, {2,1,0}
+	};
+	OwnerKeyFixture original, f;
+	uint8 out[258];
+
+	owner_key_fixture(&original);
+	for (unsigned i = 0; i < 6; i++) {
+		for (unsigned j = 0; j < 6; j++) {
+			owner_key_fixture(&f);
+			for (unsigned k = 0; k < 3; k++) {
+				f.sources[k] = original.sources[permutations[i][k]];
+				f.effects[k] = original.effects[permutations[j][k]];
+			}
+			UT_ASSERT(cluster_recovery_ctrc_owner_key_v2(&f.scope, out, sizeof(out)));
+			UT_ASSERT(memcmp(out, owner_key_golden, sizeof(out)) == 0);
+		}
+	}
+}
+
+UT_TEST(owner_key_duplicates_need_original_owner_proof)
+{
+	OwnerKeyFixture f;
+
+	for (unsigned i = 0; i < 3; i++) {
+		owner_key_fixture(&f);
+		f.sources[(i + 1) % 3] = f.sources[i];
+		UT_ASSERT(owner_key_refused(&f.scope, 258));
+		owner_key_fixture(&f);
+		f.effects[(i + 1) % 3] = f.effects[i];
+		UT_ASSERT(owner_key_refused(&f.scope, 258));
+	}
+}
+
+UT_TEST(owner_key_reference_domains_and_membership)
+{
+	OwnerKeyFixture f;
+
+	for (unsigned change = 0; change < 9; change++) {
+		ClusterRecoveryCTRCReferenceV2 *r;
+
+		owner_key_fixture(&f);
+		r = &f.effects[2].record; /* reject a late candidate atomically */
+		switch (change) {
+		case 0: r->source_index = 257; break;
+		case 1: r->start = InvalidXLogRecPtr; break;
+		case 2: r->end = r->start; break;
+		case 3: r->end = r->start - 1; break;
+		case 4: r->end = r->start + r->raw_length - 1; break;
+		case 5: r->raw_length = SizeOfXLogRecord - 1; break;
+		case 6: r->raw_length = XLogRecordMaxSize + 1; break;
+		case 7: memset(r->raw_record_sha256, 0, 32); break;
+		case 8: f.scope.source_count = 0; break;
+		}
+		UT_ASSERT(owner_key_refused(&f.scope, change == 8 ? 246 : 258));
+	}
+}
+
+UT_TEST(owner_key_native_identity_and_frozen_families)
+{
+	OwnerKeyFixture f;
+	uint8 out[258];
+
+	for (unsigned family = 1; family <= 14; family++) {
+		owner_key_fixture(&f);
+		f.scope.owner_family = family;
+		UT_ASSERT(cluster_recovery_ctrc_owner_key_v2(&f.scope, out, sizeof(out)));
+		UT_ASSERT(out[0] == family && out[1] == 0);
+		UT_ASSERT(memcmp(out + 2, owner_key_golden + 2, sizeof(out) - 2) == 0);
+	}
+	for (unsigned change = 0; change < 11; change++) {
+		ClusterRecoveryTxnKey *t;
+
+		owner_key_fixture(&f);
+		t = &f.scope.transaction;
+		switch (change) {
+		case 0: f.scope.owner_family = 0; break;
+		case 1: f.scope.owner_family = 15; break;
+		case 2: t->system_identifier = 0; break;
+		case 3: t->database_incarnation = 0; break;
+		case 4: t->origin_node_id = SCN_MAX_VALID_NODE_ID + 1; break;
+		case 5: t->segment_id = 0; break;
+		case 6: t->segment_id = 1; break;
+		case 7: t->segment_generation = UINT32_MAX; break;
+		case 8: t->slot_offset = TT_SLOTS_PER_SEGMENT; break;
+		case 9: t->slot_wrap = TT_WRAP_INVALID; break;
+		case 10: t->xid = FrozenTransactionId; break;
+		}
+		UT_ASSERT(owner_key_refused(&f.scope, 258));
+	}
+}
+
+UT_TEST(owner_key_empty_base_lists_do_not_invent_records)
+{
+	OwnerKeyFixture f;
+	uint8 out[72];
+
+	owner_key_fixture(&f);
+	f.scope.effect_count = 0; f.scope.effects = NULL;
+	UT_ASSERT(cluster_recovery_ctrc_owner_key_v2(&f.scope, out, sizeof(out)));
+	UT_ASSERT(memcmp(out + 10, owner_key_golden + 10, 54) == 0);
+	UT_ASSERT(all_zero(out + 64, 8));
+	f.scope.source_count = 0; f.scope.source_indexes = NULL;
+	UT_ASSERT(cluster_recovery_ctrc_owner_key_v2(&f.scope, out, 60));
+	UT_ASSERT(out[2] == 50 && all_zero(out + 44, 16));
+	UT_ASSERT(memcmp(out + 10, owner_key_golden + 10, 34) == 0);
+}
+
+UT_TEST(owner_key_bounds_nulls_and_bounded_clear)
+{
+	OwnerKeyFixture f;
+	uint8 out[258];
+	const size_t bad_lengths[] = { 0, 1, 59, 60, 257, 259, SIZE_MAX };
+
+	owner_key_fixture(&f);
+	UT_ASSERT(!cluster_recovery_ctrc_owner_key_v2(&f.scope, NULL, 258));
+	UT_ASSERT(owner_key_refused(NULL, 258));
+	for (unsigned i = 0; i < lengthof(bad_lengths); i++)
+		UT_ASSERT(owner_key_refused(&f.scope, bad_lengths[i]));
+	f.scope.source_indexes = NULL;
+	UT_ASSERT(owner_key_refused(&f.scope, 258));
+	owner_key_fixture(&f); f.scope.effects = NULL;
+	UT_ASSERT(owner_key_refused(&f.scope, 258));
+	owner_key_fixture(&f); f.scope.source_count = SIZE_MAX;
+	UT_ASSERT(owner_key_refused(&f.scope, 258));
+	owner_key_fixture(&f); f.scope.effect_count = SIZE_MAX;
+	UT_ASSERT(owner_key_refused(&f.scope, 258));
+	owner_key_fixture(&f);
+	UT_ASSERT(cluster_recovery_ctrc_owner_key_v2(&f.scope, out, sizeof(out)));
+}
+
+UT_TEST(owner_key_unaligned_and_input_output_aliases)
+{
+	OwnerKeyFixture f;
+	uint8 scope[sizeof(f.scope) + 1], sources[sizeof(f.sources) + 1];
+	uint8 effects[sizeof(f.effects) + 1], out[260], alias[512];
+
+	owner_key_fixture(&f);
+	memcpy(sources + 1, f.sources, sizeof(f.sources));
+	memcpy(effects + 1, f.effects, sizeof(f.effects));
+	f.scope.source_indexes = (const uint32 *)(sources + 1);
+	f.scope.effects = (const ClusterRecoveryCTRCOwnerEffectV2 *)(effects + 1);
+	memcpy(scope + 1, &f.scope, sizeof(f.scope));
+	memset(out, 0xa5, sizeof(out));
+	UT_ASSERT(cluster_recovery_ctrc_owner_key_v2(
+		(const ClusterRecoveryCTRCOwnerScopeV2 *)(scope + 1), out + 1, 258));
+	UT_ASSERT(memcmp(out + 1, owner_key_golden, 258) == 0);
+	UT_ASSERT(out[0] == 0xa5 && out[259] == 0xa5);
+	for (unsigned which = 0; which < 3; which++) {
+		owner_key_fixture(&f);
+		if (which == 0) {
+			memcpy(alias + 1, &f.scope, sizeof(f.scope));
+			UT_ASSERT(cluster_recovery_ctrc_owner_key_v2(
+				(const ClusterRecoveryCTRCOwnerScopeV2 *)(alias + 1), alias + 1, 258));
+		} else {
+			if (which == 1) {
+				memcpy(alias + 1, f.sources, sizeof(f.sources));
+				f.scope.source_indexes = (const uint32 *)(alias + 1);
+			} else {
+				memcpy(alias + 1, f.effects, sizeof(f.effects));
+				f.scope.effects = (const ClusterRecoveryCTRCOwnerEffectV2 *)(alias + 1);
+			}
+			UT_ASSERT(cluster_recovery_ctrc_owner_key_v2(&f.scope, alias + 1, 258));
+		}
+		UT_ASSERT(memcmp(alias + 1, owner_key_golden, 258) == 0);
+	}
+}
+
+UT_TEST(owner_key_allocation_refusal_frees_scratch)
+{
+	OwnerKeyFixture f;
+	uint8 out[258];
+
+	owner_key_fixture(&f);
+	graph_alloc_calls = 0; graph_alloc_fail_at = 1;
+	UT_ASSERT(owner_key_refused(&f.scope, 258));
+	UT_ASSERT_EQ(graph_alloc_calls, 1);
+	graph_alloc_fail_at = 0;
+	UT_ASSERT(cluster_recovery_ctrc_owner_key_v2(&f.scope, out, sizeof(out)));
+	UT_ASSERT(graph_alloc_live == 0 && memcmp(out, owner_key_golden, 258) == 0);
+}
+
+UT_TEST(owner_key_full_width_fields_are_bound)
+{
+	OwnerKeyFixture f;
+	uint8 out[258];
+
+	for (unsigned change = 0; change < 13; change++) {
+		owner_key_fixture(&f);
+		switch (change) {
+		case 0: f.scope.transaction.system_identifier ^= UINT64_C(1) << 63; break;
+		case 1: f.scope.transaction.database_incarnation ^= UINT64_C(1) << 63; break;
+		case 2: f.scope.transaction.segment_generation = 0xfedcba98; break;
+		case 3: f.scope.transaction.slot_offset = 47; break;
+		case 4: f.scope.transaction.slot_wrap = 0x8000; break;
+		case 5: f.scope.transaction.xid = 0xfffffffe; break;
+		case 6: f.effects[2].record.start += UINT64_C(1) << 63;
+			f.effects[2].record.end += UINT64_C(1) << 63; break;
+		case 7: f.effects[2].record.end++; break;
+		case 8: f.effects[2].record.raw_length--; break;
+		case 9: f.effects[2].record.raw_record_sha256[31] ^= 1; break;
+		case 10: f.effects[2].component_kind = UINT16_MAX; break;
+		case 11: f.effects[2].component_ordinal = UINT32_MAX; break;
+		case 12: f.sources[2] = f.effects[2].record.source_index = UINT32_MAX; break;
+		}
+		UT_ASSERT(cluster_recovery_ctrc_owner_key_v2(&f.scope, out, sizeof(out)));
+		UT_ASSERT(memcmp(out, owner_key_golden, sizeof(out)) != 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(139);
+	UT_PLAN(149);
 	UT_RUN(golden_encoding);
 	UT_RUN(golden_decoding);
 	UT_RUN(unaligned_buffers);
@@ -4789,6 +5090,16 @@ main(void)
 	UT_RUN(graph_unaligned_byte_views_and_output_aliases);
 	UT_RUN(graph_allocation_failures_leave_no_scratch);
 	UT_RUN(graph_full_unsigned_encoded_byte_order);
+	UT_RUN(owner_key_independent_golden_and_immutable);
+	UT_RUN(owner_key_complete_encoded_byte_sort);
+	UT_RUN(owner_key_duplicates_need_original_owner_proof);
+	UT_RUN(owner_key_reference_domains_and_membership);
+	UT_RUN(owner_key_native_identity_and_frozen_families);
+	UT_RUN(owner_key_empty_base_lists_do_not_invent_records);
+	UT_RUN(owner_key_bounds_nulls_and_bounded_clear);
+	UT_RUN(owner_key_unaligned_and_input_output_aliases);
+	UT_RUN(owner_key_allocation_refusal_frees_scratch);
+	UT_RUN(owner_key_full_width_fields_are_bound);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

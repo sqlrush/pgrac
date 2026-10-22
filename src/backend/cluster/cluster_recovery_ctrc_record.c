@@ -1194,4 +1194,109 @@ cluster_recovery_ctrc_decode_v2(const uint8 *bytes, size_t length, uint64 system
 	*out = value;
 	return true;
 }
+static int
+ctrc_owner_source_cmp(const void *a, const void *b)
+{
+	return memcmp(a, b, 4);
+}
+
+static int
+ctrc_owner_effect_cmp(const void *a, const void *b)
+{
+	return memcmp(a, b, 62);
+}
+
+bool
+cluster_recovery_ctrc_owner_key_v2(const ClusterRecoveryCTRCOwnerScopeV2 *scope,
+	uint8 *out, size_t out_length)
+{
+	ClusterRecoveryCTRCOwnerScopeV2 value;
+	const ClusterRecoveryTxnKey *key;
+	uint8 *scratch = NULL;
+	uint8 *sources, *effects;
+	size_t length = 60;
+
+	if (scope == NULL || out == NULL)
+		goto refused;
+	/* Logical containers may be unaligned or overlap the final output. */
+	memcpy(&value, scope, sizeof(value));
+	key = &value.transaction;
+	if (value.owner_family < 1 || value.owner_family > 14
+		|| key->system_identifier == 0 || key->database_incarnation == 0
+		|| key->origin_node_id > SCN_MAX_VALID_NODE_ID || key->segment_id == 0
+		|| (key->segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE != key->origin_node_id
+		|| key->segment_generation == UINT32_MAX || key->slot_offset >= TT_SLOTS_PER_SEGMENT
+		|| key->slot_wrap == TT_WRAP_INVALID || !TransactionIdIsNormal(key->xid)
+		|| (value.source_count != 0 && value.source_indexes == NULL)
+		|| (value.effect_count != 0 && value.effects == NULL)
+		|| value.source_count > MaxAllocSize / sizeof(uint32)
+		|| value.effect_count > MaxAllocSize / sizeof(ClusterRecoveryCTRCOwnerEffectV2)
+		|| !ctrc_graph_size_add(&length, value.source_count, 4)
+		|| !ctrc_graph_size_add(&length, value.effect_count, 62) || out_length != length)
+		goto refused;
+	scratch = palloc_extended(length, MCXT_ALLOC_NO_OOM);
+	if (scratch == NULL)
+		goto refused;
+	cluster_undo_tt_ctrc_put_u16_le(scratch, value.owner_family);
+	cluster_undo_tt_ctrc_put_u64_le(scratch + 2, length - 10);
+	cluster_undo_tt_ctrc_put_u64_le(scratch + 10, key->system_identifier);
+	cluster_undo_tt_ctrc_put_u64_le(scratch + 18, key->database_incarnation);
+	cluster_undo_tt_ctrc_put_u16_le(scratch + 26, key->origin_node_id);
+	cluster_undo_tt_ctrc_put_u32_le(scratch + 28, key->segment_id);
+	cluster_undo_tt_ctrc_put_u32_le(scratch + 32, key->segment_generation);
+	cluster_undo_tt_ctrc_put_u16_le(scratch + 36, key->slot_offset);
+	cluster_undo_tt_ctrc_put_u16_le(scratch + 38, key->slot_wrap);
+	cluster_undo_tt_ctrc_put_u32_le(scratch + 40, key->xid);
+	cluster_undo_tt_ctrc_put_u64_le(scratch + 44, value.source_count);
+	sources = scratch + 52;
+	for (size_t i = 0; i < value.source_count; i++) {
+		uint32 source;
+
+		memcpy(&source, (const uint8 *)value.source_indexes + i * sizeof(source), sizeof(source));
+		cluster_undo_tt_ctrc_put_u32_le(sources + i * 4, source);
+	}
+	qsort(sources, value.source_count, 4, ctrc_owner_source_cmp);
+	for (size_t i = 1; i < value.source_count; i++)
+		if (memcmp(sources + (i - 1) * 4, sources + i * 4, 4) == 0)
+			goto refused;
+	cluster_undo_tt_ctrc_put_u64_le(sources + value.source_count * 4, value.effect_count);
+	effects = sources + value.source_count * 4 + 8;
+	for (size_t i = 0; i < value.effect_count; i++) {
+		ClusterRecoveryCTRCOwnerEffectV2 effect;
+		const ClusterRecoveryCTRCReferenceV2 *record = &effect.record;
+		uint8 *encoded = effects + i * 62;
+
+		memcpy(&effect, (const uint8 *)value.effects + i * sizeof(effect), sizeof(effect));
+		if (record->start == InvalidXLogRecPtr || record->end <= record->start
+			|| record->raw_length < SizeOfXLogRecord || record->raw_length > XLogRecordMaxSize
+			|| record->end - record->start < record->raw_length
+			|| !ctrc_nonzero_digest(record->raw_record_sha256))
+			goto refused;
+		cluster_undo_tt_ctrc_put_u32_le(encoded, record->source_index);
+		if (bsearch(encoded, sources, value.source_count, 4, ctrc_owner_source_cmp) == NULL)
+			goto refused;
+		cluster_undo_tt_ctrc_put_u64_le(encoded + 4, record->start);
+		cluster_undo_tt_ctrc_put_u64_le(encoded + 12, record->end);
+		cluster_undo_tt_ctrc_put_u32_le(encoded + 20, record->raw_length);
+		memcpy(encoded + 24, record->raw_record_sha256, 32);
+		cluster_undo_tt_ctrc_put_u16_le(encoded + 56, effect.component_kind);
+		cluster_undo_tt_ctrc_put_u32_le(encoded + 58, effect.component_ordinal);
+	}
+	qsort(effects, value.effect_count, 62, ctrc_owner_effect_cmp);
+	for (size_t i = 1; i < value.effect_count; i++)
+		if (memcmp(effects + (i - 1) * 62, effects + i * 62, 62) == 0)
+			goto refused;
+	/* No caller output is published before every input has been consumed. */
+	memcpy(out, scratch, length);
+	pfree(scratch);
+	return true;
+
+refused:
+	if (scratch != NULL)
+		pfree(scratch);
+	if (out != NULL)
+		memset(out, 0, Min(out_length, (size_t)60));
+	return false;
+}
+
 #endif

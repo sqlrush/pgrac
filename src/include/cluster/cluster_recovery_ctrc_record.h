@@ -14,6 +14,7 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "access/xlogreader.h"
 #include "cluster/cluster_recovery_namespace.h"
+#include "cluster/cluster_recovery_reference_graph.h"
 
 #define CLUSTER_RECOVERY_CTRC_VERSION UINT16_C(2)
 #define CLUSTER_RECOVERY_CTRC_BYTES 320
@@ -330,6 +331,41 @@ extern bool cluster_recovery_ctrc_record_hash_v2(const uint8 source_identity_dig
 												 XLogRecPtr start, XLogRecPtr end,
 												 const uint8 *raw_record, size_t raw_length,
 												 uint8 out[32]);
+
+/* Logical original-decoder fields, never persistent native struct bytes. */
+typedef struct ClusterRecoveryCTRCOwnerEffectV2 {
+	ClusterRecoveryCTRCReferenceV2 record;
+	uint16 component_kind;
+	uint32 component_ordinal;
+} ClusterRecoveryCTRCOwnerEffectV2;
+
+typedef struct ClusterRecoveryCTRCOwnerScopeV2 {
+	ClusterRecoveryTxnKey transaction;
+	uint16 owner_family; /* frozen matrix row 1..14, not a source enum */
+	const uint32 *source_indexes; /* original complete input/ROOT ordering */
+	size_t source_count;
+	const ClusterRecoveryCTRCOwnerEffectV2 *effects;
+	size_t effect_count;
+} ClusterRecoveryCTRCOwnerScopeV2;
+
+/* Encode only kind2.key = U16(owner_family)||B(scope), where scope is
+ * T34||U64(source_count)||sorted(U32 sources)||U64(effect_count)||sorted(
+ * R56||U16(component_kind)||U32(component_ordinal)). Exact out_length is
+ * 60 + 4*source_count + 62*effect_count, bounded by MaxAllocSize. Sort complete
+ * unsigned encoded bytes; reject duplicate sources/effect IDs and effects
+ * outside the supplied sources. R fields receive only structural checks.
+ * Component kinds/ordinals, complete effect/input coverage and lawful overlap
+ * remain the original decoder/owner's responsibility. Empty effects do not
+ * prove a qualified base or no effect. No evidence/completion verification,
+ * source/ROOT/owner qualification, graph admission, I/O, release or live caller.
+ *
+ * Outside critical sections/spinlocks. One bounded NO_OOM scratch allocation;
+ * allocation failure refuses. Inputs are immutable during the call, may be
+ * unaligned, and may overlap out: consume before publication. On refusal clear
+ * min(out_length,60) bytes if out is non-NULL; no partial encoded tail is ever
+ * published. The caller supplies valid storage for every declared input. */
+extern bool cluster_recovery_ctrc_owner_key_v2(const ClusterRecoveryCTRCOwnerScopeV2 *scope,
+	uint8 *out, size_t out_length);
 
 /* Immutable canonical bytes supplied by the original graph producers. */
 typedef struct ClusterRecoveryCTRCGraphBytesV2 {
