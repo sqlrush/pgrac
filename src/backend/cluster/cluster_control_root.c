@@ -6953,11 +6953,33 @@ typedef enum StartupTargetAction {
 	STARTUP_TARGET_ROUTE
 } StartupTargetAction;
 
+/* One reservation binds every pending to the same predecessor ROOT. A
+ * recovered cohort may contain both original COMPLETE and CLOSED inputs;
+ * their common evidence digest retains that recovery dependency. Kind4 has
+ * per-origin creator evidence and must remain a distinct initialized cohort. */
+static bool
+startup_same_input_cohort(const ClusterWalStartupImage *selected,
+						 const ClusterWalStartupImage *peer)
+{
+	if (selected->predecessor_file_sequence != peer->predecessor_file_sequence
+		|| memcmp(selected->predecessor_file_sha256, peer->predecessor_file_sha256, 32) != 0)
+		return false;
+	if (selected->input_kind == CLUSTER_WAL_STARTUP_INITIALIZED)
+		return peer->input_kind == CLUSTER_WAL_STARTUP_INITIALIZED;
+	return (selected->input_kind == CLUSTER_WAL_STARTUP_CLEAN
+			|| selected->input_kind == CLUSTER_WAL_STARTUP_RECOVERED)
+		&& (peer->input_kind == CLUSTER_WAL_STARTUP_CLEAN
+			|| peer->input_kind == CLUSTER_WAL_STARTUP_RECOVERED)
+		&& memcmp(selected->predecessor_evidence_sha256, peer->predecessor_evidence_sha256, 32)
+			   == 0;
+}
+
 /* Every declared target must still have exactly its selected incarnation.
- * A missing member is never an excuse to shrink a clean-start operation. */
+ * A missing member is never an excuse to shrink a startup operation. */
 static ClusterControlRootResult
 startup_operation_formation(const ControlRootImage *root, uint32 phase, bool allow_progress,
-							uint32 kind, ClusterFormationSnapshotV1 *formation)
+							const ClusterWalStartupImage *selected,
+							ClusterFormationSnapshotV1 *formation)
 {
 	if (root->header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
 		|| root->header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED
@@ -6997,15 +7019,14 @@ startup_operation_formation(const ControlRootImage *root, uint32 phase, bool all
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 		if ((op.phase != phase && !(allow_progress && op.phase == CLUSTER_WAL_STARTUP_DURABLE))
-			|| (op.input_kind != CLUSTER_WAL_STARTUP_CLEAN
-				&& op.input_kind != CLUSTER_WAL_STARTUP_INITIALIZED)
-			|| op.input_kind != kind || op.config_generation != root->header.v2.config_generation
+			|| !startup_same_input_cohort(selected, &op)
+			|| op.config_generation != root->header.v2.config_generation
 			|| op.formation_epoch != formation->local_epoch
 			|| op.claim.identity.origin_owner_incarnation
 				   != formation->membership.last_admitted_incarnation[node])
 			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	}
-	if (!startup_complete_formation(root, formation, false, kind))
+	if (!startup_complete_formation(root, formation, false, selected->input_kind))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
@@ -7042,11 +7063,11 @@ startup_prepare_target_locked(StartupTargetWork *work, const ClusterControlRootI
 		if (action != STARTUP_TARGET_PREPARE || work->op.phase != CLUSTER_WAL_STARTUP_INITIALIZING)
 			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		result = startup_operation_formation(&work->base, CLUSTER_WAL_STARTUP_INITIALIZING, true,
-											 work->op.input_kind, &work->formation);
+											 &work->op, &work->formation);
 		return result == CLUSTER_CONTROL_ROOT_OK_PRIMARY ? CLUSTER_CONTROL_ROOT_CAS_CONFLICT
 														 : result;
 	}
-	result = startup_operation_formation(&work->base, phase, writer, work->op.input_kind,
+	result = startup_operation_formation(&work->base, phase, writer, &work->op,
 										 &work->formation);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
@@ -7068,7 +7089,7 @@ startup_prepare_target_locked(StartupTargetWork *work, const ClusterControlRootI
 		return result;
 	if (memcmp(work->observed.bytes, work->base.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
 		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
-	result = startup_operation_formation(&work->observed, phase, writer, work->op.input_kind,
+	result = startup_operation_formation(&work->observed, phase, writer, &work->op,
 										 &formation);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
@@ -7204,7 +7225,7 @@ startup_begin_locked(StartupBeginWork *work, const ClusterControlRootIdentity *s
 		|| !startup_operation_owner(&target->base, &target->op))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = startup_operation_formation(&target->base, CLUSTER_WAL_STARTUP_RESERVED, false,
-										 target->op.input_kind, &target->formation);
+										 &target->op, &target->formation);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (target->base.header.file_txn_seq == UINT64_MAX)
@@ -7222,13 +7243,7 @@ startup_begin_locked(StartupBeginWork *work, const ClusterControlRootIdentity *s
 		result = cluster_wal_startup_read_locked(&target->base, node, op);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
-		if (op->predecessor_file_sequence != target->op.predecessor_file_sequence
-			|| memcmp(op->predecessor_file_sha256, target->op.predecessor_file_sha256, 32) != 0
-			|| op->input_kind != target->op.input_kind
-			|| (op->input_kind == CLUSTER_WAL_STARTUP_CLEAN
-				&& memcmp(op->predecessor_evidence_sha256, target->op.predecessor_evidence_sha256,
-						  32)
-					   != 0))
+		if (!startup_same_input_cohort(&target->op, op))
 			return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 		/* A remote target may have failed after creating readable metadata
 		 * but before its fsync. Reestablish durability ourselves before CAS. */
@@ -7267,7 +7282,7 @@ startup_begin_locked(StartupBeginWork *work, const ClusterControlRootIdentity *s
 	if (!file_token_equal(expected, &token))
 		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
 	result = startup_operation_formation(&target->observed, CLUSTER_WAL_STARTUP_RESERVED, false,
-										 target->op.input_kind, &formation);
+										 &target->op, &formation);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (memcmp(&formation, &target->formation, sizeof(formation)) != 0
@@ -7289,7 +7304,7 @@ startup_begin_locked(StartupBeginWork *work, const ClusterControlRootIdentity *s
 	if (memcmp(target->observed.bytes, work->next.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
 		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
 	result = startup_operation_formation(&target->observed, CLUSTER_WAL_STARTUP_INITIALIZING, false,
-										 target->op.input_kind, &formation);
+										 &target->op, &formation);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (memcmp(&formation, &target->formation, sizeof(formation)) != 0
@@ -7393,7 +7408,7 @@ startup_checkpoint_reobserve(StartupCheckpointWork *work, const ClusterControlRo
 		!= 0)
 		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
 	result = startup_operation_formation(&work->observed, CLUSTER_WAL_STARTUP_INITIALIZING, true,
-										 work->op.input_kind, &formation);
+										 &work->op, &formation);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (memcmp(&formation, &work->formation, sizeof(formation)) != 0
@@ -7439,7 +7454,7 @@ startup_checkpoint_publish(StartupCheckpointWork *work, const ClusterControlRoot
 		|| work->op.segment_size != wal_segment_size || !startup_checkpoint_owner(work, self, end))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = startup_operation_formation(&scan->base, CLUSTER_WAL_STARTUP_INITIALIZING, true,
-										 work->op.input_kind, &work->formation);
+										 &work->op, &work->formation);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	/* Re-read the actual predecessor claim/anchor, not a copy supplied by the
@@ -7878,7 +7893,7 @@ startup_install_publish(StartupInstallWork *work, const ClusterWalStartupImage *
 		|| !startup_checkpoint_owner(check, self, end))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = startup_operation_formation(&scan->base, CLUSTER_WAL_STARTUP_INITIALIZING, true,
-										 check->op.input_kind, &check->formation);
+										 &check->op, &check->formation);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	result = startup_install_history(work, node);

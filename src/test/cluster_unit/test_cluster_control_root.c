@@ -9317,6 +9317,214 @@ v3_driver_restart(const ControlRootImage *root, unsigned node)
 	return ref;
 }
 
+
+/* The existing target/BEGIN consumers must preserve each selected input kind.
+ * Native mutation and the later recovery service gate remain separate. */
+static void
+v3_recovered_begin_fixture(uint8 before[66048], ControlRootImage *root,
+						  ClusterControlRootFileToken *token,
+						  ClusterWalStartupImage ops[2], bool all_recovered)
+{
+	ClusterControlRootIdentity self;
+	ClusterControlRootFileToken expected;
+	ControlFileData common;
+	v3_recovered_reserve_fixture(before, root, &self, &expected, all_recovered);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT_EQ(cluster_control_root_v3_reserve_recovered(&self, &expected, token), 0);
+	if (ut_current_failed)
+		return;
+	/* The reserve-specific rename observer ends with that publication.
+	 * Later BEGIN uses the existing pending/EMPTY-target contract. */
+	UT_ASSERT(!test_walr_owner_active);
+	test_walr_recovered_strict = false;
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID, root,
+															 &common, token), 0);
+	UT_ASSERT_EQ(cluster_wal_startup_read_locked(root, 0, &ops[0]), 0);
+	UT_ASSERT_EQ(cluster_wal_startup_read_locked(root, 3, &ops[1]), 0);
+	test_actual_cf = test_cf_mode = NoLock;
+	memcpy(before, root->bytes, 66048);
+}
+
+static void
+v3_recovered_begin_select(const ClusterWalStartupImage *op)
+{
+	cluster_node_id = op->claim.identity.origin_node_id;
+	test_self_incarnation = test_membership_incarnation
+		= op->claim.identity.origin_owner_incarnation;
+}
+
+static void
+v3_recovered_begin_success(bool all_recovered)
+{
+	uint8 before[66048];
+	ControlRootImage root, selected;
+	ControlFileData common;
+	ClusterControlRootFileToken token, published, actual;
+	ClusterWalStartupImage ops[2], observed;
+	v3_recovered_begin_fixture(before, &root, &token, ops, all_recovered);
+	if (ut_current_failed)
+		goto done;
+	for (unsigned i = 0; i < 2; ++i) {
+		v3_recovered_begin_select(&ops[i]);
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_prepare_target(&ops[i].claim.identity,
+																 ops[i].operation_uuid, &observed), 0);
+		UT_ASSERT(memcmp(&observed, &ops[i], sizeof(observed)) == 0);
+		UT_ASSERT(cluster_control_root_v3_startup_read_writer(&ops[i].claim.identity,
+															ops[i].operation_uuid, &observed) != 0);
+		UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+	}
+	v2_assert_primary_unchanged(before);
+	if (ut_current_failed)
+		goto done;
+	v3_recovered_begin_select(&ops[1]);
+	UT_ASSERT(cluster_control_root_v3_startup_begin_clean(&ops[1].claim.identity,
+														  ops[1].operation_uuid, &token, &published) != 0);
+	UT_ASSERT(v2_zero(&published, sizeof(published)));
+	v3_recovered_begin_select(&ops[0]);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_begin_clean(&ops[0].claim.identity,
+															 ops[0].operation_uuid, &token, &published), 0);
+	if (ut_current_failed)
+		goto done;
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID, &selected,
+															 &common, &actual), 0);
+	test_actual_cf = test_cf_mode = NoLock;
+	UT_ASSERT_EQ(actual.file_txn_seq, root.header.file_txn_seq + 1);
+	UT_ASSERT(memcmp(&published, &actual, sizeof(actual)) == 0);
+	UT_ASSERT_EQ(selected.header.v2.database_state, CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED);
+	UT_ASSERT(v2_zero(selected.header.v2.serving, sizeof(selected.header.v2.serving)));
+	for (unsigned i = 0; i < 2; ++i) {
+		unsigned node = ops[i].claim.identity.origin_node_id;
+		v3_recovered_begin_select(&ops[i]);
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_read_writer(&ops[i].claim.identity,
+																 ops[i].operation_uuid, &observed), 0);
+		UT_ASSERT_EQ(observed.phase, CLUSTER_WAL_STARTUP_INITIALIZING);
+		UT_ASSERT_EQ(observed.input_kind, ops[i].input_kind);
+		UT_ASSERT_EQ(observed.input_record_start, ops[i].input_record_start);
+		UT_ASSERT_EQ(observed.input_record_end, ops[i].input_record_end);
+		UT_ASSERT_EQ(observed.sealed_input_end, ops[i].sealed_input_end);
+		UT_ASSERT(memcmp(&observed.predecessor, &ops[i].predecessor,
+						 sizeof(observed.predecessor)) == 0);
+		UT_ASSERT(memcmp(&selected.records[node], &root.records[node],
+						 sizeof(root.records[node])) == 0);
+		UT_ASSERT(memcmp(&selected.refs[node], &root.refs[node], sizeof(root.refs[node])) == 0);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+	}
+ done:
+	cluster_node_id = 0;
+	test_reserve_mode = false;
+}
+
+UT_TEST(test_recovered_begin_mixed_inputs_keep_their_original_kinds)
+{
+	v3_recovered_begin_success(false);
+}
+
+UT_TEST(test_recovered_begin_all_complete_inputs_are_not_clean_exit)
+{
+	v3_recovered_begin_success(true);
+}
+
+UT_TEST(test_recovered_begin_requires_every_actual_empty_target)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	ClusterControlRootFileToken token, published;
+	ClusterWalStartupImage ops[2], observed;
+	v3_recovered_begin_fixture(before, &root, &token, ops, false);
+	if (ut_current_failed)
+		goto done;
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_prepare_target(&ops[0].claim.identity,
+																 ops[0].operation_uuid, &observed), 0);
+	if (ut_current_failed)
+		goto done;
+	UT_ASSERT(cluster_control_root_v3_startup_begin_clean(&ops[0].claim.identity,
+														  ops[0].operation_uuid, &token, &published) != 0);
+	UT_ASSERT(v2_zero(&published, sizeof(published)));
+	v2_assert_primary_unchanged(before);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+ done:
+	test_reserve_mode = false;
+}
+
+UT_TEST(test_recovered_begin_rejects_an_independently_rebound_peer)
+{
+	for (unsigned fault = 0; fault < 3; ++fault) {
+		uint8 before[66048];
+		ControlRootImage root;
+		ControlFileData common;
+		ClusterControlRootFileToken token, published;
+		ClusterWalStartupImage ops[2], observed, selected;
+		ClusterWalStartupStage stage;
+		v3_recovered_begin_fixture(before, &root, &token, ops, false);
+		if (ut_current_failed)
+			goto done;
+		if (fault == 0)
+			ops[1].predecessor_file_sha256[0] ^= 1;
+		else if (fault == 1)
+			ops[1].predecessor_evidence_sha256[0] ^= 1;
+		else
+			ops[1].formation_epoch++;
+		ops[1].generation = ++root.header.file_txn_seq;
+		test_actual_cf = test_cf_mode = ExclusiveLock;
+		UT_ASSERT_EQ(cluster_wal_startup_prepare(&root, 3, &ops[1], &stage), 0);
+		UT_ASSERT_EQ(cluster_wal_startup_install(&stage), 0);
+		root.startup[3].generation = stage.generation;
+		memcpy(root.startup[3].sha256, stage.sha256, 32);
+		UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+		v2_write_roots(root.bytes);
+		/* Use this ROOT's exact token so BEGIN cannot reject only for CAS. */
+		UT_ASSERT_EQ(cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID, &root,
+															 &common, &token), 0);
+		UT_ASSERT_EQ(cluster_wal_startup_read_locked(&root, 3, &selected), 0);
+		test_actual_cf = test_cf_mode = NoLock;
+		memcpy(before, root.bytes, sizeof(before));
+		if (ut_current_failed)
+			goto done;
+		memset(&observed, 0x79, sizeof(observed));
+		UT_ASSERT(cluster_control_root_v3_startup_prepare_target(&ops[0].claim.identity,
+															 ops[0].operation_uuid, &observed) != 0);
+		UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+		UT_ASSERT(cluster_control_root_v3_startup_begin_clean(&ops[0].claim.identity,
+															ops[0].operation_uuid, &token, &published) != 0);
+		UT_ASSERT(v2_zero(&published, sizeof(published)));
+		v2_assert_primary_unchanged(before);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+ done:
+		test_actual_cf = test_cf_mode = NoLock;
+		test_reserve_mode = false;
+	}
+}
+
+UT_TEST(test_recovered_begin_retains_original_owner_and_fence_guards)
+{
+	for (unsigned fault = 0; fault < 3; ++fault) {
+		uint8 before[66048];
+		ControlRootImage root;
+		ClusterControlRootFileToken token;
+		ClusterWalStartupImage ops[2], observed;
+		v3_recovered_begin_fixture(before, &root, &token, ops, false);
+		if (ut_current_failed)
+			goto done;
+		if (fault == 0)
+			test_fence = false;
+		else if (fault == 1)
+			test_reserve_formation.membership.last_admitted_incarnation[3]++;
+		else
+			MyBackendType = B_BACKEND;
+		memset(&observed, 0x79, sizeof(observed));
+		UT_ASSERT(cluster_control_root_v3_startup_prepare_target(&ops[0].claim.identity,
+															 ops[0].operation_uuid, &observed) != 0);
+		UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+		v2_assert_primary_unchanged(before);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+ done:
+		test_reserve_mode = false;
+	}
+}
+
 #include "test_cluster_control_root_first_start.inc"
 
 UT_TEST(test_v3_native_driver_prepares_sparse_targets_then_returns_initializing)
@@ -24448,6 +24656,18 @@ main(int argc, char **argv)
 	if (argc > 1)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_RECOVERED_BEGIN") != NULL) {
+		UT_PLAN(7);
+		UT_RUN(test_recovered_begin_mixed_inputs_keep_their_original_kinds);
+		UT_RUN(test_recovered_begin_all_complete_inputs_are_not_clean_exit);
+		UT_RUN(test_recovered_begin_requires_every_actual_empty_target);
+		UT_RUN(test_recovered_begin_rejects_an_independently_rebound_peer);
+		UT_RUN(test_recovered_begin_retains_original_owner_and_fence_guards);
+		UT_RUN(test_v3_native_driver_prepares_sparse_targets_then_returns_initializing);
+		UT_RUN(test_v3_begin_requires_all_declared_empty_targets_before_native_mutation);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_RECOVERED_RESERVE") != NULL) {
 		UT_PLAN(8);
 		UT_RUN(test_v3_reserve_clean_publishes_all_sparse_targets_without_serving);

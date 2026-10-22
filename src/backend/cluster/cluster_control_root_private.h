@@ -314,7 +314,9 @@ cluster_control_root_v3_startup_prepare_target(const ClusterControlRootIdentity 
 											   const uint8 operation_uuid[16],
 											   ClusterWalStartupImage *out);
 /* Coordinator StartupProcess: actual all-target EMPTY readback followed by
- * exact root CAS to INITIALIZING. Still not an ordinary writer/serving grant. */
+ * exact root CAS to INITIALIZING. Consumes CLEAN, original INITIALIZED or a
+ * same-reservation RECOVERED/CLEAN cohort without changing any input kind.
+ * Still not an ordinary writer/serving grant. */
 extern ClusterControlRootResult cluster_control_root_v3_startup_begin_clean(
 	const ClusterControlRootIdentity *self, const uint8 operation_uuid[16],
 	const ClusterControlRootFileToken *expected, ClusterControlRootFileToken *out);
