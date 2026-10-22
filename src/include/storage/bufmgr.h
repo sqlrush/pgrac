@@ -286,6 +286,9 @@ extern void MarkBufferDirtyHint(Buffer buffer, bool buffer_std);
 
 extern void UnlockBuffers(void);
 extern void LockBuffer(Buffer buffer, int mode);
+/* Acquire second while first is held only for a normalized, pinned MAIN
+ * heap pair. False leaves second untouched; caller still owns first. */
+extern bool ClusterLockBufferHeapPair(Relation relation, Buffer first, Buffer second);
 
 /*
  * PGRAC Stage-8 R2 D11: evidence-only identities for the seven real

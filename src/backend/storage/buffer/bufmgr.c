@@ -15397,6 +15397,61 @@ LockBuffer(Buffer buffer, int mode)
 	LockBufferInternal(buffer, mode, NULL, NULL, NULL, NULL, NULL);
 }
 
+typedef struct ClusterHeapPairLocks
+{
+	LWLock *first;
+	bool first_exclusive;
+	bool other_content;
+} ClusterHeapPairLocks;
+
+static void
+cluster_heap_pair_held_lock(LWLock *lock, LWLockMode mode, void *context)
+{
+	ClusterHeapPairLocks *held = context;
+
+	if (BufferDescriptorFromContentLock(lock) == NULL)
+		return;
+	if (lock == held->first && mode == LW_EXCLUSIVE)
+		held->first_exclusive = true;
+	else
+		held->other_content = true;
+}
+
+/* This entry admits nested blocking current-acquire only for an ordered heap
+ * pair.  The caller releases/restarts outside this scope, including for
+ * VM/FSM, indexes, other relations/forks, or any third content lock.
+ * Normal LockBuffer still acquires/revalidates PCM before second's content
+ * lock.  Service-side CONTENT_LOCK BUSY must defer rather than wait on first. */
+bool
+ClusterLockBufferHeapPair(Relation relation, Buffer first, Buffer second)
+{
+	BufferDesc *a;
+	BufferDesc *b;
+	ClusterHeapPairLocks held = {0};
+
+	if (relation == NULL || RelationUsesLocalBuffers(relation) ||
+		(relation->rd_rel->relkind != RELKIND_RELATION &&
+		 relation->rd_rel->relkind != RELKIND_MATVIEW &&
+		 relation->rd_rel->relkind != RELKIND_TOASTVALUE) ||
+		first <= 0 || first > NBuffers || second <= 0 || second > NBuffers ||
+		!BufferIsPinnedByMe(first) || !BufferIsPinnedByMe(second))
+		return false;
+	a = GetBufferDescriptor(first - 1);
+	b = GetBufferDescriptor(second - 1);
+	if (!BufTagMatchesRelFileLocator(&a->tag, &relation->rd_locator) ||
+		!BufTagMatchesRelFileLocator(&b->tag, &relation->rd_locator) ||
+		BufTagGetForkNum(&a->tag) != MAIN_FORKNUM ||
+		BufTagGetForkNum(&b->tag) != MAIN_FORKNUM ||
+		a->tag.blockNum >= b->tag.blockNum)
+		return false;
+	held.first = BufferDescriptorGetContentLock(a);
+	ForEachLWLockHeldByMe(cluster_heap_pair_held_lock, &held);
+	if (!held.first_exclusive || held.other_content)
+		return false;
+	LockBuffer(second, BUFFER_LOCK_EXCLUSIVE);
+	return true;
+}
+
 /*
  * PGRAC (t/400 L3 item 3): EXCLUSIVE LockBuffer that reports a nested-guard
  * BARRIER_CLOSED refusal instead of raising a client ERROR.

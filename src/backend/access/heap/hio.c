@@ -115,15 +115,16 @@ cluster_hio_refresh_buffer_pair(Relation relation, Buffer *first, Buffer *second
 	*second = ReadBuffer(relation, second_block);
 }
 
-/* P0-20: never sleep on the second PCM-X conversion with the first content
- * lock held. Ordinary misses resolve the second conversion alone. An invalid
- * KO/current pin sample instead leaves the conditional path and re-enters the
- * blocking current path in block order; retrying the same conditional probe
- * cannot refresh that sample, while a fresh ReadBuffer() could read an image
- * from storage before PCM/GCS has transferred the current copy. */
+/* Try the second lock once.  On a miss, restart in block order using the
+ * narrowly scoped heap-pair blocking acquisition.  Repeated conditional
+ * probes can livelock even when the second lock is resolved between probes.
+ * An invalid KO/current sample must first re-enter the normal current path
+ * with neither content lock held; never refresh it by reading from storage. */
 static void
 cluster_hio_lock_buffer_pair(Relation relation, Buffer *first, Buffer *second)
 {
+	bool pin_invalid;
+
 	Assert(BufferIsValid(*first));
 	Assert(BufferIsValid(*second));
 	Assert(*first != *second);
@@ -137,55 +138,50 @@ cluster_hio_lock_buffer_pair(Relation relation, Buffer *first, Buffer *second)
 	}
 #ifdef USE_PGRAC_CLUSTER
 	cluster_content_trace_pair_begin(*first, *second);
+	cluster_content_trace_pair_cycle();
+	cluster_content_trace_pair_phase(CLPAIR_FIRST);
 #endif
-	for (;;)
+	LockBuffer(*first, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+	cluster_content_trace_pair_phase(CLPAIR_CONDITIONAL_SECOND);
+#endif
+	if (ConditionalLockBufferWithPinCheck(*second, &pin_invalid))
 	{
-		bool pin_invalid;
-
 #ifdef USE_PGRAC_CLUSTER
-		cluster_content_trace_pair_cycle();
-		cluster_content_trace_pair_phase(CLPAIR_FIRST);
-#endif
-		LockBuffer(*first, BUFFER_LOCK_EXCLUSIVE);
-#ifdef USE_PGRAC_CLUSTER
-		cluster_content_trace_pair_phase(CLPAIR_CONDITIONAL_SECOND);
-#endif
-		if (ConditionalLockBufferWithPinCheck(*second, &pin_invalid))
-		{
-#ifdef USE_PGRAC_CLUSTER
-			cluster_content_trace_pair(*second, false);
-			cluster_content_trace_wait_clear(CLCONTENT_PAIR);
-			cluster_content_trace_pair_phase(CLPAIR_DONE);
-			cluster_content_trace_pair_end();
-#endif
-			return;
-		}
-
-#ifdef USE_PGRAC_CLUSTER
-		cluster_content_trace_pair(*second, true);
-#endif
-		LockBuffer(*first, BUFFER_LOCK_UNLOCK);
-		if (pin_invalid)
-		{
-#ifdef USE_PGRAC_CLUSTER
-			cluster_content_trace_wait_clear(CLCONTENT_PAIR);
-			cluster_content_trace_pair_end();
-#endif
-			cluster_hio_refresh_buffer_pair(relation, first, second, true);
-#ifdef USE_PGRAC_CLUSTER
-			cluster_content_trace_pair_begin(*first, *second);
-#endif
-			continue;
-		}
-#ifdef USE_PGRAC_CLUSTER
-		cluster_content_trace_pair_phase(CLPAIR_RESOLVE_SECOND);
-#endif
-		LockBuffer(*second, BUFFER_LOCK_EXCLUSIVE);
-		LockBuffer(*second, BUFFER_LOCK_UNLOCK);
-#ifdef USE_PGRAC_CLUSTER
+		cluster_content_trace_pair(*second, false);
 		cluster_content_trace_wait_clear(CLCONTENT_PAIR);
+		cluster_content_trace_pair_phase(CLPAIR_DONE);
+		cluster_content_trace_pair_end();
 #endif
+		return;
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	cluster_content_trace_pair(*second, true);
+#endif
+	LockBuffer(*first, BUFFER_LOCK_UNLOCK);
+	if (pin_invalid)
+		cluster_hio_refresh_buffer_pair(relation, first, second, true);
+#ifdef USE_PGRAC_CLUSTER
+	cluster_content_trace_pair_phase(CLPAIR_RESOLVE_SECOND);
+#endif
+	LockBuffer(*first, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+	if (RelationUsesLocalBuffers(relation))
+		LockBuffer(*second, BUFFER_LOCK_EXCLUSIVE);
+	else if (!ClusterLockBufferHeapPair(relation, *first, *second))
+	{
+		LockBuffer(*first, BUFFER_LOCK_UNLOCK);
+		elog(ERROR, "heap buffer pair is outside ordered acquisition scope");
+	}
+#else
+	LockBuffer(*second, BUFFER_LOCK_EXCLUSIVE);
+#endif
+#ifdef USE_PGRAC_CLUSTER
+	cluster_content_trace_wait_clear(CLCONTENT_PAIR);
+	cluster_content_trace_pair_phase(CLPAIR_DONE);
+	cluster_content_trace_pair_end();
+#endif
 }
 
 static bool

@@ -18,7 +18,7 @@ static PGAlignedBlock hio_pages[4];
 static int hio_refs[4];
 static bool hio_locks[4];
 static int hio_wait_pin_conflicts, hio_waits, hio_reads, hio_repin_failures;
-static int hio_pair_misses;
+static int hio_pair_misses, hio_pair_probes, hio_ordered_acquires;
 static Buffer hio_heap_buffers[2];
 static bool hio_remap_on_refresh;
 static int hio_data_reads, hio_refresh_error_at, hio_backoffs;
@@ -88,7 +88,9 @@ hio_lock(Buffer buffer, int mode)
 		hio_locks[buffer - 1] = false;
 		return;
 	}
-	UT_ASSERT(!hio_locks[0] && !hio_locks[1]);
+	UT_ASSERT((!hio_locks[0] && !hio_locks[1]) ||
+			  (RelationUsesLocalBuffers(&relation_data) && buffer == 2 &&
+			   hio_locks[0] && !hio_locks[1]));
 	hio_waits++;
 	if (hio_enforce_wait_order && hio_refs[2] + hio_refs[3] != 0) {
 		hio_wait_pin_conflicts++;
@@ -108,6 +110,7 @@ hio_lock(Buffer buffer, int mode)
 static bool
 hio_conditional(Buffer buffer)
 {
+	hio_pair_probes++;
 	if (hio_stale_pin) {
 		/* A blocking content-lock acquire cannot refresh a KO pin sample. */
 		if (++hio_stale_attempts == 8)
@@ -120,6 +123,27 @@ hio_conditional(Buffer buffer)
 	}
 	UT_ASSERT(!hio_locks[buffer - 1]);
 	hio_locks[buffer - 1] = true;
+	return true;
+}
+
+/* The real bufmgr scope/held-lock gate is exercised separately. Here the
+ * boundary admits only the normalized pair and detects a generic second
+ * blocking acquire, a second fast probe, or a retained VM pin. */
+static bool
+hio_lock_heap_pair(Relation relation, Buffer first, Buffer second)
+{
+	UT_ASSERT(relation == &relation_data);
+	if (RelationUsesLocalBuffers(relation))
+		return false;
+	UT_ASSERT_EQ(hio_block(first), 0);
+	UT_ASSERT_EQ(hio_block(second), 1);
+	UT_ASSERT(hio_locks[first - 1]);
+	UT_ASSERT(!hio_locks[second - 1]);
+	UT_ASSERT_EQ(hio_refs[2] + hio_refs[3], 0);
+	UT_ASSERT_EQ(hio_pair_probes, 1);
+	hio_ordered_acquires++;
+	hio_waits++;
+	hio_locks[second - 1] = true;
 	return true;
 }
 
@@ -184,6 +208,7 @@ hio_recent(Relation relation, BlockNumber heap_block, Buffer recent, Buffer *vm)
 #undef visibilitymap_pin
 #undef visibilitymap_pin_recent
 #define LockBuffer hio_lock
+#define ClusterLockBufferHeapPair hio_lock_heap_pair
 #define ReleaseBuffer hio_release
 #define BufferGetPage(buffer) (hio_pages[(buffer) - 1].data)
 #define ConditionalLockBuffer hio_conditional
@@ -218,7 +243,7 @@ hio_reset(bool same_vm)
 	memset(hio_refs, 0, sizeof(hio_refs));
 	memset(hio_locks, 0, sizeof(hio_locks));
 	hio_wait_pin_conflicts = hio_waits = hio_reads = hio_repin_failures = 0;
-	hio_pair_misses = 0;
+	hio_pair_misses = hio_pair_probes = hio_ordered_acquires = 0;
 	hio_heap_buffers[0] = 1;
 	hio_heap_buffers[1] = 2;
 	hio_remap_on_refresh = false;
@@ -246,11 +271,9 @@ hio_reset(bool same_vm)
 	PageSetAllVisible(hio_pages[1].data);
 }
 
-/* Exercise the real helper in both caller orders. The controlled blocking
- * boundary above rejects an acquire while either content lock remains held.
- * Repeated conditional misses are local ordering evidence, not a concurrent
- * two-backend progress or remote-grant proof. */
-UT_TEST(actual_hio_pair_repeated_misses_release_first_in_both_orders)
+/* Both caller orders must use one fast probe, then one ordered blocking
+ * fallback. A boundary fixture is not a native two-backend progress proof. */
+UT_TEST(actual_hio_pair_one_probe_then_ordered_fallback_in_both_orders)
 {
 	int first;
 
@@ -262,11 +285,32 @@ UT_TEST(actual_hio_pair_repeated_misses_release_first_in_both_orders)
 
 			cluster_hio_lock_buffer_pair(&relation_data, &first_buffer, &second_buffer);
 		}
-		UT_ASSERT_EQ(hio_pair_misses, 0);
-		UT_ASSERT_EQ(hio_waits, 7);
+		UT_ASSERT_EQ(hio_pair_misses, 2);
+		UT_ASSERT_EQ(hio_pair_probes, 1);
+		UT_ASSERT_EQ(hio_ordered_acquires, 1);
+		UT_ASSERT_EQ(hio_waits, 3);
 		UT_ASSERT_EQ(hio_wait_pin_conflicts, 0);
 		UT_ASSERT(hio_locks[0] && hio_locks[1]);
 	}
+}
+
+UT_TEST(actual_hio_local_pair_uses_native_ordered_fallback)
+{
+	Buffer first = 2, second = 1;
+
+	hio_reset(false);
+	relation_class.relpersistence = RELPERSISTENCE_TEMP;
+	hio_pair_misses = 3;
+	if (sigsetjmp(failure_jump, 0) == 0)
+		cluster_hio_lock_buffer_pair(&relation_data, &first, &second);
+	else
+		UT_ASSERT(false);
+	UT_ASSERT_EQ(first, 2);
+	UT_ASSERT_EQ(second, 1);
+	UT_ASSERT_EQ(hio_pair_probes, 1);
+	UT_ASSERT_EQ(hio_ordered_acquires, 0);
+	UT_ASSERT_EQ(hio_waits, 3);
+	UT_ASSERT(hio_locks[0] && hio_locks[1]);
 }
 
 UT_TEST(actual_hio_pair_observes_each_cycle_and_resolution_leg)
@@ -282,13 +326,13 @@ UT_TEST(actual_hio_pair_observes_each_cycle_and_resolution_leg)
 			cluster_hio_lock_buffer_pair(&relation_data, &first_buffer, &second_buffer);
 		}
 		UT_ASSERT_EQ(hio_trace_begins, 1);
-		UT_ASSERT_EQ(hio_trace_cycles, 4);
-		UT_ASSERT_EQ(hio_trace_phases[CLPAIR_FIRST], 4);
-		UT_ASSERT_EQ(hio_trace_phases[CLPAIR_CONDITIONAL_SECOND], 4);
-		UT_ASSERT_EQ(hio_trace_phases[CLPAIR_RESOLVE_SECOND], 3);
+		UT_ASSERT_EQ(hio_trace_cycles, 1);
+		UT_ASSERT_EQ(hio_trace_phases[CLPAIR_FIRST], 1);
+		UT_ASSERT_EQ(hio_trace_phases[CLPAIR_CONDITIONAL_SECOND], 1);
+		UT_ASSERT_EQ(hio_trace_phases[CLPAIR_RESOLVE_SECOND], 1);
 		UT_ASSERT_EQ(hio_trace_phases[CLPAIR_DONE], 1);
 		UT_ASSERT_EQ(hio_trace_ends, 1);
-		UT_ASSERT_EQ(hio_waits, 7);
+		UT_ASSERT_EQ(hio_waits, 3);
 		UT_ASSERT(hio_locks[0] && hio_locks[1]);
 	}
 }
@@ -313,7 +357,9 @@ UT_TEST(actual_hio_pair_stale_pin_reacquires_current_without_disk_reread)
 		UT_ASSERT_EQ(hio_stale_attempts, 1);
 		UT_ASSERT_EQ(hio_backoffs, 0);
 		UT_ASSERT_EQ(hio_data_reads, 0);
-		UT_ASSERT_EQ(hio_waits, 4);
+		UT_ASSERT_EQ(hio_waits, 5);
+		UT_ASSERT_EQ(hio_pair_probes, 1);
+		UT_ASSERT_EQ(hio_ordered_acquires, 1);
 		UT_ASSERT_EQ(first, order == 0 ? 1 : 2);
 		UT_ASSERT_EQ(second, order == 0 ? 2 : 1);
 		UT_ASSERT_EQ(hio_refs[0], 1);
