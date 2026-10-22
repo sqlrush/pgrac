@@ -40,7 +40,7 @@ static const RecoveryAbortScope *active_abort;
 
 /* Synchronous post-EOR capability. Its held FD certifies storage completion,
  * while the original caller owns WAL flush and target exclusion. Never use
- * this scope for general UNDO paths or an ordinary native origin. */
+ * this scope for general UNDO paths or an ordinary native transaction. */
 typedef struct RecoveryTxAbortScope {
 	ClusterWalInputsV1 *inputs;
 	ClusterRecoveryTTAbortV1 record;
@@ -77,8 +77,7 @@ cluster_undo_recovery_abort_project_tx_v1(ClusterWalInputsV1 *inputs,
 	volatile bool ok = false;
 
 	if (active_scope != NULL || active_abort != NULL || active_tx_abort != NULL
-		|| !cluster_recovery_tt_abort_valid_v1(record)
-		|| record->target_thread == cluster_node_id + 1)
+		|| !cluster_recovery_tt_abort_valid_v1(record))
 		return false;
 	scope.inputs = inputs;
 	scope.record = *record;

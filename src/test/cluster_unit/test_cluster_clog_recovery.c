@@ -47,6 +47,10 @@ CheckpointStatsData CheckpointStats;
 static uint32 wait_event;
 uint32 *my_wait_event_info = &wait_event;
 static char fixture_root[MAXPGPATH];
+static char fixture_cwd[MAXPGPATH];
+static int fixture_origin = 1, c0_origin = 1;
+LWLockPadded *MainLWLockArray;
+static LWLockPadded own_main_locks[NUM_INDIVIDUAL_LWLOCKS];
 static bool authority = true, revoke_on_lock, expect_error, fail_open, fail_sync, fail_dirsync;
 static bool c0_authority;
 static bool revoke_after_read, revoke_after_sync;
@@ -153,7 +157,7 @@ cluster_undo_recovery_cold_origin_authorized_v1(int origin)
 bool
 cluster_undo_recovery_abort_clog_authorized_v1(int origin, TransactionId xid)
 {
-	return c0_authority && origin == 1 && xid == 100;
+	return c0_authority && origin == c0_origin && xid == 100;
 }
 bool
 TransactionIdPrecedes(TransactionId a, TransactionId b)
@@ -197,7 +201,8 @@ LWLockAcquire(LWLock *lock, LWLockMode mode pg_attribute_unused())
 	unsigned i = fixture_lock_index(lock);
 	UT_ASSERT(!fixture_locks[i].held);
 	fixture_locks[i].held = true;
-	if (revoke_on_lock && lock == &ClogRecoveryLocks[3].lock)
+	if (revoke_on_lock && (lock == &ClogRecoveryLocks[3].lock
+		|| (c0_origin == 0 && lock == XactCtl->shared->ControlLock)))
 		authority = c0_authority = false;
 	return true;
 }
@@ -429,8 +434,8 @@ fixture_idle(void)
 static void
 fixture_path(int page, char *path)
 {
-	snprintf(path, MAXPGPATH, "%s/native_side/origin_1/pg_xact/%04X", fixture_root,
-			 page / SLRU_PAGES_PER_SEGMENT);
+	snprintf(path, MAXPGPATH, "%s/native_side/origin_%d/pg_xact/%04X", fixture_root,
+			 fixture_origin, page / SLRU_PAGES_PER_SEGMENT);
 }
 
 static void
@@ -1114,22 +1119,151 @@ UT_TEST(post_eor_c0_only_restores_the_exact_foreign_top_abort)
 }
 
 static void
+fixture_own_reset(void)
+{
+	fixture_origin = c0_origin = 0;
+	InRecovery = authority = false;
+	c0_authority = true;
+	for (int i = 0; i < XactCtl->shared->num_slots; i++) {
+		XactCtl->shared->page_status[i] = SLRU_PAGE_EMPTY;
+		XactCtl->shared->page_dirty[i] = false;
+	}
+	fixture_zero(0);
+}
+
+UT_TEST(own_c0_uses_original_cache_and_preserves_other_transactions)
+{
+	int slot, other;
+	XLogRecPtr lsn;
+	fixture_own_reset();
+	fixture_zero(1);
+	LWLockAcquire(XactCtl->shared->ControlLock, LW_EXCLUSIVE);
+	slot = SimpleLruReadPage(XactCtl, 0, true, 100);
+	UT_ASSERT(clog_recovery_status(XactCtl, slot, 101, TRANSACTION_STATUS_COMMITTED,
+		CLOG_RECOVERY_WRITE));
+	other = SimpleLruReadPage(XactCtl, 1, true, CLOG_XACTS_PER_PAGE + 17);
+	UT_ASSERT(clog_recovery_status(XactCtl, other, CLOG_XACTS_PER_PAGE + 17,
+		TRANSACTION_STATUS_ABORTED, CLOG_RECOVERY_WRITE));
+	LWLockRelease(XactCtl->shared->ControlLock);
+	UT_ASSERT(cluster_clog_native_recovery_apply_v1(0, 100, 0, NULL, TRANSACTION_STATUS_ABORTED));
+	UT_ASSERT(cluster_clog_native_recovery_verify_v1(0, 100, 0, NULL, TRANSACTION_STATUS_ABORTED));
+	UT_ASSERT_EQ(fixture_status(100), TRANSACTION_STATUS_ABORTED);
+	UT_ASSERT_EQ(fixture_status(101), TRANSACTION_STATUS_COMMITTED);
+	UT_ASSERT_EQ(TransactionIdGetStatus(100, &lsn), TRANSACTION_STATUS_ABORTED);
+	UT_ASSERT_EQ(TransactionIdGetStatus(101, &lsn), TRANSACTION_STATUS_COMMITTED);
+	UT_ASSERT_EQ(XactCtl->shared->page_status[other], SLRU_PAGE_VALID);
+	UT_ASSERT(XactCtl->shared->page_dirty[other]);
+	UT_ASSERT_EQ(fixture_status(CLOG_XACTS_PER_PAGE + 17), TRANSACTION_STATUS_IN_PROGRESS);
+	for (int i = 0; i < ClogRecoveryCtl[0].shared->num_slots; i++)
+		UT_ASSERT_EQ(ClogRecoveryCtl[0].shared->page_status[i], SLRU_PAGE_EMPTY);
+	fixture_idle();
+}
+
+UT_TEST(own_c0_rejects_committed_disk_or_cache_and_requires_disk_readback)
+{
+	int slot;
+	unsigned before;
+	for (int fault = 0; fault < 3; fault++) {
+		fixture_own_reset();
+		LWLockAcquire(XactCtl->shared->ControlLock, LW_EXCLUSIVE);
+		slot = SimpleLruReadPage(XactCtl, 0, true, 100);
+		if (fault != 0)
+			UT_ASSERT(clog_recovery_status(XactCtl, slot, 100,
+				fault == 1 ? TRANSACTION_STATUS_COMMITTED : TRANSACTION_STATUS_ABORTED,
+				CLOG_RECOVERY_WRITE));
+		LWLockRelease(XactCtl->shared->ControlLock);
+		if (fault == 0)
+			fixture_bit(100, TRANSACTION_STATUS_COMMITTED);
+		before = writes;
+		UT_ASSERT(!(fault == 2
+			? cluster_clog_native_recovery_verify_v1(0, 100, 0, NULL, TRANSACTION_STATUS_ABORTED)
+			: cluster_clog_native_recovery_apply_v1(0, 100, 0, NULL, TRANSACTION_STATUS_ABORTED)));
+		UT_ASSERT_EQ(writes, before);
+		UT_ASSERT_EQ(fixture_status(100), fault == 0 ? TRANSACTION_STATUS_COMMITTED
+			: TRANSACTION_STATUS_IN_PROGRESS);
+		fixture_idle();
+	}
+}
+
+UT_TEST(own_c0_keeps_exact_scope_and_original_directory_route)
+{
+	char expected[MAXPGPATH];
+	unsigned before;
+	fixture_own_reset();
+	snprintf(expected, sizeof(expected), "%s/native_side/origin_1/pg_xact", fixture_root);
+	UT_ASSERT_EQ(unlink("pg_xact"), 0);
+	UT_ASSERT_EQ(symlink(expected, "pg_xact"), 0);
+	before = writes;
+	UT_ASSERT(!cluster_clog_native_recovery_apply_v1(0, 100, 0, NULL, TRANSACTION_STATUS_ABORTED));
+	UT_ASSERT_EQ(writes, before);
+	UT_ASSERT_EQ(unlink("pg_xact"), 0);
+	snprintf(expected, sizeof(expected), "%s/native_side/origin_0/pg_xact", fixture_root);
+	UT_ASSERT_EQ(symlink(expected, "pg_xact"), 0);
+	UT_ASSERT(!cluster_clog_native_recovery_apply_v1(0, 101, 0, NULL, TRANSACTION_STATUS_ABORTED));
+	UT_ASSERT(!cluster_clog_native_recovery_apply_v1(0, 100, 0, NULL, TRANSACTION_STATUS_COMMITTED));
+	c0_authority = false;
+	UT_ASSERT(!cluster_clog_native_recovery_apply_v1(0, 100, 0, NULL, TRANSACTION_STATUS_ABORTED));
+	c0_authority = true;
+	UT_ASSERT(cluster_clog_native_recovery_apply_v1(0, 100, 0, NULL, TRANSACTION_STATUS_ABORTED));
+	fixture_idle();
+}
+
+UT_TEST(own_c0_native_error_and_revocation_preserve_cache_ownership)
+{
+	volatile bool caught = false;
+	fixture_own_reset();
+	fail_open = expect_error = true;
+	PG_TRY();
+	{
+		(void)cluster_clog_native_recovery_apply_v1(0, 100, 0, NULL, TRANSACTION_STATUS_ABORTED);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	fail_open = expect_error = false;
+	UT_ASSERT(caught);
+	fixture_idle();
+	UT_ASSERT(cluster_clog_native_recovery_apply_v1(0, 100, 0, NULL, TRANSACTION_STATUS_ABORTED));
+	fixture_own_reset();
+	revoke_on_lock = true;
+	UT_ASSERT(!cluster_clog_native_recovery_apply_v1(0, 100, 0, NULL, TRANSACTION_STATUS_ABORTED));
+	revoke_on_lock = false;
+	UT_ASSERT_EQ(fixture_status(100), TRANSACTION_STATUS_IN_PROGRESS);
+	fixture_idle();
+	fixture_own_reset();
+	revoke_after_sync = true;
+	UT_ASSERT(!cluster_clog_native_recovery_apply_v1(0, 100, 0, NULL, TRANSACTION_STATUS_ABORTED));
+	revoke_after_sync = false;
+	UT_ASSERT_EQ(fixture_status(100), TRANSACTION_STATUS_ABORTED);
+	fixture_idle();
+	fixture_origin = c0_origin = 1;
+	InRecovery = authority = true;
+	c0_authority = false;
+}
+
+static void
 fixture_cleanup(void)
 {
 	char path[MAXPGPATH], dirpath[MAXPGPATH];
-	const char *parents[]
-		= { "/native_side/origin_1/pg_xact", "/native_side/origin_1", "/native_side", "" };
+	const char *parents[] = { "/native_side/origin_1/pg_xact", "/native_side/origin_1",
+		"/native_side/origin_0/pg_xact", "/native_side/origin_0", "/native_side", "" };
 	DIR *dir;
 	struct dirent *entry;
-	snprintf(dirpath, sizeof(dirpath), "%s%s", fixture_root, parents[0]);
-	dir = opendir(dirpath);
-	while ((entry = readdir(dir)) != NULL) {
-		if (entry->d_name[0] == '.')
-			continue;
-		snprintf(path, sizeof(path), "%s/%s", dirpath, entry->d_name);
-		UT_ASSERT_EQ(unlink(path), 0);
+	UT_ASSERT_EQ(unlink("pg_xact"), 0);
+	UT_ASSERT_EQ(chdir(fixture_cwd), 0);
+	for (int origin = 0; origin < 2; origin++) {
+		snprintf(dirpath, sizeof(dirpath), "%s/native_side/origin_%d/pg_xact", fixture_root, origin);
+		dir = opendir(dirpath);
+		while ((entry = readdir(dir)) != NULL) {
+			if (entry->d_name[0] == '.')
+				continue;
+			snprintf(path, sizeof(path), "%s/%s", dirpath, entry->d_name);
+			UT_ASSERT_EQ(unlink(path), 0);
+		}
+		UT_ASSERT_EQ(closedir(dir), 0);
 	}
-	UT_ASSERT_EQ(closedir(dir), 0);
 	for (unsigned i = 0; i < lengthof(parents); i++) {
 		snprintf(path, sizeof(path), "%s%s", fixture_root, parents[i]);
 		UT_ASSERT_EQ(rmdir(path), 0);
@@ -1142,7 +1276,10 @@ int
 main(void)
 {
 	char path[MAXPGPATH];
-	const char *dirs[] = { "native_side", "native_side/origin_1", "native_side/origin_1/pg_xact" };
+	const char *dirs[] = { "native_side", "native_side/origin_1", "native_side/origin_1/pg_xact",
+		"native_side/origin_0", "native_side/origin_0/pg_xact" };
+	if (!getcwd(fixture_cwd, sizeof(fixture_cwd)))
+		return 2;
 	strlcpy(fixture_root, "/tmp/pgrac-clog-recovery.XXXXXX", sizeof(fixture_root));
 	if (!mkdtemp(fixture_root))
 		return 2;
@@ -1153,7 +1290,17 @@ main(void)
 			return 2;
 	}
 	clog_recovery_shmem_init();
-	UT_PLAN(22);
+	MainLWLockArray = own_main_locks;
+	LWLockInitialize(XactSLRULock, LWTRANCHE_XACT_BUFFER);
+	SimpleLruInit(XactCtl, "Xact own fixture", 4, CLOG_LSNS_PER_PAGE, XactSLRULock,
+		"pg_xact", LWTRANCHE_XACT_BUFFER, SYNC_HANDLER_NONE);
+	XactCtl->PagePrecedes = CLOGPagePrecedes;
+	if (chdir(fixture_root) != 0)
+		return 2;
+	snprintf(path, sizeof(path), "%s/native_side/origin_0/pg_xact", fixture_root);
+	if (symlink(path, "pg_xact") != 0)
+		return 2;
+	UT_PLAN(26);
 	UT_RUN(separate_original_origin_controls);
 	UT_RUN(commit_and_abort_persist_full_tree_without_local_pollution);
 	UT_RUN(conflicting_late_child_refuses_before_any_tree_write);
@@ -1176,6 +1323,10 @@ main(void)
 	UT_RUN(c0_native_abort_retains_conflict_and_durability_refusal);
 	UT_RUN(c0_native_abort_revocation_and_error_keep_original_cleanup);
 	UT_RUN(post_eor_c0_only_restores_the_exact_foreign_top_abort);
+	UT_RUN(own_c0_uses_original_cache_and_preserves_other_transactions);
+	UT_RUN(own_c0_rejects_committed_disk_or_cache_and_requires_disk_readback);
+	UT_RUN(own_c0_keeps_exact_scope_and_original_directory_route);
+	UT_RUN(own_c0_native_error_and_revocation_preserve_cache_ownership);
 	fixture_cleanup();
 	UT_DONE();
 	return ut_failed_count != 0;

@@ -817,6 +817,17 @@ UT_TEST(new_c0_requires_current_input_and_exact_durable_held_stamp)
 	}
 }
 
+UT_TEST(new_c0_restores_own_origin_only_through_the_exact_held_scope)
+{
+	reset_tx();
+	cluster_node_id = 1; /* Target thread 2 now belongs to this startup node. */
+	UT_ASSERT(project_tx());
+	UT_ASSERT(strcmp(order, "AVMQ") == 0);
+	UT_ASSERT_EQ(tx_revalidates, 5);
+	cluster_node_id = 0;
+	no_tx_authority();
+}
+
 UT_TEST(new_c0_io_refusal_or_source_drift_never_reports_completion)
 {
 	for (unsigned fault = 0; fault < 10; fault++) {
@@ -869,7 +880,7 @@ UT_TEST(new_c0_error_revokes_capability_without_releasing_callers_fd)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
 	UT_RUN(exact_c0_replay_binds_two_owners_and_durable_order);
 	UT_RUN(missing_authority_or_changed_claim_refuses_before_io);
 	UT_RUN(wrong_record_or_crossed_authorities_never_resolve_a_path);
@@ -881,6 +892,7 @@ main(void)
 	UT_RUN(projection_conflict_or_bad_readback_never_reports_completion);
 	UT_RUN(new_c0_restores_exact_foreign_native_then_projection_after_eor);
 	UT_RUN(new_c0_requires_current_input_and_exact_durable_held_stamp);
+	UT_RUN(new_c0_restores_own_origin_only_through_the_exact_held_scope);
 	UT_RUN(new_c0_io_refusal_or_source_drift_never_reports_completion);
 	UT_RUN(new_c0_error_revokes_capability_without_releasing_callers_fd);
 	UT_DONE();

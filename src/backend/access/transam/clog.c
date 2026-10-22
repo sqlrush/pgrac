@@ -785,6 +785,13 @@ clog_recovery_permitted(int origin)
 static bool
 clog_recovery_terminal_permitted(int origin, TransactionId xid, int count, XidStatus status)
 {
+	/* The native controller remains the sole cache for our own origin.
+	 * Only an exact durable C0 ABORT may use it through this API. */
+	if (origin == cluster_node_id)
+		return cluster_shared_config && AmStartupProcess() && origin >= 0
+			&& origin < CLOG_RECOVERY_ORIGINS && XactCtl->shared != NULL
+			&& count == 0 && TransactionIdIsNormal(xid) && status == TRANSACTION_STATUS_ABORTED
+			&& cluster_undo_recovery_abort_clog_authorized_v1(origin, xid);
 	return clog_recovery_initialized(origin)
 		   && ((InRecovery && cluster_undo_recovery_cold_origin_authorized_v1(origin))
 			   || (count == 0 && TransactionIdIsNormal(xid) && status == TRANSACTION_STATUS_ABORTED
@@ -827,8 +834,23 @@ clog_recovery_terminal_directory_ready(int origin, TransactionId xid, int count,
 	children[1] = origin_name;
 	length = snprintf(expected, sizeof(expected), "%s/native_side/%s/pg_xact",
 					  cluster_shared_data_dir, origin_name);
-	if (length < 0 || length >= sizeof(expected)
-		|| strcmp(expected, ClogRecoveryCtl[origin].Dir) != 0)
+	if (length < 0 || length >= sizeof(expected))
+		return false;
+	if (origin == cluster_node_id) {
+		char target[MAXPGPATH];
+		ssize_t size;
+
+		/* initdb installs this exact native SIDE route; do not redirect
+		 * the controller or silently accept a different origin's link. */
+		if (strcmp(XactCtl->Dir, "pg_xact") != 0)
+			return false;
+		size = readlink(XactCtl->Dir, target, sizeof(target) - 1);
+		if (size < 0 || size >= sizeof(target) - 1)
+			return false;
+		target[size] = '\0';
+		if (strcmp(target, expected) != 0)
+			return false;
+	} else if (strcmp(expected, ClogRecoveryCtl[origin].Dir) != 0)
 		return false;
 	dirs[0] = open(cluster_shared_data_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
 	if (dirs[0] < 0)
@@ -845,6 +867,10 @@ clog_recovery_terminal_directory_ready(int origin, TransactionId xid, int count,
 			goto done;
 	if (lstat(expected, &routed) != 0 || !S_ISDIR(routed.st_mode) || routed.st_dev != st.st_dev
 		|| routed.st_ino != st.st_ino)
+		goto done;
+	if (origin == cluster_node_id
+		&& (stat(XactCtl->Dir, &routed) != 0 || !S_ISDIR(routed.st_mode)
+			|| routed.st_dev != st.st_dev || routed.st_ino != st.st_ino))
 		goto done;
 	ok = true;
 done:
@@ -959,6 +985,118 @@ clog_recovery_status(SlruCtl ctl, int slot, TransactionId xid, XidStatus status,
 	return true;
 }
 
+/* Read the disk bit independently of the original native cache. A cached
+ * ABORT cannot certify persistence, or conceal a conflicting disk COMMIT. */
+static bool
+clog_recovery_disk_abort(SlruCtl ctl, TransactionId xid, const struct stat *expected, bool verify)
+{
+	int page = TransactionIdToPage(xid);
+	char path[MAXPGPATH];
+	struct stat opened, after;
+	volatile int fd = -1;
+	volatile bool ok = false;
+	uint8 byte;
+	int length = snprintf(path, sizeof(path), "%s/%04X", ctl->Dir, page / SLRU_PAGES_PER_SEGMENT);
+	off_t offset = (off_t)(page % SLRU_PAGES_PER_SEGMENT) * BLCKSZ + TransactionIdToByte(xid);
+
+	if (length < 0 || length >= sizeof(path))
+		return false;
+	PG_TRY();
+	{
+		fd = OpenTransientFile(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | PG_BINARY);
+		if (fd >= 0 && fstat(fd, &opened) == 0 && S_ISREG(opened.st_mode)
+			&& opened.st_nlink == 1 && opened.st_uid == geteuid()
+			&& (opened.st_mode & (S_IWGRP | S_IWOTH)) == 0
+			&& clog_recovery_same_file(expected, &opened)
+			&& pg_pread(fd, &byte, 1, offset) == 1) {
+			XidStatus status = (byte >> (TransactionIdToBIndex(xid) * CLOG_BITS_PER_XACT))
+				& CLOG_XACT_BITMASK;
+
+			ok = (verify ? status == TRANSACTION_STATUS_ABORTED
+				: status != TRANSACTION_STATUS_COMMITTED)
+				&& fstat(fd, &after) == 0 && clog_recovery_same_file(expected, &after)
+				&& clog_recovery_page_identity(ctl, page, &after)
+				&& clog_recovery_same_file(expected, &after);
+		}
+	}
+	PG_FINALLY();
+	{
+		if (fd >= 0 && CloseTransientFile(fd) != 0)
+			ok = false;
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+static bool
+clog_recovery_own_base_current(SlruCtl disk, int origin, TransactionId xid,
+	const struct stat *before)
+{
+	struct stat after, routed;
+	int page = TransactionIdToPage(xid);
+
+	return clog_recovery_terminal_directory_ready(origin, xid, 0, TRANSACTION_STATUS_ABORTED)
+		&& clog_recovery_page_identity(disk, page, &after)
+		&& clog_recovery_same_file(before, &after)
+		&& clog_recovery_page_identity(XactCtl, page, &routed)
+		&& clog_recovery_same_file(before, &routed);
+}
+
+static bool
+clog_recovery_own_abort(int origin, TransactionId xid, bool verify)
+{
+	SlruCtlData disk = *XactCtl;
+	struct stat before;
+	int page = TransactionIdToPage(xid);
+	int length;
+	volatile bool ok = false;
+
+	/* The absolute copy is only for disk identity/readback/sync. All cache
+	 * access and writes use the unchanged native controller and its locks. */
+	if (!clog_recovery_terminal_directory_ready(origin, xid, 0, TRANSACTION_STATUS_ABORTED))
+		return false;
+	length = snprintf(disk.Dir, sizeof(disk.Dir), "%s/native_side/origin_%d/pg_xact",
+		cluster_shared_data_dir, origin);
+	if (length < 0 || length >= sizeof(disk.Dir)
+		|| !clog_recovery_page_identity(&disk, page, &before)
+		|| !clog_recovery_own_base_current(&disk, origin, xid, &before)
+		|| !clog_recovery_disk_abort(&disk, xid, &before, verify))
+		return false;
+	PG_TRY();
+	{
+		int slot;
+
+		LWLockAcquire(XactCtl->shared->ControlLock, LW_EXCLUSIVE);
+		slot = SimpleLruReadPage(XactCtl, page, true, xid);
+		ok = clog_recovery_own_base_current(&disk, origin, xid, &before)
+			&& clog_recovery_disk_abort(&disk, xid, &before, verify)
+			&& clog_recovery_terminal_permitted(origin, xid, 0, TRANSACTION_STATUS_ABORTED)
+			&& clog_recovery_status(XactCtl, slot, xid, TRANSACTION_STATUS_ABORTED,
+				verify ? CLOG_RECOVERY_VERIFY : CLOG_RECOVERY_PREFLIGHT);
+		if (ok && !verify) {
+			(void)clog_recovery_status(XactCtl, slot, xid, TRANSACTION_STATUS_ABORTED,
+				CLOG_RECOVERY_WRITE);
+			SimpleLruWritePage(XactCtl, slot);
+		}
+	}
+	PG_FINALLY();
+	{
+		/* Native SLRU owns its I/O state. Never discard this shared cache:
+		 * unrelated transactions may still have dirty bits or group LSNs. */
+		if (LWLockHeldByMe(XactCtl->shared->ControlLock))
+			LWLockRelease(XactCtl->shared->ControlLock);
+	}
+	PG_END_TRY();
+	if (!ok || !clog_recovery_own_base_current(&disk, origin, xid, &before))
+		return false;
+	if (verify)
+		return clog_recovery_disk_abort(&disk, xid, &before, true)
+			&& clog_recovery_own_base_current(&disk, origin, xid, &before);
+	return clog_recovery_sync(&disk, page, &before) && clog_recovery_sync(&disk, -1, NULL)
+		&& clog_recovery_own_base_current(&disk, origin, xid, &before)
+		&& clog_recovery_own_abort(origin, xid, true);
+}
+
 static bool
 clog_recovery_page(int origin, int page, TransactionId top, int count,
 				   const TransactionId *children, XidStatus status, ClogRecoveryAccess access)
@@ -1070,6 +1208,8 @@ clog_recovery_access(int origin, TransactionId xid, int nsubxids, const Transact
 			return false;
 		previous = subxids[i];
 	}
+	if (origin == cluster_node_id)
+		return clog_recovery_own_abort(origin, xid, verify);
 	lock = &ClogRecoveryLocks[origin * 2 + 1].lock;
 	PG_TRY();
 	{
@@ -1090,8 +1230,9 @@ clog_recovery_access(int origin, TransactionId xid, int nsubxids, const Transact
 	return ok;
 }
 
-/* Persist only the failed origin's native terminal bits. The local SLRU,
- * allocation counters, TT, remote projection and serving gates are untouched.
+/* Persist only the original origin's native terminal bits. Own-origin C0
+ * uses the original native cache; foreign replay uses its separate controller.
+ * Allocation counters, TT, remote projection and serving gates are untouched.
  * Author: SqlRush <sqlrush@gmail.com> */
 bool
 cluster_clog_native_recovery_apply_v1(int origin, TransactionId xid, int nsubxids,
@@ -1100,7 +1241,8 @@ cluster_clog_native_recovery_apply_v1(int origin, TransactionId xid, int nsubxid
 	return clog_recovery_access(origin, xid, nsubxids, subxids, status, false);
 }
 
-/* An independent empty-cache disk readback, not a visibility certificate. */
+/* Independent disk readback (and native cache check for own-origin C0),
+ * not a visibility certificate. */
 bool
 cluster_clog_native_recovery_verify_v1(int origin, TransactionId xid, int nsubxids,
 									   const TransactionId *subxids, XidStatus status)
