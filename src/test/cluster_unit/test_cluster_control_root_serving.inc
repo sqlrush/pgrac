@@ -15,6 +15,15 @@ static unsigned serving_recovery_reads, serving_recovery_change_at, serving_reco
 static ClusterNormalStartState serving_normal_start_state = CLUSTER_NORMAL_START_UNCLASSIFIED;
 
 static void
+test_recovered_checkpoint_owner_schedule(unsigned change_at, unsigned fault)
+{
+	serving_recovery_reads = 0;
+	serving_recovery_change_at = change_at;
+	serving_recovery_fault = fault;
+}
+
+
+static void
 test_recovered_checkpoint_owner_fixture(const ClusterWalSourceRef *ref, uint64 epoch)
 {
 	memset(&serving_recovery_owner, 0, sizeof(serving_recovery_owner));
@@ -52,6 +61,7 @@ cluster_recovery_checkpoint_observe_v1(ClusterRecoveryCheckpointObservationV1 *o
 		case 4: serving_recovery_owner.owner.start_generation++; break;
 		case 5: serving_recovery_owner.owner.start_serial++; break;
 		case 6: serving_recovery_owner.owner.owner_pid++; break;
+		case 7: serving_recovery_owner.owner.writer.ref.claim.identity.origin_node_id++; break;
 		}
 	}
 	if (!serving_recovery_observed)

@@ -9079,6 +9079,25 @@ UT_TEST(test_recovered_reserve_requires_published_writer_observation)
 	v2_assert_primary_unchanged(before);
 }
 
+static void test_recovered_checkpoint_owner_schedule(unsigned change_at, unsigned fault);
+
+UT_TEST(test_recovered_reserve_rechecks_checkpoint_owner_after_publish)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	ClusterControlRootIdentity self;
+	ClusterControlRootFileToken expected, token;
+
+	v3_recovered_reserve_fixture(before, &root, &self, &expected, true);
+	if (ut_current_failed)
+		return;
+	test_recovered_checkpoint_owner_schedule(4, 7); /* final post-readback observation */
+	memset(&token, 0xa5, sizeof(token));
+	UT_ASSERT_NE(cluster_control_root_v3_reserve_recovered(&self, &expected, &token), 0);
+	UT_ASSERT(v2_zero(&token, sizeof(token)));
+	test_recovered_checkpoint_owner_schedule(0, 0);
+}
+
 static void
 recovered_reserve_lose_cohort_on_sync(void)
 {
@@ -24862,11 +24881,12 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_RECOVERED_RESERVE") != NULL) {
-		UT_PLAN(9);
+		UT_PLAN(10);
 		UT_RUN(test_v3_reserve_clean_publishes_all_sparse_targets_without_serving);
 		UT_RUN(test_recovered_reserve_mixed_roster_uses_actual_checkpoint);
 		UT_RUN(test_recovered_reserve_all_complete_without_clean_exit_ack);
 		UT_RUN(test_recovered_reserve_requires_published_writer_observation);
+		UT_RUN(test_recovered_reserve_rechecks_checkpoint_owner_after_publish);
 		UT_RUN(test_recovered_reserve_releases_partial_cohort_once);
 		UT_RUN(test_recovered_reserve_refuses_cohort_loss_before_cas);
 		UT_RUN(test_recovered_reserve_withholds_token_after_published_cut_loss);

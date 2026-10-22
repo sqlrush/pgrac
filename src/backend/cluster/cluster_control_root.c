@@ -5837,6 +5837,29 @@ startup_owner_current(uint64 system_identifier, uint64 epoch, uint64 incarnation
 								   CLUSTER_WAL_STARTUP_CLEAN);
 }
 
+static bool
+startup_recovered_owner_current(const ControlRootImage *root,
+							const ClusterFormationSnapshotV1 *formation)
+{
+	ClusterRecoveryCheckpointObservationV1 observed;
+
+	return cluster_recovery_checkpoint_observe_v1(&observed)
+		   && observed.slot_generation != 0
+		   && observed.slot_generation != UINT64_MAX
+		   && root->header.system_identifier != 0
+		   && root->header.system_identifier == GetSystemIdentifier()
+		   && observed.owner.writer.ref.claim.identity.system_identifier
+			  == root->header.system_identifier
+		   && observed.owner.owner_boot == cluster_qvotec_get_self_incarnation()
+		   && observed.owner.writer.epoch == formation->local_epoch
+		   && observed.owner.writer.ref.claim.identity.origin_node_id == cluster_node_id
+		   && observed.owner.writer.ref.claim.identity.origin_thread_id == cluster_node_id + 1
+		   && observed.owner.writer.ref.claim.identity.origin_owner_incarnation
+			  == observed.owner.owner_boot
+		   && cluster_wal_thread_recovered_writer_matches(&observed.owner.writer.ref,
+																 observed.owner.writer.epoch);
+}
+
 /* CLEAN proves collective exit; kind4 proves no previous admitted writer.
  * RECOVERED additionally requires the complete cache-recovery cut below.
  * Every input still requires the complete current formation and durable fence. */
@@ -5870,22 +5893,7 @@ startup_complete_formation(const ControlRootImage *root,
 			return false;
 	}
 	if (kind == CLUSTER_WAL_STARTUP_RECOVERED) {
-		ClusterRecoveryCheckpointObservationV1 observed;
-
-		if (!cluster_recovery_checkpoint_observe_v1(&observed)
-			|| observed.slot_generation == 0 || observed.slot_generation == UINT64_MAX
-			|| root->header.system_identifier == 0
-			|| root->header.system_identifier != GetSystemIdentifier()
-			|| observed.owner.writer.ref.claim.identity.system_identifier
-				!= root->header.system_identifier
-			|| observed.owner.owner_boot != cluster_qvotec_get_self_incarnation()
-			|| observed.owner.writer.epoch != formation->local_epoch
-			|| observed.owner.writer.ref.claim.identity.origin_node_id != cluster_node_id
-			|| observed.owner.writer.ref.claim.identity.origin_thread_id != cluster_node_id + 1
-			|| observed.owner.writer.ref.claim.identity.origin_owner_incarnation
-			   != observed.owner.owner_boot
-			|| !cluster_wal_thread_recovered_writer_matches(&observed.owner.writer.ref,
-													   observed.owner.writer.epoch))
+		if (!startup_recovered_owner_current(root, formation))
 			return false;
 	}
 	return startup_owner_for_input(root->header.system_identifier, formation->local_epoch,
@@ -6546,6 +6554,7 @@ reserve_recovered_publish(ReserveCleanWork *work, const ClusterControlRootIdenti
 			return result;
 	}
 	if (!cluster_wal_retention_root_publish_set_current_v1(work->recovered_walr)
+		|| !startup_recovered_owner_current(&scan->base, &work->formation)
 		|| !startup_owner_for_input(self->system_identifier, work->formation.local_epoch,
 								 self->origin_owner_incarnation, work->cut.required,
 								 CLUSTER_WAL_STARTUP_RECOVERED)
