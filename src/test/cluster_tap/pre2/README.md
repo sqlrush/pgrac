@@ -508,7 +508,7 @@ two contiguous DATA ports per node for the normal TAP default.
 |---|---|
 | fresh_init | `fresh_init`: supported product initialization into all new paths, including new-format identity and per-thread state; no backup clone fallback |
 | shared_start / shared_stop | `shared_start` / `shared_stop`: qualified startup and normal shutdown; no direct serving bypass |
-| root_observation | Current selected `system_identifier`, `root_digest`, `generation`; native SQL independently checks sysid, catalog version 202609290 and the shared settings on every node |
+| root_observation | Current selected `system_identifier`, `root_digest`, `generation`; native SQL independently checks sysid, the exact `CATALOG_VERSION_NO` from this source tree's `src/include/catalog/catversion.h`, and the shared settings on every node |
 | wal_observation | `observe_begin(relation)` and `wal_observation`: complete causally ordered events since the barrier; filter one relation incarnation, retain all writers and WAL generations |
 | current_handoff | Exact `tag`, `space`, `block`, `holder`, `previous_holder`, `handoff_id`, `version`, `writer`; record actual cross-node transfers, not cached-X hits |
 | checkpoint_barrier | Named holder DATA cut plus `current_handoff_pending` returning exact requester/tag/request ID; must not require a lock-held blocked update to finish before releasing the cut |

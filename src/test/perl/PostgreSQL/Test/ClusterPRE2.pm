@@ -15,6 +15,21 @@ use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC sleep);
 my $script_dir = abs_path(dirname(__FILE__) . '/../../../cluster_tap/pre2');
 sub _now { return clock_gettime(CLOCK_MONOTONIC); }
 
+sub _catalog_version
+{
+	my ($header) = @_;
+	open my $file, '<', $header or die "cannot read source catalog version: $!";
+	my @definitions;
+	while (<$file>)
+	{
+		push @definitions, $1 if /^\s*#\s*define[ \t]+CATALOG_VERSION_NO\b(.*)$/;
+	}
+	close $file or die "cannot read source catalog version: $!";
+	die 'invalid source catalog version' unless @definitions == 1
+	  && $definitions[0] =~ /^\s+([1-9][0-9]*)\s*$/;
+	return $1;
+}
+
 sub _driver
 {
 	my ($self, $op, $args, $budget) = @_;
@@ -88,6 +103,7 @@ sub start_cluster
 {
 	my ($self) = @_;
 	die 'fixture is already running' if $self->{running};
+	my $expected_catalog = _catalog_version("$script_dir/../../../include/catalog/catversion.h");
 	$self->{normal_stop_proven} = 0;
 	$self->{running} = 1; # A failed start still needs explicit cleanup.
 	$self->_driver('shared_start', {});
@@ -99,7 +115,8 @@ sub start_cluster
 		my $identity = $node->safe_psql('postgres',
 			q{SELECT system_identifier::text || '|' || catalog_version_no FROM pg_control_system()}, timeout => 10);
 		my ($current, $catalog) = split /\|/, $identity;
-		die 'PRE2 format is not activated' unless ($catalog // '') eq '202609290';
+		die "PRE2 format is not activated (expected catalog $expected_catalog, observed "
+		  . ($catalog // '<missing>') . ')' unless ($catalog // '') eq $expected_catalog;
 		die 'invalid shared system identity' unless ($current // '') =~ /^[1-9][0-9]*$/;
 		$sysid //= $current;
 		die 'different system identifiers' unless $current eq $sysid;

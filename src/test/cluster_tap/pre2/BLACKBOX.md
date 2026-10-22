@@ -140,7 +140,11 @@ JSON replies contain observations only, without `status`, `version` or
   exact sorted `members`, and `writer: {node, thread, incarnation,
   wal_generation, boot}`. Query the named node. The fixture requires one common
   root cut across all members, distinct WAL threads, actual configuration C,
-  and native catalog version 202609290. After restart, `writer.predecessor`
+  and the exact native catalog version defined by `CATALOG_VERSION_NO` in this
+  source tree's `src/include/catalog/catversion.h`. A missing or ambiguous source
+  definition is an error; an older or different node catalog is not accepted.
+  This equality check does not prove binary/source provenance. After restart,
+  `writer.predecessor`
   must identify the exact prior CLOSED `{thread, incarnation, wal_generation,
   boot}`. The root and WAL generations must advance and the boot must change.
 - `shutdown_observation`, input `{nodes, writers}`: **offline product CLI**
