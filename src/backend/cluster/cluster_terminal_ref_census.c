@@ -5245,13 +5245,13 @@ ctrc_receipt_publication_matches(const ClusterCtrcReceipt *receipt, const Cluste
 		   && ctrc_publication_request_equal(&receipt->publication, publication);
 }
 
-ClusterCtrcPrepareResult
-cluster_ctrc_receipt_prepare_table_locked(
+static ClusterCtrcPrepareResult
+ctrc_receipt_prepare_table_observed(
 	ClusterCtrcParticipantEntry *participant, const ClusterCtrcTxnKeyV1 *key,
 	const ClusterCtrcParticipantIdentity *identity, uint32 grant_generation,
 	const ClusterCtrcPublicationIdV1 *publication, const ClusterCtrcTargetV1 *target,
 	ClusterCtrcReceipt *receipts, uint8 *probe_states, Size receipt_count, uint64 journal_sequence,
-	uint64 *receipt_index_out, Size *probe_count_out)
+	uint64 *receipt_index_out, Size *probe_count_out, ClusterCtrcPreparePath *path_out)
 {
 	uint64 first_tombstone = UINT64_MAX;
 	uint64 hash;
@@ -5262,13 +5262,28 @@ cluster_ctrc_receipt_prepare_table_locked(
 		*receipt_index_out = UINT64_MAX;
 	if (probe_count_out != NULL)
 		*probe_count_out = 0;
+	if (path_out != NULL)
+		*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE;
+	/* Preserve the original short-circuit order and execute each helper
+	 * once. Only the call-local scalar is written at the original cuts. */
 	if (participant == NULL || key == NULL || identity == NULL || publication == NULL
 		|| target == NULL || receipts == NULL || probe_states == NULL || receipt_count == 0
-		|| journal_sequence == 0 || receipt_index_out == NULL
-		|| cluster_ctrc_participant_open(participant, key, grant_generation, identity)
-			   == CLUSTER_CTRC_PARTICIPANT_REFUSED
-		|| !ctrc_publication_prepare_valid(participant, publication, target))
+		|| journal_sequence == 0 || receipt_index_out == NULL) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_INPUT;
 		return CLUSTER_CTRC_PREPARE_REFUSED;
+	}
+	if (cluster_ctrc_participant_open(participant, key, grant_generation, identity)
+		== CLUSTER_CTRC_PARTICIPANT_REFUSED) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_PARTICIPANT;
+		return CLUSTER_CTRC_PREPARE_REFUSED;
+	}
+	if (!ctrc_publication_prepare_valid(participant, publication, target)) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_PUBLICATION;
+		return CLUSTER_CTRC_PREPARE_REFUSED;
+	}
 
 	hash = ctrc_receipt_probe_hash(key, publication);
 	for (probe = 0; probe < receipt_count; probe++) {
@@ -5282,6 +5297,8 @@ cluster_ctrc_receipt_prepare_table_locked(
 		if (probe_state == CTRC_RECEIPT_PROBE_EMPTY) {
 			if (!ctrc_bytes_zero(receipt, sizeof(*receipt))) {
 				participant->state = CTRC_PARTICIPANT_BLOCKED;
+				if (path_out != NULL)
+					*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_EMPTY_BYTES;
 				return CLUSTER_CTRC_PREPARE_REFUSED;
 			}
 			selected_index = first_tombstone != UINT64_MAX ? first_tombstone : index;
@@ -5290,6 +5307,8 @@ cluster_ctrc_receipt_prepare_table_locked(
 		if (probe_state == CTRC_RECEIPT_PROBE_TOMBSTONE) {
 			if (!ctrc_bytes_zero(receipt, sizeof(*receipt))) {
 				participant->state = CTRC_PARTICIPANT_BLOCKED;
+				if (path_out != NULL)
+					*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_TOMBSTONE_BYTES;
 				return CLUSTER_CTRC_PREPARE_REFUSED;
 			}
 			if (first_tombstone == UINT64_MAX)
@@ -5299,6 +5318,8 @@ cluster_ctrc_receipt_prepare_table_locked(
 		if (probe_state != CTRC_RECEIPT_PROBE_OCCUPIED || state == CTRC_RECEIPT_FREE
 			|| ctrc_bytes_zero(receipt, sizeof(*receipt))) {
 			participant->state = CTRC_PARTICIPANT_BLOCKED;
+			if (path_out != NULL)
+				*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_OCCUPIED;
 			return CLUSTER_CTRC_PREPARE_REFUSED;
 		}
 
@@ -5311,20 +5332,41 @@ cluster_ctrc_receipt_prepare_table_locked(
 				return CLUSTER_CTRC_PREPARE_DUPLICATE;
 			}
 			participant->state = CTRC_PARTICIPANT_BLOCKED;
+			if (path_out != NULL)
+				*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_DUPLICATE_CONFLICT;
 			return CLUSTER_CTRC_PREPARE_REFUSED;
 		}
 	}
 	if (selected_index == UINT64_MAX)
 		selected_index = first_tombstone;
-	if (selected_index == UINT64_MAX)
+	if (selected_index == UINT64_MAX) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_CAPACITY;
 		return CLUSTER_CTRC_PREPARE_CAPACITY;
+	}
 	if (ctrc_receipt_prepare_with_sequence(participant, publication, target,
 										   &receipts[selected_index], journal_sequence)
-		!= CLUSTER_CTRC_PREPARE_READY)
+		!= CLUSTER_CTRC_PREPARE_READY) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_SLOT_PREPARE;
 		return CLUSTER_CTRC_PREPARE_REFUSED;
+	}
 	probe_states[selected_index] = CTRC_RECEIPT_PROBE_OCCUPIED;
 	*receipt_index_out = selected_index;
 	return CLUSTER_CTRC_PREPARE_READY;
+}
+
+ClusterCtrcPrepareResult
+cluster_ctrc_receipt_prepare_table_locked(
+	ClusterCtrcParticipantEntry *participant, const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *identity, uint32 grant_generation,
+	const ClusterCtrcPublicationIdV1 *publication, const ClusterCtrcTargetV1 *target,
+	ClusterCtrcReceipt *receipts, uint8 *probe_states, Size receipt_count, uint64 journal_sequence,
+	uint64 *receipt_index_out, Size *probe_count_out)
+{
+	return ctrc_receipt_prepare_table_observed(participant, key, identity, grant_generation,
+		publication, target, receipts, probe_states, receipt_count, journal_sequence,
+		receipt_index_out, probe_count_out, NULL);
 }
 
 bool
@@ -5862,12 +5904,10 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 													  grant_generation, publication, target,
 													  &receipt_index);
 	} else {
-		if (path_out != NULL)
-			*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE;
-		result = cluster_ctrc_receipt_prepare_table_locked(
+		result = ctrc_receipt_prepare_table_observed(
 			participant, key, identity, grant_generation, publication, target, receipts,
 			ctrc_receipt_probe_states(), CtrcShared->receipt_entries, journal_sequence,
-			&receipt_index, NULL);
+			&receipt_index, NULL, path_out);
 		if (result == CLUSTER_CTRC_PREPARE_READY) {
 			CtrcReceiptLink *link = &ctrc_receipt_links()[receipt_index];
 

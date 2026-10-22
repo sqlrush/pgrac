@@ -4090,10 +4090,14 @@ UT_TEST(test_receipt_lifecycle_default_off_keeps_prepare_cancel_effects)
 	UT_ASSERT_EQ(receipt_log_count, 0);
 	UT_ASSERT_EQ(receipt_observe_calls, 0);
 }
+#ifndef CLUSTER_CTRC_PREPARE_TABLE_PATH_PRESENT
+#define CLUSTER_CTRC_PREPARE_PATH_TABLE_SLOT_PREPARE ((ClusterCtrcPreparePath)16)
+#endif
+
 UT_TEST(test_receipt_lifecycle_reports_original_shared_path_without_replay)
 {
 	for (unsigned path = CLUSTER_CTRC_PREPARE_PATH_NAMESPACE;
-		 path <= CLUSTER_CTRC_PREPARE_PATH_TABLE; path++) {
+		 path <= CLUSTER_CTRC_PREPARE_PATH_TABLE_SLOT_PREPARE; path++) {
 		ClusterUndoRecordPrepareReceipt receipt;
 		char expected[96];
 

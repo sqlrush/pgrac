@@ -107,6 +107,34 @@ cluster_ctrc_receipt_prepare_shared_observed(const ClusterCtrcTxnKeyV1 *key,
 }
 #endif
 
+
+/* Exact parent executes its original table body once. It has only the
+ * coarse TABLE observation; new expected cuts must fail behaviorally. */
+#ifndef CLUSTER_CTRC_PREPARE_TABLE_PATH_PRESENT
+#define CLUSTER_CTRC_PREPARE_PATH_TABLE_INPUT ((ClusterCtrcPreparePath)8)
+#define CLUSTER_CTRC_PREPARE_PATH_TABLE_PARTICIPANT ((ClusterCtrcPreparePath)9)
+#define CLUSTER_CTRC_PREPARE_PATH_TABLE_PUBLICATION ((ClusterCtrcPreparePath)10)
+#define CLUSTER_CTRC_PREPARE_PATH_TABLE_EMPTY_BYTES ((ClusterCtrcPreparePath)11)
+#define CLUSTER_CTRC_PREPARE_PATH_TABLE_TOMBSTONE_BYTES ((ClusterCtrcPreparePath)12)
+#define CLUSTER_CTRC_PREPARE_PATH_TABLE_OCCUPIED ((ClusterCtrcPreparePath)13)
+#define CLUSTER_CTRC_PREPARE_PATH_TABLE_DUPLICATE_CONFLICT ((ClusterCtrcPreparePath)14)
+#define CLUSTER_CTRC_PREPARE_PATH_TABLE_CAPACITY ((ClusterCtrcPreparePath)15)
+#define CLUSTER_CTRC_PREPARE_PATH_TABLE_SLOT_PREPARE ((ClusterCtrcPreparePath)16)
+
+static ClusterCtrcPrepareResult
+ctrc_receipt_prepare_table_observed(ClusterCtrcParticipantEntry *participant,
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *identity, uint32 grant,
+	const ClusterCtrcPublicationIdV1 *publication, const ClusterCtrcTargetV1 *target,
+	ClusterCtrcReceipt *receipts, uint8 *probe_states, Size count, uint64 journal,
+	uint64 *index, Size *probes, ClusterCtrcPreparePath *path)
+{
+	if (path != NULL)
+		*path = CLUSTER_CTRC_PREPARE_PATH_TABLE;
+	return cluster_ctrc_receipt_prepare_table_locked(participant, key, identity, grant,
+		publication, target, receipts, probe_states, count, journal, index, probes);
+}
+#endif
+
 int NBuffers = 16;
 int MaxBackends = 8;
 int cluster_node_id = 0;
@@ -1210,7 +1238,7 @@ UT_TEST(test_prepare_path_object_existing_keeps_refusal_race_and_duplicate)
 	}
 }
 
-UT_TEST(test_prepare_path_table_result_is_not_a_leaf_predicate)
+UT_TEST(test_prepare_path_table_ready_duplicate_and_refusals)
 {
 	ClusterCtrcOriginEntry *origin;
 	ClusterCtrcReceiptHandle first, handle;
@@ -1231,15 +1259,249 @@ UT_TEST(test_prepare_path_table_result_is_not_a_leaf_predicate)
 	}
 	UT_ASSERT_EQ(prepare_fixture_receipt_observed(origin, CtrcShared->receipt_entries + 1,
 		&handle, &path), CLUSTER_CTRC_PREPARE_CAPACITY);
-	UT_ASSERT_EQ(path, CLUSTER_CTRC_PREPARE_PATH_TABLE);
+	UT_ASSERT_EQ(path, CLUSTER_CTRC_PREPARE_PATH_TABLE_CAPACITY);
 	UT_ASSERT(!handle.valid);
 	fixture_receipt_inputs(origin, 1, &publication, &target);
 	publication.attempt_generation = 0;
 	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_shared_observed(&origin->key, &origin->touched[0],
 		origin->grant_generation, &publication, &target, &handle, &path), CLUSTER_CTRC_PREPARE_REFUSED);
-	UT_ASSERT_EQ(path, CLUSTER_CTRC_PREPARE_PATH_TABLE);
+	UT_ASSERT_EQ(path, CLUSTER_CTRC_PREPARE_PATH_TABLE_PUBLICATION);
 	UT_ASSERT(!handle.valid);
 	UT_ASSERT_EQ(held_count, 0);
+}
+
+typedef struct TablePrepareFixture {
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcParticipantEntry participant;
+	ClusterCtrcPublicationIdV1 publication;
+	ClusterCtrcTargetV1 target;
+	ClusterCtrcReceipt receipts[2];
+	uint8 probe_states[2];
+	uint64 index;
+	Size probes;
+	ClusterCtrcPreparePath path;
+} TablePrepareFixture;
+
+static void
+fixture_table_prepare(TablePrepareFixture *f)
+{
+	reset_fixture();
+	MemSet(f, 0, sizeof(*f));
+	f->origin = seed_origin(0, 1);
+	fixture_receipt_inputs(f->origin, 201, &f->publication, &f->target);
+	f->index = 42;
+	f->probes = 42;
+	f->path = CLUSTER_CTRC_PREPARE_PATH_UNKNOWN;
+}
+
+static ClusterCtrcPrepareResult
+prepare_table_fixture(TablePrepareFixture *f, Size count)
+{
+	return ctrc_receipt_prepare_table_observed(&f->participant, &f->origin->key,
+		&f->origin->touched[0], f->origin->grant_generation, &f->publication, &f->target,
+		f->receipts, f->probe_states, count, 500, &f->index, &f->probes, &f->path);
+}
+
+UT_TEST(test_table_path_input_short_circuits_participant_and_publication)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		TablePrepareFixture f;
+		ClusterCtrcParticipantEntry before;
+
+		fixture_table_prepare(&f);
+		f.participant.state = CTRC_PARTICIPANT_CLOSED_DRAINING;
+		f.publication.attempt_generation = 0;
+		before = f.participant;
+		UT_ASSERT_EQ(ctrc_receipt_prepare_table_observed(kind == 0 ? NULL : &f.participant,
+			&f.origin->key, &f.origin->touched[0], f.origin->grant_generation,
+			&f.publication, &f.target, f.receipts, f.probe_states, kind == 1 ? 0 : 1,
+			kind == 2 ? 0 : 500, kind == 3 ? NULL : &f.index, &f.probes, &f.path),
+			CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT_EQ(f.path, CLUSTER_CTRC_PREPARE_PATH_TABLE_INPUT);
+		UT_ASSERT_EQ(memcmp(&before, &f.participant, sizeof(before)), 0);
+		if (kind != 3)
+			UT_ASSERT_EQ(f.index, UINT64_MAX);
+		UT_ASSERT_EQ(f.probes, 0);
+		UT_ASSERT(ctrc_bytes_zero(f.receipts, sizeof(f.receipts)));
+	}
+}
+
+UT_TEST(test_table_path_participant_refusal_precedes_publication)
+{
+	TablePrepareFixture f;
+
+	fixture_table_prepare(&f);
+	f.participant.state = CTRC_PARTICIPANT_CLOSED_DRAINING;
+	f.publication.attempt_generation = 0;
+	UT_ASSERT_EQ(prepare_table_fixture(&f, 1), CLUSTER_CTRC_PREPARE_REFUSED);
+	UT_ASSERT_EQ(f.path, CLUSTER_CTRC_PREPARE_PATH_TABLE_PARTICIPANT);
+	UT_ASSERT_EQ(f.participant.state, CTRC_PARTICIPANT_BLOCKED);
+	UT_ASSERT_EQ(f.participant.next_key_sequence, 0);
+	UT_ASSERT_EQ(f.index, UINT64_MAX);
+	UT_ASSERT_EQ(f.probes, 0);
+	UT_ASSERT(ctrc_bytes_zero(f.receipts, sizeof(f.receipts)));
+}
+
+UT_TEST(test_table_path_publication_refusal_keeps_original_participant_open)
+{
+	TablePrepareFixture f;
+
+	fixture_table_prepare(&f);
+	f.publication.attempt_generation = 0;
+	UT_ASSERT_EQ(prepare_table_fixture(&f, 1), CLUSTER_CTRC_PREPARE_REFUSED);
+	UT_ASSERT_EQ(f.path, CLUSTER_CTRC_PREPARE_PATH_TABLE_PUBLICATION);
+	UT_ASSERT_EQ(f.participant.state, CTRC_PARTICIPANT_OPEN);
+	UT_ASSERT_EQ(f.participant.next_key_sequence, 1);
+	UT_ASSERT_EQ(f.participant.receipt_count, 0);
+	UT_ASSERT_EQ(f.index, UINT64_MAX);
+	UT_ASSERT_EQ(f.probes, 0);
+	UT_ASSERT(ctrc_bytes_zero(f.receipts, sizeof(f.receipts)));
+}
+
+UT_TEST(test_table_path_dirty_or_malformed_probe_keeps_bytes_and_blocks)
+{
+	const uint8 states[] = {CTRC_RECEIPT_PROBE_EMPTY, CTRC_RECEIPT_PROBE_TOMBSTONE,
+		255, CTRC_RECEIPT_PROBE_OCCUPIED, CTRC_RECEIPT_PROBE_OCCUPIED};
+	const ClusterCtrcPreparePath expected[] = {CLUSTER_CTRC_PREPARE_PATH_TABLE_EMPTY_BYTES,
+		CLUSTER_CTRC_PREPARE_PATH_TABLE_TOMBSTONE_BYTES,
+		CLUSTER_CTRC_PREPARE_PATH_TABLE_OCCUPIED, CLUSTER_CTRC_PREPARE_PATH_TABLE_OCCUPIED,
+		CLUSTER_CTRC_PREPARE_PATH_TABLE_OCCUPIED};
+
+	for (unsigned kind = 0; kind < lengthof(states); kind++) {
+		TablePrepareFixture f;
+		ClusterCtrcReceipt before[2];
+
+		fixture_table_prepare(&f);
+		f.probe_states[0] = states[kind];
+		if (kind != 4)
+			f.receipts[0].publication.operation_id = 99;
+		memcpy(before, f.receipts, sizeof(before));
+		UT_ASSERT_EQ(prepare_table_fixture(&f, 1), CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT_EQ(f.path, expected[kind]);
+		UT_ASSERT_EQ(f.participant.state, CTRC_PARTICIPANT_BLOCKED);
+		UT_ASSERT_EQ(f.participant.next_key_sequence, 1);
+		UT_ASSERT_EQ(f.participant.receipt_count, 0);
+		UT_ASSERT_EQ(f.participant.prepared_count, 0);
+		UT_ASSERT_EQ(f.index, UINT64_MAX);
+		UT_ASSERT_EQ(f.probes, 1);
+		UT_ASSERT_EQ(memcmp(before, f.receipts, sizeof(before)), 0);
+		UT_ASSERT_EQ(f.probe_states[0], states[kind]);
+	}
+}
+
+UT_TEST(test_table_path_duplicate_conflict_does_not_publish_again)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		TablePrepareFixture f;
+		ClusterCtrcReceipt before;
+
+		fixture_table_prepare(&f);
+		UT_ASSERT_EQ(prepare_table_fixture(&f, 1), CLUSTER_CTRC_PREPARE_READY);
+		UT_ASSERT_EQ(f.path, CLUSTER_CTRC_PREPARE_PATH_TABLE);
+		if (kind == 1)
+			f.target.block_number++;
+		if (kind == 2)
+			f.receipts[0].publication.journal_sequence = 0;
+		if (kind == 3)
+			f.receipts[0].publication.key_sequence = 0;
+		before = f.receipts[0];
+		UT_ASSERT_EQ(prepare_table_fixture(&f, 1), kind == 0 ? CLUSTER_CTRC_PREPARE_DUPLICATE
+			: CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT_EQ(f.path, kind == 0 ? CLUSTER_CTRC_PREPARE_PATH_TABLE
+			: CLUSTER_CTRC_PREPARE_PATH_TABLE_DUPLICATE_CONFLICT);
+		UT_ASSERT_EQ(f.participant.state, kind == 0 ? CTRC_PARTICIPANT_OPEN : CTRC_PARTICIPANT_BLOCKED);
+		UT_ASSERT_EQ(f.participant.next_key_sequence, 2);
+		UT_ASSERT_EQ(f.participant.receipt_count, 1);
+		UT_ASSERT_EQ(f.participant.prepared_count, 1);
+		UT_ASSERT_EQ(f.index, kind == 0 ? 0 : UINT64_MAX);
+		UT_ASSERT_EQ(f.probes, 1);
+		UT_ASSERT_EQ(memcmp(&before, &f.receipts[0], sizeof(before)), 0);
+	}
+}
+
+UT_TEST(test_table_path_sequence_capacity_and_tombstone_probe_order)
+{
+	const uint64 next[] = {0, UINT64_MAX, 2};
+	for (unsigned kind = 0; kind < lengthof(next); kind++) {
+		TablePrepareFixture f;
+
+		fixture_table_prepare(&f);
+		UT_ASSERT_EQ(cluster_ctrc_participant_open(&f.participant, &f.origin->key,
+			f.origin->grant_generation, &f.origin->touched[0]), CLUSTER_CTRC_PARTICIPANT_OPENED);
+		f.participant.next_key_sequence = next[kind];
+		UT_ASSERT_EQ(prepare_table_fixture(&f, 1), CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT_EQ(f.path, CLUSTER_CTRC_PREPARE_PATH_TABLE_SLOT_PREPARE);
+		UT_ASSERT_EQ(f.participant.state, CTRC_PARTICIPANT_BLOCKED);
+		UT_ASSERT_EQ(f.participant.next_key_sequence, next[kind]);
+		UT_ASSERT_EQ(f.participant.receipt_count, 0);
+		UT_ASSERT_EQ(f.probes, 1);
+		UT_ASSERT_EQ(f.index, UINT64_MAX);
+		UT_ASSERT_EQ(f.probe_states[0], CTRC_RECEIPT_PROBE_EMPTY);
+		UT_ASSERT(ctrc_bytes_zero(f.receipts, sizeof(f.receipts)));
+	}
+	{
+		TablePrepareFixture f;
+		ClusterCtrcReceipt before;
+
+		fixture_table_prepare(&f);
+		UT_ASSERT_EQ(prepare_table_fixture(&f, 1), CLUSTER_CTRC_PREPARE_READY);
+		before = f.receipts[0];
+		f.publication.operation_id++;
+		UT_ASSERT_EQ(prepare_table_fixture(&f, 1), CLUSTER_CTRC_PREPARE_CAPACITY);
+		UT_ASSERT_EQ(f.path, CLUSTER_CTRC_PREPARE_PATH_TABLE_CAPACITY);
+		UT_ASSERT_EQ(f.participant.state, CTRC_PARTICIPANT_OPEN);
+		UT_ASSERT_EQ(f.participant.receipt_count, 1);
+		UT_ASSERT_EQ(f.probes, 1);
+		UT_ASSERT_EQ(f.index, UINT64_MAX);
+		UT_ASSERT_EQ(memcmp(&before, &f.receipts[0], sizeof(before)), 0);
+	}
+	{
+		TablePrepareFixture f;
+		uint64 first;
+
+		fixture_table_prepare(&f);
+		first = ctrc_receipt_probe_hash(&f.origin->key, &f.publication) % 2;
+		f.probe_states[first] = CTRC_RECEIPT_PROBE_TOMBSTONE;
+		UT_ASSERT_EQ(prepare_table_fixture(&f, 2), CLUSTER_CTRC_PREPARE_READY);
+		UT_ASSERT_EQ(f.path, CLUSTER_CTRC_PREPARE_PATH_TABLE);
+		UT_ASSERT_EQ(f.index, first);
+		UT_ASSERT_EQ(f.probes, 2);
+		UT_ASSERT_EQ(f.probe_states[first], CTRC_RECEIPT_PROBE_OCCUPIED);
+		UT_ASSERT_EQ(f.probe_states[1 - first], CTRC_RECEIPT_PROBE_EMPTY);
+		UT_ASSERT_EQ(f.receipts[first].publication.journal_sequence, 500);
+	}
+}
+
+UT_TEST(test_table_path_null_observer_preserves_original_table_effects)
+{
+	for (unsigned kind = 0; kind < 3; kind++) {
+		TablePrepareFixture f, g;
+		ClusterCtrcPrepareResult old_result, observed_result;
+		uint64 journal;
+
+		fixture_table_prepare(&f);
+		if (kind == 1)
+			f.publication.attempt_generation = 0;
+		if (kind == 2)
+			f.receipts[0].publication.operation_id = 99;
+		g = f;
+		journal = CtrcShared->global_journal_generation;
+		old_result = cluster_ctrc_receipt_prepare_table_locked(&f.participant, &f.origin->key,
+			&f.origin->touched[0], f.origin->grant_generation, &f.publication, &f.target,
+			f.receipts, f.probe_states, 1, 500, &f.index, &f.probes);
+		observed_result = ctrc_receipt_prepare_table_observed(&g.participant, &g.origin->key,
+			&g.origin->touched[0], g.origin->grant_generation, &g.publication, &g.target,
+			g.receipts, g.probe_states, 1, 500, &g.index, &g.probes, NULL);
+		UT_ASSERT_EQ(old_result, kind == 0 ? CLUSTER_CTRC_PREPARE_READY : CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT_EQ(observed_result, old_result);
+		UT_ASSERT_EQ(memcmp(&f.participant, &g.participant, sizeof(f.participant)), 0);
+		UT_ASSERT_EQ(memcmp(f.receipts, g.receipts, sizeof(f.receipts)), 0);
+		UT_ASSERT_EQ(memcmp(f.probe_states, g.probe_states, sizeof(f.probe_states)), 0);
+		UT_ASSERT_EQ(f.index, g.index);
+		UT_ASSERT_EQ(f.probes, g.probes);
+		UT_ASSERT_EQ(CtrcShared->global_journal_generation, journal);
+		UT_ASSERT_EQ(held_count, 0);
+	}
 }
 
 UT_TEST(test_prepare_path_null_observer_preserves_exact_shared_effects)
@@ -3685,12 +3947,19 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(93);
+	UT_PLAN(100);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
 	UT_RUN(test_prepare_path_input_precedes_journal_exhaustion);
 	UT_RUN(test_prepare_path_chain_precedes_locator_and_keeps_blocked_state);
 	UT_RUN(test_prepare_path_object_existing_keeps_refusal_race_and_duplicate);
-	UT_RUN(test_prepare_path_table_result_is_not_a_leaf_predicate);
+	UT_RUN(test_prepare_path_table_ready_duplicate_and_refusals);
+	UT_RUN(test_table_path_input_short_circuits_participant_and_publication);
+	UT_RUN(test_table_path_participant_refusal_precedes_publication);
+	UT_RUN(test_table_path_publication_refusal_keeps_original_participant_open);
+	UT_RUN(test_table_path_dirty_or_malformed_probe_keeps_bytes_and_blocks);
+	UT_RUN(test_table_path_duplicate_conflict_does_not_publish_again);
+	UT_RUN(test_table_path_sequence_capacity_and_tombstone_probe_order);
+	UT_RUN(test_table_path_null_observer_preserves_original_table_effects);
 	UT_RUN(test_prepare_path_null_observer_preserves_exact_shared_effects);
 	UT_RUN(test_reply_trace_off_preserves_ack);
 	UT_RUN(test_reply_trace_ack_landing_is_original_locked_transition);
