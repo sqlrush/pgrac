@@ -425,6 +425,7 @@ static void reset(void)
 	CurrentResourceOwner = (ResourceOwner)&info;
 	CritSectionCount = ShutdownRequestPending = 0;
 	cluster_enabled = cluster_shared_config = true;
+	cluster_node_id = 0;
 	native_recovery = false;
 	effects_ready = false;
 	xid_ready = invalidate_writer_on_xid_ready = false;
@@ -451,6 +452,7 @@ static void reset(void)
 	memset(clusterStartupWriter.claim.identity.authority_uuid, 2, 16);
 	clusterStartupWriter.claim.identity.thread_claim_created_at = 100;
 	clusterStartupWriter.claim.identity.root_lineage_seq = 1;
+	clusterStartupWriter.claim.identity.origin_node_id = cluster_node_id;
 	clusterStartupWriter.claim.identity.origin_thread_id = 1;
 	clusterStartupWriter.claim.identity.origin_owner_incarnation = owner_boot;
 	clusterStartupWriter.database_incarnation = 2;
@@ -1235,7 +1237,7 @@ UT_TEST(test_lmon_observes_only_original_recovered_install_without_a_checkpoint_
 
 UT_TEST(test_lmon_observation_rejects_wrong_actor_or_current_input_without_leaking_a_value)
 {
-	for (int fault = 0; fault < 19; fault++) {
+	for (int fault = 0; fault < 22; fault++) {
 		ClusterRecoveryCheckpointObservationV1 observation;
 		reset(); retain(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info)); serving_actor();
 		switch (fault) {
@@ -1258,6 +1260,9 @@ UT_TEST(test_lmon_observation_rejects_wrong_actor_or_current_input_without_leaki
 		case 16: observed_writer.ref.claim.max_config_generation++; break;
 		case 17: window_region.checkpoint_owner.valid = false; break;
 		case 18: observed_writer.ref.claim.identity.system_identifier++; break;
+		case 19: observed_writer.ref.claim.identity.origin_node_id++; break;
+		case 20: observed_writer.ref.claim.identity.origin_thread_id++; break;
+		case 21: observed_writer.ref.claim.identity.origin_owner_incarnation++; break;
 		}
 		memset(&observation, 0xa5, sizeof(observation));
 		UT_ASSERT(!cluster_recovery_checkpoint_observe_v1(&observation));

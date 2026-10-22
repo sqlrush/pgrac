@@ -696,6 +696,11 @@ cluster_recovery_checkpoint_observe_v1(ClusterRecoveryCheckpointObservationV1 *o
 	SpinLockRelease(&slot->lock);
 	if (observed.slot_generation == 0 || observed.owner.owner_boot == 0
 		|| observed.owner.writer.ref.claim.identity.system_identifier != GetSystemIdentifier()
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| observed.owner.writer.ref.claim.identity.origin_node_id != cluster_node_id
+		|| observed.owner.writer.ref.claim.identity.origin_thread_id != cluster_node_id + 1
+		|| observed.owner.writer.ref.claim.identity.origin_owner_incarnation
+			   != observed.owner.owner_boot
 		|| cluster_qvotec_get_self_incarnation() != observed.owner.owner_boot
 		|| cluster_epoch_get_current() != observed.owner.writer.epoch
 		|| !cluster_wal_thread_current_v2_ref(&current)
