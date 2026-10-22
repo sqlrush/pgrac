@@ -1,0 +1,6 @@
+2026-10-23 | E | changed cluster_gcs_current_mx_member_proof_fetch_and_wait to event-driven unbounded CV sleep; next run focused compile/test and inspect diff.
+2026-10-23 | E | focused object build and test_cluster_multixact_current TAP 55/55 passed; next commit/push source-only change and register B2 inbox.
+2026-10-23 05:41 CST | E | pushed 7851b0903e4e85bb7e2df5c9a32816d88afc0d2a; next slice is service-side CONTENT_LOCK BUSY deferred test.
+2026-10-23 05:50 CST | E | added deterministic service-side CONTENT_LOCK BUSY defer source guard test; next run python fixture and commit/push.
+2026-10-23 05:55 CST | E | fixed CONTENT_LOCK BUSY source guard assertions for finish/deferred and retained-drain paths; next run deterministic test and inspect diff.
+2026-10-23 05:57 CST | E | corrected retained-drain trace assertion to guard_capture helper; next run source guard and diff checks.
