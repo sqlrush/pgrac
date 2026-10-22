@@ -4887,6 +4887,8 @@ serving_cut_read(const ClusterSemanticActivationRecord *open, const uint8 *descr
 	if (cut->recovery_owner_valid
 		&& (cut->recovery_owner.owner.owner_boot != cut->control.incarnation
 			|| cut->recovery_owner.owner.writer.epoch != cut->control.epoch
+			|| cut->recovery_owner.owner.writer.ref.claim.identity.system_identifier
+				!= GetSystemIdentifier()
 			|| cut->recovery_owner.owner.writer.ref.claim.identity.origin_node_id != cluster_node_id
 			|| cut->recovery_owner.owner.writer.ref.claim.identity.origin_thread_id != cluster_node_id + 1
 			|| cut->recovery_owner.owner.writer.ref.claim.identity.origin_owner_incarnation
@@ -4909,6 +4911,7 @@ serving_recovery_owner_current(const ServingCut *cut)
 		|| (cluster_recovery_checkpoint_observe_v1(&observed)
 			&& observed.slot_generation != 0
 			&& observed.slot_generation != UINT64_MAX
+			&& observed.owner.writer.ref.claim.identity.system_identifier == GetSystemIdentifier()
 			&& cluster_wal_thread_recovered_writer_matches(&observed.owner.writer.ref,
 													 observed.owner.writer.epoch)
 			&& memcmp(&observed, &cut->recovery_owner, sizeof(observed)) == 0);

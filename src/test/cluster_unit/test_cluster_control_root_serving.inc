@@ -311,6 +311,23 @@ UT_TEST(test_serving_recovered_state_requires_published_writer_match)
 	serving_normal_start_state = CLUSTER_NORMAL_START_UNCLASSIFIED;
 }
 
+UT_TEST(test_serving_recovered_state_rejects_foreign_owner_system)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	ClusterControlRootFileToken token;
+	serving_recovery_fixture(before, &root, CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED);
+	if (ut_current_failed)
+		return;
+	serving_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	test_recovered_checkpoint_owner_system_identifier(root.header.system_identifier ^ UINT64_C(1));
+	UT_ASSERT(cluster_control_root_v3_serving_poll(&serving_open, serving_descriptor, &token)
+			  != 0);
+	UT_ASSERT(v2_zero(&token, sizeof(token)));
+	v2_assert_primary_unchanged(before);
+	serving_normal_start_state = CLUSTER_NORMAL_START_UNCLASSIFIED;
+}
+
 UT_TEST(test_serving_recovery_owner_drift_across_root_io_never_publishes_open)
 {
 	for (unsigned fault = 0; fault < 7; fault++) {
