@@ -663,6 +663,25 @@ static XLogRecPtr cluster_recovery_merged_replay(const uint64 *bitmap, const XLo
 												 TimeLineID tli, uint16 own_thread,
 												 TimeLineID *replayTLI, bool restore_mode,
 												 ClusterRecoveryFencePlan **fence_plan);
+/* Startup-process local, one-shot handoff of the original typed preparation.
+ * Nothing here is a durable certificate or a successor writer capability. */
+typedef struct ClusterColdStartupPreparationV1 {
+	bool started;
+	bool ready;
+	ResourceOwner owner;
+	int pid;
+	XLogRecPtr checkpoint;
+	XLogRecPtr redo;
+	TimeLineID checkpoint_tli;
+	TimeLineID redo_tli;
+	ClusterMergeEngage engage;
+	ClusterRecoveryFencePlan *fence;
+	ClusterColdTypedV1 *typed;
+} ClusterColdStartupPreparationV1;
+static ClusterColdStartupPreparationV1 cluster_recovery_cold_preparation;
+static void cluster_recovery_typed_fail(ClusterRecoveryFencePlan **fence_plan,
+									  ClusterColdTypedV1 **typed,
+									  const char *message, const char *detail);
 static ClusterColdTypedV1 *cluster_recovery_typed_begin(ClusterRecoveryFencePlan **fence_plan);
 static XLogRecPtr cluster_recovery_typed_replay(ClusterColdTypedV1 **typed,
 												TimeLineID *replayTLI,
@@ -2830,64 +2849,19 @@ ShutdownWalRecovery(void)
 		DisownLatch(&XLogRecoveryCtl->recoveryWakeupLatch);
 }
 
-/*
- * Perform WAL recovery.
- *
- * If the system was shut down cleanly, this is never called.
- */
-void
-PerformWalRecovery(void)
-{
-	XLogRecord *record;
-	bool		reachedRecoveryTarget = false;
-	TimeLineID	replayTLI;
 #ifdef USE_PGRAC_CLUSTER
+/* The same readonly/claim/typed preparation is used by native replay and by
+ * the earlier shared Startup control boundary. It creates no successor WAL
+ * writer or control publication. */
+static void
+cluster_recovery_prepare_cold(ClusterMergeEngage *engage,
+							 ClusterRecoveryFencePlan **fence_plan,
+							 ClusterColdTypedV1 **typed)
+{
 	ClusterMergeEngage cluster_engage = CLUSTER_MERGE_NO_DISABLED;
 	ClusterRecoveryFencePlan *cluster_fence_plan = NULL;
 	ClusterColdTypedV1 *cluster_typed = NULL;
-#endif
 
-	/*
-	 * Initialize shared variables for tracking progress of WAL replay, as if
-	 * we had just replayed the record before the REDO location (or the
-	 * checkpoint record itself, if it's a shutdown checkpoint).
-	 */
-	SpinLockAcquire(&XLogRecoveryCtl->info_lck);
-	if (RedoStartLSN < CheckPointLoc)
-	{
-		XLogRecoveryCtl->lastReplayedReadRecPtr = InvalidXLogRecPtr;
-		XLogRecoveryCtl->lastReplayedEndRecPtr = RedoStartLSN;
-		XLogRecoveryCtl->lastReplayedTLI = RedoStartTLI;
-	}
-	else
-	{
-		XLogRecoveryCtl->lastReplayedReadRecPtr = xlogreader->ReadRecPtr;
-		XLogRecoveryCtl->lastReplayedEndRecPtr = xlogreader->EndRecPtr;
-		XLogRecoveryCtl->lastReplayedTLI = CheckPointTLI;
-	}
-	XLogRecoveryCtl->replayEndRecPtr = XLogRecoveryCtl->lastReplayedEndRecPtr;
-	XLogRecoveryCtl->replayEndTLI = XLogRecoveryCtl->lastReplayedTLI;
-	XLogRecoveryCtl->recoveryLastXTime = 0;
-	XLogRecoveryCtl->currentChunkStartTime = 0;
-	XLogRecoveryCtl->recoveryPauseState = RECOVERY_NOT_PAUSED;
-	SpinLockRelease(&XLogRecoveryCtl->info_lck);
-
-	/* Also ensure XLogReceiptTime has a sane value */
-	XLogReceiptTime = GetCurrentTimestamp();
-
-	/*
-	 * Let postmaster know we've started redo now, so that it can launch the
-	 * archiver if necessary.
-	 */
-	if (IsUnderPostmaster)
-		SendPostmasterSignal(PMSIGNAL_RECOVERY_STARTED);
-
-	/*
-	 * Allow read-only connections immediately if we're consistent already.
-	 */
-	CheckRecoveryConsistency();
-
-#ifdef USE_PGRAC_CLUSTER
 	/*
 	 * RF-ROOT P4 S04-11: the sole cold readonly producer freezes the exact
 	 * replay/proof-origin set and obtains all external admissions before the
@@ -2959,6 +2933,148 @@ PerformWalRecovery(void)
 	else
 		ereport(DEBUG1, (errmsg("cluster merged recovery: not engaged (reason %d)",
 								(int) cluster_engage)));
+
+	*engage = cluster_engage;
+	*fence_plan = cluster_fence_plan;
+	*typed = cluster_typed;
+}
+
+static bool
+cluster_recovery_cold_preparation_context(void)
+{
+	return cluster_shared_config && AmStartupProcess() && InRecovery
+		&& !ArchiveRecoveryRequested && !StandbyMode
+		&& !cluster_backup_recovery_merge_required && !cluster_mrp_should_start()
+		&& CurrentResourceOwner != NULL && MyProcPid > 0
+		&& !XLogRecPtrIsInvalid(CheckPointLoc) && !XLogRecPtrIsInvalid(RedoStartLSN)
+		&& CheckPointTLI != 0 && RedoStartTLI != 0;
+}
+
+/* Prepare once, before Startup's shared crash control site. The original
+ * typed owner retains its source/retention/IR set until that exact plan is
+ * consumed by replay; caller flags cannot substitute for its readiness. */
+void
+ClusterPrepareColdWalRecovery(void)
+{
+	ClusterColdStartupPreparationV1 *prepared = &cluster_recovery_cold_preparation;
+	ClusterMergeEngage engage;
+	ClusterRecoveryFencePlan *fence_plan = NULL;
+	ClusterColdTypedV1 *typed = NULL;
+
+	if (prepared->started || !cluster_recovery_cold_preparation_context())
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+				 errmsg("shared cold recovery preparation has no current Startup input")));
+	prepared->started = true;
+	prepared->owner = CurrentResourceOwner;
+	prepared->pid = MyProcPid;
+	prepared->checkpoint = CheckPointLoc;
+	prepared->redo = RedoStartLSN;
+	prepared->checkpoint_tli = CheckPointTLI;
+	prepared->redo_tli = RedoStartTLI;
+	cluster_recovery_prepare_cold(&engage, &fence_plan, &typed);
+	if (!cluster_recovery_cold_preparation_context()
+		|| prepared->owner != CurrentResourceOwner || prepared->pid != MyProcPid
+		|| prepared->checkpoint != CheckPointLoc || prepared->redo != RedoStartLSN
+		|| prepared->checkpoint_tli != CheckPointTLI || prepared->redo_tli != RedoStartTLI
+		|| engage != CLUSTER_MERGE_ENGAGE || fence_plan == NULL || typed == NULL)
+		cluster_recovery_typed_fail(&fence_plan, &typed,
+									"shared cold recovery preparation changed", NULL);
+	prepared->engage = engage;
+	prepared->fence = fence_plan;
+	prepared->typed = typed;
+	prepared->ready = true;
+}
+
+static void
+cluster_recovery_take_cold_preparation(ClusterMergeEngage *engage,
+									 ClusterRecoveryFencePlan **fence_plan,
+									 ClusterColdTypedV1 **typed)
+{
+	ClusterColdStartupPreparationV1 *prepared = &cluster_recovery_cold_preparation;
+
+	if (!prepared->started || !prepared->ready
+		|| !cluster_recovery_cold_preparation_context()
+		|| prepared->owner != CurrentResourceOwner || prepared->pid != MyProcPid
+		|| prepared->checkpoint != CheckPointLoc || prepared->redo != RedoStartLSN
+		|| prepared->checkpoint_tli != CheckPointTLI || prepared->redo_tli != RedoStartTLI
+		|| prepared->engage != CLUSTER_MERGE_ENGAGE
+		|| prepared->fence == NULL || prepared->typed == NULL)
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+				 errmsg("shared cold replay has no exact prepared Startup input")));
+	*engage = prepared->engage;
+	*fence_plan = prepared->fence;
+	*typed = prepared->typed;
+	prepared->ready = false;
+	prepared->fence = NULL;
+	prepared->typed = NULL;
+}
+#endif
+
+/*
+ * Perform WAL recovery.
+ *
+ * If the system was shut down cleanly, this is never called.
+ */
+void
+PerformWalRecovery(void)
+{
+	XLogRecord *record;
+	bool		reachedRecoveryTarget = false;
+	TimeLineID	replayTLI;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterMergeEngage cluster_engage = CLUSTER_MERGE_NO_DISABLED;
+	ClusterRecoveryFencePlan *cluster_fence_plan = NULL;
+	ClusterColdTypedV1 *cluster_typed = NULL;
+#endif
+
+	/*
+	 * Initialize shared variables for tracking progress of WAL replay, as if
+	 * we had just replayed the record before the REDO location (or the
+	 * checkpoint record itself, if it's a shutdown checkpoint).
+	 */
+	SpinLockAcquire(&XLogRecoveryCtl->info_lck);
+	if (RedoStartLSN < CheckPointLoc)
+	{
+		XLogRecoveryCtl->lastReplayedReadRecPtr = InvalidXLogRecPtr;
+		XLogRecoveryCtl->lastReplayedEndRecPtr = RedoStartLSN;
+		XLogRecoveryCtl->lastReplayedTLI = RedoStartTLI;
+	}
+	else
+	{
+		XLogRecoveryCtl->lastReplayedReadRecPtr = xlogreader->ReadRecPtr;
+		XLogRecoveryCtl->lastReplayedEndRecPtr = xlogreader->EndRecPtr;
+		XLogRecoveryCtl->lastReplayedTLI = CheckPointTLI;
+	}
+	XLogRecoveryCtl->replayEndRecPtr = XLogRecoveryCtl->lastReplayedEndRecPtr;
+	XLogRecoveryCtl->replayEndTLI = XLogRecoveryCtl->lastReplayedTLI;
+	XLogRecoveryCtl->recoveryLastXTime = 0;
+	XLogRecoveryCtl->currentChunkStartTime = 0;
+	XLogRecoveryCtl->recoveryPauseState = RECOVERY_NOT_PAUSED;
+	SpinLockRelease(&XLogRecoveryCtl->info_lck);
+
+	/* Also ensure XLogReceiptTime has a sane value */
+	XLogReceiptTime = GetCurrentTimestamp();
+
+	/*
+	 * Let postmaster know we've started redo now, so that it can launch the
+	 * archiver if necessary.
+	 */
+	if (IsUnderPostmaster)
+		SendPostmasterSignal(PMSIGNAL_RECOVERY_STARTED);
+
+	/*
+	 * Allow read-only connections immediately if we're consistent already.
+	 */
+	CheckRecoveryConsistency();
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config || cluster_recovery_cold_preparation.started)
+		cluster_recovery_take_cold_preparation(&cluster_engage, &cluster_fence_plan,
+											 &cluster_typed);
+	else
+		cluster_recovery_prepare_cold(&cluster_engage, &cluster_fence_plan, &cluster_typed);
 
 	/*
 	 * RF A1 W6: merge_recovered_lsn is a retained on-disk compatibility

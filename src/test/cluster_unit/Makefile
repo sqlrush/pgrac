@@ -540,6 +540,7 @@ test_cluster_relmap_init: test_cluster_relmap_init.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a -o $@
 
 # PGRAC: execute original entry-point prologues before any native mutation.
+TESTS += test_cluster_cold_start_prepare
 TESTS += test_cluster_fresh_scope
 
 # Include tests registered after the initial all prerequisite expansion.
@@ -9785,3 +9786,39 @@ test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_ow
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
         $(top_builddir)/src/common/libpgcommon_srv.a \
         $(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+
+# PGRAC: actual early typed preparation and the original replay entry handoff.
+test_cluster_cold_start_prepare_types.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile
+	awk '/^typedef struct ClusterColdStartupPreparationV1 / { emit=1; count++ } \
+	     emit { print } /^} ClusterColdStartupPreparationV1;/ { emit=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cold_start_prepare_owner.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile
+	awk '/^cluster_recovery_(prepare_cold|take_cold_preparation)\(/ { print "static void"; emit=1; count++ } \
+	     /^cluster_recovery_cold_preparation_context\(/ { print "static bool"; emit=1; count++ } \
+	     /^ClusterPrepareColdWalRecovery\(/ { print "void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cold_start_route.inc: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c Makefile
+	awk '/^cluster_cold_route_v1\(/ { print "ClusterColdRouteV1"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cold_start_replay_entry.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile
+	awk '/^PerformWalRecovery\(/ { owner=1 } \
+	     owner && /if \(cluster_shared_config \|\| cluster_recovery_cold_preparation.started\)/ { emit=1; count++ } \
+	     emit && /^[ \t]*$$/ { emit=0; ended++ } \
+	     emit { print } /^}/ { owner=0 } END { if (count != 1 || ended != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cold_start_prepare: test_cluster_cold_start_prepare.c unit_test.h \
+        test_cluster_cold_start_prepare_types.inc test_cluster_cold_start_prepare_owner.inc \
+        test_cluster_cold_start_route.inc test_cluster_cold_start_replay_entry.inc \
+        $(top_srcdir)/src/include/access/xlogrecovery.h \
+        $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_merge.h \
+        $(top_srcdir)/src/include/cluster/cluster_mrp.h \
+        $(top_srcdir)/src/include/cluster/cluster_wal_thread.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@

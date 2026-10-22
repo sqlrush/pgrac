@@ -82,6 +82,11 @@ extern void XLogRecoveryShmemInit(void);
 extern void InitWalRecovery(ControlFileData *ControlFile,
 							bool *wasShutdown_ptr, bool *haveBackupLabel_ptr,
 							bool *haveTblspcMap_ptr);
+#ifdef USE_PGRAC_CLUSTER
+/* Original typed cold plan, prepared before shared Startup control handling;
+ * one-shot replay input only, without control publication or a WAL writer. */
+extern void ClusterPrepareColdWalRecovery(void);
+#endif
 extern void PerformWalRecovery(void);
 
 /*

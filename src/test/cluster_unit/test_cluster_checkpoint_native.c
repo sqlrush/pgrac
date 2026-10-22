@@ -1954,6 +1954,17 @@ UT_TEST(legacy_startup_keeps_its_control_authority_path)
 	UT_ASSERT_EQ(legacy_anchors, 1);
 }
 
+static unsigned cold_prepare_calls;
+static bool cold_prepare_ok;
+
+void
+ClusterPrepareColdWalRecovery(void)
+{
+	cold_prepare_calls++;
+	if (!cold_prepare_ok)
+		ereport(FATAL, (errmsg("typed cold preparation refused")));
+}
+
 static bool
 startup_recovery_control_site(void)
 {
@@ -1963,24 +1974,44 @@ startup_recovery_control_site(void)
 	return true;
 }
 
-UT_TEST(shared_crash_control_refuses_before_untyped_publication)
+UT_TEST(shared_crash_control_prepares_without_untyped_publication)
 {
 	reset_fixture();
+	cold_prepare_calls = 0;
+	cold_prepare_ok = true;
 	MyBackendType = B_STARTUP;
 	InRecovery = true;
 	current.state = DB_IN_CRASH_RECOVERY;
 	selected = current;
-	UT_ASSERT(!startup_recovery_control_site());
-	UT_ASSERT_EQ(native_error_level, FATAL);
+	UT_ASSERT(startup_recovery_control_site());
+	UT_ASSERT_EQ(cold_prepare_calls, 1);
+	UT_ASSERT_EQ(native_error_level, 0);
 	UT_ASSERT_EQ(native_writes, 0);
 	UT_ASSERT_EQ(root_calls + startup_calls + install_calls, 0);
 	UT_ASSERT_EQ(memcmp(&selected, &current, sizeof(current)), 0);
 	UT_ASSERT_EQ(CritSectionCount, 0);
 }
 
+UT_TEST(shared_crash_control_prepare_refusal_never_publishes)
+{
+	reset_fixture();
+	cold_prepare_calls = 0;
+	cold_prepare_ok = false;
+	MyBackendType = B_STARTUP;
+	InRecovery = true;
+	current.state = DB_IN_CRASH_RECOVERY;
+	selected = current;
+	UT_ASSERT(!startup_recovery_control_site());
+	UT_ASSERT_EQ(cold_prepare_calls, 1);
+	UT_ASSERT_EQ(native_error_level, FATAL);
+	UT_ASSERT_EQ(native_writes, 0);
+	UT_ASSERT_EQ(memcmp(&selected, &current, sizeof(current)), 0);
+}
+
 UT_TEST(legacy_crash_control_keeps_native_publication)
 {
 	reset_fixture();
+	cold_prepare_calls = 0;
 	cluster_shared_config = false;
 	MyBackendType = B_STARTUP;
 	InRecovery = true;
@@ -1988,6 +2019,7 @@ UT_TEST(legacy_crash_control_keeps_native_publication)
 	UT_ASSERT(startup_recovery_control_site());
 	UT_ASSERT_EQ(native_error_level, 0);
 	UT_ASSERT_EQ(native_writes, 1);
+	UT_ASSERT_EQ(cold_prepare_calls, 0);
 }
 
 /* PGRAC: actual directory validator on real scratch files, not a mocked
@@ -2816,7 +2848,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(74);
+	UT_PLAN(75);
 	UT_RUN(recovery_checkpoint_selects_scope_only_for_closed_online_owner);
 	UT_RUN(recovery_checkpoint_closed_admission_uses_only_original_scope);
 	UT_RUN(recovery_checkpoint_preserves_owner_and_native_guards);
@@ -2846,7 +2878,8 @@ main(void)
 	UT_RUN(initializer_selection_waits_for_original_lock_before_native_side_effect);
 	UT_RUN(clean_writer_checkpoint_uses_exact_existing_fence_qualification);
 	UT_RUN(clean_checkpoint_cannot_borrow_other_input_epoch_or_writer);
-	UT_RUN(shared_crash_control_refuses_before_untyped_publication);
+	UT_RUN(shared_crash_control_prepares_without_untyped_publication);
+	UT_RUN(shared_crash_control_prepare_refusal_never_publishes);
 	UT_RUN(legacy_crash_control_keeps_native_publication);
 	UT_RUN(startup_file_sync_rechecks_original_writer_and_keeps_native_owner);
 	UT_RUN(shared_crash_startup_uses_original_self_seal_before_native_directory);
