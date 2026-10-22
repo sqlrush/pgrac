@@ -2308,6 +2308,18 @@ UT_TEST(writer_begin_routes_only_after_all_target_initializing)
 	UT_ASSERT_EQ(native_writes | local_updates, 0);
 }
 
+UT_TEST(writer_begin_accepts_recovered_cohort)
+{
+	writer_begin_fixture();
+	offered.input_kind = CLUSTER_WAL_STARTUP_RECOVERED;
+	UT_ASSERT_EQ(writer_begin(), wal_segment_size);
+	UT_ASSERT(clusterStartupWriterSelected && clusterStartupWriterBound);
+	UT_ASSERT_EQ(clusterStartupWriter.input_kind, CLUSTER_WAL_STARTUP_RECOVERED);
+	UT_ASSERT_EQ(route_calls, 1);
+	UT_ASSERT_EQ(bind_calls, 1);
+	UT_ASSERT_EQ(native_writes | local_updates, 0);
+}
+
 UT_TEST(writer_begin_rejects_wrong_input_or_failed_route_without_binding)
 {
 	for (unsigned f = 0; f < 13; ++f) {
@@ -2860,7 +2872,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(76);
+	UT_PLAN(77);
 	UT_RUN(recovery_checkpoint_selects_scope_only_for_closed_online_owner);
 	UT_RUN(recovery_checkpoint_closed_admission_uses_only_original_scope);
 	UT_RUN(recovery_checkpoint_preserves_owner_and_native_guards);
@@ -2929,6 +2941,7 @@ main(void)
 	UT_RUN(startup_publish_reobserves_cas_without_holding_locks);
 	UT_RUN(startup_publish_refusal_never_installs_in_memory_candidate);
 	UT_RUN(writer_begin_routes_only_after_all_target_initializing);
+	UT_RUN(writer_begin_accepts_recovered_cohort);
 	UT_RUN(initializer_selection_precedes_first_native_side_effect);
 	UT_RUN(early_selection_refusal_or_cancel_precedes_native_mutation);
 	UT_RUN(late_binding_requires_same_early_selection);
