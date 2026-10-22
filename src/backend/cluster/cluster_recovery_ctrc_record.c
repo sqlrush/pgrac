@@ -11,6 +11,7 @@
 
 #include "access/rmgr.h"
 #include "access/xlogrecord.h"
+#include "cluster/cluster_recovery_undo_scan.h"
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_segment_init.h"
@@ -620,110 +621,202 @@ ctrc_target_match(const ClusterRecoveryCTRCReleaseV2 *record, const PGAlignedBlo
 	return CLUSTER_RECOVERY_CTRC_TARGET_REFUSED;
 }
 
+/* Shared byte encoding does not broaden the selected-slot validation scope. */
+typedef struct CTRCTTDataObjectV2 {
+	ClusterRecoveryNamespaceEntry native;
+	PGAlignedBlock page;
+	uint8 id[46 + MAXPGPATH - 1];
+	size_t id_length;
+} CTRCTTDataObjectV2;
+
+static bool
+ctrc_tt_data_object(uint64 system_identifier, uint64 database_incarnation,
+	const ClusterRecoveryNamespaceEntry *entry, const void *header_page, size_t header_length,
+	CTRCTTDataObjectV2 *object)
+{
+	ClusterRecoveryNamespaceEntry *native = &object->native;
+	const UndoSegmentHeaderData *hdr = (const UndoSegmentHeaderData *)object->page.data;
+	RelFileLocator locator;
+	ForkNumber forknum;
+	char canonical[MAXPGPATH];
+	const char *end;
+	size_t path_length;
+	int canonical_length;
+	uint16 origin;
+
+	if (system_identifier == 0 || database_incarnation == 0 || entry == NULL
+		|| header_page == NULL || header_length != BLCKSZ)
+		return false;
+	/* Consume possibly unaligned/aliased input only through aligned snapshots.
+	 * The caller still owns the actual reread and final ROOT/namespace checks. */
+	memcpy(native, entry, sizeof(*native));
+	end = memchr(native->path, '\0', sizeof(native->path));
+	if (end == NULL || end == native->path || native->kind != CLUSTER_RECOVERY_FILE_UNDO_SEGMENT
+		|| native->size < BLCKSZ || native->undo_owner_instance == 0
+		|| native->undo_owner_instance > 128 || native->undo_segment == 0)
+		return false;
+	path_length = end - native->path;
+	origin = native->undo_owner_instance - 1;
+	canonical_length = snprintf(canonical, sizeof(canonical), "pg_undo/instance_%u/seg_%u.dat",
+								origin, native->undo_segment);
+	if (canonical_length < 0 || (size_t)canonical_length != path_length
+		|| memcmp(canonical, native->path, path_length) != 0
+		|| cluster_recovery_namespace_classify(native->path, &locator, &forknum)
+			   != CLUSTER_RECOVERY_FILE_UNDO_SEGMENT)
+		return false;
+	memcpy(object->page.data, header_page, BLCKSZ);
+	if (!UndoSegmentHeader_identity_matches(object->page.data, native->undo_segment,
+										  native->undo_owner_instance)
+		|| cluster_undo_segment_header_integrity(object->page.data) != CLUSTER_UNDO_HEADER_VALID
+		|| hdr->wrap_count == UINT32_MAX)
+		return false;
+
+	/* DATA ID: original relative namespace, native file generation and block 0.
+	 * stat/size are not a qualified base or durable owner completion proof. */
+	object->id_length = 46 + path_length;
+	cluster_undo_tt_ctrc_put_u64_le(object->id, system_identifier);
+	cluster_undo_tt_ctrc_put_u64_le(object->id + 8, database_incarnation);
+	cluster_undo_tt_ctrc_put_u16_le(object->id + 16, origin);
+	cluster_undo_tt_ctrc_put_u32_le(object->id + 18, CLUSTER_RECOVERY_FILE_UNDO_SEGMENT);
+	cluster_undo_tt_ctrc_put_u64_le(object->id + 22, path_length);
+	memcpy(object->id + 30, native->path, path_length);
+	cluster_undo_tt_ctrc_put_u64_le(object->id + 30 + path_length, hdr->wrap_count);
+	cluster_undo_tt_ctrc_put_u64_le(object->id + 38 + path_length, 0);
+	return true;
+}
+
+static bool
+ctrc_tt_data_slot(const TTSlot *slot)
+{
+	return TransactionIdIsNormal(slot->xid) && slot->wrap != TT_WRAP_INVALID
+		&& (slot->flags & ~TT_SLOT_FLAGS_KNOWN) == 0
+		&& (slot->status == TT_SLOT_ACTIVE || slot->status == TT_SLOT_COMMITTED
+			|| slot->status == TT_SLOT_ABORTED || slot->status == TT_SLOT_RECYCLABLE);
+}
+
+/* T34 || U16(DATA carrier) || B(DATA ID) || actual field offset/ordinal. */
+static size_t
+ctrc_tt_data_key(const CTRCTTDataObjectV2 *object, uint16 slot_offset, const TTSlot *slot,
+	uint8 *key)
+{
+	const UndoSegmentHeaderData *hdr = (const UndoSegmentHeaderData *)object->page.data;
+
+	/* DATA ID's first 18 bytes are exactly the T34 system/incarnation/origin. */
+	memcpy(key, object->id, 18);
+	cluster_undo_tt_ctrc_put_u32_le(key + 18, object->native.undo_segment);
+	cluster_undo_tt_ctrc_put_u32_le(key + 22, hdr->wrap_count);
+	cluster_undo_tt_ctrc_put_u16_le(key + 26, slot_offset);
+	cluster_undo_tt_ctrc_put_u16_le(key + 28, slot->wrap);
+	cluster_undo_tt_ctrc_put_u32_le(key + 30, slot->xid);
+	cluster_undo_tt_ctrc_put_u16_le(key + 34, 1);
+	cluster_undo_tt_ctrc_put_u64_le(key + 36, object->id_length);
+	memcpy(key + 44, object->id, object->id_length);
+	cluster_undo_tt_ctrc_put_u64_le(key + 44 + object->id_length,
+								  offsetof(UndoSegmentHeaderData, tt_slots)
+									  + slot_offset * sizeof(TTSlot) + offsetof(TTSlot, xid));
+	cluster_undo_tt_ctrc_put_u64_le(key + 52 + object->id_length, slot_offset);
+	return 60 + object->id_length;
+}
+
+static size_t
+ctrc_tt_data_evidence(const CTRCTTDataObjectV2 *object, uint8 *evidence)
+{
+	uint8 *atom = evidence + 16;
+	size_t atom_length = 34 + object->id_length + BLCKSZ;
+
+	/* A single atom2 covers the entire original object, including padding and
+	 * native UBA128. It does not invent the separate frozen U64 UNDO carrier. */
+	cluster_undo_tt_ctrc_put_u16_le(atom, 2);
+	cluster_undo_tt_ctrc_put_u64_le(atom + 2, object->id_length + 16);
+	memcpy(atom + 10, object->id, object->id_length);
+	cluster_undo_tt_ctrc_put_u64_le(atom + 10 + object->id_length, 0);
+	cluster_undo_tt_ctrc_put_u64_le(atom + 18 + object->id_length, BLCKSZ);
+	cluster_undo_tt_ctrc_put_u64_le(atom + 26 + object->id_length, BLCKSZ);
+	memcpy(atom + 34 + object->id_length, object->page.data, BLCKSZ);
+	cluster_undo_tt_ctrc_put_u64_le(evidence, 1);
+	cluster_undo_tt_ctrc_put_u64_le(evidence + 8, atom_length);
+	return 16 + atom_length;
+}
+
 bool
 cluster_recovery_ctrc_tt_data_reference_v2(
 	uint64 system_identifier, uint64 database_incarnation,
 	const ClusterRecoveryNamespaceEntry *entry, const void *header_page, size_t header_length,
 	uint16 slot_offset, ClusterRecoveryCTRCTTDataReferenceV2 *out)
 {
-	ClusterRecoveryNamespaceEntry native;
-	PGAlignedBlock page;
-	const UndoSegmentHeaderData *hdr = (const UndoSegmentHeaderData *)page.data;
-	const TTSlot *slot;
+	CTRCTTDataObjectV2 object;
 	ClusterRecoveryCTRCTTDataReferenceV2 reference = { 0 };
-	RelFileLocator locator;
-	ForkNumber forknum;
-	char canonical[MAXPGPATH];
-	const char *end;
-	uint8 id[46 + MAXPGPATH - 1];
-	uint8 *key = reference.key;
-	uint8 *atom = reference.evidence + 16;
-	size_t path_length, id_length, atom_length;
-	int canonical_length;
-	uint16 origin;
+	const UndoSegmentHeaderData *hdr = (const UndoSegmentHeaderData *)object.page.data;
 
 	if (out == NULL)
 		return false;
-	if (system_identifier == 0 || database_incarnation == 0 || entry == NULL
-		|| header_page == NULL || header_length != BLCKSZ || slot_offset >= TT_SLOTS_PER_SEGMENT)
+	if (slot_offset >= TT_SLOTS_PER_SEGMENT
+		|| !ctrc_tt_data_object(system_identifier, database_incarnation, entry, header_page,
+								header_length, &object)
+		|| !ctrc_tt_data_slot(&hdr->tt_slots[slot_offset]))
 		goto refused;
-	/* Consume possibly unaligned/aliased input only through aligned snapshots.
-	 * The caller still owns the actual reread and final ROOT/namespace checks. */
-	memcpy(&native, entry, sizeof(native));
-	end = memchr(native.path, '\0', sizeof(native.path));
-	if (end == NULL || end == native.path || native.kind != CLUSTER_RECOVERY_FILE_UNDO_SEGMENT
-		|| native.size < BLCKSZ || native.undo_owner_instance == 0
-		|| native.undo_owner_instance > 128 || native.undo_segment == 0)
-		goto refused;
-	path_length = end - native.path;
-	origin = native.undo_owner_instance - 1;
-	canonical_length = snprintf(canonical, sizeof(canonical), "pg_undo/instance_%u/seg_%u.dat",
-								origin, native.undo_segment);
-	if (canonical_length < 0 || (size_t)canonical_length != path_length
-		|| memcmp(canonical, native.path, path_length) != 0
-		|| cluster_recovery_namespace_classify(native.path, &locator, &forknum)
-			   != CLUSTER_RECOVERY_FILE_UNDO_SEGMENT)
-		goto refused;
-	memcpy(page.data, header_page, BLCKSZ);
-	if (!UndoSegmentHeader_identity_matches(page.data, native.undo_segment,
-										  native.undo_owner_instance)
-		|| cluster_undo_segment_header_integrity(page.data) != CLUSTER_UNDO_HEADER_VALID
-		|| hdr->wrap_count == UINT32_MAX)
-		goto refused;
-	slot = &hdr->tt_slots[slot_offset];
-	if (!TransactionIdIsNormal(slot->xid) || slot->wrap == TT_WRAP_INVALID
-		|| (slot->flags & ~TT_SLOT_FLAGS_KNOWN) != 0
-		|| (slot->status != TT_SLOT_ACTIVE && slot->status != TT_SLOT_COMMITTED
-			&& slot->status != TT_SLOT_ABORTED && slot->status != TT_SLOT_RECYCLABLE))
-		goto refused;
-
-	/* DATA ID: original relative namespace, native file generation and block 0.
-	 * stat/size are not a qualified base or durable owner completion proof. */
-	id_length = 46 + path_length;
-	cluster_undo_tt_ctrc_put_u64_le(id, system_identifier);
-	cluster_undo_tt_ctrc_put_u64_le(id + 8, database_incarnation);
-	cluster_undo_tt_ctrc_put_u16_le(id + 16, origin);
-	cluster_undo_tt_ctrc_put_u32_le(id + 18, CLUSTER_RECOVERY_FILE_UNDO_SEGMENT);
-	cluster_undo_tt_ctrc_put_u64_le(id + 22, path_length);
-	memcpy(id + 30, native.path, path_length);
-	cluster_undo_tt_ctrc_put_u64_le(id + 30 + path_length, hdr->wrap_count);
-	cluster_undo_tt_ctrc_put_u64_le(id + 38 + path_length, 0);
-
-	/* T34 || U16(DATA carrier) || B(DATA ID) || actual field offset/ordinal. */
-	cluster_undo_tt_ctrc_put_u64_le(key, system_identifier);
-	cluster_undo_tt_ctrc_put_u64_le(key + 8, database_incarnation);
-	cluster_undo_tt_ctrc_put_u16_le(key + 16, origin);
-	cluster_undo_tt_ctrc_put_u32_le(key + 18, native.undo_segment);
-	cluster_undo_tt_ctrc_put_u32_le(key + 22, hdr->wrap_count);
-	cluster_undo_tt_ctrc_put_u16_le(key + 26, slot_offset);
-	cluster_undo_tt_ctrc_put_u16_le(key + 28, slot->wrap);
-	cluster_undo_tt_ctrc_put_u32_le(key + 30, slot->xid);
-	cluster_undo_tt_ctrc_put_u16_le(key + 34, 1);
-	cluster_undo_tt_ctrc_put_u64_le(key + 36, id_length);
-	memcpy(key + 44, id, id_length);
-	cluster_undo_tt_ctrc_put_u64_le(key + 44 + id_length,
-								  offsetof(UndoSegmentHeaderData, tt_slots)
-									  + slot_offset * sizeof(TTSlot) + offsetof(TTSlot, xid));
-	cluster_undo_tt_ctrc_put_u64_le(key + 52 + id_length, slot_offset);
-	reference.key_length = 60 + id_length;
-
-	/* A single atom2 covers the entire original object, including padding and
-	 * native UBA128. It does not invent the separate frozen U64 UNDO carrier. */
-	atom_length = 34 + id_length + BLCKSZ;
-	cluster_undo_tt_ctrc_put_u16_le(atom, 2);
-	cluster_undo_tt_ctrc_put_u64_le(atom + 2, id_length + 16);
-	memcpy(atom + 10, id, id_length);
-	cluster_undo_tt_ctrc_put_u64_le(atom + 10 + id_length, 0);
-	cluster_undo_tt_ctrc_put_u64_le(atom + 18 + id_length, BLCKSZ);
-	cluster_undo_tt_ctrc_put_u64_le(atom + 26 + id_length, BLCKSZ);
-	memcpy(atom + 34 + id_length, page.data, BLCKSZ);
-	cluster_undo_tt_ctrc_put_u64_le(reference.evidence, 1);
-	cluster_undo_tt_ctrc_put_u64_le(reference.evidence + 8, atom_length);
-	reference.evidence_length = 16 + atom_length;
+	reference.key_length = ctrc_tt_data_key(&object, slot_offset, &hdr->tt_slots[slot_offset],
+										  reference.key);
+	reference.evidence_length = ctrc_tt_data_evidence(&object, reference.evidence);
 	memcpy(out, &reference, sizeof(reference));
 	return true;
 
 refused:
+	memset(out, 0, sizeof(*out));
+	return false;
+}
+
+bool
+cluster_recovery_ctrc_tt_data_inventory_v2(
+	uint64 system_identifier, uint64 database_incarnation,
+	const ClusterRecoveryNamespaceEntry *entry, const void *header_page, size_t header_length,
+	ClusterRecoveryCTRCTTDataInventoryV2 *out)
+{
+	CTRCTTDataObjectV2 object;
+	ClusterRecoveryCTRCTTDataInventoryV2 inventory;
+	ClusterRecoveryUndoScan *scan = NULL;
+	ClusterRecoveryUndoEntry candidate;
+	TTSlot zero;
+
+	if (out == NULL)
+		return false;
+	memset(&inventory, 0, sizeof(inventory));
+	memset(&zero, 0, sizeof(zero));
+	if (!ctrc_tt_data_object(system_identifier, database_incarnation, entry, header_page,
+							 header_length, &object)
+		|| cluster_recovery_undo_scan_begin(object.page.data, BLCKSZ, object.native.undo_segment,
+										   object.native.undo_owner_instance, &scan)
+			   != CLUSTER_RECOVERY_UNDO_MORE)
+		goto refused;
+
+	/* The original scanner visits every physical slot, independent of bitmap,
+	 * active count, FULL lifecycle or release flags. No semantic graph is
+	 * inferred from this object's END or an empty reference list. */
+	for (uint16 i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		if (cluster_recovery_undo_scan_next(scan, &candidate) != CLUSTER_RECOVERY_UNDO_ENTRY
+			|| candidate.slot_offset != i)
+			goto refused;
+		if (candidate.slot.status == TT_SLOT_UNUSED) {
+			/* Original ACTIVE transition only accepts the complete zero UNUSED
+			 * predecessor. Residual xid/wrap/UBA/padding must not disappear. */
+			if (memcmp(&candidate.slot, &zero, sizeof(zero)) != 0)
+				goto refused;
+			continue;
+		}
+		if (!ctrc_tt_data_slot(&candidate.slot))
+			goto refused;
+		ctrc_tt_data_key(&object, i, &candidate.slot, inventory.keys[inventory.reference_count++]);
+	}
+	if (cluster_recovery_undo_scan_next(scan, &candidate) != CLUSTER_RECOVERY_UNDO_END)
+		goto refused;
+	inventory.key_length = 60 + object.id_length;
+	inventory.evidence_length = ctrc_tt_data_evidence(&object, inventory.evidence);
+	cluster_recovery_undo_scan_destroy(scan);
+	memcpy(out, &inventory, sizeof(inventory));
+	return true;
+
+refused:
+	cluster_recovery_undo_scan_destroy(scan);
 	memset(out, 0, sizeof(*out));
 	return false;
 }

@@ -4183,10 +4183,279 @@ UT_TEST(data_unaligned_inputs_output_and_aliases)
 	UT_ASSERT(storage[0] == 0xa5 && storage[sizeof(storage) - 1] == 0xa5);
 }
 
+/* Independent expected keys use explicit physical positions, not the product
+ * inventory or scanner. Shared evidence is the same complete original page. */
+static void
+data_inventory_expected(uint64 system, uint64 incarnation,
+	const ClusterRecoveryNamespaceEntry *entry, const PGAlignedBlock *page,
+	const uint16 *positions, size_t count, ClusterRecoveryCTRCTTDataInventoryV2 *out)
+{
+	ClusterRecoveryCTRCTTDataReferenceV2 reference;
+
+	memset(out, 0, sizeof(*out));
+	data_expected(system, incarnation, entry, page, 0, &reference);
+	out->reference_count = count;
+	out->key_length = reference.key_length;
+	out->evidence_length = reference.evidence_length;
+	memcpy(out->evidence, reference.evidence, sizeof(out->evidence));
+	for (size_t i = 0; i < count; i++) {
+		data_expected(system, incarnation, entry, page, positions[i], &reference);
+		memcpy(out->keys[i], reference.key, sizeof(reference.key));
+	}
+}
+
+static bool
+data_inventory_refused(uint64 system, uint64 incarnation,
+	const ClusterRecoveryNamespaceEntry *entry, const void *page, size_t length)
+{
+	struct {
+		uint8 before[8];
+		ClusterRecoveryCTRCTTDataInventoryV2 out;
+		uint8 after[8];
+	} guarded;
+
+	memset(&guarded, 0xa5, sizeof(guarded));
+	return !cluster_recovery_ctrc_tt_data_inventory_v2(system, incarnation, entry, page,
+		length, &guarded.out) && all_zero(&guarded.out, sizeof(guarded.out))
+		&& guarded.before[0] == 0xa5 && guarded.before[7] == 0xa5
+		&& guarded.after[0] == 0xa5 && guarded.after[7] == 0xa5;
+}
+
+UT_TEST(data_inventory_mixed_statuses_shared_evidence_and_immutable)
+{
+	const uint16 positions[] = { 0, 5, 17, 47 };
+	ClusterRecoveryNamespaceEntry entry, saved;
+	PGAlignedBlock page, before;
+	UndoSegmentHeaderData *hdr = (UndoSegmentHeaderData *)page.data;
+	ClusterRecoveryCTRCTTDataInventoryV2 out, expected;
+	ClusterRecoveryCTRCReleaseV2 r = sample();
+
+	UT_ASSERT(data_sample(&entry, &page, 2, 257, 5));
+	for (unsigned i = 0; i < lengthof(positions); i++) {
+		hdr->tt_slots[positions[i]] = r.before;
+		hdr->tt_slots[positions[i]].xid += i;
+		hdr->tt_slots[positions[i]].status = 1 + i;
+		hdr->tt_slots[positions[i]].flags = i % 2 ? TT_SLOT_FLAG_CTRC_RELEASE_PROVEN : 0;
+	}
+	UT_ASSERT(cluster_undo_segment_header_seal(page.data));
+	saved = entry;
+	memcpy(&before, &page, sizeof(page));
+	data_inventory_expected(SYSTEM_ID, 99, &entry, &page, positions, 4, &expected);
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT(cluster_recovery_ctrc_tt_data_inventory_v2(SYSTEM_ID, 99, &entry,
+		page.data, BLCKSZ, &out));
+	UT_ASSERT(memcmp(&out, &expected, sizeof(out)) == 0);
+	UT_ASSERT(memcmp(&entry, &saved, sizeof(entry)) == 0);
+	UT_ASSERT(memcmp(&page, &before, sizeof(page)) == 0);
+}
+
+UT_TEST(data_inventory_all_physical_slots_ignore_summary_and_release)
+{
+	for (unsigned boundary = 0; boundary < 2; boundary++) {
+		ClusterRecoveryNamespaceEntry entry;
+		PGAlignedBlock page;
+		UndoSegmentHeaderData *hdr = (UndoSegmentHeaderData *)page.data;
+		ClusterRecoveryCTRCTTDataInventoryV2 out, expected;
+		ClusterRecoveryCTRCReleaseV2 r = sample();
+		uint16 positions[48];
+
+		UT_ASSERT(data_sample(&entry, &page, boundary ? 128 : 1,
+			boundary ? 32768 : 1, 0));
+		hdr->wrap_count = boundary ? UINT32_MAX - 1 : 0;
+		hdr->tt_active_count = 0;
+		hdr->segment_flags = UNDO_SEGMENT_FLAG_FULL;
+		memset(hdr->free_block_bitmap, 0xff, sizeof(hdr->free_block_bitmap));
+		for (unsigned i = 0; i < 48; i++) {
+			positions[i] = i;
+			hdr->tt_slots[i] = r.before;
+			hdr->tt_slots[i].xid = boundary ? MaxTransactionId - i : FirstNormalTransactionId + i;
+			hdr->tt_slots[i].wrap = boundary ? TT_WRAP_MAX : 0;
+			hdr->tt_slots[i].status = 1 + i % 4;
+			hdr->tt_slots[i].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+		}
+		UT_ASSERT(cluster_undo_segment_header_seal(page.data));
+		data_inventory_expected(boundary ? UINT64_MAX : 1, boundary ? UINT64_MAX : 1,
+			&entry, &page, positions, 48, &expected);
+		UT_ASSERT(cluster_recovery_ctrc_tt_data_inventory_v2(boundary ? UINT64_MAX : 1,
+			boundary ? UINT64_MAX : 1, &entry, page.data, BLCKSZ, &out));
+		UT_ASSERT(memcmp(&out, &expected, sizeof(out)) == 0);
+	}
+}
+
+UT_TEST(data_inventory_zero_slots_keep_full_object_evidence)
+{
+	ClusterRecoveryNamespaceEntry entry;
+	PGAlignedBlock page, changed;
+	UndoSegmentHeaderData *hdr = (UndoSegmentHeaderData *)page.data;
+	ClusterRecoveryCTRCTTDataInventoryV2 out, first, expected;
+
+	UT_ASSERT(data_sample(&entry, &page, 2, 257, 5));
+	memset(hdr->tt_slots, 0, sizeof(hdr->tt_slots));
+	UT_ASSERT(cluster_undo_segment_header_seal(page.data));
+	data_inventory_expected(SYSTEM_ID, 99, &entry, &page, NULL, 0, &expected);
+	UT_ASSERT(cluster_recovery_ctrc_tt_data_inventory_v2(SYSTEM_ID, 99, &entry,
+		page.data, BLCKSZ, &first));
+	UT_ASSERT(memcmp(&first, &expected, sizeof(first)) == 0);
+	UT_ASSERT_EQ(first.reference_count, 0);
+	UT_ASSERT(first.evidence_length > BLCKSZ);
+	memcpy(&changed, &page, sizeof(page));
+	((UndoSegmentHeaderData *)changed.data)->_reserved[100] ^= 0x80;
+	UT_ASSERT(cluster_undo_segment_header_seal(changed.data));
+	data_inventory_expected(SYSTEM_ID, 99, &entry, &changed, NULL, 0, &expected);
+	UT_ASSERT(cluster_recovery_ctrc_tt_data_inventory_v2(SYSTEM_ID, 99, &entry,
+		changed.data, BLCKSZ, &out));
+	UT_ASSERT(memcmp(&out, &expected, sizeof(out)) == 0);
+	UT_ASSERT(memcmp(out.evidence, first.evidence, sizeof(out.evidence)) != 0);
+}
+
+UT_TEST(data_inventory_unused_residual_at_last_slot_is_not_omitted)
+{
+	ClusterRecoveryNamespaceEntry entry;
+	PGAlignedBlock page, bad;
+
+	UT_ASSERT(data_sample(&entry, &page, 2, 257, 0));
+	for (size_t byte = 0; byte < 32; byte++) {
+		UndoSegmentHeaderData *hdr = (UndoSegmentHeaderData *)bad.data;
+
+		memcpy(&bad, &page, sizeof(page));
+		((uint8 *)&hdr->tt_slots[47])[byte] = 0x80;
+		UT_ASSERT(cluster_undo_segment_header_seal(bad.data));
+		UT_ASSERT(data_inventory_refused(SYSTEM_ID, 99, &entry, bad.data, BLCKSZ));
+	}
+}
+
+UT_TEST(data_inventory_late_invalid_candidate_has_no_partial_output)
+{
+	ClusterRecoveryNamespaceEntry entry;
+	PGAlignedBlock page, bad;
+	ClusterRecoveryCTRCReleaseV2 r = sample();
+
+	UT_ASSERT(data_sample(&entry, &page, 2, 257, 0));
+	for (unsigned i = 0; i < 9; i++) {
+		UndoSegmentHeaderData *hdr = (UndoSegmentHeaderData *)bad.data;
+		TTSlot *slot = &hdr->tt_slots[47];
+
+		memcpy(&bad, &page, sizeof(page));
+		*slot = r.before;
+		switch (i) {
+			case 0: slot->xid = InvalidTransactionId; break;
+			case 1: slot->xid = BootstrapTransactionId; break;
+			case 2: slot->xid = FrozenTransactionId; break;
+			case 3: slot->wrap = TT_WRAP_INVALID; break;
+			case 4: slot->status = TT_SLOT_UNUSED; break;
+			case 5: slot->status = TT_SLOT_INVALID; break;
+			case 6: slot->status = 5; break;
+			case 7: slot->flags = 0x80; break;
+			case 8: hdr->wrap_count = UINT32_MAX; break;
+		}
+		UT_ASSERT(cluster_undo_segment_header_seal(bad.data));
+		UT_ASSERT(data_inventory_refused(SYSTEM_ID, 99, &entry, bad.data, BLCKSZ));
+	}
+}
+
+UT_TEST(data_inventory_native_layout_namespace_and_integrity)
+{
+	ClusterRecoveryNamespaceEntry entry, wrong;
+	PGAlignedBlock page, bad;
+
+	UT_ASSERT(data_sample(&entry, &page, 2, 257, 0));
+	for (unsigned i = 0; i < 10; i++) {
+		UndoSegmentHeaderData *hdr = (UndoSegmentHeaderData *)bad.data;
+
+		memcpy(&bad, &page, sizeof(page));
+		switch (i) {
+			case 0: hdr->pd_lower++; break;
+			case 1: hdr->pd_upper--; break;
+			case 2: hdr->pd_special--; break;
+			case 3: hdr->pd_flags |= PD_HAS_ITL; break;
+			case 4: hdr->segment_flags = 0x80; break;
+			case 5: hdr->segment_id++; break;
+			case 6: hdr->owner_instance++; break;
+			case 7: hdr->tt_slots_count--; break;
+			case 8: hdr->pd_pagesize_version ^= 1; break;
+			case 9: hdr->segment_state = 255; break;
+		}
+		(void)cluster_undo_segment_header_seal(bad.data);
+		UT_ASSERT(data_inventory_refused(SYSTEM_ID, 99, &entry, bad.data, BLCKSZ));
+	}
+	for (unsigned i = 0; i < 7; i++) {
+		wrong = entry;
+		switch (i) {
+			case 0: strcpy(wrong.path, "pg_undo/instance_01/seg_257.dat"); break;
+			case 1: memset(wrong.path, 'x', sizeof(wrong.path)); break;
+			case 2: wrong.kind = CLUSTER_RECOVERY_FILE_RELATION; break;
+			case 3: wrong.size = BLCKSZ - 1; break;
+			case 4: wrong.undo_owner_instance = 129; break;
+			case 5: wrong.undo_segment++; break;
+			case 6: wrong.undo_owner_instance = 1; break;
+		}
+		UT_ASSERT(data_inventory_refused(SYSTEM_ID, 99, &wrong, page.data, BLCKSZ));
+	}
+	memcpy(&bad, &page, sizeof(page));
+	((PageHeader)bad.data)->pd_checksum = 0;
+	UT_ASSERT(data_inventory_refused(SYSTEM_ID, 99, &entry, bad.data, BLCKSZ));
+	memcpy(&bad, &page, sizeof(page));
+	bad.data[BLCKSZ - 1] ^= 1;
+	UT_ASSERT(data_inventory_refused(SYSTEM_ID, 99, &entry, bad.data, BLCKSZ));
+}
+
+UT_TEST(data_inventory_exact_lengths_nulls_and_clearing_bounds)
+{
+	ClusterRecoveryNamespaceEntry entry;
+	PGAlignedBlock page;
+	const size_t lengths[] = { 0, BLCKSZ - 1, BLCKSZ + 1, SIZE_MAX };
+
+	UT_ASSERT(data_sample(&entry, &page, 2, 257, 0));
+	for (unsigned i = 0; i < lengthof(lengths); i++)
+		UT_ASSERT(data_inventory_refused(SYSTEM_ID, 99, &entry, page.data, lengths[i]));
+	UT_ASSERT(data_inventory_refused(0, 99, &entry, page.data, BLCKSZ));
+	UT_ASSERT(data_inventory_refused(SYSTEM_ID, 0, &entry, page.data, BLCKSZ));
+	UT_ASSERT(data_inventory_refused(SYSTEM_ID, 99, NULL, page.data, BLCKSZ));
+	UT_ASSERT(data_inventory_refused(SYSTEM_ID, 99, &entry, NULL, BLCKSZ));
+	UT_ASSERT(!cluster_recovery_ctrc_tt_data_inventory_v2(SYSTEM_ID, 99, &entry,
+		page.data, BLCKSZ, NULL));
+}
+
+UT_TEST(data_inventory_unaligned_output_inputs_and_aliases)
+{
+	const uint16 positions[] = { 5 };
+	ClusterRecoveryNamespaceEntry entry;
+	PGAlignedBlock page;
+	ClusterRecoveryCTRCTTDataInventoryV2 expected;
+	uint8 storage[sizeof(expected) + 2], entry_bytes[sizeof(entry) + 1];
+	uint8 page_bytes[BLCKSZ + 1];
+
+	UT_ASSERT(data_sample(&entry, &page, 2, 257, 5));
+	data_inventory_expected(SYSTEM_ID, 99, &entry, &page, positions, 1, &expected);
+	memcpy(entry_bytes + 1, &entry, sizeof(entry));
+	memcpy(page_bytes + 1, page.data, BLCKSZ);
+	memset(storage, 0xa5, sizeof(storage));
+	UT_ASSERT(cluster_recovery_ctrc_tt_data_inventory_v2(SYSTEM_ID, 99,
+		(const ClusterRecoveryNamespaceEntry *)(entry_bytes + 1), page_bytes + 1, BLCKSZ,
+		(ClusterRecoveryCTRCTTDataInventoryV2 *)(storage + 1)));
+	UT_ASSERT(memcmp(storage + 1, &expected, sizeof(expected)) == 0);
+	UT_ASSERT(storage[0] == 0xa5 && storage[sizeof(storage) - 1] == 0xa5);
+	memcpy(storage + 1, page.data, BLCKSZ);
+	UT_ASSERT(cluster_recovery_ctrc_tt_data_inventory_v2(SYSTEM_ID, 99, &entry,
+		storage + 1, BLCKSZ, (ClusterRecoveryCTRCTTDataInventoryV2 *)(storage + 1)));
+	UT_ASSERT(memcmp(storage + 1, &expected, sizeof(expected)) == 0);
+	memcpy(storage + 1, &entry, sizeof(entry));
+	UT_ASSERT(cluster_recovery_ctrc_tt_data_inventory_v2(SYSTEM_ID, 99,
+		(const ClusterRecoveryNamespaceEntry *)(storage + 1), page.data, BLCKSZ,
+		(ClusterRecoveryCTRCTTDataInventoryV2 *)(storage + 1)));
+	UT_ASSERT(memcmp(storage + 1, &expected, sizeof(expected)) == 0);
+	memcpy(storage + 1, page.data, BLCKSZ);
+	storage[BLCKSZ] ^= 1;
+	UT_ASSERT(!cluster_recovery_ctrc_tt_data_inventory_v2(SYSTEM_ID, 99, &entry,
+		storage + 1, BLCKSZ, (ClusterRecoveryCTRCTTDataInventoryV2 *)(storage + 1)));
+	UT_ASSERT(all_zero(storage + 1, sizeof(expected)));
+	UT_ASSERT(storage[0] == 0xa5 && storage[sizeof(storage) - 1] == 0xa5);
+}
+
 int
 main(void)
 {
-	UT_PLAN(126);
+	UT_PLAN(134);
 	UT_RUN(golden_encoding);
 	UT_RUN(golden_decoding);
 	UT_RUN(unaligned_buffers);
@@ -4299,6 +4568,14 @@ main(void)
 	UT_RUN(data_full_padding_uba_and_unselected_slot_are_evidence);
 	UT_RUN(data_exact_lengths_nulls_and_clearing_bounds);
 	UT_RUN(data_unaligned_inputs_output_and_aliases);
+	UT_RUN(data_inventory_mixed_statuses_shared_evidence_and_immutable);
+	UT_RUN(data_inventory_all_physical_slots_ignore_summary_and_release);
+	UT_RUN(data_inventory_zero_slots_keep_full_object_evidence);
+	UT_RUN(data_inventory_unused_residual_at_last_slot_is_not_omitted);
+	UT_RUN(data_inventory_late_invalid_candidate_has_no_partial_output);
+	UT_RUN(data_inventory_native_layout_namespace_and_integrity);
+	UT_RUN(data_inventory_exact_lengths_nulls_and_clearing_bounds);
+	UT_RUN(data_inventory_unaligned_output_inputs_and_aliases);
 	graph_alloc_tracking = true;
 	UT_RUN(graph_independent_golden_and_immutable);
 	UT_RUN(graph_all_node_edge_permutations);

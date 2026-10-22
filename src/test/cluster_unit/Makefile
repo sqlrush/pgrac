@@ -7565,6 +7565,7 @@ test_cluster_recovery_tt_record: test_cluster_recovery_tt_record.c unit_test.h \
 
 # D0 codec, native references, record/graph hashes and native target match.
 test_cluster_recovery_ctrc_record_product.o: $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_undo_scan.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
@@ -7603,9 +7604,20 @@ test_cluster_recovery_ctrc_namespace.o: $(top_srcdir)/src/backend/cluster/cluste
 		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
+# Reuse the original full 48-slot scan; unrelated record readers are dead-stripped.
+test_cluster_recovery_ctrc_undo_scan.o: $(top_srcdir)/src/backend/cluster/cluster_recovery_undo_scan.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_undo_scan.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
+		$(top_srcdir)/src/include/cluster/cluster_uba.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_alloc.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
 test_cluster_recovery_ctrc_record: test_cluster_recovery_ctrc_record.c unit_test.h \
 		test_cluster_recovery_ctrc_record_product.o test_cluster_recovery_ctrc_header.o \
-		test_cluster_recovery_ctrc_namespace.o \
+		test_cluster_recovery_ctrc_namespace.o test_cluster_recovery_ctrc_undo_scan.o \
 		xlogreader_fs.o test_cluster_recovery_ctrc_bind_decoder.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
 		$(top_builddir)/src/common/libpgcommon.a \
@@ -7621,7 +7633,8 @@ test_cluster_recovery_ctrc_record: test_cluster_recovery_ctrc_record.c unit_test
 		$(top_srcdir)/src/include/utils/memutils.h \
 		$(top_srcdir)/src/include/utils/palloc.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_recovery_ctrc_record_product.o \
-		test_cluster_recovery_ctrc_header.o test_cluster_recovery_ctrc_namespace.o xlogreader_fs.o \
+		test_cluster_recovery_ctrc_header.o test_cluster_recovery_ctrc_namespace.o \
+		test_cluster_recovery_ctrc_undo_scan.o xlogreader_fs.o \
 		test_cluster_recovery_ctrc_bind_decoder.o $(CLUSTER_SIDE_ROUTE_O) \
 		$(CLUSTER_RF_ROUTE_O) $(LDFLAGS) \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon.a \

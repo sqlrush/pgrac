@@ -240,6 +240,34 @@ extern bool cluster_recovery_ctrc_tt_data_reference_v2(
 	const ClusterRecoveryNamespaceEntry *entry, const void *header_page, size_t header_length,
 	uint16 slot_offset, ClusterRecoveryCTRCTTDataReferenceV2 *out);
 
+/* All physical TT xid fields of one original block 0, in physical order.
+ * Keys share key_length and the same complete singleton atom2 evidence; tails
+ * are zero. reference_count may be zero, but full object evidence remains.
+ * An empty result is not a graph-completeness or terminal/release proof. */
+typedef struct ClusterRecoveryCTRCTTDataInventoryV2 {
+	uint8 keys[TT_SLOTS_PER_SEGMENT][CLUSTER_RECOVERY_CTRC_TT_DATA_KEY_MAX_BYTES];
+	uint8 evidence[CLUSTER_RECOVERY_CTRC_TT_DATA_EVIDENCE_MAX_BYTES];
+	size_t reference_count;
+	size_t key_length;
+	size_t evidence_length;
+} ClusterRecoveryCTRCTTDataInventoryV2;
+
+/* Same original namespace/owner reread, ROOT/source/cut/pin and final-check
+ * prerequisites as the selected-slot adapter. Reuse the native header scanner
+ * for all 48 slots: counters, bitmap, lifecycle and RELEASED never shorten it.
+ * Only a byte-exact zero UNUSED slot is omitted. Any residual UNUSED or invalid
+ * nonempty slot refuses the whole inventory. No terminal polarity, complete
+ * semantic graph, qualified base/floor/last-issued or release is derived.
+ * Native UBA128 remains full-page DATA evidence, not a U64 UNDO carrier.
+ *
+ * Exact BLCKSZ input; unaligned inputs/output and input/output aliases allowed.
+ * Consume all inputs before whole-output publication; refusal clears *out.
+ * No I/O, shared mutation, live caller or new authority. */
+extern bool cluster_recovery_ctrc_tt_data_inventory_v2(
+	uint64 system_identifier, uint64 database_incarnation,
+	const ClusterRecoveryNamespaceEntry *entry, const void *header_page, size_t header_length,
+	ClusterRecoveryCTRCTTDataInventoryV2 *out);
+
 typedef enum ClusterRecoveryCTRCTargetMatchV2 {
 	CLUSTER_RECOVERY_CTRC_TARGET_REFUSED = 0,
 	CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_BEFORE,
