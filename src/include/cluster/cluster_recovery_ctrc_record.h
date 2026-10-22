@@ -437,5 +437,18 @@ extern bool cluster_recovery_ctrc_graph_hash_v2(const ClusterRecoveryCTRCRelease
 												uint64 system_identifier,
 												const ClusterRecoveryCTRCGraphV2 *graph,
 												uint8 out[32]);
+
+/* Read the original completed native D0 record and require its embedded graph
+ * SHA to equal the original canonical graph hash before publishing the result.
+ * This structural correspondence does not qualify graph completeness, original
+ * source/cut/ROOT/pins, owner/base/floor/issued/terminal or durability/release.
+ * All original read_v2 and graph_hash_v2 prerequisites and ERROR behavior apply;
+ * no live caller or execution authority. Outside critical sections/spinlocks.
+ * Inputs remain immutable throughout. Graph byte views and out may be unaligned;
+ * graph descriptors follow graph_hash_v2. Graph inputs may overlap out, consumed
+ * before publication. out must not overlap reader-owned storage. Refusal clears
+ * exactly sizeof(*out) bytes when non-NULL; success copies the whole result. */
+extern bool cluster_recovery_ctrc_read_graph_v2(const XLogReaderState *reader,
+	const ClusterRecoveryCTRCGraphV2 *graph, ClusterRecoveryCTRCReleaseV2 *out);
 #endif
 #endif

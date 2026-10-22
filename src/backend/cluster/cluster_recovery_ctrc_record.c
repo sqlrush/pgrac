@@ -348,6 +348,26 @@ refused:
 }
 
 bool
+cluster_recovery_ctrc_read_graph_v2(const XLogReaderState *reader,
+	const ClusterRecoveryCTRCGraphV2 *graph, ClusterRecoveryCTRCReleaseV2 *out)
+{
+	ClusterRecoveryCTRCReleaseV2 record;
+	uint8 digest[32];
+
+	if (out == NULL)
+		return false;
+	if (!cluster_recovery_ctrc_read_v2(reader, &record)
+		|| !cluster_recovery_ctrc_graph_hash_v2(&record, reader->system_identifier, graph, digest)
+		|| memcmp(digest, record.graph_sha256, sizeof(digest)) != 0) {
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
+	/* Graph inputs may alias out; consume everything before publication. */
+	memcpy(out, &record, sizeof(record));
+	return true;
+}
+
+bool
 cluster_recovery_ctrc_reference_v2(const XLogReaderState *reader, uint32 source_index,
 								   const uint8 source_identity_digest[32], const uint8 *raw_record,
 								   size_t raw_length, ClusterRecoveryCTRCReferenceV2 *out)
