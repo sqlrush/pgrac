@@ -141,6 +141,14 @@ def main() -> int:
     print("offline two-node alternating-update fixture: 20 rounds")
     print("counter accessors: " + ", ".join(sorted(inventory)))
     print("wait candidates: " + ", ".join(sorted(wait_candidates)))
+    for name in sorted(wait_candidates):
+        candidate = wait_candidates[name]
+        line_numbers = candidate["line_numbers"]
+        markers = "; ".join(
+            f"{needle}={line_numbers[needle]}"
+            for needle in candidate["needles"]
+        )
+        print(f"{name} source lines: {markers}")
     print("wait events: " + ", ".join(WAIT_EVENT_NAMES))
     print("runtime evidence: NOT_CAPTURED (offline fixture)")
     return 0
@@ -166,10 +174,15 @@ def source_wait_candidate_inventory(root: Path) -> dict[str, dict[str, object]]:
         },
     }
     for candidate in candidates.values():
-        source = (root / candidate["path"]).read_text()
+        source = (root / candidate["path"]).read_text(encoding="utf-8")
         missing = [needle for needle in candidate["needles"] if needle not in source]
         if missing:
             raise AssertionError(f"missing wait candidate markers: {candidate['path']}: {missing}")
+        lines = source.splitlines()
+        candidate["line_numbers"] = {
+            needle: [line_no for line_no, line in enumerate(lines, start=1) if needle in line]
+            for needle in candidate["needles"]
+        }
     return candidates
 
 

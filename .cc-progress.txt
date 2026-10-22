@@ -11,3 +11,4 @@
 2026-10-23 06:05 replaced fixture with injected snapshot reader, production counter inventory, and explicit 20-round wait samples; next run it and focused existing counter tests.
 2026-10-23 06:07 CST | E | added FixtureCounterReader and injected counter-delta assertions to cluster_wait_tail_diagnostic.py; next run fixture and focused retransmit/PCM/TX tests.
 2026-10-23 06:12 CST | E | extended cluster_wait_tail_diagnostic.py with source_wait_candidate_inventory and main output for TX 1000ms, GCS backoff, PCM timed wait markers; next run fixture and focused tests.
+2026-10-23 06:18 CST | E | added exact source line-number inventory/output for TX tick, GCS backoff, and PCM timed-wait markers in cluster_wait_tail_diagnostic.py; next run fixture, syntax, and diff checks.
