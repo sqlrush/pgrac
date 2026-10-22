@@ -3167,6 +3167,8 @@ test_cluster_cf_authority: test_cluster_cf_authority.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 CLUSTER_CONTROL_ROOT_O = $(top_builddir)/src/backend/cluster/cluster_control_root.o
+$(CLUSTER_CONTROL_ROOT_O): $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h
 # migration_wal_scan (contract) drives a real XLogReader over the thread
 # stream.  The reader is compiled -DFRONTEND (pg_waldump style) so the
 # unit binary does not drag in backend palloc/elog/ShmemVariableCache

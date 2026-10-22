@@ -573,6 +573,16 @@ extern ClusterControlRootResult cluster_control_root_v3_checkpoint_publish(
 	XLogRecPtr checkpoint_end, ClusterControlRootSnapshot *out,
 	ClusterControlRootFileToken *out_token, ControlFileData *out_control);
 
+/* Original recovered INSTALL/native-DONE owner only. ONLINE evidence retains
+ * common MOUNTED/RECOVERING and local serving=0; not CLEAN/first creation,
+ * shutdown, C0 execution or semantic OPEN authority. Caller owns the scope. */
+struct ClusterRecoveryCheckpointScopeV1;
+extern ClusterControlRootResult cluster_control_root_v3_recovery_checkpoint_publish(
+	const struct ClusterRecoveryCheckpointScopeV1 *scope, const ClusterControlRootIdentity *self,
+	const ControlFileData *thread_control, XLogRecPtr checkpoint_end,
+	ClusterControlRootSnapshot *out, ClusterControlRootFileToken *out_token,
+	ControlFileData *out_control);
+
 /* PGRAC: publishes WAL-verified shutdown checkpoint evidence only. Does not
  * close a thread/database or change membership; returned native view still
  * obeys the selected root lifecycle. Normal-stop/close admission is separate.

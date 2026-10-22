@@ -31,6 +31,7 @@
 #include "cluster/cluster_ir.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_guc.h"
@@ -4349,11 +4350,14 @@ file_token_equal(const ClusterControlRootFileToken *left, const ClusterControlRo
  * Author: SqlRush <sqlrush@gmail.com>
  */
 static bool
-checkpoint_v2_owner_current(const ClusterControlRootIdentity *self, uint64 epoch, TimeLineID tli,
-							XLogRecPtr checkpoint_end, bool admitted, bool *pending)
+checkpoint_owner_current(const ClusterControlRootIdentity *self, uint64 epoch, TimeLineID tli,
+						 XLogRecPtr checkpoint_end, bool admitted, bool *pending,
+						 const struct ClusterRecoveryCheckpointScopeV1 *recovery_scope,
+						 const ClusterWalWriterToken *recovery_writer)
 {
 	bool observation_pending = false;
 	bool serving;
+	ClusterWalWriterToken observed;
 	TimeLineID flushed_tli = 0;
 	XLogRecPtr flushed;
 
@@ -4372,11 +4376,23 @@ checkpoint_v2_owner_current(const ClusterControlRootIdentity *self, uint64 epoch
 		|| cluster_epoch_get_current() != epoch || cluster_reconfig_has_pending_prebump_stage()
 		|| !cluster_write_fence_allowed())
 		return false;
-	serving = cluster_serving_ready_check(&observation_pending, NULL);
-	if (!serving && !(admitted && observation_pending)) {
-		if (pending != NULL)
-			*pending = observation_pending;
-		return false;
+	if (recovery_scope != NULL) {
+		/* Only the original recovered INSTALL/native-DONE shared owner can
+		 * replace SQL serving. This is a borrowed, revocable input, not a role
+		 * override or a checkpoint/C0 write grant. */
+		if (recovery_writer == NULL
+			|| !cluster_recovery_checkpoint_current_v1(recovery_scope, &observed)
+			|| memcmp(&observed, recovery_writer, sizeof(observed)) != 0
+			|| observed.epoch != epoch || observed.ref.timeline != tli
+			|| !cluster_control_root_identity_equal(&observed.ref.claim.identity, self))
+			return false;
+	} else {
+		serving = cluster_serving_ready_check(&observation_pending, NULL);
+		if (!serving && !(admitted && observation_pending)) {
+			if (pending != NULL)
+				*pending = observation_pending;
+			return false;
+		}
 	}
 	/* Only this already-admitted owner may finish through an incomplete
 	 * refresh. A new call cannot inherit it. Known loss still rejects, and
@@ -4384,6 +4400,13 @@ checkpoint_v2_owner_current(const ClusterControlRootIdentity *self, uint64 epoch
 	 * Never wait under CF or restart an already durable publication. */
 	flushed = GetFlushRecPtr(&flushed_tli);
 	return flushed_tli == tli && flushed >= checkpoint_end && cluster_epoch_get_current() == epoch;
+}
+
+static bool
+checkpoint_v2_owner_current(const ClusterControlRootIdentity *self, uint64 epoch, TimeLineID tli,
+							XLogRecPtr checkpoint_end, bool admitted, bool *pending)
+{
+	return checkpoint_owner_current(self, epoch, tli, checkpoint_end, admitted, pending, NULL, NULL);
 }
 
 /* PGRAC: configuration has one root publication, not a local auto.conf truth.
@@ -5198,6 +5221,7 @@ cluster_control_root_config_change(const ClusterSharedConfigEntry *change,
 
 typedef enum CheckpointV2Purpose {
 	CHECKPOINT_V2_ONLINE,
+	CHECKPOINT_V3_RECOVERY_ONLINE,
 	CHECKPOINT_V2_SHUTDOWN_EVIDENCE
 } CheckpointV2Purpose;
 
@@ -5205,6 +5229,9 @@ typedef struct CheckpointV2Work {
 	bool serving_admitted;
 	CheckpointV2Purpose purpose;
 	uint16 format_version;
+	/* Borrowed from the checkpointer; this work never ends the caller's scope. */
+	const struct ClusterRecoveryCheckpointScopeV1 *recovery_scope;
+	ClusterWalWriterToken recovery_writer;
 	ControlRootImage base;
 	ControlRootImage next;
 	ClusterWalHistoryImage *close_history;
@@ -5436,8 +5463,8 @@ checkpoint_v2_wal_verify(CheckpointV2Work *work, const ClusterControlRootIdentit
 	if (record == NULL || work->wal_reader->ReadRecPtr != control->checkPoint
 		|| work->wal_reader->EndRecPtr != end || record->xl_rmid != RM_XLOG_ID
 		|| (record->xl_info & ~XLR_INFO_MASK)
-			   != (work->purpose == CHECKPOINT_V2_ONLINE ? XLOG_CHECKPOINT_ONLINE
-														 : XLOG_CHECKPOINT_SHUTDOWN)
+			   != (work->purpose == CHECKPOINT_V2_SHUTDOWN_EVIDENCE
+					   ? XLOG_CHECKPOINT_SHUTDOWN : XLOG_CHECKPOINT_ONLINE)
 		|| XLogRecGetDataLen(work->wal_reader) != sizeof(CheckPoint)
 		|| XLogRecHasAnyBlockRefs(work->wal_reader))
 		return CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
@@ -7598,12 +7625,25 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 		return result;
 	record = &work->base.records[index];
 	if (work->base.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
-		|| work->base.header.v2.database_state != 3
-		|| (work->base.header.v2.serving[cluster_node_id / 64]
-			& (UINT64_C(1) << (cluster_node_id % 64)))
-			   == 0
 		|| record->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
 		|| work->old_view.state != DB_IN_PRODUCTION)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	if (work->purpose == CHECKPOINT_V3_RECOVERY_ONLINE) {
+		if ((work->base.header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED
+			 && work->base.header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_RECOVERING)
+			|| (work->base.header.v2.serving[cluster_node_id / 64]
+				& (UINT64_C(1) << (cluster_node_id % 64))) != 0)
+			return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+		if (work->recovery_writer.ref.claim.database_incarnation
+				!= work->base.header.v2.database_incarnation
+			|| work->recovery_writer.ref.claim.max_config_generation
+				   != work->base.header.v2.config_generation
+			|| memcmp(work->recovery_writer.ref.claim.claim_sha256,
+					  work->base.refs[index].claim_sha256, 32) != 0)
+			return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	} else if (work->base.header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_OPEN
+			   || (work->base.header.v2.serving[cluster_node_id / 64]
+				   & (UINT64_C(1) << (cluster_node_id % 64))) == 0)
 		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
 	if (work->base.header.file_txn_seq == UINT64_MAX || record->root_publish_seq == UINT64_MAX
 		|| work->base.refs[index].anchor_generation == UINT64_MAX)
@@ -7703,8 +7743,9 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		return result;
 	if (!checkpoint_v2_wal_paths_current(work, self)
-		|| !checkpoint_v2_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end,
-										work->serving_admitted, NULL))
+		|| !checkpoint_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end,
+									 work->serving_admitted, NULL, work->recovery_scope,
+									 &work->recovery_writer))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (!file_token_equal(&work->before, &actual))
 		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
@@ -7758,8 +7799,9 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (!checkpoint_v2_wal_paths_current(work, self)
-		|| !checkpoint_v2_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end,
-										work->serving_admitted, NULL))
+		|| !checkpoint_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end,
+									 work->serving_admitted, NULL, work->recovery_scope,
+									 &work->recovery_writer))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = checkpoint_v2_input_observe(work, cf, end, crc);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -7785,8 +7827,9 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 			return CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
 	}
 	if (!checkpoint_v2_wal_paths_current(work, self)
-		|| !checkpoint_v2_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end,
-										work->serving_admitted, NULL))
+		|| !checkpoint_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end,
+									 work->serving_admitted, NULL, work->recovery_scope,
+									 &work->recovery_writer))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = checkpoint_v2_input_observe(work, cf, end, crc);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -7801,12 +7844,14 @@ static ClusterControlRootResult
 checkpoint_v2_publish(CheckpointV2Purpose purpose, const ClusterControlRootIdentity *self,
 					  const ControlFileData *thread_control, XLogRecPtr checkpoint_end,
 					  ClusterControlRootSnapshot *out, ClusterControlRootFileToken *out_token,
-					  ControlFileData *out_control, uint16 version)
+					  ControlFileData *out_control, uint16 version,
+					  const struct ClusterRecoveryCheckpointScopeV1 *recovery_scope)
 {
 	CheckpointV2Work *work;
 	ClusterControlRootResult result;
 	uint64 epoch;
 	bool pending = false;
+	ClusterWalWriterToken recovery_writer;
 
 	if (out_control != NULL && out_control == thread_control)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
@@ -7819,8 +7864,10 @@ checkpoint_v2_publish(CheckpointV2Purpose purpose, const ClusterControlRootIdent
 	if (self == NULL || thread_control == NULL || out == NULL || out_token == NULL
 		|| out_control == NULL || !cluster_shared_config || !AmCheckpointerProcess() || !enableFsync
 		|| self->origin_thread_id == 0 || self->origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT
+		|| ((purpose == CHECKPOINT_V3_RECOVERY_ONLINE) != (recovery_scope != NULL))
+		|| (purpose == CHECKPOINT_V3_RECOVERY_ONLINE && version != 3)
 		|| thread_control->state
-			   != (purpose == CHECKPOINT_V2_ONLINE ? DB_IN_PRODUCTION : DB_SHUTDOWNED)
+			   != (purpose == CHECKPOINT_V2_SHUTDOWN_EVIDENCE ? DB_SHUTDOWNED : DB_IN_PRODUCTION)
 		|| (purpose == CHECKPOINT_V2_SHUTDOWN_EVIDENCE
 			&& thread_control->checkPointCopy.redo != thread_control->checkPoint)
 		|| thread_control->backupStartPoint != 0 || thread_control->backupEndPoint != 0
@@ -7842,14 +7889,20 @@ checkpoint_v2_publish(CheckpointV2Purpose purpose, const ClusterControlRootIdent
 	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	epoch = cluster_epoch_get_current();
-	if (!checkpoint_v2_owner_current(self, epoch, thread_control->checkPointCopy.ThisTimeLineID,
-									 checkpoint_end, false, &pending))
+	memset(&recovery_writer, 0, sizeof(recovery_writer));
+	if (recovery_scope != NULL
+		&& !cluster_recovery_checkpoint_current_v1(recovery_scope, &recovery_writer))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!checkpoint_owner_current(self, epoch, thread_control->checkPointCopy.ThisTimeLineID,
+								  checkpoint_end, false, &pending, recovery_scope, &recovery_writer))
 		return pending ? CLUSTER_CONTROL_ROOT_ADMISSION_PENDING
 					   : CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	work = palloc0(sizeof(*work));
 	work->serving_admitted = true;
 	work->purpose = purpose;
 	work->format_version = version;
+	work->recovery_scope = recovery_scope;
+	work->recovery_writer = recovery_writer;
 	for (size_t i = 0; i < lengthof(work->wal_dirs); ++i)
 		work->wal_dirs[i] = -1;
 	for (size_t i = 0; i < lengthof(work->wal_segments); ++i)
@@ -7886,7 +7939,7 @@ cluster_control_root_v2_checkpoint_publish(const ClusterControlRootIdentity *sel
 										   ControlFileData *out_control)
 {
 	return checkpoint_v2_publish(CHECKPOINT_V2_ONLINE, self, thread_control, checkpoint_end, out,
-								 out_token, out_control, 2);
+								 out_token, out_control, 2, NULL);
 }
 
 /* PGRAC: shutdown WAL and anchor evidence precede, but never substitute for,
@@ -7902,7 +7955,7 @@ cluster_control_root_v2_shutdown_checkpoint_publish(const ClusterControlRootIden
 													ControlFileData *out_control)
 {
 	return checkpoint_v2_publish(CHECKPOINT_V2_SHUTDOWN_EVIDENCE, self, thread_control,
-								 checkpoint_end, out, out_token, out_control, 2);
+								 checkpoint_end, out, out_token, out_control, 2, NULL);
 }
 
 /* PGRAC: failure input is a purpose-bound root transition, not a v1 patch
@@ -9764,7 +9817,17 @@ cluster_control_root_v3_checkpoint_publish(const ClusterControlRootIdentity *sel
 										   ClusterControlRootFileToken *token,
 										   ControlFileData *view)
 {
-	return checkpoint_v2_publish(CHECKPOINT_V2_ONLINE, self, control, end, out, token, view, 3);
+	return checkpoint_v2_publish(CHECKPOINT_V2_ONLINE, self, control, end, out, token, view, 3, NULL);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_recovery_checkpoint_publish(
+	const struct ClusterRecoveryCheckpointScopeV1 *scope, const ClusterControlRootIdentity *self,
+	const ControlFileData *control, XLogRecPtr end, ClusterControlRootSnapshot *out,
+	ClusterControlRootFileToken *token, ControlFileData *view)
+{
+	return checkpoint_v2_publish(CHECKPOINT_V3_RECOVERY_ONLINE, self, control, end, out, token, view,
+								 3, scope);
 }
 
 ClusterControlRootResult
@@ -9775,7 +9838,7 @@ cluster_control_root_v3_shutdown_checkpoint_publish(const ClusterControlRootIden
 													ControlFileData *view)
 {
 	return checkpoint_v2_publish(CHECKPOINT_V2_SHUTDOWN_EVIDENCE, self, control, end, out, token,
-								 view, 3);
+								 view, 3, NULL);
 }
 
 /* PGRAC (S07): move this thread's physical retention lower forward to a
