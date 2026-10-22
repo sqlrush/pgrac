@@ -96,6 +96,26 @@ extern bool cluster_recovery_ctrc_reference_v2(const XLogReaderState *reader, ui
 											   const uint8 *raw_record, size_t raw_length,
 											   ClusterRecoveryCTRCReferenceV2 *out);
 
+/* Canonical atom1: U16(1) || B(R) || B(complete native raw record).
+ * R is 56 field-coded bytes; this adapter accepts only standalone D0. */
+#define CLUSTER_RECOVERY_CTRC_WAL_ATOM_BYTES                                                       \
+	(2 + 8 + 56 + 8 + SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong                            \
+	 + CLUSTER_RECOVERY_CTRC_BYTES)
+
+/* Reuse reference_v2's exact current-reader/raw binding, then encode its R
+ * and the unmodified raw bytes. Original source/cut/order/component ownership,
+ * pins, prior D0 completion and current/future D0 exclusion remain the graph
+ * producer's prerequisites. No owner completion, full graph, release, target
+ * durability or live dispatch is established by encoding an atom.
+ *
+ * Output length must equal WAL_ATOM_BYTES. Refusal clears min(out_length,
+ * WAL_ATOM_BYTES) bytes for non-NULL out. Unaligned buffers and raw/source
+ * aliases are supported; output must not overlap reader-owned storage. */
+extern bool cluster_recovery_ctrc_wal_atom_v2(const XLogReaderState *reader, uint32 source_index,
+											  const uint8 source_identity_digest[32],
+											  const uint8 *raw_record, size_t raw_length,
+											  uint8 *out, size_t out_length);
+
 typedef enum ClusterRecoveryCTRCTargetMatchV2 {
 	CLUSTER_RECOVERY_CTRC_TARGET_REFUSED = 0,
 	CLUSTER_RECOVERY_CTRC_TARGET_EXPECTED_BEFORE,

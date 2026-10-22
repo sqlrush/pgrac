@@ -382,6 +382,41 @@ refused:
 	return false;
 }
 
+bool
+cluster_recovery_ctrc_wal_atom_v2(const XLogReaderState *reader, uint32 source_index,
+								  const uint8 source_identity_digest[32], const uint8 *raw_record,
+								  size_t raw_length, uint8 *out, size_t out_length)
+{
+	ClusterRecoveryCTRCReferenceV2 reference;
+	uint8 atom[CLUSTER_RECOVERY_CTRC_WAL_ATOM_BYTES];
+
+	if (out == NULL)
+		return false;
+	if (out_length != sizeof(atom)
+		|| !cluster_recovery_ctrc_reference_v2(reader, source_index, source_identity_digest,
+											   raw_record, raw_length, &reference))
+		goto refused;
+
+	/* U16(kind) || B(R), with R field-coded rather than a native struct. */
+	cluster_undo_tt_ctrc_put_u16_le(atom, 1);
+	cluster_undo_tt_ctrc_put_u64_le(atom + 2, 56);
+	cluster_undo_tt_ctrc_put_u32_le(atom + 10, reference.source_index);
+	cluster_undo_tt_ctrc_put_u64_le(atom + 14, reference.start);
+	cluster_undo_tt_ctrc_put_u64_le(atom + 22, reference.end);
+	cluster_undo_tt_ctrc_put_u32_le(atom + 30, reference.raw_length);
+	memcpy(atom + 34, reference.raw_record_sha256, 32);
+	/* B(raw): original complete record, without intervening WAL page headers. */
+	cluster_undo_tt_ctrc_put_u64_le(atom + 66, reference.raw_length);
+	memcpy(atom + 74, raw_record, reference.raw_length);
+	/* Consume all aliased raw/source input before publishing the atom. */
+	memcpy(out, atom, sizeof(atom));
+	return true;
+
+refused:
+	memset(out, 0, Min(out_length, sizeof(atom)));
+	return false;
+}
+
 /* record is codec-validated; page is the caller's private aligned snapshot. */
 static ClusterRecoveryCTRCTargetMatchV2
 ctrc_target_match(const ClusterRecoveryCTRCReleaseV2 *record, const PGAlignedBlock *page)
