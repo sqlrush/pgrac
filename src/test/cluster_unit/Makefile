@@ -53,7 +53,7 @@ CLUSTER_UNIT_CRYPTOHASH_O = $(top_builddir)/src/common/cryptohash.o \
 endif
 
 # Test source files (each becomes a standalone executable)
-TESTS = test_cluster_relation_size test_cluster_vm_read_visibility test_cluster_heap_maintenance test_cluster_vacuum_shared_mx test_cluster_heap_cr_reuse test_cluster_buffer_cr test_cluster_buffer_mapping test_cluster_pi_contribution_stream test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_formation_restart test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
+TESTS = test_cluster_relation_size test_cluster_vm_read_visibility test_cluster_heap_maintenance test_cluster_vacuum_shared_mx test_cluster_vacuum_proof_cleanup test_cluster_heap_cr_reuse test_cluster_buffer_cr test_cluster_buffer_mapping test_cluster_pi_contribution_stream test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_formation_restart test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
         test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_catalog_manifest test_cluster_catalog_init test_cluster_catalog_startup test_cluster_initdb_tree test_cluster_initdb_cohort \
         test_pgrac_control_binding test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker test_pgrac_fenced_cib \
         test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter \
@@ -577,7 +577,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_thread_replay_pi,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_startup_exit,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_members,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_mount,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_vacuum_shared_mx,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_vacuum_shared_mx test_cluster_vacuum_proof_cleanup,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_maintenance test_cluster_vm_read_visibility,$(SIMPLE_TESTS))
 
 # PGRAC: real native-family mount carrier, with process lifecycle boundaries.
@@ -9529,6 +9529,28 @@ test_cluster_heap_cr_reuse_scratch.inc: $(top_srcdir)/src/backend/access/heap/he
 # PGRAC: execute the real two-branch VACUUM scan and cutoff publication.
 test_cluster_vacuum_shared_mx.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c $(srcdir)/extract_vacuum_mx_fixture.py Makefile
 	python3 $(srcdir)/extract_vacuum_mx_fixture.py $< > $@
+
+# Real admission owner and inner guard cleanup, with injected resolver errors.
+test_cluster_vacuum_proof_cleanup.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/^lazy_collect_shared_freeze_proofs\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vacuum_proof_guard.inc: $(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c Makefile
+	awk '/^typedef struct ClusterRuntimeCandidateCleanup / { emit=1; found++ } \
+	     /^cluster_runtime_visibility_candidate_cleanup\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vacuum_proof_cleanup: test_cluster_vacuum_proof_cleanup.c unit_test.h \
+		test_cluster_vacuum_proof_cleanup.inc test_cluster_vacuum_proof_guard.inc \
+		$(top_srcdir)/src/include/cluster/cluster_heap_freeze.h \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_block0_current.h \
+		$(top_srcdir)/src/include/cluster/cluster_tx_resolve.h \
+		$(top_srcdir)/src/include/storage/ipc.h $(top_srcdir)/src/include/utils/elog.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # The real pure locator builders, including the existing UBA validation.
 test_cluster_vacuum_freeze_locators.inc: $(top_srcdir)/src/backend/cluster/cluster_tx_resolve.c Makefile

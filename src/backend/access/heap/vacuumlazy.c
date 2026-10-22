@@ -1608,7 +1608,6 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel)
 			page_scn_after = InvalidScn;
 	bool route_before = false,
 		route_after = false,
-		admission_entered = false,
 		admission_current = false,
 		authority_current = false;
 
@@ -1635,71 +1634,78 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel)
 	admission_result = cluster_semantic_activation_enter_r4_terminal_census(&admission);
 	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
 		goto done;
-	admission_entered = true;
-	cluster_tx_resolve_terminal_census_batch_preflight();
-
-	expected_fence.identity = vacrel->shared_freeze_batch.identity;
-	expected_fence.block = vacrel->shared_freeze_batch.block;
-	expected_fence.page_lsn = vacrel->shared_freeze_batch.page_lsn;
-	expected_fence.page_version = vacrel->shared_freeze_batch.page_version;
-	expected_fence.holder_sequence = authority_before.transition_count;
-	expected_fence.master_sequence = master_before;
-	expected_fence.admission_generation = admission.record_generation;
-	current_fence = expected_fence;
-
-	for (uint8 index = 0;
-		 index < vacrel->shared_freeze_batch.carrier_request_count; index++)
+	PG_TRY();
 	{
-		ClusterTxResolution resolution;
-		ClusterTxOutcome outcome;
+		cluster_tx_resolve_terminal_census_batch_preflight();
 
-		memset(&resolution, 0, sizeof(resolution));
-		reason = CLUSTER_TX_RESOLVE_PROTOCOL;
-		outcome = cluster_tx_resolve_exact_admitted(
-			&vacrel->shared_freeze_batch.carrier_requests[index].locator,
-			CLUSTER_TX_RESOLVE_TERMINAL_CENSUS, &admission, &resolution, &reason);
-		if ((outcome != CLUSTER_TX_COMMITTED && outcome != CLUSTER_TX_ABORTED)
-			|| reason != CLUSTER_TX_RESOLVE_NONE
-			|| !cluster_heap_freeze_build_canonical_proof_v1(
+		expected_fence.identity = vacrel->shared_freeze_batch.identity;
+		expected_fence.block = vacrel->shared_freeze_batch.block;
+		expected_fence.page_lsn = vacrel->shared_freeze_batch.page_lsn;
+		expected_fence.page_version = vacrel->shared_freeze_batch.page_version;
+		expected_fence.holder_sequence = authority_before.transition_count;
+		expected_fence.master_sequence = master_before;
+		expected_fence.admission_generation = admission.record_generation;
+		current_fence = expected_fence;
+
+		for (uint8 index = 0;
+			 index < vacrel->shared_freeze_batch.carrier_request_count; index++)
+		{
+			ClusterTxResolution resolution;
+			ClusterTxOutcome outcome;
+
+			memset(&resolution, 0, sizeof(resolution));
+			reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+			outcome = cluster_tx_resolve_exact_admitted(
 				&vacrel->shared_freeze_batch.carrier_requests[index].locator,
-				&resolution, &expected_fence, &expected_fence, true, true, true,
-				&proofs.proofs[index]))
-			goto done;
-		proofs.proof_count++;
-	}
+				CLUSTER_TX_RESOLVE_TERMINAL_CENSUS, &admission, &resolution, &reason);
+			if ((outcome != CLUSTER_TX_COMMITTED && outcome != CLUSTER_TX_ABORTED)
+				|| reason != CLUSTER_TX_RESOLVE_NONE
+				|| !cluster_heap_freeze_build_canonical_proof_v1(
+					&vacrel->shared_freeze_batch.carrier_requests[index].locator,
+					&resolution, &expected_fence, &expected_fence, true, true, true,
+					&proofs.proofs[index]))
+				goto admitted_done;
+			proofs.proof_count++;
+		}
 
-	route_after = cluster_pcm_lock_r4_route_snapshot(tag, &authority_after,
-												 &master_after, &page_scn_after);
-	if (!route_after || !SCN_VALID(page_scn_after))
-		goto done;
-	authority_current = cluster_pcm_lock_authority_matches(tag, &authority_before)
-		&& authority_before.transition_count == authority_after.transition_count
-		&& master_before == master_after;
-	authority_current = authority_current && route_after;
-	admission_current = cluster_semantic_activation_recheck_r4_terminal_census(&admission);
-	current_fence.holder_sequence = authority_after.transition_count;
-	current_fence.master_sequence = master_after;
-	for (uint8 index = 0; index < proofs.proof_count; index++)
-	{
-		proofs.proofs[index].current_fence = current_fence;
-		proofs.proofs[index].authority_current = authority_current;
-		proofs.proofs[index].admission_current = admission_current;
-	}
+		route_after = cluster_pcm_lock_r4_route_snapshot(tag, &authority_after,
+													 &master_after, &page_scn_after);
+		if (!route_after || !SCN_VALID(page_scn_after))
+			goto admitted_done;
+		authority_current = cluster_pcm_lock_authority_matches(tag, &authority_before)
+			&& authority_before.transition_count == authority_after.transition_count
+			&& master_before == master_after;
+		authority_current = authority_current && route_after;
+		admission_current = cluster_semantic_activation_recheck_r4_terminal_census(&admission);
+		current_fence.holder_sequence = authority_after.transition_count;
+		current_fence.master_sequence = master_after;
+		for (uint8 index = 0; index < proofs.proof_count; index++)
+		{
+			proofs.proofs[index].current_fence = current_fence;
+			proofs.proofs[index].authority_current = authority_current;
+			proofs.proofs[index].admission_current = admission_current;
+		}
 
-	status = cluster_heap_freeze_validate_conditional_apply_v1(
-		&vacrel->shared_freeze_batch, &proofs, &current_fence);
-	if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
-		|| status == CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED)
-	{
-		vacrel->shared_freeze_proofs = proofs;
-		vacrel->shared_freeze_fence = current_fence;
-		vacrel->shared_freeze_fence_valid =
-			status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN;
+		status = cluster_heap_freeze_validate_conditional_apply_v1(
+			&vacrel->shared_freeze_batch, &proofs, &current_fence);
+		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+			|| status == CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED)
+		{
+			vacrel->shared_freeze_proofs = proofs;
+			vacrel->shared_freeze_fence = current_fence;
+			vacrel->shared_freeze_fence_valid =
+				status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN;
+		}
+
+admitted_done:;
 	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
 
 done:
-	if (admission_entered)
-		cluster_semantic_activation_leave(&admission);
 	if (status != CLUSTER_HEAP_FREEZE_PROOF_PROVEN
 		&& status != CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED
 		&& vacrel != NULL)

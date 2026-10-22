@@ -1,0 +1,452 @@
+/*-------------------------------------------------------------------------
+ * test_cluster_vacuum_proof_cleanup.c
+ *    Exercise the real VACUUM proof helper's admission ownership on ERROR.
+ *
+ * Portions Copyright (c) 2026, pgrac contributors
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * The helper, runtime guard cleanup callback and PG exception macros are
+ * real. Route/admission/proof providers and the resolver are leaves: the
+ * resolver injects ERROR at its guarded wait boundary. This tests cleanup,
+ * not transport, shared admission counters or proof validity.
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#include "cluster/cluster_heap_freeze.h"
+#include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_semantic_activation.h"
+#include "cluster/storage/cluster_undo_block0_current.h"
+#include "storage/ipc.h"
+#include "utils/rel.h"
+#include "unit_test.h"
+
+UT_DEFINE_GLOBALS();
+
+/* Only fields consumed by the extracted production helper. */
+typedef struct LVRelState
+{
+	Relation rel;
+	ClusterHeapFreezePageBatchV1 shared_freeze_batch;
+	ClusterHeapFreezeProofBatchV1 shared_freeze_proofs;
+	ClusterHeapFreezeFinalFenceV1 shared_freeze_fence;
+	bool shared_freeze_fence_valid;
+} LVRelState;
+
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+static RelationData relation;
+static LVRelState vacrel;
+static unsigned enters, leaves, debt, resolves, routes;
+static unsigned fail_resolve;
+static bool reject_admission, reject_route_after, unknown_outcome;
+static bool error_preflight, error_validate, guard_held;
+static int inject_code, caught_code;
+static char cleanup_order[16];
+static unsigned cleanup_count;
+static pg_on_exit_callback exit_callback;
+static Datum exit_arg;
+
+static void
+note_cleanup(char event)
+{
+	if (cleanup_count + 1 >= sizeof(cleanup_order))
+		abort();
+	cleanup_order[cleanup_count++] = event;
+	cleanup_order[cleanup_count] = '\0';
+}
+
+void
+ExceptionalCondition(const char *condition, const char *file, int line)
+{
+	(void)condition;
+	(void)file;
+	(void)line;
+	abort();
+}
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack == NULL)
+		abort();
+	siglongjmp(*PG_exception_stack, 1);
+}
+
+bool
+errstart(int level, const char *domain)
+{
+	(void)domain;
+	return level >= ERROR;
+}
+
+bool
+errstart_cold(int level, const char *domain)
+{
+	return errstart(level, domain);
+}
+
+int
+errcode(int code)
+{
+	caught_code = code;
+	return 0;
+}
+
+int
+errmsg(const char *format, ...)
+{
+	(void)format;
+	return 0;
+}
+
+void
+errfinish(const char *file, int line, const char *function)
+{
+	(void)file;
+	(void)line;
+	(void)function;
+	pg_re_throw();
+}
+
+static void
+throw_error(void)
+{
+	ereport(ERROR, (errcode(inject_code), errmsg("proof wait fault injection")));
+}
+
+void
+before_shmem_exit(pg_on_exit_callback callback, Datum arg)
+{
+	if (exit_callback != NULL)
+		abort();
+	exit_callback = callback;
+	exit_arg = arg;
+}
+
+void
+cancel_before_shmem_exit(pg_on_exit_callback callback, Datum arg)
+{
+	if (callback != exit_callback || arg != exit_arg)
+		abort();
+	exit_callback = NULL;
+}
+
+void
+cluster_undo_block0_current_cancel(ClusterUndoBlock0CurrentGuard *guard)
+{
+	(void)guard;
+	if (!guard_held || debt != 1)
+		abort();
+	guard_held = false;
+	note_cleanup('G');
+}
+
+#include "test_cluster_vacuum_proof_guard.inc"
+
+bool
+cluster_pcm_lock_r4_route_snapshot(BufferTag tag, PcmAuthoritySnapshot *authority,
+								 uint64 *master, SCN *page_scn)
+{
+	(void)tag;
+	routes++;
+	authority->transition_count = 7;
+	*master = 11;
+	*page_scn = 13;
+	return !(routes > 1 && reject_route_after);
+}
+
+bool
+cluster_pcm_lock_authority_matches(BufferTag tag, const PcmAuthoritySnapshot *expected)
+{
+	(void)tag;
+	return expected->transition_count == 7;
+}
+
+ClusterSemanticAdmissionResult
+cluster_semantic_activation_enter_r4_terminal_census(ClusterSemanticAdmissionToken *token)
+{
+	enters++;
+	if (reject_admission)
+		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+	if (debt != 0)
+		abort();
+	token->record_generation = 17;
+	token->side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	token->entered = true;
+	debt++;
+	return CLUSTER_SEMANTIC_ADMISSION_OK;
+}
+
+void
+cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
+{
+	if (guard_held || !token->entered || token->record_generation != 17 || debt != 1)
+		abort();
+	leaves++;
+	debt--;
+	token->entered = false;
+	note_cleanup('A');
+}
+
+bool
+cluster_semantic_activation_recheck_r4_terminal_census(const ClusterSemanticAdmissionToken *token)
+{
+	return token->entered && debt == 1;
+}
+
+void
+cluster_tx_resolve_terminal_census_batch_preflight(void)
+{
+	if (error_preflight)
+		throw_error();
+}
+
+ClusterTxOutcome
+cluster_tx_resolve_exact_admitted(const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+								const ClusterSemanticAdmissionToken *admission,
+								ClusterTxResolution *out, ClusterTxResolveReason *reason)
+{
+	ClusterUndoBlock0CurrentGuard guard;
+	ClusterRuntimeCandidateCleanup cleanup;
+
+	(void)locator;
+	if (mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS || !admission->entered || debt != 1)
+		abort();
+	resolves++;
+	memset(&guard, 0, sizeof(guard));
+	cleanup.guard = &guard;
+	cleanup.active = true;
+	guard_held = true;
+	/* Match the runtime's existing guarded wait/error unwind ownership. */
+	PG_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
+							PointerGetDatum(&cleanup));
+	{
+		if (resolves == fail_resolve)
+			throw_error();
+		guard_held = false;
+		cleanup.active = false;
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
+								PointerGetDatum(&cleanup));
+	memset(out, 0, sizeof(*out));
+	*reason = unknown_outcome ? CLUSTER_TX_RESOLVE_PROTOCOL : CLUSTER_TX_RESOLVE_NONE;
+	return unknown_outcome ? CLUSTER_TX_UNKNOWN : CLUSTER_TX_COMMITTED;
+}
+
+bool
+cluster_heap_freeze_build_canonical_proof_v1(
+	const ClusterTxLocator *locator, const ClusterTxResolution *resolution,
+	const ClusterHeapFreezeFinalFenceV1 *expected,
+	const ClusterHeapFreezeFinalFenceV1 *current, bool finalized,
+	bool authority_current, bool admission_current, ClusterHeapFreezeCanonicalProofV1 *out)
+{
+	(void)locator;
+	(void)resolution;
+	(void)expected;
+	(void)current;
+	(void)finalized;
+	(void)authority_current;
+	(void)admission_current;
+	memset(out, 0, sizeof(*out));
+	return true;
+}
+
+ClusterHeapFreezeProofStatusV1
+cluster_heap_freeze_validate_conditional_apply_v1(
+	const ClusterHeapFreezePageBatchV1 *page, const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *fence)
+{
+	(void)page;
+	(void)proofs;
+	(void)fence;
+	if (error_validate)
+		throw_error();
+	return CLUSTER_HEAP_FREEZE_PROOF_PROVEN;
+}
+
+#include "test_cluster_vacuum_proof_cleanup.inc"
+
+static void
+reset_fixture(void)
+{
+	memset(&relation, 0, sizeof(relation));
+	memset(&vacrel, 0, sizeof(vacrel));
+	vacrel.rel = &relation;
+	vacrel.shared_freeze_batch.carrier_request_count = 1;
+	enters = leaves = debt = resolves = routes = fail_resolve = 0;
+	reject_admission = reject_route_after = unknown_outcome = false;
+	error_preflight = error_validate = guard_held = false;
+	inject_code = ERRCODE_INTERNAL_ERROR;
+	caught_code = 0;
+	cleanup_count = 0;
+	cleanup_order[0] = '\0';
+	exit_callback = NULL;
+	PG_exception_stack = NULL;
+	error_context_stack = NULL;
+}
+
+static bool
+collect_catches_error(void)
+{
+	volatile bool caught = false;
+
+	PG_TRY();
+	{
+		(void)lazy_collect_shared_freeze_proofs(&vacrel);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	return caught;
+}
+
+static void
+check_error_cleanup(const char *order)
+{
+	UT_ASSERT(collect_catches_error());
+	UT_ASSERT_EQ(caught_code, inject_code);
+	UT_ASSERT_EQ(enters, 1);
+	UT_ASSERT_EQ(leaves, 1);
+	UT_ASSERT_EQ(debt, 0);
+	UT_ASSERT(!guard_held);
+	UT_ASSERT_STR_EQ(cleanup_order, order);
+	UT_ASSERT(PG_exception_stack == NULL);
+	UT_ASSERT(error_context_stack == NULL);
+	UT_ASSERT(exit_callback == NULL);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proofs.proof_count, 0);
+	UT_ASSERT(!vacrel.shared_freeze_fence_valid);
+}
+
+UT_TEST(invalid_input_does_not_leave)
+{
+	reset_fixture();
+	vacrel.shared_freeze_batch.carrier_request_count = 0;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel),
+				 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	UT_ASSERT_EQ(enters, 0);
+	UT_ASSERT_EQ(leaves, 0);
+}
+
+UT_TEST(rejected_admission_does_not_leave)
+{
+	reset_fixture();
+	reject_admission = true;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel),
+				 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	UT_ASSERT_EQ(enters, 1);
+	UT_ASSERT_EQ(leaves, 0);
+}
+
+UT_TEST(normal_success_leaves_once)
+{
+	reset_fixture();
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(leaves, 1);
+	UT_ASSERT_EQ(debt, 0);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proofs.proof_count, 1);
+	UT_ASSERT(vacrel.shared_freeze_fence_valid);
+	UT_ASSERT(PG_exception_stack == NULL);
+}
+
+UT_TEST(unknown_resolver_leaves_once)
+{
+	reset_fixture();
+	unknown_outcome = true;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel),
+				 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	UT_ASSERT_EQ(leaves, 1);
+	UT_ASSERT_EQ(debt, 0);
+	UT_ASSERT(PG_exception_stack == NULL);
+}
+
+UT_TEST(missing_final_route_leaves_once)
+{
+	reset_fixture();
+	reject_route_after = true;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel),
+				 CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	UT_ASSERT_EQ(leaves, 1);
+	UT_ASSERT_EQ(debt, 0);
+	UT_ASSERT(PG_exception_stack == NULL);
+}
+
+UT_TEST(preflight_error_leaves_once)
+{
+	reset_fixture();
+	error_preflight = true;
+	check_error_cleanup("A");
+	UT_ASSERT_EQ(resolves, 0);
+}
+
+UT_TEST(resolver_error_unwinds_guard_before_admission)
+{
+	reset_fixture();
+	fail_resolve = 1;
+	check_error_cleanup("GA");
+}
+
+UT_TEST(query_cancel_unwinds_guard_before_admission)
+{
+	reset_fixture();
+	fail_resolve = 1;
+	inject_code = ERRCODE_QUERY_CANCELED;
+	check_error_cleanup("GA");
+}
+
+UT_TEST(later_carrier_cancel_does_not_publish_partial_proofs)
+{
+	reset_fixture();
+	vacrel.shared_freeze_batch.carrier_request_count = 2;
+	fail_resolve = 2;
+	inject_code = ERRCODE_QUERY_CANCELED;
+	check_error_cleanup("GA");
+	UT_ASSERT_EQ(resolves, 2);
+}
+
+UT_TEST(validation_error_leaves_once)
+{
+	reset_fixture();
+	error_validate = true;
+	check_error_cleanup("A");
+}
+
+UT_TEST(same_backend_can_collect_again_after_cancel)
+{
+	reset_fixture();
+	fail_resolve = 1;
+	inject_code = ERRCODE_QUERY_CANCELED;
+	check_error_cleanup("GA");
+	/* Do not reset the admission debt or exception/exit stacks. */
+	if (debt != 0)
+		return;
+	fail_resolve = 0;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(enters, 2);
+	UT_ASSERT_EQ(leaves, 2);
+	UT_ASSERT_EQ(debt, 0);
+	UT_ASSERT_STR_EQ(cleanup_order, "GAA");
+	UT_ASSERT(PG_exception_stack == NULL);
+}
+
+int
+main(void)
+{
+	UT_PLAN(11);
+	UT_RUN(invalid_input_does_not_leave);
+	UT_RUN(rejected_admission_does_not_leave);
+	UT_RUN(normal_success_leaves_once);
+	UT_RUN(unknown_resolver_leaves_once);
+	UT_RUN(missing_final_route_leaves_once);
+	UT_RUN(preflight_error_leaves_once);
+	UT_RUN(resolver_error_unwinds_guard_before_admission);
+	UT_RUN(query_cancel_unwinds_guard_before_admission);
+	UT_RUN(later_carrier_cancel_does_not_publish_partial_proofs);
+	UT_RUN(validation_error_leaves_once);
+	UT_RUN(same_backend_can_collect_again_after_cancel);
+	UT_DONE();
+	return ut_failed_count == 0 ? 0 : 1;
+}
