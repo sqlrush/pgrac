@@ -40,6 +40,15 @@
 #undef VM_ALL_FROZEN
 #define VM_ALL_FROZEN(...) false
 
+static ClusterHeapFreezeProofStatusV1
+lazy_collect_shared_freeze_proofs(LVRelState *vacrel)
+{
+	vacrel->shared_freeze_proofs.proof_count = 0;
+	vacrel->shared_freeze_fence_valid = false;
+	vacrel->shared_freeze_apply_status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
+	return CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
+}
+
 static BlockNumber
 lazy_scan_skip(LVRelState *vacrel, Buffer *vm, BlockNumber next, bool *allvis, bool *skip)
 {

@@ -390,6 +390,33 @@ freeze_canonical_locator_shape_valid(const ClusterTxLocator *request,
 	return true;
 }
 
+bool
+cluster_heap_freeze_build_canonical_proof_v1(
+	const ClusterTxLocator *requested_locator,
+	const ClusterTxResolution *resolution,
+	const ClusterHeapFreezeFinalFenceV1 *expected_fence,
+	const ClusterHeapFreezeFinalFenceV1 *current_fence,
+	bool c1b_finalized, bool authority_current, bool admission_current,
+	ClusterHeapFreezeCanonicalProofV1 *out)
+{
+	ClusterHeapFreezeCanonicalProofV1 candidate;
+
+	if (requested_locator == NULL || resolution == NULL || expected_fence == NULL
+		|| current_fence == NULL || out == NULL)
+		return false;
+
+	memset(&candidate, 0, sizeof(candidate));
+	candidate.requested_locator = *requested_locator;
+	candidate.resolution = *resolution;
+	candidate.expected_fence = *expected_fence;
+	candidate.current_fence = *current_fence;
+	candidate.c1b_finalized = c1b_finalized;
+	candidate.authority_current = authority_current;
+	candidate.admission_current = admission_current;
+	*out = candidate;
+	return true;
+}
+
 ClusterHeapFreezeProofStatusV1
 cluster_heap_freeze_validate_canonical_proof_v1(
 	const ClusterHeapFreezeCanonicalProofV1 *proof)

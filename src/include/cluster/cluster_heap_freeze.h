@@ -146,6 +146,23 @@ typedef struct ClusterHeapFreezeCanonicalProofV1
 } ClusterHeapFreezeCanonicalProofV1;
 
 /*
+ * Assemble one canonical proof from an exact transport result and the two
+ * caller-owned fence snapshots.  This is a pure copy boundary: it performs
+ * no resolver lookup, authority check, allocation, I/O, locking, WAL or page
+ * mutation.  NULL input is rejected without changing out.  The resulting
+ * object still requires the canonical validator and the conditional-apply
+ * predicate before a caller can act on it.
+ */
+extern bool
+cluster_heap_freeze_build_canonical_proof_v1(
+	const ClusterTxLocator *requested_locator,
+	const ClusterTxResolution *resolution,
+	const ClusterHeapFreezeFinalFenceV1 *expected_fence,
+	const ClusterHeapFreezeFinalFenceV1 *current_fence,
+	bool c1b_finalized, bool authority_current, bool admission_current,
+	ClusterHeapFreezeCanonicalProofV1 *out);
+
+/*
  * One bounded proof batch feeds one caller-owned conditional-apply attempt.
  * Every member must describe the same final page fence; no member is merged
  * by raw XID or treated as a page mutation permission.  The bound keeps the

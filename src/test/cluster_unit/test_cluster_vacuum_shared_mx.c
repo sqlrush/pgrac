@@ -1892,6 +1892,44 @@ UT_TEST(canonical_proof_requires_exact_row_identity_and_c1b)
 					 CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR);
 }
 
+UT_TEST(canonical_proof_builder_copies_transport_and_fence)
+{
+	ClusterHeapFreezeCanonicalProofV1 source;
+	ClusterHeapFreezeCanonicalProofV1 out;
+
+	init_canonical_proof_fixture(&source);
+	memset(&out, 0xA5, sizeof(out));
+	UT_ASSERT(cluster_heap_freeze_build_canonical_proof_v1(
+		&source.requested_locator, &source.resolution, &source.expected_fence,
+		&source.current_fence, source.c1b_finalized, source.authority_current,
+		source.admission_current, &out));
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_canonical_proof_v1(&out),
+					 CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT(memcmp(&out.requested_locator, &source.requested_locator,
+						 sizeof(out.requested_locator)) == 0);
+	UT_ASSERT(memcmp(&out.resolution, &source.resolution,
+						 sizeof(out.resolution)) == 0);
+	UT_ASSERT(memcmp(&out.expected_fence, &source.expected_fence,
+						 sizeof(out.expected_fence)) == 0);
+	UT_ASSERT(memcmp(&out.current_fence, &source.current_fence,
+						 sizeof(out.current_fence)) == 0);
+}
+
+UT_TEST(canonical_proof_builder_rejects_null_without_clobber)
+{
+	ClusterHeapFreezeCanonicalProofV1 out;
+	ClusterHeapFreezeCanonicalProofV1 before;
+	ClusterHeapFreezeCanonicalProofV1 source;
+
+	init_canonical_proof_fixture(&source);
+	memset(&out, 0xA5, sizeof(out));
+	before = out;
+	UT_ASSERT(!cluster_heap_freeze_build_canonical_proof_v1(
+		NULL, &source.resolution, &source.expected_fence, &source.current_fence,
+		true, true, true, &out));
+	UT_ASSERT(memcmp(&out, &before, sizeof(out)) == 0);
+}
+
 UT_TEST(final_fence_mismatch_retries_without_proof)
 {
 	ClusterHeapFreezeCanonicalProofV1 proof;
@@ -2039,7 +2077,7 @@ UT_TEST(conditional_apply_requires_exact_carriers_and_final_fence)
 int
 main(void)
 {
-	UT_PLAN(61);
+	UT_PLAN(63);
 	UT_RUN(share_scan_preserves_every_reference_before_native_consumer);
 	UT_RUN(cleanup_scan_preserves_before_prune_and_freeze);
 	UT_RUN(raw_multi_value_never_selects_local_reader);
@@ -2097,6 +2135,8 @@ main(void)
 	UT_RUN(retained_or_changed_inputs_independently_prevent_catalog_publication);
 	UT_RUN(zero_retained_counts_never_remove_the_original_shared_restriction);
 	UT_RUN(canonical_proof_requires_exact_row_identity_and_c1b);
+	UT_RUN(canonical_proof_builder_copies_transport_and_fence);
+	UT_RUN(canonical_proof_builder_rejects_null_without_clobber);
 	UT_RUN(final_fence_mismatch_retries_without_proof);
 	UT_RUN(unproven_tt_and_snapshot_never_admit_freeze);
 	UT_RUN(proof_batch_is_all_or_nothing_for_conditional_apply);

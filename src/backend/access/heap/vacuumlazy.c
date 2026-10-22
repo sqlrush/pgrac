@@ -80,7 +80,10 @@
 #include "cluster/cluster_heap_horizon.h"
 #include "cluster/cluster_heap_freeze.h"
 #include "cluster/cluster_mode.h"
+#include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_tx_resolve.h"
 #include "cluster/storage/cluster_smgr.h"
 #endif
 
@@ -282,6 +285,7 @@ static void lazy_scan_heap(LVRelState *vacrel);
 #ifdef USE_PGRAC_CLUSTER
 static bool lazy_scan_shared_mx(LVRelState *vacrel, Page page, BlockNumber blkno);
 static void lazy_validate_shared_freeze(LVRelState *vacrel, Page page, BlockNumber blkno);
+static ClusterHeapFreezeProofStatusV1 lazy_collect_shared_freeze_proofs(LVRelState *vacrel);
 static void lazy_prepare_shared_freeze(LVRelState *vacrel, Buffer *vmbuffer);
 #endif
 static BlockNumber lazy_scan_skip(LVRelState *vacrel, Buffer *vmbuffer,
@@ -1580,6 +1584,133 @@ lazy_validate_shared_freeze(LVRelState *vacrel, Page page, BlockNumber blkno)
 }
 
 /*
+ * Resolve every captured carrier through the terminal-census provider while
+ * retaining one R4 admission and one before/after PCM route fence.  This is
+ * evidence preparation only: the page remains untouched and the caller must
+ * still perform a later conditional apply under its normal ownership.
+ */
+static ClusterHeapFreezeProofStatusV1
+lazy_collect_shared_freeze_proofs(LVRelState *vacrel)
+{
+	BufferTag tag;
+	PcmAuthoritySnapshot authority_before,
+					authority_after;
+	ClusterSemanticAdmissionToken admission;
+	ClusterSemanticAdmissionResult admission_result;
+	ClusterHeapFreezeFinalFenceV1 expected_fence,
+							 current_fence;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeProofStatusV1 status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
+	ClusterTxResolveReason reason;
+	uint64 master_before = 0,
+			 master_after = 0;
+	SCN page_scn_before = InvalidScn,
+			page_scn_after = InvalidScn;
+	bool route_before = false,
+		route_after = false,
+		admission_entered = false,
+		admission_current = false,
+		authority_current = false;
+
+	memset(&proofs, 0, sizeof(proofs));
+	memset(&admission, 0, sizeof(admission));
+	memset(&expected_fence, 0, sizeof(expected_fence));
+	memset(&current_fence, 0, sizeof(current_fence));
+	memset(&authority_before, 0, sizeof(authority_before));
+	memset(&authority_after, 0, sizeof(authority_after));
+
+	if (vacrel == NULL || vacrel->rel == NULL
+		|| vacrel->shared_freeze_batch.carrier_request_count == 0
+		|| vacrel->shared_freeze_batch.carrier_request_count
+		> CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH)
+		goto done;
+
+	InitBufferTag(&tag, &vacrel->rel->rd_locator, MAIN_FORKNUM,
+				  vacrel->shared_freeze_batch.block);
+	route_before = cluster_pcm_lock_r4_route_snapshot(tag, &authority_before,
+												 &master_before, &page_scn_before);
+	if (!route_before || !SCN_VALID(page_scn_before))
+		goto done;
+
+	admission_result = cluster_semantic_activation_enter_r4_terminal_census(&admission);
+	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
+		goto done;
+	admission_entered = true;
+	cluster_tx_resolve_terminal_census_batch_preflight();
+
+	expected_fence.identity = vacrel->shared_freeze_batch.identity;
+	expected_fence.block = vacrel->shared_freeze_batch.block;
+	expected_fence.page_lsn = vacrel->shared_freeze_batch.page_lsn;
+	expected_fence.page_version = vacrel->shared_freeze_batch.page_version;
+	expected_fence.holder_sequence = authority_before.transition_count;
+	expected_fence.master_sequence = master_before;
+	expected_fence.admission_generation = admission.record_generation;
+	current_fence = expected_fence;
+
+	for (uint8 index = 0;
+		 index < vacrel->shared_freeze_batch.carrier_request_count; index++)
+	{
+		ClusterTxResolution resolution;
+		ClusterTxOutcome outcome;
+
+		memset(&resolution, 0, sizeof(resolution));
+		reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+		outcome = cluster_tx_resolve_exact_admitted(
+			&vacrel->shared_freeze_batch.carrier_requests[index].locator,
+			CLUSTER_TX_RESOLVE_TERMINAL_CENSUS, &admission, &resolution, &reason);
+		if ((outcome != CLUSTER_TX_COMMITTED && outcome != CLUSTER_TX_ABORTED)
+			|| reason != CLUSTER_TX_RESOLVE_NONE
+			|| !cluster_heap_freeze_build_canonical_proof_v1(
+				&vacrel->shared_freeze_batch.carrier_requests[index].locator,
+				&resolution, &expected_fence, &expected_fence, true, true, true,
+				&proofs.proofs[index]))
+			goto done;
+		proofs.proof_count++;
+	}
+
+	route_after = cluster_pcm_lock_r4_route_snapshot(tag, &authority_after,
+												 &master_after, &page_scn_after);
+	if (!route_after || !SCN_VALID(page_scn_after))
+		goto done;
+	authority_current = cluster_pcm_lock_authority_matches(tag, &authority_before)
+		&& authority_before.transition_count == authority_after.transition_count
+		&& master_before == master_after;
+	authority_current = authority_current && route_after;
+	admission_current = cluster_semantic_activation_recheck_r4_terminal_census(&admission);
+	current_fence.holder_sequence = authority_after.transition_count;
+	current_fence.master_sequence = master_after;
+	for (uint8 index = 0; index < proofs.proof_count; index++)
+	{
+		proofs.proofs[index].current_fence = current_fence;
+		proofs.proofs[index].authority_current = authority_current;
+		proofs.proofs[index].admission_current = admission_current;
+	}
+
+	status = cluster_heap_freeze_validate_conditional_apply_v1(
+		&vacrel->shared_freeze_batch, &proofs, &current_fence);
+	if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+		|| status == CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED)
+	{
+		vacrel->shared_freeze_proofs = proofs;
+		vacrel->shared_freeze_fence = current_fence;
+		vacrel->shared_freeze_fence_valid =
+			status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN;
+	}
+
+done:
+	if (admission_entered)
+		cluster_semantic_activation_leave(&admission);
+	if (status != CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+		&& status != CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED
+		&& vacrel != NULL)
+	{
+		vacrel->shared_freeze_proofs.proof_count = 0;
+		vacrel->shared_freeze_fence_valid = false;
+	}
+	return status;
+}
+
+/*
  * Caller has released its heap lock and pin. Drop the VM pin before preparing
  * owned row/request inputs, so this boundary cannot retain those buffers over
  * later proof work. Only the last capture is prepared after cleanup fallback.
@@ -1606,10 +1737,7 @@ lazy_prepare_shared_freeze(LVRelState *vacrel, Buffer *vmbuffer)
 	vacrel->shared_xmax_deferred_tuples += vacrel->shared_freeze_batch.unproven_xmax_tuples;
 	vacrel->shared_freeze_proofs.proof_count = 0;
 	vacrel->shared_freeze_fence_valid = false;
-	/* No transport provider/final fence is wired yet, so remain KEEP. */
-	vacrel->shared_freeze_apply_status =
-		cluster_heap_freeze_validate_conditional_apply_v1(
-			&vacrel->shared_freeze_batch, &vacrel->shared_freeze_proofs, NULL);
+	vacrel->shared_freeze_apply_status = lazy_collect_shared_freeze_proofs(vacrel);
 	vacrel->shared_freeze_input_valid = true;
 }
 #endif
