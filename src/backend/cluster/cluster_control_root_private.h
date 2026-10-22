@@ -109,6 +109,16 @@ extern ClusterControlRootResult
 cluster_control_root_v3_reserve_clean(const ClusterStartupExitCut *expected,
 									  ClusterControlRootFileToken *out);
 
+/* PGRAC: cache-complete cohort input reservation; no writer/serving grant.
+ * Owns CF and retains every predecessor WALR through publication/readback.
+ * Caller supplies the current StartupProcess identity and exact ROOT token;
+ * real anchor/WAL and the complete current formation are selected internally.
+ * Author: SqlRush <sqlrush@gmail.com> */
+extern ClusterControlRootResult
+cluster_control_root_v3_reserve_recovered(const ClusterControlRootIdentity *self,
+										 const ClusterControlRootFileToken *expected,
+										 ClusterControlRootFileToken *out);
+
 /* PGRAC: bounded retained-writer input, never an authority/retirement proof.
  * Author: SqlRush <sqlrush@gmail.com>
  */
