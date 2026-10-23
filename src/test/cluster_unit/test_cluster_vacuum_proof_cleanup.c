@@ -1387,10 +1387,14 @@ UT_TEST(rejected_or_cleaned_collection_cannot_reuse_creation_indexes)
 		case 3: page_match = CLUSTER_HEAP_FREEZE_PAGE_CHANGED; break;
 		case 4: setup_cleanout_page(); break;
 		}
+		vacrel.shared_freeze_batch.tuples[0].original_creator_full_xid =
+			FullTransactionIdFromEpochAndXid(9, 77);
 		(void)lazy_collect_shared_freeze_proofs(&vacrel, 1);
 		UT_ASSERT_EQ(target_bindings, 0);
 		UT_ASSERT_EQ(vacrel.shared_freeze_batch.tuples[0].creation_target_proof_index,
 			CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET);
+		UT_ASSERT(!FullTransactionIdIsValid(
+			vacrel.shared_freeze_batch.tuples[0].original_creator_full_xid));
 		UT_ASSERT_EQ(debt, 0);
 	}
 }

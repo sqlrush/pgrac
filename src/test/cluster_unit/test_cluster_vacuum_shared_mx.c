@@ -2542,10 +2542,103 @@ UT_TEST(xmin_plan_missing_arguments_and_bad_bounds_leave_output_untouched)
 	}
 }
 
+UT_TEST(creation_provenance_only_follows_exact_physical_creation_target)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+	FullTransactionId original = FullTransactionIdFromEpochAndXid(9, 77);
+
+	init_creation_binding_fixture(&page, &proofs, &fence);
+	proofs.proofs[0].resolution.local_original_full_xid = original;
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 1);
+	UT_ASSERT(FullTransactionIdEquals(page.tuples[0].original_creator_full_xid, original));
+	UT_ASSERT(!FullTransactionIdIsValid(page.tuples[1].original_creator_full_xid));
+	/* Equal raw xmin/current carrier cannot propagate provenance to another
+	 * physical row. Rebinding retires the old row observation. */
+	proofs.proofs[0].resolution.local_creation_target.offset = 2;
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 1);
+	UT_ASSERT(!FullTransactionIdIsValid(page.tuples[0].original_creator_full_xid));
+	UT_ASSERT(FullTransactionIdEquals(page.tuples[1].original_creator_full_xid, original));
+}
+
+UT_TEST(creation_provenance_missing_or_raw_mismatch_never_guesses_an_epoch)
+{
+	const FullTransactionId invalid[] = {
+		InvalidFullTransactionId, FullTransactionIdFromU64(2),
+		FullTransactionIdFromEpochAndXid(9, 78)
+	};
+
+	for (unsigned variant = 0; variant < lengthof(invalid); variant++) {
+		ClusterHeapFreezePageBatchV1 page;
+		ClusterHeapFreezeProofBatchV1 proofs;
+		ClusterHeapFreezeFinalFenceV1 fence;
+
+		init_creation_binding_fixture(&page, &proofs, &fence);
+		proofs.proofs[0].resolution.local_original_full_xid = invalid[variant];
+		UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 1);
+		UT_ASSERT_EQ(page.tuples[0].creation_target_proof_index, 0);
+		UT_ASSERT(!FullTransactionIdIsValid(page.tuples[0].original_creator_full_xid));
+	}
+}
+
+UT_TEST(creation_provenance_rejection_clears_preceding_attempt)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		ClusterHeapFreezePageBatchV1 page;
+		ClusterHeapFreezeProofBatchV1 proofs;
+		ClusterHeapFreezeFinalFenceV1 fence;
+
+		init_creation_binding_fixture(&page, &proofs, &fence);
+		for (int row = 0; row < 2; row++)
+			page.tuples[row].original_creator_full_xid = FullTransactionIdFromEpochAndXid(9, 77);
+		switch (variant) {
+		case 0: proofs.proof_count = 0; break;
+		case 1: fence.page_version++; break;
+		case 2: proofs.proofs[0].resolution.local_canonical_generation = 0; break;
+		case 3: proofs.proofs[0].resolution.local_creation_target.valid = false; break;
+		}
+		UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 0);
+		UT_ASSERT(!FullTransactionIdIsValid(page.tuples[0].original_creator_full_xid));
+		UT_ASSERT(!FullTransactionIdIsValid(page.tuples[1].original_creator_full_xid));
+	}
+}
+
+UT_TEST(creation_provenance_keeps_distinct_carriers_with_equal_raw_xmin)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+	ClusterHeapFreezeCanonicalProofV1 swap;
+	FullTransactionId first = FullTransactionIdFromEpochAndXid(9, 77);
+	FullTransactionId second = FullTransactionIdFromEpochAndXid(10, 77);
+
+	init_creation_binding_fixture(&page, &proofs, &fence);
+	page.carrier_request_count = proofs.proof_count = 2;
+	page.carrier_requests[1] = page.carrier_requests[0];
+	page.carrier_requests[1].locator.itl_slot_index = 1;
+	proofs.proofs[0].resolution.local_original_full_xid = first;
+	proofs.proofs[1] = proofs.proofs[0];
+	proofs.proofs[1].requested_locator.itl_slot_index = 1;
+	proofs.proofs[1].resolution.locator_echo.itl_slot_index = 1;
+	proofs.proofs[1].resolution.local_creation_target.offset = 2;
+	proofs.proofs[1].resolution.local_original_full_xid = second;
+	page.tuples[1].carrier_request_index = 1;
+	page.tuples[1].itl_slot_index = 1;
+	swap = proofs.proofs[0]; proofs.proofs[0] = proofs.proofs[1]; proofs.proofs[1] = swap;
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 2);
+	UT_ASSERT(FullTransactionIdEquals(page.tuples[0].original_creator_full_xid, first));
+	UT_ASSERT(FullTransactionIdEquals(page.tuples[1].original_creator_full_xid, second));
+}
+
 int
 main(void)
 {
-	UT_PLAN(78);
+	UT_PLAN(82);
+	UT_RUN(creation_provenance_only_follows_exact_physical_creation_target);
+	UT_RUN(creation_provenance_missing_or_raw_mismatch_never_guesses_an_epoch);
+	UT_RUN(creation_provenance_rejection_clears_preceding_attempt);
+	UT_RUN(creation_provenance_keeps_distinct_carriers_with_equal_raw_xmin);
 	UT_RUN(share_scan_preserves_every_reference_before_native_consumer);
 	UT_RUN(cleanup_scan_preserves_before_prune_and_freeze);
 	UT_RUN(raw_multi_value_never_selects_local_reader);

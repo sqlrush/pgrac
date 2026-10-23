@@ -204,7 +204,10 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
     ),
     ScanRule(
         "CTRC_ORIGIN_PROVENANCE",
-        ("src/backend/cluster/cluster_terminal_ref_census.c",),
+        (
+            "src/backend/cluster/cluster_terminal_ref_census.c",
+            "src/backend/cluster/cluster_runtime_visibility.c",
+        ),
         r"\bcluster_ctrc_origin_original_full_xid_(?:exact|shared)\s*\(",
     ),
     ScanRule(
@@ -490,6 +493,17 @@ _classify_owners(
         "cluster_ctrc_origin_original_full_xid_exact",
         "cluster_ctrc_origin_original_full_xid_shared",
     ),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_REFERENCE_TRANSFER_REQUIRED",
+    "NO_REFERENCE_TO_DISCHARGE",
+    "MXA-T40",
+)
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_runtime_visibility.c",
+    ("cluster_runtime_visibility_origin_original_full_xid",),
     "REGISTERED_REFERENCE",
     "ALL_CTRC_REFERENCE_KINDS",
     "ALL_CTRC_TARGET_KINDS",

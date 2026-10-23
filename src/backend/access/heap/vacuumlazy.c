@@ -1820,8 +1820,12 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 	{
 		for (uint16 index = 0;
 			 index < Min(vacrel->shared_freeze_batch.tuple_count, MaxHeapTuplesPerPage); index++)
+		{
 			vacrel->shared_freeze_batch.tuples[index].creation_target_proof_index =
 				CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET;
+			vacrel->shared_freeze_batch.tuples[index].original_creator_full_xid =
+				InvalidFullTransactionId;
+		}
 	}
 
 	if (vacrel == NULL || vacrel->rel == NULL

@@ -90,6 +90,9 @@ typedef struct ClusterHeapFreezeTupleInputV1
 	uint8 carrier_request_index;
 	/* Physical association only; never a row-freeze certificate. */
 	uint8 creation_target_proof_index;
+	/* Optional exact origin observation; Invalid means not qualified.
+	 * This association alone grants no F/H, current ownership or freeze. */
+	FullTransactionId original_creator_full_xid;
 	bool has_carrier;
 	ClusterItlSlotData carrier;
 } ClusterHeapFreezeTupleInputV1;
@@ -275,8 +278,9 @@ cluster_heap_freeze_validate_carrier_cleanout_v1(
 	const ClusterHeapFreezeFinalFenceV1 *current_fence);
 
 /* Reset prior associations and bind only exact committed creation targets to
- * their physical row/carrier in a complete, validated proof batch. No original
- * FullXid, eligibility, final apply ownership or retention is implied. */
+ * their physical row/carrier in a complete, validated proof batch. An optional
+ * exact original FullXid follows only that matching row; its absence stays
+ * unqualified. No F/H eligibility, final apply ownership or retention is implied. */
 extern uint16 cluster_heap_freeze_bind_creation_targets_v1(
 	ClusterHeapFreezePageBatchV1 *page,
 	const ClusterHeapFreezeProofBatchV1 *proofs,

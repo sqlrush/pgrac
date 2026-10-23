@@ -6092,6 +6092,10 @@ CLUSTER_R4_RUNTIME_VIS_UBA_O = $(top_builddir)/src/backend/cluster/cluster_uba.o
 CLUSTER_MULTIXACT_CURRENT_O = $(top_builddir)/src/backend/cluster/cluster_multixact_current.o
 CLUSTER_MULTIXACT_CURRENT_WIRE_O = \
 	$(top_builddir)/src/backend/cluster/cluster_multixact_current_wire.o
+# These objects allocate/copy the process-local resolution: rebuild together
+# when its optional origin-provenance projection changes size.
+$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
+		test_cluster_undo_pending_product.o: $(top_srcdir)/src/include/cluster/cluster_tx_resolve.h
 $(CLUSTER_R4_RUNTIME_VIS_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c \
 		$(top_srcdir)/src/include/cluster/cluster_tx_resolve.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_record.h

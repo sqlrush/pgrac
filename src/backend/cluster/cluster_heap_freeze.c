@@ -621,7 +621,10 @@ cluster_heap_freeze_bind_creation_targets_v1(
 	/* Rejection and replacement both retire the previous attempt's associations. */
 	bound = Min(page->tuple_count, MaxHeapTuplesPerPage);
 	for (uint16 index = 0; index < bound; index++)
+	{
 		page->tuples[index].creation_target_proof_index = CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET;
+		page->tuples[index].original_creator_full_xid = InvalidFullTransactionId;
+	}
 	if (freeze_validate_carrier_proofs(page, proofs, current_fence, true)
 		!= CLUSTER_HEAP_FREEZE_PROOF_PROVEN
 		|| page->page_lsn != current_fence->page_lsn
@@ -663,6 +666,10 @@ cluster_heap_freeze_bind_creation_targets_v1(
 				|| (target->tuple_length != 0 && target->tuple_length != tuple->tuple_length))
 				continue;
 			tuple->creation_target_proof_index = proof_index;
+			if (FullTransactionIdIsNormal(proof->resolution.local_original_full_xid)
+				&& XidFromFullTransactionId(proof->resolution.local_original_full_xid)
+					== tuple->raw_xmin)
+				tuple->original_creator_full_xid = proof->resolution.local_original_full_xid;
 			matched++;
 			break;
 		}

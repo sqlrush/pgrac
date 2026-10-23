@@ -991,6 +991,56 @@ cluster_runtime_visibility_ctrc_key_fill(const ClusterTTSlotCurrentOwner *owner,
 	return true;
 }
 
+/* Optional provenance is sampled before the caller's original final
+ * generation/root/admission checks, while its canonical guard remains held. */
+static FullTransactionId
+cluster_runtime_visibility_origin_original_full_xid(
+	const ClusterTxResolution *candidate, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission,
+	const ClusterUndoBlock0ResolvedRoot *root)
+{
+	ClusterTTSlotCurrentOwner owner = {0};
+	ClusterUndoBlock0Generation generation = {false, 0};
+	ClusterCtrcTxnKeyV1 key;
+	FullTransactionId original = InvalidFullTransactionId;
+
+	/* Optional local observation only. Its absence must not change the
+	 * transaction verdict or invoke another TT/DATA read or acquisition. */
+	if (mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS || candidate == NULL
+		|| admission == NULL || root == NULL || !admission->entered
+		|| candidate->outcome != CLUSTER_TX_COMMITTED
+		|| candidate->proof_kind != CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG
+		|| !SCN_VALID(candidate->commit_scn) || !candidate->local_canonical_valid
+		|| candidate->top_xid != candidate->locator_echo.xid
+		|| candidate->local_canonical.xid != candidate->locator_echo.xid
+		|| candidate->local_canonical.wrap != candidate->locator_echo.tt_wrap
+		|| candidate->local_canonical.wrap == TT_WRAP_INVALID
+		|| candidate->local_canonical.wrap > TT_WRAP_MAX
+		|| candidate->local_canonical.reserved32 != 0
+		|| candidate->local_canonical_generation == 0
+		|| candidate->local_canonical_generation == UINT32_MAX
+		|| candidate->local_canonical.segment_id == 0
+		|| candidate->local_canonical.segment_id > UINT16_MAX
+		|| candidate->local_canonical.slot_offset >= TT_SLOTS_PER_SEGMENT
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| (candidate->local_canonical.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE
+			!= (uint32) cluster_node_id)
+		return InvalidFullTransactionId;
+	owner.segment_id = candidate->local_canonical.segment_id;
+	owner.xid = candidate->local_canonical.xid;
+	owner.slot_offset = candidate->local_canonical.slot_offset;
+	owner.wrap = candidate->local_canonical.wrap;
+	generation.known = true;
+	generation.value = candidate->local_canonical_generation;
+	if (!cluster_runtime_visibility_ctrc_key_fill(&owner, &generation, root, admission, &key)
+		|| !cluster_ctrc_origin_original_full_xid_shared(&key, &original)
+		|| !FullTransactionIdIsNormal(original)
+		|| XidFromFullTransactionId(original) != owner.xid
+		|| cluster_qvotec_get_self_incarnation() != key.origin_boot_incarnation)
+		return InvalidFullTransactionId;
+	return original;
+}
+
 /* A raw-xid-only scan needs a caller-owned interpretation scope. */
 typedef struct ClusterTtLocateScope {
 	FullTransactionId full_xid;
@@ -2149,6 +2199,16 @@ cluster_runtime_visibility_origin_plan_freeze_data_internal(
 	plan_data->candidate.proof_kind = proof_kind;
 	plan_data->candidate.commit_scn = commit_scn;
 	cluster_runtime_visibility_origin_candidate_stamp(&plan_data->candidate, admission);
+	/* Already sampled canonical identity; no extra lookup or authority. */
+	plan_data->candidate.local_canonical.segment_id = plan_data->tt_logical.segment_id;
+	plan_data->candidate.local_canonical.xid = plan_data->canonical_locator.xid;
+	plan_data->candidate.local_canonical.slot_offset = plan_data->tt_slot_offset;
+	plan_data->candidate.local_canonical.wrap = plan_data->canonical_locator.tt_wrap;
+	plan_data->candidate.local_canonical_generation = generation.value;
+	plan_data->candidate.local_canonical_valid = true;
+	plan_data->candidate.local_original_full_xid
+		= cluster_runtime_visibility_origin_original_full_xid(
+			&plan_data->candidate, mode, admission, root);
 	if (plan_data->candidate.authority.origin_epoch != admission->formation_epoch
 		|| XLogRecPtrIsInvalid(plan_data->candidate.authority.live_hwm_lsn)
 		|| !SCN_VALID(plan_data->candidate.authority.authority_scn)
@@ -2163,13 +2223,6 @@ cluster_runtime_visibility_origin_plan_freeze_data_internal(
 		reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
 		goto failed;
 	}
-	/* Already sampled canonical identity; no extra lookup or authority. */
-	plan_data->candidate.local_canonical.segment_id = plan_data->tt_logical.segment_id;
-	plan_data->candidate.local_canonical.xid = plan_data->canonical_locator.xid;
-	plan_data->candidate.local_canonical.slot_offset = plan_data->tt_slot_offset;
-	plan_data->candidate.local_canonical.wrap = plan_data->canonical_locator.tt_wrap;
-	plan_data->candidate.local_canonical_generation = generation.value;
-	plan_data->candidate.local_canonical_valid = true;
 	plan_data->canonical_root = *root;
 	cluster_runtime_visibility_origin_creation_target(plan_data->record_buf.data,
 													 plan_data->record_length, &plan_data->candidate);
@@ -2350,6 +2403,16 @@ cluster_runtime_visibility_origin_plan_sample_canonical_held(
 	plan_data->candidate.proof_kind = proof_kind;
 	plan_data->candidate.commit_scn = commit_scn;
 	cluster_runtime_visibility_origin_candidate_stamp(&plan_data->candidate, admission);
+	/* Already sampled canonical identity; no extra lookup or authority. */
+	plan_data->candidate.local_canonical.segment_id = plan_data->tt_logical.segment_id;
+	plan_data->candidate.local_canonical.xid = plan_data->canonical_locator.xid;
+	plan_data->candidate.local_canonical.slot_offset = plan_data->tt_slot_offset;
+	plan_data->candidate.local_canonical.wrap = plan_data->canonical_locator.tt_wrap;
+	plan_data->candidate.local_canonical_generation = generation.value;
+	plan_data->candidate.local_canonical_valid = true;
+	plan_data->candidate.local_original_full_xid
+		= cluster_runtime_visibility_origin_original_full_xid(
+			&plan_data->candidate, mode, admission, root);
 	if (plan_data->candidate.authority.origin_epoch != admission->formation_epoch
 		|| XLogRecPtrIsInvalid(plan_data->candidate.authority.live_hwm_lsn)
 		|| !SCN_VALID(plan_data->candidate.authority.authority_scn)) {
@@ -2391,13 +2454,6 @@ cluster_runtime_visibility_origin_plan_sample_canonical_held(
 	}
 	plan_data->canonical_diagnostic.first_failure
 		= CLUSTER_RUNTIME_VISIBILITY_CANONICAL_FAILURE_NONE;
-	/* Already sampled canonical identity; no extra lookup or authority. */
-	plan_data->candidate.local_canonical.segment_id = plan_data->tt_logical.segment_id;
-	plan_data->candidate.local_canonical.xid = plan_data->canonical_locator.xid;
-	plan_data->candidate.local_canonical.slot_offset = plan_data->tt_slot_offset;
-	plan_data->candidate.local_canonical.wrap = plan_data->canonical_locator.tt_wrap;
-	plan_data->candidate.local_canonical_generation = generation.value;
-	plan_data->candidate.local_canonical_valid = true;
 	plan_data->canonical_root = *root;
 	plan_data->candidate_valid = true;
 	if (reason_out != NULL)
@@ -2975,6 +3031,7 @@ cluster_runtime_visibility_resolve_exact_origin_admitted(
 		memset(&out->local_canonical, 0, sizeof(out->local_canonical));
 		out->local_canonical_generation = 0;
 		out->local_canonical_valid = false;
+		out->local_original_full_xid = InvalidFullTransactionId;
 		memset(&out->local_creation_target, 0, sizeof(out->local_creation_target));
 		goto recheck;
 	}

@@ -159,6 +159,9 @@ typedef struct ClusterTxResolution {
 	ClusterTTSlotPhysicalLocator local_canonical;
 	uint32 local_canonical_generation;
 	bool local_canonical_valid;
+	/* Optional original identity copied under the canonical origin guard.
+	 * Invalid means unavailable; never reconstructed from raw XID or wire. */
+	FullTransactionId local_original_full_xid;
 	ClusterTxCreationTarget local_creation_target;
 } ClusterTxResolution;
 
