@@ -10,6 +10,8 @@
 #include "access/xloginsert.h"
 #include "cluster/cluster_page_producer.h"
 #include "cluster/cluster_scn.h"
+#include "cluster/cluster_semantic_activation.h"
+#include "miscadmin.h"
 
 static bool
 incarnation_nonzero(const uint8 incarnation[16])
@@ -91,6 +93,11 @@ rf_page_producer_prepare_v1(const RfPageProducerComponentV1 *components, uint8 c
 	uint64 token;
 	int i;
 	int j;
+
+	if (MyBackendType != B_STARTUP
+		&& cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& !cluster_semantic_activation_recovered_open_current())
+		return false;
 
 	if (components == NULL || batch == NULL || component_count == 0
 		|| component_count > RF_PAGE_PRODUCER_MAX_COMPONENTS)
