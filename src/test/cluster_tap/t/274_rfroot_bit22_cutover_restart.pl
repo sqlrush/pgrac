@@ -157,4 +157,33 @@ is($node1->safe_psql('postgres', 'SELECT 1'), '1',
 ok(root_activation_state($root_file) == 2,
 	'L5 root still ACTIVE after the coordinator restart');
 
+# L6: an immediate stop exercises the real cold-recovery startup path.  The
+# durable OPEN record must be consumed by the recovered-owner matcher before
+# the restarted member can serve SQL or retain the ACTIVE root.
+$node1->stop('immediate');
+$node1->start;
+ok($pair->wait_for_pcm_x_active(30),
+	'L6 pair reformed after the peer crash-recovery restart');
+is($node1->safe_psql('postgres', 'SELECT 1'), '1',
+	'L6 recovered peer serves SQL only after recovered OPEN');
+ok(root_activation_state($root_file) == 2,
+	'L6 durable OPEN keeps the canonical root ACTIVE after crash recovery');
+
+# L7: a boot identity drift must not reuse the old durable OPEN proof.  The
+# deliberately invalid node id is a real postmaster start, not a unit stub;
+# restoring the configured identity then proves the normal recovered path can
+# be entered again.
+$node1->stop('immediate');
+$node1->adjust_conf('postgresql.conf', 'cluster.node_id', '99');
+is($node1->start(fail_ok => 1), 0,
+	'L7 recovered startup rejects a drifted node identity before OPEN');
+$node1->adjust_conf('postgresql.conf', 'cluster.node_id', '1');
+$node1->start;
+ok($pair->wait_for_pcm_x_active(30),
+	'L7 restored identity re-forms after the drift refusal');
+is($node1->safe_psql('postgres', 'SELECT 1'), '1',
+	'L7 restored identity serves after a fresh recovered OPEN match');
+ok(root_activation_state($root_file) == 2,
+	'L7 restored identity retains the canonical ACTIVE root');
+
 done_testing();
