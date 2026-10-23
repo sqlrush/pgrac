@@ -207,12 +207,20 @@ sub new_fixture
 	return eval {
 		new_cold_pair(
 			$name,
-			seed_sql => q{
-				CREATE TABLE e1_reconcile (
-					id integer PRIMARY KEY,
-					committed boolean NOT NULL,
-					payload text NOT NULL)},
 			extra_conf => \@PAIR_CONF);
+	};
+}
+
+sub create_schema_after_open
+{
+	my ($pair) = @_;
+	return eval {
+		$pair->node0->safe_psql('postgres', q{
+			CREATE TABLE e1_reconcile (
+				id integer PRIMARY KEY,
+				committed boolean NOT NULL,
+				payload text NOT NULL)});
+		1;
 	};
 }
 
@@ -239,8 +247,15 @@ if ($started)
 ok($peer_connected, 'both live members report the peer connected');
 ok($pcm_active, 'both live members report PCM-X active');
 
-my ($committed0, $committed1) = (0, 0);
+my $schema_created = 0;
 if ($started && $initial_open && $peer_connected && $pcm_active)
+{
+	$schema_created = create_schema_after_open($pair) ? 1 : 0;
+}
+ok($schema_created, 'positive schema is created after recovered OPEN');
+
+my ($committed0, $committed1) = (0, 0);
+if ($started && $initial_open && $peer_connected && $pcm_active && $schema_created)
 {
 	$committed0 = eval { write_committed($pair->node0, 1, 32); 1 } ? 1 : 0;
 	$committed1 = eval { write_committed($pair->node1, 33, 64); 1 } ? 1 : 0;
