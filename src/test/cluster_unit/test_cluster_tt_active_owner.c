@@ -261,6 +261,12 @@ cluster_undo_segment_hard_cap_fail_count(void)
 	return 0;
 }
 
+uint64
+cluster_undo_tt_rollover_fail_activate_count(void)
+{
+	return 0;
+}
+
 static void
 reset_active_owner(void)
 {
@@ -346,6 +352,16 @@ UT_TEST(test_real_allocator_normal_local_publication)
 {
 	reset_active_owner();
 	require_published_on(1);
+}
+
+UT_TEST(test_fresh_open_reserves_active_without_recovered_proof)
+{
+	reset_active_owner();
+	cluster_shared_config = true;
+	active_owner_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+	active_owner_recovered_open = false;
+	require_published_on(1);
+	reset_active_owner();
 }
 
 UT_TEST(test_cold_allocator_preserves_occupied_durable_base)
@@ -618,13 +634,14 @@ UT_TEST(test_real_local_postbind_error_stays_failed_without_reallocation)
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(17);
 	UT_RUN(test_recovered_open_gate_precedes_canonical_reservation);
 	UT_RUN(test_modifier_refusal_precedes_allocation_and_leaves_abort_without_effects);
 	UT_RUN(test_cold_allocator_preserves_occupied_durable_base);
 	UT_RUN(test_cold_fresh_database_uses_same_publication_path);
 	UT_RUN(test_cold_full_pool_refuses_before_binding_or_bind_wal);
 	UT_RUN(test_real_allocator_normal_local_publication);
+	UT_RUN(test_fresh_open_reserves_active_without_recovered_proof);
 	UT_RUN(test_real_allocator_rolls_after_reserve_before_observation);
 	UT_RUN(test_real_allocator_rolls_during_modifier_admission);
 	UT_RUN(test_real_allocator_rolls_while_current_is_acquired);

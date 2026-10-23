@@ -78,6 +78,21 @@ current_resid_namespace_valid(uint8 type)
 		   && type != UINT8_C(0xF3);
 }
 
+/* Report the branch that actually refused; keep admission results unchanged. */
+static ClusterUndoBlock0Result
+current_live_owner_refusal(const char *operation, const char *predicate,
+						   const ClusterUndoBlock0LogicalKey *key,
+						   ClusterUndoBlock0Result result, int detail)
+{
+	ereport(LOG,
+			(errmsg_internal("undo lifecycle current refused: operation=%s predicate=%s "
+							 "result=%d detail=%d node=%d segment=%u owner=%u",
+							 operation, predicate, (int)result, detail, cluster_node_id,
+							 key == NULL ? 0 : key->segment_id,
+							 key == NULL ? 0 : (unsigned)key->owner_instance)));
+	return result;
+}
+
 /* Ordinary block-zero lifecycle writers must consume the same durable
  * recovered OPEN proof as their higher-level producers.  Startup owns the
  * cold-recovery path and remains exempt; source-zero/target-ready formation
@@ -1719,15 +1734,18 @@ current_live_owner_ensure_resident(const ClusterUndoBlock0LogicalKey *key, int t
 	ClusterUndoBlock0Result current_failure = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 	ClusterSemanticAdmissionResult admission_result;
 	uint32 logical_slot;
+	const char *predicate = "ROOT_RESOLVE";
 
 	if (publication != NULL)
 		memset(publication, 0, sizeof(*publication));
 
 	if (key == NULL || cluster_node_id < 0 || key->owner_instance != (uint8)(cluster_node_id + 1)
 		|| cluster_undo_block0_logical_slot(key, &logical_slot) != CLUSTER_UNDO_BLOCK0_OK)
-		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+		return current_live_owner_refusal("ensure_resident", "LOGICAL_KEY", key,
+									  CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, 0);
 	if (!current_live_owner_recovered_open_admitted())
-		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+		return current_live_owner_refusal("ensure_resident", "RECOVERED_OPEN", key,
+									  CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, 0);
 
 	memset(&admission, 0, sizeof(admission));
 	memset(&pin, 0, sizeof(pin));
@@ -1750,7 +1768,8 @@ current_live_owner_ensure_resident(const ClusterUndoBlock0LogicalKey *key, int t
 	 */
 	admission_result = cluster_semantic_activation_modifier_enter(true, &admission);
 	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
-		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+		return current_live_owner_refusal("ensure_resident", "MODIFIER_ENTER", key,
+									  CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, (int)admission_result);
 	cleanup.admission_held = true;
 
 	PG_ENSURE_ERROR_CLEANUP(current_live_owner_error_cleanup,
@@ -1767,6 +1786,7 @@ current_live_owner_ensure_resident(const ClusterUndoBlock0LogicalKey *key, int t
 				  : false))
 			goto ensure_done;
 
+		predicate = "CURRENT_ACQUIRE";
 		step = admission.side == CLUSTER_SEMANTIC_SOURCE_SIDE
 				   ? cluster_undo_block0_current_acquire_begin_live_owner_source(
 						 key, timeout_ms, &admission, &guard, &current_failure)
@@ -1791,9 +1811,11 @@ current_live_owner_ensure_resident(const ClusterUndoBlock0LogicalKey *key, int t
 			goto ensure_done;
 		}
 
+		predicate = "HELD_XCUR_PROOF";
 		result = current_held_xcur_proof(&guard, &data, &proof);
 		if (result != CLUSTER_UNDO_BLOCK0_OK)
 			goto ensure_done;
+		predicate = "RESIDENT_GENERATION_SAMPLE";
 		result = current_live_owner_sample_generation(data, &root, &proof, &generation, &cleanup);
 		if (result == CLUSTER_UNDO_BLOCK0_NOT_FOUND && allow_creation && cleanup.provision_held)
 			result = CLUSTER_UNDO_BLOCK0_OK;
@@ -1812,9 +1834,18 @@ current_live_owner_ensure_resident(const ClusterUndoBlock0LogicalKey *key, int t
 				  ? cluster_semantic_activation_resolve_shared_undo_root(
 						&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, key->owner_instance,
 						key->segment_id, &final_root)
-				  : false)
-			|| !cluster_undo_block0_root_matches(&root, &final_root)
-			|| !current_live_recheck(data)) {
+				  : false)) {
+			predicate = "FINAL_ROOT_RESOLVE";
+			result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+			goto ensure_done;
+		}
+		if (!cluster_undo_block0_root_matches(&root, &final_root)) {
+			predicate = "FINAL_ROOT_MATCH";
+			result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+			goto ensure_done;
+		}
+		if (!current_live_recheck(data)) {
+			predicate = "CURRENT_OWNER_RECHECK";
 			result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 			goto ensure_done;
 		}
@@ -1823,6 +1854,7 @@ current_live_owner_ensure_resident(const ClusterUndoBlock0LogicalKey *key, int t
 
 			CLUSTER_INJECTION_POINT("cluster-undo-first-publication-deny");
 			if (cluster_injection_should_skip("cluster-undo-first-publication-deny")) {
+				predicate = "FIRST_PUBLICATION_INJECTION";
 				result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 				goto ensure_done;
 			}
@@ -1835,6 +1867,7 @@ current_live_owner_ensure_resident(const ClusterUndoBlock0LogicalKey *key, int t
 			init_lsn = cluster_undo_emit_segment_init(key->owner_instance, key->segment_id,
 													  cleanup.unpublished_page);
 			if (!current_live_recheck(data)) {
+				predicate = "POST_INIT_OWNER_RECHECK";
 				result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 				goto ensure_done;
 			}
@@ -1848,9 +1881,18 @@ current_live_owner_ensure_resident(const ClusterUndoBlock0LogicalKey *key, int t
 							key->segment_id, &final_root)
 					  : cluster_semantic_activation_resolve_shared_undo_root(
 							&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, key->owner_instance,
-							key->segment_id, &final_root))
-				|| !cluster_undo_block0_root_matches(&root, &final_root)
-				|| !current_live_recheck(data)) {
+							key->segment_id, &final_root))) {
+				predicate = "POST_PUBLICATION_ROOT_RESOLVE";
+				result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+				goto ensure_done;
+			}
+			if (!cluster_undo_block0_root_matches(&root, &final_root)) {
+				predicate = "POST_PUBLICATION_ROOT_MATCH";
+				result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+				goto ensure_done;
+			}
+			if (!current_live_recheck(data)) {
+				predicate = "POST_PUBLICATION_OWNER_RECHECK";
 				result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 				goto ensure_done;
 			}
@@ -1884,8 +1926,10 @@ current_live_owner_ensure_resident(const ClusterUndoBlock0LogicalKey *key, int t
 					pg_usleep(1000L);
 			}
 			cleanup.current_active = false;
-			if (step != CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED && result == CLUSTER_UNDO_BLOCK0_OK)
+			if (step != CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED && result == CLUSTER_UNDO_BLOCK0_OK) {
+				predicate = "CURRENT_RELEASE";
 				result = current_failure;
+			}
 		}
 		cluster_semantic_activation_leave(&admission);
 		cleanup.admission_held = false;
@@ -1894,6 +1938,8 @@ current_live_owner_ensure_resident(const ClusterUndoBlock0LogicalKey *key, int t
 								PointerGetDatum((ClusterUndoBlock0LiveOwnerCleanup *)&cleanup));
 	if (result == CLUSTER_UNDO_BLOCK0_OK && publication != NULL)
 		memcpy(publication, &candidate, sizeof(candidate));
+	if (result != CLUSTER_UNDO_BLOCK0_OK)
+		return current_live_owner_refusal("ensure_resident", predicate, key, result, 0);
 	return result;
 }
 
@@ -2066,15 +2112,18 @@ cluster_undo_block0_current_live_owner_mutate_exact(const ClusterUndoBlock0Logic
 	ClusterUndoBlock0Result current_failure = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 	ClusterSemanticAdmissionResult admission_result;
 	bool root_ok;
+	const char *predicate = "ROOT_RESOLVE";
 
 	if (key == NULL || expected == NULL || !expected->known || expected->value == UINT32_MAX
 		|| predecessor_page == NULL || successor_page == NULL || timeout_ms <= 0
 		|| cluster_node_id < 0 || key->owner_instance != (uint8)(cluster_node_id + 1)
 		|| !current_lifecycle_successor_exact(predecessor_page, successor_page, key,
 											  expected->value))
-		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+		return current_live_owner_refusal("mutate_exact", "LIFECYCLE_INPUT", key,
+									  CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH, 0);
 	if (!current_live_owner_recovered_open_admitted())
-		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+		return current_live_owner_refusal("mutate_exact", "RECOVERED_OPEN", key,
+									  CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, 0);
 
 	memset(&admission, 0, sizeof(admission));
 	memset(&pin, 0, sizeof(pin));
@@ -2089,7 +2138,8 @@ cluster_undo_block0_current_live_owner_mutate_exact(const ClusterUndoBlock0Logic
 	cluster_undo_block0_current_ensure_exit_hooks();
 	admission_result = cluster_semantic_activation_modifier_enter(true, &admission);
 	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
-		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+		return current_live_owner_refusal("mutate_exact", "MODIFIER_ENTER", key,
+									  CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, (int)admission_result);
 	cleanup.admission_held = true;
 
 	PG_ENSURE_ERROR_CLEANUP(current_live_owner_error_cleanup,
@@ -2107,6 +2157,7 @@ cluster_undo_block0_current_live_owner_mutate_exact(const ClusterUndoBlock0Logic
 		if (!root_ok)
 			goto mutate_done;
 
+		predicate = "CURRENT_ACQUIRE";
 		step = admission.side == CLUSTER_SEMANTIC_SOURCE_SIDE
 				   ? cluster_undo_block0_current_acquire_begin_live_owner_source(
 						 key, timeout_ms, &admission, &guard, &current_failure)
@@ -2130,13 +2181,16 @@ cluster_undo_block0_current_live_owner_mutate_exact(const ClusterUndoBlock0Logic
 			goto mutate_done;
 		}
 
+		predicate = "RESIDENT_GENERATION_SAMPLE";
 		result = cluster_undo_block0_current_sample_generation_exclusive(&guard, &root, &observed);
 		if (result != CLUSTER_UNDO_BLOCK0_OK)
 			goto mutate_done;
 		if (!cluster_undo_block0_generation_matches(&observed, expected)) {
+			predicate = "EXPECTED_GENERATION";
 			result = CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH;
 			goto mutate_done;
 		}
+		predicate = "RESIDENT_PIN";
 		result = cluster_undo_block0_current_pin_exclusive(&guard, &root, expected, &pin,
 														   &resident_page);
 		if (result != CLUSTER_UNDO_BLOCK0_OK || resident_page == NULL)
@@ -2145,10 +2199,12 @@ cluster_undo_block0_current_live_owner_mutate_exact(const ClusterUndoBlock0Logic
 
 		if (!cluster_undo_smgr_read_block(root.intent, key->segment_id, key->owner_instance, 0,
 										  disk_block.data)) {
+			predicate = "DISK_READ";
 			result = CLUSTER_UNDO_BLOCK0_IO_ERROR;
 			goto mutate_done;
 		}
 		if (memcmp(disk_block.data, resident_page, BLCKSZ) != 0) {
+			predicate = "DISK_RESIDENT_MATCH";
 			result = CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
 			goto mutate_done;
 		}
@@ -2166,6 +2222,7 @@ cluster_undo_block0_current_live_owner_mutate_exact(const ClusterUndoBlock0Logic
 			memcpy(rebased->tt_slots, disk->tt_slots, sizeof(rebased->tt_slots));
 			if (!current_lifecycle_successor_exact(disk_block.data, rebased_block.data, key,
 												   expected->value)) {
+				predicate = "LIFECYCLE_REBASE";
 				result = CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
 				goto mutate_done;
 			}
@@ -2182,9 +2239,23 @@ cluster_undo_block0_current_live_owner_mutate_exact(const ClusterUndoBlock0Logic
 							&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, key->owner_instance,
 							key->segment_id, &final_root)
 					  : false;
-		if (!root_ok || !cluster_undo_block0_root_matches(&root, &final_root)
-			|| !cluster_semantic_activation_modifier_recheck(&admission, true)
-			|| cluster_undo_block0_current_recheck_exclusive(&guard) != CLUSTER_UNDO_BLOCK0_OK) {
+		if (!root_ok) {
+			predicate = "FINAL_ROOT_RESOLVE";
+			result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+			goto mutate_done;
+		}
+		if (!cluster_undo_block0_root_matches(&root, &final_root)) {
+			predicate = "FINAL_ROOT_MATCH";
+			result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+			goto mutate_done;
+		}
+		if (!cluster_semantic_activation_modifier_recheck(&admission, true)) {
+			predicate = "MODIFIER_RECHECK";
+			result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+			goto mutate_done;
+		}
+		if (cluster_undo_block0_current_recheck_exclusive(&guard) != CLUSTER_UNDO_BLOCK0_OK) {
+			predicate = "XCUR_RECHECK";
 			result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 			goto mutate_done;
 		}
@@ -2206,6 +2277,8 @@ cluster_undo_block0_current_live_owner_mutate_exact(const ClusterUndoBlock0Logic
 	}
 	PG_END_ENSURE_ERROR_CLEANUP(current_live_owner_error_cleanup,
 								PointerGetDatum((ClusterUndoBlock0LiveOwnerCleanup *)&cleanup));
+	if (result != CLUSTER_UNDO_BLOCK0_OK)
+		return current_live_owner_refusal("mutate_exact", predicate, key, result, 0);
 	return result;
 }
 
