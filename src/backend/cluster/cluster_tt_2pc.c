@@ -492,6 +492,13 @@ cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, 
 	uint16 i;
 
 	Assert(cluster_node_id >= 0);
+	if (MyBackendType != B_STARTUP && cluster_shared_config
+		&& cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& !cluster_semantic_activation_recovered_open_current())
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+				 errmsg("cannot finish a prepared transaction before recovered semantic OPEN"),
+				 errhint("Retry the prepared transaction after the recovered OPEN cut is visible.")));
 	if (tt_2pc_stage.armed)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("a prepared transaction finish is already staged")));
