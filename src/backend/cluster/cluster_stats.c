@@ -62,6 +62,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_scn.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_stats.h"
 #include "cluster/cluster_shmem.h"
@@ -627,6 +628,10 @@ stats_refresh_wal_state(void)
 	ClusterWalStateUpdateResult result;
 
 	if (cluster_shared_config || !stats_wal_state_configured())
+		return;
+	/* Online telemetry must not extend liveness before recovered semantic OPEN. */
+	if (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& !cluster_semantic_activation_recovered_open_current())
 		return;
 	stats_fill_wal_state_update(CLUSTER_WAL_STATE_UPDATE_TELEMETRY, 0, &update);
 	result = cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL);

@@ -4978,6 +4978,7 @@ test_cluster_diag: test_cluster_diag.c unit_test.h \
 
 # test_cluster_stats links cluster_stats.o standalone (spec-1.14 Sprint A).
 test_cluster_stats: test_cluster_stats.c unit_test.h \
+		../../../src/include/cluster/cluster_semantic_activation.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_STATS_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_STATS_O) -o $@

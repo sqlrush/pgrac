@@ -45,6 +45,7 @@
 #include "access/xlog.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_scn.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_stats.h"
 #include "cluster/cluster_wal_state.h"
@@ -342,6 +343,8 @@ static bool stats_test_recovery = false;
 static int stats_test_native_calls = 0;
 static ClusterControlRootResult stats_test_native_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 static ClusterControlRootResult stats_test_next_native_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+static ClusterNormalStartState stats_test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+static bool stats_test_recovered_open = false;
 
 static void
 stats_test_complete_native_wait(void)
@@ -363,6 +366,18 @@ ClusterStartupPhase
 cluster_current_phase(void)
 {
 	return stats_test_phase;
+}
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return stats_test_normal_start_state;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return stats_test_recovered_open;
 }
 
 const char *
@@ -493,6 +508,8 @@ reset_stats_lifecycle_fixture(void)
 	stats_test_native_calls = 0;
 	stats_test_native_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 	stats_test_next_native_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	stats_test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+	stats_test_recovered_open = false;
 	stats_test_phase = CLUSTER_PHASE_4_NORMAL;
 	stats_test_self_fenced = false;
 	stats_test_self_check_calls = 0;
@@ -775,6 +792,24 @@ UT_TEST(test_rf_a1_w4_failure_increments_existing_counter)
 }
 
 
+UT_TEST(test_online_stats_refresh_requires_recovered_semantic_open)
+{
+	reset_stats_lifecycle_fixture();
+	stats_test_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	stats_test_recovered_open = false;
+	run_one_stats_incarnation();
+	UT_ASSERT_EQ(stats_test_active_calls, 1);
+	UT_ASSERT_EQ(stats_test_telemetry_calls, 0);
+
+	reset_stats_lifecycle_fixture();
+	stats_test_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	stats_test_recovered_open = true;
+	run_one_stats_incarnation();
+	UT_ASSERT_EQ(stats_test_active_calls, 1);
+	UT_ASSERT_EQ(stats_test_telemetry_calls, 1);
+}
+
+
 /* ============================================================
  * Test runner
  * ============================================================ */
@@ -817,7 +852,7 @@ UT_TEST(postmaster_ready_wait_cannot_consume_busy_or_terminal_status)
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(18);
 	UT_RUN(test_stats_status_enum_values_frozen);
 	UT_RUN(test_stats_shared_state_size_under_4kb);
 	UT_RUN(test_stats_status_to_string_lookup);
@@ -828,6 +863,7 @@ main(void)
 	UT_RUN(test_rf_a1_running_respawn_validates_active_without_replaying_w2);
 	UT_RUN(test_rf_a1_unconfigured_registry_keeps_stats_vanilla);
 	UT_RUN(test_rf_a1_w4_failure_increments_existing_counter);
+	UT_RUN(test_online_stats_refresh_requires_recovered_semantic_open);
 	UT_RUN(test_shared_stats_observes_installed_writer_without_legacy_writes);
 	UT_RUN(test_shared_stats_refuses_invalid_native_writer_before_ready);
 	UT_RUN(test_shared_stats_retries_transient_writer_proof_before_ready);
