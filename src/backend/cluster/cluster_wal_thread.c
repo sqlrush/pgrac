@@ -536,6 +536,16 @@ cluster_wal_thread_install_startup(const ClusterWalStartupImage *expected)
 	result = cluster_control_root_v3_startup_install_writer(expected, &installed);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
+	/* RECOVERED must retain the selected physical owner through route setup;
+	 * a successful route alone cannot qualify a replacement incarnation. */
+	if (expected->input_kind == CLUSTER_WAL_STARTUP_RECOVERED
+		&& (expected->formation_epoch == 0
+			|| expected->claim.identity.origin_owner_incarnation == 0
+			|| installed.claim.identity.system_identifier
+				   != expected->claim.identity.system_identifier
+			|| installed.claim.identity.origin_owner_incarnation
+				   != expected->claim.identity.origin_owner_incarnation))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = cluster_control_bootstrap_wal_route(DataDir, cluster_wal_threads_dir, &installed);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;

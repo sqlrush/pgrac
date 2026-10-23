@@ -744,6 +744,7 @@ UT_TEST(recovered_writer_qualification_is_published_only_with_exact_install)
 {
 	ClusterWalStartupImage expected = { 0 };
 	ClusterWalSourceRef changed;
+	uint64 owner_incarnation;
 	fixture();
 	expected.claim.identity = installed_writer.claim.identity;
 	expected.operation_uuid[0] = 0x27;
@@ -751,6 +752,11 @@ UT_TEST(recovered_writer_qualification_is_published_only_with_exact_install)
 	expected.input_kind = CLUSTER_WAL_STARTUP_RECOVERED;
 	expected.formation_epoch = 77;
 	UT_ASSERT(!cluster_wal_thread_recovered_writer_matches(&installed_writer, 77));
+	owner_incarnation = expected.claim.identity.origin_owner_incarnation;
+	expected.claim.identity.origin_owner_incarnation++;
+	UT_ASSERT_EQ(cluster_wal_thread_install_startup(&expected),
+					 CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	expected.claim.identity.origin_owner_incarnation = owner_incarnation;
 	install_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	UT_ASSERT_NE(cluster_wal_thread_install_startup(&expected), 0);
 	UT_ASSERT(!cluster_wal_thread_recovered_writer_matches(&installed_writer, 77));
