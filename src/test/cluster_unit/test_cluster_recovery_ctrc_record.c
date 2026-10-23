@@ -6605,6 +6605,240 @@ UT_TEST(raw_evidence_independent_golden_and_immutable)
 	UT_ASSERT(out[length] == 0xa5 && memcmp(atoms, saved, sizeof(atoms)) == 0);
 }
 
+/* Independent Python struct.pack/hashlib over the frozen complete vector,
+ * using the earlier independent key/raw/completion/cold literals. */
+static const uint8 owner_evidence_no_cold_sha[32] = {0xdc,0x64,0xb8,0xfa,0xd9,0x40,0x75,0xc1,0xad,0xa2,0x14,0xc5,0xa3,0x50,0x92,0x37,0xd0,0xfe,0x4a,0xd1,0xc3,0x69,0xd7,0xb9,0x6c,0x9e,0x6b,0xdf,0x82,0xc3,0x51,0x0a};
+static const uint8 owner_evidence_cold_sha[32] = {0x21,0x1d,0x17,0x3b,0xb4,0x34,0x76,0x2c,0xed,0x5c,0xba,0xbf,0x63,0x2f,0xd0,0xc1,0x90,0xda,0xd2,0xf7,0xc0,0xb4,0xfc,0x5e,0x3c,0xc6,0x78,0x17,0xa5,0x6f,0xf2,0xc1};
+
+static bool
+owner_evidence_fixture(ClusterRecoveryCTRCOwnerEvidenceInputV2 *input,
+	uint8 payload[320], uint8 completion[sizeof(owner_completion_golden)])
+{
+	ClusterRecoveryCTRCReleaseV2 record = sample();
+
+	record.database_incarnation = 99;
+	record.formation_epoch = cluster_undo_tt_ctrc_get_u64_le(cold_step_golden);
+	record.recovery_serial = cluster_undo_tt_ctrc_get_u64_le(cold_step_golden + 8);
+	record.cohort_bitmap = cluster_undo_tt_ctrc_get_u64_le(cold_step_golden + 16);
+	memcpy(record.input_sha256, cold_step_golden + 32, 32);
+	if (!cluster_recovery_ctrc_encode_v2(&record, SYSTEM_ID, payload, 320))
+		return false;
+	memcpy(completion, owner_completion_golden, sizeof(owner_completion_golden));
+	*input = (ClusterRecoveryCTRCOwnerEvidenceInputV2){
+		{owner_key_golden, sizeof(owner_key_golden)},
+		{completion, sizeof(owner_completion_golden)},
+		{raw_evidence_golden, sizeof(raw_evidence_golden)},
+		{NULL, 0}, {payload, 320}
+	};
+	return true;
+}
+
+static bool
+owner_evidence_refused(const ClusterRecoveryCTRCOwnerEvidenceInputV2 *input,
+	uint64 system, size_t capacity)
+{
+	uint8 out[1026];
+	size_t length = 999, cleared = Min(capacity, (size_t)8);
+
+	memset(out, 0xa5, sizeof(out));
+	if (cluster_recovery_ctrc_owner_evidence_v2(input, system, out + 1, capacity, &length)
+		|| length != 0 || out[0] != 0xa5 || !all_zero(out + 1, cleared))
+		return false;
+	for (size_t i = cleared + 1; i < sizeof(out); i++)
+		if (out[i] != 0xa5)
+			return false;
+	return graph_alloc_live == 0;
+}
+
+UT_TEST(owner_evidence_complete_golden_pairs_and_graph_view)
+{
+	static const uint16 pairs[][2] = {{1,1}, {1,2}, {2,3}, {2,4}, {3,5}, {1,6}};
+	ClusterRecoveryCTRCOwnerEvidenceInputV2 input;
+	ClusterRecoveryCTRCGraphNodeV2 node;
+	ClusterRecoveryCTRCGraphBytesV2 view;
+	uint8 payload[320], body[sizeof(owner_completion_golden)], out[1024], digest[32];
+	size_t length = 999;
+
+	UT_ASSERT(owner_evidence_fixture(&input, payload, body));
+	for (unsigned pair = 0; pair < lengthof(pairs); pair++)
+		for (unsigned has_cold = 0; has_cold < 2; has_cold++) {
+			if (pairs[pair][1] == 3 && !has_cold)
+				continue;
+			cluster_undo_tt_ctrc_put_u16_le(body, pairs[pair][0]);
+			cluster_undo_tt_ctrc_put_u16_le(body + 2, pairs[pair][1]);
+			input.cold_step = (ClusterRecoveryCTRCGraphBytesV2){cold_step_golden,
+				has_cold ? sizeof(cold_step_golden) : 0};
+			memset(out, 0xa5, sizeof(out));
+			UT_ASSERT(cluster_recovery_ctrc_owner_evidence_v2(&input, SYSTEM_ID, out, sizeof(out), &length));
+			UT_ASSERT_EQ(length, has_cold ? 840 : 448);
+			UT_ASSERT_EQ(cluster_undo_tt_ctrc_get_u64_le(out), has_cold ? 5 : 4);
+			UT_ASSERT(memcmp(out + 8, raw_evidence_golden + 8, sizeof(raw_evidence_golden) - 8) == 0);
+			for (size_t i = length; i < sizeof(out); i++)
+				UT_ASSERT_EQ(out[i], 0xa5);
+			if ((pair == 0 && !has_cold) || (pair == 2 && has_cold)) {
+				UT_ASSERT(sha256(out, length, digest));
+				UT_ASSERT(memcmp(digest, has_cold ? owner_evidence_cold_sha : owner_evidence_no_cold_sha, 32) == 0);
+			}
+			view = (ClusterRecoveryCTRCGraphBytesV2){out, length};
+			UT_ASSERT(cluster_recovery_ctrc_owner_graph_node_v2(input.owner_key.data,
+				input.owner_key.length, &view, &node));
+			UT_ASSERT(node.kind == 2 && node.evidence.data == out && node.evidence.length == length);
+		}
+	UT_ASSERT_EQ(graph_alloc_live, 0);
+}
+
+UT_TEST(owner_evidence_complete_input_and_namespace_refusals)
+{
+	ClusterRecoveryCTRCOwnerEvidenceInputV2 input, changed;
+	ClusterRecoveryCTRCReleaseV2 record;
+	uint8 payload[320], body[sizeof(owner_completion_golden)], key[sizeof(owner_key_golden)];
+	uint8 raw[sizeof(raw_evidence_golden) + 1];
+
+	UT_ASSERT(owner_evidence_fixture(&input, payload, body));
+	for (unsigned field = 0; field < 4; field++) {
+		size_t complete = field == 0 ? input.owner_key.length : field == 1
+			? input.completion.length : field == 2 ? input.raw_evidence.length : input.payload.length;
+
+		for (size_t length = 0; length < complete; length++) {
+			changed = input;
+			switch (field) {
+			case 0: changed.owner_key.length = length; break;
+			case 1: changed.completion.length = length; break;
+			case 2: changed.raw_evidence.length = length; break;
+			case 3: changed.payload.length = length; break;
+			}
+			UT_ASSERT(owner_evidence_refused(&changed, SYSTEM_ID, 1024));
+		}
+	}
+	for (unsigned which = 0; which < 10; which++) {
+		UT_ASSERT(owner_evidence_fixture(&input, payload, body));
+		memcpy(key, owner_key_golden, sizeof(key));
+		memcpy(raw, raw_evidence_golden, sizeof(raw_evidence_golden));
+		raw[sizeof(raw_evidence_golden)] = 0;
+		input.owner_key.data = key;
+		input.raw_evidence.data = raw;
+		switch (which) {
+		case 0: key[0] = 0; break;
+		case 1: body[2] = 7; break;
+		case 2: body[0] = 3; break;
+		case 3: body[65 + 4] = 1; break; /* Missing canonical final witness. */
+		case 4: raw[74] = 3; break;
+		case 5: input.raw_evidence.length++; break;
+		case 6: payload[192] ^= 1; break;
+		case 7:
+			UT_ASSERT(cluster_recovery_ctrc_decode_v2(payload, 320, SYSTEM_ID, &record));
+			record.database_incarnation++;
+			UT_ASSERT(cluster_recovery_ctrc_encode_v2(&record, SYSTEM_ID, payload, 320));
+			break;
+		case 8: input.completion.length = SIZE_MAX; break;
+		case 9: input.raw_evidence.length = SIZE_MAX; break;
+		}
+		UT_ASSERT(owner_evidence_refused(&input, SYSTEM_ID, 1024));
+	}
+	UT_ASSERT(owner_evidence_fixture(&input, payload, body));
+	UT_ASSERT(owner_evidence_refused(&input, SYSTEM_ID + 1, 1024));
+	UT_ASSERT(owner_evidence_refused(&input, 0, 1024));
+}
+
+UT_TEST(owner_evidence_rule3_needs_exact_cold_step)
+{
+	ClusterRecoveryCTRCOwnerEvidenceInputV2 input;
+	uint8 payload[320], body[sizeof(owner_completion_golden)], cold[sizeof(cold_step_golden)];
+
+	UT_ASSERT(owner_evidence_fixture(&input, payload, body));
+	body[0] = 2;
+	body[2] = 3;
+	UT_ASSERT(owner_evidence_refused(&input, SYSTEM_ID, 1024));
+	memcpy(cold, cold_step_golden, sizeof(cold));
+	input.cold_step = (ClusterRecoveryCTRCGraphBytesV2){cold, sizeof(cold)};
+	for (size_t length = 0; length < sizeof(cold); length++) {
+		input.cold_step.length = length;
+		UT_ASSERT(owner_evidence_refused(&input, SYSTEM_ID, 1024));
+	}
+	input.cold_step.length = sizeof(cold);
+	for (unsigned which = 0; which < 7; which++) {
+		memcpy(cold, cold_step_golden, sizeof(cold));
+		switch (which) {
+		case 0: cold[0] ^= 1; break;
+		case 1: cold[8] ^= 1; break;
+		case 2: cold[32] ^= 1; break;
+		case 3: cold[24] ^= 1; break;
+		case 4: cold[72] = 2; break;
+		case 5: memset(cold + 74, 0, 8); break;
+		case 6: cold[64] = 1; break;
+		}
+		UT_ASSERT(owner_evidence_refused(&input, SYSTEM_ID, 1024));
+		/* Invalid optional atom4 must also refuse another otherwise legal rule. */
+		body[0] = 1; body[2] = 1;
+		UT_ASSERT(owner_evidence_refused(&input, SYSTEM_ID, 1024));
+		body[0] = 2; body[2] = 3;
+	}
+}
+
+UT_TEST(owner_evidence_unaligned_overlapping_views_and_publication)
+{
+	const size_t offsets[] = {0, 2, 257, 769, 1025, 1281, 1537, 2201};
+	ClusterRecoveryCTRCOwnerEvidenceInputV2 input;
+	uint8 arena[4096], expected[4096], golden_out[1024], payload[320];
+	uint8 body[sizeof(owner_completion_golden)], meta[sizeof(size_t) + 2];
+	size_t length = 0, decoded = 0;
+
+	UT_ASSERT(owner_evidence_fixture(&input, payload, body));
+	body[0] = 2; body[2] = 3;
+	input.cold_step = (ClusterRecoveryCTRCGraphBytesV2){cold_step_golden, sizeof(cold_step_golden)};
+	UT_ASSERT(cluster_recovery_ctrc_owner_evidence_v2(&input, SYSTEM_ID, golden_out, sizeof(golden_out), &length));
+	for (unsigned i = 0; i < lengthof(offsets); i++) {
+		memset(arena, 0xa5, sizeof(arena));
+		memcpy(arena + 257, owner_key_golden, sizeof(owner_key_golden));
+		memcpy(arena + 769, body, sizeof(body));
+		memcpy(arena + 1025, raw_evidence_golden, sizeof(raw_evidence_golden));
+		memcpy(arena + 1281, cold_step_golden, sizeof(cold_step_golden));
+		memcpy(arena + 1537, payload, sizeof(payload));
+		input = (ClusterRecoveryCTRCOwnerEvidenceInputV2){
+			{arena + 257, sizeof(owner_key_golden)}, {arena + 769, sizeof(body)},
+			{arena + 1025, sizeof(raw_evidence_golden)}, {arena + 1281, sizeof(cold_step_golden)},
+			{arena + 1537, sizeof(payload)}
+		};
+		memcpy(arena + 1, &input, sizeof(input));
+		memcpy(expected, arena, sizeof(expected));
+		memcpy(expected + offsets[i], golden_out, length);
+		memset(meta, 0xa5, sizeof(meta));
+		UT_ASSERT(cluster_recovery_ctrc_owner_evidence_v2((const ClusterRecoveryCTRCOwnerEvidenceInputV2 *)(arena + 1),
+			SYSTEM_ID, arena + offsets[i], length, (size_t *)(meta + 1)));
+		memcpy(&decoded, meta + 1, sizeof(decoded));
+		UT_ASSERT(decoded == length && meta[0] == 0xa5 && meta[sizeof(meta) - 1] == 0xa5);
+		UT_ASSERT(memcmp(arena, expected, sizeof(arena)) == 0 && graph_alloc_live == 0);
+	}
+}
+
+UT_TEST(owner_evidence_output_bounds_allocation_and_cleanup)
+{
+	ClusterRecoveryCTRCOwnerEvidenceInputV2 input;
+	uint8 payload[320], body[sizeof(owner_completion_golden)], out[1024];
+	size_t length = 999;
+	unsigned calls;
+
+	UT_ASSERT(owner_evidence_fixture(&input, payload, body));
+	graph_alloc_calls = 0; graph_alloc_fail_at = 0;
+	UT_ASSERT(cluster_recovery_ctrc_owner_evidence_v2(&input, SYSTEM_ID, out, sizeof(out), &length));
+	calls = graph_alloc_calls;
+	UT_ASSERT(calls > 0 && graph_alloc_live == 0);
+	for (unsigned i = 1; i <= calls; i++) {
+		graph_alloc_calls = 0; graph_alloc_fail_at = i;
+		UT_ASSERT(owner_evidence_refused(&input, SYSTEM_ID, sizeof(out)));
+	}
+	graph_alloc_fail_at = 0;
+	for (size_t capacity = 0; capacity < length; capacity++)
+		UT_ASSERT(owner_evidence_refused(&input, SYSTEM_ID, capacity));
+	UT_ASSERT(owner_evidence_refused(&input, SYSTEM_ID, SIZE_MAX));
+	UT_ASSERT(owner_evidence_refused(NULL, SYSTEM_ID, sizeof(out)));
+	UT_ASSERT(!cluster_recovery_ctrc_owner_evidence_v2(&input, SYSTEM_ID, NULL, sizeof(out), &length));
+	UT_ASSERT_EQ(length, 0);
+	memset(out, 0xa5, sizeof(out));
+	UT_ASSERT(!cluster_recovery_ctrc_owner_evidence_v2(&input, SYSTEM_ID, out, sizeof(out), NULL));
+	UT_ASSERT(all_zero(out, 8) && out[8] == 0xa5 && graph_alloc_live == 0);
+}
+
 UT_TEST(raw_evidence_permutations_and_full_encoded_sort)
 {
 	ClusterRecoveryCTRCGraphBytesV2 atoms[3], shuffled[3];
@@ -7102,7 +7336,7 @@ UT_TEST(graph_reader_allocation_refusal)
 int
 main(void)
 {
-	UT_PLAN(202);
+	UT_PLAN(207);
 	UT_RUN(golden_encoding);
 	UT_RUN(golden_decoding);
 	UT_RUN(unaligned_buffers);
@@ -7290,6 +7524,11 @@ main(void)
 	UT_RUN(cold_step_matches_exact_payload_round_and_input);
 	UT_RUN(cold_step_matches_rejects_noncanonical_body_and_invalid_payload);
 	UT_RUN(cold_step_matches_unaligned_and_original_native_payload);
+	UT_RUN(owner_evidence_complete_golden_pairs_and_graph_view);
+	UT_RUN(owner_evidence_complete_input_and_namespace_refusals);
+	UT_RUN(owner_evidence_rule3_needs_exact_cold_step);
+	UT_RUN(owner_evidence_unaligned_overlapping_views_and_publication);
+	UT_RUN(owner_evidence_output_bounds_allocation_and_cleanup);
 	UT_RUN(raw_evidence_permutations_and_full_encoded_sort);
 	UT_RUN(raw_evidence_conflicting_subject_is_atomic);
 	UT_RUN(raw_evidence_envelope_refusals);

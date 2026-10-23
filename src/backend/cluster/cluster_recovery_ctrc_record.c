@@ -2138,6 +2138,14 @@ cluster_recovery_ctrc_witness_ids_in_evidence_v2(const uint8 *witness_ids,
 	return matched;
 }
 
+static bool
+ctrc_owner_completion_pair_v2(uint16 outcome, uint16 rule)
+{
+	return (outcome == 1 && (rule == 1 || rule == 2 || rule == 6))
+		|| (outcome == 2 && (rule == 3 || rule == 4))
+		|| (outcome == 3 && rule == 5);
+}
+
 bool
 cluster_recovery_ctrc_owner_completion_bytes_v2(uint16 outcome, uint16 rule,
 	const uint8 *witness_ids, size_t witness_ids_length, const uint8 *evidence,
@@ -2145,9 +2153,7 @@ cluster_recovery_ctrc_owner_completion_bytes_v2(uint16 outcome, uint16 rule,
 {
 	if (out == NULL || out_length > MaxAllocSize || witness_ids_length > MaxAllocSize - 4
 		|| out_length != witness_ids_length + 4
-		|| !((outcome == 1 && (rule == 1 || rule == 2 || rule == 6))
-			|| (outcome == 2 && (rule == 3 || rule == 4))
-			|| (outcome == 3 && rule == 5))
+		|| !ctrc_owner_completion_pair_v2(outcome, rule)
 		|| !cluster_recovery_ctrc_witness_ids_in_evidence_v2(witness_ids,
 			witness_ids_length, evidence, evidence_length)) {
 		if (out != NULL)
@@ -2161,6 +2167,80 @@ cluster_recovery_ctrc_owner_completion_bytes_v2(uint16 outcome, uint16 rule,
 	cluster_undo_tt_ctrc_put_u16_le(out, outcome);
 	cluster_undo_tt_ctrc_put_u16_le(out + 2, rule);
 	return true;
+}
+
+bool
+cluster_recovery_ctrc_owner_evidence_v2(const ClusterRecoveryCTRCOwnerEvidenceInputV2 *input,
+	uint64 system_identifier, uint8 *out, size_t out_capacity, size_t *out_length)
+{
+	ClusterRecoveryCTRCOwnerEvidenceInputV2 value;
+	uint8 *scratch, *next;
+	size_t length, zero = 0;
+	uint16 outcome, rule;
+	bool cold;
+
+	if (input == NULL || out == NULL || out_length == NULL || out_capacity > MaxAllocSize)
+		goto refused;
+	memcpy(&value, input, sizeof(value));
+	if (value.completion.data == NULL || value.completion.length < 4
+		|| value.completion.length > MaxAllocSize
+		|| !cluster_recovery_ctrc_owner_transaction_matches_v2(value.owner_key.data,
+			value.owner_key.length, value.payload.data, value.payload.length, system_identifier))
+		goto refused;
+	outcome = cluster_undo_tt_ctrc_get_u16_le(value.completion.data);
+	rule = cluster_undo_tt_ctrc_get_u16_le(value.completion.data + 2);
+	if (!ctrc_owner_completion_pair_v2(outcome, rule)
+		|| !cluster_recovery_ctrc_witness_ids_in_evidence_v2(value.completion.data + 4,
+			value.completion.length - 4, value.raw_evidence.data, value.raw_evidence.length))
+		goto refused;
+	cold = value.cold_step.length != 0;
+	if ((rule == 3 && !cold)
+		|| (cold && !cluster_recovery_ctrc_cold_step_matches_v2(value.cold_step.data,
+			value.cold_step.length, value.payload.data, value.payload.length, system_identifier)))
+		goto refused;
+
+	length = value.raw_evidence.length;
+	/* Each B(U16(kind)||B(owner key)||B(body)) adds 26 envelope bytes. */
+	if (!ctrc_graph_size_add(&length, 1, 26)
+		|| !ctrc_graph_size_add(&length, 1, value.owner_key.length)
+		|| !ctrc_graph_size_add(&length, 1, value.completion.length)
+		|| (cold && (!ctrc_graph_size_add(&length, 1, 26)
+			|| !ctrc_graph_size_add(&length, 1, value.owner_key.length)
+			|| !ctrc_graph_size_add(&length, 1, value.cold_step.length)))
+		|| out_capacity < length)
+		goto refused;
+	scratch = palloc_extended(length, MCXT_ALLOC_NO_OOM);
+	if (scratch == NULL)
+		goto refused;
+	cluster_undo_tt_ctrc_put_u64_le(scratch,
+		cluster_undo_tt_ctrc_get_u64_le(value.raw_evidence.data) + 1 + (cold ? 1 : 0));
+	memcpy(scratch + 8, value.raw_evidence.data + 8, value.raw_evidence.length - 8);
+	next = scratch + value.raw_evidence.length;
+	/* Canonical raw kinds1/2 precede kind3/4; each new subject is exactly the
+	 * checked owner key. These bytes do not supply the owner's predicates. */
+	cluster_undo_tt_ctrc_put_u64_le(next, 18 + value.owner_key.length + value.completion.length);
+	cluster_undo_tt_ctrc_put_u16_le(next + 8, 3);
+	next = ctrc_graph_put_bytes(next + 10, &value.owner_key);
+	next = ctrc_graph_put_bytes(next, &value.completion);
+	if (cold) {
+		cluster_undo_tt_ctrc_put_u64_le(next, 18 + value.owner_key.length + value.cold_step.length);
+		cluster_undo_tt_ctrc_put_u16_le(next + 8, 4);
+		next = ctrc_graph_put_bytes(next + 10, &value.owner_key);
+		next = ctrc_graph_put_bytes(next, &value.cold_step);
+	}
+	Assert((size_t)(next - scratch) == length);
+	/* Input, views and their bytes are consumed before any aliased publish. */
+	memcpy(out, scratch, length);
+	pfree(scratch);
+	memcpy(out_length, &length, sizeof(length));
+	return true;
+
+refused:
+	if (out != NULL)
+		memset(out, 0, Min(out_capacity, (size_t)8));
+	if (out_length != NULL)
+		memcpy(out_length, &zero, sizeof(zero));
+	return false;
 }
 
 bool

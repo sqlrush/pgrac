@@ -524,6 +524,31 @@ extern bool cluster_recovery_ctrc_cold_step_bytes_v2(const ClusterRecoveryCTRCCo
 extern bool cluster_recovery_ctrc_cold_step_matches_v2(const uint8 *bytes, size_t length,
 	const uint8 *payload, size_t payload_length, uint64 system_identifier);
 
+typedef struct ClusterRecoveryCTRCOwnerEvidenceInputV2 {
+	ClusterRecoveryCTRCGraphBytesV2 owner_key;
+	ClusterRecoveryCTRCGraphBytesV2 completion;
+	ClusterRecoveryCTRCGraphBytesV2 raw_evidence;
+	ClusterRecoveryCTRCGraphBytesV2 cold_step; /* optional except for rule3 */
+	ClusterRecoveryCTRCGraphBytesV2 payload;
+} ClusterRecoveryCTRCOwnerEvidenceInputV2;
+
+/* Assemble a complete canonical structural owner evidence vector: existing
+ * raw atoms followed by atom3 and optional atom4, both subject to the exact
+ * canonical owner key. Recheck full T34 against the original D0 decoder,
+ * completion rule/witness membership, and any cold step's common D0 fields;
+ * rule3 requires a cold step. This does not prove owner-family applicability,
+ * same-graph/required witnesses, source/cut qualification or current ACKs and
+ * actual completion predicates. No live caller, completion or release right.
+ * Outside critical sections/spinlocks; one bounded NO_OOM output scratch plus
+ * the original decoder's SHA allocation/ERROR behavior. Immutable input views
+ * and bytes may be unaligned/alias out. All input is consumed before output
+ * publication; out_length is disjoint caller metadata, possibly unaligned.
+ * Success writes exact length and leaves any tail intact; refusal clears
+ * min(out_capacity,8), zeroes out_length, and publishes no partial new tail. */
+extern bool cluster_recovery_ctrc_owner_evidence_v2(
+	const ClusterRecoveryCTRCOwnerEvidenceInputV2 *input, uint64 system_identifier,
+	uint8 *out, size_t out_capacity, size_t *out_length);
+
 typedef struct ClusterRecoveryCTRCGraphNodeV2 {
 	uint16 kind; /* 1 reference/history, 2 original-owner proof */
 	ClusterRecoveryCTRCGraphBytesV2 key;
