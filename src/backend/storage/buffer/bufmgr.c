@@ -185,9 +185,7 @@ static void
 cluster_bufmgr_ko_read_wait(void)
 {
 	CHECK_FOR_INTERRUPTS();
-	(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 100L,
-					WAIT_EVENT_PCM_BLOCK_CONVERT_WAIT);
-	ResetLatch(MyLatch);
+	cluster_ko_peer_admission_wait(100L);
 	CHECK_FOR_INTERRUPTS();
 }
 

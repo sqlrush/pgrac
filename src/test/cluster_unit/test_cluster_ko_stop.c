@@ -21,6 +21,49 @@
 #include "utils/resowner.h"
 #include "utils/inval.h"
 #include "utils/relcache.h"
+#include "storage/condition_variable.h"
+
+static unsigned ko_cv_prepare_calls;
+static unsigned ko_cv_sleep_calls;
+static unsigned ko_cv_cancel_calls;
+static unsigned ko_cv_broadcast_calls;
+static long ko_cv_last_timeout;
+static uint32 ko_cv_last_wait_event;
+
+void
+ConditionVariableInit(ConditionVariable *cv)
+{
+	MemSet(cv, 0, sizeof(*cv));
+}
+
+void
+ConditionVariablePrepareToSleep(ConditionVariable *cv pg_attribute_unused())
+{
+	ko_cv_prepare_calls++;
+}
+
+bool
+ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(), long timeout,
+							uint32 wait_event_info)
+{
+	ko_cv_sleep_calls++;
+	ko_cv_last_timeout = timeout;
+	ko_cv_last_wait_event = wait_event_info;
+	return true;
+}
+
+bool
+ConditionVariableCancelSleep(void)
+{
+	ko_cv_cancel_calls++;
+	return true;
+}
+
+void
+ConditionVariableBroadcast(ConditionVariable *cv pg_attribute_unused())
+{
+	ko_cv_broadcast_calls++;
+}
 
 /* The stop fixture exercises the legacy v2 path. Keep the newly linked v3
  * route/LOCALLOCK probes fail-closed without pulling the full GRD/lock
@@ -1716,6 +1759,26 @@ reset_test(void)
 	for (int i = 0; i < CLUSTER_HW_LEASE_SLOTS; i++)
 		leases.slots[i].fork = -1;
 }
+
+UT_TEST(test_admission_wait_uses_event_wake_with_bounded_fallback)
+{
+	reset_test();
+	ko_cv_prepare_calls = ko_cv_sleep_calls = ko_cv_cancel_calls = 0;
+	ko_cv_broadcast_calls = 0;
+	ko_cv_last_timeout = 0;
+	ko_cv_last_wait_event = 0;
+
+	cluster_ko_peer_admission_wait(100L);
+	UT_ASSERT_EQ(ko_cv_prepare_calls, 1);
+	UT_ASSERT_EQ(ko_cv_sleep_calls, 1);
+	UT_ASSERT_EQ(ko_cv_cancel_calls, 1);
+	UT_ASSERT_EQ(ko_cv_last_timeout, 100L);
+	UT_ASSERT_EQ(ko_cv_last_wait_event, WAIT_EVENT_PCM_BLOCK_CONVERT_WAIT);
+
+	ko_peer_admission_wake();
+	UT_ASSERT_EQ(ko_cv_broadcast_calls, 1);
+}
+
 static void
 enqueue_legacy_epoch(uint64 id, uint64 epoch)
 {
