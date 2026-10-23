@@ -1184,7 +1184,7 @@ UT_TEST(test_original_resource_release_and_cleanup_revoke_the_shared_read)
 		reset(); retain(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
 		checkpoint_actor(); UT_ASSERT(cluster_recovery_checkpoint_begin_v1(&scope));
 		startup_actor();
-		if (cleanup) ClusterReleaseColdRecoveryInputs(&info);
+		if (cleanup) cluster_recovery_cold_inputs_cleanup(1, (Datum)0);
 		else release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
 		checkpoint_actor();
 		UT_ASSERT(!cluster_recovery_checkpoint_current_v1(scope, &writer));
@@ -1273,6 +1273,52 @@ UT_TEST(test_lmon_observation_rejects_wrong_actor_or_current_input_without_leaki
 	}
 }
 
+UT_TEST(test_successful_startup_release_hands_original_owner_to_lmon_and_checkpointer)
+{
+	ClusterRecoveryCheckpointObservationV1 before, after;
+	struct ClusterRecoveryCheckpointScopeV1 *scope = NULL;
+	ClusterWalWriterToken writer;
+	reset(); retain(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
+	serving_actor(); UT_ASSERT(cluster_recovery_checkpoint_observe_v1(&before));
+	startup_actor(); ClusterReleaseColdRecoveryInputs(&info);
+	UT_ASSERT(info.cluster_tx_start == NULL && info.cluster_cold_inputs == NULL);
+	UT_ASSERT(cluster_recovery_cold_start == NULL && cluster_recovery_cold_inputs == NULL);
+	serving_actor(); UT_ASSERT(cluster_recovery_checkpoint_observe_v1(&after));
+	UT_ASSERT(memcmp(&before, &after, sizeof(before)) == 0);
+	checkpoint_actor(); UT_ASSERT(cluster_recovery_checkpoint_begin_v1(&scope));
+	UT_ASSERT(cluster_recovery_checkpoint_current_v1(scope, &writer));
+	UT_ASSERT(memcmp(&writer, &before.owner.writer, sizeof(writer)) == 0);
+	cluster_recovery_checkpoint_end_v1(&scope);
+	/* The shared handoff remains bound to the current writer and boot. */
+	serving_actor(); owner_boot++;
+	UT_ASSERT(!cluster_recovery_checkpoint_observe_v1(&after));
+	UT_ASSERT(memcmp(&after, &(ClusterRecoveryCheckpointObservationV1){0}, sizeof(after)) == 0);
+	startup_actor();
+}
+
+UT_TEST(test_startup_handoff_refusal_keeps_inputs_for_original_error_cleanup)
+{
+	for (unsigned fault = 0; fault < 2; fault++) {
+		volatile bool caught = false;
+		const struct ClusterRecoveryStartV1 *original;
+		unsigned destroyed;
+		reset(); retain(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
+		original = info.cluster_tx_start;
+		destroyed = input_destroys;
+		if (fault == 0) owner_boot++;
+		else writer_ok = false;
+		fatal_armed = true;
+		if (setjmp(fatal_jump) == 0) ClusterReleaseColdRecoveryInputs(&info);
+		else caught = true;
+		fatal_armed = false;
+		UT_ASSERT(caught);
+		UT_ASSERT(info.cluster_tx_start == original && info.cluster_cold_inputs == &typed);
+		UT_ASSERT_EQ(input_destroys, destroyed);
+		cluster_recovery_cold_inputs_cleanup(1, (Datum)0);
+		UT_ASSERT_EQ(input_destroys, destroyed + 1);
+	}
+}
+
 UT_TEST(test_lmon_observation_preserves_full_owner_identity_and_original_revocation)
 {
 	for (int fault = 0; fault < 7; fault++) {
@@ -1287,7 +1333,8 @@ UT_TEST(test_lmon_observation_preserves_full_owner_identity_and_original_revocat
 		case 4: window_region.checkpoint_owner.owner.start_serial++; break;
 		case 5: window_region.checkpoint_owner.owner.owner_pid++; break;
 		case 6:
-			startup_actor(); ClusterReleaseColdRecoveryInputs(&info); serving_actor(); break;
+			startup_actor(); release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+			serving_actor(); break;
 		}
 		if (fault < 6) {
 			UT_ASSERT(cluster_recovery_checkpoint_observe_v1(&after));
@@ -1303,7 +1350,7 @@ UT_TEST(test_lmon_observation_preserves_full_owner_identity_and_original_revocat
 
 int main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(36);
 	UT_RUN(test_original_owner_binds_complete_empty_census_after_done);
 	UT_RUN(test_native_owner_rejects_uninstalled_recovery_and_writer_drift);
 	UT_RUN(test_current_rechecks_owner_process_boot_and_exact_writer);
@@ -1340,6 +1387,8 @@ int main(void)
 	UT_RUN(test_lmon_observes_only_original_recovered_install_without_a_checkpoint_scope);
 	UT_RUN(test_lmon_observation_rejects_wrong_actor_or_current_input_without_leaking_a_value);
 	UT_RUN(test_lmon_observation_preserves_full_owner_identity_and_original_revocation);
+	UT_RUN(test_successful_startup_release_hands_original_owner_to_lmon_and_checkpointer);
+	UT_RUN(test_startup_handoff_refusal_keeps_inputs_for_original_error_cleanup);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -3,13 +3,16 @@
 #include <setjmp.h>
 #include "access/xlogrecovery.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_recovery_plan.h"
 #include "storage/ipc.h"
+#include "utils/resowner.h"
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
 
 static ClusterColdTypedV1 attempts[2];
 static ClusterColdTypedV1 *cluster_recovery_cold_inputs;
+static struct ClusterRecoveryStartV1 *cluster_recovery_cold_start;
 static pg_on_exit_callback exit_callback;
 static Datum exit_arg;
 static unsigned registrations, cancellations, destructions;
@@ -83,6 +86,27 @@ cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed)
 	}
 }
 
+/* This fixture owns only pre-TX retained inputs. The separate cold-TX
+ * fixture executes the original checkpoint register/handoff/revoke bodies. */
+void cluster_recovery_checkpoint_revoke_v1(const struct ClusterRecoveryStartV1 *start)
+{
+	(void)start;
+	UT_ASSERT(false);
+}
+
+bool cluster_recovery_checkpoint_handoff_v1(const struct ClusterRecoveryStartV1 *start)
+{
+	(void)start;
+	UT_ASSERT(false);
+	return false;
+}
+
+void pfree(void *pointer)
+{
+	(void)pointer;
+	UT_ASSERT(false);
+}
+
 #include "test_cluster_cold_eor_inputs.inc"
 
 static void
@@ -97,7 +121,7 @@ reset(void)
 UT_TEST(test_original_inputs_survive_replay_and_transfer_read_only)
 {
 	ClusterColdTypedV1 *input = &attempts[0];
-	EndOfWalRecoveryInfo result;
+	EndOfWalRecoveryInfo result = {0};
 	const ClusterColdTypedV1 *borrowed;
 
 	reset();
@@ -140,7 +164,7 @@ UT_TEST(test_second_attempt_cannot_replace_original_inputs)
 {
 	ClusterColdTypedV1 *first = &attempts[0];
 	ClusterColdTypedV1 *second = &attempts[1];
-	EndOfWalRecoveryInfo result;
+	EndOfWalRecoveryInfo result = {0};
 
 	reset();
 	cluster_recovery_cold_inputs_retain(&first);
@@ -199,7 +223,7 @@ UT_TEST(test_wrong_result_cannot_release_another_attempt)
 
 UT_TEST(test_non_cold_recovery_has_no_retained_owner)
 {
-	EndOfWalRecoveryInfo result;
+	EndOfWalRecoveryInfo result = {0};
 
 	reset();
 	MemSet(&result, 0x5a, sizeof(result));

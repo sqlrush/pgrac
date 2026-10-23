@@ -9081,13 +9081,15 @@ test_cluster_cold_recovery_decode: test_cluster_cold_recovery_decode.c unit_test
 
 # Exercise Startup's original replay-input lifetime across EOR and exit.
 test_cluster_cold_eor_inputs.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile
-	awk '/^cluster_recovery_cold_inputs_(cleanup|retain|handoff)\(/ { print "static void"; emit=1; count++ } \
+	awk '/^struct ClusterRecoveryStartV1 \{/ { emit=1; count++ } \
+	     /^cluster_recovery_cold_inputs_(cleanup|retain|handoff)\(/ { print "static void"; emit=1; count++ } \
 	     /^ClusterReleaseColdRecoveryInputs\(/ { print "void"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 4) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (count != 5) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_cold_recovery_eor: test_cluster_cold_recovery_eor.c unit_test.h \
 		test_cluster_cold_eor_inputs.inc $(top_srcdir)/src/include/access/xlogrecovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@

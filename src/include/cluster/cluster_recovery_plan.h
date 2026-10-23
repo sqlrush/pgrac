@@ -276,6 +276,9 @@ extern bool cluster_recovery_checkpoint_observe_v1(ClusterRecoveryCheckpointObse
 struct ClusterRecoveryStartV1;
 struct ClusterRecoveryCheckpointScopeV1;
 extern bool cluster_recovery_checkpoint_register_v1(const struct ClusterRecoveryStartV1 *start);
+/* Successful Startup private-input release transfers only this original
+ * checkpoint observation. It is neither service completion nor OPEN proof. */
+extern bool cluster_recovery_checkpoint_handoff_v1(const struct ClusterRecoveryStartV1 *start);
 extern void cluster_recovery_checkpoint_revoke_v1(const struct ClusterRecoveryStartV1 *start);
 /* Checkpointer-only, process-local opaque stable read; no I/O or write grant.
  * The original publisher must still prove ROOT/common/service and all normal

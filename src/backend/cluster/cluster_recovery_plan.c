@@ -625,6 +625,34 @@ cluster_recovery_checkpoint_register_v1(const struct ClusterRecoveryStartV1 *sta
 	return true;
 }
 
+/* Startup's successful release must not destroy the original owner needed
+ * by the subsequent LMON observation and native checkpointer. The shared
+ * slot retains the same generation and value; only the private cleanup
+ * binding is detached. ERROR/exit without this handoff still revokes it. */
+bool
+cluster_recovery_checkpoint_handoff_v1(const struct ClusterRecoveryStartV1 *start)
+{
+	ClusterRecoveryCheckpointSlotV1 *slot;
+	ClusterRecoveryCheckpointOwnerV1 owner;
+	bool same;
+
+	if (MyBackendType != B_STARTUP || !IsUnderPostmaster
+		|| start == NULL || start != checkpoint_registered_start
+		|| cluster_recovery_plan_shmem == NULL
+		|| !ClusterColdRecoveryTxCheckpointOwnerV1(start, &owner)
+		|| memcmp(&owner, &checkpoint_registered_owner, sizeof(owner)) != 0)
+		return false;
+	slot = &cluster_recovery_plan_shmem->checkpoint_owner;
+	SpinLockAcquire(&slot->lock);
+	same = slot->valid && memcmp(&slot->owner, &owner, sizeof(owner)) == 0;
+	SpinLockRelease(&slot->lock);
+	if (!same)
+		return false;
+	checkpoint_registered_start = NULL;
+	memset(&checkpoint_registered_owner, 0, sizeof(checkpoint_registered_owner));
+	return true;
+}
+
 static void
 checkpoint_scope_resource_release(ResourceReleasePhase phase, bool isCommit,
 								  bool isTopLevel, void *arg)

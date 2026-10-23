@@ -1064,6 +1064,12 @@ ClusterReleaseColdRecoveryInputs(EndOfWalRecoveryInfo *info)
 	if (info == NULL || info->cluster_cold_inputs != cluster_recovery_cold_inputs
 		|| info->cluster_tx_start != cluster_recovery_cold_start)
 		ereport(FATAL, (errmsg("cold recovery input handoff belongs to another attempt")));
+	/* Preserve the original registered checkpoint owner after successful
+	 * Startup completion, before destroying its private source inputs.
+	 * An already-revoked attempt is cleanup only and transfers nothing. */
+	if (cluster_recovery_cold_start != NULL && !cluster_recovery_cold_start->revoked
+		&& !cluster_recovery_checkpoint_handoff_v1(cluster_recovery_cold_start))
+		ereport(FATAL, (errmsg("could not hand off the original recovered checkpoint owner")));
 	info->cluster_tx_start = NULL;
 	info->cluster_cold_inputs = NULL;
 	if (cluster_recovery_cold_inputs != NULL) {
