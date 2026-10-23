@@ -1054,6 +1054,15 @@ cluster_semantic_activation_record_decode(
 	return true;
 }
 
+/* This focused target does not link the semantic activation object.  Keep its
+ * recovered-open consumer successful so control-root tests exercise their own
+ * owner checks; the activation matcher is covered by the R4 FSM target. */
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return true;
+}
+
 bool
 cluster_r4_bit22_cutover_latch_verify(void)
 {

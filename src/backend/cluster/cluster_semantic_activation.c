@@ -14245,7 +14245,8 @@ cluster_semantic_activation_startup_poll(ClusterSemanticActivationRefusal *refus
 	 * OPEN; a missing or drifting owner keeps startup closed. */
 	if (state == CLUSTER_NORMAL_START_EXISTING_OTHER) {
 		/* Read the durable record before any service-side publication. */
-		/* Recovered startup enters OPEN through the existing service matcher. */
+		/* Recovered startup enters OPEN through the existing service matcher;
+		 * downstream ROOT consumers must observe this same durable cut. */
 		if (NormalStartCompletion == NULL
 			|| cluster_qvotec_bootstrap_read_semantic_activation(recovered_pgsa,
 																&recovered_implicit_zero)
@@ -14609,6 +14610,27 @@ normal_start_service_binding_current(const ClusterSemanticActivationRecord *open
 					   != input->clean_formation.admitted_incarnation[node]))
 			return false;
 	}
+	return true;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	ClusterSemanticActivationRecord open;
+	ClusterSemanticActivationAckTableV1 table;
+	uint8 selected[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	bool implicit_zero = false;
+
+	if (cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_EXISTING_OTHER
+		|| NormalStartCompletion == NULL
+		|| cluster_qvotec_bootstrap_read_semantic_activation(selected, &implicit_zero)
+			   != CLUSTER_SEMANTIC_ACTIVATION_OK
+		|| implicit_zero
+		|| !cluster_semantic_activation_record_decode(selected, &open, NULL)
+		|| open.phase != CLUSTER_SEMANTIC_PHASE_OPEN
+		|| !semantic_activation_ack_table_snapshot(&table)
+		|| !normal_start_service_binding_current(&open, NormalStartCompletion->pgrd, &table))
+		return false;
 	return true;
 }
 

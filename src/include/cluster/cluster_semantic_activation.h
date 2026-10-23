@@ -479,6 +479,10 @@ extern void cluster_semantic_activation_lmon_tick(void);
  * the original LMON's completed ROOT publication for the same live cut.
  * Only the installed never-served writer may request first activation. */
 extern bool cluster_semantic_activation_startup_poll(ClusterSemanticActivationRefusal *refusal);
+/* Read-only RECOVERED -> OPEN consumer check for downstream ROOT serving.
+ * It reuses the durable OPEN record, current ACK table and startup matcher;
+ * it grants no authority and performs no publication. */
+extern bool cluster_semantic_activation_recovered_open_current(void);
 /* RF-ROOT P7 G3: the R4 cutover coordinator proof reads the ACK table's
  * COMPLETE state bound to the exact round identity (transition epoch,
  * prepare generation, the expected/observed member sets, the source/target
