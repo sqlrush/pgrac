@@ -21929,7 +21929,7 @@ UT_TEST(test_config_selected_rejects_missing_corrupt_or_unlocked_input)
 
 UT_TEST(test_config_selected_rejects_non_online_root)
 {
-	for (int fault = 0; fault < 2; ++fault) {
+	for (int fault = 0; fault < 3; ++fault) {
 		uint8 before[66048];
 		ClusterSharedConfigRef prior = config_selected_fixture(before);
 		ClusterSharedConfigSelected selected;
@@ -21941,7 +21941,8 @@ UT_TEST(test_config_selected_rejects_non_online_root)
 		if (fault == 0)
 			root.header.activation_state = CLUSTER_CONTROL_ROOT_ACTIVATION_PREPARED;
 		else
-			root.header.v2.database_state = CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED;
+			root.header.v2.database_state = fault == 1 ? CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED
+														 : CLUSTER_CONTROL_ROOT_DATABASE_RECOVERING;
 		UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
 		v2_write_roots(root.bytes);
 		UT_ASSERT_EQ(cluster_control_root_config_read_locked(&prior, &selected, &image),
@@ -22026,31 +22027,46 @@ config_poll_fixture(void)
 
 UT_TEST(test_config_poll_delivers_only_after_its_exact_release)
 {
-	ClusterSharedConfigRef prior = config_poll_fixture();
-	ClusterSharedConfigSelected selected;
-	ClusterSharedConfigImage image = { 0 };
-	unsigned calls = test_cf_lock_calls;
-	test_cf_release_confirmed = false;
-	UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image),
-				 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
-	if (image.bytes != NULL)
-		cluster_shared_config_free(&image); /* Keep the RED itself leak-free. */
-	UT_ASSERT(v2_zero(&selected, sizeof(selected)) && v2_zero(&image, sizeof(image)));
-	UT_ASSERT_EQ(test_actual_cf, ShareLock);
-	UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image),
-				 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
-	if (image.bytes != NULL)
+	for (int recovering = 0; recovering < 2; ++recovering) {
+		uint8 before[66048];
+		ClusterSharedConfigRef prior = config_selected_fixture(before);
+		ClusterSharedConfigSelected selected;
+		ClusterSharedConfigImage image = { 0 };
+		ControlRootImage root;
+		unsigned calls = test_cf_lock_calls;
+		UT_ASSERT_EQ(cluster_control_root_v3_decode(before, sizeof(before), v2_storage, TEST_SYSID,
+												 &root), 0);
+		if (recovering) {
+			root.header.v2.database_state = CLUSTER_CONTROL_ROOT_DATABASE_RECOVERING;
+			UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+			v2_write_roots(root.bytes);
+		}
+		test_actual_cf = NoLock;
+		test_cf_local_caller = NULL;
+		test_cf_tagged_retiring = false;
+		MyBackendType = B_LMON;
+		test_cf_release_confirmed = false;
+		UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image),
+					 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+		if (image.bytes != NULL)
+			cluster_shared_config_free(&image); /* Keep the RED itself leak-free. */
+		UT_ASSERT(v2_zero(&selected, sizeof(selected)) && v2_zero(&image, sizeof(image)));
+		UT_ASSERT_EQ(test_actual_cf, ShareLock);
+		UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image),
+					 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+		if (image.bytes != NULL)
+			cluster_shared_config_free(&image);
+		UT_ASSERT_EQ(test_cf_lock_calls, calls + 1);
+		test_cf_release_confirmed = true;
+		UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image), 0);
+		UT_ASSERT_EQ(test_cf_lock_calls, calls + 1);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		UT_ASSERT(memcmp(&selected.ref, &prior, sizeof(prior)) == 0);
+		UT_ASSERT(image.bytes != NULL);
 		cluster_shared_config_free(&image);
-	UT_ASSERT_EQ(test_cf_lock_calls, calls + 1);
-	test_cf_release_confirmed = true;
-	UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image), 0);
-	UT_ASSERT_EQ(test_cf_lock_calls, calls + 1);
-	UT_ASSERT_EQ(test_actual_cf, NoLock);
-	UT_ASSERT(memcmp(&selected.ref, &prior, sizeof(prior)) == 0);
-	UT_ASSERT(image.bytes != NULL);
-	cluster_shared_config_free(&image);
-	cluster_control_root_config_cancel();
-	MyBackendType = B_INVALID;
+		cluster_control_root_config_cancel();
+		MyBackendType = B_INVALID;
+	}
 }
 
 UT_TEST(test_config_poll_cut_or_prior_drift_discards_retained_observation)

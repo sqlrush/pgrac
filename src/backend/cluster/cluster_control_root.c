@@ -4590,7 +4590,8 @@ config_selected_read(const ClusterSharedConfigRef *prior, ConfigSelectedWork *wo
 	if (work->root.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
 		|| (work->root.header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_OPEN
 			&& work->root.header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_CLOSED
-			&& work->root.header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED))
+			&& work->root.header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED
+			&& work->root.header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_RECOVERING))
 		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
 	config_root_reference(&work->root, &work->selected.ref);
 	identity = work->selected.ref.identity;
