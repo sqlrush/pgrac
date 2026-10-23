@@ -3301,6 +3301,7 @@ int
 main(void)
 {
 	static const CtrcTestCase tests[] = {
+		CTRC_TEST_ENTRY(test_ctrc_origin_original_full_xid_requires_exact_live_identity),
 		CTRC_TEST_ENTRY(test_ctrc_origin_reservation_prebind_cancel_and_postbind_block_are_exact),
 		CTRC_TEST_ENTRY(test_ctrc_origin_reservation_open_duplicate_and_aba_cleanup_do_not_mutate),
 		CTRC_TEST_ENTRY(test_ctrc_released_origin_conflict_is_retryable_without_state_loss),
