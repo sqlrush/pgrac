@@ -10503,6 +10503,7 @@ pcm_trace_wait(struct GrdEntry *entry, ClusterWaitTraceSite site, PcmLockMode mo
 				&& request->phase != RESOURCE_X_MASTER_RELEASED) {
 				q = &queued[nqueued++];
 				*q = row;
+				memset(&q->admission, 0, sizeof(q->admission));
 				q->queue_kind = 1;
 				q->requester = node;
 				q->request_known = true;
@@ -10526,6 +10527,7 @@ pcm_trace_wait(struct GrdEntry *entry, ClusterWaitTraceSite site, PcmLockMode mo
 			if (priority->state == RESOURCE_X_BOOTSTRAP_PRIORITY_NEXT_ADMISSION) {
 				q = &queued[nqueued++];
 				*q = row;
+				memset(&q->admission, 0, sizeof(q->admission));
 				q->queue_kind = 2;
 				q->requester = node;
 				q->request_known = true;
@@ -19414,6 +19416,7 @@ pcm_resource_x_bootstrap_request(
 	bool priority_same_attempt;
 	ResourceXApplyResult result;
 	ResourceXMasterSnapshot admitted_snapshot;
+	ClusterWaitTrace admission = {0};
 
 	if (ack_out != NULL)
 		memset(ack_out, 0, sizeof(*ack_out));
@@ -19614,14 +19617,42 @@ pcm_resource_x_bootstrap_request(
 			}
 		}
 	}
+	if (cluster_trace_tx_identity) {
+		pcm_trace_request(&admission, &request->common, r4_record_generation,
+			cluster_node_id, authenticated_ingress_connection_generation);
+		/* Capture both identities in the existing critical section. Later
+		 * queue projections can advance independently of this admission. */
+		if ((result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
+			&& receipt->state == RESOURCE_X_BOOTSTRAP_RECEIPT_CONSUMED_BY_ASSERT
+			&& pcm_resource_x_common_equal(&receipt->request, &request->common)
+			&& receipt->r4_record_generation == r4_record_generation
+			&& receipt->authenticated_ingress_connection_generation
+				== authenticated_ingress_connection_generation
+			&& master_request->phase != RESOURCE_X_MASTER_NONE
+			&& master_request->resource_formation == request->common.resource_formation
+			&& master_request->master_session_incarnation
+				== request->common.master_session_incarnation
+			&& master_request->assertion_sequence == request->common.assertion_sequence
+			&& master_request->sender_connection_generation
+				== request->common.sender_connection_generation
+			&& master_request->base_authority_generation == receipt->sampled_base) {
+			admission.admission.known = true;
+			admission.admission.r4 = receipt->r4_record_generation;
+			admission.admission.base = master_request->base_authority_generation;
+			admission.admission.head = master_request->head_transition_generation;
+			admission.admission.request_seq = master_request->assertion_sequence;
+			admission.admission.enqueue_order = master_request->enqueue_order;
+			admission.admission.requester_connection
+				= master_request->requester_connection_generation;
+			admission.admission.ingress_connection = master_request->sender_connection_generation;
+			admission.admission.phase = master_request->phase;
+			admission.admission.source = master_request->source_node;
+		}
+	}
 	LWLockRelease(&entry->entry_lock.lock);
 	if (cluster_trace_tx_identity) {
 		PG_TRY();
 		{
-			ClusterWaitTrace admission = {0};
-
-			pcm_trace_request(&admission, &request->common, r4_record_generation,
-				cluster_node_id, authenticated_ingress_connection_generation);
 			pcm_trace_wait(entry, CLWAIT_SITE_PCM_ADMISSION, PCM_LOCK_MODE_X,
 				cluster_node_id, requester_node, request->common.assertion_sequence, true, true,
 				&admission);

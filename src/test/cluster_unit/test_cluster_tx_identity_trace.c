@@ -173,6 +173,21 @@ int main(void) {
 	resource.master_view = true;
 	cluster_wait_trace_emit(CLWAIT_PCM_ADMISSION, &resource);
 	assert(strstr(last, "event=PCM_ADMISSION") && strstr(last, "master_view=1"));
+	/* A later queue projection alone is not an admission-to-head receipt. */
+	assert(strstr(last, "admission_bridge_known=0 admission_r4=0 admitted_base=0 admitted_head=0 admitted_request=0"));
+	resource.admission = (ClusterWaitAdmissionBridge) {
+		.known = true, .r4 = 132, .base = 133, .head = 134,
+		.request_seq = 135, .enqueue_order = 136,
+		.requester_connection = 0, .ingress_connection = 137,
+		.phase = 2, .source = 3
+	};
+	cluster_wait_trace_emit(CLWAIT_PCM_ADMISSION, &resource);
+	assert(strstr(last, "admission_bridge_known=1 admission_r4=132 admitted_base=133 admitted_head=134 admitted_request=135"));
+	assert(strstr(last, "admitted_order=136 admitted_requester_conn=0 admitted_ingress_conn=137 admitted_phase=2 admitted_source=3"));
+	/* Unknown must suppress stale payload, rather than fill a missing bridge. */
+	resource.admission.known = false;
+	cluster_wait_trace_emit(CLWAIT_PCM_ADMISSION, &resource);
+	assert(strstr(last, "admission_bridge_known=0 admission_r4=0 admitted_base=0 admitted_head=0 admitted_request=0"));
 	for (unsigned i = 0; i < CLUSTER_WAIT_TRACE_LIMIT + 2; i++)
 		cluster_wait_trace_emit(CLWAIT_PCM_WAIT, &resource);
 	assert(strstr(last, "event=LIMIT family=PCM_WAIT") && strstr(last, "evidence_complete=0"));

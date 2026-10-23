@@ -46,6 +46,7 @@
 
 #include "cluster/cluster_buffer_desc.h" /* PcmState (1.6) */
 #include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_cssd.h" /* spec-4.7a D4 — ClusterCssdPeerState for stub */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_ic_tier1.h"
@@ -54,6 +55,7 @@
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D1 — ClusterGcsBlockPhase + phase_for_tag proto */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "storage/proc.h"
 #include "cluster/cluster_pi_write.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_qvotec.h"
@@ -165,6 +167,19 @@ static int fake_lwlock_depth = 0;
 static ClusterWaitTrace wait_trace_rows[128];
 static ClusterWaitTraceKind wait_trace_kinds[128];
 static unsigned wait_trace_count;
+/* This fixture captures PCM rows, not the separate content-owner registry. */
+PROC_HDR *ProcGlobal = NULL;
+
+void
+cluster_content_trace_wait_set(ClusterContentTraceWait kind pg_attribute_unused(),
+							   const ClusterWaitTrace *row pg_attribute_unused())
+{
+}
+
+void
+cluster_content_trace_wait_clear(ClusterContentTraceWait kind pg_attribute_unused())
+{
+}
 
 uint64
 cluster_wait_trace_begin(ClusterWaitTraceKind kind pg_attribute_unused())
@@ -3828,12 +3843,23 @@ UT_TEST(test_resource_x_remote_admission_is_one_canonical_transaction)
 		request = make_resource_x_bootstrap_request(tag, 1);
 		request.common.flags = UINT8_C(0x08);
 		request.common.semantic_crc32c = 0;
+		wait_trace_count = 0;
+		cluster_trace_tx_identity = true;
 		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(&request, 1, 61, 77, 31,
 																		 71, &reply),
 					 RESOURCE_X_APPLY_APPLIED);
+		cluster_trace_tx_identity = false;
+		UT_ASSERT(wait_trace_count > 0);
+		UT_ASSERT_EQ(wait_trace_kinds[0], CLWAIT_PCM_ADMISSION);
+		UT_ASSERT_EQ(wait_trace_rows[0].base, request.common.base_authority_generation);
+		UT_ASSERT_EQ(wait_trace_rows[0].requester_connection, 51);
+		UT_ASSERT_EQ(wait_trace_rows[0].ingress_connection, 61);
+		for (unsigned i = 1; i < wait_trace_count; i++)
+			UT_ASSERT(!wait_trace_rows[i].admission.known);
 		UT_ASSERT_EQ(reply.common.flags, 0);
 		UT_ASSERT(reply.common.base_authority_generation > 0);
 		if (shape == 0 || shape == 3) {
+			UT_ASSERT(!wait_trace_rows[0].admission.known);
 			/* Local/durable admission still needs its original proof path. */
 			UT_ASSERT_EQ(reply.kind, RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP);
 			UT_ASSERT_EQ(reply.common.authority_generation, 0);
@@ -3849,11 +3875,22 @@ UT_TEST(test_resource_x_remote_admission_is_one_canonical_transaction)
 					 RESOURCE_X_APPLY_APPLIED);
 		UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_WAIT_BLOCKERS);
 		UT_ASSERT_EQ(snapshot.incompatible_holders_bitmap, UINT32_C(1) << 2);
+		UT_ASSERT(wait_trace_rows[0].admission.known);
+		UT_ASSERT_EQ(wait_trace_rows[0].admission.r4, 77);
+		UT_ASSERT_EQ(wait_trace_rows[0].admission.base, snapshot.base_authority_generation);
+		UT_ASSERT_EQ(wait_trace_rows[0].admission.request_seq, snapshot.assertion_sequence);
+		UT_ASSERT_EQ(wait_trace_rows[0].admission.phase, RESOURCE_X_MASTER_WAIT_BLOCKERS);
+		UT_ASSERT_EQ(wait_trace_rows[0].admission.requester_connection, 0);
+		UT_ASSERT_EQ(wait_trace_rows[0].admission.ingress_connection, 51);
 		UT_ASSERT(cluster_pcm_lock_resource_x_s_barrier_active_exact(&tag));
 		before = snapshot;
+		wait_trace_count = 0;
+		cluster_trace_tx_identity = true;
 		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(&request, 1, 61, 77, 31,
 																		 71, &replay),
 					 RESOURCE_X_APPLY_DUPLICATE);
+		cluster_trace_tx_identity = false;
+		UT_ASSERT(wait_trace_rows[0].admission.known);
 		UT_ASSERT(memcmp(&reply, &replay, sizeof(reply)) == 0);
 		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
 						 &request.common.logical_assertion, &snapshot),
@@ -3861,9 +3898,14 @@ UT_TEST(test_resource_x_remote_admission_is_one_canonical_transaction)
 		UT_ASSERT(memcmp(&snapshot, &before, sizeof(snapshot)) == 0);
 		wrong = request;
 		wrong.common.sender_connection_generation++;
+		wait_trace_count = 0;
+		cluster_trace_tx_identity = true;
 		UT_ASSERT_EQ(
 			cluster_pcm_lock_resource_x_bootstrap_request_exact(&wrong, 1, 61, 77, 31, 71, &replay),
 			RESOURCE_X_APPLY_STALE);
+		cluster_trace_tx_identity = false;
+		UT_ASSERT(wait_trace_count > 0);
+		UT_ASSERT(!wait_trace_rows[0].admission.known);
 		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(&request, 1, 62, 77, 31,
 																		 71, &replay),
 					 RESOURCE_X_APPLY_STALE);
@@ -3883,6 +3925,7 @@ UT_TEST(test_resource_x_remote_admission_is_one_canonical_transaction)
 					 RESOURCE_X_APPLY_APPLIED);
 		UT_ASSERT(memcmp(&snapshot, &before, sizeof(snapshot)) == 0);
 	}
+	wait_trace_count = 0;
 }
 
 UT_TEST(test_resource_x_bootstrap_receipt_drift_invalidates_but_keeps_floor)

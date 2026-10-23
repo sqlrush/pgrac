@@ -70,6 +70,10 @@ cluster_wait_trace_emit(ClusterWaitTraceKind kind, const ClusterWaitTrace *row)
 		"master_holder_instance=%d master_holder_session=%d master_holder_pid=%d master_holder_known=%d "
 		"master_request=" UINT64_FORMAT " master_head_request=" UINT64_FORMAT " master_head_known=%d "
 		"master_request_head_known=%d "
+		"admission_bridge_known=%d admission_r4=" UINT64_FORMAT " admitted_base=" UINT64_FORMAT " "
+		"admitted_head=" UINT64_FORMAT " admitted_request=" UINT64_FORMAT " "
+		"admitted_order=" UINT64_FORMAT " admitted_requester_conn=" UINT64_FORMAT " "
+		"admitted_ingress_conn=" UINT64_FORMAT " admitted_phase=%d admitted_source=%d "
 		"buffer=%d private_pins=%d shared_pins=%d content_held=%d ledger_phase=%d "
 		"buffer_state=%08x own_state=%d buffer_type=%d own_flags=%08x "
 		"own_generation=" UINT64_FORMAT " reservation=" UINT64_FORMAT " "
@@ -112,6 +116,15 @@ cluster_wait_trace_emit(ClusterWaitTraceKind kind, const ClusterWaitTrace *row)
 		row->master_holder_known, row->master_holder_known ? row->master_request : 0,
 		row->master_head_known ? row->master_head_request : 0,
 		row->master_head_known, row->master_request_head_known,
+		row->admission.known, row->admission.known ? row->admission.r4 : 0,
+		row->admission.known ? row->admission.base : 0,
+		row->admission.known ? row->admission.head : 0,
+		row->admission.known ? row->admission.request_seq : 0,
+		row->admission.known ? row->admission.enqueue_order : 0,
+		row->admission.known ? row->admission.requester_connection : 0,
+		row->admission.known ? row->admission.ingress_connection : 0,
+		row->admission.known ? row->admission.phase : -1,
+		row->admission.known ? row->admission.source : -1,
 		row->buffer, row->private_pins, row->shared_pins, row->content_held, row->ledger_phase,
 		row->buffer_state, row->own_state, row->buffer_type, row->own_flags,
 		row->own_generation, row->reservation, row->writer_activation, row->rx_activation,

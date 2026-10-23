@@ -38,8 +38,18 @@ typedef enum ClusterWaitTraceGuard {
 /* All fields are observations, never authority. Zero/unknown fields must not
  * be used to complete a remote identity. master_view is set only by the
  * authenticated master admission call, not by the local entry projection. */
+/* Owned admission-to-canonical-request projection, captured under entry_lock.
+ * head may still be zero for a queued request; this is not a wire receipt. */
+typedef struct ClusterWaitAdmissionBridge {
+	uint64 r4, base, head, request_seq, enqueue_order;
+	uint64 requester_connection, ingress_connection;
+	int32 phase, source;
+	bool known;
+} ClusterWaitAdmissionBridge;
+
 typedef struct ClusterWaitTrace {
 	BufferTag tag;
+	ClusterWaitAdmissionBridge admission;
 	uint64 snapshot, wait_seq, request_seq;
 	uint64 binding, formation, master_session, r4, acquisition;
 	uint64 base, authority, head, enqueue_order;
