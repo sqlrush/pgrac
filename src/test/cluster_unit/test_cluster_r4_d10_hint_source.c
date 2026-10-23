@@ -68,6 +68,7 @@ static int test_leave_count;
 static const ClusterICMsgTypeInfo *test_registered_msg_info;
 
 bool cluster_enabled = true;
+bool cluster_shared_config = false;
 int cluster_node_id = 0;
 int cluster_tt_status_hint_outbound_capacity = 4;
 int cluster_tt_status_hint_emit_mode = CLUSTER_TT_STATUS_HINT_EMIT_ALL_STATUS;
@@ -76,6 +77,8 @@ int cluster_multixact_member_overlay_max_members = 4;
 ClusterConf *ClusterConfShmem = &test_cluster_conf;
 ProcessingMode Mode = NormalProcessing;
 BackendType MyBackendType = B_BACKEND;
+static ClusterNormalStartState test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+static bool test_recovered_open = true;
 sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
 
@@ -285,6 +288,21 @@ test_reset_gate(ClusterSemanticAdmissionResult admission_result, bool recheck_re
 	test_admission_result = admission_result;
 	test_recheck_result = recheck_result;
 	test_leave_count = 0;
+	cluster_shared_config = false;
+	test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+	test_recovered_open = true;
+}
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return test_normal_start_state;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return test_recovered_open;
 }
 
 static void
@@ -307,6 +325,22 @@ UT_TEST(test_active_refuses_all_ops_before_request_inspection)
 	for (op = CLUSTER_TT_HINT_SOURCE_EMIT; op <= CLUSTER_TT_HINT_SOURCE_DRAIN_OUTBOUND; op++)
 		UT_ASSERT_EQ(cluster_tt_status_hint_source_dispatch(op, poison_request),
 					 CLUSTER_SEMANTIC_ADMISSION_SOURCE_DORMANT);
+	UT_ASSERT_EQ(test_leave_count, 0);
+	UT_ASSERT_EQ(cluster_tt_status_hint_get_emit_count(), 0);
+}
+
+UT_TEST(test_recovered_open_refuses_source_hint_before_request_inspection)
+{
+	const ClusterTTStatusHintSourceRequest *poison_request
+		= (const ClusterTTStatusHintSourceRequest *)(uintptr_t)1;
+
+	test_reset_gate(CLUSTER_SEMANTIC_ADMISSION_OK, true);
+	cluster_shared_config = true;
+	test_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	test_recovered_open = false;
+	UT_ASSERT_EQ(cluster_tt_status_hint_source_dispatch(CLUSTER_TT_HINT_SOURCE_EMIT,
+											 poison_request),
+					 CLUSTER_SEMANTIC_ADMISSION_CLOSED);
 	UT_ASSERT_EQ(test_leave_count, 0);
 	UT_ASSERT_EQ(cluster_tt_status_hint_get_emit_count(), 0);
 }
@@ -379,8 +413,9 @@ int
 main(void)
 {
 	test_prepare_hint_state();
-	UT_PLAN(5);
+	UT_PLAN(6);
 	UT_RUN(test_active_refuses_all_ops_before_request_inspection);
+	UT_RUN(test_recovered_open_refuses_source_hint_before_request_inspection);
 	UT_RUN(test_disabled_emit_mutates_real_source_queue);
 	UT_RUN(test_validation_happens_after_admission_and_leaves_once);
 	UT_RUN(test_recheck_drift_returns_generation_changed_and_leaves);

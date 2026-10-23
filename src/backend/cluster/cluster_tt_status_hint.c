@@ -941,6 +941,13 @@ cluster_tt_status_hint_source_dispatch(ClusterTTStatusHintSourceOp op,
 	ClusterSemanticAdmissionResult result;
 	ErrorData *volatile error_data = NULL;
 
+	/* Recovered members must not emit or consume SOURCE hints before the
+	 * durable semantic OPEN binding is current. */
+	if (MyBackendType != B_STARTUP && cluster_shared_config
+		&& cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& !cluster_semantic_activation_recovered_open_current())
+		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+
 	result = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
 											   CLUSTER_SEMANTIC_SOURCE_SIDE, &admission);
 	if (result != CLUSTER_SEMANTIC_ADMISSION_OK)
