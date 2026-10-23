@@ -18,6 +18,8 @@
  *    are supplied here. A wrong pg_wal fallback returns different bytes.
  *-------------------------------------------------------------------------
  */
+#define USE_PGRAC_CLUSTER 1
+
 #include "postgres.h"
 #include "cluster/cluster_wal_writer.h"
 

@@ -14194,6 +14194,11 @@ cluster_semantic_activation_lmon_tick(void)
 												snapshot.record_generation, current_epoch, true);
 }
 
+static bool
+normal_start_service_binding_current(const ClusterSemanticActivationRecord *open,
+									 const uint8 *root,
+									 const ClusterSemanticActivationAckTableV1 *table);
+
 /* Bounded, nonblocking postmaster adapter for the two existing first-OPEN
  * rounds. Only LMON/QVOTEC publish their durable records and admission gates.
  * A reply merely retires this request; readiness is sampled independently. */
@@ -14208,6 +14213,10 @@ cluster_semantic_activation_startup_poll(ClusterSemanticActivationRefusal *refus
 	ResourceXGateSnapshot gate, gate_after;
 	SemanticServingCut serving, serving_after;
 	ClusterSemanticActivationRefusal completion;
+	ClusterSemanticActivationRecord recovered_open;
+	ClusterSemanticActivationAckTableV1 recovered_table;
+	uint8 recovered_pgsa[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	bool recovered_implicit_zero;
 	ClusterNormalStartState state;
 	uint64 epoch = cluster_epoch_get_current();
 	uint64 next_bits;
@@ -14227,8 +14236,28 @@ cluster_semantic_activation_startup_poll(ClusterSemanticActivationRefusal *refus
 		}
 		if (start->epoch != epoch || memcmp(&start->writer, &writer, sizeof(writer)) != 0)
 			return false;
-	} else if (state != CLUSTER_NORMAL_START_TARGET_READY || start->bound)
+	} else if ((state != CLUSTER_NORMAL_START_TARGET_READY
+			   && state != CLUSTER_NORMAL_START_EXISTING_OTHER)
+			  || start->bound)
 		return false;
+	/* RECOVERED starts now consume the same durable service matcher as the
+	 * normal-serving path.  This is the handoff point from cold recovery into
+	 * OPEN; a missing or drifting owner keeps startup closed. */
+	if (state == CLUSTER_NORMAL_START_EXISTING_OTHER) {
+		/* Read the durable record before any service-side publication. */
+		/* Recovered startup enters OPEN through the existing service matcher. */
+		if (NormalStartCompletion == NULL
+			|| cluster_qvotec_bootstrap_read_semantic_activation(recovered_pgsa,
+																&recovered_implicit_zero)
+				   != CLUSTER_SEMANTIC_ACTIVATION_OK
+			|| recovered_implicit_zero
+			|| !cluster_semantic_activation_record_decode(recovered_pgsa, &recovered_open, NULL)
+			|| recovered_open.phase != CLUSTER_SEMANTIC_PHASE_OPEN
+			|| !semantic_activation_ack_table_snapshot(&recovered_table)
+			|| !normal_start_service_binding_current(&recovered_open, NormalStartCompletion->pgrd,
+																&recovered_table))
+			return false;
+	}
 
 	semantic_activation_set_refusal(refusal, CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED, 0, 0);
 	if (start->request_seq != 0) {
