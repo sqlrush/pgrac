@@ -14223,10 +14223,6 @@ cluster_semantic_activation_startup_poll(ClusterSemanticActivationRefusal *refus
 	ResourceXGateSnapshot gate, gate_after;
 	SemanticServingCut serving, serving_after;
 	ClusterSemanticActivationRefusal completion;
-	ClusterSemanticActivationRecord recovered_open;
-	ClusterSemanticActivationAckTableV1 recovered_table;
-	uint8 recovered_pgsa[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
-	bool recovered_implicit_zero;
 	ClusterNormalStartState state;
 	uint64 epoch = cluster_epoch_get_current();
 	uint64 next_bits;
@@ -14250,25 +14246,12 @@ cluster_semantic_activation_startup_poll(ClusterSemanticActivationRefusal *refus
 			   && state != CLUSTER_NORMAL_START_EXISTING_OTHER)
 			  || start->bound)
 		return false;
-	/* RECOVERED starts now consume the same durable service matcher as the
-	 * normal-serving path.  This is the handoff point from cold recovery into
-	 * OPEN; a missing or drifting owner keeps startup closed. */
-	if (state == CLUSTER_NORMAL_START_EXISTING_OTHER) {
-		/* Read the durable record before any service-side publication. */
-		/* Recovered startup enters OPEN through the existing service matcher;
-		 * downstream ROOT consumers must observe this same durable cut. */
-		if (NormalStartCompletion == NULL
-			|| cluster_qvotec_bootstrap_read_semantic_activation(recovered_pgsa,
-																&recovered_implicit_zero)
-				   != CLUSTER_SEMANTIC_ACTIVATION_OK
-			|| recovered_implicit_zero
-			|| !cluster_semantic_activation_record_decode(recovered_pgsa, &recovered_open, NULL)
-			|| recovered_open.phase != CLUSTER_SEMANTIC_PHASE_OPEN
-			|| !semantic_activation_ack_table_snapshot(&recovered_table)
-			|| !normal_start_service_binding_current(&recovered_open, NormalStartCompletion->pgrd,
-																&recovered_table))
-			return false;
-	}
+	/* The no-PGPROC postmaster observes the original LMON's completed ROOT
+	 * handoff, just like ordinary backends. It does not repeat that owner's
+	 * durable input read or invoke its role-bound checkpoint observation. */
+	if (state == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& !cluster_semantic_activation_recovered_open_current())
+		return false;
 
 	semantic_activation_set_refusal(refusal, CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED, 0, 0);
 	if (start->request_seq != 0) {
@@ -14626,22 +14609,26 @@ normal_start_service_binding_current(const ClusterSemanticActivationRecord *open
 bool
 cluster_semantic_activation_recovered_open_current(void)
 {
-	ClusterSemanticActivationRecord open;
-	ClusterSemanticActivationAckTableV1 table;
-	uint8 selected[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
-	bool implicit_zero = false;
+	const ClusterNormalStartCompletion *input = NormalStartCompletion;
+	SemanticServingCut before, after;
+	uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
 
 	if (cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_EXISTING_OTHER
-		|| NormalStartCompletion == NULL
-		|| cluster_qvotec_bootstrap_read_semantic_activation(selected, &implicit_zero)
-			   != CLUSTER_SEMANTIC_ACTIVATION_OK
-		|| implicit_zero
-		|| !cluster_semantic_activation_record_decode(selected, &open, NULL)
-		|| open.phase != CLUSTER_SEMANTIC_PHASE_OPEN
-		|| !semantic_activation_ack_table_snapshot(&table)
-		|| !normal_start_service_binding_current(&open, NormalStartCompletion->pgrd, &table))
+		|| input == NULL || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
+		|| input->node_id != cluster_node_id || !semantic_serving_cut_read(&before)
+		|| input->system_identifier != before.system_identifier || input->epoch != before.epoch
+		|| input->boot_incarnation != before.members[cluster_node_id]
+		|| !semantic_serving_ready(&before)
+		|| !semantic_activation_pgrd_snapshot_copy(root)
+		|| memcmp(root, input->pgrd, sizeof(root)) != 0)
 		return false;
-	return true;
+	/* Only the original LMON publisher performs the durable serving ROOT
+	 * operation. Ordinary backends and postmaster consume its completed cut;
+	 * an INSTALL observation or historical OPEN is not a substitute. */
+	return cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		   && NormalStartCompletion == input && semantic_serving_cut_read(&after)
+		   && memcmp(&before, &after, sizeof(before)) == 0 && semantic_serving_ready(&after);
 }
 
 ClusterNormalStopPollResult

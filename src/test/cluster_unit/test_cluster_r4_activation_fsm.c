@@ -9528,7 +9528,7 @@ UT_TEST(test_normal_start_recovered_owner_equal_epoch_does_not_use_fast_path)
 	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
 }
 
-UT_TEST(test_normal_start_recovered_open_consumer_accepts_durable_open)
+UT_TEST(test_normal_start_recovered_open_consumer_requires_completed_root)
 {
 	ClusterSemanticActivationRecord open;
 	ClusterSemanticActivationAckTableV1 table;
@@ -9538,7 +9538,8 @@ UT_TEST(test_normal_start_recovered_open_consumer_accepts_durable_open)
 	ut_a142_open_bytes(test_r4fsm_bootstrap_bytes, 0);
 	memcpy(SemanticActivationAckTable, &table, sizeof(table));
 	pg_atomic_write_u64(&SemanticActivationAckTable->publication_seq, 0);
-	UT_ASSERT(cluster_semantic_activation_recovered_open_current());
+	/* Historical OPEN plus an INSTALL observation is not serving completion. */
+	UT_ASSERT(!cluster_semantic_activation_recovered_open_current());
 
 	/* A non-OPEN durable phase must never satisfy the downstream consumer. */
 	ut_a142_open_bytes(test_r4fsm_bootstrap_bytes, 1);
@@ -11628,7 +11629,7 @@ static void test_serving_finish_root(void);
 int
 main(void)
 {
-	UT_PLAN(396);
+	UT_PLAN(398);
 	UT_RUN(test_member_commit_gap_before_all_peer_receipts);
 	UT_RUN(test_member_commit_request_waits_for_real_predecessor_receipts);
 	UT_RUN(test_member_commit_request_rejects_old_or_changed_identity);
@@ -11987,7 +11988,9 @@ main(void)
 	UT_RUN(test_normal_start_recovered_owner_observation_rejects_invalid_local_node);
 	UT_RUN(test_normal_start_recovered_owner_observation_rechecks_after_formation);
 	UT_RUN(test_normal_start_recovered_owner_equal_epoch_does_not_use_fast_path);
-	UT_RUN(test_normal_start_recovered_open_consumer_accepts_durable_open);
+	UT_RUN(test_normal_start_recovered_open_consumer_requires_completed_root);
+	UT_RUN(test_recovered_readers_consume_original_serving_completion);
+	UT_RUN(test_recovered_readers_reject_changed_serving_cut);
 	UT_RUN(test_normal_start_capture_drift_and_wrong_writer_refuse);
 	UT_RUN(test_normal_start_identity_rechecked_after_real_root_read);
 	UT_RUN(test_normal_start_bootstrap_requires_strict_source_at_entry_and_recheck);
