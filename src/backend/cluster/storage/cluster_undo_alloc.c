@@ -419,6 +419,7 @@ cluster_undo_block0_current_live_owner_lifecycle_exact(uint32 segment_id, uint8 
 	UndoSegmentHeaderData *after;
 	ClusterUndoBlock0LogicalKey key;
 	ClusterUndoBlock0Generation expected;
+	ClusterUndoBlock0Result result;
 	uint64 last;
 	uint32 block;
 
@@ -482,12 +483,24 @@ cluster_undo_block0_current_live_owner_lifecycle_exact(uint32 segment_id, uint8 
 	key.owner_instance = owner_instance;
 	expected.known = true;
 	expected.value = before->wrap_count;
-	if (cluster_undo_block0_current_live_owner_ensure_resident(&key, 10000)
-		!= CLUSTER_UNDO_BLOCK0_OK)
+	result = cluster_undo_block0_current_live_owner_ensure_resident(&key, 10000);
+	if (result != CLUSTER_UNDO_BLOCK0_OK) {
+		ereport(LOG,
+				(errmsg_internal("undo lifecycle current refused: stage=ensure_resident "
+								 "mutation=%u segment=%u owner=%u generation=%u result=%d",
+								 (unsigned)kind, segment_id, (unsigned)owner_instance,
+								 expected.value, (int)result)));
 		return false;
-	return cluster_undo_block0_current_live_owner_mutate_exact(&key, &expected, predecessor.data,
-															   successor.data, 10000)
-		   == CLUSTER_UNDO_BLOCK0_OK;
+	}
+	result = cluster_undo_block0_current_live_owner_mutate_exact(
+		&key, &expected, predecessor.data, successor.data, 10000);
+	if (result != CLUSTER_UNDO_BLOCK0_OK)
+		ereport(LOG,
+				(errmsg_internal("undo lifecycle current refused: stage=mutate_exact "
+								 "mutation=%u segment=%u owner=%u generation=%u result=%d",
+								 (unsigned)kind, segment_id, (unsigned)owner_instance,
+								 expected.value, (int)result)));
+	return result == CLUSTER_UNDO_BLOCK0_OK;
 }
 
 
