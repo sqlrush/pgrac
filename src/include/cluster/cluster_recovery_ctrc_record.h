@@ -469,6 +469,20 @@ extern bool cluster_recovery_ctrc_witness_ids_from_evidence_v2(const uint8 *evid
 extern bool cluster_recovery_ctrc_witness_ids_in_evidence_v2(const uint8 *witness_ids,
 	size_t witness_ids_length, const uint8 *evidence, size_t evidence_length);
 
+/* Encode atom3 completion bytes from a fixed outcome/rule pair and a
+ * complete canonical nonempty witness-id vector. Every witness must occur
+ * in a complete canonical raw-evidence vector. This proves only structural
+ * correspondence: the original owner must establish applicable family,
+ * same-graph provenance, required witnesses and actual completion predicates.
+ * No live caller, completion, durability or release authority is supplied.
+ * Exact output length is 4+witness_ids_length, bounded by MaxAllocSize.
+ * No allocation; immutable inputs with valid declared storage may be
+ * unaligned and alias out. All validation precedes publication. Refusal
+ * clears min(out_length,12), without a partially published tail. */
+extern bool cluster_recovery_ctrc_owner_completion_bytes_v2(uint16 outcome, uint16 rule,
+	const uint8 *witness_ids, size_t witness_ids_length, const uint8 *evidence,
+	size_t evidence_length, uint8 *out, size_t out_length);
+
 typedef struct ClusterRecoveryCTRCColdMemberV2 {
 	uint16 node_id; /* bitmap bit number, 0..63 */
 	uint64 boot;

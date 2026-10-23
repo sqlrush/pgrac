@@ -6101,6 +6101,195 @@ UT_TEST(witness_membership_unselected_raw_and_overlapping_inputs)
 	UT_ASSERT(memcmp(evidence, before, sizeof(evidence)) == 0 && graph_alloc_live == 0);
 }
 
+/* Independent Python struct.pack("<HH",1,1) plus full canonical witness
+ * vector, per the frozen atom3 byte contract; not an owner success proof. */
+static const uint8 owner_completion_golden[] = {
+	1,0,1,0,3,0,0,0,0,0,0,0,11,0,
+	0,0,0,0,0,0,1,0,1,0,0,0,0,0,
+	0,0,255,12,0,0,0,0,0,0,0,1,0,2,
+	0,0,0,0,0,0,0,1,0,11,0,0,0,0,
+	0,0,0,2,0,1,0,0,0,0,0,0,0,0,
+};
+
+static bool
+owner_completion_refused(uint16 outcome, uint16 rule, const uint8 *ids,
+	size_t ids_length, const uint8 *evidence, size_t evidence_length, size_t length)
+{
+	uint8 out[sizeof(owner_completion_golden) + 3];
+	size_t cleared = Min(length, (size_t)12);
+
+	memset(out, 0xa5, sizeof(out));
+	if (cluster_recovery_ctrc_owner_completion_bytes_v2(outcome, rule, ids, ids_length,
+			evidence, evidence_length, out + 1, length)
+		|| out[0] != 0xa5 || !all_zero(out + 1, cleared))
+		return false;
+	for (size_t i = cleared + 1; i < sizeof(out); i++)
+		if (out[i] != 0xa5)
+			return false;
+	return graph_alloc_live == 0;
+}
+
+UT_TEST(owner_completion_exact_frozen_pairs_and_subsets)
+{
+	static const uint16 pairs[][2] = {{1,1}, {1,2}, {2,3}, {2,4}, {3,5}, {1,6}};
+	uint8 out[sizeof(owner_completion_golden) + 2], ids[sizeof(witness_ids_golden)];
+
+	graph_alloc_calls = 0;
+	graph_alloc_fail_at = 1;
+	for (unsigned i = 0; i < lengthof(pairs); i++) {
+		memset(out, 0xa5, sizeof(out));
+		UT_ASSERT(cluster_recovery_ctrc_owner_completion_bytes_v2(pairs[i][0], pairs[i][1],
+			witness_ids_golden, sizeof(witness_ids_golden), raw_evidence_golden,
+			sizeof(raw_evidence_golden), out + 1, sizeof(owner_completion_golden)));
+		UT_ASSERT(out[0] == 0xa5 && out[sizeof(out) - 1] == 0xa5);
+		UT_ASSERT_EQ(out[1], pairs[i][0]);
+		UT_ASSERT_EQ(out[2], 0);
+		UT_ASSERT_EQ(out[3], pairs[i][1]);
+		UT_ASSERT_EQ(out[4], 0);
+		UT_ASSERT(memcmp(out + 5, witness_ids_golden, sizeof(witness_ids_golden)) == 0);
+		if (i == 0)
+			UT_ASSERT(memcmp(out + 1, owner_completion_golden, sizeof(owner_completion_golden)) == 0);
+	}
+	for (unsigned mask = 1; mask < 8; mask++) {
+		size_t length = witness_subset(mask, ids);
+
+		memset(out, 0xa5, sizeof(out));
+		UT_ASSERT(cluster_recovery_ctrc_owner_completion_bytes_v2(1, 1, ids, length,
+			raw_evidence_golden, sizeof(raw_evidence_golden), out, length + 4));
+		UT_ASSERT(memcmp(out + 4, ids, length) == 0 && out[length + 4] == 0xa5);
+	}
+	UT_ASSERT(graph_alloc_calls == 0 && graph_alloc_live == 0);
+	graph_alloc_fail_at = 0;
+}
+
+UT_TEST(owner_completion_invalid_rules_outcomes_and_output_bounds)
+{
+	const uint16 allowed[] = {0, 1, 1, 2, 2, 3, 1};
+	const uint16 high[] = {256, 257, 0x8001, UINT16_MAX};
+
+	for (uint16 outcome = 0; outcome < 5; outcome++)
+		for (uint16 rule = 0; rule < 8; rule++)
+			if (rule == 0 || rule > 6 || outcome != allowed[rule])
+				UT_ASSERT(owner_completion_refused(outcome, rule, witness_ids_golden,
+					sizeof(witness_ids_golden), raw_evidence_golden,
+					sizeof(raw_evidence_golden), sizeof(owner_completion_golden)));
+	for (unsigned i = 0; i < lengthof(high); i++) {
+		UT_ASSERT(owner_completion_refused(high[i], 1, witness_ids_golden,
+			sizeof(witness_ids_golden), raw_evidence_golden,
+			sizeof(raw_evidence_golden), sizeof(owner_completion_golden)));
+		UT_ASSERT(owner_completion_refused(1, high[i], witness_ids_golden,
+			sizeof(witness_ids_golden), raw_evidence_golden,
+			sizeof(raw_evidence_golden), sizeof(owner_completion_golden)));
+	}
+	for (size_t length = 0; length < sizeof(owner_completion_golden); length++)
+		UT_ASSERT(owner_completion_refused(1, 1, witness_ids_golden,
+			sizeof(witness_ids_golden), raw_evidence_golden, sizeof(raw_evidence_golden), length));
+	UT_ASSERT(owner_completion_refused(1, 1, witness_ids_golden, sizeof(witness_ids_golden),
+		raw_evidence_golden, sizeof(raw_evidence_golden), sizeof(owner_completion_golden) + 1));
+	UT_ASSERT(owner_completion_refused(1, 1, witness_ids_golden, sizeof(witness_ids_golden),
+		raw_evidence_golden, sizeof(raw_evidence_golden), SIZE_MAX));
+	UT_ASSERT(owner_completion_refused(1, 1, witness_ids_golden, SIZE_MAX,
+		raw_evidence_golden, sizeof(raw_evidence_golden), sizeof(owner_completion_golden)));
+	UT_ASSERT(!cluster_recovery_ctrc_owner_completion_bytes_v2(1, 1, witness_ids_golden,
+		sizeof(witness_ids_golden), raw_evidence_golden, sizeof(raw_evidence_golden),
+		NULL, sizeof(owner_completion_golden)));
+}
+
+UT_TEST(owner_completion_complete_canonical_witness_refusals)
+{
+	uint8 ids[sizeof(witness_ids_golden) + 1], before[sizeof(ids)];
+
+	for (size_t length = 0; length < sizeof(witness_ids_golden); length++)
+		UT_ASSERT(owner_completion_refused(1, 1, witness_ids_golden, length,
+			raw_evidence_golden, sizeof(raw_evidence_golden), length + 4));
+	for (unsigned which = 0; which < 8; which++) {
+		size_t length = sizeof(witness_ids_golden);
+
+		memcpy(ids, witness_ids_golden, length);
+		ids[length] = 0xa5;
+		switch (which) {
+		case 0: ids[0] = 0; break; /* Empty witness list is never completion. */
+		case 1: ids[0] = 4; break;
+		case 2: ids[16] = 3; break; /* atom3 is not a raw witness. */
+		case 3: ids[26]--; break; /* Canonical ID missing from this raw vector. */
+		case 4: ids[65] = 1; break;
+		case 5: memcpy(ids + 47, witness_ids_golden + 8, 19); break;
+		case 6:
+			memcpy(ids + 8, witness_ids_golden + 47, 19);
+			memcpy(ids + 47, witness_ids_golden + 8, 19);
+			break;
+		case 7: length++; break;
+		}
+		memcpy(before, ids, sizeof(before));
+		UT_ASSERT(owner_completion_refused(1, 1, ids, length, raw_evidence_golden,
+			sizeof(raw_evidence_golden), length + 4));
+		UT_ASSERT(memcmp(ids, before, sizeof(ids)) == 0);
+	}
+	UT_ASSERT(owner_completion_refused(1, 1, NULL, sizeof(witness_ids_golden),
+		raw_evidence_golden, sizeof(raw_evidence_golden), sizeof(owner_completion_golden)));
+}
+
+UT_TEST(owner_completion_rechecks_unselected_raw_before_publication)
+{
+	uint8 ids[sizeof(witness_ids_golden)], evidence[128], before[sizeof(evidence)];
+	size_t ids_length = witness_subset(1, ids);
+
+	for (size_t length = 0; length < sizeof(raw_evidence_golden); length++)
+		UT_ASSERT(owner_completion_refused(3, 5, ids, ids_length,
+			raw_evidence_golden, length, ids_length + 4));
+	for (unsigned which = 0; which < 4; which++) {
+		size_t length = sizeof(raw_evidence_golden);
+
+		memset(evidence, 0xa5, sizeof(evidence));
+		memcpy(evidence, raw_evidence_golden, length);
+		switch (which) {
+		case 0: evidence[74] = 3; break;
+		case 1: cluster_undo_tt_ctrc_put_u64_le(evidence + 85, 0); break;
+		case 2: evidence[length++] = 0; break;
+		case 3:
+			cluster_undo_tt_ctrc_put_u64_le(evidence + 66, sizeof(raw_evidence_atom2));
+			memcpy(evidence + 74, raw_evidence_atom2, sizeof(raw_evidence_atom2));
+			evidence[65]--; /* Sorted distinct bytes but conflicting same ID. */
+			length++;
+			break;
+		}
+		memcpy(before, evidence, sizeof(before));
+		UT_ASSERT(owner_completion_refused(3, 5, ids, ids_length,
+			evidence, length, ids_length + 4));
+		UT_ASSERT(memcmp(evidence, before, sizeof(evidence)) == 0);
+	}
+	UT_ASSERT(owner_completion_refused(3, 5, ids, ids_length, NULL, 8, ids_length + 4));
+	UT_ASSERT(owner_completion_refused(3, 5, ids, ids_length,
+		raw_evidence_golden, SIZE_MAX, ids_length + 4));
+}
+
+UT_TEST(owner_completion_unaligned_aliases_and_original_list_composition)
+{
+	uint8 bytes[768], expected[768], out[sizeof(owner_completion_golden)];
+	const size_t offsets[] = {256, 258, 254, 70, 63, 1};
+	ClusterRecoveryCTRCGraphBytesV2 atoms[3];
+	size_t evidence_length = 0, ids_length = 0;
+
+	for (unsigned i = 0; i < lengthof(offsets); i++) {
+		memset(bytes, 0xa5, sizeof(bytes));
+		memcpy(bytes + 257, witness_ids_golden, sizeof(witness_ids_golden));
+		memcpy(bytes + 65, raw_evidence_golden, sizeof(raw_evidence_golden));
+		memcpy(expected, bytes, sizeof(expected));
+		memcpy(expected + offsets[i], owner_completion_golden, sizeof(owner_completion_golden));
+		UT_ASSERT(cluster_recovery_ctrc_owner_completion_bytes_v2(1, 1,
+			bytes + 257, sizeof(witness_ids_golden), bytes + 65,
+			sizeof(raw_evidence_golden), bytes + offsets[i], sizeof(owner_completion_golden)));
+		UT_ASSERT(memcmp(bytes, expected, sizeof(bytes)) == 0);
+	}
+	raw_evidence_views(atoms);
+	UT_ASSERT(cluster_recovery_ctrc_raw_evidence_v2(atoms, 3, bytes + 1, 256, &evidence_length));
+	UT_ASSERT(cluster_recovery_ctrc_witness_ids_from_evidence_v2(bytes + 1, evidence_length,
+		bytes + 513, 128, &ids_length));
+	UT_ASSERT(cluster_recovery_ctrc_owner_completion_bytes_v2(1, 1, bytes + 513,
+		ids_length, bytes + 1, evidence_length, out, sizeof(out)));
+	UT_ASSERT(memcmp(out, owner_completion_golden, sizeof(out)) == 0 && graph_alloc_live == 0);
+}
+
 /* Independent little-endian struct.pack oracle for the frozen atom4 body. */
 static const uint8 cold_step_golden[] = {
 	0x08,0x07,0x06,0x05,0x04,0x03,0x02,0x01, 0x18,0x17,0x16,0x15,0x14,0x13,0x12,0x11,
@@ -6913,7 +7102,7 @@ UT_TEST(graph_reader_allocation_refusal)
 int
 main(void)
 {
-	UT_PLAN(197);
+	UT_PLAN(202);
 	UT_RUN(golden_encoding);
 	UT_RUN(golden_decoding);
 	UT_RUN(unaligned_buffers);
@@ -7090,6 +7279,11 @@ main(void)
 	UT_RUN(witness_membership_exact_subsets_and_no_allocation);
 	UT_RUN(witness_membership_missing_noncanonical_and_bounded_ids);
 	UT_RUN(witness_membership_unselected_raw_and_overlapping_inputs);
+	UT_RUN(owner_completion_exact_frozen_pairs_and_subsets);
+	UT_RUN(owner_completion_invalid_rules_outcomes_and_output_bounds);
+	UT_RUN(owner_completion_complete_canonical_witness_refusals);
+	UT_RUN(owner_completion_rechecks_unselected_raw_before_publication);
+	UT_RUN(owner_completion_unaligned_aliases_and_original_list_composition);
 	UT_RUN(cold_step_canonical_bytes_and_complete_64_member_cohort);
 	UT_RUN(cold_step_incomplete_duplicate_unknown_and_bounded_refusal);
 	UT_RUN(cold_step_unaligned_alias_inputs_and_publication);

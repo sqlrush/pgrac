@@ -2139,6 +2139,31 @@ cluster_recovery_ctrc_witness_ids_in_evidence_v2(const uint8 *witness_ids,
 }
 
 bool
+cluster_recovery_ctrc_owner_completion_bytes_v2(uint16 outcome, uint16 rule,
+	const uint8 *witness_ids, size_t witness_ids_length, const uint8 *evidence,
+	size_t evidence_length, uint8 *out, size_t out_length)
+{
+	if (out == NULL || out_length > MaxAllocSize || witness_ids_length > MaxAllocSize - 4
+		|| out_length != witness_ids_length + 4
+		|| !((outcome == 1 && (rule == 1 || rule == 2 || rule == 6))
+			|| (outcome == 2 && (rule == 3 || rule == 4))
+			|| (outcome == 3 && rule == 5))
+		|| !cluster_recovery_ctrc_witness_ids_in_evidence_v2(witness_ids,
+			witness_ids_length, evidence, evidence_length)) {
+		if (out != NULL)
+			memset(out, 0, Min(out_length, (size_t)12));
+		return false;
+	}
+	/* The canonical vector already contains U64(count)||concat(B(id)).
+	 * All input validation is complete before this possibly overlapping copy.
+	 * A rule's actual predicates and required witnesses remain owner inputs. */
+	memmove(out + 4, witness_ids, witness_ids_length);
+	cluster_undo_tt_ctrc_put_u16_le(out, outcome);
+	cluster_undo_tt_ctrc_put_u16_le(out + 2, rule);
+	return true;
+}
+
+bool
 cluster_recovery_ctrc_cold_step_bytes_v2(const ClusterRecoveryCTRCColdStepV2 *step,
 	uint8 *out, size_t out_length)
 {
