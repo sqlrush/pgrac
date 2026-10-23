@@ -532,6 +532,7 @@ cluster_recovery_ctrc_wal_reference_graph_nodes_v2(
 			|| cluster_undo_tt_ctrc_get_u64_le(key + 36) != 56
 			|| memcmp(key + 44, atom + 10, 56) != 0
 			|| cluster_undo_tt_ctrc_get_u64_le(key + 100) != field_offsets[i]
+			|| cluster_undo_tt_ctrc_get_u64_le(key + 108) != 0
 			|| (i != 0 && memcmp(key, references->keys[0], 100) != 0))
 			goto refused;
 		nodes[i] = (ClusterRecoveryCTRCGraphNodeV2){

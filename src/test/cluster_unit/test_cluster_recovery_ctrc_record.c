@@ -2589,21 +2589,25 @@ UT_TEST(wal_reference_graph_nodes_are_structural_and_atomic)
 		UT_ASSERT_EQ(nodes[i].kind, 1);
 		UT_ASSERT(nodes[i].key.data == references.keys[i]);
 		UT_ASSERT_EQ(nodes[i].key.length, CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_KEY_BYTES);
+		UT_ASSERT(all_zero(references.keys[i] + 108, 8));
 		UT_ASSERT(nodes[i].evidence.data == references.evidence);
 		UT_ASSERT_EQ(nodes[i].evidence.length,
 			CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_EVIDENCE_BYTES);
 	}
 	UT_ASSERT(memcmp(&references, &saved, sizeof(references)) == 0);
 
-	for (unsigned mutation = 0; mutation < 3; mutation++) {
+	for (unsigned mutation = 0; mutation < 3 + CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_COUNT;
+		 mutation++) {
 		ClusterRecoveryCTRCWalReferencesV2 copy = saved;
 
 		if (mutation == 0)
 			wal_atom_uint(copy.keys[1] + 100, 999, 8);
 		else if (mutation == 1)
 			wal_atom_uint(copy.evidence, 2, 8);
-		else
+		else if (mutation == 2)
 			copy.evidence[16 + 10] ^= 1;
+		else
+			wal_atom_uint(copy.keys[mutation - 3] + 108, UINT64_C(1) << 63, 8);
 		memset(guarded, 0xa5, sizeof(guarded));
 		UT_ASSERT(!cluster_recovery_ctrc_wal_reference_graph_nodes_v2(&copy,
 			(ClusterRecoveryCTRCGraphNodeV2 *)(guarded + 1)));
