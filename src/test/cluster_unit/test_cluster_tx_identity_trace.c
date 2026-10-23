@@ -45,11 +45,16 @@ int main(void) {
 	ClusterTxLocator locator = {0};
 	ClusterWaitTrace resource = {0};
 	ClusterWaitSendGate send = {0};
+	ClusterWaitRequesterGate requester = {0};
 	unsigned before;
 
 	/* Disabled instrumentation must not inspect an identity at all. */
 	cluster_tx_identity_trace_emit(CLTXID_ACTIVE, NULL);
 	cluster_wait_trace_send_gate_emit(NULL, NULL);
+	cluster_wait_trace_requester_gate_emit(NULL);
+	requester.known = true;
+	cluster_wait_trace_requester_gate_emit(&requester);
+	requester.known = false;
 	assert(logs == 0);
 	cluster_trace_tx_identity = true;
 	cluster_tx_identity_trace_canonical(&row, 2, 4196258, 513, 24, 0, 0, true, 77);
@@ -236,6 +241,27 @@ int main(void) {
 	for (unsigned i = 0; i < CLUSTER_WAIT_TRACE_LIMIT + 2; i++)
 		cluster_wait_trace_send_gate_emit(&resource.tag, &send);
 	assert(strstr(last, "event=LIMIT family=PCM_SEND_GATE") && strstr(last, "evidence_complete=0"));
+	before = logs;
+	cluster_wait_trace_requester_gate_emit(&requester);
+	assert(logs == before);
+	cluster_wait_trace_emit(CLWAIT_PCM_REQUESTER_GATE, &resource);
+	assert(logs == before); /* This family also forbids ereport. */
+	requester.known = true; requester.tag = resource.tag;
+	requester.site = CLWAIT_REQUESTER_ROUND;
+	requester.reason = CLWAIT_SEND_PHYSICAL_OWNER;
+	requester.pending = 3; requester.episode = 17; requester.r4 = 77;
+	requester.request_seq = 31; requester.requester_connection = 51;
+	requester.master_ingress = 61; requester.observed_us = 1000000;
+	requester.completed_us = 9; requester.response_us = 10;
+	cluster_wait_trace_requester_gate_emit(&requester);
+	assert(logs == before + 1 && strstr(last, "event=PCM_REQUESTER_GATE"));
+	assert(strstr(last, "requester_gate_known=1 requester_site=3 requester_reason=3"));
+	assert(strstr(last, "r4=77 request_seq=31") && strstr(last, "pending=3 episode=17"));
+	assert(strstr(last, "requester_conn=51 ingress_conn=61"));
+	assert(strstr(last, "observed_us=1000000 completed_us=9 response_us=10"));
+	for (unsigned i = 0; i < CLUSTER_WAIT_TRACE_LIMIT + 2; i++)
+		cluster_wait_trace_requester_gate_emit(&requester);
+	assert(strstr(last, "event=LIMIT family=PCM_REQUESTER_GATE") && strstr(last, "evidence_complete=0"));
 	forbid_ereport = false;
 	puts("tx identity / wait resources trace: OFF, identities and independent budgets PASS");
 	return 0;

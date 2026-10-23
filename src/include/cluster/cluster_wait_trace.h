@@ -18,7 +18,7 @@
 typedef enum ClusterWaitTraceKind {
 	CLWAIT_PCM_WAIT, CLWAIT_PCM_QUEUE, CLWAIT_PCM_ADMISSION,
 	CLWAIT_TX_BUFFER, CLWAIT_TX_LEDGER, CLWAIT_TX_SUMMARY, CLWAIT_PCM_GUARD,
-	CLWAIT_PCM_SEND_GATE, CLWAIT_NKINDS
+	CLWAIT_PCM_SEND_GATE, CLWAIT_PCM_REQUESTER_GATE, CLWAIT_NKINDS
 } ClusterWaitTraceKind;
 
 typedef enum ClusterWaitTraceSite {
@@ -66,6 +66,21 @@ typedef struct ClusterWaitSendGate {
 	int32 owner, owner_node, owner_index, requester, state, kind, destination, reason, result, site;
 	bool known, busy;
 } ClusterWaitSendGate;
+
+/* Requester-local physical send eligibility; distinct from retained slots. */
+typedef enum ClusterWaitRequesterSite {
+	CLWAIT_REQUESTER_BEGIN = 1, CLWAIT_REQUESTER_RECHECK, CLWAIT_REQUESTER_ROUND
+} ClusterWaitRequesterSite;
+
+typedef struct ClusterWaitRequesterGate {
+	BufferTag tag;
+	uint64 binding, formation, master_session, r4, request_seq, base, authority;
+	uint64 observed_us, episode, completed_us, response_us, sent_us;
+	uint64 last_dispatch_us, retry_slice_us;
+	uint32 pending, requester_connection, master_ingress;
+	int32 requester, master, phase, kind, send_kind, reason, site;
+	bool known;
+} ClusterWaitRequesterGate;
 
 typedef struct ClusterWaitTrace {
 	BufferTag tag;
@@ -116,6 +131,7 @@ extern void cluster_wait_trace_emit(ClusterWaitTraceKind kind, const ClusterWait
 /* Non-throwing stderr record: safe before returning a transport rejection. */
 extern void cluster_wait_trace_send_gate_emit(const BufferTag *tag,
 	const ClusterWaitSendGate *gate);
+extern void cluster_wait_trace_requester_gate_emit(const ClusterWaitRequesterGate *gate);
 extern void cluster_buffer_trace_tx_wait(ClusterWaitTraceSite site, uint64 wait_seq,
 	uint32 tx_xid, uint64 request_seq);
 #endif

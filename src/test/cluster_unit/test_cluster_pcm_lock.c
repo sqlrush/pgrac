@@ -170,6 +170,19 @@ static unsigned wait_trace_count;
 static ClusterWaitSendGate send_gate_last;
 static BufferTag send_gate_tag;
 static unsigned send_gate_count;
+static unsigned requester_gate_count;
+static ClusterWaitRequesterGate requester_gate_last;
+static BufferTag requester_gate_tag;
+
+void
+cluster_wait_trace_requester_gate_emit(const ClusterWaitRequesterGate *gate)
+{
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	UT_ASSERT(cluster_trace_tx_identity && gate->known);
+	requester_gate_last = *gate;
+	requester_gate_tag = gate->tag;
+	requester_gate_count++;
+}
 
 void
 cluster_wait_trace_send_gate_emit(const BufferTag *tag, const ClusterWaitSendGate *gate)
@@ -23898,21 +23911,43 @@ UT_TEST(test_requester_transport_owner_bounds_both_dispatch_roots)
 		cluster_pcm_lock_resource_x_requester_send_begin_exact(&request, 0, 1, 100000, &first),
 		RESOURCE_X_INTENT_STAGED);
 	UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_current_exact(&first));
+	/* A live physical send owner must be observable as a local eligibility
+	 * rejection, without expiring it into another request. */
+	requester_gate_count = 0;
+	cluster_trace_tx_identity = true;
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_requester_send_begin_exact(&request, 0, 1, 1000000, &second),
 		RESOURCE_X_INTENT_NOT_DUE);
+	UT_ASSERT_EQ(requester_gate_count, 1);
+	UT_ASSERT_EQ(requester_gate_last.reason, CLWAIT_SEND_PHYSICAL_OWNER);
+	UT_ASSERT_EQ(requester_gate_last.site, CLWAIT_REQUESTER_BEGIN);
+	UT_ASSERT_EQ(requester_gate_last.episode, first.send_episode);
+	UT_ASSERT_EQ(requester_gate_last.pending, 1);
+	UT_ASSERT_EQ(requester_gate_last.r4, 77);
+	UT_ASSERT_EQ(requester_gate_last.binding, first.body.owner_generation);
+	UT_ASSERT_EQ(requester_gate_last.request_seq, request.common.assertion_sequence);
+	UT_ASSERT_EQ(requester_gate_last.requester_connection, 51);
+	UT_ASSERT(BufferTagsEqual(&requester_gate_tag, &tag));
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
 					 &assertion, 0, 17, 31, 77, 51, 61, 9000000, 8900000, 1000000, 10000, false, 0,
 					 &retry, &terminal),
 				 RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
+	UT_ASSERT_EQ(requester_gate_count, 2);
+	UT_ASSERT_EQ(requester_gate_last.site, CLWAIT_REQUESTER_ROUND);
 	UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_complete_exact(&first, true, 1000001));
 	UT_ASSERT(!cluster_pcm_lock_resource_x_requester_send_complete_exact(&first, true, 1000002));
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_requester_send_begin_exact(&request, 0, 1, 1500000, &second),
 		RESOURCE_X_INTENT_NOT_DUE);
+	UT_ASSERT_EQ(requester_gate_count, 3);
+	UT_ASSERT_EQ(requester_gate_last.reason, CLWAIT_SEND_RETRY_AGE);
+	UT_ASSERT_EQ(requester_gate_last.completed_us, 1000001);
+	UT_ASSERT_EQ(requester_gate_last.observed_us, 1500000);
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_requester_send_begin_exact(&request, 0, 1, 1500001, &second),
 		RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT_EQ(requester_gate_count, 3); /* No new callback on transport handoff. */
+	cluster_trace_tx_identity = false;
 	UT_ASSERT_EQ(second.logical_generation, first.logical_generation);
 	UT_ASSERT_EQ(second.send_episode, first.send_episode + 1);
 	UT_ASSERT(cluster_pcm_rx_stats_snapshot(&stats));
@@ -23955,17 +23990,28 @@ UT_TEST(test_requester_transport_owner_bounds_both_dispatch_roots)
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_requester_send_begin_exact(&request, 0, 1, 110, &first),
 		RESOURCE_X_INTENT_STAGED);
+	requester_gate_count = 0;
+	cluster_trace_tx_identity = true;
 	fake_pcm_clock_us = 1000000;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_dispatch_exact(&fixture.delivery, &retry),
 				 RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(requester_gate_count, 1);
+	UT_ASSERT_EQ(requester_gate_last.reason, CLWAIT_SEND_PHYSICAL_OWNER);
+	UT_ASSERT_EQ(requester_gate_last.site, CLWAIT_REQUESTER_RECHECK);
 	UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_complete_exact(&first, true, 1000000));
 	fake_pcm_clock_us = 1499999;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_dispatch_exact(&fixture.delivery, &retry),
 				 RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(requester_gate_count, 2);
+	UT_ASSERT_EQ(requester_gate_last.reason, CLWAIT_SEND_RETRY_AGE);
+	UT_ASSERT_EQ(requester_gate_last.completed_us, 1000000);
+	UT_ASSERT_EQ(requester_gate_last.observed_us, 1499999);
 	fake_pcm_clock_us = 1500000;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_dispatch_exact(&fixture.delivery, &retry),
 				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(retry.common.assertion_sequence, request.common.assertion_sequence);
+	UT_ASSERT_EQ(requester_gate_count, 2);
+	cluster_trace_tx_identity = false;
 }
 
 static void

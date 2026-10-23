@@ -72,16 +72,53 @@ cluster_wait_trace_send_gate_emit(const BufferTag *tag, const ClusterWaitSendGat
 }
 
 void
+cluster_wait_trace_requester_gate_emit(const ClusterWaitRequesterGate *gate)
+{
+	uint32 *count = &wait_counts[CLWAIT_PCM_REQUESTER_GATE];
+	uint64 snapshot;
+	if (!cluster_trace_tx_identity || gate == NULL || !gate->known)
+		return;
+	snapshot = cluster_wait_trace_begin(CLWAIT_PCM_REQUESTER_GATE);
+	if (snapshot == 0)
+		return;
+	if ((*count)++ == CLUSTER_WAIT_TRACE_LIMIT) {
+		write_stderr("WAIT_RESOURCE event=LIMIT family=PCM_REQUESTER_GATE actor_node=%d "
+			"pid=%d limit=%u evidence_complete=0\n",
+			cluster_node_id, MyProcPid, CLUSTER_WAIT_TRACE_LIMIT);
+		return;
+	}
+	/* A rejected caller may still owe unrelated transport cleanup. No PG ERROR. */
+	write_stderr("WAIT_RESOURCE event=PCM_REQUESTER_GATE actor_node=%d pid=%d proc=%u "
+		"snapshot=" UINT64_FORMAT " master_view=0 tag_known=1 spc=%u db=%u rel=%u fork=%d block=%u "
+		"requester_gate_known=1 requester_site=%d requester_reason=%d "
+		"binding=" UINT64_FORMAT " formation=" UINT64_FORMAT " master_session=" UINT64_FORMAT " "
+		"r4=" UINT64_FORMAT " request_seq=" UINT64_FORMAT " base=" UINT64_FORMAT " authority=" UINT64_FORMAT " "
+		"requester=%d expected_master=%d phase=%d kind=%d send_kind=%d pending=%u "
+		"episode=" UINT64_FORMAT " requester_conn=%u ingress_conn=%u "
+		"observed_us=" UINT64_FORMAT " completed_us=" UINT64_FORMAT " response_us=" UINT64_FORMAT " "
+		"sent_us=" UINT64_FORMAT " last_dispatch_us=" UINT64_FORMAT " retry_slice_us=" UINT64_FORMAT "\n",
+		cluster_node_id, MyProcPid, MyProc != NULL ? MyProc->pgprocno : UINT32_MAX,
+		snapshot, gate->tag.spcOid, gate->tag.dbOid, gate->tag.relNumber,
+		gate->tag.forkNum, gate->tag.blockNum, gate->site, gate->reason,
+		gate->binding, gate->formation, gate->master_session, gate->r4,
+		gate->request_seq, gate->base, gate->authority, gate->requester, gate->master,
+		gate->phase, gate->kind, gate->send_kind, gate->pending, gate->episode,
+		gate->requester_connection, gate->master_ingress, gate->observed_us,
+		gate->completed_us, gate->response_us, gate->sent_us,
+		gate->last_dispatch_us, gate->retry_slice_us);
+}
+
+void
 cluster_wait_trace_emit(ClusterWaitTraceKind kind, const ClusterWaitTrace *row)
 {
 	static const char *const names[CLWAIT_NKINDS] = {
 		"PCM_WAIT", "PCM_QUEUE", "PCM_ADMISSION", "TX_BUFFER", "TX_LEDGER", "TX_SUMMARY", "PCM_GUARD",
-		"PCM_SEND_GATE"
+		"PCM_SEND_GATE", "PCM_REQUESTER_GATE"
 	};
 	uint32 *count;
 
 	if (!cluster_trace_tx_identity || row == NULL || kind < 0 || kind >= CLWAIT_NKINDS
-		|| kind == CLWAIT_PCM_SEND_GATE)
+		|| kind == CLWAIT_PCM_SEND_GATE || kind == CLWAIT_PCM_REQUESTER_GATE)
 		return;
 	count = &wait_counts[kind];
 	if (*count > CLUSTER_WAIT_TRACE_LIMIT)

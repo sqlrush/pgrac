@@ -13752,6 +13752,45 @@ pcm_resource_x_delivery_claim_exact_locked(const struct GrdEntry *entry,
 
 /* Both dispatchers and final enqueue share this predicate. An outstanding
  * physical owner never expires into a second copy of its request. */
+static void
+pcm_resource_x_requester_gate_capture_locked(const struct GrdEntry *entry,
+										   uint8 kind, uint64 now_us, int site,
+										   ClusterWaitRequesterGate *gate)
+{
+	const ClusterPcmResourceXBootstrapRound *round = &entry->resource_x_bootstrap_round;
+	const ClusterPcmResourceXRequesterSend *send = &round->send;
+	const ResourceXDecodedCommon *common = kind == RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP
+		? &round->request : &round->assertion;
+	memset(gate, 0, sizeof(*gate));
+	gate->tag = round->request.logical_assertion.resource;
+	gate->binding = entry->binding_generation;
+	gate->formation = round->resource_formation;
+	gate->master_session = round->master_session_incarnation;
+	gate->r4 = round->r4_record_generation;
+	gate->request_seq = round->request.assertion_sequence;
+	gate->base = common->base_authority_generation;
+	gate->authority = send->authority_generation;
+	gate->observed_us = now_us;
+	gate->episode = send->episode;
+	gate->completed_us = send->completed_us;
+	gate->response_us = send->response_us;
+	gate->sent_us = send->sent_us;
+	gate->last_dispatch_us = round->last_dispatch_us;
+	gate->retry_slice_us = round->retry_slice_us;
+	gate->pending = send->pending;
+	gate->requester_connection = round->requester_sender_connection_generation;
+	gate->master_ingress = round->master_ingress_connection_generation;
+	gate->requester = round->request.logical_assertion.requester_node;
+	gate->master = round->current_master_node;
+	gate->phase = round->phase;
+	gate->kind = kind;
+	gate->send_kind = send->kind;
+	gate->reason = now_us == 0 || now_us == UINT64_MAX ? CLWAIT_SEND_CLOCK
+		: send->pending != 0 ? CLWAIT_SEND_PHYSICAL_OWNER : CLWAIT_SEND_RETRY_AGE;
+	gate->site = site;
+	gate->known = true;
+}
+
 static bool
 pcm_resource_x_requester_send_due_locked(const ClusterPcmResourceXBootstrapRound *round, uint8 kind,
 										 uint64 now_us)
@@ -13777,6 +13816,8 @@ cluster_pcm_lock_resource_x_requester_send_begin_exact(const ResourceXDecodedFra
 	const ResourceXDecodedCommon *expected;
 	ResourceXIntentResult result = RESOURCE_X_INTENT_STALE;
 	uint64 previous_send;
+	ClusterWaitRequesterGate rejected;
+	bool report_rejected = false;
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
 	if (frame == NULL || out == NULL || frame_count == 0 || frame_count > 2 || master < 0
@@ -13807,6 +13848,11 @@ cluster_pcm_lock_resource_x_requester_send_begin_exact(const ResourceXDecodedFra
 		|| !cluster_pcm_lock_resource_x_gate_open_exact(round->resource_formation))
 		goto done;
 	if (!pcm_resource_x_requester_send_due_locked(round, frame->kind, now_us)) {
+		if (cluster_trace_tx_identity) {
+			pcm_resource_x_requester_gate_capture_locked(er.entry, frame->kind, now_us,
+				CLWAIT_REQUESTER_BEGIN, &rejected);
+			report_rejected = true;
+		}
 		result = RESOURCE_X_INTENT_NOT_DUE;
 		goto done;
 	}
@@ -13841,6 +13887,8 @@ cluster_pcm_lock_resource_x_requester_send_begin_exact(const ResourceXDecodedFra
 done:
 	LWLockRelease(&er.entry->entry_lock.lock);
 	pcm_entry_ref_release(&er);
+	if (report_rejected)
+		cluster_wait_trace_requester_gate_emit(&rejected);
 	return result;
 }
 
@@ -13936,6 +13984,9 @@ cluster_pcm_lock_resource_x_delivery_dispatch_exact(const ResourceXDeliveryClaim
 	const ClusterPcmResourceXBootstrapRound *round;
 	ClusterPcmResourceXMasterState *state;
 	ResourceXRequesterJoinSnapshot join;
+	ClusterWaitRequesterGate rejected;
+	uint64 rejected_at;
+	bool report_rejected = false;
 
 	if (dispatch_out != NULL)
 		memset(dispatch_out, 0, sizeof(*dispatch_out));
@@ -13965,9 +14016,16 @@ cluster_pcm_lock_resource_x_delivery_dispatch_exact(const ResourceXDeliveryClaim
 				 round->phase == RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED
 					 ? RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP
 					 : RESOURCE_X_WIRE_ASSERT_X,
-				 pcm_resource_x_monotonic_us()))
+				 (rejected_at = pcm_resource_x_monotonic_us()))) {
+		if (cluster_trace_tx_identity) {
+			pcm_resource_x_requester_gate_capture_locked(entry_ref.entry,
+				round->phase == RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED
+					? RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP : RESOURCE_X_WIRE_ASSERT_X,
+				rejected_at, CLWAIT_REQUESTER_RECHECK, &rejected);
+			report_rejected = true;
+		}
 		result = RESOURCE_X_APPLY_BAD_STATE;
-	else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED) {
+	} else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED) {
 		pcm_resource_x_bootstrap_round_dispatch_snapshot(round, dispatch_out);
 		result = RESOURCE_X_APPLY_APPLIED;
 	} else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED) {
@@ -13979,6 +14037,8 @@ cluster_pcm_lock_resource_x_delivery_dispatch_exact(const ResourceXDeliveryClaim
 					 : RESOURCE_X_APPLY_BAD_STATE;
 	LWLockRelease(&entry_ref.entry->entry_lock.lock);
 	pcm_entry_ref_release(&entry_ref);
+	if (report_rejected)
+		cluster_wait_trace_requester_gate_emit(&rejected);
 	return result;
 }
 
@@ -14944,6 +15004,8 @@ pcm_resource_x_bootstrap_round_step_internal(
 	bool broadcast = false;
 	bool diagnostic_identity_match = false;
 	ResourceXApplyResult caller_history;
+	ClusterWaitRequesterGate rejected;
+	bool report_rejected = false;
 	ClusterKoCurrentAdmissionV3 object_admission;
 	RelFileLocator locator;
 	bool check_object;
@@ -15268,6 +15330,14 @@ pcm_resource_x_bootstrap_round_step_internal(
 					   ? RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP
 					   : RESOURCE_X_WIRE_ASSERT_X,
 				   now_us)) {
+		if (cluster_trace_tx_identity) {
+			pcm_resource_x_requester_gate_capture_locked(entry,
+				round->phase == RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED
+					|| pcm_resource_x_round_image_bound(round)
+					? RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP : RESOURCE_X_WIRE_ASSERT_X,
+				now_us, CLWAIT_REQUESTER_ROUND, &rejected);
+			report_rejected = true;
+		}
 		action = RESOURCE_X_BOOTSTRAP_ROUND_WAIT;
 	} else if (now_us - round->last_dispatch_us < round->retry_slice_us) {
 		action = RESOURCE_X_BOOTSTRAP_ROUND_WAIT;
@@ -15322,6 +15392,8 @@ round_step_done:
 	}
 	LWLockRelease(&entry->entry_lock.lock);
 	pcm_entry_ref_release(&entry_ref);
+	if (report_rejected)
+		cluster_wait_trace_requester_gate_emit(&rejected);
 	if (action == RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED)
 		ereport(
 			LOG,
