@@ -447,6 +447,13 @@ extern bool cluster_recovery_ctrc_tt_reference_graph_node_v2(
 	const ClusterRecoveryCTRCTTReferenceV2 *reference,
 	ClusterRecoveryCTRCGraphNodeV2 *out);
 
+/* Expose one dormant native BIND reference as a borrowed kind-1 graph node.
+ * The fixed BIND atom/key shape is rechecked before publication; no graph,
+ * owner, terminal/base/floor/issued, durability, release or live authority. */
+extern bool cluster_recovery_ctrc_bind_graph_node_v2(
+	const ClusterRecoveryCTRCBindReferenceV2 *reference,
+	ClusterRecoveryCTRCGraphNodeV2 *out);
+
 /* Expose a complete DATA inventory as borrowed kind-1 graph reference nodes.
  * The shared atom envelope, key lengths/identity bytes and physical slot
  * ordinals are rechecked before publishing the whole fixed descriptor array.

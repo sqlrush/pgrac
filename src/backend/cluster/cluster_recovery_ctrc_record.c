@@ -807,6 +807,45 @@ refused:
 }
 
 bool
+cluster_recovery_ctrc_bind_graph_node_v2(
+	const ClusterRecoveryCTRCBindReferenceV2 *reference,
+	ClusterRecoveryCTRCGraphNodeV2 *out)
+{
+	ClusterRecoveryCTRCGraphNodeV2 node;
+	const uint8 *atom;
+
+	if (reference == NULL || out == NULL
+		|| cluster_undo_tt_ctrc_get_u16_le(reference->key + 34) != 3
+		|| cluster_undo_tt_ctrc_get_u64_le(reference->key + 36) != 56
+		|| cluster_undo_tt_ctrc_get_u32_le(reference->key + 64)
+			!= CLUSTER_RECOVERY_CTRC_BIND_RAW_BYTES
+		|| cluster_undo_tt_ctrc_get_u64_le(reference->key + 100) != 42
+		|| cluster_undo_tt_ctrc_get_u64_le(reference->evidence) != 1
+		|| cluster_undo_tt_ctrc_get_u64_le(reference->evidence + 8)
+			!= CLUSTER_RECOVERY_CTRC_BIND_ATOM_BYTES)
+		goto refused;
+	atom = reference->evidence + 16;
+	if (cluster_undo_tt_ctrc_get_u16_le(atom) != 1
+		|| cluster_undo_tt_ctrc_get_u64_le(atom + 2) != 56
+		|| cluster_undo_tt_ctrc_get_u64_le(atom + 66)
+			!= CLUSTER_RECOVERY_CTRC_BIND_RAW_BYTES
+		|| memcmp(atom + 10, reference->key + 44, 56) != 0)
+		goto refused;
+	node = (ClusterRecoveryCTRCGraphNodeV2){
+		1,
+		{ reference->key, sizeof(reference->key) },
+		{ reference->evidence, sizeof(reference->evidence) }
+	};
+	memcpy(out, &node, sizeof(node));
+	return true;
+
+refused:
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return false;
+}
+
+bool
 cluster_recovery_ctrc_bind_reference_v2(XLogReaderState *reader,
 										  uint64 database_incarnation, uint32 source_index,
 										  const uint8 source_identity_digest[32],

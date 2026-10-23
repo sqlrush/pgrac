@@ -3408,6 +3408,47 @@ UT_TEST(bind_immutable_unaligned_and_aliases)
 	XLogReaderFree(reader);
 }
 
+UT_TEST(bind_graph_node_is_structural_and_atomic)
+{
+	xl_undo_tt_slot_bind bind = bind_sample();
+	NativeRaw wire;
+	NativePages pages;
+	XLogReaderState *reader;
+	ClusterRecoveryCTRCBindReferenceV2 reference, saved;
+	ClusterRecoveryCTRCGraphNodeV2 node;
+	uint8 guarded[sizeof(node) + 2];
+
+	bind_wire(&wire, &bind);
+	UT_ASSERT(native_read(&pages, &wire, 58, false, &reader));
+	UT_ASSERT(cluster_recovery_ctrc_bind_reference_v2(reader, 99, 7, raw_source,
+		wire.bytes, 58, &reference));
+	saved = reference;
+	UT_ASSERT(cluster_recovery_ctrc_bind_graph_node_v2(&reference, &node));
+	UT_ASSERT_EQ(node.kind, 1);
+	UT_ASSERT(node.key.data == reference.key);
+	UT_ASSERT_EQ(node.key.length, sizeof(reference.key));
+	UT_ASSERT(node.evidence.data == reference.evidence);
+	UT_ASSERT_EQ(node.evidence.length, sizeof(reference.evidence));
+	UT_ASSERT(memcmp(&reference, &saved, sizeof(reference)) == 0);
+
+	for (unsigned mutation = 0; mutation < 3; mutation++) {
+		ClusterRecoveryCTRCBindReferenceV2 copy = saved;
+
+		if (mutation == 0)
+			wal_atom_uint(copy.key + 100, 41, 8);
+		else if (mutation == 1)
+			wal_atom_uint(copy.evidence + 8, 1, 8);
+		else
+			copy.evidence[16 + 10] ^= 1;
+		memset(guarded, 0xa5, sizeof(guarded));
+		UT_ASSERT(!cluster_recovery_ctrc_bind_graph_node_v2(&copy,
+			(ClusterRecoveryCTRCGraphNodeV2 *)(guarded + 1)));
+		UT_ASSERT(all_zero(guarded + 1, sizeof(guarded) - 2));
+		UT_ASSERT(guarded[0] == 0xa5 && guarded[sizeof(guarded) - 1] == 0xa5);
+	}
+	XLogReaderFree(reader);
+}
+
 UT_TEST(bind_native_boundary_identities)
 {
 	for (unsigned i = 0; i < 2; i++) {
@@ -5934,6 +5975,7 @@ main(void)
 	UT_RUN(bind_current_reader_and_bounds);
 	UT_RUN(bind_exact_native_frame);
 	UT_RUN(bind_immutable_unaligned_and_aliases);
+	UT_RUN(bind_graph_node_is_structural_and_atomic);
 	UT_RUN(bind_native_boundary_identities);
 	UT_RUN(bind_header_xid_is_evidence_not_inventory);
 	UT_RUN(tt_canonical_generation_bearing_payloads);
