@@ -435,6 +435,17 @@ extern bool cluster_recovery_ctrc_raw_evidence_v2(const ClusterRecoveryCTRCGraph
 extern bool cluster_recovery_ctrc_witness_ids_v2(const ClusterRecoveryCTRCGraphBytesV2 *atoms,
 	size_t atom_count, uint8 *out, size_t out_capacity, size_t *out_length);
 
+/* Read one complete canonical raw_evidence_v2 vector and encode its nonempty
+ * witness-id list. Reject noncanonical order, duplicates, conflicting bytes
+ * for one identity and trailing input; this consumer does not normalize them.
+ * Input is immutable for this call; unaligned bytes and input/output overlap
+ * are supported, while out_length must be disjoint. Publish only after all
+ * input is consumed. Refusal clears at most the first eight output bytes and
+ * sets out_length to zero. Structural decoding supplies no owner predicate,
+ * graph completeness, source qualification, durability or release authority. */
+extern bool cluster_recovery_ctrc_witness_ids_from_evidence_v2(const uint8 *evidence,
+	size_t evidence_length, uint8 *out, size_t out_capacity, size_t *out_length);
+
 typedef struct ClusterRecoveryCTRCGraphNodeV2 {
 	uint16 kind; /* 1 reference/history, 2 original-owner proof */
 	ClusterRecoveryCTRCGraphBytesV2 key;
