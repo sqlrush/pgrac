@@ -9602,6 +9602,8 @@ test_cluster_vacuum_proof_unlock_tail.inc: $(top_srcdir)/src/backend/storage/buf
 	mv $@.tmp $@
 
 test_cluster_vacuum_proof_cleanup: test_cluster_vacuum_proof_cleanup.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
+		$(top_srcdir)/src/include/commands/vacuum.h \
 		test_cluster_vacuum_proof_cleanup.inc test_cluster_vacuum_proof_guard.inc \
 		test_cluster_vacuum_proof_cleanout.inc \
 		test_cluster_vacuum_proof_release.inc test_cluster_vacuum_proof_unlock_tail.inc \
@@ -9625,6 +9627,7 @@ test_cluster_vacuum_freeze_locators.inc: $(top_srcdir)/src/backend/cluster/clust
 	mv $@.tmp $@
 
 test_cluster_vacuum_shared_mx: test_cluster_vacuum_shared_mx.c test_cluster_heap_maintenance_policy.inc unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
 		$(srcdir)/cluster_vacuum_mx_test_stubs.h test_cluster_vacuum_shared_mx.inc test_cluster_vacuum_freeze_locators.inc \
 		$(top_srcdir)/src/include/cluster/cluster_scn.h test_cluster_heap_small_scn.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_heap_freeze.c \

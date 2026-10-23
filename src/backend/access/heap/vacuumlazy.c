@@ -176,6 +176,10 @@ typedef struct LVRelState
 	ClusterHeapFreezePageBatchV1 shared_freeze_batch;
 	ClusterHeapFreezeProofBatchV1 shared_freeze_proofs;
 	ClusterHeapFreezeFinalFenceV1 shared_freeze_fence;
+	/* Same-admission observations only; not a positive F/H certificate. */
+	ClusterHeapFreezeCohortObservation shared_freeze_cohort;
+	FullTransactionId shared_freeze_candidate_limit_full;
+	bool		shared_freeze_cohort_observed;
 	ClusterHeapFreezeProofStatusV1 shared_freeze_apply_status;
 	bool		shared_freeze_input_captured;
 	bool		shared_freeze_input_valid;
@@ -1022,6 +1026,9 @@ lazy_scan_heap(LVRelState *vacrel)
 		vacrel->shared_freeze_input_valid = false;
 		vacrel->shared_freeze_proofs.proof_count = 0;
 		vacrel->shared_freeze_fence_valid = false;
+		vacrel->shared_freeze_cohort_observed = false;
+		vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
+		memset(&vacrel->shared_freeze_cohort, 0, sizeof(vacrel->shared_freeze_cohort));
 		vacrel->shared_freeze_apply_status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
 #endif
 		if (blkno == next_unskippable_block)
@@ -1534,6 +1541,9 @@ lazy_scan_shared_mx(LVRelState *vacrel, Page page, BlockNumber blkno)
 	vacrel->shared_freeze_input_valid = false;
 	vacrel->shared_freeze_proofs.proof_count = 0;
 	vacrel->shared_freeze_fence_valid = false;
+	vacrel->shared_freeze_cohort_observed = false;
+	vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
+	memset(&vacrel->shared_freeze_cohort, 0, sizeof(vacrel->shared_freeze_cohort));
 	vacrel->shared_freeze_apply_status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
 	if (!vacrel->versioned || !cluster_peer_mode_enabled())
 		return false;
@@ -1573,6 +1583,9 @@ lazy_validate_shared_freeze(LVRelState *vacrel, Page page, BlockNumber blkno)
 			vacrel->shared_freeze_input_valid = false;
 			vacrel->shared_freeze_proofs.proof_count = 0;
 			vacrel->shared_freeze_fence_valid = false;
+			vacrel->shared_freeze_cohort_observed = false;
+			vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
+			memset(&vacrel->shared_freeze_cohort, 0, sizeof(vacrel->shared_freeze_cohort));
 			vacrel->shared_freeze_apply_status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
 			vacrel->shared_freeze_changed_pages++;
 			break;
@@ -1818,6 +1831,9 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 	memset(&authority_before, 0, sizeof(authority_before));
 	if (vacrel != NULL)
 	{
+		vacrel->shared_freeze_cohort_observed = false;
+		vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
+		memset(&vacrel->shared_freeze_cohort, 0, sizeof(vacrel->shared_freeze_cohort));
 		for (uint16 index = 0;
 			 index < Min(vacrel->shared_freeze_batch.tuple_count, MaxHeapTuplesPerPage); index++)
 		{
@@ -1883,8 +1899,45 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 		status = lazy_recheck_shared_freeze_page(vacrel, recent_buffer,
 													 &authority_before, &admission,
 													 &proofs, &current_fence, &cleaned);
-		/* Inner cleanup has released the local content lock and pin. This is
-		 * only a physical association, never permission to freeze a row. */
+		/* Inner cleanup has released the local content lock and pin. Match a
+		 * bounded, read-only cohort observation to this original admission and
+		 * the retained policy bound. Neither grants a positive F/H certificate:
+		 * producer protection/provenance must close before any freeze apply. */
+		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN && !cleaned
+			&& FullTransactionIdIsValid(vacrel->cutoffs.SharedFreezeLimitFull)
+			&& U64FromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull) != UINT64_MAX
+			&& TransactionIdIsNormal(XidFromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull))
+			&& XidFromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull)
+			== vacrel->cutoffs.FreezeLimit)
+		{
+			ClusterHeapFreezeCohortObservation cohort;
+			ClusterHeapFreezeCohortStatus cohort_status;
+
+			memset(&cohort, 0, sizeof(cohort));
+			cohort_status = cluster_heap_freeze_cohort_observe(&cohort);
+			if (!cluster_semantic_activation_recheck_r4_terminal_census(&admission))
+				status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
+			else if (cohort_status == CLUSTER_HEAP_FREEZE_COHORT_READY
+					 && cohort.record_generation == admission.record_generation
+					 && cohort.formation_epoch == admission.formation_epoch
+					 && SCN_VALID(cohort.horizon_scn) && cohort.horizon_scn != UINT64_MAX
+					 && TransactionIdIsNormal((TransactionId) cohort.active_full_xid_min)
+					 && TransactionIdIsNormal((TransactionId) cohort.future_full_xid_max)
+					 && cohort.future_full_xid_max != UINT64_MAX
+					 && cohort.active_full_xid_min <= cohort.future_full_xid_max
+					 && cluster_node_id >= 0 && cluster_node_id < 128
+					 && ((cluster_node_id < 64
+						  ? cohort.admitted_members_lo >> cluster_node_id
+						  : cohort.admitted_members_hi >> (cluster_node_id - 64)) & 1) != 0)
+			{
+				vacrel->shared_freeze_cohort = cohort;
+				vacrel->shared_freeze_candidate_limit_full = FullTransactionIdFromU64(
+					Min(U64FromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull),
+						cohort.active_full_xid_min));
+				vacrel->shared_freeze_cohort_observed = true;
+			}
+		}
+		/* This remains only a physical association, never row-freeze permission. */
 		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN && !cleaned)
 			(void) cluster_heap_freeze_bind_creation_targets_v1(
 				&vacrel->shared_freeze_batch, &proofs, &current_fence);
@@ -1912,6 +1965,9 @@ done:
 	{
 		vacrel->shared_freeze_proofs.proof_count = 0;
 		vacrel->shared_freeze_fence_valid = false;
+		vacrel->shared_freeze_cohort_observed = false;
+		vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
+		memset(&vacrel->shared_freeze_cohort, 0, sizeof(vacrel->shared_freeze_cohort));
 	}
 	return status;
 }
@@ -1943,6 +1999,9 @@ lazy_prepare_shared_freeze(LVRelState *vacrel, Buffer recent_buffer, Buffer *vmb
 	vacrel->shared_xmax_deferred_tuples += vacrel->shared_freeze_batch.unproven_xmax_tuples;
 	vacrel->shared_freeze_proofs.proof_count = 0;
 	vacrel->shared_freeze_fence_valid = false;
+	vacrel->shared_freeze_cohort_observed = false;
+	vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
+	memset(&vacrel->shared_freeze_cohort, 0, sizeof(vacrel->shared_freeze_cohort));
 	vacrel->shared_freeze_apply_status = lazy_collect_shared_freeze_proofs(vacrel, recent_buffer);
 	vacrel->shared_freeze_input_valid = true;
 }

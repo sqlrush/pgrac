@@ -29,6 +29,7 @@
 #include "access/xlog.h"
 #include "catalog/pg_control.h"
 #include "cluster/cluster_heap_freeze.h"
+#include "cluster/cluster_heap_horizon.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_space_storage.h"
 #include "commands/progress.h"

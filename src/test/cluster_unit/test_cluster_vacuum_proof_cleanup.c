@@ -16,6 +16,8 @@
 #include "postgres.h"
 
 #include "cluster/cluster_heap_freeze.h"
+#include "cluster/cluster_heap_horizon.h"
+#include "commands/vacuum.h"
 #include "cluster/cluster_itl_cleanout.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_semantic_activation.h"
@@ -49,6 +51,10 @@ typedef struct LVRelState
 	ClusterHeapFreezePageBatchV1 shared_freeze_batch;
 	ClusterHeapFreezeProofBatchV1 shared_freeze_proofs;
 	ClusterHeapFreezeFinalFenceV1 shared_freeze_fence;
+	ClusterHeapFreezeCohortObservation shared_freeze_cohort;
+	FullTransactionId shared_freeze_candidate_limit_full;
+	bool shared_freeze_cohort_observed;
+	struct VacuumCutoffs cutoffs;
 	bool shared_freeze_fence_valid;
 } LVRelState;
 
@@ -81,6 +87,10 @@ static ClusterSpaceHintResult hint_result;
 static bool error_hint_begin, mismatch_requested_locator;
 static ClusterTxOutcome slot_outcomes[CLUSTER_ITL_INITRANS_DEFAULT];
 static SCN slot_scns[CLUSTER_ITL_INITRANS_DEFAULT];
+static ClusterHeapFreezeCohortObservation cohort_value;
+static ClusterHeapFreezeCohortStatus cohort_status;
+static unsigned cohort_calls, bindings_at_cohort;
+static bool error_cohort, revoke_cohort;
 
 static void
 note_cleanup(char event)
@@ -207,6 +217,7 @@ cluster_semantic_activation_enter_r4_terminal_census(ClusterSemanticAdmissionTok
 	if (debt != 0)
 		abort();
 	token->record_generation = 17;
+	token->formation_epoch = 9;
 	token->side = CLUSTER_SEMANTIC_TARGET_SIDE;
 	token->entered = true;
 	debt++;
@@ -499,6 +510,22 @@ cluster_heap_freeze_bind_creation_targets_v1(ClusterHeapFreezePageBatchV1 *page,
 	return 0;
 }
 
+ClusterHeapFreezeCohortStatus
+cluster_heap_freeze_cohort_observe(ClusterHeapFreezeCohortObservation *out)
+{
+	if (guard_held || pin_held || content_locked || debt != 1)
+		abort();
+	cohort_calls++;
+	bindings_at_cohort = target_bindings;
+	if (revoke_cohort)
+		changed_admission = true;
+	if (error_cohort)
+		throw_error();
+	if (cohort_status == CLUSTER_HEAP_FREEZE_COHORT_READY)
+		*out = cohort_value;
+	return cohort_status;
+}
+
 #include "test_cluster_vacuum_proof_cleanup.inc"
 
 static void
@@ -537,6 +564,17 @@ reset_fixture(void)
 	vacrel.shared_freeze_batch.tuple_count = 1;
 	vacrel.shared_freeze_batch.tuples[0].creation_target_proof_index = 0;
 	target_bindings = 0;
+	memset(&cohort_value, 0, sizeof(cohort_value));
+	cohort_value.future_full_xid_max = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 1000));
+	cohort_value.requested_full_xid_max = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 1100));
+	cohort_value.active_full_xid_min = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 60));
+	cohort_value.horizon_scn = 500;
+	cohort_value.record_generation = 17;
+	cohort_value.formation_epoch = 9;
+	cohort_value.admitted_members_lo = 3;
+	cohort_status = CLUSTER_HEAP_FREEZE_COHORT_READY;
+	cohort_calls = bindings_at_cohort = 0;
+	error_cohort = revoke_cohort = false;
 	enters = leaves = debt = resolves = routes = fail_resolve = 0;
 	reject_admission = reject_route_after = unknown_outcome = false;
 	error_preflight = error_validate = guard_held = false;
@@ -1399,10 +1437,229 @@ UT_TEST(rejected_or_cleaned_collection_cannot_reuse_creation_indexes)
 	}
 }
 
+static void
+set_shared_policy(TransactionId xid)
+{
+	vacrel.cutoffs.SharedFreezeLimitFull = FullTransactionIdFromEpochAndXid(1, xid);
+	vacrel.cutoffs.FreezeLimit = xid;
+}
+
+static void
+seed_stale_cohort(void)
+{
+	vacrel.shared_freeze_cohort = cohort_value;
+	vacrel.shared_freeze_candidate_limit_full = FullTransactionIdFromEpochAndXid(8, 90);
+	vacrel.shared_freeze_cohort_observed = true;
+}
+
+static void
+check_no_cohort(void)
+{
+	ClusterHeapFreezeCohortObservation empty = {0};
+
+	UT_ASSERT(!vacrel.shared_freeze_cohort_observed);
+	UT_ASSERT(!FullTransactionIdIsValid(vacrel.shared_freeze_candidate_limit_full));
+	UT_ASSERT_EQ(memcmp(&vacrel.shared_freeze_cohort, &empty, sizeof(empty)), 0);
+}
+
+UT_TEST(cohort_observation_uses_original_admission_after_local_release)
+{
+	reset_fixture();
+	set_shared_policy(80);
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(cohort_calls, 1);
+	UT_ASSERT_EQ(bindings_at_cohort, 0);
+	UT_ASSERT_EQ(target_bindings, 1);
+	UT_ASSERT(vacrel.shared_freeze_cohort_observed);
+	UT_ASSERT_EQ(memcmp(&vacrel.shared_freeze_cohort, &cohort_value, sizeof(cohort_value)), 0);
+	UT_ASSERT_EQ(U64FromFullTransactionId(vacrel.shared_freeze_candidate_limit_full),
+		cohort_value.active_full_xid_min);
+	UT_ASSERT(vacrel.shared_freeze_fence_valid);
+	UT_ASSERT_EQ(enters, 1);
+	UT_ASSERT_EQ(leaves, 1);
+	UT_ASSERT_EQ(debt, 0);
+	UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+}
+
+UT_TEST(cohort_candidate_cannot_raise_original_full_policy_bound)
+{
+	reset_fixture();
+	set_shared_policy(40);
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(cohort_calls, 1);
+	UT_ASSERT(vacrel.shared_freeze_cohort_observed);
+	UT_ASSERT(FullTransactionIdEquals(vacrel.shared_freeze_candidate_limit_full,
+		vacrel.cutoffs.SharedFreezeLimitFull));
+}
+
+UT_TEST(cohort_refusals_clear_observation_without_rejecting_original_proof)
+{
+	for (int status = CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE;
+		 status <= CLUSTER_HEAP_FREEZE_COHORT_INVALID; status++)
+	{
+		reset_fixture();
+		set_shared_policy(80);
+		seed_stale_cohort();
+		cohort_status = (ClusterHeapFreezeCohortStatus)status;
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT_EQ(cohort_calls, 1);
+		check_no_cohort();
+		UT_ASSERT(vacrel.shared_freeze_fence_valid);
+		UT_ASSERT_EQ(target_bindings, 1);
+		UT_ASSERT_EQ(leaves, 1);
+	}
+}
+
+UT_TEST(mismatched_or_malformed_cohort_never_publishes_candidate)
+{
+	for (int variant = 0; variant < 12; variant++)
+	{
+		reset_fixture();
+		set_shared_policy(80);
+		seed_stale_cohort();
+		switch (variant) {
+		case 0: cohort_value.record_generation++; break;
+		case 1: cohort_value.formation_epoch++; break;
+		case 2: cohort_value.horizon_scn = 0; break;
+		case 3: cohort_value.horizon_scn = UINT64_MAX; break;
+		case 4: cohort_value.active_full_xid_min = 0; break;
+		case 5: cohort_value.active_full_xid_min = (UINT64CONST(1) << 32) | 1; break;
+		case 6: cohort_value.future_full_xid_max = 0; break;
+		case 7: cohort_value.future_full_xid_max = UINT64_MAX; break;
+		case 8: cohort_value.future_full_xid_max = (UINT64CONST(1) << 32) | 2; break;
+		case 9: cohort_value.active_full_xid_min = cohort_value.future_full_xid_max + 1; break;
+		case 10: cohort_value.admitted_members_lo = 0; break;
+		case 11: cohort_value.admitted_members_lo = 2; break;
+		}
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT_EQ(cohort_calls, 1);
+		check_no_cohort();
+		UT_ASSERT(vacrel.shared_freeze_fence_valid);
+		UT_ASSERT_EQ(debt, 0);
+	}
+}
+
+UT_TEST(unavailable_or_mismatched_full_policy_skips_cohort_sample)
+{
+	for (int variant = 0; variant < 4; variant++)
+	{
+		reset_fixture();
+		set_shared_policy(80);
+		seed_stale_cohort();
+		switch (variant) {
+		case 0: vacrel.cutoffs.SharedFreezeLimitFull = InvalidFullTransactionId; break;
+		case 1: vacrel.cutoffs.FreezeLimit++; break;
+		case 2: set_shared_policy(FrozenTransactionId); break;
+		case 3: vacrel.cutoffs.SharedFreezeLimitFull = FullTransactionIdFromU64(UINT64_MAX);
+			vacrel.cutoffs.FreezeLimit = MaxTransactionId; break;
+		}
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT_EQ(cohort_calls, 0);
+		check_no_cohort();
+		UT_ASSERT_EQ(target_bindings, 1);
+	}
+}
+
+UT_TEST(rejected_changed_or_cleaned_collection_retires_old_cohort)
+{
+	for (int variant = 0; variant < 5; variant++)
+	{
+		reset_fixture();
+		switch (variant) {
+		case 0: vacrel.shared_freeze_batch.carrier_request_count = 0; break;
+		case 1: reject_admission = true; break;
+		case 2: unknown_outcome = true; break;
+		case 3: page_match = CLUSTER_HEAP_FREEZE_PAGE_CHANGED; break;
+		case 4: setup_cleanout_page(); break;
+		}
+		set_shared_policy(80);
+		seed_stale_cohort();
+		(void)lazy_collect_shared_freeze_proofs(&vacrel, 1);
+		UT_ASSERT_EQ(cohort_calls, 0);
+		check_no_cohort();
+		UT_ASSERT_EQ(debt, 0);
+	}
+}
+
+UT_TEST(admission_change_during_cohort_sample_requests_retry_before_binding)
+{
+	reset_fixture();
+	set_shared_policy(80);
+	seed_stale_cohort();
+	revoke_cohort = true;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	UT_ASSERT_EQ(cohort_calls, 1);
+	check_no_cohort();
+	UT_ASSERT(!vacrel.shared_freeze_fence_valid);
+	UT_ASSERT_EQ(target_bindings, 0);
+	UT_ASSERT_EQ(vacrel.shared_freeze_batch.tuples[0].creation_target_proof_index,
+		CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET);
+	UT_ASSERT(!FullTransactionIdIsValid(vacrel.shared_freeze_batch.tuples[0].original_creator_full_xid));
+	UT_ASSERT_EQ(leaves, 1);
+	UT_ASSERT_EQ(debt, 0);
+}
+
+UT_TEST(refused_cohort_still_rechecks_original_admission)
+{
+	reset_fixture();
+	set_shared_policy(80);
+	cohort_status = CLUSTER_HEAP_FREEZE_COHORT_H_STALE;
+	revoke_cohort = true;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	UT_ASSERT_EQ(cohort_calls, 1);
+	check_no_cohort();
+	UT_ASSERT_EQ(target_bindings, 0);
+	UT_ASSERT(!vacrel.shared_freeze_fence_valid);
+	UT_ASSERT_EQ(debt, 0);
+}
+
+UT_TEST(cohort_error_leaves_original_admission_after_page_cleanup)
+{
+	reset_fixture();
+	set_shared_policy(80);
+	seed_stale_cohort();
+	error_cohort = true;
+	check_error_cleanup("LPA");
+	UT_ASSERT_EQ(cohort_calls, 1);
+	UT_ASSERT_EQ(target_bindings, 0);
+	check_no_cohort();
+}
+
+UT_TEST(cohort_cancel_preserves_error_and_allows_same_backend_reuse)
+{
+	reset_fixture();
+	set_shared_policy(80);
+	error_cohort = true;
+	inject_code = ERRCODE_QUERY_CANCELED;
+	check_error_cleanup("LPA");
+	check_no_cohort();
+	error_cohort = false;
+	UT_ASSERT(!collect_catches_error());
+	UT_ASSERT_EQ(collected_status, CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(cohort_calls, 2);
+	UT_ASSERT_EQ(enters, 2);
+	UT_ASSERT_EQ(leaves, 2);
+	UT_ASSERT_EQ(debt, 0);
+	UT_ASSERT(vacrel.shared_freeze_cohort_observed);
+}
+
+UT_TEST(next_collection_cannot_reuse_previous_cohort_on_sample_refusal)
+{
+	reset_fixture();
+	set_shared_policy(80);
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT(vacrel.shared_freeze_cohort_observed);
+	cohort_status = CLUSTER_HEAP_FREEZE_COHORT_BUSY_PUBLISH;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(cohort_calls, 2);
+	check_no_cohort();
+	UT_ASSERT_EQ(debt, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(48);
+	UT_PLAN(59);
 	UT_RUN(invalid_input_does_not_leave);
 	UT_RUN(rejected_admission_does_not_leave);
 	UT_RUN(normal_success_leaves_once);
@@ -1451,6 +1708,17 @@ main(void)
 	UT_RUN(partial_proof_cannot_stamp_a_different_requested_locator);
 	UT_RUN(creation_binding_runs_after_local_release_before_admission_leave);
 	UT_RUN(rejected_or_cleaned_collection_cannot_reuse_creation_indexes);
+	UT_RUN(cohort_observation_uses_original_admission_after_local_release);
+	UT_RUN(cohort_candidate_cannot_raise_original_full_policy_bound);
+	UT_RUN(cohort_refusals_clear_observation_without_rejecting_original_proof);
+	UT_RUN(mismatched_or_malformed_cohort_never_publishes_candidate);
+	UT_RUN(unavailable_or_mismatched_full_policy_skips_cohort_sample);
+	UT_RUN(rejected_changed_or_cleaned_collection_retires_old_cohort);
+	UT_RUN(admission_change_during_cohort_sample_requests_retry_before_binding);
+	UT_RUN(refused_cohort_still_rechecks_original_admission);
+	UT_RUN(cohort_error_leaves_original_admission_after_page_cleanup);
+	UT_RUN(cohort_cancel_preserves_error_and_allows_same_backend_reuse);
+	UT_RUN(next_collection_cannot_reuse_previous_cohort_on_sample_refusal);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
