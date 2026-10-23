@@ -444,6 +444,7 @@ cluster_wal_writer.o: $(top_srcdir)/src/include/cluster/cluster_semantic_activat
 cluster_stats.o: $(top_srcdir)/src/include/cluster/cluster_semantic_activation.h
 cluster_recovery_namespace.o: $(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h
 cluster_wal_cut.o: $(top_srcdir)/src/include/cluster/cluster_wal_cut.h \
+	$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
 	$(top_srcdir)/src/include/cluster/cluster_wal_writer.h
 cluster_pi_data.o cluster_pi_writeback.o: $(srcdir)/cluster_pi_data_wire.h \
 	$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h

@@ -11,6 +11,7 @@
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_cut.h"
 #include "miscadmin.h"
@@ -323,6 +324,11 @@ cluster_wal_cut_begin_v1(const ClusterWalSourceRef *source, ClusterWalCutV1 **ou
 	if (source == NULL || out == NULL || *out != NULL || !cut_background()
 		|| CurrentResourceOwner == NULL || cut_shared == NULL || procno < 0)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	/* Remote online cuts are a post-recovery consumer.  Do not create a
+	 * physical flush job while an EXISTING_OTHER restart is still pre-OPEN. */
+	if (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& !cluster_semantic_activation_recovered_open_current())
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	if (active_cut != NULL)
 		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
 	request.verb = CLUSTER_WAL_CUT_SAMPLE;

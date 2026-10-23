@@ -11,6 +11,7 @@
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_cut.h"
 #include "miscadmin.h"
@@ -54,6 +55,8 @@ static char shared_bytes[2][2048] pg_attribute_aligned(MAXIMUM_ALIGNOF);
 static bool shared_found[2];
 static ResourceReleaseCallback release_callback;
 static pg_on_exit_callback exit_callback;
+static ClusterNormalStartState test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+static bool test_recovered_open = true;
 
 void
 pg_re_throw(void)
@@ -126,6 +129,18 @@ bool
 cluster_reconfig_has_pending_prebump_stage(void)
 {
 	return pending;
+}
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return test_normal_start_state;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return test_recovered_open;
 }
 ClusterMembershipState
 cluster_membership_get_state(int32 node)
@@ -265,6 +280,8 @@ reset(void)
 	quorum = native_ready = true;
 	flush_ready = true;
 	stop_requested = flush_error = false;
+	test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+	test_recovered_open = true;
 	force_flushes = 0;
 	CritSectionCount = 0;
 	memset(shared_found, 0, sizeof(shared_found));
@@ -380,6 +397,23 @@ UT_TEST(fixed_remote_cut_actively_flushes_idle_original_writer)
 	UT_ASSERT_EQ(samples, 1);
 	cluster_wal_cut_release_v1(&cut);
 	UT_ASSERT(cut == NULL);
+}
+
+UT_TEST(recovered_remote_cut_requires_semantic_open)
+{
+	ClusterWalCutV1 *cut = NULL;
+
+	reset();
+	test_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	test_recovered_open = false;
+	UT_ASSERT_EQ(cluster_wal_cut_begin_v1(&sources[1], &cut),
+					 CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+	UT_ASSERT(cut == NULL);
+
+	test_recovered_open = true;
+	UT_ASSERT_EQ(cluster_wal_cut_begin_v1(&sources[1], &cut),
+					 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	cluster_wal_cut_release_v1(&cut);
 }
 
 UT_TEST(old_reply_and_other_owner_cannot_complete_new_job)
@@ -781,8 +815,9 @@ UT_TEST(completion_retry_respects_owner_gates_and_cancellation)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(fixed_remote_cut_actively_flushes_idle_original_writer);
+	UT_RUN(recovered_remote_cut_requires_semantic_open);
 	UT_RUN(old_reply_and_other_owner_cannot_complete_new_job);
 	UT_RUN(cancellation_releases_mailbox_without_inventing_completion);
 	UT_RUN(completed_cut_refuses_new_epoch_boot_or_quorum);

@@ -8489,7 +8489,9 @@ test_cluster_pi_data: test_cluster_pi_data.c unit_test.h \
 
 test_cluster_wal_cut: test_cluster_wal_cut.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_cut.c \
-		$(top_srcdir)/src/include/cluster/cluster_wal_cut.h $(CLUSTER_WAL_CLAIM_O) \
+		$(top_srcdir)/src/include/cluster/cluster_wal_cut.h \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
+		$(CLUSTER_WAL_CLAIM_O) \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_WAL_CLAIM_O) \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
