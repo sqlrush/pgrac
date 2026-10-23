@@ -5616,6 +5616,110 @@ raw_evidence_views(ClusterRecoveryCTRCGraphBytesV2 atoms[3])
 	atoms[2] = (ClusterRecoveryCTRCGraphBytesV2){raw_evidence_atom2, sizeof(raw_evidence_atom2)};
 }
 
+/* Independent struct.pack result for the complete kind/subject IDs of the
+ * three raw atoms above, without copying their bytes fields into the list. */
+static const uint8 witness_ids_golden[] = {
+	3,0,0,0,0,0,0,0,
+	11,0,0,0,0,0,0,0, 1,0, 1,0,0,0,0,0,0,0, 0xff,
+	12,0,0,0,0,0,0,0, 1,0, 2,0,0,0,0,0,0,0, 1,0,
+	11,0,0,0,0,0,0,0, 2,0, 1,0,0,0,0,0,0,0, 0
+};
+
+UT_TEST(witness_ids_canonical_raw_subjects)
+{
+	ClusterRecoveryCTRCGraphBytesV2 atoms[5];
+	uint8 out[sizeof(witness_ids_golden) + 1];
+	size_t length = 999;
+
+	raw_evidence_views(atoms);
+	atoms[3] = atoms[0];
+	atoms[4] = atoms[2];
+	memset(out, 0xa5, sizeof(out));
+	UT_ASSERT(cluster_recovery_ctrc_witness_ids_v2(atoms, 5, out, sizeof(out), &length));
+	UT_ASSERT_EQ(length, sizeof(witness_ids_golden));
+	UT_ASSERT(memcmp(out, witness_ids_golden, length) == 0 && out[length] == 0xa5);
+}
+
+static bool
+witness_ids_refused(const ClusterRecoveryCTRCGraphBytesV2 *atoms, size_t count,
+	size_t capacity)
+{
+	uint8 out[sizeof(witness_ids_golden) + 2];
+	size_t length = 999, cleared = Min(capacity, (size_t)8);
+
+	memset(out, 0xa5, sizeof(out));
+	if (cluster_recovery_ctrc_witness_ids_v2(atoms, count, out + 1, capacity, &length)
+		|| length != 0 || out[0] != 0xa5 || !all_zero(out + 1, cleared))
+		return false;
+	for (size_t i = cleared + 1; i < sizeof(out); i++)
+		if (out[i] != 0xa5)
+			return false;
+	return graph_alloc_live == 0;
+}
+
+UT_TEST(witness_ids_conflicts_empty_and_bounds)
+{
+	ClusterRecoveryCTRCGraphBytesV2 atoms[4];
+	uint8 changed[sizeof(raw_evidence_atom0)], out[sizeof(witness_ids_golden)];
+	size_t length = 999;
+
+	raw_evidence_views(atoms);
+	memcpy(changed, raw_evidence_atom0, sizeof(changed));
+	changed[sizeof(changed) - 1] ^= 1; /* Same ID, different complete raw bytes. */
+	atoms[3] = (ClusterRecoveryCTRCGraphBytesV2){ changed, sizeof(changed) };
+	UT_ASSERT(witness_ids_refused(atoms, 4, sizeof(out)));
+	changed[0] = 3; /* Completion atoms cannot masquerade as raw witnesses. */
+	UT_ASSERT(witness_ids_refused(atoms, 4, sizeof(out)));
+	UT_ASSERT(witness_ids_refused(NULL, 0, sizeof(out)));
+	UT_ASSERT(witness_ids_refused(NULL, 1, sizeof(out)));
+	UT_ASSERT(witness_ids_refused(atoms, SIZE_MAX, sizeof(out)));
+	UT_ASSERT(witness_ids_refused(atoms, 3, SIZE_MAX));
+	for (size_t capacity = 0; capacity < sizeof(out); capacity++)
+		UT_ASSERT(witness_ids_refused(atoms, 3, capacity));
+	UT_ASSERT(!cluster_recovery_ctrc_witness_ids_v2(atoms, 3, NULL, sizeof(out), &length));
+	UT_ASSERT_EQ(length, 0);
+	UT_ASSERT(!cluster_recovery_ctrc_witness_ids_v2(atoms, 3, out, sizeof(out), NULL));
+	UT_ASSERT(all_zero(out, 8));
+	/* The original raw-evidence API still supports an empty structural set. */
+	UT_ASSERT(cluster_recovery_ctrc_raw_evidence_v2(NULL, 0, out, 8, &length));
+	UT_ASSERT_EQ(length, 8);
+	UT_ASSERT(all_zero(out, 8));
+}
+
+UT_TEST(witness_ids_unaligned_aliases_and_allocation_refusal)
+{
+	ClusterRecoveryCTRCGraphBytesV2 atoms[3];
+	uint8 alias[256], metadata[sizeof(size_t) + 1];
+	size_t length = 0;
+
+	for (unsigned which = 0; which < 2; which++) {
+		raw_evidence_views(atoms);
+		memset(alias, 0xa5, sizeof(alias));
+		if (which == 0) {
+			memcpy(alias + 1, atoms, sizeof(atoms));
+		} else {
+			memcpy(alias + 1, raw_evidence_atom0, sizeof(raw_evidence_atom0));
+			atoms[0].data = alias + 1;
+		}
+		UT_ASSERT(cluster_recovery_ctrc_witness_ids_v2(which == 0
+			? (const ClusterRecoveryCTRCGraphBytesV2 *)(alias + 1) : atoms,
+			3, alias + 1, sizeof(alias) - 2, (size_t *)(metadata + 1)));
+		memcpy(&length, metadata + 1, sizeof(length));
+		UT_ASSERT_EQ(length, sizeof(witness_ids_golden));
+		UT_ASSERT(memcmp(alias + 1, witness_ids_golden, length) == 0);
+		UT_ASSERT(alias[0] == 0xa5 && alias[length + 1] == 0xa5);
+	}
+	raw_evidence_views(atoms);
+	graph_alloc_calls = 0;
+	graph_alloc_fail_at = 1;
+	UT_ASSERT(witness_ids_refused(atoms, 3, sizeof(witness_ids_golden)));
+	UT_ASSERT_EQ(graph_alloc_calls, 1);
+	graph_alloc_fail_at = 0;
+	UT_ASSERT(cluster_recovery_ctrc_witness_ids_v2(atoms, 3, alias, sizeof(alias), &length));
+	UT_ASSERT_EQ(length, sizeof(witness_ids_golden));
+	UT_ASSERT(memcmp(alias, witness_ids_golden, length) == 0 && graph_alloc_live == 0);
+}
+
 static bool
 raw_evidence_refused(const ClusterRecoveryCTRCGraphBytesV2 *atoms, size_t count, size_t capacity)
 {
@@ -5847,6 +5951,18 @@ UT_TEST(raw_evidence_original_wal_and_data_encoder_composition)
 	UT_ASSERT(cluster_undo_tt_ctrc_get_u64_le(out + 8) == sizeof(wal));
 	UT_ASSERT(cluster_undo_tt_ctrc_get_u64_le(out + 16 + sizeof(wal)) == data_length);
 	UT_ASSERT(memcmp(out + 24 + sizeof(wal), data.evidence + 16, data_length) == 0);
+	{
+		size_t wal_id_length = 10 + cluster_undo_tt_ctrc_get_u64_le(wal + 2);
+		size_t data_id_length = 10 + cluster_undo_tt_ctrc_get_u64_le(data.evidence + 18);
+
+		UT_ASSERT(cluster_recovery_ctrc_witness_ids_v2(atoms, 3, out, sizeof(out), &length));
+		UT_ASSERT_EQ(length, 24 + wal_id_length + data_id_length);
+		UT_ASSERT(cluster_undo_tt_ctrc_get_u64_le(out) == 2);
+		UT_ASSERT(cluster_undo_tt_ctrc_get_u64_le(out + 8) == wal_id_length);
+		UT_ASSERT(memcmp(out + 16, wal, wal_id_length) == 0);
+		UT_ASSERT(cluster_undo_tt_ctrc_get_u64_le(out + 16 + wal_id_length) == data_id_length);
+		UT_ASSERT(memcmp(out + 24 + wal_id_length, data.evidence + 16, data_id_length) == 0);
+	}
 	UT_ASSERT_EQ(graph_alloc_live, 0);
 }
 
@@ -6126,7 +6242,7 @@ UT_TEST(graph_reader_allocation_refusal)
 int
 main(void)
 {
-	UT_PLAN(179);
+	UT_PLAN(182);
 	UT_RUN(golden_encoding);
 	UT_RUN(golden_decoding);
 	UT_RUN(unaligned_buffers);
@@ -6291,6 +6407,9 @@ main(void)
 	UT_RUN(owner_graph_node_identity_order_and_reference_domains);
 	UT_RUN(owner_graph_node_empty_scope_and_unaligned_views);
 	UT_RUN(raw_evidence_independent_golden_and_immutable);
+	UT_RUN(witness_ids_canonical_raw_subjects);
+	UT_RUN(witness_ids_conflicts_empty_and_bounds);
+	UT_RUN(witness_ids_unaligned_aliases_and_allocation_refusal);
 	UT_RUN(raw_evidence_permutations_and_full_encoded_sort);
 	UT_RUN(raw_evidence_conflicting_subject_is_atomic);
 	UT_RUN(raw_evidence_envelope_refusals);

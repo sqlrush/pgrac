@@ -423,6 +423,18 @@ typedef struct ClusterRecoveryCTRCGraphBytesV2 {
 extern bool cluster_recovery_ctrc_raw_evidence_v2(const ClusterRecoveryCTRCGraphBytesV2 *atoms,
 	size_t atom_count, uint8 *out, size_t out_capacity, size_t *out_length);
 
+/* Encode the nonempty witness-id list used by owner completion atoms:
+ * U64(count)||concat(B(U16(raw_kind)||B(subject))). Consume the same raw
+ * kind1/2 atoms as raw_evidence_v2, with complete-byte sorting, identical
+ * duplicate collapse and conflicting bytes for the same subject rejected.
+ * This is only a structural list, not an owner completion atom or proof of
+ * source/graph membership, rule applicability, durability or release.
+ * The original owner still proves all required witnesses and predicates.
+ * Allocation, aliasing, output publication and bounded refusal follow
+ * raw_evidence_v2; empty input refuses. No live caller or new authority. */
+extern bool cluster_recovery_ctrc_witness_ids_v2(const ClusterRecoveryCTRCGraphBytesV2 *atoms,
+	size_t atom_count, uint8 *out, size_t out_capacity, size_t *out_length);
+
 typedef struct ClusterRecoveryCTRCGraphNodeV2 {
 	uint16 kind; /* 1 reference/history, 2 original-owner proof */
 	ClusterRecoveryCTRCGraphBytesV2 key;

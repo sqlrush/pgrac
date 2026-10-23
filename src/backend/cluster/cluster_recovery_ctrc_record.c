@@ -1806,15 +1806,17 @@ ctrc_raw_evidence_cmp(const void *a, const void *b)
 								&((const CTRCRawEvidenceWork *)b)->atom);
 }
 
-bool
-cluster_recovery_ctrc_raw_evidence_v2(const ClusterRecoveryCTRCGraphBytesV2 *atoms,
-	size_t atom_count, uint8 *out, size_t out_capacity, size_t *out_length)
+static bool
+ctrc_raw_evidence_encode_v2(const ClusterRecoveryCTRCGraphBytesV2 *atoms,
+	size_t atom_count, uint8 *out, size_t out_capacity, size_t *out_length,
+	bool witness_ids)
 {
 	CTRCRawEvidenceWork *work = NULL;
 	size_t scratch = 0, length = 8, unique = 0, zero = 0;
 	uint8 *next;
 
-	if (out == NULL || out_length == NULL || out_capacity < 8 || out_capacity > MaxAllocSize)
+	if (out == NULL || out_length == NULL || out_capacity < 8 || out_capacity > MaxAllocSize
+		|| (witness_ids && atom_count == 0))
 		goto refused;
 	if (atom_count != 0) {
 		if (atoms == NULL || atom_count > MaxAllocSize / sizeof(*atoms)
@@ -1867,7 +1869,8 @@ cluster_recovery_ctrc_raw_evidence_v2(const ClusterRecoveryCTRCGraphBytesV2 *ato
 					goto refused;
 			}
 			if (!ctrc_graph_size_add(&length, 1, 8)
-				|| !ctrc_graph_size_add(&length, 1, atom.atom.length))
+				|| !ctrc_graph_size_add(&length, 1,
+					witness_ids ? atom.identity_length : atom.atom.length))
 				goto refused;
 			work[unique++] = atom;
 		}
@@ -1877,8 +1880,15 @@ cluster_recovery_ctrc_raw_evidence_v2(const ClusterRecoveryCTRCGraphBytesV2 *ato
 	/* Every input has been copied and checked before the first output byte. */
 	cluster_undo_tt_ctrc_put_u64_le(out, unique);
 	next = out + 8;
-	for (size_t i = 0; i < unique; i++)
-		next = ctrc_graph_put_bytes(next, &work[i].atom);
+	for (size_t i = 0; i < unique; i++) {
+		ClusterRecoveryCTRCGraphBytesV2 bytes = work[i].atom;
+
+		/* The complete kind/subject prefix is length-delimited, so raw atom
+		 * order also orders IDs. Conflicting raw bytes were rejected above. */
+		if (witness_ids)
+			bytes.length = work[i].identity_length;
+		next = ctrc_graph_put_bytes(next, &bytes);
+	}
 	if (work != NULL)
 		pfree(work);
 	memcpy(out_length, &length, sizeof(length));
@@ -1892,6 +1902,20 @@ refused:
 	if (out_length != NULL)
 		memcpy(out_length, &zero, sizeof(zero));
 	return false;
+}
+
+bool
+cluster_recovery_ctrc_raw_evidence_v2(const ClusterRecoveryCTRCGraphBytesV2 *atoms,
+	size_t atom_count, uint8 *out, size_t out_capacity, size_t *out_length)
+{
+	return ctrc_raw_evidence_encode_v2(atoms, atom_count, out, out_capacity, out_length, false);
+}
+
+bool
+cluster_recovery_ctrc_witness_ids_v2(const ClusterRecoveryCTRCGraphBytesV2 *atoms,
+	size_t atom_count, uint8 *out, size_t out_capacity, size_t *out_length)
+{
+	return ctrc_raw_evidence_encode_v2(atoms, atom_count, out, out_capacity, out_length, true);
 }
 
 #endif
