@@ -46,6 +46,7 @@ bool cluster_enabled = true;
 bool cluster_shared_config = false;
 int cluster_node_id = 0;
 bool cluster_recmerge_window_active = false;
+BackendType MyBackendType = B_BACKEND;
 
 static ClusterSemanticAdmissionResult test_admission_result
 	= CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED;
@@ -74,6 +75,8 @@ static bool test_provider_mutates_epoch;
 static bool test_legacy_provider_local_only;
 static int test_node_count = 1;
 static uint64 test_observed[CLUSTER_R4_OBSERVATION_EVENT_COUNT];
+static ClusterNormalStartState test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+static bool test_recovered_open = true;
 
 sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
@@ -134,6 +137,18 @@ cluster_semantic_activation_enter_r4_terminal_census(ClusterSemanticAdmissionTok
 		token->entered = true;
 	}
 	return test_terminal_census_admission_result;
+}
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return test_normal_start_state;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return test_recovered_open;
 }
 
 bool
@@ -346,6 +361,9 @@ reset_exact_resolver_fixture(void)
 	cluster_shared_config = false;
 	cluster_node_id = 0;
 	cluster_recmerge_window_active = false;
+	MyBackendType = B_BACKEND;
+	test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+	test_recovered_open = true;
 	test_node_count = 1;
 	memset(test_observed, 0, sizeof(test_observed));
 }
@@ -497,6 +515,35 @@ UT_TEST(test_exact_resolver_is_dormant_and_zeroes_output)
 	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_TARGET_DISABLED);
 	UT_ASSERT(bytes_are_zero(&resolution, sizeof(resolution)));
 	UT_ASSERT_EQ(observed_total(), 0);
+}
+
+UT_TEST(test_resolver_refuses_before_target_admission_until_recovered_open)
+{
+	ClusterTxLocator locator = exact_locator();
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_NONE;
+	ClusterMultiResolution multi_resolution;
+
+	reset_exact_resolver_fixture();
+	cluster_shared_config = true;
+	test_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	test_recovered_open = false;
+	test_admission_result = CLUSTER_SEMANTIC_ADMISSION_OK;
+	memset(&resolution, 0xA5, sizeof(resolution));
+	UT_ASSERT_EQ(cluster_tx_resolve_exact(&locator, CLUSTER_TX_RESOLVE_VISIBILITY, &resolution,
+										 &reason),
+					 CLUSTER_TX_UNKNOWN);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_RF_DEFERRED);
+	UT_ASSERT(bytes_are_zero(&resolution, sizeof(resolution)));
+	UT_ASSERT_EQ(test_enter_calls, 0);
+
+	reason = CLUSTER_TX_RESOLVE_NONE;
+	memset(&multi_resolution, 0xA5, sizeof(multi_resolution));
+	UT_ASSERT_EQ(cluster_tx_resolve_multixact((MultiXactId)91, &multi_resolution, &reason),
+					 CLUSTER_TX_UNKNOWN);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_RF_DEFERRED);
+	UT_ASSERT(bytes_are_zero(&multi_resolution, sizeof(multi_resolution)));
+	UT_ASSERT_EQ(test_enter_calls, 0);
 }
 
 UT_TEST(test_exact_resolver_binds_exact_origin_provider_and_publishes_only_after_recheck)
@@ -1587,7 +1634,7 @@ UT_TEST(test_terminal_census_batch_preflight_delegates_exit_hook_ensure)
 int
 main(void)
 {
-	UT_PLAN(67);
+	UT_PLAN(68);
 	UT_RUN(test_shared_row_wait_uses_current_origin_at_nonzero_epoch);
 	UT_RUN(test_shared_row_wait_rejects_canonical_identity_and_admission_drift);
 	UT_RUN(test_shared_row_wait_unknown_does_not_fall_back_to_legacy_provider);
@@ -1598,6 +1645,7 @@ main(void)
 	UT_RUN(test_frozen_closed_domains);
 	UT_RUN(test_reason_names_are_stable);
 	UT_RUN(test_exact_resolver_is_dormant_and_zeroes_output);
+	UT_RUN(test_resolver_refuses_before_target_admission_until_recovered_open);
 	UT_RUN(test_exact_resolver_binds_exact_origin_provider_and_publishes_only_after_recheck);
 	UT_RUN(test_exact_resolver_observes_each_positive_outcome_once);
 	UT_RUN(test_exact_resolver_rejects_mismatched_locator_echo);
