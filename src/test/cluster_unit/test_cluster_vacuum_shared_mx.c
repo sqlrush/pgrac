@@ -2572,6 +2572,29 @@ UT_TEST(xmin_plan_rejects_special_raw_fullxids_and_legacy_xmin_states)
 	}
 }
 
+UT_TEST(xmin_plan_requires_finite_fullxid_and_history_bounds)
+{
+	for (int variant = 0; variant < 3; variant++) {
+		ClusterHeapFreezePageBatchV1 page;
+		ClusterHeapFreezeProofBatchV1 proofs;
+		ClusterHeapFreezeFinalFenceV1 fence;
+		HeapTupleFreeze plan, saved;
+		FullTransactionId limit = FullTransactionIdFromEpochAndXid(1, 100);
+		SCN horizon = 10;
+
+		init_xmin_plan_fixture(&page, &proofs, &fence);
+		memset(&saved, 0x5a, sizeof(saved));
+		plan = saved;
+		if (variant != 0)
+			limit = FullTransactionIdFromU64(UINT64_MAX);
+		if (variant != 1)
+			horizon = (SCN)UINT64_MAX;
+		UT_ASSERT(!cluster_heap_freeze_prepare_xmin_v1(&page, &proofs, &fence,
+			0, FullTransactionIdFromEpochAndXid(1, 77), limit, horizon, &plan));
+		UT_ASSERT(memcmp(&plan, &saved, sizeof(plan)) == 0);
+	}
+}
+
 UT_TEST(xmin_plan_missing_arguments_and_bad_bounds_leave_output_untouched)
 {
 	for (int variant = 0; variant < 7; variant++) {
@@ -2691,7 +2714,7 @@ UT_TEST(creation_provenance_keeps_distinct_carriers_with_equal_raw_xmin)
 int
 main(void)
 {
-	UT_PLAN(83);
+	UT_PLAN(84);
 	UT_RUN(creation_provenance_only_follows_exact_physical_creation_target);
 	UT_RUN(creation_provenance_missing_or_raw_mismatch_never_guesses_an_epoch);
 	UT_RUN(creation_provenance_rejection_clears_preceding_attempt);
@@ -2774,6 +2797,7 @@ main(void)
 	UT_RUN(xmin_plan_revalidates_physical_target_instead_of_old_binding);
 	UT_RUN(xmin_plan_rejects_incomplete_proof_and_changed_final_fence);
 	UT_RUN(xmin_plan_rejects_special_raw_fullxids_and_legacy_xmin_states);
+	UT_RUN(xmin_plan_requires_finite_fullxid_and_history_bounds);
 	UT_RUN(xmin_plan_missing_arguments_and_bad_bounds_leave_output_untouched);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;

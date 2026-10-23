@@ -293,6 +293,8 @@ struct HeapTupleFreeze;
  * The caller must independently qualify the ORIGINAL creator FullXid, the
  * FullXid cutoff and H; this helper neither derives their provenance from a raw
  * XID/current epoch nor grants current ownership, retention or apply authority.
+ * Both bounds must be finite; an unconstrained history report is not a freeze
+ * cutoff. Finiteness alone does not prove the caller's provenance/admission.
  * It revalidates the physical target/carrier and final-fence evidence rather
  * than trusting creation_target_proof_index.  Success preserves raw xmax/MX
  * and every non-xmin header bit.  Failure leaves *out untouched.

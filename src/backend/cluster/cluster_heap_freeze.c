@@ -692,13 +692,15 @@ cluster_heap_freeze_prepare_xmin_v1(
 	const ClusterHeapFreezeCarrierRequestV1 *request;
 	HeapTupleFreeze plan;
 
-	/* The caller supplies proven original identity; raw XID cannot supply epoch. */
+	/* The caller supplies proven original identity; raw XID cannot supply epoch.
+	 * Unbounded observation sentinels cannot substitute for finite cutoffs. */
 	if (out == NULL || !FullTransactionIdIsNormal(original_creator_full_xid)
 		|| !TransactionIdIsNormal(XidFromFullTransactionId(original_creator_full_xid))
 		|| !FullTransactionIdIsNormal(freeze_limit_full)
 		|| !TransactionIdIsNormal(XidFromFullTransactionId(freeze_limit_full))
+		|| U64FromFullTransactionId(freeze_limit_full) == UINT64_MAX
 		|| !FullTransactionIdPrecedes(original_creator_full_xid, freeze_limit_full)
-		|| !SCN_VALID(horizon_scn)
+		|| !SCN_VALID(horizon_scn) || horizon_scn == (SCN)UINT64_MAX
 		|| freeze_validate_carrier_proofs(page, proofs, current_fence, true)
 			!= CLUSTER_HEAP_FREEZE_PROOF_PROVEN
 		|| page->page_lsn != current_fence->page_lsn

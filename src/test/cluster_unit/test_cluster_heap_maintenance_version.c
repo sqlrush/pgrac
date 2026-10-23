@@ -897,6 +897,49 @@ qualified_xmin_batch_apply(QualifiedXminFixture *f,
 		count, FullTransactionIdFromEpochAndXid(1, 100), 10);
 }
 
+UT_TEST(test_xmin_apply_rejects_unbounded_cutoffs_before_native_write)
+{
+	QualifiedXminFixture f;
+
+	for (int variant = 0; variant < 3; variant++) {
+		FullTransactionId limit = FullTransactionIdFromEpochAndXid(1, 100);
+		SCN horizon = 10;
+
+		qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		if (variant != 0)
+			limit = FullTransactionIdFromU64(UINT64_MAX);
+		if (variant != 1)
+			horizon = (SCN)UINT64_MAX;
+		UT_ASSERT(!cluster_heap_freeze_apply_xmin_v1(&relation_data, 1, &f.input,
+			&f.page, &f.proofs, &f.fence, &f.authority, &f.admission, 0,
+			FullTransactionIdFromEpochAndXid(1, 77), limit, horizon));
+		UT_ASSERT_EQ(inserts + dirties + flushes + writer_checks + authority_checks, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_batch_rejects_unbounded_cutoffs_before_native_write)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int variant = 0; variant < 3; variant++) {
+		FullTransactionId limit = FullTransactionIdFromEpochAndXid(1, 100);
+		SCN horizon = 10;
+
+		qualified_xmin_batch_setup(&f, targets);
+		if (variant != 0)
+			limit = FullTransactionIdFromU64(UINT64_MAX);
+		if (variant != 1)
+			horizon = (SCN)UINT64_MAX;
+		UT_ASSERT(!cluster_heap_freeze_apply_xmin_batch_v1(&relation_data, 1, &f.input,
+			&f.page, &f.proofs, &f.fence, &f.authority, &f.admission,
+			targets, 3, limit, horizon));
+		UT_ASSERT_EQ(inserts + dirties + flushes + writer_checks + authority_checks, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
 UT_TEST(test_xmin_apply_rejects_unbound_original_identity_before_wal)
 {
 	QualifiedXminFixture f;
@@ -1613,7 +1656,7 @@ UT_TEST(test_deferred_request_preserves_shared_freeze_restriction)
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(36);
 	UT_RUN(test_prune_native_plan_and_version);
 	UT_RUN(test_shared_freeze_refuses_before_tuple_or_wal);
 	UT_RUN(test_vacuum_native_unused_and_version);
@@ -1638,6 +1681,8 @@ main(void)
 	UT_RUN(test_ordinary_or_nonshared_vacuum_does_not_request);
 	UT_RUN(test_deferred_request_preserves_shared_freeze_restriction);
 	UT_RUN(test_qualified_xmin_rejects_recapture_with_old_proof_version);
+	UT_RUN(test_xmin_apply_rejects_unbounded_cutoffs_before_native_write);
+	UT_RUN(test_xmin_batch_rejects_unbounded_cutoffs_before_native_write);
 	UT_RUN(test_xmin_apply_rejects_unbound_original_identity_before_wal);
 	UT_RUN(test_xmin_batch_later_origin_epoch_mismatch_is_atomic);
 	UT_RUN(test_xmin_batch_one_wal_fence_fullxid_horizon_and_redo);
