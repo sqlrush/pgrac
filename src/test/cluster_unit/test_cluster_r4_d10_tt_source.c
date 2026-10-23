@@ -59,6 +59,7 @@ UT_DEFINE_GLOBALS();
 
 
 bool cluster_enabled = true;
+bool cluster_shared_config = false;
 int cluster_node_id = 1;
 bool cluster_enable_adg = false;
 int cluster_dg_role = CLUSTER_DG_ROLE_PRIMARY;
@@ -67,6 +68,7 @@ bool cluster_cf_terminal_authority = false;
 int cluster_tt_status_overlay_max_entries = 16;
 int cluster_tt_status_overlay_ttl_ms = 0;
 ProcessingMode Mode = NormalProcessing;
+BackendType MyBackendType = B_BACKEND;
 
 sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
@@ -95,6 +97,8 @@ static bool fake_recheck;
 static int fake_enter_count;
 static int fake_recheck_count;
 static int fake_leave_count;
+static ClusterNormalStartState test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+static bool test_recovered_open = true;
 
 
 void
@@ -172,6 +176,18 @@ cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSi
 		token->entered = true;
 	}
 	return fake_admission;
+}
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return test_normal_start_state;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return test_recovered_open;
 }
 
 bool
@@ -452,6 +468,9 @@ reset_fixture(void)
 	fake_enter_count = 0;
 	fake_recheck_count = 0;
 	fake_leave_count = 0;
+	cluster_shared_config = false;
+	test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+	test_recovered_open = true;
 	cluster_tt_status_shmem_init();
 }
 
@@ -511,6 +530,27 @@ UT_TEST(test_active_refuses_before_request_inspection_and_mutation)
 	UT_ASSERT_EQ(fake_recheck_count, 0);
 	UT_ASSERT_EQ(fake_leave_count, 0);
 	UT_ASSERT_EQ(cluster_tt_status_get_lookup_hit_count(), 0);
+}
+
+UT_TEST(test_recovered_open_refuses_before_source_tt_access)
+{
+	ClusterTTStatusSourceResult result;
+	ClusterSemanticAdmissionResult admission;
+
+	reset_fixture();
+	fake_admission = CLUSTER_SEMANTIC_ADMISSION_OK;
+	cluster_shared_config = true;
+	test_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	test_recovered_open = false;
+	memset(&result, 0xA5, sizeof(result));
+	admission = cluster_tt_status_source_dispatch(
+		CLUSTER_TT_SOURCE_LOOKUP, (const ClusterTTStatusSourceRequest *)(uintptr_t)1, &result);
+
+	UT_ASSERT_EQ(admission, CLUSTER_SEMANTIC_ADMISSION_CLOSED);
+	UT_ASSERT(bytes_are_zero(&result, sizeof(result)));
+	UT_ASSERT_EQ(fake_enter_count, 0);
+	UT_ASSERT_EQ(fake_recheck_count, 0);
+	UT_ASSERT_EQ(fake_leave_count, 0);
 }
 
 UT_TEST(test_disabled_source_executes_matching_counter_arm)
@@ -778,9 +818,10 @@ UT_TEST(test_error_path_runs_single_leave_funnel)
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_frozen_tt_source_operation_domain);
 	UT_RUN(test_active_refuses_before_request_inspection_and_mutation);
+	UT_RUN(test_recovered_open_refuses_before_source_tt_access);
 	UT_RUN(test_disabled_source_executes_matching_counter_arm);
 	UT_RUN(test_install_lookup_and_delete_publish_only_after_recheck);
 	UT_RUN(test_missing_required_pointer_closes_after_admission);
