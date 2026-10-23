@@ -171,11 +171,60 @@ sub with_cohort
 	};
 }
 
+sub schema_environment
+{
+	my ($cluster, $stage) = @_;
+	# Diagnostic failures must not replace the original schema-write error.
+	my $collected = eval {
+		my @paths = ((map { $_->data_dir } $cluster->nodes),
+			$cluster->shared_root, $cluster->wal_root);
+		my %evidence = (stage => $stage, monotonic => now(), paths => \@paths);
+		my $settings_ok = eval {
+			my ($rc, $stdout, $stderr) = $cluster->node0->psql('postgres', q{
+				SELECT name, setting, unit, source, sourcefile, sourceline
+				FROM pg_settings
+				WHERE name LIKE 'cluster.%undo%'
+				OR name IN ('data_directory', 'cluster.shared_data_dir',
+					'cluster.shared_storage_backend') ORDER BY name;
+			}, timeout => 5, on_error_die => 0);
+			$evidence{settings} = {rc => $rc, stdout => $stdout, stderr => $stderr};
+			1;
+		};
+		$evidence{settings_error} = "$@" unless $settings_ok;
+		for my $mode ('-Pk', '-Pi')
+		{
+			my ($stdout, $stderr) = ('', '');
+			my $df_ok = eval {
+				my $ok = run(['df', $mode, @paths], '>', \$stdout, '2>', \$stderr,
+					IPC::Run::timeout(5));
+				$evidence{df}{$mode} = {success => $ok ? 1 : 0,
+					wait_status => $?, stdout => $stdout, stderr => $stderr};
+				1;
+			};
+			$evidence{df}{$mode} = {error => "$@", stdout => $stdout, stderr => $stderr}
+			  unless $df_ok;
+		}
+		diag('E1_SCHEMA_ENVIRONMENT ' . $json->encode(\%evidence));
+		1;
+	};
+	diag("E1_SCHEMA_ENVIRONMENT capture failed: $@") unless $collected;
+}
+
 sub seed_committed
 {
 	my ($cluster) = @_;
-	$cluster->node0->safe_psql('postgres',
-		'CREATE TABLE e1_reconcile(id integer PRIMARY KEY, payload text NOT NULL)', timeout => 20);
+	schema_environment($cluster, 'before_create');
+	my $created = eval {
+		$cluster->node0->safe_psql('postgres',
+			'CREATE TABLE e1_reconcile(id integer PRIMARY KEY, payload text NOT NULL)', timeout => 20);
+		1;
+	};
+	my $error = $@;
+	if (!$created)
+	{
+		schema_environment($cluster, 'create_failed');
+		die $error;
+	}
 	my @nodes = $cluster->nodes;
 	for my $i (0 .. $#nodes)
 	{
