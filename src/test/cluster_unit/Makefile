@@ -8481,6 +8481,7 @@ test_cluster_pi_data: test_cluster_pi_data.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_data.c \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_data_wire.h \
 		$(top_srcdir)/src/include/cluster/cluster_pi_data.h \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \

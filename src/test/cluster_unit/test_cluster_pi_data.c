@@ -12,6 +12,7 @@
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_pi_data.h"
 #include "cluster/cluster_wal_thread.h"
@@ -53,6 +54,8 @@ static bool found;
 static ResourceReleaseCallback release_cb;
 static pg_on_exit_callback exit_cb;
 static ClusterICMsgTypeInfo registered;
+static ClusterNormalStartState test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+static bool test_recovered_open = true;
 struct ClusterPageDataReceiptV1 {
 	int unused;
 };
@@ -91,6 +94,18 @@ bool
 RecoveryInProgress(void)
 {
 	return false;
+}
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return test_normal_start_state;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return test_recovered_open;
 }
 uint64
 GetSystemIdentifier(void)
@@ -286,6 +301,8 @@ reset(void)
 	boots[1] = 41;
 	quorum = new_work = native_ready = data_ready = cut_ready = true;
 	prebump = native_changes = stop_during_io = io_error = false;
+	test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+	test_recovered_open = true;
 	sends = writes = imports = freed = 0;
 	clock_us += 1000000;
 	send_outcome = CLUSTER_IC_SEND_DONE;
@@ -351,6 +368,24 @@ begin(void)
 				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	UT_ASSERT(job != NULL);
 	return job;
+}
+
+static void
+recovered_remote_data_requires_semantic_open(void)
+{
+	ClusterPiDataV1 *job = NULL;
+
+	reset();
+	test_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	test_recovered_open = false;
+	UT_ASSERT_EQ(cluster_pi_data_begin_v1(&fixture.key, &fixture.cut, &job),
+					 CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+	UT_ASSERT(job == NULL);
+
+	test_recovered_open = true;
+	UT_ASSERT_EQ(cluster_pi_data_begin_v1(&fixture.key, &fixture.cut, &job),
+					 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	cluster_pi_data_release_v1(&job);
 }
 static void
 deliver(int from, int to, uint8 *bytes)
@@ -656,7 +691,8 @@ main(void)
 {
 	cluster_pi_data_shmem_register_v1();
 	cluster_pi_data_register_v1();
-	UT_PLAN(8);
+	UT_PLAN(9);
+	UT_RUN(recovered_remote_data_requires_semantic_open);
 	UT_RUN(completed_reply_sends_only_when_requested);
 	UT_RUN(wrong_sender_nonce_and_duplicate_cannot_replace_completion);
 	UT_RUN(server_error_and_producer_cut_release_pending_work);
