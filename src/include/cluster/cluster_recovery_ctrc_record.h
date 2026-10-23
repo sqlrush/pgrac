@@ -15,6 +15,7 @@
 #include "access/xlogreader.h"
 #include "cluster/cluster_recovery_namespace.h"
 #include "cluster/cluster_recovery_reference_graph.h"
+#include "cluster/cluster_recovery_tt_record.h"
 
 #define CLUSTER_RECOVERY_CTRC_VERSION UINT16_C(2)
 #define CLUSTER_RECOVERY_CTRC_BYTES 320
@@ -223,6 +224,33 @@ extern bool cluster_recovery_ctrc_tt_wal_inventory_v2(
 	XLogReaderState *reader, uint64 database_incarnation, uint32 source_index,
 	const uint8 source_identity_digest[32], const uint8 *raw_record, size_t raw_length,
 	ClusterRecoveryCTRCTTReferenceV2 *out);
+
+/* Four independent native TT-ABORT fields share one exact raw-record atom.
+ * The C0 payload has no xid-bearing WAL header; this adapter inventories only
+ * the complete target/top/exact/before fields and keeps all source, cut,
+ * owner, graph and durability qualification with the caller. */
+#define CLUSTER_RECOVERY_CTRC_TT_ABORT_REFERENCE_COUNT 4
+#define CLUSTER_RECOVERY_CTRC_TT_ABORT_RAW_BYTES \
+	(SizeOfXLogRecord + SizeOfXLogRecordDataHeaderShort + CLUSTER_RECOVERY_TT_ABORT_BYTES)
+#define CLUSTER_RECOVERY_CTRC_TT_ABORT_ATOM_BYTES \
+	(74 + CLUSTER_RECOVERY_CTRC_TT_ABORT_RAW_BYTES)
+#define CLUSTER_RECOVERY_CTRC_TT_ABORT_EVIDENCE_BYTES \
+	(16 + CLUSTER_RECOVERY_CTRC_TT_ABORT_ATOM_BYTES)
+typedef struct ClusterRecoveryCTRCTTAbortReferencesV2 {
+	uint8 keys[CLUSTER_RECOVERY_CTRC_TT_ABORT_REFERENCE_COUNT]
+		[CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_KEY_BYTES];
+	uint8 evidence[CLUSTER_RECOVERY_CTRC_TT_ABORT_EVIDENCE_BYTES];
+	size_t evidence_length;
+} ClusterRecoveryCTRCTTAbortReferencesV2;
+
+/* Inventory native TT-ABORT's four complete transaction fields as one
+ * all-or-nothing group. The exact short-data frame, decoded C0 payload and
+ * full raw CRC/hash are required; no semantic terminal, owner, graph,
+ * release, floor/issued or live-admission authority is supplied. */
+extern bool cluster_recovery_ctrc_tt_abort_wal_inventory_v2(
+	XLogReaderState *reader, uint64 database_incarnation, uint32 source_index,
+	const uint8 source_identity_digest[32], const uint8 *raw_record, size_t raw_length,
+	ClusterRecoveryCTRCTTAbortReferencesV2 *out);
 
 /* One selected native block-0 xid field, with the complete original page as
  * singleton atom2 evidence. Lengths are metadata, not encoded graph bytes;

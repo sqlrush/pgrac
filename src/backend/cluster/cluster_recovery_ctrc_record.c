@@ -11,6 +11,7 @@
 
 #include "access/rmgr.h"
 #include "access/xlogrecord.h"
+#include "cluster/cluster_recovery_tt_record.h"
 #include "cluster/cluster_recovery_undo_scan.h"
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_uba.h"
@@ -613,6 +614,90 @@ cluster_recovery_ctrc_tt_wal_inventory_v2(XLogReaderState *reader,
 	 * Never copy the payload T34 to an unresolved header field, even when
 	 * both low32 values match. Consume aliases before publishing the group. */
 	memcpy(out, &inventory, sizeof(inventory));
+	return true;
+
+refused:
+	memset(out, 0, sizeof(*out));
+	return false;
+}
+
+bool
+cluster_recovery_ctrc_tt_abort_wal_inventory_v2(XLogReaderState *reader,
+										uint64 database_incarnation, uint32 source_index,
+										const uint8 source_identity_digest[32],
+										const uint8 *raw_record, size_t raw_length,
+										ClusterRecoveryCTRCTTAbortReferencesV2 *out)
+{
+	static const uint16 field_offsets[CLUSTER_RECOVERY_CTRC_TT_ABORT_REFERENCE_COUNT] = {
+		34 + 48, 34 + 56, 34 + 104, 34 + 120
+	};
+	ClusterRecoveryTTAbortV1 abort;
+	ClusterRecoveryCTRCTTAbortReferencesV2 references = { 0 };
+	uint8 *key = references.keys[0];
+	uint8 *atom = references.evidence + 16;
+	uint8 hash[32];
+
+	if (out == NULL)
+		return false;
+	if (reader == NULL || reader->record == NULL || raw_record == NULL
+		|| database_incarnation == 0 || reader->system_identifier == 0
+		|| reader->cluster_expected_thread_id == 0
+		|| reader->cluster_expected_thread_id > UNDO_OWNER_INSTANCE_MAX
+		|| reader->ReadRecPtr == InvalidXLogRecPtr
+		|| reader->EndRecPtr <= reader->ReadRecPtr
+		|| reader->record->lsn != reader->ReadRecPtr
+		|| reader->record->next_lsn != reader->EndRecPtr
+		|| XLogRecGetRmid(reader) != RM_CLUSTER_UNDO_ID
+		|| XLogRecGetInfo(reader) != XLOG_UNDO_RECOVERY_TT_ABORT
+		|| XLogRecHasAnyBlockRefs(reader) || XLogRecHasPageVersionEdge(reader)
+		|| TransactionIdIsValid(XLogRecGetTopXid(reader))
+		|| XLogRecGetOrigin(reader) != InvalidRepOriginId
+		|| XLogRecGetXid(reader) != InvalidTransactionId
+		|| raw_length != CLUSTER_RECOVERY_CTRC_TT_ABORT_RAW_BYTES
+		|| XLogRecGetDataLen(reader) != CLUSTER_RECOVERY_TT_ABORT_BYTES
+		|| !cluster_recovery_tt_abort_decode_v1(
+			raw_record + SizeOfXLogRecord + SizeOfXLogRecordDataHeaderShort,
+			CLUSTER_RECOVERY_TT_ABORT_BYTES, &abort)
+		|| abort.target_thread != reader->cluster_expected_thread_id
+		|| memcmp(raw_record, &reader->record->header, SizeOfXLogRecord) != 0
+		|| raw_record[SizeOfXLogRecord] != XLR_BLOCK_ID_DATA_SHORT
+		|| raw_record[SizeOfXLogRecord + 1] != CLUSTER_RECOVERY_TT_ABORT_BYTES
+		|| memcmp(raw_record + SizeOfXLogRecord + SizeOfXLogRecordDataHeaderShort,
+				  XLogRecGetData(reader), CLUSTER_RECOVERY_TT_ABORT_BYTES) != 0
+		|| !cluster_recovery_ctrc_record_hash_v2(source_identity_digest,
+			reader->ReadRecPtr, reader->EndRecPtr, raw_record, raw_length, hash))
+		goto refused;
+
+	cluster_undo_tt_ctrc_put_u64_le(key, reader->system_identifier);
+	cluster_undo_tt_ctrc_put_u64_le(key + 8, database_incarnation);
+	cluster_undo_tt_ctrc_put_u16_le(key + 16, abort.target_thread);
+	cluster_undo_tt_ctrc_put_u32_le(key + 18, abort.exact.segment_id);
+	cluster_undo_tt_ctrc_put_u32_le(key + 22, abort.exact.segment_generation);
+	cluster_undo_tt_ctrc_put_u16_le(key + 26, abort.exact.slot_offset);
+	cluster_undo_tt_ctrc_put_u16_le(key + 28, abort.exact.wrap);
+	cluster_undo_tt_ctrc_put_u32_le(key + 30, abort.exact.xid);
+	cluster_undo_tt_ctrc_put_u16_le(key + 34, 3);
+	cluster_undo_tt_ctrc_put_u64_le(key + 36, 56);
+	cluster_undo_tt_ctrc_put_u32_le(key + 44, source_index);
+	cluster_undo_tt_ctrc_put_u64_le(key + 48, reader->ReadRecPtr);
+	cluster_undo_tt_ctrc_put_u64_le(key + 56, reader->EndRecPtr);
+	cluster_undo_tt_ctrc_put_u32_le(key + 64, (uint32) raw_length);
+	memcpy(key + 68, hash, sizeof(hash));
+	for (unsigned i = 0; i < CLUSTER_RECOVERY_CTRC_TT_ABORT_REFERENCE_COUNT; i++) {
+		if (i != 0)
+			memcpy(references.keys[i], key, sizeof(references.keys[i]));
+		cluster_undo_tt_ctrc_put_u64_le(references.keys[i] + 100, field_offsets[i]);
+	}
+	cluster_undo_tt_ctrc_put_u64_le(references.evidence, 1);
+	cluster_undo_tt_ctrc_put_u64_le(references.evidence + 8,
+		74 + CLUSTER_RECOVERY_CTRC_TT_ABORT_RAW_BYTES);
+	cluster_undo_tt_ctrc_put_u16_le(atom, 1);
+	cluster_undo_tt_ctrc_put_u64_le(atom + 2, 56);
+	memcpy(atom + 10, key + 44, 56);
+	cluster_undo_tt_ctrc_put_u64_le(atom + 66, raw_length);
+	memcpy(atom + 74, raw_record, raw_length);
+	references.evidence_length = CLUSTER_RECOVERY_CTRC_TT_ABORT_EVIDENCE_BYTES;
+	memcpy(out, &references, sizeof(references));
 	return true;
 
 refused:

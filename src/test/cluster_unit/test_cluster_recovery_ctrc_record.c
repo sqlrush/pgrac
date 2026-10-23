@@ -5,6 +5,7 @@
 #include "access/rmgr.h"
 #include "port/pg_crc32c.h"
 #include "cluster/cluster_recovery_ctrc_record.h"
+#include "cluster/cluster_recovery_tt_record.h"
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/storage/cluster_undo_xlog.h"
@@ -3561,6 +3562,199 @@ tt_refused(XLogReaderState *reader, uint64 dbinc, const uint8 *source,
 		&& guarded[0] == 0xa5 && guarded[sizeof(guarded) - 1] == 0xa5;
 }
 
+static ClusterRecoveryTTAbortV1
+tt_abort_sample(void)
+{
+	ClusterRecoveryTTAbortV1 abort = { 0 };
+
+	abort.version = CLUSTER_RECOVERY_TT_ABORT_VERSION;
+	abort.length = CLUSTER_RECOVERY_TT_ABORT_BYTES;
+	abort.flags = CLUSTER_RECOVERY_TT_ABORT_TOP_KNOWN;
+	abort.target_thread = 3;
+	abort.writer_thread = 3;
+	abort.target_incarnation = 11;
+	abort.writer_incarnation = 12;
+	abort.recovery_serial = 13;
+	abort.target_epoch = 17;
+	abort.target_full_xid = abort.top_full_xid = UINT64_C(0x0000000012345678);
+	memset(abort.target_claim_sha256, 0x5a, sizeof(abort.target_claim_sha256));
+	abort.exact = (xl_undo_tt_slot_abort_exact){
+		.segment_id = 2 * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1,
+		.segment_generation = 17,
+		.xid = 0x12345678,
+		.slot_offset = 5,
+		.wrap = 9,
+		.instance = 3,
+		.format_version = CLUSTER_UNDO_TT_ABORT_EXACT_VERSION
+	};
+	abort.before = (TTSlot){
+		.xid = abort.exact.xid,
+		.wrap = abort.exact.wrap,
+		.status = TT_SLOT_ACTIVE,
+		.flags = TT_FLAGS_RESERVED,
+		.commit_scn = InvalidScn,
+		.first_undo_block = (UBA)InvalidUba_init
+	};
+	return abort;
+}
+
+static size_t
+tt_abort_wire(NativeRaw *wire, const ClusterRecoveryTTAbortV1 *abort)
+{
+	memset(wire, 0, sizeof(*wire));
+	wire->align.xl_rmid = RM_CLUSTER_UNDO_ID;
+	wire->align.xl_info = XLOG_UNDO_RECOVERY_TT_ABORT;
+	wire->align.xl_scn = 41;
+	wire->bytes[SizeOfXLogRecord] = XLR_BLOCK_ID_DATA_SHORT;
+	wire->bytes[SizeOfXLogRecord + 1] = CLUSTER_RECOVERY_TT_ABORT_BYTES;
+	UT_ASSERT(cluster_recovery_tt_abort_encode_v1(abort,
+			wire->bytes + SizeOfXLogRecord + SizeOfXLogRecordDataHeaderShort,
+			CLUSTER_RECOVERY_TT_ABORT_BYTES));
+	native_crc(wire, CLUSTER_RECOVERY_CTRC_TT_ABORT_RAW_BYTES);
+	return CLUSTER_RECOVERY_CTRC_TT_ABORT_RAW_BYTES;
+}
+
+static bool
+tt_abort_expected(const XLogReaderState *reader, uint64 dbinc, uint32 index,
+				  const uint8 *source, const NativeRaw *wire,
+				  ClusterRecoveryCTRCTTAbortReferencesV2 *out)
+{
+	ClusterRecoveryTTAbortV1 decoded;
+	const ClusterRecoveryTTAbortV1 *abort = &decoded;
+	uint8 *key = out->keys[0], *atom = out->evidence + 16;
+	const uint64 field_offsets[] = { 82, 90, 138, 154 };
+
+	memset(out, 0, sizeof(*out));
+	if (!cluster_recovery_tt_abort_decode_v1(wire->bytes + 34, CLUSTER_RECOVERY_TT_ABORT_BYTES,
+										&decoded))
+		return false;
+	wal_atom_uint(key, SYSTEM_ID, 8);
+	wal_atom_uint(key + 8, dbinc, 8);
+	wal_atom_uint(key + 16, abort->target_thread, 2);
+	wal_atom_uint(key + 18, abort->exact.segment_id, 4);
+	wal_atom_uint(key + 22, abort->exact.segment_generation, 4);
+	wal_atom_uint(key + 26, abort->exact.slot_offset, 2);
+	wal_atom_uint(key + 28, abort->exact.wrap, 2);
+	wal_atom_uint(key + 30, abort->exact.xid, 4);
+	wal_atom_uint(key + 34, 3, 2);
+	wal_atom_uint(key + 36, 56, 8);
+	wal_atom_uint(key + 44, index, 4);
+	wal_atom_uint(key + 48, reader->ReadRecPtr, 8);
+	wal_atom_uint(key + 56, reader->EndRecPtr, 8);
+	wal_atom_uint(key + 64, CLUSTER_RECOVERY_CTRC_TT_ABORT_RAW_BYTES, 4);
+	if (!reference_digest(source, reader->ReadRecPtr, reader->EndRecPtr, wire,
+					 CLUSTER_RECOVERY_CTRC_TT_ABORT_RAW_BYTES, key + 68))
+		return false;
+	wal_atom_uint(key + 100, field_offsets[0], 8);
+	for (unsigned i = 1; i < CLUSTER_RECOVERY_CTRC_TT_ABORT_REFERENCE_COUNT; i++) {
+		memcpy(out->keys[i], key, sizeof(out->keys[i]));
+		wal_atom_uint(out->keys[i] + 100, field_offsets[i], 8);
+	}
+	wal_atom_uint(out->evidence, 1, 8);
+	wal_atom_uint(out->evidence + 8, 74 + CLUSTER_RECOVERY_CTRC_TT_ABORT_RAW_BYTES, 8);
+	wal_atom_uint(atom, 1, 2);
+	wal_atom_uint(atom + 2, 56, 8);
+	memcpy(atom + 10, key + 44, 56);
+	wal_atom_uint(atom + 66, CLUSTER_RECOVERY_CTRC_TT_ABORT_RAW_BYTES, 8);
+	memcpy(atom + 74, wire->bytes, CLUSTER_RECOVERY_CTRC_TT_ABORT_RAW_BYTES);
+	out->evidence_length = CLUSTER_RECOVERY_CTRC_TT_ABORT_EVIDENCE_BYTES;
+	return true;
+}
+
+static bool
+tt_abort_refused(XLogReaderState *reader, uint64 dbinc, const uint8 *source,
+				 const uint8 *raw, size_t length)
+{
+	uint8 guarded[sizeof(ClusterRecoveryCTRCTTAbortReferencesV2) + 2];
+
+	memset(guarded, 0xa5, sizeof(guarded));
+	return !cluster_recovery_ctrc_tt_abort_wal_inventory_v2(reader, dbinc, 7, source,
+					raw, length, (ClusterRecoveryCTRCTTAbortReferencesV2 *)(guarded + 1))
+			&& all_zero(guarded + 1, sizeof(guarded) - 2)
+			&& guarded[0] == 0xa5 && guarded[sizeof(guarded) - 1] == 0xa5;
+}
+
+UT_TEST(tt_abort_inventory_complete_native_fields)
+{
+	ClusterRecoveryTTAbortV1 abort = tt_abort_sample();
+	NativeRaw wire;
+	NativePages pages;
+	XLogReaderState *reader;
+	ClusterRecoveryCTRCTTAbortReferencesV2 out, expected;
+	size_t length = tt_abort_wire(&wire, &abort);
+
+	UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+	UT_ASSERT(tt_abort_expected(reader, 99, 7, raw_source, &wire, &expected));
+	UT_ASSERT(cluster_recovery_ctrc_tt_abort_wal_inventory_v2(reader, 99, 7, raw_source,
+										 wire.bytes, length, &out));
+	UT_ASSERT(memcmp(&out, &expected, sizeof(out)) == 0);
+	for (unsigned i = 0; i < CLUSTER_RECOVERY_CTRC_TT_ABORT_REFERENCE_COUNT; i++)
+		UT_ASSERT_EQ(out.keys[i][100], i == 0 ? 82 : i == 1 ? 90 : i == 2 ? 138 : 154);
+	UT_ASSERT_EQ(out.evidence_length, CLUSTER_RECOVERY_CTRC_TT_ABORT_EVIDENCE_BYTES);
+	UT_ASSERT(memcmp(out.evidence + 16 + 74, wire.bytes, length) == 0);
+	XLogReaderFree(reader);
+}
+
+UT_TEST(tt_abort_inventory_refuses_wrong_frame_or_payload)
+{
+	const unsigned mutations[] = { 0, 1, 2, 3, 4 };
+
+	for (unsigned i = 0; i < lengthof(mutations); i++) {
+		ClusterRecoveryTTAbortV1 abort = tt_abort_sample();
+		NativeRaw wire;
+		NativePages pages;
+		XLogReaderState *reader;
+
+		tt_abort_wire(&wire, &abort);
+		/* Keep the reader over the valid record; each mutation is supplied as
+		 * the raw source so the adapter must reject the exact mismatch. */
+		UT_ASSERT(native_read(&pages, &wire, CLUSTER_RECOVERY_CTRC_TT_ABORT_RAW_BYTES,
+								false, &reader));
+		if (mutations[i] == 0)
+			wire.bytes[SizeOfXLogRecord] = XLR_BLOCK_ID_DATA_LONG;
+		else if (mutations[i] == 1)
+			wire.bytes[SizeOfXLogRecord + 1]--;
+		else if (mutations[i] == 2)
+			wire.bytes[34 + 48] ^= 1;
+		else if (mutations[i] == 3)
+			wire.align.xl_xid = abort.exact.xid;
+		else
+			wire.align.xl_info = XLOG_UNDO_TT_SLOT_ABORT;
+		native_crc(&wire, CLUSTER_RECOVERY_CTRC_TT_ABORT_RAW_BYTES);
+		UT_ASSERT(tt_abort_refused(reader, 99, raw_source, wire.bytes,
+								 CLUSTER_RECOVERY_CTRC_TT_ABORT_RAW_BYTES));
+		XLogReaderFree(reader);
+	}
+}
+
+UT_TEST(tt_abort_inventory_unaligned_alias_and_immutable)
+{
+	ClusterRecoveryTTAbortV1 abort = tt_abort_sample();
+	NativeRaw wire;
+	NativePages pages, saved_pages;
+	XLogReaderState *reader, saved_reader;
+	ClusterRecoveryCTRCTTAbortReferencesV2 expected;
+	uint8 buffer[sizeof(expected) + 2];
+
+	tt_abort_wire(&wire, &abort);
+	UT_ASSERT(native_read(&pages, &wire, CLUSTER_RECOVERY_CTRC_TT_ABORT_RAW_BYTES,
+						 false, &reader));
+	UT_ASSERT(tt_abort_expected(reader, 99, 7, raw_source, &wire, &expected));
+	saved_pages = pages;
+	saved_reader = *reader;
+	memset(buffer, 0xa5, sizeof(buffer));
+	memcpy(buffer + 1, wire.bytes, CLUSTER_RECOVERY_CTRC_TT_ABORT_RAW_BYTES);
+	UT_ASSERT(cluster_recovery_ctrc_tt_abort_wal_inventory_v2(reader, 99, 7, raw_source,
+										buffer + 1,
+										CLUSTER_RECOVERY_CTRC_TT_ABORT_RAW_BYTES,
+										(ClusterRecoveryCTRCTTAbortReferencesV2 *)(buffer + 1)));
+	UT_ASSERT(memcmp(buffer + 1, &expected, sizeof(expected)) == 0);
+	UT_ASSERT(buffer[0] == 0xa5 && buffer[sizeof(buffer) - 1] == 0xa5);
+	UT_ASSERT(memcmp(&pages, &saved_pages, sizeof(pages)) == 0);
+	UT_ASSERT(memcmp(reader, &saved_reader, sizeof(*reader)) == 0);
+	XLogReaderFree(reader);
+}
+
 UT_TEST(tt_canonical_generation_bearing_payloads)
 {
 	for (unsigned kind = 0; kind < 4; kind++) {
@@ -5596,6 +5790,9 @@ main(void)
 	UT_RUN(tt_wal_inventory_original_record_binding);
 	UT_RUN(tt_wal_inventory_bounds_and_empty_identity);
 	UT_RUN(tt_wal_inventory_unaligned_aliases_and_immutable);
+	UT_RUN(tt_abort_inventory_complete_native_fields);
+	UT_RUN(tt_abort_inventory_refuses_wrong_frame_or_payload);
+	UT_RUN(tt_abort_inventory_unaligned_alias_and_immutable);
 	UT_RUN(data_canonical_full_object_and_immutable);
 	UT_RUN(data_native_boundaries_and_each_physical_slot);
 	UT_RUN(data_namespace_is_original_and_exact);
