@@ -60,8 +60,12 @@ static uint64 space_identity_invalidations;
 static bool
 space_online_recovered_open(void)
 {
-	return MyBackendType == B_STARTUP
-		   || cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_EXISTING_OTHER
+	if (MyBackendType == B_STARTUP
+		|| cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_EXISTING_OTHER)
+		return true;
+	/* A fresh cohort has no semantic publication to recover yet. Permit the
+	 * initial SPACE identity, but never reopen this window after any publish. */
+	return cluster_semantic_activation_phase1_pristine()
 		   || cluster_semantic_activation_recovered_open_current();
 }
 
