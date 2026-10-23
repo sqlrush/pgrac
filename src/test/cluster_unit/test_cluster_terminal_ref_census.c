@@ -322,12 +322,12 @@ UT_TEST(test_ctrc_origin_original_full_xid_requires_exact_live_identity)
 	origin.reservation_generation = 11;
 	origin.original_full_xid = expected;
 	UT_ASSERT(cluster_ctrc_origin_original_full_xid_exact(&origin, &key, &got));
-	UT_ASSERT(got == expected);
+	UT_ASSERT(FullTransactionIdEquals(got, expected));
 
 	wrong.slot_wrap++;
 	got = InvalidFullTransactionId;
 	UT_ASSERT(!cluster_ctrc_origin_original_full_xid_exact(&origin, &wrong, &got));
-	UT_ASSERT(got == InvalidFullTransactionId);
+	UT_ASSERT(FullTransactionIdEquals(got, InvalidFullTransactionId));
 	wrong = key;
 	origin.state = CTRC_ORIGIN_BLOCKED;
 	UT_ASSERT(!cluster_ctrc_origin_original_full_xid_exact(&origin, &key, &got));
@@ -2948,7 +2948,7 @@ source_scan_category_known(const char *category)
 		"ITL_STATUS_WRITER",		"TT_STATUS_WRITER",		   "TT_RELEASE_FLAG_WRITER",
 		"CURRENT_SLOT_GC",			"ROLLED_SEGMENT_RECYCLE",  "CURRENT_MX_PROOF_SENDER",
 		"CURRENT_MX_WIRE_DECODER",	"CTRC_TOUCH_BEFORE_PROOF", "CTRC_RECEIPT_LIFECYCLE",
-		"CTRC_CLOSE_WIRE",			"CTRC_RELATION_GATE",	   "CURRENT_MX_TERMINAL_CLEANOUT",
+		"CTRC_ORIGIN_PROVENANCE", "CTRC_CLOSE_WIRE",			"CTRC_RELATION_GATE",	   "CURRENT_MX_TERMINAL_CLEANOUT",
 	};
 	size_t i;
 

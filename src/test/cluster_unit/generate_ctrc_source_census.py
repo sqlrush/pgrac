@@ -105,7 +105,7 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/access/heap/vacuumlazy.c",
             "src/backend/access/heap/rewriteheap.c",
         ),
-        r"\b(?:HeapTuple(?:Set|Clear)(?:HotUpdated|HeapOnly)|heap_page_prune(?:_opt|_execute)?|heap_(?:prepare_|execute_)?freeze_tuple|raw_heap_insert|rewrite_heap_tuple|heap_lock_updated_tuple_rec)\s*\(",
+        r"\b(?:HeapTuple(?:Set|Clear)(?:HotUpdated|HeapOnly)|heap_page_prune(?:_opt|_execute)?|heap_(?:prepare_|execute_)?freeze_tuple|heap_freeze_execute_prepared|raw_heap_insert|rewrite_heap_tuple|heap_lock_updated_tuple_rec)\s*\(",
     ),
     ScanRule(
         "KO_PHYSICAL_REMOVAL",
@@ -201,6 +201,11 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/cluster/cluster_terminal_ref_census.c",
         ),
         r"\bcluster_ctrc_origin_touch_exact\s*\(",
+    ),
+    ScanRule(
+        "CTRC_ORIGIN_PROVENANCE",
+        ("src/backend/cluster/cluster_terminal_ref_census.c",),
+        r"\bcluster_ctrc_origin_original_full_xid_(?:exact|shared)\s*\(",
     ),
     ScanRule(
         "CTRC_RECEIPT_LIFECYCLE",
@@ -439,7 +444,12 @@ _classify_owners(
 _classify_owners(
     "CTRC_RELATION_GATE",
     "src/backend/cluster/cluster_ko_lock.c",
-    ("cluster_ko_drain_inbound_and_apply", "ko_flush_and_wait_ack"),
+    (
+        "cluster_ko_drain_inbound_and_apply",
+        "ko_flush_and_wait_ack",
+        "ko_native_origin_checkpoint",
+        "ko_peer_fence_physical_tick_v3",
+    ),
     "SUCCESSOR_BEFORE_PREDECESSOR",
     "ALL_CTRC_REFERENCE_KINDS",
     "ALL_RELATION_TARGETS",
@@ -472,6 +482,20 @@ _classify_owners(
     "cluster_ctrc_receipt_prepare_shared",
     "cluster_ctrc_receipt_discharge_current_mx_shared",
     "MXA-T20",
+)
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    (
+        "cluster_ctrc_origin_original_full_xid_exact",
+        "cluster_ctrc_origin_original_full_xid_shared",
+    ),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_REFERENCE_TRANSFER_REQUIRED",
+    "NO_REFERENCE_TO_DISCHARGE",
+    "MXA-T40",
 )
 _classify_owners(
     "CTRC_TOUCH_BEFORE_PROOF",
@@ -851,6 +875,7 @@ _classify_owners(
     "src/backend/access/heap/heapam.c",
     (
         "heap_execute_freeze_tuple",
+        "heap_freeze_apply_prepared",
         "heap_freeze_execute_prepared",
         "heap_freeze_tuple",
         "heap_lock_updated_tuple",
