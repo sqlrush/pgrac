@@ -1472,9 +1472,70 @@ UT_TEST(test_tx_result_binds_input_root_and_cannot_rewind_ordinals)
 	}
 }
 
+UT_TEST(test_original_lmon_accepts_complete_tx_without_changing_its_owner_result)
+{
+	for (unsigned empty = 0; empty < 2; empty++) {
+		ClusterRecoveryTxResultObservationV1 before, after;
+		if (empty) {
+			reset(); retain(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
+		} else
+			c0_subject();
+		UT_ASSERT(!cluster_recovery_tx_result_accept_v1());
+		UT_ASSERT(!cluster_recovery_tx_result_accepted_v1(info.cluster_tx_start));
+		UT_ASSERT(cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+		UT_ASSERT(!cluster_recovery_tx_result_accepted_v1(info.cluster_tx_start));
+		serving_actor();
+		UT_ASSERT(cluster_recovery_tx_result_observe_v1(&before));
+		UT_ASSERT(cluster_recovery_tx_result_accept_v1());
+		UT_ASSERT(cluster_recovery_tx_result_accept_v1());
+		UT_ASSERT(cluster_recovery_tx_result_observe_v1(&after));
+		UT_ASSERT(memcmp(&before, &after, sizeof(before)) == 0);
+		startup_actor();
+		UT_ASSERT(cluster_recovery_tx_result_accepted_v1(info.cluster_tx_start));
+		ClusterReleaseColdRecoveryInputs(&info);
+		serving_actor();
+		UT_ASSERT(cluster_recovery_tx_result_accept_v1());
+		UT_ASSERT(cluster_recovery_tx_result_observe_v1(&after));
+		UT_ASSERT(memcmp(&before, &after, sizeof(before)) == 0);
+		startup_actor();
+	}
+}
+
+UT_TEST(test_original_lmon_does_not_accept_unfinished_or_unproven_tx)
+{
+	for (unsigned unresolved = 0; unresolved < 2; unresolved++) {
+		c0_subject();
+		serving_actor(); UT_ASSERT(!cluster_recovery_tx_result_accept_v1());
+		startup_actor();
+		if (unresolved)
+			census.entries[0].loser_proven = false;
+		else
+			stamp_prepare_ok = false;
+		UT_ASSERT_EQ(cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start),
+			unresolved != 0);
+		serving_actor(); UT_ASSERT(!cluster_recovery_tx_result_accept_v1());
+		startup_actor();
+		UT_ASSERT(!cluster_recovery_tx_result_accepted_v1(info.cluster_tx_start));
+		if (!unresolved) {
+			stamp_prepare_ok = true;
+			/* The leaf I/O fixture counts one operation; the original start
+			 * and its pending shared result remain unchanged for this retry. */
+			scope_checks = scope_releases = stamp_closes = target_releases = 0;
+			UT_ASSERT(cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+			serving_actor(); UT_ASSERT(cluster_recovery_tx_result_accept_v1());
+			startup_actor();
+			UT_ASSERT(cluster_recovery_tx_result_accepted_v1(info.cluster_tx_start));
+		}
+		release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		UT_ASSERT(!cluster_recovery_tx_result_accepted_v1(info.cluster_tx_start));
+		serving_actor(); UT_ASSERT(!cluster_recovery_tx_result_accept_v1());
+		startup_actor(); ClusterReleaseColdRecoveryInputs(&info);
+	}
+}
+
 int main(void)
 {
-	UT_PLAN(41);
+	UT_PLAN(43);
 	UT_RUN(test_original_owner_binds_complete_empty_census_after_done);
 	UT_RUN(test_native_owner_rejects_uninstalled_recovery_and_writer_drift);
 	UT_RUN(test_current_rechecks_owner_process_boot_and_exact_writer);
@@ -1518,6 +1579,8 @@ int main(void)
 	UT_RUN(test_tx_component_distinguishes_complete_empty_from_unproven_active);
 	UT_RUN(test_tx_result_lmon_handoff_retains_exact_value_and_revokes_on_error);
 	UT_RUN(test_tx_result_binds_input_root_and_cannot_rewind_ordinals);
+	UT_RUN(test_original_lmon_accepts_complete_tx_without_changing_its_owner_result);
+	UT_RUN(test_original_lmon_does_not_accept_unfinished_or_unproven_tx);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

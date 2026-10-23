@@ -314,6 +314,11 @@ extern bool cluster_recovery_tx_result_step_v1(const struct ClusterRecoveryStart
 extern bool cluster_recovery_tx_result_finish_v1(const struct ClusterRecoveryStartV1 *start);
 /* LMON-only value snapshot, including pending results; no service grant. */
 extern bool cluster_recovery_tx_result_observe_v1(ClusterRecoveryTxResultObservationV1 *out);
+/* LMON registers the complete TX component in the same original duty slot.
+ * Startup may query that exact receipt while retaining its original start;
+ * neither operation acknowledges other services or grants OPEN. */
+extern bool cluster_recovery_tx_result_accept_v1(void);
+extern bool cluster_recovery_tx_result_accepted_v1(const struct ClusterRecoveryStartV1 *start);
 /* Checkpointer-only, process-local opaque stable read; no I/O or write grant.
  * The original publisher must still prove ROOT/common/service and all normal
  * writer, membership, fence, durability and release conditions. */

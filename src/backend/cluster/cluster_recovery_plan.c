@@ -74,6 +74,7 @@ typedef struct ClusterRecoveryCheckpointSlotV1 {
 	uint64 generation;
 	ClusterRecoveryCheckpointOwnerV1 owner;
 	ClusterRecoveryTxResultValueV1 tx_result;
+	uint64 tx_accepted_generation;
 } ClusterRecoveryCheckpointSlotV1;
 
 typedef struct ClusterRecoveryPlanShmem {
@@ -589,6 +590,7 @@ cluster_recovery_checkpoint_revoke_v1(const struct ClusterRecoveryStartV1 *start
 			slot->valid = false;
 			memset(&slot->owner, 0, sizeof(slot->owner));
 			memset(&slot->tx_result, 0, sizeof(slot->tx_result));
+			slot->tx_accepted_generation = 0;
 		}
 		SpinLockRelease(&slot->lock);
 	}
@@ -613,6 +615,7 @@ cluster_recovery_checkpoint_register_v1(const struct ClusterRecoveryStartV1 *sta
 		slot->generation++;
 		slot->owner = owner;
 		memset(&slot->tx_result, 0, sizeof(slot->tx_result));
+		slot->tx_accepted_generation = 0;
 		slot->valid = true;
 		published = true;
 	}
@@ -872,6 +875,49 @@ cluster_recovery_tx_result_observe_v1(ClusterRecoveryTxResultObservationV1 *out)
 	out->checkpoint = after;
 	out->result = result;
 	return true;
+}
+
+bool
+cluster_recovery_tx_result_accept_v1(void)
+{
+	ClusterRecoveryTxResultObservationV1 observed;
+	ClusterRecoveryCheckpointSlotV1 *slot;
+	bool same;
+
+	if (!cluster_recovery_tx_result_observe_v1(&observed)
+		|| observed.result.state != CLUSTER_RECOVERY_TX_RESULT_COMPLETE)
+		return false;
+	slot = &cluster_recovery_plan_shmem->checkpoint_owner;
+	SpinLockAcquire(&slot->lock);
+	same = slot->valid && slot->generation == observed.checkpoint.slot_generation
+		&& memcmp(&slot->owner, &observed.checkpoint.owner, sizeof(slot->owner)) == 0
+		&& memcmp(&slot->tx_result, &observed.result, sizeof(slot->tx_result)) == 0;
+	if (same)
+		slot->tx_accepted_generation = observed.result.result_generation;
+	SpinLockRelease(&slot->lock);
+	return same;
+}
+
+bool
+cluster_recovery_tx_result_accepted_v1(const struct ClusterRecoveryStartV1 *start)
+{
+	ClusterRecoveryCheckpointOwnerV1 owner;
+	ClusterRecoveryCheckpointSlotV1 *slot;
+	bool accepted;
+
+	if (start == NULL || start != checkpoint_registered_start
+		|| cluster_recovery_plan_shmem == NULL
+		|| !ClusterColdRecoveryTxCheckpointOwnerV1(start, &owner)
+		|| memcmp(&owner, &checkpoint_registered_owner, sizeof(owner)) != 0)
+		return false;
+	slot = &cluster_recovery_plan_shmem->checkpoint_owner;
+	SpinLockAcquire(&slot->lock);
+	accepted = slot->valid && memcmp(&slot->owner, &owner, sizeof(owner)) == 0
+		&& slot->tx_result.state == CLUSTER_RECOVERY_TX_RESULT_COMPLETE
+		&& slot->tx_result.result_generation != 0
+		&& slot->tx_accepted_generation == slot->tx_result.result_generation;
+	SpinLockRelease(&slot->lock);
+	return accepted;
 }
 
 bool

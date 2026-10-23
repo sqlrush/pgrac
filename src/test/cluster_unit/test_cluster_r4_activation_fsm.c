@@ -171,6 +171,7 @@ static uint64 test_first_writer_epoch;
 static bool test_recovered_checkpoint_observed;
 static ClusterRecoveryCheckpointObservationV1 test_recovered_checkpoint;
 static unsigned test_recovered_checkpoint_observe_calls;
+static unsigned test_recovery_tx_accept_calls;
 static bool test_recovered_checkpoint_fail_after_first;
 static int test_first_live_checks;
 static ClusterControlRootResult test_first_live_result;
@@ -203,6 +204,13 @@ cluster_recovery_checkpoint_observe_v1(ClusterRecoveryCheckpointObservationV1 *o
 		return false;
 	*out = test_recovered_checkpoint;
 	return true;
+}
+
+bool
+cluster_recovery_tx_result_accept_v1(void)
+{
+	test_recovery_tx_accept_calls++;
+	return false;
 }
 
 ClusterControlRootResult
@@ -1283,6 +1291,7 @@ test_gate_reset(void)
 	test_first_writer_epoch = 0;
 	test_recovered_checkpoint_observed = false;
 	test_recovered_checkpoint_observe_calls = 0;
+	test_recovery_tx_accept_calls = 0;
 	test_recovered_checkpoint_fail_after_first = false;
 	memset(&test_recovered_checkpoint, 0, sizeof(test_recovered_checkpoint));
 	test_serving_found = false;
@@ -10516,6 +10525,20 @@ UT_TEST(test_restart_classifies_recovered_owner_without_manufacturing_ready)
 	}
 }
 
+UT_TEST(test_lmon_collects_original_tx_result_while_recovered_open_is_pending)
+{
+	ut_a142_setup(0);
+	cluster_semantic_activation_note_clean_start(false);
+	test_restart_unclean = true;
+	MyAuxProcType = LmonProcess;
+	IsUnderPostmaster = true;
+	test_recovery_tx_accept_calls = 0;
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT_EQ(test_recovery_tx_accept_calls, 1);
+	UT_ASSERT(!semantic_activation_restart.requested && !semantic_activation_restart.opened);
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_u32(TEST_GATE_CLOSED_OFFSET)), 1);
+}
+
 UT_TEST(test_a142_unsafe_or_missing_startup_never_requests_open)
 {
 	int fault;
@@ -11677,7 +11700,7 @@ static void test_serving_finish_root(void);
 int
 main(void)
 {
-	UT_PLAN(400);
+	UT_PLAN(401);
 	UT_RUN(test_member_commit_gap_before_all_peer_receipts);
 	UT_RUN(test_member_commit_request_waits_for_real_predecessor_receipts);
 	UT_RUN(test_member_commit_request_rejects_old_or_changed_identity);
@@ -12048,6 +12071,7 @@ main(void)
 	UT_RUN(test_a142_clean_start_observation_is_not_rearmable);
 	UT_RUN(test_restart_retains_clean_source_in_original_round);
 	UT_RUN(test_restart_classifies_recovered_owner_without_manufacturing_ready);
+	UT_RUN(test_lmon_collects_original_tx_result_while_recovered_open_is_pending);
 	UT_RUN(test_a142_unsafe_or_missing_startup_never_requests_open);
 	UT_RUN(test_a142_wrong_durable_phase_member_or_old_boot_stays_closed);
 	UT_RUN(test_a142_root_mismatch_cannot_emit_a_self_ack);

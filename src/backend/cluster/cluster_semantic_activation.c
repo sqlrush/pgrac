@@ -14203,6 +14203,9 @@ cluster_semantic_activation_lmon_tick(void)
 	semantic_activation_ack_lmon_drain();
 	if (SemanticActivationShmem == NULL)
 		return;
+	/* Collect the original TX component even while formation/serving waits.
+	 * This value-only receipt cannot replace the remaining service owners. */
+	(void)cluster_recovery_tx_result_accept_v1();
 	if (semantic_serving_lmon_tick())
 		return;
 	/* A normal-stop read owns the same original LMON/QVOTEC slot until its
