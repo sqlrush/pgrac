@@ -194,6 +194,24 @@ ctrc_txn_key_valid(const ClusterCtrcTxnKeyV1 *key)
 		   && ctrc_bytes_zero(key->reserved, sizeof(key->reserved));
 }
 
+bool
+cluster_ctrc_origin_original_full_xid_exact(const ClusterCtrcOriginEntry *origin,
+														const ClusterCtrcTxnKeyV1 *key,
+														FullTransactionId *full_xid_out)
+{
+	if (full_xid_out != NULL)
+		*full_xid_out = InvalidFullTransactionId;
+	if (origin == NULL || !ctrc_txn_key_valid(key) || full_xid_out == NULL
+		|| memcmp(&origin->key, key, sizeof(*key)) != 0
+		|| origin->state < CTRC_ORIGIN_OPEN || origin->state > CTRC_ORIGIN_RELEASE_PROVEN
+		|| origin->reservation_generation == 0 || origin->reservation_generation == UINT64_MAX
+		|| !FullTransactionIdIsNormal(origin->original_full_xid)
+		|| XidFromFullTransactionId(origin->original_full_xid) != key->xid)
+		return false;
+	*full_xid_out = origin->original_full_xid;
+	return true;
+}
+
 static bool
 ctrc_participant_identity_valid(const ClusterCtrcTxnKeyV1 *key,
 								const ClusterCtrcParticipantIdentity *identity)
@@ -1929,6 +1947,25 @@ ctrc_origin_index(const ClusterCtrcTxnKeyV1 *key, uint64 *index_out)
 		return false;
 	*index_out = index;
 	return true;
+}
+
+bool
+cluster_ctrc_origin_original_full_xid_shared(const ClusterCtrcTxnKeyV1 *key,
+														FullTransactionId *full_xid_out)
+{
+	uint64 origin_index;
+	bool valid;
+
+	if (full_xid_out != NULL)
+		*full_xid_out = InvalidFullTransactionId;
+	if (full_xid_out == NULL || !cluster_ctrc_shmem_ready()
+		|| !ctrc_origin_index(key, &origin_index))
+		return false;
+	LWLockAcquire(&CtrcShared->origin_lock, LW_SHARED);
+	valid = cluster_ctrc_origin_original_full_xid_exact(&ctrc_origin_entries()[origin_index],
+																				key, full_xid_out);
+	LWLockRelease(&CtrcShared->origin_lock);
+	return valid;
 }
 
 static bool

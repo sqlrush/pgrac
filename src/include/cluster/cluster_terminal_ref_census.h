@@ -901,6 +901,15 @@ cluster_ctrc_origin_record_touched(ClusterCtrcOriginEntry *origin,
 								   ClusterCtrcProofClass proof_class, uint32 *grant_out);
 extern bool cluster_ctrc_origin_has_exact_touch(const ClusterCtrcOriginEntry *origin,
 												const ClusterCtrcParticipantIdentity *participant);
+/* Read-only provenance check for the volatile top identity captured before BIND. */
+extern bool cluster_ctrc_origin_original_full_xid_exact(
+												const ClusterCtrcOriginEntry *origin,
+												const ClusterCtrcTxnKeyV1 *key,
+												FullTransactionId *full_xid_out);
+/* Shared lookup samples the origin lock only; it grants no authority or freeze permission. */
+extern bool cluster_ctrc_origin_original_full_xid_shared(
+												const ClusterCtrcTxnKeyV1 *key,
+												FullTransactionId *full_xid_out);
 extern bool cluster_ctrc_origin_begin_seal_entry(ClusterCtrcOriginEntry *origin,
 												 uint64 seal_generation);
 extern bool cluster_ctrc_origin_arm_close_entry(ClusterCtrcOriginEntry *origin,

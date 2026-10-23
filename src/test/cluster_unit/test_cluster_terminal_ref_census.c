@@ -310,6 +310,35 @@ test_open_origin(ClusterCtrcOriginEntry *origin)
 				 CLUSTER_CTRC_ORIGIN_OPENED);
 }
 
+UT_TEST(test_ctrc_origin_original_full_xid_requires_exact_live_identity)
+{
+	ClusterCtrcOriginEntry origin;
+	ClusterCtrcTxnKeyV1 key = test_key();
+	ClusterCtrcTxnKeyV1 wrong = key;
+	FullTransactionId expected = FullTransactionIdFromEpochAndXid(4, key.xid);
+	FullTransactionId got = InvalidFullTransactionId;
+
+	test_open_origin(&origin);
+	origin.reservation_generation = 11;
+	origin.original_full_xid = expected;
+	UT_ASSERT(cluster_ctrc_origin_original_full_xid_exact(&origin, &key, &got));
+	UT_ASSERT(got == expected);
+
+	wrong.slot_wrap++;
+	got = InvalidFullTransactionId;
+	UT_ASSERT(!cluster_ctrc_origin_original_full_xid_exact(&origin, &wrong, &got));
+	UT_ASSERT(got == InvalidFullTransactionId);
+	wrong = key;
+	origin.state = CTRC_ORIGIN_BLOCKED;
+	UT_ASSERT(!cluster_ctrc_origin_original_full_xid_exact(&origin, &key, &got));
+	origin.state = CTRC_ORIGIN_OPEN;
+	origin.original_full_xid = FullTransactionIdFromEpochAndXid(4, key.xid + 1);
+	UT_ASSERT(!cluster_ctrc_origin_original_full_xid_exact(&origin, &key, &got));
+	origin.original_full_xid = expected;
+	origin.reservation_generation = 0;
+	UT_ASSERT(!cluster_ctrc_origin_original_full_xid_exact(&origin, &key, &got));
+}
+
 /* MXA L04/L05: the pending origin reservation is owned by one exact
  * generation.  Before BIND it may return to the byte-zero FREE image; after
  * BIND it may only retain as BLOCKED.  A stale or foreign handle must never
