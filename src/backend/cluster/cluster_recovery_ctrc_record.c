@@ -765,6 +765,48 @@ refused:
 }
 
 bool
+cluster_recovery_ctrc_tt_reference_graph_node_v2(
+	const ClusterRecoveryCTRCTTReferenceV2 *reference,
+	ClusterRecoveryCTRCGraphNodeV2 *out)
+{
+	ClusterRecoveryCTRCGraphNodeV2 node;
+	const uint8 *atom;
+	size_t raw_length;
+
+	if (reference == NULL || out == NULL
+		|| reference->evidence_length < 16 + 74
+		|| reference->evidence_length > CLUSTER_RECOVERY_CTRC_TT_EVIDENCE_MAX_BYTES
+		|| cluster_undo_tt_ctrc_get_u16_le(reference->key + 34) != 3
+		|| cluster_undo_tt_ctrc_get_u64_le(reference->key + 36) != 56
+		|| cluster_undo_tt_ctrc_get_u64_le(reference->key + 100) != 42)
+		goto refused;
+	raw_length = reference->evidence_length - 16 - 74;
+	if (raw_length == 0 || raw_length > CLUSTER_RECOVERY_CTRC_TT_RAW_MAX_BYTES
+		|| cluster_undo_tt_ctrc_get_u32_le(reference->key + 64) != raw_length
+		|| cluster_undo_tt_ctrc_get_u64_le(reference->evidence) != 1
+		|| cluster_undo_tt_ctrc_get_u64_le(reference->evidence + 8) != 74 + raw_length)
+		goto refused;
+	atom = reference->evidence + 16;
+	if (cluster_undo_tt_ctrc_get_u16_le(atom) != 1
+		|| cluster_undo_tt_ctrc_get_u64_le(atom + 2) != 56
+		|| cluster_undo_tt_ctrc_get_u64_le(atom + 66) != raw_length
+		|| memcmp(atom + 10, reference->key + 44, 56) != 0)
+		goto refused;
+	node = (ClusterRecoveryCTRCGraphNodeV2){
+		1,
+		{ reference->key, sizeof(reference->key) },
+		{ reference->evidence, reference->evidence_length }
+	};
+	memcpy(out, &node, sizeof(node));
+	return true;
+
+refused:
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return false;
+}
+
+bool
 cluster_recovery_ctrc_bind_reference_v2(XLogReaderState *reader,
 										  uint64 database_incarnation, uint32 source_index,
 										  const uint8 source_identity_digest[32],

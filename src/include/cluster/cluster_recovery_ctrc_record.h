@@ -439,6 +439,14 @@ extern bool cluster_recovery_ctrc_tt_abort_graph_nodes_v2(
 	const ClusterRecoveryCTRCTTAbortReferencesV2 *references,
 	ClusterRecoveryCTRCGraphNodeV2 out[CLUSTER_RECOVERY_CTRC_TT_ABORT_REFERENCE_COUNT]);
 
+/* Expose one complete native TT reference inventory as a borrowed kind-1
+ * graph node. The singleton raw atom and key metadata are rechecked before
+ * publication; this remains structural correspondence without graph,
+ * owner/terminal/base/floor/issued, durability, release or live authority. */
+extern bool cluster_recovery_ctrc_tt_reference_graph_node_v2(
+	const ClusterRecoveryCTRCTTReferenceV2 *reference,
+	ClusterRecoveryCTRCGraphNodeV2 *out);
+
 /* Expose a complete DATA inventory as borrowed kind-1 graph reference nodes.
  * The shared atom envelope, key lengths/identity bytes and physical slot
  * ordinals are rechecked before publishing the whole fixed descriptor array.

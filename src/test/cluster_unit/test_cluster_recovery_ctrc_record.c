@@ -4304,6 +4304,49 @@ UT_TEST(tt_wal_inventory_unaligned_aliases_and_immutable)
 	}
 }
 
+UT_TEST(tt_wal_inventory_graph_node_is_structural_and_atomic)
+{
+	xl_undo_tt_slot_bind identity = bind_sample();
+	NativeRaw wire;
+	NativePages pages;
+	XLogReaderState *reader;
+	ClusterRecoveryCTRCTTReferenceV2 reference, saved;
+	ClusterRecoveryCTRCGraphNodeV2 node;
+	uint8 guarded[sizeof(node) + 2];
+	size_t length = tt_wire(&wire, 0, &identity);
+
+	wire.align.xl_xid = InvalidTransactionId;
+	native_crc(&wire, length);
+	UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+	UT_ASSERT(cluster_recovery_ctrc_tt_wal_inventory_v2(reader, 99, 7, raw_source,
+		wire.bytes, length, &reference));
+	saved = reference;
+	UT_ASSERT(cluster_recovery_ctrc_tt_reference_graph_node_v2(&reference, &node));
+	UT_ASSERT_EQ(node.kind, 1);
+	UT_ASSERT(node.key.data == reference.key);
+	UT_ASSERT_EQ(node.key.length, sizeof(reference.key));
+	UT_ASSERT(node.evidence.data == reference.evidence);
+	UT_ASSERT_EQ(node.evidence.length, reference.evidence_length);
+	UT_ASSERT(memcmp(&reference, &saved, sizeof(reference)) == 0);
+
+	for (unsigned mutation = 0; mutation < 3; mutation++) {
+		ClusterRecoveryCTRCTTReferenceV2 copy = saved;
+
+		if (mutation == 0)
+			wal_atom_uint(copy.key + 100, 41, 8);
+		else if (mutation == 1)
+			wal_atom_uint(copy.evidence, 2, 8);
+		else
+			copy.evidence[16 + 10] ^= 1;
+		memset(guarded, 0xa5, sizeof(guarded));
+		UT_ASSERT(!cluster_recovery_ctrc_tt_reference_graph_node_v2(&copy,
+			(ClusterRecoveryCTRCGraphNodeV2 *)(guarded + 1)));
+		UT_ASSERT(all_zero(guarded + 1, sizeof(guarded) - 2));
+		UT_ASSERT(guarded[0] == 0xa5 && guarded[sizeof(guarded) - 1] == 0xa5);
+	}
+	XLogReaderFree(reader);
+}
+
 /* Full original DATA object evidence; expected scalar bytes do not use the
  * product put helpers, offset calculation or namespace enum. */
 static bool
@@ -5907,6 +5950,7 @@ main(void)
 	UT_RUN(tt_wal_inventory_original_record_binding);
 	UT_RUN(tt_wal_inventory_bounds_and_empty_identity);
 	UT_RUN(tt_wal_inventory_unaligned_aliases_and_immutable);
+	UT_RUN(tt_wal_inventory_graph_node_is_structural_and_atomic);
 	UT_RUN(tt_abort_inventory_complete_native_fields);
 	UT_RUN(tt_abort_inventory_refuses_wrong_frame_or_payload);
 	UT_RUN(tt_abort_inventory_unaligned_alias_and_immutable);
