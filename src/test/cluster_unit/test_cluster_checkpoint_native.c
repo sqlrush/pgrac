@@ -2386,6 +2386,89 @@ UT_TEST(writer_begin_accepts_recovered_cohort)
 	UT_ASSERT_EQ(native_writes | local_updates, 0);
 }
 
+static void
+recovered_writer_tail_fixture(void)
+{
+	writer_begin_fixture();
+	offered.input_kind = CLUSTER_WAL_STARTUP_RECOVERED;
+	/* The exact checkpoint is 100..220; later ordinary WAL ends at 340. */
+	offered.predecessor.snapshot.tail_last_record_lsn = 300;
+	offered.sealed_input_end = input.endOfLog = 340;
+	input.lastRec = 300;
+}
+
+UT_TEST(writer_begin_recovered_keeps_checkpoint_separate_from_tail)
+{
+	recovered_writer_tail_fixture();
+	UT_ASSERT_EQ(writer_begin(), wal_segment_size);
+	UT_ASSERT(clusterStartupWriterSelected && clusterStartupWriterBound);
+	UT_ASSERT_EQ(clusterStartupWriter.input_record_start, 100);
+	UT_ASSERT_EQ(clusterStartupWriter.input_record_end, 220);
+	UT_ASSERT_EQ(input.lastRec, 300);
+	UT_ASSERT_EQ(input.endOfLog, 340);
+	UT_ASSERT_EQ(route_calls, 1);
+	UT_ASSERT_EQ(bind_calls, 1);
+}
+
+UT_TEST(writer_begin_recovered_binds_before_native_recovery_done)
+{
+	for (unsigned state = 0; state < 2; state++) {
+		recovered_writer_tail_fixture();
+		/* The early crash branch seals; it does not select a CLEAN owner. */
+		current.state = state == 0 ? DB_IN_PRODUCTION : DB_IN_CRASH_RECOVERY;
+		self_seal_returns[0] = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		UT_ASSERT(startup_first_native_site());
+		UT_ASSERT_EQ(self_seal_calls, 1);
+		UT_ASSERT(!clusterStartupWriterSelected);
+		/* FinishWalRecovery leaves the native crash phase set until EOR. */
+		InRecovery = true;
+		current.state = DB_IN_CRASH_RECOVERY;
+		UT_ASSERT_EQ(writer_bind(), wal_segment_size);
+		UT_ASSERT(clusterStartupWriterSelected && clusterStartupWriterBound);
+		UT_ASSERT_EQ(advance_calls, 1);
+		UT_ASSERT(InRecovery);
+		UT_ASSERT_EQ(current.state, DB_IN_CRASH_RECOVERY);
+		UT_ASSERT_EQ(native_writes | local_updates, 0);
+	}
+}
+
+UT_TEST(native_crash_does_not_bind_clean_initialization)
+{
+	for (unsigned kind = 0; kind < 2; kind++) {
+		writer_begin_fixture();
+		offered.input_kind = kind == 0 ? CLUSTER_WAL_STARTUP_CLEAN
+			: CLUSTER_WAL_STARTUP_INITIALIZED;
+		current.state = DB_IN_PRODUCTION;
+		self_seal_returns[0] = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		UT_ASSERT(startup_first_native_site());
+		InRecovery = true;
+		current.state = DB_IN_CRASH_RECOVERY;
+		UT_ASSERT_EQ(writer_bind(), InvalidXLogRecPtr);
+		UT_ASSERT(!clusterStartupWriterSelected && !clusterStartupWriterBound);
+		UT_ASSERT_EQ(bind_calls | route_calls | native_writes | local_updates, 0);
+	}
+}
+
+UT_TEST(writer_begin_recovered_rejects_different_checkpoint_tail_or_phase)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		recovered_writer_tail_fixture();
+		switch (fault) {
+		case 0: current.checkPoint++; break;
+		case 1: input.lastRec++; break;
+		case 2: input.endOfLog++; break;
+		case 3: offered.input_record_end = offered.sealed_input_end + 1; break;
+		case 4: InRecovery = true; break; /* Not the corresponding crash state. */
+		case 5: current.state = DB_IN_ARCHIVE_RECOVERY; break;
+		case 6: offered.input_record_end = offered.input_record_start; break;
+		}
+		expected_control_checkpoint = current.checkPoint;
+		UT_ASSERT_EQ(writer_begin(), InvalidXLogRecPtr);
+		UT_ASSERT(!clusterStartupWriterBound);
+		UT_ASSERT_EQ(bind_calls | route_calls | native_writes | local_updates, 0);
+	}
+}
+
 UT_TEST(writer_begin_rejects_wrong_input_or_failed_route_without_binding)
 {
 	for (unsigned f = 0; f < 13; ++f) {
@@ -2938,7 +3021,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(79);
+	UT_PLAN(83);
 	UT_RUN(recovery_checkpoint_selects_scope_only_for_closed_online_owner);
 	UT_RUN(recovery_checkpoint_closed_admission_uses_only_original_scope);
 	UT_RUN(recovery_checkpoint_preserves_owner_and_native_guards);
@@ -3010,6 +3093,10 @@ main(void)
 	UT_RUN(startup_publish_refusal_never_installs_in_memory_candidate);
 	UT_RUN(writer_begin_routes_only_after_all_target_initializing);
 	UT_RUN(writer_begin_accepts_recovered_cohort);
+	UT_RUN(writer_begin_recovered_keeps_checkpoint_separate_from_tail);
+	UT_RUN(writer_begin_recovered_binds_before_native_recovery_done);
+	UT_RUN(native_crash_does_not_bind_clean_initialization);
+	UT_RUN(writer_begin_recovered_rejects_different_checkpoint_tail_or_phase);
 	UT_RUN(initializer_selection_precedes_first_native_side_effect);
 	UT_RUN(early_selection_refusal_or_cancel_precedes_native_mutation);
 	UT_RUN(late_binding_requires_same_early_selection);

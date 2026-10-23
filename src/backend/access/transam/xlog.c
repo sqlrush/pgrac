@@ -6313,16 +6313,18 @@ ClusterStartupWriterSelect(void)
 	ClusterWalSourceRef restart;
 	ClusterWalStartupImage selected;
 	ClusterControlRootResult result;
+	bool native_recovery = InRecovery;
 
 	if (MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
 		|| !cluster_controlfile_shared_authority || clusterStartupWriterSelected
 		|| clusterStartupWriterBound || clusterStartupWriterInstalled || CritSectionCount != 0
-		|| ShutdownRequestPending || InRecovery || ArchiveRecoveryRequested
-		|| ControlFile->state != DB_SHUTDOWNED || LWLockHeldByMe(ControlFileLock)
+		|| ShutdownRequestPending || ArchiveRecoveryRequested
+		|| ControlFile->state != (native_recovery ? DB_IN_CRASH_RECOVERY : DB_SHUTDOWNED)
+		|| LWLockHeldByMe(ControlFileLock)
 		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
 		|| !cluster_wal_thread_restart_v2_ref(&restart))
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-						errmsg("native clean startup has no exact immutable input")));
+						errmsg("native startup has no exact immutable input")));
 	for (;;) {
 		HandleStartupProcInterrupts();
 		CHECK_FOR_INTERRUPTS();
@@ -6347,6 +6349,7 @@ ClusterStartupWriterSelect(void)
 			 errdetail("PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=STARTUP_COHORT_UNPROVEN result=%d",
 					   (int)result)));
 	if (selected.phase != CLUSTER_WAL_STARTUP_INITIALIZING
+		|| (native_recovery && selected.input_kind != CLUSTER_WAL_STARTUP_RECOVERED)
 		|| (selected.input_kind != CLUSTER_WAL_STARTUP_CLEAN
 			&& selected.input_kind != CLUSTER_WAL_STARTUP_INITIALIZED
 			&& selected.input_kind != CLUSTER_WAL_STARTUP_RECOVERED)
@@ -6354,9 +6357,14 @@ ClusterStartupWriterSelect(void)
 		|| selected.first_segment_lsn == 0 || selected.first_segment_lsn % wal_segment_size != 0
 		|| selected.first_segment_lsn < selected.sealed_input_end
 		|| selected.first_segment_lsn > UINT64_MAX - wal_segment_size
-		|| selected.sealed_input_end != selected.input_record_end
+		|| selected.input_record_end <= selected.input_record_start
+		|| selected.input_record_end > selected.sealed_input_end
+		|| (selected.input_kind != CLUSTER_WAL_STARTUP_RECOVERED
+			&& (ControlFile->state != DB_SHUTDOWNED
+				|| selected.sealed_input_end != selected.input_record_end
+				|| ControlFile->checkPoint != selected.predecessor.snapshot.tail_last_record_lsn))
 		|| selected.timeline != selected.input_timeline
-		|| ControlFile->checkPoint != selected.predecessor.snapshot.tail_last_record_lsn
+		|| ControlFile->checkPoint != selected.input_record_start
 		|| selected.predecessor.snapshot.checkpoint_lower_lsn == InvalidXLogRecPtr
 		|| selected.predecessor.snapshot.checkpoint_lower_lsn > ControlFile->checkPoint
 		|| ControlFile->checkPointCopy.ThisTimeLineID != selected.timeline)
@@ -6494,30 +6502,47 @@ ClusterStartupWriterBegin(const EndOfWalRecoveryInfo *input)
 	const char *operation = "read";
 	unsigned step = 0;
 	bool wait_logged = false;
+	bool native_recovery = InRecovery;
 	ClusterCfAttemptObservation waiting = { 0 };
 
 	if (input == NULL || MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
-		|| !cluster_controlfile_shared_authority || !clusterStartupWriterSelected
+		|| !cluster_controlfile_shared_authority
 		|| clusterStartupWriterBound || clusterStartupWriterInstalled || CritSectionCount != 0
-		|| ShutdownRequestPending || InRecovery || ArchiveRecoveryRequested
+		|| ShutdownRequestPending || ArchiveRecoveryRequested
 		|| input->standby_signal_file_found || input->recovery_signal_file_found
 		|| input->abortedRecPtr != InvalidXLogRecPtr
-		|| input->missingContrecPtr != InvalidXLogRecPtr || ControlFile->state != DB_SHUTDOWNED
+		|| input->missingContrecPtr != InvalidXLogRecPtr
+		|| ControlFile->state != (native_recovery ? DB_IN_CRASH_RECOVERY : DB_SHUTDOWNED)
 		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock)
 		|| cluster_cf_held(ExclusiveLock))
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-						errmsg("native clean startup has no selected initialization owner")));
+						errmsg("native startup has no selected initialization owner")));
+	/* The crash branch sealed its old stream before native directory work.
+	 * Its RECOVERED successor can only be selected after redo has completed
+	 * the retained input cache, while native recovery is still in progress. */
+	if (native_recovery && !clusterStartupWriterSelected)
+		ClusterStartupWriterSelect();
+	if (!clusterStartupWriterSelected
+		|| (native_recovery && clusterStartupWriter.input_kind != CLUSTER_WAL_STARTUP_RECOVERED))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("native startup has no selected initialization owner")));
 	selected = clusterStartupWriter;
-	if (input->endOfLog != selected.sealed_input_end || input->endOfLog != selected.input_record_end
-		|| input->lastRec != selected.input_record_start
+	/* A RECOVERED input retains its exact checkpoint and its later sealed
+	 * WAL tail separately. Binding its successor still precedes native EOR;
+	 * it must not manufacture a clean shutdown or recovery-DONE state. */
+	if (input->endOfLog != selected.sealed_input_end
+		|| input->lastRec != selected.predecessor.snapshot.tail_last_record_lsn
+		|| (selected.input_kind != CLUSTER_WAL_STARTUP_RECOVERED
+			&& (input->endOfLog != selected.input_record_end
+				|| input->lastRec != selected.input_record_start))
 		|| input->lastRecTLI != selected.input_timeline
 		|| input->endOfLogTLI != selected.input_timeline
-		|| ControlFile->checkPoint != selected.predecessor.snapshot.tail_last_record_lsn
+		|| ControlFile->checkPoint != selected.input_record_start
 		|| selected.predecessor.snapshot.checkpoint_lower_lsn == InvalidXLogRecPtr
 		|| selected.predecessor.snapshot.checkpoint_lower_lsn > ControlFile->checkPoint
 		|| ControlFile->checkPointCopy.ThisTimeLineID != selected.timeline)
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-						errmsg("native recovery result contradicts its selected clean input")));
+						errmsg("native recovery result contradicts its selected input")));
 	for (;;) {
 		uint64 before;
 
@@ -6529,11 +6554,15 @@ ClusterStartupWriterBegin(const EndOfWalRecoveryInfo *input)
 		ClusterStartupConfigurationRequire();
 		if (memcmp(&selected, &clusterStartupWriter, sizeof(selected)) != 0
 			|| !clusterStartupWriterSelected || clusterStartupWriterBound
-			|| clusterStartupWriterInstalled || ControlFile->state != DB_SHUTDOWNED
-			|| ControlFile->checkPoint != selected.predecessor.snapshot.tail_last_record_lsn
+			|| clusterStartupWriterInstalled || InRecovery != native_recovery
+			|| ControlFile->state != (native_recovery ? DB_IN_CRASH_RECOVERY : DB_SHUTDOWNED)
+			|| ControlFile->checkPoint != selected.input_record_start
 			|| ControlFile->checkPointCopy.ThisTimeLineID != selected.timeline
 			|| input->endOfLog != selected.sealed_input_end
-			|| input->endOfLog != selected.input_record_end || input->lastRec != selected.input_record_start
+			|| input->lastRec != selected.predecessor.snapshot.tail_last_record_lsn
+			|| (selected.input_kind != CLUSTER_WAL_STARTUP_RECOVERED
+				&& (input->endOfLog != selected.input_record_end
+					|| input->lastRec != selected.input_record_start))
 			|| input->lastRecTLI != selected.input_timeline || input->endOfLogTLI != selected.input_timeline)
 			ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 							errmsg("native initialization owner changed before WAL binding")));
