@@ -167,6 +167,19 @@ static int fake_lwlock_depth = 0;
 static ClusterWaitTrace wait_trace_rows[128];
 static ClusterWaitTraceKind wait_trace_kinds[128];
 static unsigned wait_trace_count;
+static ClusterWaitSendGate send_gate_last;
+static BufferTag send_gate_tag;
+static unsigned send_gate_count;
+
+void
+cluster_wait_trace_send_gate_emit(const BufferTag *tag, const ClusterWaitSendGate *gate)
+{
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	UT_ASSERT(cluster_trace_tx_identity);
+	send_gate_tag = *tag;
+	send_gate_last = *gate;
+	send_gate_count++;
+}
 /* This fixture captures PCM rows, not the separate content-owner registry. */
 PROC_HDR *ProcGlobal = NULL;
 
@@ -11977,18 +11990,63 @@ UT_TEST(test_resource_x_remote_lane0_settlement_retires_only_after_exact_source_
 	UT_ASSERT_EQ(successor_ack.common.base_authority_generation, UINT64_C(0));
 
 	/* Sending retains the source debt; cadence does not substitute for ACK. */
+	send_gate_count = 0;
+	cluster_trace_tx_identity = true;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_capture_exact(
 					 &intent, intent.first_armed_us + 1, &sent_episode),
 				 RESOURCE_X_INTENT_STAGED);
+	cluster_trace_tx_identity = false;
+	UT_ASSERT_EQ(send_gate_count, 0); /* No callback before the transport handoff. */
 	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(
 		&sent_episode, true, intent.first_armed_us + 2));
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_snapshot_exact(
 					 &intent, &observed, payload, sizeof(payload)),
 				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(observed.last_send_us, intent.first_armed_us + 2);
+	{
+		uint64 saved_clock = fake_pcm_clock_us;
+		uint32 examined;
+		ResourceXIntentSlot probe_slot;
+		ResourceXIntentProbeResult probe_result;
+
+		fake_pcm_clock_us = intent.first_armed_us + 500001;
+		cluster_trace_tx_identity = true;
+		for (int i = 0; i < 64 && send_gate_count == 0; i++) {
+			probe_result = cluster_pcm_lock_resource_x_outbound_intent_probe_exact(
+				4, &probe_slot, payload, sizeof(payload), &examined);
+			if (probe_result == RESOURCE_X_INTENT_PROBE_COMPLETE
+				|| probe_result == RESOURCE_X_INTENT_PROBE_IDLE
+				|| probe_result == RESOURCE_X_INTENT_PROBE_CORRUPT)
+				break;
+		}
+		cluster_trace_tx_identity = false;
+		fake_pcm_clock_us = saved_clock;
+		UT_ASSERT(send_gate_count > 0);
+		UT_ASSERT_EQ(send_gate_last.site, CLWAIT_SEND_PROBE);
+		UT_ASSERT_EQ(send_gate_last.reason, CLWAIT_SEND_RETRY_AGE);
+		UT_ASSERT(BufferTagsEqual(&send_gate_tag, &intent.body.assertion.resource));
+		send_gate_count = 0;
+	}
+	cluster_trace_tx_identity = true;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, 0),
+				 RESOURCE_X_INTENT_NOT_DUE);
+	cluster_trace_tx_identity = false;
+	UT_ASSERT_EQ(send_gate_count, 1);
+	UT_ASSERT_EQ(send_gate_last.reason, CLWAIT_SEND_CLOCK);
+	cluster_trace_tx_identity = true;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(
 					 &intent, intent.first_armed_us + 500001),
 				 RESOURCE_X_INTENT_NOT_DUE);
+	cluster_trace_tx_identity = false;
+	UT_ASSERT_EQ(send_gate_count, 2);
+	UT_ASSERT_EQ(send_gate_last.reason, CLWAIT_SEND_RETRY_AGE);
+	UT_ASSERT_EQ(send_gate_last.site, CLWAIT_SEND_STAGE);
+	UT_ASSERT_EQ(send_gate_last.last_attempt_us, observed.last_attempt_us);
+	UT_ASSERT_EQ(send_gate_last.logical_generation, observed.logical_generation);
+	UT_ASSERT_EQ(send_gate_last.owner_generation, observed.body.owner_generation);
+	UT_ASSERT_EQ(send_gate_last.authority_generation, observed.authority_generation);
+	UT_ASSERT_EQ(send_gate_last.requester, observed.body.assertion.requester_node);
+	UT_ASSERT(BufferTagsEqual(&send_gate_tag, &intent.body.assertion.resource));
 	/* Authenticated nonterminal response owns a wait, never a success. */
 	cluster_node_id = 2; /* Exercise a remote source's two connection lifetimes. */
 	memset(&busy, 0, sizeof(busy));
@@ -12007,13 +12065,23 @@ UT_TEST(test_resource_x_remote_lane0_settlement_retires_only_after_exact_source_
 				 RESOURCE_X_APPLY_INVALID);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_busy_exact(&busy, 0, 0, 61),
 				 RESOURCE_X_APPLY_APPLIED);
+	cluster_trace_tx_identity = true;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(
 					 &intent, intent.first_armed_us + 500002),
 				 RESOURCE_X_INTENT_NOT_DUE);
+	cluster_trace_tx_identity = false;
+	UT_ASSERT_EQ(send_gate_count, 3);
+	UT_ASSERT_EQ(send_gate_last.reason, CLWAIT_SEND_STREAM_BUSY);
+	UT_ASSERT(send_gate_last.busy);
 	fake_rx_stream_generation = 0;
+	cluster_trace_tx_identity = true;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(
 					 &intent, intent.first_armed_us + 1000002),
 				 RESOURCE_X_INTENT_NOT_DUE);
+	cluster_trace_tx_identity = false;
+	UT_ASSERT_EQ(send_gate_count, 4);
+	UT_ASSERT_EQ(send_gate_last.reason, CLWAIT_SEND_STREAM_BUSY);
+	UT_ASSERT_EQ(send_gate_last.stream_generation, 0);
 	/* DATA did not change: CONTROL alone invalidates receiver continuation. */
 	fake_rx_stream_generation = 61;
 	fake_rx_capability_generation = 62;
@@ -12037,9 +12105,14 @@ UT_TEST(test_resource_x_remote_lane0_settlement_retires_only_after_exact_source_
 	UT_ASSERT(cluster_pcm_rx_stats_snapshot(&stats));
 	UT_ASSERT_EQ(stats.count[PCM_RX_POTENTIAL_LOSS], 1);
 	/* WB, then local refusal, cannot recount the same unanswered send. */
+	cluster_trace_tx_identity = true;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(
 					 &intent, intent.first_armed_us + 2000003),
 				 RESOURCE_X_INTENT_STALE);
+	cluster_trace_tx_identity = false;
+	UT_ASSERT_EQ(send_gate_count, 5);
+	UT_ASSERT_EQ(send_gate_last.reason, CLWAIT_SEND_PHYSICAL_OWNER);
+	UT_ASSERT_EQ(send_gate_last.state, RESOURCE_X_INTENT_SLOT_STAGED);
 	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(
 		&retry_episode, false, intent.first_armed_us + 2000003));
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_capture_exact(

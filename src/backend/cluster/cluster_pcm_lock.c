@@ -4759,26 +4759,76 @@ pcm_resource_x_peer_capability_generation(int32 peer)
  * ceiling, not evidence that a frame was sent or that a response was lost.
  * Scheduling eligibility is separate from retained protocol debt. Never
  * renew last_attempt while merely scanning or losing a staging race. */
-static bool
-pcm_resource_x_intent_send_due(const ClusterPcmResourceXMasterState *state,
-							   const ResourceXIntentSlot *slot, uint64 now_us)
+static void
+pcm_resource_x_send_gate_capture(const ResourceXIntentSlot *slot, uint64 now_us,
+								ClusterWaitSendGate *observed)
 {
-	if (now_us == 0 || now_us == UINT64_MAX)
+	memset(observed, 0, sizeof(*observed));
+	observed->known = true;
+	observed->owner = slot->body.owner_kind;
+	observed->owner_node = slot->body.owner_node;
+	observed->owner_index = slot->body.owner_index;
+	observed->requester = slot->body.assertion.requester_node;
+	observed->owner_generation = slot->body.owner_generation;
+	observed->logical_generation = slot->logical_generation;
+	observed->authority_generation = slot->authority_generation;
+	observed->state = slot->state;
+	observed->kind = slot->kind;
+	observed->destination = slot->destination_node;
+	observed->observed_us = now_us;
+	observed->last_attempt_us = slot->last_attempt_us;
+	observed->last_send_us = slot->last_send_us;
+	observed->episode = slot->send_episode;
+}
+
+static bool
+pcm_resource_x_intent_send_due_observed(const ClusterPcmResourceXMasterState *state,
+									const ResourceXIntentSlot *slot, uint64 now_us,
+									ClusterWaitSendGate *observation)
+{
+	if (now_us == 0 || now_us == UINT64_MAX) {
+		if (observation != NULL)
+			observation->reason = CLWAIT_SEND_CLOCK;
 		return false;
+	}
 	if (slot->body.owner_kind == RESOURCE_X_INTENT_OWNER_HOLDER_RELEASE && state != NULL
 		&& state->source_settlement.busy) {
 		const ClusterPcmResourceXSourceSettlement *debt = &state->source_settlement;
 		uint64 generation = cluster_ic_tier1_resource_x_stream_generation(slot->destination_node,
 																		  debt->busy_channel);
 		uint32 capability = pcm_resource_x_peer_capability_generation(slot->destination_node);
+		if (observation != NULL) {
+			observation->busy = true;
+			observation->stream_generation = generation;
+			observation->busy_stream_generation = debt->busy_stream_generation;
+			observation->capability_generation = capability;
+			observation->busy_capability_generation = debt->busy_capability_generation;
+		}
 		if (generation == 0 || capability == 0
 			|| (generation == debt->busy_stream_generation
-				&& capability == debt->busy_capability_generation))
+				&& capability == debt->busy_capability_generation)) {
+			if (observation != NULL)
+				observation->reason = CLWAIT_SEND_STREAM_BUSY;
 			return false;
+		}
 	}
-	return slot->last_attempt_us == 0
-		   || (now_us >= slot->last_attempt_us
-			   && now_us - slot->last_attempt_us >= UINT64_C(500000));
+	if (slot->last_attempt_us == 0
+		|| (now_us >= slot->last_attempt_us
+			&& now_us - slot->last_attempt_us >= UINT64_C(500000))) {
+		if (observation != NULL)
+			observation->reason = CLWAIT_SEND_DUE;
+		return true;
+	}
+	if (observation != NULL)
+		observation->reason = CLWAIT_SEND_RETRY_AGE;
+	return false;
+}
+
+static bool
+pcm_resource_x_intent_send_due(const ClusterPcmResourceXMasterState *state,
+							   const ResourceXIntentSlot *slot, uint64 now_us)
+{
+	return pcm_resource_x_intent_send_due_observed(state, slot, now_us, NULL);
 }
 
 /* LMS0 uses its existing event-loop timeout to revisit quiet obligations.
@@ -26090,6 +26140,9 @@ cluster_pcm_lock_resource_x_outbound_intent_stage_capture_exact(const ResourceXI
 	ResourceXIntentSlot *slot;
 	ResourceXIntentResult result;
 	uint8 *payload;
+	ClusterWaitSendGate observation;
+	ClusterWaitSendGate *observed = NULL;
+	BufferTag observed_tag;
 
 	slot = pcm_resource_x_outbound_intent_lock_exact(expected, &entry_ref, &payload);
 	if (slot == NULL)
@@ -26104,10 +26157,18 @@ cluster_pcm_lock_resource_x_outbound_intent_stage_capture_exact(const ResourceXI
 	/* Physical queue ownership is not the idempotent semantic stage API.
 	 * An ingress worker and the scan worker can observe the same ARMED
 	 * handle: only one may acquire a ring copy under this entry lock. */
-	if (slot->state != RESOURCE_X_INTENT_SLOT_ARMED)
+	if (cluster_trace_tx_identity) {
+		pcm_resource_x_send_gate_capture(slot, now_us, &observation);
+		observed = &observation;
+		observed->site = CLWAIT_SEND_STAGE;
+		observed_tag = slot->body.assertion.resource;
+	}
+	if (slot->state != RESOURCE_X_INTENT_SLOT_ARMED) {
+		if (observed != NULL)
+			observed->reason = CLWAIT_SEND_PHYSICAL_OWNER;
 		result = RESOURCE_X_INTENT_STALE;
-	else if (!pcm_resource_x_intent_send_due(pcm_resource_x_master_state_for_entry(entry_ref.entry),
-											 slot, now_us))
+	} else if (!pcm_resource_x_intent_send_due_observed(
+				   pcm_resource_x_master_state_for_entry(entry_ref.entry), slot, now_us, observed))
 		result = RESOURCE_X_INTENT_NOT_DUE;
 	else
 		result = cluster_pcm_lock_resource_x_intent_stage_exact(slot, expected, now_us);
@@ -26127,8 +26188,15 @@ cluster_pcm_lock_resource_x_outbound_intent_stage_capture_exact(const ResourceXI
 	}
 	if (result == RESOURCE_X_INTENT_STAGED && staged_out != NULL)
 		*staged_out = *slot;
+	if (observed != NULL)
+		observed->result = result;
 	LWLockRelease(&entry_ref.entry->entry_lock.lock);
 	pcm_entry_ref_release(&entry_ref);
+	/* Successful staging still owes a transport handoff. Do not add any
+	 * diagnostic callback on that path; rejections own no new ring copy. */
+	if (observed != NULL
+		&& (result == RESOURCE_X_INTENT_NOT_DUE || result == RESOURCE_X_INTENT_STALE))
+		cluster_wait_trace_send_gate_emit(&observed_tag, observed);
 	return result;
 }
 
@@ -26423,6 +26491,9 @@ cluster_pcm_lock_resource_x_outbound_work_probe_exact(uint32 probe_budget,
 		PcmEntryAcquireResult acquire_result;
 		struct GrdEntry *entry;
 		uint32 owner_index;
+		ClusterWaitSendGate rejected;
+		BufferTag rejected_tag;
+		bool rejected_known = false;
 
 		examined++;
 		if (registry_slot->state == PCM_REGISTRY_EMPTY
@@ -26618,16 +26689,33 @@ cluster_pcm_lock_resource_x_outbound_work_probe_exact(uint32 probe_budget,
 				*examined_out = examined;
 				return RESOURCE_X_INTENT_PROBE_CORRUPT;
 			}
-			if (!pcm_resource_x_intent_send_due(state, slot, pcm_resource_x_monotonic_us())) {
-				/* COMPLETE may retire this scan, but not the retained owner.
-				 * Keep the next scan eligible without a busy self-wakeup. */
-				if (!pcm_resource_x_intent_mark_pending(false)) {
-					LWLockRelease(&entry->entry_lock.lock);
-					pcm_entry_ref_release(&entry_ref);
-					*examined_out = examined;
-					return RESOURCE_X_INTENT_PROBE_CORRUPT;
+			{
+				uint64 now_us = pcm_resource_x_monotonic_us();
+				ClusterWaitSendGate *observation
+					= cluster_trace_tx_identity && !rejected_known ? &rejected : NULL;
+				bool due;
+
+				if (observation != NULL) {
+					pcm_resource_x_send_gate_capture(slot, now_us, observation);
+					observation->site = CLWAIT_SEND_PROBE;
 				}
-				continue;
+				due = pcm_resource_x_intent_send_due_observed(state, slot, now_us, observation);
+				if (!due && observation != NULL) {
+					rejected_tag = slot->body.assertion.resource;
+					rejected.result = RESOURCE_X_INTENT_NOT_DUE;
+					rejected_known = true;
+				}
+				if (!due) {
+					/* COMPLETE may retire this scan, but not the retained owner.
+					 * Keep the next scan eligible without a busy self-wakeup. */
+					if (!pcm_resource_x_intent_mark_pending(false)) {
+						LWLockRelease(&entry->entry_lock.lock);
+						pcm_entry_ref_release(&entry_ref);
+						*examined_out = examined;
+						return RESOURCE_X_INTENT_PROBE_CORRUPT;
+					}
+					continue;
+				}
 			}
 			*slot_out = *slot;
 			memcpy(payload_out, payload, slot->payload_bytes);
@@ -26638,6 +26726,8 @@ cluster_pcm_lock_resource_x_outbound_work_probe_exact(uint32 probe_budget,
 			}
 			LWLockRelease(&entry->entry_lock.lock);
 			pcm_entry_ref_release(&entry_ref);
+			if (rejected_known)
+				cluster_wait_trace_send_gate_emit(&rejected_tag, &rejected);
 			pg_atomic_write_u64(&ClusterPcm->resource_x_intent_next_state_index, cursor);
 			pg_atomic_write_u32(&ClusterPcm->resource_x_intent_next_owner_index, owner_cursor);
 			*examined_out = examined;
@@ -26645,6 +26735,8 @@ cluster_pcm_lock_resource_x_outbound_work_probe_exact(uint32 probe_budget,
 		}
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
+		if (rejected_known)
+			cluster_wait_trace_send_gate_emit(&rejected_tag, &rejected);
 		cursor++;
 		owner_cursor = 0;
 	}

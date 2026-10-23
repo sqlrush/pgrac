@@ -18,8 +18,16 @@ int MyProcPid = 1234;
 PGPROC *MyProc = NULL;
 static char last[8192];
 static unsigned logs;
+static bool forbid_ereport;
 
-bool errstart(int level, const char *domain) { (void)domain; assert(level == LOG); return true; }
+bool errstart(int level, const char *domain) { (void)domain; assert(!forbid_ereport); assert(level == LOG); return true; }
+void write_stderr(const char *fmt, ...) {
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(last, sizeof(last), fmt, ap);
+	va_end(ap);
+	logs++;
+}
 int errmsg_internal(const char *fmt, ...) {
 	va_list ap;
 	va_start(ap, fmt);
@@ -36,10 +44,12 @@ int main(void) {
 	ClusterTTStatusKey key = {0};
 	ClusterTxLocator locator = {0};
 	ClusterWaitTrace resource = {0};
+	ClusterWaitSendGate send = {0};
 	unsigned before;
 
 	/* Disabled instrumentation must not inspect an identity at all. */
 	cluster_tx_identity_trace_emit(CLTXID_ACTIVE, NULL);
+	cluster_wait_trace_send_gate_emit(NULL, NULL);
 	assert(logs == 0);
 	cluster_trace_tx_identity = true;
 	cluster_tx_identity_trace_canonical(&row, 2, 4196258, 513, 24, 0, 0, true, 77);
@@ -210,6 +220,23 @@ int main(void) {
 	cluster_wait_trace_emit(CLWAIT_NKINDS, &resource);
 	cluster_wait_trace_emit(CLWAIT_TX_BUFFER, NULL);
 	assert(logs == before + 1);
+	before = logs;
+	cluster_wait_trace_send_gate_emit(&resource.tag, &send);
+	assert(logs == before); /* Unknown is not a known send decision. */
+	send.known = true; send.owner = 6; send.state = 1;
+	send.reason = CLWAIT_SEND_RETRY_AGE; send.observed_us = 500001;
+	send.last_attempt_us = 1; send.logical_generation = 41;
+	forbid_ereport = true;
+	cluster_wait_trace_emit(CLWAIT_PCM_SEND_GATE, &resource);
+	assert(logs == before); /* This family has only the non-throwing emitter. */
+	cluster_wait_trace_send_gate_emit(&resource.tag, &send);
+	assert(logs == before + 1 && strstr(last, "event=PCM_SEND_GATE"));
+	assert(strstr(last, "send_gate_known=1 send_owner=6 send_state=1 send_reason=5"));
+	assert(strstr(last, "send_observed_us=500001 send_last_attempt_us=1"));
+	for (unsigned i = 0; i < CLUSTER_WAIT_TRACE_LIMIT + 2; i++)
+		cluster_wait_trace_send_gate_emit(&resource.tag, &send);
+	assert(strstr(last, "event=LIMIT family=PCM_SEND_GATE") && strstr(last, "evidence_complete=0"));
+	forbid_ereport = false;
 	puts("tx identity / wait resources trace: OFF, identities and independent budgets PASS");
 	return 0;
 }
