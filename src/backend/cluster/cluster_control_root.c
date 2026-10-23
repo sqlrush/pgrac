@@ -5842,29 +5842,6 @@ startup_owner_current(uint64 system_identifier, uint64 epoch, uint64 incarnation
 								   CLUSTER_WAL_STARTUP_CLEAN);
 }
 
-static bool
-startup_recovered_owner_current(const ControlRootImage *root,
-							const ClusterFormationSnapshotV1 *formation)
-{
-	ClusterRecoveryCheckpointObservationV1 observed;
-
-	return cluster_recovery_checkpoint_observe_v1(&observed)
-		   && observed.slot_generation != 0
-		   && observed.slot_generation != UINT64_MAX
-		   && root->header.system_identifier != 0
-		   && root->header.system_identifier == GetSystemIdentifier()
-		   && observed.owner.writer.ref.claim.identity.system_identifier
-			  == root->header.system_identifier
-		   && observed.owner.owner_boot == cluster_qvotec_get_self_incarnation()
-		   && observed.owner.writer.epoch == formation->local_epoch
-		   && observed.owner.writer.ref.claim.identity.origin_node_id == cluster_node_id
-		   && observed.owner.writer.ref.claim.identity.origin_thread_id == cluster_node_id + 1
-		   && observed.owner.writer.ref.claim.identity.origin_owner_incarnation
-			  == observed.owner.owner_boot
-		   && cluster_wal_thread_recovered_writer_matches(&observed.owner.writer.ref,
-																 observed.owner.writer.epoch);
-}
-
 /* CLEAN proves collective exit; kind4 proves no previous admitted writer.
  * RECOVERED additionally requires the complete cache-recovery cut below.
  * Every input still requires the complete current formation and durable fence. */
@@ -5897,10 +5874,9 @@ startup_complete_formation(const ControlRootImage *root,
 						   == root->records[node].identity.origin_owner_incarnation)))
 			return false;
 	}
-	if (kind == CLUSTER_WAL_STARTUP_RECOVERED) {
-		if (!startup_recovered_owner_current(root, formation))
-			return false;
-	}
+	/* RECOVERED namespace creation precedes native INSTALL. Its original
+	 * COMPLETE/CLOSED inputs and current formation/fence authorize this work;
+	 * the later checkpoint-owner publication belongs to service handoff. */
 	return startup_owner_for_input(root->header.system_identifier, formation->local_epoch,
 								   cluster_qvotec_get_self_incarnation(),
 								   root->header.v2.configured, kind);
@@ -5915,8 +5891,7 @@ startup_operation_owner(const ControlRootImage *root, const ClusterWalStartupIma
 		|| (op->input_kind == CLUSTER_WAL_STARTUP_RECOVERED
 			&& (!cluster_reconfig_capture_formation_snapshot_v1(
 						 op->claim.identity.origin_thread_id, &formation)
-				|| formation.local_epoch != op->formation_epoch
-				|| !startup_recovered_owner_current(root, &formation))))
+				|| formation.local_epoch != op->formation_epoch)))
 		return false;
 	return startup_owner_for_input(op->claim.identity.system_identifier, op->formation_epoch,
 								   op->claim.identity.origin_owner_incarnation,
@@ -6568,7 +6543,6 @@ reserve_recovered_publish(ReserveCleanWork *work, const ClusterControlRootIdenti
 			return result;
 	}
 	if (!cluster_wal_retention_root_publish_set_current_v1(work->recovered_walr)
-		|| !startup_recovered_owner_current(&scan->base, &work->formation)
 		|| !startup_owner_for_input(self->system_identifier, work->formation.local_epoch,
 								 self->origin_owner_incarnation, work->cut.required,
 								 CLUSTER_WAL_STARTUP_RECOVERED)
@@ -6647,6 +6621,7 @@ typedef struct StartupAdvanceWork {
 	ClusterWalStartupImage op;
 	ClusterControlRootFileToken token;
 	bool cf_held;
+	bool recovered_pending;
 } StartupAdvanceWork;
 
 /* Read the original selected inputs again; never synthesize creation/exit
@@ -6881,9 +6856,17 @@ startup_advance_observe(StartupAdvanceWork *work, const ClusterWalSourceRef *res
 			work->root.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES, restart->claim.identity.storage_uuid,
 			restart->claim.identity.system_identifier, &work->formation, &work->cut);
 	}
-	if (work->root.header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED
-		|| work->root.header.v2.serving[0] != 0 || work->root.header.v2.serving[1] != 0
-		|| work->root.startup[node].generation == 0)
+	if ((work->root.header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED
+		 && work->root.header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_RECOVERING)
+		|| work->root.header.v2.serving[0] != 0 || work->root.header.v2.serving[1] != 0)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	if (work->root.startup[node].generation == 0) {
+		/* Only select the original reserve owner here. It must reobserve the
+		 * full COMPLETE/CLOSED cohort, exact ROOT and retained WAL before CAS. */
+		work->recovered_pending = true;
+		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	}
+	if (work->root.header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED)
 		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
 	result = cluster_wal_startup_read_locked(&work->root, node, &work->op);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -6923,6 +6906,16 @@ startup_advance_step(StartupAdvanceWork *work, const ClusterWalSourceRef *restar
 		&& (work->root.header.v2.configured[coordinator / 64] & (UINT64_C(1) << (coordinator % 64)))
 			   == 0)
 		++coordinator;
+	if (work->recovered_pending) {
+		ClusterControlRootIdentity self = restart->claim.identity;
+
+		if (coordinator != (unsigned)cluster_node_id)
+			return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+		self.origin_owner_incarnation = cluster_qvotec_get_self_incarnation();
+		result = cluster_control_root_v3_reserve_recovered(&self, &work->token, &published);
+		return result == CLUSTER_CONTROL_ROOT_OK_PRIMARY ? CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+														 : result;
+	}
 	if (work->root.header.v2.database_state == CLUSTER_CONTROL_ROOT_DATABASE_CLOSED) {
 		if (coordinator != (unsigned)cluster_node_id)
 			return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;

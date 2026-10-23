@@ -142,6 +142,7 @@ static void (*test_checkpoint_published_hook)(void);
 static void test_recovered_checkpoint_owner_fixture(const ClusterWalSourceRef *ref,
 																			 uint64 epoch);
 static void test_recovered_checkpoint_owner_system_identifier(uint64 system_identifier);
+static void test_recovered_checkpoint_owner_unpublish(void);
 static int test_recovery_checkpoint_scope_key;
 static bool test_recovery_checkpoint_current;
 static unsigned test_recovery_checkpoint_reads, test_recovery_checkpoint_revoke_at;
@@ -9072,7 +9073,7 @@ UT_TEST(test_recovered_reserve_all_complete_without_clean_exit_ack)
 	v3_recovered_reserve_success(true);
 }
 
-UT_TEST(test_recovered_reserve_requires_published_writer_observation)
+UT_TEST(test_recovered_reserve_requires_retained_cache_inputs)
 {
 	uint8 before[66048];
 	ControlRootImage root;
@@ -9084,16 +9085,16 @@ UT_TEST(test_recovered_reserve_requires_published_writer_observation)
 	if (ut_current_failed)
 		return;
 
-	test_recovered_writer_epoch = 0;
+	test_recovered_checkpoint_owner_unpublish();
+	test_walr_sealed_current = false;
 	memset(&token, 0xa5, sizeof(token));
 	UT_ASSERT_NE(cluster_control_root_v3_reserve_recovered(&self, &expected, &token), 0);
 	UT_ASSERT(v2_zero(&token, sizeof(token)));
 	v2_assert_primary_unchanged(before);
+	test_walr_sealed_current = true;
 }
 
-static void test_recovered_checkpoint_owner_schedule(unsigned change_at, unsigned fault);
-
-UT_TEST(test_recovered_reserve_rechecks_checkpoint_owner_after_publish)
+UT_TEST(test_recovered_reserve_precedes_checkpoint_owner_publication)
 {
 	uint8 before[66048];
 	ControlRootImage root;
@@ -9103,11 +9104,11 @@ UT_TEST(test_recovered_reserve_rechecks_checkpoint_owner_after_publish)
 	v3_recovered_reserve_fixture(before, &root, &self, &expected, true);
 	if (ut_current_failed)
 		return;
-	test_recovered_checkpoint_owner_schedule(4, 7); /* final post-readback observation */
+	test_recovered_checkpoint_owner_unpublish();
 	memset(&token, 0xa5, sizeof(token));
-	UT_ASSERT_NE(cluster_control_root_v3_reserve_recovered(&self, &expected, &token), 0);
-	UT_ASSERT(v2_zero(&token, sizeof(token)));
-	test_recovered_checkpoint_owner_schedule(0, 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_reserve_recovered(&self, &expected, &token), 0);
+	UT_ASSERT_EQ(token.file_txn_seq, expected.file_txn_seq + 1);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
 }
 
 static void
@@ -9541,7 +9542,7 @@ UT_TEST(test_recovered_begin_requires_every_actual_empty_target)
 	test_reserve_mode = false;
 }
 
-UT_TEST(test_recovered_prepare_rechecks_checkpoint_owner_after_readback)
+UT_TEST(test_recovered_prepare_precedes_checkpoint_owner_publication)
 {
 	uint8 before[66048];
 	ControlRootImage root;
@@ -9551,12 +9552,13 @@ UT_TEST(test_recovered_prepare_rechecks_checkpoint_owner_after_readback)
 	v3_recovered_begin_fixture(before, &root, &token, ops, false);
 	if (ut_current_failed)
 		return;
-	test_recovered_checkpoint_owner_schedule(4, 7); /* final post-readback owner check */
+	test_recovered_checkpoint_owner_unpublish();
 	memset(&observed, 0xa5, sizeof(observed));
-	UT_ASSERT_NE(cluster_control_root_v3_startup_prepare_target(&ops[0].claim.identity,
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_prepare_target(&ops[0].claim.identity,
 												 ops[0].operation_uuid, &observed), 0);
-	UT_ASSERT(v2_zero(&observed, sizeof(observed)));
-	test_recovered_checkpoint_owner_schedule(0, 0);
+	UT_ASSERT_EQ(observed.phase, CLUSTER_WAL_STARTUP_RESERVED);
+	UT_ASSERT_EQ(observed.input_kind, CLUSTER_WAL_STARTUP_RECOVERED);
+	v2_assert_primary_unchanged(before);
 	test_reserve_mode = false;
 }
 
@@ -9702,7 +9704,105 @@ UT_TEST(test_v3_native_driver_advances_recovered_cohort_without_losing_kinds)
 	test_reserve_mode = false;
 }
 
-UT_TEST(test_v3_native_driver_rejects_foreign_recovered_owner_system)
+UT_TEST(test_v3_native_driver_reserves_cache_complete_cohort)
+{
+	for (unsigned variant = 0; variant < 4; variant++) {
+		uint8 before[66048];
+		ControlRootImage root;
+		ClusterControlRootIdentity self;
+		ClusterControlRootFileToken token;
+		ClusterWalStartupImage observed;
+		ClusterWalSourceRef restart;
+		char path[MAXPGPATH];
+		unsigned exits;
+		bool all_recovered = (variant & 1) != 0;
+
+		v3_recovered_reserve_fixture(before, &root, &self, &token, all_recovered);
+		if (ut_current_failed)
+			goto done;
+		/* This shared owner is published only after native INSTALL/DONE. */
+		test_recovered_checkpoint_owner_unpublish();
+		if (variant & 2) {
+			root.header.v2.database_state = CLUSTER_CONTROL_ROOT_DATABASE_RECOVERING;
+			UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+			memcpy(before, root.bytes, sizeof(before));
+			v2_write_roots(before);
+		}
+		exits = test_startup_exit_requests;
+		/* No direct reserve/begin API calls: enter at the native driver. */
+		restart = v3_recovered_driver_restart(&root, 3);
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed),
+					 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+		UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+		v2_assert_primary_unchanged(before);
+		restart = v3_recovered_driver_restart(&root, 0);
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed),
+					 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+		UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+		if (ut_current_failed)
+			goto done;
+		/* Only the reservation's rename observer needs this fixture mode. */
+		test_walr_recovered_strict = false;
+		path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+		read_all_or_abort(path, before, sizeof(before));
+		UT_ASSERT_EQ(cluster_control_root_v3_decode(before, sizeof(before), v2_storage,
+												 TEST_SYSID, &root), 0);
+		for (int node = 3; node >= 0; node -= 3) {
+			restart = v3_recovered_driver_restart(&root, node);
+			UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed),
+						 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+			UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+		}
+		for (unsigned node = 0; node <= 3; node += 3) {
+			restart = v3_recovered_driver_restart(&root, node);
+			UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed), 0);
+			UT_ASSERT_EQ(observed.phase, CLUSTER_WAL_STARTUP_INITIALIZING);
+			UT_ASSERT_EQ(observed.input_kind, node == 0 || all_recovered
+												 ? CLUSTER_WAL_STARTUP_RECOVERED
+												 : CLUSTER_WAL_STARTUP_CLEAN);
+		}
+		UT_ASSERT_EQ(test_startup_exit_requests, exits);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+done:
+		test_walr_recovered_strict = false;
+		test_reserve_mode = false;
+	}
+}
+
+UT_TEST(test_v3_native_driver_rejects_unqualified_cache_cohort)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		uint8 before[66048];
+		ControlRootImage root;
+		ClusterControlRootIdentity self;
+		ClusterControlRootFileToken token;
+		ClusterWalStartupImage observed;
+		ClusterWalSourceRef restart;
+		ClusterControlRootResult result;
+
+		v3_recovered_reserve_fixture(before, &root, &self, &token, true);
+		if (fault == 0)
+			root.records[3].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+		if (fault == 1)
+			root.records[3].recovered_last_record_crc32c ^= 1;
+		UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+		memcpy(before, root.bytes, sizeof(before));
+		v2_write_roots(before);
+		if (fault == 2)
+			test_fence = false;
+		restart = v3_recovered_driver_restart(&root, 0);
+		result = cluster_control_root_v3_startup_advance_clean(&restart, &observed);
+		UT_ASSERT(result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				  && result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+		UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+		v2_assert_primary_unchanged(before);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		test_walr_recovered_strict = false;
+		test_reserve_mode = false;
+	}
+}
+
+UT_TEST(test_v3_native_driver_rejects_foreign_current_system)
 {
 	uint8 before[66048];
 	ControlRootImage root;
@@ -9712,14 +9812,14 @@ UT_TEST(test_v3_native_driver_rejects_foreign_recovered_owner_system)
 	v3_recovered_begin_fixture(before, &root, &token, ops, false);
 	if (ut_current_failed)
 		return;
-	/* Keep the ROOT and current WAL source bound to this system while making
-	 * the published recovered owner foreign.  The formation gate must refuse
-	 * before any startup mutation. */
-	test_recovered_checkpoint_owner_system_identifier(root.header.system_identifier ^ UINT64_C(1));
+	/* Native creation must reject a foreign current system independently of
+	 * the checkpoint observation that cannot authorize this earlier phase. */
+	test_system_identifier = root.header.system_identifier ^ UINT64_C(1);
 	restart = v3_recovered_driver_restart(&root, 0);
 	UT_ASSERT_NE(cluster_control_root_v3_startup_advance_clean(&restart, &observed), 0);
 	UT_ASSERT(v2_zero(&observed, sizeof(observed)));
 	v2_assert_primary_unchanged(before);
+	test_system_identifier = TEST_SYSID;
 	test_reserve_mode = false;
 }
 
@@ -24922,16 +25022,18 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 	if (getenv("PGRAC_PRE2_TEST_RECOVERED_BEGIN") != NULL) {
-		UT_PLAN(10);
+		UT_PLAN(12);
 		UT_RUN(test_recovered_begin_mixed_inputs_keep_their_original_kinds);
 		UT_RUN(test_recovered_begin_all_complete_inputs_are_not_clean_exit);
 		UT_RUN(test_recovered_begin_requires_every_actual_empty_target);
-		UT_RUN(test_recovered_prepare_rechecks_checkpoint_owner_after_readback);
+		UT_RUN(test_recovered_prepare_precedes_checkpoint_owner_publication);
 		UT_RUN(test_recovered_begin_rejects_an_independently_rebound_peer);
 		UT_RUN(test_recovered_begin_retains_original_owner_and_fence_guards);
 		UT_RUN(test_v3_native_driver_prepares_sparse_targets_then_returns_initializing);
 		UT_RUN(test_v3_native_driver_advances_recovered_cohort_without_losing_kinds);
-		UT_RUN(test_v3_native_driver_rejects_foreign_recovered_owner_system);
+		UT_RUN(test_v3_native_driver_reserves_cache_complete_cohort);
+		UT_RUN(test_v3_native_driver_rejects_unqualified_cache_cohort);
+		UT_RUN(test_v3_native_driver_rejects_foreign_current_system);
 		UT_RUN(test_v3_begin_requires_all_declared_empty_targets_before_native_mutation);
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
@@ -24941,8 +25043,8 @@ main(int argc, char **argv)
 		UT_RUN(test_v3_reserve_clean_publishes_all_sparse_targets_without_serving);
 		UT_RUN(test_recovered_reserve_mixed_roster_uses_actual_checkpoint);
 		UT_RUN(test_recovered_reserve_all_complete_without_clean_exit_ack);
-		UT_RUN(test_recovered_reserve_requires_published_writer_observation);
-		UT_RUN(test_recovered_reserve_rechecks_checkpoint_owner_after_publish);
+		UT_RUN(test_recovered_reserve_requires_retained_cache_inputs);
+		UT_RUN(test_recovered_reserve_precedes_checkpoint_owner_publication);
 		UT_RUN(test_recovered_reserve_releases_partial_cohort_once);
 		UT_RUN(test_recovered_reserve_refuses_cohort_loss_before_cas);
 		UT_RUN(test_recovered_reserve_withholds_token_after_published_cut_loss);
@@ -25156,7 +25258,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(478);
+	UT_PLAN(480);
 	UT_RUN(test_cold_sync_retained_files_under_original_owner_without_cf);
 	UT_RUN(test_cold_sync_each_io_failure_root_race_and_error_discard_output);
 	UT_RUN(test_cold_sync_requires_exact_root_fsync_role_and_disjoint_output);
@@ -25295,9 +25397,11 @@ main(int argc, char **argv)
 	UT_RUN(test_bootstrap_side_reobserves_every_namespace_and_closes_all_fds);
 	UT_RUN(test_v3_reserve_clean_publishes_all_sparse_targets_without_serving);
 	UT_RUN(test_v3_target_creates_only_exact_empty_successor);
-	UT_RUN(test_recovered_prepare_rechecks_checkpoint_owner_after_readback);
+	UT_RUN(test_recovered_prepare_precedes_checkpoint_owner_publication);
 	UT_RUN(test_v3_native_driver_prepares_sparse_targets_then_returns_initializing);
 	UT_RUN(test_v3_native_driver_advances_recovered_cohort_without_losing_kinds);
+	UT_RUN(test_v3_native_driver_reserves_cache_complete_cohort);
+	UT_RUN(test_v3_native_driver_rejects_unqualified_cache_cohort);
 	UT_RUN(test_v3_native_driver_rejects_foreign_input_and_owner_without_mutation);
 	UT_RUN(test_v3_native_driver_reserves_closed_cohort_only_on_coordinator);
 	UT_RUN(test_v3_native_driver_missing_selected_or_partial_namespace_is_not_wait);
