@@ -3158,9 +3158,13 @@ test_cluster_config_delivery_route: test_cluster_config_delivery_route.c unit_te
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I. $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_config_delivery_driver: test_cluster_config_delivery_driver.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_startup_phase.h \
 		$(top_builddir)/src/backend/cluster/cluster_shared_config_lmon.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(top_builddir)/src/backend/cluster/cluster_shared_config_lmon.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+$(top_builddir)/src/backend/cluster/cluster_shared_config_lmon.o: \
+		$(top_srcdir)/src/include/cluster/cluster_startup_phase.h
 
 
 test_cluster_shared_config: test_cluster_shared_config.c unit_test.h $(CLUSTER_SHARED_CONFIG_O)

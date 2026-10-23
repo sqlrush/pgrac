@@ -6267,6 +6267,7 @@ static void
 ClusterStartupConfigurationRequire(void)
 {
 	ClusterFormationWitnessResult last_proof = CLUSTER_FORMATION_WITNESS_READY;
+	bool wait_reported = false;
 
 	for (;;) {
 		ClusterConfigMountResult result;
@@ -6298,6 +6299,14 @@ ClusterStartupConfigurationRequire(void)
 			ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 							errmsg("shared configuration is incompatible with mounted members"),
 							errdetail("PGRAC_REASON=CONFIG_COMMON_MISMATCH")));
+		if (!wait_reported) {
+			ereport(LOG, (errmsg("native startup is waiting for mounted configuration"),
+						  errdetail("PGRAC_FAMILY=STARTUP_CONTROL operation=config_mount "
+									"mount_result=%d witness_result=%d readiness=%d",
+									(int)result, (int)proof,
+									(int)cluster_authority_readiness_get())));
+			wait_reported = true;
+		}
 		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
 						WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
 	}
@@ -6314,6 +6323,8 @@ ClusterStartupWriterSelect(void)
 	ClusterWalStartupImage selected;
 	ClusterControlRootResult result;
 	bool native_recovery = InRecovery;
+	bool wait_reported = false;
+	TimestampTz last_wait_report = 0;
 
 	if (MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
 		|| !cluster_controlfile_shared_authority || clusterStartupWriterSelected
@@ -6326,6 +6337,8 @@ ClusterStartupWriterSelect(void)
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 						errmsg("native startup has no exact immutable input")));
 	for (;;) {
+		TimestampTz now;
+
 		HandleStartupProcInterrupts();
 		CHECK_FOR_INTERRUPTS();
 		ClusterStartupConfigurationRequire();
@@ -6334,6 +6347,15 @@ ClusterStartupWriterSelect(void)
 			&& result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT
 			&& result != CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE)
 			break;
+		now = GetCurrentTimestamp();
+		if (!wait_reported || now < last_wait_report
+			|| now - last_wait_report >= INT64CONST(5000000)) {
+			ereport(LOG, (errmsg("native startup initialization is pending"),
+						  errdetail("PGRAC_FAMILY=STARTUP_CONTROL operation=writer_select "
+									"result=%d recovery=%d", (int)result, native_recovery)));
+			last_wait_report = now;
+			wait_reported = true;
+		}
 		/* The original attempt dropped CF/WALR. Lock contention or a
 		 * pending collective exit witness grants no side effects. A missing
 		 * peer target is not permission to reduce the startup cohort. */

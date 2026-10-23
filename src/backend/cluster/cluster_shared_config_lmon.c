@@ -22,6 +22,7 @@
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_shared_config.h"
 #include "cluster/cluster_config_members.h"
+#include "cluster/cluster_startup_phase.h"
 
 static bool selection_pending;
 static TimestampTz next_probe;
@@ -31,6 +32,40 @@ static bool notified;
 /* Static solely for ERROR cleanup of an owned returned image. It is not an
  * extra configuration authority, and is empty between successful ticks. */
 static ClusterSharedConfigImage selected_image;
+
+/* An earlier GRD pending log is not the native Startup's current wait.
+ * Report this original producer's stage without changing its proof, retry
+ * scheduling or publication. Ordinary service pays no census/report cost. */
+static void
+report_startup_pending(TimestampTz now, const char *stage, ClusterControlRootResult result,
+					   uint64 config_generation)
+{
+	static bool reported;
+	static TimestampTz last_report;
+	ClusterConfigMembersObservation observation;
+	bool current;
+
+	if (cluster_current_phase() != CLUSTER_PHASE_3_RECOVERY
+		|| (reported && now >= last_report && now - last_report < INT64CONST(5000000))
+		|| cluster_config_members_mount_status() == CLUSTER_CONFIG_MOUNT_MATCH)
+		return;
+	current = cluster_config_members_observe(&observation);
+	ereport(LOG,
+		(errmsg("native startup configuration is pending"),
+		 errdetail("PGRAC_FAMILY=STARTUP_CONTROL operation=config_mount stage=%s "
+				   "root_result=%d config_generation=" UINT64_FORMAT " member_round_current=%d "
+				   "required=%016llx/%016llx observed=%016llx/%016llx "
+				   "unavailable=%016llx/%016llx",
+				   stage, (int)result, config_generation, current,
+				   (unsigned long long)observation.key.required[0],
+				   (unsigned long long)observation.key.required[1],
+				   (unsigned long long)observation.observed[0],
+				   (unsigned long long)observation.observed[1],
+				   (unsigned long long)observation.unavailable[0],
+				   (unsigned long long)observation.unavailable[1])));
+	last_report = now;
+	reported = true;
+}
 
 void
 cluster_shared_config_delivery_lmon_cancel(void)
@@ -68,6 +103,7 @@ delivery_attempt(const ClusterSharedConfigProcess *actual, TimestampTz now)
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
 		if (!selection_pending)
 			cluster_config_members_cancel();
+		report_startup_pending(now, "root_select", result, actual->ref.identity.generation);
 		return;
 	}
 	if (!notified || memcmp(&notified_ref, &selected.ref, sizeof(notified_ref)) != 0) {
@@ -90,6 +126,7 @@ delivery_attempt(const ClusterSharedConfigProcess *actual, TimestampTz now)
 		cluster_config_members_poll(&selected.ref, &members);
 	else
 		cluster_config_members_cancel();
+	report_startup_pending(now, "member_census", result, selected.ref.identity.generation);
 }
 
 void
@@ -111,6 +148,7 @@ cluster_shared_config_delivery_lmon_tick(void)
 		return;
 	if (!cluster_shared_config_process_observe(&actual) || actual.ref.identity.generation == 0) {
 		cluster_shared_config_delivery_lmon_cancel();
+		report_startup_pending(now, "parent_profile", CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT, 0);
 		return;
 	}
 	PG_TRY();
