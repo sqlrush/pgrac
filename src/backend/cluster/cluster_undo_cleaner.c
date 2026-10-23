@@ -575,6 +575,10 @@ undo_cleaner_run_pass(bool *out_work_remaining)
 		return false;
 	if (!cluster_storage_mode_enabled())
 		return false;
+	if (MyBackendType != B_STARTUP && cluster_shared_config
+		&& cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& !cluster_semantic_activation_recovered_open_current())
+		return false;
 
 	/* Each bound worker advances only its canonical TT segment shard.
 	 * The helper holds no cleaner lock while sampling or doing physical work. */
