@@ -97,6 +97,8 @@ errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_un
 {}
 
 bool cluster_enabled = true;
+bool cluster_shared_config = false;
+BackendType MyBackendType = B_BACKEND;
 int cluster_node_id = 0;
 static ClusterConf test_cluster_conf = { .node_count = 2 };
 ClusterConf *ClusterConfShmem = &test_cluster_conf;
@@ -122,6 +124,8 @@ static bool fake_lms_ready;
 static ClusterLmonStatus fake_lmon_status;
 static bool fake_quorum;
 static bool fake_member;
+static ClusterNormalStartState fake_normal_start_state;
+static bool fake_recovered_open;
 static ClusterSemanticAdmissionResult fake_admission_result;
 static ClusterSemanticAdmissionSide fake_modifier_side;
 static bool fake_admission_recheck;
@@ -397,6 +401,18 @@ cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSi
 		token->entered = true;
 	}
 	return fake_admission_result;
+}
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return fake_normal_start_state;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return fake_recovered_open;
 }
 
 ClusterSemanticAdmissionResult
@@ -1123,6 +1139,10 @@ reset_fixture(void)
 	fake_lmon_status = CLUSTER_LMON_READY;
 	fake_quorum = true;
 	fake_member = true;
+	fake_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+	fake_recovered_open = true;
+	cluster_shared_config = false;
+	MyBackendType = B_BACKEND;
 	fake_admission_result = CLUSTER_SEMANTIC_ADMISSION_OK;
 	fake_modifier_side = CLUSTER_SEMANTIC_SOURCE_SIDE;
 	fake_admission_recheck = true;
@@ -1802,6 +1822,23 @@ UT_TEST(test_live_owner_resident_authority_failures_never_produce)
 	UT_ASSERT_EQ(reserve_event, 0);
 	UT_ASSERT_EQ(frame_reserve_calls, 0);
 	UT_ASSERT_EQ(semantic_leave_calls, 1);
+}
+
+UT_TEST(test_live_owner_resident_recovered_open_gate_precedes_modifier_admission)
+{
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+
+	reset_fixture();
+	cluster_shared_config = true;
+	fake_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	fake_recovered_open = false;
+	UT_ASSERT_EQ(cluster_undo_block0_current_live_owner_ensure_resident(&key, 1000),
+				 CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+	UT_ASSERT_EQ(semantic_enter_calls, 0);
+	UT_ASSERT_EQ(root_resolve_calls, 0);
+	UT_ASSERT_EQ(flush_sync_calls, 0);
+	UT_ASSERT_EQ(smgr_exit_hook_ensure_calls, 0);
+	reset_fixture();
 }
 
 UT_TEST(test_live_owner_resident_final_pgrd_drift_unpins_before_xcur_and_source)
@@ -3864,7 +3901,7 @@ UT_TEST(test_readiness_denial_names_first_false_gate_without_side_effects)
 int
 main(void)
 {
-	UT_PLAN(92);
+	UT_PLAN(93);
 	UT_RUN(test_first_publication_deny_preserves_private_bytes_and_can_retry);
 	UT_RUN(test_first_publication_deny_does_not_intercept_existing_or_rejected_owners);
 	UT_RUN(test_first_publication_injected_error_uses_original_owner_cleanup);
@@ -3906,6 +3943,7 @@ main(void)
 	UT_RUN(test_live_owner_resident_existing_exact_needs_no_new_frame);
 	UT_RUN(test_live_owner_publication_receipt_rechecks_exact_local_state);
 	UT_RUN(test_live_owner_resident_authority_failures_never_produce);
+	UT_RUN(test_live_owner_resident_recovered_open_gate_precedes_modifier_admission);
 	UT_RUN(test_live_owner_resident_final_pgrd_drift_unpins_before_xcur_and_source);
 	UT_RUN(test_live_owner_resident_absent_or_invalid_generation_fails_closed);
 	UT_RUN(test_pending_poll_is_pure_nonblocking_and_keeps_correlation);

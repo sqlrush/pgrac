@@ -78,6 +78,19 @@ current_resid_namespace_valid(uint8 type)
 		   && type != UINT8_C(0xF3);
 }
 
+/* Ordinary block-zero lifecycle writers must consume the same durable
+ * recovered OPEN proof as their higher-level producers.  Startup owns the
+ * cold-recovery path and remains exempt; source-zero/target-ready formation
+ * keeps the existing modifier admission policy. */
+static bool
+current_live_owner_recovered_open_admitted(void)
+{
+	if (MyBackendType == B_STARTUP || !cluster_shared_config
+		|| cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_EXISTING_OTHER)
+		return true;
+	return cluster_semantic_activation_recovered_open_current();
+}
+
 void
 cluster_undo_block0_current_init(void)
 {
@@ -1713,6 +1726,8 @@ current_live_owner_ensure_resident(const ClusterUndoBlock0LogicalKey *key, int t
 	if (key == NULL || cluster_node_id < 0 || key->owner_instance != (uint8)(cluster_node_id + 1)
 		|| cluster_undo_block0_logical_slot(key, &logical_slot) != CLUSTER_UNDO_BLOCK0_OK)
 		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	if (!current_live_owner_recovered_open_admitted())
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 
 	memset(&admission, 0, sizeof(admission));
 	memset(&pin, 0, sizeof(pin));
@@ -2058,6 +2073,8 @@ cluster_undo_block0_current_live_owner_mutate_exact(const ClusterUndoBlock0Logic
 		|| !current_lifecycle_successor_exact(predecessor_page, successor_page, key,
 											  expected->value))
 		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+	if (!current_live_owner_recovered_open_admitted())
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 
 	memset(&admission, 0, sizeof(admission));
 	memset(&pin, 0, sizeof(pin));
@@ -2229,6 +2246,8 @@ cluster_undo_block0_current_live_owner_reuse_exact(const ClusterUndoBlock0Logica
 		|| !cluster_undo_block0_generation_advance(expected, &successor_generation)
 		|| !current_reuse_successor_exact(successor_page, key, successor_generation.value))
 		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+	if (!current_live_owner_recovered_open_admitted())
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 
 	memset(&admission, 0, sizeof(admission));
 	memset(&pin, 0, sizeof(pin));
@@ -2398,6 +2417,8 @@ cluster_undo_block0_current_live_owner_recycle_exact(const ClusterUndoBlock0Logi
 		|| (expected_epoch == 0 && cluster_conf_node_count() != 4)
 		|| cluster_epoch_get_current() != expected_epoch || timeout_ms <= 0 || cluster_node_id < 0
 		|| key->owner_instance != (uint8)(cluster_node_id + 1))
+		return CLUSTER_UNDO_BLOCK0_RECYCLE_FAILED;
+	if (!current_live_owner_recovered_open_admitted())
 		return CLUSTER_UNDO_BLOCK0_RECYCLE_FAILED;
 
 	memset(&admission, 0, sizeof(admission));
