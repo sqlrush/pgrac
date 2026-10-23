@@ -15,6 +15,7 @@
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_write_fence.h"
 #include "../../backend/cluster/cluster_control_root_private.h"
@@ -42,6 +43,8 @@ int cluster_node_id = 0;
 char *cluster_wal_threads_dir, *DataDir;
 int MyProcPid = 79;
 BackendType MyBackendType = B_BACKEND;
+static ClusterNormalStartState test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+static bool test_recovered_open;
 volatile sig_atomic_t ShutdownRequestPending;
 volatile uint32 CritSectionCount = 1;
 MemoryContext CurrentMemoryContext, TopMemoryContext;
@@ -73,6 +76,18 @@ static unsigned startup_reads;
 static ClusterControlRootResult route_result;
 static sigjmp_buf native_error;
 static char segment_path[MAXPGPATH];
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return test_normal_start_state;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return test_recovered_open;
+}
 
 bool
 LWLockHeldByMeInMode(LWLock *l, LWLockMode m)
@@ -1079,6 +1094,18 @@ UT_TEST(test_recovered_writer_requires_selected_input_and_installed_same_epoch)
 	UT_ASSERT_NE(cluster_wal_writer_check(&writer), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 }
 
+UT_TEST(test_online_writer_requires_recovered_semantic_open)
+{
+	fixture();
+	test_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	test_recovered_open = false;
+	UT_ASSERT_EQ(cluster_wal_writer_check(&writer), CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+	test_recovered_open = true;
+	UT_ASSERT_EQ(cluster_wal_writer_check(&writer), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+	test_recovered_open = false;
+}
+
 UT_TEST(test_initialized_writer_keeps_runtime_fence_and_exact_owner_refusals)
 {
 	for (unsigned kind = 0; kind < 2; kind++)
@@ -1431,10 +1458,11 @@ UT_TEST(test_requested_flush_rejects_foreign_or_unsafe_context_without_io)
 int
 main(void)
 {
-	UT_PLAN(32);
+	UT_PLAN(33);
 	UT_RUN(test_clean_writer_requires_selected_exit_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_requires_selected_input_and_installed_same_epoch);
 	UT_RUN(test_recovered_writer_requires_selected_input_and_installed_same_epoch);
+	UT_RUN(test_online_writer_requires_recovered_semantic_open);
 	UT_RUN(test_initialized_writer_keeps_runtime_fence_and_exact_owner_refusals);
 	UT_RUN(test_requested_background_cut_actively_flushes_fixed_end);
 	UT_RUN(test_requested_flush_rejects_foreign_or_unsafe_context_without_io);

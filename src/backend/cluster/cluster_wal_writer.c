@@ -12,6 +12,7 @@
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_write_fence.h"
@@ -61,6 +62,13 @@ cluster_wal_writer_check(const ClusterWalWriterToken *work)
 	ClusterWalWriterToken fresh = { 0 };
 	const ClusterControlRootIdentity *id = &work->ref.claim.identity;
 	fresh.epoch = work->epoch;
+
+	/* Startup installs run before EOR and retain their physical-owner gates.
+	 * Online writer consumers may proceed only after recovered semantic OPEN. */
+	if (MyBackendType != B_STARTUP &&
+		cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER &&
+		!cluster_semantic_activation_recovered_open_current())
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 
 	if (!cluster_enabled || !cluster_shared_config || !enableFsync
 		|| cluster_node_id != id->origin_node_id || id->system_identifier != GetSystemIdentifier()

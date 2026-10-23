@@ -8499,6 +8499,7 @@ test_cluster_wal_cut: test_cluster_wal_cut.c unit_test.h \
 test_cluster_wal_writer: unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_writer.c \
 		$(top_srcdir)/src/include/cluster/cluster_wal_writer.h \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
 		$(CLUSTER_WAL_CLAIM_O) xlogreader_fs.o \
 		test_cluster_wal_publish_tail.inc test_cluster_wal_publish_callers.inc test_cluster_wal_publish_entry.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(srcdir)/$@.c $(CLUSTER_WAL_CLAIM_O) \
