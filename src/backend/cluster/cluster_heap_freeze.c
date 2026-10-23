@@ -716,6 +716,8 @@ cluster_heap_freeze_prepare_xmin_v1(
 		|| (unsigned) tuple->tuple_offset + tuple->tuple_length
 			> BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE
 		|| tuple->raw_xmin != XidFromFullTransactionId(original_creator_full_xid)
+		|| !FullTransactionIdEquals(tuple->original_creator_full_xid,
+			original_creator_full_xid)
 		|| (tuple->infomask & (HEAP_XMIN_INVALID | HEAP_MOVED)) != 0
 		|| !tuple->has_carrier
 		|| tuple->carrier_request_index >= page->carrier_request_count)
@@ -733,6 +735,8 @@ cluster_heap_freeze_prepare_xmin_v1(
 
 		if (!freeze_locator_equal_exact(&request->locator, &proof->requested_locator)
 			|| proof->resolution.outcome != CLUSTER_TX_COMMITTED
+			|| !FullTransactionIdEquals(proof->resolution.local_original_full_xid,
+				original_creator_full_xid)
 			|| !SCN_VALID(proof->resolution.commit_scn)
 			|| scn_time_cmp(proof->resolution.commit_scn, horizon_scn) >= 0
 			|| tuple->raw_xmin != proof->resolution.locator_echo.xid || !target->valid

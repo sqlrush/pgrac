@@ -300,6 +300,9 @@ struct HeapTupleFreeze;
  * No production caller may supply these identities until their provenance and
  * admission contract is closed.  A prepared plan still needs the caller's
  * synchronous final page/fence comparison before native mutation/WAL.
+ * The independently qualified creator must also equal the complete original
+ * FullXid carried by the matched row and its exact canonical creation proof;
+ * missing identities or equal raw XIDs from different epochs cannot qualify.
  */
 extern bool cluster_heap_freeze_prepare_xmin_v1(
 	const ClusterHeapFreezePageBatchV1 *page,

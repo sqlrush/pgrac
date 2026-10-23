@@ -2311,6 +2311,17 @@ UT_TEST(creation_binding_missing_or_malformed_batches_cannot_reuse_old_indexes)
 	}
 }
 
+/* Model the completed local provenance handoff using the real row binder. */
+static void
+init_xmin_plan_fixture(ClusterHeapFreezePageBatchV1 *page,
+	ClusterHeapFreezeProofBatchV1 *proofs, ClusterHeapFreezeFinalFenceV1 *fence)
+{
+	init_creation_binding_fixture(page, proofs, fence);
+	proofs->proofs[0].resolution.local_original_full_xid =
+		FullTransactionIdFromEpochAndXid(1, 77);
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(page, proofs, fence), 1);
+}
+
 static bool
 prepare_fixture_xmin(const ClusterHeapFreezePageBatchV1 *page,
 	const ClusterHeapFreezeProofBatchV1 *proofs,
@@ -2321,6 +2332,43 @@ prepare_fixture_xmin(const ClusterHeapFreezePageBatchV1 *page,
 		FullTransactionIdFromEpochAndXid(1, 100), 10, out);
 }
 
+UT_TEST(xmin_plan_requires_the_bound_exact_origin_fullxid)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+	HeapTupleFreeze plan, saved;
+	FullTransactionId original = FullTransactionIdFromEpochAndXid(1, 77);
+	FullTransactionId limit = FullTransactionIdFromEpochAndXid(3, 100);
+
+	for (int variant = 0; variant < 9; variant++) {
+		init_creation_binding_fixture(&page, &proofs, &fence);
+		proofs.proofs[0].resolution.local_original_full_xid = original;
+		UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 1);
+		UT_ASSERT(cluster_heap_freeze_prepare_xmin_v1(&page, &proofs, &fence,
+			0, original, limit, 10, &plan));
+		saved = plan;
+		switch (variant) {
+		case 0: page.tuples[0].original_creator_full_xid = InvalidFullTransactionId; break;
+		case 1: page.tuples[0].original_creator_full_xid = FullTransactionIdFromEpochAndXid(1, 78); break;
+		case 2: page.tuples[0].original_creator_full_xid = FullTransactionIdFromEpochAndXid(2, 77); break;
+		case 3: proofs.proofs[0].resolution.local_original_full_xid = InvalidFullTransactionId; break;
+		case 4: proofs.proofs[0].resolution.local_original_full_xid = FullTransactionIdFromEpochAndXid(2, 77); break;
+		case 5: proofs.proofs[0].resolution.local_original_full_xid = FullTransactionIdFromEpochAndXid(1, FrozenTransactionId); break;
+		case 6: proofs.proofs[0].resolution.local_original_full_xid = FullTransactionIdFromEpochAndXid(1, 78); break;
+		case 7:
+			page.tuples[0].original_creator_full_xid = FullTransactionIdFromEpochAndXid(2, 77);
+			proofs.proofs[0].resolution.local_original_full_xid = page.tuples[0].original_creator_full_xid;
+			break;
+		case 8: break;
+		}
+		UT_ASSERT(!cluster_heap_freeze_prepare_xmin_v1(&page, &proofs, &fence, 0,
+			variant == 8 ? FullTransactionIdFromEpochAndXid(2, 77) : original,
+			limit, 10, &plan));
+		UT_ASSERT(memcmp(&plan, &saved, sizeof(plan)) == 0);
+	}
+}
+
 UT_TEST(xmin_plan_requires_strict_fullxid_and_scn_age)
 {
 	ClusterHeapFreezePageBatchV1 page;
@@ -2329,13 +2377,13 @@ UT_TEST(xmin_plan_requires_strict_fullxid_and_scn_age)
 	HeapTupleFreeze plan = {0}, saved;
 	FullTransactionId creator = FullTransactionIdFromEpochAndXid(1, 77);
 
-	init_creation_binding_fixture(&page, &proofs, &fence);
+	init_xmin_plan_fixture(&page, &proofs, &fence);
 	UT_ASSERT(prepare_fixture_xmin(&page, &proofs, &fence, &plan));
 	memset(&saved, 0xa5, sizeof(saved));
 	for (int variant = 0; variant < 6; variant++) {
 		FullTransactionId cutoff = FullTransactionIdFromEpochAndXid(1, 100);
 		SCN horizon = 10;
-		init_creation_binding_fixture(&page, &proofs, &fence);
+		init_xmin_plan_fixture(&page, &proofs, &fence);
 		if (variant == 0) cutoff = creator;
 		if (variant == 1) cutoff = FullTransactionIdFromEpochAndXid(1, 76);
 		if (variant == 2) cutoff = FullTransactionIdFromEpochAndXid(0, UINT32_MAX);
@@ -2348,6 +2396,8 @@ UT_TEST(xmin_plan_requires_strict_fullxid_and_scn_age)
 		UT_ASSERT(memcmp(&plan, &saved, sizeof(plan)) == 0);
 	}
 	/* An explicit older epoch is ordered in FullXid space, not raw-XID space. */
+	proofs.proofs[0].resolution.local_original_full_xid = FullTransactionIdFromEpochAndXid(0, 77);
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 1);
 	UT_ASSERT(cluster_heap_freeze_prepare_xmin_v1(&page, &proofs, &fence, 0,
 		FullTransactionIdFromEpochAndXid(0, 77),
 		FullTransactionIdFromEpochAndXid(1, 3), 10, &plan));
@@ -2375,7 +2425,7 @@ UT_TEST(xmin_plan_compares_scn_time_without_node_id_ordering)
 		HeapTupleFreeze plan, saved;
 		bool prepared;
 
-		init_creation_binding_fixture(&page, &proofs, &fence);
+		init_xmin_plan_fixture(&page, &proofs, &fence);
 		proofs.proofs[0].resolution.commit_scn =
 			scn_encode(cases[index].commit_node, cases[index].commit_time);
 		proofs.proofs[0].resolution.authority.authority_scn =
@@ -2407,7 +2457,7 @@ UT_TEST(xmin_plan_preserves_xmax_multi_and_other_header_bits)
 		ClusterHeapFreezeProofBatchV1 proofs;
 		ClusterHeapFreezeFinalFenceV1 fence;
 		HeapTupleFreeze plan = {0};
-		init_creation_binding_fixture(&page, &proofs, &fence);
+		init_xmin_plan_fixture(&page, &proofs, &fence);
 		page.tuples[0].raw_xmax = 88;
 		page.tuples[0].infomask = masks[index] | HEAP_HASNULL | HEAP_UPDATED;
 		page.tuples[0].infomask2 = HEAP_HOT_UPDATED | HEAP_ONLY_TUPLE | 7;
@@ -2428,7 +2478,7 @@ UT_TEST(xmin_plan_revalidates_physical_target_instead_of_old_binding)
 		ClusterHeapFreezeProofBatchV1 proofs;
 		ClusterHeapFreezeFinalFenceV1 fence;
 		HeapTupleFreeze plan, saved;
-		init_creation_binding_fixture(&page, &proofs, &fence);
+		init_xmin_plan_fixture(&page, &proofs, &fence);
 		memset(&saved, 0x5a, sizeof(saved));
 		plan = saved;
 		switch (variant) {
@@ -2454,7 +2504,7 @@ UT_TEST(xmin_plan_revalidates_physical_target_instead_of_old_binding)
 		ClusterHeapFreezeProofBatchV1 proofs;
 		ClusterHeapFreezeFinalFenceV1 fence;
 		HeapTupleFreeze plan = {0};
-		init_creation_binding_fixture(&page, &proofs, &fence);
+		init_xmin_plan_fixture(&page, &proofs, &fence);
 		page.tuples[0].creation_target_proof_index = CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET;
 		UT_ASSERT(prepare_fixture_xmin(&page, &proofs, &fence, &plan));
 		/* The other physical row has the same raw XID and carrier, but no target. */
@@ -2471,7 +2521,7 @@ UT_TEST(xmin_plan_rejects_incomplete_proof_and_changed_final_fence)
 		ClusterHeapFreezeProofBatchV1 proofs;
 		ClusterHeapFreezeFinalFenceV1 fence;
 		HeapTupleFreeze plan, saved;
-		init_creation_binding_fixture(&page, &proofs, &fence);
+		init_xmin_plan_fixture(&page, &proofs, &fence);
 		memset(&saved, 0x5a, sizeof(saved));
 		plan = saved;
 		switch (variant) {
@@ -2505,7 +2555,7 @@ UT_TEST(xmin_plan_rejects_special_raw_fullxids_and_legacy_xmin_states)
 		HeapTupleFreeze plan, saved;
 		FullTransactionId creator = FullTransactionIdFromEpochAndXid(1, 77);
 		FullTransactionId cutoff = FullTransactionIdFromEpochAndXid(1, 100);
-		init_creation_binding_fixture(&page, &proofs, &fence);
+		init_xmin_plan_fixture(&page, &proofs, &fence);
 		memset(&saved, 0x5a, sizeof(saved));
 		plan = saved;
 		if (variant < 3) creator = FullTransactionIdFromEpochAndXid(1, variant);
@@ -2528,7 +2578,7 @@ UT_TEST(xmin_plan_missing_arguments_and_bad_bounds_leave_output_untouched)
 		ClusterHeapFreezeProofBatchV1 proofs;
 		ClusterHeapFreezeFinalFenceV1 fence;
 		HeapTupleFreeze plan, saved;
-		init_creation_binding_fixture(&page, &proofs, &fence);
+		init_xmin_plan_fixture(&page, &proofs, &fence);
 		memset(&saved, 0x5a, sizeof(saved));
 		plan = saved;
 		if (variant == 4) page.tuple_count = MaxHeapTuplesPerPage + 1;
@@ -2610,6 +2660,7 @@ UT_TEST(creation_provenance_keeps_distinct_carriers_with_equal_raw_xmin)
 	ClusterHeapFreezeProofBatchV1 proofs;
 	ClusterHeapFreezeFinalFenceV1 fence;
 	ClusterHeapFreezeCanonicalProofV1 swap;
+	HeapTupleFreeze plan;
 	FullTransactionId first = FullTransactionIdFromEpochAndXid(9, 77);
 	FullTransactionId second = FullTransactionIdFromEpochAndXid(10, 77);
 
@@ -2621,6 +2672,7 @@ UT_TEST(creation_provenance_keeps_distinct_carriers_with_equal_raw_xmin)
 	proofs.proofs[1] = proofs.proofs[0];
 	proofs.proofs[1].requested_locator.itl_slot_index = 1;
 	proofs.proofs[1].resolution.locator_echo.itl_slot_index = 1;
+	proofs.proofs[1].resolution.local_canonical.slot_offset = 1;
 	proofs.proofs[1].resolution.local_creation_target.offset = 2;
 	proofs.proofs[1].resolution.local_original_full_xid = second;
 	page.tuples[1].carrier_request_index = 1;
@@ -2629,12 +2681,16 @@ UT_TEST(creation_provenance_keeps_distinct_carriers_with_equal_raw_xmin)
 	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 2);
 	UT_ASSERT(FullTransactionIdEquals(page.tuples[0].original_creator_full_xid, first));
 	UT_ASSERT(FullTransactionIdEquals(page.tuples[1].original_creator_full_xid, second));
+	for (uint16 index = 0; index < 2; index++)
+		UT_ASSERT(cluster_heap_freeze_prepare_xmin_v1(&page, &proofs, &fence,
+			index, index == 0 ? first : second,
+			FullTransactionIdFromEpochAndXid(11, 100), 10, &plan));
 }
 
 int
 main(void)
 {
-	UT_PLAN(82);
+	UT_PLAN(83);
 	UT_RUN(creation_provenance_only_follows_exact_physical_creation_target);
 	UT_RUN(creation_provenance_missing_or_raw_mismatch_never_guesses_an_epoch);
 	UT_RUN(creation_provenance_rejection_clears_preceding_attempt);
@@ -2710,6 +2766,7 @@ main(void)
 	UT_RUN(creation_binding_keeps_own_carrier_and_proof_order);
 	UT_RUN(creation_binding_rejects_incomplete_or_changed_evidence_and_resets_rows);
 	UT_RUN(creation_binding_missing_or_malformed_batches_cannot_reuse_old_indexes);
+	UT_RUN(xmin_plan_requires_the_bound_exact_origin_fullxid);
 	UT_RUN(xmin_plan_requires_strict_fullxid_and_scn_age);
 	UT_RUN(xmin_plan_compares_scn_time_without_node_id_ordering);
 	UT_RUN(xmin_plan_preserves_xmax_multi_and_other_header_bits);

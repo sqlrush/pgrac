@@ -708,6 +708,7 @@ UT_TEST(test_exact_xmin_plan_preserves_xmax_through_native_wal_and_redo)
 		proof->resolution.local_canonical.segment_id = 1;
 		proof->resolution.local_canonical.xid = 77;
 		proof->resolution.local_canonical.wrap = 2;
+		proof->resolution.local_original_full_xid = FullTransactionIdFromEpochAndXid(1, 77);
 		proof->resolution.local_creation_target = (ClusterTxCreationTarget){
 			.locator = relation_data.rd_locator, .fork = MAIN_FORKNUM,
 			.block = 7, .offset = 1, .tuple_length = ItemIdGetLength(item), .valid = true };
@@ -729,6 +730,7 @@ UT_TEST(test_exact_xmin_plan_preserves_xmax_through_native_wal_and_redo)
 		input->infomask2 = tuple->t_infomask2;
 		input->ctid = tuple->t_ctid;
 		input->has_carrier = true;
+		UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 1);
 		prepared = cluster_heap_freeze_prepare_xmin_v1(&page, &proofs, &fence, 0,
 			FullTransactionIdFromEpochAndXid(1, 77),
 			FullTransactionIdFromEpochAndXid(1, 100), 10, &plan);
@@ -816,6 +818,7 @@ qualified_xmin_setup(QualifiedXminFixture *f, uint16 xmax_mask)
 	proof->resolution.local_canonical.segment_id = 1;
 	proof->resolution.local_canonical.xid = 77;
 	proof->resolution.local_canonical.wrap = 2;
+	proof->resolution.local_original_full_xid = FullTransactionIdFromEpochAndXid(1, 77);
 	proof->resolution.local_creation_target = (ClusterTxCreationTarget){
 		.locator = relation_data.rd_locator, .fork = MAIN_FORKNUM,
 		.block = 7, .offset = 1, .tuple_length = 64, .valid = true };
@@ -824,6 +827,7 @@ qualified_xmin_setup(QualifiedXminFixture *f, uint16 xmax_mask)
 	f->authority.transition_count = 11;
 	f->admission.entered = true;
 	f->admission.record_generation = 13;
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f->page, &f->proofs, &f->fence), 1);
 }
 
 static bool
@@ -873,11 +877,14 @@ qualified_xmin_batch_setup(QualifiedXminFixture *f,
 		proof->resolution.locator_echo.tt_wrap = 2 + i;
 		proof->resolution.local_canonical.xid = xids[i];
 		proof->resolution.local_canonical.wrap = 2 + i;
+		proof->resolution.local_original_full_xid =
+			FullTransactionIdFromEpochAndXid(i == 1 ? 0 : 1, xids[i]);
 		proof->resolution.local_creation_target.offset = i + 1;
 		targets[i].tuple_index = order[i];
 		targets[i].original_creator_full_xid =
 			FullTransactionIdFromEpochAndXid(order[i] == 1 ? 0 : 1, xids[order[i]]);
 	}
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f->page, &f->proofs, &f->fence), 3);
 	expected_nplans = 2;
 }
 
@@ -888,6 +895,52 @@ qualified_xmin_batch_apply(QualifiedXminFixture *f,
 	return cluster_heap_freeze_apply_xmin_batch_v1(&relation_data, 1, &f->input,
 		&f->page, &f->proofs, &f->fence, &f->authority, &f->admission, targets,
 		count, FullTransactionIdFromEpochAndXid(1, 100), 10);
+}
+
+UT_TEST(test_xmin_apply_rejects_unbound_original_identity_before_wal)
+{
+	QualifiedXminFixture f;
+
+	for (int variant = 0; variant < 5; variant++) {
+		qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		switch (variant) {
+		case 0: f.page.tuples[0].original_creator_full_xid = InvalidFullTransactionId; break;
+		case 1: f.page.tuples[0].original_creator_full_xid = FullTransactionIdFromEpochAndXid(2, 77); break;
+		case 2: f.proofs.proofs[0].resolution.local_original_full_xid = InvalidFullTransactionId; break;
+		case 3: f.proofs.proofs[0].resolution.local_original_full_xid = FullTransactionIdFromEpochAndXid(2, 77); break;
+		case 4:
+			f.page.tuples[0].original_creator_full_xid = FullTransactionIdFromEpochAndXid(0, 77);
+			f.proofs.proofs[0].resolution.local_original_full_xid = f.page.tuples[0].original_creator_full_xid;
+			break;
+		}
+		UT_ASSERT(!qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(inserts + dirties + flushes + writer_checks + authority_checks, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_batch_later_origin_epoch_mismatch_is_atomic)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int variant = 0; variant < 3; variant++) {
+		qualified_xmin_batch_setup(&f, targets);
+		/* The first row prepares; a later target keeps the same raw XID
+		 * while its observed original epoch no longer matches the caller. */
+		if (variant == 0)
+			f.page.tuples[1].original_creator_full_xid = InvalidFullTransactionId;
+		if (variant == 1)
+			f.proofs.proofs[1].resolution.local_original_full_xid =
+				FullTransactionIdFromEpochAndXid(1, UINT32_MAX - 2);
+		if (variant == 2) {
+			f.page.tuples[0].original_creator_full_xid = FullTransactionIdFromEpochAndXid(0, 77);
+			f.proofs.proofs[0].resolution.local_original_full_xid = f.page.tuples[0].original_creator_full_xid;
+		}
+		UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
+		UT_ASSERT_EQ(inserts + dirties + flushes + writer_checks + authority_checks, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
 }
 
 UT_TEST(test_xmin_batch_one_wal_fence_fullxid_horizon_and_redo)
@@ -1010,6 +1063,8 @@ UT_TEST(test_xmin_batch_rejects_ambiguous_native_horizon)
 	qualified_xmin_batch_setup(&f, targets);
 	expected_nplans = 1;
 	targets[0].original_creator_full_xid = FullTransactionIdFromEpochAndXid(0, 66);
+	f.proofs.proofs[2].resolution.local_original_full_xid = targets[0].original_creator_full_xid;
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f.page, &f.proofs, &f.fence), 3);
 	UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
 	UT_ASSERT_EQ(inserts + dirties + flushes + writer_checks, 0);
 	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
@@ -1558,7 +1613,7 @@ UT_TEST(test_deferred_request_preserves_shared_freeze_restriction)
 int
 main(void)
 {
-	UT_PLAN(32);
+	UT_PLAN(34);
 	UT_RUN(test_prune_native_plan_and_version);
 	UT_RUN(test_shared_freeze_refuses_before_tuple_or_wal);
 	UT_RUN(test_vacuum_native_unused_and_version);
@@ -1583,6 +1638,8 @@ main(void)
 	UT_RUN(test_ordinary_or_nonshared_vacuum_does_not_request);
 	UT_RUN(test_deferred_request_preserves_shared_freeze_restriction);
 	UT_RUN(test_qualified_xmin_rejects_recapture_with_old_proof_version);
+	UT_RUN(test_xmin_apply_rejects_unbound_original_identity_before_wal);
+	UT_RUN(test_xmin_batch_later_origin_epoch_mismatch_is_atomic);
 	UT_RUN(test_xmin_batch_one_wal_fence_fullxid_horizon_and_redo);
 	UT_RUN(test_xmin_batch_later_unqualified_target_changes_nothing);
 	UT_RUN(test_xmin_batch_rejects_duplicate_physical_rows);
