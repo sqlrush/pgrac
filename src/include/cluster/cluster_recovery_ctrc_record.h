@@ -446,6 +446,17 @@ extern bool cluster_recovery_ctrc_witness_ids_v2(const ClusterRecoveryCTRCGraphB
 extern bool cluster_recovery_ctrc_witness_ids_from_evidence_v2(const uint8 *evidence,
 	size_t evidence_length, uint8 *out, size_t out_capacity, size_t *out_length);
 
+/* Check that every ID in a complete nonempty canonical witness-id vector is
+ * present in a complete canonical raw-evidence vector. A proper subset is
+ * allowed, but unselected raw atoms must also pass validation. Both inputs
+ * must be immutable, with valid declared storage; unaligned/overlapping
+ * inputs are supported. No allocation, output publication or input mutation.
+ * This checks structural membership only: the original owner still proves
+ * same-graph provenance, required witness completeness, applicable rules and
+ * predicates. Success supplies no completion, qualification or release right. */
+extern bool cluster_recovery_ctrc_witness_ids_in_evidence_v2(const uint8 *witness_ids,
+	size_t witness_ids_length, const uint8 *evidence, size_t evidence_length);
+
 typedef struct ClusterRecoveryCTRCGraphNodeV2 {
 	uint16 kind; /* 1 reference/history, 2 original-owner proof */
 	ClusterRecoveryCTRCGraphBytesV2 key;

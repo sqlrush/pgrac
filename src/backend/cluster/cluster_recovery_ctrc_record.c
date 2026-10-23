@@ -1928,59 +1928,97 @@ cluster_recovery_ctrc_witness_ids_v2(const ClusterRecoveryCTRCGraphBytesV2 *atom
 	return ctrc_raw_evidence_encode_v2(atoms, atom_count, out, out_capacity, out_length, true);
 }
 
+typedef struct CTRCRawEvidenceCursor {
+	const uint8 *data;
+	size_t length, position;
+	uint64 remaining;
+	ClusterRecoveryCTRCGraphBytesV2 previous;
+	size_t previous_identity_length;
+} CTRCRawEvidenceCursor;
+
+static bool
+ctrc_raw_evidence_cursor_v2(const uint8 *evidence, size_t evidence_length,
+	CTRCRawEvidenceCursor *cursor)
+{
+	uint64 count;
+
+	if (evidence == NULL || evidence_length < 8 || evidence_length > MaxAllocSize)
+		return false;
+	count = cluster_undo_tt_ctrc_get_u64_le(evidence);
+	/* B(atom) requires eight length bytes and at least a 20-byte atom. */
+	if (count == 0 || count > (evidence_length - 8) / 28)
+		return false;
+	*cursor = (CTRCRawEvidenceCursor){evidence, evidence_length, 8, count, {NULL, 0}, 0};
+	return true;
+}
+
+static bool
+ctrc_raw_evidence_next_v2(CTRCRawEvidenceCursor *cursor,
+	ClusterRecoveryCTRCGraphBytesV2 *identity)
+{
+	ClusterRecoveryCTRCGraphBytesV2 atom;
+	uint64 atom_length;
+	size_t identity_length;
+
+	if (cursor->remaining == 0 || cursor->length - cursor->position < 8)
+		return false;
+	atom_length = cluster_undo_tt_ctrc_get_u64_le(cursor->data + cursor->position);
+	cursor->position += 8;
+	if (atom_length > cursor->length - cursor->position)
+		return false;
+	atom = (ClusterRecoveryCTRCGraphBytesV2){cursor->data + cursor->position, (size_t)atom_length};
+	if (!ctrc_raw_atom_identity_length_v2(&atom, &identity_length)
+		|| (cursor->previous.data != NULL
+			&& (ctrc_graph_bytes_cmp(&cursor->previous, &atom) >= 0
+				|| (cursor->previous_identity_length == identity_length
+					&& memcmp(cursor->previous.data, atom.data, identity_length) == 0))))
+		return false;
+	cursor->position += atom.length;
+	cursor->remaining--;
+	if (cursor->remaining == 0 && cursor->position != cursor->length)
+		return false;
+	cursor->previous = atom;
+	cursor->previous_identity_length = identity_length;
+	*identity = (ClusterRecoveryCTRCGraphBytesV2){atom.data, identity_length};
+	return true;
+}
+
 bool
 cluster_recovery_ctrc_witness_ids_from_evidence_v2(const uint8 *evidence,
 	size_t evidence_length, uint8 *out, size_t out_capacity, size_t *out_length)
 {
 	uint8 *scratch = NULL, *next;
+	CTRCRawEvidenceCursor cursor;
 	uint64 count;
 	size_t scratch_length = 0, zero = 0;
 
-	if (evidence == NULL || evidence_length < 8 || evidence_length > MaxAllocSize
-		|| out == NULL || out_length == NULL || out_capacity < 8 || out_capacity > MaxAllocSize)
+	if (out == NULL || out_length == NULL || out_capacity < 8 || out_capacity > MaxAllocSize
+		|| !ctrc_raw_evidence_cursor_v2(evidence, evidence_length, &cursor))
 		goto refused;
-	count = cluster_undo_tt_ctrc_get_u64_le(evidence);
-	/* Every B(atom) requires at least eight length bytes and a 20-byte atom. */
-	if (count == 0 || count > (evidence_length - 8) / 28)
-		goto refused;
+	count = cursor.remaining;
 	for (unsigned pass = 0; pass < 2; pass++) {
-		ClusterRecoveryCTRCGraphBytesV2 previous = {NULL, 0};
-		size_t position = 8, length = 8, previous_identity_length = 0;
+		size_t length = 8;
 
+		if (!ctrc_raw_evidence_cursor_v2(evidence, evidence_length, &cursor)
+			|| cursor.remaining != count)
+			goto refused;
 		next = scratch;
 		if (pass != 0) {
 			cluster_undo_tt_ctrc_put_u64_le(next, count);
 			next += 8;
 		}
 		for (uint64 i = 0; i < count; i++) {
-			ClusterRecoveryCTRCGraphBytesV2 atom, identity;
-			uint64 atom_length;
-			size_t identity_length;
+			ClusterRecoveryCTRCGraphBytesV2 identity;
 
-			if (evidence_length - position < 8)
-				goto refused;
-			atom_length = cluster_undo_tt_ctrc_get_u64_le(evidence + position);
-			position += 8;
-			if (atom_length > evidence_length - position)
-				goto refused;
-			atom = (ClusterRecoveryCTRCGraphBytesV2){evidence + position, (size_t)atom_length};
-			if (!ctrc_raw_atom_identity_length_v2(&atom, &identity_length)
-				|| (i != 0 && (ctrc_graph_bytes_cmp(&previous, &atom) >= 0
-					|| (previous_identity_length == identity_length
-						&& memcmp(previous.data, atom.data, identity_length) == 0)))
+			if (!ctrc_raw_evidence_next_v2(&cursor, &identity)
 				|| !ctrc_graph_size_add(&length, 1, 8)
-				|| !ctrc_graph_size_add(&length, 1, identity_length)
+				|| !ctrc_graph_size_add(&length, 1, identity.length)
 				|| (pass != 0 && length > scratch_length))
 				goto refused;
-			if (pass != 0) {
-				identity = (ClusterRecoveryCTRCGraphBytesV2){atom.data, identity_length};
+			if (pass != 0)
 				next = ctrc_graph_put_bytes(next, &identity);
-			}
-			previous = atom;
-			previous_identity_length = identity_length;
-			position += atom.length;
 		}
-		if (position != evidence_length || length > out_capacity
+		if (length > out_capacity
 			|| (pass != 0 && length != scratch_length))
 			goto refused;
 		if (pass == 0) {
@@ -2004,6 +2042,78 @@ refused:
 	if (out_length != NULL)
 		memcpy(out_length, &zero, sizeof(zero));
 	return false;
+}
+
+static bool
+ctrc_witness_id_next_v2(const uint8 *ids, size_t length, size_t *position,
+	ClusterRecoveryCTRCGraphBytesV2 *previous)
+{
+	ClusterRecoveryCTRCGraphBytesV2 id;
+	uint64 id_length, subject_length;
+	uint16 kind;
+
+	if (length - *position < 8)
+		return false;
+	id_length = cluster_undo_tt_ctrc_get_u64_le(ids + *position);
+	*position += 8;
+	if (id_length < 11 || id_length > length - *position)
+		return false;
+	id = (ClusterRecoveryCTRCGraphBytesV2){ids + *position, (size_t)id_length};
+	kind = cluster_undo_tt_ctrc_get_u16_le(id.data);
+	subject_length = cluster_undo_tt_ctrc_get_u64_le(id.data + 2);
+	if ((kind != 1 && kind != 2) || subject_length != id.length - 10
+		|| (previous->data != NULL && ctrc_graph_bytes_cmp(previous, &id) >= 0))
+		return false;
+	*position += id.length;
+	*previous = id;
+	return true;
+}
+
+bool
+cluster_recovery_ctrc_witness_ids_in_evidence_v2(const uint8 *witness_ids,
+	size_t witness_ids_length, const uint8 *evidence, size_t evidence_length)
+{
+	CTRCRawEvidenceCursor cursor;
+	ClusterRecoveryCTRCGraphBytesV2 wanted = {NULL, 0};
+	uint64 remaining;
+	size_t position = 8;
+	bool matched = false;
+
+	if (witness_ids == NULL || witness_ids_length < 8 || witness_ids_length > MaxAllocSize
+		|| !ctrc_raw_evidence_cursor_v2(evidence, evidence_length, &cursor))
+		return false;
+	remaining = cluster_undo_tt_ctrc_get_u64_le(witness_ids);
+	/* B(U16(kind)||B(nonempty subject)) needs at least nineteen bytes. */
+	if (remaining == 0 || remaining > (witness_ids_length - 8) / 19
+		|| remaining > cursor.remaining
+		|| !ctrc_witness_id_next_v2(witness_ids, witness_ids_length, &position, &wanted))
+		return false;
+	remaining--;
+	while (cursor.remaining != 0) {
+		ClusterRecoveryCTRCGraphBytesV2 identity;
+		int cmp;
+
+		if (!ctrc_raw_evidence_next_v2(&cursor, &identity))
+			return false;
+		/* Matching the final witness never skips unselected raw validation. */
+		if (matched)
+			continue;
+		cmp = ctrc_graph_bytes_cmp(&identity, &wanted);
+		if (cmp > 0)
+			return false;
+		if (cmp == 0) {
+			if (remaining == 0) {
+				if (position != witness_ids_length)
+					return false;
+				matched = true;
+			} else {
+				if (!ctrc_witness_id_next_v2(witness_ids, witness_ids_length, &position, &wanted))
+					return false;
+				remaining--;
+			}
+		}
+	}
+	return matched;
 }
 
 #endif

@@ -5835,6 +5835,131 @@ UT_TEST(witness_evidence_unaligned_aliases_and_allocation_refusal)
 	UT_ASSERT(memcmp(alias, witness_ids_golden, length) == 0 && graph_alloc_live == 0);
 }
 
+/* Select complete independent golden ID encodings, without a product writer. */
+static size_t
+witness_subset(unsigned mask, uint8 *ids)
+{
+	const size_t offsets[] = {8, 27, 47}, widths[] = {19, 20, 19};
+	size_t length = 8;
+	uint64 count = 0;
+
+	for (unsigned i = 0; i < 3; i++)
+		if (mask & (1U << i)) {
+			memcpy(ids + length, witness_ids_golden + offsets[i], widths[i]);
+			length += widths[i];
+			count++;
+		}
+	cluster_undo_tt_ctrc_put_u64_le(ids, count);
+	return length;
+}
+
+UT_TEST(witness_membership_exact_subsets_and_no_allocation)
+{
+	uint8 ids[sizeof(witness_ids_golden)], before[sizeof(ids)];
+
+	graph_alloc_calls = 0;
+	graph_alloc_fail_at = 1;
+	for (unsigned mask = 1; mask < 8; mask++) {
+		size_t length;
+
+		memset(ids, 0xa5, sizeof(ids));
+		length = witness_subset(mask, ids);
+		memcpy(before, ids, sizeof(before));
+		UT_ASSERT(cluster_recovery_ctrc_witness_ids_in_evidence_v2(ids, length,
+			raw_evidence_golden, sizeof(raw_evidence_golden)));
+		UT_ASSERT(memcmp(ids, before, sizeof(ids)) == 0);
+	}
+	UT_ASSERT_EQ(graph_alloc_calls, 0);
+	UT_ASSERT_EQ(graph_alloc_live, 0);
+	graph_alloc_fail_at = 0;
+}
+
+UT_TEST(witness_membership_missing_noncanonical_and_bounded_ids)
+{
+	uint8 ids[sizeof(witness_ids_golden) + 1], before[sizeof(ids)];
+
+	for (size_t i = 0; i < sizeof(witness_ids_golden); i++)
+		UT_ASSERT(!cluster_recovery_ctrc_witness_ids_in_evidence_v2(witness_ids_golden, i,
+			raw_evidence_golden, sizeof(raw_evidence_golden)));
+	for (unsigned which = 0; which < 12; which++) {
+		size_t length = sizeof(witness_ids_golden);
+
+		memcpy(ids, witness_ids_golden, sizeof(witness_ids_golden));
+		ids[sizeof(witness_ids_golden)] = 0xa5;
+		switch (which) {
+		case 0: ids[26] ^= 1; break; /* Same kind, absent exact subject. */
+		case 1: ids[16] = 2; break; /* Subject alone does not identify a witness. */
+		case 2: cluster_undo_tt_ctrc_put_u64_le(ids, 0); break;
+		case 3: cluster_undo_tt_ctrc_put_u64_le(ids, UINT64_MAX); break;
+		case 4: cluster_undo_tt_ctrc_put_u64_le(ids + 8, UINT64_MAX); break;
+		case 5: cluster_undo_tt_ctrc_put_u64_le(ids + 8, 9); break;
+		case 6: cluster_undo_tt_ctrc_put_u64_le(ids + 18, 0); break;
+		case 7: cluster_undo_tt_ctrc_put_u64_le(ids + 18, UINT64_MAX); break;
+		case 8: ids[17] = 1; break; /* Full U16 kind is validated. */
+		case 9:
+			memcpy(ids + 8, witness_ids_golden + 47, 19);
+			memcpy(ids + 47, witness_ids_golden + 8, 19);
+			break;
+		case 10: memcpy(ids + 47, witness_ids_golden + 8, 19); break;
+		case 11: length++; break;
+		}
+		memcpy(before, ids, sizeof(before));
+		UT_ASSERT(!cluster_recovery_ctrc_witness_ids_in_evidence_v2(ids, length,
+			raw_evidence_golden, sizeof(raw_evidence_golden)));
+		UT_ASSERT(memcmp(ids, before, sizeof(ids)) == 0);
+	}
+	UT_ASSERT(!cluster_recovery_ctrc_witness_ids_in_evidence_v2(NULL, sizeof(witness_ids_golden),
+		raw_evidence_golden, sizeof(raw_evidence_golden)));
+	UT_ASSERT(!cluster_recovery_ctrc_witness_ids_in_evidence_v2(witness_ids_golden, SIZE_MAX,
+		raw_evidence_golden, sizeof(raw_evidence_golden)));
+}
+
+UT_TEST(witness_membership_unselected_raw_and_overlapping_inputs)
+{
+	uint8 ids[sizeof(witness_ids_golden)], evidence[128], before[sizeof(evidence)];
+	size_t ids_length = witness_subset(1, ids);
+
+	for (size_t i = 0; i < sizeof(raw_evidence_golden); i++)
+		UT_ASSERT(!cluster_recovery_ctrc_witness_ids_in_evidence_v2(ids, ids_length,
+			raw_evidence_golden, i));
+	for (unsigned which = 0; which < 5; which++) {
+		size_t length = sizeof(raw_evidence_golden);
+
+		memset(evidence, 0xa5, sizeof(evidence));
+		memcpy(evidence, raw_evidence_golden, length);
+		switch (which) {
+		case 0: evidence[74] = 3; break; /* Invalid unselected final raw kind. */
+		case 1: cluster_undo_tt_ctrc_put_u64_le(evidence + 85, 0); break;
+		case 2: evidence[length++] = 0; break;
+		case 3: case 4:
+			/* Two unselected identical identities; case4 has distinct ordered bytes. */
+			cluster_undo_tt_ctrc_put_u64_le(evidence + 66, sizeof(raw_evidence_atom2));
+			memcpy(evidence + 74, raw_evidence_atom2, sizeof(raw_evidence_atom2));
+			length++;
+			if (which == 4)
+				evidence[65]--; /* fe < ff, same kind+subject conflict. */
+			break;
+		}
+		memcpy(before, evidence, sizeof(before));
+		UT_ASSERT(!cluster_recovery_ctrc_witness_ids_in_evidence_v2(ids, ids_length, evidence, length));
+		UT_ASSERT(memcmp(evidence, before, sizeof(evidence)) == 0);
+	}
+	UT_ASSERT(!cluster_recovery_ctrc_witness_ids_in_evidence_v2(ids, ids_length, NULL, 8));
+	UT_ASSERT(!cluster_recovery_ctrc_witness_ids_in_evidence_v2(ids, ids_length, raw_evidence_golden, SIZE_MAX));
+	/* Place the valid one-ID vector inside its raw atom's bytes: overlapping,
+	 * unaligned views must both be read without any mutation. */
+	memset(evidence, 0xa5, sizeof(evidence));
+	cluster_undo_tt_ctrc_put_u64_le(evidence + 1, 1);
+	cluster_undo_tt_ctrc_put_u64_le(evidence + 9, 11 + 8 + ids_length);
+	memcpy(evidence + 17, raw_evidence_atom0, 11);
+	cluster_undo_tt_ctrc_put_u64_le(evidence + 28, ids_length);
+	memcpy(evidence + 36, ids, ids_length);
+	memcpy(before, evidence, sizeof(before));
+	UT_ASSERT(cluster_recovery_ctrc_witness_ids_in_evidence_v2(evidence + 36, ids_length,
+		evidence + 1, 35 + ids_length));
+	UT_ASSERT(memcmp(evidence, before, sizeof(evidence)) == 0 && graph_alloc_live == 0);
+}
+
 static bool
 raw_evidence_refused(const ClusterRecoveryCTRCGraphBytesV2 *atoms, size_t count, size_t capacity)
 {
@@ -6074,6 +6199,7 @@ UT_TEST(raw_evidence_original_wal_and_data_encoder_composition)
 
 		UT_ASSERT(cluster_recovery_ctrc_witness_ids_from_evidence_v2(out, length,
 			ids, sizeof(ids), &ids_length));
+		UT_ASSERT(cluster_recovery_ctrc_witness_ids_in_evidence_v2(ids, ids_length, out, length));
 		UT_ASSERT(cluster_recovery_ctrc_witness_ids_v2(atoms, 3, out, sizeof(out), &length));
 		UT_ASSERT_EQ(ids_length, length);
 		UT_ASSERT(memcmp(ids, out, length) == 0);
@@ -6363,7 +6489,7 @@ UT_TEST(graph_reader_allocation_refusal)
 int
 main(void)
 {
-	UT_PLAN(185);
+	UT_PLAN(188);
 	UT_RUN(golden_encoding);
 	UT_RUN(golden_decoding);
 	UT_RUN(unaligned_buffers);
@@ -6534,6 +6660,9 @@ main(void)
 	UT_RUN(witness_evidence_canonical_consumption);
 	UT_RUN(witness_evidence_noncanonical_and_bounded_refusal);
 	UT_RUN(witness_evidence_unaligned_aliases_and_allocation_refusal);
+	UT_RUN(witness_membership_exact_subsets_and_no_allocation);
+	UT_RUN(witness_membership_missing_noncanonical_and_bounded_ids);
+	UT_RUN(witness_membership_unselected_raw_and_overlapping_inputs);
 	UT_RUN(raw_evidence_permutations_and_full_encoded_sort);
 	UT_RUN(raw_evidence_conflicting_subject_is_atomic);
 	UT_RUN(raw_evidence_envelope_refusals);
