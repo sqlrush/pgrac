@@ -3755,6 +3755,54 @@ UT_TEST(tt_abort_inventory_unaligned_alias_and_immutable)
 	XLogReaderFree(reader);
 }
 
+UT_TEST(tt_abort_inventory_graph_nodes_are_structural_and_atomic)
+{
+	ClusterRecoveryTTAbortV1 abort = tt_abort_sample();
+	NativeRaw wire;
+	NativePages pages;
+	XLogReaderState *reader;
+	ClusterRecoveryCTRCTTAbortReferencesV2 references, saved;
+	ClusterRecoveryCTRCGraphNodeV2 nodes[CLUSTER_RECOVERY_CTRC_TT_ABORT_REFERENCE_COUNT];
+	uint8 guarded[sizeof(nodes) + 2];
+
+	tt_abort_wire(&wire, &abort);
+	UT_ASSERT(native_read(&pages, &wire, CLUSTER_RECOVERY_CTRC_TT_ABORT_RAW_BYTES,
+						 false, &reader));
+	UT_ASSERT(cluster_recovery_ctrc_tt_abort_wal_inventory_v2(reader, 99, 7, raw_source,
+										 wire.bytes,
+										 CLUSTER_RECOVERY_CTRC_TT_ABORT_RAW_BYTES,
+										 &references));
+	saved = references;
+	UT_ASSERT(cluster_recovery_ctrc_tt_abort_graph_nodes_v2(&references, nodes));
+	for (unsigned i = 0; i < CLUSTER_RECOVERY_CTRC_TT_ABORT_REFERENCE_COUNT; i++) {
+		UT_ASSERT_EQ(nodes[i].kind, 1);
+		UT_ASSERT(nodes[i].key.data == references.keys[i]);
+		UT_ASSERT_EQ(nodes[i].key.length, CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_KEY_BYTES);
+		UT_ASSERT(nodes[i].evidence.data == references.evidence);
+		UT_ASSERT_EQ(nodes[i].evidence.length, references.evidence_length);
+	}
+	UT_ASSERT(memcmp(&references, &saved, sizeof(references)) == 0);
+
+	for (unsigned mutation = 0; mutation < 4; mutation++) {
+		ClusterRecoveryCTRCTTAbortReferencesV2 copy = saved;
+
+		if (mutation == 0)
+			copy.keys[1][0] ^= 1;
+		else if (mutation == 1)
+			wal_atom_uint(copy.keys[2] + 100, 999, 8);
+		else if (mutation == 2)
+			wal_atom_uint(copy.evidence + 8, 1, 8);
+		else
+			copy.evidence[16 + 10] ^= 1;
+		memset(guarded, 0xa5, sizeof(guarded));
+		UT_ASSERT(!cluster_recovery_ctrc_tt_abort_graph_nodes_v2(&copy,
+										 (ClusterRecoveryCTRCGraphNodeV2 *)(guarded + 1)));
+		UT_ASSERT(all_zero(guarded + 1, sizeof(guarded) - 2));
+		UT_ASSERT(guarded[0] == 0xa5 && guarded[sizeof(guarded) - 1] == 0xa5);
+	}
+	XLogReaderFree(reader);
+}
+
 UT_TEST(tt_canonical_generation_bearing_payloads)
 {
 	for (unsigned kind = 0; kind < 4; kind++) {
@@ -5793,6 +5841,7 @@ main(void)
 	UT_RUN(tt_abort_inventory_complete_native_fields);
 	UT_RUN(tt_abort_inventory_refuses_wrong_frame_or_payload);
 	UT_RUN(tt_abort_inventory_unaligned_alias_and_immutable);
+	UT_RUN(tt_abort_inventory_graph_nodes_are_structural_and_atomic);
 	UT_RUN(data_canonical_full_object_and_immutable);
 	UT_RUN(data_native_boundaries_and_each_physical_slot);
 	UT_RUN(data_namespace_is_original_and_exact);

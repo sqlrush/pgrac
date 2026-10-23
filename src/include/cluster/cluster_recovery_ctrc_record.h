@@ -429,6 +429,16 @@ typedef struct ClusterRecoveryCTRCGraphNodeV2 {
 	ClusterRecoveryCTRCGraphBytesV2 evidence;
 } ClusterRecoveryCTRCGraphNodeV2;
 
+/* Expose one complete TT-ABORT inventory as four canonical reference nodes.
+ * The nodes borrow the inventory's immutable key/evidence storage and are
+ * published only after the shared raw atom and all four field offsets pass
+ * exact structural checks. This adapter supplies no graph completeness,
+ * owner/terminal/base qualification, durability, release or live authority.
+ * Refusal clears the fixed output array; no allocation or input mutation. */
+extern bool cluster_recovery_ctrc_tt_abort_graph_nodes_v2(
+	const ClusterRecoveryCTRCTTAbortReferencesV2 *references,
+	ClusterRecoveryCTRCGraphNodeV2 out[CLUSTER_RECOVERY_CTRC_TT_ABORT_REFERENCE_COUNT]);
+
 typedef struct ClusterRecoveryCTRCGraphEdgeV2 {
 	uint16 kind; /* 1 requires, 2 references, 3 retained_history, 4 discharged_by */
 	size_t from; /* indices into the supplied nodes, never hashed as indices */

@@ -706,6 +706,65 @@ refused:
 }
 
 bool
+cluster_recovery_ctrc_tt_abort_graph_nodes_v2(
+	const ClusterRecoveryCTRCTTAbortReferencesV2 *references,
+	ClusterRecoveryCTRCGraphNodeV2 out[CLUSTER_RECOVERY_CTRC_TT_ABORT_REFERENCE_COUNT])
+{
+	static const uint64 field_offsets[CLUSTER_RECOVERY_CTRC_TT_ABORT_REFERENCE_COUNT] = {
+		34 + 48, 34 + 56, 34 + 104, 34 + 120
+	};
+	ClusterRecoveryCTRCGraphNodeV2 nodes[CLUSTER_RECOVERY_CTRC_TT_ABORT_REFERENCE_COUNT];
+	const uint8 *atom;
+	uint64 atom_length;
+	uint64 raw_length;
+
+	if (references == NULL || out == NULL
+		|| references->evidence_length != CLUSTER_RECOVERY_CTRC_TT_ABORT_EVIDENCE_BYTES)
+		goto refused;
+
+	/* The inventory is one shared exact atom with four independent offsets. */
+	if (cluster_undo_tt_ctrc_get_u64_le(references->evidence) != 1
+		|| cluster_undo_tt_ctrc_get_u64_le(references->evidence + 8)
+			!= CLUSTER_RECOVERY_CTRC_TT_ABORT_ATOM_BYTES)
+		goto refused;
+	atom = references->evidence + 16;
+	atom_length = cluster_undo_tt_ctrc_get_u64_le(references->evidence + 8);
+	if (cluster_undo_tt_ctrc_get_u16_le(atom) != 1
+		|| cluster_undo_tt_ctrc_get_u64_le(atom + 2) != 56
+		|| cluster_undo_tt_ctrc_get_u64_le(atom + 66)
+			!= CLUSTER_RECOVERY_CTRC_TT_ABORT_RAW_BYTES
+		|| atom_length != 74 + cluster_undo_tt_ctrc_get_u64_le(atom + 66)
+		|| memcmp(atom + 10, references->keys[0] + 44, 56) != 0)
+		goto refused;
+	raw_length = cluster_undo_tt_ctrc_get_u32_le(references->keys[0] + 64);
+	if (raw_length != CLUSTER_RECOVERY_CTRC_TT_ABORT_RAW_BYTES)
+		goto refused;
+
+	for (unsigned i = 0; i < CLUSTER_RECOVERY_CTRC_TT_ABORT_REFERENCE_COUNT; i++) {
+		const uint8 *key = references->keys[i];
+
+		if (cluster_undo_tt_ctrc_get_u16_le(key + 34) != 3
+			|| cluster_undo_tt_ctrc_get_u64_le(key + 36) != 56
+			|| cluster_undo_tt_ctrc_get_u32_le(key + 64) != raw_length
+			|| cluster_undo_tt_ctrc_get_u64_le(key + 100) != field_offsets[i]
+			|| (i != 0 && memcmp(key, references->keys[0], 100) != 0))
+			goto refused;
+		nodes[i] = (ClusterRecoveryCTRCGraphNodeV2){
+			1,
+			{ references->keys[i], sizeof(references->keys[i]) },
+			{ references->evidence, references->evidence_length }
+		};
+	}
+	memcpy(out, nodes, sizeof(nodes));
+	return true;
+
+refused:
+	if (out != NULL)
+		memset(out, 0, sizeof(nodes));
+	return false;
+}
+
+bool
 cluster_recovery_ctrc_bind_reference_v2(XLogReaderState *reader,
 										  uint64 database_incarnation, uint32 source_index,
 										  const uint8 source_identity_digest[32],
