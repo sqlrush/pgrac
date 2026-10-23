@@ -4887,6 +4887,75 @@ UT_TEST(data_inventory_unaligned_output_inputs_and_aliases)
 	UT_ASSERT(storage[0] == 0xa5 && storage[sizeof(storage) - 1] == 0xa5);
 }
 
+UT_TEST(data_inventory_graph_nodes_are_borrowed_and_atomic)
+{
+	const uint16 positions[] = { 0, 5, 17, 47 };
+	ClusterRecoveryNamespaceEntry entry;
+	PGAlignedBlock page;
+	ClusterRecoveryCTRCTTDataInventoryV2 inventory, saved;
+	ClusterRecoveryCTRCGraphNodeV2 nodes[TT_SLOTS_PER_SEGMENT];
+	uint8 guarded[sizeof(nodes) + 2];
+	size_t count;
+
+	UT_ASSERT(data_sample(&entry, &page, 2, 257, 5));
+	{
+		UndoSegmentHeaderData *hdr = (UndoSegmentHeaderData *)page.data;
+		ClusterRecoveryCTRCReleaseV2 r = sample();
+
+		for (unsigned i = 0; i < lengthof(positions); i++) {
+			hdr->tt_slots[positions[i]] = r.before;
+			hdr->tt_slots[positions[i]].xid += i;
+			hdr->tt_slots[positions[i]].status = 1 + i;
+		}
+		UT_ASSERT(cluster_undo_segment_header_seal(page.data));
+	}
+	UT_ASSERT(cluster_recovery_ctrc_tt_data_inventory_v2(SYSTEM_ID, 99, &entry,
+		page.data, BLCKSZ, &inventory));
+	saved = inventory;
+	memset(nodes, 0, sizeof(nodes));
+	count = 0;
+	UT_ASSERT(cluster_recovery_ctrc_tt_data_graph_nodes_v2(&inventory, nodes, &count));
+	UT_ASSERT_EQ(count, inventory.reference_count);
+	for (size_t i = 0; i < count; i++) {
+		UT_ASSERT_EQ(nodes[i].kind, 1);
+		UT_ASSERT(nodes[i].key.data == inventory.keys[i]);
+		UT_ASSERT_EQ(nodes[i].key.length, inventory.key_length);
+		UT_ASSERT(nodes[i].evidence.data == inventory.evidence);
+		UT_ASSERT_EQ(nodes[i].evidence.length, inventory.evidence_length);
+	}
+	UT_ASSERT(memcmp(&inventory, &saved, sizeof(inventory)) == 0);
+	{
+		ClusterRecoveryCTRCTTDataInventoryV2 empty = saved;
+
+		empty.reference_count = 0;
+		memset(empty.keys, 0, sizeof(empty.keys));
+		count = SIZE_MAX;
+		UT_ASSERT(cluster_recovery_ctrc_tt_data_graph_nodes_v2(&empty, nodes, &count));
+		UT_ASSERT_EQ(count, 0);
+		UT_ASSERT(all_zero(nodes, sizeof(nodes)));
+	}
+
+	for (unsigned mutation = 0; mutation < 4; mutation++) {
+		ClusterRecoveryCTRCTTDataInventoryV2 copy = saved;
+
+		if (mutation == 0)
+			copy.reference_count = TT_SLOTS_PER_SEGMENT + 1;
+		else if (mutation == 1)
+			copy.keys[0][34] = 0;
+		else if (mutation == 2)
+			copy.evidence[0] = 2;
+		else
+			copy.keys[1][52 + copy.key_length - 60] ^= 1;
+		memset(guarded, 0xa5, sizeof(guarded));
+		count = SIZE_MAX;
+		UT_ASSERT(!cluster_recovery_ctrc_tt_data_graph_nodes_v2(&copy,
+			(ClusterRecoveryCTRCGraphNodeV2 *)(guarded + 1), &count));
+		UT_ASSERT_EQ(count, 0);
+		UT_ASSERT(all_zero(guarded + 1, sizeof(guarded) - 2));
+		UT_ASSERT(guarded[0] == 0xa5 && guarded[sizeof(guarded) - 1] == 0xa5);
+	}
+}
+
 
 /* Independent Python struct.pack golden: three original source indexes, three
  * effect IDs; both source and ordinal ordering differ from native numeric sort. */
@@ -5859,6 +5928,7 @@ main(void)
 	UT_RUN(data_inventory_native_layout_namespace_and_integrity);
 	UT_RUN(data_inventory_exact_lengths_nulls_and_clearing_bounds);
 	UT_RUN(data_inventory_unaligned_output_inputs_and_aliases);
+	UT_RUN(data_inventory_graph_nodes_are_borrowed_and_atomic);
 	graph_alloc_tracking = true;
 	UT_RUN(graph_independent_golden_and_immutable);
 	UT_RUN(graph_all_node_edge_permutations);

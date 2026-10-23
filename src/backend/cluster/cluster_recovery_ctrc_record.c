@@ -1012,6 +1012,66 @@ refused:
 	return false;
 }
 
+bool
+cluster_recovery_ctrc_tt_data_graph_nodes_v2(
+	const ClusterRecoveryCTRCTTDataInventoryV2 *inventory,
+	ClusterRecoveryCTRCGraphNodeV2 out[TT_SLOTS_PER_SEGMENT], size_t *out_count)
+{
+	ClusterRecoveryCTRCGraphNodeV2 nodes[TT_SLOTS_PER_SEGMENT];
+	size_t id_length;
+	uint64 atom_length;
+	const uint8 *atom;
+
+	memset(nodes, 0, sizeof(nodes));
+	if (inventory == NULL || out == NULL || out_count == NULL
+		|| inventory->reference_count > TT_SLOTS_PER_SEGMENT
+		|| inventory->key_length < 60
+		|| inventory->key_length > CLUSTER_RECOVERY_CTRC_TT_DATA_KEY_MAX_BYTES
+		|| inventory->evidence_length < 16
+		|| inventory->evidence_length > CLUSTER_RECOVERY_CTRC_TT_DATA_EVIDENCE_MAX_BYTES)
+		goto refused;
+	id_length = inventory->key_length - 60;
+	if (cluster_undo_tt_ctrc_get_u64_le(inventory->evidence) != 1
+		|| cluster_undo_tt_ctrc_get_u64_le(inventory->evidence + 8)
+			!= inventory->evidence_length - 16)
+		goto refused;
+	atom = inventory->evidence + 16;
+	atom_length = cluster_undo_tt_ctrc_get_u64_le(inventory->evidence + 8);
+	if (cluster_undo_tt_ctrc_get_u16_le(atom) != 2
+		|| cluster_undo_tt_ctrc_get_u64_le(atom + 2) != id_length + 16
+		|| atom_length != 34 + id_length + BLCKSZ
+		|| cluster_undo_tt_ctrc_get_u64_le(atom + 26 + id_length) != BLCKSZ
+		|| (inventory->reference_count > 0
+			&& memcmp(atom + 10, inventory->keys[0] + 44, id_length) != 0))
+		goto refused;
+
+	for (size_t i = 0; i < inventory->reference_count; i++) {
+		const uint8 *key = inventory->keys[i];
+
+		if (cluster_undo_tt_ctrc_get_u16_le(key + 34) != 1
+			|| cluster_undo_tt_ctrc_get_u64_le(key + 36) != id_length
+			|| memcmp(key + 44, atom + 10, id_length) != 0
+			|| cluster_undo_tt_ctrc_get_u64_le(key + 52 + id_length)
+			!= cluster_undo_tt_ctrc_get_u16_le(key + 26))
+			goto refused;
+		nodes[i] = (ClusterRecoveryCTRCGraphNodeV2){
+			1,
+			{ inventory->keys[i], inventory->key_length },
+			{ inventory->evidence, inventory->evidence_length }
+		};
+	}
+	memcpy(out, nodes, sizeof(nodes));
+	*out_count = inventory->reference_count;
+	return true;
+
+refused:
+	if (out != NULL)
+		memset(out, 0, sizeof(nodes));
+	if (out_count != NULL)
+		*out_count = 0;
+	return false;
+}
+
 ClusterRecoveryCTRCTargetMatchV2
 cluster_recovery_ctrc_target_match_v2(const uint8 *payload, size_t payload_length,
 									  uint64 system_identifier, const void *header_page,

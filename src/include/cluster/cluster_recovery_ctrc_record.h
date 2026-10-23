@@ -439,6 +439,15 @@ extern bool cluster_recovery_ctrc_tt_abort_graph_nodes_v2(
 	const ClusterRecoveryCTRCTTAbortReferencesV2 *references,
 	ClusterRecoveryCTRCGraphNodeV2 out[CLUSTER_RECOVERY_CTRC_TT_ABORT_REFERENCE_COUNT]);
 
+/* Expose a complete DATA inventory as borrowed kind-1 graph reference nodes.
+ * The shared atom envelope, key lengths/identity bytes and physical slot
+ * ordinals are rechecked before publishing the whole fixed descriptor array.
+ * This is structural correspondence only: no graph completeness, owner,
+ * terminal/base/floor/issued, durability, release or live authority. */
+extern bool cluster_recovery_ctrc_tt_data_graph_nodes_v2(
+	const ClusterRecoveryCTRCTTDataInventoryV2 *inventory,
+	ClusterRecoveryCTRCGraphNodeV2 out[TT_SLOTS_PER_SEGMENT], size_t *out_count);
+
 typedef struct ClusterRecoveryCTRCGraphEdgeV2 {
 	uint16 kind; /* 1 requires, 2 references, 3 retained_history, 4 discharged_by */
 	size_t from; /* indices into the supplied nodes, never hashed as indices */
