@@ -761,6 +761,13 @@ cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 	if (binding_out == NULL)
 		return false;
 	memset(binding_out, 0, sizeof(*binding_out));
+	/* Existing-other starts keep canonical ACTIVE reservation closed until the
+	 * recovered semantic OPEN cut is visible.  Startup-owned reservation keeps
+	 * its original recovery authority path. */
+	if (MyBackendType != B_STARTUP && cluster_shared_config
+		&& cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& !cluster_semantic_activation_recovered_open_current())
+		return false;
 	if (!cluster_enabled || cluster_node_id < 0 || !TransactionIdIsNormal(top_xid))
 		return false;
 

@@ -24,12 +24,27 @@ static bool cold_capacity_refused;
 static uint32 cold_successor;
 static int cold_selection_calls;
 static TTSlot cold_old_slot;
+static ClusterNormalStartState active_owner_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+static bool active_owner_recovered_open = true;
 bool cluster_enabled = true;
+BackendType MyBackendType = B_BACKEND;
 bool cluster_undo_retention_horizon_enabled = false;
 int cluster_undo_segments_max_per_instance = 256;
 ClusterConf *ClusterConfShmem = NULL;
 MemoryContext CurrentMemoryContext = (MemoryContext)1;
 MemoryContext TopTransactionContext = (MemoryContext)1;
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return active_owner_start_state;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return active_owner_recovered_open;
+}
 
 void *(palloc0)(Size size)
 {
@@ -257,6 +272,10 @@ reset_active_owner(void)
 	ClusterTTSlotShm = &allocator_storage;
 	lock_depth = modifier_enters = modifier_leaves = rollovers_on_enter = 0;
 	modifier_refused = false;
+	cluster_shared_config = false;
+	MyBackendType = B_BACKEND;
+	active_owner_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+	active_owner_recovered_open = true;
 	first_recheck_pending = false;
 	cold_fixture = cold_capacity_refused = false;
 	cold_selection_calls = 0;
@@ -266,6 +285,24 @@ reset_active_owner(void)
 	reset_current_write_mock();
 	g_modifier_recheck_hook = active_owner_first_recheck;
 	select_physical_fixture(1);
+}
+
+UT_TEST(test_recovered_open_gate_precedes_canonical_reservation)
+{
+	ClusterCanonicalTxnBinding result;
+
+	reset_active_owner();
+	cluster_shared_config = true;
+	active_owner_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	active_owner_recovered_open = false;
+	memset(&result, 0, sizeof(result));
+	UT_ASSERT(!cluster_tt_local_prepare_canonical_active(100, &result));
+	UT_ASSERT_EQ(cluster_tt_local_binding_count, 0);
+	UT_ASSERT_EQ(modifier_enters, 0);
+
+	cluster_shared_config = false;
+	active_owner_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+	active_owner_recovered_open = true;
 }
 
 static void
@@ -581,7 +618,8 @@ UT_TEST(test_real_local_postbind_error_stays_failed_without_reallocation)
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(16);
+	UT_RUN(test_recovered_open_gate_precedes_canonical_reservation);
 	UT_RUN(test_modifier_refusal_precedes_allocation_and_leaves_abort_without_effects);
 	UT_RUN(test_cold_allocator_preserves_occupied_durable_base);
 	UT_RUN(test_cold_fresh_database_uses_same_publication_path);
