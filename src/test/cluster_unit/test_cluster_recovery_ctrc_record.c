@@ -6108,6 +6108,142 @@ UT_TEST(cold_step_unaligned_alias_inputs_and_publication)
 }
 
 static bool
+cold_step_payload(ClusterRecoveryCTRCColdStepV2 *step,
+	ClusterRecoveryCTRCColdMemberV2 members[2], uint8 payload[CLUSTER_RECOVERY_CTRC_BYTES])
+{
+	ClusterRecoveryCTRCReleaseV2 record;
+
+	cold_step_sample(step, members);
+	if (!cluster_recovery_ctrc_decode_v2(golden, sizeof(golden), SYSTEM_ID, &record))
+		return false;
+	record.formation_epoch = step->formation_epoch;
+	record.recovery_serial = step->recovery_serial;
+	record.cohort_bitmap = step->cohort_bitmap;
+	memcpy(record.input_sha256, step->input_sha256, sizeof(record.input_sha256));
+	return cluster_recovery_ctrc_encode_v2(&record, SYSTEM_ID, payload, CLUSTER_RECOVERY_CTRC_BYTES);
+}
+
+UT_TEST(cold_step_matches_exact_payload_round_and_input)
+{
+	ClusterRecoveryCTRCColdStepV2 step;
+	ClusterRecoveryCTRCColdMemberV2 members[2];
+	ClusterRecoveryCTRCReleaseV2 record, changed;
+	uint8 payload[320], other[320], body[sizeof(cold_step_golden)];
+
+	UT_ASSERT(cold_step_payload(&step, members, payload));
+	UT_ASSERT(cluster_recovery_ctrc_decode_v2(payload, sizeof(payload), SYSTEM_ID, &record));
+	UT_ASSERT(cluster_recovery_ctrc_cold_step_matches_v2(cold_step_golden, sizeof(cold_step_golden),
+		payload, sizeof(payload), SYSTEM_ID));
+	for (unsigned which = 0; which < 4; which++) {
+		changed = record;
+		switch (which) {
+		case 0: changed.formation_epoch++; break;
+		case 1: changed.recovery_serial++; break;
+		case 2: changed.cohort_bitmap ^= 1; break;
+		case 3: changed.input_sha256[0] ^= 0x80; break;
+		}
+		/* Independently valid D0 payload: rejection must come from binding. */
+		UT_ASSERT(cluster_recovery_ctrc_encode_v2(&changed, SYSTEM_ID, other, sizeof(other)));
+		UT_ASSERT(cluster_recovery_ctrc_decode_v2(other, sizeof(other), SYSTEM_ID, &changed));
+		UT_ASSERT(!cluster_recovery_ctrc_cold_step_matches_v2(cold_step_golden, sizeof(cold_step_golden),
+			other, sizeof(other), SYSTEM_ID));
+		memcpy(body, cold_step_golden, sizeof(body));
+		body[which == 0 ? 0 : which == 1 ? 8 : which == 2 ? 16 : 32] ^= 1;
+		UT_ASSERT(!cluster_recovery_ctrc_cold_step_matches_v2(body, sizeof(body), payload, sizeof(payload), SYSTEM_ID));
+	}
+}
+
+UT_TEST(cold_step_matches_rejects_noncanonical_body_and_invalid_payload)
+{
+	ClusterRecoveryCTRCColdStepV2 step;
+	ClusterRecoveryCTRCColdMemberV2 members[2];
+	uint8 body[sizeof(cold_step_golden) + 1], before[sizeof(body)], payload[321], bad[321];
+	const size_t corrupt_payload_offsets[] = {0, 4, 24, 192, 224, 256, 288};
+
+	memset(payload, 0xa5, sizeof(payload));
+	UT_ASSERT(cold_step_payload(&step, members, payload));
+	for (size_t length = 0; length < sizeof(cold_step_golden); length++)
+		UT_ASSERT(!cluster_recovery_ctrc_cold_step_matches_v2(cold_step_golden, length, payload, 320, SYSTEM_ID));
+	for (unsigned which = 0; which < 15; which++) {
+		size_t length = sizeof(cold_step_golden);
+
+		memcpy(body, cold_step_golden, sizeof(cold_step_golden));
+		body[sizeof(cold_step_golden)] = 0xa5;
+		switch (which) {
+		case 0: cluster_undo_tt_ctrc_put_u64_le(body + 64, 0); break;
+		case 1: cluster_undo_tt_ctrc_put_u64_le(body + 64, UINT64_MAX); break;
+		case 2: cluster_undo_tt_ctrc_put_u64_le(body + 64, 65); break;
+		case 3: cluster_undo_tt_ctrc_put_u64_le(body + 64, 1); break;
+		case 4: cluster_undo_tt_ctrc_put_u64_le(body + 24, 2); break;
+		case 5: body[24] |= 1; break;
+		case 6: body[72] = 64; break;
+		case 7: body[73] = 1; break;
+		case 8: cluster_undo_tt_ctrc_put_u64_le(body + 74, 0); break;
+		case 9: cluster_undo_tt_ctrc_put_u64_le(body + 82, 0); break;
+		case 10: memcpy(body + 90, body + 72, 18); break;
+		case 11:
+			memcpy(body + 72, cold_step_golden + 90, 18);
+			memcpy(body + 90, cold_step_golden + 72, 18);
+			break;
+		case 12: memset(body + 32, 0, 32); break;
+		case 13: body[90] = 2; break; /* Unique member outside the declared cohort. */
+		case 14: length++; break;
+		}
+		memcpy(before, body, sizeof(before));
+		UT_ASSERT(!cluster_recovery_ctrc_cold_step_matches_v2(body, length, payload, 320, SYSTEM_ID));
+		UT_ASSERT(memcmp(body, before, sizeof(body)) == 0);
+	}
+	for (size_t length = 0; length < 320; length++)
+		UT_ASSERT(!cluster_recovery_ctrc_cold_step_matches_v2(cold_step_golden, sizeof(cold_step_golden), payload, length, SYSTEM_ID));
+	UT_ASSERT(!cluster_recovery_ctrc_cold_step_matches_v2(cold_step_golden, sizeof(cold_step_golden), payload, 321, SYSTEM_ID));
+	for (unsigned i = 0; i < lengthof(corrupt_payload_offsets); i++) {
+		memcpy(bad, payload, sizeof(bad));
+		bad[corrupt_payload_offsets[i]] ^= 1;
+		UT_ASSERT(!cluster_recovery_ctrc_cold_step_matches_v2(cold_step_golden, sizeof(cold_step_golden), bad, 320, SYSTEM_ID));
+		UT_ASSERT(bad[corrupt_payload_offsets[i]] == (uint8)(payload[corrupt_payload_offsets[i]] ^ 1));
+	}
+	UT_ASSERT(!cluster_recovery_ctrc_cold_step_matches_v2(NULL, sizeof(cold_step_golden), payload, 320, SYSTEM_ID));
+	UT_ASSERT(!cluster_recovery_ctrc_cold_step_matches_v2(cold_step_golden, SIZE_MAX, payload, 320, SYSTEM_ID));
+	UT_ASSERT(!cluster_recovery_ctrc_cold_step_matches_v2(cold_step_golden, sizeof(cold_step_golden), NULL, 320, SYSTEM_ID));
+	UT_ASSERT(!cluster_recovery_ctrc_cold_step_matches_v2(cold_step_golden, sizeof(cold_step_golden), payload, SIZE_MAX, SYSTEM_ID));
+	UT_ASSERT(!cluster_recovery_ctrc_cold_step_matches_v2(cold_step_golden, sizeof(cold_step_golden), payload, 320, 0));
+	UT_ASSERT(!cluster_recovery_ctrc_cold_step_matches_v2(cold_step_golden, sizeof(cold_step_golden), payload, 320, SYSTEM_ID + 1));
+}
+
+UT_TEST(cold_step_matches_unaligned_and_original_native_payload)
+{
+	ClusterRecoveryCTRCColdStepV2 step;
+	ClusterRecoveryCTRCColdMemberV2 members[2];
+	uint8 body[128], body_before[sizeof(body)], payload[326], payload_before[sizeof(payload)];
+	NativeRaw wire;
+	NativePages pages;
+	XLogReaderState *reader;
+	size_t raw_length;
+	bool tracking = graph_alloc_tracking, read_ok;
+
+	memset(body, 0xa5, sizeof(body));
+	memset(payload, 0xa5, sizeof(payload));
+	memcpy(body + 1, cold_step_golden, sizeof(cold_step_golden));
+	UT_ASSERT(cold_step_payload(&step, members, payload + 3));
+	memcpy(body_before, body, sizeof(body));
+	memcpy(payload_before, payload, sizeof(payload));
+	UT_ASSERT(cluster_recovery_ctrc_cold_step_matches_v2(body + 1, sizeof(cold_step_golden), payload + 3, 320, SYSTEM_ID));
+	UT_ASSERT(memcmp(body, body_before, sizeof(body)) == 0 && memcmp(payload, payload_before, sizeof(payload)) == 0);
+	raw_length = native_wire(&wire, payload + 3, 320, 0);
+	graph_alloc_tracking = false;
+	read_ok = native_read(&pages, &wire, raw_length, false, &reader);
+	UT_ASSERT(read_ok);
+	if (read_ok) {
+		UT_ASSERT_EQ(XLogRecGetDataLen(reader), 320);
+		UT_ASSERT(cluster_recovery_ctrc_cold_step_matches_v2(body + 1, sizeof(cold_step_golden),
+			(const uint8 *)XLogRecGetData(reader), XLogRecGetDataLen(reader), SYSTEM_ID));
+		XLogReaderFree(reader);
+	}
+	graph_alloc_tracking = tracking;
+	UT_ASSERT(memcmp(body, body_before, sizeof(body)) == 0 && graph_alloc_live == 0);
+}
+
+static bool
 raw_evidence_refused(const ClusterRecoveryCTRCGraphBytesV2 *atoms, size_t count, size_t capacity)
 {
 	uint8 out[258];
@@ -6636,7 +6772,7 @@ UT_TEST(graph_reader_allocation_refusal)
 int
 main(void)
 {
-	UT_PLAN(191);
+	UT_PLAN(194);
 	UT_RUN(golden_encoding);
 	UT_RUN(golden_decoding);
 	UT_RUN(unaligned_buffers);
@@ -6813,6 +6949,9 @@ main(void)
 	UT_RUN(cold_step_canonical_bytes_and_complete_64_member_cohort);
 	UT_RUN(cold_step_incomplete_duplicate_unknown_and_bounded_refusal);
 	UT_RUN(cold_step_unaligned_alias_inputs_and_publication);
+	UT_RUN(cold_step_matches_exact_payload_round_and_input);
+	UT_RUN(cold_step_matches_rejects_noncanonical_body_and_invalid_payload);
+	UT_RUN(cold_step_matches_unaligned_and_original_native_payload);
 	UT_RUN(raw_evidence_permutations_and_full_encoded_sort);
 	UT_RUN(raw_evidence_conflicting_subject_is_atomic);
 	UT_RUN(raw_evidence_envelope_refusals);

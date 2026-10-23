@@ -486,6 +486,18 @@ typedef struct ClusterRecoveryCTRCColdStepV2 {
 extern bool cluster_recovery_ctrc_cold_step_bytes_v2(const ClusterRecoveryCTRCColdStepV2 *step,
 	uint8 *out, size_t out_length);
 
+/* Read canonical atom4 bytes and match their formation/recovery/cohort/input
+ * fields against one complete payload accepted by the original v2 decoder.
+ * All member identities and exact sorted bitmap coverage are checked, but
+ * their current boot/incarnation/ACK legitimacy remains the original owner's
+ * responsibility. This matches common fields, not owner scope, atom3 rules,
+ * graph completeness, current-round success, durability or release authority.
+ * Immutable input views may be unaligned/overlap; no mutation or output.
+ * Outside critical sections/spinlocks; inherits the original decoder's SHA
+ * allocation/failure behavior. No live caller or ACK reconstruction. */
+extern bool cluster_recovery_ctrc_cold_step_matches_v2(const uint8 *bytes, size_t length,
+	const uint8 *payload, size_t payload_length, uint64 system_identifier);
+
 typedef struct ClusterRecoveryCTRCGraphNodeV2 {
 	uint16 kind; /* 1 reference/history, 2 original-owner proof */
 	ClusterRecoveryCTRCGraphBytesV2 key;

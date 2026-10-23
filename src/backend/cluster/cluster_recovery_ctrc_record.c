@@ -2177,4 +2177,47 @@ refused:
 	return false;
 }
 
+bool
+cluster_recovery_ctrc_cold_step_matches_v2(const uint8 *bytes, size_t length,
+	const uint8 *payload, size_t payload_length, uint64 system_identifier)
+{
+	ClusterRecoveryCTRCReleaseV2 record;
+	uint64 cohort, count, seen = 0;
+	uint16 previous = 0;
+
+	if (bytes == NULL || length < 90 || length > 72 + 18 * 64)
+		return false;
+	cohort = cluster_undo_tt_ctrc_get_u64_le(bytes + 16);
+	count = cluster_undo_tt_ctrc_get_u64_le(bytes + 64);
+	if (cluster_undo_tt_ctrc_get_u64_le(bytes) == 0
+		|| cluster_undo_tt_ctrc_get_u64_le(bytes + 8) == 0
+		|| cohort == 0 || cluster_undo_tt_ctrc_get_u64_le(bytes + 24) != cohort
+		|| !ctrc_nonzero_digest(bytes + 32) || count == 0 || count > 64
+		|| length != 72 + 18 * (size_t)count)
+		return false;
+	for (size_t i = 0; i < (size_t)count; i++) {
+		const uint8 *member = bytes + 72 + 18 * i;
+		uint16 node = cluster_undo_tt_ctrc_get_u16_le(member);
+		uint64 bit;
+
+		if (node >= 64 || (i != 0 && node <= previous)
+			|| cluster_undo_tt_ctrc_get_u64_le(member + 2) == 0
+			|| cluster_undo_tt_ctrc_get_u64_le(member + 10) == 0)
+			return false;
+		bit = UINT64_C(1) << node;
+		if ((cohort & bit) == 0)
+			return false;
+		seen |= bit;
+		previous = node;
+	}
+	if (seen != cohort
+		|| !cluster_recovery_ctrc_decode_v2(payload, payload_length, system_identifier, &record))
+		return false;
+	/* Only fields actually carried in atom4 are compared; current member ACKs
+	 * and the original owner/graph predicates cannot be inferred from them. */
+	return cluster_undo_tt_ctrc_get_u64_le(bytes) == record.formation_epoch
+		&& cluster_undo_tt_ctrc_get_u64_le(bytes + 8) == record.recovery_serial
+		&& cohort == record.cohort_bitmap && memcmp(bytes + 32, record.input_sha256, 32) == 0;
+}
+
 #endif
