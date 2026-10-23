@@ -1709,6 +1709,90 @@ refused:
 	return false;
 }
 
+/* Recheck the exact owner-key envelope before borrowing it as a graph id. */
+static bool
+ctrc_owner_key_shape_v2(const uint8 *owner_key, size_t owner_key_length)
+{
+	const uint8 *sources, *effects;
+	uint64 source_count_u64, effect_count_u64;
+	size_t source_count, effect_count, effects_offset;
+	uint32 segment_id;
+
+	if (owner_key == NULL || owner_key_length < 60 || owner_key_length > MaxAllocSize
+		|| cluster_undo_tt_ctrc_get_u16_le(owner_key) < 1
+		|| cluster_undo_tt_ctrc_get_u16_le(owner_key) > 14
+		|| cluster_undo_tt_ctrc_get_u64_le(owner_key + 2) != owner_key_length - 10
+		|| cluster_undo_tt_ctrc_get_u64_le(owner_key + 10) == 0
+		|| cluster_undo_tt_ctrc_get_u64_le(owner_key + 18) == 0
+		|| cluster_undo_tt_ctrc_get_u16_le(owner_key + 26) > SCN_MAX_VALID_NODE_ID
+		|| (segment_id = cluster_undo_tt_ctrc_get_u32_le(owner_key + 28)) == 0
+		|| (segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE
+			!= cluster_undo_tt_ctrc_get_u16_le(owner_key + 26)
+		|| cluster_undo_tt_ctrc_get_u32_le(owner_key + 32) == UINT32_MAX
+		|| cluster_undo_tt_ctrc_get_u16_le(owner_key + 36) >= TT_SLOTS_PER_SEGMENT
+		|| cluster_undo_tt_ctrc_get_u16_le(owner_key + 38) == TT_WRAP_INVALID
+		|| !TransactionIdIsNormal(cluster_undo_tt_ctrc_get_u32_le(owner_key + 40)))
+		return false;
+	source_count_u64 = cluster_undo_tt_ctrc_get_u64_le(owner_key + 44);
+	if (source_count_u64 > (owner_key_length - 60) / sizeof(uint32))
+		return false;
+	source_count = (size_t) source_count_u64;
+	effects_offset = 60 + source_count * sizeof(uint32);
+	effect_count_u64 = cluster_undo_tt_ctrc_get_u64_le(owner_key + effects_offset - 8);
+	if (effect_count_u64 > (owner_key_length - effects_offset) / 62)
+		return false;
+	effect_count = (size_t) effect_count_u64;
+	if (effects_offset + effect_count * 62 != owner_key_length)
+		return false;
+	sources = owner_key + 52;
+	effects = owner_key + effects_offset;
+	for (size_t i = 1; i < source_count; i++)
+		if (memcmp(sources + (i - 1) * sizeof(uint32),
+				sources + i * sizeof(uint32), sizeof(uint32)) >= 0)
+			return false;
+	for (size_t i = 0; i < effect_count; i++) {
+		const uint8 *effect = effects + i * 62;
+		uint64 start = cluster_undo_tt_ctrc_get_u64_le(effect + 4);
+		uint64 end = cluster_undo_tt_ctrc_get_u64_le(effect + 12);
+		uint32 raw_length = cluster_undo_tt_ctrc_get_u32_le(effect + 20);
+
+		if ((i != 0 && memcmp(effects + (i - 1) * 62, effect, 62) >= 0)
+			|| bsearch(effect, sources, source_count, 4, ctrc_owner_source_cmp) == NULL
+			|| start == InvalidXLogRecPtr || end <= start
+			|| raw_length < SizeOfXLogRecord || raw_length > XLogRecordMaxSize
+			|| end - start < raw_length || !ctrc_nonzero_digest(effect + 24))
+			return false;
+	}
+	return true;
+}
+
+bool
+cluster_recovery_ctrc_owner_graph_node_v2(const uint8 *owner_key,
+	size_t owner_key_length, const ClusterRecoveryCTRCGraphBytesV2 *evidence,
+	ClusterRecoveryCTRCGraphNodeV2 *out)
+{
+	ClusterRecoveryCTRCGraphNodeV2 node;
+	ClusterRecoveryCTRCGraphBytesV2 witness;
+
+	if (out == NULL || evidence == NULL || owner_key_length > MaxAllocSize - 18
+		|| !ctrc_owner_key_shape_v2(owner_key, owner_key_length))
+		goto refused;
+	memcpy(&witness, evidence, sizeof(witness));
+	if (witness.data == NULL || witness.length == 0
+		|| witness.length > MaxAllocSize - 18 - owner_key_length)
+		goto refused;
+	node = (ClusterRecoveryCTRCGraphNodeV2){
+		2, { owner_key, owner_key_length }, witness
+	};
+	memcpy(out, &node, sizeof(node));
+	return true;
+
+refused:
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return false;
+}
+
 typedef struct CTRCRawEvidenceWork {
 	ClusterRecoveryCTRCGraphBytesV2 atom;
 	size_t identity_length;

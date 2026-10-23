@@ -429,6 +429,23 @@ typedef struct ClusterRecoveryCTRCGraphNodeV2 {
 	ClusterRecoveryCTRCGraphBytesV2 evidence;
 } ClusterRecoveryCTRCGraphNodeV2;
 
+/* Expose one canonical dormant owner-scope key as a borrowed kind-2 graph
+ * node. The exact owner-key envelope, transaction identity, sorted source/
+ * effect lists, memberships and R-field domains are rechecked before
+ * publication; evidence is an immutable nonempty view supplied by the
+ * original producer. This remains structural correspondence only: evidence
+ * semantics, owner completion, graph completeness, terminal/base/floor/
+ * issued qualification, durability, release and live authority remain the
+ * original producer's responsibility. The combined node bytes must fit the
+ * existing graph transcript budget. No allocation or input mutation. Key and
+ * evidence bytes must remain immutable and alive for the borrowed node's
+ * lifetime; out must be disjoint from those bytes. Views/bytes/out may be
+ * unaligned; the evidence view is consumed before publication and may alias
+ * out. Refusal clears only the descriptor. */
+extern bool cluster_recovery_ctrc_owner_graph_node_v2(const uint8 *owner_key,
+	size_t owner_key_length, const ClusterRecoveryCTRCGraphBytesV2 *evidence,
+	ClusterRecoveryCTRCGraphNodeV2 *out);
+
 /* Expose one complete TT-ABORT inventory as four canonical reference nodes.
  * The nodes borrow the inventory's immutable key/evidence storage and are
  * published only after the shared raw atom and all four field offsets pass

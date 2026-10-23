@@ -5420,6 +5420,167 @@ UT_TEST(owner_key_full_width_fields_are_bound)
 	}
 }
 
+static bool
+owner_graph_node_refused(const uint8 *key, size_t key_length,
+	const ClusterRecoveryCTRCGraphBytesV2 *evidence)
+{
+	ClusterRecoveryCTRCGraphNodeV2 node;
+
+	memset(&node, 0xa5, sizeof(node));
+	return !cluster_recovery_ctrc_owner_graph_node_v2(key, key_length, evidence, &node)
+		&& all_zero(&node, sizeof(node));
+}
+
+UT_TEST(owner_graph_node_borrows_canonical_key_and_evidence)
+{
+	OwnerKeyFixture f;
+	ClusterRecoveryCTRCGraphBytesV2 evidence;
+	ClusterRecoveryCTRCGraphNodeV2 node;
+	uint8 key[258], changed[258];
+	uint8 evidence_bytes[] = { 0x02, 0x00, 0xaa, 0x55 };
+
+	owner_key_fixture(&f);
+	UT_ASSERT(cluster_recovery_ctrc_owner_key_v2(&f.scope, key, sizeof(key)));
+	evidence = (ClusterRecoveryCTRCGraphBytesV2){ evidence_bytes, sizeof(evidence_bytes) };
+	UT_ASSERT(cluster_recovery_ctrc_owner_graph_node_v2(key, sizeof(key), &evidence, &node));
+	UT_ASSERT_EQ(node.kind, 2);
+	UT_ASSERT(node.key.data == key && node.key.length == sizeof(key)
+		&& node.evidence.data == evidence_bytes
+		&& node.evidence.length == sizeof(evidence_bytes));
+
+	memcpy(changed, key, sizeof(changed));
+	changed[0] = 0;
+	UT_ASSERT(owner_graph_node_refused(changed, sizeof(changed), &evidence));
+	memcpy(changed, key, sizeof(changed));
+	changed[2] ^= 1;
+	UT_ASSERT(owner_graph_node_refused(changed, sizeof(changed), &evidence));
+	memcpy(changed, key, sizeof(changed));
+	changed[52] = 2; /* breaks complete encoded-byte source ordering */
+	UT_ASSERT(owner_graph_node_refused(changed, sizeof(changed), &evidence));
+	memcpy(changed, key, sizeof(changed));
+	changed[72] = 2; /* effect source is outside the canonical source set */
+	UT_ASSERT(owner_graph_node_refused(changed, sizeof(changed), &evidence));
+	memcpy(changed, key, sizeof(changed));
+	changed[92] = 0; changed[93] = 0; /* raw length falls below the native header */
+	UT_ASSERT(owner_graph_node_refused(changed, sizeof(changed), &evidence));
+	evidence.length = 0;
+	UT_ASSERT(owner_graph_node_refused(key, sizeof(key), &evidence));
+	UT_ASSERT(!cluster_recovery_ctrc_owner_graph_node_v2(key, sizeof(key), &evidence, NULL));
+}
+
+UT_TEST(owner_graph_node_variable_length_bounds)
+{
+	uint8 key[sizeof(owner_key_golden) + 1];
+	uint8 witness = 1;
+	ClusterRecoveryCTRCGraphBytesV2 evidence = { &witness, 1 };
+
+	memcpy(key, owner_key_golden, sizeof(owner_key_golden));
+	for (size_t length = 0; length < sizeof(owner_key_golden); length++)
+		UT_ASSERT(owner_graph_node_refused(key, length, &evidence));
+	UT_ASSERT(owner_graph_node_refused(NULL, sizeof(owner_key_golden), &evidence));
+	UT_ASSERT(owner_graph_node_refused(key, SIZE_MAX, &evidence));
+	UT_ASSERT(owner_graph_node_refused(key, sizeof(owner_key_golden), NULL));
+	for (unsigned change = 0; change < 3; change++) {
+		memcpy(key, owner_key_golden, sizeof(owner_key_golden));
+		if (change == 0)
+			cluster_undo_tt_ctrc_put_u64_le(key + 44, UINT64_MAX);
+		else if (change == 1)
+			cluster_undo_tt_ctrc_put_u64_le(key + 64, UINT64_MAX);
+		else
+			cluster_undo_tt_ctrc_put_u64_le(key + 64, 2);
+		UT_ASSERT(owner_graph_node_refused(key, sizeof(owner_key_golden), &evidence));
+	}
+	memcpy(key, owner_key_golden, sizeof(owner_key_golden));
+	cluster_undo_tt_ctrc_put_u64_le(key + 2, sizeof(key) - 10);
+	key[sizeof(key) - 1] = 0;
+	UT_ASSERT(owner_graph_node_refused(key, sizeof(key), &evidence));
+	evidence.data = NULL;
+	UT_ASSERT(owner_graph_node_refused(owner_key_golden, sizeof(owner_key_golden), &evidence));
+	evidence.data = &witness;
+	evidence.length = MaxAllocSize;
+	/* A single node must fit the existing graph transcript byte budget. */
+	UT_ASSERT(owner_graph_node_refused(owner_key_golden, sizeof(owner_key_golden), &evidence));
+	evidence.length = SIZE_MAX;
+	UT_ASSERT(owner_graph_node_refused(owner_key_golden, sizeof(owner_key_golden), &evidence));
+}
+
+UT_TEST(owner_graph_node_identity_order_and_reference_domains)
+{
+	uint8 key[sizeof(owner_key_golden)];
+	uint8 witness = 1;
+	ClusterRecoveryCTRCGraphBytesV2 evidence = { &witness, 1 };
+
+	for (unsigned change = 0; change < 20; change++) {
+		memcpy(key, owner_key_golden, sizeof(key));
+		switch (change) {
+		case 0: cluster_undo_tt_ctrc_put_u16_le(key, 15); break;
+		case 1: memset(key + 10, 0, 8); break;
+		case 2: memset(key + 18, 0, 8); break;
+		case 3: cluster_undo_tt_ctrc_put_u16_le(key + 26, 128); break;
+		case 4: cluster_undo_tt_ctrc_put_u32_le(key + 28, 0); break;
+		case 5: cluster_undo_tt_ctrc_put_u32_le(key + 28, 1); break;
+		case 6: cluster_undo_tt_ctrc_put_u32_le(key + 32, UINT32_MAX); break;
+		case 7: cluster_undo_tt_ctrc_put_u16_le(key + 36, TT_SLOTS_PER_SEGMENT); break;
+		case 8: cluster_undo_tt_ctrc_put_u16_le(key + 38, TT_WRAP_INVALID); break;
+		case 9: cluster_undo_tt_ctrc_put_u32_le(key + 40, FrozenTransactionId); break;
+		case 10: memcpy(key + 56, key + 52, 4); break;
+		case 11: memcpy(key + 134, key + 196, 62); break;
+		case 12: memcpy(key + 72, owner_key_golden + 134, 62);
+			memcpy(key + 134, owner_key_golden + 72, 62); break;
+		case 13: memset(key + 200, 0, 8); break;
+		case 14: memcpy(key + 208, key + 200, 8); break;
+		case 15: cluster_undo_tt_ctrc_put_u64_le(key + 208,
+			cluster_undo_tt_ctrc_get_u64_le(key + 200) - 1); break;
+		case 16: cluster_undo_tt_ctrc_put_u32_le(key + 216, SizeOfXLogRecord - 1); break;
+		case 17: cluster_undo_tt_ctrc_put_u32_le(key + 216, XLogRecordMaxSize + 1); break;
+		case 18: cluster_undo_tt_ctrc_put_u64_le(key + 208,
+			cluster_undo_tt_ctrc_get_u64_le(key + 200) + 356); break;
+		case 19: memset(key + 220, 0, 32); break;
+		}
+		UT_ASSERT(owner_graph_node_refused(key, sizeof(key), &evidence));
+	}
+}
+
+UT_TEST(owner_graph_node_empty_scope_and_unaligned_views)
+{
+	OwnerKeyFixture f;
+	uint8 key[73], saved[73], witness = 1;
+	uint8 view[sizeof(ClusterRecoveryCTRCGraphBytesV2) + 1];
+	uint8 guarded[sizeof(ClusterRecoveryCTRCGraphNodeV2) + 2];
+	ClusterRecoveryCTRCGraphBytesV2 evidence = { &witness, 1 };
+	ClusterRecoveryCTRCGraphNodeV2 node;
+
+	owner_key_fixture(&f);
+	f.scope.effect_count = 0;
+	f.scope.effects = NULL;
+	memcpy(view + 1, &evidence, sizeof(evidence));
+	for (unsigned pass = 0; pass < 2; pass++) {
+		size_t length = pass == 0 ? 72 : 60;
+
+		if (pass != 0) {
+			f.scope.source_count = 0;
+			f.scope.source_indexes = NULL;
+		}
+		memset(key, 0xa5, sizeof(key));
+		UT_ASSERT(cluster_recovery_ctrc_owner_key_v2(&f.scope, key + 1, length));
+		memcpy(saved, key, sizeof(key));
+		memset(guarded, 0xa5, sizeof(guarded));
+		UT_ASSERT(cluster_recovery_ctrc_owner_graph_node_v2(key + 1, length,
+			(const ClusterRecoveryCTRCGraphBytesV2 *)(view + 1),
+			(ClusterRecoveryCTRCGraphNodeV2 *)(guarded + 1)));
+		memcpy(&node, guarded + 1, sizeof(node));
+		UT_ASSERT(node.kind == 2 && node.key.data == key + 1 && node.key.length == length);
+		UT_ASSERT(node.evidence.data == &witness && node.evidence.length == 1);
+		UT_ASSERT(memcmp(key, saved, sizeof(key)) == 0 && witness == 1);
+		UT_ASSERT(guarded[0] == 0xa5 && guarded[sizeof(guarded) - 1] == 0xa5);
+		key[1] = 0;
+		UT_ASSERT(!cluster_recovery_ctrc_owner_graph_node_v2(key + 1, length, &evidence,
+			(ClusterRecoveryCTRCGraphNodeV2 *)(guarded + 1)));
+		UT_ASSERT(all_zero(guarded + 1, sizeof(node)));
+		UT_ASSERT(guarded[0] == 0xa5 && guarded[sizeof(guarded) - 1] == 0xa5);
+	}
+}
+
 /* Python struct.pack/sorted/set literal oracle: structural envelopes only,
  * never qualified native witness or original-owner completion evidence. */
 static const uint8 raw_evidence_atom0[] = {
@@ -5961,7 +6122,7 @@ UT_TEST(graph_reader_allocation_refusal)
 int
 main(void)
 {
-	UT_PLAN(166);
+	UT_PLAN(179);
 	UT_RUN(golden_encoding);
 	UT_RUN(golden_decoding);
 	UT_RUN(unaligned_buffers);
@@ -6121,6 +6282,10 @@ main(void)
 	UT_RUN(owner_key_unaligned_and_input_output_aliases);
 	UT_RUN(owner_key_allocation_refusal_frees_scratch);
 	UT_RUN(owner_key_full_width_fields_are_bound);
+	UT_RUN(owner_graph_node_borrows_canonical_key_and_evidence);
+	UT_RUN(owner_graph_node_variable_length_bounds);
+	UT_RUN(owner_graph_node_identity_order_and_reference_domains);
+	UT_RUN(owner_graph_node_empty_scope_and_unaligned_views);
 	UT_RUN(raw_evidence_independent_golden_and_immutable);
 	UT_RUN(raw_evidence_permutations_and_full_encoded_sort);
 	UT_RUN(raw_evidence_conflicting_subject_is_atomic);
