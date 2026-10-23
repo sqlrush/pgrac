@@ -1699,6 +1699,35 @@ UT_TEST(test_record_prepare_owns_extent_and_block0_slow_paths)
 	free(source);
 }
 
+/* Ordinary existing-other starts must not reach segment creation before the
+ * recovered semantic OPEN cut is visible; the STARTUP owner remains exempt. */
+UT_TEST(test_record_prepare_recovered_open_gate_precedes_segment_creation)
+{
+	char *source = read_undo_record_source();
+	const char *prepare;
+	const char *guard;
+	const char *gate;
+	const char *segment_create;
+
+	if (source == NULL)
+		return;
+	prepare = strstr(source, "cluster_undo_record_prepare_trace_impl(");
+	guard = prepare == NULL ? NULL : strstr(prepare, "if (MyBackendType != B_STARTUP");
+	gate = guard == NULL ? NULL : strstr(guard, "cluster_semantic_normal_start_state()");
+	segment_create = prepare == NULL
+					 ? NULL
+					 : strstr(prepare, "cluster_undo_active_segment_for_node_or_create(");
+	UT_ASSERT_NOT_NULL(prepare);
+	UT_ASSERT_NOT_NULL(guard);
+	UT_ASSERT_NOT_NULL(gate);
+	UT_ASSERT_NOT_NULL(segment_create);
+	if (prepare != NULL && guard != NULL && gate != NULL && segment_create != NULL)
+		UT_ASSERT(prepare < guard && guard < gate && gate < segment_create);
+	UT_ASSERT(strstr(gate == NULL ? "" : gate,
+					"!cluster_semantic_activation_recovered_open_current()") != NULL);
+	free(source);
+}
+
 /* A prepared receipt is an exact, one-shot identity.  The in-lock consumer
  * must compare the backend reservation sequence, complete extent cursor and
  * exact block0 publication before the first record byte or UBA is exposed. */
@@ -3789,7 +3818,7 @@ UT_TEST(test_a148_undo_stop_does_not_confuse_extent_and_cursor_cache_with_writer
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(77);
+	UT_PLAN(78);
 	UT_RUN(test_abort_prepared_after_lock_release_is_idempotent);
 	UT_RUN(test_abort_prepared_cancel_failure_and_borrowed_owner_do_not_panic);
 	UT_RUN(test_abort_attempted_or_applied_retains_debt_and_panics);
@@ -3836,6 +3865,7 @@ main(int argc, char **argv)
 	UT_RUN(test_extend_selects_reuse_without_mutating_block0);
 	UT_RUN(test_reuse_wrapper_routes_only_through_exact_current_owner);
 	UT_RUN(test_record_prepare_owns_extent_and_block0_slow_paths);
+	UT_RUN(test_record_prepare_recovered_open_gate_precedes_segment_creation);
 	UT_RUN(test_prepared_consumer_rechecks_exact_receipt_before_record_mutation);
 	UT_RUN(test_prepared_consume_lock_precedes_first_receipt_apply);
 	UT_RUN(test_terminal_census_precedes_final_receipt_recheck_and_itl_allocation);
