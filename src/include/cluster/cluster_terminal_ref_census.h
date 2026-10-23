@@ -369,6 +369,9 @@ typedef struct ClusterCtrcOriginReservation {
 	ClusterCtrcTxnKeyV1 key;
 	uint64 origin_index;
 	uint64 reservation_generation;
+	/* Same protected top identity as the origin row, retained across BIND.
+	 * Process-local only; never reconstruct it from the raw key at OPEN. */
+	FullTransactionId original_full_xid;
 	uint8 kind;
 	bool valid;
 	uint8 reserved8[6];

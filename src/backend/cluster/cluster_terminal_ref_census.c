@@ -2649,6 +2649,7 @@ cluster_ctrc_origin_reserve_entry(ClusterCtrcOriginEntry *origin, const ClusterC
 	reservation->key = *key;
 	reservation->origin_index = origin_index;
 	reservation->reservation_generation = reservation_generation;
+	reservation->original_full_xid = origin->original_full_xid;
 	reservation->valid = true;
 	return result;
 }
@@ -2663,6 +2664,7 @@ ctrc_origin_reservation_exact(const ClusterCtrcOriginEntry *origin, uint64 origi
 		   && reservation->reservation_generation != UINT64_MAX
 		   && ctrc_bytes_zero(reservation->reserved8, sizeof(reservation->reserved8))
 		   && origin->reservation_generation == reservation->reservation_generation
+		   && FullTransactionIdEquals(origin->original_full_xid, reservation->original_full_xid)
 		   && memcmp(&origin->key, &reservation->key, sizeof(reservation->key)) == 0;
 }
 
@@ -2760,6 +2762,9 @@ cluster_ctrc_origin_reserve_active(const ClusterCtrcTxnKeyV1 *key,
 											   reservation);
 	if (result == CLUSTER_CTRC_ORIGIN_RESERVED_PENDING)
 		origin->original_full_xid = top_full;
+	if (result == CLUSTER_CTRC_ORIGIN_RESERVED_PENDING
+		|| result == CLUSTER_CTRC_ORIGIN_RESERVED_EXISTING_OPEN)
+		reservation->original_full_xid = top_full;
 	if (result == CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED)
 		CtrcShared->full_refusal_count++;
 	LWLockRelease(&CtrcShared->origin_lock);
@@ -2860,6 +2865,8 @@ cluster_ctrc_origin_open_reserved(const ClusterCtrcOriginReservation *reservatio
 		|| (reservation->kind != CTRC_ORIGIN_RESERVATION_PENDING_OWNED
 			&& reservation->kind != CTRC_ORIGIN_RESERVATION_EXISTING_OPEN)
 		|| reservation->reservation_generation == 0
+		|| !FullTransactionIdIsNormal(reservation->original_full_xid)
+		|| XidFromFullTransactionId(reservation->original_full_xid) != reservation->key.xid
 		|| !ctrc_bytes_zero(reservation->reserved8, sizeof(reservation->reserved8))
 		|| !cluster_ctrc_shmem_ready() || !ctrc_origin_index(&reservation->key, &index)
 		|| index != reservation->origin_index)
@@ -2869,6 +2876,7 @@ cluster_ctrc_origin_open_reserved(const ClusterCtrcOriginReservation *reservatio
 	origin = &ctrc_origin_entries()[index];
 	if (origin->state == CTRC_ORIGIN_OPEN
 		&& origin->reservation_generation == reservation->reservation_generation
+		&& FullTransactionIdEquals(origin->original_full_xid, reservation->original_full_xid)
 		&& origin->grant_generation != 0
 		&& memcmp(&origin->key, &reservation->key, sizeof(reservation->key)) == 0) {
 		grant = origin->grant_generation;
@@ -2876,6 +2884,7 @@ cluster_ctrc_origin_open_reserved(const ClusterCtrcOriginReservation *reservatio
 	} else if (origin->state == CTRC_ORIGIN_EMPTY
 			   && reservation->kind == CTRC_ORIGIN_RESERVATION_PENDING_OWNED
 			   && origin->reservation_generation == reservation->reservation_generation
+			   && FullTransactionIdEquals(origin->original_full_xid, reservation->original_full_xid)
 			   && origin->grant_generation == 0
 			   && memcmp(&origin->key, &reservation->key, sizeof(reservation->key)) == 0
 			   && CtrcShared->global_grant_generation != UINT32_MAX) {
