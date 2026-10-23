@@ -295,6 +295,14 @@ cluster_cr_build_on_holder(const BufferTag *tag, SCN read_scn, char dst[BLCKSZ],
 
 	if (dst == NULL || reason_out == NULL)
 		return CLUSTER_CR_BUILD_FAIL_CLOSED;
+	/* A recovered member cannot expose a holder image until the durable
+	 * semantic OPEN/service-owner cut is current.  Generic R4 admission alone
+	 * permits EXISTING_OTHER, so keep this physical-copy boundary closed. */
+	if (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& !cluster_semantic_activation_recovered_open_current()) {
+		*reason_out = CLUSTER_CR_BUILD_RF_DEFERRED;
+		return CLUSTER_CR_BUILD_RETRYABLE;
+	}
 
 	admission_result = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
 														 CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
