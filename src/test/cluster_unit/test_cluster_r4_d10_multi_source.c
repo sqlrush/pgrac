@@ -57,6 +57,7 @@ ErrorContextCallback *error_context_stack = NULL;
 
 bool cluster_enabled = true;
 bool cluster_shared_config;
+BackendType MyBackendType = B_BACKEND;
 int cluster_node_id = 0;
 int cluster_multixact_member_overlay_max_entries = 16;
 int cluster_multixact_member_overlay_max_members = 32;
@@ -69,6 +70,8 @@ static ClusterSemanticAdmissionResult target_admission_result;
 static ClusterSemanticAdmissionResult source_admission_result;
 static bool admission_result_by_side;
 static bool admission_recheck_ok;
+static ClusterNormalStartState test_normal_start_state;
+static bool test_recovered_open;
 static int admission_enter_count;
 static int admission_recheck_count;
 static int admission_leave_count;
@@ -173,6 +176,10 @@ reset_admission(ClusterSemanticAdmissionResult result, bool recheck_ok)
 	source_admission_result = result;
 	admission_result_by_side = false;
 	admission_recheck_ok = recheck_ok;
+	test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+	test_recovered_open = true;
+	cluster_shared_config = false;
+	MyBackendType = B_BACKEND;
 	admission_enter_count = 0;
 	admission_recheck_count = 0;
 	admission_leave_count = 0;
@@ -220,6 +227,18 @@ cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSi
 		token->entered = true;
 	}
 	return selected_result;
+}
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return test_normal_start_state;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return test_recovered_open;
 }
 
 bool
@@ -844,6 +863,30 @@ UT_TEST(t11_remote_visibility_follows_current_semantic_side)
 	UT_ASSERT(!result.overlay_hit);
 }
 
+UT_TEST(t12_recovered_remote_visibility_refuses_source_fallback_before_open)
+{
+	ClusterMultiXactSourceRequest request;
+	ClusterMultiXactSourceResult result;
+	SnapshotData snapshot;
+
+	memset(&snapshot, 0, sizeof(snapshot));
+	memset(&request, 0, sizeof(request));
+	request.snapshot = &snapshot;
+	request.origin_slot = 3;
+	request.mxid = 91;
+	memset(&result, 0x7f, sizeof(result));
+	reset_admission_sides(CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED,
+						  CLUSTER_SEMANTIC_ADMISSION_OK, true);
+	cluster_shared_config = true;
+	test_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	test_recovered_open = false;
+	UT_ASSERT_EQ((int)cluster_multixact_remote_xmax_visibility_dispatch(&request, &result),
+				 (int)CLUSTER_SEMANTIC_ADMISSION_CLOSED);
+	UT_ASSERT_EQ(admission_enter_count, 0);
+	UT_ASSERT(!result.overlay_hit);
+	cluster_shared_config = false;
+}
+
 UT_TEST(t12_shared_projection_requires_native_persistence_and_postread)
 {
 	ClusterSideProjectionOperationV1 op = { 0 };
@@ -971,7 +1014,7 @@ main(void)
 	memset(&fake_hash_entry, 0, sizeof(fake_hash_entry));
 	cluster_multixact_shmem_init();
 
-	UT_PLAN(14);
+	UT_PLAN(15);
 	UT_RUN(t1_frozen_dispatch_surface);
 	UT_RUN(t2_dormant_refuses_before_request_and_mutation);
 	UT_RUN(t3_invalid_after_admission_closes_and_leaves);
@@ -983,6 +1026,7 @@ main(void)
 	UT_RUN(t9_null_result_is_closed_after_balanced_admission);
 	UT_RUN(t10_recovery_projection_create_has_exact_postread);
 	UT_RUN(t11_remote_visibility_follows_current_semantic_side);
+	UT_RUN(t12_recovered_remote_visibility_refuses_source_fallback_before_open);
 	UT_RUN(t12_shared_projection_requires_native_persistence_and_postread);
 	UT_RUN(t13_shared_zero_and_truncate_cannot_only_purge_overlay);
 	UT_RUN(t14_native_readback_error_leaves_derived_overlay_untouched);

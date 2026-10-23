@@ -88,6 +88,17 @@ typedef struct ClusterMultiXactShmem {
 
 static HTAB *ClusterMultiXactHTAB = NULL;
 static LWLock *ClusterMultiXactLock = NULL;
+
+/* Ordinary heap visibility must not fall back to the dormant SOURCE side
+ * while a recovered member is still proving the durable OPEN binding. */
+static bool
+cluster_multixact_recovered_open_admitted(void)
+{
+	if (MyBackendType == B_STARTUP || !cluster_shared_config
+		|| cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_EXISTING_OTHER)
+		return true;
+	return cluster_semantic_activation_recovered_open_current();
+}
 static ClusterMultiXactShmem *ClusterMultiXactState = NULL;
 
 /* ------------------------------------------------------------ */
@@ -1106,6 +1117,8 @@ cluster_multixact_source_dispatch(ClusterMultiXactSourceOp op,
 	memset(&local_result, 0, sizeof(local_result));
 	if (result != NULL)
 		memset(result, 0, sizeof(*result));
+	if (!cluster_multixact_recovered_open_admitted())
+		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 
 	admission = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
 												  CLUSTER_SEMANTIC_SOURCE_SIDE, &token);
@@ -1163,6 +1176,8 @@ cluster_multixact_remote_xmax_visibility_dispatch(const ClusterMultiXactSourceRe
 	memset(&local_result, 0, sizeof(local_result));
 	if (result != NULL)
 		memset(result, 0, sizeof(*result));
+	if (!cluster_multixact_recovered_open_admitted())
+		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 
 	admission = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
 												  CLUSTER_SEMANTIC_TARGET_SIDE, &token);
