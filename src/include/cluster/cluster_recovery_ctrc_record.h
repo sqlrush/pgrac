@@ -395,6 +395,18 @@ typedef struct ClusterRecoveryCTRCOwnerScopeV2 {
 extern bool cluster_recovery_ctrc_owner_key_v2(const ClusterRecoveryCTRCOwnerScopeV2 *scope,
 	uint8 *out, size_t out_length);
 
+/* Match a canonical owner key's full T34 transaction against the target in a
+ * complete payload accepted by the original v2 decoder. Recheck the key's
+ * complete source/effect envelope before comparing all eight identity fields;
+ * generation zero remains legal. Matching T does not qualify the owner family,
+ * source/cut or complete effect inventory, evidence/rules, graph or completion.
+ * Immutable input bytes may be unaligned/overlap; no mutation or output.
+ * Outside critical sections/spinlocks; inherits original decoder SHA allocation
+ * and failure behavior. No live caller, owner success or release authority. */
+extern bool cluster_recovery_ctrc_owner_transaction_matches_v2(const uint8 *owner_key,
+	size_t owner_key_length, const uint8 *payload, size_t payload_length,
+	uint64 system_identifier);
+
 /* Immutable canonical bytes supplied by the original graph producers. */
 typedef struct ClusterRecoveryCTRCGraphBytesV2 {
 	const uint8 *data;

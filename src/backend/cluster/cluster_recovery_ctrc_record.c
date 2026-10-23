@@ -1794,6 +1794,28 @@ refused:
 	return false;
 }
 
+bool
+cluster_recovery_ctrc_owner_transaction_matches_v2(const uint8 *owner_key,
+	size_t owner_key_length, const uint8 *payload, size_t payload_length,
+	uint64 system_identifier)
+{
+	ClusterRecoveryCTRCReleaseV2 record;
+
+	if (!ctrc_owner_key_shape_v2(owner_key, owner_key_length)
+		|| !cluster_recovery_ctrc_decode_v2(payload, payload_length, system_identifier, &record))
+		return false;
+	/* T34 is encoded explicitly, never compared as a padded native struct.
+	 * Same transaction is not proof of complete or applicable owner work. */
+	return cluster_undo_tt_ctrc_get_u64_le(owner_key + 10) == system_identifier
+		&& cluster_undo_tt_ctrc_get_u64_le(owner_key + 18) == record.database_incarnation
+		&& cluster_undo_tt_ctrc_get_u16_le(owner_key + 26) == record.origin_node_id
+		&& cluster_undo_tt_ctrc_get_u32_le(owner_key + 28) == record.segment_id
+		&& cluster_undo_tt_ctrc_get_u32_le(owner_key + 32) == record.segment_generation
+		&& cluster_undo_tt_ctrc_get_u16_le(owner_key + 36) == record.slot_offset
+		&& cluster_undo_tt_ctrc_get_u16_le(owner_key + 38) == record.wrap
+		&& cluster_undo_tt_ctrc_get_u32_le(owner_key + 40) == record.xid;
+}
+
 typedef struct CTRCRawEvidenceWork {
 	ClusterRecoveryCTRCGraphBytesV2 atom;
 	size_t identity_length;

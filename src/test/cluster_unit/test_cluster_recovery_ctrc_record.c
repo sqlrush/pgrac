@@ -5425,6 +5425,147 @@ UT_TEST(owner_key_full_width_fields_are_bound)
 }
 
 static bool
+owner_transaction_payload(uint8 payload[CLUSTER_RECOVERY_CTRC_BYTES])
+{
+	ClusterRecoveryCTRCReleaseV2 record = sample();
+
+	/* The old D0 golden has another database incarnation. Keep both old
+	 * goldens unchanged and explicitly construct the matching namespace. */
+	record.database_incarnation = 99;
+	return cluster_recovery_ctrc_encode_v2(&record, SYSTEM_ID, payload, CLUSTER_RECOVERY_CTRC_BYTES);
+}
+
+UT_TEST(owner_transaction_matches_exact_T_and_canonical_scopes)
+{
+	OwnerKeyFixture f;
+	uint8 key[sizeof(owner_key_golden)], payload[CLUSTER_RECOVERY_CTRC_BYTES];
+
+	UT_ASSERT(owner_transaction_payload(payload));
+	/* Both generations are zero; the unrelated old incarnation must refuse. */
+	UT_ASSERT(!cluster_recovery_ctrc_owner_transaction_matches_v2(owner_key_golden,
+		sizeof(owner_key_golden), golden, sizeof(golden), SYSTEM_ID));
+	UT_ASSERT(cluster_recovery_ctrc_owner_transaction_matches_v2(owner_key_golden,
+		sizeof(owner_key_golden), payload, sizeof(payload), SYSTEM_ID));
+	for (unsigned family = 1; family <= 14; family++) {
+		owner_key_fixture(&f);
+		f.scope.owner_family = family;
+		UT_ASSERT(cluster_recovery_ctrc_owner_key_v2(&f.scope, key, sizeof(key)));
+		UT_ASSERT(cluster_recovery_ctrc_owner_transaction_matches_v2(key, sizeof(key),
+			payload, sizeof(payload), SYSTEM_ID));
+	}
+	/* T matching alone cannot prove complete sources/effects or a base. */
+	f.scope.source_count = f.scope.effect_count = 0;
+	UT_ASSERT(cluster_recovery_ctrc_owner_key_v2(&f.scope, key, 60));
+	UT_ASSERT(cluster_recovery_ctrc_owner_transaction_matches_v2(key, 60,
+		payload, sizeof(payload), SYSTEM_ID));
+}
+
+UT_TEST(owner_transaction_rejects_canonical_other_transaction_keys)
+{
+	OwnerKeyFixture f;
+	ClusterRecoveryCTRCGraphBytesV2 evidence = {(const uint8 *)"opaque", 6};
+	ClusterRecoveryCTRCGraphNodeV2 node;
+	uint8 key[sizeof(owner_key_golden)], before[sizeof(key)], payload[CLUSTER_RECOVERY_CTRC_BYTES];
+
+	UT_ASSERT(owner_transaction_payload(payload));
+	UT_ASSERT(cluster_recovery_ctrc_owner_transaction_matches_v2(owner_key_golden,
+		sizeof(owner_key_golden), payload, sizeof(payload), SYSTEM_ID));
+	for (unsigned which = 0; which < 10; which++) {
+		owner_key_fixture(&f);
+		switch (which) {
+		case 0: f.scope.transaction.system_identifier++; break;
+		case 1: f.scope.transaction.database_incarnation++; break;
+		case 2:
+			f.scope.transaction.origin_node_id++;
+			f.scope.transaction.segment_id += CLUSTER_UNDO_SEGS_PER_INSTANCE;
+			break;
+		case 3: f.scope.transaction.segment_id++; break;
+		case 4: f.scope.transaction.segment_generation++; break;
+		case 5: f.scope.transaction.slot_offset++; break;
+		case 6: f.scope.transaction.slot_wrap++; break;
+		case 7: f.scope.transaction.xid++; break;
+		case 8: f.scope.transaction.system_identifier ^= UINT64_C(1) << 56; break;
+		case 9: f.scope.transaction.database_incarnation ^= UINT64_C(1) << 40; break;
+		}
+		UT_ASSERT(cluster_recovery_ctrc_owner_key_v2(&f.scope, key, sizeof(key)));
+		/* The original independent shape consumer must accept this key first. */
+		UT_ASSERT(cluster_recovery_ctrc_owner_graph_node_v2(key, sizeof(key), &evidence, &node));
+		memcpy(before, key, sizeof(before));
+		UT_ASSERT(!cluster_recovery_ctrc_owner_transaction_matches_v2(node.key.data,
+			node.key.length, payload, sizeof(payload), SYSTEM_ID));
+		UT_ASSERT(memcmp(before, key, sizeof(key)) == 0);
+	}
+}
+
+UT_TEST(owner_transaction_complete_key_payload_and_unaligned_native_views)
+{
+	uint8 key[sizeof(owner_key_golden) + 2], before[sizeof(key)], payload[322], payload_before[sizeof(payload)];
+	NativeRaw wire;
+	NativePages pages;
+	XLogReaderState *reader;
+	bool tracking = graph_alloc_tracking, read_ok;
+	size_t raw_length;
+
+	memset(key, 0xa5, sizeof(key));
+	memset(payload, 0xa5, sizeof(payload));
+	memcpy(key + 1, owner_key_golden, sizeof(owner_key_golden));
+	UT_ASSERT(owner_transaction_payload(payload + 1));
+	for (size_t length = 0; length < sizeof(owner_key_golden); length++)
+		UT_ASSERT(!cluster_recovery_ctrc_owner_transaction_matches_v2(key + 1, length,
+			payload + 1, sizeof(golden), SYSTEM_ID));
+	UT_ASSERT(!cluster_recovery_ctrc_owner_transaction_matches_v2(key + 1, sizeof(owner_key_golden) + 1,
+		payload + 1, sizeof(golden), SYSTEM_ID));
+	for (unsigned which = 0; which < 9; which++) {
+		memcpy(key + 1, owner_key_golden, sizeof(owner_key_golden));
+		switch (which) {
+		case 0: key[1] = 0; break;
+		case 1: key[2] = 1; break; /* Full U16 owner family. */
+		case 2: key[3] ^= 1; break;
+		case 3: cluster_undo_tt_ctrc_put_u64_le(key + 1 + 44, UINT64_MAX); break;
+		case 4: key[1 + 52] = 2; break;
+		case 5: cluster_undo_tt_ctrc_put_u64_le(key + 1 + 64, UINT64_MAX); break;
+		case 6: cluster_undo_tt_ctrc_put_u64_le(key + 1 + 76, 0); break;
+		case 7: cluster_undo_tt_ctrc_put_u32_le(key + 1 + 32, UINT32_MAX); break;
+		case 8: cluster_undo_tt_ctrc_put_u16_le(key + 1 + 38, TT_WRAP_INVALID); break;
+		}
+		memcpy(before, key, sizeof(before));
+		UT_ASSERT(!cluster_recovery_ctrc_owner_transaction_matches_v2(key + 1, sizeof(owner_key_golden),
+			payload + 1, sizeof(golden), SYSTEM_ID));
+		UT_ASSERT(memcmp(key, before, sizeof(key)) == 0);
+	}
+	memcpy(key + 1, owner_key_golden, sizeof(owner_key_golden));
+	memcpy(before, key, sizeof(before));
+	memcpy(payload_before, payload, sizeof(payload));
+	UT_ASSERT(cluster_recovery_ctrc_owner_transaction_matches_v2(key + 1, sizeof(owner_key_golden),
+		payload + 1, sizeof(golden), SYSTEM_ID));
+	for (size_t length = 0; length < sizeof(golden); length++)
+		UT_ASSERT(!cluster_recovery_ctrc_owner_transaction_matches_v2(key + 1, sizeof(owner_key_golden),
+			payload + 1, length, SYSTEM_ID));
+	payload[1 + 192] ^= 1;
+	UT_ASSERT(!cluster_recovery_ctrc_owner_transaction_matches_v2(key + 1, sizeof(owner_key_golden),
+		payload + 1, sizeof(golden), SYSTEM_ID));
+	payload[1 + 192] ^= 1;
+	UT_ASSERT(!cluster_recovery_ctrc_owner_transaction_matches_v2(NULL, sizeof(owner_key_golden), payload + 1, sizeof(golden), SYSTEM_ID));
+	UT_ASSERT(!cluster_recovery_ctrc_owner_transaction_matches_v2(key + 1, SIZE_MAX, payload + 1, sizeof(golden), SYSTEM_ID));
+	UT_ASSERT(!cluster_recovery_ctrc_owner_transaction_matches_v2(key + 1, sizeof(owner_key_golden), NULL, sizeof(golden), SYSTEM_ID));
+	UT_ASSERT(!cluster_recovery_ctrc_owner_transaction_matches_v2(key + 1, sizeof(owner_key_golden), payload + 1, SIZE_MAX, SYSTEM_ID));
+	UT_ASSERT(!cluster_recovery_ctrc_owner_transaction_matches_v2(key + 1, sizeof(owner_key_golden), payload + 1, sizeof(golden), 0));
+	UT_ASSERT(!cluster_recovery_ctrc_owner_transaction_matches_v2(key + 1, sizeof(owner_key_golden), payload + 1, sizeof(golden), SYSTEM_ID + 1));
+	UT_ASSERT(memcmp(key, before, sizeof(key)) == 0 && memcmp(payload, payload_before, sizeof(payload)) == 0);
+	raw_length = native_wire(&wire, payload + 1, sizeof(golden), 0);
+	graph_alloc_tracking = false;
+	read_ok = native_read(&pages, &wire, raw_length, false, &reader);
+	UT_ASSERT(read_ok);
+	if (read_ok) {
+		UT_ASSERT(cluster_recovery_ctrc_owner_transaction_matches_v2(key + 1, sizeof(owner_key_golden),
+			(const uint8 *)XLogRecGetData(reader), XLogRecGetDataLen(reader), SYSTEM_ID));
+		XLogReaderFree(reader);
+	}
+	graph_alloc_tracking = tracking;
+	UT_ASSERT(memcmp(key, before, sizeof(key)) == 0 && graph_alloc_live == 0);
+}
+
+static bool
 owner_graph_node_refused(const uint8 *key, size_t key_length,
 	const ClusterRecoveryCTRCGraphBytesV2 *evidence)
 {
@@ -6772,7 +6913,7 @@ UT_TEST(graph_reader_allocation_refusal)
 int
 main(void)
 {
-	UT_PLAN(194);
+	UT_PLAN(197);
 	UT_RUN(golden_encoding);
 	UT_RUN(golden_decoding);
 	UT_RUN(unaligned_buffers);
@@ -6932,6 +7073,9 @@ main(void)
 	UT_RUN(owner_key_unaligned_and_input_output_aliases);
 	UT_RUN(owner_key_allocation_refusal_frees_scratch);
 	UT_RUN(owner_key_full_width_fields_are_bound);
+	UT_RUN(owner_transaction_matches_exact_T_and_canonical_scopes);
+	UT_RUN(owner_transaction_rejects_canonical_other_transaction_keys);
+	UT_RUN(owner_transaction_complete_key_payload_and_unaligned_native_views);
 	UT_RUN(owner_graph_node_borrows_canonical_key_and_evidence);
 	UT_RUN(owner_graph_node_variable_length_bounds);
 	UT_RUN(owner_graph_node_identity_order_and_reference_domains);
