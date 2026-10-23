@@ -553,7 +553,16 @@ typedef struct SemanticActivationRestartDiagnostic {
 	bool wait_logged;
 } SemanticActivationRestartDiagnostic;
 
+/* Volatile source identity in the original restart round. A recovered
+ * source never changes the native clean-start observation into CLEAN. */
+typedef enum ClusterSemanticRestartSource {
+	CLUSTER_SEMANTIC_RESTART_SOURCE_NONE = 0,
+	CLUSTER_SEMANTIC_RESTART_SOURCE_CLEAN,
+	CLUSTER_SEMANTIC_RESTART_SOURCE_RECOVERED
+} ClusterSemanticRestartSource;
+
 typedef struct SemanticActivationRestart {
+	ClusterSemanticRestartSource source;
 	bool disabled;
 	bool failed;
 	bool have_open;
@@ -13367,23 +13376,57 @@ cluster_semantic_activation_note_clean_start(bool clean)
 		pg_atomic_write_u32(SemanticActivationCleanStart, 2);
 }
 
+static ClusterSemanticRestartSource
+semantic_activation_restart_source_current(void)
+{
+	const ClusterNormalStartCompletion *input = NormalStartCompletion;
+	ClusterRecoveryCheckpointObservationV1 observed;
+	uint32 native;
+
+	if (SemanticActivationCleanStart == NULL || RecoveryInProgress())
+		return CLUSTER_SEMANTIC_RESTART_SOURCE_NONE;
+	native = pg_atomic_read_u32(SemanticActivationCleanStart);
+	if (native != 1 && native != 2)
+		return CLUSTER_SEMANTIC_RESTART_SOURCE_NONE;
+	/* The original ROOT-selected INSTALL identifies RECOVERED, independently
+	 * of whether this node's own old WAL happened to end in a clean stop.
+	 * This observation says nothing about completion of its service work. */
+	if (cluster_shared_config
+		&& cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& input != NULL && input->node_id == cluster_node_id
+		&& cluster_recovery_checkpoint_observe_v1(&observed)
+		&& input->system_identifier == observed.owner.writer.ref.claim.identity.system_identifier
+		&& input->boot_incarnation == observed.owner.owner_boot
+		&& input->epoch == observed.owner.writer.epoch
+		&& cluster_wal_thread_recovered_writer_matches(&observed.owner.writer.ref, input->epoch))
+		return CLUSTER_SEMANTIC_RESTART_SOURCE_RECOVERED;
+	if (native == 1 && !cluster_qvotec_prior_unclean_death()
+		&& (cluster_shared_config
+				? (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_TARGET_READY
+				   && normal_start_identity_current(input) && normal_start_clean_installed(input))
+				: cluster_epoch_get_current() == CLUSTER_EPOCH_INITIAL))
+		return CLUSTER_SEMANTIC_RESTART_SOURCE_CLEAN;
+	return CLUSTER_SEMANTIC_RESTART_SOURCE_NONE;
+}
+
 static bool
 semantic_activation_restart_current(void)
 {
 	SemanticActivationAdmissionSnapshot gate;
 	ClusterInitialCleanFormationSnapshot clean;
+	ClusterSemanticRestartSource source = semantic_activation_restart_source_current();
 	uint64 lo, hi, epoch;
 	int32 coordinator;
 
-	return SemanticActivationCleanStart != NULL
-		   && pg_atomic_read_u32(SemanticActivationCleanStart) == 1
-		   && !cluster_r4_bit22_cutover_active() && !RecoveryInProgress()
-		   && !cluster_qvotec_prior_unclean_death()
-		   && (cluster_shared_config
-				   ? (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_TARGET_READY
-					  && normal_start_identity_current(NormalStartCompletion)
-					  && normal_start_clean_installed(NormalStartCompletion))
-				   : cluster_epoch_get_current() == CLUSTER_EPOCH_INITIAL)
+	if (source == CLUSTER_SEMANTIC_RESTART_SOURCE_NONE
+		|| (semantic_activation_restart.source != CLUSTER_SEMANTIC_RESTART_SOURCE_NONE
+			&& semantic_activation_restart.source != source))
+		return false;
+	semantic_activation_restart.source = source;
+	/* RECOVERED has a distinct source now. Its full original service-result
+	 * handoff is still required before collecting a new OPEN_APPLIED round. */
+	return source == CLUSTER_SEMANTIC_RESTART_SOURCE_CLEAN
+		   && !cluster_r4_bit22_cutover_active()
 		   && cluster_grd_recovery_state_value() == GRD_RECOVERY_IDLE
 		   && semantic_activation_snapshot(&gate) && gate.transition_closed && gate.active_bits == 0
 		   && gate.record_generation == 0 && gate.formation_epoch == cluster_epoch_get_current()
@@ -13455,7 +13498,11 @@ normal_start_record_matches(const ClusterSemanticActivationRecord *record)
 {
 	uint8 encoded[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
 	return NormalStartCompletion != NULL
-		   && cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_TARGET_READY
+		   && (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_TARGET_READY
+			   || (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+				   && record != NULL && record->phase == CLUSTER_SEMANTIC_PHASE_OPEN
+				   && semantic_activation_restart_source_current()
+						  == CLUSTER_SEMANTIC_RESTART_SOURCE_RECOVERED))
 		   && cluster_semantic_activation_record_encode(record, encoded)
 		   && memcmp(encoded, NormalStartCompletion->pgsa, sizeof(encoded)) == 0;
 }

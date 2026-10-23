@@ -10468,6 +10468,54 @@ UT_TEST(test_a142_clean_start_observation_is_not_rearmable)
 	test_gate_reset();
 }
 
+UT_TEST(test_restart_retains_clean_source_in_original_round)
+{
+	ut_a142_setup(0);
+	UT_ASSERT(semantic_activation_restart_current());
+	UT_ASSERT_EQ(semantic_activation_restart.source, CLUSTER_SEMANTIC_RESTART_SOURCE_CLEAN);
+	test_gate_reset();
+}
+
+UT_TEST(test_restart_classifies_recovered_owner_without_manufacturing_ready)
+{
+	for (unsigned variant = 0; variant < 3; variant++) {
+		ClusterSemanticActivationRecord open;
+		ClusterSemanticActivationAckTableV1 table;
+		ut_normal_start_recovered_owner_setup(&open, &table);
+		NormalStartCompletion->node_id = cluster_node_id;
+		NormalStartCompletion->epoch = test_current_epoch;
+		NormalStartCompletion->boot_incarnation = cluster_qvotec_get_self_incarnation();
+		cluster_semantic_activation_note_clean_start(false);
+		test_restart_unclean = true;
+		MyAuxProcType = LmonProcess;
+		IsUnderPostmaster = true;
+		if (variant == 1)
+			test_recovered_checkpoint_observed = false;
+		if (variant == 2)
+			pg_atomic_write_u32(SemanticActivationCleanStart, 1); /* Own old WAL was clean. */
+		/* INSTALL identifies the source; complete service results are separate. */
+		UT_ASSERT(!semantic_activation_restart_current());
+		UT_ASSERT_EQ(semantic_activation_restart.source,
+			variant == 1 ? CLUSTER_SEMANTIC_RESTART_SOURCE_NONE
+				: CLUSTER_SEMANTIC_RESTART_SOURCE_RECOVERED);
+		UT_ASSERT_EQ(pg_atomic_read_u32(SemanticActivationCleanStart), variant == 2 ? 1 : 2);
+		UT_ASSERT(!semantic_activation_restart.requested && !semantic_activation_restart.opened);
+		/* Reuse the exact captured historical OPEN as a round input only. */
+		ut_a142_open_bytes(NormalStartCompletion->pgsa, 0);
+		UT_ASSERT(cluster_semantic_activation_record_decode(NormalStartCompletion->pgsa,
+			&open, NULL));
+		UT_ASSERT_EQ(normal_start_record_matches(&open), variant != 1);
+		open.record_generation++;
+		UT_ASSERT(!normal_start_record_matches(&open));
+		/* An exact PREPARE/COMMIT input is still owned by the original FSM. */
+		ut_a142_open_bytes(NormalStartCompletion->pgsa, 1);
+		UT_ASSERT(cluster_semantic_activation_record_decode(NormalStartCompletion->pgsa,
+			&open, NULL));
+		UT_ASSERT(!normal_start_record_matches(&open));
+		test_gate_reset();
+	}
+}
+
 UT_TEST(test_a142_unsafe_or_missing_startup_never_requests_open)
 {
 	int fault;
@@ -11629,7 +11677,7 @@ static void test_serving_finish_root(void);
 int
 main(void)
 {
-	UT_PLAN(398);
+	UT_PLAN(400);
 	UT_RUN(test_member_commit_gap_before_all_peer_receipts);
 	UT_RUN(test_member_commit_request_waits_for_real_predecessor_receipts);
 	UT_RUN(test_member_commit_request_rejects_old_or_changed_identity);
@@ -11998,6 +12046,8 @@ main(void)
 	UT_RUN(test_normal_start_closed_modes_block_regular_and_terminal_census);
 	UT_RUN(test_normal_start_publish_and_legacy_sync_cannot_bypass_mode);
 	UT_RUN(test_a142_clean_start_observation_is_not_rearmable);
+	UT_RUN(test_restart_retains_clean_source_in_original_round);
+	UT_RUN(test_restart_classifies_recovered_owner_without_manufacturing_ready);
 	UT_RUN(test_a142_unsafe_or_missing_startup_never_requests_open);
 	UT_RUN(test_a142_wrong_durable_phase_member_or_old_boot_stays_closed);
 	UT_RUN(test_a142_root_mismatch_cannot_emit_a_self_ack);
