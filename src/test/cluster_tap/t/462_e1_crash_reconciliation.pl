@@ -352,7 +352,7 @@ if ($missing_pair)
 ok($missing_started, 'missing-record fixture reaches its pre-crash live state');
 kill_all($missing_pair) if $missing_pair;
 my $control_path = $missing_pair
-	? $missing_pair->shared_control_root . '/global/pg_control' : undef;
+	? $missing_pair->shared_data_root . '/global/pg_control' : undef;
 my $removed_control = defined($control_path) && unlink($control_path);
 ok($removed_control, 'negative fixture removes the durable shared control record');
 my $missing_restarted = $missing_pair ? raw_strict_start($missing_pair) : 0;
