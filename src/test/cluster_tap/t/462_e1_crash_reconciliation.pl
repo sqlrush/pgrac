@@ -21,8 +21,6 @@ my @CONF = (
 	'shared_buffers = 16MB',
 	'log_error_verbosity = verbose',
 	'cluster.merged_recovery = on',
-	'cluster.recovery_workers_max = 0',
-	'cluster.recovery_stale_active_ms = 1000',
 	'cluster.gcs_block_retransmit_max_retries = 8',
 	'cluster.gcs_reply_timeout_ms = 3000',
 	'cluster.ges_request_timeout_ms = 30000',
@@ -31,6 +29,25 @@ my @CONF = (
 	'cluster.cssd_dead_deadband_factor = 10',
 );
 my $json = JSON::PP->new->canonical;
+# The native controller supplies a fresh three-device set for each cohort.
+# Reusing a written voting device must remain a native fresh-init refusal.
+my $entries = $json->decode($ENV{PGRAC_PRE2_E1_ENTRY_FILES} // 'null');
+BAIL_OUT('462 requires three native PRE2 entry profiles')
+  unless ref($entries) eq 'ARRAY' && @$entries == 3;
+my %votes;
+for my $entry (@$entries)
+{
+	BAIL_OUT('462 entry profile is not a readable file') unless !ref($entry) && -f $entry && -r $entry;
+	my $profile = $json->decode(PostgreSQL::Test::Utils::slurp_file($entry));
+	my $devices = $profile->{fixture}{votes};
+	BAIL_OUT('462 requires three distinct voting devices per cohort')
+	  unless ref($devices) eq 'ARRAY' && @$devices == 3;
+	for my $device (@$devices)
+	{
+		BAIL_OUT('462 cohorts must not reuse voting devices')
+		  if ref($device) || !defined($device) || $device eq '' || $votes{$device}++;
+	}
+}
 sub now { return clock_gettime(CLOCK_MONOTONIC); }
 
 sub log_offsets
@@ -132,8 +149,9 @@ sub clean_after_failure
 
 sub with_cohort
 {
-	my ($name, $body) = @_;
+	my ($name, $entry_index, $body) = @_;
 	subtest $name => sub {
+		local $ENV{PGRAC_PRE2_ENTRY_FILE} = $entries->[$entry_index];
 		my $cluster;
 		my $completed = eval {
 			$cluster = PostgreSQL::Test::ClusterPRE2->new_cluster($name,
@@ -169,7 +187,7 @@ sub seed_committed
 	pass('all four members acknowledge committed writes');
 }
 
-with_cohort('e1_pre2_crash_462', sub {
+with_cohort('e1_pre2_crash_462', 0, sub {
 	my ($cluster) = @_;
 	seed_committed($cluster);
 	my @sessions;
@@ -224,7 +242,7 @@ with_cohort('e1_pre2_crash_462', sub {
 
 for my $case ('identity', 'missing_control')
 {
-	with_cohort("e1_pre2_${case}_462", sub {
+	with_cohort("e1_pre2_${case}_462", $case eq 'identity' ? 1 : 2, sub {
 		my ($cluster) = @_;
 		seed_committed($cluster);
 		ok(crash_all($cluster), 'negative input is applied only after a proven live cohort crashes');
