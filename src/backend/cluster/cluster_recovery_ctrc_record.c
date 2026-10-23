@@ -2116,4 +2116,65 @@ cluster_recovery_ctrc_witness_ids_in_evidence_v2(const uint8 *witness_ids,
 	return matched;
 }
 
+bool
+cluster_recovery_ctrc_cold_step_bytes_v2(const ClusterRecoveryCTRCColdStepV2 *step,
+	uint8 *out, size_t out_length)
+{
+	ClusterRecoveryCTRCColdStepV2 value;
+	uint8 bytes[72 + 18 * 64];
+	uint64 seen = 0;
+	size_t length, position = 72;
+
+	if (step == NULL || out == NULL)
+		goto refused;
+	memcpy(&value, step, sizeof(value));
+	if (value.formation_epoch == 0 || value.recovery_serial == 0
+		|| value.cohort_bitmap == 0 || value.completed_bitmap != value.cohort_bitmap
+		|| !ctrc_nonzero_digest(value.input_sha256) || value.members == NULL
+		|| value.member_count == 0 || value.member_count > 64)
+		goto refused;
+	length = 72 + 18 * value.member_count;
+	if (out_length != length)
+		goto refused;
+	cluster_undo_tt_ctrc_put_u64_le(bytes, value.formation_epoch);
+	cluster_undo_tt_ctrc_put_u64_le(bytes + 8, value.recovery_serial);
+	cluster_undo_tt_ctrc_put_u64_le(bytes + 16, value.cohort_bitmap);
+	cluster_undo_tt_ctrc_put_u64_le(bytes + 24, value.completed_bitmap);
+	memcpy(bytes + 32, value.input_sha256, sizeof(value.input_sha256));
+	cluster_undo_tt_ctrc_put_u64_le(bytes + 64, value.member_count);
+	for (size_t i = 0; i < value.member_count; i++) {
+		ClusterRecoveryCTRCColdMemberV2 member;
+		uint64 bit;
+		uint8 *entry;
+
+		memcpy(&member, (const uint8 *)value.members + i * sizeof(member), sizeof(member));
+		if (member.node_id >= 64 || member.boot == 0 || member.admitted_incarnation == 0)
+			goto refused;
+		bit = UINT64_C(1) << member.node_id;
+		if ((value.cohort_bitmap & bit) == 0 || (seen & bit) != 0)
+			goto refused;
+		seen |= bit;
+		entry = bytes + 72 + 18 * member.node_id;
+		cluster_undo_tt_ctrc_put_u16_le(entry, member.node_id);
+		cluster_undo_tt_ctrc_put_u64_le(entry + 2, member.boot);
+		cluster_undo_tt_ctrc_put_u64_le(entry + 10, member.admitted_incarnation);
+	}
+	if (seen != value.cohort_bitmap)
+		goto refused;
+	/* Compact indexed entries forwards: no unread higher-node entry is lost. */
+	for (unsigned node = 0; node < 64; node++)
+		if (seen & (UINT64_C(1) << node)) {
+			memmove(bytes + position, bytes + 72 + 18 * node, 18);
+			position += 18;
+		}
+	/* The descriptor and every member were consumed before touching out. */
+	memcpy(out, bytes, length);
+	return true;
+
+refused:
+	if (out != NULL)
+		memset(out, 0, Min(out_length, (size_t)72));
+	return false;
+}
+
 #endif

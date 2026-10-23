@@ -457,6 +457,35 @@ extern bool cluster_recovery_ctrc_witness_ids_from_evidence_v2(const uint8 *evid
 extern bool cluster_recovery_ctrc_witness_ids_in_evidence_v2(const uint8 *witness_ids,
 	size_t witness_ids_length, const uint8 *evidence, size_t evidence_length);
 
+typedef struct ClusterRecoveryCTRCColdMemberV2 {
+	uint16 node_id; /* bitmap bit number, 0..63 */
+	uint64 boot;
+	uint64 admitted_incarnation;
+} ClusterRecoveryCTRCColdMemberV2;
+
+typedef struct ClusterRecoveryCTRCColdStepV2 {
+	uint64 formation_epoch;
+	uint64 recovery_serial;
+	uint64 cohort_bitmap;
+	uint64 completed_bitmap;
+	uint8 input_sha256[32];
+	const ClusterRecoveryCTRCColdMemberV2 *members;
+	size_t member_count;
+} ClusterRecoveryCTRCColdStepV2;
+
+/* Encode only atom4's bytes field: four U64 fields, input digest32,
+ * U64(member_count), then U16(node)||U64(boot)||U64(admitted incarnation)
+ * members in ascending node order. Exact length is 72+18*member_count;
+ * require nonzero identities/digest and exact complete cohort membership.
+ * Immutable, valid declared input storage may be unaligned and overlap out;
+ * all inputs are consumed before publication. Fixed bounded stack scratch,
+ * no allocation. Refusal clears min(out_length,72), with no partial tail.
+ * This codec cannot manufacture original RESET/load success or current ACKs.
+ * The original owner must recheck nonce/current/ACK and exact scope/round;
+ * these bytes alone supply no atom3, persistent proof, release or authority. */
+extern bool cluster_recovery_ctrc_cold_step_bytes_v2(const ClusterRecoveryCTRCColdStepV2 *step,
+	uint8 *out, size_t out_length);
+
 typedef struct ClusterRecoveryCTRCGraphNodeV2 {
 	uint16 kind; /* 1 reference/history, 2 original-owner proof */
 	ClusterRecoveryCTRCGraphBytesV2 key;

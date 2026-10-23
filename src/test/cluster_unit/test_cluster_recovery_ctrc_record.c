@@ -5960,6 +5960,153 @@ UT_TEST(witness_membership_unselected_raw_and_overlapping_inputs)
 	UT_ASSERT(memcmp(evidence, before, sizeof(evidence)) == 0 && graph_alloc_live == 0);
 }
 
+/* Independent little-endian struct.pack oracle for the frozen atom4 body. */
+static const uint8 cold_step_golden[] = {
+	0x08,0x07,0x06,0x05,0x04,0x03,0x02,0x01, 0x18,0x17,0x16,0x15,0x14,0x13,0x12,0x11,
+	0x02,0,0,0,0,0,0,0x80, 0x02,0,0,0,0,0,0,0x80,
+	1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,
+	17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,
+	2,0,0,0,0,0,0,0,
+	1,0, 0x28,0x27,0x26,0x25,0x24,0x23,0x22,0x21, 0x38,0x37,0x36,0x35,0x34,0x33,0x32,0x31,
+	63,0, 0x48,0x47,0x46,0x45,0x44,0x43,0x42,0x41, 0x58,0x57,0x56,0x55,0x54,0x53,0x52,0x51
+};
+
+static void
+cold_step_sample(ClusterRecoveryCTRCColdStepV2 *step, ClusterRecoveryCTRCColdMemberV2 members[2])
+{
+	memset(step, 0, sizeof(*step));
+	memset(members, 0, 2 * sizeof(*members));
+	step->formation_epoch = UINT64_C(0x0102030405060708);
+	step->recovery_serial = UINT64_C(0x1112131415161718);
+	step->cohort_bitmap = step->completed_bitmap = (UINT64_C(1) << 63) | 2;
+	for (unsigned i = 0; i < sizeof(step->input_sha256); i++)
+		step->input_sha256[i] = i + 1;
+	members[0] = (ClusterRecoveryCTRCColdMemberV2){63, UINT64_C(0x4142434445464748), UINT64_C(0x5152535455565758)};
+	members[1] = (ClusterRecoveryCTRCColdMemberV2){1, UINT64_C(0x2122232425262728), UINT64_C(0x3132333435363738)};
+	step->members = members;
+	step->member_count = 2;
+}
+
+static bool
+cold_step_refused(const ClusterRecoveryCTRCColdStepV2 *step, size_t length)
+{
+	uint8 out[1240];
+
+	memset(out, 0xa5, sizeof(out));
+	if (cluster_recovery_ctrc_cold_step_bytes_v2(step, out + 1, length)
+		|| out[0] != 0xa5 || !all_zero(out + 1, Min(length, (size_t)72)))
+		return false;
+	for (size_t i = 1 + Min(length, (size_t)72); i < sizeof(out); i++)
+		if (out[i] != 0xa5)
+			return false;
+	return graph_alloc_live == 0;
+}
+
+UT_TEST(cold_step_canonical_bytes_and_complete_64_member_cohort)
+{
+	ClusterRecoveryCTRCColdStepV2 step, before;
+	ClusterRecoveryCTRCColdMemberV2 members[64], saved[2];
+	uint8 out[72 + 18 * 64 + 1];
+	unsigned calls = graph_alloc_calls;
+
+	cold_step_sample(&step, members);
+	memcpy(&before, &step, sizeof(before));
+	memcpy(saved, members, sizeof(saved));
+	memset(out, 0xa5, sizeof(out));
+	graph_alloc_fail_at = calls + 1;
+	UT_ASSERT(cluster_recovery_ctrc_cold_step_bytes_v2(&step, out, sizeof(cold_step_golden)));
+	UT_ASSERT_EQ(sizeof(cold_step_golden), 108);
+	UT_ASSERT(memcmp(out, cold_step_golden, sizeof(cold_step_golden)) == 0);
+	UT_ASSERT(out[sizeof(cold_step_golden)] == 0xa5);
+	UT_ASSERT(memcmp(&step, &before, sizeof(step)) == 0 && memcmp(members, saved, sizeof(saved)) == 0);
+	step.cohort_bitmap = step.completed_bitmap = UINT64_C(1) << 63;
+	step.member_count = 1;
+	UT_ASSERT(cluster_recovery_ctrc_cold_step_bytes_v2(&step, out, 90));
+	UT_ASSERT_EQ(cluster_undo_tt_ctrc_get_u64_le(out + 64), 1);
+	UT_ASSERT_EQ(cluster_undo_tt_ctrc_get_u16_le(out + 72), 63);
+	step.cohort_bitmap = step.completed_bitmap = UINT64_MAX;
+	step.member_count = 64;
+	for (unsigned i = 0; i < 64; i++)
+		members[i] = (ClusterRecoveryCTRCColdMemberV2){63 - i, 100 + i, 200 + i};
+	UT_ASSERT(cluster_recovery_ctrc_cold_step_bytes_v2(&step, out, sizeof(out) - 1));
+	UT_ASSERT_EQ(cluster_undo_tt_ctrc_get_u64_le(out + 64), 64);
+	for (unsigned node = 0; node < 64; node++) {
+		UT_ASSERT_EQ(cluster_undo_tt_ctrc_get_u16_le(out + 72 + 18 * node), node);
+		UT_ASSERT_EQ(cluster_undo_tt_ctrc_get_u64_le(out + 74 + 18 * node), 163 - node);
+		UT_ASSERT_EQ(cluster_undo_tt_ctrc_get_u64_le(out + 82 + 18 * node), 263 - node);
+	}
+	UT_ASSERT(out[sizeof(out) - 1] == 0xa5 && graph_alloc_calls == calls && graph_alloc_live == 0);
+	graph_alloc_fail_at = 0;
+}
+
+UT_TEST(cold_step_incomplete_duplicate_unknown_and_bounded_refusal)
+{
+	ClusterRecoveryCTRCColdStepV2 step;
+	ClusterRecoveryCTRCColdMemberV2 members[2];
+	uint8 out[108];
+
+	for (unsigned which = 0; which < 16; which++) {
+		size_t length = sizeof(cold_step_golden);
+
+		cold_step_sample(&step, members);
+		switch (which) {
+		case 0: step.formation_epoch = 0; break;
+		case 1: step.recovery_serial = 0; break;
+		case 2: step.cohort_bitmap = step.completed_bitmap = 0; break;
+		case 3: step.completed_bitmap = 2; break;
+		case 4: step.completed_bitmap |= 1; break;
+		case 5: memset(step.input_sha256, 0, sizeof(step.input_sha256)); break;
+		case 6: step.members = NULL; break;
+		case 7: step.member_count = 0; length = 72; break;
+		case 8: step.member_count = 65; break;
+		case 9: step.member_count = SIZE_MAX; break;
+		case 10: members[1].node_id = members[0].node_id; break;
+		case 11: members[1].node_id = 64; break;
+		case 12: members[1].node_id = 0; break;
+		case 13: members[1].boot = 0; break;
+		case 14: members[1].admitted_incarnation = 0; break;
+		case 15: step.member_count = 1; length = 90; break;
+		}
+		UT_ASSERT(cold_step_refused(&step, length));
+	}
+	cold_step_sample(&step, members);
+	for (size_t length = 0; length < sizeof(cold_step_golden); length++)
+		UT_ASSERT(cold_step_refused(&step, length));
+	UT_ASSERT(cold_step_refused(&step, sizeof(cold_step_golden) + 1));
+	UT_ASSERT(cold_step_refused(&step, SIZE_MAX));
+	UT_ASSERT(cold_step_refused(NULL, sizeof(cold_step_golden)));
+	UT_ASSERT(!cluster_recovery_ctrc_cold_step_bytes_v2(&step, NULL, sizeof(out)));
+}
+
+UT_TEST(cold_step_unaligned_alias_inputs_and_publication)
+{
+	ClusterRecoveryCTRCColdStepV2 step;
+	ClusterRecoveryCTRCColdMemberV2 members[2];
+	uint8 arena[256], expected[sizeof(arena)];
+
+	for (unsigned which = 0; which < 3; which++) {
+		const ClusterRecoveryCTRCColdStepV2 *input = &step;
+		size_t offset = which == 2 ? 73 : 1;
+
+		cold_step_sample(&step, members);
+		memset(arena, 0xa5, sizeof(arena));
+		if (which != 0) {
+			size_t position = which == 1 ? 1 : 128;
+
+			memcpy(arena + position, members, sizeof(members));
+			step.members = (const ClusterRecoveryCTRCColdMemberV2 *)(arena + position);
+		}
+		if (which != 1) {
+			memcpy(arena + 1, &step, sizeof(step));
+			input = (const ClusterRecoveryCTRCColdStepV2 *)(arena + 1);
+		}
+		memcpy(expected, arena, sizeof(expected));
+		memcpy(expected + offset, cold_step_golden, sizeof(cold_step_golden));
+		UT_ASSERT(cluster_recovery_ctrc_cold_step_bytes_v2(input, arena + offset, sizeof(cold_step_golden)));
+		UT_ASSERT(memcmp(arena, expected, sizeof(arena)) == 0 && graph_alloc_live == 0);
+	}
+}
+
 static bool
 raw_evidence_refused(const ClusterRecoveryCTRCGraphBytesV2 *atoms, size_t count, size_t capacity)
 {
@@ -6489,7 +6636,7 @@ UT_TEST(graph_reader_allocation_refusal)
 int
 main(void)
 {
-	UT_PLAN(188);
+	UT_PLAN(191);
 	UT_RUN(golden_encoding);
 	UT_RUN(golden_decoding);
 	UT_RUN(unaligned_buffers);
@@ -6663,6 +6810,9 @@ main(void)
 	UT_RUN(witness_membership_exact_subsets_and_no_allocation);
 	UT_RUN(witness_membership_missing_noncanonical_and_bounded_ids);
 	UT_RUN(witness_membership_unselected_raw_and_overlapping_inputs);
+	UT_RUN(cold_step_canonical_bytes_and_complete_64_member_cohort);
+	UT_RUN(cold_step_incomplete_duplicate_unknown_and_bounded_refusal);
+	UT_RUN(cold_step_unaligned_alias_inputs_and_publication);
 	UT_RUN(raw_evidence_permutations_and_full_encoded_sort);
 	UT_RUN(raw_evidence_conflicting_subject_is_atomic);
 	UT_RUN(raw_evidence_envelope_refusals);
