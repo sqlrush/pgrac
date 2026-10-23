@@ -319,6 +319,9 @@ extern bool cluster_recovery_tx_result_observe_v1(ClusterRecoveryTxResultObserva
  * neither operation acknowledges other services or grants OPEN. */
 extern bool cluster_recovery_tx_result_accept_v1(void);
 extern bool cluster_recovery_tx_result_accepted_v1(const struct ClusterRecoveryStartV1 *start);
+/* Original Startup handoff: wait locally for the registered TX component;
+ * missing, unresolved or stale results refuse rather than releasing proof. */
+extern bool cluster_recovery_tx_result_wait_v1(const struct ClusterRecoveryStartV1 *start);
 /* Checkpointer-only, process-local opaque stable read; no I/O or write grant.
  * The original publisher must still prove ROOT/common/service and all normal
  * writer, membership, fence, durability and release conditions. */

@@ -63,8 +63,11 @@
 #include "postmaster/bgwriter.h" /* CheckPointTimeout (liveness threshold, contract) */
 #include "storage/shmem.h"
 #include "postmaster/interrupt.h"
+#include "postmaster/startup.h"
+#include "storage/latch.h"
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
+#include "utils/wait_event.h"
 
 /* Volatile original-start input, never a durable certificate or service bit.
  * The lock protects only bounded memory copies, never ROOT/WAL/storage I/O. */
@@ -898,26 +901,61 @@ cluster_recovery_tx_result_accept_v1(void)
 	return same;
 }
 
-bool
-cluster_recovery_tx_result_accepted_v1(const struct ClusterRecoveryStartV1 *start)
+typedef enum RecoveryTxHandoffStatus {
+	RECOVERY_TX_HANDOFF_BLOCKED,
+	RECOVERY_TX_HANDOFF_WAIT,
+	RECOVERY_TX_HANDOFF_ACCEPTED
+} RecoveryTxHandoffStatus;
+
+static RecoveryTxHandoffStatus
+recovery_tx_result_handoff_status(const struct ClusterRecoveryStartV1 *start)
 {
 	ClusterRecoveryCheckpointOwnerV1 owner;
 	ClusterRecoveryCheckpointSlotV1 *slot;
-	bool accepted;
+	RecoveryTxHandoffStatus status = RECOVERY_TX_HANDOFF_BLOCKED;
 
 	if (start == NULL || start != checkpoint_registered_start
 		|| cluster_recovery_plan_shmem == NULL
 		|| !ClusterColdRecoveryTxCheckpointOwnerV1(start, &owner)
 		|| memcmp(&owner, &checkpoint_registered_owner, sizeof(owner)) != 0)
-		return false;
+		return RECOVERY_TX_HANDOFF_BLOCKED;
 	slot = &cluster_recovery_plan_shmem->checkpoint_owner;
 	SpinLockAcquire(&slot->lock);
-	accepted = slot->valid && memcmp(&slot->owner, &owner, sizeof(owner)) == 0
+	if (slot->valid && memcmp(&slot->owner, &owner, sizeof(owner)) == 0
 		&& slot->tx_result.state == CLUSTER_RECOVERY_TX_RESULT_COMPLETE
-		&& slot->tx_result.result_generation != 0
-		&& slot->tx_accepted_generation == slot->tx_result.result_generation;
+		&& slot->tx_result.result_generation != 0)
+		status = slot->tx_accepted_generation == slot->tx_result.result_generation
+			? RECOVERY_TX_HANDOFF_ACCEPTED : RECOVERY_TX_HANDOFF_WAIT;
 	SpinLockRelease(&slot->lock);
-	return accepted;
+	return status;
+}
+
+bool
+cluster_recovery_tx_result_accepted_v1(const struct ClusterRecoveryStartV1 *start)
+{
+	return recovery_tx_result_handoff_status(start) == RECOVERY_TX_HANDOFF_ACCEPTED;
+}
+
+bool
+cluster_recovery_tx_result_wait_v1(const struct ClusterRecoveryStartV1 *start)
+{
+	if (start == NULL)
+		return true;
+	for (;;) {
+		RecoveryTxHandoffStatus status;
+
+		status = recovery_tx_result_handoff_status(start);
+		if (status == RECOVERY_TX_HANDOFF_BLOCKED)
+			return false;
+		ResetLatch(MyLatch);
+		HandleStartupProcInterrupts();
+		if (status == RECOVERY_TX_HANDOFF_ACCEPTED)
+			return true;
+		/* The original LMON is already running. Poll wakeups are local;
+		 * elapsed time alone cannot invalidate this retained component. */
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						100L, PG_WAIT_EXTENSION);
+	}
 }
 
 bool

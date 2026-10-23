@@ -18,7 +18,10 @@
 #include "../../../src/backend/cluster/cluster_control_root_private.h"
 #include "miscadmin.h"
 #include "postmaster/interrupt.h"
+#include "postmaster/startup.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
+#include "utils/wait_event.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "../../backend/cluster/cluster_recovery_plan.c"
@@ -70,6 +73,11 @@ static unsigned callback_registrations, input_destroys, allocations, frees;
 static pg_on_exit_callback exit_callback;
 static jmp_buf fatal_jump;
 static bool fatal_armed;
+static Latch tx_wait_latch;
+Latch *MyLatch = &tx_wait_latch;
+static unsigned tx_waits, tx_interrupts;
+static unsigned tx_wait_destroy_base;
+static bool tx_wait_drift;
 static const struct ClusterRecoveryStartV1 *destroy_probe;
 static ClusterRecoveryPlanShmem window_region;
 static bool found_window_region;
@@ -221,6 +229,13 @@ static void test_fatal(void)
 #include "test_cluster_cold_tx_owner.inc"
 #include "test_cluster_cold_tx_xid_maximum.inc"
 #include "test_cluster_cold_tx_consumer.inc"
+
+/* Historical semantic classification cannot suppress an independently
+ * retained cold attempt bound to the actual recovered writer. */
+ClusterNormalStartState cluster_semantic_normal_start_state(void)
+{
+	return CLUSTER_NORMAL_START_TARGET_LOADING;
+}
 
 static void actual_startup_tx_begin(EndOfWalRecoveryInfo *endOfRecoveryInfo)
 {
@@ -394,6 +409,8 @@ bool cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 st
 
 static void reset(void)
 {
+	tx_waits = tx_interrupts = 0;
+	tx_wait_drift = false;
 	if (reserved_target != NULL || stamp_live) abort();
 	/* Fault injection changes actor identity; real process exit runs as the
 	 * original Startup PID, never as the deliberately forged test actor. */
@@ -622,6 +639,9 @@ UT_TEST(test_actual_post_done_boundary_binds_or_fails_before_later_work)
 	reset(); retain();
 	actual_startup_tx_begin(&info);
 	UT_ASSERT(ClusterColdRecoveryTxCurrent(info.cluster_tx_start));
+	UT_ASSERT_EQ(window_region.checkpoint_owner.tx_result.state,
+		CLUSTER_RECOVERY_TX_RESULT_COMPLETE);
+	UT_ASSERT_EQ(window_region.checkpoint_owner.tx_result.subject_count, 0);
 	ClusterReleaseColdRecoveryInputs(&info);
 	retain();
 	clusterStartupWriterInstalled = false;
@@ -1472,6 +1492,80 @@ UT_TEST(test_tx_result_binds_input_root_and_cannot_rewind_ordinals)
 	}
 }
 
+void
+HandleStartupProcInterrupts(void)
+{
+	tx_interrupts++;
+}
+
+void
+ResetLatch(Latch *latch)
+{
+	UT_ASSERT(latch == MyLatch);
+}
+
+int
+WaitLatch(Latch *latch, int events, long timeout, uint32 wait_event_info)
+{
+	UT_ASSERT(latch == MyLatch);
+	UT_ASSERT_EQ(events, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH);
+	UT_ASSERT_EQ(timeout, 100);
+	UT_ASSERT_EQ(wait_event_info, PG_WAIT_EXTENSION);
+	UT_ASSERT(info.cluster_tx_start != NULL && input_destroys == tx_wait_destroy_base);
+	UT_ASSERT(ClusterColdRecoveryTxCurrent(info.cluster_tx_start));
+	tx_waits++;
+	if (tx_wait_drift)
+		owner_boot++;
+	else if (tx_waits == 3) {
+		serving_actor();
+		UT_ASSERT(cluster_recovery_tx_result_accept_v1());
+		startup_actor();
+	}
+	return WL_TIMEOUT; /* Poll timeouts never become transaction errors. */
+}
+
+static void
+actual_startup_finish_tx(EndOfWalRecoveryInfo *endOfRecoveryInfo)
+{
+#include "test_cluster_cold_tx_finish_boundary.inc"
+}
+
+UT_TEST(test_actual_startup_keeps_private_tx_input_until_lmon_accepts)
+{
+	c0_subject();
+	tx_wait_destroy_base = input_destroys;
+	UT_ASSERT(cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+	actual_startup_finish_tx(&info);
+	UT_ASSERT_EQ(tx_waits, 3);
+	UT_ASSERT(tx_interrupts >= tx_waits);
+	UT_ASSERT_EQ(input_destroys, tx_wait_destroy_base + 1);
+	UT_ASSERT(info.cluster_tx_start == NULL && info.cluster_cold_inputs == NULL);
+	serving_actor();
+	UT_ASSERT(cluster_recovery_tx_result_accept_v1());
+	startup_actor();
+}
+
+UT_TEST(test_tx_handoff_refuses_pending_or_drift_without_destroying_input)
+{
+	UT_ASSERT(cluster_recovery_tx_result_wait_v1(NULL));
+	for (unsigned drift = 0; drift < 2; drift++) {
+		c0_subject();
+		tx_wait_destroy_base = input_destroys;
+		if (!drift)
+			census.entries[0].loser_proven = false;
+		UT_ASSERT(cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+		tx_wait_drift = drift != 0;
+		UT_ASSERT(!cluster_recovery_tx_result_wait_v1(info.cluster_tx_start));
+		UT_ASSERT_EQ(tx_waits, drift ? 1 : 0);
+		UT_ASSERT_EQ(input_destroys, tx_wait_destroy_base);
+		UT_ASSERT(info.cluster_tx_start != NULL && info.cluster_cold_inputs != NULL);
+		startup_actor();
+		release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		ClusterReleaseColdRecoveryInputs(&info);
+		UT_ASSERT_EQ(input_destroys, tx_wait_destroy_base + 1);
+	}
+}
+
 UT_TEST(test_original_lmon_accepts_complete_tx_without_changing_its_owner_result)
 {
 	for (unsigned empty = 0; empty < 2; empty++) {
@@ -1535,7 +1629,7 @@ UT_TEST(test_original_lmon_does_not_accept_unfinished_or_unproven_tx)
 
 int main(void)
 {
-	UT_PLAN(43);
+	UT_PLAN(45);
 	UT_RUN(test_original_owner_binds_complete_empty_census_after_done);
 	UT_RUN(test_native_owner_rejects_uninstalled_recovery_and_writer_drift);
 	UT_RUN(test_current_rechecks_owner_process_boot_and_exact_writer);
@@ -1581,6 +1675,8 @@ int main(void)
 	UT_RUN(test_tx_result_binds_input_root_and_cannot_rewind_ordinals);
 	UT_RUN(test_original_lmon_accepts_complete_tx_without_changing_its_owner_result);
 	UT_RUN(test_original_lmon_does_not_accept_unfinished_or_unproven_tx);
+	UT_RUN(test_actual_startup_keeps_private_tx_input_until_lmon_accepts);
+	UT_RUN(test_tx_handoff_refuses_pending_or_drift_without_destroying_input);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

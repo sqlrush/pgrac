@@ -9765,7 +9765,7 @@ test_cluster_cold_tx_start_boundary.inc: $(top_srcdir)/src/backend/access/transa
 	     owner && done && /LWLockRelease\(ControlFileLock\)/ { unlocked++ } \
 	     owner && /Bind original TX inputs only after actual INSTALL and native DONE/ { emit=1; count++ } \
 	     emit { print } \
-	     emit && /errmsg\("could not bind original Startup transaction recovery inputs"\)/ { emit=0; last=1; exit } \
+	     emit && /errmsg\("could not consume post-EOR physical loser inputs"\)/ { emit=0; last=1; exit } \
 	     END { if (count != 1 || done != 1 || unlocked != 1 || !last || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
@@ -9779,7 +9779,16 @@ test_cluster_cold_tx_xid_maximum.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_cold_tx_finish_boundary.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^StartupXLOG\(/ { owner=1 } \
+	     owner && /Complete original TX component handoff before releasing private input/ { emit=1; count++ } \
+	     emit { print } \
+	     emit && /ClusterReleaseColdRecoveryInputs\(endOfRecoveryInfo\)/ { emit=0; last=1; exit } \
+	     END { if (count != 1 || !last || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_owner.inc \
+		test_cluster_cold_tx_finish_boundary.inc \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
         test_cluster_cold_tx_consumer.inc test_cluster_cold_tx_xid_maximum.inc \
         test_cluster_cold_tx_writer.inc test_cluster_cold_tx_start_boundary.inc unit_test.h \

@@ -8091,8 +8091,9 @@ StartupXLOG(void)
 	 * fresh original-owner TX_CLOSURE scope. Exact C0 execution and terminal
 	 * reconstruction retain that scope through their final readback; release
 	 * precedes later Startup work and grants no checkpoint or OPEN authority. */
+	/* The original retained attempt, rather than the historical semantic
+	 * classification, selects this work. Clean/no-cold has a NULL start. */
 	if (cluster_shared_config
-		&& cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_TARGET_LOADING
 		&& !cluster_cold_recovery_consume_loser_inputs_v1(endOfRecoveryInfo->cluster_tx_start))
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 						 errmsg("could not consume post-EOR physical loser inputs")));
@@ -8216,6 +8217,9 @@ StartupXLOG(void)
 					 errdetail("reason=%s",
 							   normal_failure != NULL ? normal_failure : "INVALID_STARTUP_STATE")));
 	}
+	/* Complete original TX component handoff before releasing private input. */
+	if (!cluster_recovery_tx_result_wait_v1(endOfRecoveryInfo->cluster_tx_start))
+		ereport(FATAL, (errmsg("could not complete original Startup transaction result handoff")));
 	ClusterReleaseColdRecoveryInputs(endOfRecoveryInfo);
 #endif
 }
