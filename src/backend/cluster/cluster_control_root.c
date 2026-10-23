@@ -5904,6 +5904,15 @@ startup_complete_formation(const ControlRootImage *root,
 static bool
 startup_operation_owner(const ControlRootImage *root, const ClusterWalStartupImage *op)
 {
+	ClusterFormationSnapshotV1 formation;
+
+	if (root == NULL || op == NULL
+		|| (op->input_kind == CLUSTER_WAL_STARTUP_RECOVERED
+			&& (!cluster_reconfig_capture_formation_snapshot_v1(
+						 op->claim.identity.origin_thread_id, &formation)
+				|| formation.local_epoch != op->formation_epoch
+				|| !startup_recovered_owner_current(root, &formation))))
+		return false;
 	return startup_owner_for_input(op->claim.identity.system_identifier, op->formation_epoch,
 								   op->claim.identity.origin_owner_incarnation,
 								   root->header.v2.configured, op->input_kind);

@@ -9529,6 +9529,25 @@ UT_TEST(test_recovered_begin_requires_every_actual_empty_target)
 	test_reserve_mode = false;
 }
 
+UT_TEST(test_recovered_prepare_rechecks_checkpoint_owner_after_readback)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	ClusterControlRootFileToken token;
+	ClusterWalStartupImage ops[2], observed;
+
+	v3_recovered_begin_fixture(before, &root, &token, ops, false);
+	if (ut_current_failed)
+		return;
+	test_recovered_checkpoint_owner_schedule(4, 7); /* final post-readback owner check */
+	memset(&observed, 0xa5, sizeof(observed));
+	UT_ASSERT_NE(cluster_control_root_v3_startup_prepare_target(&ops[0].claim.identity,
+												 ops[0].operation_uuid, &observed), 0);
+	UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+	test_recovered_checkpoint_owner_schedule(0, 0);
+	test_reserve_mode = false;
+}
+
 UT_TEST(test_recovered_begin_rejects_an_independently_rebound_peer)
 {
 	for (unsigned fault = 0; fault < 3; ++fault) {
@@ -24867,10 +24886,11 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 	if (getenv("PGRAC_PRE2_TEST_RECOVERED_BEGIN") != NULL) {
-		UT_PLAN(9);
+		UT_PLAN(10);
 		UT_RUN(test_recovered_begin_mixed_inputs_keep_their_original_kinds);
 		UT_RUN(test_recovered_begin_all_complete_inputs_are_not_clean_exit);
 		UT_RUN(test_recovered_begin_requires_every_actual_empty_target);
+		UT_RUN(test_recovered_prepare_rechecks_checkpoint_owner_after_readback);
 		UT_RUN(test_recovered_begin_rejects_an_independently_rebound_peer);
 		UT_RUN(test_recovered_begin_retains_original_owner_and_fence_guards);
 		UT_RUN(test_v3_native_driver_prepares_sparse_targets_then_returns_initializing);
@@ -25099,7 +25119,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(476);
+	UT_PLAN(477);
 	UT_RUN(test_cold_sync_retained_files_under_original_owner_without_cf);
 	UT_RUN(test_cold_sync_each_io_failure_root_race_and_error_discard_output);
 	UT_RUN(test_cold_sync_requires_exact_root_fsync_role_and_disjoint_output);
@@ -25237,6 +25257,7 @@ main(int argc, char **argv)
 	UT_RUN(test_bootstrap_side_reobserves_every_namespace_and_closes_all_fds);
 	UT_RUN(test_v3_reserve_clean_publishes_all_sparse_targets_without_serving);
 	UT_RUN(test_v3_target_creates_only_exact_empty_successor);
+	UT_RUN(test_recovered_prepare_rechecks_checkpoint_owner_after_readback);
 	UT_RUN(test_v3_native_driver_prepares_sparse_targets_then_returns_initializing);
 	UT_RUN(test_v3_native_driver_advances_recovered_cohort_without_losing_kinds);
 	UT_RUN(test_v3_native_driver_rejects_foreign_input_and_owner_without_mutation);
