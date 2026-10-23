@@ -380,6 +380,9 @@ typedef struct ClusterCtrcOriginReservation {
 typedef struct ClusterCtrcParticipantEntry {
 	ClusterCtrcTxnKeyV1 key;
 	ClusterCtrcParticipantIdentity identity;
+	/* Volatile original identity handed off by a protected local origin.
+	 * Invalid remains unknown, particularly for unqualified foreign grants. */
+	FullTransactionId original_full_xid;
 	uint32 grant_generation;
 	uint8 state;
 	uint8 reserved8[3];

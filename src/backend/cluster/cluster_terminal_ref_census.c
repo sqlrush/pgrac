@@ -1843,16 +1843,19 @@ cluster_ctrc_active_scan_step(ClusterCtrcActiveScan *scan)
 			entry = &ctrc_participant_entries()[index];
 			occupied = !ctrc_bytes_zero(entry, sizeof(*entry));
 			key = entry->key;
+			full = entry->original_full_xid;
 			valid = entry->state <= CTRC_PARTICIPANT_BLOCKED;
 		}
 		LWLockRelease(lock);
 		if (occupied) {
 			if (!valid || !ctrc_txn_key_valid(&key) || !TransactionIdIsNormal(key.xid)
-				|| (is_origin
+				|| ((is_origin || FullTransactionIdIsValid(full))
 					&& (!FullTransactionIdIsNormal(full)
 						|| XidFromFullTransactionId(full) != key.xid)))
 				goto invalid;
-			if (!is_origin) {
+			if (!is_origin && !FullTransactionIdIsValid(full)) {
+				/* Unknown foreign/legacy identity remains only a candidate
+				 * observation; widening cannot qualify a producer certificate. */
 				uint32 distance = key.xid - XidFromFullTransactionId(scan->reference_full);
 
 				if (distance == UINT32_C(0x80000000)
@@ -5357,18 +5360,27 @@ ctrc_receipt_prepare_refused(bool invalid_namespace)
 static bool
 ctrc_origin_protects_local_receipt_locked(const ClusterCtrcTxnKeyV1 *key,
 										  const ClusterCtrcParticipantIdentity *identity,
-										  uint32 grant_generation)
+										  uint32 grant_generation,
+										  FullTransactionId *original_full_xid_out)
 {
 	const ClusterCtrcOriginEntry *origin;
 	uint64 index;
+	bool protects;
 
+	*original_full_xid_out = InvalidFullTransactionId;
 	if (grant_generation == 0 || !ctrc_origin_index(key, &index))
 		return false;
 	origin = &ctrc_origin_entries()[index];
-	return origin->state >= CTRC_ORIGIN_OPEN && origin->state <= CTRC_ORIGIN_CERTIFYING
-		   && origin->grant_generation == grant_generation
-		   && memcmp(&origin->key, key, sizeof(*key)) == 0
-		   && cluster_ctrc_origin_has_exact_touch(origin, identity);
+	protects = origin->state >= CTRC_ORIGIN_OPEN && origin->state <= CTRC_ORIGIN_CERTIFYING
+			   && origin->grant_generation == grant_generation
+			   && memcmp(&origin->key, key, sizeof(*key)) == 0
+			   && cluster_ctrc_origin_has_exact_touch(origin, identity);
+	/* Copy only an already retained identity under this original lock.
+	 * Missing metadata does not change the existing receipt admission. */
+	if (protects && FullTransactionIdIsNormal(origin->original_full_xid)
+		&& XidFromFullTransactionId(origin->original_full_xid) == key->xid)
+		*original_full_xid_out = origin->original_full_xid;
+	return protects;
 }
 
 static ClusterCtrcPrepareResult
@@ -5383,6 +5395,7 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 	ClusterCtrcParticipantEntry *participant;
 	ClusterCtrcReceipt *receipts;
 	ClusterCtrcPrepareResult result;
+	FullTransactionId original_full_xid = InvalidFullTransactionId;
 	uint64 participant_index;
 	uint64 receipt_index = UINT64_MAX;
 	uint64 journal_sequence = 0;
@@ -5427,7 +5440,8 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 	local_origin = key->origin_node_id == (uint16)cluster_node_id;
 	if (local_origin) {
 		LWLockAcquire(&CtrcShared->origin_lock, LW_SHARED);
-		if (!ctrc_origin_protects_local_receipt_locked(key, identity, grant_generation)) {
+		if (!ctrc_origin_protects_local_receipt_locked(key, identity, grant_generation,
+													 &original_full_xid)) {
 			LWLockRelease(&CtrcShared->origin_lock);
 			return ctrc_receipt_prepare_refused(false);
 		}
@@ -5436,8 +5450,14 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 	receipts = ctrc_receipt_entries();
 	ctrc_participant_locks_acquire(ctrc_participant_lock_mask(participant_index));
 	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
-	if (!ctrc_receipt_chain_exact_locked(participant_index, false)
-		|| !ctrc_receipt_prepare_locators_valid_locked(key, publication)) {
+	if (FullTransactionIdIsValid(original_full_xid)
+		&& FullTransactionIdIsValid(participant->original_full_xid)
+		&& !FullTransactionIdEquals(original_full_xid, participant->original_full_xid)) {
+		/* Same physical grant cannot silently acquire another original epoch.
+		 * Reject before receipt/participant mutation and retain both owners. */
+		result = CLUSTER_CTRC_PREPARE_REFUSED;
+	} else if (!ctrc_receipt_chain_exact_locked(participant_index, false)
+			   || !ctrc_receipt_prepare_locators_valid_locked(key, publication)) {
 		participant->state = CTRC_PARTICIPANT_BLOCKED;
 		result = CLUSTER_CTRC_PREPARE_REFUSED;
 	} else if (check_object
@@ -5470,9 +5490,15 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 	if (result == CLUSTER_CTRC_PREPARE_CAPACITY) {
 		(void)pg_atomic_fetch_add_u64((pg_atomic_uint64 *)&CtrcShared->full_refusal_count, 1);
 	}
-	if (result == CLUSTER_CTRC_PREPARE_READY || result == CLUSTER_CTRC_PREPARE_DUPLICATE)
+	if (result == CLUSTER_CTRC_PREPARE_READY || result == CLUSTER_CTRC_PREPARE_DUPLICATE) {
+		/* Receiver protection is visible before the original origin guard
+		 * leaves. Retain a known identity through CLOSE/ACK until reclamation. */
+		if (FullTransactionIdIsValid(original_full_xid)
+			&& !FullTransactionIdIsValid(participant->original_full_xid))
+			participant->original_full_xid = original_full_xid;
 		ctrc_receipt_handle_fill(handle, participant, participant_index, &receipts[receipt_index],
 								 receipt_index);
+	}
 
 	LWLockRelease(&CtrcShared->receipt_lock);
 	ctrc_participant_locks_release(ctrc_participant_lock_mask(participant_index));

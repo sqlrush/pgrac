@@ -1401,6 +1401,7 @@ UT_TEST(test_local_receipt_refuses_missing_or_aliased_origin_protection)
 
 static ClusterCtrcReceiptHandle *watched_receipt;
 static unsigned receipt_origin_guards, guarded_receipt_locks, guarded_receipt_publications;
+static unsigned guarded_original_identity_publications;
 static bool retire_before_origin_guard;
 
 /* The lock fixture observes production acquisition/publication boundaries;
@@ -1421,8 +1422,13 @@ observe_receipt_origin_guard(LWLock *lock, LWLockMode mode, bool acquiring)
 		&& watched_receipt->participant->receipt_count == 1
 		&& watched_receipt->receipt->state == CTRC_RECEIPT_PREPARED
 		&& ctrc_participant_receipt_heads()[watched_receipt->participant_index]
-			   == watched_receipt->receipt_index + 1)
+			   == watched_receipt->receipt_index + 1) {
 		guarded_receipt_publications++;
+		if (FullTransactionIdIsValid(watched_receipt->participant->original_full_xid)
+			&& FullTransactionIdEquals(watched_receipt->participant->original_full_xid,
+									   ctrc_origin_entries()[0].original_full_xid))
+			guarded_original_identity_publications++;
+	}
 	return false;
 }
 
@@ -3643,6 +3649,108 @@ UT_TEST(test_active_scan_uses_original_origin_identity_after_pgproc_exit)
 	UT_ASSERT_EQ(durability_calls, 0);
 }
 
+UT_TEST(test_local_receipt_hands_original_identity_to_retained_participant)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcReceiptHandle handle;
+	ClusterCtrcActiveScan scan;
+	FullTransactionId original;
+
+	reset_fixture();
+	origin = seed_origin(0, 1);
+	original = FullTransactionIdFromEpochAndXid(3, origin->key.xid);
+	origin->original_full_xid = original;
+	watched_receipt = &handle;
+	guarded_original_identity_publications = 0;
+	external_lock_hook = observe_receipt_origin_guard;
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 301, &handle), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(FullTransactionIdEquals(handle.participant->original_full_xid, original));
+	UT_ASSERT_EQ(guarded_original_identity_publications, 1);
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 301, &handle), CLUSTER_CTRC_PREPARE_DUPLICATE);
+	UT_ASSERT_EQ(guarded_original_identity_publications, 2);
+	external_lock_hook = NULL;
+	watched_receipt = NULL;
+	/* Source retirement is a fixture interleaving, not a release certificate.
+	 * The receiver must retain the original epoch after that source is gone. */
+	MemSet(origin, 0, sizeof(*origin));
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+	finish_active_scan(&scan);
+	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT(FullTransactionIdEquals(scan.min_full, original));
+	UT_ASSERT_EQ(top_full_reads, 0);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_local_receipt_refuses_conflicting_retained_original_identity)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcReceiptHandle first, refused;
+	ClusterCtrcParticipantEntry before;
+	ClusterCtrcReceipt receipt_before;
+
+	reset_fixture();
+	origin = seed_origin(0, 1);
+	origin->original_full_xid = FullTransactionIdFromEpochAndXid(3, origin->key.xid);
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 301, &first), CLUSTER_CTRC_PREPARE_READY);
+	first.participant->original_full_xid = origin->original_full_xid;
+	before = *first.participant;
+	receipt_before = *first.receipt;
+	origin->original_full_xid = FullTransactionIdFromEpochAndXid(4, origin->key.xid);
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 302, &refused), CLUSTER_CTRC_PREPARE_REFUSED);
+	UT_ASSERT(ctrc_bytes_zero(&refused, sizeof(refused)));
+	UT_ASSERT(memcmp(first.participant, &before, sizeof(before)) == 0);
+	UT_ASSERT(memcmp(first.receipt, &receipt_before, sizeof(receipt_before)) == 0);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_receipt_never_guesses_missing_or_foreign_original_identity)
+{
+	for (unsigned foreign = 0; foreign < 2; foreign++) {
+		ClusterCtrcOriginEntry *origin, request;
+		ClusterCtrcReceiptHandle handle;
+
+		reset_fixture();
+		origin = seed_origin(0, 1);
+		request = *origin;
+		if (foreign) {
+			MemSet(origin, 0, sizeof(*origin));
+			request.key.owner_instance = 2;
+			request.key.origin_node_id = 1;
+			request.key.segment_id = CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+			request.key.origin_boot_incarnation = 1102;
+			origin = &request;
+		} else
+			origin->original_full_xid = InvalidFullTransactionId;
+		UT_ASSERT_EQ(prepare_fixture_receipt(origin, 301, &handle), CLUSTER_CTRC_PREPARE_READY);
+		UT_ASSERT(!FullTransactionIdIsValid(handle.participant->original_full_xid));
+		UT_ASSERT_EQ(top_full_reads, 0);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_active_scan_refuses_malformed_known_participant_identity)
+{
+	for (unsigned fault = 0; fault < 2; fault++) {
+		ClusterCtrcOriginEntry *origin;
+		ClusterCtrcParticipantEntry *participant;
+		ClusterCtrcActiveScan scan;
+
+		reset_fixture();
+		origin = seed_origin(0, 0);
+		participant = &ctrc_participant_entries()[0];
+		participant->key = origin->key;
+		participant->state = CTRC_PARTICIPANT_OPEN;
+		participant->original_full_xid = FullTransactionIdFromEpochAndXid(
+			3, fault == 0 ? FrozenTransactionId : origin->key.xid + 1);
+		MemSet(origin, 0, sizeof(*origin));
+		UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+		finish_active_scan(&scan);
+		UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_INVALID);
+		UT_ASSERT(!FullTransactionIdIsValid(scan.min_full));
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
 UT_TEST(test_active_scan_refuses_unknown_or_mismatched_origin_fullxid)
 {
 	for (unsigned fault = 0; fault < 3; fault++) {
@@ -3705,7 +3813,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(85);
+	UT_PLAN(89);
 	printf("# CTRC header_bytes=%zu total_bytes=%zu\n", sizeof(ClusterCtrcSharedHeader),
 		   capacity.total_bytes);
 	UT_RUN(test_origin_reserve_requires_published_local_top_protection);
@@ -3791,6 +3899,10 @@ main(void)
 	UT_RUN(test_active_scan_corrupt_empty_entry_invalidates_sample);
 	UT_RUN(test_active_scan_fresh_begin_discards_previous_partial_sample);
 	UT_RUN(test_active_scan_uses_original_origin_identity_after_pgproc_exit);
+	UT_RUN(test_local_receipt_hands_original_identity_to_retained_participant);
+	UT_RUN(test_local_receipt_refuses_conflicting_retained_original_identity);
+	UT_RUN(test_receipt_never_guesses_missing_or_foreign_original_identity);
+	UT_RUN(test_active_scan_refuses_malformed_known_participant_identity);
 	UT_RUN(test_active_scan_refuses_unknown_or_mismatched_origin_fullxid);
 	UT_RUN(test_active_scan_participant_widens_old_epoch_and_rejects_unrepresentable_xids);
 	free(CtrcShared);
