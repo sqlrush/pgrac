@@ -29,6 +29,7 @@
 #include "cluster/cluster_ko.h"
 #include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_space_reservation.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -55,6 +56,14 @@ typedef struct SpaceIdentityCacheEntry {
 
 static HTAB *space_identity_cache;
 static uint64 space_identity_invalidations;
+
+static bool
+space_online_recovered_open(void)
+{
+	return MyBackendType == B_STARTUP
+		   || cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_EXISTING_OTHER
+		   || cluster_semantic_activation_recovered_open_current();
+}
 
 bool
 cluster_space_cold_install_v1(const ClusterSpaceIdentityKey *key,
@@ -415,7 +424,8 @@ cluster_space_buffer_version_component(const ClusterSpaceIdentity *identity, Buf
 	Page page;
 	RfPageProducerComponentV1 captured;
 
-	if (identity == NULL || component == NULL || RecoveryInProgress()
+	if (!space_online_recovered_open()
+		|| identity == NULL || component == NULL || RecoveryInProgress()
 		|| !space_namespace(identity->key.locator, false, &expected, NULL)
 		|| !cluster_space_identity_encode(identity, encoded, sizeof(encoded))
 		|| !cluster_space_identity_decode(encoded, sizeof(encoded), &expected, &checked)
@@ -485,7 +495,8 @@ space_copy_page_wal(const ClusterSpaceIdentity *identity, ForkNumber forknum, Bl
 	PGAlignedBlock result;
 	XLogRecPtr recptr;
 
-	if (lsn == NULL
+	if (!space_online_recovered_open()
+		|| lsn == NULL
 		|| !space_copy_prepare(identity, forknum, block, page, (Page)zero_before,
 							   zero_before == NULL ? RF_PAGE_STATE_ABSENT
 												   : RF_PAGE_STATE_UNFORMATTED,
@@ -524,7 +535,8 @@ cluster_space_copy_buffer_wal(const ClusterSpaceIdentity *identity, const void *
 	Page target;
 	XLogRecPtr lsn;
 
-	if (identity == NULL || !BufferIsValid(destination) || BufferIsLocal(destination)
+	if (!space_online_recovered_open()
+		|| identity == NULL || !BufferIsValid(destination) || BufferIsLocal(destination)
 		|| !BufferIsPermanent(destination))
 		return false;
 	BufferGetTag(destination, &locator, &forknum, &block);
@@ -609,6 +621,8 @@ cluster_space_relation_create(RelFileLocator locator)
 	XLogRecPtr lsn;
 	bool success = false;
 
+	if (!space_online_recovered_open())
+		return false;
 	if (!cluster_shared_config || cluster_smgr_which_for(locator, InvalidBackendId) != 1)
 		return true;
 	if (RecoveryInProgress() || !space_namespace(locator, false, &identity->result.key, NULL))
@@ -684,7 +698,8 @@ cluster_space_reserve(const ClusterSpaceIdentity *identity, const struct HwLock 
 	if (granted == NULL)
 		return InvalidBlockNumber;
 	*granted = 0;
-	if (identity == NULL || lock == NULL || !lock->held || !lock->coordinated
+	if (!space_online_recovered_open()
+		|| identity == NULL || lock == NULL || !lock->held || !lock->coordinated
 		|| lock->req.lockmode != ExclusiveLock || want == 0 || RecoveryInProgress()
 		|| !space_namespace(identity->key.locator, false, &expected, NULL)
 		|| !cluster_space_identity_encode(identity, expected_identity, sizeof(expected_identity))
@@ -815,6 +830,8 @@ space_structure_prepare(const ClusterSpaceIdentityKey *expected, ClusterSpaceWal
 	uint8 apply_mask;
 
 	Assert(action == CLUSTER_SPACE_WAL_TRUNCATE || action == CLUSTER_SPACE_WAL_TOMBSTONE);
+	if (!space_online_recovered_open())
+		return NULL;
 	smgr = smgropen(expected->locator, InvalidBackendId);
 	if (!smgrexists(smgr, SPACE_FORKNUM) || smgrnblocks(smgr, SPACE_FORKNUM) != 2)
 		return NULL;

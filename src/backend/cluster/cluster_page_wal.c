@@ -3,6 +3,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_page_wal.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_scn.h"
@@ -384,6 +385,12 @@ cluster_page_wal_prepare_install_v1(Buffer buffer, const ClusterPageWalBindingV1
 	ClusterWalSourceRef current;
 	BufferDesc *buf;
 	uint32 state;
+
+	if (MyBackendType != B_STARTUP
+		&& cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& !cluster_semantic_activation_recovered_open_current())
+		return false;
+
 	if (bindings == NULL || buffer <= 0 || buffer > NBuffers || carrier == NULL || image == NULL
 		|| prepared == NULL || !cluster_enabled || !cluster_shared_config)
 		return false;

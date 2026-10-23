@@ -2377,10 +2377,14 @@ test_cluster_page_wal: test_cluster_page_wal.c unit_test.h test_cluster_page_wal
 		test_cluster_page_wal_image.inc test_cluster_pcm_checksum_owner.inc \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(top_builddir)/src/common/cluster_space_identity.o \
+		$(top_builddir)/src/common/cluster_space_reservation.o \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
+		$(top_builddir)/src/common/cluster_space_identity.o \
+		$(top_builddir)/src/common/cluster_space_reservation.o \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto -lm -o $@

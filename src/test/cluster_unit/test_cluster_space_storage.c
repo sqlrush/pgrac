@@ -32,6 +32,7 @@
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_space_reservation.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_xnode_profile.h"
@@ -60,6 +61,22 @@ int NBuffers = 2, NLocBuffer;
 char *BufferBlocks;
 Block *LocalBufferBlockPointers;
 volatile uint32 CritSectionCount;
+BackendType MyBackendType = B_BACKEND;
+static ClusterNormalStartState space_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+static bool space_recovered_open = true;
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return space_start_state;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return space_recovered_open;
+}
+
 bool cluster_recmerge_window_active, cluster_recmerge_apply_foreign;
 uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
 int wal_level = WAL_LEVEL_REPLICA;
@@ -1486,6 +1503,23 @@ UT_TEST(test_real_create_binds_selected_namespace_and_wal)
 	UT_ASSERT_EQ(change.identity.result.incarnation[15], 0x45);
 	UT_ASSERT(cluster_space_reservation_page_valid(pages[1].data, BLCKSZ));
 	UT_ASSERT_EQ(PageGetLSN(pages[1].data), UINT64_C(0x10000200));
+}
+
+UT_TEST(test_online_space_writes_require_recovered_open)
+{
+	ClusterNormalStartState saved_state = space_start_state;
+	bool saved_open = space_recovered_open;
+
+	reset();
+	space_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	space_recovered_open = false;
+	UT_ASSERT(!cluster_space_relation_create(locator));
+	UT_ASSERT_EQ(io_calls + create_calls + wal_calls + dirty_calls, 0);
+	space_recovered_open = true;
+	UT_ASSERT(cluster_space_relation_create(locator));
+
+	space_start_state = saved_state;
+	space_recovered_open = saved_open;
 }
 
 UT_TEST(test_native_space_unavailable_attribution_forgets_under_same_owner)
@@ -4643,7 +4677,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(93);
+	UT_PLAN(94);
 	UT_RUN(test_original_space_step_orders_complete_install_before_commit);
 	UT_RUN(test_original_foreign_space_refusal_never_runs_commit_early);
 	UT_RUN(test_original_foreign_final_uses_exact_scope_without_reinstall);
@@ -4691,6 +4725,7 @@ main(void)
 	UT_RUN(test_cold_physical_truncate_uses_original_forks_without_local_wal_flush);
 	UT_RUN(test_cold_physical_truncate_refuses_owner_and_vm_before_shrink);
 	UT_RUN(test_real_create_binds_selected_namespace_and_wal);
+	UT_RUN(test_online_space_writes_require_recovered_open);
 	UT_RUN(test_native_space_unavailable_attribution_forgets_under_same_owner);
 	UT_RUN(test_no_create_on_legacy_or_unproved_namespace);
 	UT_RUN(test_existing_identity_is_never_recreated);
