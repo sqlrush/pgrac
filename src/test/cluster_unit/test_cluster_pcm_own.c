@@ -34,6 +34,7 @@
 #include "port/pg_crc32c.h"
 #include "utils/memdebug.h"
 
+#include "cluster/cluster_content_trace.h"
 #include "unit_test.h"
 
 /* Generated from the production bufmgr function bodies, never a test rewrite. */
@@ -72,6 +73,21 @@ bool cluster_trace_tx_identity = false;
 static unsigned guard_trace_count;
 static bool guard_trace_error;
 static ClusterWaitTrace guard_trace_last;
+
+/* Content-owner publication is tested separately. Keep this consumer fixture
+ * independent while compiling the current production capture/emit seams. */
+void
+cluster_content_trace_capture(const BufferTag *tag pg_attribute_unused(), ClusterContentTraceCut *cut)
+{
+	memset(cut, 0, sizeof(*cut));
+}
+
+void
+cluster_content_trace_emit(const ClusterWaitTrace *guard pg_attribute_unused(),
+						   const ClusterContentTraceCut *cut pg_attribute_unused())
+{
+	UT_ASSERT(!transition_mapping_held && !transition_content_held);
+}
 
 uint64
 cluster_wait_trace_begin(ClusterWaitTraceKind kind)
@@ -1116,6 +1132,7 @@ retained_drain_consume(ClusterPcmOwnHeldXRevoke held_x_revoke)
 	ClusterPcmOwnResult own_result;
 	ResourceXApplyResult failure_result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	ClusterWaitTrace retained_drain_trace pg_attribute_unused() = { 0 };
+	ClusterContentTraceCut retained_content_cut = { 0 };
 	bool tagless_target_x = true, target_x_retain = true, semantic_retained = false;
 	bool held_x_revoke_active = true, target_revoke_owner_held = true, revoke_started = true;
 	int32 resource_master_node = 0;
@@ -6718,6 +6735,75 @@ UT_TEST(test_retained_drain_trace_error_after_abort_and_yield)
 	ClusterPcmOwnArray = saved;
 }
 
+/* Exercise two real service-consumer slices. The entry-local yield is still
+ * a fixture; this proves bounded defer/unwind, not LMS scheduling fairness. */
+UT_TEST(test_retained_content_busy_allows_another_resource_drain)
+{
+	BufferDesc bufs[2];
+	ClusterPcmOwnEntry entries[2];
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot revoking;
+	ClusterPcmOwnHeldXRevoke held;
+	ClusterPcmOwnFinishRefusal refusal;
+	PGIOAlignedBlock busy_page;
+
+	cluster_trace_tx_identity = guard_trace_error = false;
+	source_finish_fuses = source_finish_owner_releases = retained_drain_yields = 0;
+	retained_drain_yield_result = RESOURCE_X_APPLY_APPLIED;
+	for (int i = 0; i < 2; i++) {
+		transition_fixture(&bufs[i], &entries[i], &revoking, false);
+		bufs[i].buf_id = i;
+		bufs[i].tag.blockNum += i;
+		ClusterPcmOwnArray = entries;
+		bufs[i].pcm_state = PCM_STATE_X;
+		bufs[i].buffer_type = BUF_TYPE_XCUR;
+		(void)transition_lock_header(&bufs[i]);
+		cluster_pcm_own_snapshot_locked(&bufs[i], &revoking);
+		UnlockBufHdr(&bufs[i], pg_atomic_read_u32(&bufs[i].state));
+		memset(&held, 0, sizeof(held));
+		held.revoking = revoking;
+		held.buffer_id = i;
+		held.flags = CLUSTER_PCM_OWN_HELD_X_REVOKE_KNOWN_MASK;
+		transition_pin_count = transition_base_pins = 1;
+		pg_atomic_fetch_add_u32(&bufs[i].state, BUF_REFCOUNT_ONE);
+		transition_content_busy = i == 0;
+		if (i == 0)
+			memcpy(busy_page.data, transition_page.data, BLCKSZ);
+		UT_ASSERT_EQ(retained_drain_consume(held),
+					 i == 0 ? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(!transition_mapping_held && !transition_content_held);
+		UT_ASSERT_EQ(retained_drain_yields, 1);
+		UT_ASSERT_EQ(source_finish_fuses, 0);
+		UT_ASSERT_EQ(source_finish_owner_releases, 0);
+		if (i == 1)
+			UT_ASSERT_EQ(cluster_bufmgr_pcm_own_abort_held_x_revoke(&held), CLUSTER_PCM_OWN_OK);
+		UT_ASSERT_EQ(transition_pin_count, 0);
+		UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&bufs[i].state)), 0);
+		UT_ASSERT_EQ(cluster_pcm_own_flags_get(i), 0);
+	}
+	UT_ASSERT(!BufferTagsEqual(&bufs[0].tag, &bufs[1].tag));
+	/* Returning to the original tag still sees its external content owner.
+	 * The other resource did not clear this BUSY predicate to make progress. */
+	transition_buf = &bufs[0];
+	transition_pin_count = transition_base_pins = 0;
+	transition_content_busy = true;
+	memcpy(transition_page.data, busy_page.data, BLCKSZ);
+	(void)transition_lock_header(transition_buf);
+	cluster_pcm_own_snapshot_locked(transition_buf, &revoking);
+	UnlockBufHdr(transition_buf, pg_atomic_read_u32(&transition_buf->state));
+	UT_ASSERT_EQ(cluster_bufmgr_pcm_own_begin_x_revoke_held_by_tag(
+					 &revoking.tag, &revoking, &held), CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_bufmgr_pcm_own_try_drain_held_x_revoke_observed(&held, &refusal),
+				 CLUSTER_PCM_OWN_BUSY);
+	UT_ASSERT_EQ(refusal.reason, CLUSTER_PCM_OWN_FINISH_REFUSAL_CONTENT_LOCK);
+	transition_content_busy = false;
+	UT_ASSERT_EQ(cluster_bufmgr_pcm_own_try_drain_held_x_revoke(&held), CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_bufmgr_pcm_own_abort_held_x_revoke(&held), CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(transition_pin_count, 0);
+	UT_ASSERT(!transition_mapping_held && !transition_content_held);
+	ClusterPcmOwnArray = saved;
+}
+
 UT_TEST(test_real_selected_s_finish_wait_keeps_hard_refusals)
 {
 	BufferDesc buf;
@@ -11008,7 +11094,7 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(177);
+	UT_PLAN(178);
 	UT_RUN(test_native_flush_refuses_cr_before_starting_io);
 	UT_RUN(test_shared_leave_releases_dirty_and_clean_x_through_exact_owner);
 	UT_RUN(test_shared_leave_write_and_sync_error_keep_x_and_mapping);
@@ -11077,6 +11163,7 @@ main(void)
 	UT_RUN(test_real_source_finish_busy_is_owned_wait_not_global_failure);
 	UT_RUN(test_source_finish_trace_error_after_handoff_or_release);
 	UT_RUN(test_retained_drain_trace_error_after_abort_and_yield);
+	UT_RUN(test_retained_content_busy_allows_another_resource_drain);
 	UT_RUN(test_real_main_revoke_drain_preserves_passive_pins);
 	UT_RUN(test_real_main_revoke_finish_retains_passive_pins);
 	UT_RUN(test_real_source_pin_is_continuous_across_busy_and_owner_adoption);
