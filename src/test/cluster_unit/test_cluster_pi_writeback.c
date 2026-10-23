@@ -1943,6 +1943,21 @@ rebuild_setup(void)
 	return data;
 }
 
+UT_TEST(pi_rebuild_requires_recovered_semantic_open)
+{
+	ClusterPageDataReceiptV1 *data = rebuild_setup();
+
+	test_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	test_recovered_open = false;
+	UT_ASSERT_EQ(cluster_pi_rebuild_bgwriter_tick_v1(), CLUSTER_PI_REBUILD_IDLE);
+	UT_ASSERT_EQ(wb_resumes, 0);
+	UT_ASSERT_EQ(rebuild_applies, 0);
+
+	cluster_page_data_receipt_free_v1(&data);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
 UT_TEST(retained_rebuild_never_completes_with_unmapped_side_contributions)
 {
 	ClusterPageDataReceiptV1 *data = rebuild_setup();
@@ -2302,8 +2317,9 @@ int
 main(void)
 {
 	printf("# sizeof_WritebackShared=%zu\n", sizeof(WritebackShared));
-	UT_PLAN(79);
+	UT_PLAN(80);
 	UT_RUN(writeback_jobs_require_recovered_semantic_open);
+	UT_RUN(pi_rebuild_requires_recovered_semantic_open);
 	UT_RUN(writeback_v2_structure_scheduler_checks_local_work_without_wal_pins);
 	UT_RUN(writeback_v2_structure_scheduler_counts_invalid_completion_and_continues);
 	UT_RUN(writeback_v2_structure_scheduler_collects_all_original_page_acks);

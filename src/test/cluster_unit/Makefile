@@ -2396,6 +2396,7 @@ test_cluster_pi_writeback: test_cluster_pi_writeback_v2.inc $(CLUSTER_KO_O)
 test_cluster_pi_writeback: test_cluster_pi_writeback.c test_cluster_page_data.c \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_rebuild.c \
 		$(top_srcdir)/src/include/cluster/cluster_pi_rebuild.h \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_data_wire.h \
 		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h
