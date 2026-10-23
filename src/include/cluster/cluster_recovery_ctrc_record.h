@@ -549,6 +549,20 @@ extern bool cluster_recovery_ctrc_owner_evidence_v2(
 	const ClusterRecoveryCTRCOwnerEvidenceInputV2 *input, uint64 system_identifier,
 	uint8 *out, size_t out_capacity, size_t *out_length);
 
+/* Read a complete canonical owner evidence vector and bind atom3/4 subjects
+ * to the exact expected owner key. Require ordered unique raw kind1/2 atoms,
+ * one atom3, optional atom4 (required for rule3), complete witness membership
+ * and exact D0 transaction/common cold fields. Reject duplicates, unknown
+ * kinds, malformed envelopes and trailing input without normalization.
+ * Immutable evidence/key/payload may be unaligned or overlap; no mutation or
+ * output publication. No transcript scratch allocation, but original D0 SHA
+ * allocation/ERROR behavior is inherited; outside critical sections/spinlocks.
+ * Structural correspondence supplies no same-graph/required-set, source/cut,
+ * actual owner/ACK predicate, completion, durability or release authority. */
+extern bool cluster_recovery_ctrc_owner_evidence_matches_v2(const uint8 *evidence,
+	size_t evidence_length, const uint8 *owner_key, size_t owner_key_length,
+	const uint8 *payload, size_t payload_length, uint64 system_identifier);
+
 typedef struct ClusterRecoveryCTRCGraphNodeV2 {
 	uint16 kind; /* 1 reference/history, 2 original-owner proof */
 	ClusterRecoveryCTRCGraphBytesV2 key;

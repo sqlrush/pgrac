@@ -2091,18 +2091,16 @@ ctrc_witness_id_next_v2(const uint8 *ids, size_t length, size_t *position,
 	return true;
 }
 
-bool
-cluster_recovery_ctrc_witness_ids_in_evidence_v2(const uint8 *witness_ids,
-	size_t witness_ids_length, const uint8 *evidence, size_t evidence_length)
+static bool
+ctrc_witness_ids_in_cursor_v2(const uint8 *witness_ids, size_t witness_ids_length,
+	CTRCRawEvidenceCursor cursor)
 {
-	CTRCRawEvidenceCursor cursor;
 	ClusterRecoveryCTRCGraphBytesV2 wanted = {NULL, 0};
 	uint64 remaining;
 	size_t position = 8;
 	bool matched = false;
 
-	if (witness_ids == NULL || witness_ids_length < 8 || witness_ids_length > MaxAllocSize
-		|| !ctrc_raw_evidence_cursor_v2(evidence, evidence_length, &cursor))
+	if (witness_ids == NULL || witness_ids_length < 8 || witness_ids_length > MaxAllocSize)
 		return false;
 	remaining = cluster_undo_tt_ctrc_get_u64_le(witness_ids);
 	/* B(U16(kind)||B(nonempty subject)) needs at least nineteen bytes. */
@@ -2136,6 +2134,18 @@ cluster_recovery_ctrc_witness_ids_in_evidence_v2(const uint8 *witness_ids,
 		}
 	}
 	return matched;
+}
+
+bool
+cluster_recovery_ctrc_witness_ids_in_evidence_v2(const uint8 *witness_ids,
+	size_t witness_ids_length, const uint8 *evidence, size_t evidence_length)
+{
+	CTRCRawEvidenceCursor cursor;
+
+	if (witness_ids == NULL || witness_ids_length < 8 || witness_ids_length > MaxAllocSize
+		|| !ctrc_raw_evidence_cursor_v2(evidence, evidence_length, &cursor))
+		return false;
+	return ctrc_witness_ids_in_cursor_v2(witness_ids, witness_ids_length, cursor);
 }
 
 static bool
@@ -2241,6 +2251,90 @@ refused:
 	if (out_length != NULL)
 		memcpy(out_length, &zero, sizeof(zero));
 	return false;
+}
+
+static bool
+ctrc_owner_atom_next_v2(const uint8 *evidence, size_t length, size_t *position,
+	uint16 *kind, ClusterRecoveryCTRCGraphBytesV2 *subject, ClusterRecoveryCTRCGraphBytesV2 *body)
+{
+	const uint8 *atom;
+	uint64 atom_length, subject_length, body_length;
+	size_t start = *position, body_offset;
+
+	if (start > length || length - start < 8)
+		return false;
+	atom_length = cluster_undo_tt_ctrc_get_u64_le(evidence + start);
+	start += 8;
+	if (atom_length < 20 || atom_length > length - start)
+		return false;
+	atom = evidence + start;
+	subject_length = cluster_undo_tt_ctrc_get_u64_le(atom + 2);
+	if (subject_length == 0 || subject_length > atom_length - 18)
+		return false;
+	body_offset = 10 + (size_t)subject_length;
+	body_length = cluster_undo_tt_ctrc_get_u64_le(atom + body_offset);
+	if (body_length == 0 || body_length != atom_length - body_offset - 8)
+		return false;
+	*kind = cluster_undo_tt_ctrc_get_u16_le(atom);
+	*subject = (ClusterRecoveryCTRCGraphBytesV2){atom + 10, (size_t)subject_length};
+	*body = (ClusterRecoveryCTRCGraphBytesV2){atom + body_offset + 8, (size_t)body_length};
+	*position = start + (size_t)atom_length;
+	return true;
+}
+
+bool
+cluster_recovery_ctrc_owner_evidence_matches_v2(const uint8 *evidence, size_t evidence_length,
+	const uint8 *owner_key, size_t owner_key_length, const uint8 *payload,
+	size_t payload_length, uint64 system_identifier)
+{
+	ClusterRecoveryCTRCGraphBytesV2 completion = {NULL, 0}, cold = {NULL, 0};
+	CTRCRawEvidenceCursor raw;
+	uint64 count, raw_count = 0;
+	size_t position = 8, raw_end = 8;
+	uint16 outcome, rule;
+
+	if (evidence == NULL || evidence_length < 8 || evidence_length > MaxAllocSize
+		|| !cluster_recovery_ctrc_owner_transaction_matches_v2(owner_key, owner_key_length,
+			payload, payload_length, system_identifier))
+		return false;
+	count = cluster_undo_tt_ctrc_get_u64_le(evidence);
+	if (count == 0 || count > (evidence_length - 8) / 28)
+		return false;
+	for (uint64 i = 0; i < count; i++) {
+		ClusterRecoveryCTRCGraphBytesV2 subject, body;
+		uint16 kind;
+
+		if (!ctrc_owner_atom_next_v2(evidence, evidence_length, &position, &kind, &subject, &body))
+			return false;
+		if (kind == 1 || kind == 2) {
+			if (completion.data != NULL)
+				return false;
+			raw_count++;
+			raw_end = position;
+		} else {
+			if (subject.length != owner_key_length || memcmp(subject.data, owner_key, owner_key_length) != 0)
+				return false;
+			if (kind == 3 && completion.data == NULL && cold.data == NULL)
+				completion = body;
+			else if (kind == 4 && completion.data != NULL && cold.data == NULL)
+				cold = body;
+			else
+				return false;
+		}
+	}
+	if (position != evidence_length || raw_count == 0 || completion.length < 4)
+		return false;
+	outcome = cluster_undo_tt_ctrc_get_u16_le(completion.data);
+	rule = cluster_undo_tt_ctrc_get_u16_le(completion.data + 2);
+	/* This cursor covers only the actual raw prefix; the original whole-vector
+	 * header includes atom3/4. Preserve full raw validation after final match. */
+	raw = (CTRCRawEvidenceCursor){evidence, raw_end, 8, raw_count, {NULL, 0}, 0};
+	if (!ctrc_owner_completion_pair_v2(outcome, rule)
+		|| !ctrc_witness_ids_in_cursor_v2(completion.data + 4, completion.length - 4, raw)
+		|| (rule == 3 && cold.data == NULL))
+		return false;
+	return cold.data == NULL || cluster_recovery_ctrc_cold_step_matches_v2(cold.data,
+		cold.length, payload, payload_length, system_identifier);
 }
 
 bool
