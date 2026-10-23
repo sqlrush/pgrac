@@ -112,6 +112,9 @@ AuxProcType MyAuxProcType = NotAnAuxProcess;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 static bool test_checkpoint_mode;
+static bool test_recovered_open = true;
+static ClusterNormalStartState test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+static bool test_normal_start_state_override;
 static bool test_inputs_startup_cf;
 static bool test_random_leading_zero;
 static uint64 test_self_incarnation;
@@ -1060,7 +1063,7 @@ cluster_semantic_activation_record_decode(
 bool
 cluster_semantic_activation_recovered_open_current(void)
 {
-	return true;
+	return test_recovered_open;
 }
 
 bool
@@ -22381,6 +22384,8 @@ inputs_fixture(uint8 bytes[66048], ClusterRecoveryAnchorV2 anchors[2])
 	memset(&inputs_peer_flush, 0, sizeof(inputs_peer_flush));
 	cluster_shared_config = true;
 	MyBackendType = B_BG_WORKER;
+	test_recovered_open = true;
+	test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
 }
 
 typedef struct InputsVisitTest {
@@ -22811,6 +22816,28 @@ UT_TEST(test_wal_inputs_live_local_uses_original_complete_end)
 	UT_ASSERT_EQ(out.records, 1);
 	UT_ASSERT_EQ(inputs_native_flush_calls, 1);
 	UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), 2);
+	inputs_live_done(&inputs);
+}
+
+UT_TEST(test_wal_inputs_live_local_requires_recovered_semantic_open)
+{
+	ClusterWalInputsV1 *inputs = inputs_live_wal_fixture(0);
+	ClusterWalTailObservation out;
+	InputsVisitTest visit = { 0 };
+	test_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	test_normal_start_state_override = true;
+	test_recovered_open = false;
+	UT_ASSERT_EQ(
+		cluster_wal_inputs_visit_live_local_v1(inputs, 0, inputs_visit_record, &visit, &out),
+		CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+	UT_ASSERT_EQ(inputs_native_begin_calls + inputs_native_flush_calls + visit.calls, 0);
+	test_recovered_open = true;
+	UT_ASSERT_EQ(
+		cluster_wal_inputs_visit_live_local_v1(inputs, 0, inputs_visit_record, &visit, &out),
+		CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(visit.calls, 1);
+	test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+	test_normal_start_state_override = false;
 	inputs_live_done(&inputs);
 }
 
@@ -25070,7 +25097,7 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_WAL_INPUTS") != NULL) {
-		UT_PLAN(41);
+		UT_PLAN(42);
 		UT_RUN(test_cold_census_visits_all_selected_sources_twice);
 		UT_RUN(test_cold_census_open_source_waits_without_partial_callbacks);
 		UT_RUN(test_cold_census_refusal_error_and_final_drift_never_complete);
@@ -25094,6 +25121,7 @@ main(int argc, char **argv)
 		UT_RUN(test_wal_inputs_contributions_all_closed_or_local_live);
 		UT_RUN(test_wal_inputs_contributions_waits_whole_set_and_discards_on_source_failure);
 		UT_RUN(test_wal_inputs_live_local_uses_original_complete_end);
+		UT_RUN(test_wal_inputs_live_local_requires_recovered_semantic_open);
 		UT_RUN(test_wal_inputs_live_accepted_cut_never_expands_during_plan_build);
 		UT_RUN(test_wal_inputs_live_cut_uses_its_own_fixed_native_flush_job);
 		UT_RUN(test_wal_inputs_live_refuses_foreign_writer_and_changed_owner);
@@ -25128,7 +25156,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(477);
+	UT_PLAN(478);
 	UT_RUN(test_cold_sync_retained_files_under_original_owner_without_cf);
 	UT_RUN(test_cold_sync_each_io_failure_root_race_and_error_discard_output);
 	UT_RUN(test_cold_sync_requires_exact_root_fsync_role_and_disjoint_output);
@@ -25206,6 +25234,7 @@ main(int argc, char **argv)
 	UT_RUN(test_wal_inputs_contributions_all_closed_or_local_live);
 	UT_RUN(test_wal_inputs_contributions_waits_whole_set_and_discards_on_source_failure);
 	UT_RUN(test_wal_inputs_live_local_uses_original_complete_end);
+	UT_RUN(test_wal_inputs_live_local_requires_recovered_semantic_open);
 	UT_RUN(test_wal_inputs_live_accepted_cut_never_expands_during_plan_build);
 	UT_RUN(test_wal_inputs_live_cut_uses_its_own_fixed_native_flush_job);
 	UT_RUN(test_wal_inputs_live_refuses_foreign_writer_and_changed_owner);

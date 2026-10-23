@@ -14,6 +14,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_recovery_tt_record.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_wal_thread.h"
@@ -765,6 +766,9 @@ cluster_wal_inputs_prepare_live_local_v1(ClusterWalInputsV1 *inputs, uint32 inde
 	if (!inputs_current(inputs) || (inputs->purpose != WAL_INPUTS_ONLINE) || index >= inputs->count || CritSectionCount != 0
 		|| ShutdownRequestPending || RecoveryInProgress())
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& !cluster_semantic_activation_recovered_open_current())
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	item = &inputs->items[index];
 	if (!item->current || item->kind != CLUSTER_WAL_INPUT_CHECKPOINT
 		|| item->checkpoint.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN)

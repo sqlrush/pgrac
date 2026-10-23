@@ -438,6 +438,7 @@ cluster_wal_thread.o cluster_wal_writer.o cluster_wal_retention.o: \
 cluster_control_bootstrap.o cluster_control_bootstrap_read.o cluster_control_root.o \
 cluster_wal_tail.o: $(top_srcdir)/src/include/cluster/cluster_wal_tail.h
 cluster_wal_inputs.o: $(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+	$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
 	$(srcdir)/cluster_control_root_private.h $(srcdir)/cluster_recovery_anchor_private.h
 cluster_recovery_namespace.o: $(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h
 cluster_wal_cut.o: $(top_srcdir)/src/include/cluster/cluster_wal_cut.h \

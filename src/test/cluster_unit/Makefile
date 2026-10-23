@@ -3215,6 +3215,7 @@ WAL_INPUT_CONTRIBUTION_TEST_OBJS = $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
 # execute their production implementations.
 test_cluster_wal_inputs_product.o: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c \
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_tt_record.h \
 		$(top_srcdir)/src/include/cluster/storage/cluster_shared_fs.h \
 		$(top_srcdir)/src/include/access/xlogrecovery.h \

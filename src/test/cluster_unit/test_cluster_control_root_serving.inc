@@ -43,7 +43,7 @@ test_recovered_checkpoint_owner_system_identifier(uint64 system_identifier)
 ClusterNormalStartState
 cluster_semantic_normal_start_state(void)
 {
-	return serving_normal_start_state;
+	return test_normal_start_state_override ? test_normal_start_state : serving_normal_start_state;
 }
 
 /* Only this shared-owner leaf is doubled here. The original owner's shared
