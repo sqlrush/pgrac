@@ -21,6 +21,7 @@
 #include "access/xlog.h"
 #include "miscadmin.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_undo_root_descriptor.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
@@ -886,6 +887,7 @@ cluster_undo_block0_provision_publish(ClusterUndoBlock0Pin *pin, XLogRecPtr init
 	ClusterUndoBlock0SlotData *meta;
 	ClusterUndoBlock0Generation generation;
 	ClusterUndoSmgrPublishResult publish_result;
+	PGAlignedBlock sealed;
 	char *frame;
 
 	if (Block0Ctl == NULL || pin == NULL || pin->slot < 0
@@ -901,11 +903,16 @@ cluster_undo_block0_provision_publish(ClusterUndoBlock0Pin *pin, XLogRecPtr init
 	frame = BLOCK0_FRAME_DATA(meta->frame_index);
 	if (!block0_page_identity(frame, &meta->logical, &generation) || generation.value == UINT32_MAX)
 		ereport(ERROR, (errmsg("invalid undo block-zero provision image")));
+	/* The storage owner seals block zero. Publish those same bytes in the
+	 * resident frame so the first lifecycle writer has an exact predecessor. */
+	memcpy(sealed.data, frame, BLCKSZ);
+	if (!cluster_undo_segment_header_seal(sealed.data))
+		ereport(ERROR, (errmsg("could not seal undo block-zero provision image")));
 
 	XLogFlush(init_lsn);
 	publish_result = cluster_undo_smgr_provision_temp_publish(
 		meta->resolved_root.intent, meta->logical.segment_id, meta->logical.owner_instance,
-		owned->temp_path, frame);
+		owned->temp_path, sealed.data);
 	if (publish_result == CLUSTER_UNDO_SMGR_PUBLISH_EXISTS) {
 		if (cluster_undo_smgr_probe_segment(meta->resolved_root.intent, meta->logical.segment_id,
 											meta->logical.owner_instance, frame)
@@ -915,6 +922,8 @@ cluster_undo_block0_provision_publish(ClusterUndoBlock0Pin *pin, XLogRecPtr init
 			ereport(ERROR, (errmsg("undo block-zero provision winner is not exact")));
 	} else if (publish_result != CLUSTER_UNDO_SMGR_PUBLISH_PUBLISHED)
 		ereport(ERROR, (errmsg("could not publish undo block-zero provision image")));
+	else
+		memcpy(frame, sealed.data, BLCKSZ);
 
 	meta->generation = generation;
 	meta->last_wal_lsn = InvalidXLogRecPtr;
@@ -1819,6 +1828,7 @@ cluster_undo_block0_flush_sync(ClusterUndoBlock0Pin *pin, const char *successor_
 	ClusterUndoBlock0Generation successor_generation;
 	XLogRecPtr flush_lsn;
 	uint32 state;
+	PGAlignedBlock sealed;
 
 	if (Block0Ctl == NULL || pin == NULL || pin->slot < 0
 		|| pin->slot >= CLUSTER_UNDO_BLOCK0_SLOT_COUNT || pin->mode != CLUSTER_UNDO_BLOCK0_EXCLUSIVE
@@ -1836,6 +1846,9 @@ cluster_undo_block0_flush_sync(ClusterUndoBlock0Pin *pin, const char *successor_
 		ereport(ERROR, (errmsg("undo block-zero synchronous flush found invalid resident state")));
 	if (XLogRecPtrIsInvalid(required_wal_lsn) && state == CLUSTER_UNDO_BLOCK0_SLOT_VALID_DIRTY)
 		ereport(ERROR, (errmsg("undo block-zero dirty flush requires a valid WAL LSN")));
+	memcpy(sealed.data, successor_page, BLCKSZ);
+	if (!cluster_undo_segment_header_seal(sealed.data))
+		ereport(ERROR, (errmsg("could not seal undo block-zero synchronous flush image")));
 
 	flush_lsn = required_wal_lsn;
 	if (!XLogRecPtrIsInvalid(meta->last_wal_lsn)
@@ -1844,10 +1857,10 @@ cluster_undo_block0_flush_sync(ClusterUndoBlock0Pin *pin, const char *successor_
 	if (!XLogRecPtrIsInvalid(flush_lsn))
 		XLogFlush(flush_lsn);
 	if (!cluster_undo_smgr_write_block(meta->resolved_root.intent, meta->logical.segment_id,
-									   meta->logical.owner_instance, 0, successor_page, true))
+									   meta->logical.owner_instance, 0, sealed.data, true))
 		ereport(ERROR, (errmsg("could not flush undo block zero")));
 
-	memcpy(BLOCK0_FRAME_DATA(meta->frame_index), successor_page, BLCKSZ);
+	memcpy(BLOCK0_FRAME_DATA(meta->frame_index), sealed.data, BLCKSZ);
 	meta->generation = successor_generation;
 	pin->observed_generation = successor_generation;
 	meta->last_wal_lsn = InvalidXLogRecPtr;

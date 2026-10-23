@@ -19,5 +19,10 @@ run_scenario('pre2_fresh_open', [], sub {
 		require_equal(sql($nodes[$i], 'SELECT 1'), '1',
 			"fresh node $i is SQL-ready after OPEN");
 	}
+	# The first shared DDL must also acquire and activate its first TT segment.
+	# This catches a sealed disk header differing from its resident predecessor.
+	sql($nodes[0], 'CREATE TABLE pre2_first_bind (id integer PRIMARY KEY)');
+	require_equal(sql($nodes[0], 'SELECT count(*) FROM pre2_first_bind'), '0',
+		'first shared DDL commits after fresh OPEN');
 	$cluster->stop_cluster;
 });

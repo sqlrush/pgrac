@@ -29,6 +29,7 @@
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/cluster_undo_segment_init.h"
 #include "port/atomics.h"
 #include "port/pg_pthread.h"
 #include "storage/bufpage.h"
@@ -293,8 +294,12 @@ cluster_undo_smgr_write_block(ClusterUndoPathIntent intent pg_attribute_unused()
 	smgr_last_do_fsync = do_fsync;
 	if (wal_io_order_count < (int)lengthof(wal_io_order))
 		wal_io_order[wal_io_order_count++] = 2;
-	if (buf != NULL)
+	if (buf != NULL) {
 		memcpy(smgr_written_image, buf, BLCKSZ);
+		/* Match the production block-zero writer's checksum contract. */
+		if (block_no == 0)
+			UT_ASSERT(cluster_undo_segment_header_seal(smgr_written_image));
+	}
 	return smgr_write_ok;
 }
 
@@ -326,9 +331,13 @@ cluster_undo_smgr_provision_temp_publish(ClusterUndoPathIntent intent pg_attribu
 										 uint32 segment_id pg_attribute_unused(),
 										 uint8 owner_instance pg_attribute_unused(),
 										 const char *temp_path pg_attribute_unused(),
-										 const char block0[BLCKSZ] pg_attribute_unused())
+										 const char block0[BLCKSZ])
 {
 	smgr_temp_publish_calls++;
+	if (smgr_publish_result == CLUSTER_UNDO_SMGR_PUBLISH_PUBLISHED) {
+		memcpy(smgr_written_image, block0, BLCKSZ);
+		UT_ASSERT(cluster_undo_segment_header_seal(smgr_written_image));
+	}
 	if (smgr_publish_result != CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR)
 		smgr_temp_active = false;
 	if (smgr_publish_result == CLUSTER_UNDO_SMGR_PUBLISH_EXISTS)
@@ -1252,6 +1261,7 @@ UT_TEST(test_block0_provision_absent_creator_publishes_after_wal_flush)
 	ClusterUndoBlock0Pin pin;
 	char *page = NULL;
 	bool creator = false;
+	char copied[BLCKSZ];
 
 	fresh_block0_region(1);
 	make_valid_block0(1, 1, 5, 0x76);
@@ -1273,6 +1283,11 @@ UT_TEST(test_block0_provision_absent_creator_publishes_after_wal_flush)
 	UT_ASSERT(pin.observed_generation.known);
 	UT_ASSERT_EQ(pin.observed_generation.value, 5);
 	cluster_undo_block0_unpin(&pin);
+	UT_ASSERT_EQ(cluster_undo_block0_copy_resident(&logical, &root,
+					 &pin.observed_generation, &proof, copied, NULL), CLUSTER_UNDO_BLOCK0_OK);
+	/* The first lifecycle mutation compares the physical and resident pages.
+	 * A private INIT image with checksum zero cannot replace the sealed file. */
+	UT_ASSERT_EQ(memcmp(copied, smgr_written_image, BLCKSZ), 0);
 }
 
 UT_TEST(test_block0_provision_eexist_loser_installs_exact_winner_image)
@@ -1654,6 +1669,7 @@ UT_TEST(test_block0_flush_publishes_successor_generation)
 	ClusterUndoBlock0Generation sampled = make_generation(false, 99);
 	char successor[BLCKSZ];
 	char copied[BLCKSZ];
+	PGAlignedBlock sealed;
 	char *page = NULL;
 
 	fresh_block0_region(1);
@@ -1679,6 +1695,12 @@ UT_TEST(test_block0_flush_publishes_successor_generation)
 	UT_ASSERT_EQ(
 		cluster_undo_block0_copy_resident(&logical, &root, &new_generation, &proof, copied, NULL),
 		CLUSTER_UNDO_BLOCK0_OK);
+	/* The storage writer seals block zero. Its resident successor must have
+	 * the same checksum and bytes before a lifecycle caller reuses it. */
+	memcpy(sealed.data, successor, BLCKSZ);
+	UT_ASSERT(cluster_undo_segment_header_seal(sealed.data));
+	UT_ASSERT_EQ(memcmp(copied, sealed.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(memcmp(copied, smgr_written_image, BLCKSZ), 0);
 }
 
 UT_TEST(test_block0_flush_failure_preserves_resident_predecessor_and_dirty_lsn)

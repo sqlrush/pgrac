@@ -7437,8 +7437,11 @@ CLUSTER_UNDO_BLOCK0_CURRENT_O = \
 	$(top_builddir)/src/backend/cluster/storage/cluster_undo_block0_current.o
 CLUSTER_UNDO_BLOCK0_RESIDENT_O = \
 	$(top_builddir)/src/backend/cluster/storage/cluster_undo_block0_resident.o
+$(CLUSTER_UNDO_BLOCK0_RESIDENT_O): $(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h
+
 test_cluster_undo_block0: test_cluster_undo_block0.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_block0.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_UNDO_BLOCK0_RESIDENT_O) \
 		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O)
 	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) $< \
