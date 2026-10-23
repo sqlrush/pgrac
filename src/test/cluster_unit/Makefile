@@ -2397,7 +2397,8 @@ test_cluster_pi_writeback: test_cluster_pi_writeback.c test_cluster_page_data.c 
 		$(top_srcdir)/src/backend/cluster/cluster_pi_rebuild.c \
 		$(top_srcdir)/src/include/cluster/cluster_pi_rebuild.h \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c \
-		$(top_srcdir)/src/backend/cluster/cluster_pi_data_wire.h
+		$(top_srcdir)/src/backend/cluster/cluster_pi_data_wire.h \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h
 test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error: unit_test.h test_cluster_page_data.inc test_cluster_page_data_scn.inc \
 		test_cluster_block_redeclare_scan.inc \
 		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \

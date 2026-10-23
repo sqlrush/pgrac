@@ -16,6 +16,7 @@ extern void *ShmemInitStruct(const char *name, Size size, bool *found);
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_membership.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_inputs.h"
@@ -190,6 +191,8 @@ static unsigned rebuild_side_blocked, rebuild_logs;
 static unsigned rebuild_apply_blocked, rebuild_fail_after = UINT32_MAX;
 static unsigned rebuild_plan_blocked;
 static RfPageProofDetailV1 rebuild_plan_failure;
+static ClusterNormalStartState test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+static bool test_recovered_open = true;
 
 void
 cluster_grd_inc_pi_rebuild_side_blocked(void)
@@ -962,6 +965,19 @@ static bool wb_offer_complete_for_transport(uint32 slot, uint64 serial,
 #define cluster_pcm_lock_pi_structural_complete_v2 wb_structure_complete_for_schedule
 #define cluster_page_structural_receipt_free_v2 wb_structure_receipt_free_for_schedule
 #define cluster_page_structural_pi_ack_free_v2 wb_structure_ack_free_for_schedule
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return test_normal_start_state;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return test_recovered_open;
+}
+
 #include "../../backend/cluster/cluster_pi_writeback.c"
 #undef cluster_page_structural_pi_fact_v2
 #undef cluster_ko_shared_structure_offer_next_v2
@@ -994,6 +1010,8 @@ static ClusterPageDataReceiptV1 *
 wb_setup(void)
 {
 	ClusterPageDataReceiptV1 *data = NULL;
+	test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+	test_recovered_open = true;
 	wb_multiple = false;
 	wb_epoch = ack_writer_epoch = 1;
 	wb_membership_generation = 2;
@@ -1078,6 +1096,28 @@ wb_start(ClusterPageDataReceiptV1 *data)
 	cluster_pi_writeback_lmon_tick_v1();
 	UT_ASSERT_EQ(wb_destination, 1);
 	return job;
+}
+
+UT_TEST(writeback_jobs_require_recovered_semantic_open)
+{
+	ClusterPageDataReceiptV1 *data = wb_setup();
+	ClusterPiWritebackJobV1 *job = NULL;
+
+	test_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	test_recovered_open = false;
+	UT_ASSERT_EQ(cluster_pi_writeback_begin_v1((const ClusterPageDataReceiptV1 **)&data, 1,
+														 &wb_sources[1], &job),
+					 CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+	UT_ASSERT(job == NULL);
+
+	test_recovered_open = true;
+	UT_ASSERT_EQ(cluster_pi_writeback_begin_v1((const ClusterPageDataReceiptV1 **)&data, 1,
+														 &wb_sources[1], &job),
+					 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	cluster_pi_writeback_release_v1(&job);
+	cluster_page_data_receipt_free_v1(&data);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
 }
 
 static void
@@ -2262,7 +2302,8 @@ int
 main(void)
 {
 	printf("# sizeof_WritebackShared=%zu\n", sizeof(WritebackShared));
-	UT_PLAN(78);
+	UT_PLAN(79);
+	UT_RUN(writeback_jobs_require_recovered_semantic_open);
 	UT_RUN(writeback_v2_structure_scheduler_checks_local_work_without_wal_pins);
 	UT_RUN(writeback_v2_structure_scheduler_counts_invalid_completion_and_continues);
 	UT_RUN(writeback_v2_structure_scheduler_collects_all_original_page_acks);

@@ -15,6 +15,7 @@
 #include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_inputs.h"
@@ -858,6 +859,13 @@ wb_background(void)
 }
 
 static bool
+wb_recovered_open_for_online_job(void)
+{
+	return cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_EXISTING_OTHER
+		   || cluster_semantic_activation_recovered_open_current();
+}
+
+static bool
 wb_fact_current(const ClusterPiDataFactV1 *f, const ClusterWalSourceRef *peer, uint64 epoch,
 				bool master)
 {
@@ -1117,6 +1125,8 @@ cluster_pi_writeback_begin_v1(const ClusterPageDataReceiptV1 *const *receipts, u
 		|| count > CLUSTER_PI_WRITEBACK_MAX || !wb_background() || wb_shared == NULL
 		|| MyProcPid <= 0)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!wb_recovered_open_for_online_job())
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	if (wb_active != NULL)
 		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
 	m.verb = CLUSTER_PI_WRITEBACK_NOTIFY;
@@ -1157,6 +1167,8 @@ cluster_pi_writeback_structural_begin_v2(const ClusterPageStructuralReceiptV2 *c
 		|| count > CLUSTER_PI_WRITEBACK_MAX || !wb_background() || wb_shared == NULL
 		|| MyProcPid <= 0)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!wb_recovered_open_for_online_job())
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	if (wb_active != NULL)
 		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
 	m.verb = CLUSTER_PI_WRITEBACK_NOTIFY;
@@ -1202,6 +1214,8 @@ cluster_pi_writeback_structure_offer_begin_v2(uint32 slot, uint64 serial,
 	if (peer == NULL || out == NULL || *out != NULL || !wb_background() || wb_shared == NULL
 		|| MyProcPid <= 0 || serial == 0 || slot == UINT32_MAX)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!wb_recovered_open_for_online_job())
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	if (wb_active != NULL)
 		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
 	m.verb = CLUSTER_PI_WRITEBACK_NOTIFY;
