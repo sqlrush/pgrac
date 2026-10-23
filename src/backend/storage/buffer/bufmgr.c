@@ -9554,6 +9554,15 @@ FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	bool		first_observed = false;
 	uint64		written_token = 0;
 
+	/* An existing-other start keeps ordinary dirty-buffer flushes closed until
+	 * the recovered semantic OPEN cut is observed. Recovery-owned flushes use
+	 * the explicit batch below and remain on their original authority path. */
+	if (recovery == NULL && cluster_enabled && cluster_shared_config && !RecoveryInProgress()
+		&& MyBackendType != B_STARTUP
+		&& cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& !cluster_semantic_activation_recovered_open_current())
+		return;
+
 	/* The original pin makes the type stable. CR bytes have no DATA writer,
 	 * including while PCM is inactive or a caller bypasses the shared path. */
 	if (buf->buffer_type == BUF_TYPE_CR)

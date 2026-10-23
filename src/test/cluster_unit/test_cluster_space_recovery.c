@@ -30,6 +30,7 @@
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_wal_tail.h"
@@ -59,6 +60,7 @@ int NBuffers = 2, NLocBuffer;
 char *BufferBlocks;
 Block *LocalBufferBlockPointers;
 bool cluster_enabled = true, cluster_shared_config = true;
+BackendType MyBackendType = B_BG_WRITER;
 static BufferDescPadded descriptors[2];
 BufferDescPadded *BufferDescriptors = descriptors;
 static PGAlignedBlock pages[2];
@@ -89,6 +91,20 @@ static bool hw_held, permitted, stale, exists, corrupt_disk, structural, wrong_c
 static bool creating;
 static FILE *main_file;
 static bool main_exists, stale_after_main_create, stale_after_main_sync, hide_main_after_sync;
+static ClusterNormalStartState flush_start_state = CLUSTER_NORMAL_START_UNCLASSIFIED;
+static bool flush_recovered_open;
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return flush_start_state;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return flush_recovered_open;
+}
 static unsigned main_creates, main_syncs, create_source_syncs;
 static unsigned create_namespace_syncs[2];
 static int fail_create_namespace, stale_create_namespace;
@@ -938,6 +954,9 @@ static void
 reset(void)
 {
 	MyAuxProcType = NotAnAuxProcess;
+	MyBackendType = B_BG_WRITER;
+	flush_start_state = CLUSTER_NORMAL_START_UNCLASSIFIED;
+	flush_recovered_open = false;
 	recovery = cold_current = true;
 	cold_window = merge_claim = true;
 	cold_truncates = 0;
@@ -1343,6 +1362,27 @@ UT_TEST(test_ordinary_native_flush_keeps_local_wal)
 	UT_ASSERT_EQ(wal_flushes, 1);
 	UT_ASSERT_EQ(writes, 1);
 	UT_ASSERT_EQ(io_aborts, 0);
+}
+
+UT_TEST(test_existing_other_flush_waits_for_recovered_open)
+{
+	uint32 before_state;
+
+	reset();
+	recovery = false;
+	flush_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	flush_recovered_open = false;
+	pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_DIRTY);
+	before_state = pg_atomic_read_u32(&descriptors[1].bufferdesc.state);
+	FlushBufferWithRecovery(&descriptors[1].bufferdesc, &relation, IOOBJECT_RELATION,
+							IOCONTEXT_NORMAL, NULL, NULL, NULL, NULL);
+	UT_ASSERT_EQ(writes, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&descriptors[1].bufferdesc.state), before_state);
+	flush_recovered_open = true;
+	FlushBufferWithRecovery(&descriptors[1].bufferdesc, &relation, IOOBJECT_RELATION,
+							IOCONTEXT_NORMAL, NULL, NULL, NULL, NULL);
+	UT_ASSERT_EQ(writes, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&descriptors[1].bufferdesc.state) & BM_DIRTY, 0);
 }
 
 UT_TEST(test_cold_violation_blocks_native_write_even_for_already_dirty_page)
@@ -4387,7 +4427,7 @@ UT_TEST(test_cold_abort_preflight_io_error_unwinds_original_owner_for_retry)
 int
 main(void)
 {
-	UT_PLAN(101);
+	UT_PLAN(102);
 	UT_RUN(test_cold_final_abort_binds_original_input_before_result_check);
 	UT_RUN(test_cold_final_abort_accepts_actual_per_source_capture);
 	UT_RUN(test_cold_final_per_source_capture_keeps_complete_owner_and_exact_cut);
@@ -4487,6 +4527,7 @@ main(void)
 	UT_RUN(test_error_releases_original_resources);
 	UT_RUN(test_native_flush_wait_and_stale_source_unwind);
 	UT_RUN(test_ordinary_native_flush_keeps_local_wal);
+	UT_RUN(test_existing_other_flush_waits_for_recovered_open);
 	UT_RUN(test_reject_unrelated_resource_owner);
 	UT_RUN(test_physical_checksum_is_strict);
 	if (file)
