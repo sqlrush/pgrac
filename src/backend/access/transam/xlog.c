@@ -6811,6 +6811,8 @@ cluster_cold_recovery_consume_loser_inputs_v1(
 	typed = ClusterColdRecoveryTxInputs(start);
 	if (typed == NULL || typed->top_tx_census == NULL)
 		return false;
+	if (!cluster_recovery_tx_result_begin_v1(start))
+		return false;
 
 	for (uint32 i = 0; i < typed->top_tx_census->count; i++)
 	{
@@ -6838,8 +6840,11 @@ cluster_cold_recovery_consume_loser_inputs_v1(
 
 		/* A retained ACTIVE without an independent loser proof stays
 		 * unresolved; it must not be promoted by this consumer. */
-		if (!entry->loser_proven)
+		if (!entry->loser_proven) {
+			if (!cluster_recovery_tx_result_step_v1(start, i))
+				return false;
 			continue;
+		}
 		/* A physical loser is necessary but not sufficient: the consumer
 		 * accepts only the complete independently retained TopTxProof for
 		 * this exact old-ACTIVE entry before preparing its C0 execution. */
@@ -6893,8 +6898,12 @@ cluster_cold_recovery_consume_loser_inputs_v1(
 		cluster_wal_inputs_release_v1(&inputs);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return false;
+		/* Record only the original owner's successful complete operation,
+		 * after target close and both original guards have been released. */
+		if (!cluster_recovery_tx_result_step_v1(start, i))
+			return false;
 	}
-	return true;
+	return cluster_recovery_tx_result_finish_v1(start);
 }
 
 #endif

@@ -50,6 +50,7 @@
 #include "cluster/cluster_clean_leave.h"
 #include "miscadmin.h"
 #include "cluster/cluster_control_root.h" /* RF-ROOT P7 G1b step 4: canonical verdict source */
+#include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_worker.h" /* pool lives in this wrapper (spec-4.4 D5) */
 #include "cluster/cluster_scn.h"
@@ -72,6 +73,7 @@ typedef struct ClusterRecoveryCheckpointSlotV1 {
 	bool valid;
 	uint64 generation;
 	ClusterRecoveryCheckpointOwnerV1 owner;
+	ClusterRecoveryTxResultValueV1 tx_result;
 } ClusterRecoveryCheckpointSlotV1;
 
 typedef struct ClusterRecoveryPlanShmem {
@@ -586,6 +588,7 @@ cluster_recovery_checkpoint_revoke_v1(const struct ClusterRecoveryStartV1 *start
 								 sizeof(slot->owner)) == 0) {
 			slot->valid = false;
 			memset(&slot->owner, 0, sizeof(slot->owner));
+			memset(&slot->tx_result, 0, sizeof(slot->tx_result));
 		}
 		SpinLockRelease(&slot->lock);
 	}
@@ -609,6 +612,7 @@ cluster_recovery_checkpoint_register_v1(const struct ClusterRecoveryStartV1 *sta
 	if (!slot->valid && slot->generation != PG_UINT64_MAX) {
 		slot->generation++;
 		slot->owner = owner;
+		memset(&slot->tx_result, 0, sizeof(slot->tx_result));
 		slot->valid = true;
 		published = true;
 	}
@@ -651,6 +655,97 @@ cluster_recovery_checkpoint_handoff_v1(const struct ClusterRecoveryStartV1 *star
 	checkpoint_registered_start = NULL;
 	memset(&checkpoint_registered_owner, 0, sizeof(checkpoint_registered_owner));
 	return true;
+}
+
+typedef enum RecoveryTxResultAction {
+	RECOVERY_TX_RESULT_BEGIN,
+	RECOVERY_TX_RESULT_STEP,
+	RECOVERY_TX_RESULT_FINISH
+} RecoveryTxResultAction;
+
+static bool
+recovery_tx_result_update(const struct ClusterRecoveryStartV1 *start, uint32 ordinal,
+						 RecoveryTxResultAction action)
+{
+	ClusterRecoveryCheckpointSlotV1 *slot;
+	ClusterRecoveryCheckpointOwnerV1 owner;
+	ClusterRecoveryTxResultValueV1 *result;
+	const ClusterColdTypedV1 *typed;
+	uint8 zero[32] = {0};
+	bool proven = false, ok = false;
+
+	if (start == NULL || start != checkpoint_registered_start
+		|| cluster_recovery_plan_shmem == NULL
+		|| !ClusterColdRecoveryTxCheckpointOwnerV1(start, &owner)
+		|| memcmp(&owner, &checkpoint_registered_owner, sizeof(owner)) != 0)
+		return false;
+	typed = ClusterColdRecoveryTxInputs(start);
+	if (typed == NULL || typed->top_tx_census == NULL || !typed->census_root_captured
+		|| typed->census_root.system_identifier != owner.writer.ref.claim.identity.system_identifier
+		|| memcmp(typed->census_root.image_sha256, zero, sizeof(zero)) == 0)
+		return false;
+	if (action == RECOVERY_TX_RESULT_STEP) {
+		if (ordinal >= typed->top_tx_census->count)
+			return false;
+		proven = typed->top_tx_census->entries[ordinal].loser_proven;
+	}
+	slot = &cluster_recovery_plan_shmem->checkpoint_owner;
+	SpinLockAcquire(&slot->lock);
+	result = &slot->tx_result;
+	if (!slot->valid || memcmp(&slot->owner, &owner, sizeof(owner)) != 0)
+		goto done;
+	if (action == RECOVERY_TX_RESULT_BEGIN && result->state == CLUSTER_RECOVERY_TX_RESULT_EMPTY) {
+		result->result_generation = 1;
+		result->subject_count = typed->top_tx_census->count;
+		result->state = CLUSTER_RECOVERY_TX_RESULT_PENDING;
+		memcpy(result->input_root_sha256, typed->census_root.image_sha256, 32);
+		ok = true;
+		goto done;
+	}
+	if (result->state != CLUSTER_RECOVERY_TX_RESULT_PENDING
+		|| result->subject_count != typed->top_tx_census->count
+		|| memcmp(result->input_root_sha256, typed->census_root.image_sha256, 32) != 0
+		|| result->result_generation != (uint64) result->processed_count + 1)
+		goto done;
+	if (action == RECOVERY_TX_RESULT_BEGIN) {
+		/* A pre-execution refusal may retry without erasing any result. */
+		ok = result->processed_count == 0;
+	} else if (action == RECOVERY_TX_RESULT_STEP && ordinal == result->processed_count) {
+		result->processed_count++;
+		if (proven)
+			result->completed_count++;
+		else
+			result->unresolved_count++;
+		result->result_generation++;
+		ok = true;
+	} else if (action == RECOVERY_TX_RESULT_FINISH
+			   && result->processed_count == result->subject_count) {
+		if (result->unresolved_count == 0)
+			result->state = CLUSTER_RECOVERY_TX_RESULT_COMPLETE;
+		result->result_generation++;
+		ok = true;
+	}
+done:
+	SpinLockRelease(&slot->lock);
+	return ok;
+}
+
+bool
+cluster_recovery_tx_result_begin_v1(const struct ClusterRecoveryStartV1 *start)
+{
+	return recovery_tx_result_update(start, 0, RECOVERY_TX_RESULT_BEGIN);
+}
+
+bool
+cluster_recovery_tx_result_step_v1(const struct ClusterRecoveryStartV1 *start, uint32 ordinal)
+{
+	return recovery_tx_result_update(start, ordinal, RECOVERY_TX_RESULT_STEP);
+}
+
+bool
+cluster_recovery_tx_result_finish_v1(const struct ClusterRecoveryStartV1 *start)
+{
+	return recovery_tx_result_update(start, 0, RECOVERY_TX_RESULT_FINISH);
 }
 
 static void
@@ -742,6 +837,40 @@ cluster_recovery_checkpoint_observe_v1(ClusterRecoveryCheckpointObservationV1 *o
 		|| cluster_epoch_get_current() != observed.owner.writer.epoch)
 		return false;
 	*out = observed;
+	return true;
+}
+
+bool
+cluster_recovery_tx_result_observe_v1(ClusterRecoveryTxResultObservationV1 *out)
+{
+	ClusterRecoveryCheckpointObservationV1 before, after;
+	ClusterRecoveryTxResultValueV1 result;
+	ClusterRecoveryCheckpointSlotV1 *slot;
+	bool same;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || !cluster_recovery_checkpoint_observe_v1(&before))
+		return false;
+	slot = &cluster_recovery_plan_shmem->checkpoint_owner;
+	SpinLockAcquire(&slot->lock);
+	same = slot->valid && slot->generation == before.slot_generation
+		&& memcmp(&slot->owner, &before.owner, sizeof(slot->owner)) == 0;
+	result = slot->tx_result;
+	SpinLockRelease(&slot->lock);
+	if (!same || result.state == CLUSTER_RECOVERY_TX_RESULT_EMPTY
+		|| result.result_generation == 0 || !cluster_recovery_checkpoint_observe_v1(&after)
+		|| memcmp(&before, &after, sizeof(before)) != 0)
+		return false;
+	SpinLockAcquire(&slot->lock);
+	same = slot->valid && slot->generation == before.slot_generation
+		&& memcmp(&slot->owner, &before.owner, sizeof(slot->owner)) == 0
+		&& memcmp(&slot->tx_result, &result, sizeof(result)) == 0;
+	SpinLockRelease(&slot->lock);
+	if (!same)
+		return false;
+	out->checkpoint = after;
+	out->result = result;
 	return true;
 }
 

@@ -268,6 +268,32 @@ typedef struct ClusterRecoveryCheckpointObservationV1 {
 	ClusterRecoveryCheckpointOwnerV1 owner;
 } ClusterRecoveryCheckpointObservationV1;
 
+/* TX component only in the original local Startup duty. This is not
+ * SERVICE_READY, checkpoint permission or a whole-recovery certificate. */
+typedef enum ClusterRecoveryTxResultStateV1 {
+	CLUSTER_RECOVERY_TX_RESULT_EMPTY = 0,
+	CLUSTER_RECOVERY_TX_RESULT_PENDING,
+	CLUSTER_RECOVERY_TX_RESULT_COMPLETE
+} ClusterRecoveryTxResultStateV1;
+
+/* Slot-owned value survives successful private-input release.  The generation
+ * advances for begin, each original census ordinal and finish; unresolved
+ * ACTIVE subjects retain PENDING even after every ordinal was visited. */
+typedef struct ClusterRecoveryTxResultValueV1 {
+	uint64 result_generation;
+	uint32 subject_count;
+	uint32 processed_count;
+	uint32 completed_count;
+	uint32 unresolved_count;
+	ClusterRecoveryTxResultStateV1 state;
+	uint8 input_root_sha256[32];
+} ClusterRecoveryTxResultValueV1;
+
+typedef struct ClusterRecoveryTxResultObservationV1 {
+	ClusterRecoveryCheckpointObservationV1 checkpoint;
+	ClusterRecoveryTxResultValueV1 result;
+} ClusterRecoveryTxResultObservationV1;
+
 /* LMON-only read of the original recovered INSTALL/native-DONE input.
  * Consumers must retain and revalidate the complete value across I/O; this
  * does not prove another member's INSTALL or any service completion. */
@@ -280,6 +306,14 @@ extern bool cluster_recovery_checkpoint_register_v1(const struct ClusterRecovery
  * checkpoint observation. It is neither service completion nor OPEN proof. */
 extern bool cluster_recovery_checkpoint_handoff_v1(const struct ClusterRecoveryStartV1 *start);
 extern void cluster_recovery_checkpoint_revoke_v1(const struct ClusterRecoveryStartV1 *start);
+/* Only the original Startup C0 loop records these ordinal results, after
+ * its existing write/projection/close succeeds. Unproven ACTIVE is pending. */
+extern bool cluster_recovery_tx_result_begin_v1(const struct ClusterRecoveryStartV1 *start);
+extern bool cluster_recovery_tx_result_step_v1(const struct ClusterRecoveryStartV1 *start,
+											uint32 ordinal);
+extern bool cluster_recovery_tx_result_finish_v1(const struct ClusterRecoveryStartV1 *start);
+/* LMON-only value snapshot, including pending results; no service grant. */
+extern bool cluster_recovery_tx_result_observe_v1(ClusterRecoveryTxResultObservationV1 *out);
 /* Checkpointer-only, process-local opaque stable read; no I/O or write grant.
  * The original publisher must still prove ROOT/common/service and all normal
  * writer, membership, fence, durability and release conditions. */
