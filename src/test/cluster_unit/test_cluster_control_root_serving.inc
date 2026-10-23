@@ -230,8 +230,14 @@ UT_TEST(test_serving_local_advanced_checkpoint_requires_original_recovered_owner
 		serving_recovery_fixture(before, &root, state);
 		if (ut_current_failed)
 			return;
+		/* This publisher creates the serving proof consumed by recovered OPEN. */
+		test_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+		test_normal_start_state_override = true;
+		test_recovered_open = false;
 		UT_ASSERT_EQ(cluster_control_root_v3_serving_poll(&serving_open, serving_descriptor, &token),
 					 0);
+		test_recovered_open = true;
+		test_normal_start_state_override = false;
 		path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
 		read_all_or_abort(path, after, sizeof(after));
 		UT_ASSERT_EQ(cluster_control_root_v3_decode(after, sizeof(after), v2_storage, TEST_SYSID,

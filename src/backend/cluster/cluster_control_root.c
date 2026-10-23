@@ -4907,9 +4907,8 @@ serving_recovery_owner_current(const ServingCut *cut)
 
 	if (cut == NULL)
 		return false;
-	if (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
-		&& !cluster_semantic_activation_recovered_open_current())
-		return false;
+	/* This publisher creates the serving ROOT. Requiring its downstream
+	 * recovered-OPEN completion here would make the handoff circular. */
 	if (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
 		&& !cut->recovery_owner_valid)
 		return false;

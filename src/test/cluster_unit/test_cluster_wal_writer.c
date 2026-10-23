@@ -1094,16 +1094,23 @@ UT_TEST(test_recovered_writer_requires_selected_input_and_installed_same_epoch)
 	UT_ASSERT_NE(cluster_wal_writer_check(&writer), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 }
 
-UT_TEST(test_online_writer_requires_recovered_semantic_open)
+UT_TEST(test_physical_writer_precedes_semantic_open)
 {
-	fixture();
-	test_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
-	test_recovered_open = false;
-	UT_ASSERT_EQ(cluster_wal_writer_check(&writer), CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
-	test_recovered_open = true;
-	UT_ASSERT_EQ(cluster_wal_writer_check(&writer), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	const BackendType roles[] = { B_LMON, B_CHECKPOINTER, B_BACKEND };
+	for (unsigned role = 0; role < lengthof(roles); role++) {
+		test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+		fixture();
+		MyBackendType = roles[role];
+		test_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+		test_recovered_open = false;
+		/* Control/checkpoint owners must produce the eventual OPEN proof.
+		 * A physical writer token is not user or DATA admission. */
+		UT_ASSERT_EQ(cluster_wal_writer_check(&writer), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		writer.ref.claim.identity.origin_owner_incarnation++;
+		UT_ASSERT_NE(cluster_wal_writer_check(&writer), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	}
 	test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
-	test_recovered_open = false;
+	fixture();
 }
 
 UT_TEST(test_initialized_writer_keeps_runtime_fence_and_exact_owner_refusals)
@@ -1462,7 +1469,7 @@ main(void)
 	UT_RUN(test_clean_writer_requires_selected_exit_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_requires_selected_input_and_installed_same_epoch);
 	UT_RUN(test_recovered_writer_requires_selected_input_and_installed_same_epoch);
-	UT_RUN(test_online_writer_requires_recovered_semantic_open);
+	UT_RUN(test_physical_writer_precedes_semantic_open);
 	UT_RUN(test_initialized_writer_keeps_runtime_fence_and_exact_owner_refusals);
 	UT_RUN(test_requested_background_cut_actively_flushes_fixed_end);
 	UT_RUN(test_requested_flush_rejects_foreign_or_unsafe_context_without_io);

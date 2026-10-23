@@ -21,6 +21,14 @@ static unsigned startup_release_calls;
 static bool startup_cf_ok, startup_hw_ok;
 static int startup_fatal_level;
 
+bool
+cluster_recovery_tx_result_wait_v1(const struct ClusterRecoveryStartV1 *start)
+{
+	/* These normal-start fixtures have no retained cold TX input. Match the
+	 * production NULL case, and refuse any unmodelled retained handoff. */
+	return start == NULL;
+}
+
 void
 cluster_tt_slot_capture_startup_checkpoint(SCN scn, FullTransactionId xid)
 {
