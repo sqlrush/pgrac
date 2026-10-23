@@ -21,6 +21,12 @@ extern bool cluster_heap_freeze_policy_v1(TransactionId ceiling, TransactionId f
 										  int table_age, TransactionId *freeze_limit,
 										  bool *aggressive);
 
+/* Same policy and single legal-next sample, retaining the exact FullXid
+ * result instead of projecting away its epoch. Both outputs are unchanged
+ * on refusal. This is a conservative policy observation, not F/H admission. */
+extern bool cluster_heap_freeze_policy_full_v1(TransactionId ceiling, TransactionId frozen,
+	int min_age, int table_age, FullTransactionId *freeze_limit, bool *aggressive);
+
 /*
  * Frozen 2.14 M1 waterline report.  The wire image is deliberately encoded
  * field-by-field in little-endian order; sizeof(ClusterHeapFreezeReportV2)

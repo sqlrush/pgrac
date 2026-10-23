@@ -17,6 +17,7 @@
 #include "access/htup.h"
 #include "access/genam.h"
 #include "access/parallel.h"
+#include "access/transam.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_type.h"
@@ -278,6 +279,11 @@ struct VacuumCutoffs
 	 */
 	TransactionId FreezeLimit;
 	MultiXactId MultiXactCutoff;
+#ifdef USE_PGRAC_CLUSTER
+	/* Same-sample shared policy cutoff, or Invalid when unavailable/native.
+	 * Retains epoch only; this is not positive F/H or row-freeze authority. */
+	FullTransactionId SharedFreezeLimitFull;
+#endif
 };
 
 /*

@@ -251,8 +251,8 @@ cluster_heap_freeze_cutoff_v1(TransactionId proposed, TransactionId *out)
  * neither observation is a terminal or freeze certificate.
  */
 bool
-cluster_heap_freeze_policy_v1(TransactionId ceiling, TransactionId frozen, int min_age,
-							  int table_age, TransactionId *freeze_limit, bool *aggressive)
+cluster_heap_freeze_policy_full_v1(TransactionId ceiling, TransactionId frozen,
+	int min_age, int table_age, FullTransactionId *freeze_limit, bool *aggressive)
 {
 	ClusterXidStripeSampleFence fence;
 	ClusterHeapFreezeWatermark watermark;
@@ -306,7 +306,24 @@ cluster_heap_freeze_policy_v1(TransactionId ceiling, TransactionId frozen, int m
 	if (candidate < FirstNormalTransactionId || !TransactionIdIsNormal((TransactionId)candidate)
 		|| candidate > next || next - candidate >= UINT64CONST(0x80000000))
 		return false;
-	*freeze_limit = (TransactionId)candidate;
+	*freeze_limit = FullTransactionIdFromU64(candidate);
 	*aggressive = next - oldest >= (uint64)table_age;
+	return true;
+}
+
+/* The raw compatibility entry projects only a successfully checked FullXid;
+ * it shares the computation and never takes a second legal-next sample. */
+bool
+cluster_heap_freeze_policy_v1(TransactionId ceiling, TransactionId frozen, int min_age,
+	int table_age, TransactionId *freeze_limit, bool *aggressive)
+{
+	FullTransactionId full;
+	bool scan;
+
+	if (freeze_limit == NULL || aggressive == NULL
+		|| !cluster_heap_freeze_policy_full_v1(ceiling, frozen, min_age, table_age, &full, &scan))
+		return false;
+	*freeze_limit = XidFromFullTransactionId(full);
+	*aggressive = scan;
 	return true;
 }

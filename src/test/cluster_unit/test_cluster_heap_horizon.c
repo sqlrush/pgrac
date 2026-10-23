@@ -48,6 +48,116 @@ setup_horizon(void)
 
 #include "test_cluster_heap_horizon_vacuum_fixture.inc"
 
+UT_TEST(full_policy_retains_the_sampled_legal_epoch)
+{
+	for (uint32 epoch = 1; epoch <= 2; epoch++) {
+		FullTransactionId cutoff = fxid(9, 42);
+		bool aggressive = true;
+
+		setup_age();
+		stub_next_full = age_cache.nextXid = fxid(epoch, 100);
+		age_future = fxid(epoch, 1000);
+		UT_ASSERT(cluster_heap_freeze_policy_full_v1(80, 10, 180, 100000,
+			&cutoff, &aggressive));
+		UT_ASSERT(FullTransactionIdEquals(cutoff, fxid(epoch, 80)));
+		UT_ASSERT(!aggressive);
+		UT_ASSERT_EQ(age_sample_reads, 1);
+		UT_ASSERT_EQ(age_watermark_reads, 1);
+		UT_ASSERT_EQ(age_fence_reads, 1);
+		UT_ASSERT_EQ(age_lock_acquires, age_lock_releases);
+		UT_ASSERT(!age_xid_lock);
+	}
+}
+
+UT_TEST(full_policy_keeps_prior_epoch_floor_and_raw_wrapper_compatibility)
+{
+	FullTransactionId cutoff;
+	TransactionId raw = 0;
+	bool aggressive, raw_aggressive;
+
+	setup_age();
+	stub_next_full = age_cache.nextXid = fxid(2, 100);
+	age_future = fxid(2, 1000);
+	age_watermark_ready = true;
+	age_watermark.active_full_xid_min = U64FromFullTransactionId(fxid(1, UINT32_MAX - 20));
+	UT_ASSERT(cluster_heap_freeze_policy_full_v1(80, 10, 180, 100000, &cutoff, &aggressive));
+	UT_ASSERT(FullTransactionIdEquals(cutoff, fxid(1, UINT32_MAX - 20)));
+	UT_ASSERT(cluster_heap_freeze_policy_v1(80, 10, 180, 100000, &raw, &raw_aggressive));
+	UT_ASSERT_EQ(raw, XidFromFullTransactionId(cutoff));
+	UT_ASSERT_EQ(raw_aggressive, aggressive);
+	UT_ASSERT_EQ(age_sample_reads, 2);
+}
+
+UT_TEST(full_policy_refusal_preserves_both_outputs)
+{
+	for (int variant = 0; variant < 8; variant++) {
+		FullTransactionId cutoff = fxid(9, 42);
+		bool aggressive = true;
+
+		setup_age();
+		if (variant == 0) age_promise_ready = false;
+		if (variant == 1) age_revoke_on_release = true;
+		if (variant == 2) age_revoke_on_watermark = true;
+		if (variant == 3) {
+			stub_next_full = age_cache.nextXid = fxid(1, 100);
+			age_future = fxid(1, 1000);
+			age_watermark_ready = true;
+			age_watermark.active_full_xid_min = FirstNormalTransactionId;
+		}
+		UT_ASSERT(!cluster_heap_freeze_policy_full_v1(variant == 4 ? 0 : 80,
+			variant == 5 ? 0 : 10, variant == 6 ? -1 : 180,
+			variant == 7 ? -1 : 100000, &cutoff, &aggressive));
+		UT_ASSERT(FullTransactionIdEquals(cutoff, fxid(9, 42)));
+		UT_ASSERT(aggressive);
+		UT_ASSERT_EQ(age_lock_acquires, age_lock_releases);
+	}
+	{
+		FullTransactionId cutoff = fxid(9, 42);
+		bool aggressive = true;
+		setup_age();
+		UT_ASSERT(!cluster_heap_freeze_policy_full_v1(80, 10, 180, 100000, NULL, &aggressive));
+		UT_ASSERT(!cluster_heap_freeze_policy_full_v1(80, 10, 180, 100000, &cutoff, NULL));
+		UT_ASSERT(FullTransactionIdEquals(cutoff, fxid(9, 42)) && aggressive);
+		UT_ASSERT_EQ(age_sample_reads, 0);
+	}
+}
+
+UT_TEST(real_vacuum_retains_full_policy_before_both_scan_exits)
+{
+	for (int variant = 0; variant < 2; variant++) {
+		struct VacuumCutoffs cutoffs;
+		setup_age();
+		stub_next_full = age_cache.nextXid = fxid(2, 100);
+		activation_floor = U64FromFullTransactionId(fxid(2, 100));
+		age_future = fxid(2, 1000);
+		cutoffs.SharedFreezeLimitFull = fxid(9, 42);
+		UT_ASSERT_EQ(vacuum_policy_scan(10, 180, variant == 0 ? 100000 : 1,
+			RELPERSISTENCE_PERMANENT, 90, &cutoffs), variant != 0);
+		UT_ASSERT(FullTransactionIdEquals(cutoffs.SharedFreezeLimitFull, fxid(2, 80)));
+		UT_ASSERT_EQ(cutoffs.FreezeLimit, 80);
+		UT_ASSERT_EQ(cutoffs.MultiXactCutoff, 42);
+		UT_ASSERT_EQ(age_sample_reads, 1);
+		UT_ASSERT_EQ(age_watermark_reads, 1);
+	}
+}
+
+UT_TEST(real_vacuum_discards_previous_full_policy_on_refusal_or_nontarget)
+{
+	for (int variant = 0; variant < 5; variant++) {
+		struct VacuumCutoffs cutoffs;
+		setup_age();
+		cutoffs.SharedFreezeLimitFull = fxid(9, 42);
+		if (variant == 0) age_promise_ready = false;
+		if (variant == 1) age_revoke_on_release = true;
+		if (variant == 2) age_revoke_on_watermark = true;
+		if (variant == 3) cluster_shared_config = false;
+		(void) vacuum_policy_scan(10, 180, 100000,
+			variant == 4 ? RELPERSISTENCE_TEMP : RELPERSISTENCE_PERMANENT, 90, &cutoffs);
+		UT_ASSERT(!FullTransactionIdIsValid(cutoffs.SharedFreezeLimitFull));
+		UT_ASSERT_EQ(age_sample_reads, variant >= 3 ? 0 : 1);
+	}
+}
+
 UT_TEST(published_watermark_caps_existing_vacuum_limit)
 {
 	struct VacuumCutoffs cutoffs;
@@ -686,7 +796,12 @@ UT_TEST(freeze_report_v2_decode_rejects_invalid_payload)
 int
 main(void)
 {
-	UT_PLAN(38);
+	UT_PLAN(43);
+	UT_RUN(full_policy_retains_the_sampled_legal_epoch);
+	UT_RUN(full_policy_keeps_prior_epoch_floor_and_raw_wrapper_compatibility);
+	UT_RUN(full_policy_refusal_preserves_both_outputs);
+	UT_RUN(real_vacuum_retains_full_policy_before_both_scan_exits);
+	UT_RUN(real_vacuum_discards_previous_full_policy_on_refusal_or_nontarget);
 	UT_RUN(published_watermark_caps_existing_vacuum_limit);
 	UT_RUN(published_watermark_never_raises_age_or_activation_ceiling);
 	UT_RUN(published_watermark_minimum_uses_full_xid_epoch);

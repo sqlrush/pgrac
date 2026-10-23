@@ -8911,6 +8911,7 @@ test_cluster_heap_horizon_compare.inc: $(top_srcdir)/src/backend/access/transam/
 	mv $@.tmp $@
 
 test_cluster_heap_horizon: test_cluster_heap_horizon.c test_cluster_xid_stripe.c unit_test.h \
+		$(top_srcdir)/src/include/commands/vacuum.h \
 		test_cluster_heap_horizon_create.inc test_cluster_heap_horizon_vacuum.inc \
 		test_cluster_heap_horizon_compare.inc \
 		test_cluster_heap_horizon_vacuum_fixture.inc \
