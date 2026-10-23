@@ -454,6 +454,14 @@ extern bool cluster_recovery_ctrc_bind_graph_node_v2(
 	const ClusterRecoveryCTRCBindReferenceV2 *reference,
 	ClusterRecoveryCTRCGraphNodeV2 *out);
 
+/* Expose one selected native TT-DATA reference as a borrowed kind-1 graph
+ * node. The complete page atom, DATA identity and physical slot coordinates
+ * are rechecked; no graph, owner, terminal/base/floor/issued, durability,
+ * release or live authority is supplied. */
+extern bool cluster_recovery_ctrc_tt_data_reference_graph_node_v2(
+	const ClusterRecoveryCTRCTTDataReferenceV2 *reference,
+	ClusterRecoveryCTRCGraphNodeV2 *out);
+
 /* Expose a complete DATA inventory as borrowed kind-1 graph reference nodes.
  * The shared atom envelope, key lengths/identity bytes and physical slot
  * ordinals are rechecked before publishing the whole fixed descriptor array.

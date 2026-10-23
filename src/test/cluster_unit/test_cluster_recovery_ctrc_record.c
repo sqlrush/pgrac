@@ -4702,6 +4702,42 @@ UT_TEST(data_unaligned_inputs_output_and_aliases)
 	UT_ASSERT(storage[0] == 0xa5 && storage[sizeof(storage) - 1] == 0xa5);
 }
 
+UT_TEST(data_reference_graph_node_is_structural_and_atomic)
+{
+	ClusterRecoveryNamespaceEntry entry;
+	PGAlignedBlock page;
+	ClusterRecoveryCTRCTTDataReferenceV2 reference, saved;
+	ClusterRecoveryCTRCGraphNodeV2 node;
+	uint8 guarded[sizeof(node) + 2];
+
+	UT_ASSERT(data_sample(&entry, &page, 2, 257, 5));
+	data_expected(SYSTEM_ID, 99, &entry, &page, 5, &reference);
+	saved = reference;
+	UT_ASSERT(cluster_recovery_ctrc_tt_data_reference_graph_node_v2(&reference, &node));
+	UT_ASSERT_EQ(node.kind, 1);
+	UT_ASSERT(node.key.data == reference.key);
+	UT_ASSERT_EQ(node.key.length, reference.key_length);
+	UT_ASSERT(node.evidence.data == reference.evidence);
+	UT_ASSERT_EQ(node.evidence.length, reference.evidence_length);
+	UT_ASSERT(memcmp(&reference, &saved, sizeof(reference)) == 0);
+
+	for (unsigned mutation = 0; mutation < 3; mutation++) {
+		ClusterRecoveryCTRCTTDataReferenceV2 copy = saved;
+
+		if (mutation == 0)
+			wal_atom_uint(copy.key + 52 + copy.key_length - 60, 4, 8);
+		else if (mutation == 1)
+			wal_atom_uint(copy.evidence + 16, 1, 2);
+		else
+			copy.evidence[16 + 10] ^= 1;
+		memset(guarded, 0xa5, sizeof(guarded));
+		UT_ASSERT(!cluster_recovery_ctrc_tt_data_reference_graph_node_v2(&copy,
+			(ClusterRecoveryCTRCGraphNodeV2 *)(guarded + 1)));
+		UT_ASSERT(all_zero(guarded + 1, sizeof(guarded) - 2));
+		UT_ASSERT(guarded[0] == 0xa5 && guarded[sizeof(guarded) - 1] == 0xa5);
+	}
+}
+
 /* Independent expected keys use explicit physical positions, not the product
  * inventory or scanner. Shared evidence is the same complete original page. */
 static void
@@ -6006,6 +6042,7 @@ main(void)
 	UT_RUN(data_full_padding_uba_and_unselected_slot_are_evidence);
 	UT_RUN(data_exact_lengths_nulls_and_clearing_bounds);
 	UT_RUN(data_unaligned_inputs_output_and_aliases);
+	UT_RUN(data_reference_graph_node_is_structural_and_atomic);
 	UT_RUN(data_inventory_mixed_statuses_shared_evidence_and_immutable);
 	UT_RUN(data_inventory_all_physical_slots_ignore_summary_and_release);
 	UT_RUN(data_inventory_zero_slots_keep_full_object_evidence);
