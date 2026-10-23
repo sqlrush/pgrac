@@ -9431,6 +9431,47 @@ UT_TEST(test_normal_start_recovered_owner_observation_accepts_exact_binding)
 	UT_ASSERT(normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
 }
 
+UT_TEST(test_recovered_prepare_supplies_service_binding_input)
+{
+	ClusterSemanticActivationRecord open;
+	ClusterSemanticActivationAckTableV1 table;
+	const char *failure;
+
+	ut_normal_start_recovered_owner_setup(&open, &table);
+	/* Use the real producer, rather than the hand-filled consumer payload. */
+	memset(NormalStartCompletion, 0, sizeof(*NormalStartCompletion));
+	pg_atomic_init_u32(&NormalStartCompletion->state, CLUSTER_NORMAL_START_UNCLASSIFIED);
+	UT_ASSERT(cluster_semantic_normal_start_prepare(false, 0, &failure));
+	UT_ASSERT_EQ(cluster_semantic_normal_start_state(), CLUSTER_NORMAL_START_EXISTING_OTHER);
+	UT_ASSERT_EQ(NormalStartCompletion->system_identifier, test_system_identifier);
+	UT_ASSERT_EQ(NormalStartCompletion->node_id, cluster_node_id);
+	UT_ASSERT_EQ(NormalStartCompletion->boot_incarnation, cluster_qvotec_get_self_incarnation());
+	UT_ASSERT_EQ(NormalStartCompletion->epoch, test_current_epoch);
+	UT_ASSERT_EQ(memcmp(NormalStartCompletion->pgrd, test_normal_pgrd_bytes, 512), 0);
+	UT_ASSERT(normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+}
+
+UT_TEST(test_recovered_prepare_requires_original_pgrd)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		ClusterSemanticActivationRecord open;
+		ClusterSemanticActivationAckTableV1 table;
+		const char *failure;
+
+		ut_normal_start_recovered_owner_setup(&open, &table);
+		memset(NormalStartCompletion, 0, sizeof(*NormalStartCompletion));
+		pg_atomic_init_u32(&NormalStartCompletion->state, CLUSTER_NORMAL_START_UNCLASSIFIED);
+		if (fault == 0)
+			test_normal_pgrd_state = CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
+		if (fault == 1)
+			test_pgrd_candidate_state = CLUSTER_UNDO_SMGR_ROOT_MIRROR_ABSENT;
+		if (fault == 2)
+			test_pgrd_candidate[40] ^= 1;
+		UT_ASSERT(!cluster_semantic_normal_start_prepare(false, 0, &failure));
+		UT_ASSERT_EQ(cluster_semantic_normal_start_state(), CLUSTER_NORMAL_START_FAILED);
+	}
+}
+
 UT_TEST(test_normal_start_recovered_owner_observation_fails_closed_without_observation)
 {
 	ClusterSemanticActivationRecord open;
@@ -11587,7 +11628,7 @@ static void test_serving_finish_root(void);
 int
 main(void)
 {
-	UT_PLAN(388);
+	UT_PLAN(396);
 	UT_RUN(test_member_commit_gap_before_all_peer_receipts);
 	UT_RUN(test_member_commit_request_waits_for_real_predecessor_receipts);
 	UT_RUN(test_member_commit_request_rejects_old_or_changed_identity);
@@ -11939,6 +11980,8 @@ main(void)
 	UT_RUN(test_normal_start_incomplete_or_changed_root_is_sticky);
 	UT_RUN(test_normal_start_existing_other_is_not_target_completion);
 	UT_RUN(test_normal_start_recovered_owner_observation_accepts_exact_binding);
+	UT_RUN(test_recovered_prepare_supplies_service_binding_input);
+	UT_RUN(test_recovered_prepare_requires_original_pgrd);
 	UT_RUN(test_normal_start_recovered_owner_observation_fails_closed_without_observation);
 	UT_RUN(test_normal_start_recovered_owner_observation_rejects_foreign_system);
 	UT_RUN(test_normal_start_recovered_owner_observation_rejects_invalid_local_node);

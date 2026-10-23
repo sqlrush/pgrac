@@ -12896,7 +12896,7 @@ cluster_semantic_normal_start_prepare(bool clean, int prepared_count, const char
 		return normal_start_prepare_failed(failure, "NORMAL_START_PGSA_INVALID");
 	/* Unsupported valid records keep their original recovery/cutover contract.
 	 * They cannot borrow this normal completion or the SOURCE-zero exception. */
-	if (!clean || record.phase != CLUSTER_SEMANTIC_PHASE_OPEN
+	if (record.phase != CLUSTER_SEMANTIC_PHASE_OPEN
 		|| record.source_feature_bitmap != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
 		|| record.target_feature_bitmap
 			   != (CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
@@ -12904,19 +12904,23 @@ cluster_semantic_normal_start_prepare(bool clean, int prepared_count, const char
 		|| (!cluster_shared_config && record.transition_epoch != CLUSTER_EPOCH_INITIAL)
 		|| record.record_generation < 6 || record.record_generation == UINT64_MAX
 		|| record.coordinator_node != 0 || record.admitted_members_lo != UINT64_C(15)
-		|| record.admitted_members_hi != 0 || record.rollback_feature_bitmap != 0)
+		|| record.admitted_members_hi != 0 || record.rollback_feature_bitmap != 0
+		|| (!clean && !cluster_shared_config))
 		goto publish;
-	if (prepared_count != 0 || !normal_start_checkpoint_captured || normal_start_checkpoint_invalid)
+	if (clean
+		&& (prepared_count != 0 || !normal_start_checkpoint_captured || normal_start_checkpoint_invalid))
 		return normal_start_prepare_failed(failure, "NORMAL_START_OWN_CHECKPOINT_UNPROVEN");
 	image.node_id = cluster_node_id;
 	image.system_identifier = GetSystemIdentifier();
 	image.boot_incarnation = cluster_qvotec_get_self_incarnation();
 	image.epoch = cluster_shared_config ? cluster_epoch_get_current() : record.transition_epoch;
-	image.own_checkpoint_lsn = normal_start_checkpoint.lsn;
-	image.own_redo_lsn = normal_start_checkpoint.redo;
-	image.own_next_full_xid = normal_start_checkpoint.next_full_xid;
-	image.own_checkpoint_scn = normal_start_checkpoint.scn;
-	if (cluster_shared_config) {
+	if (clean) {
+		image.own_checkpoint_lsn = normal_start_checkpoint.lsn;
+		image.own_redo_lsn = normal_start_checkpoint.redo;
+		image.own_next_full_xid = normal_start_checkpoint.next_full_xid;
+		image.own_checkpoint_scn = normal_start_checkpoint.scn;
+	}
+	if (clean && cluster_shared_config) {
 		ClusterControlRootResult result = cluster_wal_startup_clean_input_v1(&image.clean_input);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 			ereport(LOG, (errmsg("cluster normal startup CLEAN input unavailable"),
@@ -12929,7 +12933,8 @@ cluster_semantic_normal_start_prepare(bool clean, int prepared_count, const char
 		if (!normal_start_clean_input_valid(&image, &record))
 			return normal_start_prepare_failed(failure, "NORMAL_START_CLEAN_BRIDGE_UNPROVEN");
 	}
-	if (!normal_start_identity_current(&image) || !normal_start_closed_snapshot(&before))
+	if (clean
+		&& (!normal_start_identity_current(&image) || !normal_start_closed_snapshot(&before)))
 		return normal_start_prepare_failed(failure, "NORMAL_START_NOT_EXCLUSIVE");
 	if (cluster_qvotec_bootstrap_read_undo_root_descriptor(image.system_identifier, image.pgrd)
 			!= CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
@@ -12941,6 +12946,11 @@ cluster_semantic_normal_start_prepare(bool clean, int prepared_count, const char
 			   != CLUSTER_UNDO_SMGR_ROOT_MIRROR_EXACT
 		|| memcmp(mirror, image.pgrd, sizeof(mirror)) != 0)
 		return normal_start_prepare_failed(failure, "NORMAL_START_PGRD_UNPROVEN");
+	/* Preserve the original inputs for the recovered-owner service consumer.
+	 * This is still EXISTING_OTHER: no CLEAN bridge, resident completion or
+	 * restart binding is manufactured from recovery's prepare step. */
+	if (!clean)
+		goto publish;
 	if (!normal_start_identity_current(&image) || !normal_start_closed_snapshot(&after)
 		|| before.seq != after.seq)
 		return normal_start_prepare_failed(failure, "NORMAL_START_IDENTITY_CHANGED");
