@@ -2570,6 +2570,49 @@ UT_TEST(wal_references_unaligned_alias_and_immutable_inputs)
 	XLogReaderFree(reader);
 }
 
+UT_TEST(wal_reference_graph_nodes_are_structural_and_atomic)
+{
+	NativeRaw wire;
+	NativePages pages;
+	XLogReaderState *reader;
+	ClusterRecoveryCTRCWalReferencesV2 references, saved;
+	ClusterRecoveryCTRCGraphNodeV2 nodes[CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_COUNT];
+	uint8 guarded[sizeof(nodes) + 2];
+	size_t length = native_wire(&wire, golden, sizeof(golden), 0);
+
+	UT_ASSERT(native_read(&pages, &wire, length, false, &reader));
+	UT_ASSERT(cluster_recovery_ctrc_wal_references_v2(reader, 7, raw_source,
+		wire.bytes, length, &references));
+	saved = references;
+	UT_ASSERT(cluster_recovery_ctrc_wal_reference_graph_nodes_v2(&references, nodes));
+	for (unsigned i = 0; i < CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_COUNT; i++) {
+		UT_ASSERT_EQ(nodes[i].kind, 1);
+		UT_ASSERT(nodes[i].key.data == references.keys[i]);
+		UT_ASSERT_EQ(nodes[i].key.length, CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_KEY_BYTES);
+		UT_ASSERT(nodes[i].evidence.data == references.evidence);
+		UT_ASSERT_EQ(nodes[i].evidence.length,
+			CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_EVIDENCE_BYTES);
+	}
+	UT_ASSERT(memcmp(&references, &saved, sizeof(references)) == 0);
+
+	for (unsigned mutation = 0; mutation < 3; mutation++) {
+		ClusterRecoveryCTRCWalReferencesV2 copy = saved;
+
+		if (mutation == 0)
+			wal_atom_uint(copy.keys[1] + 100, 999, 8);
+		else if (mutation == 1)
+			wal_atom_uint(copy.evidence, 2, 8);
+		else
+			copy.evidence[16 + 10] ^= 1;
+		memset(guarded, 0xa5, sizeof(guarded));
+		UT_ASSERT(!cluster_recovery_ctrc_wal_reference_graph_nodes_v2(&copy,
+			(ClusterRecoveryCTRCGraphNodeV2 *)(guarded + 1)));
+		UT_ASSERT(all_zero(guarded + 1, sizeof(guarded) - 2));
+		UT_ASSERT(guarded[0] == 0xa5 && guarded[sizeof(guarded) - 1] == 0xa5);
+	}
+	XLogReaderFree(reader);
+}
+
 /* Controlled allocation leaf only. The graph implementation is the separately
  * compiled production object, with the same sort/hash/traversal in both builds. */
 static unsigned graph_alloc_calls, graph_alloc_live, graph_alloc_fail_at;
@@ -6003,6 +6046,7 @@ main(void)
 	UT_RUN(wal_references_atomic_refusal_and_current_reader);
 	UT_RUN(wal_references_complete_raw_binding);
 	UT_RUN(wal_references_unaligned_alias_and_immutable_inputs);
+	UT_RUN(wal_reference_graph_nodes_are_structural_and_atomic);
 	UT_RUN(bind_canonical_reference);
 	UT_RUN(bind_cross_page_actual_interval);
 	UT_RUN(bind_source_and_root_domains);

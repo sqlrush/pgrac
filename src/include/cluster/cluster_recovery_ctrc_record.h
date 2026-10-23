@@ -454,6 +454,13 @@ extern bool cluster_recovery_ctrc_bind_graph_node_v2(
 	const ClusterRecoveryCTRCBindReferenceV2 *reference,
 	ClusterRecoveryCTRCGraphNodeV2 *out);
 
+/* Expose the three-field native WAL reference inventory as borrowed kind-1
+ * graph nodes. The shared raw atom, subject bytes and physical offsets are
+ * rechecked before whole-array publication; no graph or admission authority. */
+extern bool cluster_recovery_ctrc_wal_reference_graph_nodes_v2(
+	const ClusterRecoveryCTRCWalReferencesV2 *references,
+	ClusterRecoveryCTRCGraphNodeV2 out[CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_COUNT]);
+
 /* Expose one selected native TT-DATA reference as a borrowed kind-1 graph
  * node. The complete page atom, DATA identity and physical slot coordinates
  * are rechecked; no graph, owner, terminal/base/floor/issued, durability,

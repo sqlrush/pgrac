@@ -500,6 +500,56 @@ refused:
 }
 
 bool
+cluster_recovery_ctrc_wal_reference_graph_nodes_v2(
+	const ClusterRecoveryCTRCWalReferencesV2 *references,
+	ClusterRecoveryCTRCGraphNodeV2 out[CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_COUNT])
+{
+	static const uint64 field_offsets[CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_COUNT] = {
+		SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + 116,
+		SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + 128,
+		SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + 160
+	};
+	ClusterRecoveryCTRCGraphNodeV2 nodes[CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_COUNT];
+	const uint8 *atom;
+
+	if (references == NULL || out == NULL
+		|| cluster_undo_tt_ctrc_get_u64_le(references->evidence) != 1
+		|| cluster_undo_tt_ctrc_get_u64_le(references->evidence + 8)
+			!= CLUSTER_RECOVERY_CTRC_WAL_ATOM_BYTES)
+		goto refused;
+	atom = references->evidence + 16;
+	if (cluster_undo_tt_ctrc_get_u16_le(atom) != 1
+		|| cluster_undo_tt_ctrc_get_u64_le(atom + 2) != 56
+		|| cluster_undo_tt_ctrc_get_u32_le(atom + 30)
+			!= CLUSTER_RECOVERY_CTRC_WAL_ATOM_BYTES - 74
+		|| cluster_undo_tt_ctrc_get_u64_le(atom + 66)
+			!= CLUSTER_RECOVERY_CTRC_WAL_ATOM_BYTES - 74)
+		goto refused;
+	for (unsigned i = 0; i < CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_COUNT; i++) {
+		const uint8 *key = references->keys[i];
+
+		if (cluster_undo_tt_ctrc_get_u16_le(key + 34) != 3
+			|| cluster_undo_tt_ctrc_get_u64_le(key + 36) != 56
+			|| memcmp(key + 44, atom + 10, 56) != 0
+			|| cluster_undo_tt_ctrc_get_u64_le(key + 100) != field_offsets[i]
+			|| (i != 0 && memcmp(key, references->keys[0], 100) != 0))
+			goto refused;
+		nodes[i] = (ClusterRecoveryCTRCGraphNodeV2){
+			1,
+			{ references->keys[i], CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_KEY_BYTES },
+			{ references->evidence, CLUSTER_RECOVERY_CTRC_WAL_REFERENCE_EVIDENCE_BYTES }
+		};
+	}
+	memcpy(out, nodes, sizeof(nodes));
+	return true;
+
+refused:
+	if (out != NULL)
+		memset(out, 0, sizeof(nodes));
+	return false;
+}
+
+bool
 cluster_recovery_ctrc_tt_reference_v2(XLogReaderState *reader,
 										uint64 database_incarnation, uint32 source_index,
 										const uint8 source_identity_digest[32],
