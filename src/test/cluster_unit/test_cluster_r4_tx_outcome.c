@@ -39,6 +39,7 @@
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/storage/cluster_undo_buf.h"
+#include "miscadmin.h"
 #include "cluster/cluster_cr.h"
 #include "cluster/cluster_cr_server.h"
 #include "storage/ipc.h"
@@ -61,6 +62,8 @@ UT_DEFINE_GLOBALS();
 #define TEST_TT_OFFSET ((uint16)3)
 
 int cluster_node_id = 0;
+bool cluster_shared_config = false;
+BackendType MyBackendType = B_BACKEND;
 bool cluster_crossnode_runtime_visibility = true;
 TransactionId TransactionXmin = FirstNormalTransactionId;
 volatile sig_atomic_t InterruptPending = false;
@@ -101,6 +104,8 @@ static int test_twophase_calls;
 static TTSlot test_tt_slot;
 static SCN test_commit_scn;
 static uint64 test_formation_epoch;
+static ClusterNormalStartState test_normal_start_state;
+static bool test_recovered_open;
 static XLogRecPtr test_flush_lsn;
 static uint64 test_tt_generation;
 static SCN test_authority_scn;
@@ -440,6 +445,18 @@ cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSi
 	token->side = side;
 	token->entered = true;
 	return CLUSTER_SEMANTIC_ADMISSION_OK;
+}
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return test_normal_start_state;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return test_recovered_open;
 }
 
 void
@@ -1017,6 +1034,10 @@ reset_exact_origin_fixture(void)
 	test_tt_slot.wrap = TEST_ORIGIN_WRAP;
 	test_tt_slot.commit_scn = test_commit_scn;
 	test_formation_epoch = 42;
+	test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+	test_recovered_open = true;
+	cluster_shared_config = false;
+	MyBackendType = B_BACKEND;
 	test_flush_lsn = (XLogRecPtr)UINT64CONST(0x12345678);
 	test_tt_generation = 9;
 	test_authority_scn = scn_encode(0, 100);
@@ -1723,6 +1744,31 @@ UT_TEST(test_ctrc_current_owner_uses_published_binding_across_rollover)
 	UT_ASSERT(!cluster_runtime_visibility_current_owner_lookup_exact_ctrc_full(
 		TEST_ORIGIN_XID, &status_key, &status, &grant, &ctrc_key, &participant));
 	UT_ASSERT_EQ(test_ctrc_touch_calls, 0);
+}
+
+UT_TEST(test_current_owner_lookup_refuses_recovered_drift_before_admission)
+{
+	ClusterTTStatusKey status_key;
+	ClusterTTStatusResult status;
+	ClusterCtrcTxnKeyV1 ctrc_key;
+	ClusterCtrcParticipantIdentity participant;
+	uint32 grant = 0;
+
+	reset_exact_origin_fixture();
+	cluster_shared_config = true;
+	test_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	test_recovered_open = false;
+	test_current_owner_available = true;
+	memset(&status_key, 0xa5, sizeof(status_key));
+	memset(&status, 0xa5, sizeof(status));
+	memset(&ctrc_key, 0xa5, sizeof(ctrc_key));
+	memset(&participant, 0xa5, sizeof(participant));
+
+	UT_ASSERT(!cluster_runtime_visibility_current_owner_lookup_exact_ctrc_full(
+		TEST_ORIGIN_XID, &status_key, &status, &grant, &ctrc_key, &participant));
+	UT_ASSERT_EQ(test_current_owner_calls, 0);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 0);
+	UT_ASSERT_EQ(grant, 0);
 }
 
 UT_TEST(test_current_mx_active_proof_reconstructs_exact_ctrc_identity)
@@ -4526,7 +4572,7 @@ UT_TEST(test_self_fresh_role_does_not_inherit_ordinary_abort_permission)
 int
 main(void)
 {
-	UT_PLAN(135);
+	UT_PLAN(136);
 	UT_RUN(test_local_updater_precommit_retries_only_after_guard_release);
 	UT_RUN(test_local_updater_precommit_release_and_admission_failure_stay_unknown);
 	UT_RUN(test_local_updater_does_not_retry_unproven_samples);
@@ -4584,6 +4630,7 @@ main(void)
 	UT_RUN(test_current_member_target_canonical_active_requires_exact_physical_slot);
 	UT_RUN(test_ctrc_physical_active_sample_excludes_precommit_committed_window);
 	UT_RUN(test_ctrc_current_owner_uses_published_binding_across_rollover);
+	UT_RUN(test_current_owner_lookup_refuses_recovered_drift_before_admission);
 	UT_RUN(test_current_mx_active_proof_reconstructs_exact_ctrc_identity);
 	UT_RUN(test_current_mx_active_proof_uses_origin_binding_without_foreign_storage);
 	UT_RUN(test_current_member_rolled_terminal_uses_locator_then_canonical_scur);

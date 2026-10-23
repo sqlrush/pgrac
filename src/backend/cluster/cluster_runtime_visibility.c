@@ -84,6 +84,7 @@
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/storage/cluster_undo_buf.h"
+#include "miscadmin.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/procarray.h"
@@ -95,6 +96,18 @@ cluster_runtime_visibility_direct_xid_status(TransactionId xid)
 	XLogRecPtr xid_lsn;
 
 	return TransactionIdGetStatus(xid, &xid_lsn);
+}
+
+/* Ordinary visibility must not expose a recovered owner's physical slot
+ * before the durable OPEN proof has been re-observed.  Startup itself owns
+ * cold recovery and remains allowed to sample its private inputs. */
+static bool
+cluster_runtime_visibility_recovered_open_admitted(void)
+{
+	if (MyBackendType == B_STARTUP || !cluster_shared_config
+		|| cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_EXISTING_OTHER)
+		return true;
+	return cluster_semantic_activation_recovered_open_current();
 }
 
 void
@@ -1022,6 +1035,7 @@ cluster_runtime_visibility_current_owner_lookup_internal(
 	if (key_out == NULL || result_out == NULL || cluster_node_id < 0
 		|| cluster_node_id >= CLUSTER_MAX_NODES || (ctrc_required && ctrc_grant_out == NULL)
 		|| cluster_xid_origin_slot(xid) != cluster_node_id
+		|| !cluster_runtime_visibility_recovered_open_admitted()
 		|| cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
 											 CLUSTER_SEMANTIC_TARGET_SIDE, &admission)
 			   != CLUSTER_SEMANTIC_ADMISSION_OK)
@@ -1204,7 +1218,8 @@ cluster_runtime_visibility_local_terminal_lookup_exact(TransactionId xid,
 	MemSet(&locator, 0, sizeof(locator));
 	if (key_out == NULL || result_out == NULL || cluster_node_id < 0
 		|| cluster_node_id >= CLUSTER_MAX_NODES || !TransactionIdIsNormal(xid)
-		|| cluster_xid_origin_slot(xid) != cluster_node_id)
+		|| cluster_xid_origin_slot(xid) != cluster_node_id
+		|| !cluster_runtime_visibility_recovered_open_admitted())
 		return false;
 	epoch = cluster_epoch_get_current();
 	/* Epoch zero is the valid clean-formation epoch.  The exact TARGET
