@@ -908,10 +908,155 @@ UT_TEST(freeze_report_v2_decode_rejects_invalid_payload)
 	assert_freeze_report_v2_equal(&input, &output);
 }
 
+static void
+observed_bounds_fixture(ClusterHeapFreezePolicySampleV1 *policy,
+	ClusterHeapFreezeCohortObservation *cohort, ClusterSemanticAdmissionToken *admission)
+{
+	memset(policy, 0, sizeof(*policy));
+	memset(cohort, 0, sizeof(*cohort));
+	memset(admission, 0, sizeof(*admission));
+	policy->legal_next = FullTransactionIdFromEpochAndXid(2, 1000);
+	policy->freeze_limit = FullTransactionIdFromEpochAndXid(2, 80);
+	cohort->active_full_xid_min = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(2, 60));
+	cohort->future_full_xid_max = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(2, 2000));
+	cohort->horizon_scn = 500;
+	cohort->record_generation = admission->record_generation = 17;
+	cohort->formation_epoch = admission->formation_epoch = 9;
+	cohort->admitted_members_lo = 3;
+	cohort->admission_fence.record_generation = 17;
+	cohort->admission_fence.formation_epoch = 9;
+	cohort->admission_fence.admitted_members_lo = 3;
+	cohort->admission_fence.local_node_id = 0;
+	admission->entered = true;
+}
+
+UT_TEST(observed_bounds_cap_policy_at_same_cohort_and_preserve_h_domain)
+{
+	ClusterHeapFreezePolicySampleV1 policy;
+	ClusterHeapFreezeCohortObservation cohort;
+	ClusterSemanticAdmissionToken admission;
+	ClusterHeapFreezeObservedBoundsV1 out;
+	unsigned before;
+
+	observed_bounds_fixture(&policy, &cohort, &admission);
+	before = activation_reads;
+	UT_ASSERT(cluster_heap_freeze_observed_bounds_v1(&policy, &cohort, &admission, 0, &out));
+	UT_ASSERT_EQ(U64FromFullTransactionId(out.freeze_limit), cohort.active_full_xid_min);
+	UT_ASSERT_EQ(out.horizon_scn, cohort.horizon_scn);
+	cohort.active_full_xid_min = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(2, 90));
+	UT_ASSERT(cluster_heap_freeze_observed_bounds_v1(&policy, &cohort, &admission, 0, &out));
+	UT_ASSERT(FullTransactionIdEquals(out.freeze_limit, policy.freeze_limit));
+	UT_ASSERT_EQ(out.horizon_scn, cohort.horizon_scn);
+	UT_ASSERT_EQ(activation_reads, before);
+}
+
+UT_TEST(observed_bounds_identity_refusal_preserves_complete_output)
+{
+	for (int variant = 0; variant < 15; variant++) {
+		ClusterHeapFreezePolicySampleV1 policy;
+		ClusterHeapFreezeCohortObservation cohort;
+		ClusterSemanticAdmissionToken admission;
+		ClusterHeapFreezeObservedBoundsV1 out, saved;
+		int node = 0;
+		observed_bounds_fixture(&policy, &cohort, &admission);
+		memset(&out, 0x5a, sizeof(out)); saved = out;
+		switch (variant) {
+		case 0: admission.entered = false; break;
+		case 1: admission.record_generation++; break;
+		case 2: admission.formation_epoch++; break;
+		case 3: cohort.admission_fence.record_generation++; break;
+		case 4: cohort.admission_fence.formation_epoch++; break;
+		case 5: cohort.admission_fence.admitted_members_lo ^= 4; break;
+		case 6: cohort.admission_fence.admitted_members_hi = 1; break;
+		case 7: cohort.admission_fence.local_node_id = 1; break;
+		case 8: cohort.admitted_members_lo = cohort.admission_fence.admitted_members_lo = 2; break;
+		case 9: node = -1; break;
+		case 10: node = 128; break;
+		case 11: cohort.local_unqualified_entries = 1; break;
+		case 12: cohort.local_unqualified_entries = UINT64_MAX; break;
+		case 13: cohort.record_generation = admission.record_generation = cohort.admission_fence.record_generation = 0; break;
+		case 14: cohort.formation_epoch = admission.formation_epoch = cohort.admission_fence.formation_epoch = 0; break;
+		}
+		UT_ASSERT(!cluster_heap_freeze_observed_bounds_v1(&policy, &cohort, &admission, node, &out));
+		UT_ASSERT_EQ(memcmp(&out, &saved, sizeof(out)), 0);
+	}
+}
+
+UT_TEST(observed_bounds_policy_window_refusal_is_atomic)
+{
+	for (int variant = 0; variant < 8; variant++) {
+		ClusterHeapFreezePolicySampleV1 policy;
+		ClusterHeapFreezeCohortObservation cohort;
+		ClusterSemanticAdmissionToken admission;
+		ClusterHeapFreezeObservedBoundsV1 out, saved;
+		observed_bounds_fixture(&policy, &cohort, &admission);
+		memset(&out, 0x5a, sizeof(out)); saved = out;
+		switch (variant) {
+		case 0: policy.legal_next = InvalidFullTransactionId; break;
+		case 1: policy.freeze_limit = InvalidFullTransactionId; break;
+		case 2: policy.legal_next = FullTransactionIdFromEpochAndXid(2, FrozenTransactionId); break;
+		case 3: policy.freeze_limit = FullTransactionIdFromEpochAndXid(2, BootstrapTransactionId); break;
+		case 4: policy.legal_next = FullTransactionIdFromU64(UINT64_MAX); break;
+		case 5: policy.freeze_limit = FullTransactionIdFromU64(UINT64_MAX); break;
+		case 6: policy.freeze_limit = FullTransactionIdFromEpochAndXid(2, 1001); break;
+		case 7: policy.legal_next = FullTransactionIdFromU64(U64FromFullTransactionId(policy.freeze_limit) + UINT64CONST(0x80000000)); break;
+		}
+		UT_ASSERT(!cluster_heap_freeze_observed_bounds_v1(&policy, &cohort, &admission, 0, &out));
+		UT_ASSERT_EQ(memcmp(&out, &saved, sizeof(out)), 0);
+	}
+}
+
+UT_TEST(observed_bounds_cohort_refusal_and_nulls_preserve_output)
+{
+	for (int variant = 0; variant < 11; variant++) {
+		ClusterHeapFreezePolicySampleV1 policy;
+		ClusterHeapFreezeCohortObservation cohort;
+		ClusterSemanticAdmissionToken admission;
+		ClusterHeapFreezeObservedBoundsV1 out, saved;
+		observed_bounds_fixture(&policy, &cohort, &admission);
+		memset(&out, 0x5a, sizeof(out)); saved = out;
+		switch (variant) {
+		case 0: cohort.active_full_xid_min = (UINT64CONST(2) << 32) | FrozenTransactionId; break;
+		case 1: cohort.future_full_xid_max = (UINT64CONST(2) << 32) | BootstrapTransactionId; break;
+		case 2: cohort.future_full_xid_max = UINT64_MAX; break;
+		case 3: cohort.active_full_xid_min = cohort.future_full_xid_max + 1; break;
+		case 4: cohort.horizon_scn = 0; break;
+		case 5: cohort.horizon_scn = UINT64_MAX; break;
+		case 6: cohort.active_full_xid_min = UINT64_MAX; break;
+		default: break;
+		}
+		UT_ASSERT(!cluster_heap_freeze_observed_bounds_v1(variant == 7 ? NULL : &policy,
+			variant == 8 ? NULL : &cohort, variant == 9 ? NULL : &admission,
+			0, variant == 10 ? NULL : &out));
+		UT_ASSERT_EQ(memcmp(&out, &saved, sizeof(out)), 0);
+	}
+}
+
+UT_TEST(observed_bounds_keep_fullxid_epoch_and_high_member_bit)
+{
+	ClusterHeapFreezePolicySampleV1 policy;
+	ClusterHeapFreezeCohortObservation cohort;
+	ClusterSemanticAdmissionToken admission;
+	ClusterHeapFreezeObservedBoundsV1 out;
+
+	observed_bounds_fixture(&policy, &cohort, &admission);
+	cohort.active_full_xid_min = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 80));
+	cohort.admitted_members_hi = cohort.admission_fence.admitted_members_hi = UINT64CONST(1) << 63;
+	cohort.admission_fence.local_node_id = 127;
+	UT_ASSERT(cluster_heap_freeze_observed_bounds_v1(&policy, &cohort, &admission, 127, &out));
+	UT_ASSERT_EQ(U64FromFullTransactionId(out.freeze_limit), cohort.active_full_xid_min);
+	UT_ASSERT(!FullTransactionIdEquals(out.freeze_limit, policy.freeze_limit));
+}
+
 int
 main(void)
 {
-	UT_PLAN(47);
+	UT_PLAN(52);
+	UT_RUN(observed_bounds_cap_policy_at_same_cohort_and_preserve_h_domain);
+	UT_RUN(observed_bounds_identity_refusal_preserves_complete_output);
+	UT_RUN(observed_bounds_policy_window_refusal_is_atomic);
+	UT_RUN(observed_bounds_cohort_refusal_and_nulls_preserve_output);
+	UT_RUN(observed_bounds_keep_fullxid_epoch_and_high_member_bit);
 	UT_RUN(policy_sample_retains_original_legal_next_and_allocation_fence);
 	UT_RUN(policy_sample_refusal_preserves_complete_output);
 	UT_RUN(policy_sample_rechecks_original_fence_without_resampling_next);

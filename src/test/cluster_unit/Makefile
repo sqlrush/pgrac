@@ -9610,7 +9610,14 @@ test_cluster_vacuum_proof_unlock_tail.inc: $(top_srcdir)/src/backend/storage/buf
 	     END { print "}"; if (found != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# The actual pure observed policy/cohort boundary, without replacing it by a leaf.
+test_cluster_vacuum_observed_bounds.inc: $(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c Makefile
+	awk '/^cluster_heap_freeze_observed_bounds_v1\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_vacuum_proof_cleanup: test_cluster_vacuum_proof_cleanup.c unit_test.h \
+		test_cluster_vacuum_observed_bounds.inc \
 		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
 		$(top_srcdir)/src/include/commands/vacuum.h \

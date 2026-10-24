@@ -363,3 +363,51 @@ cluster_heap_freeze_policy_sample_current_v1(const ClusterHeapFreezePolicySample
 		return false;
 	return cluster_xid_stripe_sample_fence_current(&sample->allocation_fence);
 }
+
+bool
+cluster_heap_freeze_observed_bounds_v1(
+	const ClusterHeapFreezePolicySampleV1 *policy,
+	const ClusterHeapFreezeCohortObservation *cohort,
+	const ClusterSemanticAdmissionToken *admission, int local_node_id,
+	ClusterHeapFreezeObservedBoundsV1 *out)
+{
+	ClusterHeapFreezeObservedBoundsV1 bounds = { 0 };
+
+	if (policy == NULL || cohort == NULL || admission == NULL || out == NULL
+		|| !admission->entered || admission->record_generation == 0
+		|| admission->formation_epoch == 0 || local_node_id < 0 || local_node_id >= 128
+		|| !FullTransactionIdIsValid(policy->legal_next)
+		|| !FullTransactionIdIsValid(policy->freeze_limit)
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(policy->legal_next))
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(policy->freeze_limit))
+		|| U64FromFullTransactionId(policy->legal_next) == UINT64_MAX
+		|| U64FromFullTransactionId(policy->freeze_limit) == UINT64_MAX
+		|| FullTransactionIdFollows(policy->freeze_limit, policy->legal_next)
+		|| U64FromFullTransactionId(policy->legal_next)
+			- U64FromFullTransactionId(policy->freeze_limit) >= UINT64CONST(0x80000000)
+		|| cohort->record_generation != admission->record_generation
+		|| cohort->formation_epoch != admission->formation_epoch
+		|| cohort->admission_fence.record_generation != cohort->record_generation
+		|| cohort->admission_fence.formation_epoch != cohort->formation_epoch
+		|| cohort->admission_fence.admitted_members_lo != cohort->admitted_members_lo
+		|| cohort->admission_fence.admitted_members_hi != cohort->admitted_members_hi
+		|| cohort->admission_fence.local_node_id != local_node_id
+		|| cohort->local_unqualified_entries != 0
+		|| !SCN_VALID((SCN)cohort->horizon_scn) || cohort->horizon_scn == UINT64_MAX
+		|| !TransactionIdIsNormal((TransactionId)cohort->active_full_xid_min)
+		|| !TransactionIdIsNormal((TransactionId)cohort->future_full_xid_max)
+		|| cohort->future_full_xid_max == UINT64_MAX
+		|| cohort->active_full_xid_min > cohort->future_full_xid_max
+		|| ((local_node_id < 64
+			 ? cohort->admitted_members_lo >> local_node_id
+			 : cohort->admitted_members_hi >> (local_node_id - 64)) & 1) == 0)
+		return false;
+
+	/* F only caps the original policy; H remains in its independent SCN
+	 * domain. Neither numeric match supplies producer-retention authority. */
+	bounds.freeze_limit = FullTransactionIdFromU64(
+		Min(U64FromFullTransactionId(policy->freeze_limit), cohort->active_full_xid_min));
+	bounds.horizon_scn = cohort->horizon_scn;
+	memcpy(out, &bounds, sizeof(bounds));
+	return true;
+}

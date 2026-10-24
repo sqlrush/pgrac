@@ -164,6 +164,22 @@ typedef struct ClusterHeapFreezeCohortObservation {
 	ClusterHeapFreezeCohortPeerObservation source_peers[CLUSTER_MAX_NODES];
 } ClusterHeapFreezeCohortObservation;
 
+/* Pure match of retained, separately current-checked inputs. These are
+ * candidate bounds only, not a positive F/H or producer-retention certificate.
+ * No nextXid/H sample, current fetch, lock or identity callback is performed.
+ * Failure preserves *out; the caller still owns the original admission and
+ * must qualify provenance/retention before any native plan or shared write. */
+typedef struct ClusterHeapFreezeObservedBoundsV1 {
+	FullTransactionId freeze_limit;
+	uint64 horizon_scn;
+} ClusterHeapFreezeObservedBoundsV1;
+
+extern bool cluster_heap_freeze_observed_bounds_v1(
+	const ClusterHeapFreezePolicySampleV1 *policy,
+	const ClusterHeapFreezeCohortObservation *cohort,
+	const ClusterSemanticAdmissionToken *admission, int local_node_id,
+	ClusterHeapFreezeObservedBoundsV1 *out);
+
 /* Bounded reads, fixed required set, current connection/admission rechecks.
  * Only READY writes out; every refusal preserves it. An old completed F
  * remains usable with fresh H; F itself has no age expiry. */

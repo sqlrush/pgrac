@@ -1822,6 +1822,7 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 	ClusterHeapFreezeFinalFenceV1 expected_fence,
 							 current_fence;
 	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeObservedBoundsV1 observed_bounds = { 0 };
 	ClusterHeapFreezeProofStatusV1 status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
 	ClusterTxResolveReason reason;
 	uint64 master_before = 0;
@@ -1935,28 +1936,12 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 				status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
 			else if (cohort_status == CLUSTER_HEAP_FREEZE_COHORT_READY
 					 && cohort_current
-					 && cohort.admission_fence.record_generation == cohort.record_generation
-					 && cohort.admission_fence.formation_epoch == cohort.formation_epoch
-					 && cohort.admission_fence.admitted_members_lo == cohort.admitted_members_lo
-					 && cohort.admission_fence.admitted_members_hi == cohort.admitted_members_hi
-					 && cohort.admission_fence.local_node_id == cluster_node_id
-					 && cohort.local_unqualified_entries == 0
-					 && cohort.record_generation == admission.record_generation
-					 && cohort.formation_epoch == admission.formation_epoch
-					 && SCN_VALID(cohort.horizon_scn) && cohort.horizon_scn != UINT64_MAX
-					 && TransactionIdIsNormal((TransactionId) cohort.active_full_xid_min)
-					 && TransactionIdIsNormal((TransactionId) cohort.future_full_xid_max)
-					 && cohort.future_full_xid_max != UINT64_MAX
-					 && cohort.active_full_xid_min <= cohort.future_full_xid_max
-					 && cluster_node_id >= 0 && cluster_node_id < 128
-					 && ((cluster_node_id < 64
-						  ? cohort.admitted_members_lo >> cluster_node_id
-						  : cohort.admitted_members_hi >> (cluster_node_id - 64)) & 1) != 0)
+					 && cluster_heap_freeze_observed_bounds_v1(
+						 &vacrel->cutoffs.SharedFreezePolicySample, &cohort,
+						 &admission, cluster_node_id, &observed_bounds))
 			{
 				memcpy(&vacrel->shared_freeze_cohort, &cohort, sizeof(cohort));
-				vacrel->shared_freeze_candidate_limit_full = FullTransactionIdFromU64(
-					Min(U64FromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull),
-						cohort.active_full_xid_min));
+				vacrel->shared_freeze_candidate_limit_full = observed_bounds.freeze_limit;
 				vacrel->shared_freeze_cohort_observed = true;
 			}
 		}
@@ -1972,7 +1957,7 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 				(void) cluster_heap_freeze_select_xmin_candidates_v1(
 					&vacrel->shared_freeze_batch, &proofs, &current_fence,
 					vacrel->shared_freeze_candidate_limit_full,
-					vacrel->shared_freeze_cohort.horizon_scn,
+					observed_bounds.horizon_scn,
 					&vacrel->shared_freeze_xmin_candidates);
 		}
 		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN

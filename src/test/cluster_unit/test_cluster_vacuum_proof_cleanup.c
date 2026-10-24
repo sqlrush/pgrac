@@ -602,6 +602,8 @@ cluster_heap_freeze_cohort_current(const ClusterHeapFreezeCohortObservation *exp
 		? CLUSTER_HEAP_FREEZE_COHORT_READY : CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
 }
 
+#include "test_cluster_vacuum_observed_bounds.inc"
+
 #include "test_cluster_vacuum_proof_cleanup.inc"
 
 static void
