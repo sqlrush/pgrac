@@ -84,6 +84,9 @@ static ClusterControlRootReadToken tokens[NROOTS + 1];
 static XLogRecPtr native_redo[NROOTS + 1];
 static ClusterWalRecoveryCheckpointV1 native_checkpoint[NROOTS + 1];
 static ClusterControlRootResult source_result[NROOTS + 1];
+static ClusterControlRootResult own_lookup_result;
+static bool own_lookup_override;
+static ClusterControlRootIdentity own_lookup_identity;
 char *cluster_shared_data_dir = "fixture-shared";
 static ClusterControlRootResult commit_ts_profile_result[NROOTS];
 static unsigned commit_ts_profile_calls[NROOTS], commit_ts_profile_fail_after[NROOTS];
@@ -242,10 +245,15 @@ cluster_control_root_lookup_owner_by_node_runtime(int32 node, ClusterControlRoot
 {
 	if (node < 0 || node >= NROOTS)
 		return CLUSTER_CONTROL_ROOT_ABSENT;
+	if (node == 0 && own_lookup_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& own_lookup_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return own_lookup_result; /* Failed lookup need not initialize outputs. */
 	*snapshot = roots[node + 1];
 	*identity = snapshot->identity;
+	if (node == 0 && own_lookup_override)
+		*identity = own_lookup_identity;
 	*token = tokens[node + 1];
-	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	return node == 0 ? own_lookup_result : CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
 ClusterControlRootResult
@@ -1303,6 +1311,9 @@ fixture(void)
 {
 	uint16 thread;
 
+	own_lookup_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	own_lookup_override = false;
+	memset(&own_lookup_identity, 0, sizeof(own_lookup_identity));
 	serial_input_calls = serial_input_count = 0;
 	serial_input_ok = true;
 	memset(serial_input_threads, 0, sizeof(serial_input_threads));

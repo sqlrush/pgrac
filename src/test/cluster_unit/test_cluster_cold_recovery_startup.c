@@ -3581,10 +3581,211 @@ UT_TEST(test_prepare_native_v2_own_claim_still_requires_exact_physical_identity)
 	}
 }
 
+/* Real own-root gates and native duty comparison; only the physical reader
+ * supplies controlled values. Refusals must survive into the native FATAL
+ * detail without reading outputs after an unsuccessful reader call. */
+static void
+assert_own_root_refusal(ClusterColdTypedV1 *typed, const char *predicate, const char *field)
+{
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_PARTICIPANT_INVALID);
+	UT_ASSERT_NULL(typed->plan);
+	UT_ASSERT(strstr(typed->refusal_detail, predicate) != NULL);
+	if (strstr(typed->refusal_detail, field) == NULL)
+		printf("# diagnostic fragment expected=%s actual=%s\n", field, typed->refusal_detail);
+	UT_ASSERT(strstr(typed->refusal_detail, field) != NULL);
+	UT_ASSERT(strstr(typed->refusal_detail, "expected=") != NULL);
+	UT_ASSERT(strstr(typed->refusal_detail, "actual=") != NULL);
+	UT_ASSERT(strlen(typed->refusal_detail) < sizeof(typed->refusal_detail) - 1);
+	UT_ASSERT_EQ(source_sync_calls, 0);
+}
+
+UT_TEST(test_own_root_lookup_diagnostic_does_not_read_failed_outputs)
+{
+	const ClusterControlRootResult results[] = { CLUSTER_CONTROL_ROOT_ABSENT,
+		CLUSTER_CONTROL_ROOT_IO_ERROR, CLUSTER_CONTROL_ROOT_STALE_TOKEN };
+
+	for (unsigned i = 0; i < lengthof(results); i++) {
+		ClusterColdTypedV1 *typed;
+		char actual[32];
+
+		fixture();
+		own_lookup_result = results[i];
+		typed = prepare(0x800);
+		snprintf(actual, sizeof(actual), "actual=%d", (int)results[i]);
+		assert_own_root_refusal(typed, "predicate=LOOKUP_RESULT", actual);
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+	/* The original degraded-success result must still reach the plan. */
+	{
+		ClusterColdTypedV1 *typed;
+
+		fixture();
+		own_lookup_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED;
+		typed = prepare(0x800);
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+		UT_ASSERT_NOT_NULL(typed->plan);
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_own_root_key_format_diagnostic_names_the_field)
+{
+	const char *fields[] = { "system_identifier", "storage_uuid", "authority_uuid",
+		"authority_uuid[6]", "authority_uuid[8]", "origin_thread_id", "origin_thread_id",
+		"origin_node_id", "origin_node_id", "origin_node_thread", "reserved42",
+		"thread_claim_created_at", "thread_claim_created_at", "reserved60",
+		"origin_owner_incarnation", "root_lineage_seq" };
+
+	for (unsigned fault = 0; fault < lengthof(fields); fault++) {
+		ClusterColdTypedV1 *typed;
+		ClusterControlRootIdentity *id;
+
+		fixture();
+		cluster_shared_config = true;
+		id = &roots[1].identity;
+		switch (fault) {
+		case 0: id->system_identifier = 0; break;
+		case 1: memset(id->storage_uuid, 0, 16); break;
+		case 2: memset(id->authority_uuid, 0, 16); break;
+		case 3: id->authority_uuid[6] = 0; break;
+		case 4: id->authority_uuid[8] = 0; break;
+		case 5: id->origin_thread_id = 0; break;
+		case 6: id->origin_thread_id = CLUSTER_CONTROL_ROOT_RECORD_COUNT + 1; break;
+		case 7: id->origin_node_id = -1; break;
+		case 8: id->origin_node_id = CLUSTER_CONTROL_ROOT_RECORD_COUNT; break;
+		case 9: id->origin_node_id = 1; break;
+		case 10: id->reserved42 = 1; break;
+		case 11: id->thread_claim_created_at = 0; break;
+		case 12: id->thread_claim_created_at = -1; break;
+		case 13: id->reserved60 = 1; break;
+		case 14: id->origin_owner_incarnation = 0; break;
+		case 15: id->root_lineage_seq = 0; break;
+		}
+		typed = prepare(0x800);
+		assert_own_root_refusal(typed, "predicate=KEY_FORMAT", fields[fault]);
+		UT_ASSERT(strstr(typed->refusal_detail, "claim=v2") != NULL);
+		cluster_cold_typed_destroy_v1(&typed);
+		cluster_shared_config = false;
+	}
+}
+
+UT_TEST(test_own_root_legacy_crc_diagnostic_uses_native_claim_crc)
+{
+	for (unsigned fault = 0; fault < 2; fault++) {
+		ClusterColdTypedV1 *typed;
+		char expected[48], actual[48];
+		uint32 crc;
+
+		fixture();
+		cluster_shared_config = false;
+		crc = roots[1].identity.thread_claim_crc32c;
+		roots[1].identity.thread_claim_crc32c = fault ? crc ^ 1 : 0;
+		snprintf(expected, sizeof(expected), "expected=%u", crc);
+		snprintf(actual, sizeof(actual), "actual=%u", roots[1].identity.thread_claim_crc32c);
+		typed = prepare(0x800);
+		assert_own_root_refusal(typed, "predicate=KEY_FORMAT", "thread_claim_crc32c");
+		UT_ASSERT(strstr(typed->refusal_detail, "claim=v1") != NULL);
+		UT_ASSERT(strstr(typed->refusal_detail, expected) != NULL);
+		UT_ASSERT(strstr(typed->refusal_detail, actual) != NULL);
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
+UT_TEST(test_own_root_thread_diagnostic_has_expected_and_actual)
+{
+	ClusterColdTypedV1 *typed;
+
+	fixture();
+	cluster_shared_config = true;
+	roots[1].identity.origin_thread_id = 2;
+	roots[1].identity.origin_node_id = 1;
+	typed = prepare(0x800);
+	assert_own_root_refusal(typed, "predicate=OWN_THREAD", "expected=1 actual=2");
+	cluster_cold_typed_destroy_v1(&typed);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_own_root_identity_diagnostic_reports_exact_field_values)
+{
+	const char *fields[] = { "system_identifier", "storage_uuid", "authority_uuid",
+		"origin_thread_id", "reserved42", "origin_node_id", "thread_claim_created_at",
+		"thread_claim_crc32c", "reserved60", "origin_owner_incarnation", "root_lineage_seq" };
+	const char *expected[] = { "expected=9 actual=10",
+		"expected=01010101010101010101010101010101 actual=02010101010101010101010101010101",
+		"expected=00000000000040008000000000000000 actual=01000000000040008000000000000000",
+		"expected=1 actual=2", "expected=0 actual=1", "expected=0 actual=1",
+		"expected=42 actual=43", NULL, "expected=0 actual=1", "expected=11 actual=12",
+		"expected=3 actual=4" };
+
+	for (unsigned fault = 0; fault < lengthof(fields); fault++) {
+		ClusterColdTypedV1 *typed;
+		ClusterControlRootIdentity *id;
+		char crc_values[96];
+
+		fixture();
+		cluster_shared_config = true;
+		own_lookup_override = true;
+		own_lookup_identity = roots[1].identity;
+		id = &roots[1].identity;
+		switch (fault) {
+		case 0: id->system_identifier++; break;
+		case 1: id->storage_uuid[0]++; break;
+		case 2: id->authority_uuid[0]++; break;
+		case 3: id->origin_thread_id++; break;
+		case 4: id->reserved42++; break;
+		case 5: id->origin_node_id++; break;
+		case 6: id->thread_claim_created_at++; break;
+		case 7: id->thread_claim_crc32c++; break;
+		case 8: id->reserved60++; break;
+		case 9: id->origin_owner_incarnation++; break;
+		case 10: id->root_lineage_seq++; break;
+		}
+		snprintf(crc_values, sizeof(crc_values), "expected=%u actual=%u",
+			own_lookup_identity.thread_claim_crc32c, id->thread_claim_crc32c);
+		typed = prepare(0x800);
+		assert_own_root_refusal(typed, "predicate=ROOT_IDENTITY", fields[fault]);
+		UT_ASSERT(strstr(typed->refusal_detail, expected[fault] ? expected[fault] : crc_values) != NULL);
+		UT_ASSERT(strstr(typed->refusal_detail, "expected_source=lookup actual_source=root") != NULL);
+		cluster_cold_typed_destroy_v1(&typed);
+		cluster_shared_config = false;
+	}
+}
+
+UT_TEST(test_own_root_seal_diagnostic_separates_lifecycle_and_flags)
+{
+	for (unsigned fault = 0; fault < 2; fault++) {
+		ClusterColdTypedV1 *typed;
+		char expected[96];
+		uint32 required;
+
+		fixture();
+		required = CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
+			| CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
+			| CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+		if (fault == 0) {
+			roots[1].lifecycle++;
+			snprintf(expected, sizeof(expected), "expected=%u actual=%u",
+				CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED, roots[1].lifecycle);
+		} else {
+			roots[1].root_flags &= ~CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID;
+			snprintf(expected, sizeof(expected), "expected=0x%x actual=0x%x", required, roots[1].root_flags);
+		}
+		typed = prepare(0x800);
+		assert_own_root_refusal(typed, fault ? "predicate=SEALED_FLAGS" : "predicate=SEALED_LIFECYCLE", expected);
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(127);
+	UT_PLAN(133);
+	UT_RUN(test_own_root_lookup_diagnostic_does_not_read_failed_outputs);
+	UT_RUN(test_own_root_key_format_diagnostic_names_the_field);
+	UT_RUN(test_own_root_legacy_crc_diagnostic_uses_native_claim_crc);
+	UT_RUN(test_own_root_thread_diagnostic_has_expected_and_actual);
+	UT_RUN(test_own_root_identity_diagnostic_reports_exact_field_values);
+	UT_RUN(test_own_root_seal_diagnostic_separates_lifecycle_and_flags);
 	UT_RUN(test_prepare_accepts_native_v2_own_claim_without_legacy_crc);
 	UT_RUN(test_prepare_retains_legacy_own_claim_crc_requirement);
 	UT_RUN(test_prepare_native_v2_own_claim_still_requires_exact_physical_identity);

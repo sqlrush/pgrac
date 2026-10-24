@@ -131,36 +131,184 @@ cold_refuse(ClusterColdTypedV1 *typed, ClusterColdDetailV1 detail, const char *f
 	}
 }
 
+/* Diagnostics only: the original claim validator decides admission. Explain
+ * its failed format constraint without taking a new observation or treating a
+ * native v2 record CRC as a reconstructed legacy CRC. */
+static void
+cold_own_key_refuse(ClusterColdTypedV1 *typed, uint16 thread,
+					const ClusterControlRootIdentity *key)
+{
+	static const uint8 zero_uuid[16] = {0};
+	const char *claim = cluster_shared_config ? "v2" : "v1";
+	ClusterWalThreadClaim legacy;
+
+#define COLD_KEY_BAD(condition, field, format, ...) \
+	do { \
+		if (condition) { \
+			cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID, \
+				"own thread %u root predicate=KEY_FORMAT claim=%s field=" #field " " format, \
+				(unsigned)thread, claim, __VA_ARGS__); \
+			return; \
+		} \
+	} while (0)
+	COLD_KEY_BAD(key->system_identifier == 0, system_identifier,
+		"expected=nonzero actual=" UINT64_FORMAT, key->system_identifier);
+	COLD_KEY_BAD(memcmp(key->storage_uuid, zero_uuid, 16) == 0, storage_uuid,
+		"expected=nonzero_UUID actual=%s", "00000000000000000000000000000000");
+	COLD_KEY_BAD(memcmp(key->authority_uuid, zero_uuid, 16) == 0, authority_uuid,
+		"expected=nonzero_UUID actual=%s", "00000000000000000000000000000000");
+	COLD_KEY_BAD((key->authority_uuid[6] & 0xf0) != 0x40, authority_uuid[6],
+		"expected=(byte&0xf0)=0x40 actual=0x%02x", (unsigned)key->authority_uuid[6]);
+	COLD_KEY_BAD((key->authority_uuid[8] & 0xc0) != 0x80, authority_uuid[8],
+		"expected=(byte&0xc0)=0x80 actual=0x%02x", (unsigned)key->authority_uuid[8]);
+	COLD_KEY_BAD(key->origin_thread_id == 0
+		|| key->origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT, origin_thread_id,
+		"expected=1..%u actual=%u", (unsigned)CLUSTER_CONTROL_ROOT_RECORD_COUNT,
+		(unsigned)key->origin_thread_id);
+	COLD_KEY_BAD(key->origin_node_id < 0
+		|| key->origin_node_id >= CLUSTER_CONTROL_ROOT_RECORD_COUNT, origin_node_id,
+		"expected=0..%u actual=%d", (unsigned)CLUSTER_CONTROL_ROOT_RECORD_COUNT - 1,
+		(int)key->origin_node_id);
+	COLD_KEY_BAD(key->origin_thread_id != (uint16)(key->origin_node_id + 1), origin_node_thread,
+		"expected=%u actual=%u", (unsigned)key->origin_node_id + 1,
+		(unsigned)key->origin_thread_id);
+	COLD_KEY_BAD(key->reserved42 != 0, reserved42,
+		"expected=0 actual=%u", (unsigned)key->reserved42);
+	COLD_KEY_BAD(key->thread_claim_created_at == 0
+		|| (cluster_shared_config && key->thread_claim_created_at < 0), thread_claim_created_at,
+		"expected=%s actual=" INT64_FORMAT, cluster_shared_config ? ">0" : "nonzero",
+		key->thread_claim_created_at);
+	COLD_KEY_BAD(key->reserved60 != 0, reserved60,
+		"expected=0 actual=%u", key->reserved60);
+	COLD_KEY_BAD(key->origin_owner_incarnation == 0, origin_owner_incarnation,
+		"expected=nonzero actual=" UINT64_FORMAT, key->origin_owner_incarnation);
+	COLD_KEY_BAD(key->root_lineage_seq == 0, root_lineage_seq,
+		"expected=nonzero actual=" UINT64_FORMAT, key->root_lineage_seq);
+	if (!cluster_shared_config) {
+		cluster_wal_thread_claim_fill(&legacy, key->origin_thread_id, key->origin_node_id,
+			key->thread_claim_created_at);
+		COLD_KEY_BAD(key->thread_claim_crc32c == 0 || key->thread_claim_crc32c != legacy.crc,
+			thread_claim_crc32c, "expected=%u actual=%u", (unsigned)legacy.crc,
+			key->thread_claim_crc32c);
+	}
+#undef COLD_KEY_BAD
+	/* Keep an explicit refusal if the original validator gains a new rule. */
+	cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+		"own thread %u root predicate=KEY_FORMAT claim=%s field=validator expected=valid actual=invalid",
+		(unsigned)thread, claim);
+}
+
+static void
+cold_identity_uuid_hex(const uint8 uuid[16], char out[33])
+{
+	static const char digits[] = "0123456789abcdef";
+
+	for (unsigned i = 0; i < 16; i++) {
+		out[2 * i] = digits[uuid[i] >> 4];
+		out[2 * i + 1] = digits[uuid[i] & 15];
+	}
+	out[32] = '\0';
+}
+
+/* Report the first different field in the two values already read, including
+ * generation/lineage and complete UUIDs. Never re-read a mutable ROOT here. */
+static void
+cold_own_identity_refuse(ClusterColdTypedV1 *typed, uint16 thread,
+		const ClusterControlRootIdentity *expected, const ClusterControlRootIdentity *actual,
+		ClusterRecoveryDutyCompare compare)
+{
+	char expected_hex[33], actual_hex[33];
+	const uint8 *expected_uuid[] = { expected->storage_uuid, expected->authority_uuid };
+	const uint8 *actual_uuid[] = { actual->storage_uuid, actual->authority_uuid };
+	const char *uuid_field[] = { "storage_uuid", "authority_uuid" };
+
+#define COLD_ID_DIFFERENT(field, format, type) \
+	do { \
+		if (expected->field != actual->field) { \
+			cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID, \
+				"own thread %u root predicate=ROOT_IDENTITY field=" #field \
+				" expected=" format " actual=" format \
+				" expected_source=lookup actual_source=root compare=%d", \
+				(unsigned)thread, (type)expected->field, (type)actual->field, (int)compare); \
+			return; \
+		} \
+	} while (0)
+	COLD_ID_DIFFERENT(system_identifier, UINT64_FORMAT, uint64);
+	for (unsigned i = 0; i < lengthof(expected_uuid); i++) {
+		if (memcmp(expected_uuid[i], actual_uuid[i], 16) != 0) {
+			cold_identity_uuid_hex(expected_uuid[i], expected_hex);
+			cold_identity_uuid_hex(actual_uuid[i], actual_hex);
+			cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+				"own thread %u root predicate=ROOT_IDENTITY field=%s expected=%s actual=%s "
+				"expected_source=lookup actual_source=root compare=%d",
+				(unsigned)thread, uuid_field[i], expected_hex, actual_hex, (int)compare);
+			return;
+		}
+	}
+	COLD_ID_DIFFERENT(origin_thread_id, UINT64_FORMAT, uint64);
+	COLD_ID_DIFFERENT(reserved42, UINT64_FORMAT, uint64);
+	COLD_ID_DIFFERENT(origin_node_id, INT64_FORMAT, int64);
+	COLD_ID_DIFFERENT(thread_claim_created_at, INT64_FORMAT, int64);
+	COLD_ID_DIFFERENT(thread_claim_crc32c, UINT64_FORMAT, uint64);
+	COLD_ID_DIFFERENT(reserved60, UINT64_FORMAT, uint64);
+	COLD_ID_DIFFERENT(origin_owner_incarnation, UINT64_FORMAT, uint64);
+	COLD_ID_DIFFERENT(root_lineage_seq, UINT64_FORMAT, uint64);
+#undef COLD_ID_DIFFERENT
+	cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+		"own thread %u root predicate=ROOT_IDENTITY field=validator expected=%d actual=%d",
+		(unsigned)thread, (int)CLUSTER_RECOVERY_DUTY_COMPARE_EXACT, (int)compare);
+}
+
 /* The founder's previous generation must be sealed like every peer. */
 static bool
 cold_own_root(ClusterColdTypedV1 *typed, uint16 own_thread, ColdRoot *out)
 {
 	ClusterControlRootIdentity identity;
 	ClusterControlRootResult result;
+	ClusterRecoveryDutyCompare compare;
 
 	result = cluster_control_root_lookup_owner_by_node_runtime((int32)own_thread - 1, &identity,
 															   &out->root, &out->token);
-	if ((result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
-		 && result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
-		/* PRE2's canonical reader already authenticates its native v2 claim.
-		 * Its CRC is not the legacy claim CRC reconstructed by the v1 helper.
-		 * Use the same claim domain as the original foreign-root consumer. */
-		|| !cluster_recovery_duty_key_valid_for_claim(&identity, cluster_shared_config)
-		|| identity.origin_thread_id != own_thread
-		|| cluster_recovery_duty_key_compare_for_claim(&identity, &out->root.identity,
-													  cluster_shared_config)
-			   != CLUSTER_RECOVERY_DUTY_COMPARE_EXACT) {
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
 		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
-					"own thread %u root is unreadable (result %d)", (unsigned)own_thread,
-					(int)result);
+					"own thread %u root predicate=LOOKUP_RESULT expected=%d|%d actual=%d",
+					(unsigned)own_thread, (int)CLUSTER_CONTROL_ROOT_OK_PRIMARY,
+					(int)CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED, (int)result);
 		return false;
 	}
-	if (out->root.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
-		|| (out->root.root_flags & COLD_REQUIRED_ROOT_FLAGS) != COLD_REQUIRED_ROOT_FLAGS) {
+	/* PRE2's canonical reader authenticates its native v2 record CRC, which
+	 * differs from the legacy claim CRC. Retain the original claim domain. */
+	if (!cluster_recovery_duty_key_valid_for_claim(&identity, cluster_shared_config)) {
+		cold_own_key_refuse(typed, own_thread, &identity);
+		return false;
+	}
+	if (identity.origin_thread_id != own_thread) {
+		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+			"own thread %u root predicate=OWN_THREAD field=origin_thread_id expected=%u actual=%u",
+			(unsigned)own_thread, (unsigned)own_thread, (unsigned)identity.origin_thread_id);
+		return false;
+	}
+	compare = cluster_recovery_duty_key_compare_for_claim(&identity, &out->root.identity,
+		cluster_shared_config);
+	if (compare != CLUSTER_RECOVERY_DUTY_COMPARE_EXACT) {
+		cold_own_identity_refuse(typed, own_thread, &identity, &out->root.identity, compare);
+		return false;
+	}
+	if (out->root.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED) {
+		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+			"own thread %u previous generation is not sealed for recovery "
+			"predicate=SEALED_LIFECYCLE expected=%u actual=%u",
+			(unsigned)own_thread, (unsigned)CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED,
+			(unsigned)out->root.lifecycle);
+		return false;
+	}
+	if ((out->root.root_flags & COLD_REQUIRED_ROOT_FLAGS) != COLD_REQUIRED_ROOT_FLAGS) {
 		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
 					"own thread %u previous generation is not sealed for recovery "
-					"(lifecycle %d, flags 0x%x)",
-					(unsigned)own_thread, (int)out->root.lifecycle, out->root.root_flags);
+					"predicate=SEALED_FLAGS expected=0x%x actual=0x%x missing=0x%x",
+					(unsigned)own_thread, COLD_REQUIRED_ROOT_FLAGS, out->root.root_flags,
+					COLD_REQUIRED_ROOT_FLAGS & ~out->root.root_flags);
 		return false;
 	}
 	return true;
