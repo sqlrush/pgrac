@@ -2820,15 +2820,19 @@ cluster_ctrc_origin_reserve_active(const ClusterCtrcTxnKeyV1 *key,
 
 	/* Ordinary ACTIVE registration must retain its original top PGPROC
 	 * protection until the reservation is visible. GetNewTransactionId
-	 * publishes MyProc->xid before returning; this backend alone clears it.
-	 * Read the nonallocating top xid before origin_lock, without introducing
+	 * publishes the original full identity before its raw xid; this backend
+	 * alone retires that protection. Match the nonallocating transaction
+	 * state to that same publication before origin_lock, without introducing
 	 * ProcArrayLock below the caller's block-0 authority. Exact TT slot and
 	 * incarnation validation remains the canonical publisher's contract. */
 	if (MyProc == NULL || key->origin_node_id != cluster_node_id || !TransactionIdIsNormal(key->xid)
 		|| MyProc->xid != key->xid)
 		return CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED;
 	top_full = GetTopFullTransactionIdIfAny();
-	if (!FullTransactionIdIsNormal(top_full) || XidFromFullTransactionId(top_full) != key->xid)
+	if (!FullTransactionIdIsNormal(top_full) || U64FromFullTransactionId(top_full) == UINT64_MAX
+		|| XidFromFullTransactionId(top_full) != key->xid
+		|| pg_atomic_read_u64(&MyProc->cluster_top_full_xid_atomic)
+			!= U64FromFullTransactionId(top_full))
 		return CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED;
 
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);

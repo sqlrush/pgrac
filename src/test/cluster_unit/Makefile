@@ -8279,6 +8279,11 @@ test_cluster_ctrc_capacity: test_cluster_ctrc_capacity.c test_cluster_ctrc_clean
 test_cluster_undo_cleaner: $(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
 	$(top_srcdir)/src/include/miscadmin.h
 
+# These fixtures use the real shared engine and PGPROC allocation identity.
+test_cluster_ctrc_cleaner test_cluster_ctrc_capacity test_cluster_ctrc_dispatch \
+		test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: \
+		$(top_srcdir)/src/include/storage/proc.h
+
 test_cluster_ctrc_cleaner: test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc unit_test.h $(CLUSTER_SCN_O) $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
