@@ -58,6 +58,69 @@ RESOURCE_WAITS = {'BufferContent', 'PcmBlockConvertWait', 'ClusterRelExtendWait'
                   'GesConvertWait', 'GesBastWait', 'GesCancelDrain', 'ClusterCfEnqueueWait'}
 
 
+def pcm_logical_bridge(wait, service, resources):
+    """Owned retained logical selection only; never route or send authority."""
+    if (not wait.get('transport_known') or
+            any(not isinstance(wait.get(k), int) or wait[k] <= 0
+                for k in ('r4', 'requester_connection', 'ingress_connection')) or
+            wait['r4'] != service.get('r4') or service.get('source') not in range(32)):
+        return None
+    logical = ('tag', 'requester', 'request_seq', 'formation', 'master_session', 'base')
+    common = logical + ('authority', 'ordered_lane', 'source', 'state', 'mode',
+                       'source_candidate', 'retain_pi_if_dirty', 'common_flags', 'common_outcome')
+    if (service.get('mode') != 0 or service.get('state') not in (1, 2) or
+            service.get('source_candidate') != 1 or service.get('retain_pi_if_dirty') != 1 or
+            service.get('common_flags') != 1 or service.get('common_outcome') != 0):
+        return None
+    queues = []
+    for resource in resources:
+        if (resource.get('kind') != 'pcm' or resource.get('node') != wait.get('expected_master') or
+                resource.get('status') != 0 or resource.get('stable') is not True or
+                resource.get('omitted_blocks') != 0):
+            continue
+        view = resource.get('view', {})
+        for queue in resource.get('queue', []):
+            if (queue.get('queue_kind') == 1 and queue.get('request_known') is True and
+                    queue.get('transport_known') is True and queue.get('phase') in (2, 3) and
+                    all(wait.get(k) == queue.get(k) for k in logical) and
+                    queue.get('requester_connection') == wait['requester_connection'] and
+                    queue.get('ingress_connection') == wait['ingress_connection'] and
+                    queue.get('ordered_lane') == service.get('ordered_lane') and
+                    queue.get('source') == service['source'] and
+                    queue.get('incompatible', 0) & (1 << service['source']) and
+                    not queue.get('blocked', 0) & (1 << service['source']) and
+                    all(isinstance(queue.get(k), int) and queue[k] > 0 for k in ('head', 'enqueue_order')) and
+                    all(queue[k] == view.get(k) for k in ('head', 'enqueue_order')) and
+                    view.get('tag') == wait.get('tag') and
+                    view.get('head_requester') == wait.get('requester') and
+                    view.get('head_request') == wait.get('request_seq')):
+                queues.append((resource, queue))
+    if len(queues) != 1:
+        return None
+    resource, queue = queues[0]
+    blocks = []
+    for block in resource.get('blocks', []):
+        slot = block.get('slot', {})
+        state = slot.get('state')
+        retained = block.get('request') or {}
+        if (block.get('holder') == service['source'] and block.get('decoded') is True and
+                block.get('neutral_sender') is True and block.get('reject') == 0 and
+                (state == 0 or (state in (1, 2) and block.get('slot_matches') is True and
+                                slot.get('owner_node') == resource['node'])) and
+                all(k in service and k in retained and service[k] == retained[k] for k in common)):
+            blocks.append(block)
+    if len(blocks) != 1:
+        return None
+    block = blocks[0]
+    return dict(quality='retained_logical_only', master=resource['node'],
+                enqueue_order=queue['enqueue_order'], head=queue['head'],
+                active_slot=block['slot']['state'] != 0,
+                requester_connection=wait['requester_connection'], master_ingress=wait['ingress_connection'],
+                retained_sender=block['request']['wire_sender_connection'],
+                service_sender=service.get('wire_sender_connection'),
+                canonical_route_proven=False, physical_send_proven=False)
+
+
 def build_graph(snapshots, resources):
     """Join copied native identities only; unknown edges remain in the result."""
     owners, unknown, edges, epochs = {}, [], [], {}
@@ -210,6 +273,7 @@ def build_graph(snapshots, resources):
                         request_seq=wait['request_seq'], requester=wait['requester'],
                         formation=wait['formation'], master_session=wait['master_session'],
                         base=wait['base'], master=wait['expected_master'],
+                        logical_bridge=pcm_logical_bridge(wait, service, resources),
                         service_wire_sender_connection=service.get('wire_sender_connection')),
                         'candidate_pcm_service')
             unknown.append(dict(process=identity(row), reason='pcm_service_process_edge_unresolved',
@@ -218,8 +282,13 @@ def build_graph(snapshots, resources):
             unknown.append(dict(process=identity(row), reason='tx_source_edge_unresolved', wait=row['tx_wait']))
     for resource in resources:
         absent = 1 if resource.get('kind') == 'enqueue' else 2
-        if resource.get('status') not in (0, absent) or resource.get('stable', True) is not True:
+        if (resource.get('status') not in (0, absent) or resource.get('stable', True) is not True or
+                resource.get('omitted_blocks', 0)):
             unknown.append(dict(reason='resource_unavailable_or_changed', resource=resource))
+        for block in resource.get('blocks', []):
+            if (block.get('decoded') is not True or block.get('slot', {}).get('state') not in (0, 1, 2) or
+                    (block['slot']['state'] != 0 and block.get('slot_matches') is not True)):
+                unknown.append(dict(reason='pcm_retained_block_invalid', node=resource.get('node'), block=block))
     return dict(version=2, atomic_graph=False, complete=not unknown,
                 vertices=[dict(id=identity(x), **x) for x in owners.values()],
                 edges=edges, cycles=_cycles(edges), unknown=unknown)

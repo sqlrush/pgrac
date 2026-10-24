@@ -36,6 +36,12 @@ service_boundary(const ResourceXDecodedFrame *block, int32 master, uint64 r4, in
 		UT_ASSERT_EQ(cut.owners[0].pcm_service.base, 0);
 		UT_ASSERT_EQ(cut.owners[0].pcm_service.wire_sender_connection, 104);
 		UT_ASSERT_EQ(cut.owners[0].pcm_service.requester_connection, 0);
+		UT_ASSERT_EQ(cut.owners[0].pcm_service.authority, 300);
+		UT_ASSERT_EQ(cut.owners[0].pcm_service.ordered_lane, 7);
+		UT_ASSERT_EQ(cut.owners[0].pcm_service.semantic_crc32c, 301);
+		UT_ASSERT_EQ(cut.owners[0].pcm_service.common_flags, 1);
+		UT_ASSERT_EQ(cut.owners[0].pcm_service.source_candidate, 1);
+		UT_ASSERT_EQ(cut.owners[0].pcm_service.retain_pi_if_dirty, 1);
 	} else UT_ASSERT(!local_owner.pcm_serving);
 	if (service_cleans) cluster_content_trace_error_cleanup();
 	if (service_throws) pg_re_throw();
@@ -81,6 +87,9 @@ static void service_reset(void)
 	frame.common.assertion_sequence = 100; frame.common.resource_formation = 101;
 	frame.common.master_session_incarnation = 102;
 	frame.common.sender_connection_generation = 104; frame.common.action_node = 0;
+	frame.common.authority_generation = 300; frame.common.ordered_lane = 7;
+	frame.common.semantic_crc32c = 301; frame.common.flags = 1;
+	frame.common.source_candidate = frame.common.retain_pi_if_dirty = 1;
 	service_throws = service_cleans = false; source_calls = finish_calls = 0;
 }
 

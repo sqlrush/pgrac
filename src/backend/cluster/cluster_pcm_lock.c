@@ -10582,6 +10582,7 @@ pcm_trace_entry_locked(struct GrdEntry *entry, ClusterWaitTrace *row,
 				q->authority = request->final_authority_generation;
 				q->head = request->head_transition_generation;
 				q->enqueue_order = request->enqueue_order;
+				q->ordered_lane = request->ordered_lane;
 				q->requester_connection = request->requester_connection_generation;
 				q->wire_sender_connection = request->sender_connection_generation;
 				q->transport_known = true;
@@ -10619,14 +10620,66 @@ pcm_trace_entry_locked(struct GrdEntry *entry, ClusterWaitTrace *row,
 }
 
 void
+cluster_pcm_wait_graph_decode_block(ClusterWaitGraphPcmBlock *block)
+{
+	ResourceXDecodedFrame frame;
+	const ResourceXDecodedCommon *common = &frame.common;
+	const ResourceXIntentSlot *slot = &block->slot;
+	ClusterWaitTrace *row = &block->request;
+
+	memset(row, 0, sizeof(*row));
+	block->decoded = block->slot_matches = block->neutral_sender = false;
+	block->reject = RESOURCE_X_WIRE_REJECT_NONE;
+	if (!cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCK_TO_N, block->payload,
+		RESOURCE_X_CONTROL_V1_BYTES, &frame, &block->reject))
+		return;
+	block->decoded = true;
+	row->tag = common->logical_assertion.resource;
+	row->tag_known = row->request_known = true;
+	row->requester = common->logical_assertion.requester_node;
+	row->request_seq = common->assertion_sequence;
+	row->formation = common->resource_formation;
+	row->master_session = common->master_session_incarnation;
+	row->base = common->base_authority_generation;
+	row->authority = common->authority_generation;
+	row->wire_sender_connection = common->sender_connection_generation;
+	row->ordered_lane = common->ordered_lane;
+	row->semantic_crc32c = common->semantic_crc32c;
+	row->source = common->action_node;
+	row->state = common->observed_mode;
+	row->mode = common->target_mode;
+	row->source_candidate = common->source_candidate;
+	row->retain_pi_if_dirty = common->retain_pi_if_dirty;
+	row->common_flags = common->flags;
+	row->common_outcome = common->outcome;
+	block->neutral_sender = common->sender_connection_generation
+		== PGRAC_RESOURCE_X_RETAINED_SENDER_GENERATION;
+	block->slot_matches = block->neutral_sender && block->holder >= 0 &&
+		block->holder < RESOURCE_X_PROTOCOL_NODE_LIMIT &&
+		(slot->state == RESOURCE_X_INTENT_SLOT_ARMED || slot->state == RESOURCE_X_INTENT_SLOT_STAGED) &&
+		slot->kind == RESOURCE_X_WIRE_BLOCK_TO_N && slot->payload_bytes == RESOURCE_X_CONTROL_V1_BYTES &&
+		slot->destination_node == (uint32)block->holder && common->action_node == block->holder &&
+		slot->logical_generation == common->assertion_sequence &&
+		slot->authority_generation == common->base_authority_generation &&
+		slot->body.owner_kind == RESOURCE_X_INTENT_OWNER_MASTER_BLOCK &&
+		slot->body.owner_index == block->holder &&
+		slot->body.owner_generation == common->assertion_sequence &&
+		slot->body.assertion.requester_node == common->logical_assertion.requester_node &&
+		BufferTagsEqual(&slot->body.assertion.resource, &common->logical_assertion.resource);
+}
+
+void
 cluster_pcm_wait_graph_snapshot(const BufferTag *tag, ClusterWaitGraphPcmSnapshot *out)
 {
 	struct GrdEntry *entry;
+	ClusterPcmResourceXMasterState *state;
+	static const uint8 empty[RESOURCE_X_CONTROL_V1_BYTES] = {0};
 	bool found;
 
 	memset(out, 0, sizeof(*out));
 	out->status = CLWG_UNAVAILABLE;
-	if (tag == NULL || RESOURCE_X_PROTOCOL_NODE_LIMIT * 2 > CLWG_PCM_QUEUE) {
+	if (tag == NULL || RESOURCE_X_PROTOCOL_NODE_LIMIT * 2 > CLWG_PCM_QUEUE ||
+		RESOURCE_X_PROTOCOL_NODE_LIMIT > CLWG_PCM_BLOCKS) {
 		out->status = CLWG_INVALID;
 		return;
 	}
@@ -10653,8 +10706,28 @@ cluster_pcm_wait_graph_snapshot(const BufferTag *tag, ClusterWaitGraphPcmSnapsho
 	}
 	out->view.binding = entry->binding_generation;
 	out->nqueued = pcm_trace_entry_locked(entry, &out->view, out->queue);
+	state = pcm_resource_x_master_state_for_entry(entry);
+	if (state != NULL) {
+		for (int32 node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
+			const ClusterPcmResourceXBlockIntent *source = &state->block_intents[node];
+			ClusterWaitGraphPcmBlock *block;
+			if (source->slot.state == RESOURCE_X_INTENT_SLOT_EMPTY &&
+				memcmp(source->payload, empty, sizeof(empty)) == 0)
+				continue;
+			if (out->nblocks == CLWG_PCM_BLOCKS) {
+				out->omitted_blocks++;
+				continue;
+			}
+			block = &out->blocks[out->nblocks++];
+			block->holder = node;
+			block->slot = source->slot;
+			memcpy(block->payload, source->payload, sizeof(block->payload));
+		}
+	}
 	LWLockRelease(&entry->entry_lock.lock);
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
+	for (uint32 i = 0; i < out->nblocks; i++)
+		cluster_pcm_wait_graph_decode_block(&out->blocks[i]);
 	out->view.rows = out->nqueued;
 	out->status = CLWG_OBSERVED;
 }

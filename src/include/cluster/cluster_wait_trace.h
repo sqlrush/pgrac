@@ -111,6 +111,8 @@ typedef struct ClusterWaitTrace {
 	uint32 refusal_flags, refusal_pins;
 	uint32 tx_xid;
 	uint32 pins_seen, ledger_seen, local_pins, rows, omitted;
+	uint32 ordered_lane, semantic_crc32c;
+	uint8 source_candidate, retain_pi_if_dirty, common_flags, common_outcome;
 	int32 site, mode, expected_master, requester, source, queue_kind;
 	int32 state, x_holder, pending_requester, phase, round_phase, owner_phase;
 	int32 round_requester, head_requester;

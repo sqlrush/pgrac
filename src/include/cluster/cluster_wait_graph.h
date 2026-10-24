@@ -3,6 +3,7 @@
 #define CLUSTER_WAIT_GRAPH_H
 
 #include "cluster/cluster_grd.h"
+#include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_wait_trace.h"
 
 #ifdef USE_PGRAC_CLUSTER
@@ -11,13 +12,27 @@ typedef enum ClusterWaitGraphStatus {
 } ClusterWaitGraphStatus;
 
 #define CLWG_PCM_QUEUE 64
+#define CLWG_PCM_BLOCKS 32
 #define CLWG_KO_ROWS 192
+
+/* Entirely caller-owned. EMPTY slot can retain an immutable logical body;
+ * neither that body nor a STAGED slot proves physical transport delivery. */
+typedef struct ClusterWaitGraphPcmBlock {
+	int32 holder;
+	ResourceXIntentSlot slot;
+	uint8 payload[RESOURCE_X_CONTROL_V1_BYTES];
+	ClusterWaitTrace request;
+	ResourceXWireReject reject;
+	bool decoded, slot_matches, neutral_sender;
+} ClusterWaitGraphPcmBlock;
 
 typedef struct ClusterWaitGraphPcmSnapshot {
 	ClusterWaitGraphStatus status;
 	ClusterWaitTrace view;
 	uint32 nqueued;
 	ClusterWaitTrace queue[CLWG_PCM_QUEUE];
+	uint32 nblocks, omitted_blocks;
+	ClusterWaitGraphPcmBlock blocks[CLWG_PCM_BLOCKS];
 } ClusterWaitGraphPcmSnapshot;
 
 typedef struct ClusterWaitGraphKoRow {
@@ -40,6 +55,8 @@ typedef struct ClusterWaitGraphKoSnapshot {
 
 extern void cluster_pcm_wait_graph_snapshot(const BufferTag *tag,
 	ClusterWaitGraphPcmSnapshot *out);
+/* Decode only an owned copy, after all original source locks are released. */
+extern void cluster_pcm_wait_graph_decode_block(ClusterWaitGraphPcmBlock *block);
 extern void cluster_ko_wait_graph_snapshot(ClusterWaitGraphKoSnapshot *out);
 #endif
 #endif

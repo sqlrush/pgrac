@@ -74,6 +74,8 @@ json_wait(StringInfo out, const ClusterWaitTrace *row)
 	WG_U(continuation_claim_pending); WG_U(continuation_claim_reservation); WG_U(refusal_token);
 	WG_U(buffer_state); WG_U(own_flags); WG_U(refusal_flags); WG_U(refusal_pins); WG_U(tx_xid);
 	WG_U(pins_seen); WG_U(ledger_seen); WG_U(local_pins); WG_U(rows); WG_U(omitted);
+	WG_U(ordered_lane); WG_U(semantic_crc32c); WG_U(source_candidate);
+	WG_U(retain_pi_if_dirty); WG_U(common_flags); WG_U(common_outcome);
 	WG_I(site); WG_I(mode); WG_I(expected_master); WG_I(requester); WG_I(source);
 	WG_I(queue_kind); WG_I(state); WG_I(x_holder); WG_I(pending_requester);
 	WG_I(phase); WG_I(round_phase); WG_I(owner_phase); WG_I(round_requester);
@@ -90,6 +92,34 @@ json_wait(StringInfo out, const ClusterWaitTrace *row)
 #undef WG_U
 #undef WG_I
 #undef WG_B
+	appendStringInfoChar(out, '}');
+}
+
+static void
+json_pcm_block(StringInfo out, const ClusterWaitGraphPcmBlock *block)
+{
+	const ResourceXIntentSlot *slot = &block->slot;
+	appendStringInfo(out, "{\"holder\":%d,\"decoded\":%s,\"reject\":%d,"
+		"\"slot_matches\":%s,\"neutral_sender\":%s,\"slot\":{\"state\":%u,"
+		"\"kind\":%u,\"destination\":%u,\"payload_bytes\":%u,\"logical_generation\":" UINT64_FORMAT
+		",\"authority_generation\":" UINT64_FORMAT ",\"first_armed_us\":" UINT64_FORMAT
+		",\"last_attempt_us\":" UINT64_FORMAT ",\"send_episode\":" UINT64_FORMAT
+		",\"last_send_us\":" UINT64_FORMAT ",\"owner_node\":%u,\"owner_kind\":%u,"
+		"\"owner_index\":%u,\"owner_generation\":" UINT64_FORMAT ",\"requester\":%d,\"tag\":",
+		block->holder, block->decoded ? "true" : "false", block->reject,
+		block->slot_matches ? "true" : "false", block->neutral_sender ? "true" : "false",
+		slot->state, slot->kind, slot->destination_node, slot->payload_bytes,
+		slot->logical_generation, slot->authority_generation, slot->first_armed_us,
+		slot->last_attempt_us, slot->send_episode, slot->last_send_us,
+		slot->body.owner_node, slot->body.owner_kind, slot->body.owner_index,
+		slot->body.owner_generation, slot->body.assertion.requester_node);
+	json_tag(out, &slot->body.assertion.resource);
+	appendStringInfoString(out, "},\"payload_hex\":\"");
+	for (uint32 i = 0; i < sizeof(block->payload); i++)
+		appendStringInfo(out, "%02x", block->payload[i]);
+	appendStringInfoString(out, "\",\"request\":");
+	if (block->decoded) json_wait(out, &block->request);
+	else appendStringInfoString(out, "null");
 	appendStringInfoChar(out, '}');
 }
 
@@ -308,6 +338,11 @@ test_pgrac_wait_graph_block(PG_FUNCTION_ARGS)
 	for (uint32 i = 0; i < snapshot->nqueued; i++) {
 		if (i != 0) appendStringInfoChar(&out, ',');
 		json_wait(&out, &snapshot->queue[i]);
+	}
+	appendStringInfo(&out, "],\"omitted_blocks\":%u,\"blocks\":[", snapshot->omitted_blocks);
+	for (uint32 i = 0; i < snapshot->nblocks; i++) {
+		if (i != 0) appendStringInfoChar(&out, ',');
+		json_pcm_block(&out, &snapshot->blocks[i]);
 	}
 	appendStringInfoString(&out, "]}"); pfree(snapshot);
 	PG_RETURN_TEXT_P(cstring_to_text(out.data));

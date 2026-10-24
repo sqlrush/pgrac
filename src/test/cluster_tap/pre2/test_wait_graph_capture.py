@@ -1,5 +1,6 @@
 """Actual collector policy; no database or workload in these tests."""
 import unittest
+import copy
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -7,6 +8,69 @@ import wait_graph_capture as graph
 
 
 class GraphTests(unittest.TestCase):
+    def pcm_bridge_fixture(self):
+        wait = dict(tag=[1,2,3,4,5], requester=0, request_seq=9, formation=7,
+                    master_session=8, base=1, expected_master=2, r4=12,
+                    requester_connection=15, ingress_connection=16, transport_known=True)
+        service = dict(wait, authority=3, ordered_lane=4, source=1, state=2, mode=0,
+                       source_candidate=1, retain_pi_if_dirty=1, common_flags=1,
+                       common_outcome=0, wire_sender_connection=42)
+        queue = dict(wait, queue_kind=1, source=1, phase=2, head=5, enqueue_order=6,
+                     ordered_lane=4, incompatible=2, blocked=0, request_known=True)
+        retained = dict(service, wire_sender_connection=1)
+        block = dict(holder=1, decoded=True, neutral_sender=True, slot_matches=True,
+                     reject=0, slot=dict(state=1, owner_node=2), request=retained)
+        resource = dict(kind='pcm', node=2, status=0, stable=True, omitted_blocks=0,
+                        view=dict(tag=wait['tag'], head_requester=0, head_request=9,
+                                  head=5, enqueue_order=6), queue=[queue], blocks=[block])
+        return wait, service, [resource]
+
+    def test_pcm_logical_bridge_keeps_three_connection_namespaces_separate(self):
+        wait, service, resources = self.pcm_bridge_fixture()
+        bridge = graph.pcm_logical_bridge(wait, service, resources)
+        self.assertEqual(bridge['quality'], 'retained_logical_only')
+        self.assertEqual([bridge[k] for k in ('requester_connection', 'master_ingress',
+                         'retained_sender', 'service_sender')], [15,16,1,42])
+        self.assertFalse(bridge['physical_send_proven'])
+        snapshots = [dict(node=0, owners=[dict(node=0,pid=10,procno=1,backend_id=2,
+                        backend_start=3,proc_generation=17,pcm_wait=wait)]),
+                     dict(node=1, owners=[dict(node=1,pid=20,procno=2,backend_id=-1,
+                        backend_start=0,proc_generation=18,pcm_service=service)])]
+        result = graph.build_graph(snapshots, resources)
+        self.assertEqual(result['edges'][0]['resource']['logical_bridge'], bridge)
+        self.assertEqual(result['edges'][0]['quality'], 'candidate_pcm_service')
+        self.assertEqual(result['cycles'], []); self.assertFalse(result['complete'])
+        # Native DATA completion clears the slot, retaining original payload.
+        resources[0]['blocks'][0]['slot'] = dict(state=0)
+        resources[0]['blocks'][0]['slot_matches'] = False
+        self.assertFalse(graph.pcm_logical_bridge(wait, service, resources)['active_slot'])
+
+    def test_pcm_logical_bridge_rejects_missing_duplicate_and_drifted_evidence(self):
+        wait, service, resources = self.pcm_bridge_fixture()
+        mutations = [lambda r: r[0].update(stable=False),
+                     lambda r: r[0].update(status=1),
+                     lambda r: r[0].update(omitted_blocks=1),
+                     lambda r: r.append(copy.deepcopy(r[0])),
+                     lambda r: r[0]['queue'].append(copy.deepcopy(r[0]['queue'][0])),
+                     lambda r: r[0]['blocks'].append(copy.deepcopy(r[0]['blocks'][0])),
+                     lambda r: r[0]['blocks'][0].update(decoded=False),
+                     lambda r: r[0]['blocks'][0].update(neutral_sender=False),
+                     lambda r: r[0]['blocks'][0].update(slot_matches=False),
+                     lambda r: r[0]['blocks'][0]['slot'].update(owner_node=3),
+                     lambda r: r[0]['blocks'][0]['slot'].update(state=3)]
+        for field in ('request_seq','formation','master_session','base','requester_connection',
+                      'ingress_connection','head','enqueue_order','ordered_lane','source'):
+            mutations.append(lambda r,f=field: r[0]['queue'][0].update({f:r[0]['queue'][0][f]+1}))
+        for field in ('authority','ordered_lane','source_candidate','retain_pi_if_dirty',
+                      'common_flags','common_outcome','state','mode'):
+            mutations.append(lambda r,f=field: r[0]['blocks'][0]['request'].update({f:r[0]['blocks'][0]['request'][f]+1}))
+        for i, mutate in enumerate(mutations):
+            changed=copy.deepcopy(resources);mutate(changed)
+            self.assertIsNone(graph.pcm_logical_bridge(wait, service, changed), i)
+        for field in ('r4','requester_connection','ingress_connection'):
+            changed=dict(wait);changed[field]=0
+            self.assertIsNone(graph.pcm_logical_bridge(changed, service, resources), field)
+
     def test_pcm_active_service_is_candidate_and_never_an_exact_cycle(self):
         key = dict(tag=[1,2,3,4,5], requester=0, request_seq=9, formation=7,
                    master_session=8, base=0, expected_master=2, request_known=True)

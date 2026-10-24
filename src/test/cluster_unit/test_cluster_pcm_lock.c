@@ -20958,6 +20958,64 @@ UT_TEST(test_pcm_wait_graph_copy_is_owned_and_busy_never_waits)
 	free(snapshot);
 }
 
+UT_TEST(test_pcm_wait_graph_retained_block_is_owned_after_slot_retirement)
+{
+	BufferTag tag = make_tag(1099);
+	ResourceXDecodedFrame assertion;
+	ResourceXMasterSnapshot master;
+	ResourceXIntentSlot intent;
+	uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
+	ClusterWaitGraphPcmSnapshot *cut = calloc(1, sizeof(*cut));
+	ClusterWaitGraphPcmBlock saved, malformed;
+	UT_ASSERT(cut != NULL);
+	reset_fake_pcm_runtime(4); cluster_node_id = 0;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_X);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17), RESOURCE_X_APPLY_APPLIED);
+	assertion = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X, tag, 2, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&assertion, 2, &master), RESOURCE_X_APPLY_APPLIED);
+	cluster_pcm_wait_graph_snapshot(&tag, cut);
+	UT_ASSERT_EQ(cut->status, CLWG_OBSERVED); UT_ASSERT_EQ(cut->nblocks, 1);
+	UT_ASSERT_EQ(cut->omitted_blocks, 0); UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	saved = cut->blocks[0];
+	UT_ASSERT(saved.decoded && saved.slot_matches && saved.neutral_sender);
+	UT_ASSERT_EQ(saved.holder, 0); UT_ASSERT_EQ(saved.request.request_seq, 41);
+	UT_ASSERT_EQ(saved.request.source_candidate, 1); UT_ASSERT_EQ(saved.request.retain_pi_if_dirty, 1);
+	UT_ASSERT_EQ(saved.request.authority, 3); UT_ASSERT_EQ(saved.request.base, 1);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_intent_snapshot_exact(
+		&assertion.common.logical_assertion, 0, &intent, payload, sizeof(payload)), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(memcmp(saved.payload, payload, RESOURCE_X_CONTROL_V1_BYTES) == 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, intent.first_armed_us + 1), RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&intent));
+	cluster_pcm_wait_graph_snapshot(&tag, cut);
+	UT_ASSERT_EQ(cut->nblocks, 1); UT_ASSERT(cut->blocks[0].decoded);
+	UT_ASSERT_EQ(cut->blocks[0].slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+	UT_ASSERT(!cut->blocks[0].slot_matches);
+	UT_ASSERT(memcmp(saved.payload, cut->blocks[0].payload, RESOURCE_X_CONTROL_V1_BYTES) == 0);
+	UT_ASSERT_EQ(saved.slot.state, RESOURCE_X_INTENT_SLOT_ARMED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_intent_snapshot_exact(
+		&assertion.common.logical_assertion, 0, &intent, payload, sizeof(payload)), RESOURCE_X_APPLY_NOT_FOUND);
+	/* Diagnostic decoding mutates only this caller-owned copy. */
+	malformed = saved; malformed.slot.payload_bytes = 0;
+	cluster_pcm_wait_graph_decode_block(&malformed);
+	UT_ASSERT(malformed.decoded && !malformed.slot_matches);
+	malformed = saved; malformed.slot.body.owner_kind = RESOURCE_X_INTENT_OWNER_HOLDER_STATUS;
+	cluster_pcm_wait_graph_decode_block(&malformed); UT_ASSERT(!malformed.slot_matches);
+	malformed = saved; malformed.slot.state = UINT8_MAX;
+	cluster_pcm_wait_graph_decode_block(&malformed); UT_ASSERT(!malformed.slot_matches);
+	malformed = saved; malformed.payload[5] ^= 1;
+	cluster_pcm_wait_graph_decode_block(&malformed);
+	UT_ASSERT(!malformed.decoded && !malformed.slot_matches);
+	UT_ASSERT(malformed.reject != RESOURCE_X_WIRE_REJECT_NONE);
+	UT_ASSERT(!malformed.request.tag_known); UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	for (int fail_at = 1; fail_at <= 2; fail_at++) {
+		wait_graph_conditional_fail_at = fail_at;
+		cluster_pcm_wait_graph_snapshot(&tag, cut);
+		UT_ASSERT_EQ(cut->status, CLWG_BUSY); UT_ASSERT_EQ(cut->nblocks, 0);
+		UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	}
+	free(cut);
+}
+
 UT_TEST(test_pcm_authority_snapshot_is_one_entry_lock_view)
 {
 	BufferTag tag = make_tag(97);
@@ -24620,13 +24678,14 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(370);
+	UT_PLAN(371);
 	/* Observe the actual startup state before any runtime fixture overrides
 	 * the postmaster GUC or initializes shared PCM state and counters. */
 	UT_RUN(test_pcm_grd_max_entries_default_is_minus_one);
 	UT_RUN(test_pcm_disable_path_counters_return_zero);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 	UT_RUN(test_pcm_wait_graph_copy_is_owned_and_busy_never_waits);
+	UT_RUN(test_pcm_wait_graph_retained_block_is_owned_after_slot_retirement);
 
 	UT_RUN(test_resource_x_pi_complete_resumes_native_master_without_new_assert);
 	UT_RUN(test_resource_x_master_work_never_substitutes_for_pi_or_admission);

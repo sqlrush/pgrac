@@ -10093,6 +10093,13 @@ gcs_block_pcm_service_begin(ClusterContentTraceServiceScope *scope,
 	service.formation = common->resource_formation;
 	service.master_session = common->master_session_incarnation;
 	service.base = common->base_authority_generation;
+	service.authority = common->authority_generation;
+	service.ordered_lane = common->ordered_lane;
+	service.semantic_crc32c = common->semantic_crc32c;
+	service.source_candidate = common->source_candidate;
+	service.retain_pi_if_dirty = common->retain_pi_if_dirty;
+	service.common_flags = common->flags;
+	service.common_outcome = common->outcome;
 	/* This is the master's wire sender, never the requester connection. */
 	service.wire_sender_connection = common->sender_connection_generation;
 	service.expected_master = master_node;
