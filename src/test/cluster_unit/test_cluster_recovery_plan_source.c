@@ -4,6 +4,8 @@
  */
 #define USE_PGRAC_CLUSTER 1
 #include "postgres.h"
+#include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_wal_thread.h"
@@ -26,6 +28,19 @@ int cluster_recovery_stale_active_ms = 1000;
 static int CheckPointTimeout = 300;
 static ClusterControlRootResult root_result[5];
 static ClusterControlRootSnapshot roots[5];
+
+bool
+cluster_reconfig_capture_formation_snapshot_v1(uint16 tid, ClusterFormationSnapshotV1 *out)
+{
+	(void)tid;
+	memset(out, 0, sizeof(*out));
+	out->startup_formation_generation = 1;
+	for (unsigned node = 0; node < 4; node++) {
+		out->membership.membership_state[node] = CLUSTER_MEMBER_MEMBER;
+		out->membership.last_admitted_incarnation[node] = 12;
+	}
+	return true;
+}
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -187,6 +202,7 @@ UT_TEST(test_pre2_root_alive_clean_and_degraded_polarities_are_unchanged)
 {
 	reset_plan_fixture();
 	roots[2].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	roots[2].identity.origin_owner_incarnation = 12;
 	roots[2].published_at_usec = GetCurrentTimestamp();
 	roots[3].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
 	root_result[4] = CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED;

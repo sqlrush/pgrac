@@ -403,10 +403,13 @@ cluster_recovery_worker_main(Datum main_arg)
 			pg_read_barrier();
 			if (input->generation != pool->generation || !input->root_valid)
 				sv = CLUSTER_RECOVERY_STREAM_UNREADABLE;
-			else if (cluster_recovery_classify_root_slot(CLUSTER_CONTROL_ROOT_OK_PRIMARY,
-						 &input->snapshot, own_thread, tid, now_us, CheckPointTimeout)
-					 != CLUSTER_RECOVERY_THREAD_CRASHED_CANDIDATE)
+			else if (input->snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
+					 || input->snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE)
 				sv = CLUSTER_RECOVERY_STREAM_SKIPPED;
+			else if (input->snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED)
+				/* An OPEN from either boot is not a sealed stream. Its ROOT
+				 * timestamp cannot supply PRE2 membership or recoverability. */
+				sv = CLUSTER_RECOVERY_STREAM_UNREADABLE;
 			else
 				sv = validate_pre2_stream(tid, input);
 		} else if (cluster_r4_bit22_cutover_active()) {

@@ -278,7 +278,7 @@ UT_TEST(test_launch_pins_complete_pre2_input_before_background_reads)
 	UT_ASSERT_EQ(root_reads, 1); UT_ASSERT_EQ(source_reads, 1); UT_ASSERT_EQ(registry_reads, 0);
 	UT_ASSERT_EQ(exit_callbacks, 1);
 }
-UT_TEST(test_background_keeps_stale_launch_and_alive_refusals)
+UT_TEST(test_background_keeps_stale_launch_and_unsealed_refusals)
 {
 	fixture(); cluster_recovery_workers_launch();
 	worker_pool.pre2_input[2].generation--;
@@ -286,13 +286,15 @@ UT_TEST(test_background_keeps_stale_launch_and_alive_refusals)
 	cluster_recovery_worker_main(Int32GetDatum(0));
 	UT_ASSERT_EQ(worker_pool.stream_verdict[2], CLUSTER_RECOVERY_STREAM_UNREADABLE);
 	UT_ASSERT_EQ(root_reads, 1); UT_ASSERT_EQ(source_reads, 1);
-	fixture(); root.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
-	root.published_at_usec = GetCurrentTimestamp();
-	cluster_recovery_workers_launch();
-	CurrentResourceOwner = NULL;
-	cluster_recovery_worker_main(Int32GetDatum(0));
-	UT_ASSERT_EQ(worker_pool.stream_verdict[2], CLUSTER_RECOVERY_STREAM_SKIPPED);
-	UT_ASSERT_EQ(root_reads, 1); UT_ASSERT_EQ(registry_reads, 0);
+	for (unsigned sample = 0; sample < 3; sample++) {
+		fixture(); root.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+		root.published_at_usec = sample == 0 ? 1 : GetCurrentTimestamp() + sample;
+		cluster_recovery_workers_launch();
+		CurrentResourceOwner = NULL;
+		cluster_recovery_worker_main(Int32GetDatum(0));
+		UT_ASSERT_EQ(worker_pool.stream_verdict[2], CLUSTER_RECOVERY_STREAM_UNREADABLE);
+		UT_ASSERT_EQ(root_reads, 1); UT_ASSERT_EQ(registry_reads, 0);
+	}
 }
 int
 main(void)
@@ -306,7 +308,7 @@ main(void)
 	UT_RUN(test_pre2_source_refusal_is_not_legacy_fallback);
 	UT_RUN(test_legacy_registry_selection_is_unchanged);
 	UT_RUN(test_launch_pins_complete_pre2_input_before_background_reads);
-	UT_RUN(test_background_keeps_stale_launch_and_alive_refusals);
+	UT_RUN(test_background_keeps_stale_launch_and_unsealed_refusals);
 	if (scratch[0] && !rmtree(scratch, true)) abort();
 	UT_DONE(); return ut_failed_count != 0;
 }

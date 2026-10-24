@@ -9891,6 +9891,8 @@ test_cluster_recovery_plan_generate.inc: $(top_srcdir)/src/backend/cluster/clust
 
 test_cluster_recovery_plan_source: test_cluster_recovery_plan_source.c unit_test.h \
         test_cluster_recovery_plan_generate.inc \
+        $(top_srcdir)/src/include/cluster/cluster_reconfig.h \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_duty.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 

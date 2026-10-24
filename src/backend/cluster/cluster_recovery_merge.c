@@ -1535,9 +1535,12 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 	}
 	/* Only the same complete cohort's original input producers can make a
 	 * fresh census usable. Re-publish once after readiness, never to age or
-	 * override an ALIVE verdict. No claim or fence has been acquired yet. */
+	 * override an ALIVE verdict. UNKNOWN may be a predecessor's unsealed
+	 * OPEN, but only the complete original cohort input cut can resolve it.
+	 * No claim or fence has been acquired yet. */
 	if (cluster_shared_config && cluster_recovery_plan_snapshot(&observed)
-		&& !observed.failed && observed.own_thread == own_thread && observed.n_alive > 0) {
+		&& !observed.failed && observed.own_thread == own_thread
+		&& (observed.n_alive > 0 || observed.n_unknown > 0)) {
 		if (!recovery_merge_wait_cold_inputs(own_thread))
 			return CLUSTER_MERGE_NO_NOT_COLD;
 		cluster_recovery_plan_generate(observed.dbstate_at_startup, observed.local_recovery_needed);

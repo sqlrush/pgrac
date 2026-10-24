@@ -51,6 +51,8 @@
 #include "miscadmin.h"
 #include "cluster/cluster_control_root.h" /* RF-ROOT P7 G1b step 4: canonical verdict source */
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_worker.h" /* pool lives in this wrapper (spec-4.4 D5) */
 #include "cluster/cluster_scn.h"
@@ -291,6 +293,8 @@ cluster_recovery_plan_generate(uint32 dbstate_at_startup, bool local_recovery_ne
 	int64 now_us;
 	uint16 tid;
 	bool root_source;
+	ClusterFormationSnapshotV1 membership;
+	bool membership_current = false;
 
 	if (cluster_wal_threads_dir == NULL || cluster_wal_threads_dir[0] == '\0')
 		return;
@@ -316,6 +320,9 @@ cluster_recovery_plan_generate(uint32 dbstate_at_startup, bool local_recovery_ne
 	if (!cluster_shared_config)
 		cluster_control_root_restore_bit22_latch_if_active();
 	root_source = cluster_shared_config || cluster_r4_bit22_cutover_active();
+	if (cluster_shared_config)
+		membership_current = cluster_reconfig_capture_formation_snapshot_v1(own_thread, &membership)
+			&& membership.startup_formation_generation != 0;
 
 	/*
 	 * Defensive pass-level gate.  Under today's startup ordering the
@@ -355,7 +362,31 @@ cluster_recovery_plan_generate(uint32 dbstate_at_startup, bool local_recovery_ne
 			 */
 			root_result = cluster_control_root_read_canonical_discovered(tid, &snapshot, &token);
 			read_verdict = (int)root_result;
-			verdict = cluster_recovery_classify_root_slot(root_result, &snapshot, own_thread, tid,
+			if (cluster_shared_config && tid != own_thread
+				&& (root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+					|| root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+				&& snapshot.identity.origin_node_id == (int32)tid - 1
+				&& snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN) {
+				uint32 node = tid - 1;
+				uint64 boot = membership_current
+					? membership.membership.last_admitted_incarnation[node] : 0;
+
+				/* PRE2 membership belongs to the accepted formation, not a
+				 * checkpoint-aged ROOT publication. A predecessor's OPEN is
+				 * unsealed input, never evidence of a live or dead old writer.
+				 * The original cold cohort/self-seal and isolation owners must
+				 * still establish recoverable inputs before admission. */
+				verdict = membership_current && boot != 0
+					&& membership.membership.membership_state[node] == CLUSTER_MEMBER_MEMBER
+					&& snapshot.identity.origin_owner_incarnation == boot
+					? CLUSTER_RECOVERY_THREAD_ALIVE : CLUSTER_RECOVERY_THREAD_UNKNOWN;
+				ereport(LOG, (errmsg("recovery ROOT membership observation thread=%u root_boot="
+					UINT64_FORMAT " member_boot=" UINT64_FORMAT " formation_current=%d verdict=%d",
+					(unsigned)tid, snapshot.identity.origin_owner_incarnation, boot,
+					membership_current ? 1 : 0, (int)verdict)));
+			}
+			else
+				verdict = cluster_recovery_classify_root_slot(root_result, &snapshot, own_thread, tid,
 														  now_us, CheckPointTimeout);
 
 			if (root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY

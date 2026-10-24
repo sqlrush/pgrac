@@ -141,24 +141,46 @@ UT_TEST(test_snapshot_is_a_copy_and_unpublished_input_is_not_consumed)
 	UT_ASSERT(strstr(last_plan_log_detail, "PLAN_SNAPSHOT_UNAVAILABLE") != NULL);
 }
 
-UT_TEST(test_published_census_reprojects_after_original_foreign_seals)
+static ClusterControlRootSnapshot completed_peer_inputs[2];
+
+static void
+complete_original_input_seals(void)
+{
+	for (uint16 tid = 2; tid <= 3; tid++) {
+		uint64 next_publish_seq = roots[tid].root_publish_seq + 1;
+		roots[tid] = completed_peer_inputs[tid - 2];
+		roots[tid].root_publish_seq = next_publish_seq;
+		tokens[tid].lifecycle = roots[tid].lifecycle;
+		tokens[tid].root_flags = roots[tid].root_flags;
+		tokens[tid].root_publish_seq++;
+	}
+}
+
+UT_TEST(test_published_census_reprojects_after_original_input_seals)
 {
 	ClusterRecoveryPlan observed;
 	ClusterRecoveryFencePlan *plan = NULL;
 
 	pipeline_fixture();
+	completed_peer_inputs[0] = roots[2];
+	completed_peer_inputs[1] = roots[3];
 	make_open(2);
 	make_sealed_without_tail(3);
 	cluster_recovery_plan_generate(DB_IN_PRODUCTION, true);
 	UT_ASSERT(cluster_recovery_plan_snapshot(&observed));
-	UT_ASSERT_EQ(observed.n_crashed_candidate, 3);
+	/* An old OPEN cannot become a candidate by aging its ROOT timestamp.
+	 * The original input owners complete both peer self-seal stages. */
+	UT_ASSERT_EQ(observed.n_crashed_candidate, 2);
+	UT_ASSERT_EQ(observed.n_unknown, 1);
+	cold_wait_hook = complete_original_input_seals;
 	expect_engaged(&plan);
 	if (plan == NULL)
 		return;
-	UT_ASSERT_EQ(open_calls[2], 1);
-	UT_ASSERT_EQ(tail_calls[2], 1);
+	UT_ASSERT_EQ(cold_input_waits, 1);
+	UT_ASSERT_EQ(open_calls[2], 0);
+	UT_ASSERT_EQ(tail_calls[2], 0);
 	UT_ASSERT_EQ(open_calls[3], 0);
-	UT_ASSERT_EQ(tail_calls[3], 1);
+	UT_ASSERT_EQ(tail_calls[3], 0);
 	UT_ASSERT_EQ(plan->origin_count, 3);
 	UT_ASSERT_EQ(plan->start_lsn[1], OWN_REDO);
 	UT_ASSERT_EQ(plan->start_lsn[2], redo[2]);
@@ -229,7 +251,7 @@ UT_TEST(test_generated_alive_peer_keeps_cold_preflight_closed)
 	UT_ASSERT_EQ(cold_input_waits, 0);
 }
 
-UT_TEST(test_published_alive_observation_is_refreshed_before_admission)
+UT_TEST(test_published_unsealed_observation_is_refreshed_before_admission)
 {
 	ClusterRecoveryPlan observed;
 	ClusterRecoveryFencePlan *plan = NULL;
@@ -241,7 +263,8 @@ UT_TEST(test_published_alive_observation_is_refreshed_before_admission)
 	roots[2].published_at_usec = GetCurrentTimestamp();
 	cluster_recovery_plan_generate(DB_IN_PRODUCTION, true);
 	UT_ASSERT(cluster_recovery_plan_snapshot(&observed));
-	UT_ASSERT_EQ(observed.n_alive, 1);
+	UT_ASSERT_EQ(observed.n_alive, 0);
+	UT_ASSERT_EQ(observed.n_unknown, 1);
 	/* The original peer self-seal completed before this consumer began.
 	 * The published observational census still describes its prior OPEN. */
 	roots[2].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
@@ -264,7 +287,8 @@ seal_next_cohort_input(void)
 	ClusterRecoveryPlan observed;
 	uint16 tid = (uint16)cold_input_waits + 1;
 	UT_ASSERT(cluster_recovery_plan_snapshot(&observed));
-	UT_ASSERT_EQ(observed.n_alive, 3);
+	UT_ASSERT_EQ(observed.n_alive, 0);
+	UT_ASSERT_EQ(observed.n_unknown, 3);
 	UT_ASSERT_EQ(observed.n_crashed_candidate, 0);
 	UT_ASSERT(tid >= 2 && tid <= NODES);
 	roots[tid].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
@@ -286,7 +310,8 @@ UT_TEST(test_cold_admission_waits_for_all_original_peer_self_seals)
 	}
 	cluster_recovery_plan_generate(DB_IN_PRODUCTION, true);
 	UT_ASSERT(cluster_recovery_plan_snapshot(&observed));
-	UT_ASSERT_EQ(observed.n_alive, 3);
+	UT_ASSERT_EQ(observed.n_alive, 0);
+	UT_ASSERT_EQ(observed.n_unknown, 3);
 	cold_wait_hook = seal_next_cohort_input;
 	UT_ASSERT(preflight(&plan, &engage));
 	UT_ASSERT_EQ(engage, CLUSTER_MERGE_ENGAGE);
@@ -420,17 +445,82 @@ UT_TEST(test_cold_wait_includes_peers_unfinished_tail_seal)
 	cluster_recovery_merge_fence_plan_destroy(&plan);
 }
 
+UT_TEST(test_previous_boot_open_is_not_current_membership)
+{
+	TimestampTz publications[] = {1, GetCurrentTimestamp(), GetCurrentTimestamp() + 1000000};
+	ClusterRecoveryPlan observed;
+	unsigned i;
+
+	for (i = 0; i < lengthof(publications); i++)
+	{
+		pipeline_fixture();
+		roots[2].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+		roots[2].published_at_usec = publications[i];
+		cluster_recovery_plan_generate(DB_IN_PRODUCTION, true);
+		UT_ASSERT(cluster_recovery_plan_snapshot(&observed));
+		UT_ASSERT_EQ(observed.n_alive, 0);
+		UT_ASSERT_EQ(observed.n_unknown, 1);
+		UT_ASSERT(!cluster_recovery_plan_candidate_test(&observed, 2));
+	}
+}
+
+UT_TEST(test_current_boot_membership_does_not_expire_with_root_age)
+{
+	TimestampTz publications[] = {1, GetCurrentTimestamp(), GetCurrentTimestamp() + 1000000};
+	ClusterRecoveryPlan observed;
+	unsigned i;
+
+	for (i = 0; i < lengthof(publications); i++)
+	{
+		pipeline_fixture();
+		roots[2].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+		roots[2].identity.origin_owner_incarnation = 12;
+		roots[2].published_at_usec = publications[i];
+		cluster_recovery_plan_generate(DB_IN_PRODUCTION, true);
+		UT_ASSERT(cluster_recovery_plan_snapshot(&observed));
+		UT_ASSERT_EQ(observed.n_alive, 1);
+		UT_ASSERT_EQ(observed.n_unknown, 0);
+		UT_ASSERT(!cluster_recovery_plan_candidate_test(&observed, 2));
+	}
+}
+
+UT_TEST(test_unaccepted_boot_cannot_supply_root_liveness)
+{
+	ClusterRecoveryPlan observed;
+
+	for (unsigned missing = 0; missing < 3; missing++) {
+		pipeline_fixture();
+		roots[2].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+		roots[2].identity.origin_owner_incarnation = 12;
+		roots[2].published_at_usec = GetCurrentTimestamp();
+		if (missing == 0)
+			cold_cohort.startup_formation_generation = 0;
+		else if (missing == 1)
+			cold_cohort.membership.membership_state[1] = CLUSTER_MEMBER_ABSENT;
+		else
+			roots[2].identity.origin_owner_incarnation++;
+		cluster_recovery_plan_generate(DB_IN_PRODUCTION, true);
+		UT_ASSERT(cluster_recovery_plan_snapshot(&observed));
+		UT_ASSERT_EQ(observed.n_alive, 0);
+		UT_ASSERT_EQ(observed.n_unknown, 1);
+		UT_ASSERT(!cluster_recovery_plan_candidate_test(&observed, 2));
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(17);
+	UT_RUN(test_previous_boot_open_is_not_current_membership);
+	UT_RUN(test_current_boot_membership_does_not_expire_with_root_age);
+	UT_RUN(test_unaccepted_boot_cannot_supply_root_liveness);
 	UT_RUN(test_published_pre2_census_reaches_actual_cold_preflight);
 	UT_RUN(test_snapshot_is_a_copy_and_unpublished_input_is_not_consumed);
-	UT_RUN(test_published_census_reprojects_after_original_foreign_seals);
+	UT_RUN(test_published_census_reprojects_after_original_input_seals);
 	UT_RUN(test_generated_failed_source_is_consumed_as_no_plan);
 	UT_RUN(test_generated_unknown_never_reaches_fence_admission);
 	UT_RUN(test_generated_alive_peer_keeps_cold_preflight_closed);
-	UT_RUN(test_published_alive_observation_is_refreshed_before_admission);
+	UT_RUN(test_published_unsealed_observation_is_refreshed_before_admission);
 	UT_RUN(test_cold_admission_waits_for_all_original_peer_self_seals);
 	UT_RUN(test_cold_input_wait_rejects_boot_cohort_drift);
 	UT_RUN(test_cold_input_wait_preserves_selected_history_refusal);
