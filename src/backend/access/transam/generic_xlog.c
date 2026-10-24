@@ -23,8 +23,10 @@
 /* PGRAC: exact versions for the three internal cleanup owners. */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_page_cold_redo.h"
+#include "cluster/cluster_recovery_stamp.h"
 #include "cluster/cluster_space_storage.h"
 #include "common/cryptohash.h"
+#include "postmaster/interrupt.h"
 #endif
 
 /*-------------------------------------------------------------------------
@@ -607,6 +609,108 @@ GenericXLogRecoveryImageRegister(GenericXLogRecoveryImageV1 *image)
 	XLogRegisterBlock(0, &image->identity.key.locator, image->fork_number,
 		image->block_number, image->image.data, REGBUF_FORCE_IMAGE | REGBUF_STANDARD);
 	return rf_page_producer_register_wal_v1(&batch);
+}
+
+/* Publish only the existing E1 recoverer's private frame. The full image is
+ * copied before WAL preparation/PAGE promotion; the window has its descriptor.
+ * Image hashing and native capacity preparation precede PAGE promotion. */
+bool
+GenericXLogRecoveryImageFinish(const GenericXLogRecoveryImageV1 *image,
+	const ClusterRecoveryStampOwnerV1 *owner, RfPageAuthorityPreflightV1 *preflight,
+	ClusterRecoverySerialGuard *serial, ClusterWalRetentionPin *pin,
+	ClusterRecoveryFpiInsertV1 *out)
+{
+	ClusterRecoveryStampOwnerV1 fixed_owner;
+	ClusterWalWriterToken installed;
+	GenericXLogRecoveryImageDescriptorV1 descriptor;
+	RfPageIdentityV1 target = {0};
+	uint8 operation_uuid[16];
+	uint64 install_generation;
+	volatile bool completed = false;
+
+	if (out == NULL)
+		return false;
+	if ((image != NULL && genericXLogImageRangesOverlap(out, sizeof(*out), image, sizeof(*image)))
+		|| (owner != NULL && genericXLogImageRangesOverlap(out, sizeof(*out), owner, sizeof(*owner)))
+		|| (serial != NULL && genericXLogImageRangesOverlap(out, sizeof(*out), serial, sizeof(*serial))))
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!cluster_enabled || !cluster_shared_config || !IsUnderPostmaster
+		|| MyBackendType != B_STARTUP || MyProcPid <= 0 || CritSectionCount != 0
+		|| ShutdownRequestPending || RecoveryInProgress() || image == NULL || owner == NULL
+		|| preflight == NULL || serial == NULL || pin == NULL || owner->executor_pid != MyProcPid
+		|| !serial->held || serial->release_uncertain
+		|| serial->mode != CLUSTER_RECOVERY_SERIAL_COLD_FORMED)
+		return false;
+	fixed_owner = *owner;
+	if (!ClusterStartupInstalledRecoveryWriterV1(&installed, operation_uuid, &install_generation)
+		|| install_generation == 0 || installed.epoch != fixed_owner.writer.epoch
+		|| installed.startup_first_lsn != fixed_owner.writer.startup_first_lsn
+		|| memcmp(&installed.ref, &fixed_owner.writer.ref, sizeof(installed.ref)) != 0)
+		return false;
+	out->image = *image;
+	if (!GenericXLogRecoveryImageDescribe(&out->image, &descriptor)) {
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
+	/* Native capacity may allocate. The existing typed guard is promoted only
+	 * after all image and record-storage preparation has finished. */
+	XLogEnsureRecordSpace(0, 0);
+	target.system_identifier = out->image.identity.key.system_identifier;
+	memcpy(target.storage_uuid, out->image.identity.key.storage_uuid, 16);
+	target.locator = out->image.identity.key.locator;
+	target.forknum = out->image.fork_number;
+	target.blockno = out->image.block_number;
+	if (rf_page_authority_batch_promote_nowait_v1(preflight, serial, &out->guard)
+		!= RF_PAGE_AUTHORITY_OK) {
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
+
+	PG_TRY();
+	{
+		if (cluster_recovery_stamp_prepare_fpi_v1(&fixed_owner, &target, &descriptor,
+				out->guard, serial, pin, &out->window)) {
+			if (cluster_wal_writer_check(&fixed_owner.writer) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				|| rf_page_authority_batch_revalidate_nowait_v1(out->guard, serial)
+					!= RF_PAGE_AUTHORITY_OK) {
+				/* No insertion or target mutation has started on this branch. */
+				if (cluster_recovery_stamp_cancel_v1(&out->window))
+					memset(&out->window, 0, sizeof(out->window));
+				else
+					(void)cluster_recovery_stamp_fail_v1(&out->window);
+			} else {
+				START_CRIT_SECTION();
+				if (!cluster_recovery_stamp_inserting_v1(&out->window))
+					ereport(PANIC, (errmsg("could not begin recovery page image insertion")));
+				XLogBeginInsert();
+				if (!GenericXLogRecoveryImageRegister(&out->image))
+					ereport(PANIC, (errmsg("could not register recovery page image")));
+				out->record_end = XLogInsert(RM_GENERIC_ID, 0);
+				out->record_start = ProcLastRecPtr;
+				if (!cluster_recovery_stamp_inserted_v1(&out->window,
+						out->record_start, out->record_end))
+					ereport(PANIC, (errmsg("could not record recovery page image insertion")));
+				END_CRIT_SECTION();
+				XLogFlush(out->record_end);
+				if (cluster_wal_writer_check(&fixed_owner.writer) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+					&& rf_page_authority_batch_revalidate_nowait_v1(out->guard, serial)
+						== RF_PAGE_AUTHORITY_OK) {
+					out->wal_flushed = true;
+					completed = true;
+				} else
+					(void)cluster_recovery_stamp_fail_v1(&out->window);
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		if (out->window.key.window_seq != 0)
+			(void)cluster_recovery_stamp_fail_v1(&out->window);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return completed;
 }
 #endif
 

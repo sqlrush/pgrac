@@ -36,6 +36,35 @@ static bool found_region;
 static ClusterRecoveryStampOwnerV1 owner;
 static uint8 payload[CLUSTER_RECOVERY_TT_ABORT_BYTES];
 static unsigned stamp_hash_calls;
+static char fpi_guard_object, fpi_pin_object;
+static ClusterRecoverySerialGuard fpi_serial;
+static RfPageIdentityV1 fpi_target;
+static bool fpi_protection_current;
+
+/* PAGE authority is exercised with its real promoted guards in
+ * test_cluster_page_authority. This slot fixture controls only that boundary;
+ * SPACE decoding, immutable windows and checkpoint/exit states stay real. */
+bool
+rf_page_authority_recovery_reference_v1(const RfPageAuthorityGuardV1 *guard,
+	ClusterRecoverySerialGuard *serial, ClusterWalRetentionPin *pin,
+	const RfPageIdentityV1 *identity, const RfPageVersionV1 *version,
+	RfPageRecoveryReferenceV1 *out)
+{
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	for (unsigned i = 0; i <= CLUSTER_RECOVERY_STAMP_SLOTS; i++)
+		UT_ASSERT(SpinLockFree(&region.thread_replay[i].stamp.lock));
+	if (!fpi_protection_current || guard != (RfPageAuthorityGuardV1 *)&fpi_guard_object
+		|| serial != &fpi_serial || pin != (ClusterWalRetentionPin *)&fpi_pin_object
+		|| identity->system_identifier != 99 || identity->storage_uuid[0] != 1
+		|| identity->locator.spcOid != 1663 || identity->locator.dbOid != 8
+		|| identity->locator.relNumber != 900 || identity->forknum != MAIN_FORKNUM
+		|| identity->blockno != 7 || version->mutation_token != 20
+		|| version->segment_incarnation[0] != 6)
+		return false;
+	*out = (RfPageRecoveryReferenceV1){ .source_binding_cookie = 71,
+		.protection_fingerprint = 55, .partition = 3 };
+	return true;
+}
 
 /* Observe the actual D0 codec's provider allocation, rather than replacing
  * its decode result. All original slot locks must already be released. */
@@ -126,11 +155,13 @@ errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused()
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 
+#ifndef CLUSTER_STAMP_EXTERNAL_RETHROW_PROVIDER
 void
 pg_re_throw(void)
 {
 	siglongjmp(*PG_exception_stack, 1);
 }
+#endif
 static uint8 target_payload[320];
 static ClusterUndoSmgrRecoveryStampV1 target_stamp = { .token = 37 };
 static const uint8 *apply_raw, *apply_start;
@@ -254,6 +285,7 @@ flush_unlocked(void)
 
 /* These are original writer/native WAL leaves, not graph or IO authority.
  * The real startup accessor is separately exercised in its existing suite. */
+#ifndef CLUSTER_STAMP_EXTERNAL_WAL_PROVIDER
 ClusterControlRootResult
 cluster_wal_writer_check(const ClusterWalWriterToken *writer)
 {
@@ -292,6 +324,7 @@ XLogFlush(XLogRecPtr end)
 		break;
 	}
 }
+#endif
 
 bool
 ClusterXLogStartupFlushCovers(XLogRecPtr end, TimeLineID timeline)
@@ -327,6 +360,7 @@ native_insert_boundary(unsigned stage)
 	if (native_throw == stage)
 		siglongjmp(insert_error_boundary, 1);
 }
+#ifndef CLUSTER_STAMP_EXTERNAL_WAL_PROVIDER
 void
 XLogBeginInsert(void)
 {
@@ -335,6 +369,7 @@ XLogBeginInsert(void)
 	UT_ASSERT(!begininsert_called);
 	begininsert_called = true;
 }
+#endif
 void
 XLogRegisterData(char *data, uint32 length)
 {
@@ -344,6 +379,7 @@ XLogRegisterData(char *data, uint32 length)
 	UT_ASSERT(memcmp(data, region.thread_replay[2].stamp.handle.payload, 320) == 0);
 	memcpy(registered_payload, data, 320);
 }
+#ifndef CLUSTER_STAMP_EXTERNAL_WAL_PROVIDER
 XLogRecPtr
 XLogInsert(RmgrId rmid, uint8 info)
 {
@@ -390,6 +426,7 @@ XLogInsert(RmgrId rmid, uint8 info)
 	memcpy(hdr_scratch, &native_header, SizeOfXLogRecord);
 	return XactLastRecEnd;
 }
+#endif
 #include "test_cluster_recovery_stamp_insert.inc"
 
 /* Use the actual codec/provider. Allocation must be outside every original
@@ -548,6 +585,53 @@ begin(ClusterRecoveryStampHandleV1 *h)
 												sizeof(payload), h);
 	UT_ASSERT(ok);
 	return ok;
+}
+
+static void
+fresh_fpi(GenericXLogRecoveryImageDescriptorV1 *descriptor)
+{
+	ClusterSpaceIdentity identity = {0};
+	fresh();
+	memset(&fpi_serial, 0, sizeof(fpi_serial));
+	fpi_serial.duty = owner.target.identity;
+	fpi_serial.held = true;
+	fpi_serial.mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+	fpi_protection_current = true;
+	memset(descriptor, 0, sizeof(*descriptor));
+	identity.key.system_identifier = 99;
+	identity.key.database_incarnation = 8;
+	memset(identity.key.storage_uuid, 1, 16);
+	identity.key.locator = (RelFileLocator){1663, 8, 900};
+	memset(identity.incarnation, 6, 16);
+	identity.sequence = identity.operation = 1;
+	identity.state = CLUSTER_SPACE_IDENTITY_LIVE;
+	memset(&fpi_target, 0, sizeof(fpi_target));
+	fpi_target.system_identifier = 99;
+	memset(fpi_target.storage_uuid, 1, 16);
+	fpi_target.locator = identity.key.locator;
+	fpi_target.forknum = MAIN_FORKNUM;
+	fpi_target.blockno = 7;
+	UT_ASSERT(cluster_space_identity_encode(&identity, descriptor->space_identity,
+		sizeof(descriptor->space_identity)));
+	descriptor->owner = GENERIC_XLOG_CTRC_ITL;
+	descriptor->fork_number = MAIN_FORKNUM;
+	descriptor->block_number = 7;
+	descriptor->result_token = 101;
+	descriptor->version.page_class = RF_PAGE_CLASS_ORDINARY;
+	descriptor->version.before_kind = descriptor->version.result_kind = RF_PAGE_STATE_PRESENT;
+	memset(descriptor->version.before.segment_incarnation, 6, 16);
+	descriptor->version.before.mutation_token = 20;
+	memset(descriptor->version.result_incarnation, 6, 16);
+	memset(descriptor->after_sha256, 9, sizeof(descriptor->after_sha256));
+}
+
+static bool
+begin_fpi(const GenericXLogRecoveryImageDescriptorV1 *descriptor,
+	ClusterRecoveryStampHandleV1 *out)
+{
+	return cluster_recovery_stamp_prepare_fpi_v1(&owner, &fpi_target, descriptor,
+		(RfPageAuthorityGuardV1 *)&fpi_guard_object, &fpi_serial,
+		(ClusterWalRetentionPin *)&fpi_pin_object, out);
 }
 static void
 insert(ClusterRecoveryStampHandleV1 *h)
@@ -3149,10 +3233,110 @@ UT_TEST(worker_stop_rejects_snapshot_drift_without_poisoning_current_window)
 	}
 }
 
+UT_TEST(fpi_window_requires_protected_typed_preparation)
+{
+	GenericXLogRecoveryImageDescriptorV1 descriptor;
+	ClusterRecoveryStampHandleV1 handle, next;
+	ClusterRecoveryStampFpiV1 envelope;
+	ClusterRecoveryStampCaptureV1 capture;
+	fresh_fpi(&descriptor);
+	UT_ASSERT(!cluster_recovery_stamp_prepare_v1(&owner, CLUSTER_RECOVERY_STAMP_FPI,
+		(const uint8 *)&descriptor, sizeof(descriptor), &handle));
+	UT_ASSERT(begin_fpi(&descriptor, &handle));
+	UT_ASSERT_EQ(handle.kind, CLUSTER_RECOVERY_STAMP_FPI);
+	UT_ASSERT_EQ(handle.payload_length, sizeof(envelope));
+	UT_ASSERT_EQ(sizeof(handle.payload), 320);
+	memcpy(&envelope, handle.payload, sizeof(envelope));
+	UT_ASSERT_EQ(envelope.image.block_number, 7);
+	UT_ASSERT_EQ(envelope.protection.source_binding_cookie, 71);
+	UT_ASSERT_EQ(envelope.protection.protection_fingerprint, 55);
+	UT_ASSERT(!cluster_recovery_stamp_prepare_v1(&owner, CLUSTER_RECOVERY_STAMP_FPI,
+		handle.payload, handle.payload_length, &next));
+	UT_ASSERT(cluster_recovery_stamp_capture_v1(&capture));
+	UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&capture), CLUSTER_RECOVERY_STAMP_PENDING);
+	descriptor.after_sha256[0] ^= 1;
+	UT_ASSERT_EQ(handle.payload[offsetof(ClusterRecoveryStampFpiV1, image.after_sha256)], 9);
+	UT_ASSERT(!cluster_recovery_stamp_prepare_v1(&owner, CLUSTER_RECOVERY_STAMP_C0,
+		payload, sizeof(payload), &next));
+	UT_ASSERT(!cluster_recovery_stamp_durable_v1(&handle));
+	UT_ASSERT(cluster_recovery_stamp_cancel_v1(&handle));
+	UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&capture), CLUSTER_RECOVERY_STAMP_COMPLETE);
+	descriptor = envelope.image;
+	UT_ASSERT(begin_fpi(&descriptor, &next));
+	insert(&next);
+	UT_ASSERT(cluster_recovery_stamp_durable_v1(&next));
+	UT_ASSERT(cluster_recovery_stamp_clear_v1(&next));
+}
+
+UT_TEST(fpi_refuses_stale_protection_target_version_and_bad_shape)
+{
+	for (unsigned fault = 0; fault < 13; fault++) {
+		GenericXLogRecoveryImageDescriptorV1 descriptor;
+		ClusterRecoveryStampHandleV1 handle;
+		ClusterRecoveryStampCaptureV1 capture;
+		fresh_fpi(&descriptor);
+		switch (fault) {
+		case 0: fpi_protection_current = false; break;
+		case 1: descriptor.owner = GENERIC_XLOG_ITL_FINISH; break;
+		case 2: descriptor.fork_number = VISIBILITYMAP_FORKNUM; break;
+		case 3: descriptor.block_number = InvalidBlockNumber; break;
+		case 4: descriptor.result_token = 0; break;
+		case 5: descriptor.version.before.mutation_token = 0; break;
+		case 6: descriptor.version.before.mutation_token++; break;
+		case 7: descriptor.version.result_incarnation[15]++; break;
+		case 8: descriptor.space_identity[127] ^= 1; break;
+		case 9: memset(descriptor.after_sha256, 0, sizeof(descriptor.after_sha256)); break;
+		case 10: fpi_serial.duty.origin_owner_incarnation++; break;
+		case 11: fpi_serial.held = false; break;
+		case 12: descriptor.block_number++; break;
+		}
+		memset(&handle, 0xa5, sizeof(handle));
+		UT_ASSERT(!begin_fpi(&descriptor, &handle));
+		UT_ASSERT_EQ(handle.key.window_seq, 0);
+		UT_ASSERT(cluster_recovery_stamp_capture_v1(&capture));
+		UT_ASSERT_EQ(capture.count, 0);
+	}
+}
+
+UT_TEST(fpi_inserted_failure_and_worker_exit_keep_immutable_debt)
+{
+	GenericXLogRecoveryImageDescriptorV1 descriptor;
+	ClusterRecoveryStampHandleV1 handle, changed;
+	ClusterRecoveryStampCaptureV1 capture;
+	ClusterRecoveryStampSlotV1 *slot;
+	fresh_fpi(&descriptor);
+	MyBackendType = B_BG_WORKER;
+	pg_atomic_write_u64(&region.thread_replay[2].episode_epoch, 81);
+	pg_atomic_write_u32(&region.thread_replay[2].state, CLUSTER_THREADREC_REPLAY_REPLAYING);
+	UT_ASSERT(cluster_recovery_stamp_worker_begin_v1(2, 81));
+	UT_ASSERT(begin_fpi(&descriptor, &handle));
+	UT_ASSERT(cluster_recovery_stamp_capture_v1(&capture));
+	changed = handle;
+	changed.payload[0] ^= 1;
+	CritSectionCount = 1;
+	UT_ASSERT(!cluster_recovery_stamp_inserting_v1(&changed));
+	UT_ASSERT(cluster_recovery_stamp_inserting_v1(&handle));
+	UT_ASSERT(cluster_recovery_stamp_inserted_v1(&handle, 0x2000010, 0x2000200));
+	CritSectionCount = 0;
+	UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&handle));
+	UT_ASSERT(cluster_recovery_stamp_fail_v1(&handle));
+	UT_ASSERT(!cluster_recovery_stamp_durable_v1(&handle));
+	UT_ASSERT(!cluster_recovery_stamp_clear_v1(&handle));
+	MyBackendType = B_LMON;
+	UT_ASSERT(cluster_recovery_stamp_worker_stopped_v1(2, 81));
+	slot = &region.thread_replay[2].stamp;
+	UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_ADOPT_PENDING);
+	UT_ASSERT_EQ(slot->adopt_from, CLUSTER_RECOVERY_STAMP_INSERTED);
+	UT_ASSERT(memcmp(&slot->handle, &handle, sizeof(handle)) == 0);
+	UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&capture), CLUSTER_RECOVERY_STAMP_PENDING);
+	slot->handle.payload[0] ^= 1;
+	UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&capture), CLUSTER_RECOVERY_STAMP_INVALID);
+}
+
 int
 main(void)
 {
-	UT_PLAN(71);
+	UT_PLAN(74);
 	UT_RUN(worker_stop_rejects_corrupt_c0_d0_without_changing_debt);
 	UT_RUN(worker_stop_rejects_snapshot_drift_without_poisoning_current_window);
 	UT_RUN(original_worker_stop_keeps_c0_d0_and_blocks_replacement);
@@ -3224,6 +3408,9 @@ main(void)
 	UT_RUN(d0_execute_reference_hash_refusal_keeps_completed_operation_and_outputs);
 	UT_RUN(d0_execute_reference_hash_error_propagates_after_completed_close);
 	UT_RUN(d0_execute_reference_postinsert_panic_preserves_original_duty);
+	UT_RUN(fpi_window_requires_protected_typed_preparation);
+	UT_RUN(fpi_refuses_stale_protection_target_version_and_bad_shape);
+	UT_RUN(fpi_inserted_failure_and_worker_exit_keep_immutable_debt);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

@@ -84,6 +84,23 @@ extern bool GenericXLogRecoveryImagePrepare(GenericXLogInternalOwner owner,
 	const ClusterSpaceIdentity *identity, ForkNumber fork_number, BlockNumber block_number,
 	const char *before_image, const char *after_image, GenericXLogRecoveryImageV1 *out);
 extern bool GenericXLogRecoveryImageRegister(GenericXLogRecoveryImageV1 *image);
+
+struct ClusterRecoveryStampOwnerV1;
+struct RfPageAuthorityPreflightV1;
+struct ClusterRecoverySerialGuard;
+struct ClusterWalRetentionPin;
+struct ClusterRecoveryFpiInsertV1;
+/* E1 recovered Startup only, after actual INSTALL/native DONE. This is the
+ * native WAL leg: hash/capacity before nowait PAGE promotion, then the exact
+ * F4 window, insertion and flush. No target write, discharge or DURABLE.
+ * Supply a fresh, separate local result and retain it and all borrowed owners
+ * through typed install/sync/postread and responsibility discharge. A returned
+ * guard remains held even on false/ERROR. Aliased known inputs refuse unchanged;
+ * other early refusals clear the result. Never reuse a live result. */
+extern bool GenericXLogRecoveryImageFinish(const GenericXLogRecoveryImageV1 *image,
+	const struct ClusterRecoveryStampOwnerV1 *owner,
+	struct RfPageAuthorityPreflightV1 *preflight, struct ClusterRecoverySerialGuard *serial,
+	struct ClusterWalRetentionPin *pin, struct ClusterRecoveryFpiInsertV1 *out);
 #endif
 
 /* API for construction of generic xlog records */

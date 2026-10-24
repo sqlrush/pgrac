@@ -8,6 +8,8 @@
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_recovery_tt_record.h"
 #include "cluster/cluster_recovery_ctrc_record.h"
+#include "cluster/cluster_page_authority.h"
+#include "access/generic_xlog.h"
 #include "storage/spin.h"
 
 #define CLUSTER_RECOVERY_STAMP_PAYLOAD_BYTES 320
@@ -59,6 +61,31 @@ typedef struct ClusterRecoveryStampHandleV1 {
 	uint8 payload[CLUSTER_RECOVERY_STAMP_PAYLOAD_BYTES];
 } ClusterRecoveryStampHandleV1;
 
+/* Local image comparison plus references to the original held protection.
+ * The locator is the typed SPACE decoder's expected key; the namespace is
+ * the immutable operation owner's. No image bytes or object pointers. */
+typedef struct ClusterRecoveryStampFpiV1 {
+	GenericXLogRecoveryImageDescriptorV1 image;
+	RelFileLocator locator;
+	uint32 reserved_zero;
+	RfPageRecoveryReferenceV1 protection;
+} ClusterRecoveryStampFpiV1;
+StaticAssertDecl(sizeof(ClusterRecoveryStampFpiV1) <= CLUSTER_RECOVERY_STAMP_PAYLOAD_BYTES,
+	"recovery FPI envelope must fit the existing stamp payload");
+
+/* Process-local WAL-leg result, never embedded in shared memory. The exact
+ * image copy remains available for subsequent typed installation. The caller
+ * retains the original preflight/serial/pin and this promoted guard on success,
+ * refusal after promotion, or ERROR. WAL flush does not retire the window. */
+typedef struct ClusterRecoveryFpiInsertV1 {
+	GenericXLogRecoveryImageV1 image;
+	RfPageAuthorityGuardV1 *guard;
+	ClusterRecoveryStampHandleV1 window;
+	XLogRecPtr record_start;
+	XLogRecPtr record_end;
+	bool wal_flushed;
+} ClusterRecoveryFpiInsertV1;
+
 /* Embedded in the original per-thread replay slot. No pointers or callbacks. */
 typedef struct ClusterRecoveryStampSlotV1 {
 	slock_t lock;
@@ -90,13 +117,22 @@ extern bool cluster_recovery_stamp_worker_stopped_v1(uint16 thread, uint64 attem
 
 /* Call only after original authority, reservation and held-FD preparation.
  * Admits exact C0/D0 bound to the original writer/target/boot/serial;
- * FPI and unknown shapes refuse. Complete codec validation is outside every
+ * Raw FPI and unknown shapes refuse. Complete codec validation is outside every
  * slot lock; transitions compare the prepared operation without decoding.
  * No WAL or IO and no authority, graph-completion or release qualification.
  * Inputs/output must not alias. Output is zero on refusal. */
 extern bool cluster_recovery_stamp_prepare_v1(const ClusterRecoveryStampOwnerV1 *owner,
 											  ClusterRecoveryStampKindV1 kind, const uint8 *payload,
 											  Size length, ClusterRecoveryStampHandleV1 *out);
+/* The sole FPI admission path. Describe the local image before promotion;
+ * consume its exact typed target and original promoted PAGE/serial/pin here.
+ * This only records PRE_INSERT, never insertion, installation or completion.
+ * Retain all borrowed objects and the local image through the actual work.
+ * Inputs/output must not alias. Output is zero on ordinary refusal. */
+extern bool cluster_recovery_stamp_prepare_fpi_v1(const ClusterRecoveryStampOwnerV1 *owner,
+	const RfPageIdentityV1 *target, const GenericXLogRecoveryImageDescriptorV1 *image,
+	const RfPageAuthorityGuardV1 *guard, ClusterRecoverySerialGuard *serial_guard,
+	ClusterWalRetentionPin *retention_pin, ClusterRecoveryStampHandleV1 *out);
 /* Both insertion transitions require the original executor's critical section.
  * INSERTED records the actual XLogInsert start/end; no insertion lock is held.
  * All transitions match the unchanged prepared operation, without allocation,

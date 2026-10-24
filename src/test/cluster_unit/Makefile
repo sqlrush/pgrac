@@ -61,7 +61,7 @@ TESTS = test_cluster_vm_read_visibility test_cluster_heap_maintenance test_clust
         test_pgrac_fenced_target_request \
         test_pgrac_fenced_pacemaker_owned \
         test_cluster_update_trace test_cluster_wait_resources test_cluster_content_trace test_cluster_tx_identity_trace test_cluster_cr_dependency test_cluster_startup_exit test_cluster_config_members test_cluster_config_mount \
-        test_cluster_heap_prepare_diagnostic test_cluster_generic_version test_cluster_generic_redo \
+        test_cluster_heap_prepare_diagnostic test_cluster_generic_version test_cluster_generic_redo test_cluster_recovery_fpi_insert \
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
         test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_ctrc_successor_fence test_cluster_ctrc_dispatch test_cluster_heap_receipt \
         test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_pgproc_active_sample test_cluster_retention_sample test_cluster_active_sample_fence test_cluster_ctrc_itl_reuse test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_ges_holder test_cluster_ko_relation_scan test_cluster_ko_current_admission test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop \
@@ -482,7 +482,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_replay_batch,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_install,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_producer test_cluster_space_fork test_cluster_space_identity test_cluster_space_page_verify test_cluster_space_table_size test_cluster_space_wal test_cluster_space_storage test_cluster_space_recovery test_cluster_space_cache test_cluster_space_recovery_route test_cluster_space_copy test_cluster_space_copy_version test_cluster_heap_insert_version test_cluster_vm_version test_cluster_vm_redo,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_space_lazy_fork,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_generic_version test_cluster_generic_redo,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_generic_version test_cluster_generic_redo test_cluster_recovery_fpi_insert,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_wal_checkpoint_sample,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_wal_retained_cut test_cluster_wal_retained_cut_records,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_cold_recovery_xid,$(SIMPLE_TESTS))
@@ -2841,6 +2841,7 @@ test_cluster_space_producer_product.o: $(top_srcdir)/src/backend/cluster/cluster
 # PGRAC: native generic producer, with only buffer/WAL I/O replaced by fixtures.
 test_cluster_generic_product.o: $(top_srcdir)/src/backend/access/transam/generic_xlog.c \
 		$(top_srcdir)/src/include/access/generic_xlog.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
 		$(top_srcdir)/src/include/cluster/cluster_page_producer.h \
 		$(top_srcdir)/src/include/cluster/cluster_space_identity.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
@@ -2863,6 +2864,24 @@ test_cluster_generic_version: test_cluster_generic_version.c unit_test.h \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+test_cluster_recovery_fpi_generic.o: $(top_srcdir)/src/backend/access/transam/generic_xlog.c \
+		$(top_srcdir)/src/include/access/generic_xlog.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Dpg_cryptohash_create=recovery_fpi_hash_create \
+		-ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_recovery_fpi_insert: test_cluster_recovery_fpi_insert.c test_cluster_recovery_stamp.c \
+		unit_test.h test_cluster_recovery_fpi_generic.o test_cluster_space_producer_product.o \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_claim.c $(CLUSTER_UNIT_CRYPTOHASH_O) Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		test_cluster_recovery_fpi_generic.o test_cluster_space_producer_product.o \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_claim.c $(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 test_cluster_space_copy_buffer.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^RelationCopyStorageUsingBuffer\(/ { print "static void"; emit=1; count++ } \
@@ -11073,7 +11092,8 @@ test_cluster_checkpoint_stamp: test_cluster_checkpoint_stamp.c test_cluster_reco
         $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 test_cluster_recovery_stamp test_cluster_recovery_stamp_exit test_cluster_checkpoint_stamp: \
-		$(top_srcdir)/src/include/access/generic_xlog.h
+		$(top_srcdir)/src/include/access/generic_xlog.h \
+		$(top_srcdir)/src/include/cluster/cluster_page_authority.h
 
 # Original retained-input owner and installed native writer, without I/O grants.
 test_cluster_cold_tx_owner.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile

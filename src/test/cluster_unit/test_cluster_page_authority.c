@@ -491,6 +491,71 @@ UT_TEST(test_identity_and_incarnation_are_exact)
 	rf_page_authority_preflight_destroy_v1(&preflight);
 }
 
+/* A promoted partition alone must not qualify a different target/version,
+ * another pin, a stale source, or an already released protection. */
+UT_TEST(test_recovery_reference_requires_exact_held_target_and_pin)
+{
+	RfPageAuthorityBatchRequestV1 request;
+	RfPageAuthorityTargetV1 targets[2];
+	ClusterRecoverySerialGuard serial, copied_serial;
+	RfPageAuthorityPreflightV1 *preflight = NULL;
+	RfPageAuthorityGuardV1 *guard = NULL;
+	RfPageRecoveryReferenceV1 reference, saved;
+	RfPageIdentityV1 other;
+	RfPageVersionV1 version;
+
+	init_case(&request, targets, &serial);
+	source_objects[0].binding_cookie = source_objects[0].current_binding_cookie = 71;
+	rf_page_guard_shmem_init_v1();
+	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(&request, 1000, &preflight),
+				 RF_PAGE_AUTHORITY_OK);
+	memset(&reference, 0xa5, sizeof(reference));
+	saved = reference;
+	UT_ASSERT(!rf_page_authority_recovery_reference_v1(NULL, &serial, PIN,
+		&targets[0].page_identity, &targets[0].expected_result, &reference));
+	UT_ASSERT(memcmp(&reference, &saved, sizeof(reference)) == 0);
+	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(preflight, &serial, &guard),
+				 RF_PAGE_AUTHORITY_OK);
+	UT_ASSERT(rf_page_authority_recovery_reference_v1(guard, &serial, PIN,
+		&targets[0].page_identity, &targets[0].expected_result, &reference));
+	UT_ASSERT_EQ(reference.source_binding_cookie, 71);
+	UT_ASSERT(reference.protection_fingerprint != 0);
+	UT_ASSERT(reference.partition < RF_PAGE_GUARD_PARTITIONS);
+	UT_ASSERT_EQ(reference.reserved_zero, 0);
+	saved = reference;
+	other = targets[0].page_identity;
+	other.blockno = 3;
+	version = targets[0].expected_result;
+	version.mutation_token++;
+	copied_serial = serial;
+	UT_ASSERT(!rf_page_authority_recovery_reference_v1(guard, &serial, PIN,
+		&other, &targets[0].expected_result, &reference));
+	UT_ASSERT(!rf_page_authority_recovery_reference_v1(guard, &serial, PIN,
+		&targets[0].page_identity, &version, &reference));
+	version = targets[0].expected_result;
+	version.segment_incarnation[15]++;
+	UT_ASSERT(!rf_page_authority_recovery_reference_v1(guard, &serial, PIN,
+		&targets[0].page_identity, &version, &reference));
+	UT_ASSERT(!rf_page_authority_recovery_reference_v1(guard, &copied_serial, PIN,
+		&targets[0].page_identity, &targets[0].expected_result, &reference));
+	UT_ASSERT(!rf_page_authority_recovery_reference_v1(guard, &serial,
+		(ClusterWalRetentionPin *)&needs_object, &targets[0].page_identity,
+		&targets[0].expected_result, &reference));
+	source_objects[0].current_binding_cookie++;
+	UT_ASSERT(!rf_page_authority_recovery_reference_v1(guard, &serial, PIN,
+		&targets[0].page_identity, &targets[0].expected_result, &reference));
+	source_objects[0].current_binding_cookie--;
+	pin_current = false;
+	UT_ASSERT(!rf_page_authority_recovery_reference_v1(guard, &serial, PIN,
+		&targets[0].page_identity, &targets[0].expected_result, &reference));
+	pin_current = true;
+	UT_ASSERT(memcmp(&reference, &saved, sizeof(reference)) == 0);
+	rf_page_authority_guard_release_v1(&guard);
+	UT_ASSERT(!rf_page_authority_recovery_reference_v1(guard, &serial, PIN,
+		&targets[0].page_identity, &targets[0].expected_result, &reference));
+	rf_page_authority_preflight_destroy_v1(&preflight);
+}
+
 UT_TEST(test_install_adapter_runs_promote_publish_release)
 {
 	RfPageAuthorityBatchRequestV1 request;
@@ -532,7 +597,7 @@ UT_TEST(test_install_adapter_runs_promote_publish_release)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
 	UT_RUN(test_exact_owner_set_promotes_and_revalidates);
 	UT_RUN(test_batch_target_set_is_not_limited_by_record_components);
 	UT_RUN(test_missing_live_stop04_object_is_invalid);
@@ -545,6 +610,7 @@ main(void)
 	UT_RUN(test_serial_duty_mismatch_blocks_page_promotion);
 	UT_RUN(test_serial_root_token_mismatch_blocks_page_promotion);
 	UT_RUN(test_identity_and_incarnation_are_exact);
+	UT_RUN(test_recovery_reference_requires_exact_held_target_and_pin);
 	UT_RUN(test_install_adapter_runs_promote_publish_release);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
