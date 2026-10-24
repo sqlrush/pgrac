@@ -119,6 +119,8 @@ static ClusterGcsUndoHeaderPathCounters transport_header;
 static ClusterGcsUndoVerdictPathCounters transport_verdict;
 static unsigned header_snapshots, verdict_snapshots;
 static bool charge_transport, reset_transport_during_resolve, overflow_transport_sum;
+static bool target_admission_current, error_target_recheck, revoke_on_target_recheck;
+static unsigned target_admission_checks;
 
 /* Backend-local transport snapshots are leaves; no reset is requested by
  * the real VACUUM owner. Counter changes below model already paid work. */
@@ -317,6 +319,20 @@ bool
 cluster_semantic_activation_recheck_r4_terminal_census(const ClusterSemanticAdmissionToken *token)
 {
 	return token->entered && debt == 1 && !changed_admission;
+}
+
+/* Full TARGET readiness is distinct from terminal-census read admission. */
+bool
+cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
+{
+	if (guard_held || pin_held || content_locked || debt != 1 || target_bindings != 0
+		|| clock_reads == 0 || cohort_receipt_checks == 0)
+		abort();
+	target_admission_checks++;
+	if (error_target_recheck) throw_error();
+	if (revoke_on_target_recheck) changed_admission = true;
+	return token->entered && token->side == CLUSTER_SEMANTIC_TARGET_SIDE
+		&& target_admission_current && !changed_admission;
 }
 
 void
@@ -708,6 +724,9 @@ reset_fixture(void)
 	memset(&transport_header, 0, sizeof(transport_header));
 	memset(&transport_verdict, 0, sizeof(transport_verdict));
 	header_snapshots = verdict_snapshots = 0;
+	target_admission_current = true;
+	error_target_recheck = revoke_on_target_recheck = false;
+	target_admission_checks = 0;
 	charge_transport = reset_transport_during_resolve = overflow_transport_sum = false;
 	vacrel.rel = &relation;
 	relation.rd_isvalid = true;
@@ -2322,10 +2341,113 @@ UT_TEST(proof_cost_transport_sum_overflow_is_unknown)
 	UT_ASSERT_EQ(debt, 0);
 }
 
+UT_TEST(positive_candidate_requires_full_target_admission)
+{
+	reset_fixture();
+	set_shared_policy(80);
+	target_admission_current = false;
+	seed_stale_cohort();
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(target_admission_checks, 1);
+	check_no_cohort();
+	UT_ASSERT_EQ(candidate_selections, 0);
+	UT_ASSERT_EQ(target_bindings, 1);
+	UT_ASSERT(vacrel.shared_freeze_fence_valid);
+	UT_ASSERT_EQ(leaves, 1);
+	UT_ASSERT_EQ(debt, 0);
+	UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+}
+
+UT_TEST(positive_candidate_full_target_recheck_uses_original_token_after_clock)
+{
+	reset_fixture();
+	set_shared_policy(80);
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(target_admission_checks, 1);
+	UT_ASSERT(vacrel.shared_freeze_cohort_observed);
+	UT_ASSERT_EQ(candidate_selections, 1);
+	UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.target_count, 1);
+	UT_ASSERT_EQ(enters, 1);
+	UT_ASSERT_EQ(leaves, 1);
+	UT_ASSERT_EQ(debt, 0);
+}
+
+UT_TEST(positive_target_recheck_error_and_cancel_use_original_cleanup)
+{
+	const int codes[] = {ERRCODE_INTERNAL_ERROR, ERRCODE_QUERY_CANCELED};
+	for (unsigned i = 0; i < lengthof(codes); i++)
+	{
+		reset_fixture();
+		set_shared_policy(80);
+		error_target_recheck = true;
+		inject_code = codes[i];
+		UT_ASSERT(collect_catches_error());
+		UT_ASSERT_EQ(caught_code, codes[i]);
+		UT_ASSERT_EQ(target_admission_checks, 1);
+		check_no_cohort();
+		UT_ASSERT_EQ(target_bindings, 0);
+		UT_ASSERT_EQ(leaves, 1);
+		UT_ASSERT_EQ(debt, 0);
+		UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+	}
+}
+
+UT_TEST(positive_target_recheck_generation_change_is_retry)
+{
+	reset_fixture();
+	set_shared_policy(80);
+	revoke_on_target_recheck = true;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	UT_ASSERT_EQ(target_admission_checks, 1);
+	check_no_cohort();
+	UT_ASSERT_EQ(target_bindings, 0);
+	UT_ASSERT(!vacrel.shared_freeze_fence_valid);
+	UT_ASSERT_EQ(leaves, 1);
+	UT_ASSERT_EQ(debt, 0);
+}
+
+UT_TEST(positive_target_recheck_skips_unproven_or_unbound_inputs)
+{
+	reset_fixture();
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(target_admission_checks, 0);
+	reset_fixture();
+	set_shared_policy(80);
+	unknown_outcome = true;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	UT_ASSERT_EQ(target_admission_checks, 0);
+	UT_ASSERT_EQ(debt, 0);
+}
+
+UT_TEST(positive_target_readiness_change_allows_same_backend_next_attempt)
+{
+	reset_fixture();
+	set_shared_policy(80);
+	target_admission_current = false;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	check_no_cohort();
+	/* Per-attempt observation only; retain the original backend/debt stacks. */
+	target_bindings = 0;
+	target_admission_current = true;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(target_admission_checks, 2);
+	UT_ASSERT(vacrel.shared_freeze_cohort_observed);
+	UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.target_count, 1);
+	UT_ASSERT_EQ(enters, 2);
+	UT_ASSERT_EQ(leaves, 2);
+	UT_ASSERT_EQ(debt, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(85);
+	UT_PLAN(91);
+	UT_RUN(positive_candidate_requires_full_target_admission);
+	UT_RUN(positive_candidate_full_target_recheck_uses_original_token_after_clock);
+	UT_RUN(positive_target_recheck_error_and_cancel_use_original_cleanup);
+	UT_RUN(positive_target_recheck_generation_change_is_retry);
+	UT_RUN(positive_target_recheck_skips_unproven_or_unbound_inputs);
+	UT_RUN(positive_target_readiness_change_allows_same_backend_next_attempt);
 	UT_RUN(proof_cost_counts_all_five_transport_paths_once);
 	UT_RUN(proof_cost_charges_error_and_cancel_before_original_leave);
 	UT_RUN(proof_cost_accumulates_refusal_and_next_success_without_reset);

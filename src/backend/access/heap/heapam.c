@@ -20801,6 +20801,8 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 		|| authority_now.transition_count != fence->holder_sequence
 		|| master_sequence != fence->master_sequence
 		|| !cluster_pcm_lock_authority_matches(tag, authority_before)
+		/* Proof-read admission alone cannot authorize a native heap write. */
+		|| !cluster_semantic_activation_recheck(admission)
 		|| !cluster_semantic_activation_recheck_r4_terminal_census(admission))
 		return false;
 

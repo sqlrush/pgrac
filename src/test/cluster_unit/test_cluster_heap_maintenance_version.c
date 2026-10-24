@@ -92,6 +92,8 @@ static unsigned flushes;
 static unsigned writer_checks, route_checks, authority_checks, admission_checks;
 static SCN fixture_wal_clock, inserted_wal_clock;
 static unsigned wal_clock_reads;
+static bool full_target_current, target_recheck_error, revoke_target_census;
+static unsigned full_target_checks;
 
 /* The real native apply reads this clock before mutation. WAL insertion's
  * existing production xl_scn stamp uses the same clock; this leaf captures
@@ -167,6 +169,24 @@ cluster_semantic_activation_recheck_r4_terminal_census(
 	UT_ASSERT(token != NULL && token->entered);
 	return admission_current;
 }
+/* Existing full TARGET policy is stronger than census-read permission. */
+bool
+cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
+{
+	full_target_checks++;
+	UT_ASSERT(token != NULL && token->entered);
+	UT_ASSERT(local_x && backend_pin_count == 1);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(writer_checks, 1);
+	UT_ASSERT_EQ(route_checks, 1);
+	UT_ASSERT_EQ(authority_checks, 1);
+	UT_ASSERT_EQ(admission_checks, 0);
+	UT_ASSERT_EQ(wal_clock_reads + inserts + dirties + edges + flushes, 0);
+	if (target_recheck_error) elog(ERROR, "injected full TARGET recheck error");
+	if (revoke_target_census) admission_current = false;
+	return full_target_current;
+}
+
 void
 XLogFlush(XLogRecPtr lsn)
 {
@@ -530,6 +550,9 @@ reset(uint8 opcode, bool shared)
 	fixture_wal_clock = scn_encode(0, 100);
 	inserted_wal_clock = InvalidScn;
 	wal_clock_reads = 0;
+	full_target_current = true;
+	target_recheck_error = revoke_target_census = false;
+	full_target_checks = 0;
 	local_x = writer_current = route_current = authority_current = admission_current = true;
 	backend_pin_count = 1;
 	pin_checks = 0;
@@ -1777,10 +1800,78 @@ UT_TEST(test_deferred_request_preserves_shared_freeze_restriction)
 	UT_ASSERT_EQ(maintenance_requests, 1);
 }
 
+UT_TEST(test_xmin_single_and_batch_require_full_target_not_census_only)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	for (int batch = 0; batch < 2; batch++) {
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		full_target_current = false;
+		UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3)
+			: qualified_xmin_apply(&f, 0)));
+		UT_ASSERT_EQ(full_target_checks, 1);
+		UT_ASSERT_EQ(admission_checks + wal_clock_reads + inserts + edges + dirties + flushes, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		UT_ASSERT(local_x && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
+UT_TEST(test_xmin_target_admission_keeps_original_census_recheck_last)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	qualified_xmin_batch_setup(&f, targets);
+	revoke_target_census = true;
+	UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
+	UT_ASSERT_EQ(full_target_checks, 1);
+	UT_ASSERT_EQ(admission_checks, 1);
+	UT_ASSERT_EQ(wal_clock_reads + inserts + edges + dirties + flushes, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	UT_ASSERT(local_x && f.admission.entered);
+	UT_ASSERT_EQ(backend_pin_count, 1);
+}
+
+UT_TEST(test_xmin_full_target_error_keeps_borrowed_resources_before_wal)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	qualified_xmin_batch_setup(&f, targets);
+	target_recheck_error = expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		(void)qualified_xmin_batch_apply(&f, targets, 3);
+		UT_ASSERT(false);
+	} else {
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT_EQ(full_target_checks, 1);
+		UT_ASSERT_EQ(wal_clock_reads + inserts + edges + dirties + flushes, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		UT_ASSERT(local_x && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+	expecting_error = false;
+}
+
+UT_TEST(test_xmin_bad_final_authority_never_checks_full_target)
+{
+	QualifiedXminFixture f;
+	qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	authority_current = false;
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(full_target_checks, 0);
+	UT_ASSERT_EQ(admission_checks + wal_clock_reads + inserts + dirties + flushes, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(40);
+	UT_PLAN(44);
+	UT_RUN(test_xmin_single_and_batch_require_full_target_not_census_only);
+	UT_RUN(test_xmin_target_admission_keeps_original_census_recheck_last);
+	UT_RUN(test_xmin_full_target_error_keeps_borrowed_resources_before_wal);
+	UT_RUN(test_xmin_bad_final_authority_never_checks_full_target);
 	UT_RUN(test_prune_native_plan_and_version);
 	UT_RUN(test_shared_freeze_refuses_before_tuple_or_wal);
 	UT_RUN(test_vacuum_native_unused_and_version);

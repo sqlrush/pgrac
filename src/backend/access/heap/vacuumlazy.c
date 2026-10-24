@@ -2004,9 +2004,19 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 					&& policy_current && cohort_current && SCN_VALID(wal_clock)
 					&& scn_time_cmp(wal_clock, observed_bounds.horizon_scn) >= 0)
 				{
-					memcpy(&vacrel->shared_freeze_cohort, &cohort, sizeof(cohort));
-					vacrel->shared_freeze_candidate_limit_full = observed_bounds.freeze_limit;
-					vacrel->shared_freeze_cohort_observed = true;
+					bool target_current = cluster_semantic_activation_recheck(&admission);
+
+					/* Census admission permits proof reads before ordinary TARGET
+					 * writes are open. Only the same token's full TARGET policy
+					 * can retain inputs for later positive freeze admission. */
+					if (!cluster_semantic_activation_recheck_r4_terminal_census(&admission))
+						status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
+					else if (target_current)
+					{
+						memcpy(&vacrel->shared_freeze_cohort, &cohort, sizeof(cohort));
+						vacrel->shared_freeze_candidate_limit_full = observed_bounds.freeze_limit;
+						vacrel->shared_freeze_cohort_observed = true;
+					}
 				}
 			}
 		}

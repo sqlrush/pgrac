@@ -369,8 +369,9 @@ extern bool cluster_heap_freeze_prepare_xmin_batch_v1(
 /*
  * Qualified xmin-only mutation using native FREEZE_PAGE WAL and synchronous
  * WAL flush.  The caller owns the pin, exclusive content lock, ACTIVE PCM-X
- * writer ledger and R4 terminal-census admission throughout this call.  This
- * entry never acquires/releases them or fetches a page/proof.  It rechecks the
+ * writer ledger and the same R4 TARGET token accepted by both the ordinary
+ * write policy and terminal-census recheck throughout this call.  This entry
+ * never acquires/releases them or fetches a page/proof.  It rechecks the
  * captured physical image, exact row/carrier and current authority before the
  * native write.  False means no mutation; ERROR propagates to the resource
  * owner.  Success changes the page version/LSN and invalidates the old proof.
