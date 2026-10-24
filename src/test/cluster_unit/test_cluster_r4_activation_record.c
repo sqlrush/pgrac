@@ -3396,10 +3396,38 @@ UT_TEST(test_101_stage_ahead_barrier_request_connection_conflict_fails_closed)
 	stage_ahead_barrier_request_fixture_cleanup();
 }
 
+UT_TEST(wait_graph_semantic_cut_is_owned_bounded_and_nonmutating)
+{
+	ClusterSemanticActivationShmem shmem = {0};
+	ClusterSemanticWaitGraphSnapshot out;
+	ClusterSemanticActivationShmem before;
+	SemanticActivationShmem = NULL;
+	memset(&out, 0x7f, sizeof(out));
+	UT_ASSERT(!cluster_semantic_activation_wait_graph_snapshot(&out));
+	UT_ASSERT(!out.known); UT_ASSERT_EQ(out.record_generation, 0);
+	SemanticActivationShmem = &shmem;
+	pg_atomic_init_u64(&shmem.admission_seq, 8);
+	pg_atomic_init_u64(&shmem.active_bits, UINT64_C(1025));
+	pg_atomic_init_u64(&shmem.record_generation, 12);
+	pg_atomic_init_u64(&shmem.formation_epoch, 7);
+	pg_atomic_init_u32(&shmem.transition_closed, 0);
+	before = shmem;
+	UT_ASSERT(cluster_semantic_activation_wait_graph_snapshot(&out));
+	UT_ASSERT(out.known); UT_ASSERT_EQ(out.seq, 8);
+	UT_ASSERT_EQ(out.active_bits, 1025); UT_ASSERT_EQ(out.record_generation, 12);
+	UT_ASSERT_EQ(out.formation_epoch, 7); UT_ASSERT(!out.transition_closed);
+	UT_ASSERT(memcmp(&before, &shmem, sizeof(shmem)) == 0);
+	pg_atomic_write_u64(&shmem.admission_seq, 9);
+	UT_ASSERT(!cluster_semantic_activation_wait_graph_snapshot(&out));
+	UT_ASSERT(!out.known); UT_ASSERT_EQ(out.record_generation, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&shmem.admission_seq), 9);
+	SemanticActivationShmem = NULL;
+}
+
 int
 main(void)
 {
-	UT_PLAN(101);
+	UT_PLAN(102);
 	UT_RUN(test_01_record_constants);
 	UT_RUN(test_02_phase_numeric_values);
 	UT_RUN(test_03_encode_rejects_null_record);
@@ -3501,6 +3529,7 @@ main(void)
 	UT_RUN(test_99_stage_ahead_barrier_request_waits_without_mutation_then_applies);
 	UT_RUN(test_100_stage_ahead_barrier_request_duplicate_is_consumed_once);
 	UT_RUN(test_101_stage_ahead_barrier_request_connection_conflict_fails_closed);
+	UT_RUN(wait_graph_semantic_cut_is_owned_bounded_and_nonmutating);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

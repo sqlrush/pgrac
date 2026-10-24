@@ -4343,7 +4343,7 @@ test_cluster_ic_router: test_cluster_ic_router.c unit_test.h \
 # test_cluster_conf.c since the unit test only takes addresses and
 # reads constants (never invokes the parser body or SRF body).
 test_cluster_conf: test_cluster_conf.c unit_test.h $(CLUSTER_VERSION_O) \
-		$(CLUSTER_CONF_O)
+		$(top_srcdir)/src/include/cluster/cluster_conf.h $(CLUSTER_CONF_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_CONF_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
@@ -6798,11 +6798,21 @@ test_cluster_bufmgr_pcm_hook: test_cluster_bufmgr_pcm_hook.c unit_test.h \
 # handler symbols, observability accessors).  Link-surface coverage only;
 # behavioral coverage in cluster_tap t/110_gcs_loopback.pl.
 test_cluster_gcs_dispatch: test_cluster_gcs_dispatch.c unit_test.h \
-		test_cluster_gcs_shared_registration.inc $(CLUSTER_VERSION_O) $(CLUSTER_GCS_O)
+		test_cluster_gcs_shared_registration.inc test_cluster_wait_graph_route.inc \
+		$(top_srcdir)/src/include/cluster/cluster_conf.h $(CLUSTER_VERSION_O) $(CLUSTER_GCS_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_GCS_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Compile the diagnostic route cut verbatim; native GCS remains separately
+# linked so healthy sparse routing can be compared without a copied router.
+test_cluster_wait_graph_route.inc: $(top_srcdir)/src/test/modules/test_pgrac_shared_config/test_pgrac_wait_graph.c Makefile
+	awk '/^typedef struct WaitGraphRoute / { emit=1; types++ } \
+	     /^wait_graph_route_snapshot\(/ { print "static void"; emit=1; bodies++ } \
+	     emit { print } emit && (/^} WaitGraphRoute;/ || /^}/) { emit=0 } \
+	     END { if (types != 1 || bodies != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 
 # PGRAC: compile the actual post-image registration consumer, not a copy
 # of its result policy. The surrounding loop and already-verified image

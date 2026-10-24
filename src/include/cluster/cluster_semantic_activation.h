@@ -34,6 +34,18 @@
 #define CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE UINT32_C(2)
 #define CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_OPEN_PROOF UINT32_C(4)
 
+/* Bounded diagnostic seqlock projection, never an admission/serving token. */
+typedef struct ClusterSemanticWaitGraphSnapshot {
+	uint64 seq;
+	uint64 active_bits;
+	uint64 record_generation;
+	uint64 formation_epoch;
+	bool transition_closed;
+	bool known;
+} ClusterSemanticWaitGraphSnapshot;
+
+extern bool cluster_semantic_activation_wait_graph_snapshot(ClusterSemanticWaitGraphSnapshot *out);
+
 typedef enum ClusterSemanticActivationAckKind {
 	CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_INVALID = 0,
 	CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST = 1,

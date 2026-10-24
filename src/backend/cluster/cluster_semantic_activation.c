@@ -8664,6 +8664,25 @@ semantic_activation_snapshot(SemanticActivationAdmissionSnapshot *snapshot)
 	return false;
 }
 
+bool
+cluster_semantic_activation_wait_graph_snapshot(ClusterSemanticWaitGraphSnapshot *out)
+{
+	SemanticActivationAdmissionSnapshot snapshot;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!semantic_activation_snapshot(&snapshot))
+		return false;
+	out->seq = snapshot.seq;
+	out->active_bits = snapshot.active_bits;
+	out->record_generation = snapshot.record_generation;
+	out->formation_epoch = snapshot.formation_epoch;
+	out->transition_closed = snapshot.transition_closed;
+	out->known = true;
+	return true;
+}
+
 /* A postmaster-safe lifecycle hint, NOT a pristine/OPEN/close proof. Once any
  * original publisher has run (including an odd/incomplete publication), keep
  * the original actors. Missing regions are also conservative retention. The

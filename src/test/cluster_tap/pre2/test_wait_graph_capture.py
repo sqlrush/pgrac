@@ -150,6 +150,126 @@ class GraphTests(unittest.TestCase):
         self.assertIsNone(graph.pcm_admission_bridge(wait, service, []))
         self.assertIsNone(graph.pcm_admission_bridge(wait, service, resources + resources))
 
+    def current_route_fixture(self):
+        wait, service, resources = self.admitted_service_fixture()
+        snapshots = []
+        for node in range(4):
+            semantic = dict(known=True, seq=2+2*node, active_bits=1025,
+                            record_generation=12, formation_epoch=7, transition_closed=False)
+            gate = dict(known=True, phase=0, formation=7, freeze=19 if node == 1 else node)
+            context = dict(semantic_begin=semantic, semantic_end=copy.deepcopy(semantic),
+                           pcm_gate_begin=gate, pcm_gate_end=copy.deepcopy(gate))
+            snapshots.append(dict(node=node, epoch_begin=7, epoch_end=7, context_stable=True,
+                                  owners=[], **copy.deepcopy(context)))
+            if node != 2:
+                resources.append(dict(kind='pcm', node=node, status=2, stable=True))
+            resource = next(r for r in resources if r['node'] == node)
+            route = dict(known=True, master=2, epoch=7, declared=[0,1,2,3],
+                         membership_generation=2+2*node, dead_generation=node)
+            resource.update(copy.deepcopy(context), tag=wait['tag'], epoch=7,
+                            route_begin=route, route_end=copy.deepcopy(route))
+        snapshots[0]['owners'] = [dict(node=0,pid=10,procno=1,backend_id=2,
+            backend_start=3,proc_generation=17,pcm_wait=wait)]
+        snapshots[1]['owners'] = [dict(node=1,pid=20,procno=2,backend_id=-1,
+            backend_start=0,proc_generation=18,pcm_service=service)]
+        return wait, service, resources, snapshots
+
+    def test_pcm_current_route_requires_all_native_cuts_and_remains_candidate(self):
+        wait, service, resources, snapshots = self.current_route_fixture()
+        proof = graph.pcm_current_bridge(wait, service, resources, snapshots)
+        self.assertEqual(proof['quality'], 'current_healthy_route_context')
+        self.assertEqual(proof['master'], 2)
+        self.assertEqual(proof['nodes'], [0,1,2,3])
+        self.assertEqual(proof['source_gate_freeze'], 19)
+        self.assertFalse(proof['peer_capability_current_proven'])
+        self.assertFalse(proof['claimed_owner_proven'])
+        result = graph.build_graph(snapshots, resources)
+        self.assertEqual(result['edges'][0]['resource']['current_context'], proof)
+        self.assertEqual(result['edges'][0]['quality'], 'candidate_pcm_service')
+        self.assertEqual(result['cycles'], [])
+        self.assertFalse(result['complete'])
+
+    def test_pcm_current_route_rejects_missing_duplicate_or_changed_node_cuts(self):
+        wait, service, resources, snapshots = self.current_route_fixture()
+        for group in ('snapshots', 'resources'):
+            for mutation in ('missing', 'duplicate'):
+                rs, ss = copy.deepcopy(resources), copy.deepcopy(snapshots)
+                items = ss if group == 'snapshots' else rs
+                if mutation == 'missing': items.pop()
+                else: items.append(copy.deepcopy(items[0]))
+                self.assertIsNone(graph.pcm_current_bridge(wait, service, rs, ss), (group,mutation))
+        for group in ('snapshots', 'resources'):
+            for cut in ('semantic_begin','semantic_end','pcm_gate_begin','pcm_gate_end'):
+                for mutation in ('missing','unknown','drift'):
+                    rs, ss = copy.deepcopy(resources), copy.deepcopy(snapshots)
+                    item = (ss if group == 'snapshots' else rs)[0]
+                    if mutation == 'missing': del item[cut]
+                    elif mutation == 'unknown': item[cut]['known'] = False
+                    else:
+                        field = 'seq' if cut.startswith('semantic') else 'freeze'
+                        item[cut][field] += 2
+                    self.assertIsNone(graph.pcm_current_bridge(wait, service, rs, ss), (group,cut,mutation))
+
+    def test_pcm_current_route_rejects_consistent_but_invalid_context(self):
+        wait, service, resources, snapshots = self.current_route_fixture()
+        for cut, field, value in (
+                ('semantic','record_generation',13), ('semantic','formation_epoch',8),
+                ('semantic','active_bits',1), ('semantic','transition_closed',True),
+                ('semantic','seq',0), ('semantic','seq',3), ('pcm_gate','phase',1),
+                ('pcm_gate','formation',8), ('pcm_gate','freeze',2**64-1)):
+            rs, ss = copy.deepcopy(resources), copy.deepcopy(snapshots)
+            for item in rs + ss:
+                for side in ('begin','end'): item[cut+'_'+side][field] = value
+            self.assertIsNone(graph.pcm_current_bridge(wait, service, rs, ss), (cut,field,value))
+        rs = copy.deepcopy(resources)
+        for side in ('begin','end'):
+            next(r for r in rs if r['node']==1)['pcm_gate_'+side]['freeze'] = 20
+        self.assertIsNone(graph.pcm_current_bridge(wait, service, rs, snapshots))
+        for field, value in (('known',False), ('master',3), ('epoch',8),
+                             ('declared',[0,1,2]), ('declared',[0,1,2,2]),
+                             ('membership_generation',0), ('membership_generation',3)):
+            rs = copy.deepcopy(resources)
+            for r in rs:
+                for side in ('begin','end'): r['route_'+side][field] = value
+            self.assertIsNone(graph.pcm_current_bridge(wait, service, rs, snapshots), (field,value))
+        for field in ('epoch','tag','route_end'):
+            rs = copy.deepcopy(resources)
+            if field=='tag': rs[0][field]=[1,2,3,4,6]
+            elif field=='epoch': rs[0][field]=8
+            else: rs[0][field]['dead_generation'] += 1
+            self.assertIsNone(graph.pcm_current_bridge(wait, service, rs, snapshots), field)
+        self.assertIsNone(graph.pcm_current_bridge(wait, {}, resources, snapshots))
+
+    def test_capture_rejects_context_change_between_outer_owner_cuts(self):
+        wait, service, resources, snapshots = self.current_route_fixture()
+        class Reader:
+            def __init__(self, node, directory): self.node, self.calls = node['node'], 0
+            def query(self, sql, deadline):
+                if sql.endswith('_prepare()'): return 't'
+                if 'pgrac_wg_block(' in sql:
+                    return graph.json.dumps(next(r for r in resources if r['node']==self.node))
+                if 'pgrac_wg_enqueue(' in sql:
+                    return graph.json.dumps(dict(node=self.node,kind='enqueue',status=1))
+                self.calls += 1
+                value = copy.deepcopy(snapshots[self.node])
+                value.pop('context_stable')
+                if self.calls > 1:
+                    value['semantic_begin']['seq'] += 2
+                    value['semantic_end']['seq'] += 2
+                return graph.json.dumps(value)
+            def close(self): pass
+        with tempfile.TemporaryDirectory() as directory, patch.object(graph, 'PsqlReader', Reader):
+            session = graph.CaptureSession([dict(node=n,connstr=str(n)) for n in range(4)], Path(directory)/'capture')
+            try:
+                for reader in session.readers: reader.calls = 0
+                session.capture()
+                result = graph.json.loads((session.output/'wait-for-graph.json').read_text())
+                self.assertIsNone(result['edges'][0]['resource']['current_context'])
+                self.assertEqual(result['cycles'], [])
+                self.assertFalse(result['complete'])
+            finally:
+                session.close()
+
     def test_capture_queries_service_tag_without_a_wait_or_hold(self):
         tag = [1,2,3,4,5]
         class Reader:

@@ -8,10 +8,15 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_conf.h"
 #include "cluster/cluster_content_trace.h"
+#include "cluster/cluster_cssd.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_membership.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_wait_graph.h"
+#include "common/hashfn.h"
 #include "storage/proc.h"
 #endif
 
@@ -31,6 +36,109 @@ check_reader(void)
 }
 
 #ifdef USE_PGRAC_CLUSTER
+typedef struct WaitGraphRoute {
+	ClusterConfDeclaredNodes topology;
+	uint64 epoch;
+	uint64 membership_generation;
+	uint64 dead_generation;
+	int32 master;
+	bool known;
+} WaitGraphRoute;
+
+/* Diagnostic healthy static-route subset only. No normal lookup/counter or
+ * cache mutation, no recovery routing, no admission and no blocking wait. */
+static void
+wait_graph_route_snapshot(const BufferTag *tag, WaitGraphRoute *out)
+{
+	WaitGraphRoute cut = {0};
+	ClusterConfDeclaredNodes after;
+	bool busy;
+	bool self_declared = false;
+
+	memset(out, 0, sizeof(*out));
+	out->master = -1;
+	if (tag == NULL || !cluster_shared_config ||
+		cluster_cssd_get_status_nowait(&busy) != CLUSTER_CSSD_READY || busy)
+		return;
+	cut.epoch = cluster_epoch_get_current();
+	cut.membership_generation = cluster_membership_cut_generation();
+	cut.dead_generation = cluster_cssd_get_dead_generation();
+	if (cut.epoch == 0 || cut.membership_generation == 0 ||
+		(cut.membership_generation & 1) != 0 ||
+		!cluster_conf_declared_nodes_observe(&cut.topology) || !cut.topology.known ||
+		cut.topology.count == 0 || cut.topology.count > CLUSTER_MAX_NODES)
+		return;
+	for (uint32 i = 0; i < cut.topology.count; i++) {
+		int32 node = cut.topology.nodes[i];
+		if (node < 0 || node >= CLUSTER_MAX_NODES ||
+			(i != 0 && node <= cut.topology.nodes[i - 1]) ||
+			cluster_cssd_get_peer_state(node) != CLUSTER_CSSD_PEER_ALIVE ||
+			!cluster_membership_is_member(node))
+			return;
+		self_declared |= node == cluster_node_id;
+	}
+	if (cut.topology.count == 1 && !self_declared)
+		return;
+	cut.master = cut.topology.count == 1 ? cluster_node_id :
+		cut.topology.nodes[hash_bytes((const unsigned char *)tag, sizeof(*tag)) % cut.topology.count];
+	for (uint32 i = 0; i < cut.topology.count; i++)
+		if (cluster_cssd_get_peer_state(cut.topology.nodes[i]) != CLUSTER_CSSD_PEER_ALIVE ||
+			!cluster_membership_is_member(cut.topology.nodes[i]))
+			return;
+	if (!cluster_conf_declared_nodes_observe(&after) || !after.known ||
+		after.count != cut.topology.count ||
+		memcmp(after.nodes, cut.topology.nodes, after.count * sizeof(after.nodes[0])) != 0 ||
+		!cluster_membership_cut_generation_current(cut.membership_generation) ||
+		cluster_cssd_get_dead_generation() != cut.dead_generation ||
+		cluster_epoch_get_current() != cut.epoch ||
+		cluster_cssd_get_status_nowait(&busy) != CLUSTER_CSSD_READY || busy)
+		return;
+	cut.known = true;
+	*out = cut;
+}
+
+typedef struct WaitGraphContext {
+	ClusterSemanticWaitGraphSnapshot semantic;
+	ResourceXGateSnapshot gate;
+	bool gate_known;
+} WaitGraphContext;
+
+static void
+wait_graph_context_snapshot(WaitGraphContext *out)
+{
+	memset(out, 0, sizeof(*out));
+	cluster_semantic_activation_wait_graph_snapshot(&out->semantic);
+	out->gate_known = cluster_pcm_lock_resource_x_gate_snapshot(&out->gate);
+}
+
+static void
+json_context(StringInfo out, const char *side, const WaitGraphContext *cut)
+{
+	const ClusterSemanticWaitGraphSnapshot *s = &cut->semantic;
+	appendStringInfo(out, ",\"semantic_%s\":{\"known\":%s,\"seq\":" UINT64_FORMAT
+		",\"active_bits\":" UINT64_FORMAT ",\"record_generation\":" UINT64_FORMAT
+		",\"formation_epoch\":" UINT64_FORMAT ",\"transition_closed\":%s}",
+		side, s->known ? "true" : "false", s->seq, s->active_bits,
+		s->record_generation, s->formation_epoch, s->transition_closed ? "true" : "false");
+	appendStringInfo(out, ",\"pcm_gate_%s\":{\"known\":%s,\"phase\":%u,\"formation\":" UINT64_FORMAT
+		",\"freeze\":" UINT64_FORMAT "}", side, cut->gate_known ? "true" : "false",
+		cut->gate.phase, cut->gate.formation, cut->gate.freeze_generation);
+}
+
+static void
+json_route(StringInfo out, const WaitGraphRoute *cut)
+{
+	appendStringInfo(out, "{\"known\":%s,\"master\":%d,\"epoch\":" UINT64_FORMAT
+		",\"membership_generation\":" UINT64_FORMAT ",\"dead_generation\":" UINT64_FORMAT
+		",\"declared\":[", cut->known ? "true" : "false", cut->master,
+		cut->epoch, cut->membership_generation, cut->dead_generation);
+	for (uint32 i = 0; i < cut->topology.count; i++) {
+		if (i != 0) appendStringInfoChar(out, ',');
+		appendStringInfo(out, "%d", cut->topology.nodes[i]);
+	}
+	appendStringInfoString(out, "]}");
+}
+
 static void
 json_tag(StringInfo out, const BufferTag *tag)
 {
@@ -240,11 +348,13 @@ test_pgrac_wait_graph(PG_FUNCTION_ARGS)
 	WaitGraphOwnerWriter writer = {.out = &out};
 	ClusterContentTraceWalkStats stats;
 	ClusterWaitGraphKoSnapshot *ko;
+	WaitGraphContext begin, end;
 	uint64 epoch;
 	bool first = true;
 	check_reader();
 	ko = palloc0(sizeof(*ko));
 	epoch = cluster_epoch_get_current();
+	wait_graph_context_snapshot(&begin);
 	initStringInfo(&out);
 	appendStringInfo(&out, "{\"version\":2,\"node\":%d,\"epoch_begin\":" UINT64_FORMAT
 		",\"atomic_graph\":false,\"observed_at\":" INT64_FORMAT ",\"owners\":[",
@@ -278,6 +388,9 @@ test_pgrac_wait_graph(PG_FUNCTION_ARGS)
 	}
 	cluster_ko_wait_graph_snapshot(ko);
 	appendStringInfoString(&out, "],\"ko\":"); json_ko(&out, ko);
+	wait_graph_context_snapshot(&end);
+	json_context(&out, "begin", &begin);
+	json_context(&out, "end", &end);
 	appendStringInfo(&out, ",\"epoch_end\":" UINT64_FORMAT "}", cluster_epoch_get_current());
 	pfree(ko);
 	PG_RETURN_TEXT_P(cstring_to_text(out.data));
@@ -340,8 +453,11 @@ test_pgrac_wait_graph_block(PG_FUNCTION_ARGS)
 {
 #ifdef USE_PGRAC_CLUSTER
 	StringInfoData out;
-	BufferTag tag;
+	BufferTag tag = {0};
 	ClusterWaitGraphPcmSnapshot *snapshot;
+	WaitGraphRoute route_begin, route_end;
+	WaitGraphContext begin, end;
+	uint64 epoch;
 	check_reader();
 	snapshot = palloc0(sizeof(*snapshot));
 	tag.spcOid = key_argument(fcinfo, 0, UINT32_MAX);
@@ -349,10 +465,21 @@ test_pgrac_wait_graph_block(PG_FUNCTION_ARGS)
 	tag.relNumber = key_argument(fcinfo, 2, UINT32_MAX);
 	tag.forkNum = key_argument(fcinfo, 3, MAX_FORKNUM);
 	tag.blockNum = key_argument(fcinfo, 4, MaxBlockNumber);
+	epoch = cluster_epoch_get_current();
+	wait_graph_route_snapshot(&tag, &route_begin);
+	wait_graph_context_snapshot(&begin);
 	cluster_pcm_wait_graph_snapshot(&tag, snapshot);
+	wait_graph_context_snapshot(&end);
+	wait_graph_route_snapshot(&tag, &route_end);
 	initStringInfo(&out);
 	appendStringInfo(&out, "{\"kind\":\"pcm\",\"node\":%d,\"epoch\":" UINT64_FORMAT
-		",\"status\":%d,\"view\":", cluster_node_id, cluster_epoch_get_current(), snapshot->status);
+		",\"status\":%d,\"tag\":", cluster_node_id, epoch, snapshot->status);
+	json_tag(&out, &tag);
+	appendStringInfoString(&out, ",\"route_begin\":"); json_route(&out, &route_begin);
+	appendStringInfoString(&out, ",\"route_end\":"); json_route(&out, &route_end);
+	json_context(&out, "begin", &begin);
+	json_context(&out, "end", &end);
+	appendStringInfoString(&out, ",\"view\":");
 	json_wait(&out, &snapshot->view);
 	appendStringInfoString(&out, ",\"queue\":[");
 	for (uint32 i = 0; i < snapshot->nqueued; i++) {
@@ -384,6 +511,8 @@ test_pgrac_wait_graph_prepare(PG_FUNCTION_ARGS)
 	check_reader();
 	key.type = UINT8_MAX;
 	key.lockmethodid = UINT8_MAX;
+	/* The cut itself must never initialize the process-local conf index. */
+	(void) cluster_conf_lookup_node(0);
 	status = cluster_grd_queue_snapshot(&key, &snapshot, NULL, 0);
 	PG_RETURN_BOOL(status != CLUSTER_GRD_QUEUE_UNAVAILABLE && status != CLUSTER_GRD_QUEUE_INVALID);
 #else

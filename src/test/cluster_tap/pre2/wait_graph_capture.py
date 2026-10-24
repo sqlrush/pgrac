@@ -156,6 +156,66 @@ def pcm_admission_bridge(wait, service, resources):
                 route_checked_at_entry=True, current_route_proven=False)
 
 
+CONTEXT_CUTS = ('semantic_begin', 'semantic_end', 'pcm_gate_begin', 'pcm_gate_end')
+
+
+def pcm_current_bridge(wait, service, resources, snapshots):
+    """Supplement finite healthy-route cuts only; no live owner/capability proof."""
+    if pcm_admission_bridge(wait, service, resources) is None:
+        return None
+    nodes = [s.get('node') for s in snapshots]
+    if (len(nodes) != 4 or any(type(n) is not int or not 0 <= n < 128 for n in nodes) or
+            len(set(nodes)) != 4):
+        return None
+    nodes = sorted(nodes)
+    if any(n not in nodes for n in (wait.get('requester'), service.get('source'), wait.get('expected_master'))):
+        return None
+    formation, record = wait['formation'], wait['r4']
+    cuts = [r for r in resources if r.get('kind') == 'pcm' and r.get('tag') == wait.get('tag')]
+    if len(cuts) != 4 or sorted(r.get('node', -1) for r in cuts) != nodes:
+        return None
+
+    def integer(value, minimum=0):
+        return type(value) is int and minimum <= value < 2**64-1
+
+    source_freeze = None
+    for snapshot in snapshots:
+        node = snapshot['node']
+        resource = next(r for r in cuts if r['node'] == node)
+        if (snapshot.get('context_stable') is not True or
+                snapshot.get('epoch_begin') != formation or snapshot.get('epoch_end') != formation or
+                resource.get('epoch') != formation or resource.get('stable') is not True or
+                resource.get('status') not in (0, 2)):
+            return None
+        route = resource.get('route_begin') or {}
+        if (route != resource.get('route_end') or route.get('known') is not True or
+                route.get('master') != wait['expected_master'] or route.get('epoch') != formation or
+                route.get('declared') != nodes or
+                not integer(route.get('membership_generation'), 1) or route['membership_generation'] & 1 or
+                not integer(route.get('dead_generation'))):
+            return None
+        for item in (snapshot, resource):
+            semantic = item.get('semantic_begin') or {}
+            gate = item.get('pcm_gate_begin') or {}
+            if (semantic != item.get('semantic_end') or gate != item.get('pcm_gate_end') or
+                    semantic.get('known') is not True or gate.get('known') is not True or
+                    not integer(semantic.get('seq'), 1) or semantic['seq'] & 1 or
+                    not integer(semantic.get('active_bits')) or not semantic['active_bits'] & 1024 or
+                    semantic.get('record_generation') != record or semantic.get('formation_epoch') != formation or
+                    semantic.get('transition_closed') is not False or gate.get('phase') != 0 or
+                    gate.get('formation') != formation or not integer(gate.get('freeze'))):
+                return None
+        if any(snapshot.get(k) != resource.get(k) for k in CONTEXT_CUTS):
+            return None
+        if node == service['source']:
+            source_freeze = snapshot['pcm_gate_begin']['freeze']
+    if source_freeze != service['service_admission']['gate_freeze']:
+        return None
+    return dict(quality='current_healthy_route_context', master=wait['expected_master'], nodes=nodes,
+                formation=formation, record_generation=record, source_gate_freeze=source_freeze,
+                peer_capability_current_proven=False, claimed_owner_proven=False)
+
+
 def build_graph(snapshots, resources):
     """Join copied native identities only; unknown edges remain in the result."""
     owners, unknown, edges, epochs = {}, [], [], {}
@@ -310,6 +370,7 @@ def build_graph(snapshots, resources):
                         base=wait['base'], master=wait['expected_master'],
                         logical_bridge=pcm_logical_bridge(wait, service, resources),
                         native_admission=pcm_admission_bridge(wait, service, resources),
+                        current_context=pcm_current_bridge(wait, service, resources, snapshots),
                         service_wire_sender_connection=service.get('wire_sender_connection')),
                         'candidate_pcm_service')
             unknown.append(dict(process=identity(row), reason='pcm_service_process_edge_unresolved',
@@ -507,6 +568,7 @@ class CaptureSession:
             for owner in first['owners']:
                 matching = [x for x in last['owners'] if x['procno'] == owner['procno']]
                 owner['stable'] = len(matching) == 1 and matching[0] == owner
+            first['context_stable'] = all(first.get(k) == last.get(k) for k in CONTEXT_CUTS)
             snapshots.append(first)
         resources = []
         for entry in result['resources']:
