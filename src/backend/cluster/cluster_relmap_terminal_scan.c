@@ -10,6 +10,7 @@
 #include "cluster/cluster_recovery_record_hash.h"
 #include "cluster/cluster_relmap_recovery.h"
 #include "cluster/cluster_relmap_owner.h"
+#include "cluster/cluster_relmap_retention.h"
 #include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "miscadmin.h"
@@ -493,6 +494,135 @@ recovery_overlap(const void *a, size_t an, const void *b, size_t bn)
 {
 	uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
 	return a != NULL && b != NULL && ((x <= y && y - x < an) || (y <= x && x - y < bn));
+}
+
+typedef struct RelmapRetentionCheckpointInput {
+	ClusterWalInputV1 selected;
+	ClusterRelmapCheckpointWindow window;
+	XLogRecPtr last_end;
+	uint64 records;
+	bool checkpoint_seen;
+} RelmapRetentionCheckpointInput;
+
+static bool
+retention_checkpoint_visit(XLogReaderState *reader, void *arg)
+{
+	RelmapRetentionCheckpointInput *work = arg;
+	const ClusterWalInputV1 *input = &work->selected;
+	const ClusterControlRootIdentity *id = &input->source.claim.identity;
+
+	CHECK_FOR_INTERRUPTS();
+	if (reader == NULL || reader->record == NULL || reader->cluster_record_crc_failed
+		|| reader->cluster_expected_thread_id != id->origin_thread_id
+		|| reader->ReadRecPtr != reader->record->lsn
+		|| reader->EndRecPtr != reader->record->next_lsn
+		|| reader->ReadRecPtr < input->checkpoint.checkpoint_lower_lsn
+		|| reader->ReadRecPtr < work->last_end || reader->EndRecPtr <= reader->ReadRecPtr
+		|| reader->EndRecPtr > input->checkpoint.validated_tail_lsn_exclusive
+		|| work->records == UINT64_MAX)
+		return false;
+	if (reader->ReadRecPtr == input->checkpoint_start) {
+		uint8 info = XLogRecGetInfo(reader);
+		uint64 post_issued, next = U64FromFullTransactionId(input->native_checkpoint.nextXid);
+		uint64 upper;
+		if (work->checkpoint_seen || XLogRecGetRmid(reader) != RM_XLOG_ID
+			|| (info != XLOG_CHECKPOINT_ONLINE && info != XLOG_CHECKPOINT_SHUTDOWN)
+			|| XLogRecGetXid(reader) != InvalidTransactionId || XLogRecMaxBlockId(reader) >= 0
+			|| reader->record->has_page_version_edge
+			|| XLogRecGetOrigin(reader) != InvalidRepOriginId
+			|| TransactionIdIsValid(reader->record->toplevel_xid) || XLogRecGetData(reader) == NULL
+			|| XLogRecGetDataLen(reader) != sizeof(CheckPoint)
+			|| memcmp(XLogRecGetData(reader), &input->native_checkpoint, sizeof(CheckPoint)) != 0
+			|| !cluster_relmap_checkpoint_window_decode_v2(
+				input->native_window, &input->native_checkpoint, reader->ReadRecPtr,
+				reader->EndRecPtr, id, input->source.claim.database_incarnation, &work->window,
+				&post_issued))
+			return false;
+		/* These original references must share one half-space. Neither the
+		 * checkpoint's nextXid nor the post-flush sample replaces last-issued. */
+		upper = Max(next, post_issued);
+		if (!TransactionIdIsNormal((TransactionId)next) || upper < work->window.native_floor
+			|| upper - work->window.native_floor >= UINT64CONST(0x80000000))
+			return false;
+		work->checkpoint_seen = true;
+	}
+	work->records++;
+	work->last_end = reader->EndRecPtr;
+	return true;
+}
+
+bool
+cluster_relmap_recovery_retention_build_start_v1(ClusterWalInputsV1 *inputs, uint16 origin,
+												 ClusterRelmapRetentionDirectory *out)
+{
+	RelmapRetentionCheckpointInput work = { 0 };
+	ClusterRelmapRetentionDirectory directory = { 0 };
+	ClusterWalTailObservation observed = { 0 };
+	const ClusterWalInputV1 *selected = NULL;
+	uint32 index = 0, count;
+	uint64 serial;
+
+	if (out == NULL || origin >= 128 || MyBackendType != B_STARTUP || !RecoveryInProgress()
+		|| CritSectionCount != 0)
+		return false;
+	count = cluster_wal_inputs_count_v1(inputs);
+	if (count == 0 || count > CLUSTER_WAL_INPUTS_MAX)
+		return false;
+	for (uint32 i = 0; i < count; i++) {
+		const ClusterWalInputV1 *input = cluster_wal_inputs_at_v1(inputs, i);
+		if (input == NULL || recovery_overlap(out, sizeof(*out), input, sizeof(*input)))
+			return false;
+		if (input->source.claim.identity.origin_node_id == origin) {
+			if (selected != NULL)
+				return false; /* No partial origin/history directory. */
+			selected = input;
+			index = i;
+		}
+	}
+	if (selected == NULL || selected->kind != CLUSTER_WAL_INPUT_CHECKPOINT
+		|| selected->checkpoint.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+		|| !cluster_control_root_identity_equal(&selected->source.claim.identity,
+												&selected->checkpoint.identity)
+		|| selected->source.timeline != selected->checkpoint.checkpoint_tli
+		|| selected->native_checkpoint.ThisTimeLineID != selected->source.timeline
+		|| selected->native_checkpoint.redo != selected->native_redo
+		|| selected->native_redo < selected->checkpoint.checkpoint_lower_lsn
+		|| selected->native_redo > selected->checkpoint_start)
+		return false;
+	/* Old UNKNOWN/BUILDING storage and unoccupied stale pins are not a new
+	 * directory. Do not call the resetting core on caller storage. */
+	for (size_t i = 0; i < sizeof(*out); i++)
+		if (((const unsigned char *)out)[i] != 0)
+			return false;
+	work.selected = *selected;
+	if (cluster_wal_inputs_revalidate_v1(inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| (serial = cluster_undo_recovery_cold_scope_id_v1(
+				&work.selected.source, &work.selected.checkpoint, work.selected.native_redo))
+			   == 0
+		|| cluster_wal_inputs_visit_retained_v1(inputs, index, retention_checkpoint_visit, &work,
+												&observed)
+			   != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| !work.checkpoint_seen || observed.records != work.records
+		|| observed.complete_end != work.selected.checkpoint.validated_tail_lsn_exclusive
+		|| work.last_end != observed.complete_end
+		|| cluster_wal_inputs_revalidate_v1(inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| cluster_undo_recovery_cold_scope_id_v1(&work.selected.source, &work.selected.checkpoint,
+												  work.selected.native_redo)
+			   != serial
+		|| cluster_wal_inputs_revalidate_v1(inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| cluster_wal_inputs_count_v1(inputs) != count
+		|| (selected = cluster_wal_inputs_at_v1(inputs, index)) == NULL
+		|| memcmp(selected, &work.selected, sizeof(*selected)) != 0 || MyBackendType != B_STARTUP
+		|| !RecoveryInProgress() || CritSectionCount != 0
+		|| cluster_relmap_retention_build_start(
+			   &directory, work.window.system_identifier, work.window.database_incarnation,
+			   work.window.origin, serial, work.window.native_floor, work.window.last_issued)
+			   != CLUSTER_RELMAP_RETENTION_OK)
+		return false;
+	/* No local allocation, FD, scope or pin needs cleanup on an earlier ERROR.
+	 * Only the original caller can qualify and eventually publish this build. */
+	*out = directory;
+	return true;
 }
 
 static bool

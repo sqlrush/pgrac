@@ -3422,6 +3422,7 @@ test_cluster_recovery_native_inputs: test_cluster_recovery_xact_join_inputs.inc 
 
 # The prefix/base composition consumes both public native-owner declarations.
 $(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o: \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
 		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
@@ -3430,6 +3431,7 @@ $(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o: \
 		$(top_srcdir)/src/include/access/clog.h
 
 test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
+		test_cluster_relmap_origin_build.inc \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_terminal_scan.h \
