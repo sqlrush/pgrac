@@ -20713,6 +20713,7 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 	uint64 master_sequence;
 	uint8 pcm_state;
 	SCN page_version;
+	SCN wal_clock;
 
 	/* Borrow a real writer's resources; a local conditional lock is not X. */
 	if (rel == NULL || rel->rd_rel == NULL || input == NULL || page == NULL
@@ -20801,6 +20802,13 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 		|| master_sequence != fence->master_sequence
 		|| !cluster_pcm_lock_authority_matches(tag, authority_before)
 		|| !cluster_semantic_activation_recheck_r4_terminal_census(admission))
+		return false;
+
+	/* XLogInsertRecord stamps the existing local SCN clock, not H. The
+	 * caller must have observed H before borrowing the page lock; do not
+	 * advance the clock or introduce callbacks/waits under that lock here. */
+	wal_clock = cluster_scn_current();
+	if (!SCN_VALID(wal_clock) || scn_time_cmp(wal_clock, horizon_scn) < 0)
 		return false;
 
 	/* Native redo and the existing SPACE version edge remain the only format. */

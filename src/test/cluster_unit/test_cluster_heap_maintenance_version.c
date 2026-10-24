@@ -90,6 +90,21 @@ static uint8 writer_state;
 static uint64 route_holder, route_master;
 static unsigned flushes;
 static unsigned writer_checks, route_checks, authority_checks, admission_checks;
+static SCN fixture_wal_clock, inserted_wal_clock;
+static unsigned wal_clock_reads;
+
+/* The real native apply reads this clock before mutation. WAL insertion's
+ * existing production xl_scn stamp uses the same clock; this leaf captures
+ * that value without simulating physical WAL insertion or persistence. */
+SCN
+cluster_scn_current(void)
+{
+	wal_clock_reads++;
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	UT_ASSERT_EQ(admission_checks, 1);
+	return fixture_wal_clock;
+}
 
 /* Only the process-local private refcount is a leaf double. Compile the
  * actual pin reader as well as the native apply bodies below. */
@@ -359,6 +374,7 @@ XLogInsert(RmgrId rmgr, uint8 info)
 	UT_ASSERT_EQ(rmgr, expected_info == XLOG_FPI_FOR_HINT ? RM_XLOG_ID : RM_HEAP2_ID);
 	UT_ASSERT_EQ(info, expected_info);
 	begun = false;
+	inserted_wal_clock = fixture_wal_clock;
 	inserts++;
 	return UINT64_C(0x9000);
 }
@@ -511,6 +527,9 @@ reset(uint8 opcode, bool shared)
 	CritSectionCount = 0;
 	edges = inserts = dirties = hints = flushes = 0;
 	writer_checks = route_checks = authority_checks = admission_checks = 0;
+	fixture_wal_clock = scn_encode(0, 100);
+	inserted_wal_clock = InvalidScn;
+	wal_clock_reads = 0;
 	local_x = writer_current = route_current = authority_current = admission_current = true;
 	backend_pin_count = 1;
 	pin_checks = 0;
@@ -1175,8 +1194,67 @@ UT_TEST(test_xmin_batch_final_authority_refusal_changes_nothing)
 		UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
 		UT_ASSERT_EQ(writer_checks, 1);
 		UT_ASSERT_EQ(route_checks, 1);
+		UT_ASSERT_EQ(wal_clock_reads, 0);
 		UT_ASSERT_EQ(inserts + dirties + flushes, 0);
 		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_single_and_batch_reject_unknown_or_behind_wal_clock)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int batch = 0; batch < 2; batch++) {
+		for (int unknown = 0; unknown < 2; unknown++) {
+			if (batch)
+				qualified_xmin_batch_setup(&f, targets);
+			else
+				qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			/* Larger node bits do not make an older clock reach H. */
+			fixture_wal_clock = unknown ? InvalidScn : scn_encode(7, 9);
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3)
+				: qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(wal_clock_reads, 1);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			UT_ASSERT(local_x && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+		}
+	}
+}
+
+UT_TEST(test_xmin_single_and_batch_wal_clock_accept_time_equal_or_ahead)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	const SCN horizon = scn_encode(7, 10);
+	const FullTransactionId limit = FullTransactionIdFromEpochAndXid(1, 100);
+
+	for (int batch = 0; batch < 2; batch++) {
+		for (int ahead = 0; ahead < 2; ahead++) {
+			bool applied;
+
+			if (batch)
+				qualified_xmin_batch_setup(&f, targets);
+			else
+				qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
+			/* A lower node id at the same time is still sufficient. */
+			fixture_wal_clock = scn_encode(0, 10 + ahead);
+			applied = batch ? cluster_heap_freeze_apply_xmin_batch_v1(
+				&relation_data, 1, &f.input, &f.page, &f.proofs, &f.fence,
+				&f.authority, &f.admission, targets, 3, limit, horizon)
+				: cluster_heap_freeze_apply_xmin_v1(&relation_data, 1, &f.input,
+					&f.page, &f.proofs, &f.fence, &f.authority, &f.admission,
+					0, FullTransactionIdFromEpochAndXid(1, 77), limit, horizon);
+			UT_ASSERT(applied);
+			UT_ASSERT_EQ(wal_clock_reads, 1);
+			UT_ASSERT_EQ(inserts, 1);
+			UT_ASSERT_EQ(flushes, 1);
+			UT_ASSERT(scn_time_cmp(inserted_wal_clock, horizon) >= 0);
+			UT_ASSERT(local_x && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+		}
 	}
 }
 
@@ -1702,7 +1780,7 @@ UT_TEST(test_deferred_request_preserves_shared_freeze_restriction)
 int
 main(void)
 {
-	UT_PLAN(38);
+	UT_PLAN(40);
 	UT_RUN(test_prune_native_plan_and_version);
 	UT_RUN(test_shared_freeze_refuses_before_tuple_or_wal);
 	UT_RUN(test_vacuum_native_unused_and_version);
@@ -1740,6 +1818,8 @@ main(void)
 	UT_RUN(test_xmin_batch_later_stale_row_rejects_before_fence);
 	UT_RUN(test_xmin_batch_rejects_ambiguous_native_horizon);
 	UT_RUN(test_xmin_batch_final_authority_refusal_changes_nothing);
+	UT_RUN(test_xmin_single_and_batch_reject_unknown_or_behind_wal_clock);
+	UT_RUN(test_xmin_single_and_batch_wal_clock_accept_time_equal_or_ahead);
 	UT_RUN(test_xmin_batch_flush_error_keeps_borrowed_resources);
 	UT_DONE();
 	return ut_failed_count != 0;
