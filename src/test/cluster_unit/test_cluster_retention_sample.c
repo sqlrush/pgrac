@@ -227,6 +227,78 @@ UT_TEST(test_invalid_clock_never_borrows_a_snapshot_time)
 	UT_ASSERT_EQ(releases, 1);
 }
 
+UT_TEST(test_nonfinite_clock_cannot_borrow_a_snapshot_or_empty_array)
+{
+	for (int count = 0; count <= 1; count++) {
+		ClusterUndoRetentionSample sample;
+
+		reset_fixture();
+		sample_clock = (SCN) UINT64_MAX;
+		procArray->numProcs = count;
+		pg_atomic_write_u64(&entries[0].cluster_read_scn_atomic, 400);
+		MemSet(&sample, 0xa5, sizeof(sample));
+		UT_ASSERT(!cluster_undo_retention_horizon_sample(&sample));
+		UT_ASSERT(empty_sample(&sample));
+		UT_ASSERT_EQ(acquires, 1);
+		UT_ASSERT_EQ(releases, 1);
+		UT_ASSERT_EQ(clock_reads, 1);
+		UT_ASSERT_EQ(lock_errors, 0);
+		UT_ASSERT(!held);
+	}
+}
+
+UT_TEST(test_nonfinite_reader_cannot_be_ignored_in_a_finite_clock_cut)
+{
+	for (int has_xmin = 0; has_xmin <= 1; has_xmin++) {
+		ClusterUndoRetentionSample sample;
+
+		reset_fixture();
+		procArray->numProcs = 2;
+		pg_atomic_write_u64(&entries[0].cluster_read_scn_atomic, 400);
+		entries[1].xmin = has_xmin ? 80 : InvalidTransactionId;
+		pg_atomic_write_u64(&entries[1].cluster_read_scn_atomic, (SCN) UINT64_MAX);
+		MemSet(&sample, 0xa5, sizeof(sample));
+		UT_ASSERT(!cluster_undo_retention_horizon_sample(&sample));
+		UT_ASSERT(empty_sample(&sample));
+		UT_ASSERT_EQ(releases, 1);
+		UT_ASSERT_EQ(lock_errors, 0);
+		UT_ASSERT(!held);
+	}
+}
+
+UT_TEST(test_scalar_compatibility_never_publishes_a_nonfinite_clock)
+{
+	reset_fixture();
+	sample_clock = (SCN) UINT64_MAX;
+	UT_ASSERT_EQ(cluster_undo_retention_horizon(), InvalidScn);
+	UT_ASSERT_EQ(acquires, 1);
+	UT_ASSERT_EQ(releases, 1);
+	UT_ASSERT_EQ(clock_reads, 1);
+	UT_ASSERT_EQ(lock_errors, 0);
+}
+
+UT_TEST(test_original_sample_recovers_after_nonfinite_source_is_replaced)
+{
+	ClusterUndoRetentionSample sample;
+
+	reset_fixture();
+	procArray->numProcs = 1;
+	pg_atomic_write_u64(&entries[0].cluster_read_scn_atomic, (SCN) UINT64_MAX);
+	UT_ASSERT(!cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT(empty_sample(&sample));
+	pg_atomic_write_u64(&entries[0].cluster_read_scn_atomic, 400);
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 400);
+	UT_ASSERT_EQ(sample.clock_scn, 700);
+	UT_ASSERT_EQ(sample.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+	UT_ASSERT_EQ(sample.contributor_token, 1);
+	UT_ASSERT_EQ(acquires, 2);
+	UT_ASSERT_EQ(releases, 2);
+	UT_ASSERT_EQ(clock_reads, 2);
+	UT_ASSERT_EQ(lock_errors, 0);
+	UT_ASSERT(!held);
+}
+
 UT_TEST(test_unlock_cannot_change_sample_or_scalar_wrapper)
 {
 	ClusterUndoRetentionSample sample;
@@ -434,7 +506,7 @@ UT_TEST(test_null_output_and_disabled_cluster_do_not_scan)
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(21);
 	UT_RUN(test_empty_array_has_one_prescan_clock);
 	UT_RUN(test_all_database_and_vacuum_snapshot_minima_are_included);
 	UT_RUN(test_equal_time_prefers_snapshot_without_changing_scalar_bits);
@@ -442,6 +514,10 @@ main(void)
 	UT_RUN(test_unexplained_read_scn_is_unknown_and_equal_snapshot_wins);
 	UT_RUN(test_missing_read_scn_clears_partial_minimum);
 	UT_RUN(test_invalid_clock_never_borrows_a_snapshot_time);
+	UT_RUN(test_nonfinite_clock_cannot_borrow_a_snapshot_or_empty_array);
+	UT_RUN(test_nonfinite_reader_cannot_be_ignored_in_a_finite_clock_cut);
+	UT_RUN(test_scalar_compatibility_never_publishes_a_nonfinite_clock);
+	UT_RUN(test_original_sample_recovers_after_nonfinite_source_is_replaced);
 	UT_RUN(test_unlock_cannot_change_sample_or_scalar_wrapper);
 	UT_RUN(test_replication_slot_pin_without_backend_refuses_horizon);
 	UT_RUN(test_catalog_slot_pin_cannot_borrow_backend_read_scn);

@@ -1044,6 +1044,8 @@ lazy_scan_heap(LVRelState *vacrel)
 		vacrel->shared_freeze_proofs.proof_count = 0;
 		vacrel->shared_freeze_fence_valid = false;
 		vacrel->shared_freeze_cohort_observed = false;
+		vacrel->shared_freeze_input.freeze_policy = NULL;
+		vacrel->shared_freeze_input.freeze_cohort = NULL;
 		vacrel->shared_freeze_xmin_candidates.target_count = 0;
 		vacrel->shared_freeze_aborted_xmax_candidates.target_count = 0;
 		vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
@@ -1561,6 +1563,8 @@ lazy_scan_shared_mx(LVRelState *vacrel, Page page, BlockNumber blkno)
 	vacrel->shared_freeze_proofs.proof_count = 0;
 	vacrel->shared_freeze_fence_valid = false;
 	vacrel->shared_freeze_cohort_observed = false;
+	vacrel->shared_freeze_input.freeze_policy = NULL;
+	vacrel->shared_freeze_input.freeze_cohort = NULL;
 	vacrel->shared_freeze_xmin_candidates.target_count = 0;
 	vacrel->shared_freeze_aborted_xmax_candidates.target_count = 0;
 	vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
@@ -1613,6 +1617,8 @@ lazy_validate_shared_freeze(LVRelState *vacrel, Page page, BlockNumber blkno, Bu
 			vacrel->shared_freeze_proofs.proof_count = 0;
 			vacrel->shared_freeze_fence_valid = false;
 			vacrel->shared_freeze_cohort_observed = false;
+			vacrel->shared_freeze_input.freeze_policy = NULL;
+			vacrel->shared_freeze_input.freeze_cohort = NULL;
 			vacrel->shared_freeze_xmin_candidates.target_count = 0;
 			vacrel->shared_freeze_aborted_xmax_candidates.target_count = 0;
 			vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
@@ -1954,6 +1960,8 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 	if (vacrel != NULL)
 	{
 		vacrel->shared_freeze_cohort_observed = false;
+		vacrel->shared_freeze_input.freeze_policy = NULL;
+		vacrel->shared_freeze_input.freeze_cohort = NULL;
 		vacrel->shared_freeze_xmin_candidates.target_count = 0;
 		vacrel->shared_freeze_aborted_xmax_candidates.target_count = 0;
 		vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
@@ -2149,6 +2157,12 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 						memcpy(&vacrel->shared_freeze_cohort, &cohort, sizeof(cohort));
 						vacrel->shared_freeze_candidate_limit_full = observed_bounds.freeze_limit;
 						vacrel->shared_freeze_cohort_observed = true;
+						/* Borrow only the owned observations in this original context;
+						 * these companions do not promote candidate F/H to authority. */
+						vacrel->shared_freeze_input.freeze_policy =
+							&vacrel->cutoffs.SharedFreezePolicySample;
+						vacrel->shared_freeze_input.freeze_cohort =
+							&vacrel->shared_freeze_cohort;
 					}
 				}
 			}
@@ -2171,12 +2185,35 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 			/* Screen the same attempt's original creator identities and observed
 			 * bounds without producing native plans. Positive F/H and producer
 			 * retention admission are still required before any shared write. */
-			if (vacrel->shared_freeze_cohort_observed)
-				(void) cluster_heap_freeze_select_xmin_candidates_v1(
+			if (vacrel->shared_freeze_cohort_observed
+				&& cluster_heap_freeze_select_xmin_candidates_v1(
 					&vacrel->shared_freeze_batch, &proofs, &current_fence,
 					vacrel->shared_freeze_candidate_limit_full,
 					observed_bounds.horizon_scn,
-					&vacrel->shared_freeze_xmin_candidates);
+					&vacrel->shared_freeze_xmin_candidates))
+			{
+				ClusterHeapFreezeXminCandidateBatchV1 *candidates =
+					&vacrel->shared_freeze_xmin_candidates;
+				FullTransactionId legal_next = vacrel->cutoffs.SharedFreezePolicySample.legal_next;
+				uint16 kept = 0;
+
+				/* Screen only native format compatibility, in original row order.
+				 * A source-proven old row outside the raw WAL window must not
+				 * discard the other candidates. This grants no positive F/H. */
+				if (candidates->target_count > MaxHeapTuplesPerPage)
+					candidates->target_count = 0;
+				for (uint16 i = 0; i < candidates->target_count; i++)
+				{
+					const ClusterHeapFreezeXminTargetV1 *target = &candidates->targets[i];
+
+					if (FullTransactionIdPrecedes(target->original_creator_full_xid, legal_next)
+						&& U64FromFullTransactionId(legal_next)
+							- U64FromFullTransactionId(target->original_creator_full_xid)
+							< UINT64CONST(0x80000000))
+						candidates->targets[kept++] = *target;
+				}
+				candidates->target_count = kept;
+			}
 		}
 		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
 			|| status == CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED
@@ -2240,6 +2277,8 @@ done:
 		vacrel->shared_freeze_proofs.proof_count = 0;
 		vacrel->shared_freeze_fence_valid = false;
 		vacrel->shared_freeze_cohort_observed = false;
+		vacrel->shared_freeze_input.freeze_policy = NULL;
+		vacrel->shared_freeze_input.freeze_cohort = NULL;
 		vacrel->shared_freeze_xmin_candidates.target_count = 0;
 		vacrel->shared_freeze_aborted_xmax_candidates.target_count = 0;
 		vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
@@ -2276,6 +2315,8 @@ lazy_prepare_shared_freeze(LVRelState *vacrel, Buffer recent_buffer, Buffer *vmb
 	vacrel->shared_freeze_proofs.proof_count = 0;
 	vacrel->shared_freeze_fence_valid = false;
 	vacrel->shared_freeze_cohort_observed = false;
+	vacrel->shared_freeze_input.freeze_policy = NULL;
+	vacrel->shared_freeze_input.freeze_cohort = NULL;
 	vacrel->shared_freeze_xmin_candidates.target_count = 0;
 	vacrel->shared_freeze_aborted_xmax_candidates.target_count = 0;
 	vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;

@@ -49,6 +49,7 @@
 
 #include "cluster/cluster_advisory.h" /* spec-5.5 D8 — UL counters */
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_ges_reply_wait.h" /* cluster_ges_reply_wait_next_request_id (spec-5.16: node-global request_id) */
@@ -456,10 +457,13 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 		 * waiter edge (spec-5.8 D1b/D1e).
 		 */
 		ClusterLmdProcWaitState *ws = (MyProc != NULL) ? &MyProc->cluster_lmd_wait : NULL;
-		if (ws != NULL)
-			(void)cluster_lmd_wait_state_publish(ws, CLUSTER_LMD_WAIT_GES, req->request_id,
-												 cluster_epoch_get_current(),
-												 GetTopTransactionIdIfAny());
+		if (ws != NULL) {
+			uint64 epoch = cluster_epoch_get_current();
+			uint64 wait_seq = cluster_lmd_wait_state_publish(ws, CLUSTER_LMD_WAIT_GES,
+				req->request_id, epoch, GetTopTransactionIdIfAny());
+			cluster_content_trace_enqueue_wait_set(&req->resid, &req->holder,
+				req->lockmode, req->current_mode, false, req->request_id, epoch, wait_seq);
+		}
 		PG_TRY();
 		{
 			if (cluster_lock_acquire_is_hw_request(req))
@@ -483,6 +487,7 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 		}
 		PG_CATCH();
 		{
+			cluster_content_trace_enqueue_wait_clear();
 			if (ws != NULL)
 				cluster_lmd_wait_state_clear(ws);
 			if (cluster_lock_acquire_is_hw_request(req)
@@ -494,6 +499,7 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
+		cluster_content_trace_enqueue_wait_clear();
 		if (ws != NULL)
 			cluster_lmd_wait_state_clear(ws);
 	}
@@ -611,10 +617,13 @@ cluster_lock_acquire_s5_convert(const ClusterLockAcquireRequest *req)
 	 * wait so the resolver can revalidate the victim. */
 	ClusterLmdProcWaitState *ws = (MyProc != NULL) ? &MyProc->cluster_lmd_wait : NULL;
 
-	if (ws != NULL && !convert_nowait)
-		(void)cluster_lmd_wait_state_publish(ws, CLUSTER_LMD_WAIT_GES, req->request_id,
-											 cluster_epoch_get_current(),
-											 GetTopTransactionIdIfAny());
+	if (ws != NULL && !convert_nowait) {
+		uint64 epoch = cluster_epoch_get_current();
+		uint64 wait_seq = cluster_lmd_wait_state_publish(ws, CLUSTER_LMD_WAIT_GES,
+			req->request_id, epoch, GetTopTransactionIdIfAny());
+		cluster_content_trace_enqueue_wait_set(&req->resid, &req->holder,
+			req->lockmode, req->current_mode, true, req->request_id, epoch, wait_seq);
+	}
 	PG_TRY();
 	{
 		if (convert_nowait)
@@ -629,11 +638,15 @@ cluster_lock_acquire_s5_convert(const ClusterLockAcquireRequest *req)
 	}
 	PG_CATCH();
 	{
+		if (!convert_nowait)
+			cluster_content_trace_enqueue_wait_clear();
 		if (ws != NULL && !convert_nowait)
 			cluster_lmd_wait_state_clear(ws);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	if (!convert_nowait)
+		cluster_content_trace_enqueue_wait_clear();
 	if (ws != NULL && !convert_nowait)
 		cluster_lmd_wait_state_clear(ws);
 	if (reject == GES_REJECT_REASON_NONE) {
@@ -804,8 +817,15 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 	for (;;) {
 		result = cluster_lock_acquire_s5_promote_once(req);
 		if (result != CLUSTER_LOCK_ACQUIRE_PENDING || MyBackendType == B_LMON
-			|| MyBackendType == B_LMS)
+			|| MyBackendType == B_LMS) {
+			/* Observe only the nonconverting manual HW/KO lifecycle. The
+			 * original result remains the sole grant decision. */
+			if (result == CLUSTER_LOCK_ACQUIRE_OK_GRANTED && req != NULL &&
+				req->op == CLUSTER_LOCK_OP_REQUEST && req->lockmode == ExclusiveLock &&
+				(req->resid.type == CLUSTER_HW_RESID_TYPE || req->resid.type == CLUSTER_KO_RESID_TYPE))
+				cluster_content_trace_enqueue_granted(&req->resid, &req->holder, req->lockmode);
 			return result;
+		}
 		CHECK_FOR_INTERRUPTS();
 		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 10,
 						WAIT_EVENT_CLUSTER_GES_REPLY_WAIT);
@@ -829,6 +849,8 @@ cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 
+	if (req->resid.type == CLUSTER_HW_RESID_TYPE || req->resid.type == CLUSTER_KO_RESID_TYPE)
+		cluster_content_trace_enqueue_releasing(&req->resid, &req->holder);
 
 	/*
 	 * PGRAC: spec-5.5 P0 — route the release the SAME way the acquire/send path

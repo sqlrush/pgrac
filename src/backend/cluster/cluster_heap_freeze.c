@@ -89,6 +89,8 @@ cluster_heap_freeze_capture_page_v1(const ClusterSpaceIdentity *identity,
 	out->max_offset = maxoff;
 	out->normal_tuples = normal;
 	out->multi_tuples = multi;
+	out->freeze_policy = NULL;
+	out->freeze_cohort = NULL;
 	out->writer_context_valid = false;
 	out->writer_object_revision = 0;
 	out->writer_object_checked = false;

@@ -203,6 +203,9 @@ static ClusterInjectPoint cluster_injection_registry[] = {
 	{ .name = "cluster-cssd-main-loop-pre-tick" },
 	{ .name = "cluster-cssd-shutdown-pre" },
 	{ .name = "cluster-cssd-shutdown-post" },
+	/* Native reservation durable, no content lock, before DATA materialization. */
+	{ .name = "cluster-ko-extension-reserved" },
+	{ .name = "cluster-ko-extension-recovery-start" },
 	/* spec-2.6 Sprint A Step 4 D14 — 5 qvotec / quorum-lite injects. */
 	{ .name = "cluster-qvotec-poll-pre" },
 	{ .name = "cluster-qvotec-poll-post" },

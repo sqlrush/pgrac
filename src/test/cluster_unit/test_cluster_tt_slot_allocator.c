@@ -311,6 +311,17 @@ int cluster_node_id = 0;
 bool IsUnderPostmaster = false;
 BackendType MyBackendType = B_INVALID;
 
+/* No original origin publisher is linked in this allocator-only fixture. */
+bool
+cluster_ctrc_origin_original_full_xid_shared(const ClusterCtrcTxnKeyV1 *key,
+											FullTransactionId *out)
+{
+	(void)key;
+	if (out != NULL)
+		*out = InvalidFullTransactionId;
+	return false;
+}
+
 SCN
 cluster_undo_retention_horizon(void)
 {

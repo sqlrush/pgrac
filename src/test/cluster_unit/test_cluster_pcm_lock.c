@@ -68,6 +68,7 @@
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_wait_trace.h"
+#include "cluster/cluster_wait_graph.h"
 #include "port/pg_crc32c.h"
 #include "miscadmin.h"
 #include "storage/backendid.h"	   /* spec-6.14 D9 amend — MyBackendId stub */
@@ -491,7 +492,7 @@ cluster_lms_wakeup(int worker_id)
 }
 
 #define FAKE_PCM_MAX_ENTRIES 24
-#define FAKE_PCM_ENTRY_BYTES 1432
+#define FAKE_PCM_ENTRY_BYTES 1456
 StaticAssertDecl(sizeof(struct StopPcmEntryLayout) == FAKE_PCM_ENTRY_BYTES,
 				 "negative fixture field offsets must match the generated original entry");
 
@@ -1095,9 +1096,12 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 	return true;
 }
 
+static int wait_graph_conditional_fail_at;
 bool
 LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
 {
+	if (wait_graph_conditional_fail_at > 0 && --wait_graph_conditional_fail_at == 0)
+		return false;
 	if (fake_lwlock_conditional_fail_once) {
 		fake_lwlock_conditional_fail_once = false;
 		return false;
@@ -18245,6 +18249,11 @@ UT_TEST(test_resource_x_deferred_source_pin_claim_is_exact_and_single_owner)
 	ResourceXDecodedFrame retained;
 	ResourceXTerminalXLineage lineage;
 	int cycle;
+	PGPROC proc = {0};
+	PGPROC *saved_proc = MyProc;
+	bool saved_trace = cluster_trace_tx_identity;
+	ClusterWaitGraphPcmSnapshot *cut = calloc(1, sizeof(*cut));
+	UT_ASSERT(cut != NULL);
 
 	check_resource_x_prepared_retain_episode_mode(0, 2, true, false);
 	owner = prepared_finish_owner;
@@ -18336,8 +18345,14 @@ UT_TEST(test_resource_x_deferred_source_pin_claim_is_exact_and_single_owner)
 		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_finish_claim_exact(&successor, 20, &claim),
 					 RESOURCE_X_APPLY_STALE);
 		successor.formation--;
+		proc.pgprocno = 20; proc.pid = MyProcPid; proc.cluster_grd_generation = 71 + cycle;
+		MyProc = &proc; cluster_trace_tx_identity = true;
 		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_finish_claim_exact(&successor, 20, &claim),
 					 RESOURCE_X_APPLY_APPLIED);
+		cluster_pcm_wait_graph_snapshot(&successor.assertion.resource, cut);
+		UT_ASSERT_EQ(cut->local_owner.claim.pid, MyProcPid);
+		UT_ASSERT_EQ(cut->local_owner.claim.proc_generation, 71 + cycle);
+		UT_ASSERT_EQ(cut->local_owner.claim.owner_generation, claim.owner.owner_generation);
 		UT_ASSERT_EQ(claim.buffer_id, 1);
 		UT_ASSERT_EQ(claim.master_node, 0);
 		UT_ASSERT_EQ(claim.owner.owner_generation, owner.owner_generation + 1);
@@ -18350,12 +18365,16 @@ UT_TEST(test_resource_x_deferred_source_pin_claim_is_exact_and_single_owner)
 			cluster_pcm_lock_resource_x_source_finish_claim_exact(&successor, 21, &duplicate),
 			RESOURCE_X_APPLY_BAD_STATE);
 		UT_ASSERT_EQ(duplicate.buffer_id, -1);
+		cluster_pcm_wait_graph_snapshot(&successor.assertion.resource, cut);
+		UT_ASSERT_EQ(cut->local_owner.claim.proc_generation, 71 + cycle);
+		UT_ASSERT_EQ(cut->local_owner.claim.owner_generation, claim.owner.owner_generation);
 		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_release_exact(&owner),
 					 RESOURCE_X_APPLY_STALE);
 		owner = claim.owner;
 	}
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_release_exact(&owner),
 				 RESOURCE_X_APPLY_APPLIED);
+	MyProc = saved_proc; cluster_trace_tx_identity = saved_trace; free(cut);
 }
 
 UT_TEST(test_resource_x_source_replay_observes_concurrent_finish_publication)
@@ -21003,6 +21022,221 @@ UT_TEST(test_pcm_dead_node_cleanup_drops_holder_records)
 	UT_ASSERT_EQ(cluster_pcm_lock_clear_pending_x_if(stag, 2), true);
 	UT_ASSERT_EQ(cluster_pcm_lock_query_pending_x_requester(stag), -1);
 	UT_ASSERT_EQ(cluster_pcm_lock_clear_pending_x_if(stag, 2), false);
+}
+
+UT_TEST(test_pcm_wait_graph_copy_is_owned_and_busy_never_waits)
+{
+	BufferTag tag = make_tag(1097), absent = make_tag(1098);
+	ClusterWaitGraphPcmSnapshot *snapshot = calloc(1, sizeof(*snapshot));
+	uint64 transitions;
+	UT_ASSERT(snapshot != NULL);
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 1;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	cluster_node_id = 2;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	cluster_pcm_lock_set_pending_x(tag, 3, 0x1234);
+	transitions = cluster_pcm_get_trans_n_to_s_count();
+	cluster_pcm_wait_graph_snapshot(&tag, snapshot);
+	UT_ASSERT_EQ(snapshot->status, CLWG_OBSERVED);
+	UT_ASSERT(snapshot->view.tag_known && snapshot->view.entry_known);
+	UT_ASSERT_EQ(snapshot->view.s_holders, (1U << 1) | (1U << 2));
+	UT_ASSERT_EQ(snapshot->view.pending_requester, 3);
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	for (int fail_at = 1; fail_at <= 2; fail_at++) {
+		wait_graph_conditional_fail_at = fail_at;
+		cluster_pcm_wait_graph_snapshot(&tag, snapshot);
+		UT_ASSERT_EQ(snapshot->status, CLWG_BUSY);
+		UT_ASSERT_EQ(snapshot->nqueued, 0);
+		UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	}
+	cluster_pcm_wait_graph_snapshot(&absent, snapshot);
+	UT_ASSERT_EQ(snapshot->status, CLWG_ABSENT);
+	cluster_pcm_wait_graph_snapshot(NULL, snapshot);
+	UT_ASSERT_EQ(snapshot->status, CLWG_INVALID);
+	UT_ASSERT_EQ(cluster_pcm_get_trans_n_to_s_count(), transitions);
+	free(snapshot);
+}
+
+UT_TEST(test_pcm_wait_graph_retained_block_is_owned_after_slot_retirement)
+{
+	BufferTag tag = make_tag(1099);
+	ResourceXDecodedFrame assertion;
+	ResourceXMasterSnapshot master;
+	ResourceXIntentSlot intent;
+	uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
+	ClusterWaitGraphPcmSnapshot *cut = calloc(1, sizeof(*cut));
+	ClusterWaitGraphPcmBlock saved, malformed;
+	UT_ASSERT(cut != NULL);
+	reset_fake_pcm_runtime(4); cluster_node_id = 0;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_X);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17), RESOURCE_X_APPLY_APPLIED);
+	assertion = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X, tag, 2, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&assertion, 2, &master), RESOURCE_X_APPLY_APPLIED);
+	cluster_pcm_wait_graph_snapshot(&tag, cut);
+	UT_ASSERT_EQ(cut->status, CLWG_OBSERVED); UT_ASSERT_EQ(cut->nblocks, 1);
+	UT_ASSERT_EQ(cut->omitted_blocks, 0); UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	saved = cut->blocks[0];
+	UT_ASSERT(saved.decoded && saved.slot_matches && saved.neutral_sender);
+	UT_ASSERT_EQ(saved.holder, 0); UT_ASSERT_EQ(saved.request.request_seq, 41);
+	UT_ASSERT_EQ(saved.request.source_candidate, 1); UT_ASSERT_EQ(saved.request.retain_pi_if_dirty, 1);
+	UT_ASSERT_EQ(saved.request.authority, 3); UT_ASSERT_EQ(saved.request.base, 1);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_intent_snapshot_exact(
+		&assertion.common.logical_assertion, 0, &intent, payload, sizeof(payload)), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(memcmp(saved.payload, payload, RESOURCE_X_CONTROL_V1_BYTES) == 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, intent.first_armed_us + 1), RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&intent));
+	cluster_pcm_wait_graph_snapshot(&tag, cut);
+	UT_ASSERT_EQ(cut->nblocks, 1); UT_ASSERT(cut->blocks[0].decoded);
+	UT_ASSERT_EQ(cut->blocks[0].slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+	UT_ASSERT(!cut->blocks[0].slot_matches);
+	UT_ASSERT(memcmp(saved.payload, cut->blocks[0].payload, RESOURCE_X_CONTROL_V1_BYTES) == 0);
+	UT_ASSERT_EQ(saved.slot.state, RESOURCE_X_INTENT_SLOT_ARMED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_intent_snapshot_exact(
+		&assertion.common.logical_assertion, 0, &intent, payload, sizeof(payload)), RESOURCE_X_APPLY_NOT_FOUND);
+	/* Diagnostic decoding mutates only this caller-owned copy. */
+	malformed = saved; malformed.slot.payload_bytes = 0;
+	cluster_pcm_wait_graph_decode_block(&malformed);
+	UT_ASSERT(malformed.decoded && !malformed.slot_matches);
+	malformed = saved; malformed.slot.body.owner_kind = RESOURCE_X_INTENT_OWNER_HOLDER_STATUS;
+	cluster_pcm_wait_graph_decode_block(&malformed); UT_ASSERT(!malformed.slot_matches);
+	malformed = saved; malformed.slot.state = UINT8_MAX;
+	cluster_pcm_wait_graph_decode_block(&malformed); UT_ASSERT(!malformed.slot_matches);
+	malformed = saved; malformed.payload[5] ^= 1;
+	cluster_pcm_wait_graph_decode_block(&malformed);
+	UT_ASSERT(!malformed.decoded && !malformed.slot_matches);
+	UT_ASSERT(malformed.reject != RESOURCE_X_WIRE_REJECT_NONE);
+	UT_ASSERT(!malformed.request.tag_known); UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	for (int fail_at = 1; fail_at <= 2; fail_at++) {
+		wait_graph_conditional_fail_at = fail_at;
+		cluster_pcm_wait_graph_snapshot(&tag, cut);
+		UT_ASSERT_EQ(cut->status, CLWG_BUSY); UT_ASSERT_EQ(cut->nblocks, 0);
+		UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	}
+	free(cut);
+}
+
+static ResourceXDecodedFrame
+wait_graph_claim_fixture(BufferTag tag)
+{
+	ResourceXDecodedFrame successor;
+	reset_fake_pcm_runtime(4); cluster_node_id = 1; fake_gcs_master_node = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17), RESOURCE_X_APPLY_APPLIED);
+	(void)setup_resource_x_test_terminal_cover(tag, 60);
+	successor = make_resource_x_master_frame(RESOURCE_X_WIRE_BLOCK_TO_N, tag, 2, 1);
+	successor.payload_bytes = RESOURCE_X_CONTROL_V1_BYTES;
+	successor.common.base_authority_generation = successor.common.authority_generation = 3;
+	successor.common.assertion_sequence = 42; successor.common.ordered_lane = 0;
+	successor.common.observed_mode = PCM_STATE_X; successor.common.target_mode = PCM_STATE_N;
+	successor.common.source_candidate = successor.common.retain_pi_if_dirty = 1;
+	return successor;
+}
+
+UT_TEST(test_pcm_wait_graph_claim_identity_is_original_not_proc_slot_sample)
+{
+	const struct { bool enabled, present; int32 slot, pid; uint64 generation; bool known; } cases[] = {
+		{true, true, 9, 4242, 71, true}, {false, true, 9, 4242, 71, false},
+		{true, false, 9, 4242, 71, false}, {true, true, 8, 4242, 71, false},
+		{true, true, 9, 4243, 71, false}, {true, true, 9, 4242, 0, false},
+		{true, true, 9, 4242, UINT64_MAX, false}
+	};
+	PGPROC proc = {0};
+	PGPROC *saved_proc = MyProc;
+	bool saved_trace = cluster_trace_tx_identity;
+	ClusterWaitGraphPcmSnapshot *cut = calloc(1, sizeof(*cut));
+	ClusterWaitGraphPcmOwner saved;
+	UT_ASSERT(cut != NULL);
+	for (uint32 i = 0; i < lengthof(cases); i++) {
+		BufferTag tag = make_tag(1101 + i);
+		ResourceXDecodedFrame successor;
+		ResourceXLocalOwnerHandle handle, replay;
+		ResourceXTerminalXLineage lineage;
+		cluster_trace_tx_identity = false; MyProc = NULL;
+		successor = wait_graph_claim_fixture(tag);
+		proc.pgprocno = cases[i].slot; proc.pid = cases[i].pid;
+		proc.cluster_grd_generation = cases[i].generation;
+		MyProc = cases[i].present ? &proc : NULL;
+		cluster_trace_tx_identity = cases[i].enabled;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
+			&successor, 0, 77, 60, 19, 9, 127, &lineage, &handle), RESOURCE_X_APPLY_APPLIED);
+		cluster_pcm_wait_graph_snapshot(&tag, cut);
+		UT_ASSERT_EQ(cut->status, CLWG_OBSERVED); UT_ASSERT(cut->local_owner.valid);
+		UT_ASSERT_EQ(cut->local_owner.claim.pid, cases[i].known ? 4242 : 0);
+		UT_ASSERT_EQ(cut->local_owner.claim.proc_generation, cases[i].known ? 71 : 0);
+		UT_ASSERT_EQ(cut->local_owner.claim.owner_generation, cases[i].known ? handle.owner_generation : 0);
+		saved = cut->local_owner;
+		/* A reused slot and a failed claim must not rewrite the original cut. */
+		proc.cluster_grd_generation = 72; proc.pid = 4343;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
+			&successor, 0, 77, 60, 20, 9, 127, &lineage, &replay), RESOURCE_X_APPLY_BAD_STATE);
+		cluster_pcm_wait_graph_snapshot(&tag, cut);
+		UT_ASSERT(memcmp(&saved.claim, &cut->local_owner.claim, sizeof(saved.claim)) == 0);
+		cluster_trace_tx_identity = false;
+		cluster_pcm_wait_graph_snapshot(&tag, cut);
+		UT_ASSERT(memcmp(&saved.claim, &cut->local_owner.claim, sizeof(saved.claim)) == 0);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_release_exact(&handle), RESOURCE_X_APPLY_APPLIED);
+		cluster_pcm_wait_graph_snapshot(&tag, cut);
+		UT_ASSERT_EQ(cut->local_owner.claim.pid, 0);
+		UT_ASSERT_EQ(cut->local_owner.claim.proc_generation, 0);
+		UT_ASSERT_EQ(cut->local_owner.claim.owner_generation, 0);
+		UT_ASSERT_EQ(saved.claim.proc_generation, cases[i].known ? 71 : 0);
+		UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	}
+	MyProc = saved_proc; cluster_trace_tx_identity = saved_trace; free(cut);
+}
+
+UT_TEST(test_pcm_wait_graph_local_owner_preserves_holder_and_successor)
+{
+	BufferTag tag = make_tag(1100);
+	ResourceXAcquisitionRef holder;
+	ResourceXDecodedFrame successor;
+	ResourceXLocalOwnerHandle handle;
+	ResourceXTerminalXLineage lineage;
+	ClusterWaitGraphPcmSnapshot *cut = calloc(1, sizeof(*cut));
+	ClusterWaitGraphPcmOwner saved;
+
+	UT_ASSERT(cut != NULL);
+	reset_fake_pcm_runtime(4); cluster_node_id = 1;
+	fake_gcs_master_node = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17), RESOURCE_X_APPLY_APPLIED);
+	holder = setup_resource_x_test_terminal_cover(tag, 60);
+	successor = make_resource_x_master_frame(RESOURCE_X_WIRE_BLOCK_TO_N, tag, 2, 1);
+	successor.payload_bytes = RESOURCE_X_CONTROL_V1_BYTES;
+	successor.common.base_authority_generation = 3;
+	successor.common.authority_generation = 3;
+	successor.common.assertion_sequence = 42;
+	successor.common.ordered_lane = 0;
+	successor.common.observed_mode = PCM_STATE_X;
+	successor.common.target_mode = PCM_STATE_N;
+	successor.common.source_candidate = successor.common.retain_pi_if_dirty = 1;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
+		&successor, 0, 77, 60, 19, 9, 127, &lineage, &handle), RESOURCE_X_APPLY_APPLIED);
+	cluster_pcm_wait_graph_snapshot(&tag, cut);
+	UT_ASSERT_EQ(cut->status, CLWG_OBSERVED); UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	UT_ASSERT(cut->local_owner.valid && cut->local_owner.successor_known);
+	UT_ASSERT_EQ(cut->local_owner.state, 2);
+	UT_ASSERT(memcmp(&cut->local_owner.handle, &handle, sizeof(handle)) == 0);
+	UT_ASSERT_EQ(cut->local_owner.handle.ref.acquisition_generation, holder.acquisition_generation);
+	UT_ASSERT_EQ(cut->local_owner.handle.ref.assertion.requester_node, 1);
+	UT_ASSERT_EQ(cut->local_owner.successor.requester, 2);
+	UT_ASSERT_EQ(cut->local_owner.successor.request_seq, 42);
+	UT_ASSERT_EQ(cut->local_owner.successor.expected_master, 0);
+	UT_ASSERT_EQ(cut->local_owner.successor.r4, 77);
+	UT_ASSERT_EQ(cut->local_owner.highest_generation, handle.owner_generation);
+	saved = cut->local_owner;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_release_exact(&handle), RESOURCE_X_APPLY_APPLIED);
+	cluster_pcm_wait_graph_snapshot(&tag, cut);
+	UT_ASSERT(cut->local_owner.valid); UT_ASSERT_EQ(cut->local_owner.state, 0);
+	UT_ASSERT_EQ(cut->local_owner.handle.owner_generation, 0);
+	UT_ASSERT_EQ(saved.state, 2); UT_ASSERT_EQ(saved.handle.owner_generation, handle.owner_generation);
+	UT_ASSERT_EQ(saved.handle.absolute_deadline_us, handle.absolute_deadline_us);
+	for (int fail_at = 1; fail_at <= 2; fail_at++) {
+		wait_graph_conditional_fail_at = fail_at;
+		cluster_pcm_wait_graph_snapshot(&tag, cut);
+		UT_ASSERT_EQ(cut->status, CLWG_BUSY); UT_ASSERT(!cut->local_owner.valid);
+		UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	}
+	free(cut);
 }
 
 UT_TEST(test_pcm_authority_snapshot_is_one_entry_lock_view)
@@ -24915,12 +25149,14 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(379);
+	UT_PLAN(383);
 	/* Observe the actual startup state before any runtime fixture overrides
 	 * the postmaster GUC or initializes shared PCM state and counters. */
 	UT_RUN(test_pcm_grd_max_entries_default_is_minus_one);
 	UT_RUN(test_pcm_disable_path_counters_return_zero);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
+	UT_RUN(test_pcm_wait_graph_copy_is_owned_and_busy_never_waits);
+	UT_RUN(test_pcm_wait_graph_retained_block_is_owned_after_slot_retirement);
 
 	UT_RUN(test_resource_x_pi_complete_resumes_native_master_without_new_assert);
 	UT_RUN(test_resource_x_master_work_never_substitutes_for_pi_or_admission);
@@ -25299,6 +25535,8 @@ main(void)
 	UT_RUN(test_pi_relation_scan_never_retires_master_or_local_pi);
 	UT_RUN(test_pi_relation_scan_refuses_orphan_and_preheld_lock);
 	UT_RUN(test_pi_relation_scan_rejects_wrong_gate_and_pending_transfer);
+	UT_RUN(test_pcm_wait_graph_claim_identity_is_original_not_proc_slot_sample);
+	UT_RUN(test_pcm_wait_graph_local_owner_preserves_holder_and_successor);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

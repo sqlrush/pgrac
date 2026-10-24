@@ -692,6 +692,12 @@ GetNamedLWLockTranche(const char *tranche_name pg_attribute_unused())
 	return dummy_locks;
 }
 
+/* The diagnostic walk is not called by this native fairness fixture. */
+volatile sig_atomic_t InterruptPending = false;
+void
+ProcessInterrupts(void)
+{}
+
 static LWLock *held_locks[8];
 static int held_lock_count;
 
@@ -702,6 +708,13 @@ LWLockAcquire(LWLock *lock, LWLockMode mode pg_attribute_unused())
 		abort();
 	held_locks[held_lock_count++] = lock;
 	return true;
+}
+
+/* Native try-reader link boundary; this fixture has no contended LWLocks. */
+bool
+LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
+{
+	return LWLockAcquire(lock, mode);
 }
 
 void

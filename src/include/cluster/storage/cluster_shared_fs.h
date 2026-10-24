@@ -357,6 +357,10 @@ extern const ClusterSharedFsOps cluster_shared_fs_local_ops;
 extern const ClusterSharedFsOps cluster_shared_fs_block_device_ops;
 /* Stage 4.5a (spec-4.5a D1): first genuinely cross-node-shared backend. */
 extern const ClusterSharedFsOps cluster_shared_fs_sharedfs_ops;
+/* Returns false when the provider cannot preserve existing bytes atomically.
+ * Only the exact selected KO failed-extension executor may call this. */
+extern bool cluster_shared_fs_sharedfs_preserve_extension_v3(ClusterSharedFsHandle *handle,
+															   BlockNumber block);
 
 /* Local physical result only, not authority or a PI receipt. The original
  * postcommit DROP owner supplies its exact TOMBSTONED SPACE identity/token.

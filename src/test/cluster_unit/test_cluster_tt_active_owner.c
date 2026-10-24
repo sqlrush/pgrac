@@ -791,10 +791,81 @@ UT_TEST(test_real_local_abort_keeps_bound_wrap)
 	check_terminal_binding_wrap(false);
 }
 
+UT_TEST(test_original_identity_survives_origin_retirement_and_terminal)
+{
+	for (int committed = 0; committed < 2; committed++) {
+		ClusterCtrcTxnKeyV1 key;
+		FullTransactionId full = InvalidFullTransactionId;
+
+		reset_active_owner();
+		require_published_on(1);
+		key = g_ctrc_original_reservation.key;
+		UT_ASSERT(cluster_tt_slot_origin_identity_read(&key, &full));
+		UT_ASSERT(FullTransactionIdEquals(full, g_ctrc_reserved_original_full));
+		/* Original source retirement must not erase the slot-owned handoff. */
+		g_ctrc_original_available = false;
+		if (committed)
+			cluster_tt_slot_mark_committed(key.segment_id, key.slot_offset, key.xid,
+									   key.slot_wrap, (SCN)91);
+		else
+			cluster_tt_slot_mark_aborted(key.segment_id, key.slot_offset, key.xid, key.slot_wrap);
+		UT_ASSERT(cluster_tt_slot_origin_identity_read(&key, &full));
+		UT_ASSERT(FullTransactionIdEquals(full, g_ctrc_reserved_original_full));
+		UT_ASSERT_EQ(lock_depth, 0);
+	}
+}
+
+UT_TEST(test_original_identity_exact_key_and_slot_lifetime)
+{
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcTxnKeyV1 changed;
+	FullTransactionId full;
+
+	reset_active_owner();
+	require_published_on(1);
+	key = g_ctrc_original_reservation.key;
+	UT_ASSERT(cluster_tt_slot_origin_identity_read(&key, &full));
+	UT_ASSERT(cluster_tt_slot_origin_identity_retain(&g_ctrc_original_reservation));
+	changed = key;
+	changed.root_generation++;
+	full = g_ctrc_reserved_original_full;
+	UT_ASSERT(!cluster_tt_slot_origin_identity_read(&changed, &full));
+	UT_ASSERT(!FullTransactionIdIsValid(full));
+	changed = key;
+	changed.slot_wrap++;
+	UT_ASSERT(!cluster_tt_slot_origin_identity_read(&changed, &full));
+	cluster_tt_slot_free(key.segment_id, key.slot_offset);
+	UT_ASSERT(!cluster_tt_slot_origin_identity_read(&key, &full));
+	UT_ASSERT_EQ(cluster_tt_slot_alloc(key.segment_id, key.xid), key.slot_offset);
+	/* Same raw identity after FREE is not the former published reservation. */
+	UT_ASSERT(!cluster_tt_slot_origin_identity_read(&key, &full));
+	cluster_tt_slot_rollover(0, 2, NULL);
+	cluster_tt_slot_rollover(0, 1, NULL);
+	UT_ASSERT(!cluster_tt_slot_origin_identity_read(&key, &full));
+	UT_ASSERT_EQ(lock_depth, 0);
+}
+
+UT_TEST(test_missing_origin_identity_never_changes_active_success)
+{
+	FullTransactionId full;
+
+	reset_active_owner();
+	g_ctrc_original_available = false;
+	require_published_on(1);
+	full = g_ctrc_reserved_original_full;
+	UT_ASSERT(!cluster_tt_slot_origin_identity_read(&g_ctrc_original_reservation.key, &full));
+	UT_ASSERT(!FullTransactionIdIsValid(full));
+	g_ctrc_original_available = true;
+	g_ctrc_original_reservation.kind = CTRC_ORIGIN_RESERVATION_EXISTING_OPEN;
+	UT_ASSERT(!cluster_tt_slot_origin_identity_retain(&g_ctrc_original_reservation));
+	UT_ASSERT(!cluster_tt_slot_origin_identity_read(&g_ctrc_original_reservation.key, &full));
+	UT_ASSERT_EQ(lock_depth, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(24);
 	UT_RUN(test_recovered_open_gate_precedes_canonical_reservation);
 	UT_RUN(test_binding_memory_error_precedes_allocator_and_cold_selection);
 	UT_RUN(test_binding_growth_error_preserves_existing_reservations);
@@ -816,6 +887,9 @@ main(void)
 	UT_RUN(test_real_local_postbind_error_stays_failed_without_reallocation);
 	UT_RUN(test_real_local_commit_keeps_bound_wrap);
 	UT_RUN(test_real_local_abort_keeps_bound_wrap);
+	UT_RUN(test_original_identity_survives_origin_retirement_and_terminal);
+	UT_RUN(test_original_identity_exact_key_and_slot_lifetime);
+	UT_RUN(test_missing_origin_identity_never_changes_active_success);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

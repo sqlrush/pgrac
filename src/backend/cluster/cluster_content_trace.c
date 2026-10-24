@@ -9,6 +9,7 @@
 #include "postgres.h"
 #include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_grd.h"
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h"
 #include "storage/proc.h"
@@ -33,6 +34,7 @@ static uint32 pair_depth;
 static bool pair_recording;
 static int pair_slot = -1;
 static Buffer pair_buffers[2];
+static uint64 service_serial, service_current;
 
 static Size
 content_trace_size(void)
@@ -70,6 +72,15 @@ cluster_content_trace_shmem_register(void)
 		.owner_subsys = "cluster_content_trace", .reserved_flags = 0
 	};
 	cluster_shmem_register_region(&region);
+}
+
+void
+cluster_content_trace_process_start(uint32 procno)
+{
+	/* Invalidate a prior incarnation even if its PID/backendId are reused.
+	 * Never take busy away from a reader or a previous, interrupted publisher. */
+	if (content_trace != NULL && procno < content_trace->nslots)
+		(void)pg_atomic_fetch_add_u64(&content_trace->slots[procno].revision, 1);
 }
 
 static bool
@@ -127,6 +138,7 @@ content_trace_publish(bool entering_wait)
 		local_owner.procno = MyProc->pgprocno;
 		local_owner.backend_id = MyProc->backendId;
 		local_owner.backend_start = MyStartTimestamp;
+		local_owner.proc_generation = MyProc->cluster_grd_generation;
 		local_owner.nlocks = local_owner.omitted_locks = 0;
 		memset(local_owner.locks, 0, sizeof(local_owner.locks));
 		ForEachLWLockHeldByMe(content_trace_collect_lock, &local_owner);
@@ -147,6 +159,154 @@ cluster_content_trace_lock_changed(LWLock *lock)
 	/* Do not read the released buffer's tag: another backend can rebind it. */
 	if (BufferDescriptorFromContentLock(lock) != NULL)
 		content_trace_publish(false);
+}
+
+/* Invalidate before native ownership changes. A delayed post-release
+ * publication must not leave the previous owner looking current. */
+void
+cluster_content_trace_lock_invalidating(LWLock *lock)
+{
+	if ((!cluster_trace_tx_identity && local_owner.pid == 0) ||
+		content_trace == NULL || MyProc == NULL ||
+		MyProc->pgprocno >= content_trace->nslots ||
+		BufferDescriptorFromContentLock(lock) == NULL)
+		return;
+	(void)pg_atomic_fetch_add_u64(&content_trace->slots[MyProc->pgprocno].revision, 1);
+}
+
+void
+cluster_content_trace_native_wait_set(LWLock *lock, LWLockMode mode)
+{
+	BufferDesc *buf;
+	ClusterContentTraceLock *wait = &local_owner.native_wait;
+
+	if (!cluster_trace_tx_identity ||
+		(buf = BufferDescriptorFromContentLock(lock)) == NULL)
+		return;
+	memset(wait, 0, sizeof(*wait));
+	wait->buffer = BufferDescriptorGetBuffer(buf);
+	wait->mode = mode;
+	/* The original native caller owns its pin; no remote tag inference. */
+	wait->tag_known = (pg_atomic_read_u32(&buf->state) & BM_TAG_VALID) != 0;
+	if (wait->tag_known)
+		wait->tag = buf->tag;
+	local_owner.native_waiting = true;
+	content_trace_publish(true);
+}
+
+void
+cluster_content_trace_native_wait_clear(void)
+{
+	if (!local_owner.native_waiting)
+		return;
+	local_owner.native_waiting = false;
+	memset(&local_owner.native_wait, 0, sizeof(local_owner.native_wait));
+	content_trace_publish(false);
+}
+
+void
+cluster_content_trace_enqueue_wait_set(const ClusterResId *resid,
+	const ClusterGrdHolderId *holder, int32 mode, int32 current_mode,
+	bool convert, uint64 request, uint64 epoch, uint64 wait_seq)
+{
+	ClusterContentTraceEnqueue *wait = &local_owner.enqueue;
+
+	if (!cluster_trace_tx_identity || resid == NULL || holder == NULL)
+		return;
+	memset(wait, 0, sizeof(*wait));
+	wait->field1 = resid->field1;
+	wait->field2 = resid->field2;
+	wait->field3 = resid->field3;
+	wait->field4 = resid->field4;
+	wait->type = resid->type;
+	wait->lockmethodid = resid->lockmethodid;
+	wait->mode = mode;
+	wait->current_mode = current_mode;
+	wait->convert = convert;
+	wait->holder_node = holder->node_id;
+	wait->holder_procno = holder->procno;
+	wait->holder_epoch = holder->cluster_epoch;
+	wait->holder_request = holder->request_id;
+	wait->request = request;
+	wait->epoch = epoch;
+	wait->wait_seq = wait_seq;
+	local_owner.enqueue_waiting = true;
+	content_trace_publish(true);
+}
+
+static bool
+content_trace_grant_matches(const ClusterContentTraceGrant *row,
+	const ClusterResId *resid, const ClusterGrdHolderId *holder)
+{
+	return row->field1 == resid->field1 && row->field2 == resid->field2 &&
+		row->field3 == resid->field3 && row->field4 == resid->field4 &&
+		row->type == resid->type && row->lockmethodid == resid->lockmethodid &&
+		row->holder_node == holder->node_id && row->holder_procno == holder->procno &&
+		row->holder_epoch == holder->cluster_epoch && row->holder_request == holder->request_id;
+}
+
+void
+cluster_content_trace_enqueue_granted(const ClusterResId *resid,
+	const ClusterGrdHolderId *holder, int32 mode)
+{
+	ClusterContentTraceGrant *row;
+	uint32 i;
+
+	if (!cluster_trace_tx_identity || resid == NULL || holder == NULL || MyProc == NULL ||
+		holder->node_id != (uint32)cluster_node_id || holder->procno != (uint32)MyProc->pgprocno ||
+		holder->request_id == 0 || holder->cluster_epoch == 0 ||
+		mode < AccessShareLock || mode > AccessExclusiveLock)
+		return;
+	for (i = 0; i < local_owner.ngrants; i++)
+		if (content_trace_grant_matches(&local_owner.grants[i], resid, holder))
+			break;
+	if (i == CLUSTER_CONTENT_TRACE_GRANTS) {
+		/* Identity of omitted rows is unknown. Keep this sticky until process
+		 * exit/trace disable, rather than guess which later release retires it. */
+		if (local_owner.omitted_grants != UINT32_MAX)
+			local_owner.omitted_grants++;
+	} else {
+		if (i == local_owner.ngrants) local_owner.ngrants++;
+		row = &local_owner.grants[i];
+		memset(row, 0, sizeof(*row));
+		row->field1 = resid->field1; row->field2 = resid->field2; row->field3 = resid->field3;
+		row->field4 = resid->field4; row->type = resid->type; row->lockmethodid = resid->lockmethodid;
+		row->holder_node = holder->node_id; row->holder_procno = holder->procno;
+		row->holder_epoch = holder->cluster_epoch; row->holder_request = holder->request_id;
+		row->mode = mode;
+	}
+	content_trace_publish(false);
+}
+
+void
+cluster_content_trace_enqueue_releasing(const ClusterResId *resid,
+	const ClusterGrdHolderId *holder)
+{
+	if (resid == NULL || holder == NULL)
+		return;
+	if (!cluster_trace_tx_identity) {
+		if (local_owner.pid != 0) content_trace_publish(false);
+		return;
+	}
+	for (uint32 i = 0; i < local_owner.ngrants; i++) {
+		if (!content_trace_grant_matches(&local_owner.grants[i], resid, holder)) continue;
+		local_owner.ngrants--;
+		memmove(&local_owner.grants[i], &local_owner.grants[i + 1],
+			(local_owner.ngrants - i) * sizeof(local_owner.grants[0]));
+		memset(&local_owner.grants[local_owner.ngrants], 0, sizeof(local_owner.grants[0]));
+		content_trace_publish(false); /* Invalidate before original S6 can mutate/wait. */
+		return;
+	}
+}
+
+void
+cluster_content_trace_enqueue_wait_clear(void)
+{
+	if (!local_owner.enqueue_waiting)
+		return;
+	local_owner.enqueue_waiting = false;
+	memset(&local_owner.enqueue, 0, sizeof(local_owner.enqueue));
+	content_trace_publish(false);
 }
 
 void
@@ -170,6 +330,67 @@ cluster_content_trace_wait_clear(ClusterContentTraceWait kind)
 	content_trace_publish(false);
 }
 
+/* A nested finish can carry the enclosing entry checks only for the same
+ * complete native request. Unknown or distinct work must not borrow them. */
+static bool
+content_trace_same_pcm_service(const ClusterWaitTrace *a, const ClusterWaitTrace *b)
+{
+	return a->tag_known && b->tag_known && a->request_known && b->request_known
+		&& a->request_seq != 0 && a->formation != 0 && a->master_session != 0 && a->r4 != 0
+		&& content_trace_tag_equal(&a->tag, &b->tag)
+		&& a->request_seq == b->request_seq && a->requester == b->requester
+		&& a->formation == b->formation && a->master_session == b->master_session
+		&& a->r4 == b->r4 && a->base == b->base && a->authority == b->authority
+		&& a->expected_master == b->expected_master && a->source == b->source
+		&& a->wire_sender_connection == b->wire_sender_connection
+		&& a->ordered_lane == b->ordered_lane && a->semantic_crc32c == b->semantic_crc32c
+		&& a->source_candidate == b->source_candidate && a->retain_pi_if_dirty == b->retain_pi_if_dirty
+		&& a->common_flags == b->common_flags && a->common_outcome == b->common_outcome
+		&& a->state == b->state && a->mode == b->mode;
+}
+
+void
+cluster_content_trace_service_begin(ClusterContentTraceServiceScope *scope,
+	const ClusterWaitTrace *service)
+{
+	memset(scope, 0, sizeof(*scope));
+	if (!cluster_trace_tx_identity || service == NULL)
+		return;
+	/* Exhaustion cannot create an alias to an outstanding diagnostic scope. */
+	if (service_serial == PG_UINT64_MAX) {
+		service_current = 0;
+		local_owner.pcm_serving = false;
+		memset(&local_owner.pcm_service, 0, sizeof(local_owner.pcm_service));
+		content_trace_publish(false);
+		return;
+	}
+	scope->serial = ++service_serial;
+	scope->previous_serial = service_current;
+	scope->previous_active = local_owner.pcm_serving;
+	scope->previous = local_owner.pcm_service;
+	service_current = scope->serial;
+	local_owner.pcm_service = *service;
+	if (!service->service_admission.supplied && scope->previous_active
+		&& content_trace_same_pcm_service(service, &scope->previous))
+		local_owner.pcm_service.service_admission = scope->previous.service_admission;
+	local_owner.pcm_serving = true;
+	content_trace_publish(false);
+}
+
+void
+cluster_content_trace_service_end(ClusterContentTraceServiceScope *scope)
+{
+	if (scope->serial == 0)
+		return;
+	if (service_current == scope->serial) {
+		service_current = scope->previous_serial;
+		local_owner.pcm_serving = scope->previous_active;
+		local_owner.pcm_service = scope->previous;
+		content_trace_publish(false);
+	}
+	scope->serial = 0;
+}
+
 void
 cluster_content_trace_error_cleanup(void)
 {
@@ -181,6 +402,12 @@ cluster_content_trace_error_cleanup(void)
 	pair_recording = false;
 	pair_slot = -1;
 	local_owner.wait_mask = 0;
+	local_owner.native_waiting = local_owner.enqueue_waiting = false;
+	service_current = 0;
+	local_owner.pcm_serving = false;
+	memset(&local_owner.pcm_service, 0, sizeof(local_owner.pcm_service));
+	memset(&local_owner.native_wait, 0, sizeof(local_owner.native_wait));
+	memset(&local_owner.enqueue, 0, sizeof(local_owner.enqueue));
 	content_trace_publish(false);
 }
 
@@ -349,21 +576,28 @@ cluster_content_trace_pair(Buffer target, bool missed)
 }
 
 void
-cluster_content_trace_capture(const BufferTag *tag, ClusterContentTraceCut *cut)
+cluster_content_trace_walk(ClusterContentTraceVisitor visitor, void *context,
+	ClusterContentTraceWalkStats *stats)
 {
-	memset(cut, 0, sizeof(*cut));
-	if (!cluster_trace_tx_identity || tag == NULL || content_trace == NULL || ProcGlobal == NULL)
+	memset(stats, 0, sizeof(*stats));
+#ifdef EXEC_BACKEND
+	/* This build attaches the diagnostic mapping after native PID publication.
+	 * Pre-PID incarnation invalidation is unproved, so return UNKNOWN. */
+	return;
+#endif
+	if (!cluster_trace_tx_identity || content_trace == NULL ||
+		ProcGlobal == NULL || visitor == NULL)
 		return;
+	stats->available = true;
 	for (uint32 i = 0; i < content_trace->nslots; i++) {
 		ContentTraceSlot *slot = &content_trace->slots[i];
 		ClusterContentTraceOwner owner;
 		uint32 expected = 0;
 		uint64 revision;
-		bool matches = false;
 
-		cut->scanned++;
+		stats->scanned++;
 		if (!pg_atomic_compare_exchange_u32(&slot->busy, &expected, 1)) {
-			cut->busy++;
+			stats->busy++;
 			continue;
 		}
 		owner = slot->owner;
@@ -371,35 +605,79 @@ cluster_content_trace_capture(const BufferTag *tag, ClusterContentTraceCut *cut)
 		/* Finish the owned copy before a publisher may overwrite its source. */
 		(void)pg_atomic_exchange_u32(&slot->busy, 0);
 		if (owner.revision != revision) {
-			cut->changed++;
+			stats->changed++;
 			continue;
 		}
 		if (owner.pid == 0)
 			continue;
-		/* PID alone is not an incarnation key: reject a reused proc slot or
-		 * an auxiliary owner without a stable backend identity as UNKNOWN. */
+		/* Native generation also identifies auxiliaries without a backendId.
+		 * Zero/uninitialized or reused native identities remain UNKNOWN. */
 		if (i >= ProcGlobal->allProcCount ||
-			owner.backend_id <= 0 ||
+			(owner.backend_id <= 0 && owner.backend_id != InvalidBackendId) ||
+			owner.proc_generation == 0 || owner.procno != i ||
+			ProcGlobal->allProcs[i].pgprocno != i ||
+			ProcGlobal->allProcs[i].cluster_grd_generation != owner.proc_generation ||
 			ProcGlobal->allProcs[i].pid != owner.pid ||
 			ProcGlobal->allProcs[i].backendId != owner.backend_id) {
-			cut->dead++;
+			stats->dead++;
 			continue;
 		}
-		cut->omitted_locks += owner.omitted_locks;
+		/* Process allocation invalidates before publishing its native identity.
+		 * Recheck after the census reads so a simultaneous reuse stays UNKNOWN. */
+		pg_read_barrier();
+		if (revision != pg_atomic_read_u64(&slot->revision)) {
+			stats->changed++;
+			continue;
+		}
+		stats->omitted_locks += owner.omitted_locks;
 		for (uint32 j = 0; j < owner.nlocks; j++) {
 			if (!owner.locks[j].tag_known)
-				cut->omitted_locks++;
-			else if (content_trace_tag_equal(tag, &owner.locks[j].tag))
-				matches = true;
+				stats->omitted_locks++;
 		}
-		if (!matches)
-			continue;
-		cut->matches++;
-		if (cut->nowners == CLUSTER_CONTENT_TRACE_OWNERS)
-			cut->omitted_owners++;
-		else
-			cut->owners[cut->nowners++] = owner;
+		stats->owners++;
+		visitor(&owner, context);
 	}
+}
+
+typedef struct ContentTraceCapture {
+	const BufferTag *tag;
+	ClusterContentTraceCut *cut;
+} ContentTraceCapture;
+
+static void
+content_trace_capture_owner(const ClusterContentTraceOwner *owner, void *context)
+{
+	ContentTraceCapture *capture = context;
+	ClusterContentTraceCut *cut = capture->cut;
+	bool matches = capture->tag == NULL;
+
+	for (uint32 j = 0; !matches && j < owner->nlocks; j++) {
+		if (owner->locks[j].tag_known &&
+			content_trace_tag_equal(capture->tag, &owner->locks[j].tag))
+			matches = true;
+	}
+	if (!matches)
+		return;
+	cut->matches++;
+	if (cut->nowners == CLUSTER_CONTENT_TRACE_OWNERS)
+		cut->omitted_owners++;
+	else
+		cut->owners[cut->nowners++] = *owner;
+}
+
+void
+cluster_content_trace_capture(const BufferTag *tag, ClusterContentTraceCut *cut)
+{
+	ContentTraceCapture capture = {.tag = tag, .cut = cut};
+	ClusterContentTraceWalkStats stats;
+
+	memset(cut, 0, sizeof(*cut));
+	cluster_content_trace_walk(content_trace_capture_owner, &capture, &stats);
+	cut->scanned = stats.scanned;
+	cut->busy = stats.busy;
+	cut->changed = stats.changed;
+	cut->dead = stats.dead;
+	cut->omitted_locks = stats.omitted_locks;
 }
 
 static bool

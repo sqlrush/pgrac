@@ -15,6 +15,9 @@
 #include "cluster/cluster_heap_horizon.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_undo_horizon.h"
+#include "cluster/cluster_undo_retention.h"
+#include "access/twophase.h"
+#include "test_cluster_pgproc_active_types.inc"
 #include "../../backend/utils/time/snapmgr.c"
 #include "test_cluster_snapshot_admission_horizon.inc"
 
@@ -29,6 +32,10 @@ MemoryContext CurrentMemoryContext = (MemoryContext)1;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 static PGPROC proc;
+static PGPROC *allProcs = &proc;
+static ProcArrayStruct *procArray;
+static bool retention_lock, retention_probe_before_publish, retention_gap_refused;
+static unsigned retention_acquires, retention_releases, retention_clocks;
 static unsigned remembered;
 static ClusterUndoHorizonShmem horizon;
 static ClusterMembershipState self_member = CLUSTER_MEMBER_MEMBER;
@@ -38,6 +45,8 @@ static OldSnapshotControlData snapshot_control;
 static bool snapshot_control_found;
 static CommandId current_command;
 static bool poison_allocations;
+static SCN snapshot_clock = 100;
+static bool catalog_services = true;
 int cluster_injection_armed_count;
 bool cluster_enable_adg;
 int cluster_adg_lag_threshold_sec;
@@ -65,7 +74,32 @@ cluster_mrp_read_service_available(void)
 SCN
 cluster_scn_current(void)
 {
-	return 100;
+	if (retention_lock)
+		retention_clocks++;
+	return snapshot_clock;
+}
+/* Only service posture, resolver recursion and catalogue membership are
+ * boundary doubles.  The original catalog registration/retirement and
+ * PGPROC retention publisher execute from snapmgr.c below. */
+bool
+cluster_catalog_services_ready(void)
+{
+	return catalog_services;
+}
+bool
+cluster_vis_resolve_in_flight(void)
+{
+	return false;
+}
+bool
+RelationInvalidatesSnapshotsOnly(Oid relid)
+{
+	return false;
+}
+bool
+RelationHasSysCache(Oid relid)
+{
+	return true;
 }
 bool
 cluster_cr_injection_armed(const char *name, uint64 *param)
@@ -729,18 +763,244 @@ UT_TEST(cr_identity_restore_and_snapshot_refresh_start_new_lifetimes)
 
 /* PGRAC: catalogue I/O leaves around the real maintenance entry and snapshots. */
 #include "test_cluster_snapshot_vacuum_fixture.inc"
+#include "test_cluster_retention_sample.inc"
+
+/* Use the actual catalog getter, pairing heap, publisher and invalidation;
+ * GetSnapshotData supplies controlled source fields through the existing
+ * actual ClusterSnapshotRefreshFields leaf, not a retention publication. */
+UT_TEST(catalog_getter_publishes_its_original_snapshot_before_return)
+{
+	Snapshot snapshot;
+
+	InvalidateCatalogSnapshot();
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), InvalidScn);
+	snapshot = GetNonHistoricCatalogSnapshot(RelationRelationId);
+	UT_ASSERT(snapshot == CatalogSnapshot);
+	UT_ASSERT(pairingheap_is_singular(&RegisteredSnapshots));
+	UT_ASSERT(!ActiveSnapshotSet());
+	UT_ASSERT_EQ(snapshot->cluster_source, SNAPSHOT_SOURCE_CLUSTER);
+	UT_ASSERT_EQ(snapshot->read_scn, 100);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), snapshot->read_scn);
+	InvalidateCatalogSnapshot();
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), InvalidScn);
+	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
+}
+
+UT_TEST(catalog_publication_keeps_an_older_original_registered_protection)
+{
+	Snapshot original = registered(60);
+	Snapshot catalog = GetNonHistoricCatalogSnapshot(RelationRelationId);
+
+	UT_ASSERT_EQ(catalog->read_scn, 100);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), 60);
+	UnregisterSnapshot(original);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), catalog->read_scn);
+	InvalidateCatalogSnapshot();
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), InvalidScn);
+}
+
+UT_TEST(catalog_service_posture_rebuild_publishes_only_the_original_cluster_snapshot)
+{
+	Snapshot local, cluster;
+
+	catalog_services = false;
+	local = GetNonHistoricCatalogSnapshot(RelationRelationId);
+	UT_ASSERT_EQ(local->cluster_source, SNAPSHOT_SOURCE_LOCAL);
+	UT_ASSERT_EQ(local->read_scn, InvalidScn);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), InvalidScn);
+	catalog_services = true;
+	cluster = GetNonHistoricCatalogSnapshot(RelationRelationId);
+	UT_ASSERT_EQ(cluster->cluster_source, SNAPSHOT_SOURCE_CLUSTER);
+	UT_ASSERT_EQ(cluster->read_scn, 100);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), cluster->read_scn);
+	UT_ASSERT(pairingheap_is_singular(&RegisteredSnapshots));
+	InvalidateCatalogSnapshot();
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), InvalidScn);
+}
+
+UT_TEST(catalog_cache_keeps_its_original_h_until_actual_invalidation)
+{
+	Snapshot first = GetNonHistoricCatalogSnapshot(RelationRelationId);
+	Snapshot cached, replacement;
+
+	snapshot_clock = 200;
+	cached = GetNonHistoricCatalogSnapshot(RelationRelationId);
+	UT_ASSERT(cached == first);
+	UT_ASSERT_EQ(cached->read_scn, 100);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), 100);
+	InvalidateCatalogSnapshot();
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), InvalidScn);
+	replacement = GetNonHistoricCatalogSnapshot(RelationRelationId);
+	UT_ASSERT_EQ(replacement->read_scn, 200);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), 200);
+	UT_ASSERT(pairingheap_is_singular(&RegisteredSnapshots));
+	InvalidateCatalogSnapshot();
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), InvalidScn);
+	snapshot_clock = 100;
+}
+
+/* Execute the actual original sampler, not a replacement for its H result.
+ * The single-entry ProcArray and lock scheduling below remain controlled. */
+static bool
+catalog_history_sample(ClusterUndoRetentionSample *sample)
+{
+	unsigned acquires = retention_acquires;
+	unsigned releases = retention_releases;
+	unsigned clocks = retention_clocks;
+	bool valid;
+
+	valid = cluster_undo_retention_horizon_sample(sample);
+	UT_ASSERT_EQ(retention_acquires, acquires + 1);
+	UT_ASSERT_EQ(retention_releases, releases + 1);
+	UT_ASSERT_EQ(retention_clocks, clocks + 1);
+	UT_ASSERT(!retention_lock);
+	return valid;
+}
+
+UT_TEST(catalog_original_publication_completes_the_real_h_sample)
+{
+	ClusterUndoRetentionSample sample;
+	Snapshot catalog;
+
+	retention_probe_before_publish = true;
+	retention_gap_refused = false;
+	catalog = GetNonHistoricCatalogSnapshot(RelationRelationId);
+	retention_probe_before_publish = false;
+	UT_ASSERT(retention_gap_refused);
+	UT_ASSERT(catalog_history_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, catalog->read_scn);
+	UT_ASSERT_EQ(sample.clock_scn, 100);
+	UT_ASSERT_EQ(sample.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+	UT_ASSERT_EQ(sample.contributor_token, 1);
+	InvalidateCatalogSnapshot();
+}
+
+UT_TEST(catalog_h_sample_preserves_other_original_snapshot_protection)
+{
+	ClusterUndoRetentionSample sample;
+	Snapshot older = registered(60);
+	Snapshot catalog = GetNonHistoricCatalogSnapshot(RelationRelationId);
+
+	UT_ASSERT(catalog_history_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, older->read_scn);
+	UT_ASSERT_EQ(sample.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+	UnregisterSnapshot(older);
+	UT_ASSERT(catalog_history_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, catalog->read_scn);
+	InvalidateCatalogSnapshot();
+}
+
+UT_TEST(catalog_actual_retirement_releases_only_its_original_h_pin)
+{
+	ClusterUndoRetentionSample sample;
+	Snapshot catalog = GetNonHistoricCatalogSnapshot(RelationRelationId);
+
+	snapshot_clock = 300;
+	UT_ASSERT(GetNonHistoricCatalogSnapshot(RelationRelationId) == catalog);
+	UT_ASSERT(catalog_history_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 100);
+	UT_ASSERT_EQ(sample.clock_scn, 300);
+	UT_ASSERT_EQ(sample.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+	InvalidateCatalogSnapshot();
+	UT_ASSERT(catalog_history_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 300);
+	UT_ASSERT_EQ(sample.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+	UT_ASSERT_EQ(sample.contributor_token, 0);
+	snapshot_clock = 100;
+}
+
+UT_TEST(catalog_local_source_cannot_borrow_the_clock_as_h_evidence)
+{
+	ClusterUndoRetentionSample sample, zero = { 0 };
+
+	catalog_services = false;
+	GetNonHistoricCatalogSnapshot(RelationRelationId);
+	memset(&sample, 0xa5, sizeof(sample));
+	UT_ASSERT(!catalog_history_sample(&sample));
+	UT_ASSERT_EQ(memcmp(&sample, &zero, sizeof(sample)), 0);
+	catalog_services = true;
+	GetNonHistoricCatalogSnapshot(RelationRelationId);
+	UT_ASSERT(catalog_history_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 100);
+	InvalidateCatalogSnapshot();
+}
+
+UT_TEST(catalog_scn_does_not_supply_independent_replication_history)
+{
+	ClusterUndoRetentionSample sample, zero = { 0 };
+	Snapshot catalog = GetNonHistoricCatalogSnapshot(RelationRelationId);
+
+	procArray->replication_slot_catalog_xmin = catalog->xmin;
+	memset(&sample, 0xa5, sizeof(sample));
+	UT_ASSERT(!catalog_history_sample(&sample));
+	UT_ASSERT_EQ(memcmp(&sample, &zero, sizeof(sample)), 0);
+	procArray->replication_slot_catalog_xmin = InvalidTransactionId;
+	UT_ASSERT(catalog_history_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, catalog->read_scn);
+	InvalidateCatalogSnapshot();
+}
+
+UT_TEST(original_catalog_pin_cannot_supply_a_missing_finite_clock)
+{
+	ClusterUndoRetentionSample sample, zero = { 0 };
+	Snapshot catalog = GetNonHistoricCatalogSnapshot(RelationRelationId);
+
+	snapshot_clock = (SCN) UINT64_MAX;
+	memset(&sample, 0xa5, sizeof(sample));
+	UT_ASSERT(!catalog_history_sample(&sample));
+	UT_ASSERT_EQ(memcmp(&sample, &zero, sizeof(sample)), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), catalog->read_scn);
+	snapshot_clock = 300;
+	UT_ASSERT(catalog_history_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, catalog->read_scn);
+	UT_ASSERT_EQ(sample.clock_scn, 300);
+	InvalidateCatalogSnapshot();
+	snapshot_clock = 100;
+}
+
+UT_TEST(original_registered_nonfinite_reader_keeps_h_unqualified_until_retirement)
+{
+	ClusterUndoRetentionSample sample, zero = { 0 };
+	Snapshot original = registered((SCN) UINT64_MAX);
+
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), (SCN) UINT64_MAX);
+	memset(&sample, 0xa5, sizeof(sample));
+	UT_ASSERT(!catalog_history_sample(&sample));
+	UT_ASSERT_EQ(memcmp(&sample, &zero, sizeof(sample)), 0);
+	UnregisterSnapshot(original);
+	UT_ASSERT(catalog_history_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 100);
+	UT_ASSERT_EQ(sample.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+}
 
 int
 main(void)
 {
 	MyProc = &proc;
+	proc.pid = 1234;
+	procArray = calloc(1, sizeof(ProcArrayStruct) + sizeof(int));
+	if (procArray == NULL)
+		abort();
+	procArray->maxProcs = procArray->numProcs = 1;
+	procArray->pgprocnos[0] = 0;
 	pg_atomic_init_u64(&proc.cluster_read_scn_atomic, 0);
 	UndoHorizonShmem = &horizon;
 	pg_atomic_init_u64(&horizon.self_admitted_epoch, 8);
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(59);
+	UT_PLAN(70);
+	UT_RUN(original_catalog_pin_cannot_supply_a_missing_finite_clock);
+	UT_RUN(original_registered_nonfinite_reader_keeps_h_unqualified_until_retirement);
+	UT_RUN(catalog_original_publication_completes_the_real_h_sample);
+	UT_RUN(catalog_h_sample_preserves_other_original_snapshot_protection);
+	UT_RUN(catalog_actual_retirement_releases_only_its_original_h_pin);
+	UT_RUN(catalog_local_source_cannot_borrow_the_clock_as_h_evidence);
+	UT_RUN(catalog_scn_does_not_supply_independent_replication_history);
+	UT_RUN(catalog_getter_publishes_its_original_snapshot_before_return);
+	UT_RUN(catalog_publication_keeps_an_older_original_registered_protection);
+	UT_RUN(catalog_service_posture_rebuild_publishes_only_the_original_cluster_snapshot);
+	UT_RUN(catalog_cache_keeps_its_original_h_until_actual_invalidation);
 	UT_RUN(registered_catalog_is_live_without_becoming_active);
 	UT_RUN(evaluated_registered_snapshot_overrides_an_unrelated_active_snapshot);
 	UT_RUN(forged_reference_counts_do_not_establish_liveness);
@@ -803,6 +1063,7 @@ main(void)
 	UT_ASSERT_EQ(remembered, 0);
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	UT_ASSERT(!ActiveSnapshotSet());
+	free(procArray);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

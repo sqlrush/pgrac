@@ -6072,9 +6072,9 @@ cluster_grd_sweep_runs(void)
 /* Unlike the SQL summary walker, diagnostics must not pin/release an entry:
  * releasing a lookup pin could retire a cold entry. The shard lock protects
  * its address against HASH_REMOVE; the entry lock protects every vector. */
-ClusterGrdQueueObservationStatus
-cluster_grd_queue_snapshot(const ClusterResId *resid, ClusterGrdQueueSnapshot *out,
-						   ClusterGrdQueueMemberSnapshot *members, int capacity)
+static ClusterGrdQueueObservationStatus
+grd_queue_snapshot(const ClusterResId *resid, ClusterGrdQueueSnapshot *out,
+	ClusterGrdQueueMemberSnapshot *members, int capacity, bool nowait)
 {
 	ClusterGrdEntry *entry;
 	ClusterGrdQueueObservationStatus status;
@@ -6082,27 +6082,52 @@ cluster_grd_queue_snapshot(const ClusterResId *resid, ClusterGrdQueueSnapshot *o
 	uint32 shard;
 	int64 total = 0;
 	bool found;
+	uint32 route_initialized;
+	uint64 route_epoch;
 
 	if (out == NULL)
 		return CLUSTER_GRD_QUEUE_INVALID;
 	memset(out, 0, sizeof(*out));
+	out->master_node = -1;
 	if (resid == NULL || capacity < 0 || (capacity > 0 && members == NULL))
 		return CLUSTER_GRD_QUEUE_INVALID;
 	out->resid = *resid;
 	if (cluster_grd_entry_htab == NULL || cluster_grd_shard_locks == NULL
 		|| cluster_grd_state == NULL)
 		return CLUSTER_GRD_QUEUE_UNAVAILABLE;
-	grd_slot_area_attach();
+	/* A hang reader must not lazily attach DSA (which can wait). Prepare its
+	 * process mapping before clients start, through the original read API. */
+	if (nowait && grd_slot_area == NULL && grd_slot_pool != NULL)
+		return CLUSTER_GRD_QUEUE_UNAVAILABLE;
+	if (!nowait)
+		grd_slot_area_attach();
 	hash64 = cluster_grd_hash_resource(resid);
 	shard = (uint32)(hash64 % PGRAC_GRD_SHARD_COUNT);
-	LWLockAcquire(&cluster_grd_shard_locks[shard].lock, LW_SHARED);
+	/* Counter-free native routing cut. The directory's generation protects
+	 * master moves; the caller also compares the complete repeated cut. */
+	route_epoch = cluster_epoch_get_current();
+	route_initialized = pg_atomic_read_u32(&cluster_grd_state->master_map_initialized);
+	out->master_node = (int32)pg_atomic_read_u32(&cluster_grd_state->master[shard]);
+	out->master_generation = pg_atomic_read_u32(&cluster_grd_state->master_generation[shard]);
+	out->shard_phase = pg_atomic_read_u32(&cluster_grd_state->shard_phase[shard]);
+	if (nowait) {
+		if (!LWLockConditionalAcquire(&cluster_grd_shard_locks[shard].lock, LW_SHARED))
+			return CLUSTER_GRD_QUEUE_BUSY;
+	} else
+		LWLockAcquire(&cluster_grd_shard_locks[shard].lock, LW_SHARED);
 	entry = hash_search_with_hash_value(cluster_grd_entry_htab, resid, (uint32)hash64, HASH_FIND,
 										&found);
 	if (entry == NULL) {
 		LWLockRelease(&cluster_grd_shard_locks[shard].lock);
 		return CLUSTER_GRD_QUEUE_ABSENT;
 	}
-	SpinLockAcquire(&entry->lock);
+	if (nowait) {
+		if (!SpinLockTryAcquire(&entry->lock)) {
+			LWLockRelease(&cluster_grd_shard_locks[shard].lock);
+			return CLUSTER_GRD_QUEUE_BUSY;
+		}
+	} else
+		SpinLockAcquire(&entry->lock);
 	out->generation = entry->generation;
 	out->last_modified_scn = entry->last_modified_scn;
 	out->state_flags = entry->state_flags;
@@ -6202,7 +6227,28 @@ cluster_grd_queue_snapshot(const ClusterResId *resid, ClusterGrdQueueSnapshot *o
 done:
 	SpinLockRelease(&entry->lock);
 	LWLockRelease(&cluster_grd_shard_locks[shard].lock);
+	out->route_known = route_epoch != 0 && route_epoch == cluster_epoch_get_current() &&
+		route_initialized == 1 && out->master_node >= 0 && out->master_node < CLUSTER_MAX_NODES &&
+		out->shard_phase == GRD_SHARD_NORMAL &&
+		pg_atomic_read_u32(&cluster_grd_state->master_map_initialized) == route_initialized &&
+		(int32)pg_atomic_read_u32(&cluster_grd_state->master[shard]) == out->master_node &&
+		pg_atomic_read_u32(&cluster_grd_state->master_generation[shard]) == out->master_generation &&
+		pg_atomic_read_u32(&cluster_grd_state->shard_phase[shard]) == out->shard_phase;
 	return status;
+}
+
+ClusterGrdQueueObservationStatus
+cluster_grd_queue_snapshot(const ClusterResId *resid, ClusterGrdQueueSnapshot *out,
+	ClusterGrdQueueMemberSnapshot *members, int capacity)
+{
+	return grd_queue_snapshot(resid, out, members, capacity, false);
+}
+
+ClusterGrdQueueObservationStatus
+cluster_grd_queue_try_snapshot(const ClusterResId *resid, ClusterGrdQueueSnapshot *out,
+	ClusterGrdQueueMemberSnapshot *members, int capacity)
+{
+	return grd_queue_snapshot(resid, out, members, capacity, true);
 }
 
 bool

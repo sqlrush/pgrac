@@ -5,6 +5,27 @@
 #include "test_cluster_recovery_root_set.c"
 #include "cluster/cluster_relmap_retention_census.h"
 #include "cluster/cluster_relmap_pending.h"
+#include "access/xlog.h"
+#include "miscadmin.h"
+#include "storage/fd.h"
+
+/* This fixture borrows every fd/ROOT. Native lifetime/context leaves must
+ * stay unreachable; the retained-WAL fixture exercises their owned variant. */
+BackendType MyBackendType = B_BG_WORKER;
+volatile uint32 CritSectionCount = 0;
+
+bool
+RecoveryInProgress(void)
+{
+	abort();
+}
+
+int
+CloseTransientFile(int fd)
+{
+	(void)fd;
+	abort();
+}
 
 #define CENSUS_BUDGET (128 * 1024)
 #define CENSUS_FULL UINT64CONST(0x200000123)
@@ -987,7 +1008,12 @@ ProcessInterrupts(void)
 int
 main(void)
 {
-	UT_PLAN(95);
+	UT_PLAN(100);
+	UT_RUN(test_census_restart_native_return_checks_original_ancestor_pins);
+	UT_RUN(test_census_restart_original_source_is_required_after_publication);
+	UT_RUN(test_census_restart_original_pin_and_metadata_checks_continue_until_native);
+	UT_RUN(test_census_restart_later_source_error_revokes_only_new_observation);
+	UT_RUN(test_census_repeated_restart_keeps_earliest_original_protection);
 	UT_RUN(test_census_initial_owner_inputs_restore_all_pending_without_old_directory);
 	UT_RUN(test_census_initial_entry_gates_budget_aliases_and_null_preserve_borrowed_inputs);
 	UT_RUN(test_census_initial_producer_refusal_metadata_and_error_revoke_only_observation);

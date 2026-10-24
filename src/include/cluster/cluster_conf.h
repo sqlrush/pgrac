@@ -188,6 +188,16 @@ extern void cluster_conf_load(void);
  */
 extern const ClusterNodeInfo *cluster_conf_lookup_node(int32 node_id);
 
+/* Owned diagnostic copy of an already-current index. Never initializes or
+ * rebuilds the process cache; an unprepared/stale index remains unknown. */
+typedef struct ClusterConfDeclaredNodes {
+	uint32 count;
+	int32 nodes[CLUSTER_MAX_NODES];
+	bool known;
+} ClusterConfDeclaredNodes;
+
+extern bool cluster_conf_declared_nodes_observe(ClusterConfDeclaredNodes *out);
+
 /* Returns ClusterConfShmem->node_count, with NULL safety. */
 extern int cluster_conf_node_count(void);
 

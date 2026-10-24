@@ -548,6 +548,13 @@ GetNonHistoricCatalogSnapshot(Oid relid)
 		 * CatalogSnapshot pointer is already valid.
 		 */
 		pairingheap_add(&RegisteredSnapshots, &CatalogSnapshot->ph_node);
+#ifdef USE_PGRAC_CLUSTER
+		/* This manual registration has no subsequent RegisterSnapshot or
+		 * PushActiveSnapshot to publish its history protection.  Hand the
+		 * original read SCN to PGPROC before returning the catalog reader;
+		 * recomputing the full minimum preserves any older live snapshot. */
+		cluster_recompute_proc_read_scn();
+#endif
 	}
 
 	return CatalogSnapshot;

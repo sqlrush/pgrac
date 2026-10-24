@@ -491,10 +491,51 @@ UT_TEST(test_lookup_cache_duplicate_and_range)
 }
 
 
+UT_TEST(readonly_declared_cut_never_builds_or_rebuilds_index)
+{
+	ClusterConf conf = {0}, replacement = {0};
+	struct { ClusterConfDeclaredNodes value; uint64 canary; } cut;
+	uint32 generation;
+	conf.node_count = 3; conf.nodes[0].node_id = 5;
+	conf.nodes[1].node_id = 2; conf.nodes[2].node_id = 5;
+	ClusterConfShmem = NULL; (void)cluster_conf_lookup_node(0);
+	ClusterConfShmem = &conf;
+	generation = cluster_conf_lookup_cache_generation_for_test();
+	cut.canary = UINT64_C(0x1122334455667788);
+	UT_ASSERT(!cluster_conf_declared_nodes_observe(&cut.value));
+	UT_ASSERT_EQ(cluster_conf_lookup_cache_generation_for_test(), generation);
+	UT_ASSERT_EQ(cut.value.count, 0);
+	(void)cluster_conf_lookup_node(2); /* Explicit preparation owns cache mutation. */
+	generation = cluster_conf_lookup_cache_generation_for_test();
+	UT_ASSERT(cluster_conf_declared_nodes_observe(&cut.value));
+	UT_ASSERT(cut.value.known); UT_ASSERT_EQ(cut.value.count, 2);
+	UT_ASSERT_EQ(cut.value.nodes[0], 2); UT_ASSERT_EQ(cut.value.nodes[1], 5);
+	UT_ASSERT_EQ(cluster_conf_lookup_cache_generation_for_test(), generation);
+	conf.node_count = 2;
+	UT_ASSERT(!cluster_conf_declared_nodes_observe(&cut.value));
+	UT_ASSERT_EQ(cluster_conf_lookup_cache_generation_for_test(), generation);
+	ClusterConfShmem = &replacement;
+	UT_ASSERT(!cluster_conf_declared_nodes_observe(&cut.value));
+	UT_ASSERT_EQ(cluster_conf_lookup_cache_generation_for_test(), generation);
+	UT_ASSERT_EQ(cut.canary, UINT64_C(0x1122334455667788));
+	UT_ASSERT(!cluster_conf_declared_nodes_observe(NULL));
+	ClusterConfShmem = &conf;
+	for (int bad_count = -1; bad_count <= CLUSTER_MAX_NODES + 1; bad_count += CLUSTER_MAX_NODES + 2) {
+		conf.node_count = bad_count;
+		(void)cluster_conf_lookup_node(0);
+		generation = cluster_conf_lookup_cache_generation_for_test();
+		UT_ASSERT(!cluster_conf_declared_nodes_observe(&cut.value));
+		UT_ASSERT(!cut.value.known); UT_ASSERT_EQ(cut.value.count, 0);
+		UT_ASSERT_EQ(cluster_conf_lookup_cache_generation_for_test(), generation);
+	}
+	UT_ASSERT_EQ(cut.canary, UINT64_C(0x1122334455667788));
+	ClusterConfShmem = NULL; (void)cluster_conf_lookup_node(0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(25);
 	UT_RUN(test_max_nodes_constant);
 	UT_RUN(test_conf_magic_constant);
 	UT_RUN(test_node_role_int32_sized);
@@ -519,6 +560,7 @@ main(void)
 	UT_RUN(test_lookup_cache_reuses_index);
 	UT_RUN(test_lookup_cache_invalidates_topology);
 	UT_RUN(test_lookup_cache_duplicate_and_range);
+	UT_RUN(readonly_declared_cut_never_builds_or_rebuilds_index);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

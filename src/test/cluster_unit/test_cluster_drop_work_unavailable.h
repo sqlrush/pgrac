@@ -3,6 +3,33 @@
  * Author: SqlRush <sqlrush@gmail.com> */
 #include "cluster/cluster_ko.h"
 #include "storage/fd.h"
+#include "miscadmin.h"
+
+#ifndef CLUSTER_EXTENSION_TARGET_FIXTURE
+bool
+cluster_ko_extend_recovery_target_v3(RelFileLocator locator pg_attribute_unused(),
+								   ForkNumber fork pg_attribute_unused(),
+								   BlockNumber block pg_attribute_unused())
+{
+	return false;
+}
+#endif
+
+static uint32 extension_wait_event;
+uint32 *my_wait_event_info = &extension_wait_event;
+volatile sig_atomic_t InterruptPending;
+
+void
+ProcessInterrupts(void)
+{
+	abort();
+}
+
+int
+FileGetRawDesc(File file)
+{
+	return (int)file;
+}
 
 /* No original work can be acquired here, so its trace boundary is unexpected. */
 void

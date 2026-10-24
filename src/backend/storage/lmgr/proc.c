@@ -42,6 +42,7 @@
 #include "access/twophase.h"
 #include "access/xlogutils.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_grd.h" /* spec-2.17 D28c — cluster_grd_alloc_generation */
 #include "cluster/cluster_guc.h" /* spec-2.17 — cluster_enabled */
 #include "cluster/cluster_shared_config.h" /* native family lifetime reset */
@@ -409,6 +410,9 @@ InitProcess(void)
 	MyProc->xid = InvalidTransactionId;
 	pg_atomic_write_u64(&MyProc->cluster_top_full_xid_atomic, 0);
 	MyProc->xmin = InvalidTransactionId;
+#ifdef USE_PGRAC_CLUSTER
+	cluster_content_trace_process_start(MyProc->pgprocno);
+#endif
 	MyProc->pid = MyProcPid;
 	/* backendId, databaseId and roleId will be filled in later */
 	MyProc->backendId = InvalidBackendId;
@@ -617,6 +621,9 @@ InitAuxiliaryProcess(void)
 #endif
 
 	/* Mark auxiliary proc as in use by me */
+#ifdef USE_PGRAC_CLUSTER
+	cluster_content_trace_process_start(auxproc->pgprocno);
+#endif
 	/* use volatile pointer to prevent code rearrangement */
 	((volatile PGPROC *) auxproc)->pid = MyProcPid;
 

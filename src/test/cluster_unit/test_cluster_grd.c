@@ -962,6 +962,20 @@ LWLockAcquire(LWLock *lock, LWLockMode mode pg_attribute_unused())
 	return true;
 }
 
+static bool wait_graph_shard_busy;
+bool
+LWLockConditionalAcquire(LWLock *lock, LWLockMode mode pg_attribute_unused())
+{
+	if (wait_graph_shard_busy)
+		return false;
+	if (stop_lock_tracking) {
+		if (stop_held_lock != NULL)
+			abort();
+		stop_held_lock = lock;
+	}
+	return true;
+}
+
 void
 LWLockRelease(LWLock *lock)
 {
@@ -8058,6 +8072,70 @@ UT_TEST(test_grd_queue_observation_distinguishes_unavailable_absent_and_empty)
 	convert_teardown();
 }
 
+UT_TEST(test_grd_try_snapshot_never_waits_or_changes_native_owner)
+{
+	ClusterResId resid;
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdQueueSnapshot snapshot;
+	uint64 waits, hits, generation;
+	convert_reset();
+	bast_resid(6199, &resid);
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&resid, true, &entry), CLUSTER_GRD_ENTRY_OK);
+	waits = ut_grd_blocking_lwlock_calls;
+	hits = cluster_grd_entry_lookup_hit_count();
+	generation = entry->generation;
+	stop_lock_tracking = true;
+	UT_ASSERT_EQ(cluster_grd_queue_try_snapshot(&resid, &snapshot, NULL, 0), CLUSTER_GRD_QUEUE_OBSERVED);
+	UT_ASSERT_EQ(snapshot.pin_count, 1);
+	UT_ASSERT(stop_held_lock == NULL);
+	wait_graph_shard_busy = true;
+	UT_ASSERT_EQ(cluster_grd_queue_try_snapshot(&resid, &snapshot, NULL, 0), CLUSTER_GRD_QUEUE_BUSY);
+	wait_graph_shard_busy = false;
+	SpinLockAcquire(&entry->lock);
+	UT_ASSERT_EQ(cluster_grd_queue_try_snapshot(&resid, &snapshot, NULL, 0), CLUSTER_GRD_QUEUE_BUSY);
+	SpinLockRelease(&entry->lock);
+	UT_ASSERT(stop_held_lock == NULL);
+	UT_ASSERT_EQ(ut_grd_blocking_lwlock_calls, waits);
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_hit_count(), hits);
+	UT_ASSERT_EQ(cluster_grd_entry_pin_count(entry), 1);
+	UT_ASSERT_EQ(entry->generation, generation);
+	stop_lock_tracking = false;
+	cluster_grd_entry_release(entry);
+	convert_teardown();
+}
+
+UT_TEST(test_grd_snapshot_route_requires_current_normal_master_map)
+{
+	ClusterGrdShared *shared = stop_grd_setup();
+	ClusterResId resid;
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdQueueSnapshot snapshot;
+	uint64 saved_epoch = ut_mock_epoch, hits;
+	uint32 shard;
+	ut_mock_epoch = 17;
+	bast_resid(6200, &resid);
+	shard = cluster_grd_shard_for_resource(&resid);
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&resid, true, &entry), CLUSTER_GRD_ENTRY_OK);
+	hits = cluster_grd_entry_lookup_hit_count();
+	UT_ASSERT_EQ(cluster_grd_queue_try_snapshot(&resid, &snapshot, NULL, 0), CLUSTER_GRD_QUEUE_OBSERVED);
+	UT_ASSERT(snapshot.route_known);
+	UT_ASSERT_EQ(snapshot.master_node, pg_atomic_read_u32(&shared->master[shard]));
+	UT_ASSERT_EQ(snapshot.master_generation, pg_atomic_read_u32(&shared->master_generation[shard]));
+	pg_atomic_write_u32(&shared->shard_phase[shard], GRD_SHARD_FROZEN);
+	UT_ASSERT_EQ(cluster_grd_queue_try_snapshot(&resid, &snapshot, NULL, 0), CLUSTER_GRD_QUEUE_OBSERVED);
+	UT_ASSERT(!snapshot.route_known);
+	pg_atomic_write_u32(&shared->shard_phase[shard], GRD_SHARD_NORMAL);
+	pg_atomic_write_u32(&shared->master_map_initialized, 0);
+	UT_ASSERT_EQ(cluster_grd_queue_try_snapshot(&resid, &snapshot, NULL, 0), CLUSTER_GRD_QUEUE_OBSERVED);
+	UT_ASSERT(!snapshot.route_known);
+	pg_atomic_write_u32(&shared->master_map_initialized, 1);
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_hit_count(), hits);
+	UT_ASSERT_EQ(cluster_grd_entry_pin_count(entry), 1);
+	cluster_grd_entry_release(entry);
+	ut_mock_epoch = saved_epoch;
+	stop_grd_finish();
+}
+
 static void
 observe_queue_visitor(void *ctx, ClusterGrdQueueObservationStatus status,
 					  const ClusterGrdQueueSnapshot *entry,
@@ -8250,12 +8328,14 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(176);
+	UT_PLAN(178);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
 	UT_RUN(test_grd_queue_observation_distinguishes_unavailable_absent_and_empty);
 	UT_RUN(test_grd_queue_observation_copies_native_waiter_identity_without_mutation);
 	UT_RUN(test_grd_queue_observation_keeps_convert_and_reservation_distinct);
 	UT_RUN(test_grd_queue_observation_copies_dynamic_vector_and_reports_truncation);
+	UT_RUN(test_grd_try_snapshot_never_waits_or_changes_native_owner);
+	UT_RUN(test_grd_snapshot_route_requires_current_normal_master_map);
 	UT_RUN(test_parallel_group_worker_cannot_wait_behind_blocked_ddl);
 	UT_RUN(test_parallel_group_convert_uses_original_holder_group);
 	UT_RUN(test_parallel_group_waiter_drain_and_wfg);

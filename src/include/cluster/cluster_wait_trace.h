@@ -27,7 +27,7 @@ typedef enum ClusterWaitTraceSite {
 	CLWAIT_SITE_PCM_INSTALL, CLWAIT_SITE_PCM_ADMISSION,
 	CLWAIT_SITE_TX_SOURCE, CLWAIT_SITE_TX_TARGET, CLWAIT_SITE_GES_TX,
 	CLWAIT_SITE_PCM_SOURCE_FINISH, CLWAIT_SITE_PCM_RETAINED_DRAIN,
-	CLWAIT_SITE_PCM_TARGET_PREPARE
+	CLWAIT_SITE_PCM_TARGET_PREPARE, CLWAIT_SITE_PCM_SOURCE_SERVICE
 } ClusterWaitTraceSite;
 
 typedef enum ClusterWaitTraceGuard {
@@ -82,9 +82,27 @@ typedef struct ClusterWaitRequesterGate {
 	bool known;
 } ClusterWaitRequesterGate;
 
+typedef enum ClusterWaitPcmServiceOrigin {
+	CLWAIT_PCM_SERVICE_UNKNOWN, CLWAIT_PCM_SERVICE_INGRESS,
+	CLWAIT_PCM_SERVICE_DRAIN, CLWAIT_PCM_SERVICE_FINISH
+} ClusterWaitPcmServiceOrigin;
+
+/* Owned values from an already accepted native call. Receiver-local peer
+ * capability generation is not the sender's wire connection generation.
+ * This records entry checks, not ongoing route freshness or authority. */
+typedef struct ClusterWaitPcmAdmission {
+	uint64 feature_bit, record_generation, formation_epoch;
+	uint64 gate_formation, gate_freeze, master_session;
+	uint32 gate_phase, peer_capability_generation;
+	int32 origin, master_node;
+	uint8 side;
+	bool supplied, entered, known;
+} ClusterWaitPcmAdmission;
+
 typedef struct ClusterWaitTrace {
 	BufferTag tag;
 	ClusterWaitAdmissionBridge admission;
+	ClusterWaitPcmAdmission service_admission;
 	uint64 snapshot, wait_seq, request_seq;
 	uint64 binding, formation, master_session, r4, acquisition;
 	uint64 base, authority, head, enqueue_order;
@@ -111,6 +129,8 @@ typedef struct ClusterWaitTrace {
 	uint32 refusal_flags, refusal_pins;
 	uint32 tx_xid;
 	uint32 pins_seen, ledger_seen, local_pins, rows, omitted;
+	uint32 ordered_lane, semantic_crc32c;
+	uint8 source_candidate, retain_pi_if_dirty, common_flags, common_outcome;
 	int32 site, mode, expected_master, requester, source, queue_kind;
 	int32 state, x_holder, pending_requester, phase, round_phase, owner_phase;
 	int32 round_requester, head_requester;

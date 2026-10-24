@@ -72,6 +72,8 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 
+bool cluster_trace_control_config = false;
+
 /* Storage/transport observers retain complete keys; the GRD is always real. */
 /* Legacy control fixtures deliberately do not execute object queries. */
 #ifndef PGRAC_REAL_HOLDER_PROBE
@@ -194,6 +196,30 @@ void
 cluster_content_trace_wait_clear(ClusterContentTraceWait kind)
 {
 }
+
+void
+cluster_content_trace_enqueue_wait_set(const ClusterResId *resid pg_attribute_unused(),
+	const ClusterGrdHolderId *holder pg_attribute_unused(),
+	int32 mode pg_attribute_unused(), int32 current_mode pg_attribute_unused(),
+	bool convert pg_attribute_unused(), uint64 request pg_attribute_unused(),
+	uint64 epoch pg_attribute_unused(), uint64 wait_seq pg_attribute_unused())
+{
+}
+
+void
+cluster_content_trace_enqueue_wait_clear(void)
+{
+}
+
+void
+cluster_content_trace_enqueue_granted(const ClusterResId *resid pg_attribute_unused(),
+	const ClusterGrdHolderId *holder pg_attribute_unused(), int32 mode pg_attribute_unused())
+{}
+
+void
+cluster_content_trace_enqueue_releasing(const ClusterResId *resid pg_attribute_unused(),
+	const ClusterGrdHolderId *holder pg_attribute_unused())
+{}
 
 /* Real S3/GES/S5, with the KO owner an explicit boundary. Acceptance must
  * arrive before consumption, after both exact promotion/proof checks. */

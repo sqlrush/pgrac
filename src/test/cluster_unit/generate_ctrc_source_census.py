@@ -207,8 +207,10 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
         (
             "src/backend/cluster/cluster_terminal_ref_census.c",
             "src/backend/cluster/cluster_runtime_visibility.c",
+            "src/backend/cluster/cluster_tt_slot.c",
+            "src/backend/cluster/cluster_tt_durable.c",
         ),
-        r"\bcluster_ctrc_origin_original_full_xid_(?:exact|shared)\s*\(",
+        r"\b(?:cluster_ctrc_origin_original_full_xid_(?:exact|shared)|cluster_tt_slot_origin_identity_(?:retain|read))\s*\(",
     ),
     ScanRule(
         "CTRC_RECEIPT_LIFECYCLE",
@@ -476,6 +478,28 @@ _classify_owners(
     "MXA-T27",
 )
 
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_tt_slot.c",
+    ("cluster_tt_slot_origin_identity_retain", "cluster_tt_slot_origin_identity_read"),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "CANONICAL_TT_SLOT",
+    "NO_REFERENCE_TRANSFER_REQUIRED",
+    "NO_REFERENCE_TO_DISCHARGE",
+    "MXA-T40",
+)
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_tt_durable.c",
+    ("cluster_tt_slot_durable_publish_active",),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "CANONICAL_TT_SLOT",
+    "NO_REFERENCE_TRANSFER_REQUIRED",
+    "NO_REFERENCE_TO_DISCHARGE",
+    "MXA-T40",
+)
 _classify_owners(
     "CTRC_TOUCH_BEFORE_PROOF",
     "src/backend/cluster/cluster_gcs_block.c",

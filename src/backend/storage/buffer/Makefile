@@ -21,3 +21,6 @@ OBJS = \
 	localbuf.o
 
 include $(top_srcdir)/src/backend/common.mk
+
+# Native opt-in diagnostic publisher layout.
+bufmgr.o: $(top_srcdir)/src/include/cluster/cluster_content_trace.h

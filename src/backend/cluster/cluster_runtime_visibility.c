@@ -1046,9 +1046,15 @@ cluster_runtime_visibility_origin_original_full_xid(
 	owner.wrap = candidate->local_canonical.wrap;
 	generation.known = true;
 	generation.value = candidate->local_canonical_generation;
-	if (!cluster_runtime_visibility_ctrc_key_fill(&owner, &generation, root, admission, &key)
-		|| !cluster_ctrc_origin_original_full_xid_shared(&key, &original)
+	if (!cluster_runtime_visibility_ctrc_key_fill(&owner, &generation, root, admission, &key))
+		return InvalidFullTransactionId;
+	/* The original origin row may already be retired.  Only the exact
+	 * original ACTIVE slot handoff is an alternative local source; neither
+	 * miss changes the verdict or obtains new canonical/current authority. */
+	if ((!cluster_ctrc_origin_original_full_xid_shared(&key, &original)
+		 && !cluster_tt_slot_origin_identity_read(&key, &original))
 		|| !FullTransactionIdIsNormal(original)
+		|| U64FromFullTransactionId(original) == UINT64_MAX
 		|| XidFromFullTransactionId(original) != owner.xid
 		|| cluster_qvotec_get_self_incarnation() != key.origin_boot_incarnation)
 		return InvalidFullTransactionId;

@@ -59,7 +59,11 @@
 SCN
 cluster_undo_retention_sample_min(SCN sampled_clock, TransactionId xmin, SCN published_read_scn)
 {
-	if (!SCN_VALID(sampled_clock))
+	/* The idle-report sentinel is neither a sampled clock nor a reader's
+	 * retained SCN.  A finite peer/reader cannot supply the missing clock,
+	 * and the clock cannot stand in for an explicitly unproven reader. */
+	if (!SCN_VALID(sampled_clock) || sampled_clock == (SCN) UINT64_MAX
+		|| published_read_scn == (SCN) UINT64_MAX)
 		return InvalidScn;
 	if (SCN_VALID(published_read_scn))
 		return scn_time_cmp(published_read_scn, sampled_clock) < 0 ? published_read_scn

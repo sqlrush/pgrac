@@ -2273,7 +2273,10 @@ cluster_undo_retention_horizon_sample(ClusterUndoRetentionSample *out)
 	 * Existing unpublished snapshots refuse below; there is no post-scan
 	 * clock sample that could run ahead of a concurrently created reader. */
 	sample.clock_scn = cluster_scn_current();
-	sample.horizon_scn = sample.clock_scn;
+	/* Use the original fold even for an empty ProcArray: an idle-report
+	 * sentinel cannot become this cut's clock or be repaired by a reader. */
+	sample.horizon_scn = cluster_undo_retention_sample_min(sample.clock_scn,
+														 InvalidTransactionId, InvalidScn);
 	sample.contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK;
 	/* An invalid census cannot prove that the clock is unconstrained. Check
 	 * in the same ProcArray cut before following any membership index. */

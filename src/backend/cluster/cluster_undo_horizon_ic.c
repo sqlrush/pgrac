@@ -552,7 +552,7 @@ undo_horizon_sample_local_report(ClusterUndoRetentionSample *out)
 		SCN bound = cluster_mrp_standby_consistent_scn();
 		int cmp;
 
-		if (bound == InvalidScn)
+		if (bound == InvalidScn || bound == CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED)
 			return false;
 		cmp = scn_time_cmp(bound, sample.horizon_scn);
 		if (cmp < 0)
@@ -979,6 +979,10 @@ undo_horizon_v2_observe_peer(int32 peer, const ClusterSemanticActiveSampleFence 
 		return CLUSTER_HEAP_FREEZE_COHORT_INVALID;
 	identity->recv_at_us = view.recv_at_us;
 	identity->interval_ms = report->sender_interval_ms;
+	candidate->source_peer_horizon_scn[peer] = report->horizon_scn;
+	candidate->source_peer_history[peer].sample_clock_scn = report->h_sample_clock_scn;
+	candidate->source_peer_history[peer].contributor_kind = report->h_contributor_kind;
+	candidate->source_peer_history[peer].contributor_token = report->h_contributor_token;
 	identity->covered = undo_horizon_maintenance_coverage(peer, report->future_full_xid);
 	candidate->future_full_xid_max = Max(candidate->future_full_xid_max, report->future_full_xid);
 	candidate->requested_full_xid_max
@@ -1097,7 +1101,12 @@ undo_horizon_v2_cohort_observe(ClusterHeapFreezeCohortObservation *out,
 		= undo_horizon_maintenance_coverage(cluster_node_id, candidate.future_full_xid_max);
 	candidate.active_full_xid_min = U64FromFullTransactionId(active.scan.min_full);
 	candidate.local_unqualified_entries = active.scan.unqualified_entries;
+	memcpy(&candidate.local_registration_cut, &active.scan, sizeof(active.scan));
 	memcpy(&candidate.admission_fence, &fence, sizeof(fence));
+	candidate.source_local_horizon_scn = history.horizon_scn;
+	candidate.source_local_history.sample_clock_scn = history.clock_scn;
+	candidate.source_local_history.contributor_kind = history.contributor_kind;
+	candidate.source_local_history.contributor_token = history.contributor_token;
 	candidate.horizon_scn = history.horizon_scn;
 	candidate.record_generation = fence.record_generation;
 	candidate.formation_epoch = fence.formation_epoch;
@@ -1245,6 +1254,7 @@ cluster_heap_freeze_cohort_current(const ClusterHeapFreezeCohortObservation *exp
 		return CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE;
 	if (active.sample_id != expected->source_local_sample_id
 		|| active.scan.status != CTRC_ACTIVE_SCAN_COMPLETE
+		|| memcmp(&active.scan, &expected->local_registration_cut, sizeof(active.scan)) != 0
 		|| memcmp(&active.admission_fence, fence, sizeof(*fence)) != 0
 		|| !cluster_undo_cleaner_active_sample_current(&active))
 		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;

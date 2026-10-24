@@ -139,6 +139,9 @@ extern bool cluster_smgr_exists(SMgrRelation reln, ForkNumber forknum);
 extern void cluster_smgr_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo);
 extern void cluster_smgr_extend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 								const void *buffer, bool skipFsync);
+/* Exact abandoned reservation only; allocate absent bytes without rewriting
+ * any existing current image, then publish native size invalidation. */
+extern bool cluster_smgr_finish_extension_page_v3(RelFileLocator locator, BlockNumber block);
 extern void cluster_smgr_zeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 									int nblocks, bool skipFsync);
 extern bool cluster_smgr_prefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum);

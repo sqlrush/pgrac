@@ -57,6 +57,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "common/hashfn.h"
 #include "storage/lwlock.h"
 #include "utils/wait_event.h"
 
@@ -113,6 +114,19 @@ static int fake_reply_status = -1;
 static uint64 fake_last_request_id;
 static uint64 fake_previous_request_id;
 static int fake_ack_degraded;
+static uint64 fake_route_epoch;
+static uint64 fake_route_generation = 2;
+static uint64 fake_route_dead_generation;
+static bool fake_route_known = true;
+static bool fake_route_busy;
+static bool fake_route_sparse;
+static int32 fake_route_ids[CLUSTER_MAX_NODES];
+static int32 fake_missing_member = -1;
+static bool fake_route_churn;
+static bool fake_route_dead_churn;
+static unsigned fake_route_reads;
+static unsigned fake_route_dead_reads;
+static unsigned fake_conf_lookup_calls;
 
 /* Only the counter touched by the extracted, real block consumer. */
 static struct {
@@ -331,7 +345,7 @@ pg_re_throw(void)
 uint64
 cluster_epoch_get_current(void)
 {
-	return 0;
+	return fake_route_epoch;
 }
 
 void
@@ -461,8 +475,13 @@ const ClusterNodeInfo *
 cluster_conf_lookup_node(int32 node_id)
 {
 	static ClusterNodeInfo infos[CLUSTER_MAX_NODES];
+	bool declared = false;
 
-	if (node_id >= 0 && node_id < fake_declared_count) {
+	fake_conf_lookup_calls++;
+	for (int i = 0; i < fake_declared_count; i++)
+		if (node_id == (fake_route_sparse ? fake_route_ids[i] : i))
+			declared = true;
+	if (node_id >= 0 && node_id < CLUSTER_MAX_NODES && declared) {
 		infos[node_id].node_id = node_id;
 		return &infos[node_id];
 	}
@@ -564,7 +583,113 @@ UT_TEST(test_gcs_reply_status_enum_count_is_4)
 bool
 cluster_membership_is_member(int32 node_id)
 {
-	return cluster_conf_lookup_node(node_id) != NULL;
+	if (node_id == fake_missing_member)
+		return false;
+	for (int i = 0; i < fake_declared_count; i++)
+		if (node_id == (fake_route_sparse ? fake_route_ids[i] : i))
+			return true;
+	return false;
+}
+
+/* Native conf copying is tested in test_cluster_conf. These inputs exercise
+ * the actual extension helper against the separately linked native router. */
+bool
+cluster_conf_declared_nodes_observe(ClusterConfDeclaredNodes *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!fake_route_known)
+		return false;
+	for (int i = 0; i < fake_declared_count; i++)
+		out->nodes[out->count++] = fake_route_sparse ? fake_route_ids[i] : i;
+	out->known = true;
+	return true;
+}
+
+uint64
+cluster_membership_cut_generation(void)
+{
+	return fake_route_generation + (fake_route_churn && fake_route_reads++ != 0 ? 2 : 0);
+}
+
+bool
+cluster_membership_cut_generation_current(uint64 expected)
+{
+	return expected != 0 && cluster_membership_cut_generation() == expected;
+}
+
+uint64
+cluster_cssd_get_dead_generation(void)
+{
+	return fake_route_dead_generation + (fake_route_dead_churn && fake_route_dead_reads++ != 0 ? 1 : 0);
+}
+
+ClusterCssdStatus
+cluster_cssd_get_status_nowait(bool *busy)
+{
+	*busy = fake_route_busy;
+	return CLUSTER_CSSD_READY;
+}
+
+#include "test_cluster_wait_graph_route.inc"
+
+UT_TEST(test_wait_graph_route_matches_native_sparse_routing_without_cache_calls)
+{
+	BufferTag tag = {0};
+	WaitGraphRoute route;
+
+	cluster_shared_config = true;
+	fake_route_epoch = 7;
+	fake_declared_count = 4;
+	fake_route_sparse = true;
+	fake_route_ids[0] = 0; fake_route_ids[1] = 2;
+	fake_route_ids[2] = 5; fake_route_ids[3] = 127;
+	for (int block = 0; block < 256; block++) {
+		unsigned calls = fake_conf_lookup_calls;
+		tag.blockNum = block;
+		wait_graph_route_snapshot(&tag, &route);
+		UT_ASSERT(route.known);
+		UT_ASSERT_EQ(fake_conf_lookup_calls, calls);
+		UT_ASSERT_EQ(route.topology.count, 4);
+		UT_ASSERT_EQ(route.topology.nodes[3], 127);
+		UT_ASSERT_EQ(route.master, cluster_gcs_lookup_master(tag));
+	}
+	fake_route_sparse = false;
+	fake_declared_count = 1;
+	fake_route_epoch = 0;
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_wait_graph_route_refuses_unknown_or_changing_inputs)
+{
+	BufferTag tag = {0};
+	WaitGraphRoute route;
+
+	cluster_shared_config = true;
+	fake_route_epoch = 7;
+	fake_declared_count = 4;
+	for (int failure = 0; failure < 10; failure++) {
+		fake_route_known = failure != 0;
+		cluster_shared_config = failure != 1;
+		fake_dead_node = failure == 2 ? 1 : -1;
+		fake_missing_member = failure == 3 ? 2 : -1;
+		fake_route_busy = failure == 4;
+		fake_route_epoch = failure == 5 ? 0 : 7;
+		fake_route_generation = failure == 6 ? 0 : 2;
+		fake_route_churn = failure == 7;
+		fake_route_dead_churn = failure == 8;
+		fake_declared_count = failure == 9 ? 0 : 4;
+		fake_route_reads = fake_route_dead_reads = 0;
+		wait_graph_route_snapshot(&tag, &route);
+		UT_ASSERT(!route.known);
+		UT_ASSERT_EQ(route.master, -1);
+	}
+	fake_route_known = true;
+	fake_dead_node = fake_missing_member = -1;
+	fake_route_busy = fake_route_churn = fake_route_dead_churn = false;
+	fake_route_generation = 2;
+	fake_declared_count = 1;
+	fake_route_epoch = 0;
+	cluster_shared_config = false;
 }
 
 UT_TEST(test_gcs_lookup_master_symbol_linkable)
@@ -1005,7 +1130,7 @@ run_holder_registration(uint8 final_status, PcmLockTransition transition_id, boo
 
 	int main(void)
 	{
-		UT_PLAN(23);
+		UT_PLAN(25);
 		UT_RUN(test_gcs_msg_type_enum_values_no_collision);
 		UT_RUN(test_gcs_payload_sizes_locked);
 		UT_RUN(test_gcs_payload_field_offsets);
@@ -1029,6 +1154,8 @@ run_holder_registration(uint8 final_status, PcmLockTransition transition_id, boo
 		UT_RUN(test_forwarded_s_registration_refusal_reenters_without_grant);
 		UT_RUN(test_forwarded_registration_hard_failures_never_become_retry);
 		UT_RUN(test_shared_control_rejects_old_x_before_apply_or_pending_cleanup);
+		UT_RUN(test_wait_graph_route_matches_native_sparse_routing_without_cache_calls);
+		UT_RUN(test_wait_graph_route_refuses_unknown_or_changing_inputs);
 		free(fake_shmem);
 		UT_DONE();
 		return ut_failed_count == 0 ? 0 : 1;

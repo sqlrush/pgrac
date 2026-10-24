@@ -6,6 +6,7 @@
 #include "access/transam.h"
 #include "cluster/cluster_xid_stripe_boot.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_terminal_ref_census.h"
 
 /* Before heap mutation, cap a local proposal at the immutable activation
  * floor: another slot can still issue an XID below this node's proposal.
@@ -130,7 +131,7 @@ typedef enum ClusterHeapFreezeCohortStatus {
 	CLUSTER_HEAP_FREEZE_COHORT_INVALID
 } ClusterHeapFreezeCohortStatus;
 
-/* Same receive publication used by the original fold. Process-local only;
+/* Same receive publication identity used by the original fold and watermark;
  * covered is maintenance intent coverage, never freeze permission. */
 typedef struct ClusterHeapFreezeCohortPeerObservation {
 	uint64 recv_at_us;
@@ -139,6 +140,14 @@ typedef struct ClusterHeapFreezeCohortPeerObservation {
 	uint32 seq;
 	uint64 covered;
 } ClusterHeapFreezeCohortPeerObservation;
+
+/* Original H-source diagnostics retained in process-local observations only.
+ * This is neither shared/wire storage nor contributor-lifetime authority. */
+typedef struct ClusterHeapFreezeHistorySourceObservationV1 {
+	uint64 sample_clock_scn;
+	ClusterHeapFreezeReportV2ContributorKind contributor_kind;
+	uint64 contributor_token;
+} ClusterHeapFreezeHistorySourceObservationV1;
 
 /* Read-only observation of the entire admitted cohort, never a freeze or
  * truncation certificate. Producer protection closure is still required
@@ -155,9 +164,19 @@ typedef struct ClusterHeapFreezeCohortObservation {
 	uint64 admitted_members_hi;
 	/* Same local completed sample; remote reports do not prove identity coverage. */
 	uint64 local_unqualified_entries;
+	/* Original completed local scan, retained verbatim for the final local
+	 * registration-cut check. No remote/provenance/retention authority. */
+	ClusterCtrcActiveScan local_registration_cut;
 	/* Original fixed-cohort cut, retained verbatim for the existing current
 	 * getter. Keep unchanged; not a producer-retention certificate. */
 	ClusterSemanticActiveSampleFence admission_fence;
+	/* Original local H from the same single history sample used by the fold. */
+	uint64 source_local_horizon_scn;
+	/* Kept outside the peer identity type, which is also stored in shmem. */
+	uint64 source_peer_horizon_scn[CLUSTER_MAX_NODES];
+	/* Same original cuts as the H scalars above; never resampled on handoff. */
+	ClusterHeapFreezeHistorySourceObservationV1 source_local_history;
+	ClusterHeapFreezeHistorySourceObservationV1 source_peer_history[CLUSTER_MAX_NODES];
 	uint64 source_local_sample_id;
 	uint64 source_started_at_us;
 	uint32 source_interval_ms;
@@ -166,6 +185,14 @@ typedef struct ClusterHeapFreezeCohortObservation {
 
 /* Pure match of retained, separately current-checked inputs. These are
  * candidate bounds only, not a positive F/H or producer-retention certificate.
+ * The selected Min(policy,F) must remain strictly inside the original
+ * policy legal-next past half-space; a higher ignored F does not qualify
+ * or invalidate that selected bound. The retained H must equal the original
+ * SCN-time minimum of its local sample and exactly the required peer sources,
+ * preserving the original fold order for equal-time values.
+ * Original source clock/kind/token metadata survives this handoff. Each H
+ * must fit its source clock and original report kind range; UNKNOWN and
+ * diagnostic tokens do not establish contributor protection or authority.
  * No nextXid/H sample, current fetch, lock or identity callback is performed.
  * Failure preserves *out; the caller still owns the original admission and
  * must qualify provenance/retention before any native plan or shared write. */

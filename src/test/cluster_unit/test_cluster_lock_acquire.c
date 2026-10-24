@@ -47,6 +47,7 @@
 
 #include "cluster/cluster_advisory.h"
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_ges.h" /* GES_REJECT_REASON_* for U6 */
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_lmd_wait_state.h"
@@ -317,7 +318,9 @@ ErrorContextCallback *error_context_stack = NULL;
 void
 pg_re_throw(void)
 {
-	abort(); /* never reached — the stub wait never throws */
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
 }
 
 void
@@ -337,6 +340,63 @@ void
 cluster_ges_reply_wait_delete(const GesReplyWaitKey *key pg_attribute_unused())
 {}
 
+static uint64 trace_wait_seq;
+static unsigned trace_sets, trace_clears;
+static bool trace_active, trace_throw;
+static int trace_expect_send = -1;
+static ClusterResId trace_resid;
+static ClusterGrdHolderId trace_holder;
+static int32 trace_mode, trace_current_mode;
+static bool trace_convert;
+static uint64 trace_request, trace_epoch, trace_sequence;
+
+/* Diagnostic boundary only; these fixtures never create a queue or grant. */
+void
+cluster_content_trace_enqueue_wait_set(const ClusterResId *resid,
+	const ClusterGrdHolderId *holder, int32 mode, int32 current_mode,
+	bool convert, uint64 request, uint64 epoch, uint64 wait_seq)
+{
+	trace_sets++; trace_active = true; trace_resid = *resid; trace_holder = *holder;
+	trace_mode = mode; trace_current_mode = current_mode; trace_convert = convert;
+	trace_request = request; trace_epoch = epoch; trace_sequence = wait_seq;
+}
+
+void
+cluster_content_trace_enqueue_wait_clear(void)
+{
+	trace_clears++; trace_active = false;
+}
+
+static unsigned trace_grants, trace_releases;
+static int trace_expect_release = -1;
+static ClusterResId trace_grant_resid;
+static ClusterGrdHolderId trace_grant_holder;
+static int32 trace_grant_mode;
+void
+cluster_content_trace_enqueue_granted(const ClusterResId *resid,
+	const ClusterGrdHolderId *holder, int32 mode)
+{
+	trace_grants++; trace_grant_resid = *resid; trace_grant_holder = *holder; trace_grant_mode = mode;
+}
+void
+cluster_content_trace_enqueue_releasing(const ClusterResId *resid,
+	const ClusterGrdHolderId *holder)
+{
+	trace_releases++; trace_grant_resid = *resid; trace_grant_holder = *holder;
+}
+
+static void
+trace_send_boundary(void)
+{
+	if (trace_expect_send >= 0)
+		UT_ASSERT_EQ(trace_active, trace_expect_send != 0);
+	if (trace_throw) {
+		if (PG_exception_stack == NULL)
+			abort();
+		siglongjmp(*PG_exception_stack, 1);
+	}
+}
+
 uint64
 cluster_lmd_wait_state_publish(ClusterLmdProcWaitState *ws pg_attribute_unused(),
 							   uint8 kind pg_attribute_unused(),
@@ -344,7 +404,7 @@ cluster_lmd_wait_state_publish(ClusterLmdProcWaitState *ws pg_attribute_unused()
 							   uint64 cluster_epoch pg_attribute_unused(),
 							   TransactionId xid pg_attribute_unused())
 {
-	return 0;
+	return ++trace_wait_seq;
 }
 
 void
@@ -833,6 +893,7 @@ cluster_ges_send_native_request_and_wait(const ClusterResId *resid pg_attribute_
 										 ClusterGesHwGrant *grant pg_attribute_unused())
 {
 	/* Mapping-only fixture; no retained authority is manufactured here. */
+	trace_send_boundary();
 	if (dontwait)
 		stub_ges_request_nowait_wait_calls++;
 	else
@@ -929,6 +990,7 @@ cluster_ges_send_request_and_wait(const struct ClusterResId *resid pg_attribute_
 								  int timeout_ms pg_attribute_unused(),
 								  uint32 wait_event pg_attribute_unused())
 {
+	trace_send_boundary();
 	stub_ges_request_wait_calls++;
 	return stub_ges_reject_reason;
 }
@@ -942,6 +1004,7 @@ cluster_ges_send_request_nowait_and_wait(
 	uint64 request_id pg_attribute_unused(), int timeout_ms pg_attribute_unused(),
 	uint32 wait_event pg_attribute_unused())
 {
+	trace_send_boundary();
 	stub_ges_request_nowait_wait_calls++;
 	return stub_ges_reject_reason;
 }
@@ -953,6 +1016,7 @@ cluster_ges_send_convert_nowait_and_wait(
 	uint64 convert_request_id pg_attribute_unused(), uint64 old_request_id,
 	int timeout_ms pg_attribute_unused(), uint32 wait_event pg_attribute_unused())
 {
+	trace_send_boundary();
 	stub_ges_convert_nowait_wait_calls++;
 	stub_convert_nowait_requested_mode = requested_mode;
 	stub_convert_nowait_current_mode = current_mode;
@@ -966,6 +1030,7 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid pg_attribute_
 								  uint64 request_id pg_attribute_unused(), int timeout_ms,
 								  uint32 wait_event)
 {
+	if (trace_expect_release >= 0) UT_ASSERT_EQ(trace_releases, trace_expect_release);
 	stub_ges_release_timeout_ms = timeout_ms;
 	stub_ges_release_wait_event = wait_event;
 	return 0;
@@ -977,6 +1042,7 @@ uint32
 cluster_ges_release_and_drain_local(const struct ClusterResId *resid pg_attribute_unused(),
 									const struct ClusterGrdHolderId *holder pg_attribute_unused())
 {
+	if (trace_expect_release >= 0) UT_ASSERT_EQ(trace_releases, trace_expect_release);
 	return stub_local_release_result;
 }
 
@@ -991,6 +1057,7 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid pg_attribute_
 								  uint64 convert_request_id pg_attribute_unused(),
 								  int timeout_ms pg_attribute_unused())
 {
+	trace_send_boundary();
 	stub_ges_convert_wait_calls++;
 	return stub_ges_reject_reason;
 }
@@ -1546,6 +1613,41 @@ UT_TEST(test_ul_try_lock_nowait_s4_reject_mapping)
 	cluster_node_id = saved_node;
 }
 
+UT_TEST(test_hw_ko_grant_trace_follows_original_s5_s6_results)
+{
+	ClusterLockAcquireRequest req = {0};
+	ClusterGrdEntryResult saved_promote = owner_promote_result;
+	int32 saved_master = stub_master_node;
+	uint32 saved_release = stub_local_release_result;
+	unsigned grants = trace_grants, releases = trace_releases;
+	req.resid = (ClusterResId){1, 2, 3, 0, 0xf6, 1};
+	req.holder = (ClusterGrdHolderId){0, 2, 7, 101};
+	req.op = CLUSTER_LOCK_OP_REQUEST; req.lockmode = ExclusiveLock;
+	owner_promote_result = CLUSTER_GRD_ENTRY_OK;
+	UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&req), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(trace_grants, grants + 1); UT_ASSERT_EQ(trace_grant_resid.type, 0xf6);
+	UT_ASSERT_EQ(trace_grant_holder.request_id, 101); UT_ASSERT_EQ(trace_grant_mode, ExclusiveLock);
+	req.resid.type = 0xf2;
+	UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&req), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(trace_grants, grants + 2);
+	owner_promote_result = CLUSTER_GRD_ENTRY_NOT_FOUND;
+	UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&req), CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	UT_ASSERT_EQ(trace_grants, grants + 2);
+	req.resid.type = 0xf6;
+	stub_master_node = cluster_node_id;
+	stub_local_release_result = GES_REJECT_REASON_TIMEOUT;
+	trace_expect_release = releases + 1;
+	UT_ASSERT_EQ(cluster_lock_acquire_s6_release(&req), CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	UT_ASSERT_EQ(trace_releases, releases + 1);
+	stub_master_node = cluster_node_id + 1;
+	trace_expect_release = releases + 2;
+	UT_ASSERT_EQ(cluster_lock_acquire_s6_release(&req), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(trace_releases, releases + 2);
+	trace_expect_release = -1;
+	owner_promote_result = saved_promote; stub_master_node = saved_master;
+	stub_local_release_result = saved_release;
+}
+
 UT_TEST(test_walr_convert_nowait_routes_upgrade_only_and_maps_conflict)
 {
 	ClusterLockAcquireRequest req;
@@ -2014,13 +2116,80 @@ UT_TEST(test_relation_fence_sample_never_created_after_a_grant)
 	UT_ASSERT_EQ(ko_sample_calls, 0);
 }
 
+UT_TEST(test_blocking_wait_trace_matches_original_request_and_retires)
+{
+	PGPROC proc = {0};
+	ClusterLockAcquireRequest req = {0};
+	unsigned before = trace_sets;
+	PGPROC *saved_proc = MyProc;
+	uint32 saved_reject = stub_ges_reject_reason;
+
+	MyProc = &proc;
+	req.resid = (ClusterResId){11, 22, 33, 44, LOCKTAG_ADVISORY, 2};
+	req.locktag.locktag_type = LOCKTAG_ADVISORY;
+	req.holder = (ClusterGrdHolderId){3, 17, 19, 23};
+	req.request_id = 29; req.lockmode = ExclusiveLock; req.current_mode = ShareLock;
+	trace_expect_send = 1; stub_ges_reject_reason = GES_REJECT_REASON_NONE;
+	UT_ASSERT_EQ(cluster_lock_acquire_s4_remote_request_wait(&req), CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK);
+	UT_ASSERT_EQ(trace_sets, before + 1); UT_ASSERT(!trace_active);
+	UT_ASSERT(memcmp(&trace_resid, &req.resid, sizeof(trace_resid)) == 0);
+	UT_ASSERT(memcmp(&trace_holder, &req.holder, sizeof(trace_holder)) == 0);
+	UT_ASSERT_EQ(trace_mode, ExclusiveLock); UT_ASSERT_EQ(trace_current_mode, ShareLock);
+	UT_ASSERT(!trace_convert); UT_ASSERT_EQ(trace_request, 29);
+	UT_ASSERT_EQ(trace_epoch, stub_redeclare_epoch); UT_ASSERT_EQ(trace_sequence, trace_wait_seq);
+	req.dontwait = true; trace_expect_send = 0; stub_ges_reject_reason = GES_REJECT_REASON_LOCK_CONFLICT;
+	UT_ASSERT_EQ(cluster_lock_acquire_s4_remote_request_wait(&req), CLUSTER_LOCK_ACQUIRE_NOT_AVAIL);
+	UT_ASSERT_EQ(trace_sets, before + 1);
+	req.dontwait = false; req.op = CLUSTER_LOCK_OP_CONVERT; trace_expect_send = 1;
+	UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&req), CLUSTER_LOCK_ACQUIRE_NOT_AVAIL);
+	UT_ASSERT_EQ(trace_sets, before + 2); UT_ASSERT(!trace_active); UT_ASSERT(trace_convert);
+	req.dontwait = true; trace_expect_send = 0;
+	UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&req), CLUSTER_LOCK_ACQUIRE_NOT_AVAIL);
+	UT_ASSERT_EQ(trace_sets, before + 2);
+	trace_expect_send = -1; MyProc = saved_proc; stub_ges_reject_reason = saved_reject;
+}
+
+UT_TEST(test_blocking_wait_trace_retires_on_original_error_exit)
+{
+	PGPROC proc = {0};
+	ClusterLockAcquireRequest req = {0};
+	PGPROC *saved_proc = MyProc;
+	unsigned before = trace_clears;
+
+	MyProc = &proc; req.resid.type = LOCKTAG_ADVISORY;
+	req.locktag.locktag_type = LOCKTAG_ADVISORY;
+	req.current_mode = ShareLock; req.lockmode = ExclusiveLock;
+	trace_expect_send = 1; trace_throw = true;
+	for (int convert = 0; convert < 2; convert++) {
+		volatile bool caught = false;
+		req.op = convert ? CLUSTER_LOCK_OP_CONVERT : CLUSTER_LOCK_OP_REQUEST;
+		PG_TRY();
+		{
+			if (convert)
+				(void)cluster_lock_acquire_s5_promote(&req);
+			else
+				(void)cluster_lock_acquire_s4_remote_request_wait(&req);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+			FlushErrorState();
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught); UT_ASSERT(!trace_active);
+	}
+	UT_ASSERT_EQ(trace_clears, before + 2);
+	trace_throw = false; trace_expect_send = -1; MyProc = saved_proc;
+}
+
 UT_DEFINE_GLOBALS();
 
 
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	UT_PLAN(31);
+	UT_PLAN(34);
+	UT_RUN(test_hw_ko_grant_trace_follows_original_s5_s6_results);
 
 	UT_RUN(test_7step_api_surface_linkable_and_initial_counters_zero);
 	UT_RUN(test_7step_s1_hc1_fail_closed);
@@ -2053,6 +2222,8 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 	UT_RUN(test_pending_entry_cancel_keeps_no_request_or_reservation);
 	UT_RUN(test_relation_fence_sample_precedes_reservation_and_survives_retries);
 	UT_RUN(test_relation_fence_sample_never_created_after_a_grant);
+	UT_RUN(test_blocking_wait_trace_matches_original_request_and_retires);
+	UT_RUN(test_blocking_wait_trace_retires_on_original_error_exit);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

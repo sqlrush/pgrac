@@ -86,6 +86,8 @@ rf_page_storage_install_smgr_v1(const RfPageStorageInstallRequestV1 *request,
 								RfPageStorageInstallProofV1 *proof);
 
 #ifdef USE_PGRAC_CLUSTER
+#include "access/generic_xlog.h"
+
 struct ClusterRecoveryFpiInsertV1;
 struct ClusterRecoverySerialGuard;
 struct ClusterWalRetentionPin;
@@ -137,6 +139,24 @@ extern bool rf_page_recovery_ctrc_itl_image_smgr_v1(const struct ClusterRecovery
 	const struct ClusterSpaceIdentity *space, BlockNumber blockno,
 	const RfPageVersionV1 *expected_before, const RfPageRecoveryCtrcItlSelectionV1 *selections,
 	Size count, RfPageRecoveryCtrcItlImageV1 *out);
+
+typedef struct RfPageRecoveryCtrcItlFpiV1 {
+	GenericXLogRecoveryImageV1 frame;
+	bool rewritten;
+} RfPageRecoveryCtrcItlFpiV1;
+
+/* Prepare the original Generic versioned frame from that same protected
+ * predecessor and selected ITL calculation. No change returns rewritten=false
+ * and a zero frame without minting a token. Refusal/ERROR preserves all output
+ * bytes and borrowed owners. A frame is only a private candidate: complete
+ * source/history/coverage proof, later hash/capacity preparation outside PAGE,
+ * exact F4/WAL/installation and responsibility discharge remain required. */
+extern bool rf_page_recovery_ctrc_itl_fpi_smgr_v1(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, const struct RfPageAuthorityGuardV1 *guard,
+	struct ClusterRecoverySerialGuard *serial, struct ClusterWalRetentionPin *pin,
+	const struct ClusterSpaceIdentity *space, BlockNumber blockno,
+	const RfPageVersionV1 *expected_before, const RfPageRecoveryCtrcItlSelectionV1 *selections,
+	Size count, RfPageRecoveryCtrcItlFpiV1 *out);
 #endif
 
 #endif /* CLUSTER_PAGE_INSTALL_H */

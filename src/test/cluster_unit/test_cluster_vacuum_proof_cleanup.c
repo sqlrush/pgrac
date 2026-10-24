@@ -121,6 +121,8 @@ static unsigned cohort_receipt_checks;
 static ClusterHeapFreezeCohortStatus cohort_receipt_status;
 static bool revoke_on_receipt_check;
 static unsigned candidate_selections;
+static bool use_candidate_value;
+static ClusterHeapFreezeXminCandidateBatchV1 candidate_value;
 static bool select_candidates;
 static FullTransactionId candidate_limit_seen;
 static SCN candidate_horizon_seen;
@@ -767,6 +769,7 @@ cluster_heap_freeze_select_xmin_candidates_v1(const ClusterHeapFreezePageBatchV1
 	out->target_count = 1;
 	out->targets[0].tuple_index = 0;
 	out->targets[0].original_creator_full_xid = FullTransactionIdFromEpochAndXid(1, 77);
+	if (use_candidate_value) *out = candidate_value;
 	return true;
 }
 
@@ -927,6 +930,14 @@ reset_fixture(void)
 	cohort_value.requested_full_xid_max = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 1100));
 	cohort_value.active_full_xid_min = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 60));
 	cohort_value.horizon_scn = 500;
+	cohort_value.source_local_horizon_scn = 600;
+	cohort_value.source_peer_horizon_scn[1] = 500;
+	cohort_value.source_local_history.sample_clock_scn = 700;
+	cohort_value.source_local_history.contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT;
+	cohort_value.source_local_history.contributor_token = 11;
+	cohort_value.source_peer_history[1].sample_clock_scn = 800;
+	cohort_value.source_peer_history[1].contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_PREPARED;
+	cohort_value.source_peer_history[1].contributor_token = 17;
 	cohort_value.record_generation = 17;
 	cohort_value.formation_epoch = 9;
 	cohort_value.admitted_members_lo = 3;
@@ -960,6 +971,8 @@ reset_fixture(void)
 	cohort_receipt_status = CLUSTER_HEAP_FREEZE_COHORT_READY;
 	revoke_on_receipt_check = false;
 	candidate_selections = 0;
+	use_candidate_value = false;
+	memset(&candidate_value, 0, sizeof(candidate_value));
 	select_candidates = true;
 	candidate_limit_seen = InvalidFullTransactionId;
 	candidate_horizon_seen = InvalidScn;
@@ -3105,10 +3118,140 @@ UT_TEST(test_writer_resume_error_before_lock_still_unpins_before_admission)
 	UT_ASSERT_EQ(debt, 0); UT_ASSERT_EQ(leaves, 1);
 }
 
+UT_TEST(bound_sources_borrow_original_owned_policy_and_cohort)
+{
+	reset_fixture(); set_shared_policy(80);
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT(vacrel.shared_freeze_cohort_observed);
+	UT_ASSERT(vacrel.shared_freeze_input.freeze_policy == &vacrel.cutoffs.SharedFreezePolicySample);
+	UT_ASSERT(vacrel.shared_freeze_input.freeze_cohort == &vacrel.shared_freeze_cohort);
+	UT_ASSERT_EQ(vacrel.shared_freeze_input.freeze_cohort->source_local_history.sample_clock_scn, 700);
+	UT_ASSERT_EQ(vacrel.shared_freeze_input.freeze_cohort->source_local_history.contributor_kind,
+		CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+	UT_ASSERT_EQ(vacrel.shared_freeze_input.freeze_cohort->source_local_history.contributor_token, 11);
+	UT_ASSERT_EQ(vacrel.shared_freeze_input.freeze_cohort->source_peer_history[1].sample_clock_scn, 800);
+	UT_ASSERT_EQ(vacrel.shared_freeze_input.freeze_cohort->source_peer_history[1].contributor_kind,
+		CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_PREPARED);
+	UT_ASSERT_EQ(vacrel.shared_freeze_input.freeze_cohort->source_peer_history[1].contributor_token, 17);
+	UT_ASSERT_EQ(cohort_calls, 1);
+	UT_ASSERT_EQ(debt, 0); UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+}
+
+UT_TEST(refused_collection_retires_previous_bound_source_borrows)
+{
+	for (int early = 0; early < 2; early++) {
+		reset_fixture(); set_shared_policy(80);
+		vacrel.shared_freeze_input.freeze_policy = &vacrel.cutoffs.SharedFreezePolicySample;
+		vacrel.shared_freeze_input.freeze_cohort = &vacrel.shared_freeze_cohort;
+		if (early) vacrel.shared_freeze_batch.carrier_request_count = 0;
+		else target_admission_current = false;
+		(void)lazy_collect_shared_freeze_proofs(&vacrel, 1);
+		UT_ASSERT(vacrel.shared_freeze_input.freeze_policy == NULL);
+		UT_ASSERT(vacrel.shared_freeze_input.freeze_cohort == NULL);
+		UT_ASSERT_EQ(debt, 0);
+	}
+}
+
+UT_TEST(native_window_candidate_subset_keeps_physical_order)
+{
+	uint64 next;
+	const uint64 distances[] = {UINT64CONST(0x80000001), UINT64CONST(0x7fffffff),
+		UINT64CONST(0x80000000), 923};
+
+	reset_fixture(); set_shared_policy(80);
+	next = U64FromFullTransactionId(vacrel.cutoffs.SharedFreezePolicySample.legal_next);
+	use_candidate_value = true;
+	candidate_value.target_count = lengthof(distances);
+	vacrel.shared_freeze_batch.tuple_count = lengthof(distances);
+	for (unsigned i = 0; i < lengthof(distances); i++) {
+		candidate_value.targets[i].tuple_index = i;
+		candidate_value.targets[i].original_creator_full_xid =
+			FullTransactionIdFromU64(next - distances[i]);
+	}
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.target_count, 2);
+	UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.targets[0].tuple_index, 1);
+	UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.targets[1].tuple_index, 3);
+	UT_ASSERT(FullTransactionIdEquals(vacrel.shared_freeze_xmin_candidates.targets[0].original_creator_full_xid,
+		candidate_value.targets[1].original_creator_full_xid));
+	UT_ASSERT(FullTransactionIdEquals(vacrel.shared_freeze_xmin_candidates.targets[1].original_creator_full_xid,
+		candidate_value.targets[3].original_creator_full_xid));
+	UT_ASSERT_EQ(candidate_selections, 1);
+	UT_ASSERT(vacrel.shared_freeze_cohort_observed && vacrel.shared_freeze_fence_valid);
+	UT_ASSERT_EQ(debt, 0); UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+}
+
+UT_TEST(native_window_empty_subset_keeps_other_proof_observations)
+{
+	reset_fixture(); set_shared_policy(80);
+	use_candidate_value = true;
+	candidate_value.target_count = 1;
+	candidate_value.targets[0].tuple_index = 0;
+	candidate_value.targets[0].original_creator_full_xid = FullTransactionIdFromU64(
+		U64FromFullTransactionId(vacrel.cutoffs.SharedFreezePolicySample.legal_next)
+		- UINT64CONST(0x80000000));
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.target_count, 0);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proofs.proof_count, 1);
+	UT_ASSERT_EQ(vacrel.shared_freeze_aborted_xmax_candidates.target_count, 1);
+	UT_ASSERT(vacrel.shared_freeze_cohort_observed && vacrel.shared_freeze_fence_valid);
+	UT_ASSERT_EQ(debt, 0); UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+}
+
+UT_TEST(observed_cutoff_outside_native_window_keeps_proofs_without_candidates)
+{
+	for (unsigned variant = 0; variant < 3; variant++) {
+		uint64 legal;
+		reset_fixture(); set_shared_policy(80);
+		legal = U64FromFullTransactionId(vacrel.cutoffs.SharedFreezePolicySample.legal_next);
+		cohort_value.active_full_xid_min = legal - UINT64CONST(0x80000000) - variant;
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT(!vacrel.shared_freeze_cohort_observed);
+		UT_ASSERT(!FullTransactionIdIsValid(vacrel.shared_freeze_candidate_limit_full));
+		UT_ASSERT(vacrel.shared_freeze_input.freeze_policy == NULL);
+		UT_ASSERT(vacrel.shared_freeze_input.freeze_cohort == NULL);
+		UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.target_count, 0);
+		UT_ASSERT_EQ(vacrel.shared_freeze_proofs.proof_count, 1);
+		UT_ASSERT(vacrel.shared_freeze_fence_valid);
+		UT_ASSERT_EQ(debt, 0); UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+	}
+}
+
+UT_TEST(native_window_subset_uses_original_legal_next_not_freeze_limit)
+{
+	reset_fixture(); set_shared_policy(80);
+	vacrel.cutoffs.SharedFreezePolicySample.legal_next = FullTransactionIdFromU64(
+		U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 77))
+		+ UINT64CONST(0x7fffffff));
+	/* Keep the selected cutoff inside this original N_legal window; only
+	 * the second creator falls outside it. */
+	cohort_value.active_full_xid_min = U64FromFullTransactionId(
+		FullTransactionIdFromEpochAndXid(1, 79));
+	use_candidate_value = true;
+	candidate_value.target_count = 2;
+	vacrel.shared_freeze_batch.tuple_count = 2;
+	for (unsigned i = 0; i < 2; i++) {
+		candidate_value.targets[i].tuple_index = i;
+		candidate_value.targets[i].original_creator_full_xid = FullTransactionIdFromEpochAndXid(1, 77 - i);
+	}
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.target_count, 1);
+	UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.targets[0].tuple_index, 0);
+	UT_ASSERT(FullTransactionIdEquals(vacrel.shared_freeze_xmin_candidates.targets[0].original_creator_full_xid,
+		candidate_value.targets[0].original_creator_full_xid));
+	UT_ASSERT_EQ(debt, 0); UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+}
+
 int
 main(void)
 {
-	UT_PLAN(118);
+	UT_PLAN(124);
+	UT_RUN(native_window_candidate_subset_keeps_physical_order);
+	UT_RUN(native_window_empty_subset_keeps_other_proof_observations);
+	UT_RUN(observed_cutoff_outside_native_window_keeps_proofs_without_candidates);
+	UT_RUN(native_window_subset_uses_original_legal_next_not_freeze_limit);
+	UT_RUN(bound_sources_borrow_original_owned_policy_and_cohort);
+	UT_RUN(refused_collection_retires_previous_bound_source_borrows);
 	UT_RUN(partial_xmin_candidate_keeps_page_unproven_after_original_release);
 	UT_RUN(partial_xmin_candidates_require_successful_resident_and_pcm_recheck);
 	UT_RUN(partial_xmin_candidates_keep_original_target_and_source_revocation);

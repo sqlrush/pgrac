@@ -309,3 +309,223 @@ UT_TEST(test_census_restart_interrupted_new_cursor_destroys_only_local_storage)
 		census_cold_consume_cleanup(&f);
 	}
 }
+
+static ClusterRelmapCensusResult
+census_restart_drain(ClusterRelmapRetentionCensus *census)
+{
+	ClusterRelmapCensusResult result = CLUSTER_RELMAP_CENSUS_MORE;
+
+	for (unsigned i = 0; i < 20000 && result == CLUSTER_RELMAP_CENSUS_MORE; i++)
+		result = cluster_relmap_retention_census_next(census);
+	return result;
+}
+
+UT_TEST(test_census_restart_original_source_is_required_after_publication)
+{
+	for (unsigned prepared = 0; prepared < 2; prepared++)
+		for (unsigned fault = 0; fault < (prepared ? 5 : 8); fault++) {
+			CensusFixture f;
+			ClusterRelmapRetentionCensus *fresh = NULL;
+			ClusterRelmapRetentionDirectory saved[2];
+			ClusterRelmapRecoverySourceObservationV1 source;
+			ClusterRelmapCensusRecovery input = { 0 };
+			if (census_restart_ready(&f, 5)) {
+				memcpy(saved, f.origin, sizeof(saved));
+				source = census_cold_selected;
+				UT_ASSERT(cluster_relmap_retention_census_restart_cold(f.census, 1024 * 1024,
+																	   CENSUS_BUDGET, &fresh));
+				if (prepared)
+					UT_ASSERT_EQ(census_restart_drain(fresh), CLUSTER_RELMAP_CENSUS_DRAINED);
+				if (fault == 0)
+					census_cold_selected.scope_serial++;
+				if (fault == 1)
+					census_cold_selected.checkpoint.root_publish_seq++;
+				if (fault == 2)
+					census_cold_selected.native_redo++;
+				if (fault == 3)
+					census_cold_selected.source.claim.identity.storage_uuid[0] ^= 1;
+				if (fault == 4)
+					census_native_scope_current = false;
+				if (fault == 5)
+					cluster_shared_catalog = false;
+				if (fault == 6)
+					census_merger_held = false;
+				if (fault == 7)
+					census_namespace_x = false;
+				if (prepared) {
+					unsigned before = census_native_prepares;
+					UT_ASSERT(!cluster_relmap_retention_census_recovery_prepare_cold(
+						fresh, InvalidOid, &input));
+					UT_ASSERT(census_recovery_zero(&input));
+					UT_ASSERT_EQ(census_native_prepares, before);
+				} else
+					UT_ASSERT_EQ(census_restart_drain(fresh), CLUSTER_RELMAP_CENSUS_CHANGED);
+				census_cold_selected = source;
+				census_native_scope_current = true;
+				cluster_shared_catalog = census_merger_held = census_namespace_x = true;
+				UT_ASSERT_EQ(cluster_relmap_retention_census_next(fresh),
+							 prepared ? CLUSTER_RELMAP_CENSUS_UNAVAILABLE
+									  : CLUSTER_RELMAP_CENSUS_CHANGED);
+				UT_ASSERT_EQ(memcmp(saved, f.origin, sizeof(saved)), 0);
+				if (input.handle != NULL)
+					cluster_relmap_recovery_handle_release_v1(&input.handle);
+			}
+			cluster_relmap_retention_census_destroy(fresh);
+			census_cold_consume_cleanup(&f);
+		}
+}
+
+UT_TEST(test_census_restart_original_pin_and_metadata_checks_continue_until_native)
+{
+	for (unsigned prepared = 0; prepared < 2; prepared++)
+		for (unsigned fault = 0; fault < 9; fault++) {
+			CensusFixture f;
+			ClusterRelmapRetentionCensus *fresh = NULL;
+			ClusterRelmapRetentionDirectory saved[2];
+			ClusterRelmapCensusRecovery input = { 0 };
+			if (census_restart_ready(&f, 5)) {
+				UT_ASSERT(cluster_relmap_retention_census_restart_cold(f.census, 1024 * 1024,
+																	   CENSUS_BUDGET, &fresh));
+				if (prepared)
+					UT_ASSERT_EQ(census_restart_drain(fresh), CLUSTER_RELMAP_CENSUS_DRAINED);
+				if (fault == 0)
+					f.origin[0].pins[0].wal_end++;
+				if (fault == 1)
+					f.origin[0].pins[CLUSTER_RELMAP_RETENTION_CAPACITY - 1].wal_end++;
+				if (fault == 2)
+					f.origin[0].generation++;
+				if (fault == 3)
+					f.origin[0].native_floor++;
+				if (fault == 4)
+					f.origin[0].last_issued++;
+				if (fault == 5)
+					f.origin[0].state = CLUSTER_RELMAP_RETENTION_BUILDING;
+				if (fault == 6)
+					f.origin[0].system_identifier++;
+				if (fault == 7)
+					f.origin[0].database_incarnation++;
+				if (fault == 8)
+					f.origin[0].origin++;
+				memcpy(saved, f.origin, sizeof(saved));
+				if (prepared) {
+					unsigned before = census_native_prepares;
+					UT_ASSERT(!cluster_relmap_retention_census_recovery_prepare_cold(
+						fresh, InvalidOid, &input));
+					UT_ASSERT(census_recovery_zero(&input));
+					UT_ASSERT_EQ(census_native_prepares, before);
+				} else
+					UT_ASSERT_EQ(census_restart_drain(fresh), CLUSTER_RELMAP_CENSUS_CHANGED);
+				UT_ASSERT_EQ(cluster_relmap_retention_census_next(fresh),
+							 prepared ? CLUSTER_RELMAP_CENSUS_UNAVAILABLE
+									  : CLUSTER_RELMAP_CENSUS_CHANGED);
+				/* Even a changed original pin/metadata byte is never repaired,
+				 * released or rewritten by the new observation's refusal. */
+				UT_ASSERT_EQ(memcmp(saved, f.origin, sizeof(saved)), 0);
+				if (input.handle != NULL)
+					cluster_relmap_recovery_handle_release_v1(&input.handle);
+			}
+			cluster_relmap_retention_census_destroy(fresh);
+			census_cold_consume_cleanup(&f);
+		}
+}
+
+UT_TEST(test_census_restart_later_source_error_revokes_only_new_observation)
+{
+	for (unsigned prepared = 0; prepared < 2; prepared++) {
+		CensusFixture f;
+		ClusterRelmapRetentionCensus *fresh = NULL;
+		ClusterRelmapRetentionDirectory saved[2];
+		ClusterRelmapCensusRecovery input = { 0 };
+		volatile bool caught = false;
+		if (census_restart_ready(&f, 5)) {
+			memcpy(saved, f.origin, sizeof(saved));
+			UT_ASSERT(cluster_relmap_retention_census_restart_cold(f.census, 1024 * 1024,
+																   CENSUS_BUDGET, &fresh));
+			if (prepared)
+				UT_ASSERT_EQ(census_restart_drain(fresh), CLUSTER_RELMAP_CENSUS_DRAINED);
+			census_cold_fault = 8;
+			PG_TRY();
+			{
+				if (prepared)
+					(void)cluster_relmap_retention_census_recovery_prepare_cold(fresh, InvalidOid,
+																				&input);
+				else
+					(void)census_restart_drain(fresh);
+			}
+			PG_CATCH();
+			{
+				caught = true;
+			}
+			PG_END_TRY();
+			UT_ASSERT(caught && census_recovery_zero(&input));
+			census_cold_fault = 0;
+			UT_ASSERT_EQ(cluster_relmap_retention_census_next(fresh),
+						 prepared ? CLUSTER_RELMAP_CENSUS_UNAVAILABLE
+								  : CLUSTER_RELMAP_CENSUS_CHANGED);
+			UT_ASSERT_EQ(memcmp(saved, f.origin, sizeof(saved)), 0);
+			UT_ASSERT(fcntl(f.fd, F_GETFD) >= 0);
+		}
+		cluster_relmap_retention_census_destroy(fresh);
+		census_cold_consume_cleanup(&f);
+	}
+}
+
+UT_TEST(test_census_repeated_restart_keeps_earliest_original_protection)
+{
+	for (unsigned changed = 0; changed < 2; changed++) {
+		CensusFixture f;
+		ClusterRelmapRetentionCensus *first = NULL, *second = NULL;
+		ClusterRelmapRetentionDirectory saved[2];
+		if (census_restart_ready(&f, 5)) {
+			UT_ASSERT(cluster_relmap_retention_census_restart_cold(f.census, 1024 * 1024,
+																   CENSUS_BUDGET, &first));
+			UT_ASSERT_EQ(census_restart_drain(first), CLUSTER_RELMAP_CENSUS_DRAINED);
+			UT_ASSERT_EQ(cluster_relmap_retention_census_recovery_arbitrate_cold(first, InvalidOid),
+						 CLUSTER_RELMAP_V2_CLEARED_POSTREAD);
+			UT_ASSERT(cluster_relmap_retention_census_restart_cold(first, 1024 * 1024,
+																   CENSUS_BUDGET, &second));
+			if (changed)
+				f.origin[0].pins[CLUSTER_RELMAP_RETENTION_CAPACITY - 1].wal_end++;
+			memcpy(saved, f.origin, sizeof(saved));
+			UT_ASSERT_EQ(census_restart_drain(second),
+						 changed ? CLUSTER_RELMAP_CENSUS_CHANGED : CLUSTER_RELMAP_CENSUS_DRAINED);
+			UT_ASSERT_EQ(memcmp(saved, f.origin, sizeof(saved)), 0);
+			UT_ASSERT(census_pin(&f.origin[0], 5) != NULL);
+			UT_ASSERT(fcntl(f.fd, F_GETFD) >= 0);
+		}
+		cluster_relmap_retention_census_destroy(second);
+		cluster_relmap_retention_census_destroy(first);
+		census_cold_consume_cleanup(&f);
+	}
+}
+
+static void
+census_restart_ancestor_after_arbitration(void)
+{
+	census_cold_clear_pair_bytes();
+	census_native_fixture->origin[0].pins[CLUSTER_RELMAP_RETENTION_CAPACITY - 1].wal_end++;
+}
+
+UT_TEST(test_census_restart_native_return_checks_original_ancestor_pins)
+{
+	CensusFixture f;
+	ClusterRelmapRetentionCensus *fresh = NULL, *again = (void *)1;
+	ClusterRelmapRetentionDirectory saved[2];
+	if (census_restart_ready(&f, 5)) {
+		UT_ASSERT(cluster_relmap_retention_census_restart_cold(f.census, 1024 * 1024, CENSUS_BUDGET,
+															   &fresh));
+		UT_ASSERT_EQ(census_restart_drain(fresh), CLUSTER_RELMAP_CENSUS_DRAINED);
+		memcpy(saved, f.origin, sizeof(saved));
+		census_native_after_arbitration = census_restart_ancestor_after_arbitration;
+		UT_ASSERT_EQ(cluster_relmap_retention_census_recovery_arbitrate_cold(fresh, InvalidOid),
+					 CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+		saved[0].pins[CLUSTER_RELMAP_RETENTION_CAPACITY - 1].wal_end++;
+		UT_ASSERT_EQ(memcmp(saved, f.origin, sizeof(saved)), 0);
+		UT_ASSERT_EQ(cluster_relmap_retention_census_next(fresh), CLUSTER_RELMAP_CENSUS_CHANGED);
+		UT_ASSERT(!cluster_relmap_retention_census_restart_cold(fresh, 1024 * 1024, CENSUS_BUDGET,
+																&again));
+		UT_ASSERT(again == NULL);
+	}
+	cluster_relmap_retention_census_destroy(fresh);
+	census_cold_consume_cleanup(&f);
+}

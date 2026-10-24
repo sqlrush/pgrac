@@ -297,6 +297,10 @@ extern bool cluster_sf_peer_pcm_x_capability_sample(int32 peer_id, bool *rebase_
 /* One locked record, including its invalid/not-yet-learned state. False is
  * absent storage/invalid arguments, not a coherent capability mismatch. */
 extern bool cluster_sf_peer_capability_record_snapshot(int32 peer_id, ClusterSfPeerCap *out);
+/* Diagnostic owned table copy. Capacity must equal CLUSTER_MAX_NODES; never
+ * waits for the native store lock. False clears only bounded caller storage. */
+extern bool cluster_sf_peer_capability_table_try_snapshot(ClusterSfPeerCap *out,
+	uint32 capacity, bool *busy);
 extern bool cluster_sf_peer_pcm_x_connection_generation(int32 peer_id, uint32 *generation);
 extern void cluster_sf_note_peer_disconnected_gen(int32 peer_id, uint32 generation);
 extern void cluster_sf_note_peer_disconnected(int32 peer_id);

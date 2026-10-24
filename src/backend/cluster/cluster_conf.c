@@ -208,6 +208,35 @@ cluster_conf_lookup_node(int32 node_id)
 	return cluster_conf_lookup_cache[node_id];
 }
 
+bool
+cluster_conf_declared_nodes_observe(ClusterConfDeclaredNodes *out)
+{
+	ClusterConf *conf = ClusterConfShmem;
+	int32 count;
+	uint32 generation = cluster_conf_lookup_cache_generation;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (conf == NULL || cluster_conf_lookup_cache_conf != conf)
+		return false;
+	count = conf->node_count;
+	if (count < 0 || count > CLUSTER_MAX_NODES || cluster_conf_lookup_cache_count != count)
+		return false;
+	for (int32 id = 0; id < CLUSTER_MAX_NODES; id++)
+		if (cluster_conf_lookup_cache[id] != NULL)
+			out->nodes[out->count++] = id;
+	pg_read_barrier();
+	if (ClusterConfShmem != conf || conf->node_count != count ||
+		cluster_conf_lookup_cache_conf != conf || cluster_conf_lookup_cache_count != count ||
+		cluster_conf_lookup_cache_generation != generation) {
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
+	out->known = true;
+	return true;
+}
+
 static void
 cluster_conf_lookup_cache_rebuild(void)
 {

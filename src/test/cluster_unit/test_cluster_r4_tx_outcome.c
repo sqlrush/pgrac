@@ -47,6 +47,7 @@
 #include "cluster/cluster_cr_server.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
+#include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/snapmgr.h"
 
@@ -55,6 +56,37 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+bool cluster_trace_normal_stop = false;
+volatile uint32 CritSectionCount;
+PGPROC *MyProc;
+
+/* This fixture exercises the original producer with diagnostics disabled. */
+void
+ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *) pg_attribute_unused(),
+					void *context pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_ctrc_receipt_observe_shared(const ClusterCtrcReceiptHandle *handle pg_attribute_unused(),
+								  ClusterCtrcReceiptObservation *out pg_attribute_unused())
+{
+	abort();
+}
+
+ClusterCtrcPrepareResult
+cluster_ctrc_receipt_prepare_shared_observed(const ClusterCtrcTxnKeyV1 *key pg_attribute_unused(),
+	const ClusterCtrcParticipantIdentity *identity pg_attribute_unused(),
+	uint32 grant_generation pg_attribute_unused(),
+	const ClusterCtrcPublicationIdV1 *publication pg_attribute_unused(),
+	const ClusterCtrcTargetV1 *target pg_attribute_unused(),
+	ClusterCtrcReceiptHandle *handle pg_attribute_unused(),
+	ClusterCtrcPreparePath *path_out pg_attribute_unused())
+{
+	abort();
+}
 
 #include "test_cluster_current_mx_local_sample.inc"
 
@@ -866,8 +898,39 @@ cluster_tt_local_get_published_binding(TransactionId xid, ClusterCanonicalTxnBin
 	return true;
 }
 
-/* Shared lookup/locking is a leaf here; the exact engine accessor is tested
- * by test_cluster_terminal_ref_census. Never synthesize an epoch on a miss. */
+/* Controlled retained-slot source; canonical resolver bodies remain real. */
+static bool g_retained_origin_available;
+static FullTransactionId g_retained_origin_full;
+static int g_retained_origin_reads;
+static int g_retained_origin_drift;
+static ClusterCtrcTxnKeyV1 g_retained_origin_key;
+
+bool
+cluster_tt_slot_origin_identity_read(const ClusterCtrcTxnKeyV1 *key, FullTransactionId *out)
+{
+	g_retained_origin_reads++;
+	if (key != NULL)
+		g_retained_origin_key = *key;
+	if (out == NULL)
+		return false;
+	*out = InvalidFullTransactionId;
+	if (!g_retained_origin_available || key == NULL
+		|| memcmp(key, &test_original_key, sizeof(*key)) != 0)
+		return false;
+	UT_ASSERT_EQ(test_candidate_held_count, 1);
+	if (g_retained_origin_drift == 1)
+		test_candidate_tt_generation = ++test_candidate_data_generation;
+	else if (g_retained_origin_drift == 2)
+		test_candidate_root_drift = true;
+	else if (g_retained_origin_drift == 3)
+		test_admission_revoked = true;
+	else if (g_retained_origin_drift == 4)
+		test_boot_incarnation++;
+	*out = g_retained_origin_full;
+	return true;
+}
+
+/* Shared source/locking is a leaf; its real engine has separate coverage. */
 bool
 cluster_ctrc_origin_original_full_xid_shared(const ClusterCtrcTxnKeyV1 *key,
 	FullTransactionId *out)
@@ -1299,6 +1362,11 @@ reset_exact_origin_fixture(void)
 	memset(&test_original_key, 0, sizeof(test_original_key));
 	test_original_calls = 0;
 	test_original_drift = 0;
+	g_retained_origin_available = false;
+	g_retained_origin_full = InvalidFullTransactionId;
+	g_retained_origin_reads = 0;
+	g_retained_origin_drift = 0;
+	memset(&g_retained_origin_key, 0, sizeof(g_retained_origin_key));
 	test_candidate_copy_generation_drift = false;
 	test_candidate_root_drift = false;
 	test_tt_segment_seen = 0;
@@ -7253,6 +7321,7 @@ UT_TEST(test_original_full_xid_reaches_same_and_cross_segment_census_result)
 			test_original_full_xid));
 		UT_ASSERT(resolution.local_creation_target.valid);
 		UT_ASSERT_EQ(test_original_calls, 1);
+		UT_ASSERT_EQ(g_retained_origin_reads, 0);
 		UT_ASSERT_EQ(test_candidate_max_held_count, 1);
 		UT_ASSERT_EQ(test_candidate_held_count, 0);
 		UT_ASSERT_EQ(test_candidate_acquire_calls, same ? 1 : 3);
@@ -7307,6 +7376,7 @@ UT_TEST(test_original_full_xid_not_queried_for_other_roles_or_abort)
 			variant == 0 ? CLUSTER_TX_COMMITTED : CLUSTER_TX_ABORTED);
 		UT_ASSERT(!FullTransactionIdIsValid(resolution.local_original_full_xid));
 		UT_ASSERT_EQ(test_original_calls, 0);
+		UT_ASSERT_EQ(g_retained_origin_reads, 0);
 	}
 }
 
@@ -7333,14 +7403,94 @@ UT_TEST(test_original_full_xid_does_not_escape_final_fence_drift)
 	}
 }
 
+UT_TEST(test_retired_origin_uses_retained_slot_identity_without_extra_acquisition)
+{
+	for (int same = 0; same < 2; same++) {
+		ClusterTxResolution resolution;
+
+		setup_original_full_xid(same);
+		test_original_available = false;
+		g_retained_origin_available = true;
+		g_retained_origin_full = test_original_full_xid;
+		UT_ASSERT_EQ(resolve_original_full_xid(CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+			&resolution), CLUSTER_TX_COMMITTED);
+		UT_ASSERT(FullTransactionIdEquals(resolution.local_original_full_xid,
+			g_retained_origin_full));
+		UT_ASSERT_EQ(test_original_calls, 1);
+		UT_ASSERT_EQ(g_retained_origin_reads, 1);
+		UT_ASSERT_EQ(memcmp(&g_retained_origin_key, &test_original_key,
+			sizeof(test_original_key)), 0);
+		UT_ASSERT_EQ(test_candidate_max_held_count, 1);
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, same ? 1 : 3);
+		UT_ASSERT(resolution.local_creation_target.valid);
+	}
+}
+
+UT_TEST(test_retained_slot_unknown_or_mismatched_source_preserves_verdict_only)
+{
+	for (int variant = 0; variant < 8; variant++) {
+		ClusterTxResolution resolution;
+
+		setup_original_full_xid(false);
+		test_original_available = false;
+		g_retained_origin_available = true;
+		g_retained_origin_full = test_original_full_xid;
+		switch (variant) {
+		case 0: g_retained_origin_available = false; break;
+		case 1: g_retained_origin_full = InvalidFullTransactionId; break;
+		case 2: g_retained_origin_full = FullTransactionIdFromEpochAndXid(9, FrozenTransactionId); break;
+		case 3: g_retained_origin_full = FullTransactionIdFromEpochAndXid(9, TEST_ORIGIN_XID+1); break;
+		case 4: test_original_key.root_generation++; break;
+		case 5: test_original_key.segment_generation++; break;
+		case 6: test_original_key.origin_boot_incarnation++; break;
+		case 7: test_original_key.admission_record_generation++; break;
+		}
+		UT_ASSERT_EQ(resolve_original_full_xid(CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+			&resolution), CLUSTER_TX_COMMITTED);
+		UT_ASSERT(!FullTransactionIdIsValid(resolution.local_original_full_xid));
+		UT_ASSERT_EQ(test_original_calls, 1);
+		UT_ASSERT_EQ(g_retained_origin_reads, 1);
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+	}
+}
+
+UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
+{
+	for (int same = 0; same < 2; same++) {
+		for (int drift = 1; drift <= 4; drift++) {
+			ClusterTxResolution resolution;
+			ClusterTxOutcome outcome;
+
+			setup_original_full_xid(same);
+			test_original_available = false;
+			g_retained_origin_available = true;
+			g_retained_origin_full = test_original_full_xid;
+			if (drift == 2)
+				test_regular_root_resolve_calls = 2;
+			g_retained_origin_drift = drift;
+			outcome = resolve_original_full_xid(CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+				&resolution);
+			UT_ASSERT_EQ(outcome, drift == 4 ? CLUSTER_TX_COMMITTED : CLUSTER_TX_UNKNOWN);
+			UT_ASSERT(!FullTransactionIdIsValid(resolution.local_original_full_xid));
+			UT_ASSERT_EQ(test_original_calls, 1);
+			UT_ASSERT_EQ(g_retained_origin_reads, 1);
+			UT_ASSERT_EQ(test_candidate_held_count, 0);
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(203);
+	UT_PLAN(206);
 	UT_RUN(test_original_full_xid_reaches_same_and_cross_segment_census_result);
 	UT_RUN(test_original_full_xid_missing_or_key_alias_keeps_verdict_without_identity);
 	UT_RUN(test_original_full_xid_not_queried_for_other_roles_or_abort);
 	UT_RUN(test_original_full_xid_does_not_escape_final_fence_drift);
+	UT_RUN(test_retired_origin_uses_retained_slot_identity_without_extra_acquisition);
+	UT_RUN(test_retained_slot_unknown_or_mismatched_source_preserves_verdict_only);
+	UT_RUN(test_retained_slot_identity_does_not_escape_original_final_fences);
 	UT_RUN(test_retained_active_identity_reaches_real_undo_pending);
 	UT_RUN(test_retained_undo_pending_requires_matching_active_tt_receipt);
 	UT_RUN(test_retained_undo_pending_guard_drift_cannot_publish);

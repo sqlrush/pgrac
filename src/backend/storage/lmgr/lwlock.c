@@ -821,6 +821,10 @@ LWLockInitialize(LWLock *lock, int tranche_id)
 static inline void
 LWLockReportWaitStart(LWLock *lock)
 {
+#ifdef USE_PGRAC_CLUSTER
+	if (MyProc != NULL)
+		cluster_content_trace_native_wait_set(lock, MyProc->lwWaitMode);
+#endif
 	pgstat_report_wait_start(PG_WAIT_LWLOCK | lock->tranche);
 }
 
@@ -830,6 +834,9 @@ LWLockReportWaitStart(LWLock *lock)
 static inline void
 LWLockReportWaitEnd(void)
 {
+#ifdef USE_PGRAC_CLUSTER
+	cluster_content_trace_native_wait_clear();
+#endif
 	pgstat_report_wait_end();
 }
 
@@ -1867,6 +1874,9 @@ LWLockRelease(LWLock *lock)
 
 	mode = held_lwlocks[i].mode;
 
+#ifdef USE_PGRAC_CLUSTER
+	cluster_content_trace_lock_invalidating(lock);
+#endif
 	num_held_lwlocks--;
 	for (; i < num_held_lwlocks; i++)
 		held_lwlocks[i] = held_lwlocks[i + 1];
