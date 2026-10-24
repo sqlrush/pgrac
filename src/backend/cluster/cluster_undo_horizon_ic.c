@@ -552,7 +552,7 @@ undo_horizon_sample_local_report(ClusterUndoRetentionSample *out)
 		SCN bound = cluster_mrp_standby_consistent_scn();
 		int cmp;
 
-		if (bound == InvalidScn)
+		if (bound == InvalidScn || bound == CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED)
 			return false;
 		cmp = scn_time_cmp(bound, sample.horizon_scn);
 		if (cmp < 0)
