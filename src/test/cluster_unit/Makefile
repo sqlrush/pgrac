@@ -583,6 +583,7 @@ test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
 		test_cluster_relmap_census_cold_restart.inc \
 		test_cluster_relmap_census_execution_batch.inc \
 		test_cluster_relmap_census_cold_initial.inc \
+		test_cluster_relmap_census_execute.inc \
 		test_cluster_recovery_root_reobserve.inc \
 		test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c \
 		test_cluster_recovery_crypto_boundary.h unit_test.h \

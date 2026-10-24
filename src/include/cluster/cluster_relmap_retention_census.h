@@ -90,6 +90,30 @@ extern bool cluster_relmap_retention_census_open_cold(uint16 origin, size_t root
 													  size_t memory_budget, size_t payload_budget,
 													  ClusterRelmapRetentionCensus **out);
 
+/* One dormant original-owner operation: open and drain the complete initial
+ * census, prepare/consume all pending once, then restart and drain once after
+ * all CLEAR. Require no remaining pending before publishing a DRAINED cursor;
+ * an initially clean census makes no native attempt. UNKNOWN/ERROR never
+ * retries or replaces the original scope. All original complete-single-origin,
+ * isolation/native/SIDE/base/era/history/lifetime qualifications above remain
+ * caller preconditions; no live caller or COMPLETE/release authority follows.
+ *
+ * Fresh NULL exclusive output is unchanged on false/ERROR. Clean up every
+ * intermediate local handle/cursor/ROOT/fd on every exit. Success owns its
+ * internal predecessor chain: one destroy releases local descendant storage
+ * before predecessor ROOT and its tracked fd, never original scope/pins/debt.
+ * Keep original owner/protections alive until destroy. Ordinary restart still
+ * borrows its predecessor. Returned cursor/sets remain provisional BUILDING.
+ *
+ * Each ROOT receives half root_budget. memory_budget bounds both fixed
+ * cursor/directory allocations or original fixed storage plus batch, whichever
+ * is larger. Native handle allocations remain separate; payload_budget applies
+ * to each original WAL target decode. All work is synchronous. */
+extern bool cluster_relmap_retention_census_execute_cold(uint16 origin, size_t root_budget,
+														 size_t memory_budget,
+														 size_t payload_budget,
+														 ClusterRelmapRetentionCensus **out);
+
 /* At most128 metadata candidates, one <=BLCKSZ original file read, or one
  * existing whole-ROOT recheck step. Require global/base and both exact v2
  * copies for global and every canonical physical base/db directory, including

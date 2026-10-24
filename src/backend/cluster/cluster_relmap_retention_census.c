@@ -68,6 +68,7 @@ struct ClusterRelmapRetentionCensus {
 	ClusterRelmapRecoverySourceObservationV1 cold_input_source;
 	/* Borrowed original protection; dependents are destroyed first. */
 	const ClusterRelmapRetentionCensus *cold_parent;
+	bool owns_cold_parent; /* Only the one-shot executor adopts its local input. */
 };
 
 typedef struct CensusRecoveryItem {
@@ -1754,18 +1755,110 @@ cluster_relmap_retention_census_rebuild_pending_side_wal(ClusterRelmapRetentionC
 		sources, source_count);
 }
 
+static bool
+census_execute_drain(ClusterRelmapRetentionCensus *census)
+{
+	ClusterRelmapCensusResult result;
+
+	do {
+		CHECK_FOR_INTERRUPTS();
+		result = cluster_relmap_retention_census_next(census);
+	} while (result == CLUSTER_RELMAP_CENSUS_MORE);
+	return result == CLUSTER_RELMAP_CENSUS_DRAINED && census_recovery_current(census);
+}
+
+static bool
+census_execute_pending(const ClusterRelmapRetentionCensus *census)
+{
+	for (size_t o = 0; o < census->origin_count; o++) {
+		const ClusterRelmapRetentionDirectory *directory
+			= census->origins[census->nodes[o]].directory;
+
+		for (size_t i = 0; i < lengthof(directory->pins); i++)
+			if (directory->pins[i].occupied)
+				return true;
+	}
+	return false;
+}
+
+bool
+cluster_relmap_retention_census_execute_cold(uint16 origin, size_t root_budget,
+											 size_t memory_budget, size_t payload_budget,
+											 ClusterRelmapRetentionCensus **out)
+{
+	const size_t fixed
+		= sizeof(ClusterRelmapRetentionCensus) + sizeof(ClusterRelmapRetentionDirectory);
+	ClusterRelmapRetentionCensus *volatile original = NULL, *volatile fresh = NULL;
+	ClusterRelmapCensusRecoveryBatch *volatile batch = NULL;
+	volatile bool accepted = false;
+
+	if (out == NULL || *out != NULL || memory_budget / 2 < fixed || root_budget / 2 == 0
+		|| !census_open_context())
+		return false;
+	PG_TRY();
+	{
+		do {
+			if (!cluster_relmap_retention_census_open_cold(
+					origin, root_budget / 2, fixed, payload_budget,
+					(ClusterRelmapRetentionCensus **)&original)
+				|| !census_execute_drain((ClusterRelmapRetentionCensus *)original))
+				break;
+			if (!census_execute_pending((ClusterRelmapRetentionCensus *)original)) {
+				*out = (ClusterRelmapRetentionCensus *)original;
+				original = NULL;
+				accepted = true;
+				break;
+			}
+			if (!cluster_relmap_retention_census_recovery_prepare_all_cold(
+					(ClusterRelmapRetentionCensus *)original, memory_budget - fixed,
+					(ClusterRelmapCensusRecoveryBatch **)&batch)
+				|| cluster_relmap_retention_census_recovery_arbitrate_all_cold(
+					   (ClusterRelmapCensusRecoveryBatch **)&batch)
+					   != CLUSTER_RELMAP_V2_CLEARED_POSTREAD
+				|| !cluster_relmap_retention_census_restart_cold(
+					(ClusterRelmapRetentionCensus *)original, root_budget / 2,
+					memory_budget - fixed, (ClusterRelmapRetentionCensus **)&fresh)
+				|| !census_execute_drain((ClusterRelmapRetentionCensus *)fresh)
+				|| census_execute_pending((ClusterRelmapRetentionCensus *)fresh))
+				break;
+			/* Ordinary restart borrows its parent. This original is local to
+			 * this call, so transfer it only after the final complete scan. */
+			fresh->owns_cold_parent = true;
+			original = NULL;
+			*out = (ClusterRelmapRetentionCensus *)fresh;
+			fresh = NULL;
+			accepted = true;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		cluster_relmap_retention_census_recovery_batch_release(
+			(ClusterRelmapCensusRecoveryBatch **)&batch);
+		cluster_relmap_retention_census_destroy((ClusterRelmapRetentionCensus *)fresh);
+		cluster_relmap_retention_census_destroy((ClusterRelmapRetentionCensus *)original);
+	}
+	PG_END_TRY();
+	return accepted;
+}
+
 void
 cluster_relmap_retention_census_destroy(ClusterRelmapRetentionCensus *census)
 {
-	if (census != NULL && census->result == CLUSTER_RELMAP_CENSUS_MORE)
-		census_failed(census, CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
-	if (census != NULL && census->owned_directory != NULL) {
-		if (census->owns_roots)
-			cluster_recovery_root_set_destroy(census->roots);
-		if (census->owned_root_fd >= 0)
-			(void)CloseTransientFile(census->owned_root_fd);
-		free(census->owned_directory);
+	while (census != NULL) {
+		ClusterRelmapRetentionCensus *parent
+			= census->owns_cold_parent ? (ClusterRelmapRetentionCensus *)census->cold_parent : NULL;
+
+		if (census->result == CLUSTER_RELMAP_CENSUS_MORE)
+			census_failed(census, CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+		if (census->owned_directory != NULL) {
+			if (census->owns_roots)
+				cluster_recovery_root_set_destroy(census->roots);
+			if (census->owned_root_fd >= 0)
+				(void)CloseTransientFile(census->owned_root_fd);
+			free(census->owned_directory);
+		}
+		free(census);
+		census = parent;
 	}
-	free(census);
 }
 #endif
