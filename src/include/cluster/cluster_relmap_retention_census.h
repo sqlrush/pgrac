@@ -11,6 +11,7 @@
 #include "cluster/cluster_relmap_recovery.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_relmap_authority.h"
 typedef struct ClusterRelmapRetentionCensus ClusterRelmapRetentionCensus;
 
 typedef enum ClusterRelmapCensusResult {
@@ -128,6 +129,22 @@ extern bool cluster_relmap_retention_census_recovery_prepare(ClusterRelmapRetent
 															 struct ClusterWalInputsV1 *inputs,
 															 Oid dbid,
 															 ClusterRelmapCensusRecovery *out);
+
+/* Dormant original-owner consumer: while holding the original sole-merger
+ * claim and namespace X, prepare the selected DRAINED namespace above, then
+ * consume its opaque handle through original v2 arbitration. No supplied
+ * outcome, map or terminal boolean is accepted. Missing locks/master switch
+ * or an unfinished scan returns UNKNOWN without consuming that scan.
+ *
+ * EVERY attempted arbitration invalidates the old census/ROOT/directories,
+ * on success, UNKNOWN and ERROR alike: target bytes may already have changed.
+ * All original pins remain. Re-observe under original recovery ownership;
+ * never adopt old maps/sets or treat false as rollback/automatic retry.
+ * CLEARED_POSTREAD is only this pair's result, not directory COMPLETE,
+ * release, global floor/issued, live activation or whole-cold completion. */
+extern ClusterRelmapV2ClearResult
+cluster_relmap_retention_census_recovery_arbitrate(ClusterRelmapRetentionCensus *census,
+												   struct ClusterWalInputsV1 *inputs, Oid dbid);
 
 /* Same single-use window and provisional structural result. When either copy
  * retains pending, validate that exact union image through the caller's held

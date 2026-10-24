@@ -603,6 +603,11 @@ test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
 
 # Keep the original census-only fixture independent of the unused SIDE join.
 test_cluster_relmap_retention_census_product.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_retention_census.c \
+		$(top_srcdir)/src/include/cluster/cluster_guc.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_merge.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_arb.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_lock.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \

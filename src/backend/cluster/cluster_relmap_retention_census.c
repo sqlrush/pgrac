@@ -9,6 +9,10 @@
 #include "common/cryptohash.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_recovery_merge.h"
+#include "cluster/cluster_relmap_arb.h"
+#include "cluster/cluster_relmap_lock.h"
 #include "cluster/cluster_wal_inputs.h"
 
 typedef struct CensusOrigin {
@@ -297,6 +301,47 @@ cluster_relmap_retention_census_recovery_prepare(ClusterRelmapRetentionCensus *c
 	}
 	PG_END_TRY();
 	return accepted;
+}
+
+ClusterRelmapV2ClearResult
+cluster_relmap_retention_census_recovery_arbitrate(ClusterRelmapRetentionCensus *census,
+												   ClusterWalInputsV1 *inputs, Oid dbid)
+{
+	ClusterRelmapCensusRecovery input = { 0 };
+	ClusterRelmapRecoveryHandle *volatile handle = NULL;
+	volatile bool attempted = false;
+	ClusterRelmapV2ClearResult result = CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+
+	/* Missing original ownership is not permission to acquire it here, nor
+	 * to invalidate an unfinished observation that no target has consumed. */
+	if (census == NULL || census->result != CLUSTER_RELMAP_CENSUS_DRAINED || !cluster_shared_catalog
+		|| !cluster_recovery_merge_claim_is_held() || !cluster_relmap_authority_x_held())
+		return result;
+	PG_TRY();
+	{
+		if (cluster_relmap_retention_census_recovery_prepare(census, inputs, dbid, &input)) {
+			handle = input.handle;
+			input.handle = NULL;
+			attempted = true;
+			/* The original consumer rechecks claim/X after native I/O and
+			 * makes its own terminal decision. Never route this via v1's
+			 * raw local XID or a caller-supplied completion boolean. */
+			result = cluster_relmap_arbitrate_pending_v2((ClusterRelmapRecoveryHandle **)&handle,
+														 &input.identity, &input.pending);
+		}
+	}
+	PG_FINALLY();
+	{
+		/* Even UNKNOWN/ERROR may follow durable target writes. Revoke the
+		 * old observation before releasing only local native custody; all
+		 * original pins and their unresolved obligations survive. */
+		if (attempted)
+			census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
+		if (handle != NULL)
+			cluster_relmap_recovery_handle_release_v1((ClusterRelmapRecoveryHandle **)&handle);
+	}
+	PG_END_TRY();
+	return result;
 }
 
 ClusterRelmapCensusResult

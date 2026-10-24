@@ -972,7 +972,11 @@ UT_TEST(test_root_rebuild_preserves_existing_proofs_and_exact_pins)
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(38);
+	UT_RUN(test_census_recovery_arbitration_requires_drained);
+	UT_RUN(test_census_recovery_arbitration_missing_original_gates_preserves_scan);
+	UT_RUN(test_census_recovery_arbitration_always_retires_old_observations_only);
+	UT_RUN(test_census_recovery_arbitration_native_refusal_never_attempts_target);
 	UT_RUN(test_census_recovery_prepares_only_after_whole_root_drained);
 	UT_RUN(test_census_recovery_exact_namespace_and_partial_publish_base);
 	UT_RUN(test_census_recovery_requires_exact_already_restored_pin);

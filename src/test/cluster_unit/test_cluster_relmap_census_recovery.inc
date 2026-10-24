@@ -3,6 +3,10 @@
  * Author: SqlRush <sqlrush@gmail.com>
  * Spec: 2026-10-11-pre2-p0-m5-e-relmap-retention.md, sections3/4. */
 #include "cluster/cluster_wal_inputs.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_recovery_merge.h"
+#include "cluster/cluster_relmap_arb.h"
+#include "cluster/cluster_relmap_lock.h"
 
 static unsigned char census_native_cookie, census_inputs_cookie;
 static unsigned census_native_prepares, census_native_releases;
@@ -13,6 +17,44 @@ static ClusterRelmapV2View census_native_pending;
 static ClusterWalInputV1 census_native_sources[2];
 static uint32 census_native_source_count;
 static bool census_native_scope_current;
+static bool census_merger_held = true, census_namespace_x = true;
+static unsigned census_arbitrations, census_arbitration_mode;
+bool cluster_shared_catalog = true;
+
+bool
+cluster_recovery_merge_claim_is_held(void)
+{
+	return census_merger_held;
+}
+
+bool
+cluster_relmap_authority_x_held(void)
+{
+	return census_namespace_x;
+}
+
+ClusterRelmapV2ClearResult
+cluster_relmap_arbitrate_pending_v2(ClusterRelmapRecoveryHandle **handle,
+									const ClusterRelmapV2Namespace *identity,
+									const ClusterRelmapV2View *pending)
+{
+	uint8 digest[32];
+
+	census_arbitrations++;
+	UT_ASSERT(handle != NULL && *handle == (ClusterRelmapRecoveryHandle *)&census_native_cookie);
+	UT_ASSERT_EQ(memcmp(identity, &census_native_identity, sizeof(*identity)), 0);
+	UT_ASSERT_EQ(memcmp(pending, &census_native_pending, sizeof(*pending)), 0);
+	UT_ASSERT(cluster_shared_catalog && census_merger_held && census_namespace_x);
+	UT_ASSERT(cluster_recovery_root_set_digest(census_native_fixture->roots, digest));
+	for (unsigned i = 0; i < 2; i++)
+		UT_ASSERT_EQ(census_native_fixture->origin[i].state, CLUSTER_RELMAP_RETENTION_BUILDING);
+	cluster_relmap_recovery_handle_release_v1(handle);
+	if (census_arbitration_mode == 2)
+		siglongjmp(*PG_exception_stack, 1);
+	return census_arbitration_mode == 0 ? CLUSTER_RELMAP_V2_CLEARED_POSTREAD
+										: CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+}
+
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 
@@ -94,6 +136,8 @@ census_native_begin(CensusFixture *f, Oid dbid, unsigned cut, bool drain)
 		census_pair(f->fd, 5, 3, cut == 0, cut != 0, cut == 1);
 	census_native_fixture = f;
 	census_native_prepares = census_native_releases = census_native_fault = 0;
+	census_arbitrations = census_arbitration_mode = 0;
+	census_merger_held = census_namespace_x = cluster_shared_catalog = true;
 	memset(census_native_sources, 0, sizeof(census_native_sources));
 	for (size_t i = 0; i < lengthof(census_native_sources); i++) {
 		census_native_sources[i].source.claim.identity.system_identifier = 817;
@@ -346,6 +390,135 @@ UT_TEST(test_census_recovery_requires_original_wal_storage_scope)
 			UT_ASSERT(census_recovery_zero(&out));
 			UT_ASSERT_EQ(census_native_prepares, 0);
 			UT_ASSERT_EQ(memcmp(&before, census_pin(&f.origin[0], 5), sizeof(before)), 0);
+			census_refused(&f);
+		}
+		census_cleanup(&f);
+	}
+}
+
+UT_TEST(test_census_recovery_arbitration_requires_drained)
+{
+	UT_ASSERT(cluster_relmap_retention_census_recovery_arbitrate(NULL, NULL, InvalidOid)
+			  == CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+	{
+		CensusFixture f;
+		if (census_native_begin(&f, 5, 2, false)) {
+			UT_ASSERT_EQ(cluster_relmap_retention_census_recovery_arbitrate(
+							 f.census, (ClusterWalInputsV1 *)&census_inputs_cookie, 5),
+						 CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+			UT_ASSERT_EQ(census_native_prepares, 0);
+			UT_ASSERT_EQ(census_arbitrations, 0);
+			UT_ASSERT_EQ(census_drain(&f), CLUSTER_RELMAP_CENSUS_DRAINED);
+		}
+		census_cleanup(&f);
+	}
+}
+
+UT_TEST(test_census_recovery_arbitration_missing_original_gates_preserves_scan)
+{
+	for (unsigned gate = 0; gate < 3; gate++) {
+		CensusFixture f;
+		uint8 digest[32];
+
+		if (census_native_begin(&f, 5, 2, true)) {
+			census_merger_held = gate != 0;
+			census_namespace_x = gate != 1;
+			cluster_shared_catalog = gate != 2;
+			UT_ASSERT_EQ(cluster_relmap_retention_census_recovery_arbitrate(
+							 f.census, (ClusterWalInputsV1 *)&census_inputs_cookie, 5),
+						 CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+			UT_ASSERT_EQ(census_native_prepares, 0);
+			UT_ASSERT_EQ(census_arbitrations, 0);
+			UT_ASSERT(cluster_recovery_root_set_digest(f.roots, digest));
+			for (unsigned i = 0; i < 2; i++)
+				UT_ASSERT_EQ(f.origin[i].state, CLUSTER_RELMAP_RETENTION_BUILDING);
+			UT_ASSERT_EQ(census_drain(&f), CLUSTER_RELMAP_CENSUS_DRAINED);
+		}
+		census_cleanup(&f);
+	}
+	census_merger_held = census_namespace_x = cluster_shared_catalog = true;
+}
+
+UT_TEST(test_census_recovery_arbitration_always_retires_old_observations_only)
+{
+	const Oid dbids[] = { InvalidOid, 5 };
+
+	for (unsigned d = 0; d < lengthof(dbids); d++) {
+		for (unsigned cut = 0; cut < 3; cut++) {
+			for (unsigned mode = 0; mode < 3; mode++) {
+				CensusFixture f;
+				ClusterRelmapRetentionDirectory before[2];
+				volatile bool caught = false;
+
+				if (census_native_begin(&f, dbids[d], cut, true)) {
+					memcpy(before, f.origin, sizeof(before));
+					census_arbitration_mode = mode;
+					PG_TRY();
+					{
+						UT_ASSERT_EQ(
+							cluster_relmap_retention_census_recovery_arbitrate(
+								f.census, (ClusterWalInputsV1 *)&census_inputs_cookie, dbids[d]),
+							mode == 0 ? CLUSTER_RELMAP_V2_CLEARED_POSTREAD
+									  : CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+					}
+					PG_CATCH();
+					{
+						caught = true;
+					}
+					PG_END_TRY();
+					UT_ASSERT_EQ(caught, mode == 2);
+					UT_ASSERT_EQ(census_native_prepares, 1);
+					UT_ASSERT_EQ(census_arbitrations, 1);
+					UT_ASSERT_EQ(census_native_releases, 1);
+					for (unsigned i = 0; i < 2; i++)
+						UT_ASSERT_EQ(
+							memcmp(f.origin[i].pins, before[i].pins, sizeof(before[i].pins)), 0);
+					census_refused(&f);
+					UT_ASSERT_EQ(
+						cluster_relmap_retention_census_recovery_arbitrate(
+							f.census, (ClusterWalInputsV1 *)&census_inputs_cookie, dbids[d]),
+						CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+					UT_ASSERT_EQ(census_native_prepares, 1);
+					UT_ASSERT_EQ(census_arbitrations, 1);
+					UT_ASSERT_EQ(census_native_releases, 1);
+				}
+				census_cleanup(&f);
+			}
+		}
+	}
+}
+
+UT_TEST(test_census_recovery_arbitration_native_refusal_never_attempts_target)
+{
+	for (unsigned fault = 1; fault <= 6; fault++) {
+		CensusFixture f;
+		ClusterRelmapRetentionDirectory before[2];
+		volatile bool caught = false;
+
+		if (census_native_begin(&f, 5, 2, true)) {
+			memcpy(before, f.origin, sizeof(before));
+			census_native_fault = fault;
+			PG_TRY();
+			{
+				UT_ASSERT_EQ(cluster_relmap_retention_census_recovery_arbitrate(
+								 f.census, (ClusterWalInputsV1 *)&census_inputs_cookie, 5),
+							 CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+			}
+			PG_CATCH();
+			{
+				caught = true;
+			}
+			PG_END_TRY();
+			UT_ASSERT_EQ(caught, fault == 2);
+			UT_ASSERT_EQ(census_native_prepares, 1);
+			UT_ASSERT_EQ(census_arbitrations, 0);
+			UT_ASSERT_EQ(census_native_releases, fault <= 2 ? 0 : 1);
+			/* Fault 4 intentionally changes the original pin; no other pin
+             * may disappear, including when prepare throws. */
+			if (fault == 4)
+				((ClusterRelmapRetentionPin *)census_pin(&f.origin[0], 5))->wal_end--;
+			for (unsigned i = 0; i < 2; i++)
+				UT_ASSERT_EQ(memcmp(f.origin[i].pins, before[i].pins, sizeof(before[i].pins)), 0);
 			census_refused(&f);
 		}
 		census_cleanup(&f);
