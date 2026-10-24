@@ -7,8 +7,33 @@
 #define CLUSTER_RELMAP_RECOVERY_H
 #include "access/transam.h"
 #include "access/clog.h"
+#include "common/cluster_relmap_v2.h"
 #ifdef USE_PGRAC_CLUSTER
 struct ClusterRelmapOwnerSampleV2;
+
+/* Original-round recovery custody; no caller-supplied terminal authority. */
+typedef struct ClusterRelmapRecoveryHandle ClusterRelmapRecoveryHandle;
+struct ClusterWalInputsV1;
+/* Dormant pending custody, not a terminal result. Borrow the original cold
+ * scope and complete inputs for this process/round. Validate the full view,
+ * select its owner origin internally, and bind the exact pending native WAL
+ * before the checkpoint-prefix terminal and its owner window. No supplied
+ * status/qualification boolean, new scope, source pin or native base grant.
+ * Inputs must outlive the handle. Nonoverlap refusal sets *out NULL; overlap
+ * is unchanged. ERROR frees only local memory and propagates. */
+extern bool cluster_relmap_recovery_prepare_v1(struct ClusterWalInputsV1 *inputs,
+											   const ClusterRelmapV2Namespace *identity,
+											   const ClusterRelmapV2View *pending,
+											   ClusterRelmapRecoveryHandle **out);
+/* Exact full namespace/view and original-round current checks only. Refusal
+ * or ERROR after entry is sticky; overlapping inputs are unchanged and do
+ * not invalidate custody. No terminal/COMPLETE/release permission. */
+extern bool cluster_relmap_recovery_handle_matches_v1(ClusterRelmapRecoveryHandle *handle,
+													  const ClusterRelmapV2Namespace *identity,
+													  const ClusterRelmapV2View *pending);
+/* Frees local custody only; never the original borrowed scope/pins. */
+extern void cluster_relmap_recovery_handle_release_v1(ClusterRelmapRecoveryHandle **handle);
+
 typedef struct ClusterRelmapRecoveryNativeBounds {
 	uint64 system_identifier;
 	uint64 database_incarnation;

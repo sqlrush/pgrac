@@ -8,6 +8,8 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "cluster/cluster_recovery_record_hash.h"
+#include "cluster/cluster_relmap_recovery.h"
+#include "cluster/cluster_relmap_owner.h"
 #include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "miscadmin.h"
@@ -22,6 +24,8 @@ struct ClusterRelmapTerminalScanV1 {
 	pg_cryptohash_ctx *hash;
 	XLogRecPtr last_end;
 	bool checkpoint_seen, terminal_seen, failed, prefix_only, native_base_retained;
+	bool pending_required, pending_seen;
+	ClusterRelmapV2Image pending;
 };
 
 static void
@@ -182,6 +186,12 @@ terminal_scan_visit(XLogReaderState *reader, void *arg)
 			scan->observation.prefix_end = reader->EndRecPtr;
 		scan->checkpoint_seen = true;
 	}
+	if (scan->pending_required && reader->EndRecPtr == scan->pending.pending_owner.wal_end) {
+		if (scan->pending_seen || scan->terminal_seen
+			|| !cluster_relmap_owner_wal_matches_v2(&scan->pending, &input->source, reader))
+			return false;
+		scan->pending_seen = true;
+	}
 	if ((scan->terminal_seen && XLogRecGetXid(reader) == target)
 		|| (XLogRecGetRmid(reader) == RM_XACT_ID && !terminal_scan_xact(scan, reader)))
 		return false;
@@ -198,7 +208,8 @@ terminal_scan_visit(XLogReaderState *reader, void *arg)
 
 static bool
 terminal_scan(ClusterWalInputsV1 *inputs, uint32 index, FullTransactionId requested_top,
-			  bool prefix_only, ClusterRelmapTerminalScanV1 **out)
+			  bool prefix_only, const ClusterRelmapV2Image *pending,
+			  ClusterRelmapTerminalScanV1 **out)
 {
 	static const uint8 legacy_domain[] = "PGRAC-RELMAP-RETAINED-TERMINAL-V1";
 	static const uint8 prefix_domain[] = "PGRAC-RELMAP-RETAINED-TERMINAL-PREFIX-V2";
@@ -249,6 +260,9 @@ terminal_scan(ClusterWalInputsV1 *inputs, uint32 index, FullTransactionId reques
 	scan->index = index;
 	scan->count = count;
 	scan->selected = *input;
+	scan->pending_required = pending != NULL;
+	if (pending != NULL)
+		scan->pending = *pending;
 	scan->observation.source = input->source;
 	scan->observation.requested_top_full_xid = full;
 	scan->observation.cut = input->checkpoint.validated_tail_lsn_exclusive;
@@ -268,6 +282,15 @@ terminal_scan(ClusterWalInputsV1 *inputs, uint32 index, FullTransactionId reques
 													&observed)
 				   == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			&& scan->checkpoint_seen && scan->terminal_seen
+			&& (!scan->pending_required
+				|| (scan->pending_seen && scan->native_base_retained
+					&& scan->pending.pending_owner.wal_end <= scan->observation.terminal_start
+					&& scan->pending.pending_owner.membership_epoch
+						   == scan->observation.window.epoch
+					&& scan->pending.pending_owner.boot_incarnation
+						   == scan->observation.window.boot_incarnation
+					&& scan->pending.pending_owner.admitted_incarnation
+						   == scan->observation.window.admitted_incarnation))
 			&& observed.records == scan->observation.records
 			&& observed.complete_end == scan->observation.cut
 			&& scan->last_end == scan->observation.cut
@@ -295,7 +318,7 @@ cluster_relmap_recovery_terminal_scan_v1(ClusterWalInputsV1 *inputs, uint32 inde
 										 FullTransactionId requested_top,
 										 ClusterRelmapTerminalScanV1 **out)
 {
-	return terminal_scan(inputs, index, requested_top, false, out);
+	return terminal_scan(inputs, index, requested_top, false, NULL, out);
 }
 
 bool
@@ -303,7 +326,7 @@ cluster_relmap_recovery_terminal_prefix_scan_v2(ClusterWalInputsV1 *inputs, uint
 												FullTransactionId requested_top,
 												ClusterRelmapTerminalScanV1 **out)
 {
-	return terminal_scan(inputs, index, requested_top, true, out);
+	return terminal_scan(inputs, index, requested_top, true, NULL, out);
 }
 
 static bool
@@ -428,6 +451,170 @@ cluster_relmap_recovery_terminal_scan_release_v1(ClusterRelmapTerminalScanV1 **s
 	old = *scan;
 	*scan = NULL;
 	terminal_scan_free(old);
+}
+
+/* Custody of a complete pending view and the original recovery round only.
+ * This deliberately exports no terminal result or qualification flag. */
+struct ClusterRelmapRecoveryHandle {
+	pid_t pid;
+	uint64 scope_serial;
+	bool failed;
+	ClusterRelmapTerminalScanV1 *scan;
+	uint8 pending_wire[CLUSTER_RELMAP_V2_FILE_SIZE];
+	uint8 committed_wire[CLUSTER_RELMAP_V2_FILE_SIZE];
+};
+
+static bool
+recovery_overlap(const void *a, size_t an, const void *b, size_t bn)
+{
+	uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
+	return a != NULL && b != NULL && ((x <= y && y - x < an) || (y <= x && x - y < bn));
+}
+
+static bool
+recovery_pending_encode(const ClusterRelmapV2Namespace *identity, const ClusterRelmapV2View *view,
+						ClusterRelmapV2Image *image,
+						uint8 pending_wire[CLUSTER_RELMAP_V2_FILE_SIZE],
+						uint8 committed_wire[CLUSTER_RELMAP_V2_FILE_SIZE])
+{
+	ClusterRelmapV2Image current = { 0 };
+	if (identity == NULL || view == NULL || !view->pending_complete || !view->has_pending
+		|| view->used_backup)
+		return false;
+	memset(image, 0, sizeof(*image));
+	image->identity = *identity;
+	image->committed_generation = view->pending_committed_generation;
+	image->pending_generation = view->pending_generation;
+	image->pending_owner = view->pending_owner;
+	image->committed = view->pending_committed;
+	image->pending = view->pending;
+	if (cluster_relmap_v2_encode(image, pending_wire, CLUSTER_RELMAP_V2_FILE_SIZE)
+			!= CLUSTER_RELMAP_V2_VALID
+		|| (view->committed_generation == view->pending_committed_generation
+				? memcmp(&view->committed, &view->pending_committed, sizeof(RelMapFile)) != 0
+				: view->committed_generation != view->pending_generation
+					  || memcmp(&view->committed, &view->pending, sizeof(RelMapFile)) != 0))
+		return false;
+	current.identity = *identity;
+	current.committed_generation = view->committed_generation;
+	current.committed = view->committed;
+	return cluster_relmap_v2_encode(&current, committed_wire, CLUSTER_RELMAP_V2_FILE_SIZE)
+		   == CLUSTER_RELMAP_V2_VALID;
+}
+
+static bool
+recovery_handle_current(ClusterRelmapRecoveryHandle *handle)
+{
+	ClusterRelmapTerminalScanV1 *scan = handle->scan;
+	return terminal_scan_current(scan)
+		   && cluster_undo_recovery_cold_scope_id_v1(
+				  &scan->selected.source, &scan->selected.checkpoint, scan->selected.native_redo)
+				  == handle->scope_serial
+		   && terminal_scan_current(scan);
+}
+
+bool
+cluster_relmap_recovery_prepare_v1(ClusterWalInputsV1 *inputs,
+								   const ClusterRelmapV2Namespace *identity,
+								   const ClusterRelmapV2View *pending,
+								   ClusterRelmapRecoveryHandle **out)
+{
+	ClusterRelmapV2Image image;
+	uint8 pending_wire[CLUSTER_RELMAP_V2_FILE_SIZE], committed_wire[CLUSTER_RELMAP_V2_FILE_SIZE];
+	ClusterRelmapRecoveryHandle *handle;
+	const ClusterWalInputV1 *selected = NULL;
+	uint32 index = 0, count;
+	uint64 serial;
+	bool accepted = false;
+
+	if (out == NULL || recovery_overlap(out, sizeof(*out), identity, sizeof(*identity))
+		|| recovery_overlap(out, sizeof(*out), pending, sizeof(*pending)))
+		return false;
+	*out = NULL;
+	if (CritSectionCount != 0
+		|| !recovery_pending_encode(identity, pending, &image, pending_wire, committed_wire))
+		return false;
+	count = cluster_wal_inputs_count_v1(inputs);
+	for (uint32 i = 0; i < count; i++) {
+		const ClusterWalInputV1 *input = cluster_wal_inputs_at_v1(inputs, i);
+		if (input == NULL)
+			return false;
+		if (input->source.claim.identity.origin_node_id == image.pending_owner.node) {
+			if (selected != NULL)
+				return false; /* No partial origin/history set. */
+			selected = input;
+			index = i;
+		}
+	}
+	if (selected == NULL || selected->kind != CLUSTER_WAL_INPUT_CHECKPOINT)
+		return false;
+	serial = cluster_undo_recovery_cold_scope_id_v1(&selected->source, &selected->checkpoint,
+													selected->native_redo);
+	if (serial == 0)
+		return false;
+	handle = palloc0(sizeof(*handle));
+	handle->pid = getpid();
+	handle->scope_serial = serial;
+	memcpy(handle->pending_wire, pending_wire, sizeof(pending_wire));
+	memcpy(handle->committed_wire, committed_wire, sizeof(committed_wire));
+	PG_TRY();
+	{
+		accepted = terminal_scan(inputs, index,
+								 FullTransactionIdFromU64(image.pending_owner.top_full_xid), true,
+								 &image, &handle->scan)
+				   && recovery_handle_current(handle);
+	}
+	PG_CATCH();
+	{
+		terminal_scan_free(handle->scan);
+		pfree(handle);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!accepted) {
+		terminal_scan_free(handle->scan);
+		pfree(handle);
+		return false;
+	}
+	*out = handle;
+	return true;
+}
+
+bool
+cluster_relmap_recovery_handle_matches_v1(ClusterRelmapRecoveryHandle *handle,
+										  const ClusterRelmapV2Namespace *identity,
+										  const ClusterRelmapV2View *pending)
+{
+	ClusterRelmapV2Image image;
+	uint8 pending_wire[CLUSTER_RELMAP_V2_FILE_SIZE], committed_wire[CLUSTER_RELMAP_V2_FILE_SIZE];
+	if (handle == NULL || handle->pid != getpid() || handle->failed
+		|| recovery_overlap(handle, sizeof(*handle), identity, sizeof(*identity))
+		|| recovery_overlap(handle, sizeof(*handle), pending, sizeof(*pending)))
+		return false;
+	/* Original source/owner checks can ERROR. Leave this local handle dead. */
+	handle->failed = true;
+	if (CritSectionCount != 0
+		|| !recovery_pending_encode(identity, pending, &image, pending_wire, committed_wire)
+		|| memcmp(pending_wire, handle->pending_wire, sizeof(pending_wire)) != 0
+		|| memcmp(committed_wire, handle->committed_wire, sizeof(committed_wire)) != 0
+		|| !recovery_handle_current(handle))
+		return false;
+	handle->failed = false;
+	return true;
+}
+
+void
+cluster_relmap_recovery_handle_release_v1(ClusterRelmapRecoveryHandle **handle)
+{
+	ClusterRelmapRecoveryHandle *old;
+	if (handle == NULL)
+		return;
+	old = *handle;
+	*handle = NULL;
+	if (old != NULL) {
+		terminal_scan_free(old->scan);
+		pfree(old);
+	}
 }
 
 #endif

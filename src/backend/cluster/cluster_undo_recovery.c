@@ -19,6 +19,8 @@
 #include "cluster/storage/cluster_shared_fs.h"
 
 static ClusterUndoRecoveryScopeV1 *active_scope;
+/* Never reuse an original-round identity within this backend process. */
+static uint64 undo_scope_serial;
 
 /* A selected C0 grants a path to one target segment only. It never becomes
  * the ordinary origin scope used by native CLOG/MX or general UNDO redo. */
@@ -281,10 +283,10 @@ cluster_undo_recovery_scope_enter_v1(ClusterUndoRecoveryScopeV1 *scope,
 {
 	ClusterUndoRecoveryScopeV1 candidate = { 0 };
 
-	if (active_scope != NULL || active_abort != NULL || scope == NULL || authority == NULL
-		|| plan == NULL || authority->duty == NULL || authority->root_token == NULL
-		|| authority->root_snapshot == NULL || authority->duty->origin_thread_id == 0
-		|| authority->duty->origin_thread_id > 128)
+	if (undo_scope_serial == UINT64_MAX || active_scope != NULL || active_abort != NULL
+		|| scope == NULL || authority == NULL || plan == NULL || authority->duty == NULL
+		|| authority->root_token == NULL || authority->root_snapshot == NULL
+		|| authority->duty->origin_thread_id == 0 || authority->duty->origin_thread_id > 128)
 		return false;
 	candidate.authority = authority;
 	candidate.plan = plan;
@@ -303,6 +305,7 @@ cluster_undo_recovery_scope_enter_v1(ClusterUndoRecoveryScopeV1 *scope,
 	cluster_undo_smgr_fd_cache_reset();
 	*scope = candidate;
 	active_scope = scope;
+	undo_scope_serial++;
 	return true;
 }
 
@@ -366,6 +369,20 @@ cluster_undo_recovery_cold_source_matches_v1(const ClusterWalSourceRef *source,
 	return active_scope == scope
 		   && cluster_undo_recovery_cold_origin_authorized_v1(source->claim.identity.origin_node_id)
 		   && memcmp(checkpoint, scope->authority->root_snapshot, sizeof(*checkpoint)) == 0;
+}
+
+uint64
+cluster_undo_recovery_cold_scope_id_v1(const ClusterWalSourceRef *source,
+									   const ClusterControlRootSnapshot *checkpoint,
+									   XLogRecPtr native_redo)
+{
+	const ClusterUndoRecoveryScopeV1 *scope = active_scope;
+	uint64 serial = undo_scope_serial;
+	if (serial == 0
+		|| !cluster_undo_recovery_cold_source_matches_v1(source, checkpoint, native_redo)
+		|| active_scope != scope || undo_scope_serial != serial)
+		return 0;
+	return serial;
 }
 
 bool

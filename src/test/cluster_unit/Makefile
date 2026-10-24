@@ -3020,6 +3020,7 @@ test_cluster_recovery_c0_apply: test_cluster_recovery_c0_apply.c unit_test.h \
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_undo_recovery: test_cluster_undo_recovery.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
 		test_cluster_undo_path_native.inc test_cluster_undo_fd_native.inc test_cluster_undo_dir_native.inc \
 		test_cluster_undo_recovery_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_undo_gcs.o \
@@ -3405,11 +3406,15 @@ test_cluster_recovery_native_inputs: test_cluster_recovery_xact_join_inputs.inc 
 
 # The prefix/base composition consumes both public native-owner declarations.
 $(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o: \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_terminal_scan.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
 		$(top_srcdir)/src/include/access/clog.h
 
 test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_terminal_scan.h \
 		test_cluster_relmap_retained_census.o test_cluster_relmap_pending_product.o \

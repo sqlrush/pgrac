@@ -22,6 +22,7 @@ int control_fixture_main(int argc, char **argv);
 #include "test_cluster_control_root.c"
 #undef main
 #include "cluster/cluster_relmap_owner.h"
+#include "cluster/cluster_relmap_recovery.h"
 #include "cluster/cluster_relmap_terminal_scan.h"
 #include "cluster/cluster_relmap_retention_census.h"
 #include "cluster/cluster_undo_recovery.h"
@@ -2114,6 +2115,30 @@ terminal_test_fixture(unsigned selected, bool aborting, unsigned fault)
 }
 
 static XLogRecPtr prefix_test_checkpoint_end;
+static ClusterRelmapV2Image custody_image;
+static bool custody_shared;
+static uint64 custody_scope = 1;
+static unsigned custody_scope_reads, custody_scope_error_after;
+static void
+custody_image_init(const ClusterControlRootSnapshot *snapshot, uint64 dbinc)
+{
+	memset(&custody_image, 0, sizeof(custody_image));
+	custody_image.identity
+		= (ClusterRelmapV2Namespace){ TEST_SYSID, dbinc, custody_shared ? InvalidOid : 42,
+									  custody_shared };
+	custody_image.committed_generation = 7;
+	custody_image.pending_generation = 8;
+	custody_image.pending_owner
+		= (ClusterRelmapV2Owner){ 0, 99, 97, snapshot->identity.origin_owner_incarnation, 0, 411 };
+	custody_image.committed.magic = RELMAPPER_FILEMAGIC;
+	custody_image.committed.num_mappings = 1;
+	custody_image.committed.mappings[0].mapoid = 1259;
+	custody_image.committed.mappings[0].mapfilenumber = 40000;
+	relmap_test_crc(&custody_image.committed);
+	custody_image.pending = custody_image.committed;
+	custody_image.pending.mappings[0].mapfilenumber++;
+	relmap_test_crc(&custody_image.pending);
+}
 static ClusterWalInputsV1 *
 terminal_prefix_fixture(bool aborting, unsigned fault)
 {
@@ -2136,6 +2161,8 @@ terminal_prefix_fixture(bool aborting, unsigned fault)
 	snapshot = &root.records[0];
 	lower = snapshot->checkpoint_lower_lsn;
 	at = lower + MAXALIGN(SizeOfXLogRecord + 2 + sizeof(timestamp));
+	if (fault == 29)
+		at += MAXALIGN(SizeOfXLogRecord + 5 + MinSizeOfRelmapUpdate + sizeof(RelMapFile));
 	if (fault == 4 || fault == 5 || fault == 6)
 		at += MAXALIGN(SizeOfXLogRecord + 2 + sizeof(timestamp));
 	if (fault == 14 || fault == 27)
@@ -2160,7 +2187,23 @@ terminal_prefix_fixture(bool aborting, unsigned fault)
 	source.claim.max_config_generation = root.header.v2.config_generation;
 	memcpy(source.claim.claim_sha256, root.refs[0].claim_sha256, 32);
 	source.timeline = snapshot->tail_tli;
-	if (fault == 14 || fault == 28) {
+	if (fault == 29) {
+		uint8 payload[MinSizeOfRelmapUpdate + sizeof(RelMapFile)];
+		xl_relmap_update update = { 0 };
+		WalTestRecord pending;
+		custody_image_init(snapshot, root.header.v2.database_incarnation);
+		update.dbid = custody_image.identity.dbid;
+		update.tsid = custody_shared ? GLOBALTABLESPACE_OID : DEFAULTTABLESPACE_OID;
+		update.nbytes = sizeof(RelMapFile);
+		memcpy(payload, &update, MinSizeOfRelmapUpdate);
+		memcpy(payload + MinSizeOfRelmapUpdate, &custody_image.pending, sizeof(RelMapFile));
+		pending = terminal_test_record(&source, lower, 0, RM_RELMAP_ID, XLOG_RELMAP_UPDATE, 99,
+									   payload, sizeof(payload));
+		custody_image.pending_owner.wal_end = pending.exclusive_end;
+		terminal = terminal_test_record(&source, pending.exclusive_end, pending.record_start,
+										RM_XACT_ID, aborting ? XLOG_XACT_ABORT : XLOG_XACT_COMMIT,
+										99, &timestamp, sizeof(timestamp));
+	} else if (fault == 14 || fault == 28) {
 		int page = 0;
 		xl_clog_truncate trunc = { .pageno = 0, .oldestXact = 80, .oldestXactDb = 123 };
 		WalTestRecord before = terminal_test_record(
@@ -2296,6 +2339,18 @@ cluster_undo_recovery_cold_source_matches_v1(const ClusterWalSourceRef *source,
 		   && memcmp(source, &prefix_base_expected.source, sizeof(*source)) == 0
 		   && memcmp(checkpoint, &prefix_base_expected.checkpoint, sizeof(*checkpoint)) == 0
 		   && native_redo == prefix_base_expected.native_redo;
+}
+
+uint64
+cluster_undo_recovery_cold_scope_id_v1(const ClusterWalSourceRef *source,
+									   const ClusterControlRootSnapshot *checkpoint,
+									   XLogRecPtr native_redo)
+{
+	if (++custody_scope_reads == custody_scope_error_after)
+		ereport(ERROR, (errmsg("injected original scope identity ERROR")));
+	return cluster_undo_recovery_cold_source_matches_v1(source, checkpoint, native_redo)
+			   ? custody_scope
+			   : 0;
 }
 
 bool
@@ -2741,6 +2796,183 @@ UT_TEST(test_terminal_scan_error_frees_only_local_state_and_keeps_pin)
 	}
 }
 
+static ClusterRelmapV2View
+custody_view(bool published)
+{
+	ClusterRelmapV2View view = { 0 };
+	view.committed = published ? custody_image.pending : custody_image.committed;
+	view.committed_generation = published ? 8 : 7;
+	view.pending_complete = view.has_pending = true;
+	view.pending_generation = 8;
+	view.pending_owner = custody_image.pending_owner;
+	view.pending = custody_image.pending;
+	view.pending_committed_generation = 7;
+	view.pending_committed = custody_image.committed;
+	return view;
+}
+static ClusterWalInputsV1 *
+custody_setup(bool shared, bool aborted)
+{
+	ClusterWalInputsV1 *inputs;
+	custody_shared = shared;
+	custody_scope = 7;
+	custody_scope_reads = custody_scope_error_after = 0;
+	inputs = terminal_prefix_fixture(aborted, 29);
+	prefix_base_expected = *cluster_wal_inputs_at_v1(inputs, 0);
+	prefix_base_fault = prefix_base_scope_checks = prefix_base_reads = 0;
+	return inputs;
+}
+UT_TEST(test_recovery_custody_binds_both_namespaces_and_pair_cuts)
+{
+	for (unsigned shared = 0; shared < 2; shared++)
+		for (unsigned cut = 0; cut < 3; cut++) {
+			ClusterWalInputsV1 *inputs = custody_setup(shared, cut % 2);
+			ClusterRelmapRecoveryHandle *handle = NULL;
+			ClusterRelmapV2View view = custody_view(cut == 1);
+			ClusterRelmapV2Namespace identity = custody_image.identity;
+			ClusterRelmapV2View saved_view = view;
+			ClusterRelmapV2Namespace saved_identity = identity;
+			UT_ASSERT(!cluster_relmap_recovery_prepare_v1(inputs, &identity, &view, (void *)&view));
+			UT_ASSERT(memcmp(&view, &saved_view, sizeof(view)) == 0);
+			UT_ASSERT(
+				!cluster_relmap_recovery_prepare_v1(inputs, &identity, &view, (void *)&identity));
+			UT_ASSERT(memcmp(&identity, &saved_identity, sizeof(identity)) == 0);
+			UT_ASSERT(cluster_relmap_recovery_prepare_v1(inputs, &identity, &view, &handle));
+			UT_ASSERT(handle != NULL && inputs_pin_held);
+			UT_ASSERT(!cluster_relmap_recovery_handle_matches_v1(handle, (void *)handle, &view));
+			UT_ASSERT(
+				!cluster_relmap_recovery_handle_matches_v1(handle, &identity, (void *)handle));
+			UT_ASSERT(cluster_relmap_recovery_handle_matches_v1(handle, &identity, &view));
+			UT_ASSERT_EQ(prefix_base_reads, 0);
+			cluster_relmap_recovery_handle_release_v1(&handle);
+			UT_ASSERT(handle == NULL && inputs_pin_held);
+			cold_census_done(&inputs);
+		}
+}
+UT_TEST(test_recovery_custody_rejects_pending_owner_window_and_view_corruption)
+{
+	for (unsigned fault = 0; fault < 19; fault++) {
+		ClusterWalInputsV1 *inputs = custody_setup(false, false);
+		ClusterRelmapRecoveryHandle *handle = (void *)1;
+		ClusterRelmapV2View view = custody_view(false);
+		ClusterRelmapV2Namespace identity = custody_image.identity;
+		if (fault == 0)
+			view.pending_complete = false;
+		if (fault == 1)
+			view.has_pending = false;
+		if (fault == 2)
+			view.pending_owner.membership_epoch++;
+		if (fault == 3)
+			view.pending_owner.boot_incarnation++;
+		if (fault == 4)
+			view.pending_owner.admitted_incarnation++;
+		if (fault == 5)
+			view.pending_owner.top_full_xid += UINT64CONST(0x100000000);
+		if (fault == 6)
+			view.pending_owner.wal_end++;
+		if (fault == 7)
+			view.pending_owner.node = 1;
+		if (fault == 8) {
+			view.pending.mappings[0].mapfilenumber++;
+			relmap_test_crc(&view.pending);
+		}
+		if (fault == 9)
+			view.pending_generation++;
+		if (fault == 10)
+			identity.database_incarnation++;
+		if (fault == 11)
+			identity.dbid++;
+		if (fault == 12)
+			view.committed_generation++;
+		if (fault == 13) {
+			view.committed.mappings[0].mapfilenumber++;
+			relmap_test_crc(&view.committed);
+		}
+		if (fault == 14)
+			view.pending_committed.crc++;
+		if (fault == 15)
+			custody_scope = 0;
+		if (fault == 16)
+			inputs_pin_current = false;
+		if (fault == 17)
+			prefix_base_fault = 1;
+		if (fault == 18)
+			view.used_backup = true;
+		UT_ASSERT(!cluster_relmap_recovery_prepare_v1(inputs, &identity, &view, &handle));
+		UT_ASSERT(handle == NULL && inputs_pin_held);
+		UT_ASSERT_EQ(prefix_base_reads, 0);
+		cold_census_done(&inputs);
+	}
+}
+UT_TEST(test_recovery_custody_refusal_is_sticky_and_scope_aba_is_not_current)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		ClusterWalInputsV1 *inputs = custody_setup(false, false);
+		ClusterRelmapRecoveryHandle *handle = NULL;
+		ClusterRelmapV2View view = custody_view(false), changed = view;
+		ClusterRelmapV2Namespace identity = custody_image.identity, changed_ns = identity;
+		UT_ASSERT(cluster_relmap_recovery_prepare_v1(inputs, &identity, &view, &handle));
+		if (fault == 0)
+			custody_scope++;
+		if (fault == 1)
+			changed.pending_owner.wal_end++;
+		if (fault == 2)
+			changed_ns.dbid++;
+		if (fault == 3)
+			inputs_pin_current = false;
+		if (fault == 4)
+			v2_checkpoint_root_race();
+		if (fault == 5)
+			prefix_base_fault = 9;
+		UT_ASSERT(!cluster_relmap_recovery_handle_matches_v1(handle, &changed_ns, &changed));
+		custody_scope = 7;
+		inputs_pin_current = true;
+		prefix_base_fault = 0;
+		UT_ASSERT(!cluster_relmap_recovery_handle_matches_v1(handle, &identity, &view));
+		cluster_relmap_recovery_handle_release_v1(&handle);
+		UT_ASSERT(handle == NULL && inputs_pin_held);
+		cold_census_done(&inputs);
+	}
+}
+
+UT_TEST(test_recovery_custody_error_preserves_pins_and_invalidates_handle)
+{
+	for (unsigned fault = 0; fault < 2; fault++) {
+		ClusterWalInputsV1 *inputs = custody_setup(false, false);
+		ClusterRelmapRecoveryHandle *handle = NULL;
+		ClusterRelmapV2View view = custody_view(false);
+		ClusterRelmapV2Namespace identity = custody_image.identity;
+		volatile bool threw = false;
+		if (fault)
+			UT_ASSERT(cluster_relmap_recovery_prepare_v1(inputs, &identity, &view, &handle));
+		custody_scope_error_after = fault ? custody_scope_reads + 1 : 2;
+		test_capture_error_level = true;
+		test_last_error_level = 0;
+		PG_TRY();
+		{
+			if (fault)
+				(void)cluster_relmap_recovery_handle_matches_v1(handle, &identity, &view);
+			else
+				(void)cluster_relmap_recovery_prepare_v1(inputs, &identity, &view, &handle);
+		}
+		PG_CATCH();
+		{
+			threw = true;
+		}
+		PG_END_TRY();
+		test_capture_error_level = false;
+		custody_scope_error_after = 0;
+		UT_ASSERT(threw && test_last_error_level == ERROR);
+		UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock);
+		if (fault)
+			UT_ASSERT(!cluster_relmap_recovery_handle_matches_v1(handle, &identity, &view));
+		else
+			UT_ASSERT(handle == NULL);
+		cluster_relmap_recovery_handle_release_v1(&handle);
+		cold_census_done(&inputs);
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -2748,7 +2980,11 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(48);
+	UT_PLAN(52);
+	UT_RUN(test_recovery_custody_error_preserves_pins_and_invalidates_handle);
+	UT_RUN(test_recovery_custody_binds_both_namespaces_and_pair_cuts);
+	UT_RUN(test_recovery_custody_rejects_pending_owner_window_and_view_corruption);
+	UT_RUN(test_recovery_custody_refusal_is_sticky_and_scope_aba_is_not_current);
 	UT_RUN(test_retained_relmap_matches_each_selected_namespace);
 	UT_RUN(test_retained_relmap_requires_exact_pending);
 	UT_RUN(test_retained_relmap_scans_suffix_and_other_source);

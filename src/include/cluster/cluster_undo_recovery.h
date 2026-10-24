@@ -44,6 +44,12 @@ extern bool
 cluster_undo_recovery_cold_source_matches_v1(const ClusterWalSourceRef *source,
 											 const ClusterControlRootSnapshot *checkpoint,
 											 XLogRecPtr native_redo);
+/* Nonzero process-local original scope serial after the same complete source
+ * checks. Never reused within this process, even for the same stack address
+ * and identical authority. Zero on refusal; not a durability/terminal grant. */
+extern uint64 cluster_undo_recovery_cold_scope_id_v1(const ClusterWalSourceRef *source,
+													 const ClusterControlRootSnapshot *checkpoint,
+													 XLogRecPtr native_redo);
 /* Only the already-durable exact C0 target's top-level native ABORT bit.
  * This does not authorize an origin scope or other native operations. */
 extern bool cluster_undo_recovery_abort_clog_authorized_v1(int origin_node, TransactionId xid);
