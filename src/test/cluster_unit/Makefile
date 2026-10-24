@@ -8357,6 +8357,7 @@ test_cluster_ctrc_itl_reuse: test_cluster_ctrc_itl_reuse.c test_cluster_ctrc_cle
 		test_cluster_ctrc_itl_roles_product.o test_cluster_ctrc_transam_product.o \
 		$(top_srcdir)/src/backend/cluster/cluster_undo_horizon.c \
 		$(top_srcdir)/src/backend/cluster/cluster_uba.c \
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		test_cluster_ctrc_itl_roles_product.o test_cluster_ctrc_transam_product.o \

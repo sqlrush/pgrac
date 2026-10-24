@@ -7060,10 +7060,7 @@ ctrc_cleaner_dependencies_durable(const ClusterSfDepVec *dependencies,
 
 /* Stack copies only. A carrier is not transaction authority: its distinct
  * publication must be proven below, then revalidated at the original CAS. */
-typedef struct CtrcItlCarrierCapture {
-	uint8 mask;
-	ClusterItlSlotData slots[CLUSTER_ITL_INITRANS_DEFAULT];
-} CtrcItlCarrierCapture;
+typedef ClusterCtrcItlCarrierImageV1 CtrcItlCarrierCapture;
 
 typedef struct CtrcItlCompanionProof {
 	ClusterCtrcParticipantEntry participant;
@@ -7263,10 +7260,41 @@ ctrc_cleaner_retired_itl_page(Page page, const ClusterCtrcTxnKeyV1 *key,
 }
 
 static bool
+ctrc_image_capture_overlaps(const void *output, Size output_length,
+	const void *input, Size input_length)
+{
+	uintptr_t out = (uintptr_t)output;
+	uintptr_t in = (uintptr_t)input;
+
+	return out <= in ? in - out < output_length : out - in < input_length;
+}
+
+bool
+cluster_ctrc_itl_retired_image_v1(const char *page_image, const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcTargetV1 *target, bool logical_history, ClusterCtrcItlCarrierImageV1 *capture)
+{
+	CtrcItlCarrierCapture observed;
+
+	if (page_image == NULL || key == NULL || target == NULL
+		|| ((uintptr_t)page_image & (MAXIMUM_ALIGNOF - 1)) != 0
+		|| (capture != NULL
+			&& (ctrc_image_capture_overlaps(capture, sizeof(*capture), page_image, BLCKSZ)
+				|| ctrc_image_capture_overlaps(capture, sizeof(*capture), key, sizeof(*key))
+				|| ctrc_image_capture_overlaps(capture, sizeof(*capture), target, sizeof(*target)))))
+		return false;
+	if (!ctrc_cleaner_retired_itl_page((Page)page_image, key, target, logical_history,
+			capture == NULL ? NULL : &observed))
+		return false;
+	if (capture != NULL)
+		memcpy(capture, &observed, sizeof(observed));
+	return true;
+}
+
+static bool
 ctrc_cleaner_lock_itl_absent(Page page, const ClusterCtrcTxnKeyV1 *key,
 							 const ClusterCtrcTargetV1 *target)
 {
-	return ctrc_cleaner_retired_itl_page(page, key, target, false, NULL);
+	return cluster_ctrc_itl_retired_image_v1(page, key, target, false, NULL);
 }
 
 /* Only the current ITL/UBA locator is retired here. Logical old xmin/xmax
@@ -7277,7 +7305,7 @@ static bool
 ctrc_cleaner_history_itl_retired(Page page, const ClusterCtrcTxnKeyV1 *key,
 								 const ClusterCtrcTargetV1 *target)
 {
-	return ctrc_cleaner_retired_itl_page(page, key, target, true, NULL);
+	return cluster_ctrc_itl_retired_image_v1(page, key, target, true, NULL);
 }
 
 static void
@@ -7323,6 +7351,16 @@ ctrc_cleaner_companion_target_matches(const ClusterCtrcReceipt *original,
 		   && memcmp(b->uba, &slot->undo_segment_head, sizeof(UBA)) == 0;
 }
 
+bool
+cluster_ctrc_itl_companion_target_matches_v1(const ClusterCtrcReceipt *original,
+	const ClusterCtrcReceipt *candidate, unsigned index, const ClusterItlSlotData *slot,
+	ClusterCtrcTerminalStatus status, SCN commit_scn)
+{
+	return original != NULL && candidate != NULL && slot != NULL
+		&& index < CLUSTER_ITL_INITRANS_DEFAULT
+		&& ctrc_cleaner_companion_target_matches(original, candidate, index, slot, status, commit_scn);
+}
+
 /* Called only after current/content release. The APPLIED original keeps the
  * same key from ACK_FROZEN reclamation; copies are still rechecked at CAS. */
 static bool
@@ -7360,7 +7398,7 @@ ctrc_cleaner_companions_capture(const ClusterCtrcParticipantEntry *expected,
 			original_seen = true;
 		for (unsigned i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
 			if ((carriers->mask & (1U << i)) == 0
-				|| !ctrc_cleaner_companion_target_matches(original, candidate, i,
+				|| !cluster_ctrc_itl_companion_target_matches_v1(original, candidate, i,
 														  &carriers->slots[i], status, commit_scn))
 				continue;
 			if ((matched & (1U << i)) != 0 || !ctrc_receipt_snapshot_valid(participant, candidate)
@@ -8502,10 +8540,10 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	history_retired
 		= !absent && ctrc_cleaner_history_itl_retired(page, &receipt->key, &receipt->target);
 	if (!absent && !history_retired) {
-		absent = ctrc_cleaner_retired_itl_page(page, &receipt->key, &receipt->target, false,
+		absent = cluster_ctrc_itl_retired_image_v1(page, &receipt->key, &receipt->target, false,
 											   &first_carriers);
 		history_retired = !absent
-						  && ctrc_cleaner_retired_itl_page(page, &receipt->key, &receipt->target,
+						  && cluster_ctrc_itl_retired_image_v1(page, &receipt->key, &receipt->target,
 														   true, &first_carriers);
 	}
 	abort_history = history_retired && terminal_status == CTRC_TERMINAL_ABORTED;
@@ -8584,7 +8622,7 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	cluster_sf_dep_vec_reset(&final_dependencies);
 	(void)cluster_sf_dep_vec_for_ship(buffer, &final_dependencies);
 	if (absent
-		&& (!(has_companions ? ctrc_cleaner_retired_itl_page(page, &receipt->key, &receipt->target,
+		&& (!(has_companions ? cluster_ctrc_itl_retired_image_v1(page, &receipt->key, &receipt->target,
 															 false, &final_carriers)
 							 : ctrc_cleaner_lock_itl_absent(page, &receipt->key, &receipt->target))
 			|| !ctrc_cleaner_absence_page_dependency(page, &receipt->target,
@@ -8594,7 +8632,7 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	}
 	if (history_retired
 		&& (!(has_companions
-				  ? ctrc_cleaner_retired_itl_page(page, &receipt->key, &receipt->target, true,
+				  ? cluster_ctrc_itl_retired_image_v1(page, &receipt->key, &receipt->target, true,
 												  &final_carriers)
 				  : ctrc_cleaner_history_itl_retired(page, &receipt->key, &receipt->target))
 			|| !ctrc_cleaner_absence_page_dependency(page, &receipt->target,

@@ -1040,6 +1040,27 @@ extern ClusterCtrcItlCleanoutApplyResult cluster_ctrc_itl_cleanout_image_v1(
 	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcTargetV1 *target,
 	ClusterCtrcTerminalStatus terminal_status, SCN commit_scn,
 	const char *before_image, char *after_image);
+/* Process-local image observations, never receipt or terminal authority. */
+typedef struct ClusterCtrcItlCarrierImageV1 {
+	uint8 mask;
+	ClusterItlSlotData slots[CLUSTER_ITL_INITRANS_DEFAULT];
+} ClusterCtrcItlCarrierImageV1;
+/* Native ordinary/recovery owner borrows one aligned immutable heap image.
+ * Reuse the original full-page absence/history predicate. A non-NULL capture
+ * reports same-xid carriers requiring their distinct original companions;
+ * NULL retains the stricter original no-capture rules. Refusal leaves capture
+ * unchanged, including overlap with page/key/target. No allocation, locks or
+ * I/O. The caller still proves custody, original source/terminal, history,
+ * companion chain/durability and final CAS; true never discharges anything. */
+extern bool cluster_ctrc_itl_retired_image_v1(const char *page_image,
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcTargetV1 *target,
+	bool logical_history, ClusterCtrcItlCarrierImageV1 *capture);
+/* Target/publication/terminal-shape match only. It does not validate receipt
+ * key/state/chain, source coverage, history floor or durability. Those original
+ * owner checks remain mandatory before any discharge. No input mutation. */
+extern bool cluster_ctrc_itl_companion_target_matches_v1(const ClusterCtrcReceipt *original,
+	const ClusterCtrcReceipt *candidate, unsigned index, const ClusterItlSlotData *slot,
+	ClusterCtrcTerminalStatus status, SCN commit_scn);
 extern ClusterCtrcCloseResult
 cluster_ctrc_participant_close(ClusterCtrcParticipantEntry *participant,
 							   const ClusterCtrcParticipantIdentity *identity,

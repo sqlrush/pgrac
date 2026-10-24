@@ -2027,10 +2027,112 @@ UT_TEST(test_shared_cleaner_missing_identity_retains_receipt_without_mutation)
 	reuse_space_available = true;
 }
 
+UT_TEST(test_retired_image_observation_keeps_page_receipts_and_owners_unchanged)
+{
+	ClusterCtrcItlCarrierImageV1 carriers;
+	PGAlignedBlock before;
+	ClusterCtrcReceipt receipt;
+	ClusterCtrcParticipantEntry participant;
+
+	reuse_setup(true);
+	before = reuse_page;
+	receipt = *reuse_handle.receipt;
+	participant = *reuse_handle.participant;
+	memset(&carriers, 0xa5, sizeof(carriers));
+	UT_ASSERT(cluster_ctrc_itl_retired_image_v1(reuse_page.data, &reuse_receipt.key,
+		&reuse_receipt.target, false, &carriers));
+	UT_ASSERT(memcmp(&carriers, &(ClusterCtrcItlCarrierImageV1){0}, sizeof(carriers)) == 0);
+	UT_ASSERT(cluster_ctrc_itl_retired_image_v1(reuse_page.data, &reuse_receipt.key,
+		&reuse_receipt.target, false, NULL));
+	UT_ASSERT(memcmp(&before, &reuse_page, sizeof(before)) == 0);
+	UT_ASSERT(memcmp(&receipt, reuse_handle.receipt, sizeof(receipt)) == 0);
+	UT_ASSERT(memcmp(&participant, reuse_handle.participant, sizeof(participant)) == 0);
+	UT_ASSERT_EQ(reuse_enters + reuse_pins + reuse_locks + reuse_wal_starts + flush_calls, 0);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_retired_image_captures_exact_terminal_companion_without_clearing_it)
+{
+	for (uint8 itl_class = 1; itl_class <= 2; itl_class++) {
+		ClusterCtrcReceiptHandle companion;
+		ClusterCtrcItlCarrierImageV1 carriers;
+		PGAlignedBlock before;
+		ClusterCtrcReceipt saved;
+
+		companion = reuse_same_incarnation_setup(itl_class, 7, false, true);
+		before = reuse_page;
+		saved = *companion.receipt;
+		UT_ASSERT(cluster_ctrc_itl_retired_image_v1(reuse_page.data, &reuse_receipt.key,
+			&reuse_receipt.target, true, &carriers));
+		UT_ASSERT_EQ(carriers.mask, 1);
+		UT_ASSERT(memcmp(&carriers.slots[0], &ClusterPageGetItlSlots(reuse_page.data)[0],
+			sizeof(carriers.slots[0])) == 0);
+		UT_ASSERT(!cluster_ctrc_itl_retired_image_v1(reuse_page.data, &reuse_receipt.key,
+			&reuse_receipt.target, true, NULL));
+		UT_ASSERT(cluster_ctrc_itl_companion_target_matches_v1(&reuse_receipt,
+			companion.receipt, 0, &carriers.slots[0], CTRC_TERMINAL_COMMITTED, 900));
+		companion.receipt->target.uba[0] ^= 1;
+		UT_ASSERT(!cluster_ctrc_itl_companion_target_matches_v1(&reuse_receipt,
+			companion.receipt, 0, &carriers.slots[0], CTRC_TERMINAL_COMMITTED, 900));
+		*companion.receipt = saved;
+		UT_ASSERT(!cluster_ctrc_itl_companion_target_matches_v1(&reuse_receipt,
+			companion.receipt, CLUSTER_ITL_INITRANS_DEFAULT, &carriers.slots[0],
+			CTRC_TERMINAL_COMMITTED, 900));
+		UT_ASSERT(!cluster_ctrc_itl_companion_target_matches_v1(&reuse_receipt,
+			companion.receipt, 0, &carriers.slots[0], CTRC_TERMINAL_COMMITTED, 901));
+		UT_ASSERT(!cluster_ctrc_itl_companion_target_matches_v1(NULL,
+			companion.receipt, 0, &carriers.slots[0], CTRC_TERMINAL_COMMITTED, 900));
+		UT_ASSERT(memcmp(&saved, companion.receipt, sizeof(saved)) == 0);
+		UT_ASSERT(memcmp(&before, &reuse_page, sizeof(before)) == 0);
+		UT_ASSERT_EQ(reuse_handle.receipt->state, CTRC_RECEIPT_APPLIED);
+		UT_ASSERT_EQ(reuse_enters + reuse_pins + reuse_locks + reuse_wal_starts + flush_calls, 0);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_retired_image_refusal_and_aliases_preserve_all_bytes)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		ClusterCtrcItlCarrierImageV1 carriers, saved;
+		ClusterCtrcItlCarrierImageV1 *out = &carriers;
+		PGAlignedBlock before;
+		const char *page;
+		ClusterCtrcTxnKeyV1 key;
+		ClusterCtrcTargetV1 target;
+		union { ClusterCtrcItlCarrierImageV1 result; ClusterCtrcTxnKeyV1 key; } key_alias;
+		union { ClusterCtrcItlCarrierImageV1 result; ClusterCtrcTargetV1 target; } target_alias;
+
+		reuse_setup(true);
+		page = reuse_page.data;
+		key = reuse_receipt.key;
+		target = reuse_receipt.target;
+		memset(&carriers, 0xa5, sizeof(carriers));
+		saved = carriers;
+		if (fault == 0) reuse_tuple()->t_infomask &= ~HEAP_XMAX_INVALID;
+		if (fault == 1) page++;
+		if (fault == 2) out = (ClusterCtrcItlCarrierImageV1 *)(reuse_page.data + MAXIMUM_ALIGNOF);
+		if (fault == 3) { key_alias.key = key; out = &key_alias.result; }
+		if (fault == 4) { target_alias.target = target; out = &target_alias.result; }
+		if (fault == 5) page = NULL;
+		before = reuse_page;
+		UT_ASSERT(!cluster_ctrc_itl_retired_image_v1(page,
+			fault == 3 ? &key_alias.key : &key,
+			fault == 4 ? &target_alias.target : &target, false, out));
+		UT_ASSERT(memcmp(&before, &reuse_page, sizeof(before)) == 0);
+		UT_ASSERT(memcmp(&saved, &carriers, sizeof(saved)) == 0);
+		if (fault == 3) UT_ASSERT(memcmp(&key_alias.key, &key, sizeof(key)) == 0);
+		if (fault == 4) UT_ASSERT(memcmp(&target_alias.target, &target, sizeof(target)) == 0);
+		UT_ASSERT_EQ(reuse_handle.receipt->state, CTRC_RECEIPT_APPLIED);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(49);
+	UT_PLAN(52);
+	UT_RUN(test_retired_image_observation_keeps_page_receipts_and_owners_unchanged);
+	UT_RUN(test_retired_image_captures_exact_terminal_companion_without_clearing_it);
+	UT_RUN(test_retired_image_refusal_and_aliases_preserve_all_bytes);
 	UT_RUN(test_aborted_history_final_guard_rejects_change_after_second_current);
 	UT_RUN(test_aborted_history_retires_only_with_all_three_proofs_without_floor);
 	UT_RUN(test_aborted_history_never_uses_absence_of_live_owner_as_abort_proof);
