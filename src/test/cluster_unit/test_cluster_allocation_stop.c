@@ -27,6 +27,7 @@ bool cluster_shared_config;
 BackendType MyBackendType = B_INVALID;
 int MaxBackends = 16;
 int cluster_ges_request_timeout_ms = 1000;
+int cluster_ges_retransmit_max_attempts = 3;
 int cluster_oid_lease_size = 8;
 int cluster_node_id = 0;
 char *cluster_shared_data_dir;
@@ -56,6 +57,8 @@ static bool stop_new_modifier_allowed = true;
 static unsigned stop_new_modifier_calls, hw_wal_calls, hw_flush_calls, hw_send_calls;
 static BlockNumber hw_wal_end;
 static HwAllocReply hw_sent_reply;
+static ClusterLockAcquireRequest captured_hw_lock_request;
+static unsigned hw_lock_acquire_calls;
 
 bool
 cluster_normal_stop_service_new_work(bool modifies_data)
@@ -349,6 +352,8 @@ ClusterLockAcquireResult
 cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 {
 	Assert(held_lock == NULL);
+	captured_hw_lock_request = *req;
+	hw_lock_acquire_calls++;
 	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 }
 ClusterLockAcquireResult
@@ -732,10 +737,45 @@ UT_TEST(shared_profile_cannot_publish_legacy_counter_reservations)
 	cluster_shared_config = false;
 }
 
+UT_TEST(hw_contention_wait_is_not_a_request_deadline)
+{
+	ClusterResId resid;
+	HwLock lock;
+
+	reset_fixture();
+	cluster_hw_resid_encode((RelFileLocator){ 1663, 5, 16385 }, MAIN_FORKNUM, &resid);
+	/* A short GES retry budget must not turn an ordinary HW queue wait into
+	 * 53RA6. Execute the real HW wrapper; only the GES boundary is mocked. */
+	cluster_ges_request_timeout_ms = 1;
+	UT_ASSERT(cluster_hw_lock(&resid, &lock));
+	UT_ASSERT_EQ(captured_hw_lock_request.timeout_ms, -1);
+	UT_ASSERT(!captured_hw_lock_request.dontwait);
+	UT_ASSERT_EQ(captured_hw_lock_request.wait_event, WAIT_EVENT_CLUSTER_REL_EXTEND_WAIT);
+	UT_ASSERT(lock.held && lock.coordinated);
+	cluster_hw_unlock(&lock);
+	UT_ASSERT(!lock.held);
+	cluster_ges_request_timeout_ms = 1000;
+}
+
+UT_TEST(hw_unbounded_wait_requires_existing_transport_recovery)
+{
+	ClusterResId resid;
+	HwLock lock;
+	unsigned calls = hw_lock_acquire_calls;
+
+	reset_fixture();
+	cluster_hw_resid_encode((RelFileLocator){ 1663, 5, 16385 }, MAIN_FORKNUM, &resid);
+	cluster_ges_retransmit_max_attempts = 0;
+	UT_ASSERT(!cluster_hw_lock(&resid, &lock));
+	UT_ASSERT(!lock.held && !lock.coordinated);
+	UT_ASSERT_EQ(hw_lock_acquire_calls, calls);
+	cluster_ges_retransmit_max_attempts = 3;
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(14);
 	UT_RUN(owner_and_missing_regions);
 	UT_RUN(oid_original_refill_success_and_unused_grant);
 	UT_RUN(oid_original_exception_closes_refill);
@@ -748,6 +788,8 @@ main(void)
 	UT_RUN(hw_remote_seal_precedes_original_advance_wal_and_reply);
 	UT_RUN(hw_local_backend_and_existing_reply_keep_original_paths);
 	UT_RUN(shared_profile_cannot_publish_legacy_counter_reservations);
+	UT_RUN(hw_contention_wait_is_not_a_request_deadline);
+	UT_RUN(hw_unbounded_wait_requires_existing_transport_recovery);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

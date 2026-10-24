@@ -82,6 +82,7 @@
 #include "storage/backendid.h"
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
+#include "storage/condition_variable.h"
 #include "storage/latch.h"
 #include "storage/proc.h"
 #include "storage/lock.h"
@@ -298,6 +299,7 @@ typedef struct ClusterKoShared {
 	 * Passive READY/terminal identities survive its context cleanup. */
 	uint64 peer_fence_serial;
 	pg_atomic_uint64 peer_admission_revision;
+	ConditionVariable peer_admission_wait_cv;
 	uint64 holder_probe_nonce;
 	uint32 holder_probe_cursor;
 	ClusterKoPeerFenceV3 peer_fences[CLUSTER_KO_SHARED_CAPACITY];
@@ -323,6 +325,17 @@ typedef struct ClusterKoShared {
 static ClusterKoShared *ko_state = NULL;
 static ClusterKoPeerFenceHandleV3 ko_peer_attempt;
 static bool ko_peer_attempt_active;
+
+/* Admission waiters always re-sample the KO predicate after waking.  The
+ * broadcast is deliberately independent of shared_lock: it only publishes a
+ * latch wake and never grants admission by itself. */
+static inline void
+ko_peer_admission_wake(void)
+{
+	if (ko_state != NULL)
+		ConditionVariableBroadcast(&ko_state->peer_admission_wait_cv);
+}
+
 static bool ko_shared_v3_peer_identity_current(const ClusterKoSharedMessageV3 *message);
 static ClusterKoExtendWorkV3 ko_extend_local;
 static uint32 ko_extend_slot;
@@ -566,6 +579,7 @@ cluster_ko_shmem_init(void)
 		memset(ko_state->drop_trace, 0, sizeof(ko_state->drop_trace));
 		ko_state->peer_fence_serial = 0;
 		pg_atomic_init_u64(&ko_state->peer_admission_revision, 1);
+		ConditionVariableInit(&ko_state->peer_admission_wait_cv);
 		ko_state->holder_probe_nonce = 0;
 		ko_state->holder_probe_cursor = 0;
 		memset(ko_state->peer_fences, 0, sizeof(ko_state->peer_fences));
@@ -2020,6 +2034,17 @@ cluster_ko_peer_admission_begin_v3(RelFileLocator locator, ClusterKoPeerAdmissio
 	return allowed;
 }
 
+void
+cluster_ko_peer_admission_wait(long timeout_ms)
+{
+	if (ko_state == NULL)
+		return;
+	ConditionVariablePrepareToSleep(&ko_state->peer_admission_wait_cv);
+	(void) ConditionVariableTimedSleep(&ko_state->peer_admission_wait_cv,
+									 timeout_ms, WAIT_EVENT_PCM_BLOCK_CONVERT_WAIT);
+	ConditionVariableCancelSleep();
+}
+
 bool
 cluster_ko_peer_admission_current_v3(const ClusterKoPeerAdmissionV3 *admission,
 									 RelFileLocator locator)
@@ -2158,8 +2183,10 @@ cluster_ko_cleaner_enter_v3(RelFileLocator locator, const ClusterCtrcCleanerRead
 		work->scope = *scope;
 		work->used = true;
 		/* A scan started before this finite producer must be retried. */
-		if (fenced)
+		if (fenced) {
 			(void)pg_atomic_fetch_add_u64(&ko_state->peer_admission_revision, 1);
+			ko_peer_admission_wake();
+		}
 		allowed = true;
 	}
 	SpinLockRelease(&ko_state->shared_lock);
@@ -2188,6 +2215,7 @@ cluster_ko_cleaner_leave_v3(RelFileLocator locator, const ClusterCtrcCleanerRead
 			pg_atomic_write_u64(&ko_state->peer_admission_revision,
 								revision == 0 || revision == UINT64_MAX ? UINT64_MAX
 																		: revision + 1);
+			ko_peer_admission_wake();
 		}
 		memset(work, 0, sizeof(*work));
 		wake = true;
@@ -2634,6 +2662,7 @@ cluster_ko_create_end_v3(uint64 serial, bool complete)
 				uint64 revision = pg_atomic_read_u64(&ko_state->peer_admission_revision);
 				pg_atomic_write_u64(&ko_state->peer_admission_revision,
 									revision == 0 || revision == UINT64_MAX ? UINT64_MAX : revision + 1);
+				ko_peer_admission_wake();
 				break;
 			}
 		}
@@ -2788,6 +2817,7 @@ cluster_ko_extend_end_v3(uint64 serial)
 				pg_atomic_write_u64(&ko_state->peer_admission_revision,
 									revision == 0 || revision == UINT64_MAX ? UINT64_MAX
 																			: revision + 1);
+				ko_peer_admission_wake();
 				break;
 			}
 		}
@@ -2856,6 +2886,7 @@ ko_peer_fence_begin(const ClusterKoSharedMessageV3 *request,
 		/* Invalidate samples taken before this publication. No buffer or
 		 * PCM lock is acquired while holding the KO lock. */
 		(void)pg_atomic_fetch_add_u64(&ko_state->peer_admission_revision, 1);
+		ko_peer_admission_wake();
 		handle->slot = empty;
 		handle->serial = entry->serial;
 		*state = entry->state;
@@ -3111,6 +3142,7 @@ ko_peer_fence_ready(const ClusterKoSharedMessageV3 *request,
 			 * carry this fence's proof forward and invalidate all old samples.
 			 * Other in-progress scans reobserve through their original owner. */
 			pg_atomic_write_u64(&ko_state->peer_admission_revision, sealed_revision);
+			ko_peer_admission_wake();
 			entry->physical_revision = entry->local_scan_revision = sealed_revision;
 		}
 		entry->state = CLUSTER_KO_PEER_FENCE_READY;
@@ -3316,6 +3348,7 @@ ko_peer_discard_close_locked(ClusterKoPeerFenceV3 *entry)
 			return false;
 		identity->state = KO_DROP_IDENTITY_CLOSING;
 		pg_atomic_write_u64(&ko_state->peer_admission_revision, revision + 1);
+		ko_peer_admission_wake();
 		ko_peer_fence_physical_reset_locked(entry);
 	}
 	if (ko_directory_io_pending_locked(entry->request.base.key.locator)
@@ -3585,6 +3618,7 @@ ko_peer_fence_clear_locked(ClusterKoPeerFenceV3 *entry)
 		return false;
 	memset(entry, 0, sizeof(*entry));
 	(void)pg_atomic_fetch_add_u64(&ko_state->peer_admission_revision, 1);
+	ko_peer_admission_wake();
 	return true;
 }
 
@@ -3813,6 +3847,7 @@ cluster_ko_peer_commit_v3(int32 source_node, uint64 epoch, uint64 origin_boot,
 				}
 				identity->state = KO_DROP_IDENTITY_CLOSING;
 				pg_atomic_write_u64(&ko_state->peer_admission_revision, revision + 1);
+				ko_peer_admission_wake();
 			}
 			ok = !ko_directory_io_pending_locked(entry->request.base.key.locator);
 			if (ok)
@@ -4413,6 +4448,7 @@ ko_native_origin_checkpoint(ClusterKoCompletionV2 *owned)
 			&& memcmp(entry, &before, sizeof(before)) == 0 && !ko_drop_closed_locked(locator)) {
 			entry->origin_checkpoint = true;
 			(void)pg_atomic_fetch_add_u64(&ko_state->peer_admission_revision, 1);
+			ko_peer_admission_wake();
 			armed = true;
 		}
 	}
@@ -4617,6 +4653,7 @@ ko_native_origin_checkpoint(ClusterKoCompletionV2 *owned)
 				ko_state->contexts[owned->slot].origin_data_closed = true;
 				owned->origin_data_closed = true;
 				(void)pg_atomic_fetch_add_u64(&ko_state->peer_admission_revision, 1);
+				ko_peer_admission_wake();
 			}
 			SpinLockRelease(&ko_state->shared_lock);
 			if (closed)
@@ -5378,6 +5415,7 @@ cluster_ko_shared_native_publication_v3(void)
 				if (identity->state == KO_DROP_IDENTITY_RESERVED) {
 					identity->state = KO_DROP_IDENTITY_CLOSING;
 					pg_atomic_write_u64(&ko_state->peer_admission_revision, revision + 1);
+					ko_peer_admission_wake();
 				}
 				if (!ko_directory_io_pending_locked(before.request.key.locator))
 					identity->state = KO_DROP_IDENTITY_RETIRED;
@@ -8289,6 +8327,7 @@ ko_native_origin_discard_v4(ClusterKoCompletionV2 *owned, ClusterKoNativeContinu
 			before = work->context = *entry;
 			/* Consume our own close revision, never invalidate our prefix. */
 			pg_atomic_write_u64(&ko_state->peer_admission_revision, ++revision);
+			ko_peer_admission_wake();
 		}
 	}
 	SpinLockRelease(&ko_state->shared_lock);

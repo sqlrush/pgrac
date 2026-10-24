@@ -922,6 +922,10 @@ cluster_bufmgr_pcm_own_adopt_held_x_revoke(int buffer_id, const ResourceXLocalOw
 										   ClusterPcmOwnHeldXRevoke *held_out);
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_try_drain_held_x_revoke(const ClusterPcmOwnHeldXRevoke *held);
+/* Optional process-local sample from the same refusal predicate. */
+extern ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_try_drain_held_x_revoke_observed(
+	const ClusterPcmOwnHeldXRevoke *held, ClusterPcmOwnFinishRefusal *out_refusal);
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_try_drain_drop_x_revoke(BufferDesc *buf,
 											   const ClusterPcmOwnSnapshot *expected_revoking);

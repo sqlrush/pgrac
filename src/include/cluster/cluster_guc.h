@@ -155,6 +155,7 @@ extern bool cluster_xnode_profile_enabled;
 
 /* Diagnostic per-storage-UPDATE phase trace (default off). */
 extern bool cluster_update_trace_enabled;
+extern bool cluster_trace_tx_identity;
 
 /* Empty OID list disables passive visibility diagnostics. */
 /* Passive abort/invalidation phase logging; default off. */
@@ -185,7 +186,7 @@ extern int cluster_adg_lease_takeover_grace_ms;
 extern int cluster_adg_barrier_interval_ms;
 extern int cluster_wal_sender_timeout_sec;
 extern int cluster_wal_receiver_timeout_sec;
-/* spec-6.12c: resolver terminal memo switch (default off). */
+/* spec-6.12c: resolver terminal memo switch (default on; off for compatibility or diagnostics). */
 extern bool cluster_page_scn_shortcut;
 
 /* spec-6.12a: quiescent S-cache switch (default off). */

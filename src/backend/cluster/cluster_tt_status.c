@@ -67,7 +67,12 @@
 #include "cluster/cluster_tt_durable.h" /* spec-3.11 D5: overlay-miss durable lookup */
 #include "cluster/cluster_tt_slot.h"	/* cluster_tt_slot_id_to_offset, TT_SLOTS_PER_SEGMENT */
 #include "cluster/cluster_tt_status.h"
+#include "cluster/cluster_tx_identity_trace.h"
 #include "cluster/cluster_xid_stripe.h"
+
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_tx_enqueue.h"
+#endif
 
 /*
  * ClusterTTOverlayEntry -- HTAB value type.
@@ -902,6 +907,22 @@ cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus s
 
 	LWLockRelease(ClusterTTStatusLock);
 
+	/*
+	 * Publish-before-wake: this local terminal-install path wakes waiters
+	 * only after the exact holder status is visible.  The prepared-commit
+	 * resolver below follows the same ordering for its batch of exact keys.
+	 */
+	if (status == CLUSTER_TT_STATUS_COMMITTED || status == CLUSTER_TT_STATUS_ABORTED) {
+		if (cluster_trace_tx_identity) {
+			ClusterTxIdentityTrace row;
+
+			cluster_tx_identity_trace_source(&row, key);
+			row.status = status;
+			cluster_tx_identity_trace_emit(CLTXID_TERMINAL, &row);
+		}
+		cluster_txw_wake_waiters(key);
+	}
+
 	pg_atomic_fetch_add_u64(&ClusterTTStatusState->install_count, 1);
 	return true;
 }
@@ -916,6 +937,8 @@ cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
 	bool have_match = false;
 	uint16 match_origin = 0;
 	uint32 match_epoch = 0;
+	int wake_key_capacity;
+	ClusterTTStatusKey *wake_keys;
 	int resolved = 0;
 
 	if (!TransactionIdIsValid(xid) || !SCN_VALID(commit_scn))
@@ -925,6 +948,14 @@ cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
 
 	now = GetCurrentTimestamp();
 	adg_standby = cluster_tt_status_adg_standby_overlay_enabled();
+	/*
+	 * The overlay capacity is fixed when the hash is created, so reserve one
+	 * exact key slot per possible entry before taking the TT lock.  Keeping
+	 * allocation outside the critical section preserves the publish-before-
+	 * wake ordering even if memory pressure raises an ERROR.
+	 */
+	wake_key_capacity = Max(cluster_tt_status_overlay_max_entries, 1);
+	wake_keys = palloc0(mul_size(sizeof(*wake_keys), wake_key_capacity));
 
 	LWLockAcquire(ClusterTTStatusLock, LW_EXCLUSIVE);
 
@@ -954,6 +985,7 @@ cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
 		if (ambiguous) {
 			hash_seq_term(&seq);
 			LWLockRelease(ClusterTTStatusLock);
+			pfree(wake_keys);
 			ereport(LOG,
 					(errmsg("cluster standby skipped ambiguous prepared-transaction TT overlay "
 							"resolve for xid %u",
@@ -987,9 +1019,23 @@ cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
 		e->install_ts = now;
 		e->has_parent_key = false;
 		memset(&e->parent_key, 0, sizeof(e->parent_key));
+		Assert(resolved < wake_key_capacity);
+		wake_keys[resolved] = e->key;
 		resolved++;
 	}
 	LWLockRelease(ClusterTTStatusLock);
+
+	for (int i = 0; i < resolved; i++) {
+		if (cluster_trace_tx_identity) {
+			ClusterTxIdentityTrace row;
+
+			cluster_tx_identity_trace_source(&row, &wake_keys[i]);
+			row.status = CLUSTER_TT_STATUS_COMMITTED;
+			cluster_tx_identity_trace_emit(CLTXID_TERMINAL, &row);
+		}
+		cluster_txw_wake_waiters(&wake_keys[i]);
+	}
+	pfree(wake_keys);
 
 	if (resolved > 0)
 		pg_atomic_fetch_add_u64(&ClusterTTStatusState->recovery_overlay_rebuild_count,

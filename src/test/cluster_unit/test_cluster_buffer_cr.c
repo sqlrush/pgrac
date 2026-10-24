@@ -24,6 +24,7 @@
 #include <stdlib.h>
 
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_ko.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -497,6 +498,14 @@ pg_re_throw(void)
 	longjmp(error_jump, 1);
 }
 
+/* READ_IMAGE last-pin retirement has its own production-body fixture. This
+ * fixture exercises ordinary/CR owners only and must not model that bracket. */
+static void
+cluster_bufmgr_pcm_read_image_last_pin(BufferDesc *buf)
+{
+	UT_ASSERT(buf->pcm_state != (uint8) PCM_STATE_READ_IMAGE);
+}
+
 #include "test_cluster_buffer_cr_pins.inc"
 
 #define REFCOUNT_ARRAY_ENTRIES 8
@@ -634,9 +643,24 @@ copy_bytes(void *dst, const void *src, size_t size)
 	return memcpy(dst, src, size);
 }
 
+static unsigned pair_event_count;
+static ClusterContentTracePairEvent pair_event_reason;
+static int32 pair_event_result;
+
+static void
+capture_pair_event(Buffer buffer pg_attribute_unused(), ClusterContentTracePairEvent event,
+				   int32 result)
+{
+	pair_event_count++;
+	pair_event_reason = event;
+	pair_event_result = result;
+}
+
+#define cluster_content_trace_pair_event capture_pair_event
 #define memcpy copy_bytes
 #include "test_cluster_buffer_cr_owner.inc"
 #undef memcpy
+#undef cluster_content_trace_pair_event
 
 /* The relation AEL guarantees that no new version can enter while DROP scans.
  * The fixture preserves the production header-to-mapping lock order. */
@@ -1621,7 +1645,7 @@ UT_TEST(test_conditional_object_sample_never_replaces_pcm_proof)
 	for (unsigned refusal = 0; refusal < 5; refusal++) {
 		BufferTag tag = reset_buffers();
 		BufferDesc *buf = conditional_read_pin(0, &tag);
-		bool granted;
+		bool granted, pin_invalid = true;
 		memset(&pcm_conf, 0, sizeof(pcm_conf));
 		pcm_conf.node_count = 2;
 		ClusterConfShmem = &pcm_conf;
@@ -1639,11 +1663,47 @@ UT_TEST(test_conditional_object_sample_never_replaces_pcm_proof)
 			owner_flags[0] = PCM_OWN_FLAG_REVOKING;
 		else
 			buf->buffer_type = BUF_TYPE_CR;
-		granted = ConditionalLockBuffer(1);
+		granted = ConditionalLockBufferWithPinCheck(1, &pin_invalid);
 		UT_ASSERT(!granted);
+		UT_ASSERT(!pin_invalid);
 		if (granted)
 			LockBuffer(1, BUFFER_LOCK_UNLOCK);
 		UT_ASSERT_EQ(lock_depth, 0);
+		UnpinBuffer(buf);
+	}
+}
+
+UT_TEST(test_conditional_reports_each_invalid_pin_sample_after_unlock)
+{
+	for (unsigned cause = 0; cause < 3; cause++) {
+		BufferTag tag = reset_buffers();
+		BufferDesc *buf = conditional_read_pin(0, &tag);
+		PrivateRefCountEntry *ref = GetPrivateRefCountEntry(1, false);
+		PrivateRefCountEntry saved = *ref;
+		bool pin_invalid = false;
+
+		/* Missing/zero references are injected contract violations: the
+		 * independent fixture pin keeps the actual owner body observable. */
+		if (cause == 0) {
+			ref->refcount = 0;
+			ForgetPrivateRefCountEntry(ref);
+		} else if (cause == 1)
+			ref->refcount = 0;
+		else
+			ko_revision++;
+		pair_event_count = 0;
+		UT_ASSERT(!ConditionalLockBufferWithPinCheck(1, &pin_invalid));
+		UT_ASSERT(pin_invalid);
+		UT_ASSERT_EQ(pair_event_count, 1);
+		UT_ASSERT_EQ(pair_event_reason, CLPAIR_OBJECT_BLOCKED);
+		UT_ASSERT_EQ(pair_event_result, CLPAIR_OBJECT_NO_REF + cause);
+		UT_ASSERT_EQ(lock_depth, 0);
+		UT_ASSERT_EQ(remembered_pins, 1);
+		if (cause == 0) {
+			ReservePrivateRefCountEntry();
+			ref = NewPrivateRefCountEntry(1);
+		}
+		*ref = saved;
 		UnpinBuffer(buf);
 	}
 }
@@ -1958,7 +2018,7 @@ UT_TEST(test_committed_discard_removes_clean_cr_with_original_mapping_tail)
 int
 main(void)
 {
-	UT_PLAN(49);
+	UT_PLAN(50);
 	UT_RUN(test_origin_discard_scope_removes_dead_bytes_without_directory_retirement);
 	printf("# private pin entry: %zu bytes; current admission: %zu bytes\n",
 		   sizeof(PrivateRefCountEntry), sizeof(ClusterKoCurrentAdmissionV3));
@@ -2004,6 +2064,7 @@ main(void)
 	UT_RUN(test_conditional_admission_survives_private_pin_spill_and_restore);
 	UT_RUN(test_cleanup_lock_keeps_original_pin_when_object_is_fenced);
 	UT_RUN(test_conditional_object_sample_never_replaces_pcm_proof);
+	UT_RUN(test_conditional_reports_each_invalid_pin_sample_after_unlock);
 	UT_RUN(test_conditional_nonshared_paths_keep_native_behavior);
 	UT_RUN(test_committed_discard_requires_retired_identity_before_any_buffer_touch);
 	UT_RUN(test_committed_discard_removes_dirty_current_and_pi_all_forks_without_io);

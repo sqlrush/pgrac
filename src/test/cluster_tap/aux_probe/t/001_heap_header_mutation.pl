@@ -105,5 +105,38 @@ isnt($rc, 0, 'same-transaction second lock is not a new physical mutation');
 like($err, qr/fresh transaction/, 'no-op rejected instead of reported as completed');
 is($node->safe_psql('postgres', 'SELECT sum(value) FROM micro_heap'), '0',
 	'normal error cleanup preserves payload');
+
+# Rule 29.2 VM/FSM auxiliary scenarios must start from a real frozen,
+# all-visible heap.  Keep this fixture separate from micro_heap: the C probe
+# deliberately rejects ordinary or partially initialized pages.
+$node->safe_psql('postgres', q{
+	CREATE TABLE aux_mutate (
+		id integer NOT NULL,
+		value bigint NOT NULL,
+		pad text NOT NULL
+	) WITH (fillfactor=10);
+	INSERT INTO aux_mutate
+		SELECT g, 0, repeat('x', 700)
+		FROM generate_series(1,256) AS g;
+	CREATE FUNCTION aux_step(regclass,integer,integer) RETURNS void
+		AS '$libdir/test_pgrac_aux_consumer','test_pgrac_aux_step'
+		LANGUAGE C STRICT;
+});
+$node->safe_psql('postgres', 'VACUUM (FREEZE, ANALYZE) aux_mutate');
+my ($vm_geometry_rc, $vm_geometry_out, $vm_geometry_err) = $node->psql('postgres', q{
+	SELECT relpages::bigint || ':' || relallvisible::bigint
+	FROM pg_class WHERE oid = 'aux_mutate'::regclass
+});
+is($vm_geometry_rc, 0, 'all-visible fixture geometry query succeeds');
+chomp $vm_geometry_out;
+my ($vm_pages, $vm_allvisible) = split /:/, $vm_geometry_out;
+ok($vm_pages >= 16, 'all-visible fixture has the first sixteen heap blocks');
+is($vm_allvisible, $vm_pages, 'VACUUM FREEZE marks every fixture heap page all-visible');
+my ($vm_rc, $vm_out, $vm_err) = $node->psql('postgres',
+	"SELECT aux_step('aux_mutate',0,2)");
+is($vm_rc, 0, 'VM auxiliary step accepts the frozen all-visible fixture');
+my ($fsm_rc, $fsm_out, $fsm_err) = $node->psql('postgres',
+	"SELECT aux_step('aux_mutate',0,3)");
+is($fsm_rc, 0, 'FSM auxiliary step accepts the frozen all-visible fixture');
 $node->stop;
 done_testing();

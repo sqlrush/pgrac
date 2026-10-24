@@ -19,9 +19,12 @@
  *	  measured at ~2.7us per tuple with zero amortization.  Non-terminal
  *	  statuses (IN_PROGRESS / SUBCOMMITTED / CLEANED_OUT / UNKNOWN) are
  *	  NEVER memoized (rule 8.A: nothing uncertain is replayed).  Entries
- *	  are scoped to the installing top-level transaction (lxid-stamped),
- *	  which keeps the memo inside the snapshot-horizon guarantees the
- *	  exact-key TT lookup itself relies on.
+ *	  are scoped to the installing top-level transaction and current epoch;
+ *	  an observed domain change clears all entries. Incomplete identities
+ *	  never enter. Recycled TT slots still use origin-side wrap validation
+ *	  before the resolver can install a terminal fact. Transaction scoping
+ *	  keeps the memo inside the snapshot-horizon guarantees the exact-key
+ *	  TT lookup itself relies on.
  *
  *	  Backend-only header (pg_atomic + PGPROC dependencies).
  *
@@ -164,7 +167,8 @@ extern void cluster_xnode_lever_shmem_register(void);
  * Wave-c resolver memo (backend-local storage, shared counters).
  *
  * cluster_vis_memo_probe: true + fills status/scn only for a terminal
- * outcome installed by THIS top-level transaction under the exact key.
+ * outcome installed by THIS top-level transaction under the exact complete
+ * key in the current epoch. Observed transaction/epoch drift retires entries.
  * cluster_vis_memo_install: no-op unless status is terminal (COMMITTED
  * with a valid SCN, or ABORTED).  Both are no-ops while
  * cluster.page_scn_shortcut is off.

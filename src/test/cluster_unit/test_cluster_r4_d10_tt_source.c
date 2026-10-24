@@ -31,6 +31,7 @@
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_status.h"
+#include "cluster/cluster_tx_identity_trace.h"
 #include "cluster/cluster_xid_stripe.h"
 #include "miscadmin.h"
 #include "storage/lwlock.h"
@@ -52,6 +53,7 @@
 
 #include "unit_test.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 
@@ -60,6 +62,7 @@ UT_DEFINE_GLOBALS();
 
 bool cluster_enabled = true;
 bool cluster_shared_config = false;
+bool cluster_trace_tx_identity = false;
 int cluster_node_id = 1;
 bool cluster_enable_adg = false;
 int cluster_dg_role = CLUSTER_DG_ROLE_PRIMARY;
@@ -106,6 +109,21 @@ static int fake_recheck_count;
 static int fake_leave_count;
 static ClusterNormalStartState test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
 static bool test_recovered_open = true;
+static int fake_wake_count;
+static ClusterTTStatusKey fake_wake_key;
+static ClusterTTStatusKey fake_wake_keys[4];
+static ClusterTxIdentityTrace fake_terminal_trace;
+static int fake_terminal_traces;
+
+void
+cluster_tx_identity_trace_emit(ClusterTxIdentityTraceKind kind,
+								const ClusterTxIdentityTrace *row)
+{
+	UT_ASSERT_EQ(kind, CLTXID_TERMINAL);
+	UT_ASSERT(cluster_trace_tx_identity);
+	fake_terminal_trace = *row;
+	fake_terminal_traces++;
+}
 
 
 void
@@ -463,9 +481,54 @@ void
 cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unused())
 {}
 
+void *
+palloc0(Size bytes)
+{
+	return calloc(1, bytes);
+}
+
+void
+pfree(void *pointer)
+{
+	free(pointer);
+}
+
+Size
+mul_size(Size s1, Size s2)
+{
+	if (s2 != 0 && s1 > ((Size) -1) / s2)
+		abort();
+	return s1 * s2;
+}
+
+void
+cluster_txw_wake_waiters(const ClusterTTStatusKey *holder_key)
+{
+	if (cluster_trace_tx_identity) {
+		UT_ASSERT_EQ(fake_terminal_traces, fake_wake_count + 1);
+		UT_ASSERT(fake_terminal_trace.source_known);
+		UT_ASSERT(!fake_terminal_trace.tt_known);
+		UT_ASSERT(!fake_terminal_trace.generation_known);
+		UT_ASSERT_EQ(fake_terminal_trace.node, holder_key->origin_node_id);
+		UT_ASSERT_EQ(fake_terminal_trace.xid, holder_key->local_xid);
+		UT_ASSERT_EQ(fake_terminal_trace.epoch, holder_key->cluster_epoch);
+		UT_ASSERT_EQ(fake_terminal_trace.source_segment, holder_key->undo_segment_id);
+		UT_ASSERT_EQ(fake_terminal_trace.source_slot_id, holder_key->tt_slot_id);
+	}
+	fake_wake_count++;
+	UT_ASSERT_NOT_NULL(holder_key);
+	if (holder_key != NULL) {
+		fake_wake_key = *holder_key;
+		if (fake_wake_count <= (int) lengthof(fake_wake_keys))
+			fake_wake_keys[fake_wake_count - 1] = *holder_key;
+	}
+}
+
 static void
 reset_fixture(void)
 {
+	cluster_trace_tx_identity = false;
+	fake_terminal_traces = 0;
 	memset(fake_state_storage, 0, sizeof(fake_state_storage));
 	memset(fake_lock_storage, 0, sizeof(fake_lock_storage));
 	memset(fake_hash_storage, 0, sizeof(fake_hash_storage));
@@ -497,6 +560,9 @@ reset_fixture(void)
 	cluster_shared_config = false;
 	test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
 	test_recovered_open = true;
+	fake_wake_count = 0;
+	memset(&fake_wake_key, 0, sizeof(fake_wake_key));
+	memset(fake_wake_keys, 0, sizeof(fake_wake_keys));
 	cluster_tt_status_shmem_init();
 }
 
@@ -651,6 +717,7 @@ UT_TEST(test_install_lookup_and_delete_publish_only_after_recheck)
 	ClusterTTStatusSourceResult result;
 
 	reset_fixture();
+	cluster_trace_tx_identity = true;
 	memset(&request, 0, sizeof(request));
 	request.key = &key;
 	request.status = CLUSTER_TT_STATUS_COMMITTED;
@@ -659,6 +726,9 @@ UT_TEST(test_install_lookup_and_delete_publish_only_after_recheck)
 		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
 		CLUSTER_SEMANTIC_ADMISSION_OK);
 	UT_ASSERT(result.bool_value);
+	UT_ASSERT_EQ(fake_wake_count, 1);
+	UT_ASSERT_EQ(fake_terminal_trace.status, CLUSTER_TT_STATUS_COMMITTED);
+	UT_ASSERT_EQ(memcmp(&fake_wake_key, &key, sizeof(key)), 0);
 
 	memset(&result, 0xA5, sizeof(result));
 	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &request, &result),
@@ -1302,10 +1372,87 @@ UT_TEST(test_error_path_runs_single_leave_funnel)
 	UT_ASSERT_EQ(fake_leave_count, 1);
 }
 
+UT_TEST(test_abort_install_publishes_then_wakes_once)
+{
+	ClusterTTStatusKey key = make_key((TransactionId)606);
+	ClusterTTStatusSourceRequest request;
+	ClusterTTStatusSourceResult result;
+
+	reset_fixture();
+	cluster_trace_tx_identity = true;
+	memset(&request, 0, sizeof(request));
+	request.key = &key;
+	request.status = CLUSTER_TT_STATUS_ABORTED;
+	request.commit_scn = InvalidScn;
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT_EQ(fake_wake_count, 1);
+	UT_ASSERT_EQ(fake_terminal_trace.status, CLUSTER_TT_STATUS_ABORTED);
+	UT_ASSERT_EQ(memcmp(&fake_wake_key, &key, sizeof(key)), 0);
+
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_ABORTED);
+	UT_ASSERT_EQ(result.lookup.commit_scn, InvalidScn);
+}
+
+UT_TEST(test_prepared_commit_publishes_then_wakes_each_exact_holder)
+{
+	ClusterTTStatusKey key = make_key((TransactionId)607);
+	ClusterTTStatusKey sibling = key;
+	ClusterTTStatusSourceRequest request;
+	ClusterTTStatusSourceResult result;
+
+	reset_fixture();
+	cluster_trace_tx_identity = true;
+	sibling.undo_segment_id = 4;
+	sibling.tt_slot_id = 5;
+	memset(&request, 0, sizeof(request));
+	request.status = CLUSTER_TT_STATUS_IN_PROGRESS;
+	request.commit_scn = InvalidScn;
+	request.key = &key;
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	request.key = &sibling;
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT_EQ(fake_wake_count, 0);
+
+	memset(&request, 0, sizeof(request));
+	request.xid = key.local_xid;
+	request.commit_scn = UINT64_C(9007);
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(
+						 CLUSTER_TT_SOURCE_RESOLVE_PREPARED_COMMIT, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT_EQ(result.int_value, 2);
+	UT_ASSERT_EQ(fake_wake_count, 2);
+	UT_ASSERT_EQ(fake_terminal_trace.status, CLUSTER_TT_STATUS_COMMITTED);
+	UT_ASSERT_EQ(memcmp(&fake_wake_keys[0], &key, sizeof(key)), 0);
+	UT_ASSERT_EQ(memcmp(&fake_wake_keys[1], &sibling, sizeof(sibling)), 0);
+
+	request.key = &key;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_COMMITTED);
+	UT_ASSERT_EQ(result.lookup.commit_scn, UINT64_C(9007));
+}
+
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(21);
 	UT_RUN(test_frozen_tt_source_operation_domain);
 	UT_RUN(test_active_refuses_before_request_inspection_and_mutation);
 	UT_RUN(test_recovered_open_refuses_before_source_tt_access);
@@ -1316,6 +1463,8 @@ main(void)
 	UT_RUN(test_parent_chain_follow_counter_is_admitted);
 	UT_RUN(test_prepared_commit_resolves_local_origin_entries);
 	UT_RUN(test_prepared_commit_rejects_invalid_arguments);
+	UT_RUN(test_abort_install_publishes_then_wakes_once);
+	UT_RUN(test_prepared_commit_publishes_then_wakes_each_exact_holder);
 	UT_RUN(test_missing_required_pointer_closes_after_admission);
 	UT_RUN(test_unknown_operation_closes_after_admission);
 	UT_RUN(test_generation_drift_discards_fixed_result);

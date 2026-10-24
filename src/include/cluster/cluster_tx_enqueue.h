@@ -104,9 +104,9 @@ extern ClusterTxwResult cluster_tx_enqueue_wait_current_mx(const ClusterTTStatus
 /*
  * cluster_txw_wake_waiters — wake every backend waiting on holder_key.
  *
- *   Called from the TT-status-hint apply path when a holder transaction's
- *   status becomes terminal (COMMITTED/ABORTED), and from the dead-holder /
- *   reconfig fence path.  Matches on the FULL 24B key (H1):  the same
+ *   Called after any terminal TT publication (direct install, prepared-
+ *   commit resolution, or hint apply), and from the dead-holder / reconfig
+ *   fence path.  Matches on the FULL 24B key (H1):  the same
  *   (origin, xid, epoch) with a different undo_segment_id / tt_slot_id (slot
  *   reuse) must NOT be woken.
  */

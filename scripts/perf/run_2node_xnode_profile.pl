@@ -39,7 +39,8 @@
 #    spec-6.12 D0-shared additive hookups (buckets/attribution untouched):
 #      XP_EXTRA_GUC  semicolon-separated GUC lines injected into the solo
 #                    + pair cluster tiers (lever wave switches; default
-#                    empty = byte-identical 5.59 behaviour)
+#                    empty = product defaults; value-gate baselines set an
+#                    explicit OFF value where a wave now defaults ON)
 #      XP_STORAGE    'block_device' boots the PAIR on the spec-6.0a raw
 #                    block_device backend (loopback file image) instead
 #                    of the shared-nothing phantom harness
@@ -149,7 +150,8 @@ my $XP_OUT    = $ENV{XP_OUT}
   // File::Spec->catfile($REPO_ROOT, 'scripts', 'perf', 'results',
 	'xnode-profile-' . time() . '.md');
 
-# spec-6.12 D0-shared knobs (all default-off; empty = 5.59 behaviour).
+# spec-6.12 D0-shared knobs (wave-specific; callers that need a baseline
+# must set the corresponding GUC explicitly).
 my $XP_EXTRA_GUC = $ENV{XP_EXTRA_GUC} // '';
 my $XP_STORAGE   = $ENV{XP_STORAGE} // '';
 my $XP_TSV_OUT   = $ENV{XP_TSV_OUT} // '';

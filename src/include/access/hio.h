@@ -61,8 +61,10 @@ typedef struct BulkInsertStateData
 
 extern void RelationPutHeapTuple(Relation relation, Buffer buffer,
 								 HeapTuple tuple, bool token);
+/* otherBuffer may be NULL, or points to a pinned buffer whose descriptor can
+ * change when stale current admission requires an ordinary reread. */
 extern Buffer RelationGetBufferForTuple(Relation relation, Size len,
-										Buffer otherBuffer, int options,
+										Buffer *otherBuffer, int options,
 										BulkInsertStateData *bistate,
 										Buffer *vmbuffer, Buffer *vmbuffer_other,
 										int num_pages);

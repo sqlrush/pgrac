@@ -25,6 +25,38 @@
 SELECT name, setting, unit, context, source, pending_restart FROM pg_settings WHERE name = 'cluster.xnode_profile';
 ```
 
+## `cluster.trace_tx_identity`
+
+| 属性 | 值 |
+|---|---|
+| 类型 | `bool` |
+| 默认值 | `false` |
+| 范围/枚举 | on / off |
+| Context | `superuser` |
+| 生效方式 | 超级用户可在会话或配置文件中设置 |
+| 输出 | 服务端日志中的 `TX_IDENTITY` 记录 |
+
+采集跨节点事务等待时，在各节点的诊断配置中设置
+`cluster.trace_tx_identity = on`，启动诊断实例后核对：
+
+```sql
+SHOW cluster.trace_tx_identity;
+```
+
+会话内的 `SET` 仅影响当前会话。需要同时采集分配、origin 解析、终态发布和唤醒记录时，
+应在启动前为所有参与节点配置此参数。采集结束后关闭。
+
+`tt_known` / `generation_known` 表示 canonical TT 字段是否有效；数值 `0` 本身不表示未知。
+`source_segment` / `source_slot_id` 是 SOURCE 字段；`tt_slot` 是从零开始的 canonical 槽偏移。
+`uba0` / `uba1` 保存完整 DATA UBA；`itl_wrap` 是 ITL 字段，应与 `tt_wrap` 分开读取。
+`WAIT_TARGET` 可能不具备 canonical 字段，应结合 origin 的 `ORIGIN_MAP` 记录、节点启动身份
+和同次运行日志关联，不能用同 raw xid 的当前分配器样本补齐。
+
+每个进程、每类事件最多输出 32768 条，随后输出一次 `event=LIMIT`；`ORIGIN_MAP` 会在有界
+窗口内合并重复记录。`WAKE_SUMMARY` 的 `count` 是实际唤醒数，`skipped_targets` 是扫描中
+跳过的 TARGET 槽数，`omitted` 是未逐条输出的唤醒接收者数。出现 LIMIT 或 omitted 时保留
+证据缺口；没有某条记录也不能证明对应事件未发生。请与配置、二进制身份和原始节点日志一起保存。
+
 ## `cluster.adg_rfs_conninfos`
 
 | 属性 | 值 |

@@ -30,6 +30,23 @@ their own context below.
 Deprecated compatibility setting. Existing configuration files may keep either
 `on` or `off`; both values are accepted and have identical runtime behavior.
 
+### `cluster.page_scn_shortcut`
+
+| | |
+|---|---|
+| Type | boolean |
+| Default | `on` |
+| Context | superuser |
+
+Enables the cross-node visibility resolver's terminal-outcome memo. The normal
+read path reuses an exact-identity `COMMITTED` result with a valid SCN or an
+`ABORTED` result after the authoritative TT/undo lookup has proved it. Unknown,
+in-progress, incomplete-identity, or changed-identity results are never cached,
+so fail-closed visibility checks remain in force. Set this GUC to `off` only for
+compatibility or diagnostic baseline comparisons; the default keeps repeated
+remote terminal lookups from turning a large cross-node read into a per-row
+round trip.
+
 ### `cluster.node_id`
 
 | | |

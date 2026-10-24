@@ -95,6 +95,8 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	shared_data         => 1,
 	extra_conf          => [
 		'autovacuum = off',
+		# The product default is ON; L2 is the explicit OFF control leg.
+		'cluster.page_scn_shortcut = off',
 		# L355: widen heartbeat deathwatch under CI load.
 		'cluster.cssd_heartbeat_interval_ms = 2000',
 		'cluster.cssd_dead_deadband_factor = 10',

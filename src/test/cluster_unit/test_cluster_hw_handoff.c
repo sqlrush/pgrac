@@ -28,6 +28,9 @@
 #define cluster_lms_get_shard_master_generation retained_grd_generation
 #define errfinish retained_grd_errfinish
 #define ProcGlobal retained_grd_proc_global
+#define InterruptPending retained_grd_interrupt_pending
+#define ProcessInterrupts retained_grd_process_interrupts
+#define errcode retained_grd_errcode
 #include "test_cluster_grd.c"
 #undef main
 #undef ShmemInitStruct
@@ -39,11 +42,16 @@
 #undef cluster_lms_get_shard_master_generation
 #undef errfinish
 #undef ProcGlobal
+#undef InterruptPending
+#undef ProcessInterrupts
+#undef errcode
 
 #include <sys/wait.h>
 #include <unistd.h>
 #include "access/xact.h"
+#include "utils/timeout.h"
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_ges_holder.h"
 #include "cluster/cluster_ges_dedup.h"
@@ -168,6 +176,25 @@ static bool relation_case;
 static int ko_sample_calls;
 static int ko_accept_calls;
 
+/* This composition has no KO shared registry or content-trace publisher.
+ * Keep those external boundaries explicitly empty; GRD/GES are real. */
+bool
+cluster_ko_ax_native_wait_v3(const LOCKTAG *tag, bool dontwait)
+{
+	return true;
+}
+
+bool
+cluster_ko_ax_acquire_pending_v3(const ClusterResId *resid, uint32 procno, uint32 group)
+{
+	return false;
+}
+
+void
+cluster_content_trace_wait_clear(ClusterContentTraceWait kind)
+{
+}
+
 /* Real S3/GES/S5, with the KO owner an explicit boundary. Acceptance must
  * arrive before consumption, after both exact promotion/proof checks. */
 uint64
@@ -215,6 +242,17 @@ static bool release_case;
 static ReleaseFault release_fault;
 static bool release_route_changed;
 static int cooperative_sleeps;
+static int hw_release_after_sleeps;
+static int hw_signal_on_wait;
+static bool hw_lock_timeout, hw_statement_timeout;
+static TimestampTz hw_lock_timeout_finish, hw_statement_timeout_finish;
+static int hw_signal_error_code;
+/* The embedded GRD fixture renamed the first miscadmin declarations. */
+extern volatile sig_atomic_t InterruptPending;
+void ProcessInterrupts(void);
+int errcode(int code);
+static ConditionVariable *hw_wait_cv;
+static unsigned hw_wait_broadcasts;
 static int cooperative_drift;
 static bool guard_armed;
 static int guard_reads;
@@ -227,6 +265,32 @@ static bool hw_error_after_wait_release;
 static bool hw_local_case;
 static GesReplyPayload actual_reply;
 static ClusterICEnvelope actual_envelope;
+
+int
+errcode(int code)
+{
+	hw_signal_error_code = code;
+	return 0;
+}
+
+bool
+get_timeout_indicator(TimeoutId id, bool reset)
+{
+	bool *flag = id == LOCK_TIMEOUT ? &hw_lock_timeout : &hw_statement_timeout;
+	bool pending = *flag;
+
+	HW_CHECK(id == LOCK_TIMEOUT || id == STATEMENT_TIMEOUT);
+	if (reset)
+		*flag = false;
+	return pending;
+}
+
+TimestampTz
+get_timeout_finish_time(TimeoutId id)
+{
+	HW_CHECK(id == LOCK_TIMEOUT || id == STATEMENT_TIMEOUT);
+	return id == LOCK_TIMEOUT ? hw_lock_timeout_finish : hw_statement_timeout_finish;
+}
 
 void
 errfinish(const char *file, int line, const char *function)
@@ -397,15 +461,24 @@ ConditionVariableCancelSleep(void)
 void
 ConditionVariableBroadcast(ConditionVariable *cv)
 {
-	(void)cv;
+	if (hw_local_case && cv == hw_wait_cv)
+		hw_wait_broadcasts++;
 }
 bool
 ConditionVariableTimedSleep(ConditionVariable *cv, long ms, uint32 event)
 {
-	(void)cv;
+	hw_wait_cv = cv;
 	(void)event;
 	cooperative_sleeps++;
-	if (hw_release_on_wait != NULL) {
+	if (hw_signal_on_wait != 0 && cooperative_sleeps == 1) {
+		ProcDiePending = hw_signal_on_wait == 1;
+		QueryCancelPending = hw_signal_on_wait >= 2;
+		InterruptPending = true;
+		/* Match the production CV's interrupt check. A held content LWLock
+		 * makes native ProcessInterrupts defer these signals. */
+		CHECK_FOR_INTERRUPTS();
+	}
+	if (hw_release_on_wait != NULL && cooperative_sleeps >= hw_release_after_sleeps) {
 		const ClusterLockAcquireRequest *owner = hw_release_on_wait;
 		int procno = MyProc->pgprocno;
 		hw_release_on_wait = NULL;
@@ -646,10 +719,16 @@ cluster_touched_peers_stamp(int32 node, ClusterTouchKind kind)
 	return true;
 }
 volatile sig_atomic_t InterruptPending = false;
+volatile sig_atomic_t ProcDiePending = false;
+volatile sig_atomic_t QueryCancelPending = false;
 volatile uint32 InterruptHoldoffCount = 0;
+volatile uint32 QueryCancelHoldoffCount = 0;
+volatile uint32 CritSectionCount = 0;
 void
 ProcessInterrupts(void)
 {
+	if (InterruptHoldoffCount != 0 || CritSectionCount != 0)
+		return;
 	abort();
 }
 bool
@@ -1859,6 +1938,12 @@ hw_local_competitors(ClusterLockAcquireRequest *a, ClusterLockAcquireRequest *b)
 	hw_local_case = true;
 	hw_release_on_wait = NULL;
 	cooperative_sleeps = 0;
+	hw_release_after_sleeps = 0;
+	hw_signal_on_wait = 0;
+	hw_lock_timeout = hw_statement_timeout = false;
+	hw_signal_error_code = 0;
+	hw_wait_cv = NULL;
+	hw_wait_broadcasts = 0;
 	*b = *a;
 	b->holder = grd_lifecycle_holder(3, 22, 202);
 	b->holder.cluster_epoch = 1;
@@ -1903,6 +1988,128 @@ UT_TEST(hw_local_two_reservations_survive_exact_grants)
 	UT_ASSERT_EQ(request_sent, 0);
 	UT_ASSERT_EQ(ut_mock_epoch, 1);
 	MyProc = NULL;
+}
+
+UT_TEST(hw_blocking_queue_survives_retry_ticks_until_holder_wakes_it)
+{
+	ClusterLockAcquireRequest a, b;
+	ClusterLockAcquireResult a3, b3;
+	TimestampTz started;
+
+	hw_local_competitors(&a, &b);
+	b.timeout_ms = -1; /* The HW wrapper's blocking policy. */
+	cluster_ges_request_timeout_ms = 1;
+	a3 = cluster_lock_acquire_s3_partition_reservation(&a);
+	MyProc->pgprocno = 22;
+	b3 = cluster_lock_acquire_s3_partition_reservation(&b);
+	hw_dispatch_reserved(&a, a3);
+	UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&a), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	hw_release_on_wait = &a;
+	hw_release_after_sleeps = 4;
+	started = GetCurrentTimestamp();
+	/* Real GRD queue + S6 drain + reply publication; only scheduling and
+	 * CV sleep are cooperative fixtures. Three recovery ticks are not errors. */
+	hw_dispatch_reserved(&b, b3);
+	UT_ASSERT_EQ(cooperative_sleeps, 4);
+	UT_ASSERT(GetCurrentTimestamp() - started >= 3000000);
+	UT_ASSERT(hw_wait_broadcasts > 0);
+	UT_ASSERT(hw_release_on_wait == NULL);
+	UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&b), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(cluster_lock_acquire_s6_release(&b), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+	UT_ASSERT_EQ(request_sent, 0); /* Local-master wait needs no polling messages. */
+	cluster_ges_request_timeout_ms = 5000;
+}
+
+static void
+hw_pending_signal_under_content_lock(int signal_kind, bool critical, bool cancel_held)
+{
+	static ClusterLockAcquireRequest a, b; /* Survive the ERROR unwind. */
+	volatile bool caught = false;
+	LOCKMODE mode = NoLock;
+
+	hw_local_competitors(&a, &b);
+	b.timeout_ms = -1;
+	hw_dispatch_reserved(&a, cluster_lock_acquire_s3_partition_reservation(&a));
+	UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&a), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	MyProc->pgprocno = b.holder.procno;
+	UT_ASSERT_EQ(cluster_lock_acquire_s3_partition_reservation(&b),
+				 CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	hw_release_on_wait = &a;
+	hw_release_after_sleeps = 2; /* Bound the original RED; never hang the test. */
+	hw_signal_on_wait = signal_kind;
+	hw_lock_timeout = signal_kind == 3 || signal_kind >= 5;
+	hw_statement_timeout = signal_kind >= 4;
+	hw_statement_timeout_finish = 100;
+	hw_lock_timeout_finish = signal_kind == 5 ? 200 : 100;
+	InterruptHoldoffCount = 1; /* An outer index buffer content lock. */
+	CritSectionCount = critical;
+	QueryCancelHoldoffCount = cancel_held;
+	PG_TRY();
+	{
+		(void)cluster_lock_acquire_s4_remote_request_wait(&b);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	/* A caught query_canceled must not re-deliver the same request. Shutdown
+	 * stays armed so native recovery disconnects after exact cleanup. */
+	UT_ASSERT_EQ(caught, !critical && !cancel_held);
+	UT_ASSERT_EQ(ProcDiePending, signal_kind == 1);
+	UT_ASSERT_EQ(QueryCancelPending, signal_kind >= 2 && !caught);
+	if (caught) {
+		int expected = signal_kind == 1 ? ERRCODE_ADMIN_SHUTDOWN
+			: (signal_kind == 3 || signal_kind == 6) ? ERRCODE_LOCK_NOT_AVAILABLE
+			: ERRCODE_QUERY_CANCELED;
+
+		UT_ASSERT_EQ(hw_signal_error_code, expected);
+		UT_ASSERT(!hw_lock_timeout && !hw_statement_timeout);
+	}
+	InterruptPending = ProcDiePending = QueryCancelPending = false;
+	InterruptHoldoffCount = CritSectionCount = QueryCancelHoldoffCount = 0;
+	hw_signal_on_wait = 0;
+	UT_ASSERT_EQ(cluster_ges_reply_wait_table_active_count(), 0);
+	if (caught) {
+		UT_ASSERT_EQ(cooperative_sleeps, 1);
+		UT_ASSERT(!b.hw_grant.cleanup_pending);
+		UT_ASSERT(!cluster_grd_holder_mode_by_id(&b.resid, &b.holder, &mode));
+		UT_ASSERT(cluster_grd_holder_mode_by_id(&a.resid, &a.holder, &mode));
+		hw_release_on_wait = NULL;
+		MyProc->pgprocno = a.holder.procno;
+		UT_ASSERT_EQ(cluster_lock_acquire_s6_release(&a), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	} else {
+		UT_ASSERT_EQ(cooperative_sleeps, 2);
+		UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&b), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+		UT_ASSERT_EQ(cluster_lock_acquire_s6_release(&b), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	}
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+}
+
+UT_TEST(hw_shutdown_pending_under_content_lock_unwinds_exact_waiter)
+{
+	hw_pending_signal_under_content_lock(1, false, false);
+}
+
+UT_TEST(hw_query_cancel_under_content_lock_unwinds_exact_waiter)
+{
+	hw_pending_signal_under_content_lock(2, false, false);
+}
+
+UT_TEST(hw_signal_keeps_critical_and_cancel_holdoff_boundaries)
+{
+	hw_pending_signal_under_content_lock(1, true, false);
+	hw_pending_signal_under_content_lock(2, false, true);
+}
+
+UT_TEST(hw_query_cancel_consumes_native_timeout_causes_once)
+{
+	hw_pending_signal_under_content_lock(3, false, false);
+	hw_pending_signal_under_content_lock(4, false, false);
+	hw_pending_signal_under_content_lock(5, false, false);
+	hw_pending_signal_under_content_lock(6, false, false);
 }
 
 UT_TEST(object_startup_compatible_reservations_survive_registration)
@@ -2527,7 +2734,7 @@ main(void)
 	MyBackendType = B_BACKEND; /* Definition belongs to the embedded GRD fixture. */
 	setvbuf(stdout, NULL, _IONBF, 0);
 	alarm(30); /* Standalone fixture owner, not a database deadline. */
-	UT_PLAN(51);
+	UT_PLAN(56);
 	UT_RUN(no_sibling_control);
 	UT_RUN(real_grant_sibling_promotes);
 	UT_RUN(relation_share_grant_survives_compatible_sibling);
@@ -2568,6 +2775,11 @@ main(void)
 	UT_RUN(hw_local_cancel_after_grant_keeps_exact_cleanup_owner);
 	UT_RUN(hw_local_grant_rejects_epoch_change_before_promotion);
 	UT_RUN(hw_local_two_reservations_survive_exact_grants);
+	UT_RUN(hw_blocking_queue_survives_retry_ticks_until_holder_wakes_it);
+	UT_RUN(hw_shutdown_pending_under_content_lock_unwinds_exact_waiter);
+	UT_RUN(hw_query_cancel_under_content_lock_unwinds_exact_waiter);
+	UT_RUN(hw_signal_keeps_critical_and_cancel_holdoff_boundaries);
+	UT_RUN(hw_query_cancel_consumes_native_timeout_causes_once);
 	UT_RUN(object_startup_compatible_reservations_survive_registration);
 	UT_RUN(native_request_reservation_capacity_remains_bounded);
 	UT_RUN(hw_local_release_does_not_invalidate_another_reserved_request);

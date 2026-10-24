@@ -44,6 +44,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_xnode_lever.h"
 #include "storage/proc.h"
 
@@ -84,6 +85,13 @@ bool cluster_xnode_profile_enabled = false;
 /* Backend identity: the memo stamps entries with MyProc->lxid. */
 static PGPROC ut_proc;
 PGPROC *MyProc = &ut_proc;
+static uint64 ut_epoch = 5;
+
+uint64
+cluster_epoch_get_current(void)
+{
+	return ut_epoch;
+}
 
 /* L105 union force-align ShmemInitStruct stub. */
 void *
@@ -155,7 +163,7 @@ UT_TEST(test_lever_shmem_init_zeroes)
 
 UT_TEST(test_lever_guc_off_inert)
 {
-	ClusterTTStatusKey k = mk_key(1, 2, 33, 0, 1000);
+	ClusterTTStatusKey k = mk_key(1, 2, 33, 5, 1000);
 	uint8 status = 0;
 	SCN scn = 0;
 
@@ -178,7 +186,7 @@ UT_TEST(test_lever_guc_off_inert)
 
 UT_TEST(test_lever_committed_roundtrip)
 {
-	ClusterTTStatusKey k = mk_key(1, 2, 33, 0, 1000);
+	ClusterTTStatusKey k = mk_key(1, 2, 33, 5, 1000);
 	uint8 status = 0;
 	SCN scn = 0;
 
@@ -196,7 +204,7 @@ UT_TEST(test_lever_committed_roundtrip)
 
 UT_TEST(test_lever_nonterminal_never_installed)
 {
-	ClusterTTStatusKey k = mk_key(3, 4, 55, 0, 2000);
+	ClusterTTStatusKey k = mk_key(3, 4, 55, 5, 2000);
 	uint8 status = 0;
 	SCN scn = 0;
 	uint64 pre_install = ctr(&ClusterXnodeLeverCtl->c_memo_install_count);
@@ -217,7 +225,7 @@ UT_TEST(test_lever_nonterminal_never_installed)
 
 UT_TEST(test_lever_lxid_scope_fencing)
 {
-	ClusterTTStatusKey k = mk_key(1, 2, 34, 0, 1001);
+	ClusterTTStatusKey k = mk_key(1, 2, 34, 5, 1001);
 	uint8 status = 0;
 	SCN scn = 0;
 
@@ -229,6 +237,39 @@ UT_TEST(test_lever_lxid_scope_fencing)
 	/* next top-level transaction: prior entries never replay */
 	ut_proc.lxid = 8;
 	UT_ASSERT(!cluster_vis_memo_probe(&k, &status, &scn));
+	/* Old numeric lxid reuse must not resurrect entries from an earlier
+	 * observed transaction, even if the local counter eventually wraps. */
+	ut_proc.lxid = 7;
+	UT_ASSERT(!cluster_vis_memo_probe(&k, &status, &scn));
+}
+
+UT_TEST(test_lever_epoch_drift_and_incomplete_identity_never_replay)
+{
+	ClusterTTStatusKey k = mk_key(1, 2, 40, 5, 3100);
+	ClusterTTStatusKey incomplete;
+	uint8 status = 0;
+	SCN scn = 0;
+
+	cluster_page_scn_shortcut = true;
+	ut_epoch = 5;
+	ut_proc.lxid = 10;
+	cluster_vis_memo_install(&k, CLUSTER_TT_STATUS_COMMITTED, (SCN)710);
+	UT_ASSERT(cluster_vis_memo_probe(&k, &status, &scn));
+	ut_epoch = 6;
+	UT_ASSERT(!cluster_vis_memo_probe(&k, &status, &scn));
+	/* A stale key cannot be installed under the new identity domain. */
+	cluster_vis_memo_install(&k, CLUSTER_TT_STATUS_ABORTED, InvalidScn);
+	UT_ASSERT(!cluster_vis_memo_probe(&k, &status, &scn));
+	ut_epoch = 5;
+	UT_ASSERT(!cluster_vis_memo_probe(&k, &status, &scn));
+	incomplete = k;
+	incomplete.tt_slot_id = 0;
+	cluster_vis_memo_install(&incomplete, CLUSTER_TT_STATUS_COMMITTED, (SCN)720);
+	UT_ASSERT(!cluster_vis_memo_probe(&incomplete, &status, &scn));
+	incomplete = k;
+	incomplete.local_xid = InvalidTransactionId;
+	cluster_vis_memo_install(&incomplete, CLUSTER_TT_STATUS_ABORTED, InvalidScn);
+	UT_ASSERT(!cluster_vis_memo_probe(&incomplete, &status, &scn));
 }
 
 UT_TEST(test_lever_exact_key_discipline)
@@ -254,7 +295,7 @@ UT_TEST(test_lever_exact_key_discipline)
 
 UT_TEST(test_lever_aborted_roundtrip)
 {
-	ClusterTTStatusKey k = mk_key(2, 1, 77, 0, 4000);
+	ClusterTTStatusKey k = mk_key(2, 1, 77, 5, 4000);
 	uint8 status = 0;
 	SCN scn = 12345; /* poisoned; must come back InvalidScn */
 
@@ -304,13 +345,14 @@ UT_DEFINE_GLOBALS();
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
 
 	UT_RUN(test_lever_shmem_init_zeroes);
 	UT_RUN(test_lever_guc_off_inert);
 	UT_RUN(test_lever_committed_roundtrip);
 	UT_RUN(test_lever_nonterminal_never_installed);
 	UT_RUN(test_lever_lxid_scope_fencing);
+	UT_RUN(test_lever_epoch_drift_and_incomplete_identity_never_replay);
 	UT_RUN(test_lever_exact_key_discipline);
 	UT_RUN(test_lever_aborted_roundtrip);
 	UT_RUN(test_lever_measure_mode_counters);

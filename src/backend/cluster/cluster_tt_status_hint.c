@@ -59,7 +59,6 @@
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_shmem.h"
-#include "cluster/cluster_tx_enqueue.h" /* spec-5.2 D6: wake TX-enqueue waiters */
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_tt_status_hint.h"
 
@@ -888,16 +887,6 @@ cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const v
 	if (tt_admission != CLUSTER_SEMANTIC_ADMISSION_OK || !tt_result.bool_value)
 		return;
 
-	if (!is_v3_subcommitted) {
-		/*
-		 * spec-5.2 D6:  a remote holder just became terminal on this node's
-		 * TT cache — wake any backend blocked in cluster_tx_enqueue_wait on
-		 * that holder so it re-judges (apply-then-wake gives a happens-before:
-		 * the woken waiter re-checks the status and sees it terminal).
-		 */
-		if (status_raw == CLUSTER_TT_STATUS_COMMITTED || status_raw == CLUSTER_TT_STATUS_ABORTED)
-			cluster_txw_wake_waiters(key);
-	}
 	pg_atomic_fetch_add_u64(&ClusterTTHintCounters->install_count, 1);
 }
 

@@ -251,6 +251,13 @@ int wal_level = WAL_LEVEL_REPLICA;
 static bool *smart_fusion_value_addr = NULL;
 static bool smart_fusion_boot_value = true;
 static GucContext smart_fusion_context = PGC_INTERNAL;
+static bool *tx_identity_value_addr = NULL;
+static bool tx_identity_boot_value = true;
+static GucContext tx_identity_context = PGC_INTERNAL;
+static bool *writer_chain_value_addr = NULL;
+static bool writer_chain_boot_value = false;
+static GucContext writer_chain_context = PGC_INTERNAL;
+static GucBoolCheckHook writer_chain_check_hook = NULL;
 
 void
 DefineCustomBoolVariable(const char *name, const char *short_desc pg_attribute_unused(),
@@ -267,6 +274,17 @@ DefineCustomBoolVariable(const char *name, const char *short_desc pg_attribute_u
 		smart_fusion_value_addr = valueAddr;
 		smart_fusion_boot_value = bootValue;
 		smart_fusion_context = context;
+	}
+	if (strcmp(name, "cluster.trace_tx_identity") == 0) {
+		tx_identity_value_addr = valueAddr;
+		tx_identity_boot_value = bootValue;
+		tx_identity_context = context;
+	}
+	if (strcmp(name, "cluster.crossnode_write_write") == 0) {
+		writer_chain_value_addr = valueAddr;
+		writer_chain_boot_value = bootValue;
+		writer_chain_context = context;
+		writer_chain_check_hook = check_hook;
 	}
 }
 
@@ -823,14 +841,41 @@ UT_TEST(test_catalog_trace_is_off_and_superuser_scoped)
 	}
 }
 
+UT_TEST(test_tx_identity_trace_is_off_and_superuser_scoped)
+{
+	UT_ASSERT(!cluster_trace_tx_identity);
+	cluster_init_guc();
+	UT_ASSERT(tx_identity_value_addr == &cluster_trace_tx_identity);
+	UT_ASSERT(!tx_identity_boot_value);
+	UT_ASSERT_EQ(tx_identity_context, PGC_SUSET);
+}
+
+UT_TEST(test_terminal_writer_chaining_defaults_on)
+{
+	UT_ASSERT(cluster_crossnode_write_write);
+}
+
+UT_TEST(test_terminal_writer_chaining_registration_defaults_on)
+{
+	cluster_init_guc();
+	UT_ASSERT(writer_chain_value_addr == &cluster_crossnode_write_write);
+	UT_ASSERT(writer_chain_boot_value);
+	UT_ASSERT_EQ(writer_chain_context, PGC_SUSET);
+	/* Explicit OFF remains available for the conservative comparison. */
+	UT_ASSERT(writer_chain_check_hook == NULL);
+}
+
 int
 main(void)
 {
 #ifdef ENABLE_INJECTION
-	UT_PLAN(13);
+	UT_PLAN(16);
 #else
-	UT_PLAN(12);
+	UT_PLAN(15);
 #endif
+	UT_RUN(test_terminal_writer_chaining_defaults_on);
+	UT_RUN(test_terminal_writer_chaining_registration_defaults_on);
+	UT_RUN(test_tx_identity_trace_is_off_and_superuser_scoped);
 	UT_RUN(test_catalog_trace_is_off_and_superuser_scoped);
 	UT_RUN(test_cluster_node_id_default_is_minus_one);
 	UT_RUN(test_cluster_node_id_address_stable);

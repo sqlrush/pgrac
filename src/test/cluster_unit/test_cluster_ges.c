@@ -89,6 +89,8 @@
 #undef strerror_r
 
 #include "unit_test.h"
+#include "cluster/cluster_content_trace.h"
+#include "utils/timeout.h"
 
 /* PGRAC: these legacy protocol cases do not enter PRE2 retirement.
  * Its real service/master combinations have dedicated tests.
@@ -1379,6 +1381,33 @@ ClusterXnodeProfileShared *ClusterXnodeProfileCtl = NULL;
 
 /* CHECK_FOR_INTERRUPTS() in the local-master wait loop. */
 volatile sig_atomic_t InterruptPending = false;
+volatile sig_atomic_t ProcDiePending = false;
+volatile sig_atomic_t QueryCancelPending = false;
+volatile uint32 InterruptHoldoffCount = 0;
+volatile uint32 QueryCancelHoldoffCount = 0;
+volatile uint32 CritSectionCount = 0;
+
+/* No buffer/content ownership is fabricated by this protocol fixture. */
+void
+cluster_content_trace_wait_clear(ClusterContentTraceWait kind)
+{
+	(void)kind;
+}
+
+bool
+get_timeout_indicator(TimeoutId id, bool reset)
+{
+	(void)id;
+	(void)reset;
+	return false; /* No asynchronous timeout is armed in this fixture. */
+}
+
+TimestampTz
+get_timeout_finish_time(TimeoutId id)
+{
+	(void)id;
+	abort(); /* No timeout cause: a finish time must not be queried. */
+}
 
 void
 ProcessInterrupts(void)

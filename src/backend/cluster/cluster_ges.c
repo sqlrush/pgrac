@@ -54,6 +54,8 @@
 #include "cluster/cluster_membership.h"		   /* RF-ROOT P6 diag */
 #include "cluster/cluster_native_lock_probe.h" /* spec-2.25 D5 — probe protocol handlers */
 #include "cluster/cluster_grd_work_queue.h"
+#include "cluster/cluster_wait_trace.h"
+#include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_guc.h"		   /* cluster_node_id + cluster_ges_request_timeout_ms */
 #include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 class 1 */
 #include "cluster/cluster_wal_retention.h" /* RF-ROOT P6 WALR conditional convert */
@@ -80,6 +82,7 @@
 #include "port/atomics.h"
 #include "storage/shmem.h"
 #include "utils/elog.h"
+#include "utils/timeout.h"
 #include "utils/wait_event.h"
 
 
@@ -2652,17 +2655,64 @@ ges_arm_local_request_grant(ClusterGesHwGrant *grant, const ClusterResId *resid,
 	grant->cleanup_pending = true;
 }
 
+static void
+ges_hw_wait_check_interrupts(const ClusterResId *resid)
+{
+	/* An index split may hold its original content LWLock while acquiring
+	 * HW. Native ProcessInterrupts defers under that lock. At this wait
+	 * boundary no extension has been performed: ERROR can use S4's exact
+	 * waiter/grant cleanup, followed by native transaction/LWLock cleanup.
+	 * Never clear the caller's holdoff counts and resume its protected work.
+	 * Keep ProcDiePending set so native shutdown disconnects after unwind. */
+	if (resid == NULL || resid->type != CLUSTER_HW_RESID_TYPE
+		|| MyBackendType != B_BACKEND || InterruptHoldoffCount == 0
+		|| CritSectionCount != 0 || QueryCancelHoldoffCount != 0)
+		return;
+	if (ProcDiePending)
+		ereport(ERROR,
+				(errcode(ERRCODE_ADMIN_SHUTDOWN),
+				 errmsg("canceling statement during administrator shutdown while waiting for cluster relation extension")));
+	if (QueryCancelPending) {
+		bool lock_timeout, statement_timeout;
+
+		/* Match native cancellation consumption, including EXCEPTION
+		 * handlers that catch this ERROR without reaching PostgresMain. */
+		QueryCancelPending = false;
+		lock_timeout = get_timeout_indicator(LOCK_TIMEOUT, true);
+		statement_timeout = get_timeout_indicator(STATEMENT_TIMEOUT, true);
+		if (lock_timeout && statement_timeout
+			&& get_timeout_finish_time(STATEMENT_TIMEOUT) < get_timeout_finish_time(LOCK_TIMEOUT))
+			lock_timeout = false;
+		if (lock_timeout)
+			ereport(ERROR, (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+							errmsg("canceling statement due to lock timeout")));
+		if (statement_timeout)
+			ereport(ERROR, (errcode(ERRCODE_QUERY_CANCELED),
+							errmsg("canceling statement due to statement timeout")));
+		ereport(ERROR,
+				(errcode(ERRCODE_QUERY_CANCELED),
+				 errmsg("canceling statement while waiting for cluster relation extension")));
+	}
+}
+
 /* Startup uses private signal flags. Check both sides of each real sleep so
  * a reply racing SIGTERM cannot turn a cancelled wait into further recovery.
  * Original proc_exit owns CV/native-lock cleanup and shared CONTROL transfer. */
 static bool
-ges_timed_sleep(ConditionVariable *cv, long timeout_ms, uint32 wait_event)
+ges_timed_sleep(ConditionVariable *cv, long timeout_ms, uint32 wait_event,
+				const ClusterResId *resid, uint64 request_id)
 {
 	bool timed_out;
 
 	if (AmStartupProcess() && !proc_exit_inprogress)
 		HandleStartupProcInterrupts();
+	if (cluster_trace_tx_identity && resid != NULL && resid->type == LOCKTAG_TRANSACTION)
+		cluster_buffer_trace_tx_wait(CLWAIT_SITE_GES_TX, ges_local_wait_seq(),
+								 resid->field1, request_id);
 	timed_out = ConditionVariableTimedSleep(cv, timeout_ms, wait_event);
+#ifdef USE_PGRAC_CLUSTER
+	cluster_content_trace_wait_clear(CLCONTENT_TX);
+#endif
 	if (AmStartupProcess() && !proc_exit_inprogress)
 		HandleStartupProcInterrupts();
 	return timed_out;
@@ -2948,7 +2998,9 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 						sleep_ms = (int)remaining_ms;
 				}
 
-				(void)ges_timed_sleep(&entry->cv, sleep_ms, wait_ev);
+				ges_hw_wait_check_interrupts(resid);
+				(void)ges_timed_sleep(&entry->cv, sleep_ms, wait_ev, resid, request_id);
+				ges_hw_wait_check_interrupts(resid);
 				CHECK_FOR_INTERRUPTS();
 			}
 		}
@@ -3151,6 +3203,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 	while (!entry->ready) {
 		int sleep_ms;
 		long remaining_ms;
+		bool sleep_timed_out;
 
 		/*
 		 * spec-5.7 Direction B — dead-master native-safe abort.
@@ -3237,7 +3290,10 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 				sleep_ms = (int)remaining_ms;
 		}
 
-		if (!ges_timed_sleep(&entry->cv, sleep_ms, wait_ev)) {
+		ges_hw_wait_check_interrupts(resid);
+		sleep_timed_out = ges_timed_sleep(&entry->cv, sleep_ms, wait_ev, resid, request_id);
+		ges_hw_wait_check_interrupts(resid);
+		if (!sleep_timed_out) {
 			/* CV signaled — re-check loop predicate. */
 			continue;
 		}
@@ -3921,7 +3977,7 @@ ges_release_send_owned(const struct ClusterResId *resid, const struct ClusterGrd
 					sleep_ms = (int)remaining_ms;
 			}
 
-			if (!ges_timed_sleep(&entry->cv, sleep_ms, effective_wait_event))
+			if (!ges_timed_sleep(&entry->cv, sleep_ms, effective_wait_event, resid, holder->request_id))
 				continue;
 
 			if (pending)
@@ -4332,7 +4388,8 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 			remaining_ms = 1;
 		if (remaining_ms > 100)
 			remaining_ms = 100;
-		(void)ges_timed_sleep(&entry->cv, remaining_ms, WAIT_EVENT_GES_CONVERT_WAIT);
+		(void)ges_timed_sleep(&entry->cv, remaining_ms, WAIT_EVENT_GES_CONVERT_WAIT,
+							  resid, convert_request_id);
 	}
 	ConditionVariableCancelSleep();
 	cluster_xp_end(&xp_wait); /* PGRAC: spec-5.59 D2 profiling */

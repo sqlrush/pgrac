@@ -28,6 +28,8 @@
 #include "utils/snapmgr.h"
 
 typedef void *Block;
+struct HwLock;
+struct ClusterSpaceIdentity;
 
 /*
  * Possible arguments for GetAccessStrategy().
@@ -190,6 +192,7 @@ extern void ReleaseBuffer(Buffer buffer);
 extern void UnlockReleaseBuffer(Buffer buffer);
 extern void MarkBufferDirty(Buffer buffer);
 extern void IncrBufferRefCount(Buffer buffer);
+extern bool BufferIsPinnedByMe(Buffer buffer);
 extern void CheckBufferIsPinnedOnce(Buffer buffer);
 extern Buffer ReleaseAndReadBuffer(Buffer buffer, Relation relation,
 								   BlockNumber blockNum);
@@ -198,6 +201,19 @@ extern Buffer ExtendBufferedRel(BufferManagerRelation bmr,
 								ForkNumber forkNum,
 								BufferAccessStrategy strategy,
 								uint32 flags);
+#ifdef USE_PGRAC_CLUSTER
+/* B-tree allocation after its caller acquired exact MAIN HW before page locks.
+ * Resolve the complete SPACE identity before HW and pass the owned snapshot;
+ * the original reservation consumer must still recheck canonical current bytes.
+ * The caller retains ownership and must release HW on every exit, including
+ * ERROR. This consumer neither reacquires nor releases the borrowed handle. */
+extern Buffer ExtendBufferedRelWithHW(BufferManagerRelation bmr,
+									 ForkNumber forkNum,
+									 BufferAccessStrategy strategy,
+									 uint32 flags,
+									 const struct HwLock *preheld_hw,
+									 const struct ClusterSpaceIdentity *space_identity);
+#endif
 extern BlockNumber ExtendBufferedRelBy(BufferManagerRelation bmr,
 									   ForkNumber fork,
 									   BufferAccessStrategy strategy,
@@ -285,6 +301,9 @@ extern void MarkBufferDirtyHint(Buffer buffer, bool buffer_std);
 
 extern void UnlockBuffers(void);
 extern void LockBuffer(Buffer buffer, int mode);
+/* Acquire second while first is held only for a normalized, pinned MAIN
+ * heap pair. False leaves second untouched; caller still owns first. */
+extern bool ClusterLockBufferHeapPair(Relation relation, Buffer first, Buffer second);
 
 /*
  * PGRAC Stage-8 R2 D11: evidence-only identities for the seven real
@@ -394,6 +413,9 @@ extern void ClusterUnlockReleaseBufferAfterConditionalMutation(Buffer buffer);
 extern void ClusterUnlockReleaseBufferAfterConditionalRead(Buffer buffer);
 /* Conditional local X plus cluster_space_hint_begin/finish() publication only. */
 extern void ClusterUnlockReleaseBufferAfterConditionalHint(Buffer buffer);
+/* As above; non-NULL pin_invalid is always set. True requests a normal
+ * reread, not a busy-lock retry. The caller must still own a releasable pin. */
+extern bool ConditionalLockBufferWithPinCheck(Buffer buffer, bool *pin_invalid);
 extern void LockBufferForCleanup(Buffer buffer);
 extern bool ConditionalLockBufferForCleanup(Buffer buffer);
 extern bool IsBufferCleanupOK(Buffer buffer);

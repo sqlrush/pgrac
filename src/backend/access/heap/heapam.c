@@ -1702,6 +1702,7 @@ cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer
 	volatile bool terminal = false;
 	volatile bool active = false;
 	volatile bool unprovable = false;
+	volatile bool census_current = false;
 	uint8 i;
 	int remaining_ms;
 	uint64 wait_deadline;
@@ -1802,28 +1803,36 @@ cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer
 			} else
 				unprovable = true;
 		}
-		if (!cluster_semantic_activation_recheck_r4_terminal_census(&census.admission))
-			unprovable = true;
+		census_current = cluster_semantic_activation_recheck_r4_terminal_census(&census.admission);
 	}
 	PG_FINALLY();
 	{
 		cluster_heap_itl_finish_terminal_census(&census);
 	}
 	PG_END_TRY();
-	if (unprovable) {
+	if (!census_current) {
 		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_UNPROVABLE);
 		cluster_heap_itl_capacity_diagnostic(&census, capture_result, "RESOLVE");
 		return CLUSTER_TXW_UNPROVABLE;
 	}
 	if (terminal) {
+		/* Only ask the caller to recapture and apply exact terminal proofs.
+		 * An unrelated unknown slot is neither changed nor made reusable. */
 		*diagnostic_reason = "ITL_FRESH_REQUALIFY";
 		return CLUSTER_TXW_RETRY;
 	}
 	if (!active) {
+		if (unprovable) {
+			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_UNPROVABLE);
+			cluster_heap_itl_capacity_diagnostic(&census, capture_result, "RESOLVE");
+			return CLUSTER_TXW_UNPROVABLE;
+		}
 		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_PROTECTED);
 		*diagnostic_reason = "ITL_PROTECTED_HISTORY_CAPACITY";
 		return CLUSTER_TXW_UNPROVABLE;
 	}
+	/* Waiting for one independently proven blocker does not consume any
+	 * other slot's outcome. Every wakeup restarts full page qualification. */
 	cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_SELECTED);
 	remaining_ms = cluster_heap_itl_remaining_wait_ms(deadline_us, cluster_heap_itl_now_us(),
 													  cluster_ges_request_timeout_ms);
@@ -6268,7 +6277,7 @@ cluster_heap_insert_retry:
 	cluster_itl_write_scn = InvalidScn;
 #endif
 	buffer = RelationGetBufferForTuple(relation, heaptup->t_len,
-									   InvalidBuffer, options, bistate,
+									   NULL, options, bistate,
 									   &vmbuffer, NULL,
 									   0);
 
@@ -7092,7 +7101,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		 * empty page. See all_frozen_set below.
 		 */
 		buffer = RelationGetBufferForTuple(relation, heaptuples[ndone]->t_len,
-										   InvalidBuffer, options, bistate,
+										   NULL, options, bistate,
 										   &vmbuffer, NULL,
 										   npages - npages_used);
 		page = BufferGetPage(buffer);
@@ -13590,7 +13599,7 @@ l_pgrac_reacquire:
 			{
 				/* It doesn't fit, must use RelationGetBufferForTuple. */
 				newbuf = RelationGetBufferForTuple(relation, heaptup->t_len,
-												   buffer, 0, NULL,
+												   &buffer, 0, NULL,
 												   &vmbuffer_new, &vmbuffer,
 												   0);
 				/* We're all done. */
@@ -13638,6 +13647,8 @@ l_pgrac_reacquire:
 		heaptup = newtup;
 	}
 
+	/* HIO may have reread the old logical block into another descriptor. */
+	page = BufferGetPage(buffer);
 #ifdef USE_PGRAC_CLUSTER
 	/* TEMP_LOCK protects the logical row, not its physical location in a
 	 * newer image. Both same-page and allocation retries converge here. */

@@ -2076,14 +2076,16 @@ SELECT name, setting, unit, context, source, pending_restart FROM pg_settings WH
 | 属性 | 值 |
 |---|---|
 | 类型 | `bool` |
-| 默认值 | `false` |
+| 默认值 | `true` |
 | 范围/枚举 | on / off |
 | Context | `superuser` |
 | 生效方式 | 超级用户可在会话/系统范围修改 |
 | 单位 | — |
 | 内置短说明（与 `pg_settings.short_desc` 对应） | Chain a local write past a terminal remote writer. |
 
-工作原理与调节影响：开关 `crossnode` / 写入 / 写入 路径。改变值只影响该开关明确覆盖的路径；安全拒绝条件不因关闭诊断开关而消失。
+默认开启跨节点写入接续：等待远端持有事务结束后，已证明提交的 UPDATE 经原生 EvalPlanQual 重验新版本，已提交 DELETE 按删除处理，已回滚写入允许继续。仅凭相同 raw xid 不足以接续；终态权威、元组身份或新版本不可证明时仍拒绝。
+
+显式设为 `off` 可保留旧行为对照：终态远端写入冲突返回 `53R9H`，不会接续新版本。该对照不适合要求同一行跨节点并发更新自动排队接续的应用。
 
 依赖与保护：无额外配置钩子；组合约束仍可能在启动或运行入口检查。
 

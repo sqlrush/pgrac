@@ -267,6 +267,10 @@ typedef struct ClusterKoPeerAdmissionV3 {
 
 extern bool cluster_ko_peer_admission_begin_v3(RelFileLocator locator,
 											   ClusterKoPeerAdmissionV3 *out);
+/* Wait for a KO admission state/revision change.  The timeout is only a
+ * bounded fallback; callers must re-sample the admission predicate after
+ * every return and must not turn a timeout into a transaction error. */
+extern void cluster_ko_peer_admission_wait(long timeout_ms);
 extern bool cluster_ko_peer_admission_current_v3(const ClusterKoPeerAdmissionV3 *admission,
 												 RelFileLocator locator);
 /* Continuation gate only for an already retained local delivery target.

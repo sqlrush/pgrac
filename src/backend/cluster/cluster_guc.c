@@ -115,6 +115,7 @@ int cluster_recovery_merge_wait_timeout = 10000;
 bool cluster_xnode_profile_enabled = false;
 /* Diagnostic per-storage-UPDATE phase trace; default OFF. */
 bool cluster_update_trace_enabled = false;
+bool cluster_trace_tx_identity = false;
 bool cluster_trace_cleanup = false;
 char *cluster_trace_visibility_relids = NULL;
 bool cluster_trace_visibility_enabled = false;
@@ -133,8 +134,8 @@ int cluster_adg_lease_takeover_grace_ms = 5000;
 int cluster_adg_barrier_interval_ms = 1000;
 int cluster_wal_sender_timeout_sec = 60;
 int cluster_wal_receiver_timeout_sec = 60;
-/* spec-6.12c: read-layer-3 resolver terminal memo (default OFF). */
-bool cluster_page_scn_shortcut = false;
+/* spec-6.12c: read-layer-3 resolver terminal memo (default ON). */
+bool cluster_page_scn_shortcut = true;
 /* spec-6.12a: quiescent-block S-cache via X->S downgrade (default OFF). */
 bool cluster_read_scache = false;
 /* spec-6.12e1: GES release-side handoff verify + counters (default OFF). */
@@ -805,10 +806,11 @@ bool cluster_gcs_block_local_cache = true;
 bool cluster_tx_enqueue_wait_enabled = true;
 bool cluster_ic_duty_lazy = true; /* spec-7.2 D1 duty-chain on-demand gating */
 
-/* PGRAC: spec-7.1a D0 -- cross-node write-write chaining (default off).
- * Off keeps the pre-7.1a floor: a TERMINAL remote writer holder fails
- * closed (SQLSTATE 53R9H) instead of chaining to a sound TM_Result. */
-bool cluster_crossnode_write_write = false;
+/* PGRAC: spec-7.1a D0 -- cross-node write-write chaining (default on).
+ * Proven terminal outcomes use the native TM_Result/EPQ continuation.
+ * Explicit off keeps the pre-7.1a 53R9H floor; unprovable outcomes still
+ * fail closed in either mode. */
+bool cluster_crossnode_write_write = true;
 int cluster_gcs_block_dedup_max_entries = 16384; /* spec-7.2a: raised from 1024 */
 /*
  * spec-7.2a test-only: when non-zero, the drop-reply injection only fires for
@@ -1729,6 +1731,11 @@ cluster_init_guc(void)
 		&cluster_update_trace_enabled, false, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
+		"cluster.trace_tx_identity", gettext_noop("Log exact transaction identity observations."),
+		gettext_noop("Bounded per-process diagnostic capture; unknown identity fields stay unknown."),
+		&cluster_trace_tx_identity, false, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
 		"cluster.trace_cleanup", gettext_noop("Log transaction cleanup and buffer invalidation phases."),
 		NULL, &cluster_trace_cleanup, false, PGC_SUSET, 0, NULL, NULL, NULL);
 
@@ -1847,15 +1854,16 @@ cluster_init_guc(void)
 	 * replays them instead of repeating the TT overlay lookup for every
 	 * tuple.  Terminal outcomes are immutable, so the memo never answers
 	 * anything the same transaction's authoritative lookup did not
-	 * already answer.  Default OFF: resolver behaviour byte-identical to
-	 * the 5.59 baseline.  SUSET for measurement-window toggling (same
+	 * already answer.  Default ON: this exact terminal memo is the normal
+	 * read path; explicit OFF remains available for compatibility and
+	 * diagnostic comparisons.  SUSET for measurement-window toggling (same
 	 * rationale as cluster.xnode_profile).
 	 */
 	DefineCustomBoolVariable(
 		"cluster.page_scn_shortcut",
 		gettext_noop("Enable the cross-node visibility resolver terminal-outcome memo."),
-		gettext_noop("Off keeps the per-tuple TT lookup path byte-identical."),
-		&cluster_page_scn_shortcut, false, PGC_SUSET, 0, NULL, NULL, NULL);
+		gettext_noop("Off disables the memo for compatibility or diagnostic comparison; fail-closed checks remain active."),
+		&cluster_page_scn_shortcut, true, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/*
 	 * cluster.read_scache -- spec-6.12 wave a (read layer 1).  When on, a
@@ -4457,14 +4465,14 @@ cluster_init_guc(void)
 	DefineCustomBoolVariable(
 		"cluster.crossnode_write_write",
 		gettext_noop("Chain a local write past a terminal remote writer."),
-		gettext_noop("When on, a write that conflicts with a remote writer "
+		gettext_noop("When on (default), a write that conflicts with a remote writer "
 					 "that already committed or aborted maps the outcome onto "
 					 "the native TM_Result contract (remote UPDATE -> chase the "
 					 "new version via EvalPlanQual; remote DELETE -> deleted; "
-					 "aborted -> proceed).  Off (default) keeps the fail-closed "
+					 "aborted -> proceed).  Off keeps the fail-closed "
 					 "floor: SQLSTATE 53R9H, retry.  Unprovable outcomes fail "
 					 "closed either way.  spec-7.1a D0.  PGC_SUSET."),
-		&cluster_crossnode_write_write, false, PGC_SUSET, 0, NULL, NULL, NULL);
+		&cluster_crossnode_write_write, true, PGC_SUSET, 0, NULL, NULL, NULL);
 	DefineCustomIntVariable(
 		"cluster.gcs_block_retransmit_initial_backoff_ms",
 		gettext_noop("Initial backoff before retry 1 (subsequent retries double)."),

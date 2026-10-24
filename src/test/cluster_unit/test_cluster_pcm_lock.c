@@ -46,6 +46,7 @@
 
 #include "cluster/cluster_buffer_desc.h" /* PcmState (1.6) */
 #include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_cssd.h" /* spec-4.7a D4 — ClusterCssdPeerState for stub */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_ic_tier1.h"
@@ -54,6 +55,7 @@
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D1 — ClusterGcsBlockPhase + phase_for_tag proto */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "storage/proc.h"
 #include "cluster/cluster_pi_write.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_qvotec.h"
@@ -65,6 +67,7 @@
 #include "cluster/cluster_resource_x_node_wire.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_wait_trace.h"
 #include "port/pg_crc32c.h"
 #include "miscadmin.h"
 #include "storage/backendid.h"	   /* spec-6.14 D9 amend — MyBackendId stub */
@@ -120,6 +123,11 @@ int cluster_injection_armed_count = 0;
 int cluster_gcs_reply_timeout_ms = 1;
 static uint64 ut_lms_master_generation = (UINT64_C(1) << 32) | UINT64_C(1);
 static uint64 ut_master_session = 31;
+static uint32 ready_connection_generation = 61;
+static bool ready_peer_ok = true;
+static uint32 bootstrap_ingress_generation;
+static unsigned bootstrap_ack_count;
+static ResourceXDecodedFrame bootstrap_last_ack;
 uint64
 cluster_qvotec_get_self_incarnation(void)
 {
@@ -156,6 +164,74 @@ static ClusterPcmPiWriteCutV1 structural_master_write_cut;
 static ClusterPcmPiStorageCutV1 structural_master_storage_cut;
 static void (*structural_master_ack_hook)(void);
 static int fake_lwlock_depth = 0;
+static ClusterWaitTrace wait_trace_rows[128];
+static ClusterWaitTraceKind wait_trace_kinds[128];
+static unsigned wait_trace_count;
+static ClusterWaitSendGate send_gate_last;
+static BufferTag send_gate_tag;
+static unsigned send_gate_count;
+static unsigned requester_gate_count;
+static ClusterWaitRequesterGate requester_gate_last;
+static BufferTag requester_gate_tag;
+
+void
+cluster_wait_trace_requester_gate_emit(const ClusterWaitRequesterGate *gate)
+{
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	UT_ASSERT(cluster_trace_tx_identity && gate->known);
+	requester_gate_last = *gate;
+	requester_gate_tag = gate->tag;
+	requester_gate_count++;
+}
+
+void
+cluster_wait_trace_send_gate_emit(const BufferTag *tag, const ClusterWaitSendGate *gate)
+{
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	UT_ASSERT(cluster_trace_tx_identity);
+	send_gate_tag = *tag;
+	send_gate_last = *gate;
+	send_gate_count++;
+}
+/* This fixture captures PCM rows, not the separate content-owner registry. */
+PROC_HDR *ProcGlobal = NULL;
+PGPROC *MyProc = NULL;
+static unsigned source_drain_latch_wakes;
+static Latch *source_drain_woken_latch;
+
+void
+SetLatch(Latch *latch)
+{
+	source_drain_latch_wakes++;
+	source_drain_woken_latch = latch;
+}
+
+void
+cluster_content_trace_wait_set(ClusterContentTraceWait kind pg_attribute_unused(),
+							   const ClusterWaitTrace *row pg_attribute_unused())
+{
+}
+
+void
+cluster_content_trace_wait_clear(ClusterContentTraceWait kind pg_attribute_unused())
+{
+}
+
+uint64
+cluster_wait_trace_begin(ClusterWaitTraceKind kind pg_attribute_unused())
+{
+	return cluster_trace_tx_identity ? wait_trace_count + 1 : 0;
+}
+
+void
+cluster_wait_trace_emit(ClusterWaitTraceKind kind, const ClusterWaitTrace *row)
+{
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	UT_ASSERT(cluster_trace_tx_identity);
+	UT_ASSERT(wait_trace_count < lengthof(wait_trace_rows));
+	wait_trace_kinds[wait_trace_count] = kind;
+	wait_trace_rows[wait_trace_count++] = *row;
+}
 /* Object admission is a boundary fixture; PCM round/caller transitions below
  * remain the real product object. Tests may race the original entry lock. */
 int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
@@ -391,7 +467,7 @@ cluster_lms_wakeup(int worker_id)
 }
 
 #define FAKE_PCM_MAX_ENTRIES 24
-#define FAKE_PCM_ENTRY_BYTES 1304
+#define FAKE_PCM_ENTRY_BYTES 1432
 StaticAssertDecl(sizeof(struct StopPcmEntryLayout) == FAKE_PCM_ENTRY_BYTES,
 				 "negative fixture field offsets must match the generated original entry");
 
@@ -501,6 +577,12 @@ static bool fake_cv_timed_sleep_timed_out = false;
 static bool fake_cv_prepared = false;
 static bool fake_cv_signaled = false;
 static uint32 fake_cv_sleep_wait_event = 0;
+static bool fake_cv_shutdown_on_sleep = false;
+static bool fake_error_use_pg_exception_stack = false;
+static int fake_last_sqlerrcode = 0;
+volatile sig_atomic_t ProcDiePending = false;
+volatile uint32 InterruptHoldoffCount = 0;
+volatile uint32 CritSectionCount = 0;
 static void (*fake_cv_prepare_hook)(void) = NULL;
 static struct {
 	BufferTag tag;
@@ -697,6 +779,7 @@ reset_fake_pcm_runtime(int max_entries)
 	fake_lwlock_conditional_fail_once = false;
 	ut_wait_event_info_storage = 0;
 	ut_ereport_fired_count = 0;
+	fake_last_sqlerrcode = 0;
 	ut_ereport_jump_armed = false;
 	fake_cv_init_count = 0;
 	fake_cv_prepare_count = 0;
@@ -708,6 +791,7 @@ reset_fake_pcm_runtime(int max_entries)
 	fake_cv_prepared = false;
 	fake_cv_signaled = false;
 	fake_cv_sleep_wait_event = 0;
+	fake_cv_shutdown_on_sleep = false;
 	fake_cv_prepare_hook = NULL;
 	fake_cv_wake_release.armed = false;
 	fake_cv_wake_pending_x_clear.armed = false;
@@ -1091,6 +1175,10 @@ ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(), long ti
 	fake_cv_sleep_wait_event = wait_event_info;
 	fake_cv_timed_sleep_timed_out = !fake_cv_signaled;
 	fake_cv_signaled = false;
+	if (fake_cv_shutdown_on_sleep) {
+		fake_cv_shutdown_on_sleep = false;
+		ProcDiePending = true;
+	}
 	return fake_cv_timed_sleep_timed_out;
 }
 
@@ -1298,13 +1386,16 @@ errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_un
 		  const char *funcname pg_attribute_unused())
 {
 	ut_ereport_fired_count++;
+	if (fake_error_use_pg_exception_stack && PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
 	if (ut_ereport_jump_armed)
 		siglongjmp(ut_ereport_jump, 1);
 }
 
 int
-errcode(int sqlerrcode pg_attribute_unused())
+errcode(int sqlerrcode)
 {
+	fake_last_sqlerrcode = sqlerrcode;
 	return 0;
 }
 
@@ -1676,7 +1767,7 @@ UT_TEST(test_pcm_real_summary_counts_live_entries)
 UT_TEST(test_pcm_grd_entry_abi_includes_resource_x_executor_state)
 {
 	reset_fake_pcm_runtime(4);
-	UT_ASSERT_EQ(fake_pcm_entrysize, 1304);
+	UT_ASSERT_EQ(fake_pcm_entrysize, FAKE_PCM_ENTRY_BYTES);
 	UT_ASSERT_EQ(cluster_pcm_grd_shmem_size(), add_size(fake_pcm_header_requested_size,
 														hash_estimate_size(4, fake_pcm_entrysize)));
 }
@@ -3803,12 +3894,23 @@ UT_TEST(test_resource_x_remote_admission_is_one_canonical_transaction)
 		request = make_resource_x_bootstrap_request(tag, 1);
 		request.common.flags = UINT8_C(0x08);
 		request.common.semantic_crc32c = 0;
+		wait_trace_count = 0;
+		cluster_trace_tx_identity = true;
 		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(&request, 1, 61, 77, 31,
 																		 71, &reply),
 					 RESOURCE_X_APPLY_APPLIED);
+		cluster_trace_tx_identity = false;
+		UT_ASSERT(wait_trace_count > 0);
+		UT_ASSERT_EQ(wait_trace_kinds[0], CLWAIT_PCM_ADMISSION);
+		UT_ASSERT_EQ(wait_trace_rows[0].base, request.common.base_authority_generation);
+		UT_ASSERT_EQ(wait_trace_rows[0].requester_connection, 51);
+		UT_ASSERT_EQ(wait_trace_rows[0].ingress_connection, 61);
+		for (unsigned i = 1; i < wait_trace_count; i++)
+			UT_ASSERT(!wait_trace_rows[i].admission.known);
 		UT_ASSERT_EQ(reply.common.flags, 0);
 		UT_ASSERT(reply.common.base_authority_generation > 0);
 		if (shape == 0 || shape == 3) {
+			UT_ASSERT(!wait_trace_rows[0].admission.known);
 			/* Local/durable admission still needs its original proof path. */
 			UT_ASSERT_EQ(reply.kind, RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP);
 			UT_ASSERT_EQ(reply.common.authority_generation, 0);
@@ -3824,11 +3926,22 @@ UT_TEST(test_resource_x_remote_admission_is_one_canonical_transaction)
 					 RESOURCE_X_APPLY_APPLIED);
 		UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_WAIT_BLOCKERS);
 		UT_ASSERT_EQ(snapshot.incompatible_holders_bitmap, UINT32_C(1) << 2);
+		UT_ASSERT(wait_trace_rows[0].admission.known);
+		UT_ASSERT_EQ(wait_trace_rows[0].admission.r4, 77);
+		UT_ASSERT_EQ(wait_trace_rows[0].admission.base, snapshot.base_authority_generation);
+		UT_ASSERT_EQ(wait_trace_rows[0].admission.request_seq, snapshot.assertion_sequence);
+		UT_ASSERT_EQ(wait_trace_rows[0].admission.phase, RESOURCE_X_MASTER_WAIT_BLOCKERS);
+		UT_ASSERT_EQ(wait_trace_rows[0].admission.requester_connection, 0);
+		UT_ASSERT_EQ(wait_trace_rows[0].admission.ingress_connection, 51);
 		UT_ASSERT(cluster_pcm_lock_resource_x_s_barrier_active_exact(&tag));
 		before = snapshot;
+		wait_trace_count = 0;
+		cluster_trace_tx_identity = true;
 		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(&request, 1, 61, 77, 31,
 																		 71, &replay),
 					 RESOURCE_X_APPLY_DUPLICATE);
+		cluster_trace_tx_identity = false;
+		UT_ASSERT(wait_trace_rows[0].admission.known);
 		UT_ASSERT(memcmp(&reply, &replay, sizeof(reply)) == 0);
 		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
 						 &request.common.logical_assertion, &snapshot),
@@ -3836,9 +3949,14 @@ UT_TEST(test_resource_x_remote_admission_is_one_canonical_transaction)
 		UT_ASSERT(memcmp(&snapshot, &before, sizeof(snapshot)) == 0);
 		wrong = request;
 		wrong.common.sender_connection_generation++;
+		wait_trace_count = 0;
+		cluster_trace_tx_identity = true;
 		UT_ASSERT_EQ(
 			cluster_pcm_lock_resource_x_bootstrap_request_exact(&wrong, 1, 61, 77, 31, 71, &replay),
 			RESOURCE_X_APPLY_STALE);
+		cluster_trace_tx_identity = false;
+		UT_ASSERT(wait_trace_count > 0);
+		UT_ASSERT(!wait_trace_rows[0].admission.known);
 		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(&request, 1, 62, 77, 31,
 																		 71, &replay),
 					 RESOURCE_X_APPLY_STALE);
@@ -3858,6 +3976,7 @@ UT_TEST(test_resource_x_remote_admission_is_one_canonical_transaction)
 					 RESOURCE_X_APPLY_APPLIED);
 		UT_ASSERT(memcmp(&snapshot, &before, sizeof(snapshot)) == 0);
 	}
+	wait_trace_count = 0;
 }
 
 UT_TEST(test_resource_x_bootstrap_receipt_drift_invalidates_but_keeps_floor)
@@ -4002,7 +4121,8 @@ UT_TEST(test_resource_x_bootstrap_terminal_retire_clears_binding_not_floor)
 	UT_ASSERT_EQ(ack.common.base_authority_generation, UINT64_C(2));
 }
 
-UT_TEST(test_resource_x_bootstrap_dispatches_one_current_base_at_a_time)
+static void
+check_resource_x_bootstrap_active_queue(int drift)
 {
 	BufferTag tag = make_tag(151);
 	ResourceXDecodedFrame first_request;
@@ -4040,8 +4160,11 @@ UT_TEST(test_resource_x_bootstrap_dispatches_one_current_base_at_a_time)
 				 RESOURCE_X_APPLY_BAD_STATE);
 	UT_ASSERT(memcmp(&second_ack, &zero_ack, sizeof(second_ack)) == 0);
 
-	/* The first otherwise-admissible rejection owns the single exact next
-	 * admission.  A later requester cannot overwrite that identity. */
+	/* Every otherwise-admissible node has one bounded queue item. Later
+	 * arrivals cannot overwrite or bypass the first retained identity. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(&third_request, 3, 63, 77, 31,
+																	 73, &second_ack),
+				 RESOURCE_X_APPLY_BAD_STATE);
 	stop_new_work_allowed = false;
 	stop_new_work_calls = 0;
 	memset(&second_ack, 0xa5, sizeof(second_ack));
@@ -4112,6 +4235,71 @@ UT_TEST(test_resource_x_bootstrap_dispatches_one_current_base_at_a_time)
 					 &assertion.common.logical_assertion, 41, &snapshot),
 				 RESOURCE_X_APPLY_APPLIED);
 
+	/* A retained successor must become LMS work without another requester
+	 * packet or advancing the 500ms physical-loss clock. */
+	{
+		ResourceXIntentSlot slot;
+		ResourceXAcquisitionRef delivery;
+		ResourceXIntentProbeResult result = RESOURCE_X_INTENT_PROBE_IDLE;
+		uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
+		uint32 examined;
+		ResourceXBootstrapWork work;
+		ResourceXBootstrapWork stale;
+
+		for (int i = 0; i < 32; i++) {
+			result = cluster_pcm_lock_resource_x_outbound_work_probe_exact(
+				1, &slot, payload, sizeof(payload), &examined, &delivery);
+			UT_ASSERT(examined <= 1);
+			UT_ASSERT(result != RESOURCE_X_INTENT_PROBE_CORRUPT);
+			if (result == RESOURCE_X_INTENT_PROBE_BOOTSTRAP
+				|| result == RESOURCE_X_INTENT_PROBE_IDLE
+				|| result == RESOURCE_X_INTENT_PROBE_COMPLETE)
+				break;
+		}
+		UT_ASSERT_EQ(result, RESOURCE_X_INTENT_PROBE_BOOTSTRAP);
+		memcpy(&work, payload, sizeof(work));
+		UT_ASSERT_EQ(work.request.logical_assertion.requester_node, 2);
+		/* A late scan snapshot cannot delete a different exact queue item. */
+		stale = work;
+		stale.enqueue_order++;
+		cluster_pcm_lock_resource_x_bootstrap_forget_exact(&stale);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_resume_exact(&stale, &replay_ack),
+					 RESOURCE_X_APPLY_STALE);
+		ready_connection_generation = 72;
+		bootstrap_ingress_generation = 62;
+		bootstrap_ack_count = 0;
+		ready_peer_ok = false;
+		UT_ASSERT_EQ(cluster_gcs_block_resource_x_bootstrap_tick(&work),
+					 RESOURCE_X_APPLY_BAD_STATE);
+		UT_ASSERT_EQ(bootstrap_ack_count, 0);
+		ready_peer_ok = true;
+		if (drift != 0) {
+			if (drift == 1)
+				bootstrap_ingress_generation++;
+			else
+				ready_connection_generation++;
+			UT_ASSERT_EQ(cluster_gcs_block_resource_x_bootstrap_tick(&work),
+						 RESOURCE_X_APPLY_STALE);
+			UT_ASSERT_EQ(bootstrap_ack_count, 0);
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_resume_exact(&work, &replay_ack),
+						 RESOURCE_X_APPLY_STALE);
+			ready_connection_generation = 61;
+			bootstrap_ingress_generation = 0;
+			/* Invalidating the old head exposes the next retained requester. */
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+							 &third_request, 3, 63, 77, 31, 73, &replay_ack),
+						 RESOURCE_X_APPLY_APPLIED);
+			UT_ASSERT_EQ(replay_ack.common.base_authority_generation, UINT64_C(2));
+			return;
+		}
+		UT_ASSERT_EQ(cluster_gcs_block_resource_x_bootstrap_tick(&work), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(bootstrap_ack_count, 1);
+		UT_ASSERT_EQ(bootstrap_last_ack.common.logical_assertion.requester_node, 2);
+		UT_ASSERT_EQ(bootstrap_last_ack.common.base_authority_generation, UINT64_C(2));
+		ready_connection_generation = 61;
+		bootstrap_ingress_generation = 0;
+	}
+
 	/* Retirement does not let a fresh contender bypass the retained exact
 	 * successor.  The priority never froze base 1: only the exact successor
 	 * replay may now sample current base 2 and create an ordinary receipt. */
@@ -4123,9 +4311,62 @@ UT_TEST(test_resource_x_bootstrap_dispatches_one_current_base_at_a_time)
 
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(&second_request, 2, 62, 77, 31,
 																	 72, &second_ack),
-				 RESOURCE_X_APPLY_APPLIED);
+				 RESOURCE_X_APPLY_DUPLICATE);
 	UT_ASSERT_EQ(second_ack.common.base_authority_generation, UINT64_C(2));
 	UT_ASSERT_EQ(stop_new_work_calls, 0);
+}
+
+UT_TEST(test_resource_x_bootstrap_dispatches_one_current_base_at_a_time)
+{
+	check_resource_x_bootstrap_active_queue(0);
+}
+
+UT_TEST(test_resource_x_bootstrap_active_queue_rejects_ingress_drift)
+{
+	check_resource_x_bootstrap_active_queue(1);
+}
+
+UT_TEST(test_resource_x_bootstrap_active_queue_rejects_outbound_drift)
+{
+	check_resource_x_bootstrap_active_queue(2);
+}
+
+UT_TEST(test_resource_x_wait_trace_keeps_exact_master_queue_and_unlocked_logging)
+{
+	BufferTag tag = make_tag(151);
+	bool admission = false;
+	bool priority = false;
+
+	UT_ASSERT_EQ(wait_trace_count, 0); /* Existing OFF paths emitted nothing. */
+	cluster_trace_tx_identity = true;
+	check_resource_x_bootstrap_active_queue(0);
+	cluster_trace_tx_identity = false;
+	for (unsigned i = 0; i < wait_trace_count; i++) {
+		const ClusterWaitTrace *row = &wait_trace_rows[i];
+
+		UT_ASSERT(row->tag_known);
+		UT_ASSERT(BufferTagsEqual(&row->tag, &tag));
+		UT_ASSERT(row->entry_known && row->master_view);
+		UT_ASSERT_EQ(row->mode, PCM_LOCK_MODE_X);
+		UT_ASSERT_EQ(row->expected_master, 0);
+		UT_ASSERT(row->binding != 0);
+		if (wait_trace_kinds[i] == CLWAIT_PCM_ADMISSION) {
+			admission = true;
+			UT_ASSERT(row->request_known);
+			UT_ASSERT_EQ(row->request_seq, 41);
+		}
+		if (wait_trace_kinds[i] == CLWAIT_PCM_QUEUE && row->queue_kind == 2
+			&& row->requester == 2) {
+			priority = true;
+			UT_ASSERT_EQ(row->formation, 17);
+			UT_ASSERT_EQ(row->master_session, 31);
+			UT_ASSERT_EQ(row->request_seq, 41);
+			UT_ASSERT_EQ(row->requester_connection, 52);
+			UT_ASSERT_EQ(row->ingress_connection, 62);
+		}
+	}
+	UT_ASSERT(admission && priority);
+	wait_trace_count = 0;
 }
 
 UT_TEST(test_resource_x_bootstrap_r8_clears_old_binding_not_attempt_floor)
@@ -4490,6 +4731,74 @@ UT_TEST(test_resource_x_round_wait_rechecks_progress_in_finite_slices)
 					 &assertion, 0, 17, 31, 77, 51, 61, 2000, UINT64_MAX - 1, 50),
 				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_FAILURE_NONE);
+}
+
+/* Exercise the real registered wait and its PG_FINALLY, rather than a
+ * standalone interrupt predicate. A content LWLock's holdoff must remain
+ * intact while ERROR returns through exact CV/entry-pin cleanup. */
+UT_TEST(test_resource_x_shutdown_unwinds_bootstrap_cv_and_pin)
+{
+	BackendType saved_backend = MyBackendType;
+	for (int cut = 0; cut < 5; cut++) {
+		BufferTag tag = make_tag(6480 + cut);
+		ResourceXAssertion assertion;
+		ResourceXDecodedFrame request;
+		ResourceXAcquisitionRef terminal;
+		ResourceXBootstrapRoundFailureSnapshot after;
+		struct StopPcmEntryLayout *entry;
+		volatile bool caught = false;
+
+		reset_fake_pcm_runtime(4);
+		cluster_node_id = 1;
+		fake_pcm_clock_us = 100000;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(resource_x_assertion_init(&tag, 1, &assertion));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+						 &assertion, 0, 17, 31, 77, 51, 61, 500000, 5000, 100000, 2000,
+						 false, 0, &request, &terminal),
+					 RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+		/* Cuts 0/1 are SIGTERM before/after sleep. The remaining cuts
+		 * must keep the existing background/native/critical behavior. */
+		MyBackendType = cut == 2 ? B_LMS : B_BACKEND;
+		InterruptHoldoffCount = cut == 3 ? 0 : 1;
+		CritSectionCount = cut == 4 ? 1 : 0;
+		ProcDiePending = cut != 1;
+		fake_cv_shutdown_on_sleep = cut == 1;
+		fake_error_use_pg_exception_stack = true;
+		PG_TRY();
+		{
+			(void)cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
+				&assertion, 0, 17, 31, 77, 51, 61, 2000, UINT64_MAX - 1, 50);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		fake_error_use_pg_exception_stack = false;
+		UT_ASSERT_EQ(caught, cut < 2);
+		if (caught)
+			UT_ASSERT_EQ(fake_last_sqlerrcode, ERRCODE_ADMIN_SHUTDOWN);
+		UT_ASSERT(ProcDiePending); /* native disconnect still owns SIGTERM */
+		UT_ASSERT_EQ(InterruptHoldoffCount, cut == 3 ? 0 : 1);
+		UT_ASSERT_EQ(CritSectionCount, cut == 4 ? 1 : 0);
+		UT_ASSERT_EQ(fake_cv_sleep_count, cut == 0 ? 0 : 1);
+		UT_ASSERT_EQ(fake_cv_prepare_count, fake_cv_cancel_count);
+		UT_ASSERT_EQ(fake_lwlock_depth, 0);
+		entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+		UT_ASSERT_NOT_NULL(entry);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pin_count), 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->wait_refcount), 0);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
+						 &assertion, 0, 17, 31, 77, 51, 61, 50, &after),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(after.head_failure_reason, RESOURCE_X_HEAD_FAILURE_NONE);
+		ProcDiePending = false;
+		InterruptHoldoffCount = 0;
+		CritSectionCount = 0;
+	}
+	MyBackendType = saved_backend;
 }
 
 UT_TEST(test_resource_x_reply_wait_metrics_are_shared_and_bucket_exact)
@@ -11787,18 +12096,63 @@ UT_TEST(test_resource_x_remote_lane0_settlement_retires_only_after_exact_source_
 	UT_ASSERT_EQ(successor_ack.common.base_authority_generation, UINT64_C(0));
 
 	/* Sending retains the source debt; cadence does not substitute for ACK. */
+	send_gate_count = 0;
+	cluster_trace_tx_identity = true;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_capture_exact(
 					 &intent, intent.first_armed_us + 1, &sent_episode),
 				 RESOURCE_X_INTENT_STAGED);
+	cluster_trace_tx_identity = false;
+	UT_ASSERT_EQ(send_gate_count, 0); /* No callback before the transport handoff. */
 	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(
 		&sent_episode, true, intent.first_armed_us + 2));
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_snapshot_exact(
 					 &intent, &observed, payload, sizeof(payload)),
 				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(observed.last_send_us, intent.first_armed_us + 2);
+	{
+		uint64 saved_clock = fake_pcm_clock_us;
+		uint32 examined;
+		ResourceXIntentSlot probe_slot;
+		ResourceXIntentProbeResult probe_result;
+
+		fake_pcm_clock_us = intent.first_armed_us + 500001;
+		cluster_trace_tx_identity = true;
+		for (int i = 0; i < 64 && send_gate_count == 0; i++) {
+			probe_result = cluster_pcm_lock_resource_x_outbound_intent_probe_exact(
+				4, &probe_slot, payload, sizeof(payload), &examined);
+			if (probe_result == RESOURCE_X_INTENT_PROBE_COMPLETE
+				|| probe_result == RESOURCE_X_INTENT_PROBE_IDLE
+				|| probe_result == RESOURCE_X_INTENT_PROBE_CORRUPT)
+				break;
+		}
+		cluster_trace_tx_identity = false;
+		fake_pcm_clock_us = saved_clock;
+		UT_ASSERT(send_gate_count > 0);
+		UT_ASSERT_EQ(send_gate_last.site, CLWAIT_SEND_PROBE);
+		UT_ASSERT_EQ(send_gate_last.reason, CLWAIT_SEND_RETRY_AGE);
+		UT_ASSERT(BufferTagsEqual(&send_gate_tag, &intent.body.assertion.resource));
+		send_gate_count = 0;
+	}
+	cluster_trace_tx_identity = true;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, 0),
+				 RESOURCE_X_INTENT_NOT_DUE);
+	cluster_trace_tx_identity = false;
+	UT_ASSERT_EQ(send_gate_count, 1);
+	UT_ASSERT_EQ(send_gate_last.reason, CLWAIT_SEND_CLOCK);
+	cluster_trace_tx_identity = true;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(
 					 &intent, intent.first_armed_us + 500001),
 				 RESOURCE_X_INTENT_NOT_DUE);
+	cluster_trace_tx_identity = false;
+	UT_ASSERT_EQ(send_gate_count, 2);
+	UT_ASSERT_EQ(send_gate_last.reason, CLWAIT_SEND_RETRY_AGE);
+	UT_ASSERT_EQ(send_gate_last.site, CLWAIT_SEND_STAGE);
+	UT_ASSERT_EQ(send_gate_last.last_attempt_us, observed.last_attempt_us);
+	UT_ASSERT_EQ(send_gate_last.logical_generation, observed.logical_generation);
+	UT_ASSERT_EQ(send_gate_last.owner_generation, observed.body.owner_generation);
+	UT_ASSERT_EQ(send_gate_last.authority_generation, observed.authority_generation);
+	UT_ASSERT_EQ(send_gate_last.requester, observed.body.assertion.requester_node);
+	UT_ASSERT(BufferTagsEqual(&send_gate_tag, &intent.body.assertion.resource));
 	/* Authenticated nonterminal response owns a wait, never a success. */
 	cluster_node_id = 2; /* Exercise a remote source's two connection lifetimes. */
 	memset(&busy, 0, sizeof(busy));
@@ -11817,13 +12171,23 @@ UT_TEST(test_resource_x_remote_lane0_settlement_retires_only_after_exact_source_
 				 RESOURCE_X_APPLY_INVALID);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_busy_exact(&busy, 0, 0, 61),
 				 RESOURCE_X_APPLY_APPLIED);
+	cluster_trace_tx_identity = true;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(
 					 &intent, intent.first_armed_us + 500002),
 				 RESOURCE_X_INTENT_NOT_DUE);
+	cluster_trace_tx_identity = false;
+	UT_ASSERT_EQ(send_gate_count, 3);
+	UT_ASSERT_EQ(send_gate_last.reason, CLWAIT_SEND_STREAM_BUSY);
+	UT_ASSERT(send_gate_last.busy);
 	fake_rx_stream_generation = 0;
+	cluster_trace_tx_identity = true;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(
 					 &intent, intent.first_armed_us + 1000002),
 				 RESOURCE_X_INTENT_NOT_DUE);
+	cluster_trace_tx_identity = false;
+	UT_ASSERT_EQ(send_gate_count, 4);
+	UT_ASSERT_EQ(send_gate_last.reason, CLWAIT_SEND_STREAM_BUSY);
+	UT_ASSERT_EQ(send_gate_last.stream_generation, 0);
 	/* DATA did not change: CONTROL alone invalidates receiver continuation. */
 	fake_rx_stream_generation = 61;
 	fake_rx_capability_generation = 62;
@@ -11847,9 +12211,14 @@ UT_TEST(test_resource_x_remote_lane0_settlement_retires_only_after_exact_source_
 	UT_ASSERT(cluster_pcm_rx_stats_snapshot(&stats));
 	UT_ASSERT_EQ(stats.count[PCM_RX_POTENTIAL_LOSS], 1);
 	/* WB, then local refusal, cannot recount the same unanswered send. */
+	cluster_trace_tx_identity = true;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(
 					 &intent, intent.first_armed_us + 2000003),
 				 RESOURCE_X_INTENT_STALE);
+	cluster_trace_tx_identity = false;
+	UT_ASSERT_EQ(send_gate_count, 5);
+	UT_ASSERT_EQ(send_gate_last.reason, CLWAIT_SEND_PHYSICAL_OWNER);
+	UT_ASSERT_EQ(send_gate_last.state, RESOURCE_X_INTENT_SLOT_STAGED);
 	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(
 		&retry_episode, false, intent.first_armed_us + 2000003));
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_capture_exact(
@@ -13480,9 +13849,22 @@ UT_TEST(test_resource_x_predecessor_cv_observes_settlement_without_a_head)
 	retain_resource_x_test_settlement_pair(tag, PCM_STATE_S, 60, 61, 5,
 										   &predecessor_wait_settlement);
 	UT_ASSERT(resource_x_assertion_init(&tag, 1, &assertion));
+	wait_trace_count = 0;
+	cluster_trace_tx_identity = true;
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_predecessor_wait_exact(&tag, 0, 31, 17, 0, 102500, 10000),
 		RESOURCE_X_APPLY_APPLIED);
+	cluster_trace_tx_identity = false;
+	UT_ASSERT_EQ(wait_trace_count, 1);
+	UT_ASSERT_EQ(wait_trace_rows[0].site, CLWAIT_SITE_PCM_PREDECESSOR);
+	UT_ASSERT(wait_trace_rows[0].request_known);
+	UT_ASSERT_EQ(wait_trace_rows[0].request_seq,
+		predecessor_wait_settlement.common.assertion_sequence);
+	UT_ASSERT_EQ(wait_trace_rows[0].requester,
+		predecessor_wait_settlement.common.logical_assertion.requester_node);
+	UT_ASSERT_EQ(wait_trace_rows[0].base,
+		predecessor_wait_settlement.common.base_authority_generation);
+	wait_trace_count = 0;
 	UT_ASSERT_EQ(fake_cv_sleep_count, 1);
 	UT_ASSERT_EQ(fake_cv_timed_sleep_timeout, 10);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
@@ -14455,7 +14837,6 @@ UT_TEST(test_resource_x_gcs_predecessor_reobserve_is_not_authority)
  * suite. Synthetic endless-probe mode tests just the scheduler's16 bound. */
 BackendType MyBackendType = B_LMS;
 int cluster_lms_workers = 2;
-static bool ready_peer_ok = true;
 static bool ready_ring_full;
 static bool ready_interleave_once;
 static bool ready_stale_interleave_once;
@@ -14467,7 +14848,7 @@ static bool
 gcs_block_pcm_x_resource_x_peer_ready_exact(int32 node, uint32 *connection)
 {
 	UT_ASSERT(node >= 0 && node < RESOURCE_X_PROTOCOL_NODE_LIMIT);
-	*connection = 61;
+	*connection = ready_connection_generation;
 	return ready_peer_ok;
 }
 
@@ -15016,9 +15397,21 @@ UT_TEST(test_resource_x_terminal_delivery_holds_reference_until_release)
 				 RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
 	UT_ASSERT_EQ(memcmp(&terminal, &empty, sizeof(empty)), 0);
 	sleeps = fake_cv_sleep_count;
+	wait_trace_count = 0;
+	cluster_trace_tx_identity = true;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
 					 &fixture.assertion, 0, 17, 31, 77, 51, 61, 50, 4000, 1),
 				 RESOURCE_X_APPLY_APPLIED);
+	cluster_trace_tx_identity = false;
+	UT_ASSERT_EQ(wait_trace_count, 1);
+	UT_ASSERT_EQ(wait_trace_rows[0].site, CLWAIT_SITE_PCM_BOOTSTRAP);
+	UT_ASSERT(wait_trace_rows[0].request_known);
+	UT_ASSERT_EQ(wait_trace_rows[0].request_seq, fixture.ref.acquisition_generation);
+	UT_ASSERT_EQ(wait_trace_rows[0].formation, 17);
+	UT_ASSERT_EQ(wait_trace_rows[0].master_session, 31);
+	UT_ASSERT_EQ(wait_trace_rows[0].requester_connection, 51);
+	UT_ASSERT_EQ(wait_trace_rows[0].ingress_connection, 61);
+	wait_trace_count = 0;
 	UT_ASSERT_EQ(fake_cv_sleep_count, sleeps + 1);
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_delivery_complete_exact(&fixture.delivery, &fixture.installed),
@@ -15065,9 +15458,21 @@ UT_TEST(test_resource_x_install_follow_waits_for_delivery_release)
 					 &wrong, &fixture.installed, &terminal),
 				 RESOURCE_X_TARGET_INSTALL_STALE);
 	sleeps = fake_cv_sleep_count;
+	wait_trace_count = 0;
+	cluster_trace_tx_identity = true;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
 					 &follow, RESOURCE_X_TARGET_INSTALL_INFLIGHT, 1),
 				 RESOURCE_X_APPLY_APPLIED);
+	cluster_trace_tx_identity = false;
+	UT_ASSERT_EQ(wait_trace_count, 1);
+	UT_ASSERT_EQ(wait_trace_rows[0].site, CLWAIT_SITE_PCM_INSTALL);
+	UT_ASSERT(wait_trace_rows[0].request_known);
+	UT_ASSERT_EQ(wait_trace_rows[0].request_seq, fixture.ref.acquisition_generation);
+	UT_ASSERT_EQ(wait_trace_rows[0].formation, 17);
+	UT_ASSERT_EQ(wait_trace_rows[0].master_session, 31);
+	UT_ASSERT_EQ(wait_trace_rows[0].requester_connection, 51);
+	UT_ASSERT_EQ(wait_trace_rows[0].ingress_connection, 61);
+	wait_trace_count = 0;
 	UT_ASSERT_EQ(fake_cv_sleep_count, sleeps + 1);
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_delivery_complete_exact(&fixture.delivery, &fixture.installed),
@@ -15076,6 +15481,77 @@ UT_TEST(test_resource_x_install_follow_waits_for_delivery_release)
 					 &follow, &fixture.installed, &terminal),
 				 RESOURCE_X_TARGET_INSTALL_TERMINAL);
 	UT_ASSERT_EQ(terminal.acquisition_generation, fixture.ref.acquisition_generation);
+}
+
+UT_TEST(test_resource_x_install_trace_keeps_queue_continuations_separate)
+{
+	DeliveryObserverFixture fixture;
+	ResourceXTargetInstallContinuation follow;
+	ResourceXDecodedFrame first, next, ack, assertion;
+	ResourceXMasterSnapshot snapshot;
+	bool saw_install = false, saw_canonical = false, saw_priority = false;
+
+	setup_terminal_delivery_observer(&fixture);
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(
+			&fixture.assertion, 0, 17, 31, 77, 51, 61, 50, 4000, &fixture.installed, &follow),
+		RESOURCE_X_TARGET_INSTALL_INFLIGHT);
+	/* Independent master requests share the tag, never this waiter's
+	 * physical INSTALL continuation. Use the actual admission APIs. */
+	cluster_node_id = 0;
+	first = make_resource_x_bootstrap_request_values(fixture.assertion.resource, 1, 17, 31, 41, 51);
+	next = make_resource_x_bootstrap_request_values(fixture.assertion.resource, 3, 17, 31, 43, 53);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+					 &first, 1, 61, 77, 31, 71, &ack), RESOURCE_X_APPLY_APPLIED);
+	assertion = ack;
+	assertion.kind = RESOURCE_X_WIRE_ASSERT_X;
+	assertion.common.sender_connection_generation = 51;
+	assertion.common.authority_generation = assertion.common.base_authority_generation;
+	assertion.common.outcome = RESOURCE_X_OUTCOME_NONE;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
+					 &assertion, 1, 61, 77, 31, 71, &snapshot), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+					 &next, 3, 63, 77, 31, 73, &ack), RESOURCE_X_APPLY_BAD_STATE);
+	cluster_node_id = 2;
+	wait_trace_count = 0;
+	cluster_trace_tx_identity = true;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
+					 &follow, RESOURCE_X_TARGET_INSTALL_INFLIGHT, 1), RESOURCE_X_APPLY_APPLIED);
+	cluster_trace_tx_identity = false;
+	for (int i = 0; i < wait_trace_count; i++) {
+		const ClusterWaitTrace *row = &wait_trace_rows[i];
+
+		if (wait_trace_kinds[i] == CLWAIT_PCM_WAIT) {
+			UT_ASSERT_EQ(row->site, CLWAIT_SITE_PCM_INSTALL);
+			UT_ASSERT(row->continuation_known);
+			UT_ASSERT_EQ(row->requester, 2);
+			UT_ASSERT_EQ(row->request_seq, fixture.ref.acquisition_generation);
+			saw_install = true;
+		} else if (wait_trace_kinds[i] == CLWAIT_PCM_QUEUE) {
+			UT_ASSERT(row->request_known);
+			UT_ASSERT(!row->continuation_known);
+			UT_ASSERT_EQ(row->continuation_pending, 0);
+			UT_ASSERT_EQ(row->continuation_expected_x, 0);
+			UT_ASSERT_EQ(row->continuation_reservation, 0);
+			UT_ASSERT_EQ(row->continuation_claim_pending, 0);
+			UT_ASSERT_EQ(row->continuation_claim_reservation, 0);
+			UT_ASSERT_EQ(row->wait_head_change, 0);
+			UT_ASSERT_EQ(row->acquisition, 0);
+			if (row->queue_kind == 1) {
+				UT_ASSERT_EQ(row->requester, 1);
+				UT_ASSERT_EQ(row->request_seq, 41);
+				UT_ASSERT(row->caller_matches_head);
+				saw_canonical = true;
+			} else {
+				UT_ASSERT_EQ(row->queue_kind, 2);
+				UT_ASSERT_EQ(row->requester, 3);
+				UT_ASSERT_EQ(row->request_seq, 43);
+				saw_priority = true;
+			}
+		}
+	}
+	UT_ASSERT(saw_install && saw_canonical && saw_priority);
+	wait_trace_count = 0;
 }
 
 static DeliveryObserverFixture *delivery_release_on_enroll;
@@ -16539,6 +17015,14 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 type, uint32 dest, const void *pa
 {
 	ResourceXDecodedFrame frame;
 	ResourceXWireReject reject;
+	if (type == RESOURCE_X_MSG_IMAGE_OR_GRANT) {
+		UT_ASSERT(cluster_resource_x_wire_decode(type, payload, length, &frame, &reject));
+		UT_ASSERT_EQ(frame.kind, RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP);
+		UT_ASSERT_EQ(dest, frame.common.logical_assertion.requester_node);
+		bootstrap_last_ack = frame;
+		bootstrap_ack_count++;
+		return true;
+	}
 	UT_ASSERT_EQ(type, RESOURCE_X_MSG_BLOCKED_TO_N);
 	UT_ASSERT_EQ(dest, 0);
 	UT_ASSERT(cluster_resource_x_wire_decode(type, payload, length, &frame, &reject));
@@ -17262,6 +17746,7 @@ static ResourceXDecodedFrame prepared_finish_block;
 static ResourceXDecodedFrame prepared_finish_image;
 static ResourceXLocalOwnerHandle prepared_finish_owner;
 static ClusterPcmOwnSnapshot prepared_finish_revoking;
+static bool prepared_finish_before_pair;
 
 static void
 check_resource_x_prepared_retain_episode_mode(uint64 old_generation, int old_requester,
@@ -17405,6 +17890,11 @@ check_resource_x_prepared_retain_episode_mode(uint64 old_generation, int old_req
 				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT(cluster_pcm_lock_resource_x_terminal_x_revoke_revalidate_held_exact(
 		&block, 0, 77, 91, &owner, &lineage));
+	if (prepared_finish_before_pair) {
+		prepared_finish_block = block;
+		prepared_finish_owner = owner;
+		return;
+	}
 
 	make_resource_x_remote_join_pair(tag, 2, &grant, &image);
 	retarget_resource_x_remote_join_pair(&grant, &image, source_base + 2, UINT64_C(42));
@@ -17498,6 +17988,163 @@ UT_TEST(test_resource_x_retained_source_replay_outlives_handoff_age)
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_publish_needed_exact(
 					 &prepared_finish_block.common.logical_assertion, 42, 0, 31),
 				 RESOURCE_X_APPLY_APPLIED);
+}
+
+UT_TEST(test_resource_x_content_release_requeues_exact_source_without_new_frame)
+{
+	ResourceXSourceDrainWork work;
+	ResourceXIntentSlot slot;
+	ResourceXAcquisitionRef delivery;
+	uint8 payload[RESOURCE_X_IMAGE_V2_BYTES];
+	uint32 examined;
+	bool found;
+	PGPROC proc = { 0 };
+	PROC_HDR proc_header = { 0 };
+	PGPROC *saved_proc = MyProc;
+	PROC_HDR *saved_global = ProcGlobal;
+	BackendType saved_backend = MyBackendType;
+
+	prepared_finish_before_pair = true;
+	check_resource_x_prepared_retain_episode_mode(0, 2, true, false);
+	prepared_finish_before_pair = false;
+	proc_header.allProcs = &proc;
+	proc_header.allProcCount = 1;
+	MyProc = &proc;
+	ProcGlobal = &proc_header;
+	MyBackendType = B_LMS;
+	source_drain_latch_wakes = 0;
+	source_drain_woken_latch = NULL;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_yield_exact(
+					 &prepared_finish_owner, UINT64_C(131)), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_defer_exact(
+					 &prepared_finish_block, 0, 77, 0), RESOURCE_X_APPLY_INVALID);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_defer_exact(
+					 &prepared_finish_block, 0, 78, 51), RESOURCE_X_APPLY_STALE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_defer_exact(
+					 &prepared_finish_block, 0, 77, 51), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_defer_exact(
+					 &prepared_finish_block, 0, 77, 52), RESOURCE_X_APPLY_STALE);
+	for (int pass = 0; pass < 3; pass++) {
+		found = false;
+		/* BUSY work is discoverable once initially and once per subsequent
+		 * content-release event, without a new type-17/requester packet. */
+		for (int calls = 0; calls < 64; calls++) {
+			ResourceXIntentProbeResult probe
+				= cluster_pcm_lock_resource_x_outbound_work_probe_exact(
+					1, &slot, payload, sizeof(payload), &examined, &delivery);
+			UT_ASSERT(probe != RESOURCE_X_INTENT_PROBE_CORRUPT);
+			if (probe == RESOURCE_X_INTENT_PROBE_SOURCE_DRAIN) {
+				memcpy(&work, payload, sizeof(work));
+				UT_ASSERT_EQ(work.master_node, 0);
+				UT_ASSERT_EQ(work.r4_record_generation, UINT64_C(77));
+				UT_ASSERT_EQ(work.authenticated_connection_generation, UINT32_C(51));
+				UT_ASSERT(resource_x_assertion_equal(&work.request.logical_assertion,
+					&prepared_finish_block.common.logical_assertion));
+				UT_ASSERT_EQ(work.request.assertion_sequence, UINT64_C(42));
+				found = true;
+				break;
+			}
+			if (probe == RESOURCE_X_INTENT_PROBE_COMPLETE
+				&& cluster_pcm_lock_resource_x_outbound_wait_timeout(1000L) == 0)
+				continue;
+			if (probe == RESOURCE_X_INTENT_PROBE_COMPLETE
+				|| probe == RESOURCE_X_INTENT_PROBE_IDLE)
+				break;
+		}
+		UT_ASSERT(found);
+		{
+			ResourceXSourceDrainWork stale = work;
+			ResourceXTerminalXLineage lineage;
+			ResourceXLocalOwnerHandle retry;
+
+			stale.attempt_generation++;
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(
+				&stale, RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_STALE);
+			/* Exercise the real HANDOFF consumption, not just a synthetic
+			 * complete(BUSY): source claim must retain the parked request. */
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
+				&prepared_finish_block, 0, 77, 91, 12, 9,
+				UINT64_C(132) + pass * 2, &lineage, &retry), RESOURCE_X_APPLY_APPLIED);
+			if (pass == 1)
+				cluster_pcm_lock_resource_x_source_drain_content_released();
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_yield_exact(
+				&retry, UINT64_C(133) + pass * 2), RESOURCE_X_APPLY_APPLIED);
+		}
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(
+						 &work, RESOURCE_X_APPLY_BAD_STATE), RESOURCE_X_APPLY_APPLIED);
+		found = false;
+		for (int calls = 0; calls < 64; calls++) {
+			ResourceXIntentProbeResult probe
+				= cluster_pcm_lock_resource_x_outbound_work_probe_exact(
+					1, &slot, payload, sizeof(payload), &examined, &delivery);
+			if (probe == RESOURCE_X_INTENT_PROBE_SOURCE_DRAIN) {
+				UT_ASSERT(!found && pass == 1);
+				memcpy(&work, payload, sizeof(work));
+				UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(
+					&work, RESOURCE_X_APPLY_BAD_STATE), RESOURCE_X_APPLY_APPLIED);
+				found = true;
+			}
+			if (probe == RESOURCE_X_INTENT_PROBE_COMPLETE
+				&& cluster_pcm_lock_resource_x_outbound_wait_timeout(1000L) == 0)
+				continue;
+			if (probe == RESOURCE_X_INTENT_PROBE_COMPLETE
+				|| probe == RESOURCE_X_INTENT_PROBE_IDLE)
+				break;
+		}
+		/* Only the release during an attempt permits another call. No
+		 * notification is lost between a failed drain and its BUSY return. */
+		UT_ASSERT_EQ(found, pass == 1);
+		cluster_pcm_lock_resource_x_source_drain_content_released();
+	}
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(
+					 &work, RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_APPLIED);
+	cluster_pcm_lock_resource_x_source_drain_content_released();
+	found = false;
+	for (int calls = 0; calls < 64; calls++) {
+		ResourceXIntentProbeResult probe
+			= cluster_pcm_lock_resource_x_outbound_work_probe_exact(
+				1, &slot, payload, sizeof(payload), &examined, &delivery);
+		found |= probe == RESOURCE_X_INTENT_PROBE_SOURCE_DRAIN;
+		if (probe == RESOURCE_X_INTENT_PROBE_COMPLETE || probe == RESOURCE_X_INTENT_PROBE_IDLE)
+			break;
+	}
+	UT_ASSERT(!found);
+	UT_ASSERT_EQ(source_drain_latch_wakes, 4);
+	UT_ASSERT(source_drain_woken_latch == &proc.procLatch);
+	MyProc = saved_proc;
+	ProcGlobal = saved_global;
+	MyBackendType = saved_backend;
+}
+
+UT_TEST(test_resource_x_parked_source_retires_with_exact_owner)
+{
+	ResourceXTerminalXLineage lineage;
+	ResourceXLocalOwnerHandle owner;
+	ResourceXIntentSlot slot;
+	ResourceXAcquisitionRef delivery;
+	uint8 payload[RESOURCE_X_IMAGE_V2_BYTES];
+	uint32 examined;
+
+	prepared_finish_before_pair = true;
+	check_resource_x_prepared_retain_episode_mode(0, 2, true, false);
+	prepared_finish_before_pair = false;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_yield_exact(
+		&prepared_finish_owner, UINT64_C(131)), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_defer_exact(
+		&prepared_finish_block, 0, 77, 51), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
+		&prepared_finish_block, 0, 77, 91, 12, 9, UINT64_C(132), &lineage, &owner),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_release_exact(&owner),
+		RESOURCE_X_APPLY_APPLIED);
+	for (int calls = 0; calls < 64; calls++) {
+		ResourceXIntentProbeResult probe
+			= cluster_pcm_lock_resource_x_outbound_work_probe_exact(
+				1, &slot, payload, sizeof(payload), &examined, &delivery);
+		UT_ASSERT(probe != RESOURCE_X_INTENT_PROBE_SOURCE_DRAIN);
+		if (probe == RESOURCE_X_INTENT_PROBE_COMPLETE || probe == RESOURCE_X_INTENT_PROBE_IDLE)
+			break;
+	}
 }
 
 UT_TEST(test_resource_x_deferred_source_pin_claim_is_exact_and_single_owner)
@@ -20727,6 +21374,40 @@ UT_TEST(test_resource_x_trace_is_exact_bounded_and_cannot_erase_unexported_evide
 	UT_ASSERT_EQ(cluster_pcm_grd_count(), 0);
 }
 
+UT_TEST(test_resource_x_trace_reserves_capacity_for_high_signal_events)
+{
+	BufferTag tag = make_tag(493);
+	ResourceXTraceStats stats;
+	ResourceXTraceEvent event = {0};
+	ResourceXTraceEvent exported[64];
+	uint64 cursor = 0;
+
+	reset_fake_pcm_runtime(16);
+	event.assertion.resource = tag;
+	event.assertion.requester_node = 0;
+	event.kind = RESOURCE_X_TRACE_PREUSE;
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_begin(&tag, 1));
+	for (uint32 i = 0; i < 16 * 64; i++)
+		cluster_pcm_lock_resource_x_trace_note(&event);
+	event.kind = RESOURCE_X_TRACE_SEND;
+	for (uint32 i = 0; i < 4 * 64; i++)
+		cluster_pcm_lock_resource_x_trace_note(&event);
+	cluster_pcm_lock_resource_x_trace_note(&event);
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_seal(1));
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_snapshot(&stats));
+	UT_ASSERT_EQ(stats.count, 16 * 64);
+	UT_ASSERT_EQ(stats.overflow, 1);
+	UT_ASSERT_EQ(stats.suppressed, 16 * 64 / 4);
+	while (cursor < stats.count)
+	{
+		uint32 copied = cluster_pcm_lock_resource_x_trace_read(1, cursor,
+													exported, lengthof(exported));
+		UT_ASSERT_EQ(copied, Min((uint64) lengthof(exported), stats.count - cursor));
+		cursor += copied;
+	}
+	UT_ASSERT(cluster_pcm_lock_resource_x_trace_release(1));
+}
+
 
 static void
 pi_relation_scan_setup(void)
@@ -23039,6 +23720,26 @@ cluster_bufmgr_read_storage_image_for_resource_x(BufferTag tag, char *image,
  * proof bytes, the callback, directory rechecks and grant intent are real. */
 #include "test_cluster_pcm_master_durable.inc"
 
+uint64
+cluster_epoch_get_current(void)
+{
+	return 17;
+}
+
+ClusterSemanticResourceXPeerOpenResult
+cluster_semantic_activation_resource_x_peer_open_check(const ClusterSemanticAdmissionToken *token,
+													   int32 node, uint32 generation)
+{
+	UT_ASSERT(token->entered);
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	UT_ASSERT(node >= 0 && node < RESOURCE_X_PROTOCOL_NODE_LIMIT);
+	return bootstrap_ingress_generation == 0 || generation == bootstrap_ingress_generation
+			   ? CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH
+			   : CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_DRIFT;
+}
+
+#include "test_cluster_pcm_bootstrap_tick.inc"
+
 static uint64
 lms_outbound_monotonic_us(void)
 {
@@ -23084,6 +23785,14 @@ cluster_gcs_block_resource_x_source_finish_tick(const ResourceXAcquisitionRef *r
 {
 	(void)ref;
 	UT_ASSERT(false); /* No source-finish work in this fixture. */
+	return RESOURCE_X_APPLY_BAD_STATE;
+}
+
+ResourceXApplyResult
+cluster_gcs_block_resource_x_source_drain_tick(const ResourceXSourceDrainWork *work)
+{
+	(void)work;
+	UT_ASSERT(false); /* This fixture probes metadata without running GCS. */
 	return RESOURCE_X_APPLY_BAD_STATE;
 }
 
@@ -23466,21 +24175,43 @@ UT_TEST(test_requester_transport_owner_bounds_both_dispatch_roots)
 		cluster_pcm_lock_resource_x_requester_send_begin_exact(&request, 0, 1, 100000, &first),
 		RESOURCE_X_INTENT_STAGED);
 	UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_current_exact(&first));
+	/* A live physical send owner must be observable as a local eligibility
+	 * rejection, without expiring it into another request. */
+	requester_gate_count = 0;
+	cluster_trace_tx_identity = true;
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_requester_send_begin_exact(&request, 0, 1, 1000000, &second),
 		RESOURCE_X_INTENT_NOT_DUE);
+	UT_ASSERT_EQ(requester_gate_count, 1);
+	UT_ASSERT_EQ(requester_gate_last.reason, CLWAIT_SEND_PHYSICAL_OWNER);
+	UT_ASSERT_EQ(requester_gate_last.site, CLWAIT_REQUESTER_BEGIN);
+	UT_ASSERT_EQ(requester_gate_last.episode, first.send_episode);
+	UT_ASSERT_EQ(requester_gate_last.pending, 1);
+	UT_ASSERT_EQ(requester_gate_last.r4, 77);
+	UT_ASSERT_EQ(requester_gate_last.binding, first.body.owner_generation);
+	UT_ASSERT_EQ(requester_gate_last.request_seq, request.common.assertion_sequence);
+	UT_ASSERT_EQ(requester_gate_last.requester_connection, 51);
+	UT_ASSERT(BufferTagsEqual(&requester_gate_tag, &tag));
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
 					 &assertion, 0, 17, 31, 77, 51, 61, 9000000, 8900000, 1000000, 10000, false, 0,
 					 &retry, &terminal),
 				 RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
+	UT_ASSERT_EQ(requester_gate_count, 2);
+	UT_ASSERT_EQ(requester_gate_last.site, CLWAIT_REQUESTER_ROUND);
 	UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_complete_exact(&first, true, 1000001));
 	UT_ASSERT(!cluster_pcm_lock_resource_x_requester_send_complete_exact(&first, true, 1000002));
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_requester_send_begin_exact(&request, 0, 1, 1500000, &second),
 		RESOURCE_X_INTENT_NOT_DUE);
+	UT_ASSERT_EQ(requester_gate_count, 3);
+	UT_ASSERT_EQ(requester_gate_last.reason, CLWAIT_SEND_RETRY_AGE);
+	UT_ASSERT_EQ(requester_gate_last.completed_us, 1000001);
+	UT_ASSERT_EQ(requester_gate_last.observed_us, 1500000);
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_requester_send_begin_exact(&request, 0, 1, 1500001, &second),
 		RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT_EQ(requester_gate_count, 3); /* No new callback on transport handoff. */
+	cluster_trace_tx_identity = false;
 	UT_ASSERT_EQ(second.logical_generation, first.logical_generation);
 	UT_ASSERT_EQ(second.send_episode, first.send_episode + 1);
 	UT_ASSERT(cluster_pcm_rx_stats_snapshot(&stats));
@@ -23523,17 +24254,28 @@ UT_TEST(test_requester_transport_owner_bounds_both_dispatch_roots)
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_requester_send_begin_exact(&request, 0, 1, 110, &first),
 		RESOURCE_X_INTENT_STAGED);
+	requester_gate_count = 0;
+	cluster_trace_tx_identity = true;
 	fake_pcm_clock_us = 1000000;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_dispatch_exact(&fixture.delivery, &retry),
 				 RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(requester_gate_count, 1);
+	UT_ASSERT_EQ(requester_gate_last.reason, CLWAIT_SEND_PHYSICAL_OWNER);
+	UT_ASSERT_EQ(requester_gate_last.site, CLWAIT_REQUESTER_RECHECK);
 	UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_complete_exact(&first, true, 1000000));
 	fake_pcm_clock_us = 1499999;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_dispatch_exact(&fixture.delivery, &retry),
 				 RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(requester_gate_count, 2);
+	UT_ASSERT_EQ(requester_gate_last.reason, CLWAIT_SEND_RETRY_AGE);
+	UT_ASSERT_EQ(requester_gate_last.completed_us, 1000000);
+	UT_ASSERT_EQ(requester_gate_last.observed_us, 1499999);
 	fake_pcm_clock_us = 1500000;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_dispatch_exact(&fixture.delivery, &retry),
 				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(retry.common.assertion_sequence, request.common.assertion_sequence);
+	UT_ASSERT_EQ(requester_gate_count, 2);
+	cluster_trace_tx_identity = false;
 }
 
 static void
@@ -23838,7 +24580,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(361);
+	UT_PLAN(369);
 	/* Observe the actual startup state before any runtime fixture overrides
 	 * the postmaster GUC or initializes shared PCM state and counters. */
 	UT_RUN(test_pcm_grd_max_entries_default_is_minus_one);
@@ -23868,6 +24610,7 @@ main(void)
 	UT_RUN(test_pcm_illegal_transition_validator_rejects);
 	UT_RUN(test_pcm_wait_margin_keeps_each_ratio_pair_and_separate_lifetimes);
 	UT_RUN(test_resource_x_trace_is_exact_bounded_and_cannot_erase_unexported_evidence);
+	UT_RUN(test_resource_x_trace_reserves_capacity_for_high_signal_events);
 	UT_RUN(test_resource_x_trace_observes_actual_head_and_same_ref_waiters);
 	UT_RUN(test_resource_x_trace_preserves_physical_authority_image_flags);
 	UT_RUN(test_pcm_vm_metrics_distinguish_requests_completions_and_latency);
@@ -23928,6 +24671,9 @@ main(void)
 	UT_RUN(test_resource_x_bootstrap_receipt_drift_invalidates_but_keeps_floor);
 	UT_RUN(test_resource_x_bootstrap_terminal_retire_clears_binding_not_floor);
 	UT_RUN(test_resource_x_bootstrap_dispatches_one_current_base_at_a_time);
+	UT_RUN(test_resource_x_wait_trace_keeps_exact_master_queue_and_unlocked_logging);
+	UT_RUN(test_resource_x_bootstrap_active_queue_rejects_ingress_drift);
+	UT_RUN(test_resource_x_bootstrap_active_queue_rejects_outbound_drift);
 	UT_RUN(test_resource_x_bootstrap_r8_clears_old_binding_not_attempt_floor);
 	UT_RUN(test_resource_x_bootstrap_round_fans_in_and_retries_same_attempt);
 	UT_RUN(test_resource_x_node_fanin_ignores_caller_deadline_and_retry_slice);
@@ -23936,6 +24682,7 @@ main(void)
 	UT_RUN(test_resource_x_exact_ack_sample_before_retry_is_not_failure);
 	UT_RUN(test_resource_x_head_budget_and_owned_progress_are_independent);
 	UT_RUN(test_resource_x_round_wait_rechecks_progress_in_finite_slices);
+	UT_RUN(test_resource_x_shutdown_unwinds_bootstrap_cv_and_pin);
 	UT_RUN(test_resource_x_reply_wait_metrics_are_shared_and_bucket_exact);
 	UT_RUN(test_resource_x_expired_follower_cannot_cancel_live_head);
 	UT_RUN(test_resource_x_post_ack_rejected_follower_preserves_shared_head);
@@ -24047,6 +24794,7 @@ main(void)
 	UT_RUN(test_resource_x_actual_wait_does_not_reject_own_terminal_delivery);
 	UT_RUN(test_resource_x_terminal_delivery_holds_reference_until_release);
 	UT_RUN(test_resource_x_install_follow_waits_for_delivery_release);
+	UT_RUN(test_resource_x_install_trace_keeps_queue_continuations_separate);
 	UT_RUN(test_resource_x_delivery_release_before_sleep_and_original_deadline);
 	UT_RUN(test_resource_x_observed_step_preserves_strict_successor_proof);
 	UT_RUN(test_resource_x_wait_threshold_does_not_fail_owned_delivery);
@@ -24086,6 +24834,8 @@ main(void)
 	UT_RUN(test_resource_x_remote_retain_reuse_orders_by_proven_current_authority);
 	UT_RUN(test_resource_x_delegated_reentry_requires_physical_cover_and_drain);
 	UT_RUN(test_resource_x_retained_source_replay_outlives_handoff_age);
+	UT_RUN(test_resource_x_content_release_requeues_exact_source_without_new_frame);
+	UT_RUN(test_resource_x_parked_source_retires_with_exact_owner);
 	UT_RUN(test_resource_x_deferred_source_pin_claim_is_exact_and_single_owner);
 	UT_RUN(test_resource_x_deferred_source_rejects_corruption_exhaustion_and_reconfig);
 	UT_RUN(test_resource_x_source_replay_observes_concurrent_finish_publication);

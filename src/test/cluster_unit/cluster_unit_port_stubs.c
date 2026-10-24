@@ -16,12 +16,44 @@
 #include "cluster/cluster_visibility_trace_filter.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_update_trace.h"
+#include "cluster/cluster_tx_identity_trace.h"
+#include "cluster/cluster_wait_trace.h"
 #include "cluster/cluster_xnode_profile.h"
 #include "cluster/cluster_storage_quorum.h"
 
 /* Profiling-aware product objects can link without a diagnostic backend.
  * Dedicated trace tests override these defaults with the real collector. */
 bool cluster_update_trace_enabled __attribute__((weak)) = false;
+bool cluster_trace_tx_identity __attribute__((weak)) = false;
+void __attribute__((weak))
+cluster_tx_identity_trace_emit(ClusterTxIdentityTraceKind kind pg_attribute_unused(),
+								const ClusterTxIdentityTrace *row pg_attribute_unused())
+{
+	abort();
+}
+uint64 __attribute__((weak))
+cluster_wait_trace_begin(ClusterWaitTraceKind kind pg_attribute_unused())
+{
+	if (cluster_trace_tx_identity)
+		abort();
+	return 0;
+}
+void __attribute__((weak))
+cluster_wait_trace_emit(ClusterWaitTraceKind kind pg_attribute_unused(),
+						const ClusterWaitTrace *row pg_attribute_unused())
+{
+	if (cluster_trace_tx_identity)
+		abort();
+}
+void __attribute__((weak))
+cluster_buffer_trace_tx_wait(ClusterWaitTraceSite site pg_attribute_unused(),
+							uint64 wait_seq pg_attribute_unused(),
+							uint32 tx_xid pg_attribute_unused(),
+							uint64 request_seq pg_attribute_unused())
+{
+	if (cluster_trace_tx_identity)
+		abort();
+}
 bool cluster_trace_visibility_enabled __attribute__((weak)) = false;
 ClusterVisibilityTraceFilter cluster_trace_visibility_filter __attribute__((weak)) = { 0 };
 NodeId __attribute__((weak))

@@ -302,6 +302,10 @@ cluster_hw_lock(const ClusterResId *resid, HwLock *lk)
 
 	Assert(resid != NULL && lk != NULL);
 	memset(lk, 0, sizeof(*lk));
+	/* Match the GUC's existing perpetual-wait safety invariant. Without
+	 * retransmission a lost remote grant would strand this new HW waiter. */
+	if (cluster_ges_retransmit_max_attempts <= 0)
+		return false;
 
 	memset(&req, 0, sizeof(req));
 	req.resid = *resid;
@@ -313,7 +317,12 @@ cluster_hw_lock(const ClusterResId *resid, HwLock *lk)
 	req.dontwait = false;
 	req.sessionLock = false;
 	req.caller_local_start_ts_ms = (uint64)(GetCurrentTimestamp() / 1000);
-	req.timeout_ms = cluster_ges_request_timeout_ms;
+	/* HW contention is an enqueue wait, not a failed extension. Keep the
+	 * original request queued until its holder releases and GES signals the
+	 * reply CV. GES retry sleeps remain loss-recovery fallbacks; their budget
+	 * must not cancel an ordinary HW waiter and become 53RA6. Cancellation,
+	 * deadlock and epoch/authority rejection still use the original cleanup. */
+	req.timeout_ms = -1;
 	req.wait_event = WAIT_EVENT_CLUSTER_REL_EXTEND_WAIT;
 
 	r = cluster_lock_acquire_seven_step(&req);

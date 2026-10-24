@@ -216,6 +216,9 @@ cluster_injection_run(const char *name pg_attribute_unused())
 
 UT_DEFINE_GLOBALS();
 
+/* Process-local topology lookup cache generation, test-only observability. */
+extern uint32 cluster_conf_lookup_cache_generation_for_test(void);
+
 
 /* ============================================================
  * Shmem ABI invariants (compile-time anchors).
@@ -402,10 +405,96 @@ UT_TEST(test_cluster_enabled_linkable)
 }
 
 
+/* ============================================================
+ * Lookup cache behavior.
+ *
+ * cluster_conf_load() establishes the topology once during startup, so the
+ * hot lookup path may index the process-local view instead of scanning every
+ * declared node.  These fixtures exercise reuse and the explicit pointer /
+ * node-count invalidation boundaries without requiring a backend process.
+ * ============================================================
+ */
+
+UT_TEST(test_lookup_cache_reuses_index)
+{
+	ClusterConf conf;
+	uint32 generation;
+	const ClusterNodeInfo *node;
+
+	memset(&conf, 0, sizeof(conf));
+	conf.node_count = 2;
+	conf.nodes[0].node_id = 0;
+	conf.nodes[1].node_id = 1;
+	ClusterConfShmem = &conf;
+
+	generation = cluster_conf_lookup_cache_generation_for_test();
+	node = cluster_conf_lookup_node(1);
+	UT_ASSERT(node == &conf.nodes[1]);
+	UT_ASSERT(cluster_conf_lookup_cache_generation_for_test() > generation);
+
+	generation = cluster_conf_lookup_cache_generation_for_test();
+	UT_ASSERT(cluster_conf_lookup_node(1) == node);
+	UT_ASSERT_EQ(cluster_conf_lookup_cache_generation_for_test(), generation);
+
+	ClusterConfShmem = NULL;
+	UT_ASSERT_NULL(cluster_conf_lookup_node(1));
+}
+
+UT_TEST(test_lookup_cache_invalidates_topology)
+{
+	ClusterConf conf_a;
+	ClusterConf conf_b;
+	uint32 generation;
+
+	memset(&conf_a, 0, sizeof(conf_a));
+	memset(&conf_b, 0, sizeof(conf_b));
+	conf_a.node_count = 2;
+	conf_a.nodes[0].node_id = 0;
+	conf_a.nodes[1].node_id = 1;
+	conf_b.node_count = 2;
+	conf_b.nodes[0].node_id = 0;
+	conf_b.nodes[1].node_id = 2;
+
+	ClusterConfShmem = &conf_a;
+	UT_ASSERT(cluster_conf_lookup_node(0) == &conf_a.nodes[0]);
+	generation = cluster_conf_lookup_cache_generation_for_test();
+
+	ClusterConfShmem = &conf_b;
+	UT_ASSERT(cluster_conf_lookup_node(0) == &conf_b.nodes[0]);
+	UT_ASSERT(cluster_conf_lookup_cache_generation_for_test() > generation);
+
+	generation = cluster_conf_lookup_cache_generation_for_test();
+	conf_b.node_count = 1;
+	UT_ASSERT_NULL(cluster_conf_lookup_node(2));
+	UT_ASSERT(cluster_conf_lookup_cache_generation_for_test() > generation);
+
+	ClusterConfShmem = NULL;
+	UT_ASSERT_NULL(cluster_conf_lookup_node(0));
+}
+
+UT_TEST(test_lookup_cache_duplicate_and_range)
+{
+	ClusterConf conf;
+
+	memset(&conf, 0, sizeof(conf));
+	conf.node_count = 2;
+	conf.nodes[0].node_id = 3;
+	conf.nodes[1].node_id = 3;
+	ClusterConfShmem = &conf;
+
+	/* Preserve the old first-match rule when malformed input duplicates an id. */
+	UT_ASSERT(cluster_conf_lookup_node(3) == &conf.nodes[0]);
+	UT_ASSERT_NULL(cluster_conf_lookup_node(-1));
+	UT_ASSERT_NULL(cluster_conf_lookup_node(CLUSTER_MAX_NODES));
+
+	ClusterConfShmem = NULL;
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(24);
 	UT_RUN(test_max_nodes_constant);
 	UT_RUN(test_conf_magic_constant);
 	UT_RUN(test_node_role_int32_sized);
@@ -427,6 +516,9 @@ main(void)
 	UT_RUN(test_scn_node_id_valid_range);
 	UT_RUN(test_scn_node_id_valid_overflow);
 	UT_RUN(test_cluster_enabled_linkable);
+	UT_RUN(test_lookup_cache_reuses_index);
+	UT_RUN(test_lookup_cache_invalidates_topology);
+	UT_RUN(test_lookup_cache_duplicate_and_range);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
