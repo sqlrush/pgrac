@@ -472,7 +472,7 @@ UT_TEST(test_pi_ko_commit_marker_preserves_owner_without_execution)
 		FakeXactRecord fake;
 		RfPageOnlineRecordIdentityV1 identity;
 		RfDetachedRecordPlanV1 record;
-		RfSideOnlinePlanV1 *plan, *recovery;
+		RfSideOnlinePlanV1 *plan;
 		RfSideOnlineOperationV1 op;
 		RfSideContributionOwnersV1 owners;
 		RfPageProofDetailV1 detail;
@@ -496,6 +496,7 @@ UT_TEST(test_pi_ko_commit_marker_preserves_owner_without_execution)
 			if (detail == RF_PAGE_PROOF_DETAIL_OK) {
 				UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
 				UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &op));
+				UT_ASSERT(op.xact.pi_read_only);
 				UT_ASSERT_EQ(op.xact.invalidation_count, 1);
 				UT_ASSERT_EQ(op.owned_payload_length, fake.u.decoded.main_data_len);
 				UT_ASSERT(memcmp(op.owned_payload, fake.data, op.owned_payload_length) == 0);
@@ -505,10 +506,14 @@ UT_TEST(test_pi_ko_commit_marker_preserves_owner_without_execution)
 													   op.owned_payload_length), RF_SIDE_XACT_APPLY_BLOCKED);
 			}
 		}
-		recovery = pi_side_plan(&identity, false);
-		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(recovery, &record, &identity),
-					 RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
-		rf_side_online_plan_destroy_v1(&recovery);
+		/* A recovery plan can select its original cold completion owner.
+		 * Only the strict decoder is required to reject unowned effects. */
+		{
+			RfSideXactOperationV1 strict;
+
+			UT_ASSERT(!rf_side_xact_decode_v1(&fake.reader, identity.record.system_identifier,
+				identity.record.origin_thread, &strict));
+		}
 		rf_side_online_plan_destroy_v1(&plan);
 	}
 }
@@ -523,7 +528,7 @@ UT_TEST(test_pi_relation_stats_keeps_native_owner_without_execution)
 		FakeXactRecord fake;
 		RfPageOnlineRecordIdentityV1 identity;
 		RfDetachedRecordPlanV1 record;
-		RfSideOnlinePlanV1 *plan, *recovery;
+		RfSideOnlinePlanV1 *plan;
 		RfSideOnlineOperationV1 op;
 		RfSideContributionOwnersV1 owners;
 		RfPageProofDetailV1 detail;
@@ -544,6 +549,7 @@ UT_TEST(test_pi_relation_stats_keeps_native_owner_without_execution)
 		if (detail == RF_PAGE_PROOF_DETAIL_OK) {
 			UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
 			UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &op));
+			UT_ASSERT(op.xact.pi_read_only);
 			UT_ASSERT_EQ(op.owned_payload_length, fake.u.decoded.main_data_len);
 			UT_ASSERT(memcmp(op.owned_payload, fake.data, op.owned_payload_length) == 0);
 			UT_ASSERT(rf_side_online_plan_contribution_owners_v1(plan, 0, &owners));
@@ -563,10 +569,14 @@ UT_TEST(test_pi_relation_stats_keeps_native_owner_without_execution)
 			UT_ASSERT_EQ(capture.count, 0);
 			UT_ASSERT(!capture.end_complete);
 		}
-		recovery = pi_side_plan(&identity, false);
-		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(recovery, &record, &identity),
-					 RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
-		rf_side_online_plan_destroy_v1(&recovery);
+		/* A recovery plan can select its original cold completion owner.
+		 * Only the strict decoder is required to reject unowned effects. */
+		{
+			RfSideXactOperationV1 strict;
+
+			UT_ASSERT(!rf_side_xact_decode_v1(&fake.reader, identity.record.system_identifier,
+				identity.record.origin_thread, &strict));
+		}
 		rf_side_online_plan_destroy_v1(&plan);
 	}
 }
@@ -778,10 +788,48 @@ UT_TEST(test_live_pi_entry_never_selects_cold_children_or_function_stats)
 	}
 }
 
+UT_TEST(test_cold_effects_acceptance_does_not_qualify_strict_or_pi_execution)
+{
+	for (int variant = 0; variant < 3; variant++) {
+		SharedInvalidationMessage msg = {0};
+		xl_xact_stats_item item = {
+			variant == 2 ? PGSTAT_KIND_FUNCTION : PGSTAT_KIND_RELATION, 5, 76543
+		};
+		FakeXactRecord fake;
+		RfPageOnlineRecordIdentityV1 identity;
+		xl_xact_parsed_commit parsed;
+		RfSideXactOperationV1 cold = {0}, strict, pi;
+
+		msg.ko.id = SHAREDINVALKO_COMMIT_ID;
+		msg.ko.version = SHAREDINVALKO_COMMIT_VERSION;
+		msg.ko.batch_lo = 17;
+		pi_commit(&fake, 0, variant == 0 ? &msg : NULL, variant == 0 ? 1 : 0);
+		if (variant != 0)
+			pi_commit_add_stats(&fake, &item, 1);
+		identity = pi_identity(&fake);
+		UT_ASSERT(ParseCommitRecord(XLogRecGetInfo(&fake.reader),
+			(xl_xact_commit *)XLogRecGetData(&fake.reader), XLogRecGetDataLen(&fake.reader), &parsed));
+		/* This is the cold effects predicate, not its complete owner preflight. */
+		UT_ASSERT(side_xact_pi_effects_valid(&parsed, identity.record.system_identifier, true, &cold));
+		UT_ASSERT_EQ(cold.kind, 0);
+		UT_ASSERT(!rf_side_xact_decode_v1(&fake.reader, identity.record.system_identifier,
+			identity.record.origin_thread, &strict));
+		UT_ASSERT_EQ(rf_side_xact_inspect_pi_v1(&fake.reader, identity.record.system_identifier,
+			identity.record.origin_thread, &pi), variant != 2);
+		if (variant != 2) {
+			UT_ASSERT(pi.pi_read_only);
+			UT_ASSERT_EQ(rf_side_xact_apply_owned_v1(&pi, fake.data,
+				fake.u.decoded.main_data_len), RF_SIDE_XACT_APPLY_BLOCKED);
+		} else
+			UT_ASSERT_EQ(pi.kind, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(18);
+	UT_RUN(test_cold_effects_acceptance_does_not_qualify_strict_or_pi_execution);
 	UT_RUN(test_pi_and_cold_effects_keep_distinct_stats_and_children_contracts);
 	UT_RUN(test_cold_effects_reject_unsupported_stats_without_changing_owner);
 	UT_RUN(test_effect_modes_preserve_origin_physical_and_invalidation_checks);

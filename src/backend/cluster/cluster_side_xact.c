@@ -360,21 +360,17 @@ side_xact_pi_effects_valid(const xl_xact_parsed_commit *parsed, uint64 system_id
 {
 	uint32 kinds = 0;
 
-	/* These additional transaction owners are not proved by this consumer. */
+	/* Cold completion has its own child and native stats owners. PI retains
+	 * only validated relation stats and never acquires those execution owners. */
 	if ((!cold_completion && parsed->nsubxacts != 0)
+		|| (cold_completion && !side_xact_cold_stats_valid(parsed->nstats, parsed->stats,
+														 parsed->xinfo, parsed->dbId))
 		|| (parsed->xinfo & XACT_XINFO_HAS_ORIGIN) != 0)
 		return false;
-	/* Keep the original cold completion and PI obligations separate. The
-	 * cold caller must still validate its native child list and execution
-	 * owner; this effects predicate cannot qualify a cold completion. */
-	if (cold_completion) {
-		if (!side_xact_cold_stats_valid(parsed->nstats, parsed->stats, parsed->xinfo, parsed->dbId))
-			return false;
-	} else {
-		/* Relation statistics are logical pgstat keys, not physical locators.
-		 * Their original transaction/recovery owner still owes every deletion;
-		 * keeping the complete payload does not execute it or add a version edge.
-		 * Shared keys use dboid zero; other keys need the original COMMIT scope. */
+	if (!cold_completion) {
+		/* Logical pgstat keys are not physical locators or version edges.
+		 * Shared keys use dboid zero; scoped keys need the original COMMIT
+		 * database. Their original native owner still owes every deletion. */
 		for (int i = 0; i < parsed->nstats; i++) {
 			xl_xact_stats_item item;
 
