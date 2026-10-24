@@ -13,6 +13,7 @@
 #include "cluster/cluster_cssd.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h"
@@ -102,6 +103,12 @@ typedef struct WaitGraphContext {
 	ClusterSemanticWaitGraphSnapshot semantic;
 	ResourceXGateSnapshot gate;
 	ClusterSfPeerCap peers[CLUSTER_MAX_NODES];
+	ClusterICTerminalPeerSessions streams[CLUSTER_MAX_NODES];
+	bool stream_known[CLUSTER_MAX_NODES];
+	uint64 stream_epoch;
+	uint32 local_capability;
+	int stream_channels;
+	bool streams_known;
 	bool gate_known;
 	bool peers_known, peers_busy;
 } WaitGraphContext;
@@ -109,11 +116,38 @@ typedef struct WaitGraphContext {
 static void
 wait_graph_context_snapshot(WaitGraphContext *out)
 {
+	ClusterSfPeerCap after[CLUSTER_MAX_NODES];
+	bool busy;
+
 	memset(out, 0, sizeof(*out));
 	cluster_semantic_activation_wait_graph_snapshot(&out->semantic);
 	out->gate_known = cluster_pcm_lock_resource_x_gate_snapshot(&out->gate);
 	out->peers_known = cluster_sf_peer_capability_table_try_snapshot(
 		out->peers, CLUSTER_MAX_NODES, &out->peers_busy);
+	out->stream_epoch = cluster_epoch_get_current();
+	out->stream_channels = cluster_lms_workers;
+	out->local_capability = cluster_ic_local_capability_word();
+	if (!out->peers_known || out->peers_busy || out->stream_epoch == 0 ||
+		out->stream_epoch == UINT64_MAX || out->stream_channels < 1 ||
+		out->stream_channels > CLUSTER_IC_TIER1_DATA_CHANNELS)
+		return;
+	/* Reuse the native bounded, read-only CONTROL/all-DATA cut. A current
+	 * stream is not a receipt witness for an earlier BLOCK frame. */
+	for (uint32 i = 0; i < CLUSTER_MAX_NODES; i++)
+		if (i != cluster_node_id && out->peers[i].valid &&
+			(out->peers[i].bits & PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1) != 0)
+			out->stream_known[i] = cluster_ic_tier1_terminal_peer_sessions(
+				i, out->stream_epoch, out->peers[i].generation,
+				out->stream_channels, &out->streams[i]);
+	if (!cluster_sf_peer_capability_table_try_snapshot(after, CLUSTER_MAX_NODES, &busy) || busy ||
+		cluster_epoch_get_current() != out->stream_epoch || cluster_lms_workers != out->stream_channels ||
+		cluster_ic_local_capability_word() != out->local_capability)
+		return;
+	for (uint32 i = 0; i < CLUSTER_MAX_NODES; i++)
+		if (after[i].bits != out->peers[i].bits || after[i].generation != out->peers[i].generation ||
+			after[i].valid != out->peers[i].valid)
+			return;
+	out->streams_known = true;
 }
 
 static void
@@ -134,6 +168,21 @@ json_context(StringInfo out, const char *side, const WaitGraphContext *cut)
 		if (i != 0) appendStringInfoChar(out, ',');
 		appendStringInfo(out, "{\"node\":%u,\"bits\":%u,\"generation\":%u,\"valid\":%s}",
 			i, cut->peers[i].bits, cut->peers[i].generation, cut->peers[i].valid ? "true" : "false");
+	}
+	appendStringInfoString(out, "]}");
+	appendStringInfo(out, ",\"streams_%s\":{\"known\":%s,\"epoch\":" UINT64_FORMAT
+		",\"channels\":%d,\"local_bits\":%u,\"rows\":[", side, cut->streams_known ? "true" : "false",
+		cut->stream_epoch, cut->stream_channels, cut->local_capability);
+	for (uint32 i = 0; i < CLUSTER_MAX_NODES; i++) {
+		const ClusterICTerminalPeerSessions *stream = &cut->streams[i];
+		if (i != 0) appendStringInfoChar(out, ',');
+		appendStringInfo(out, "{\"node\":%u,\"known\":%s,\"control\":" UINT64_FORMAT ",\"data\":[",
+			i, cut->stream_known[i] ? "true" : "false", stream->control_stream_generation);
+		for (uint32 ch = 0; ch < stream->data_channels && ch < CLUSTER_IC_TIER1_DATA_CHANNELS; ch++) {
+			if (ch != 0) appendStringInfoChar(out, ',');
+			appendStringInfo(out, UINT64_FORMAT, stream->data_stream_generation[ch]);
+		}
+		appendStringInfoString(out, "]}");
 	}
 	appendStringInfoString(out, "]}");
 }
