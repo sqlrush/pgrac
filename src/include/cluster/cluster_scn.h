@@ -198,6 +198,25 @@ scn_local(SCN scn)
 }
 
 
+#ifdef FRONTEND
+/* Record/header validation is also used by frontend WAL tools. Expose only
+ * the original pure time comparison here; backend stateful APIs stay below
+ * the FRONTEND guard. Keep this body identical to cluster_scn.c. */
+static inline int
+scn_time_cmp(SCN a, SCN b)
+{
+	uint64 la = scn_local(a);
+	uint64 lb = scn_local(b);
+
+	if (la < lb)
+		return -1;
+	if (la > lb)
+		return 1;
+	return 0;
+}
+#endif
+
+
 #ifndef FRONTEND
 
 #include "datatype/timestamp.h" /* TimestampTz (backend only) */

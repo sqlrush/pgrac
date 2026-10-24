@@ -1756,6 +1756,197 @@ test_native_itl_batch(ClusterColdTtSlotInputV1 *subjects,
 	}
 }
 
+UT_TEST(test_ctrc_native_itl_page_uses_all_slots_and_original_terminal_projection)
+{
+	for (unsigned count = 1; count <= CLUSTER_ITL_INITRANS_DEFAULT; count++) {
+		ClusterColdTtSlotInputV1 subjects[CLUSTER_ITL_INITRANS_DEFAULT + 1], reversed[CLUSTER_ITL_INITRANS_DEFAULT + 1], saved[CLUSTER_ITL_INITRANS_DEFAULT + 1];
+		ClusterCtrcRecoveryItlPlanV1 plans[CLUSTER_ITL_INITRANS_DEFAULT];
+		PGAlignedBlock before, original, expected, after, again;
+
+		test_native_itl_batch(subjects, plans, &before, count);
+		original = before;
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_batch_image_v1(plans, count,
+			before.data, expected.data), CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN);
+		/* An unrelated ACTIVE entry must not supply or prevent this page's
+		 * terminal calculation. This is not the global TX completion gate. */
+		subjects[count] = subjects[0];
+		subjects[count].key.xid += 100;
+		subjects[count].slot.xid = subjects[count].key.xid;
+		subjects[count].slot.status = TT_SLOT_ACTIVE;
+		subjects[count].slot.commit_scn = InvalidScn;
+		memcpy(saved, subjects, (count + 1) * sizeof(*subjects));
+		for (unsigned i = 0; i <= count; i++)
+			reversed[count - i] = subjects[i];
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_page_image_v1(subjects, count + 1,
+			before.data, after.data), CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN);
+		UT_ASSERT(memcmp(after.data, expected.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_page_image_v1(reversed, count + 1,
+			before.data, again.data), CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN);
+		UT_ASSERT(memcmp(after.data, again.data, BLCKSZ) == 0);
+		again = before;
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_page_image_v1(subjects, count + 1,
+			again.data, again.data), CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN);
+		UT_ASSERT(memcmp(after.data, again.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_page_image_v1(subjects, count + 1,
+			after.data, again.data), CLUSTER_CTRC_ITL_CLEANOUT_ALREADY_TERMINAL);
+		UT_ASSERT(memcmp(after.data, again.data, BLCKSZ) == 0);
+		UT_ASSERT(memcmp(before.data, original.data, BLCKSZ) == 0);
+		UT_ASSERT(memcmp(subjects, saved, (count + 1) * sizeof(*subjects)) == 0);
+	}
+}
+
+UT_TEST(test_ctrc_native_itl_page_missing_late_or_ambiguous_input_is_atomic)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		ClusterColdTtSlotInputV1 subjects[4], saved[4];
+		ClusterCtrcRecoveryItlPlanV1 plans[3];
+		PGAlignedBlock before, original, after, untouched;
+		Size count = 3;
+
+		test_native_itl_batch(subjects, plans, &before, 3);
+		subjects[3] = subjects[2];
+		switch (fault) {
+			case 0: count = 2; break; /* valid prefix, missing final ITL */
+			case 1: subjects[2].key.xid++; break;
+			case 2: subjects[2].slot.status = TT_SLOT_ACTIVE;
+				subjects[2].slot.commit_scn = InvalidScn; break;
+			case 3: count = 4; break; /* even byte-identical duplicates refuse */
+			case 4: count = 4; subjects[3].key.segment_generation++; break;
+			case 5: count = 4; subjects[3].key.slot_wrap++;
+				subjects[3].slot.wrap++; break;
+			case 6: subjects[2].key.segment_generation = UINT32_MAX; break;
+		}
+		original = before;
+		memcpy(saved, subjects, sizeof(subjects));
+		memset(after.data, 0xa5, BLCKSZ); untouched = after;
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_page_image_v1(subjects, count,
+			before.data, after.data), CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+		UT_ASSERT(memcmp(after.data, untouched.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_page_image_v1(subjects, count,
+			before.data, before.data), CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+		UT_ASSERT(memcmp(before.data, original.data, BLCKSZ) == 0);
+		UT_ASSERT(memcmp(subjects, saved, sizeof(subjects)) == 0);
+	}
+}
+
+UT_TEST(test_ctrc_native_itl_page_derives_classes_without_raw_xid_cross_binding)
+{
+	ClusterColdTtSlotInputV1 subjects[2];
+	ClusterCtrcRecoveryItlPlanV1 plans[2];
+	PGAlignedBlock before, expected, after;
+	ClusterItlSlotData *slots;
+
+	test_native_itl_batch(subjects, plans, &before, 2);
+	slots = ClusterPageGetItlSlots((Page)before.data);
+	/* The same raw xid in two different native TT addresses is not one
+	 * transaction binding. Each slot still uses its original own terminal. */
+	subjects[1].key.xid = subjects[0].key.xid;
+	subjects[1].slot.xid = subjects[1].key.xid;
+	slots[1].xid = subjects[1].key.xid;
+	subjects[0].slot.status = TT_SLOT_COMMITTED;
+	slots[0].flags = ITL_FLAG_LOCK_ONLY_COMMITTED;
+	slots[0].commit_scn = subjects[0].slot.commit_scn;
+	subjects[1].slot.status = TT_SLOT_COMMITTED;
+	subjects[1].slot.commit_scn = 1100;
+	slots[1].flags = ITL_FLAG_NEEDS_CLEANOUT;
+	slots[1].commit_scn = subjects[1].slot.commit_scn;
+	UT_ASSERT_EQ(cluster_ctrc_recovery_itl_batch_image_v1(plans, 2,
+		before.data, expected.data), CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN);
+	UT_ASSERT_EQ(cluster_ctrc_recovery_itl_page_image_v1(subjects, 2,
+		before.data, after.data), CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN);
+	UT_ASSERT(memcmp(after.data, expected.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_ctrc_native_itl_page_empty_has_no_release_or_skipped_input_claim)
+{
+	ClusterColdTtSlotInputV1 subject;
+	PGAlignedBlock before, after;
+	ClusterItlSlotData *slots;
+
+	test_native_itl_image(&subject, &before, 1);
+	slots = ClusterPageGetItlSlots((Page)before.data);
+	memset(slots, 0, CLUSTER_ITL_INITRANS_DEFAULT * sizeof(*slots));
+	for (unsigned i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+		slots[i].wrap = i; /* a free slot's local reuse counter may remain */
+	UT_ASSERT_EQ(cluster_ctrc_recovery_itl_page_image_v1(NULL, 0, before.data, after.data),
+		CLUSTER_CTRC_ITL_CLEANOUT_ALREADY_TERMINAL);
+	UT_ASSERT(memcmp(before.data, after.data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(cluster_ctrc_recovery_itl_page_image_v1(NULL, 0, before.data, before.data),
+		CLUSTER_CTRC_ITL_CLEANOUT_ALREADY_TERMINAL);
+	/* A nonempty native page cannot be declared empty by passing no TTs. */
+	test_native_itl_image(&subject, &before, 1);
+	memset(after.data, 0xa5, BLCKSZ);
+	UT_ASSERT_EQ(cluster_ctrc_recovery_itl_page_image_v1(NULL, 0, before.data, after.data),
+		CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+	UT_ASSERT((unsigned char)after.data[0] == 0xa5);
+}
+
+UT_TEST(test_ctrc_native_itl_page_refuses_unsupported_and_corrupt_page_states)
+{
+	for (unsigned fault = 0; fault < 10; fault++) {
+		ClusterColdTtSlotInputV1 subject;
+		PGAlignedBlock before, original, after, untouched;
+		ClusterItlSlotData *slots;
+
+		test_native_itl_image(&subject, &before, 1);
+		slots = ClusterPageGetItlSlots((Page)before.data);
+		switch (fault) {
+			case 0: slots[2].flags = ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI; break;
+			case 1: slots[2].flags = UINT8_MAX; break;
+			case 2: slots[2].flags = ITL_FLAG_FREE; break;
+			case 3: slots[2].undo_segment_head = (UBA)InvalidUba_init; break;
+			case 4: ((PageHeader)before.data)->pd_upper = BLCKSZ; break;
+			case 5: ItemIdSetNormal(PageGetItemId((Page)before.data, 1), BLCKSZ - 2, 80); break;
+			case 6: slots[2].xid = InvalidTransactionId; break;
+			case 7: slots[2].commit_scn = 900; break; /* ACTIVE cannot have commit SCN */
+			case 8: ((PageHeader)before.data)->pd_flags &= ~PD_HAS_ITL; break;
+			case 9: memset(before.data, 0, BLCKSZ); break;
+		}
+		original = before; memset(after.data, 0xa5, BLCKSZ); untouched = after;
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_page_image_v1(&subject, 1,
+			before.data, after.data), CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+		UT_ASSERT(memcmp(after.data, untouched.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_page_image_v1(&subject, 1,
+			before.data, before.data), CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+		UT_ASSERT(memcmp(before.data, original.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_ctrc_native_itl_page_refuses_bounds_and_all_input_output_aliases)
+{
+	ClusterColdTtSlotInputV1 subjects[2];
+	ClusterCtrcRecoveryItlPlanV1 plans[2];
+	PGAlignedBlock before, original, after, untouched, arena[2], saved_arena[2];
+	char unaligned[BLCKSZ + 1];
+
+	test_native_itl_batch(subjects, plans, &before, 2);
+	original = before; memset(after.data, 0xa5, BLCKSZ); untouched = after;
+	UT_ASSERT_EQ(cluster_ctrc_recovery_itl_page_image_v1(NULL, 2, before.data, after.data),
+		CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+	UT_ASSERT_EQ(cluster_ctrc_recovery_itl_page_image_v1(subjects, (Size)-1, before.data, after.data),
+		CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+	UT_ASSERT_EQ(cluster_ctrc_recovery_itl_page_image_v1(subjects, 2, NULL, after.data),
+		CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+	UT_ASSERT_EQ(cluster_ctrc_recovery_itl_page_image_v1(subjects, 2, before.data, NULL),
+		CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+	UT_ASSERT(memcmp(after.data, untouched.data, BLCKSZ) == 0);
+	memcpy(arena[0].data, before.data, BLCKSZ); saved_arena[0] = arena[0];
+	UT_ASSERT_EQ(cluster_ctrc_recovery_itl_page_image_v1(subjects, 2,
+		arena[0].data, arena[0].data + 1), CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+	UT_ASSERT(memcmp(arena[0].data, saved_arena[0].data, BLCKSZ) == 0);
+	memset(arena, 0xa5, sizeof(arena));
+	memcpy(arena[0].data, subjects, sizeof(subjects));
+	memcpy(saved_arena, arena, sizeof(arena));
+	/* Output starts in the second subject: checking only entry zero fails. */
+	UT_ASSERT_EQ(cluster_ctrc_recovery_itl_page_image_v1((void *)arena[0].data, 2,
+		before.data, arena[0].data + sizeof(subjects[0])), CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+	UT_ASSERT(memcmp(arena, saved_arena, sizeof(arena)) == 0);
+	UT_ASSERT(memcmp(before.data, original.data, BLCKSZ) == 0);
+	memcpy(unaligned + 1, before.data, BLCKSZ);
+	UT_ASSERT_EQ(cluster_ctrc_recovery_itl_page_image_v1(subjects, 2,
+		unaligned + 1, after.data), CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN);
+}
+
 UT_TEST(test_ctrc_native_itl_batch_merges_mixed_plans_once_per_page)
 {
 	for (unsigned count = 1; count <= CLUSTER_ITL_INITRANS_DEFAULT; count++) {
@@ -3828,6 +4019,12 @@ main(void)
 		CTRC_TEST_ENTRY(test_ctrc_itl_image_calculation_preserves_input_and_replays_exactly),
 		CTRC_TEST_ENTRY(test_ctrc_itl_image_partial_overlap_is_retained),
 		CTRC_TEST_ENTRY(test_ctrc_native_tt_image_matches_original_terminal_rules),
+		CTRC_TEST_ENTRY(test_ctrc_native_itl_page_uses_all_slots_and_original_terminal_projection),
+		CTRC_TEST_ENTRY(test_ctrc_native_itl_page_missing_late_or_ambiguous_input_is_atomic),
+		CTRC_TEST_ENTRY(test_ctrc_native_itl_page_derives_classes_without_raw_xid_cross_binding),
+		CTRC_TEST_ENTRY(test_ctrc_native_itl_page_empty_has_no_release_or_skipped_input_claim),
+		CTRC_TEST_ENTRY(test_ctrc_native_itl_page_refuses_unsupported_and_corrupt_page_states),
+		CTRC_TEST_ENTRY(test_ctrc_native_itl_page_refuses_bounds_and_all_input_output_aliases),
 		CTRC_TEST_ENTRY(test_ctrc_native_itl_batch_merges_mixed_plans_once_per_page),
 		CTRC_TEST_ENTRY(test_ctrc_native_itl_batch_refusal_preserves_whole_page_after_valid_prefix),
 		CTRC_TEST_ENTRY(test_ctrc_native_itl_batch_refuses_empty_oversize_and_missing_inputs),

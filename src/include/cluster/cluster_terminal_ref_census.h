@@ -1200,6 +1200,19 @@ typedef struct ClusterCtrcRecoveryItlPlanV1 {
 extern ClusterCtrcItlCleanoutApplyResult cluster_ctrc_recovery_itl_batch_image_v1(
 	const ClusterCtrcRecoveryItlPlanV1 *plans, Size count,
 	const char *before_image, char *after_image);
+/* Calculate all eight slots of one immutable supplied native page. Derive
+ * data/plain-lock class from original flags and require one unambiguous
+ * UBA-segment/TT-offset/xid match in the original subjects. Missing, duplicate,
+ * ACTIVE/unqualified matches and unsupported MX/unknown states refuse the
+ * whole image. No-op/empty is only a local observation, not release/coverage.
+ * Unique raw matching does not establish canonical generation/wrap/history;
+ * those proofs, original array capacity/freshness and custody remain mandatory
+ * caller obligations. No allocation, I/O, token, authority or completion.
+ * Exact in-place is supported; partial page or output/subject-array overlap
+ * refuses unchanged, as do every other refusal and unqualified late slot. */
+extern ClusterCtrcItlCleanoutApplyResult cluster_ctrc_recovery_itl_page_image_v1(
+	const struct ClusterColdTtSlotInputV1 *subjects, Size subject_count,
+	const char *before_image, char *after_image);
 /* Process-local image observations, never receipt or terminal authority. */
 typedef struct ClusterCtrcItlCarrierImageV1 {
 	uint8 mask;

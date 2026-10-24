@@ -1268,6 +1268,91 @@ cluster_ctrc_recovery_itl_batch_image_v1(const ClusterCtrcRecoveryItlPlanV1 *pla
 	return result;
 }
 
+/* Calculate every supplied page ITL, not a caller-selected prefix. A raw
+ * UBA/xid match selects input only; canonical generation/history authority
+ * and complete producer coverage still belong to the recovery owner. */
+ClusterCtrcItlCleanoutApplyResult
+cluster_ctrc_recovery_itl_page_image_v1(const ClusterColdTtSlotInputV1 *subjects,
+	Size subject_count, const char *before_image, char *after_image)
+{
+	PGAlignedBlock image;
+	Page page;
+	ClusterItlSlotData *slots;
+	ClusterCtrcRecoveryItlPlanV1 plans[CLUSTER_ITL_INITRANS_DEFAULT];
+	ClusterCtrcItlCleanoutApplyResult result;
+	Size count = 0;
+
+	if (before_image == NULL || after_image == NULL
+		|| (subject_count != 0 && subjects == NULL)
+		|| subject_count > SIZE_MAX / sizeof(*subjects)
+		|| (subject_count != 0 && ctrc_itl_image_overlaps(after_image, BLCKSZ,
+			subjects, subject_count * sizeof(*subjects)))
+		|| (before_image != after_image
+			&& ctrc_itl_image_overlaps(before_image, BLCKSZ, after_image, BLCKSZ))
+		|| (slots = ctrc_itl_image_slot(before_image, image.data, 0, &image, &page)) == NULL
+		|| !ctrc_recovery_itl_tuples_valid(page))
+		return CLUSTER_CTRC_ITL_CLEANOUT_RETAIN;
+	for (uint16 i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		const ClusterItlSlotData *slot = &slots[i];
+		const ClusterColdTtSlotInputV1 *subject = NULL;
+		uint32 segment, block;
+		uint16 offset, row;
+		uint8 itl_class;
+
+		switch (slot->flags) {
+			case ITL_FLAG_FREE:
+				/* A reuse counter may remain, but FREE cannot hide a native
+				 * transaction or UBA reference from this calculation. */
+				if (TransactionIdIsValid(slot->xid) || !UBA_is_invalid(slot->undo_segment_head)
+					|| SCN_VALID(slot->commit_scn) || slot->lock_count != 0)
+					return CLUSTER_CTRC_ITL_CLEANOUT_RETAIN;
+				continue;
+			case ITL_FLAG_ACTIVE:
+			case ITL_FLAG_COMMITTED:
+			case ITL_FLAG_ABORTED:
+			case ITL_FLAG_NEEDS_CLEANOUT:
+				itl_class = 1;
+				break;
+			case ITL_FLAG_LOCK_ONLY_ACTIVE:
+			case ITL_FLAG_LOCK_ONLY_COMMITTED:
+			case ITL_FLAG_LOCK_ONLY_ABORTED:
+				itl_class = 2;
+				break;
+			default: /* MX markers require their separate original work. */
+				return CLUSTER_CTRC_ITL_CLEANOUT_RETAIN;
+		}
+		if (!TransactionIdIsNormal(slot->xid)
+			|| !uba_decode(slot->undo_segment_head, &segment, &block, &offset, &row))
+			return CLUSTER_CTRC_ITL_CLEANOUT_RETAIN;
+		for (Size j = 0; j < subject_count; j++) {
+			const ClusterColdTtSlotInputV1 *candidate = &subjects[j];
+
+			if (candidate->key.segment_id != segment || candidate->key.slot_offset != offset
+				|| candidate->key.xid != slot->xid)
+				continue;
+			/* Do not choose a newest generation/wrap or accept a duplicate
+			 * merely because its bytes happen to match. */
+			if (subject != NULL)
+				return CLUSTER_CTRC_ITL_CLEANOUT_RETAIN;
+			subject = candidate;
+		}
+		if (subject == NULL)
+			return CLUSTER_CTRC_ITL_CLEANOUT_RETAIN;
+		plans[count].subject = subject;
+		plans[count].itl_index = i;
+		plans[count].expected_itl_wrap = slot->wrap;
+		plans[count].itl_class = itl_class;
+		count++;
+	}
+	/* All references must be selected before the original atomic projector.
+	 * Even an unchanged/empty result is only a private image observation. */
+	result = count == 0 ? CLUSTER_CTRC_ITL_CLEANOUT_ALREADY_TERMINAL
+		: cluster_ctrc_recovery_itl_batch_image_v1(plans, count, image.data, image.data);
+	if (result != CLUSTER_CTRC_ITL_CLEANOUT_RETAIN)
+		memcpy(after_image, image.data, BLCKSZ);
+	return result;
+}
+
 static bool
 ctrc_target_pending_offnum_valid(const ClusterCtrcPublicationIdV1 *publication,
 								 const ClusterCtrcTargetV1 *target)
