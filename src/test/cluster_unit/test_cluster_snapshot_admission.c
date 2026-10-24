@@ -940,6 +940,39 @@ UT_TEST(catalog_scn_does_not_supply_independent_replication_history)
 	InvalidateCatalogSnapshot();
 }
 
+UT_TEST(original_catalog_pin_cannot_supply_a_missing_finite_clock)
+{
+	ClusterUndoRetentionSample sample, zero = { 0 };
+	Snapshot catalog = GetNonHistoricCatalogSnapshot(RelationRelationId);
+
+	snapshot_clock = (SCN) UINT64_MAX;
+	memset(&sample, 0xa5, sizeof(sample));
+	UT_ASSERT(!catalog_history_sample(&sample));
+	UT_ASSERT_EQ(memcmp(&sample, &zero, sizeof(sample)), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), catalog->read_scn);
+	snapshot_clock = 300;
+	UT_ASSERT(catalog_history_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, catalog->read_scn);
+	UT_ASSERT_EQ(sample.clock_scn, 300);
+	InvalidateCatalogSnapshot();
+	snapshot_clock = 100;
+}
+
+UT_TEST(original_registered_nonfinite_reader_keeps_h_unqualified_until_retirement)
+{
+	ClusterUndoRetentionSample sample, zero = { 0 };
+	Snapshot original = registered((SCN) UINT64_MAX);
+
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), (SCN) UINT64_MAX);
+	memset(&sample, 0xa5, sizeof(sample));
+	UT_ASSERT(!catalog_history_sample(&sample));
+	UT_ASSERT_EQ(memcmp(&sample, &zero, sizeof(sample)), 0);
+	UnregisterSnapshot(original);
+	UT_ASSERT(catalog_history_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 100);
+	UT_ASSERT_EQ(sample.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+}
+
 int
 main(void)
 {
@@ -956,7 +989,9 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(68);
+	UT_PLAN(70);
+	UT_RUN(original_catalog_pin_cannot_supply_a_missing_finite_clock);
+	UT_RUN(original_registered_nonfinite_reader_keeps_h_unqualified_until_retirement);
 	UT_RUN(catalog_original_publication_completes_the_real_h_sample);
 	UT_RUN(catalog_h_sample_preserves_other_original_snapshot_protection);
 	UT_RUN(catalog_actual_retirement_releases_only_its_original_h_pin);
