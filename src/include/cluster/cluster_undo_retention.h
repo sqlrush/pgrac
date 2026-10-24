@@ -38,6 +38,20 @@
 #define CLUSTER_UNDO_RETENTION_H
 
 #include "cluster/cluster_scn.h" /* SCN */
+#include "cluster/cluster_heap_horizon.h"
+
+/* One ProcArray cut, with the clock sampled before reading any PGPROC.
+ * Contributor identity is diagnostic only, never a retention release proof.
+ * A nonzero snapshot token is pgprocno + 1 and may be reused after exit. */
+typedef struct ClusterUndoRetentionSample {
+	SCN horizon_scn;
+	SCN clock_scn;
+	ClusterHeapFreezeReportV2ContributorKind contributor_kind;
+	uint64 contributor_token;
+} ClusterUndoRetentionSample;
+
+/* Same locking/ordering as the scalar wrapper below; refusal clears out. */
+extern bool cluster_undo_retention_horizon_sample(ClusterUndoRetentionSample *out);
 
 /*
  * cluster_undo_retention_horizon -- own-instance retention lower bound:
@@ -84,14 +98,18 @@ extern bool cluster_undo_retention_all_quiescent(void);
  *	  retention watermark (= max commit_scn over the header's COMMITTED TT
  *	  slots) is strictly below the horizon.  ACTIVE / ALLOCATED / FULL-but-
  *	  ACTIVE are never recyclable (C5), even when they carry no COMMITTED slot.
- *	  A SEGMENT_COMMITTED segment with no live COMMITTED slot is recyclable; one
- *	  carrying a COMMITTED slot with an unresolved commit_scn is retained
- *	  (rule 8.A fail-closed).
+ *	  Both modes retain a segment containing any ACTIVE slot, unknown slot
+ *	  status or terminal slot with an invalid xid/wrap, even if no undo record
+ *	  has been written yet. A segment with no COMMITTED slot is recyclable only
+ *	  after these and the record seal/drain checks pass. An unresolved
+ *	  COMMITTED commit_scn retains the segment (rule 8.A fail-closed).
  *
  *	cluster_undo_segment_recyclable_for_mode:
- *	  Applies the same pure predicate while additionally retaining every
- *	  segment containing a canonical ABORTED slot in peer mode.  The legacy
- *	  wrapper keeps single-node C7 immediate reuse unchanged.
+ *	  Peer mode additionally requires exact durable release evidence and an
+ *	  empty undo anchor on every terminal slot. COMMITTED requires commit_scn
+ *	  <= horizon; ABORTED requires InvalidScn with no invented time horizon.
+ *	  The non-peer wrapper keeps its strict watermark < horizon comparison and
+ *	  immediate reuse of valid ABORTED slots, subject to the common gates.
  */
 struct UndoSegmentHeaderData;
 

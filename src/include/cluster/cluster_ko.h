@@ -53,8 +53,12 @@
 
 #include "cluster/cluster_grd.h"	/* ClusterResId */
 #include "cluster/cluster_dl.h"		/* CLUSTER_DL_RESID_TYPE (collision check) */
+#include "cluster/cluster_terminal_ref_census.h"
 #include "storage/relfilelocator.h" /* RelFileLocator */
 #include "storage/lock.h"			/* LOCKTAG_LAST_TYPE */
+
+struct RelationData;
+struct ClusterLockAcquireRequest;
 
 /*
  * CLUSTER_KO_RESID_TYPE -- KO resource-id namespace marker.  Above every PG
@@ -83,7 +87,31 @@ extern void cluster_ko_resid_encode(RelFileLocator rloc, ClusterResId *dst);
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_space_identity.h"
 
+/* Native AX cleanup keeps the original holder until its operation completes. */
+extern bool cluster_ko_ax_retain_native_v3(const LOCKTAG *tag, const ClusterGrdHolderId *holder);
+extern bool cluster_ko_ax_release_handoff_v3(const LOCKTAG *tag, LOCKMODE mode,
+											 const ClusterGrdHolderId *holder);
+extern bool cluster_ko_ax_acquire_pending_v3(const ClusterResId *resid, uint32 procno,
+											 uint32 lock_group_procno_plus_one);
+extern bool cluster_ko_ax_native_wait_v3(const LOCKTAG *tag, bool dontwait);
+
+typedef struct ClusterKoAxCleanupV3 {
+	uint64 revision;
+	unsigned count;
+	ClusterGrdHolderId holders[64];
+} ClusterKoAxCleanupV3;
+extern void cluster_ko_ax_cleanup_sample_v3(const ClusterResId *resid, int dead_procno,
+											int32 dead_node, ClusterKoAxCleanupV3 *sample);
+extern bool cluster_ko_ax_cleanup_claim_v3(const ClusterKoAxCleanupV3 *sample);
+extern bool cluster_ko_ax_cleanup_retains_v3(const ClusterKoAxCleanupV3 *sample,
+											 const ClusterGrdHolderId *holder);
+extern void cluster_ko_ax_cleanup_finish_v3(const ClusterKoAxCleanupV3 *sample);
+
 #define CLUSTER_KO_SHARED_V2_BYTES 160
+#define CLUSTER_KO_SHARED_V3_BYTES 240
+#define CLUSTER_KO_SHARED_V3_VERSION 3
+#define CLUSTER_KO_SHARED_V4_BYTES 240
+#define CLUSTER_KO_SHARED_V4_VERSION 4
 #define CLUSTER_KO_SHARED_CONTEXT_LIMIT_V2 64
 #define CLUSTER_KO_SHARED_MEMBER_BYTES 16
 #define CLUSTER_KO_SHARED_REQUEST 1
@@ -110,6 +138,234 @@ typedef struct ClusterKoSharedMessageV2 {
 	uint8 member_digest[32];
 } ClusterKoSharedMessageV2;
 
+/*
+ * Object-drain v3 identity.  The v2 structural receipt remains a separate
+ * legacy contract; it has no relation lock/OID or consumed-grant identity and
+ * therefore cannot be accepted as a v3 READY.  Values are encoded explicitly
+ * by the v3 codec below; this C layout is not a wire ABI.
+ */
+typedef struct ClusterKoSharedMessageV3 {
+	ClusterKoSharedMessageV2 base;
+	ClusterResId ax_resid;
+	ClusterGrdHolderId ax_holder;
+	uint64 ax_request_id;
+	uint64 ax_master_generation;
+	int32 ax_master_node;
+	uint32 ax_mode;
+	uint16 operation;
+	uint16 full_fork_mask;
+	uint64 space_mutation_token;
+} ClusterKoSharedMessageV3;
+
+/* Committed old-incarnation discard has a distinct wire and value type.
+ * The object identity is unchanged, but a v3 flush result is not this READY
+ * contract. Representation alone proves neither COMMIT nor physical closure.
+ * Shared new-relfilenode TRUNCATE uses REWRITE_OLD for the removed identity;
+ * the in-place TRUNCATE operation is not part of this contract. */
+typedef struct ClusterKoSharedMessageV4 {
+	ClusterKoSharedMessageV3 object;
+} ClusterKoSharedMessageV4;
+
+/* Last exact local PI identity observed by the native origin checkpoint.
+ * Values are diagnostic snapshots only and never grant a retirement or DATA
+ * proof.  A source node/boot of -1/0 explicitly means the retained WAL ref
+ * could not expose that identity, rather than guessing from a slot number. */
+typedef struct ClusterKoOriginCheckpointPendingV1 {
+	uint32 registry_slot;
+	RelFileLocator locator;
+	uint32 forknum;
+	uint32 blocknum;
+	uint64 binding_generation;
+	uint64 local_pi_revision;
+	uint32 pcm_state;
+	int32 current_holder_node;
+	int32 master_holder_node;
+	int32 master_node;
+	int32 pending_x_requester_node;
+	uint32 s_holders_bitmap;
+	uint32 pi_holders_bitmap;
+	int32 pi_source_node_first;
+	int32 pi_source_node_last;
+	uint64 pi_source_boot_first;
+	uint64 pi_source_boot_last;
+	uint16 pi_source_slot_first;
+	uint16 pi_source_slot_last;
+	uint32 pending_predicate_mask;
+	uint64 first_token;
+	uint64 last_token;
+	bool valid;
+} ClusterKoOriginCheckpointPendingV1;
+
+extern bool cluster_ko_origin_checkpoint_pending_identity(
+	ClusterKoOriginCheckpointPendingV1 *out);
+
+/* The original peer owner retains this exact operation through publication.
+ * A handle is process-independent, but is neither a READY nor an AX proof. */
+typedef enum ClusterKoPeerFenceStateV3 {
+	CLUSTER_KO_PEER_FENCE_EMPTY = 0,
+	CLUSTER_KO_PEER_FENCE_ACTIVE,
+	CLUSTER_KO_PEER_FENCE_READY,
+	CLUSTER_KO_PEER_FENCE_COMMITTED
+} ClusterKoPeerFenceStateV3;
+
+typedef struct ClusterKoPeerFenceHandleV3 {
+	uint32 slot;
+	uint64 serial;
+} ClusterKoPeerFenceHandleV3;
+
+/* A reference to one entered synchronous directory I/O call. It carries no
+ * DATA, grant or retirement authority. End only from the entering process. */
+typedef struct ClusterKoDirectoryIoV3 {
+	uint32 slot;
+	int32 pid;
+	uint64 serial;
+} ClusterKoDirectoryIoV3;
+extern bool cluster_ko_directory_io_begin_v3(RelFileLocator locator, ClusterKoDirectoryIoV3 *out);
+extern bool cluster_ko_directory_io_end_v3(const ClusterKoDirectoryIoV3 *call);
+/* Purpose-limited identity for the original checkpointer's PI observation.
+ * Requires an already entered call; neither this snapshot nor a recheck
+ * grants current, DATA completion, deletion or recovery permission. */
+typedef struct ClusterKoPiStorageIdentityV3 {
+	ClusterKoSharedMessageV3 request;
+	ClusterKoDirectoryIoV3 call;
+	uint64 serial;
+	uint64 route_generation;
+	uint64 admission_revision;
+	uint64 native_owner; /* Opaque original carrier; never caller-owned. */
+	uint32 slot;
+	ClusterKoPeerFenceStateV3 state;
+	bool origin;
+} ClusterKoPiStorageIdentityV3;
+extern bool cluster_ko_pi_storage_identity_v3(const ClusterSpaceIdentityKey *key,
+											const uint8 incarnation[16],
+											const ClusterKoDirectoryIoV3 *call,
+											ClusterKoPiStorageIdentityV3 *out);
+extern bool cluster_ko_pi_storage_identity_current_v3(const ClusterKoPiStorageIdentityV3 *sample);
+/* Positive runtime COMMIT evidence, only for canceling old-locator work.
+ * Not a DATA receipt, READY, completed marker, or recovery authorization. */
+extern bool cluster_ko_directory_drop_committed_v3(RelFileLocator locator);
+/* Stronger than committed: original entered directory calls have drained.
+ * Read outside PCM locks; immutable until shared-state reinitialization. */
+extern bool cluster_ko_directory_drop_retired_v3(RelFileLocator locator);
+/* Dead local bytes/PI only: peer retirement or this backend's exact committed
+ * origin discard window. Read outside buffer/PCM locks. Not I/O authority,
+ * directory retirement, final SPACE or a completed native deletion. */
+extern bool cluster_ko_local_drop_discard_current_v4(RelFileLocator locator);
+
+/* A local admission sample for one locator, not an AX or completion proof.
+ * Sample outside mapping/header/PCM locks. Revalidate under the original
+ * producer lock immediately before publishing its reference or image. */
+typedef struct ClusterKoPeerAdmissionV3 {
+	RelFileLocator locator;
+	uint64 revision;
+	ForkNumber fork;
+	BlockNumber block;
+	ClusterCtrcCleanerReadScopeV3 cleaner;
+	uint64 extension_serial;
+	uint64 origin_serial; /* Exact native DROP's final SPACE writer only. */
+} ClusterKoPeerAdmissionV3;
+
+extern bool cluster_ko_peer_admission_begin_v3(RelFileLocator locator,
+											   ClusterKoPeerAdmissionV3 *out);
+extern bool cluster_ko_peer_admission_current_v3(const ClusterKoPeerAdmissionV3 *admission,
+												 RelFileLocator locator);
+/* Continuation gate only for an already retained local delivery target.
+ * The PCM owner must still prove its exact request/target under entry X.
+ * ACTIVE may finish old work; READY/COMMITTED cannot start an installer.
+ * Sample outside PCM locks, then revalidate before publishing the claim. */
+extern bool cluster_ko_peer_delivery_begin_v3(RelFileLocator locator, uint64 *revision);
+extern bool cluster_ko_peer_delivery_current_v3(uint64 revision);
+/* Exact native read only. A cleaner sample cannot be consumed by the
+ * generic publication predicate above (including CR installation). */
+extern bool cluster_ko_peer_read_begin_v3(RelFileLocator locator, ForkNumber fork,
+										  BlockNumber block, ClusterKoPeerAdmissionV3 *out);
+extern bool cluster_ko_peer_read_current_v3(const ClusterKoPeerAdmissionV3 *admission,
+											RelFileLocator locator, ForkNumber fork,
+											BlockNumber block);
+
+/* Object admission for an exact current acquisition. This is separate from
+ * a read sample and never substitutes for the original PCM/grant checks.
+ * Only an already registered finite owner can continue behind a fence. */
+typedef struct ClusterKoCurrentAdmissionV3 {
+	ClusterKoPeerAdmissionV3 target;
+} ClusterKoCurrentAdmissionV3;
+extern bool cluster_ko_peer_current_begin_v3(RelFileLocator locator, ForkNumber fork,
+											 BlockNumber block, ClusterKoCurrentAdmissionV3 *out);
+extern bool cluster_ko_peer_current_valid_v3(const ClusterKoCurrentAdmissionV3 *admission,
+											 RelFileLocator locator, ForkNumber fork,
+											 BlockNumber block);
+
+/* One finite attempt per original cleaner worker, never a new work queue.
+ * These calls run outside buffer/PCM/CTRC locks. */
+extern bool cluster_ko_cleaner_enter_v3(RelFileLocator locator,
+										const struct ClusterCtrcCleanerReadScopeV3 *scope);
+extern void cluster_ko_cleaner_leave_v3(RelFileLocator locator,
+										const struct ClusterCtrcCleanerReadScopeV3 *scope);
+
+/* One original extension call, from before its first SPACE read until the
+ * physical range is materialized. No IO or current permission is implied.
+ * A false begin is waitable only when retry is explicitly true. */
+extern bool cluster_ko_extend_active_v3(void);
+extern bool cluster_ko_extend_begin_v3(RelFileLocator locator, ForkNumber fork, uint64 *serial,
+									   bool *retry);
+extern bool cluster_ko_extend_write_begin_v3(RelFileLocator locator, ForkNumber fork);
+extern bool cluster_ko_extend_write_done_v3(RelFileLocator locator, ForkNumber fork);
+extern bool cluster_ko_extend_end_v3(uint64 serial);
+extern void cluster_ko_extend_abort_v3(uint64 serial);
+
+/* Native MAIN/SPACE construction holds one reference in the same bounded
+ * table. A typed SPACE call can borrow only its exact original constructor;
+ * its child SPACE extensions retain independent references. No recovery,
+ * current, durability or deletion permission is conferred by these calls. */
+extern bool cluster_ko_create_begin_v3(RelFileLocator locator, uint64 *serial);
+/* Raw destination copy and bulk build share the finite owner/end/abort
+ * lifecycle, with SPACE0/1 read admission fixed at registration. */
+extern bool cluster_ko_copy_begin_v3(RelFileLocator locator, uint64 *serial);
+extern bool cluster_ko_build_begin_v3(RelFileLocator locator, uint64 *serial);
+/* Buffered copy additionally selects one original destination block at a
+ * time, in order. Selection is outside content locks; the returned sample
+ * is consumed by peer_current_valid before WAL/dirty under those locks. */
+extern bool cluster_ko_buffer_copy_begin_v3(RelFileLocator locator, ForkNumber fork,
+											BlockNumber nblocks, uint64 *serial);
+extern bool cluster_ko_buffer_copy_target_v3(RelFileLocator locator, uint64 serial, ForkNumber fork,
+											 BlockNumber block, ClusterKoCurrentAdmissionV3 *out);
+extern bool cluster_ko_create_current_v3(RelFileLocator locator, uint64 *serial);
+extern bool cluster_ko_create_write_begin_v3(RelFileLocator locator, uint64 serial);
+extern bool cluster_ko_create_end_v3(uint64 serial, bool complete);
+extern void cluster_ko_create_abort_v3(uint64 serial);
+
+extern bool cluster_ko_peer_holder_begin_v3(const ClusterKoPeerFenceHandleV3 *handle);
+extern bool cluster_ko_peer_holder_result_v3(const ClusterKoPeerFenceHandleV3 *handle,
+											 ClusterGrdHolderObservation *observation,
+											 LOCKMODE *mode);
+extern bool cluster_ko_peer_fence_begin_v3(const ClusterKoSharedMessageV3 *request,
+										 ClusterKoPeerFenceHandleV3 *handle,
+										 ClusterKoPeerFenceStateV3 *state);
+/* Consumes the original SI owner's recorded physical completion and stable
+ * complete local scan. Neither a handle nor an empty queue can create READY. */
+extern bool cluster_ko_peer_fence_ready_v3(const ClusterKoSharedMessageV3 *request,
+										 const ClusterKoPeerFenceHandleV3 *handle);
+/* SI-owner pressure tick.  It may reclaim only a fully quiesced COMMITTED
+ * fence or a READY fence whose exact AX holder query proves ABSENT; a single
+ * absent observation is never sufficient without the complete local cut. */
+extern bool cluster_ko_peer_fence_gc_tick_v3(void);
+/* Sample once before the original relation request's S3 reservation. Zero is
+ * unsampled; UINT64_MAX is an unusable sample that must not be refreshed. */
+extern uint64 cluster_ko_peer_fence_request_sample_v3(void);
+/* Only the original S5 consumer may retire a passive fence, before consuming
+ * its exact, locally promoted grant. Master dispatch is not acceptance. */
+extern bool cluster_ko_peer_fence_fresh_grant_v3(const struct ClusterLockAcquireRequest *request);
+/* Only the authenticated transaction-publication consumer may call this.
+ * No matching operation is an idempotent no-op, never a new READY proof. */
+extern bool cluster_ko_peer_commit_v3(int32 source_node, uint64 epoch, uint64 origin_boot,
+									uint64 peer_boot, uint64 batch_id);
+
+#define CLUSTER_KO_SHARED_V3_OPERATION_DROP 1
+#define CLUSTER_KO_SHARED_V3_OPERATION_TRUNCATE 2
+#define CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD 3
+#define CLUSTER_KO_SHARED_V3_FULL_FORK_MASK \
+	((uint16)((UINT32_C(1) << (MAX_FORKNUM + 1)) - UINT32_C(1)))
+
 /* Exact length, little-endian, unaligned buffers accepted. Refusal preserves
  * output; overlapping input and output is refused. Nonshared legacy payloads
  * below remain separate and are never accepted by these shared codecs. */
@@ -119,6 +375,26 @@ extern bool cluster_ko_shared_decode_v2(const void *bytes, size_t length,
 										ClusterKoSharedMessageV2 *out);
 extern bool cluster_ko_shared_ack_matches_v2(const ClusterKoSharedMessageV2 *request,
 											 const ClusterKoSharedMessageV2 *ack);
+extern bool cluster_ko_shared_encode_v3(const ClusterKoSharedMessageV3 *message, void *bytes,
+										size_t length);
+extern bool cluster_ko_shared_decode_v3(const void *bytes, size_t length,
+										ClusterKoSharedMessageV3 *out);
+extern bool cluster_ko_shared_ack_matches_v3(const ClusterKoSharedMessageV3 *request,
+											 const ClusterKoSharedMessageV3 *ack);
+/* Full operation identity for DONE or FAILED; matching FAILED is never a
+ * successful ACK. Consumers must retain its negative polarity. */
+extern bool cluster_ko_shared_result_matches_v3(const ClusterKoSharedMessageV3 *request,
+												const ClusterKoSharedMessageV3 *result);
+
+/* PKO4 committed-discard codec; no v2/v3 frame fallback is permitted. */
+extern bool cluster_ko_shared_encode_v4(const ClusterKoSharedMessageV4 *message, void *bytes,
+										size_t length);
+extern bool cluster_ko_shared_decode_v4(const void *bytes, size_t length,
+										ClusterKoSharedMessageV4 *out);
+extern bool cluster_ko_shared_result_matches_v4(const ClusterKoSharedMessageV4 *request,
+											 const ClusterKoSharedMessageV4 *result);
+extern bool cluster_ko_shared_ack_matches_v4(const ClusterKoSharedMessageV4 *request,
+										  const ClusterKoSharedMessageV4 *ack);
 #endif
 
 #ifndef FRONTEND
@@ -202,16 +478,23 @@ StaticAssertDecl(sizeof(KoFlushAckHeader) == 24, "spec-5.7 D6 KoFlushAckHeader w
  * no data.
  */
 extern void cluster_ko_flush_and_wait_ack(RelFileLocator rlocator, char relpersistence);
+/* R2 relation entry: bind the v3 barrier to the caller's registered AX grant. */
+extern void cluster_ko_flush_and_wait_ack_relation(struct RelationData *rel,
+																	char relpersistence, uint16 operation);
 
 #ifdef USE_PGRAC_CLUSTER
-/* Original barrier's process/ResourceOwner-local completion. The caller still
- * holds exclusive relation lifecycle authority. Only a successful original
- * barrier can construct this handle; raw ACK bytes cannot. Release before its
- * owner ends, on every exit. These APIs certify only the KO scope, never a
+/* Original operation's process/ResourceOwner-local handle. The caller still
+ * holds exclusive relation lifecycle authority. A v3 registration may retain
+ * the handle before its barrier; completion consumers still require the
+ * original completed operation. Release before its owner ends, on every exit.
+ * These APIs certify only the KO scope, never a
  * commit, a durable structural effect, an ancestor chain or PI retirement.
  * Direct begin binds CurrentResourceOwner. The native shared DDL wrapper
  * retains its completion with CurTransactionResourceOwner for SPACE. */
 typedef struct ClusterKoCompletionV2 ClusterKoCompletionV2;
+/* The original committed backend's entered SPACE call, never general I/O. */
+extern bool cluster_ko_native_space_current_v4(const ClusterKoCompletionV2 *completion,
+	const ClusterKoDirectoryIoV3 *call, const ClusterSpaceIdentity *expected);
 /* Successful subtransaction cleanup transfers this original handle to its
  * parent ResourceOwner. Native observed handles span top-level commit's
  * pending deletes; all others end at the original ResourceOwner cleanup.
@@ -224,6 +507,22 @@ extern bool cluster_ko_shared_begin_v2(RelFileLocator rlocator, char relpersiste
  * second barrier. Refusal leaves out unchanged. */
 extern bool cluster_ko_shared_claim_v2(const ClusterSpaceIdentityKey *key,
 									   const uint8 incarnation[16], ClusterKoCompletionV2 **out);
+/* Native structural record preparation: the locked old SPACE identity and
+ * action must match the original operation. An unsent v3 DROP/REWRITE_OLD
+ * registration can prepare TOMBSTONE only; it is not write permission.
+ * V3 keeps its exact local AX binding. Identity-only v2 cannot consume v3. */
+extern bool cluster_ko_shared_claim_structure(const ClusterSpaceIdentity *identity,
+											  ClusterSpaceWalAction action,
+											  ClusterKoCompletionV2 **out);
+/* Read the original claimed native purpose before COMMIT. This does not
+ * confer physical write permission; an unknown/mismatched owner refuses. */
+extern bool cluster_ko_shared_drop_prepare_mode_v4(const ClusterKoCompletionV2 *completion,
+												  bool *committed_discard);
+/* Outside critical sections, validate the claimed operation's completed
+ * barrier before physical write. The SPACE owner checks this before reacquiring
+ * its pages and after revalidating their exact typed predecessor under lock. */
+extern bool cluster_ko_shared_drop_write_current(const ClusterKoCompletionV2 *completion,
+												   const ClusterSpaceIdentity *identity);
 struct ClusterPageWalBindingV1;
 /* Original SPACE finish, after both pages have an exact durable observation.
  * Saves only that observation in the already reserved native handle. This is
@@ -302,9 +601,16 @@ extern bool cluster_ko_shared_native_handoff_v2(ClusterKoCompletionV2 **completi
  * Transfer preallocated work while retaining the original pending-delete
  * handle. Disabled until the full structural protocol is advertised. */
 extern void cluster_ko_shared_native_commit_v2(void);
+extern void cluster_ko_shared_native_publication_v3(void);
+struct ClusterSpaceDropState;
+extern void cluster_ko_shared_native_window_v4(const struct ClusterSpaceDropState *space_drop);
 /* Native smgr only, after DropRelationsAllBuffers returns for this locator.
  * Releases only the original local-buffer gate, never physical durability. */
 extern void cluster_ko_shared_native_drop_buffers_released_v2(RelFileLocator locator);
+/* Native smgr only, immediately before DropRelationsAllBuffers. This
+ * handoff does not claim invalidation; the following callback must still
+ * publish buffers_released for the same continuation. */
+extern bool cluster_ko_shared_native_prepare_drop_v2(RelFileLocator locator);
 /* True suppresses the backend's obsolete pathname operation, even with a
  * now-stale cut. It conveys no physical completion or reuse permission. */
 extern bool cluster_ko_shared_native_drop_deferred_v2(RelFileLocator locator);
@@ -354,6 +660,30 @@ extern bool cluster_ko_shared_drop_work_abandon_next_v2(uint32 *cursor, Size sto
  * pathname operations. Success consumes the work, admits the original
  * structural PI consumer, and grants no MAIN/WAL reclamation authority. */
 extern bool cluster_ko_shared_drop_work_finish_v2(ClusterKoDropWorkV2 **work);
+
+/* Volatile diagnostics of the original CP file responsibility; no authority. */
+typedef struct ClusterKoDropTraceV1 {
+	RelFileLocator locator;
+	uint32 slot;
+	int32 pid;
+	uint64 serial, batch;
+	uint32 operation;
+	uint32 phase, step, provider_step, cursor, prefix_cursor, local_result;
+	uint32 gate_phase;
+	uint64 revision, current_revision, gate_formation, gate_freeze, selections;
+	int64 observed_pg_us;
+	int32 forknum, io_error;
+	bool observed, gate_observed, io_attempted, drop_pending, failed;
+} ClusterKoDropTraceV1;
+
+#define CLUSTER_KO_DROP_TRACE_CONTEXT 1
+#define CLUSTER_KO_DROP_TRACE_LOCAL 2
+#define CLUSTER_KO_DROP_TRACE_PROVIDER 3
+#define CLUSTER_KO_DROP_TRACE_FINISH 4
+
+extern bool cluster_ko_drop_pending_v1(ClusterKoDropTraceV1 *out);
+extern void cluster_ko_drop_work_note_v1(ClusterKoDropWorkV2 *work, uint32 phase,
+	uint32 step, ForkNumber fork, bool io_attempted, int io_error);
 /* End only this node's original background work, after its complete local
  * responsibility scan and, for an origin, all peer ownership handoffs.
  * Other accepted owners retain their own work. No global retirement or
@@ -420,10 +750,174 @@ extern void cluster_ko_flush_ack_handler(const ClusterICEnvelope *env, const voi
  * full buffer-pool scan.
  */
 extern void cluster_ko_drain_inbound_and_apply(void);
+/* Original SI error owner, after its LWLocks/pins have been released and
+ * before FlushErrorState. Records only the exact active v3 attempt. */
+extern void cluster_ko_peer_apply_error_v3(int sqlerrcode);
 /* Original LMON drains the shared-only fixed frame queue, outside locks. */
 extern void cluster_ko_lmon_tick_v2(void);
 
 /* ---- observability counters (dump_ko; surfaced by pg_cluster_state) - */
+typedef enum ClusterKoOriginCheckpointReason
+{
+	CLUSTER_KO_ORIGIN_REASON_PROGRESS = 0,
+	CLUSTER_KO_ORIGIN_REASON_CUT_CURRENT,
+	CLUSTER_KO_ORIGIN_REASON_PEER_REVISION,
+	CLUSTER_KO_ORIGIN_REASON_GATE_NOT_OPEN,
+	CLUSTER_KO_ORIGIN_REASON_GATE_CHANGED,
+	CLUSTER_KO_ORIGIN_REASON_CTRC_NOT_READY,
+	CLUSTER_KO_ORIGIN_REASON_CLEANER_PENDING,
+	CLUSTER_KO_ORIGIN_REASON_EXTEND_PENDING,
+	CLUSTER_KO_ORIGIN_REASON_DRAIN_WAIT,
+	CLUSTER_KO_ORIGIN_REASON_DRAIN_MORE,
+	CLUSTER_KO_ORIGIN_REASON_DRAIN_REDIRTIED,
+	CLUSTER_KO_ORIGIN_REASON_PI_SCAN_PENDING,
+	CLUSTER_KO_ORIGIN_REASON_PI_SCAN_MORE,
+	CLUSTER_KO_ORIGIN_REASON_WB_NOT_CLOSED,
+	CLUSTER_KO_ORIGIN_REASON_WB_REVISION,
+	CLUSTER_KO_ORIGIN_REASON_CONTEXT_CHANGED,
+	CLUSTER_KO_ORIGIN_REASON_COUNT
+} ClusterKoOriginCheckpointReason;
+
+/* Diagnostic copies only: none of these values grants discard or I/O authority.
+ * The subsystem copies its rejected tuple while holding its existing locks;
+ * the origin logs it only after those locks have been released. */
+typedef struct ClusterKoDiscardDetailV1 {
+	RelFileLocator locator;
+	int32 forknum;
+	uint32 blocknum;
+	uint32 slot;
+	int32 pid;
+	uint32 source;
+	uint32 state;
+	uint32 refs;
+	uint32 flags;
+	uint32 predicate_mask;
+	uint32 projection; /* bit 0 LOCAL, bit 1 local PI, bit 2 DIRECTORY */
+	int32 current_holder_node;
+	uint32 s_holders;
+	uint32 s_holder_refs;
+	uint32 local_owner_state;
+	uint32 round_phase;
+	uint32 send_pending;
+	uint32 delivery_buffer_id_plus_one;
+	uint64 delivery_executor_purpose;
+	uint64 revision;
+	uint64 value;
+	uint64 value2;
+	bool valid;
+} ClusterKoDiscardDetailV1;
+
+#define CLUSTER_KO_DISCARD_BUFFER 1
+#define CLUSTER_KO_DISCARD_DIRECTORY_IO 2
+#define CLUSTER_KO_DISCARD_EXTEND 3
+#define CLUSTER_KO_DISCARD_CLEANER 4
+#define CLUSTER_KO_DISCARD_PCM 5
+#define CLUSTER_KO_DISCARD_WB 6
+
+typedef enum ClusterKoOriginDiscardReason {
+	CLUSTER_KO_DISCARD_PEER_REVISION,
+	CLUSTER_KO_DISCARD_DIRECTORY_PENDING,
+	CLUSTER_KO_DISCARD_EXTEND_PENDING,
+	CLUSTER_KO_DISCARD_CLEANER_PENDING,
+	CLUSTER_KO_DISCARD_BUFFER_MORE,
+	CLUSTER_KO_DISCARD_BUFFER_WAIT,
+	CLUSTER_KO_DISCARD_BUFFER_CUT,
+	CLUSTER_KO_DISCARD_BUFFER_PENDING,
+	CLUSTER_KO_DISCARD_PI_MORE,
+	CLUSTER_KO_DISCARD_PI_PENDING,
+	CLUSTER_KO_DISCARD_WB_NOT_CLOSED,
+	CLUSTER_KO_DISCARD_FINAL_CUT,
+	CLUSTER_KO_DISCARD_WB_REVISION,
+	CLUSTER_KO_DISCARD_FINAL_PENDING,
+	CLUSTER_KO_DISCARD_REASON_COUNT
+} ClusterKoOriginDiscardReason;
+
+extern void cluster_ko_origin_discard_detail_v1(const ClusterKoDiscardDetailV1 *detail);
+extern uint64 cluster_ko_origin_discard_count(const char *reason);
+extern const char *cluster_ko_origin_discard_reason_name(int reason);
+
+/* Diagnostic copies, never authority or a wire record. Zero means no failure. */
+typedef enum ClusterKoNativeFailureReason {
+	CLUSTER_KO_NATIVE_FAIL_NONE,
+	CLUSTER_KO_NATIVE_FAIL_PUBLISH,
+	CLUSTER_KO_NATIVE_FAIL_PUBLISH_IDENTITY,
+	CLUSTER_KO_NATIVE_FAIL_REGISTRATION,
+	CLUSTER_KO_NATIVE_FAIL_PUBLICATION,
+	CLUSTER_KO_NATIVE_FAIL_WINDOW_OWNER,
+	CLUSTER_KO_NATIVE_FAIL_WINDOW_WAIT,
+	CLUSTER_KO_NATIVE_FAIL_WINDOW_DISCARD,
+	CLUSTER_KO_NATIVE_FAIL_WINDOW_SPACE,
+	CLUSTER_KO_NATIVE_FAIL_WINDOW_CLOSE,
+	CLUSTER_KO_NATIVE_FAIL_WINDOW_ERROR,
+	CLUSTER_KO_NATIVE_FAIL_ABANDON,
+	CLUSTER_KO_NATIVE_FAIL_PROMOTION_CUT,
+	CLUSTER_KO_NATIVE_FAIL_UNTRACKED,
+	CLUSTER_KO_NATIVE_FAIL_COUNT
+} ClusterKoNativeFailureReason;
+
+typedef enum ClusterKoNativeFailureStage {
+	CLUSTER_KO_NATIVE_STAGE_NONE,
+	CLUSTER_KO_NATIVE_STAGE_OWNER,
+	CLUSTER_KO_NATIVE_STAGE_WAIT,
+	CLUSTER_KO_NATIVE_STAGE_DISCARD,
+	CLUSTER_KO_NATIVE_STAGE_SPACE,
+	CLUSTER_KO_NATIVE_STAGE_CLOSE,
+	CLUSTER_KO_NATIVE_STAGE_ABANDON,
+	CLUSTER_KO_NATIVE_STAGE_PUBLISH,
+	CLUSTER_KO_NATIVE_STAGE_PUBLISH_IDENTITY,
+	CLUSTER_KO_NATIVE_STAGE_REGISTRATION,
+	CLUSTER_KO_NATIVE_STAGE_PUBLICATION,
+	CLUSTER_KO_NATIVE_STAGE_PROMOTE
+} ClusterKoNativeFailureStage;
+
+/* Diagnostic-only final SPACE substages; stable IDs, never authority. */
+typedef enum ClusterKoNativeSpaceStage {
+	CLUSTER_KO_NATIVE_SPACE_NONE,
+	CLUSTER_KO_NATIVE_SPACE_ENTERED_IO,
+	CLUSTER_KO_NATIVE_SPACE_COMMIT,
+	CLUSTER_KO_NATIVE_SPACE_CURRENT,
+	CLUSTER_KO_NATIVE_SPACE_INPUT,
+	CLUSTER_KO_NATIVE_SPACE_PUBLICATION,
+	CLUSTER_KO_NATIVE_SPACE_READBACK,
+	CLUSTER_KO_NATIVE_SPACE_POSTCHECK,
+	CLUSTER_KO_NATIVE_SPACE_IO_END
+} ClusterKoNativeSpaceStage;
+
+/* Stable IDs for the seven original recovery_required writes. */
+typedef enum ClusterKoNativeFailureSite {
+	CLUSTER_KO_NATIVE_SITE_ABANDON = 1,
+	CLUSTER_KO_NATIVE_SITE_PUBLISH,
+	CLUSTER_KO_NATIVE_SITE_PUBLISH_IDENTITY,
+	CLUSTER_KO_NATIVE_SITE_REGISTRATION,
+	CLUSTER_KO_NATIVE_SITE_PUBLICATION,
+	CLUSTER_KO_NATIVE_SITE_PROMOTE,
+	CLUSTER_KO_NATIVE_SITE_WINDOW
+} ClusterKoNativeFailureSite;
+
+#define CLUSTER_KO_NATIVE_ERROR_SUMMARY_BYTES 192
+
+typedef struct ClusterKoNativeFailureV1 {
+	uint32 reason, stage, site, space_stage;
+	char error_message[CLUSTER_KO_NATIVE_ERROR_SUMMARY_BYTES];
+	int32 sqlerrcode, pid, producer_pid;
+	uint32 slot, operation;
+	int64 captured_pg_us;
+	RelFileLocator locator;
+	uint64 serial, batch, epoch, drop_identity_serial, revision;
+	uint32 drop_identity, identity_state;
+	/* work: publication/predelete/buffers/recovery, low bit first. */
+	uint32 work_flags, owner_flags, context_flags, entry_flags, matches, handoff;
+	uint16 sent_peers, sending_peers, uncertain_peers, done_peers, failed_peers;
+	uint64 terminal_start, terminal_end, source_thread, source_boot, mutation_token;
+	uint32 source_timeline;
+} ClusterKoNativeFailureV1;
+
+extern const char *cluster_ko_native_failure_reason_name(int reason);
+extern const char *cluster_ko_native_failure_stage_name(int stage);
+extern uint64 cluster_ko_native_failure_count(const char *reason);
+extern bool cluster_ko_native_failure_first(const char *reason, ClusterKoNativeFailureV1 *out);
+
+
 extern uint64 cluster_ko_flush_count(void);		   /* barriers initiated (enqueuer) */
 extern uint64 cluster_ko_ack_received_count(void); /* peer DONE ACKs recorded (enqueuer) */
 extern uint64 cluster_ko_failclosed_count(void);   /* 53RAA fail-closed (enqueuer) */
@@ -431,6 +925,10 @@ extern uint64 cluster_ko_native_count(void);	   /* no-op: single-node / no peer 
 extern uint64 cluster_ko_lockfail_count(void); /* KO(X) acquire failed (best-effort; barrier ran) */
 extern uint64 cluster_ko_peer_apply_count(void);   /* flush+drop applied + ACK'd (peer) */
 extern uint64 cluster_ko_inbound_full_count(void); /* KO inbound ring full (peer -> no ACK) */
+extern uint64 cluster_ko_origin_checkpoint_restart_count(const char *reason);
+extern uint64 cluster_ko_origin_checkpoint_wait_count(const char *reason);
+extern const char *cluster_ko_origin_checkpoint_reason_name(
+	ClusterKoOriginCheckpointReason reason);
 
 #endif /* !FRONTEND */
 

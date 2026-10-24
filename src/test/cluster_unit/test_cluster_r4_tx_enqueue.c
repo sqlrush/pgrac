@@ -1671,10 +1671,81 @@ UT_TEST(test_backend_exit_counter_underflow_fails_stop_without_freeing_slot)
 	ClusterTxw->slots[0].waiting = CLUSTER_TXW_SLOT_FREE;
 }
 
+UT_TEST(test_wait_snapshot_copies_real_source_and_target_without_mutation)
+{
+	ClusterTTStatusKey source = test_source_key();
+	ClusterTxLocator locator = test_locator();
+	ClusterTxWaitSnapshot rows[2];
+	char before[sizeof(test_txw_storage)];
+	int copied = -1;
+	int required = -1;
+
+	reset_fixture();
+	UT_ASSERT(txw_slot_set(0, &source, false));
+	UT_ASSERT(txw_target_slot_set_if_free(1, &locator));
+	memcpy(before, test_txw_storage, sizeof(before));
+	UT_ASSERT(cluster_tx_enqueue_snapshot(rows, 2, &copied, &required));
+	UT_ASSERT_EQ(copied, 2);
+	UT_ASSERT_EQ(required, 2);
+	UT_ASSERT_EQ(rows[0].procno, 0);
+	UT_ASSERT_EQ(rows[0].kind, CLUSTER_TXW_SLOT_SOURCE);
+	UT_ASSERT_EQ(memcmp(&rows[0].source_key, &source, sizeof(source)), 0);
+	UT_ASSERT_EQ(rows[1].procno, 1);
+	UT_ASSERT_EQ(rows[1].kind, CLUSTER_TXW_SLOT_TARGET);
+	UT_ASSERT_EQ(memcmp(&rows[1].target_locator, &locator, sizeof(locator)), 0);
+	UT_ASSERT_EQ(memcmp(before, test_txw_storage, sizeof(before)), 0);
+}
+
+UT_TEST(test_wait_snapshot_truncation_is_not_empty)
+{
+	ClusterTTStatusKey key = test_source_key();
+	ClusterTxWaitSnapshot rows[2];
+	ClusterTxWaitSnapshot sentinel;
+	int copied;
+	int required;
+
+	reset_fixture();
+	UT_ASSERT(txw_slot_set(0, &key, true));
+	key.local_xid++;
+	UT_ASSERT(txw_slot_set(1, &key, false));
+	memset(rows, 0xa5, sizeof(rows));
+	sentinel = rows[1];
+	UT_ASSERT(cluster_tx_enqueue_snapshot(rows, 1, &copied, &required));
+	UT_ASSERT_EQ(copied, 1);
+	UT_ASSERT_EQ(required, 2);
+	UT_ASSERT_EQ(rows[0].kind, CLUSTER_TXW_SLOT_SOURCE_CURRENT_MX);
+	UT_ASSERT_EQ(memcmp(&sentinel, &rows[1], sizeof(sentinel)), 0);
+	UT_ASSERT(cluster_tx_enqueue_snapshot(NULL, 0, &copied, &required));
+	UT_ASSERT_EQ(copied, 0);
+	UT_ASSERT_EQ(required, 2);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterTxw->active_waiters), 2);
+}
+
+UT_TEST(test_wait_snapshot_unavailable_and_invalid_are_not_empty)
+{
+	int copied = 9;
+	int required = 9;
+
+	reset_fixture();
+	UT_ASSERT(cluster_tx_enqueue_snapshot(NULL, 0, &copied, &required));
+	UT_ASSERT_EQ(copied, 0);
+	UT_ASSERT_EQ(required, 0);
+	ClusterTxw = NULL;
+	UT_ASSERT(!cluster_tx_enqueue_snapshot(NULL, 0, &copied, &required));
+	reset_fixture();
+	UT_ASSERT(!cluster_tx_enqueue_snapshot(NULL, 1, &copied, &required));
+	UT_ASSERT(!cluster_tx_enqueue_snapshot(NULL, -1, &copied, &required));
+	UT_ASSERT(!cluster_tx_enqueue_snapshot(NULL, 0, NULL, &required));
+	UT_ASSERT(!cluster_tx_enqueue_snapshot(NULL, 0, &copied, NULL));
+}
+
 int
 main(void)
 {
-	UT_PLAN(44);
+	UT_PLAN(47);
+	UT_RUN(test_wait_snapshot_copies_real_source_and_target_without_mutation);
+	UT_RUN(test_wait_snapshot_truncation_is_not_empty);
+	UT_RUN(test_wait_snapshot_unavailable_and_invalid_are_not_empty);
 	UT_RUN(test_parallel_tx_wait_preserves_group_and_exact_cancel_identity);
 	UT_RUN(test_exact_wait_abi_and_shmem_size_are_frozen);
 	UT_RUN(test_fixed_false_precedes_malformed_and_shared_state);

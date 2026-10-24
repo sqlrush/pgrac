@@ -74,6 +74,7 @@
 #include "cluster/cluster_extend_gate.h" /* spec-5.7 §3.1d — liveness engage gate */
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ic.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_sf_dep.h"		/* spec-6.2 Smart Fusion DBWR brake */
 #include "cluster/cluster_xnode_profile.h"	/* spec-5.59 D3/D4 — read probe + relkind hint */
 #include "cluster/cluster_itl.h"	/* spec-6.12a — quiescent check for X->S downgrade */
@@ -149,6 +150,45 @@ static void FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject
 									volatile bool *write_attempted);
 
 #ifdef USE_PGRAC_CLUSTER
+/* Sample the object exclusion before taking a mapping/header/PCM lock.
+ * The returned bool selects the shared tier1 path, not successful admission.
+ * A refused sample remains zero and fails the later locked revalidation. */
+static bool
+cluster_bufmgr_ko_read_sample(RelFileLocator locator, ClusterKoPeerAdmissionV3 *sample)
+{
+	if (!cluster_enabled || !cluster_shared_config || cluster_interconnect_tier != CLUSTER_IC_TIER_1
+		|| cluster_smgr_which_for(locator, InvalidBackendId) != 1)
+		return false;
+	(void)cluster_ko_peer_admission_begin_v3(locator, sample);
+	return true;
+}
+
+/* Only native reads may borrow the original cleaner's exact finite attempt.
+ * CR publication/copy keep the ordinary predicate and cannot use this scope. */
+static bool
+cluster_bufmgr_ko_native_read_sample(RelFileLocator locator, ForkNumber fork, BlockNumber block,
+									 ClusterKoPeerAdmissionV3 *sample)
+{
+	if (!cluster_enabled || !cluster_shared_config || cluster_interconnect_tier != CLUSTER_IC_TIER_1
+		|| cluster_smgr_which_for(locator, InvalidBackendId) != 1)
+		return false;
+	(void)cluster_ko_peer_read_begin_v3(locator, fork, block, sample);
+	return true;
+}
+
+/* No mapping/header/content lock or new pin may survive this local wait.
+ * The bounded latch poll is a fallback; only the next admission sample can
+ * authorize publication. Waiting alone never becomes a transaction error. */
+static void
+cluster_bufmgr_ko_read_wait(void)
+{
+	CHECK_FOR_INTERRUPTS();
+	(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 100L,
+					WAIT_EVENT_PCM_BLOCK_CONVERT_WAIT);
+	ResetLatch(MyLatch);
+	CHECK_FOR_INTERRUPTS();
+}
+
 static inline bool
 cluster_bufmgr_should_pcm_track(BufferDesc *buf)
 {
@@ -376,7 +416,8 @@ cluster_bufmgr_stop_held_lock(LWLock *lock, LWLockMode mode, void *context)
 
 static ClusterNormalStopPollResult
 cluster_bufmgr_stop_poll(bool post_checkpoint, bool require_pi_retired, BufferTag *tag_out,
-						int *buffer_id_out, const char **reason_out)
+						int *buffer_id_out, const char **reason_out,
+						ClusterBufferStopObservation *observation)
 {
 	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
 	BufferTag observed = { 0 };
@@ -384,6 +425,9 @@ cluster_bufmgr_stop_poll(bool post_checkpoint, bool require_pi_retired, BufferTa
 	int observed_id = -1;
 	bool held_lock = false;
 	int i;
+
+	if (observation != NULL)
+		MemSet(observation, 0, sizeof(*observation));
 
 	if (!IsUnderPostmaster || !cluster_enabled || NBuffers <= 0 || BufferDescriptors == NULL
 		|| ClusterPcmOwnArray == NULL || ClusterPiShadow == NULL) {
@@ -404,7 +448,7 @@ cluster_bufmgr_stop_poll(bool post_checkpoint, bool require_pi_retired, BufferTa
 		uint32 state = LockBufHdr(buf);
 		ClusterNormalStopPollResult current = CLUSTER_NORMAL_STOP_READY;
 		const char *current_reason = "BUFMGR_READY";
-		ClusterPcmOwnSnapshot own;
+		ClusterPcmOwnSnapshot own = { 0 };
 		uint64 delivery = 0;
 		bool is_pi = buf->buffer_type == BUF_TYPE_PI;
 
@@ -465,6 +509,12 @@ cluster_bufmgr_stop_poll(bool post_checkpoint, bool require_pi_retired, BufferTa
 			reason = current_reason;
 			observed = buf->tag;
 			observed_id = i;
+			if (observation != NULL) {
+				observation->own = own;
+				observation->state = state & ~BM_LOCKED;
+				observation->delivery = delivery;
+				observation->wait_backend_pgprocno = buf->wait_backend_pgprocno;
+			}
 		}
 		UnlockBufHdr(buf, state);
 	}
@@ -483,14 +533,49 @@ cluster_bufmgr_normal_stop_poll(bool post_checkpoint, BufferTag *tag_out, int *b
 								const char **reason_out)
 {
 	return cluster_bufmgr_stop_poll(post_checkpoint, post_checkpoint, tag_out, buffer_id_out,
-								   reason_out);
+								   reason_out, NULL);
+}
+
+ClusterNormalStopPollResult
+cluster_bufmgr_normal_stop_observed(bool post_checkpoint, bool require_pi_retired,
+	BufferTag *tag_out, int *buffer_id_out, const char **reason_out,
+	ClusterBufferStopObservation *observation)
+{
+	return cluster_bufmgr_stop_poll(post_checkpoint, require_pi_retired, tag_out,
+		buffer_id_out, reason_out, observation);
 }
 
 ClusterNormalStopPollResult
 cluster_bufmgr_normal_stop_local_checkpoint_poll(BufferTag *tag_out, int *buffer_id_out,
 												   const char **reason_out)
 {
-	return cluster_bufmgr_stop_poll(true, false, tag_out, buffer_id_out, reason_out);
+	return cluster_bufmgr_stop_poll(true, false, tag_out, buffer_id_out, reason_out, NULL);
+}
+
+/* Native cleanup diagnostics do not acquire authority or change an owner.
+ * Sample under the header lock, but emit only after releasing it. */
+static void
+cluster_bufmgr_trace_cleanup(BufferDesc *buf, const char *stage, uint64 attempt)
+{
+	ClusterPcmOwnSnapshot own;
+	uint32 state;
+	uint64 delivery;
+
+	if (!cluster_trace_cleanup || CritSectionCount != 0 || ClusterPcmOwnArray == NULL)
+		return;
+	state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_post_state_locked(buf, state, &own);
+	delivery = cluster_pcm_own_delivery_attempt_get(buf->buf_id);
+	UnlockBufHdr(buf, state);
+	elog(LOG, "cluster cleanup buffer stage=%s attempt=" UINT64_FORMAT
+		 " tag=%u/%u/%u/%u/%u buffer=%d state=%08x refs=%u pcm=%u type=%u "
+		 "gen=" UINT64_FORMAT " flags=%x token=" UINT64_FORMAT
+		 " activation=" UINT64_FORMAT " r4=" UINT64_FORMAT " delivery=" UINT64_FORMAT,
+		 stage, attempt, own.tag.spcOid, own.tag.dbOid, own.tag.relNumber,
+		 (unsigned) own.tag.forkNum, own.tag.blockNum, buf->buf_id, state & ~BM_LOCKED,
+		 BUF_STATE_GET_REFCOUNT(state), own.pcm_state, own.buffer_type, own.generation,
+		 own.flags, own.reservation_token, own.writer_activation_token,
+		 own.resource_x_activation_generation, delivery);
 }
 
 /* A normal D-h1 PI is !BM_VALID.  PCM-X retained-image transfer deliberately
@@ -2861,6 +2946,8 @@ typedef struct ClusterPcmXWriterLedgerEntry {
 	ResourceXWriterUseContext authority;
 	ClusterPcmOwnSnapshot granted;
 	ResourceXLocalOwnerHandle recycle_owner;
+	uint64 object_revision;
+	bool object_checked;
 } ClusterPcmXWriterLedgerEntry;
 
 static ClusterPcmXWriterLedgerEntry cluster_bufmgr_pcm_x_writer_ledger[LWLOCK_MAX_HELD_BY_PROC];
@@ -3127,6 +3214,7 @@ cluster_bufmgr_pcm_acquire_shared_owned(BufferDesc *buf,
 
 	PG_TRY();
 	{
+		cluster_bufmgr_trace_cleanup(buf, "shared_acquire_enter", reservation_token);
 		acquired = cluster_pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_S, retry_denied);
 	}
 	PG_CATCH();
@@ -3151,6 +3239,7 @@ cluster_bufmgr_pcm_acquire_shared_owned(BufferDesc *buf,
 			result = cluster_pcm_own_reservation_abort_exact(
 				buf->buf_id, base->generation, reservation_token, PCM_OWN_FLAG_GRANT_PENDING);
 		UnlockBufHdr(buf, state);
+		cluster_bufmgr_trace_cleanup(buf, "shared_acquire_catch", (uint64) result);
 		if (result != CLUSTER_PCM_OWN_OK)
 			elog(LOG,
 				 "cluster shared acquisition error cleanup not proven: buffer=%d "
@@ -3278,6 +3367,23 @@ cluster_bufmgr_pcm_x_writer_clear(ClusterPcmXWriterLedgerEntry *entry)
 {
 	if (entry != NULL)
 		MemSet(entry, 0, sizeof(*entry));
+}
+
+/* The exact post-T3 target is already retained by its original owner. Bind
+ * its object admission before waiting for content-X; neither this sample nor
+ * its later atomic check grants current authority. ACTIVE may finish that
+ * retained target, while READY/terminal fences cannot reopen it. */
+static void
+cluster_bufmgr_pcm_x_writer_object_sample(ClusterPcmXWriterLedgerEntry *entry)
+{
+	RelFileLocator locator = BufTagGetRelFileLocator(&entry->authority.ref.assertion.resource);
+
+	entry->object_revision = 0;
+	entry->object_checked = cluster_enabled && cluster_shared_config
+							&& cluster_interconnect_tier == CLUSTER_IC_TIER_1
+							&& cluster_smgr_which_for(locator, InvalidBackendId) == 1;
+	if (entry->object_checked)
+		(void)cluster_ko_peer_delivery_begin_v3(locator, &entry->object_revision);
 }
 
 static ClusterPcmXWriterLedgerEntry *
@@ -3421,6 +3527,7 @@ cluster_bufmgr_pcm_x_writer_prepare_target(BufferDesc *buf, const BufferTag *exp
 		}
 		entry->authority = context;
 		entry->granted = granted;
+		cluster_bufmgr_pcm_x_writer_object_sample(entry);
 		entry->phase = PCM_X_WRITER_LEDGER_ACQUIRING;
 		return entry;
 	}
@@ -3500,6 +3607,7 @@ cluster_bufmgr_pcm_x_writer_track_target_direct_init(
 	entry->content_lock = BufferDescriptorGetContentLock(buf);
 	entry->authority = *context;
 	entry->granted = granted;
+	cluster_bufmgr_pcm_x_writer_object_sample(entry);
 	entry->phase = PCM_X_WRITER_LEDGER_ACQUIRING;
 	if (!cluster_bufmgr_pcm_x_writer_entry_exact(entry, buf)) {
 		cluster_bufmgr_pcm_x_writer_clear(entry);
@@ -3574,6 +3682,19 @@ cluster_bufmgr_pcm_x_writer_activate(
 			cluster_bufmgr_resource_x_fail_closed_exact(&gate);
 			cluster_bufmgr_resource_x_writer_report_failure(context_result, buf,
 															"Resource-X target activate");
+		}
+		/* Consume the original sample only; taking the object lock or
+		 * refreshing permission under content-X would reverse the lock order.
+		 * A failed sample ends only this use attempt, never the node's target,
+		 * pin, IO or PI responsibility. Direct-init cannot return to a caller
+		 * that would initialize bytes after a false activation. */
+		if (entry->object_checked && !cluster_ko_peer_delivery_current_v3(entry->object_revision)) {
+			if (allow_reprobe) {
+				cluster_bufmgr_pcm_x_writer_clear(entry);
+				return false;
+			}
+			cluster_bufmgr_resource_x_writer_report_failure(RESOURCE_X_APPLY_STALE, buf,
+															"Resource-X target object admission");
 		}
 		break;
 	}
@@ -4433,9 +4554,14 @@ typedef struct PrivateRefCountEntry
 {
 	Buffer		buffer;
 	int32		refcount;
+#ifdef USE_PGRAC_CLUSTER
+	/* A read pin is not current authority. Keep its exact object admission
+	 * only for lock-free revalidation by the conditional cached-X entrance. */
+	ClusterKoCurrentAdmissionV3 ko_current;
+#endif
 } PrivateRefCountEntry;
 
-/* 64 bytes, about the size of a cache line on common systems */
+/* Eight hot entries; cluster entries also retain their pin admission. */
 #define REFCOUNT_ARRAY_ENTRIES 8
 
 /*
@@ -4630,6 +4756,9 @@ ReservePrivateRefCountEntry(void)
 							  &found);
 		Assert(!found);
 		hashent->refcount = ReservedRefCountEntry->refcount;
+#ifdef USE_PGRAC_CLUSTER
+		hashent->ko_current = ReservedRefCountEntry->ko_current;
+#endif
 
 		/* clear the now free array slot */
 		ReservedRefCountEntry->buffer = InvalidBuffer;
@@ -4657,6 +4786,9 @@ NewPrivateRefCountEntry(Buffer buffer)
 	/* and fill it */
 	res->buffer = buffer;
 	res->refcount = 0;
+#ifdef USE_PGRAC_CLUSTER
+	memset(&res->ko_current, 0, sizeof(res->ko_current));
+#endif
 
 	return res;
 }
@@ -4726,6 +4858,9 @@ GetPrivateRefCountEntry(Buffer buffer, bool do_move)
 		/* and fill it */
 		free->buffer = buffer;
 		free->refcount = res->refcount;
+#ifdef USE_PGRAC_CLUSTER
+		free->ko_current = res->ko_current;
+#endif
 
 		/* delete from hashtable */
 		hash_search(PrivateRefCountHash, &buffer, HASH_REMOVE, &found);
@@ -4769,6 +4904,9 @@ static void
 ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref)
 {
 	Assert(ref->refcount == 0);
+#ifdef USE_PGRAC_CLUSTER
+	memset(&ref->ko_current, 0, sizeof(ref->ko_current));
+#endif
 
 	if (ref >= &PrivateRefCountArray[0] &&
 		ref < &PrivateRefCountArray[REFCOUNT_ARRAY_ENTRIES])
@@ -4793,6 +4931,23 @@ ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref)
 		PrivateRefCountOverflowed--;
 	}
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/* Called only after native first-pin/mapping admission validated the sample.
+ * No new object lock or permission is acquired. The original private pin
+ * keeps this tag stable, including while its refcount entry moves to hash. */
+static void
+cluster_bufmgr_ko_remember_pin(BufferDesc *buf, const ClusterKoPeerAdmissionV3 *sample)
+{
+	PrivateRefCountEntry *ref = GetPrivateRefCountEntry(BufferDescriptorGetBuffer(buf), false);
+
+	if (ref == NULL || ref->refcount <= 0 || sample == NULL)
+		return;
+	ref->ko_current.target = *sample;
+	ref->ko_current.target.fork = buf->tag.forkNum;
+	ref->ko_current.target.block = buf->tag.blockNum;
+}
+#endif
 
 /*
  * BufferIsPinned
@@ -4827,11 +4982,11 @@ static BlockNumber ExtendBufferedRelShared(BufferManagerRelation bmr,
 										   BlockNumber extend_upto,
 										   Buffer *buffers,
 										   uint32 *extended_by);
-typedef enum PinBufferLookupResult
-{
+typedef enum PinBufferLookupResult {
 	PIN_BUFFER_LOOKUP_RETRY = 0,
 	PIN_BUFFER_LOOKUP_INVALID,
-	PIN_BUFFER_LOOKUP_VALID
+	PIN_BUFFER_LOOKUP_VALID,
+	PIN_BUFFER_LOOKUP_OBJECT_RETRY
 } PinBufferLookupResult;
 
 static PinBufferLookupResult PinBufferForLookup(
@@ -4839,6 +4994,10 @@ static PinBufferLookupResult PinBufferForLookup(
 static bool PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy);
 static void PinBuffer_Locked(BufferDesc *buf);
 static void UnpinBuffer(BufferDesc *buf);
+#ifdef USE_PGRAC_CLUSTER
+static PinBufferLookupResult PinBufferForObjectRead(BufferDesc *buf, BufferAccessStrategy strategy,
+													const ClusterKoPeerAdmissionV3 *sample);
+#endif
 static void BufferSync(int flags);
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: spec-6.12h D-h1 — Past Image conversion (definition below). */
@@ -4869,7 +5028,7 @@ static bool InvalidateBufferCommitLocked(BufferDesc *buf, BufferTag *oldTag, uin
 static void InvalidateBufferCommitTailLocked(BufferDesc *buf, BufferTag *oldTag, uint32 oldHash,
 										 LWLock *oldPartitionLock, uint32 buf_state,
 										 uint8 old_pcm_mode, bool release_pcm_holder);
-static bool InvalidateBufferTry(BufferDesc *buf);
+static bool InvalidateBufferTry(BufferDesc *buf, bool preserve_dirty);
 static BufferDesc *BufferAlloc(SMgrRelation smgr,
 							   char relpersistence,
 							   ForkNumber forkNum,
@@ -5028,6 +5187,10 @@ ReadRecentBuffer(RelFileLocator rlocator, ForkNumber forkNum, BlockNumber blockN
 	BufferTag	tag;
 	uint32		buf_state;
 	bool		have_private_ref;
+#ifdef USE_PGRAC_CLUSTER
+	bool check_ko = false;
+	ClusterKoPeerAdmissionV3 ko_sample;
+#endif
 
 	Assert(BufferIsValid(recent_buffer));
 
@@ -5056,6 +5219,11 @@ ReadRecentBuffer(RelFileLocator rlocator, ForkNumber forkNum, BlockNumber blockN
 	{
 		bufHdr = GetBufferDescriptor(recent_buffer - 1);
 		have_private_ref = GetPrivateRefCount(recent_buffer) > 0;
+#ifdef USE_PGRAC_CLUSTER
+		if (!have_private_ref)
+			check_ko
+				= cluster_bufmgr_ko_native_read_sample(rlocator, forkNum, blockNum, &ko_sample);
+#endif
 
 		/*
 		 * Do we already have this buffer pinned with a private reference?  If
@@ -5075,6 +5243,11 @@ ReadRecentBuffer(RelFileLocator rlocator, ForkNumber forkNum, BlockNumber blockN
 			 * InvalidateBuffer() if we pinned a random non-matching buffer.
 			 */
 #ifdef USE_PGRAC_CLUSTER
+			if (check_ko
+				&& !cluster_ko_peer_read_current_v3(&ko_sample, rlocator, forkNum, blockNum)) {
+				UnlockBufHdr(bufHdr, buf_state);
+				return false;
+			}
 			if (!have_private_ref
 				&& !cluster_pcm_x_aux_pin_admission_allowed(
 					cluster_pcm_is_active(),
@@ -5090,6 +5263,10 @@ ReadRecentBuffer(RelFileLocator rlocator, ForkNumber forkNum, BlockNumber blockN
 				PinBuffer(bufHdr, NULL);	/* bump pin count */
 			else
 				PinBuffer_Locked(bufHdr);	/* pin for first time */
+#ifdef USE_PGRAC_CLUSTER
+			if (check_ko && !have_private_ref)
+				cluster_bufmgr_ko_remember_pin(bufHdr, &ko_sample);
+#endif
 
 			pgBufferUsage.shared_blks_hit++;
 
@@ -5330,17 +5507,59 @@ ExtendBufferedRelTo(BufferManagerRelation bmr,
 		 bmr.smgr->smgr_cached_nblocks[fork] == InvalidBlockNumber) &&
 		!smgrexists(bmr.smgr, fork))
 	{
-		LockRelationForExtension(bmr.rel, ExclusiveLock);
+#ifdef USE_PGRAC_CLUSTER
+		RelFileLocator fork_locator = bmr.smgr->smgr_rlocator.locator;
+		BackendId fork_backend = bmr.smgr->smgr_rlocator.backend;
+		uint64 fork_serial = 0;
+		bool fork_scoped = cluster_enabled && cluster_shared_config
+						   && cluster_interconnect_tier == CLUSTER_IC_TIER_1
+						   && !RecoveryInProgress() && bmr.relpersistence != RELPERSISTENCE_TEMP
+						   && cluster_smgr_which_for(fork_locator, fork_backend) == 1;
 
-		/* could have been closed while waiting for lock */
-		if (bmr.rel)
-			bmr.smgr = RelationGetSmgr(bmr.rel);
+		/* The optional file constructor precedes the independent extension. */
+		if (fork_scoped && !cluster_ko_create_begin_v3(fork_locator, &fork_serial))
+			elog(ERROR, "auxiliary fork creation conflicts with object drain");
+		PG_TRY();
+		{
+#endif
+			LockRelationForExtension(bmr.rel, ExclusiveLock);
 
-		/* recheck, fork might have been created concurrently */
-		if (!smgrexists(bmr.smgr, fork))
-			smgrcreate(bmr.smgr, fork, flags & EB_PERFORMING_RECOVERY);
+			/* could have been closed while waiting for lock */
+			if (bmr.rel)
+				bmr.smgr = RelationGetSmgr(bmr.rel);
 
-		UnlockRelationForExtension(bmr.rel, ExclusiveLock);
+#ifdef USE_PGRAC_CLUSTER
+			if (fork_serial != 0
+				&& (!RelFileLocatorEquals(bmr.smgr->smgr_rlocator.locator, fork_locator)
+					|| bmr.smgr->smgr_rlocator.backend != fork_backend))
+				elog(ERROR, "auxiliary fork creation changed storage identity while waiting");
+#endif
+			/* recheck, fork might have been created concurrently */
+			if (!smgrexists(bmr.smgr, fork))
+#ifdef USE_PGRAC_CLUSTER
+			{
+				if (fork_serial != 0
+					&& !cluster_ko_create_write_begin_v3(fork_locator, fork_serial))
+					elog(ERROR, "auxiliary fork creation lost its original owner");
+#endif
+				smgrcreate(bmr.smgr, fork, flags & EB_PERFORMING_RECOVERY);
+#ifdef USE_PGRAC_CLUSTER
+			}
+#endif
+
+			UnlockRelationForExtension(bmr.rel, ExclusiveLock);
+#ifdef USE_PGRAC_CLUSTER
+		}
+		PG_CATCH();
+		{
+			cluster_ko_create_abort_v3(fork_serial);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		/* File/IO cleanup remains with its original owners. */
+		if (fork_serial != 0 && !cluster_ko_create_end_v3(fork_serial, true))
+			elog(ERROR, "auxiliary fork creation cannot retire its original owner");
+#endif
 	}
 
 	/*
@@ -5750,6 +5969,10 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	BufferDesc *victim_buf_hdr;
 	uint32		victim_buf_state;
 	uint32		aux_pin_waits = 0;
+#ifdef USE_PGRAC_CLUSTER
+	bool check_ko;
+	ClusterKoPeerAdmissionV3 ko_sample;
+#endif
 
 	/* create a tag so we can lookup the buffer */
 	InitBufferTag(&newTag, &smgr->smgr_rlocator.locator, forkNum, blockNum);
@@ -5760,6 +5983,10 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 
 	/* see if the block is in the buffer pool already */
 retry_lookup:
+#ifdef USE_PGRAC_CLUSTER
+	check_ko = cluster_bufmgr_ko_native_read_sample(smgr->smgr_rlocator.locator, forkNum, blockNum,
+													&ko_sample);
+#endif
 	LWLockAcquire(newPartitionLock, LW_SHARED);
 	existing_buf_id = BufTableLookup(&newTag, newHash);
 	if (existing_buf_id >= 0)
@@ -5775,11 +6002,20 @@ retry_lookup:
 		 */
 		buf = GetBufferDescriptor(existing_buf_id);
 
-		pin_result = PinBufferForLookup(buf, strategy);
+#ifdef USE_PGRAC_CLUSTER
+		if (check_ko)
+			pin_result = PinBufferForObjectRead(buf, strategy, &ko_sample);
+		else
+#endif
+			pin_result = PinBufferForLookup(buf, strategy);
 
 		/* Can release the mapping lock as soon as we've pinned it */
 		LWLockRelease(newPartitionLock);
 #ifdef USE_PGRAC_CLUSTER
+		if (pin_result == PIN_BUFFER_LOOKUP_OBJECT_RETRY) {
+			cluster_bufmgr_ko_read_wait();
+			goto retry_lookup;
+		}
 		if (pin_result == PIN_BUFFER_LOOKUP_RETRY)
 		{
 			(void) cluster_bufmgr_resource_x_wait_retry(
@@ -5821,6 +6057,12 @@ retry_lookup:
 	 * buffer.  Remember to unlock the mapping lock while doing the work.
 	 */
 	LWLockRelease(newPartitionLock);
+#ifdef USE_PGRAC_CLUSTER
+	if (check_ko && ko_sample.revision == 0) {
+		cluster_bufmgr_ko_read_wait();
+		goto retry_lookup;
+	}
+#endif
 
 	/*
 	 * Acquire a victim buffer. Somebody else might try to do the same, we
@@ -5866,11 +6108,20 @@ retry_lookup:
 
 		existing_buf_hdr = GetBufferDescriptor(existing_buf_id);
 
-		pin_result = PinBufferForLookup(existing_buf_hdr, strategy);
+#ifdef USE_PGRAC_CLUSTER
+		if (check_ko)
+			pin_result = PinBufferForObjectRead(existing_buf_hdr, strategy, &ko_sample);
+		else
+#endif
+			pin_result = PinBufferForLookup(existing_buf_hdr, strategy);
 
 		/* Can release the mapping lock as soon as we've pinned it */
 		LWLockRelease(newPartitionLock);
 #ifdef USE_PGRAC_CLUSTER
+		if (pin_result == PIN_BUFFER_LOOKUP_OBJECT_RETRY) {
+			cluster_bufmgr_ko_read_wait();
+			goto retry_lookup;
+		}
 		if (pin_result == PIN_BUFFER_LOOKUP_RETRY)
 		{
 			(void) cluster_bufmgr_resource_x_wait_retry(
@@ -5916,6 +6167,21 @@ retry_lookup:
 	Assert(BUF_STATE_GET_REFCOUNT(victim_buf_state) == 1);
 	Assert(!(victim_buf_state & (BM_TAG_VALID | BM_VALID | BM_DIRTY | BM_IO_IN_PROGRESS)));
 
+#ifdef USE_PGRAC_CLUSTER
+	if (check_ko
+		&& !cluster_ko_peer_read_current_v3(&ko_sample, smgr->smgr_rlocator.locator, forkNum,
+											blockNum)) {
+		/* The mapping is still private to mapping-X. Undo it before
+		 * releasing the unused reservation or waiting; no target IO began. */
+		UnlockBufHdr(victim_buf_hdr, victim_buf_state);
+		BufTableDelete(&newTag, newHash);
+		LWLockRelease(newPartitionLock);
+		UnpinBuffer(victim_buf_hdr);
+		StrategyFreeBuffer(victim_buf_hdr);
+		cluster_bufmgr_ko_read_wait();
+		goto retry_lookup;
+	}
+#endif
 	victim_buf_hdr->tag = newTag;
 
 	/*
@@ -5931,6 +6197,10 @@ retry_lookup:
 	UnlockBufHdr(victim_buf_hdr, victim_buf_state);
 
 	LWLockRelease(newPartitionLock);
+#ifdef USE_PGRAC_CLUSTER
+	if (check_ko)
+		cluster_bufmgr_ko_remember_pin(victim_buf_hdr, &ko_sample);
+#endif
 
 	/*
 	 * Buffer contents are currently invalid.  Try to obtain the right to
@@ -5982,6 +6252,9 @@ InvalidateBuffer(BufferDesc *buf)
 	uint32		oldHash;		/* hash value for oldTag */
 	LWLock	   *oldPartitionLock;	/* buffer partition lock for it */
 	uint32		buf_state;
+#ifdef USE_PGRAC_CLUSTER
+	uint64 cleanup_attempt = 0;
+#endif
 
 	/* Save the original buffer tag before dropping the spinlock */
 	oldTag = buf->tag;
@@ -5997,6 +6270,9 @@ InvalidateBuffer(BufferDesc *buf)
 	 */
 	oldHash = BufTableHashCode(&oldTag);
 	oldPartitionLock = BufMappingPartitionLock(oldHash);
+#ifdef USE_PGRAC_CLUSTER
+	cluster_bufmgr_trace_cleanup(buf, "invalidate_enter", 0);
+#endif
 
 retry:
 
@@ -6039,6 +6315,11 @@ retry:
 
 	if (!InvalidateBufferCommitLocked(buf, &oldTag, oldHash, oldPartitionLock, buf_state))
 	{
+#ifdef USE_PGRAC_CLUSTER
+		cleanup_attempt++;
+		if ((cleanup_attempt & (cleanup_attempt - 1)) == 0)
+			cluster_bufmgr_trace_cleanup(buf, "invalidate_retry", cleanup_attempt);
+#endif
 		pg_usleep(1000L);
 		goto retry;
 	}
@@ -6492,10 +6773,13 @@ cluster_bufmgr_cr_publish_v1(Buffer buffer, const BufferCrKey *key, const void *
 	int			head;
 	uint64		generation;
 	bool		reserved;
+	bool check_ko;
+	ClusterKoPeerAdmissionV3 ko_sample;
 
 	if (buffer <= 0 || buffer > NBuffers || page == NULL || !BufferCrKeyValid(key) ||
 		GetPrivateRefCount(buffer) != 1)
 		return false;
+	check_ko = cluster_bufmgr_ko_read_sample(BufTagGetRelFileLocator(&key->tag), &ko_sample);
 	buf = GetBufferDescriptor(buffer - 1);
 	state = LockBufHdr(buf);
 	cluster_pcm_own_eviction_capture_locked(buf, &own);
@@ -6530,6 +6814,15 @@ cluster_bufmgr_cr_publish_v1(Buffer buffer, const BufferCrKey *key, const void *
 	/* As with native BufferAlloc, initialize the descriptor after inserting
 	 * the mapping, before releasing mapping-X. No throwing work follows. */
 	state = LockBufHdr(buf);
+	if (check_ko
+		&& !cluster_ko_peer_admission_current_v3(&ko_sample, BufTagGetRelFileLocator(&tag))) {
+		bool restored = BufTableCRReplaceHead(&tag, hash, generation, buf->buf_id, head);
+		UnlockBufHdr(buf, state);
+		LWLockRelease(partition);
+		if (!restored)
+			elog(PANIC, "read-only buffer chain changed under mapping lock");
+		return false;
+	}
 	buf->tag = tag;
 	buf->buffer_type = BUF_TYPE_CR;
 	buf->pcm_state = PCM_STATE_N;
@@ -6564,12 +6857,15 @@ cluster_bufmgr_cr_copy_v1(const BufferCrKey *key, void *page)
 	BufferDesc *buf;
 	int			id;
 	bool		valid;
+	bool check_ko;
+	ClusterKoPeerAdmissionV3 ko_sample;
 
 	if (page == NULL || !BufferCrKeyValid(key))
 		return false;
 	ReservePrivateRefCountEntry();
 	ResourceOwnerEnlargeBuffers(CurrentResourceOwner);
 	tag = key->tag;
+	check_ko = cluster_bufmgr_ko_read_sample(BufTagGetRelFileLocator(&tag), &ko_sample);
 	hash = BufTableHashCode(&tag);
 	partition = BufMappingPartitionLock(hash);
 	LWLockAcquire(partition, LW_SHARED);
@@ -6585,7 +6881,15 @@ cluster_bufmgr_cr_copy_v1(const BufferCrKey *key, void *page)
 		return false;
 	}
 	buf = GetBufferDescriptor(id);
-	valid = PinBuffer(buf, NULL);
+	if (check_ko) {
+		PinBufferLookupResult pin = PinBufferForObjectRead(buf, NULL, &ko_sample);
+		if (pin == PIN_BUFFER_LOOKUP_RETRY || pin == PIN_BUFFER_LOOKUP_OBJECT_RETRY) {
+			LWLockRelease(partition);
+			return false;
+		}
+		valid = pin == PIN_BUFFER_LOOKUP_VALID;
+	} else
+		valid = PinBuffer(buf, NULL);
 	LWLockRelease(partition);
 	PG_TRY();
 	{
@@ -6799,7 +7103,7 @@ InvalidateBufferCommitTailLocked(BufferDesc *buf, BufferTag *oldTag, uint32 oldH
  * fail-closes with a retryable deny).
  */
 static bool
-InvalidateBufferTry(BufferDesc *buf)
+InvalidateBufferTry(BufferDesc *buf, bool preserve_dirty)
 {
 	BufferTag	oldTag;
 	uint32		oldHash;		/* hash value for oldTag */
@@ -6865,7 +7169,7 @@ InvalidateBufferTry(BufferDesc *buf)
 	 * can arrive after the wrapper staged N. Native relation DROP is separate.
 	 * Author: SqlRush <sqlrush@gmail.com>
 	 */
-	if (cluster_shared_config && cluster_bufmgr_in_gcs_drop
+	if ((preserve_dirty || (cluster_shared_config && cluster_bufmgr_in_gcs_drop))
 		&& (buf_state
 			& (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR | BM_IO_IN_PROGRESS))
 			   != 0) {
@@ -7340,14 +7644,10 @@ ExtendBufferedRelCommon(BufferManagerRelation bmr,
  * shared buffers.
  */
 static BlockNumber
-ExtendBufferedRelShared(BufferManagerRelation bmr,
-						ForkNumber fork,
-						BufferAccessStrategy strategy,
-						uint32 flags,
-						uint32 extend_by,
-						BlockNumber extend_upto,
-						Buffer *buffers,
-						uint32 *extended_by)
+ExtendBufferedRelSharedInternal(BufferManagerRelation bmr, ForkNumber fork,
+								BufferAccessStrategy strategy, uint32 flags, uint32 extend_by,
+								BlockNumber extend_upto, Buffer *buffers, uint32 *extended_by,
+								volatile uint64 *ko_serial)
 {
 	BlockNumber first_block;
 	IOContext	io_context = IOContextForStrategy(strategy);
@@ -7390,6 +7690,7 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	uint32		aux_pin_waits = 0;
 	ClusterSpaceIdentity space_identity;
 	bool		space_reservation = false;
+	bool ko_scoped = ko_serial != NULL;
 
 	if (cluster_relation_extend_lock_enabled && bmr.rel != NULL && cluster_node_id >= 0
 		&& fork == MAIN_FORKNUM && !RecoveryInProgress()
@@ -7594,6 +7895,9 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 
 			PG_TRY();
 			{
+				if (ko_scoped
+					&& !cluster_ko_extend_write_begin_v3(bmr.smgr->smgr_rlocator.locator, fork))
+					elog(ERROR, "shared extension lost its original object owner");
 				if (space_reservation)
 					first_block = cluster_space_reserve(&space_identity, &hwlk, hw_want, &hw_granted);
 				else
@@ -7672,6 +7976,13 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 		else if ((uint64) first_block + extend_by > extend_upto)
 			extend_by = extend_upto - first_block;
 
+#ifdef USE_PGRAC_CLUSTER
+		/* The grant already covers the original request and any parked tail.
+		 * Reducing returned buffers cannot discard its durable reservation. */
+		if (ko_scoped && hwc == CLUSTER_HW_GLOBALIZE)
+			hw_lease_tail += orig_extend_by - extend_by;
+#endif
+
 		for (uint32 i = extend_by; i < orig_extend_by; i++)
 		{
 			BufferDesc *buf_hdr = GetBufferDescriptor(buffers[i] - 1);
@@ -7686,6 +7997,18 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 
 		if (extend_by == 0)
 		{
+#ifdef USE_PGRAC_CLUSTER
+			if (ko_scoped && hw_lease_tail > 0) {
+				/* Materialize this exact newly granted range even when the
+				 * requested end was already satisfied. No buffer is returned. */
+				smgrzeroextend(bmr.smgr, fork, first_block, (int)hw_lease_tail, false);
+				if (ko_scoped
+					&& !cluster_ko_extend_write_done_v3(bmr.smgr->smgr_rlocator.locator, fork))
+					elog(ERROR, "shared extension lost its materialized range owner");
+				cluster_hw_lease_install(bmr.smgr->smgr_rlocator.locator, fork, first_block,
+										 hw_lease_tail);
+			}
+#endif
 			if (!(flags & EB_SKIP_EXTENSION_LOCK))
 				UnlockRelationForExtension(bmr.rel, ExclusiveLock);
 			*extended_by = extend_by;
@@ -7700,6 +8023,13 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 				 errmsg("cannot extend relation %s beyond %u blocks",
 						relpath(bmr.smgr->smgr_rlocator, fork),
 						MaxBlockNumber)));
+
+#ifdef USE_PGRAC_CLUSTER
+	/* The original finite call holds the object reference through every
+	 * mapping/IO publication below, including positional auxiliary extends. */
+	if (ko_scoped && !cluster_ko_extend_write_begin_v3(bmr.smgr->smgr_rlocator.locator, fork))
+		elog(ERROR, "shared extension lost its original object owner");
+#endif
 
 	/*
 	 * Insert buffers into buffer table, mark as IO_IN_PROGRESS.
@@ -7889,6 +8219,8 @@ retry_extend_collision:
 		cluster_hw_lease_install(bmr.smgr->smgr_rlocator.locator, fork,
 								 first_block + extend_by, hw_lease_tail);
 	}
+	if (ko_scoped && !cluster_ko_extend_write_done_v3(bmr.smgr->smgr_rlocator.locator, fork))
+		elog(ERROR, "shared extension lost its materialized range owner");
 #endif
 
 	/*
@@ -7903,6 +8235,18 @@ retry_extend_collision:
 
 	pgstat_count_io_op_time(IOOBJECT_RELATION, io_context, IOOP_EXTEND,
 							io_start, extend_by);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Transfer only after materialization: every returned range buffer now
+	 * has its real tag, pin and IO reference, which the original drain sees.
+	 * Retire the call reference before taking returned content locks; never
+	 * acquire the object lock beneath a buffer header/content lock. */
+	if (ko_scoped) {
+		if (!cluster_ko_extend_end_v3(*ko_serial))
+			elog(ERROR, "shared extension could not hand off its materialized range");
+		*ko_serial = 0;
+	}
+#endif
 
 	/* Set BM_VALID, terminate IO, and wake up any waiters */
 #ifdef USE_PGRAC_CLUSTER
@@ -7973,6 +8317,63 @@ retry_extend_collision:
 	*extended_by = extend_by;
 
 	return first_block;
+}
+
+/* The reference precedes the first target identity read/reservation. Once
+ * the whole range is materialized, the original tagged pins/IO take over
+ * before returned content locks are acquired. No object lock spans current,
+ * WAL or IO. An unmaterialized reservation survives local ERROR for recovery. */
+static BlockNumber
+ExtendBufferedRelShared(BufferManagerRelation bmr, ForkNumber fork, BufferAccessStrategy strategy,
+						uint32 flags, uint32 extend_by, BlockNumber extend_upto, Buffer *buffers,
+						uint32 *extended_by)
+{
+#ifdef USE_PGRAC_CLUSTER
+	RelFileLocator locator = bmr.smgr->smgr_rlocator.locator;
+	BackendId backend = bmr.smgr->smgr_rlocator.backend;
+	BlockNumber first_block;
+	volatile uint64 serial = 0;
+	bool scoped = cluster_enabled && cluster_shared_config
+				  && cluster_interconnect_tier == CLUSTER_IC_TIER_1 && !RecoveryInProgress()
+				  && bmr.relpersistence != RELPERSISTENCE_TEMP
+				  && cluster_smgr_which_for(locator, backend) == 1;
+
+	if (!scoped)
+		return ExtendBufferedRelSharedInternal(bmr, fork, strategy, flags, extend_by, extend_upto,
+											   buffers, extended_by, NULL);
+	if (cluster_ko_extend_active_v3())
+		elog(ERROR, "cannot nest shared extension object owners");
+	for (;;) {
+		bool retry;
+		if (cluster_ko_extend_begin_v3(locator, fork, (uint64 *)&serial, &retry))
+			break;
+		if (!retry)
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+							errmsg("cannot qualify the shared extension object owner")));
+		cluster_bufmgr_ko_read_wait();
+	}
+	PG_TRY();
+	{
+		/* An admission wait may process invalidations. Retain the exact
+		 * locator/backend, never a possibly retired native SMgr pointer. */
+		bmr.smgr = smgropen(locator, backend);
+		first_block = ExtendBufferedRelSharedInternal(bmr, fork, strategy, flags, extend_by,
+													  extend_upto, buffers, extended_by, &serial);
+	}
+	PG_CATCH();
+	{
+		cluster_ko_extend_abort_v3(serial);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (serial != 0 && !cluster_ko_extend_end_v3(serial))
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+						errmsg("shared extension requires its original range recovery")));
+	return first_block;
+#else
+	return ExtendBufferedRelSharedInternal(bmr, fork, strategy, flags, extend_by, extend_upto,
+										   buffers, extended_by, NULL);
+#endif
 }
 
 /*
@@ -8158,6 +8559,46 @@ PinBufferForLookup(BufferDesc *buf, BufferAccessStrategy strategy)
 		? PIN_BUFFER_LOOKUP_VALID : PIN_BUFFER_LOOKUP_INVALID;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* A new read reference is published under the same header lock used by the
+ * object drain. An existing private reference already pins this descriptor;
+ * its original owner must release it before the drain can finish. */
+static PinBufferLookupResult
+PinBufferForObjectRead(BufferDesc *buf, BufferAccessStrategy strategy,
+					   const ClusterKoPeerAdmissionV3 *sample)
+{
+	Buffer b = BufferDescriptorGetBuffer(buf);
+	uint32 state;
+	bool valid;
+
+	if (GetPrivateRefCountEntry(b, true) != NULL)
+		return PinBuffer(buf, strategy) ? PIN_BUFFER_LOOKUP_VALID : PIN_BUFFER_LOOKUP_INVALID;
+	ReservePrivateRefCountEntry();
+	state = LockBufHdr(buf);
+	if (!cluster_ko_peer_read_current_v3(sample, BufTagGetRelFileLocator(&buf->tag),
+										 buf->tag.forkNum, buf->tag.blockNum)) {
+		UnlockBufHdr(buf, state);
+		return PIN_BUFFER_LOOKUP_OBJECT_RETRY;
+	}
+	if (!cluster_pcm_x_aux_pin_admission_allowed(
+			cluster_pcm_is_active(), cluster_bufmgr_should_pcm_track(buf), buf->tag.forkNum,
+			cluster_pcm_own_flags_get(buf->buf_id))) {
+		UnlockBufHdr(buf, state);
+		return PIN_BUFFER_LOOKUP_RETRY;
+	}
+	if (strategy == NULL) {
+		if (BUF_STATE_GET_USAGECOUNT(state) < BM_MAX_USAGE_COUNT)
+			state += BUF_USAGECOUNT_ONE;
+	} else if (BUF_STATE_GET_USAGECOUNT(state) == 0)
+		state += BUF_USAGECOUNT_ONE;
+	valid = (state & BM_VALID) != 0;
+	pg_atomic_write_u32(&buf->state, state);
+	PinBuffer_Locked(buf);
+	cluster_bufmgr_ko_remember_pin(buf, sample);
+	return valid ? PIN_BUFFER_LOOKUP_VALID : PIN_BUFFER_LOOKUP_INVALID;
+}
+#endif
+
 /*
  * PinBuffer -- make buffer unavailable for replacement.
  *
@@ -8328,6 +8769,53 @@ PinBuffer_Locked(BufferDesc *buf)
  * This should be applied only to shared buffers, never local ones.  This
  * always adjusts CurrentResourceOwner.
  */
+#ifdef USE_PGRAC_CLUSTER
+/* Normal UNLOCK retires READ_IMAGE before releasing content. ERROR/FATAL
+ * cleanup uses LWLockReleaseAll instead, so the original last pin must finish
+ * that same non-durable bracket. Its pin preserves the descriptor mapping;
+ * sole shared reference plus content-X excludes another live user. Reuse the
+ * exact generation/token reclaimer, never clear a grant, IO, delivery or
+ * dirty image. Refusal leaves the responsibility visible to normal stop.
+ * No wait, allocation, message, data write or Resource-X grant is introduced.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static void
+cluster_bufmgr_pcm_read_image_last_pin(BufferDesc *buf)
+{
+	ClusterPcmOwnSnapshot published;
+	LWLock *content_lock;
+	uint32 state;
+	uint64 cleared_generation;
+	bool eligible;
+
+	if (!cluster_enabled || !cluster_shared_config || CritSectionCount != 0
+		|| ClusterPcmOwnArray == NULL
+		|| buf->pcm_state != (uint8) PCM_STATE_READ_IMAGE)
+		return;
+	content_lock = BufferDescriptorGetContentLock(buf);
+	if (LWLockHeldByMe(content_lock))
+		return;
+	state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_locked(buf, &published);
+	eligible = BUF_STATE_GET_REFCOUNT(state) == 1
+		&& (state & (BM_TAG_VALID | BM_VALID)) == (BM_TAG_VALID | BM_VALID)
+		&& (state & (BM_DIRTY | BM_IO_IN_PROGRESS | BM_IO_ERROR | BM_PIN_COUNT_WAITER)) == 0
+		&& published.pcm_state == (uint8) PCM_STATE_READ_IMAGE
+		&& published.buffer_type == (uint8) BUF_TYPE_CURRENT
+		&& published.flags == 0 && published.writer_activation_token == 0
+		&& published.resource_x_activation_generation == 0
+		&& cluster_pcm_own_delivery_attempt_get(buf->buf_id) == 0;
+	UnlockBufHdr(buf, state);
+	if (!eligible || !LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE))
+		return;
+	/* A new generation, token, IO interval or delivery cannot be absorbed by
+	 * the original pin. The established reclaimer checks the whole identity
+	 * again under the header lock while content-X remains held. */
+	(void) cluster_pcm_own_reclaim_read_image_exact(buf, &published, &cleared_generation);
+	LWLockRelease(content_lock);
+}
+#endif
+
 static void
 UnpinBuffer(BufferDesc *buf)
 {
@@ -8339,6 +8827,14 @@ UnpinBuffer(BufferDesc *buf)
 	/* not moving as we're likely deleting it soon anyway */
 	ref = GetPrivateRefCountEntry(b, false);
 	Assert(ref != NULL);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Conditional lock acquisition can ERROR at the native held-lock limit.
+	 * Keep both the ResourceOwner pin and private count until it has returned,
+	 * so ordinary abort cleanup can still release this original reference. */
+	if (ref->refcount == 1)
+		cluster_bufmgr_pcm_read_image_last_pin(buf);
+#endif
 
 	ResourceOwnerForgetBuffer(CurrentResourceOwner, b);
 
@@ -9064,8 +9560,9 @@ BgBufferSync(WritebackContext *wb_context)
  *	BUF_REUSABLE: buffer is available for replacement, ie, it has
  *		pin count 0 and usage count 0.
  *
- * (BUF_WRITTEN could be set in error if FlushBuffer finds the buffer clean
- * after locking it, but we don't care all that much.)
+ * The shared cluster path reports only this call's actual DATA write.
+ * The native path can still set BUF_WRITTEN if another writer cleaned the
+ * buffer before FlushBuffer acquired its I/O ownership.
  *
  * Note: caller must have done ResourceOwnerEnlargeBuffers.
  */
@@ -9076,6 +9573,10 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 	int			result = 0;
 	uint32		buf_state;
 	BufferTag	tag;
+#ifdef USE_PGRAC_CLUSTER
+	volatile bool write_attempted = false;
+	bool		observe_write = cluster_enabled && cluster_shared_config;
+#endif
 
 	ReservePrivateRefCountEntry();
 
@@ -9164,13 +9665,37 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 	UnlockBufHdr(bufHdr, buf_state);
 #endif
 
-	FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+#ifdef USE_PGRAC_CLUSTER
+	if (observe_write)
+	{
+		FlushBufferWithAttempt(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
+							   &write_attempted);
+		if (!write_attempted)
+		{
+			/* A deferred dirty image is not available for replacement yet.
+			 * Keep its original checkpoint/IO obligation and caller retry. */
+			buf_state = LockBufHdr(bufHdr);
+			if (buf_state & (BM_DIRTY | BM_IO_IN_PROGRESS))
+				result &= ~BUF_REUSABLE;
+			UnlockBufHdr(bufHdr, buf_state);
+		}
+	}
+	else
+#endif
+		FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 
 	LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
 
 	tag = bufHdr->tag;
 
 	UnpinBuffer(bufHdr);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* FlushBuffer may defer without submitting DATA I/O. Its void return
+	 * cannot consume write budget or enqueue writeback for such an attempt. */
+	if (observe_write && !write_attempted)
+		return result;
+#endif
 
 	/*
 	 * SyncOneBuffer() is only called by checkpointer and bgwriter, so
@@ -10725,6 +11250,247 @@ FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 	pfree(srels);
 }
 
+#ifdef USE_PGRAC_CLUSTER
+bool
+cluster_bufmgr_flush_created_abort_v1(SMgrRelation rel)
+{
+	int i;
+
+	if (rel == NULL || RelFileLocatorBackendIsTemp(rel->smgr_rlocator)
+		|| rel->smgr_which != CLUSTER_SMGR_SMGRSW_INDEX)
+		return false;
+	FlushRelationsAllBuffers(&rel, 1);
+
+	/* A normal flush may skip a retained/fenced image. Never convert its
+	 * return into a claim of clean completion. Ordinary cached-X eviction
+	 * still owns every pin, generation, gate and remote completion check. */
+	for (i = 0; i < NBuffers; i++) {
+		BufferDesc *buf = GetBufferDescriptor(i);
+		uint32 state = LockBufHdr(buf);
+		bool pending = (state & BM_TAG_VALID) != 0
+			&& BufTagMatchesRelFileLocator(&buf->tag, &rel->smgr_rlocator.locator)
+			&& (state & (BM_DIRTY | BM_IO_IN_PROGRESS | BM_IO_ERROR)) != 0;
+
+		UnlockBufHdr(buf, state);
+		if (pending)
+			return false;
+	}
+	return true;
+}
+
+/* A qualified SI or native origin owner resumes the flush/drop walks here.
+ * The cursor counts descriptors, not matches; blocked ownership stays there.
+ * The caller keeps its object fence and performs the original per-fork sync
+ * between the flush and invalidation passes. */
+ClusterBufferDrainResult
+cluster_bufmgr_drain_relation_v3(SMgrRelation smgr, bool flush, uint32 *budget, uint32 *cursor)
+{
+	RelFileLocator locator;
+
+	if (smgr == NULL || budget == NULL || cursor == NULL || *budget == 0 || *budget > 128
+		|| NBuffers <= 0 || *cursor > (uint32)NBuffers || !cluster_shared_config
+		|| RelFileLocatorBackendIsTemp(smgr->smgr_rlocator))
+		return CLUSTER_BUFFER_DRAIN_INVALID;
+	locator = smgr->smgr_rlocator.locator;
+	if (!OidIsValid(locator.spcOid) || !OidIsValid(locator.relNumber))
+		return CLUSTER_BUFFER_DRAIN_INVALID;
+	if (flush)
+		ResourceOwnerEnlargeBuffers(CurrentResourceOwner);
+	while (*budget > 0 && *cursor < (uint32)NBuffers) {
+		BufferDesc *buf = GetBufferDescriptor(*cursor);
+		uint32 state;
+
+		(*budget)--;
+		if (flush)
+			ReservePrivateRefCountEntry();
+		state = LockBufHdr(buf);
+		if (!(state & BM_TAG_VALID) || !BufTagMatchesRelFileLocator(&buf->tag, &locator)) {
+			UnlockBufHdr(buf, state);
+			(*cursor)++;
+			continue;
+		}
+		if (state & (BM_IO_IN_PROGRESS | BM_IO_ERROR)) {
+			UnlockBufHdr(buf, state);
+			return CLUSTER_BUFFER_DRAIN_WAIT;
+		}
+		if (flush) {
+			if (!(state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED))) {
+				UnlockBufHdr(buf, state);
+				(*cursor)++;
+				continue;
+			}
+			if (buf->buffer_type == BUF_TYPE_CR || !(state & BM_VALID)) {
+				UnlockBufHdr(buf, state);
+				return CLUSTER_BUFFER_DRAIN_INVALID;
+			}
+			if (!(state & BM_DIRTY) || !cluster_bufmgr_pcm_aux_pin_admission_locked(buf)) {
+				UnlockBufHdr(buf, state);
+				return CLUSTER_BUFFER_DRAIN_WAIT;
+			}
+			PinBuffer_Locked(buf);
+			if (!LWLockConditionalAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED)) {
+				UnpinBuffer(buf);
+				return CLUSTER_BUFFER_DRAIN_WAIT;
+			}
+			FlushBuffer(buf, smgr, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+			LWLockRelease(BufferDescriptorGetContentLock(buf));
+			UnpinBuffer(buf);
+			state = LockBufHdr(buf);
+			if ((state & BM_TAG_VALID) && BufTagMatchesRelFileLocator(&buf->tag, &locator)
+				&& (state
+					& (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_IN_PROGRESS
+					   | BM_IO_ERROR))) {
+				UnlockBufHdr(buf, state);
+				return CLUSTER_BUFFER_DRAIN_WAIT;
+			}
+			UnlockBufHdr(buf, state);
+		} else {
+			if (state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) {
+				UnlockBufHdr(buf, state);
+				return CLUSTER_BUFFER_DRAIN_REDIRTIED;
+			}
+			/* Native Try repeats pin/dirty checks under mapping-X/header,
+			 * then uses the original exact ownership/eviction commit. */
+			if (!InvalidateBufferTry(buf, true))
+				return CLUSTER_BUFFER_DRAIN_WAIT;
+		}
+		(*cursor)++;
+	}
+	return *cursor == (uint32)NBuffers ? CLUSTER_BUFFER_DRAIN_EMPTY : CLUSTER_BUFFER_DRAIN_MORE;
+}
+/* AM05: remove dead-object bytes under the original mapping/header tuple.
+ * No content bytes are read. Zero pins and no I/O exclude a byte user;
+ * reservations/activation retain their original owner. The immutable KO
+ * tombstone was checked outside these locks and can never reopen this locator.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static bool
+cluster_bufmgr_discard_buffer_v4(BufferDesc *buf)
+{
+	BufferTag tag = buf->tag;
+	ClusterPcmOwnEvictionCapture capture;
+	ClusterPcmOwnResult result;
+	uint32 state = pg_atomic_read_u32(&buf->state), hash;
+	uint32 flags = 0;
+	uint64 generation = 0;
+	LWLock *partition;
+	uint32 delivery = UINT32_MAX;
+	bool fence_sampled = false, fence_matches = false;
+	ClusterKoDiscardDetailV1 detail = {
+		.locator = BufTagGetRelFileLocator(&tag), .forknum = tag.forkNum,
+		.blocknum = tag.blockNum, .slot = buf->buf_id,
+		.source = CLUSTER_KO_DISCARD_BUFFER, .state = state,
+		.refs = BUF_STATE_GET_REFCOUNT(state), .flags = buf->pcm_state,
+		.valid = true
+	};
+
+	cluster_pcm_own_eviction_capture_locked(buf, &capture);
+	detail.revision = capture.generation;
+	UnlockBufHdr(buf, state);
+	hash = BufTableHashCode(&tag);
+	partition = BufMappingPartitionLock(hash);
+	if (!LWLockConditionalAcquire(partition, LW_EXCLUSIVE)) {
+		detail.predicate_mask = 1; /* mapping lock */
+		cluster_ko_origin_discard_detail_v1(&detail);
+		return false;
+	}
+	state = LockBufHdr(buf);
+	detail.state = state;
+	detail.refs = BUF_STATE_GET_REFCOUNT(state);
+	detail.flags = buf->pcm_state;
+	if (!BufferTagsEqual(&tag, &buf->tag)) {
+		UnlockBufHdr(buf, state);
+		LWLockRelease(partition);
+		return true;
+	}
+	if (BUF_STATE_GET_REFCOUNT(state) != 0 || (state & (BM_IO_IN_PROGRESS | BM_IO_ERROR)) != 0
+		|| capture.generation == 0 || (delivery = cluster_pcm_own_delivery_attempt_get(buf->buf_id)) != 0
+		|| (buf->pcm_state != PCM_STATE_N && buf->pcm_state != PCM_STATE_S
+			&& buf->pcm_state != PCM_STATE_X)
+		|| !(fence_sampled = true, fence_matches = cluster_pcm_own_fence_matches_locked(buf, &capture))
+		|| (buf->buffer_type != BUF_TYPE_CURRENT && buf->buffer_type != BUF_TYPE_PI
+			&& buf->buffer_type != BUF_TYPE_CR && buf->buffer_type != BUF_TYPE_SCUR
+			&& buf->buffer_type != BUF_TYPE_XCUR)) {
+		/* First rejected term, with the original short-circuit probe order.
+		 * 2=pin, 4=I/O, 8=generation, 16=delivery, 32=PCM, 64=fence, 128=type. */
+		detail.state = state;
+		detail.refs = BUF_STATE_GET_REFCOUNT(state);
+		detail.flags = buf->pcm_state;
+		detail.value = delivery;
+		detail.predicate_mask = detail.refs != 0 ? 2
+			: (state & (BM_IO_IN_PROGRESS | BM_IO_ERROR)) != 0 ? 4
+			: capture.generation == 0 ? 8 : delivery != 0 ? 16
+			: (buf->pcm_state != PCM_STATE_N && buf->pcm_state != PCM_STATE_S
+				&& buf->pcm_state != PCM_STATE_X) ? 32
+			: fence_sampled && !fence_matches ? 64 : 128;
+		if (detail.refs != 0)
+			detail.value2 = GetPrivateRefCount(BufferDescriptorGetBuffer(buf));
+		cluster_ko_origin_discard_detail_v1(&detail);
+		UnlockBufHdr(buf, state);
+		LWLockRelease(partition);
+		return false;
+	}
+	/* SCUR/XCUR are native current-copy labels, retained even after release.
+	 * The original PCM/fence capture above, rather than the hint label, owns
+	 * the eviction. CR has a separate read-only version-chain mapping tail. */
+	if (buf->buffer_type == BUF_TYPE_CR) {
+		bool complete = InvalidateBufferCommitLocked(buf, &tag, hash, partition, state);
+		if (!complete) {
+			detail.predicate_mask = 1024; /* CR mapping tail */
+			cluster_ko_origin_discard_detail_v1(&detail);
+		}
+		return complete;
+	}
+	if (BufTableLookup(&tag, hash) != buf->buf_id) {
+		detail.predicate_mask = 256; /* mapping identity */
+		cluster_ko_origin_discard_detail_v1(&detail);
+		UnlockBufHdr(buf, state);
+		LWLockRelease(partition);
+		return false;
+	}
+	result = cluster_pcm_own_eviction_commit_locked(buf, &capture, &generation, &flags);
+	if (result != CLUSTER_PCM_OWN_OK) {
+		detail.predicate_mask = 512; /* original eviction result */
+		detail.value = result;
+		cluster_ko_origin_discard_detail_v1(&detail);
+		UnlockBufHdr(buf, state);
+		LWLockRelease(partition);
+		return false;
+	}
+	/* The old incarnation is dead: do not publish another live PI or send an
+	 * X release. Descriptor refs alone end here; directory/local owners still
+	 * block READY until their original exact consumers finish. */
+	InvalidateBufferCommitTailLocked(buf, &tag, hash, partition, state, PCM_STATE_N, false);
+	return true;
+}
+
+ClusterBufferDrainResult
+cluster_bufmgr_discard_relation_v4(RelFileLocator locator, uint32 *budget, uint32 *cursor)
+{
+	if (budget == NULL || cursor == NULL || *budget == 0 || *budget > 128
+		|| NBuffers <= 0 || *cursor > (uint32)NBuffers
+		|| !cluster_ko_local_drop_discard_current_v4(locator))
+		return CLUSTER_BUFFER_DRAIN_INVALID;
+	while (*budget > 0 && *cursor < (uint32)NBuffers) {
+		BufferDesc *buf = GetBufferDescriptor(*cursor);
+		uint32 state;
+
+		(*budget)--;
+		state = LockBufHdr(buf);
+		if (!(state & BM_TAG_VALID) || !BufTagMatchesRelFileLocator(&buf->tag, &locator)) {
+			UnlockBufHdr(buf, state);
+			(*cursor)++;
+			continue;
+		}
+		if (!cluster_bufmgr_discard_buffer_v4(buf))
+			return CLUSTER_BUFFER_DRAIN_WAIT;
+		(*cursor)++;
+	}
+	return *cursor == (uint32)NBuffers ? CLUSTER_BUFFER_DRAIN_EMPTY : CLUSTER_BUFFER_DRAIN_MORE;
+}
+
+#endif
+
 /* ---------------------------------------------------------------------
  *		RelationCopyStorageUsingBuffer
  *
@@ -10753,7 +11519,19 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 #ifdef USE_PGRAC_CLUSTER
 	bool		versioned_copy = false;
 	ClusterSpaceIdentity copy_identity;
+	uint64 copy_serial = 0;
 #endif
+
+	/*
+	 * The buffered builder is an independent physical producer.  Apply the
+	 * same transaction/object eligibility gate as RelationCopyStorage before
+	 * reading the source size or extending the destination.  In particular,
+	 * an internal DDL subtransaction must not create a destination fork and
+	 * only fail later in its SPACE/WAL owner.  The gate is a no-op for private,
+	 * temporary, and disabled storage, preserving their native semantics.
+	 */
+	RelationCheckStorageTransaction(
+		dstlocator, permanent ? RELPERSISTENCE_PERMANENT : RELPERSISTENCE_UNLOGGED, "copy");
 
 	/*
 	 * In general, we want to write WAL whenever wal_level > 'minimal', but we
@@ -10775,83 +11553,118 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 		return;
 
 #ifdef USE_PGRAC_CLUSTER
-	if (cluster_shared_config && permanent &&
-		cluster_smgr_which_for(dstlocator, InvalidBackendId) == 1)
+	versioned_copy = cluster_shared_config && permanent
+					 && cluster_smgr_which_for(dstlocator, InvalidBackendId) == 1;
+	if (versioned_copy
+		&& !cluster_ko_buffer_copy_begin_v3(dstlocator, forkNum, nblocks, &copy_serial))
+		elog(ERROR, "buffer copy conflicts with object drain");
+	/* The serial is fixed before setjmp. ERROR may still hold native buffer
+	 * locks; only expire permission here, retaining original cleanup ownership. */
+	PG_TRY();
 	{
-		/* PGRAC: SPACE access precedes ordinary content locks. Reopen the
-		 * destination by value afterward; the read may invalidate handles. */
-		if (!use_wal || (forkNum != MAIN_FORKNUM && forkNum != FSM_FORKNUM &&
-						 forkNum != VISIBILITYMAP_FORKNUM) ||
-			!cluster_space_relation_read_identity(dstlocator, &copy_identity))
-			elog(ERROR, "cannot bind new buffer copy to exact SPACE identity");
-		if (smgrnblocks(smgropen(dstlocator, InvalidBackendId), forkNum) != 0)
-			elog(ERROR, "versioned buffer copy requires an empty destination fork");
-		if (forkNum == MAIN_FORKNUM && !cluster_space_reserve_exact(&copy_identity, 0, nblocks))
-			elog(ERROR, "cannot reserve new buffer copy block range");
-		versioned_copy = true;
-	}
+		if (versioned_copy) {
+			/* PGRAC: SPACE access precedes ordinary content locks. Reopen the
+			 * destination by value afterward; the read may invalidate handles. */
+			if (!cluster_ko_create_write_begin_v3(dstlocator, copy_serial) || !use_wal
+				|| (forkNum != MAIN_FORKNUM && forkNum != FSM_FORKNUM
+					&& forkNum != VISIBILITYMAP_FORKNUM)
+				|| !cluster_space_relation_read_identity(dstlocator, &copy_identity))
+				elog(ERROR, "cannot bind new buffer copy to exact SPACE identity");
+			if (smgrnblocks(smgropen(dstlocator, InvalidBackendId), forkNum) != 0)
+				elog(ERROR, "versioned buffer copy requires an empty destination fork");
+			if (!cluster_ko_create_write_begin_v3(dstlocator, copy_serial))
+				elog(ERROR, "buffer copy lost object drain owner before reservation");
+			if (forkNum == MAIN_FORKNUM && !cluster_space_reserve_exact(&copy_identity, 0, nblocks))
+				elog(ERROR, "cannot reserve new buffer copy block range");
+		}
 #endif
 
-	/*
-	 * Bulk extend the destination relation of the same size as the source
-	 * relation before starting to copy block by block.
-	 */
-	memset(buf.data, 0, BLCKSZ);
-	smgrextend(smgropen(dstlocator, InvalidBackendId), forkNum, nblocks - 1,
-			   buf.data, true);
+		/*
+		 * Bulk extend the destination relation of the same size as the source
+		 * relation before starting to copy block by block.
+		 */
+		memset(buf.data, 0, BLCKSZ);
+#ifdef USE_PGRAC_CLUSTER
+		if (copy_serial != 0 && !cluster_ko_create_write_begin_v3(dstlocator, copy_serial))
+			elog(ERROR, "buffer copy lost object drain owner before extension");
+#endif
+		smgrextend(smgropen(dstlocator, InvalidBackendId), forkNum, nblocks - 1, buf.data, true);
 
-	/* This is a bulk operation, so use buffer access strategies. */
-	bstrategy_src = GetAccessStrategy(BAS_BULKREAD);
-	bstrategy_dst = GetAccessStrategy(BAS_BULKWRITE);
+		/* This is a bulk operation, so use buffer access strategies. */
+		bstrategy_src = GetAccessStrategy(BAS_BULKREAD);
+		bstrategy_dst = GetAccessStrategy(BAS_BULKWRITE);
 
-	/* Iterate over each block of the source relation file. */
-	for (blkno = 0; blkno < nblocks; blkno++)
-	{
-		CHECK_FOR_INTERRUPTS();
-
-		/* Read block from source relation. */
-		srcBuf = ReadBufferWithoutRelcache(srclocator, forkNum, blkno,
-										   RBM_NORMAL, bstrategy_src,
-										   permanent);
-		LockBuffer(srcBuf, BUFFER_LOCK_SHARE);
-		srcPage = BufferGetPage(srcBuf);
-
-		dstBuf = ReadBufferWithoutRelcache(dstlocator, forkNum, blkno,
-										   RBM_ZERO_AND_LOCK, bstrategy_dst,
-										   permanent);
-		dstPage = BufferGetPage(dstBuf);
+		/* Iterate over each block of the source relation file. */
+		for (blkno = 0; blkno < nblocks; blkno++) {
+#ifdef USE_PGRAC_CLUSTER
+			ClusterKoCurrentAdmissionV3 copy_admission;
+#endif
+			CHECK_FOR_INTERRUPTS();
 
 #ifdef USE_PGRAC_CLUSTER
-		if (versioned_copy)
-		{
-			/* PGRAC: bulk extension created an actual zero-page predecessor,
-			 * not an absent block. Keep both native content locks until the
-			 * new version/FPI and dirty destination are published together. */
-			if (!cluster_space_copy_buffer_wal(&copy_identity, srcPage, dstBuf))
-				elog(ERROR, "cannot WAL-log new SPACE buffer version");
-		}
-		else
+			/* Select only this original destination before taking either native
+			 * pin/content lock. Current acquisition still uses the original proof. */
+			if (copy_serial != 0
+				&& !cluster_ko_buffer_copy_target_v3(dstlocator, copy_serial, forkNum, blkno,
+													 &copy_admission))
+				elog(ERROR, "buffer copy lost exact object drain target");
 #endif
-		{
-			START_CRIT_SECTION();
 
-			/* Copy page data from the source to the destination. */
-			memcpy(dstPage, srcPage, BLCKSZ);
-			MarkBufferDirty(dstBuf);
+			/* Read block from source relation. */
+			srcBuf = ReadBufferWithoutRelcache(srclocator, forkNum, blkno, RBM_NORMAL,
+											   bstrategy_src, permanent);
+			LockBuffer(srcBuf, BUFFER_LOCK_SHARE);
+			srcPage = BufferGetPage(srcBuf);
 
-			/* WAL-log the copied page. */
-			if (use_wal)
-				log_newpage_buffer(dstBuf, true);
+			dstBuf = ReadBufferWithoutRelcache(dstlocator, forkNum, blkno, RBM_ZERO_AND_LOCK,
+											   bstrategy_dst, permanent);
+			dstPage = BufferGetPage(dstBuf);
 
-			END_CRIT_SECTION();
+#ifdef USE_PGRAC_CLUSTER
+			if (versioned_copy) {
+				/* Atomic/local consumption only: do not take the KO/CONTROL locks
+				 * below content locks after a buffer/current wait. */
+				if (!cluster_ko_peer_current_valid_v3(&copy_admission, dstlocator, forkNum, blkno))
+					elog(ERROR, "buffer copy lost object drain admission before WAL");
+				/* PGRAC: bulk extension created an actual zero-page predecessor,
+				 * not an absent block. Keep both native content locks until the
+				 * new version/FPI and dirty destination are published together. */
+				if (!cluster_space_copy_buffer_wal(&copy_identity, srcPage, dstBuf))
+					elog(ERROR, "cannot WAL-log new SPACE buffer version");
+			} else
+#endif
+			{
+				START_CRIT_SECTION();
+
+				/* Copy page data from the source to the destination. */
+				memcpy(dstPage, srcPage, BLCKSZ);
+				MarkBufferDirty(dstBuf);
+
+				/* WAL-log the copied page. */
+				if (use_wal)
+					log_newpage_buffer(dstBuf, true);
+
+				END_CRIT_SECTION();
+			}
+
+			UnlockReleaseBuffer(dstBuf);
+			UnlockReleaseBuffer(srcBuf);
 		}
 
-		UnlockReleaseBuffer(dstBuf);
-		UnlockReleaseBuffer(srcBuf);
+		FreeAccessStrategy(bstrategy_src);
+		FreeAccessStrategy(bstrategy_dst);
+#ifdef USE_PGRAC_CLUSTER
 	}
-
-	FreeAccessStrategy(bstrategy_src);
-	FreeAccessStrategy(bstrategy_dst);
+	PG_CATCH();
+	{
+		cluster_ko_create_abort_v3(copy_serial);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	/* Dirty/current/IO obligations remain with their original owners. */
+	if (copy_serial != 0 && !cluster_ko_create_end_v3(copy_serial, true))
+		elog(ERROR, "buffer copy cannot retire object drain owner");
+#endif
 }
 
 /* ---------------------------------------------------------------------
@@ -10899,14 +11712,49 @@ CreateAndCopyRelationData(RelFileLocator src_rlocator,
 #endif
 		if (smgrexists(smgropen(src_rlocator, InvalidBackendId), forkNum))
 		{
-			smgrcreate(smgropen(dst_rlocator, InvalidBackendId), forkNum, false);
+#ifdef USE_PGRAC_CLUSTER
+			uint64 fork_serial = 0;
+			bool fork_scoped = cluster_enabled && cluster_shared_config
+							   && cluster_interconnect_tier == CLUSTER_IC_TIER_1
+							   && !RecoveryInProgress()
+							   && cluster_smgr_which_for(dst_rlocator, InvalidBackendId) == 1;
 
-			/*
+			/* MAIN creation and the data copy have separate finite owners.
+			 * Keep this native fork constructor visible between those calls. */
+			if (fork_scoped && !cluster_ko_create_begin_v3(dst_rlocator, &fork_serial))
+				elog(ERROR, "auxiliary fork creation conflicts with object drain");
+			PG_TRY();
+			{
+				if (fork_serial != 0
+					&& !cluster_ko_create_write_begin_v3(dst_rlocator, fork_serial))
+					elog(ERROR, "auxiliary fork creation lost its original owner");
+#endif
+				smgrcreate(smgropen(dst_rlocator, InvalidBackendId), forkNum, false);
+
+				/*
 			 * WAL log creation if the relation is persistent, or this is the
 			 * init fork of an unlogged relation.
 			 */
-			if (permanent || forkNum == INIT_FORKNUM)
-				log_smgrcreate(&dst_rlocator, forkNum);
+#ifdef USE_PGRAC_CLUSTER
+				if (fork_serial != 0 && (permanent || forkNum == INIT_FORKNUM)
+					&& !cluster_ko_create_write_begin_v3(dst_rlocator, fork_serial))
+					elog(ERROR, "auxiliary fork creation lost its owner before WAL");
+#endif
+				if (permanent || forkNum == INIT_FORKNUM)
+					log_smgrcreate(&dst_rlocator, forkNum);
+#ifdef USE_PGRAC_CLUSTER
+			}
+			PG_CATCH();
+			{
+				cluster_ko_create_abort_v3(fork_serial);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+			/* File/WAL obligations remain with their original owners. The
+			 * following data-copy call must qualify its own finite scope. */
+			if (fork_serial != 0 && !cluster_ko_create_end_v3(fork_serial, true))
+				elog(ERROR, "auxiliary fork creation cannot retire its original owner");
+#endif
 
 			/* Copy a fork's data, block by block. */
 			RelationCopyStorageUsingBuffer(src_rlocator, dst_rlocator, forkNum,
@@ -11069,6 +11917,11 @@ struct ClusterPageDataReceiptV1 {
 	const ClusterThreadRecoveryFabricPlanV1 *space_plan;
 	uint32 space_operation;
 	bool space_terminal;
+	/* Ordinary storage observations keep their complete immutable input.
+	 * Imported storage facts must bind it before physical PI consumption. */
+	const ClusterThreadRecoveryFabricPlanV1 *storage_plan;
+	const ClusterPiWritebackNoticeV1 *notice;
+	uint32 notice_index;
 };
 
 /* A structural receipt remains owned by the original completed KO slot.
@@ -11231,10 +12084,12 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 	volatile bool io_started = false;
 	volatile bool data_locked = false;
 	volatile bool complete = false;
+	volatile bool physical_cleanup_complete = false;
 	bool space_target, identity_target;
 	PGAlignedBlock expected, disk;
 	uint64 space_token;
 	ClusterPageDataReceiptV1 *receipt;
+	ClusterKoDirectoryIoV3 io;
 
 	if (target == NULL || out == NULL || *out != NULL || CurrentResourceOwner == NULL
 		|| !cluster_enabled || !cluster_shared_config || RecoveryInProgress()
@@ -11271,136 +12126,150 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 			|| !BufferTagsEqual(&write_cut.holder.assertion.resource, &data_tag))
 			return false;
 	}
+	if (!cluster_ko_directory_io_begin_v3(key.locator, &io))
+		return false;
+	/* The original call also owns receipt construction/publication. Keep
+	 * buffer cleanup inside it; an unfinished cleanup must retain ownership. */
 	PG_TRY();
 	{
-		do {
-			PageHeader header;
-			SMgrRelation rel;
-			uint16 stored_checksum;
-			int page_origin;
+		PG_TRY();
+		{
+			do {
+				PageHeader header;
+				SMgrRelation rel;
+				uint16 stored_checksum;
+				int page_origin;
 
-			space = cluster_page_data_try_hold(space_tag, identity_target, &space_owner);
-			if (space == NULL
-				|| !cluster_space_identity_page_decode(BufHdrGetBlock(space), BLCKSZ, SPACE_FORKNUM,
-													   0, &key, &space_identity, &space_token)
-				|| (!space_target && space_identity.state != CLUSTER_SPACE_IDENTITY_LIVE)
-				|| (!sample_identity
-					&& memcmp(space_identity.incarnation, target->version.segment_incarnation, 16)
-						   != 0))
-				break;
-			if (identity_target) {
-				data = space;
-				data_owner = space_owner;
-			} else
-				data = cluster_page_data_try_hold(data_tag, true, &data_owner);
-			data_locked = data != NULL;
-			if (data == NULL
-				|| (cut != NULL
-					&& data_owner.generation != write_cut.holder.requester_target_generation)
-				|| !cluster_page_wal_read_v1(BufferDescriptorGetBuffer(data), &space_identity,
-											 &binding)
-				|| (!cluster_page_data_source_same(&source, &binding.source)
-					&& (binding.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0))
-				break;
-			if (sample_current)
-				written_target.version = binding.version;
-			memcpy(expected.data, BufHdrGetBlock(data), BLCKSZ);
-			header = (PageHeader)expected.data;
-			if (PageIsNew(expected.data) || PageGetPageSize(expected.data) != BLCKSZ
-				|| PageGetPageLayoutVersion(expected.data) != PG_PAGE_LAYOUT_VERSION
-				|| (header->pd_flags & (~PD_VALID_FLAG_BITS | PD_UNDO_SEG_HEADER)) != 0
-				|| (!space_target && (header->pd_flags & PD_SPACE_METADATA) != 0)
-				|| header->pd_lower < SizeOfPageHeaderData || header->pd_lower > header->pd_upper
-				|| header->pd_upper > header->pd_special || header->pd_special > BLCKSZ
-				|| header->pd_block_scn != written_target.version.mutation_token
-				|| !PageGetLSNOrigin(expected.data, &page_origin)
-				|| page_origin != binding.source.claim.identity.origin_thread_id - 1
-				|| XLogRecPtrIsInvalid(PageGetLSN(expected.data))
-				|| ((binding.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
-					&& PageGetLSN(expected.data) > GetXLogInsertRecPtr()))
-				break;
-			/* A transportable completion includes the original WAL certificate,
-			 * including when the current buffer was already clean. Never certify
-			 * foreign WAL through the receiver's Flush pointer. */
-			if (sample_identity && !cluster_page_wal_flush_source_v1(&binding, &binding))
-				break;
-			rel = smgropen(key.locator, InvalidBackendId);
-			FlushBufferWithRecovery(data, rel, IOOBJECT_RELATION, IOCONTEXT_NORMAL, NULL,
-									&io_started, &binding, NULL);
-			if (!cluster_page_data_holder_ready(data, &data_tag, true, &live)
-				|| !cluster_pcm_own_fence_equal_exact(&data_owner, &live)
-				|| (live.semantic_buf_state & (BM_DIRTY | BM_JUST_DIRTIED)) != 0)
-				break;
-			/* The native write consumed a stable snapshot. Keep the raw pin
-			 * and SPACE identity owner, but let foreground current writers run
-			 * during fork fsync/readback. Reacquire without waiting below.
-			 * SPACE0 itself owns the identity lock and must retain that single
-			 * hold; neither reacquire it recursively nor release it twice. */
-			if (!identity_target) {
-				LWLockRelease(BufferDescriptorGetContentLock(data));
-				data_locked = false;
+				space = cluster_page_data_try_hold(space_tag, identity_target, &space_owner);
+				if (space == NULL
+					|| !cluster_space_identity_page_decode(BufHdrGetBlock(space), BLCKSZ, SPACE_FORKNUM,
+														   0, &key, &space_identity, &space_token)
+					|| (!space_target && space_identity.state != CLUSTER_SPACE_IDENTITY_LIVE)
+					|| (!sample_identity
+						&& memcmp(space_identity.incarnation, target->version.segment_incarnation, 16)
+							   != 0))
+					break;
+				if (identity_target) {
+					data = space;
+					data_owner = space_owner;
+				} else
+					data = cluster_page_data_try_hold(data_tag, true, &data_owner);
+				data_locked = data != NULL;
+				if (data == NULL
+					|| (cut != NULL
+						&& data_owner.generation != write_cut.holder.requester_target_generation)
+					|| !cluster_page_wal_read_v1(BufferDescriptorGetBuffer(data), &space_identity,
+												 &binding)
+					|| (!cluster_page_data_source_same(&source, &binding.source)
+						&& (binding.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0))
+					break;
+				if (sample_current)
+					written_target.version = binding.version;
+				memcpy(expected.data, BufHdrGetBlock(data), BLCKSZ);
+				header = (PageHeader)expected.data;
+				if (PageIsNew(expected.data) || PageGetPageSize(expected.data) != BLCKSZ
+					|| PageGetPageLayoutVersion(expected.data) != PG_PAGE_LAYOUT_VERSION
+					|| (header->pd_flags & (~PD_VALID_FLAG_BITS | PD_UNDO_SEG_HEADER)) != 0
+					|| (!space_target && (header->pd_flags & PD_SPACE_METADATA) != 0)
+					|| header->pd_lower < SizeOfPageHeaderData || header->pd_lower > header->pd_upper
+					|| header->pd_upper > header->pd_special || header->pd_special > BLCKSZ
+					|| header->pd_block_scn != written_target.version.mutation_token
+					|| !PageGetLSNOrigin(expected.data, &page_origin)
+					|| page_origin != binding.source.claim.identity.origin_thread_id - 1
+					|| XLogRecPtrIsInvalid(PageGetLSN(expected.data))
+					|| ((binding.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
+						&& PageGetLSN(expected.data) > GetXLogInsertRecPtr()))
+					break;
+				/* A transportable completion includes the original WAL certificate,
+				 * including when the current buffer was already clean. Never certify
+				 * foreign WAL through the receiver's Flush pointer. */
+				if (sample_identity && !cluster_page_wal_flush_source_v1(&binding, &binding))
+					break;
+				rel = smgropen(key.locator, InvalidBackendId);
+				FlushBufferWithRecovery(data, rel, IOOBJECT_RELATION, IOCONTEXT_NORMAL, NULL,
+										&io_started, &binding, NULL);
+				if (!cluster_page_data_holder_ready(data, &data_tag, true, &live)
+					|| !cluster_pcm_own_fence_equal_exact(&data_owner, &live)
+					|| (live.semantic_buf_state & (BM_DIRTY | BM_JUST_DIRTIED)) != 0)
+					break;
+				/* The native write consumed a stable snapshot. Keep the raw pin
+				 * and SPACE identity owner, but let foreground current writers run
+				 * during fork fsync/readback. Reacquire without waiting below.
+				 * SPACE0 itself owns the identity lock and must retain that single
+				 * hold; neither reacquire it recursively nor release it twice. */
+				if (!identity_target) {
+					LWLockRelease(BufferDescriptorGetContentLock(data));
+					data_locked = false;
+				}
+				smgrimmedsync(rel, target->identity.forknum);
+				smgrread(rel, target->identity.forknum, target->identity.blockno, disk.data);
+				/* Never let ignore_checksum_failure qualify physical DATA. Check
+				 * PageIsNew before computing checksums (native checksum asserts). */
+				if (PageIsNew(disk.data))
+					break;
+				stored_checksum = ((PageHeader)disk.data)->pd_checksum;
+				PageSetChecksumInplace(disk.data, target->identity.blockno);
+				if (DataChecksumsEnabled() && stored_checksum != ((PageHeader)disk.data)->pd_checksum)
+					break;
+				header->pd_checksum = ((PageHeader)disk.data)->pd_checksum = 0;
+				if (memcmp(expected.data, disk.data, BLCKSZ) != 0
+					|| (!data_locked
+						&& !LWLockConditionalAcquire(BufferDescriptorGetContentLock(data), LW_SHARED)))
+					break;
+				data_locked = true;
+				if (!cluster_page_data_holder_ready(data, &data_tag, true, &live)
+					|| !cluster_pcm_own_fence_equal_exact(&data_owner, &live)
+					|| (live.semantic_buf_state & (BM_DIRTY | BM_JUST_DIRTIED)) != 0
+					|| !cluster_page_wal_read_v1(BufferDescriptorGetBuffer(data), &space_identity,
+												 &reobserved)
+					|| !cluster_page_wal_same_mutation_v1(&binding, &reobserved)
+					|| !cluster_page_data_holder_ready(space, &space_tag, false, &live)
+					|| !cluster_pcm_own_fence_equal_exact(&space_owner, &live)
+					|| !cluster_wal_thread_current_v2_ref(&current)
+					|| !cluster_page_data_source_same(&source, &current))
+					break;
+				complete = true;
+			} while (false);
+		}
+		PG_FINALLY();
+		{
+			error_context_stack = saved_context;
+			if (io_started)
+				AbortBufferIO(BufferDescriptorGetBuffer(data));
+			if (data != NULL && data != space) {
+				/* elog(ERROR) reset holdoffs, but these exact locks remain ours. */
+				if (data_locked) {
+					if (InterruptHoldoffCount == 0)
+						HOLD_INTERRUPTS();
+					LWLockRelease(BufferDescriptorGetContentLock(data));
+				}
+				cluster_bufmgr_unpin_for_gcs(data);
 			}
-			smgrimmedsync(rel, target->identity.forknum);
-			smgrread(rel, target->identity.forknum, target->identity.blockno, disk.data);
-			/* Never let ignore_checksum_failure qualify physical DATA. Check
-			 * PageIsNew before computing checksums (native checksum asserts). */
-			if (PageIsNew(disk.data))
-				break;
-			stored_checksum = ((PageHeader)disk.data)->pd_checksum;
-			PageSetChecksumInplace(disk.data, target->identity.blockno);
-			if (DataChecksumsEnabled() && stored_checksum != ((PageHeader)disk.data)->pd_checksum)
-				break;
-			header->pd_checksum = ((PageHeader)disk.data)->pd_checksum = 0;
-			if (memcmp(expected.data, disk.data, BLCKSZ) != 0
-				|| (!data_locked
-					&& !LWLockConditionalAcquire(BufferDescriptorGetContentLock(data), LW_SHARED)))
-				break;
-			data_locked = true;
-			if (!cluster_page_data_holder_ready(data, &data_tag, true, &live)
-				|| !cluster_pcm_own_fence_equal_exact(&data_owner, &live)
-				|| (live.semantic_buf_state & (BM_DIRTY | BM_JUST_DIRTIED)) != 0
-				|| !cluster_page_wal_read_v1(BufferDescriptorGetBuffer(data), &space_identity,
-											 &reobserved)
-				|| !cluster_page_wal_same_mutation_v1(&binding, &reobserved)
-				|| !cluster_page_data_holder_ready(space, &space_tag, false, &live)
-				|| !cluster_pcm_own_fence_equal_exact(&space_owner, &live)
-				|| !cluster_wal_thread_current_v2_ref(&current)
-				|| !cluster_page_data_source_same(&source, &current))
-				break;
-			complete = true;
-		} while (false);
+			if (space != NULL) {
+				if (InterruptHoldoffCount == 0)
+					HOLD_INTERRUPTS();
+				LWLockRelease(BufferDescriptorGetContentLock(space));
+				cluster_bufmgr_unpin_for_gcs(space);
+			}
+			physical_cleanup_complete = true;
+		}
+		PG_END_TRY();
+		if (complete) {
+			receipt = palloc0(sizeof(*receipt));
+			receipt->magic = UINT64_C(0x5047444154413031);
+			receipt->target = written_target;
+			receipt->wal = binding;
+			receipt->pi_cut = write_cut;
+			*out = receipt;
+		}
 	}
 	PG_FINALLY();
 	{
-		error_context_stack = saved_context;
-		if (io_started)
-			AbortBufferIO(BufferDescriptorGetBuffer(data));
-		if (data != NULL && data != space) {
-			/* elog(ERROR) reset holdoffs, but these exact locks remain ours. */
-			if (data_locked) {
-				if (InterruptHoldoffCount == 0)
-					HOLD_INTERRUPTS();
-				LWLockRelease(BufferDescriptorGetContentLock(data));
-			}
-			cluster_bufmgr_unpin_for_gcs(data);
-		}
-		if (space != NULL) {
-			if (InterruptHoldoffCount == 0)
-				HOLD_INTERRUPTS();
-			LWLockRelease(BufferDescriptorGetContentLock(space));
-			cluster_bufmgr_unpin_for_gcs(space);
-		}
+		if (physical_cleanup_complete)
+			(void)cluster_ko_directory_io_end_v3(&io);
 	}
 	PG_END_TRY();
-	if (!complete)
-		return false;
-	receipt = palloc0(sizeof(*receipt));
-	receipt->magic = UINT64_C(0x5047444154413031);
-	receipt->target = written_target;
-	receipt->wal = binding;
-	receipt->pi_cut = write_cut;
-	*out = receipt;
-	return true;
+	return complete;
 }
 
 bool
@@ -11479,6 +12348,7 @@ cluster_page_data_from_remote_v1(const ClusterPiDataV1 *job, ClusterPageDataRece
 	ClusterPageWalBindingV1 binding;
 	ClusterPcmPiWriteCutV1 cut;
 	ClusterPageDataReceiptV1 *receipt;
+	ClusterKoDirectoryIoV3 io;
 	BufferTag tag;
 	if (out == NULL || *out != NULL || !cluster_pi_data_read_v1(job, &binding, &cut)
 		|| !cluster_page_wal_binding_shape_v1(&binding)
@@ -11491,14 +12361,24 @@ cluster_page_data_from_remote_v1(const ClusterPiDataV1 *job, ClusterPageDataRece
 				  binding.identity.blockno);
 	if (!BufferTagsEqual(&tag, &cut.holder.assertion.resource))
 		return false;
-	receipt = palloc0(sizeof(*receipt));
-	receipt->magic = UINT64_C(0x5047444154413031);
-	receipt->target.database_incarnation = binding.source.claim.database_incarnation;
-	receipt->target.identity = binding.identity;
-	receipt->target.version = binding.version;
-	receipt->wal = binding;
-	receipt->pi_cut = cut;
-	*out = receipt;
+	if (!cluster_ko_directory_io_begin_v3(binding.identity.locator, &io))
+		return false;
+	PG_TRY();
+	{
+		receipt = palloc0(sizeof(*receipt));
+		receipt->magic = UINT64_C(0x5047444154413031);
+		receipt->target.database_incarnation = binding.source.claim.database_incarnation;
+		receipt->target.identity = binding.identity;
+		receipt->target.version = binding.version;
+		receipt->wal = binding;
+		receipt->pi_cut = cut;
+		*out = receipt;
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
 	return true;
 }
 
@@ -11552,18 +12432,31 @@ cluster_page_data_from_notice_v1(const ClusterPiWritebackNoticeV1 *notice, uint3
 {
 	ClusterPiDataFactV1 fact;
 	ClusterPageDataReceiptV1 *receipt;
+	ClusterKoDirectoryIoV3 io;
 	if (out == NULL || *out != NULL || !cluster_pi_writeback_notice_read_v1(notice, index, &fact)
 		|| !cluster_page_data_fact_shape(&fact))
 		return false;
-	receipt = palloc0(sizeof(*receipt));
-	receipt->magic = UINT64_C(0x5047444154413031);
-	receipt->target.database_incarnation = fact.binding.source.claim.database_incarnation;
-	receipt->target.identity = fact.binding.identity;
-	receipt->target.version = fact.binding.version;
-	receipt->wal = fact.binding;
-	receipt->pi_cut = fact.write_cut;
-	receipt->storage_cut = fact.storage_cut;
-	*out = receipt;
+	if (!cluster_ko_directory_io_begin_v3(fact.binding.identity.locator, &io))
+		return false;
+	PG_TRY();
+	{
+		receipt = palloc0(sizeof(*receipt));
+		receipt->magic = UINT64_C(0x5047444154413031);
+		receipt->target.database_incarnation = fact.binding.source.claim.database_incarnation;
+		receipt->target.identity = fact.binding.identity;
+		receipt->target.version = fact.binding.version;
+		receipt->wal = fact.binding;
+		receipt->pi_cut = fact.write_cut;
+		receipt->storage_cut = fact.storage_cut;
+		receipt->notice = notice;
+		receipt->notice_index = index;
+		*out = receipt;
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
 	return true;
 }
 
@@ -11996,35 +12889,52 @@ cluster_page_structural_from_ko_v2(uint32 slot, uint64 serial,
 	ClusterSpaceStructureChange decoded;
 	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], actual[sizeof(wal)];
 	BufferTag tag;
+	ClusterKoDirectoryIoV3 io;
+	volatile bool complete = false;
 	if (out == NULL || *out != NULL || !rf_page_identity_valid_v1(page)
-		|| (page->forknum != MAIN_FORKNUM && page->forknum != VISIBILITYMAP_FORKNUM)
-		|| !cluster_ko_shared_structure_observation_v2(slot, serial, &value.terminal, wal, sizeof(wal))
-		|| !cluster_space_structure_wal_decode(wal, sizeof(wal), &decoded)
-		|| (decoded.identity.action != CLUSTER_SPACE_WAL_TRUNCATE
-			&& decoded.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE)
-		|| !cluster_page_structural_record_v1(&value.terminal, decoded.identity.expected.incarnation,
-			plan, &value.change)
-		|| !cluster_space_structure_wal_encode(&value.change, actual, sizeof(actual))
-		|| memcmp(wal, actual, sizeof(wal)) != 0
-		|| !cluster_page_structural_page_covered(&value.terminal, &value.change, page, plan))
+		|| (page->forknum != MAIN_FORKNUM && page->forknum != VISIBILITYMAP_FORKNUM))
 		return false;
-	value.magic = UINT64_C(0x5047535452454332);
-	value.owner = CurrentResourceOwner;
-	value.pid = getpid();
-	value.slot = slot;
-	value.serial = serial;
-	value.page = *page;
-	value.plan = plan;
-	InitBufferTag(&tag, &page->locator, page->forknum, page->blockno);
-	if (!cluster_pcm_lock_pi_write_snapshot_v1(tag, &value.write_cut)
-		&& !cluster_pcm_lock_pi_storage_snapshot_v1(tag, &value.storage_cut))
+	if (!cluster_ko_directory_io_begin_v3(page->locator, &io))
 		return false;
-	if (!cluster_page_structural_pi_proof_v2(&value, &x, &s))
-		return false;
-	receipt = palloc(sizeof(*receipt));
-	*receipt = value;
-	*out = receipt;
-	return true;
+	/* Observation, proof and publication belong to this same finite call. */
+	PG_TRY();
+	{
+		do {
+			if (!cluster_ko_shared_structure_observation_v2(slot, serial, &value.terminal, wal, sizeof(wal))
+				|| !cluster_space_structure_wal_decode(wal, sizeof(wal), &decoded)
+				|| (decoded.identity.action != CLUSTER_SPACE_WAL_TRUNCATE
+					&& decoded.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE)
+				|| !cluster_page_structural_record_v1(&value.terminal, decoded.identity.expected.incarnation,
+					plan, &value.change)
+				|| !cluster_space_structure_wal_encode(&value.change, actual, sizeof(actual))
+				|| memcmp(wal, actual, sizeof(wal)) != 0
+				|| !cluster_page_structural_page_covered(&value.terminal, &value.change, page, plan))
+				break;
+			value.magic = UINT64_C(0x5047535452454332);
+			value.owner = CurrentResourceOwner;
+			value.pid = getpid();
+			value.slot = slot;
+			value.serial = serial;
+			value.page = *page;
+			value.plan = plan;
+			InitBufferTag(&tag, &page->locator, page->forknum, page->blockno);
+			if (!cluster_pcm_lock_pi_write_snapshot_v1(tag, &value.write_cut)
+				&& !cluster_pcm_lock_pi_storage_snapshot_v1(tag, &value.storage_cut))
+				break;
+			if (!cluster_page_structural_pi_proof_v2(&value, &x, &s))
+				break;
+			receipt = palloc(sizeof(*receipt));
+			*receipt = value;
+			*out = receipt;
+			complete = true;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
+	return complete;
 }
 
 bool
@@ -12039,41 +12949,58 @@ cluster_page_structural_from_notice_v2(const ClusterPiWritebackNoticeV1 *notice,
 	ClusterPcmPiWriteCutV1 x;
 	ClusterPcmPiStorageCutV1 storage;
 	uint8 expected[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], actual[sizeof(expected)];
+	ClusterKoDirectoryIoV3 io;
+	volatile bool complete = false;
 	if (out == NULL || *out != NULL || plan == NULL || MyBackendType != B_BG_WRITER
 		|| CurrentResourceOwner == NULL || CritSectionCount != 0
 		|| !cluster_pi_writeback_structural_notice_read_v2(notice, index, &value.notice_revision,
 														   &fact)
-		|| fact.kind != CLUSTER_PI_WRITEBACK_STRUCTURAL_V2
-		|| !cluster_space_structure_wal_encode(&s->change, expected, sizeof(expected))
-		|| !cluster_page_structural_record_v1(
-			&s->terminal.binding, s->change.identity.expected.incarnation, plan, &value.change)
-		|| !cluster_space_structure_wal_encode(&value.change, actual, sizeof(actual))
-		|| memcmp(expected, actual, sizeof(expected)) != 0)
+		|| fact.kind != CLUSTER_PI_WRITEBACK_STRUCTURAL_V2)
 		return false;
-	value.magic = UINT64_C(0x5047535452454332);
-	value.owner = CurrentResourceOwner;
-	value.pid = getpid();
-	value.plan = plan;
-	value.notice = notice;
-	value.notice_index = index;
-	value.durability_flags = s->durability_flags;
-	value.ko = s->ko;
-	value.terminal = s->terminal.binding;
-	value.write_cut = s->terminal.write_cut;
-	value.storage_cut = s->terminal.storage_cut;
-	tag = value.write_cut.binding_generation != 0 ? &value.write_cut.holder.assertion.resource
-												  : &value.storage_cut.resource;
-	value.page = value.terminal.identity;
-	value.page.locator = BufTagGetRelFileLocator(tag);
-	value.page.forknum = tag->forkNum;
-	value.page.blockno = tag->blockNum;
-	if (!cluster_page_structural_page_covered(&value.terminal, &value.change, &value.page, plan)
-		|| !cluster_page_structural_pi_proof_v2(&value, &x, &storage))
+	if (!cluster_ko_directory_io_begin_v3(s->terminal.binding.identity.locator, &io))
 		return false;
-	receipt = palloc(sizeof(*receipt));
-	*receipt = value;
-	*out = receipt;
-	return true;
+	/* Observation, proof and publication belong to this same finite call. */
+	PG_TRY();
+	{
+		do {
+			if (!cluster_space_structure_wal_encode(&s->change, expected, sizeof(expected))
+				|| !cluster_page_structural_record_v1(
+					&s->terminal.binding, s->change.identity.expected.incarnation, plan, &value.change)
+				|| !cluster_space_structure_wal_encode(&value.change, actual, sizeof(actual))
+				|| memcmp(expected, actual, sizeof(expected)) != 0)
+				break;
+			value.magic = UINT64_C(0x5047535452454332);
+			value.owner = CurrentResourceOwner;
+			value.pid = getpid();
+			value.plan = plan;
+			value.notice = notice;
+			value.notice_index = index;
+			value.durability_flags = s->durability_flags;
+			value.ko = s->ko;
+			value.terminal = s->terminal.binding;
+			value.write_cut = s->terminal.write_cut;
+			value.storage_cut = s->terminal.storage_cut;
+			tag = value.write_cut.binding_generation != 0 ? &value.write_cut.holder.assertion.resource
+														  : &value.storage_cut.resource;
+			value.page = value.terminal.identity;
+			value.page.locator = BufTagGetRelFileLocator(tag);
+			value.page.forknum = tag->forkNum;
+			value.page.blockno = tag->blockNum;
+			if (!cluster_page_structural_page_covered(&value.terminal, &value.change, &value.page, plan)
+				|| !cluster_page_structural_pi_proof_v2(&value, &x, &storage))
+				break;
+			receipt = palloc(sizeof(*receipt));
+			*receipt = value;
+			*out = receipt;
+			complete = true;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
+	return complete;
 }
 
 bool
@@ -12122,6 +13049,22 @@ cluster_page_structural_receipt_free_v2(ClusterPageStructuralReceiptV2 **receipt
 	*receipt = NULL;
 }
 
+static bool cluster_page_data_storage_lifecycle(const ClusterPageDataTargetV1 *target,
+	const ClusterPageWalBindingV1 *binding,
+	const ClusterThreadRecoveryFabricPlanV1 *fabric, const ClusterWalSourceRef *sources,
+	uint32 source_count, const RfSidePiStorageCaptureV1 *capture);
+
+static bool
+cluster_page_data_notice_current(const ClusterPageDataReceiptV1 *receipt)
+{
+	ClusterPiDataFactV1 fact;
+	return receipt->notice == NULL
+		|| (cluster_pi_writeback_notice_read_v1(receipt->notice, receipt->notice_index, &fact)
+			&& memcmp(&fact.binding, &receipt->wal, sizeof(fact.binding)) == 0
+			&& memcmp(&fact.write_cut, &receipt->pi_cut, sizeof(fact.write_cut)) == 0
+			&& memcmp(&fact.storage_cut, &receipt->storage_cut, sizeof(fact.storage_cut)) == 0);
+}
+
 bool
 cluster_page_data_bind_plan_v1(ClusterPageDataReceiptV1 *receipt,
 							   const ClusterThreadRecoveryFabricPlanV1 *plan)
@@ -12134,8 +13077,33 @@ cluster_page_data_bind_plan_v1(ClusterPageDataReceiptV1 *receipt,
 
 	if (!cluster_page_data_receipt_read_v1(receipt, &target))
 		return false;
-	if (target.identity.forknum != SPACE_FORKNUM)
-		return true; /* Its original PAGE proof remains mandatory. */
+	if (target.identity.forknum != SPACE_FORKNUM) {
+		ClusterWalSourceRef sources[RF_PAGE_STABLE_MAX_PARTICIPANTS];
+		uint32 count;
+		/* Current-writer and local resident observations retain their own
+		 * identity proof. A remote storage fact is authenticated, not a new
+		 * file observation: cover it with the peer's complete input. */
+		if (receipt->storage_cut.binding_generation == 0)
+			return true;
+		if (!cluster_page_data_notice_current(receipt))
+			return false;
+		if (receipt->storage_plan != NULL)
+			return receipt->storage_plan == plan;
+		if (receipt->notice == NULL)
+			return true;
+		count = cluster_thread_recovery_fabric_participant_count_v1(plan);
+		if (count == 0 || count > RF_PAGE_STABLE_MAX_PARTICIPANTS
+			|| !cluster_page_data_pi_fact_v1(receipt, &storage_fact))
+			return false;
+		for (uint32 i = 0; i < count; i++)
+			if (!rf_page_online_plan_source_v1(cluster_thread_recovery_fabric_page_plan_v1(plan),
+					i, &sources[i]))
+				return false;
+		if (!cluster_page_data_storage_lifecycle(&target, &receipt->wal, plan, sources, count, NULL))
+			return false;
+		receipt->storage_plan = plan;
+		return true;
+	}
 	if (receipt->space_plan != NULL)
 		return receipt->space_plan == plan;
 	if (!rf_page_identity_equal_v1(&target.identity, &receipt->wal.identity)
@@ -12230,6 +13198,31 @@ cluster_page_data_terminal_binding(const ClusterPageDataTargetV1 *target,
 			return false;
 		*out = binding;
 		return true;
+	}
+	return false;
+}
+
+static bool
+cluster_page_data_storage_lifecycle(const ClusterPageDataTargetV1 *target,
+	const ClusterPageWalBindingV1 *binding,
+	const ClusterThreadRecoveryFabricPlanV1 *fabric, const ClusterWalSourceRef *sources,
+	uint32 source_count, const RfSidePiStorageCaptureV1 *capture)
+{
+	const RfPageOnlinePlanV1 *page = cluster_thread_recovery_fabric_page_plan_v1(fabric);
+	ClusterPageWalBindingV1 terminal;
+
+	if (!cluster_thread_recovery_fabric_pi_contributions_v1(fabric)
+		|| !cluster_page_data_terminal_binding(target, page, sources, source_count, &terminal)
+		|| !cluster_page_wal_same_mutation_v1(binding, &terminal))
+		return false;
+	for (uint32 i = 0; i < rf_page_online_plan_target_count_v1(page); i++) {
+		RfPageOnlineTargetViewV1 view;
+		if (!rf_page_online_plan_target_v1(page, i, &view))
+			return false;
+		if (rf_page_identity_equal_v1(&view.page_identity, &target->identity))
+			return rf_side_online_plan_pi_storage_lifecycle_v1(
+				cluster_thread_recovery_fabric_side_plan_v1(fabric), &view, sources,
+				source_count, capture);
 	}
 	return false;
 }
@@ -12349,8 +13342,12 @@ cluster_bufmgr_observe_pi_storage_internal(const ClusterPageDataTargetV1 *target
 	ErrorContextCallback *saved_context = error_context_stack;
 	PGAlignedBlock before, after;
 	volatile bool complete = false;
+	volatile bool physical_cleanup_complete = false;
 	uint64 token;
 	ClusterPageDataReceiptV1 *receipt;
+	ClusterKoDirectoryIoV3 io;
+	ClusterKoPiStorageIdentityV3 ko_identity = {0};
+	bool drop_identity = false;
 
 	if (target == NULL || out == NULL || *out != NULL || CurrentResourceOwner == NULL
 		|| !cluster_enabled || !cluster_shared_config || RecoveryInProgress()
@@ -12358,6 +13355,10 @@ cluster_bufmgr_observe_pi_storage_internal(const ClusterPageDataTargetV1 *target
 		|| cut->master_node != cluster_node_id)
 		return false;
 	typed = target->identity.forknum == SPACE_FORKNUM;
+	if (!typed && fabric != NULL
+		&& (!cluster_thread_recovery_fabric_pi_contributions_v1(fabric)
+			|| cluster_thread_recovery_fabric_page_plan_v1(fabric) != plan))
+		return false;
 	key.system_identifier = target->identity.system_identifier;
 	key.database_incarnation = target->database_incarnation;
 	memcpy(key.storage_uuid, target->identity.storage_uuid, 16);
@@ -12386,71 +13387,113 @@ cluster_bufmgr_observe_pi_storage_internal(const ClusterPageDataTargetV1 *target
 		|| !cluster_pcm_lock_pi_storage_matches_v1(&observed))
 		return false;
 	InitBufferTag(&space_tag, &key.locator, SPACE_FORKNUM, 0);
+	if (!cluster_ko_directory_io_begin_v3(key.locator, &io))
+		return false;
+	/* The original call also owns receipt construction/publication. Keep
+	 * buffer cleanup inside it; an unfinished cleanup must retain ownership. */
 	PG_TRY();
 	{
-		do {
-			SMgrRelation rel;
-			/* SPACE0 is the identity itself. Its exact N/S master cut protects
-			 * this read-only observation even with no resident current buffer.
-			 * SPACE1 and ordinary DATA retain the original identity-S owner. */
-			if (!typed || target->identity.blockno != 0) {
-				space = cluster_page_data_try_hold(space_tag, false, &space_owner);
-				if (space == NULL
-					|| !cluster_space_identity_page_decode(
-						BufHdrGetBlock(space), BLCKSZ, SPACE_FORKNUM, 0, &key, &identity, &token)
-					|| (!typed && identity.state != CLUSTER_SPACE_IDENTITY_LIVE)
-					|| memcmp(identity.incarnation, target->version.segment_incarnation, 16) != 0
-					|| (typed
-						&& (identity.state != expected_identity.state
-							|| identity.sequence != expected_identity.sequence
-							|| identity.operation != expected_identity.operation)))
+		PG_TRY();
+		{
+			do {
+				SMgrRelation rel;
+				/* The resident path keeps its original identity-S proof. Only
+				 * its unavailable-buffer case can use an exact DROP capture. */
+				if (!typed || target->identity.blockno != 0) {
+					space = cluster_page_data_try_hold(space_tag, false, &space_owner);
+					if (space == NULL && !typed && fabric != NULL
+						&& cluster_ko_pi_storage_identity_v3(&key,
+							target->version.segment_incarnation, &io, &ko_identity)) {
+						RfSidePiStorageCaptureV1 capture = {0};
+						capture.key = ko_identity.request.base.key;
+						memcpy(capture.incarnation, ko_identity.request.base.incarnation, 16);
+						capture.token = ko_identity.request.space_mutation_token;
+						capture.origin_node = ko_identity.request.base.origin_node;
+						capture.origin_boot = ko_identity.request.base.origin_boot;
+						capture.batch_id = ko_identity.request.base.batch_id;
+						if (ko_identity.request.operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP
+							|| !cluster_page_data_storage_lifecycle(target, &binding, fabric, sources,
+								source_count, &capture)
+							|| !cluster_ko_pi_storage_identity_current_v3(&ko_identity))
+							break;
+						drop_identity = true;
+					}
+					if (!drop_identity
+						&& (space == NULL
+							|| !cluster_space_identity_page_decode(
+								BufHdrGetBlock(space), BLCKSZ, SPACE_FORKNUM, 0, &key, &identity, &token)
+							|| (!typed && identity.state != CLUSTER_SPACE_IDENTITY_LIVE)
+							|| memcmp(identity.incarnation, target->version.segment_incarnation, 16) != 0
+							|| (typed
+								&& (identity.state != expected_identity.state
+									|| identity.sequence != expected_identity.sequence
+									|| identity.operation != expected_identity.operation))))
+						break;
+				}
+				rel = smgropen(key.locator, InvalidBackendId);
+				smgrread(rel, target->identity.forknum, target->identity.blockno, before.data);
+				if (!cluster_page_data_storage_page_valid(&binding, before.data,
+														  typed ? &expected_identity : NULL))
 					break;
+				smgrimmedsync(rel, target->identity.forknum);
+				smgrread(rel, target->identity.forknum, target->identity.blockno, after.data);
+				if (!cluster_page_data_storage_page_valid(&binding, after.data,
+														  typed ? &expected_identity : NULL)
+					|| memcmp(before.data, after.data, BLCKSZ) != 0
+					|| (space != NULL
+						&& (!cluster_page_data_holder_ready(space, &space_tag, false, &live)
+							|| !cluster_pcm_own_fence_equal_exact(&space_owner, &live)))
+					|| !cluster_wal_thread_current_v2_ref(&current)
+					|| !cluster_page_data_source_same(&source, &current)
+					|| !cluster_pcm_lock_pi_storage_matches_v1(&observed)
+					|| (drop_identity && !cluster_ko_pi_storage_identity_current_v3(&ko_identity)))
+					break;
+				complete = true;
+			} while (false);
+		}
+		PG_FINALLY();
+		{
+			error_context_stack = saved_context;
+			if (space != NULL) {
+				if (InterruptHoldoffCount == 0)
+					HOLD_INTERRUPTS();
+				LWLockRelease(BufferDescriptorGetContentLock(space));
+				cluster_bufmgr_unpin_for_gcs(space);
 			}
-			rel = smgropen(key.locator, InvalidBackendId);
-			smgrread(rel, target->identity.forknum, target->identity.blockno, before.data);
-			if (!cluster_page_data_storage_page_valid(&binding, before.data,
-													  typed ? &expected_identity : NULL))
-				break;
-			smgrimmedsync(rel, target->identity.forknum);
-			smgrread(rel, target->identity.forknum, target->identity.blockno, after.data);
-			if (!cluster_page_data_storage_page_valid(&binding, after.data,
-													  typed ? &expected_identity : NULL)
-				|| memcmp(before.data, after.data, BLCKSZ) != 0
-				|| (space != NULL
-					&& (!cluster_page_data_holder_ready(space, &space_tag, false, &live)
-						|| !cluster_pcm_own_fence_equal_exact(&space_owner, &live)))
-				|| !cluster_wal_thread_current_v2_ref(&current)
-				|| !cluster_page_data_source_same(&source, &current)
-				|| !cluster_pcm_lock_pi_storage_matches_v1(&observed))
-				break;
-			complete = true;
-		} while (false);
+			physical_cleanup_complete = true;
+		}
+		PG_END_TRY();
+		if (complete) {
+			receipt = palloc0(sizeof(*receipt));
+			receipt->magic = UINT64_C(0x5047444154413031);
+			receipt->target = *target;
+			receipt->wal = binding;
+			receipt->storage_cut = observed;
+			if (drop_identity) {
+				receipt->storage_plan = fabric;
+				/* Allocation can process interrupts. Publish only against the
+				 * original operation while the original entered call is live. */
+				if (!cluster_ko_pi_storage_identity_current_v3(&ko_identity)) {
+					pfree(receipt);
+					complete = false;
+				}
+			}
+			if (typed) {
+				receipt->space_plan = fabric;
+				receipt->space_operation = typed_operation;
+				receipt->space_terminal = true;
+			}
+			if (complete)
+				*out = receipt;
+		}
 	}
 	PG_FINALLY();
 	{
-		error_context_stack = saved_context;
-		if (space != NULL) {
-			if (InterruptHoldoffCount == 0)
-				HOLD_INTERRUPTS();
-			LWLockRelease(BufferDescriptorGetContentLock(space));
-			cluster_bufmgr_unpin_for_gcs(space);
-		}
+		if (physical_cleanup_complete)
+			(void)cluster_ko_directory_io_end_v3(&io);
 	}
 	PG_END_TRY();
-	if (!complete)
-		return false;
-	receipt = palloc0(sizeof(*receipt));
-	receipt->magic = UINT64_C(0x5047444154413031);
-	receipt->target = *target;
-	receipt->wal = binding;
-	receipt->storage_cut = observed;
-	if (typed) {
-		receipt->space_plan = fabric;
-		receipt->space_operation = typed_operation;
-		receipt->space_terminal = true;
-	}
-	*out = receipt;
-	return true;
+	return complete;
 }
 
 bool
@@ -12462,6 +13505,17 @@ cluster_bufmgr_observe_pi_storage_v1(const ClusterPageDataTargetV1 *target,
 {
 	return cluster_bufmgr_observe_pi_storage_internal(target, cut, plan, sources, source_count,
 													  NULL, out);
+}
+
+bool
+cluster_bufmgr_observe_pi_storage_plan_v1(const ClusterPageDataTargetV1 *target,
+	const ClusterPcmPiStorageCutV1 *cut, const ClusterThreadRecoveryFabricPlanV1 *plan,
+	const ClusterWalSourceRef *sources, uint32 source_count, ClusterPageDataReceiptV1 **out)
+{
+	if (plan == NULL || !cluster_thread_recovery_fabric_pi_contributions_v1(plan))
+		return false;
+	return cluster_bufmgr_observe_pi_storage_internal(target, cut,
+		cluster_thread_recovery_fabric_page_plan_v1(plan), sources, source_count, plan, out);
 }
 
 bool
@@ -12505,9 +13559,16 @@ cluster_page_data_pi_storage_proof_v1(const ClusterPageDataReceiptV1 *receipt,
 			|| cluster_thread_recovery_fabric_page_plan_v1(receipt->space_plan) != plan
 			|| !cluster_page_data_prefix_v1(plan, sources, source_count, NULL, 0, prefixes))
 			return false;
-	} else if (!cluster_page_data_terminal_binding(&target, plan, sources, source_count, &terminal)
-			   || !cluster_page_wal_same_mutation_v1(&terminal, &receipt->wal))
-		return false;
+	} else {
+		if (!cluster_page_data_terminal_binding(&target, plan, sources, source_count, &terminal)
+			|| !cluster_page_wal_same_mutation_v1(&terminal, &receipt->wal)
+			|| (receipt->notice != NULL && (receipt->storage_plan == NULL
+				|| !cluster_page_data_notice_current(receipt)))
+			|| (receipt->storage_plan != NULL
+				&& (!cluster_thread_recovery_fabric_pi_contributions_v1(receipt->storage_plan)
+					|| cluster_thread_recovery_fabric_page_plan_v1(receipt->storage_plan) != plan)))
+			return false;
+	}
 	InitBufferTag(&tag, &target.identity.locator, target.identity.forknum, target.identity.blockno);
 	if (!BufferTagsEqual(&tag, &receipt->storage_cut.resource))
 		return false;
@@ -14480,6 +15541,18 @@ ConditionalLockBuffer(Buffer buffer)
 			cluster_pcm_own_flags_get(buf->buf_id),
 			cluster_pcm_own_writer_activation_token_get(buf->buf_id),
 			cluster_pcm_own_resource_x_activation_generation_get(buf->buf_id));
+		if (!blocked && cluster_enabled && cluster_shared_config
+			&& cluster_interconnect_tier == CLUSTER_IC_TIER_1
+			&& cluster_smgr_which_for(BufTagGetRelFileLocator(&buf->tag), InvalidBackendId) == 1) {
+			PrivateRefCountEntry *ref = GetPrivateRefCountEntry(buffer, false);
+
+			/* Other content locks may already be held. Consume the original
+			 * pin's exact sample; never take the KO lock or refresh it here. */
+			blocked = ref == NULL || ref->refcount <= 0
+					  || !cluster_ko_peer_current_valid_v3(&ref->ko_current,
+														   BufTagGetRelFileLocator(&buf->tag),
+														   buf->tag.forkNum, buf->tag.blockNum);
+		}
 		UnlockBufHdr(buf, buf_state);
 		if (blocked)
 		{
@@ -14489,6 +15562,215 @@ ConditionalLockBuffer(Buffer buffer)
 	}
 #endif
 	return acquired;
+}
+
+/* Borrowed-resource consumers must prove their own original pin, rather than
+ * descriptor residency or another backend's shared refcount. Never repin. */
+bool
+ClusterBufferHasSharedPin(Buffer buffer)
+{
+	return buffer > 0 && buffer <= NBuffers && GetPrivateRefCount(buffer) > 0;
+}
+
+/* Retain only this backend's original post-T3 use proof.  The caller must
+ * already hold its pin and native content-X; descriptor residency, local-X
+ * alone and a cached node-level X cannot manufacture a writer ledger. */
+bool
+ClusterBufferCaptureMutationContext(Buffer buffer, struct ResourceXWriterUseContext *out,
+	uint64 *object_revision, bool *object_checked)
+{
+#ifdef USE_PGRAC_CLUSTER
+	BufferDesc *buf;
+	ClusterPcmXWriterLedgerEntry *entry;
+	uint64 generation, epoch;
+	uint8 state;
+
+	if (out == NULL || object_revision == NULL || object_checked == NULL
+		|| !ClusterBufferHasSharedPin(buffer))
+		return false;
+	buf = GetBufferDescriptor(buffer - 1);
+	if (!LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE))
+		return false;
+	entry = cluster_bufmgr_pcm_x_writer_find(buf);
+	if (entry == NULL || entry->phase != PCM_X_WRITER_LEDGER_ACTIVE
+		|| !cluster_bufmgr_pcm_x_writer_entry_exact(entry, buf)
+		|| (entry->object_checked
+			&& !cluster_ko_peer_delivery_current_v3(entry->object_revision))
+		|| !cluster_bufmgr_terminal_stamp_authority(buffer, &buf->tag,
+			&generation, &epoch, &state)
+		|| generation != entry->authority.buffer_ownership_generation
+		|| epoch == 0 || state != (uint8) PCM_STATE_X)
+		return false;
+	*out = entry->authority;
+	*object_revision = entry->object_revision;
+	*object_checked = entry->object_checked;
+	return true;
+#else
+	return false;
+#endif
+}
+
+bool
+ClusterBufferMutationContextMatches(Buffer buffer, const struct ResourceXWriterUseContext *expected,
+	uint64 object_revision, bool object_checked)
+{
+#ifdef USE_PGRAC_CLUSTER
+	ResourceXWriterUseContext current;
+	uint64 current_object_revision;
+	bool current_object_checked;
+
+	if (expected == NULL || !ClusterBufferCaptureMutationContext(buffer, &current,
+			&current_object_revision, &current_object_checked))
+		return false;
+	/* Compare logical fields, never C struct padding. */
+	return resource_x_assertion_equal(&current.ref.assertion, &expected->ref.assertion)
+		&& current.ref.formation == expected->ref.formation
+		&& current.ref.acquisition_generation == expected->ref.acquisition_generation
+		&& current.r4_record_generation == expected->r4_record_generation
+		&& current.buffer_ownership_generation == expected->buffer_ownership_generation
+		&& current.writer_activation_token == expected->writer_activation_token
+		&& current.resource_x_activation_generation == expected->resource_x_activation_generation
+		&& current_object_revision == object_revision
+		&& current_object_checked == object_checked;
+#else
+	return false;
+#endif
+}
+
+/* Continue a previously captured post-T3 use without acquiring current again.
+ * Sample object admission before content-X. The provisional backend-local
+ * ledger is never exposed to a mutator before the original full writer check;
+ * refusal/ERROR removes only this scope and leaves the caller's pin intact. */
+bool
+ClusterConditionalLockBufferWithMutationContext(Buffer buffer,
+	const struct ResourceXWriterUseContext *expected,
+	uint64 object_revision, bool object_checked)
+{
+#ifdef USE_PGRAC_CLUSTER
+	BufferDesc *buf;
+	ClusterPcmXWriterLedgerEntry prepared;
+	ClusterPcmXWriterLedgerEntry *entry;
+	volatile bool bound = false;
+	volatile bool resumed = false;
+
+	if (expected == NULL || !ClusterBufferHasSharedPin(buffer))
+		return false;
+	buf = GetBufferDescriptor(buffer - 1);
+	if (LWLockHeldByMe(BufferDescriptorGetContentLock(buf))
+		|| cluster_bufmgr_pcm_x_writer_find(buf) != NULL
+		|| (entry = cluster_bufmgr_pcm_x_writer_free_entry()) == NULL)
+		return false;
+	MemSet(&prepared, 0, sizeof(prepared));
+	prepared.phase = PCM_X_WRITER_LEDGER_ACTIVE;
+	prepared.buffer_id = buf->buf_id;
+	prepared.content_lock = BufferDescriptorGetContentLock(buf);
+	prepared.authority = *expected;
+	if (cluster_bufmgr_pcm_own_snapshot(buf, &prepared.granted) != CLUSTER_PCM_OWN_OK
+		|| !cluster_bufmgr_pcm_x_writer_entry_exact(&prepared, buf))
+		return false;
+	cluster_bufmgr_pcm_x_writer_object_sample(&prepared);
+	/* A current sample may only validate the original object cut. It must
+	 * never refresh an older proof into a newly admitted incarnation. */
+	if (prepared.object_checked != object_checked
+		|| prepared.object_revision != object_revision)
+		return false;
+
+	PG_TRY();
+	{
+		if (ConditionalLockBuffer(buffer))
+		{
+			*entry = prepared;
+			bound = true;
+			resumed = ClusterBufferMutationContextMatches(buffer, expected,
+				object_revision, object_checked);
+		}
+	}
+	PG_FINALLY();
+	{
+		if (!resumed)
+		{
+			if (bound)
+				cluster_bufmgr_pcm_x_writer_clear(entry);
+			/* Also unwind an ERROR raised inside the local conditional lock
+			 * before it returned. No lock was held at this scope's entry. */
+			if (LWLockHeldByMeInMode(prepared.content_lock, LW_EXCLUSIVE))
+				LWLockRelease(prepared.content_lock);
+		}
+	}
+	PG_END_TRY();
+	return resumed;
+#else
+	return false;
+#endif
+}
+
+/* Restore only the local writer-use/content-X bracket to its caller. The
+ * original pin and node-level T3 remain under their existing owners. No
+ * generic cache-off PCM release may intervene in ERROR/cancel cleanup. */
+void
+ClusterUnlockBufferAfterConditionalMutation(Buffer buffer)
+{
+#ifdef USE_PGRAC_CLUSTER
+	BufferDesc *buf = GetBufferDescriptor(buffer - 1);
+	ClusterPcmXWriterLedgerEntry *entry = cluster_bufmgr_pcm_x_writer_find(buf);
+
+	Assert(entry != NULL && entry->phase == PCM_X_WRITER_LEDGER_ACTIVE);
+	Assert(LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE));
+	cluster_bufmgr_pcm_x_writer_clear(entry);
+	LWLockRelease(BufferDescriptorGetContentLock(buf));
+#else
+	Assert(false);
+#endif
+}
+
+/* The VACUUM recheck additionally owns one original pin. Its outer census
+ * owner still leaves admission after this local cleanup. */
+void
+ClusterUnlockReleaseBufferAfterConditionalMutation(Buffer buffer)
+{
+#ifdef USE_PGRAC_CLUSTER
+	ClusterUnlockBufferAfterConditionalMutation(buffer);
+	ReleaseBuffer(buffer);
+#else
+	Assert(false);
+#endif
+}
+
+/*
+ * Release a pin and the local content lock after a read-only successful
+ * ConditionalLockBuffer().  That acquisition did not acquire PCM ownership or
+ * enter its writer ledger.  In particular, a generic LockBuffer(UNLOCK) here
+ * could perform a synchronous PCM release when local caching is disabled,
+ * raising an ERROR before the pin is released or replacing an unwinding ERROR.
+ *
+ * Leave the pre-existing PCM ownership to its normal owner/revoker/eviction
+ * lifecycle.  Only the native content lock and original native pin belong to
+ * this read-only scope.  This is not a pair for LockBuffer(), nor for a caller
+ * that modified the page after ConditionalLockBuffer().
+ */
+void
+ClusterUnlockReleaseBufferAfterConditionalRead(Buffer buffer)
+{
+	if (!BufferIsLocal(buffer))
+		LWLockRelease(BufferDescriptorGetContentLock(GetBufferDescriptor(buffer - 1)));
+	ReleaseBuffer(buffer);
+}
+
+/*
+ * Pair ConditionalLockBuffer() with optional shared hint publication through
+ * cluster_space_hint_begin/finish().  That path independently requires current
+ * PCM-X write permission and a versioned SPACE publication context; it does not
+ * acquire PCM ownership or enter the writer ledger.  Release only this scope's
+ * native content lock and pin, including if hint preparation raises an ERROR.
+ * Pre-existing PCM ownership remains with its owner/revoker/eviction lifecycle.
+ * No synchronous PCM release may intervene before the native pin is returned.
+ */
+void
+ClusterUnlockReleaseBufferAfterConditionalHint(Buffer buffer)
+{
+	if (!BufferIsLocal(buffer))
+		LWLockRelease(BufferDescriptorGetContentLock(GetBufferDescriptor(buffer - 1)));
+	ReleaseBuffer(buffer);
 }
 
 /*
@@ -15276,6 +16558,7 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 {
 	instr_time	io_start;
 	int			i;
+	int			issued = 0;
 
 	if (wb_context->nr_pending == 0)
 		return;
@@ -15303,6 +16586,9 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 		BufferTag	tag;
 		RelFileLocator currlocator;
 		Size		nblocks = 1;
+#ifdef USE_PGRAC_CLUSTER
+		ClusterKoDirectoryIoV3 io;
+#endif
 
 		cur = &wb_context->pending_writebacks[i];
 		tag = cur->tag;
@@ -15337,17 +16623,41 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 
 		i += ahead;
 
+#ifdef USE_PGRAC_CLUSTER
+		/* This context outlives the buffer's content lock and may outlive
+		 * its mapping. Serialize the actual call with object COMMIT before
+		 * opening even a cached relation handle. All native callers reach
+		 * here outside buffer content/header locks.
+		 *
+		 * This is an optional scheduling hint, not queued fsync or DATA
+		 * responsibility. Any refused hint can be dropped without proving
+		 * object retirement; the original sync/receipt owners remain. */
+		if (!cluster_ko_directory_io_begin_v3(currlocator, &io))
+			continue;
+		PG_TRY();
+		{
+#endif
 		/* and finally tell the kernel to write the data to storage */
 		reln = smgropen(currlocator, InvalidBackendId);
 		smgrwriteback(reln, BufTagGetForkNum(&tag), tag.blockNum, nblocks);
+#ifdef USE_PGRAC_CLUSTER
+		}
+		PG_FINALLY();
+		{
+			(void) cluster_ko_directory_io_end_v3(&io);
+		}
+		PG_END_TRY();
+#endif
+		issued += ahead + 1;
 	}
 
 	/*
 	 * Assume that writeback requests are only issued for buffers containing
 	 * blocks of permanent relations.
 	 */
-	pgstat_count_io_op_time(IOOBJECT_RELATION, io_context,
-							IOOP_WRITEBACK, io_start, wb_context->nr_pending);
+	if (issued > 0)
+		pgstat_count_io_op_time(IOOBJECT_RELATION, io_context,
+								IOOP_WRITEBACK, io_start, issued);
 
 	wb_context->nr_pending = 0;
 }
@@ -15643,12 +16953,23 @@ cluster_bufmgr_read_storage_scn_for_gcs(BufferTag tag, SCN *out_page_scn)
 {
 	PGAlignedBlock scratch;
 	SMgrRelation reln;
+	ClusterKoDirectoryIoV3 io;
 
 	if (out_page_scn != NULL)
 		*out_page_scn = InvalidScn;
 
-	reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
-	smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
+	if (!cluster_ko_directory_io_begin_v3(BufTagGetRelFileLocator(&tag), &io))
+		return false;
+	PG_TRY();
+	{
+		reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
+		smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
 	if (!PageIsVerifiedForFork((Page) scratch.data, BufTagGetForkNum(&tag), tag.blockNum,
 								PIV_LOG_WARNING | PIV_REPORT_STAT))
 		return false;
@@ -15665,6 +16986,7 @@ cluster_bufmgr_read_storage_image_for_resource_x(
 {
 	PGIOAlignedBlock scratch;
 	SMgrRelation reln;
+	ClusterKoDirectoryIoV3 io;
 	Page page = (Page)scratch.data;
 
 	if (block_data != NULL)
@@ -15676,8 +16998,18 @@ cluster_bufmgr_read_storage_image_for_resource_x(
 	if (block_data == NULL || out_page_lsn == NULL || out_page_scn == NULL)
 		return false;
 
-	reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
-	smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
+	if (!cluster_ko_directory_io_begin_v3(BufTagGetRelFileLocator(&tag), &io))
+		return false;
+	PG_TRY();
+	{
+		reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
+		smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
 	if (!PageIsVerifiedForFork(page, BufTagGetForkNum(&tag), tag.blockNum,
 								PIV_LOG_WARNING | PIV_REPORT_STAT))
 		return false;
@@ -18118,7 +19450,7 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	 * its true PCM state.
 	 */
 	cluster_bufmgr_in_gcs_drop = true;	/* gates the drop-prepin inject */
-	invalidate_succeeded = InvalidateBufferTry(buf);	/* releases the header spinlock */
+	invalidate_succeeded = InvalidateBufferTry(buf, false); /* releases the header spinlock */
 	if (!invalidate_succeeded)
 	{
 		cluster_bufmgr_in_gcs_drop = false;
@@ -18227,12 +19559,26 @@ cluster_bufmgr_read_block_scn_for_gcs(BufferDesc *buf)
 bool
 cluster_bufmgr_block_is_extension_for_gcs(BufferTag tag)
 {
-	SMgrRelation reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
+	SMgrRelation reln;
 	ForkNumber	fork = BufTagGetForkNum(&tag);
+	ClusterKoDirectoryIoV3 io;
+	volatile bool extension = false;
 
-	/* Drop any cached size so a concurrent extension is not missed. */
-	smgrrelease(reln);
-	return tag.blockNum >= smgrnblocks(reln, fork);
+	if (!cluster_ko_directory_io_begin_v3(BufTagGetRelFileLocator(&tag), &io))
+		return false;
+	PG_TRY();
+	{
+		reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
+		/* Drop any cached size so a concurrent extension is not missed. */
+		smgrrelease(reln);
+		extension = tag.blockNum >= smgrnblocks(reln, fork);
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
+	return extension;
 }
 
 bool
@@ -18245,6 +19591,8 @@ cluster_bufmgr_refresh_block_from_storage_for_gcs(BufferDesc *buf, SCN *out_page
 	uint32		buf_state;
 	bool		dirty;
 	bool		write_permitted;
+	ClusterKoDirectoryIoV3 io;
+	volatile bool refreshed = false;
 
 	if (out_page_scn != NULL)
 		*out_page_scn = InvalidScn;
@@ -18257,32 +19605,41 @@ cluster_bufmgr_refresh_block_from_storage_for_gcs(BufferDesc *buf, SCN *out_page
 	 * this cannot read past EOF (a concurrent truncate would ereport here,
 	 * which is the correct fail-closed outcome for a dropped block).
 	 */
-	reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
-	smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
-	if (!PageIsVerifiedForFork((Page) scratch.data, BufTagGetForkNum(&tag), tag.blockNum,
-								PIV_LOG_WARNING | PIV_REPORT_STAT))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("invalid page in block %u of relation %u during GCS storage-fallback refresh",
-						tag.blockNum, tag.relNumber)));
-
-	content_lock = BufferDescriptorGetContentLock(buf);
-	LWLockAcquire(content_lock, LW_EXCLUSIVE);
-	write_permitted = cluster_bufmgr_pcm_x_content_write_permitted(buf);
-	buf_state = LockBufHdr(buf);
-	dirty = (buf_state & BM_DIRTY) != 0;
-	UnlockBufHdr(buf, buf_state);
-	if (dirty || !write_permitted)
-	{
-		LWLockRelease(content_lock);
+	if (!cluster_ko_directory_io_begin_v3(BufTagGetRelFileLocator(&tag), &io))
 		return false;
-	}
-	memcpy((char *) BufHdrGetBlock(buf), scratch.data, BLCKSZ);
-	LWLockRelease(content_lock);
+	PG_TRY();
+	{
+		reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
+		smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
+		if (!PageIsVerifiedForFork((Page) scratch.data, BufTagGetForkNum(&tag), tag.blockNum,
+									PIV_LOG_WARNING | PIV_REPORT_STAT))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid page in block %u of relation %u during GCS storage-fallback refresh",
+							tag.blockNum, tag.relNumber)));
 
-	if (out_page_scn != NULL)
+		content_lock = BufferDescriptorGetContentLock(buf);
+		LWLockAcquire(content_lock, LW_EXCLUSIVE);
+		write_permitted = cluster_bufmgr_pcm_x_content_write_permitted(buf);
+		buf_state = LockBufHdr(buf);
+		dirty = (buf_state & BM_DIRTY) != 0;
+		UnlockBufHdr(buf, buf_state);
+		if (!dirty && write_permitted)
+		{
+			memcpy((char *) BufHdrGetBlock(buf), scratch.data, BLCKSZ);
+			refreshed = true;
+		}
+		LWLockRelease(content_lock);
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
+
+	if (refreshed && out_page_scn != NULL)
 		*out_page_scn = ((PageHeader) scratch.data)->pd_block_scn;
-	return true;
+	return refreshed;
 }
 
 /* ========================================================================
@@ -18624,7 +19981,7 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 	/* PGRAC: GCS serve-stall round-5 (A2) — bounded drop;  restore the
 	 * residency mode on a raced pin (mirrors the invalidate wrapper). */
 	cluster_bufmgr_in_gcs_drop = true;	/* gates the drop-prepin inject */
-	invalidate_succeeded = InvalidateBufferTry(buf);	/* releases the header spinlock */
+	invalidate_succeeded = InvalidateBufferTry(buf, false); /* releases the header spinlock */
 	if (!invalidate_succeeded)
 	{
 		cluster_bufmgr_in_gcs_drop = false;
@@ -18769,8 +20126,8 @@ cluster_bufmgr_pcm_own_copy_source_image_exact(
  * published here.  Ordinary failures remove only this exact reservation;
  * inability to do so is corruption and retains the evidence fail-closed.
  */
-ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_prepare_n_source_image(BufferDesc *buf,
+static ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_prepare_n_source_image_internal(BufferDesc *buf,
 											  const ClusterPcmOwnSnapshot *expected_n,
 											  ClusterPcmOwnSnapshot *out_revoking,
 											  char block_data[BLCKSZ], XLogRecPtr *out_page_lsn,
@@ -18915,6 +20272,48 @@ cluster_bufmgr_pcm_own_prepare_n_source_image(BufferDesc *buf,
 	memset(block_data, 0, BLCKSZ);
 	*out_page_lsn = InvalidXLogRecPtr;
 	*out_page_scn = 0;
+	return result;
+}
+
+/* PGRAC: bind the complete original source call before it can pin, reserve,
+ * flush or read. No KO lock is held inside the source owner. Its ERROR and
+ * ordinary cleanup runs before this reference ends; a successful REVOKING
+ * reservation still belongs to the original retained handoff owner.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_prepare_n_source_image(BufferDesc *buf,
+											  const ClusterPcmOwnSnapshot *expected_n,
+											  ClusterPcmOwnSnapshot *out_revoking,
+											  char block_data[BLCKSZ], XLogRecPtr *out_page_lsn,
+											  uint64 *out_page_scn)
+{
+	ClusterKoDirectoryIoV3 io = {0};
+	ClusterPcmOwnResult result;
+
+	/* Preserve the original invalid-input classification and empty outputs. */
+	if (buf == NULL || expected_n == NULL || out_revoking == NULL || block_data == NULL
+		|| out_page_lsn == NULL || out_page_scn == NULL
+		|| expected_n->pcm_state != (uint8)PCM_STATE_N || expected_n->flags != 0
+		|| ClusterPcmOwnArray == NULL)
+		return cluster_bufmgr_pcm_own_prepare_n_source_image_internal(
+			buf, expected_n, out_revoking, block_data, out_page_lsn, out_page_scn);
+	if (!cluster_ko_directory_io_begin_v3(BufTagGetRelFileLocator(&expected_n->tag), &io)) {
+		memset(out_revoking, 0, sizeof(*out_revoking));
+		memset(block_data, 0, BLCKSZ);
+		*out_page_lsn = InvalidXLogRecPtr;
+		*out_page_scn = 0;
+		return CLUSTER_PCM_OWN_BUSY;
+	}
+	PG_TRY();
+	{
+		result = cluster_bufmgr_pcm_own_prepare_n_source_image_internal(
+			buf, expected_n, out_revoking, block_data, out_page_lsn, out_page_scn);
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
 	return result;
 }
 
@@ -19120,8 +20519,8 @@ cluster_bufmgr_pcm_own_observe_s_source_hard_failure(
  * either its clean resident page or shared storage.  REVOKING prevents local
  * data writes/reuse while the conditional content-lock hold binds the final
  * comparison and optional storage refresh to the same ownership tuple. */
-ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_prepare_s_source_image(
+static ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_prepare_s_source_image_internal(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_s, SCN required_page_scn,
 	ClusterPcmOwnSnapshot *out_revoking, char block_data[BLCKSZ], XLogRecPtr *out_page_lsn,
 	uint64 *out_page_scn, ClusterPcmOwnSourcePrepareRefusal *out_refusal,
@@ -19389,6 +20788,53 @@ cluster_bufmgr_pcm_own_prepare_s_source_image(
 	memset(block_data, 0, BLCKSZ);
 	*out_page_lsn = InvalidXLogRecPtr;
 	*out_page_scn = 0;
+	return result;
+}
+
+/* PGRAC: bind the complete original source call before it can pin, reserve,
+ * flush or read. No KO lock is held inside the source owner. Its ERROR and
+ * ordinary cleanup runs before this reference ends; a successful REVOKING
+ * reservation still belongs to the original retained handoff owner.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_prepare_s_source_image(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_s, SCN required_page_scn,
+	ClusterPcmOwnSnapshot *out_revoking, char block_data[BLCKSZ], XLogRecPtr *out_page_lsn,
+	uint64 *out_page_scn, ClusterPcmOwnSourcePrepareRefusal *out_refusal,
+	ClusterPageWalBindingV1 *out_wal)
+{
+	ClusterKoDirectoryIoV3 io = {0};
+	ClusterPcmOwnResult result;
+
+	/* Preserve the original invalid-input classification and empty outputs. */
+	if (buf == NULL || expected_s == NULL || out_revoking == NULL || block_data == NULL
+		|| out_page_lsn == NULL || out_page_scn == NULL || out_refusal == NULL
+		|| expected_s->pcm_state != (uint8)PCM_STATE_S || expected_s->flags != 0
+		|| ClusterPcmOwnArray == NULL)
+		return cluster_bufmgr_pcm_own_prepare_s_source_image_internal(
+			buf, expected_s, required_page_scn, out_revoking, block_data,
+			out_page_lsn, out_page_scn, out_refusal, out_wal);
+	if (!cluster_ko_directory_io_begin_v3(BufTagGetRelFileLocator(&expected_s->tag), &io)) {
+		memset(out_revoking, 0, sizeof(*out_revoking));
+		memset(block_data, 0, BLCKSZ);
+		*out_page_lsn = InvalidXLogRecPtr;
+		*out_page_scn = 0;
+		*out_refusal = CLUSTER_PCM_OWN_SOURCE_PREPARE_REFUSAL_NONE;
+		if (out_wal != NULL)
+			memset(out_wal, 0, sizeof(*out_wal));
+		return CLUSTER_PCM_OWN_BUSY;
+	}
+	PG_TRY();
+	{
+		result = cluster_bufmgr_pcm_own_prepare_s_source_image_internal(
+			buf, expected_s, required_page_scn, out_revoking, block_data,
+			out_page_lsn, out_page_scn, out_refusal, out_wal);
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
 	return result;
 }
 

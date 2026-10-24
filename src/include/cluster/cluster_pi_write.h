@@ -96,6 +96,14 @@ extern bool cluster_bufmgr_observe_pi_storage_v1(const ClusterPageDataTargetV1 *
 												 const ClusterWalSourceRef *sources,
 												 uint32 source_count,
 												 ClusterPageDataReceiptV1 **out);
+/* Same storage owner with a complete PI-only fabric. An exact runtime DROP
+ * may use its captured identity and typed lifecycle instead of a resident
+ * SPACE current. The original resident path is otherwise unchanged. */
+extern bool cluster_bufmgr_observe_pi_storage_plan_v1(
+	const ClusterPageDataTargetV1 *target, const ClusterPcmPiStorageCutV1 *cut,
+	const struct ClusterThreadRecoveryFabricPlanV1 *plan,
+	const ClusterWalSourceRef *sources, uint32 source_count,
+	ClusterPageDataReceiptV1 **out);
 /* Typed SPACE terminal selected from the complete retained input. SPACE0
  * is its own identity: exact master N/S cut plus typed read/fsync/read needs
  * no resident current image. SPACE1 retains the original SPACE0 identity-S.
@@ -311,10 +319,94 @@ typedef enum ClusterPcmPiRelationScanV2 {
 	CLUSTER_PCM_PI_RELATION_MORE,
 	CLUSTER_PCM_PI_RELATION_EMPTY
 } ClusterPcmPiRelationScanV2;
+
+/* Read-only identity captured by the KO origin scanner at the exact registry
+ * entry which returned PENDING.  This is diagnostic evidence only: it is not
+ * a PI receipt, a DATA proof, or permission to retire the entry.  The page WAL
+ * references are copied as values while the entry lock is held; no ownership
+ * is acquired or released by the scanner. */
+#define CLUSTER_PCM_PI_PENDING_LOCAL_ACTIVE UINT32_C(0x00000001)
+#define CLUSTER_PCM_PI_PENDING_LOCAL_OWNER UINT32_C(0x00000002)
+#define CLUSTER_PCM_PI_PENDING_BOOTSTRAP_ROUND UINT32_C(0x00000004)
+#define CLUSTER_PCM_PI_PENDING_CURRENT_HOLDER UINT32_C(0x00000008)
+#define CLUSTER_PCM_PI_PENDING_LOCAL_PI UINT32_C(0x00000010)
+#define CLUSTER_PCM_PI_PENDING_AGGREGATE_REF UINT32_C(0x00000020)
+#define CLUSTER_PCM_PI_PENDING_MASTER_REQUEST UINT32_C(0x00000040)
+#define CLUSTER_PCM_PI_PENDING_BOOTSTRAP_RECEIPT UINT32_C(0x00000080)
+#define CLUSTER_PCM_PI_PENDING_BLOCK_INTENT UINT32_C(0x00000100)
+#define CLUSTER_PCM_PI_PENDING_GRANT_INTENT UINT32_C(0x00000200)
+#define CLUSTER_PCM_PI_PENDING_REQUESTER_JOIN UINT32_C(0x00000400)
+#define CLUSTER_PCM_PI_PENDING_SETTLEMENT UINT32_C(0x00000800)
+#define CLUSTER_PCM_PI_PENDING_HOLDER_PAIR UINT32_C(0x00001000)
+#define CLUSTER_PCM_PI_PENDING_DIRECTORY_STATE UINT32_C(0x00002000)
+#define CLUSTER_PCM_PI_PENDING_WATERMARK UINT32_C(0x00004000)
+#define CLUSTER_PCM_PI_PENDING_X_REQUEST UINT32_C(0x00008000)
+
+typedef struct ClusterPcmPiPendingIdentityV1 {
+	uint32 registry_slot;
+	BufferTag tag;
+	uint64 binding_generation;
+	uint64 local_pi_revision;
+	uint32 pcm_state;
+	int32 current_holder_node;
+	int32 master_holder_node;
+	int32 master_node;
+	int32 pending_x_requester_node;
+	uint32 s_holders_bitmap;
+	uint32 pi_holders_bitmap;
+	int32 pi_source_node_first;
+	int32 pi_source_node_last;
+	uint64 pi_source_boot_first;
+	uint64 pi_source_boot_last;
+	uint16 pi_source_slot_first;
+	uint16 pi_source_slot_last;
+	uint32 pending_predicate_mask;
+	ClusterPageWalRefV1 local_pi_first;
+	ClusterPageWalRefV1 local_pi_last;
+	bool valid;
+} ClusterPcmPiPendingIdentityV1;
+
+StaticAssertDecl(sizeof(ClusterPcmPiPendingIdentityV1) == 208,
+				 "KO pending PI identity diagnostic shape must remain bounded");
+
 extern ClusterPcmPiRelationScanV2 cluster_pcm_lock_pi_relation_scan_v2(RelFileLocator locator,
 																	   uint64 formation,
 																	   uint32 budget,
 																	   uint32 *cursor);
+
+/* Object-drain observation covers every supported fork and current holder.
+ * EMPTY is only a bounded directory observation, never the complete READY
+ * conjunction. The caller must exclude new producers and bind the scan to
+ * its unchanged object operation and gate/freeze generation. */
+extern ClusterPcmPiRelationScanV2 cluster_pcm_lock_ko_relation_scan_v3(RelFileLocator locator,
+																	   uint64 formation,
+																	   uint32 budget,
+																	   uint32 *cursor);
+
+/* AM01 F04 role projections.  Both are read-only bounded observations and
+ * retain the same gate, formation, registry and 128-entry budget as the
+ * combined observer above.  The local projection admits only work which can
+ * still produce a local buffer/current/install or local PI effect; the
+ * directory projection observes canonical master/head/grant/PI responsibility
+ * independently.  Unknown aggregate references remain PENDING in both. */
+extern ClusterPcmPiRelationScanV2 cluster_pcm_lock_ko_local_relation_scan_v3(RelFileLocator locator,
+																			 uint64 formation,
+																			 uint32 budget,
+																			 uint32 *cursor);
+/* Committed old-object consumer, not a read-only census. Requires the
+ * immutable I/O-retired identity; releases only exact local PI references
+ * when all other local owners are closed. Master responsibility is retained.
+ * The caller still supplies physical closure and the full READY conjunction. */
+extern ClusterPcmPiRelationScanV2
+cluster_pcm_lock_ko_local_relation_discard_v4(RelFileLocator locator, uint64 formation,
+											  uint32 budget, uint32 *cursor);
+extern ClusterPcmPiRelationScanV2
+cluster_pcm_lock_ko_local_relation_scan_v3_identity(RelFileLocator locator, uint64 formation,
+																											 uint32 budget, uint32 *cursor,
+																											 ClusterPcmPiPendingIdentityV1 *pending_out);
+extern ClusterPcmPiRelationScanV2
+cluster_pcm_lock_ko_directory_relation_scan_v3(RelFileLocator locator, uint64 formation,
+											   uint32 budget, uint32 *cursor);
 
 /* Actual holder DATA write. The cut is captured before this call; it must
  * match the installed current-X buffer generation. No ownership acquisition.

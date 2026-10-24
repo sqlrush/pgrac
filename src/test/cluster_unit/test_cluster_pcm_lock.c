@@ -59,6 +59,8 @@
 #include "cluster/cluster_qvotec.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
+#include "cluster/cluster_ko.h"
+#include "cluster/storage/cluster_smgr.h"
 #include "cluster/cluster_resource_x_identity.h"
 #include "cluster/cluster_resource_x_node_wire.h"
 #include "cluster/cluster_shmem.h"
@@ -154,6 +156,86 @@ static ClusterPcmPiWriteCutV1 structural_master_write_cut;
 static ClusterPcmPiStorageCutV1 structural_master_storage_cut;
 static void (*structural_master_ack_hook)(void);
 static int fake_lwlock_depth = 0;
+/* Object admission is a boundary fixture; PCM round/caller transitions below
+ * remain the real product object. Tests may race the original entry lock. */
+int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+static bool object_admission_allowed = true;
+static bool object_current_continuation;
+static bool object_delivery_allowed = true;
+static int object_delivery_samples;
+static uint64 object_admission_revision = 1;
+static int object_admission_samples;
+static int object_smgr_route = 1;
+static void (*object_entry_lock_hook)(void);
+int
+cluster_smgr_which_for(RelFileLocator locator pg_attribute_unused(),
+					   BackendId backend pg_attribute_unused())
+{
+	return object_smgr_route;
+}
+bool
+cluster_ko_peer_admission_begin_v3(RelFileLocator locator, ClusterKoPeerAdmissionV3 *out)
+{
+	Assert(fake_lwlock_depth == 0);
+	object_admission_samples++;
+	memset(out, 0, sizeof(*out));
+	if (!object_admission_allowed)
+		return false;
+	out->locator = locator;
+	out->revision = object_admission_revision;
+	return true;
+}
+bool
+cluster_ko_peer_admission_current_v3(const ClusterKoPeerAdmissionV3 *sample, RelFileLocator locator)
+{
+	Assert(fake_lwlock_depth > 0);
+	return sample != NULL && sample->revision != 0 && sample->revision == object_admission_revision
+		   && RelFileLocatorEquals(sample->locator, locator);
+}
+bool
+cluster_ko_peer_current_begin_v3(RelFileLocator locator, ForkNumber fork, BlockNumber block,
+								 ClusterKoCurrentAdmissionV3 *out)
+{
+	bool allowed;
+	if (object_current_continuation) {
+		Assert(fake_lwlock_depth == 0);
+		object_admission_samples++;
+		memset(out, 0, sizeof(*out));
+		out->target.locator = locator;
+		out->target.revision = object_admission_revision;
+		out->target.cleaner.serial = 1;
+		allowed = true;
+	} else
+		allowed = cluster_ko_peer_admission_begin_v3(locator, &out->target);
+	out->target.fork = fork;
+	out->target.block = block;
+	return allowed;
+}
+bool
+cluster_ko_peer_current_valid_v3(const ClusterKoCurrentAdmissionV3 *sample, RelFileLocator locator,
+								 ForkNumber fork, BlockNumber block)
+{
+	return sample != NULL && sample->target.fork == fork && sample->target.block == block
+		   && (sample->target.cleaner.serial == 0 || object_current_continuation)
+		   && cluster_ko_peer_admission_current_v3(&sample->target, locator);
+}
+
+bool
+cluster_ko_peer_delivery_begin_v3(RelFileLocator locator pg_attribute_unused(), uint64 *revision)
+{
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	object_delivery_samples++;
+	*revision = object_delivery_allowed ? object_admission_revision : 0;
+	return object_delivery_allowed;
+}
+
+bool
+cluster_ko_peer_delivery_current_v3(uint64 revision)
+{
+	UT_ASSERT(fake_lwlock_depth > 0);
+	return revision != 0 && revision == object_admission_revision;
+}
+
 static ClusterWalSourceRef local_pi_writer;
 static union {
 	uint64 align;
@@ -373,6 +455,39 @@ static uint32 fake_init_wait_event_seen = 0;
 static uint32 fake_lwlock_wait_event_seen = 0;
 static bool fake_lwlock_conditional_fail_once = false;
 
+/* Object publication and its entered-I/O drain are tested by the KO fixture.
+ * This directory fixture supplies only their exact immutable terminal result. */
+int MyProcPid = 4242; /* Explicit backend identity for the diagnostic boundary. */
+
+static bool object_drop_retired;
+static bool object_origin_discard;
+static RelFileLocator object_drop_locator;
+static unsigned object_drop_queries;
+bool cluster_ko_directory_drop_retired_v3(RelFileLocator locator);
+#ifndef Z_PCM_ORIGINAL_KO
+bool
+cluster_ko_directory_drop_retired_v3(RelFileLocator locator)
+{
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	object_drop_queries++;
+	return object_drop_retired && RelFileLocatorEquals(locator, object_drop_locator);
+}
+bool cluster_ko_local_drop_discard_current_v4(RelFileLocator locator);
+bool
+cluster_ko_local_drop_discard_current_v4(RelFileLocator locator)
+{
+	return cluster_ko_directory_drop_retired_v3(locator)
+		|| (object_origin_discard && RelFileLocatorEquals(locator, object_drop_locator));
+}
+#endif
+
+/* Backend-local diagnostics are not KO authority in this PCM fixture. */
+void
+cluster_ko_origin_discard_detail_v1(const ClusterKoDiscardDetailV1 *detail)
+{
+	(void)detail;
+}
+
 /* PGRAC: spec-2.31 D1 v0.4 — ConditionVariable stub counters (declared
  * here so reset_fake_pcm_runtime() can clear them;  definitions of the
  * stub functions themselves live below LWLockHeldByMeInMode). */
@@ -541,6 +656,18 @@ s_lock(volatile slock_t *lock, const char *file pg_attribute_unused(),
 static void
 reset_fake_pcm_runtime(int max_entries)
 {
+	object_drop_retired = object_origin_discard = false;
+	memset(&object_drop_locator, 0, sizeof(object_drop_locator));
+	object_drop_queries = 0;
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+	object_admission_allowed = true;
+	object_current_continuation = false;
+	object_delivery_allowed = true;
+	object_delivery_samples = 0;
+	object_admission_revision = 1;
+	object_admission_samples = 0;
+	object_smgr_route = 1;
+	object_entry_lock_hook = NULL;
 	cluster_shared_config = false;
 	pi_service_blocked = false;
 	stop_new_work_allowed = true;
@@ -811,8 +938,14 @@ bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
 	if ((uintptr_t)lock >= (uintptr_t)&fake_pcm_entries
-		&& (uintptr_t)lock < (uintptr_t)&fake_pcm_entries + sizeof(fake_pcm_entries))
+		&& (uintptr_t)lock < (uintptr_t)&fake_pcm_entries + sizeof(fake_pcm_entries)) {
 		fake_last_entry_lock = lock;
+		if (object_entry_lock_hook != NULL) {
+			void (*hook)(void) = object_entry_lock_hook;
+			object_entry_lock_hook = NULL;
+			hook();
+		}
+	}
 	Assert(fake_lwlock_depth < (int)lengthof(fake_lwlock_stack));
 	fake_lwlock_stack[fake_lwlock_depth] = lock;
 	fake_lwlock_mode_stack[fake_lwlock_depth] = mode;
@@ -1359,8 +1492,9 @@ UT_TEST(test_pcm_illegal_transition_validator_rejects)
 UT_TEST(test_pcm_disable_path_counters_return_zero)
 {
 	/*
-	 * In cluster_unit binary cluster_pcm_grd_init is never called so
-	 * ClusterPcm stays NULL — all 9 counter accessors return 0.
+	 * The startup-only section runs before cluster_pcm_grd_init, so
+	 * ClusterPcm is NULL and all nine accessors must return zero. Later
+	 * runtime fixtures initialize the region and exercise real counters.
 	 */
 	UT_ASSERT_EQ((int)cluster_pcm_get_trans_n_to_s_count(), 0);
 	UT_ASSERT_EQ((int)cluster_pcm_get_trans_n_to_x_count(), 0);
@@ -9793,6 +9927,75 @@ setup_pi_write_master_with_holders(BufferTag tag, uint32 holders)
 			cluster_pcm_lock_pi_holder_note(tag, node);
 	UT_ASSERT_EQ(cluster_pcm_lock_pi_write_snapshot_v1(tag, &pi_receipt_cut), holders != 0);
 	pi_ack_cut = pi_receipt_cut;
+}
+
+/* Build a valid local SETTLED directory record, then release its physical
+ * N/X state.  The relation-role fixture uses this to prove that terminal
+ * history remains directory debt without reopening local work. */
+static void
+setup_local_settled_terminal_without_physical(BufferTag tag)
+{
+	ResourceXDecodedFrame assertion, settlement;
+	ResourceXDurableProof durable = { 0 };
+	ResourceXMasterSnapshot snapshot;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 0;
+	cluster_shared_config = true;
+	pi_receipt_valid = false;
+	pi_storage_receipt_valid = false;
+	pi_ack_available = 7;
+	pi_ack_imported = 6;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	assertion = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X, tag, 0, 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&assertion, 0, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	durable.assertion = assertion.common.logical_assertion;
+	durable.base_authority_generation = 1;
+	durable.resource_formation = 17;
+	durable.master_session_incarnation = 31;
+	durable.assertion_sequence = 41;
+	durable.requester_target_generation = 41;
+	durable.page_scn_lsn = 82;
+	durable.page_checksum = UINT32_C(0x12345678);
+	durable.source_proof_crc32c = UINT32_C(0x87654321);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_durable_proof_exact(&durable, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	{
+		ResourceXIntentSlot intent;
+		uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
+
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_grant_intent_snapshot_exact(
+						 &assertion.common.logical_assertion, &intent, payload, sizeof(payload)),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_grant_intent_stage_exact(
+						 &intent, intent.first_armed_us + 1),
+					 RESOURCE_X_INTENT_STAGED);
+		UT_ASSERT(cluster_pcm_lock_resource_x_grant_intent_complete_exact(&intent));
+	}
+	settlement = make_resource_x_master_frame(RESOURCE_X_WIRE_INSTALL_SETTLEMENT, tag, 0, 0);
+	settlement.common.outcome = RESOURCE_X_OUTCOME_OK;
+	settlement.common.authority_generation = 2;
+	settlement.body.install_settlement.conversion_base_generation = 1;
+	settlement.body.install_settlement.final_authority_generation = 2;
+	settlement.body.install_settlement.requester_connection_generation = 91;
+	settlement.body.install_settlement.requester_target_generation = 41;
+	settlement.body.install_settlement.page_scn_lsn = 82;
+	settlement.body.install_settlement.page_checksum = UINT32_C(0x12345678);
+	settlement.body.install_settlement.source_proof_crc32c = UINT32_C(0x87654321);
+	settlement.body.install_settlement.installed_mode = PCM_STATE_X;
+	settlement.body.install_settlement.requester_role = RESOURCE_X_REQUESTER_ROLE_ACQUIRER;
+	settlement.body.install_settlement.terminal_outcome = RESOURCE_X_OUTCOME_OK;
+	settlement.body.install_settlement.terminal_state = RESOURCE_X_SETTLEMENT_TERMINAL_INSTALLED;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_install_settlement_exact(&settlement, 0, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_SETTLED);
+	/* Physical N state is independent of the terminal directory record.  Use
+	 * the native transition owner to drop the local X residency while leaving
+	 * the SETTLED request intact. */
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_X_TO_N_RELEASE, 0),
+				 PCM_GCS_TRANSITION_APPLIED);
 }
 
 static void
@@ -23636,17 +23839,21 @@ main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	UT_PLAN(361);
+	/* Observe the actual startup state before any runtime fixture overrides
+	 * the postmaster GUC or initializes shared PCM state and counters. */
+	UT_RUN(test_pcm_grd_max_entries_default_is_minus_one);
+	UT_RUN(test_pcm_disable_path_counters_return_zero);
+	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
+
 	UT_RUN(test_resource_x_pi_complete_resumes_native_master_without_new_assert);
 	UT_RUN(test_resource_x_master_work_never_substitutes_for_pi_or_admission);
 	UT_RUN(test_resource_x_master_work_rejects_stale_capture_before_io);
 	UT_RUN(test_resource_x_master_work_rechecks_after_storage_io);
 	UT_RUN(test_resource_x_master_work_duplicate_and_error_leave_original_owner);
-	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
-	UT_RUN(test_pcm_grd_max_entries_default_is_minus_one);
 	UT_RUN(test_pcm_buffer_desc_invariants_hold_at_stage_2_30);
 	UT_RUN(test_pcm_lock_module_init_symbol_is_callable);
 	UT_RUN(test_pcm_trans_1_n_to_s_validator_accepts);
@@ -23659,7 +23866,6 @@ main(void)
 	UT_RUN(test_pcm_trans_8_s_to_n_release_validator_accepts);
 	UT_RUN(test_pcm_trans_9_cleanout_validator_reachable_but_apply_fail_closed);
 	UT_RUN(test_pcm_illegal_transition_validator_rejects);
-	UT_RUN(test_pcm_disable_path_counters_return_zero);
 	UT_RUN(test_pcm_wait_margin_keeps_each_ratio_pair_and_separate_lifetimes);
 	UT_RUN(test_resource_x_trace_is_exact_bounded_and_cannot_erase_unexported_evidence);
 	UT_RUN(test_resource_x_trace_observes_actual_head_and_same_ref_waiters);

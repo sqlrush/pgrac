@@ -17,6 +17,7 @@ int origin_resolver_fixture_main(void);
 #define cluster_xid_provably_foreign origin_unused_foreign_stub
 #define cluster_itl_cleanout_lazy origin_unused_cleanout_stub
 #include "test_cluster_r4_scratch_resolver.c"
+#include "cluster/cluster_catalog_trace.h"
 #undef main
 #undef cluster_cr_satisfies_mvcc
 #undef uba_origin_node_id

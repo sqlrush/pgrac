@@ -26,6 +26,7 @@ static int cold_selection_calls;
 static TTSlot cold_old_slot;
 static ClusterNormalStartState active_owner_start_state = CLUSTER_NORMAL_START_TARGET_READY;
 static bool active_owner_recovered_open = true;
+static bool fail_next_memory_allocation;
 bool cluster_enabled = true;
 BackendType MyBackendType = B_BACKEND;
 bool cluster_undo_retention_horizon_enabled = false;
@@ -46,15 +47,25 @@ cluster_semantic_activation_recovered_open_current(void)
 	return active_owner_recovered_open;
 }
 
-void *(palloc0)(Size size)
+static void
+check_memory_allocation(void)
 {
-	return calloc(1, size);
+	if (fail_next_memory_allocation) {
+		fail_next_memory_allocation = false;
+		ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("injected allocation failure")));
+	}
 }
 
 void *
 MemoryContextAllocZero(MemoryContext context pg_attribute_unused(), Size size)
 {
+	check_memory_allocation();
 	return calloc(1, size);
+}
+
+void *(palloc0)(Size size)
+{
+	return MemoryContextAllocZero(CurrentMemoryContext, size);
 }
 
 void *
@@ -66,6 +77,7 @@ MemoryContextAllocZeroAligned(MemoryContext context, Size size)
 void *
 repalloc(void *pointer, Size size)
 {
+	check_memory_allocation();
 	return realloc(pointer, size);
 }
 
@@ -285,6 +297,7 @@ reset_active_owner(void)
 	first_recheck_pending = false;
 	cold_fixture = cold_capacity_refused = false;
 	cold_selection_calls = 0;
+	fail_next_memory_allocation = false;
 	cold_successor = 2;
 	memset(&cold_old_slot, 0, sizeof(cold_old_slot));
 	cluster_tt_slot_rollover(0, 1, NULL);
@@ -362,6 +375,99 @@ UT_TEST(test_fresh_open_reserves_active_without_recovered_proof)
 	active_owner_recovered_open = false;
 	require_published_on(1);
 	reset_active_owner();
+}
+
+UT_TEST(test_binding_memory_error_precedes_allocator_and_cold_selection)
+{
+	for (int cold = 0; cold < 2; cold++) {
+		ClusterCanonicalTxnBinding result;
+		ClusterTTSlotShmem before;
+		volatile bool caught = false;
+
+		reset_active_owner();
+		if (cold) {
+			memset(&allocator_storage, 0, sizeof(allocator_storage));
+			cold_fixture = true;
+		}
+		before = allocator_storage;
+		fail_next_memory_allocation = true;
+		PG_TRY();
+		{
+			(void)cluster_tt_local_prepare_canonical_active(100, &result);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(last_ereport_errcode, ERRCODE_OUT_OF_MEMORY);
+		UT_ASSERT(!fail_next_memory_allocation);
+		UT_ASSERT_EQ(memcmp(&allocator_storage, &before, sizeof(before)), 0);
+		UT_ASSERT_NULL(cluster_tt_local_bindings);
+		UT_ASSERT_EQ(cluster_tt_local_binding_count, 0);
+		UT_ASSERT_EQ(cluster_tt_local_binding_capacity, 0);
+		UT_ASSERT(!cluster_tt_local_has_binding(100));
+		UT_ASSERT(!cluster_tt_local_preabort_durable_finish(100));
+		UT_ASSERT_EQ(cold_selection_calls, 0);
+		UT_ASSERT_EQ(g_bind_emit_calls, 0);
+		UT_ASSERT_EQ(g_ctrc_reserve_calls, 0);
+		UT_ASSERT_EQ(g_current_acquire_calls, 0);
+		UT_ASSERT_EQ(modifier_enters, 1);
+		UT_ASSERT_EQ(modifier_leaves, 1);
+		UT_ASSERT_EQ(lock_depth, 0);
+	}
+}
+
+UT_TEST(test_binding_growth_error_preserves_existing_reservations)
+{
+	ClusterCanonicalTxnBinding result;
+	ClusterTTLocalBinding saved[8];
+	ClusterTTLocalBinding *before_bindings;
+	ClusterTTSlotShmem before;
+	volatile bool caught = false;
+
+	reset_active_owner();
+	/* Seed the existing table through the original private reservation path;
+	 * no durable publication or new transaction authority is simulated. */
+	for (int i = 0; i < 8; i++) {
+		uint32 segment;
+		uint16 slot;
+		uint32 slot_id;
+
+		UT_ASSERT(cluster_tt_local_reserve_binding(101 + i, &segment, &slot, &slot_id));
+	}
+	UT_ASSERT_EQ(cluster_tt_local_binding_count, 8);
+	UT_ASSERT_EQ(cluster_tt_local_binding_capacity, 8);
+	before_bindings = cluster_tt_local_bindings;
+	memcpy(saved, before_bindings, sizeof(saved));
+	before = allocator_storage;
+	fail_next_memory_allocation = true;
+	PG_TRY();
+	{
+		(void)cluster_tt_local_prepare_canonical_active(100, &result);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(last_ereport_errcode, ERRCODE_OUT_OF_MEMORY);
+	UT_ASSERT(!fail_next_memory_allocation);
+	UT_ASSERT_EQ(memcmp(&allocator_storage, &before, sizeof(before)), 0);
+	UT_ASSERT(cluster_tt_local_bindings == before_bindings);
+	UT_ASSERT_EQ(memcmp(cluster_tt_local_bindings, saved, sizeof(saved)), 0);
+	UT_ASSERT_EQ(cluster_tt_local_binding_count, 8);
+	UT_ASSERT_EQ(cluster_tt_local_binding_capacity, 8);
+	UT_ASSERT(!cluster_tt_local_has_binding(100));
+	UT_ASSERT(!cluster_tt_local_preabort_durable_finish(100));
+	UT_ASSERT_EQ(g_bind_emit_calls, 0);
+	UT_ASSERT_EQ(g_ctrc_reserve_calls, 0);
+	UT_ASSERT_EQ(g_current_acquire_calls, 0);
+	UT_ASSERT_EQ(modifier_enters, 1);
+	UT_ASSERT_EQ(modifier_leaves, 1);
+	UT_ASSERT_EQ(lock_depth, 0);
 }
 
 UT_TEST(test_cold_allocator_preserves_occupied_durable_base)
@@ -631,11 +737,67 @@ UT_TEST(test_real_local_postbind_error_stays_failed_without_reallocation)
 	UT_ASSERT_EQ(modifier_leaves, 1);
 }
 
+/* Exercise the real finish consumer with an already-published binding. The
+ * terminal receipt is supplied by this fixture; durable commit/abort admission
+ * is covered separately. Never refresh the binding's identity from the slot. */
+static void
+check_terminal_binding_wrap(bool committed)
+{
+	for (unsigned drift = 0; drift < 6; drift++) {
+		ClusterTTLocalBinding *binding;
+		ClusterTTSlotAllocEntry *entry;
+		int wakeups;
+
+		reset_active_owner();
+		require_published_on(1);
+		binding = cluster_tt_local_bindings;
+		entry = &allocator_storage.per_node[0].slots[binding->slot_offset];
+		binding->terminal_state = committed ? CLUSTER_TT_LOCAL_TERMINAL_COMMIT_STAGED
+											: CLUSTER_TT_LOCAL_TERMINAL_ABORT_DURABLE;
+		if (drift == 1)
+			entry->wrap++;
+		else if (drift == 2)
+			binding->wrap = TT_WRAP_INVALID;
+		else if (drift == 3)
+			entry->xid++;
+		else if (drift == 4)
+			allocator_storage.per_node[0].segment_id = 2;
+		else if (drift == 5) {
+			binding->wrap = TT_WRAP_INVALID;
+			entry->wrap = TT_WRAP_INVALID;
+		}
+		wakeups = g_undo_cleaner_wakeup_calls;
+		cluster_tt_local_finish_bindings(committed, committed ? (SCN)91 : InvalidScn);
+		UT_ASSERT_EQ(entry->status,
+					 drift == 0 ? (committed ? CTS_COMMITTED : CTS_ABORTED) : CTS_ACTIVE);
+		UT_ASSERT_EQ(entry->commit_scn, committed && drift == 0 ? (SCN)91 : InvalidScn);
+		UT_ASSERT_EQ(g_undo_cleaner_wakeup_calls, wakeups + (drift == 0));
+		UT_ASSERT_EQ(entry->xid, drift == 3 ? 101 : 100);
+		UT_ASSERT_EQ(entry->wrap, drift == 5 ? TT_WRAP_INVALID : (drift == 1 ? 1 : 0));
+		UT_ASSERT_EQ(cluster_tt_local_binding_count, 0);
+		UT_ASSERT(cluster_tt_local_bindings == NULL);
+		UT_ASSERT_EQ(lock_depth, 0);
+		free(binding);
+	}
+}
+
+UT_TEST(test_real_local_commit_keeps_bound_wrap)
+{
+	check_terminal_binding_wrap(true);
+}
+
+UT_TEST(test_real_local_abort_keeps_bound_wrap)
+{
+	check_terminal_binding_wrap(false);
+}
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(21);
 	UT_RUN(test_recovered_open_gate_precedes_canonical_reservation);
+	UT_RUN(test_binding_memory_error_precedes_allocator_and_cold_selection);
+	UT_RUN(test_binding_growth_error_preserves_existing_reservations);
 	UT_RUN(test_modifier_refusal_precedes_allocation_and_leaves_abort_without_effects);
 	UT_RUN(test_cold_allocator_preserves_occupied_durable_base);
 	UT_RUN(test_cold_fresh_database_uses_same_publication_path);
@@ -652,6 +814,8 @@ main(void)
 	UT_RUN(test_cancel_after_unpublished_rollover_leaves_no_failed_binding);
 	UT_RUN(test_real_allocator_repeated_prebind_rollover_does_not_grow_bindings);
 	UT_RUN(test_real_local_postbind_error_stays_failed_without_reallocation);
+	UT_RUN(test_real_local_commit_keeps_bound_wrap);
+	UT_RUN(test_real_local_abort_keeps_bound_wrap);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

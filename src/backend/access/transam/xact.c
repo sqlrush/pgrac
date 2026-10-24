@@ -18,6 +18,8 @@
  *
  *	Modified by: SqlRush <sqlrush@gmail.com>
  *	Reconcile prepared undo ownership after abort releases LWLocks.
+ *	Defer DROP SPACE dirty marking until the committed publication.
+ *	Spec: 2026-10-16-pre2-p014-am05-shared-ddl-autocommit.md
  *	Spec: spec-1.16-local-scn-maintenance.md (commit/abort SCN advance)
  *	Spec: spec-1.18-wal-record-xl-scn.md (WAL emit + replay observe)
  *
@@ -1488,7 +1490,13 @@ AtSubStart_ResourceOwner(void)
  * If you change this function, see RecordTransactionCommitPrepared also.
  */
 static TransactionId
-RecordTransactionCommit(void)
+RecordTransactionCommit(
+#ifdef USE_PGRAC_CLUSTER
+	ClusterSpaceDropState **deferred_drop
+#else
+	void
+#endif
+)
 {
 	TransactionId xid = GetTopTransactionIdIfAny();
 	bool		markXidCommitted = TransactionIdIsValid(xid);
@@ -1754,15 +1762,14 @@ RecordTransactionCommit(void)
 			space_drop = cluster_space_drop_prepare(rels, nrels);
 			if (space_drop == NULL)
 				elog(ERROR, "cannot prepare exact SPACE deletion");
+			if (!cluster_space_drop_is_deferred_v4(space_drop)
+				&& !cluster_space_drop_authorize(space_drop))
+				elog(ERROR, "cannot authorize exact SPACE deletion");
 			space_drop_data = cluster_space_drop_wal(space_drop, &space_drop_len);
 		}
 #endif
 		START_CRIT_SECTION();
 		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
-#ifdef USE_PGRAC_CLUSTER
-		if (space_drop != NULL)
-			cluster_space_drop_mark_dirty(space_drop);
-#endif
 
 		/*
 		 * Insert the commit XLOG record.
@@ -1909,7 +1916,10 @@ RecordTransactionCommit(void)
 		if (space_drop != NULL)
 		{
 			Assert(commit_record_flushed);
-			cluster_space_drop_publish(space_drop, XactLastRecEnd);
+			if (cluster_space_drop_is_deferred_v4(space_drop))
+				cluster_space_drop_defer_v4(space_drop, XactLastRecEnd);
+			else
+				cluster_space_drop_publish(space_drop, XactLastRecEnd);
 		}
 #endif
 		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
@@ -1919,7 +1929,10 @@ RecordTransactionCommit(void)
 #ifdef USE_PGRAC_CLUSTER
 	if (space_drop != NULL)
 	{
-		cluster_space_drop_finish(space_drop);
+		if (cluster_space_drop_is_deferred_v4(space_drop))
+			*deferred_drop = space_drop;
+		else
+			cluster_space_drop_finish(space_drop);
 		space_drop = NULL;
 	}
 	if (markXidCommitted)
@@ -2149,6 +2162,18 @@ AtSubCommit_childXids(void)
  * Returns latest XID among xact and its children, or InvalidTransactionId
  * if the xact has no XID.  (We compute that here just because it's easier.)
  */
+/* Observational only: do not run inside a critical section or buffer lock. */
+static void
+cluster_xact_trace_cleanup(const char *stage)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_trace_cleanup && CritSectionCount == 0)
+		elog(LOG, "cluster cleanup stage=%s xid=%u cid=%u hold=%u critical=%u",
+			 stage, GetTopTransactionIdIfAny(), GetCurrentCommandId(false),
+			 InterruptHoldoffCount, CritSectionCount);
+#endif
+}
+
 static TransactionId
 RecordTransactionAbort(bool isSubXact)
 {
@@ -2307,6 +2332,7 @@ RecordTransactionAbort(bool isSubXact)
 	TransactionIdAbortTree(xid, nchildren, children);
 
 	END_CRIT_SECTION();
+	cluster_xact_trace_cleanup("abort_wal_clog_done");
 
 	/*
 	 * PGRAC (spec-3.1 D6):  record ABORTED into in-memory cluster Undo TT
@@ -2316,7 +2342,11 @@ RecordTransactionAbort(bool isSubXact)
 	 */
 #ifdef USE_PGRAC_CLUSTER
 	if (!isSubXact && cluster_storage_mode_enabled() && cluster_tt_local_has_binding(xid))
+	{
+		cluster_xact_trace_cleanup("tt_local_abort_enter");
 		cluster_tt_local_record_abort(xid);
+		cluster_xact_trace_cleanup("tt_local_abort_done");
+	}
 #endif
 
 	/* Compute latestXid while we have the child XIDs handy */
@@ -2695,6 +2725,9 @@ CommitTransaction(void)
 	TransactionState s = CurrentTransactionState;
 	TransactionId latestXid;
 	bool		is_parallel_worker;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterSpaceDropState *deferred_space_drop = NULL;
+#endif
 
 	is_parallel_worker = (s->blockState == TBLOCK_PARALLEL_INPROGRESS);
 
@@ -2905,7 +2938,11 @@ CommitTransaction(void)
 		 * We need to mark our XIDs as committed in pg_xact.  This is where we
 		 * durably commit.
 		 */
+#ifdef USE_PGRAC_CLUSTER
+		latestXid = RecordTransactionCommit(&deferred_space_drop);
+#else
 		latestXid = RecordTransactionCommit();
+#endif
 	}
 	else
 	{
@@ -2988,7 +3025,29 @@ CommitTransaction(void)
 	 */
 	AtEOXact_Inval(true);
 
+#ifdef USE_PGRAC_CLUSTER
+	/* Record the successful publication in the original committed DROP
+	 * owner before releasing its AX or handing off pending file deletion. */
+	if (!is_parallel_worker)
+		cluster_ko_shared_native_publication_v3();
+#endif
+
 	AtEOXact_MultiXact();
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: collect committed object results after local cleanup while the
+	 * original AX is still held. Unfinished physical work stays native-owned.
+	 * Spec: 2026-10-16-pre2-p014-am05-shared-ddl-autocommit.md */
+	if (!is_parallel_worker)
+	{
+		cluster_ko_shared_native_window_v4(deferred_space_drop);
+		/* The immutable COMMIT remains in WAL and the original native owner
+		 * retains unfinished work. Release only this private preparation. */
+		if (deferred_space_drop != NULL)
+			cluster_space_drop_finish(deferred_space_drop);
+		deferred_space_drop = NULL;
+	}
+#endif
 
 	ResourceOwnerRelease(TopTransactionResourceOwner,
 						 RESOURCE_RELEASE_LOCKS,
@@ -3671,12 +3730,20 @@ AbortTransactionBody(void)
 	/*
 	 * do abort processing
 	 */
+	cluster_xact_trace_cleanup("triggers_enter");
 	AfterTriggerEndXact(false); /* 'false' means it's abort */
+	cluster_xact_trace_cleanup("triggers_done");
+	cluster_xact_trace_cleanup("portals_enter");
 	AtAbort_Portals();
+	cluster_xact_trace_cleanup("portals_done");
+	cluster_xact_trace_cleanup("pending_sync_enter");
 	smgrDoPendingSyncs(false, is_parallel_worker);
+	cluster_xact_trace_cleanup("pending_sync_done");
 	AtEOXact_LargeObject(false);
 	AtAbort_Notify();
+	cluster_xact_trace_cleanup("relmap_enter");
 	AtEOXact_RelationMap(false, is_parallel_worker);
+	cluster_xact_trace_cleanup("relmap_done");
 	AtAbort_Twophase();
 
 	/*
@@ -3686,7 +3753,11 @@ AbortTransactionBody(void)
 	 * record.
 	 */
 	if (!is_parallel_worker)
+	{
+		cluster_xact_trace_cleanup("record_abort_enter");
 		latestXid = RecordTransactionAbort(false);
+		cluster_xact_trace_cleanup("record_abort_done");
+	}
 	else
 	{
 		latestXid = InvalidTransactionId;
@@ -3706,7 +3777,9 @@ AbortTransactionBody(void)
 	 * must be done _before_ releasing locks we hold and _after_
 	 * RecordTransactionAbort.
 	 */
+	cluster_xact_trace_cleanup("procarray_enter");
 	ProcArrayEndTransaction(MyProc, latestXid);
+	cluster_xact_trace_cleanup("procarray_done");
 
 	/*
 	 * Post-abort cleanup.  See notes in CommitTransaction() concerning
@@ -3720,20 +3793,34 @@ AbortTransactionBody(void)
 		else
 			CallXactCallbacks(XACT_EVENT_ABORT);
 
+		cluster_xact_trace_cleanup("resources_before_locks_enter");
 		ResourceOwnerRelease(TopTransactionResourceOwner,
 							 RESOURCE_RELEASE_BEFORE_LOCKS,
 							 false, true);
+		cluster_xact_trace_cleanup("resources_before_locks_done");
+		cluster_xact_trace_cleanup("buffers_enter");
 		AtEOXact_Buffers(false);
+		cluster_xact_trace_cleanup("buffers_done");
+		cluster_xact_trace_cleanup("relcache_enter");
 		AtEOXact_RelationCache(false);
+		cluster_xact_trace_cleanup("relcache_done");
+		cluster_xact_trace_cleanup("inval_enter");
 		AtEOXact_Inval(false);
+		cluster_xact_trace_cleanup("inval_done");
 		AtEOXact_MultiXact();
+		cluster_xact_trace_cleanup("resources_locks_enter");
 		ResourceOwnerRelease(TopTransactionResourceOwner,
 							 RESOURCE_RELEASE_LOCKS,
 							 false, true);
+		cluster_xact_trace_cleanup("resources_locks_done");
+		cluster_xact_trace_cleanup("resources_after_locks_enter");
 		ResourceOwnerRelease(TopTransactionResourceOwner,
 							 RESOURCE_RELEASE_AFTER_LOCKS,
 							 false, true);
+		cluster_xact_trace_cleanup("resources_after_locks_done");
+		cluster_xact_trace_cleanup("pending_delete_enter");
 		smgrDoPendingDeletes(false);
+		cluster_xact_trace_cleanup("pending_delete_done");
 
 		AtEOXact_GUC(false, 1);
 		AtEOXact_SPI(false);
@@ -3753,6 +3840,7 @@ AbortTransactionBody(void)
 	/*
 	 * State remains TRANS_ABORT until CleanupTransaction().
 	 */
+	cluster_xact_trace_cleanup("abort_body_done");
 	RESUME_INTERRUPTS();
 }
 

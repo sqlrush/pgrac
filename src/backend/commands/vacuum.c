@@ -23,6 +23,9 @@
  *	  Modified by: SqlRush <sqlrush@gmail.com>
  *	  - Validate shared heap freeze boundaries using cluster_heap_horizon.
  *	  - Retain a transaction snapshot during shared database maintenance.
+ *	  - Use durable legal-next XID age for shared aggressive scans.
+ *	  - Bound shared rel/datfrozenxid merges by a durable FullXid window.
+ *	  - Reject native maintenance outside that shared catalogue window.
  *
  *-------------------------------------------------------------------------
  */
@@ -56,6 +59,7 @@
 #include "postmaster/interrupt.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
+#include "storage/lwlock.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
@@ -71,6 +75,8 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_heap_horizon.h"
 #include "cluster/cluster_mode.h"
+#include "cluster/cluster_xid_stripe.h"
+#include "cluster/cluster_xid_stripe_boot.h"
 #endif
 
 
@@ -1109,6 +1115,12 @@ vacuum_get_cutoffs(Relation rel, const VacuumParams *params,
 				safeOldestMxact,
 				aggressiveMXIDCutoff;
 
+#ifdef USE_PGRAC_CLUSTER
+	/* Never reuse a preceding relation's observed FullXid policy cut. */
+	cutoffs->SharedFreezeLimitFull = InvalidFullTransactionId;
+	memset(&cutoffs->SharedFreezePolicySample, 0, sizeof(cutoffs->SharedFreezePolicySample));
+#endif
+
 	/* Use mutable copies of freeze age parameters */
 	freeze_min_age = params->freeze_min_age;
 	multixact_freeze_min_age = params->multixact_freeze_min_age;
@@ -1260,12 +1272,38 @@ vacuum_get_cutoffs(Relation rel, const VacuumParams *params,
 		freeze_table_age = vacuum_freeze_table_age;
 	freeze_table_age = Min(freeze_table_age, autovacuum_freeze_max_age * 0.95);
 	Assert(freeze_table_age >= 0);
-	aggressiveXIDCutoff = nextXID - freeze_table_age;
-	if (!TransactionIdIsNormal(aggressiveXIDCutoff))
-		aggressiveXIDCutoff = FirstNormalTransactionId;
-	if (TransactionIdPrecedesOrEquals(rel->rd_rel->relfrozenxid,
-									  aggressiveXIDCutoff))
-		return true;
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config && rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT) {
+		ClusterHeapFreezePolicySampleV1 sample;
+
+		/*
+		 * Use one legal-next sample for both age policies, still capped
+		 * by the original activation-clamped OldestXmin. Missing evidence
+		 * requests a full scan without advancing the freeze boundary.
+		 */
+		if (!cluster_heap_freeze_policy_sample_v1(cutoffs->OldestXmin, cutoffs->relfrozenxid,
+											freeze_min_age, freeze_table_age, &sample)) {
+			cutoffs->FreezeLimit = cutoffs->relfrozenxid;
+			if (TransactionIdPrecedes(cutoffs->OldestXmin, cutoffs->FreezeLimit))
+				cutoffs->FreezeLimit = cutoffs->OldestXmin;
+			return true;
+		}
+		/* Preserve the same sample for later shared preparation; this does
+		 * not qualify the global candidate as F/H or authorize mutation. */
+		cutoffs->SharedFreezePolicySample = sample;
+		cutoffs->SharedFreezeLimitFull = sample.freeze_limit;
+		cutoffs->FreezeLimit = XidFromFullTransactionId(sample.freeze_limit);
+		if (sample.aggressive)
+			return true;
+	} else
+#endif
+	{
+		aggressiveXIDCutoff = nextXID - freeze_table_age;
+		if (!TransactionIdIsNormal(aggressiveXIDCutoff))
+			aggressiveXIDCutoff = FirstNormalTransactionId;
+		if (TransactionIdPrecedesOrEquals(rel->rd_rel->relfrozenxid, aggressiveXIDCutoff))
+			return true;
+	}
 
 	/*
 	 * Similar to the above, determine the table freeze age to use for
@@ -1477,6 +1515,30 @@ vac_update_relstats(Relation relation,
 				futuremxid;
 	TransactionId oldfrozenxid;
 	MultiXactId oldminmulti;
+#ifdef USE_PGRAC_CLUSTER
+	bool		shared_xid = cluster_storage_mode_enabled() && cluster_shared_catalog;
+	FullTransactionId legal_next = InvalidFullTransactionId;
+
+	/*
+	 * Capture the existing durable allocation bound before the inplace lock:
+	 * neither XidGenLock nor the stripe fence belongs under a content lock.
+	 * This retained bound only rejects unprovable catalogue advances.  It is
+	 * not F, a tuple-freeze certificate, or a new permission to advance one.
+	 */
+	if (shared_xid && TransactionIdIsNormal(frozenxid) && cluster_xid_striping &&
+		ShmemVariableCache != NULL)
+	{
+		ClusterXidStripeSampleFence fence;
+		bool		sampled;
+
+		LWLockAcquire(XidGenLock, LW_SHARED);
+		sampled = cluster_xid_stripe_sample_future(ShmemVariableCache->nextXid,
+												 &legal_next, &fence);
+		LWLockRelease(XidGenLock);
+		if (!sampled || !cluster_xid_stripe_sample_fence_current(&fence))
+			legal_next = InvalidFullTransactionId;
+	}
+#endif
 
 	rd = table_open(RelationRelationId, RowExclusiveLock);
 
@@ -1546,6 +1608,13 @@ vac_update_relstats(Relation relation,
 	 * it's corrupt, and overwrite with the oldest remaining XID in the table.
 	 * This should match vac_update_datfrozenxid() concerning what we consider
 	 * to be "in the future".
+	 *
+	 * PGRAC: a shared catalogue value can legitimately exceed this node's
+	 * local nextXid.  Do not use that local bound to lower the value reread
+	 * under the original current-X/inplace lock.  Both shared values must
+	 * fit the captured durable FullXid window before a monotone merge.  A
+	 * missing or ambiguous window leaves the XID alone; statistics and MX
+	 * still follow their independent original paths.
 	 */
 	oldfrozenxid = pgcform->relfrozenxid;
 	futurexid = false;
@@ -1555,6 +1624,26 @@ vac_update_relstats(Relation relation,
 	{
 		bool		update = false;
 
+#ifdef USE_PGRAC_CLUSTER
+		if (shared_xid)
+		{
+			FullTransactionId current_full = cluster_xid_widen(oldfrozenxid, legal_next);
+			FullTransactionId proposed_full = cluster_xid_widen(frozenxid, legal_next);
+			uint64		next = U64FromFullTransactionId(legal_next);
+			uint64		current = U64FromFullTransactionId(current_full);
+			uint64		proposed = U64FromFullTransactionId(proposed_full);
+
+			if (FullTransactionIdIsValid(legal_next) &&
+				TransactionIdIsNormal(XidFromFullTransactionId(legal_next)) &&
+				FullTransactionIdIsValid(current_full) &&
+				FullTransactionIdIsValid(proposed_full) &&
+				current <= next && proposed <= next &&
+				next - current < UINT64CONST(0x80000000) &&
+				next - proposed < UINT64CONST(0x80000000))
+				update = current < proposed;
+		}
+		else
+#endif
 		if (TransactionIdPrecedes(oldfrozenxid, frozenxid))
 			update = true;
 		else if (TransactionIdPrecedes(ReadNextTransactionId(), oldfrozenxid))
@@ -1668,7 +1757,12 @@ vac_update_datfrozenxid(void)
 #endif
 }
 
-/* PGRAC: retain the original maintenance decisions and conservative returns. */
+/*
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: scan and merge shared database XIDs in one legal window.
+ * Why: local raw-XID ordering cannot validate a shared catalogue value.
+ * Retain the original oldest seed, MX decisions and native truncation guards.
+ */
 static void
 vac_update_datfrozenxid_internal(void)
 {
@@ -1683,8 +1777,16 @@ vac_update_datfrozenxid_internal(void)
 	MultiXactId lastSaneMinMulti;
 	bool		bogus = false;
 	bool		dirty = false;
+	bool		update_frozen = false;
 	ScanKeyData key[1];
 	void	   *inplace_state;
+#ifdef USE_PGRAC_CLUSTER
+	bool		shared_xid = cluster_storage_mode_enabled() && cluster_shared_catalog;
+	FullTransactionId legal_next = InvalidFullTransactionId;
+	FullTransactionId newFrozenFull = InvalidFullTransactionId;
+	ClusterXidStripeSampleFence fence;
+	bool sampled = false;
+#endif
 
 	/*
 	 * Restrict this task to one backend per database.  This avoids race
@@ -1716,6 +1818,32 @@ vac_update_datfrozenxid_internal(void)
 	 */
 	lastSaneFrozenXid = ReadNextTransactionId();
 	lastSaneMinMulti = ReadNextMultiXactId();
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: another node's relfrozenxid can exceed local nextXid.  Fold
+	 * shared XIDs against one legal FullXid sample, without holding the
+	 * allocator lock across catalogue I/O.  An unknown seed/window cannot
+	 * advance datfrozenxid, but does not prevent the independent MX scan.
+	 */
+	if (shared_xid && cluster_xid_striping && ShmemVariableCache != NULL) {
+		uint64 next_value;
+		uint64 seed_value;
+
+		LWLockAcquire(XidGenLock, LW_SHARED);
+		sampled
+			= cluster_xid_stripe_sample_future(ShmemVariableCache->nextXid, &legal_next, &fence);
+		LWLockRelease(XidGenLock);
+		newFrozenFull = cluster_xid_widen(newFrozenXid, legal_next);
+		next_value = U64FromFullTransactionId(legal_next);
+		seed_value = U64FromFullTransactionId(newFrozenFull);
+		if (!sampled || !FullTransactionIdIsValid(legal_next)
+			|| !TransactionIdIsNormal(XidFromFullTransactionId(legal_next))
+			|| !FullTransactionIdIsValid(newFrozenFull) || seed_value > next_value
+			|| next_value - seed_value >= UINT64CONST(0x80000000))
+			legal_next = InvalidFullTransactionId;
+	}
+#endif
 
 	/*
 	 * We must seqscan pg_class to find the minimum Xid, because there is no
@@ -1764,18 +1892,38 @@ vac_update_datfrozenxid_internal(void)
 
 		if (TransactionIdIsValid(relfrozenxid))
 		{
-			Assert(TransactionIdIsNormal(relfrozenxid));
+#ifdef USE_PGRAC_CLUSTER
+			if (shared_xid) {
+				if (FullTransactionIdIsValid(legal_next)) {
+					FullTransactionId relfull = cluster_xid_widen(relfrozenxid, legal_next);
+					uint64 next_value = U64FromFullTransactionId(legal_next);
+					uint64 rel_value = U64FromFullTransactionId(relfull);
 
-			/* check for values in the future */
-			if (TransactionIdPrecedes(lastSaneFrozenXid, relfrozenxid))
+					if (!FullTransactionIdIsValid(relfull) || rel_value > next_value
+						|| next_value - rel_value >= UINT64CONST(0x80000000)) {
+						bogus = true;
+						break;
+					}
+					if (rel_value < U64FromFullTransactionId(newFrozenFull)) {
+						newFrozenFull = relfull;
+						newFrozenXid = relfrozenxid;
+					}
+				}
+			} else
+#endif
 			{
-				bogus = true;
-				break;
-			}
+				Assert(TransactionIdIsNormal(relfrozenxid));
 
-			/* determine new horizon */
-			if (TransactionIdPrecedes(relfrozenxid, newFrozenXid))
-				newFrozenXid = relfrozenxid;
+				/* check for values in the future */
+				if (TransactionIdPrecedes(lastSaneFrozenXid, relfrozenxid)) {
+					bogus = true;
+					break;
+				}
+
+				/* determine new horizon */
+				if (TransactionIdPrecedes(relfrozenxid, newFrozenXid))
+					newFrozenXid = relfrozenxid;
+			}
 		}
 
 		if (MultiXactIdIsValid(relminmxid))
@@ -1804,6 +1952,12 @@ vac_update_datfrozenxid_internal(void)
 	Assert(TransactionIdIsNormal(newFrozenXid));
 	Assert(MultiXactIdIsValid(newMinMulti));
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: the same lease identity must still cover the completed scan. */
+	if (sampled && !cluster_xid_stripe_sample_fence_current(&fence))
+		legal_next = InvalidFullTransactionId;
+#endif
+
 	/* Now fetch the pg_database tuple we need to update. */
 	relation = table_open(DatabaseRelationId, RowExclusiveLock);
 
@@ -1830,10 +1984,42 @@ vac_update_datfrozenxid_internal(void)
 	 * As in vac_update_relstats(), we ordinarily don't want to let
 	 * datfrozenxid go backward; but if it's "in the future" then it must be
 	 * corrupt and it seems best to overwrite it.
+	 *
+	 * PGRAC: another node may have advanced the shared tuple after our scan.
+	 * Preserve that locked value even when it exceeds our local scan bound.
 	 */
-	if (dbform->datfrozenxid != newFrozenXid &&
-		(TransactionIdPrecedes(dbform->datfrozenxid, newFrozenXid) ||
-		 TransactionIdPrecedes(lastSaneFrozenXid, dbform->datfrozenxid)))
+	if (dbform->datfrozenxid != newFrozenXid)
+	{
+#ifdef USE_PGRAC_CLUSTER
+		if (shared_xid)
+		{
+			/*
+			 * PGRAC: keep an unknown, future or ambiguous locked value.
+			 * Only merge two values inside the same proven legal window.
+			 */
+			FullTransactionId current = cluster_xid_widen(dbform->datfrozenxid,
+															 legal_next);
+			FullTransactionId proposed = cluster_xid_widen(newFrozenXid, legal_next);
+			uint64		next_value = U64FromFullTransactionId(legal_next);
+			uint64		current_value = U64FromFullTransactionId(current);
+			uint64		proposed_value = U64FromFullTransactionId(proposed);
+
+			if (FullTransactionIdIsValid(legal_next) &&
+				TransactionIdIsNormal(XidFromFullTransactionId(legal_next)) &&
+				FullTransactionIdIsValid(current) &&
+				FullTransactionIdIsValid(proposed) &&
+				current_value <= next_value && proposed_value <= next_value &&
+				next_value - current_value < UINT64CONST(0x80000000) &&
+				next_value - proposed_value < UINT64CONST(0x80000000))
+				update_frozen = current_value < proposed_value;
+		}
+		else
+#endif
+		if (TransactionIdPrecedes(dbform->datfrozenxid, newFrozenXid) ||
+			TransactionIdPrecedes(lastSaneFrozenXid, dbform->datfrozenxid))
+			update_frozen = true;
+	}
+	if (update_frozen)
 	{
 		dbform->datfrozenxid = newFrozenXid;
 		dirty = true;
@@ -1870,6 +2056,26 @@ vac_update_datfrozenxid_internal(void)
 						  lastSaneFrozenXid, lastSaneMinMulti);
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Check a raw catalogue XID against one captured legal allocation window. */
+static bool
+vacuum_xid_in_legal_window(TransactionId xid, FullTransactionId legal_next)
+{
+	FullTransactionId full;
+	uint64		next_value;
+	uint64		value;
+
+	if (!TransactionIdIsNormal(xid) || !FullTransactionIdIsValid(legal_next) ||
+		!TransactionIdIsNormal(XidFromFullTransactionId(legal_next)))
+		return false;
+
+	full = cluster_xid_widen(xid, legal_next);
+	next_value = U64FromFullTransactionId(legal_next);
+	value = U64FromFullTransactionId(full);
+	return FullTransactionIdIsValid(full) && value <= next_value &&
+		next_value - value < UINT64CONST(0x80000000);
+}
+#endif
 
 /*
  *	vac_truncate_clog() -- attempt to truncate the commit log
@@ -1894,7 +2100,8 @@ vac_truncate_clog(TransactionId frozenXID,
 				  TransactionId lastSaneFrozenXid,
 				  MultiXactId lastSaneMinMulti)
 {
-	TransactionId nextXID = ReadNextTransactionId();
+	TransactionId nextXID;
+	TransactionId truncateXID;
 	Relation	relation;
 	TableScanDesc scan;
 	HeapTuple	tuple;
@@ -1902,8 +2109,36 @@ vac_truncate_clog(TransactionId frozenXID,
 	Oid			minmulti_datoid;
 	bool		bogus = false;
 	bool		frozenAlreadyWrapped = false;
+	bool		truncate_xid = true;
+#ifdef USE_PGRAC_CLUSTER
+	bool		shared_xid = cluster_storage_mode_enabled() && cluster_shared_catalog;
+	bool		have_watermark = false;
+	FullTransactionId legal_next = InvalidFullTransactionId;
+	ClusterXidStripeSampleFence fence;
+	ClusterHeapFreezeWatermark watermark;
 
-	/* Restrict task to one backend per cluster; see SimpleLruTruncate(). */
+	/* Sample before taking the native maintenance lock or doing catalogue I/O. */
+	if (shared_xid)
+	{
+		bool		sampled;
+
+		if (!cluster_xid_striping || ShmemVariableCache == NULL)
+			return;
+		LWLockAcquire(XidGenLock, LW_SHARED);
+		sampled = cluster_xid_stripe_sample_future(ShmemVariableCache->nextXid,
+												 &legal_next, &fence);
+		LWLockRelease(XidGenLock);
+		if (!sampled || !vacuum_xid_in_legal_window(frozenXID, legal_next) ||
+			!vacuum_xid_in_legal_window(lastSaneFrozenXid, legal_next))
+			return;
+		/* Bounded local observation, outside allocation/maintenance locks. */
+		have_watermark = cluster_heap_freeze_watermark_sample(&watermark);
+	}
+#endif
+
+	nextXID = ReadNextTransactionId();
+
+	/* Restrict task to one backend in this instance; see SimpleLruTruncate(). */
 	LWLockAcquire(WrapLimitsVacuumLock, LW_EXCLUSIVE);
 
 	/* init oldest datoids to sync with my frozenXID/minMulti values */
@@ -1938,9 +2173,6 @@ vac_truncate_clog(TransactionId frozenXID,
 		TransactionId datfrozenxid = dbform->datfrozenxid;
 		TransactionId datminmxid = dbform->datminmxid;
 
-		Assert(TransactionIdIsNormal(datfrozenxid));
-		Assert(MultiXactIdIsValid(datminmxid));
-
 		/*
 		 * If database is in the process of getting dropped, or has been
 		 * interrupted while doing so, no connections to it are possible
@@ -1954,6 +2186,16 @@ vac_truncate_clog(TransactionId frozenXID,
 				 NameStr(dbform->datname));
 			continue;
 		}
+
+#ifdef USE_PGRAC_CLUSTER
+		if (shared_xid && !vacuum_xid_in_legal_window(datfrozenxid, legal_next))
+		{
+			bogus = true;
+			continue;
+		}
+#endif
+		Assert(TransactionIdIsNormal(datfrozenxid));
+		Assert(MultiXactIdIsValid(datminmxid));
 
 		/*
 		 * If things are working properly, no database should have a
@@ -2009,11 +2251,48 @@ vac_truncate_clog(TransactionId frozenXID,
 		return;
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	/* This is an additional refusal, not a freeze certificate or a pin proof. */
+	if (shared_xid && !cluster_xid_stripe_sample_fence_current(&fence))
+	{
+		LWLockRelease(WrapLimitsVacuumLock);
+		return;
+	}
+#endif
+
+	truncateXID = frozenXID;
+#ifdef USE_PGRAC_CLUSTER
+	if (shared_xid)
+	{
+		uint64		next = U64FromFullTransactionId(legal_next);
+		uint64		global_min = have_watermark ? watermark.active_full_xid_min : 0;
+
+		/*
+		 * F can only retain additional XID history. It cannot replace the
+		 * database scan or the native owners' pin/protection obligations.
+		 * Unknown or ambiguous F defers XID history maintenance, while MX
+		 * and the real database wrap/warn/stop limits remain independent.
+		 */
+		if (!have_watermark || global_min < FirstNormalTransactionId ||
+			!TransactionIdIsNormal((TransactionId) global_min) ||
+			global_min > next || next - global_min >= UINT64CONST(0x80000000))
+			truncate_xid = false;
+		else
+		{
+			FullTransactionId database_min = cluster_xid_widen(frozenXID, legal_next);
+
+			truncateXID = (TransactionId) Min(U64FromFullTransactionId(database_min),
+											global_min);
+		}
+	}
+#endif
+
 	/*
 	 * Freeze any old transaction IDs in the async notification queue before
 	 * CLOG truncation.
 	 */
-	AsyncNotifyFreezeXids(frozenXID);
+	if (truncate_xid)
+		AsyncNotifyFreezeXids(truncateXID);
 
 	/*
 	 * Advance the oldest value for commit timestamps before truncating, so
@@ -2022,13 +2301,17 @@ vac_truncate_clog(TransactionId frozenXID,
 	 * found" error from slru.c.  This doesn't matter for xact/multixact
 	 * because they are not subject to arbitrary lookups from users.
 	 */
-	AdvanceOldestCommitTsXid(frozenXID);
+	if (truncate_xid)
+		AdvanceOldestCommitTsXid(truncateXID);
 
 	/*
 	 * Truncate CLOG, multixact and CommitTs to the oldest computed value.
 	 */
-	TruncateCLOG(frozenXID, oldestxid_datoid);
-	TruncateCommitTs(frozenXID);
+	if (truncate_xid)
+	{
+		TruncateCLOG(truncateXID, oldestxid_datoid);
+		TruncateCommitTs(truncateXID);
+	}
 	TruncateMultiXact(minMulti, minmulti_datoid);
 
 	/*

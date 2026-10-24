@@ -38,6 +38,7 @@
 #include "access/htup_details.h"
 #include "access/multixact.h"
 #include "access/transam.h"
+#include "access/xact.h"
 #include "access/xlog.h"
 #include "catalog/pg_class_d.h"
 #include "miscadmin.h"
@@ -49,6 +50,8 @@
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_itl.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_mxid_stripe.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
@@ -65,6 +68,7 @@
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/storage/cluster_undo_xlog.h"
+#include "cluster/storage/cluster_smgr.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_xid_stripe.h"
@@ -72,16 +76,18 @@
 #include "storage/buf_internals.h"
 #include "storage/backendid.h"
 #include "storage/bufpage.h"
+#include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
 #include "storage/shmem.h"
 #include "portability/instr_time.h"
 #include "utils/memutils.h"
 #include "utils/palloc.h"
+#include "utils/timestamp.h"
 #endif
 
 #define CLUSTER_CTRC_SHMEM_MAGIC UINT32_C(0x43545243)
-#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(11)
+#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(12)
 #ifndef CLUSTER_CTRC_TEST_TABLE_VISIT
 #define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) ((void)0)
 #endif
@@ -187,6 +193,24 @@ ctrc_txn_key_valid(const ClusterCtrcTxnKeyV1 *key)
 		   && key->admission_record_generation != 0 && key->root_descriptor_incarnation != 0
 		   && key->root_id != 0 && key->root_generation != 0
 		   && ctrc_bytes_zero(key->reserved, sizeof(key->reserved));
+}
+
+bool
+cluster_ctrc_origin_original_full_xid_exact(const ClusterCtrcOriginEntry *origin,
+														const ClusterCtrcTxnKeyV1 *key,
+														FullTransactionId *full_xid_out)
+{
+	if (full_xid_out != NULL)
+		*full_xid_out = InvalidFullTransactionId;
+	if (origin == NULL || !ctrc_txn_key_valid(key) || full_xid_out == NULL
+		|| memcmp(&origin->key, key, sizeof(*key)) != 0
+		|| origin->state < CTRC_ORIGIN_OPEN || origin->state > CTRC_ORIGIN_RELEASE_PROVEN
+		|| origin->reservation_generation == 0 || origin->reservation_generation == UINT64_MAX
+		|| !FullTransactionIdIsNormal(origin->original_full_xid)
+		|| XidFromFullTransactionId(origin->original_full_xid) != key->xid)
+		return false;
+	*full_xid_out = origin->original_full_xid;
+	return true;
 }
 
 static bool
@@ -1470,6 +1494,8 @@ typedef struct ClusterCtrcSharedHeader {
 	uint64 global_request_generation;
 	uint64 full_refusal_count;
 	pg_atomic_uint64 stats[CTRC_STAT_COUNT];
+	/* Saturating, postmaster-local identity-ingress invalidation sequence. */
+	pg_atomic_uint64 unqualified_registration_generation;
 	pg_atomic_uint64 test_barrier_hit_count;
 	pg_atomic_uint32 test_barrier_phase;
 	CtrcCleanerWorkerObservationShared workers[CLUSTER_CTRC_CLEANER_WORKERS];
@@ -1792,6 +1818,210 @@ ctrc_participant_locks_release(uint32 mask)
 			LWLockRelease(&CtrcShared->participant_locks[i].lock);
 }
 
+/* Called under the original participant shard lock, before publication.
+ * A foreign/unknown receiver has no local origin/PGPROC handoff that an
+ * earlier cursor can rely on. Revoke local observations even if its slot
+ * was already visited. Exact local origin -> participant transfers retain
+ * the original ordered-scan protection and need no restart. */
+static void
+ctrc_note_unqualified_registration(void)
+{
+	uint64 generation;
+
+	generation = pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation);
+	while (generation != UINT64_MAX
+		&& !pg_atomic_compare_exchange_u64(&CtrcShared->unqualified_registration_generation,
+			&generation, generation + 1))
+		;
+	/* Saturation permanently refuses new samples; never wrap into an old cut. */
+}
+
+bool
+cluster_ctrc_active_scan_registration_current(const ClusterCtrcActiveScan *scan)
+{
+	return scan != NULL && ctrc_runtime_attached()
+		&& (scan->status == CTRC_ACTIVE_SCAN_INCOMPLETE || scan->status == CTRC_ACTIVE_SCAN_COMPLETE)
+		&& scan->unqualified_registration_generation != 0
+		&& scan->unqualified_registration_generation != UINT64_MAX
+		&& scan->unqualified_registration_generation
+			== pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation);
+}
+
+/* A sample scans the original fixed arrays without consuming cleaner budgets.
+ * The captured reference is only the widening anchor, not a legal future xid. */
+bool
+cluster_ctrc_active_scan_begin(ClusterCtrcActiveScan *scan, FullTransactionId reference_full)
+{
+	if (scan == NULL)
+		return false;
+	MemSet(scan, 0, sizeof(*scan));
+	scan->status = CTRC_ACTIVE_SCAN_INVALID;
+	if (!FullTransactionIdIsValid(reference_full)
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(reference_full))
+		|| !cluster_ctrc_shmem_ready()
+		|| CtrcShared->origin_key_entries > UINT64_MAX - CtrcShared->participant_key_entries)
+		return false;
+	scan->unqualified_registration_generation
+		= pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation);
+	if (scan->unqualified_registration_generation == 0
+		|| scan->unqualified_registration_generation == UINT64_MAX)
+		return false;
+	scan->reference_full = reference_full;
+	scan->min_full = reference_full;
+	scan->total_entries = CtrcShared->origin_key_entries + CtrcShared->participant_key_entries;
+	scan->status = CTRC_ACTIVE_SCAN_INCOMPLETE;
+	return true;
+}
+
+static void
+ctrc_active_scan_step(ClusterCtrcActiveScan *scan,
+					  const ClusterSemanticActiveSampleFence *source)
+{
+	if (scan == NULL || scan->status != CTRC_ACTIVE_SCAN_INCOMPLETE)
+		return;
+	scan->lock_busy = false;
+	/* The source is the worker's original semantic cut, not a newly sampled
+	 * lease owner. Validate it before acquiring any census entry lock. */
+	if (source != NULL
+		&& (source->system_identifier == 0 || source->record_generation == 0
+			|| source->formation_epoch == 0 || source->formation_epoch > UINT32_MAX
+			|| source->local_boot_incarnation == 0 || source->local_node_id < 0
+			|| source->local_node_id >= CLUSTER_MAX_NODES
+			|| ((source->local_node_id < 64 ? source->admitted_members_lo
+											 : source->admitted_members_hi)
+				& (UINT64_C(1) << (source->local_node_id % 64))) == 0
+			|| source->admitted_incarnation[source->local_node_id]
+				   != source->local_boot_incarnation))
+		goto invalid;
+	if (!cluster_ctrc_active_scan_registration_current(scan)
+		|| CtrcShared->origin_key_entries > UINT64_MAX - CtrcShared->participant_key_entries
+		|| scan->total_entries
+			   != CtrcShared->origin_key_entries + CtrcShared->participant_key_entries
+		|| scan->next_index >= scan->total_entries
+		|| !FullTransactionIdIsValid(scan->reference_full)
+		|| !FullTransactionIdIsValid(scan->min_full))
+		goto invalid;
+
+	for (unsigned visited = 0;
+		 visited < CLUSTER_CTRC_ACTIVE_SCAN_SLICE && scan->next_index < scan->total_entries;
+		 visited++) {
+		ClusterCtrcTxnKeyV1 key;
+		FullTransactionId full = InvalidFullTransactionId;
+		LWLock *lock;
+		uint64 index = scan->next_index;
+		bool occupied, valid, is_origin = index < CtrcShared->origin_key_entries;
+
+		if (is_origin) {
+			ClusterCtrcOriginEntry *entry = &ctrc_origin_entries()[index];
+
+			lock = &CtrcShared->origin_lock;
+			if (!LWLockConditionalAcquire(lock, LW_SHARED)) {
+				scan->lock_busy = true;
+				return;
+			}
+			occupied = !ctrc_bytes_zero(entry, sizeof(*entry));
+			key = entry->key;
+			full = entry->original_full_xid;
+			valid = entry->state <= CTRC_ORIGIN_BLOCKED;
+		} else {
+			ClusterCtrcParticipantEntry *entry;
+			uint32 mask;
+			unsigned shard = 0;
+
+			index -= CtrcShared->origin_key_entries;
+			mask = ctrc_participant_lock_mask(index);
+			while ((mask & (UINT32_C(1) << shard)) == 0)
+				shard++;
+			lock = &CtrcShared->participant_locks[shard].lock;
+			if (!LWLockConditionalAcquire(lock, LW_SHARED)) {
+				scan->lock_busy = true;
+				return;
+			}
+			entry = &ctrc_participant_entries()[index];
+			occupied = !ctrc_bytes_zero(entry, sizeof(*entry));
+			key = entry->key;
+			full = entry->original_full_xid;
+			valid = entry->state <= CTRC_PARTICIPANT_BLOCKED;
+		}
+		LWLockRelease(lock);
+		if (occupied) {
+			bool unqualified = false;
+
+			if (!valid || !ctrc_txn_key_valid(&key) || !TransactionIdIsNormal(key.xid)
+				|| ((is_origin || FullTransactionIdIsValid(full))
+					&& (!FullTransactionIdIsNormal(full)
+						|| XidFromFullTransactionId(full) != key.xid)))
+				goto invalid;
+			if (!is_origin && !FullTransactionIdIsValid(full)) {
+				/* Unknown foreign/legacy identity remains only a candidate
+				 * observation; widening cannot qualify a producer certificate. */
+				uint32 distance = key.xid - XidFromFullTransactionId(scan->reference_full);
+
+				if (distance == UINT32_C(0x80000000)
+					|| (distance < UINT32_C(0x80000000)
+						&& U64FromFullTransactionId(scan->reference_full) > UINT64_MAX - distance))
+					goto invalid;
+				full = cluster_xid_widen(key.xid, scan->reference_full);
+				if (!FullTransactionIdIsValid(full))
+					goto invalid;
+				unqualified = true;
+			}
+			/* A retained older source still constrains the minimum. It cannot
+			 * qualify this round's producer coverage merely by knowing FullXid.
+			 * Foreign origins use their own original admitted incarnation. */
+			if (source != NULL
+				&& (key.system_identifier != source->system_identifier
+					|| key.admission_record_generation != source->record_generation
+					|| key.formation_epoch != source->formation_epoch
+					|| key.cluster_epoch != source->formation_epoch
+					|| key.origin_node_id >= CLUSTER_MAX_NODES
+					|| ((key.origin_node_id < 64 ? source->admitted_members_lo
+												 : source->admitted_members_hi)
+						& (UINT64_C(1) << (key.origin_node_id % 64))) == 0
+					|| key.origin_boot_incarnation
+						   != source->admitted_incarnation[key.origin_node_id]))
+				unqualified = true;
+			if (unqualified)
+				scan->unqualified_entries++;
+			if (FullTransactionIdPrecedes(full, scan->min_full))
+				scan->min_full = full;
+		}
+		scan->next_index++;
+	}
+	/* Also cover a registration between the first check and the last row. */
+	if (!cluster_ctrc_active_scan_registration_current(scan))
+		goto invalid;
+	if (scan->next_index == scan->total_entries)
+		scan->status = CTRC_ACTIVE_SCAN_COMPLETE;
+	return;
+
+invalid:
+	scan->min_full = InvalidFullTransactionId;
+	scan->status = CTRC_ACTIVE_SCAN_INVALID;
+}
+
+/* Standalone census remains an observation with its original coverage rules. */
+void
+cluster_ctrc_active_scan_step(ClusterCtrcActiveScan *scan)
+{
+	ctrc_active_scan_step(scan, NULL);
+}
+
+void
+cluster_ctrc_active_scan_step_source(ClusterCtrcActiveScan *scan,
+									const ClusterSemanticActiveSampleFence *source)
+{
+	if (source == NULL) {
+		if (scan != NULL && scan->status == CTRC_ACTIVE_SCAN_INCOMPLETE) {
+			scan->lock_busy = false;
+			scan->min_full = InvalidFullTransactionId;
+			scan->status = CTRC_ACTIVE_SCAN_INVALID;
+		}
+		return;
+	}
+	ctrc_active_scan_step(scan, source);
+}
+
 /*
  * ctrc_receipt_chain_exact_locked -- Validate a bounded physical locator chain.
  *
@@ -1862,6 +2092,25 @@ ctrc_origin_index(const ClusterCtrcTxnKeyV1 *key, uint64 *index_out)
 		return false;
 	*index_out = index;
 	return true;
+}
+
+bool
+cluster_ctrc_origin_original_full_xid_shared(const ClusterCtrcTxnKeyV1 *key,
+														FullTransactionId *full_xid_out)
+{
+	uint64 origin_index;
+	bool valid;
+
+	if (full_xid_out != NULL)
+		*full_xid_out = InvalidFullTransactionId;
+	if (full_xid_out == NULL || !cluster_ctrc_shmem_ready()
+		|| !ctrc_origin_index(key, &origin_index))
+		return false;
+	LWLockAcquire(&CtrcShared->origin_lock, LW_SHARED);
+	valid = cluster_ctrc_origin_original_full_xid_exact(&ctrc_origin_entries()[origin_index],
+																				key, full_xid_out);
+	LWLockRelease(&CtrcShared->origin_lock);
+	return valid;
 }
 
 static bool
@@ -2153,6 +2402,7 @@ cluster_ctrc_shmem_init(void)
 		CtrcShared->global_request_generation = 1;
 		for (int i = 0; i < CTRC_STAT_COUNT; i++)
 			pg_atomic_init_u64(&CtrcShared->stats[i], 0);
+		pg_atomic_init_u64(&CtrcShared->unqualified_registration_generation, 1);
 		pg_atomic_init_u64(&CtrcShared->test_barrier_hit_count, 0);
 		pg_atomic_init_u32(&CtrcShared->test_barrier_phase, CTRC_TEST_BARRIER_NONE);
 		for (unsigned i = 0; i < CLUSTER_CTRC_CLEANER_WORKERS; i++) {
@@ -2545,6 +2795,7 @@ cluster_ctrc_origin_reserve_entry(ClusterCtrcOriginEntry *origin, const ClusterC
 	reservation->key = *key;
 	reservation->origin_index = origin_index;
 	reservation->reservation_generation = reservation_generation;
+	reservation->original_full_xid = origin->original_full_xid;
 	reservation->valid = true;
 	return result;
 }
@@ -2559,6 +2810,7 @@ ctrc_origin_reservation_exact(const ClusterCtrcOriginEntry *origin, uint64 origi
 		   && reservation->reservation_generation != UINT64_MAX
 		   && ctrc_bytes_zero(reservation->reserved8, sizeof(reservation->reserved8))
 		   && origin->reservation_generation == reservation->reservation_generation
+		   && FullTransactionIdEquals(origin->original_full_xid, reservation->original_full_xid)
 		   && memcmp(&origin->key, &reservation->key, sizeof(reservation->key)) == 0;
 }
 
@@ -2604,6 +2856,7 @@ cluster_ctrc_origin_reserve_active(const ClusterCtrcTxnKeyV1 *key,
 	ClusterCtrcOriginEntry *origin;
 	uint64 index;
 	uint64 reservation_generation;
+	FullTransactionId top_full;
 	ClusterCtrcOriginReserveResult result;
 
 	if (reservation == NULL)
@@ -2612,12 +2865,38 @@ cluster_ctrc_origin_reserve_active(const ClusterCtrcTxnKeyV1 *key,
 	if (!cluster_ctrc_shmem_ready() || !ctrc_origin_index(key, &index))
 		return CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED;
 
+	/* Ordinary ACTIVE registration must retain its original top PGPROC
+	 * protection until the reservation is visible. GetNewTransactionId
+	 * publishes the original full identity before its raw xid; this backend
+	 * alone retires that protection. Match the nonallocating transaction
+	 * state to that same publication before origin_lock, without introducing
+	 * ProcArrayLock below the caller's block-0 authority. Exact TT slot and
+	 * incarnation validation remains the canonical publisher's contract. */
+	if (MyProc == NULL || key->origin_node_id != cluster_node_id || !TransactionIdIsNormal(key->xid)
+		|| MyProc->xid != key->xid)
+		return CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED;
+	top_full = GetTopFullTransactionIdIfAny();
+	if (!FullTransactionIdIsNormal(top_full) || U64FromFullTransactionId(top_full) == UINT64_MAX
+		|| XidFromFullTransactionId(top_full) != key->xid
+		|| pg_atomic_read_u64(&MyProc->cluster_top_full_xid_atomic)
+			!= U64FromFullTransactionId(top_full))
+		return CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED;
+
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	origin = &ctrc_origin_entries()[index];
 	if (origin->state == CTRC_ORIGIN_RELEASE_PROVEN
 		&& memcmp(&origin->key, key, sizeof(*key)) != 0) {
 		LWLockRelease(&CtrcShared->origin_lock);
 		return CLUSTER_CTRC_ORIGIN_RESERVE_RETRY_RELEASED;
+	}
+	if (origin->state == CTRC_ORIGIN_OPEN && memcmp(&origin->key, key, sizeof(*key)) == 0
+		&& (!FullTransactionIdIsNormal(origin->original_full_xid)
+			|| !FullTransactionIdEquals(origin->original_full_xid, top_full))) {
+		/* An OPEN replay must retain the original top identity.  Raw-xid or
+		 * carrier reuse cannot silently become a second origin authority. */
+		CtrcShared->full_refusal_count++;
+		LWLockRelease(&CtrcShared->origin_lock);
+		return CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED;
 	}
 	if (origin->state == CTRC_ORIGIN_OPEN)
 		reservation_generation = origin->reservation_generation;
@@ -2631,6 +2910,11 @@ cluster_ctrc_origin_reserve_active(const ClusterCtrcTxnKeyV1 *key,
 	}
 	result = cluster_ctrc_origin_reserve_entry(origin, key, index, reservation_generation,
 											   reservation);
+	if (result == CLUSTER_CTRC_ORIGIN_RESERVED_PENDING)
+		origin->original_full_xid = top_full;
+	if (result == CLUSTER_CTRC_ORIGIN_RESERVED_PENDING
+		|| result == CLUSTER_CTRC_ORIGIN_RESERVED_EXISTING_OPEN)
+		reservation->original_full_xid = top_full;
 	if (result == CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED)
 		CtrcShared->full_refusal_count++;
 	LWLockRelease(&CtrcShared->origin_lock);
@@ -2731,6 +3015,8 @@ cluster_ctrc_origin_open_reserved(const ClusterCtrcOriginReservation *reservatio
 		|| (reservation->kind != CTRC_ORIGIN_RESERVATION_PENDING_OWNED
 			&& reservation->kind != CTRC_ORIGIN_RESERVATION_EXISTING_OPEN)
 		|| reservation->reservation_generation == 0
+		|| !FullTransactionIdIsNormal(reservation->original_full_xid)
+		|| XidFromFullTransactionId(reservation->original_full_xid) != reservation->key.xid
 		|| !ctrc_bytes_zero(reservation->reserved8, sizeof(reservation->reserved8))
 		|| !cluster_ctrc_shmem_ready() || !ctrc_origin_index(&reservation->key, &index)
 		|| index != reservation->origin_index)
@@ -2740,6 +3026,7 @@ cluster_ctrc_origin_open_reserved(const ClusterCtrcOriginReservation *reservatio
 	origin = &ctrc_origin_entries()[index];
 	if (origin->state == CTRC_ORIGIN_OPEN
 		&& origin->reservation_generation == reservation->reservation_generation
+		&& FullTransactionIdEquals(origin->original_full_xid, reservation->original_full_xid)
 		&& origin->grant_generation != 0
 		&& memcmp(&origin->key, &reservation->key, sizeof(reservation->key)) == 0) {
 		grant = origin->grant_generation;
@@ -2747,6 +3034,7 @@ cluster_ctrc_origin_open_reserved(const ClusterCtrcOriginReservation *reservatio
 	} else if (origin->state == CTRC_ORIGIN_EMPTY
 			   && reservation->kind == CTRC_ORIGIN_RESERVATION_PENDING_OWNED
 			   && origin->reservation_generation == reservation->reservation_generation
+			   && FullTransactionIdEquals(origin->original_full_xid, reservation->original_full_xid)
 			   && origin->grant_generation == 0
 			   && memcmp(&origin->key, &reservation->key, sizeof(reservation->key)) == 0
 			   && CtrcShared->global_grant_generation != UINT32_MAX) {
@@ -5122,6 +5410,11 @@ ctrc_receipt_handle_fill(ClusterCtrcReceiptHandle *handle, ClusterCtrcParticipan
 	handle->participant = participant;
 	handle->receipt = receipt;
 	handle->key = receipt->key;
+	/* The original participant protection still spans this publication.
+	 * Copy only its already known identity, before making the handle valid. */
+	if (FullTransactionIdIsNormal(participant->original_full_xid)
+		&& XidFromFullTransactionId(participant->original_full_xid) == receipt->key.xid)
+		handle->original_full_xid = participant->original_full_xid;
 	handle->participant_index = participant_index;
 	handle->receipt_index = receipt_index;
 	handle->journal_slot_generation = receipt->publication.journal_slot_generation;
@@ -5141,7 +5434,14 @@ ctrc_receipt_handle_exact(const ClusterCtrcReceiptHandle *handle)
 		   && handle->receipt->publication.journal_slot_generation
 				  == handle->journal_slot_generation
 		   && memcmp(&handle->participant->key, &handle->key, sizeof(handle->key)) == 0
-		   && memcmp(&handle->receipt->key, &handle->key, sizeof(handle->key)) == 0;
+		   && memcmp(&handle->receipt->key, &handle->key, sizeof(handle->key)) == 0
+		   /* An unknown old handle may finish after exact local backfill, but
+			* a known snapshot cannot silently change epochs or lose its source. */
+		   && (!FullTransactionIdIsValid(handle->original_full_xid)
+			   || (FullTransactionIdIsNormal(handle->original_full_xid)
+				   && XidFromFullTransactionId(handle->original_full_xid) == handle->key.xid
+				   && FullTransactionIdEquals(handle->original_full_xid,
+											  handle->participant->original_full_xid)));
 }
 
 /* Check the locator bytes of the original allocation probe before that
@@ -5167,6 +5467,40 @@ ctrc_receipt_prepare_locators_valid_locked(const ClusterCtrcTxnKeyV1 *key,
 	}
 	return true;
 }
+
+/* A fenced retry may retrieve an already accepted exact receipt, but it
+ * cannot open a participant or allocate another row. The caller has checked
+ * the original chain under participant -> receipt locks. */
+static ClusterCtrcPrepareResult
+ctrc_receipt_prepare_existing_locked(ClusterCtrcParticipantEntry *participant,
+									 uint64 participant_index, const ClusterCtrcTxnKeyV1 *key,
+									 const ClusterCtrcParticipantIdentity *identity,
+									 uint32 grant_generation,
+									 const ClusterCtrcPublicationIdV1 *publication,
+									 const ClusterCtrcTargetV1 *target, uint64 *receipt_index)
+{
+	uint64 cursor;
+
+	if (participant->state != CTRC_PARTICIPANT_OPEN
+		|| participant->grant_generation != grant_generation
+		|| memcmp(&participant->key, key, sizeof(*key)) != 0
+		|| memcmp(&participant->identity, identity, sizeof(*identity)) != 0
+		|| !ctrc_publication_prepare_valid(participant, publication, target))
+		return CLUSTER_CTRC_PREPARE_REFUSED;
+	for (cursor = ctrc_participant_receipt_heads()[participant_index]; cursor != 0;
+		 cursor = ctrc_receipt_links()[cursor - 1].next_plus_one) {
+		const ClusterCtrcReceipt *receipt = &ctrc_receipt_entries()[cursor - 1];
+
+		if (ctrc_receipt_publication_matches(receipt, key, publication)
+			&& memcmp(&receipt->target, target, sizeof(*target)) == 0
+			&& receipt->publication.journal_sequence != 0 && receipt->publication.key_sequence != 0
+			&& receipt->publication.journal_slot_generation != 0) {
+			*receipt_index = cursor - 1;
+			return CLUSTER_CTRC_PREPARE_DUPLICATE;
+		}
+	}
+	return CLUSTER_CTRC_PREPARE_REFUSED;
+}
 #endif
 
 static ClusterCtrcPrepareResult
@@ -5178,22 +5512,58 @@ ctrc_receipt_prepare_refused(bool invalid_namespace)
 	return CLUSTER_CTRC_PREPARE_REFUSED;
 }
 
-ClusterCtrcPrepareResult
-cluster_ctrc_receipt_prepare_shared(const ClusterCtrcTxnKeyV1 *key,
-									const ClusterCtrcParticipantIdentity *identity,
-									uint32 grant_generation,
-									const ClusterCtrcPublicationIdV1 *publication,
-									const ClusterCtrcTargetV1 *target,
-									ClusterCtrcReceiptHandle *handle)
-{
 #ifndef CLUSTER_CTRC_UNIT_TEST
+/* Caller holds origin_lock. Keep an already issued grant protected until
+ * its participant receipt is visible. SEALING alone does not close an
+ * in-flight grant: the participant CLOSE remains the publication barrier. */
+static bool
+ctrc_origin_protects_local_receipt_locked(const ClusterCtrcTxnKeyV1 *key,
+										  const ClusterCtrcParticipantIdentity *identity,
+										  uint32 grant_generation,
+										  FullTransactionId *original_full_xid_out)
+{
+	const ClusterCtrcOriginEntry *origin;
+	uint64 index;
+	bool protects;
+
+	*original_full_xid_out = InvalidFullTransactionId;
+	if (grant_generation == 0 || !ctrc_origin_index(key, &index))
+		return false;
+	origin = &ctrc_origin_entries()[index];
+	protects = origin->state >= CTRC_ORIGIN_OPEN && origin->state <= CTRC_ORIGIN_CERTIFYING
+			   && origin->grant_generation == grant_generation
+			   && memcmp(&origin->key, key, sizeof(*key)) == 0
+			   && cluster_ctrc_origin_has_exact_touch(origin, identity);
+	/* Copy only an already retained identity under this original lock.
+	 * Missing metadata does not change the existing receipt admission. */
+	if (protects && FullTransactionIdIsNormal(origin->original_full_xid)
+		&& XidFromFullTransactionId(origin->original_full_xid) == key->xid)
+		*original_full_xid_out = origin->original_full_xid;
+	return protects;
+}
+
+static ClusterCtrcPrepareResult
+ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
+									 const ClusterCtrcParticipantIdentity *identity,
+									 uint32 grant_generation,
+									 const ClusterCtrcPublicationIdV1 *publication,
+									 const ClusterCtrcTargetV1 *target,
+									 ClusterCtrcReceiptHandle *handle,
+									 const ClusterKoPeerAdmissionV3 *continuation)
+{
 	ClusterCtrcParticipantEntry *participant;
 	ClusterCtrcReceipt *receipts;
 	ClusterCtrcPrepareResult result;
+	FullTransactionId original_full_xid = InvalidFullTransactionId;
 	uint64 participant_index;
 	uint64 receipt_index = UINT64_MAX;
-	uint64 journal_sequence;
-#endif
+	uint64 journal_sequence = 0;
+	ClusterKoPeerAdmissionV3 admission;
+	RelFileLocator locator;
+	bool check_object;
+	bool sampled = false;
+	bool local_origin;
+	bool participant_was_empty;
 
 	if (handle != NULL)
 		MemSet(handle, 0, sizeof(*handle));
@@ -5202,22 +5572,66 @@ cluster_ctrc_receipt_prepare_shared(const ClusterCtrcTxnKeyV1 *key,
 	if (target != NULL
 		&& !ctrc_relation_namespace_valid(target->spc_oid, target->db_oid, target->rel_number))
 		return ctrc_receipt_prepare_refused(true);
-#ifndef CLUSTER_CTRC_UNIT_TEST
 	if (handle == NULL || identity == NULL || publication == NULL || target == NULL
 		|| cluster_node_id < 0 || identity->node_id != (uint16)cluster_node_id
 		|| !cluster_ctrc_shmem_ready()
-		|| !ctrc_participant_index(key, identity->node_id, &participant_index)
-		|| !ctrc_allocate_journal_sequence(&journal_sequence))
+		|| !ctrc_participant_index(key, identity->node_id, &participant_index))
+		return ctrc_receipt_prepare_refused(false);
+	locator = (RelFileLocator){ target->spc_oid, target->db_oid, target->rel_number };
+	check_object = cluster_shared_config && cluster_interconnect_tier == CLUSTER_IC_TIER_1
+				   && cluster_smgr_which_for(locator, InvalidBackendId) == 1;
+	if (check_object) {
+		if (continuation != NULL) {
+			admission = *continuation;
+			sampled = true;
+		} else
+			sampled = cluster_ko_peer_admission_begin_v3(locator, &admission);
+	}
+	/* No object lock may be acquired under the original CTRC locks. A
+	 * refused sample only looks for an exact already accepted duplicate. */
+	if ((!check_object || sampled) && !ctrc_allocate_journal_sequence(&journal_sequence))
 		return ctrc_receipt_prepare_refused(false);
 
+	/* The allocator above takes origin_lock exclusively. Recheck only after
+	 * it releases that lock, then hold local origin protection through the
+	 * original participant -> receipt publication. No reverse acquisition or
+	 * allocator call is allowed under these nested locks. Foreign origins
+	 * retain their existing distributed grant/CLOSE protocol. */
+	local_origin = key->origin_node_id == (uint16)cluster_node_id;
+	if (local_origin) {
+		LWLockAcquire(&CtrcShared->origin_lock, LW_SHARED);
+		if (!ctrc_origin_protects_local_receipt_locked(key, identity, grant_generation,
+													 &original_full_xid)) {
+			LWLockRelease(&CtrcShared->origin_lock);
+			return ctrc_receipt_prepare_refused(false);
+		}
+	}
 	participant = &ctrc_participant_entries()[participant_index];
 	receipts = ctrc_receipt_entries();
 	ctrc_participant_locks_acquire(ctrc_participant_lock_mask(participant_index));
 	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
-	if (!ctrc_receipt_chain_exact_locked(participant_index, false)
-		|| !ctrc_receipt_prepare_locators_valid_locked(key, publication)) {
+	participant_was_empty = ctrc_bytes_zero(participant, sizeof(*participant));
+	if (FullTransactionIdIsValid(original_full_xid)
+		&& FullTransactionIdIsValid(participant->original_full_xid)
+		&& !FullTransactionIdEquals(original_full_xid, participant->original_full_xid)) {
+		/* Same physical grant cannot silently acquire another original epoch.
+		 * Reject before receipt/participant mutation and retain both owners. */
+		result = CLUSTER_CTRC_PREPARE_REFUSED;
+	} else if (!ctrc_receipt_chain_exact_locked(participant_index, false)
+			   || !ctrc_receipt_prepare_locators_valid_locked(key, publication)) {
 		participant->state = CTRC_PARTICIPANT_BLOCKED;
 		result = CLUSTER_CTRC_PREPARE_REFUSED;
+	} else if (check_object
+			   && (!sampled
+				   || (continuation != NULL
+						   ? admission.extension_serial != 0
+								 || !cluster_ko_peer_read_current_v3(
+									 &admission, locator, (ForkNumber)target->fork_number,
+									 target->block_number)
+						   : !cluster_ko_peer_admission_current_v3(&admission, locator)))) {
+		result = ctrc_receipt_prepare_existing_locked(participant, participant_index, key, identity,
+													  grant_generation, publication, target,
+													  &receipt_index);
 	} else {
 		result = cluster_ctrc_receipt_prepare_table_locked(
 			participant, key, identity, grant_generation, publication, target, receipts,
@@ -5237,12 +5651,24 @@ cluster_ctrc_receipt_prepare_shared(const ClusterCtrcTxnKeyV1 *key,
 	if (result == CLUSTER_CTRC_PREPARE_CAPACITY) {
 		(void)pg_atomic_fetch_add_u64((pg_atomic_uint64 *)&CtrcShared->full_refusal_count, 1);
 	}
-	if (result == CLUSTER_CTRC_PREPARE_READY || result == CLUSTER_CTRC_PREPARE_DUPLICATE)
+	if (result == CLUSTER_CTRC_PREPARE_READY || result == CLUSTER_CTRC_PREPARE_DUPLICATE) {
+		/* Receiver protection is visible before the original origin guard
+		 * leaves. Retain a known identity through CLOSE/ACK until reclamation. */
+		if (FullTransactionIdIsValid(original_full_xid)
+			&& !FullTransactionIdIsValid(participant->original_full_xid))
+			participant->original_full_xid = original_full_xid;
 		ctrc_receipt_handle_fill(handle, participant, participant_index, &receipts[receipt_index],
 								 receipt_index);
+	}
+	if (participant_was_empty && !ctrc_bytes_zero(participant, sizeof(*participant))
+		&& (!FullTransactionIdIsNormal(participant->original_full_xid)
+			|| XidFromFullTransactionId(participant->original_full_xid) != participant->key.xid))
+		ctrc_note_unqualified_registration();
 
 	LWLockRelease(&CtrcShared->receipt_lock);
 	ctrc_participant_locks_release(ctrc_participant_lock_mask(participant_index));
+	if (local_origin)
+		LWLockRelease(&CtrcShared->origin_lock);
 	if (result == CLUSTER_CTRC_PREPARE_READY)
 		cluster_ctrc_stat_bump(CTRC_STAT_RECEIPT_PREPARED);
 	else if (result == CLUSTER_CTRC_PREPARE_CAPACITY)
@@ -5250,12 +5676,30 @@ cluster_ctrc_receipt_prepare_shared(const ClusterCtrcTxnKeyV1 *key,
 	else if (result == CLUSTER_CTRC_PREPARE_REFUSED)
 		return ctrc_receipt_prepare_refused(false);
 	return result;
+}
+#endif
+
+ClusterCtrcPrepareResult
+cluster_ctrc_receipt_prepare_shared(const ClusterCtrcTxnKeyV1 *key,
+									const ClusterCtrcParticipantIdentity *identity,
+									uint32 grant_generation,
+									const ClusterCtrcPublicationIdV1 *publication,
+									const ClusterCtrcTargetV1 *target,
+									ClusterCtrcReceiptHandle *handle)
+{
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	return ctrc_receipt_prepare_shared_internal(key, identity, grant_generation, publication,
+												target, handle, NULL);
 #else
+	if (handle != NULL)
+		MemSet(handle, 0, sizeof(*handle));
+	if (target != NULL
+		&& !ctrc_relation_namespace_valid(target->spc_oid, target->db_oid, target->rel_number))
+		return ctrc_receipt_prepare_refused(true);
 	(void)key;
 	(void)identity;
 	(void)grant_generation;
 	(void)publication;
-	(void)target;
 	return ctrc_receipt_prepare_refused(false);
 #endif
 }
@@ -6099,10 +6543,18 @@ cluster_ctrc_participant_request_shared(const ClusterCtrcTxnKeyV1 *key,
 		&& !cluster_normal_stop_service_new_work(true)) {
 		*first_reason = CTRC_SEAL_REASON_ACK_UNAVAILABLE;
 		result = CTRC_SEAL_REPLY_DENIED;
-	} else
+	} else {
+		/* CLOSE may create its tombstone before a durability callback throws.
+		 * Revoke first, while the original shard still hides the empty slot.
+		 * A later refusal may conservatively revoke, but never changes the FSM. */
+		if (ctrc_bytes_zero(&participant_before, sizeof(participant_before))
+			&& ctrc_participant_identity_valid(key, identity)
+			&& grant_generation != 0 && seal_generation != 0)
+			ctrc_note_unqualified_registration();
 		result = cluster_ctrc_participant_request_apply(participant, ack_summary, key, identity,
 														grant_generation, seal_generation,
 														suboperation, first_reason, ack_out);
+	}
 	progressed = result != CTRC_SEAL_REPLY_BLOCKED_RETAIN && result != CTRC_SEAL_REPLY_DENIED
 				 && memcmp(participant, &participant_before, sizeof(participant_before)) != 0;
 	LWLockRelease(&CtrcShared->receipt_lock);
@@ -7834,6 +8286,10 @@ ctrc_cleaner_cancel_successor_receipts(ClusterCtrcReceiptHandle *handles, const 
 			(void)cluster_ctrc_receipt_cancel_shared(&handles[i]);
 }
 
+/* A private call site, not an admission API for arbitrary publishers. */
+static bool ctrc_cleaner_successor_admission(const ClusterCtrcReceipt *predecessor,
+											 ClusterKoPeerAdmissionV3 *sample);
+
 static bool
 ctrc_cleaner_prepare_current_mx_successor(
 	const ClusterCtrcReceipt *predecessor, const CtrcCleanerCurrentMxCapture *capture,
@@ -7854,12 +8310,22 @@ ctrc_cleaner_prepare_current_mx_successor(
 	uint16 prepared_count = 0;
 	uint16 i;
 	int successor_origin;
+	ClusterKoPeerAdmissionV3 admission;
+	bool check_object;
 
 	if (predecessor == NULL || capture == NULL || members == NULL || proofs == NULL
 		|| proof_capability_generations == NULL || plan == NULL || planned_header == NULL
 		|| successor_target == NULL || transfer == NULL
 		|| plan->kind != CTRC_CURRENT_MX_REWRITE_SUCCESSOR || plan->survivor_count == 0
-		|| plan->survivor_count > nmembers
+		|| plan->survivor_count > nmembers)
+		return false;
+	check_object = cluster_shared_config && cluster_interconnect_tier == CLUSTER_IC_TIER_1
+				   && cluster_smgr_which_for((RelFileLocator){ predecessor->target.spc_oid,
+															   predecessor->target.db_oid,
+															   predecessor->target.rel_number },
+											 InvalidBackendId)
+						  == 1;
+	if ((check_object && !ctrc_cleaner_successor_admission(predecessor, &admission))
 		|| !ctrc_allocate_journal_sequence(&successor_operation_id))
 		return false;
 	MemSet(handles, 0, sizeof(handles));
@@ -7962,8 +8428,9 @@ ctrc_cleaner_prepare_current_mx_successor(
 		publication.reference_kind = CTRC_REF_RECOMPOSED_SURVIVOR;
 		publication.target_kind = CTRC_TARGET_PAGE_PENDING_OFFNUM;
 		publication.grant_generation = grant;
-		prepare_result = cluster_ctrc_receipt_prepare_shared(
-			&key, &participant, grant, &publication, &pending_target, &handles[prepared_count]);
+		prepare_result = ctrc_receipt_prepare_shared_internal(
+			&key, &participant, grant, &publication, &pending_target, &handles[prepared_count],
+			check_object ? &admission : NULL);
 		if (prepare_result != CLUSTER_CTRC_PREPARE_READY
 			&& prepare_result != CLUSTER_CTRC_PREPARE_DUPLICATE)
 			goto successor_failed;
@@ -8034,6 +8501,7 @@ ctrc_cleaner_clean_current_mx_receipt(const ClusterCtrcParticipantEntry *partici
 	bool permanent;
 	const char *retain_stage = "input";
 	CtrcCleanerCurrentMxPresence capture_presence;
+	TimestampTz operation_deadline = 0;
 
 	if (participant == NULL || receipt == NULL
 		|| participant_index >= CtrcShared->participant_key_entries
@@ -8046,6 +8514,11 @@ ctrc_cleaner_clean_current_mx_receipt(const ClusterCtrcParticipantEntry *partici
 			&& receipt->target.relation_persistence != RELPERSISTENCE_UNLOGGED)
 		|| receipt->target.fork_number < 0 || receipt->target.fork_number > MAX_FORKNUM)
 		return false;
+	/* The cleaner owns one operation budget. Capture it before relation, page,
+	 * and proof work so a later proof call cannot restart the wait. */
+	if (cluster_gcs_reply_timeout_ms > 0)
+		operation_deadline
+			= TimestampTzPlusMilliseconds(GetCurrentTimestamp(), cluster_gcs_reply_timeout_ms);
 
 	MemSet(&admission, 0, sizeof(admission));
 	if (cluster_semantic_activation_enter_r4_terminal_census(&admission)
@@ -8177,9 +8650,9 @@ ctrc_cleaner_clean_current_mx_receipt(const ClusterCtrcParticipantEntry *partici
 		retain_stage = "descriptor-hash";
 		goto current_mx_retain_unlocked;
 	}
-	resolve_result = cluster_multixact_current_members_resolve(
+	resolve_result = cluster_multixact_current_members_resolve_until(
 		&descriptor_key, members, nmembers, descriptor_hash, NULL, proofs, &updater_proof,
-		proof_capability_generations);
+		proof_capability_generations, &operation_deadline);
 	if (resolve_result != CMX_RESOLVE_OK) {
 		retain_stage = "resolve";
 		goto current_mx_retain_unlocked;
@@ -8693,6 +9166,210 @@ itl_retain_locked:
 	return false;
 }
 
+/* Bound by the original receipt selector; never a caller-supplied role
+ * bypass or a second shared work queue. */
+typedef struct CtrcCleanerReadScope {
+	bool active;
+	uint64 serial;
+	int32 pid;
+	uint32 worker;
+	uint64 participant_index;
+	uint64 receipt_index;
+	ClusterCtrcParticipantEntry participant;
+	ClusterCtrcReceipt receipt;
+} CtrcCleanerReadScope;
+
+static CtrcCleanerReadScope CtrcReadScope;
+static uint64 CtrcReadSerial;
+
+static bool
+ctrc_cleaner_read_scope_owner(void)
+{
+	return MyProcPid > 0 && MyBackendType == B_UNDO_CLEANER && CtrcWorkerId >= 0
+		   && CtrcWorkerId < CLUSTER_CTRC_CLEANER_WORKERS
+		   && ClusterUndoCleanerWorkerIdForType(MyAuxProcType) == CtrcWorkerId;
+}
+
+/* Original participant -> receipt lock order, never under a buffer lock. */
+static bool
+ctrc_cleaner_read_scope_exact(const ClusterCtrcParticipantEntry *participant,
+							  const ClusterCtrcReceipt *receipt, uint64 participant_index,
+							  uint64 receipt_index)
+{
+	uint64 expected_index;
+	uint32 mask;
+	bool exact;
+
+	if (!ctrc_cleaner_read_scope_owner() || participant == NULL || receipt == NULL
+		|| !cluster_ctrc_shmem_ready() || !ctrc_txn_key_valid(&receipt->key)
+		|| !ctrc_cleaner_owns_key(&receipt->key)
+		|| !ctrc_participant_identity_valid(&receipt->key, &participant->identity)
+		|| participant->identity.node_id != cluster_node_id
+		|| participant->state != CTRC_PARTICIPANT_CLOSED_DRAINING
+		|| participant->seal_generation == 0 || participant->applied_count == 0
+		|| receipt->state != CTRC_RECEIPT_APPLIED
+		|| receipt->publication.grant_generation != participant->grant_generation
+		|| receipt->publication.journal_slot_generation == 0
+		|| memcmp(&receipt->key, &participant->key, sizeof(receipt->key)) != 0
+		|| receipt->target.fork_number < 0 || receipt->target.fork_number > MAX_FORKNUM
+		|| (receipt->publication.reference_kind == CTRC_REF_HEAP_ITL_UBA
+				? !ctrc_target_exact_itl_valid(&receipt->key, &receipt->target)
+				: !ctrc_target_exact_tid_valid(&receipt->publication, &receipt->target))
+		|| !ctrc_participant_index(&receipt->key, participant->identity.node_id, &expected_index)
+		|| expected_index != participant_index || receipt_index >= CtrcShared->receipt_entries)
+		return false;
+	mask = ctrc_participant_lock_mask(participant_index);
+	ctrc_participant_locks_acquire(mask);
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
+	exact
+		= memcmp(&ctrc_participant_entries()[participant_index], participant, sizeof(*participant))
+			  == 0
+		  && memcmp(&ctrc_receipt_entries()[receipt_index], receipt, sizeof(*receipt)) == 0
+		  && ctrc_receipt_probe_states()[receipt_index] == CTRC_RECEIPT_PROBE_OCCUPIED
+		  && ctrc_receipt_links()[receipt_index].participant_plus_one == participant_index + 1
+		  && ctrc_receipt_links()[receipt_index].journal_generation
+				 == receipt->publication.journal_slot_generation;
+	LWLockRelease(&CtrcShared->receipt_lock);
+	ctrc_participant_locks_release(mask);
+	return exact;
+}
+
+static ClusterCtrcCleanerReadScopeV3
+ctrc_cleaner_read_scope_identity(void)
+{
+	ClusterCtrcCleanerReadScopeV3 proof = { 0 };
+
+	proof.serial = CtrcReadScope.serial;
+	proof.pid = CtrcReadScope.pid;
+	proof.worker = CtrcReadScope.worker;
+	proof.system_identifier = CtrcReadScope.receipt.key.system_identifier;
+	proof.formation_epoch = CtrcReadScope.participant.identity.formation_epoch;
+	proof.boot_incarnation = CtrcReadScope.participant.identity.boot_incarnation;
+	return proof;
+}
+
+static bool
+ctrc_cleaner_read_scope_target(RelFileLocator locator, ForkNumber fork, BlockNumber block)
+{
+	const ClusterCtrcTargetV1 *target = &CtrcReadScope.receipt.target;
+
+	return CtrcReadScope.active && ctrc_cleaner_read_scope_owner() && CtrcReadScope.pid == MyProcPid
+		   && CtrcReadScope.worker == (unsigned)CtrcWorkerId && locator.spcOid == target->spc_oid
+		   && locator.dbOid == target->db_oid && locator.relNumber == target->rel_number
+		   && ((fork == target->fork_number && block == target->block_number)
+			   || (fork == SPACE_FORKNUM && block == 0));
+}
+
+/* Only the original validated current-MX successor producer can use this
+ * sample. It is bound to the entire selected APPLIED receipt and the finite
+ * registered attempt, not merely the cleaner role or a reference-kind bit.
+ * Original member/TT proof, PREPARE/APPLY, descriptor flush and final page
+ * recheck remain mandatory. No object/CTRC lock crosses the sample. */
+static bool
+ctrc_cleaner_successor_admission(const ClusterCtrcReceipt *predecessor,
+								 ClusterKoPeerAdmissionV3 *sample)
+{
+	RelFileLocator locator;
+
+	if (predecessor == NULL || !CtrcReadScope.active
+		|| memcmp(predecessor, &CtrcReadScope.receipt, sizeof(*predecessor)) != 0
+		|| predecessor->target.kind != CTRC_TARGET_EXACT_TID
+		|| predecessor->state != CTRC_RECEIPT_APPLIED)
+		return false;
+	locator = (RelFileLocator){ predecessor->target.spc_oid, predecessor->target.db_oid,
+								predecessor->target.rel_number };
+	if (!ctrc_cleaner_read_scope_target(locator, (ForkNumber)predecessor->target.fork_number,
+										predecessor->target.block_number)
+		|| !cluster_ko_peer_read_begin_v3(locator, (ForkNumber)predecessor->target.fork_number,
+										  predecessor->target.block_number, sample)
+		|| sample->extension_serial != 0)
+		return false;
+	return true;
+}
+
+static bool
+ctrc_cleaner_read_scope_begin(const ClusterCtrcParticipantEntry *participant,
+							  const ClusterCtrcReceipt *receipt, uint64 participant_index,
+							  uint64 receipt_index, volatile uint64 *serial)
+{
+	ClusterCtrcCleanerReadScopeV3 proof;
+	RelFileLocator locator;
+
+	if (serial == NULL || CtrcReadScope.active || CtrcReadSerial == UINT64_MAX
+		|| !ctrc_cleaner_read_scope_exact(participant, receipt, participant_index, receipt_index))
+		return false;
+	CtrcReadScope.participant = *participant;
+	CtrcReadScope.receipt = *receipt;
+	CtrcReadScope.participant_index = participant_index;
+	CtrcReadScope.receipt_index = receipt_index;
+	CtrcReadScope.pid = MyProcPid;
+	CtrcReadScope.worker = CtrcWorkerId;
+	CtrcReadScope.serial = ++CtrcReadSerial;
+	CtrcReadScope.active = true;
+	*serial = CtrcReadScope.serial;
+	proof = ctrc_cleaner_read_scope_identity();
+	locator = (RelFileLocator){ receipt->target.spc_oid, receipt->target.db_oid,
+								receipt->target.rel_number };
+	/* Keep the finite attempt visible even if a concurrent original abort
+	 * cleanout discharges its receipt. No CTRC lock crosses this call. */
+	if (!cluster_ko_cleaner_enter_v3(locator, &proof)) {
+		CtrcReadScope.active = false;
+		*serial = 0;
+		return false;
+	}
+	return true;
+}
+
+static bool
+ctrc_cleaner_read_scope_end(uint64 serial)
+{
+	ClusterCtrcCleanerReadScopeV3 proof;
+	RelFileLocator locator;
+
+	if (!CtrcReadScope.active || serial == 0 || serial != CtrcReadScope.serial
+		|| CtrcReadScope.pid != MyProcPid)
+		return false;
+	proof = ctrc_cleaner_read_scope_identity();
+	locator = (RelFileLocator){ CtrcReadScope.receipt.target.spc_oid,
+								CtrcReadScope.receipt.target.db_oid,
+								CtrcReadScope.receipt.target.rel_number };
+	CtrcReadScope.active = false;
+	cluster_ko_cleaner_leave_v3(locator, &proof);
+	return true;
+}
+
+bool
+cluster_ctrc_cleaner_read_scope_snapshot_v3(RelFileLocator locator, ForkNumber fork,
+											BlockNumber block, ClusterCtrcCleanerReadScopeV3 *out)
+{
+	if (out != NULL)
+		MemSet(out, 0, sizeof(*out));
+	/* This is the selected finite attempt, not a second APPLIED claim. The
+	 * original physical consumer still rechecks target/receipt at discharge.
+	 * Concurrent cleanout cannot strand this registered attempt behind the
+	 * very fence whose READY must wait for its finally exit. */
+	if (out == NULL || !ctrc_cleaner_read_scope_target(locator, fork, block))
+		return false;
+	*out = ctrc_cleaner_read_scope_identity();
+	return true;
+}
+
+bool
+cluster_ctrc_cleaner_read_scope_current_v3(const ClusterCtrcCleanerReadScopeV3 *scope,
+										   RelFileLocator locator, ForkNumber fork,
+										   BlockNumber block)
+{
+	/* No shared-table read or lock here. The original attempt stays registered
+	 * with the drain owner until finally, independently of concurrent receipt
+	 * discharge. This is finite read admission, not page/current authority. */
+	return scope != NULL && ctrc_cleaner_read_scope_target(locator, fork, block)
+		   && scope->serial == CtrcReadScope.serial && scope->pid == CtrcReadScope.pid
+		   && scope->worker == CtrcReadScope.worker
+		   && scope->system_identifier == CtrcReadScope.receipt.key.system_identifier
+		   && scope->formation_epoch == CtrcReadScope.participant.identity.formation_epoch
+		   && scope->boot_incarnation == CtrcReadScope.participant.identity.boot_incarnation;
+}
+
 static bool
 ctrc_cleaner_clean_next_receipt(void)
 {
@@ -8700,17 +9377,29 @@ ctrc_cleaner_clean_next_receipt(void)
 	ClusterCtrcReceipt receipt;
 	uint64 participant_index;
 	uint64 receipt_index;
-	bool cleaned;
+	volatile uint64 serial = 0;
+	bool cleaned = false;
 
 	if (!ctrc_cleaner_next_applied_receipt(&participant, &receipt, &participant_index,
 										   &receipt_index))
 		return false;
-	if (receipt.publication.reference_kind == CTRC_REF_HEAP_ITL_UBA)
-		cleaned = ctrc_cleaner_clean_itl_receipt(&participant, &receipt, participant_index,
-												 receipt_index);
-	else
-		cleaned = ctrc_cleaner_clean_current_mx_receipt(&participant, &receipt, participant_index,
-														receipt_index);
+	PG_TRY();
+	{
+		if (ctrc_cleaner_read_scope_begin(&participant, &receipt, participant_index, receipt_index,
+										  &serial)) {
+			if (receipt.publication.reference_kind == CTRC_REF_HEAP_ITL_UBA)
+				cleaned = ctrc_cleaner_clean_itl_receipt(&participant, &receipt, participant_index,
+														 receipt_index);
+			else
+				cleaned = ctrc_cleaner_clean_current_mx_receipt(&participant, &receipt,
+																participant_index, receipt_index);
+		}
+	}
+	PG_FINALLY();
+	{
+		(void)ctrc_cleaner_read_scope_end(serial);
+	}
+	PG_END_TRY();
 	if (cleaned)
 		cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_NONE);
 	return cleaned;
@@ -9391,11 +10080,16 @@ ctrc_normal_stop_origin_exact(const ClusterCtrcOriginEntry *origin, uint64 index
 		|| origin->reservation_generation == UINT64_MAX
 		|| !ctrc_bytes_zero(origin->reserved8, sizeof(origin->reserved8)))
 		return false;
+	if (FullTransactionIdIsValid(origin->original_full_xid)
+		&& (!FullTransactionIdIsNormal(origin->original_full_xid)
+			|| XidFromFullTransactionId(origin->original_full_xid) != origin->key.xid))
+		return false;
 	if (origin->state == CTRC_ORIGIN_EMPTY) {
 		ClusterCtrcOriginEntry remainder = *origin;
 
 		MemSet(&remainder.key, 0, sizeof(remainder.key));
 		remainder.reservation_generation = 0;
+		remainder.original_full_xid = InvalidFullTransactionId;
 		return origin->reservation_generation != 0
 			   && ctrc_bytes_zero(&remainder, sizeof(remainder));
 	}

@@ -57,6 +57,18 @@ extern bool TransactionIdIsActive(TransactionId xid);
 extern TransactionId GetOldestNonRemovableTransactionId(Relation rel);
 extern TransactionId GetOldestTransactionIdConsideredRunning(void);
 extern TransactionId GetOldestActiveTransactionId(void);
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * Observation only: capture N and a durable-lease future under XidGenLock,
+ * then include every top/prepared xid. Failure invalidates all outputs.
+ * The lease fence belongs to that same start cut, not a later re-sample.
+ */
+struct ClusterXidStripeSampleFence;
+extern bool ProcArrayGetActiveFullXidSample(FullTransactionId *reference_full,
+										FullTransactionId *future_full,
+										FullTransactionId *active_min,
+										struct ClusterXidStripeSampleFence *lease_fence);
+#endif
 extern TransactionId GetOldestSafeDecodingTransactionId(bool catalogOnly);
 extern void GetReplicationHorizons(TransactionId *xmin, TransactionId *catalog_xmin);
 

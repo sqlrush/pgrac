@@ -39,6 +39,7 @@ include $(top_builddir)/src/Makefile.global
 ifeq ($(enable_pgrac_cluster), yes)
 OBJS = \
 	cluster.o \
+	cluster_catalog_trace.o \
 	cluster_initdb_base.o \
 	cluster_initdb_config.o \
 	cluster_initdb_cohort.o \
@@ -164,6 +165,7 @@ OBJS = \
 	cluster_fence_authority.o \
 	cluster_write_fence.o \
 	cluster_ges.o \
+	cluster_ges_holder.o \
 	cluster_ges_dedup.o \
 	cluster_ges_handoff.o \
 	cluster_ges_handoff_policy.o \
@@ -383,6 +385,7 @@ OBJS = \
 	cluster_pi_data.o \
 	cluster_pi_writeback.o \
 	cluster_heap_horizon.o \
+	cluster_heap_freeze.o \
 	cluster_block_redeclare.o \
 	cluster_pi_rebuild.o \
 	cluster_wal_restart_read.o \

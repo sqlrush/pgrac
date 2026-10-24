@@ -478,7 +478,7 @@ typedef enum {
 	WAIT_EVENT_CLUSTER_LMS_DATA_RECV,
 	WAIT_EVENT_CLUSTER_LMS_DATA_SEND,
 
-	/* Cluster: Undo (11 events) -- AD-010; spec-3.9 adds CR_CONSTRUCT;
+	/* Cluster: Undo (12 events) -- AD-010; spec-3.9 adds CR_CONSTRUCT;
 	 * spec-3.11 adds TT_DURABLE_IO; spec-3.18 D7 adds BUF_FLUSH + EXTENT_CLAIM;
 	 * spec-5.22b D2-6 adds BLOCK_GRANT/INVALIDATE/REMASTER (owner-as-master
 	 * grant data plane; PCM convert/downgrade waits reuse the PCM class above) */
@@ -493,6 +493,7 @@ typedef enum {
 	WAIT_EVENT_UNDO_BLOCK_GRANT_WAIT,	   /* spec-5.22b D2-6: owner-as-master S/X grant */
 	WAIT_EVENT_UNDO_BLOCK_INVALIDATE_WAIT, /* spec-5.22b D2-6: PI-discard invalidate broadcast */
 	WAIT_EVENT_UNDO_BLOCK_REMASTER_WAIT,   /* spec-5.22b D2-6: remaster serve-gate wait */
+	WAIT_EVENT_CLUSTER_UNDO_CAPACITY_WAIT, /* Frontend undo capacity recheck. */
 
 	/* Cluster: ADG (4 events) -- #95 */
 	WAIT_EVENT_ADG_MRP_APPLY_WAIT = PG_WAIT_CLUSTER_ADG,

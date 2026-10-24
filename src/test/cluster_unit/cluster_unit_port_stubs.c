@@ -13,6 +13,8 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_visibility_trace_filter.h"
+#include "cluster/cluster_uba.h"
 #include "cluster/cluster_update_trace.h"
 #include "cluster/cluster_xnode_profile.h"
 #include "cluster/cluster_storage_quorum.h"
@@ -20,6 +22,13 @@
 /* Profiling-aware product objects can link without a diagnostic backend.
  * Dedicated trace tests override these defaults with the real collector. */
 bool cluster_update_trace_enabled __attribute__((weak)) = false;
+bool cluster_trace_visibility_enabled __attribute__((weak)) = false;
+ClusterVisibilityTraceFilter cluster_trace_visibility_filter __attribute__((weak)) = { 0 };
+NodeId __attribute__((weak))
+uba_origin_node_id(UBA uba pg_attribute_unused())
+{
+	abort();
+}
 bool cluster_xnode_profile_enabled __attribute__((weak)) = false;
 ClusterXnodeProfileShared *ClusterXnodeProfileCtl __attribute__((weak)) = NULL;
 
@@ -110,6 +119,21 @@ errcode(int sqlerrcode pg_attribute_unused())
 void __attribute__((weak))
 errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
+{
+	abort();
+}
+
+/* Old default-non-SELF fixtures cannot manufacture command ownership.
+ * The dedicated FULL/SELF test links the real CID module and publication edge. */
+#include "access/htup.h"
+#include "cluster/cluster_tt_local.h"
+__attribute__((weak)) bool
+cluster_tt_local_get_published_binding(TransactionId xid, ClusterCanonicalTxnBinding *out)
+{
+	abort();
+}
+__attribute__((weak)) bool
+HeapTupleHeaderCommandIdIsAvailable(HeapTupleHeader tuple)
 {
 	abort();
 }

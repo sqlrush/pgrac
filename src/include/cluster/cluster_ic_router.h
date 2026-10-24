@@ -269,6 +269,27 @@ extern bool cluster_ic_data_send_admission(bool *pending);
 /* Call only for the current frame, before mutation or ownership transfer. */
 extern void cluster_ic_dispatch_defer(const ClusterICEnvelope *env);
 
+typedef enum ClusterICControlCarrier {
+	CLUSTER_IC_CONTROL_UNKNOWN = 0,
+	CLUSTER_IC_CONTROL_TCP
+} ClusterICControlCarrier;
+
+/* Local receive provenance, not a wire identity or a prefix acknowledgement.
+ * The receive owner captures it before transferring the frame to a handler. */
+typedef struct ClusterICControlIngress {
+	uint64 serial;
+	uint64 epoch;
+	int32 owner_pid;
+	int32 source_node;
+	ClusterICControlCarrier carrier;
+} ClusterICControlIngress;
+
+extern bool cluster_ic_dispatch_control_ingress(const ClusterICEnvelope *env,
+												ClusterICControlIngress *out);
+extern ClusterICDispatchResult
+cluster_ic_dispatch_control_envelope(const ClusterICEnvelope *env, const void *payload,
+									 int32 peer_id, const ClusterICControlIngress *ingress);
+
 extern ClusterICDispatchResult cluster_ic_dispatch_envelope(const ClusterICEnvelope *env,
 															const void *payload, int32 peer_id);
 

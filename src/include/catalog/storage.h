@@ -22,6 +22,16 @@
 /* GUC variables */
 extern PGDLLIMPORT int wal_skip_threshold;
 
+extern void RelationCheckStorageTransaction(RelFileLocator rlocator, char relpersistence,
+											const char *operation);
+extern void RelationCheckStorageDrain(RelFileLocator rlocator, char relpersistence,
+									  const char *operation);
+extern bool RelationStorageUsesClusterSharedPath(RelFileLocator rlocator,
+												 BackendId backend,
+												 char relpersistence);
+extern void RelationCheckStorageDDLTransaction(Relation rel, bool isTopLevel,
+											  const char *command);
+
 extern SMgrRelation RelationCreateStorage(RelFileLocator rlocator,
 										  char relpersistence,
 										  bool register_delete);

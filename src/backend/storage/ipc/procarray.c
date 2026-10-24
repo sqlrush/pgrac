@@ -83,6 +83,7 @@
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_undo_retention.h" /* spec-3.12 D1: retention horizon */
+#include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D5d: standby skip-fill */
 #endif
 
@@ -726,6 +727,7 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 		proc->xmin = InvalidTransactionId;
 		/* PGRAC: spec-3.12 D1 — clear retention read_scn safety net. */
 		pg_atomic_write_u64(&proc->cluster_read_scn_atomic, 0);
+		pg_atomic_write_u64(&proc->cluster_top_full_xid_atomic, 0);
 
 		/* be sure this is cleared in abort */
 		proc->delayChkptFlags = 0;
@@ -771,6 +773,7 @@ ProcArrayEndTransactionInternal(PGPROC *proc, TransactionId latestXid)
 	/* PGRAC: spec-3.12 D1 — clear retention read_scn safety net (snapmgr
 	 * already publishes InvalidScn on last snapshot release). */
 	pg_atomic_write_u64(&proc->cluster_read_scn_atomic, 0);
+	pg_atomic_write_u64(&proc->cluster_top_full_xid_atomic, 0);
 
 	/* be sure this is cleared in abort */
 	proc->delayChkptFlags = 0;
@@ -959,6 +962,7 @@ ProcArrayClearTransaction(PGPROC *proc)
 	proc->xmin = InvalidTransactionId;
 	/* PGRAC: spec-3.12 D1 — clear retention read_scn safety net. */
 	pg_atomic_write_u64(&proc->cluster_read_scn_atomic, 0);
+	pg_atomic_write_u64(&proc->cluster_top_full_xid_atomic, 0);
 	proc->recoveryConflictPending = false;
 
 	Assert(!(proc->statusFlags & PROC_VACUUM_STATE_MASK));
@@ -2227,7 +2231,7 @@ ClusterSnapshotRefreshFields(Snapshot snapshot)
 }
 
 /*
- * cluster_undo_retention_horizon -- spec-3.12 D1.
+ * cluster_undo_retention_horizon_sample -- spec-3.12 D1, typed H observation.
  *
  * Own-instance undo/TT-slot retention lower bound: the min CLUSTER-source
  * read_scn over all backends' live snapshots (each backend publishes its min
@@ -2250,35 +2254,89 @@ ClusterSnapshotRefreshFields(Snapshot snapshot)
  * publication; callers must NOT hold seg->lock / undo lifecycle_lock
  * when calling (C17 lock ordering: compute horizon first).
  */
-SCN
-cluster_undo_retention_horizon(void)
+bool
+cluster_undo_retention_horizon_sample(ClusterUndoRetentionSample *out)
 {
 	ProcArrayStruct *arrayP = procArray;
-	SCN min;
+	ClusterUndoRetentionSample sample = {0};
 	int			index;
 
-	if (cluster_node_id < 0)
-		return InvalidScn;		/* cluster disabled */
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (cluster_node_id < 0 || arrayP == NULL || allProcs == NULL)
+		return false;
 
 	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
 	/* Snapshot xmin is published under this lock before read_scn is chosen.
 	 * Sample the clock first: a later snapshot cannot precede this value.
 	 * Existing unpublished snapshots refuse below; there is no post-scan
 	 * clock sample that could run ahead of a concurrently created reader. */
-	min = cluster_scn_current();
-	for (index = 0; index < arrayP->numProcs; index++)
+	sample.clock_scn = cluster_scn_current();
+	sample.horizon_scn = sample.clock_scn;
+	sample.contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK;
+	/* An invalid census cannot prove that the clock is unconstrained. Check
+	 * in the same ProcArray cut before following any membership index. */
+	if (arrayP->numProcs < 0 || arrayP->numProcs > arrayP->maxProcs)
+		sample.horizon_scn = InvalidScn;
+	/* Replication slots can retain history without a live PGPROC. Their
+	 * xmin fields have no associated read SCN, even when an active backend
+	 * publishes the same raw XID. Until the slot owner supplies that proof,
+	 * refuse H in this same cut; neither the clock nor another reader can
+	 * stand in for the slot's history protection. */
+	if (TransactionIdIsValid(arrayP->replication_slot_xmin) ||
+		TransactionIdIsValid(arrayP->replication_slot_catalog_xmin))
+		sample.horizon_scn = InvalidScn;
+	for (index = 0; SCN_VALID(sample.horizon_scn) && index < arrayP->numProcs; index++)
 	{
 		int			pgprocno = arrayP->pgprocnos[index];
 		PGPROC	   *proc = &allProcs[pgprocno];
 		SCN			r = (SCN) pg_atomic_read_u64(&proc->cluster_read_scn_atomic);
+		SCN			previous = sample.horizon_scn;
 
-		min = cluster_undo_retention_sample_min(min, UINT32_ACCESS_ONCE(proc->xmin), r);
-		if (!SCN_VALID(min))
+		sample.horizon_scn = cluster_undo_retention_sample_min(previous,
+															UINT32_ACCESS_ONCE(proc->xmin), r);
+		if (!SCN_VALID(sample.horizon_scn))
 			break;
+		if (SCN_VALID(r))
+		{
+			int			cmp = scn_time_cmp(r, previous);
+			ClusterHeapFreezeReportV2ContributorKind kind;
+			bool		prefer;
+
+			kind = proc->pid > 0
+				? CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT
+				: CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_UNKNOWN;
+			prefer = sample.contributor_kind == CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK ||
+				(sample.contributor_kind == CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_UNKNOWN &&
+				 kind == CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+
+			/* Attribute the minimum in this same cut. Equal-time protection
+			 * wins over CLOCK; an unexplained dummy entry is never promoted
+			 * to a prepared-transaction SCN proof. Keep the scalar SCN bits. */
+			if (cmp < 0 || (cmp == 0 && prefer))
+			{
+				sample.contributor_kind = kind;
+				sample.contributor_token = kind == CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT
+					? (uint64) pgprocno + 1 : 0;
+			}
+		}
 	}
 	LWLockRelease(ProcArrayLock);
 
-	return min;
+	if (!SCN_VALID(sample.horizon_scn))
+		return false;
+	*out = sample;
+	return true;
+}
+
+/* Compatibility entry point: preserve the original numeric H and refusal. */
+SCN
+cluster_undo_retention_horizon(void)
+{
+	ClusterUndoRetentionSample sample;
+
+	return cluster_undo_retention_horizon_sample(&sample) ? sample.horizon_scn : InvalidScn;
 }
 
 /*
@@ -3173,6 +3231,100 @@ GetOldestActiveTransactionId(void)
 
 	return oldestRunningXid;
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * Capture one FullXid reference before scanning the complete native top-XID
+ * array. GetNewTransactionId publishes its assigned XID before releasing
+ * XidGenLock, so no pre-N allocation can remain private at this cut.
+ * ProcArrayLock stabilizes membership, including prepared dummy PGPROCs.
+ * As in GetOldestActiveTransactionId, include VACUUM and every database;
+ * each parent's XID precedes its children, including overflowed subxids.
+ *
+ * This is one input to the cluster active scan, not freeze authority. An
+ * exited PGPROC may still have census protection, which must be scanned
+ * afterwards. The existing durable lease supplies the future input at the
+ * same XidGenLock cut as N. Each active identity comes from its original
+ * PGPROC assignment, never a raw-XID epoch guess. Recovery's
+ * unclaimed transactions cannot be proved from this native array.
+ */
+bool
+ProcArrayGetActiveFullXidSample(FullTransactionId *reference_full,
+							   FullTransactionId *future_full,
+							   FullTransactionId *active_min,
+							   ClusterXidStripeSampleFence *lease_fence)
+{
+	ClusterXidStripeSampleFence fence;
+	FullTransactionId reference;
+	FullTransactionId future;
+	FullTransactionId minimum;
+	bool		valid = true;
+	int			index;
+
+	if (reference_full != NULL)
+		*reference_full = InvalidFullTransactionId;
+	if (future_full != NULL)
+		*future_full = InvalidFullTransactionId;
+	if (active_min != NULL)
+		*active_min = InvalidFullTransactionId;
+	if (lease_fence != NULL)
+		MemSet(lease_fence, 0, sizeof(*lease_fence));
+	if (reference_full == NULL || future_full == NULL || active_min == NULL || lease_fence == NULL ||
+		reference_full == future_full || reference_full == active_min || future_full == active_min ||
+		RecoveryInProgress() || procArray == NULL || ProcGlobal == NULL ||
+		ProcGlobal->xids == NULL || ProcGlobal->allProcs == NULL || ShmemVariableCache == NULL)
+		return false;
+
+	/* Capture both inputs before releasing XidGenLock. Raising a floor after
+	 * this cut must not hide an older allocation from the PGPROC scan. */
+	LWLockAcquire(XidGenLock, LW_SHARED);
+	reference = ShmemVariableCache->nextXid;
+	valid = FullTransactionIdIsValid(reference) &&
+		TransactionIdIsNormal(XidFromFullTransactionId(reference)) &&
+		cluster_xid_stripe_sample_future(reference, &future, &fence);
+	LWLockRelease(XidGenLock);
+	if (!valid || !FullTransactionIdIsValid(future) ||
+		!TransactionIdIsNormal(XidFromFullTransactionId(future)) ||
+		FullTransactionIdPrecedes(future, reference))
+		return false;
+	minimum = future;
+
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	if (procArray->numProcs < 0 || procArray->numProcs > procArray->maxProcs)
+		valid = false;
+	for (index = 0; valid && index < procArray->numProcs; index++)
+	{
+		TransactionId xid = UINT32_ACCESS_ONCE(ProcGlobal->xids[index]);
+		PGPROC	   *proc;
+		FullTransactionId full;
+
+		if (!TransactionIdIsValid(xid))
+			continue;
+		/* Membership and pgprocnos are stable under ProcArrayLock. Pair
+		 * with the allocator's original-identity-before-raw publication. */
+		pg_read_barrier();
+		proc = &ProcGlobal->allProcs[procArray->pgprocnos[index]];
+		full = FullTransactionIdFromU64(pg_atomic_read_u64(&proc->cluster_top_full_xid_atomic));
+		if (!TransactionIdIsNormal(xid) || !FullTransactionIdIsValid(full) ||
+			U64FromFullTransactionId(full) == UINT64_MAX || XidFromFullTransactionId(full) != xid)
+		{
+			valid = false;
+			break;
+		}
+		if (FullTransactionIdPrecedes(full, minimum))
+			minimum = full;
+	}
+	LWLockRelease(ProcArrayLock);
+	if (!valid)
+		return false;
+
+	*reference_full = reference;
+	*future_full = future;
+	*active_min = minimum;
+	*lease_fence = fence;
+	return true;
+}
+#endif
 
 /*
  * GetOldestSafeDecodingTransactionId -- lowest xid not affected by vacuum

@@ -100,6 +100,20 @@ static CommandId GetRealCmax(CommandId combocid);
  * the originating one, use HeapTupleHeaderGetRawCommandId() directly.
  */
 
+/* Immutable FULL consumers cannot infer a local combo map from an integer.
+ * This check supplies no transaction authority; it only makes the original
+ * getters safe after the caller has proved exact SELF ownership. */
+bool
+HeapTupleHeaderCommandIdIsAvailable(HeapTupleHeader tup)
+{
+	CommandId cid = HeapTupleHeaderGetRawCommandId(tup);
+
+	if ((tup->t_infomask & HEAP_MOVED) != 0 || cid == InvalidCommandId)
+		return false;
+	return (tup->t_infomask & HEAP_COMBOCID) == 0
+		|| (comboCids != NULL && cid < (CommandId) usedComboCids);
+}
+
 CommandId
 HeapTupleHeaderGetCmin(HeapTupleHeader tup)
 {

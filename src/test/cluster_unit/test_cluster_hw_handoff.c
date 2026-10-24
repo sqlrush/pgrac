@@ -45,11 +45,13 @@
 #include "access/xact.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_ges.h"
+#include "cluster/cluster_ges_holder.h"
 #include "cluster/cluster_ges_dedup.h"
 #include "cluster/cluster_ges_reply_wait.h"
 #include "cluster/cluster_grd_work_queue.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_lmd_wait_state.h"
 #include "cluster/cluster_native_lock_probe.h"
@@ -63,6 +65,31 @@
 #include "storage/latch.h"
 
 /* Storage/transport observers retain complete keys; the GRD is always real. */
+/* Legacy control fixtures deliberately do not execute object queries. */
+#ifndef PGRAC_REAL_HOLDER_PROBE
+bool
+cluster_ges_holder_probe_is_frame(const void *payload, Size length)
+{
+	(void)payload;
+	(void)length;
+	return false;
+}
+void
+cluster_ges_holder_probe_ingress(const ClusterICEnvelope *env, const void *payload)
+{
+	(void)env;
+	(void)payload;
+	abort();
+}
+void
+cluster_ges_holder_probe_drain(const ClusterGrdWorkItem *item)
+{
+	(void)item;
+	abort();
+}
+#endif
+static bool (*hw_probe_work_enqueue)(uint32, const void *, uint16);
+static bool (*hw_probe_work_dequeue)(ClusterGrdWorkItem *);
 static void (*hw_dedup_remove_observe)(const ClusterGesDedupKey *key);
 static void (*hw_dedup_record_observe)(const ClusterGesDedupKey *key, const GesReplyPayload *reply);
 static bool (*hw_control_retire_observe)(uint32 node, uint32 proc, uint64 epoch, uint64 request);
@@ -138,6 +165,29 @@ typedef enum HandoffFault {
 
 static HandoffFault fault;
 static bool relation_case;
+static int ko_sample_calls;
+static int ko_accept_calls;
+
+/* Real S3/GES/S5, with the KO owner an explicit boundary. Acceptance must
+ * arrive before consumption, after both exact promotion/proof checks. */
+uint64
+cluster_ko_peer_fence_request_sample_v3(void)
+{
+	ko_sample_calls++;
+	return 42;
+}
+
+bool
+cluster_ko_peer_fence_fresh_grant_v3(const ClusterLockAcquireRequest *request)
+{
+	UT_ASSERT(request->hw_grant.local_promoted);
+	UT_ASSERT(!request->hw_grant.consumed);
+	UT_ASSERT(request->hw_grant.cleanup_pending);
+	UT_ASSERT(cluster_ges_relation_grant_is_current(&request->hw_grant, &request->resid,
+		&request->holder, request->request_id, request->lockmode, request->dontwait));
+	ko_accept_calls++;
+	return false; /* No KO shared memory or retirement fabricated here. */
+}
 static uint8 relation_type = LOCKTAG_RELATION;
 static LOCKMODE relation_mode = ShareLock;
 static uint64 advisory_counts[CLUSTER_ADVISORY_COUNTER_COUNT];
@@ -605,6 +655,8 @@ ProcessInterrupts(void)
 bool
 cluster_grd_work_queue_enqueue(uint32 source, const void *payload, uint16 length)
 {
+	if (hw_probe_work_enqueue != NULL)
+		return hw_probe_work_enqueue(source, payload, length);
 	(void)source;
 	(void)payload;
 	(void)length;
@@ -668,6 +720,8 @@ fixture_cf_master(const ClusterResId *resid)
 bool
 cluster_grd_work_queue_dequeue(ClusterGrdWorkItem *out)
 {
+	if (hw_probe_work_dequeue != NULL)
+		return hw_probe_work_dequeue(out);
 	if (!master_work_pending)
 		return false;
 	memset(out, 0, sizeof(*out));
@@ -1037,6 +1091,7 @@ setup_case(ClusterLockAcquireRequest *req, bool sibling)
 			cluster_grd_try_reserve(&req->resid, &other, req->lockmode, 1, NULL, &generation),
 			CLUSTER_GRD_ENTRY_OK);
 	cleanup_sent = request_sent = invalid_replies_rejected = cancel_sent = 0;
+	ko_sample_calls = ko_accept_calls = 0;
 	local_native_probes = 0;
 	memset(&local_cleanup_release, 0, sizeof(local_cleanup_release));
 	memset(&actual_reply, 0, sizeof(actual_reply));
@@ -1065,6 +1120,16 @@ run_case(bool sibling, HandoffFault selected)
 
 	fault = selected;
 	setup_case(&req, sibling);
+	if (relation_case && relation_type == LOCKTAG_RELATION) {
+		UT_ASSERT_EQ(cluster_grd_cancel_reservation_by_id(&req.resid, &req.holder),
+			CLUSTER_GRD_ENTRY_OK);
+		MyProc->pgprocno = req.holder.procno;
+		UT_ASSERT_EQ(cluster_lock_acquire_s3_partition_reservation(&req),
+			CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+		UT_ASSERT_EQ(ko_sample_calls, 1);
+		UT_ASSERT_EQ(req.ko_fence_serial_limit, 42);
+		UT_ASSERT_EQ(req.ko_fence_request_id, req.request_id);
+	}
 	original = req.holder;
 	original_resid = req.resid;
 	other = grd_lifecycle_holder(1, 22, 202);
@@ -1092,6 +1157,8 @@ run_case(bool sibling, HandoffFault selected)
 	}
 	PG_END_TRY();
 	UT_ASSERT(PG_exception_stack == saved_exception_stack);
+	if (relation_case && relation_type == LOCKTAG_RELATION)
+		UT_ASSERT_EQ(ko_accept_calls, selected == HW_NORMAL ? 1 : 0);
 	UT_ASSERT_EQ(caught, s4_error || s5_error);
 	UT_ASSERT_EQ(MyProc->cluster_lmd_wait.active, 0);
 	if (selected == HW_NORMAL) {
@@ -1205,6 +1272,11 @@ run_local_relation_case(bool abandon, bool nowait_conflict)
 	req.dontwait = nowait_conflict;
 	UT_ASSERT_EQ(cluster_lock_acquire_s3_partition_reservation(&req),
 				 CLUSTER_LOCK_ACQUIRE_OK_GRANTED); /* Dispatch S4, not the old shortcut. */
+	if (!cf_case && relation_type == LOCKTAG_RELATION) {
+		UT_ASSERT_EQ(ko_sample_calls, 1);
+		UT_ASSERT_EQ(req.ko_fence_serial_limit, 42);
+		UT_ASSERT_EQ(req.ko_fence_request_id, req.request_id);
+	}
 	UT_ASSERT(!cluster_grd_holder_mode_by_id(&req.resid, &req.holder, &mode));
 	successor = grd_lifecycle_holder(2, 23, 203);
 	if (nowait_conflict)
@@ -1269,6 +1341,8 @@ run_local_relation_case(bool abandon, bool nowait_conflict)
 	}
 	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
 	UT_ASSERT_EQ(cluster_ges_reply_wait_table_active_count(), 0);
+	if (!cf_case && relation_type == LOCKTAG_RELATION)
+		UT_ASSERT_EQ(ko_accept_calls, !abandon && !nowait_conflict ? 1 : 0);
 	MyProc = NULL;
 	relation_case = false;
 }

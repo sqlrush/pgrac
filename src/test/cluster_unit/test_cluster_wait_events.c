@@ -238,10 +238,12 @@ UT_TEST(test_per_category_event_counts)
 				 9);
 	/* Undo category: 4 (AD-010) + CR_CONSTRUCT (spec-3.9) + TT_DURABLE_IO
 	 * (spec-3.11) + BUF_FLUSH + EXTENT_CLAIM (spec-3.18 D7) + BLOCK_GRANT_WAIT +
-	 * BLOCK_INVALIDATE_WAIT + BLOCK_REMASTER_WAIT (spec-5.22b D2-6) = 11.  Count
+	 * BLOCK_INVALIDATE_WAIT + BLOCK_REMASTER_WAIT (spec-5.22b D2-6) + frontend
+	 * CAPACITY_WAIT = 12.  Count
 	 * the full range to the last event so future additions are caught here (F12). */
-	UT_ASSERT_EQ(
-		(uint32)WAIT_EVENT_UNDO_BLOCK_REMASTER_WAIT - (uint32)WAIT_EVENT_UNDO_REMOTE_READ + 1, 11);
+	UT_ASSERT_EQ((uint32)WAIT_EVENT_CLUSTER_UNDO_CAPACITY_WAIT - (uint32)WAIT_EVENT_UNDO_REMOTE_READ
+					 + 1,
+				 12);
 	UT_ASSERT_EQ((uint32)WAIT_EVENT_ADG_SCN_SYNC_WAIT - (uint32)WAIT_EVENT_ADG_MRP_APPLY_WAIT + 1,
 				 4);
 	UT_ASSERT_EQ((uint32)WAIT_EVENT_CLUSTER_BLOCK_DEVICE_PR_REGISTER
@@ -260,9 +262,9 @@ UT_TEST(test_cross_category_jump_is_one_class_step)
 {
 	UT_ASSERT_EQ((uint32)WAIT_EVENT_PCM_BLOCK_READ_N_S - (uint32)WAIT_EVENT_GES_LOCAL_FAST_PATH,
 				 0x01000000U - 4U);
-	/* spec-3.9: last Undo event is now CR_CONSTRUCT (0x18000004) */
-	UT_ASSERT_EQ((uint32)WAIT_EVENT_ADG_MRP_APPLY_WAIT - (uint32)WAIT_EVENT_CLUSTER_CR_CONSTRUCT,
-				 0x01000000U - 4U);
+	UT_ASSERT_EQ((uint32)WAIT_EVENT_ADG_MRP_APPLY_WAIT
+					 - (uint32)WAIT_EVENT_CLUSTER_UNDO_CAPACITY_WAIT,
+				 0x01000000U - 11U);
 	UT_ASSERT_EQ((uint32)WAIT_EVENT_CLUSTER_SHARED_FS_READ - (uint32)WAIT_EVENT_ADG_SCN_SYNC_WAIT,
 				 0x01000000U - 3U);
 }
@@ -277,10 +279,20 @@ UT_TEST(test_phase_publication_wait_is_appended_to_its_own_class)
 	UT_ASSERT_EQ((uint32)WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP, PG_WAIT_CLUSTER_BGPROC);
 }
 
+UT_TEST(test_capacity_wait_appends_without_renumbering_existing_undo_events)
+{
+	UT_ASSERT_EQ((uint32)WAIT_EVENT_UNDO_BLOCK_GRANT_WAIT, PG_WAIT_CLUSTER_UNDO | 8U);
+	UT_ASSERT_EQ((uint32)WAIT_EVENT_UNDO_BLOCK_INVALIDATE_WAIT, PG_WAIT_CLUSTER_UNDO | 9U);
+	UT_ASSERT_EQ((uint32)WAIT_EVENT_UNDO_BLOCK_REMASTER_WAIT, PG_WAIT_CLUSTER_UNDO | 10U);
+	UT_ASSERT_EQ((uint32)WAIT_EVENT_CLUSTER_UNDO_CAPACITY_WAIT, PG_WAIT_CLUSTER_UNDO | 11U);
+	UT_ASSERT_EQ((uint32)WAIT_EVENT_ADG_MRP_APPLY_WAIT, PG_WAIT_CLUSTER_ADG);
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
+	UT_RUN(test_capacity_wait_appends_without_renumbering_existing_undo_events);
 	UT_RUN(test_phase_publication_wait_is_appended_to_its_own_class);
 	UT_RUN(test_class_ids_match_design_doc);
 	UT_RUN(test_class_ids_pairwise_distinct);

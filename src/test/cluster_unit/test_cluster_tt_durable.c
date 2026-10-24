@@ -579,6 +579,8 @@ static int g_ctrc_bind_order = 0;
 static int g_ctrc_write_order = 0;
 static int g_ctrc_open_calls = 0;
 static int g_ctrc_open_order = 0;
+static FullTransactionId g_ctrc_reserved_original_full;
+static FullTransactionId g_ctrc_open_original_full;
 static ClusterCtrcOriginReserveResult g_ctrc_reserve_result = CLUSTER_CTRC_ORIGIN_RESERVED_PENDING;
 static int g_ctrc_reserve_retry_countdown = 0;
 static int g_ctrc_release_overlap_pending_countdown = 0;
@@ -608,6 +610,10 @@ cluster_ctrc_origin_reserve_active(const ClusterCtrcTxnKeyV1 *key,
 	reservation->key = *key;
 	reservation->origin_index = 7;
 	reservation->reservation_generation = 41;
+	/* Fixture-supplied producer identity; the real engine captures PGPROC.
+	 * The linked publisher must preserve these bytes across BIND/write. */
+	g_ctrc_reserved_original_full = FullTransactionIdFromEpochAndXid(7, key->xid);
+	reservation->original_full_xid = g_ctrc_reserved_original_full;
 	reservation->kind = g_ctrc_reserve_result == CLUSTER_CTRC_ORIGIN_RESERVED_PENDING
 							? CTRC_ORIGIN_RESERVATION_PENDING_OWNED
 							: CTRC_ORIGIN_RESERVATION_EXISTING_OPEN;
@@ -644,6 +650,7 @@ cluster_ctrc_origin_open_reserved(const ClusterCtrcOriginReservation *reservatio
 	g_ctrc_open_order = ++g_ctrc_event_sequence;
 	if (!g_ctrc_open_ok || reservation == NULL || grant_generation == NULL)
 		return false;
+	g_ctrc_open_original_full = reservation->original_full_xid;
 	*grant_generation = g_ctrc_open_grant;
 	return true;
 }
@@ -1055,6 +1062,8 @@ reset_current_write_mock(void)
 	g_ctrc_write_order = 0;
 	g_ctrc_open_calls = 0;
 	g_ctrc_open_order = 0;
+	g_ctrc_reserved_original_full = InvalidFullTransactionId;
+	g_ctrc_open_original_full = InvalidFullTransactionId;
 	g_ctrc_reserve_result = CLUSTER_CTRC_ORIGIN_RESERVED_PENDING;
 	g_ctrc_reserve_retry_countdown = 0;
 	g_ctrc_release_overlap_pending_countdown = 0;
@@ -1703,6 +1712,9 @@ UT_TEST(test_active_publish_wal_precedes_identical_disk_and_resident_successor)
 	UT_ASSERT_EQ(g_current_recheck_calls, 1);
 	UT_ASSERT_EQ(g_ctrc_reserve_calls, 1);
 	UT_ASSERT_EQ(g_ctrc_open_calls, 1);
+	UT_ASSERT(FullTransactionIdEquals(g_ctrc_reserved_original_full,
+									FullTransactionIdFromEpochAndXid(7, successor.xid)));
+	UT_ASSERT(FullTransactionIdEquals(g_ctrc_open_original_full, g_ctrc_reserved_original_full));
 	UT_ASSERT(g_ctrc_reserve_order < g_ctrc_bind_order);
 	UT_ASSERT(g_ctrc_bind_order < g_ctrc_write_order);
 	UT_ASSERT(g_ctrc_write_order < g_ctrc_open_order);
@@ -1740,6 +1752,9 @@ UT_TEST(test_active_publish_waits_for_released_origin_notification_before_bind)
 	UT_ASSERT_EQ(g_undo_cleaner_wakeup_calls, 1);
 	UT_ASSERT_EQ(g_bind_emit_calls, 1);
 	UT_ASSERT_EQ(g_ctrc_open_calls, 1);
+	UT_ASSERT(FullTransactionIdEquals(g_ctrc_reserved_original_full,
+									FullTransactionIdFromEpochAndXid(7, successor.xid)));
+	UT_ASSERT(FullTransactionIdEquals(g_ctrc_open_original_full, g_ctrc_reserved_original_full));
 	UT_ASSERT(g_ctrc_reserve_order < g_ctrc_bind_order);
 }
 

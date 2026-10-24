@@ -1580,11 +1580,15 @@ GrantRole(ParseState *pstate, GrantRoleStmt *stmt)
  *
  * Drop the objects owned by a given list of roles.
  */
-void
-DropOwnedObjects(DropOwnedStmt *stmt)
+static void
+DropOwnedObjectsInternal(DropOwnedStmt *stmt, bool check_storage_only, bool isTopLevel)
 {
 	List	   *role_ids = roleSpecsToIds(stmt->roles);
 	ListCell   *cell;
+	int flags = PERFORM_DELETION_USER_COMMAND;
+
+	if (isTopLevel)
+		flags |= PERFORM_DELETION_TOPLEVEL;
 
 	/* Check privileges */
 	foreach(cell, role_ids)
@@ -1600,8 +1604,24 @@ DropOwnedObjects(DropOwnedStmt *stmt)
 	}
 
 	/* Ok, do it */
-	shdepDropOwned(role_ids, stmt->behavior);
+	if (check_storage_only)
+		shdepCheckOwnedStorageDrop(role_ids, stmt->behavior, flags);
+	else
+		shdepDropOwned(role_ids, stmt->behavior, flags);
 }
+
+void
+DropOwnedObjects(DropOwnedStmt *stmt, bool isTopLevel)
+{
+	DropOwnedObjectsInternal(stmt, false, isTopLevel);
+}
+
+void
+CheckOwnedObjectsStorageDrop(DropOwnedStmt *stmt, bool isTopLevel)
+{
+	DropOwnedObjectsInternal(stmt, true, isTopLevel);
+}
+
 
 /*
  * ReassignOwnedObjects

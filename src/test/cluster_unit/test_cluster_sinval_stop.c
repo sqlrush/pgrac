@@ -33,6 +33,7 @@ static bool hash_used[64];
 static char hash_identity;
 static int wake_count, apply_count, reset_count, send_count;
 static int initfile_invalidations;
+static int ko_commit_calls, ko_calls_at_apply;
 static bool initfile_locked;
 static uint8 sent_type;
 static union {
@@ -49,6 +50,7 @@ static unsigned gate_calls;
 static ClusterNodeInfo known_peer;
 static ClusterR4MembershipSnapshot current_membership;
 static uint64 current_epoch = 1;
+static uint64 admitted_peer_boot = 200;
 static bool membership_valid = true, prebump_pending;
 static bool reset_during_apply;
 static uint64 concurrent_reset_ticket;
@@ -252,7 +254,7 @@ cluster_membership_get_state(int32 node)
 uint64
 cluster_membership_get_last_admitted_incarnation(int32 node)
 {
-	return node == 0 ? 100 : 200;
+	return node == 0 ? 100 : admitted_peer_boot;
 }
 bool
 cluster_injection_should_skip(const char *name)
@@ -267,6 +269,10 @@ cluster_injection_run(const char *name)
 void
 SendSharedInvalidMessages(const SharedInvalidationMessage *msgs, int n)
 {
+	for (int i = 0; i < n; i++)
+		if (msgs[i].id == SHAREDINVALKO_COMMIT_ID)
+			ko_calls_at_apply = ko_commit_calls;
+
 	Assert(held_lock == NULL && n > 0);
 	apply_count += n;
 }
@@ -418,6 +424,7 @@ reset_test(void)
 	gate_admit = true;
 	gate_calls = 0;
 	current_epoch = 1;
+	admitted_peer_boot = 200;
 	membership_valid = true;
 	prebump_pending = false;
 	reset_during_apply = false;
@@ -1027,13 +1034,223 @@ UT_TEST(test_publication_overflow_needs_retry_and_duplicates_are_safe)
 	UT_ASSERT_EQ(poll_all(), CLUSTER_NORMAL_STOP_READY);
 }
 
+static bool ko_commit_result = true;
+static uint64 ko_batch_observed;
+
+bool
+cluster_ko_peer_commit_v3(int32 source, uint64 epoch, uint64 origin_boot,
+						 uint64 peer_boot, uint64 batch)
+{
+	Assert(held_lock == NULL && !initfile_locked);
+	Assert(source == 1 && epoch == 1 && origin_boot == 200 && peer_boot == 100);
+	ko_commit_calls++;
+	ko_batch_observed = batch;
+	return ko_commit_result;
+}
+
+static void
+receive_ko_marker(int variant)
+{
+	struct {
+		SinvalPublicationHeader hdr;
+		SharedInvalidationMessage msg;
+	} frame = { 0 };
+	ClusterICEnvelope env = { 0 };
+
+	frame.hdr.base.batch_id = 400;
+	frame.hdr.base.epoch = 1;
+	frame.hdr.base.source_node = 1;
+	frame.hdr.base.nmsgs = 1;
+	frame.hdr.base.flags = SINVAL_REQUIRES_ACK | SINVAL_PUBLICATION;
+	frame.hdr.origin_incarnation = 200;
+	frame.hdr.target_incarnation = 100;
+	frame.msg.ko.id = SHAREDINVALKO_COMMIT_ID;
+	frame.msg.ko.version = SHAREDINVALKO_COMMIT_VERSION;
+	frame.msg.ko.batch_lo = 345;
+	frame.msg.ko.batch_hi = 7;
+	if (variant == 1) frame.msg.ko.version++;
+	if (variant == 2) frame.msg.ko.reserved++;
+	if (variant == 3) frame.msg.ko.batch_lo = frame.msg.ko.batch_hi = 0;
+	if (variant == 4) frame.hdr.origin_incarnation++;
+	env.source_node_id = 1;
+	env.payload_length = sizeof(frame);
+	cluster_sinval_handle_envelope(&env, &frame);
+}
+
+UT_TEST(test_ko_publication_consumes_terminal_before_native_si_and_ack)
+{
+	reset_test();
+	ko_commit_calls = ko_calls_at_apply = 0;
+	ko_commit_result = true;
+	receive_ko_marker(0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterSinvalInbound->tail), 1);
+	UT_ASSERT_EQ(ko_commit_calls, 0);
+	cluster_sinval_drain_inbound_and_apply();
+	UT_ASSERT_EQ(ko_commit_calls, 1);
+	UT_ASSERT_EQ(ko_calls_at_apply, 1);
+	UT_ASSERT_EQ(ko_batch_observed, (UINT64_C(7) << 32) | 345);
+	UT_ASSERT_EQ(apply_count, 1);
+	UT_ASSERT_EQ(send_count, 0);
+	cluster_sinval_drain_ack_outbound_and_send();
+	UT_ASSERT_EQ(send_count, 1);
+	/* Publication retry is safe even if its earlier ACK was not consumed. */
+	receive_ko_marker(0);
+	cluster_sinval_drain_inbound_and_apply();
+	UT_ASSERT_EQ(ko_commit_calls, 2);
+}
+
+UT_TEST(test_ko_publication_refusal_and_reset_never_satisfy_ack)
+{
+	reset_test();
+	ko_commit_calls = ko_calls_at_apply = 0;
+	ko_commit_result = false;
+	receive_ko_marker(0);
+	cluster_sinval_drain_inbound_and_apply();
+	UT_ASSERT_EQ(ko_commit_calls, 1);
+	UT_ASSERT_EQ(apply_count, 0);
+	cluster_sinval_drain_ack_outbound_and_send();
+	UT_ASSERT_EQ(send_count, 0);
+	pg_atomic_write_u32(&ClusterSinval->inbound_overflow_reset_pending, 1);
+	cluster_sinval_apply_inbound_overflow_reset_if_pending();
+	UT_ASSERT_EQ(reset_count, 1);
+	UT_ASSERT_EQ(ko_commit_calls, 1);
+	ko_commit_result = true;
+	receive_ko_marker(0);
+	cluster_sinval_drain_inbound_and_apply();
+	cluster_sinval_drain_ack_outbound_and_send();
+	UT_ASSERT_EQ(send_count, 1);
+}
+
+UT_TEST(test_ko_marker_requires_valid_authenticated_publication)
+{
+	SharedInvalidationMessage msg = { 0 };
+
+	for (int variant = 1; variant <= 4; variant++) {
+		reset_test();
+		ko_commit_calls = 0;
+		receive_ko_marker(variant);
+		cluster_sinval_drain_inbound_and_apply();
+		cluster_sinval_drain_ack_outbound_and_send();
+		UT_ASSERT_EQ(ko_commit_calls, 0);
+		UT_ASSERT_EQ(apply_count, 0);
+		UT_ASSERT_EQ(send_count, 0);
+	}
+	/* Even an injected, shape-valid native SI entry has no publication
+	 * authentication. It cannot drive a terminal or pass a native ACK. */
+	reset_test();
+	ko_commit_calls = 0;
+	msg.ko.id = SHAREDINVALKO_COMMIT_ID;
+	msg.ko.version = SHAREDINVALKO_COMMIT_VERSION;
+	msg.ko.batch_lo = 345;
+	{
+		struct {
+			SinvalBroadcastHeader hdr;
+			SharedInvalidationMessage msg;
+		} legacy = { 0 };
+		ClusterICEnvelope env = { 0 };
+
+		legacy.hdr.batch_id = 400;
+		legacy.hdr.epoch = 1;
+		legacy.hdr.source_node = 1;
+		legacy.hdr.nmsgs = 1;
+		legacy.hdr.flags = SINVAL_REQUIRES_ACK;
+		legacy.msg = msg;
+		env.source_node_id = 1;
+		env.payload_length = sizeof(legacy);
+		cluster_sinval_handle_envelope(&env, &legacy);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterSinvalInbound->tail), 0);
+	}
+	UT_ASSERT(cluster_sinval_inbound_try_enqueue(400, &msg, 1, 1));
+	cluster_sinval_drain_inbound_and_apply();
+	cluster_sinval_drain_ack_outbound_and_send();
+	UT_ASSERT_EQ(ko_commit_calls, 0);
+	UT_ASSERT_EQ(apply_count, 0);
+	UT_ASSERT_EQ(send_count, 0);
+}
+
+UT_TEST(test_ko_publication_rechecks_boot_after_enqueue)
+{
+	reset_test();
+	ko_commit_calls = 0;
+	receive_ko_marker(0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterSinvalInbound->tail), 1);
+	admitted_peer_boot++;
+	cluster_sinval_drain_inbound_and_apply();
+	cluster_sinval_drain_ack_outbound_and_send();
+	UT_ASSERT_EQ(ko_commit_calls, 0);
+	UT_ASSERT_EQ(apply_count, 0);
+	UT_ASSERT_EQ(send_count, 0);
+}
+
+UT_TEST(test_ko_failure_wakes_owner_without_ack_or_completion)
+{
+	int32 peer = -1;
+	reset_test();
+	MyProc->pid = 123;
+	UT_ASSERT(cluster_sinval_ack_wait_begin(901, 6, 9000000));
+	cluster_sinval_ack_wait_record_failure(901, 1);
+	UT_ASSERT(cluster_sinval_ack_wait_read_failure(901, &peer));
+	UT_ASSERT_EQ(peer, 1);
+	UT_ASSERT_EQ(wake_count, 1);
+	UT_ASSERT_EQ(hash_entries[0].ack_received_mask, 0);
+	UT_ASSERT_EQ(hash_entries[0].completion_signaled, 0);
+	UT_ASSERT(!cluster_sinval_ack_wait_is_complete(901));
+	cluster_sinval_ack_wait_record_failure(901, 1);
+	UT_ASSERT_EQ(wake_count, 1);
+	cluster_sinval_ack_wait_record(901, 1);
+	cluster_sinval_ack_wait_record(901, 2);
+	UT_ASSERT(!cluster_sinval_ack_wait_is_complete(901));
+	UT_ASSERT_EQ(hash_entries[0].ack_received_mask, 0);
+	UT_ASSERT_EQ(poll_all(), CLUSTER_NORMAL_STOP_PENDING);
+	cluster_sinval_ack_wait_remove(901);
+	UT_ASSERT(!cluster_sinval_ack_wait_read_failure(901, NULL));
+	UT_ASSERT_EQ(poll_all(), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_ko_failure_cannot_poison_publication_or_other_wait)
+{
+	int32 peer = 77;
+	reset_test();
+	begin_publication(902);
+	cluster_sinval_ack_wait_record_failure(902, 1);
+	UT_ASSERT(!cluster_sinval_ack_wait_read_failure(902, &peer));
+	UT_ASSERT_EQ(peer, 77);
+	UT_ASSERT_EQ(wake_count, 0);
+	reset_test();
+	UT_ASSERT(cluster_sinval_ack_wait_begin(903, 2, 9000000));
+	cluster_sinval_ack_wait_record_failure(904, 1);
+	cluster_sinval_ack_wait_record_failure(903, 2);
+	cluster_sinval_ack_wait_record_failure(903, -1);
+	cluster_sinval_ack_wait_record_failure(903, 32);
+	UT_ASSERT(!cluster_sinval_ack_wait_read_failure(903, &peer));
+	UT_ASSERT_EQ(peer, 77);
+	UT_ASSERT_EQ(wake_count, 0);
+	cluster_sinval_ack_wait_record(903, 1);
+	UT_ASSERT(cluster_sinval_ack_wait_is_complete(903));
+}
+
+UT_TEST(test_ko_failure_does_not_notify_reused_proc_slot)
+{
+	reset_test();
+	MyProc->pid = 123;
+	UT_ASSERT(cluster_sinval_ack_wait_begin(905, 2, 9000000));
+	MyProc->pid = 124;
+	cluster_sinval_ack_wait_record_failure(905, 1);
+	UT_ASSERT_EQ(wake_count, 0);
+	UT_ASSERT(cluster_sinval_ack_wait_read_failure(905, NULL));
+	UT_ASSERT(!cluster_sinval_ack_wait_is_complete(905));
+}
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(33);
 	UT_RUN(test_required_state_and_nonzero_empty_cursors);
 	UT_RUN(test_actual_inbound_outbound_and_ack_handoffs);
 	UT_RUN(test_all_acknowledged_still_needs_original_remove);
+	UT_RUN(test_ko_failure_wakes_owner_without_ack_or_completion);
+	UT_RUN(test_ko_failure_cannot_poison_publication_or_other_wait);
+	UT_RUN(test_ko_failure_does_not_notify_reused_proc_slot);
 	UT_RUN(test_reset_flags_need_original_consumers);
 	UT_RUN(test_later_malformed_ack_overrides_pending);
 	UT_RUN(test_geometry_live_identity_and_original_lock);
@@ -1057,6 +1274,10 @@ main(void)
 	UT_RUN(test_high_node_exact_ack_and_full_table_retention);
 	UT_RUN(test_publication_rejects_invalid_native_message_ids);
 	UT_RUN(test_publication_overflow_needs_retry_and_duplicates_are_safe);
+	UT_RUN(test_ko_publication_consumes_terminal_before_native_si_and_ack);
+	UT_RUN(test_ko_publication_refusal_and_reset_never_satisfy_ack);
+	UT_RUN(test_ko_marker_requires_valid_authenticated_publication);
+	UT_RUN(test_ko_publication_rechecks_boot_after_enqueue);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

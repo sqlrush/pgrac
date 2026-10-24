@@ -1,15 +1,18 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_resolver_cache.c
- *	  pgrac shared (per-instance) resolver cache -- spec-5.55 search-shortcut
+ *	  pgrac shared (per-instance) resolver cache -- spec-5.55 diagnostic
  *	  memo for the own-instance CR Source 3 WRAP_ANY by-xid durable scan.
  *
  *	  A position-hint memo: (xid_epoch, raw_xid, origin) -> {seg, slot, wrap}.
- *	  probe() looks the key up and LOCK-FREE re-validates the single hint slot
- *	  (gate (1) non-authoritative + (2) exact-(xid,wrap) reval + (4) epoch fence);
- *	  the caller (cluster_cr.c) then runs the SAME wrap_suspect acceptance gate it
- *	  runs on a fresh scan (gate (3)), so a memo hit is verdict-equivalent to the
- *	  O(segments) fresh scan it replaces.  install() caches the {seg,slot,wrap}
+ *	  probe() looks the key up and re-validates the single hint slot outside
+ *	  the cache partition lock
+ *	  (gate (1) non-authoritative + (2) stable exact-(xid,wrap) + native commit
+ *	  reval + (4) epoch fence before and after I/O);
+ *	  the caller (cluster_cr.c) measures acceptance without trusting the hint,
+ *	  then always runs the authoritative full scan.  Single-slot revalidation
+ *	  does not prove retained transaction identity across all carriers.
+ *	  install() caches the {seg,slot,wrap}
  *	  the fresh scan matched (own-instance gate (5) + COMMITTED gate (6), only
  *	  after acceptance passed).
  *
@@ -35,7 +38,7 @@
  */
 #include "postgres.h"
 
-#include "access/transam.h" /* ReadNextFullTransactionId, EpochFromFullTransactionId */
+#include "access/transam.h" /* FullXid epoch, TransactionIdDidCommit */
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/lwlock.h"
@@ -214,7 +217,12 @@ cluster_resolver_cache_shmem_register(void)
 bool
 cluster_resolver_cache_trust(void)
 {
-	return cluster_resolver_cache_enabled && ResolverCache != NULL;
+	/*
+	 * No configuration may replace the full scan with a position hint until
+	 * retained identity provenance and equivalent admission are established.
+	 * The enabled/measure settings still control diagnostic hint allocation.
+	 */
+	return false;
 }
 
 /* ============================================================
@@ -225,13 +233,11 @@ uint64
 cluster_resolver_xid_epoch(void)
 {
 	/*
-	 * The own node's FullTransactionId epoch.  pgrac segments the xid space by
-	 * (origin_node_id, xid) compound key (cluster_remote_xact), NOT by value-
-	 * range, so a raw 32-bit xid is reused on the own node only once per 2^32 own
-	 * xids -- exactly one increment of this epoch.  install + probe both read the
-	 * CURRENT epoch; a hit therefore requires the epoch to be unchanged since
-	 * install (< 2^32 xids elapsed), within which the raw xid is unique and a
-	 * previous-epoch incarnation cannot still be retained (retention << 2^32).
+	 * The own node's current FullTransactionId epoch.  The caller samples it BEFORE
+	 * a fresh scan; install retains that epoch, while probe checks the current
+	 * epoch before and after durable/native revalidation.  A scan that spans an
+	 * epoch advance must never be relabeled as a new-epoch hint.  This local
+	 * fence alone does not establish full retained-xid incarnation provenance.
 	 */
 	return (uint64)EpochFromFullTransactionId(ReadNextFullTransactionId());
 }
@@ -276,7 +282,7 @@ resolver_idx_lock(int idx)
 }
 
 /* ============================================================
- * spec-5.55 D4: probe (lock-free reval; candidate only, NO acceptance)
+ * spec-5.55 D4: probe (reval outside cache lock; candidate only, NO acceptance)
  * ============================================================ */
 
 bool
@@ -332,13 +338,21 @@ cluster_resolver_cache_probe(uint16 origin_node, TransactionId raw_xid, SCN *out
 	pg_atomic_fetch_add_u64(&ResolverCache->key_present_count, 1);
 
 	/*
-	 * gate (1)+(2): LOCK-FREE exact (xid, wrap) re-validation.  The returned scn
-	 * is a fresh durable re-read (never the cached commit_scn_debug).  A recycled
-	 * or wrap-bumped slot fails the lookup -> the hint is stale -> the caller
-	 * re-scans (a pure search shortcut).
+	 * gate (1)+(2): outside the cache partition lock, verify exact (xid, wrap),
+	 * native C1b and an unchanged second TT read.  TT COMMITTED is stamped at
+	 * precommit; the caller's earlier native check does not cover this I/O
+	 * window.  The returned scn is fresh durable state, never commit_scn_debug.
+	 * A stale or unproved hint falls through to the caller's existing scan.
 	 */
-	if (!cluster_tt_slot_durable_lookup(h_seg, h_slot, raw_xid, h_wrap, &probe_scn)) {
+	if (!cluster_tt_slot_durable_lookup_committed_stable(h_seg, h_slot, raw_xid, h_wrap,
+														 TransactionIdDidCommit, &probe_scn)) {
 		pg_atomic_fetch_add_u64(&ResolverCache->revalidate_miss_count, 1);
+		return false;
+	}
+
+	/* gate (4): blocking durable/native reads must not cross the own xid epoch. */
+	if (cluster_resolver_xid_epoch() != epoch) {
+		pg_atomic_fetch_add_u64(&ResolverCache->epoch_miss_count, 1);
 		return false;
 	}
 
@@ -353,9 +367,8 @@ cluster_resolver_cache_probe(uint16 origin_node, TransactionId raw_xid, SCN *out
 
 void
 cluster_resolver_cache_install(uint16 origin_node, TransactionId raw_xid, uint16 seg, uint16 slot,
-							   uint16 wrap, SCN commit_scn)
+							   uint16 wrap, SCN commit_scn, uint64 scan_epoch)
 {
-	uint64 epoch;
 	int idx;
 	LWLock *lk;
 
@@ -370,7 +383,10 @@ cluster_resolver_cache_install(uint16 origin_node, TransactionId raw_xid, uint16
 		return;
 	}
 
-	epoch = cluster_resolver_xid_epoch();
+	/* Sample outside the cache partition: ReadNextFullTransactionId takes
+	 * XidGenLock.  Reject a result already known to span a raw-xid epoch. */
+	if (scan_epoch != cluster_resolver_xid_epoch())
+		return;
 	idx = resolver_slot_idx(raw_xid, origin_node);
 	lk = resolver_idx_lock(idx);
 
@@ -380,11 +396,13 @@ cluster_resolver_cache_install(uint16 origin_node, TransactionId raw_xid, uint16
 
 		/* direct-mapped: overwriting a different live key is an eviction. */
 		if (s->state == RESOLVER_STATE_VALID
-			&& !(s->key.xid_epoch == epoch && s->key.raw_xid == raw_xid
+			&& !(s->key.xid_epoch == scan_epoch && s->key.raw_xid == raw_xid
 				 && s->key.origin_node_id == origin_node))
 			pg_atomic_fetch_add_u64(&ResolverCache->evict_count, 1);
 
-		s->key.xid_epoch = epoch;
+		/* Epoch may advance while acquiring this partition.  Keep the scan's
+		 * original epoch so a later probe misses; never relabel its result. */
+		s->key.xid_epoch = scan_epoch;
 		s->key.raw_xid = raw_xid;
 		s->key.origin_node_id = origin_node;
 		s->key._pad = 0;

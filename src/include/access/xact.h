@@ -347,6 +347,8 @@ typedef struct xl_xact_invals
 	SharedInvalidationMessage msgs[FLEXIBLE_ARRAY_MEMBER];
 } xl_xact_invals;
 #define MinSizeOfXactInvals offsetof(xl_xact_invals, msgs)
+StaticAssertDecl(MinSizeOfXactInvals == 4,
+				 "transaction invalidation WAL array offset must remain unchanged");
 
 typedef struct xl_xact_twophase
 {

@@ -353,6 +353,22 @@ typedef struct RfSideSpaceTerminalV1 {
 	RfSideSpaceContributionV1 contribution;
 } RfSideSpaceTerminalV1;
 
+/* Read-only lifecycle association for an original DROP PI observation.
+ * A NULL capture checks an already authenticated DATA fact's coverage only;
+ * it cannot authorize new storage observation. No current or apply grant. */
+typedef struct RfSidePiStorageCaptureV1 {
+	ClusterSpaceIdentityKey key;
+	uint8 incarnation[16];
+	uint64 token;
+	int32 origin_node;
+	uint64 origin_boot;
+	uint64 batch_id;
+} RfSidePiStorageCaptureV1;
+extern bool rf_side_online_plan_pi_storage_lifecycle_v1(
+	const RfSideOnlinePlanV1 *plan, const RfPageOnlineTargetViewV1 *target,
+	const ClusterWalSourceRef *sources, uint32 count,
+	const RfSidePiStorageCaptureV1 *capture);
+
 /* Select this block's terminal contribution using the same complete, strict
  * retained ancestry proof. No source/durability authority; refusal preserves
  * output, including when no retained operation contributes to this block. */

@@ -99,6 +99,25 @@ static bool stub_retire_driver_enabled;
 static ClusterControlRequestCut stub_retire_cut;
 static int stub_retire_drain_budget;
 static ClusterGrdGrantIdentity stub_drained_grant;
+
+/* The standalone GES fixture does not link the holder-probe worker.  Keep
+ * those ingress paths inert while exercising production grant dispatch. */
+bool
+cluster_ges_holder_probe_is_frame(const void *payload pg_attribute_unused(),
+								  Size length pg_attribute_unused())
+{
+	return false;
+}
+
+void
+cluster_ges_holder_probe_ingress(const ClusterICEnvelope *env pg_attribute_unused(),
+								 const void *payload pg_attribute_unused())
+{}
+
+void
+cluster_ges_holder_probe_drain(const ClusterGrdWorkItem *item pg_attribute_unused())
+{}
+
 bool
 cluster_control_retire_is_frame(const void *bytes pg_attribute_unused(),
 								Size len pg_attribute_unused())

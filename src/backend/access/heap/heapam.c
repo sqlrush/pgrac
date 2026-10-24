@@ -36,6 +36,9 @@
  *   Keep cluster-only VM acquisition plans out of non-cluster builds.
  *   Bind inplace WAL private images and visible pages to one exact version.
  *   Reject unsupported shared-heap subtransactions before creating receipts.
+ *   Preflight canonical binding before executor child work and row locking.
+ *   Reject direct DML children before XID allocation; bind before relcache work.
+ *   See 2026-10-18-pre2-m1-design-integration.md.
  */
 #include "postgres.h"
 
@@ -93,6 +96,9 @@
 #include "cluster/cluster_epoch.h"		/* current-MX operation fence */
 #include "cluster/cluster_mode.h"		/* cluster_storage_mode_enabled / cluster_peer_mode_enabled */
 #include "cluster/cluster_guc.h"		/* cluster_enabled */
+#include "cluster/cluster_heap_freeze.h" /* qualified conditional xmin write */
+#include "cluster/cluster_pcm_lock.h" /* final holder/master authority */
+#include "cluster/cluster_gcs_block.h" /* ACTIVE local writer ledger */
 #include "cluster/cluster_itl.h"		/* alloc_or_reuse_slot / stamp_active */
 #include "cluster/cluster_multixact_current.h" /* current-DML authority */
 #include "cluster/cluster_multixact_current_stats.h" /* authority counters */
@@ -165,15 +171,13 @@ cluster_itl_write_path_enabled(Relation relation)
 		cluster_shared_catalog, relation->rd_locator.relNumber);
 }
 
-/* PGRAC: reject before canonical, undo or CTRC preparation.  A row-lock
- * operation can enter a subtransaction before it has an assigned child XID. */
+/* PGRAC: a row-lock operation can enter a subtransaction before it has an
+ * assigned child XID. Call only after classifying the target as shared. */
 static void
-cluster_heap_itl_require_supported_xact(Relation relation, const char *operation)
+cluster_heap_itl_require_top_xact(Relation relation, const char *operation)
 {
 	TransactionId current_xid;
 
-	if (!cluster_itl_write_path_enabled(relation))
-		return;
 	if (IsSubTransaction())
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -191,6 +195,47 @@ cluster_heap_itl_require_supported_xact(Relation relation, const char *operation
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("shared-heap top-level transaction identity mismatch")));
+}
+
+/* Reject before canonical, undo or CTRC preparation at native heap entries. */
+static void
+cluster_heap_itl_require_supported_xact(Relation relation, const char *operation)
+{
+	if (cluster_itl_write_path_enabled(relation))
+		cluster_heap_itl_require_top_xact(relation, operation);
+}
+
+bool
+cluster_heap_preflight_write(Relation relation, const char *operation)
+{
+	ClusterCanonicalTxnBinding binding;
+	bool		shared_target;
+
+	switch (relation->rd_rel->relkind)
+	{
+		case RELKIND_RELATION:
+		case RELKIND_MATVIEW:
+		case RELKIND_TOASTVALUE:
+			shared_target = cluster_itl_write_path_enabled(relation);
+			break;
+		case RELKIND_PARTITIONED_TABLE:
+			/* The logical target has no relfilenumber until tuple routing. */
+			shared_target = cluster_heap_itl_relation_route(
+				cluster_storage_mode_enabled(), RelationUsesLocalBuffers(relation),
+				cluster_shared_catalog, RelationGetRelid(relation));
+			break;
+		default:
+			return false;
+	}
+	if (!shared_target)
+		return false;
+
+	cluster_heap_itl_require_top_xact(relation, operation);
+	if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared %s", operation)));
+	return true;
 }
 
 typedef struct ClusterHeapItlTerminalCensus
@@ -6135,6 +6180,28 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("frozen insertion is not supported for shared heaps"),
 				 errhint("Use COPY or INSERT without freezing tuples.")));
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * Direct/catalog callers also need BIND before bulk acquisition or TOAST,
+	 * which can recursively write shared tuples. Retain this exact binding for
+	 * the original undo preparation below. Reject children before assigning XID.
+	 */
+	cluster_heap_itl_require_supported_xact(relation, "INSERT");
+	if (cluster_itl_write_path_enabled(relation))
+	{
+		/* A worker may already have inherited a valid top XID. */
+		if (IsParallelWorker())
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+					 errmsg("cannot insert tuples in a parallel worker")));
+		canonical_xid = GetTopTransactionId();
+		if (!cluster_tt_local_prepare_canonical_active(
+				canonical_xid, &canonical_binding))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("canonical ACTIVE publication failed before heap insert")));
+	}
+#endif
 	xid = GetCurrentTransactionId();
 
 	/* Cheap, simplistic check that the tuple matches the rel's rowtype. */
@@ -6151,7 +6218,6 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	 * -> LockRelationForExtension.  No-op for a regular insert (bistate == NULL ->
 	 * HW alone) or after the lease is already held.
 	 */
-	cluster_heap_itl_require_supported_xact(relation, "INSERT");
 	cluster_dl_bulk_acquire(relation, bistate);
 #endif
 
@@ -6174,13 +6240,6 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 			elog(ERROR, "shared heap insert requires a live SPACE identity");
 		cluster_page_versioned = true;
 	}
-	canonical_xid = GetTopTransactionId();
-	if (cluster_itl_write_path_enabled(relation)
-		&& !cluster_tt_local_prepare_canonical_active(
-			canonical_xid, &canonical_binding))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("canonical ACTIVE publication failed before heap insert")));
 	if (cluster_itl_write_path_enabled(relation))
 		undo_prepare_deadline_us = cluster_undo_record_prepare_deadline_us();
 	if (cluster_itl_write_path_enabled(relation)
@@ -6894,6 +6953,18 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("frozen insertion is not supported for shared heaps"),
 				 errhint("Use COPY or INSERT without freezing tuples.")));
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * Bind the shared batch before its lease or slot materialization. Each
+	 * delegated heap_insert reuses the top binding and owns its own receipt.
+	 * Preserve the worker refusal before BIND even with an inherited XID.
+	 */
+	if (cluster_itl_write_path_enabled(relation) && IsParallelWorker())
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				 errmsg("cannot insert tuples in a parallel worker")));
+	cluster_heap_preflight_write(relation, "MULTI INSERT");
+#endif
 	xid = GetCurrentTransactionId();
 
 	/* currently not needed (thus unsupported) for heap_multi_insert() */
@@ -10992,13 +11063,18 @@ cluster_heap_lock_vm_needs_clear(Relation relation, BlockNumber heap_block,
 #endif
 
 
+/*
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: check shared transaction support before assigning an XID.
+ * Why: unsupported child transactions must not create transaction state.
+ */
 TM_Result
 heap_delete(Relation relation, ItemPointer tid,
 			CommandId cid, Snapshot crosscheck, bool wait,
 			TM_FailureData *tmfd, bool changingPart)
 {
 	TM_Result	result;
-	TransactionId xid = GetCurrentTransactionId();
+	TransactionId xid;
 	ItemId		lp;
 	HeapTupleData tp;
 	Page		page;
@@ -11060,6 +11136,12 @@ heap_delete(Relation relation, ItemPointer tid,
 				 errmsg("cannot delete tuples during a parallel operation")));
 
 #ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: reject unsupported shared children before allocating any XID. */
+	cluster_heap_itl_require_supported_xact(relation, "DELETE");
+#endif
+	xid = GetCurrentTransactionId();
+
+#ifdef USE_PGRAC_CLUSTER
 	if (cluster_shared_config
 		&& relation->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
 		&& cluster_smgr_which_for(relation->rd_locator, InvalidBackendId) == 1)
@@ -11070,7 +11152,6 @@ heap_delete(Relation relation, ItemPointer tid,
 			elog(ERROR, "shared heap delete requires a live SPACE identity");
 		cluster_page_versioned = true;
 	}
-	cluster_heap_itl_require_supported_xact(relation, "DELETE");
 	canonical_xid = GetTopTransactionId();
 	if (cluster_itl_write_path_enabled(relation)
 		&& !cluster_tt_local_prepare_canonical_active(
@@ -12166,6 +12247,11 @@ simple_heap_delete(Relation relation, ItemPointer tid)
  * t_xmax (resolving a possible MultiXact, if necessary), and t_cmax (the last
  * only for TM_SelfModified, since we cannot obtain cmax from a combo CID
  * generated by another transaction).
+ *
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: reject unsupported children before XID assignment and bind the
+ * shared top transaction before relcache access, reusing the original receipt.
+ * Why: relcache work must not precede the canonical transaction protection.
  */
 TM_Result
 heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
@@ -12174,7 +12260,7 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 			TU_UpdateIndexes *update_indexes)
 {
 	TM_Result	result;
-	TransactionId xid = GetCurrentTransactionId();
+	TransactionId xid;
 	Bitmapset  *hot_attrs;
 	Bitmapset  *sum_attrs;
 	Bitmapset  *key_attrs;
@@ -12295,6 +12381,23 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
 				 errmsg("cannot update tuples during a parallel operation")));
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: reject unsupported shared children before allocating any XID. */
+	cluster_heap_itl_require_supported_xact(relation, "UPDATE");
+#endif
+	xid = GetCurrentTransactionId();
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: protect the original top identity before relcache can read pages. */
+	canonical_xid = GetTopTransactionId();
+	if (cluster_itl_write_path_enabled(relation)
+		&& !cluster_tt_local_prepare_canonical_active(
+			canonical_xid, &canonical_binding))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before heap update")));
+#endif
+
 #ifdef USE_ASSERT_CHECKING
 	check_lock_if_inplace_updateable_rel(relation, otid, newtup);
 #endif
@@ -12337,14 +12440,6 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 			elog(ERROR, "shared heap update requires a live SPACE identity");
 		cluster_page_versioned = true;
 	}
-	cluster_heap_itl_require_supported_xact(relation, "UPDATE");
-	canonical_xid = GetTopTransactionId();
-	if (cluster_itl_write_path_enabled(relation)
-		&& !cluster_tt_local_prepare_canonical_active(
-			canonical_xid, &canonical_binding))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("canonical ACTIVE publication failed before heap update")));
 	if (cluster_itl_write_path_enabled(relation))
 		undo_prepare_deadline_us = cluster_undo_record_prepare_deadline_us();
 	if (cluster_itl_write_path_enabled(relation)
@@ -20492,27 +20587,20 @@ heap_execute_freeze_tuple(HeapTupleHeader tuple, HeapTupleFreeze *frz)
 }
 
 /*
- * heap_freeze_execute_prepared
- *
- * Executes freezing of one or more heap tuples on a page on behalf of caller.
- * Caller passes an array of tuple plans from heap_prepare_freeze_tuple.
- * Caller must set 'offset' in each plan for us.  Note that we destructively
- * sort caller's tuples array in-place, so caller had better be done with it.
- *
- * WAL-logs the changes so that VACUUM can advance the rel's relfrozenxid
- * later on without any risk of unsafe pg_xact lookups, even following a hard
- * crash (or when querying from a standby).  We represent freezing by setting
- * infomask bits in tuple headers, but this shouldn't be thought of as a hint.
- * See section on buffer access rules in src/backend/storage/buffer/README.
+ * Apply already-qualified freeze plans under the caller's exclusive content
+ * lock.  Eligibility checks belong to the caller; this private mutation/WAL
+ * kernel neither proves transaction identity nor grants shared freeze access.
+ * Keep SPACE preparation outside the critical section and page changes in the
+ * same native FREEZE_PAGE WAL record.
  */
-void
-heap_freeze_execute_prepared(Relation rel, Buffer buffer,
-							 TransactionId snapshotConflictHorizon,
-							 HeapTupleFreeze *tuples, int ntuples
+static void
+heap_freeze_apply_prepared(Relation rel, Buffer buffer,
+						   TransactionId snapshotConflictHorizon,
+						   HeapTupleFreeze *tuples, int ntuples
 #ifdef USE_PGRAC_CLUSTER
-							 , const ClusterSpaceIdentity *identity
+						   , const ClusterSpaceIdentity *identity
 #endif
-							 )
+						   )
 {
 	Page		page = BufferGetPage(buffer);
 #ifdef USE_PGRAC_CLUSTER
@@ -20522,60 +20610,7 @@ heap_freeze_execute_prepared(Relation rel, Buffer buffer,
 		&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1;
 #endif
 
-	/* PGRAC: reject before transaction checks or tuple changes. */
-	if (cluster_heap_maintenance_restricted(rel))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("freezing shared heap tuples is not supported"),
-				 errhint("Run VACUUM for supported maintenance without advancing freeze cutoffs.")));
-
 	Assert(ntuples > 0);
-
-	/*
-	 * Perform xmin/xmax XID status sanity checks before critical section.
-	 *
-	 * heap_prepare_freeze_tuple doesn't perform these checks directly because
-	 * pg_xact lookups are relatively expensive.  They shouldn't be repeated
-	 * by successive VACUUMs that each decide against freezing the same page.
-	 */
-	for (int i = 0; i < ntuples; i++)
-	{
-		HeapTupleFreeze *frz = tuples + i;
-		ItemId		itemid = PageGetItemId(page, frz->offset);
-		HeapTupleHeader htup;
-
-		htup = (HeapTupleHeader) PageGetItem(page, itemid);
-
-		/* Deliberately avoid relying on tuple hint bits here */
-		if (frz->checkflags & HEAP_FREEZE_CHECK_XMIN_COMMITTED)
-		{
-			TransactionId xmin = HeapTupleHeaderGetRawXmin(htup);
-
-			Assert(!HeapTupleHeaderXminFrozen(htup));
-			if (unlikely(!TransactionIdDidCommit(xmin)))
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg_internal("uncommitted xmin %u needs to be frozen",
-										 xmin)));
-		}
-
-		/*
-		 * TransactionIdDidAbort won't work reliably in the presence of XIDs
-		 * left behind by transactions that were in progress during a crash,
-		 * so we can only check that xmax didn't commit
-		 */
-		if (frz->checkflags & HEAP_FREEZE_CHECK_XMAX_ABORTED)
-		{
-			TransactionId xmax = HeapTupleHeaderGetRawXmax(htup);
-
-			Assert(TransactionIdIsNormal(xmax));
-			if (unlikely(TransactionIdDidCommit(xmax)))
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg_internal("cannot freeze committed xmax %u",
-										 xmax)));
-		}
-	}
 
 #ifdef USE_PGRAC_CLUSTER
 	/* The VACUUM owner obtained this identity before taking content locks. */
@@ -20648,6 +20683,318 @@ heap_freeze_execute_prepared(Relation rel, Buffer buffer,
 	}
 
 	END_CRIT_SECTION();
+}
+
+#ifdef USE_PGRAC_CLUSTER
+static bool
+cluster_heap_freeze_apply_xmin_batch_locked_v1(
+	Relation rel, Buffer buffer,
+	const ClusterHeapFreezePageInputV1 *input,
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeFinalFenceV1 *fence,
+	const PcmAuthoritySnapshot *authority_before,
+	const ClusterSemanticAdmissionToken *admission,
+	const ClusterHeapFreezeXminTargetV1 *targets, uint16 target_count,
+	HeapTupleFreeze *plans, TransactionId conflict_horizon, SCN horizon_scn)
+{
+	RelFileLocator locator;
+	ForkNumber fork;
+	BlockNumber block;
+	BufferTag tag;
+	BufferDesc *buf;
+	Page live_page;
+	bool seen[MaxHeapTuplesPerPage] = { false };
+	PcmAuthoritySnapshot authority_now;
+	uint64 own_generation;
+	uint64 acquisition_epoch;
+	uint64 master_sequence;
+	uint8 pcm_state;
+	SCN page_version;
+	SCN wal_clock;
+
+	/* Borrow a real writer's resources; a local conditional lock is not X. */
+	if (rel == NULL || rel->rd_rel == NULL || input == NULL || page == NULL
+		|| plans == NULL || fence == NULL || authority_before == NULL
+		|| admission == NULL || targets == NULL || target_count == 0
+		|| target_count > MaxHeapTuplesPerPage
+		|| target_count > page->tuple_count
+		|| !cluster_enabled || !cluster_shared_config
+		|| rel->rd_rel->relpersistence != RELPERSISTENCE_PERMANENT
+		|| cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) != 1
+		|| !RelationNeedsWAL(rel)
+		|| buffer <= 0 || buffer > NBuffers || BufferDescriptors == NULL
+		|| !ClusterBufferHasSharedPin(buffer))
+		return false;
+	buf = GetBufferDescriptor(buffer - 1);
+	if (!LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE))
+		return false;
+	BufferGetTag(buffer, &locator, &fork, &block);
+	if (!RelFileLocatorEquals(locator, rel->rd_locator)
+		|| fork != MAIN_FORKNUM || block != fence->block)
+		return false;
+	InitBufferTag(&tag, &locator, fork, block);
+	live_page = BufferGetPage(buffer);
+	/* Recapturing the image cannot refresh an older canonical proof fence. */
+	if (PageGetLSN(live_page) != fence->page_lsn
+		|| ((PageHeader)live_page)->pd_block_scn != fence->page_version
+		|| cluster_heap_freeze_validate_page_v1(input, &fence->identity, block,
+			live_page) != CLUSTER_HEAP_FREEZE_PAGE_MATCHED)
+		return false;
+
+	for (uint16 i = 0; i < target_count; i++)
+	{
+		const ClusterHeapFreezeXminTargetV1 *target = &targets[i];
+		const ClusterHeapFreezeTupleInputV1 *saved;
+		ItemId item;
+		HeapTupleHeader tuple;
+
+		saved = &page->tuples[target->tuple_index];
+		/* Different input indexes cannot name the same physical tuple twice. */
+		if (!OffsetNumberIsValid(saved->offset)
+			|| saved->offset > MaxHeapTuplesPerPage
+			|| saved->offset > PageGetMaxOffsetNumber(live_page)
+			|| seen[saved->offset - 1]
+			|| !PageHasItl(live_page)
+			|| saved->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT)
+			return false;
+		seen[saved->offset - 1] = true;
+		item = PageGetItemId(live_page, saved->offset);
+		if (!ItemIdIsNormal(item) || ItemIdGetOffset(item) != saved->tuple_offset
+			|| ItemIdGetLength(item) != saved->tuple_length)
+			return false;
+		tuple = (HeapTupleHeader) PageGetItem(live_page, item);
+		if (HeapTupleHeaderGetRawXmin(tuple) != saved->raw_xmin
+			|| HeapTupleHeaderGetRawXmax(tuple) != saved->raw_xmax
+			|| ItemPointerGetBlockNumberNoCheck(&tuple->t_ctid)
+				!= ItemPointerGetBlockNumberNoCheck(&saved->ctid)
+			|| ItemPointerGetOffsetNumberNoCheck(&tuple->t_ctid)
+				!= ItemPointerGetOffsetNumberNoCheck(&saved->ctid)
+			|| tuple->t_infomask != saved->infomask
+			|| tuple->t_infomask2 != saved->infomask2
+			|| tuple->t_hoff != saved->header_length
+			|| tuple->t_itl_slot_idx != saved->itl_slot_index
+			|| memcmp(ClusterPageGetItlSlot(live_page, saved->itl_slot_index),
+				&saved->carrier, sizeof(saved->carrier)) != 0)
+			return false;
+
+	}
+
+	/* Final synchronous fence.  No current fetch or proof request is allowed. */
+	if (!admission->entered
+		|| admission->record_generation != fence->admission_generation
+		|| authority_before->transition_count != fence->holder_sequence
+		|| !cluster_bufmgr_terminal_stamp_authority(buffer, &tag,
+			&own_generation, &acquisition_epoch, &pcm_state)
+		|| own_generation == 0 || acquisition_epoch == 0
+		|| pcm_state != (uint8) PCM_STATE_X
+		|| !input->writer_context_valid
+		|| input->writer_context.r4_record_generation != admission->record_generation
+		|| input->writer_context.buffer_ownership_generation != own_generation
+		|| !ClusterBufferMutationContextMatches(buffer, &input->writer_context,
+			input->writer_object_revision, input->writer_object_checked)
+		|| !cluster_pcm_lock_r4_route_snapshot(tag, &authority_now,
+			&master_sequence, &page_version)
+		|| authority_now.transition_count != fence->holder_sequence
+		|| master_sequence != fence->master_sequence
+		|| !cluster_pcm_lock_authority_matches(tag, authority_before)
+		/* Proof-read admission alone cannot authorize a native heap write. */
+		|| !cluster_semantic_activation_recheck(admission)
+		|| !cluster_semantic_activation_recheck_r4_terminal_census(admission))
+		return false;
+
+	/* XLogInsertRecord stamps the existing local SCN clock, not H. The
+	 * caller must have observed H before borrowing the page lock; do not
+	 * advance the clock or introduce callbacks/waits under that lock here. */
+	wal_clock = cluster_scn_current();
+	if (!SCN_VALID(wal_clock) || scn_time_cmp(wal_clock, horizon_scn) < 0)
+		return false;
+
+	/* Native redo and the existing SPACE version edge remain the only format. */
+	heap_freeze_apply_prepared(rel, buffer,
+		conflict_horizon, plans, target_count,
+		&fence->identity);
+	XLogFlush(PageGetLSN(live_page));
+	return true;
+}
+
+bool
+cluster_heap_freeze_apply_xmin_batch_v1(
+	Relation rel, Buffer buffer,
+	const ClusterHeapFreezePageInputV1 *input,
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *fence,
+	const PcmAuthoritySnapshot *authority_before,
+	const ClusterSemanticAdmissionToken *admission,
+	const ClusterHeapFreezeXminTargetV1 *targets, uint16 target_count,
+	FullTransactionId freeze_limit_full, SCN horizon_scn)
+{
+	BufferDesc *buf;
+	HeapTupleFreeze plans[MaxHeapTuplesPerPage];
+	TransactionId conflict_horizon;
+	volatile bool resumed = false;
+	volatile bool applied = false;
+
+	/* The original pin is borrowed on every path, including ERROR. Neither
+	 * this continuation nor its cleanup may repin, fetch current or proof,
+	 * or replace an already-owned local lock. */
+	if (buffer <= 0 || buffer > NBuffers || BufferDescriptors == NULL
+		|| !ClusterBufferHasSharedPin(buffer))
+		return false;
+	/* Plan only from the caller's immutable captured inputs. Finish the
+	 * whole batch before restoring a writer or taking its local content X;
+	 * the locked kernel still rechecks every physical row and final fence. */
+	if (!cluster_heap_freeze_prepare_xmin_batch_v1(page, proofs, fence,
+		targets, target_count, freeze_limit_full, horizon_scn,
+		plans, lengthof(plans), &conflict_horizon))
+		return false;
+	buf = GetBufferDescriptor(buffer - 1);
+	if (LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
+		return cluster_heap_freeze_apply_xmin_batch_locked_v1(rel, buffer,
+			input, page, fence, authority_before, admission,
+			targets, target_count, plans, conflict_horizon, horizon_scn);
+	if (input == NULL || !input->writer_context_valid)
+		return false;
+	/* A census-read token cannot restore an ordinary writer. Validate the
+	 * same captured TARGET generation while no local content lock/ledger is
+	 * owned; the locked kernel must still repeat both policies before WAL. */
+	if (admission == NULL || !admission->entered
+		|| admission->record_generation != fence->admission_generation
+		|| input->writer_context.r4_record_generation != admission->record_generation
+		|| !cluster_semantic_activation_recheck(admission)
+		|| !cluster_semantic_activation_recheck_r4_terminal_census(admission))
+		return false;
+
+	PG_TRY();
+	{
+		resumed = ClusterConditionalLockBufferWithMutationContext(buffer,
+			&input->writer_context, input->writer_object_revision,
+			input->writer_object_checked);
+		if (resumed)
+			applied = cluster_heap_freeze_apply_xmin_batch_locked_v1(rel, buffer,
+				input, page, fence, authority_before, admission,
+				targets, target_count, plans, conflict_horizon, horizon_scn);
+	}
+	PG_FINALLY();
+	{
+		/* A resumer ERROR unwinds its partial ledger/local lock internally.
+		 * Only a returned successful scope is ours to release here. Keep
+		 * the caller's original pin/admission after refusal, WAL or ERROR. */
+		if (resumed)
+			ClusterUnlockBufferAfterConditionalMutation(buffer);
+	}
+	PG_END_TRY();
+	return applied;
+}
+
+bool
+cluster_heap_freeze_apply_xmin_v1(
+	Relation rel, Buffer buffer,
+	const ClusterHeapFreezePageInputV1 *input,
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *fence,
+	const PcmAuthoritySnapshot *authority_before,
+	const ClusterSemanticAdmissionToken *admission,
+	uint16 tuple_index, FullTransactionId original_creator_full_xid,
+	FullTransactionId freeze_limit_full, SCN horizon_scn)
+{
+	const ClusterHeapFreezeXminTargetV1 target = {
+		tuple_index, original_creator_full_xid
+	};
+
+	return cluster_heap_freeze_apply_xmin_batch_v1(rel, buffer, input, page,
+		proofs, fence, authority_before, admission, &target, 1,
+		freeze_limit_full, horizon_scn);
+}
+#endif
+
+/*
+ * heap_freeze_execute_prepared
+ *
+ * Executes freezing of one or more heap tuples on a page on behalf of caller.
+ * Caller passes an array of tuple plans from heap_prepare_freeze_tuple.
+ * Caller must set 'offset' in each plan for us.  Note that we destructively
+ * sort caller's tuples array in-place, so caller had better be done with it.
+ *
+ * WAL-logs the changes so that VACUUM can advance the rel's relfrozenxid
+ * later on without any risk of unsafe pg_xact lookups, even following a hard
+ * crash (or when querying from a standby).  We represent freezing by setting
+ * infomask bits in tuple headers, but this shouldn't be thought of as a hint.
+ * See section on buffer access rules in src/backend/storage/buffer/README.
+ */
+void
+heap_freeze_execute_prepared(Relation rel, Buffer buffer,
+							 TransactionId snapshotConflictHorizon,
+							 HeapTupleFreeze *tuples, int ntuples
+#ifdef USE_PGRAC_CLUSTER
+							 , const ClusterSpaceIdentity *identity
+#endif
+							 )
+{
+	Page		page = BufferGetPage(buffer);
+
+	/* PGRAC: reject before transaction checks or tuple changes. */
+	if (cluster_heap_maintenance_restricted(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("freezing shared heap tuples is not supported"),
+				 errhint("Run VACUUM for supported maintenance without advancing freeze cutoffs.")));
+
+	Assert(ntuples > 0);
+
+	/*
+	 * Perform xmin/xmax XID status sanity checks before critical section.
+	 *
+	 * heap_prepare_freeze_tuple doesn't perform these checks directly because
+	 * pg_xact lookups are relatively expensive.  They shouldn't be repeated
+	 * by successive VACUUMs that each decide against freezing the same page.
+	 */
+	for (int i = 0; i < ntuples; i++)
+	{
+		HeapTupleFreeze *frz = tuples + i;
+		ItemId		itemid = PageGetItemId(page, frz->offset);
+		HeapTupleHeader htup;
+
+		htup = (HeapTupleHeader) PageGetItem(page, itemid);
+
+		/* Deliberately avoid relying on tuple hint bits here */
+		if (frz->checkflags & HEAP_FREEZE_CHECK_XMIN_COMMITTED)
+		{
+			TransactionId xmin = HeapTupleHeaderGetRawXmin(htup);
+
+			Assert(!HeapTupleHeaderXminFrozen(htup));
+			if (unlikely(!TransactionIdDidCommit(xmin)))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg_internal("uncommitted xmin %u needs to be frozen",
+										 xmin)));
+		}
+
+		/*
+		 * TransactionIdDidAbort won't work reliably in the presence of XIDs
+		 * left behind by transactions that were in progress during a crash,
+		 * so we can only check that xmax didn't commit
+		 */
+		if (frz->checkflags & HEAP_FREEZE_CHECK_XMAX_ABORTED)
+		{
+			TransactionId xmax = HeapTupleHeaderGetRawXmax(htup);
+
+			Assert(TransactionIdIsNormal(xmax));
+			if (unlikely(TransactionIdDidCommit(xmax)))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg_internal("cannot freeze committed xmax %u",
+										 xmax)));
+		}
+	}
+
+	heap_freeze_apply_prepared(rel, buffer, snapshotConflictHorizon, tuples,
+							   ntuples
+#ifdef USE_PGRAC_CLUSTER
+							   , identity
+#endif
+							   );
 }
 
 /*

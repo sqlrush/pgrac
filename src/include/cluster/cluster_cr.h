@@ -58,6 +58,7 @@
 #include "cluster/cluster_tt_status.h" /* ClusterVisibilityDecision */
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_cr_server.h" /* R4 holder-step ABI types */
+#include "cluster/cluster_undo_record.h"
 #endif
 #include "storage/bufmgr.h"
 #include "utils/snapshot.h"
@@ -91,6 +92,31 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 								ClusterR4CrSlotExtension *extension, char result_page[BLCKSZ],
 								const char foreign_undo_page[BLCKSZ],
 								ClusterCrBuildReason *reason_out);
+
+/* Process-local metadata only; neither a terminal verdict nor a row proof. */
+#define CLUSTER_R4_RESIDENT_RECORD_BATCH_MAX 8
+typedef struct ClusterR4ResidentRecord {
+	ClusterTxLocator canonical_locator;
+	UndoRecordHeader header;
+	uint32 record_offset;
+	uint16 record_length;
+} ClusterR4ResidentRecord;
+
+typedef struct ClusterR4ResidentRecordBatch {
+	uint32 count;
+	ClusterR4ResidentRecord records[CLUSTER_R4_RESIDENT_RECORD_BATCH_MAX];
+} ClusterR4ResidentRecordBatch;
+
+/*
+ * Validate 1..8 exact records in request order from one stable private DATA
+ * image. Requests must name the same physical segment/block; the caller owns
+ * that image's association with the block and its lifetime. No I/O or shared
+ * state access, freshness, admission or terminal-status proof. On failure the
+ * entire output is unchanged. Successful spans refer only to this image.
+ */
+extern bool cluster_cr_r4_prepare_resident_records(
+	const char resident_undo_page[BLCKSZ], const ClusterTxLocator *request_locators,
+	uint32 request_count, ClusterR4ResidentRecordBatch *out);
 /*
  * Extract one exact transaction member from an already-resident private DATA
  * block.  This helper performs no I/O and touches no shared state.  On success

@@ -18,6 +18,7 @@
 #include "cluster/cluster_page_producer.h"
 #include "cluster/cluster_space_identity.h"
 #include "cluster/cluster_space_reservation.h"
+#include "cluster/cluster_wal_thread.h"
 #include "storage/buf.h"
 #include "utils/relcache.h"
 
@@ -26,6 +27,32 @@
  * False MUST abort that operation. No legacy/local
  * relation acquires a SPACE identity, and no existing identity is replaced. */
 extern bool cluster_space_relation_create(RelFileLocator locator);
+
+/* Process-local observation produced by the original live CREATE scope.
+ * This value does not retain that scope, certify ABORT/COMMIT, or authorize
+ * discard, I/O or directory retirement. It has no persistent representation. */
+typedef struct ClusterSpaceCreateObservationV1 {
+	ClusterSpaceIdentity identity;
+	ClusterWalSourceRef namespace_source; /* namespace sample, not WAL attribution */
+	uint64 create_serial;
+	XLogRecPtr end_rec_ptr;
+} ClusterSpaceCreateObservationV1;
+
+/* Native MAIN constructor only, under its existing create serial and abort
+ * pending-delete owner. Capture the actual typed CREATE at its WAL publication
+ * before releasing buffers. False leaves output unchanged. A post-publication
+ * ERROR preserves the observation and the original cleanup obligation. The
+ * caller owns that scope and every ERROR cleanup. Never starts a new scope. */
+extern bool cluster_space_relation_create_observed_v1(RelFileLocator locator,
+	uint64 create_serial, ClusterSpaceCreateObservationV1 *out);
+
+/* Only the original native abort pending-delete for this new storage may
+ * call this, after its transaction/users are gone and before unlink/reuse.
+ * Match the actual CREATE identity, use the unchanged writer/WAL gates, and
+ * recheck identity. A namespace sample/serial never grants death authority.
+ * False/ERROR leaves pending-delete responsible; this does not evict/unlink. */
+extern bool cluster_space_relation_flush_created_abort_v1(RelFileLocator locator,
+													 const ClusterSpaceCreateObservationV1 *created);
 
 /* Original relation owner holds its lifecycle lock. Reads exact LIVE state
  * through native buffers; never creates missing storage. Output unchanged
@@ -180,12 +207,34 @@ extern void cluster_space_truncate_finish(ClusterSpaceTruncateState *state, Rela
 typedef struct ClusterSpaceDropState ClusterSpaceDropState;
 
 /* Native commit owner of its pending-delete list, after exclusive lifecycle
- * and KO. Prepare only locks/validates private results and serializes the
- * optional native COMMIT tail. Mark dirty before COMMIT insertion; publish
- * only after that COMMIT is flushed and decided. Finish unlocks before unlink. */
+ * and KO. Prepare validates private results, serializes the optional native
+ * COMMIT tail and releases its page references. Authorize separately checks
+ * the completed operation, reacquires both pages and revalidates the exact
+ * two-page predecessor outside the critical section. A clean refusal releases
+ * those references; an ERROR retains the original ResourceOwner cleanup.
+ * Publish marks dirty and installs both pages
+ * only after that COMMIT is flushed and decided, with the original checkpoint
+ * delay still held. Finish unlocks before unlink. */
 extern ClusterSpaceDropState *cluster_space_drop_prepare(const RelFileLocator *locators, int count);
 extern const char *cluster_space_drop_wal(const ClusterSpaceDropState *state, uint32 *len);
-extern void cluster_space_drop_mark_dirty(ClusterSpaceDropState *state);
+/* Deferred native purpose retains this unpinned preparation through local
+ * transaction cleanup. The original commit critical section records its
+ * flushed LSN, without publishing either page. No new persistent format. */
+extern bool cluster_space_drop_is_deferred_v4(const ClusterSpaceDropState *state);
+extern void cluster_space_drop_defer_v4(ClusterSpaceDropState *state, XLogRecPtr commit_lsn);
+struct ClusterKoCompletionV2;
+extern bool cluster_space_drop_committed_owner_v4(const ClusterSpaceDropState *state,
+												 const struct ClusterKoCompletionV2 *completion);
+struct ClusterKoDirectoryIoV3;
+struct ClusterPageWalBindingV1;
+/* Same committed preparation and entered call; writes only its two existing
+ * SPACE pages. Output is published after sync/readback and exact revalidation.
+ * Refusal/ERROR leaves physical and native recovery responsibility intact.
+ * Optional diagnostic_stage is caller-owned observation, never authority. */
+extern bool cluster_space_drop_complete_v4(const ClusterSpaceDropState *state,
+	const struct ClusterKoCompletionV2 *completion, const struct ClusterKoDirectoryIoV3 *call,
+	struct ClusterPageWalBindingV1 *terminal, void *wal, uint32 *diagnostic_stage);
+extern bool cluster_space_drop_authorize(ClusterSpaceDropState *state);
 extern void cluster_space_drop_publish(ClusterSpaceDropState *state, XLogRecPtr commit_lsn);
 extern void cluster_space_drop_finish(ClusterSpaceDropState *state);
 

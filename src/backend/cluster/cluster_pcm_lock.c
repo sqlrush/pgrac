@@ -48,6 +48,8 @@
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_cssd.h" /* PGRAC: spec-4.7a D4 — peer liveness for other-holder check */
 #include "cluster/cluster_lms.h"
+#include "cluster/cluster_ko.h"
+#include "cluster/storage/cluster_smgr.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_sf_dep.h"
@@ -880,6 +882,9 @@ typedef struct ClusterPcmShared {
 	LWLockPadded wm_prov_lock;
 	pg_atomic_uint64 wm_prov_insert_fail_count;
 	ClusterPcmWmProvSlot wm_prov[CLUSTER_PCM_WM_PROV_SLOTS];
+	/* 0 empty, 1 single publisher, 2 immutable diagnostic snapshot. */
+	pg_atomic_uint32 normal_stop_refusal_state;
+	PcmNormalStopRefusalV1 normal_stop_refusal;
 } ClusterPcmShared;
 
 StaticAssertDecl(sizeof(ClusterPcmShared) >= sizeof(LWLockPadded) + 72,
@@ -964,6 +969,8 @@ static bool pcm_resource_x_local_handoff_valid(const ClusterPcmResourceXLocalHan
 static bool pcm_resource_x_local_owner_priority_clear_locked(struct GrdEntry *entry);
 static bool pcm_resource_x_local_owner_expire_locked(struct GrdEntry *entry, uint64 now_us);
 static void pcm_local_pi_release_locked(struct GrdEntry *entry);
+static bool pcm_local_pi_snapshot_locked(struct GrdEntry *entry,
+										ClusterPcmLocalPiSnapshotV1 *out);
 static bool pcm_local_pi_source_equal(const ClusterWalSourceRef *a, const ClusterWalSourceRef *b);
 static uint64 pcm_resource_x_monotonic_us(void);
 static bool pcm_resource_x_head_changed_locked(struct GrdEntry *entry, bool semantic_progress,
@@ -1030,6 +1037,8 @@ static bool pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
 	struct GrdEntry *entry, const ClusterPcmResourceXBootstrapRound *round,
 	const ResourceXAcquisitionRef *ref, uint64 master_session_incarnation,
 	uint64 r4_record_generation, uint64 cached_ownership_generation);
+static bool
+pcm_resource_x_install_claim_valid_locked(const ClusterPcmResourceXBootstrapRound *round);
 static bool pcm_resource_x_requester_join_live_round_base_exact_locked(
 	struct GrdEntry *entry, const ClusterPcmResourceXBootstrapRound *round,
 	const ResourceXDecodedFrame *frame, int32 authenticated_source_node,
@@ -1912,10 +1921,39 @@ pcm_resource_x_source_settlement_debt_decode_locked(struct GrdEntry *entry,
  * Caller holds the directory EXCLUSIVE lock and this exact entry lock.  The
  * helper is deliberately read-only; D4 owns sidecar clearing and HASH_REMOVE.
  */
+static bool pcm_resource_x_terminal_state_locked(struct GrdEntry *,
+	const ClusterPcmResourceXMasterState *, bool, bool, bool, uint64 *, uint64 *,
+	PcmNormalStopRefusalV1 *);
+static bool pcm_resource_x_terminal_request_identity_valid(
+	const ClusterPcmResourceXMasterRequest *, bool);
+
+static bool
+pcm_protocol_refuse(PcmNormalStopRefusalV1 *diagnostic, uint32 code, uint32 source_line, int node)
+{
+	if (diagnostic != NULL && diagnostic->code == 0) {
+		diagnostic->code = code;
+		diagnostic->source_line = source_line;
+		diagnostic->node = node;
+	}
+	return false;
+}
+
+bool
+cluster_pcm_normal_stop_first_refusal_v1(PcmNormalStopRefusalV1 *out)
+{
+	if (out == NULL || ClusterPcm == NULL
+		|| pg_atomic_read_u32(&ClusterPcm->normal_stop_refusal_state) != 2)
+		return false;
+	pg_read_barrier();
+	*out = ClusterPcm->normal_stop_refusal;
+	return true;
+}
+
 static bool
 pcm_entry_retire_eligible_locked(struct GrdEntry *entry, uint64 expected_generation,
-								 PcmRetireRefusal *why)
+								 PcmRetireRefusal *why, bool object_retired)
 {
+	static const ClusterPageWalRefV1 empty_pi;
 	static const ClusterPcmResourceXMasterRequest empty_request;
 	static const ClusterPcmResourceXTerminalTombstone empty_tombstone;
 	ClusterPcmResourceXMasterState *state;
@@ -1924,6 +1962,7 @@ pcm_entry_retire_eligible_locked(struct GrdEntry *entry, uint64 expected_generat
 	uint32 lifecycle;
 	uint64 gate_formation;
 	bool drained = false;
+	bool settled = false;
 	int node;
 
 	Assert(entry != NULL);
@@ -1967,12 +2006,32 @@ pcm_entry_retire_eligible_locked(struct GrdEntry *entry, uint64 expected_generat
 		*why = PCM_RETIRE_REFUSAL_HOLDER_PRESENT;
 		return false;
 	}
-	if (pg_atomic_read_u32(&entry->pi_holders_bitmap) != 0
-		|| entry->local_pi_first.source_flags != 0 || entry->local_pi_last.source_flags != 0) {
+	/* Live objects still require their original DATA/physical-ACK consumer. */
+	if (!object_retired && (pg_atomic_read_u32(&entry->pi_holders_bitmap) != 0
+		|| entry->local_pi_first.source_flags != 0 || entry->local_pi_last.source_flags != 0)) {
 		*why = PCM_RETIRE_REFUSAL_PI_PRESENT;
 		return false;
 	}
-	if (entry->pi_watermark_lsn != InvalidXLogRecPtr || entry->pi_watermark_scn != InvalidScn) {
+	/* AM05: a committed, I/O-retired DROP may discard this quiescent entry's
+	 * two owned local references. This is reference validation, not a DATA
+	 * proof. Partial/unknown responsibility and every other owner below still
+	 * refuse. The original caller has already checked the immutable tombstone
+	 * outside the directory lock; no KO lock is acquired here. */
+	if (object_retired
+		&& (memcmp(&entry->local_pi_first, &empty_pi, sizeof(empty_pi)) != 0
+			|| memcmp(&entry->local_pi_last, &empty_pi, sizeof(empty_pi)) != 0)) {
+		ClusterPcmLocalPiSnapshotV1 local;
+
+		if (entry->local_pi_revision >= UINT64_MAX - 1
+			|| !pcm_local_pi_snapshot_locked(entry, &local)
+			|| (local.first.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
+			|| (local.last.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0) {
+			*why = PCM_RETIRE_REFUSAL_PI_PRESENT;
+			return false;
+		}
+	}
+	if (!object_retired
+		&& (entry->pi_watermark_lsn != InvalidXLogRecPtr || entry->pi_watermark_scn != InvalidScn)) {
 		*why = PCM_RETIRE_REFUSAL_WATERMARK_PRESENT;
 		return false;
 	}
@@ -2053,6 +2112,12 @@ pcm_entry_retire_eligible_locked(struct GrdEntry *entry, uint64 expected_generat
 				*why = PCM_RETIRE_REFUSAL_SIDECAR_NOT_TERMINAL;
 				return false;
 			}
+		} else if (object_retired && request->phase == RESOURCE_X_MASTER_SETTLED) {
+			if (!pcm_resource_x_terminal_request_identity_valid(request, true)) {
+				*why = PCM_RETIRE_REFUSAL_SIDECAR_NOT_TERMINAL;
+				return false;
+			}
+			settled = true;
 		} else if (request->phase != RESOURCE_X_MASTER_RELEASED || request->resource_formation == 0
 				   || request->resource_formation == UINT64_MAX || request->assertion_sequence == 0
 				   || request->assertion_sequence == UINT64_MAX) {
@@ -2069,12 +2134,17 @@ pcm_entry_retire_eligible_locked(struct GrdEntry *entry, uint64 expected_generat
 		}
 	} else if (state->terminal_tombstone.valid != 1 || state->terminal_tombstone.requester_node < 0
 			   || state->terminal_tombstone.requester_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
-			   || state->terminal_tombstone.request.phase != RESOURCE_X_MASTER_RELEASED
+			   || (state->terminal_tombstone.request.phase != RESOURCE_X_MASTER_RELEASED
+				   && (!object_retired
+					   || state->terminal_tombstone.request.phase != RESOURCE_X_MASTER_SETTLED))
 			   || state->terminal_tombstone.request.resource_formation == 0
 			   || state->terminal_tombstone.request.resource_formation == UINT64_MAX) {
 		*why = PCM_RETIRE_REFUSAL_SIDECAR_NOT_TERMINAL;
 		return false;
 	}
+	if (state->terminal_tombstone.valid == 1
+		&& state->terminal_tombstone.request.phase == RESOURCE_X_MASTER_SETTLED)
+		settled = true;
 	if (drained) {
 		if (state->holder_pair_drained_resource_formation == 0
 			|| state->holder_pair_drained_resource_formation == UINT64_MAX
@@ -2107,6 +2177,17 @@ pcm_entry_retire_eligible_locked(struct GrdEntry *entry, uint64 expected_generat
 														 : PCM_RETIRE_REFUSAL_SIDECAR_NOT_TERMINAL;
 		return false;
 	}
+	/* LOCAL already consumed this dead object's current, not an ordinary
+	 * RELEASE_X. Only OBJECT_RETIRED may consume its fully passive SETTLED
+	 * history, without inventing a release, receipt or DATA proof. */
+	if (settled) {
+		uint64 terminal_count = 0, digest = PGRAC_RESOURCE_X_PROOF_DIGEST_OFFSET;
+		if (!pcm_resource_x_terminal_state_locked(entry, state, true, true, true,
+			&terminal_count, &digest, NULL)) {
+			*why = PCM_RETIRE_REFUSAL_SIDECAR_NOT_TERMINAL;
+			return false;
+		}
+	}
 	return true;
 }
 
@@ -2137,7 +2218,7 @@ pcm_entry_retire_classify_exact(const BufferTag *tag, uint64 expected_generation
 		LWLockRelease(&ClusterPcm->htab_lock.lock);
 		return false;
 	}
-	eligible = pcm_entry_retire_eligible_locked(entry, expected_generation, why);
+	eligible = pcm_entry_retire_eligible_locked(entry, expected_generation, why, false);
 	LWLockRelease(&entry->entry_lock.lock);
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
 	return eligible;
@@ -2146,6 +2227,7 @@ pcm_entry_retire_classify_exact(const BufferTag *tag, uint64 expected_generation
 bool
 pcm_entry_try_retire_exact(const BufferTag *tag, uint64 binding_generation, PcmRetireReason reason)
 {
+	ClusterPageWalRefV1 retired_local[2] = { 0 };
 	ClusterPcmResourceXMasterState *state;
 	ClusterPcmResourceXSlot *registry_slot;
 	ClusterPcmWmProvSlot *provenance_slot = NULL;
@@ -2157,10 +2239,18 @@ pcm_entry_try_retire_exact(const BufferTag *tag, uint64 binding_generation, PcmR
 	uint64 retired_authority_floor;
 	bool found;
 	bool removed;
+	bool object_retired = reason == PCM_RETIRE_REASON_OBJECT_RETIRED;
 
 	if (tag == NULL || binding_generation == 0 || binding_generation == UINT64_MAX
-		|| reason < PCM_RETIRE_REASON_HOLDER_RELEASE || reason > PCM_RETIRE_REASON_BOUNDED_RECLAIM
+		|| reason < PCM_RETIRE_REASON_HOLDER_RELEASE || reason > PCM_RETIRE_REASON_OBJECT_RETIRED
 		|| ClusterPcm == NULL || cluster_pcm_htab == NULL)
+		return false;
+	/* Never take the KO lock under the directory/entry locks. Its terminal
+	 * old-locator identity cannot reopen; native MAIN prevents locator reuse.
+	 * The original exact generation and eligibility table still run below. */
+	if (object_retired
+		&& (!cluster_shared_config
+			|| !cluster_ko_directory_drop_retired_v3(BufTagGetRelFileLocator(tag))))
 		return false;
 	pg_atomic_fetch_add_u64(&ClusterPcm->reclaim_attempt_count, 1);
 
@@ -2182,7 +2272,7 @@ pcm_entry_try_retire_exact(const BufferTag *tag, uint64 binding_generation, PcmR
 		LWLockRelease(&ClusterPcm->htab_lock.lock);
 		return false;
 	}
-	if (!pcm_entry_retire_eligible_locked(entry, binding_generation, &why)) {
+	if (!pcm_entry_retire_eligible_locked(entry, binding_generation, &why, object_retired)) {
 		pcm_entry_retire_refused_mark(why);
 		LWLockRelease(&entry->entry_lock.lock);
 		LWLockRelease(&ClusterPcm->htab_lock.lock);
@@ -2229,6 +2319,14 @@ pcm_entry_try_retire_exact(const BufferTag *tag, uint64 binding_generation, PcmR
 		return false;
 	}
 
+	/* These copies transfer ownership only if the original HASH_REMOVE below
+	 * succeeds. Every refusal before it retains the references in the entry.
+	 * Release outside all directory/entry/provenance locks, never by clearing
+	 * a source pool slot or claiming an ordinary physical ACK. */
+	if (object_retired) {
+		retired_local[0] = entry->local_pi_first;
+		retired_local[1] = entry->local_pi_last;
+	}
 	pg_atomic_write_u32(&entry->lifecycle, PCM_ENTRY_RETIRING);
 	if (authority_generation > binding_generation && authority_generation > retired_authority_floor)
 		pg_atomic_write_u64(&ClusterPcm->resource_x_retired_authority_floor, authority_generation);
@@ -2258,6 +2356,10 @@ pcm_entry_try_retire_exact(const BufferTag *tag, uint64 binding_generation, PcmR
 		return false;
 	}
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
+	if (object_retired && retired_local[0].source_flags != 0
+		&& (!cluster_page_wal_ref_release_v1(&retired_local[0])
+			|| !cluster_page_wal_ref_release_v1(&retired_local[1])))
+		elog(PANIC, "retired DROP lost its owned local PI references");
 	pg_atomic_fetch_add_u64(&ClusterPcm->reclaim_success_count, 1);
 	return true;
 }
@@ -2314,7 +2416,8 @@ cluster_pcm_lock_reclaim_bounded(uint32 probe_budget, PcmReclaimBatch *out)
 		if (state != PCM_REGISTRY_LIVE)
 			continue;
 		out->attempted_count++;
-		if (pcm_entry_try_retire_exact(&tag, binding_generation, PCM_RETIRE_REASON_BOUNDED_RECLAIM))
+		if (pcm_entry_try_retire_exact(&tag, binding_generation, PCM_RETIRE_REASON_BOUNDED_RECLAIM)
+			|| pcm_entry_try_retire_exact(&tag, binding_generation, PCM_RETIRE_REASON_OBJECT_RETIRED))
 			out->retired_count++;
 	}
 	if (cursor == capacity) {
@@ -3745,7 +3848,7 @@ pcm_resource_x_terminal_state_locked(struct GrdEntry *entry,
 									 const ClusterPcmResourceXMasterState *state,
 									 bool allow_stable_residency, bool allow_drained_pair_history,
 									 bool allow_retired_n, uint64 *terminal_request_count_io,
-									 uint64 *digest_io)
+									 uint64 *digest_io, PcmNormalStopRefusalV1 *diagnostic)
 {
 	static const ClusterPcmResourceXMasterRequest empty_request;
 	static const ClusterPcmResourceXTerminalTombstone empty_tombstone;
@@ -3774,7 +3877,7 @@ pcm_resource_x_terminal_state_locked(struct GrdEntry *entry,
 			|| empty_round.failed_attempt_floor > empty_round.highest_attempt_floor
 			|| empty_round.cancelled_attempt_floor > empty_round.highest_attempt_floor
 			|| memcmp(&entry->resource_x_bootstrap_round, &empty_round, sizeof(empty_round)) != 0)
-			return false;
+			return pcm_protocol_refuse(diagnostic, 201, __LINE__, -1);
 	} else if (allow_stable_residency && entry->resource_x_bootstrap_round.send.pending == 0
 			   && entry->resource_x_bootstrap_round.phase
 					  == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
@@ -3786,17 +3889,17 @@ pcm_resource_x_terminal_state_locked(struct GrdEntry *entry,
 				   entry->resource_x_bootstrap_round.cached_ownership_generation))
 		;
 	else
-		return false;
+		return pcm_protocol_refuse(diagnostic, 202, __LINE__, -1);
 	/* D S09 R-A22: a PENDING first record is unretired WAL responsibility. */
 	if (state->holder_pi_first.source_flags != 0)
-		return false;
+		return pcm_protocol_refuse(diagnostic, 203, __LINE__, -1);
 	if (state->holder_status.valid != 0 || state->holder_image.valid != 0
 		|| state->holder_status_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
 		|| state->holder_image_intent.state != RESOURCE_X_INTENT_SLOT_EMPTY) {
 		if (!allow_drained_pair_history
 			|| !pcm_resource_x_holder_pair_drained_history_locked(entry, state, &drained_status,
 																  &drained_image))
-			return false;
+			return pcm_protocol_refuse(diagnostic, 204, __LINE__, -1);
 		drained_pair_history = true;
 	}
 	if (!pcm_resource_x_active_empty_locked(entry)
@@ -3808,12 +3911,12 @@ pcm_resource_x_terminal_state_locked(struct GrdEntry *entry,
 		|| !pcm_resource_x_requester_join_empty_locked(&state->requester_join)
 		|| !pcm_resource_x_bootstrap_priority_valid(&state->bootstrap_priority)
 		|| state->bootstrap_priority.state != RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY)
-		return false;
+		return pcm_protocol_refuse(diagnostic, 205, __LINE__, -1);
 	if (!pcm_resource_x_settlement_retry_decode_locked(entry, state, NULL)
 		|| state->settlement_retry.pending
 		|| !pcm_resource_x_source_settlement_debt_decode_locked(entry, state, &source_settlement)
 		|| state->source_settlement.state == RESOURCE_X_SOURCE_SETTLEMENT_PENDING)
-		return false;
+		return pcm_protocol_refuse(diagnostic, 206, __LINE__, -1);
 
 	digest = pcm_resource_x_proof_digest_tag(*digest_io, &entry->tag);
 	digest = pcm_resource_x_proof_digest_u64(
@@ -3850,27 +3953,27 @@ pcm_resource_x_terminal_state_locked(struct GrdEntry *entry,
 
 		if (!pcm_resource_x_bootstrap_receipt_valid(receipt)
 			|| receipt->state != RESOURCE_X_BOOTSTRAP_RECEIPT_EMPTY)
-			return false;
+			return pcm_protocol_refuse(diagnostic, 207, __LINE__, node);
 		digest = pcm_resource_x_proof_digest_u64(digest, receipt->highest_attempt_floor);
 		if (state->block_intents[node].slot.state != RESOURCE_X_INTENT_SLOT_EMPTY)
-			return false;
+			return pcm_protocol_refuse(diagnostic, 208, __LINE__, node);
 		if (request->phase == RESOURCE_X_MASTER_NONE) {
 			if (memcmp(request, &empty_request, sizeof(*request)) != 0)
-				return false;
+				return pcm_protocol_refuse(diagnostic, 209, __LINE__, node);
 		} else if (request->phase == RESOURCE_X_MASTER_RELEASED
 				   || (allow_stable_residency && request->phase == RESOURCE_X_MASTER_SETTLED)) {
 			if (!pcm_resource_x_terminal_request_identity_valid(request, allow_stable_residency))
-				return false;
+				return pcm_protocol_refuse(diagnostic, 210, __LINE__, node);
 			if (request->phase == RESOURCE_X_MASTER_SETTLED) {
 				if (settled_terminal_node != -1)
-					return false;
+					return pcm_protocol_refuse(diagnostic, 211, __LINE__, node);
 				settled_terminal_node = node;
 			}
 			(*terminal_request_count_io)++;
 			digest = pcm_resource_x_proof_digest_u64(digest, request->resource_formation);
 			digest = pcm_resource_x_proof_digest_u64(digest, request->assertion_sequence);
 		} else
-			return false;
+			return pcm_protocol_refuse(diagnostic, 212, __LINE__, node);
 		if (state->holder_pair_drained_sequences[node] != 0) {
 			drained = true;
 			(*terminal_request_count_io)++;
@@ -3880,16 +3983,16 @@ pcm_resource_x_terminal_state_locked(struct GrdEntry *entry,
 	}
 	if (state->terminal_tombstone.valid == 0) {
 		if (memcmp(&state->terminal_tombstone, &empty_tombstone, sizeof(empty_tombstone)) != 0)
-			return false;
+			return pcm_protocol_refuse(diagnostic, 213, __LINE__, -1);
 	} else if (state->terminal_tombstone.valid != 1 || state->terminal_tombstone.requester_node < 0
 			   || state->terminal_tombstone.requester_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 			   || !pcm_resource_x_terminal_request_identity_valid(
 				   &state->terminal_tombstone.request, allow_stable_residency)) {
-		return false;
+		return pcm_protocol_refuse(diagnostic, 214, __LINE__, -1);
 	} else {
 		if (state->terminal_tombstone.request.phase == RESOURCE_X_MASTER_SETTLED) {
 			if (!allow_stable_residency || settled_terminal_node != -1)
-				return false;
+				return pcm_protocol_refuse(diagnostic, 215, __LINE__, -1);
 			settled_terminal_node = state->terminal_tombstone.requester_node;
 		}
 		(*terminal_request_count_io)++;
@@ -3904,12 +4007,12 @@ pcm_resource_x_terminal_state_locked(struct GrdEntry *entry,
 			|| state->holder_pair_drained_master_node < 0
 			|| state->holder_pair_drained_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 			|| state->holder_pair_drained_reserved != 0)
-			return false;
+			return pcm_protocol_refuse(diagnostic, 216, __LINE__, -1);
 	} else if (state->holder_pair_drained_resource_formation != 0
 			   || state->holder_pair_drained_master_session != 0
 			   || state->holder_pair_drained_master_node != 0
 			   || state->holder_pair_drained_reserved != 0)
-		return false;
+		return pcm_protocol_refuse(diagnostic, 217, __LINE__, -1);
 	if (settled_terminal_node != -1) {
 		uint32 settled_bit = UINT32_C(1) << (uint32)settled_terminal_node;
 		uint32 s_holders = pg_atomic_read_u32(&entry->s_holders_bitmap);
@@ -3927,11 +4030,11 @@ pcm_resource_x_terminal_state_locked(struct GrdEntry *entry,
 							&& ((pi_holders & settled_bit) != 0 || allow_retired_n);
 		if (!stable_cached || entry->pending_x_requester_node != -1
 			|| entry->pending_x_since_lsn != 0)
-			return false;
+			return pcm_protocol_refuse(diagnostic, 218, __LINE__, -1);
 	}
 	if (state->authority_generation == 0 || state->authority_generation == UINT64_MAX
 		|| state->next_enqueue_order == 0 || state->next_enqueue_order == UINT64_MAX)
-		return false;
+		return pcm_protocol_refuse(diagnostic, 219, __LINE__, -1);
 	digest = pcm_resource_x_proof_digest_u64(digest, state->authority_generation);
 	digest = pcm_resource_x_proof_digest_u64(digest, state->next_enqueue_order);
 	*digest_io = digest;
@@ -3944,7 +4047,7 @@ pcm_resource_x_clean_state_locked(struct GrdEntry *entry,
 								  uint64 *terminal_request_count_io, uint64 *digest_io)
 {
 	return pcm_resource_x_terminal_state_locked(entry, state, false, false, false,
-												terminal_request_count_io, digest_io);
+												terminal_request_count_io, digest_io, NULL);
 }
 
 static bool
@@ -8753,13 +8856,196 @@ cluster_pcm_grd_lifecycle_stats_snapshot(PcmGrdLifecycleStats *out)
 
 
 static bool pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out,
-												 bool *retained_out, bool allow_retired_n);
+												 bool *retained_out, bool allow_retired_n,
+	PcmNormalStopRefusalV1 *diagnostic);
 
 static void
 pcm_normal_stop_note_held_lock(LWLock *lock pg_attribute_unused(),
 							   LWLockMode mode pg_attribute_unused(), void *context)
 {
 	*(bool *)context = true;
+}
+
+/* No KO lock nests under PCM locks. This immutable dead-object proof can
+ * justify PENDING, never READY or clearing: the original bounded AM03
+ * consumer must still perform exact removal. Live no-cover remains invalid. */
+static bool
+pcm_object_retire_pending_exact(const BufferTag *tag, uint64 generation, uint32 slot)
+{
+	static const ClusterPcmResourceXMasterState empty_state;
+	ClusterPcmResourceXMasterState *state;
+	ClusterPcmResourceXSlot *registry;
+	struct GrdEntry *entry;
+	PcmRetireRefusal why;
+	bool found, pending = false, settled = false;
+
+	if (!cluster_shared_config || generation == 0 || generation == UINT64_MAX
+		|| slot >= (uint32)pcm_grd_effective
+		|| !cluster_ko_directory_drop_retired_v3(BufTagGetRelFileLocator(tag)))
+		return false;
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_EXCLUSIVE);
+	registry = &cluster_pcm_resource_x_slots[slot];
+	state = &cluster_pcm_resource_x_master_states[slot];
+	entry = hash_search(cluster_pcm_htab, tag, HASH_FIND, &found);
+	if (!found || entry == NULL) {
+		/* An original retirement may finish between the two observations.
+		 * Require its exact old generation; only a fresh census grants READY. */
+		pending = registry->state == PCM_REGISTRY_TOMBSTONE && registry->reserved == 0
+			&& BufferTagsEqual(&registry->tag, tag) && registry->binding_generation == generation
+			&& registry->retired_authority_generation > 0
+			&& registry->retired_authority_generation < UINT64_MAX
+			&& memcmp(state, &empty_state, sizeof(*state)) == 0;
+	} else if (entry->binding_generation == generation && entry->registry_slot == slot
+		&& BufferTagsEqual(&entry->tag, tag)
+		&& LWLockConditionalAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE)) {
+		for (unsigned node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++)
+			settled |= state->requests[node].phase == RESOURCE_X_MASTER_SETTLED;
+		settled |= state->terminal_tombstone.valid == 1
+			&& state->terminal_tombstone.request.phase == RESOURCE_X_MASTER_SETTLED;
+		pending = settled && pcm_entry_retire_eligible_locked(entry, generation, &why, true);
+		LWLockRelease(&entry->entry_lock.lock);
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+	return pending;
+}
+
+/* Caller retains the same directory/entry locks as the refusing predicate. */
+static void
+pcm_normal_stop_refusal_values_locked(struct GrdEntry *entry, PcmNormalStopRefusalV1 *f)
+{
+	const ClusterPcmResourceXMasterState *state = NULL;
+	const ClusterPcmResourceXMasterRequest *request = NULL;
+	const ClusterPcmResourceXSlot *registry;
+	const ClusterPcmResourceXBootstrapRound *round = &entry->resource_x_bootstrap_round;
+	int request_node = -1;
+
+	f->pid = MyProcPid;
+	f->captured_pg_us = GetCurrentTimestamp();
+	f->tag = entry->tag;
+	f->slot = entry->registry_slot;
+	f->binding = entry->binding_generation;
+	f->formation = entry->resource_x_formation;
+	f->gate = pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase);
+	f->gate_formation = pg_atomic_read_u64(&ClusterPcm->resource_x_gate_formation);
+	f->lifecycle = pg_atomic_read_u32(&entry->lifecycle);
+	f->pins = pg_atomic_read_u32(&entry->pin_count);
+	f->waits = pg_atomic_read_u32(&entry->wait_refcount);
+	f->transport = pg_atomic_read_u32(&entry->transport_refcount);
+	f->mode = pg_atomic_read_u32(&entry->master_state);
+	f->s_holders = pg_atomic_read_u32(&entry->s_holders_bitmap);
+	f->pi_holders = pg_atomic_read_u32(&entry->pi_holders_bitmap);
+	f->local_refs = entry->s_holder_refcount_local;
+	f->x_holder = entry->x_holder_node;
+	f->master_holder = entry->master_holder.node_id;
+	f->pending_x = entry->pending_x_requester_node;
+	f->pending_x_lsn = entry->pending_x_since_lsn;
+	f->convert = entry->convert_queue != NULL;
+	f->owner_state = entry->resource_x_local_owner.state;
+	f->owner_buffer = entry->resource_x_local_owner.held_buffer_id_plus_one;
+	f->owner_generation = entry->resource_x_local_owner.highest_owner_generation;
+	f->round_phase = round->phase;
+	f->send_pending = round->send.pending;
+	f->attempt = round->highest_attempt_floor;
+	f->round_formation = round->resource_formation;
+	f->round_master_session = round->master_session_incarnation;
+	f->delivery_sequence = round->delivery_executor_sequence;
+	f->local_pi_first = entry->local_pi_first.source_flags;
+	f->local_pi_last = entry->local_pi_last.source_flags;
+	f->pi_lsn = entry->pi_watermark_lsn;
+	f->pi_scn = entry->pi_watermark_scn;
+	f->tombstone_node = f->request_node = -1;
+	if (f->slot >= (uint32)pcm_grd_effective)
+		return;
+	registry = &cluster_pcm_resource_x_slots[f->slot];
+	state = &cluster_pcm_resource_x_master_states[f->slot];
+	f->registry_tag = registry->tag;
+	f->registry_state = registry->state;
+	f->registry_reserved = registry->reserved;
+	f->registry_binding = registry->binding_generation;
+	f->state_binding = state->binding_generation;
+	f->authority = state->authority_generation;
+	f->tombstone_valid = state->terminal_tombstone.valid;
+	f->tombstone_node = state->terminal_tombstone.requester_node;
+	f->tombstone_phase = state->terminal_tombstone.request.phase;
+	f->holder_status = state->holder_status.valid;
+	f->holder_image = state->holder_image.valid;
+	f->grant = state->grant_intent.slot.state;
+	f->requester_settlement = state->requester_settlement_intent.slot.state;
+	f->requester_join_grant = state->requester_join.grant_valid;
+	f->requester_join_image = state->requester_join.image_valid;
+	f->deferred = state->deferred_settlement.present;
+	f->retry_pending = state->settlement_retry.pending;
+	f->retry_running = state->settlement_retry.running;
+	f->source_settlement = state->source_settlement.state;
+	f->priority = state->bootstrap_priority.state;
+	if (f->node >= 0 && f->node < RESOURCE_X_PROTOCOL_NODE_LIMIT)
+		request_node = f->node;
+	else if (state->terminal_tombstone.valid == 1)
+		request_node = state->terminal_tombstone.requester_node;
+	else
+		for (int node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++)
+			if (state->requests[node].phase != RESOURCE_X_MASTER_NONE) {
+				request_node = node;
+				break;
+			}
+	if (request_node < 0 || request_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT)
+		return;
+	f->request_node = request_node;
+	request = &state->requests[request_node];
+	if (request->phase == RESOURCE_X_MASTER_NONE && state->terminal_tombstone.valid == 1
+		&& request_node == state->terminal_tombstone.requester_node)
+		request = &state->terminal_tombstone.request;
+	f->request_phase = request->phase;
+	f->request_formation = request->resource_formation;
+	f->request_session = request->master_session_incarnation;
+	f->assertion = request->assertion_sequence;
+	f->base = request->base_authority_generation;
+	f->final_authority = request->final_authority_generation;
+	f->requester_connection = request->settlement_requester_connection_generation;
+	f->requester_target = request->requester_target_generation;
+	f->sender_connection = request->sender_connection_generation;
+}
+
+/* Bounded, preallocated, single publication; no allocation/LOG under PCM
+ * locks, and none of these saved values is read by a protocol predicate. */
+static void
+pcm_normal_stop_refusal_publish(const PcmNormalStopRefusalV1 *f)
+{
+	uint32 expected = 0;
+
+	if (!pg_atomic_compare_exchange_u32(&ClusterPcm->normal_stop_refusal_state, &expected, 1))
+		return;
+	ClusterPcm->normal_stop_refusal = *f;
+	pg_write_barrier();
+	pg_atomic_write_u32(&ClusterPcm->normal_stop_refusal_state, 2);
+	elog(LOG, "PCM normal-stop first refusal code=%u line=%u predicate_node=%d pid=%d captured_pg_us=" INT64_FORMAT
+		 " tag=%u/%u/%u/%d/%u slot=%u binding=" UINT64_FORMAT
+		 " registry=%u reserved=%u registry_binding=" UINT64_FORMAT " state_binding=" UINT64_FORMAT
+		 " formation=" UINT64_FORMAT " gate=%u gate_formation=" UINT64_FORMAT " authority=" UINT64_FORMAT
+		 " lifecycle=%u pins=%u waits=%u transport=%u mode=%u x_holder=%d s=0x%x pi=0x%x local_refs=%u master_holder=%u"
+		 " pending_x=%d pending_x_lsn=" UINT64_FORMAT " convert=%u"
+		 " owner=%u owner_buffer=%u owner_generation=" UINT64_FORMAT " round=%u send=%u attempt=" UINT64_FORMAT
+		 " round_formation=" UINT64_FORMAT " round_session=" UINT64_FORMAT " delivery=" UINT64_FORMAT
+		 " local_pi=%u/%u pi_lsn=" UINT64_FORMAT " pi_scn=" UINT64_FORMAT
+		 " request_node=%d request_phase=%u tombstone=%u/%d/%u request_formation=" UINT64_FORMAT
+		 " request_session=" UINT64_FORMAT " assertion=" UINT64_FORMAT " base=" UINT64_FORMAT " final=" UINT64_FORMAT
+		 " requester_connection=" UINT64_FORMAT " requester_target=" UINT64_FORMAT " sender_connection=%u"
+		 " holder=%u/%u grant=%u requester_settlement=%u join=%u/%u deferred=%u retry=%u/%u source_settlement=%u priority=%u",
+		 f->code, f->source_line, f->node, f->pid, f->captured_pg_us,
+		 f->tag.spcOid, f->tag.dbOid, f->tag.relNumber, f->tag.forkNum, f->tag.blockNum,
+		 f->slot, f->binding, f->registry_state, f->registry_reserved, f->registry_binding, f->state_binding,
+		 f->formation, f->gate, f->gate_formation, f->authority, f->lifecycle, f->pins, f->waits,
+		 f->transport, f->mode, f->x_holder, f->s_holders, f->pi_holders, f->local_refs, f->master_holder,
+		 f->pending_x, f->pending_x_lsn, f->convert,
+		 f->owner_state, f->owner_buffer, f->owner_generation, f->round_phase, f->send_pending,
+		 f->attempt, f->round_formation, f->round_master_session, f->delivery_sequence,
+		 f->local_pi_first, f->local_pi_last, f->pi_lsn, f->pi_scn,
+		 f->request_node, f->request_phase, f->tombstone_valid, f->tombstone_node, f->tombstone_phase,
+		 f->request_formation, f->request_session, f->assertion, f->base, f->final_authority,
+		 f->requester_connection, f->requester_target, f->sender_connection,
+		 f->holder_status, f->holder_image, f->grant, f->requester_settlement,
+		 f->requester_join_grant, f->requester_join_image, f->deferred, f->retry_pending,
+		 f->retry_running, f->source_settlement, f->priority);
 }
 
 static ClusterNormalStopPollResult
@@ -8771,10 +9057,13 @@ pcm_normal_stop_scan(bool require_pi_retired, bool retire_pi, BufferTag *tag_out
 	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
 	BufferTag observed = { 0 };
 	uint32 observed_slot = PG_UINT32_MAX;
+	uint64 observed_generation = 0;
+	PcmNormalStopRefusalV1 first = {0};
 	const char *reason = "NONE";
 	HASH_SEQ_STATUS scan;
 	struct GrdEntry *entry;
 	bool held_lock = false;
+	bool additional_invalid = false;
 	bool durable_stop_cut;
 	uint32 gate;
 
@@ -8820,16 +9109,22 @@ pcm_normal_stop_scan(bool require_pi_retired, bool retire_pi, BufferTag *tag_out
 		uint32 pins, waits, transport, mode, s_holders, pi_holders;
 		bool active, retained;
 		bool valid;
+		PcmNormalStopRefusalV1 failure = {.node = -1};
 
 		/* Directory S keeps this original entry and its sidecar alive,
 		 * without creating a lookup pin or invoking a retire path. */
 		LWLockAcquire(&entry->entry_lock.lock, retire_pi ? LW_EXCLUSIVE : LW_SHARED);
-		valid = pcm_resource_x_protocol_state_locked(entry, &active, &retained, durable_stop_cut);
+		valid = pcm_resource_x_protocol_state_locked(entry, &active, &retained, durable_stop_cut,
+			&failure);
 		if (!valid || entry->binding_generation == 0 || entry->binding_generation == UINT64_MAX
 			|| entry->resource_x_bootstrap_round.phase
 				   == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED) {
 			current = CLUSTER_NORMAL_STOP_INVALID;
 			current_reason = "PCM_PROTOCOL_INVALID";
+			if (failure.code == 0)
+				(void)pcm_protocol_refuse(&failure,
+					entry->binding_generation == 0 || entry->binding_generation == UINT64_MAX
+					? 301 : 302, __LINE__, -1);
 		} else if (active || retained
 				   || entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY) {
 			current = CLUSTER_NORMAL_STOP_PENDING;
@@ -8893,12 +9188,19 @@ pcm_normal_stop_scan(bool require_pi_retired, bool retire_pi, BufferTag *tag_out
 			entry->pi_watermark_scn = InvalidScn;
 			pcm_local_pi_release_locked(entry);
 		}
+		if (current == CLUSTER_NORMAL_STOP_INVALID && result == CLUSTER_NORMAL_STOP_INVALID)
+			additional_invalid = true;
 		if ((current == CLUSTER_NORMAL_STOP_INVALID && result != CLUSTER_NORMAL_STOP_INVALID)
 			|| (current == CLUSTER_NORMAL_STOP_PENDING && result == CLUSTER_NORMAL_STOP_READY)) {
 			result = current;
 			reason = current_reason;
 			observed = entry->tag;
 			observed_slot = entry->registry_slot;
+			observed_generation = entry->binding_generation;
+			if (current == CLUSTER_NORMAL_STOP_INVALID && failure.code != 0) {
+				pcm_normal_stop_refusal_values_locked(entry, &failure);
+				first = failure;
+			}
 		}
 		LWLockRelease(&entry->entry_lock.lock);
 	}
@@ -8932,6 +9234,8 @@ pcm_normal_stop_scan(bool require_pi_retired, bool retire_pi, BufferTag *tag_out
 					  || memcmp(state, &empty_state, sizeof(*state)) != 0;
 		} else
 			invalid = true;
+		if (invalid && result == CLUSTER_NORMAL_STOP_INVALID)
+			additional_invalid = true;
 		if (invalid && result != CLUSTER_NORMAL_STOP_INVALID) {
 			result = CLUSTER_NORMAL_STOP_INVALID;
 			reason = "PCM_REGISTRY_BINDING_INVALID";
@@ -8941,6 +9245,18 @@ pcm_normal_stop_scan(bool require_pi_retired, bool retire_pi, BufferTag *tag_out
 	}
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
 done:
+	/* One exact dead-object proof cannot justify any other refusing entry,
+	 * gate or reverse-registry binding. Keep the original INVALID when the
+	 * same census contains another refusal; AM03 must retire real history
+	 * before a fresh census can change that result. */
+	if (result == CLUSTER_NORMAL_STOP_INVALID && !additional_invalid
+		&& strcmp(reason, "PCM_PROTOCOL_INVALID") == 0
+		&& pcm_object_retire_pending_exact(&observed, observed_generation, observed_slot)) {
+		result = CLUSTER_NORMAL_STOP_PENDING;
+		reason = "PCM_OBJECT_RETIRE_PENDING";
+	}
+	if (result == CLUSTER_NORMAL_STOP_INVALID && first.code != 0)
+		pcm_normal_stop_refusal_publish(&first);
 	if (tag_out != NULL)
 		*tag_out = observed;
 	if (slot_out != NULL)
@@ -8983,7 +9299,7 @@ cluster_pcm_normal_stop_pi_retire(BufferTag *tag_out, uint32 *slot_out, const ch
  * diagnostic counters are never inputs to a stop decision. */
 static bool
 pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out, bool *retained_out,
-									 bool allow_retired_n)
+									 bool allow_retired_n, PcmNormalStopRefusalV1 *diagnostic)
 {
 	ClusterPcmResourceXMasterState *state = NULL;
 	ClusterPcmResourceXBootstrapRound *round;
@@ -9002,24 +9318,27 @@ pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out, b
 	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED)
 		   || LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
 
+#define PCM_PROTOCOL_INVALID(code, node) \
+	do { invalid = true; (void)pcm_protocol_refuse(diagnostic, code, __LINE__, node); } while (0)
+
 	lifecycle = pg_atomic_read_u32(&entry->lifecycle);
 	if (lifecycle != PCM_ENTRY_LIVE && lifecycle != PCM_ENTRY_QUIESCING)
-		invalid = true;
+		PCM_PROTOCOL_INVALID(101, -1);
 
 	owner = &entry->resource_x_local_owner;
 	if (!pcm_resource_x_local_owner_valid_locked(owner))
-		invalid = true;
+		PCM_PROTOCOL_INVALID(102, -1);
 
 	if (!pcm_resource_x_active_empty_locked(entry)) {
 		active = true;
 		if (!pcm_resource_x_active_valid_locked(entry))
-			invalid = true;
+			PCM_PROTOCOL_INVALID(103, -1);
 	}
 	round = &entry->resource_x_bootstrap_round;
 	if (round->send.pending != 0)
 		retained = true;
 	if (round->phase > RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED)
-		invalid = true;
+		PCM_PROTOCOL_INVALID(104, -1);
 	else if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
 			 && round->phase != RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED)
 		active = true;
@@ -9030,11 +9349,11 @@ pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out, b
 		|| !BufferTagsEqual(&cluster_pcm_resource_x_slots[entry->registry_slot].tag, &entry->tag)
 		|| cluster_pcm_resource_x_slots[entry->registry_slot].binding_generation
 			   != entry->binding_generation) {
-		invalid = true;
+		PCM_PROTOCOL_INVALID(105, -1);
 	} else {
 		state = &cluster_pcm_resource_x_master_states[entry->registry_slot];
 		if (state->binding_generation != entry->binding_generation)
-			invalid = true;
+			PCM_PROTOCOL_INVALID(106, -1);
 	}
 
 	if (state != NULL) {
@@ -9054,25 +9373,25 @@ pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out, b
 			|| state->holder_image_intent.state > RESOURCE_X_INTENT_SLOT_STAGED
 			|| state->grant_intent.slot.state > RESOURCE_X_INTENT_SLOT_STAGED
 			|| state->requester_settlement_intent.slot.state > RESOURCE_X_INTENT_SLOT_STAGED)
-			invalid = true;
+			PCM_PROTOCOL_INVALID(107, -1);
 
 		if (!pcm_resource_x_requester_join_empty_locked(&state->requester_join)) {
 			retained = true;
 			if (!pcm_resource_x_requester_join_decode_locked(&state->requester_join, &join_grant,
 															 &join_image))
-				invalid = true;
+				PCM_PROTOCOL_INVALID(108, -1);
 		}
 		if (!pcm_resource_x_settlement_retry_decode_locked(entry, state, NULL))
-			invalid = true;
+			PCM_PROTOCOL_INVALID(109, -1);
 		if (state->settlement_retry.pending)
 			retained = true;
 		if (!pcm_resource_x_source_settlement_debt_decode_locked(entry, state, &source_settlement))
-			invalid = true;
+			PCM_PROTOCOL_INVALID(110, -1);
 		else if (state->source_settlement.state == RESOURCE_X_SOURCE_SETTLEMENT_PENDING)
 			retained = true;
 
 		if (!pcm_resource_x_bootstrap_priority_valid(&state->bootstrap_priority))
-			invalid = true;
+			PCM_PROTOCOL_INVALID(111, -1);
 		else if (state->bootstrap_priority.state != RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY)
 			retained = true;
 
@@ -9082,16 +9401,16 @@ pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out, b
 			const ResourceXIntentSlot *block_intent = &state->block_intents[node].slot;
 
 			if (!pcm_resource_x_bootstrap_receipt_valid(receipt))
-				invalid = true;
+				PCM_PROTOCOL_INVALID(112, node);
 			else if (receipt->state != RESOURCE_X_BOOTSTRAP_RECEIPT_EMPTY)
 				retained = true;
 			if (block_intent->state != RESOURCE_X_INTENT_SLOT_EMPTY)
 				retained = true;
 			if (block_intent->state > RESOURCE_X_INTENT_SLOT_STAGED)
-				invalid = true;
+				PCM_PROTOCOL_INVALID(113, node);
 
 			if (request->phase > RESOURCE_X_MASTER_RELEASED)
-				invalid = true;
+				PCM_PROTOCOL_INVALID(114, node);
 			else if (request->phase != RESOURCE_X_MASTER_NONE
 					 && request->phase != RESOURCE_X_MASTER_SETTLED
 					 && request->phase != RESOURCE_X_MASTER_RELEASED)
@@ -9106,11 +9425,12 @@ pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out, b
 			uint64 digest = PGRAC_RESOURCE_X_PROOF_DIGEST_OFFSET;
 
 			if (!pcm_resource_x_terminal_state_locked(entry, state, true, true, allow_retired_n,
-													  &terminal_count, &digest))
-				invalid = true;
+													  &terminal_count, &digest, diagnostic))
+				PCM_PROTOCOL_INVALID(115, -1);
 		}
 	}
 
+#undef PCM_PROTOCOL_INVALID
 	*active_out = active;
 	*retained_out = retained;
 	return !invalid;
@@ -9136,7 +9456,7 @@ cluster_pcm_grd_protocol_debt_snapshot(PcmGrdProtocolDebtStats *out)
 		bool active, retained, valid;
 
 		LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
-		valid = pcm_resource_x_protocol_state_locked(entry, &active, &retained, durable_stop_cut);
+		valid = pcm_resource_x_protocol_state_locked(entry, &active, &retained, durable_stop_cut, NULL);
 		out->wait_refcount += pg_atomic_read_u32(&entry->wait_refcount);
 		out->transport_refcount += pg_atomic_read_u32(&entry->transport_refcount);
 		if (entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY) {
@@ -9305,6 +9625,8 @@ cluster_pcm_grd_init(void)
 		pg_atomic_init_u32(&ClusterPcm->reclaim_requested, 0);
 		pg_atomic_init_u64(&ClusterPcm->reclaim_scan_cursor, 0);
 		pg_atomic_init_u64(&ClusterPcm->reclaim_attempt_count, 0);
+		pg_atomic_init_u32(&ClusterPcm->normal_stop_refusal_state, 0);
+		memset(&ClusterPcm->normal_stop_refusal, 0, sizeof(ClusterPcm->normal_stop_refusal));
 		pg_atomic_init_u64(&ClusterPcm->reclaim_success_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->reclaim_reuse_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->reclaim_capacity_retry_count, 0);
@@ -10842,6 +11164,11 @@ cluster_pcm_lock_pi_candidates_v1(uint32 *cursor, uint32 probe_budget, BufferTag
 		LWLockRelease(&ClusterPcm->htab_lock.lock);
 		position++;
 		examined++;
+		/* Reuse this original bounded pass; no receipt or new I/O is needed
+		 * for an exactly retired object with only quiescent directory debt. */
+		if (live && generation != 0 && generation != UINT64_MAX
+			&& pcm_entry_try_retire_exact(&tag, generation, PCM_RETIRE_REASON_OBJECT_RETIRED))
+			continue;
 		if (live && generation != 0 && generation != UINT64_MAX
 			&& ((cluster_pcm_lock_pi_write_snapshot_v1(tag, &x)
 				 && x.binding_generation == generation)
@@ -10853,13 +11180,324 @@ cluster_pcm_lock_pi_candidates_v1(uint32 *cursor, uint32 probe_budget, BufferTag
 	return count;
 }
 
+typedef enum PcmRelationScanRole {
+	PCM_RELATION_SCAN_COMBINED = 0,
+	PCM_RELATION_SCAN_LOCAL,
+	PCM_RELATION_SCAN_DIRECTORY
+} PcmRelationScanRole;
+
+/* AM01 F04: state which lives in MasterState is not automatically directory
+ * work.  A requester/round which names this node remains local physical work;
+ * a request owned by another node is directory work.  Anything for which the
+ * owner cannot be proved from the retained identity stays pending. */
+static bool
+pcm_resource_x_role_pending_locked(struct GrdEntry *entry,
+								   const ClusterPcmResourceXMasterState *state,
+								   PcmRelationScanRole role,
+								   uint32 *predicate_mask, bool *only_local_pi, uint32 *projection)
+{
+	const ClusterPcmResourceXBootstrapRound *round = &entry->resource_x_bootstrap_round;
+	bool local = false;
+	bool local_pi = false;
+	bool directory = false;
+	uint32 mode = pg_atomic_read_u32(&entry->master_state);
+	uint32 s_holders = pg_atomic_read_u32(&entry->s_holders_bitmap);
+	uint32 pi_holders = pg_atomic_read_u32(&entry->pi_holders_bitmap);
+	int node;
+
+	if (predicate_mask != NULL)
+		*predicate_mask = 0;
+#define PCM_PENDING_NOTE(bit) \
+	do { \
+		if (predicate_mask != NULL) \
+			*predicate_mask |= (bit); \
+	} while (0)
+
+	/* Local executor, round, owner and local holder/cached-X state. */
+	if (!pcm_resource_x_active_empty_locked(entry)) {
+		local = true;
+		PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_LOCAL_ACTIVE);
+	}
+	if (entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY) {
+		local = true;
+		PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_LOCAL_OWNER);
+	}
+	if (round->send.pending != 0 || round->phase != RESOURCE_X_BOOTSTRAP_ROUND_EMPTY) {
+		local = true;
+		PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_BOOTSTRAP_ROUND);
+	}
+	if ((mode == PCM_STATE_X && entry->x_holder_node == cluster_node_id)
+		|| (mode == PCM_STATE_S && cluster_node_id >= 0
+			&& cluster_node_id < RESOURCE_X_PROTOCOL_NODE_LIMIT
+			&& (s_holders & (UINT32_C(1) << (uint32)cluster_node_id)) != 0)) {
+		local = true;
+		PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_CURRENT_HOLDER);
+	}
+	if (entry->s_holder_refcount_local != 0) {
+		local = true;
+		PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_CURRENT_HOLDER);
+	}
+	if (entry->local_pi_first.source_flags != 0 || entry->local_pi_last.source_flags != 0) {
+		local_pi = true;
+		PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_LOCAL_PI);
+	}
+	if (entry->pending_x_requester_node == cluster_node_id) {
+		local = true;
+		PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_X_REQUEST);
+	}
+
+	/* Aggregate refs and conversion queues have no exact role identity.  They
+	 * therefore cannot be subtracted from either projection. */
+	if (entry->convert_queue != NULL || pg_atomic_read_u32(&entry->pin_count) != 0
+		|| pg_atomic_read_u32(&entry->wait_refcount) != 0
+		|| pg_atomic_read_u32(&entry->transport_refcount) != 0) {
+		local = directory = true;
+		PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_AGGREGATE_REF);
+	}
+
+	if (state != NULL) {
+		for (node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
+			const ClusterPcmResourceXMasterRequest *request = &state->requests[node];
+			const ClusterPcmResourceXBootstrapReceipt *receipt = &state->bootstrap_receipts[node];
+
+			if (request->phase != RESOURCE_X_MASTER_NONE
+				&& request->phase != RESOURCE_X_MASTER_RELEASED) {
+				directory = true;
+				PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_MASTER_REQUEST);
+				/* SETTLED is terminal directory history.  It remains visible to
+				 * the directory projection, but cannot reopen local physical work
+				 * after the local owner and PI have already drained. */
+				if (node == cluster_node_id && request->phase != RESOURCE_X_MASTER_SETTLED)
+					local = true;
+			}
+			if (receipt->state != RESOURCE_X_BOOTSTRAP_RECEIPT_EMPTY) {
+				directory = true;
+				PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_BOOTSTRAP_RECEIPT);
+			}
+			if (state->block_intents[node].slot.state != RESOURCE_X_INTENT_SLOT_EMPTY) {
+				directory = true;
+				PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_BLOCK_INTENT);
+			}
+		}
+		if (state->bootstrap_priority.state != RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY) {
+			directory = true;
+			PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_BOOTSTRAP_RECEIPT);
+		}
+		if (state->grant_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY) {
+			directory = true;
+			PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_GRANT_INTENT);
+		}
+		if (state->requester_settlement_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
+			|| state->deferred_settlement.present != 0) {
+			directory = true;
+			PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_SETTLEMENT);
+		}
+		/* An outbound requester settlement and a retained source/retry have
+		 * local completion owners, even while their directory history remains.
+		 * They cannot be erased by dead-object cached-cover retirement. */
+		if (state->requester_settlement_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY)
+			local = true;
+		if (!pcm_resource_x_requester_join_empty_locked(&state->requester_join)) {
+			PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_REQUESTER_JOIN);
+			ResourceXDecodedFrame grant, image;
+			if (!pcm_resource_x_requester_join_decode_locked(&state->requester_join, &grant,
+															 &image))
+				local = directory = true;
+			else {
+				directory = true;
+				if (grant.common.logical_assertion.requester_node == cluster_node_id
+					|| image.common.logical_assertion.requester_node == cluster_node_id)
+					local = true;
+			}
+		}
+		if (state->settlement_retry.pending || state->settlement_retry.running
+			|| state->source_settlement.state == RESOURCE_X_SOURCE_SETTLEMENT_PENDING) {
+			local = directory = true;
+			PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_SETTLEMENT);
+		}
+		if (state->holder_status.valid != 0 || state->holder_image.valid != 0
+			|| state->holder_status_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
+			|| state->holder_image_intent.state != RESOURCE_X_INTENT_SLOT_EMPTY) {
+			if (!pcm_resource_x_holder_pair_drained_history_locked(entry, state, NULL, NULL)) {
+				directory = true;
+				PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_HOLDER_PAIR);
+			}
+		}
+		if (state->holder_pi_first.source_flags != 0) {
+			local = directory = true;
+			PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_HOLDER_PAIR);
+		}
+	}
+
+	/* Master mode/holder and pending conversion are directory service state;
+	 * local current holders were already attributed above. PI bitmap and
+	 * watermarks survive local PI retirement until the full master cut is
+	 * complete. Local PI is tracked by its owned references above. */
+	if ((mode == PCM_STATE_X && entry->x_holder_node != -1) || mode == PCM_STATE_S
+		|| entry->master_holder.node_id != INVALID_PCM_MASTER_HOLDER_NODE) {
+		directory = true;
+		PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_DIRECTORY_STATE);
+	}
+	if (pi_holders != 0 || entry->pi_watermark_lsn != 0 || entry->pi_watermark_scn != 0) {
+		directory = true;
+		PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_WATERMARK);
+	}
+	if (entry->pending_x_requester_node != -1) {
+		directory = true;
+		PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_X_REQUEST);
+	}
+
+	{
+		bool result = role == PCM_RELATION_SCAN_LOCAL ? (local || local_pi)
+			: role == PCM_RELATION_SCAN_DIRECTORY ? directory : false;
+		if (only_local_pi != NULL)
+			*only_local_pi = local_pi && !local;
+		if (projection != NULL)
+			*projection = (local ? 1u : 0u) | (local_pi ? 2u : 0u) | (directory ? 4u : 0u);
+		#undef PCM_PENDING_NOTE
+		return result;
+	}
+}
+
+/* AM05: the original committed-object owner has already discarded physical
+ * copies and excluded entered I/O before taking the directory locks. End all
+ * quiescent local responsibilities together; no ordinary release, wire or
+ * master-directory cleanup belongs in this non-throwing commit window.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterPcmPiRelationScanV2
+pcm_ko_local_terminal_discard_locked(struct GrdEntry *entry,
+	const ClusterPcmResourceXMasterState *state, uint64 formation)
+{
+	static const ClusterPageWalRefV1 empty_pi;
+	static const ResourceXDeliveryTarget empty_delivery;
+	ClusterPcmResourceXBootstrapRound empty_round = { 0 };
+	ClusterPcmResourceXBootstrapRound *round = &entry->resource_x_bootstrap_round;
+	ClusterPcmLocalPiSnapshotV1 pi;
+	ResourceXDecodedFrame grant, image;
+	uint32 mode = pg_atomic_read_u32(&entry->master_state);
+	uint32 holders = pg_atomic_read_u32(&entry->s_holders_bitmap);
+	uint32 local_bit = UINT32_C(1) << (uint32)cluster_node_id;
+	bool has_pi = entry->local_pi_first.source_flags != 0;
+	bool terminal = round->phase == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED;
+	bool local_current = (mode == PCM_STATE_X && entry->x_holder_node == cluster_node_id)
+		|| (mode == PCM_STATE_S && (holders & local_bit) != 0);
+	const ClusterPcmResourceXMasterRequest *request = &state->requests[cluster_node_id];
+
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	/* Validate both references before consuming either or any current cover. */
+	if ((!has_pi && memcmp(&entry->local_pi_first, &empty_pi, sizeof(empty_pi)) != 0)
+		|| (entry->local_pi_last.source_flags == 0
+			&& memcmp(&entry->local_pi_last, &empty_pi, sizeof(empty_pi)) != 0)
+		|| !pcm_local_pi_snapshot_locked(entry, &pi)
+		|| (has_pi
+			&& (entry->local_pi_revision >= UINT64_MAX - 1
+				|| (pi.first.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
+				|| (pi.last.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0)))
+		return CLUSTER_PCM_PI_RELATION_INVALID;
+
+	/* These are real users or original protocol consumers, not cached history.
+	 * In particular a PENDING source first-record must reach its original
+	 * publication into local PI before this consumer can release that PI. */
+	if (!pcm_resource_x_active_empty_locked(entry)
+		|| entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY
+		|| entry->convert_queue != NULL || pg_atomic_read_u32(&entry->pin_count) != 0
+		|| pg_atomic_read_u32(&entry->wait_refcount) != 0
+		|| pg_atomic_read_u32(&entry->transport_refcount) != 0
+		|| entry->s_holder_refcount_local != 0
+		|| entry->pending_x_requester_node == cluster_node_id
+		|| (request->phase != RESOURCE_X_MASTER_NONE
+			&& request->phase != RESOURCE_X_MASTER_SETTLED
+			&& request->phase != RESOURCE_X_MASTER_RELEASED)
+		|| state->holder_pi_first.source_flags != 0
+		|| state->requester_settlement_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
+		|| state->settlement_retry.pending || state->settlement_retry.running
+		|| state->source_settlement.state == RESOURCE_X_SOURCE_SETTLEMENT_PENDING)
+		return CLUSTER_PCM_PI_RELATION_PENDING;
+	if (!pcm_resource_x_requester_join_empty_locked(&state->requester_join)
+		&& (!pcm_resource_x_requester_join_decode_locked(&state->requester_join, &grant, &image)
+			|| (state->requester_join.grant_valid
+				&& grant.common.logical_assertion.requester_node == cluster_node_id)
+			|| (state->requester_join.image_valid
+				&& image.common.logical_assertion.requester_node == cluster_node_id)))
+		return CLUSTER_PCM_PI_RELATION_PENDING;
+	if (round->highest_attempt_floor == UINT64_MAX
+		|| round->failed_attempt_floor > round->highest_attempt_floor
+		|| round->cancelled_attempt_floor > round->highest_attempt_floor)
+		return CLUSTER_PCM_PI_RELATION_PENDING;
+	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY) {
+		empty_round.highest_attempt_floor = round->highest_attempt_floor;
+		empty_round.failed_attempt_floor = round->failed_attempt_floor;
+		empty_round.cancelled_attempt_floor = round->cancelled_attempt_floor;
+		if (memcmp(round, &empty_round, sizeof(empty_round)) != 0)
+			return CLUSTER_PCM_PI_RELATION_PENDING;
+	} else if (!terminal || round->send.pending != 0
+		|| memcmp(&round->delivery_target, &empty_delivery, sizeof(empty_delivery)) != 0
+		|| round->delivery_executor_purpose != 0 || round->delivery_executor_sequence == UINT64_MAX
+		|| !pcm_resource_x_install_claim_valid_locked(round)
+		|| (round->install_claim_source != RESOURCE_X_INSTALL_CLAIM_NONE
+			&& round->install_claim_pending_generation + 1 != round->cached_ownership_generation)
+		|| round->resource_formation != formation
+		|| round->request.resource_formation != formation
+		|| round->request.logical_assertion.requester_node != cluster_node_id
+		|| !BufferTagsEqual(&round->terminal_ref.assertion.resource, &entry->tag)
+		|| round->master_session_incarnation == 0 || round->master_session_incarnation == UINT64_MAX
+		|| round->r4_record_generation == 0 || round->r4_record_generation == UINT64_MAX
+		|| round->cached_ownership_generation == 0 || round->cached_ownership_generation == UINT64_MAX
+		|| round->failed_attempt_floor >= round->highest_attempt_floor
+		|| round->cancelled_attempt_floor >= round->highest_attempt_floor
+		|| round->reserved[0] != 0
+		|| (mode != PCM_STATE_N && (mode != PCM_STATE_X || entry->x_holder_node != cluster_node_id))
+		|| !pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(entry, round,
+			&round->terminal_ref, round->master_session_incarnation, round->r4_record_generation,
+			round->cached_ownership_generation))
+		return CLUSTER_PCM_PI_RELATION_PENDING;
+
+	/* The complete decision precedes the first mutation. Keep the master
+	 * sidecar, remote current declarations and all PI bitmap/watermark history.
+	 * Only this node's mirror/bit is consumed; this is not a remote release ACK. */
+	if (has_pi)
+		pcm_local_pi_release_locked(entry);
+	if (terminal)
+		pcm_resource_x_bootstrap_round_clear_binding_locked(round);
+	if (mode == PCM_STATE_X && entry->x_holder_node == cluster_node_id) {
+		entry->x_holder_node = -1;
+		pg_atomic_write_u32(&entry->master_state, PCM_STATE_N);
+		pcm_master_holder_clear(entry);
+	} else if (mode == PCM_STATE_S && (holders & local_bit) != 0) {
+		holders &= ~local_bit;
+		pg_atomic_write_u32(&entry->s_holders_bitmap, holders);
+		if (holders == 0) {
+			pg_atomic_write_u32(&entry->master_state, PCM_STATE_N);
+			pcm_master_holder_clear(entry);
+		} else if (entry->master_holder.node_id == (uint32)cluster_node_id)
+			pcm_master_holder_set_node(entry, pcm_lowest_set_bit_node(holders));
+	}
+	if (has_pi || terminal || local_current)
+		ConditionVariableBroadcast(&entry->wait_cv);
+	return CLUSTER_PCM_PI_RELATION_EMPTY;
+}
+
 /* The KO owner has already excluded old-incarnation producers. Observe
  * every registry slot, including entries which cannot become writeback
  * candidates. Neither stable residency nor terminal history is permission
  * to ignore a real PI, reference, or in-flight protocol owner. */
-ClusterPcmPiRelationScanV2
-cluster_pcm_lock_pi_relation_scan_v2(RelFileLocator locator, uint64 formation, uint32 budget,
-									 uint32 *cursor)
+static ClusterPcmPiRelationScanV2 pcm_pi_relation_scan_role(RelFileLocator locator,
+	uint64 formation, uint32 budget, uint32 *cursor, bool object_drain,
+	PcmRelationScanRole role, bool discard_local, ClusterPcmPiPendingIdentityV1 *pending_out);
+
+static ClusterPcmPiRelationScanV2
+pcm_pi_relation_scan(RelFileLocator locator, uint64 formation, uint32 budget, uint32 *cursor,
+					 bool object_drain)
+{
+	return pcm_pi_relation_scan_role(locator, formation, budget, cursor, object_drain,
+																																		 PCM_RELATION_SCAN_COMBINED, false, NULL);
+}
+
+static ClusterPcmPiRelationScanV2
+pcm_pi_relation_scan_role(RelFileLocator locator, uint64 formation, uint32 budget,
+											 uint32 *cursor, bool object_drain,
+											 PcmRelationScanRole role, bool discard_local,
+											 ClusterPcmPiPendingIdentityV1 *pending_out)
 {
 	static const ClusterPcmResourceXSlot empty_slot;
 	static const ClusterPcmResourceXMasterState empty_state;
@@ -10867,6 +11505,8 @@ cluster_pcm_lock_pi_relation_scan_v2(RelFileLocator locator, uint64 formation, u
 	ClusterPcmPiRelationScanV2 result = CLUSTER_PCM_PI_RELATION_MORE;
 	uint32 position, end;
 	bool held = false;
+	if (pending_out != NULL)
+		memset(pending_out, 0, sizeof(*pending_out));
 
 	if (!cluster_shared_config || ClusterPcm == NULL || cluster_pcm_htab == NULL
 		|| cluster_pcm_resource_x_slots == NULL || cluster_pcm_resource_x_master_states == NULL
@@ -10878,6 +11518,13 @@ cluster_pcm_lock_pi_relation_scan_v2(RelFileLocator locator, uint64 formation, u
 	ForEachLWLockHeldByMe(pcm_normal_stop_note_held_lock, &held);
 	if (held)
 		return CLUSTER_PCM_PI_RELATION_INVALID;
+	/* This exclusion is read before any directory lock. It grants
+	 * only dead-object reference retirement, never DATA or current rights. */
+	if (discard_local
+		&& (!cluster_enabled || !object_drain || role != PCM_RELATION_SCAN_LOCAL
+			|| cluster_node_id < 0 || cluster_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+			|| !cluster_ko_local_drop_discard_current_v4(locator)))
+		return CLUSTER_PCM_PI_RELATION_INVALID;
 	position = *cursor;
 	end = position + Min(budget, (uint32)pcm_grd_effective - position);
 	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
@@ -10886,8 +11533,9 @@ cluster_pcm_lock_pi_relation_scan_v2(RelFileLocator locator, uint64 formation, u
 		const ClusterPcmResourceXMasterState *state
 			= &cluster_pcm_resource_x_master_states[position];
 		struct GrdEntry *entry;
-		bool active, retained, valid;
+		bool active, retained, valid, pending = false, only_local_pi = false;
 		uint32 mode, s_holders, pi_holders;
+		uint32 predicate_mask = 0, pending_projection = 0;
 
 		if (slot->state == PCM_REGISTRY_EMPTY) {
 			if (memcmp(slot, &empty_slot, sizeof(*slot)) != 0
@@ -10912,18 +11560,28 @@ cluster_pcm_lock_pi_relation_scan_v2(RelFileLocator locator, uint64 formation, u
 		if (entry == NULL || entry->registry_slot != position
 			|| entry->binding_generation != slot->binding_generation)
 			goto invalid;
-		if (!BufTagMatchesRelFileLocator(&slot->tag, &locator)
-			|| (slot->tag.forkNum != MAIN_FORKNUM && slot->tag.forkNum != VISIBILITYMAP_FORKNUM))
+		if (!BufTagMatchesRelFileLocator(&slot->tag, &locator))
 			continue;
-		LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+		if (object_drain) {
+			if (slot->tag.forkNum < MAIN_FORKNUM || slot->tag.forkNum > MAX_FORKNUM)
+				goto invalid;
+		} else if (slot->tag.forkNum != MAIN_FORKNUM && slot->tag.forkNum != VISIBILITYMAP_FORKNUM)
+			continue;
+		LWLockAcquire(&entry->entry_lock.lock, discard_local ? LW_EXCLUSIVE : LW_SHARED);
 		/* True only admits a terminal N history after its PI has already
 		 * been retired by its original owner. This read never retires it
 		 * and does not consume the all-member shutdown checkpoint cut. */
-		valid = pcm_resource_x_protocol_state_locked(entry, &active, &retained, true);
+		valid = pcm_resource_x_protocol_state_locked(entry, &active, &retained, true, NULL);
 		mode = pg_atomic_read_u32(&entry->master_state);
 		s_holders = pg_atomic_read_u32(&entry->s_holders_bitmap);
 		pi_holders = pg_atomic_read_u32(&entry->pi_holders_bitmap);
-		if (!valid
+		if ((discard_local
+			 && (entry->binding_generation != slot->binding_generation
+				 || (entry->resource_x_formation != 0 && entry->resource_x_formation != formation)
+				 || !cluster_pcm_lock_resource_x_gate_snapshot(&after)
+				 || memcmp(&before, &after, sizeof(before)) != 0
+				 || pg_atomic_read_u32(&ClusterPcm->resource_x_intent_generation_exhausted) != 0))
+			|| !valid
 			|| entry->resource_x_bootstrap_round.phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
 			|| mode > PCM_STATE_X || ((uint64)s_holders >> RESOURCE_X_PROTOCOL_NODE_LIMIT) != 0
 			|| ((uint64)pi_holders >> RESOURCE_X_PROTOCOL_NODE_LIMIT) != 0
@@ -10945,16 +11603,105 @@ cluster_pcm_lock_pi_relation_scan_v2(RelFileLocator locator, uint64 formation, u
 			|| entry->pending_x_requester_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 			|| (entry->pending_x_requester_node == -1 && entry->pending_x_since_lsn != 0))
 			result = CLUSTER_PCM_PI_RELATION_INVALID;
-		else if (active || retained
-				 || entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY
-				 || pg_atomic_read_u32(&entry->pin_count) != 0
-				 || pg_atomic_read_u32(&entry->wait_refcount) != 0
-				 || pg_atomic_read_u32(&entry->transport_refcount) != 0
-				 || entry->pending_x_requester_node != -1 || entry->convert_queue != NULL
-				 || pi_holders != 0 || entry->pi_watermark_lsn != 0 || entry->pi_watermark_scn != 0
-				 || entry->local_pi_first.source_flags != 0
-				 || entry->local_pi_last.source_flags != 0)
-			result = CLUSTER_PCM_PI_RELATION_PENDING;
+		else {
+			pending = role == PCM_RELATION_SCAN_COMBINED
+				? (active || retained || (object_drain && mode != PCM_STATE_N)
+					|| entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY
+					|| pg_atomic_read_u32(&entry->pin_count) != 0
+					|| pg_atomic_read_u32(&entry->wait_refcount) != 0
+					|| pg_atomic_read_u32(&entry->transport_refcount) != 0
+					|| entry->pending_x_requester_node != -1 || entry->convert_queue != NULL
+					|| pi_holders != 0 || entry->pi_watermark_lsn != 0
+					|| entry->pi_watermark_scn != 0 || entry->local_pi_first.source_flags != 0
+					|| entry->local_pi_last.source_flags != 0)
+				: pcm_resource_x_role_pending_locked(entry, state, role, &predicate_mask,
+														&only_local_pi, &pending_projection);
+			if (discard_local) {
+				ClusterPcmPiRelationScanV2 retired
+					= pcm_ko_local_terminal_discard_locked(entry, state, formation);
+				if (retired == CLUSTER_PCM_PI_RELATION_INVALID)
+					result = retired;
+				pending = retired == CLUSTER_PCM_PI_RELATION_PENDING
+					|| pcm_resource_x_role_pending_locked(entry, state, role, &predicate_mask,
+						&only_local_pi, &pending_projection);
+				mode = pg_atomic_read_u32(&entry->master_state);
+				s_holders = pg_atomic_read_u32(&entry->s_holders_bitmap);
+			}
+			if (pending && result != CLUSTER_PCM_PI_RELATION_INVALID) {
+				result = CLUSTER_PCM_PI_RELATION_PENDING;
+				if (pending_out != NULL && role == PCM_RELATION_SCAN_LOCAL) {
+					ClusterPageWalBindingV1 binding;
+					int32 source_node_first = -1, source_node_last = -1;
+					uint64 source_boot_first = 0, source_boot_last = 0;
+
+					*pending_out = (ClusterPcmPiPendingIdentityV1) {
+						.registry_slot = position,
+						.tag = entry->tag,
+						.binding_generation = entry->binding_generation,
+						.local_pi_revision = entry->local_pi_revision,
+						.pcm_state = mode,
+						.current_holder_node = mode == PCM_STATE_X ? entry->x_holder_node : -1,
+						.master_holder_node = pcm_master_holder_is_valid(entry)
+							? (int32) entry->master_holder.node_id : -1,
+						.master_node = cluster_gcs_lookup_master(entry->tag),
+						.pending_x_requester_node = entry->pending_x_requester_node,
+						.s_holders_bitmap = s_holders,
+						.pi_holders_bitmap = pi_holders,
+						.pi_source_node_first = -1,
+						.pi_source_node_last = -1,
+						.pending_predicate_mask = predicate_mask,
+						.local_pi_first = entry->local_pi_first,
+						.local_pi_last = entry->local_pi_last,
+						.valid = true
+					};
+					memset(&binding, 0, sizeof(binding));
+					if (entry->local_pi_first.source_flags != 0
+						&& cluster_page_wal_ref_read_v1(&entry->local_pi_first,
+							BufTagGetRelFileLocator(&entry->tag), entry->tag.forkNum,
+							entry->tag.blockNum, &binding)) {
+						source_node_first = binding.source.claim.identity.origin_node_id;
+						source_boot_first = binding.source.claim.identity.origin_owner_incarnation;
+					}
+					memset(&binding, 0, sizeof(binding));
+					if (entry->local_pi_last.source_flags != 0
+						&& cluster_page_wal_ref_read_v1(&entry->local_pi_last,
+							BufTagGetRelFileLocator(&entry->tag), entry->tag.forkNum,
+							entry->tag.blockNum, &binding)) {
+						source_node_last = binding.source.claim.identity.origin_node_id;
+						source_boot_last = binding.source.claim.identity.origin_owner_incarnation;
+					}
+					pending_out->pi_source_node_first = source_node_first;
+					pending_out->pi_source_node_last = source_node_last;
+					pending_out->pi_source_boot_first = source_boot_first;
+					pending_out->pi_source_boot_last = source_boot_last;
+					pending_out->pi_source_slot_first = entry->local_pi_first.source_flags & UINT16_C(0x7fff);
+					pending_out->pi_source_slot_last = entry->local_pi_last.source_flags & UINT16_C(0x7fff);
+				}
+			}
+		}
+		if (discard_local && result == CLUSTER_PCM_PI_RELATION_PENDING) {
+			/* Copy the rejected local tuple under the original entry lock.
+			 * The sink only copies backend-local diagnostic bytes. */
+			ClusterKoDiscardDetailV1 detail = {
+				.locator = BufTagGetRelFileLocator(&entry->tag),
+				.forknum = entry->tag.forkNum, .blocknum = entry->tag.blockNum,
+				.slot = entry->registry_slot, .source = CLUSTER_KO_DISCARD_PCM,
+				.state = mode, .refs = pg_atomic_read_u32(&entry->pin_count),
+				.flags = pg_atomic_read_u32(&entry->wait_refcount),
+				.predicate_mask = predicate_mask, .projection = pending_projection,
+				.current_holder_node = entry->x_holder_node,
+				.s_holders = s_holders, .s_holder_refs = entry->s_holder_refcount_local,
+				.local_owner_state = entry->resource_x_local_owner.state,
+				.round_phase = entry->resource_x_bootstrap_round.phase,
+				.send_pending = entry->resource_x_bootstrap_round.send.pending,
+				.delivery_buffer_id_plus_one = entry->resource_x_bootstrap_round.delivery_target.buffer_id_plus_one,
+				.delivery_executor_purpose = entry->resource_x_bootstrap_round.delivery_executor_purpose,
+				.revision = entry->local_pi_revision,
+				.value = pg_atomic_read_u32(&entry->transport_refcount),
+				.value2 = entry->resource_x_local_owner.state, .valid = true
+			};
+			cluster_ko_origin_discard_detail_v1(&detail);
+		}
 		LWLockRelease(&entry->entry_lock.lock);
 		if (result != CLUSTER_PCM_PI_RELATION_MORE)
 			break;
@@ -10973,6 +11720,56 @@ done:
 	if (result != CLUSTER_PCM_PI_RELATION_INVALID)
 		*cursor = position;
 	return result;
+}
+
+ClusterPcmPiRelationScanV2
+cluster_pcm_lock_pi_relation_scan_v2(RelFileLocator locator, uint64 formation, uint32 budget,
+									 uint32 *cursor)
+{
+	return pcm_pi_relation_scan(locator, formation, budget, cursor, false);
+}
+
+ClusterPcmPiRelationScanV2
+cluster_pcm_lock_ko_relation_scan_v3(RelFileLocator locator, uint64 formation, uint32 budget,
+									 uint32 *cursor)
+{
+	return pcm_pi_relation_scan(locator, formation, budget, cursor, true);
+}
+
+ClusterPcmPiRelationScanV2
+cluster_pcm_lock_ko_local_relation_scan_v3(RelFileLocator locator, uint64 formation, uint32 budget,
+										   uint32 *cursor)
+{
+	return pcm_pi_relation_scan_role(locator, formation, budget, cursor, true,
+																 PCM_RELATION_SCAN_LOCAL, false, NULL);
+}
+
+/* The original committed-object owner calls this after physical discard.
+ * Consume only jointly proven terminal local responsibilities. In-flight
+ * local/protocol work remains PENDING; master directory history stays AM03. */
+ClusterPcmPiRelationScanV2
+cluster_pcm_lock_ko_local_relation_discard_v4(RelFileLocator locator, uint64 formation,
+											  uint32 budget, uint32 *cursor)
+{
+	return pcm_pi_relation_scan_role(locator, formation, budget, cursor, true,
+		PCM_RELATION_SCAN_LOCAL, true, NULL);
+}
+
+ClusterPcmPiRelationScanV2
+cluster_pcm_lock_ko_local_relation_scan_v3_identity(RelFileLocator locator, uint64 formation,
+																 uint32 budget, uint32 *cursor,
+																 ClusterPcmPiPendingIdentityV1 *pending_out)
+{
+	return pcm_pi_relation_scan_role(locator, formation, budget, cursor, true,
+																 PCM_RELATION_SCAN_LOCAL, false, pending_out);
+}
+
+ClusterPcmPiRelationScanV2
+cluster_pcm_lock_ko_directory_relation_scan_v3(RelFileLocator locator, uint64 formation,
+											   uint32 budget, uint32 *cursor)
+{
+	return pcm_pi_relation_scan_role(locator, formation, budget, cursor, true,
+																 PCM_RELATION_SCAN_DIRECTORY, false, NULL);
 }
 
 /* All potentially allocating proof work precedes directory locks. Only the
@@ -12454,6 +13251,9 @@ cluster_pcm_lock_resource_x_delivery_claim_begin_exact(const ResourceXAcquisitio
 	ClusterPcmResourceXBootstrapRound *round;
 	ResourceXApplyResult result;
 	bool expired;
+	RelFileLocator locator;
+	uint64 object_revision = 0;
+	bool check_object;
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
@@ -12461,6 +13261,11 @@ cluster_pcm_lock_resource_x_delivery_claim_begin_exact(const ResourceXAcquisitio
 		|| target->buffer_id_plus_one == 0 || now_us == 0 || now_us == UINT64_MAX
 		|| (purpose != RESOURCE_X_DELIVERY_NORMAL && purpose != RESOURCE_X_DELIVERY_CLEANUP))
 		return RESOURCE_X_APPLY_INVALID;
+	locator = BufTagGetRelFileLocator(&ref->assertion.resource);
+	check_object = cluster_shared_config && cluster_interconnect_tier == CLUSTER_IC_TIER_1
+				   && cluster_smgr_which_for(locator, InvalidBackendId) == 1;
+	if (check_object)
+		(void)cluster_ko_peer_delivery_begin_v3(locator, &object_revision);
 	if (!pcm_entry_ref_acquire(&ref->assertion.resource, false, &entry_ref, &acquire_result))
 		return RESOURCE_X_APPLY_NOT_FOUND;
 	LWLockAcquire(&entry_ref.entry->entry_lock.lock, LW_EXCLUSIVE);
@@ -12484,7 +13289,12 @@ cluster_pcm_lock_resource_x_delivery_claim_begin_exact(const ResourceXAcquisitio
 			   || (round->failed_attempt_floor >= ref->acquisition_generation
 				   && round->head_failure_reason != RESOURCE_X_HEAD_NO_PROGRESS_EXPIRED))
 		result = RESOURCE_X_APPLY_BAD_STATE;
+	else if (check_object && !cluster_ko_peer_delivery_current_v3(object_revision))
+		result = RESOURCE_X_APPLY_BAD_STATE;
 	else {
+		/* Only the exact already-retained target can reach this point.  Its
+		 * round and delivery reference remain local drain work until the
+		 * original completion/cleanup owner retires them. */
 		if (purpose == RESOURCE_X_DELIVERY_CLEANUP)
 			pcm_resource_x_head_fail_locked(entry_ref.entry, RESOURCE_X_HEAD_NO_PROGRESS_EXPIRED);
 		pcm_resource_x_head_margin_note(round, now_us);
@@ -13019,6 +13829,10 @@ cluster_pcm_lock_resource_x_caller_observe_exact(const ResourceXAssertion *asser
 	PcmEntryAcquireResult acquire_result;
 	ClusterPcmResourceXBootstrapRound *round;
 	ResourceXApplyResult result;
+	ClusterKoCurrentAdmissionV3 object_admission;
+	RelFileLocator locator;
+	bool check_object;
+	bool sampled = false;
 
 	if (caller == NULL || !resource_x_assertion_valid(assertion)
 		|| assertion->requester_node != cluster_node_id || resource_formation == 0
@@ -13031,6 +13845,17 @@ cluster_pcm_lock_resource_x_caller_observe_exact(const ResourceXAssertion *asser
 	if (!pcm_resource_x_caller_namespace_matches(caller, assertion, resource_formation,
 												 master_session_incarnation, r4_record_generation))
 		return RESOURCE_X_APPLY_STALE;
+	/* This observer can perform the first caller binding, before the
+	 * exclusive step. History alone is not an object-admission receipt. */
+	locator = BufTagGetRelFileLocator(&assertion->resource);
+	check_object = caller->joined_request.assertion_sequence == 0 && cluster_shared_config
+				   && cluster_interconnect_tier == CLUSTER_IC_TIER_1
+				   && cluster_smgr_which_for(locator, InvalidBackendId) == 1;
+	if (check_object)
+		sampled = cluster_ko_peer_current_begin_v3(locator, BufTagGetForkNum(&assertion->resource),
+												   assertion->resource.blockNum, &object_admission);
+	if (check_object && !sampled)
+		return RESOURCE_X_APPLY_BAD_STATE;
 	if (!pcm_entry_ref_acquire(&assertion->resource, false, &entry_ref, &acquire_result))
 		return caller->joined_request.assertion_sequence == 0 ? RESOURCE_X_APPLY_APPLIED
 															  : RESOURCE_X_APPLY_STALE;
@@ -13042,6 +13867,11 @@ cluster_pcm_lock_resource_x_caller_observe_exact(const ResourceXAssertion *asser
 			|| round->master_session_incarnation != master_session_incarnation
 			|| round->r4_record_generation != r4_record_generation))
 		result = RESOURCE_X_APPLY_STALE;
+	else if (check_object
+			 && !cluster_ko_peer_current_valid_v3(&object_admission, locator,
+												  BufTagGetForkNum(&assertion->resource),
+												  assertion->resource.blockNum))
+		result = RESOURCE_X_APPLY_BAD_STATE;
 	else
 		result = pcm_resource_x_caller_observe_locked(entry_ref.entry, caller);
 	LWLockRelease(&entry_ref.entry->entry_lock.lock);
@@ -13728,6 +14558,10 @@ pcm_resource_x_bootstrap_round_step_internal(
 	bool broadcast = false;
 	bool diagnostic_identity_match = false;
 	ResourceXApplyResult caller_history;
+	ClusterKoCurrentAdmissionV3 object_admission;
+	RelFileLocator locator;
+	bool check_object;
+	bool sampled = false;
 
 	pcm_rx_last_step_head_failure = RESOURCE_X_HEAD_FAILURE_NONE;
 	if (dispatch_out == NULL || terminal_ref_out == NULL)
@@ -13763,6 +14597,13 @@ pcm_resource_x_bootstrap_round_step_internal(
 				|| caller->master_ingress_connection_generation
 					   != master_ingress_connection_generation)))
 		return RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
+
+	locator = BufTagGetRelFileLocator(&assertion->resource);
+	check_object = cluster_shared_config && cluster_interconnect_tier == CLUSTER_IC_TIER_1
+				   && cluster_smgr_which_for(locator, InvalidBackendId) == 1;
+	if (check_object)
+		sampled = cluster_ko_peer_current_begin_v3(locator, BufTagGetForkNum(&assertion->resource),
+												   assertion->resource.blockNum, &object_admission);
 
 	if (!pcm_entry_ref_acquire(&assertion->resource, allow_create, &entry_ref, &acquire_result)) {
 		if (allow_create && acquire_result == PCM_ENTRY_ACQUIRE_NO_CAPACITY)
@@ -13808,6 +14649,24 @@ pcm_resource_x_bootstrap_round_step_internal(
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
 		return RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
+	}
+	/* Serialize new caller/round acceptance with the existing entry, not
+	 * merely EMPTY->REQUEST. In particular, a cached terminal cover cannot
+	 * admit a new writer. Exact already-joined in-flight work retains its
+	 * original continuation/retirement owner; do not fail or cancel its head.
+	 * A later writer-use check is still required before content mutation. */
+	if (check_object
+		&& (caller == NULL || caller->joined_request.assertion_sequence == 0
+			|| round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
+			|| round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
+			|| round->phase == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED)
+		&& (!sampled
+			|| !cluster_ko_peer_current_valid_v3(&object_admission, locator,
+												 BufTagGetForkNum(&assertion->resource),
+												 assertion->resource.blockNum))) {
+		LWLockRelease(&entry->entry_lock.lock);
+		pcm_entry_ref_release(&entry_ref);
+		return RESOURCE_X_BOOTSTRAP_ROUND_BACKPRESSURE;
 	}
 	if (pcm_resource_x_caller_observe_locked(entry, caller) != RESOURCE_X_APPLY_APPLIED) {
 		LWLockRelease(&entry->entry_lock.lock);

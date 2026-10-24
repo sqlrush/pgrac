@@ -32,6 +32,8 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_hw_lease.h"
+#include "cluster/cluster_ko.h"
+#include "cluster/storage/cluster_smgr.h"
 #include "cluster/cluster_shmem.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -109,6 +111,20 @@ lease_slot_find(RelFileLocator rloc, ForkNumber fork)
 	return NULL;
 }
 
+/* A parked range is already materialized. Refusing to park or consume it
+ * does not undo its durable reservation: the original extension/drain owner
+ * still owns that range. Sample outside the lease lock, then revalidate at
+ * the original slot mutation; never acquire the KO lock inside it. */
+static bool
+lease_object_admission_sample(RelFileLocator locator, ClusterKoPeerAdmissionV3 *sample)
+{
+	if (!cluster_shared_config || cluster_interconnect_tier != CLUSTER_IC_TIER_1
+		|| cluster_smgr_which_for(locator, InvalidBackendId) != 1)
+		return false;
+	(void)cluster_ko_peer_admission_begin_v3(locator, sample);
+	return true;
+}
+
 /*
  * cluster_hw_lease_install -- park [start, start+len) as this node's
  * lease for (rloc, fork).
@@ -124,11 +140,18 @@ void
 cluster_hw_lease_install(RelFileLocator rloc, ForkNumber fork, BlockNumber start, uint32 len)
 {
 	ClusterHwLeaseSlot *slot;
+	ClusterKoPeerAdmissionV3 admission;
+	bool check_object;
 
 	if (len == 0 || !cluster_hw_lease_active())
 		return;
 
+	check_object = lease_object_admission_sample(rloc, &admission);
 	LWLockAcquire(&ClusterHwLeaseCtl->lock.lock, LW_EXCLUSIVE);
+	if (check_object && !cluster_ko_peer_admission_current_v3(&admission, rloc)) {
+		LWLockRelease(&ClusterHwLeaseCtl->lock.lock);
+		return;
+	}
 
 	slot = lease_slot_find(rloc, fork);
 	if (slot == NULL) {
@@ -178,11 +201,18 @@ cluster_hw_lease_next_block(RelFileLocator rloc, ForkNumber fork)
 {
 	ClusterHwLeaseSlot *slot;
 	BlockNumber blk = InvalidBlockNumber;
+	ClusterKoPeerAdmissionV3 admission;
+	bool check_object;
 
 	if (!cluster_hw_lease_active())
 		return InvalidBlockNumber;
 
+	check_object = lease_object_admission_sample(rloc, &admission);
 	LWLockAcquire(&ClusterHwLeaseCtl->lock.lock, LW_EXCLUSIVE);
+	if (check_object && !cluster_ko_peer_admission_current_v3(&admission, rloc)) {
+		LWLockRelease(&ClusterHwLeaseCtl->lock.lock);
+		return InvalidBlockNumber;
+	}
 	slot = lease_slot_find(rloc, fork);
 	if (slot != NULL && slot->next_block < slot->end_block) {
 		blk = slot->next_block++;

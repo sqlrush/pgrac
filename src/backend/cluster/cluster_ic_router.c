@@ -85,6 +85,7 @@ static const ClusterICEnvelope *data_dispatch_envelope;
 typedef struct ClusterICDispatchScope {
 	const ClusterICEnvelope *envelope;
 	volatile bool pending;
+	ClusterICControlIngress control_ingress;
 } ClusterICDispatchScope;
 static ClusterICDispatchScope *dispatch_scope;
 
@@ -335,15 +336,28 @@ cluster_ic_dispatch_data_admitted(const ClusterICEnvelope *env)
 	return env != NULL && env == data_dispatch_envelope;
 }
 
-ClusterICDispatchResult
-cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, int32 peer_id)
+bool
+cluster_ic_dispatch_control_ingress(const ClusterICEnvelope *env, ClusterICControlIngress *out)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || env == NULL || dispatch_scope == NULL || dispatch_scope->envelope != env
+		|| dispatch_scope->control_ingress.serial == 0)
+		return false;
+	*out = dispatch_scope->control_ingress;
+	return true;
+}
+
+static ClusterICDispatchResult
+dispatch_envelope(const ClusterICEnvelope *env, const void *payload, int32 peer_id,
+				  const ClusterICControlIngress *ingress)
 {
 	const ClusterICMsgTypeInfo *info;
 	MemoryContext old_ctx;
 	MemoryContext dispatch_ctx;
 	ClusterXpScope xps; /* PGRAC: spec-5.59 D6 profiling */
 	const ClusterICEnvelope *previous_data_envelope = data_dispatch_envelope;
-	ClusterICDispatchScope scope = { env, false };
+	ClusterICDispatchScope scope = { .envelope = env };
 	ClusterICDispatchScope *previous_scope = dispatch_scope;
 
 	if (env == NULL)
@@ -422,6 +436,15 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 			return pending ? CLUSTER_IC_DISPATCH_PENDING : CLUSTER_IC_DISPATCH_DONE;
 	}
 
+	/* Only the actual CONTROL receive owner can attach this local stamp.
+	 * An ordinary/nested/chunked dispatch has no inherited stream identity. */
+	if (ingress != NULL && (ClusterICPlane)info->plane == CLUSTER_IC_PLANE_CONTROL
+		&& MyBackendType == B_LMON && MyProcPid > 0 && ingress->owner_pid == MyProcPid
+		&& ingress->serial != 0 && ingress->serial != UINT64_MAX && ingress->epoch != 0
+		&& ingress->epoch == env->epoch && peer_id >= 0 && ingress->source_node == peer_id
+		&& env->source_node_id == (uint32)peer_id && ingress->carrier == CLUSTER_IC_CONTROL_TCP)
+		scope.control_ingress = *ingress;
+
 	/*
 	 * spec-2.3 §3.5 + Q14 + R3 防御层: PG_TRY/PG_CATCH wrap.  Catches
 	 * elevel == ERROR (handler violated §3.5 by raising ERROR) -- LOG
@@ -479,6 +502,19 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 	MemoryContextDelete(dispatch_ctx);
 
 	return scope.pending ? CLUSTER_IC_DISPATCH_PENDING : CLUSTER_IC_DISPATCH_DONE;
+}
+
+ClusterICDispatchResult
+cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, int32 peer_id)
+{
+	return dispatch_envelope(env, payload, peer_id, NULL);
+}
+
+ClusterICDispatchResult
+cluster_ic_dispatch_control_envelope(const ClusterICEnvelope *env, const void *payload,
+									 int32 peer_id, const ClusterICControlIngress *ingress)
+{
+	return dispatch_envelope(env, payload, peer_id, ingress);
 }
 
 

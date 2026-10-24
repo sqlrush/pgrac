@@ -192,24 +192,38 @@ cluster_tt_local_find_binding(TransactionId xid)
 	return -1;
 }
 
+/* Prepare fallible local bookkeeping before reserving an allocator slot.
+ * Otherwise an allocation ERROR can strand an ACTIVE slot with no binding
+ * for the original transaction abort path to find. */
+static void
+cluster_tt_local_prepare_binding_capacity(void)
+{
+	ClusterTTLocalBinding *bindings;
+	uint32 capacity;
+
+	if (cluster_tt_local_binding_count < cluster_tt_local_binding_capacity)
+		return;
+
+	capacity = cluster_tt_local_binding_capacity == 0 ? 8 : cluster_tt_local_binding_capacity * 2;
+	if (cluster_tt_local_bindings == NULL) {
+		Assert(TopTransactionContext != NULL);
+		bindings = (ClusterTTLocalBinding *)MemoryContextAllocZero(
+			TopTransactionContext, sizeof(ClusterTTLocalBinding) * capacity);
+	} else {
+		bindings = (ClusterTTLocalBinding *)repalloc(cluster_tt_local_bindings,
+													 sizeof(ClusterTTLocalBinding) * capacity);
+	}
+
+	/* An allocation ERROR must leave the old table and its capacity intact. */
+	cluster_tt_local_bindings = bindings;
+	cluster_tt_local_binding_capacity = capacity;
+}
+
 static ClusterTTLocalBinding *
 cluster_tt_local_append_binding(void)
 {
-	if (cluster_tt_local_bindings == NULL) {
-		MemoryContext oldcxt;
-
-		Assert(TopTransactionContext != NULL);
-		oldcxt = MemoryContextSwitchTo(TopTransactionContext);
-		cluster_tt_local_binding_capacity = 8;
-		cluster_tt_local_bindings = (ClusterTTLocalBinding *)palloc0(
-			sizeof(ClusterTTLocalBinding) * cluster_tt_local_binding_capacity);
-		MemoryContextSwitchTo(oldcxt);
-	} else if (cluster_tt_local_binding_count == cluster_tt_local_binding_capacity) {
-		cluster_tt_local_binding_capacity *= 2;
-		cluster_tt_local_bindings = (ClusterTTLocalBinding *)repalloc(
-			cluster_tt_local_bindings,
-			sizeof(ClusterTTLocalBinding) * cluster_tt_local_binding_capacity);
-	}
+	Assert(cluster_tt_local_bindings != NULL);
+	Assert(cluster_tt_local_binding_count < cluster_tt_local_binding_capacity);
 
 	memset(&cluster_tt_local_bindings[cluster_tt_local_binding_count], 0,
 		   sizeof(ClusterTTLocalBinding));
@@ -270,6 +284,7 @@ cluster_tt_local_reserve_binding(TransactionId top_xid, uint32 *out_segment_id,
 		uint16 wrap;
 		ClusterCtrcTxnKeyV1 capacity_continuation = { 0 };
 
+		cluster_tt_local_prepare_binding_capacity();
 		for (;;) {
 			bool retained_pressure = false;
 			bool current_drift = false;
@@ -508,13 +523,14 @@ cluster_tt_local_finish_bindings(bool committed, SCN commit_scn)
 			continue;
 		if (committed && b->publish_state == CLUSTER_CANONICAL_TXN_PUBLISHED
 			&& b->terminal_state == CLUSTER_TT_LOCAL_TERMINAL_COMMIT_STAGED)
-			cluster_tt_slot_mark_committed(b->segment_id, b->slot_offset, b->top_xid, commit_scn);
+			cluster_tt_slot_mark_committed(b->segment_id, b->slot_offset, b->top_xid, b->wrap,
+										   commit_scn);
 		else if (!committed
 				 && ((b->publish_state == CLUSTER_CANONICAL_TXN_RESERVED
 					  && b->terminal_state == CLUSTER_TT_LOCAL_TERMINAL_NONE)
 					 || (b->publish_state == CLUSTER_CANONICAL_TXN_PUBLISHED
 						 && b->terminal_state == CLUSTER_TT_LOCAL_TERMINAL_ABORT_DURABLE)))
-			cluster_tt_slot_mark_aborted(b->segment_id, b->slot_offset, b->top_xid);
+			cluster_tt_slot_mark_aborted(b->segment_id, b->slot_offset, b->top_xid, b->wrap);
 	}
 
 	cluster_tt_local_reset_binding();

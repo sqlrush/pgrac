@@ -425,6 +425,19 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 	return CLUSTER_IC_DISPATCH_DONE;
 }
 
+static ClusterICControlIngress ut_control_ingress;
+static unsigned ut_control_ingress_calls;
+ClusterICDispatchResult
+cluster_ic_dispatch_control_envelope(const ClusterICEnvelope *env, const void *payload,
+									 int32 peer_id, const ClusterICControlIngress *ingress)
+{
+	memset(&ut_control_ingress, 0, sizeof(ut_control_ingress));
+	if (ingress != NULL)
+		ut_control_ingress = *ingress;
+	ut_control_ingress_calls++;
+	return cluster_ic_dispatch_envelope(env, payload, peer_id);
+}
+
 ClusterICEnvelopeVerifyResult
 cluster_ic_envelope_accept_and_observe(const ClusterICEnvelope *env, const void *payload,
 									   uint32 payload_len, uint32 self_node_id, int32 peer_id)
@@ -1015,6 +1028,36 @@ UT_TEST(test_pending_receive_retains_original_frame_until_next_pass)
 	UT_ASSERT_EQ(tier1_recv_buf_len[UT_PEER_ID], 0);
 	UT_ASSERT(cluster_ic_tier1_recv_heartbeat_drain(UT_PEER_ID, ut_tx_fd));
 	UT_ASSERT_EQ(ut_dispatch_count, before + 1);
+}
+
+UT_TEST(test_control_ingress_captures_actual_tcp_stream_across_pending)
+{
+	ClusterICEnvelope env = { 0 };
+	ClusterICTier1Stream stream;
+	fd_set rfds;
+	struct timeval tv = { 5, 0 };
+	unsigned before = ut_control_ingress_calls;
+	UT_ASSERT(cluster_ic_tier1_stream_capture(UT_PEER_ID, &stream));
+	env.msg_type = 44;
+	env.epoch = stream.epoch;
+	env.source_node_id = UT_PEER_ID;
+	env.dest_node_id = cluster_node_id;
+	UT_ASSERT_EQ(send(ut_rx_fd, &env, sizeof(env), 0), sizeof(env));
+	FD_ZERO(&rfds);
+	FD_SET(ut_tx_fd, &rfds);
+	UT_ASSERT_EQ(select(ut_tx_fd + 1, &rfds, NULL, NULL, &tv), 1);
+	ut_dispatch_pending = true;
+	UT_ASSERT(cluster_ic_tier1_recv_heartbeat_drain(UT_PEER_ID, ut_tx_fd));
+	UT_ASSERT_EQ(ut_control_ingress_calls, before + 1);
+	UT_ASSERT_EQ(ut_control_ingress.carrier, CLUSTER_IC_CONTROL_TCP);
+	UT_ASSERT_EQ(ut_control_ingress.serial, stream.serial);
+	UT_ASSERT_EQ(ut_control_ingress.owner_pid, stream.owner_pid);
+	UT_ASSERT_EQ(ut_control_ingress.epoch, stream.epoch);
+	UT_ASSERT_EQ(ut_control_ingress.source_node, UT_PEER_ID);
+	ut_dispatch_pending = false;
+	UT_ASSERT(cluster_ic_tier1_recv_heartbeat_drain(UT_PEER_ID, ut_tx_fd));
+	UT_ASSERT_EQ(ut_control_ingress_calls, before + 2);
+	UT_ASSERT_EQ(ut_control_ingress.serial, stream.serial);
 }
 
 UT_TEST(test_stream_reconnect_is_not_same_epoch_or_diagnostic_identity)
@@ -1847,7 +1890,7 @@ int
 main(void)
 {
 	MyProcPid = getpid();
-	UT_PLAN(33);
+	UT_PLAN(34);
 
 	UT_RUN(test_stop_poll_requires_initialized_actual_plane_owner);
 	UT_RUN(test_connect_registers_peer_fd);
@@ -1865,6 +1908,7 @@ main(void)
 	UT_RUN(test_stream_reconnect_is_not_same_epoch_or_diagnostic_identity);
 	UT_RUN(test_recv_drain_yields_after_bounded_frames);
 	UT_RUN(test_pending_receive_retains_original_frame_until_next_pass);
+	UT_RUN(test_control_ingress_captures_actual_tcp_stream_across_pending);
 	UT_RUN(test_empty_and_partial_receive_do_not_renew_heartbeat);
 	UT_RUN(test_stop_poll_real_partial_envelope_and_payload);
 	UT_RUN(test_stop_poll_malformed_state_overrides_earlier_pending);

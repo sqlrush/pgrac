@@ -354,6 +354,7 @@ gcs_block_slot_clear_current_mx_expectation(ClusterGcsBlockOutstandingSlot *slot
 }
 
 static ClusterGcsBlockBackendBlock *gcs_block_backend_blocks = NULL;
+static ClusterGcsUndoVerdictPathCounters gcs_undo_verdict_path_counters;
 
 /*
  * Count only live requester slots whose closed domain is R4_CR.  LMON uses
@@ -5179,6 +5180,7 @@ cluster_gcs_block_r4_tx_resolve_fetch_and_wait_trace_impl(
 		|| !uba_decode(locator->uba, &segment_id, &block_no, &tt_slot_offset, &row_offset)
 		|| block_no == 0 || uba_origin_node_id(locator->uba) != (NodeId)origin_node)
 		return CLUSTER_TX_UNKNOWN;
+	gcs_undo_verdict_path_counters.r4_tx_resolve.calls++;
 	tag = GcsBlockUndoFetchTagMake(segment_id, block_no);
 	slot = gcs_block_try_reserve_r4_slot(tag, formation_epoch, origin_node, &request_id);
 	if (slot == NULL)
@@ -5203,6 +5205,10 @@ cluster_gcs_block_r4_tx_resolve_fetch_and_wait_trace_impl(
 			ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
 			instr_time started;
 
+			/* Accepted logical exchange, including later timeout or ERROR.
+			 * Local CV wakes and physical retransmits are not counted here. */
+			gcs_undo_verdict_path_counters.r4_tx_resolve.request_enqueues++;
+			gcs_undo_verdict_path_counters.r4_tx_resolve.sync_exchanges++;
 			INSTR_TIME_SET_CURRENT(started);
 			ConditionVariablePrepareToSleep(&slot->reply_cv);
 			for (;;) {
@@ -5219,6 +5225,7 @@ cluster_gcs_block_r4_tx_resolve_fetch_and_wait_trace_impl(
 				LWLockRelease(&blk->lock.lock);
 				if (have_reply) {
 					got_reply = true;
+					gcs_undo_verdict_path_counters.r4_tx_resolve.matched_replies++;
 					break;
 				}
 				if (stale)
@@ -5252,6 +5259,7 @@ cluster_gcs_block_r4_tx_resolve_fetch_and_wait_trace_impl(
 			reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
 			goto tx_done;
 		}
+		gcs_undo_verdict_path_counters.r4_tx_resolve.verified_replies++;
 		decoded.authority.live_hwm_lsn = (XLogRecPtr)slot->reply_header.page_lsn;
 		cluster_scn_observe(decoded.commit_scn);
 		cluster_scn_observe(decoded.horizon_scn);
@@ -5578,6 +5586,34 @@ cluster_r4_source_cr_dispatch(ClusterR4SourceCrOp op, const ClusterR4SourceCrReq
 }
 
 
+static ClusterGcsUndoHeaderPathCounters gcs_undo_header_path_counters;
+
+void
+cluster_gcs_block_undo_header_counters_reset(void)
+{
+	memset(&gcs_undo_header_path_counters, 0, sizeof(gcs_undo_header_path_counters));
+}
+
+void
+cluster_gcs_block_undo_header_counters_snapshot(ClusterGcsUndoHeaderPathCounters *out)
+{
+	if (out != NULL)
+		*out = gcs_undo_header_path_counters;
+}
+
+void
+cluster_gcs_block_undo_verdict_counters_reset(void)
+{
+	memset(&gcs_undo_verdict_path_counters, 0, sizeof(gcs_undo_verdict_path_counters));
+}
+
+void
+cluster_gcs_block_undo_verdict_counters_snapshot(ClusterGcsUndoVerdictPathCounters *out)
+{
+	if (out != NULL)
+		*out = gcs_undo_verdict_path_counters;
+}
+
 /*
  * PGRAC: spec-6.12i D-i1 — requester-side undo-TT fetch.
  *
@@ -5610,6 +5646,7 @@ cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id, u
 	if (dst_page == NULL || auth_out == NULL || origin_node < 0 || origin_node == cluster_node_id)
 		return false;
 
+	gcs_undo_header_path_counters.calls++;
 	memset(auth_out, 0, sizeof(*auth_out));
 	tag = GcsBlockUndoFetchTagMake(segment_id, block_no);
 
@@ -5657,6 +5694,8 @@ cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id, u
 						   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 						   cluster_node_id)));
 
+		gcs_undo_header_path_counters.request_enqueues++;
+		gcs_undo_header_path_counters.sync_exchanges++;
 		deadline = GetCurrentTimestamp()
 				   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
 
@@ -5670,6 +5709,7 @@ cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id, u
 			have_reply = slot->in_use && slot->reply_received;
 			LWLockRelease(&blk->lock.lock);
 			if (have_reply) {
+				gcs_undo_header_path_counters.matched_replies++;
 				got_reply = true;
 				break;
 			}
@@ -5698,6 +5738,7 @@ cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id, u
 				/* spec-5.14 D2: the authority is the origin's volatile
 				 * co-sample — depend on it for fail-stop (D-i3). */
 				gcs_block_stamp_touched(origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+				gcs_undo_header_path_counters.successful_fetches++;
 				fetched = true;
 			} else {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
@@ -5834,6 +5875,7 @@ gcs_block_undo_verdict_wire_exchange_trace_impl(
 	ClusterGcsUndoVerdictPage *page_out, uint64 *tt_generation_out, uint64 *authority_scn_out)
 {
 	ClusterGcsBlockOutstandingSlot *slot;
+	ClusterGcsUndoVerdictExchangeCounters *counters;
 	uint64 request_id = 0;
 	GcsBlockForwardPayload fwd;
 	bool got_reply = false;
@@ -5844,6 +5886,11 @@ gcs_block_undo_verdict_wire_exchange_trace_impl(
 
 	if (freshref_pair && (!authoritative || authority_kind))
 		return false;
+
+	counters = freshref_pair	? &gcs_undo_verdict_path_counters.freshref_c1b_pair
+			   : authority_kind ? &gcs_undo_verdict_path_counters.authority_verdict
+								: &gcs_undo_verdict_path_counters.owner_verdict;
+	counters->calls++;
 
 	cluster_gcs_block_dedup_register_backend_exit_hook();
 	slot = gcs_block_reserve_slot(tag, (uint8)PCM_TRANS_N_TO_S, cluster_node_id, &request_id);
@@ -5910,6 +5957,8 @@ gcs_block_undo_verdict_wire_exchange_trace_impl(
 						   cluster_node_id)));
 		}
 
+		counters->request_enqueues++;
+		counters->sync_exchanges++;
 		deadline = GetCurrentTimestamp()
 				   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
 
@@ -5928,6 +5977,7 @@ gcs_block_undo_verdict_wire_exchange_trace_impl(
 			}
 			LWLockRelease(&blk->lock.lock);
 			if (have_reply) {
+				counters->matched_replies++;
 				got_reply = true;
 				break;
 			}
@@ -5961,6 +6011,7 @@ gcs_block_undo_verdict_wire_exchange_trace_impl(
 				 * carriers (the acceptance policy stays in the wrappers). */
 				if (authority_scn_out != NULL)
 					*authority_scn_out = slot->reply_undo_authority_scn;
+				counters->verified_replies++;
 				fetched = true;
 			} else {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);

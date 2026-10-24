@@ -153,6 +153,43 @@ extern void cluster_mxid_stripe_lazy_latch(void);
  */
 extern FullTransactionId cluster_xid_stripe_my_slot_floor(void);
 
+/* Volatile observation of the original activation/claim and durable lease.
+ * Same-incarnation extensions preserve the captured interval. This is only a
+ * component of the full admission/cohort fence, never freeze authority. */
+typedef struct ClusterXidStripeSampleFence {
+	uint64 activation_floor_full;
+	uint64 activation_epoch;
+	uint64 activation_generation;
+	uint64 slot_floor_full;
+	uint64 slot_owner_incarnation;
+	uint64 incarnation;
+	uint64 lease_floor_full;
+	uint64 lease_limit_full;
+	int slot;
+} ClusterXidStripeSampleFence;
+
+/* Caller holds XidGenLock while capturing reference. Failure clears both
+ * outputs. No allocation, lease wait, or F publication. */
+extern bool cluster_xid_stripe_sample_future(FullTransactionId reference, FullTransactionId *future,
+											 ClusterXidStripeSampleFence *fence);
+/* Call after releasing native/census locks; no XidGenLock is required. */
+extern bool cluster_xid_stripe_sample_fence_current(const ClusterXidStripeSampleFence *fence);
+
+struct ClusterSemanticActiveSampleFence;
+typedef enum ClusterXidStripeMaintenanceResult {
+	CLUSTER_XID_STRIPE_MAINTENANCE_PENDING,
+	CLUSTER_XID_STRIPE_MAINTENANCE_DURABLE,
+	CLUSTER_XID_STRIPE_MAINTENANCE_IDENTITY_CHANGED,
+	CLUSTER_XID_STRIPE_MAINTENANCE_UNAVAILABLE
+} ClusterXidStripeMaintenanceResult;
+
+/* Explicit maintenance intent only. Caller releases native/census locks first.
+ * QVOTEC alone syncs the original slot and arms the original allocation floor.
+ * Neither PENDING nor DURABLE authorizes freezing or retiring an ACTIVE xid. */
+extern ClusterXidStripeMaintenanceResult
+cluster_xid_stripe_request_maintenance(const struct ClusterSemanticActiveSampleFence *identity,
+									   const ClusterXidStripeSampleFence *stripe,
+									   FullTransactionId requested);
 /* Shared allocation consumes only majority-durable reservations. Waiting
  * callers must release XidGenLock and rederive the candidate on return. */
 extern bool cluster_xid_stripe_lease_ready(FullTransactionId candidate);

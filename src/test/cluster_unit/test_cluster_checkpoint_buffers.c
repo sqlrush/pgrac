@@ -20,7 +20,7 @@ UT_DEFINE_GLOBALS();
 #define NB 4
 
 int NBuffers = NB, checkpoint_flush_after;
-bool cluster_shared_config = true;
+bool cluster_enabled = true, cluster_shared_config = true;
 static BufferDescPadded descriptors[NB];
 BufferDescPadded *BufferDescriptors = descriptors;
 static ConditionVariableMinimallyPadded cvs[NB];
@@ -36,6 +36,7 @@ static Latch latch;
 Latch *MyLatch = &latch;
 static sigjmp_buf error_boundary;
 static bool allow_pin[NB], retained[NB], content[NB];
+static bool defer_flush[NB], clean_on_lock;
 static unsigned pins[NB], flushes[NB], probe[NB], waits, absorbs, writebacks;
 static unsigned release_at;
 static bool cancel_wait, peer_write, recycle_peer, error_write, retain_on_lock, fresh_dirty;
@@ -120,6 +121,9 @@ LWLockAcquire(LWLock *l, LWLockMode mode)
 			content[i] = true;
 			if (retain_on_lock && i == 0)
 				retained[i] = true;
+			if (clean_on_lock && i == 0)
+				pg_atomic_fetch_and_u32(&GetBufferDescriptor(i)->state,
+									   ~(BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED));
 			return true;
 		}
 	abort();
@@ -158,16 +162,33 @@ void
 ConditionVariableBroadcast(ConditionVariable *cv pg_attribute_unused())
 {}
 static void
-FlushBuffer(BufferDesc *b, SMgrRelation r pg_attribute_unused(), IOObject object, IOContext context)
+fixture_flush(BufferDesc *b, IOObject object, IOContext context, volatile bool *attempted)
 {
 	uint32 s = LockBufHdr(b);
 	UT_ASSERT(pins[b->buf_id] == 1 && content[b->buf_id]);
 	UT_ASSERT(object == IOOBJECT_RELATION && context == IOCONTEXT_NORMAL);
+	if (defer_flush[b->buf_id] || (s & BM_DIRTY) == 0) {
+		UnlockBufHdr(b, s);
+		return;
+	}
+	if (attempted != NULL)
+		*attempted = true;
 	if (error_write)
 		siglongjmp(error_boundary, 2);
 	flushes[b->buf_id]++;
 	UnlockBufHdr(b, (s | BM_IO_IN_PROGRESS) & ~BM_JUST_DIRTIED);
 	TerminateBufferIO(b, true, 0);
+}
+static void
+FlushBuffer(BufferDesc *b, SMgrRelation r pg_attribute_unused(), IOObject object, IOContext context)
+{
+	fixture_flush(b, object, context, NULL);
+}
+static void
+FlushBufferWithAttempt(BufferDesc *b, SMgrRelation r pg_attribute_unused(), IOObject object,
+					   IOContext context, volatile bool *attempted)
+{
+	fixture_flush(b, object, context, attempted);
 }
 void
 WritebackContextInit(WritebackContext *w, int *max)
@@ -251,6 +272,7 @@ WaitLatch(Latch *l, int e, long timeout, uint32 event)
 		for (i = 0; i < NB; i++) {
 			allow_pin[i] = true;
 			retained[i] = false;
+			defer_flush[i] = false;
 		}
 		retain_on_lock = false;
 		if (peer_write) {
@@ -279,6 +301,7 @@ fixture(void)
 	memset(pins, 0, sizeof(pins));
 	memset(content, 0, sizeof(content));
 	memset(retained, 0, sizeof(retained));
+	memset(defer_flush, 0, sizeof(defer_flush));
 	memset(probe, 0, sizeof(probe));
 	memset(flushes, 0, sizeof(flushes));
 	memset(&CheckpointStats, 0, sizeof(CheckpointStats));
@@ -295,7 +318,8 @@ fixture(void)
 										  | (i < 2 ? BM_DIRTY | BM_JUST_DIRTIED : 0));
 		allow_pin[i] = true;
 	}
-	cluster_shared_config = true;
+	cluster_enabled = cluster_shared_config = true;
+	clean_on_lock = false;
 	cancel_wait = peer_write = recycle_peer = error_write = retain_on_lock = fresh_dirty = false;
 	waits = absorbs = writebacks = 0;
 	release_at = 2;
@@ -385,16 +409,97 @@ UT_TEST(test_io_error_cannot_complete)
 	UT_ASSERT_EQ(CheckpointStats.ckpt_bufs_written, 0);
 	/* Real PG abort owns pin/lock cleanup after I/O ERROR; not mocked as success. */
 }
+
+UT_TEST(test_shared_sync_deferred_write_keeps_native_work)
+{
+	WritebackContext wb;
+	uint32 state;
+
+	fixture();
+	WritebackContextInit(&wb, &checkpoint_flush_after);
+	pg_atomic_fetch_or_u32(&GetBufferDescriptor(0)->state, BM_CHECKPOINT_NEEDED);
+	defer_flush[0] = true;
+	UT_ASSERT_EQ(SyncOneBuffer(0, true, &wb), 0);
+	state = pg_atomic_read_u32(&GetBufferDescriptor(0)->state);
+	UT_ASSERT(state & BM_DIRTY);
+	UT_ASSERT(state & BM_CHECKPOINT_NEEDED);
+	UT_ASSERT_EQ(flushes[0], 0);
+	UT_ASSERT_EQ(writebacks, 0);
+	assert_unheld();
+	defer_flush[0] = false;
+	UT_ASSERT_EQ(SyncOneBuffer(0, true, &wb), BUF_WRITTEN | BUF_REUSABLE);
+	UT_ASSERT(!needed(0));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&GetBufferDescriptor(0)->state) & BM_DIRTY, 0);
+	UT_ASSERT_EQ(flushes[0], 1);
+	UT_ASSERT_EQ(writebacks, 1);
+	assert_unheld();
+}
+
+UT_TEST(test_shared_checkpoint_deferred_write_resumes_exact_set)
+{
+	fixture();
+	defer_flush[0] = true;
+	fresh_dirty = true;
+	BufferSync(CHECKPOINT_IMMEDIATE);
+	UT_ASSERT_EQ(waits, 2);
+	UT_ASSERT_EQ(flushes[0], 1);
+	UT_ASSERT_EQ(flushes[1], 1);
+	UT_ASSERT_EQ(flushes[3], 0);
+	UT_ASSERT(pg_atomic_read_u32(&GetBufferDescriptor(3)->state) & BM_DIRTY);
+	UT_ASSERT(!needed(0) && !needed(1));
+	UT_ASSERT_EQ(CheckpointStats.ckpt_bufs_written, 2);
+	UT_ASSERT_EQ(PendingCheckpointerStats.buf_written_checkpoints, 2);
+	UT_ASSERT_EQ(writebacks, 2);
+	assert_unheld();
+}
+
+UT_TEST(test_shared_sync_concurrent_completion_is_not_own_write)
+{
+	WritebackContext wb;
+
+	fixture();
+	WritebackContextInit(&wb, &checkpoint_flush_after);
+	clean_on_lock = true;
+	pg_atomic_fetch_or_u32(&GetBufferDescriptor(0)->state, BM_CHECKPOINT_NEEDED);
+	UT_ASSERT_EQ(SyncOneBuffer(0, false, &wb), BUF_REUSABLE);
+	UT_ASSERT(!needed(0));
+	UT_ASSERT_EQ(flushes[0], 0);
+	UT_ASSERT_EQ(writebacks, 0);
+	assert_unheld();
+}
+
+UT_TEST(test_shared_deferred_flush_cancel_keeps_marked_obligation)
+{
+	int escaped;
+
+	fixture();
+	defer_flush[0] = cancel_wait = true;
+	escaped = sigsetjmp(error_boundary, 0);
+	if (!escaped)
+		BufferSync(CHECKPOINT_IMMEDIATE);
+	UT_ASSERT_EQ(escaped, 1);
+	UT_ASSERT(needed(0));
+	UT_ASSERT_EQ(flushes[0], 0);
+	UT_ASSERT_EQ(flushes[1], 1);
+	UT_ASSERT_EQ(PendingCheckpointerStats.buf_written_checkpoints, 1);
+	UT_ASSERT_EQ(writebacks, 1);
+	assert_unheld();
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(10);
 	UT_RUN(test_aux_refusal_owned_until_write);
 	UT_RUN(test_retain_after_pin_releases_before_wait);
 	UT_RUN(test_peer_write_and_retag_not_new_obligation);
 	UT_RUN(test_cancel_never_completes_obligation);
 	UT_RUN(test_legacy_pass_and_complete_profile);
 	UT_RUN(test_io_error_cannot_complete);
+	UT_RUN(test_shared_sync_deferred_write_keeps_native_work);
+	UT_RUN(test_shared_checkpoint_deferred_write_resumes_exact_set);
+	UT_RUN(test_shared_sync_concurrent_completion_is_not_own_write);
+	UT_RUN(test_shared_deferred_flush_cancel_keeps_marked_obligation);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

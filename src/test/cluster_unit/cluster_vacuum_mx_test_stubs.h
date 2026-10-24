@@ -23,6 +23,7 @@
 
 #define FAILSAFE_EVERY_PAGES 524288
 #define VACUUM_FSM_EVERY_PAGES 1048576
+#define FIXTURE_VM_BUFFER 1000
 #define pgstat_progress_update_param(...) ((void)0)
 #define pgstat_progress_update_multi_param(n, index, values)                                       \
 	((void)(n), (void)(index), (void)(values))
@@ -39,6 +40,16 @@
 #undef VM_ALL_FROZEN
 #define VM_ALL_FROZEN(...) false
 
+static ClusterHeapFreezeProofStatusV1
+lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
+{
+	(void)recent_buffer;
+	vacrel->shared_freeze_proofs.proof_count = 0;
+	vacrel->shared_freeze_fence_valid = false;
+	vacrel->shared_freeze_apply_status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
+	return CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
+}
+
 static BlockNumber
 lazy_scan_skip(LVRelState *vacrel, Buffer *vm, BlockNumber next, bool *allvis, bool *skip)
 {
@@ -54,7 +65,11 @@ visibilitymap_pin(Relation rel, BlockNumber block, Buffer *vm)
 {
 	(void)rel;
 	(void)block;
-	*vm = InvalidBuffer;
+	if (!BufferIsValid(*vm)) {
+		*vm = FIXTURE_VM_BUFFER;
+		fixture_vm_pins++;
+		fixture_vm_acquires++;
+	}
 }
 
 Buffer
@@ -67,6 +82,7 @@ ReadBufferExtended(Relation rel, ForkNumber fork, BlockNumber block, ReadBufferM
 	(void)strategy;
 	if (fixture_read_error)
 		longjmp(fixture_error, 1);
+	fixture_reads++;
 	fixture_pins++;
 	return block + 1;
 }
@@ -90,23 +106,34 @@ LockBuffer(Buffer buf, int mode)
 void
 LockBufferForCleanup(Buffer buf)
 {
-	(void)buf;
 	fixture_locks++;
+	if (fixture_cleanup_empty)
+		((PageHeader)BufferGetPage(buf))->pd_lower = SizeOfPageHeaderData;
+	if (TransactionIdIsValid(fixture_cleanup_xmin)) {
+		Page page = BufferGetPage(buf);
+		HeapTupleHeader tuple = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, 1));
+
+		HeapTupleHeaderSetXmin(tuple, fixture_cleanup_xmin);
+	}
 }
 
 void
 UnlockReleaseBuffer(Buffer buf)
 {
-	(void)buf;
 	fixture_locks--;
 	fixture_pins--;
+	if (fixture_clear_released_page)
+		memset(BufferGetPage(buf), 0, BLCKSZ);
 }
 
 void
 ReleaseBuffer(Buffer buf)
 {
-	(void)buf;
-	fixture_pins--;
+	if (buf == FIXTURE_VM_BUFFER) {
+		fixture_vm_pins--;
+		fixture_vm_releases++;
+	} else
+		fixture_pins--;
 }
 
 static bool
@@ -132,9 +159,14 @@ lazy_scan_noprune(LVRelState *vacrel, Buffer buf, BlockNumber block, Page page, 
 	(void)block;
 	(void)page;
 	fixture_noprune++;
+	if (!fixture_finish_noprune)
+		return false;
+	if (fixture_noprune_hint)
+		((HeapTupleHeader)PageGetItem(page, PageGetItemId(page, 1)))->t_infomask
+			|= HEAP_XMIN_COMMITTED;
 	vacrel->live_tuples++;
 	*hastup = true;
-	*recordspace = false;
+	*recordspace = fixture_recordspace;
 	return true;
 }
 
@@ -146,9 +178,14 @@ lazy_scan_prune(LVRelState *vacrel, Buffer buf, BlockNumber block, Page page,
 	(void)block;
 	(void)page;
 	fixture_prune++;
+	if (fixture_prune_change == 1)
+		ItemIdSetUnused(PageGetItemId(page, 1));
+	else if (fixture_prune_change == 2)
+		((PageHeader)page)->pd_upper = BLCKSZ;
 	vacrel->live_tuples++;
 	memset(state, 0, sizeof(*state));
 	state->hastup = true;
+	state->has_lpdead_items = fixture_prune_lpdead;
 }
 
 static void
@@ -166,6 +203,8 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber block, Buffer buf, int off
 	(void)offset;
 	(void)vm;
 	fixture_consumed_dead += vacrel->dead_items->num_items;
+	if (fixture_vacuum_change)
+		ItemIdSetUnused(PageGetItemId(BufferGetPage(buf), 3));
 }
 
 static void
@@ -192,3 +231,16 @@ lazy_clear_visibility_versioned(Relation rel, const ClusterSpaceIdentity *identi
 #define vac_estimate_reltuples(rel, pages, scanned, tuples) ((double)(tuples))
 
 #endif /* CLUSTER_VACUUM_MX_TEST_STUBS_H */
+
+/* Existing scan locks are controlled leaves, never Resource-X writer grants. */
+bool
+ClusterBufferCaptureMutationContext(Buffer buffer, ResourceXWriterUseContext *out,
+	uint64 *object_revision, bool *object_checked)
+{
+	(void) buffer;
+	(void) out;
+	(void) object_revision;
+	(void) object_checked;
+	UT_ASSERT(fixture_locks > 0);
+	return false;
+}

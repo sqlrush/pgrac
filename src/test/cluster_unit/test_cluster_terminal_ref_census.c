@@ -310,6 +310,35 @@ test_open_origin(ClusterCtrcOriginEntry *origin)
 				 CLUSTER_CTRC_ORIGIN_OPENED);
 }
 
+UT_TEST(test_ctrc_origin_original_full_xid_requires_exact_live_identity)
+{
+	ClusterCtrcOriginEntry origin;
+	ClusterCtrcTxnKeyV1 key = test_key();
+	ClusterCtrcTxnKeyV1 wrong = key;
+	FullTransactionId expected = FullTransactionIdFromEpochAndXid(4, key.xid);
+	FullTransactionId got = InvalidFullTransactionId;
+
+	test_open_origin(&origin);
+	origin.reservation_generation = 11;
+	origin.original_full_xid = expected;
+	UT_ASSERT(cluster_ctrc_origin_original_full_xid_exact(&origin, &key, &got));
+	UT_ASSERT(FullTransactionIdEquals(got, expected));
+
+	wrong.slot_wrap++;
+	got = InvalidFullTransactionId;
+	UT_ASSERT(!cluster_ctrc_origin_original_full_xid_exact(&origin, &wrong, &got));
+	UT_ASSERT(FullTransactionIdEquals(got, InvalidFullTransactionId));
+	wrong = key;
+	origin.state = CTRC_ORIGIN_BLOCKED;
+	UT_ASSERT(!cluster_ctrc_origin_original_full_xid_exact(&origin, &key, &got));
+	origin.state = CTRC_ORIGIN_OPEN;
+	origin.original_full_xid = FullTransactionIdFromEpochAndXid(4, key.xid + 1);
+	UT_ASSERT(!cluster_ctrc_origin_original_full_xid_exact(&origin, &key, &got));
+	origin.original_full_xid = expected;
+	origin.reservation_generation = 0;
+	UT_ASSERT(!cluster_ctrc_origin_original_full_xid_exact(&origin, &key, &got));
+}
+
 /* MXA L04/L05: the pending origin reservation is owned by one exact
  * generation.  Before BIND it may return to the byte-zero FREE image; after
  * BIND it may only retain as BLOCKED.  A stale or foreign handle must never
@@ -2522,6 +2551,16 @@ UT_TEST(test_ctrc_existing_undo_cleaner_owns_terminal_seal_progress)
 	UT_ASSERT(source_file_contains("src/backend/cluster/cluster_terminal_ref_census.c",
 								   "ctrc_origin_ack_entries()"));
 	UT_ASSERT(source_file_contains("src/backend/cluster/cluster_terminal_ref_census.c",
+								   "#include \"utils/timestamp.h\""));
+	UT_ASSERT(source_file_contains("src/backend/cluster/cluster_terminal_ref_census.c",
+								   "TimestampTz operation_deadline = 0;"));
+	UT_ASSERT(source_file_contains(
+		"src/backend/cluster/cluster_terminal_ref_census.c",
+		"TimestampTzPlusMilliseconds(GetCurrentTimestamp(), cluster_gcs_reply_timeout_ms)"));
+	UT_ASSERT(source_file_contains(
+		"src/backend/cluster/cluster_terminal_ref_census.c",
+		"cluster_multixact_current_members_resolve_until("));
+	UT_ASSERT(source_file_contains("src/backend/cluster/cluster_terminal_ref_census.c",
 								   "CTRC_SEAL_CERTIFICATE_COMMITTED"));
 	UT_ASSERT(source_file_contains("src/backend/cluster/cluster_tt_slot.c",
 								   "cluster_undo_cleaner_wakeup()"));
@@ -3004,7 +3043,7 @@ source_scan_category_known(const char *category)
 		"ITL_STATUS_WRITER",		"TT_STATUS_WRITER",		   "TT_RELEASE_FLAG_WRITER",
 		"CURRENT_SLOT_GC",			"ROLLED_SEGMENT_RECYCLE",  "CURRENT_MX_PROOF_SENDER",
 		"CURRENT_MX_WIRE_DECODER",	"CTRC_TOUCH_BEFORE_PROOF", "CTRC_RECEIPT_LIFECYCLE",
-		"CTRC_CLOSE_WIRE",			"CTRC_RELATION_GATE",	   "CURRENT_MX_TERMINAL_CLEANOUT",
+		"CTRC_ORIGIN_PROVENANCE", "CTRC_CLOSE_WIRE",			"CTRC_RELATION_GATE",	   "CURRENT_MX_TERMINAL_CLEANOUT",
 	};
 	size_t i;
 
@@ -3357,6 +3396,7 @@ int
 main(void)
 {
 	static const CtrcTestCase tests[] = {
+		CTRC_TEST_ENTRY(test_ctrc_origin_original_full_xid_requires_exact_live_identity),
 		CTRC_TEST_ENTRY(test_ctrc_origin_reservation_prebind_cancel_and_postbind_block_are_exact),
 		CTRC_TEST_ENTRY(test_ctrc_origin_reservation_open_duplicate_and_aba_cleanup_do_not_mutate),
 		CTRC_TEST_ENTRY(test_ctrc_released_origin_conflict_is_retryable_without_state_loss),

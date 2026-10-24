@@ -25,6 +25,9 @@
  *		careful....
  */
 #include "postgres.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_catalog_trace.h"
+#endif
 
 #include <sys/file.h>
 #include <fcntl.h>
@@ -384,6 +387,11 @@ ScanPgRelation(Oid targetRelId, bool indexOK, bool force_non_historic)
 									   1, key);
 
 	pg_class_tuple = systable_getnext(pg_class_scan);
+#ifdef USE_PGRAC_CLUSTER
+	if (unlikely(cluster_trace_visibility_enabled))
+		cluster_catalog_trace_catalog("relcache.pg_class", targetRelId, pg_class_tuple,
+									  GetCurrentCommandId(false));
+#endif
 
 	/*
 	 * Must copy tuple before releasing buffer.
@@ -443,6 +451,7 @@ AllocateRelationDesc(Form_pg_class relp)
 
 	/* and allocate attribute tuple form storage */
 	relation->rd_att = CreateTemplateTupleDesc(relationForm->relnatts);
+
 	/* which we mark as a reference-counted tupdesc */
 	relation->rd_att->tdrefcount = 1;
 
@@ -577,6 +586,14 @@ RelationBuildTupleDesc(Relation relation)
 		attp = (Form_pg_attribute) GETSTRUCT(pg_attribute_tuple);
 
 		attnum = attp->attnum;
+#ifdef USE_PGRAC_CLUSTER
+		if (unlikely(cluster_trace_visibility_enabled)) {
+			cluster_catalog_trace_catalog("relcache.pg_attribute", RelationGetRelid(relation),
+										  pg_attribute_tuple, GetCurrentCommandId(false));
+			cluster_catalog_trace_descriptor("relcache.before_attribute", relation, attnum,
+											 GetCurrentCommandId(false));
+		}
+#endif
 		if (attnum <= 0 || attnum > RelationGetNumberOfAttributes(relation))
 			elog(ERROR, "invalid attribute number %d for relation \"%s\"",
 				 attp->attnum, RelationGetRelationName(relation));
@@ -584,6 +601,12 @@ RelationBuildTupleDesc(Relation relation)
 		memcpy(TupleDescAttr(relation->rd_att, attnum - 1),
 			   attp,
 			   ATTRIBUTE_FIXED_PART_SIZE);
+#ifdef USE_PGRAC_CLUSTER
+		if (unlikely(cluster_trace_visibility_enabled))
+			cluster_catalog_trace_descriptor("relcache.after_attribute", relation, attnum,
+											 GetCurrentCommandId(false));
+#endif
+
 
 		/* Update constraint/default info */
 		if (attp->attnotnull)
@@ -1127,6 +1150,11 @@ retry:
 	 * initialize the relation's relation id (relation->rd_id)
 	 */
 	RelationGetRelid(relation) = relid;
+#ifdef USE_PGRAC_CLUSTER
+	if (unlikely(cluster_trace_visibility_enabled))
+		cluster_catalog_trace_descriptor("relcache.allocate", relation, 0,
+										 GetCurrentCommandId(false));
+#endif
 
 	/*
 	 * Normal relations are not nailed into the cache.  Since we don't flush
@@ -3735,6 +3763,10 @@ RelationSetNewRelfilenumber(Relation relation, char persistence)
 	TransactionId freezeXid = InvalidTransactionId;
 	RelFileLocator newrlocator;
 
+	RelationCheckStorageTransaction(relation->rd_locator,
+									relation->rd_rel->relpersistence, "rewrite");
+	RelationCheckStorageDrain(relation->rd_locator, relation->rd_rel->relpersistence, "rewrite");
+
 	if (!IsBinaryUpgrade)
 	{
 		/* Allocate a new relfilenumber */
@@ -3765,6 +3797,10 @@ RelationSetNewRelfilenumber(Relation relation, char persistence)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("unexpected request for new relfilenumber in binary upgrade mode")));
+
+	newrlocator = relation->rd_locator;
+	newrlocator.relNumber = newrelfilenumber;
+	RelationCheckStorageTransaction(newrlocator, persistence, "rewrite");
 
 	/*
 	 * Get a writable copy of the pg_class tuple for the given relation.
@@ -3820,9 +3856,6 @@ RelationSetNewRelfilenumber(Relation relation, char persistence)
 	 * NOTE: If relevant for the AM, any conflict in relfilenumber value will
 	 * be caught here, if GetNewRelFileNumber messes up for any reason.
 	 */
-	newrlocator = relation->rd_locator;
-	newrlocator.relNumber = newrelfilenumber;
-
 	if (RELKIND_HAS_TABLE_AM(relation->rd_rel->relkind))
 	{
 		table_relation_set_new_filelocator(relation, &newrlocator,

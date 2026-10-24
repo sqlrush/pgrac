@@ -21,7 +21,8 @@
 #include "utils/array.h"
 
 /* commands/dropcmds.c */
-extern void RemoveObjects(DropStmt *stmt);
+extern void RemoveObjects(DropStmt *stmt, bool isTopLevel);
+extern void CheckObjectsStorageDrop(DropStmt *stmt, bool isTopLevel);
 
 /* commands/indexcmds.c */
 #ifdef USE_PGRAC_CLUSTER

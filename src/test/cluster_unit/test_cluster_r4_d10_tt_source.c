@@ -91,6 +91,13 @@ static uint16 fake_durable_wrap;
 static uint8 fake_durable_status;
 static bool fake_current_owner_found;
 static ClusterTTSlotCurrentOwner fake_current_owner;
+static int fake_overlay_lock_depth;
+static int fake_current_owner_samples;
+static void (*fake_after_owner_sample)(void);
+static bool fake_next_current_owner_found;
+static ClusterTTSlotCurrentOwner fake_next_current_owner;
+static ClusterTTStatusSourceOp fake_overlay_change_op;
+static ClusterTTStatusSourceRequest fake_overlay_change_request;
 
 static ClusterSemanticAdmissionResult fake_admission;
 static bool fake_recheck;
@@ -316,12 +323,17 @@ add_size(Size size_a, Size size_b)
 bool
 LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
+	UT_ASSERT_EQ(fake_overlay_lock_depth, 0);
+	fake_overlay_lock_depth++;
 	return true;
 }
 
 void
 LWLockRelease(LWLock *lock pg_attribute_unused())
-{}
+{
+	UT_ASSERT_EQ(fake_overlay_lock_depth, 1);
+	fake_overlay_lock_depth--;
+}
 
 void
 LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute_unused())
@@ -428,14 +440,22 @@ cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node, TransactionId 
 bool
 cluster_tt_slot_current_owner_by_xid(int node_id, TransactionId xid, ClusterTTSlotCurrentOwner *out)
 {
+	void (*after_sample)(void) = fake_after_owner_sample;
+
 	UT_ASSERT_EQ(node_id, cluster_node_id);
 	UT_ASSERT(TransactionIdIsNormal(xid));
 	UT_ASSERT(out != NULL);
+	UT_ASSERT_EQ(fake_overlay_lock_depth, 0);
+	fake_current_owner_samples++;
 	memset(out, 0, sizeof(*out));
 	if (!fake_current_owner_found)
 		return false;
 	UT_ASSERT_EQ(fake_current_owner.xid, xid);
 	*out = fake_current_owner;
+	/* Schedule another backend's change after copying the first sample. */
+	fake_after_owner_sample = NULL;
+	if (after_sample != NULL)
+		after_sample();
 	return true;
 }
 
@@ -463,6 +483,12 @@ reset_fixture(void)
 	fake_durable_status = TT_SLOT_INVALID;
 	fake_current_owner_found = false;
 	memset(&fake_current_owner, 0, sizeof(fake_current_owner));
+	fake_overlay_lock_depth = 0;
+	fake_current_owner_samples = 0;
+	fake_after_owner_sample = NULL;
+	fake_next_current_owner_found = false;
+	memset(&fake_next_current_owner, 0, sizeof(fake_next_current_owner));
+	memset(&fake_overlay_change_request, 0, sizeof(fake_overlay_change_request));
 	fake_admission = CLUSTER_SEMANTIC_ADMISSION_OK;
 	fake_recheck = true;
 	fake_enter_count = 0;
@@ -498,6 +524,55 @@ bytes_are_zero(const void *ptr, Size size)
 			return false;
 	}
 	return true;
+}
+
+static void
+install_matching_source_aliases(const ClusterTTStatusKey *canonical,
+							   const ClusterTTStatusKey *data_alias, ClusterTTStatus status,
+							   SCN commit_scn)
+{
+	ClusterTTStatusSourceRequest request;
+	ClusterTTStatusSourceResult result;
+
+	memset(&request, 0, sizeof(request));
+	request.status = status;
+	request.commit_scn = commit_scn;
+	request.key = canonical;
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	request.key = data_alias;
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+
+	fake_current_owner_found = true;
+	fake_current_owner.segment_id = canonical->undo_segment_id;
+	fake_current_owner.xid = canonical->local_xid;
+	fake_current_owner.commit_scn = commit_scn;
+	fake_current_owner.slot_offset = cluster_tt_slot_id_to_offset(canonical->tt_slot_id);
+	fake_current_owner.wrap = 4;
+	fake_current_owner.status = status == CLUSTER_TT_STATUS_COMMITTED ? CTS_COMMITTED : CTS_ACTIVE;
+}
+
+static void
+change_owner_after_sample(void)
+{
+	fake_current_owner_found = fake_next_current_owner_found;
+	fake_current_owner = fake_next_current_owner;
+}
+
+static void
+change_overlay_after_sample(void)
+{
+	ClusterTTStatusSourceResult result;
+
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(fake_overlay_change_op,
+												 &fake_overlay_change_request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
 }
 
 UT_TEST(test_frozen_tt_source_operation_domain)
@@ -600,6 +675,240 @@ UT_TEST(test_install_lookup_and_delete_publish_only_after_recheck)
 	UT_ASSERT_EQ(fake_enter_count, 3);
 	UT_ASSERT_EQ(fake_recheck_count, 3);
 	UT_ASSERT_EQ(fake_leave_count, 3);
+}
+
+UT_TEST(test_subcommitted_source_preserves_parent_identity)
+{
+	ClusterTTStatusKey child = make_key((TransactionId)609);
+	ClusterTTStatusKey parent = make_key((TransactionId)610);
+	ClusterTTStatusSourceRequest request;
+	ClusterTTStatusSourceResult result;
+
+	reset_fixture();
+	memset(&request, 0, sizeof(request));
+	request.key = &parent;
+	request.status = CLUSTER_TT_STATUS_IN_PROGRESS;
+	request.commit_scn = InvalidScn;
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+
+	request.key = &child;
+	request.parent_key = &parent;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
+					 CLUSTER_TT_SOURCE_INSTALL_SUBCOMMITTED, &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT_EQ(cluster_tt_status_get_install_count(), 2);
+	UT_ASSERT_EQ(cluster_tt_status_get_subcommitted_install_count(), 1);
+
+	/* A parent binding is a normal local entry and must carry the zero
+	 * parent-key sentinel; only the child publishes the exact chain edge. */
+	request.key = &parent;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
+					 CLUSTER_TT_SOURCE_LOOKUP, &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT(result.lookup.authoritative);
+	UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_IN_PROGRESS);
+	UT_ASSERT_EQ(result.lookup.commit_scn, InvalidScn);
+	UT_ASSERT_EQ(result.lookup.status_epoch, parent.cluster_epoch);
+	UT_ASSERT(!result.lookup.has_parent_key);
+	UT_ASSERT(bytes_are_zero(&result.lookup.parent_key, sizeof(result.lookup.parent_key)));
+
+	request.key = &child;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
+					 CLUSTER_TT_SOURCE_LOOKUP, &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT(result.lookup.authoritative);
+	UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_SUBCOMMITTED);
+	UT_ASSERT_EQ(result.lookup.commit_scn, InvalidScn);
+	UT_ASSERT_EQ(result.lookup.status_epoch, child.cluster_epoch);
+	UT_ASSERT(result.lookup.has_parent_key);
+	UT_ASSERT_EQ(memcmp(&result.lookup.parent_key, &parent, sizeof(parent)), 0);
+	UT_ASSERT_EQ(cluster_tt_status_get_lookup_hit_count(), 2);
+	UT_ASSERT_EQ(cluster_tt_status_get_subcommitted_lookup_hit_count(), 1);
+}
+
+UT_TEST(test_subcommitted_source_requires_parent_pointer)
+{
+	ClusterTTStatusKey child = make_key((TransactionId)611);
+	ClusterTTStatusSourceRequest request;
+	ClusterTTStatusSourceResult result;
+
+	reset_fixture();
+	memset(&request, 0, sizeof(request));
+	request.key = &child;
+	request.parent_key = NULL;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
+					 CLUSTER_TT_SOURCE_INSTALL_SUBCOMMITTED, &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_CLOSED);
+	UT_ASSERT(bytes_are_zero(&result, sizeof(result)));
+	UT_ASSERT_EQ(cluster_tt_status_get_subcommitted_install_count(), 0);
+	UT_ASSERT_EQ(fake_enter_count, 1);
+	UT_ASSERT_EQ(fake_recheck_count, 0);
+	UT_ASSERT_EQ(fake_leave_count, 1);
+}
+
+UT_TEST(test_parent_chain_follow_counter_is_admitted)
+{
+	ClusterTTStatusSourceResult result;
+
+	reset_fixture();
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
+					 CLUSTER_TT_SOURCE_BUMP_PARENT_CHAIN_FOLLOW, NULL, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(bytes_are_zero(&result, sizeof(result)));
+	UT_ASSERT_EQ(cluster_tt_status_get_parent_chain_follow_count(), 1);
+	UT_ASSERT_EQ(fake_enter_count, 1);
+	UT_ASSERT_EQ(fake_recheck_count, 1);
+	UT_ASSERT_EQ(fake_leave_count, 1);
+}
+
+UT_TEST(test_prepared_commit_resolves_local_origin_entries)
+{
+	ClusterTTStatusKey active = make_key((TransactionId)620);
+	ClusterTTStatusKey committed = active;
+	ClusterTTStatusKey aborted = active;
+	ClusterTTStatusKey foreign = active;
+	ClusterTTStatusSourceRequest request;
+	ClusterTTStatusSourceResult result;
+
+	committed.undo_segment_id = 4;
+	committed.tt_slot_id = 5;
+	aborted.undo_segment_id = 6;
+	aborted.tt_slot_id = 7;
+	foreign.origin_node_id = 2;
+	foreign.undo_segment_id = 8;
+	foreign.tt_slot_id = 9;
+
+	reset_fixture();
+	memset(&request, 0, sizeof(request));
+	request.status = CLUSTER_TT_STATUS_IN_PROGRESS;
+	request.commit_scn = InvalidScn;
+	request.key = &active;
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	request.status = CLUSTER_TT_STATUS_COMMITTED;
+	request.commit_scn = UINT64_C(9004);
+	request.key = &committed;
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	request.status = CLUSTER_TT_STATUS_ABORTED;
+	request.commit_scn = InvalidScn;
+	request.key = &aborted;
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	request.status = CLUSTER_TT_STATUS_IN_PROGRESS;
+	request.key = &foreign;
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT_EQ(cluster_tt_status_get_install_count(), 4);
+
+	memset(&request, 0, sizeof(request));
+	request.xid = active.local_xid;
+	request.commit_scn = UINT64_C(9100);
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
+					 CLUSTER_TT_SOURCE_RESOLVE_PREPARED_COMMIT, &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT_EQ(result.int_value, 2);
+	UT_ASSERT_EQ(cluster_vis_get_recovery_overlay_rebuild_count(), 2);
+
+	request.key = &active;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT(result.lookup.authoritative);
+	UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_COMMITTED);
+	UT_ASSERT_EQ(result.lookup.commit_scn, UINT64_C(9100));
+
+	request.key = &committed;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT(result.lookup.authoritative);
+	UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_COMMITTED);
+	UT_ASSERT_EQ(result.lookup.commit_scn, UINT64_C(9100));
+
+	request.key = &aborted;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT(result.lookup.authoritative);
+	UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_ABORTED);
+	UT_ASSERT_EQ(result.lookup.commit_scn, InvalidScn);
+
+	request.key = &foreign;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT(result.lookup.authoritative);
+	UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_IN_PROGRESS);
+	UT_ASSERT_EQ(result.lookup.commit_scn, InvalidScn);
+}
+
+UT_TEST(test_prepared_commit_rejects_invalid_arguments)
+{
+	ClusterTTStatusKey key = make_key((TransactionId)621);
+	ClusterTTStatusSourceRequest request;
+	ClusterTTStatusSourceResult result;
+
+	reset_fixture();
+	memset(&request, 0, sizeof(request));
+	request.key = &key;
+	request.status = CLUSTER_TT_STATUS_IN_PROGRESS;
+	request.commit_scn = InvalidScn;
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+
+	memset(&request, 0, sizeof(request));
+	request.xid = InvalidTransactionId;
+	request.commit_scn = UINT64_C(9101);
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
+					 CLUSTER_TT_SOURCE_RESOLVE_PREPARED_COMMIT, &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(bytes_are_zero(&result, sizeof(result)));
+
+	request.xid = key.local_xid;
+	request.commit_scn = InvalidScn;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
+					 CLUSTER_TT_SOURCE_RESOLVE_PREPARED_COMMIT, &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(bytes_are_zero(&result, sizeof(result)));
+	UT_ASSERT_EQ(cluster_vis_get_recovery_overlay_rebuild_count(), 0);
+
+	request.key = &key;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT(result.lookup.authoritative);
+	UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_IN_PROGRESS);
+	UT_ASSERT_EQ(result.lookup.commit_scn, InvalidScn);
 }
 
 UT_TEST(test_missing_required_pointer_closes_after_admission)
@@ -785,6 +1094,184 @@ UT_TEST(test_current_own_uses_exact_allocator_canonical_among_matching_data_alia
 	UT_ASSERT(!result.bool_value);
 }
 
+UT_TEST(test_exact_old_key_survives_current_owner_miss)
+{
+	ClusterTTStatusKey old_key = make_key((TransactionId)606);
+	ClusterTTStatusKey data_alias = old_key;
+	ClusterTTStatusSourceRequest request;
+	ClusterTTStatusSourceResult result;
+
+	reset_fixture();
+	data_alias.undo_segment_id = 9;
+	install_matching_source_aliases(&old_key, &data_alias, CLUSTER_TT_STATUS_IN_PROGRESS,
+								  InvalidScn);
+	fake_current_owner_found = false;
+	memset(&request, 0, sizeof(request));
+	request.xid = old_key.local_xid;
+	request.key = &old_key;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
+					 CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID_CANDIDATE, &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(!result.bool_value);
+	UT_ASSERT(!result.lookup.authoritative);
+	UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_UNKNOWN);
+	UT_ASSERT_EQ(result.current_key_verdict, CLUSTER_TT_CURRENT_KEY_UNKNOWN);
+	UT_ASSERT(bytes_are_zero(&result.current_key, sizeof(result.current_key)));
+	UT_ASSERT_EQ(fake_current_owner_samples, 1);
+
+	/* A raw-xid alias miss does not erase an already exact SOURCE identity. */
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT(result.lookup.authoritative);
+	UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_IN_PROGRESS);
+	UT_ASSERT_EQ(result.lookup.commit_scn, InvalidScn);
+	UT_ASSERT_EQ(result.lookup.status_epoch, old_key.cluster_epoch);
+	UT_ASSERT_EQ(fake_current_owner_samples, 1);
+
+	fake_recheck = false;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_GENERATION_CHANGED);
+	UT_ASSERT(bytes_are_zero(&result, sizeof(result)));
+	UT_ASSERT_EQ(fake_enter_count, 5);
+	UT_ASSERT_EQ(fake_recheck_count, 5);
+	UT_ASSERT_EQ(fake_leave_count, 5);
+}
+
+UT_TEST(test_current_alias_owner_change_discards_authority)
+{
+	static const char *const changes[] = {"segment", "slot", "wrap", "status", "SCN", "missing"};
+	int candidate;
+	int change;
+
+	for (candidate = 0; candidate < 2; candidate++) {
+		for (change = 0; change < lengthof(changes); change++) {
+			ClusterTTStatusKey canonical = make_key((TransactionId)607);
+			ClusterTTStatusKey data_alias = canonical;
+			ClusterTTStatusSourceRequest request;
+			ClusterTTStatusSourceResult result;
+			ClusterTTStatusSourceOp op = candidate
+				? CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID_CANDIDATE
+				: CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID;
+			uint64 hits_before;
+
+			printf("# owner change %s, candidate=%d\n", changes[change], candidate);
+			reset_fixture();
+			data_alias.undo_segment_id = 9;
+			install_matching_source_aliases(
+				&canonical, &data_alias,
+				change == 4 ? CLUSTER_TT_STATUS_COMMITTED : CLUSTER_TT_STATUS_IN_PROGRESS,
+				change == 4 ? UINT64_C(9010) : InvalidScn);
+			memset(&request, 0, sizeof(request));
+			request.key = &canonical;
+			request.xid = canonical.local_xid;
+			UT_ASSERT_EQ(cluster_tt_status_source_dispatch(op, &request, &result),
+						 CLUSTER_SEMANTIC_ADMISSION_OK);
+			UT_ASSERT(result.bool_value);
+			UT_ASSERT(result.lookup.authoritative);
+			UT_ASSERT_EQ(memcmp(&result.current_key, &canonical, sizeof(canonical)), 0);
+			if (candidate)
+				UT_ASSERT_EQ(result.current_key_verdict, CLUSTER_TT_CURRENT_KEY_MATCH);
+
+			fake_next_current_owner = fake_current_owner;
+			fake_next_current_owner_found = true;
+			switch (change) {
+			case 0:
+				fake_next_current_owner.segment_id++;
+				break;
+			case 1:
+				fake_next_current_owner.slot_offset++;
+				break;
+			case 2:
+				fake_next_current_owner.wrap++;
+				break;
+			case 3:
+				fake_next_current_owner.status = CTS_COMMITTED;
+				fake_next_current_owner.commit_scn = UINT64_C(9010);
+				break;
+			case 4:
+				fake_next_current_owner.commit_scn++;
+				break;
+			case 5:
+				fake_next_current_owner_found = false;
+				break;
+			}
+			fake_current_owner_samples = 0;
+			fake_after_owner_sample = change_owner_after_sample;
+			hits_before = cluster_tt_status_get_lookup_hit_count();
+			memset(&result, 0xA5, sizeof(result));
+			UT_ASSERT_EQ(cluster_tt_status_source_dispatch(op, &request, &result),
+						 CLUSTER_SEMANTIC_ADMISSION_OK);
+			UT_ASSERT(!result.bool_value);
+			UT_ASSERT(!result.lookup.authoritative);
+			UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_UNKNOWN);
+			UT_ASSERT_EQ(result.lookup.commit_scn, InvalidScn);
+			if (candidate)
+				UT_ASSERT_EQ(result.current_key_verdict, CLUSTER_TT_CURRENT_KEY_UNKNOWN);
+			UT_ASSERT(bytes_are_zero(&result.current_key, sizeof(result.current_key)));
+			UT_ASSERT_EQ(fake_current_owner_samples, 2);
+			UT_ASSERT_EQ(fake_overlay_lock_depth, 0);
+			UT_ASSERT_EQ(cluster_tt_status_get_lookup_hit_count(), hits_before);
+			UT_ASSERT_EQ(fake_enter_count, 4);
+			UT_ASSERT_EQ(fake_recheck_count, 4);
+			UT_ASSERT_EQ(fake_leave_count, 4);
+		}
+	}
+}
+
+UT_TEST(test_current_alias_overlay_change_discards_authority)
+{
+	int candidate;
+	int remove_canonical;
+
+	for (candidate = 0; candidate < 2; candidate++) {
+		for (remove_canonical = 0; remove_canonical < 2; remove_canonical++) {
+			ClusterTTStatusKey canonical = make_key((TransactionId)608);
+			ClusterTTStatusKey data_alias = canonical;
+			ClusterTTStatusSourceRequest request;
+			ClusterTTStatusSourceResult result;
+			ClusterTTStatusSourceOp op = candidate
+				? CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID_CANDIDATE
+				: CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID;
+
+			printf("# overlay change %s, candidate=%d\n",
+				   remove_canonical ? "canonical removed" : "alias status", candidate);
+			reset_fixture();
+			data_alias.undo_segment_id = 9;
+			install_matching_source_aliases(&canonical, &data_alias, CLUSTER_TT_STATUS_IN_PROGRESS,
+										  InvalidScn);
+			fake_overlay_change_op = remove_canonical ? CLUSTER_TT_SOURCE_DELETE_EXACT
+													 : CLUSTER_TT_SOURCE_INSTALL_LOCAL;
+			fake_overlay_change_request.key = remove_canonical ? &canonical : &data_alias;
+			fake_overlay_change_request.status = CLUSTER_TT_STATUS_ABORTED;
+			fake_overlay_change_request.commit_scn = InvalidScn;
+			fake_after_owner_sample = change_overlay_after_sample;
+			memset(&request, 0, sizeof(request));
+			request.key = &canonical;
+			request.xid = canonical.local_xid;
+			memset(&result, 0xA5, sizeof(result));
+			UT_ASSERT_EQ(cluster_tt_status_source_dispatch(op, &request, &result),
+						 CLUSTER_SEMANTIC_ADMISSION_OK);
+			UT_ASSERT(!result.bool_value);
+			UT_ASSERT(!result.lookup.authoritative);
+			UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_UNKNOWN);
+			UT_ASSERT_EQ(result.lookup.commit_scn, InvalidScn);
+			if (candidate)
+				UT_ASSERT_EQ(result.current_key_verdict, CLUSTER_TT_CURRENT_KEY_UNKNOWN);
+			UT_ASSERT(bytes_are_zero(&result.current_key, sizeof(result.current_key)));
+			UT_ASSERT_EQ(fake_current_owner_samples, 1);
+			UT_ASSERT_EQ(fake_overlay_lock_depth, 0);
+			UT_ASSERT_EQ(cluster_tt_status_get_lookup_hit_count(), 0);
+			UT_ASSERT_EQ(fake_enter_count, 4);
+			UT_ASSERT_EQ(fake_recheck_count, 4);
+			UT_ASSERT_EQ(fake_leave_count, 4);
+		}
+	}
+}
+
 UT_TEST(test_error_path_runs_single_leave_funnel)
 {
 	ClusterTTStatusKey key = make_key((TransactionId)603);
@@ -818,17 +1305,25 @@ UT_TEST(test_error_path_runs_single_leave_funnel)
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(19);
 	UT_RUN(test_frozen_tt_source_operation_domain);
 	UT_RUN(test_active_refuses_before_request_inspection_and_mutation);
 	UT_RUN(test_recovered_open_refuses_before_source_tt_access);
 	UT_RUN(test_disabled_source_executes_matching_counter_arm);
 	UT_RUN(test_install_lookup_and_delete_publish_only_after_recheck);
+	UT_RUN(test_subcommitted_source_preserves_parent_identity);
+	UT_RUN(test_subcommitted_source_requires_parent_pointer);
+	UT_RUN(test_parent_chain_follow_counter_is_admitted);
+	UT_RUN(test_prepared_commit_resolves_local_origin_entries);
+	UT_RUN(test_prepared_commit_rejects_invalid_arguments);
 	UT_RUN(test_missing_required_pointer_closes_after_admission);
 	UT_RUN(test_unknown_operation_closes_after_admission);
 	UT_RUN(test_generation_drift_discards_fixed_result);
 	UT_RUN(test_current_own_candidate_is_exact_and_admission_bound);
 	UT_RUN(test_current_own_uses_exact_allocator_canonical_among_matching_data_aliases);
+	UT_RUN(test_exact_old_key_survives_current_owner_miss);
+	UT_RUN(test_current_alias_owner_change_discards_authority);
+	UT_RUN(test_current_alias_overlay_change_discards_authority);
 	UT_RUN(test_error_path_runs_single_leave_funnel);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

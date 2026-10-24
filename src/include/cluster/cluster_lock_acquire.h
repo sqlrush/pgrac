@@ -208,6 +208,11 @@ typedef struct ClusterLockAcquireRequest {
 	/* PRE2 manual-control owner: process-local stable identity, never a
 	 * pointer into a copyable guard or the wire. Author: SqlRush. */
 	uint64 control_owner_id;
+	/* First S3 relation REQUEST only: fences below this local serial limit
+	 * predate this request. UINT64_MAX records an unusable sample so retries
+	 * cannot manufacture a later causal edge. Never sent on the wire. */
+	uint64 ko_fence_serial_limit;
+	uint64 ko_fence_request_id;
 } ClusterLockAcquireRequest;
 
 /* Error owner around the complete PG-native acquisition body.  The callback
@@ -248,6 +253,15 @@ typedef struct ClusterLockReleaseRequest {
  */
 extern ClusterLockAcquireResult
 cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req);
+
+/* P0-14 R2: return exact AX registration evidence retained by LOCALLOCK for
+ * a relation lock still held by this backend. The lookup does not recreate an
+ * already-consumed grant; callers still bind the result to their operation. */
+extern bool cluster_lock_current_ax_binding(const LOCKTAG *locktag,
+												ClusterGrdHolderId *holder_out,
+												uint64 *request_id_out,
+												int32 *master_node_out,
+												uint64 *master_generation_out);
 
 
 /*

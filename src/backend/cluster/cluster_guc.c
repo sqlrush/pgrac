@@ -35,6 +35,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_visibility_trace_filter.h"
 
 #include <limits.h>
 #include <sys/stat.h>
@@ -114,6 +115,10 @@ int cluster_recovery_merge_wait_timeout = 10000;
 bool cluster_xnode_profile_enabled = false;
 /* Diagnostic per-storage-UPDATE phase trace; default OFF. */
 bool cluster_update_trace_enabled = false;
+bool cluster_trace_cleanup = false;
+char *cluster_trace_visibility_relids = NULL;
+bool cluster_trace_visibility_enabled = false;
+ClusterVisibilityTraceFilter cluster_trace_visibility_filter = { 0 };
 /* spec-6.4: ADG physical standby / read-only service knobs. */
 int cluster_dg_role = CLUSTER_DG_ROLE_PRIMARY;
 int cluster_dg_mode = CLUSTER_DG_MODE_ASYNC;
@@ -1084,6 +1089,24 @@ check_cluster_sinval_ack_mode(int *newval, void **extra, GucSource source)
 }
 
 static bool
+check_trace_visibility_relids(char **newval, void **extra pg_attribute_unused(),
+							  GucSource source pg_attribute_unused())
+{
+	ClusterVisibilityTraceFilter parsed;
+	return cluster_visibility_trace_parse(*newval, &parsed);
+}
+
+static void
+assign_trace_visibility_relids(const char *newval, void *extra pg_attribute_unused())
+{
+	ClusterVisibilityTraceFilter parsed;
+	if (!cluster_visibility_trace_parse(newval, &parsed))
+		return;
+	cluster_trace_visibility_filter = parsed;
+	cluster_trace_visibility_enabled = parsed.count != 0;
+}
+
+static bool
 check_cluster_shared_catalog(bool *newval, void **extra, GucSource source)
 {
 	if (*newval && cluster_sinval_ack_mode == CLUSTER_SINVAL_ACK_MODE_NONE) {
@@ -1704,6 +1727,17 @@ cluster_init_guc(void)
 		"cluster.update_trace", gettext_noop("Enable whole-UPDATE execution phase tracing."),
 		gettext_noop("A full diagnostic capture drops new records, never overwrites."),
 		&cluster_update_trace_enabled, false, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.trace_cleanup", gettext_noop("Log transaction cleanup and buffer invalidation phases."),
+		NULL, &cluster_trace_cleanup, false, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	DefineCustomStringVariable(
+		"cluster.trace_visibility_relids",
+		gettext_noop("Trace visibility and descriptors for a comma-separated relation OID list."),
+		gettext_noop("An empty list disables diagnostic logging; at most 64 distinct OIDs."),
+		&cluster_trace_visibility_relids, "", PGC_SUSET, 0, check_trace_visibility_relids,
+		assign_trace_visibility_relids, NULL);
 
 	/*
 	 * spec-6.4 ADG role and read-only service knobs.  Defaults keep existing
@@ -4013,23 +4047,20 @@ cluster_init_guc(void)
 					 "affects hit/miss. The threshold is pending spec-5.58 calibration."),
 		&cluster_cr_pool_admit_pressure_ratio, 0, 0, 100000, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
-	/* spec-5.55 D7: shared resolver cache (CR Source 3 by-xid search-shortcut
-	 * memo).  Both PGC_POSTMASTER: the entry count + measure switch are final at
+	/* spec-5.55 D7: shared resolver cache (CR Source 3 diagnostic position
+	 * memo).  All PGC_POSTMASTER: the entry count + mode switches are final at
 	 * shmem reservation.  Default entries 0 / measure off = true zero memory (the
 	 * region is registered but reserves 0 bytes), so the spec-3.22 by-xid path is
-	 * byte-identical.  v1 ships in MEASURE mode only (the value gate, §0.6): it
-	 * always re-runs the authoritative scan and never trusts the hint -- the
-	 * trust path (flip-on) is gated on measured redundancy + re-probe hit rate. */
+	 * unchanged.  TRUST is unconditionally disabled: both settings preserve the
+	 * authoritative full scan and only enable diagnostic hints/counters. */
 	DefineCustomBoolVariable(
 		"cluster.resolver_cache_enabled",
-		gettext_noop("Enable spec-5.55 shared resolver cache TRUST mode (skip the by-xid scan on a "
-					 "re-validated + accepted hint)."),
-		gettext_noop("Spec-5.55. Default off. When on (with resolver_cache_entries > 0), a CR "
-					 "Source 3 by-xid resolution that hits the shared memo re-validates the hint "
-					 "slot in O(1) and re-runs the SAME wrap_suspect acceptance as a fresh scan, "
-					 "resolving WITHOUT the O(segments) scan (verdict-equivalent by construction). "
-					 "The recommended non-zero default is bound to the §0.6 value gate evidence "
-					 "(spec-5.58). PGC_POSTMASTER: requires a restart."),
+		gettext_noop("Enable shared resolver cache diagnostic hints (TRUST is disabled)."),
+		gettext_noop("Default off. When on (with resolver_cache_entries > 0), CR Source 3 "
+					 "re-validates memoized position hints and records diagnostic counters. "
+					 "The authoritative full by-xid scan always runs, including on a valid hint "
+					 "hit. This setting cannot enable scan bypass. PGC_POSTMASTER: requires a "
+					 "restart."),
 		&cluster_resolver_cache_enabled, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -4038,8 +4069,8 @@ cluster_init_guc(void)
 		gettext_noop("Spec-5.55 §0.6. Default off. When on (with resolver_cache_entries > 0), CR "
 					 "Source 3 records whether its own-instance by-xid scan result was already "
 					 "memoized by a peer backend and whether an O(1) re-validation + acceptance "
-					 "would have passed -- the cross-backend redundancy + re-probe hit rate that "
-					 "gate the trust path.  Never changes a visibility verdict (the authoritative "
+					 "would have passed. Never enables TRUST or changes a visibility verdict (the "
+					 "authoritative "
 					 "scan always runs).  Orthogonal to resolver_cache_enabled.  PGC_POSTMASTER."),
 		&cluster_resolver_cache_measure, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 

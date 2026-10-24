@@ -927,8 +927,8 @@ cluster_tt_slot_pernode_structural(uint32 segment_id, const char *fn)
  *	NOT freed at commit (unlike the spec-3.4b MVP); the retention gate in
  *	cluster_tt_slot_alloc keeps it (and therefore the durable segment-header TT
  *	slot at this offset) addressable until commit_scn drops below the horizon.
- *	Defensive: only an ACTIVE slot owned by `xid` transitions, so a double
- *	end-of-xact callback (or a slot already recycled by a later xact) is a
+ *	Defensive: only an ACTIVE slot with the bound xid and wrap transitions, so
+ *	a double end-of-xact callback (or a slot recycled by a later xact) is a
  *	no-op rather than corrupting another owner's retention state.
  *
  *	spec-3.12 D2b: if the node has rolled this segment away (seg->segment_id no
@@ -937,7 +937,7 @@ cluster_tt_slot_pernode_structural(uint32 segment_id, const char *fn)
  */
 void
 cluster_tt_slot_mark_committed(uint32 segment_id, uint16 slot_offset, TransactionId xid,
-							   SCN commit_scn)
+							   uint16 expected_wrap, SCN commit_scn)
 {
 	ClusterTTSlotAllocPerSegment *seg;
 	bool transitioned = false;
@@ -961,7 +961,8 @@ cluster_tt_slot_mark_committed(uint32 segment_id, uint16 slot_offset, Transactio
 	if (seg->segment_id == segment_id) {
 		ClusterTTSlotAllocEntry *e = &seg->slots[slot_offset];
 
-		if (e->status == CTS_ACTIVE && e->xid == xid) {
+		if (expected_wrap != TT_WRAP_INVALID && e->status == CTS_ACTIVE && e->xid == xid
+			&& e->wrap == expected_wrap) {
 			e->status = CTS_COMMITTED;
 			e->commit_scn = commit_scn;
 			transitioned = true;
@@ -979,11 +980,12 @@ cluster_tt_slot_mark_committed(uint32 segment_id, uint16 slot_offset, Transactio
  *
  *	ACTIVE -> ABORTED.  commit_scn is cleared.  Single-node C7 may recycle it
  *	immediately; peer mode retains the physical slot as canonical current-MX
- *	evidence until an exact release owner exists.  Same defensive ownership +
- *	rolled-away (D2b) guards as mark_committed.
+ *	evidence until an exact release owner exists.  Same defensive xid/wrap
+ *	ownership + rolled-away (D2b) guards as mark_committed.
  */
 void
-cluster_tt_slot_mark_aborted(uint32 segment_id, uint16 slot_offset, TransactionId xid)
+cluster_tt_slot_mark_aborted(uint32 segment_id, uint16 slot_offset, TransactionId xid,
+							 uint16 expected_wrap)
 {
 	ClusterTTSlotAllocPerSegment *seg;
 	bool transitioned = false;
@@ -999,7 +1001,8 @@ cluster_tt_slot_mark_aborted(uint32 segment_id, uint16 slot_offset, TransactionI
 	if (seg->segment_id == segment_id) {
 		ClusterTTSlotAllocEntry *e = &seg->slots[slot_offset];
 
-		if (e->status == CTS_ACTIVE && e->xid == xid) {
+		if (expected_wrap != TT_WRAP_INVALID && e->status == CTS_ACTIVE && e->xid == xid
+			&& e->wrap == expected_wrap) {
 			e->status = CTS_ABORTED;
 			e->commit_scn = InvalidScn;
 			transitioned = true;

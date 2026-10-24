@@ -122,6 +122,21 @@ extern uint64 cluster_txw_get_wait_count(void);
 extern uint64 cluster_txw_get_wakeup_count(void);
 extern uint64 cluster_txw_get_timeout_count(void);
 
+/* Diagnostic value copies only; neither form is a transaction verdict.
+ * kind uses the native slot discriminator: 1 SOURCE, 2 TARGET, 3 current-MX.
+ * False means unavailable/invalid, never an initialized empty observation.
+ * required counts every active slot; copied may be smaller than required.
+ * The original waiter storage, counters and wake/exit lifecycle are unchanged. */
+typedef struct ClusterTxWaitSnapshot {
+	int procno;
+	uint32 kind;
+	ClusterTTStatusKey source_key;
+	ClusterTxLocator target_locator;
+} ClusterTxWaitSnapshot;
+
+extern bool cluster_tx_enqueue_snapshot(ClusterTxWaitSnapshot *out, int capacity, int *copied,
+										int *required);
+
 #endif /* USE_PGRAC_CLUSTER */
 
 #endif /* CLUSTER_TX_ENQUEUE_H */

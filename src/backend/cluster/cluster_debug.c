@@ -997,6 +997,19 @@ dump_undo_cleaner(ReturnSetInfo *rsinfo)
 		emit_row(rsinfo, prefix, "main_loop_iters", fmt_int64(row.main_loop_iters));
 		emit_row(rsinfo, prefix, "local_completed_passes", fmt_int64(row.local_completed_passes));
 		emit_row(rsinfo, prefix, "local_progress_events", fmt_int64(row.local_progress_events));
+		if (i == 0) {
+			emit_row(rsinfo, prefix, "active_census_status", fmt_int32(row.active_census.status));
+			emit_row(rsinfo, prefix, "active_census_position",
+					 fmt_int64(row.active_census.next_index));
+			emit_row(rsinfo, prefix, "active_census_entries",
+					 fmt_int64(row.active_census.total_entries));
+			emit_row(rsinfo, prefix, "active_census_reference_full",
+					 fmt_int64(U64FromFullTransactionId(row.active_census.reference_full)));
+			emit_row(rsinfo, prefix, "active_census_min_full",
+					 fmt_int64(U64FromFullTransactionId(row.active_census.min_full)));
+			emit_row(rsinfo, prefix, "active_census_lock_busy",
+					 row.active_census.lock_busy ? "true" : "false");
+		}
 		if (cluster_ctrc_cleaner_worker_observation(i, &observation)) {
 			emit_row(rsinfo, prefix, "dispatch_backlog", fmt_int64(observation.dispatch_backlog));
 			emit_row(rsinfo, prefix, "certificate_backlog",
@@ -2102,6 +2115,48 @@ dump_pcm(ReturnSetInfo *rsinfo)
 			 fmt_uint64(protocol_debt.evicting_entry_count));
 	emit_row(rsinfo, "pcm", "resource_x_invalid_debt_count",
 			 fmt_uint64(protocol_debt.invalid_entry_count));
+	{
+		PcmNormalStopRefusalV1 f;
+		if (cluster_pcm_normal_stop_first_refusal_v1(&f)) {
+#define PCM_STOP_FIELD(field) \
+		emit_row(rsinfo, "pcm", "normal_stop_first_" #field, fmt_uint64(f.field))
+			PCM_STOP_FIELD(code); PCM_STOP_FIELD(source_line); PCM_STOP_FIELD(captured_pg_us);
+			PCM_STOP_FIELD(slot); PCM_STOP_FIELD(binding); PCM_STOP_FIELD(registry_state);
+			PCM_STOP_FIELD(registry_reserved); PCM_STOP_FIELD(registry_binding);
+			PCM_STOP_FIELD(state_binding); PCM_STOP_FIELD(lifecycle); PCM_STOP_FIELD(gate);
+			PCM_STOP_FIELD(formation); PCM_STOP_FIELD(gate_formation); PCM_STOP_FIELD(authority);
+			PCM_STOP_FIELD(pins); PCM_STOP_FIELD(waits); PCM_STOP_FIELD(transport);
+			PCM_STOP_FIELD(mode); PCM_STOP_FIELD(s_holders); PCM_STOP_FIELD(pi_holders);
+			PCM_STOP_FIELD(local_refs); PCM_STOP_FIELD(master_holder); PCM_STOP_FIELD(owner_state);
+			PCM_STOP_FIELD(pending_x_lsn); PCM_STOP_FIELD(convert);
+			PCM_STOP_FIELD(owner_buffer); PCM_STOP_FIELD(owner_generation); PCM_STOP_FIELD(round_phase);
+			PCM_STOP_FIELD(send_pending); PCM_STOP_FIELD(attempt); PCM_STOP_FIELD(round_formation);
+			PCM_STOP_FIELD(round_master_session); PCM_STOP_FIELD(delivery_sequence);
+			PCM_STOP_FIELD(local_pi_first); PCM_STOP_FIELD(local_pi_last);
+			PCM_STOP_FIELD(pi_lsn); PCM_STOP_FIELD(pi_scn); PCM_STOP_FIELD(request_phase);
+			PCM_STOP_FIELD(tombstone_valid); PCM_STOP_FIELD(tombstone_phase);
+			PCM_STOP_FIELD(request_formation); PCM_STOP_FIELD(request_session); PCM_STOP_FIELD(assertion);
+			PCM_STOP_FIELD(base); PCM_STOP_FIELD(final_authority); PCM_STOP_FIELD(requester_connection);
+			PCM_STOP_FIELD(requester_target); PCM_STOP_FIELD(sender_connection);
+			PCM_STOP_FIELD(holder_status); PCM_STOP_FIELD(holder_image); PCM_STOP_FIELD(grant);
+			PCM_STOP_FIELD(requester_settlement); PCM_STOP_FIELD(requester_join_grant);
+			PCM_STOP_FIELD(requester_join_image); PCM_STOP_FIELD(deferred);
+			PCM_STOP_FIELD(retry_pending); PCM_STOP_FIELD(retry_running);
+			PCM_STOP_FIELD(source_settlement); PCM_STOP_FIELD(priority);
+#undef PCM_STOP_FIELD
+#define PCM_STOP_SIGNED(field) \
+		emit_row(rsinfo, "pcm", "normal_stop_first_" #field, psprintf("%d", f.field))
+			PCM_STOP_SIGNED(pid); PCM_STOP_SIGNED(node); PCM_STOP_SIGNED(request_node);
+			PCM_STOP_SIGNED(x_holder); PCM_STOP_SIGNED(tombstone_node);
+			PCM_STOP_SIGNED(pending_x);
+#undef PCM_STOP_SIGNED
+			emit_row(rsinfo, "pcm", "normal_stop_first_tag", psprintf("%u/%u/%u/%d/%u",
+				f.tag.spcOid, f.tag.dbOid, f.tag.relNumber, f.tag.forkNum, f.tag.blockNum));
+			emit_row(rsinfo, "pcm", "normal_stop_first_registry_tag", psprintf("%u/%u/%u/%d/%u",
+				f.registry_tag.spcOid, f.registry_tag.dbOid, f.registry_tag.relNumber,
+				f.registry_tag.forkNum, f.registry_tag.blockNum));
+		}
+	}
 	for (refusal = PCM_RETIRE_REFUSAL_GATE_NOT_OPEN; refusal < PCM_RETIRE_REFUSAL_N; refusal++)
 		emit_row(rsinfo, "pcm", reclaim_refusal_keys[refusal],
 				 fmt_uint64(lifecycle.reclaim_refused[refusal]));
@@ -4003,6 +4058,33 @@ dump_ts(ReturnSetInfo *rsinfo)
 static void
 dump_ko(ReturnSetInfo *rsinfo)
 {
+	ClusterKoDropTraceV1 trace;
+	if (cluster_ko_drop_pending_v1(&trace)) {
+		char key[96], value[96];
+#define KO_DROP_TRACE_ROW(field) \
+		do { \
+			snprintf(key, sizeof(key), "drop_pending_" #field); \
+			snprintf(value, sizeof(value), UINT64_FORMAT, (uint64)trace.field); \
+			emit_row(rsinfo, "ko", key, value); \
+		} while (0)
+		KO_DROP_TRACE_ROW(slot); KO_DROP_TRACE_ROW(serial); KO_DROP_TRACE_ROW(batch);
+		KO_DROP_TRACE_ROW(operation); KO_DROP_TRACE_ROW(drop_pending); KO_DROP_TRACE_ROW(failed);
+		KO_DROP_TRACE_ROW(observed); KO_DROP_TRACE_ROW(phase); KO_DROP_TRACE_ROW(step);
+		KO_DROP_TRACE_ROW(provider_step);
+		KO_DROP_TRACE_ROW(cursor); KO_DROP_TRACE_ROW(prefix_cursor); KO_DROP_TRACE_ROW(local_result);
+		KO_DROP_TRACE_ROW(selections); KO_DROP_TRACE_ROW(gate_observed); KO_DROP_TRACE_ROW(gate_phase);
+		KO_DROP_TRACE_ROW(gate_formation); KO_DROP_TRACE_ROW(gate_freeze);
+		KO_DROP_TRACE_ROW(revision); KO_DROP_TRACE_ROW(current_revision);
+		KO_DROP_TRACE_ROW(io_attempted);
+#undef KO_DROP_TRACE_ROW
+		emit_row(rsinfo, "ko", "drop_pending_pid", fmt_int64(trace.pid));
+		emit_row(rsinfo, "ko", "drop_pending_forknum", fmt_int64(trace.forknum));
+		emit_row(rsinfo, "ko", "drop_pending_io_error", fmt_int64(trace.io_error));
+		emit_row(rsinfo, "ko", "drop_pending_sampled_pg_us", fmt_int64(trace.observed_pg_us));
+		snprintf(value, sizeof(value), "%u/%u/%u", trace.locator.spcOid,
+			trace.locator.dbOid, trace.locator.relNumber);
+		emit_row(rsinfo, "ko", "drop_pending_locator", value);
+	}
 	emit_row(rsinfo, "ko", "flush_count", fmt_int64((int64)cluster_ko_flush_count()));
 	emit_row(rsinfo, "ko", "ack_received_count", fmt_int64((int64)cluster_ko_ack_received_count()));
 	emit_row(rsinfo, "ko", "failclosed_count", fmt_int64((int64)cluster_ko_failclosed_count()));
@@ -4010,6 +4092,112 @@ dump_ko(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "ko", "lockfail_count", fmt_int64((int64)cluster_ko_lockfail_count()));
 	emit_row(rsinfo, "ko", "peer_apply_count", fmt_int64((int64)cluster_ko_peer_apply_count()));
 	emit_row(rsinfo, "ko", "inbound_full_count", fmt_int64((int64)cluster_ko_inbound_full_count()));
+	for (int i = 0; i < CLUSTER_KO_DISCARD_REASON_COUNT; i++) {
+		char key[128];
+		const char *reason = cluster_ko_origin_discard_reason_name(i);
+		snprintf(key, sizeof(key), "origin_discard_%s_count", reason);
+		emit_row(rsinfo, "ko", key, fmt_int64((int64)cluster_ko_origin_discard_count(reason)));
+	}
+	for (int i = 1; i < CLUSTER_KO_NATIVE_FAIL_COUNT; i++) {
+		char key[160];
+		const char *reason = cluster_ko_native_failure_reason_name(i);
+		ClusterKoNativeFailureV1 first;
+
+		snprintf(key, sizeof(key), "native_failure_%s_count", reason);
+		emit_row(rsinfo, "ko", key, fmt_int64((int64)cluster_ko_native_failure_count(reason)));
+		if (cluster_ko_native_failure_first(reason, &first)) {
+#define KO_NATIVE_FIRST_FIELD(field) \
+			snprintf(key, sizeof(key), "native_failure_%s_first_" #field, reason); \
+			emit_row(rsinfo, "ko", key, fmt_int64((int64)first.field))
+			KO_NATIVE_FIRST_FIELD(stage);
+			KO_NATIVE_FIRST_FIELD(space_stage);
+			KO_NATIVE_FIRST_FIELD(site);
+			KO_NATIVE_FIRST_FIELD(captured_pg_us);
+			KO_NATIVE_FIRST_FIELD(serial);
+			KO_NATIVE_FIRST_FIELD(batch);
+			KO_NATIVE_FIRST_FIELD(producer_pid);
+			KO_NATIVE_FIRST_FIELD(slot);
+			KO_NATIVE_FIRST_FIELD(sqlerrcode);
+			KO_NATIVE_FIRST_FIELD(work_flags);
+			KO_NATIVE_FIRST_FIELD(owner_flags);
+			KO_NATIVE_FIRST_FIELD(context_flags);
+			KO_NATIVE_FIRST_FIELD(entry_flags);
+			KO_NATIVE_FIRST_FIELD(matches);
+			KO_NATIVE_FIRST_FIELD(handoff);
+#undef KO_NATIVE_FIRST_FIELD
+			snprintf(key, sizeof(key), "native_failure_%s_first_locator", reason);
+			emit_row(rsinfo, "ko", key, psprintf("%u/%u/%u", first.locator.spcOid,
+				first.locator.dbOid, first.locator.relNumber));
+			snprintf(key, sizeof(key), "native_failure_%s_first_error_message", reason);
+			emit_row(rsinfo, "ko", key, first.error_message);
+		}
+	}
+	for (int i = 0; i < CLUSTER_KO_ORIGIN_REASON_COUNT; i++) {
+		char key[128];
+		const char *reason = cluster_ko_origin_checkpoint_reason_name(
+			(ClusterKoOriginCheckpointReason)i);
+
+		snprintf(key, sizeof(key), "origin_checkpoint_%s_restart_count", reason);
+		emit_row(rsinfo, "ko", key,
+			 fmt_int64((int64)cluster_ko_origin_checkpoint_restart_count(reason)));
+		snprintf(key, sizeof(key), "origin_checkpoint_%s_wait_count", reason);
+		emit_row(rsinfo, "ko", key,
+				 fmt_int64((int64)cluster_ko_origin_checkpoint_wait_count(reason)));
+	}
+	{
+		ClusterKoOriginCheckpointPendingV1 pending = {0};
+		bool valid = cluster_ko_origin_checkpoint_pending_identity(&pending);
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_identity_valid",
+				 fmt_int64(valid ? 1 : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_registry_slot",
+				 fmt_int64(valid ? (int64)pending.registry_slot : -1));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_spc_oid",
+				 fmt_int64(valid ? (int64)pending.locator.spcOid : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_db_oid",
+				 fmt_int64(valid ? (int64)pending.locator.dbOid : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_rel_number",
+				 fmt_int64(valid ? (int64)pending.locator.relNumber : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_fork",
+				 fmt_int64(valid ? (int64)pending.forknum : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_block",
+				 fmt_int64(valid ? (int64)pending.blocknum : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_binding_generation",
+				 fmt_int64(valid ? (int64)pending.binding_generation : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_local_pi_revision",
+				 fmt_int64(valid ? (int64)pending.local_pi_revision : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_pcm_state",
+				 fmt_int64(valid ? (int64)pending.pcm_state : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_current_holder",
+				 fmt_int64(valid ? (int64)pending.current_holder_node : -1));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_master_holder",
+				 fmt_int64(valid ? (int64)pending.master_holder_node : -1));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_master_node",
+				 fmt_int64(valid ? (int64)pending.master_node : -1));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_x_requester",
+				 fmt_int64(valid ? (int64)pending.pending_x_requester_node : -1));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_s_holders",
+				 fmt_int64(valid ? (int64)pending.s_holders_bitmap : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_pi_holders",
+				 fmt_int64(valid ? (int64)pending.pi_holders_bitmap : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_pi_first_source_node",
+				 fmt_int64(valid ? (int64)pending.pi_source_node_first : -1));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_pi_first_source_boot",
+				 fmt_int64(valid ? (int64)pending.pi_source_boot_first : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_pi_first_source_slot",
+				 fmt_int64(valid ? (int64)pending.pi_source_slot_first : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_pi_last_source_node",
+				 fmt_int64(valid ? (int64)pending.pi_source_node_last : -1));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_pi_last_source_boot",
+				 fmt_int64(valid ? (int64)pending.pi_source_boot_last : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_pi_last_source_slot",
+				 fmt_int64(valid ? (int64)pending.pi_source_slot_last : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_predicate_mask",
+				 fmt_int64(valid ? (int64)pending.pending_predicate_mask : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_first_token",
+				 fmt_int64(valid ? (int64)pending.first_token : 0));
+		emit_row(rsinfo, "ko", "origin_checkpoint_pending_last_token",
+				 fmt_int64(valid ? (int64)pending.last_token : 0));
+	}
 }
 
 /*

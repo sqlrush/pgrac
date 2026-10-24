@@ -233,17 +233,19 @@ cluster_tt_slot_durable_prepared_release(ClusterTTPreparedStage *stage)
 void
 cluster_tt_slot_mark_committed(uint32 segment_id pg_attribute_unused(),
 							   uint16 slot_offset pg_attribute_unused(),
-							   TransactionId xid pg_attribute_unused(),
+							   TransactionId xid pg_attribute_unused(), uint16 expected_wrap,
 							   SCN commit_scn pg_attribute_unused())
 {
+	UT_ASSERT_EQ(expected_wrap, 2);
 	marks++;
 }
 
 void
 cluster_tt_slot_mark_aborted(uint32 segment_id pg_attribute_unused(),
 							 uint16 slot_offset pg_attribute_unused(),
-							 TransactionId xid pg_attribute_unused())
+							 TransactionId xid pg_attribute_unused(), uint16 expected_wrap)
 {
+	UT_ASSERT_EQ(expected_wrap, 2);
 	marks++;
 }
 

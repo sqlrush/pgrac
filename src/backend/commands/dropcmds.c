@@ -54,11 +54,17 @@ static bool type_in_list_does_not_exist_skipping(List *typenames,
  * performMultipleDeletions() call.  This avoids unnecessary DROP RESTRICT
  * errors if there are dependencies between them.
  */
-void
-RemoveObjects(DropStmt *stmt)
+static void
+RemoveObjectsInternal(DropStmt *stmt, bool check_storage_only, bool isTopLevel)
 {
 	ObjectAddresses *objects;
 	ListCell   *cell1;
+	int flags = PERFORM_DELETION_USER_COMMAND;
+
+	if (isTopLevel)
+		flags |= PERFORM_DELETION_TOPLEVEL;
+	if (check_storage_only)
+		flags |= PERFORM_DELETION_CHECK_STORAGE_ONLY | PERFORM_DELETION_QUIETLY;
 
 	objects = new_object_addresses();
 
@@ -84,7 +90,8 @@ RemoveObjects(DropStmt *stmt)
 		if (!OidIsValid(address.objectId))
 		{
 			Assert(stmt->missing_ok);
-			does_not_exist_skipping(stmt->removeType, object);
+			if (!check_storage_only)
+				does_not_exist_skipping(stmt->removeType, object);
 			continue;
 		}
 
@@ -125,10 +132,23 @@ RemoveObjects(DropStmt *stmt)
 	}
 
 	/* Here we really delete them. */
-	performMultipleDeletions(objects, stmt->behavior, 0);
+	performMultipleDeletions(objects, stmt->behavior, flags);
 
 	free_object_addresses(objects);
 }
+
+void
+RemoveObjects(DropStmt *stmt, bool isTopLevel)
+{
+	RemoveObjectsInternal(stmt, false, isTopLevel);
+}
+
+void
+CheckObjectsStorageDrop(DropStmt *stmt, bool isTopLevel)
+{
+	RemoveObjectsInternal(stmt, true, isTopLevel);
+}
+
 
 /*
  * owningrel_does_not_exist_skipping

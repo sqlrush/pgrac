@@ -4,6 +4,7 @@
  * final InvalidateBuffer mapping removal are explicit fixture boundaries.
  * No live disk durability, native concurrency or full shutdown is claimed. */
 #include "postgres.h"
+#include "access/xact.h"
 
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_guc.h"
@@ -39,6 +40,25 @@ static LWLock mapping_lock;
 static bool mapping_held;
 static bool caller_lock_held;
 static int header_reads, discarded, io_forgotten, io_wakes;
+bool cluster_trace_cleanup;
+volatile uint32 InterruptHoldoffCount = 1, CritSectionCount = 0;
+static unsigned trace_count;
+static char trace_message[1024];
+TransactionId GetTopTransactionIdIfAny(void) { return 7001; }
+CommandId GetCurrentCommandId(bool used) { UT_ASSERT(!used); return 9; }
+bool errstart(int level, const char *domain) { (void) domain; return level == LOG; }
+bool errstart_cold(int level, const char *domain) { return errstart(level, domain); }
+void errfinish(const char *file, int line, const char *fn)
+{ (void) file; (void) line; (void) fn; trace_count++; }
+int errmsg_internal(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(trace_message, sizeof(trace_message), fmt, ap);
+	va_end(ap);
+	return 0;
+}
+#include "test_cluster_cleanup_trace.inc"
 static int pi_kept, pi_ineligible;
 static bool all_checkpoints;
 
@@ -557,10 +577,83 @@ test_cr_stop_requires_clean_immutable_metadata(void)
 	UT_ASSERT_EQ(poll_stop(false), CLUSTER_NORMAL_STOP_INVALID);
 }
 
+static void
+test_pending_owner_snapshot_is_coherent_and_passive(void)
+{
+	ClusterBufferStopObservation observation;
+	BufferDesc *buf;
+	BufferTag tag;
+	const char *reason;
+	uint32 state;
+	uint64 token;
+	int id;
+
+	reset_fixture();
+	buf = resident(2);
+	state = LockBufHdr(buf);
+	UT_ASSERT_EQ(cluster_pcm_own_reservation_begin_exact(
+		2, 0, PCM_OWN_FLAG_GRANT_PENDING, &token), CLUSTER_PCM_OWN_OK);
+	UnlockBufHdr(buf, state);
+	UT_ASSERT_EQ(cluster_bufmgr_normal_stop_observed(false, false, &tag, &id,
+		&reason, &observation), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_STR_EQ(reason, "BUFMGR_OWNED");
+	UT_ASSERT_EQ(id, 2);
+	UT_ASSERT_EQ(observation.own.flags, PCM_OWN_FLAG_GRANT_PENDING);
+	UT_ASSERT_EQ(observation.own.reservation_token, token);
+	UT_ASSERT(BufferTagsEqual(&observation.own.tag, &tag));
+	UT_ASSERT((observation.state & BM_LOCKED) == 0);
+	UT_ASSERT_EQ(observation.delivery, 0);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(2), PCM_OWN_FLAG_GRANT_PENDING);
+	/* A pin and IO are recorded separately; neither is retired by census. */
+	pg_atomic_fetch_or_u32(&buf->state, BM_IO_IN_PROGRESS | 1);
+	UT_ASSERT_EQ(cluster_bufmgr_normal_stop_observed(false, false, NULL, NULL,
+		NULL, &observation), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(observation.state), 1);
+	UT_ASSERT((observation.state & BM_IO_IN_PROGRESS) != 0);
+	UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf->state)), 1);
+	UT_ASSERT((pg_atomic_read_u32(&buf->state) & BM_IO_IN_PROGRESS) != 0);
+}
+
+static void
+test_cleanup_trace_disabled_and_complete_fields(void)
+{
+	BufferDesc *buf;
+
+	reset_fixture();
+	buf = resident(1);
+	trace_count = header_reads = 0;
+	cluster_trace_cleanup = false;
+	cluster_xact_trace_cleanup("record_abort_enter");
+	cluster_bufmgr_trace_cleanup(buf, "invalidate_retry", 8);
+	UT_ASSERT_EQ(trace_count, 0);
+	UT_ASSERT_EQ(header_reads, 0);
+	cluster_trace_cleanup = true;
+	CritSectionCount = 1;
+	cluster_xact_trace_cleanup("record_abort_enter");
+	cluster_bufmgr_trace_cleanup(buf, "invalidate_retry", 8);
+	UT_ASSERT_EQ(trace_count, 0);
+	UT_ASSERT_EQ(header_reads, 0);
+	CritSectionCount = 0;
+	cluster_xact_trace_cleanup("record_abort_enter");
+	UT_ASSERT_EQ(trace_count, 1);
+	UT_ASSERT(strstr(trace_message, "stage=record_abort_enter xid=7001 cid=9 hold=1 critical=0"));
+	cluster_bufmgr_trace_cleanup(buf, "invalidate_retry", 8);
+	UT_ASSERT_EQ(trace_count, 2);
+	UT_ASSERT_EQ(header_reads, 1);
+	UT_ASSERT(strstr(trace_message, "stage=invalidate_retry attempt=8 tag="));
+	UT_ASSERT(strstr(trace_message, "buffer=1 state="));
+	UT_ASSERT(strstr(trace_message, "refs=0 pcm="));
+	UT_ASSERT(strstr(trace_message, "gen=0 flags=0 token=0 activation=0 r4=0 delivery=0"));
+	UT_ASSERT((pg_atomic_read_u32(&buf->state) & BM_LOCKED) == 0);
+	cluster_trace_cleanup = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(12);
+	UT_RUN(test_cleanup_trace_disabled_and_complete_fields);
+	UT_RUN(test_pending_owner_snapshot_is_coherent_and_passive);
 	UT_RUN(test_cr_stop_requires_clean_immutable_metadata);
 	UT_RUN(test_required_init_and_lock_boundary);
 	UT_RUN(test_original_reservation_activation_delivery_completion);

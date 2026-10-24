@@ -27,9 +27,17 @@ def extract(source):
     print(state)
     if "shared_mx_deferred_pages" in state:
         print("#define FIXTURE_HAS_MX_DEFER 1")
+    if "shared_freeze_input_valid" in state:
+        print("#define FIXTURE_HAS_FREEZE_INPUT 1")
+    if "ClusterHeapFreezePageBatchV1 shared_freeze_batch" in state:
+        print("#define FIXTURE_HAS_FREEZE_BATCH 1")
     print('#include "cluster_vacuum_mx_test_stubs.h"')
     if re.search(r"^lazy_scan_shared_mx\(", source, re.M):
         print(function(source, "lazy_scan_shared_mx", "static bool"))
+    if re.search(r"^lazy_validate_shared_freeze\(", source, re.M):
+        print(function(source, "lazy_validate_shared_freeze", "static void"))
+    if re.search(r"^lazy_prepare_shared_freeze\(", source, re.M):
+        print(function(source, "lazy_prepare_shared_freeze", "static void"))
     print(function(source, "lazy_scan_heap", "static void"))
 
     # Keep both native assertions and the real publication decision intact.
@@ -43,6 +51,8 @@ def extract(source):
     start = source.index("\tvacrel->rel = rel;")
     end = source.index("\tvac_open_indexes(", start)
     print("static void\nfixture_bind_relation(LVRelState *vacrel, Relation rel)\n{")
+    print("\tconst VacuumParams fixture_params = {0};")
+    print("\tconst VacuumParams *params = &fixture_params;")
     print(source[start:end])
     print("}")
 

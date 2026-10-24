@@ -13,6 +13,9 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_catalog_trace.h"
+#endif
 
 #include "access/attmap.h"
 #include "access/genam.h"
@@ -48,7 +51,9 @@
 #include "catalog/pg_trigger.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h" /* PGRAC: spec-6.14 Q12 shared-catalog SET UNLOGGED refusal */
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_ts.h" /* PGRAC: spec-5.7 TT (§3.3) placement TT(S) guard */
+#include "cluster/storage/cluster_smgr.h"
 #endif
 #include "catalog/pg_type.h"
 #include "catalog/storage.h"
@@ -1370,14 +1375,19 @@ DropErrorMsgWrongType(const char *relname, char wrongkind, char rightkind)
  *		Implements DROP TABLE, DROP INDEX, DROP SEQUENCE, DROP VIEW,
  *		DROP MATERIALIZED VIEW, DROP FOREIGN TABLE
  */
-void
-RemoveRelations(DropStmt *drop)
+static void
+RemoveRelationsInternal(DropStmt *drop, bool check_storage_only, bool isTopLevel)
 {
 	ObjectAddresses *objects;
 	char		relkind;
 	ListCell   *cell;
-	int			flags = 0;
+	int flags
+		= check_storage_only ? PERFORM_DELETION_CHECK_STORAGE_ONLY | PERFORM_DELETION_QUIETLY : 0;
 	LOCKMODE	lockmode = AccessExclusiveLock;
+
+	flags |= PERFORM_DELETION_USER_COMMAND;
+	if (isTopLevel)
+		flags |= PERFORM_DELETION_TOPLEVEL;
 
 	/* DROP CONCURRENTLY uses a weaker lock, and has some restrictions */
 	if (drop->concurrent)
@@ -1476,7 +1486,8 @@ RemoveRelations(DropStmt *drop)
 		/* Not there? */
 		if (!OidIsValid(relOid))
 		{
-			DropErrorMsgNonExistent(rel, relkind, drop->missing_ok);
+			if (!check_storage_only || !drop->missing_ok)
+				DropErrorMsgNonExistent(rel, relkind, drop->missing_ok);
 			continue;
 		}
 
@@ -1526,6 +1537,18 @@ RemoveRelations(DropStmt *drop)
 	performMultipleDeletions(objects, drop->behavior, flags);
 
 	free_object_addresses(objects);
+}
+
+void
+RemoveRelations(DropStmt *drop, bool isTopLevel)
+{
+	RemoveRelationsInternal(drop, false, isTopLevel);
+}
+
+void
+CheckRelationsStorageDrop(DropStmt *drop, bool isTopLevel)
+{
+	RemoveRelationsInternal(drop, true, isTopLevel);
 }
 
 /*
@@ -1694,7 +1717,7 @@ RangeVarCallbackForDropRelation(const RangeVar *rel, Oid relOid, Oid oldRelOid,
  * are truncated and reindexed.
  */
 void
-ExecuteTruncate(TruncateStmt *stmt)
+ExecuteTruncate(TruncateStmt *stmt, bool isTopLevel)
 {
 	List	   *rels = NIL;
 	List	   *relids = NIL;
@@ -1793,7 +1816,7 @@ ExecuteTruncate(TruncateStmt *stmt)
 	}
 
 	ExecuteTruncateGuts(rels, relids, relids_logged,
-						stmt->behavior, stmt->restart_seqs, false);
+						stmt->behavior, stmt->restart_seqs, false, isTopLevel);
 
 	/* And close the rels */
 	foreach(cell, rels)
@@ -1822,7 +1845,7 @@ ExecuteTruncateGuts(List *explicit_rels,
 					List *relids,
 					List *relids_logged,
 					DropBehavior behavior, bool restart_seqs,
-					bool run_as_table_owner)
+					bool run_as_table_owner, bool isTopLevel)
 {
 	List	   *rels;
 	List	   *seq_relids = NIL;
@@ -1877,6 +1900,18 @@ ExecuteTruncateGuts(List *explicit_rels,
 		}
 	}
 
+	/* Preflight the entire expanded target set before triggers or any
+	 * truncation/rewrite; a later shared relation cannot refuse after an
+	 * earlier target has already changed. */
+	foreach (cell, rels) {
+		Relation rel = lfirst(cell);
+
+		if (RELKIND_HAS_STORAGE(rel->rd_rel->relkind)) {
+			RelationCheckStorageDDLTransaction(rel, isTopLevel, "TRUNCATE");
+			RelationCheckStorageDrain(rel->rd_locator, rel->rd_rel->relpersistence, "truncation");
+		}
+	}
+
 	/*
 	 * Check foreign key references.  In CASCADE mode, this should be
 	 * unnecessary since we just pulled in all the references; but as a
@@ -1909,6 +1944,10 @@ ExecuteTruncateGuts(List *explicit_rels,
 				Relation	seq_rel;
 
 				seq_rel = relation_open(seq_relid, AccessExclusiveLock);
+
+				RelationCheckStorageDDLTransaction(seq_rel, isTopLevel, "TRUNCATE");
+				RelationCheckStorageDrain(seq_rel->rd_locator, seq_rel->rd_rel->relpersistence,
+										  "truncation");
 
 				/* This check must match AlterSequence! */
 				if (!object_ownercheck(RelationRelationId, seq_relid, GetUserId()))
@@ -2036,9 +2075,13 @@ ExecuteTruncateGuts(List *explicit_rels,
 		 * a new relfilenumber in the current (sub)transaction, then we can
 		 * just truncate it in-place, because a rollback would cause the whole
 		 * table or the current physical file to be thrown away anyway.
+		 * Shared storage always takes the new-file path: the committed object
+		 * drain retires the old locator, which must not be reused in-place.
 		 */
-		if (rel->rd_createSubid == mySubid ||
-			rel->rd_newRelfilelocatorSubid == mySubid)
+		if ((rel->rd_createSubid == mySubid ||
+			 rel->rd_newRelfilelocatorSubid == mySubid) &&
+			!RelationStorageUsesClusterSharedPath(rel->rd_locator, rel->rd_backend,
+													 rel->rd_rel->relpersistence))
 		{
 			/* Immediate, non-rollbackable truncation is OK */
 			heap_truncate_one_rel(rel);
@@ -7270,6 +7313,12 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	((Form_pg_class) GETSTRUCT(reltup))->relnatts = newattnum;
 
 	CatalogTupleUpdate(pgclass, &reltup->t_self, reltup);
+#ifdef USE_PGRAC_CLUSTER
+	if (unlikely(cluster_trace_visibility_enabled))
+		cluster_catalog_trace_catalog("alter.pg_class_update", myrelid, reltup,
+									  GetCurrentCommandId(false));
+#endif
+
 
 	heap_freetuple(reltup);
 
@@ -7280,6 +7329,12 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 
 	/* Make the attribute's catalog entry visible */
 	CommandCounterIncrement();
+#ifdef USE_PGRAC_CLUSTER
+	if (unlikely(cluster_trace_visibility_enabled))
+		cluster_catalog_trace_descriptor("alter.after_cci", rel, newattnum,
+										 GetCurrentCommandId(false));
+#endif
+
 
 	/*
 	 * Store the DEFAULT, if any, in the catalogs
@@ -15316,6 +15371,8 @@ index_copy_data(Relation rel, RelFileLocator newrlocator)
 {
 	SMgrRelation dstrel;
 
+	RelationCheckStorageTransaction(newrlocator, rel->rd_rel->relpersistence, "copy");
+
 	dstrel = smgropen(newrlocator, rel->rd_backend);
 
 	/*
@@ -15350,16 +15407,52 @@ index_copy_data(Relation rel, RelFileLocator newrlocator)
 #endif
 		if (smgrexists(RelationGetSmgr(rel), forkNum))
 		{
-			smgrcreate(dstrel, forkNum, false);
+#ifdef USE_PGRAC_CLUSTER
+			uint64 fork_serial = 0;
+			bool fork_scoped = cluster_enabled && cluster_shared_config
+							   && cluster_interconnect_tier == CLUSTER_IC_TIER_1
+							   && !RecoveryInProgress()
+							   && rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP
+							   && cluster_smgr_which_for(newrlocator, rel->rd_backend) == 1;
 
-			/*
+			/* This constructor precedes the raw copy's separate finite owner. */
+			if (fork_scoped && !cluster_ko_create_begin_v3(newrlocator, &fork_serial))
+				elog(ERROR, "auxiliary fork creation conflicts with object drain");
+			PG_TRY();
+			{
+				if (fork_serial != 0 && !cluster_ko_create_write_begin_v3(newrlocator, fork_serial))
+					elog(ERROR, "auxiliary fork creation lost its original owner");
+#endif
+				smgrcreate(dstrel, forkNum, false);
+
+				/*
 			 * WAL log creation if the relation is persistent, or this is the
 			 * init fork of an unlogged relation.
 			 */
-			if (RelationIsPermanent(rel) ||
-				(rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED &&
-				 forkNum == INIT_FORKNUM))
-				log_smgrcreate(&newrlocator, forkNum);
+#ifdef USE_PGRAC_CLUSTER
+				if (fork_serial != 0
+					&& (RelationIsPermanent(rel)
+						|| (rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED
+							&& forkNum == INIT_FORKNUM))
+					&& !cluster_ko_create_write_begin_v3(newrlocator, fork_serial))
+					elog(ERROR, "auxiliary fork creation lost its owner before WAL");
+#endif
+				if (RelationIsPermanent(rel)
+					|| (rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED
+						&& forkNum == INIT_FORKNUM))
+					log_smgrcreate(&newrlocator, forkNum);
+#ifdef USE_PGRAC_CLUSTER
+			}
+			PG_CATCH();
+			{
+				cluster_ko_create_abort_v3(fork_serial);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+			/* File/WAL cleanup remains with its original owners. */
+			if (fork_serial != 0 && !cluster_ko_create_end_v3(fork_serial, true))
+				elog(ERROR, "auxiliary fork creation cannot retire its original owner");
+#endif
 			RelationCopyStorage(RelationGetSmgr(rel), dstrel, forkNum,
 								rel->rd_rel->relpersistence);
 		}

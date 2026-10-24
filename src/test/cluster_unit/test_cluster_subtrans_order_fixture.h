@@ -45,6 +45,10 @@ static char fixture_path[MAXPGPATH];
 static int lock_fd, error_level, error_errno;
 static bool catch_error, sync_fails, fail_copy_alloc, fail_critical_alloc;
 static unsigned sync_calls, file_reads;
+/* Only the shared-file callback result is a boundary in these native
+ * pendingOps tests; the real KO/callback pair has its own unit target. */
+static int shared_sync_result, shared_sync_errno;
+static unsigned shared_sync_calls;
 static int pause_writer[2], resume_writer[2], wait_reader[2];
 static int writer_pause;
 static bool reader_notify;
@@ -462,8 +466,10 @@ multixactmemberssyncfiletag(const FileTag *t pg_attribute_unused(), char *p pg_a
 int
 cluster_smgr_syncfiletag(const FileTag *t pg_attribute_unused(), char *p pg_attribute_unused())
 {
-	fixture_panic();
-	return 0;
+	shared_sync_calls++;
+	strlcpy(p, "shared-sync-fixture", MAXPGPATH);
+	errno = shared_sync_errno;
+	return shared_sync_result;
 }
 int
 cluster_smgr_unlinkfiletag(const FileTag *t pg_attribute_unused(), char *p pg_attribute_unused())

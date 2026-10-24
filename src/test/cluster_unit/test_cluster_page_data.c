@@ -3,6 +3,7 @@
  * Author: SqlRush <sqlrush@gmail.com> */
 #include "postgres.h"
 #include <unistd.h>
+#include <sys/wait.h>
 
 #include "access/xlog.h"
 #include "access/xact.h"
@@ -28,6 +29,7 @@
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "executor/instrument.h"
@@ -73,6 +75,79 @@ static LWLock mapping;
 static unsigned pins[2];
 static int data_slot = 1;
 static bool locks[2], resident[2], busy[2], selected, sf_blocked, bad_checksum, bad_bytes;
+/* The actual KO exclusion/marker race is covered by test_cluster_ko_drop_io.
+ * This boundary checks the CP caller's range and final cleanup ordering. */
+static bool directory_io_denied, directory_io_entered;
+static bool require_data_io_scope;
+static unsigned directory_io_begins, directory_io_ends;
+static RelFileLocator directory_io_locator;
+static ClusterPageDataReceiptV1 **receipt_publication_out;
+static ClusterPageStructuralReceiptV2 **structural_publication_out;
+static bool receipt_allocation_watch, receipt_allocation_error, receipt_cleanup_error;
+static bool receipt_allocation_close;
+static bool receipt_allocation_entered, receipt_allocation_clean, receipt_published_at_end;
+static unsigned receipt_allocations;
+static unsigned structural_observation_calls;
+
+bool
+cluster_ko_directory_io_begin_v3(RelFileLocator locator, ClusterKoDirectoryIoV3 *out)
+{
+	UT_ASSERT(!locks[0] && !locks[1]);
+	UT_ASSERT(!directory_io_entered);
+	directory_io_begins++;
+	directory_io_locator = locator;
+	memset(out, 0, sizeof(*out));
+	if (directory_io_denied)
+		return false;
+	directory_io_entered = true;
+	out->serial = 717;
+	return true;
+}
+
+bool
+cluster_ko_directory_io_end_v3(const ClusterKoDirectoryIoV3 *scope)
+{
+	UT_ASSERT(!locks[0] && !locks[1]);
+	UT_ASSERT(!pins[0] && !pins[1]);
+	UT_ASSERT(directory_io_entered && scope->serial == 717);
+	if (receipt_publication_out != NULL)
+		receipt_published_at_end = *receipt_publication_out != NULL;
+	if (structural_publication_out != NULL)
+		receipt_published_at_end = *structural_publication_out != NULL;
+	directory_io_entered = false;
+	directory_io_ends++;
+	return true;
+}
+
+/* KO's exact snapshot/marker races run in test_cluster_ko_drop_io. Here
+ * this module boundary supplies a qualified original operation only. */
+static bool pi_drop_available, pi_drop_current, pi_drop_sampled, pi_drop_expire_sync;
+static ClusterKoSharedMessageV3 pi_drop_request;
+
+bool
+cluster_ko_pi_storage_identity_v3(const ClusterSpaceIdentityKey *key,
+	const uint8 incarnation[16], const ClusterKoDirectoryIoV3 *call,
+	ClusterKoPiStorageIdentityV3 *out)
+{
+	if (!pi_drop_available || !pi_drop_current || !directory_io_entered
+		|| call->serial != 717 || !RelFileLocatorEquals(key->locator, pi_drop_request.base.key.locator))
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->request = pi_drop_request;
+	out->call = *call;
+	out->serial = 19;
+	pi_drop_sampled = true;
+	return true;
+}
+
+bool
+cluster_ko_pi_storage_identity_current_v3(const ClusterKoPiStorageIdentityV3 *sample)
+{
+	return pi_drop_current && !directory_io_denied && directory_io_entered && sample->call.serial == 717
+		&& sample->serial == 19
+		&& memcmp(&sample->request, &pi_drop_request, sizeof(pi_drop_request)) == 0;
+}
+
 static bool redeclare_scan_test;
 static int redeclare_scope = 1;
 static unsigned redeclare_content_attempts;
@@ -157,6 +232,7 @@ cluster_ko_shared_structure_observation_v2(uint32 slot, uint64 serial,
 										   ClusterPageWalBindingV1 *terminal, void *wal,
 										   Size length)
 {
+	structural_observation_calls++;
 	if (!structural_scope_ready || slot != 7 || serial != 19 || terminal == NULL || wal == NULL
 		|| length != sizeof(structural_wal))
 		return false;
@@ -606,6 +682,11 @@ static void
 cluster_bufmgr_unpin_for_gcs(BufferDesc *buf)
 {
 	UT_ASSERT(!locks[buf->buf_id] && pins[buf->buf_id]);
+	if (receipt_cleanup_error) {
+		receipt_cleanup_error = false;
+		InterruptHoldoffCount = 0;
+		pg_re_throw();
+	}
 	pins[buf->buf_id]--;
 }
 static bool
@@ -702,6 +783,8 @@ GetXLogInsertRecPtr(void)
 void
 XLogFlush(XLogRecPtr lsn)
 {
+	if (require_data_io_scope)
+		UT_ASSERT(directory_io_entered);
 	UT_ASSERT_EQ(lsn, PageGetLSN(pages[data_slot].data));
 	wal_flushes++;
 	fault(1);
@@ -724,12 +807,16 @@ DataChecksumsEnabled(void)
 SMgrRelation
 smgropen(RelFileLocator r, BackendId b)
 {
+	if (require_data_io_scope)
+		UT_ASSERT(directory_io_entered);
 	UT_ASSERT(RelFileLocatorEquals(r, target.identity.locator));
 	return &relation;
 }
 void
 smgrwrite(SMgrRelation r, ForkNumber f, BlockNumber b, const void *data, bool skip)
 {
+	if (require_data_io_scope)
+		UT_ASSERT(directory_io_entered);
 	if (storage_write_hook != NULL) {
 		storage_write_hook(r, f, b, data, skip);
 		return;
@@ -744,7 +831,9 @@ smgrwrite(SMgrRelation r, ForkNumber f, BlockNumber b, const void *data, bool sk
 void
 smgrimmedsync(SMgrRelation r, ForkNumber f)
 {
-	UT_ASSERT(!locks[1] && (locks[0] || (storage_read && data_slot == 0)));
+	if (require_data_io_scope)
+		UT_ASSERT(directory_io_entered);
+	UT_ASSERT(!locks[1] && (locks[0] || (storage_read && (data_slot == 0 || (pi_drop_sampled && directory_io_entered)))));
 	fault(3);
 	UT_ASSERT_EQ(fsync(fileno(file)), 0);
 	syncs++;
@@ -775,13 +864,17 @@ smgrimmedsync(SMgrRelation r, ForkNumber f)
 		pg_atomic_write_u32(&own[data_slot].flags, PCM_OWN_FLAG_REVOKING);
 	if (storage_cut_changed)
 		storage_cut_current = false;
+	if (pi_drop_expire_sync)
+		pi_drop_current = false;
 	if (storage_space_changed)
 		pg_atomic_fetch_add_u64(&own[0].generation, 1);
 }
 void
 smgrread(SMgrRelation r, ForkNumber f, BlockNumber b, void *out)
 {
-	UT_ASSERT(!locks[1] && (locks[0] || (storage_read && data_slot == 0))
+	if (require_data_io_scope)
+		UT_ASSERT(directory_io_entered);
+	UT_ASSERT(!locks[1] && (locks[0] || (storage_read && (data_slot == 0 || (pi_drop_sampled && directory_io_entered))))
 			  && (storage_read || syncs));
 	fault(storage_read && reads > 0 ? 5 : 4);
 	reads++;
@@ -855,7 +948,38 @@ shared_buffer_write_error_callback(void *arg)
 #include "test_cluster_space_recovery_flush.inc"
 #include "test_cluster_page_flush.inc"
 #include "test_cluster_page_data_scn.inc"
+/* Observe the real caller's allocation boundary, not a replacement receipt
+ * builder. The existing allocator still owns successful memory. */
+static void
+receipt_publication_allocation(void)
+{
+	if (receipt_allocation_watch) {
+		receipt_allocations++;
+		receipt_allocation_entered = directory_io_entered;
+		receipt_allocation_clean = !locks[0] && !locks[1] && !pins[0] && !pins[1];
+		if (receipt_allocation_close)
+			directory_io_denied = true;
+		if (receipt_allocation_error)
+			pg_re_throw();
+	}
+}
+static void *
+receipt_publication_alloc0(Size size)
+{
+	receipt_publication_allocation();
+	return palloc0(size);
+}
+static void *
+receipt_publication_alloc(Size size)
+{
+	receipt_publication_allocation();
+	return palloc(size);
+}
+#define palloc receipt_publication_alloc
+#define palloc0 receipt_publication_alloc0
 #include "test_cluster_page_data.inc"
+#undef palloc0
+#undef palloc
 #include "test_cluster_block_redeclare_scan.inc"
 
 static void
@@ -894,6 +1018,21 @@ static void
 reset(void)
 {
 	PageHeader p = (PageHeader)pages[1].data;
+
+	UT_ASSERT(!directory_io_entered);
+	directory_io_denied = false;
+	pi_drop_available = pi_drop_sampled = pi_drop_expire_sync = false;
+	pi_drop_current = true;
+	memset(&pi_drop_request, 0, sizeof(pi_drop_request));
+	require_data_io_scope = false;
+	directory_io_begins = directory_io_ends = 0;
+	receipt_publication_out = NULL;
+	structural_publication_out = NULL;
+	receipt_allocation_watch = receipt_allocation_error = receipt_cleanup_error = false;
+	receipt_allocation_close = false;
+	receipt_allocation_entered = receipt_allocation_clean = receipt_published_at_end = false;
+	receipt_allocations = 0;
+	structural_observation_calls = 0;
 
 #ifndef PGRAC_TEST_REAL_PI_WRITEBACK
 	recovered_count = 3;
@@ -1011,7 +1150,11 @@ success_and_old_completion(void)
 	ClusterPageDataTargetV1 out;
 	PGAlignedBlock disk;
 	reset();
+	require_data_io_scope = true;
 	UT_ASSERT(cluster_bufmgr_write_page_data_v1(&target, &receipt));
+	UT_ASSERT(!directory_io_entered);
+	UT_ASSERT_EQ(directory_io_begins, 1);
+	UT_ASSERT_EQ(directory_io_ends, 1);
 	if (receipt == NULL)
 		return;
 	UT_ASSERT(receipt != NULL);
@@ -1031,6 +1174,20 @@ success_and_old_completion(void)
 	UT_ASSERT(pg_atomic_read_u32(&descriptors[1].bufferdesc.state) & BM_DIRTY);
 	cluster_page_data_receipt_free_v1(&receipt);
 	UT_ASSERT(receipt == NULL);
+}
+
+static void
+data_refuses_closed_object_before_original_write_work(void)
+{
+	ClusterPageDataReceiptV1 *receipt = NULL;
+	reset();
+	directory_io_denied = true;
+	UT_ASSERT(!cluster_bufmgr_write_page_data_v1(&target, &receipt));
+	UT_ASSERT(receipt == NULL && !directory_io_entered);
+	UT_ASSERT_EQ(writes + syncs + reads + wal_flushes, 0);
+	UT_ASSERT(pg_atomic_read_u32(&descriptors[1].bufferdesc.state) & BM_DIRTY);
+	clean();
+	cluster_page_data_receipt_free_v1(&receipt);
 }
 static void
 identity_refusals(void)
@@ -1137,6 +1294,7 @@ io_failure_cleanup(void)
 		ClusterPageDataReceiptV1 *r = NULL;
 		volatile bool caught = false;
 		reset();
+		require_data_io_scope = true;
 		throw_at = at;
 		PG_TRY();
 		{
@@ -1150,6 +1308,9 @@ io_failure_cleanup(void)
 		UT_ASSERT(caught);
 		UT_ASSERT(r == NULL);
 		UT_ASSERT_EQ(aborts, at <= 2 ? 1 : 0);
+		UT_ASSERT(!directory_io_entered);
+		UT_ASSERT_EQ(directory_io_begins, 1);
+		UT_ASSERT_EQ(directory_io_ends, 1);
 		clean();
 	}
 }
@@ -1373,6 +1534,40 @@ ordinary_clean_write_discharges_first_after_later_capture_loss(void)
 	clean();
 }
 
+#ifndef PGRAC_TEST_REAL_PI_WRITEBACK
+static void
+ordinary_flush_attempt_tracks_actual_data_submission(void)
+{
+	BufferDesc *buf;
+	volatile bool attempted = false;
+
+	reset();
+	buf = &descriptors[1].bufferdesc;
+	pins[1] = 1;
+	locks[0] = locks[1] = true;
+	cluster_smart_fusion = sf_blocked = true;
+	FlushBufferWithAttempt(buf, &relation, IOOBJECT_RELATION, IOCONTEXT_NORMAL, &attempted);
+	UT_ASSERT(!attempted);
+	UT_ASSERT(pg_atomic_read_u32(&buf->state) & BM_DIRTY);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&buf->state) & BM_IO_IN_PROGRESS, 0);
+	UT_ASSERT_EQ(writes + wal_flushes + syncs, 0);
+	sf_blocked = false;
+	FlushBufferWithAttempt(buf, &relation, IOOBJECT_RELATION, IOCONTEXT_NORMAL, &attempted);
+	UT_ASSERT(attempted);
+	UT_ASSERT_EQ(writes, 1);
+	UT_ASSERT_EQ(wal_flushes, 1);
+	UT_ASSERT_EQ(syncs, 0); /* DATA submission is not a durable receipt. */
+	UT_ASSERT_EQ(pg_atomic_read_u32(&buf->state) & (BM_DIRTY | BM_IO_IN_PROGRESS), 0);
+	attempted = false;
+	FlushBufferWithAttempt(buf, &relation, IOOBJECT_RELATION, IOCONTEXT_NORMAL, &attempted);
+	UT_ASSERT(!attempted); /* An already clean page contributes no new write. */
+	UT_ASSERT_EQ(writes, 1);
+	locks[0] = locks[1] = false;
+	pins[1] = 0;
+	clean();
+}
+#endif
+
 /* Decoded WAL is an explicit input boundary; actual preflight, detached FPI
  * apply, dependency sealing, DATA I/O and receipt qualification run together. */
 static RfPageOnlinePlanV1 *
@@ -1516,6 +1711,9 @@ n_s_storage_observation_qualifies_only_terminal_data(void)
 		}
 		UT_ASSERT(cluster_bufmgr_observe_pi_storage_v1(&target, &cut, plan, sources, 3, &receipt));
 		UT_ASSERT(receipt != NULL);
+		UT_ASSERT(!directory_io_entered);
+		UT_ASSERT_EQ(directory_io_begins, 1);
+		UT_ASSERT_EQ(directory_io_ends, 1);
 		UT_ASSERT_EQ(writes + wal_flushes, 0);
 		UT_ASSERT_EQ(syncs, 1);
 		UT_ASSERT_EQ(reads, 2);
@@ -1530,6 +1728,24 @@ n_s_storage_observation_qualifies_only_terminal_data(void)
 		rf_page_online_plan_destroy_v1(&plan);
 		clean();
 	}
+}
+
+static void
+storage_observation_refuses_closed_drop_before_io(void)
+{
+	ClusterWalSourceRef sources[3];
+	ClusterPcmPiStorageCutV1 cut;
+	ClusterPageDataReceiptV1 *receipt = NULL;
+	RfPageOnlinePlanV1 *plan = prepare_storage_observation(sources, &cut);
+
+	directory_io_denied = true;
+	UT_ASSERT(!cluster_bufmgr_observe_pi_storage_v1(&target, &cut, plan, sources, 3, &receipt));
+	UT_ASSERT(receipt == NULL && !directory_io_entered);
+	UT_ASSERT_EQ(directory_io_begins, 1);
+	UT_ASSERT_EQ(directory_io_ends, 0);
+	UT_ASSERT_EQ(reads + writes + syncs + wal_flushes, 0);
+	rf_page_online_plan_destroy_v1(&plan);
+	clean();
 }
 
 static void
@@ -1597,6 +1813,9 @@ storage_observation_releases_space_on_io_error(void)
 		}
 		PG_END_TRY();
 		UT_ASSERT(caught);
+		UT_ASSERT(!directory_io_entered);
+		UT_ASSERT_EQ(directory_io_begins, 1);
+		UT_ASSERT_EQ(directory_io_ends, 1);
 		UT_ASSERT(receipt == NULL);
 		UT_ASSERT_EQ(writes + wal_flushes + aborts, 0);
 		rf_page_online_plan_destroy_v1(&plan);
@@ -5247,13 +5466,284 @@ space_storage_io_errors_never_export_or_leak_identity(void)
 		}
 }
 
+
+/* Reconstruct real receipts from existing DATA facts or decoded structural
+ * plans. Job/notice and KO admission remain explicit environment fixtures. */
+static void
+receipt_rebuild_case(unsigned mode, unsigned fault)
+{
+	const SCN tokens[] = { 10, scn_encode(1, 20), 30 };
+	ClusterPageDataReceiptV1 *written = NULL, *data = NULL;
+	ClusterPageStructuralReceiptV2 *master = NULL, *structural = NULL;
+	ClusterThreadRecoveryFabricPlanV1 *plan = NULL;
+	ClusterPageWalBindingV1 terminal, pi[2];
+	ClusterSpaceStructureChange change;
+	RelFileLocator locator;
+	volatile bool caught = false, result = false;
+	unsigned io_before;
+
+	if (mode < 2) {
+		ClusterPcmPiWriteCutV1 cut;
+		reset();
+		cut = data_pi_cut();
+		UT_ASSERT(cluster_bufmgr_write_tag_data_at_cut_v1(&identity.key, &cut, &written));
+		UT_ASSERT(cluster_page_data_pi_export_v1(written, &remote_data_binding, &remote_data_cut));
+		UT_ASSERT(cluster_page_data_pi_fact_v1(written, &notice_fact));
+		remote_data_ready = notice_ready = true;
+		locator = target.identity.locator;
+	} else {
+		plan = space_structural_plan_internal(true, false, true, false, &terminal, &change,
+											  tokens, MAIN_FORKNUM, pi);
+		prepare_structural_master(&terminal, &change, &pi[0].identity, 0);
+		locator = pi[0].identity.locator;
+		if (mode == 3) {
+			UT_ASSERT(cluster_page_structural_from_ko_v2(7, 19, &pi[0].identity, plan, &master));
+			UT_ASSERT(cluster_page_structural_pi_fact_v2(master, 1, &structural_notice_fact));
+			structural_notice_fact.proof.structural.ko.peer_boot
+				= pi[0].source.claim.identity.origin_owner_incarnation;
+			structural_notice_ready = true;
+			cluster_node_id = 1;
+			writer = pi[0].source;
+		}
+	}
+	UT_ASSERT(!directory_io_entered);
+	directory_io_begins = directory_io_ends = structural_observation_calls = 0;
+	memset(&directory_io_locator, 0, sizeof(directory_io_locator));
+	receipt_publication_out = mode < 2 ? &data : NULL;
+	structural_publication_out = mode >= 2 ? &structural : NULL;
+	receipt_allocation_watch = true;
+	receipt_allocation_error = fault == 2;
+	receipt_allocation_close = fault == 3;
+	directory_io_denied = fault == 1;
+	if (fault == 4) {
+		if (mode == 2)
+			structural_terminal.record_crc++;
+		else
+			structural_notice_fact.proof.structural.terminal.binding.record_crc++;
+	}
+	io_before = writes + reads + syncs + wal_flushes + pi_discards + logical_pi_retire_calls;
+	PG_TRY();
+	{
+		if (mode == 0)
+			result = cluster_page_data_from_remote_v1((void *)1, &data);
+		else if (mode == 1)
+			result = cluster_page_data_from_notice_v1((void *)1, 0, &data);
+		else if (mode == 2)
+			result = cluster_page_structural_from_ko_v2(7, 19, &pi[0].identity, plan, &structural);
+		else
+			result = cluster_page_structural_from_notice_v2((void *)41, 2, plan, &structural);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT_EQ(caught, fault == 2);
+	UT_ASSERT_EQ(result, fault == 0 || fault == 3);
+	UT_ASSERT_EQ(data != NULL || structural != NULL, fault == 0 || fault == 3);
+	UT_ASSERT_EQ(directory_io_begins, 1);
+	UT_ASSERT(RelFileLocatorEquals(directory_io_locator, locator));
+	UT_ASSERT_EQ(directory_io_ends, fault == 1 ? 0 : 1);
+	UT_ASSERT(!directory_io_entered);
+	UT_ASSERT_EQ(receipt_allocations, fault == 1 || fault == 4 ? 0 : 1);
+	if (fault != 1 && fault != 4) {
+		UT_ASSERT(receipt_allocation_entered);
+		UT_ASSERT(receipt_allocation_clean);
+	}
+	UT_ASSERT_EQ(receipt_published_at_end, fault == 0 || fault == 3);
+	if (mode == 2 && fault == 1)
+		UT_ASSERT_EQ(structural_observation_calls, 0);
+	UT_ASSERT_EQ(writes + reads + syncs + wal_flushes + pi_discards + logical_pi_retire_calls,
+				 io_before);
+	if (fault == 3) {
+		/* The entered call may publish before end; a later constructor
+		 * cannot reopen that same old locator after the close. */
+		cluster_page_data_receipt_free_v1(&data);
+		cluster_page_structural_receipt_free_v2(&structural);
+		if (mode == 0)
+			UT_ASSERT(!cluster_page_data_from_remote_v1((void *)1, &data));
+		else if (mode == 1)
+			UT_ASSERT(!cluster_page_data_from_notice_v1((void *)1, 0, &data));
+		else if (mode == 2)
+			UT_ASSERT(!cluster_page_structural_from_ko_v2(7, 19, &pi[0].identity, plan, &structural));
+		else
+			UT_ASSERT(!cluster_page_structural_from_notice_v2((void *)41, 2, plan, &structural));
+		UT_ASSERT(data == NULL && structural == NULL);
+		UT_ASSERT_EQ(directory_io_begins, 2);
+		UT_ASSERT_EQ(directory_io_ends, 1);
+		UT_ASSERT_EQ(receipt_allocations, 1);
+	}
+	receipt_allocation_watch = false;
+	receipt_publication_out = NULL;
+	structural_publication_out = NULL;
+	cluster_page_data_receipt_free_v1(&data);
+	cluster_page_data_receipt_free_v1(&written);
+	cluster_page_structural_receipt_free_v2(&structural);
+	cluster_page_structural_receipt_free_v2(&master);
+	if (plan != NULL)
+		cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
+	cluster_node_id = 0;
+	clean();
+}
+
+static void
+receipt_rebuild_closed_identity_refuses_before_observation(void)
+{
+	for (unsigned mode = 0; mode < 4; mode++)
+		receipt_rebuild_case(mode, 1);
+}
+
+static void
+receipt_rebuild_owns_allocation_and_publication(void)
+{
+	for (unsigned mode = 0; mode < 4; mode++)
+		receipt_rebuild_case(mode, 0);
+}
+
+static void
+receipt_rebuild_allocation_error_releases_only_its_call(void)
+{
+	for (unsigned mode = 0; mode < 4; mode++)
+		receipt_rebuild_case(mode, 2);
+}
+
+static void
+receipt_rebuild_closure_during_call_refuses_later_work(void)
+{
+	for (unsigned mode = 0; mode < 4; mode++)
+		receipt_rebuild_case(mode, 3);
+}
+
+static void
+receipt_rebuild_original_proof_refusal_releases_call(void)
+{
+	for (unsigned mode = 2; mode < 4; mode++)
+		receipt_rebuild_case(mode, 4);
+}
+
+/* Exercise the actual DATA/storage producers. A committed marker must not
+ * overtake allocation/publication after physical cleanup. */
+static void
+receipt_publication_case(int mode, int error_stage)
+{
+	ClusterPageDataReceiptV1 *receipt = NULL;
+	ClusterWalSourceRef sources[3];
+	ClusterPageWalBindingV1 ancestor;
+	ClusterPcmPiStorageCutV1 cut;
+	RfPageOnlinePlanV1 *plan = NULL;
+	ClusterThreadRecoveryFabricPlanV1 *fabric = NULL;
+	volatile bool caught = false, result = false;
+
+	if (mode == 0)
+		reset();
+	else if (mode == 1)
+		plan = prepare_storage_observation(sources, &cut);
+	else
+		fabric = space_storage_fixture(mode - 2, false, false, sources, &ancestor, &cut);
+	receipt_publication_out = &receipt;
+	receipt_allocation_watch = true;
+	receipt_allocation_error = error_stage == 1;
+	receipt_cleanup_error = error_stage == 2;
+	PG_TRY();
+	{
+		if (mode == 0)
+			result = cluster_bufmgr_write_page_data_v1(&target, &receipt);
+		else if (mode == 1)
+			result = cluster_bufmgr_observe_pi_storage_v1(&target, &cut, plan, sources, 3,
+														  &receipt);
+		else
+			result = cluster_bufmgr_observe_pi_space_storage_v1(&identity.key, &cut, fabric,
+																 sources, 2, &receipt);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT_EQ(caught, error_stage != 0);
+	UT_ASSERT_EQ(result, error_stage == 0);
+	UT_ASSERT_EQ(receipt != NULL, error_stage == 0);
+	UT_ASSERT_EQ(directory_io_begins, 1);
+	if (error_stage == 2) {
+		UT_ASSERT(directory_io_entered);
+		UT_ASSERT_EQ(directory_io_ends, 0);
+		UT_ASSERT_EQ(receipt_allocations, 0);
+		UT_ASSERT(pins[0] || pins[1]);
+		/* Only child processes exercise this uncertain cleanup. Their exit
+		 * is test isolation, not a production recovery/completion proof. */
+		return;
+	}
+	UT_ASSERT_EQ(receipt_allocations, 1);
+	UT_ASSERT(receipt_allocation_entered);
+	UT_ASSERT(receipt_allocation_clean);
+	UT_ASSERT_EQ(receipt_published_at_end, error_stage == 0);
+	UT_ASSERT(!directory_io_entered);
+	UT_ASSERT_EQ(directory_io_ends, 1);
+	receipt_allocation_watch = false;
+	receipt_publication_out = NULL;
+	cluster_page_data_receipt_free_v1(&receipt);
+	if (plan != NULL)
+		rf_page_online_plan_destroy_v1(&plan);
+	if (fabric != NULL)
+		cluster_thread_recovery_fabric_plan_destroy_v1(&fabric);
+	clean();
+}
+
+static void
+receipt_publication_stays_inside_original_call(void)
+{
+	for (int mode = 0; mode < 4; mode++)
+		receipt_publication_case(mode, 0);
+}
+
+static void
+receipt_allocation_error_ends_call_without_output(void)
+{
+	for (int mode = 0; mode < 4; mode++)
+		receipt_publication_case(mode, 1);
+}
+
+static void
+receipt_cleanup_error_keeps_unknown_call_owned(void)
+{
+	for (int mode = 0; mode < 4; mode++) {
+		pid_t child;
+		int status;
+		if (mode == 2)
+			continue; /* SPACE0 storage observation has no physical pin. */
+		fflush(NULL);
+		child = fork();
+		UT_ASSERT(child >= 0);
+		if (child == 0) {
+			ut_current_failed = 0;
+			receipt_publication_case(mode, 2);
+			fflush(NULL);
+			_exit(ut_current_failed ? 1 : 0);
+		}
+		if (child > 0) {
+			UT_ASSERT_EQ(waitpid(child, &status, 0), child);
+			UT_ASSERT(WIFEXITED(status));
+			UT_ASSERT_EQ(WEXITSTATUS(status), 0);
+		}
+	}
+}
+
 #endif
 
 int
 main(void)
 {
 #ifndef PGRAC_TEST_REAL_PI_WRITEBACK
-	UT_PLAN(77);
+	UT_PLAN(88);
+	UT_RUN(receipt_rebuild_closed_identity_refuses_before_observation);
+	UT_RUN(receipt_rebuild_owns_allocation_and_publication);
+	UT_RUN(receipt_rebuild_allocation_error_releases_only_its_call);
+	UT_RUN(receipt_rebuild_closure_during_call_refuses_later_work);
+	UT_RUN(receipt_rebuild_original_proof_refusal_releases_call);
+	UT_RUN(receipt_publication_stays_inside_original_call);
+	UT_RUN(receipt_allocation_error_ends_call_without_output);
+	UT_RUN(receipt_cleanup_error_keeps_unknown_call_owned);
+	UT_RUN(ordinary_flush_attempt_tracks_actual_data_submission);
 	UT_RUN(structural_remote_ack_import_binds_original_inputs_and_cut);
 	UT_RUN(structural_remote_ack_refuses_transport_input_and_collector_drift);
 	UT_RUN(structural_remote_notice_uses_actual_plan_and_peer_physical_owner);
@@ -5288,7 +5778,7 @@ main(void)
 	UT_RUN(recovery_ack_cannot_outlive_original_input_membership_or_owner);
 	UT_RUN(recovery_ack_refuses_successor_pi_not_covered_by_actual_data);
 #else
-	UT_PLAN(44);
+	UT_PLAN(46);
 #endif
 	UT_RUN(space_data_writes_exact_typed_live_and_tombstoned_pages);
 	UT_RUN(space_binding_rejects_wrong_typed_identity_before_io);
@@ -5313,6 +5803,7 @@ main(void)
 	UT_RUN(same_claim_data_under_later_root_ceiling);
 	UT_RUN(same_claim_pi_under_later_root_ceiling);
 	UT_RUN(success_and_old_completion);
+	UT_RUN(data_refuses_closed_object_before_original_write_work);
 	UT_RUN(identity_refusals);
 	UT_RUN(authority_refusals);
 	UT_RUN(explicit_wal_origin);
@@ -5326,6 +5817,7 @@ main(void)
 	UT_RUN(plan_sources_are_immutable);
 	UT_RUN(pi_cut_must_match_current_holder_before_data);
 	UT_RUN(physical_receipts_close_only_exact_contributions);
+	UT_RUN(storage_observation_refuses_closed_drop_before_io);
 	UT_RUN(n_s_storage_observation_qualifies_only_terminal_data);
 	UT_RUN(storage_observation_rejects_incomplete_or_changed_proof);
 	UT_RUN(storage_observation_releases_space_on_io_error);

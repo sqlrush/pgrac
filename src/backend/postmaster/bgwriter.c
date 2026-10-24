@@ -58,6 +58,7 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_pi_data.h"
 #include "cluster/cluster_pi_writeback.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_pi_rebuild.h"
 #include "cluster/cluster_wal_cut.h"
 #endif
@@ -244,7 +245,13 @@ BackgroundWriterMain(void)
 		/*
 		 * Do one cycle of dirty-buffer writing.
 		 */
-		can_hibernate = BgBufferSync(&wb_context);
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_normal_stop_requested()) {
+			can_hibernate = true;
+			cluster_pi_writeback_bgwriter_quiesced_v1();
+		} else
+#endif
+			can_hibernate = BgBufferSync(&wb_context);
 #ifdef USE_PGRAC_CLUSTER
 		/* GCS write requests execute here, outside CONTROL dispatch and with
 		 * the native auxiliary ResourceOwner/error cleanup. Runnable census
@@ -302,7 +309,13 @@ BackgroundWriterMain(void)
 		 * Checkpointer, when active, is barely ever in its mainloop and thus
 		 * makes it hard to log regularly.
 		 */
-		if (XLogStandbyInfoActive() && !RecoveryInProgress())
+		if (XLogStandbyInfoActive() && !RecoveryInProgress()
+#ifdef USE_PGRAC_CLUSTER
+			/* The retained BG serves old I/O; new ordinary WAL must stop
+			 * before quiescence and the final shutdown checkpoint. */
+			&& !cluster_normal_stop_requested()
+#endif
+		)
 		{
 			TimestampTz timeout = 0;
 			TimestampTz now = GetCurrentTimestamp();

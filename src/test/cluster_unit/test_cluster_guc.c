@@ -100,6 +100,11 @@ static int cold_plan_min_value = -1;
 static int cold_plan_max_value = -1;
 static GucContext cold_plan_context = PGC_INTERNAL;
 static int cold_plan_flags = 0;
+static char **visibility_trace_addr;
+static const char *visibility_trace_boot;
+static GucContext visibility_trace_context = PGC_INTERNAL;
+static GucStringCheckHook visibility_trace_check;
+static GucStringAssignHook visibility_trace_assign;
 
 static int *undo_buffers_value_addr = NULL;
 static int undo_buffers_boot_value = -1;
@@ -216,7 +221,13 @@ DefineCustomStringVariable(const char *name, const char *short_desc pg_attribute
 						   GucStringAssignHook assign_hook pg_attribute_unused(),
 						   GucShowHook show_hook pg_attribute_unused())
 {
-	if (strcmp(name, "cluster.external_fence_socket_path") == 0) {
+	if (strcmp(name, "cluster.trace_visibility_relids") == 0) {
+		visibility_trace_addr = valueAddr;
+		visibility_trace_boot = bootValue;
+		visibility_trace_context = context;
+		visibility_trace_check = check_hook;
+		visibility_trace_assign = assign_hook;
+	} else if (strcmp(name, "cluster.external_fence_socket_path") == 0) {
 		external_fence_socket_value_addr = valueAddr;
 		external_fence_socket_boot_value = bootValue;
 		external_fence_socket_context = context;
@@ -789,14 +800,38 @@ UT_TEST(test_shared_catalog_requires_durable_checkpoint_publication)
 	cluster_shared_catalog = false;
 }
 
+UT_TEST(test_catalog_trace_is_off_and_superuser_scoped)
+{
+	cluster_init_guc();
+	UT_ASSERT_NOT_NULL(visibility_trace_addr);
+	UT_ASSERT_NOT_NULL(visibility_trace_boot);
+	UT_ASSERT_EQ(visibility_trace_context, PGC_SUSET);
+	UT_ASSERT_NOT_NULL(visibility_trace_check);
+	UT_ASSERT_NOT_NULL(visibility_trace_assign);
+	if (visibility_trace_boot != NULL)
+		UT_ASSERT_EQ(strlen(visibility_trace_boot), 0);
+	if (visibility_trace_check != NULL && visibility_trace_assign != NULL) {
+		char *valid = "1259,1249,1247,16385,4294967295";
+		char *invalid = "1259,4294967296";
+		void *extra = NULL;
+		UT_ASSERT(visibility_trace_check(&valid, &extra, PGC_S_SESSION));
+		visibility_trace_assign(valid, NULL);
+		UT_ASSERT(cluster_trace_visibility_enabled);
+		UT_ASSERT(!visibility_trace_check(&invalid, &extra, PGC_S_SESSION));
+		visibility_trace_assign("", NULL);
+		UT_ASSERT(!cluster_trace_visibility_enabled);
+	}
+}
+
 int
 main(void)
 {
 #ifdef ENABLE_INJECTION
-	UT_PLAN(12);
+	UT_PLAN(13);
 #else
-	UT_PLAN(11);
+	UT_PLAN(12);
 #endif
+	UT_RUN(test_catalog_trace_is_off_and_superuser_scoped);
 	UT_RUN(test_cluster_node_id_default_is_minus_one);
 	UT_RUN(test_cluster_node_id_address_stable);
 	UT_RUN(test_cluster_init_guc_symbol_is_linkable);

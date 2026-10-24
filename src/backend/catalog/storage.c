@@ -40,6 +40,8 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_ko.h" /* PGRAC: spec-5.7 D6 object-reuse flush barrier */
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_space_recovery.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -80,6 +82,9 @@ typedef struct PendingRelDelete
 	BackendId	backend;		/* InvalidBackendId if not a temp rel */
 	bool		atCommit;		/* T=delete at commit; F=delete at abort */
 	int			nestLevel;		/* xact nesting level of request */
+#ifdef USE_PGRAC_CLUSTER
+	ClusterSpaceCreateObservationV1 shared_create;	/* process-local birth only */
+#endif
 	struct PendingRelDelete *next;	/* linked-list link */
 } PendingRelDelete;
 
@@ -129,6 +134,99 @@ AddPendingSync(const RelFileLocator *rlocator)
 }
 
 /*
+ * Match the storage-mode/relation-class eligibility of shared heap writes.
+ * Internal DDL must also reject before files, SPACE identity or abort-delete
+ * ownership are created. A child need not have assigned an XID yet.
+ */
+void
+RelationCheckStorageTransaction(RelFileLocator rlocator, char relpersistence,
+								const char *operation)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (relpersistence != RELPERSISTENCE_TEMP
+		&& cluster_storage_mode_enabled()
+		&& cluster_pcm_x_relation_number_tracked(rlocator.relNumber, cluster_shared_catalog)
+		&& IsSubTransaction())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("shared relation storage %s does not support subtransactions", operation),
+				 errdetail("PGRAC_FAMILY=HEAP_ITL "
+						   "PGRAC_REASON=SHARED_ITL_SUBTRANSACTION_UNSUPPORTED PGRAC_NODE=%d",
+						   cluster_node_id),
+				 errhint("Execute this operation in a top-level transaction. "
+						 "SAVEPOINT, PL/pgSQL EXCEPTION blocks, psql ON_ERROR_ROLLBACK "
+						 "and driver autosave create subtransactions.")));
+#endif
+}
+
+/* Check the configured transport, never the mux's current fallback choice.
+ * Both catalog preflight and internal storage producers use this predicate. */
+void
+RelationCheckStorageDrain(RelFileLocator rlocator, char relpersistence, const char *operation)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (relpersistence != RELPERSISTENCE_TEMP && cluster_storage_mode_enabled()
+		&& cluster_interconnect_tier != CLUSTER_IC_TIER_1
+		&& cluster_smgr_which_for(rlocator, InvalidBackendId) == 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("shared relation storage %s requires the tier1 interconnect", operation),
+				 errdetail("Object drain is not supported by the configured interconnect tier."),
+				 errhint("Set cluster.interconnect_tier=tier1 and restart before retrying this "
+						 "operation.")));
+#endif
+}
+
+/*
+ * Return the same storage admission decision used by smgropen for a
+ * relation that is about to be removed or truncated.  This read-only
+ * classification does not impose a transaction policy; temporary and
+ * backend-local relations remain on their native storage path.
+ */
+bool
+RelationStorageUsesClusterSharedPath(RelFileLocator rlocator, BackendId backend,
+									 char relpersistence)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (backend != InvalidBackendId || relpersistence == RELPERSISTENCE_TEMP
+		|| !cluster_storage_mode_enabled())
+		return false;
+
+	return cluster_smgr_which_for(rlocator, backend) == 1;
+#else
+	(void) rlocator;
+	(void) backend;
+	(void) relpersistence;
+	return false;
+#endif
+}
+
+/* User DROP/TRUNCATE must finish as one native top-level command. Classify
+ * the exact storage path, not relisshared or an OID/tablespace approximation.
+ * Internal storage cleanup is not a new user DDL command. */
+void
+RelationCheckStorageDDLTransaction(Relation rel, bool isTopLevel, const char *command)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (!RelationStorageUsesClusterSharedPath(rel->rd_locator, rel->rd_backend,
+											rel->rd_rel->relpersistence))
+		return;
+
+	if (IsInTransactionBlock(isTopLevel))
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("shared relation %s requires a standalone top-level statement", command),
+				 errhint("Execute shared DROP or TRUNCATE outside a transaction block, "
+						 "function, or DO block. Send it as a single statement, "
+						 "separate from other commands.")));
+
+	/* Retain the native pipeline check and post-command immediate-commit flag.
+	 * This does not commit any preceding work or open an internal transaction. */
+	PreventInTransactionBlock(isTopLevel, command);
+#endif
+}
+
+/*
  * RelationCreateStorage
  *		Create physical storage for a relation.
  *
@@ -148,8 +246,14 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 	SMgrRelation srel;
 	BackendId	backend;
 	bool		needs_wal;
+#ifdef USE_PGRAC_CLUSTER
+	uint64		create_serial = 0;
+	bool		create_scoped;
+	PendingRelDelete *abort_pending = NULL;
+#endif
 
 	Assert(!IsInParallelMode());	/* couldn't update pendingSyncHash */
+	RelationCheckStorageTransaction(rlocator, relpersistence, "creation");
 
 	switch (relpersistence)
 	{
@@ -170,6 +274,22 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 			return NULL;		/* placate compiler */
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	create_scoped = cluster_enabled && cluster_shared_config
+		&& cluster_interconnect_tier == CLUSTER_IC_TIER_1 && !RecoveryInProgress()
+		&& relpersistence != RELPERSISTENCE_TEMP
+		&& cluster_smgr_which_for(rlocator, backend) == 1;
+	if (create_scoped && !cluster_ko_create_begin_v3(rlocator, &create_serial))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot qualify shared relation creation for %u", rlocator.relNumber)));
+	PG_TRY();
+	{
+		/* The reference precedes MAIN and survives until SPACE hands its
+		 * buffers/WAL back to their original owners. No lock spans IO. */
+		if (create_scoped && !cluster_ko_create_write_begin_v3(rlocator, create_serial))
+			elog(ERROR, "shared relation creation lost its original owner");
+#endif
 	srel = smgropen(rlocator, backend);
 	smgrcreate(srel, MAIN_FORKNUM, false);
 
@@ -186,6 +306,10 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 
 		pending = (PendingRelDelete *)
 			MemoryContextAlloc(TopMemoryContext, sizeof(PendingRelDelete));
+#ifdef USE_PGRAC_CLUSTER
+		memset(&pending->shared_create, 0, sizeof(pending->shared_create));
+		abort_pending = pending;
+#endif
 		pending->rlocator = rlocator;
 		pending->backend = backend;
 		pending->atCommit = false;	/* delete if abort */
@@ -204,10 +328,25 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 	/* PGRAC: the native abort-delete owner is registered before any SPACE
 	 * creation, unless the caller owns whole-directory cleanup (CREATE
 	 * DATABASE). Temporary/unlogged relations keep their native contract. */
-	if (needs_wal && !cluster_space_relation_create(rlocator))
+	if (needs_wal
+		&& !(create_scoped && abort_pending != NULL
+			 ? cluster_space_relation_create_observed_v1(rlocator, create_serial,
+				 &abort_pending->shared_create)
+			 : cluster_space_relation_create(rlocator)))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("could not create exact SPACE identity for relation %u", rlocator.relNumber)));
+	}
+	PG_CATCH();
+	{
+		cluster_ko_create_abort_v3(create_serial);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (create_scoped && !cluster_ko_create_end_v3(create_serial, true))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("shared relation creation requires its original recovery owner")));
 #endif
 
 	return srel;
@@ -241,6 +380,9 @@ RelationDropStorage(Relation rel)
 {
 	PendingRelDelete *pending;
 
+	RelationCheckStorageTransaction(rel->rd_locator, rel->rd_rel->relpersistence, "deletion");
+	RelationCheckStorageDrain(rel->rd_locator, rel->rd_rel->relpersistence, "deletion");
+
 #ifdef USE_PGRAC_CLUSTER
 	/*
 	 * PGRAC: spec-5.7 D6 (KO).  Before scheduling the relfilenode's file for
@@ -251,12 +393,16 @@ RelationDropStorage(Relation rel)
 	 * barrier failure aborts the statement (the relfilenode survives intact).
 	 * No-op for temp relations / single-node / when the barrier is disabled.
 	 */
-	cluster_ko_flush_and_wait_ack(rel->rd_locator, rel->rd_rel->relpersistence);
+	cluster_ko_flush_and_wait_ack_relation(rel, rel->rd_rel->relpersistence,
+												CLUSTER_KO_SHARED_V3_OPERATION_DROP);
 #endif
 
 	/* Add the relation to the list of stuff to delete at commit */
 	pending = (PendingRelDelete *)
 		MemoryContextAlloc(TopMemoryContext, sizeof(PendingRelDelete));
+#ifdef USE_PGRAC_CLUSTER
+	memset(&pending->shared_create, 0, sizeof(pending->shared_create));
+#endif
 	pending->rlocator = rel->rd_locator;
 	pending->backend = rel->rd_backend;
 	pending->atCommit = true;	/* delete if commit */
@@ -346,6 +492,9 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 #ifdef USE_PGRAC_CLUSTER
 	ClusterSpaceTruncateState *space_truncate = NULL;
 
+	RelationCheckStorageTransaction(rel->rd_locator, rel->rd_rel->relpersistence, "truncation");
+	RelationCheckStorageDrain(rel->rd_locator, rel->rd_rel->relpersistence, "truncation");
+
 	/*
 	 * PGRAC: spec-5.7 D6 (KO).  Before shrinking the relfilenode's file, make
 	 * every alive peer flush + drop its buffers for this relfilenode so a stale
@@ -356,7 +505,8 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	 * cross-node AccessExclusiveLock; ereport(ERROR 53RAA) on failure aborts the
 	 * truncation.  No-op for temp relations / single-node / when disabled.
 	 */
-	cluster_ko_flush_and_wait_ack(rel->rd_locator, rel->rd_rel->relpersistence);
+	cluster_ko_flush_and_wait_ack_relation(rel, rel->rd_rel->relpersistence,
+												CLUSTER_KO_SHARED_V3_OPERATION_TRUNCATE);
 #endif
 
 	/*
@@ -544,6 +694,9 @@ RelationPreTruncate(Relation rel)
 {
 	PendingRelSync *pending;
 
+	RelationCheckStorageTransaction(rel->rd_locator, rel->rd_rel->relpersistence, "truncation");
+	RelationCheckStorageDrain(rel->rd_locator, rel->rd_rel->relpersistence, "truncation");
+
 	if (!pendingSyncHash)
 		return;
 
@@ -581,6 +734,33 @@ RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
 #ifdef USE_PGRAC_CLUSTER
 	bool		versioned_copy = false;
 	ClusterSpaceIdentity copy_identity;
+	RelFileLocator copy_locator = dst->smgr_rlocator.locator;
+	uint64		copy_serial = 0;
+	bool		copy_scoped;
+#endif
+
+	RelationCheckStorageTransaction(dst->smgr_rlocator.locator, relpersistence, "copy");
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: keep the original constructor reference across raw copy IO.
+	 * Save the locator before any SPACE read can retire SMgr handles.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	copy_scoped = cluster_enabled && cluster_shared_config
+		&& cluster_interconnect_tier == CLUSTER_IC_TIER_1 && !RecoveryInProgress()
+		&& relpersistence != RELPERSISTENCE_TEMP
+		&& cluster_smgr_which_for(copy_locator, dst->smgr_rlocator.backend) == 1;
+	if (copy_scoped && !cluster_ko_copy_begin_v3(copy_locator, &copy_serial))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot qualify shared relation copy for %u", copy_locator.relNumber)));
+	PG_TRY();
+	{
+		/* A SPACE read can itself leave current/PI work. Register its
+		 * original error owner before it, not just before the first DATA. */
+		if (copy_scoped && !cluster_ko_create_write_begin_v3(copy_locator, copy_serial))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("shared relation copy lost its original owner")));
 #endif
 
 	page = (Page) buf.data;
@@ -670,6 +850,12 @@ RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
 							blkno, relpath)));
 		}
 
+#ifdef USE_PGRAC_CLUSTER
+		if (copy_scoped && !cluster_ko_create_write_begin_v3(copy_locator, copy_serial))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("shared relation copy lost its original owner before WAL")));
+#endif
 		/*
 		 * WAL-log the copied page. Unfortunately we don't know what kind of a
 		 * page this is, so we have to log the full page including any unused
@@ -695,6 +881,13 @@ RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
 
 		PageSetChecksumInplace(page, blkno);
 
+#ifdef USE_PGRAC_CLUSTER
+		/* WAL flush may have waited; retain the same owner for DATA. */
+		if (copy_scoped && !cluster_ko_create_write_begin_v3(copy_locator, copy_serial))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("shared relation copy lost its original owner before DATA")));
+#endif
 		/*
 		 * Now write the page.  We say skipFsync = true because there's no
 		 * need for smgr to schedule an fsync for this write; we'll do it
@@ -713,7 +906,30 @@ RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
 	 * they might still not be on disk when the crash occurs.
 	 */
 	if (use_wal || copying_initfork)
+	{
+#ifdef USE_PGRAC_CLUSTER
+		if (copy_scoped && !cluster_ko_create_write_begin_v3(copy_locator, copy_serial))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("shared relation copy lost its original owner before sync")));
+#endif
 		smgrimmedsync(dst, forkNum);
+	}
+#ifdef USE_PGRAC_CLUSTER
+	}
+	PG_CATCH();
+	{
+		/* Expire permission now; buffer/lock cleanup retains uncertain work
+		 * through the original ResourceOwner and backend-exit callbacks. */
+		cluster_ko_create_abort_v3(copy_serial);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (copy_scoped && !cluster_ko_create_end_v3(copy_serial, true))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("shared relation copy requires its original recovery owner")));
+#endif
 }
 
 /*
@@ -835,6 +1051,34 @@ smgrDoPendingDeletes(bool isCommit)
 	int			nrels = 0,
 				maxrels = 0;
 	SMgrRelation *srels = NULL;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Keep the whole native pending list until every selected writeback has
+	 * succeeded. A later object must not strand earlier entries on ERROR. */
+	for (pending = pendingDeletes; pending != NULL; pending = pending->next)
+	{
+		if (pending->nestLevel < nestLevel)
+			continue;
+		/* The original abort owner must make its new shared storage clean
+		 * through the ordinary WAL-first writer before generic eviction.
+		 * Keep the pending entry linked if proof/output fails. An incomplete
+		 * constructor without a published birth keeps its original cleanup. */
+		if (!isCommit && !pending->atCommit
+			&& (pending->shared_create.create_serial != 0
+				|| pending->shared_create.identity.state != 0
+				|| !XLogRecPtrIsInvalid(pending->shared_create.end_rec_ptr))
+			&& (pending->backend != InvalidBackendId
+				|| !cluster_space_relation_flush_created_abort_v1(pending->rlocator,
+															 &pending->shared_create)))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot finish shared new-storage abort writeback"),
+					 errdetail("Original pending-delete retained for relation %u/%u/%u, create serial %llu.",
+							   pending->rlocator.spcOid, pending->rlocator.dbOid,
+							   pending->rlocator.relNumber,
+							   (unsigned long long)pending->shared_create.create_serial)));
+	}
+#endif
 
 	prev = NULL;
 	for (pending = pendingDeletes; pending != NULL; pending = next)

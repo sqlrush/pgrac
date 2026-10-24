@@ -49,6 +49,7 @@
 
 #include "cluster/cluster_catalog_stats.h" /* spec-6.14 D10b catalog counter stubs */
 #include "cluster/cluster_debug.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_undo_record_api.h"
@@ -1006,6 +1007,26 @@ uint64 cluster_ko_native_count(void);
 uint64 cluster_ko_lockfail_count(void);
 uint64 cluster_ko_peer_apply_count(void);
 uint64 cluster_ko_inbound_full_count(void);
+static bool dump_drop_trace;
+bool
+cluster_ko_drop_pending_v1(ClusterKoDropTraceV1 *out)
+{
+	if (!dump_drop_trace || out == NULL) return false;
+	memset(out, 0, sizeof(*out));
+	out->locator = (RelFileLocator){1663, 5, 16385};
+	out->serial = 42;
+	out->batch = 12;
+	out->observed = out->gate_observed = out->io_attempted = true;
+	out->phase = CLUSTER_KO_DROP_TRACE_PROVIDER;
+	out->step = 8;
+	out->cursor = 2048;
+	out->io_error = EIO;
+	out->forknum = -1;
+	return true;
+}
+uint64 cluster_ko_origin_checkpoint_restart_count(const char *reason);
+uint64 cluster_ko_origin_checkpoint_wait_count(const char *reason);
+const char *cluster_ko_origin_checkpoint_reason_name(ClusterKoOriginCheckpointReason reason);
 uint64
 cluster_ko_flush_count(void)
 {
@@ -1040,6 +1061,75 @@ uint64
 cluster_ko_inbound_full_count(void)
 {
 	return 0;
+}
+bool
+cluster_ko_origin_checkpoint_pending_identity(ClusterKoOriginCheckpointPendingV1 *out pg_attribute_unused())
+{
+	return false;
+}
+
+uint64
+cluster_ko_origin_discard_count(const char *reason)
+{
+	return strcmp(reason, "buffer_wait") == 0 ? 17 : 0;
+}
+const char *
+cluster_ko_origin_discard_reason_name(int reason)
+{
+	static const char *const names[] = {
+		"peer_revision", "directory_pending", "extend_pending", "cleaner_pending",
+		"buffer_more", "buffer_wait", "buffer_cut", "buffer_pending", "pi_more",
+		"pi_pending", "wb_not_closed", "final_cut", "wb_revision", "final_pending"
+	};
+	return reason >= 0 && reason < (int)lengthof(names) ? names[reason] : "unknown";
+}
+
+/* Explicit diagnostic sink fixture, not a native producer/authority proof. */
+const char *
+cluster_ko_native_failure_reason_name(int reason)
+{
+	static const char *const names[] = {
+		"none", "publish", "publish_identity", "registration_publication", "publication",
+		"window_owner", "window_wait", "window_discard", "window_space", "window_close",
+		"window_error", "abandon", "promotion_cut", "producer_untracked"
+	};
+	return reason >= 0 && reason < (int)lengthof(names) ? names[reason] : "unknown";
+}
+uint64
+cluster_ko_native_failure_count(const char *reason)
+{
+	return strcmp(reason, "window_close") == 0 ? 23 : 0;
+}
+bool
+cluster_ko_native_failure_first(const char *reason, ClusterKoNativeFailureV1 *out)
+{
+	if (strcmp(reason, "window_close") != 0)
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->stage = CLUSTER_KO_NATIVE_STAGE_CLOSE;
+	out->space_stage = CLUSTER_KO_NATIVE_SPACE_NONE;
+	out->site = CLUSTER_KO_NATIVE_SITE_WINDOW;
+	strlcpy(out->error_message, "saved native error summary", sizeof(out->error_message));
+	out->locator = (RelFileLocator){1663, 5, 16385};
+	out->serial = 29;
+	out->batch = 12;
+	return true;
+}
+
+uint64
+cluster_ko_origin_checkpoint_restart_count(const char *reason pg_attribute_unused())
+{
+	return 0;
+}
+uint64
+cluster_ko_origin_checkpoint_wait_count(const char *reason pg_attribute_unused())
+{
+	return 0;
+}
+const char *
+cluster_ko_origin_checkpoint_reason_name(ClusterKoOriginCheckpointReason reason pg_attribute_unused())
+{
+	return "progress";
 }
 
 uint64
@@ -1273,6 +1363,22 @@ cluster_pcm_grd_protocol_debt_snapshot(PcmGrdProtocolDebtStats *out)
 	out->local_owner_entry_count = 17;
 	out->evicting_entry_count = 18;
 	out->invalid_entry_count = 19;
+}
+
+bool
+cluster_pcm_normal_stop_first_refusal_v1(PcmNormalStopRefusalV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->code = 218;
+	out->source_line = 777;
+	out->binding = 29;
+	out->slot = 1187;
+	out->x_holder = -1;
+	out->request_node = out->tombstone_node = 3;
+	out->tombstone_valid = 1;
+	out->tombstone_phase = RESOURCE_X_MASTER_SETTLED;
+	out->tag = (BufferTag){.spcOid=1663, .dbOid=5, .relNumber=16385, .forkNum=0, .blockNum=0};
+	return true;
 }
 
 bool
@@ -5511,6 +5617,80 @@ UT_TEST(test_debug_dump_exposes_exact_current_protocol_debt_gauges)
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_invalid_debt_count"), "19");
 }
 
+UT_TEST(test_debug_dump_exposes_native_drop_context_and_real_io_observation)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	const char *const keys[] = {"drop_pending_locator", "drop_pending_serial",
+		"drop_pending_batch", "drop_pending_phase", "drop_pending_step",
+		"drop_pending_cursor", "drop_pending_io_attempted", "drop_pending_io_error",
+		"drop_pending_forknum"};
+	const char *const values[] = {"1663/5/16385", "42", "12", "3", "8",
+		"2048", "1", "5", "-1"};
+	memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+	memset(&rsinfo, 0, sizeof(rsinfo));
+	captured_dump_row_count = captured_formatted_value_count = 0;
+	fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+	dump_drop_trace = true;
+	(void)cluster_dump_state(fcinfo);
+	dump_drop_trace = false;
+	for (unsigned i = 0; i < lengthof(keys); i++) {
+		UT_ASSERT_EQ(captured_dump_count("ko", keys[i]), 1);
+		if (captured_dump_count("ko", keys[i]) == 1)
+			UT_ASSERT_STR_EQ(captured_dump_value("ko", keys[i]), values[i]);
+	}
+}
+
+UT_TEST(test_debug_dump_exposes_pcm_first_refusal_identity_and_subpredicate)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	const char *const keys[] = {"normal_stop_first_code", "normal_stop_first_source_line",
+		"normal_stop_first_tag", "normal_stop_first_binding", "normal_stop_first_slot",
+		"normal_stop_first_x_holder", "normal_stop_first_tombstone_node"};
+	const char *const values[] = {"218", "777", "1663/5/16385/0/0", "29", "1187", "-1", "3"};
+	memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+	memset(&rsinfo, 0, sizeof(rsinfo));
+	captured_dump_row_count = captured_formatted_value_count = 0;
+	fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+	(void)cluster_dump_state(fcinfo);
+	for (unsigned i = 0; i < lengthof(keys); i++) {
+		UT_ASSERT_EQ(captured_dump_count("pcm", keys[i]), 1);
+		if (captured_dump_count("pcm", keys[i]) == 1)
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", keys[i]), values[i]);
+	}
+}
+
+UT_TEST(test_debug_dump_exposes_origin_discard_reason_counters)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+	memset(&rsinfo, 0, sizeof(rsinfo));
+	captured_dump_row_count = captured_formatted_value_count = 0;
+	fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+	(void)cluster_dump_state(fcinfo);
+	UT_ASSERT_EQ(captured_dump_count("ko", "origin_discard_buffer_wait_count"), 1);
+	if (captured_dump_count("ko", "origin_discard_buffer_wait_count") == 1)
+		UT_ASSERT_STR_EQ(captured_dump_value("ko", "origin_discard_buffer_wait_count"), "17");
+	UT_ASSERT_EQ(captured_dump_count("ko", "origin_discard_pi_pending_count"), 1);
+	{
+		const char *const keys[] = { "native_failure_window_close_count",
+			"native_failure_window_close_first_stage", "native_failure_window_close_first_locator",
+			"native_failure_window_close_first_space_stage",
+			"native_failure_window_close_first_serial", "native_failure_window_close_first_site",
+			"native_failure_window_close_first_error_message" };
+		const char *const values[] = { "23", "5", "1663/5/16385", "0", "29", "7",
+			"saved native error summary" };
+
+		for (unsigned i = 0; i < lengthof(keys); i++) {
+			UT_ASSERT_EQ(captured_dump_count("ko", keys[i]), 1);
+			if (captured_dump_count("ko", keys[i]) == 1)
+				UT_ASSERT_STR_EQ(captured_dump_value("ko", keys[i]), values[i]);
+		}
+	}
+}
+
 UT_TEST(test_debug_dump_exposes_receipt_lifetime_and_cancel_before_counters)
 {
 	LOCAL_FCINFO(fcinfo, 0);
@@ -6172,7 +6352,9 @@ UT_TEST(test_debug_phase_symbol_present)
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(25);
+	UT_RUN(test_debug_dump_exposes_native_drop_context_and_real_io_observation);
+	UT_RUN(test_debug_dump_exposes_pcm_first_refusal_identity_and_subpredicate);
 	UT_RUN(test_debug_dump_normal_completion_never_fabricates_unready_proof);
 	UT_RUN(test_debug_dump_srf_linkable);
 	UT_RUN(test_debug_dump_omits_retired_legacy_pcm_x_compatibility_keys);
@@ -6182,6 +6364,7 @@ main(void)
 	UT_RUN(test_debug_dump_exposes_reply_wait_sites_without_fabricating_zeros);
 	UT_RUN(test_debug_dump_exposes_paired_wait_margins_without_zero_fabrication);
 	UT_RUN(test_debug_dump_exposes_vm_counts_and_histogram_as_separate_cohorts);
+	UT_RUN(test_debug_dump_exposes_origin_discard_reason_counters);
 	UT_RUN(test_debug_dump_exposes_receipt_lifetime_and_cancel_before_counters);
 	UT_RUN(test_debug_dump_exposes_tt_and_itl_reason_counters_without_fake_zero);
 	UT_RUN(test_debug_dump_exposes_closed_ctrc_observability);

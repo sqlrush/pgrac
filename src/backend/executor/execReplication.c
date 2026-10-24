@@ -15,6 +15,9 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "access/heapam.h"
+#endif
 #include "access/relscan.h"
 #include "access/tableam.h"
 #include "access/transam.h"
@@ -457,6 +460,11 @@ ExecSimpleRelationInsert(ResultRelInfo *resultRelInfo,
 
 	CheckCmdReplicaIdentity(rel, CMD_INSERT);
 
+#ifdef USE_PGRAC_CLUSTER
+	/* Bind the shared writer before triggers or expressions can do work. */
+	(void) cluster_heap_preflight_write(rel, "replication INSERT");
+#endif
+
 	/* BEFORE ROW INSERT Triggers */
 	if (resultRelInfo->ri_TrigDesc &&
 		resultRelInfo->ri_TrigDesc->trig_insert_before_row)
@@ -527,6 +535,11 @@ ExecSimpleRelationUpdate(ResultRelInfo *resultRelInfo,
 
 	CheckCmdReplicaIdentity(rel, CMD_UPDATE);
 
+#ifdef USE_PGRAC_CLUSTER
+	/* Bind the shared writer before triggers or expressions can do work. */
+	(void) cluster_heap_preflight_write(rel, "replication UPDATE");
+#endif
+
 	/* BEFORE ROW UPDATE Triggers */
 	if (resultRelInfo->ri_TrigDesc &&
 		resultRelInfo->ri_TrigDesc->trig_update_before_row)
@@ -588,6 +601,11 @@ ExecSimpleRelationDelete(ResultRelInfo *resultRelInfo,
 	ItemPointer tid = &searchslot->tts_tid;
 
 	CheckCmdReplicaIdentity(rel, CMD_DELETE);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Bind the shared writer before triggers can do work. */
+	(void) cluster_heap_preflight_write(rel, "replication DELETE");
+#endif
 
 	/* BEFORE ROW DELETE Triggers */
 	if (resultRelInfo->ri_TrigDesc &&

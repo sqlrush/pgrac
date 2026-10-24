@@ -30,6 +30,7 @@
 #include "catalog/objectaccess.h"
 #include "catalog/pg_sequence.h"
 #include "catalog/pg_type.h"
+#include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "commands/defrem.h"
 #include "commands/sequence.h"
@@ -653,6 +654,8 @@ ResetSequence(Oid seq_relid)
 	 * indeed a sequence.
 	 */
 	init_sequence(seq_relid, &elm, &seq_rel);
+	RelationCheckStorageTransaction(seq_rel->rd_locator,
+									seq_rel->rd_rel->relpersistence, "sequence rewrite");
 	(void) read_seq_tuple(seq_rel, &buf, &seqdatatuple);
 
 	pgstuple = SearchSysCache1(SEQRELID, ObjectIdGetDatum(seq_relid));
@@ -958,6 +961,8 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 	}
 
 	init_sequence(relid, &elm, &seqrel);
+	RelationCheckStorageTransaction(seqrel->rd_locator,
+									seqrel->rd_rel->relpersistence, "sequence rewrite");
 
 	rel = table_open(SequenceRelationId, RowExclusiveLock);
 	seqtuple = SearchSysCacheCopy1(SEQRELID,
@@ -1050,6 +1055,8 @@ SequenceChangePersistence(Oid relid, char newrelpersistence)
 	 */
 	LockRelationOid(relid, AccessExclusiveLock);
 	init_sequence(relid, &elm, &seqrel);
+	RelationCheckStorageTransaction(seqrel->rd_locator,
+									seqrel->rd_rel->relpersistence, "sequence rewrite");
 
 	/* check the comment above nextval_internal()'s equivalent call. */
 	if (RelationNeedsWAL(seqrel))

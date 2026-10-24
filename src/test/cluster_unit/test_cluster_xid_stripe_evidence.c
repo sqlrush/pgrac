@@ -24,6 +24,8 @@
 #include "cluster/cluster_voting_disk_io.h"
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_xid_stripe_boot.h"
+#include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_heap_horizon.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_inject.h"
@@ -54,7 +56,12 @@ static int error_level, error_code;
 static unsigned prepares, sleeps, cancels, wait_action;
 static bool postmaster_alive = true;
 static uint64 incarnation = 81;
+static bool outside_qvotec;
+static ClusterXidStripeSampleFence sample_fence;
 static bool in_quorum = true;
+static bool xid_lock_held, change_inc_on_release;
+static LWLockPadded locks[NUM_INDIVIDUAL_LWLOCKS];
+LWLockPadded *MainLWLockArray = locks;
 static unsigned allowed_writes = 3, writes, premature_grants, wakeups;
 static unsigned read_errors;
 static unsigned history_writes, allowed_history_writes = 3;
@@ -62,8 +69,36 @@ static unsigned history_read_errors;
 static unsigned history_write_errors, source_sync_writes, allowed_source_sync_writes = 3;
 static int disks[3];
 static FullTransactionId pending_candidate;
+static ClusterSemanticActiveSampleFence semantic_fence;
+static ClusterHeapFreezeCohortObservation cohort;
+static ClusterHeapFreezeCohortStatus cohort_status;
+static unsigned cohort_reads, sync_writes, tracking_writes, premature_floor_arms;
+static uint64 forbidden_floor;
+static void (*slot_write_hook)(void);
+static void (*exclusive_release_hook)(void);
+static bool exclusive_lock;
+
+bool
+cluster_semantic_activation_active_sample_current(const ClusterSemanticActiveSampleFence *expected)
+{
+	return expected != NULL && memcmp(expected, &semantic_fence, sizeof(*expected)) == 0;
+}
+
+ClusterHeapFreezeCohortStatus
+cluster_heap_freeze_cohort_observe(ClusterHeapFreezeCohortObservation *out)
+{
+	cohort_reads++;
+	if (cohort_status == CLUSTER_HEAP_FREEZE_COHORT_READY)
+		*out = cohort;
+	return cohort_status;
+}
 uint64
 cluster_qvotec_self_incarnation_value(void)
+{
+	return outside_qvotec ? 0 : incarnation;
+}
+uint64
+cluster_qvotec_get_self_incarnation(void)
 {
 	return incarnation;
 }
@@ -88,11 +123,28 @@ ReadNextFullTransactionId(void)
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
+	exclusive_lock = mode == LW_EXCLUSIVE;
 	return true;
+}
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	return lock == XidGenLock && xid_lock_held;
 }
 void
 LWLockRelease(LWLock *lock)
-{}
+{
+	if (exclusive_lock && exclusive_release_hook != NULL) {
+		void (*hook)(void) = exclusive_release_hook;
+		exclusive_release_hook = NULL;
+		hook();
+	}
+	exclusive_lock = false;
+	if (change_inc_on_release) {
+		incarnation++;
+		change_inc_on_release = false;
+	}
+}
 const ClusterNodeInfo *
 cluster_conf_lookup_node(int32 node)
 {
@@ -194,6 +246,18 @@ ClusterVotingDiskIoState
 cluster_voting_disk_write_stripe_slot_ex(int fd, uint32 node, const void *bytes, bool sync)
 {
 	const ClusterXidStripeSlotRecord *record = bytes;
+	if (sync)
+		sync_writes++;
+	else
+		tracking_writes++;
+	if (forbidden_floor != 0
+		&& U64FromFullTransactionId(cluster_xid_stripe_herding_floor()) >= forbidden_floor)
+		premature_floor_arms++;
+	if (slot_write_hook != NULL) {
+		void (*hook)(void) = slot_write_hook;
+		slot_write_hook = NULL;
+		hook();
+	}
 	if (sync && record->lease_incarnation != incarnation) {
 		if (++source_sync_writes > allowed_source_sync_writes)
 			return CLUSTER_VOTING_DISK_IO_FAILED;
@@ -302,9 +366,13 @@ reset_lease(void)
 	memset(&lease, 0, sizeof(lease));
 	pg_atomic_init_u64(&lease.floor_full, 0);
 	pg_atomic_init_u64(&lease.limit_full, 0);
+	pg_atomic_init_u64(&lease.published_incarnation, 0);
 	pg_atomic_init_u32(&lease.failed, 0);
 	StripeLease = &lease;
 	incarnation++;
+	outside_qvotec = false;
+	xid_lock_held = true;
+	change_inc_on_release = false;
 	in_quorum = cluster_enabled = cluster_shared_catalog = cluster_xid_striping = true;
 	cluster_node_id = 4;
 	allowed_writes = 3;
@@ -321,14 +389,24 @@ reset_lease(void)
 	IsUnderPostmaster = postmaster_alive = true;
 	memset(&boot, 0, sizeof(boot));
 	boot.floor_full = boot.my_slot_floor_full = 1024;
-	boot.epoch = 1;
+	boot.epoch = boot.generation = 1;
+	boot.my_slot_claimed = true;
+	boot.my_owner_incarnation = 71; /* The immutable claim survives restarts. */
 	boot.disk_state = CLUSTER_XID_STRIPE_DISK_PUBLISHED;
 	boot.slot_state = CLUSTER_XID_STRIPE_SLOT_MINE;
 	pg_atomic_init_u64(&boot.herding_floor_full, 0);
 	pg_atomic_init_u64(&boot.cluster_min_active_hwm, 0);
 	pg_atomic_init_u64(&boot.cluster_max_active_hwm, 0);
+	pg_atomic_init_u32(&boot.wrap_barrier_done, 1);
 	StripeBootShmem = &boot;
 	pending_candidate = FullTransactionIdFromU64(2052);
+	MemSet(&semantic_fence, 0, sizeof(semantic_fence));
+	MemSet(&cohort, 0, sizeof(cohort));
+	cohort_status = CLUSTER_HEAP_FREEZE_COHORT_READY;
+	cohort_reads = sync_writes = tracking_writes = premature_floor_arms = 0;
+	forbidden_floor = 0;
+	slot_write_hook = exclusive_release_hook = NULL;
+	exclusive_lock = false;
 }
 
 static void
@@ -463,6 +541,7 @@ UT_TEST(reservation_waits_for_durable_majority_and_retries_exact_range)
 	stripe_lease_tick(disks, 3, 2052);
 	UT_ASSERT(!cluster_xid_stripe_lease_ready(pending_candidate));
 	UT_ASSERT_EQ(wakeups, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&lease.published_incarnation), 0);
 	UT_ASSERT_EQ(stripe_read_slot_all(disks, 3, 4, &out, STRIPE_READ_EVIDENCE), STRIPE_READ_VALID);
 	pending_limit = out.issued_limit_full;
 	UT_ASSERT(pending_limit > 2052);
@@ -472,6 +551,7 @@ UT_TEST(reservation_waits_for_durable_majority_and_retries_exact_range)
 	UT_ASSERT_EQ(premature_grants, 0);
 	UT_ASSERT(cluster_xid_stripe_lease_ready(pending_candidate));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&lease.limit_full), pending_limit);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&lease.published_incarnation), incarnation);
 	UT_ASSERT_EQ(wakeups, 1);
 	UT_ASSERT(!cluster_xid_stripe_lease_ready(FullTransactionIdFromU64(pending_limit)));
 }
@@ -935,6 +1015,654 @@ UT_TEST(wait_cancellation_quorum_loss_and_parent_death_cleanup)
 	}
 }
 
+/* Publish through the original majority-durable owner, not a ready stub. */
+static void
+prepare_future_lease(void)
+{
+	ClusterXidStripeSlotRecord out;
+
+	reset_lease();
+	reset_rows();
+	UT_ASSERT_EQ(read_rows(&out, false), STRIPE_READ_VALID);
+	stripe_lease_tick(disks, 3, local_next);
+}
+
+UT_TEST(future_requires_majority_and_current_lease_incarnation)
+{
+	FullTransactionId future = FullTransactionIdFromU64(99);
+	ClusterXidStripeSlotRecord out;
+	unsigned writes_before;
+
+	reset_lease();
+	reset_rows();
+	UT_ASSERT_EQ(read_rows(&out, false), STRIPE_READ_VALID);
+	allowed_writes = 1;
+	stripe_lease_tick(disks, 3, local_next);
+	UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+												&sample_fence));
+	UT_ASSERT(!FullTransactionIdIsValid(future));
+	allowed_writes = 3;
+	writes = 0;
+	stripe_lease_tick(disks, 3, local_next);
+	writes_before = writes;
+	UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+											   &sample_fence));
+	UT_ASSERT_EQ(U64FromFullTransactionId(future), 2052);
+	UT_ASSERT_EQ(writes, writes_before);
+	UT_ASSERT_EQ(local_next, 2052);
+	UT_ASSERT(boot.my_owner_incarnation != incarnation);
+	incarnation++;
+	UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+												&sample_fence));
+	UT_ASSERT(!FullTransactionIdIsValid(future));
+	writes = 0;
+	stripe_lease_tick(disks, 3, local_next);
+	UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+											   &sample_fence));
+	UT_ASSERT_EQ(U64FromFullTransactionId(future), pg_atomic_read_u64(&lease.floor_full));
+}
+
+UT_TEST(future_uses_shared_incarnation_outside_qvotec)
+{
+	FullTransactionId future;
+
+	prepare_future_lease();
+	outside_qvotec = true;
+	UT_ASSERT_EQ(cluster_qvotec_self_incarnation_value(), 0);
+	UT_ASSERT_EQ(cluster_qvotec_get_self_incarnation(), incarnation);
+	UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+											   &sample_fence));
+	UT_ASSERT_EQ(U64FromFullTransactionId(future), local_next);
+}
+
+UT_TEST(future_clamps_original_floors_without_changing_allocation)
+{
+	FullTransactionId future;
+	unsigned writes_before;
+
+	prepare_future_lease();
+	writes_before = writes;
+	boot.floor_full = 2055;
+	UT_ASSERT(
+		cluster_xid_stripe_sample_future(FullTransactionIdFromU64(2052), &future, &sample_fence));
+	UT_ASSERT_EQ(U64FromFullTransactionId(future), 2068);
+	boot.my_slot_floor_full = 2080;
+	UT_ASSERT(
+		cluster_xid_stripe_sample_future(FullTransactionIdFromU64(2052), &future, &sample_fence));
+	UT_ASSERT_EQ(U64FromFullTransactionId(future), 2084);
+	pg_atomic_write_u64(&boot.herding_floor_full, 2101);
+	UT_ASSERT(
+		cluster_xid_stripe_sample_future(FullTransactionIdFromU64(2052), &future, &sample_fence));
+	UT_ASSERT_EQ(U64FromFullTransactionId(future), 2116);
+	UT_ASSERT(
+		cluster_xid_stripe_sample_future(FullTransactionIdFromU64(2120), &future, &sample_fence));
+	UT_ASSERT_EQ(U64FromFullTransactionId(future), 2132);
+	UT_ASSERT_EQ(local_next, 2052);
+	UT_ASSERT_EQ(writes, writes_before);
+}
+
+UT_TEST(future_refuses_missing_or_changing_authority)
+{
+	for (unsigned fault = 0; fault < 22; fault++) {
+		FullTransactionId future = FullTransactionIdFromU64(99);
+
+		prepare_future_lease();
+		switch (fault) {
+		case 0:
+			cluster_enabled = false;
+			break;
+		case 1:
+			cluster_shared_catalog = false;
+			break;
+		case 2:
+			cluster_xid_striping = false;
+			break;
+		case 3:
+			cluster_node_id = -1;
+			break;
+		case 4:
+			cluster_node_id = CLUSTER_XID_STRIDE;
+			break;
+		case 5:
+			StripeBootShmem = NULL;
+			break;
+		case 6:
+			StripeLease = NULL;
+			break;
+		case 7:
+			in_quorum = false;
+			break;
+		case 8:
+			incarnation = 0;
+			break;
+		case 9:
+			pg_atomic_write_u64(&lease.published_incarnation, 0);
+			break;
+		case 10:
+			pg_atomic_write_u32(&lease.failed, 1);
+			break;
+		case 11:
+			boot.disk_state = CLUSTER_XID_STRIPE_DISK_UNKNOWN;
+			break;
+		case 12:
+			boot.slot_state = CLUSTER_XID_STRIPE_SLOT_RETIRED;
+			break;
+		case 13:
+			boot.my_slot_claimed = false;
+			break;
+		case 14:
+			boot.my_owner_incarnation = 0;
+			break;
+		case 15:
+			boot.epoch = 0;
+			break;
+		case 16:
+			boot.generation = 0;
+			break;
+		case 17:
+			boot.floor_full = 0;
+			break;
+		case 18:
+			boot.my_slot_floor_full = 0;
+			break;
+		case 19:
+			pg_atomic_write_u64(&lease.floor_full, 0);
+			break;
+		case 20:
+			xid_lock_held = false;
+			break;
+		case 21:
+			change_inc_on_release = true;
+			break;
+		}
+		UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+													&sample_fence));
+		UT_ASSERT(!FullTransactionIdIsValid(future));
+	}
+	prepare_future_lease();
+	UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), NULL,
+												&sample_fence));
+}
+
+UT_TEST(future_retains_lease_bounds_wrap_and_window_guards)
+{
+	FullTransactionId future;
+
+	prepare_future_lease();
+	UT_ASSERT(!cluster_xid_stripe_sample_future(
+		FullTransactionIdFromU64(pg_atomic_read_u64(&lease.limit_full)), &future, &sample_fence));
+	UT_ASSERT(!FullTransactionIdIsValid(future));
+	UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(UINT64_MAX), &future,
+												&sample_fence));
+	UT_ASSERT(!FullTransactionIdIsValid(future));
+	for (uint64 special = 0; special < FirstNormalTransactionId; special++) {
+		UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(special), &future,
+													&sample_fence));
+		UT_ASSERT(!FullTransactionIdIsValid(future));
+	}
+	pg_atomic_write_u64(&boot.cluster_min_active_hwm, 1);
+	cluster_xid_herding_slack = 1;
+	UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+												&sample_fence));
+	UT_ASSERT(!FullTransactionIdIsValid(future));
+	cluster_xid_herding_slack = 4194304;
+	pg_atomic_write_u64(&lease.floor_full, (uint64)UINT32_MAX - 32);
+	pg_atomic_write_u64(&lease.limit_full, (uint64)UINT32_MAX + 32);
+	pg_atomic_write_u32(&boot.wrap_barrier_done, 0);
+	UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(UINT32_MAX - 1), &future,
+												&sample_fence));
+	UT_ASSERT(!FullTransactionIdIsValid(future));
+	pg_atomic_write_u32(&boot.wrap_barrier_done, 1);
+	pg_atomic_write_u64(&boot.cluster_min_active_hwm, 0);
+	UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(UINT32_MAX - 1), &future,
+											   &sample_fence));
+	UT_ASSERT_EQ(U64FromFullTransactionId(future), (UINT64CONST(1) << 32) + 4);
+}
+
+UT_TEST(sample_fence_keeps_original_durable_interval_across_renewal)
+{
+	FullTransactionId future;
+	ClusterXidStripeSampleFence saved;
+	unsigned writes_before;
+
+	prepare_future_lease();
+	outside_qvotec = true;
+	UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+											   &sample_fence));
+	saved = sample_fence;
+	UT_ASSERT_EQ(saved.incarnation, incarnation);
+	UT_ASSERT_EQ(saved.activation_generation, boot.generation);
+	UT_ASSERT_EQ(saved.slot_owner_incarnation, boot.my_owner_incarnation);
+	UT_ASSERT_EQ(saved.lease_limit_full, pg_atomic_read_u64(&lease.limit_full));
+	writes_before = writes;
+	UT_ASSERT(cluster_xid_stripe_sample_fence_current(&saved));
+	UT_ASSERT_EQ(writes, writes_before);
+	/* Use the real sole publisher to extend the same durable promise. */
+	outside_qvotec = false;
+	writes = 0;
+	stripe_lease_tick(disks, 3, saved.lease_limit_full);
+	UT_ASSERT(pg_atomic_read_u64(&lease.limit_full) > saved.lease_limit_full);
+	UT_ASSERT(cluster_xid_stripe_sample_fence_current(&saved));
+	UT_ASSERT_EQ(memcmp(&sample_fence, &saved, sizeof(saved)), 0);
+}
+
+UT_TEST(sample_fence_rejects_replaced_or_revoked_authority)
+{
+	for (unsigned fault = 0; fault < 21; fault++) {
+		FullTransactionId future;
+		ClusterXidStripeSampleFence saved;
+
+		prepare_future_lease();
+		UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+												   &saved));
+		switch (fault) {
+		case 0:
+			incarnation++;
+			break;
+		case 1:
+			in_quorum = false;
+			break;
+		case 2:
+			pg_atomic_write_u32(&lease.failed, 1);
+			break;
+		case 3:
+			pg_atomic_write_u64(&lease.limit_full, 0);
+			break;
+		case 4:
+			pg_atomic_write_u64(&lease.limit_full, saved.lease_limit_full - 1);
+			break;
+		case 5:
+			pg_atomic_write_u64(&lease.floor_full, saved.lease_floor_full + 16);
+			break;
+		case 6:
+			pg_atomic_write_u64(&lease.published_incarnation, incarnation + 1);
+			break;
+		case 7:
+			boot.floor_full++;
+			break;
+		case 8:
+			boot.epoch++;
+			break;
+		case 9:
+			boot.generation++;
+			break;
+		case 10:
+			boot.my_slot_floor_full++;
+			break;
+		case 11:
+			boot.my_owner_incarnation++;
+			break;
+		case 12:
+			boot.my_slot_claimed = false;
+			break;
+		case 13:
+			boot.slot_state = CLUSTER_XID_STRIPE_SLOT_ABSENT;
+			break;
+		case 14:
+			boot.disk_state = CLUSTER_XID_STRIPE_DISK_ABSENT;
+			break;
+		case 15:
+			cluster_node_id++;
+			break;
+		case 16:
+			cluster_enabled = false;
+			break;
+		case 17:
+			cluster_shared_catalog = false;
+			break;
+		case 18:
+			cluster_xid_striping = false;
+			break;
+		case 19:
+			StripeBootShmem = NULL;
+			break;
+		case 20:
+			StripeLease = NULL;
+			break;
+		}
+		UT_ASSERT(!cluster_xid_stripe_sample_fence_current(&saved));
+	}
+}
+
+UT_TEST(sample_fence_failure_clears_outputs_and_refuses_empty_fence)
+{
+	FullTransactionId future;
+	ClusterXidStripeSampleFence empty = { 0 };
+
+	prepare_future_lease();
+	UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+											   &sample_fence));
+	in_quorum = false;
+	UT_ASSERT(!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+												&sample_fence));
+	UT_ASSERT(!FullTransactionIdIsValid(future));
+	UT_ASSERT_EQ(memcmp(&sample_fence, &empty, sizeof(empty)), 0);
+	in_quorum = true;
+	UT_ASSERT(!cluster_xid_stripe_sample_fence_current(NULL));
+	UT_ASSERT(!cluster_xid_stripe_sample_fence_current(&empty));
+	UT_ASSERT(
+		!cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future, NULL));
+	UT_ASSERT(!FullTransactionIdIsValid(future));
+}
+
+
+/* The cohort/semantic dependencies are controlled here. Their real complete
+ * fixed-set observer has its own fixture; IO/selection/lease/JUMP run above. */
+static void
+prepare_maintenance(void)
+{
+	FullTransactionId future;
+
+	prepare_future_lease();
+	writes = 0;
+	cluster_xid_stripe_herding_tick(disks, 3);
+	UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next), &future,
+											   &sample_fence));
+	xid_lock_held = false;
+	semantic_fence.system_identifier = 300;
+	semantic_fence.admission_publication_seq = 2;
+	semantic_fence.active_bits = 1;
+	semantic_fence.record_generation = cohort.record_generation = 7;
+	semantic_fence.formation_epoch = cohort.formation_epoch = 9;
+	semantic_fence.membership_cut_generation = 5;
+	semantic_fence.local_boot_incarnation = incarnation;
+	semantic_fence.local_node_id = cluster_node_id;
+	semantic_fence.admitted_members_lo = cohort.admitted_members_lo = 17;
+	semantic_fence.admitted_members_hi = cohort.admitted_members_hi = 2;
+	semantic_fence.admitted_incarnation[4] = incarnation;
+	semantic_fence.admitted_incarnation[65] = 105;
+	cohort.future_full_xid_max = 8000004;
+	cohort.active_full_xid_min = 100;
+	cohort.horizon_scn = 20;
+	writes = sync_writes = tracking_writes = cohort_reads = 0;
+}
+
+static ClusterXidStripeMaintenanceResult
+request_maintenance(uint64 target)
+{
+	ClusterSemanticActiveSampleFence saved_identity = semantic_fence;
+	ClusterXidStripeSampleFence saved_stripe = sample_fence;
+
+	return cluster_xid_stripe_request_maintenance(&saved_identity, &saved_stripe,
+												  FullTransactionIdFromU64(target));
+}
+
+UT_TEST(maintenance_stages_then_syncs_before_arming_original_floor)
+{
+	ClusterXidStripeSlotRecord out;
+	uint64 old_limit;
+
+	prepare_maintenance();
+	old_limit = pg_atomic_read_u64(&lease.limit_full);
+	forbidden_floor = 8196;
+	UT_ASSERT_EQ(request_maintenance(8196), CLUSTER_XID_STRIPE_MAINTENANCE_PENDING);
+	UT_ASSERT(boot.maintenance_pending);
+	UT_ASSERT_EQ(writes, 0);
+	UT_ASSERT(U64FromFullTransactionId(cluster_xid_stripe_herding_floor()) < 8196);
+	cluster_xid_stripe_herding_tick(disks, 3);
+	UT_ASSERT_EQ(sync_writes, 3);
+	UT_ASSERT_EQ(tracking_writes, 0);
+	UT_ASSERT_EQ(premature_floor_arms, 0);
+	UT_ASSERT_EQ(U64FromFullTransactionId(cluster_xid_stripe_herding_floor()), 8196);
+	UT_ASSERT(!boot.maintenance_pending);
+	UT_ASSERT_EQ(local_next, 2052); /* old allocations/ACTIVE identities unchanged */
+	UT_ASSERT_EQ(stripe_read_slot_all(disks, 3, 4, &out, STRIPE_READ_UPDATE), STRIPE_READ_VALID);
+	UT_ASSERT_EQ(out.version, 3);
+	UT_ASSERT_EQ(out.next_xid_hwm_full, 8196);
+	UT_ASSERT_EQ(out.issued_limit_full, old_limit);
+	UT_ASSERT_EQ(out.lease_incarnation, incarnation);
+	UT_ASSERT_EQ(request_maintenance(8196), CLUSTER_XID_STRIPE_MAINTENANCE_DURABLE);
+	UT_ASSERT_EQ(writes, 3);
+	UT_ASSERT(cohort_reads >= 2);
+}
+
+UT_TEST(maintenance_syncs_even_when_tracking_hwm_already_covers_request)
+{
+	prepare_maintenance();
+	local_next = 16388;
+	cluster_xid_stripe_herding_tick(disks, 3);
+	UT_ASSERT_EQ(tracking_writes, 3);
+	UT_ASSERT_EQ(boot.my_hwm_on_disk, 16388);
+	UT_ASSERT(U64FromFullTransactionId(cluster_xid_stripe_herding_floor()) < 8196);
+	writes = sync_writes = tracking_writes = 0;
+	UT_ASSERT_EQ(request_maintenance(8196), CLUSTER_XID_STRIPE_MAINTENANCE_PENDING);
+	cluster_xid_stripe_herding_tick(disks, 3);
+	UT_ASSERT_EQ(sync_writes, 3);
+	UT_ASSERT_EQ(tracking_writes, 0);
+	UT_ASSERT_EQ(U64FromFullTransactionId(cluster_xid_stripe_herding_floor()), 8196);
+	UT_ASSERT_EQ(boot.my_hwm_on_disk, 16388);
+}
+
+UT_TEST(maintenance_partial_write_retries_without_arming)
+{
+	prepare_maintenance();
+	forbidden_floor = 8196;
+	UT_ASSERT_EQ(request_maintenance(8196), CLUSTER_XID_STRIPE_MAINTENANCE_PENDING);
+	allowed_writes = 1;
+	cluster_xid_stripe_herding_tick(disks, 3);
+	UT_ASSERT(boot.maintenance_pending);
+	UT_ASSERT(U64FromFullTransactionId(cluster_xid_stripe_herding_floor()) < 8196);
+	UT_ASSERT_EQ(premature_floor_arms, 0);
+	UT_ASSERT_EQ(request_maintenance(8196), CLUSTER_XID_STRIPE_MAINTENANCE_PENDING);
+	allowed_writes = 3;
+	writes = sync_writes = 0;
+	cluster_xid_stripe_herding_tick(disks, 3);
+	UT_ASSERT_EQ(sync_writes, 3);
+	UT_ASSERT_EQ(premature_floor_arms, 0);
+	UT_ASSERT_EQ(U64FromFullTransactionId(cluster_xid_stripe_herding_floor()), 8196);
+	UT_ASSERT(!boot.maintenance_pending);
+}
+
+UT_TEST(maintenance_requires_complete_current_cohort_before_staging)
+{
+	for (unsigned fault = 0; fault < 9; fault++) {
+		ClusterXidStripeMaintenanceResult result;
+
+		prepare_maintenance();
+		if (fault < 5)
+			cohort_status = CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE + fault;
+		else if (fault == 5)
+			cohort.record_generation++;
+		else if (fault == 6)
+			cohort.formation_epoch++;
+		else if (fault == 7)
+			cohort.admitted_members_lo ^= 1;
+		else
+			cohort.admitted_members_hi = 0;
+		result = request_maintenance(8196);
+		UT_ASSERT(result != CLUSTER_XID_STRIPE_MAINTENANCE_PENDING
+				  && result != CLUSTER_XID_STRIPE_MAINTENANCE_DURABLE);
+		UT_ASSERT(!boot.maintenance_pending);
+		UT_ASSERT_EQ(writes, 0);
+	}
+}
+
+UT_TEST(maintenance_refuses_unbounded_or_illegal_targets_without_io)
+{
+	for (unsigned fault = 0; fault < 12; fault++) {
+		uint64 target = 8196;
+
+		prepare_maintenance();
+		switch (fault) {
+		case 0:
+			target = 0;
+			break;
+		case 1:
+			target = 2;
+			break;
+		case 2:
+			target++;
+			break; /* another origin */
+		case 3:
+			cohort.future_full_xid_max = target - 1;
+			break;
+		case 4:
+			target = local_next + cluster_xid_herding_slack + CLUSTER_XID_STRIDE;
+			break;
+		case 5:
+			local_next = 400000004;
+			target = cohort.future_full_xid_max = local_next + 16;
+			pg_atomic_write_u64(&boot.cluster_min_active_hwm, 1024);
+			break;
+		case 6:
+			local_next = UINT64_C(0x100002004);
+			target = cohort.future_full_xid_max = local_next + 16;
+			pg_atomic_write_u32(&boot.wrap_barrier_done, 0);
+			break;
+		case 7:
+			local_next = UINT64_MAX - 27;
+			target = cohort.future_full_xid_max = local_next + 16;
+			break;
+		case 8:
+			xid_lock_held = true;
+			break;
+		case 9:
+			boot.maintenance_seq = UINT64_MAX;
+			break;
+		case 10:
+			cluster_shared_catalog = false;
+			break;
+		case 11:
+			pg_atomic_write_u32(&lease.failed, 1);
+			break;
+		}
+		UT_ASSERT_EQ(request_maintenance(target), CLUSTER_XID_STRIPE_MAINTENANCE_UNAVAILABLE);
+		UT_ASSERT(!boot.maintenance_pending);
+		UT_ASSERT_EQ(writes, 0);
+	}
+}
+
+UT_TEST(maintenance_rechecks_cohort_and_retires_changed_identity)
+{
+	prepare_maintenance();
+	UT_ASSERT_EQ(request_maintenance(8196), CLUSTER_XID_STRIPE_MAINTENANCE_PENDING);
+	cohort_status = CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE;
+	cluster_xid_stripe_herding_tick(disks, 3);
+	UT_ASSERT(boot.maintenance_pending);
+	UT_ASSERT_EQ(sync_writes, 0);
+	cohort_status = CLUSTER_HEAP_FREEZE_COHORT_READY;
+	semantic_fence.admitted_incarnation[65]++;
+	cluster_xid_stripe_herding_tick(disks, 3);
+	UT_ASSERT(!boot.maintenance_pending);
+	UT_ASSERT_EQ(sync_writes, 0);
+	UT_ASSERT(U64FromFullTransactionId(cluster_xid_stripe_herding_floor()) < 8196);
+}
+
+static void
+change_maintenance_identity(void)
+{
+	semantic_fence.membership_cut_generation++;
+}
+
+UT_TEST(maintenance_identity_change_during_io_cannot_arm_on_later_tick)
+{
+	prepare_maintenance();
+	UT_ASSERT_EQ(request_maintenance(8196), CLUSTER_XID_STRIPE_MAINTENANCE_PENDING);
+	slot_write_hook = change_maintenance_identity;
+	cluster_xid_stripe_herding_tick(disks, 3);
+	UT_ASSERT_EQ(sync_writes, 3);
+	UT_ASSERT(!boot.maintenance_pending);
+	UT_ASSERT(U64FromFullTransactionId(cluster_xid_stripe_herding_floor()) < 8196);
+	cluster_xid_stripe_herding_tick(disks, 3);
+	UT_ASSERT(U64FromFullTransactionId(cluster_xid_stripe_herding_floor()) < 8196);
+	UT_ASSERT_EQ(sync_writes, 3);
+}
+
+static void
+stage_later_maintenance(void)
+{
+	UT_ASSERT_EQ(request_maintenance(24580), CLUSTER_XID_STRIPE_MAINTENANCE_PENDING);
+}
+
+UT_TEST(maintenance_coalesces_max_and_old_io_cannot_clear_new_request)
+{
+	uint64 seq;
+
+	prepare_maintenance();
+	UT_ASSERT_EQ(request_maintenance(8196), CLUSTER_XID_STRIPE_MAINTENANCE_PENDING);
+	seq = boot.maintenance_seq;
+	UT_ASSERT_EQ(request_maintenance(4100), CLUSTER_XID_STRIPE_MAINTENANCE_PENDING);
+	UT_ASSERT_EQ(boot.maintenance_seq, seq);
+	UT_ASSERT_EQ(request_maintenance(16388), CLUSTER_XID_STRIPE_MAINTENANCE_PENDING);
+	UT_ASSERT(boot.maintenance_seq > seq);
+	slot_write_hook = stage_later_maintenance;
+	cluster_xid_stripe_herding_tick(disks, 3);
+	UT_ASSERT_EQ(U64FromFullTransactionId(cluster_xid_stripe_herding_floor()), 16388);
+	UT_ASSERT(boot.maintenance_pending);
+	UT_ASSERT_EQ(boot.maintenance_requested_full, 24580);
+	writes = 0;
+	cluster_xid_stripe_herding_tick(disks, 3);
+	UT_ASSERT_EQ(U64FromFullTransactionId(cluster_xid_stripe_herding_floor()), 24580);
+	UT_ASSERT(!boot.maintenance_pending);
+}
+
+UT_TEST(maintenance_extends_only_original_lease_and_respects_stall)
+{
+	ClusterXidStripeSlotRecord out;
+	uint64 old_limit, target;
+
+	prepare_maintenance();
+	UT_ASSERT_EQ(cohort_reads, 0); /* no observer on ordinary polls */
+	old_limit = pg_atomic_read_u64(&lease.limit_full);
+	target = old_limit + 16;
+	UT_ASSERT_EQ(request_maintenance(target), CLUSTER_XID_STRIPE_MAINTENANCE_PENDING);
+	stall_herding = true;
+	cluster_xid_stripe_herding_tick(disks, 3);
+	UT_ASSERT(boot.maintenance_pending);
+	UT_ASSERT_EQ(writes, 0);
+	stall_herding = false;
+	allowed_writes = 6;
+	cluster_xid_stripe_herding_tick(disks, 3);
+	UT_ASSERT(!boot.maintenance_pending);
+	UT_ASSERT_EQ(writes, 6); /* original legal lease majority, then JUMP majority */
+	UT_ASSERT_EQ(sync_writes, 3);
+	UT_ASSERT_EQ(U64FromFullTransactionId(cluster_xid_stripe_herding_floor()), target);
+	UT_ASSERT(pg_atomic_read_u64(&lease.limit_full) > target);
+	UT_ASSERT(cluster_xid_stripe_sample_fence_current(&sample_fence));
+	UT_ASSERT_EQ(stripe_read_slot_all(disks, 3, 4, &out, STRIPE_READ_UPDATE), STRIPE_READ_VALID);
+	UT_ASSERT_EQ(out.lease_floor_full, sample_fence.lease_floor_full);
+	UT_ASSERT_EQ(out.history_generation, 0);
+	UT_ASSERT_EQ(out.lease_incarnation, incarnation);
+}
+
+
+UT_TEST(maintenance_staging_and_durable_reply_recheck_identity_after_unlock)
+{
+	for (unsigned durable = 0; durable < 2; durable++) {
+		prepare_maintenance();
+		exclusive_release_hook = change_maintenance_identity;
+		UT_ASSERT_EQ(request_maintenance(durable ? 2052 : 8196),
+					 CLUSTER_XID_STRIPE_MAINTENANCE_IDENTITY_CHANGED);
+		UT_ASSERT_EQ(writes, 0);
+		cluster_xid_stripe_herding_tick(disks, 3);
+		UT_ASSERT(!boot.maintenance_pending);
+		UT_ASSERT_EQ(writes, 0);
+	}
+}
+
+static void
+lose_maintenance_cohort(void)
+{
+	cohort_status = CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE;
+}
+
+UT_TEST(maintenance_durable_io_still_requires_current_proof_before_arm)
+{
+	prepare_maintenance();
+	UT_ASSERT_EQ(request_maintenance(8196), CLUSTER_XID_STRIPE_MAINTENANCE_PENDING);
+	slot_write_hook = lose_maintenance_cohort;
+	cluster_xid_stripe_herding_tick(disks, 3);
+	UT_ASSERT_EQ(sync_writes, 3);
+	UT_ASSERT(boot.maintenance_pending);
+	UT_ASSERT(U64FromFullTransactionId(cluster_xid_stripe_herding_floor()) < 8196);
+	cohort_status = CLUSTER_HEAP_FREEZE_COHORT_READY;
+	writes = sync_writes = 0;
+	cluster_xid_stripe_herding_tick(disks, 3);
+	UT_ASSERT_EQ(sync_writes, 3);
+	UT_ASSERT(!boot.maintenance_pending);
+	UT_ASSERT_EQ(U64FromFullTransactionId(cluster_xid_stripe_herding_floor()), 8196);
+}
+
 int
 main(void)
 {
@@ -944,7 +1672,7 @@ main(void)
 		if (disks[i] < 0 || unlink(path) != 0)
 			abort();
 	}
-	UT_PLAN(25);
+	UT_PLAN(44);
 	UT_RUN(coherent_tracking_and_retirement_choose_latest);
 	UT_RUN(equal_generation_disagreement_refuses_in_either_order);
 	UT_RUN(newer_record_cannot_replace_claim_identity);
@@ -970,6 +1698,25 @@ main(void)
 	UT_RUN(herding_services_reservation_and_preserves_ceiling);
 	UT_RUN(wait_timeouts_retry_and_new_floor_returns_for_rederivation);
 	UT_RUN(wait_cancellation_quorum_loss_and_parent_death_cleanup);
+	UT_RUN(future_requires_majority_and_current_lease_incarnation);
+	UT_RUN(future_uses_shared_incarnation_outside_qvotec);
+	UT_RUN(future_clamps_original_floors_without_changing_allocation);
+	UT_RUN(future_refuses_missing_or_changing_authority);
+	UT_RUN(future_retains_lease_bounds_wrap_and_window_guards);
+	UT_RUN(sample_fence_keeps_original_durable_interval_across_renewal);
+	UT_RUN(sample_fence_rejects_replaced_or_revoked_authority);
+	UT_RUN(sample_fence_failure_clears_outputs_and_refuses_empty_fence);
+	UT_RUN(maintenance_stages_then_syncs_before_arming_original_floor);
+	UT_RUN(maintenance_syncs_even_when_tracking_hwm_already_covers_request);
+	UT_RUN(maintenance_partial_write_retries_without_arming);
+	UT_RUN(maintenance_requires_complete_current_cohort_before_staging);
+	UT_RUN(maintenance_refuses_unbounded_or_illegal_targets_without_io);
+	UT_RUN(maintenance_rechecks_cohort_and_retires_changed_identity);
+	UT_RUN(maintenance_identity_change_during_io_cannot_arm_on_later_tick);
+	UT_RUN(maintenance_coalesces_max_and_old_io_cannot_clear_new_request);
+	UT_RUN(maintenance_extends_only_original_lease_and_respects_stall);
+	UT_RUN(maintenance_staging_and_durable_reply_recheck_identity_after_unlock);
+	UT_RUN(maintenance_durable_io_still_requires_current_proof_before_arm);
 	for (int i = 0; i < 3; i++)
 		close(disks[i]);
 	UT_DONE();

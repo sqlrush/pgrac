@@ -55,6 +55,7 @@
 #include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
+#include "storage/procarray.h"
 #include "storage/procsignal.h"
 #include "storage/shmem.h"
 #include "tcop/tcopprot.h"
@@ -77,6 +78,7 @@
 #include "cluster/cluster_undo_record_api.h" /* active segment + advance (D3) */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_undo_cleaner.h"
+#include "cluster/cluster_xid_stripe_boot.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 
@@ -88,6 +90,10 @@
  */
 static UndoCleanerSharedState *undo_cleaner_state = NULL;
 static int undo_cleaner_worker = -1;
+static ClusterCtrcActiveScan undo_cleaner_active_scan;
+static ClusterXidStripeSampleFence undo_cleaner_active_lease_fence;
+static ClusterSemanticActiveSampleFence undo_cleaner_active_admission_fence;
+static bool undo_cleaner_active_scan_pending;
 
 StaticAssertDecl(CLUSTER_UNDO_CLEANER_WORKER_TYPES == CLUSTER_CTRC_CLEANER_WORKERS,
 				 "each terminal-supply shard needs one distinct auxiliary process");
@@ -217,6 +223,80 @@ cluster_undo_cleaner_worker_snapshot(unsigned worker_id, UndoCleanerWorkerState 
 	return true;
 }
 
+bool
+cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out)
+{
+	ClusterUndoCleanerActiveSample sample;
+
+	if (out == NULL)
+		return false;
+	MemSet(out, 0, sizeof(*out));
+	if (undo_cleaner_state == NULL)
+		return false;
+	LWLockAcquire(&undo_cleaner_state->lwlock, LW_SHARED);
+	sample = undo_cleaner_state->active_sample;
+	LWLockRelease(&undo_cleaner_state->lwlock);
+	if (!cluster_undo_cleaner_active_sample_current(&sample))
+		return false;
+	*out = sample;
+	return true;
+}
+
+bool
+cluster_undo_cleaner_active_sample_current(const ClusterUndoCleanerActiveSample *expected)
+{
+	bool current;
+
+	if (expected == NULL || undo_cleaner_state == NULL || expected->sample_id == 0
+		|| expected->scan.status != CTRC_ACTIVE_SCAN_COMPLETE || !cluster_undo_cleaner_enabled
+		|| !cluster_storage_mode_enabled() || cluster_normal_stop_maintenance_cut())
+		return false;
+	/* Never nest the cleaner lock with native, census, lease or admission
+	 * locks. Check the original scan's fences, then its shared publication. */
+	if (!cluster_xid_stripe_sample_fence_current(&expected->lease_fence)
+		|| !cluster_semantic_activation_active_sample_current(&expected->admission_fence))
+		return false;
+	LWLockAcquire(&undo_cleaner_state->lwlock, LW_SHARED);
+	current = !undo_cleaner_state->shutdown_requested
+			  && undo_cleaner_state->workers[0].status == UNDO_CLEANER_READY
+			  && expected->worker_pid > 0
+			  && undo_cleaner_state->workers[0].pid == expected->worker_pid
+			  && memcmp(&undo_cleaner_state->active_sample, expected, sizeof(*expected)) == 0;
+	LWLockRelease(&undo_cleaner_state->lwlock);
+	/* Check after all callbacks/cleaner ownership: late unknown ingress must
+	 * also revoke a completed sample retained by LMON or a local consumer. */
+	return current && cluster_ctrc_active_scan_registration_current(&expected->scan);
+}
+
+/* Worker0 is the sole publisher. Keep the last completed image while the
+ * next census is incomplete: fresh H may reuse this immutable F generation.
+ * Failure/revocation clears it. The sequence survives worker0 respawns. */
+static void
+undo_cleaner_publish_active_sample(void)
+{
+	ClusterUndoCleanerActiveSample *sample;
+
+	if (undo_cleaner_worker != 0 || undo_cleaner_state == NULL)
+		return;
+	if (undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_INCOMPLETE)
+		return;
+	LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
+	sample = &undo_cleaner_state->active_sample;
+	MemSet(sample, 0, sizeof(*sample));
+	if (undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_COMPLETE
+		&& !undo_cleaner_state->shutdown_requested
+		&& undo_cleaner_state->workers[0].status == UNDO_CLEANER_READY
+		&& undo_cleaner_state->workers[0].pid == MyProcPid
+		&& undo_cleaner_state->active_sample_sequence != UINT64_MAX) {
+		sample->scan = undo_cleaner_active_scan;
+		sample->lease_fence = undo_cleaner_active_lease_fence;
+		sample->admission_fence = undo_cleaner_active_admission_fence;
+		sample->sample_id = ++undo_cleaner_state->active_sample_sequence;
+		sample->worker_pid = MyProcPid;
+	}
+	LWLockRelease(&undo_cleaner_state->lwlock);
+}
+
 static void
 undo_cleaner_note_held_lwlock(LWLock *lock pg_attribute_unused(),
 							  LWLockMode mode pg_attribute_unused(), void *context)
@@ -307,6 +387,7 @@ bool
 cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *continuation)
 {
 	bool retry = false;
+	uint32 previous_wait_event = *my_wait_event_info;
 
 	if (undo_cleaner_state == NULL || continuation == NULL)
 		return false;
@@ -314,6 +395,7 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 		LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
 		undo_cleaner_state->capacity_wait_refused_context++;
 		LWLockRelease(&undo_cleaner_state->lwlock);
+		pgstat_report_wait_start(previous_wait_event);
 		return false;
 	}
 	ConditionVariablePrepareToSleep(&undo_cleaner_state->capacity_cv);
@@ -348,7 +430,7 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 				 * not a new failure deadline or a reason to assume FREE. */
 				(void)ConditionVariableTimedSleep(&undo_cleaner_state->capacity_cv,
 												  Max(cluster_lmon_main_loop_interval, 200),
-												  WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP);
+												  WAIT_EVENT_CLUSTER_UNDO_CAPACITY_WAIT);
 				LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
 				undo_cleaner_state->capacity_wait_repolled++;
 				LWLockRelease(&undo_cleaner_state->lwlock);
@@ -368,6 +450,8 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 		ConditionVariableCancelSleep();
 	}
 	PG_END_TRY();
+	/* CV and bookkeeping LWLock waits clear their events. Errors use PG cleanup. */
+	pgstat_report_wait_start(previous_wait_event);
 	return retry;
 }
 
@@ -479,6 +563,14 @@ undo_cleaner_publish_status(UndoCleanerStatus status)
 	 * respawn.
 	 */
 	if (status == UNDO_CLEANER_SPAWNING) {
+		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
+		MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
+		MemSet(&undo_cleaner_active_admission_fence, 0,
+			   sizeof(undo_cleaner_active_admission_fence));
+		undo_cleaner_active_scan_pending = false;
+		if (undo_cleaner_worker == 0)
+			MemSet(&undo_cleaner_state->active_sample, 0,
+				   sizeof(undo_cleaner_state->active_sample));
 		MemSet(worker, 0, sizeof(*worker));
 		worker->pid = MyProcPid;
 		worker->spawned_at = now;
@@ -561,7 +653,7 @@ undo_cleaner_advance_liveness_tick(void)
  *	false, so the continuous mode can never busy-spin.
  */
 static bool
-undo_cleaner_run_pass(bool *out_work_remaining)
+undo_cleaner_run_pass(bool *out_work_remaining, bool maintenance_due)
 {
 	ClusterUndoCleanerPassStats stats;
 	ClusterSemanticAdmissionToken modifier_token;
@@ -570,11 +662,16 @@ undo_cleaner_run_pass(bool *out_work_remaining)
 	bool ctrc_local_progress;
 
 	*out_work_remaining = false;
+	undo_cleaner_active_scan_pending = false;
 
-	if (!cluster_undo_cleaner_enabled)
+	if (!cluster_undo_cleaner_enabled || !cluster_storage_mode_enabled()) {
+		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
+		MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
+		MemSet(&undo_cleaner_active_admission_fence, 0,
+			   sizeof(undo_cleaner_active_admission_fence));
+		undo_cleaner_publish_active_sample();
 		return false;
-	if (!cluster_storage_mode_enabled())
-		return false;
+	}
 	if (MyBackendType != B_STARTUP && cluster_shared_config
 		&& cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
 		&& !cluster_semantic_activation_recovered_open_current())
@@ -598,7 +695,57 @@ undo_cleaner_run_pass(bool *out_work_remaining)
 	 * coordinator waits for their real owners to become idle before park.
 	 * An already admitted maintenance pass still completes and releases its
 	 * modifier normally; this observation grants no shutdown/park authority. */
-	if (cluster_normal_stop_maintenance_cut())
+	if (cluster_normal_stop_maintenance_cut()) {
+		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
+		MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
+		MemSet(&undo_cleaner_active_admission_fence, 0,
+			   sizeof(undo_cleaner_active_admission_fence));
+		undo_cleaner_publish_active_sample();
+		return false;
+	}
+	/* Capture N/future then all top/prepared PGPROCs before the census. No
+	 * input grants freeze authority. Keep these inputs throughout an
+	 * incomplete round, including continuations at a busy census entry. */
+	if (undo_cleaner_active_scan.status != CTRC_ACTIVE_SCAN_INCOMPLETE) {
+		FullTransactionId reference;
+		FullTransactionId future;
+		FullTransactionId active_min;
+
+		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
+		MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
+		MemSet(&undo_cleaner_active_admission_fence, 0,
+			   sizeof(undo_cleaner_active_admission_fence));
+		undo_cleaner_active_scan.status = CTRC_ACTIVE_SCAN_INVALID;
+		if (cluster_semantic_activation_active_sample_capture(&undo_cleaner_active_admission_fence)
+			&& ProcArrayGetActiveFullXidSample(&reference, &future, &active_min,
+											   &undo_cleaner_active_lease_fence)
+			&& cluster_ctrc_active_scan_begin(&undo_cleaner_active_scan, reference)) {
+			undo_cleaner_active_scan.future_full = future;
+			undo_cleaner_active_scan.min_full = active_min;
+		}
+	}
+	/* Qualify against the same semantic source saved before N, including each
+	 * origin's admitted incarnation. The stripe first-owner is not this boot. */
+	cluster_ctrc_active_scan_step_source(&undo_cleaner_active_scan,
+										 &undo_cleaner_active_admission_fence);
+	/* Recheck the original admission/cohort and lease after the slice has
+	 * released every census lock. No replacement may complete an old sample. */
+	if ((undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_INCOMPLETE
+		 || undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_COMPLETE)
+		&& (!cluster_xid_stripe_sample_fence_current(&undo_cleaner_active_lease_fence)
+			|| !cluster_semantic_activation_active_sample_current(
+				&undo_cleaner_active_admission_fence))) {
+		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
+		MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
+		MemSet(&undo_cleaner_active_admission_fence, 0,
+			   sizeof(undo_cleaner_active_admission_fence));
+		undo_cleaner_active_scan.status = CTRC_ACTIVE_SCAN_INVALID;
+	}
+	undo_cleaner_active_scan_pending
+		= undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_INCOMPLETE;
+	undo_cleaner_publish_active_sample();
+	/* Census continuation must not accelerate optional segment maintenance. */
+	if (!maintenance_due)
 		return false;
 	writable_admission = cluster_reconfig_self_join_gate_verdict() == CLUSTER_JOIN_GATE_ALLOW;
 	if (cluster_semantic_activation_modifier_enter(writable_admission, &modifier_token)
@@ -878,6 +1025,9 @@ undo_cleaner_normal_stop_park(void)
 void
 UndoCleanerMain(void)
 {
+	TimestampTz maintenance_at = 0;
+	bool maintenance_due = true;
+
 	/* HC1 reverse defense: we must be a postmaster child. */
 	Assert(IsUnderPostmaster);
 	undo_cleaner_worker = ClusterUndoCleanerWorkerIdForType(MyAuxProcType);
@@ -952,12 +1102,14 @@ UndoCleanerMain(void)
 
 		CLUSTER_INJECTION_POINT("undo-cleaner-main-loop-iter");
 
-		floor_retry = undo_cleaner_run_pass(&work_remaining);
+		floor_retry = undo_cleaner_run_pass(&work_remaining, maintenance_due);
 		LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
 		undo_cleaner_state->workers[undo_cleaner_worker].local_completed_passes
 			= cluster_ctrc_cleaner_local_passes();
 		undo_cleaner_state->workers[undo_cleaner_worker].local_progress_events
 			= cluster_ctrc_cleaner_local_progress();
+		if (undo_cleaner_worker == 0)
+			undo_cleaner_state->workers[0].active_census = undo_cleaner_active_scan;
 		LWLockRelease(&undo_cleaner_state->lwlock);
 		/* The complete outer pass, including worker0 GC/segment work and
 		 * modifier release, has returned. Cover the fast-continue edge too. */
@@ -974,8 +1126,10 @@ UndoCleanerMain(void)
 		 * and the signal requires PROGRESS, so a pinned or stalled floor
 		 * always falls through to the waits below.
 		 */
-		if (work_remaining)
+		if (work_remaining) {
+			maintenance_due = true;
 			continue;
+		}
 
 		/*
 		 * interval 0 = pressure-wakeup only (Q8): block without
@@ -992,12 +1146,24 @@ UndoCleanerMain(void)
 		 * bounds the interval=0 mode, whose stalled pass previously
 		 * waited on a latch nobody was obliged to set.
 		 */
-		timeout_ms = cluster_undo_cleaner_interval_ms;
-		if (floor_retry) {
-			int retry_ms = Max(cluster_lmon_main_loop_interval, 200);
+		if (maintenance_due) {
+			timeout_ms = cluster_undo_cleaner_interval_ms;
+			if (floor_retry) {
+				int retry_ms = Max(cluster_lmon_main_loop_interval, 200);
 
-			if (timeout_ms <= 0 || retry_ms < timeout_ms)
-				timeout_ms = retry_ms;
+				if (timeout_ms <= 0 || retry_ms < timeout_ms)
+					timeout_ms = retry_ms;
+			}
+			maintenance_at = timeout_ms > 0
+								 ? TimestampTzPlusMilliseconds(GetCurrentTimestamp(), timeout_ms)
+								 : 0;
+		} else if (maintenance_at != 0) {
+			TimestampTz now = GetCurrentTimestamp();
+			int64 remaining_ms = maintenance_at > now ? (maintenance_at - now + 999) / 1000 : 1;
+
+			timeout_ms = (int)Min(remaining_ms, PG_INT32_MAX);
+		} else {
+			timeout_ms = 0;
 		}
 		/* A DRAIN wake is not proof that the terminal census can succeed
 		 * in that pass. Retry retained responsibilities within the original
@@ -1005,11 +1171,17 @@ UndoCleanerMain(void)
 		 * park and completion checks above remain the sole exit authority. */
 		if (cluster_normal_stop_requested() && (timeout_ms <= 0 || timeout_ms > 200))
 			timeout_ms = 200;
+		if (undo_cleaner_active_scan_pending && (timeout_ms <= 0 || timeout_ms > 10))
+			timeout_ms = 10;
 		rc = WaitLatch(
 			MyLatch, WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | (timeout_ms > 0 ? WL_TIMEOUT : 0),
 			timeout_ms > 0 ? timeout_ms : -1L, WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP);
 		if (rc & WL_LATCH_SET)
 			ResetLatch(MyLatch);
+		/* Preserve the original maintenance deadline across census-only wakes.
+		 * Pressure/signals still request a complete pass immediately. */
+		maintenance_due = (rc & WL_LATCH_SET) != 0
+						  || (maintenance_at != 0 && GetCurrentTimestamp() >= maintenance_at);
 	}
 
 	CLUSTER_INJECTION_POINT("undo-cleaner-shutdown-pre");

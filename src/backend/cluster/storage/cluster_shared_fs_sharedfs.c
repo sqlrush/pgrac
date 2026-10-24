@@ -1003,6 +1003,29 @@ sharedfs_drop_work_namespace(const ClusterKoDropWorkV2 *work, SharedFsDropWorkSt
 	return true;
 }
 
+enum SharedFsDropTraceStep {
+	SHAREDFS_DROP_TRACE_POLICY = 1, SHAREDFS_DROP_TRACE_FORGET,
+	SHAREDFS_DROP_TRACE_DIRECTORY_OPEN, SHAREDFS_DROP_TRACE_DIRECTORY_BIND,
+	SHAREDFS_DROP_TRACE_FORK_OPEN, SHAREDFS_DROP_TRACE_NAMESPACE,
+	SHAREDFS_DROP_TRACE_MAIN_TRUNCATE, SHAREDFS_DROP_TRACE_MAIN_SYNC,
+	SHAREDFS_DROP_TRACE_AUX_UNLINK, SHAREDFS_DROP_TRACE_DIRECTORY_SYNC,
+	SHAREDFS_DROP_TRACE_CLOSE
+};
+
+static void
+sharedfs_drop_work_note(ClusterKoDropWorkV2 *work, uint32 step, ForkNumber fork)
+{
+	cluster_ko_drop_work_note_v1(work, CLUSTER_KO_DROP_TRACE_PROVIDER, step, fork, false, 0);
+}
+
+static bool
+sharedfs_drop_work_io_error(ClusterKoDropWorkV2 *work, uint32 step, ForkNumber fork)
+{
+	int error = errno;
+	cluster_ko_drop_work_note_v1(work, CLUSTER_KO_DROP_TRACE_PROVIDER, step, fork, true, error);
+	return false;
+}
+
 /* One bounded attempt on the original state. False never clears responsibility;
  * after all I/O and closes succeed, future attempts perform no pathname I/O. */
 static bool
@@ -1013,6 +1036,7 @@ sharedfs_drop_work_attempt(ClusterKoDropWorkV2 *work, SharedFsDropWorkState *sta
 	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 	uint8 identity_bytes[CLUSTER_SPACE_IDENTITY_BYTES];
 
+	sharedfs_drop_work_note(work, SHAREDFS_DROP_TRACE_POLICY, InvalidForkNumber);
 	if (state == NULL || state->failed || !enableFsync
 		|| !cluster_ko_shared_drop_work_read_v2(work, &terminal, wal, sizeof(wal))
 		|| !cluster_space_structure_wal_decode(wal, sizeof(wal), &change)
@@ -1064,6 +1088,7 @@ sharedfs_drop_work_attempt(ClusterKoDropWorkV2 *work, SharedFsDropWorkState *sta
 	for (; state->forget_next <= MAX_FORKNUM; state->forget_next++) {
 		FileTag tag;
 
+		sharedfs_drop_work_note(work, SHAREDFS_DROP_TRACE_FORGET, state->forget_next);
 		memset(&tag, 0, sizeof(tag));
 		tag.handler = SYNC_HANDLER_CLUSTER_SHARED;
 		tag.rlocator = state->identity.key.locator;
@@ -1074,6 +1099,7 @@ sharedfs_drop_work_attempt(ClusterKoDropWorkV2 *work, SharedFsDropWorkState *sta
 	}
 	if (!state->closing) {
 		if (state->directory < 0) {
+			sharedfs_drop_work_note(work, SHAREDFS_DROP_TRACE_DIRECTORY_OPEN, InvalidForkNumber);
 			if (!cluster_ko_shared_drop_work_revalidate_v2(work) || !AcquireExternalFD())
 				return false;
 			if (!cluster_ko_shared_drop_work_revalidate_v2(work)) {
@@ -1082,11 +1108,15 @@ sharedfs_drop_work_attempt(ClusterKoDropWorkV2 *work, SharedFsDropWorkState *sta
 			}
 			state->directory = open(state->parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | PG_BINARY);
 			if (state->directory < 0) {
+				int error = errno;
+				cluster_ko_drop_work_note_v1(work, CLUSTER_KO_DROP_TRACE_PROVIDER,
+					SHAREDFS_DROP_TRACE_DIRECTORY_OPEN, InvalidForkNumber, true, error);
 				ReleaseExternalFD();
 				return false;
 			}
 		}
 		if (!state->directory_bound) {
+			sharedfs_drop_work_note(work, SHAREDFS_DROP_TRACE_DIRECTORY_BIND, InvalidForkNumber);
 			if (!cluster_ko_shared_drop_work_revalidate_v2(work)
 				|| fstat(state->directory, &state->directory_identity) != 0)
 				return false;
@@ -1104,6 +1134,7 @@ sharedfs_drop_work_attempt(ClusterKoDropWorkV2 *work, SharedFsDropWorkState *sta
 		for (; state->open_next <= MAX_FORKNUM; state->open_next++) {
 			SharedFsDropWorkFork *f = &state->forks[state->open_next];
 
+			sharedfs_drop_work_note(work, SHAREDFS_DROP_TRACE_FORK_OPEN, state->open_next);
 			if (f->fd < 0) {
 				if (!cluster_ko_shared_drop_work_revalidate_v2(work) || !AcquireExternalFD())
 					return false;
@@ -1117,6 +1148,8 @@ sharedfs_drop_work_attempt(ClusterKoDropWorkV2 *work, SharedFsDropWorkState *sta
 				if (f->fd < 0) {
 					int error = errno;
 
+					cluster_ko_drop_work_note_v1(work, CLUSTER_KO_DROP_TRACE_PROVIDER,
+						SHAREDFS_DROP_TRACE_FORK_OPEN, state->open_next, true, error);
 					ReleaseExternalFD();
 					if (error != ENOENT || state->open_next == MAIN_FORKNUM
 						|| state->open_next == SPACE_FORKNUM) {
@@ -1132,22 +1165,27 @@ sharedfs_drop_work_attempt(ClusterKoDropWorkV2 *work, SharedFsDropWorkState *sta
 			if (!S_ISREG(f->identity.st_mode) || f->identity.st_nlink != 1)
 				return sharedfs_drop_work_invalid(state);
 		}
+		sharedfs_drop_work_note(work, SHAREDFS_DROP_TRACE_NAMESPACE, InvalidForkNumber);
 		if (!sharedfs_drop_work_namespace(work, state))
 			return false;
 		if (!state->truncated) {
-			if (!cluster_ko_shared_drop_work_revalidate_v2(work)
-				|| ftruncate(state->forks[MAIN_FORKNUM].fd, 0) != 0)
+			sharedfs_drop_work_note(work, SHAREDFS_DROP_TRACE_MAIN_TRUNCATE, MAIN_FORKNUM);
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work))
 				return false;
+			if (ftruncate(state->forks[MAIN_FORKNUM].fd, 0) != 0)
+				return sharedfs_drop_work_io_error(work, SHAREDFS_DROP_TRACE_MAIN_TRUNCATE,
+					MAIN_FORKNUM);
 			state->truncated = true;
 		}
 		if (!state->main_synced) {
+			sharedfs_drop_work_note(work, SHAREDFS_DROP_TRACE_MAIN_SYNC, MAIN_FORKNUM);
 			if (!cluster_ko_shared_drop_work_revalidate_v2(work))
 				return false;
 			if (pg_fsync(state->forks[MAIN_FORKNUM].fd) != 0) {
 				/* The OS may have discarded dirty bytes. A later successful
 				 * fsync is not proof; retain the original WAL obligation. */
 				state->failed = true;
-				return false;
+				return sharedfs_drop_work_io_error(work, SHAREDFS_DROP_TRACE_MAIN_SYNC, MAIN_FORKNUM);
 			}
 			state->main_synced = true;
 		}
@@ -1156,25 +1194,33 @@ sharedfs_drop_work_attempt(ClusterKoDropWorkV2 *work, SharedFsDropWorkState *sta
 
 			if (f->absent || f->removed)
 				continue;
+			sharedfs_drop_work_note(work, SHAREDFS_DROP_TRACE_NAMESPACE, state->unlink_next);
 			if (!sharedfs_drop_work_namespace(work, state))
 				return false;
 			if (f->removed)
 				continue;
-			if (!cluster_ko_shared_drop_work_revalidate_v2(work)
-				|| unlinkat(state->directory, f->name, 0) != 0)
+			sharedfs_drop_work_note(work, SHAREDFS_DROP_TRACE_AUX_UNLINK, state->unlink_next);
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work))
 				return false;
+			if (unlinkat(state->directory, f->name, 0) != 0)
+				return sharedfs_drop_work_io_error(work, SHAREDFS_DROP_TRACE_AUX_UNLINK,
+					state->unlink_next);
 			f->removed = true;
 		}
 		if (!state->directory_synced) {
+			sharedfs_drop_work_note(work, SHAREDFS_DROP_TRACE_NAMESPACE, InvalidForkNumber);
 			if (!sharedfs_drop_work_namespace(work, state)
 				|| !cluster_ko_shared_drop_work_revalidate_v2(work))
 				return false;
+			sharedfs_drop_work_note(work, SHAREDFS_DROP_TRACE_DIRECTORY_SYNC, InvalidForkNumber);
 			if (pg_fsync(state->directory) != 0) {
 				state->failed = true;
-				return false;
+				return sharedfs_drop_work_io_error(work, SHAREDFS_DROP_TRACE_DIRECTORY_SYNC,
+					InvalidForkNumber);
 			}
 			state->directory_synced = true;
 		}
+		sharedfs_drop_work_note(work, SHAREDFS_DROP_TRACE_NAMESPACE, InvalidForkNumber);
 		if (!sharedfs_drop_work_namespace(work, state))
 			return false;
 		state->closing = true;
@@ -1182,19 +1228,26 @@ sharedfs_drop_work_attempt(ClusterKoDropWorkV2 *work, SharedFsDropWorkState *sta
 	for (; state->close_next <= MAX_FORKNUM + 1; state->close_next++) {
 		int *fd = state->close_next <= MAX_FORKNUM ? &state->forks[state->close_next].fd
 												   : &state->directory;
-		int result;
+		int result, close_error;
 
 		if (*fd < 0)
 			continue;
+		sharedfs_drop_work_note(work, SHAREDFS_DROP_TRACE_CLOSE,
+			state->close_next <= MAX_FORKNUM ? (ForkNumber)state->close_next : InvalidForkNumber);
 		if (!cluster_ko_shared_drop_work_revalidate_v2(work))
 			return false;
 		result = close(*fd);
+		close_error = result != 0 ? errno : 0;
 		*fd = -1;
 		ReleaseExternalFD();
 		/* close failure has platform-dependent descriptor ownership. Never
 		 * close that number again or turn an uncertain close into success. */
 		if (result != 0) {
 			state->failed = true;
+			cluster_ko_drop_work_note_v1(work, CLUSTER_KO_DROP_TRACE_PROVIDER,
+				SHAREDFS_DROP_TRACE_CLOSE,
+				state->close_next <= MAX_FORKNUM ? (ForkNumber)state->close_next : InvalidForkNumber,
+				true, close_error);
 			return false;
 		}
 	}

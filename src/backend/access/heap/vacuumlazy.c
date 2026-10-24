@@ -32,7 +32,8 @@
  *    Modified by: SqlRush <sqlrush@gmail.com>
  *    Retain shared relation version identity during native maintenance and
  *    preserve peer MultiXact pages and freeze cutoffs until their references
- *    can be maintained safely. See spec-3.6b-multixact-current-dml.md and
+ *    can be maintained safely. Validate owned freeze inputs before releasing
+ *    the original content lock. See spec-3.6b-multixact-current-dml.md and
  *    2026-10-11-pre2-p0-m5-f-multixact-am01.md.
  *
  *-------------------------------------------------------------------------
@@ -75,9 +76,17 @@
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: native maintenance retains pre-lock relation version identity. */
 #include "catalog/pg_control.h"
+#include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_heap_horizon.h"
+#include "cluster/cluster_heap_freeze.h"
+#include "cluster/cluster_itl_cleanout.h"
 #include "cluster/cluster_mode.h"
+#include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_scn.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_tx_resolve.h"
 #include "cluster/storage/cluster_smgr.h"
 #endif
 
@@ -164,8 +173,32 @@ typedef struct LVRelState
 #ifdef USE_PGRAC_CLUSTER
 	bool		versioned;
 	ClusterSpaceIdentity identity;
+	/* Unproven image and bounded rows; no pointer or freeze permission. */
+	ClusterHeapFreezePageInputV1 shared_freeze_input;
+	ClusterHeapFreezePageBatchV1 shared_freeze_batch;
+	ClusterHeapFreezeProofBatchV1 shared_freeze_proofs;
+	ClusterHeapFreezeFinalFenceV1 shared_freeze_fence;
+	/* Same-admission observations only; not a positive F/H certificate. */
+	ClusterHeapFreezeCohortObservation shared_freeze_cohort;
+	FullTransactionId shared_freeze_candidate_limit_full;
+	/* Pre-admission row requests only; never native freeze plans. */
+	ClusterHeapFreezeXminCandidateBatchV1 shared_freeze_xmin_candidates;
+	ClusterHeapFreezeAbortedXmaxCandidateBatchV1 shared_freeze_aborted_xmax_candidates;
+	bool		shared_freeze_cohort_observed;
+	ClusterHeapFreezeProofStatusV1 shared_freeze_apply_status;
+	bool		shared_freeze_input_captured;
+	bool		shared_freeze_input_valid;
+	bool		shared_freeze_fence_valid;
 	BlockNumber shared_mx_deferred_pages;
 	int64		shared_mx_deferred_tuples;
+	int64		shared_xmin_deferred_tuples;
+	int64		shared_xmax_deferred_tuples;
+	BlockNumber shared_freeze_changed_pages;
+	/* Query-local diagnostics only; never a message-budget certificate. */
+	uint64 shared_freeze_proof_calls;
+	uint64 shared_freeze_proof_requests;
+	uint64 shared_freeze_proof_exchanges;
+	bool shared_freeze_proof_cost_incomplete;
 #endif
 
 	/* Buffer access strategy and parallel vacuum state */
@@ -266,6 +299,9 @@ typedef struct LVSavedErrInfo
 static void lazy_scan_heap(LVRelState *vacrel);
 #ifdef USE_PGRAC_CLUSTER
 static bool lazy_scan_shared_mx(LVRelState *vacrel, Page page, BlockNumber blkno);
+static void lazy_validate_shared_freeze(LVRelState *vacrel, Page page, BlockNumber blkno, Buffer buffer);
+static ClusterHeapFreezeProofStatusV1 lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer);
+static void lazy_prepare_shared_freeze(LVRelState *vacrel, Buffer recent_buffer, Buffer *vmbuffer);
 #endif
 static BlockNumber lazy_scan_skip(LVRelState *vacrel, Buffer *vmbuffer,
 								  BlockNumber next_block,
@@ -404,6 +440,11 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 	if (vacrel->versioned && (!RelationNeedsWAL(rel)
 		|| !cluster_space_relation_get_identity(rel, &vacrel->identity)))
 		elog(ERROR, "PGRAC shared VACUUM requires exact SPACE identity");
+	/* Queue only an intent before heap content locks. Missing cohort evidence
+	 * defers the request; it cannot lift the existing shared freeze restriction. */
+	if (vacrel->versioned && vacrel->shared_maintenance_restricted
+		&& (params->options & VACOPT_FREEZE))
+		(void) cluster_heap_freeze_request_maintenance();
 #endif
 	vac_open_indexes(vacrel->rel, RowExclusiveLock, &vacrel->nindexes,
 					 &vacrel->indrels);
@@ -599,8 +640,11 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 									   vacrel->cutoffs.relminmxid,
 									   vacrel->NewRelminMxid));
 #ifdef USE_PGRAC_CLUSTER
-	/* PGRAC: unexamined members cannot authorize either freeze cutoff. */
-	if (vacrel->shared_maintenance_restricted || vacrel->shared_mx_deferred_pages > 0)
+	/* PGRAC: retained or unexamined inputs cannot authorize either cutoff. */
+	if (vacrel->shared_maintenance_restricted || vacrel->shared_mx_deferred_pages > 0 ||
+		vacrel->shared_xmin_deferred_tuples > 0 ||
+		vacrel->shared_xmax_deferred_tuples > 0 ||
+		vacrel->shared_freeze_changed_pages > 0)
 	{
 		vacrel->NewRelfrozenXid = InvalidTransactionId;
 		vacrel->NewRelminMxid = InvalidMultiXactId;
@@ -745,6 +789,21 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 					_("shared MultiXact references retained: %u pages, %lld tuples; relfrozenxid and relminmxid not advanced\n"),
 					vacrel->shared_mx_deferred_pages,
 					(long long) vacrel->shared_mx_deferred_tuples);
+			if (vacrel->shared_xmin_deferred_tuples > 0 ||
+				vacrel->shared_xmax_deferred_tuples > 0 ||
+				vacrel->shared_freeze_changed_pages > 0)
+				appendStringInfo(&buf,
+					_("shared unproven references retained: %lld xmin, %lld ordinary xmax; %u changed page inputs discarded\n"),
+					(long long) vacrel->shared_xmin_deferred_tuples,
+					(long long) vacrel->shared_xmax_deferred_tuples,
+					vacrel->shared_freeze_changed_pages);
+			if (vacrel->shared_maintenance_restricted)
+				appendStringInfo(&buf,
+					_("shared freeze proof transport (logical undo-header/verdict only): " UINT64_FORMAT " calls, " UINT64_FORMAT " admitted requests, " UINT64_FORMAT " synchronous exchanges%s\n"),
+					vacrel->shared_freeze_proof_calls,
+					vacrel->shared_freeze_proof_requests,
+					vacrel->shared_freeze_proof_exchanges,
+					vacrel->shared_freeze_proof_cost_incomplete ? _("; incomplete counter interval") : "");
 #endif
 			if (vacrel->missed_dead_tuples > 0)
 				appendStringInfo(&buf,
@@ -939,7 +998,7 @@ lazy_clear_visibility_versioned(Relation rel, const ClusterSpaceIdentity *identi
  *
  * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
  * What changed: Both lock branches preserve peer MX pages before native
- * pruning or member enumeration.
+ * pruning or member enumeration, and compare captured inputs before unlock.
  * Why: Cleanup locking does not provide remote member authority.
  */
 
@@ -978,6 +1037,19 @@ lazy_scan_heap(LVRelState *vacrel)
 		bool		all_visible_according_to_vm;
 		LVPagePruneState prunestate;
 
+#ifdef USE_PGRAC_CLUSTER
+		/* A skipped/new/empty/error page must not inherit the preceding input. */
+		vacrel->shared_freeze_input_captured = false;
+		vacrel->shared_freeze_input_valid = false;
+		vacrel->shared_freeze_proofs.proof_count = 0;
+		vacrel->shared_freeze_fence_valid = false;
+		vacrel->shared_freeze_cohort_observed = false;
+		vacrel->shared_freeze_xmin_candidates.target_count = 0;
+		vacrel->shared_freeze_aborted_xmax_candidates.target_count = 0;
+		vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
+		memset(&vacrel->shared_freeze_cohort, 0, sizeof(vacrel->shared_freeze_cohort));
+		vacrel->shared_freeze_apply_status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
+#endif
 		if (blkno == next_unskippable_block)
 		{
 			/*
@@ -1098,7 +1170,9 @@ lazy_scan_heap(LVRelState *vacrel)
 			/* PGRAC: retain references before native member enumeration. */
 			if (lazy_scan_shared_mx(vacrel, page, blkno))
 			{
+				lazy_validate_shared_freeze(vacrel, page, blkno, buf);
 				UnlockReleaseBuffer(buf);
+				lazy_prepare_shared_freeze(vacrel, buf, &vmbuffer);
 				continue;
 			}
 #endif
@@ -1119,7 +1193,13 @@ lazy_scan_heap(LVRelState *vacrel)
 					vacrel->nonempty_pages = blkno + 1;
 				if (recordfreespace)
 					freespace = PageGetHeapFreeSpace(page);
+#ifdef USE_PGRAC_CLUSTER
+				lazy_validate_shared_freeze(vacrel, page, blkno, buf);
+#endif
 				UnlockReleaseBuffer(buf);
+#ifdef USE_PGRAC_CLUSTER
+				lazy_prepare_shared_freeze(vacrel, buf, &vmbuffer);
+#endif
 				if (recordfreespace)
 					RecordPageWithFreeSpace(vacrel->rel, blkno, freespace);
 				continue;
@@ -1137,6 +1217,10 @@ lazy_scan_heap(LVRelState *vacrel)
 		/* Check for new or empty pages before lazy_scan_prune call */
 		if (lazy_scan_new_or_empty(vacrel, buf, blkno, page, false, vmbuffer))
 		{
+#ifdef USE_PGRAC_CLUSTER
+			/* Cleanup fallback may have replaced the earlier SHARE image. */
+			vacrel->shared_freeze_input_captured = false;
+#endif
 			/* Processed as new/empty page (lock and pin released) */
 			continue;
 		}
@@ -1145,7 +1229,9 @@ lazy_scan_heap(LVRelState *vacrel)
 		/* PGRAC: cleanup ownership does not prove peer member state. */
 		if (lazy_scan_shared_mx(vacrel, page, blkno))
 		{
+			lazy_validate_shared_freeze(vacrel, page, blkno, buf);
 			UnlockReleaseBuffer(buf);
+			lazy_prepare_shared_freeze(vacrel, buf, &vmbuffer);
 			continue;
 		}
 #endif
@@ -1209,7 +1295,13 @@ lazy_scan_heap(LVRelState *vacrel)
 				 */
 				freespace = PageGetHeapFreeSpace(page);
 
+#ifdef USE_PGRAC_CLUSTER
+				lazy_validate_shared_freeze(vacrel, page, blkno, buf);
+#endif
 				UnlockReleaseBuffer(buf);
+#ifdef USE_PGRAC_CLUSTER
+				lazy_prepare_shared_freeze(vacrel, buf, &vmbuffer);
+#endif
 				RecordPageWithFreeSpace(vacrel->rel, blkno, freespace);
 				continue;
 			}
@@ -1389,13 +1481,25 @@ lazy_scan_heap(LVRelState *vacrel)
 			 * it this far when there were no LP_DEAD items during pruning.
 			 */
 			Assert(vacrel->nindexes > 0);
+#ifdef USE_PGRAC_CLUSTER
+			lazy_validate_shared_freeze(vacrel, page, blkno, buf);
+#endif
 			UnlockReleaseBuffer(buf);
+#ifdef USE_PGRAC_CLUSTER
+			lazy_prepare_shared_freeze(vacrel, buf, &vmbuffer);
+#endif
 		}
 		else
 		{
 			Size		freespace = PageGetHeapFreeSpace(page);
 
+#ifdef USE_PGRAC_CLUSTER
+			lazy_validate_shared_freeze(vacrel, page, blkno, buf);
+#endif
 			UnlockReleaseBuffer(buf);
+#ifdef USE_PGRAC_CLUSTER
+			lazy_prepare_shared_freeze(vacrel, buf, &vmbuffer);
+#endif
 			RecordPageWithFreeSpace(vacrel->rel, blkno, freespace);
 		}
 	}
@@ -1445,41 +1549,723 @@ lazy_scan_heap(LVRelState *vacrel)
 #ifdef USE_PGRAC_CLUSTER
 /*
  * Preserve a peer MX page while holding its original share or cleanup lock.
- * The physical tuple count follows the shared maintenance KEEP convention;
- * it does not assert transaction visibility or release any reference.
+ * Capture bounded physical input and consume its counts for the existing MX
+ * KEEP decision. Defer row/request preparation until after releasing the heap
+ * lock and heap/VM pins. Neither stage proves transaction state or eligibility.
  */
 static bool
 lazy_scan_shared_mx(LVRelState *vacrel, Page page, BlockNumber blkno)
 {
-	OffsetNumber maxoff;
-	int64		tuples = 0;
-	bool		has_multi = false;
-
+	vacrel->shared_freeze_input_captured = false;
+	vacrel->shared_freeze_input_valid = false;
+	vacrel->shared_freeze_proofs.proof_count = 0;
+	vacrel->shared_freeze_fence_valid = false;
+	vacrel->shared_freeze_cohort_observed = false;
+	vacrel->shared_freeze_xmin_candidates.target_count = 0;
+	vacrel->shared_freeze_aborted_xmax_candidates.target_count = 0;
+	vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
+	memset(&vacrel->shared_freeze_cohort, 0, sizeof(vacrel->shared_freeze_cohort));
+	vacrel->shared_freeze_apply_status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
 	if (!vacrel->versioned || !cluster_peer_mode_enabled())
 		return false;
 
-	maxoff = PageGetMaxOffsetNumber(page);
-	for (OffsetNumber offnum = FirstOffsetNumber; offnum <= maxoff;
-		 offnum = OffsetNumberNext(offnum))
-	{
-		ItemId		item = PageGetItemId(page, offnum);
-		HeapTupleHeader tuple;
-
-		if (!ItemIdIsNormal(item))
-			continue;
-		tuple = (HeapTupleHeader) PageGetItem(page, item);
-		tuples++;
-		if (tuple->t_infomask & HEAP_XMAX_IS_MULTI)
-			has_multi = true;
-	}
-	if (!has_multi)
+	if (!cluster_heap_freeze_capture_page_v1(&vacrel->identity, blkno, page,
+											   &vacrel->shared_freeze_input))
+		elog(ERROR, "invalid shared heap freeze input at block %u", blkno);
+	vacrel->shared_freeze_input_captured = true;
+	if (vacrel->shared_freeze_input.multi_tuples == 0)
 		return false;
 
 	vacrel->shared_mx_deferred_pages++;
-	vacrel->shared_mx_deferred_tuples += tuples;
-	vacrel->live_tuples += tuples;
+	vacrel->shared_mx_deferred_tuples += vacrel->shared_freeze_input.normal_tuples;
+	vacrel->live_tuples += vacrel->shared_freeze_input.normal_tuples;
 	vacrel->nonempty_pages = blkno + 1;
 	return true;
+}
+
+/*
+ * Still under the original content lock, discard an image changed by native
+ * hint/prune/vacuum work before it can become a proof request. Do not recopy or
+ * retry here: the input remains unproven, with no freeze/metadata permission.
+ * This local comparison cannot replace a final holder/master fence after proof.
+ */
+static void
+lazy_validate_shared_freeze(LVRelState *vacrel, Page page, BlockNumber blkno, Buffer buffer)
+{
+	if (!vacrel->shared_freeze_input_captured)
+		return;
+	switch (cluster_heap_freeze_validate_page_v1(&vacrel->shared_freeze_input,
+												   &vacrel->identity, blkno, page))
+	{
+		case CLUSTER_HEAP_FREEZE_PAGE_MATCHED:
+			/* Preserve only the original writer use proof before unlock.
+			 * SHARE/conditional read-only X cannot create this context. */
+			vacrel->shared_freeze_input.writer_context_valid =
+				ClusterBufferCaptureMutationContext(buffer,
+					&vacrel->shared_freeze_input.writer_context,
+					&vacrel->shared_freeze_input.writer_object_revision,
+					&vacrel->shared_freeze_input.writer_object_checked);
+			break;
+		case CLUSTER_HEAP_FREEZE_PAGE_CHANGED:
+			vacrel->shared_freeze_input.writer_context_valid = false;
+			vacrel->shared_freeze_input_captured = false;
+			vacrel->shared_freeze_input_valid = false;
+			vacrel->shared_freeze_proofs.proof_count = 0;
+			vacrel->shared_freeze_fence_valid = false;
+			vacrel->shared_freeze_cohort_observed = false;
+			vacrel->shared_freeze_xmin_candidates.target_count = 0;
+			vacrel->shared_freeze_aborted_xmax_candidates.target_count = 0;
+			vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
+			memset(&vacrel->shared_freeze_cohort, 0, sizeof(vacrel->shared_freeze_cohort));
+			vacrel->shared_freeze_apply_status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
+			vacrel->shared_freeze_changed_pages++;
+			break;
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid page input for freezing shared heap block %u", blkno),
+					 errhint("Check the server log for the affected relation and block.")));
+	}
+}
+
+/*
+ * Apply only optional delayed ITL cleanout after the canonical proof and final
+ * resident-page fence succeeded under local X.  Check every complete physical
+ * carrier before starting the versioned hint batch; no tuple or reference is
+ * retired here.  In particular, a missing SPACE publication context is not a
+ * reason to fall back to an unversioned shared-page write.
+ */
+static bool
+lazy_cleanout_shared_freeze_page(LVRelState *vacrel, Buffer buffer,
+							   const ClusterHeapFreezeProofBatchV1 *proofs,
+							   const ClusterTxResolution *retained, uint8 retained_mask)
+{
+	const ClusterHeapFreezePageBatchV1 *batch = &vacrel->shared_freeze_batch;
+	Page page = BufferGetPage(buffer);
+	PageHeader header = (PageHeader)page;
+	ClusterItlSlotData *slots;
+	bool stamp[CLUSTER_ITL_INITRANS_DEFAULT] = {false};
+	SCN commit_scns[CLUSTER_ITL_INITRANS_DEFAULT];
+	uint16 seen_slots = 0;
+	uint8 matched_proofs = 0;
+	bool changed = false;
+	RfPageProducerBatchV1 hint_batch;
+
+	if (batch->carrier_request_count == 0
+		|| batch->carrier_request_count > CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH
+		|| (proofs->proof_count == 0 && retained_mask == 0)
+		|| (retained_mask != 0 && retained == NULL)
+		|| (retained_mask >> batch->carrier_request_count) != 0
+		|| proofs->proof_count > batch->carrier_request_count
+		|| !PageHasItl(page) || header->pd_special > BLCKSZ
+		|| header->pd_special < SizeOfPageHeaderData
+		|| BLCKSZ - header->pd_special
+			< sizeof(ClusterItlSlotData) * CLUSTER_ITL_INITRANS_DEFAULT)
+		return false;
+	slots = ClusterPageGetItlSlots(page);
+	for (uint8 index = 0; index < batch->carrier_request_count; index++)
+	{
+		const ClusterHeapFreezeCarrierRequestV1 *request = &batch->carrier_requests[index];
+		const ClusterTxResolution *resolution = NULL;
+		uint8 slot_index = request->locator.itl_slot_index;
+
+		if (slot_index >= CLUSTER_ITL_INITRANS_DEFAULT
+			|| (seen_slots & (1U << slot_index)) != 0
+			|| memcmp(&slots[slot_index], &request->carrier, sizeof(request->carrier)) != 0)
+			return false;
+		seen_slots |= 1U << slot_index;
+		for (uint8 proof_index = 0; proof_index < proofs->proof_count; proof_index++)
+		{
+			const ClusterHeapFreezeCanonicalProofV1 *proof = &proofs->proofs[proof_index];
+			const ClusterTxLocator *locator = &proof->requested_locator;
+
+			/* The requested wrap is an exact field, not a reply wildcard. */
+			if (locator->uba.raw[0] != request->locator.uba.raw[0]
+				|| locator->uba.raw[1] != request->locator.uba.raw[1]
+				|| locator->xid != request->locator.xid
+				|| locator->tt_wrap != request->locator.tt_wrap
+				|| locator->itl_kind != request->locator.itl_kind
+				|| locator->itl_slot_index != slot_index)
+				continue;
+			if (resolution != NULL)
+				return false;
+			resolution = &proof->resolution;
+		}
+		if (resolution != NULL)
+		{
+			if ((retained_mask & (1U << index)) != 0)
+				return false;
+			matched_proofs++;
+		}
+		else if ((retained_mask & (1U << index)) != 0)
+		{
+			/* A retained C1b pair is only an ITL hint. It never enters the
+			 * canonical batch or supplies creator/FullXid freeze evidence. */
+			resolution = &retained[index];
+			if (request->carrier.flags != ITL_FLAG_NEEDS_CLEANOUT
+				|| request->locator.itl_kind != ITL_FLAG_NEEDS_CLEANOUT
+				|| request->locator.tt_wrap != TT_WRAP_INVALID
+				|| resolution->locator_echo.tt_wrap != TT_WRAP_INVALID
+				|| resolution->locator_echo.uba.raw[0] != request->locator.uba.raw[0]
+				|| resolution->locator_echo.uba.raw[1] != request->locator.uba.raw[1]
+				|| resolution->locator_echo.xid != request->locator.xid
+				|| resolution->locator_echo.itl_kind != request->locator.itl_kind
+				|| resolution->locator_echo.itl_slot_index != slot_index
+				|| resolution->local_canonical_valid
+				|| resolution->outcome != CLUSTER_TX_COMMITTED
+				|| resolution->proof_kind != CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG
+				|| resolution->top_xid != request->locator.xid
+				|| !SCN_VALID(resolution->commit_scn)
+				|| resolution->commit_scn != request->carrier.commit_scn)
+				return false;
+		}
+		else
+			continue;
+		if (resolution->outcome == CLUSTER_TX_COMMITTED
+			&& cluster_itl_cleanout_can_stamp(&slots[slot_index], request->carrier.xid,
+										 resolution->commit_scn))
+		{
+			stamp[slot_index] = true;
+			commit_scns[slot_index] = resolution->commit_scn;
+			changed = true;
+		}
+	}
+	if (matched_proofs != proofs->proof_count || !changed
+		|| cluster_space_hint_begin(buffer, &hint_batch) != CLUSTER_SPACE_HINT_VERSIONED)
+		return false;
+
+	/* The versioned begin entered the critical section.  No fallible work or
+	 * further rejection is allowed before finishing this single hint batch. */
+	for (uint8 slot_index = 0; slot_index < CLUSTER_ITL_INITRANS_DEFAULT; slot_index++)
+	{
+		if (stamp[slot_index])
+		{
+			slots[slot_index].commit_scn = commit_scns[slot_index];
+			slots[slot_index].flags = ITL_FLAG_COMMITTED;
+		}
+	}
+	cluster_space_hint_finish(buffer, true, &hint_batch);
+	return true;
+}
+
+/*
+ * Recheck only the still-resident original buffer after proof.  The descriptor
+ * number is an unowned hint until ReadRecentBuffer verifies its complete tag
+ * and pins it; neither that operation nor ConditionalLockBuffer fetches a new
+ * current block.  Eviction or unavailable local X means retry, not a second
+ * acquisition.  Release this ownership before the caller leaves admission,
+ * including on ERROR/cancel.
+ *
+ * Optional delayed ITL cleanout can consume this fence before local X is
+ * released.  It grants no tuple freeze or enduring apply permission.  The
+ * captured SPACE identity is compared, not refreshed through storage I/O.
+ */
+static ClusterHeapFreezeProofStatusV1
+lazy_recheck_shared_freeze_page(LVRelState *vacrel, Buffer recent_buffer,
+							 const PcmAuthoritySnapshot *authority_before,
+							 const ClusterSemanticAdmissionToken *admission,
+							 ClusterHeapFreezeProofBatchV1 *proofs,
+							 const ClusterTxResolution *retained, uint8 retained_mask,
+							 ClusterHeapFreezeFinalFenceV1 *current_fence,
+							 bool *cleaned)
+{
+	ClusterHeapFreezeProofStatusV1 status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
+	volatile bool locked = false;
+	volatile bool hint_scope = false;
+	volatile bool writer_scope = false;
+
+	*cleaned = false;
+	if (recent_buffer <= InvalidBuffer || !vacrel->rel->rd_isvalid
+		|| !RelFileLocatorEquals(vacrel->rel->rd_locator, vacrel->identity.key.locator)
+		|| !ReadRecentBuffer(vacrel->rel->rd_locator, MAIN_FORKNUM,
+							 vacrel->shared_freeze_batch.block, recent_buffer))
+		return status;
+
+	PG_TRY();
+	{
+		Page page;
+		BufferTag tag;
+		PcmAuthoritySnapshot authority_after;
+		uint64 master_after = 0;
+		SCN page_scn_after = InvalidScn;
+		bool authority_current,
+			admission_current;
+
+		if (vacrel->shared_freeze_input.writer_context_valid)
+		{
+			if (!ClusterConditionalLockBufferWithMutationContext(recent_buffer,
+					&vacrel->shared_freeze_input.writer_context,
+					vacrel->shared_freeze_input.writer_object_revision,
+					vacrel->shared_freeze_input.writer_object_checked))
+				goto recheck_done;
+			writer_scope = true;
+		}
+		else if (!ConditionalLockBuffer(recent_buffer))
+			goto recheck_done;
+		locked = true;
+		page = BufferGetPage(recent_buffer);
+		switch (cluster_heap_freeze_validate_page_v1(&vacrel->shared_freeze_input,
+														   &vacrel->identity,
+														   vacrel->shared_freeze_batch.block, page))
+		{
+			case CLUSTER_HEAP_FREEZE_PAGE_MATCHED:
+				break;
+			case CLUSTER_HEAP_FREEZE_PAGE_CHANGED:
+				goto recheck_done;
+			default:
+				status = CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR;
+				goto recheck_done;
+		}
+
+		current_fence->page_lsn = PageGetLSN(page);
+		current_fence->page_version = ((PageHeader)page)->pd_block_scn;
+		InitBufferTag(&tag, &vacrel->rel->rd_locator, MAIN_FORKNUM,
+					  vacrel->shared_freeze_batch.block);
+		memset(&authority_after, 0, sizeof(authority_after));
+		if (!cluster_pcm_lock_r4_route_snapshot(tag, &authority_after,
+													 &master_after, &page_scn_after)
+			|| !SCN_VALID(page_scn_after))
+		{
+			status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
+			goto recheck_done;
+		}
+		authority_current = cluster_pcm_lock_authority_matches(tag, authority_before)
+			&& authority_before->transition_count == authority_after.transition_count
+			&& current_fence->master_sequence == master_after;
+		admission_current = cluster_semantic_activation_recheck_r4_terminal_census(admission);
+		current_fence->holder_sequence = authority_after.transition_count;
+		current_fence->master_sequence = master_after;
+		for (uint8 index = 0; index < proofs->proof_count; index++)
+		{
+			proofs->proofs[index].current_fence = *current_fence;
+			proofs->proofs[index].authority_current = authority_current;
+			proofs->proofs[index].admission_current = admission_current;
+		}
+		status = cluster_heap_freeze_validate_conditional_apply_v1(
+			&vacrel->shared_freeze_batch, proofs, current_fence);
+		/* Hint-only pairs have no canonical expected-fence member. Recheck
+		 * their original page version explicitly, along with the same PCM
+		 * authority and admission, before permitting even an ITL hint. */
+		if (retained_mask != 0 && status != CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR
+			&& (!authority_current || !admission_current
+				|| current_fence->page_lsn != vacrel->shared_freeze_batch.page_lsn
+				|| current_fence->page_version != vacrel->shared_freeze_batch.page_version))
+			status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
+		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+			|| (status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN
+				&& (retained_mask != 0
+					|| cluster_heap_freeze_validate_carrier_cleanout_v1(
+						&vacrel->shared_freeze_batch, proofs, current_fence)
+					== CLUSTER_HEAP_FREEZE_PROOF_PROVEN)))
+		{
+			hint_scope = true;
+			*cleaned = lazy_cleanout_shared_freeze_page(vacrel, recent_buffer, proofs,
+				retained, retained_mask);
+		}
+
+recheck_done:;
+	}
+	PG_FINALLY();
+	{
+		if (locked)
+		{
+			if (writer_scope)
+				ClusterUnlockReleaseBufferAfterConditionalMutation(recent_buffer);
+			else if (hint_scope)
+				ClusterUnlockReleaseBufferAfterConditionalHint(recent_buffer);
+			else
+				ClusterUnlockReleaseBufferAfterConditionalRead(recent_buffer);
+		}
+		else
+			ReleaseBuffer(recent_buffer);
+	}
+	PG_END_TRY();
+	return status;
+}
+
+/* Five existing backend-local transport legs, three logical counters each.
+ * Snapshots neither reset the providers nor acquire resources or authority. */
+static void
+lazy_shared_freeze_transport_snapshot(uint64 *out)
+{
+	ClusterGcsUndoHeaderPathCounters header;
+	ClusterGcsUndoVerdictPathCounters verdict;
+	const ClusterGcsUndoVerdictExchangeCounters *paths[] = {
+		&verdict.owner_verdict, &verdict.freshref_c1b_pair,
+		&verdict.authority_verdict, &verdict.r4_tx_resolve
+	};
+
+	cluster_gcs_block_undo_header_counters_snapshot(&header);
+	cluster_gcs_block_undo_verdict_counters_snapshot(&verdict);
+	out[0] = header.calls;
+	out[1] = header.request_enqueues;
+	out[2] = header.sync_exchanges;
+	for (unsigned i = 0; i < lengthof(paths); i++)
+	{
+		out[3 * (i + 1)] = paths[i]->calls;
+		out[3 * (i + 1) + 1] = paths[i]->request_enqueues;
+		out[3 * (i + 1) + 2] = paths[i]->sync_exchanges;
+	}
+}
+
+/*
+ * Resolve every captured carrier through the terminal-census provider while
+ * retaining one R4 admission, then recheck the resident page under local X.
+ * Compact the proven subset without dropping any physical carrier witnesses.
+ * Optional delayed ITL cleanout uses that same ownership, but a partial proof
+ * keeps the page unproven.  No tuple-freeze permission survives its release,
+ * and a cleanout invalidates the saved fence.
+ */
+static ClusterHeapFreezeProofStatusV1
+lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
+{
+	BufferTag tag;
+	PcmAuthoritySnapshot authority_before;
+	ClusterSemanticAdmissionToken admission;
+	ClusterSemanticAdmissionResult admission_result;
+	ClusterHeapFreezeFinalFenceV1 expected_fence,
+							 current_fence;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	/* Private, bounded hint-only evidence; never exported as canonical proof. */
+	ClusterTxResolution retained[CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH];
+	uint8 retained_mask = 0;
+	ClusterHeapFreezeObservedBoundsV1 observed_bounds = { 0 };
+	ClusterHeapFreezeProofStatusV1 status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
+	ClusterTxResolveReason reason;
+	uint64 master_before = 0;
+	SCN page_scn_before = InvalidScn;
+	bool route_before = false;
+	bool cleaned = false;
+	uint64 proof_cost_before[15];
+
+	memset(&proofs, 0, sizeof(proofs));
+	memset(retained, 0, sizeof(retained));
+	memset(&admission, 0, sizeof(admission));
+	memset(&expected_fence, 0, sizeof(expected_fence));
+	memset(&current_fence, 0, sizeof(current_fence));
+	memset(&authority_before, 0, sizeof(authority_before));
+	if (vacrel != NULL)
+	{
+		vacrel->shared_freeze_cohort_observed = false;
+		vacrel->shared_freeze_xmin_candidates.target_count = 0;
+		vacrel->shared_freeze_aborted_xmax_candidates.target_count = 0;
+		vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
+		memset(&vacrel->shared_freeze_cohort, 0, sizeof(vacrel->shared_freeze_cohort));
+		for (uint16 index = 0;
+			 index < Min(vacrel->shared_freeze_batch.tuple_count, MaxHeapTuplesPerPage); index++)
+		{
+			vacrel->shared_freeze_batch.tuples[index].creation_target_proof_index =
+				CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET;
+			vacrel->shared_freeze_batch.tuples[index].aborted_xmax_target_proof_index =
+				CLUSTER_HEAP_FREEZE_NO_ABORTED_XMAX_TARGET;
+			vacrel->shared_freeze_batch.tuples[index].original_creator_full_xid =
+				InvalidFullTransactionId;
+		}
+	}
+
+	if (vacrel == NULL || vacrel->rel == NULL
+		|| vacrel->shared_freeze_batch.carrier_request_count == 0
+		|| vacrel->shared_freeze_batch.carrier_request_count
+		> CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH)
+		goto done;
+
+	InitBufferTag(&tag, &vacrel->rel->rd_locator, MAIN_FORKNUM,
+				  vacrel->shared_freeze_batch.block);
+	route_before = cluster_pcm_lock_r4_route_snapshot(tag, &authority_before,
+												 &master_before, &page_scn_before);
+	if (!route_before || !SCN_VALID(page_scn_before))
+		goto done;
+
+	admission_result = cluster_semantic_activation_enter_r4_terminal_census(&admission);
+	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
+		goto done;
+	lazy_shared_freeze_transport_snapshot(proof_cost_before);
+	PG_TRY();
+	{
+		cluster_tx_resolve_terminal_census_batch_preflight();
+
+		expected_fence.identity = vacrel->shared_freeze_batch.identity;
+		expected_fence.block = vacrel->shared_freeze_batch.block;
+		expected_fence.page_lsn = vacrel->shared_freeze_batch.page_lsn;
+		expected_fence.page_version = vacrel->shared_freeze_batch.page_version;
+		expected_fence.holder_sequence = authority_before.transition_count;
+		expected_fence.master_sequence = master_before;
+		expected_fence.admission_generation = admission.record_generation;
+		current_fence = expected_fence;
+
+		for (uint8 index = 0;
+			 index < vacrel->shared_freeze_batch.carrier_request_count; index++)
+		{
+			const ClusterHeapFreezeCarrierRequestV1 *request =
+				&vacrel->shared_freeze_batch.carrier_requests[index];
+			ClusterTxResolution resolution;
+			ClusterTxOutcome outcome;
+			bool retained_eligible;
+
+			memset(&resolution, 0, sizeof(resolution));
+			reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+			/* As in the heap ITL census, retain only this carrier's captured
+			 * SCN. The existing entry first runs the ordinary exact resolver;
+			 * its fallback requires an exact origin C1b pair. The copied SCN
+			 * itself is never terminal authority or a creator identity. */
+			retained_eligible = request->carrier.flags == ITL_FLAG_NEEDS_CLEANOUT
+				&& request->locator.itl_kind == ITL_FLAG_NEEDS_CLEANOUT
+				&& request->locator.tt_wrap == TT_WRAP_INVALID
+				&& SCN_VALID(request->carrier.commit_scn);
+			if (retained_eligible)
+				outcome = cluster_tx_resolve_terminal_census_retained_admitted(
+					&request->locator, request->carrier.commit_scn,
+					&admission, &resolution, &reason);
+			else
+				outcome = cluster_tx_resolve_exact_admitted(
+					&request->locator, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+					&admission, &resolution, &reason);
+			if ((outcome != CLUSTER_TX_COMMITTED && outcome != CLUSTER_TX_ABORTED)
+				|| reason != CLUSTER_TX_RESOLVE_NONE)
+				continue;
+			if (!resolution.local_canonical_valid
+				|| resolution.locator_echo.tt_wrap == TT_WRAP_INVALID)
+			{
+				/* The retained fallback deliberately supplies no canonical TT
+				 * identity. Keep it out of that batch, including mixed pages. */
+				if (retained_eligible && outcome == CLUSTER_TX_COMMITTED
+					&& resolution.outcome == outcome && !resolution.local_canonical_valid
+					&& resolution.locator_echo.tt_wrap == TT_WRAP_INVALID
+					&& resolution.locator_echo.uba.raw[0] == request->locator.uba.raw[0]
+					&& resolution.locator_echo.uba.raw[1] == request->locator.uba.raw[1]
+					&& resolution.locator_echo.xid == request->locator.xid
+					&& resolution.locator_echo.itl_kind == request->locator.itl_kind
+					&& resolution.locator_echo.itl_slot_index == request->locator.itl_slot_index
+					&& resolution.top_xid == request->locator.xid
+					&& resolution.proof_kind == CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG
+					&& resolution.commit_scn == request->carrier.commit_scn
+					&& resolution.authority.origin_epoch == admission.formation_epoch
+					&& !XLogRecPtrIsInvalid(resolution.authority.live_hwm_lsn)
+					&& SCN_VALID(resolution.authority.authority_scn))
+				{
+					retained[index] = resolution;
+					retained_mask |= 1U << index;
+				}
+				continue;
+			}
+			if (cluster_heap_freeze_build_canonical_proof_v1(&request->locator,
+					&resolution, &expected_fence, &expected_fence, true, true, true,
+					&proofs.proofs[proofs.proof_count]))
+				proofs.proof_count++;
+		}
+		if (proofs.proof_count == 0 && retained_mask == 0)
+			goto admitted_done;
+
+		status = lazy_recheck_shared_freeze_page(vacrel, recent_buffer,
+													 &authority_before, &admission,
+													 &proofs, retained, retained_mask,
+													 &current_fence, &cleaned);
+		/* Inner cleanup has released the local content lock and pin. Match a
+		 * bounded, read-only cohort observation to this original admission and
+		 * the retained policy bound. Neither grants a positive F/H certificate:
+		 * producer protection/provenance must close before any freeze apply. */
+		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN && !cleaned
+			&& FullTransactionIdIsValid(vacrel->cutoffs.SharedFreezeLimitFull)
+			&& U64FromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull) != UINT64_MAX
+			&& TransactionIdIsNormal(XidFromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull))
+			&& XidFromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull)
+			== vacrel->cutoffs.FreezeLimit
+			&& FullTransactionIdEquals(vacrel->cutoffs.SharedFreezePolicySample.freeze_limit,
+									   vacrel->cutoffs.SharedFreezeLimitFull))
+		{
+			ClusterHeapFreezeCohortObservation cohort;
+			ClusterHeapFreezeCohortStatus cohort_status;
+			bool policy_current;
+			bool cohort_current;
+
+			memset(&cohort, 0, sizeof(cohort));
+			cohort_status = cluster_heap_freeze_cohort_observe(&cohort);
+			policy_current = cohort_status == CLUSTER_HEAP_FREEZE_COHORT_READY
+				&& cluster_heap_freeze_policy_sample_current_v1(&vacrel->cutoffs.SharedFreezePolicySample);
+			/* Recheck the same local/peer publications and H end-clock after
+			 * identity callbacks, then recheck our original entered token. */
+			cohort_current = policy_current
+				&& cluster_heap_freeze_cohort_current(&cohort) == CLUSTER_HEAP_FREEZE_COHORT_READY;
+			if (!cluster_semantic_activation_recheck_r4_terminal_census(&admission))
+				status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
+			else if (cohort_status == CLUSTER_HEAP_FREEZE_COHORT_READY
+					 && cohort_current
+					 && cluster_heap_freeze_observed_bounds_v1(
+						 &vacrel->cutoffs.SharedFreezePolicySample, &cohort,
+						 &admission, cluster_node_id, &observed_bounds))
+			{
+				SCN wal_clock = cluster_scn_current();
+
+				/* Observe this same H after releasing page/proof ownership.
+				 * The native apply entry only checks the clock under its lock.
+				 * Clock callbacks can invalidate the original protection, so
+				 * repeat the same checks before retaining any candidate. */
+				if (!SCN_VALID(wal_clock)
+					|| scn_time_cmp(wal_clock, observed_bounds.horizon_scn) < 0)
+				{
+					cluster_scn_observe(observed_bounds.horizon_scn);
+					wal_clock = cluster_scn_current();
+					policy_current = cluster_heap_freeze_policy_sample_current_v1(
+						&vacrel->cutoffs.SharedFreezePolicySample);
+					cohort_current = policy_current
+						&& cluster_heap_freeze_cohort_current(&cohort)
+						== CLUSTER_HEAP_FREEZE_COHORT_READY;
+					if (!cluster_semantic_activation_recheck_r4_terminal_census(&admission))
+						status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
+				}
+				if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+					&& policy_current && cohort_current && SCN_VALID(wal_clock)
+					&& scn_time_cmp(wal_clock, observed_bounds.horizon_scn) >= 0)
+				{
+					bool target_current = cluster_semantic_activation_recheck(&admission);
+
+					/* TARGET callbacks may retire the saved source observations.
+					 * Match the same policy/cohort again before retaining them;
+					 * the original census recheck must follow these callbacks. */
+					if (target_current)
+					{
+						policy_current = cluster_heap_freeze_policy_sample_current_v1(
+							&vacrel->cutoffs.SharedFreezePolicySample);
+						cohort_current = policy_current
+							&& cluster_heap_freeze_cohort_current(&cohort)
+							== CLUSTER_HEAP_FREEZE_COHORT_READY;
+					}
+
+					/* Census admission permits proof reads before ordinary TARGET
+					 * writes are open. Only the same token's full TARGET policy
+					 * can retain inputs for later positive freeze admission. */
+					if (!cluster_semantic_activation_recheck_r4_terminal_census(&admission))
+						status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
+					else if (target_current && policy_current && cohort_current)
+					{
+						memcpy(&vacrel->shared_freeze_cohort, &cohort, sizeof(cohort));
+						vacrel->shared_freeze_candidate_limit_full = observed_bounds.freeze_limit;
+						vacrel->shared_freeze_cohort_observed = true;
+					}
+				}
+			}
+		}
+		/* This remains only a physical association, never row-freeze permission. */
+		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN && !cleaned)
+		{
+			(void) cluster_heap_freeze_bind_creation_targets_v1(
+				&vacrel->shared_freeze_batch, &proofs, &current_fence);
+			(void) cluster_heap_freeze_bind_aborted_xmax_targets_v1(
+				&vacrel->shared_freeze_batch, &proofs, &current_fence);
+			(void) cluster_heap_freeze_select_aborted_xmax_candidates_v1(
+				&vacrel->shared_freeze_batch, &proofs, &current_fence,
+				&vacrel->shared_freeze_aborted_xmax_candidates);
+			/* Screen the same attempt's original creator identities and observed
+			 * bounds without producing native plans. Positive F/H and producer
+			 * retention admission are still required before any shared write. */
+			if (vacrel->shared_freeze_cohort_observed)
+				(void) cluster_heap_freeze_select_xmin_candidates_v1(
+					&vacrel->shared_freeze_batch, &proofs, &current_fence,
+					vacrel->shared_freeze_candidate_limit_full,
+					observed_bounds.horizon_scn,
+					&vacrel->shared_freeze_xmin_candidates);
+		}
+		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+			|| status == CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED)
+		{
+			vacrel->shared_freeze_proofs = proofs;
+			vacrel->shared_freeze_fence = current_fence;
+			vacrel->shared_freeze_fence_valid =
+				status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN && !cleaned;
+		}
+
+admitted_done:;
+	}
+	PG_FINALLY();
+	{
+		uint64 after[15];
+		uint64 totals[3] = {vacrel->shared_freeze_proof_calls,
+			vacrel->shared_freeze_proof_requests, vacrel->shared_freeze_proof_exchanges};
+		bool complete = true;
+
+		/* Release the original owner first, also on ERROR/cancel. These
+		 * observations are local, allocation-free and cannot dispatch work. */
+		cluster_semantic_activation_leave(&admission);
+		lazy_shared_freeze_transport_snapshot(after);
+		for (unsigned i = 0; i < lengthof(after); i++)
+		{
+			unsigned metric = i % lengthof(totals);
+			uint64 delta;
+
+			if (after[i] < proof_cost_before[i])
+			{
+				complete = false;
+				break;
+			}
+			delta = after[i] - proof_cost_before[i];
+			if (UINT64_MAX - totals[metric] < delta)
+			{
+				complete = false;
+				break;
+			}
+			totals[metric] += delta;
+		}
+		if (complete)
+		{
+			vacrel->shared_freeze_proof_calls = totals[0];
+			vacrel->shared_freeze_proof_requests = totals[1];
+			vacrel->shared_freeze_proof_exchanges = totals[2];
+		}
+		else
+			vacrel->shared_freeze_proof_cost_incomplete = true;
+	}
+	PG_END_TRY();
+
+done:
+	if (status != CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+		&& status != CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED
+		&& vacrel != NULL)
+	{
+		vacrel->shared_freeze_proofs.proof_count = 0;
+		vacrel->shared_freeze_fence_valid = false;
+		vacrel->shared_freeze_cohort_observed = false;
+		vacrel->shared_freeze_xmin_candidates.target_count = 0;
+		vacrel->shared_freeze_aborted_xmax_candidates.target_count = 0;
+		vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
+		memset(&vacrel->shared_freeze_cohort, 0, sizeof(vacrel->shared_freeze_cohort));
+	}
+	return status;
+}
+
+/*
+ * Caller has released its heap lock and pin. Drop the VM pin before preparing
+ * owned row/request inputs, so this boundary cannot retain those buffers over
+ * later proof work. Only the last capture is prepared after cleanup fallback.
+ * Another writer may change the page after the pre-release comparison; the
+ * copied input remains unproven and grants no permission to change it.
+ */
+static void
+lazy_prepare_shared_freeze(LVRelState *vacrel, Buffer recent_buffer, Buffer *vmbuffer)
+{
+	if (!vacrel->shared_freeze_input_captured)
+		return;
+	if (BufferIsValid(*vmbuffer))
+	{
+		ReleaseBuffer(*vmbuffer);
+		*vmbuffer = InvalidBuffer;
+	}
+	vacrel->shared_freeze_input_captured = false;
+	if (!cluster_heap_freeze_prepare_page_v1(&vacrel->shared_freeze_input,
+											   &vacrel->shared_freeze_batch))
+		elog(ERROR, "invalid shared heap freeze row inputs at block %u",
+			 vacrel->shared_freeze_input.block);
+	/* These negative counts survive per-page input replacement/invalidation. */
+	vacrel->shared_xmin_deferred_tuples += vacrel->shared_freeze_batch.unproven_xmin_tuples;
+	vacrel->shared_xmax_deferred_tuples += vacrel->shared_freeze_batch.unproven_xmax_tuples;
+	vacrel->shared_freeze_proofs.proof_count = 0;
+	vacrel->shared_freeze_fence_valid = false;
+	vacrel->shared_freeze_cohort_observed = false;
+	vacrel->shared_freeze_xmin_candidates.target_count = 0;
+	vacrel->shared_freeze_aborted_xmax_candidates.target_count = 0;
+	vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
+	memset(&vacrel->shared_freeze_cohort, 0, sizeof(vacrel->shared_freeze_cohort));
+	vacrel->shared_freeze_apply_status = lazy_collect_shared_freeze_proofs(vacrel, recent_buffer);
+	vacrel->shared_freeze_input_valid = true;
 }
 #endif
 

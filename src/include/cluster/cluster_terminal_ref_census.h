@@ -33,6 +33,7 @@
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_undo_format.h"
 #include "storage/block.h"
+#include "storage/relfilelocator.h"
 
 #define CLUSTER_CTRC_FORMAT_VERSION UINT8_C(1)
 #define CLUSTER_CTRC_TXN_KEY_BYTES 96
@@ -342,6 +343,8 @@ typedef struct ClusterCtrcCloseDispatch {
 typedef struct ClusterCtrcOriginEntry {
 	ClusterCtrcTxnKeyV1 key;
 	uint64 reservation_generation;
+	/* Volatile original top identity, captured before BIND; never raw-widened. */
+	FullTransactionId original_full_xid;
 	uint32 grant_generation;
 	uint32 touched_bitmap;
 	uint64 seal_generation;
@@ -366,6 +369,9 @@ typedef struct ClusterCtrcOriginReservation {
 	ClusterCtrcTxnKeyV1 key;
 	uint64 origin_index;
 	uint64 reservation_generation;
+	/* Same protected top identity as the origin row, retained across BIND.
+	 * Process-local only; never reconstruct it from the raw key at OPEN. */
+	FullTransactionId original_full_xid;
 	uint8 kind;
 	bool valid;
 	uint8 reserved8[6];
@@ -374,6 +380,9 @@ typedef struct ClusterCtrcOriginReservation {
 typedef struct ClusterCtrcParticipantEntry {
 	ClusterCtrcTxnKeyV1 key;
 	ClusterCtrcParticipantIdentity identity;
+	/* Volatile original identity handed off by a protected local origin.
+	 * Invalid remains unknown, particularly for unqualified foreign grants. */
+	FullTransactionId original_full_xid;
 	uint32 grant_generation;
 	uint8 state;
 	uint8 reserved8[3];
@@ -399,6 +408,25 @@ typedef struct ClusterCtrcReceipt {
 	XLogRecPtr required_lsn[CLUSTER_SF_DEP_MAX_ORIGINS];
 } ClusterCtrcReceipt;
 
+/* A process-local observation of the original cleaner's one APPLIED
+ * receipt. It neither completes the receipt nor grants page/current access. */
+typedef struct ClusterCtrcCleanerReadScopeV3 {
+	uint64 serial;
+	int32 pid;
+	uint32 worker;
+	uint64 system_identifier;
+	uint64 formation_epoch;
+	uint64 boot_incarnation;
+} ClusterCtrcCleanerReadScopeV3;
+
+extern bool cluster_ctrc_cleaner_read_scope_snapshot_v3(RelFileLocator locator, ForkNumber fork,
+														BlockNumber block,
+														ClusterCtrcCleanerReadScopeV3 *out);
+/* Lock-free: usable inside the original buffer header publication lock. */
+extern bool cluster_ctrc_cleaner_read_scope_current_v3(const ClusterCtrcCleanerReadScopeV3 *scope,
+													   RelFileLocator locator, ForkNumber fork,
+													   BlockNumber block);
+
 typedef struct ClusterCtrcApplyToken {
 	bool valid;
 	uint8 reserved8[7];
@@ -413,6 +441,9 @@ typedef struct ClusterCtrcReceiptHandle {
 	ClusterCtrcParticipantEntry *participant;
 	ClusterCtrcReceipt *receipt;
 	ClusterCtrcTxnKeyV1 key;
+	/* Optional identity retained at original publication, never inferred.
+	 * Invalid remains unknown; it is not a freeze/retention certificate. */
+	FullTransactionId original_full_xid;
 	uint64 participant_index;
 	uint64 receipt_index;
 	uint64 journal_slot_generation;
@@ -719,6 +750,47 @@ typedef struct ClusterCtrcCapacity {
 	Size total_bytes;
 } ClusterCtrcCapacity;
 
+#define CLUSTER_CTRC_ACTIVE_SCAN_SLICE 64
+
+typedef enum ClusterCtrcActiveScanStatus {
+	CTRC_ACTIVE_SCAN_NOT_STARTED = 0,
+	CTRC_ACTIVE_SCAN_INCOMPLETE,
+	CTRC_ACTIVE_SCAN_COMPLETE,
+	CTRC_ACTIVE_SCAN_INVALID
+} ClusterCtrcActiveScanStatus;
+
+/* Process-local read-only census component. Completion alone grants no
+ * freeze/truncation authority or protection against later registration. */
+typedef struct ClusterCtrcActiveScan {
+	ClusterCtrcActiveScanStatus status;
+	FullTransactionId reference_full;
+	/* Worker input; zero for a standalone census-only scan. */
+	FullTransactionId future_full;
+	FullTransactionId min_full;
+	uint64 next_index;
+	uint64 total_entries;
+	/* Complete candidate scans may still include raw-only participant keys.
+	 * Worker source mode also requires the original semantic source/cohort.
+	 * Zero counts coverage, not producer-retention or freeze authority. */
+	uint64 unqualified_entries;
+	/* Local unknown-identity ingress cut; not a retention certificate. */
+	uint64 unqualified_registration_generation;
+	bool lock_busy;
+} ClusterCtrcActiveScan;
+
+extern bool cluster_ctrc_active_scan_begin(ClusterCtrcActiveScan *scan,
+										   FullTransactionId reference_full);
+extern void cluster_ctrc_active_scan_step(ClusterCtrcActiveScan *scan);
+/* No locks or callbacks. New unqualified participants revoke an older cut,
+ * including completed local samples. This does not revoke remote reports. */
+extern bool cluster_ctrc_active_scan_registration_current(const ClusterCtrcActiveScan *scan);
+/* The worker borrows its original semantic source cut for every slice.
+ * Source coverage is not a producer-retention or freeze certificate. */
+struct ClusterSemanticActiveSampleFence;
+extern void cluster_ctrc_active_scan_step_source(
+	ClusterCtrcActiveScan *scan, const struct ClusterSemanticActiveSampleFence *source);
+
+
 typedef struct ClusterCtrcDebugSnapshot {
 	uint64 origin_open;
 	uint64 origin_sealing;
@@ -853,6 +925,15 @@ cluster_ctrc_origin_record_touched(ClusterCtrcOriginEntry *origin,
 								   ClusterCtrcProofClass proof_class, uint32 *grant_out);
 extern bool cluster_ctrc_origin_has_exact_touch(const ClusterCtrcOriginEntry *origin,
 												const ClusterCtrcParticipantIdentity *participant);
+/* Read-only provenance check for the volatile top identity captured before BIND. */
+extern bool cluster_ctrc_origin_original_full_xid_exact(
+												const ClusterCtrcOriginEntry *origin,
+												const ClusterCtrcTxnKeyV1 *key,
+												FullTransactionId *full_xid_out);
+/* Shared lookup samples the origin lock only; it grants no authority or freeze permission. */
+extern bool cluster_ctrc_origin_original_full_xid_shared(
+												const ClusterCtrcTxnKeyV1 *key,
+												FullTransactionId *full_xid_out);
 extern bool cluster_ctrc_origin_begin_seal_entry(ClusterCtrcOriginEntry *origin,
 												 uint64 seal_generation);
 extern bool cluster_ctrc_origin_arm_close_entry(ClusterCtrcOriginEntry *origin,

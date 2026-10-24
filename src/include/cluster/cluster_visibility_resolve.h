@@ -106,6 +106,10 @@ typedef struct ClusterVisResolve {
 								   * would read it as committed-after ->
 								   * false-invisible, Rule 8.A). */
 	ClusterUndoTTSlotRef ref; /* copied exact ref (REMOTE/LOCAL/STALE) */
+	/* FULL scratch only: exact own-origin ACTIVE verdict and this backend's
+	 * published canonical binding proved local command-ID ownership. Not a
+	 * native visibility fallback and never inferred from a raw xid alone. */
+	bool scratch_self;
 	/* Stage-8 PRE adjustment 23: a wait consumer may use only the exact
 	 * page-derived DATA locator captured under the same content lock as the
 	 * verdict.  The ref/raw xid is never promoted into a remote wait key. */

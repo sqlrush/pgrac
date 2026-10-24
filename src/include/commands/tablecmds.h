@@ -27,7 +27,8 @@ struct AlterTableUtilityContext;	/* avoid including tcop/utility.h here */
 extern ObjectAddress DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 									ObjectAddress *typaddress, const char *queryString);
 
-extern void RemoveRelations(DropStmt *drop);
+extern void RemoveRelations(DropStmt *drop, bool isTopLevel);
+extern void CheckRelationsStorageDrop(DropStmt *drop, bool isTopLevel);
 
 extern Oid	AlterTableLookupRelation(AlterTableStmt *stmt, LOCKMODE lockmode);
 
@@ -60,13 +61,13 @@ extern void AlterRelationNamespaceInternal(Relation classRel, Oid relOid,
 
 extern void CheckTableNotInUse(Relation rel, const char *stmt);
 
-extern void ExecuteTruncate(TruncateStmt *stmt);
+extern void ExecuteTruncate(TruncateStmt *stmt, bool isTopLevel);
 extern void ExecuteTruncateGuts(List *explicit_rels,
 								List *relids,
 								List *relids_logged,
 								DropBehavior behavior,
 								bool restart_seqs,
-								bool run_as_table_owner);
+								bool run_as_table_owner, bool isTopLevel);
 
 extern void SetRelationHasSubclass(Oid relationId, bool relhassubclass);
 

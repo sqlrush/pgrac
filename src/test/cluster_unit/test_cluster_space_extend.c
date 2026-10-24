@@ -6,6 +6,7 @@
 #include "cluster/cluster_extend_gate.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_hw.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_hw_lease.h"
 #include "cluster/cluster_pcm_direct_init.h"
 #include "cluster/cluster_space_storage.h"
@@ -21,6 +22,78 @@ UT_DEFINE_GLOBALS();
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 bool cluster_shared_config, cluster_relation_extend_lock_enabled = true;
+bool cluster_enabled = true;
+int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+static bool owner_expected, owner_live, owner_armed, owner_end_ok = true;
+static bool owner_wait_retire, owner_invalid_admission;
+static void owner_retire_handle(void);
+static unsigned owner_enters, owner_ends, owner_refusals, owner_waits, owner_materialized,
+	owner_aborts;
+
+bool
+cluster_ko_extend_begin_v3(RelFileLocator locator, ForkNumber fork, uint64 *serial, bool *retry)
+{
+	UT_ASSERT(!owner_live);
+	owner_enters++;
+	*serial = 0;
+	*retry = false;
+	if (owner_invalid_admission)
+		return false;
+	if (owner_refusals != 0) {
+		*retry = true;
+		owner_refusals--;
+		return false;
+	}
+	owner_live = true;
+	*serial = 42;
+	return true;
+}
+bool
+cluster_ko_extend_active_v3(void)
+{
+	return owner_live;
+}
+bool
+cluster_ko_extend_write_begin_v3(RelFileLocator locator, ForkNumber fork)
+{
+	UT_ASSERT(owner_live);
+	owner_armed = true;
+	return true;
+}
+bool
+cluster_ko_extend_write_done_v3(RelFileLocator locator, ForkNumber fork)
+{
+	UT_ASSERT(owner_live && owner_armed);
+	owner_materialized++;
+	return true;
+}
+void
+cluster_ko_extend_abort_v3(uint64 serial)
+{
+	UT_ASSERT_EQ(serial, 42);
+	UT_ASSERT(owner_live);
+	owner_aborts++;
+}
+bool
+cluster_ko_extend_end_v3(uint64 serial)
+{
+	UT_ASSERT_EQ(serial, 42);
+	UT_ASSERT(owner_live);
+	owner_live = false;
+	owner_ends++;
+	return owner_end_ok;
+}
+static void
+cluster_bufmgr_ko_read_wait(void)
+{
+	UT_ASSERT(!owner_live);
+	owner_waits++;
+	if (owner_invalid_admission)
+		pg_re_throw();
+	if (owner_wait_retire)
+		owner_retire_handle();
+}
+
 int cluster_node_id, cluster_space_lease_blocks = 8;
 static RelationData relation;
 static FormData_pg_class form;
@@ -33,6 +106,15 @@ static bool hw_held, retired, missing_identity, refuse_hw, refuse_grant, throw_g
 static unsigned victims, unpins, identity_reads, reservations, legacy_allocations, size_reads;
 static bool local_lock;
 volatile uint32 InterruptHoldoffCount;
+
+static void
+owner_retire_handle(void)
+{
+	retired = true;
+	relation.rd_smgr = NULL;
+	memset(&storage, 0xa5, sizeof(storage));
+}
+
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -90,6 +172,9 @@ bool
 cluster_space_relation_read_identity(RelFileLocator tag, ClusterSpaceIdentity *out)
 {
 	UT_ASSERT(!hw_held && !local_lock && victims == 0);
+	UT_ASSERT(RelFileLocatorEquals(tag, identity.key.locator));
+	if (owner_expected)
+		UT_ASSERT(owner_live);
 	identity_reads++;
 	if (missing_identity)
 		return false;
@@ -130,6 +215,8 @@ cluster_space_reserve(const ClusterSpaceIdentity *id, const HwLock *lock, uint32
 					  uint32 *granted)
 {
 	UT_ASSERT(hw_held && lock->held && id->sequence == identity.sequence);
+	if (owner_expected)
+		UT_ASSERT(owner_live && owner_armed);
 	UT_ASSERT_EQ(want, 2);
 	UT_ASSERT_EQ(size_reads, 0);
 	if (throw_grant)
@@ -196,6 +283,10 @@ reset(void)
 	for (int i = 0; i < 2; i++)
 		descriptors[i].bufferdesc.buf_id = i;
 	cluster_shared_config = true;
+	owner_expected = owner_live = owner_armed = owner_wait_retire = owner_invalid_admission = false;
+	owner_end_ok = true;
+	owner_enters = owner_ends = owner_refusals = owner_waits = owner_materialized = owner_aborts
+		= 0;
 	hw_held = local_lock = retired = missing_identity = refuse_hw = refuse_grant = throw_grant
 		= false;
 	victims = unpins = identity_reads = reservations = legacy_allocations = size_reads = 0;
@@ -416,16 +507,197 @@ UT_TEST(test_extension_error_releases_current_and_earlier_content_locks)
 			UT_ASSERT(!init_ledgers[0].present && !init_ledgers[1].present);
 		}
 }
+static unsigned zero_calls, zero_blocks, zero_fail_at;
+void
+smgrzeroextend(SMgrRelation rel, ForkNumber fork, BlockNumber first, int count, bool skipFsync)
+{
+	UT_ASSERT(owner_live && owner_armed);
+	UT_ASSERT_EQ(first, 200 + zero_blocks);
+	zero_calls++;
+	if (zero_fail_at == zero_calls)
+		pg_re_throw();
+	zero_blocks += count;
+}
+void
+cluster_hw_lease_install(RelFileLocator locator, ForkNumber fork, BlockNumber first, uint32 count)
+{
+	UT_ASSERT_EQ(first + count, 200 + zero_blocks);
+}
+
+/* Original post-reservation resize block; allocation and IO are explicit
+ * boundaries. A five-block durable grant may not disappear on extend-to's
+ * already-satisfied branch. */
+static BlockNumber
+resize_reserved_range(BlockNumber extend_upto, uint32 *extended_by, bool ko_scoped)
+{
+	BufferManagerRelation bmr = { .rel = &relation, .smgr = &reopened };
+	ForkNumber fork = MAIN_FORKNUM;
+	uint32 flags = EB_SKIP_EXTENSION_LOCK, extend_by = 2;
+	uint32 hw_lease_tail = 3;
+	BlockNumber first_block = 200;
+	Buffer buffers[2] = { 1, 2 };
+	ClusterHwClass hwc = CLUSTER_HW_GLOBALIZE;
+
+#include "test_cluster_space_extend_resize.inc"
+	*extended_by = extend_by;
+	return hw_lease_tail;
+}
+
+UT_TEST(test_original_resize_keeps_entire_durable_grant_materialized)
+{
+	uint32 extended;
+	reset();
+	owner_live = owner_armed = true;
+	zero_calls = zero_blocks = 0;
+	UT_ASSERT_EQ(resize_reserved_range(199, &extended, true), 200);
+	UT_ASSERT_EQ(extended, 0);
+	UT_ASSERT_EQ(zero_calls, 1);
+	UT_ASSERT_EQ(zero_blocks, 5);
+	reset();
+	owner_live = owner_armed = true;
+	UT_ASSERT_EQ(resize_reserved_range(201, &extended, true), 4);
+	UT_ASSERT_EQ(extended, 1);
+	/* No change to the legacy, non-v3 extension implementation. */
+	zero_calls = zero_blocks = 0;
+	UT_ASSERT_EQ(resize_reserved_range(199, &extended, false), 200);
+	UT_ASSERT_EQ(zero_calls, 0);
+	UT_ASSERT_EQ(resize_reserved_range(201, &extended, false), 3);
+	owner_live = false;
+}
+
+static void
+materialize_original_range(void)
+{
+	BufferManagerRelation bmr = { .smgr = &reopened };
+	ForkNumber fork = MAIN_FORKNUM;
+	BlockNumber first_block = 200;
+	uint32 extend_by = 2, hw_lease_tail = 3;
+	bool ko_scoped = true;
+
+#include "test_cluster_space_extend_zero.inc"
+}
+
+static void
+handoff_original_range(volatile uint64 *ko_serial)
+{
+	bool ko_scoped = true;
+
+#include "test_cluster_space_extend_handoff.inc"
+}
+
+UT_TEST(test_original_materialization_precedes_handoff_and_tail_error_retains_owner)
+{
+	for (int fail = 0; fail < 3; fail++) {
+		volatile bool caught = false;
+		volatile uint64 serial = 42;
+		reset();
+		owner_live = owner_armed = true;
+		zero_calls = zero_blocks = 0;
+		zero_fail_at = fail;
+		PG_TRY();
+		{
+			materialize_original_range();
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fail != 0);
+		UT_ASSERT_EQ(owner_materialized, fail == 0 ? 1 : 0);
+		UT_ASSERT_EQ(owner_ends, 0);
+		UT_ASSERT(owner_live);
+		if (fail == 0) {
+			UT_ASSERT_EQ(zero_blocks, 5);
+			handoff_original_range(&serial);
+			UT_ASSERT_EQ(serial, 0);
+			UT_ASSERT_EQ(owner_ends, 1);
+			UT_ASSERT(!owner_live);
+		}
+	}
+	zero_fail_at = 0;
+	owner_live = false;
+}
+
+UT_TEST(test_original_extension_registers_before_identity_and_reservation)
+{
+	for (int private = 0; private < 2; private ++) {
+		reset();
+		owner_expected = owner_wait_retire = true;
+		owner_refusals = 2;
+		UT_ASSERT_EQ(extend(private, MAIN_FORKNUM), 200);
+		UT_ASSERT_EQ(owner_enters, 3);
+		UT_ASSERT_EQ(owner_waits, 2);
+		UT_ASSERT_EQ(owner_ends, 1);
+		UT_ASSERT(!owner_live);
+	}
+}
+
+UT_TEST(test_original_extension_cleanup_keeps_error_and_ends_exact_attempt)
+{
+	for (int failure = 0; failure < 3; failure++) {
+		volatile bool caught = false;
+		reset();
+		owner_expected = true;
+		missing_identity = failure == 0;
+		throw_grant = failure == 1;
+		owner_end_ok = failure == 0;
+		PG_TRY();
+		{
+			(void)extend(false, MAIN_FORKNUM);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(owner_enters, 1);
+		UT_ASSERT_EQ(owner_ends, failure == 2 ? 1 : 0);
+		UT_ASSERT_EQ(owner_aborts, failure == 2 ? 0 : 1);
+		UT_ASSERT_EQ(owner_live, failure != 2);
+		UT_ASSERT(!hw_held);
+		/* Shared cleanup is tested through the actual ResourceOwner callback
+		 * in test_cluster_ko_stop; this caller must not end it under ERROR. */
+	}
+}
+UT_TEST(test_invalid_extension_owner_does_not_wait_as_if_only_fenced)
+{
+	volatile bool caught = false;
+	reset();
+	owner_invalid_admission = true;
+	PG_TRY();
+	{
+		(void)extend(false, MAIN_FORKNUM);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(owner_waits, 0);
+	UT_ASSERT_EQ(owner_enters, 1);
+	UT_ASSERT_EQ(owner_ends, 0);
+	UT_ASSERT_EQ(identity_reads + victims + reservations, 0);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(11);
 	UT_RUN(test_single_live_and_private_callers_use_canonical_reservations);
 	UT_RUN(test_nonshared_and_auxiliary_keep_native_extension);
 	UT_RUN(test_refusals_do_not_fall_back_to_file_size);
 	UT_RUN(test_reservation_error_releases_hw);
 	UT_RUN(test_extension_returns_initialized_content_locks);
 	UT_RUN(test_extension_error_releases_current_and_earlier_content_locks);
+	UT_RUN(test_original_resize_keeps_entire_durable_grant_materialized);
+	UT_RUN(test_original_materialization_precedes_handoff_and_tail_error_retains_owner);
+	UT_RUN(test_original_extension_registers_before_identity_and_reservation);
+	UT_RUN(test_original_extension_cleanup_keeps_error_and_ends_exact_attempt);
+	UT_RUN(test_invalid_extension_owner_does_not_wait_as_if_only_fenced);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

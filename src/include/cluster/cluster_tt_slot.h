@@ -378,12 +378,14 @@ extern uint16 cluster_tt_slot_get_wrap(uint32 segment_id, uint16 slot_offset);
  *	  ACTIVE -> ABORTED; commit_scn is cleared.  Single-node C7 permits immediate
  *	  reuse, while peer mode retains the canonical slot until exact release.
  *
- *	Both are idempotent / defensive: a slot not currently ACTIVE-owned by
- *	`xid` is left unchanged (guards against double end-of-xact callbacks).
+ *	Both are idempotent / defensive: only an ACTIVE slot with the caller's
+ *	bound xid and valid expected_wrap may transition. Callers must not refresh
+ *	the wrap from the current slot for a delayed end-of-xact callback.
  */
 extern void cluster_tt_slot_mark_committed(uint32 segment_id, uint16 slot_offset, TransactionId xid,
-										   SCN commit_scn);
-extern void cluster_tt_slot_mark_aborted(uint32 segment_id, uint16 slot_offset, TransactionId xid);
+										   uint16 expected_wrap, SCN commit_scn);
+extern void cluster_tt_slot_mark_aborted(uint32 segment_id, uint16 slot_offset, TransactionId xid,
+										 uint16 expected_wrap);
 
 /*
  * spec-3.12 D2b — retention-pressure segment rollover support.

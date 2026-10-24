@@ -10,13 +10,9 @@
 #    + view + SQL pipeline is intact end to end on a real PG instance:
 #
 #      - The view exists and is queryable.
-#      - It returns exactly 85 rows (one per cluster wait event through
-#        spec-2.33;  spec-2.33 83 + spec-2.34 +2 reliability hardening).
-#      - It exposes 10 distinct cluster wait classes (matching
-#        docs/cluster-wait-events-design.md §2.1).
-#      - Per-class row counts match the design doc (GES 5, PCM 16,
-#        BufferShip 5, SCN 4, Reconfig 5, Recovery 5, Sinval 3,
-#        Interconnect 5, Undo 4, ADG 4).
+#      - It returns exactly 125 rows (one per registered cluster wait event).
+#      - It exposes 13 distinct cluster wait classes.
+#      - Per-class row counts match the registered roster.
 #      - Specific event names are present.
 #      - PG-native pg_stat_* views are unaffected.
 #
@@ -46,12 +42,12 @@ $node->start;
 
 
 # ----------
-# Total row count: 124, including phase publication wait.
+# Total row count: 125, including frontend undo capacity wait.
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'124',
-	'pg_stat_cluster_wait_events returns 124 rows (spec-6.13 RDMA + spec-5.22b D2-6 undo grant-plane +3 + spec-7.2 LMS data-plane +2; merge sum 118+3+2+1)');
+	'125',
+	'pg_stat_cluster_wait_events returns 125 rows including frontend undo capacity wait');
 
 is($node->safe_psql(
 		'postgres',
@@ -89,7 +85,7 @@ my %expected = (
 	'Cluster: Recovery' => 7,    # spec-4.12 D6: +ClusterWriteFenceVerify
 	'Cluster: Sinval' => 6,
 	'Cluster: Interconnect' => 11,	# spec-6.13: +busypoll + inline send waits; spec-7.2 D6: +LmsDataRecv/Send
-	'Cluster: Undo' => 7,    # spec-5.22b D2-6: +UndoBlock Grant/Invalidate/Remaster waits
+	'Cluster: Undo' => 8,    # Includes frontend undo capacity wait.
 	'Cluster: ADG' => 4,
 );
 
@@ -104,16 +100,22 @@ for my $type (sort keys %expected)
 
 
 # ----------
-# Spot-check 6 event names exist.
+# Spot-check 7 event names exist.
 # ----------
 for my $name ('GesEnqueueAcquire', 'PcmBlockReadNS', 'SinvalInjectLocalQueue',
-              'InterconnectRdmaSend', 'ClusterICRdmaFallback', 'AdgWalReceiveLag')
+              'InterconnectRdmaSend', 'ClusterICRdmaFallback', 'AdgWalReceiveLag',
+              'ClusterUndoCapacityWait')
 {
 	my $count = $node->safe_psql(
 		'postgres',
 		"SELECT count(*) FROM pg_stat_cluster_wait_events WHERE name = '$name'");
 	is($count, '1', "spot-check: '$name' present exactly once");
 }
+
+is($node->safe_psql('postgres',
+		q{SELECT type FROM pg_stat_cluster_wait_events WHERE name = 'ClusterUndoCapacityWait'}),
+	'Cluster: Undo',
+	'frontend undo capacity wait is in the Undo class');
 
 
 # ----------

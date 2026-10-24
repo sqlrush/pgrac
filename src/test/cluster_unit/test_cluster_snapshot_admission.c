@@ -12,6 +12,8 @@
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_sf_dep.h"
+#include "cluster/cluster_heap_horizon.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_undo_horizon.h"
 #include "../../backend/utils/time/snapmgr.c"
 #include "test_cluster_snapshot_admission_horizon.inc"
@@ -738,7 +740,7 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(29);
+	UT_PLAN(59);
 	UT_RUN(registered_catalog_is_live_without_becoming_active);
 	UT_RUN(evaluated_registered_snapshot_overrides_an_unrelated_active_snapshot);
 	UT_RUN(forged_reference_counts_do_not_establish_liveness);
@@ -768,6 +770,36 @@ main(void)
 	UT_RUN(vacuum_nontarget_modes_keep_original_body);
 	UT_RUN(vacuum_direct_worker_entry_needs_no_table_snapshot);
 	UT_RUN(vacuum_stale_borrowed_snapshot_is_not_refreshed);
+	UT_RUN(vacuum_shared_relstats_keeps_newer_locked_frozen_xid);
+	UT_RUN(vacuum_shared_database_keeps_newer_locked_frozen_xid);
+	UT_RUN(vacuum_shared_relstats_keeps_invalid_and_equal_candidates);
+	UT_RUN(vacuum_shared_relstats_retains_native_wrap_order);
+	UT_RUN(vacuum_shared_frozen_merge_keeps_independent_mx_path);
+	UT_RUN(vacuum_nontarget_frozen_merge_keeps_native_repair);
+	UT_RUN(vacuum_relstats_rejects_future_candidate);
+	UT_RUN(vacuum_relstats_rejects_future_locked_current);
+	UT_RUN(vacuum_relstats_rejects_half_space_current);
+	UT_RUN(vacuum_relstats_missing_promise_preserves_xid);
+	UT_RUN(vacuum_relstats_revoked_promise_preserves_xid);
+	UT_RUN(vacuum_relstats_invalid_reference_and_current_preserve_xid);
+	UT_RUN(vacuum_relstats_uses_durable_legal_bound);
+	UT_RUN(vacuum_relstats_unknown_window_keeps_stats_and_mx);
+	UT_RUN(vacuum_relstats_accepts_legal_next_boundary);
+	UT_RUN(vacuum_database_rejects_future_values);
+	UT_RUN(vacuum_database_rejects_half_space_current);
+	UT_RUN(vacuum_database_unavailable_promise_preserves_xid);
+	UT_RUN(vacuum_database_invalid_window_preserves_xid);
+	UT_RUN(vacuum_database_accepts_durable_bound_and_next_boundary);
+	UT_RUN(vacuum_database_retains_full_xid_wrap_order);
+	UT_RUN(vacuum_database_unknown_window_keeps_independent_mx);
+	UT_RUN(vacuum_database_scan_accepts_foreign_xid_and_keeps_seed);
+	UT_RUN(vacuum_database_scan_uses_full_xid_minimum_across_wrap);
+	UT_RUN(vacuum_database_scan_rejects_invalid_later_xid);
+	UT_RUN(vacuum_database_scan_unknown_window_keeps_independent_mx);
+	UT_RUN(vacuum_database_scan_rechecks_fence_after_catalog_read);
+	UT_RUN(vacuum_database_scan_rejects_invalid_seed_before_fold);
+	UT_RUN(vacuum_database_scan_nontarget_keeps_native_future_refusal);
+	UT_RUN(vacuum_database_scan_keeps_mx_future_refusal);
 	UT_ASSERT_EQ(remembered, 0);
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	UT_ASSERT(!ActiveSnapshotSet());

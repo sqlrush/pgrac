@@ -93,6 +93,12 @@ extern bool cluster_pi_writeback_ack_matches_v2(const ClusterPiWritebackMessageV
  * Requires the separate v2 capability, which is not yet advertised. */
 extern bool cluster_pi_writeback_request_current_v2(const ClusterPiWritebackMessageV2 *request,
 													bool sending);
+/* Original BG loop's normal flush has completed and will not restart.
+ * Does not certify WB I/O, reply ownership, or a producer seal. */
+extern void cluster_pi_writeback_bgwriter_quiesced_v1(void);
+/* Derived WAL input read only, bound to this original BG notice. This
+ * neither admits a new WB request nor proves any physical completion. */
+extern bool cluster_pi_writeback_retained_read_current_v1(const ClusterWalSourceRef *source);
 
 typedef struct ClusterPiWritebackNoticeV1 ClusterPiWritebackNoticeV1;
 typedef struct ClusterPiWritebackJobV1 ClusterPiWritebackJobV1;
@@ -200,6 +206,13 @@ extern bool cluster_pi_writeback_structure_offer_ack_v2(const ClusterPiWriteback
 														ClusterWalWriterToken *peer);
 extern ClusterControlRootResult cluster_pi_writeback_poll_v1(ClusterPiWritebackJobV1 *job);
 extern void cluster_pi_writeback_release_v1(ClusterPiWritebackJobV1 **job);
+
+/* Local physical/ACK-owner projection only, never a master completion proof.
+ * Sample outside KO/PCM locks; the final READY owner checks only the atomic
+ * revision. An unaccepted reply or an in-flight physical notice is not closed. */
+extern bool cluster_pi_writeback_local_relation_closed_v3(RelFileLocator locator, uint64 formation,
+														  uint64 *revision);
+extern bool cluster_pi_writeback_local_revision_current_v3(uint64 revision);
 
 extern void cluster_pi_writeback_ingress_v1(const ClusterICEnvelope *env, const void *payload);
 extern void cluster_pi_writeback_lmon_tick_v1(void);

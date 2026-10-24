@@ -28,6 +28,7 @@
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_xlog.h"
+#include "pgstat.h"
 #include "utils/syscache.h"
 #include "utils/inval.h"
 #include "miscadmin.h"
@@ -517,13 +518,28 @@ side_xact_pi_effects_valid(const xl_xact_parsed_commit *parsed, uint64 system_id
 	for (int i = 0; i < parsed->nmsgs; i++) {
 		SharedInvalidationMessage message;
 		Oid database;
-		uint32 kind;
 
 		memcpy(&message, &parsed->msgs[i], sizeof(message));
-		kind = side_xact_invalidation_message_kind(&message, &database);
-		if (kind == 0)
+		if (message.id >= 0 && message.id < SysCacheSize) {
+			kinds |= UINT32_C(1) << 0;
+			database = message.cc.dbId;
+		} else if (message.id == SHAREDINVALCATALOG_ID && OidIsValid(message.cat.catId)) {
+			kinds |= UINT32_C(1) << 1;
+			database = message.cat.dbId;
+		} else if (message.id == SHAREDINVALRELCACHE_ID) {
+			kinds |= UINT32_C(1) << 2;
+			database = message.rc.dbId;
+		} else if (message.id == SHAREDINVALSNAPSHOT_ID) {
+			kinds |= UINT32_C(1) << 3;
+			database = message.sn.dbId;
+		} else if (message.id == SHAREDINVALKO_COMMIT_ID
+				   && SharedInvalKoCommitIsValid(&message.ko)) {
+			/* Retain the complete payload for its original live owner.
+			 * Inspection cannot retire a fence or synthesize a delivery. */
+			kinds |= UINT32_C(1) << 4;
+			database = InvalidOid;
+		} else
 			return false;
-		kinds |= kind;
 		if (database != InvalidOid && database != parsed->dbId)
 			return false;
 	}

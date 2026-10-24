@@ -397,6 +397,8 @@ setup(void)
 static void
 forget_pid(pid_t pid)
 {
+	if (pid == BgWriterPID)
+		BgWriterPID = 0;
 	pid_t *single[] = { &LmonPID, &LmsPID,	  &SinvalBcastPID, &LckPID,
 						&LmdPID,  &QvotecPID, &CssdPID,		   &CheckpointerPID };
 	for (unsigned i = 0; i < lengthof(single); i++)
@@ -424,7 +426,7 @@ UT_TEST(capture_is_once_and_does_not_authorize_checkpoint)
 	UT_ASSERT(NormalStopPostmasterBegin());
 	UT_ASSERT(normal_stop_pm.selected);
 	UT_ASSERT_EQ(request_calls, 1);
-	UT_ASSERT_EQ(normal_stop_pm.expected, (1U << 22) - 1);
+	UT_ASSERT_EQ(normal_stop_pm.expected, (1U << (cluster_shared_config ? 23 : 22)) - 1);
 	UT_ASSERT_EQ(normal_stop_pm.pids[21], 121);
 	UT_ASSERT_EQ(normal_stop_pm.checkpointer, 140);
 	UT_ASSERT(NormalStopPostmasterBegin());
@@ -557,10 +559,10 @@ UT_TEST(success_needs_all_original_exits_and_all_disk_clear)
 	(void)NormalStopPostmasterBegin();
 	finish_checkpoint();
 	UT_ASSERT(NormalStopPostmasterRelease());
-	UT_ASSERT_EQ(signal_count, 22);
+	UT_ASSERT_EQ(signal_count, cluster_shared_config ? 23 : 22);
 	UT_ASSERT(NormalStopPostmasterRelease());
-	UT_ASSERT_EQ(signal_count, 22);
-	for (int i = 0; i < 22; i++) {
+	UT_ASSERT_EQ(signal_count, cluster_shared_config ? 23 : 22);
+	for (int i = 0; i < NORMAL_STOP_AUX_COUNT; i++) {
 		pid_t pid = normal_stop_pm.pids[i];
 		UT_ASSERT(!NormalStopPostmasterComplete());
 		NormalStopPostmasterReap(pid, 0);
@@ -703,7 +705,7 @@ UT_TEST(actual_final_exit_requires_original_exits_and_disk_clear)
 		(void)NormalStopPostmasterBegin();
 		finish_checkpoint();
 		UT_ASSERT(NormalStopPostmasterRelease());
-		for (int i = 0; i < 22; i++) {
+		for (int i = 0; i < NORMAL_STOP_AUX_COUNT; i++) {
 			pid_t pid = normal_stop_pm.pids[i];
 			if (f != 1)
 				NormalStopPostmasterReap(pid, 0);
@@ -723,7 +725,7 @@ UT_TEST(actual_respawn_never_replaces_selected_aux_roster)
 {
 	setup();
 	(void)NormalStopPostmasterBegin();
-	for (int i = 0; i < 22; i++)
+	for (int i = 0; i < NORMAL_STOP_AUX_COUNT; i++)
 		forget_pid(normal_stop_pm.pids[i]);
 	/* Diagnostics are not selected owners and keep their native behavior. */
 	DiagPID = 701;
@@ -757,7 +759,7 @@ UT_TEST(immediate_upgrade_keeps_native_abnormal_exit_not_normal_proof)
 	setup();
 	(void)NormalStopPostmasterBegin();
 	Shutdown = ImmediateShutdown;
-	for (int i = 0; i < 22; i++)
+	for (int i = 0; i < NORMAL_STOP_AUX_COUNT; i++)
 		forget_pid(normal_stop_pm.pids[i]);
 	CheckpointerPID = 0;
 	pmState = PM_WAIT_BACKENDS;
@@ -796,13 +798,14 @@ UT_TEST(shared_config_retains_original_services_without_legacy_formation_hint)
 	for (unsigned n = 0; n < lengthof(counts); n++) {
 		setup();
 		cluster_shared_config = true;
+		BgWriterPID = 122;
 		configured_nodes = counts[n];
 		retention_hint = false;
 		UT_ASSERT(NormalStopPostmasterPreselectReady());
 		UT_ASSERT(NormalStopPostmasterBegin());
 		UT_ASSERT(normal_stop_pm.selected);
 		UT_ASSERT_EQ(request_calls, 1);
-		UT_ASSERT_EQ(normal_stop_pm.expected, (1U << 22) - 1);
+		UT_ASSERT_EQ(normal_stop_pm.expected, (1U << (cluster_shared_config ? 23 : 22)) - 1);
 		UT_ASSERT_EQ(normal_stop_pm.pids[9], 109);
 		UT_ASSERT_EQ(normal_stop_pm.pids[21], 121);
 		UT_ASSERT(!NormalStopPostmasterComplete());
@@ -815,6 +818,7 @@ UT_TEST(shared_config_preselection_rejects_missing_actors_without_poisoning)
 	for (int fast = 0; fast < 2; fast++) {
 		setup();
 		cluster_shared_config = true;
+		BgWriterPID = 122;
 		configured_nodes = 2;
 		retention_hint = false;
 		Shutdown = NoShutdown;
@@ -852,6 +856,7 @@ UT_TEST(shared_config_actual_shutdown_keeps_actors_until_protocol_completion)
 	for (int mode = SmartShutdown; mode <= FastShutdown; mode++) {
 		setup();
 		cluster_shared_config = true;
+		BgWriterPID = 122;
 		configured_nodes = 2;
 		retention_hint = false;
 		Shutdown = mode;
@@ -890,6 +895,7 @@ UT_TEST(shared_config_cannot_substitute_an_actor_or_skip_final_voting_clear)
 	for (int replace = 0; replace < 2; replace++) {
 		setup();
 		cluster_shared_config = true;
+		BgWriterPID = 122;
 		configured_nodes = 4;
 		retention_hint = false;
 		UT_ASSERT(NormalStopPostmasterBegin());
@@ -905,8 +911,8 @@ UT_TEST(shared_config_cannot_substitute_an_actor_or_skip_final_voting_clear)
 		}
 		finish_checkpoint();
 		UT_ASSERT(NormalStopPostmasterRelease());
-		UT_ASSERT_EQ(signal_count, 22);
-		for (int i = 0; i < 22; i++) {
+		UT_ASSERT_EQ(signal_count, cluster_shared_config ? 23 : 22);
+		for (int i = 0; i < NORMAL_STOP_AUX_COUNT; i++) {
 			pid_t pid = normal_stop_pm.pids[i];
 			NormalStopPostmasterReap(pid, 0);
 			forget_pid(pid);
@@ -922,6 +928,7 @@ UT_TEST(shared_config_does_not_turn_abnormal_exit_into_normal_stop)
 	for (int fault = 0; fault < 5; fault++) {
 		setup();
 		cluster_shared_config = true;
+		BgWriterPID = 122;
 		configured_nodes = 2;
 		retention_hint = false;
 		if (fault == 0)
@@ -940,10 +947,51 @@ UT_TEST(shared_config_does_not_turn_abnormal_exit_into_normal_stop)
 	}
 }
 
+UT_TEST(actual_stop_keeps_original_bgwriter_for_retained_physical_responsibility)
+{
+ setup();
+ cluster_shared_config=true;
+ BgWriterPID=150;
+ (void)NormalStopPostmasterBegin();
+ pmState=PM_STOP_BACKENDS;
+ child_count=1;
+ PostmasterStateMachine();
+ UT_ASSERT_EQ(signal_count,0);
+ signal_count=0;
+ child_count=0;
+ pmState=PM_WAIT_BACKENDS;
+ expected_signal=SIGUSR2;
+ PostmasterStateMachine();
+ UT_ASSERT_EQ(pmState,PM_SHUTDOWN);
+ UT_ASSERT_EQ(signal_count,1);
+ UT_ASSERT_EQ(signals[0],CheckpointerPID);
+}
+
+UT_TEST(actual_shutdown2_waits_for_original_bgwriter_exit)
+{
+ setup();cluster_shared_config=true;BgWriterPID=150;
+ (void)NormalStopPostmasterBegin();
+ finish_checkpoint();
+ UT_ASSERT(NormalStopPostmasterRelease());
+ for(int i=0;i<22;i++) {
+  pid_t p=normal_stop_pm.pids[i];
+  NormalStopPostmasterReap(p,0);forget_pid(p);
+ }
+ clear_ok=true;pmState=PM_SHUTDOWN_2;
+ if(setjmp(exit_jump)==0) PostmasterStateMachine();
+ UT_ASSERT_EQ(pmState,PM_SHUTDOWN_2);
+ UT_ASSERT_EQ(exit_code,-1);
+ NormalStopPostmasterReap(BgWriterPID,0);BgWriterPID=0;
+ if(setjmp(exit_jump)==0) PostmasterStateMachine();
+ UT_ASSERT_EQ(exit_code,0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(27);
+	UT_RUN(actual_shutdown2_waits_for_original_bgwriter_exit);
+	UT_RUN(actual_stop_keeps_original_bgwriter_for_retained_physical_responsibility);
 	UT_RUN(capture_is_once_and_does_not_authorize_checkpoint);
 	UT_RUN(configured_pool_is_frozen_not_surviving_pids);
 	UT_RUN(missing_extra_and_duplicate_actor_fail_without_shrinking);

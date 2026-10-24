@@ -41,6 +41,7 @@
 #include "cluster/cluster_ges.h"	  /* GesRequestPayload / RELEASE cleanup payload */
 #include "cluster/cluster_ges_mode.h" /* spec-5.1b D1: ges_modes_compatible (frozen matrix) */
 #include "cluster/cluster_grd.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_pi_rebuild.h"
 #include "cluster/cluster_grd_outbound.h" /* cluster_grd_outbound_enqueue_cleanup_release (D10) */
 #include "cluster/cluster_hw_remaster.h" /* spec-5.7 D3 S5d — HW authority rebuild launch + gate */
@@ -6068,6 +6069,172 @@ cluster_grd_sweep_runs(void)
  *   holderless entries.
  * ============================================================ */
 
+/* Unlike the SQL summary walker, diagnostics must not pin/release an entry:
+ * releasing a lookup pin could retire a cold entry. The shard lock protects
+ * its address against HASH_REMOVE; the entry lock protects every vector. */
+ClusterGrdQueueObservationStatus
+cluster_grd_queue_snapshot(const ClusterResId *resid, ClusterGrdQueueSnapshot *out,
+						   ClusterGrdQueueMemberSnapshot *members, int capacity)
+{
+	ClusterGrdEntry *entry;
+	ClusterGrdQueueObservationStatus status;
+	uint64 hash64;
+	uint32 shard;
+	int64 total = 0;
+	bool found;
+
+	if (out == NULL)
+		return CLUSTER_GRD_QUEUE_INVALID;
+	memset(out, 0, sizeof(*out));
+	if (resid == NULL || capacity < 0 || (capacity > 0 && members == NULL))
+		return CLUSTER_GRD_QUEUE_INVALID;
+	out->resid = *resid;
+	if (cluster_grd_entry_htab == NULL || cluster_grd_shard_locks == NULL
+		|| cluster_grd_state == NULL)
+		return CLUSTER_GRD_QUEUE_UNAVAILABLE;
+	grd_slot_area_attach();
+	hash64 = cluster_grd_hash_resource(resid);
+	shard = (uint32)(hash64 % PGRAC_GRD_SHARD_COUNT);
+	LWLockAcquire(&cluster_grd_shard_locks[shard].lock, LW_SHARED);
+	entry = hash_search_with_hash_value(cluster_grd_entry_htab, resid, (uint32)hash64, HASH_FIND,
+										&found);
+	if (entry == NULL) {
+		LWLockRelease(&cluster_grd_shard_locks[shard].lock);
+		return CLUSTER_GRD_QUEUE_ABSENT;
+	}
+	SpinLockAcquire(&entry->lock);
+	out->generation = entry->generation;
+	out->last_modified_scn = entry->last_modified_scn;
+	out->state_flags = entry->state_flags;
+	out->pin_count = pg_atomic_read_u32(&entry->pin);
+	out->ngranted = entry->ngranted;
+	out->nwaiters = entry->nwaiters;
+	out->nconverts = entry->nconverts;
+	out->nreservations = entry->nreservations;
+	status = CLUSTER_GRD_QUEUE_INVALID;
+	for (int k = 0; k < GRD_VECTOR_COUNT; k++) {
+		int count = grd_vector_count(entry, (GrdVectorKind)k);
+
+		if (count < 0 || count > entry->vectors[k].capacity)
+			goto done;
+		total += count;
+	}
+	if (total > INT_MAX)
+		goto done;
+	out->required = (int)total;
+	for (int k = 0; k < GRD_VECTOR_COUNT; k++) {
+		int count = grd_vector_count(entry, (GrdVectorKind)k);
+
+		for (int i = 0; i < count && out->copied < capacity; i++) {
+			ClusterGrdQueueMemberSnapshot *row = &members[out->copied++];
+
+			memset(row, 0, sizeof(*row));
+			row->ordinal = i;
+			switch ((GrdVectorKind)k) {
+			case GRD_HOLDERS: {
+				const ClusterGrdHolder *h = &grd_holders(entry)[i];
+
+				row->kind = CLUSTER_GRD_QUEUE_HOLDER;
+				row->id.node_id = h->node_id;
+				row->id.procno = h->procno;
+				row->id.cluster_epoch = h->cluster_epoch;
+				row->id.request_id = h->request_id;
+				row->source_node_id = h->node_id;
+				row->lock_group_procno_plus_one = h->lock_group_procno_plus_one;
+				row->mode = h->mode;
+				break;
+			}
+			case GRD_WAITERS: {
+				const ClusterGrdWaiter *w = &grd_waiters(entry)[i];
+
+				row->kind = CLUSTER_GRD_QUEUE_WAITER;
+				row->id.node_id = w->node_id;
+				row->id.procno = w->procno;
+				row->id.cluster_epoch = w->cluster_epoch;
+				row->id.request_id = w->request_id;
+				row->source_node_id = w->source_node_id;
+				row->lock_group_procno_plus_one = w->lock_group_procno_plus_one;
+				row->mode = w->mode;
+				row->request_opcode = w->request_opcode;
+				row->waiter_xid = w->waiter_xid;
+				row->wait_seq = w->wait_seq;
+				row->shard_master_generation = w->shard_master_generation;
+				row->wait_start = w->wait_start;
+				row->fair_queue_seq = w->fair_queue_seq;
+				row->skip_count = w->skip_count;
+				row->boosted = w->boosted;
+				break;
+			}
+			case GRD_CONVERTS: {
+				const ClusterGrdConvert *c = &grd_converts(entry)[i];
+
+				row->kind = CLUSTER_GRD_QUEUE_CONVERT;
+				row->id.node_id = c->node_id;
+				row->id.procno = c->procno;
+				row->id.cluster_epoch = c->cluster_epoch;
+				row->id.request_id = c->convert_request_id;
+				row->source_node_id = c->source_node_id;
+				row->lock_group_procno_plus_one = c->lock_group_procno_plus_one;
+				row->mode = c->requested_mode;
+				row->current_mode = c->current_mode;
+				row->request_opcode = c->request_opcode;
+				row->waiter_xid = c->waiter_xid;
+				row->wait_seq = c->wait_seq;
+				row->shard_master_generation = c->shard_master_generation;
+				row->wait_start = c->wait_start;
+				row->fair_queue_seq = c->fair_queue_seq;
+				row->skip_count = c->skip_count;
+				row->boosted = c->boosted;
+				break;
+			}
+			case GRD_RESERVATIONS:
+				row->kind = CLUSTER_GRD_QUEUE_RESERVATION;
+				row->id = grd_reservations(entry)[i].id;
+				row->source_node_id = row->id.node_id;
+				row->mode = grd_reservations(entry)[i].mode;
+				break;
+			default:
+				pg_unreachable();
+			}
+		}
+	}
+	status = out->copied < out->required ? CLUSTER_GRD_QUEUE_TRUNCATED : CLUSTER_GRD_QUEUE_OBSERVED;
+done:
+	SpinLockRelease(&entry->lock);
+	LWLockRelease(&cluster_grd_shard_locks[shard].lock);
+	return status;
+}
+
+bool
+cluster_grd_queue_snapshots_walk(ClusterGrdQueueSnapshotVisitor visitor, void *ctx,
+								 int member_capacity)
+{
+	ClusterResId *resids = NULL;
+	ClusterGrdQueueMemberSnapshot *members = NULL;
+	int nresids;
+
+	if (visitor == NULL || member_capacity < 0
+		|| (Size)member_capacity > MaxAllocSize / sizeof(*members) || cluster_grd_entry_htab == NULL
+		|| cluster_grd_shard_locks == NULL || cluster_grd_state == NULL)
+		return false;
+	if (member_capacity > 0)
+		members = palloc((Size)member_capacity * sizeof(*members));
+	nresids = cluster_grd_snapshot_entry_resids(&resids);
+	for (int r = 0; r < nresids; r++) {
+		ClusterGrdQueueSnapshot entry;
+		ClusterGrdQueueObservationStatus status;
+
+		CHECK_FOR_INTERRUPTS();
+		status = cluster_grd_queue_snapshot(&resids[r], &entry, members, member_capacity);
+		visitor(ctx, status, &entry, members);
+	}
+	if (members != NULL)
+		pfree(members);
+	if (resids != NULL)
+		pfree(resids);
+	return true;
+}
+
 void
 cluster_grd_entries_walk(ClusterGrdEntryRowVisitor visitor, void *ctx)
 {
@@ -9606,6 +9773,7 @@ cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32
 	ClusterGrdHolderId *departed = NULL;
 	int departed_capacity = 0;
 	int n_departed = 0;
+	ClusterKoAxCleanupV3 ko_sample;
 
 	Assert(entry != NULL);
 
@@ -9613,11 +9781,22 @@ cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32
 		int holders;
 		int waiting;
 
+		cluster_ko_ax_cleanup_sample_v3(&entry->resid, dead_procno, dead_node_id, &ko_sample);
 		SpinLockAcquire(&entry->lock);
 		holders = entry->ngranted;
 		waiting = entry->nwaiters + entry->nconverts;
-		if (holders <= release_capacity && waiting <= departed_capacity)
-			break;
+		if (holders <= release_capacity && waiting <= departed_capacity) {
+			if (cluster_ko_ax_cleanup_claim_v3(&ko_sample))
+				break;
+			/* A concurrent publisher owns this version. The original stale
+			 * process sweep retries; do not spin or remove from a stale sample. */
+			SpinLockRelease(&entry->lock);
+			if (release_payloads != NULL)
+				pfree(release_payloads);
+			if (departed != NULL)
+				pfree(departed);
+			return 0;
+		}
 		SpinLockRelease(&entry->lock);
 		if (holders > release_capacity) {
 			GesRequestPayload *fresh = palloc((Size)holders * sizeof(*fresh));
@@ -9648,6 +9827,17 @@ cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32
 			match = true;
 		if (!match)
 			continue;
+
+		{
+			const ClusterGrdHolder *held = &grd_holders(entry)[i];
+			ClusterGrdHolderId id = { 0 };
+			id.node_id = held->node_id;
+			id.procno = held->procno;
+			id.cluster_epoch = held->cluster_epoch;
+			id.request_id = held->request_id;
+			if (cluster_ko_ax_cleanup_retains_v3(&ko_sample, &id))
+				continue;
+		}
 
 		/* Stash a full GES_RELEASE payload for post-lock enqueue. */
 		{
@@ -9757,6 +9947,7 @@ cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32
 
 	memcpy(&entry_resid, &entry->resid, sizeof(entry_resid));
 
+	cluster_ko_ax_cleanup_finish_v3(&ko_sample);
 	SpinLockRelease(&entry->lock);
 
 	/* Enqueue one full GES_RELEASE per removed real holder.  Route to the
@@ -10175,6 +10366,94 @@ cluster_grd_holder_mode_by_id(const ClusterResId *resid, const ClusterGrdHolderI
 	SpinLockRelease(&entry->lock);
 	cluster_grd_entry_release(entry);
 	return found;
+}
+
+/* Only the current, normal master can report a point-in-time absence. This
+ * observer neither allocates an entry nor cancels an existing obligation.
+ * The protocol caller still authenticates boots and its complete query key.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterGrdHolderObservation
+cluster_grd_holder_observe(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+						   uint64 master_generation, LOCKMODE *mode_out)
+{
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdEntryResult er;
+	ClusterGrdHolderObservation result = CLUSTER_GRD_HOLDER_UNKNOWN;
+	LOCKMODE mode = NoLock;
+	uint64 generation;
+	uint32 shard;
+	uint32 shard_generation;
+
+	if (mode_out != NULL)
+		*mode_out = NoLock;
+	if (resid == NULL || holder == NULL || cluster_grd_state == NULL
+		|| resid->type != LOCKTAG_RELATION || resid->lockmethodid != DEFAULT_LOCKMETHOD
+		|| resid->field2 == InvalidOid || resid->field3 != 0 || resid->field4 != 0
+		|| holder->node_id >= CLUSTER_MAX_NODES || holder->procno > INT_MAX
+		|| holder->request_id == 0 || holder->request_id == PG_UINT64_MAX
+		|| holder->cluster_epoch == 0 || holder->cluster_epoch != cluster_epoch_get_current()
+		|| master_generation == 0
+		|| cluster_grd_lookup_master_gen(resid, &generation) != cluster_node_id
+		|| generation != master_generation)
+		return CLUSTER_GRD_HOLDER_UNKNOWN;
+	shard = cluster_grd_shard_for_resource(resid);
+	shard_generation = cluster_grd_shard_master_generation(shard);
+	if (cluster_grd_shard_phase(shard) != GRD_SHARD_NORMAL)
+		return CLUSTER_GRD_HOLDER_UNKNOWN;
+
+	er = cluster_grd_entry_lookup_or_create(resid, false, &entry);
+	if (er == CLUSTER_GRD_ENTRY_NOT_FOUND)
+		result = CLUSTER_GRD_HOLDER_ABSENT;
+	else if (er == CLUSTER_GRD_ENTRY_OK && entry != NULL) {
+		SpinLockAcquire(&entry->lock);
+		result = CLUSTER_GRD_HOLDER_ABSENT;
+		for (int i = 0; i < entry->ngranted; i++) {
+			const ClusterGrdHolder *h = &grd_holders(entry)[i];
+
+			if (h->node_id == holder->node_id && h->procno == holder->procno
+				&& h->cluster_epoch == holder->cluster_epoch
+				&& h->request_id == holder->request_id) {
+				mode = h->mode;
+				result = mode >= AccessShareLock && mode <= AccessExclusiveLock
+							 ? CLUSTER_GRD_HOLDER_PRESENT
+							 : CLUSTER_GRD_HOLDER_UNKNOWN;
+				break;
+			}
+		}
+		for (int i = 0; result == CLUSTER_GRD_HOLDER_ABSENT && i < entry->nwaiters; i++) {
+			const ClusterGrdWaiter *w = &grd_waiters(entry)[i];
+
+			if (w->node_id == holder->node_id && w->procno == holder->procno
+				&& w->cluster_epoch == holder->cluster_epoch && w->request_id == holder->request_id)
+				result = CLUSTER_GRD_HOLDER_UNKNOWN;
+		}
+		for (int i = 0; result == CLUSTER_GRD_HOLDER_ABSENT && i < entry->nconverts; i++) {
+			const ClusterGrdConvert *c = &grd_converts(entry)[i];
+
+			if (c->node_id == holder->node_id && c->procno == holder->procno
+				&& c->cluster_epoch == holder->cluster_epoch
+				&& c->convert_request_id == holder->request_id)
+				result = CLUSTER_GRD_HOLDER_UNKNOWN;
+		}
+		for (int i = 0; result == CLUSTER_GRD_HOLDER_ABSENT && i < entry->nreservations; i++) {
+			const ClusterGrdHolderId *r = &grd_reservations(entry)[i].id;
+
+			if (r->node_id == holder->node_id && r->procno == holder->procno
+				&& r->cluster_epoch == holder->cluster_epoch && r->request_id == holder->request_id)
+				result = CLUSTER_GRD_HOLDER_UNKNOWN;
+		}
+		SpinLockRelease(&entry->lock);
+		cluster_grd_entry_release(entry);
+	}
+	if (holder->cluster_epoch != cluster_epoch_get_current()
+		|| cluster_grd_lookup_master_gen(resid, &generation) != cluster_node_id
+		|| generation != master_generation
+		|| cluster_grd_shard_master_generation(shard) != shard_generation
+		|| cluster_grd_shard_phase(shard) != GRD_SHARD_NORMAL)
+		return CLUSTER_GRD_HOLDER_UNKNOWN;
+	if (mode_out != NULL && result == CLUSTER_GRD_HOLDER_PRESENT)
+		*mode_out = mode;
+	return result;
 }
 
 ClusterGrdEntryResult

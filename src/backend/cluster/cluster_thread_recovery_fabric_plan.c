@@ -365,6 +365,13 @@ cluster_thread_recovery_fabric_replay_allowed_v1(const ClusterThreadRecoveryFabr
 		&& plan->sealed && !plan->failed && plan->purpose == RF_SIDE_PLAN_RECOVERY;
 }
 
+bool
+cluster_thread_recovery_fabric_pi_contributions_v1(const ClusterThreadRecoveryFabricPlanV1 *plan)
+{
+	return plan != NULL && plan->magic == CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_MAGIC
+		&& plan->sealed && !plan->failed && plan->purpose == RF_SIDE_PLAN_PI_CONTRIBUTIONS;
+}
+
 uint32
 cluster_thread_recovery_fabric_participant_count_v1(const ClusterThreadRecoveryFabricPlanV1 *plan)
 {

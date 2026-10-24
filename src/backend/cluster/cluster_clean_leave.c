@@ -37,6 +37,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_pcm_x_bufmgr.h"
 
 #include "cluster/cluster_lmd.h"
 
@@ -57,6 +58,7 @@
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_lock_owner.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_cssd.h"
 #include "cluster/cluster_epoch.h"	   /* cluster_epoch_get_current (version-coherent) */
@@ -1946,13 +1948,23 @@ cl_normal_stop_modules_poll(bool post_checkpoint, bool require_pi_retired,
 		case 8:
 			result = cluster_grd_normal_stop_poll(&resid, &index, &current.reason);
 			break;
-		case 9:
-			result = post_checkpoint && !require_pi_retired
-						 ? cluster_bufmgr_normal_stop_local_checkpoint_poll(&tag, &backend,
-																			&current.reason)
-						 : cluster_bufmgr_normal_stop_poll(post_checkpoint, &tag, &backend,
-														   &current.reason);
+		case 9: {
+			ClusterBufferStopObservation observed;
+
+			result = cluster_bufmgr_normal_stop_observed(post_checkpoint,
+				post_checkpoint && require_pi_retired, &tag, &backend, &current.reason, &observed);
+			snprintf(current.object, sizeof(current.object),
+				"tag=%u/%u/%u/%u/%u buffer=%d state=%08x refs=%u waitproc=%d "
+				"pcm=%u type=%u gen=" UINT64_FORMAT " flags=%x token=" UINT64_FORMAT
+				" activation=" UINT64_FORMAT " r4=" UINT64_FORMAT " delivery=" UINT64_FORMAT,
+				tag.spcOid, tag.dbOid, tag.relNumber, (unsigned) tag.forkNum, tag.blockNum,
+				backend, observed.state, BUF_STATE_GET_REFCOUNT(observed.state),
+				observed.wait_backend_pgprocno, observed.own.pcm_state, observed.own.buffer_type,
+				observed.own.generation, observed.own.flags, observed.own.reservation_token,
+				observed.own.writer_activation_token, observed.own.resource_x_activation_generation,
+				observed.delivery);
 			break;
+		}
 		case 10:
 			result = cluster_oid_lease_normal_stop_poll(&current.reason);
 			strlcpy(current.object, "oid-lease", sizeof(current.object));
@@ -1973,7 +1985,7 @@ cl_normal_stop_modules_poll(bool post_checkpoint, bool require_pi_retired,
 		default:
 			result = CLUSTER_NORMAL_STOP_INVALID;
 		}
-		if (owner == 4 || owner == 9)
+		if (owner == 4)
 			snprintf(current.object, sizeof(current.object), "tag=%u/%u/%u/%u/%u slot=%u buffer=%d",
 					 tag.spcOid, tag.dbOid, tag.relNumber, (unsigned)tag.forkNum, tag.blockNum,
 					 index, backend);
@@ -3473,6 +3485,50 @@ cl_normal_stop_checkpoint_state_locked(uint32 expected_services, uint32 phase, u
 	return cluster_normal_stop_failure() == CLUSTER_NORMAL_STOP_FAILURE_NONE;
 }
 
+/* Diagnostic-only coherent buffer observation before any frontend cut is
+ * consumed. It grants no cut, creates no work/reference and never changes
+ * the caller's verdict. The original DRAIN census must still run later. */
+static void
+cl_normal_stop_trace_pre_front_buffer(void)
+{
+	static TimestampTz last_trace;
+	ClusterBufferStopObservation observed;
+	BufferTag tag = { 0 };
+	const char *reason;
+	ClusterNormalStopPollResult result;
+	TimestampTz now;
+	uint32 mask;
+	int buffer = -1;
+
+	if (!cluster_trace_cleanup || CritSectionCount != 0 || !AmCheckpointerProcess())
+		return;
+	now = GetCurrentTimestamp();
+	if (last_trace != 0 && now >= last_trace && now - last_trace < INT64CONST(1000000))
+		return;
+	last_trace = now;
+	result = cluster_bufmgr_normal_stop_observed(false, false, &tag, &buffer,
+		&reason, &observed);
+	mask = (BUF_STATE_GET_REFCOUNT(observed.state) != 0 ? 1u : 0u)
+		| ((observed.state & BM_IO_IN_PROGRESS) != 0 ? 2u : 0u)
+		| ((observed.state & BM_PIN_COUNT_WAITER) != 0 ? 4u : 0u)
+		| (observed.own.flags != 0 ? 8u : 0u)
+		| (observed.own.writer_activation_token != 0 ? 16u : 0u)
+		| (observed.own.resource_x_activation_generation != 0 ? 32u : 0u)
+		| (observed.delivery != 0 ? 64u : 0u)
+		| (observed.own.pcm_state == PCM_STATE_READ_IMAGE ? 128u : 0u);
+	elog(LOG, "normal-stop passive pre-frontend buffer result=%d reason=%s "
+		"mask=%u tag=%u/%u/%u/%u/%u buffer=%d state=%08x refs=%u waitproc=%d "
+		"pcm=%u type=%u gen=" UINT64_FORMAT " flags=%x token=" UINT64_FORMAT
+		" activation=" UINT64_FORMAT " r4=" UINT64_FORMAT " delivery=" UINT64_FORMAT,
+		(int) result, reason, mask, tag.spcOid, tag.dbOid, tag.relNumber,
+		(unsigned) tag.forkNum, tag.blockNum, buffer, observed.state,
+		BUF_STATE_GET_REFCOUNT(observed.state), observed.wait_backend_pgprocno,
+		observed.own.pcm_state, observed.own.buffer_type, observed.own.generation,
+		observed.own.flags, observed.own.reservation_token,
+		observed.own.writer_activation_token, observed.own.resource_x_activation_generation,
+		observed.delivery);
+}
+
 static ClusterNormalStopPollResult
 cl_normal_stop_checkpoint_poll(uint32 expected_services, ClusterPhase1FullStopPlan *plan_out,
 							   ClusterNormalStopModuleObservation *observation,
@@ -3507,6 +3563,7 @@ cl_normal_stop_checkpoint_poll(uint32 expected_services, ClusterPhase1FullStopPl
 	phase = pg_atomic_read_u32(&cl_normal_stop->phase);
 	if (phase <= CLUSTER_NORMAL_STOP_DRAIN
 		&& (!cluster_shared_config || !progress->identity_ready)) {
+		cl_normal_stop_trace_pre_front_buffer();
 		result = cluster_normal_stop_fronts_poll(&observed, &observation->reason);
 		if (result != CLUSTER_NORMAL_STOP_READY)
 			return result;
@@ -3688,6 +3745,29 @@ cl_normal_stop_checkpoint_run(ClusterPhase1FullStopPlan *plan,
 		ResetLatch(MyLatch);
 		cluster_cf_retirement_poll();
 		cluster_lock_owners_service_poll();
+		if (step == 0 && !after_checkpoint
+			&& pg_atomic_read_u32(&cl_normal_stop->phase) < CLUSTER_NORMAL_STOP_CHECKPOINT
+			&& pg_atomic_read_u32(&cl_normal_stop->service_seal) == 0
+			&& cluster_normal_stop_failure() == CLUSTER_NORMAL_STOP_FAILURE_NONE) {
+			PcmReclaimBatch retired = {0};
+			bool owner_progress;
+			/* Continue the original bounded no-I/O master consumer before
+			 * the producer cut. Same cursor, gates, owner and absolute budget;
+			 * passive module census never executes native physical work. */
+			LWLockAcquire(&cl_state->lock, LW_SHARED);
+			deadline = cl_state->barrier_deadline_us;
+			LWLockRelease(&cl_state->lock);
+			now = (uint64)GetCurrentTimestamp();
+			if (now != 0 && deadline != UINT64_MAX && now < deadline) {
+				owner_progress = cluster_ko_shared_native_poll_v2();
+				if (cluster_pcm_lock_reclaim_bounded(128, &retired)
+					&& retired.examined_count != 0
+					&& (!retired.complete_wrap || retired.retired_count != 0))
+					owner_progress = true;
+				if (owner_progress)
+					SetLatch(MyLatch);
+			}
+		}
 		if (step == 0)
 			result = cl_normal_stop_checkpoint_poll(expected, plan, observation, &progress);
 		else if (step == 1)
@@ -4119,6 +4199,32 @@ cluster_normal_stop_service_data_sealed(void)
 	if (seal > 2)
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
 	return seal != 0;
+}
+
+bool
+cluster_normal_stop_continuation_allowed(void)
+{
+	uint32 phase;
+	uint64 now, deadline;
+	bool allowed;
+
+	if (!cluster_normal_stop_requested())
+		return true;
+	if (!IsUnderPostmaster || !cluster_enabled || cl_state == NULL || cl_normal_stop == NULL)
+		return false;
+	now = (uint64)GetCurrentTimestamp();
+	/* Called outside module locks. This only bounds an existing owner's
+	 * execution; it neither admits work nor replaces its exact authority. */
+	LWLockAcquire(&cl_state->lock, LW_SHARED);
+	phase = pg_atomic_read_u32(&cl_normal_stop->phase);
+	deadline = cl_state->barrier_deadline_us;
+	allowed = cluster_normal_stop_failure() == CLUSTER_NORMAL_STOP_FAILURE_NONE
+		&& pg_atomic_read_u32(&cl_normal_stop->identity_published) == 1
+		&& phase >= CLUSTER_NORMAL_STOP_DRAIN && phase < CLUSTER_NORMAL_STOP_CHECKPOINT
+		&& pg_atomic_read_u32(&cl_normal_stop->service_seal) == 0
+		&& now != 0 && deadline != 0 && deadline != UINT64_MAX && now < deadline;
+	LWLockRelease(&cl_state->lock);
+	return allowed;
 }
 
 bool

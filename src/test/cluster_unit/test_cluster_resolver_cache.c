@@ -3,21 +3,19 @@
  * test_cluster_resolver_cache.c
  *	  spec-5.55 unit tests for the shared resolver cache module
  *	  (cluster_resolver_cache.o), with malloc-backed shmem + no-op LWLock stubs
- *	  and a MOCKED cluster_tt_slot_durable_lookup (the gate (2) re-validation) +
- *	  MOCKED ReadNextFullTransactionId (the gate (4) own-instance xid epoch).
+ *	  and MOCKED durable TT lookups (the gate (2) re-validation) + native
+ *	  commit check and ReadNextFullTransactionId (gate (4) own xid epoch).
  *
  *	  Covers the module-local gates: (1) memo non-authoritative (probe returns the
  *	  mocked DURABLE scn, never the cached commit_scn_debug), (2) exact-(xid,wrap)
  *	  re-validation (probe passes hint.wrap; a lookup miss -> revalidate_miss),
  *	  (4) xid_epoch fence (a hint installed at epoch E is an epoch_miss in E+1),
  *	  (5) own-instance install gate, plus the counter taxonomy, eviction, the
- *	  trust predicate and the entries==0 zero-memory no-op.  gate (3) (the
- *	  acceptance same-segment rerun) lives in cluster_cr.c (caller side), so it is
- *	  split across two homes: its VERDICT LOGIC is the pure
- *	  cluster_tt_recovery_wrap_suspect gate, unit-tested by
- *	  test_cluster_tt_durable.c (the test_wrap_suspect_* matrix); its memo-path
- *	  fail-closed BRANCH is exercised by the cluster_tap test (317 L5, injection-
- *	  driven -- the natural workload cannot reach a wrap-suspect memo hit).  The
+ *	  disabled trust predicate and the entries==0 zero-memory no-op.  The real
+ *	  extracted CR Source 3 caller checks pre-scan epoch provenance and always
+ *	  scans even on a valid hint, preserving rejected/unavailable scan results.
+ *	  Scan and acceptance dependencies are fixture boundaries; the actual
+ *	  wrap_suspect predicate is covered by test_cluster_tt_durable.c.  The
  *	  16-byte key / 8-byte-aligned slot StaticAsserts are enforced at
  *	  cluster_resolver_cache.o compile time.
  *
@@ -44,8 +42,10 @@
 
 #include "access/transam.h" /* FullTransactionId */
 #include "cluster/cluster_resolver_cache.h"
+#include "cluster/cluster_itl.h"
+#include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_shmem.h"		/* ClusterShmemRegion */
-#include "cluster/cluster_tt_durable.h" /* cluster_tt_slot_durable_lookup proto */
+#include "cluster/cluster_tt_durable.h" /* durable lookup prototypes */
 #include "storage/lwlock.h"
 #include "storage/shmem.h" /* ShmemInitStruct proto */
 
@@ -82,6 +82,9 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *foundPt
 }
 
 static LWLockPadded stub_locks[64];
+static uint64 mock_epoch = 1;
+static bool mock_advance_epoch_on_exclusive = false;
+static int mock_cache_locks_held = 0;
 
 LWLockPadded *
 GetNamedLWLockTranche(const char *tranche_name pg_attribute_unused())
@@ -95,26 +98,34 @@ RequestNamedLWLockTranche(const char *tranche_name pg_attribute_unused(),
 {}
 
 bool
-LWLockAcquire(LWLock *l pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+LWLockAcquire(LWLock *l pg_attribute_unused(), LWLockMode mode)
 {
+	mock_cache_locks_held++;
+	if (mode == LW_EXCLUSIVE && mock_advance_epoch_on_exclusive) {
+		mock_epoch++;
+		mock_advance_epoch_on_exclusive = false;
+	}
 	return true;
 }
 
 void
 LWLockRelease(LWLock *l pg_attribute_unused())
-{}
+{
+	mock_cache_locks_held--;
+}
 
 void
 cluster_shmem_register_region(const ClusterShmemRegion *r pg_attribute_unused())
 {}
 
 /* ---- mock: gate (4) own-instance xid epoch ---- */
-static uint64 mock_epoch = 1;
-
 FullTransactionId
 ReadNextFullTransactionId(void)
 {
 	FullTransactionId f;
+
+	if (mock_cache_locks_held != 0)
+		abort(); /* XidGenLock must not nest under a cache partition lock. */
 
 	/* epoch in the high 32 bits; low bits are an arbitrary live xid. */
 	f.value = (mock_epoch << 32) | 0x1000u;
@@ -129,22 +140,120 @@ static uint16 mock_lookup_seg = 0;
 static uint16 mock_lookup_slot = 0;
 static uint32 mock_lookup_wrap = 0;
 static TransactionId mock_lookup_xid = 0;
+static bool mock_commit_result = true;
+static int mock_commit_calls = 0;
+static TransactionId mock_commit_xid = InvalidTransactionId;
+static int mock_plain_lookup_calls = 0;
+static int mock_stable_lookup_calls = 0;
+static bool mock_advance_epoch_during_lookup = false;
+static ClusterTTDurableXidCommitCheck mock_commit_check = NULL;
+static bool mock_advance_epoch_during_scan = false;
+static int mock_scan_calls = 0;
+static ClusterTTDurableResolve mock_scan_result = CLUSTER_TT_DURABLE_RESOLVED_SCN;
 
-bool
-cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, TransactionId xid,
-							   uint32 expected_wrap, SCN *commit_scn)
+static bool
+mock_durable_lookup(uint32 segment_id, uint16 slot_offset, TransactionId xid, uint32 expected_wrap)
 {
 	mock_lookup_calls++;
 	mock_lookup_seg = (uint16)segment_id;
 	mock_lookup_slot = slot_offset;
 	mock_lookup_wrap = expected_wrap;
 	mock_lookup_xid = xid;
-	if (!mock_lookup_result)
+	if (mock_advance_epoch_during_lookup)
+		mock_epoch++;
+	return mock_lookup_result;
+}
+
+bool
+TransactionIdDidCommit(TransactionId xid)
+{
+	mock_commit_calls++;
+	mock_commit_xid = xid;
+	return mock_commit_result;
+}
+
+/* Keep the old lookup double so RED can execute the unchanged product. */
+bool
+cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, TransactionId xid,
+							   uint32 expected_wrap, SCN *commit_scn)
+{
+	mock_plain_lookup_calls++;
+	if (!mock_durable_lookup(segment_id, slot_offset, xid, expected_wrap))
 		return false;
 	if (commit_scn != NULL)
 		*commit_scn = mock_lookup_scn;
 	return true;
 }
+
+/* The real helper's two-read stability is covered by test_cluster_tt_durable. */
+bool
+cluster_tt_slot_durable_lookup_committed_stable(uint32 segment_id, uint16 slot_offset,
+												TransactionId xid, uint32 expected_wrap,
+												ClusterTTDurableXidCommitCheck xid_committed,
+												SCN *commit_scn)
+{
+	mock_stable_lookup_calls++;
+	mock_commit_check = xid_committed;
+	if (!mock_durable_lookup(segment_id, slot_offset, xid, expected_wrap) || xid_committed == NULL
+		|| !xid_committed(xid))
+		return false;
+	if (commit_scn != NULL)
+		*commit_scn = mock_lookup_scn;
+	return true;
+}
+
+/* Execute the production Source 3 caller; ITL/overlay are outside these cases. */
+bool
+cluster_itl_get_tt_ref(Page page pg_attribute_unused(), uint8 idx pg_attribute_unused(),
+					   ClusterUndoTTSlotRef *ref pg_attribute_unused())
+{
+	abort();
+}
+
+ClusterSemanticAdmissionResult
+cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op pg_attribute_unused(),
+								  const ClusterTTStatusSourceRequest *request pg_attribute_unused(),
+								  ClusterTTStatusSourceResult *result pg_attribute_unused())
+{
+	abort();
+}
+
+ClusterTTDurableResolve
+cluster_tt_slot_durable_resolve_by_xid(TransactionId xid pg_attribute_unused(),
+									   uint32 expected_wrap, SCN *commit_scn, uint16 *out_seg,
+									   uint16 *out_slot, uint16 *out_wrap)
+{
+	UT_ASSERT_EQ(expected_wrap, CLUSTER_TT_WRAP_ANY);
+	mock_scan_calls++;
+	if (mock_advance_epoch_during_scan)
+		mock_epoch++;
+	*commit_scn = scn_encode(1, 77);
+	*out_seg = 11;
+	*out_slot = 12;
+	*out_wrap = 13;
+	return mock_scan_result;
+}
+
+static bool
+cluster_cr_accept_resolved_scn(SCN scn)
+{
+	return SCN_VALID(scn);
+}
+
+static bool
+cluster_cr_resolved_scn_is_acceptable(SCN scn)
+{
+	return SCN_VALID(scn);
+}
+
+static bool
+cluster_cr_injection_armed(const char *name pg_attribute_unused(),
+						   void *param pg_attribute_unused())
+{
+	return false;
+}
+
+#include "test_cluster_resolver_cache_caller.inc"
 
 /* ---- helpers ---- */
 
@@ -161,12 +270,24 @@ static void
 mock_reset(void)
 {
 	mock_epoch = 1;
+	mock_advance_epoch_on_exclusive = false;
+	mock_cache_locks_held = 0;
+	mock_advance_epoch_during_scan = false;
+	mock_scan_calls = 0;
+	mock_scan_result = CLUSTER_TT_DURABLE_RESOLVED_SCN;
 	mock_lookup_result = true;
 	mock_lookup_scn = 0;
 	mock_lookup_calls = 0;
 	mock_lookup_seg = mock_lookup_slot = 0;
 	mock_lookup_wrap = 0;
 	mock_lookup_xid = 0;
+	mock_commit_result = true;
+	mock_commit_calls = 0;
+	mock_commit_xid = InvalidTransactionId;
+	mock_plain_lookup_calls = 0;
+	mock_stable_lookup_calls = 0;
+	mock_advance_epoch_during_lookup = false;
+	mock_commit_check = NULL;
 }
 
 /* =====================================================================
@@ -181,7 +302,7 @@ UT_TEST(test_off_entries0_noop)
 	mock_reset();
 	rc_init(0, true, true); /* entries 0 dominates -> no region */
 	UT_ASSERT_EQ((int)cluster_resolver_cache_probe(0, 12345, &got), 0);
-	cluster_resolver_cache_install(0, 12345, 1, 2, 3, scn_encode(1, 50));
+	cluster_resolver_cache_install(0, 12345, 1, 2, 3, scn_encode(1, 50), mock_epoch);
 	UT_ASSERT_EQ((int)cluster_resolver_cache_lookup_count(), 0);
 	UT_ASSERT_EQ((int)cluster_resolver_cache_install_count(), 0);
 	UT_ASSERT_EQ(cluster_resolver_cache_live_entries(), 0);
@@ -197,7 +318,7 @@ UT_TEST(test_probe_hit_returns_durable_not_debug)
 	rc_init(64, false, true);
 	mock_epoch = 5;
 	/* install with a "debug" scn of 100 */
-	cluster_resolver_cache_install(0, 777, 3, 7, 2, scn_encode(1, 100));
+	cluster_resolver_cache_install(0, 777, 3, 7, 2, scn_encode(1, 100), mock_epoch);
 	/* the durable slot now reads a DIFFERENT scn (200) */
 	mock_lookup_result = true;
 	mock_lookup_scn = scn_encode(1, 200);
@@ -206,6 +327,57 @@ UT_TEST(test_probe_hit_returns_durable_not_debug)
 	UT_ASSERT_EQ((int)cluster_resolver_cache_hit_count(), 1);
 	UT_ASSERT_EQ((int)cluster_resolver_cache_key_present_count(), 1);
 	UT_ASSERT_EQ((int)cluster_resolver_cache_lookup_count(), 1);
+	UT_ASSERT_EQ(mock_stable_lookup_calls, 1);
+	UT_ASSERT_EQ(mock_plain_lookup_calls, 0);
+	UT_ASSERT_EQ(mock_commit_calls, 1);
+	UT_ASSERT_EQ((int)mock_commit_xid, 777);
+	UT_ASSERT(mock_commit_check == TransactionIdDidCommit);
+}
+
+/* A TT precommit stamp is not native commit proof, in TRUST or MEASURE mode. */
+UT_TEST(test_probe_requires_native_commit_proof)
+{
+	int measure;
+
+	for (measure = 0; measure < 2; measure++) {
+		SCN got = scn_encode(1, 999);
+
+		mock_reset();
+		rc_init(64, measure != 0, measure == 0);
+		mock_epoch = 5;
+		cluster_resolver_cache_install(0, 777, 3, 7, 2, scn_encode(1, 100), mock_epoch);
+		mock_lookup_scn = scn_encode(1, 200);
+		mock_commit_result = false;
+		UT_ASSERT_EQ((int)cluster_resolver_cache_probe(0, 777, &got), 0);
+		UT_ASSERT_EQ((int)SCN_VALID(got), 0);
+		UT_ASSERT_EQ((int)cluster_resolver_cache_revalidate_miss_count(), 1);
+		UT_ASSERT_EQ((int)cluster_resolver_cache_hit_count(), 0);
+		UT_ASSERT_EQ(mock_commit_calls, 1);
+	}
+}
+
+/* The partition lock is released before I/O; the epoch must still match after. */
+UT_TEST(test_probe_epoch_changes_during_lookup)
+{
+	int measure;
+
+	for (measure = 0; measure < 2; measure++) {
+		SCN got = scn_encode(1, 999);
+
+		mock_reset();
+		rc_init(64, measure != 0, measure == 0);
+		mock_epoch = 5;
+		cluster_resolver_cache_install(0, 777, 3, 7, 2, scn_encode(1, 100), mock_epoch);
+		mock_lookup_scn = scn_encode(1, 200);
+		mock_advance_epoch_during_lookup = true;
+		UT_ASSERT_EQ((int)cluster_resolver_cache_probe(0, 777, &got), 0);
+		UT_ASSERT_EQ((int)SCN_VALID(got), 0);
+		UT_ASSERT_EQ((int)cluster_resolver_cache_epoch_miss_count(), 1);
+		UT_ASSERT_EQ((int)cluster_resolver_cache_key_present_count(), 1);
+		UT_ASSERT_EQ((int)cluster_resolver_cache_revalidate_miss_count(), 0);
+		UT_ASSERT_EQ((int)cluster_resolver_cache_hit_count(), 0);
+		UT_ASSERT_EQ(mock_lookup_calls, 1);
+	}
 }
 
 /* U (gate 2): probe re-validates with the HINT WRAP (concrete), not WRAP_ANY. */
@@ -216,7 +388,7 @@ UT_TEST(test_probe_uses_hint_wrap)
 	mock_reset();
 	rc_init(64, false, true);
 	mock_epoch = 5;
-	cluster_resolver_cache_install(0, 888, 4, 9, 6 /* wrap */, scn_encode(1, 10));
+	cluster_resolver_cache_install(0, 888, 4, 9, 6 /* wrap */, scn_encode(1, 10), mock_epoch);
 	mock_lookup_scn = scn_encode(1, 10);
 	(void)cluster_resolver_cache_probe(0, 888, &got);
 	UT_ASSERT_EQ((int)mock_lookup_seg, 4);
@@ -233,7 +405,7 @@ UT_TEST(test_probe_revalidate_miss)
 	mock_reset();
 	rc_init(64, false, true);
 	mock_epoch = 5;
-	cluster_resolver_cache_install(0, 999, 1, 1, 1, scn_encode(1, 10));
+	cluster_resolver_cache_install(0, 999, 1, 1, 1, scn_encode(1, 10), mock_epoch);
 	mock_lookup_result = false; /* slot recycled */
 	UT_ASSERT_EQ((int)cluster_resolver_cache_probe(0, 999, &got), 0);
 	UT_ASSERT_EQ((int)SCN_VALID(got), 0);
@@ -250,7 +422,7 @@ UT_TEST(test_epoch_fence_miss)
 	mock_reset();
 	rc_init(64, false, true);
 	mock_epoch = 5;
-	cluster_resolver_cache_install(0, 4242, 2, 2, 2, scn_encode(1, 50));
+	cluster_resolver_cache_install(0, 4242, 2, 2, 2, scn_encode(1, 50), mock_epoch);
 	mock_epoch = 6; /* own-instance xid wraparound */
 	UT_ASSERT_EQ((int)cluster_resolver_cache_probe(0, 4242, &got), 0);
 	UT_ASSERT_EQ((int)cluster_resolver_cache_epoch_miss_count(), 1);
@@ -267,7 +439,7 @@ UT_TEST(test_epoch_same_hit)
 	mock_reset();
 	rc_init(64, false, true);
 	mock_epoch = 9;
-	cluster_resolver_cache_install(0, 4242, 2, 2, 2, scn_encode(1, 50));
+	cluster_resolver_cache_install(0, 4242, 2, 2, 2, scn_encode(1, 50), mock_epoch);
 	mock_lookup_scn = scn_encode(1, 50);
 	UT_ASSERT_EQ((int)cluster_resolver_cache_probe(0, 4242, &got), 1);
 	UT_ASSERT_EQ((int)cluster_resolver_cache_hit_count(), 1);
@@ -295,7 +467,7 @@ UT_TEST(test_install_nonown_skip)
 	rc_init(64, false, true);
 	mock_epoch = 5;
 	cluster_node_id = 0;
-	cluster_resolver_cache_install(1 /* != own 0 */, 555, 1, 1, 1, scn_encode(1, 10));
+	cluster_resolver_cache_install(1 /* != own 0 */, 555, 1, 1, 1, scn_encode(1, 10), mock_epoch);
 	UT_ASSERT_EQ((int)cluster_resolver_cache_nonown_skip_count(), 1);
 	UT_ASSERT_EQ((int)cluster_resolver_cache_install_count(), 0);
 	UT_ASSERT_EQ(cluster_resolver_cache_live_entries(), 0);
@@ -324,9 +496,10 @@ UT_TEST(test_evict_on_collision)
 	mock_reset();
 	rc_init(1, false, true); /* 1 slot -> every key maps to idx 0 */
 	mock_epoch = 5;
-	cluster_resolver_cache_install(0, 100, 1, 1, 1, scn_encode(1, 10));
+	cluster_resolver_cache_install(0, 100, 1, 1, 1, scn_encode(1, 10), mock_epoch);
 	UT_ASSERT_EQ((int)cluster_resolver_cache_evict_count(), 0);			/* fresh slot */
-	cluster_resolver_cache_install(0, 200, 2, 2, 2, scn_encode(1, 20)); /* evicts xid 100 */
+	cluster_resolver_cache_install(0, 200, 2, 2, 2, scn_encode(1, 20),
+								   mock_epoch); /* evicts xid 100 */
 	UT_ASSERT_EQ((int)cluster_resolver_cache_evict_count(), 1);
 	UT_ASSERT_EQ((int)cluster_resolver_cache_install_count(), 2);
 }
@@ -337,8 +510,8 @@ UT_TEST(test_refresh_no_evict)
 	mock_reset();
 	rc_init(1, false, true);
 	mock_epoch = 5;
-	cluster_resolver_cache_install(0, 100, 1, 1, 1, scn_encode(1, 10));
-	cluster_resolver_cache_install(0, 100, 1, 1, 1, scn_encode(1, 11)); /* same key */
+	cluster_resolver_cache_install(0, 100, 1, 1, 1, scn_encode(1, 10), mock_epoch);
+	cluster_resolver_cache_install(0, 100, 1, 1, 1, scn_encode(1, 11), mock_epoch); /* same key */
 	UT_ASSERT_EQ((int)cluster_resolver_cache_evict_count(), 0);
 	UT_ASSERT_EQ((int)cluster_resolver_cache_install_count(), 2);
 }
@@ -351,23 +524,81 @@ UT_TEST(test_live_entries)
 	mock_epoch = 5;
 	/* normal xids only (>= FirstNormalTransactionId == 3); a real deleter xid is
 	 * always normal, and install guards non-normal xids. */
-	cluster_resolver_cache_install(0, 10, 1, 1, 1, scn_encode(1, 1));
-	cluster_resolver_cache_install(0, 20, 1, 1, 1, scn_encode(1, 2));
-	cluster_resolver_cache_install(0, 30, 1, 1, 1, scn_encode(1, 3));
+	cluster_resolver_cache_install(0, 10, 1, 1, 1, scn_encode(1, 1), mock_epoch);
+	cluster_resolver_cache_install(0, 20, 1, 1, 1, scn_encode(1, 2), mock_epoch);
+	cluster_resolver_cache_install(0, 30, 1, 1, 1, scn_encode(1, 3), mock_epoch);
 	UT_ASSERT_EQ((int)cluster_resolver_cache_install_count(), 3);
 	UT_ASSERT_EQ(cluster_resolver_cache_live_entries(), 3);
 }
 
-/* U: trust predicate reflects (enabled && region live). */
+/* U: no setting permits a hint to replace the authoritative scan. */
 UT_TEST(test_trust_predicate)
 {
 	mock_reset();
 	rc_init(64, true, false); /* measure-only -> region live but not trusting */
 	UT_ASSERT_EQ((int)cluster_resolver_cache_trust(), 0);
-	rc_init(64, false, true); /* enabled -> trusting */
-	UT_ASSERT_EQ((int)cluster_resolver_cache_trust(), 1);
+	rc_init(64, false, true); /* enabled with live region still cannot skip */
+	UT_ASSERT_EQ((int)cluster_resolver_cache_trust(), 0);
+	rc_init(64, true, true); /* both settings on still cannot skip */
+	UT_ASSERT_EQ((int)cluster_resolver_cache_trust(), 0);
 	rc_init(0, false, true); /* enabled but no region -> not trusting */
 	UT_ASSERT_EQ((int)cluster_resolver_cache_trust(), 0);
+}
+
+/* U: a revalidated hint is diagnostic; the real caller returns the scan SCN. */
+UT_TEST(test_source3_hit_still_scans)
+{
+	int mode;
+
+	for (mode = 1; mode <= 3; mode++) {
+		SCN got = InvalidScn;
+
+		mock_reset();
+		rc_init(64, (mode & 2) != 0, (mode & 1) != 0);
+		cluster_resolver_cache_install(0, 12345, 11, 12, 13, scn_encode(1, 70), mock_epoch);
+		mock_lookup_scn = scn_encode(1, 70);
+		UT_ASSERT_EQ(
+			cluster_cr_resolve_xmax_commit_scn(NULL, CLUSTER_ITL_SLOT_UNALLOCATED, 12345, &got),
+			CLUSTER_CR_XMAX_RESOLVED_SCN);
+		UT_ASSERT_EQ(cluster_resolver_cache_hit_count(), 1);
+		UT_ASSERT_EQ(mock_scan_calls, 1);
+		UT_ASSERT_EQ(got, scn_encode(1, 77));
+		UT_ASSERT(!cluster_resolver_cache_trust());
+	}
+}
+
+/* U: a valid hint cannot hide a rejected, recycled or unavailable full scan. */
+UT_TEST(test_source3_hit_preserves_scan_rejection)
+{
+	static const struct {
+		ClusterTTDurableResolve scan_result;
+		int caller_result;
+	} cases[] = {
+		{ CLUSTER_TT_DURABLE_XID_MATCH_INVALID_SCN, CLUSTER_CR_XMAX_INVALID_OR_AMBIGUOUS },
+		{ CLUSTER_TT_DURABLE_AMBIGUOUS_WRAP, CLUSTER_CR_XMAX_INVALID_OR_AMBIGUOUS },
+		{ CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE, CLUSTER_CR_XMAX_SCAN_UNAVAILABLE },
+		{ CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH, CLUSTER_CR_XMAX_RECYCLED },
+	};
+	int mode;
+	size_t i;
+
+	for (mode = 1; mode <= 3; mode++) {
+		for (i = 0; i < lengthof(cases); i++) {
+			SCN got = InvalidScn;
+
+			mock_reset();
+			rc_init(64, (mode & 2) != 0, (mode & 1) != 0);
+			cluster_resolver_cache_install(0, 12345, 11, 12, 13, scn_encode(1, 70), mock_epoch);
+			mock_lookup_scn = scn_encode(1, 70);
+			mock_scan_result = cases[i].scan_result;
+			UT_ASSERT_EQ(
+				cluster_cr_resolve_xmax_commit_scn(NULL, CLUSTER_ITL_SLOT_UNALLOCATED, 12345, &got),
+				cases[i].caller_result);
+			UT_ASSERT_EQ(cluster_resolver_cache_hit_count(), 1);
+			UT_ASSERT_EQ(mock_scan_calls, 1);
+			UT_ASSERT_EQ(got, InvalidScn);
+		}
+	}
 }
 
 /* U: install / probe of an abnormal (non-normal) xid is a guarded no-op. */
@@ -378,7 +609,7 @@ UT_TEST(test_abnormal_xid_guarded)
 	mock_reset();
 	rc_init(64, false, true);
 	mock_epoch = 5;
-	cluster_resolver_cache_install(0, InvalidTransactionId, 1, 1, 1, scn_encode(1, 10));
+	cluster_resolver_cache_install(0, InvalidTransactionId, 1, 1, 1, scn_encode(1, 10), mock_epoch);
 	UT_ASSERT_EQ((int)cluster_resolver_cache_install_count(), 0);
 	UT_ASSERT_EQ((int)cluster_resolver_cache_probe(0, InvalidTransactionId, &got), 0);
 	UT_ASSERT_EQ((int)cluster_resolver_cache_lookup_count(), 0); /* guarded before count */
@@ -403,7 +634,7 @@ UT_TEST(test_nonterminal_skip_structural_zero)
 	mock_reset();
 	rc_init(64, false, true);
 	mock_epoch = 5;
-	cluster_resolver_cache_install(0, 10, 1, 1, 1, scn_encode(1, 1));
+	cluster_resolver_cache_install(0, 10, 1, 1, 1, scn_encode(1, 1), mock_epoch);
 	UT_ASSERT_EQ((int)cluster_resolver_cache_nonterminal_skip_count(), 0);
 }
 
@@ -415,7 +646,7 @@ UT_TEST(test_counter_accounting)
 	mock_reset();
 	rc_init(64, false, true);
 	mock_epoch = 5;
-	cluster_resolver_cache_install(0, 10, 1, 1, 1, scn_encode(1, 10));
+	cluster_resolver_cache_install(0, 10, 1, 1, 1, scn_encode(1, 10), mock_epoch);
 	mock_lookup_scn = scn_encode(1, 10);
 	(void)cluster_resolver_cache_probe(0, 10, &got); /* hit */
 	(void)cluster_resolver_cache_probe(0, 11, &got); /* absent */
@@ -435,19 +666,109 @@ UT_TEST(test_measure_mode_region_live)
 	mock_reset();
 	rc_init(64, true, false); /* measure, not enabled */
 	mock_epoch = 5;
-	cluster_resolver_cache_install(0, 71, 1, 1, 1, scn_encode(1, 7));
+	cluster_resolver_cache_install(0, 71, 1, 1, 1, scn_encode(1, 7), mock_epoch);
 	mock_lookup_scn = scn_encode(1, 7);
 	UT_ASSERT_EQ((int)cluster_resolver_cache_probe(0, 71, &got), 1); /* probe still works */
 	UT_ASSERT_EQ((int)cluster_resolver_cache_hit_count(), 1);
 	UT_ASSERT_EQ((int)cluster_resolver_cache_trust(), 0); /* but not trusting */
 }
 
+/* A scan begun in E must not publish a reusable hint in E+1. */
+UT_TEST(test_fresh_scan_cross_epoch_does_not_install)
+{
+	int measure;
+
+	for (measure = 0; measure <= 1; measure++) {
+		SCN got = InvalidScn;
+
+		mock_reset();
+		rc_init(64, measure != 0, measure == 0);
+		mock_advance_epoch_during_scan = true;
+		UT_ASSERT_EQ(
+			cluster_cr_resolve_xmax_commit_scn(NULL, CLUSTER_ITL_SLOT_UNALLOCATED, 12345, &got),
+			CLUSTER_CR_XMAX_RESOLVED_SCN);
+		UT_ASSERT_EQ(got, scn_encode(1, 77)); /* original fresh verdict unchanged */
+		UT_ASSERT_EQ(cluster_resolver_cache_install_count(), 0);
+		mock_lookup_scn = scn_encode(1, 77);
+		UT_ASSERT(!cluster_resolver_cache_probe(0, 12345, &got));
+		UT_ASSERT_EQ(got, InvalidScn);
+		UT_ASSERT_EQ(mock_lookup_calls, 0);
+	}
+}
+
+/* An already-stale scan must not displace an E+1 hint for the same raw xid. */
+UT_TEST(test_stale_scan_does_not_replace_current_hint)
+{
+	int measure;
+
+	for (measure = 0; measure <= 1; measure++) {
+		SCN got = InvalidScn;
+
+		mock_reset();
+		rc_init(64, measure != 0, measure == 0);
+		mock_epoch = 2;
+		cluster_resolver_cache_install(0, 12345, 21, 22, 23, scn_encode(1, 80), 2);
+		cluster_resolver_cache_install(0, 12345, 11, 12, 13, scn_encode(1, 77), 1);
+		mock_lookup_scn = scn_encode(1, 80);
+		UT_ASSERT(cluster_resolver_cache_probe(0, 12345, &got));
+		UT_ASSERT_EQ(mock_lookup_seg, 21);
+		UT_ASSERT_EQ(mock_lookup_slot, 22);
+		UT_ASSERT_EQ(mock_lookup_wrap, 23);
+		UT_ASSERT_EQ(cluster_resolver_cache_install_count(), 1);
+	}
+}
+
+/* Epoch can advance after the pre-lock check; retain E rather than relabel E+1. */
+UT_TEST(test_install_epoch_advances_while_waiting_partition)
+{
+	int measure;
+
+	for (measure = 0; measure <= 1; measure++) {
+		SCN got = InvalidScn;
+
+		mock_reset();
+		rc_init(64, measure != 0, measure == 0);
+		mock_advance_epoch_on_exclusive = true;
+		cluster_resolver_cache_install(0, 12345, 11, 12, 13, scn_encode(1, 77), 1);
+		UT_ASSERT_EQ(mock_epoch, 2);
+		mock_lookup_scn = scn_encode(1, 77);
+		UT_ASSERT(!cluster_resolver_cache_probe(0, 12345, &got));
+		UT_ASSERT_EQ(got, InvalidScn);
+		UT_ASSERT_EQ(mock_lookup_calls, 0);
+	}
+}
+
+/* Epoch zero is the valid first FullXid era, not an invalid token. */
+UT_TEST(test_fresh_scan_epoch_zero_can_install)
+{
+	SCN got = InvalidScn;
+
+	mock_reset();
+	rc_init(64, false, true);
+	mock_epoch = 0;
+	UT_ASSERT_EQ(
+		cluster_cr_resolve_xmax_commit_scn(NULL, CLUSTER_ITL_SLOT_UNALLOCATED, 12345, &got),
+		CLUSTER_CR_XMAX_RESOLVED_SCN);
+	UT_ASSERT_EQ(cluster_resolver_cache_install_count(), 1);
+	mock_lookup_scn = scn_encode(1, 77);
+	UT_ASSERT(cluster_resolver_cache_probe(0, 12345, &got));
+	UT_ASSERT_EQ(mock_lookup_seg, 11);
+	UT_ASSERT_EQ(mock_lookup_slot, 12);
+	UT_ASSERT_EQ(mock_lookup_wrap, 13);
+}
+
 int
 main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 {
-	UT_PLAN(18);
+	UT_PLAN(26);
+	UT_RUN(test_fresh_scan_cross_epoch_does_not_install);
+	UT_RUN(test_stale_scan_does_not_replace_current_hint);
+	UT_RUN(test_install_epoch_advances_while_waiting_partition);
+	UT_RUN(test_fresh_scan_epoch_zero_can_install);
 	UT_RUN(test_off_entries0_noop);
 	UT_RUN(test_probe_hit_returns_durable_not_debug);
+	UT_RUN(test_probe_requires_native_commit_proof);
+	UT_RUN(test_probe_epoch_changes_during_lookup);
 	UT_RUN(test_probe_uses_hint_wrap);
 	UT_RUN(test_probe_revalidate_miss);
 	UT_RUN(test_epoch_fence_miss);
@@ -459,6 +780,8 @@ main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 	UT_RUN(test_refresh_no_evict);
 	UT_RUN(test_live_entries);
 	UT_RUN(test_trust_predicate);
+	UT_RUN(test_source3_hit_still_scans);
+	UT_RUN(test_source3_hit_preserves_scan_rejection);
 	UT_RUN(test_abnormal_xid_guarded);
 	UT_RUN(test_count_acceptance);
 	UT_RUN(test_nonterminal_skip_structural_zero);

@@ -53,6 +53,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
@@ -492,7 +493,9 @@ sinval_receive_publication(const ClusterICEnvelope *env, const void *payload)
 	}
 	msgs = (const SharedInvalidationMessage *)((const char *)payload + sizeof(*pub));
 	for (int i = 0; i < hdr->nmsgs; i++) {
-		if (msgs[i].id < SHAREDINVALSNAPSHOT_ID || msgs[i].id >= SysCacheSize) {
+		if (msgs[i].id == SHAREDINVALKO_COMMIT_ID
+			? !SharedInvalKoCommitIsValid(&msgs[i].ko)
+			: (msgs[i].id < SHAREDINVALSNAPSHOT_ID || msgs[i].id >= SysCacheSize)) {
 			pg_atomic_fetch_add_u64(&ClusterSinval->validation_drop_count, 1);
 			return;
 		}
@@ -621,6 +624,13 @@ cluster_sinval_handle_envelope(const ClusterICEnvelope *env, const void *payload
 	if (!cluster_normal_stop_service_new_work(false))
 		return;
 	msgs = (const SharedInvalidationMessage *)((const char *)hdr + sizeof(*hdr));
+	for (int i = 0; i < hdr->nmsgs; i++) {
+		/* A native/nontransactional message has no commit provenance. */
+		if (msgs[i].id == SHAREDINVALKO_COMMIT_ID) {
+			pg_atomic_fetch_add_u64(&ClusterSinval->validation_drop_count, 1);
+			return;
+		}
+	}
 
 	/* HC133 nonblocking try-enqueue;  failure → fail-safe SIResetAll
 	 * by aux process (set flag,  no silent stale).
@@ -744,6 +754,44 @@ cluster_sinval_drain_outbound_and_broadcast(void)
 	}
 }
 
+/* The original SI auxiliary owns commit effects before publication ACK.
+ * Native insertion/overflow RESET cannot stand in for this exact consumer. */
+static bool
+sinval_apply_ko_commits(const ClusterSinvalQueueEntry *entry)
+{
+	bool contains_ko = false;
+
+	for (int i = 0; i < entry->nmsgs; i++) {
+		if (entry->msgs[i].id != SHAREDINVALKO_COMMIT_ID)
+			continue;
+		if (!SharedInvalKoCommitIsValid(&entry->msgs[i].ko))
+			return false;
+		contains_ko = true;
+	}
+	if (!contains_ko)
+		return true;
+	/* Revalidate after the queue handoff. A stale boot or a testing/native
+	 * enqueue without the authenticated header cannot retire any operation. */
+	if (entry->flags != (SINVAL_PUBLICATION | SINVAL_REQUIRES_ACK)
+		|| entry->epoch == 0 || entry->epoch != cluster_epoch_get_current()
+		|| entry->source_node < 0 || entry->source_node >= CLUSTER_MAX_NODES
+		|| entry->source_node == cluster_node_id
+		|| entry->origin_incarnation == 0 || entry->target_incarnation == 0
+		|| entry->target_incarnation != cluster_qvotec_get_self_incarnation()
+		|| cluster_membership_get_state(entry->source_node) != CLUSTER_MEMBER_MEMBER
+		|| entry->origin_incarnation
+			!= cluster_membership_get_last_admitted_incarnation(entry->source_node))
+		return false;
+	for (int i = 0; i < entry->nmsgs; i++) {
+		if (entry->msgs[i].id == SHAREDINVALKO_COMMIT_ID
+			&& !cluster_ko_peer_commit_v3(entry->source_node, entry->epoch,
+										entry->origin_incarnation, entry->target_incarnation,
+										SharedInvalKoCommitBatchId(&entry->msgs[i].ko)))
+			return false;
+	}
+	return true;
+}
+
 void
 cluster_sinval_drain_inbound_and_apply(void)
 {
@@ -773,6 +821,12 @@ cluster_sinval_drain_inbound_and_apply(void)
 		 * Keep the sender's obligation alive; its retry supplies the batch. */
 		if ((local.flags & SINVAL_PUBLICATION) != 0
 			&& !cluster_sinval_reconfig_reset_ready(local.epoch)) {
+			drained++;
+			continue;
+		}
+		if (!sinval_apply_ko_commits(&local)) {
+			/* Keep the sender's retained publication unacknowledged. Retry
+			 * replays the exact marker; earlier members are idempotent. */
 			drained++;
 			continue;
 		}
@@ -1185,6 +1239,8 @@ cluster_sinval_request_reset_all_broadcast(void)
 typedef struct ClusterSinvalAckWaitEntry {
 	uint64 batch_id; /* HTAB key */
 	int32 enqueuer_pgprocno;
+	int32 ko_enqueuer_pid;
+	uint32 ko_failed_peer_mask;
 	uint32 alive_peer_mask;
 	uint32 ack_received_mask;
 	TimestampTz deadline_us;
@@ -1674,6 +1730,7 @@ cluster_sinval_normal_stop_poll(const char **domain_out, uint64 *key_out, const 
 		if (entry->batch_id == 0 || entry->enqueuer_pgprocno < 0
 			|| (uint32)entry->enqueuer_pgprocno >= ProcGlobal->allProcCount
 			|| (entry->ack_received_mask & ~entry->alive_peer_mask) != 0
+			|| (entry->ko_failed_peer_mask & ~entry->alive_peer_mask) != 0
 			|| entry->status > SINVAL_ACK_RESET_PENDING || entry->completion_signaled > 1
 			|| (entry->completion_signaled && entry->ack_received_mask != entry->alive_peer_mask))
 			SINVAL_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, "ack_wait", entry->batch_id,
@@ -2048,8 +2105,10 @@ cluster_sinval_ack_wait_alloc_batch_id(void)
 
 /*
  * Insert an ack_wait entry keyed by batch_id, owned by the CURRENT backend
- * (its procLatch is signalled on completion), waiting for the alive_mask peers
- * until deadline_us.  Returns false if the HTAB is full (caller fails closed).
+ * (its procLatch is signalled on completion), waiting for the alive_mask peers.
+ * deadline_us records the caller's deadline, or zero for no protocol deadline.
+ * Only the caller enforces it and removes the entry; time alone never removes
+ * accepted ownership. Returns false if the HTAB is full (caller fails closed).
  */
 bool
 cluster_sinval_ack_wait_begin(uint64 batch_id, uint32 alive_mask, TimestampTz deadline_us)
@@ -2070,6 +2129,7 @@ cluster_sinval_ack_wait_begin(uint64 batch_id, uint32 alive_mask, TimestampTz de
 	memset(entry, 0, sizeof(*entry));
 	entry->batch_id = batch_id;
 	entry->enqueuer_pgprocno = MyProc->pgprocno;
+	entry->ko_enqueuer_pid = MyProc->pid;
 	entry->alive_peer_mask = alive_mask;
 	entry->ack_received_mask = 0;
 	entry->deadline_us = deadline_us;
@@ -2103,7 +2163,8 @@ cluster_sinval_ack_wait_record(uint64 batch_id, int32 acker_node)
 	LWLockAcquire(ClusterSinvalAckWaitLock, LW_EXCLUSIVE);
 	entry = (ClusterSinvalAckWaitEntry *)hash_search(ClusterSinvalAckWaitHTAB, &batch_id, HASH_FIND,
 													 &found);
-	if (found && !entry->publication && (entry->alive_peer_mask & acker_bit) != 0) {
+	if (found && !entry->publication && entry->ko_failed_peer_mask == 0
+		&& (entry->alive_peer_mask & acker_bit) != 0) {
 		entry->ack_received_mask |= acker_bit;
 		if ((entry->ack_received_mask & entry->alive_peer_mask) == entry->alive_peer_mask
 			&& entry->completion_signaled == 0) {
@@ -2115,6 +2176,59 @@ cluster_sinval_ack_wait_record(uint64 batch_id, int32 acker_node)
 
 	if (enqueuer_pgprocno >= 0)
 		SetLatch(&GetPGProcByNumber(enqueuer_pgprocno)->procLatch);
+}
+
+/* The KO handler has authenticated the complete operation. Record only its
+ * negative result here; generic catalog publication and DONE masks are not
+ * a carrier for a failed physical operation. */
+void
+cluster_sinval_ack_wait_record_failure(uint64 batch_id, int32 peer)
+{
+	ClusterSinvalAckWaitEntry *entry;
+	uint32 bit;
+	int32 procno = -1, pid = 0;
+	bool found;
+
+	if (ClusterSinval == NULL || ClusterSinvalAckWaitHTAB == NULL || peer < 0 || peer >= 32)
+		return;
+	bit = UINT32_C(1) << peer;
+	LWLockAcquire(ClusterSinvalAckWaitLock, LW_EXCLUSIVE);
+	entry = hash_search(ClusterSinvalAckWaitHTAB, &batch_id, HASH_FIND, &found);
+	if (found && !entry->publication && (entry->alive_peer_mask & bit) != 0
+		&& (entry->ko_failed_peer_mask & bit) == 0) {
+		entry->ko_failed_peer_mask |= bit;
+		procno = entry->enqueuer_pgprocno;
+		pid = entry->ko_enqueuer_pid;
+	}
+	LWLockRelease(ClusterSinvalAckWaitLock);
+	if (ProcGlobal != NULL && procno >= 0 && (uint32)procno < ProcGlobal->allProcCount && pid > 0
+		&& GetPGProcByNumber(procno)->pid == pid)
+		SetLatch(&GetPGProcByNumber(procno)->procLatch);
+}
+
+bool
+cluster_sinval_ack_wait_read_failure(uint64 batch_id, int32 *peer_out)
+{
+	ClusterSinvalAckWaitEntry *entry;
+	uint32 failed = 0;
+	bool found;
+
+	if (ClusterSinval == NULL || ClusterSinvalAckWaitHTAB == NULL)
+		return false;
+	LWLockAcquire(ClusterSinvalAckWaitLock, LW_SHARED);
+	entry = hash_search(ClusterSinvalAckWaitHTAB, &batch_id, HASH_FIND, &found);
+	if (found && !entry->publication)
+		failed = entry->ko_failed_peer_mask;
+	LWLockRelease(ClusterSinvalAckWaitLock);
+	if (failed == 0)
+		return false;
+	if (peer_out != NULL)
+		for (int32 peer = 0; peer < 32; peer++)
+			if ((failed & (UINT32_C(1) << peer)) != 0) {
+				*peer_out = peer;
+				break;
+			}
+	return true;
 }
 
 /* True when every alive peer has ACK'd for batch_id. */
@@ -2133,8 +2247,9 @@ cluster_sinval_ack_wait_is_complete(uint64 batch_id)
 													 &found);
 	if (found)
 		complete = entry->publication ? sinval_publication_complete(entry)
-									  : (entry->ack_received_mask & entry->alive_peer_mask)
-											== entry->alive_peer_mask;
+									  : entry->ko_failed_peer_mask == 0
+											&& (entry->ack_received_mask & entry->alive_peer_mask)
+												   == entry->alive_peer_mask;
 	LWLockRelease(ClusterSinvalAckWaitLock);
 	return complete;
 }

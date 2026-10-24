@@ -190,4 +190,212 @@ cluster_ko_shared_ack_matches_v2(const ClusterKoSharedMessageV2 *request,
 		   && cluster_ko_shared_encode_v2(&normalized, observed, sizeof(observed))
 		   && memcmp(expected, observed, sizeof(expected)) == 0;
 }
+
+static bool
+ko_shared_v3_valid(const ClusterKoSharedMessageV3 *m)
+{
+	const ClusterKoSharedMessageV2 *base;
+	uint32 master;
+
+	if (m == NULL || !ko_shared_valid(&m->base))
+		return false;
+	base = &m->base;
+	master = (uint32)m->ax_master_node;
+	if (m->ax_resid.type != LOCKTAG_RELATION
+		|| m->ax_resid.lockmethodid != DEFAULT_LOCKMETHOD
+		|| m->ax_resid.field3 != 0 || m->ax_resid.field4 != 0
+		|| m->ax_resid.field1 != base->key.locator.dbOid
+		|| m->ax_resid.field2 == InvalidOid
+		|| m->ax_holder.node_id >= CLUSTER_KO_SHARED_MEMBER_BYTES * 8
+		|| m->ax_holder.cluster_epoch == 0 || m->ax_holder.cluster_epoch == UINT64_MAX
+		|| m->ax_holder.cluster_epoch != base->epoch
+		|| m->ax_holder.request_id == 0 || m->ax_holder.request_id == UINT64_MAX
+		|| m->ax_request_id != m->ax_holder.request_id
+		|| m->ax_master_generation == 0 || m->ax_master_generation == UINT64_MAX
+		|| m->ax_master_node < 0 || master >= CLUSTER_KO_SHARED_MEMBER_BYTES * 8
+		|| (base->members[m->ax_holder.node_id / 8] & (1u << (m->ax_holder.node_id % 8))) == 0
+		|| (base->members[master / 8] & (1u << (master % 8))) == 0
+		|| m->ax_mode != AccessExclusiveLock
+		|| m->full_fork_mask != CLUSTER_KO_SHARED_V3_FULL_FORK_MASK
+		|| m->space_mutation_token == 0 || m->space_mutation_token == UINT64_MAX
+		|| (m->operation != CLUSTER_KO_SHARED_V3_OPERATION_DROP
+			&& m->operation != CLUSTER_KO_SHARED_V3_OPERATION_TRUNCATE
+			&& m->operation != CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD))
+		return false;
+	return true;
+}
+
+bool
+cluster_ko_shared_encode_v3(const ClusterKoSharedMessageV3 *m, void *out, size_t length)
+{
+	uint8 prefix[CLUSTER_KO_SHARED_V2_BYTES];
+	uint8 *bytes = out;
+
+	if (out == NULL || length != CLUSTER_KO_SHARED_V3_BYTES || !ko_shared_v3_valid(m)
+		|| ko_shared_overlap(m, sizeof(*m), out, length)
+		|| !cluster_ko_shared_encode_v2(&m->base, prefix, sizeof(prefix)))
+		return false;
+	memset(bytes, 0, length);
+	memcpy(bytes, prefix, sizeof(prefix));
+	memcpy(bytes, "PKO3", 4);
+	ko_shared_put(bytes + 4, CLUSTER_KO_SHARED_V3_VERSION, 2);
+	ko_shared_put(bytes + 6, CLUSTER_KO_SHARED_V3_BYTES, 2);
+	ko_shared_put(bytes + 160, m->ax_resid.field1, 4);
+	ko_shared_put(bytes + 164, m->ax_resid.field2, 4);
+	ko_shared_put(bytes + 168, m->ax_resid.field3, 4);
+	ko_shared_put(bytes + 172, m->ax_resid.field4, 2);
+	bytes[174] = m->ax_resid.type;
+	bytes[175] = m->ax_resid.lockmethodid;
+	ko_shared_put(bytes + 176, m->ax_holder.node_id, 4);
+	ko_shared_put(bytes + 180, m->ax_holder.procno, 4);
+	ko_shared_put(bytes + 184, m->ax_holder.cluster_epoch, 8);
+	ko_shared_put(bytes + 192, m->ax_holder.request_id, 8);
+	ko_shared_put(bytes + 200, m->ax_request_id, 8);
+	ko_shared_put(bytes + 208, m->ax_master_generation, 8);
+	ko_shared_put(bytes + 216, (uint32)m->ax_master_node, 4);
+	ko_shared_put(bytes + 220, m->ax_mode, 4);
+	ko_shared_put(bytes + 224, m->operation, 2);
+	ko_shared_put(bytes + 226, m->full_fork_mask, 2);
+	ko_shared_put(bytes + 232, m->space_mutation_token, 8);
+	return true;
+}
+
+bool
+cluster_ko_shared_decode_v3(const void *data, size_t length, ClusterKoSharedMessageV3 *out)
+{
+	const uint8 *bytes = data;
+	ClusterKoSharedMessageV3 m = { 0 };
+	uint8 prefix[CLUSTER_KO_SHARED_V2_BYTES];
+	ClusterKoSharedMessageV2 base;
+
+	if (bytes == NULL || out == NULL || length != CLUSTER_KO_SHARED_V3_BYTES
+		|| ko_shared_overlap(bytes, length, out, sizeof(*out))
+		|| memcmp(bytes, "PKO3", 4) != 0
+		|| ko_shared_get(bytes + 4, 2) != CLUSTER_KO_SHARED_V3_VERSION
+		|| ko_shared_get(bytes + 6, 2) != CLUSTER_KO_SHARED_V3_BYTES
+		|| ko_shared_get(bytes + 12, 4) != 0
+		|| ko_shared_get(bytes + 228, 4) != 0)
+		return false;
+	memcpy(prefix, bytes, sizeof(prefix));
+	memcpy(prefix, "PKO2", 4);
+	ko_shared_put(prefix + 4, 2, 2);
+	ko_shared_put(prefix + 6, CLUSTER_KO_SHARED_V2_BYTES, 2);
+	if (!cluster_ko_shared_decode_v2(prefix, sizeof(prefix), &base))
+		return false;
+	m.base = base;
+	m.ax_resid.field1 = ko_shared_get(bytes + 160, 4);
+	m.ax_resid.field2 = ko_shared_get(bytes + 164, 4);
+	m.ax_resid.field3 = ko_shared_get(bytes + 168, 4);
+	m.ax_resid.field4 = ko_shared_get(bytes + 172, 2);
+	m.ax_resid.type = bytes[174];
+	m.ax_resid.lockmethodid = bytes[175];
+	m.ax_holder.node_id = ko_shared_get(bytes + 176, 4);
+	m.ax_holder.procno = ko_shared_get(bytes + 180, 4);
+	m.ax_holder.cluster_epoch = ko_shared_get(bytes + 184, 8);
+	m.ax_holder.request_id = ko_shared_get(bytes + 192, 8);
+	m.ax_request_id = ko_shared_get(bytes + 200, 8);
+	m.ax_master_generation = ko_shared_get(bytes + 208, 8);
+	m.ax_master_node = (int32)ko_shared_get(bytes + 216, 4);
+	m.ax_mode = ko_shared_get(bytes + 220, 4);
+	m.operation = ko_shared_get(bytes + 224, 2);
+	m.full_fork_mask = ko_shared_get(bytes + 226, 2);
+	m.space_mutation_token = ko_shared_get(bytes + 232, 8);
+	if (!ko_shared_v3_valid(&m))
+		return false;
+	*out = m;
+	return true;
+}
+
+bool
+cluster_ko_shared_result_matches_v3(const ClusterKoSharedMessageV3 *request,
+									const ClusterKoSharedMessageV3 *ack)
+{
+	ClusterKoSharedMessageV3 normalized;
+	uint8 expected[CLUSTER_KO_SHARED_V3_BYTES], observed[sizeof(expected)];
+
+	if (!ko_shared_v3_valid(request) || !ko_shared_v3_valid(ack)
+		|| request->base.verb != CLUSTER_KO_SHARED_REQUEST
+		|| ack->base.verb != CLUSTER_KO_SHARED_ACK
+		|| (ack->base.status != CLUSTER_KO_SHARED_DONE
+			&& ack->base.status != CLUSTER_KO_SHARED_FAILED))
+		return false;
+	normalized = *ack;
+	normalized.base.verb = CLUSTER_KO_SHARED_REQUEST;
+	normalized.base.status = CLUSTER_KO_SHARED_REQUEST_STATUS;
+	return cluster_ko_shared_encode_v3(request, expected, sizeof(expected))
+		   && cluster_ko_shared_encode_v3(&normalized, observed, sizeof(observed))
+		   && memcmp(expected, observed, sizeof(expected)) == 0;
+}
+
+bool
+cluster_ko_shared_ack_matches_v3(const ClusterKoSharedMessageV3 *request,
+								 const ClusterKoSharedMessageV3 *ack)
+{
+	return ack != NULL && ack->base.status == CLUSTER_KO_SHARED_DONE
+		   && cluster_ko_shared_result_matches_v3(request, ack);
+}
+
+static bool
+ko_shared_v4_valid(const ClusterKoSharedMessageV4 *m)
+{
+	return m != NULL && ko_shared_v3_valid(&m->object)
+		&& (m->object.operation == CLUSTER_KO_SHARED_V3_OPERATION_DROP
+			|| m->object.operation == CLUSTER_KO_SHARED_V3_OPERATION_REWRITE_OLD);
+}
+
+bool
+cluster_ko_shared_encode_v4(const ClusterKoSharedMessageV4 *m, void *out, size_t length)
+{
+	uint8 bytes[CLUSTER_KO_SHARED_V4_BYTES];
+
+	if (out == NULL || length != sizeof(bytes) || !ko_shared_v4_valid(m)
+		|| ko_shared_overlap(m, sizeof(*m), out, length)
+		|| !cluster_ko_shared_encode_v3(&m->object, bytes, sizeof(bytes)))
+		return false;
+	memcpy(bytes, "PKO4", 4);
+	ko_shared_put(bytes + 4, CLUSTER_KO_SHARED_V4_VERSION, 2);
+	memcpy(out, bytes, sizeof(bytes));
+	return true;
+}
+
+bool
+cluster_ko_shared_decode_v4(const void *data, size_t length, ClusterKoSharedMessageV4 *out)
+{
+	const uint8 *input = data;
+	uint8 bytes[CLUSTER_KO_SHARED_V4_BYTES];
+	ClusterKoSharedMessageV4 m = { 0 };
+
+	if (input == NULL || out == NULL || length != sizeof(bytes)
+		|| ko_shared_overlap(input, length, out, sizeof(*out))
+		|| memcmp(input, "PKO4", 4) != 0
+		|| ko_shared_get(input + 4, 2) != CLUSTER_KO_SHARED_V4_VERSION
+		|| ko_shared_get(input + 6, 2) != CLUSTER_KO_SHARED_V4_BYTES)
+		return false;
+	/* The v4 envelope must match before common bounded identity decoding.
+	 * Normalizing a private copy does not accept a legacy wire frame. */
+	memcpy(bytes, input, sizeof(bytes));
+	memcpy(bytes, "PKO3", 4);
+	ko_shared_put(bytes + 4, CLUSTER_KO_SHARED_V3_VERSION, 2);
+	if (!cluster_ko_shared_decode_v3(bytes, sizeof(bytes), &m.object)
+		|| !ko_shared_v4_valid(&m))
+		return false;
+	*out = m;
+	return true;
+}
+
+bool
+cluster_ko_shared_result_matches_v4(const ClusterKoSharedMessageV4 *request,
+									const ClusterKoSharedMessageV4 *ack)
+{
+	return ko_shared_v4_valid(request) && ko_shared_v4_valid(ack)
+		&& cluster_ko_shared_result_matches_v3(&request->object, &ack->object);
+}
+
+bool
+cluster_ko_shared_ack_matches_v4(const ClusterKoSharedMessageV4 *request,
+									 const ClusterKoSharedMessageV4 *ack)
+{
+	return ack != NULL && ack->object.base.status == CLUSTER_KO_SHARED_DONE
+		&& cluster_ko_shared_result_matches_v4(request, ack);
+}
 #endif

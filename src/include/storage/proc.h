@@ -366,6 +366,11 @@ struct PGPROC {
 	 */
 	pg_atomic_uint64 cluster_read_scn_atomic;
 
+	/* Original top-level FullXid, published before its native raw xid under
+	 * XidGenLock and cleared with that transaction. Zero means unknown; an
+	 * active sampler must not reconstruct an epoch from a raw xid. */
+	pg_atomic_uint64 cluster_top_full_xid_atomic;
+
 	/*
 	 * spec-5.8 D1d — per-proc cluster wait-state.  This backend publishes it
 	 * before a cross-node GES/TX wait and clears it on every exit;  the LMD

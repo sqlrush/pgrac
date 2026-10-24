@@ -3085,8 +3085,22 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 			 * can route to chunk_dispatch_frame with caller's known peer.
 			 */
 		{
-			ClusterICDispatchResult dispatched
-				= cluster_ic_dispatch_envelope(&env, payload, peer_id);
+			ClusterICDispatchResult dispatched;
+			ClusterICTier1Stream stream;
+			ClusterICControlIngress ingress = { 0 };
+
+			if (tier1_my_plane == CLUSTER_IC_PLANE_CONTROL) {
+				if (tier1_peer_fds[peer_id] == peer_fd
+					&& cluster_ic_tier1_stream_capture(peer_id, &stream)) {
+					ingress.serial = stream.serial;
+					ingress.epoch = stream.epoch;
+					ingress.owner_pid = stream.owner_pid;
+					ingress.source_node = peer_id;
+					ingress.carrier = CLUSTER_IC_CONTROL_TCP;
+				}
+				dispatched = cluster_ic_dispatch_control_envelope(&env, payload, peer_id, &ingress);
+			} else
+				dispatched = cluster_ic_dispatch_envelope(&env, payload, peer_id);
 
 			if (dispatched == CLUSTER_IC_DISPATCH_PENDING)
 				return true; /* retain bytes; never report peer failure */

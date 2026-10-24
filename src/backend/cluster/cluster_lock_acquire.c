@@ -57,6 +57,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ir.h" /* spec-5.7 D8 — CLUSTER_IR_RESID_TYPE (freeze-gate bypass belt) */
 #include "cluster/cluster_inject.h" /* spec-4.6 L11/L14 — redeclare-skip probe */
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_lmd_wait_state.h" /* spec-5.8 D1d — per-proc wait-state */
 #include "cluster/cluster_lms.h"
@@ -317,6 +318,17 @@ cluster_lock_acquire_s3_partition_reservation(const ClusterLockAcquireRequest *r
 
 	mut = (ClusterLockAcquireRequest *)req;
 	fill_request_holder(mut);
+	if (req->resid.type == LOCKTAG_RELATION
+		&& !cluster_ko_ax_native_wait_v3(&req->locktag, req->dontwait))
+		return CLUSTER_LOCK_ACQUIRE_NOT_AVAIL;
+	/* Capture before any reservation or REQUEST can obtain a grant. Retain
+	 * even an empty/refused sample through retries of this same request. */
+	if (req->resid.type == LOCKTAG_RELATION && cluster_lock_acquire_is_native_request(req)
+		&& mut->ko_fence_serial_limit == 0) {
+		mut->ko_fence_request_id = req->request_id;
+		mut->ko_fence_serial_limit = req->hw_grant.key.request_id == 0
+			? cluster_ko_peer_fence_request_sample_v3() : UINT64_MAX;
+	}
 	if (!cluster_lock_owner_request_prepare(mut))
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 
@@ -665,6 +677,12 @@ cluster_lock_acquire_s5_promote_once(const ClusterLockAcquireRequest *req)
 	if (!cluster_grd_control_acquire_allowed(&req->resid, req->lockmode))
 		return CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING;
 	mut->registration_failure_reason = NULL;
+	if (req->resid.type == LOCKTAG_RELATION
+		&& cluster_ko_ax_acquire_pending_v3(&req->resid, req->holder.procno,
+											cluster_ges_current_lock_group(&req->holder))) {
+		mut->registration_failure_reason = "KO_AX_RELEASE_PENDING";
+		return CLUSTER_LOCK_ACQUIRE_PENDING;
+	}
 
 	/* Retained HW/native-lock/CF GRANT owns its exact registration, not
 	 * the S3 mutation snapshot. Other control classes keep their own path. */
@@ -709,7 +727,18 @@ cluster_lock_acquire_s5_promote_once(const ClusterLockAcquireRequest *req)
 					mut->registration_failure_reason = "GRANT_CHANGED_DURING_REGISTRATION";
 					promoted = cluster_lock_acquire_retained_grant_is_current(req, &pending);
 				}
+				if (promoted && req->resid.type == LOCKTAG_RELATION
+					&& cluster_ko_ax_acquire_pending_v3(
+						&req->resid, req->holder.procno,
+						cluster_ges_current_lock_group(&req->holder))) {
+					pending = true;
+					promoted = false;
+					mut->registration_failure_reason = "KO_AX_RELEASE_PENDING";
+				}
 				if (promoted) {
+					if (req->resid.type == LOCKTAG_RELATION)
+						(void)cluster_ko_peer_fence_fresh_grant_v3(req);
+					grant->registration_proof = true;
 					grant->consumed = true;
 					grant->cleanup_pending = false;
 					mut->registration_failure_reason = NULL;

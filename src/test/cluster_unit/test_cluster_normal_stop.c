@@ -43,6 +43,9 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+bool cluster_trace_cleanup;
+volatile uint32 CritSectionCount;
+
 
 static ClusterCleanLeaveSharedState test_region;
 static bool test_found;
@@ -78,6 +81,58 @@ static void (*checkpoint_wait_action)(void);
 static unsigned checkpoint_waits, checkpoint_resets, checkpoint_wakes;
 static unsigned checkpoint_cf_retirement_pending;
 static long checkpoint_previous_timeout;
+
+/* Original owner boundaries: only the real CP loop may schedule these. */
+static unsigned checkpoint_native_remaining, checkpoint_retire_remaining;
+static unsigned checkpoint_native_calls, checkpoint_retire_calls;
+static bool checkpoint_native_fail, checkpoint_native_failed;
+bool
+cluster_ko_shared_native_poll_v2(void)
+{
+	UT_ASSERT(AmCheckpointerProcess() && lock_holds == 0);
+	checkpoint_native_calls++;
+	if (checkpoint_native_fail) {
+		checkpoint_native_failed = true;
+		return false;
+	}
+	if (checkpoint_native_remaining == 0)
+		return false;
+	if (--checkpoint_native_remaining == 0)
+		module_results[9] = CLUSTER_NORMAL_STOP_READY;
+	return true;
+}
+ClusterNormalStopPollResult
+cluster_ko_shared_normal_stop_poll_v2(const char **reason)
+{
+	if (reason != NULL)
+		*reason = checkpoint_native_failed ? "KO_SHARED_COMMITTED_RECOVERY_REQUIRED"
+			: checkpoint_native_remaining != 0 ? "KO_SHARED_COMMITTED_OWNED" : "KO_SHARED_EMPTY";
+	return checkpoint_native_failed ? CLUSTER_NORMAL_STOP_INVALID
+		: checkpoint_native_remaining != 0 ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_READY;
+}
+
+bool
+cluster_pcm_lock_reclaim_bounded(uint32 budget, PcmReclaimBatch *out)
+{
+	UT_ASSERT(AmCheckpointerProcess() && lock_holds == 0);
+	UT_ASSERT_EQ(budget, 128);
+	checkpoint_retire_calls++;
+	memset(out, 0, sizeof(*out));
+	if (checkpoint_retire_remaining != 0) {
+		out->examined_count = 1;
+		out->complete_wrap = --checkpoint_retire_remaining == 0;
+		out->retired_count = out->complete_wrap;
+		if (out->complete_wrap)
+			module_results[4] = CLUSTER_NORMAL_STOP_READY;
+	}
+	return true;
+}
+void
+cluster_ko_peer_apply_error_v3(int code)
+{
+	UT_ASSERT(code != 0);
+}
+int geterrcode(void) { return ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE; }
 
 /* The extracted LMS loop retains its control-owner scheduling edge. Its
  * registry/transport implementation is exercised by the control-owner tests. */
@@ -363,6 +418,16 @@ ClusterNormalStopPollResult
 cluster_bufmgr_normal_stop_local_checkpoint_poll(BufferTag *tag, int *buffer, const char **reason)
 {
 	return cluster_bufmgr_normal_stop_poll(false, tag, buffer, reason);
+}
+
+ClusterNormalStopPollResult
+cluster_bufmgr_normal_stop_observed(bool post, bool require_pi_retired, BufferTag *tag,
+	int *buffer, const char **reason, ClusterBufferStopObservation *observation)
+{
+	memset(observation, 0, sizeof(*observation));
+	return post && !require_pi_retired
+		? cluster_bufmgr_normal_stop_local_checkpoint_poll(tag, buffer, reason)
+		: cluster_bufmgr_normal_stop_poll(post, tag, buffer, reason);
 }
 
 ClusterNormalStopPollResult
@@ -1025,6 +1090,8 @@ UT_TEST(test_service_lmd_participation_is_frozen_not_live_pid_dependent)
 static UndoCleanerSharedState cleaner_region;
 static UndoCleanerSharedState *undo_cleaner_state = &cleaner_region;
 static int undo_cleaner_worker = -1;
+static ClusterCtrcActiveScan undo_cleaner_active_scan;
+static bool undo_cleaner_active_scan_pending;
 static pg_on_exit_callback exit_callback;
 static sigjmp_buf main_exit;
 static unsigned main_passes, main_waits, main_bindings;
@@ -1033,6 +1100,9 @@ static bool main_early_shutdown, main_pass_failure;
 static bool main_progress;
 static bool main_drain_probe, main_probe_without_stop, main_probe_floor_retry;
 static long main_observed_timeout;
+static bool main_census_probe, main_census_latch;
+static bool main_census_maintenance_due[2];
+static long main_census_timeouts[2];
 static bool sinval_main_test;
 static bool lms_main_test;
 static int test_lms_wait(void);
@@ -1169,6 +1239,19 @@ int
 WaitLatch(Latch *latch pg_attribute_unused(), int events, long timeout pg_attribute_unused(),
 		  uint32 event pg_attribute_unused())
 {
+	if (main_census_probe) {
+		UT_ASSERT_EQ(lock_holds, 0);
+		UT_ASSERT(!modifier_held);
+		UT_ASSERT_EQ(main_passes, main_waits + 1);
+		UT_ASSERT_EQ((events & WL_TIMEOUT) != 0, timeout > 0);
+		if (main_waits >= lengthof(main_census_timeouts))
+			abort();
+		main_census_timeouts[main_waits++] = timeout;
+		if (main_waits == 2)
+			siglongjmp(main_exit, 1);
+		fixture_now += timeout * 1000;
+		return main_census_latch ? WL_LATCH_SET : WL_TIMEOUT;
+	}
 	if (main_drain_probe) {
 		UT_ASSERT_EQ(lock_holds, 0);
 		UT_ASSERT(!modifier_held);
@@ -1271,10 +1354,21 @@ undo_cleaner_shutdown_requested(void)
 }
 
 static bool
-undo_cleaner_run_pass(bool *work_remaining)
+undo_cleaner_run_pass(bool *work_remaining, bool maintenance_due)
 {
 	modifier_held = true;
 	main_passes++;
+	if (main_census_probe) {
+		if (main_passes > lengthof(main_census_maintenance_due))
+			abort();
+		main_census_maintenance_due[main_passes - 1] = maintenance_due;
+		undo_cleaner_active_scan_pending = main_passes == 1;
+		undo_cleaner_active_scan.status
+			= main_passes == 1 ? CTRC_ACTIVE_SCAN_INCOMPLETE : CTRC_ACTIVE_SCAN_COMPLETE;
+		modifier_held = false;
+		*work_remaining = false;
+		return false;
+	}
 	if (main_drain_probe) {
 		/* A terminal sample can still refuse after a wakeup; the original
 		 * owner must get another pass, without signing park or completion. */
@@ -1310,7 +1404,8 @@ run_actual_cleaner_main(unsigned worker, bool request_before, bool progress, boo
 {
 	sinval_main_test = false;
 	seed_drain_boundary();
-	if (main_drain_probe && main_probe_without_stop)
+	undo_cleaner_active_scan_pending = false;
+	if ((main_drain_probe && main_probe_without_stop) || main_census_probe)
 		pg_atomic_write_u32(&cl_normal_stop->requested, 0);
 	MyAuxProcType = ClusterUndoCleanerTypeForWorker(worker);
 	if (request_before) {
@@ -1401,6 +1496,30 @@ UT_TEST(test_actual_cleaner_without_stop_preserves_idle_cadence)
 		UT_ASSERT_EQ(main_waits, 1);
 	}
 	main_drain_probe = main_probe_without_stop = false;
+	cluster_undo_cleaner_interval_ms = saved_interval;
+}
+
+UT_TEST(test_actual_cleaner_census_wakes_keep_original_maintenance_deadline)
+{
+	static const int intervals[] = { 0, 1000, 5, 1000 };
+	static const long second_waits[] = { -1, 990, 5, 1000 };
+	int saved_interval = cluster_undo_cleaner_interval_ms;
+
+	main_census_probe = true;
+	for (unsigned i = 0; i < lengthof(intervals); i++) {
+		cluster_undo_cleaner_interval_ms = intervals[i];
+		main_census_latch = i == 3;
+		run_actual_cleaner_main(0, false, false, false, false);
+		UT_ASSERT_EQ(main_passes, 2);
+		UT_ASSERT_EQ(main_waits, 2);
+		UT_ASSERT(main_census_maintenance_due[0]);
+		UT_ASSERT_EQ(main_census_maintenance_due[1], intervals[i] == 5 || main_census_latch);
+		UT_ASSERT_EQ(main_census_timeouts[0], intervals[i] == 5 ? 5 : 10);
+		UT_ASSERT_EQ(main_census_timeouts[1], second_waits[i]);
+		UT_ASSERT_EQ(cleaner_region.workers[0].active_census.status, CTRC_ACTIVE_SCAN_COMPLETE);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->cleaner_quiesced_mask), 0);
+	}
+	main_census_probe = main_census_latch = false;
 	cluster_undo_cleaner_interval_ms = saved_interval;
 }
 
@@ -4811,6 +4930,88 @@ start_checkpoint_wait(void (*action)(void))
 	checkpoint_previous_timeout = LONG_MAX;
 	InterruptPending = false;
 }
+static void
+checkpoint_original_owner_wait(void)
+{
+	uint32 phase = pg_atomic_read_u32(&cl_normal_stop->phase);
+	if (checkpoint_waits > 6 || checkpoint_native_failed)
+		checkpoint_expire_wait();
+	else if (checkpoint_native_remaining != 0 || checkpoint_retire_remaining != 0)
+		return; /* Original CP owners must finish before the parked actor fixture. */
+	else if (phase == CLUSTER_NORMAL_STOP_QUIESCE || phase == CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK)
+		checkpoint_pre_wait();
+	if (checkpoint_native_remaining != 0)
+		module_results[9] = CLUSTER_NORMAL_STOP_PENDING;
+	if (checkpoint_retire_remaining != 0)
+		module_results[4] = CLUSTER_NORMAL_STOP_PENDING;
+}
+UT_TEST(test_actual_prepare_services_original_native_and_am03_with_same_deadline)
+{
+	ClusterPhase1FullStopPlan plan = {0};
+	uint64 deadline, nonce;
+	seed_module_drain();
+	idle_original_actors();
+	deadline = cl_state->barrier_deadline_us;
+	nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
+	checkpoint_native_calls = checkpoint_retire_calls = 0;
+	checkpoint_native_remaining = checkpoint_retire_remaining = 2;
+	module_results[9] = module_results[4] = CLUSTER_NORMAL_STOP_PENDING;
+	start_checkpoint_wait(checkpoint_original_owner_wait);
+	UT_ASSERT(cluster_normal_stop_checkpoint_prepare(&plan, NULL));
+	checkpoint_wait_action = NULL;
+	UT_ASSERT_EQ(checkpoint_native_remaining + checkpoint_retire_remaining, 0);
+	UT_ASSERT(checkpoint_native_calls >= 2 && checkpoint_retire_calls >= 2);
+	UT_ASSERT_EQ(plan.absolute_deadline_us, deadline);
+	UT_ASSERT_EQ(plan.attempt_nonce, nonce);
+	checkpoint_native_remaining = checkpoint_retire_remaining = 0;
+}
+
+UT_TEST(test_actual_prepare_keeps_failed_native_work_and_rejects_stop)
+{
+	ClusterPhase1FullStopPlan plan = {0};
+	ClusterNormalStopModuleObservation observed;
+	seed_module_drain();
+	idle_original_actors();
+	checkpoint_native_remaining = 2;
+	checkpoint_native_fail = true;
+	start_checkpoint_wait(checkpoint_original_owner_wait);
+	UT_ASSERT(!cluster_normal_stop_checkpoint_prepare(&plan, &observed));
+	UT_ASSERT_EQ(checkpoint_native_remaining, 2);
+	UT_ASSERT(checkpoint_native_failed);
+	UT_ASSERT(cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE);
+	checkpoint_wait_action = NULL;
+	checkpoint_native_fail = checkpoint_native_failed = false;
+	checkpoint_native_remaining = 0;
+}
+
+UT_TEST(test_actual_prepare_does_not_start_owner_work_after_original_deadline)
+{
+	ClusterPhase1FullStopPlan plan = {0};
+	seed_module_drain();
+	idle_original_actors();
+	checkpoint_native_remaining = 1;
+	checkpoint_native_calls = checkpoint_retire_calls = 0;
+	fixture_now = cl_state->barrier_deadline_us;
+	UT_ASSERT(!cluster_normal_stop_checkpoint_prepare(&plan, NULL));
+	UT_ASSERT_EQ(checkpoint_native_calls + checkpoint_retire_calls, 0);
+	UT_ASSERT_EQ(checkpoint_native_remaining, 1);
+	checkpoint_native_remaining = 0;
+}
+
+UT_TEST(test_actual_prepare_never_starts_native_work_after_producer_seal)
+{
+	ClusterPhase1FullStopPlan plan = {0};
+	seed_module_drain();
+	idle_original_actors();
+	checkpoint_native_remaining = 1;
+	checkpoint_native_calls = checkpoint_retire_calls = 0;
+	pg_atomic_write_u32(&cl_normal_stop->service_seal, 1);
+	UT_ASSERT(!cluster_normal_stop_checkpoint_prepare(&plan, NULL));
+	UT_ASSERT_EQ(checkpoint_native_calls + checkpoint_retire_calls, 0);
+	UT_ASSERT_EQ(checkpoint_native_remaining, 1);
+	checkpoint_native_remaining = 0;
+}
+
 UT_TEST(test_actual_prepare_wait_drives_original_quiesce_and_ack)
 {
 	ClusterPhase1FullStopPlan plan = { 0 };
@@ -4832,6 +5033,7 @@ UT_TEST(test_actual_complete_wait_drives_original_post_stop_and_release)
 {
 	ClusterPhase1FullStopPlan plan;
 	uint64 deadline, nonce;
+	unsigned native_before = checkpoint_native_calls, retire_before = checkpoint_retire_calls;
 	seed_at_checkpoint(&plan);
 	deadline = plan.absolute_deadline_us;
 	nonce = plan.attempt_nonce;
@@ -4843,6 +5045,8 @@ UT_TEST(test_actual_complete_wait_drives_original_post_stop_and_release)
 	UT_ASSERT_EQ(plan.absolute_deadline_us, deadline);
 	UT_ASSERT(plan.attempt_nonce != nonce);
 	UT_ASSERT(cluster_normal_stop_protocol_closed());
+	UT_ASSERT_EQ(checkpoint_native_calls, native_before);
+	UT_ASSERT_EQ(checkpoint_retire_calls, retire_before);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->qvotec_clear_result), 0);
 }
 UT_TEST(test_completed_checkpoint_gets_once_only_post_budget)
@@ -6213,6 +6417,51 @@ UT_TEST(test_precheckpoint_wait_drives_its_own_cf_retirement)
 	checkpoint_cf_retirement_pending = 0;
 }
 
+UT_TEST(test_original_continuation_gate_ends_at_seal_or_original_deadline)
+{
+ for (unsigned mutation=0;mutation<6;mutation++) {
+  seed_module_drain();
+  UT_ASSERT(cluster_normal_stop_continuation_allowed());
+  switch(mutation) {
+   case 0: pg_atomic_write_u32(&cl_normal_stop->service_seal,1); break;
+   case 1: fixture_now=cl_state->barrier_deadline_us; break;
+   case 2: pg_atomic_write_u32(&cl_normal_stop->identity_published,0); break;
+   case 3: pg_atomic_write_u32(&cl_normal_stop->phase,CLUSTER_NORMAL_STOP_CHECKPOINT); break;
+   case 4: cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_SERVICE); break;
+   case 5: pg_atomic_write_u32(&cl_normal_stop->phase,CLUSTER_NORMAL_STOP_IDLE); break;
+  }
+  UT_ASSERT(!cluster_normal_stop_continuation_allowed());
+ }
+ reset_identity();
+ UT_ASSERT(cluster_normal_stop_continuation_allowed());
+}
+
+UT_TEST(test_pre_front_buffer_observation_never_advances_cut)
+{
+	uint32 phase;
+
+	reset_identity();
+	front_local_postmaster_cut(false);
+	phase = pg_atomic_read_u32(&cl_normal_stop->phase);
+	MyAuxProcType = CheckpointerProcess;
+	cluster_trace_cleanup = false;
+	cl_normal_stop_trace_pre_front_buffer();
+	UT_ASSERT_EQ(module_calls[9], 0);
+	cluster_trace_cleanup = true;
+	cl_normal_stop_trace_pre_front_buffer();
+	UT_ASSERT_EQ(module_calls[9], 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), phase);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->frontends_gone), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_idle_mask), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_seal), 0);
+	CritSectionCount = 1;
+	fixture_now += 2000000;
+	cl_normal_stop_trace_pre_front_buffer();
+	UT_ASSERT_EQ(module_calls[9], 1);
+	CritSectionCount = 0;
+	cluster_trace_cleanup = false;
+}
+
 int
 main(void)
 {
@@ -6222,12 +6471,19 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(156);
+	UT_PLAN(163);
+	UT_RUN(test_pre_front_buffer_observation_never_advances_cut);
+	UT_RUN(test_original_continuation_gate_ends_at_seal_or_original_deadline);
+	UT_RUN(test_actual_prepare_never_starts_native_work_after_producer_seal);
+	UT_RUN(test_actual_prepare_does_not_start_owner_work_after_original_deadline);
+	UT_RUN(test_actual_prepare_keeps_failed_native_work_and_rejects_stop);
+	UT_RUN(test_actual_prepare_services_original_native_and_am03_with_same_deadline);
 	UT_RUN(test_tail_timer_never_consumes_stopped_or_early_peer_acks);
 	UT_RUN(test_post_arm_cannot_start_or_reset_the_checkpoint_tail);
 	UT_RUN(test_precheckpoint_wait_drives_its_own_cf_retirement);
 	UT_RUN(test_actual_cleaner_pending_stop_retries_before_recycle_interval);
 	UT_RUN(test_actual_cleaner_without_stop_preserves_idle_cadence);
+	UT_RUN(test_actual_cleaner_census_wakes_keep_original_maintenance_deadline);
 	UT_RUN(test_pre2_stop_clean_restart_binds_current_epoch_and_original_record);
 	UT_RUN(test_pre2_stop_refuses_unqualified_or_changed_current_epoch);
 	UT_RUN(test_clean_restart_terminal_receipt_uses_saved_current_epoch_without_recursion);

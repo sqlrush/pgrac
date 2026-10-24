@@ -81,6 +81,53 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+/* Backend-local observations of the ordinary undo TT-header CR fetch.
+ * request_enqueues counts accepted logical requests; matched_replies counts
+ * replies observed in the exact outstanding slot, including DENIED/corrupt
+ * replies. sync_exchanges counts admitted request/reply legs, even when they
+ * time out or raise ERROR. Local queue-FULL retries count none of these.
+ * These are not physical-transmission/retransmit counters or a whole current
+ * transfer budget. They grant no authority and change no waiting policy. */
+typedef struct ClusterGcsUndoHeaderPathCounters {
+	uint64 calls;
+	uint64 request_enqueues;
+	uint64 matched_replies;
+	uint64 sync_exchanges;
+	uint64 successful_fetches;
+} ClusterGcsUndoHeaderPathCounters;
+
+/* Only these diagnostic counters are reset; no memo/cache or shared state. */
+extern void cluster_gcs_block_undo_header_counters_reset(void);
+extern void cluster_gcs_block_undo_header_counters_snapshot(ClusterGcsUndoHeaderPathCounters *out);
+
+/* The same logical accounting for the existing shared verdict transport.
+ * calls counts entries into the valid exchange core. verified_replies means
+ * status/trailer/checksum passed there, NOT that the wrapper accepted the
+ * identity, epoch or verdict as terminal proof. A wrapper refusal still
+ * incurred the exchange. The R4 member documents its later decode/identity
+ * acceptance point below. Other fields use the header-counter rules above. */
+typedef struct ClusterGcsUndoVerdictExchangeCounters {
+	uint64 calls;
+	uint64 request_enqueues;
+	uint64 matched_replies;
+	uint64 sync_exchanges;
+	uint64 verified_replies;
+} ClusterGcsUndoVerdictExchangeCounters;
+
+typedef struct ClusterGcsUndoVerdictPathCounters {
+	ClusterGcsUndoVerdictExchangeCounters owner_verdict;
+	ClusterGcsUndoVerdictExchangeCounters freshref_c1b_pair;
+	ClusterGcsUndoVerdictExchangeCounters authority_verdict;
+	/* R4 exact-origin requester: verified means the decoded locator and
+	 * formation epoch passed acceptance, not terminal/FullXid proof. */
+	ClusterGcsUndoVerdictExchangeCounters r4_tx_resolve;
+} ClusterGcsUndoVerdictPathCounters;
+
+/* Backend-local diagnostics only; independent of the header observations. */
+extern void cluster_gcs_block_undo_verdict_counters_reset(void);
+extern void
+cluster_gcs_block_undo_verdict_counters_snapshot(ClusterGcsUndoVerdictPathCounters *out);
+
 /* One bounded, local requester-delivery callback on the existing LMS loop.
  * No wire ownership or foreground success is implied by this result. */
 extern ResourceXApplyResult

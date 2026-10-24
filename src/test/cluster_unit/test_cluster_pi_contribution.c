@@ -4,6 +4,10 @@ int side_xact_fixture_main(void);
 #define main side_xact_fixture_main
 #include "test_cluster_side_xact.c"
 #undef main
+#include "pgstat.h"
+#include "utils/syscache.h"
+
+#include "test_cluster_side_xact_effects.inc"
 
 /* Insert the native counted array before invalidations/SCN/TT/typed drops. */
 static Size
@@ -32,6 +36,7 @@ pi_commit_add_stats(FakeXactRecord *fake, const xl_xact_stats_item *items, int c
 	fake->u.decoded.main_data_len += extra;
 	return offset;
 }
+
 
 static void
 pi_commit(FakeXactRecord *fake, uint32 flags, const SharedInvalidationMessage *messages, int count)
@@ -495,6 +500,8 @@ UT_TEST(test_pi_commit_keeps_all_drop_locators_and_exact_namespace)
 	}
 }
 
+
+
 UT_TEST(test_pi_relation_stats_keep_complete_payload_without_execution)
 {
 	for (int variant = 0; variant < 3; variant++) {
@@ -554,6 +561,7 @@ UT_TEST(test_pi_relation_stats_keep_complete_payload_without_execution)
 	}
 }
 
+
 UT_TEST(test_pi_relation_stats_check_every_item_and_original_scope)
 {
 	for (int variant = 0; variant < 12; variant++) {
@@ -599,6 +607,7 @@ UT_TEST(test_pi_relation_stats_check_every_item_and_original_scope)
 	}
 }
 
+
 UT_TEST(test_cold_completion_and_pi_stats_keep_separate_child_and_kind_contracts)
 {
 	for (int children = 0; children < 2; children++)
@@ -636,10 +645,387 @@ UT_TEST(test_cold_completion_and_pi_stats_keep_separate_child_and_kind_contracts
 		}
 }
 
+
+UT_TEST(test_pi_ko_commit_marker_preserves_owner_without_execution)
+{
+	for (int variant = 0; variant < 5; variant++) {
+		SharedInvalidationMessage msg = { 0 };
+		FakeXactRecord fake;
+		RfPageOnlineRecordIdentityV1 identity;
+		RfDetachedRecordPlanV1 record;
+		RfSideOnlinePlanV1 *plan;
+		RfSideOnlineOperationV1 op;
+		RfSideContributionOwnersV1 owners;
+		RfPageProofDetailV1 detail;
+
+		msg.ko.id = SHAREDINVALKO_COMMIT_ID;
+		msg.ko.version = SHAREDINVALKO_COMMIT_VERSION;
+		msg.ko.batch_lo = 17;
+		if (variant == 1) msg.ko.version++;
+		if (variant == 2) msg.ko.flags = 1;
+		if (variant == 3) msg.ko.reserved = 1;
+		if (variant == 4) msg.ko.batch_lo = 0;
+		pi_commit(&fake, XACT_COMPLETION_FORCE_SYNC_COMMIT, &msg, 1);
+		identity = pi_identity(&fake);
+		record = make_record_plan(&fake);
+		plan = pi_side_plan(&identity, true);
+		detail = rf_side_online_plan_feed_record_v1(plan, &record, &identity);
+		if (variant != 0)
+			UT_ASSERT_NE(detail, RF_PAGE_PROOF_DETAIL_OK);
+		else {
+			UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_OK);
+			if (detail == RF_PAGE_PROOF_DETAIL_OK) {
+				UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+				UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &op));
+				UT_ASSERT(op.xact.pi_read_only);
+				UT_ASSERT_EQ(op.xact.invalidation_count, 1);
+				UT_ASSERT_EQ(op.owned_payload_length, fake.u.decoded.main_data_len);
+				UT_ASSERT(memcmp(op.owned_payload, fake.data, op.owned_payload_length) == 0);
+				UT_ASSERT(rf_side_online_plan_contribution_owners_v1(plan, 0, &owners));
+				UT_ASSERT((owners.owners & RF_SIDE_CONTRIBUTION_INVALIDATION) != 0);
+				UT_ASSERT_EQ(rf_side_xact_apply_owned_v1(&op.xact, op.owned_payload,
+													   op.owned_payload_length), RF_SIDE_XACT_APPLY_BLOCKED);
+			}
+		}
+		/* A recovery plan can select its original cold completion owner.
+		 * Only the strict decoder is required to reject unowned effects. */
+		{
+			RfSideXactOperationV1 strict;
+
+			UT_ASSERT(!rf_side_xact_decode_v1(&fake.reader, identity.record.system_identifier,
+				identity.record.origin_thread, &strict));
+		}
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+
+UT_TEST(test_pi_relation_stats_keeps_native_owner_without_execution)
+{
+	for (int variant = 0; variant < 3; variant++) {
+		/* Logical relation OIDs need not name any physical locator in the WAL. */
+		xl_xact_stats_item items[2] = {
+			{ PGSTAT_KIND_RELATION, 5, 76543 }, { PGSTAT_KIND_RELATION, InvalidOid, 1260 }
+		};
+		FakeXactRecord fake;
+		RfPageOnlineRecordIdentityV1 identity;
+		RfDetachedRecordPlanV1 record;
+		RfSideOnlinePlanV1 *plan;
+		RfSideOnlineOperationV1 op;
+		RfSideContributionOwnersV1 owners;
+		RfPageProofDetailV1 detail;
+		RfSideOnlineApplyOpsV1 ops = { 0 };
+		ApplyCapture capture = { 0 };
+
+		if (variant == 2) {
+			make_commit(&fake, 801, 901, 123456, false);
+			items[0].dboid = InvalidOid;
+		} else
+			pi_commit(&fake, variant == 1 ? XACT_COMPLETION_FORCE_SYNC_COMMIT : 0, NULL, 0);
+		pi_commit_add_stats(&fake, items, lengthof(items));
+		identity = pi_identity(&fake);
+		record = make_record_plan(&fake);
+		plan = pi_side_plan(&identity, true);
+		detail = rf_side_online_plan_feed_record_v1(plan, &record, &identity);
+		UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_OK);
+		if (detail == RF_PAGE_PROOF_DETAIL_OK) {
+			UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &op));
+			UT_ASSERT(op.xact.pi_read_only);
+			UT_ASSERT_EQ(op.owned_payload_length, fake.u.decoded.main_data_len);
+			UT_ASSERT(memcmp(op.owned_payload, fake.data, op.owned_payload_length) == 0);
+			UT_ASSERT(rf_side_online_plan_contribution_owners_v1(plan, 0, &owners));
+			UT_ASSERT_EQ(owners.owners, RF_SIDE_CONTRIBUTION_UNDO_HEADER
+						 | RF_SIDE_CONTRIBUTION_TERMINAL | RF_SIDE_CONTRIBUTION_COMPLETION);
+			UT_ASSERT_EQ(rf_side_online_plan_space_contribution_count_v1(plan, 0), 0);
+			UT_ASSERT_EQ(rf_side_xact_apply_owned_v1(&op.xact, op.owned_payload,
+												   op.owned_payload_length), RF_SIDE_XACT_APPLY_BLOCKED);
+			ops.arg = &capture;
+			ops.begin_protected_set = capture_begin;
+			ops.end_protected_set = capture_end;
+			ops.preflight_xact = accept_preflight;
+			ops.apply_xact = capture_apply;
+			UT_ASSERT_NE(rf_side_online_plan_preflight_v1(plan, &ops), RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT_NE(rf_side_online_plan_apply_v1(plan, &ops), RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT_EQ(capture.begin_count, 0);
+			UT_ASSERT_EQ(capture.count, 0);
+			UT_ASSERT(!capture.end_complete);
+		}
+		/* A recovery plan can select its original cold completion owner.
+		 * Only the strict decoder is required to reject unowned effects. */
+		{
+			RfSideXactOperationV1 strict;
+
+			UT_ASSERT(!rf_side_xact_decode_v1(&fake.reader, identity.record.system_identifier,
+				identity.record.origin_thread, &strict));
+		}
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+
+UT_TEST(test_pi_relation_stats_checks_every_item_and_bounded_scope)
+{
+	for (int variant = 0; variant < 10; variant++) {
+		xl_xact_stats_item items[2] = {
+			{ PGSTAT_KIND_RELATION, 5, 76543 }, { PGSTAT_KIND_RELATION, 5, 76544 }
+		};
+		FakeXactRecord fake;
+		RfPageOnlineRecordIdentityV1 identity;
+		RfDetachedRecordPlanV1 record;
+		RfSideOnlinePlanV1 *plan;
+		Size offset;
+		int count;
+		Oid database = InvalidOid;
+
+		if (variant == 0) items[1].kind = PGSTAT_KIND_DATABASE;
+		if (variant == 1) items[1].kind = -1;
+		if (variant == 2) items[1].objoid = InvalidOid;
+		if (variant == 3) items[1].dboid = 6;
+		if (variant == 4)
+			make_commit(&fake, 801, 901, 123456, false);
+		else
+			pi_commit(&fake, 0, NULL, 0);
+		if (variant == 5)
+			memcpy(fake.data + MinSizeOfXactCommit + sizeof(xl_xact_xinfo),
+				   &database, sizeof(database));
+		offset = pi_commit_add_stats(&fake, items, lengthof(items));
+		if (variant == 6 || variant == 7) {
+			count = variant == 6 ? -1 : INT_MAX;
+			memcpy(fake.data + offset, &count, sizeof(count));
+		}
+		if (variant == 8)
+			fake.u.decoded.main_data_len = offset + sizeof(count) + sizeof(items) - 1;
+		if (variant == 9)
+			fake.data[fake.u.decoded.main_data_len++] = 0;
+		identity = pi_identity(&fake);
+		record = make_record_plan(&fake);
+		plan = pi_side_plan(&identity, true);
+		UT_ASSERT_NE(rf_side_online_plan_feed_record_v1(plan, &record, &identity), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_NE(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+
+UT_TEST(test_pi_relation_stats_preserves_other_commit_effect_checks)
+{
+	for (int variant = 0; variant < 5; variant++) {
+		xl_xact_stats_item item = { PGSTAT_KIND_RELATION, 5, 76543 };
+		SharedInvalidationMessage msg = { 0 };
+		FakeXactRecord fake;
+		RfPageOnlineRecordIdentityV1 identity;
+		RfDetachedRecordPlanV1 record;
+		RfSideOnlinePlanV1 *plan;
+		RfPageProofDetailV1 detail;
+
+		msg.ko.id = SHAREDINVALKO_COMMIT_ID;
+		msg.ko.version = SHAREDINVALKO_COMMIT_VERSION;
+		msg.ko.batch_lo = 17;
+		if (variant == 1) msg.ko.version++;
+		if (variant == 2) msg.id = -99;
+		pi_commit(&fake, XACT_COMPLETION_FORCE_SYNC_COMMIT | XACT_XINFO_HAS_AE_LOCKS, &msg, 1);
+		pi_commit_add_stats(&fake, &item, 1);
+		if (variant == 3) fake.u.decoded.header.xl_xid++;
+		identity = pi_identity(&fake);
+		if (variant == 4) identity.record.origin_thread = 2;
+		record = make_record_plan(&fake);
+		plan = pi_side_plan(&identity, true);
+		detail = rf_side_online_plan_feed_record_v1(plan, &record, &identity);
+		if (variant != 0)
+			UT_ASSERT_NE(detail, RF_PAGE_PROOF_DETAIL_OK);
+		else {
+			RfSideOnlineOperationV1 op;
+			RfSideContributionOwnersV1 owners;
+			UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_OK);
+			if (detail == RF_PAGE_PROOF_DETAIL_OK) {
+				UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+				UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &op));
+				UT_ASSERT_EQ(op.xact.invalidation_count, 1);
+				UT_ASSERT_EQ(op.owned_payload_length, fake.u.decoded.main_data_len);
+				UT_ASSERT(memcmp(op.owned_payload, fake.data, op.owned_payload_length) == 0);
+				UT_ASSERT(rf_side_online_plan_contribution_owners_v1(plan, 0, &owners));
+				UT_ASSERT((owners.owners & RF_SIDE_CONTRIBUTION_INVALIDATION) != 0);
+				UT_ASSERT((owners.owners & RF_SIDE_CONTRIBUTION_COMPLETION) != 0);
+			}
+		}
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+
+UT_TEST(test_pi_and_cold_effects_keep_distinct_stats_and_children_contracts)
+{
+	for (int cold = 0; cold < 2; cold++) {
+		for (int variant = 0; variant < 9; variant++) {
+			xl_xact_stats_item items[2] = {
+				{ PGSTAT_KIND_RELATION, 5, 76543 }, { PGSTAT_KIND_RELATION, InvalidOid, 1260 }
+			};
+			xl_xact_parsed_commit parsed = {0};
+			RfSideXactOperationV1 out = {0};
+			bool expected = true;
+
+			parsed.xinfo = XACT_XINFO_HAS_DBINFO;
+			parsed.dbId = 5;
+			parsed.nstats = 2;
+			parsed.stats = items;
+			switch (variant) {
+			case 0: break;
+			case 1: parsed.nsubxacts = 1; expected = cold; break;
+			case 2: items[0].kind = PGSTAT_KIND_FUNCTION; expected = cold; break;
+			case 3: parsed.nsubxacts = 2; items[0].kind = PGSTAT_KIND_FUNCTION; expected = cold; break;
+			case 4: items[0].kind = PGSTAT_KIND_FUNCTION; items[0].dboid = InvalidOid; expected = false; break;
+			case 5: items[0].kind = PGSTAT_KIND_DATABASE; expected = false; break;
+			case 6: items[1].objoid = InvalidOid; expected = false; break;
+			case 7: items[1].dboid = 6; expected = false; break;
+			case 8: parsed.xinfo = 0; expected = cold; break;
+			}
+			/* A cold caller still owes its original bounded child-list and
+			 * execution preflight; this is only the shared effects predicate. */
+			UT_ASSERT_EQ(side_xact_pi_effects_valid(&parsed, UINT64_C(0x11223344), cold, &out), expected);
+		}
+	}
+}
+
+
+UT_TEST(test_cold_effects_reject_unsupported_stats_without_changing_owner)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		xl_xact_stats_item item = { PGSTAT_KIND_FUNCTION, 5, 99 };
+		xl_xact_parsed_commit parsed = {0};
+		RfSideXactOperationV1 out = {0};
+
+		parsed.xinfo = XACT_XINFO_HAS_DBINFO;
+		parsed.dbId = 5;
+		parsed.nstats = 1;
+		parsed.stats = &item;
+		switch (variant) {
+		case 0: item.dboid = InvalidOid; break;
+		case 1: item.objoid = InvalidOid; break;
+		case 2: item.kind = PGSTAT_KIND_ARCHIVER; break;
+		case 3: item.kind = PGSTAT_KIND_SUBSCRIPTION; break;
+		}
+		UT_ASSERT(!side_xact_pi_effects_valid(&parsed, UINT64_C(0x11223344), true, &out));
+		UT_ASSERT_EQ(out.kind, 0);
+	}
+}
+
+
+UT_TEST(test_effect_modes_preserve_origin_physical_and_invalidation_checks)
+{
+	for (int cold = 0; cold < 2; cold++) {
+		for (int variant = 0; variant < 7; variant++) {
+			xl_xact_parsed_commit parsed = {0};
+			SharedInvalidationMessage msg = {0};
+			RfSideXactOperationV1 out = {0};
+			bool expected = false;
+
+			parsed.xinfo = XACT_XINFO_HAS_DBINFO;
+			parsed.dbId = 5; parsed.tsId = DEFAULTTABLESPACE_OID;
+			switch (variant) {
+			case 0: parsed.xinfo |= XACT_XINFO_HAS_ORIGIN; break;
+			case 1: parsed.nrels = 1; break;
+			case 2: parsed.nrels = 1; parsed.nspace_drops = 1; break;
+			case 3: parsed.nmsgs = 1; parsed.msgs = &msg; msg.cc.id = 0; msg.cc.dbId = 6; break;
+			case 4: parsed.nmsgs = 1; parsed.msgs = &msg; msg.cc.id = SHAREDINVALSMGR_ID; break;
+			case 5: parsed.nmsgs = 1; parsed.msgs = &msg; parsed.xinfo = 0; break;
+			case 6: parsed.nmsgs = 1; parsed.msgs = &msg; msg.cc.id = 0; msg.cc.dbId = 5; expected = true; break;
+			}
+			UT_ASSERT_EQ(side_xact_pi_effects_valid(&parsed, UINT64_C(0x11223344), cold, &out), expected);
+			if (expected) {
+				UT_ASSERT_EQ(out.invalidation_count, 1);
+				UT_ASSERT_EQ(out.invalidation_kinds, 1);
+			}
+		}
+	}
+}
+
+
+UT_TEST(test_live_pi_entry_never_selects_cold_children_or_function_stats)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		xl_xact_stats_item item = { variant & 1 ? PGSTAT_KIND_FUNCTION : PGSTAT_KIND_RELATION, 5, 76543 };
+		FakeXactRecord fake;
+		RfPageOnlineRecordIdentityV1 identity;
+		RfSideXactOperationV1 operation;
+
+		pi_commit(&fake, 0, NULL, 0);
+		pi_commit_add_stats(&fake, &item, 1);
+		if (variant & 2) {
+			uint32 xinfo;
+			int count = 1;
+			TransactionId child = 802;
+			Size offset = MinSizeOfXactCommit + sizeof(xl_xact_xinfo) + sizeof(xl_xact_dbinfo);
+			Size extra = sizeof(count) + sizeof(child);
+
+			memcpy(&xinfo, fake.data + MinSizeOfXactCommit, sizeof(xinfo));
+			UT_ASSERT(fake.u.decoded.main_data_len + extra <= sizeof(fake.data));
+			memmove(fake.data + offset + extra, fake.data + offset, fake.u.decoded.main_data_len - offset);
+			memcpy(fake.data + offset, &count, sizeof(count));
+			memcpy(fake.data + offset + sizeof(count), &child, sizeof(child));
+			xinfo |= XACT_XINFO_HAS_SUBXACTS;
+			memcpy(fake.data + MinSizeOfXactCommit, &xinfo, sizeof(xinfo));
+			fake.u.decoded.main_data_len += extra;
+		}
+		identity = pi_identity(&fake);
+		UT_ASSERT_EQ(rf_side_xact_inspect_pi_v1(&fake.reader, identity.record.system_identifier,
+			identity.record.origin_thread, &operation), variant == 0);
+		if (variant == 0) UT_ASSERT(operation.pi_read_only);
+		else UT_ASSERT_EQ(operation.kind, 0);
+	}
+}
+
+
+UT_TEST(test_cold_effects_acceptance_does_not_qualify_strict_or_pi_execution)
+{
+	for (int variant = 0; variant < 3; variant++) {
+		SharedInvalidationMessage msg = {0};
+		xl_xact_stats_item item = {
+			variant == 2 ? PGSTAT_KIND_FUNCTION : PGSTAT_KIND_RELATION, 5, 76543
+		};
+		FakeXactRecord fake;
+		RfPageOnlineRecordIdentityV1 identity;
+		xl_xact_parsed_commit parsed;
+		RfSideXactOperationV1 cold = {0}, strict, pi;
+
+		msg.ko.id = SHAREDINVALKO_COMMIT_ID;
+		msg.ko.version = SHAREDINVALKO_COMMIT_VERSION;
+		msg.ko.batch_lo = 17;
+		pi_commit(&fake, 0, variant == 0 ? &msg : NULL, variant == 0 ? 1 : 0);
+		if (variant != 0)
+			pi_commit_add_stats(&fake, &item, 1);
+		identity = pi_identity(&fake);
+		UT_ASSERT(ParseCommitRecord(XLogRecGetInfo(&fake.reader),
+			(xl_xact_commit *)XLogRecGetData(&fake.reader), XLogRecGetDataLen(&fake.reader), &parsed));
+		/* This is the cold effects predicate, not its complete owner preflight. */
+		UT_ASSERT(side_xact_pi_effects_valid(&parsed, identity.record.system_identifier, true, &cold));
+		UT_ASSERT_EQ(cold.kind, 0);
+		UT_ASSERT(!rf_side_xact_decode_v1(&fake.reader, identity.record.system_identifier,
+			identity.record.origin_thread, &strict));
+		UT_ASSERT_EQ(rf_side_xact_inspect_pi_v1(&fake.reader, identity.record.system_identifier,
+			identity.record.origin_thread, &pi), variant != 2);
+		if (variant != 2) {
+			UT_ASSERT(pi.pi_read_only);
+			UT_ASSERT_EQ(rf_side_xact_apply_owned_v1(&pi, fake.data,
+				fake.u.decoded.main_data_len), RF_SIDE_XACT_APPLY_BLOCKED);
+		} else
+			UT_ASSERT_EQ(pi.kind, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(21);
+	UT_RUN(test_cold_effects_acceptance_does_not_qualify_strict_or_pi_execution);
+	UT_RUN(test_pi_relation_stats_keep_complete_payload_without_execution);
+	UT_RUN(test_pi_relation_stats_check_every_item_and_original_scope);
+	UT_RUN(test_cold_completion_and_pi_stats_keep_separate_child_and_kind_contracts);
+
+	UT_RUN(test_pi_and_cold_effects_keep_distinct_stats_and_children_contracts);
+	UT_RUN(test_cold_effects_reject_unsupported_stats_without_changing_owner);
+	UT_RUN(test_effect_modes_preserve_origin_physical_and_invalidation_checks);
+	UT_RUN(test_live_pi_entry_never_selects_cold_children_or_function_stats);
 	UT_RUN(test_pi_commit_keeps_complete_flags_and_invalidation_payload);
 	UT_RUN(test_pi_side_plan_rejects_execution_before_callbacks);
 	UT_RUN(test_pi_commit_unknown_or_damaged_effects_still_refuse);
@@ -649,9 +1035,10 @@ main(void)
 	UT_RUN(test_pi_ctrc_other_fields_still_refuse);
 	UT_RUN(test_pi_create_namespace_modifier_and_page_reuse_boundaries);
 	UT_RUN(test_pi_commit_keeps_all_drop_locators_and_exact_namespace);
-	UT_RUN(test_pi_relation_stats_keep_complete_payload_without_execution);
-	UT_RUN(test_pi_relation_stats_check_every_item_and_original_scope);
-	UT_RUN(test_cold_completion_and_pi_stats_keep_separate_child_and_kind_contracts);
+	UT_RUN(test_pi_ko_commit_marker_preserves_owner_without_execution);
+	UT_RUN(test_pi_relation_stats_keeps_native_owner_without_execution);
+	UT_RUN(test_pi_relation_stats_checks_every_item_and_bounded_scope);
+	UT_RUN(test_pi_relation_stats_preserves_other_commit_effect_checks);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

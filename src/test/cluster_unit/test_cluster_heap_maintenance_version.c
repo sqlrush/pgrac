@@ -28,15 +28,28 @@
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
+#include "access/xlogutils.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_control.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_heap_freeze.h"
+#include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_pcm_own.h"
+#include "cluster/cluster_ko.h"
+#include "cluster/cluster_ic.h"
+#include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_heap_horizon.h"
+#include "cluster/cluster_scn.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
+#include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "storage/buf_internals.h"
+#include "storage/standby.h"
 #include "utils/rel.h"
 #include "unit_test.h"
 #include "cluster/cluster_mode.h"
@@ -44,11 +57,16 @@
 #include "test_cluster_heap_maintenance_policy.inc"
 
 UT_DEFINE_GLOBALS();
+#include "test_cluster_heap_small_scn.inc"
+#include "test_cluster_vacuum_freeze_locators.inc"
 bool cluster_enabled = true, cluster_shared_config = true;
 int cluster_node_id = 0, wal_level = WAL_LEVEL_REPLICA, NBuffers = 1, NLocBuffer;
+static BufferDescPadded descriptors[1];
+BufferDescPadded *BufferDescriptors = descriptors;
 char *BufferBlocks;
 Block *LocalBufferBlockPointers;
 volatile uint32 CritSectionCount;
+HotStandbyState standbyState = STANDBY_DISABLED;
 bool cluster_recmerge_window_active, cluster_recmerge_apply_foreign;
 uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
 
@@ -59,9 +77,278 @@ static ClusterSpaceIdentity space_identity;
 static RfPageVersionEdgeEntryV1 edge;
 static uint64 next_token, edge_token;
 static unsigned inserts, edges, dirties, hints;
+static unsigned tx_checks, redo_dirties, redo_releases, freeze_data_calls;
+static int expected_nplans;
+static PGAlignedBlock freeze_main_data, freeze_block_data;
+static Size freeze_block_length;
 static uint8 expected_info;
 static bool begun, expecting_error, tx_committed;
+static bool redoing, redo_locked;
 static jmp_buf error_jump;
+static bool local_x, writer_current, route_current, authority_current, admission_current;
+static bool local_share, resume_allowed, resume_error, resumed_writer;
+static bool node_grant_current, object_current, error_after_local_lock, error_after_ledger_bind;
+static uint64 current_object_revision;
+static unsigned local_lock_attempts, local_unlocks;
+int cluster_interconnect_tier;
+static bool fixture_node_grant_matches(void);
+static unsigned conditional_resumes, conditional_unlocks;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+static int32 backend_pin_count;
+static unsigned pin_checks;
+static bool flush_error;
+static uint8 writer_state;
+static uint64 route_holder, route_master;
+static unsigned flushes;
+static unsigned writer_checks, route_checks, authority_checks, admission_checks;
+static SCN fixture_wal_clock, inserted_wal_clock;
+static unsigned wal_clock_reads;
+static bool full_target_current, target_recheck_error, revoke_target_census;
+static unsigned full_target_checks;
+static unsigned target_preflight_checks, census_preflight_checks;
+static bool preflight_target_error, preflight_revoke_census, allow_preflight_target;
+
+/* The real native apply reads this clock before mutation. WAL insertion's
+ * existing production xl_scn stamp uses the same clock; this leaf captures
+ * that value without simulating physical WAL insertion or persistence. */
+SCN
+cluster_scn_current(void)
+{
+	wal_clock_reads++;
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	UT_ASSERT_EQ(admission_checks, 1);
+	return fixture_wal_clock;
+}
+
+/* Only the process-local private refcount is a leaf double. Compile the
+ * actual pin reader as well as the native apply bodies below. */
+static int32
+GetPrivateRefCount(Buffer buffer)
+{
+	pin_checks++;
+	UT_ASSERT_EQ(buffer, 1);
+	return backend_pin_count;
+}
+#include "test_cluster_heap_borrowed_pin.inc"
+
+bool
+LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
+{
+	UT_ASSERT(lock == BufferDescriptorGetContentLock(GetBufferDescriptor(0)));
+	UT_ASSERT_EQ(mode, LW_EXCLUSIVE);
+	return local_x;
+}
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	UT_ASSERT(lock == BufferDescriptorGetContentLock(GetBufferDescriptor(0)));
+	return local_x || local_share;
+}
+
+static ResourceXWriterUseContext original_writer_context;
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	longjmp(error_jump, 1);
+}
+
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_snapshot(BufferDesc *buf, ClusterPcmOwnSnapshot *out)
+{
+	UT_ASSERT(buf == GetBufferDescriptor(0) && !local_x && backend_pin_count == 1);
+	if (resume_error)
+		ereport(ERROR, (errmsg("pre-lock snapshot ERROR fixture")));
+	memset(out, 0, sizeof(*out)); out->tag = buf->tag;
+	out->generation = original_writer_context.buffer_ownership_generation;
+	out->pcm_state = writer_state;
+	return node_grant_current ? CLUSTER_PCM_OWN_OK : CLUSTER_PCM_OWN_STALE;
+}
+
+bool
+cluster_ko_peer_delivery_begin_v3(RelFileLocator locator, uint64 *revision)
+{
+	UT_ASSERT(RelFileLocatorEquals(locator, relation_data.rd_locator));
+	UT_ASSERT(!local_x); *revision = current_object_revision;
+	return object_current;
+}
+
+bool
+cluster_ko_peer_delivery_current_v3(uint64 revision)
+{
+	return object_current && revision == current_object_revision;
+}
+
+bool
+ConditionalLockBuffer(Buffer buffer)
+{
+	UT_ASSERT_EQ(buffer, 1);
+	UT_ASSERT(backend_pin_count == 1 && !local_x && !local_share);
+	local_lock_attempts++; local_x = resume_allowed;
+	if (error_after_local_lock)
+		ereport(ERROR, (errmsg("post-local-lock ERROR fixture")));
+	return local_x;
+}
+
+void
+LWLockRelease(LWLock *lock)
+{
+	UT_ASSERT(lock == BufferDescriptorGetContentLock(GetBufferDescriptor(0)));
+	UT_ASSERT(local_x && backend_pin_count == 1);
+	local_unlocks++; local_x = resumed_writer = false;
+}
+
+bool
+cluster_bufmgr_terminal_stamp_authority(Buffer buffer, const BufferTag *tag,
+	uint64 *generation, uint64 *epoch, uint8 *state)
+{
+	writer_checks++;
+	UT_ASSERT_EQ(buffer, 1);
+	UT_ASSERT(RelFileLocatorEquals(BufTagGetRelFileLocator(tag), relation_data.rd_locator));
+	UT_ASSERT_EQ(tag->forkNum, MAIN_FORKNUM);
+	UT_ASSERT_EQ(tag->blockNum, 7);
+	UT_ASSERT(local_x);
+	*generation = 14;
+	*epoch = 15;
+	*state = writer_state;
+	if (error_after_ledger_bind)
+		ereport(ERROR, (errmsg("post-ledger-bind ERROR fixture")));
+	return writer_current && node_grant_current && fixture_node_grant_matches();
+}
+
+/* Compile the actual bufmgr ledger, pin-independent capture/match, original
+ * writer resumer and both paired cleanups into the same native WAL fixture.
+ * Only these API counters wrap the real functions; no authority is created. */
+static bool fixture_actual_resume(Buffer, const ResourceXWriterUseContext *, uint64, bool);
+static void fixture_actual_unlock(Buffer);
+#define ClusterConditionalLockBufferWithMutationContext fixture_actual_resume
+#define ClusterUnlockBufferAfterConditionalMutation fixture_actual_unlock
+#include "test_cluster_freeze_writer_context.inc"
+#undef ClusterUnlockBufferAfterConditionalMutation
+#undef ClusterConditionalLockBufferWithMutationContext
+
+static bool
+fixture_node_grant_matches(void)
+{
+	ClusterPcmXWriterLedgerEntry *e = cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0));
+	return e != NULL && e->phase == PCM_X_WRITER_LEDGER_ACTIVE
+		&& resource_x_assertion_equal(&e->authority.ref.assertion,
+			&original_writer_context.ref.assertion)
+		&& e->authority.ref.formation == original_writer_context.ref.formation
+		&& e->authority.ref.acquisition_generation == original_writer_context.ref.acquisition_generation
+		&& e->authority.r4_record_generation == original_writer_context.r4_record_generation
+		&& e->authority.buffer_ownership_generation == original_writer_context.buffer_ownership_generation;
+}
+
+bool
+ClusterConditionalLockBufferWithMutationContext(Buffer buffer,
+	const ResourceXWriterUseContext *expected, uint64 revision, bool checked)
+{
+	conditional_resumes++;
+	resumed_writer = fixture_actual_resume(buffer, expected, revision, checked);
+	return resumed_writer;
+}
+
+void ClusterUnlockBufferAfterConditionalMutation(Buffer buffer);
+void
+ClusterUnlockBufferAfterConditionalMutation(Buffer buffer)
+{
+	conditional_unlocks++;
+	fixture_actual_unlock(buffer);
+	UT_ASSERT(!local_x && backend_pin_count == 1);
+	UT_ASSERT(cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0)) == NULL);
+}
+
+static void
+fixture_release_original_writer(void)
+{
+	/* Initial unlock is a controlled seam; actual release/resume bodies and
+	 * the node's original T3 are checked independently and below. */
+	memset(cluster_bufmgr_pcm_x_writer_ledger, 0, sizeof(cluster_bufmgr_pcm_x_writer_ledger));
+	local_x = false;
+}
+
+bool
+cluster_pcm_lock_r4_route_snapshot(BufferTag tag, PcmAuthoritySnapshot *out,
+	uint64 *master, SCN *scn)
+{
+	route_checks++;
+	UT_ASSERT_EQ(tag.blockNum, 7);
+	memset(out, 0, sizeof(*out));
+	out->transition_count = route_holder;
+	*master = route_master;
+	*scn = 20;
+	return route_current;
+}
+bool
+cluster_pcm_lock_authority_matches(BufferTag tag, const PcmAuthoritySnapshot *expected)
+{
+	authority_checks++;
+	UT_ASSERT_EQ(tag.blockNum, 7);
+	UT_ASSERT_EQ(expected->transition_count, 11);
+	return authority_current;
+}
+bool
+cluster_semantic_activation_recheck_r4_terminal_census(
+	const ClusterSemanticAdmissionToken *token)
+{
+	if (!local_x) {
+		census_preflight_checks++;
+		UT_ASSERT(token != NULL && token->entered && backend_pin_count == 1);
+		UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+		return admission_current;
+	}
+	admission_checks++;
+	UT_ASSERT(token != NULL && token->entered);
+	return admission_current;
+}
+/* Existing full TARGET policy is stronger than census-read permission. */
+bool
+cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
+{
+	if (!local_x) {
+		target_preflight_checks++;
+		UT_ASSERT(token != NULL && token->entered && backend_pin_count == 1);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+		UT_ASSERT_EQ(writer_checks + route_checks + authority_checks + admission_checks, 0);
+		UT_ASSERT_EQ(wal_clock_reads + inserts + dirties + edges + flushes, 0);
+		if (preflight_target_error) elog(ERROR, "injected unlocked TARGET preflight error");
+		if (preflight_revoke_census) admission_current = false;
+		return full_target_current || allow_preflight_target;
+	}
+	full_target_checks++;
+	UT_ASSERT(token != NULL && token->entered);
+	UT_ASSERT(local_x && backend_pin_count == 1);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	/* Native final authority + real capture; a resumed scope checked once more. */
+	UT_ASSERT_EQ(writer_checks, resumed_writer ? 3 : 2);
+	UT_ASSERT_EQ(route_checks, 1);
+	UT_ASSERT_EQ(authority_checks, 1);
+	UT_ASSERT_EQ(admission_checks, 0);
+	UT_ASSERT_EQ(wal_clock_reads + inserts + dirties + edges + flushes, 0);
+	if (target_recheck_error) elog(ERROR, "injected full TARGET recheck error");
+	if (revoke_target_census) admission_current = false;
+	return full_target_current;
+}
+
+void
+XLogFlush(XLogRecPtr lsn)
+{
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(lsn, UINT64_C(0x9000));
+	UT_ASSERT_EQ(dirties, 1);
+	UT_ASSERT_EQ(inserts, 1);
+	UT_ASSERT(local_x && writer_current);
+	flushes++;
+	if (flush_error)
+		elog(ERROR, "injected WAL flush failure");
+}
+
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -112,7 +399,7 @@ errfinish(const char *file, int line, const char *function)
 		printf("# unexpected error %s:%d %s\n", file, line, function);
 		abort();
 	}
-	longjmp(error_jump, 1);
+	pg_re_throw();
 }
 bool
 RecoveryInProgress(void)
@@ -172,12 +459,19 @@ TransactionIdDidCommit(TransactionId xid)
 {
 	UT_ASSERT_EQ(CritSectionCount, 0);
 	UT_ASSERT_EQ(xid, 77);
+	tx_checks++;
 	return tx_committed;
 }
 void
 MarkBufferDirty(Buffer buffer)
 {
 	UT_ASSERT_EQ(buffer, 1);
+	if (redoing) {
+		UT_ASSERT(redo_locked);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		redo_dirties++;
+		return;
+	}
 	UT_ASSERT_EQ(CritSectionCount, 1);
 	dirties++;
 }
@@ -204,7 +498,8 @@ XLogRegisterData(char *data, uint32 length)
 		UT_ASSERT_EQ(((xl_heap_prune *)data)->nredirected, 1);
 	} else if (expected_info == XLOG_HEAP2_FREEZE_PAGE) {
 		UT_ASSERT_EQ(length, SizeOfHeapFreezePage);
-		UT_ASSERT_EQ(((xl_heap_freeze_page *)data)->nplans, 1);
+		UT_ASSERT_EQ(((xl_heap_freeze_page *)data)->nplans, expected_nplans);
+		memcpy(freeze_main_data.data, data, length);
 	} else {
 		UT_ASSERT_EQ(length, SizeOfHeapVacuum);
 		UT_ASSERT_EQ(((xl_heap_vacuum *)data)->nunused, 1);
@@ -225,6 +520,12 @@ XLogRegisterBufData(uint8 id, char *data, uint32 length)
 {
 	UT_ASSERT(begun && data != NULL && length > 0);
 	UT_ASSERT_EQ(id, 0);
+	if (expected_info == XLOG_HEAP2_FREEZE_PAGE) {
+		UT_ASSERT(freeze_block_length + length <= BLCKSZ);
+		memcpy(freeze_block_data.data + freeze_block_length, data, length);
+		freeze_block_length += length;
+		freeze_data_calls++;
+	}
 }
 void
 XLogRegisterPageVersionEdge(uint64 token, const RfPageVersionEdgeEntryV1 *entries, uint8 count)
@@ -242,6 +543,7 @@ XLogInsert(RmgrId rmgr, uint8 info)
 	UT_ASSERT_EQ(rmgr, expected_info == XLOG_FPI_FOR_HINT ? RM_XLOG_ID : RM_HEAP2_ID);
 	UT_ASSERT_EQ(info, expected_info);
 	begun = false;
+	inserted_wal_clock = fixture_wal_clock;
 	inserts++;
 	return UINT64_C(0x9000);
 }
@@ -250,12 +552,76 @@ static void page_verify_redirects(Page page);
 #include "test_cluster_heap_prune_helpers.inc"
 #include "test_cluster_heap_freeze_helpers.inc"
 
+/* Plans here are fixture-qualified, not shared FullXid/provenance evidence. */
+static void
+heap_freeze_apply_prepared(Relation rel, Buffer buffer,
+						   TransactionId snapshotConflictHorizon,
+						   HeapTupleFreeze *tuples, int ntuples,
+						   const ClusterSpaceIdentity *identity)
+#include "test_cluster_heap_freeze_apply.inc"
+
+#include "test_cluster_heap_freeze_xmin_apply.inc"
+
 /* Execute the full native freeze body with the planned pre-lock identity. */
 static void
 run_freeze(Relation rel, Buffer buffer, TransactionId snapshotConflictHorizon,
 		   HeapTupleFreeze *tuples, int ntuples,
 		   const ClusterSpaceIdentity *identity pg_attribute_unused())
 #include "test_cluster_heap_freeze_body.inc"
+
+XLogRedoAction
+XLogReadBufferForRedo(XLogReaderState *record, uint8 id, Buffer *buffer)
+{
+	UT_ASSERT(redoing && !redo_locked);
+	UT_ASSERT_EQ(id, 0);
+	UT_ASSERT_EQ(record->EndRecPtr, UINT64_C(0x9000));
+	*buffer = 1;
+	redo_locked = true;
+	return BLK_NEEDS_REDO;
+}
+
+char *
+XLogRecGetBlockData(XLogReaderState *record, uint8 id, Size *length)
+{
+	UT_ASSERT(redoing && redo_locked && record != NULL);
+	UT_ASSERT_EQ(id, 0);
+	if (length != NULL)
+		*length = freeze_block_length;
+	return freeze_block_data.data;
+}
+
+void
+XLogRecGetBlockTag(XLogReaderState *record, uint8 id, RelFileLocator *locator,
+				   ForkNumber *forknum, BlockNumber *block)
+{
+	/* Hot-standby conflict handling is outside this native replay fixture. */
+	(void)record;
+	(void)id;
+	(void)locator;
+	(void)forknum;
+	(void)block;
+	abort();
+}
+
+void
+ResolveRecoveryConflictWithSnapshot(TransactionId xid, bool catalog, RelFileLocator locator)
+{
+	(void)xid;
+	(void)catalog;
+	(void)locator;
+	abort();
+}
+
+void
+UnlockReleaseBuffer(Buffer buffer)
+{
+	UT_ASSERT(redoing && redo_locked);
+	UT_ASSERT_EQ(buffer, 1);
+	redo_locked = false;
+	redo_releases++;
+}
+
+#include "test_cluster_heap_freeze_redo.inc"
 
 	/* Native eligibility/retention is covered by test_cluster_r4_lock_order.
  * Here the exact approved redirect/remove plan enters the real WAL section. */
@@ -328,7 +694,38 @@ reset(uint8 opcode, bool shared)
 	cluster_shared_config = shared;
 	cluster_enabled = shared;
 	CritSectionCount = 0;
-	edges = inserts = dirties = hints = 0;
+	edges = inserts = dirties = hints = flushes = 0;
+	writer_checks = route_checks = authority_checks = admission_checks = 0;
+	fixture_wal_clock = scn_encode(0, 100);
+	inserted_wal_clock = InvalidScn;
+	wal_clock_reads = 0;
+	full_target_current = true;
+	target_recheck_error = revoke_target_census = false;
+	full_target_checks = 0;
+	target_preflight_checks = census_preflight_checks = 0;
+	preflight_target_error = preflight_revoke_census = allow_preflight_target = false;
+	local_x = writer_current = route_current = authority_current = admission_current = true;
+	local_share = resume_allowed = resume_error = resumed_writer = false;
+	node_grant_current = true;
+	object_current = true; current_object_revision = 7;
+	error_after_local_lock = error_after_ledger_bind = false;
+	local_lock_attempts = local_unlocks = 0;
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+	memset(cluster_bufmgr_pcm_x_writer_ledger, 0, sizeof(cluster_bufmgr_pcm_x_writer_ledger));
+	memset(descriptors, 0, sizeof(descriptors));
+	conditional_resumes = conditional_unlocks = 0;
+	backend_pin_count = 1;
+	pin_checks = 0;
+	writer_state = PCM_STATE_X;
+	route_holder = 11;
+	route_master = 12;
+	flush_error = false;
+	tx_checks = redo_dirties = redo_releases = freeze_data_calls = 0;
+	freeze_block_length = 0;
+	expected_nplans = 1;
+	memset(freeze_main_data.data, 0, BLCKSZ);
+	memset(freeze_block_data.data, 0, BLCKSZ);
+	redoing = redo_locked = false;
 	begun = expecting_error = false;
 	tx_committed = true;
 	next_token = 100;
@@ -402,6 +799,920 @@ check_publication(bool shared)
 		UT_ASSERT_EQ(edge.result_kind, RF_PAGE_STATE_PRESENT);
 		UT_ASSERT(memcmp(edge.before.segment_incarnation, space_identity.incarnation, 16) == 0);
 		UT_ASSERT(memcmp(edge.result_incarnation, space_identity.incarnation, 16) == 0);
+	}
+}
+
+static HeapTupleHeader
+freeze_tuple(Page page, OffsetNumber offset)
+{
+	return (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, offset));
+}
+
+static void
+replay_freeze_record(void)
+{
+	PGAlignedBlock written;
+	XLogReaderState reader = { 0 };
+	DecodedXLogRecord *decoded = calloc(1, offsetof(DecodedXLogRecord, blocks)
+										 + sizeof(DecodedBkpBlock));
+
+	UT_ASSERT_NOT_NULL(decoded);
+	if (decoded == NULL)
+		return;
+	memcpy(written.data, current_page.data, BLCKSZ);
+	memcpy(current_page.data, before_page.data, BLCKSZ);
+	decoded->main_data = freeze_main_data.data;
+	decoded->main_data_len = SizeOfHeapFreezePage;
+	reader.record = decoded;
+	reader.EndRecPtr = UINT64_C(0x9000);
+	redoing = true;
+	heap_xlog_freeze_page(&reader);
+	redoing = false;
+	UT_ASSERT_EQ(redo_dirties, 1);
+	UT_ASSERT_EQ(redo_releases, 1);
+	UT_ASSERT(!redo_locked);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	/* SPACE edge replay is an outer layer, not native heap freeze redo. */
+	UT_ASSERT_EQ(((PageHeader)current_page.data)->pd_block_scn, 20);
+	((PageHeader)written.data)->pd_block_scn = 20;
+	UT_ASSERT(memcmp(written.data, current_page.data, BLCKSZ) == 0);
+	free(decoded);
+}
+
+UT_TEST(test_qualified_freeze_kernel_changes_only_planned_headers)
+{
+	HeapTupleFreeze tuples[2] = { { 0 } };
+
+	reset(XLOG_HEAP2_FREEZE_PAGE, true);
+	tx_committed = false;
+	for (int i = 0; i < 2; i++) {
+		tuples[i].offset = i + 1;
+		tuples[i].t_infomask = HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID;
+		tuples[i].checkflags = HEAP_FREEZE_CHECK_XMIN_COMMITTED;
+	}
+	heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 2, &space_identity);
+	check_publication(true);
+	UT_ASSERT_EQ(tx_checks, 0);
+	UT_ASSERT_EQ(freeze_data_calls, 2);
+	for (int i = 1; i <= 3; i++) {
+		HeapTupleHeader tuple = freeze_tuple(current_page.data, i);
+		HeapTupleHeader original = freeze_tuple(before_page.data, i);
+		Size length = ItemIdGetLength(PageGetItemId(current_page.data, i));
+
+		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(tuple), 77);
+		UT_ASSERT_EQ(HeapTupleHeaderXminFrozen(tuple), i <= 2);
+		UT_ASSERT(ItemPointerEquals(&tuple->t_ctid, &original->t_ctid));
+		UT_ASSERT_EQ(tuple->t_hoff, original->t_hoff);
+		UT_ASSERT(memcmp((char *)tuple + tuple->t_hoff,
+						 (char *)original + original->t_hoff,
+						 length - tuple->t_hoff) == 0);
+	}
+	UT_ASSERT(memcmp(freeze_tuple(current_page.data, 3),
+					 freeze_tuple(before_page.data, 3), 64) == 0);
+	if (inserts == 1)
+		replay_freeze_record();
+}
+
+UT_TEST(test_exact_xmin_plan_preserves_xmax_through_native_wal_and_redo)
+{
+	const uint16 xmax_masks[] = {
+		HEAP_XMAX_INVALID,
+		HEAP_XMAX_COMMITTED,
+		HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK,
+		HEAP_XMAX_IS_MULTI | HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_KEYSHR_LOCK
+	};
+
+	for (unsigned variant = 0; variant < lengthof(xmax_masks); variant++) {
+		ClusterHeapFreezePageBatchV1 page = { 0 };
+		ClusterHeapFreezeProofBatchV1 proofs = { .proof_count = 1 };
+		ClusterHeapFreezeCanonicalProofV1 *proof = &proofs.proofs[0];
+		ClusterHeapFreezeFinalFenceV1 fence;
+		ClusterHeapFreezeTupleInputV1 *input = &page.tuples[0];
+		HeapTupleFreeze plan;
+		HeapTupleHeader tuple;
+		ItemId item;
+		bool prepared;
+
+		reset(XLOG_HEAP2_FREEZE_PAGE, true);
+		/* The canonical final fence requires an already-persisted page LSN. */
+		PageSetLSN(current_page.data, UINT64_C(0x8000));
+		tuple = freeze_tuple(current_page.data, 1);
+		item = PageGetItemId(current_page.data, 1);
+		HeapTupleHeaderSetXmax(tuple, 88);
+		tuple->t_infomask = HEAP_XMIN_COMMITTED | HEAP_UPDATED | xmax_masks[variant];
+		tuple->t_infomask2 = HEAP_HOT_UPDATED | 7;
+		memcpy(before_page.data, current_page.data, BLCKSZ);
+
+		/* These identities are qualified fixture inputs, not an epoch producer. */
+		fence = (ClusterHeapFreezeFinalFenceV1){
+			.identity = space_identity, .block = 7, .page_lsn = UINT64_C(0x8000), .page_version = 20,
+			.holder_sequence = 11, .master_sequence = 12, .admission_generation = 13 };
+		proof->requested_locator.uba = uba_encode(1, 1, 0, 1);
+		proof->requested_locator.xid = 77;
+		proof->requested_locator.tt_wrap = TT_WRAP_INVALID;
+		proof->requested_locator.itl_kind = ITL_FLAG_ACTIVE;
+		proof->resolution.locator_echo = proof->requested_locator;
+		proof->resolution.locator_echo.tt_wrap = 2;
+		proof->resolution.outcome = CLUSTER_TX_COMMITTED;
+		proof->resolution.proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
+		proof->resolution.commit_scn = 9;
+		proof->resolution.authority.origin_epoch = 1;
+		proof->resolution.authority.live_hwm_lsn = 1;
+		proof->resolution.authority.tt_generation = 1;
+		proof->resolution.authority.authority_scn = 9;
+		proof->resolution.local_canonical_valid = true;
+		proof->resolution.local_canonical_generation = 1;
+		proof->resolution.local_canonical.segment_id = 1;
+		proof->resolution.local_canonical.xid = 77;
+		proof->resolution.local_canonical.wrap = 2;
+		proof->resolution.local_original_full_xid = FullTransactionIdFromEpochAndXid(1, 77);
+		proof->resolution.local_creation_target = (ClusterTxCreationTarget){
+			.locator = relation_data.rd_locator, .fork = MAIN_FORKNUM,
+			.block = 7, .offset = 1, .tuple_length = ItemIdGetLength(item), .valid = true };
+		proof->c1b_finalized = proof->authority_current = proof->admission_current = true;
+		proof->expected_fence = proof->current_fence = fence;
+		page.identity = space_identity;
+		page.block = 7;
+		page.page_lsn = fence.page_lsn;
+		page.page_version = fence.page_version;
+		page.tuple_count = page.carrier_request_count = 1;
+		page.carrier_requests[0].locator = proof->requested_locator;
+		input->offset = 1;
+		input->tuple_offset = ItemIdGetOffset(item);
+		input->tuple_length = ItemIdGetLength(item);
+		input->header_length = tuple->t_hoff;
+		input->raw_xmin = HeapTupleHeaderGetRawXmin(tuple);
+		input->raw_xmax = HeapTupleHeaderGetRawXmax(tuple);
+		input->infomask = tuple->t_infomask;
+		input->infomask2 = tuple->t_infomask2;
+		input->ctid = tuple->t_ctid;
+		input->has_carrier = true;
+		UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 1);
+		prepared = cluster_heap_freeze_prepare_xmin_v1(&page, &proofs, &fence, 0,
+			FullTransactionIdFromEpochAndXid(1, 77),
+			FullTransactionIdFromEpochAndXid(1, 100), 10, &plan);
+		UT_ASSERT(prepared);
+		if (!prepared)
+			continue;
+		tx_committed = false;
+		heap_freeze_apply_prepared(&relation_data, 1, 70, &plan, 1, &space_identity);
+		check_publication(true);
+		UT_ASSERT_EQ(tx_checks, 0);
+		UT_ASSERT_EQ(freeze_data_calls, 2);
+		UT_ASSERT(HeapTupleHeaderXminFrozen(tuple));
+		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(tuple), 77);
+		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmax(tuple), 88);
+		UT_ASSERT_EQ(tuple->t_infomask,
+			HEAP_XMIN_FROZEN | HEAP_UPDATED | xmax_masks[variant]);
+		UT_ASSERT_EQ(tuple->t_infomask2, HEAP_HOT_UPDATED | 7);
+		UT_ASSERT(memcmp(freeze_tuple(current_page.data, 2),
+			freeze_tuple(before_page.data, 2), 64) == 0);
+		UT_ASSERT(memcmp(freeze_tuple(current_page.data, 3),
+			freeze_tuple(before_page.data, 3), 64) == 0);
+		if (inserts == 1)
+			replay_freeze_record();
+	}
+}
+
+/* Qualified identities and ownership below are leaf fixture inputs.  The real
+ * capture, preparation, final apply, native WAL assembly and redo are exercised. */
+typedef struct QualifiedXminFixture
+{
+	ClusterHeapFreezePageInputV1 input;
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+	PcmAuthoritySnapshot authority;
+	ClusterSemanticAdmissionToken admission;
+} QualifiedXminFixture;
+
+static void
+qualified_xmin_setup(QualifiedXminFixture *f, uint16 xmax_mask)
+{
+	ClusterHeapFreezeCanonicalProofV1 *proof;
+	ClusterItlSlotData *slot;
+	HeapTupleHeader tuple;
+
+	reset(XLOG_HEAP2_FREEZE_PAGE, true);
+	memset(f, 0, sizeof(*f));
+	PageSetLSN(current_page.data, UINT64_C(0x8000));
+	slot = ClusterPageGetItlSlot(current_page.data, 0);
+	memset(slot, 0, sizeof(*slot));
+	slot->xid = 77;
+	slot->wrap = 2;
+	slot->flags = ITL_FLAG_ACTIVE;
+	slot->undo_segment_head = uba_encode(1, 11, 21, 31);
+	slot->write_scn = 100;
+	slot->first_change_lsn = 200;
+	for (int i = 1; i <= 3; i++)
+		freeze_tuple(current_page.data, i)->t_itl_slot_idx = 0;
+	tuple = freeze_tuple(current_page.data, 1);
+	HeapTupleHeaderSetXmax(tuple, 88);
+	tuple->t_infomask = HEAP_XMIN_COMMITTED | HEAP_UPDATED | xmax_mask;
+	tuple->t_infomask2 = HEAP_HOT_UPDATED | 7;
+	memcpy(before_page.data, current_page.data, BLCKSZ);
+	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&space_identity, 7,
+		current_page.data, &f->input));
+	memset(&original_writer_context, 0, sizeof(original_writer_context));
+	InitBufferTag(&original_writer_context.ref.assertion.resource,
+		&relation_data.rd_locator, MAIN_FORKNUM, 7);
+	original_writer_context.ref.assertion.requester_node = 0;
+	original_writer_context.ref.formation = 21;
+	original_writer_context.ref.acquisition_generation = 22;
+	original_writer_context.r4_record_generation = 13;
+	original_writer_context.buffer_ownership_generation = 14;
+	{
+		BufferDesc *buf = GetBufferDescriptor(0);
+		ClusterPcmXWriterLedgerEntry *e = &cluster_bufmgr_pcm_x_writer_ledger[0];
+		buf->tag = original_writer_context.ref.assertion.resource;
+		e->phase = PCM_X_WRITER_LEDGER_ACTIVE; e->buffer_id = 0;
+		e->content_lock = BufferDescriptorGetContentLock(buf);
+		e->authority = original_writer_context;
+		e->granted.tag = buf->tag; e->granted.generation = 14;
+		e->granted.pcm_state = PCM_STATE_X;
+		e->object_checked = true; e->object_revision = 7;
+	}
+	f->input.writer_context = original_writer_context;
+	f->input.writer_context_valid = true;
+	f->input.writer_object_revision = 7;
+	f->input.writer_object_checked = true;
+	UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&f->input, &f->page));
+	UT_ASSERT_EQ(f->page.carrier_request_count, 1);
+	f->fence = (ClusterHeapFreezeFinalFenceV1){
+		.identity = space_identity, .block = 7, .page_lsn = UINT64_C(0x8000), .page_version = 20,
+		.holder_sequence = 11, .master_sequence = 12, .admission_generation = 13 };
+	f->proofs.proof_count = 1;
+	proof = &f->proofs.proofs[0];
+	proof->requested_locator = f->page.carrier_requests[0].locator;
+	proof->resolution.locator_echo = proof->requested_locator;
+	proof->resolution.locator_echo.tt_wrap = 2;
+	proof->resolution.outcome = CLUSTER_TX_COMMITTED;
+	proof->resolution.proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
+	proof->resolution.commit_scn = 9;
+	proof->resolution.authority.origin_epoch = 1;
+	proof->resolution.authority.live_hwm_lsn = 1;
+	proof->resolution.authority.tt_generation = 1;
+	proof->resolution.authority.authority_scn = 9;
+	proof->resolution.local_canonical_valid = true;
+	proof->resolution.local_canonical_generation = 1;
+	proof->resolution.local_canonical.segment_id = 1;
+	proof->resolution.local_canonical.xid = 77;
+	proof->resolution.local_canonical.wrap = 2;
+	proof->resolution.local_original_full_xid = FullTransactionIdFromEpochAndXid(1, 77);
+	proof->resolution.local_creation_target = (ClusterTxCreationTarget){
+		.locator = relation_data.rd_locator, .fork = MAIN_FORKNUM,
+		.block = 7, .offset = 1, .tuple_length = 64, .valid = true };
+	proof->c1b_finalized = proof->authority_current = proof->admission_current = true;
+	proof->expected_fence = proof->current_fence = f->fence;
+	f->authority.transition_count = 11;
+	f->admission.entered = true;
+	f->admission.record_generation = 13;
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f->page, &f->proofs, &f->fence), 1);
+}
+
+static bool
+qualified_xmin_apply(QualifiedXminFixture *f, uint16 index)
+{
+	return cluster_heap_freeze_apply_xmin_v1(&relation_data, 1, &f->input,
+		&f->page, &f->proofs, &f->fence, &f->authority, &f->admission, index,
+		FullTransactionIdFromEpochAndXid(1, 77),
+		FullTransactionIdFromEpochAndXid(1, 100), 10);
+}
+
+static void
+qualified_xmin_batch_setup(QualifiedXminFixture *f,
+	ClusterHeapFreezeXminTargetV1 targets[3])
+{
+	const TransactionId xids[] = { 77, UINT32_MAX - 2, 66 };
+	const uint16 order[] = { 2, 0, 1 };
+	ClusterHeapFreezeCanonicalProofV1 seed;
+	ClusterItlSlotData carrier;
+
+	qualified_xmin_setup(f, HEAP_XMAX_INVALID);
+	seed = f->proofs.proofs[0];
+	carrier = *ClusterPageGetItlSlot(current_page.data, 0);
+	for (int i = 0; i < 3; i++) {
+		ClusterItlSlotData *slot = ClusterPageGetItlSlot(current_page.data, i);
+		HeapTupleHeader tuple = freeze_tuple(current_page.data, i + 1);
+
+		*slot = carrier;
+		slot->xid = xids[i];
+		slot->wrap += i;
+		slot->undo_segment_head = uba_encode(1, 11, 21 + i, 31);
+		HeapTupleHeaderSetXmin(tuple, xids[i]);
+		tuple->t_itl_slot_idx = i;
+	}
+	memcpy(before_page.data, current_page.data, BLCKSZ);
+	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&space_identity, 7,
+		current_page.data, &f->input));
+	f->input.writer_context = original_writer_context;
+	f->input.writer_context_valid = true;
+	f->input.writer_object_revision = 7;
+	f->input.writer_object_checked = true;
+	UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&f->input, &f->page));
+	UT_ASSERT_EQ(f->page.carrier_request_count, 3);
+	f->proofs.proof_count = 3;
+	for (int i = 0; i < 3; i++) {
+		ClusterHeapFreezeCanonicalProofV1 *proof = &f->proofs.proofs[i];
+
+		*proof = seed;
+		proof->requested_locator = f->page.carrier_requests[i].locator;
+		proof->resolution.locator_echo = proof->requested_locator;
+		proof->resolution.locator_echo.tt_wrap = 2 + i;
+		proof->resolution.local_canonical.xid = xids[i];
+		proof->resolution.local_canonical.wrap = 2 + i;
+		proof->resolution.local_original_full_xid =
+			FullTransactionIdFromEpochAndXid(i == 1 ? 0 : 1, xids[i]);
+		proof->resolution.local_creation_target.offset = i + 1;
+		targets[i].tuple_index = order[i];
+		targets[i].original_creator_full_xid =
+			FullTransactionIdFromEpochAndXid(order[i] == 1 ? 0 : 1, xids[order[i]]);
+	}
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f->page, &f->proofs, &f->fence), 3);
+	expected_nplans = 2;
+}
+
+static bool
+qualified_xmin_batch_apply(QualifiedXminFixture *f,
+	const ClusterHeapFreezeXminTargetV1 *targets, uint16 count)
+{
+	return cluster_heap_freeze_apply_xmin_batch_v1(&relation_data, 1, &f->input,
+		&f->page, &f->proofs, &f->fence, &f->authority, &f->admission, targets,
+		count, FullTransactionIdFromEpochAndXid(1, 100), 10);
+}
+
+UT_TEST(test_xmin_apply_requires_original_backend_pin_before_page_or_writer_use)
+{
+	QualifiedXminFixture f;
+
+	qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	backend_pin_count = 0;
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(pin_checks, 1);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes + writer_checks
+		+ route_checks + authority_checks + admission_checks, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	UT_ASSERT(local_x && f.admission.entered);
+	UT_ASSERT_EQ(backend_pin_count, 0);
+}
+
+UT_TEST(test_xmin_batch_requires_original_backend_pin_without_repin_or_write)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	qualified_xmin_batch_setup(&f, targets);
+	backend_pin_count = 0;
+	UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
+	UT_ASSERT_EQ(pin_checks, 1);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes + writer_checks
+		+ route_checks + authority_checks + admission_checks, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	UT_ASSERT(local_x && f.admission.entered);
+	UT_ASSERT_EQ(backend_pin_count, 0);
+}
+
+UT_TEST(test_xmin_apply_rejects_unbounded_cutoffs_before_native_write)
+{
+	QualifiedXminFixture f;
+
+	for (int variant = 0; variant < 3; variant++) {
+		FullTransactionId limit = FullTransactionIdFromEpochAndXid(1, 100);
+		SCN horizon = 10;
+
+		qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		if (variant != 0)
+			limit = FullTransactionIdFromU64(UINT64_MAX);
+		if (variant != 1)
+			horizon = (SCN)UINT64_MAX;
+		UT_ASSERT(!cluster_heap_freeze_apply_xmin_v1(&relation_data, 1, &f.input,
+			&f.page, &f.proofs, &f.fence, &f.authority, &f.admission, 0,
+			FullTransactionIdFromEpochAndXid(1, 77), limit, horizon));
+		UT_ASSERT_EQ(inserts + dirties + flushes + writer_checks + authority_checks, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_batch_rejects_unbounded_cutoffs_before_native_write)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int variant = 0; variant < 3; variant++) {
+		FullTransactionId limit = FullTransactionIdFromEpochAndXid(1, 100);
+		SCN horizon = 10;
+
+		qualified_xmin_batch_setup(&f, targets);
+		if (variant != 0)
+			limit = FullTransactionIdFromU64(UINT64_MAX);
+		if (variant != 1)
+			horizon = (SCN)UINT64_MAX;
+		UT_ASSERT(!cluster_heap_freeze_apply_xmin_batch_v1(&relation_data, 1, &f.input,
+			&f.page, &f.proofs, &f.fence, &f.authority, &f.admission,
+			targets, 3, limit, horizon));
+		UT_ASSERT_EQ(inserts + dirties + flushes + writer_checks + authority_checks, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_apply_rejects_unbound_original_identity_before_wal)
+{
+	QualifiedXminFixture f;
+
+	for (int variant = 0; variant < 5; variant++) {
+		qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		switch (variant) {
+		case 0: f.page.tuples[0].original_creator_full_xid = InvalidFullTransactionId; break;
+		case 1: f.page.tuples[0].original_creator_full_xid = FullTransactionIdFromEpochAndXid(2, 77); break;
+		case 2: f.proofs.proofs[0].resolution.local_original_full_xid = InvalidFullTransactionId; break;
+		case 3: f.proofs.proofs[0].resolution.local_original_full_xid = FullTransactionIdFromEpochAndXid(2, 77); break;
+		case 4:
+			f.page.tuples[0].original_creator_full_xid = FullTransactionIdFromEpochAndXid(0, 77);
+			f.proofs.proofs[0].resolution.local_original_full_xid = f.page.tuples[0].original_creator_full_xid;
+			break;
+		}
+		UT_ASSERT(!qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(inserts + dirties + flushes + writer_checks + authority_checks, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_batch_later_origin_epoch_mismatch_is_atomic)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int variant = 0; variant < 3; variant++) {
+		qualified_xmin_batch_setup(&f, targets);
+		/* The first row prepares; a later target keeps the same raw XID
+		 * while its observed original epoch no longer matches the caller. */
+		if (variant == 0)
+			f.page.tuples[1].original_creator_full_xid = InvalidFullTransactionId;
+		if (variant == 1)
+			f.proofs.proofs[1].resolution.local_original_full_xid =
+				FullTransactionIdFromEpochAndXid(1, UINT32_MAX - 2);
+		if (variant == 2) {
+			f.page.tuples[0].original_creator_full_xid = FullTransactionIdFromEpochAndXid(0, 77);
+			f.proofs.proofs[0].resolution.local_original_full_xid = f.page.tuples[0].original_creator_full_xid;
+		}
+		UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
+		UT_ASSERT_EQ(inserts + dirties + flushes + writer_checks + authority_checks, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_batch_one_wal_fence_fullxid_horizon_and_redo)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	qualified_xmin_batch_setup(&f, targets);
+	UT_ASSERT(qualified_xmin_batch_apply(&f, targets, 3));
+	UT_ASSERT_EQ(inserts, 1);
+	UT_ASSERT_EQ(flushes, 1);
+	UT_ASSERT_EQ(writer_checks, 2);
+	UT_ASSERT_EQ(route_checks, 1);
+	UT_ASSERT_EQ(authority_checks, 1);
+	UT_ASSERT_EQ(admission_checks, 1);
+	UT_ASSERT_EQ(((xl_heap_freeze_page *)freeze_main_data.data)->snapshotConflictHorizon, 77);
+	for (int i = 1; i <= 3; i++) {
+		HeapTupleHeader tuple = freeze_tuple(current_page.data, i);
+		HeapTupleHeader old = freeze_tuple(before_page.data, i);
+
+		UT_ASSERT(HeapTupleHeaderXminFrozen(tuple));
+		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(tuple), HeapTupleHeaderGetRawXmin(old));
+		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmax(tuple), HeapTupleHeaderGetRawXmax(old));
+		UT_ASSERT_EQ(tuple->t_infomask, old->t_infomask | HEAP_XMIN_FROZEN);
+		UT_ASSERT_EQ(tuple->t_infomask2, old->t_infomask2);
+		UT_ASSERT(memcmp(ClusterPageGetItlSlot(current_page.data, i - 1),
+			ClusterPageGetItlSlot(before_page.data, i - 1), sizeof(ClusterItlSlotData)) == 0);
+	}
+	if (inserts == 1) {
+		check_publication(true);
+		UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
+		UT_ASSERT_EQ(inserts, 1);
+		UT_ASSERT_EQ(flushes, 1);
+		replay_freeze_record();
+	}
+}
+
+UT_TEST(test_xmin_batch_later_unqualified_target_changes_nothing)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int variant = 0; variant < 4; variant++) {
+		qualified_xmin_batch_setup(&f, targets);
+		expected_nplans = 1; /* RED scaffold can write its first row. */
+		switch (variant) {
+		case 0: f.proofs.proofs[1].resolution.local_creation_target.offset = 1; break;
+		case 1: f.proofs.proofs[1].resolution.commit_scn = 10; break;
+		case 2: targets[2].original_creator_full_xid = FullTransactionIdFromEpochAndXid(0, 99); break;
+		case 3: targets[2].original_creator_full_xid = FullTransactionIdFromEpochAndXid(2, UINT32_MAX - 2); break;
+		}
+		UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
+		UT_ASSERT_EQ(inserts + dirties + flushes, 0);
+		UT_ASSERT_EQ(writer_checks + route_checks + authority_checks + admission_checks, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_batch_rejects_duplicate_physical_rows)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int alias = 0; alias < 2; alias++) {
+		qualified_xmin_batch_setup(&f, targets);
+		expected_nplans = 1;
+		targets[1] = targets[0];
+		if (alias) {
+			/* Distinct request indexes cannot authorize the same physical row. */
+			f.page.tuples[1] = f.page.tuples[2];
+			targets[1].tuple_index = 1;
+		}
+		UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 2));
+		UT_ASSERT_EQ(inserts + dirties + flushes + writer_checks, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_batch_runtime_bounds_and_empty_reject)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int variant = 0; variant < 4; variant++) {
+		qualified_xmin_batch_setup(&f, targets);
+		if (variant == 3)
+			targets[0].tuple_index = UINT16_MAX;
+		UT_ASSERT(!qualified_xmin_batch_apply(&f, variant == 1 ? NULL : targets,
+			variant == 0 ? 0 : variant == 2 ? MaxHeapTuplesPerPage + 1 : 3));
+		UT_ASSERT_EQ(inserts + dirties + flushes + writer_checks, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_batch_later_stale_row_rejects_before_fence)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int variant = 0; variant < 3; variant++) {
+		qualified_xmin_batch_setup(&f, targets);
+		expected_nplans = 1;
+		if (variant == 0)
+			f.page.tuples[1].raw_xmax++;
+		else if (variant == 1)
+			f.page.tuples[1].tuple_offset += MAXIMUM_ALIGNOF;
+		else
+			f.page.tuples[1].infomask2 ^= HEAP_ONLY_TUPLE;
+		UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
+		UT_ASSERT_EQ(inserts + dirties + flushes + writer_checks, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_batch_rejects_ambiguous_native_horizon)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	qualified_xmin_batch_setup(&f, targets);
+	expected_nplans = 1;
+	targets[0].original_creator_full_xid = FullTransactionIdFromEpochAndXid(0, 66);
+	f.proofs.proofs[2].resolution.local_original_full_xid = targets[0].original_creator_full_xid;
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f.page, &f.proofs, &f.fence), 3);
+	UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
+	UT_ASSERT_EQ(inserts + dirties + flushes + writer_checks, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_xmin_batch_final_authority_refusal_changes_nothing)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int variant = 0; variant < 3; variant++) {
+		qualified_xmin_batch_setup(&f, targets);
+		if (variant == 0)
+			admission_current = false;
+		else if (variant == 1)
+			authority_current = false;
+		else
+			route_master++;
+		UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
+		UT_ASSERT_EQ(writer_checks, 2);
+		UT_ASSERT_EQ(route_checks, 1);
+		UT_ASSERT_EQ(wal_clock_reads, 0);
+		UT_ASSERT_EQ(inserts + dirties + flushes, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_single_and_batch_reject_unknown_or_behind_wal_clock)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int batch = 0; batch < 2; batch++) {
+		for (int unknown = 0; unknown < 2; unknown++) {
+			if (batch)
+				qualified_xmin_batch_setup(&f, targets);
+			else
+				qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			/* Larger node bits do not make an older clock reach H. */
+			fixture_wal_clock = unknown ? InvalidScn : scn_encode(7, 9);
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3)
+				: qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(wal_clock_reads, 1);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			UT_ASSERT(local_x && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+		}
+	}
+}
+
+UT_TEST(test_xmin_single_and_batch_wal_clock_accept_time_equal_or_ahead)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	const SCN horizon = scn_encode(7, 10);
+	const FullTransactionId limit = FullTransactionIdFromEpochAndXid(1, 100);
+
+	for (int batch = 0; batch < 2; batch++) {
+		for (int ahead = 0; ahead < 2; ahead++) {
+			bool applied;
+
+			if (batch)
+				qualified_xmin_batch_setup(&f, targets);
+			else
+				qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
+			/* A lower node id at the same time is still sufficient. */
+			fixture_wal_clock = scn_encode(0, 10 + ahead);
+			applied = batch ? cluster_heap_freeze_apply_xmin_batch_v1(
+				&relation_data, 1, &f.input, &f.page, &f.proofs, &f.fence,
+				&f.authority, &f.admission, targets, 3, limit, horizon)
+				: cluster_heap_freeze_apply_xmin_v1(&relation_data, 1, &f.input,
+					&f.page, &f.proofs, &f.fence, &f.authority, &f.admission,
+					0, FullTransactionIdFromEpochAndXid(1, 77), limit, horizon);
+			UT_ASSERT(applied);
+			UT_ASSERT_EQ(wal_clock_reads, 1);
+			UT_ASSERT_EQ(inserts, 1);
+			UT_ASSERT_EQ(flushes, 1);
+			UT_ASSERT(scn_time_cmp(inserted_wal_clock, horizon) >= 0);
+			UT_ASSERT(local_x && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+		}
+	}
+}
+
+UT_TEST(test_xmin_batch_flush_error_keeps_borrowed_resources)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	qualified_xmin_batch_setup(&f, targets);
+	flush_error = expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		(void)qualified_xmin_batch_apply(&f, targets, 3);
+		UT_ASSERT(false);
+	} else {
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT_EQ(inserts, 1);
+		UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT_EQ(writer_checks, 2);
+		UT_ASSERT_EQ(admission_checks, 1);
+		for (int i = 1; i <= 3; i++)
+			UT_ASSERT(HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, i)));
+		UT_ASSERT(local_x && f.admission.entered);
+	}
+	expecting_error = false;
+}
+
+UT_TEST(test_qualified_xmin_apply_wal_flush_and_redo)
+{
+	const uint16 masks[] = { HEAP_XMAX_INVALID, HEAP_XMAX_COMMITTED,
+		HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK,
+		HEAP_XMAX_IS_MULTI | HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_KEYSHR_LOCK };
+	QualifiedXminFixture f;
+
+	for (unsigned i = 0; i < lengthof(masks); i++) {
+		qualified_xmin_setup(&f, masks[i]);
+		UT_ASSERT(qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(inserts, 1);
+		UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT(HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, 1)));
+		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(freeze_tuple(current_page.data, 1)), 77);
+		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmax(freeze_tuple(current_page.data, 1)), 88);
+		UT_ASSERT_EQ(freeze_tuple(current_page.data, 1)->t_infomask,
+			HEAP_XMIN_FROZEN | HEAP_UPDATED | masks[i]);
+		UT_ASSERT_EQ(freeze_tuple(current_page.data, 1)->t_infomask2, HEAP_HOT_UPDATED | 7);
+		UT_ASSERT(memcmp(ClusterPageGetItlSlot(current_page.data, 0),
+			ClusterPageGetItlSlot(before_page.data, 0), sizeof(ClusterItlSlotData)) == 0);
+		UT_ASSERT(memcmp(freeze_tuple(current_page.data, 2),
+			freeze_tuple(before_page.data, 2), 64) == 0);
+		UT_ASSERT(memcmp(freeze_tuple(current_page.data, 3),
+			freeze_tuple(before_page.data, 3), 64) == 0);
+		if (inserts == 1) {
+			check_publication(true);
+			UT_ASSERT(!qualified_xmin_apply(&f, 0));
+			UT_ASSERT_EQ(inserts, 1);
+			UT_ASSERT_EQ(flushes, 1);
+			replay_freeze_record();
+		}
+	}
+}
+
+UT_TEST(test_qualified_xmin_rejects_missing_or_changed_ownership)
+{
+	QualifiedXminFixture f;
+
+	for (int variant = 0; variant < 10; variant++) {
+		qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
+		switch (variant) {
+			case 0: local_x = false; break;
+			case 1: writer_current = false; break; /* ConditionalLock alone */
+			case 2: writer_state = PCM_STATE_N; break;
+			case 3: route_current = false; break;
+			case 4: authority_current = false; break;
+			case 5: route_holder++; break;
+			case 6: route_master++; break;
+			case 7: admission_current = false; break;
+			case 8: f.admission.record_generation++; break;
+			case 9: relform.relpersistence = RELPERSISTENCE_UNLOGGED; break;
+		}
+		UT_ASSERT(!qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(inserts + dirties + flushes, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_qualified_xmin_rejects_stale_physical_row_and_bounds)
+{
+	QualifiedXminFixture f;
+
+	for (int variant = 0; variant < 7; variant++) {
+		qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
+		switch (variant) {
+			case 0: ClusterPageGetItlSlot(current_page.data, 0)->wrap++; break;
+			case 1: f.page.tuples[0].raw_xmax++; break;
+			case 2: f.page.tuples[0].tuple_offset++; break;
+			case 3: f.page.tuples[0].itl_slot_index = UINT8_MAX; break;
+			case 4: f.proofs.proofs[0].resolution.local_creation_target.offset++; break;
+			case 5: f.proofs.proof_count = UINT8_MAX; break;
+			case 6: break; /* out-of-range physical row */
+		}
+		UT_ASSERT(!qualified_xmin_apply(&f, variant == 6 ? UINT16_MAX : 0));
+		UT_ASSERT_EQ(inserts + dirties + flushes, 0);
+	}
+}
+
+UT_TEST(test_qualified_xmin_flush_error_propagates_after_native_write)
+{
+	QualifiedXminFixture f;
+
+	qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
+	flush_error = expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		(void)qualified_xmin_apply(&f, 0);
+		UT_ASSERT(false);
+	} else {
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT_EQ(inserts, 1);
+		UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT(HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, 1)));
+		UT_ASSERT(local_x); /* borrowed resources remain with the caller */
+	}
+	expecting_error = false;
+}
+
+UT_TEST(test_qualified_xmin_rejects_recapture_with_old_proof_version)
+{
+	QualifiedXminFixture f;
+
+	for (int variant = 0; variant < 2; variant++) {
+		qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
+		if (variant == 0)
+			PageSetLSN(current_page.data, UINT64_C(0x8001));
+		else
+			((PageHeader)current_page.data)->pd_block_scn++;
+		/* A fresh physical capture cannot refresh the old batch/proof fence. */
+		UT_ASSERT(cluster_heap_freeze_capture_page_v1(&space_identity, 7,
+			current_page.data, &f.input));
+		memcpy(before_page.data, current_page.data, BLCKSZ);
+		UT_ASSERT(!qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(inserts + dirties + flushes, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_freeze_native_wal_dedup_and_redo)
+{
+	for (int shared = 0; shared <= 1; shared++) {
+		HeapTupleFreeze tuples[3] = { { 0 } };
+		const OffsetNumber order[] = { 3, 1, 2 };
+		xl_heap_freeze_page *header;
+		xl_heap_freeze_plan *plans;
+		OffsetNumber *offsets;
+
+		reset(XLOG_HEAP2_FREEZE_PAGE, shared);
+		expected_nplans = 2;
+		for (int i = 1; i <= 3; i++) {
+			HeapTupleHeader tuple = freeze_tuple(current_page.data, i);
+
+			tuple->t_infomask |= i == 1 ? HEAP_MOVED_OFF : HEAP_MOVED_IN;
+			HeapTupleHeaderSetXvac(tuple, 89 + i);
+		}
+		memcpy(before_page.data, current_page.data, BLCKSZ);
+		for (int i = 0; i < 3; i++) {
+			tuples[i].offset = order[i];
+			tuples[i].t_infomask = HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID;
+			tuples[i].t_infomask2 = order[i] == 1 ? 0 : HEAP_ONLY_TUPLE;
+			tuples[i].frzflags = order[i] == 1 ? XLH_INVALID_XVAC : XLH_FREEZE_XVAC;
+			tuples[i].checkflags = HEAP_FREEZE_CHECK_XMIN_COMMITTED;
+		}
+		if (shared)
+			heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 3, &space_identity);
+		else
+			run_freeze(&relation_data, 1, 70, tuples, 3, NULL);
+		check_publication(shared);
+		UT_ASSERT_EQ(tx_checks, shared ? 0 : 3);
+		if (inserts != 1)
+			continue;
+		UT_ASSERT_EQ(freeze_data_calls, 2);
+		UT_ASSERT_EQ(freeze_block_length,
+					 2 * sizeof(xl_heap_freeze_plan) + 3 * sizeof(OffsetNumber));
+		header = (xl_heap_freeze_page *)freeze_main_data.data;
+		UT_ASSERT_EQ(header->snapshotConflictHorizon, 70);
+		UT_ASSERT(!header->isCatalogRel);
+		UT_ASSERT_EQ(header->nplans, 2);
+		plans = (xl_heap_freeze_plan *)freeze_block_data.data;
+		offsets = (OffsetNumber *)(freeze_block_data.data + 2 * sizeof(*plans));
+		for (int i = 0; i < 2; i++) {
+			UT_ASSERT_EQ(plans[i].xmax, InvalidTransactionId);
+			UT_ASSERT_EQ(plans[i].t_infomask, HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID);
+			UT_ASSERT_EQ(plans[i].t_infomask2, i == 0 ? 0 : HEAP_ONLY_TUPLE);
+			UT_ASSERT_EQ(plans[i].frzflags, i == 0 ? XLH_INVALID_XVAC : XLH_FREEZE_XVAC);
+			UT_ASSERT_EQ(plans[i].ntuples, i == 0 ? 1 : 2);
+		}
+		for (int i = 0; i < 3; i++) {
+			HeapTupleHeader tuple = freeze_tuple(current_page.data, i + 1);
+
+			UT_ASSERT_EQ(offsets[i], i + 1);
+			/* Xvac's raw field remains observable after MOVED bits clear. */
+			UT_ASSERT_EQ(HeapTupleHeaderGetRawCommandId(tuple),
+						 i == 0 ? InvalidTransactionId : FrozenTransactionId);
+			UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(tuple), 77);
+			UT_ASSERT(HeapTupleHeaderXminFrozen(tuple));
+			UT_ASSERT_EQ(tuple->t_infomask & HEAP_MOVED, 0);
+		}
+		replay_freeze_record();
+	}
+}
+
+UT_TEST(test_freeze_kernel_rejects_invalid_space_before_write)
+{
+	for (int bad = 0; bad < 7; bad++) {
+		HeapTupleFreeze tuple = { 0 };
+
+		reset(XLOG_HEAP2_FREEZE_PAGE, true);
+		tuple.offset = 1;
+		tuple.t_infomask = HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID;
+		switch (bad) {
+		case 0:
+			space_identity.key.database_incarnation++;
+			break;
+		case 1:
+			space_identity.key.locator.relNumber++;
+			break;
+		case 2:
+			space_identity.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+			break;
+		case 3:
+			((PageHeader)current_page.data)->pd_block_scn = 0;
+			break;
+		case 4:
+			break; /* no pre-lock identity */
+		case 5:
+			memset(space_identity.incarnation, 0, 16);
+			break;
+		case 6:
+			relation_data.rd_locator.relNumber++;
+			break;
+		}
+		memcpy(before_page.data, current_page.data, BLCKSZ);
+		expecting_error = true;
+		if (setjmp(error_jump) == 0) {
+			heap_freeze_apply_prepared(&relation_data, 1, 70, &tuple, 1,
+									 bad == 4 ? NULL : &space_identity);
+			UT_ASSERT(false);
+		}
+		expecting_error = false;
+		UT_ASSERT(memcmp(before_page.data, current_page.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(tx_checks + inserts + dirties + edges + CritSectionCount, 0);
+		UT_ASSERT_EQ(next_token, 100);
 	}
 }
 
@@ -549,6 +1860,18 @@ UT_TEST(test_freeze_preserves_native_transaction_sanity_gate)
 
 static unsigned identity_reads;
 static bool identity_ready;
+static unsigned maintenance_requests;
+static bool maintenance_request_ready;
+
+bool
+cluster_heap_freeze_request_maintenance(void)
+{
+	UT_ASSERT_EQ(identity_reads, 1);
+	UT_ASSERT_EQ(CritSectionCount + inserts + dirties + edges, 0);
+	maintenance_requests++;
+	return maintenance_request_ready;
+}
+
 static bool
 maintenance_identity_io(Relation rel, ClusterSpaceIdentity *out)
 {
@@ -561,6 +1884,7 @@ maintenance_identity_io(Relation rel, ClusterSpaceIdentity *out)
 
 UT_TEST(test_vacuum_native_entry_copies_prelock_identity)
 {
+	VacuumParams options = { .options = VACOPT_VACUUM }, *params = &options;
 	struct {
 		Relation rel;
 		bool versioned;
@@ -583,6 +1907,7 @@ UT_TEST(test_vacuum_native_entry_copies_prelock_identity)
 
 UT_TEST(test_vacuum_native_entry_refuses_missing_identity)
 {
+	VacuumParams options = { .options = VACOPT_VACUUM | VACOPT_FREEZE }, *params = &options;
 	struct {
 		Relation rel;
 		bool versioned;
@@ -593,6 +1918,7 @@ UT_TEST(test_vacuum_native_entry_refuses_missing_identity)
 	reset(XLOG_HEAP2_VACUUM, true);
 	identity_reads = 0;
 	identity_ready = false;
+	maintenance_requests = 0;
 	expecting_error = true;
 	if (setjmp(error_jump) == 0) {
 #define cluster_space_relation_get_identity maintenance_identity_io
@@ -602,14 +1928,487 @@ UT_TEST(test_vacuum_native_entry_refuses_missing_identity)
 	}
 	expecting_error = false;
 	UT_ASSERT_EQ(identity_reads, 1);
+	UT_ASSERT_EQ(maintenance_requests, 0);
 	UT_ASSERT_EQ(CritSectionCount + inserts + dirties + edges, 0);
 	UT_ASSERT(memcmp(before_page.data, current_page.data, BLCKSZ) == 0);
+}
+
+static bool
+maintenance_entry(bits32 options)
+{
+	VacuumParams settings = { .options = options, .freeze_min_age = 0 }, *params = &settings;
+	struct {
+		Relation rel;
+		bool versioned;
+		bool shared_maintenance_restricted;
+		ClusterSpaceIdentity identity;
+	} state = { 0 }, *vacrel = &state;
+	Relation rel = &relation_data;
+
+	identity_reads = maintenance_requests = 0;
+	identity_ready = true;
+#define cluster_space_relation_get_identity maintenance_identity_io
+#include "test_cluster_heap_maintenance_identity.inc"
+#undef cluster_space_relation_get_identity
+	UT_ASSERT_EQ(CritSectionCount + inserts + dirties + edges, 0);
+	return vacrel->shared_maintenance_restricted;
+}
+
+UT_TEST(test_explicit_shared_freeze_requests_before_content_locks)
+{
+	reset(XLOG_HEAP2_VACUUM, true);
+	maintenance_request_ready = true;
+	UT_ASSERT(maintenance_entry(VACOPT_VACUUM | VACOPT_FREEZE));
+	UT_ASSERT_EQ(maintenance_requests, 1);
+}
+
+UT_TEST(test_ordinary_or_nonshared_vacuum_does_not_request)
+{
+	for (int scope = 0; scope < 5; scope++) {
+		reset(XLOG_HEAP2_VACUUM, true);
+		if (scope == 1)
+			cluster_shared_config = false;
+		else if (scope == 2)
+			cluster_enabled = false;
+		else if (scope == 3)
+			relform.relpersistence = RELPERSISTENCE_TEMP;
+		else if (scope == 4)
+			relform.relpersistence = RELPERSISTENCE_UNLOGGED;
+		(void)maintenance_entry(VACOPT_VACUUM | (scope == 0 ? 0 : VACOPT_FREEZE));
+		UT_ASSERT_EQ(maintenance_requests, 0);
+	}
+}
+
+UT_TEST(test_deferred_request_preserves_shared_freeze_restriction)
+{
+	reset(XLOG_HEAP2_VACUUM, true);
+	maintenance_request_ready = false;
+	UT_ASSERT(maintenance_entry(VACOPT_VACUUM | VACOPT_FREEZE));
+	UT_ASSERT_EQ(maintenance_requests, 1);
+}
+
+UT_TEST(test_xmin_single_and_batch_require_full_target_not_census_only)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	for (int batch = 0; batch < 2; batch++) {
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		full_target_current = false;
+		UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3)
+			: qualified_xmin_apply(&f, 0)));
+		UT_ASSERT_EQ(full_target_checks, 1);
+		UT_ASSERT_EQ(admission_checks + wal_clock_reads + inserts + edges + dirties + flushes, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		UT_ASSERT(local_x && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
+UT_TEST(test_xmin_target_admission_keeps_original_census_recheck_last)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	qualified_xmin_batch_setup(&f, targets);
+	revoke_target_census = true;
+	UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
+	UT_ASSERT_EQ(full_target_checks, 1);
+	UT_ASSERT_EQ(admission_checks, 1);
+	UT_ASSERT_EQ(wal_clock_reads + inserts + edges + dirties + flushes, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	UT_ASSERT(local_x && f.admission.entered);
+	UT_ASSERT_EQ(backend_pin_count, 1);
+}
+
+UT_TEST(test_xmin_full_target_error_keeps_borrowed_resources_before_wal)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	qualified_xmin_batch_setup(&f, targets);
+	target_recheck_error = expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		(void)qualified_xmin_batch_apply(&f, targets, 3);
+		UT_ASSERT(false);
+	} else {
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT_EQ(full_target_checks, 1);
+		UT_ASSERT_EQ(wal_clock_reads + inserts + edges + dirties + flushes, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		UT_ASSERT(local_x && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+	expecting_error = false;
+}
+
+UT_TEST(test_xmin_bad_final_authority_never_checks_full_target)
+{
+	QualifiedXminFixture f;
+	qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	authority_current = false;
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(full_target_checks, 0);
+	UT_ASSERT_EQ(admission_checks + wal_clock_reads + inserts + dirties + flushes, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_xmin_apply_requires_original_writer_context_before_wal)
+{
+	QualifiedXminFixture f;
+	qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	f.input.writer_context_valid = false;
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(inserts + dirties + flushes + full_target_checks, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_xmin_apply_rejects_replacement_t3_with_same_buffer_generation)
+{
+	QualifiedXminFixture f;
+	qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	original_writer_context.ref.acquisition_generation++;
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(inserts + dirties + flushes + full_target_checks, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_page_recapture_drops_original_writer_context)
+{
+	QualifiedXminFixture f;
+	ResourceXWriterUseContext zero = {0};
+	qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	UT_ASSERT(f.input.writer_context_valid);
+	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&space_identity, 7,
+		current_page.data, &f.input));
+	UT_ASSERT(!f.input.writer_context_valid);
+	UT_ASSERT_EQ(f.input.writer_object_revision, 0);
+	UT_ASSERT(!f.input.writer_object_checked);
+	UT_ASSERT(memcmp(&f.input.writer_context, &zero, sizeof(zero)) == 0);
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(inserts + dirties + flushes + full_target_checks, 0);
+}
+UT_TEST(test_xmin_batch_rejects_replacement_original_writer_before_wal)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	qualified_xmin_batch_setup(&f, targets);
+	original_writer_context.ref.acquisition_generation++;
+	UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
+	UT_ASSERT_EQ(inserts + dirties + flushes + full_target_checks, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_xmin_single_batch_keep_original_writer_object_fence)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	for (int batch = 0; batch < 2; batch++)
+		for (int which = 0; which < 2; which++) {
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			if (which) f.input.writer_object_checked = false;
+			else f.input.writer_object_revision++;
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3)
+				: qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(inserts + dirties + flushes + full_target_checks, 0);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+}
+
+UT_TEST(test_xmin_actual_writer_keeps_original_ko_revision_before_lock)
+{
+	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	fixture_release_original_writer(); resume_allowed = true;
+	current_object_revision = 8;
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(conditional_resumes, 1);
+	UT_ASSERT_EQ(local_lock_attempts + local_unlocks + conditional_unlocks, 0);
+	UT_ASSERT_EQ(inserts + dirties + flushes, 0); UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+	UT_ASSERT(cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0)) == NULL);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_xmin_actual_resumer_inner_error_cleans_before_native_wrapper)
+{
+	for (int after_bind = 0; after_bind < 2; after_bind++) {
+		QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		fixture_release_original_writer(); resume_allowed = expecting_error = true;
+		error_after_local_lock = !after_bind; error_after_ledger_bind = after_bind;
+		if (setjmp(error_jump) == 0) {
+			(void) qualified_xmin_apply(&f, 0); UT_ASSERT(false);
+		} else {
+			UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(local_lock_attempts, 1);
+			UT_ASSERT_EQ(local_unlocks, 1); UT_ASSERT_EQ(conditional_unlocks, 0);
+			UT_ASSERT_EQ(inserts + dirties + flushes, 0); UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT(cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0)) == NULL);
+			UT_ASSERT(PG_exception_stack == NULL);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+		expecting_error = false;
+	}
+}
+
+UT_TEST(test_xmin_released_writer_requires_actual_original_node_grant)
+{
+	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	fixture_release_original_writer(); resume_allowed = true; node_grant_current = false;
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(inserts + dirties + flushes, 0);
+	UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_xmin_released_writer_single_and_batch_reach_native_wal)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f;
+		ClusterHeapFreezeXminTargetV1 targets[3];
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		fixture_release_original_writer(); resume_allowed = true;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3)
+			: qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
+UT_TEST(test_xmin_released_writer_refusal_never_fetches_or_writes)
+{
+	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	fixture_release_original_writer();
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(conditional_resumes, 1);
+	UT_ASSERT_EQ(conditional_unlocks + full_target_checks + inserts + dirties + flushes, 0);
+	UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_xmin_plan_refusal_before_resume_keeps_original_pin)
+{
+	QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+	qualified_xmin_batch_setup(&f, targets);
+	fixture_release_original_writer(); resume_allowed = true;
+	targets[2].original_creator_full_xid = InvalidFullTransactionId;
+	UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
+	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+	UT_ASSERT_EQ(writer_checks + route_checks + authority_checks + full_target_checks, 0);
+	UT_ASSERT_EQ(inserts + dirties + flushes, 0); UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_xmin_missing_proof_refuses_before_writer_resume)
+{
+	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	fixture_release_original_writer(); resume_allowed = true;
+	f.proofs.proof_count = 0;
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+	UT_ASSERT_EQ(writer_checks + route_checks + authority_checks + full_target_checks, 0);
+	UT_ASSERT_EQ(inserts + dirties + flushes, 0);
+	UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_xmin_released_writer_requires_target_and_census_before_resume)
+{
+	QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int batch = 0; batch < 2; batch++) {
+		for (int variant = 0; variant < 3; variant++) {
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			fixture_release_original_writer(); resume_allowed = true;
+			if (variant == 0) full_target_current = false;
+			else if (variant == 1) admission_current = false;
+			else preflight_revoke_census = true;
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3)
+				: qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(target_preflight_checks, 1);
+			UT_ASSERT_EQ(census_preflight_checks, variant == 0 ? 0 : 1);
+			UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+			UT_ASSERT_EQ(full_target_checks + writer_checks + route_checks + authority_checks, 0);
+			UT_ASSERT_EQ(inserts + dirties + flushes, 0);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_xmin_released_writer_rejects_missing_or_different_original_token)
+{
+	QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int variant = 0; variant < 4; variant++) {
+		qualified_xmin_batch_setup(&f, targets);
+		fixture_release_original_writer(); resume_allowed = true;
+		if (variant == 0) f.admission.entered = false;
+		else if (variant == 1) f.admission.record_generation++;
+		else if (variant == 2) f.input.writer_context.r4_record_generation++;
+		UT_ASSERT(!cluster_heap_freeze_apply_xmin_batch_v1(&relation_data, 1,
+			&f.input, &f.page, &f.proofs, &f.fence, &f.authority,
+			variant == 3 ? NULL : &f.admission, targets, 3,
+			FullTransactionIdFromEpochAndXid(1, 100), 10));
+		UT_ASSERT_EQ(target_preflight_checks + census_preflight_checks, 0);
+		UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+		UT_ASSERT_EQ(inserts + dirties + flushes, 0);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(!local_x && !resumed_writer);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_unlocked_target_error_never_restores_writer)
+{
+	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	fixture_release_original_writer(); resume_allowed = preflight_target_error = expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		(void) qualified_xmin_apply(&f, 0); UT_ASSERT(false);
+	} else {
+		UT_ASSERT_EQ(target_preflight_checks, 1);
+		UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks, 0);
+		UT_ASSERT_EQ(local_lock_attempts + inserts + dirties + flushes, 0);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+	expecting_error = false;
+}
+
+UT_TEST(test_xmin_successful_preflight_still_requires_final_target)
+{
+	QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int batch = 0; batch < 2; batch++) {
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		fixture_release_original_writer(); resume_allowed = allow_preflight_target = true;
+		full_target_current = false;
+		UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3)
+			: qualified_xmin_apply(&f, 0)));
+		UT_ASSERT_EQ(target_preflight_checks, 1); UT_ASSERT_EQ(census_preflight_checks, 1);
+		UT_ASSERT_EQ(full_target_checks, 1);
+		UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
+		UT_ASSERT_EQ(inserts + dirties + flushes, 0); UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_successful_preflight_still_requires_final_census)
+{
+	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	fixture_release_original_writer(); resume_allowed = revoke_target_census = true;
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(target_preflight_checks, 1); UT_ASSERT_EQ(census_preflight_checks, 1);
+	UT_ASSERT_EQ(full_target_checks, 1); UT_ASSERT_EQ(admission_checks, 1);
+	UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
+	UT_ASSERT_EQ(inserts + dirties + flushes, 0); UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_xmin_resumed_writer_target_error_runs_finally)
+{
+	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	fixture_release_original_writer(); resume_allowed = target_recheck_error = expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		(void) qualified_xmin_apply(&f, 0); UT_ASSERT(false);
+	} else {
+		UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
+		UT_ASSERT_EQ(inserts + dirties + flushes, 0); UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+	}
+	expecting_error = false;
+}
+
+UT_TEST(test_xmin_resumed_writer_flush_error_runs_finally_after_wal)
+{
+	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	fixture_release_original_writer(); resume_allowed = flush_error = expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		(void) qualified_xmin_apply(&f, 0); UT_ASSERT(false);
+	} else {
+		UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+	}
+	expecting_error = false;
+}
+
+UT_TEST(test_xmin_resume_error_keeps_original_pin_and_admission)
+{
+	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	fixture_release_original_writer(); resume_error = expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		(void) qualified_xmin_apply(&f, 0); UT_ASSERT(false);
+	} else {
+		UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 0);
+		UT_ASSERT_EQ(inserts + dirties + flushes, 0); UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+	}
+	expecting_error = false;
+}
+
+UT_TEST(test_xmin_existing_local_x_never_reacquires_or_releases_it)
+{
+	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	resume_allowed = true;
+	UT_ASSERT(qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks, 0);
+	UT_ASSERT(local_x && f.admission.entered);
+	UT_ASSERT(fixture_node_grant_matches()); UT_ASSERT_EQ(backend_pin_count, 1);
+}
+
+UT_TEST(test_xmin_existing_share_lock_is_not_a_resume_scope)
+{
+	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	fixture_release_original_writer(); local_share = resume_allowed = true;
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + inserts + dirties + flushes, 0);
+	UT_ASSERT(!local_x && local_share && f.admission.entered);
+	UT_ASSERT_EQ(backend_pin_count, 1);
 }
 
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(66);
+	UT_RUN(test_xmin_actual_writer_keeps_original_ko_revision_before_lock);
+	UT_RUN(test_xmin_actual_resumer_inner_error_cleans_before_native_wrapper);
+	UT_RUN(test_xmin_released_writer_requires_actual_original_node_grant);
+	UT_RUN(test_xmin_released_writer_single_and_batch_reach_native_wal);
+	UT_RUN(test_xmin_released_writer_refusal_never_fetches_or_writes);
+	UT_RUN(test_xmin_plan_refusal_before_resume_keeps_original_pin);
+	UT_RUN(test_xmin_missing_proof_refuses_before_writer_resume);
+	UT_RUN(test_xmin_released_writer_requires_target_and_census_before_resume);
+	UT_RUN(test_xmin_released_writer_rejects_missing_or_different_original_token);
+	UT_RUN(test_xmin_unlocked_target_error_never_restores_writer);
+	UT_RUN(test_xmin_successful_preflight_still_requires_final_target);
+	UT_RUN(test_xmin_successful_preflight_still_requires_final_census);
+	UT_RUN(test_xmin_resumed_writer_target_error_runs_finally);
+	UT_RUN(test_xmin_resumed_writer_flush_error_runs_finally_after_wal);
+	UT_RUN(test_xmin_resume_error_keeps_original_pin_and_admission);
+	UT_RUN(test_xmin_existing_local_x_never_reacquires_or_releases_it);
+	UT_RUN(test_xmin_existing_share_lock_is_not_a_resume_scope);
+	UT_RUN(test_xmin_single_batch_keep_original_writer_object_fence);
+	UT_RUN(test_page_recapture_drops_original_writer_context);
+	UT_RUN(test_xmin_batch_rejects_replacement_original_writer_before_wal);
+	UT_RUN(test_xmin_apply_requires_original_writer_context_before_wal);
+	UT_RUN(test_xmin_apply_rejects_replacement_t3_with_same_buffer_generation);
+	UT_RUN(test_xmin_single_and_batch_require_full_target_not_census_only);
+	UT_RUN(test_xmin_target_admission_keeps_original_census_recheck_last);
+	UT_RUN(test_xmin_full_target_error_keeps_borrowed_resources_before_wal);
+	UT_RUN(test_xmin_bad_final_authority_never_checks_full_target);
 	UT_RUN(test_prune_native_plan_and_version);
 	UT_RUN(test_shared_freeze_refuses_before_tuple_or_wal);
 	UT_RUN(test_vacuum_native_unused_and_version);
@@ -620,8 +2419,36 @@ main(void)
 	UT_RUN(test_prune_hint_missing_identity_refuses_before_mutation);
 	UT_RUN(test_invalid_identity_refuses_before_mutation);
 	UT_RUN(test_freeze_preserves_native_transaction_sanity_gate);
+	UT_RUN(test_qualified_freeze_kernel_changes_only_planned_headers);
+	UT_RUN(test_exact_xmin_plan_preserves_xmax_through_native_wal_and_redo);
+	UT_RUN(test_qualified_xmin_apply_wal_flush_and_redo);
+	UT_RUN(test_xmin_apply_requires_original_backend_pin_before_page_or_writer_use);
+	UT_RUN(test_xmin_batch_requires_original_backend_pin_without_repin_or_write);
+	UT_RUN(test_qualified_xmin_rejects_missing_or_changed_ownership);
+	UT_RUN(test_qualified_xmin_rejects_stale_physical_row_and_bounds);
+	UT_RUN(test_qualified_xmin_flush_error_propagates_after_native_write);
+	UT_RUN(test_freeze_native_wal_dedup_and_redo);
+	UT_RUN(test_freeze_kernel_rejects_invalid_space_before_write);
 	UT_RUN(test_vacuum_native_entry_copies_prelock_identity);
 	UT_RUN(test_vacuum_native_entry_refuses_missing_identity);
+	UT_RUN(test_explicit_shared_freeze_requests_before_content_locks);
+	UT_RUN(test_ordinary_or_nonshared_vacuum_does_not_request);
+	UT_RUN(test_deferred_request_preserves_shared_freeze_restriction);
+	UT_RUN(test_qualified_xmin_rejects_recapture_with_old_proof_version);
+	UT_RUN(test_xmin_apply_rejects_unbounded_cutoffs_before_native_write);
+	UT_RUN(test_xmin_batch_rejects_unbounded_cutoffs_before_native_write);
+	UT_RUN(test_xmin_apply_rejects_unbound_original_identity_before_wal);
+	UT_RUN(test_xmin_batch_later_origin_epoch_mismatch_is_atomic);
+	UT_RUN(test_xmin_batch_one_wal_fence_fullxid_horizon_and_redo);
+	UT_RUN(test_xmin_batch_later_unqualified_target_changes_nothing);
+	UT_RUN(test_xmin_batch_rejects_duplicate_physical_rows);
+	UT_RUN(test_xmin_batch_runtime_bounds_and_empty_reject);
+	UT_RUN(test_xmin_batch_later_stale_row_rejects_before_fence);
+	UT_RUN(test_xmin_batch_rejects_ambiguous_native_horizon);
+	UT_RUN(test_xmin_batch_final_authority_refusal_changes_nothing);
+	UT_RUN(test_xmin_single_and_batch_reject_unknown_or_behind_wal_clock);
+	UT_RUN(test_xmin_single_and_batch_wal_clock_accept_time_equal_or_ahead);
+	UT_RUN(test_xmin_batch_flush_error_keeps_borrowed_resources);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

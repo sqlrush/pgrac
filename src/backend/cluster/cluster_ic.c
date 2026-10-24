@@ -604,11 +604,15 @@ cluster_ic_local_capability_word(void)
 		  | PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1 | PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1
 		  | PGRAC_IC_HELLO_CAP_CONTROL_ROOT_V1 | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
 		  | PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
+	capabilities |= PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2;
 
 	/* PGRAC: codec support only; never an application/admission assertion.
 	 * Author: SqlRush <sqlrush@gmail.com> */
 	if (cluster_shared_config)
 		capabilities |= PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V3 | PGRAC_IC_HELLO_CAP_KO_SHARED_V2;
+	if (cluster_shared_config && cluster_interconnect_tier == CLUSTER_IC_TIER_1)
+		capabilities
+			|= PGRAC_IC_HELLO_CAP_KO_COMMITTED_DISCARD_V1 | PGRAC_IC_HELLO_CAP_KO_COMMIT_FENCE_V1;
 	if (cluster_smart_fusion && cluster_interconnect_tier == cluster_smart_fusion_tier_min)
 		capabilities |= PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2;
 	if (!cluster_ic_suppress_caps_reply)

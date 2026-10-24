@@ -4,6 +4,7 @@
 
 #include "cluster/cluster_gcs.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_pi_rebuild.h"
 #include "cluster/cluster_semantic_activation.h"
@@ -228,7 +229,8 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 		pi_rebuild_callback_registered = true;
 	}
 	state = cluster_grd_pi_rebuild_snapshot_v1(&cut);
-	if (ShutdownRequestPending || state != 1 || !cluster_grd_pi_rebuild_gate_v1()
+	if (ShutdownRequestPending || cluster_normal_stop_requested()
+		|| state != 1 || !cluster_grd_pi_rebuild_gate_v1()
 		|| !cluster_wal_thread_current_v2_ref(&local)
 		|| local.claim.identity.origin_owner_incarnation != cut.self_boot
 		|| local.claim.identity.origin_node_id != cluster_node_id)

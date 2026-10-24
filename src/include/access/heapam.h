@@ -19,6 +19,8 @@
  *   Modified by: SqlRush <sqlrush@gmail.com>
  *   Carry cluster successor proofs and inplace SPACE identities through
  *   native heap consumers; non-cluster signatures remain unchanged.
+ *   Bind shared write targets before executor children can create references.
+ *   See 2026-10-18-pre2-m1-design-integration.md.
  */
 
 #include "access/relation.h"	/* for backward compatibility */
@@ -48,6 +50,9 @@ struct TupleTableSlot;
 struct VacuumCutoffs;
 #ifdef USE_PGRAC_CLUSTER
 struct ClusterSpaceIdentity;
+/* Return true only after the original canonical BIND for a shared target.
+ * Private targets are untouched; unsupported shared subtransactions ERROR. */
+extern bool cluster_heap_preflight_write(Relation relation, const char *operation);
 #endif
 
 #ifdef USE_PGRAC_CLUSTER

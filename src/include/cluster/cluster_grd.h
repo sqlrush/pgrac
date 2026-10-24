@@ -1052,6 +1052,21 @@ typedef struct ClusterGrdHolderId {
 
 StaticAssertDecl(sizeof(ClusterGrdHolderId) == 24, "ClusterGrdHolderId 4-tuple ABI 24-byte lock");
 
+/* A read-only current-master observation, never a release or replay barrier.
+ * UNKNOWN includes queued acquisition/conversion/reservation of this identity.
+ * Even ABSENT does not exclude future arrivals on an unordered transport. */
+typedef enum ClusterGrdHolderObservation {
+	CLUSTER_GRD_HOLDER_UNKNOWN = 0,
+	CLUSTER_GRD_HOLDER_PRESENT = 1,
+	CLUSTER_GRD_HOLDER_ABSENT = 2
+} ClusterGrdHolderObservation;
+
+extern ClusterGrdHolderObservation cluster_grd_holder_observe(const ClusterResId *resid,
+															  const ClusterGrdHolderId *holder,
+															  uint64 master_generation,
+															  LOCKMODE *mode_out);
+
+
 /*
  * spec-5.8 D1c/D1e — waiter deadlock metadata threaded from the waiting
  * backend's D1d wait-state into the master-side WFG vertex.  Neither field is
@@ -1497,6 +1512,69 @@ typedef struct ClusterGrdConvert {
 	uint32 skip_count;	   /* scan-on-grant jump count (D2; convert: reserved) */
 	bool boosted;		   /* head-of-line boosted (D2; convert: reserved) */
 } ClusterGrdConvert;
+
+/* Passive per-entry diagnostics, never grant/release or absence authority.
+ * Value copies contain no shared pointers. Ordinals preserve native vector
+ * order; a reservation is explicitly distinct from a granted holder. */
+typedef enum ClusterGrdQueueMemberKind {
+	CLUSTER_GRD_QUEUE_HOLDER = 0,
+	CLUSTER_GRD_QUEUE_WAITER,
+	CLUSTER_GRD_QUEUE_CONVERT,
+	CLUSTER_GRD_QUEUE_RESERVATION
+} ClusterGrdQueueMemberKind;
+
+typedef struct ClusterGrdQueueMemberSnapshot {
+	ClusterGrdQueueMemberKind kind;
+	int ordinal;
+	ClusterGrdHolderId id;
+	int32 source_node_id;
+	uint32 lock_group_procno_plus_one;
+	LOCKMODE mode;
+	LOCKMODE current_mode;
+	uint32 request_opcode;
+	TransactionId waiter_xid;
+	uint64 wait_seq;
+	uint64 shard_master_generation;
+	TimestampTz wait_start;
+	uint64 fair_queue_seq;
+	uint32 skip_count;
+	bool boosted;
+} ClusterGrdQueueMemberSnapshot;
+
+typedef struct ClusterGrdQueueSnapshot {
+	ClusterResId resid;
+	uint64 generation;
+	uint64 last_modified_scn;
+	uint32 state_flags;
+	uint32 pin_count;
+	int ngranted;
+	int nwaiters;
+	int nconverts;
+	int nreservations;
+	int copied;
+	int required;
+} ClusterGrdQueueSnapshot;
+
+typedef enum ClusterGrdQueueObservationStatus {
+	CLUSTER_GRD_QUEUE_OBSERVED = 0,
+	CLUSTER_GRD_QUEUE_ABSENT,
+	CLUSTER_GRD_QUEUE_UNAVAILABLE,
+	CLUSTER_GRD_QUEUE_TRUNCATED,
+	CLUSTER_GRD_QUEUE_INVALID
+} ClusterGrdQueueObservationStatus;
+
+extern ClusterGrdQueueObservationStatus
+cluster_grd_queue_snapshot(const ClusterResId *resid, ClusterGrdQueueSnapshot *out,
+						   ClusterGrdQueueMemberSnapshot *members, int capacity);
+
+/* The key walk is not a globally atomic graph. Every callback receives its
+ * own status/generation and runs after all native locks have been released.
+ * No lookup pin, creation, counter increment or cold reclaim is performed. */
+typedef void (*ClusterGrdQueueSnapshotVisitor)(void *ctx, ClusterGrdQueueObservationStatus status,
+											   const ClusterGrdQueueSnapshot *entry,
+											   const ClusterGrdQueueMemberSnapshot *members);
+extern bool cluster_grd_queue_snapshots_walk(ClusterGrdQueueSnapshotVisitor visitor, void *ctx,
+											 int member_capacity);
 
 StaticAssertDecl(sizeof(ClusterGrdConvert) == 88,
 				 "ClusterGrdConvert layout pinned (spec-5.1b D2 64B; spec-5.8 D1e +8 wait_seq; "

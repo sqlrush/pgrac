@@ -321,6 +321,63 @@ UT_TEST(nonshared_subtrans_has_no_sync_work)
 	UT_ASSERT(fixture_process_sync());
 }
 
+UT_TEST(shared_retired_sync_cancels_without_success_statistics)
+{
+	FileTag tag = {0};
+	tag.handler = SYNC_HANDLER_CLUSTER_SHARED;
+	tag.rlocator = (RelFileLocator){1663, 5, 16388};
+	tag.forknum = MAIN_FORKNUM;
+	RememberSyncRequest(&tag, SYNC_REQUEST);
+	shared_sync_result = 1; /* Committed DROP, not a successful fsync. */
+	shared_sync_errno = EIO; /* Classification must not depend on stale errno. */
+	UT_ASSERT(fixture_process_sync());
+	UT_ASSERT_EQ(shared_sync_calls, 1);
+	UT_ASSERT(hash_search(pendingOps, &tag, HASH_FIND, NULL) == NULL);
+	UT_ASSERT_EQ(CheckpointStats.ckpt_sync_rels, 0);
+	UT_ASSERT_EQ(CheckpointStats.ckpt_longest_sync, 0);
+	UT_ASSERT_EQ(CheckpointStats.ckpt_agg_sync_time, 0);
+	/* A late original request meets the same lifetime tombstone. */
+	RememberSyncRequest(&tag, SYNC_REQUEST);
+	UT_ASSERT(fixture_process_sync());
+	UT_ASSERT_EQ(shared_sync_calls, 2);
+	UT_ASSERT(hash_search(pendingOps, &tag, HASH_FIND, NULL) == NULL);
+	UT_ASSERT_EQ(CheckpointStats.ckpt_sync_rels, 0);
+}
+
+UT_TEST(shared_sync_refusal_keeps_pending_then_original_retry_succeeds)
+{
+	FileTag tag = {0};
+	PendingFsyncEntry *entry;
+	tag.handler = SYNC_HANDLER_CLUSTER_SHARED;
+	tag.rlocator = (RelFileLocator){1663, 5, 16388};
+	RememberSyncRequest(&tag, SYNC_REQUEST);
+	shared_sync_result = -1;
+	shared_sync_errno = EAGAIN;
+	UT_ASSERT(!fixture_process_sync());
+	UT_ASSERT_EQ(error_level, PANIC);
+	entry = hash_search(pendingOps, &tag, HASH_FIND, NULL);
+	UT_ASSERT(entry != NULL && !entry->canceled);
+	shared_sync_result = 0;
+	UT_ASSERT(fixture_process_sync());
+	UT_ASSERT_EQ(shared_sync_calls, 2);
+	UT_ASSERT_EQ(CheckpointStats.ckpt_sync_rels, 1);
+	UT_ASSERT(hash_search(pendingOps, &tag, HASH_FIND, NULL) == NULL);
+}
+
+UT_TEST(shared_unknown_result_is_not_a_retirement)
+{
+	FileTag tag = {0};
+	PendingFsyncEntry *entry;
+	tag.handler = SYNC_HANDLER_CLUSTER_SHARED;
+	tag.rlocator = (RelFileLocator){1663, 5, 16388};
+	RememberSyncRequest(&tag, SYNC_REQUEST);
+	shared_sync_result = 2;
+	shared_sync_errno = EIO;
+	UT_ASSERT(!fixture_process_sync());
+	entry = hash_search(pendingOps, &tag, HASH_FIND, NULL);
+	UT_ASSERT(entry != NULL && !entry->canceled);
+}
+
 static void
 run_case(void (*fn)(void))
 {
@@ -365,11 +422,14 @@ WRAPPED_CASE(wrapped_old_segment_keeps_current_parent)
 WRAPPED_CASE(absorb_copy_failure_does_not_delete_or_clear_queue)
 WRAPPED_CASE(absorb_hash_failure_after_transfer_remains_panic)
 WRAPPED_CASE(nonshared_subtrans_has_no_sync_work)
+WRAPPED_CASE(shared_retired_sync_cancels_without_success_statistics)
+WRAPPED_CASE(shared_sync_refusal_keeps_pending_then_original_retry_succeeds)
+WRAPPED_CASE(shared_unknown_result_is_not_a_retirement)
 
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(22);
 	UT_RUN(run_queued_sync_then_checkpointer_forget);
 	UT_RUN(run_queued_sync_then_subtrans_truncate);
 	UT_RUN(run_delete_waits_for_original_writer_to_queue_sync);
@@ -389,6 +449,9 @@ main(void)
 	UT_RUN(run_absorb_copy_failure_does_not_delete_or_clear_queue);
 	UT_RUN(run_absorb_hash_failure_after_transfer_remains_panic);
 	UT_RUN(run_nonshared_subtrans_has_no_sync_work);
+	UT_RUN(run_shared_retired_sync_cancels_without_success_statistics);
+	UT_RUN(run_shared_sync_refusal_keeps_pending_then_original_retry_succeeds);
+	UT_RUN(run_shared_unknown_result_is_not_a_retirement);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

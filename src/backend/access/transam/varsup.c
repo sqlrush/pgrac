@@ -112,6 +112,9 @@ GetNewTransactionId(bool isSubXact)
 	if (IsBootstrapProcessingMode())
 	{
 		Assert(!isSubXact);
+#ifdef USE_PGRAC_CLUSTER
+		pg_atomic_write_u64(&MyProc->cluster_top_full_xid_atomic, 0);
+#endif
 		MyProc->xid = BootstrapTransactionId;
 		ProcGlobal->xids[MyProc->pgxactoff] = BootstrapTransactionId;
 		return FullTransactionIdFromEpochAndXid(0, BootstrapTransactionId);
@@ -450,6 +453,13 @@ retry_cluster_xid_reservation:
 		Assert(MyProc->subxidStatus.count == 0);
 		Assert(!MyProc->subxidStatus.overflowed);
 
+#ifdef USE_PGRAC_CLUSTER
+		/* Keep the actual assignment, before either raw-XID publication.
+		 * ProcArray readers need not also hold XidGenLock. */
+		pg_atomic_write_u64(&MyProc->cluster_top_full_xid_atomic,
+							U64FromFullTransactionId(full_xid));
+		pg_write_barrier();
+#endif
 		/* LWLockRelease acts as barrier */
 		MyProc->xid = xid;
 		ProcGlobal->xids[MyProc->pgxactoff] = xid;

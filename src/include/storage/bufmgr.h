@@ -233,6 +233,31 @@ extern bool FlushOneBufferForSpaceRecovery(Buffer buffer,
 #endif
 extern void FlushRelationBuffers(Relation rel);
 extern void FlushRelationsAllBuffers(struct SMgrRelationData **smgrs, int nrels);
+#ifdef USE_PGRAC_CLUSTER
+/* Original abort pending-delete owns the exact newly created shared storage.
+ * Use the ordinary writer, then check that it left no dirty/IO/error image.
+ * This grants no eviction/death authority; the original clean eviction and
+ * physical deletion contracts must still complete. False retains that owner. */
+extern bool cluster_bufmgr_flush_created_abort_v1(struct SMgrRelationData *smgr);
+
+typedef enum ClusterBufferDrainResult {
+	CLUSTER_BUFFER_DRAIN_INVALID = 0,
+	CLUSTER_BUFFER_DRAIN_MORE,
+	CLUSTER_BUFFER_DRAIN_WAIT,
+	CLUSTER_BUFFER_DRAIN_REDIRTIED,
+	CLUSTER_BUFFER_DRAIN_EMPTY
+} ClusterBufferDrainResult;
+
+extern ClusterBufferDrainResult cluster_bufmgr_drain_relation_v3(struct SMgrRelationData *smgr,
+																 bool flush, uint32 *budget,
+																 uint32 *cursor);
+/* Only an immutable, I/O-retired committed old-object tombstone admits this
+ * no-write discard. Directory responsibility is not completed here. */
+extern ClusterBufferDrainResult cluster_bufmgr_discard_relation_v4(RelFileLocator locator,
+																 uint32 *budget, uint32 *cursor);
+
+#endif
+
 extern void CreateAndCopyRelationData(RelFileLocator src_rlocator,
 									  RelFileLocator dst_rlocator,
 									  bool permanent);
@@ -344,6 +369,31 @@ extern bool ClusterLockBufferShareBarrierAware(Buffer buffer);
 extern Buffer LockBufferForVisibilityMapPageInit(Buffer buffer);
 extern Buffer LockBufferForFreeSpaceMapPageInit(Buffer buffer);
 extern bool ConditionalLockBuffer(Buffer buffer);
+/* Read only: an existing shared-buffer pin held by this backend. Does not
+ * acquire a pin or grant content/PCM writer authority. */
+extern bool ClusterBufferHasSharedPin(Buffer buffer);
+struct ResourceXWriterUseContext;
+/* Borrow the original ACTIVE writer while its native content-X is held.
+ * Refusal preserves out; neither entry point fetches/grants current. */
+extern bool ClusterBufferCaptureMutationContext(
+	Buffer buffer, struct ResourceXWriterUseContext *out,
+	uint64 *object_revision, bool *object_checked);
+extern bool ClusterBufferMutationContextMatches(
+	Buffer buffer, const struct ResourceXWriterUseContext *expected,
+	uint64 object_revision, bool object_checked);
+/* Resume only the original retained T3 use; failure leaves the borrowed pin,
+ * no ledger or content lock, with no current acquisition or remote wait. */
+extern bool ClusterConditionalLockBufferWithMutationContext(
+	Buffer buffer, const struct ResourceXWriterUseContext *expected,
+	uint64 object_revision, bool object_checked);
+/* Pair only a successful conditional writer resume; local unlock/unpin only. */
+/* Successful conditional mutation scope only; preserve the original pin. */
+extern void ClusterUnlockBufferAfterConditionalMutation(Buffer buffer);
+extern void ClusterUnlockReleaseBufferAfterConditionalMutation(Buffer buffer);
+/* Read-only successful ConditionalLockBuffer() only; no PCM writer cleanup. */
+extern void ClusterUnlockReleaseBufferAfterConditionalRead(Buffer buffer);
+/* Conditional local X plus cluster_space_hint_begin/finish() publication only. */
+extern void ClusterUnlockReleaseBufferAfterConditionalHint(Buffer buffer);
 extern void LockBufferForCleanup(Buffer buffer);
 extern bool ConditionalLockBufferForCleanup(Buffer buffer);
 extern bool IsBufferCleanupOK(Buffer buffer);

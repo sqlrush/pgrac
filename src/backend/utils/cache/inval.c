@@ -813,6 +813,11 @@ LocalExecuteInvalidationMessage(SharedInvalidationMessage *msg)
 			InvalidateCatalogSnapshot();
 		else if (msg->sn.dbId == MyDatabaseId)
 			InvalidateCatalogSnapshot();
+	} else if (msg->id == SHAREDINVALKO_COMMIT_ID) {
+		/* Command-end, abort and WAL replay have no authenticated remote
+		 * operation owner. Only live publication delivery consumes it. */
+		if (!SharedInvalKoCommitIsValid(&msg->ko))
+			elog(FATAL, "invalid KO commit invalidation");
 	} else
 		elog(FATAL, "unrecognized SI message ID: %d", msg->id);
 }
@@ -1024,6 +1029,24 @@ ProcessCommittedInvalidationMessages(const SharedInvalidationMessage *msgs, int 
 }
 
 #ifdef USE_PGRAC_CLUSTER
+void
+CacheInvalidateKoCommit(uint64 batch_id)
+{
+	SharedInvalidationMessage msg = { 0 };
+	InvalidationInfo *info;
+
+	msg.ko.id = SHAREDINVALKO_COMMIT_ID;
+	msg.ko.version = SHAREDINVALKO_COMMIT_VERSION;
+	msg.ko.batch_lo = (uint32)batch_id;
+	msg.ko.batch_hi = (uint32)(batch_id >> 32);
+	if (!SharedInvalKoCommitIsValid(&msg.ko) || !cluster_shared_catalog
+		|| !cluster_peer_mode_enabled() || GetCurrentTransactionNestLevel() != 1)
+		ereport(ERROR,
+				(errmsg("KO commit publication requires a shared top-level transaction")));
+	info = PrepareInvalidationState();
+	AddInvalidationMessage(&info->CurrentCmdInvalidMsgs, RelCacheMsgs, &msg);
+}
+
 /* PGRAC: capture the admitted cohort before commit becomes irreversible.
  * Catalog rows use the original durable transaction outcome. Author: SqlRush. */
 void

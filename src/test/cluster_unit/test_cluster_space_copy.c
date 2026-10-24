@@ -12,10 +12,15 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include <setjmp.h>
 
 #include "catalog/pg_class.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
+#include "access/xlog.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_ko.h"
+#include "cluster/storage/cluster_smgr.h"
 #include "storage/bufmgr.h"
 #include "storage/smgr.h"
 #include "utils/rel.h"
@@ -27,8 +32,53 @@ static SMgrRelationData source, destination;
 static RelationData relation;
 static FormData_pg_class form;
 static unsigned created, copied, logged, flushes, drops, creates;
-static bool registered;
+static bool registered, refuse_copy;
+static unsigned opens, qualifications;
+static jmp_buf refusal_jump;
 static uint64 destination_identity;
+
+/* This older fork-selection fixture uses the native/nonshared route. The
+ * finite-owner branches of these exact callers run in copy_version. */
+bool cluster_enabled = false, cluster_shared_config = false;
+int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+bool
+RecoveryInProgress(void)
+{
+	return false;
+}
+
+int
+cluster_smgr_which_for(RelFileLocator locator, BackendId backend)
+{
+	abort();
+}
+
+bool
+cluster_ko_create_begin_v3(RelFileLocator locator, uint64 *serial)
+{
+	abort();
+}
+
+bool
+cluster_ko_create_write_begin_v3(RelFileLocator locator, uint64 serial)
+{
+	abort();
+}
+
+void
+cluster_ko_create_abort_v3(uint64 serial)
+{
+	abort();
+}
+
+bool
+cluster_ko_create_end_v3(uint64 serial, bool complete)
+{
+	abort();
+}
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -40,6 +90,7 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 SMgrRelation
 smgropen(RelFileLocator locator, BackendId backend)
 {
+	opens++;
 	if (backend != InvalidBackendId)
 		abort();
 	if (RelFileLocatorEquals(locator, source.smgr_rlocator.locator))
@@ -55,6 +106,20 @@ smgrsetowner(SMgrRelation *owner, SMgrRelation rel)
 	(void)owner;
 	(void)rel;
 	abort();
+}
+
+/* The eligibility implementation is linked by storage_subtransaction. Here
+ * force its refusal to check that the real callers have done no earlier I/O. */
+void
+RelationCheckStorageTransaction(RelFileLocator locator, char persistence,
+								const char *operation)
+{
+	UT_ASSERT(RelFileLocatorEquals(locator, destination.smgr_rlocator.locator));
+	UT_ASSERT_EQ(persistence, form.relpersistence);
+	UT_ASSERT(strcmp(operation, "copy") == 0);
+	qualifications++;
+	if (refuse_copy)
+		longjmp(refusal_jump, 1);
 }
 
 SMgrRelation
@@ -144,9 +209,14 @@ smgrcloserellocator(RelFileLocatorBackend locator)
 }
 
 /* Exact production owner bodies, extracted by name with count guards. */
+#undef elog
+#define elog(elevel, ...) abort()
+#define pg_re_throw abort
 #include "test_cluster_space_copy_heap.inc"
 #include "test_cluster_space_copy_index.inc"
 #include "test_cluster_space_copy_database.inc"
+#undef pg_re_throw
+#undef elog
 
 static void
 reset(char persistence)
@@ -165,7 +235,8 @@ reset(char persistence)
 	form.relpersistence = persistence;
 	created = copied = logged = flushes = drops = creates = 0;
 	destination_identity = 0;
-	registered = false;
+	registered = refuse_copy = false;
+	opens = qualifications = 0;
 }
 
 static void
@@ -213,10 +284,30 @@ UT_TEST(test_unlogged_copy_keeps_native_init_wal)
 	check_copy(true);
 }
 
+UT_TEST(test_copy_refusal_precedes_open_flush_and_creation)
+{
+	for (int variant = 0; variant < 2; variant++)
+	{
+		reset(RELPERSISTENCE_PERMANENT);
+		refuse_copy = true;
+		if (setjmp(refusal_jump) == 0)
+		{
+			if (variant == 0)
+				heapam_relation_copy_data(&relation, &destination.smgr_rlocator.locator);
+			else
+				index_copy_data(&relation, destination.smgr_rlocator.locator);
+			UT_ASSERT(false);
+		}
+		UT_ASSERT_EQ(qualifications, 1);
+		UT_ASSERT_EQ(opens + created + copied + logged + flushes + drops + creates, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(5);
+	UT_RUN(test_copy_refusal_precedes_open_flush_and_creation);
 	UT_RUN(test_heap_tablespace_copy_keeps_new_identity);
 	UT_RUN(test_index_tablespace_copy_keeps_new_identity);
 	UT_RUN(test_database_copy_uses_outer_abort_owner);

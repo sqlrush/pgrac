@@ -27,20 +27,28 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_control.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_ic.h"
+#include "cluster/cluster_ko.h"
+#include "commands/progress.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "storage/smgr.h"
 #include "storage/checksum.h"
 #include "storage/checksum_impl.h"
 #include "utils/rel.h"
+#include "utils/tuplesort.h"
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
 
 bool cluster_enabled = true, cluster_shared_config = true;
 int cluster_node_id = 0, wal_level = WAL_LEVEL_REPLICA;
+int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
 bool cluster_recmerge_window_active, cluster_recmerge_apply_foreign;
 uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
 
@@ -62,6 +70,71 @@ static BlockNumber reserved;
 static unsigned reservations;
 static bool fail_reserve;
 static jmp_buf error_jump;
+
+/* The real builder owns this fixture capability; no KO/IO completion is
+ * inferred from it. Actual KO table/READY behavior has its own target. */
+enum BuildSite { SITE_NONE, SITE_IDENTITY, SITE_RESERVE, SITE_WAL,
+	SITE_FLUSH, SITE_READ, SITE_ZERO, SITE_DATA, SITE_SYNC };
+static enum BuildSite lose_at, fail_at;
+static bool owner_live, owner_allowed, owner_end_allowed, observe_owner;
+static unsigned owner_begins, owner_ends, owner_aborts, unowned_effects;
+static unsigned site_count[10], load_pages;
+static BlockNumber load_first;
+static bool load_backfill;
+static BTWriteState *active_state;
+static BTScanInsertData scan_key;
+
+static void
+observe(enum BuildSite site)
+{
+	site_count[site]++;
+	if (observe_owner && !owner_live)
+		unowned_effects++;
+	if (lose_at == site)
+		owner_allowed = false;
+	if (fail_at == site)
+		elog(ERROR, "fixture build effect failure");
+}
+
+bool
+cluster_ko_build_begin_v3(RelFileLocator locator, uint64 *serial)
+{
+	UT_ASSERT(RelFileLocatorEquals(locator, relation.rd_locator));
+	owner_begins++;
+	*serial = 0;
+	if (!owner_allowed || owner_live)
+		return false;
+	owner_live = true;
+	*serial = 77;
+	return true;
+}
+bool
+cluster_ko_create_write_begin_v3(RelFileLocator locator, uint64 serial)
+{
+	return owner_allowed && owner_live && serial == 77
+		&& RelFileLocatorEquals(locator, relation.rd_locator);
+}
+bool
+cluster_ko_create_end_v3(uint64 serial, bool complete)
+{
+	UT_ASSERT_EQ(serial, 77);
+	UT_ASSERT(complete && owner_live);
+	if (!owner_end_allowed || !owner_allowed)
+		return false;
+	owner_live = false;
+	owner_ends++;
+	return true;
+}
+void
+cluster_ko_create_abort_v3(uint64 serial)
+{
+	UT_ASSERT(serial == 0 || serial == 77);
+	if (serial != 0) {
+		UT_ASSERT(owner_live);
+		owner_allowed = false;
+		owner_aborts++;
+	}
+}
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -93,6 +166,13 @@ errfinish(const char *file, int line, const char *function)
 		printf("# unexpected error %s:%d %s\n", file, line, function);
 		abort();
 	}
+	pg_re_throw();
+}
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
 	longjmp(error_jump, 1);
 }
 bool
@@ -169,6 +249,7 @@ smgrextend(SMgrRelation rel, ForkNumber forknum, BlockNumber block, const void *
 		UT_ASSERT(block < reserved);
 	if (cluster_shared_config && !PageIsNew(page))
 		UT_ASSERT(flushed >= PageGetLSN(page) && flushed != InvalidXLogRecPtr);
+	observe(PageIsNew(page) ? SITE_ZERO : SITE_DATA);
 	memcpy(pages[block].data, page, BLCKSZ);
 	count++;
 	writes++;
@@ -181,6 +262,7 @@ smgrwrite(SMgrRelation rel, ForkNumber forknum, BlockNumber block, const void *d
 	UT_ASSERT(block < count);
 	if (cluster_shared_config)
 		UT_ASSERT(flushed >= PageGetLSN(page) && flushed != InvalidXLogRecPtr);
+	observe(SITE_DATA);
 	memcpy(pages[block].data, page, BLCKSZ);
 	writes++;
 }
@@ -188,6 +270,7 @@ void
 smgrread(SMgrRelation rel, ForkNumber forknum, BlockNumber block, void *page)
 {
 	UT_ASSERT(rel == &smgr && forknum == MAIN_FORKNUM && block < count);
+	observe(SITE_READ);
 	memcpy(page, pages[block].data, BLCKSZ);
 	reads++;
 }
@@ -209,6 +292,7 @@ cluster_scn_advance(void)
 void
 XLogBeginInsert(void)
 {
+	observe(SITE_WAL);
 	UT_ASSERT(!begun);
 	begun = true;
 }
@@ -244,6 +328,7 @@ XLogFlush(XLogRecPtr lsn)
 	UT_ASSERT_EQ(lsn, 100 + wal_count);
 	if (fail_flush)
 		elog(ERROR, "fixture WAL fsync failure");
+	observe(SITE_FLUSH);
 	flushed = lsn;
 	flush_count++;
 }
@@ -253,6 +338,7 @@ XLogFlush(XLogRecPtr lsn)
 static bool
 fixture_reserve(const ClusterSpaceIdentity *id, BlockNumber first, uint32 want)
 {
+	observe(SITE_RESERVE);
 	UT_ASSERT(want > 0);
 	if (fail_reserve || first != reserved || memcmp(id, &identity, sizeof(identity)) != 0)
 		return false;
@@ -268,8 +354,9 @@ void
 smgrimmedsync(SMgrRelation rel, ForkNumber forknum)
 {
 	UT_ASSERT(rel == &smgr && forknum == MAIN_FORKNUM);
-	UT_ASSERT_EQ(state.pending_count, 0);
+	UT_ASSERT_EQ(active_state->pending_count, 0);
 	UT_ASSERT_EQ(free_count, wal_count + legacy_wal);
+	observe(SITE_SYNC);
 	sync_count++;
 }
 
@@ -277,16 +364,70 @@ static void
 _bt_uppershutdown(BTWriteState *wstate, void *unused)
 {
 	/* Tuple construction is outside this I/O-order test. */
-	UT_ASSERT(wstate == &state && unused == NULL);
+	UT_ASSERT(wstate == active_state && unused == NULL);
+}
+
+static void
+finish_build_state(BTWriteState *wstate)
+{
+	void *state = NULL;
+#include "test_cluster_btree_build_finish.inc"
 }
 
 static void
 finish_build(void)
 {
-	BTWriteState *wstate = &state;
-	void *state = NULL;
-#include "test_cluster_btree_build_finish.inc"
+	finish_build_state(&state);
 }
+
+typedef struct BTSpool BTSpool;
+static void
+_bt_load(BTWriteState *wstate, BTSpool *spool, BTSpool *spool2)
+{
+	(void)spool;
+	(void)spool2;
+	active_state = wstate;
+	for (unsigned i = 0; i < load_pages; i++) {
+		pending[i] = source;
+		_bt_blwritepage(wstate, pending[i].data, load_backfill && i == 1 ? 0 : load_first + i);
+	}
+	finish_build_state(wstate);
+}
+void
+tuplesort_performsort(Tuplesortstate *sortstate)
+{
+	(void)sortstate;
+}
+void
+pgstat_progress_update_param(int index, int64 value)
+{
+	(void)index;
+	(void)value;
+}
+BTScanInsert
+_bt_mkscankey(Relation rel, IndexTuple tuple)
+{
+	UT_ASSERT(rel == &relation && tuple == NULL);
+	memset(&scan_key, 0, sizeof(scan_key));
+	return &scan_key;
+}
+bool
+_bt_allequalimage(Relation rel, bool debugmessage)
+{
+	UT_ASSERT(rel == &relation && debugmessage);
+	return true;
+}
+static bool
+fixture_identity(Relation rel, ClusterSpaceIdentity *out)
+{
+	UT_ASSERT(rel == &relation);
+	observe(SITE_IDENTITY);
+	*out = identity;
+	return true;
+}
+#define cluster_space_relation_get_identity fixture_identity
+#include "test_cluster_btree_build_leaf.inc"
+#undef cluster_space_relation_get_identity
 
 static void
 reset(bool shared)
@@ -299,6 +440,18 @@ reset(bool shared)
 	memset(entries, 0, sizeof(entries));
 	count = writes = reads = wal_count = legacy_wal = edge_count = flush_count = free_count = 0;
 	sync_count = 0;
+	owner_begins = owner_ends = owner_aborts = unowned_effects = 0;
+	memset(site_count, 0, sizeof(site_count));
+	owner_live = shared;
+	owner_allowed = owner_end_allowed = true;
+	observe_owner = false;
+	lose_at = fail_at = SITE_NONE;
+	load_pages = 1;
+	load_first = 0;
+	load_backfill = false;
+	active_state = &state;
+	PG_exception_stack = NULL;
+	error_context_stack = NULL;
 	reserved = reservations = 0;
 	fail_reserve = false;
 	begun = expecting_error = fail_flush = checksums = false;
@@ -320,6 +473,8 @@ reset(bool shared)
 	state.index = &relation;
 	state.btws_use_wal = true;
 	state.versioned = shared;
+	/* Direct writer cases begin at the already-qualified owner boundary. */
+	state.ko_serial = shared ? 77 : 0;
 	state.identity = identity;
 	PageInit(source.data, BLCKSZ, sizeof(BTPageOpaqueData));
 	BTPageGetOpaque(source.data)->btpo_flags = BTP_LEAF;
@@ -533,10 +688,134 @@ UT_TEST(test_bulk_refuses_before_wal_or_data_without_reservation)
 	}
 }
 
+
+static void
+run_leaf_build(void)
+{
+	BTSpool spool = { 0 };
+
+	spool.index = &relation;
+	owner_live = false;
+	observe_owner = cluster_shared_config;
+	_bt_leafbuild(&spool, NULL);
+}
+
+UT_TEST(test_build_refusal_precedes_identity_and_all_target_effects)
+{
+	reset(true);
+	owner_allowed = false;
+	expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		run_leaf_build();
+		UT_ASSERT(false);
+	}
+	UT_ASSERT_EQ(site_count[SITE_IDENTITY] + reservations + wal_count + writes + sync_count, 0);
+	UT_ASSERT_EQ(owner_ends + owner_aborts, 0);
+}
+UT_TEST(test_build_owner_covers_pending_batches_through_final_sync)
+{
+	for (unsigned pages_to_load = 0; pages_to_load <= 40; pages_to_load += 20) {
+		reset(true);
+		load_pages = pages_to_load;
+		run_leaf_build();
+		UT_ASSERT_EQ(owner_begins, 1);
+		UT_ASSERT_EQ(owner_ends, 1);
+		UT_ASSERT_EQ(owner_aborts + unowned_effects, 0);
+		UT_ASSERT_EQ(writes, pages_to_load);
+		UT_ASSERT_EQ(sync_count, 1);
+		UT_ASSERT(!owner_live);
+	}
+}
+UT_TEST(test_build_owner_loss_stops_wal_zero_fill_data_and_sync)
+{
+	const enum BuildSite loss[] = { SITE_RESERVE, SITE_FLUSH, SITE_ZERO, SITE_DATA };
+	const unsigned expected_writes[] = { 0, 0, 1, 4 };
+
+	for (unsigned i = 0; i < lengthof(loss); i++) {
+		reset(true);
+		load_first = 3;
+		lose_at = loss[i];
+		expecting_error = true;
+		if (setjmp(error_jump) == 0) {
+			run_leaf_build();
+			UT_ASSERT(false);
+		}
+		UT_ASSERT_EQ(writes, expected_writes[i]);
+		UT_ASSERT_EQ(sync_count + owner_ends, 0);
+		UT_ASSERT_EQ(owner_aborts, 1);
+		UT_ASSERT(owner_live);
+		if (loss[i] == SITE_RESERVE)
+			UT_ASSERT_EQ(wal_count, 0);
+	}
+}
+UT_TEST(test_build_lost_owner_before_backfill_read_performs_no_read)
+{
+	reset(true);
+	load_first = 3;
+	load_pages = 2;
+	load_backfill = true;
+	lose_at = SITE_DATA;
+	expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		run_leaf_build();
+		UT_ASSERT(false);
+	}
+	UT_ASSERT_EQ(writes, 4);
+	UT_ASSERT_EQ(reads, 0);
+	UT_ASSERT_EQ(wal_count, 1);
+	UT_ASSERT_EQ(owner_aborts, 1);
+	UT_ASSERT_EQ(owner_ends + sync_count, 0);
+}
+UT_TEST(test_build_error_hands_exact_owner_to_original_cleanup)
+{
+	const enum BuildSite failure[] = { SITE_IDENTITY, SITE_RESERVE, SITE_WAL,
+		SITE_FLUSH, SITE_ZERO, SITE_DATA, SITE_READ, SITE_SYNC };
+
+	for (unsigned i = 0; i < lengthof(failure); i++) {
+		reset(true);
+		load_first = 3;
+		fail_at = failure[i];
+		if (fail_at == SITE_READ) {
+			load_pages = 2;
+			load_backfill = true;
+		}
+		expecting_error = true;
+		if (setjmp(error_jump) == 0) {
+			run_leaf_build();
+			UT_ASSERT(false);
+		}
+		UT_ASSERT_EQ(owner_aborts, 1);
+		UT_ASSERT_EQ(owner_ends + unowned_effects, 0);
+		UT_ASSERT(owner_live && !owner_allowed);
+		UT_ASSERT(PG_exception_stack == NULL);
+	}
+}
+UT_TEST(test_build_failed_final_owner_check_does_not_claim_retired)
+{
+	reset(true);
+	owner_end_allowed = false;
+	expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		run_leaf_build();
+		UT_ASSERT(false);
+	}
+	UT_ASSERT_EQ(sync_count, 1);
+	UT_ASSERT_EQ(owner_ends, 0);
+	UT_ASSERT(owner_live);
+}
+UT_TEST(test_nonshared_build_does_not_register_shared_finite_work)
+{
+	reset(false);
+	run_leaf_build();
+	UT_ASSERT_EQ(owner_begins + owner_ends + owner_aborts, 0);
+	UT_ASSERT_EQ(writes, 1);
+	UT_ASSERT_EQ(legacy_wal, 1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(19);
 	UT_RUN(test_new_btree_page_is_versioned_before_data_write);
 	UT_RUN(test_out_of_order_build_has_exact_zero_predecessor);
 	UT_RUN(test_nonshared_keeps_native_build_wal);
@@ -549,6 +828,13 @@ main(void)
 	UT_RUN(test_revisiting_queued_page_cannot_overwrite_it_as_absent);
 	UT_RUN(test_bulk_reservations_cover_batches_and_backfills);
 	UT_RUN(test_bulk_refuses_before_wal_or_data_without_reservation);
+	UT_RUN(test_build_refusal_precedes_identity_and_all_target_effects);
+	UT_RUN(test_build_owner_covers_pending_batches_through_final_sync);
+	UT_RUN(test_build_owner_loss_stops_wal_zero_fill_data_and_sync);
+	UT_RUN(test_build_lost_owner_before_backfill_read_performs_no_read);
+	UT_RUN(test_build_error_hands_exact_owner_to_original_cleanup);
+	UT_RUN(test_build_failed_final_owner_check_does_not_claim_retired);
+	UT_RUN(test_nonshared_build_does_not_register_shared_finite_work);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

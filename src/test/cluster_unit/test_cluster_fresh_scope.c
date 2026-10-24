@@ -28,6 +28,8 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_control.h"
 #include "commands/defrem.h"
+#include "commands/user.h"
+#include "cluster/cluster_ic.h"
 #include "commands/tablecmds.h"
 #include "common/controldata_utils.h"
 #include "miscadmin.h"
@@ -44,6 +46,7 @@
 UT_DEFINE_GLOBALS();
 const ObjectAddress InvalidObjectAddress = { 0 };
 bool cluster_shared_config, cluster_shared_catalog;
+int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 bool IsUnderPostmaster, IsPostmasterEnvironment = true;
 bool process_shared_preload_libraries_done;
 ProcessingMode Mode = NormalProcessing;
@@ -202,6 +205,18 @@ PreventInTransactionBlock(bool top, const char *stmt)
 	(void)top;
 	(void)stmt;
 }
+static bool utility_in_transaction;
+static bool utility_storage_mode = true;
+bool
+cluster_storage_mode_enabled(void)
+{
+	return utility_storage_mode;
+}
+bool
+IsInTransactionBlock(bool top)
+{
+	return utility_in_transaction || !top;
+}
 char *
 defGetString(DefElem *def)
 {
@@ -214,6 +229,29 @@ defGetString(DefElem *def)
 #include "test_cluster_fresh_read.inc"
 #include "test_cluster_fresh_startup.inc"
 #include "test_cluster_fresh_boolean.inc"
+static unsigned storage_drop_preflights, utility_after_preflight;
+static bool drop_target_shared;
+void
+CheckRelationsStorageDrop(DropStmt *stmt, bool isTopLevel)
+{
+	storage_drop_preflights++;
+	if (drop_target_shared) {
+		error_code = utility_in_transaction ? ERRCODE_ACTIVE_SQL_TRANSACTION
+										 : ERRCODE_FEATURE_NOT_SUPPORTED;
+		siglongjmp(boundary, 1);
+	}
+}
+void
+CheckObjectsStorageDrop(DropStmt *stmt, bool isTopLevel)
+{
+	CheckRelationsStorageDrop(stmt, isTopLevel);
+}
+void
+CheckOwnedObjectsStorageDrop(DropOwnedStmt *stmt, bool isTopLevel)
+{
+	CheckRelationsStorageDrop(NULL, isTopLevel);
+}
+
 #include "test_cluster_shared_utility.inc"
 #include "test_cluster_fresh_index.inc"
 #include "test_cluster_fresh_catalog_index.inc"
@@ -225,9 +263,11 @@ sql_entry(Node *node)
 	PlannedStmt *pstmt = &plan;
 	Node *parsetree;
 	const char *queryString = "";
+	bool isTopLevel = true;
 	plan.utilityStmt = node;
 #include "test_cluster_fresh_utility.inc"
 	(void)parsetree;
+	utility_after_preflight++;
 }
 
 static void
@@ -858,10 +898,83 @@ UT_TEST(test_shared_two_phase_refuses_but_transaction_control_remains_native)
 	}
 }
 
+UT_TEST(test_rdma_drop_checks_native_targets_before_later_utility_work)
+{
+	ObjectType kinds[] = { OBJECT_TABLE, OBJECT_INDEX, OBJECT_SEQUENCE, OBJECT_SCHEMA };
+	cluster_shared_config = true;
+	for (int tier = CLUSTER_IC_TIER_2; tier <= CLUSTER_IC_TIER_3; tier++) {
+		cluster_interconnect_tier = tier;
+		for (unsigned i = 0; i < lengthof(kinds); i++) {
+			DropStmt drop = { .type = T_DropStmt, .removeType = kinds[i] };
+			int caught;
+			storage_drop_preflights = utility_after_preflight = 0;
+			drop_target_shared = true;
+			reset_error();
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				sql_entry((Node *)&drop);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+			UT_ASSERT_EQ(storage_drop_preflights, 1);
+			UT_ASSERT_EQ(utility_after_preflight, 0);
+			drop_target_shared = false;
+			sql_entry((Node *)&drop);
+			UT_ASSERT_EQ(storage_drop_preflights, 2);
+			UT_ASSERT_EQ(utility_after_preflight, 1);
+		}
+	}
+	{
+		DropOwnedStmt owned = { .type = T_DropOwnedStmt };
+		int caught;
+		storage_drop_preflights = utility_after_preflight = 0;
+		drop_target_shared = true;
+		reset_error();
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			sql_entry((Node *)&owned);
+		UT_ASSERT_EQ(caught, 1);
+		UT_ASSERT_EQ(storage_drop_preflights, 1);
+		UT_ASSERT_EQ(utility_after_preflight, 0);
+	}
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+}
+
+UT_TEST(test_shared_smgr_drop_preflight_is_independent_of_shared_catalog_gucs)
+{
+	DropStmt drop = {0};
+	DropOwnedStmt owned = {0};
+	Node *commands[] = {(Node *)&drop, (Node *)&drop, (Node *)&owned};
+	int caught;
+
+	drop.type = T_DropStmt;
+	owned.type = T_DropOwnedStmt;
+	cluster_shared_config = cluster_shared_catalog = false;
+	utility_storage_mode = utility_in_transaction = true;
+	for (unsigned i = 0; i < lengthof(commands); i++) {
+		drop.removeType = i == 0 ? OBJECT_TABLE : OBJECT_SCHEMA;
+		storage_drop_preflights = utility_after_preflight = 0;
+		drop_target_shared = true;
+		reset_error();
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			sql_entry(commands[i]);
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(error_code, ERRCODE_ACTIVE_SQL_TRANSACTION);
+		UT_ASSERT_EQ(storage_drop_preflights, 1);
+		UT_ASSERT_EQ(utility_after_preflight, 0);
+		drop_target_shared = false;
+		sql_entry(commands[i]);
+		UT_ASSERT_EQ(storage_drop_preflights, 2);
+		UT_ASSERT_EQ(utility_after_preflight, 1);
+	}
+	utility_in_transaction = false;
+	utility_storage_mode = true;
+}
+
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(21);
 	UT_RUN(test_pre1_startup_refuses_before_root_and_without_writes);
 	UT_RUN(test_selected_pre1_image_and_corruption_are_distinct);
 	UT_RUN(test_nonshared_startup_remains_native);
@@ -881,6 +994,8 @@ main(void)
 	UT_RUN(test_shared_unbound_checksum_refusal_precedes_root_and_writes);
 	UT_RUN(test_nonshared_control_keeps_native_checksum_choice);
 	UT_RUN(test_shared_two_phase_refuses_but_transaction_control_remains_native);
+	UT_RUN(test_rdma_drop_checks_native_targets_before_later_utility_work);
+	UT_RUN(test_shared_smgr_drop_preflight_is_independent_of_shared_catalog_gucs);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
