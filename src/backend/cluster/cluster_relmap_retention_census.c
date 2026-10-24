@@ -9,6 +9,7 @@
 #include "common/cryptohash.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "access/xlog.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_relmap_arb.h"
@@ -17,6 +18,7 @@
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_wal_inputs.h"
 #include "miscadmin.h"
+#include "storage/fd.h"
 
 typedef struct CensusOrigin {
 	ClusterRelmapRetentionDirectory *directory;
@@ -57,10 +59,11 @@ struct ClusterRelmapRetentionCensus {
 	uint8 cold_observe_pins[32];
 	uint16 cold_observe_origin;
 	bool cold_observe_ready;
-	/* Initial execution construction owns only its directory; restart also
-	 * owns its distinct new ROOT. Neither owns the original held fd. */
+	/* Borrowed construction owns its directory; restart also owns its ROOT.
+	 * Full initial construction additionally owns its new tracked fd. */
 	ClusterRelmapRetentionDirectory *owned_directory;
 	bool owns_roots;
+	int owned_root_fd; /* -1 unless full initial construction transfers custody. */
 	bool cold_input_bound;
 	ClusterRelmapRecoverySourceObservationV1 cold_input_source;
 };
@@ -408,6 +411,14 @@ census_cold_source_current(const ClusterRelmapRetentionCensus *census, uint16 or
 			   &source->source, &source->checkpoint, source->native_redo, source->scope_serial);
 }
 
+static bool
+census_open_context(void)
+{
+	return MyBackendType == B_STARTUP && RecoveryInProgress() && CritSectionCount == 0
+		   && cluster_shared_catalog && cluster_recovery_merge_claim_is_held()
+		   && cluster_relmap_authority_x_held();
+}
+
 /* A new initial cursor cannot outlive or replace its original source owner.
  * The source check does I/O; revoke observations even when it raises ERROR. */
 static bool
@@ -422,9 +433,11 @@ census_initial_current(ClusterRelmapRetentionCensus *census)
 		accepted
 			= census->origin_count == 1 && cluster_shared_catalog
 			  && cluster_recovery_merge_claim_is_held() && cluster_relmap_authority_x_held()
+			  && (census->owned_root_fd < 0 || census_open_context())
 			  && census_cold_source_current(census, census->nodes[0], &census->cold_input_source)
 			  && cluster_shared_catalog && cluster_recovery_merge_claim_is_held()
-			  && cluster_relmap_authority_x_held();
+			  && cluster_relmap_authority_x_held()
+			  && (census->owned_root_fd < 0 || census_open_context());
 	}
 	PG_FINALLY();
 	{
@@ -501,6 +514,87 @@ cluster_relmap_retention_census_begin_cold(ClusterRecoveryRootSet *roots, uint16
 		if (!accepted)
 			cluster_recovery_root_set_invalidate(roots);
 		cluster_relmap_retention_census_destroy((ClusterRelmapRetentionCensus *)fresh);
+		free((ClusterRelmapRetentionDirectory *)directory);
+	}
+	PG_END_TRY();
+	return accepted;
+}
+
+bool
+cluster_relmap_retention_census_open_cold(uint16 origin, size_t root_budget, size_t memory_budget,
+										  size_t payload_budget, ClusterRelmapRetentionCensus **out)
+{
+	ClusterRelmapRetentionDirectory *volatile directory = NULL;
+	ClusterRecoveryRootSet *volatile roots = NULL;
+	ClusterRelmapRetentionCensus *volatile fresh = NULL;
+	int volatile fd = -1;
+	volatile bool accepted = false;
+
+	if (out == NULL || *out != NULL || origin >= CLUSTER_RELMAP_RETENTION_MAX_ORIGINS
+		|| root_budget == 0 || payload_budget == 0 || memory_budget < sizeof(*fresh)
+		|| memory_budget - sizeof(*fresh) < sizeof(*directory) || !census_open_context())
+		return false;
+	PG_TRY();
+	{
+		do {
+			ClusterRelmapRecoverySourceObservationV1 source = { 0 };
+			ClusterRelmapRecoveryRootObservationV1 observed = { 0 };
+			ClusterRelmapRetentionDirectory *directories[1];
+			ClusterRecoveryRootsEvent event;
+			ClusterRecoveryRootsResult result;
+
+			directory = calloc(1, sizeof(*directory));
+			if (directory == NULL
+				|| !cluster_relmap_recovery_retention_build_start_cold_source_v1(
+					origin, (ClusterRelmapRetentionDirectory *)directory, &source)
+				|| directory->system_identifier != source.source.claim.identity.system_identifier
+				|| directory->database_incarnation != source.source.claim.database_incarnation
+				|| directory->origin != origin || directory->generation != source.scope_serial
+				|| !cluster_relmap_recovery_root_observe_cold_v1(&source, root_budget,
+																 payload_budget, &observed))
+				break;
+			roots = observed.roots;
+			fd = observed.root_fd;
+			directories[0] = (ClusterRelmapRetentionDirectory *)directory;
+			if (cluster_relmap_retention_census_begin(
+					roots, directory->system_identifier, directory->database_incarnation,
+					source.source.claim.identity.storage_uuid, directories, 1,
+					memory_budget - sizeof(*directory), (ClusterRelmapRetentionCensus **)&fresh)
+				!= CLUSTER_RELMAP_CENSUS_MORE)
+				break;
+			fresh->owned_directory = (ClusterRelmapRetentionDirectory *)directory;
+			fresh->owns_roots = true;
+			fresh->owned_root_fd = fd;
+			fresh->cold_input_source = source;
+			fresh->cold_input_bound = true;
+			directory = NULL;
+			roots = NULL;
+			fd = -1;
+			if (!census_recovery_current((ClusterRelmapRetentionCensus *)fresh))
+				break;
+			/* Retain all original protections. No new observation may skip
+			 * a complete verification after original-source producer I/O. */
+			result = cluster_recovery_root_set_recheck_begin(fresh->roots);
+			while (result < CLUSTER_RECOVERY_ROOTS_OBSERVED) {
+				CHECK_FOR_INTERRUPTS();
+				if (!census_open_context())
+					break;
+				result = cluster_recovery_root_set_step(fresh->roots, &event);
+			}
+			if (result != CLUSTER_RECOVERY_ROOTS_OBSERVED
+				|| !census_recovery_current((ClusterRelmapRetentionCensus *)fresh))
+				break;
+			*out = (ClusterRelmapRetentionCensus *)fresh;
+			fresh = NULL;
+			accepted = true;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		cluster_relmap_retention_census_destroy((ClusterRelmapRetentionCensus *)fresh);
+		cluster_recovery_root_set_destroy((ClusterRecoveryRootSet *)roots);
+		if (fd >= 0)
+			(void)CloseTransientFile(fd);
 		free((ClusterRelmapRetentionDirectory *)directory);
 	}
 	PG_END_TRY();
@@ -1223,6 +1317,7 @@ cluster_relmap_retention_census_begin(
 		goto fail;
 	}
 	census->roots = roots;
+	census->owned_root_fd = -1;
 	census->system_identifier = system_identifier;
 	census->database_incarnation = database_incarnation;
 	memcpy(census->storage_uuid, storage_uuid, sizeof(census->storage_uuid));
@@ -1623,6 +1718,8 @@ cluster_relmap_retention_census_destroy(ClusterRelmapRetentionCensus *census)
 	if (census != NULL && census->owned_directory != NULL) {
 		if (census->owns_roots)
 			cluster_recovery_root_set_destroy(census->roots);
+		if (census->owned_root_fd >= 0)
+			(void)CloseTransientFile(census->owned_root_fd);
 		free(census->owned_directory);
 	}
 	free(census);

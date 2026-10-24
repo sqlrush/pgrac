@@ -3374,6 +3374,7 @@ UT_TEST(test_terminal_read_native_error_keeps_output_zero_and_custody_dead)
 #include "test_cluster_relmap_execution_custody.inc"
 #include "test_cluster_relmap_execution_targets.inc"
 #include "test_cluster_relmap_execution_observe.inc"
+#include "test_cluster_relmap_census_open.inc"
 
 int
 main(int argc, char **argv)
@@ -3382,7 +3383,14 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(105);
+	UT_PLAN(112);
+	UT_RUN(test_census_open_original_wal_physical_pairs_and_owned_fd);
+	UT_RUN(test_census_open_initial_gates_output_and_budgets);
+	UT_RUN(test_census_open_checkpoint_refusal_and_error_cleanup);
+	UT_RUN(test_census_open_storage_refusal_and_error_cleanup);
+	UT_RUN(test_census_open_all_physical_passes_refuse_drift_and_errors);
+	UT_RUN(test_census_open_later_missing_pair_source_or_error_keeps_fd_until_destroy);
+	UT_RUN(test_census_open_early_destroy_owns_only_new_custody);
 	UT_RUN(test_execution_observe_complete_wal_and_physical_union);
 	UT_RUN(test_execution_observe_missing_gates_and_invalid_source);
 	UT_RUN(test_execution_observe_fresh_output_aliases_and_budgets);

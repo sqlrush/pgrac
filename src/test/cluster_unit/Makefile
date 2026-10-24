@@ -3455,7 +3455,8 @@ test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
 		test_cluster_relmap_origin_build.inc \
 		test_cluster_relmap_execution_custody.inc \
 		test_cluster_relmap_execution_targets.inc \
-		test_cluster_relmap_execution_observe.inc test_cluster_relmap_observation_namespace.o \
+		test_cluster_relmap_execution_observe.inc test_cluster_relmap_census_open.inc \
+		test_cluster_relmap_observation_namespace.o \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_terminal_scan.h \

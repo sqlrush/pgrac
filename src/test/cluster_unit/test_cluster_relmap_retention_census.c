@@ -5,6 +5,27 @@
 #include "test_cluster_recovery_root_set.c"
 #include "cluster/cluster_relmap_retention_census.h"
 #include "cluster/cluster_relmap_pending.h"
+#include "access/xlog.h"
+#include "miscadmin.h"
+#include "storage/fd.h"
+
+/* This fixture borrows every fd/ROOT. Native lifetime/context leaves must
+ * stay unreachable; the retained-WAL fixture exercises their owned variant. */
+BackendType MyBackendType = B_BG_WORKER;
+volatile uint32 CritSectionCount = 0;
+
+bool
+RecoveryInProgress(void)
+{
+	abort();
+}
+
+int
+CloseTransientFile(int fd)
+{
+	(void)fd;
+	abort();
+}
 
 #define CENSUS_BUDGET (128 * 1024)
 #define CENSUS_FULL UINT64CONST(0x200000123)
