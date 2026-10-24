@@ -677,34 +677,29 @@ cluster_heap_freeze_bind_creation_targets_v1(
 	return matched;
 }
 
-bool
-cluster_heap_freeze_prepare_xmin_v1(
+/* Shared exact row predicate. The batch/fence has already been validated;
+ * this performs no native planning or authority qualification. */
+static bool
+freeze_xmin_row_matches(
 	const ClusterHeapFreezePageBatchV1 *page,
 	const ClusterHeapFreezeProofBatchV1 *proofs,
-	const ClusterHeapFreezeFinalFenceV1 *current_fence,
 	uint16 tuple_index,
 	FullTransactionId original_creator_full_xid,
 	FullTransactionId freeze_limit_full,
-	SCN horizon_scn,
-	HeapTupleFreeze *out)
+	SCN horizon_scn)
 {
 	const ClusterHeapFreezeTupleInputV1 *tuple;
 	const ClusterHeapFreezeCarrierRequestV1 *request;
-	HeapTupleFreeze plan;
 
-	/* The caller supplies proven original identity; raw XID cannot supply epoch.
+	/* The caller supplies original identity; raw XID cannot supply epoch.
 	 * Unbounded observation sentinels cannot substitute for finite cutoffs. */
-	if (out == NULL || !FullTransactionIdIsNormal(original_creator_full_xid)
+	if (!FullTransactionIdIsNormal(original_creator_full_xid)
 		|| !TransactionIdIsNormal(XidFromFullTransactionId(original_creator_full_xid))
 		|| !FullTransactionIdIsNormal(freeze_limit_full)
 		|| !TransactionIdIsNormal(XidFromFullTransactionId(freeze_limit_full))
 		|| U64FromFullTransactionId(freeze_limit_full) == UINT64_MAX
 		|| !FullTransactionIdPrecedes(original_creator_full_xid, freeze_limit_full)
 		|| !SCN_VALID(horizon_scn) || horizon_scn == (SCN)UINT64_MAX
-		|| freeze_validate_carrier_proofs(page, proofs, current_fence, true)
-			!= CLUSTER_HEAP_FREEZE_PROOF_PROVEN
-		|| page->page_lsn != current_fence->page_lsn
-		|| page->page_version != current_fence->page_version
 		|| tuple_index >= page->tuple_count)
 		return false;
 
@@ -748,14 +743,82 @@ cluster_heap_freeze_prepare_xmin_v1(
 			|| (target->tuple_length != 0 && target->tuple_length != tuple->tuple_length))
 			continue;
 
-		/* Native freeze/WAL consumes this plan; xmax/MX remains entirely opaque. */
-		memset(&plan, 0, sizeof(plan));
-		plan.xmax = tuple->raw_xmax;
-		plan.offset = tuple->offset;
-		plan.t_infomask = tuple->infomask | HEAP_XMIN_FROZEN;
-		plan.t_infomask2 = tuple->infomask2;
-		*out = plan;
 		return true;
 	}
 	return false;
+}
+
+bool
+cluster_heap_freeze_prepare_xmin_v1(
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *current_fence,
+	uint16 tuple_index,
+	FullTransactionId original_creator_full_xid,
+	FullTransactionId freeze_limit_full,
+	SCN horizon_scn,
+	HeapTupleFreeze *out)
+{
+	const ClusterHeapFreezeTupleInputV1 *tuple;
+	HeapTupleFreeze plan;
+
+	if (out == NULL
+		|| freeze_validate_carrier_proofs(page, proofs, current_fence, true)
+			!= CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+		|| page->page_lsn != current_fence->page_lsn
+		|| page->page_version != current_fence->page_version
+		|| !freeze_xmin_row_matches(page, proofs, tuple_index,
+			original_creator_full_xid, freeze_limit_full, horizon_scn))
+		return false;
+
+	/* Only this independently qualified entry emits a native freeze plan. */
+	tuple = &page->tuples[tuple_index];
+	memset(&plan, 0, sizeof(plan));
+	plan.xmax = tuple->raw_xmax;
+	plan.offset = tuple->offset;
+	plan.t_infomask = tuple->infomask | HEAP_XMIN_FROZEN;
+	plan.t_infomask2 = tuple->infomask2;
+	*out = plan;
+	return true;
+}
+
+bool
+cluster_heap_freeze_select_xmin_candidates_v1(
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *current_fence,
+	FullTransactionId candidate_limit_full,
+	SCN observed_horizon_scn,
+	ClusterHeapFreezeXminCandidateBatchV1 *out)
+{
+	ClusterHeapFreezeXminCandidateBatchV1 candidates;
+
+	if (out == NULL || !FullTransactionIdIsNormal(candidate_limit_full)
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(candidate_limit_full))
+		|| U64FromFullTransactionId(candidate_limit_full) == UINT64_MAX
+		|| !SCN_VALID(observed_horizon_scn) || observed_horizon_scn == (SCN)UINT64_MAX
+		|| freeze_validate_carrier_proofs(page, proofs, current_fence, true)
+			!= CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+		|| page->page_lsn != current_fence->page_lsn
+		|| page->page_version != current_fence->page_version)
+		return false;
+
+	/* Validate the common bounded batch once, then retain physical rows in
+	 * their original order. Equal raw XIDs never merge different carriers. */
+	memset(&candidates, 0, sizeof(candidates));
+	for (uint16 index = 0; index < page->tuple_count; index++)
+	{
+		FullTransactionId original = page->tuples[index].original_creator_full_xid;
+		ClusterHeapFreezeXminTargetV1 *target;
+
+		if (!freeze_xmin_row_matches(page, proofs, index, original,
+			candidate_limit_full, observed_horizon_scn))
+			continue;
+		target = &candidates.targets[candidates.target_count++];
+		target->tuple_index = index;
+		target->original_creator_full_xid = original;
+	}
+	/* This publishes candidates only, not native plans or positive authority. */
+	memcpy(out, &candidates, sizeof(candidates));
+	return true;
 }

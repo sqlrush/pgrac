@@ -53,6 +53,7 @@ typedef struct LVRelState
 	ClusterHeapFreezeFinalFenceV1 shared_freeze_fence;
 	ClusterHeapFreezeCohortObservation shared_freeze_cohort;
 	FullTransactionId shared_freeze_candidate_limit_full;
+	ClusterHeapFreezeXminCandidateBatchV1 shared_freeze_xmin_candidates;
 	bool shared_freeze_cohort_observed;
 	struct VacuumCutoffs cutoffs;
 	bool shared_freeze_fence_valid;
@@ -98,6 +99,10 @@ static unsigned cohort_fence_checks, policy_checks_at_cohort_fence;
 static unsigned cohort_receipt_checks;
 static ClusterHeapFreezeCohortStatus cohort_receipt_status;
 static bool revoke_on_receipt_check;
+static unsigned candidate_selections;
+static bool select_candidates;
+static FullTransactionId candidate_limit_seen;
+static SCN candidate_horizon_seen;
 
 static void
 note_cleanup(char event)
@@ -517,6 +522,26 @@ cluster_heap_freeze_bind_creation_targets_v1(ClusterHeapFreezePageBatchV1 *page,
 	return 0;
 }
 
+bool
+cluster_heap_freeze_select_xmin_candidates_v1(const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs, const ClusterHeapFreezeFinalFenceV1 *fence,
+	FullTransactionId limit, SCN horizon, ClusterHeapFreezeXminCandidateBatchV1 *out)
+{
+	if (guard_held || pin_held || content_locked || debt != 1
+		|| target_bindings != 1 || page != &vacrel.shared_freeze_batch
+		|| proofs == NULL || fence == NULL || !vacrel.shared_freeze_cohort_observed)
+		abort();
+	candidate_selections++;
+	candidate_limit_seen = limit;
+	candidate_horizon_seen = horizon;
+	if (!select_candidates) return false;
+	memset(out, 0, sizeof(*out));
+	out->target_count = 1;
+	out->targets[0].tuple_index = 0;
+	out->targets[0].original_creator_full_xid = FullTransactionIdFromEpochAndXid(1, 77);
+	return true;
+}
+
 ClusterHeapFreezeCohortStatus
 cluster_heap_freeze_cohort_observe(ClusterHeapFreezeCohortObservation *out)
 {
@@ -646,6 +671,10 @@ reset_fixture(void)
 	cohort_receipt_checks = 0;
 	cohort_receipt_status = CLUSTER_HEAP_FREEZE_COHORT_READY;
 	revoke_on_receipt_check = false;
+	candidate_selections = 0;
+	select_candidates = true;
+	candidate_limit_seen = InvalidFullTransactionId;
+	candidate_horizon_seen = InvalidScn;
 	enters = leaves = debt = resolves = routes = fail_resolve = 0;
 	reject_admission = reject_route_after = unknown_outcome = false;
 	error_preflight = error_validate = guard_held = false;
@@ -1878,10 +1907,91 @@ UT_TEST(next_collection_cannot_reuse_previous_cohort_on_sample_refusal)
 	UT_ASSERT_EQ(debt, 0);
 }
 
+
+UT_TEST(xmin_candidate_batch_uses_same_bound_proof_and_cohort_after_release)
+{
+	reset_fixture();
+	set_shared_policy(80);
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(candidate_selections, 1);
+	UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.target_count, 1);
+	UT_ASSERT(FullTransactionIdEquals(candidate_limit_seen, vacrel.shared_freeze_candidate_limit_full));
+	UT_ASSERT_EQ(candidate_horizon_seen, vacrel.shared_freeze_cohort.horizon_scn);
+	UT_ASSERT_EQ(leaves, 1);
+	UT_ASSERT_EQ(debt, 0);
+	UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+}
+
+UT_TEST(xmin_candidate_selection_requires_current_cohort_and_policy)
+{
+	for (unsigned variant = 0; variant < 3; variant++) {
+		reset_fixture();
+		set_shared_policy(80);
+		vacrel.shared_freeze_xmin_candidates.target_count = 7;
+		if (variant == 0) cohort_receipt_status = CLUSTER_HEAP_FREEZE_COHORT_H_STALE;
+		if (variant == 1) policy_sample_current = false;
+		if (variant == 2) cohort_value.local_unqualified_entries = 1;
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT_EQ(target_bindings, 1);
+		UT_ASSERT_EQ(candidate_selections, 0);
+		UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.target_count, 0);
+		UT_ASSERT_EQ(debt, 0);
+	}
+}
+
+UT_TEST(xmin_candidate_refusal_preserves_proof_without_stale_selection)
+{
+	reset_fixture();
+	set_shared_policy(80);
+	vacrel.shared_freeze_xmin_candidates.target_count = 7;
+	select_candidates = false;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(candidate_selections, 1);
+	UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.target_count, 0);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proofs.proof_count, 1);
+	UT_ASSERT(vacrel.shared_freeze_fence_valid);
+	UT_ASSERT_EQ(debt, 0);
+}
+
+UT_TEST(xmin_candidate_next_attempt_cannot_reuse_previous_targets)
+{
+	for (unsigned variant = 0; variant < 2; variant++) {
+		reset_fixture();
+		set_shared_policy(80);
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.target_count, 1);
+		if (variant == 0) reject_route_after = true;
+		else changed_admission = true;
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1),
+			variant == 0 ? CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN
+			: CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+		UT_ASSERT_EQ(candidate_selections, 1);
+		UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.target_count, 0);
+		UT_ASSERT_EQ(debt, 0);
+	}
+}
+
+UT_TEST(xmin_candidate_collection_without_full_policy_clears_old_targets)
+{
+	reset_fixture();
+	vacrel.shared_freeze_xmin_candidates.target_count = 7;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(candidate_selections, 0);
+	UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.target_count, 0);
+	UT_ASSERT_EQ(target_bindings, 1);
+	UT_ASSERT_EQ(debt, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(68);
+	UT_PLAN(73);
+	UT_RUN(xmin_candidate_batch_uses_same_bound_proof_and_cohort_after_release);
+	UT_RUN(xmin_candidate_selection_requires_current_cohort_and_policy);
+	UT_RUN(xmin_candidate_refusal_preserves_proof_without_stale_selection);
+	UT_RUN(xmin_candidate_next_attempt_cannot_reuse_previous_targets);
+	UT_RUN(xmin_candidate_collection_without_full_policy_clears_old_targets);
+
 	UT_RUN(invalid_input_does_not_leave);
 	UT_RUN(rejected_admission_does_not_leave);
 	UT_RUN(normal_success_leaves_once);

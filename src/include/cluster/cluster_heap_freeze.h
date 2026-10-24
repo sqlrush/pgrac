@@ -320,12 +320,36 @@ struct RelationData;
 struct PcmAuthoritySnapshot;
 struct ClusterSemanticAdmissionToken;
 
-/* Process-local qualification; neither field can be inferred from a raw XID. */
+/* Process-local requested identity; neither field can be inferred from a raw
+ * XID. The caller must independently qualify it before native apply. */
 typedef struct ClusterHeapFreezeXminTargetV1
 {
 	uint16 tuple_index;
 	FullTransactionId original_creator_full_xid;
 } ClusterHeapFreezeXminTargetV1;
+
+/* Unqualified selection from the current attempt's physical/proof inputs.
+ * A nonempty batch is not a native plan, F/H certificate, retention handoff
+ * or permission to mutate a page. Retire it with the saved page/proof/cohort. */
+typedef struct ClusterHeapFreezeXminCandidateBatchV1
+{
+	uint16 target_count;
+	ClusterHeapFreezeXminTargetV1 targets[MaxHeapTuplesPerPage];
+} ClusterHeapFreezeXminCandidateBatchV1;
+
+/* Read-only, bounded selection in physical input order. The observed bounds
+ * only screen candidates; their positive provenance/admission remains the
+ * caller's responsibility. Rechecks exact committed creation evidence and
+ * the complete original FullXid; never widens raw XIDs or emits native plans.
+ * False preserves *out; true replaces it, including an empty selection.
+ * Call without page/pin/census locks before later final ownership checks. */
+extern bool cluster_heap_freeze_select_xmin_candidates_v1(
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *current_fence,
+	FullTransactionId candidate_limit_full,
+	SCN observed_horizon_scn,
+	ClusterHeapFreezeXminCandidateBatchV1 *out);
 
 /*
  * Qualified xmin-only mutation using native FREEZE_PAGE WAL and synchronous
