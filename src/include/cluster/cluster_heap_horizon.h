@@ -199,7 +199,9 @@ cluster_heap_freeze_cohort_current(const ClusterHeapFreezeCohortObservation *exp
  * This is a volatile observation for the 2.4 producer/consumer handoff: it
  * is not a freeze certificate, native truncation permission, or proof that
  * every retained FullXid producer has completed its handoff.  The reader
- * rechecks the worker sample and semantic fence before accepting it.
+ * rechecks the worker sample, original required peer publications/connections
+ * and semantic fence before accepting it. A changed source retires this
+ * combined candidate until a new complete fold; F itself has no age expiry.
  */
 typedef struct ClusterHeapFreezeWatermark {
 	uint64 future_full_xid_max;

@@ -185,6 +185,10 @@ cluster_sf_peer_capability_generation_matches(int32 peer, uint32 required, uint3
 				pg_atomic_fetch_add_u32(&test_horizon_store.freeze_slots[changed].seq, 2);
 			else if (test_cohort_change == 3)
 				test_v2_fence.admission_publication_seq += 2;
+			else if (test_cohort_change == 4) {
+				test_horizon_store.freeze_watermark.publication_sequence++;
+				pg_atomic_fetch_add_u32(&test_horizon_store.freeze_watermark_seq, 2);
+			}
 		}
 		return required == PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2 && test_horizon_capable
 			   && generation == test_cohort_generations[peer];
@@ -2541,10 +2545,151 @@ UT_TEST(test_v2_lmon_observes_clock_rollback_as_stale)
 	UT_ASSERT(strstr(summary, ",h=") == NULL);
 }
 
+
+UT_TEST(test_v2_watermark_retires_replaced_required_peer_publication)
+{
+	for (int which = 0; which < 2; which++) {
+		int32 peer = which == 0 ? 1 : 65;
+		ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
+		ClusterHeapFreezeWatermark first, out, zero = { 0 };
+
+		cohort_receive(65, report);
+		cluster_undo_horizon_lmon_tick();
+		UT_ASSERT(cluster_heap_freeze_watermark_sample(&first));
+		report.report_sequence++;
+		report.f_sample_id++;
+		cohort_receive(peer, report);
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT(!cluster_heap_freeze_watermark_sample(&out));
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		UT_ASSERT(memcmp(&first, &test_horizon_store.freeze_watermark, sizeof(first)) == 0);
+		test_horizon_now += 1000001;
+		cluster_undo_horizon_lmon_tick();
+		UT_ASSERT(cluster_heap_freeze_watermark_sample(&out));
+		UT_ASSERT_EQ(out.publication_sequence, first.publication_sequence + 1);
+	}
+}
+
+UT_TEST(test_v2_watermark_rejects_required_connection_and_busy_source)
+{
+	for (int fault = 0; fault < 4; fault++) {
+		ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
+		ClusterHeapFreezeWatermark first, out, zero = { 0 };
+		int32 peer = fault % 2 == 0 ? 1 : 65;
+
+		cohort_receive(65, report);
+		cluster_undo_horizon_lmon_tick();
+		UT_ASSERT(cluster_heap_freeze_watermark_sample(&first));
+		if (fault < 2)
+			test_cohort_generations[peer]++;
+		else if (fault == 2)
+			test_horizon_capable = false;
+		else
+			pg_atomic_fetch_add_u32(&test_horizon_store.freeze_slots[peer].seq, 1);
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT(!cluster_heap_freeze_watermark_sample(&out));
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		UT_ASSERT(memcmp(&first, &test_horizon_store.freeze_watermark, sizeof(first)) == 0);
+	}
+}
+
+UT_TEST(test_v2_watermark_identity_callbacks_cannot_splice_original_source)
+{
+	for (int fault = 1; fault <= 3; fault++) {
+		ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
+		ClusterHeapFreezeWatermark first, out, zero = { 0 };
+
+		cohort_receive(65, report);
+		cluster_undo_horizon_lmon_tick();
+		UT_ASSERT(cluster_heap_freeze_watermark_sample(&first));
+		test_cohort_trigger_peer = 65;
+		test_cohort_changed_peer = 1;
+		test_cohort_change = fault;
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT(!cluster_heap_freeze_watermark_sample(&out));
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		UT_ASSERT(memcmp(&first, &test_horizon_store.freeze_watermark, sizeof(first)) == 0);
+	}
+}
+
+UT_TEST(test_v2_watermark_source_binding_never_expires_f_by_clock)
+{
+	ClusterHeapFreezeWatermark first, out;
+
+	(void)reset_v2_cohort(false);
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT(cluster_heap_freeze_watermark_sample(&first));
+	/* This getter supplies F caps; H must be separately proved fresh. No
+	 * timeout, refused new fold or non-required peer may expire F by age. */
+	test_horizon_now += INT64CONST(86400000000);
+	pg_atomic_write_u32(&test_horizon_store.freeze_slots[2].seq, 1);
+	test_cohort_generations[2]++;
+	UT_ASSERT(cluster_heap_freeze_watermark_sample(&out));
+	UT_ASSERT(memcmp(&first, &out, sizeof(first)) == 0);
+	test_horizon_now -= INT64CONST(172800000000);
+	UT_ASSERT(cluster_heap_freeze_watermark_sample(&out));
+	UT_ASSERT(memcmp(&first, &out, sizeof(first)) == 0);
+}
+
+UT_TEST(test_v2_watermark_publish_rejects_retired_source_without_sequence_debt)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_cohort(false);
+	ClusterHeapFreezeCohortObservation cohort;
+	UndoHorizonV2MaintenanceObservation observed;
+	ClusterHeapFreezeWatermark first;
+	uint32 sequence;
+
+	UT_ASSERT_EQ(undo_horizon_v2_cohort_observe(&cohort, NULL, &observed),
+				 CLUSTER_HEAP_FREEZE_COHORT_READY);
+	UT_ASSERT(undo_horizon_publish_freeze_watermark(&cohort, &observed, test_horizon_now));
+	first = test_horizon_store.freeze_watermark;
+	sequence = pg_atomic_read_u32(&test_horizon_store.freeze_watermark_seq);
+	report.report_sequence++;
+	cohort_receive(1, report);
+	UT_ASSERT(!undo_horizon_publish_freeze_watermark(&cohort, &observed, test_horizon_now + 1));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&test_horizon_store.freeze_watermark_seq), sequence);
+	UT_ASSERT(memcmp(&first, &test_horizon_store.freeze_watermark, sizeof(first)) == 0);
+}
+
+UT_TEST(test_v2_watermark_publish_rechecks_source_after_identity_callbacks)
+{
+	for (int fault = 1; fault <= 3; fault++) {
+		ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
+		ClusterHeapFreezeCohortObservation cohort;
+		UndoHorizonV2MaintenanceObservation observed;
+
+		cohort_receive(65, report);
+		UT_ASSERT_EQ(undo_horizon_v2_cohort_observe(&cohort, NULL, &observed),
+					 CLUSTER_HEAP_FREEZE_COHORT_READY);
+		test_cohort_trigger_peer = 65;
+		test_cohort_changed_peer = 1;
+		test_cohort_change = fault;
+		UT_ASSERT(!undo_horizon_publish_freeze_watermark(&cohort, &observed, test_horizon_now));
+		UT_ASSERT_EQ(test_horizon_store.freeze_watermark.publication_sequence, 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&test_horizon_store.freeze_watermark_seq), 0);
+	}
+}
+
+UT_TEST(test_v2_watermark_reader_retries_own_publication_after_callbacks)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
+	ClusterHeapFreezeWatermark first, out;
+
+	cohort_receive(65, report);
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT(cluster_heap_freeze_watermark_sample(&first));
+	test_cohort_trigger_peer = 65;
+	test_cohort_changed_peer = 1;
+	test_cohort_change = 4;
+	UT_ASSERT(cluster_heap_freeze_watermark_sample(&out));
+	UT_ASSERT_EQ(out.publication_sequence, first.publication_sequence + 1);
+	UT_ASSERT(memcmp(&out, &test_horizon_store.freeze_watermark, sizeof(out)) == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(92);
+	UT_PLAN(99);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -2635,6 +2780,13 @@ main(void)
 	UT_RUN(test_v2_publisher_checks_both_identity_coverage_inputs_atomically);
 	UT_RUN(test_v2_watermark_reader_rejects_unknown_identity_and_preserves_candidate);
 	UT_RUN(test_v2_refused_fold_preserves_watermark_and_identity_failure_blocks_reader);
+	UT_RUN(test_v2_watermark_retires_replaced_required_peer_publication);
+	UT_RUN(test_v2_watermark_rejects_required_connection_and_busy_source);
+	UT_RUN(test_v2_watermark_identity_callbacks_cannot_splice_original_source);
+	UT_RUN(test_v2_watermark_source_binding_never_expires_f_by_clock);
+	UT_RUN(test_v2_watermark_publish_rejects_retired_source_without_sequence_debt);
+	UT_RUN(test_v2_watermark_publish_rechecks_source_after_identity_callbacks);
+	UT_RUN(test_v2_watermark_reader_retries_own_publication_after_callbacks);
 	UT_RUN(test_v2_lmon_counts_missing_local_history_without_sending);
 	UT_RUN(test_v2_lmon_records_real_cohort_refusals);
 	UT_RUN(test_v2_lmon_observation_respects_original_shutdown_and_enable_gates);

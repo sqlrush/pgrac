@@ -130,6 +130,9 @@ typedef struct ClusterUndoHorizonShmem {
 	ClusterHeapFreezeWatermark freeze_watermark;
 	ClusterSemanticActiveSampleFence freeze_watermark_fence;
 	uint64 freeze_watermark_active_sample_id;
+	/* Exact READY-fold source publications, protected by the same seqlock.
+	 * F has no age expiry; a replaced source needs a new complete fold. */
+	ClusterHeapFreezeCohortPeerObservation freeze_watermark_sources[CLUSTER_MAX_NODES];
 	/* Diagnostic outcomes; the candidate above is not release authority. */
 	pg_atomic_uint64 freeze_observation_count[UNDO_HORIZON_V2_STATUS_COUNT];
 	/* observability (D5-5); bumped via the note_* helpers below */
@@ -816,6 +819,55 @@ cluster_heap_freeze_report_v2_sample(int32 peer, ClusterHeapFreezeReportV2View *
 		   == CLUSTER_HEAP_FREEZE_COHORT_READY;
 }
 
+/* Recheck only retained producer identity, never refold reports or expire F
+ * using the H clock. All connection callbacks precede the final semantic cut
+ * and locked generation/source-sequence reads in both admitted mask halves. */
+static bool
+undo_horizon_watermark_sources_current(
+	const ClusterSemanticActiveSampleFence *fence,
+	const ClusterHeapFreezeCohortPeerObservation *sources)
+{
+	int32 peer;
+
+	if (fence->local_node_id != cluster_node_id || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES
+		|| ((cluster_node_id < 64 ? fence->admitted_members_lo : fence->admitted_members_hi)
+			& (UINT64CONST(1) << (cluster_node_id % 64))) == 0)
+		return false;
+	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+		const ClusterHeapFreezeCohortPeerObservation *source = &sources[peer];
+
+		if (peer == cluster_node_id
+			|| ((peer < 64 ? fence->admitted_members_lo : fence->admitted_members_hi)
+				& (UINT64CONST(1) << (peer % 64))) == 0)
+			continue;
+		if (source->seq == 0 || (source->seq & 1) != 0 || source->generation == 0
+			|| !cluster_sf_peer_capability_generation_matches(
+				peer, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2, source->generation))
+			return false;
+	}
+	if (!cluster_semantic_activation_active_sample_current(fence))
+		return false;
+	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+		uint32 word, generation;
+
+		if (peer == cluster_node_id
+			|| ((peer < 64 ? fence->admitted_members_lo : fence->admitted_members_hi)
+				& (UINT64CONST(1) << (peer % 64))) == 0)
+			continue;
+		/* This original CONTROL-locked read has no identity callbacks. A
+		 * later peer's earlier callback may have reconnected this peer. */
+		if (!cluster_sf_peer_capability_word_sample(
+				peer, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2, &word, &generation)
+			|| generation != sources[peer].generation)
+			return false;
+		pg_read_barrier();
+		if (sources[peer].seq != pg_atomic_read_u32(&UndoHorizonShmem->freeze_slots[peer].seq))
+			return false;
+	}
+	return true;
+}
+
 bool
 cluster_heap_freeze_watermark_sample(ClusterHeapFreezeWatermark *out)
 {
@@ -831,6 +883,7 @@ cluster_heap_freeze_watermark_sample(ClusterHeapFreezeWatermark *out)
 		uint32 seq1 = pg_atomic_read_u32(&UndoHorizonShmem->freeze_watermark_seq);
 		ClusterHeapFreezeWatermark watermark;
 		ClusterSemanticActiveSampleFence fence;
+		ClusterHeapFreezeCohortPeerObservation sources[CLUSTER_MAX_NODES];
 		uint64 active_sample_id;
 		FullTransactionId future;
 		FullTransactionId active_min;
@@ -843,6 +896,7 @@ cluster_heap_freeze_watermark_sample(ClusterHeapFreezeWatermark *out)
 		watermark = UndoHorizonShmem->freeze_watermark;
 		fence = UndoHorizonShmem->freeze_watermark_fence;
 		active_sample_id = UndoHorizonShmem->freeze_watermark_active_sample_id;
+		memcpy(sources, UndoHorizonShmem->freeze_watermark_sources, sizeof(sources));
 		future = FullTransactionIdFromU64(watermark.future_full_xid_max);
 		active_min = FullTransactionIdFromU64(watermark.active_full_xid_min);
 		pg_read_barrier();
@@ -871,7 +925,13 @@ cluster_heap_freeze_watermark_sample(ClusterHeapFreezeWatermark *out)
 			|| active.sample_id != active_sample_id
 			|| active.scan.unqualified_entries != 0
 			|| memcmp(&active.admission_fence, &fence, sizeof(fence)) != 0
-			|| !cluster_undo_cleaner_active_sample_current(&active))
+			|| !cluster_undo_cleaner_active_sample_current(&active)
+			|| !undo_horizon_watermark_sources_current(&fence, sources))
+			continue;
+		/* Connection/admission observers may overlap another publication.
+		 * Never return bytes from an earlier cut after those callbacks. */
+		pg_read_barrier();
+		if (seq1 != pg_atomic_read_u32(&UndoHorizonShmem->freeze_watermark_seq))
 			continue;
 		*out = watermark;
 		return true;
@@ -1103,7 +1163,8 @@ undo_horizon_publish_freeze_watermark(const ClusterHeapFreezeCohortObservation *
 		|| cohort->admitted_members_lo != observed->fence.admitted_members_lo
 		|| cohort->admitted_members_hi != observed->fence.admitted_members_hi
 		|| memcmp(&active.admission_fence, &observed->fence, sizeof(active.admission_fence)) != 0
-		|| !cluster_undo_cleaner_active_sample_current(&active))
+		|| !cluster_undo_cleaner_active_sample_current(&active)
+		|| !undo_horizon_watermark_sources_current(&observed->fence, cohort->source_peers))
 		return false;
 	seq = pg_atomic_read_u32(&UndoHorizonShmem->freeze_watermark_seq);
 	if ((seq & 1) != 0 || seq >= UINT32_MAX - 1)
@@ -1127,6 +1188,8 @@ undo_horizon_publish_freeze_watermark(const ClusterHeapFreezeCohortObservation *
 	UndoHorizonShmem->freeze_watermark = watermark;
 	UndoHorizonShmem->freeze_watermark_fence = observed->fence;
 	UndoHorizonShmem->freeze_watermark_active_sample_id = observed->active_sample_id;
+	memcpy(UndoHorizonShmem->freeze_watermark_sources, cohort->source_peers,
+		   sizeof(UndoHorizonShmem->freeze_watermark_sources));
 	pg_write_barrier();
 	pg_atomic_write_u32(&UndoHorizonShmem->freeze_watermark_seq, seq + 2);
 	return true;
