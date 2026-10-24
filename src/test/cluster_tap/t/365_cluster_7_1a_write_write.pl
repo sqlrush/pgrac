@@ -8,7 +8,7 @@
 #
 #    Legs (every leg tags its substrate with "# layer:"):
 #      L1  # layer: live -- pair boots; cluster.crossnode_write_write is
-#          default OFF; seed rows flushed to shared storage.
+#          default ON; seed rows flushed to shared storage.
 #      L2  # layer: live -- today's write-write boundary, GUC off: a node1
 #          write against an IN-FLIGHT remote writer fails closed (53R97
 #          family, retryable) at the visibility judge; after the remote
@@ -187,8 +187,8 @@ ok($pair->wait_for_peer_state(1, 0, 'connected', 30), 'L1 node1 sees node0 conne
 
 my ($node0, $node1) = ($pair->node0, $pair->node1);
 
-is($node0->safe_psql('postgres', 'SHOW cluster.crossnode_write_write'), 'off',
-	'L1 crossnode_write_write default off');
+is($node0->safe_psql('postgres', 'SHOW cluster.crossnode_write_write'), 'on',
+	'L1 crossnode_write_write defaults to wait-and-chain');
 is($node0->safe_psql('postgres', 'SHOW cluster.crossnode_runtime_visibility'), 'on',
 	'L1 crossnode_runtime_visibility armed by conf (striped-read substrate)');
 
@@ -213,6 +213,14 @@ ok(wait_for_val($node1, 'SELECT ctr FROM ww_t WHERE id = 1', '100', 20),
 # fails closed; the post-commit retry applies on top (no lost update).
 # (The blocked-wait chain gain is KNOWN-BLOCKED -- see header.)
 # ============================================================
+for my $n ($node0, $node1)
+{
+	$n->safe_psql('postgres', 'ALTER SYSTEM SET cluster.crossnode_write_write = off');
+	$n->safe_psql('postgres', 'SELECT pg_reload_conf()');
+}
+usleep(1_000_000);
+is($node1->safe_psql('postgres', 'SHOW cluster.crossnode_write_write'), 'off',
+	'L2 explicitly disabled writer chaining preserves the fail-closed comparison');
 {
 	my $h0 = $node0->background_psql('postgres', on_error_die => 1);
 	$h0->query_safe('BEGIN');
