@@ -2677,8 +2677,8 @@ pfree(void *memory)
 }
 
 typedef struct GraphFixture {
-	uint8 keys[4][128];
-	uint8 evidence[4][256];
+	uint8 keys[4][512];
+	uint8 evidence[4][1024];
 	ClusterRecoveryCTRCGraphNodeV2 nodes[4];
 	ClusterRecoveryCTRCGraphEdgeV2 edges[8];
 	size_t roots[4];
@@ -7330,8 +7330,32 @@ UT_TEST(raw_evidence_original_wal_and_data_encoder_composition)
 	UT_ASSERT_EQ(graph_alloc_live, 0);
 }
 
-/* Keep native reader allocation outside the graph's NO_OOM scratch injector.
- * Graph fixtures are structural transcripts, not qualified owner evidence. */
+/* These reader fixtures use canonical owner envelopes bound to the original
+ * D0 target. They remain structural fixtures, not qualified owner completion. */
+static ClusterRecoveryCTRCReleaseV2
+graph_reader_value(void)
+{
+	ClusterRecoveryCTRCReleaseV2 value = sample();
+
+	value.database_incarnation = 99;
+	value.formation_epoch = cluster_undo_tt_ctrc_get_u64_le(cold_step_golden);
+	value.recovery_serial = cluster_undo_tt_ctrc_get_u64_le(cold_step_golden + 8);
+	value.cohort_bitmap = cluster_undo_tt_ctrc_get_u64_le(cold_step_golden + 16);
+	memcpy(value.input_sha256, cold_step_golden + 32, 32);
+	return value;
+}
+
+static void
+graph_reader_fixture(GraphFixture *f)
+{
+	graph_fixture(f);
+	memcpy(f->keys[2], owner_key_golden, sizeof(owner_key_golden));
+	memcpy(f->evidence[2], owner_evidence_read_golden, sizeof(owner_evidence_read_golden));
+	f->nodes[2].key = (ClusterRecoveryCTRCGraphBytesV2){f->keys[2], sizeof(owner_key_golden)};
+	f->nodes[2].evidence = (ClusterRecoveryCTRCGraphBytesV2){f->evidence[2], sizeof(owner_evidence_read_golden)};
+}
+
+/* Keep native reader allocation outside the graph's NO_OOM scratch injector. */
 static bool
 graph_reader_run(const ClusterRecoveryCTRCReleaseV2 *value,
 	const ClusterRecoveryCTRCGraphV2 *graph, unsigned extra, bool cross_page,
@@ -7389,16 +7413,16 @@ UT_TEST(graph_reader_golden_and_terminal)
 	GraphFixture f, saved;
 	ClusterRecoveryCTRCReleaseV2 value, out;
 
-	graph_fixture(&f);
+	graph_reader_fixture(&f);
 	saved = f;
 	for (unsigned terminal = TT_SLOT_COMMITTED; terminal <= TT_SLOT_ABORTED; terminal++) {
-		value = sample();
+		value = graph_reader_value();
 		value.terminal_outcome = value.before.status = value.after.status = terminal;
 		if (terminal == TT_SLOT_ABORTED) {
 			value.before.commit_scn = value.after.commit_scn = InvalidScn;
-			UT_ASSERT(cluster_recovery_ctrc_graph_hash_v2(&value, SYSTEM_ID, &f.graph,
-				value.graph_sha256));
-		} else memcpy(value.graph_sha256, graph_golden, 32);
+		}
+		UT_ASSERT(cluster_recovery_ctrc_graph_hash_v2(&value, SYSTEM_ID, &f.graph,
+			value.graph_sha256));
 		for (unsigned cross = 0; cross < 2; cross++) {
 			UT_ASSERT(graph_reader_run(&value, &f.graph, 0, cross != 0, 0, &out));
 			UT_ASSERT(same_fields(&out, &value));
@@ -7412,16 +7436,17 @@ UT_TEST(graph_reader_canonical_equivalent_inputs)
 	const unsigned permutations[6][3]
 		= { { 0, 1, 2 }, { 0, 2, 1 }, { 1, 0, 2 }, { 1, 2, 0 }, { 2, 0, 1 }, { 2, 1, 0 } };
 	GraphFixture f;
-	ClusterRecoveryCTRCReleaseV2 value = sample(), out;
+	ClusterRecoveryCTRCReleaseV2 value = graph_reader_value(), out;
 
-	memcpy(value.graph_sha256, graph_golden, 32);
+	graph_reader_fixture(&f);
+	UT_ASSERT(cluster_recovery_ctrc_graph_hash_v2(&value, SYSTEM_ID, &f.graph, value.graph_sha256));
 	for (unsigned n = 0; n < 6; n++)
 		for (unsigned e = 0; e < 6; e++) {
 			ClusterRecoveryCTRCGraphNodeV2 nodes[3];
 			ClusterRecoveryCTRCGraphEdgeV2 edges[3];
 			size_t inverse[3], root;
 
-			graph_fixture(&f);
+			graph_reader_fixture(&f);
 			for (unsigned i = 0; i < 3; i++) {
 				nodes[i] = f.nodes[permutations[n][i]];
 				inverse[permutations[n][i]] = i;
@@ -7436,7 +7461,7 @@ UT_TEST(graph_reader_canonical_equivalent_inputs)
 			UT_ASSERT(graph_reader_run(&value, &f.graph, 0, false, 0, &out));
 			UT_ASSERT(same_fields(&out, &value));
 		}
-	graph_fixture(&f);
+	graph_reader_fixture(&f);
 	f.nodes[3] = f.nodes[0]; f.graph.node_count++;
 	f.edges[3] = f.edges[0]; f.graph.edge_count++;
 	UT_ASSERT(graph_reader_run(&value, &f.graph, 0, false, 0, &out));
@@ -7446,10 +7471,10 @@ UT_TEST(graph_reader_canonical_equivalent_inputs)
 UT_TEST(graph_reader_exact_graph_digest)
 {
 	GraphFixture f;
-	ClusterRecoveryCTRCReleaseV2 value = sample();
+	ClusterRecoveryCTRCReleaseV2 value = graph_reader_value();
 
-	graph_fixture(&f);
-	memcpy(value.graph_sha256, graph_golden, 32);
+	graph_reader_fixture(&f);
+	UT_ASSERT(cluster_recovery_ctrc_graph_hash_v2(&value, SYSTEM_ID, &f.graph, value.graph_sha256));
 	/* Each changed payload is encoded anew with valid payload/identity hashes
 	 * and a valid native CRC, so integrity alone cannot admit the wrong graph. */
 	for (unsigned i = 0; i < 32; i++) {
@@ -7476,10 +7501,10 @@ UT_TEST(graph_reader_record_context)
 	GraphFixture f;
 	ClusterRecoveryCTRCReleaseV2 value;
 
-	graph_fixture(&f);
+	graph_reader_fixture(&f);
 	for (unsigned i = 0; i < 12; i++) {
-		value = sample();
-		memcpy(value.graph_sha256, graph_golden, 32);
+		value = graph_reader_value();
+		UT_ASSERT(cluster_recovery_ctrc_graph_hash_v2(&value, SYSTEM_ID, &f.graph, value.graph_sha256));
 		switch (i) {
 		case 0: value.root_id ^= 1; break;
 		case 1: value.root_generation ^= 1; break;
@@ -7502,10 +7527,10 @@ UT_TEST(graph_reader_preserves_native_admission)
 {
 	const unsigned extra[] = { NATIVE_BLOCK, NATIVE_EDGE, NATIVE_ORIGIN, NATIVE_TOP_XID };
 	GraphFixture f;
-	ClusterRecoveryCTRCReleaseV2 value = sample();
+	ClusterRecoveryCTRCReleaseV2 value = graph_reader_value();
 
-	graph_fixture(&f);
-	memcpy(value.graph_sha256, graph_golden, 32);
+	graph_reader_fixture(&f);
+	UT_ASSERT(cluster_recovery_ctrc_graph_hash_v2(&value, SYSTEM_ID, &f.graph, value.graph_sha256));
 	for (unsigned i = 0; i < lengthof(extra); i++)
 		UT_ASSERT(graph_reader_refused(&value, &f.graph, extra[i], 0));
 	for (unsigned fault = 1; fault <= 6; fault++)
@@ -7515,14 +7540,15 @@ UT_TEST(graph_reader_preserves_native_admission)
 UT_TEST(graph_reader_malformed_graph_and_nulls)
 {
 	GraphFixture f;
-	ClusterRecoveryCTRCReleaseV2 value = sample();
+	ClusterRecoveryCTRCReleaseV2 value = graph_reader_value();
 
-	memcpy(value.graph_sha256, graph_golden, 32);
+	graph_reader_fixture(&f);
+	UT_ASSERT(cluster_recovery_ctrc_graph_hash_v2(&value, SYSTEM_ID, &f.graph, value.graph_sha256));
 	UT_ASSERT(graph_reader_refused(&value, NULL, 0, 0));
-	graph_fixture(&f);
+	graph_reader_fixture(&f);
 	UT_ASSERT(!graph_reader_run(&value, &f.graph, 0, false, 0, NULL));
 	for (unsigned i = 0; i < 8; i++) {
-		graph_fixture(&f);
+		graph_reader_fixture(&f);
 		switch (i) {
 		case 0: f.graph.node_count = 0; break;
 		case 1: f.graph.root_count = 0; break;
@@ -7540,15 +7566,15 @@ UT_TEST(graph_reader_malformed_graph_and_nulls)
 UT_TEST(graph_reader_unaligned_alias_and_no_partial)
 {
 	GraphFixture f;
-	ClusterRecoveryCTRCReleaseV2 value = sample(), out;
-	uint8 keys[3][129], evidence[3][257], alias[sizeof(out) + 258];
+	ClusterRecoveryCTRCReleaseV2 value = graph_reader_value(), out;
+	uint8 keys[3][513], evidence[3][1025], alias[sizeof(out) + 1026];
 	union {
 		ClusterRecoveryCTRCGraphV2 graph;
 		uint8 bytes[sizeof(out) + 8];
 	} descriptors;
 
-	graph_fixture(&f);
-	memcpy(value.graph_sha256, graph_golden, 32);
+	graph_reader_fixture(&f);
+	UT_ASSERT(cluster_recovery_ctrc_graph_hash_v2(&value, SYSTEM_ID, &f.graph, value.graph_sha256));
 	for (unsigned i = 0; i < 3; i++) {
 		memcpy(keys[i] + 1, f.nodes[i].key.data, f.nodes[i].key.length);
 		memcpy(evidence[i] + 1, f.nodes[i].evidence.data, f.nodes[i].evidence.length);
@@ -7561,19 +7587,20 @@ UT_TEST(graph_reader_unaligned_alias_and_no_partial)
 	UT_ASSERT(same_fields(&out, &value));
 	UT_ASSERT(alias[0] == 0xa5 && alias[sizeof(out) + 1] == 0xa5);
 	/* Consume aliased evidence completely before either success or refusal. */
-	for (unsigned mismatch = 0; mismatch < 2; mismatch++) {
-		graph_fixture(&f);
-		memset(alias, 0xa5, sizeof(alias));
-		memcpy(alias + 1, f.nodes[0].evidence.data, f.nodes[0].evidence.length);
-		f.nodes[0].evidence.data = alias + 1;
-		if (mismatch) alias[1] ^= 1;
-		UT_ASSERT(graph_reader_run(&value, &f.graph, 0, false, 0, (void *)(alias + 1))
-			== !mismatch);
-		memcpy(&out, alias + 1, sizeof(out));
-		UT_ASSERT(mismatch ? all_zero(&out, sizeof(out)) : same_fields(&out, &value));
-		UT_ASSERT(alias[0] == 0xa5 && alias[sizeof(out) + 1] == 0xa5);
-	}
-	graph_fixture(&f);
+	for (unsigned node = 0; node <= 2; node += 2)
+		for (unsigned mismatch = 0; mismatch < 2; mismatch++) {
+			graph_reader_fixture(&f);
+			memset(alias, 0xa5, sizeof(alias));
+			memcpy(alias + 1, f.nodes[node].evidence.data, f.nodes[node].evidence.length);
+			f.nodes[node].evidence.data = alias + 1;
+			if (mismatch) alias[1] ^= 1;
+			UT_ASSERT(graph_reader_run(&value, &f.graph, 0, false, 0, (void *)(alias + 1))
+				== !mismatch);
+			memcpy(&out, alias + 1, sizeof(out));
+			UT_ASSERT(mismatch ? all_zero(&out, sizeof(out)) : same_fields(&out, &value));
+			UT_ASSERT(alias[0] == 0xa5 && alias[sizeof(alias) - 1] == 0xa5);
+		}
+	graph_reader_fixture(&f);
 	memset(&descriptors, 0xa5, sizeof(descriptors));
 	descriptors.graph = f.graph;
 	UT_ASSERT(graph_reader_run(&value, &descriptors.graph, 0, false, 0, (void *)&descriptors));
@@ -7581,14 +7608,84 @@ UT_TEST(graph_reader_unaligned_alias_and_no_partial)
 	UT_ASSERT(same_fields(&out, &value) && descriptors.bytes[sizeof(out)] == 0xa5);
 }
 
+UT_TEST(graph_reader_canonical_owner_required)
+{
+	GraphFixture f;
+	ClusterRecoveryCTRCReleaseV2 value = graph_reader_value();
+
+	for (unsigned fault = 0; fault < 7; fault++) {
+		graph_reader_fixture(&f);
+		switch (fault) {
+		case 0: f.nodes[2].evidence.length--; break;
+		case 1: f.nodes[2].evidence.length++; break;
+		case 2: f.evidence[2][0]++; break;
+		case 3: f.evidence[2][94] ^= 1; break; /* exact atom3 owner subject */
+		case 4: f.evidence[2][430] = 0xff; break; /* completion body */
+		case 5: f.nodes[2].key.length--; break;
+		case 6: f.keys[2][0] = 0xff; break;
+		}
+		UT_ASSERT(cluster_recovery_ctrc_graph_hash_v2(&value, SYSTEM_ID, &f.graph, value.graph_sha256));
+		UT_ASSERT(graph_reader_refused(&value, &f.graph, 0, 0));
+	}
+}
+
+UT_TEST(graph_reader_owner_target_bound)
+{
+	GraphFixture f;
+	ClusterRecoveryCTRCReleaseV2 value;
+
+	for (unsigned fault = 0; fault < 4; fault++) {
+		graph_reader_fixture(&f);
+		value = graph_reader_value();
+		switch (fault) {
+		case 0: value.database_incarnation++; break;
+		case 1: value.xid++; value.before.xid = value.after.xid = value.xid; break;
+		case 2: value.wrap++; value.before.wrap = value.after.wrap = value.wrap; break;
+		case 3: value.segment_generation++; break;
+		}
+		UT_ASSERT(cluster_recovery_ctrc_graph_hash_v2(&value, SYSTEM_ID, &f.graph, value.graph_sha256));
+		UT_ASSERT(graph_reader_refused(&value, &f.graph, 0, 0));
+	}
+}
+
+UT_TEST(graph_reader_last_owner_and_cold_binding)
+{
+	GraphFixture f;
+	ClusterRecoveryCTRCReleaseV2 value = graph_reader_value(), out;
+
+	graph_reader_fixture(&f);
+	memcpy(f.evidence[2], owner_evidence_read_cold_golden, sizeof(owner_evidence_read_cold_golden));
+	f.nodes[2].evidence.length = sizeof(owner_evidence_read_cold_golden);
+	UT_ASSERT(cluster_recovery_ctrc_graph_hash_v2(&value, SYSTEM_ID, &f.graph, value.graph_sha256));
+	UT_ASSERT(graph_reader_run(&value, &f.graph, 0, true, 0, &out));
+	UT_ASSERT(same_fields(&out, &value));
+	value.formation_epoch++;
+	UT_ASSERT(cluster_recovery_ctrc_graph_hash_v2(&value, SYSTEM_ID, &f.graph, value.graph_sha256));
+	UT_ASSERT(graph_reader_refused(&value, &f.graph, 0, 0));
+
+	value = graph_reader_value();
+	graph_reader_fixture(&f);
+	/* An extra reachable owner follows an otherwise valid complete owner. */
+	memcpy(f.keys[3], f.keys[2], f.nodes[2].key.length);
+	memcpy(f.evidence[3], f.evidence[2], f.nodes[2].evidence.length);
+	f.nodes[3] = f.nodes[2];
+	f.nodes[3].key.data = f.keys[3];
+	f.nodes[3].evidence.data = f.evidence[3];
+	f.keys[3][0] = 0xff;
+	f.edges[3] = (ClusterRecoveryCTRCGraphEdgeV2){4, 1, 3};
+	f.graph.node_count = f.graph.edge_count = 4;
+	UT_ASSERT(cluster_recovery_ctrc_graph_hash_v2(&value, SYSTEM_ID, &f.graph, value.graph_sha256));
+	UT_ASSERT(graph_reader_refused(&value, &f.graph, 0, 0));
+}
+
 UT_TEST(graph_reader_allocation_refusal)
 {
 	GraphFixture f;
-	ClusterRecoveryCTRCReleaseV2 value = sample(), out;
+	ClusterRecoveryCTRCReleaseV2 value = graph_reader_value(), out;
 	unsigned allocations;
 
-	graph_fixture(&f);
-	memcpy(value.graph_sha256, graph_golden, 32);
+	graph_reader_fixture(&f);
+	UT_ASSERT(cluster_recovery_ctrc_graph_hash_v2(&value, SYSTEM_ID, &f.graph, value.graph_sha256));
 	graph_alloc_calls = 0;
 	UT_ASSERT(graph_reader_run(&value, &f.graph, 0, false, 0, &out));
 	allocations = graph_alloc_calls;
@@ -7606,7 +7703,7 @@ UT_TEST(graph_reader_allocation_refusal)
 int
 main(void)
 {
-	UT_PLAN(212);
+	UT_PLAN(215);
 	UT_RUN(golden_encoding);
 	UT_RUN(golden_decoding);
 	UT_RUN(unaligned_buffers);
@@ -7819,6 +7916,9 @@ main(void)
 	UT_RUN(graph_reader_preserves_native_admission);
 	UT_RUN(graph_reader_malformed_graph_and_nulls);
 	UT_RUN(graph_reader_unaligned_alias_and_no_partial);
+	UT_RUN(graph_reader_canonical_owner_required);
+	UT_RUN(graph_reader_owner_target_bound);
+	UT_RUN(graph_reader_last_owner_and_cold_binding);
 	UT_RUN(graph_reader_allocation_refusal);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
