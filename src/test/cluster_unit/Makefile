@@ -7249,10 +7249,14 @@ CLUSTER_TT_DURABLE_O = $(top_builddir)/src/backend/cluster/cluster_tt_durable.o
 
 # The process-local reservation is allocated by the linked producer and by
 # these fixtures. Rebuild both sides when its header changes.
-$(CLUSTER_TT_DURABLE_O): $(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
+$(CLUSTER_TT_DURABLE_O) $(CLUSTER_TT_SLOT_O): \
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h
 
 test_cluster_tt_durable test_cluster_tt_rollback_entry test_cluster_tt_abort_owner \
-test_cluster_tt_active_owner: $(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
+test_cluster_tt_active_owner test_cluster_tt_slot_allocator: \
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h
 
 # spec-3.11 D2/D9: test_cluster_tt_durable — pure decision predicates
 # (redo wrap table / slot match) + lookup / by-xid scan with a mocked

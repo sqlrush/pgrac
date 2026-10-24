@@ -664,6 +664,9 @@ cluster_tt_slot_durable_publish_active(const ClusterTTSlotCurrentOwner *expected
 			|| ctrc_grant_generation == 0)
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
 							errmsg("canonical ACTIVE CTRC origin grant is unavailable")));
+		/* Optional original identity follows the existing successful ACTIVE
+		 * owner; absence must not turn normal publication into a new gate. */
+		(void)cluster_tt_slot_origin_identity_retain(&ctrc_reservation);
 		ctrc_post_bind_block_armed = false;
 
 		*segment_generation_out = generation.value;

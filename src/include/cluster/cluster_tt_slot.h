@@ -404,6 +404,17 @@ extern void cluster_tt_slot_mark_aborted(uint32 segment_id, uint16 slot_offset, 
 extern uint32 cluster_tt_slot_current_segment(int node_id);
 extern bool cluster_tt_slot_current_owner_by_xid(int node_id, TransactionId xid,
 												 ClusterTTSlotCurrentOwner *out);
+/*
+ * Volatile original identity, owned by the existing allocator binding/slot.
+ * Only the original pending reservation may install it after ACTIVE publication.
+ * A read is provenance only: it supplies no terminal, retention or freeze grant.
+ */
+struct ClusterCtrcOriginReservation;
+struct ClusterCtrcTxnKeyV1;
+extern bool cluster_tt_slot_origin_identity_retain(
+	const struct ClusterCtrcOriginReservation *reservation);
+extern bool cluster_tt_slot_origin_identity_read(const struct ClusterCtrcTxnKeyV1 *key,
+											   FullTransactionId *out);
 extern void cluster_tt_slot_rollover(int node_id, uint32 new_segment_id, bool *out_old_had_active);
 
 

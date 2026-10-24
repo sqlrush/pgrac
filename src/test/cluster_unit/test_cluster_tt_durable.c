@@ -577,6 +577,8 @@ static int g_ctrc_open_calls = 0;
 static int g_ctrc_open_order = 0;
 static FullTransactionId g_ctrc_reserved_original_full;
 static FullTransactionId g_ctrc_open_original_full;
+static ClusterCtrcOriginReservation g_ctrc_original_reservation;
+static bool g_ctrc_original_available = true;
 static ClusterCtrcOriginReserveResult g_ctrc_reserve_result = CLUSTER_CTRC_ORIGIN_RESERVED_PENDING;
 static int g_ctrc_reserve_retry_countdown = 0;
 static int g_ctrc_release_overlap_pending_countdown = 0;
@@ -614,6 +616,7 @@ cluster_ctrc_origin_reserve_active(const ClusterCtrcTxnKeyV1 *key,
 							? CTRC_ORIGIN_RESERVATION_PENDING_OWNED
 							: CTRC_ORIGIN_RESERVATION_EXISTING_OPEN;
 	reservation->valid = true;
+	g_ctrc_original_reservation = *reservation;
 	return g_ctrc_reserve_result;
 }
 
@@ -651,6 +654,21 @@ cluster_ctrc_origin_open_reserved(const ClusterCtrcOriginReservation *reservatio
 	return true;
 }
 
+/* Controlled origin source only; the ACTIVE publisher and allocator are real. */
+bool
+cluster_ctrc_origin_original_full_xid_shared(const ClusterCtrcTxnKeyV1 *key,
+											FullTransactionId *out)
+{
+	if (out == NULL)
+		return false;
+	*out = InvalidFullTransactionId;
+	if (!g_ctrc_original_available || g_ctrc_open_calls == 0 || key == NULL
+		|| memcmp(key, &g_ctrc_original_reservation.key, sizeof(*key)) != 0)
+		return false;
+	*out = g_ctrc_open_original_full;
+	return true;
+}
+
 bool
 cluster_ctrc_origin_cancel_pre_bind(const ClusterCtrcOriginReservation *reservation)
 {
@@ -666,6 +684,13 @@ cluster_ctrc_origin_block_post_bind(const ClusterCtrcOriginReservation *reservat
 }
 
 #ifndef TT_DURABLE_REAL_ALLOCATOR_FIXTURE
+bool
+cluster_tt_slot_origin_identity_retain(const ClusterCtrcOriginReservation *reservation)
+{
+	(void)reservation;
+	return false;
+}
+
 bool
 cluster_tt_slot_current_owner_by_xid(int node_id, TransactionId xid, ClusterTTSlotCurrentOwner *out)
 {
@@ -1052,6 +1077,8 @@ reset_current_write_mock(void)
 	g_ctrc_open_order = 0;
 	g_ctrc_reserved_original_full = InvalidFullTransactionId;
 	g_ctrc_open_original_full = InvalidFullTransactionId;
+	memset(&g_ctrc_original_reservation, 0, sizeof(g_ctrc_original_reservation));
+	g_ctrc_original_available = true;
 	g_ctrc_reserve_result = CLUSTER_CTRC_ORIGIN_RESERVED_PENDING;
 	g_ctrc_reserve_retry_countdown = 0;
 	g_ctrc_release_overlap_pending_countdown = 0;
