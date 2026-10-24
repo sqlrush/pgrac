@@ -2829,10 +2829,13 @@ custody_view(bool published)
 	view.pending_committed = custody_image.committed;
 	return view;
 }
+static int custody_saved_node;
 static ClusterWalInputsV1 *
 custody_setup(bool shared, bool aborted)
 {
 	ClusterWalInputsV1 *inputs;
+	custody_saved_node = cluster_node_id;
+	cluster_node_id = 1; /* Original cold owner is foreign origin zero. */
 	custody_shared = shared;
 	custody_scope = 7;
 	custody_scope_reads = custody_scope_error_after = 0;
@@ -2840,7 +2843,15 @@ custody_setup(bool shared, bool aborted)
 	inputs = terminal_prefix_fixture(aborted, 29);
 	prefix_base_expected = *cluster_wal_inputs_at_v1(inputs, 0);
 	prefix_base_fault = prefix_base_scope_checks = prefix_base_reads = 0;
+	prefix_base_status = aborted ? TRANSACTION_STATUS_ABORTED : TRANSACTION_STATUS_COMMITTED;
+	prefix_base_last_byte = 0x24;
 	return inputs;
+}
+static void
+custody_done(ClusterWalInputsV1 **inputs)
+{
+	cold_census_done(inputs);
+	cluster_node_id = custody_saved_node;
 }
 UT_TEST(test_recovery_custody_binds_both_namespaces_and_pair_cuts)
 {
@@ -2863,10 +2874,10 @@ UT_TEST(test_recovery_custody_binds_both_namespaces_and_pair_cuts)
 			UT_ASSERT(
 				!cluster_relmap_recovery_handle_matches_v1(handle, &identity, (void *)handle));
 			UT_ASSERT(cluster_relmap_recovery_handle_matches_v1(handle, &identity, &view));
-			UT_ASSERT_EQ(prefix_base_reads, 0);
+			UT_ASSERT_EQ(prefix_base_reads, 2); /* prepare + successful match */
 			cluster_relmap_recovery_handle_release_v1(&handle);
 			UT_ASSERT(handle == NULL && inputs_pin_held);
-			cold_census_done(&inputs);
+			custody_done(&inputs);
 		}
 }
 UT_TEST(test_recovery_custody_rejects_pending_owner_window_and_view_corruption)
@@ -2921,7 +2932,7 @@ UT_TEST(test_recovery_custody_rejects_pending_owner_window_and_view_corruption)
 		UT_ASSERT(!cluster_relmap_recovery_prepare_v1(inputs, &identity, &view, &handle));
 		UT_ASSERT(handle == NULL && inputs_pin_held);
 		UT_ASSERT_EQ(prefix_base_reads, 0);
-		cold_census_done(&inputs);
+		custody_done(&inputs);
 	}
 }
 UT_TEST(test_recovery_custody_refusal_is_sticky_and_scope_aba_is_not_current)
@@ -2951,7 +2962,7 @@ UT_TEST(test_recovery_custody_refusal_is_sticky_and_scope_aba_is_not_current)
 		UT_ASSERT(!cluster_relmap_recovery_handle_matches_v1(handle, &identity, &view));
 		cluster_relmap_recovery_handle_release_v1(&handle);
 		UT_ASSERT(handle == NULL && inputs_pin_held);
-		cold_census_done(&inputs);
+		custody_done(&inputs);
 	}
 }
 
@@ -2989,7 +3000,7 @@ UT_TEST(test_recovery_custody_error_preserves_pins_and_invalidates_handle)
 		else
 			UT_ASSERT(handle == NULL);
 		cluster_relmap_recovery_handle_release_v1(&handle);
-		cold_census_done(&inputs);
+		custody_done(&inputs);
 	}
 }
 
@@ -3020,8 +3031,94 @@ UT_TEST(test_recovery_custody_requires_original_sealed_terminal_source)
 		UT_ASSERT_EQ(handle != NULL, fault == 0);
 		UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock);
 		cluster_relmap_recovery_handle_release_v1(&handle);
-		cold_census_done(&inputs);
+		custody_done(&inputs);
 	}
+}
+
+UT_TEST(test_recovery_custody_reads_original_native_base_before_publication)
+{
+	static const unsigned faults[] = { 0, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+	for (unsigned aborted = 0; aborted < 2; aborted++)
+		for (unsigned i = 0; i < lengthof(faults); i++) {
+			unsigned fault = faults[i];
+			ClusterWalInputsV1 *inputs = custody_setup(i % 2, aborted);
+			ClusterRelmapRecoveryHandle *handle = NULL;
+			ClusterRelmapV2View view = custody_view(false);
+			volatile bool threw = false;
+			prefix_base_fault = fault;
+			test_capture_error_level = fault == 8;
+			PG_TRY();
+			{
+				UT_ASSERT_EQ(cluster_relmap_recovery_prepare_v1(inputs, &custody_image.identity,
+																&view, &handle),
+							 fault == 0);
+			}
+			PG_CATCH();
+			{
+				threw = true;
+			}
+			PG_END_TRY();
+			test_capture_error_level = false;
+			prefix_base_fault = 0;
+			UT_ASSERT_EQ(threw, fault == 8);
+			/* Fault 9 invalidates the source in the pre-I/O scope check. */
+			UT_ASSERT_EQ(prefix_base_reads, fault == 9 ? 0 : 1);
+			UT_ASSERT_EQ(handle != NULL, fault == 0);
+			UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock);
+			cluster_relmap_recovery_handle_release_v1(&handle);
+			custody_done(&inputs);
+		}
+}
+
+UT_TEST(test_recovery_custody_base_drift_and_io_error_are_sticky)
+{
+	for (unsigned shared = 0; shared < 2; shared++)
+		for (unsigned fault = 0; fault < 4; fault++) {
+			ClusterWalInputsV1 *inputs = custody_setup(shared, fault % 2);
+			ClusterRelmapRecoveryHandle *handle = NULL;
+			ClusterRelmapV2View view = custody_view(false);
+			volatile bool threw = false;
+			unsigned reads;
+			uint8 original = prefix_base_last_byte;
+			UT_ASSERT(cluster_relmap_recovery_prepare_v1(inputs, &custody_image.identity, &view,
+														 &handle));
+			UT_ASSERT_EQ(prefix_base_reads, 1);
+			UT_ASSERT(
+				cluster_relmap_recovery_handle_matches_v1(handle, &custody_image.identity, &view));
+			UT_ASSERT_EQ(prefix_base_reads, 2);
+			if (fault == 0)
+				prefix_base_last_byte ^= 1; /* Unrelated native page byte. */
+			if (fault == 1)
+				prefix_base_fault = 8;
+			if (fault == 2)
+				prefix_base_fault = 5;
+			if (fault == 3)
+				prefix_base_fault = 2;
+			test_capture_error_level = fault == 1;
+			PG_TRY();
+			{
+				UT_ASSERT(!cluster_relmap_recovery_handle_matches_v1(
+					handle, &custody_image.identity, &view));
+			}
+			PG_CATCH();
+			{
+				threw = true;
+			}
+			PG_END_TRY();
+			test_capture_error_level = false;
+			UT_ASSERT_EQ(threw, fault == 1);
+			UT_ASSERT_EQ(prefix_base_reads, 3);
+			reads = prefix_base_reads;
+			prefix_base_last_byte = original;
+			prefix_base_fault = 0;
+			UT_ASSERT(
+				!cluster_relmap_recovery_handle_matches_v1(handle, &custody_image.identity, &view));
+			UT_ASSERT_EQ(prefix_base_reads, reads);
+			UT_ASSERT(inputs_pin_held && inputs_pin_current && test_actual_cf == NoLock);
+			cluster_relmap_recovery_handle_release_v1(&handle);
+			UT_ASSERT_EQ(prefix_base_reads, reads);
+			custody_done(&inputs);
+		}
 }
 
 int
@@ -3031,7 +3128,9 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(53);
+	UT_PLAN(55);
+	UT_RUN(test_recovery_custody_base_drift_and_io_error_are_sticky);
+	UT_RUN(test_recovery_custody_reads_original_native_base_before_publication);
 	UT_RUN(test_recovery_custody_requires_original_sealed_terminal_source);
 	UT_RUN(test_recovery_custody_error_preserves_pins_and_invalidates_handle);
 	UT_RUN(test_recovery_custody_binds_both_namespaces_and_pair_cuts);

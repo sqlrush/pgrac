@@ -19,13 +19,19 @@ struct ClusterWalInputsV1;
  * select its owner origin internally, and bind the exact pending native WAL
  * before the checkpoint-prefix terminal and its owner window. No supplied
  * status/qualification boolean, new scope, source pin or native base grant.
+ * Internally bind the original native durable page observation fingerprint;
+ * original source/round checks bracket its native sync/readback. This does
+ * not certify the FullXid era or retained lifetime.
  * Inputs must outlive the handle. Nonoverlap refusal sets *out NULL; overlap
  * is unchanged. ERROR frees only local memory and propagates. */
 extern bool cluster_relmap_recovery_prepare_v1(struct ClusterWalInputsV1 *inputs,
 											   const ClusterRelmapV2Namespace *identity,
 											   const ClusterRelmapV2View *pending,
 											   ClusterRelmapRecoveryHandle **out);
-/* Exact full namespace/view and original-round current checks only. Refusal
+/* Exact full namespace/view, original-round current checks and an unchanged
+ * internally reread native base fingerprint. Page drift (even another slot)
+ * conservatively refuses this snapshot; false is not rollback/retry permission.
+ * Refusal
  * or ERROR after entry is sticky; overlapping inputs are unchanged and do
  * not invalidate custody. No terminal/COMPLETE/release permission. */
 extern bool cluster_relmap_recovery_handle_matches_v1(ClusterRelmapRecoveryHandle *handle,

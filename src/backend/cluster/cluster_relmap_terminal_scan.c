@@ -469,6 +469,7 @@ struct ClusterRelmapRecoveryHandle {
 	ClusterRelmapTerminalScanV1 *scan;
 	uint8 pending_wire[CLUSTER_RELMAP_V2_FILE_SIZE];
 	uint8 committed_wire[CLUSTER_RELMAP_V2_FILE_SIZE];
+	uint8 native_base_fingerprint[32];
 };
 
 static bool
@@ -520,6 +521,22 @@ recovery_handle_current(ClusterRelmapRecoveryHandle *handle)
 		   && terminal_scan_current(scan);
 }
 
+/* Bind the original native durable page observation, without exporting its
+ * status or upgrading it to FullXid/base-lifetime qualification. Every read
+ * still uses the original native owner and its own held-FD sync/readback. */
+static bool
+recovery_handle_base_fingerprint(ClusterRelmapRecoveryHandle *handle, uint8 out[32])
+{
+	ClusterRelmapTerminalBaseObservationV1 base;
+
+	if (!recovery_handle_current(handle)
+		|| !cluster_relmap_recovery_terminal_prefix_base_read_v1(handle->scan, &base)
+		|| !recovery_handle_current(handle))
+		return false;
+	memcpy(out, base.fingerprint, 32);
+	return true;
+}
+
 bool
 cluster_relmap_recovery_prepare_v1(ClusterWalInputsV1 *inputs,
 								   const ClusterRelmapV2Namespace *identity,
@@ -569,7 +586,7 @@ cluster_relmap_recovery_prepare_v1(ClusterWalInputsV1 *inputs,
 		accepted = terminal_scan(inputs, index,
 								 FullTransactionIdFromU64(image.pending_owner.top_full_xid), true,
 								 &image, serial, &handle->scan)
-				   && recovery_handle_current(handle);
+				   && recovery_handle_base_fingerprint(handle, handle->native_base_fingerprint);
 	}
 	PG_CATCH();
 	{
@@ -593,6 +610,7 @@ cluster_relmap_recovery_handle_matches_v1(ClusterRelmapRecoveryHandle *handle,
 										  const ClusterRelmapV2View *pending)
 {
 	ClusterRelmapV2Image image;
+	uint8 native_base_fingerprint[32];
 	uint8 pending_wire[CLUSTER_RELMAP_V2_FILE_SIZE], committed_wire[CLUSTER_RELMAP_V2_FILE_SIZE];
 	if (handle == NULL || handle->pid != getpid() || handle->failed
 		|| recovery_overlap(handle, sizeof(*handle), identity, sizeof(*identity))
@@ -604,7 +622,8 @@ cluster_relmap_recovery_handle_matches_v1(ClusterRelmapRecoveryHandle *handle,
 		|| !recovery_pending_encode(identity, pending, &image, pending_wire, committed_wire)
 		|| memcmp(pending_wire, handle->pending_wire, sizeof(pending_wire)) != 0
 		|| memcmp(committed_wire, handle->committed_wire, sizeof(committed_wire)) != 0
-		|| !recovery_handle_current(handle))
+		|| !recovery_handle_base_fingerprint(handle, native_base_fingerprint)
+		|| memcmp(native_base_fingerprint, handle->native_base_fingerprint, 32) != 0)
 		return false;
 	handle->failed = false;
 	return true;
