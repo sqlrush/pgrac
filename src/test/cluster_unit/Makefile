@@ -541,6 +541,29 @@ SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_catalog_manifest test_cluster_catalog_init test_cluster_catalog_startup,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_init,$(SIMPLE_TESTS))
 
+# Recovery record headers and pure history checks also serve pg_waldump.
+TESTS += test_cluster_recovery_frontend
+SIMPLE_TESTS := $(filter-out test_cluster_recovery_frontend,$(SIMPLE_TESTS))
+all: test_cluster_recovery_frontend
+
+test_cluster_recovery_frontend_compare.inc: $(top_srcdir)/src/backend/cluster/cluster_scn.c Makefile
+	awk '/^scn_time_cmp\(/ { print "static int"; sub(/^scn_time_cmp/, "test_backend_scn_time_cmp"); emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_recovery_frontend: test_cluster_recovery_frontend.c \
+		test_cluster_recovery_frontend_compare.inc unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_uba.c \
+		$(top_srcdir)/src/include/cluster/cluster_scn.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_undo_scan.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_reference_graph.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
+		$(top_srcdir)/src/backend/cluster/cluster_uba.c \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a -o $@
+
 # Fresh image constructor must link as a frontend, without backend services.
 test_cluster_relmap_init: test_cluster_relmap_init.c unit_test.h \
 		$(top_srcdir)/src/include/common/relmap.h \
