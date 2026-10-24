@@ -293,6 +293,7 @@ InitProcGlobal(void)
 		pg_atomic_init_u64(&(proc->waitStart), 0);
 		/* PGRAC: spec-3.12 D1 — retention horizon read_scn (InvalidScn == 0). */
 		pg_atomic_init_u64(&(proc->cluster_read_scn_atomic), 0);
+		pg_atomic_init_u64(&proc->cluster_top_full_xid_atomic, 0);
 		/* PGRAC: spec-4.6 D3 — holder-rebind barrier ack generation +
 		 * live registered-grant count (barrier scope filter). */
 		pg_atomic_init_u64(&(proc->cluster_grd_redeclare_acked), 0);
@@ -406,6 +407,7 @@ InitProcess(void)
 	MyProc->fpVXIDLock = false;
 	MyProc->fpLocalTransactionId = InvalidLocalTransactionId;
 	MyProc->xid = InvalidTransactionId;
+	pg_atomic_write_u64(&MyProc->cluster_top_full_xid_atomic, 0);
 	MyProc->xmin = InvalidTransactionId;
 	MyProc->pid = MyProcPid;
 	/* backendId, databaseId and roleId will be filled in later */
@@ -632,6 +634,7 @@ InitAuxiliaryProcess(void)
 	MyProc->fpVXIDLock = false;
 	MyProc->fpLocalTransactionId = InvalidLocalTransactionId;
 	MyProc->xid = InvalidTransactionId;
+	pg_atomic_write_u64(&MyProc->cluster_top_full_xid_atomic, 0);
 	MyProc->xmin = InvalidTransactionId;
 	MyProc->backendId = InvalidBackendId;
 	MyProc->databaseId = InvalidOid;

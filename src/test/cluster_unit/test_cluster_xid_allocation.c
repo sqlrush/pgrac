@@ -79,6 +79,12 @@ LWLockRelease(LWLock *lock)
 {
 	if (lock != XidGenLock || !held)
 		lock_errors++;
+	/* Observe the native top publication before XidGenLock is released. */
+	if (TransactionIdIsNormal(proc.xid) &&
+		pg_atomic_read_u64(&proc.cluster_top_full_xid_atomic) !=
+		U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(
+			EpochFromFullTransactionId(variables.nextXid), proc.xid)))
+		lock_errors++;
 	held = false;
 }
 FullTransactionId
@@ -239,13 +245,33 @@ UT_TEST(native_allocation_preserves_ordinary_counter)
 	UT_ASSERT_EQ(extensions, 3);
 	UT_ASSERT_EQ(lock_errors, 0);
 }
+UT_TEST(original_top_fullxid_is_published_and_subxid_does_not_replace_it)
+{
+	FullTransactionId top, child;
+
+	reset_allocator();
+	cluster_enabled = cluster_shared_catalog = cluster_xid_striping = false;
+	variables.nextXid = FullTransactionIdFromEpochAndXid(7, 2053);
+	top = GetNewTransactionId(false);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_top_full_xid_atomic),
+				 U64FromFullTransactionId(top));
+	child = GetNewTransactionId(true);
+	UT_ASSERT(FullTransactionIdFollows(child, top));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_top_full_xid_atomic),
+				 U64FromFullTransactionId(top));
+	UT_ASSERT_EQ(proc.xid, XidFromFullTransactionId(top));
+	UT_ASSERT_EQ(lock_errors, 0);
+	UT_ASSERT(!held);
+}
+
 int
 main(void)
 {
-	UT_PLAN(3);
+	UT_PLAN(4);
 	UT_RUN(no_storage_or_procarray_mutation_before_reservation);
 	UT_RUN(wait_rederives_native_counter_and_new_boot_floor);
 	UT_RUN(native_allocation_preserves_ordinary_counter);
+	UT_RUN(original_top_fullxid_is_published_and_subxid_does_not_replace_it);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

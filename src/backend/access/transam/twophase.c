@@ -532,6 +532,20 @@ MarkAsPreparingGuts(GlobalTransaction gxact, TransactionId xid, const char *gid,
 	proc->waitLock = NULL;
 	proc->waitProcLock = NULL;
 	pg_atomic_init_u64(&proc->waitStart, 0);
+	/* A live PREPARE hands off the same original top identity before its
+	 * PGPROC protection ends. Recovery has no such source: leave unknown. */
+	pg_atomic_init_u64(&proc->cluster_top_full_xid_atomic, 0);
+#ifdef USE_PGRAC_CLUSTER
+	if (!RecoveryInProgress() && MyProc->xid == xid && TransactionIdIsNormal(xid))
+	{
+		FullTransactionId full = FullTransactionIdFromU64(
+			pg_atomic_read_u64(&MyProc->cluster_top_full_xid_atomic));
+
+		if (FullTransactionIdIsValid(full) && U64FromFullTransactionId(full) != UINT64_MAX &&
+			XidFromFullTransactionId(full) == xid)
+			pg_atomic_write_u64(&proc->cluster_top_full_xid_atomic, U64FromFullTransactionId(full));
+	}
+#endif
 	for (i = 0; i < NUM_LOCK_PARTITIONS; i++)
 		dlist_init(&proc->myProcLocks[i]);
 	/* subxid data must be filled later by GXactLoadSubxactData */

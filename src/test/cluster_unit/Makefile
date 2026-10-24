@@ -8173,23 +8173,29 @@ test_cluster_undo_extent_claim: test_cluster_undo_extent_claim.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
 
 # Execute the native array sampler and next-XID reader without copying logic.
-test_cluster_pgproc_active_types.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
+test_cluster_pgproc_active_types.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c \
+		$(top_srcdir)/src/backend/access/transam/twophase.c Makefile
 	awk '/^#define UINT32_ACCESS_ONCE/ { print; count++ } \
-	     /^typedef struct ProcArrayStruct$$/ { emit=1; count++ } \
-	     emit { print } /^} ProcArrayStruct;$$/ { emit=0 } \
-	     END { if (count != 2 || emit) exit 1 }' $< > $@.tmp
+	     /^typedef struct (ProcArrayStruct$$|GlobalTransactionData \{)/ { emit=1; count++ } \
+	     emit { print } /^} (ProcArrayStruct|GlobalTransactionData);$$/ { emit=0 } \
+	     END { if (count != 3 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pgproc_active_sample.inc: $(top_srcdir)/src/backend/access/transam/varsup.c \
-		$(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
+		$(top_srcdir)/src/backend/storage/ipc/procarray.c \
+		$(top_srcdir)/src/backend/access/transam/twophase.c Makefile
 	awk '/^ReadNextFullTransactionId\(void\)$$/ { print "FullTransactionId"; emit=1; count++ } \
 	     /^ProcArrayGetActiveFullXidSample\(/ { print "bool"; emit=1; count++ } \
+	     /^ProcArrayEndTransactionInternal\(/ { print "static inline void"; emit=1; count++ } \
+	     /^ProcArrayClearTransaction\(/ { print "void"; emit=1; count++ } \
+	     /^MarkAsPreparingGuts\(/ { print "static void"; emit=1; count++ } \
 	     emit { print } /^}$$/ { emit=0 } \
-	     END { if (count != 2 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	     END { if (count != 5 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pgproc_active_sample: test_cluster_pgproc_active_sample.c unit_test.h \
 		test_cluster_pgproc_active_types.inc test_cluster_pgproc_active_sample.inc \
+		$(top_srcdir)/src/include/storage/proc.h \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
 		$(top_srcdir)/src/include/storage/procarray.h \
 		$(top_builddir)/src/backend/cluster/cluster_xid_stripe.o
@@ -8838,7 +8844,8 @@ test_cluster_xid_allocation.inc: $(top_srcdir)/src/backend/access/transam/varsup
 	mv $@.tmp $@
 
 test_cluster_xid_allocation: test_cluster_xid_allocation.c unit_test.h \
-		test_cluster_xid_allocation.inc $(CLUSTER_XID_STRIPE_O)
+		test_cluster_xid_allocation.inc $(CLUSTER_XID_STRIPE_O) \
+		$(top_srcdir)/src/include/storage/proc.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Exercise the original recovery -> seed -> claim -> WAL gate. Dependency

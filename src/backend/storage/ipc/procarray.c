@@ -727,6 +727,7 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 		proc->xmin = InvalidTransactionId;
 		/* PGRAC: spec-3.12 D1 — clear retention read_scn safety net. */
 		pg_atomic_write_u64(&proc->cluster_read_scn_atomic, 0);
+		pg_atomic_write_u64(&proc->cluster_top_full_xid_atomic, 0);
 
 		/* be sure this is cleared in abort */
 		proc->delayChkptFlags = 0;
@@ -772,6 +773,7 @@ ProcArrayEndTransactionInternal(PGPROC *proc, TransactionId latestXid)
 	/* PGRAC: spec-3.12 D1 — clear retention read_scn safety net (snapmgr
 	 * already publishes InvalidScn on last snapshot release). */
 	pg_atomic_write_u64(&proc->cluster_read_scn_atomic, 0);
+	pg_atomic_write_u64(&proc->cluster_top_full_xid_atomic, 0);
 
 	/* be sure this is cleared in abort */
 	proc->delayChkptFlags = 0;
@@ -960,6 +962,7 @@ ProcArrayClearTransaction(PGPROC *proc)
 	proc->xmin = InvalidTransactionId;
 	/* PGRAC: spec-3.12 D1 — clear retention read_scn safety net. */
 	pg_atomic_write_u64(&proc->cluster_read_scn_atomic, 0);
+	pg_atomic_write_u64(&proc->cluster_top_full_xid_atomic, 0);
 	proc->recoveryConflictPending = false;
 
 	Assert(!(proc->statusFlags & PROC_VACUUM_STATE_MASK));
@@ -3237,7 +3240,8 @@ GetOldestActiveTransactionId(void)
  * This is one input to the cluster active scan, not freeze authority. An
  * exited PGPROC may still have census protection, which must be scanned
  * afterwards. The existing durable lease supplies the future input at the
- * same XidGenLock cut as N; N alone is only a widening anchor. Recovery's
+ * same XidGenLock cut as N. Each active identity comes from its original
+ * PGPROC assignment, never a raw-XID epoch guess. Recovery's
  * unclaimed transactions cannot be proved from this native array.
  */
 bool
@@ -3264,7 +3268,7 @@ ProcArrayGetActiveFullXidSample(FullTransactionId *reference_full,
 	if (reference_full == NULL || future_full == NULL || active_min == NULL || lease_fence == NULL ||
 		reference_full == future_full || reference_full == active_min || future_full == active_min ||
 		RecoveryInProgress() || procArray == NULL || ProcGlobal == NULL ||
-		ProcGlobal->xids == NULL || ShmemVariableCache == NULL)
+		ProcGlobal->xids == NULL || ProcGlobal->allProcs == NULL || ShmemVariableCache == NULL)
 		return false;
 
 	/* Capture both inputs before releasing XidGenLock. Raising a floor after
@@ -3287,21 +3291,18 @@ ProcArrayGetActiveFullXidSample(FullTransactionId *reference_full,
 	for (index = 0; valid && index < procArray->numProcs; index++)
 	{
 		TransactionId xid = UINT32_ACCESS_ONCE(ProcGlobal->xids[index]);
-		uint32		distance;
+		PGPROC	   *proc;
 		FullTransactionId full;
 
 		if (!TransactionIdIsValid(xid))
 			continue;
-		distance = xid - XidFromFullTransactionId(reference);
-		if (!TransactionIdIsNormal(xid) || distance == UINT32_C(0x80000000) ||
-			(distance < UINT32_C(0x80000000) &&
-			 U64FromFullTransactionId(reference) > UINT64_MAX - distance))
-		{
-			valid = false;
-			break;
-		}
-		full = cluster_xid_widen(xid, reference);
-		if (!FullTransactionIdIsValid(full))
+		/* Membership and pgprocnos are stable under ProcArrayLock. Pair
+		 * with the allocator's original-identity-before-raw publication. */
+		pg_read_barrier();
+		proc = &ProcGlobal->allProcs[procArray->pgprocnos[index]];
+		full = FullTransactionIdFromU64(pg_atomic_read_u64(&proc->cluster_top_full_xid_atomic));
+		if (!TransactionIdIsNormal(xid) || !FullTransactionIdIsValid(full) ||
+			U64FromFullTransactionId(full) == UINT64_MAX || XidFromFullTransactionId(full) != xid)
 		{
 			valid = false;
 			break;
