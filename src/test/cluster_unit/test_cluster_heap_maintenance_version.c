@@ -1124,6 +1124,8 @@ qualified_xmin_setup(QualifiedXminFixture *f, uint16 xmax_mask)
 	f->cohort.future_full_xid_max = U64FromFullTransactionId(f->policy.legal_next);
 	f->cohort.horizon_scn = 10;
 	f->cohort.source_local_horizon_scn = 10;
+	f->cohort.source_local_history.sample_clock_scn = 10;
+	f->cohort.source_local_history.contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK;
 	f->cohort.record_generation = 13; f->cohort.formation_epoch = 21;
 	f->cohort.admitted_members_lo = 1;
 	f->cohort.admission_fence.record_generation = 13;
@@ -1586,6 +1588,7 @@ UT_TEST(test_xmin_single_and_batch_wal_clock_accept_time_equal_or_ahead)
 				qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
 			f.cohort.horizon_scn = horizon;
 			f.cohort.source_local_horizon_scn = horizon;
+			f.cohort.source_local_history.sample_clock_scn = horizon;
 			/* A lower node id at the same time is still sufficient. */
 			fixture_wal_clock = scn_encode(0, 10 + ahead);
 			applied = batch ? cluster_heap_freeze_apply_xmin_batch_v1(
@@ -2812,7 +2815,7 @@ UT_TEST(test_xmin_original_h_source_refusal_precedes_writer_use)
 {
 	for (int batch = 0; batch < 2; batch++) {
 		for (int released = 0; released < 2; released++) {
-			for (int variant = 0; variant < 4; variant++) {
+			for (int variant = 0; variant < 7; variant++) {
 				QualifiedXminFixture f;
 				ClusterHeapFreezeXminTargetV1 targets[3];
 				if (batch) qualified_xmin_batch_setup(&f, targets);
@@ -2823,6 +2826,10 @@ UT_TEST(test_xmin_original_h_source_refusal_precedes_writer_use)
 				case 1: f.cohort.source_local_horizon_scn = UINT64_MAX; break;
 				case 2: f.cohort.source_local_horizon_scn = 9; break;
 				case 3: f.cohort.source_local_horizon_scn = 11; break;
+				case 4: f.cohort.source_local_history.sample_clock_scn = 0; break;
+				case 5: f.cohort.source_local_history.sample_clock_scn = 9; break;
+				case 6: f.cohort.source_local_history.contributor_kind =
+					(ClusterHeapFreezeReportV2ContributorKind)5; break;
 				}
 				UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 2)
 					: qualified_xmin_apply(&f, 0)));

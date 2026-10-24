@@ -141,6 +141,14 @@ typedef struct ClusterHeapFreezeCohortPeerObservation {
 	uint64 covered;
 } ClusterHeapFreezeCohortPeerObservation;
 
+/* Original H-source diagnostics retained in process-local observations only.
+ * This is neither shared/wire storage nor contributor-lifetime authority. */
+typedef struct ClusterHeapFreezeHistorySourceObservationV1 {
+	uint64 sample_clock_scn;
+	ClusterHeapFreezeReportV2ContributorKind contributor_kind;
+	uint64 contributor_token;
+} ClusterHeapFreezeHistorySourceObservationV1;
+
 /* Read-only observation of the entire admitted cohort, never a freeze or
  * truncation certificate. Producer protection closure is still required
  * before these values may authorize a global floor. F and H use different
@@ -166,6 +174,9 @@ typedef struct ClusterHeapFreezeCohortObservation {
 	uint64 source_local_horizon_scn;
 	/* Kept outside the peer identity type, which is also stored in shmem. */
 	uint64 source_peer_horizon_scn[CLUSTER_MAX_NODES];
+	/* Same original cuts as the H scalars above; never resampled on handoff. */
+	ClusterHeapFreezeHistorySourceObservationV1 source_local_history;
+	ClusterHeapFreezeHistorySourceObservationV1 source_peer_history[CLUSTER_MAX_NODES];
 	uint64 source_local_sample_id;
 	uint64 source_started_at_us;
 	uint32 source_interval_ms;
@@ -179,6 +190,9 @@ typedef struct ClusterHeapFreezeCohortObservation {
  * or invalidate that selected bound. The retained H must equal the original
  * SCN-time minimum of its local sample and exactly the required peer sources,
  * preserving the original fold order for equal-time values.
+ * Original source clock/kind/token metadata survives this handoff. Each H
+ * must fit its source clock and original report kind range; UNKNOWN and
+ * diagnostic tokens do not establish contributor protection or authority.
  * No nextXid/H sample, current fetch, lock or identity callback is performed.
  * Failure preserves *out; the caller still owns the original admission and
  * must qualify provenance/retention before any native plan or shared write. */

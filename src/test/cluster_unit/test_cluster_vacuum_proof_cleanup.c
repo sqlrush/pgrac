@@ -932,6 +932,12 @@ reset_fixture(void)
 	cohort_value.horizon_scn = 500;
 	cohort_value.source_local_horizon_scn = 600;
 	cohort_value.source_peer_horizon_scn[1] = 500;
+	cohort_value.source_local_history.sample_clock_scn = 700;
+	cohort_value.source_local_history.contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT;
+	cohort_value.source_local_history.contributor_token = 11;
+	cohort_value.source_peer_history[1].sample_clock_scn = 800;
+	cohort_value.source_peer_history[1].contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_PREPARED;
+	cohort_value.source_peer_history[1].contributor_token = 17;
 	cohort_value.record_generation = 17;
 	cohort_value.formation_epoch = 9;
 	cohort_value.admitted_members_lo = 3;
@@ -3119,6 +3125,15 @@ UT_TEST(bound_sources_borrow_original_owned_policy_and_cohort)
 	UT_ASSERT(vacrel.shared_freeze_cohort_observed);
 	UT_ASSERT(vacrel.shared_freeze_input.freeze_policy == &vacrel.cutoffs.SharedFreezePolicySample);
 	UT_ASSERT(vacrel.shared_freeze_input.freeze_cohort == &vacrel.shared_freeze_cohort);
+	UT_ASSERT_EQ(vacrel.shared_freeze_input.freeze_cohort->source_local_history.sample_clock_scn, 700);
+	UT_ASSERT_EQ(vacrel.shared_freeze_input.freeze_cohort->source_local_history.contributor_kind,
+		CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+	UT_ASSERT_EQ(vacrel.shared_freeze_input.freeze_cohort->source_local_history.contributor_token, 11);
+	UT_ASSERT_EQ(vacrel.shared_freeze_input.freeze_cohort->source_peer_history[1].sample_clock_scn, 800);
+	UT_ASSERT_EQ(vacrel.shared_freeze_input.freeze_cohort->source_peer_history[1].contributor_kind,
+		CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_PREPARED);
+	UT_ASSERT_EQ(vacrel.shared_freeze_input.freeze_cohort->source_peer_history[1].contributor_token, 17);
+	UT_ASSERT_EQ(cohort_calls, 1);
 	UT_ASSERT_EQ(debt, 0); UT_ASSERT_STR_EQ(cleanup_order, "LPA");
 }
 

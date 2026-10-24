@@ -980,6 +980,9 @@ undo_horizon_v2_observe_peer(int32 peer, const ClusterSemanticActiveSampleFence 
 	identity->recv_at_us = view.recv_at_us;
 	identity->interval_ms = report->sender_interval_ms;
 	candidate->source_peer_horizon_scn[peer] = report->horizon_scn;
+	candidate->source_peer_history[peer].sample_clock_scn = report->h_sample_clock_scn;
+	candidate->source_peer_history[peer].contributor_kind = report->h_contributor_kind;
+	candidate->source_peer_history[peer].contributor_token = report->h_contributor_token;
 	identity->covered = undo_horizon_maintenance_coverage(peer, report->future_full_xid);
 	candidate->future_full_xid_max = Max(candidate->future_full_xid_max, report->future_full_xid);
 	candidate->requested_full_xid_max
@@ -1101,6 +1104,9 @@ undo_horizon_v2_cohort_observe(ClusterHeapFreezeCohortObservation *out,
 	memcpy(&candidate.local_registration_cut, &active.scan, sizeof(active.scan));
 	memcpy(&candidate.admission_fence, &fence, sizeof(fence));
 	candidate.source_local_horizon_scn = history.horizon_scn;
+	candidate.source_local_history.sample_clock_scn = history.clock_scn;
+	candidate.source_local_history.contributor_kind = history.contributor_kind;
+	candidate.source_local_history.contributor_token = history.contributor_token;
 	candidate.horizon_scn = history.horizon_scn;
 	candidate.record_generation = fence.record_generation;
 	candidate.formation_epoch = fence.formation_epoch;

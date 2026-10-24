@@ -926,6 +926,10 @@ observed_bounds_fixture(ClusterHeapFreezePolicySampleV1 *policy,
 	cohort->source_local_horizon_scn = 700;
 	cohort->source_peer_horizon_scn[0] = 700;
 	cohort->source_peer_horizon_scn[1] = 500;
+	cohort->source_local_history.sample_clock_scn = 1000;
+	cohort->source_local_history.contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK;
+	cohort->source_peer_history[0] = cohort->source_local_history;
+	cohort->source_peer_history[1] = cohort->source_local_history;
 	cohort->record_generation = admission->record_generation = 17;
 	cohort->formation_epoch = admission->formation_epoch = 9;
 	cohort->admitted_members_lo = 3;
@@ -976,6 +980,7 @@ UT_TEST(observed_bounds_reproduces_original_fixed_cohort_h_minimum)
 	UT_ASSERT_EQ(out.horizon_scn, cohort.source_local_horizon_scn); /* same-time tie */
 	cohort.admitted_members_hi = cohort.admission_fence.admitted_members_hi = UINT64CONST(1) << 63;
 	cohort.source_peer_horizon_scn[127] = scn_encode(9, 80);
+	cohort.source_peer_history[127] = cohort.source_local_history;
 	cohort.horizon_scn = cohort.source_peer_horizon_scn[127];
 	UT_ASSERT(cluster_heap_freeze_observed_bounds_v1(&policy, &cohort, &admission, 0, &out));
 	UT_ASSERT_EQ(out.horizon_scn, cohort.source_peer_horizon_scn[127]);
@@ -1002,6 +1007,29 @@ UT_TEST(observed_bounds_rejects_changed_or_missing_original_h_atomically)
 		}
 		UT_ASSERT(!cluster_heap_freeze_observed_bounds_v1(&policy, &cohort, &admission, 0, &out));
 		UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+	}
+}
+
+UT_TEST(observed_bounds_requires_original_history_metadata_atomically)
+{
+	for (int peer = 0; peer < 2; peer++) {
+		for (int field = 0; field < 3; field++) {
+			ClusterHeapFreezePolicySampleV1 policy;
+			ClusterHeapFreezeCohortObservation cohort;
+			ClusterSemanticAdmissionToken admission;
+			ClusterHeapFreezeObservedBoundsV1 out, before;
+			ClusterHeapFreezeHistorySourceObservationV1 *history;
+			observed_bounds_fixture(&policy, &cohort, &admission);
+			history = peer == 0 ? &cohort.source_local_history : &cohort.source_peer_history[1];
+			if (field == 0) history->sample_clock_scn = 0;
+			if (field == 1) history->sample_clock_scn = peer == 0 ? 699 : 499;
+			if (field == 2) history->contributor_kind =
+				(ClusterHeapFreezeReportV2ContributorKind)5;
+			memset(&out, 0xa5, sizeof(out)); before = out;
+			UT_ASSERT(!cluster_heap_freeze_observed_bounds_v1(&policy, &cohort,
+				&admission, 0, &out));
+			UT_ASSERT(memcmp(&out, &before, sizeof(out)) == 0);
+		}
 	}
 }
 
@@ -1167,10 +1195,11 @@ UT_TEST(observed_bounds_keep_fullxid_epoch_and_high_member_bit)
 int
 main(void)
 {
-	UT_PLAN(57);
+	UT_PLAN(58);
 	UT_RUN(observed_bounds_cap_policy_at_same_cohort_and_preserve_h_domain);
 	UT_RUN(observed_bounds_reproduces_original_fixed_cohort_h_minimum);
 	UT_RUN(observed_bounds_rejects_changed_or_missing_original_h_atomically);
+	UT_RUN(observed_bounds_requires_original_history_metadata_atomically);
 	UT_RUN(observed_bounds_identity_refusal_preserves_complete_output);
 	UT_RUN(observed_bounds_policy_window_refusal_is_atomic);
 	UT_RUN(observed_bounds_cohort_refusal_and_nulls_preserve_output);

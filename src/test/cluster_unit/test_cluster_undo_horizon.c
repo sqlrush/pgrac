@@ -1963,7 +1963,14 @@ UT_TEST(test_v2_cohort_retains_original_local_and_peer_history_values)
 	ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
 	ClusterHeapFreezeCohortObservation out;
 	unsigned calls = test_retention_sample_calls;
+	ClusterUndoRetentionSample saved_history = test_retention_sample;
+	test_retention_sample.clock_scn = 710;
+	test_retention_sample.contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT;
+	test_retention_sample.contributor_token = 17;
 	report.horizon_scn = scn_encode(65, 250);
+	report.h_sample_clock_scn = 800;
+	report.h_contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_PREPARED;
+	report.h_contributor_token = 55;
 	cohort_receive(65, report);
 	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
 	UT_ASSERT_EQ(test_retention_sample_calls, calls + 1);
@@ -1972,6 +1979,24 @@ UT_TEST(test_v2_cohort_retains_original_local_and_peer_history_values)
 	UT_ASSERT_EQ(out.source_peer_horizon_scn[65], report.horizon_scn);
 	UT_ASSERT_EQ(out.source_peer_horizon_scn[2], 0);
 	UT_ASSERT_EQ(out.horizon_scn, report.horizon_scn);
+	UT_ASSERT_EQ(out.source_local_history.sample_clock_scn, 710);
+	UT_ASSERT_EQ(out.source_local_history.contributor_kind,
+		CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+	UT_ASSERT_EQ(out.source_local_history.contributor_token, 17);
+	UT_ASSERT_EQ(out.source_peer_history[1].sample_clock_scn,
+		test_horizon_store.freeze_slots[1].view.report.h_sample_clock_scn);
+	UT_ASSERT_EQ(out.source_peer_history[1].contributor_kind,
+		test_horizon_store.freeze_slots[1].view.report.h_contributor_kind);
+	UT_ASSERT_EQ(out.source_peer_history[1].contributor_token,
+		test_horizon_store.freeze_slots[1].view.report.h_contributor_token);
+	UT_ASSERT_EQ(out.source_peer_history[65].sample_clock_scn, 800);
+	UT_ASSERT_EQ(out.source_peer_history[65].contributor_kind,
+		CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_PREPARED);
+	UT_ASSERT_EQ(out.source_peer_history[65].contributor_token, 55);
+	UT_ASSERT_EQ(out.source_peer_history[2].sample_clock_scn, 0);
+	UT_ASSERT_EQ(out.source_peer_history[2].contributor_kind, 0);
+	UT_ASSERT_EQ(out.source_peer_history[2].contributor_token, 0);
+	test_retention_sample = saved_history;
 }
 
 UT_TEST(test_v2_cohort_requires_both_mask_halves_and_keeps_domains_separate)
