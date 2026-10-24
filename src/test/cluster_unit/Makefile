@@ -605,6 +605,7 @@ test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
 		test_cluster_relmap_census_batch.inc \
 		test_cluster_relmap_census_cold.inc \
 		test_cluster_relmap_census_cold_consume.inc \
+		test_cluster_recovery_root_reobserve.inc \
 		test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c \
 		test_cluster_recovery_crypto_boundary.h unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
@@ -657,6 +658,7 @@ test_cluster_relmap_census_side: test_cluster_relmap_retention_census.c \
 		test_cluster_relmap_census_batch.inc \
 		test_cluster_relmap_census_cold.inc \
 		test_cluster_relmap_census_cold_consume.inc \
+		test_cluster_recovery_root_reobserve.inc \
 		test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c \
 		test_cluster_recovery_crypto_boundary.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
@@ -10664,7 +10666,8 @@ test_cluster_recovery_heap_scan: test_cluster_recovery_heap_scan.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_heap_scan.h cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-test_cluster_recovery_root_set: test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c test_cluster_recovery_crypto_boundary.h unit_test.h \
+test_cluster_recovery_root_set: test_cluster_recovery_root_set.c test_cluster_recovery_root_reobserve.inc \
+		test_cluster_recovery_namespace.c test_cluster_recovery_crypto_boundary.h unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \

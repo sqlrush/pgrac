@@ -9737,7 +9737,7 @@ CreateCheckPoint(int flags)
 
 #ifdef USE_PGRAC_CLUSTER
 	/* Original writer sampling precedes native critical work and I/O. */
-	if (cluster_shared_config)
+	if (cluster_shared_config && MyBackendType == B_CHECKPOINTER)
 		(void)cluster_relmap_recovery_checkpoint_window_capture(GetWALInsertionTimeLine(),
 																&native_window);
 #endif

@@ -40,12 +40,13 @@ struct ClusterRecoveryRootSet {
 	uint32 *buckets, *order, *merge;
 	bool *verified;
 	uint32 capacity, bucket_count, count, current;
+	uint32 required_physical;
 	uint32 verify_at, width, left, mid, right, a, b, pos, hash_at;
 	uint64 offset;
 	pg_cryptohash_ctx *file_hash, *set_hash;
 	uint8 bytes[BLCKSZ];
 	unsigned pass, stage;
-	bool started, reading, merging, rechecking;
+	bool started, reading, merging, rechecking, reobserve_ready;
 	ClusterRecoveryRootsResult status;
 };
 
@@ -206,6 +207,105 @@ cluster_recovery_root_set_begin(int root_fd, uint64 system_identifier, uint64 da
 	return CLUSTER_RECOVERY_ROOTS_MORE;
 }
 
+static bool
+roots_overlap(const void *a, size_t a_size, const void *b, size_t b_size)
+{
+	uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
+
+	return a != NULL && b != NULL && a_size != 0 && b_size != 0
+		   && (x >= y ? x - y < b_size : y - x < a_size);
+}
+
+/* Refuse known owned-storage aliases before clearing the distinct output. */
+static bool
+roots_reobserve_alias(const ClusterRecoveryRootSet *previous, ClusterRecoveryRootSet **out)
+{
+	return previous != NULL
+		   && (roots_overlap(out, sizeof(*out), previous, sizeof(*previous))
+			   || roots_overlap(out, sizeof(*out), previous->entries,
+								previous->capacity * sizeof(*previous->entries))
+			   || roots_overlap(out, sizeof(*out), previous->buckets,
+								previous->bucket_count * sizeof(*previous->buckets))
+			   || roots_overlap(out, sizeof(*out), previous->order,
+								previous->capacity * sizeof(*previous->order))
+			   || roots_overlap(out, sizeof(*out), previous->merge,
+								previous->capacity * sizeof(*previous->merge))
+			   || roots_overlap(out, sizeof(*out), previous->verified,
+								previous->capacity * sizeof(*previous->verified)));
+}
+
+ClusterRecoveryRootsResult
+cluster_recovery_root_set_reobserve_begin(const ClusterRecoveryRootSet *previous,
+										  size_t memory_budget, ClusterRecoveryRootSet **out)
+{
+	ClusterRecoveryRootSet *fresh = NULL;
+	ClusterRecoveryRootsResult result;
+	struct stat current;
+
+	if (roots_reobserve_alias(previous, out))
+		return CLUSTER_RECOVERY_ROOTS_INVALID;
+	if (out != NULL)
+		*out = NULL;
+	if (out == NULL || previous == NULL || !previous->reobserve_ready
+		|| previous->status != CLUSTER_RECOVERY_ROOTS_INVALID || previous->scan != NULL)
+		return CLUSTER_RECOVERY_ROOTS_INVALID;
+	if (fstat(previous->root_fd, &current) != 0)
+		return CLUSTER_RECOVERY_ROOTS_IO;
+	if (!S_ISDIR(current.st_mode) || current.st_dev != previous->root_stat.st_dev
+		|| current.st_ino != previous->root_stat.st_ino)
+		return CLUSTER_RECOVERY_ROOTS_CHANGED;
+	result = cluster_recovery_root_set_begin(previous->root_fd, previous->system_identifier,
+											 previous->database_incarnation, previous->storage_uuid,
+											 memory_budget, &fresh);
+	if (result != CLUSTER_RECOVERY_ROOTS_MORE)
+		return result;
+	if (fresh->root_stat.st_dev != previous->root_stat.st_dev
+		|| fresh->root_stat.st_ino != previous->root_stat.st_ino) {
+		result = CLUSTER_RECOVERY_ROOTS_CHANGED;
+		goto refuse;
+	}
+	/* Seed every prior physical path first. These stable indexes must all
+	 * regain PHYSICAL in discovery, including old unreferenced/unknown files.
+	 * Old WAL-only candidates retain their missing-file/extent requirements.
+	 * No prior stat, content hash or physical existence claim is reused. */
+	for (unsigned pass = 0; pass < 2; pass++) {
+		for (uint32 i = 0; i < previous->count; i++) {
+			const ClusterRecoveryRootEntry *old = &previous->entries[i];
+			ClusterRecoveryRootEntry *entry;
+			uint32 index;
+
+			if (((old->origins & CLUSTER_RECOVERY_ROOT_PHYSICAL) != 0) != (pass == 0))
+				continue;
+			if (!roots_lookup(fresh, old->file.path, true, &index)) {
+				result = fresh->status;
+				goto refuse;
+			}
+			entry = &fresh->entries[index];
+			entry->file = old->file;
+			entry->file.size = 0;
+			memset(&entry->file.observed, 0, sizeof(entry->file.observed));
+			entry->origins = old->origins & CLUSTER_RECOVERY_ROOT_FROM_WAL;
+			entry->required_blocks = old->required_blocks;
+		}
+		if (pass == 0)
+			fresh->required_physical = fresh->count;
+	}
+	if (fstat(previous->root_fd, &current) != 0) {
+		result = CLUSTER_RECOVERY_ROOTS_IO;
+		goto refuse;
+	}
+	if (!cluster_recovery_namespace_stat_same(&fresh->root_stat, &current)) {
+		result = CLUSTER_RECOVERY_ROOTS_CHANGED;
+		goto refuse;
+	}
+	*out = fresh;
+	return CLUSTER_RECOVERY_ROOTS_MORE;
+
+refuse:
+	cluster_recovery_root_set_destroy(fresh);
+	return result;
+}
+
 /* Both producer enumeration and later target joins use the same legal
  * address chain. Formatting a path does not establish physical existence. */
 static bool
@@ -341,8 +441,10 @@ cluster_recovery_root_set_add_undo(ClusterRecoveryRootSet *roots, uint64 system_
 void
 cluster_recovery_root_set_invalidate(ClusterRecoveryRootSet *roots)
 {
-	if (roots != NULL && roots->status <= CLUSTER_RECOVERY_ROOTS_OBSERVED)
+	if (roots != NULL && roots->status <= CLUSTER_RECOVERY_ROOTS_OBSERVED) {
+		roots->reobserve_ready = roots->status == CLUSTER_RECOVERY_ROOTS_OBSERVED;
 		roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	}
 }
 
 /* Record file requirements in the original origin namespace. These are
@@ -883,6 +985,9 @@ cluster_recovery_root_set_step(ClusterRecoveryRootSet *roots, ClusterRecoveryRoo
 	if (roots->stage == 1) {
 		for (unsigned work = 0; work < ROOTS_TICK && roots->verify_at < roots->count; work++) {
 			index = roots->verify_at++;
+			if (index < roots->required_physical
+				&& (roots->entries[index].origins & CLUSTER_RECOVERY_ROOT_PHYSICAL) == 0)
+				return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_CHANGED);
 			if ((roots->entries[index].origins & CLUSTER_RECOVERY_ROOT_PHYSICAL) != 0
 				&& !roots->verified[index])
 				return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_CHANGED);
@@ -949,7 +1054,8 @@ cluster_recovery_root_set_step(ClusterRecoveryRootSet *roots, ClusterRecoveryRoo
 	entry = &roots->entries[index];
 	if (roots->pass == 0) {
 		if ((entry->origins & CLUSTER_RECOVERY_ROOT_PHYSICAL) != 0
-			|| ((entry->origins & CLUSTER_RECOVERY_ROOT_FROM_WAL) != 0
+			|| (((entry->origins & CLUSTER_RECOVERY_ROOT_FROM_WAL) != 0
+				 || index < roots->required_physical)
 				&& file.kind != entry->file.kind))
 			return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_CHANGED);
 		entry->file = file;

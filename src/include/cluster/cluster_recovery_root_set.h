@@ -72,6 +72,20 @@ cluster_recovery_root_set_begin(int root_fd, uint64 system_identifier, uint64 da
 								const uint8 storage_uuid[16], size_t memory_budget,
 								ClusterRecoveryRootSet **out);
 
+/* Start a distinct two-pass observation after explicit invalidation of an
+ * OBSERVED set. Borrow the same original held directory fd/namespace, retain
+ * every WAL requirement and require every old physical path with its original
+ * kind. Bytes/inodes and additions may change; removal is not qualified here.
+ * Construction copies O(previous candidates) metadata within memory_budget;
+ * step keeps its normal work limits. Old storage stays invalid/unchanged.
+ * Caller retains original isolation/cuts/pins and destroys both cursors on
+ * every exit, including PG_FINALLY. No target write, release or authority.
+ * out must be fresh exclusive storage. Known old storage overlap refuses
+ * unchanged; other refusal clears *out. MORE is only an unpublished candidate. */
+extern ClusterRecoveryRootsResult
+cluster_recovery_root_set_reobserve_begin(const ClusterRecoveryRootSet *previous,
+										  size_t memory_budget, ClusterRecoveryRootSet **out);
+
 /* Before the first step only. Preserve every typed PAGE target, including a
  * currently missing fork or blocks beyond EOF; the typed owner must explain
  * CREATE/DROP/TRUNCATE. Original record/source/incarnation proofs stay in the
