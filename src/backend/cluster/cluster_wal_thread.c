@@ -60,6 +60,8 @@
 #include "cluster/cluster_wal_state.h" /* spec-4.2 ensure() */
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_writer.h"
+#include "cluster/cluster_same_host_fence.h"
+#include "cluster/cluster_external_fence.h"
 #include "cluster_control_bootstrap_private.h"
 #include "cluster_control_root_private.h"
 #include "miscadmin.h" /* IsUnderPostmaster, DataDir */
@@ -558,6 +560,19 @@ cluster_wal_thread_install_startup(const ClusterWalStartupImage *expected)
 		= expected->input_kind == CLUSTER_WAL_STARTUP_INITIALIZED ? expected->formation_epoch : 0;
 	clean_epoch = expected->input_kind == CLUSTER_WAL_STARTUP_CLEAN ? expected->formation_epoch : 0;
 	recovered_epoch = expected->input_kind == CLUSTER_WAL_STARTUP_RECOVERED ? expected->formation_epoch : 0;
+	/* Publish the actual postmaster identity before this process-local writer
+	 * becomes READY. Missing OS evidence leaves only this provider unavailable;
+	 * it must never fabricate historical identity on the recovery read path. */
+	if (cluster_same_host_fence_available()) {
+		ClusterSameHostKeyV1 key = { .system_identifier = installed.claim.identity.system_identifier,
+			.origin_node_id = (uint32)installed.claim.identity.origin_node_id,
+			.incarnation = installed.claim.identity.origin_owner_incarnation };
+
+		if (!cluster_external_fence_rejoin_protected_set_digest(key.protected_set_digest)
+			|| !cluster_same_host_fence_record_writer_v1(cluster_wal_threads_dir, &key, PostmasterPid))
+			ereport(WARNING, (errmsg("same-host process identity unavailable for writer origin %u incarnation " UINT64_FORMAT,
+									key.origin_node_id, key.incarnation)));
+	}
 	if (!pg_atomic_compare_exchange_u32(&cluster_wal_thread_shmem->writer_ref_state, &state, 1)) {
 		if (state != 2)
 			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;

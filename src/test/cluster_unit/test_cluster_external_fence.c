@@ -33,6 +33,15 @@
 UT_DEFINE_GLOBALS();
 
 bool cluster_shared_config = false;
+char *cluster_wal_threads_dir;
+static bool stub_same_host_available;
+
+bool cluster_external_fence_test_same_host_available(void);
+bool
+cluster_external_fence_test_same_host_available(void)
+{
+	return stub_same_host_available;
+}
 
 static uint32 stub_local_capabilities;
 static ClusterFormationWitnessResult stub_formation_result;

@@ -5,8 +5,9 @@
  *
  *	  Oracle documents failure isolation, GES/LMON recovery coordination and
  *	  IPMI integration, but not these bytes or predicates.  The exact layouts
- *	  below are the approved PGRAC adaptation.  No production provider is
- *	  selected: provider id 0 remains UNAVAILABLE and bit 24 remains inactive.
+ *	  below are the approved PGRAC adaptation.  Transport provider id 0 remains
+ *	  UNAVAILABLE and bit 24 inactive.  E1 has a separate exact same-host
+ *	  process-exclusion provider; ordinary online/rejoin admission is unchanged.
  *
  *-------------------------------------------------------------------------
  */
@@ -342,7 +343,8 @@ cluster_reconfig_rejoin_pending_snapshot(const ClusterReconfigRejoinFailureSnaps
 extern bool
 cluster_reconfig_rejoin_pending_ready(const ClusterReconfigRejoinPendingSnapshotV1 *pending);
 
-/* STOP04 §11.7 current-package policy.  This remains false until a later
+/* STOP04 §11.7 transport policy (not the E1 same-host process provider).
+ * This remains false until a later
  * explicit provider selection and deployment certification authorizes bit24.
  * Keeping the check as a production callsite leaves the approved LMON handoff
  * dormant without weakening ordinary online join. */

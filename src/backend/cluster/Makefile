@@ -159,6 +159,7 @@ OBJS = \
 	cluster_epoch.o \
 	cluster_extend_gate.o \
 	cluster_external_fence.o \
+	cluster_same_host_fence.o \
 	cluster_fence.o \
 	cluster_fence_authority.o \
 	cluster_write_fence.o \

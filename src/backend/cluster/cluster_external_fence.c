@@ -3,11 +3,10 @@
  * cluster_external_fence.c
  *	  Provider-neutral external I/O fence backend boundary (RF-ROOT P4).
  *
- * The current approved package deliberately has no production provider:
- * provider id 0 is UNAVAILABLE and bit 24 is not advertised.  Consequently
- * this file keeps production fail-closed.  A compile-time unit-test seam may
- * supply an authenticated transport for the frozen protocol's positive-path
- * witnesses; it is absent from the production object and link map.
+ * The transport provider remains UNAVAILABLE and bit 24 is not advertised.
+ * Cold recovery additionally accepts exact same-host process exclusion;
+ * remote, missing and unreadable identities remain unavailable.  The online
+ * transport's affirmative unit-test seam is absent from production objects.
  *
  *-------------------------------------------------------------------------
  */
@@ -31,6 +30,7 @@
 #endif
 
 #include "cluster/cluster_external_fence.h"
+#include "cluster/cluster_same_host_fence.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/storage/cluster_shared_fs.h"
@@ -50,11 +50,22 @@ cluster_external_fence_need_set_last_predicate(void)
 
 #ifdef USE_CLUSTER_UNIT
 extern bool cluster_external_fence_test_runtime_active(void);
+extern bool cluster_external_fence_test_same_host_available(void);
 extern int cluster_external_fence_test_connect_root_daemon(int timeout_ms);
 extern bool cluster_external_fence_test_root_peer_authenticated(int fd);
 extern int
 cluster_external_fence_test_admission_lease_ms(const PgracExternalFenceAdmissionV1 *admission);
 #endif
+
+static bool
+external_fence_same_host_available(void)
+{
+#ifdef USE_CLUSTER_UNIT
+	return cluster_external_fence_test_same_host_available();
+#else
+	return cluster_same_host_fence_available();
+#endif
+}
 
 bool
 cluster_external_fence_runtime_active(void)
@@ -133,6 +144,8 @@ struct PgracExternalFenceAdmissionV1 {
 	uint64 cached_mapping_generation;
 	int32 cooperative_lease_ms_snapshot;
 	int32 socket_fd;
+	bool same_host;
+	ClusterSameHostRecordV1 same_host_record;
 };
 
 struct PgracExternalFenceNeedSetV1 {
@@ -622,7 +635,9 @@ external_fence_admission_valid(const PgracExternalFenceAdmissionV1 *admission)
 {
 	return admission != NULL && admission->magic == PGRAC_EXTERNAL_FENCE_ADMISSION_MAGIC
 		   && admission->owner_pid == external_fence_owner_pid() && admission->released == 0
-		   && admission->socket_fd >= 0;
+		   && (admission->socket_fd >= 0 || (admission->same_host
+			&& cluster_same_host_record_matches_v1(&admission->same_host_record,
+												 &admission->same_host_record.key)));
 }
 
 static bool
@@ -776,7 +791,8 @@ external_fence_need_set_build(const ClusterRecoveryDutyKey *duty,
 		external_fence_need_set_predicate = "CONTROL_ROOT_CAPABILITY_UNAVAILABLE";
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_CAPABILITY_UNAVAILABLE;
 	}
-	if (!cluster_external_fence_runtime_active()) {
+	if (!cluster_external_fence_runtime_active()
+		&& !(cold && external_fence_same_host_available())) {
 		external_fence_need_set_predicate = "ROOT_FENCING_PROVIDER_INACTIVE";
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_CAPABILITY_UNAVAILABLE;
 	}
@@ -1351,6 +1367,21 @@ cluster_external_fence_revalidate_nowait(const PgracExternalFenceAdmissionV1 *ad
 		*reason = PGRAC_EXTERNAL_FENCE_DENY_MAPPING_CHANGED;
 		return false;
 	}
+	if (admission->same_host) {
+		ClusterSameHostKeyV1 key = { .system_identifier = current->system_identifier,
+			.origin_node_id = (uint32)current->victim_node_id, .incarnation = current->victim_incarnation };
+
+		memcpy(key.protected_set_digest, current->protected_set_digest, 32);
+		/* A fixed exited process cannot return. This proof is private to this
+		 * recovering process; reboot kills it, and the original NeedSet/formation
+		 * is independently revalidated. No IO is added to this nowait accessor. */
+		if (!cluster_same_host_record_matches_v1(&admission->same_host_record, &key)) {
+			*reason = PGRAC_EXTERNAL_FENCE_DENY_BINDING_MISMATCH;
+			return false;
+		}
+		*reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
+		return true;
+	}
 	if (!bytes_nonzero(admission->daemon_boot_id, sizeof(admission->daemon_boot_id))
 		|| admission->journal_seq == 0 || admission->proof_generation == 0) {
 		*reason = PGRAC_EXTERNAL_FENCE_DENY_PROTOCOL;
@@ -1388,6 +1419,47 @@ cluster_external_fence_revalidate_nowait(const PgracExternalFenceAdmissionV1 *ad
 #endif
 	*reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
 	return true;
+}
+
+/* Only the full cold NeedSet owner can select the local process provider.
+ * The public single-victim, online and rejoin transports remain unchanged. */
+static PgracExternalFenceVerdict
+external_fence_admit_same_host(const PgracExternalFenceNeedV1 *need,
+							 PgracExternalFenceAdmissionV1 **out)
+{
+	ClusterSameHostKeyV1 key = { .system_identifier = need->system_identifier,
+		.origin_node_id = (uint32)need->victim_node_id, .incarnation = need->victim_incarnation };
+	ClusterSameHostRecordV1 record;
+	ClusterSameHostResultV1 result;
+	PgracExternalFenceAdmissionV1 *admission;
+
+	*out = NULL;
+	memcpy(key.protected_set_digest, need->protected_set_digest, 32);
+	result = cluster_same_host_fence_prove_v1(cluster_wal_threads_dir, &key, &record);
+	if (result != CLUSTER_SAME_HOST_WRITE_EXCLUDED)
+		return external_fence_admit_result(result == CLUSTER_SAME_HOST_STILL_ALIVE
+				? PGRAC_EXTERNAL_FENCE_REJECTED : PGRAC_EXTERNAL_FENCE_UNAVAILABLE,
+				result == CLUSTER_SAME_HOST_STILL_ALIVE
+				? PGRAC_EXTERNAL_FENCE_DENY_PROVIDER_REJECTED : PGRAC_EXTERNAL_FENCE_DENY_STORAGE_IDENTITY,
+				0, 0);
+	admission = palloc0(sizeof(*admission));
+	admission->magic = PGRAC_EXTERNAL_FENCE_ADMISSION_MAGIC;
+	admission->owner_pid = external_fence_owner_pid();
+	admission->socket_fd = -1;
+	admission->same_host = true;
+	admission->same_host_record = record;
+	admission->binding.system_identifier = need->system_identifier;
+	admission->binding.canonical_duty_digest = need->canonical_duty_digest;
+	admission->binding.victim_node_id = need->victim_node_id;
+	admission->binding.victim_incarnation = need->victim_incarnation;
+	admission->binding.target_mapping_generation = key.incarnation;
+	admission->cached_mapping_generation = key.incarnation;
+	memcpy(admission->binding.protected_set_digest, need->protected_set_digest, 32);
+	admission->binding.predicate_id = need->predicate_id;
+	admission->binding.predicate_version = need->predicate_version;
+	*out = admission;
+	return external_fence_admit_result(PGRAC_EXTERNAL_FENCE_WRITE_EXCLUDED,
+									 PGRAC_EXTERNAL_FENCE_DENY_NONE, 0, 0);
 }
 
 PgracExternalFenceVerdict
@@ -1450,8 +1522,11 @@ cluster_external_fence_admit_set_wait(const PgracExternalFenceNeedSetV1 *needs,
 		remaining_ms = (remaining_ns + UINT64_C(999999)) / UINT64_C(1000000);
 		if (remaining_ms > PGRAC_EXTERNAL_FENCE_TIMEOUT_MAX_MS)
 			remaining_ms = PGRAC_EXTERNAL_FENCE_TIMEOUT_MAX_MS;
-		verdict = cluster_external_fence_admit_wait(&needs->needs[i], (int)remaining_ms,
-													&set->admissions[i]);
+		if (needs->cold && !cluster_external_fence_runtime_active())
+			verdict = external_fence_admit_same_host(&needs->needs[i], &set->admissions[i]);
+		else
+			verdict = cluster_external_fence_admit_wait(&needs->needs[i], (int)remaining_ms,
+														&set->admissions[i]);
 		if (verdict != PGRAC_EXTERNAL_FENCE_WRITE_EXCLUDED || set->admissions[i] == NULL) {
 			cluster_external_fence_admission_set_release(&set);
 			return verdict;

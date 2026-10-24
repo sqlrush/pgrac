@@ -229,6 +229,8 @@ TESTS += test_cluster_cr_inline_stop
 TESTS += test_cluster_sync_error
 TESTS += test_cluster_cold_tx_start
 TESTS += test_cluster_cold_xid_native_completion
+TESTS += test_cluster_same_host_fence
+TESTS += test_cluster_same_host_provider
 TESTS += test_cluster_recovery_worker_pre2
 
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
@@ -749,17 +751,39 @@ test_cluster_recovery_serial: test_cluster_recovery_serial.c unit_test.h $(CLUST
 		$(CLUSTER_DL_O) $(CLUSTER_HW_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-CLUSTER_EXTERNAL_FENCE_O = test_cluster_external_fence_product.o
+CLUSTER_EXTERNAL_FENCE_O = test_cluster_external_fence_product.o test_cluster_same_host_fence_product.o
 PGRAC_EXTERNAL_FENCE_PROTOCOL_O = \
 	$(top_builddir)/src/common/pgrac_external_fence_protocol_srv.o
 $(PGRAC_EXTERNAL_FENCE_PROTOCOL_O): \
 		$(top_srcdir)/src/common/pgrac_external_fence_protocol.c
 	$(MAKE) -C $(top_builddir)/src/common pgrac_external_fence_protocol_srv.o
-$(CLUSTER_EXTERNAL_FENCE_O): \
+test_cluster_external_fence_product.o: \
 		$(top_srcdir)/src/backend/cluster/cluster_external_fence.c \
-		$(top_srcdir)/src/include/cluster/cluster_external_fence.h
+		$(top_srcdir)/src/include/cluster/cluster_external_fence.h \
+		$(top_srcdir)/src/include/cluster/cluster_same_host_fence.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT \
 		-c $(top_srcdir)/src/backend/cluster/cluster_external_fence.c -o $@
+test_cluster_same_host_fence_product.o: $(top_srcdir)/src/backend/cluster/cluster_same_host_fence.c \
+		$(top_srcdir)/src/include/cluster/cluster_same_host_fence.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
+
+test_cluster_same_host_fence: test_cluster_same_host_fence.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_same_host_fence.c \
+		$(top_srcdir)/src/include/cluster/cluster_same_host_fence.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/common/libpgcommon.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -lssl -lcrypto -o $@
+test_cluster_same_host_provider_core.o: $(top_srcdir)/src/backend/cluster/cluster_same_host_fence.c \
+		$(top_srcdir)/src/include/cluster/cluster_same_host_fence.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DCLUSTER_SAME_HOST_OS_TEST -c $< -o $@
+
+test_cluster_same_host_provider: test_cluster_same_host_provider.c test_cluster_external_fence.c \
+		$(top_srcdir)/src/include/cluster/cluster_same_host_fence.h \
+		unit_test.h test_cluster_external_fence_duty.inc test_cluster_external_fence_product.o \
+		test_cluster_same_host_provider_core.o $(PGRAC_EXTERNAL_FENCE_PROTOCOL_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_external_fence_product.o \
+		test_cluster_same_host_provider_core.o $(PGRAC_EXTERNAL_FENCE_PROTOCOL_O) \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) -lssl -lcrypto -o $@
 test_cluster_external_fence_duty.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_duty.c
 	$(AWK) '/^write_u16_le\(/ { print "static void"; emit=1 } \
 		emit { print } /^cluster_recovery_duty_key_compare_for_claim\(/ { last=1 } \
@@ -4176,7 +4200,7 @@ test_cluster_thread_orchestrator: test_cluster_thread_orchestrator.c unit_test.h
 # judge cluster_write_fence_decide (a header inline -- no cluster object needed;
 # only libpgcommon/libpgport for the unit harness).  The token region + qvotec
 # refresh + hot-path gating land as cluster_tap (D8).
-SIMPLE_TESTS := $(filter-out test_cluster_cold_xid_native_completion,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_cold_xid_native_completion test_cluster_same_host_fence test_cluster_same_host_provider,$(SIMPLE_TESTS))
 
 test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
@@ -8458,6 +8482,7 @@ test_cluster_wal_restart_mirror.inc: $(top_srcdir)/src/backend/cluster/cluster_w
 	mv $@.tmp $@
 
 test_cluster_wal_restart_read: test_cluster_wal_restart_read.c test_cluster_native_wal_read.inc test_cluster_wal_restart_mirror.inc unit_test.h $(CLUSTER_WAL_CLAIM_O) \
+		$(top_srcdir)/src/include/cluster/cluster_same_host_fence.h \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_restart_read.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_WAL_CLAIM_O) \
 		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \

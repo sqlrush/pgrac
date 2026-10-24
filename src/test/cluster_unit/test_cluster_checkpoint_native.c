@@ -1067,6 +1067,31 @@ UT_TEST(recovery_checkpoint_preserves_owner_and_native_guards)
 		}
 	}
 }
+UT_TEST(recovery_checkpoint_exact_recovered_owner_without_transport)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		recovery_setup();
+		provider_ok = false;
+		recovered_ok = true;
+		if (fault == 1) recovered_ok = false;
+		if (fault == 2) recovered_epoch++;
+		if (fault == 3) recovered_ref.claim.identity.origin_owner_incarnation++;
+		if (fault == 4) recovery_scope_valid = false;
+		if (fault == 5) lose_initialized_on_release = true;
+		UT_ASSERT_EQ(recovery_prepare(CHECKPOINT_FORCE), fault == 0);
+		if (fault == 0) {
+			candidate = selected;
+			candidate.checkPoint = 200;
+			UT_ASSERT(recovery_publish());
+			UT_ASSERT_EQ(recovery_publishes, 1);
+			UT_ASSERT_EQ(current.checkPoint, 200);
+			UT_ASSERT(!serving_ok && !provider_ok);
+		} else {
+			UT_ASSERT_EQ(recovery_publishes | root_calls, 0);
+			UT_ASSERT_EQ(current.checkPoint, 100);
+		}
+	}
+}
 UT_TEST(recovery_checkpoint_rechecks_read_and_confirmed_release)
 {
 	for (int fault = 0; fault < 7; fault++) {
@@ -2999,10 +3024,11 @@ int
 main(void)
 {
 	if (getenv("PGRAC_RECOVERY_CHECKPOINT_ONLY") != NULL) {
-		UT_PLAN(7);
+		UT_PLAN(8);
 		UT_RUN(recovery_checkpoint_selects_scope_only_for_closed_online_owner);
 		UT_RUN(recovery_checkpoint_closed_admission_uses_only_original_scope);
 		UT_RUN(recovery_checkpoint_preserves_owner_and_native_guards);
+		UT_RUN(recovery_checkpoint_exact_recovered_owner_without_transport);
 		UT_RUN(recovery_checkpoint_rechecks_read_and_confirmed_release);
 		UT_RUN(recovery_checkpoint_retries_without_reclassifying_its_owner);
 		UT_RUN(recovery_checkpoint_rechecks_durable_result_before_projection);
@@ -3021,10 +3047,11 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(83);
+	UT_PLAN(84);
 	UT_RUN(recovery_checkpoint_selects_scope_only_for_closed_online_owner);
 	UT_RUN(recovery_checkpoint_closed_admission_uses_only_original_scope);
 	UT_RUN(recovery_checkpoint_preserves_owner_and_native_guards);
+	UT_RUN(recovery_checkpoint_exact_recovered_owner_without_transport);
 	UT_RUN(recovery_checkpoint_rechecks_read_and_confirmed_release);
 	UT_RUN(recovery_checkpoint_retries_without_reclassifying_its_owner);
 	UT_RUN(recovery_checkpoint_rechecks_durable_result_before_projection);

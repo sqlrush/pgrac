@@ -9224,7 +9224,8 @@ ClusterCheckpointV3Prepare(int flags, ControlFileData *selected,
 		 * Author: SqlRush <sqlrush@gmail.com> */
 		|| (!cluster_external_fence_runtime_active()
 			&& (recovery_scope != NULL
-				|| (!cluster_wal_thread_initialized_writer_matches(&ref, epoch)
+				? !cluster_wal_thread_recovered_writer_matches(&ref, epoch)
+				: (!cluster_wal_thread_initialized_writer_matches(&ref, epoch)
 					&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)
 					&& !cluster_wal_thread_recovered_writer_matches(&ref, epoch)))))
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
@@ -9254,7 +9255,8 @@ ClusterCheckpointV3Prepare(int flags, ControlFileData *selected,
 			|| !cluster_write_fence_allowed()
 			|| (!cluster_external_fence_runtime_active()
 				&& (recovery_scope != NULL
-					|| (!cluster_wal_thread_initialized_writer_matches(&ref, epoch)
+					? !cluster_wal_thread_recovered_writer_matches(&ref, epoch)
+					: (!cluster_wal_thread_initialized_writer_matches(&ref, epoch)
 						&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)
 						&& !cluster_wal_thread_recovered_writer_matches(&ref, epoch)))))
 			ereport(ERROR,
@@ -9326,7 +9328,8 @@ wait_for_owner:
 				|| memcmp(&observed_writer, &writer, sizeof(writer)) != 0))
 		|| (!cluster_external_fence_runtime_active()
 			&& (recovery_scope != NULL
-				|| (!cluster_wal_thread_initialized_writer_matches(&ref, epoch)
+				? !cluster_wal_thread_recovered_writer_matches(&ref, epoch)
+				: (!cluster_wal_thread_initialized_writer_matches(&ref, epoch)
 					&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)
 					&& !cluster_wal_thread_recovered_writer_matches(&ref, epoch))))) {
 		memset(selected, 0, sizeof(*selected));
@@ -9397,7 +9400,8 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end,
 			|| !cluster_wal_thread_current_v2_ref(&observed) || memcmp(&observed, &ref, sizeof(ref)) != 0
 			|| (!cluster_external_fence_runtime_active()
 				&& (recovery_scope != NULL
-					|| (!cluster_wal_thread_initialized_writer_matches(&ref, epoch)
+					? !cluster_wal_thread_recovered_writer_matches(&ref, epoch)
+					: (!cluster_wal_thread_initialized_writer_matches(&ref, epoch)
 						&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)
 						&& !cluster_wal_thread_recovered_writer_matches(&ref, epoch))))
 			|| (!serving && !pending) || !cluster_write_fence_allowed())
@@ -9449,7 +9453,9 @@ wait_for_owner:
 	if (recovery_scope != NULL
 		&& (!cluster_recovery_checkpoint_current_v1(recovery_scope, &observed_writer)
 			|| memcmp(&observed_writer, &writer, sizeof(writer)) != 0
-			|| !cluster_external_fence_runtime_active() || !cluster_write_fence_allowed()
+			|| (!cluster_external_fence_runtime_active()
+				&& !cluster_wal_thread_recovered_writer_matches(&writer.ref, writer.epoch))
+			|| !cluster_write_fence_allowed()
 			|| cluster_reconfig_has_pending_prebump_stage()))
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
