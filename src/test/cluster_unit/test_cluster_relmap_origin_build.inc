@@ -319,14 +319,13 @@ cluster_undo_recovery_cold_checkpoint_visit_v1(int origin,
 }
 
 static void
-execution_build_setup(unsigned input_fault, bool clean)
+execution_inputs_from_read_scope(ClusterWalInputsV1 **inputs)
 {
-	ClusterWalInputsV1 *inputs = origin_build_setup(input_fault, clean);
 	uint8 bytes[66048];
 	ControlRootImage root;
 	char path[MAXPGPATH];
-	UT_ASSERT(inputs != NULL);
-	cluster_wal_inputs_release_v1(&inputs);
+	UT_ASSERT(*inputs != NULL);
+	cluster_wal_inputs_release_v1(inputs);
 	UT_ASSERT(!inputs_pin_held);
 	inputs_pin_refuse = true; /* Execution may not reacquire pass-1 census pins. */
 	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
@@ -340,7 +339,15 @@ execution_build_setup(unsigned input_fault, bool clean)
 	UT_ASSERT_EQ(cluster_control_root_v3_read_canonical(1, &root.records[0].identity,
 														&execution_root, &execution_token),
 				 0);
+	prefix_base_expected.checkpoint = execution_root;
 	execution_fault = execution_visits = execution_records = 0;
+}
+
+static void
+execution_build_setup(unsigned input_fault, bool clean)
+{
+	ClusterWalInputsV1 *inputs = origin_build_setup(input_fault, clean);
+	execution_inputs_from_read_scope(&inputs);
 }
 
 static void

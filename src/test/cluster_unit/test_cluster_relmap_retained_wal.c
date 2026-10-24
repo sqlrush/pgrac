@@ -2170,7 +2170,7 @@ terminal_prefix_fixture(bool aborting, unsigned fault)
 	snapshot = &root.records[0];
 	lower = snapshot->checkpoint_lower_lsn;
 	at = lower + MAXALIGN(SizeOfXLogRecord + 2 + sizeof(timestamp));
-	if (fault == 29 || fault == 30)
+	if (fault >= 29 && fault <= 32)
 		at += MAXALIGN(SizeOfXLogRecord + 5 + MinSizeOfRelmapUpdate + sizeof(RelMapFile));
 	if (fault == 4 || fault == 5 || fault == 6)
 		at += MAXALIGN(SizeOfXLogRecord + 2 + sizeof(timestamp));
@@ -2196,7 +2196,7 @@ terminal_prefix_fixture(bool aborting, unsigned fault)
 	source.claim.max_config_generation = root.header.v2.config_generation;
 	memcpy(source.claim.claim_sha256, root.refs[0].claim_sha256, 32);
 	source.timeline = snapshot->tail_tli;
-	if (fault == 29 || fault == 30) {
+	if (fault >= 29 && fault <= 32) {
 		uint8 payload[MinSizeOfRelmapUpdate + sizeof(RelMapFile)];
 		xl_relmap_update update = { 0 };
 		WalTestRecord pending;
@@ -2244,6 +2244,14 @@ terminal_prefix_fixture(bool aborting, unsigned fault)
 									  sizeof(a->checkpoint_copy));
 	UT_ASSERT_EQ(checkpoint.exclusive_end, prefix_test_checkpoint_end);
 	tail = checkpoint;
+	if (fault == 31 || fault == 32) {
+		int page = 0;
+		xl_clog_truncate trunc = { .pageno = 0, .oldestXact = 80, .oldestXactDb = 123 };
+		tail = terminal_test_record(&source, tail.exclusive_end, tail.record_start, RM_CLOG_ID,
+									fault == 31 ? CLOG_ZEROPAGE : CLOG_TRUNCATE, 0,
+									fault == 31 ? (const void *)&page : (const void *)&trunc,
+									fault == 31 ? sizeof(page) : sizeof(trunc));
+	}
 	if (fault == 30)
 		tail = terminal_test_record(&source, tail.exclusive_end, tail.record_start, RM_XACT_ID,
 									XLOG_XACT_COMMIT, 98, &timestamp, sizeof(timestamp));
@@ -3347,6 +3355,7 @@ UT_TEST(test_terminal_read_native_error_keeps_output_zero_and_custody_dead)
 }
 
 #include "test_cluster_relmap_origin_build.inc"
+#include "test_cluster_relmap_execution_custody.inc"
 
 int
 main(int argc, char **argv)
@@ -3355,7 +3364,14 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(73);
+	UT_PLAN(80);
+	UT_RUN(test_execution_pending_original_source_and_native_terminal_read);
+	UT_RUN(test_execution_pending_requires_original_owner_and_single_source);
+	UT_RUN(test_execution_pending_refuses_wrong_complete_view_and_era);
+	UT_RUN(test_execution_pending_keeps_native_inventory_and_lifetime_gates);
+	UT_RUN(test_execution_pending_drift_is_sticky_and_keeps_original_owner);
+	UT_RUN(test_execution_pending_error_releases_only_local_custody);
+	UT_RUN(test_execution_pending_alias_refusal_preserves_inputs);
 	UT_RUN(test_execution_build_uses_original_inputs_without_census_read_scope);
 	UT_RUN(test_execution_build_refuses_wrong_role_and_original_owner);
 	UT_RUN(test_execution_build_validates_checkpoint_window_and_complete_suffix);

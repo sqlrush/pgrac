@@ -28,6 +28,18 @@ extern bool cluster_relmap_recovery_prepare_v1(struct ClusterWalInputsV1 *inputs
 											   const ClusterRelmapV2Namespace *identity,
 											   const ClusterRelmapV2View *pending,
 											   ClusterRelmapRecoveryHandle **out);
+/* Dormant Startup-only execution-owner variant, after pass-1 census read
+ * pins have been released. Select the full pending's origin in the original
+ * executable cold scope; require its own sealed plan to have one physical
+ * and one bound source for that origin. Read the entire original source and
+ * reuse exact pending/native terminal/window/lifetime and durable page checks.
+ * No read pin or replacement scope is acquired. Original owner/pins must
+ * outlive the handle; existing matches/terminal_read/release apply. The same
+ * refusal/alias/ERROR contracts and qualification limits above remain.
+ * No target write, COMPLETE, pin release, allocator or activation follows. */
+extern bool cluster_relmap_recovery_prepare_cold_v1(const ClusterRelmapV2Namespace *identity,
+													const ClusterRelmapV2View *pending,
+													ClusterRelmapRecoveryHandle **out);
 /* Exact full namespace/view, original-round current checks and an unchanged
  * internally reread native base fingerprint. Page drift (even another slot)
  * conservatively refuses this snapshot; false is not rollback/retry permission.

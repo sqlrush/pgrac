@@ -700,7 +700,8 @@ UT_TEST(test_cold_terminal_match_uses_only_original_round_and_plan)
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(18);
+	UT_RUN(test_cold_single_source_uses_only_original_round_and_plan);
 	UT_RUN(test_checkpoint_visit_uses_original_execution_owner);
 	UT_RUN(test_checkpoint_visit_refuses_missing_original_owner);
 	UT_RUN(test_checkpoint_visit_refuses_changed_metadata_and_sealed_cut);

@@ -1462,6 +1462,23 @@ rf_side_online_plan_recovery_claim_matches_v1(const RfSideOnlinePlanV1 *plan,
 	return side_recovery_claim_matches(plan, source, true);
 }
 
+bool
+rf_side_online_plan_recovery_single_source_v1(const RfSideOnlinePlanV1 *plan,
+											  const ClusterWalSourceRef *source)
+{
+	uint32 physical = 0, bound = 0;
+
+	if (!rf_side_online_plan_recovery_claim_matches_v1(plan, source))
+		return false;
+	for (uint32 i = 0; i < plan->participant_count; i++)
+		if (plan->physical_cuts[i].failed_thread == source->claim.identity.origin_thread_id)
+			physical++;
+	for (uint32 i = 0; i < plan->source_count; i++)
+		if (plan->sources[i].claim.identity.origin_node_id == source->claim.identity.origin_node_id)
+			bound++;
+	return physical == 1 && bound == 1;
+}
+
 uint32
 rf_side_online_plan_native_terminal_count_v1(const RfSideOnlinePlanV1 *plan,
 											 const ClusterWalSourceRef *source)

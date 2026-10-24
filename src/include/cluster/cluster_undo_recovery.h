@@ -51,6 +51,13 @@ cluster_undo_recovery_cold_source_matches_v1(const ClusterWalSourceRef *source,
 extern uint64 cluster_undo_recovery_cold_scope_id_v1(const ClusterWalSourceRef *source,
 													 const ClusterControlRootSnapshot *checkpoint,
 													 XLogRecPtr native_redo);
+/* Same original cold source/ROOT/nonreused serial plus its own immutable
+ * plan's single-physical/bound-source origin check. No caller plan or new
+ * scope, retention, era/base or completion permission is accepted/created. */
+extern bool
+cluster_undo_recovery_cold_single_source_v1(const ClusterWalSourceRef *source,
+											const ClusterControlRootSnapshot *checkpoint,
+											XLogRecPtr native_redo, uint64 scope_serial);
 /* Provisional, read-only original execution-owner input. No census read pin
  * or replacement scope is acquired. The callback must neither publish shared
  * state nor mutate/retire its borrowed owner or inputs; all observations are

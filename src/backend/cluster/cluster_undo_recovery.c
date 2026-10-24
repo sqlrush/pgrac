@@ -385,6 +385,23 @@ cluster_undo_recovery_cold_scope_id_v1(const ClusterWalSourceRef *source,
 	return serial;
 }
 
+bool
+cluster_undo_recovery_cold_single_source_v1(const ClusterWalSourceRef *source,
+											const ClusterControlRootSnapshot *checkpoint,
+											XLogRecPtr native_redo, uint64 scope_serial)
+{
+	const ClusterUndoRecoveryScopeV1 *scope = active_scope;
+
+	if (scope_serial == 0
+		|| cluster_undo_recovery_cold_scope_id_v1(source, checkpoint, native_redo) != scope_serial
+		|| active_scope != scope
+		|| !rf_side_online_plan_recovery_single_source_v1(scope->plan, source))
+		return false;
+	return active_scope == scope && undo_scope_serial == scope_serial
+		   && cluster_undo_recovery_cold_scope_id_v1(source, checkpoint, native_redo)
+				  == scope_serial;
+}
+
 typedef struct UndoRecoveryCheckpointVisit {
 	const ClusterUndoRecoveryScopeV1 *scope;
 	ClusterControlRootSnapshot root;

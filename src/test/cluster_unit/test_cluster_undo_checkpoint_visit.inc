@@ -5,6 +5,17 @@ static ClusterWalRecoveryCheckpointV1 visit_checkpoint;
 static unsigned checkpoint_fault, checkpoint_gets, checkpoint_visits, checkpoint_callbacks;
 static uint64 checkpoint_first_serial;
 static ClusterUndoRecoveryScopeV1 *checkpoint_scope;
+static bool checkpoint_single = true;
+static unsigned checkpoint_single_calls;
+
+bool
+rf_side_online_plan_recovery_single_source_v1(const RfSideOnlinePlanV1 *selected,
+											  const ClusterWalSourceRef *source)
+{
+	checkpoint_single_calls++;
+	UT_ASSERT(selected == plan);
+	return checkpoint_single && memcmp(source, &cold_source, sizeof(*source)) == 0;
+}
 
 ClusterControlRootResult
 cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *expected,
@@ -99,7 +110,39 @@ checkpoint_setup(ClusterUndoRecoveryScopeV1 *scope)
 	checkpoint_fault = checkpoint_gets = checkpoint_visits = checkpoint_callbacks = 0;
 	checkpoint_first_serial = 0;
 	checkpoint_scope = scope;
+	checkpoint_single = true;
+	checkpoint_single_calls = 0;
 	UT_ASSERT(cluster_undo_recovery_scope_enter_v1(scope, &authority, plan));
+}
+
+UT_TEST(test_cold_single_source_uses_only_original_round_and_plan)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		ClusterUndoRecoveryScopeV1 scope = { 0 };
+		ClusterWalSourceRef source;
+		uint64 round;
+		checkpoint_setup(&scope);
+		source = cold_source;
+		round = cluster_undo_recovery_cold_scope_id_v1(&source, &root, 120);
+		if (fault == 1)
+			checkpoint_single = false;
+		if (fault == 2)
+			round++;
+		if (fault == 3)
+			authority_result = CLUSTER_THREAD_AUTHORITY_FENCE_STALE;
+		if (fault == 4)
+			source.claim.claim_sha256[31] ^= 1;
+		if (fault == 5) {
+			cluster_undo_recovery_scope_leave_v1(&scope);
+			UT_ASSERT(cluster_undo_recovery_scope_enter_v1(&scope, &authority, plan));
+		}
+		UT_ASSERT_EQ(cluster_undo_recovery_cold_single_source_v1(&source, &root, 120, round),
+					 fault == 0);
+		UT_ASSERT_EQ(checkpoint_single_calls, fault <= 1 ? 1 : 0);
+		UT_ASSERT(!cluster_undo_recovery_cold_single_source_v1(&source, &root, 120, 0));
+		UT_ASSERT_EQ(wal_sync_calls + path_calls, 0);
+		cluster_undo_recovery_scope_leave_v1(&scope);
+	}
 }
 
 static bool
