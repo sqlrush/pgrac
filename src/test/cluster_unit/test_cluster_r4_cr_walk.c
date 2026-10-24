@@ -12,6 +12,8 @@
 #define USE_PGRAC_CLUSTER 1
 
 #include "postgres.h"
+#include "miscadmin.h"
+#include "utils/timestamp.h"
 
 #include <stdarg.h>
 #include <string.h>
@@ -82,6 +84,12 @@ palloc(Size size)
 
 int cluster_node_id = 0;
 int cluster_cr_chain_walk_max_steps = 4096;
+bool cluster_trace_normal_stop = false;
+volatile uint32 CritSectionCount;
+int MyProcPid = 4242;
+static unsigned ut_diag_events, ut_wall_calls, ut_diag_error_event;
+static char ut_diag_logs[524288], ut_last_log[8192];
+TimestampTz GetCurrentTimestamp(void) { ut_wall_calls++; return 12500; }
 static unsigned ut_horizon_log_count;
 static char ut_horizon_log[1536];
 
@@ -115,12 +123,18 @@ errmsg(const char *format pg_attribute_unused(), ...)
 }
 
 int
+errdetail(const char *format pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+int
 errmsg_internal(const char *format, ...)
 {
 	va_list args;
 
 	va_start(args, format);
-	vsnprintf(ut_horizon_log, sizeof(ut_horizon_log), format, args);
+	vsnprintf(ut_last_log, sizeof(ut_last_log), format, args);
 	va_end(args);
 	return 0;
 }
@@ -129,8 +143,17 @@ void
 errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused(),
 		  const char *func pg_attribute_unused())
 {
-	UT_ASSERT(strstr(ut_horizon_log, "PGRAC_FAMILY=R4_HISTORY_REFUSAL") != NULL);
-	ut_horizon_log_count++;
+	if (strstr(ut_last_log, "PGRAC_FAMILY=R4_HISTORY_REFUSAL") != NULL) {
+		strlcpy(ut_horizon_log, ut_last_log, sizeof(ut_horizon_log));
+		ut_horizon_log_count++;
+	} else {
+		UT_ASSERT(strstr(ut_last_log, "PGRAC_FAMILY=R4_UNDO") != NULL);
+		ut_diag_events++;
+		if (ut_diag_events == ut_diag_error_event && PG_exception_stack != NULL)
+			siglongjmp(*PG_exception_stack, 1);
+		strncat(ut_diag_logs, ut_last_log, sizeof(ut_diag_logs) - strlen(ut_diag_logs) - 2);
+		strncat(ut_diag_logs, "\n", sizeof(ut_diag_logs) - strlen(ut_diag_logs) - 1);
+	}
 }
 
 MemoryContext TopMemoryContext = (MemoryContext)0x1;
@@ -3453,10 +3476,207 @@ UT_TEST(test_retained_insert_into_real_line_pointer_hole_restores_page)
 	cluster_cr_build_on_holder_forget(0, 645);
 }
 
+
+/* Execute the original builder/inverses, not trace-return or visibility stubs.
+ * Only the local undo-copy boundary above supplies controlled record bytes. */
+static void
+reset_undo_trace(bool enabled)
+{
+	cluster_trace_normal_stop = enabled;
+	CritSectionCount = 0;
+	ut_diag_events = ut_wall_calls = ut_diag_error_event = 0;
+	ut_diag_logs[0] = '\0';
+}
+
+UT_TEST(test_undo_trace_default_off_preserves_real_insert)
+{
+	reset_undo_trace(false);
+	test_r4_builder_single_local_insert_inverse_reaches_full();
+	UT_ASSERT(ut_diag_events == 0 && ut_wall_calls == 0);
+}
+UT_TEST(test_undo_trace_invalid_layout_is_observed_without_item_reads)
+{
+	reset_undo_trace(true);
+	test_r4_builder_rejects_invalid_page_layout_before_full();
+	cluster_trace_normal_stop = false;
+	UT_ASSERT(strstr(ut_diag_logs, "predicate=PAGE_LAYOUT"));
+	UT_ASSERT(strstr(ut_diag_logs, "page_known=0") && strstr(ut_diag_logs, "target_item_known=0"));
+}
+
+UT_TEST(test_undo_trace_local_copy_carries_separate_record_and_locator)
+{
+	reset_undo_trace(true);
+	test_r4_builder_single_local_insert_inverse_reaches_full();
+	cluster_trace_normal_stop = false;
+	UT_ASSERT(strstr(ut_diag_logs, "event=undo.read.end"));
+	UT_ASSERT(strstr(ut_diag_logs, "slot=0 slot_generation=71 builder_incarnation=101"));
+	UT_ASSERT(strstr(ut_diag_logs, "spc=1663 db=5 rel=20000 fork=0 block=37"));
+	UT_ASSERT(strstr(ut_diag_logs, "record_source=local_copy"));
+	UT_ASSERT(strstr(ut_diag_logs, "record_header_known=1"));
+	UT_ASSERT(strstr(ut_diag_logs, "locator_known=1") && strstr(ut_diag_logs, "record_tt_wrap_plus1="));
+	UT_ASSERT(strstr(ut_diag_logs, "authoritative=0") && strstr(ut_diag_logs, "full_xid_known=0"));
+	UT_ASSERT(strstr(ut_diag_logs, "event=build.full"));
+}
+UT_TEST(test_undo_trace_hot_update_logs_original_inverse_completion)
+{
+	reset_undo_trace(true);
+	test_r4_builder_single_local_update_hot_inverse_reaches_full();
+	cluster_trace_normal_stop = false;
+	UT_ASSERT(strstr(ut_diag_logs, "event=legacy.accept"));
+	UT_ASSERT(strstr(ut_diag_logs, "apply_record=1"));
+	UT_ASSERT(strstr(ut_diag_logs, "target_offset=1"));
+	UT_ASSERT(strstr(ut_diag_logs, "page_itl_wrap=") && strstr(ut_diag_logs, "target_item_known="));
+}
+static ClusterR4CrBuildStepResult
+trace_bad_record(unsigned fault)
+{
+	PGAlignedBlock page, foreign;
+	ClusterR4CrSlotExtension extension = make_builder_extension(8001 + fault, 9001 + fault);
+	ClusterCrBuildReason reason;
+	UndoRecordHeader *record = (UndoRecordHeader *)ut_undo_record;
+	ClusterR4CrBuildStepResult result;
+
+	make_one_insert_candidate_page(page.data, &extension);
+	memset(foreign.data, 0, BLCKSZ);
+	if (fault == 0) ut_undo_record_length = 0;
+	if (fault == 1) ut_undo_record_length = sizeof(*record) - 1;
+	if (fault == 2) record->xid++;
+	if (fault == 3) record->payload_length++;
+	if (fault == 4) record->record_type = 255;
+	result = cluster_cr_build_on_holder_step(0, extension.slot_generation, false,
+										   &extension, page.data, foreign.data, &reason);
+	cluster_cr_build_on_holder_forget(0, extension.slot_generation);
+	return result;
+}
+UT_TEST(test_undo_trace_missing_record_never_invents_header)
+{
+	reset_undo_trace(true);
+	UT_ASSERT_EQ(trace_bad_record(0), CLUSTER_R4_CR_STEP_FAIL);
+	cluster_trace_normal_stop = false;
+	UT_ASSERT(strstr(ut_diag_logs, "event=record.missing"));
+	UT_ASSERT(strstr(ut_diag_logs, "record_length=0 record_header_known=0"));
+}
+UT_TEST(test_undo_trace_short_record_never_reads_header)
+{
+	reset_undo_trace(true);
+	UT_ASSERT_EQ(trace_bad_record(1), CLUSTER_R4_CR_STEP_FAIL);
+	cluster_trace_normal_stop = false;
+	UT_ASSERT(strstr(ut_diag_logs, "event=record.header.reject"));
+	UT_ASSERT(!strstr(ut_diag_logs, "record_header_known=1"));
+}
+UT_TEST(test_undo_trace_canonical_rejection_keeps_unknown_inner_reason)
+{
+	reset_undo_trace(true);
+	UT_ASSERT_EQ(trace_bad_record(2), CLUSTER_R4_CR_STEP_FAIL);
+	cluster_trace_normal_stop = false;
+	UT_ASSERT(strstr(ut_diag_logs, "event=record.canonical.reject"));
+	UT_ASSERT(strstr(ut_diag_logs, "locator_reason_known=0"));
+}
+UT_TEST(test_undo_trace_length_refusal_keeps_original_first_gate)
+{
+	reset_undo_trace(true);
+	UT_ASSERT_EQ(trace_bad_record(3), CLUSTER_R4_CR_STEP_FAIL);
+	cluster_trace_normal_stop = false;
+	UT_ASSERT(strstr(ut_diag_logs, "predicate=RECORD_LENGTH"));
+	UT_ASSERT(!strstr(ut_diag_logs, "event=legacy.accept"));
+}
+UT_TEST(test_undo_trace_unsupported_type_does_not_report_inverse_success)
+{
+	reset_undo_trace(true);
+	UT_ASSERT_EQ(trace_bad_record(4), CLUSTER_R4_CR_STEP_FAIL);
+	cluster_trace_normal_stop = false;
+	UT_ASSERT(strstr(ut_diag_logs, "predicate=RECORD_TYPE"));
+	UT_ASSERT(!strstr(ut_diag_logs, "event=legacy.accept"));
+}
+UT_TEST(test_undo_trace_foreign_need_is_only_prepared_handoff)
+{
+	reset_undo_trace(true);
+	test_r4_builder_foreign_head_freezes_one_need_undo();
+	cluster_trace_normal_stop = false;
+	UT_ASSERT(strstr(ut_diag_logs, "event=undo.need"));
+	UT_ASSERT(strstr(ut_diag_logs, "transport_receipt=0") && strstr(ut_diag_logs, "foreign_request_id="));
+	UT_ASSERT(!strstr(ut_diag_logs, "event=undo.read.end"));
+}
+UT_TEST(test_undo_trace_resident_foreign_record_is_not_local_io)
+{
+	reset_undo_trace(true);
+	test_r4_builder_foreign_resume_preserves_predecessor_and_step_count();
+	cluster_trace_normal_stop = false;
+	UT_ASSERT(strstr(ut_diag_logs, "record_source=resident_foreign_copy"));
+	UT_ASSERT(strstr(ut_diag_logs, "event=record.validated"));
+}
+UT_TEST(test_undo_trace_off_target_record_keeps_skip_separate_from_inverse)
+{
+	reset_undo_trace(true);
+	test_r4_builder_transaction_global_chain_skips_other_block();
+	cluster_trace_normal_stop = false;
+	UT_ASSERT(strstr(ut_diag_logs, "event=legacy.accept"));
+	UT_ASSERT(strstr(ut_diag_logs, "apply_record=0"));
+}
+UT_TEST(test_undo_trace_page_history_executes_real_inverse)
+{
+	reset_undo_trace(true);
+	test_page_history_restores_reused_slot_across_transaction_identity();
+	cluster_trace_normal_stop = false;
+	UT_ASSERT(strstr(ut_diag_logs, "event=history.inverse.begin"));
+	UT_ASSERT(strstr(ut_diag_logs, "event=history.inverse.end"));
+	UT_ASSERT(strstr(ut_diag_logs, "predicate=INVERSE_RETURN_TRUE"));
+}
+UT_TEST(test_undo_trace_history_refusal_never_falls_back)
+{
+	reset_undo_trace(true);
+	test_page_history_corruption_never_falls_back_to_legacy_or_partial_full();
+	cluster_trace_normal_stop = false;
+	UT_ASSERT(strstr(ut_diag_logs, "event=history.inverse.reject"));
+	UT_ASSERT(!strstr(ut_diag_logs, "event=legacy.accept"));
+}
+UT_TEST(test_undo_trace_log_error_leaves_exact_owner_cleanup_usable)
+{
+	PGAlignedBlock page, foreign;
+	ClusterR4CrSlotExtension extension = make_builder_extension(8101, 9101);
+	ClusterCrBuildReason reason;
+	volatile bool caught = false;
+	unsigned before_forget;
+
+	reset_undo_trace(true);
+	make_one_insert_candidate_page(page.data, &extension);
+	memset(foreign.data, 0, BLCKSZ);
+	ut_diag_error_event = 1;
+	PG_TRY(); {
+		(void)cluster_cr_build_on_holder_step(0, 8101, false, &extension,
+											 page.data, foreign.data, &reason);
+	}
+	PG_CATCH(); { caught = true; }
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	before_forget = ut_diag_events;
+	cluster_cr_build_on_holder_forget(0, 8101);
+	UT_ASSERT_EQ(ut_diag_events, before_forget); /* no new LOG in cleanup */
+	reset_undo_trace(false);
+	extension = make_builder_extension(8101, 9101);
+	make_one_insert_candidate_page(page.data, &extension);
+	UT_ASSERT_EQ(cluster_cr_build_on_holder_step(0, 8101, false, &extension,
+											   page.data, foreign.data, &reason),
+				 CLUSTER_R4_CR_STEP_FULL);
+	cluster_cr_build_on_holder_forget(0, 8101);
+}
+UT_TEST(test_undo_trace_critical_gap_is_disclosed_without_changing_work)
+{
+	reset_undo_trace(true); CritSectionCount = 1;
+	test_r4_builder_single_local_insert_inverse_reaches_full();
+	UT_ASSERT_EQ(ut_diag_events, 0);
+	CritSectionCount = 0;
+	test_r4_builder_single_local_insert_inverse_reaches_full();
+	cluster_trace_normal_stop = false;
+	UT_ASSERT(strstr(ut_diag_logs, "trace_critical_skipped="));
+	UT_ASSERT(!strstr(ut_diag_logs, "trace_critical_skipped=0 "));
+}
+
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(83);
+	UT_PLAN(99);
 	UT_RUN(test_retained_insert_into_real_line_pointer_hole_restores_page);
 	UT_RUN(test_synchronous_entry_consumes_new_history_not_transaction_chain);
 	UT_RUN(test_page_history_reclaims_removed_successor_storage_before_readding_old_version);
@@ -3541,6 +3761,23 @@ main(int argc, char **argv)
 	UT_RUN(test_r4_candidate_allows_history_at_snapshot_boundary);
 	UT_RUN(test_r4_missing_local_record_keeps_refusal_and_reports_exact_site);
 	UT_RUN(test_r4_history_detail_limit_never_changes_the_refusal);
+
+	UT_RUN(test_undo_trace_default_off_preserves_real_insert);
+	UT_RUN(test_undo_trace_invalid_layout_is_observed_without_item_reads);
+	UT_RUN(test_undo_trace_local_copy_carries_separate_record_and_locator);
+	UT_RUN(test_undo_trace_hot_update_logs_original_inverse_completion);
+	UT_RUN(test_undo_trace_missing_record_never_invents_header);
+	UT_RUN(test_undo_trace_short_record_never_reads_header);
+	UT_RUN(test_undo_trace_canonical_rejection_keeps_unknown_inner_reason);
+	UT_RUN(test_undo_trace_length_refusal_keeps_original_first_gate);
+	UT_RUN(test_undo_trace_unsupported_type_does_not_report_inverse_success);
+	UT_RUN(test_undo_trace_foreign_need_is_only_prepared_handoff);
+	UT_RUN(test_undo_trace_resident_foreign_record_is_not_local_io);
+	UT_RUN(test_undo_trace_off_target_record_keeps_skip_separate_from_inverse);
+	UT_RUN(test_undo_trace_page_history_executes_real_inverse);
+	UT_RUN(test_undo_trace_history_refusal_never_falls_back);
+	UT_RUN(test_undo_trace_log_error_leaves_exact_owner_cleanup_usable);
+	UT_RUN(test_undo_trace_critical_gap_is_disclosed_without_changing_work);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

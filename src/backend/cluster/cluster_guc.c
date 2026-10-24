@@ -117,6 +117,7 @@ bool cluster_xnode_profile_enabled = false;
 bool cluster_update_trace_enabled = false;
 bool cluster_trace_tx_identity = false;
 bool cluster_trace_cleanup = false;
+bool cluster_trace_normal_stop = false;
 char *cluster_trace_visibility_relids = NULL;
 bool cluster_trace_visibility_enabled = false;
 ClusterVisibilityTraceFilter cluster_trace_visibility_filter = { 0 };
@@ -1738,6 +1739,11 @@ cluster_init_guc(void)
 	DefineCustomBoolVariable(
 		"cluster.trace_cleanup", gettext_noop("Log transaction cleanup and buffer invalidation phases."),
 		NULL, &cluster_trace_cleanup, false, PGC_SUSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable(
+		"cluster.trace_normal_stop",
+		gettext_noop("Log passive producer ACK and retained DROP progress during normal stop."),
+		gettext_noop("Correlate peer-local owner records by formation, origin, batch and locator."),
+		&cluster_trace_normal_stop, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	DefineCustomStringVariable(
 		"cluster.trace_visibility_relids",

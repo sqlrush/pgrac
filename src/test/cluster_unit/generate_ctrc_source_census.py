@@ -363,6 +363,7 @@ _classify_owners(
     (
         "cluster_ctrc_receipt_apply_shared",
         "cluster_ctrc_receipt_prepare_shared",
+        "cluster_ctrc_receipt_prepare_shared_observed",
         "ctrc_receipt_prepare_shared_internal",
     ),
     "REGISTERED_REFERENCE",

@@ -251,6 +251,9 @@ int wal_level = WAL_LEVEL_REPLICA;
 static bool *smart_fusion_value_addr = NULL;
 static bool smart_fusion_boot_value = true;
 static GucContext smart_fusion_context = PGC_INTERNAL;
+static bool *normal_stop_trace_value_addr;
+static bool normal_stop_trace_boot_value = true;
+static GucContext normal_stop_trace_context = PGC_INTERNAL;
 static bool *tx_identity_value_addr = NULL;
 static bool tx_identity_boot_value = true;
 static GucContext tx_identity_context = PGC_INTERNAL;
@@ -274,6 +277,11 @@ DefineCustomBoolVariable(const char *name, const char *short_desc pg_attribute_u
 		smart_fusion_value_addr = valueAddr;
 		smart_fusion_boot_value = bootValue;
 		smart_fusion_context = context;
+	}
+	if (strcmp(name, "cluster.trace_normal_stop") == 0) {
+		normal_stop_trace_value_addr = valueAddr;
+		normal_stop_trace_boot_value = bootValue;
+		normal_stop_trace_context = context;
 	}
 	if (strcmp(name, "cluster.trace_tx_identity") == 0) {
 		tx_identity_value_addr = valueAddr;
@@ -865,13 +873,23 @@ UT_TEST(test_terminal_writer_chaining_registration_defaults_on)
 	UT_ASSERT(writer_chain_check_hook == NULL);
 }
 
+UT_TEST(test_normal_stop_trace_is_default_off_and_reloadable)
+{
+	UT_ASSERT(!cluster_trace_normal_stop);
+	cluster_init_guc();
+	UT_ASSERT(normal_stop_trace_value_addr == &cluster_trace_normal_stop);
+	UT_ASSERT(!normal_stop_trace_boot_value);
+	UT_ASSERT_EQ(normal_stop_trace_context, PGC_SIGHUP);
+	UT_ASSERT(!cluster_trace_normal_stop);
+}
+
 int
 main(void)
 {
 #ifdef ENABLE_INJECTION
-	UT_PLAN(16);
+	UT_PLAN(17);
 #else
-	UT_PLAN(15);
+	UT_PLAN(16);
 #endif
 	UT_RUN(test_terminal_writer_chaining_defaults_on);
 	UT_RUN(test_terminal_writer_chaining_registration_defaults_on);
@@ -888,6 +906,7 @@ main(void)
 	UT_RUN(test_cold_plan_memory_guc_bounds_and_startup_owner);
 	UT_RUN(test_shared_catalog_requires_wal_for_new_files);
 	UT_RUN(test_shared_catalog_requires_durable_checkpoint_publication);
+	UT_RUN(test_normal_stop_trace_is_default_off_and_reloadable);
 #ifdef ENABLE_INJECTION
 	UT_RUN(test_pcm_x_retain_flush_error_target_guc_contract);
 #endif

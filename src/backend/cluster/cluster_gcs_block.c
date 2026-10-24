@@ -4260,6 +4260,318 @@ gcs_block_stage_forward_wait(ClusterGcsBlockOutstandingSlot *slot, int32 destina
 	return admitted;
 }
 
+/* A process-local observation of this legacy read-image operation, not a
+ * grant, a transport receipt or a replacement for the slot's authority. */
+typedef struct GcsReadImageTrace {
+	BufferTag tag;
+	PcmAuthoritySnapshot authority;
+	GcsBlockReplyHeader reply;
+	uint64 operation_request_id;
+	uint64 request_id;
+	uint64 request_epoch;
+	SCN pi_watermark;
+	TimestampTz deadline;
+	int attempt;
+	int32 holder_node;
+	bool image_only;
+	bool reply_known;
+	bool checksum_known;
+	uint32 checksum_actual;
+	bool installed;
+	bool durable_s;
+	bool retry_denied;
+} GcsReadImageTrace;
+
+/* Ordinary read-image forward/reply observations.  No shared pointers survive
+ * a slot lock or a send: the view contains only copies of the inputs used by
+ * the original operation.  It is not a receipt or fresh authority proof. */
+/*
+ * Rejected bytes have not acquired a reply/holder identity.  In particular,
+ * a copied header below is an unvalidated payload projection, not a receipt.
+ * Called only at the original ingress refusal points, before resource lookup.
+ */
+static void
+gcs_block_read_image_ingress_reject_trace(const ClusterICEnvelope *env, const void *payload,
+										bool is_forward, const char *event, const char *predicate)
+{
+	static uint64 event_seq;
+	static uint64 critical_skipped;
+	GcsBlockForwardPayload forward;
+	GcsBlockReplyHeader reply;
+	BufferTag tag;
+	bool header_known = false;
+	bool tag_known = false;
+
+	if (!cluster_trace_normal_stop)
+		return;
+	if (CritSectionCount != 0) {
+		if (critical_skipped != UINT64_MAX)
+			critical_skipped++;
+		return;
+	}
+	memset(&forward, 0, sizeof(forward));
+	memset(&reply, 0, sizeof(reply));
+	memset(&tag, 0, sizeof(tag));
+	/* The envelope length is the transport-owned payload bound.  Never read
+	 * an undersized/absent payload or reinterpret a short forward as a tag. */
+	if (env != NULL && payload != NULL) {
+		if (is_forward && env->payload_length == sizeof(forward)) {
+			memcpy(&forward, payload, sizeof(forward));
+			tag = forward.tag;
+			header_known = tag_known = true;
+		} else if (!is_forward && env->payload_length >= sizeof(reply)) {
+			memcpy(&reply, payload, sizeof(reply));
+			header_known = true;
+		}
+	}
+	if (event_seq != UINT64_MAX)
+		event_seq++;
+	ereport(LOG,
+			(errmsg_internal(
+				 "PGRAC_FAMILY=READ_IMAGE_INGRESS event=%s predicate=%s "
+				 "event_seq=%llu sequence_scope=process sequence_domain=READ_IMAGE_INGRESS "
+				 "node_id=%d pid=%d procno=%d backend_id=%d backend_type=%d "
+				 "wall_us=%lld monotonic_us=%llu identity_source=run_manifest "
+				 "run_id_known=0 process_incarnation_known=0 boot_identity_known=0 "
+				 "transaction_identity_known=0 root_identity_known=0 "
+				 "authoritative=0 transport_receipt=0 read_image_attribution=unknown "
+				 "ingress_leg=%s envelope_known=%d source_node=%u dest_node=%u envelope_epoch=%llu "
+				 "payload_present=%d payload_length_known=%d payload_length=%u "
+				 "expected_v1_size=%u expected_v2_size=%u expected_undo_size=%u expected_forward_size=%u "
+				 "payload_header_known=%d header_validated=0 "
+				 "request_id=%llu payload_epoch=%llu requester_node_known=%d requester_node=%d "
+				 "requester_backend=%d master_node=%d reply_sender=%d reply_status=%d transition=%u "
+				 "tag_source=%s tag_known=%d spc=%u db=%u rel=%u fork=%d block=%u "
+				 "page_lsn=%llu checksum=%u trace_critical_skipped=%llu trace_sequence_exhausted=%d",
+				 event, predicate, (unsigned long long)event_seq, cluster_node_id, (int)getpid(),
+				 MyProc != NULL ? MyProc->pgprocno : -1, (int)MyBackendId, (int)MyBackendType,
+				 (long long)GetCurrentTimestamp(),
+				 (unsigned long long)gcs_block_pcm_x_monotonic_us(),
+				 is_forward ? "forward" : "reply", env != NULL,
+				 env != NULL ? env->source_node_id : 0, env != NULL ? env->dest_node_id : 0,
+				 env != NULL ? (unsigned long long)env->epoch : 0, payload != NULL, env != NULL,
+				 env != NULL ? env->payload_length : 0,
+				 (uint32)(sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE),
+				 (uint32)(sizeof(GcsBlockReplyHeaderV2) + GCS_BLOCK_DATA_SIZE),
+				 (uint32)(sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE
+						  + sizeof(ClusterGcsUndoAuthTrailer)),
+				 (uint32)sizeof(GcsBlockForwardPayload), header_known,
+				 (unsigned long long)(is_forward ? forward.request_id : reply.request_id),
+				 (unsigned long long)(is_forward ? forward.epoch : reply.epoch),
+				 is_forward && header_known, is_forward && header_known ? forward.original_requester_node : -1,
+				 !header_known ? -1 : is_forward ? forward.requester_backend_id : reply.requester_backend_id,
+				 !header_known ? -1 : is_forward ? forward.master_node
+														 : GcsBlockReplyHeaderGetForwardingMasterNode(&reply),
+				 !is_forward && header_known ? reply.sender_node : -1,
+				 !is_forward && header_known ? (int)reply.status : -1,
+				 (unsigned int)(is_forward ? forward.transition_id : reply.transition_id),
+				 tag_known ? "unvalidated_forward" : "unknown", tag_known,
+				 tag.spcOid, tag.dbOid, (unsigned int)tag.relNumber, (int)tag.forkNum,
+				 (unsigned int)tag.blockNum, (unsigned long long)reply.page_lsn, reply.checksum,
+				 (unsigned long long)critical_skipped, event_seq == UINT64_MAX)));
+}
+
+typedef struct GcsReadImageHopTrace {
+	bool envelope_known, forward_known, reply_known, tag_known, slot_known;
+	uint32 envelope_source, envelope_dest;
+	uint64 envelope_epoch;
+	GcsBlockForwardPayload forward;
+	GcsBlockReplyHeader reply;
+	BufferTag tag;
+	int slot_index;
+	uint64 slot_request_id, expected_epoch;
+	int32 expected_master;
+	uint8 expected_transition, slot_domain, incoming_domain;
+	bool incoming_domain_known;
+	bool slot_in_use, slot_reply_received, slot_stale, signal_called;
+	ClusterGcsBlockDirectState direct_state;
+	uint32 direct_generation;
+	bool copy_known, ship_ok, page_scn_known, verdict_known, downgrade_known;
+	ClusterBufmgrGcsCopyRefusal copy_refusal;
+	ClusterBufmgrGcsDowngradeOutcome downgrade;
+	SCN page_scn, expected_scn, verdict_input_scn;
+	GcsLostWriteVerdict verdict;
+	bool send_known, direct_handled_known, direct_handled;
+	ClusterICSendResult send_result;
+} GcsReadImageHopTrace;
+
+static void
+gcs_block_read_image_hop_slot_capture(GcsReadImageHopTrace *view,
+									const ClusterGcsBlockOutstandingSlot *slot, int index)
+{
+	/* Caller holds the existing backend-block lock; no lookup or allocation. */
+	view->slot_known = view->tag_known = true;
+	view->tag = slot->tag;
+	view->slot_index = index;
+	view->slot_request_id = slot->request_id;
+	view->expected_epoch = slot->request_epoch;
+	view->expected_master = slot->expected_master_node;
+	view->expected_transition = slot->transition_id;
+	view->slot_domain = slot->reply_domain;
+	view->slot_in_use = slot->in_use;
+	view->slot_reply_received = slot->reply_received;
+	view->slot_stale = slot->stale;
+	view->direct_state = slot->direct_state;
+	view->direct_generation = slot->direct_generation;
+}
+
+static void
+gcs_block_read_image_hop_trace(const GcsReadImageHopTrace *view, const char *event,
+							 const char *predicate)
+{
+	static uint64 event_seq;
+	static uint64 critical_skipped;
+	const GcsBlockReplyHeader *r = &view->reply;
+	const GcsBlockForwardPayload *f = &view->forward;
+
+	if (!cluster_trace_normal_stop)
+		return;
+	if (CritSectionCount != 0) {
+		if (critical_skipped != UINT64_MAX)
+			critical_skipped++;
+		return;
+	}
+	if (event_seq != UINT64_MAX)
+		event_seq++;
+	ereport(LOG,
+			(errmsg_internal(
+				 "PGRAC_FAMILY=READ_IMAGE_HOP event=%s predicate=%s "
+				 "event_seq=%llu sequence_scope=process sequence_domain=READ_IMAGE_HOP "
+				 "node_id=%d pid=%d procno=%d backend_id=%d backend_type=%d "
+				 "wall_us=%lld monotonic_us=%llu identity_source=run_manifest "
+				 "run_id_known=0 process_incarnation_known=0 boot_identity_known=0 "
+				 "transaction_identity_known=0 root_identity_known=0 authoritative=0 "
+				 "transport_receipt=0 role=%s envelope_known=%d source_node=%u dest_node=%u "
+				 "envelope_epoch=%llu forward_known=%d request_id=%llu request_epoch=%llu "
+				 "requester_node=%d requester_backend=%d master_node=%d "
+				 "tag_source=%s tag_known=%d spc=%u db=%u rel=%u fork=%d block=%u "
+				 "slot_known=%d slot_index=%d slot_request_id=%llu expected_master=%d "
+				 "expected_epoch=%llu reply_epoch=%llu expected_transition=%u reply_transition=%u "
+				 "slot_domain=%u incoming_domain_known=%d incoming_domain=%d "
+				 "slot_in_use=%d slot_reply_received_before=%d slot_stale=%d "
+				 "direct_state=%d direct_generation=%u signal_called=%d "
+				 "reply_header_scope=%s reply_known=%d reply_sender=%d forwarding_master=%d reply_status=%d "
+				 "page_lsn=%llu checksum=%u copy_known=%d copy_refusal=%d copy_ship_ok=%d "
+				 "downgrade_known=%d downgrade_outcome=%d page_scn_known=%d page_scn=%llu "
+				 "verdict_known=%d expected_pi_watermark=%llu verdict_input_scn=%llu verdict=%d "
+				 "send_result_known=%d send_result=%d direct_handled_known=%d direct_handled=%d "
+				 "direct_wire_reply_known=0 "
+				 "trace_critical_skipped=%llu trace_sequence_exhausted=%d",
+				 event, predicate, (unsigned long long)event_seq, cluster_node_id, (int)getpid(),
+				 MyProc != NULL ? MyProc->pgprocno : -1, (int)MyBackendId, (int)MyBackendType,
+				 (long long)GetCurrentTimestamp(),
+				 (unsigned long long)gcs_block_pcm_x_monotonic_us(),
+				 view->forward_known ? "holder" : "reply_receiver", view->envelope_known,
+				 view->envelope_source, view->envelope_dest,
+				 (unsigned long long)view->envelope_epoch, view->forward_known,
+				 (unsigned long long)(view->reply_known ? r->request_id : f->request_id),
+				 (unsigned long long)(view->forward_known ? f->epoch : view->expected_epoch),
+				 view->forward_known ? f->original_requester_node : cluster_node_id,
+				 view->forward_known ? f->requester_backend_id : r->requester_backend_id,
+				 view->forward_known ? f->master_node : view->slot_known ? view->expected_master : -1,
+				 view->forward_known ? "forward_projection" : view->slot_known ? "slot_projection" : "unknown",
+				 view->tag_known, view->tag.spcOid, view->tag.dbOid,
+				 (unsigned int)view->tag.relNumber, (int)view->tag.forkNum,
+				 (unsigned int)view->tag.blockNum, view->slot_known,
+				 view->slot_known ? view->slot_index : -1,
+				 (unsigned long long)view->slot_request_id,
+				 view->slot_known ? view->expected_master : -1,
+				 (unsigned long long)view->expected_epoch,
+				 view->reply_known ? (unsigned long long)r->epoch : 0,
+				 (unsigned int)view->expected_transition,
+				 view->reply_known ? (unsigned int)r->transition_id : 0,
+				 (unsigned int)view->slot_domain, view->incoming_domain_known,
+				 view->incoming_domain_known ? (int)view->incoming_domain : -1,
+				 view->slot_in_use, view->slot_reply_received,
+				 view->slot_stale, (int)view->direct_state, view->direct_generation,
+				 view->signal_called, view->forward_known ? "prepared" : "decoded", view->reply_known,
+				 view->reply_known ? r->sender_node : -1,
+				 view->reply_known ? GcsBlockReplyHeaderGetForwardingMasterNode(r) : -1,
+				 view->reply_known ? (int)r->status : -1,
+				 view->reply_known ? (unsigned long long)r->page_lsn : 0,
+				 view->reply_known ? r->checksum : 0, view->copy_known,
+				 view->copy_known ? (int)view->copy_refusal : -1, view->ship_ok, view->downgrade_known,
+				 view->downgrade_known ? (int)view->downgrade : -1,
+				 view->page_scn_known, (unsigned long long)view->page_scn,
+				 view->verdict_known, (unsigned long long)view->expected_scn,
+				 (unsigned long long)view->verdict_input_scn, (int)view->verdict,
+				 view->send_known, view->send_known ? (int)view->send_result : -1, view->direct_handled_known,
+				 view->direct_handled, (unsigned long long)critical_skipped,
+				 event_seq == UINT64_MAX)));
+}
+
+static void
+gcs_block_read_image_trace(const volatile GcsReadImageTrace *trace, const char *event)
+{
+	static uint64 event_seq;
+	static uint64 critical_skipped;
+	GcsBlockReplyHeader reply_copy = trace->reply;
+	const GcsBlockReplyHeader *reply = &reply_copy;
+
+	if (!cluster_trace_normal_stop)
+		return;
+	/* Never allocate a LOG in a critical section.  Missing observations are
+	 * disclosed by the next safe event and cannot prove absent work. */
+	if (CritSectionCount != 0) {
+		if (critical_skipped != UINT64_MAX)
+			critical_skipped++;
+		return;
+	}
+	if (event_seq != UINT64_MAX)
+		event_seq++;
+	ereport(LOG,
+			(errmsg_internal(
+				 "PGRAC_FAMILY=READ_IMAGE event=%s event_seq=%llu sequence_scope=process "
+				 "sequence_domain=READ_IMAGE "
+				 "node_id=%d pid=%d procno=%d backend_id=%d wall_us=%lld monotonic_us=%llu "
+				 "identity_source=run_manifest run_id_known=0 process_incarnation_known=0 "
+				 "backend_type_known=0 transaction_identity_known=0 "
+				 "role=requester master_node=%d holder_node=%d holder_procno=%u "
+				 "holder_epoch=%llu holder_request_id=%llu "
+				 "transition_count=%llu pending_x_since_lsn=%llu "
+				 "authority_state=%d authority_x_holder=%d authority_s_bitmap=%u "
+				 "authority_pending_x_requester=%d authoritative=0 "
+				 "operation_request_id=%llu request_id=%llu request_epoch=%llu "
+				 "attempt=%d transition_id=%u spc=%u db=%u rel=%u fork=%d block=%u "
+				 "image_only=%d expected_pi_watermark=%llu deadline_wall_us=%lld "
+				 "reply_known=%d status=%d status_source=%s "
+				 "reply_request_id=%llu reply_epoch=%llu reply_sender=%d forwarding_master=%d "
+				 "reply_backend=%d reply_transition=%u page_lsn=%llu page_scn_known=0 read_scn_known=0 "
+				 "checksum_known=%d checksum_expected=%u checksum_actual=%u "
+				 "installed=%d durable_s=%d retry_denied=%d "
+				 "trace_critical_skipped=%llu trace_sequence_exhausted=%d",
+				 event, (unsigned long long)event_seq, cluster_node_id, (int)getpid(),
+				 MyProc != NULL ? MyProc->pgprocno : -1, (int)MyBackendId,
+				 (long long)GetCurrentTimestamp(),
+				 (unsigned long long)gcs_block_pcm_x_monotonic_us(), cluster_node_id,
+				 trace->holder_node, trace->authority.master_holder.procno,
+				 (unsigned long long)trace->authority.master_holder.cluster_epoch,
+				 (unsigned long long)trace->authority.master_holder.request_id,
+				 (unsigned long long)trace->authority.transition_count,
+				 (unsigned long long)trace->authority.pending_x_since_lsn,
+				 (int)trace->authority.state, trace->authority.x_holder_node,
+				 trace->authority.s_holders_bitmap, trace->authority.pending_x_requester_node,
+				 (unsigned long long)trace->operation_request_id,
+				 (unsigned long long)trace->request_id, (unsigned long long)trace->request_epoch,
+				 trace->attempt, (unsigned int)PCM_TRANS_N_TO_S,
+				 trace->tag.spcOid, trace->tag.dbOid, (unsigned int)trace->tag.relNumber,
+				 (int)trace->tag.forkNum, (unsigned int)trace->tag.blockNum,
+				 trace->image_only, (unsigned long long)trace->pi_watermark,
+				 (long long)trace->deadline, trace->reply_known,
+				 trace->reply_known ? (int)reply->status : -1,
+				 trace->reply_known ? "accepted_reply_header" : "requester_observation",
+				 trace->reply_known ? (unsigned long long)reply->request_id : 0,
+				 trace->reply_known ? (unsigned long long)reply->epoch : 0,
+				 trace->reply_known ? reply->sender_node : -1,
+				 trace->reply_known ? GcsBlockReplyHeaderGetForwardingMasterNode(reply) : -1,
+				 trace->reply_known ? reply->requester_backend_id : -1,
+				 trace->reply_known ? (unsigned int)reply->transition_id : 0,
+				 trace->reply_known ? (unsigned long long)reply->page_lsn : 0,
+				 trace->checksum_known, trace->reply_known ? reply->checksum : 0,
+				 trace->checksum_actual, trace->installed, trace->durable_s, trace->retry_denied,
+				 (unsigned long long)critical_skipped, event_seq == UINT64_MAX)));
+}
+
 bool
 cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthoritySnapshot *expected,
 											 bool force_one_shot, bool *out_retry_denied)
@@ -4277,6 +4589,8 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 	bool durable_s = false; /* spec-6.12a ㉕ — holder downgraded, we registered */
 	bool image_only;
 	int32 holder_node;
+	bool trace_enabled = cluster_trace_normal_stop;
+	volatile GcsReadImageTrace trace;
 
 	Assert(out_retry_denied != NULL);
 	if (buf == NULL || expected == NULL || out_retry_denied == NULL)
@@ -4298,12 +4612,22 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 						   cluster_node_id)));
 
 	tag = buf->tag;
+	if (trace_enabled) {
+		memset((void *)&trace, 0, sizeof(trace));
+		trace.tag = tag;
+		trace.authority = *expected;
+		trace.holder_node = holder_node;
+	}
 	/* P0-21 residual: the holder is an exact authority identity, not a route
 	 * hint.  A queue winner may have displaced a caller's optimistic sample
 	 * before this helper starts; let bufmgr abort/rearm GRANT_PENDING and
 	 * drive the new authority rather than sending to the stale node. */
 	if (!cluster_pcm_lock_authority_matches(tag, expected)) {
 		*out_retry_denied = true;
+		if (trace_enabled) {
+			trace.retry_denied = true;
+			gcs_block_read_image_trace(&trace, "authority.displaced");
+		}
 		return false;
 	}
 	image_only = force_one_shot || cluster_gcs_block_resource_x_local_s_barrier_active(tag);
@@ -4311,6 +4635,10 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 	/* expected_master == self:  the holder's reply carries forwarding_master =
 	 * self, which the HC108 authorized chain validates against this slot. */
 	slot = gcs_block_reserve_slot(tag, (uint8)PCM_TRANS_N_TO_S, cluster_node_id, &request_id);
+	if (trace_enabled) {
+		trace.operation_request_id = trace.request_id = request_id;
+		trace.image_only = image_only;
+	}
 	max_retries = cluster_gcs_block_retransmit_max_retries >= 0
 					  ? cluster_gcs_block_retransmit_max_retries
 					  : 4;
@@ -4319,6 +4647,9 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 	{
 		ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
 		TimestampTz deadline;
+
+		if (trace_enabled)
+			gcs_block_read_image_trace(&trace, "request.reserved");
 
 		for (retry_attempt = 0; retry_attempt <= max_retries; retry_attempt++) {
 			attempts = retry_attempt + 1;
@@ -4361,6 +4692,14 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 			slot->request_epoch = cluster_epoch_get_current();
 			slot->expected_master_node = cluster_node_id;
 			slot->stale = false;
+			if (trace_enabled) {
+				trace.request_id = request_id;
+				trace.request_epoch = slot->request_epoch;
+				trace.attempt = attempts;
+				trace.reply_known = trace.checksum_known = false;
+				trace.checksum_actual = 0;
+				trace.deadline = 0;
+			}
 			LWLockRelease(&blk->lock.lock);
 
 			memset(&fwd, 0, sizeof(fwd));
@@ -4380,6 +4719,10 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 		 * the registration is a local transition apply — no ACK wire. */
 			if (cluster_read_scache && !image_only)
 				GcsBlockForwardPayloadSetDowngradeRequest(&fwd, true);
+			if (trace_enabled) {
+				trace.pi_watermark = GcsBlockForwardPayloadGetExpectedPiWatermarkScn(&fwd);
+				gcs_block_read_image_trace(&trace, "attempt.armed");
+			}
 
 			if (retry_attempt > 0)
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->retransmit_send_count, 1);
@@ -4387,6 +4730,10 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
 			if (!gcs_block_stage_forward_wait(slot, holder_node, &fwd, expected,
 											  out_retry_denied)) {
+				if (trace_enabled) {
+					trace.retry_denied = *out_retry_denied;
+					gcs_block_read_image_trace(&trace, "forward.refused");
+				}
 				if (*out_retry_denied)
 					break;
 				ereport(
@@ -4400,9 +4747,15 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 						 "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 						 cluster_node_id)));
 			}
+			if (trace_enabled)
+				gcs_block_read_image_trace(&trace, "forward.enqueued");
 
 			deadline = GetCurrentTimestamp()
 					   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
+			if (trace_enabled) {
+				trace.deadline = deadline;
+				gcs_block_read_image_trace(&trace, "wait.begin");
+			}
 
 			ConditionVariablePrepareToSleep(&slot->reply_cv);
 			for (;;) {
@@ -4428,6 +4781,12 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 			}
 			ConditionVariableCancelSleep();
 			last_status = got_reply ? (int)slot->reply_header.status : -1;
+			if (trace_enabled) {
+				trace.reply_known = got_reply;
+				if (got_reply)
+					trace.reply = slot->reply_header;
+				gcs_block_read_image_trace(&trace, got_reply ? "wait.reply" : "wait.timeout");
+			}
 
 			if (got_reply
 				&& (slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
@@ -4436,10 +4795,22 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 							   == (uint8)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE))) {
 				uint32 expected = slot->reply_header.checksum;
 				uint32 got = gcs_block_compute_checksum(slot->reply_block_data);
+				if (trace_enabled) {
+					trace.checksum_known = true;
+					trace.checksum_actual = got;
+					gcs_block_read_image_trace(&trace,
+											   expected == got ? "checksum.accept" : "checksum.reject");
+				}
 
 				if (expected == got) {
+					if (trace_enabled)
+						gcs_block_read_image_trace(&trace, "install.begin");
 					gcs_block_install_reply_block(buf, slot->reply_block_data,
 												  (XLogRecPtr)slot->reply_header.page_lsn, slot);
+					if (trace_enabled) {
+						trace.installed = true;
+						gcs_block_read_image_trace(&trace, "install.end");
+					}
 					/* spec-5.14 D2 class 2: this node (local master) consumed the
 				 * remote holder's volatile image. */
 					gcs_block_stamp_touched(holder_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
@@ -4509,11 +4880,20 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 	PG_CATCH();
 	{
 		gcs_block_release_slot(slot);
+		if (trace_enabled)
+			gcs_block_read_image_trace(&trace, "slot.released.error");
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
 	gcs_block_release_slot(slot);
+	if (trace_enabled) {
+		trace.retry_denied = *out_retry_denied;
+		trace.installed = installed;
+		trace.durable_s = durable_s;
+		gcs_block_read_image_trace(&trace, "slot.released");
+		gcs_block_read_image_trace(&trace, "request.finish");
+	}
 
 	if (*out_retry_denied)
 		return false;
@@ -19018,14 +19398,20 @@ gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const void *payload
 	if (out_undo_trailer != NULL)
 		*out_undo_trailer = NULL;
 
-	if (env == NULL || payload == NULL)
+	if (env == NULL || payload == NULL) {
+		gcs_block_read_image_ingress_reject_trace(env, payload, false, "reply.decode_refused",
+			env == NULL ? "reply.envelope_present" : "reply.payload_present");
 		return false;
+	}
 
 	if (env->payload_length == v1_size) {
 		const GcsBlockReplyHeader *h = (const GcsBlockReplyHeader *)payload;
 
-		if (!GcsBlockReplyStatusIsLegacy((GcsBlockReplyStatus)h->status))
+		if (!GcsBlockReplyStatusIsLegacy((GcsBlockReplyStatus)h->status)) {
+			gcs_block_read_image_ingress_reject_trace(env, payload, false, "reply.decode_refused",
+				"reply.v1.status_legacy");
 			return false;
+		}
 		if (out_hdr != NULL)
 			*out_hdr = h;
 		if (out_block_data != NULL)
@@ -19042,8 +19428,11 @@ gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const void *payload
 	if (env->payload_length == undo_size) {
 		const GcsBlockReplyHeader *h = (const GcsBlockReplyHeader *)payload;
 
-		if (!GcsBlockReplyStatusCarriesUndoAuthTrailer((GcsBlockReplyStatus)h->status))
+		if (!GcsBlockReplyStatusCarriesUndoAuthTrailer((GcsBlockReplyStatus)h->status)) {
+			gcs_block_read_image_ingress_reject_trace(env, payload, false, "reply.decode_refused",
+				"reply.undo.status_trailer");
 			return false;
+		}
 		if (out_hdr != NULL)
 			*out_hdr = h;
 		if (out_block_data != NULL)
@@ -19064,6 +19453,13 @@ gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const void *payload
 			|| !cluster_smart_fusion
 			|| !cluster_gcs_block_reply_v2_extract_dep_vec(hdrv2, &dep_vec)) {
 			cluster_sf_dep_note_lost_failclosed();
+			/* The dependency extractor ran at most once, in the original
+			 * short-circuit guard above.  Do not retry it for observation. */
+			gcs_block_read_image_ingress_reject_trace(env, payload, false, "reply.decode_refused",
+				!GcsBlockReplyStatusIsLegacy((GcsBlockReplyStatus)hdrv2->v1.status)
+					? "reply.v2.status_legacy"
+					: !cluster_smart_fusion ? "reply.v2.smart_fusion_enabled"
+									   : "reply.v2.dependency_vector");
 			return false;
 		}
 		if (out_hdr != NULL)
@@ -19079,6 +19475,8 @@ gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const void *payload
 		return true;
 	}
 
+	gcs_block_read_image_ingress_reject_trace(env, payload, false, "reply.decode_refused",
+		"reply.payload_size");
 	return false;
 }
 
@@ -19763,6 +20161,8 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 	int backend_idx;
 	ClusterGcsBlockBackendBlock *blk;
 	int i;
+	bool trace_enabled;
+	GcsReadImageHopTrace trace;
 
 	if (gcs_block_try_resource_x_frame(env, payload))
 		return;
@@ -19776,12 +20176,30 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 	if (!gcs_block_decode_reply_payload(env, payload, &hdr, &block_data, &sf_dep_valid, &sf_flags,
 										&sf_dep_vec, &undo_trailer))
 		return;
+	trace_enabled = cluster_trace_normal_stop
+		&& !GcsBlockReplyStatusIsR4((GcsBlockReplyStatus)hdr->status)
+		&& (hdr->transition_id == PCM_TRANS_N_TO_S
+			|| hdr->status == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
+			|| hdr->status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE);
+	if (trace_enabled) {
+		memset(&trace, 0, sizeof(trace));
+		trace.reply_known = trace.envelope_known = true;
+		trace.reply = *hdr;
+		trace.envelope_source = env->source_node_id;
+		trace.envelope_dest = env->dest_node_id;
+		trace.envelope_epoch = env->epoch;
+	}
 	/* Bind the payload's claimed sender to the authenticated DATA envelope.
 	 * The canonical PCM-X image-id path is direct holder -> requester, so
 	 * accepting a forged header source here would bypass its holder proof. */
 	if (env->source_node_id != (uint32)hdr->sender_node
-		|| env->dest_node_id != (uint32)cluster_node_id)
+		|| env->dest_node_id != (uint32)cluster_node_id) {
+		if (trace_enabled)
+			gcs_block_read_image_hop_trace(&trace, "reply.envelope_refused",
+				env->source_node_id != (uint32)hdr->sender_node
+					? "envelope.source_exact" : "envelope.destination_exact");
 		return;
+	}
 
 	/* D4 status 24 is a worker-0 internal response, never a backend-table
 	 * reply.  The decoder has already established its exact authenticated
@@ -19796,13 +20214,19 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 
 	if (cluster_shared_config && !GcsBlockReplyStatusIsR4((GcsBlockReplyStatus)hdr->status)
 		&& (!cluster_pcm_legacy_transition_allowed(true, (PcmLockTransition)hdr->transition_id)
-			|| hdr->status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER))
+			|| hdr->status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER)) {
+		if (trace_enabled)
+			gcs_block_read_image_hop_trace(&trace, "reply.legacy_refused", "legacy.transition_allowed");
 		return;
+	}
 
 	/* HC80: direct index by requester_backend_id (1..MaxBackends → 0..MaxBackends-1). */
 	backend_idx = hdr->requester_backend_id - 1;
-	if (backend_idx < 0 || backend_idx >= MaxBackends)
+	if (backend_idx < 0 || backend_idx >= MaxBackends) {
+		if (trace_enabled)
+			gcs_block_read_image_hop_trace(&trace, "reply.backend_refused", "backend.range");
 		return; /* malformed key; drop */
+	}
 
 	blk = &gcs_block_backend_blocks[backend_idx];
 
@@ -19817,11 +20241,20 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 									 ? CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR
 									 : CLUSTER_GCS_BLOCK_REPLY_DOMAIN_LEGACY_ACQUIRE;
 
+			if (trace_enabled) {
+				gcs_block_read_image_hop_slot_capture(&trace, slot, i);
+				trace.incoming_domain_known = true;
+				trace.incoming_domain = reply_domain;
+			}
+
 			/* Reply identity includes the closed slot domain.  Reject before
 			 * touching reply_received or any other slot-owned result byte. */
 			if (slot->reply_domain != reply_domain) {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
 				LWLockRelease(&blk->lock.lock);
+				if (trace_enabled)
+					gcs_block_read_image_hop_trace(&trace, "reply.domain_refused",
+						"reply.domain_exact");
 				return;
 			}
 
@@ -19839,6 +20272,9 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 			if (slot->reply_received) {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
 				LWLockRelease(&blk->lock.lock);
+				if (trace_enabled)
+					gcs_block_read_image_hop_trace(&trace, "reply.duplicate",
+						"reply.first_wins");
 				return;
 			}
 
@@ -19847,6 +20283,9 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 				|| slot->direct_state == GCS_BLOCK_DIRECT_ABORTING) {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
 				LWLockRelease(&blk->lock.lock);
+				if (trace_enabled)
+					gcs_block_read_image_hop_trace(&trace, "reply.direct_active",
+						"reply.direct_unarmed");
 				return;
 			}
 
@@ -19909,6 +20348,10 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 				|| hdr->transition_id != slot->transition_id) {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
 				LWLockRelease(&blk->lock.lock);
+				if (trace_enabled)
+					gcs_block_read_image_hop_trace(&trace, "reply.identity_refused",
+						!authorized ? "reply.authorized_chain"
+						: hdr->epoch < trace.expected_epoch ? "reply.epoch_minimum" : "reply.transition_exact");
 				return;
 			}
 			slot->reply_header = *hdr;
@@ -19926,10 +20369,16 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 			slot->reply_received = true;
 			ConditionVariableSignal(&slot->reply_cv);
 			LWLockRelease(&blk->lock.lock);
+			if (trace_enabled) {
+				trace.signal_called = true;
+				gcs_block_read_image_hop_trace(&trace, "reply.published", "none");
+			}
 			return;
 		}
 	}
 	LWLockRelease(&blk->lock.lock);
+	if (trace_enabled)
+		gcs_block_read_image_hop_trace(&trace, "reply.no_slot", "slot.exact_request");
 	/* No matching slot — stale/late reply; drop silently (HC74 semantics). */
 }
 
@@ -20176,6 +20625,8 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	bool sf_dep_valid = false;
 	bool sf_peer_v2 = false;
 	bool send_sf_dep = false;
+	bool trace_enabled = false;
+	GcsReadImageHopTrace trace;
 	uint32 header_len;
 	uint32 total;
 	char *buf;
@@ -20190,8 +20641,12 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		return;
 	if (gcs_block_try_r4_forward96(env, payload))
 		return;
-	if (env == NULL || payload == NULL || env->payload_length != sizeof(GcsBlockForwardPayload))
+	if (env == NULL || payload == NULL || env->payload_length != sizeof(GcsBlockForwardPayload)) {
+		gcs_block_read_image_ingress_reject_trace(env, payload, true, "holder.shape_refused",
+			env == NULL ? "forward.envelope_present"
+			: payload == NULL ? "forward.payload_present" : "forward.payload_size");
 		return;
+	}
 
 	cluster_sf_dep_vec_reset(&sf_dep_vec);
 	fwd = (const GcsBlockForwardPayload *)payload;
@@ -20217,9 +20672,11 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_received_count, 1);
 
 	/* HC75 transition_id range guard (same as request handler). */
-	if (fwd->transition_id < PCM_TRANS_N_TO_S || fwd->transition_id > PCM_TRANS_S_TO_X_CLEANOUT)
-		return; /* malformed, silently drop;  master
-								 * dedup TTL will sweep stale entry */
+	if (fwd->transition_id < PCM_TRANS_N_TO_S || fwd->transition_id > PCM_TRANS_S_TO_X_CLEANOUT) {
+		gcs_block_read_image_ingress_reject_trace(env, payload, true, "holder.transition_refused",
+			"forward.transition_range");
+		return; /* malformed; master dedup TTL will sweep stale entry */
+	}
 
 	/*
 	 * PGRAC: spec-6.12b + spec-7.3 D6 — CR-server request.  When the family is
@@ -20310,11 +20767,28 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	 * (e1 release-side) path untouched (§3.4b: never force the holder).
 	 * MUST branch before the ship-image copy below: a nudge ships nothing.
 	 */
+	/* Synthetic families returned above; this view is ordinary read-image only. */
+	trace_enabled = cluster_trace_normal_stop && GcsBlockForwardPayloadIsReadImage(fwd)
+		&& !GcsBlockForwardPayloadIsBastNudge(fwd);
+	if (trace_enabled) {
+		memset(&trace, 0, sizeof(trace));
+		trace.envelope_known = trace.forward_known = trace.tag_known = true;
+		trace.envelope_source = env->source_node_id;
+		trace.envelope_dest = env->dest_node_id;
+		trace.envelope_epoch = env->epoch;
+		trace.forward = *fwd;
+		trace.tag = fwd->tag;
+		trace.expected_scn = GcsBlockForwardPayloadGetExpectedPiWatermarkScn(fwd);
+		gcs_block_read_image_hop_trace(&trace, "holder.forward.received", "none");
+	}
+
 	if (cluster_shared_config
 		&& (GcsBlockForwardPayloadIsXTransfer(fwd)
 			|| !cluster_pcm_legacy_transition_allowed(true,
 													  (PcmLockTransition)fwd->transition_id))) {
 		gcs_block_forward_reply_immediate_deny(fwd);
+		if (trace_enabled)
+			gcs_block_read_image_hop_trace(&trace, "holder.legacy_refused", "legacy.transition_allowed");
 		return;
 	}
 
@@ -20375,9 +20849,16 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 				fwd->tag, fwd->master_node, &page_lsn, block_buf, &copy_refusal);
 		remote_downgraded = remote_downgrade_outcome == CLUSTER_BUFMGR_GCS_DOWNGRADE_COMMITTED;
 		cluster_lever_a_note_remote_downgrade(remote_downgraded);
+		if (trace_enabled) {
+			trace.downgrade_known = true;
+			trace.downgrade = remote_downgrade_outcome;
+		}
 	}
-	if (remote_downgrade_outcome == CLUSTER_BUFMGR_GCS_DOWNGRADE_FAILCLOSED_POST_NOTIFY)
+	if (remote_downgrade_outcome == CLUSTER_BUFMGR_GCS_DOWNGRADE_FAILCLOSED_POST_NOTIFY) {
+		if (trace_enabled)
+			gcs_block_read_image_hop_trace(&trace, "holder.post_notify_refused", "downgrade.post_notify");
 		return;
+	}
 
 	/* spec-2.35 D15 — SKIP simulates the evict race. */
 	if (holder_evicted_injected) {
@@ -20394,6 +20875,13 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 			fwd->tag, fwd->original_requester_node, true, &page_lsn, block_buf, &block_payload,
 			&block_payload_lkey, &block_payload_release_cb, &block_payload_release_arg, &sf_dep_vec,
 			&sf_dep_valid, &copy_refusal);
+
+	/* Copy results without logging while a ship-image callback may own a pin. */
+	if (trace_enabled) {
+		trace.copy_known = true;
+		trace.ship_ok = holder_ship_ok;
+		trace.copy_refusal = copy_refusal;
+	}
 
 	/* Build reply (header + 8KB block or zero pad) and direct-ship to
 	 * the original requester.  HC109 stores fwd->master_node in the
@@ -20437,6 +20925,13 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 			shipped_scn = InvalidScn;
 
 		verdict = gcs_block_lost_write_verdict(expected_scn, shipped_scn);
+		if (trace_enabled) {
+			trace.page_scn_known = trace.verdict_known = true;
+			trace.page_scn = ((PageHeader)block_payload)->pd_block_scn;
+			trace.expected_scn = expected_scn;
+			trace.verdict_input_scn = shipped_scn;
+			trace.verdict = verdict;
+		}
 
 		if (verdict == GCS_LOST_WRITE_FAIL_STALE || verdict == GCS_LOST_WRITE_FAIL_ANOMALY) {
 			/* S3 forensics step 1 — the (expected, shipped) verdict SCN pair is
@@ -20691,10 +21186,17 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		hdrv2->sf_dep_count = (uint8)n;
 	}
 
+	if (trace_enabled) {
+		trace.reply_known = true;
+		trace.reply = *hdr;
+	}
+
 	if (GcsBlockForwardPayloadIsDirectLandArmed(fwd)) {
+		bool direct_handled;
+
 		if (!GcsBlockReplyStatusIsDirectLandSendable((GcsBlockReplyStatus)hdr->status))
 			GCS_BLOCK_LOG_MASTER_NOT_HOLDER_FORWARD(fwd, "holder-direct-land-nonsendable");
-		(void)gcs_block_try_send_direct_reply(fwd->original_requester_node, true, hdr,
+		direct_handled = gcs_block_try_send_direct_reply(fwd->original_requester_node, true, hdr,
 											  holder_ship_ok ? block_payload : NULL,
 											  holder_ship_ok ? block_payload_lkey : 0,
 											  block_payload_release_cb, block_payload_release_arg);
@@ -20703,6 +21205,11 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		block_payload_release_cb = NULL;
 		block_payload_release_arg = NULL;
 		pfree(buf);
+		if (trace_enabled) {
+			trace.direct_handled_known = true;
+			trace.direct_handled = direct_handled;
+			gcs_block_read_image_hop_trace(&trace, "holder.reply.direct_return", "direct.handled");
+		}
 		return;
 	}
 
@@ -20734,20 +21241,31 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 			gcs_block_note_live_sge_send();
 		block_payload_release_cb = NULL;
 		block_payload_release_arg = NULL;
+		if (trace_enabled) {
+			trace.send_known = true;
+			trace.send_result = send_rc;
+		}
 	} else {
+		ClusterICSendResult send_rc;
+
 		gcs_block_release_ship_image(block_payload_release_cb, block_payload_release_arg);
 		block_payload_release_cb = NULL;
 		block_payload_release_arg = NULL;
-		cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY,
-											cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
-																	 fwd->original_requester_node,
-																	 buf, total));
+		send_rc = cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+										 fwd->original_requester_node, buf, total);
+		cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY, send_rc);
+		if (trace_enabled) {
+			trace.send_known = true;
+			trace.send_result = send_rc;
+		}
 	}
 	/* PGRAC: spec-5.59 D3 — close the holder-forward read-image ship scope
 	 * (no-op unless the read-image branch above started it). */
 	cluster_xp_end(&xp_fwd_ship);
 
 	pfree(buf);
+	if (trace_enabled)
+		gcs_block_read_image_hop_trace(&trace, "holder.reply.send_result", "none");
 }
 
 

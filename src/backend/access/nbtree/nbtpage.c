@@ -40,6 +40,9 @@
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: pre-lock identity transport and native versioned WAL producers. */
 #include "cluster/cluster_guc.h"
+#include "storage/buf_internals.h"
+#include "storage/proc.h"
+#include <time.h>
 #include "cluster/storage/cluster_smgr.h"
 #endif
 
@@ -1281,6 +1284,243 @@ _bt_pageinit(Page page, Size size)
 	PageInit(page, size, sizeof(BTPageOpaqueData));
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Bounded, backend-private producer observations.  No reusable permission. */
+typedef struct BtDeleteTrace {
+	bool enabled, tag_known, space_known;
+	BufferTag tag;
+	RelFileLocator requested_locator;
+	Oid relid;
+	ClusterSpaceIdentity space;
+	int ndeleted, nupdated, captured;
+	struct {
+		OffsetNumber offset;
+		bool posting_update;
+		uint16 removed_count, positions_captured;
+		uint16 positions[8];
+	} changes[32];
+	PGAlignedBlock before;
+} BtDeleteTrace;
+
+static bool
+_bt_delete_trace_shape(Page page, OffsetNumber *maxoff)
+{
+	PageHeader h = (PageHeader)page;
+
+	*maxoff = InvalidOffsetNumber;
+	if (page == NULL || PageGetPageSize(page) != BLCKSZ
+		|| h->pd_lower < SizeOfPageHeaderData || h->pd_lower > h->pd_upper
+		|| h->pd_upper > h->pd_special || h->pd_special > BLCKSZ
+		|| (h->pd_lower - SizeOfPageHeaderData) % sizeof(ItemIdData) != 0)
+		return false;
+	*maxoff = PageGetMaxOffsetNumber(page);
+	return *maxoff <= MaxIndexTuplesPerPage;
+}
+
+static void
+_bt_delete_trace_capture(BtDeleteTrace *view, Relation rel, Buffer buf, Page page,
+						 bool versioned, const ClusterSpaceIdentity *identity,
+						 OffsetNumber *deletable, int ndeletable,
+						 BTVacuumPosting *updatable, int nupdatable)
+{
+	int n = 0;
+
+	view->enabled = cluster_trace_normal_stop && versioned;
+	if (!view->enabled)
+		return;
+	memset(view, 0, sizeof(*view));
+	view->enabled = true;
+	view->requested_locator = rel->rd_locator;
+	view->relid = RelationGetRelid(rel);
+	view->tag_known = buf > 0 && buf <= NBuffers;
+	if (view->tag_known)
+		view->tag = GetBufferDescriptor(buf - 1)->tag;
+	view->space_known = identity != NULL;
+	if (identity != NULL)
+		view->space = *identity;
+	view->ndeleted = ndeletable;
+	view->nupdated = nupdatable;
+	/* Original caller owns this pinned, write-locked index page. */
+	memcpy(view->before.data, page, BLCKSZ);
+	for (int i = 0; i < ndeletable && n < lengthof(view->changes); i++, n++)
+		view->changes[n].offset = deletable[i];
+	for (int i = 0; i < nupdatable && n < lengthof(view->changes); i++, n++) {
+		view->changes[n].offset = updatable[i]->updatedoffset;
+		view->changes[n].posting_update = true;
+		view->changes[n].removed_count = updatable[i]->ndeletedtids;
+		view->changes[n].positions_captured
+			= Min(updatable[i]->ndeletedtids, lengthof(view->changes[n].positions));
+		for (int j = 0; j < view->changes[n].positions_captured; j++)
+			view->changes[n].positions[j] = updatable[i]->deletetids[j];
+	}
+	view->captured = n;
+}
+
+static void
+_bt_delete_trace_item(Page page, OffsetNumber off, const uint16 *positions, int npositions,
+					  char *item_out, Size item_size, char *removed_out, Size removed_size)
+{
+	OffsetNumber maxoff;
+	ItemId item;
+	IndexTupleData tuple;
+	Size start, len, tuple_size, posting_offset = 0;
+	uint16 posting_count = 0;
+	bool posting, pivot, posting_shape = false, heap_tid_known;
+
+	strlcpy(item_out, "item_known=0", item_size);
+	strlcpy(removed_out, "unknown", removed_size);
+	if (!_bt_delete_trace_shape(page, &maxoff)
+		|| off < FirstOffsetNumber || off > maxoff)
+		return;
+	item = PageGetItemId(page, off);
+	start = ItemIdGetOffset(item);
+	len = ItemIdGetLength(item);
+	/* Index LP_DEAD items can still own their original tuple storage. */
+	if (!ItemIdHasStorage(item) || len < sizeof(tuple)
+		|| start < ((PageHeader)page)->pd_upper || start > ((PageHeader)page)->pd_special
+		|| len > ((PageHeader)page)->pd_special - start) {
+		snprintf(item_out, item_size, "item_known=1 lp=%u tuple_known=0", item->lp_flags);
+		return;
+	}
+	memcpy(&tuple, page + start, sizeof(tuple));
+	tuple_size = IndexTupleSize(&tuple);
+	if (tuple_size < sizeof(tuple) || tuple_size > len) {
+		snprintf(item_out, item_size, "item_known=1 lp=%u tuple_known=0", item->lp_flags);
+		return;
+	}
+	posting = BTreeTupleIsPosting(&tuple);
+	pivot = BTreeTupleIsPivot(&tuple);
+	heap_tid_known = !posting && !pivot && ItemPointerIsValid(&tuple.t_tid);
+	if (posting) {
+		posting_count = BTreeTupleGetNPosting(&tuple);
+		posting_offset = BTreeTupleGetPostingOffset(&tuple);
+		posting_shape = posting_count > 1 && posting_offset >= sizeof(tuple)
+			&& posting_offset <= tuple_size
+			&& posting_count <= (tuple_size - posting_offset) / sizeof(ItemPointerData);
+	}
+	snprintf(item_out, item_size,
+			 "item_known=1 lp=%u tuple_known=1 storage_off=%zu storage_len=%zu "
+			 "tuple_size=%zu posting=%d posting_shape_known=%d posting_count=%u pivot=%d "
+			 "heap_tid_known=%d heap_tid=%u/%u raw_index_tid=%u/%u",
+			 item->lp_flags, start, len, tuple_size, posting, posting_shape, posting_count, pivot,
+			 heap_tid_known, heap_tid_known ? ItemPointerGetBlockNumberNoCheck(&tuple.t_tid) : 0,
+			 heap_tid_known ? ItemPointerGetOffsetNumberNoCheck(&tuple.t_tid) : 0,
+			 ItemPointerGetBlockNumberNoCheck(&tuple.t_tid),
+			 ItemPointerGetOffsetNumberNoCheck(&tuple.t_tid));
+	if (!posting_shape)
+		return;
+	removed_out[0] = '\0';
+	for (int i = 0; i < npositions; i++) {
+		ItemPointerData tid;
+		Size used = strlen(removed_out);
+
+		if (positions[i] >= posting_count) {
+			snprintf(removed_out + used, removed_size - used, "%s%u:unknown",
+					 i ? "," : "", positions[i]);
+			continue;
+		}
+		memcpy(&tid, page + start + posting_offset + positions[i] * sizeof(tid), sizeof(tid));
+		snprintf(removed_out + used, removed_size - used, "%s%u:%u/%u",
+				 i ? "," : "", positions[i], ItemPointerGetBlockNumberNoCheck(&tid),
+				 ItemPointerGetOffsetNumberNoCheck(&tid));
+	}
+}
+
+static void
+_bt_delete_trace_emit(const char *event, const BtDeleteTrace *view, Page after,
+					  bool needswal, bool horizon_known, TransactionId horizon)
+{
+	static uint64 event_seq, critical_skipped;
+	uint64 operation_seq, mono_us = 0;
+	struct timespec now;
+	OffsetNumber before_max, after_max;
+	bool before_shape, after_shape;
+	XLogRecPtr after_lsn;
+	uint64 after_scn;
+	char storage_uuid[33], incarnation[33];
+	static const char hex[] = "0123456789abcdef";
+
+	if (!view->enabled)
+		return;
+	if (CritSectionCount != 0) {
+		if (critical_skipped != UINT64_MAX)
+			critical_skipped++;
+		return;
+	}
+	before_shape = _bt_delete_trace_shape((Page)view->before.data, &before_max);
+	after_shape = _bt_delete_trace_shape(after, &after_max);
+	after_lsn = PageGetLSN(after);
+	after_scn = ((PageHeader)after)->pd_block_scn;
+	if (event_seq != UINT64_MAX)
+		event_seq++;
+	operation_seq = event_seq;
+	if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
+		mono_us = (uint64)now.tv_sec * UINT64_C(1000000) + now.tv_nsec / 1000;
+	for (int i = 0; i < 16; i++) {
+		storage_uuid[i * 2] = hex[view->space.key.storage_uuid[i] >> 4];
+		storage_uuid[i * 2 + 1] = hex[view->space.key.storage_uuid[i] & 15];
+		incarnation[i * 2] = hex[view->space.incarnation[i] >> 4];
+		incarnation[i * 2 + 1] = hex[view->space.incarnation[i] & 15];
+	}
+	storage_uuid[32] = incarnation[32] = '\0';
+	/*
+	 * Post-critical and after the original temporary frees.  The original
+	 * caller still owns its index lock/pin; observation must not release them.
+	 * A LOG ERROR follows the original caller's error/ResourceOwner path.
+	 */
+	ereport(LOG, (errmsg_internal(
+		"PGRAC_FAMILY=R4_BTREE_DELETE event=%s event_seq=" UINT64_FORMAT
+		" operation_seq=" UINT64_FORMAT " node=%d pid=%d procno=%d backend=%d role=%d "
+		"emit_wall_us=" INT64_FORMAT " emit_mono_us=" UINT64_FORMAT
+		" relid=%u requested_locator=%u/%u/%u actual_tag_known=%d actual_tag=%u/%u/%u/%d/%u "
+		"space_known=%d space_system=" UINT64_FORMAT " database_incarnation=" UINT64_FORMAT
+		" storage_uuid=%s space_incarnation=%s space_sequence=" UINT64_FORMAT
+		" space_operation=" UINT64_FORMAT " space_state=%d "
+		"before_shape=%d after_shape=%d before_maxoff=%u after_maxoff=%u "
+		"before_lsn=" UINT64_FORMAT " after_lsn=" UINT64_FORMAT
+		" before_scn=" UINT64_FORMAT " after_scn=" UINT64_FORMAT
+		"conflict_horizon_known=%d conflict_horizon=%u ndeleted=%d nupdated=%d captured=%d omitted=%d "
+		"wal_required=%d inserted_lsn_known=%d inserted_lsn=" UINT64_FORMAT
+		" caller_index_lock_retained=1 caller_cleanup_known=0 new_offset_mapping_known=0 "
+		"authoritative=0 wal_flush_known=0 boot_known=0 process_incarnation_known=0 "
+		"trace_critical_skipped=" UINT64_FORMAT " trace_sequence_exhausted=%d",
+		event, event_seq, operation_seq, cluster_node_id, MyProcPid,
+		MyProc != NULL ? MyProc->pgprocno : -1, (int)MyBackendId, (int)MyBackendType,
+		GetCurrentTimestamp(), mono_us, view->relid, view->requested_locator.spcOid,
+		view->requested_locator.dbOid, view->requested_locator.relNumber, view->tag_known,
+		view->tag.spcOid, view->tag.dbOid, view->tag.relNumber, view->tag.forkNum, view->tag.blockNum,
+		view->space_known, view->space.key.system_identifier, view->space.key.database_incarnation,
+		storage_uuid, incarnation, view->space.sequence, view->space.operation, view->space.state,
+		before_shape, after_shape, before_max, after_max,
+		(uint64)PageGetLSN((Page)view->before.data), (uint64)after_lsn,
+		(uint64)((PageHeader)view->before.data)->pd_block_scn, after_scn,
+		horizon_known, horizon, view->ndeleted, view->nupdated, view->captured,
+		view->ndeleted + view->nupdated - view->captured, needswal, needswal,
+		needswal ? (uint64)after_lsn : 0, critical_skipped, event_seq == UINT64_MAX)));
+	for (int i = 0; i < view->captured; i++) {
+		char item[512], removed[256];
+
+		_bt_delete_trace_item((Page)view->before.data, view->changes[i].offset,
+							 view->changes[i].positions, view->changes[i].positions_captured,
+							 item, sizeof(item), removed, sizeof(removed));
+		if (event_seq != UINT64_MAX)
+			event_seq++;
+		ereport(LOG, (errmsg_internal(
+			"PGRAC_FAMILY=R4_BTREE_DELETE event=index.item event_seq=" UINT64_FORMAT
+			" operation_seq=" UINT64_FORMAT " node=%d pid=%d item_ordinal=%d item_events_expected=%d "
+			"old_index_offset=%u change=%s before={%s} removed_count=%u positions_captured=%u "
+			"positions_omitted=%u removed={%s} new_offset_mapping_known=0 authoritative=0 "
+			"trace_sequence_exhausted=%d",
+			event_seq, operation_seq, cluster_node_id, MyProcPid, i + 1, view->captured,
+			view->changes[i].offset, view->changes[i].posting_update ? "posting_update" : "delete",
+			item, view->changes[i].removed_count, view->changes[i].positions_captured,
+			view->changes[i].removed_count - view->changes[i].positions_captured, removed,
+			event_seq == UINT64_MAX)));
+	}
+}
+#endif
+
+
 /*
  * Delete item(s) from a btree leaf page during VACUUM.
  *
@@ -1317,11 +1557,16 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 	OffsetNumber updatedoffsets[MaxIndexTuplesPerPage];
 #ifdef USE_PGRAC_CLUSTER
 	RfPageProducerBatchV1 version_batch;
+	BtDeleteTrace trace;
 	bool		versioned = _bt_prepare_page_version(rel, buf, identity, &version_batch);
 #endif
 
 	/* Shouldn't be called unless there's something to do */
 	Assert(ndeletable > 0 || nupdatable > 0);
+#ifdef USE_PGRAC_CLUSTER
+	_bt_delete_trace_capture(&trace, rel, buf, page, versioned, identity,
+		deletable, ndeletable, updatable, nupdatable);
+#endif
 
 	/* Generate new version of posting lists without deleted TIDs */
 	if (nupdatable > 0)
@@ -1427,6 +1672,11 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 	/* free tuples allocated within _bt_delitems_update() */
 	for (int i = 0; i < nupdatable; i++)
 		pfree(updatable[i]->itup);
+#ifdef USE_PGRAC_CLUSTER
+	if (trace.enabled)
+		_bt_delete_trace_emit("vacuum.applied", &trace, page, needswal,
+			false, InvalidTransactionId);
+#endif
 }
 
 /*
@@ -1465,11 +1715,16 @@ _bt_delitems_delete(Relation rel, Buffer buf,
 	OffsetNumber updatedoffsets[MaxIndexTuplesPerPage];
 #ifdef USE_PGRAC_CLUSTER
 	RfPageProducerBatchV1 version_batch;
+	BtDeleteTrace trace;
 	bool		versioned = _bt_prepare_page_version(rel, buf, identity, &version_batch);
 #endif
 
 	/* Shouldn't be called unless there's something to do */
 	Assert(ndeletable > 0 || nupdatable > 0);
+#ifdef USE_PGRAC_CLUSTER
+	_bt_delete_trace_capture(&trace, rel, buf, page, versioned, identity,
+		deletable, ndeletable, updatable, nupdatable);
+#endif
 
 	/* Generate new versions of posting lists without deleted TIDs */
 	if (nupdatable > 0)
@@ -1562,6 +1817,11 @@ _bt_delitems_delete(Relation rel, Buffer buf,
 	/* free tuples allocated within _bt_delitems_update() */
 	for (int i = 0; i < nupdatable; i++)
 		pfree(updatable[i]->itup);
+#ifdef USE_PGRAC_CLUSTER
+	if (trace.enabled)
+		_bt_delete_trace_emit("delete.applied", &trace, page, needswal,
+			true, snapshotConflictHorizon);
+#endif
 }
 
 /*

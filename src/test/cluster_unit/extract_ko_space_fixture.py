@@ -8,7 +8,8 @@ import sys
 from extract_vacuum_mx_fixture import function
 root = pathlib.Path(sys.argv[1])
 space = (root / "cluster/cluster_space_storage.c").read_text()
-for name, result in [("space_namespace", "static bool"),
+for name, result in [("space_namespace_capture", "static bool"),
+                     ("space_namespace", "static bool"),
                      ("space_read_identity_buffer", "static Buffer"),
                      ("space_read_locked_identity", "static bool"),
                      ("space_read_identity", "static bool"),

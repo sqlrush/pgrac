@@ -37,6 +37,8 @@
 #include "access/xact.h"	   /* spec-3.19 D3: TransactionIdIsCurrentTransactionId */
 #include "storage/procarray.h" /* spec-3.19 D3: TransactionIdIsInProgress */
 #include "miscadmin.h"
+#include "portability/instr_time.h"
+#include "utils/timestamp.h"
 #include "port/atomics.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
@@ -360,6 +362,175 @@ StaticAssertDecl(CLUSTER_ITL_INITRANS_DEFAULT <= 8,
 
 static ClusterR4CrBuildContext CrR4BuildContexts[CLUSTER_LMS_CR_SLOTS];
 
+/* One builder call's operands, never a shared/wire carrier or authority. */
+typedef struct CrR4UndoTrace {
+	uint32 slot_index;
+	const ClusterR4CrSlotExtension *extension;
+	const ClusterR4CrBuildContext *context;
+	Page page;
+	ClusterTxLocator locator;
+	UBA uba;
+	UndoRecordHeader record;
+	Size record_length;
+	bool locator_known, uba_known, read_returned, record_header_known, resident_foreign;
+	int apply_record, locator_reason;
+} CrR4UndoTrace;
+
+/* Owned byte projections only. The original server PG_TRY catches LOG ERROR
+ * and terminalizes its exact builder key. No LOG is added to error cleanup. */
+static void
+cr_r4_undo_trace(const CrR4UndoTrace *v, const char *event, const char *predicate, int outcome)
+{
+	static uint64 event_seq, critical_skipped;
+	const ClusterR4CrSlotExtension *e;
+	const ClusterR4CrBuildContext *c;
+	const BufferTag *tag;
+	UndoRecordHeader empty_record = {0};
+	ClusterTxLocator empty_locator = {0};
+	const UndoRecordHeader *r;
+	const ClusterTxLocator *l;
+	PageHeader page;
+	ClusterItlSlotData slot = {0};
+	ClusterItlPageHeader itl_header = {0};
+	HeapTupleHeaderData tuple = {0};
+	bool page_known, slot_known, item_known = false, tuple_known = false;
+	bool uba_decoded, locator_reason_known = false;
+	uint32 segment = 0, block = 0;
+	uint16 tt_offset = 0, row_offset = 0;
+	unsigned item_flags = 0;
+	Size item_offset = 0, item_length = 0;
+	instr_time now;
+
+	if (v == NULL || !cluster_trace_normal_stop)
+		return;
+	if (CritSectionCount != 0) {
+		if (critical_skipped != UINT64_MAX) critical_skipped++;
+		return;
+	}
+	e = v->extension; c = v->context; tag = &e->route_proof.tag;
+	r = v->record_header_known ? &v->record : &empty_record;
+	l = v->locator_known ? &v->locator : &empty_locator;
+	page = (PageHeader)v->page;
+	page_known = PageHasItl(v->page) && page->pd_lower >= SizeOfPageHeaderData
+		&& page->pd_lower <= page->pd_upper && page->pd_upper <= page->pd_special
+		&& page->pd_special <= BLCKSZ && BLCKSZ - page->pd_special >= CLUSTER_ITL_SPECIAL_SIZE
+		&& PageGetMaxOffsetNumber(v->page) <= MaxHeapTuplesPerPage;
+	slot_known = page_known && v->locator_known && l->itl_slot_index < CLUSTER_ITL_INITRANS_DEFAULT;
+	if (page_known)
+		memcpy(&itl_header, (char *)v->page + page->pd_special + CLUSTER_ITL_ARRAY_SIZE,
+			   sizeof(itl_header));
+	if (slot_known)
+		memcpy(&slot, (char *)v->page + page->pd_special + l->itl_slot_index * sizeof(slot),
+			   sizeof(slot));
+	if (page_known && v->record_header_known
+		&& r->target_locator.spcOid == tag->spcOid && r->target_locator.dbOid == tag->dbOid
+		&& r->target_locator.relNumber == tag->relNumber && r->target_fork == tag->forkNum
+		&& r->target_block == tag->blockNum && r->target_offset >= FirstOffsetNumber
+		&& r->target_offset <= PageGetMaxOffsetNumber(v->page)) {
+		ItemId item = PageGetItemId(v->page, r->target_offset);
+
+		item_known = true; item_flags = item->lp_flags;
+		item_offset = ItemIdGetOffset(item); item_length = ItemIdGetLength(item);
+		if (ItemIdIsNormal(item) && item_length >= SizeofHeapTupleHeader
+			&& item_offset >= page->pd_upper && item_offset <= page->pd_special
+			&& item_length <= page->pd_special - item_offset) {
+			memcpy(&tuple, (char *)v->page + item_offset, SizeofHeapTupleHeader);
+			tuple_known = tuple.t_hoff >= SizeofHeapTupleHeader && tuple.t_hoff <= item_length;
+		}
+	}
+	/* Reclassify only copied scalar guards; never re-run the native validator. */
+	if (strcmp(predicate, "RECORD_VALIDATION") == 0 && v->record_header_known) {
+		if (v->record_length != sizeof(*r) + r->payload_length) predicate = "RECORD_LENGTH";
+		else if ((r->flags & ~UNDO_REC_FLAG_HAS_ITL_HISTORY)
+				 != (UBA_is_invalid(r->prev_uba) ? UNDO_REC_FLAG_FIRST_IN_TX : 0))
+			predicate = "RECORD_FLAGS";
+		else if (!SCN_VALID(r->write_scn)) predicate = "RECORD_SCN";
+		else {
+			predicate = c->have_previous ? "PREVIOUS_EDGE_IDENTITY" : "HEAD_IDENTITY";
+			locator_reason_known = v->locator_reason >= 0;
+		}
+	} else if (strcmp(event, "record.validated") == 0)
+		locator_reason_known = v->locator_reason >= 0;
+	uba_decoded = v->uba_known && uba_decode(v->uba, &segment, &block, &tt_offset, &row_offset);
+	if (event_seq != UINT64_MAX) event_seq++;
+	INSTR_TIME_SET_CURRENT(now);
+	ereport(LOG, (errmsg_internal(
+		"PGRAC_FAMILY=R4_UNDO event=%s predicate=%s outcome=%d "
+		"event_seq=" UINT64_FORMAT " sequence_scope=process sequence_domain=R4_UNDO "
+		"node_id=%d pid=%d wall_us=" INT64_FORMAT " monotonic_us=" UINT64_FORMAT
+		" identity_source=run_manifest run_id_known=0 boot_identity_known=0 "
+		"process_incarnation_known=0 request_id_known=0 root_identity_known=0 full_xid_known=0 "
+		"authoritative=0 transport_receipt=0 "
+		"slot=%u slot_generation=" UINT64_FORMAT " builder_incarnation=" UINT64_FORMAT
+		" builder_pid=%d builder_worker=%u edge_incarnation=" UINT64_FORMAT
+		" edge_pid=%d edge_worker=%u edge_role=%u "
+		"spc=%u db=%u rel=%u fork=%d block=%u read_scn=" UINT64_FORMAT
+		" formation_epoch=" UINT64_FORMAT " activation_generation=" UINT64_FORMAT
+		" master_authority_generation=" UINT64_FORMAT " master_transition=" UINT64_FORMAT
+		" real_master=%d selected_holder=%d expected_page_scn=" UINT64_FORMAT
+		" copied_page_lsn=" UINT64_FORMAT " copied_page_scn=" UINT64_FORMAT
+		" candidate_cursor=%u candidate_count=%u covered_mask=%u record_format=%u "
+		"build_steps=%u max_steps=%u visited=%u have_previous=%d "
+		"locator_scope=operation_copy locator_known=%d locator_xid=%u locator_tt_wrap=%u "
+		"locator_itl_kind=%u locator_itl_slot=%u locator_uba=" UINT64_FORMAT "/" UINT64_FORMAT
+		" uba_known=%d uba=" UINT64_FORMAT "/" UINT64_FORMAT
+		" uba_decoded=%d uba_segment=%u uba_block=%u uba_tt_offset=%u uba_row_offset=%u "
+		"foreign_request_id=" UINT64_FORMAT " origin_formation_epoch=" UINT64_FORMAT
+		" origin_tt_generation=" UINT64_FORMAT " origin_authority_scn=" UINT64_FORMAT
+		" record_source=%s read_return_known=%d record_length=%zu record_header_known=%d "
+		"record_type=%u record_flags=%u record_payload_length=%u record_xid=%u "
+		"record_origin=%u record_tt_segment=%u record_tt_slot=%u record_tt_wrap_plus1=%u "
+		"record_write_scn=" UINT64_FORMAT " record_prev=" UINT64_FORMAT "/" UINT64_FORMAT
+		" target_spc=%u target_db=%u target_rel=%u target_fork=%d target_block=%u target_offset=%u "
+		"image_scope=owned_builder page_known=%d page_lsn=" UINT64_FORMAT
+		" page_scn=" UINT64_FORMAT " page_watermark=" UINT64_FORMAT
+		" page_itl_known=%d page_itl_xid=%u page_itl_wrap=%u page_itl_flags=%u "
+		"page_itl_write_scn=" UINT64_FORMAT " page_itl_uba=" UINT64_FORMAT "/" UINT64_FORMAT
+		" target_item_known=%d target_item_flags=%u target_item_offset=%zu target_item_length=%zu "
+		"target_tuple_known=%d tuple_xmin=%u tuple_xmax=%u tuple_ctid=%u/%u tuple_mask=%u/%u "
+		"apply_record=%d locator_reason_known=%d locator_reason=%d "
+		"trace_critical_skipped=" UINT64_FORMAT " trace_sequence_exhausted=%d",
+		event, predicate, outcome, event_seq, cluster_node_id, MyProcPid,
+		(int64)GetCurrentTimestamp(), (uint64)INSTR_TIME_GET_MICROSEC(now),
+		v->slot_index, e->slot_generation, e->owner.builder_incarnation,
+		e->owner.builder_pid, e->owner.builder_worker_id, e->owner.edge_owner_incarnation,
+		e->owner.edge_owner_pid, e->owner.edge_owner_worker_id, e->owner.edge_owner_role,
+		tag->spcOid, tag->dbOid, tag->relNumber, tag->forkNum, tag->blockNum,
+		(uint64)e->route_proof.read_scn, e->route_proof.formation_epoch,
+		e->route_proof.activation_generation, e->route_proof.master_authority_generation,
+		e->route_proof.master_resource_transition_count, e->route_proof.real_master_node,
+		e->route_proof.selected_holder_node, (uint64)e->route_proof.expected_page_scn,
+		(uint64)e->copied_page_lsn, (uint64)e->copied_page_scn,
+		c->candidate_cursor, c->candidate_count, c->covered_candidate_mask, c->record_format,
+		e->build_steps, c->max_steps, c->visited_count, c->have_previous,
+		v->locator_known, l->xid, l->tt_wrap, l->itl_kind, l->itl_slot_index,
+		l->uba.raw[0], l->uba.raw[1], v->uba_known,
+		v->uba_known ? v->uba.raw[0] : (uint64)0, v->uba_known ? v->uba.raw[1] : (uint64)0,
+		uba_decoded, segment, block, tt_offset, row_offset,
+		e->foreign_request_id, e->origin_formation_epoch, e->origin_tt_generation,
+		(uint64)e->origin_authority_scn,
+		!v->read_returned ? "unread" : v->resident_foreign ? "resident_foreign_copy" : "local_copy",
+		v->read_returned, v->read_returned ? v->record_length : (Size)0,
+		v->record_header_known, r->record_type, r->flags, r->payload_length, r->xid,
+		r->origin_node_id, r->tt_slot_segment_id, r->tt_slot_id, r->tt_wrap_plus1,
+		(uint64)r->write_scn, r->prev_uba.raw[0], r->prev_uba.raw[1],
+		r->target_locator.spcOid, r->target_locator.dbOid, r->target_locator.relNumber,
+		r->target_fork, r->target_block, r->target_offset,
+		page_known, page_known ? (uint64)PageGetLSN(v->page) : (uint64)0,
+		page_known ? (uint64)page->pd_block_scn : (uint64)0,
+		(uint64)itl_header.itl_recycle_watermark_scn, slot_known, slot.xid, slot.wrap, slot.flags,
+		(uint64)slot.write_scn, slot.undo_segment_head.raw[0], slot.undo_segment_head.raw[1],
+		item_known, item_flags, item_offset, item_length,
+		tuple_known, tuple_known ? HeapTupleHeaderGetRawXmin(&tuple) : 0,
+		tuple_known ? HeapTupleHeaderGetRawXmax(&tuple) : 0,
+		tuple_known ? ItemPointerGetBlockNumberNoCheck(&tuple.t_ctid) : 0,
+		tuple_known ? ItemPointerGetOffsetNumberNoCheck(&tuple.t_ctid) : 0,
+		tuple_known ? tuple.t_infomask : 0, tuple_known ? tuple.t_infomask2 : 0,
+		v->apply_record, locator_reason_known, locator_reason_known ? v->locator_reason : -1,
+		critical_skipped, event_seq == UINT64_MAX)));
+}
+
+
 /*
  * spec-5.54 D2: a SEPARATE backend-local scratch page for the tuple-level
  * verdict-only fast path, distinct from cr_scratch so the fast path never shares
@@ -617,6 +788,7 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 								ClusterCrBuildReason *reason_out)
 {
 	ClusterR4CrBuildContext *context;
+	CrR4UndoTrace trace_storage, *trace = NULL;
 	PageHeader page_header;
 	bool supplied_foreign_record;
 	int candidate_count = 0;
@@ -647,15 +819,27 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 	} else if (foreign_undo_ready)
 		return CLUSTER_R4_CR_STEP_FAIL;
 
+	if (cluster_trace_normal_stop) {
+		memset(&trace_storage, 0, sizeof(trace_storage));
+		trace = &trace_storage;
+		trace->slot_index = slot_index;
+		trace->extension = extension;
+		trace->context = context;
+		trace->page = (Page)result_page;
+		trace->apply_record = trace->locator_reason = -1;
+	}
+
 	page_header = (PageHeader)result_page;
 	if (!PageHasItl((Page)result_page) || page_header->pd_lower < SizeOfPageHeaderData
 		|| page_header->pd_lower > page_header->pd_upper
 		|| page_header->pd_upper > page_header->pd_special
 		|| page_header->pd_special < SizeOfPageHeaderData || page_header->pd_special > BLCKSZ
 		|| BLCKSZ - page_header->pd_special < CLUSTER_ITL_SPECIAL_SIZE) {
+		cr_r4_undo_trace(trace, "build.reject", "PAGE_LAYOUT", 0);
 		*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 		return CLUSTER_R4_CR_STEP_FAIL;
 	}
+
 
 	if (!context->in_use) {
 		SCN recycle_watermark_scn
@@ -666,6 +850,7 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 		if (SCN_VALID(recycle_watermark_scn)
 			&& scn_time_cmp(recycle_watermark_scn, extension->route_proof.read_scn) > 0) {
 			*reason_out = CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD;
+			cr_r4_undo_trace(trace, "build.reject", "PAGE_WATERMARK", 0);
 			cr_r4_history_refusal_log("PAGE_WATERMARK", slot_index, extension,
 									  recycle_watermark_scn, NULL, InvalidTransactionId);
 			return CLUSTER_R4_CR_STEP_FAIL;
@@ -683,6 +868,7 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 		context->in_use = true;
 
 		if (candidate_count == 0) {
+			cr_r4_undo_trace(trace, "build.full", "ZERO_CANDIDATES", 1);
 			*reason_out = CLUSTER_CR_BUILD_NONE;
 			return CLUSTER_R4_CR_STEP_FULL;
 		}
@@ -691,6 +877,7 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 
 			if (!cluster_tx_locator_from_itl((Page)result_page, context->candidates[i].slot_idx,
 											 &context->locators[i], &locator_reason)) {
+				cr_r4_undo_trace(trace, "build.reject", "CANDIDATE_LOCATOR", 0);
 				*reason_out = CLUSTER_CR_BUILD_BAD_LOCATOR;
 				return CLUSTER_R4_CR_STEP_FAIL;
 			}
@@ -699,6 +886,7 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 			context->locators[i].tt_wrap = TT_WRAP_INVALID;
 		}
 		if (cluster_cr_chain_walk_max_steps <= 0) {
+			cr_r4_undo_trace(trace, "build.reject", "CHAIN_LIMIT_CONFIG", 0);
 			*reason_out = CLUSTER_CR_BUILD_CHAIN_LIMIT;
 			return CLUSTER_R4_CR_STEP_FAIL;
 		}
@@ -706,6 +894,7 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 		context->visited_ubas
 			= MemoryContextAllocZero(TopMemoryContext, sizeof(UBA) * (Size)context->max_steps);
 	}
+	cr_r4_undo_trace(trace, "build.begin", "FROZEN_CONTEXT", -1);
 	supplied_foreign_record = foreign_undo_ready;
 
 	while (context->candidate_cursor < context->candidate_count) {
@@ -739,13 +928,24 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 			uint16 foreign_tt_offset;
 			uint16 foreign_row;
 
+			if (trace != NULL) {
+				trace->locator = *locator;
+				trace->locator_known = trace->uba_known = true;
+				trace->uba = current_uba;
+				trace->read_returned = trace->record_header_known = false;
+				trace->record_length = 0;
+				trace->resident_foreign = record_from_foreign_page;
+				trace->apply_record = trace->locator_reason = -1;
+			}
 			origin = uba_origin_node_id(current_uba);
 			if (origin == InvalidNodeId) {
+				cr_r4_undo_trace(trace, "undo.reject", "UBA_ORIGIN", 0);
 				*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 				return CLUSTER_R4_CR_STEP_FAIL;
 			}
 			if (!record_from_foreign_page) {
 				if (extension->build_steps >= context->max_steps) {
+					cr_r4_undo_trace(trace, "undo.reject", "CHAIN_LIMIT", 0);
 					*reason_out = CLUSTER_CR_BUILD_CHAIN_LIMIT;
 					return CLUSTER_R4_CR_STEP_FAIL;
 				}
@@ -753,6 +953,7 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 				for (visited_index = 0; visited_index < context->visited_count; visited_index++) {
 					if (cluster_undo_record_uba_equal(context->visited_ubas[visited_index],
 													  current_uba)) {
+						cr_r4_undo_trace(trace, "undo.reject", "VISITED_UBA", 0);
 						*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 						return CLUSTER_R4_CR_STEP_FAIL;
 					}
@@ -798,14 +999,17 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 				context->pending_locator = *locator;
 				context->pending_locator.uba = current_uba;
 				context->pending_locator_valid = true;
+				cr_r4_undo_trace(trace, "undo.need", "PREPARED_FOREIGN_REQUEST", -1);
 				*reason_out = CLUSTER_CR_BUILD_NONE;
 				return CLUSTER_R4_CR_STEP_NEED_UNDO;
 			}
 			if (origin == (NodeId)cluster_node_id && record_from_foreign_page) {
+				cr_r4_undo_trace(trace, "undo.reject", "LOCAL_ORIGIN_FOREIGN_PAGE", 0);
 				*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 				return CLUSTER_R4_CR_STEP_FAIL;
 			}
 
+			cr_r4_undo_trace(trace, "undo.read.begin", "COPY_BOUNDARY", -1);
 			if (record_from_foreign_page) {
 				record_length = 0;
 				if (cluster_cr_r4_extract_resident_record(
@@ -820,7 +1024,18 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 			} else
 				record_length = cluster_undo_get_record(current_uba, record_buffer.data,
 														sizeof(record_buffer.data));
+			if (trace != NULL) {
+				trace->locator = *locator;
+				trace->read_returned = true;
+				trace->record_length = record_length;
+				trace->record_header_known = record_length >= sizeof(UndoRecordHeader)
+					&& record_length <= sizeof(record_buffer.data);
+				if (trace->record_header_known)
+					memcpy(&trace->record, record_buffer.data, sizeof(trace->record));
+			}
+			cr_r4_undo_trace(trace, "undo.read.end", "COPIED_BYTES_UNVALIDATED", -1);
 			if (record_length == 0) {
+				cr_r4_undo_trace(trace, "record.missing", "COPY_RETURNED_ZERO", 0);
 				*reason_out = record_from_foreign_page ? CLUSTER_CR_BUILD_BAD_UNDO
 													   : CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD;
 				if (!record_from_foreign_page)
@@ -831,6 +1046,7 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 				return CLUSTER_R4_CR_STEP_FAIL;
 			}
 			if (record_length < sizeof(UndoRecordHeader)) {
+				cr_r4_undo_trace(trace, "record.header.reject", "SHORT_HEADER", 0);
 				*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 				return CLUSTER_R4_CR_STEP_FAIL;
 			}
@@ -841,17 +1057,21 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 					= (record->flags & UNDO_REC_FLAG_HAS_ITL_HISTORY) != 0 ? 2 : 1;
 			if (((record->flags & UNDO_REC_FLAG_HAS_ITL_HISTORY) != 0)
 				!= (context->record_format == 2)) {
+				cr_r4_undo_trace(trace, "record.format.reject", "MIXED_RECORD_FORMAT", 0);
 				*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 				return CLUSTER_R4_CR_STEP_FAIL;
 			}
 			if (!context->have_previous && locator->tt_wrap == TT_WRAP_INVALID) {
 				if (!cr_r4_canonical_record_locator(locator, current_uba, record,
 													&canonical_locator)) {
+					cr_r4_undo_trace(trace, "record.canonical.reject", "CANONICAL_LOCATOR", 0);
 					*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 					return CLUSTER_R4_CR_STEP_FAIL;
 				}
 				*locator = canonical_locator;
 			}
+			if (trace != NULL)
+				trace->locator = *locator;
 			if (record_length != sizeof(UndoRecordHeader) + record->payload_length
 				|| (record->flags & ~UNDO_REC_FLAG_HAS_ITL_HISTORY)
 					   != (terminal ? UNDO_REC_FLAG_FIRST_IN_TX : 0)
@@ -862,16 +1082,25 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 												 record, &locator_reason)
 										   : !cluster_undo_record_validate_identity(
 												 locator, current_uba, record, &locator_reason))) {
+				if (trace != NULL)
+					trace->locator_reason = (int)locator_reason;
+				cr_r4_undo_trace(trace, "record.validate.reject", "RECORD_VALIDATION", 0);
 				*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 				return CLUSTER_R4_CR_STEP_FAIL;
 			}
+			if (trace != NULL)
+				trace->locator_reason = (int)locator_reason;
+			cr_r4_undo_trace(trace, "record.validated", "ORIGINAL_VALIDATOR_RETURN_TRUE", 1);
 			if (context->record_format == 2) {
+				cr_r4_undo_trace(trace, "history.inverse.begin", "PAGE_HISTORY", -1);
 				if (!cluster_cr_history_inverse(
 						result_page, &extension->route_proof.tag, locator, current_uba, record,
 						record_buffer.data + sizeof(*record), record->payload_length)) {
+					cr_r4_undo_trace(trace, "history.inverse.reject", "INVERSE_RETURN_FALSE", 0);
 					*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 					return CLUSTER_R4_CR_STEP_FAIL;
 				}
+				cr_r4_undo_trace(trace, "history.inverse.end", "INVERSE_RETURN_TRUE", 1);
 				if (record_from_foreign_page) {
 					cr_r4_clear_foreign_request(extension, context);
 					supplied_foreign_record = false;
@@ -893,6 +1122,9 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 						  record->target_block);
 			apply_record
 				= !horizon_reached && BufferTagsEqual(&target_tag, &extension->route_proof.tag);
+			if (trace != NULL)
+				trace->apply_record = apply_record;
+			cr_r4_undo_trace(trace, "legacy.inspect", "VALIDATED_RECORD", -1);
 			switch (record->record_type) {
 			case UNDO_RECORD_INSERT: {
 				const UndoInsertPayload *payload
@@ -901,6 +1133,7 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 				if (record->payload_length != sizeof(*payload)
 					|| (apply_record
 						&& !cluster_cr_apply_insert_inverse(result_page, record, payload))) {
+					cr_r4_undo_trace(trace, "legacy.reject", "INSERT_PAYLOAD_OR_INVERSE", 0);
 					*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 					return CLUSTER_R4_CR_STEP_FAIL;
 				}
@@ -919,6 +1152,7 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 					|| payload->old_tuple_length < SizeofHeapTupleHeader
 					|| (size_t)payload->old_tuple_offset + payload->old_tuple_length
 						   != record->payload_length) {
+					cr_r4_undo_trace(trace, "legacy.reject", "UPDATE_PAYLOAD_SHAPE", 0);
 					*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 					return CLUSTER_R4_CR_STEP_FAIL;
 				}
@@ -939,12 +1173,14 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 				if ((!successor_absent && !successor_present)
 					|| old_header->t_hoff < SizeofHeapTupleHeader
 					|| old_header->t_hoff > payload->old_tuple_length) {
+					cr_r4_undo_trace(trace, "legacy.reject", "UPDATE_SUCCESSOR_OR_HEADER", 0);
 					*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 					return CLUSTER_R4_CR_STEP_FAIL;
 				}
 				if (apply_record
 					&& !cluster_cr_apply_update_inverse(result_page, record, payload, old_tuple,
 														payload->old_tuple_length)) {
+					cr_r4_undo_trace(trace, "legacy.reject", "UPDATE_INVERSE", 0);
 					*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 					return CLUSTER_R4_CR_STEP_FAIL;
 				}
@@ -960,6 +1196,7 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 					|| payload->full_tuple_length == 0
 					|| (size_t)payload->full_tuple_offset + payload->full_tuple_length
 						   != record->payload_length) {
+					cr_r4_undo_trace(trace, "legacy.reject", "DELETE_PAYLOAD_SHAPE", 0);
 					*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 					return CLUSTER_R4_CR_STEP_FAIL;
 				}
@@ -967,6 +1204,7 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 				if (apply_record
 					&& !cluster_cr_apply_delete_inverse(result_page, record, payload, full_tuple,
 														payload->full_tuple_length)) {
+					cr_r4_undo_trace(trace, "legacy.reject", "DELETE_INVERSE", 0);
 					*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 					return CLUSTER_R4_CR_STEP_FAIL;
 				}
@@ -980,15 +1218,19 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 					|| payload->itl_slot_idx >= CLUSTER_ITL_INITRANS_DEFAULT
 					|| (apply_record
 						&& !cluster_cr_apply_itl_inverse(result_page, record, payload))) {
+					cr_r4_undo_trace(trace, "legacy.reject", "ITL_PAYLOAD_SLOT_OR_INVERSE", 0);
 					*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 					return CLUSTER_R4_CR_STEP_FAIL;
 				}
 				break;
 			}
 			default:
+				cr_r4_undo_trace(trace, "legacy.reject", "RECORD_TYPE", 0);
 				*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 				return CLUSTER_R4_CR_STEP_FAIL;
 			}
+
+			cr_r4_undo_trace(trace, "legacy.accept", "ORIGINAL_SWITCH_COMPLETED", 1);
 
 			/* Several page slots can anchor the same transaction chain. Mark
 			 * an older head only after this record and its inverse are proven;
@@ -1033,9 +1275,15 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 		}
 	}
 
+	if (trace != NULL) {
+		trace->locator_known = trace->uba_known = false;
+		trace->read_returned = trace->record_header_known = false;
+		trace->apply_record = trace->locator_reason = -1;
+	}
 	if (context->record_format != 2)
 		(void)cluster_cr_prune_post_snapshot_versions(result_page, context->candidates,
 													  context->candidate_count);
+	cr_r4_undo_trace(trace, "build.full", "ORIGINAL_WALK_COMPLETED", 1);
 	*reason_out = CLUSTER_CR_BUILD_NONE;
 	return CLUSTER_R4_CR_STEP_FULL;
 }
@@ -1721,8 +1969,16 @@ cr_scratch_ensure(void)
  *	returns (it always ereport(ERROR)s).  The data plane is Stage 6 (#119).
  */
 static void
-pg_attribute_noreturn() cr_coordinator_refuse_runtime_remote(int origin_node)
+pg_attribute_noreturn() cr_coordinator_refuse_runtime_remote(
+	int origin_node, const char *refusal_site,
+	const ClusterSemanticAdmissionResult *source_admission)
 {
+	/* Only the source-dispatch refusal has an admission result. Its output
+	 * is consumable only on OK; in that branch this refusal means !fetched.
+	 * Preserve unknown elsewhere without inspecting non-OK output bytes. */
+	bool fetched_known = source_admission != NULL
+						 && *source_admission == CLUSTER_SEMANTIC_ADMISSION_OK;
+
 	if (cluster_cross_instance_cr_coordinator != CR_COORD_MODE_OFF) {
 		cluster_cr_coordinator_stat_bump(CR_COORD_CROSS_INSTANCE_CR_REFUSED);
 		cluster_cr_coordinator_stat_bump(CR_COORD_REMOTE_UNDO_READ_REFUSED);
@@ -1746,6 +2002,11 @@ pg_attribute_noreturn() cr_coordinator_refuse_runtime_remote(int origin_node)
 					errmsg("cluster CR cross-instance UBA encountered at the remote-undo-read "
 						   "leg (origin_node_id=%d, local=%d)",
 						   origin_node, cluster_node_id),
+					errdetail("refusal_site=%s source_admission_known=%d source_admission=%d "
+							  "source_fetched_known=%d source_fetched=%d",
+							  refusal_site, source_admission != NULL,
+							  source_admission != NULL ? (int)*source_admission : -1,
+							  fetched_known, fetched_known ? 0 : -1),
 					errhint("Own-instance CR only unless the origin was materialized by merged "
 							"recovery; the runtime cross-instance CR/undo data plane lands in "
 							"Stage 6 (#119 undo-block Cache Fusion); see Spec: spec-5.57.")));
@@ -1779,7 +2040,7 @@ cr_check_error_injections(void)
 		 * routine the production pre-check uses (53R9G + both coordinator counters
 		 * + probe/forward), so the TAP injection legs exercise the real boundary
 		 * behavior deterministically (param = synthetic origin_node_id). */
-		cr_coordinator_refuse_runtime_remote((int)param);
+		cr_coordinator_refuse_runtime_remote((int)param, "injection", NULL);
 
 	if (cluster_cr_injection_armed("cr_corruption", &param)) {
 		const char *kind = (param == 1)	  ? "uba_decode"
@@ -1886,7 +2147,7 @@ cr_walk_chain(char *scratch_page, UBA start_uba, SCN read_scn,
 			if (cr_origin_class == CR_COORD_ORIGIN_RUNTIME_REMOTE) {
 				/* class③: fail closed via the shared refusal routine (53R9G +
 				 * both coordinator counters; non-degradable, §2.2). */
-				cr_coordinator_refuse_runtime_remote((int)cr_origin);
+				cr_coordinator_refuse_runtime_remote((int)cr_origin, "chain_walk", NULL);
 			} else if (cr_origin_class == CR_COORD_ORIGIN_MATERIALIZED_REMOTE) {
 				/* class②: merged-materialized remote, served from the local tree
 				 * (already shipped, spec-4.5a D8).  Count the serve (advisory). */
@@ -2260,7 +2521,7 @@ cr_construct_retained_history(char *page, SCN read_scn, const BufferTag *tag, bo
 				if (!selected)
 					break; /* the existing remote-first dispatcher still owns it */
 				if (!server_mode)
-					cr_coordinator_refuse_runtime_remote((int)origin);
+					cr_coordinator_refuse_runtime_remote((int)origin, "retained_history", NULL);
 				if (out_partial != NULL)
 					*out_partial = true;
 				break;
@@ -2407,6 +2668,7 @@ cr_construct_from_copy(char *dst_page, SCN read_scn, RelFileLocator cur_locator,
 		if (cluster_cr_coordinator_classify_origin(head_origin) == CR_COORD_ORIGIN_RUNTIME_REMOTE) {
 			ClusterR4SourceCrRequest source_request;
 			ClusterR4SourceCrResult source_result;
+			ClusterSemanticAdmissionResult source_admission;
 			BufferTag tag;
 
 			InitBufferTag(&tag, &cur_locator, cur_fork, cur_block);
@@ -2415,14 +2677,15 @@ cr_construct_from_copy(char *dst_page, SCN read_scn, RelFileLocator cur_locator,
 			source_request.read_scn = read_scn;
 			source_request.origin_node = (int32)head_origin;
 			source_request.dst_page = dst_page;
-			if (cluster_r4_source_cr_dispatch(CLUSTER_R4_SOURCE_CR_FETCH, &source_request,
-											  &source_result)
-					!= CLUSTER_SEMANTIC_ADMISSION_OK
+			source_admission = cluster_r4_source_cr_dispatch(CLUSTER_R4_SOURCE_CR_FETCH,
+															   &source_request, &source_result);
+			if (source_admission != CLUSTER_SEMANTIC_ADMISSION_OK
 				|| !source_result.fetched) {
 				if (CRShared != NULL)
 					pg_atomic_fetch_add_u64(&CRShared->cr_remote_failed_count, 1);
 				/* Unchanged spec-5.57 refusal: 53R9G + coordinator counters. */
-				cr_coordinator_refuse_runtime_remote((int)head_origin);
+				cr_coordinator_refuse_runtime_remote((int)head_origin, "source_dispatch",
+													 &source_admission);
 			}
 
 			if (!source_result.partial) {

@@ -87,10 +87,64 @@ UT_TEST(test_real_stop_cut_refuses_execution_but_keeps_passive_proof)
  }
 }
 
+/* Default NULL outside this case. Limit the real PCM observer's budget at
+ * its existing module boundary, so an eight-slot pool produces MORE. */
+static ClusterPcmPiRelationScanV2
+full_one_slot_scan(RelFileLocator locator, uint64 formation, uint32 budget, uint32 *cursor)
+{
+ return z_pcm_bridge_scan(locator,formation,Min(budget,1u),cursor);
+}
+
+UT_TEST(test_real_more_owner_survives_stop_then_finishes_under_original_cut)
+{
+ RelFileLocator a,b;
+ ResourceXGateSnapshot gate;
+ const char *reason;
+ ClusterKoDropWorkV2 *paused=NULL;
+ if(!full_setup()) return;
+ pg_atomic_write_u32(&full_stop.requested,0);
+ a=space_identity.key.locator;b=a;a.relNumber=z_objects[0];b.relNumber=z_objects[1];
+ UT_ASSERT(cluster_pcm_lock_resource_x_gate_snapshot(&gate));
+ z_pcm_bridge_setup(a,b,gate.formation);
+ UT_ASSERT(z_pcm_bridge_ok());
+ local_relation_scan_boundary=full_one_slot_scan;
+ for(unsigned tick=0;tick<8 && paused==NULL;tick++) {
+  UT_ASSERT(cluster_ko_shared_native_poll_v2());
+  for(unsigned slot=0;slot<CLUSTER_KO_SHARED_CAPACITY;slot++)
+   if(ko_drop_work[slot]!=NULL && ko_drop_work[slot]->local_scan_cursor==1)
+	paused=ko_drop_work[slot];
+ }
+ UT_ASSERT(paused!=NULL);
+ if(paused!=NULL) {
+  UT_ASSERT_EQ(paused->local_scan_cursor,1);
+  UT_ASSERT(!paused->local_scan_complete);
+ }
+ UT_ASSERT_EQ(main_syncs+dir_syncs,0);
+ /* Pause the original CP scheduler after MORE, then request stop. No
+  * mutation or synthetic completion stands in for the retained owner. */
+ pg_atomic_write_u32(&full_stop.requested,1);
+ UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason),CLUSTER_NORMAL_STOP_PENDING);
+ UT_ASSERT_EQ(pg_atomic_read_u32(&full_stop.service_seal),0);
+ for(unsigned i=0;i<64 && main_syncs<2;i++) (void)cluster_ko_shared_native_poll_v2();
+ UT_ASSERT_EQ(main_syncs,2);
+ UT_ASSERT_EQ(dir_syncs,2);
+ UT_ASSERT_EQ(external_fds,0);
+ for(unsigned slot=0;slot<CLUSTER_KO_SHARED_CAPACITY;slot++) UT_ASSERT(ko_drop_work[slot]==NULL);
+ UT_ASSERT_EQ(z_pcm_bridge_retire(),2);
+ z_release_ax();
+ MyBackendType=B_BG_WRITER;
+ cluster_pi_writeback_bgwriter_quiesced_v1();
+ MyBackendType=B_LMON;
+ UT_ASSERT_EQ(lmon_normal_stop_observe(true),CLUSTER_NORMAL_STOP_READY);
+ UT_ASSERT(z_pcm_bridge_ok());
+ local_relation_scan_boundary=NULL;
+}
+
 int main(void)
 {
- setvbuf(stdout,NULL,_IOLBF,0);UT_PLAN(2);
+ setvbuf(stdout,NULL,_IOLBF,0);UT_PLAN(3);
  UT_RUN(test_real_stop_cut_refuses_execution_but_keeps_passive_proof);
  UT_RUN(test_two_original_objects_reach_am03_and_lmon_idle_after_stop);
+ UT_RUN(test_real_more_owner_survives_stop_then_finishes_under_original_cut);
  UT_DONE();return ut_failed_count != 0;
 }

@@ -44,6 +44,9 @@
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "storage/buf_internals.h"
+#include "storage/lwlock.h"
+#include "storage/proc.h"
+#include <time.h>
 #endif
 
 /* Working data for heap_page_prune and subroutines */
@@ -287,6 +290,210 @@ cluster_heap_prune_pcm(Buffer buffer, ClusterPcmOwnSnapshot *pcm)
 /* One opportunistic owner: capture under current-X/cleanup, resolve with no
  * content lock, then revalidate the entire image and authority. No background
  * owner, cross-call proof cache or conversion/wait loop is introduced. */
+/* Backend-private observations of the existing shared-prune owner.  These
+ * are owned copies, not reusable PCM, transaction or durability authority. */
+typedef struct ClusterHeapPruneTrace {
+	bool enabled, before_known, after_known, floor_known, space_known;
+	const char *stage;
+	Oid relid;
+	RelFileLocator requested_locator;
+	SCN read_scn, floor_scn;
+	uint64 epoch;
+	ClusterSemanticAdmissionToken admission;
+	ClusterSpaceIdentity space;
+	ClusterPcmOwnSnapshot pcm;
+	int ndeleted, nnewlpdead;
+} ClusterHeapPruneTrace;
+
+static void
+cluster_heap_prune_trace_note_lock(LWLock *lock, LWLockMode mode, void *context)
+{
+	*(bool *)context = true;
+}
+
+/* Only private BLCKSZ images reach this helper; failed captures stay NULL. */
+static bool
+cluster_heap_prune_trace_shape(Page page, OffsetNumber *maxoff)
+{
+	PageHeader h = (PageHeader)page;
+
+	*maxoff = InvalidOffsetNumber;
+	if (page == NULL || !PageHasItl(page) || PageGetPageSize(page) != BLCKSZ
+		|| h->pd_lower < SizeOfPageHeaderData || h->pd_lower > h->pd_upper
+		|| h->pd_upper > h->pd_special || h->pd_special > BLCKSZ - CLUSTER_ITL_ARRAY_SIZE
+		|| (h->pd_lower - SizeOfPageHeaderData) % sizeof(ItemIdData) != 0)
+		return false;
+	*maxoff = PageGetMaxOffsetNumber(page);
+	return *maxoff <= MaxHeapTuplesPerPage;
+}
+
+static void
+cluster_heap_prune_trace_item(Page page, OffsetNumber off, char *out, Size size)
+{
+	OffsetNumber maxoff;
+	ItemId item;
+	Size start, len;
+	HeapTupleHeaderData tuple;
+	ClusterItlSlotData slot = {0};
+	bool slot_known;
+
+	strlcpy(out, "item_known=0", size);
+	if (!cluster_heap_prune_trace_shape(page, &maxoff)
+		|| off < FirstOffsetNumber || off > maxoff)
+		return;
+	item = PageGetItemId(page, off);
+	start = ItemIdGetOffset(item);
+	len = ItemIdGetLength(item);
+	if (!ItemIdIsNormal(item)) {
+		snprintf(out, size, "item_known=1 lp=%u redirect=%u off=%zu len=%zu tuple_known=0",
+				 item->lp_flags, ItemIdIsRedirected(item) ? ItemIdGetRedirect(item) : 0,
+				 start, len);
+		return;
+	}
+	if (len < SizeofHeapTupleHeader || start < ((PageHeader)page)->pd_upper
+		|| start > ((PageHeader)page)->pd_special
+		|| len > ((PageHeader)page)->pd_special - start) {
+		snprintf(out, size, "item_known=1 lp=%u tuple_known=0", item->lp_flags);
+		return;
+	}
+	memset(&tuple, 0, sizeof(tuple));
+	memcpy(&tuple, page + start, SizeofHeapTupleHeader);
+	if (tuple.t_hoff < SizeofHeapTupleHeader || tuple.t_hoff > len) {
+		snprintf(out, size, "item_known=1 lp=%u tuple_known=0", item->lp_flags);
+		return;
+	}
+	slot_known = tuple.t_itl_slot_idx < CLUSTER_ITL_INITRANS_DEFAULT;
+	if (slot_known)
+		memcpy(&slot, &ClusterPageGetItlSlots(page)[tuple.t_itl_slot_idx], sizeof(slot));
+	snprintf(out, size,
+			 "item_known=1 lp=%u tuple_known=1 off=%zu len=%zu "
+			 "xmin=%u xmax=%u ctid=%u/%u mask=%u/%u raw_cid=%u combo=%d "
+			 "itl=%u slot_known=%d slot_xid=%u itl_wrap=%u flags=%u "
+			 "write_scn=" UINT64_FORMAT " commit_scn=" UINT64_FORMAT
+			 " first_change_lsn=" UINT64_FORMAT " uba_raw=" UINT64_FORMAT "/" UINT64_FORMAT
+			 " full_xid_known=0 tt_wrap_known=0",
+			 item->lp_flags, start, len, HeapTupleHeaderGetRawXmin(&tuple),
+			 HeapTupleHeaderGetRawXmax(&tuple),
+			 ItemPointerGetBlockNumberNoCheck(&tuple.t_ctid),
+			 ItemPointerGetOffsetNumberNoCheck(&tuple.t_ctid),
+			 tuple.t_infomask, tuple.t_infomask2, HeapTupleHeaderGetRawCommandId(&tuple),
+			 (tuple.t_infomask & HEAP_COMBOCID) != 0, tuple.t_itl_slot_idx, slot_known,
+			 slot.xid, slot.wrap, slot.flags, (uint64)slot.write_scn, (uint64)slot.commit_scn,
+			 (uint64)slot.first_change_lsn,
+			 slot.undo_segment_head.raw[0], slot.undo_segment_head.raw[1]);
+}
+
+static bool
+cluster_heap_prune_trace_changed(Page before, OffsetNumber before_max,
+								Page after, OffsetNumber after_max, OffsetNumber off)
+{
+	return off > before_max || off > after_max
+		|| memcmp(PageGetItemId(before, off), PageGetItemId(after, off), sizeof(ItemIdData)) != 0;
+}
+
+static void
+cluster_heap_prune_trace_emit(const ClusterHeapPruneTrace *view, Page before, Page after)
+{
+	static uint64 event_seq, critical_skipped, lwlock_skipped;
+	uint64 operation_seq, mono_us = 0;
+	TimestampTz wall_us;
+	struct timespec now;
+	OffsetNumber before_max, after_max, off, maxoff;
+	bool before_shape, after_shape, held = false;
+	int changed = 0;
+	char incarnation[33];
+	static const char hex[] = "0123456789abcdef";
+
+	if (!view->enabled)
+		return;
+	if (CritSectionCount != 0) {
+		if (critical_skipped != UINT64_MAX)
+			critical_skipped++;
+		return;
+	}
+	ForEachLWLockHeldByMe(cluster_heap_prune_trace_note_lock, &held);
+	if (held) {
+		if (lwlock_skipped != UINT64_MAX)
+			lwlock_skipped++;
+		return;
+	}
+	before_shape = cluster_heap_prune_trace_shape(before, &before_max);
+	after_shape = cluster_heap_prune_trace_shape(after, &after_max);
+	maxoff = before_shape && after_shape ? Max(before_max, after_max) : InvalidOffsetNumber;
+	for (off = FirstOffsetNumber; off <= maxoff; off++)
+		if (cluster_heap_prune_trace_changed(before, before_max, after, after_max, off))
+			changed++;
+	if (event_seq != UINT64_MAX)
+		event_seq++;
+	operation_seq = event_seq;
+	wall_us = GetCurrentTimestamp();
+	if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
+		mono_us = (uint64)now.tv_sec * UINT64_C(1000000) + now.tv_nsec / 1000;
+	for (int i = 0; i < 16; i++) {
+		incarnation[i * 2] = hex[view->space.incarnation[i] >> 4];
+		incarnation[i * 2 + 1] = hex[view->space.incarnation[i] & 15];
+	}
+	incarnation[32] = '\0';
+	ereport(LOG, (errmsg_internal(
+		"PGRAC_FAMILY=R4_HEAP_PRUNE event=prune.result event_seq=" UINT64_FORMAT
+		" operation_seq=" UINT64_FORMAT " node=%d pid=%d procno=%d backend=%d role=%d "
+		"wall_us=" INT64_FORMAT " mono_us=" UINT64_FORMAT
+		" stage=%s subpredicate_known=0 relid=%u requested_locator=%u/%u/%u "
+		"actual_tag_known=%d actual_tag=%u/%u/%u/%d/%u read_scn=" UINT64_FORMAT
+		" epoch=" UINT64_FORMAT " admission_feature=" UINT64_FORMAT
+		" admission_generation=" UINT64_FORMAT " admission_epoch=" UINT64_FORMAT
+		" admission_side=%u space_known=%d space_system=" UINT64_FORMAT
+		" database_incarnation=" UINT64_FORMAT " space_incarnation=%s space_sequence=" UINT64_FORMAT
+		" space_operation=" UINT64_FORMAT " space_state=%d "
+		"before_known=%d after_known=%d before_shape=%d after_shape=%d "
+		"before_lsn=" UINT64_FORMAT " before_scn=" UINT64_FORMAT
+		" after_lsn=" UINT64_FORMAT " after_scn=" UINT64_FORMAT
+		" floor_known=%d floor_scn=" UINT64_FORMAT
+		" ndeleted=%d nnewlpdead=%d changed_items=%d "
+		"pcm_generation=" UINT64_FORMAT " reservation_token=" UINT64_FORMAT
+		" writer_activation=" UINT64_FORMAT " resource_x_activation=" UINT64_FORMAT
+		" pcm_state=%u pcm_flags=%u pin_scope=caller_retained authoritative=0 "
+		"wal_flush_known=0 boot_known=0 process_incarnation_known=0 image_hash_known=0 "
+		"trace_critical_skipped=" UINT64_FORMAT " trace_lwlock_skipped=" UINT64_FORMAT
+		" trace_sequence_exhausted=%d",
+		event_seq, operation_seq, cluster_node_id, MyProcPid,
+		MyProc != NULL ? MyProc->pgprocno : -1, (int)MyBackendId, (int)MyBackendType,
+		wall_us, mono_us, view->stage, view->relid, view->requested_locator.spcOid,
+		view->requested_locator.dbOid, view->requested_locator.relNumber,
+		view->before_known, view->pcm.tag.spcOid, view->pcm.tag.dbOid,
+		view->pcm.tag.relNumber, view->pcm.tag.forkNum, view->pcm.tag.blockNum,
+		(uint64)view->read_scn, view->epoch, view->admission.feature_bit,
+		view->admission.record_generation, view->admission.formation_epoch,
+		view->admission.side, view->space_known, view->space.key.system_identifier,
+		view->space.key.database_incarnation, incarnation, view->space.sequence,
+		view->space.operation, (int)view->space.state, view->before_known,
+		view->after_known, before_shape, after_shape,
+		before != NULL ? (uint64)PageGetLSN(before) : 0,
+		before != NULL ? (uint64)((PageHeader)before)->pd_block_scn : 0,
+		after != NULL ? (uint64)PageGetLSN(after) : 0,
+		after != NULL ? (uint64)((PageHeader)after)->pd_block_scn : 0,
+		view->floor_known, (uint64)view->floor_scn, view->ndeleted, view->nnewlpdead, changed,
+		view->pcm.generation, view->pcm.reservation_token, view->pcm.writer_activation_token,
+		view->pcm.resource_x_activation_generation, view->pcm.pcm_state, view->pcm.flags,
+		critical_skipped, lwlock_skipped, event_seq == UINT64_MAX)));
+	for (off = FirstOffsetNumber; off <= maxoff; off++) {
+		char old_item[768], new_item[768];
+
+		if (!cluster_heap_prune_trace_changed(before, before_max, after, after_max, off))
+			continue;
+		cluster_heap_prune_trace_item(before, off, old_item, sizeof(old_item));
+		cluster_heap_prune_trace_item(after, off, new_item, sizeof(new_item));
+		if (event_seq != UINT64_MAX)
+			event_seq++;
+		ereport(LOG, (errmsg_internal(
+			"PGRAC_FAMILY=R4_HEAP_PRUNE event=prune.item event_seq=" UINT64_FORMAT
+			" operation_seq=" UINT64_FORMAT " node=%d pid=%d offset=%u before={%s} after={%s} "
+			"authoritative=0 trace_sequence_exhausted=%d",
+			event_seq, operation_seq, cluster_node_id, MyProcPid, off, old_item, new_item,
+			event_seq == UINT64_MAX)));
+	}
+}
+
 static void
 cluster_heap_page_prune_opt(Relation relation, Buffer buffer)
 {
@@ -297,6 +504,9 @@ cluster_heap_page_prune_opt(Relation relation, Buffer buffer)
 	ClusterPcmOwnSnapshot captured_pcm;
 	ClusterPcmOwnSnapshot live_pcm;
 	PGAlignedBlock image;
+	/* Reserved stack space only; copied solely while tracing is enabled. */
+	PGAlignedBlock trace_after;
+	ClusterHeapPruneTrace trace;
 	ClusterUndoVerdictResult verdicts[MaxHeapTuplesPerPage + 1];
 	bool proved_dead[MaxHeapTuplesPerPage + 1];
 	Snapshot snapshot;
@@ -340,6 +550,21 @@ cluster_heap_page_prune_opt(Relation relation, Buffer buffer)
 	if (cluster_semantic_activation_enter_r4_terminal_census(&admission)
 		!= CLUSTER_SEMANTIC_ADMISSION_OK)
 		return;
+	trace.enabled = cluster_trace_normal_stop;
+	if (trace.enabled) {
+		memset(&trace, 0, sizeof(trace));
+		trace.enabled = true;
+		trace.stage = "capture_cleanup";
+		trace.relid = RelationGetRelid(relation);
+		trace.requested_locator = relation->rd_locator;
+		trace.read_scn = read_scn;
+		trace.epoch = epoch;
+		trace.admission = admission;
+		trace.space_known = versioned;
+		if (versioned)
+			trace.space = identity;
+		trace.ndeleted = trace.nnewlpdead = -1;
+	}
 	PG_TRY();
 	{
 		do
@@ -352,12 +577,21 @@ cluster_heap_page_prune_opt(Relation relation, Buffer buffer)
 				|| !ConditionalLockBufferForCleanup(buffer))
 				break;
 			locked = true;
+			if (trace.enabled)
+				trace.stage = "capture_input";
 			if (!cluster_semantic_activation_recheck_r4_terminal_census(&admission)
 				|| !cluster_heap_prune_pcm(buffer, &captured_pcm)
 				|| !cluster_heap_prune_page_valid(live, block)
 				|| heap_page_has_current_mx_predecessor(live))
 				break;
 			memcpy(image.data, live, BLCKSZ);
+			if (trace.enabled) {
+				trace.before_known = true;
+				trace.pcm = captured_pcm;
+				trace.floor_known = true;
+				trace.floor_scn = floor.scn;
+				trace.stage = "resolve";
+			}
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 			locked = false;
 			maxoff = PageGetMaxOffsetNumber(page);
@@ -415,8 +649,14 @@ cluster_heap_page_prune_opt(Relation relation, Buffer buffer)
 						origin, segment, xid, fresh ? (uint32) slot + 1 : 0,
 						read_scn, fresh);
 			}
+			if (trace.enabled)
+				trace.stage = "refold_floor";
 			if (!cluster_heap_prune_floor(epoch, &floor))
 				break;
+			if (trace.enabled) {
+				trace.floor_scn = floor.scn;
+				trace.stage = "relock_cleanup";
+			}
 			for (off = FirstOffsetNumber; off <= maxoff; off++)
 				proved_dead[off] = (verdicts[off].kind == CLUSTER_UNDO_VERDICT_COMMITTED_EXACT
 					|| verdicts[off].kind == CLUSTER_UNDO_VERDICT_COMMITTED_BOUND)
@@ -425,6 +665,8 @@ cluster_heap_page_prune_opt(Relation relation, Buffer buffer)
 			if (!ConditionalLockBufferForCleanup(buffer))
 				break;
 			locked = true;
+			if (trace.enabled)
+				trace.stage = "revalidate_input";
 			if (!cluster_semantic_activation_recheck_r4_terminal_census(&admission)
 				|| !cluster_heap_prune_pcm(buffer, &live_pcm)
 				|| !cluster_pcm_own_snapshot_equal_exact(&captured_pcm, &live_pcm)
@@ -437,6 +679,13 @@ cluster_heap_page_prune_opt(Relation relation, Buffer buffer)
 				versioned ? &identity : NULL);
 			if (ndeleted > nnewlpdead)
 				pgstat_update_heap_dead_tuples(relation, ndeleted - nnewlpdead);
+			if (trace.enabled) {
+				memcpy(trace_after.data, live, BLCKSZ);
+				trace.after_known = true;
+				trace.stage = "pruned";
+				trace.ndeleted = ndeleted;
+				trace.nnewlpdead = nnewlpdead;
+			}
 		} while (false);
 	}
 	PG_FINALLY();
@@ -446,6 +695,10 @@ cluster_heap_page_prune_opt(Relation relation, Buffer buffer)
 		cluster_semantic_activation_leave(&admission);
 	}
 	PG_END_TRY();
+	/* No live page/descriptor access or changed caller pin ownership here. */
+	if (trace.enabled)
+		cluster_heap_prune_trace_emit(&trace, trace.before_known ? page : NULL,
+			trace.after_known ? (Page)trace_after.data : NULL);
 }
 #endif
 

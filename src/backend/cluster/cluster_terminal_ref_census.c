@@ -42,6 +42,8 @@
 #include "access/xlog.h"
 #include "catalog/pg_class_d.h"
 #include "miscadmin.h"
+#include "storage/proc.h"
+#include <unistd.h>
 
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_clean_leave.h"
@@ -1734,8 +1736,9 @@ static bool
 ctrc_origin_certificate_commit_shared(const ClusterCtrcOriginCertificateSnapshot *snapshot);
 static bool ctrc_cleaner_publish_certificate(const ClusterCtrcOriginCertificateSnapshot *snapshot);
 static void ctrc_participant_capture_durability(ClusterCtrcDurability *durability);
+typedef struct CtrcOriginBatchReplyTrace CtrcOriginBatchReplyTrace;
 static bool ctrc_origin_ack_land_locked(uint64 request_id, const ClusterCtrcLocalReleaseAckV1 *ack,
-										bool *progressed);
+										bool *progressed, CtrcOriginBatchReplyTrace *trace);
 
 /* Hot-path counters and the deterministic test seam must not repeat the
  * capacity/layout walk performed by cluster_ctrc_shmem_ready().  The shared
@@ -3513,12 +3516,263 @@ ctrc_origin_note_close_match_locked(uint64 index, uint64 request_id, uint16 part
 }
 #endif
 
+
+#ifndef CLUSTER_CTRC_UNIT_TEST
+/* Owned scalar-reply samples only: no shared pointer survives the original
+ * origin lock. This is not wire validation, authority or an atomic graph. */
+#define CLUSTER_CTRC_ORIGIN_REPLY_TRACE_PRESENT 1
+static uint64 CtrcReplyTraceSequence;
+static uint64 CtrcReplyTraceUnsafeSkipped;
+
+static void
+ctrc_origin_reply_trace_lock(LWLock *lock pg_attribute_unused(),
+							LWLockMode mode pg_attribute_unused(), void *arg)
+{
+	*(bool *)arg = true;
+}
+
+static void
+ctrc_origin_reply_trace(const char *event, uint64 request, uint16 node,
+						ClusterCtrcSealReplyResult result, bool accepted,
+						bool progressed, bool known,
+						const ClusterCtrcOriginEntry *before,
+						const ClusterCtrcOriginEntry *after,
+						const ClusterCtrcLocalReleaseAckV1 *input)
+{
+	const ClusterCtrcTxnKeyV1 *key = &before->key;
+	ClusterCtrcParticipantIdentity peer = {0};
+	bool held = false;
+
+	if (!cluster_trace_normal_stop)
+		return;
+	if (CritSectionCount == 0)
+		ForEachLWLockHeldByMe(ctrc_origin_reply_trace_lock, &held);
+	if (CritSectionCount != 0 || held) {
+		if (CtrcReplyTraceUnsafeSkipped != UINT64_MAX)
+			CtrcReplyTraceUnsafeSkipped++;
+		return;
+	}
+	if (known && node < CLUSTER_CTRC_MAX_PARTICIPANTS)
+		peer = before->touched[node];
+	if (CtrcReplyTraceSequence != UINT64_MAX)
+		CtrcReplyTraceSequence++;
+	ereport(LOG, (errmsg_internal(
+		"PGRAC_FAMILY=CTRC_ORIGIN_REPLY event=%s "
+		"event_seq=" UINT64_FORMAT " sequence_scope=process sequence_domain=CTRC_ORIGIN_REPLY "
+		"node_id=%d pid=%d procno=%d backend_type=%d wall_us=" INT64_FORMAT
+		" capture_clock_known=0 process_incarnation_known=0 full_xid_known=0 "
+		"request_id=" UINT64_FORMAT " peer_node=%u result=%u accepted=%d progressed=%d "
+		"row_sample_known=%d identity_source=origin_locked_before shared_atomic_graph=0 "
+		"authoritative=0 durability_known=0 recipient_resume_known=0 "
+		"system_identifier=" UINT64_FORMAT " key_format=%u owner_instance=%u origin_node=%u xid=%u "
+		"segment=%u segment_generation=%u slot=%u tt_wrap=%u cluster_epoch=%u "
+		"boot=" UINT64_FORMAT " formation=" UINT64_FORMAT " admission=" UINT64_FORMAT
+		" root_descriptor=" UINT64_FORMAT " root_id=" UINT64_FORMAT " root_generation=" UINT64_FORMAT
+		" peer_boot=" UINT64_FORMAT " peer_capability=%u peer_formation=" UINT64_FORMAT
+		" peer_admission=" UINT64_FORMAT
+		" before_state=%u after_state=%u before_grant=%u after_grant=%u "
+		"before_seal=" UINT64_FORMAT " after_seal=" UINT64_FORMAT
+		" before_touched=%u after_touched=%u before_dispatched=%u after_dispatched=%u "
+		"before_confirmed=%u after_confirmed=%u before_ack=%u after_ack=%u "
+		"before_request=" UINT64_FORMAT " after_request=" UINT64_FORMAT
+		" after_key_matches_before=%d after_row_zero=%d "
+		"input_ack_known=%d input_key_matches_before=%d input_grant_matches_before=%d "
+		"input_seal_matches_before=%d input_grant=%u input_seal=" UINT64_FORMAT
+		" input_crc=%u input_first_predicate=%u "
+		"unsafe_skipped=" UINT64_FORMAT " sequence_saturated=%d",
+		event, CtrcReplyTraceSequence, cluster_node_id, (int)getpid(),
+		MyProc != NULL ? MyProc->pgprocno : -1, MyBackendType, GetCurrentTimestamp(),
+		request, node, result, accepted, progressed, known,
+		key->system_identifier, key->format_version, key->owner_instance, key->origin_node_id, key->xid,
+		key->segment_id, key->segment_generation, key->slot_offset, key->slot_wrap,
+		key->cluster_epoch, key->origin_boot_incarnation, key->formation_epoch,
+		key->admission_record_generation, key->root_descriptor_incarnation,
+		key->root_id, key->root_generation, peer.boot_incarnation,
+		peer.capability_record_generation, peer.formation_epoch, peer.admission_record_generation,
+		before->state, after->state, before->grant_generation, after->grant_generation,
+		before->seal_generation, after->seal_generation, before->touched_bitmap, after->touched_bitmap,
+		before->close_dispatched_bitmap, after->close_dispatched_bitmap,
+		before->close_confirmed_bitmap, after->close_confirmed_bitmap, before->ack_bitmap, after->ack_bitmap,
+		known ? before->close_request_id[node] : 0, known ? after->close_request_id[node] : 0,
+		known && memcmp(key, &after->key, sizeof(*key)) == 0,
+		known && ctrc_bytes_zero(after, sizeof(*after)), input != NULL,
+		known && input != NULL && memcmp(key, &input->transaction_key, sizeof(*key)) == 0,
+		known && input != NULL && before->grant_generation == input->grant_generation,
+		known && input != NULL && before->seal_generation == input->seal_generation,
+		input != NULL ? input->grant_generation : 0, input != NULL ? input->seal_generation : 0,
+		input != NULL ? input->crc32c : 0, input != NULL ? input->first_failed_predicate : 0,
+		CtrcReplyTraceUnsafeSkipped, CtrcReplyTraceSequence == UINT64_MAX)));
+}
+#endif
+
+
+#ifndef CLUSTER_CTRC_UNIT_TEST
+/* One bounded batch's owned observations, never shared state or authority.
+ * Only compact before/after fields are copied, not 64 complete origin rows. */
+#define CLUSTER_CTRC_LOCAL_BATCH_REPLY_TRACE_PRESENT 1
+typedef struct CtrcOriginBatchTraceState {
+	uint64 seal;
+	uint64 request;
+	uint32 grant;
+	uint32 touched;
+	uint32 dispatched;
+	uint32 confirmed;
+	uint32 ack;
+	uint8 state;
+} CtrcOriginBatchTraceState;
+
+struct CtrcOriginBatchReplyTrace {
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcParticipantIdentity peer;
+	CtrcOriginBatchTraceState before;
+	CtrcOriginBatchTraceState after;
+	uint64 origin_index;
+	uint64 input_seal;
+	uint32 input_grant;
+	uint32 input_crc;
+	uint16 input_node;
+	uint8 matched_count;
+	ClusterCtrcSealReplyResult reply_result;
+	bool sample_known;
+	bool accepted;
+	bool entry_called;
+	bool entry_progressed;
+	bool progressed;
+	bool pending_duplicate;
+	bool after_same_key;
+	bool after_row_zero;
+	bool input_ack_known;
+	bool input_key_matches_before;
+};
+
+static uint64 CtrcBatchReplyTraceSequence;
+static uint64 CtrcBatchReplyTraceSkipped;
+
+static void
+ctrc_origin_batch_trace_state(CtrcOriginBatchTraceState *out,
+							 const ClusterCtrcOriginEntry *origin, uint16 node)
+{
+	out->seal = origin->seal_generation;
+	out->request = node < CLUSTER_CTRC_MAX_PARTICIPANTS ? origin->close_request_id[node] : 0;
+	out->grant = origin->grant_generation;
+	out->touched = origin->touched_bitmap;
+	out->dispatched = origin->close_dispatched_bitmap;
+	out->confirmed = origin->close_confirmed_bitmap;
+	out->ack = origin->ack_bitmap;
+	out->state = origin->state;
+}
+
+/* Pure copies at the original lock owner, no lookup, allocation or output. */
+static void
+ctrc_origin_batch_trace_before(CtrcOriginBatchReplyTrace *sample, uint64 index,
+							  const ClusterCtrcOriginEntry *origin, uint16 node)
+{
+	sample->origin_index = index;
+	sample->sample_known = true;
+	sample->matched_count = 1;
+	sample->key = origin->key;
+	if (node < CLUSTER_CTRC_MAX_PARTICIPANTS)
+		sample->peer = origin->touched[node];
+	ctrc_origin_batch_trace_state(&sample->before, origin, node);
+}
+
+static void
+ctrc_origin_batch_trace_after(CtrcOriginBatchReplyTrace *sample,
+							 const ClusterCtrcOriginEntry *origin, uint16 node)
+{
+	ctrc_origin_batch_trace_state(&sample->after, origin, node);
+	sample->after_same_key = memcmp(&sample->key, &origin->key, sizeof(origin->key)) == 0;
+	sample->after_row_zero = ctrc_bytes_zero(origin, sizeof(*origin));
+}
+
+static void
+ctrc_origin_batch_reply_trace(const char *event, const CtrcOriginBatchReplyTrace *sample,
+							 ClusterCtrcSealReplyResult result, Size ordinal, Size count)
+{
+	const ClusterCtrcTxnKeyV1 *key = &sample->key;
+	const ClusterCtrcParticipantIdentity *peer = &sample->peer;
+	const CtrcOriginBatchTraceState *before = &sample->before, *after = &sample->after;
+	bool held = false;
+	struct timespec now;
+	uint64 mono_us = 0;
+
+	if (!cluster_trace_normal_stop)
+		return;
+	if (CritSectionCount == 0)
+		ForEachLWLockHeldByMe(ctrc_origin_reply_trace_lock, &held);
+	if (CritSectionCount != 0 || held) {
+		if (CtrcBatchReplyTraceSkipped != UINT64_MAX)
+			CtrcBatchReplyTraceSkipped++;
+		return;
+	}
+	if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
+		mono_us = (uint64)now.tv_sec * 1000000 + (uint64)now.tv_nsec / 1000;
+	if (CtrcBatchReplyTraceSequence != UINT64_MAX)
+		CtrcBatchReplyTraceSequence++;
+	ereport(LOG, (errmsg_internal(
+		"PGRAC_FAMILY=CTRC_ORIGIN_BATCH_REPLY event=%s "
+		"event_seq=" UINT64_FORMAT " sequence_scope=process sequence_domain=CTRC_ORIGIN_BATCH_REPLY "
+		"node_id=%d pid=%d procno=%d backend_type=%d emit_wall_us=" INT64_FORMAT
+		" emit_monotonic_us=" UINT64_FORMAT " capture_clock_known=0 process_incarnation_known=0 "
+		"full_xid_known=0 authoritative=0 shared_atomic_graph=0 durability_known=0 recipient_resume_known=0 "
+		"batch_ordinal=%zu batch_count=%zu request_id=" UINT64_FORMAT " suboperation=%u "
+		"expected_peer=%u expected_peer_boot=" UINT64_FORMAT " expected_peer_capability=%u "
+		"expected_peer_formation=" UINT64_FORMAT " expected_peer_admission=" UINT64_FORMAT
+		" expected_grant=%u expected_seal=" UINT64_FORMAT
+		" result=%u entry_called=%d accepted=%d progressed=%d entry_progressed=%d pending_duplicate=%d "
+		"sample_known=%d matched_count=%u origin_index=" UINT64_FORMAT
+		" identity_source=origin_locked_before expected_key_matches_before=%d "
+		"system_identifier=" UINT64_FORMAT " key_format=%u owner_instance=%u origin_node=%u xid=%u "
+		"segment=%u segment_generation=%u slot=%u tt_wrap=%u cluster_epoch=%u "
+		"boot=" UINT64_FORMAT " formation=" UINT64_FORMAT " admission=" UINT64_FORMAT
+		" root_descriptor=" UINT64_FORMAT " root_id=" UINT64_FORMAT " root_generation=" UINT64_FORMAT
+		" actual_peer=%u actual_peer_boot=" UINT64_FORMAT " actual_peer_capability=%u "
+		"actual_peer_formation=" UINT64_FORMAT " actual_peer_admission=" UINT64_FORMAT
+		" before_state=%u after_state=%u before_grant=%u after_grant=%u "
+		"before_seal=" UINT64_FORMAT " after_seal=" UINT64_FORMAT
+		" before_touched=%u after_touched=%u before_dispatched=%u after_dispatched=%u "
+		"before_confirmed=%u after_confirmed=%u before_ack=%u after_ack=%u "
+		"before_request=" UINT64_FORMAT " after_request=" UINT64_FORMAT
+		" after_key_matches_before=%d after_row_zero=%d "
+		"input_ack_known=%d input_node=%u input_key_matches_before=%d "
+		"input_grant=%u input_seal=" UINT64_FORMAT " input_crc=%u consumer_subpredicate_known=0 "
+		"unsafe_skipped=" UINT64_FORMAT " partial_emit_possible=1 sequence_saturated=%d",
+		event, CtrcBatchReplyTraceSequence, cluster_node_id, (int)getpid(),
+		MyProc != NULL ? MyProc->pgprocno : -1, MyBackendType, GetCurrentTimestamp(), mono_us,
+		ordinal, count, sample->dispatch.request_id, sample->dispatch.suboperation,
+		sample->dispatch.participant.node_id, sample->dispatch.participant.boot_incarnation,
+		sample->dispatch.participant.capability_record_generation,
+		sample->dispatch.participant.formation_epoch, sample->dispatch.participant.admission_record_generation,
+		sample->dispatch.grant_generation, sample->dispatch.seal_generation, result,
+		sample->entry_called, sample->accepted, sample->progressed, sample->entry_progressed,
+		sample->pending_duplicate, sample->sample_known, sample->matched_count, sample->origin_index,
+		sample->sample_known && memcmp(key, &sample->dispatch.key, sizeof(*key)) == 0,
+		key->system_identifier, key->format_version, key->owner_instance, key->origin_node_id,
+		key->xid, key->segment_id, key->segment_generation, key->slot_offset, key->slot_wrap,
+		key->cluster_epoch, key->origin_boot_incarnation, key->formation_epoch,
+		key->admission_record_generation, key->root_descriptor_incarnation, key->root_id, key->root_generation,
+		peer->node_id, peer->boot_incarnation, peer->capability_record_generation,
+		peer->formation_epoch, peer->admission_record_generation,
+		before->state, after->state, before->grant, after->grant, before->seal, after->seal,
+		before->touched, after->touched, before->dispatched, after->dispatched,
+		before->confirmed, after->confirmed, before->ack, after->ack,
+		before->request, after->request, sample->after_same_key, sample->after_row_zero,
+		sample->input_ack_known, sample->input_node, sample->input_key_matches_before,
+		sample->input_grant, sample->input_seal, sample->input_crc,
+		CtrcBatchReplyTraceSkipped, CtrcBatchReplyTraceSequence == UINT64_MAX)));
+}
+#endif
+
 bool
 cluster_ctrc_origin_note_close_reply_shared(uint64 request_id, uint16 participant_node_id,
 											ClusterCtrcSealReplyResult result)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	ClusterCtrcOriginEntry *matched = NULL;
+	bool trace = cluster_trace_normal_stop;
+	ClusterCtrcOriginEntry trace_before, trace_after;
+	bool trace_known = false;
 	bool noted = false;
 	bool progressed = false;
 	uint64 i;
@@ -3527,6 +3781,10 @@ cluster_ctrc_origin_note_close_reply_shared(uint64 request_id, uint16 participan
 	if (request_id == 0 || participant_node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS
 		|| !cluster_ctrc_shmem_ready())
 		return false;
+	if (trace) {
+		MemSet(&trace_before, 0, sizeof(trace_before));
+		MemSet(&trace_after, 0, sizeof(trace_after));
+	}
 	bit = UINT32_C(1) << participant_node_id;
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	for (i = 0; i < CtrcShared->origin_key_entries; i++) {
@@ -3544,14 +3802,24 @@ cluster_ctrc_origin_note_close_reply_shared(uint64 request_id, uint16 participan
 		}
 		matched = candidate;
 	}
-	if (matched != NULL)
+	if (matched != NULL) {
+		if (trace) {
+			trace_before = *matched;
+			trace_known = true;
+		}
 		noted = ctrc_origin_note_close_match_locked(matched - ctrc_origin_entries(), request_id,
 													participant_node_id, result, &progressed);
+		if (trace)
+			trace_after = *matched;
+	}
 	LWLockRelease(&CtrcShared->origin_lock);
 	if (progressed)
 		ctrc_semantic_progress(true);
 	else if (noted && result == CTRC_SEAL_REPLY_PENDING_DRAIN)
 		cluster_ctrc_stat_bump(CTRC_STAT_PENDING_DUPLICATE);
+	if (trace)
+		ctrc_origin_reply_trace("close.reply", request_id, participant_node_id, result,
+								 noted, progressed, trace_known, &trace_before, &trace_after, NULL);
 	return noted;
 #else
 	(void)request_id;
@@ -3592,6 +3860,9 @@ cluster_ctrc_origin_note_certificate_reply_shared(uint64 request_id, uint16 part
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	ClusterCtrcOriginEntry *matched = NULL;
 	uint64 matched_index = UINT64_MAX;
+	bool trace = cluster_trace_normal_stop;
+	ClusterCtrcOriginEntry trace_before, trace_after;
+	bool trace_known = false;
 	bool noted = false;
 	bool progressed = false;
 	uint64 i;
@@ -3600,6 +3871,10 @@ cluster_ctrc_origin_note_certificate_reply_shared(uint64 request_id, uint16 part
 	if (request_id == 0 || participant_node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS
 		|| !cluster_ctrc_shmem_ready())
 		return false;
+	if (trace) {
+		MemSet(&trace_before, 0, sizeof(trace_before));
+		MemSet(&trace_after, 0, sizeof(trace_after));
+	}
 	bit = UINT32_C(1) << participant_node_id;
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	for (i = 0; i < CtrcShared->origin_key_entries; i++) {
@@ -3619,12 +3894,22 @@ cluster_ctrc_origin_note_certificate_reply_shared(uint64 request_id, uint16 part
 		matched = candidate;
 		matched_index = i;
 	}
-	if (matched != NULL)
+	if (matched != NULL) {
+		if (trace) {
+			trace_before = *matched;
+			trace_known = true;
+		}
 		noted = ctrc_origin_note_certificate_match_locked(matched_index, request_id,
 														  participant_node_id, result, &progressed);
+		if (trace)
+			trace_after = *matched;
+	}
 	LWLockRelease(&CtrcShared->origin_lock);
 	if (noted && progressed)
 		ctrc_semantic_progress(true);
+	if (trace)
+		ctrc_origin_reply_trace("certificate.reply", request_id, participant_node_id, result,
+								 noted, progressed, trace_known, &trace_before, &trace_after, NULL);
 	return noted;
 #else
 	(void)request_id;
@@ -3737,12 +4022,22 @@ cluster_ctrc_origin_note_local_certificate_batch_shared(const ClusterCtrcCloseDi
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	CtrcOriginReplyLookup lookup;
+	bool trace = cluster_trace_normal_stop;
+	CtrcOriginBatchReplyTrace trace_items[CLUSTER_CTRC_RECLAIM_BATCH_MAX];
 	bool progress[CLUSTER_CTRC_RECLAIM_BATCH_MAX] = { false };
 
 	if (results == NULL
 		|| !ctrc_origin_reply_lookup_prepare(&lookup, dispatches, count,
 											 CTRC_SEAL_CERTIFICATE_COMMITTED))
 		return false;
+	if (trace) {
+		MemSet(trace_items, 0, sizeof(trace_items));
+		for (Size i = 0; i < count; i++) {
+			trace_items[i].dispatch = dispatches[i];
+			trace_items[i].reply_result = results[i];
+			trace_items[i].origin_index = UINT64_MAX;
+		}
+	}
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	ctrc_origin_reply_lookup_locked(&lookup, dispatches, 4);
 	/* A row has only one local request ID, so distinct inputs' match sets
@@ -3750,20 +4045,40 @@ cluster_ctrc_origin_note_local_certificate_batch_shared(const ClusterCtrcCloseDi
 	 * two duplicate rows, including its refusal to clear any such origin. */
 	for (Size i = 0; i < count; i++) {
 		bool progressed = false;
+		bool noted = false;
 
 		if (lookup.second[i] != UINT64_MAX) {
 			ctrc_origin_entries()[lookup.first[i]].state = CTRC_ORIGIN_BLOCKED;
 			ctrc_origin_entries()[lookup.second[i]].state = CTRC_ORIGIN_BLOCKED;
-		} else if (lookup.first[i] != UINT64_MAX)
-			progress[i] = ctrc_origin_note_certificate_match_locked(
+		} else if (lookup.first[i] != UINT64_MAX) {
+			if (trace) {
+				ctrc_origin_batch_trace_before(&trace_items[i], lookup.first[i],
+					&ctrc_origin_entries()[lookup.first[i]], (uint16)cluster_node_id);
+				trace_items[i].entry_called = true;
+			}
+			noted = ctrc_origin_note_certificate_match_locked(
 							  lookup.first[i], dispatches[i].request_id, (uint16)cluster_node_id,
-							  results[i], &progressed)
-						  && progressed;
+							  results[i], &progressed);
+			progress[i] = noted && progressed;
+			if (trace)
+				ctrc_origin_batch_trace_after(&trace_items[i],
+					&ctrc_origin_entries()[lookup.first[i]], (uint16)cluster_node_id);
+		}
+		if (trace) {
+			trace_items[i].accepted = noted;
+			trace_items[i].entry_progressed = progressed;
+			trace_items[i].progressed = progress[i];
+			if (lookup.second[i] != UINT64_MAX)
+				trace_items[i].matched_count = 2;
+		}
 	}
 	LWLockRelease(&CtrcShared->origin_lock);
 	for (Size i = 0; i < count; i++)
 		if (progress[i])
 			ctrc_semantic_progress(true);
+	if (trace)
+		for (Size i = 0; i < count; i++)
+			ctrc_origin_batch_reply_trace("local.certificate.reply", &trace_items[i], trace_items[i].reply_result, i, count);
 	return true;
 #else
 	(void)dispatches;
@@ -3791,6 +4106,8 @@ cluster_ctrc_origin_note_local_close_batch_shared(const ClusterCtrcCloseDispatch
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	CtrcOriginReplyLookup lookup;
+	bool trace = cluster_trace_normal_stop;
+	CtrcOriginBatchReplyTrace trace_items[CLUSTER_CTRC_RECLAIM_BATCH_MAX];
 	bool progress[CLUSTER_CTRC_RECLAIM_BATCH_MAX] = { false };
 	bool duplicate[CLUSTER_CTRC_RECLAIM_BATCH_MAX] = { false };
 	bool needs_lookup = false;
@@ -3800,6 +4117,14 @@ cluster_ctrc_origin_note_local_close_batch_shared(const ClusterCtrcCloseDispatch
 		return false;
 	for (Size i = 0; i < count; i++)
 		needs_lookup |= results[i] != CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK;
+	if (trace) {
+		MemSet(trace_items, 0, sizeof(trace_items));
+		for (Size i = 0; i < count; i++) {
+			trace_items[i].dispatch = dispatches[i];
+			trace_items[i].reply_result = results[i];
+			trace_items[i].origin_index = UINT64_MAX;
+		}
+	}
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	if (needs_lookup)
 		ctrc_origin_reply_lookup_locked(&lookup, dispatches, 5);
@@ -3807,15 +4132,32 @@ cluster_ctrc_origin_note_local_close_batch_shared(const ClusterCtrcCloseDispatch
 		bool noted = false;
 
 		if (results[i] == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK)
-			noted = ctrc_origin_ack_land_locked(dispatches[i].request_id, &acks[i], &progress[i]);
+			noted = ctrc_origin_ack_land_locked(dispatches[i].request_id, &acks[i], &progress[i],
+				trace ? &trace_items[i] : NULL);
 		else if (lookup.second[i] != UINT64_MAX) {
 			ctrc_origin_entries()[lookup.first[i]].state = CTRC_ORIGIN_BLOCKED;
 			ctrc_origin_entries()[lookup.second[i]].state = CTRC_ORIGIN_BLOCKED;
-		} else if (lookup.first[i] != UINT64_MAX)
+		} else if (lookup.first[i] != UINT64_MAX) {
+			if (trace) {
+				ctrc_origin_batch_trace_before(&trace_items[i], lookup.first[i],
+					&ctrc_origin_entries()[lookup.first[i]], (uint16)cluster_node_id);
+				trace_items[i].entry_called = true;
+			}
 			noted = ctrc_origin_note_close_match_locked(lookup.first[i], dispatches[i].request_id,
 														(uint16)cluster_node_id, results[i],
 														&progress[i]);
+			if (trace)
+				ctrc_origin_batch_trace_after(&trace_items[i],
+					&ctrc_origin_entries()[lookup.first[i]], (uint16)cluster_node_id);
+		}
 		duplicate[i] = noted && !progress[i] && results[i] == CTRC_SEAL_REPLY_PENDING_DRAIN;
+		if (trace) {
+			trace_items[i].accepted = noted;
+			trace_items[i].progressed = trace_items[i].entry_progressed = progress[i];
+			trace_items[i].pending_duplicate = duplicate[i];
+			if (results[i] != CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK && lookup.second[i] != UINT64_MAX)
+				trace_items[i].matched_count = 2;
+		}
 	}
 	LWLockRelease(&CtrcShared->origin_lock);
 	for (Size i = 0; i < count; i++) {
@@ -3824,6 +4166,9 @@ cluster_ctrc_origin_note_local_close_batch_shared(const ClusterCtrcCloseDispatch
 		else if (duplicate[i])
 			cluster_ctrc_stat_bump(CTRC_STAT_PENDING_DUPLICATE);
 	}
+	if (trace)
+		for (Size i = 0; i < count; i++)
+			ctrc_origin_batch_reply_trace("local.close.reply", &trace_items[i], trace_items[i].reply_result, i, count);
 	return true;
 #else
 	(void)dispatches;
@@ -4896,6 +5241,153 @@ ctrc_cleaner_publish_certificate(const ClusterCtrcOriginCertificateSnapshot *sna
 }
 #endif
 
+/* Passive one-row origin projection after the existing dispatch batch. */
+#ifndef CLUSTER_CTRC_UNIT_TEST
+#define CLUSTER_CTRC_ORIGIN_DISPATCH_TRACE_PRESENT 1
+static uint64 CtrcOriginTraceSequence;
+static uint64 CtrcOriginTraceCriticalSkipped;
+static uint64 CtrcOriginTraceLwlockSkipped;
+
+static void
+ctrc_origin_dispatch_trace_note_lock(LWLock *lock pg_attribute_unused(),
+								   LWLockMode mode pg_attribute_unused(), void *context)
+{
+	*(bool *)context = true;
+}
+
+static void
+ctrc_origin_dispatch_trace(const ClusterCtrcCloseDispatch *dispatch, Size ordinal, Size count)
+{
+	ClusterCtrcOriginEntry actual;
+	ClusterCtrcParticipantIdentity peer = {0};
+	const ClusterCtrcTxnKeyV1 *key;
+	const char *predicate = "snapshot.detached";
+	uint64 index = 0, actual_request = 0, mono_us = 0;
+	struct timespec now;
+	bool held = false, available = false, matches = false, peer_known = false;
+	volatile bool locked = false;
+
+	if (!cluster_trace_normal_stop || dispatch == NULL)
+		return;
+	if (CritSectionCount != 0) {
+		if (CtrcOriginTraceCriticalSkipped != UINT64_MAX)
+			CtrcOriginTraceCriticalSkipped++;
+		return;
+	}
+	ForEachLWLockHeldByMe(ctrc_origin_dispatch_trace_note_lock, &held);
+	if (held) {
+		if (CtrcOriginTraceLwlockSkipped != UINT64_MAX)
+			CtrcOriginTraceLwlockSkipped++;
+		return;
+	}
+	MemSet(&actual, 0, sizeof(actual));
+	key = &dispatch->key;
+	/* Fixed key-to-slot arithmetic, never a table scan/shmem_ready walk. */
+	if (ctrc_runtime_attached()) {
+		if (!ctrc_origin_index(key, &index))
+			predicate = "snapshot.key_shape";
+		else {
+			PG_TRY();
+			{
+				if (LWLockConditionalAcquire(&CtrcShared->origin_lock, LW_SHARED)) {
+					locked = true;
+					actual = ctrc_origin_entries()[index];
+					available = true;
+				} else
+					predicate = "snapshot.lock_busy";
+			}
+			PG_FINALLY();
+			{
+				if (locked)
+					LWLockRelease(&CtrcShared->origin_lock);
+			}
+			PG_END_TRY();
+		}
+	}
+	/* Validate this passive row's relation to the owned dispatch. This is
+	 * not the original mutation guard or a new permission/retirement proof. */
+	if (available) {
+		if (dispatch->participant.node_id < CLUSTER_CTRC_MAX_PARTICIPANTS) {
+			uint32 bit = UINT32_C(1) << dispatch->participant.node_id;
+			peer_known = (actual.touched_bitmap & bit) != 0;
+			peer = actual.touched[dispatch->participant.node_id];
+			actual_request = actual.close_request_id[dispatch->participant.node_id];
+		}
+		if (memcmp(&actual.key, key, sizeof(*key)) != 0)
+			predicate = "snapshot.key";
+		else if (actual.grant_generation != dispatch->grant_generation)
+			predicate = "snapshot.grant";
+		else if (actual.seal_generation != dispatch->seal_generation)
+			predicate = "snapshot.seal";
+		else if (!peer_known)
+			predicate = "snapshot.peer_absent";
+		else if (memcmp(&peer, &dispatch->participant, sizeof(peer)) != 0)
+			predicate = "snapshot.peer_identity";
+		else if (actual_request != dispatch->request_id)
+			predicate = "snapshot.request";
+		else {
+			predicate = "snapshot.matches";
+			matches = true;
+		}
+	}
+	if (clock_gettime(CLOCK_MONOTONIC, &now) == 0 && now.tv_sec >= 0
+		&& (uint64)now.tv_sec <= (UINT64_MAX - 999999) / 1000000)
+		mono_us = (uint64)now.tv_sec * 1000000 + (uint64)now.tv_nsec / 1000;
+	if (CtrcOriginTraceSequence != UINT64_MAX)
+		CtrcOriginTraceSequence++;
+	ereport(LOG, (errmsg_internal(
+		"PGRAC_FAMILY=CTRC_ORIGIN_DISPATCH event=dispatch.batch_return "
+		"event_seq=" UINT64_FORMAT " sequence_scope=process sequence_domain=CTRC_ORIGIN_DISPATCH "
+		"node_id=%d pid=%d procno=%d backend_id=%d backend_type=%d worker_id=%d "
+		"wall_us=" INT64_FORMAT " monotonic_us=" UINT64_FORMAT
+		" identity_source=owned_dispatch run_id_known=0 process_incarnation_known=0 full_xid_known=0 "
+		"delivery_known=0 ack_receipt_known=0 authoritative=0 shared_retired_known=0 shared_atomic_graph=0 "
+		"batch_ordinal=%zu batch_count=%zu request_id=" UINT64_FORMAT " suboperation=%u "
+		"expected_grant=%u expected_seal=" UINT64_FORMAT
+		" expected_system_identifier=" UINT64_FORMAT " expected_origin_node=%u expected_owner_instance=%u "
+		"expected_boot=" UINT64_FORMAT " expected_cluster_epoch=%u expected_formation=" UINT64_FORMAT
+		" expected_admission=" UINT64_FORMAT " expected_root_descriptor=" UINT64_FORMAT
+		" expected_root_id=" UINT64_FORMAT " expected_root_generation=" UINT64_FORMAT
+		" expected_segment=%u expected_segment_generation=%u expected_slot=%u expected_tt_wrap=%u expected_xid=%u "
+		"expected_peer=%u expected_peer_boot=" UINT64_FORMAT " expected_peer_capability=%u "
+		"expected_peer_formation=" UINT64_FORMAT " expected_peer_admission=" UINT64_FORMAT
+		" origin_sample_available=%d origin_binding_match=%d origin_predicate=%s origin_index=" UINT64_FORMAT
+		" origin_state=%u origin_reservation_generation=" UINT64_FORMAT
+		" origin_grant=%u origin_seal=" UINT64_FORMAT " origin_touched=%u origin_dispatched=%u "
+		"origin_close_confirmed=%u origin_ack=%u origin_touched_count=%u "
+		"actual_system_identifier=" UINT64_FORMAT " actual_origin_node=%u actual_owner_instance=%u "
+		"actual_boot=" UINT64_FORMAT " actual_cluster_epoch=%u actual_formation=" UINT64_FORMAT
+		" actual_admission=" UINT64_FORMAT " actual_root_descriptor=" UINT64_FORMAT
+		" actual_root_id=" UINT64_FORMAT " actual_root_generation=" UINT64_FORMAT
+		" actual_segment=%u actual_segment_generation=%u actual_slot=%u actual_tt_wrap=%u actual_xid=%u "
+		"actual_peer_known=%d actual_peer=%u actual_peer_boot=" UINT64_FORMAT " actual_peer_capability=%u "
+		"actual_peer_formation=" UINT64_FORMAT " actual_peer_admission=" UINT64_FORMAT
+		" actual_request_id=" UINT64_FORMAT " critical_skipped=" UINT64_FORMAT
+		" lwlock_skipped=" UINT64_FORMAT " sequence_exhausted=%d",
+		CtrcOriginTraceSequence, cluster_node_id, (int)getpid(), MyProc != NULL ? MyProc->pgprocno : -1,
+		(int)MyBackendId, (int)MyBackendType, CtrcWorkerId, GetCurrentTimestamp(), mono_us,
+		(size_t)ordinal, (size_t)count, dispatch->request_id, dispatch->suboperation,
+		dispatch->grant_generation, dispatch->seal_generation, key->system_identifier,
+		key->origin_node_id, key->owner_instance, key->origin_boot_incarnation, key->cluster_epoch,
+		key->formation_epoch, key->admission_record_generation, key->root_descriptor_incarnation,
+		key->root_id, key->root_generation, key->segment_id, key->segment_generation,
+		key->slot_offset, key->slot_wrap, key->xid, dispatch->participant.node_id,
+		dispatch->participant.boot_incarnation, dispatch->participant.capability_record_generation,
+		dispatch->participant.formation_epoch, dispatch->participant.admission_record_generation,
+		available, matches, predicate, index, actual.state, actual.reservation_generation,
+		actual.grant_generation, actual.seal_generation, actual.touched_bitmap, actual.close_dispatched_bitmap,
+		actual.close_confirmed_bitmap, actual.ack_bitmap, actual.touched_count,
+		actual.key.system_identifier, actual.key.origin_node_id, actual.key.owner_instance,
+		actual.key.origin_boot_incarnation, actual.key.cluster_epoch, actual.key.formation_epoch,
+		actual.key.admission_record_generation, actual.key.root_descriptor_incarnation, actual.key.root_id,
+		actual.key.root_generation, actual.key.segment_id, actual.key.segment_generation,
+		actual.key.slot_offset, actual.key.slot_wrap, actual.key.xid, peer_known, peer.node_id,
+		peer.boot_incarnation, peer.capability_record_generation, peer.formation_epoch,
+		peer.admission_record_generation, actual_request, CtrcOriginTraceCriticalSkipped,
+		CtrcOriginTraceLwlockSkipped, CtrcOriginTraceSequence == UINT64_MAX)));
+}
+#endif
+
 bool
 cluster_ctrc_cleaner_run_pass(void)
 {
@@ -4950,6 +5442,9 @@ cluster_ctrc_cleaner_run_pass(void)
 			/* An accepted duplicate and a remote enqueue are not progress.
 			 * Only the actual shared reply/participant edges record it. */
 			cluster_gcs_ctrc_dispatch_batch(dispatches, dispatch_count);
+			if (cluster_trace_normal_stop)
+				for (Size i = 0; i < dispatch_count; i++)
+					ctrc_origin_dispatch_trace(&dispatches[i], i, dispatch_count);
 		}
 		for (unsigned i = 0;
 			 i < CTRC_CLEANER_CERTIFICATE_BATCH && CtrcBatch.remaining[CTRC_SCAN_CERTIFICATE] != 0;
@@ -5082,13 +5577,13 @@ ctrc_receipt_publication_matches(const ClusterCtrcReceipt *receipt, const Cluste
 		   && ctrc_publication_request_equal(&receipt->publication, publication);
 }
 
-ClusterCtrcPrepareResult
-cluster_ctrc_receipt_prepare_table_locked(
+static ClusterCtrcPrepareResult
+ctrc_receipt_prepare_table_observed(
 	ClusterCtrcParticipantEntry *participant, const ClusterCtrcTxnKeyV1 *key,
 	const ClusterCtrcParticipantIdentity *identity, uint32 grant_generation,
 	const ClusterCtrcPublicationIdV1 *publication, const ClusterCtrcTargetV1 *target,
 	ClusterCtrcReceipt *receipts, uint8 *probe_states, Size receipt_count, uint64 journal_sequence,
-	uint64 *receipt_index_out, Size *probe_count_out)
+	uint64 *receipt_index_out, Size *probe_count_out, ClusterCtrcPreparePath *path_out)
 {
 	uint64 first_tombstone = UINT64_MAX;
 	uint64 hash;
@@ -5099,13 +5594,28 @@ cluster_ctrc_receipt_prepare_table_locked(
 		*receipt_index_out = UINT64_MAX;
 	if (probe_count_out != NULL)
 		*probe_count_out = 0;
+	if (path_out != NULL)
+		*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE;
+	/* Preserve the original short-circuit order and execute each helper
+	 * once. Only the call-local scalar is written at the original cuts. */
 	if (participant == NULL || key == NULL || identity == NULL || publication == NULL
 		|| target == NULL || receipts == NULL || probe_states == NULL || receipt_count == 0
-		|| journal_sequence == 0 || receipt_index_out == NULL
-		|| cluster_ctrc_participant_open(participant, key, grant_generation, identity)
-			   == CLUSTER_CTRC_PARTICIPANT_REFUSED
-		|| !ctrc_publication_prepare_valid(participant, publication, target))
+		|| journal_sequence == 0 || receipt_index_out == NULL) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_INPUT;
 		return CLUSTER_CTRC_PREPARE_REFUSED;
+	}
+	if (cluster_ctrc_participant_open(participant, key, grant_generation, identity)
+		== CLUSTER_CTRC_PARTICIPANT_REFUSED) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_PARTICIPANT;
+		return CLUSTER_CTRC_PREPARE_REFUSED;
+	}
+	if (!ctrc_publication_prepare_valid(participant, publication, target)) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_PUBLICATION;
+		return CLUSTER_CTRC_PREPARE_REFUSED;
+	}
 
 	hash = ctrc_receipt_probe_hash(key, publication);
 	for (probe = 0; probe < receipt_count; probe++) {
@@ -5119,6 +5629,8 @@ cluster_ctrc_receipt_prepare_table_locked(
 		if (probe_state == CTRC_RECEIPT_PROBE_EMPTY) {
 			if (!ctrc_bytes_zero(receipt, sizeof(*receipt))) {
 				participant->state = CTRC_PARTICIPANT_BLOCKED;
+				if (path_out != NULL)
+					*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_EMPTY_BYTES;
 				return CLUSTER_CTRC_PREPARE_REFUSED;
 			}
 			selected_index = first_tombstone != UINT64_MAX ? first_tombstone : index;
@@ -5127,6 +5639,8 @@ cluster_ctrc_receipt_prepare_table_locked(
 		if (probe_state == CTRC_RECEIPT_PROBE_TOMBSTONE) {
 			if (!ctrc_bytes_zero(receipt, sizeof(*receipt))) {
 				participant->state = CTRC_PARTICIPANT_BLOCKED;
+				if (path_out != NULL)
+					*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_TOMBSTONE_BYTES;
 				return CLUSTER_CTRC_PREPARE_REFUSED;
 			}
 			if (first_tombstone == UINT64_MAX)
@@ -5136,6 +5650,8 @@ cluster_ctrc_receipt_prepare_table_locked(
 		if (probe_state != CTRC_RECEIPT_PROBE_OCCUPIED || state == CTRC_RECEIPT_FREE
 			|| ctrc_bytes_zero(receipt, sizeof(*receipt))) {
 			participant->state = CTRC_PARTICIPANT_BLOCKED;
+			if (path_out != NULL)
+				*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_OCCUPIED;
 			return CLUSTER_CTRC_PREPARE_REFUSED;
 		}
 
@@ -5148,20 +5664,41 @@ cluster_ctrc_receipt_prepare_table_locked(
 				return CLUSTER_CTRC_PREPARE_DUPLICATE;
 			}
 			participant->state = CTRC_PARTICIPANT_BLOCKED;
+			if (path_out != NULL)
+				*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_DUPLICATE_CONFLICT;
 			return CLUSTER_CTRC_PREPARE_REFUSED;
 		}
 	}
 	if (selected_index == UINT64_MAX)
 		selected_index = first_tombstone;
-	if (selected_index == UINT64_MAX)
+	if (selected_index == UINT64_MAX) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_CAPACITY;
 		return CLUSTER_CTRC_PREPARE_CAPACITY;
+	}
 	if (ctrc_receipt_prepare_with_sequence(participant, publication, target,
 										   &receipts[selected_index], journal_sequence)
-		!= CLUSTER_CTRC_PREPARE_READY)
+		!= CLUSTER_CTRC_PREPARE_READY) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_SLOT_PREPARE;
 		return CLUSTER_CTRC_PREPARE_REFUSED;
+	}
 	probe_states[selected_index] = CTRC_RECEIPT_PROBE_OCCUPIED;
 	*receipt_index_out = selected_index;
 	return CLUSTER_CTRC_PREPARE_READY;
+}
+
+ClusterCtrcPrepareResult
+cluster_ctrc_receipt_prepare_table_locked(
+	ClusterCtrcParticipantEntry *participant, const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *identity, uint32 grant_generation,
+	const ClusterCtrcPublicationIdV1 *publication, const ClusterCtrcTargetV1 *target,
+	ClusterCtrcReceipt *receipts, uint8 *probe_states, Size receipt_count, uint64 journal_sequence,
+	uint64 *receipt_index_out, Size *probe_count_out)
+{
+	return ctrc_receipt_prepare_table_observed(participant, key, identity, grant_generation,
+		publication, target, receipts, probe_states, receipt_count, journal_sequence,
+		receipt_index_out, probe_count_out, NULL);
 }
 
 bool
@@ -5503,6 +6040,115 @@ ctrc_receipt_prepare_existing_locked(ClusterCtrcParticipantEntry *participant,
 }
 #endif
 
+/* Passive exact-handle observation for safe caller diagnostics. */
+#ifndef CLUSTER_CTRC_UNIT_TEST
+static void
+ctrc_receipt_observe_note_lock(LWLock *lock pg_attribute_unused(),
+							  LWLockMode mode pg_attribute_unused(), void *context)
+{
+	*(bool *)context = true;
+}
+#endif
+
+#define CLUSTER_CTRC_RECEIPT_OBSERVER_PRESENT 1
+bool
+cluster_ctrc_receipt_observe_shared(const ClusterCtrcReceiptHandle *handle,
+								  ClusterCtrcReceiptObservation *out)
+{
+	if (out == NULL)
+		return false;
+	MemSet(out, 0, sizeof(*out));
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	{
+		ClusterCtrcReceiptObservation sampled;
+		ClusterCtrcParticipantEntry *participant;
+		ClusterCtrcReceipt *receipt;
+		LWLock *participant_lock;
+		uint32 mask;
+		unsigned shard;
+		bool held = false, observed = false;
+		volatile bool participant_locked = false, receipt_locked = false;
+
+		if (CritSectionCount != 0 || !ctrc_runtime_attached() || handle == NULL
+			|| !handle->valid || handle->journal_slot_generation == 0
+			|| !ctrc_bytes_zero(handle->reserved8, sizeof(handle->reserved8))
+			|| CtrcShared->origin_key_entries == 0
+			|| CtrcShared->participant_key_entries < CtrcShared->origin_key_entries
+			|| handle->participant_index >= CtrcShared->participant_key_entries
+			|| handle->receipt_index >= CtrcShared->receipt_entries)
+			return false;
+		ForEachLWLockHeldByMe(ctrc_receipt_observe_note_lock, &held);
+		if (held)
+			return false;
+		participant = &ctrc_participant_entries()[handle->participant_index];
+		receipt = &ctrc_receipt_entries()[handle->receipt_index];
+		if (handle->participant != participant || handle->receipt != receipt)
+			return false;
+		mask = ctrc_participant_lock_mask(handle->participant_index);
+		for (shard = 0; shard < CLUSTER_CTRC_CLEANER_WORKERS; shard++)
+			if ((mask & (UINT32_C(1) << shard)) != 0)
+				break;
+		if (shard == CLUSTER_CTRC_CLEANER_WORKERS)
+			return false;
+		participant_lock = &CtrcShared->participant_locks[shard].lock;
+		MemSet(&sampled, 0, sizeof(sampled));
+		PG_TRY();
+		{
+			do {
+				if (!LWLockConditionalAcquire(participant_lock, LW_SHARED))
+					break;
+				participant_locked = true;
+				if (!LWLockConditionalAcquire(&CtrcShared->receipt_lock, LW_SHARED))
+					break;
+				receipt_locked = true;
+				/* Fixed storage/key/publication binding only. Do not repeat
+				 * cluster_ctrc_shmem_ready's whole-capacity validation here. */
+				if (receipt->publication.journal_slot_generation != handle->journal_slot_generation
+					|| memcmp(&participant->key, &handle->key, sizeof(handle->key)) != 0
+					|| memcmp(&receipt->key, &handle->key, sizeof(handle->key)) != 0)
+					break;
+				sampled.state_before = pg_atomic_read_u32((pg_atomic_uint32 *)&receipt->state);
+				sampled.key = receipt->key;
+				sampled.participant = participant->identity;
+				sampled.publication = receipt->publication;
+				/* APPLY/cancel need not take these table locks. These fixed
+				 * byte copies and individual atomic counters are projections,
+				 * not a coherent mutable-state cut or reusable permission. */
+				sampled.target = receipt->target;
+				sampled.participant_state = participant->state;
+				sampled.grant_generation = participant->grant_generation;
+				sampled.receipt_count = pg_atomic_read_u64((pg_atomic_uint64 *)&participant->receipt_count);
+				sampled.prepared_count = pg_atomic_read_u64((pg_atomic_uint64 *)&participant->prepared_count);
+				sampled.applied_count = pg_atomic_read_u64((pg_atomic_uint64 *)&participant->applied_count);
+				sampled.cancelled_count = pg_atomic_read_u64((pg_atomic_uint64 *)&participant->cancelled_count);
+				sampled.cleaned_count = pg_atomic_read_u64((pg_atomic_uint64 *)&participant->cleaned_count);
+				sampled.ack_frozen_count = pg_atomic_read_u64((pg_atomic_uint64 *)&participant->ack_frozen_count);
+				sampled.seal_generation = participant->seal_generation;
+				sampled.last_key_sequence = participant->last_key_sequence;
+				sampled.disposition = receipt->disposition;
+				sampled.highest_local_wal_lsn = receipt->highest_local_wal_lsn;
+				sampled.state_after = pg_atomic_read_u32((pg_atomic_uint32 *)&receipt->state);
+				observed = true;
+			} while (false);
+		}
+		PG_FINALLY();
+		{
+			if (receipt_locked)
+				LWLockRelease(&CtrcShared->receipt_lock);
+			if (participant_locked)
+				LWLockRelease(participant_lock);
+		}
+		PG_END_TRY();
+		if (observed)
+			*out = sampled;
+		return observed;
+	}
+#else
+	(void)handle;
+	return false;
+#endif
+}
+
 static ClusterCtrcPrepareResult
 ctrc_receipt_prepare_refused(bool invalid_namespace)
 {
@@ -5549,7 +6195,8 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 									 const ClusterCtrcPublicationIdV1 *publication,
 									 const ClusterCtrcTargetV1 *target,
 									 ClusterCtrcReceiptHandle *handle,
-									 const ClusterKoPeerAdmissionV3 *continuation)
+									 const ClusterKoPeerAdmissionV3 *continuation,
+									 ClusterCtrcPreparePath *path_out)
 {
 	ClusterCtrcParticipantEntry *participant;
 	ClusterCtrcReceipt *receipts;
@@ -5565,18 +6212,26 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 	bool local_origin;
 	bool participant_was_empty;
 
+	if (path_out != NULL)
+		*path_out = CLUSTER_CTRC_PREPARE_PATH_UNKNOWN;
 	if (handle != NULL)
 		MemSet(handle, 0, sizeof(*handle));
 	/* Report this exact input predicate before any journal or participant
 	 * mutation. Unknown transaction/owner state remains a separate refusal. */
 	if (target != NULL
-		&& !ctrc_relation_namespace_valid(target->spc_oid, target->db_oid, target->rel_number))
+		&& !ctrc_relation_namespace_valid(target->spc_oid, target->db_oid, target->rel_number)) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_NAMESPACE;
 		return ctrc_receipt_prepare_refused(true);
+	}
 	if (handle == NULL || identity == NULL || publication == NULL || target == NULL
 		|| cluster_node_id < 0 || identity->node_id != (uint16)cluster_node_id
 		|| !cluster_ctrc_shmem_ready()
-		|| !ctrc_participant_index(key, identity->node_id, &participant_index))
+		|| !ctrc_participant_index(key, identity->node_id, &participant_index)) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_INPUT;
 		return ctrc_receipt_prepare_refused(false);
+	}
 	locator = (RelFileLocator){ target->spc_oid, target->db_oid, target->rel_number };
 	check_object = cluster_shared_config && cluster_interconnect_tier == CLUSTER_IC_TIER_1
 				   && cluster_smgr_which_for(locator, InvalidBackendId) == 1;
@@ -5589,8 +6244,11 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 	}
 	/* No object lock may be acquired under the original CTRC locks. A
 	 * refused sample only looks for an exact already accepted duplicate. */
-	if ((!check_object || sampled) && !ctrc_allocate_journal_sequence(&journal_sequence))
+	if ((!check_object || sampled) && !ctrc_allocate_journal_sequence(&journal_sequence)) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_JOURNAL;
 		return ctrc_receipt_prepare_refused(false);
+	}
 
 	/* The allocator above takes origin_lock exclusively. Recheck only after
 	 * it releases that lock, then hold local origin protection through the
@@ -5611,14 +6269,24 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 	ctrc_participant_locks_acquire(ctrc_participant_lock_mask(participant_index));
 	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
 	participant_was_empty = ctrc_bytes_zero(participant, sizeof(*participant));
+	/* Only scalar call-local stores accompany the original predicates under
+	 * these locks. Do not log, call an observer, or repeat a table probe here. */
 	if (FullTransactionIdIsValid(original_full_xid)
 		&& FullTransactionIdIsValid(participant->original_full_xid)
 		&& !FullTransactionIdEquals(original_full_xid, participant->original_full_xid)) {
 		/* Same physical grant cannot silently acquire another original epoch.
 		 * Reject before receipt/participant mutation and retain both owners. */
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_ORIGINAL_FULL_XID;
 		result = CLUSTER_CTRC_PREPARE_REFUSED;
-	} else if (!ctrc_receipt_chain_exact_locked(participant_index, false)
-			   || !ctrc_receipt_prepare_locators_valid_locked(key, publication)) {
+	} else if (!ctrc_receipt_chain_exact_locked(participant_index, false)) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_CHAIN;
+		participant->state = CTRC_PARTICIPANT_BLOCKED;
+		result = CLUSTER_CTRC_PREPARE_REFUSED;
+	} else if (!ctrc_receipt_prepare_locators_valid_locked(key, publication)) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_LOCATOR;
 		participant->state = CTRC_PARTICIPANT_BLOCKED;
 		result = CLUSTER_CTRC_PREPARE_REFUSED;
 	} else if (check_object
@@ -5629,14 +6297,16 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 									 &admission, locator, (ForkNumber)target->fork_number,
 									 target->block_number)
 						   : !cluster_ko_peer_admission_current_v3(&admission, locator)))) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_OBJECT_EXISTING;
 		result = ctrc_receipt_prepare_existing_locked(participant, participant_index, key, identity,
 													  grant_generation, publication, target,
 													  &receipt_index);
 	} else {
-		result = cluster_ctrc_receipt_prepare_table_locked(
+		result = ctrc_receipt_prepare_table_observed(
 			participant, key, identity, grant_generation, publication, target, receipts,
 			ctrc_receipt_probe_states(), CtrcShared->receipt_entries, journal_sequence,
-			&receipt_index, NULL);
+			&receipt_index, NULL, path_out);
 		if (result == CLUSTER_CTRC_PREPARE_READY) {
 			CtrcReceiptLink *link = &ctrc_receipt_links()[receipt_index];
 
@@ -5687,15 +6357,30 @@ cluster_ctrc_receipt_prepare_shared(const ClusterCtrcTxnKeyV1 *key,
 									const ClusterCtrcTargetV1 *target,
 									ClusterCtrcReceiptHandle *handle)
 {
+	return cluster_ctrc_receipt_prepare_shared_observed(key, identity, grant_generation,
+		publication, target, handle, NULL);
+}
+
+ClusterCtrcPrepareResult
+cluster_ctrc_receipt_prepare_shared_observed(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *identity, uint32 grant_generation,
+	const ClusterCtrcPublicationIdV1 *publication, const ClusterCtrcTargetV1 *target,
+	ClusterCtrcReceiptHandle *handle, ClusterCtrcPreparePath *path_out)
+{
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	return ctrc_receipt_prepare_shared_internal(key, identity, grant_generation, publication,
-												target, handle, NULL);
+												target, handle, NULL, path_out);
 #else
+	if (path_out != NULL)
+		*path_out = CLUSTER_CTRC_PREPARE_PATH_UNKNOWN;
 	if (handle != NULL)
 		MemSet(handle, 0, sizeof(*handle));
 	if (target != NULL
-		&& !ctrc_relation_namespace_valid(target->spc_oid, target->db_oid, target->rel_number))
+		&& !ctrc_relation_namespace_valid(target->spc_oid, target->db_oid, target->rel_number)) {
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_NAMESPACE;
 		return ctrc_receipt_prepare_refused(true);
+	}
 	(void)key;
 	(void)identity;
 	(void)grant_generation;
@@ -6357,7 +7042,7 @@ cluster_ctrc_origin_ack_land_entry(ClusterCtrcOriginEntry *origin, uint64 reques
 #ifndef CLUSTER_CTRC_UNIT_TEST
 static bool
 ctrc_origin_ack_land_locked(uint64 request_id, const ClusterCtrcLocalReleaseAckV1 *ack,
-							bool *progressed)
+							bool *progressed, CtrcOriginBatchReplyTrace *trace)
 {
 	ClusterCtrcOriginEntry *origin;
 	uint64 origin_index;
@@ -6372,9 +7057,22 @@ ctrc_origin_ack_land_locked(uint64 request_id, const ClusterCtrcLocalReleaseAckV
 		return false;
 	origin = &ctrc_origin_entries()[origin_index];
 	ack_before = origin->ack_bitmap;
+	if (trace != NULL) {
+		ctrc_origin_batch_trace_before(trace, origin_index, origin, ack->participant_node_id);
+		trace->entry_called = true;
+		trace->input_ack_known = true;
+		trace->input_node = ack->participant_node_id;
+		trace->input_grant = ack->grant_generation;
+		trace->input_seal = ack->seal_generation;
+		trace->input_crc = ack->crc32c;
+		trace->input_key_matches_before
+			= memcmp(&origin->key, &ack->transaction_key, sizeof(origin->key)) == 0;
+	}
 	landed = cluster_ctrc_origin_ack_land_entry(origin, request_id, ack,
 												&ctrc_origin_ack_entries()[ack_index]);
 	*progressed = landed && ack_before != origin->ack_bitmap;
+	if (trace != NULL)
+		ctrc_origin_batch_trace_after(trace, origin, ack->participant_node_id);
 	return landed;
 }
 #endif
@@ -6384,6 +7082,9 @@ cluster_ctrc_origin_ack_land_shared(uint64 request_id, const ClusterCtrcLocalRel
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	uint64 origin_index, ack_index;
+	bool trace = cluster_trace_normal_stop;
+	ClusterCtrcOriginEntry trace_before, trace_after;
+	ClusterCtrcLocalReleaseAckV1 trace_input;
 	bool landed;
 	bool progressed;
 
@@ -6392,10 +7093,20 @@ cluster_ctrc_origin_ack_land_shared(uint64 request_id, const ClusterCtrcLocalRel
 		|| !ctrc_origin_ack_index(&ack->transaction_key, ack->participant_node_id, &ack_index))
 		return false;
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
-	landed = ctrc_origin_ack_land_locked(request_id, ack, &progressed);
+	if (trace) {
+		trace_before = ctrc_origin_entries()[origin_index];
+		trace_input = *ack;
+	}
+	landed = ctrc_origin_ack_land_locked(request_id, ack, &progressed, NULL);
+	if (trace)
+		trace_after = ctrc_origin_entries()[origin_index];
 	LWLockRelease(&CtrcShared->origin_lock);
 	if (progressed)
 		ctrc_semantic_progress(true);
+	if (trace)
+		ctrc_origin_reply_trace("ack.land", request_id, trace_input.participant_node_id,
+			CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK, landed, progressed, true,
+			&trace_before, &trace_after, &trace_input);
 	return landed;
 #else
 	(void)request_id;
@@ -8430,7 +9141,7 @@ ctrc_cleaner_prepare_current_mx_successor(
 		publication.grant_generation = grant;
 		prepare_result = ctrc_receipt_prepare_shared_internal(
 			&key, &participant, grant, &publication, &pending_target, &handles[prepared_count],
-			check_object ? &admission : NULL);
+			check_object ? &admission : NULL, NULL);
 		if (prepare_result != CLUSTER_CTRC_PREPARE_READY
 			&& prepare_result != CLUSTER_CTRC_PREPARE_DUPLICATE)
 			goto successor_failed;

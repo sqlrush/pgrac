@@ -675,7 +675,7 @@ typedef struct ClusterKoDropTraceV1 {
 	uint32 phase, step, provider_step, cursor, prefix_cursor, local_result;
 	uint32 gate_phase;
 	uint64 revision, current_revision, gate_formation, gate_freeze, selections;
-	int64 observed_pg_us;
+	int64 observed_pg_us, last_progress_pg_us;
 	int32 forknum, io_error;
 	bool observed, gate_observed, io_attempted, drop_pending, failed;
 } ClusterKoDropTraceV1;
@@ -686,6 +686,8 @@ typedef struct ClusterKoDropTraceV1 {
 #define CLUSTER_KO_DROP_TRACE_FINISH 4
 
 extern bool cluster_ko_drop_pending_v1(ClusterKoDropTraceV1 *out);
+/* Passive per-instance records, joined across node logs; no remote authority. */
+extern void cluster_ko_normal_stop_trace_v1(void);
 extern void cluster_ko_drop_work_note_v1(ClusterKoDropWorkV2 *work, uint32 phase,
 	uint32 step, ForkNumber fork, bool io_attempted, int io_error);
 /* End only this node's original background work, after its complete local
@@ -753,7 +755,9 @@ extern void cluster_ko_flush_ack_handler(const ClusterICEnvelope *env, const voi
  * Runs in the aux process (off the LMON heartbeat path) because the drop is a
  * full buffer-pool scan.
  */
-extern void cluster_ko_drain_inbound_and_apply(void);
+/* True only when an inbound item or the original bounded peer owner advanced.
+ * No progress means the SI loop may wait for another owner or input. */
+extern bool cluster_ko_drain_inbound_and_apply(void);
 /* Original SI error owner, after its LWLocks/pins have been released and
  * before FlushErrorState. Records only the exact active v3 attempt. */
 extern void cluster_ko_peer_apply_error_v3(int sqlerrcode);

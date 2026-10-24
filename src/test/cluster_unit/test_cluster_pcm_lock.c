@@ -72,6 +72,7 @@
 #include "miscadmin.h"
 #include "storage/backendid.h"	   /* spec-6.14 D9 amend — MyBackendId stub */
 #include "storage/buf_internals.h" /* BufferTag */
+#include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/spin.h"
 #include "utils/hsearch.h"
@@ -114,6 +115,12 @@ UT_DEFINE_GLOBALS();
  * ============================================================ */
 
 int cluster_node_id = 0;
+bool cluster_trace_normal_stop = false;
+static unsigned fake_pcm_timestamp_calls;
+static bool fake_pcm_capture_census_log;
+static unsigned fake_pcm_census_logs;
+static int fake_pcm_error_level;
+static char fake_pcm_census_text[256];
 bool cluster_enabled = false;
 bool cluster_shared_config = false;
 bool IsUnderPostmaster = false;
@@ -231,6 +238,23 @@ cluster_wait_trace_emit(ClusterWaitTraceKind kind, const ClusterWaitTrace *row)
 	UT_ASSERT(wait_trace_count < lengthof(wait_trace_rows));
 	wait_trace_kinds[wait_trace_count] = kind;
 	wait_trace_rows[wait_trace_count++] = *row;
+}
+
+static int fake_pcm_exit_hook_registrations = 0;
+
+extern void cluster_pcm_lock_register_backend_exit_hook(void);
+
+void
+before_shmem_exit(pg_on_exit_callback function pg_attribute_unused(),
+				  Datum arg pg_attribute_unused())
+{
+	fake_pcm_exit_hook_registrations++;
+}
+
+void
+cancel_before_shmem_exit(pg_on_exit_callback function pg_attribute_unused(),
+						 Datum arg pg_attribute_unused())
+{
 }
 /* Object admission is a boundary fixture; PCM round/caller transitions below
  * remain the real product object. Tests may race the original entry lock. */
@@ -485,6 +509,34 @@ cluster_ic_tier1_resource_x_stream_generation(int32 peer, int channel)
 static void (*fake_pcm_clock_hook)(void);
 static unsigned int fake_pcm_clock_hook_countdown;
 int cluster_test_pcm_clock_gettime(clockid_t clock_id, struct timespec *time_out);
+int cluster_test_pcm_memcmp(const void *left, const void *right, size_t bytes);
+
+static bool fake_pcm_count_comparisons;
+static Size fake_pcm_max_compare_bytes;
+static unsigned fake_pcm_full_state_compares;
+static const void *fake_pcm_first_master_compare;
+
+int
+cluster_test_pcm_memcmp(const void *left, const void *right, size_t bytes)
+{
+	if (fake_pcm_count_comparisons) {
+		fake_pcm_max_compare_bytes = Max(fake_pcm_max_compare_bytes, bytes);
+		if (bytes == 49960)
+			fake_pcm_full_state_compares++;
+		if ((bytes == 304 || bytes == 49960) && fake_pcm_first_master_compare == NULL)
+			fake_pcm_first_master_compare = left;
+	}
+	return memcmp(left, right, bytes);
+}
+
+static void
+pcm_comparison_count_begin(void)
+{
+	fake_pcm_max_compare_bytes = 0;
+	fake_pcm_full_state_compares = 0;
+	fake_pcm_first_master_compare = NULL;
+	fake_pcm_count_comparisons = true;
+}
 
 int
 cluster_test_pcm_clock_gettime(clockid_t clock_id, struct timespec *time_out)
@@ -516,6 +568,7 @@ static union {
 } fake_pcm_entries;
 
 static char fake_pcm_htab_token;
+static uint64 fake_pcm_hash_find_calls;
 static bool fake_pcm_header_found = false;
 static Size fake_pcm_header_requested_size = 0;
 static long fake_pcm_entry_count = 0;
@@ -948,6 +1001,8 @@ hash_search(HTAB *hashp pg_attribute_unused(), const void *keyPtr pg_attribute_u
 	Assert(hashp == (HTAB *)&fake_pcm_htab_token);
 	Assert(fake_pcm_keysize > 0);
 	Assert(fake_pcm_entrysize > 0);
+	if (action == HASH_FIND)
+		fake_pcm_hash_find_calls++;
 
 	for (i = 0; i < fake_pcm_entry_count; i++) {
 		char *entry = fake_pcm_entries.data[i];
@@ -1208,6 +1263,7 @@ ConditionVariableSignal(ConditionVariable *cv pg_attribute_unused())
 TimestampTz
 GetCurrentTimestamp(void)
 {
+	fake_pcm_timestamp_calls++;
 	return (TimestampTz)0;
 }
 
@@ -1372,7 +1428,8 @@ cluster_gcs_block_fallback_verify_refresh(struct BufferDesc *buf pg_attribute_un
 bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
-	return elevel >= ERROR;
+	fake_pcm_error_level = elevel;
+	return elevel >= ERROR || (fake_pcm_capture_census_log && elevel == LOG);
 }
 
 bool
@@ -1385,6 +1442,8 @@ void
 errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
 {
+	if (fake_pcm_error_level == LOG)
+		return;
 	ut_ereport_fired_count++;
 	if (fake_error_use_pg_exception_stack && PG_exception_stack != NULL)
 		siglongjmp(*PG_exception_stack, 1);
@@ -1402,6 +1461,13 @@ errcode(int sqlerrcode)
 int
 errmsg(const char *fmt pg_attribute_unused(), ...)
 {
+	if (fake_pcm_capture_census_log && strstr(fmt, "PCM normal-stop census") != NULL) {
+		va_list args;
+		va_start(args, fmt);
+		vsnprintf(fake_pcm_census_text, sizeof(fake_pcm_census_text), fmt, args);
+		va_end(args);
+		fake_pcm_census_logs++;
+	}
 	return 0;
 }
 
@@ -1464,6 +1530,25 @@ UT_TEST(test_pcm_lock_mode_constant_aliases_match_pcm_state)
 	UT_ASSERT_EQ((int)PCM_LOCK_MODE_N, (int)PCM_STATE_N);
 	UT_ASSERT_EQ((int)PCM_LOCK_MODE_S, (int)PCM_STATE_S);
 	UT_ASSERT_EQ((int)PCM_LOCK_MODE_X, (int)PCM_STATE_X);
+}
+
+UT_TEST(test_pcm_executor_exit_hook_registration_is_idempotent)
+{
+	bool saved_under_postmaster = IsUnderPostmaster;
+	BackendType saved_backend_type = MyBackendType;
+	BackendId saved_backend_id = MyBackendId;
+
+	fake_pcm_exit_hook_registrations = 0;
+	IsUnderPostmaster = true;
+	MyBackendType = B_LMS;
+	MyBackendId = InvalidBackendId;
+	cluster_pcm_lock_register_backend_exit_hook();
+	MyBackendId = 1;
+	cluster_pcm_lock_register_backend_exit_hook();
+	UT_ASSERT_EQ(fake_pcm_exit_hook_registrations, 1);
+	IsUnderPostmaster = saved_under_postmaster;
+	MyBackendType = saved_backend_type;
+	MyBackendId = saved_backend_id;
 }
 
 UT_TEST(test_pcm_lock_transition_count_is_9)
@@ -21418,6 +21503,254 @@ pi_relation_scan_setup(void)
 	cluster_shared_config = true;
 }
 
+static void
+pcm_scan_retire_fixture(BufferTag tag)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	uint64 generation;
+	UT_ASSERT(pcm_entry_ref_acquire(&tag, true, &ref, &acquired));
+	generation = ref.binding_generation;
+	pcm_entry_ref_release(&ref);
+	UT_ASSERT(pcm_entry_try_retire_exact(&tag, generation, PCM_RETIRE_REASON_HOLDER_RELEASE));
+}
+
+UT_TEST(test_relation_scan_inactive_slots_read_only_registry)
+{
+	ClusterPcmPiRelationScanV2 (*scans[])(RelFileLocator, uint64, uint32, uint32 *) = {
+		cluster_pcm_lock_pi_relation_scan_v2,
+		cluster_pcm_lock_ko_relation_scan_v3,
+		cluster_pcm_lock_ko_local_relation_scan_v3,
+		cluster_pcm_lock_ko_directory_relation_scan_v3,
+	};
+	BufferTag tag = make_tag(6810);
+	RelFileLocator locator = BufTagGetRelFileLocator(&tag);
+	for (int retired = 0; retired < 2; retired++) {
+		for (unsigned role = 0; role < lengthof(scans); role++) {
+			uint32 cursor = 0;
+			pi_relation_scan_setup();
+			if (retired)
+				pcm_scan_retire_fixture(tag);
+			pcm_comparison_count_begin();
+			UT_ASSERT_EQ(scans[role](locator, 17, 4, &cursor), CLUSTER_PCM_PI_RELATION_EMPTY);
+			fake_pcm_count_comparisons = false;
+			UT_ASSERT_EQ(cursor, 4);
+			UT_ASSERT_EQ(fake_pcm_full_state_compares, 0);
+			UT_ASSERT(fake_pcm_max_compare_bytes <= 48);
+			UT_ASSERT(fake_pcm_first_master_compare == NULL);
+		}
+	}
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_normal_stop_inactive_slots_read_only_registry)
+{
+	for (int retired = 0; retired < 2; retired++) {
+		pi_relation_scan_setup();
+		if (retired)
+			pcm_scan_retire_fixture(make_tag(6810));
+		pcm_comparison_count_begin();
+		UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+		fake_pcm_count_comparisons = false;
+		UT_ASSERT_EQ(fake_pcm_full_state_compares, 0);
+		UT_ASSERT(fake_pcm_max_compare_bytes <= 48);
+		UT_ASSERT(fake_pcm_first_master_compare == NULL);
+	}
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_inactive_master_body_is_outside_scan_integrity_proof)
+{
+#ifdef USE_ASSERT_CHECKING
+	BufferTag tag = make_tag(6810);
+	RelFileLocator locator = BufTagGetRelFileLocator(&tag);
+	for (int retired = 0; retired < 2; retired++) {
+		uint32 cursor = 0;
+		unsigned char *state;
+		/* The original EMPTY publication validates every zero body.
+		 * Observe that real address before the scan counter is reset. */
+		pcm_comparison_count_begin();
+		pi_relation_scan_setup();
+		fake_pcm_count_comparisons = false;
+		state = (unsigned char *)fake_pcm_first_master_compare;
+		UT_ASSERT_NOT_NULL(state);
+		if (state == NULL)
+			continue;
+		if (retired)
+			pcm_scan_retire_fixture(tag);
+		/* Deliberately damage only fixture-owned inactive storage. These
+		 * scans prove registry lifecycle, not inactive-body integrity. */
+		memset(state, 0xa5, 49960);
+		pcm_comparison_count_begin();
+		UT_ASSERT_EQ(cluster_pcm_lock_ko_relation_scan_v3(locator, 17, 4, &cursor),
+					 CLUSTER_PCM_PI_RELATION_EMPTY);
+		UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+		fake_pcm_count_comparisons = false;
+		UT_ASSERT_EQ(cursor, 4);
+		UT_ASSERT(fake_pcm_max_compare_bytes <= 48);
+		UT_ASSERT(fake_pcm_first_master_compare == NULL);
+		memset(state, 0, 49960);
+	}
+	cluster_shared_config = false;
+#endif
+}
+
+UT_TEST(test_retirement_establishes_and_checks_zero_inactive_body)
+{
+#ifdef USE_ASSERT_CHECKING
+	static const unsigned char zero[49960];
+#endif
+	pi_relation_scan_setup();
+	pcm_comparison_count_begin();
+	pcm_scan_retire_fixture(make_tag(6810));
+	fake_pcm_count_comparisons = false;
+#ifdef USE_ASSERT_CHECKING
+	UT_ASSERT(fake_pcm_full_state_compares > 0);
+	UT_ASSERT_NOT_NULL(fake_pcm_first_master_compare);
+	if (fake_pcm_first_master_compare != NULL)
+		UT_ASSERT_EQ(memcmp(fake_pcm_first_master_compare, zero, sizeof(zero)), 0);
+#endif
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_normal_stop_census_timing_is_default_off_and_lock_free)
+{
+	LWLock lock;
+	pi_relation_scan_setup();
+	fake_pcm_capture_census_log = true;
+	fake_pcm_timestamp_calls = fake_pcm_census_logs = 0;
+	UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(fake_pcm_census_logs, 0);
+	UT_ASSERT_EQ(fake_pcm_timestamp_calls, 0);
+	cluster_trace_normal_stop = true;
+	UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(fake_pcm_census_logs, 1);
+	UT_ASSERT_EQ(fake_pcm_timestamp_calls, 2);
+	UT_ASSERT(strstr(fake_pcm_census_text, "post_checkpoint=0 retire_pi=0") != NULL);
+	UT_ASSERT(strstr(fake_pcm_census_text, "slots=4 elapsed_us=0") != NULL);
+	LWLockInitialize(&lock, 0);
+	LWLockAcquire(&lock, LW_SHARED);
+	UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(fake_pcm_census_logs, 1);
+	LWLockRelease(&lock);
+	CritSectionCount = 1;
+	UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(fake_pcm_census_logs, 1);
+	CritSectionCount = 0;
+	fake_pcm_capture_census_log = cluster_trace_normal_stop = cluster_shared_config = false;
+}
+
+/* Count real production scan lookups, after constructing the registry. */
+UT_TEST(test_relation_scan_hashes_only_the_target_in_every_role)
+{
+	ClusterPcmPiRelationScanV2 (*scans[])(RelFileLocator, uint64, uint32, uint32 *) = {
+		cluster_pcm_lock_pi_relation_scan_v2,
+		cluster_pcm_lock_ko_relation_scan_v3,
+		cluster_pcm_lock_ko_local_relation_scan_v3,
+		cluster_pcm_lock_ko_directory_relation_scan_v3,
+	};
+
+	for (unsigned role = 0; role < lengthof(scans); role++) {
+		BufferTag target = make_tag(6811);
+		RelFileLocator locator = BufTagGetRelFileLocator(&target);
+		PcmEntryAcquireResult acquired;
+		PcmEntryRef ref;
+		uint32 cursor = 0;
+
+		pi_relation_scan_setup();
+		for (unsigned index = 0; index < 4; index++) {
+			BufferTag tag = target;
+
+			if (index != 3)
+				tag.relNumber += index + 1;
+			UT_ASSERT(pcm_entry_ref_acquire(&tag, true, &ref, &acquired));
+			pcm_entry_ref_release(&ref);
+		}
+		fake_pcm_hash_find_calls = 0;
+		UT_ASSERT_EQ(scans[role](locator, 17, 4, &cursor), CLUSTER_PCM_PI_RELATION_EMPTY);
+		UT_ASSERT_EQ(cursor, 4);
+		UT_ASSERT_EQ(fake_pcm_hash_find_calls, 1);
+		cluster_shared_config = false;
+	}
+}
+
+UT_TEST(test_relation_scan_non_target_hash_orphan_is_outside_object_proof)
+{
+	BufferTag other = make_tag(6812), target = other;
+	RelFileLocator locator;
+	PcmEntryAcquireResult acquired;
+	PcmEntryRef ref;
+	uint32 cursor = 0;
+	bool found;
+
+	pi_relation_scan_setup();
+	target.relNumber++;
+	locator = BufTagGetRelFileLocator(&target);
+	UT_ASSERT(pcm_entry_ref_acquire(&other, true, &ref, &acquired));
+	pcm_entry_ref_release(&ref);
+	(void)hash_search((HTAB *)&fake_pcm_htab_token, &other, HASH_REMOVE, &found);
+	UT_ASSERT(found);
+	UT_ASSERT(pcm_entry_ref_acquire(&target, true, &ref, &acquired));
+	pcm_entry_ref_release(&ref);
+	fake_pcm_hash_find_calls = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_ko_relation_scan_v3(locator, 17, 4, &cursor),
+				 CLUSTER_PCM_PI_RELATION_EMPTY);
+	UT_ASSERT_EQ(cursor, 4);
+	UT_ASSERT_EQ(fake_pcm_hash_find_calls, 1);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_pi_scan_filters_excluded_fork_but_ko_keeps_target_validation)
+{
+	BufferTag tag = make_tag(6813);
+	RelFileLocator locator = BufTagGetRelFileLocator(&tag);
+	PcmEntryAcquireResult acquired;
+	PcmEntryRef ref;
+	uint32 cursor = 0;
+	bool found;
+
+	pi_relation_scan_setup();
+	tag.forkNum = FSM_FORKNUM;
+	UT_ASSERT(pcm_entry_ref_acquire(&tag, true, &ref, &acquired));
+	pcm_entry_ref_release(&ref);
+	(void)hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_REMOVE, &found);
+	UT_ASSERT(found);
+	fake_pcm_hash_find_calls = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_pi_relation_scan_v2(locator, 17, 4, &cursor),
+				 CLUSTER_PCM_PI_RELATION_EMPTY);
+	UT_ASSERT_EQ(cursor, 4);
+	UT_ASSERT_EQ(fake_pcm_hash_find_calls, 0);
+	cursor = 0;
+	fake_pcm_hash_find_calls = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_ko_relation_scan_v3(locator, 17, 4, &cursor),
+				 CLUSTER_PCM_PI_RELATION_INVALID);
+	UT_ASSERT_EQ(cursor, 0);
+	UT_ASSERT_EQ(fake_pcm_hash_find_calls, 1);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_relation_scan_target_hash_binding_mismatch_remains_invalid)
+{
+	BufferTag tag = make_tag(6814);
+	RelFileLocator locator = BufTagGetRelFileLocator(&tag);
+	PcmEntryAcquireResult acquired;
+	PcmEntryRef ref;
+	struct StopPcmEntryLayout *entry;
+	uint32 cursor = 0;
+
+	pi_relation_scan_setup();
+	UT_ASSERT(pcm_entry_ref_acquire(&tag, true, &ref, &acquired));
+	pcm_entry_ref_release(&ref);
+	entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+	entry->binding_generation++;
+	fake_pcm_hash_find_calls = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_ko_relation_scan_v3(locator, 17, 4, &cursor),
+				 CLUSTER_PCM_PI_RELATION_INVALID);
+	UT_ASSERT_EQ(cursor, 0);
+	UT_ASSERT_EQ(fake_pcm_hash_find_calls, 1);
+	cluster_shared_config = false;
+}
+
 UT_TEST(test_pi_relation_empty_requires_complete_bounded_scan)
 {
 	BufferTag tag = make_tag(6801);
@@ -24580,7 +24913,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(369);
+	UT_PLAN(379);
 	/* Observe the actual startup state before any runtime fixture overrides
 	 * the postmaster GUC or initializes shared PCM state and counters. */
 	UT_RUN(test_pcm_grd_max_entries_default_is_minus_one);
@@ -24594,6 +24927,7 @@ main(void)
 	UT_RUN(test_resource_x_master_work_duplicate_and_error_leave_original_owner);
 
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
+	UT_RUN(test_pcm_executor_exit_hook_registration_is_idempotent);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
 	UT_RUN(test_pcm_buffer_desc_invariants_hold_at_stage_2_30);
@@ -24949,6 +25283,15 @@ main(void)
 	UT_RUN(test_real_lms_wait_retains_quiet_retry_deadline);
 	UT_RUN(test_real_pcm_pump_continues_past_sixteenth_delivery);
 	UT_RUN(test_requester_transport_owner_bounds_both_dispatch_roots);
+	UT_RUN(test_relation_scan_hashes_only_the_target_in_every_role);
+	UT_RUN(test_relation_scan_inactive_slots_read_only_registry);
+	UT_RUN(test_normal_stop_inactive_slots_read_only_registry);
+	UT_RUN(test_inactive_master_body_is_outside_scan_integrity_proof);
+	UT_RUN(test_retirement_establishes_and_checks_zero_inactive_body);
+	UT_RUN(test_normal_stop_census_timing_is_default_off_and_lock_free);
+	UT_RUN(test_relation_scan_non_target_hash_orphan_is_outside_object_proof);
+	UT_RUN(test_pi_scan_filters_excluded_fork_but_ko_keeps_target_validation);
+	UT_RUN(test_relation_scan_target_hash_binding_mismatch_remains_invalid);
 	UT_RUN(test_pi_relation_empty_requires_complete_bounded_scan);
 	UT_RUN(test_pi_relation_scan_checks_main_vm_and_original_references);
 	UT_RUN(test_pi_relation_scan_never_retires_master_or_local_pi);

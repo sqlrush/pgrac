@@ -788,10 +788,189 @@ UT_TEST(test_actual_gcs_mixed_operations_preserve_order_and_remote_enqueue)
 	UT_ASSERT_EQ(allocated, 0);
 }
 
+UT_TEST(test_local_batch_trace_off_preserves_actual_dispatch)
+{
+	ClusterCtrcCloseDispatch dispatches[8];
+	ClusterCtrcLocalReleaseAckV1 acks[8];
+	reset_dispatch_fixture();
+	for (Size i = 0; i < 8; i++)
+		UT_ASSERT(seed_close_notification(i, &dispatches[i], &acks[i], true));
+	origin_log_enabled = true;
+	cluster_gcs_ctrc_dispatch_batch(dispatches, 8);
+	UT_ASSERT_EQ(batch_reply_log_count, 0);
+	for (Size i = 0; i < 8; i++) UT_ASSERT_EQ(ctrc_origin_entries()[i].ack_bitmap, 1);
+	UT_ASSERT_EQ(enters, leaves); UT_ASSERT_EQ(allocated, 0);
+}
+UT_TEST(test_local_batch_trace_mixed_results_and_single_census)
+{
+#ifdef CLUSTER_CTRC_LOCAL_BATCH_REPLY_TRACE_PRESENT
+	ClusterCtrcCloseDispatch dispatches[8];
+	ClusterCtrcLocalReleaseAckV1 acks[8];
+	ClusterCtrcSealReplyResult results[8];
+	reset_dispatch_fixture();
+	for (Size i = 0; i < 8; i++) {
+		UT_ASSERT(seed_close_notification(i, &dispatches[i], &acks[i], i % 2 != 0));
+		results[i] = i % 2 != 0 ? CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK : CTRC_SEAL_REPLY_PENDING_DRAIN;
+	}
+	results[6] = CTRC_SEAL_REPLY_DENIED;
+	origin_log_enabled = cluster_trace_normal_stop = true; MemSet(table_visits, 0, sizeof(table_visits));
+	UT_ASSERT(cluster_ctrc_origin_note_local_close_batch_shared(dispatches, results, acks, 8));
+	UT_ASSERT_EQ(batch_reply_log_count, 8); UT_ASSERT_EQ(reply_log_count, 0);
+	UT_ASSERT_EQ(table_visits[5], CtrcShared->origin_key_entries);
+	UT_ASSERT(strstr(batch_reply_logs[0], "event=local.close.reply") != NULL);
+	UT_ASSERT(strstr(batch_reply_logs[0], "before_ack=0 after_ack=0") != NULL);
+	UT_ASSERT(strstr(batch_reply_logs[1], "before_ack=0 after_ack=1") != NULL);
+	UT_ASSERT(strstr(batch_reply_logs[0], "sample_known=1 matched_count=1") != NULL);
+	UT_ASSERT(strstr(batch_reply_logs[0], "authoritative=0") != NULL);
+	UT_ASSERT(strstr(batch_reply_logs[0], "expected_key_matches_before=1") != NULL);
+	UT_ASSERT_EQ(held_count, 0);
+	printf("# batch diagnostic item_bytes=%zu max_stack_bytes=%zu\n", sizeof(CtrcOriginBatchReplyTrace),
+		sizeof(CtrcOriginBatchReplyTrace) * CLUSTER_CTRC_RECLAIM_BATCH_MAX);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(test_local_batch_trace_all_ack_capacity_has_no_added_census)
+{
+#ifdef CLUSTER_CTRC_LOCAL_BATCH_REPLY_TRACE_PRESENT
+	ClusterCtrcCloseDispatch dispatches[64];
+	ClusterCtrcLocalReleaseAckV1 acks[64];
+	ClusterCtrcSealReplyResult results[64];
+	reset_dispatch_fixture();
+	for (Size i = 0; i < 64; i++) {
+		UT_ASSERT(seed_close_notification(i, &dispatches[i], &acks[i], true));
+		results[i] = CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK;
+	}
+	origin_log_enabled = cluster_trace_normal_stop = true; MemSet(table_visits, 0, sizeof(table_visits));
+	UT_ASSERT(cluster_ctrc_origin_note_local_close_batch_shared(dispatches, results, acks, 64));
+	UT_ASSERT_EQ(batch_reply_log_count, 64); UT_ASSERT_EQ(table_visits[5], 0);
+	UT_ASSERT(strstr(batch_reply_logs[63], "batch_ordinal=63 batch_count=64") != NULL);
+	for (Size i = 0; i < 64; i++) UT_ASSERT_EQ(ctrc_origin_entries()[i].ack_bitmap, 1);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(test_local_batch_trace_bad_ack_and_duplicate_are_not_bound_success)
+{
+#ifdef CLUSTER_CTRC_LOCAL_BATCH_REPLY_TRACE_PRESENT
+	for (unsigned duplicate = 0; duplicate < 2; duplicate++) {
+		ClusterCtrcCloseDispatch dispatch;
+		ClusterCtrcLocalReleaseAckV1 ack;
+		ClusterCtrcSealReplyResult result;
+		reset_dispatch_fixture(); UT_ASSERT(seed_close_notification(0, &dispatch, &ack, !duplicate));
+		result = duplicate ? CTRC_SEAL_REPLY_PENDING_DRAIN : CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK;
+		if (duplicate) ctrc_origin_entries()[1] = ctrc_origin_entries()[0];
+		else ack.crc32c++;
+		origin_log_enabled = cluster_trace_normal_stop = true;
+		UT_ASSERT(cluster_ctrc_origin_note_local_close_batch_shared(&dispatch, &result, &ack, 1));
+		UT_ASSERT_EQ(ctrc_origin_entries()[0].ack_bitmap, 0);
+		UT_ASSERT_EQ(ctrc_origin_entries()[0].state, CTRC_ORIGIN_BLOCKED);
+		UT_ASSERT(strstr(batch_reply_logs[0], "accepted=0 progressed=0") != NULL);
+		UT_ASSERT(strstr(batch_reply_logs[0], duplicate ? "sample_known=0 matched_count=2" :
+			"sample_known=1 matched_count=1") != NULL);
+	}
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(test_local_batch_trace_certificate_retains_preclear_identity)
+{
+#ifdef CLUSTER_CTRC_LOCAL_BATCH_REPLY_TRACE_PRESENT
+	ClusterCtrcCloseDispatch dispatches[8];
+	uint64 participants[8], receipts[8];
+	reset_dispatch_fixture();
+	for (Size i = 0; i < 8; i++)
+		UT_ASSERT(seed_certificate_notification(i, &dispatches[i], &participants[i], &receipts[i]));
+	origin_log_enabled = cluster_trace_normal_stop = true; MemSet(table_visits, 0, sizeof(table_visits));
+	cluster_gcs_ctrc_dispatch_batch(dispatches, 8);
+	UT_ASSERT_EQ(batch_reply_log_count, 8); UT_ASSERT_EQ(reply_log_count, 0);
+	UT_ASSERT_EQ(table_visits[4], CtrcShared->origin_key_entries);
+	for (Size i = 0; i < 8; i++) {
+		UT_ASSERT(ctrc_bytes_zero(&ctrc_origin_entries()[i], sizeof(ClusterCtrcOriginEntry)));
+		UT_ASSERT(strstr(batch_reply_logs[i], "event=local.certificate.reply") != NULL);
+		UT_ASSERT(strstr(batch_reply_logs[i], "system_identifier=42") != NULL);
+		UT_ASSERT(strstr(batch_reply_logs[i], "after_row_zero=1") != NULL);
+	}
+	UT_ASSERT_EQ(enters, leaves); UT_ASSERT_EQ(allocated, 0); UT_ASSERT_EQ(held_count, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(test_local_batch_trace_invalid_shape_does_not_emit)
+{
+#ifdef CLUSTER_CTRC_LOCAL_BATCH_REPLY_TRACE_PRESENT
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcLocalReleaseAckV1 ack;
+	ClusterCtrcSealReplyResult result = CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK;
+	reset_dispatch_fixture(); UT_ASSERT(seed_close_notification(0, &dispatch, &ack, true));
+	origin_log_enabled = cluster_trace_normal_stop = true;
+	UT_ASSERT(!cluster_ctrc_origin_note_local_close_batch_shared(&dispatch, &result, &ack, 65));
+	UT_ASSERT_EQ(batch_reply_log_count, 0); UT_ASSERT_EQ(ctrc_origin_entries()[0].ack_bitmap, 0);
+	UT_ASSERT(!cluster_ctrc_origin_note_local_certificate_batch_shared(NULL, &result, 1));
+	UT_ASSERT_EQ(batch_reply_log_count, 0); UT_ASSERT_EQ(held_count, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(test_local_batch_trace_critical_is_gap_without_log)
+{
+#ifdef CLUSTER_CTRC_LOCAL_BATCH_REPLY_TRACE_PRESENT
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcLocalReleaseAckV1 ack;
+	ClusterCtrcSealReplyResult result = CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK;
+	reset_dispatch_fixture(); UT_ASSERT(seed_close_notification(0, &dispatch, &ack, true));
+	origin_log_enabled = cluster_trace_normal_stop = true; CritSectionCount = 1;
+	UT_ASSERT(cluster_ctrc_origin_note_local_close_batch_shared(&dispatch, &result, &ack, 1));
+	CritSectionCount = 0; UT_ASSERT_EQ(batch_reply_log_count, 0);
+	{
+		CtrcOriginBatchReplyTrace sample = {0};
+		LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
+		ctrc_origin_batch_reply_trace("held-lock.fixture", &sample, result, 0, 1);
+		LWLockRelease(&CtrcShared->receipt_lock);
+	}
+	UT_ASSERT_EQ(batch_reply_log_count, 0);
+	UT_ASSERT(cluster_ctrc_origin_note_local_close_batch_shared(&dispatch, &result, &ack, 1));
+	UT_ASSERT(strstr(batch_reply_logs[0], "unsafe_skipped=2") != NULL);
+	UT_ASSERT(strstr(batch_reply_logs[0], "accepted=1 progressed=0") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(test_local_batch_trace_log_error_keeps_all_progress_and_gcs_cleanup)
+{
+#ifdef CLUSTER_CTRC_LOCAL_BATCH_REPLY_TRACE_PRESENT
+	ClusterCtrcCloseDispatch dispatches[8];
+	ClusterCtrcLocalReleaseAckV1 acks[8];
+	volatile bool caught = false;
+	unsigned wakes_before;
+	reset_dispatch_fixture();
+	for (Size i = 0; i < 8; i++) UT_ASSERT(seed_close_notification(i, &dispatches[i], &acks[i], true));
+	wakes_before = wake_count;
+	origin_log_enabled = cluster_trace_normal_stop = true; batch_reply_log_throw_at = 1;
+	PG_TRY(); { cluster_gcs_ctrc_dispatch_batch(dispatches, 8); }
+	PG_CATCH(); { caught = true; } PG_END_TRY();
+	batch_reply_log_throw_at = 0; UT_ASSERT(caught); UT_ASSERT_EQ(batch_reply_log_count, 1);
+	UT_ASSERT_EQ(enters, 8); UT_ASSERT_EQ(enters, leaves); UT_ASSERT_EQ(allocated, 0); UT_ASSERT_EQ(held_count, 0);
+	for (Size i = 0; i < 8; i++) UT_ASSERT_EQ(ctrc_origin_entries()[i].ack_bitmap, 1);
+	UT_ASSERT_EQ(wake_count, wakes_before + 8);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(23);
+	UT_RUN(test_local_batch_trace_off_preserves_actual_dispatch);
+	UT_RUN(test_local_batch_trace_mixed_results_and_single_census);
+	UT_RUN(test_local_batch_trace_all_ack_capacity_has_no_added_census);
+	UT_RUN(test_local_batch_trace_bad_ack_and_duplicate_are_not_bound_success);
+	UT_RUN(test_local_batch_trace_certificate_retains_preclear_identity);
+	UT_RUN(test_local_batch_trace_invalid_shape_does_not_emit);
+	UT_RUN(test_local_batch_trace_critical_is_gap_without_log);
+	UT_RUN(test_local_batch_trace_log_error_keeps_all_progress_and_gcs_cleanup);
+
 	UT_RUN(test_actual_gcs_close_replies_share_full_census);
 	UT_RUN(test_local_close_batch_matches_all_scalar_results);
 	UT_RUN(test_local_close_invalid_shape_has_no_mutation);

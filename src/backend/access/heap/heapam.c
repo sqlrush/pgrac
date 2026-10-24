@@ -5233,6 +5233,260 @@ heap_hot_r4_log_miss(Relation relation, Buffer buffer, Snapshot snapshot,
 					   current_last, full_root, full_last, trace_complete, decisions)));
 }
 
+/* Only bounded bytes from an owned image are described. Raw CID/UBA/ITL
+ * projections do not resolve combo CIDs or establish transaction identity. */
+static void
+heap_hot_r4_trace_item(Page page, OffsetNumber offnum, char *out, Size size)
+{
+	ItemId item;
+	PageHeader header;
+	HeapTupleHeaderData tuple;
+	ClusterItlSlotData slot = {0};
+	bool slot_known;
+	Size offset, length;
+
+	strlcpy(out, "item_known=0", size);
+	if (!heap_hot_r4_scratch_page_valid(page)
+		|| offnum < FirstOffsetNumber || offnum > PageGetMaxOffsetNumber(page))
+		return;
+	header = (PageHeader)page;
+	item = PageGetItemId(page, offnum);
+	offset = ItemIdGetOffset(item);
+	length = ItemIdGetLength(item);
+	if (!ItemIdIsNormal(item)) {
+		snprintf(out, size, "item_known=1 lp=%u off=%zu len=%zu tuple_known=0",
+				 item->lp_flags, offset, length);
+		return;
+	}
+	if (length < SizeofHeapTupleHeader || offset < header->pd_upper
+		|| offset > header->pd_special || length > header->pd_special - offset) {
+		snprintf(out, size, "item_known=1 lp=%u tuple_known=0", item->lp_flags);
+		return;
+	}
+	memset(&tuple, 0, sizeof(tuple));
+	memcpy(&tuple, page + offset, SizeofHeapTupleHeader);
+	if (tuple.t_hoff < SizeofHeapTupleHeader || tuple.t_hoff > length) {
+		snprintf(out, size, "item_known=1 lp=%u tuple_known=0", item->lp_flags);
+		return;
+	}
+	slot_known = tuple.t_itl_slot_idx < CLUSTER_ITL_INITRANS_DEFAULT;
+	if (slot_known)
+		memcpy(&slot, (char *)PageGetSpecialPointer(page)
+			   + tuple.t_itl_slot_idx * sizeof(slot), sizeof(slot));
+	snprintf(out, size,
+			 "item_known=1 lp=%u tuple_known=1 off=%zu len=%zu "
+			 "xmin=%u xmax=%u ctid=%u/%u mask=%u/%u raw_cid=%u combo=%d "
+			 "itl=%u slot_known=%d slot_xid=%u wrap=%u flags=%u "
+			 "write_scn=" UINT64_FORMAT " commit_scn=" UINT64_FORMAT
+			 " first_change_lsn=" UINT64_FORMAT " uba_raw=" UINT64_FORMAT "/" UINT64_FORMAT,
+			 item->lp_flags, offset, length,
+			 HeapTupleHeaderGetRawXmin(&tuple), HeapTupleHeaderGetRawXmax(&tuple),
+			 ItemPointerGetBlockNumberNoCheck(&tuple.t_ctid),
+			 ItemPointerGetOffsetNumberNoCheck(&tuple.t_ctid), tuple.t_infomask,
+			 tuple.t_infomask2, HeapTupleHeaderGetRawCommandId(&tuple),
+			 (tuple.t_infomask & HEAP_COMBOCID) != 0,
+			 tuple.t_itl_slot_idx, slot_known, slot.xid, slot.wrap, slot.flags,
+			 (uint64)slot.write_scn, (uint64)slot.commit_scn,
+			 (uint64)slot.first_change_lsn,
+			 slot.undo_segment_head.raw[0], slot.undo_segment_head.raw[1]);
+}
+
+/* Private diagnostic projections, captured only under the original content
+ * locks.  Item strings own their bytes; no Page/Buffer/tuple pointer escapes. */
+typedef struct HeapHotR4UpdatePageTrace {
+	BufferTag tag;
+	OffsetNumber offset;
+	bool page_known;
+	XLogRecPtr lsn;
+	SCN scn;
+	char item[512];
+} HeapHotR4UpdatePageTrace;
+
+typedef struct HeapHotR4UpdateTrace {
+	bool enabled;
+	TransactionId raw_xid, canonical_xid;
+	CommandId command_id;
+	ItemPointerData requested_tid, old_tid, new_tid;
+	bool hot, cross_page;
+	UBA undo;
+	XLogRecPtr wal_lsn;
+	HeapHotR4UpdatePageTrace before_old, before_new, after_old, after_new;
+} HeapHotR4UpdateTrace;
+
+static void
+heap_hot_r4_update_capture(HeapHotR4UpdatePageTrace *out, const BufferTag *tag,
+						  Page page, OffsetNumber offset)
+{
+	/* No logging, clocks, allocation, lookup or I/O in the locked capture. */
+	memset(out, 0, sizeof(*out));
+	out->tag = *tag;
+	out->offset = offset;
+	out->page_known = heap_hot_r4_scratch_page_valid(page);
+	if (out->page_known) {
+		out->lsn = PageGetLSN(page);
+		out->scn = ((PageHeader)page)->pd_block_scn;
+	}
+	heap_hot_r4_trace_item(page, offset, out->item, sizeof(out->item));
+}
+
+static void
+heap_hot_r4_update_trace(const HeapHotR4UpdateTrace *view)
+{
+	static uint64 event_seq;
+	static uint64 critical_skipped;
+
+	if (!cluster_trace_normal_stop || !view->enabled)
+		return;
+	if (CritSectionCount != 0) {
+		if (critical_skipped != UINT64_MAX)
+			critical_skipped++;
+		return;
+	}
+	if (event_seq != UINT64_MAX)
+		event_seq++;
+	ereport(LOG,
+			(errmsg_internal(
+				 "PGRAC_FAMILY=R4_HEAP_UPDATE event=update.published "
+				 "event_seq=" UINT64_FORMAT " sequence_scope=process sequence_domain=R4_HEAP_UPDATE "
+				 "node_id=%d pid=%d procno=%d backend_id=%d backend_type=%d "
+				 "wall_us=" INT64_FORMAT " monotonic_us=" UINT64_FORMAT
+				 " identity_source=run_manifest run_id_known=0 boot_identity_known=0 "
+				 "process_incarnation_known=0 full_xid_known=0 "
+				 "request_id_known=0 root_identity_known=0 receipt_identity_known=0 "
+				 "authoritative=0 transport_receipt=0 commit_receipt=0 "
+				 "capture_scope=final_heap_update emission_scope=after_original_release "
+				 "raw_xid=%u canonical_xid=%u input_command_id=%u hot=%d cross_page=%d "
+				 "requested_tid=%u/%u old_tid=%u/%u new_tid=%u/%u "
+				 "undo_uba_raw=" UINT64_FORMAT "/" UINT64_FORMAT
+				 " wal_inserted=%d wal_lsn=" UINT64_FORMAT " wal_flush_known=0 "
+				 "old_tag=%u/%u/%u/%d/%u new_tag=%u/%u/%u/%d/%u "
+				 "after_old_tag=%u/%u/%u/%d/%u after_new_tag=%u/%u/%u/%d/%u "
+				 "before_old_page_known=%d before_old_offset=%u before_old_lsn=" UINT64_FORMAT
+				 " before_old_scn=" UINT64_FORMAT " before_old={%s} "
+				 "before_new_page_known=%d before_new_offset=%u before_new_lsn=" UINT64_FORMAT
+				 " before_new_scn=" UINT64_FORMAT " before_new={%s} "
+				 "after_old_page_known=%d after_old_offset=%u after_old_lsn=" UINT64_FORMAT
+				 " after_old_scn=" UINT64_FORMAT " after_old={%s} "
+				 "after_new_page_known=%d after_new_offset=%u after_new_lsn=" UINT64_FORMAT
+				 " after_new_scn=" UINT64_FORMAT " after_new={%s} "
+				 "trace_critical_skipped=" UINT64_FORMAT " trace_sequence_exhausted=%d",
+				 event_seq, cluster_node_id, MyProcPid, MyProc != NULL ? MyProc->pgprocno : -1,
+				 (int)MyBackendId, (int)MyBackendType,
+				 GetCurrentTimestamp(), cluster_heap_itl_now_us(),
+				 view->raw_xid, view->canonical_xid, view->command_id, view->hot, view->cross_page,
+				 ItemPointerGetBlockNumberNoCheck(&view->requested_tid),
+				 ItemPointerGetOffsetNumberNoCheck(&view->requested_tid),
+				 ItemPointerGetBlockNumberNoCheck(&view->old_tid),
+				 ItemPointerGetOffsetNumberNoCheck(&view->old_tid),
+				 ItemPointerGetBlockNumberNoCheck(&view->new_tid),
+				 ItemPointerGetOffsetNumberNoCheck(&view->new_tid),
+				 view->undo.raw[0], view->undo.raw[1], !XLogRecPtrIsInvalid(view->wal_lsn),
+				 (uint64)view->wal_lsn,
+				 view->before_old.tag.spcOid, view->before_old.tag.dbOid,
+				 (unsigned int)view->before_old.tag.relNumber, (int)view->before_old.tag.forkNum,
+				 (unsigned int)view->before_old.tag.blockNum,
+				 view->before_new.tag.spcOid, view->before_new.tag.dbOid,
+				 (unsigned int)view->before_new.tag.relNumber, (int)view->before_new.tag.forkNum,
+				 (unsigned int)view->before_new.tag.blockNum,
+				 view->after_old.tag.spcOid, view->after_old.tag.dbOid,
+				 (unsigned int)view->after_old.tag.relNumber, (int)view->after_old.tag.forkNum,
+				 (unsigned int)view->after_old.tag.blockNum,
+				 view->after_new.tag.spcOid, view->after_new.tag.dbOid,
+				 (unsigned int)view->after_new.tag.relNumber, (int)view->after_new.tag.forkNum,
+				 (unsigned int)view->after_new.tag.blockNum,
+				 view->before_old.page_known, view->before_old.offset, (uint64)view->before_old.lsn,
+				 (uint64)view->before_old.scn, view->before_old.item,
+				 view->before_new.page_known, view->before_new.offset, (uint64)view->before_new.lsn,
+				 (uint64)view->before_new.scn, view->before_new.item,
+				 view->after_old.page_known, view->after_old.offset, (uint64)view->after_old.lsn,
+				 (uint64)view->after_old.scn, view->after_old.item,
+				 view->after_new.page_known, view->after_new.offset, (uint64)view->after_new.lsn,
+				 (uint64)view->after_new.scn, view->after_new.item,
+				 critical_skipped, event_seq == UINT64_MAX)));
+}
+
+/* Original caller's stable_input and request-owned FULL scratch only. Never
+ * inspect the live buffer while its SHARE lock is dropped. The unchanged
+ * caller still revalidates the input after this cycle returns. */
+static void
+heap_hot_r4_full_trace(Buffer buffer, const BufferTag *tag,
+					   const ItemPointerData *root, OffsetNumber queried, Page before,
+					   Snapshot snapshot, const HeapHotSearchResult *result,
+					   bool build_known, ClusterCrBuildResult build_result,
+					   ClusterCrBuildReason build_reason, bool search_known,
+					   uint64 *cycle, const char *event)
+{
+	static uint64 event_seq;
+	static uint64 critical_skipped;
+	Page full;
+	bool before_known, full_known, decisions_complete;
+	ClusterItlPageHeader before_itl = {0}, full_itl = {0};
+	char before_root[512], before_queried[512], full_root[512], full_queried[512];
+	char decisions[4096];
+	OffsetNumber root_off = ItemPointerGetOffsetNumberNoCheck(root);
+
+	if (!cluster_trace_normal_stop)
+		return;
+	if (CritSectionCount != 0) {
+		if (critical_skipped != UINT64_MAX)
+			critical_skipped++;
+		return;
+	}
+	if (event_seq != UINT64_MAX)
+		event_seq++;
+	if (*cycle == 0)
+		*cycle = event_seq;
+	full = build_known && build_result == CLUSTER_CR_BUILD_FULL
+		&& build_reason == CLUSTER_CR_BUILD_NONE ? (Page)result->scratch_page : NULL;
+	before_known = heap_hot_r4_scratch_page_valid(before);
+	full_known = heap_hot_r4_scratch_page_valid(full);
+	if (before_known)
+		memcpy(&before_itl, (char *)PageGetSpecialPointer(before)
+			   + CLUSTER_ITL_ARRAY_SIZE, sizeof(before_itl));
+	if (full_known)
+		memcpy(&full_itl, (char *)PageGetSpecialPointer(full)
+			   + CLUSTER_ITL_ARRAY_SIZE, sizeof(full_itl));
+	heap_hot_r4_trace_item(before, root_off, before_root, sizeof(before_root));
+	heap_hot_r4_trace_item(before, queried, before_queried, sizeof(before_queried));
+	heap_hot_r4_trace_item(full, root_off, full_root, sizeof(full_root));
+	heap_hot_r4_trace_item(full, queried, full_queried, sizeof(full_queried));
+	decisions_complete = cluster_heap_r4_trace_format(
+		search_known ? &result->visibility_trace : NULL, decisions, sizeof(decisions));
+	ereport(LOG, (errmsg_internal(
+		"PGRAC_FAMILY=HOT_FULL event=%s event_seq=" UINT64_FORMAT
+		" sequence_scope=process sequence_domain=HOT_FULL cycle=" UINT64_FORMAT
+		" node_id=%d pid=%d wall_us=" INT64_FORMAT " monotonic_us=" UINT64_FORMAT
+		" identity_source=run_manifest run_id_known=0 boot_identity_known=0 "
+		"process_incarnation_known=0 request_id_known=0 full_xid_known=0 "
+		"tx_origin_known=0 slot_incarnation_known=0 authoritative=0 "
+		"buffer=%d spc=%u db=%u rel=%u fork=%d block=%u "
+		"root_block=%u root_offset=%u queried_offset=%u "
+		"read_scn=" UINT64_FORMAT " read_epoch=" UINT64_FORMAT " snapshot_curcid=%u "
+		"image_scope=owned_copy input_revalidated=0 image_hash_known=0 page_generation_known=0 "
+		"build_known=%d build_result=%d build_reason=%d search_known=%d candidate_kind=%d "
+		"before_known=%d before_lsn=" UINT64_FORMAT " before_scn=" UINT64_FORMAT
+		" before_watermark=" UINT64_FORMAT " full_known=%d full_lsn=" UINT64_FORMAT
+		" full_scn=" UINT64_FORMAT " full_watermark=" UINT64_FORMAT
+		" before_root={%s} before_queried={%s} full_root={%s} full_queried={%s} "
+		"decision_text_complete=%d decisions={%s} trace_critical_skipped=" UINT64_FORMAT
+		" trace_sequence_exhausted=%d",
+		event, event_seq, *cycle, cluster_node_id, MyProcPid,
+		(int64)GetCurrentTimestamp(), cluster_heap_itl_now_us(),
+		buffer, tag->spcOid, tag->dbOid, tag->relNumber, tag->forkNum, tag->blockNum,
+		ItemPointerGetBlockNumberNoCheck(root), root_off, queried,
+		(uint64)snapshot->read_scn, (uint64)snapshot->read_epoch, snapshot->curcid,
+		build_known, build_known ? (int)build_result : -1,
+		build_known ? (int)build_reason : -1, search_known, (int)result->kind,
+		before_known, before_known ? (uint64)PageGetLSN(before) : 0,
+		before_known ? (uint64)((PageHeader)before)->pd_block_scn : 0,
+		(uint64)before_itl.itl_recycle_watermark_scn,
+		full_known, full_known ? (uint64)PageGetLSN(full) : 0,
+		full_known ? (uint64)((PageHeader)full)->pd_block_scn : 0,
+		(uint64)full_itl.itl_recycle_watermark_scn,
+		before_root, before_queried, full_root, full_queried,
+		decisions_complete, decisions, critical_skipped, event_seq == UINT64_MAX)));
+}
+
 /*
  * Drop SHARE before the TARGET fetch and restore it in PG_FINALLY.  A FULL
  * result is decided solely from result->scratch_page.  TARGET_DISABLED is the
@@ -5242,6 +5496,7 @@ heap_hot_r4_log_miss(Relation relation, Buffer buffer, Snapshot snapshot,
 static HeapHotR4CycleOutcome
 heap_hot_r4_full_cycle(Buffer buffer, const BufferTag *tag,
 					   const ItemPointerData *logical_root,
+					   OffsetNumber queried, Page before,
 					   Relation relation, Snapshot snapshot,
 					   HeapHotSearchResult *result,
 					   ClusterCrBuildResult *build_result_out,
@@ -5250,6 +5505,7 @@ heap_hot_r4_full_cycle(Buffer buffer, const BufferTag *tag,
 	ClusterCrBuildReason raw_reason = CLUSTER_CR_BUILD_PROTOCOL;
 	volatile ClusterCrBuildResult build_result = CLUSTER_CR_BUILD_FAIL_CLOSED;
 	volatile ClusterCrBuildReason build_reason = CLUSTER_CR_BUILD_PROTOCOL;
+	uint64 trace_cycle = 0;
 
 	memset(result, 0, sizeof(*result));
 	result->kind = HEAP_HOT_SEARCH_NOT_FOUND;
@@ -5257,16 +5513,25 @@ heap_hot_r4_full_cycle(Buffer buffer, const BufferTag *tag,
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 	PG_TRY();
 	{
+		heap_hot_r4_full_trace(buffer, tag, logical_root, queried, before,
+							   snapshot, result, false, build_result, build_reason,
+							   false, &trace_cycle, "full.fetch.begin");
 		build_result = cluster_gcs_block_cr_fetch_and_wait(
 			*tag, snapshot->read_scn, result->scratch_page,
 			&raw_reason);
 		build_reason = raw_reason;
+		heap_hot_r4_full_trace(buffer, tag, logical_root, queried, before,
+							   snapshot, result, true, build_result, build_reason,
+							   false, &trace_cycle, "full.fetch.end");
 		if (build_result == CLUSTER_CR_BUILD_FULL
 			&& build_reason == CLUSTER_CR_BUILD_NONE)
 		{
 			if (heap_hot_r4_search_scratch(tag, logical_root, relation,
 										 snapshot, result, false))
 				result->kind = HEAP_HOT_SEARCH_OWNED_SCRATCH;
+			heap_hot_r4_full_trace(buffer, tag, logical_root, queried, before,
+								   snapshot, result, true, build_result, build_reason,
+								   true, &trace_cycle, "full.search.end");
 		}
 	}
 	PG_FINALLY();
@@ -5663,6 +5928,7 @@ restart_live_search:
 
 				memcpy(stable_input, page, BLCKSZ);
 				outcome = heap_hot_r4_full_cycle(buffer, &tag, &logical_root,
+										 offnum, (Page)stable_input,
 										 relation, snapshot, result,
 										 &build_result, &build_reason);
 				revalidated_tag = heap_hot_r4_buffer_tag(buffer);
@@ -12367,6 +12633,8 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 	ClusterUndoRecordPrepareReceipt undo_receipt = {0};
 	ClusterCtrcReceiptHandle cluster_itl_ctrc_handles[2] = {{0}};
 	uint64		undo_prepare_deadline_us = 0;
+	bool		cluster_update_trace_enabled = false;
+	HeapHotR4UpdateTrace cluster_update_trace;
 	TransactionId canonical_xid = InvalidTransactionId;
 	TransactionId creation_xmin = InvalidTransactionId;
 	int			cluster_current_mx_undo_diagnostic_budget = 8;
@@ -14885,6 +15153,30 @@ l_pgrac_reacquire:
 	}
 #endif
 
+#ifdef USE_PGRAC_CLUSTER
+	cluster_update_trace_enabled = cluster_trace_normal_stop && cluster_heap_read_needs_copy(relation);
+	if (cluster_update_trace_enabled)
+	{
+		BufferTag old_tag = heap_hot_r4_buffer_tag(buffer);
+		BufferTag new_tag = heap_hot_r4_buffer_tag(newbuf);
+
+		memset(&cluster_update_trace, 0, sizeof(cluster_update_trace));
+		cluster_update_trace.enabled = true;
+		cluster_update_trace.raw_xid = xid;
+		cluster_update_trace.canonical_xid = canonical_xid;
+		cluster_update_trace.command_id = pgrac_entry_cid;
+		cluster_update_trace.requested_tid = *otid;
+		cluster_update_trace.old_tid = oldtup.t_self;
+		cluster_update_trace.hot = use_hot_update;
+		cluster_update_trace.cross_page = newbuf != buffer;
+		heap_hot_r4_update_capture(&cluster_update_trace.before_old, &old_tag,
+			BufferGetPage(buffer), ItemPointerGetOffsetNumber(&oldtup.t_self));
+		/* The physical new item does not exist until RelationPutHeapTuple. */
+		heap_hot_r4_update_capture(&cluster_update_trace.before_new, &new_tag,
+			BufferGetPage(newbuf), InvalidOffsetNumber);
+	}
+#endif
+
 	/* NO EREPORT(ERROR) from here till changes are logged */
 	START_CRIT_SECTION();
 
@@ -15132,6 +15424,8 @@ l_pgrac_reacquire:
 		}
 		PageSetLSN(BufferGetPage(buffer), recptr);
 #ifdef USE_PGRAC_CLUSTER
+		if (cluster_update_trace_enabled)
+			cluster_update_trace.wal_lsn = recptr;
 		if (cluster_page_versioned)
 		{
 			if (vm_locked)
@@ -15143,6 +15437,21 @@ l_pgrac_reacquire:
 	}
 
 	END_CRIT_SECTION();
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_update_trace_enabled)
+	{
+		BufferTag old_tag = heap_hot_r4_buffer_tag(buffer);
+		BufferTag new_tag = heap_hot_r4_buffer_tag(newbuf);
+
+		cluster_update_trace.new_tid = heaptup->t_self;
+		cluster_update_trace.undo = cluster_itl_uba;
+		heap_hot_r4_update_capture(&cluster_update_trace.after_old, &old_tag,
+			BufferGetPage(buffer), ItemPointerGetOffsetNumber(&oldtup.t_self));
+		heap_hot_r4_update_capture(&cluster_update_trace.after_new, &new_tag,
+			BufferGetPage(newbuf), ItemPointerGetOffsetNumber(&heaptup->t_self));
+	}
+#endif
 
 #ifdef USE_PGRAC_CLUSTER
 	if (cluster_current_mx_recomposed)
@@ -15247,6 +15556,13 @@ l_pgrac_reacquire:
 	 */
 	if (have_tuple_lock)
 		UnlockTupleTuplock(relation, &(oldtup.t_self), *lockmode);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* No shared page pointer survives capture; diagnostic ERROR cannot strand
+	 * these original buffer/pin or tuple-lock responsibilities. */
+	if (cluster_update_trace_enabled)
+		heap_hot_r4_update_trace(&cluster_update_trace);
+#endif
 
 	pgstat_count_heap_update(relation, use_hot_update, newbuf != buffer);
 

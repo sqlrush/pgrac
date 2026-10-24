@@ -53,6 +53,7 @@
 #include "port/atomics.h"
 #include "port/pg_crc32c.h"
 #include "storage/ipc.h"
+#include "storage/lwlock.h"
 #include "storage/fd.h"
 #include "storage/shmem.h"
 #include <dirent.h>
@@ -460,6 +461,147 @@ typedef struct ClusterSemanticActivationAckTableV1 {
 	SemanticActivationAckTuple observed[CLUSTER_MAX_NODES];
 	uint8 restart_binding[PG_SHA256_DIGEST_LENGTH];
 } ClusterSemanticActivationAckTableV1;
+
+/* Process-local diagnostics only. Copies never grant or replace authority. */
+typedef struct SemanticStopTrace {
+	char predicate[112];
+	const char *stage;
+	const char *failure_stage;
+	int member;
+	int failure_member;
+	int local_node;
+	uint64 system_identifier;
+	uint64 expected;
+	uint64 current;
+	uint64 upper;
+	bool range;
+	Size byte_count;
+	uint8 expected_bytes[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	uint8 current_bytes[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	bool have_open, have_before, have_after, have_service, have_writer, have_formation;
+	ClusterSemanticActivationRecord open;
+	uint8 root_expected[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	uint8 root_before[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	uint8 root_after[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	SemanticActivationAdmissionSnapshot before, after;
+	uint64 members_lo[2], members_hi[2], formation_epoch[2];
+	int32 coordinator[2];
+	uint32 caps, caps_after;
+	bool have_caps, have_caps_after;
+	ClusterSemanticActivationAckTableV1 table, table_after;
+	const char *service_stage;
+	ClusterNormalStartCompletion service;
+	ClusterWalSourceRef writer;
+	ClusterFormationSnapshotV1 formation;
+	struct {
+		const char *stage;
+		bool sampled, have_state, have_capability, have_tuple;
+		ClusterMembershipState state;
+		uint64 admitted, self;
+		ClusterSfPeerCap capability;
+		SemanticActivationAckTuple tuple;
+	} live[CLUSTER_MAX_NODES];
+} SemanticStopTrace;
+
+static SemanticStopTrace semantic_stop_first_trace;
+static bool semantic_stop_trace_reported;
+
+static inline bool
+semantic_stop_ne(SemanticStopTrace *trace, const char *predicate, uint64 current, uint64 expected)
+{
+	if (current == expected)
+		return false;
+	if (trace != NULL && trace->predicate[0] == '\0') {
+		strlcpy(trace->predicate, predicate, sizeof(trace->predicate));
+		trace->failure_stage = trace->stage;
+		trace->failure_member = trace->member;
+		trace->expected = expected;
+		trace->current = current;
+	}
+	return true;
+}
+
+static inline bool
+semantic_stop_bad(SemanticStopTrace *trace, const char *predicate, bool bad)
+{
+	return semantic_stop_ne(trace, predicate, bad, false);
+}
+
+static inline bool
+semantic_stop_outside(SemanticStopTrace *trace, const char *predicate, uint64 current, uint64 lower,
+					  uint64 upper)
+{
+	if (current >= lower && current <= upper)
+		return false;
+	if (trace != NULL && trace->predicate[0] == '\0') {
+		(void)semantic_stop_ne(trace, predicate, current, lower);
+		trace->range = true;
+		trace->upper = upper;
+	}
+	return true;
+}
+
+static inline bool
+semantic_stop_bytes_ne(SemanticStopTrace *trace, const char *predicate, const void *current,
+					   const void *expected, Size bytes)
+{
+	if (memcmp(current, expected, bytes) == 0)
+		return false;
+	if (trace != NULL && trace->predicate[0] == '\0') {
+		(void)semantic_stop_ne(trace, predicate, 1, 0);
+		if (bytes <= sizeof(trace->expected_bytes)) {
+			trace->byte_count = bytes;
+			memcpy(trace->expected_bytes, expected, bytes);
+			memcpy(trace->current_bytes, current, bytes);
+		}
+	}
+	return true;
+}
+
+static ClusterMembershipState
+semantic_stop_member_state(SemanticStopTrace *trace, int node)
+{
+	ClusterMembershipState state = cluster_membership_get_state(node);
+	if (trace != NULL && node >= 0 && node < CLUSTER_MAX_NODES) {
+		trace->live[node].have_state = true;
+		trace->live[node].state = state;
+	}
+	return state;
+}
+
+static bool
+semantic_stop_writer_ref(SemanticStopTrace *trace, ClusterWalSourceRef *out)
+{
+	bool ok = cluster_wal_thread_current_v2_ref(out);
+	if (ok && trace != NULL) {
+		trace->writer = *out;
+		trace->have_writer = true;
+	}
+	return !semantic_stop_ne(trace, "service.writer.current_ref", ok, true);
+}
+
+static bool
+semantic_stop_formation_snapshot(SemanticStopTrace *trace, uint16 origin,
+								 ClusterFormationSnapshotV1 *out)
+{
+	bool ok = cluster_reconfig_capture_formation_snapshot_v1(origin, out);
+	if (ok && trace != NULL) {
+		trace->formation = *out;
+		trace->have_formation = true;
+	}
+	return !semantic_stop_ne(trace, "service.formation_snapshot", ok, true);
+}
+
+static bool
+semantic_stop_caps_changed(SemanticStopTrace *trace, uint32 expected)
+{
+	uint32 current = cluster_ic_local_capability_word();
+	if (trace != NULL) {
+		trace->caps_after = current;
+		trace->have_caps_after = true;
+	}
+	return semantic_stop_ne(trace, "capability.word_changed", current, expected);
+}
 
 typedef struct SemanticActivationAckIngressItem {
 	ClusterSemanticActivationAckWireV1 message;
@@ -4469,12 +4611,87 @@ semantic_activation_full_ack_table_matches(
 	return true;
 }
 
+/* These comparisons inspect the same local immutable image as the original
+ * predicate. No live authority is sampled again to explain a failed check. */
+static bool
+semantic_stop_tuple_matches(SemanticStopTrace *trace, const char *prefix,
+							const SemanticActivationAckTuple *current,
+							const SemanticActivationAckTuple *expected)
+{
+	bool matches = semantic_activation_ack_matches(current, expected);
+	if (!matches && trace != NULL && trace->predicate[0] == '\0') {
+		char name[112];
+#define STOP_TUPLE_FIELD(field)                                                                    \
+	do {                                                                                           \
+		snprintf(name, sizeof(name), "%s.%s", prefix, #field);                                     \
+		if (semantic_stop_ne(trace, name, current->field, expected->field))                        \
+			return false;                                                                          \
+	} while (0)
+		STOP_TUPLE_FIELD(node_id);
+		STOP_TUPLE_FIELD(boot_id);
+		STOP_TUPLE_FIELD(admitted_incarnation);
+		STOP_TUPLE_FIELD(control_connection_generation);
+		STOP_TUPLE_FIELD(capability_word);
+		STOP_TUPLE_FIELD(capability_generation);
+		STOP_TUPLE_FIELD(transition_epoch);
+		STOP_TUPLE_FIELD(record_generation);
+#undef STOP_TUPLE_FIELD
+	}
+	return matches;
+}
+
+static bool
+semantic_stop_full_ack_bad(SemanticStopTrace *trace,
+						   const ClusterSemanticActivationAckTableV1 *image)
+{
+	bool matches = semantic_activation_full_ack_table_matches(
+		image->observed, image->observed_members_lo, image->observed_members_hi, image->expected,
+		image->expected_members_lo, image->expected_members_hi);
+	if (matches || trace == NULL)
+		return !matches;
+	if (semantic_stop_bad(trace, "ack.members_empty",
+						  image->expected_members_lo == 0 && image->expected_members_hi == 0)
+		|| semantic_stop_ne(trace, "ack.observed_members_lo", image->observed_members_lo,
+							image->expected_members_lo)
+		|| semantic_stop_ne(trace, "ack.observed_members_hi", image->observed_members_hi,
+							image->expected_members_hi))
+		return true;
+	for (int node = 0; node < CLUSTER_MAX_NODES; node++) {
+		if (!semantic_activation_ack_member_present(image->expected_members_lo,
+													image->expected_members_hi, node))
+			continue;
+		trace->member = node;
+		if (semantic_stop_ne(trace, "ack.expected.node_id", image->expected[node].node_id, node)
+			|| semantic_stop_outside(trace, "ack.expected.boot_id", image->expected[node].boot_id,
+									 1, UINT64_MAX)
+			|| semantic_stop_outside(trace, "ack.expected.admitted_incarnation",
+									 image->expected[node].admitted_incarnation, 1, UINT64_MAX)
+			|| semantic_stop_outside(trace, "ack.expected.control_connection_generation",
+									 image->expected[node].control_connection_generation, 1,
+									 UINT64_MAX)
+			|| semantic_stop_ne(trace, "ack.expected.required_caps",
+								image->expected[node].capability_word
+									& CLUSTER_SEMANTIC_REPLACEMENT_REQUIRED_CAPS,
+								CLUSTER_SEMANTIC_REPLACEMENT_REQUIRED_CAPS)
+			|| semantic_stop_outside(trace, "ack.expected.capability_generation",
+									 image->expected[node].capability_generation, 1, UINT64_MAX)
+			|| semantic_stop_outside(trace, "ack.expected.record_generation",
+									 image->expected[node].record_generation, 1, UINT64_MAX)
+			|| !semantic_stop_tuple_matches(trace, "ack.observed", &image->observed[node],
+											&image->expected[node]))
+			return true;
+	}
+	(void)semantic_stop_bad(trace, "ack.full_table", true);
+	return true;
+}
+
 static ClusterSemanticResourceXPeerOpenResult
 semantic_activation_ack_complete_image_check_internal(
 	const ClusterSemanticActivationAckTableV1 *image, uint64 current_members_lo,
 	uint64 current_members_hi, uint64 current_epoch, int32 current_coordinator_node,
 	int32 local_node_id, uint32 local_capability_word,
-	const ClusterSemanticActivationRecord *stop_record, const uint8 *stop_root)
+	const ClusterSemanticActivationRecord *stop_record, const uint8 *stop_root,
+	SemanticStopTrace *trace)
 {
 	SemanticActivationAckTuple current;
 	ClusterSfPeerCap capability;
@@ -4483,57 +4700,97 @@ semantic_activation_ack_complete_image_check_internal(
 	bool observation_pending = false;
 	int node;
 
-	if (image == NULL || local_node_id < 0 || local_node_id >= CLUSTER_MAX_NODES
-		|| current_coordinator_node < 0 || current_coordinator_node >= CLUSTER_MAX_NODES
-		|| image->stage < CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE
-		|| image->stage > CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED
-		|| image->round_nonce == 0 || image->record_generation == 0
-		|| image->coordinator_node != (uint32)current_coordinator_node
-		|| image->expected_members_lo != current_members_lo
-		|| image->expected_members_hi != current_members_hi
-		|| image->transition_epoch != current_epoch
-		|| !semantic_activation_ack_round_required_caps(
-			image->source_feature_bitmap, image->target_feature_bitmap,
-			image->rollback_feature_bitmap, &required_caps)
-		|| (local_capability_word & required_caps) != required_caps
-		|| !semantic_activation_ack_member_present(current_members_lo, current_members_hi,
-												   local_node_id)
-		|| (image->flags
-			& (CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
-			   | CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE))
-			   != (CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
-				   | CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE)
-		|| !semantic_activation_full_ack_table_matches(
-			image->observed, image->observed_members_lo, image->observed_members_hi,
-			image->expected, image->expected_members_lo, image->expected_members_hi))
+	if (semantic_stop_bad(trace, "ack.image_missing", image == NULL)
+		|| semantic_stop_outside(trace, "ack.local_node_id", local_node_id, 0,
+								 CLUSTER_MAX_NODES - 1)
+		|| semantic_stop_outside(trace, "ack.coordinator_range", current_coordinator_node, 0,
+								 CLUSTER_MAX_NODES - 1)
+		|| semantic_stop_outside(trace, "ack.stage", image->stage,
+								 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE,
+								 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED)
+		|| semantic_stop_outside(trace, "ack.round_nonce", image->round_nonce, 1, UINT64_MAX)
+		|| semantic_stop_outside(trace, "ack.record_generation", image->record_generation, 1,
+								 UINT64_MAX)
+		|| semantic_stop_ne(trace, "ack.coordinator_node", image->coordinator_node,
+							(uint32)current_coordinator_node)
+		|| semantic_stop_ne(trace, "ack.expected_members_lo", image->expected_members_lo,
+							current_members_lo)
+		|| semantic_stop_ne(trace, "ack.expected_members_hi", image->expected_members_hi,
+							current_members_hi)
+		|| semantic_stop_ne(trace, "ack.transition_epoch", image->transition_epoch, current_epoch)
+		|| semantic_stop_ne(trace, "ack.required_caps_valid",
+							semantic_activation_ack_round_required_caps(
+								image->source_feature_bitmap, image->target_feature_bitmap,
+								image->rollback_feature_bitmap, &required_caps),
+							true)
+		|| semantic_stop_ne(trace, "ack.local.required_caps", local_capability_word & required_caps,
+							required_caps)
+		|| semantic_stop_ne(trace, "ack.local_member_present",
+							semantic_activation_ack_member_present(
+								current_members_lo, current_members_hi, local_node_id),
+							true)
+		|| semantic_stop_ne(trace, "ack.complete_flags",
+							image->flags
+								& (CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+								   | CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE),
+							CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+								| CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE)
+		|| semantic_stop_full_ack_bad(trace, image))
 		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_NOT_CURRENT;
 
 	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
 		if (!semantic_activation_ack_member_present(current_members_lo, current_members_hi, node))
 			continue;
 		admitted_incarnation = cluster_membership_get_last_admitted_incarnation(node);
-		if (image->expected[node].transition_epoch != current_epoch
-			|| image->expected[node].record_generation != image->record_generation
-			|| cluster_membership_get_state(node) != CLUSTER_MEMBER_MEMBER
+		if (trace != NULL) {
+			/* A later pass may reject before rebuilding the current tuple. */
+			memset(&trace->live[node], 0, sizeof(trace->live[node]));
+			trace->member = node;
+			trace->live[node].stage = trace->stage;
+			trace->live[node].sampled = true;
+			trace->live[node].admitted = admitted_incarnation;
+		}
+		if (semantic_stop_ne(trace, "ack.member.transition_epoch",
+							 image->expected[node].transition_epoch, current_epoch)
+			|| semantic_stop_ne(trace, "ack.member.record_generation",
+								image->expected[node].record_generation, image->record_generation)
+			|| semantic_stop_ne(trace, "ack.member.membership_state",
+								semantic_stop_member_state(trace, node), CLUSTER_MEMBER_MEMBER)
 			|| (admitted_incarnation != 0
-				&& (admitted_incarnation != image->expected[node].admitted_incarnation
-					|| admitted_incarnation != image->observed[node].admitted_incarnation
+				&& (semantic_stop_ne(trace, "ack.member.admitted_incarnation", admitted_incarnation,
+									 image->expected[node].admitted_incarnation)
+					|| semantic_stop_ne(trace, "ack.member.observed_incarnation",
+										admitted_incarnation,
+										image->observed[node].admitted_incarnation)
 					|| (node != local_node_id
-						&& admitted_incarnation != image->expected[node].boot_id))))
+						&& semantic_stop_ne(trace, "ack.member.boot_id", admitted_incarnation,
+											image->expected[node].boot_id)))))
 			return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_NOT_CURRENT;
 		if (node == local_node_id) {
 			uint64 self_incarnation = cluster_qvotec_get_self_incarnation();
+			if (trace != NULL)
+				trace->live[node].self = self_incarnation;
 
-			if ((local_capability_word & CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS)
-					!= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS
-				|| local_capability_word != image->expected[node].capability_word
+			if (semantic_stop_ne(trace, "ack.self.required_caps",
+								 local_capability_word
+									 & CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS,
+								 CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS)
+				|| semantic_stop_ne(trace, "ack.self.capability_word", local_capability_word,
+									image->expected[node].capability_word)
 				|| (self_incarnation != 0
-					&& (self_incarnation != image->expected[node].boot_id
-						|| self_incarnation != image->observed[node].boot_id
-						|| self_incarnation != image->expected[node].control_connection_generation
-						|| self_incarnation != image->expected[node].capability_generation
+					&& (semantic_stop_ne(trace, "ack.self.boot_id", self_incarnation,
+										 image->expected[node].boot_id)
+						|| semantic_stop_ne(trace, "ack.self.observed_boot_id", self_incarnation,
+											image->observed[node].boot_id)
+						|| semantic_stop_ne(trace, "ack.self.control_connection_generation",
+											self_incarnation,
+											image->expected[node].control_connection_generation)
+						|| semantic_stop_ne(trace, "ack.self.capability_generation",
+											self_incarnation,
+											image->expected[node].capability_generation)
 						|| (admitted_incarnation != 0
-							&& self_incarnation != admitted_incarnation))))
+							&& semantic_stop_ne(trace, "ack.self.admitted_incarnation",
+												self_incarnation, admitted_incarnation)))))
 				return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_NOT_CURRENT;
 			if (self_incarnation == 0 || admitted_incarnation == 0) {
 				observation_pending = true;
@@ -4549,8 +4806,14 @@ semantic_activation_ack_complete_image_check_internal(
 			current.transition_epoch = current_epoch;
 			current.record_generation = image->record_generation;
 		} else {
-			if (!cluster_sf_peer_capability_record_snapshot(node, &capability))
+			if (semantic_stop_ne(trace, "ack.peer.capability_snapshot",
+								 cluster_sf_peer_capability_record_snapshot(node, &capability),
+								 true))
 				return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_NOT_CURRENT;
+			if (trace != NULL) {
+				trace->live[node].have_capability = true;
+				trace->live[node].capability = capability;
+			}
 			if (!capability.valid) {
 				/* Online acquisition still requires a live HELLO. Only the
 				 * final normal-stop receipt may outlive that connection, after
@@ -4566,12 +4829,22 @@ semantic_activation_ack_complete_image_check_internal(
 				observation_pending = true;
 				continue;
 			}
-			if (capability.generation == 0 || (capability.bits & required_caps) != required_caps
-				|| capability.generation != image->expected[node].capability_generation
-				|| capability.generation != image->observed[node].capability_generation
-				|| capability.generation != image->expected[node].control_connection_generation
-				|| capability.bits != image->expected[node].capability_word
-				|| capability.bits != image->observed[node].capability_word)
+			if (semantic_stop_outside(trace, "ack.peer.generation_valid", capability.generation, 1,
+									  UINT64_MAX)
+				|| semantic_stop_ne(trace, "ack.peer.required_caps",
+									capability.bits & required_caps, required_caps)
+				|| semantic_stop_ne(trace, "ack.peer.capability_generation", capability.generation,
+									image->expected[node].capability_generation)
+				|| semantic_stop_ne(trace, "ack.peer.observed_capability_generation",
+									capability.generation,
+									image->observed[node].capability_generation)
+				|| semantic_stop_ne(trace, "ack.peer.control_connection_generation",
+									capability.generation,
+									image->expected[node].control_connection_generation)
+				|| semantic_stop_ne(trace, "ack.peer.capability_word", capability.bits,
+									image->expected[node].capability_word)
+				|| semantic_stop_ne(trace, "ack.peer.observed_capability_word", capability.bits,
+									image->observed[node].capability_word))
 				return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_NOT_CURRENT;
 			if (admitted_incarnation == 0) {
 				observation_pending = true;
@@ -4587,10 +4860,18 @@ semantic_activation_ack_complete_image_check_internal(
 			current.transition_epoch = current_epoch;
 			current.record_generation = image->record_generation;
 		}
-		if (!semantic_activation_ack_matches(&image->expected[node], &current)
-			|| !semantic_activation_ack_matches(&image->observed[node], &current))
+		if (trace != NULL) {
+			trace->live[node].have_tuple = true;
+			trace->live[node].tuple = current;
+		}
+		if (!semantic_stop_tuple_matches(trace, "ack.current_expected", &current,
+										 &image->expected[node])
+			|| !semantic_stop_tuple_matches(trace, "ack.current_observed", &current,
+											&image->observed[node]))
 			return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_NOT_CURRENT;
 	}
+	if (trace != NULL)
+		trace->member = -1;
 	return observation_pending ? CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_OBSERVATION_PENDING
 							   : CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH;
 }
@@ -4603,7 +4884,7 @@ semantic_activation_ack_complete_image_check(const ClusterSemanticActivationAckT
 {
 	return semantic_activation_ack_complete_image_check_internal(
 		image, current_members_lo, current_members_hi, current_epoch, current_coordinator_node,
-		local_node_id, local_capability_word, NULL, NULL);
+		local_node_id, local_capability_word, NULL, NULL, NULL);
 }
 
 static bool
@@ -12879,29 +13160,54 @@ normal_start_clean_input_valid(const ClusterNormalStartCompletion *image,
 }
 
 static bool
-normal_start_clean_writer_current(const ClusterNormalStartCompletion *image)
+normal_start_clean_writer_current_traced(const ClusterNormalStartCompletion *image,
+										 SemanticStopTrace *trace)
 {
 	ClusterWalSourceRef current;
 	uint8 encoded[CLUSTER_WAL_CLAIM_V2_BYTES], digest[32], binding[32];
 	const ClusterWalStartupCleanInputV1 *input = &image->clean_input;
 	if (!cluster_shared_config)
 		return true;
-	return image->node_id == cluster_node_id && image->system_identifier == GetSystemIdentifier()
-		   && image->boot_incarnation == cluster_qvotec_get_self_incarnation()
-		   && image->epoch == cluster_epoch_get_current() && !cluster_qvotec_prior_unclean_death()
-		   && cluster_wal_claim_v2_encode(&input->successor, encoded)
-				  == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-		   && normal_start_sha256(encoded, sizeof(encoded), digest)
-		   && cluster_wal_thread_current_v2_ref(&current) && current.timeline == input->timeline
-		   && memcmp(&current.claim.identity, &input->successor.identity,
-					 sizeof(current.claim.identity))
-				  == 0
-		   && current.claim.database_incarnation == input->successor.database_incarnation
-		   && current.claim.max_config_generation == input->successor.config_generation
-		   && memcmp(current.claim.claim_sha256, digest, sizeof(digest)) == 0
-		   && cluster_wal_thread_clean_writer_matches(&current, image->epoch)
-		   && normal_start_binding(image, binding)
-		   && memcmp(image->restart_binding, binding, sizeof(binding)) == 0;
+	return !semantic_stop_ne(trace, "service.writer.node_id", image->node_id, cluster_node_id)
+		   && !semantic_stop_ne(trace, "service.writer.system_identifier", image->system_identifier,
+								GetSystemIdentifier())
+		   && !semantic_stop_ne(trace, "service.writer.boot_incarnation", image->boot_incarnation,
+								cluster_qvotec_get_self_incarnation())
+		   && !semantic_stop_ne(trace, "service.writer.epoch", image->epoch,
+								cluster_epoch_get_current())
+		   && !semantic_stop_bad(trace, "service.writer.prior_unclean_death",
+								 cluster_qvotec_prior_unclean_death())
+		   && !semantic_stop_ne(trace, "service.writer.claim_encode",
+								cluster_wal_claim_v2_encode(&input->successor, encoded),
+								CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		   && !semantic_stop_ne(trace, "service.writer.claim_digest",
+								normal_start_sha256(encoded, sizeof(encoded), digest), true)
+		   && semantic_stop_writer_ref(trace, &current)
+		   && !semantic_stop_ne(trace, "service.writer.timeline", current.timeline, input->timeline)
+		   && !semantic_stop_bytes_ne(trace, "service.writer.claim_identity",
+									  &current.claim.identity, &input->successor.identity,
+									  sizeof(current.claim.identity))
+		   && !semantic_stop_ne(trace, "service.writer.database_incarnation",
+								current.claim.database_incarnation,
+								input->successor.database_incarnation)
+		   && !semantic_stop_ne(trace, "service.writer.config_generation",
+								current.claim.max_config_generation,
+								input->successor.config_generation)
+		   && !semantic_stop_bytes_ne(trace, "service.writer.claim_sha256",
+									  current.claim.claim_sha256, digest, sizeof(digest))
+		   && !semantic_stop_ne(trace, "service.writer.clean_writer_matches",
+								cluster_wal_thread_clean_writer_matches(&current, image->epoch),
+								true)
+		   && !semantic_stop_ne(trace, "service.writer.binding_valid",
+								normal_start_binding(image, binding), true)
+		   && !semantic_stop_bytes_ne(trace, "service.writer.restart_binding",
+									  image->restart_binding, binding, sizeof(binding));
+}
+
+static bool
+normal_start_clean_writer_current(const ClusterNormalStartCompletion *image)
+{
+	return normal_start_clean_writer_current_traced(image, NULL);
 }
 
 static bool
@@ -13566,17 +13872,29 @@ semantic_activation_restart_request_from_table(const ClusterSemanticActivationAc
 }
 
 static bool
-normal_start_record_matches(const ClusterSemanticActivationRecord *record)
+normal_start_record_matches_traced(const ClusterSemanticActivationRecord *record,
+								   SemanticStopTrace *trace)
 {
 	uint8 encoded[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
-	return NormalStartCompletion != NULL
-		   && (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_TARGET_READY
-			   || (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
-				   && record != NULL && record->phase == CLUSTER_SEMANTIC_PHASE_OPEN
-				   && semantic_activation_restart_source_current()
-						  == CLUSTER_SEMANTIC_RESTART_SOURCE_RECOVERED))
-		   && cluster_semantic_activation_record_encode(record, encoded)
-		   && memcmp(encoded, NormalStartCompletion->pgsa, sizeof(encoded)) == 0;
+	return !semantic_stop_bad(trace, "service.completion_missing", NormalStartCompletion == NULL)
+		   && !semantic_stop_ne(trace, "service.normal_start_state",
+								(cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_TARGET_READY
+								 || (cluster_semantic_normal_start_state()
+										 == CLUSTER_NORMAL_START_EXISTING_OTHER
+									 && record != NULL
+									 && record->phase == CLUSTER_SEMANTIC_PHASE_OPEN
+									 && semantic_activation_restart_source_current()
+											== CLUSTER_SEMANTIC_RESTART_SOURCE_RECOVERED)), true)
+		   && !semantic_stop_ne(trace, "service.open_encode",
+								cluster_semantic_activation_record_encode(record, encoded), true)
+		   && !semantic_stop_bytes_ne(trace, "service.pgsa", NormalStartCompletion->pgsa, encoded,
+									  sizeof(encoded));
+}
+
+static bool
+normal_start_record_matches(const ClusterSemanticActivationRecord *record)
+{
+	return normal_start_record_matches_traced(record, NULL);
 }
 
 static bool
@@ -14086,7 +14404,7 @@ semantic_serving_cut_read(SemanticServingCut *out)
 			&& semantic_activation_ack_complete_image_check_internal(
 				   &table, table.expected_members_lo, table.expected_members_hi,
 				   gate.formation_epoch, 0, cluster_node_id, cluster_ic_local_capability_word(),
-				   NULL, NULL)
+				   NULL, NULL, NULL)
 				   != CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH))
 		return false;
 	for (unsigned node = 0; node < CLUSTER_MAX_NODES; node++) {
@@ -14689,56 +15007,105 @@ normal_start_recovered_service_binding_current(const ClusterSemanticActivationRe
 }
 
 static bool
-normal_start_service_binding_current(const ClusterSemanticActivationRecord *open, const uint8 *root,
-									 const ClusterSemanticActivationAckTableV1 *table)
+normal_start_service_binding_current_traced(const ClusterSemanticActivationRecord *open, const uint8 *root,
+									 const ClusterSemanticActivationAckTableV1 *table,
+									 SemanticStopTrace *trace)
 {
 	ClusterFormationSnapshotV1 formation;
 	const ClusterNormalStartCompletion *input = NormalStartCompletion;
 
+	if (trace != NULL) {
+		trace->service_stage = trace->stage;
+		trace->have_service = trace->have_writer = trace->have_formation = false;
+	}
 	/* A recovered start must advance the service epoch before it can expose
 	 * the recovered owner.  Do not let the equal-epoch fast path bypass the
 	 * physical owner observation required by the RECOVERED -> OPEN handoff. */
-	if (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
-		&& table->transition_epoch == open->transition_epoch)
+	if (semantic_stop_bad(trace, "service.recovered_epoch_not_advanced",
+						  cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+							  && table->transition_epoch == open->transition_epoch))
 		return false;
-	if (table->transition_epoch == open->transition_epoch)
-		return semantic_activation_bytes_are_zero(table->restart_binding, 32);
+	if (table->transition_epoch == open->transition_epoch) {
+		static const uint8 empty_binding[32];
+		return !semantic_stop_bytes_ne(trace, "service.same_epoch_restart_binding",
+									   table->restart_binding, empty_binding,
+									   sizeof(empty_binding));
+	}
 	if (!cluster_shared_config)
-		return false;
+		return !semantic_stop_bad(trace, "service.shared_config_required", true);
+	if (trace != NULL && input != NULL) {
+		trace->service = *input;
+		trace->have_service = true;
+	}
 	if (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER)
-		return normal_start_recovered_service_binding_current(open, root, table);
-	if (!normal_start_record_matches(open) || input->epoch != table->transition_epoch
-		|| open->transition_epoch == 0 || open->transition_epoch >= input->epoch
-		|| memcmp(root, input->pgrd, CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES) != 0
-		|| memcmp(table->restart_binding, input->restart_binding, 32) != 0
-		|| !normal_start_clean_writer_current(input)
-		|| !cluster_reconfig_capture_formation_snapshot_v1(cluster_node_id + 1, &formation)
-		|| formation.local_epoch != input->epoch
-		|| formation.startup_formation_generation
-			   != input->clean_formation.formation_marker_generation
-		|| formation.self_join_admitted != 1 || formation.self_join_failed
-		|| formation.prebump_sync_active
-		|| !semantic_activation_bytes_are_zero(formation.reserved, sizeof(formation.reserved))
-		|| !semantic_activation_bytes_are_zero(formation.pending_join_bitmap,
-											   sizeof(formation.pending_join_bitmap))
-		|| !semantic_activation_bytes_are_zero(formation.excluded_bitmap,
-											   sizeof(formation.excluded_bitmap))
-		|| !semantic_activation_bytes_are_zero(formation.clean_departed_bitmap,
-											   sizeof(formation.clean_departed_bitmap))
-		|| !semantic_activation_bytes_are_zero(formation.removed_bitmap,
-											   sizeof(formation.removed_bitmap)))
+		return !semantic_stop_bad(trace, "service.recovered_owner_proof",
+								  !normal_start_recovered_service_binding_current(open, root, table));
+	if (!normal_start_record_matches_traced(open, trace)
+		|| semantic_stop_ne(trace, "service.epoch", input->epoch, table->transition_epoch)
+		|| semantic_stop_bad(trace, "service.open_epoch_zero_or_not_before_restart",
+							 open->transition_epoch == 0 || open->transition_epoch >= input->epoch)
+		|| semantic_stop_bytes_ne(trace, "service.root", root, input->pgrd,
+								  CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES)
+		|| semantic_stop_bytes_ne(trace, "service.restart_binding", table->restart_binding,
+								  input->restart_binding, 32)
+		|| !normal_start_clean_writer_current_traced(input, trace)
+		|| !semantic_stop_formation_snapshot(trace, cluster_node_id + 1, &formation)
+		|| semantic_stop_ne(trace, "service.formation_epoch", formation.local_epoch, input->epoch)
+		|| semantic_stop_ne(trace, "service.formation_generation",
+							formation.startup_formation_generation,
+							input->clean_formation.formation_marker_generation)
+		|| semantic_stop_ne(trace, "service.self_join_admitted", formation.self_join_admitted, 1)
+		|| semantic_stop_bad(trace, "service.self_join_failed", formation.self_join_failed)
+		|| semantic_stop_bad(trace, "service.prebump_sync_active", formation.prebump_sync_active)
+		|| semantic_stop_ne(
+			trace, "service.formation_reserved_zero",
+			semantic_activation_bytes_are_zero(formation.reserved, sizeof(formation.reserved)),
+			true)
+		|| semantic_stop_ne(
+			trace, "service.pending_join_bitmap_zero",
+			semantic_activation_bytes_are_zero(formation.pending_join_bitmap,
+											   sizeof(formation.pending_join_bitmap)),
+			true)
+		|| semantic_stop_ne(trace, "service.excluded_bitmap_zero",
+							semantic_activation_bytes_are_zero(formation.excluded_bitmap,
+															   sizeof(formation.excluded_bitmap)),
+							true)
+		|| semantic_stop_ne(
+			trace, "service.clean_departed_bitmap_zero",
+			semantic_activation_bytes_are_zero(formation.clean_departed_bitmap,
+											   sizeof(formation.clean_departed_bitmap)),
+			true)
+		|| semantic_stop_ne(trace, "service.removed_bitmap_zero",
+							semantic_activation_bytes_are_zero(formation.removed_bitmap,
+															   sizeof(formation.removed_bitmap)),
+							true))
 		return false;
 	for (unsigned node = 0; node < CLUSTER_MAX_NODES; node++) {
-		if ((node < 4) != (formation.membership.membership_state[node] == CLUSTER_MEMBER_MEMBER))
+		if (trace != NULL)
+			trace->member = node;
+		if (semantic_stop_ne(trace, "service.member_present",
+							 formation.membership.membership_state[node] == CLUSTER_MEMBER_MEMBER,
+							 node < 4))
 			return false;
 		if (node < 4
-			&& (formation.membership.last_admitted_incarnation[node]
-					!= input->clean_formation.admitted_incarnation[node]
-				|| table->expected[node].admitted_incarnation
-					   != input->clean_formation.admitted_incarnation[node]))
+			&& (semantic_stop_ne(trace, "service.member_incarnation",
+								 formation.membership.last_admitted_incarnation[node],
+								 input->clean_formation.admitted_incarnation[node])
+				|| semantic_stop_ne(trace, "service.ack_incarnation",
+									table->expected[node].admitted_incarnation,
+									input->clean_formation.admitted_incarnation[node])))
 			return false;
 	}
+	if (trace != NULL)
+		trace->member = -1;
 	return true;
+}
+
+static bool
+normal_start_service_binding_current(const ClusterSemanticActivationRecord *open, const uint8 *root,
+									 const ClusterSemanticActivationAckTableV1 *table)
+{
+	return normal_start_service_binding_current_traced(open, root, table, NULL);
 }
 
 bool
@@ -14766,11 +15133,12 @@ cluster_semantic_activation_recovered_open_current(void)
 		   && memcmp(&before, &after, sizeof(before)) == 0 && semantic_serving_ready(&after);
 }
 
-ClusterNormalStopPollResult
-cluster_semantic_normal_stop_match(
+static ClusterNormalStopPollResult
+semantic_normal_stop_match_impl(
 	const ClusterSemanticActivationRecord *open_record,
 	const uint8 root_descriptor[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
-	uint64 member_incarnations_out[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT], const char **reason_out)
+	uint64 member_incarnations_out[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT], const char **reason_out,
+	SemanticStopTrace *trace)
 {
 	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_INVALID;
 	const char *reason = "SEMANTIC_STOP_IDENTITY_INVALID";
@@ -14791,32 +15159,58 @@ cluster_semantic_normal_stop_match(
 		memset(member_incarnations_out, 0, sizeof(uint64) * CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT);
 	/* The input must come from the existing durable-record consumer. This
 	 * read-only matcher neither replaces that producer nor closes admission. */
-	if (!IsUnderPostmaster || open_record == NULL || root_descriptor == NULL || cluster_node_id < 0
-		|| cluster_node_id >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
-		|| SemanticActivationShmem == NULL || SemanticActivationAckTable == NULL
-		|| SemanticActivationPgrdSnapshot == NULL)
+	if (semantic_stop_ne(trace, "input.under_postmaster", IsUnderPostmaster, true)
+		|| semantic_stop_bad(trace, "input.open_missing", open_record == NULL)
+		|| semantic_stop_bad(trace, "input.root_missing", root_descriptor == NULL)
+		|| semantic_stop_outside(trace, "input.node_id", cluster_node_id, 0,
+								 CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT - 1)
+		|| semantic_stop_bad(trace, "input.admission_missing", SemanticActivationShmem == NULL)
+		|| semantic_stop_bad(trace, "input.ack_missing", SemanticActivationAckTable == NULL)
+		|| semantic_stop_bad(trace, "input.pgrd_missing", SemanticActivationPgrdSnapshot == NULL))
 		goto done;
+	if (trace != NULL) {
+		trace->open = *open_record;
+		trace->system_identifier = GetSystemIdentifier();
+		memcpy(trace->root_expected, root_descriptor, sizeof(trace->root_expected));
+		trace->have_open = true;
+	}
 	/* The complete OPEN carrier declares participants. Unused profile slots
 	 * cannot contribute shutdown votes or force an otherwise valid pair out. */
 	expected_members = cluster_shared_config ? open_record->admitted_members_lo : UINT64_C(15);
-	if (expected_members == 0
-		|| (expected_members & ~((UINT64_C(1) << CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT) - 1)) != 0
-		|| (expected_members & (UINT64_C(1) << cluster_node_id)) == 0
-		|| (expected_members & UINT64_C(1)) == 0)
+	if (semantic_stop_outside(trace, "open.members_nonempty", expected_members, 1, UINT64_MAX)
+		|| semantic_stop_ne(
+			trace, "open.members_range",
+			expected_members & ~((UINT64_C(1) << CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT) - 1), 0)
+		|| semantic_stop_ne(trace, "open.local_member",
+							(expected_members & (UINT64_C(1) << cluster_node_id)) != 0, true)
+		|| semantic_stop_ne(trace, "open.coordinator_member", (expected_members & UINT64_C(1)) != 0,
+							true))
 		goto done;
-	if (open_record->phase != CLUSTER_SEMANTIC_PHASE_OPEN || open_record->record_generation < 6
-		|| open_record->record_generation == UINT64_MAX
-		|| open_record->source_feature_bitmap != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
-		|| open_record->target_feature_bitmap != target_bits
-		|| open_record->transition_epoch == UINT64_MAX || open_record->coordinator_node != 0
-		|| open_record->coordinator_incarnation == 0
-		|| open_record->coordinator_incarnation == UINT64_MAX
-		|| open_record->admitted_members_lo != expected_members
-		|| open_record->admitted_members_hi != 0 || open_record->capability_sample_digest == 0
-		|| open_record->rollback_feature_bitmap != 0
-		|| cluster_undo_root_descriptor_decode(root_descriptor, GetSystemIdentifier(), &descriptor)
-			   != CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
-		|| descriptor.root_kind != CLUSTER_UNDO_ROOT_KIND_SHARED || descriptor.owner_node != -1)
+	if (semantic_stop_ne(trace, "open.phase", open_record->phase, CLUSTER_SEMANTIC_PHASE_OPEN)
+		|| semantic_stop_outside(trace, "open.record_generation", open_record->record_generation, 6,
+								 UINT64_MAX - 1)
+		|| semantic_stop_ne(trace, "open.source_features", open_record->source_feature_bitmap,
+							CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1)
+		|| semantic_stop_ne(trace, "open.target_features", open_record->target_feature_bitmap,
+							target_bits)
+		|| semantic_stop_outside(trace, "open.transition_epoch", open_record->transition_epoch, 0,
+								 UINT64_MAX - 1)
+		|| semantic_stop_ne(trace, "open.coordinator_node", open_record->coordinator_node, 0)
+		|| semantic_stop_outside(trace, "open.coordinator_incarnation",
+								 open_record->coordinator_incarnation, 1, UINT64_MAX - 1)
+		|| semantic_stop_ne(trace, "open.members_lo", open_record->admitted_members_lo,
+							expected_members)
+		|| semantic_stop_ne(trace, "open.members_hi", open_record->admitted_members_hi, 0)
+		|| semantic_stop_outside(trace, "open.capability_digest",
+								 open_record->capability_sample_digest, 1, UINT64_MAX)
+		|| semantic_stop_ne(trace, "open.rollback_features", open_record->rollback_feature_bitmap,
+							0)
+		|| semantic_stop_ne(trace, "root.decode",
+							cluster_undo_root_descriptor_decode(root_descriptor,
+																GetSystemIdentifier(), &descriptor),
+							CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID)
+		|| semantic_stop_ne(trace, "root.kind", descriptor.root_kind, CLUSTER_UNDO_ROOT_KIND_SHARED)
+		|| semantic_stop_ne(trace, "root.owner_node", descriptor.owner_node, (uint64)(int64)-1))
 		goto done;
 	result = CLUSTER_NORMAL_STOP_PENDING;
 	reason = "SEMANTIC_STOP_OBSERVATION_PENDING";
@@ -14825,32 +15219,66 @@ cluster_semantic_normal_stop_match(
 		|| !semantic_activation_ack_current_authority_internal(
 			cluster_node_id, &lo, &hi, &epoch, &coordinator, open_record, root_descriptor))
 		goto done;
+	if (trace != NULL) {
+		trace->stage = "before";
+		trace->before = before;
+		trace->table = table;
+		memcpy(trace->root_before, root, sizeof(root));
+		trace->members_lo[0] = lo;
+		trace->members_hi[0] = hi;
+		trace->formation_epoch[0] = epoch;
+		trace->coordinator[0] = coordinator;
+		trace->have_before = true;
+	}
 	result = CLUSTER_NORMAL_STOP_INVALID;
 	reason = "SEMANTIC_STOP_IDENTITY_INVALID";
-	if (before.transition_closed || before.active_bits != target_bits
-		|| before.record_generation != open_record->record_generation
-		|| before.formation_epoch != epoch || lo != expected_members || hi != 0 || coordinator != 0
-		|| !normal_start_service_binding_current(open_record, root_descriptor, &table)
-		|| table.stage != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED
-		|| table.flags
-			   != (CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
-				   | CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE)
-		|| table.coordinator_node != open_record->coordinator_node
-		|| table.transition_epoch != epoch
-		|| table.record_generation != open_record->record_generation
-		|| table.source_feature_bitmap != open_record->source_feature_bitmap
-		|| table.target_feature_bitmap != open_record->target_feature_bitmap
-		|| table.rollback_feature_bitmap != open_record->rollback_feature_bitmap
-		|| table.expected_members_lo != open_record->admitted_members_lo
-		|| table.expected_members_hi != open_record->admitted_members_hi
-		|| table.capability_sample_digest != open_record->capability_sample_digest
-		|| open_record->coordinator_incarnation > table.expected[0].admitted_incarnation
-		|| memcmp(root, root_descriptor, sizeof(root)) != 0)
+	if (semantic_stop_bad(trace, "admission.transition_closed", before.transition_closed)
+		|| semantic_stop_ne(trace, "admission.active_bits", before.active_bits, target_bits)
+		|| semantic_stop_ne(trace, "admission.record_generation", before.record_generation,
+							open_record->record_generation)
+		|| semantic_stop_ne(trace, "admission.formation_epoch", before.formation_epoch, epoch)
+		|| semantic_stop_ne(trace, "authority.members_lo", lo, expected_members)
+		|| semantic_stop_ne(trace, "authority.members_hi", hi, 0)
+		|| semantic_stop_ne(trace, "authority.coordinator", coordinator, 0)
+		|| !normal_start_service_binding_current_traced(open_record, root_descriptor, &table, trace)
+		|| semantic_stop_ne(trace, "ack.stage", table.stage,
+							CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED)
+		|| semantic_stop_ne(trace, "ack.flags", table.flags,
+							CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+								| CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE)
+		|| semantic_stop_ne(trace, "ack.coordinator_node", table.coordinator_node,
+							open_record->coordinator_node)
+		|| semantic_stop_ne(trace, "ack.transition_epoch", table.transition_epoch, epoch)
+		|| semantic_stop_ne(trace, "ack.record_generation", table.record_generation,
+							open_record->record_generation)
+		|| semantic_stop_ne(trace, "ack.source_features", table.source_feature_bitmap,
+							open_record->source_feature_bitmap)
+		|| semantic_stop_ne(trace, "ack.target_features", table.target_feature_bitmap,
+							open_record->target_feature_bitmap)
+		|| semantic_stop_ne(trace, "ack.rollback_features", table.rollback_feature_bitmap,
+							open_record->rollback_feature_bitmap)
+		|| semantic_stop_ne(trace, "ack.members_lo", table.expected_members_lo,
+							open_record->admitted_members_lo)
+		|| semantic_stop_ne(trace, "ack.members_hi", table.expected_members_hi,
+							open_record->admitted_members_hi)
+		|| semantic_stop_ne(trace, "ack.capability_digest", table.capability_sample_digest,
+							open_record->capability_sample_digest)
+		|| semantic_stop_outside(trace, "ack.coordinator_incarnation",
+								 open_record->coordinator_incarnation, 0,
+								 table.expected[0].admitted_incarnation)
+		|| semantic_stop_bytes_ne(trace, "root.current", root, root_descriptor, sizeof(root)))
 		goto done;
 	caps = cluster_ic_local_capability_word();
+	if (trace != NULL) {
+		trace->caps = caps;
+		trace->have_caps = true;
+	}
 	image = semantic_activation_ack_complete_image_check_internal(
-		&table, lo, hi, epoch, coordinator, cluster_node_id, caps, open_record, root_descriptor);
+		&table, lo, hi, epoch, coordinator, cluster_node_id, caps, open_record, root_descriptor,
+		trace);
 	if (image != CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH) {
+		(void)semantic_stop_ne(trace, "ack.image_result", image,
+							   CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH);
 		if (image == CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_OBSERVATION_PENDING) {
 			result = CLUSTER_NORMAL_STOP_PENDING;
 			reason = "SEMANTIC_STOP_OBSERVATION_PENDING";
@@ -14868,6 +15296,17 @@ cluster_semantic_normal_stop_match(
 		|| !semantic_activation_ack_current_authority_internal(
 			cluster_node_id, &lo, &hi, &epoch, &coordinator, open_record, root_descriptor))
 		goto done;
+	if (trace != NULL) {
+		trace->stage = "after";
+		trace->after = after;
+		trace->table_after = table_after;
+		memcpy(trace->root_after, root_after, sizeof(root_after));
+		trace->members_lo[1] = lo;
+		trace->members_hi[1] = hi;
+		trace->formation_epoch[1] = epoch;
+		trace->coordinator[1] = coordinator;
+		trace->have_after = true;
+	}
 	if (before.seq != after.seq || before.active_bits != after.active_bits
 		|| before.record_generation != after.record_generation
 		|| before.formation_epoch != after.formation_epoch
@@ -14877,14 +15316,19 @@ cluster_semantic_normal_stop_match(
 		goto done;
 	result = CLUSTER_NORMAL_STOP_INVALID;
 	reason = "SEMANTIC_STOP_IDENTITY_INVALID";
-	if (lo != expected_members || hi != 0 || epoch != before.formation_epoch || coordinator != 0
-		|| caps != cluster_ic_local_capability_word()
-		|| !normal_start_service_binding_current(open_record, root_descriptor, &table_after))
+	if (semantic_stop_ne(trace, "authority.members_lo", lo, expected_members)
+		|| semantic_stop_ne(trace, "authority.members_hi", hi, 0)
+		|| semantic_stop_ne(trace, "authority.formation_epoch", epoch, before.formation_epoch)
+		|| semantic_stop_ne(trace, "authority.coordinator", coordinator, 0)
+		|| semantic_stop_caps_changed(trace, caps)
+		|| !normal_start_service_binding_current_traced(open_record, root_descriptor, &table_after, trace))
 		goto done;
 	image = semantic_activation_ack_complete_image_check_internal(
 		&table_after, lo, hi, epoch, coordinator, cluster_node_id, caps, open_record,
-		root_descriptor);
+		root_descriptor, trace);
 	if (image != CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH) {
+		(void)semantic_stop_ne(trace, "ack.image_result", image,
+							   CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH);
 		if (image == CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_OBSERVATION_PENDING) {
 			result = CLUSTER_NORMAL_STOP_PENDING;
 			reason = "SEMANTIC_STOP_OBSERVATION_PENDING";
@@ -14901,6 +15345,357 @@ done:
 	if (reason_out != NULL)
 		*reason_out = reason;
 	return result;
+}
+
+static void
+semantic_stop_hex(const uint8 *bytes, Size length, char out[65])
+{
+	static const char digits[] = "0123456789abcdef";
+	if (length > 32) {
+		strlcpy(out, "unavailable", 65);
+		return;
+	}
+	for (Size i = 0; i < length; i++) {
+		out[2 * i] = digits[bytes[i] >> 4];
+		out[2 * i + 1] = digits[bytes[i] & 15];
+	}
+	out[2 * length] = '\0';
+}
+
+static void
+semantic_stop_log_open(const char *label, const ClusterSemanticActivationRecord *open)
+{
+	ereport(
+		LOG,
+		(errmsg(
+			"semantic normal-stop %s.phase=%u %s.record_generation=" UINT64_FORMAT
+			" transition_epoch=" UINT64_FORMAT " source_features=" UINT64_FORMAT
+			" target_features=" UINT64_FORMAT " rollback_features=" UINT64_FORMAT
+			" coordinator=%u coordinator_incarnation=" UINT64_FORMAT " members_lo=" UINT64_FORMAT
+			" members_hi=" UINT64_FORMAT " capability_sample_digest=" UINT64_FORMAT,
+			label, (unsigned)open->phase, label, open->record_generation, open->transition_epoch,
+			open->source_feature_bitmap, open->target_feature_bitmap, open->rollback_feature_bitmap,
+			open->coordinator_node, open->coordinator_incarnation, open->admitted_members_lo,
+			open->admitted_members_hi, open->capability_sample_digest)));
+}
+
+static void
+semantic_stop_log_root(const char *label, const uint8 *bytes, uint64 system_identifier)
+{
+	ClusterUndoRootDescriptorV1 descriptor;
+	uint8 digest[32];
+	char hash[65] = "unavailable", uuid[65];
+	ClusterUndoRootDescriptorState status;
+	if (normal_start_sha256(bytes, CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES, digest))
+		semantic_stop_hex(digest, sizeof(digest), hash);
+	status = cluster_undo_root_descriptor_decode(bytes, system_identifier, &descriptor);
+	if (status != CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID) {
+		ereport(LOG, (errmsg("semantic normal-stop root.%s decode=%u sha256=%s", label,
+							 (unsigned)status, hash)));
+		return;
+	}
+	semantic_stop_hex(descriptor.root_uuid, sizeof(descriptor.root_uuid), uuid);
+	ereport(LOG, (errmsg("semantic normal-stop root.%s decode=%u system_identifier=" UINT64_FORMAT
+						 " descriptor_incarnation=" UINT64_FORMAT " namespace_id=" UINT64_FORMAT
+						 " kind=%u owner=%d ordinal=%u uuid=%s sha256=%s",
+						 label, (unsigned)status, descriptor.system_identifier,
+						 descriptor.descriptor_incarnation, descriptor.namespace_id,
+						 descriptor.root_kind, descriptor.owner_node, descriptor.root_ordinal, uuid,
+						 hash)));
+}
+
+static void
+semantic_stop_log_tuple(const char *sample, const char *kind, int node,
+						const SemanticActivationAckTuple *tuple)
+{
+	ereport(LOG, (errmsg("semantic normal-stop sample=%s ack.%s node=%d node_id=%u"
+						 " boot_id=" UINT64_FORMAT " admitted_incarnation=" UINT64_FORMAT
+						 " control_connection_generation=" UINT64_FORMAT " capability_word=%u"
+						 " capability_generation=" UINT64_FORMAT " transition_epoch=" UINT64_FORMAT
+						 " record_generation=" UINT64_FORMAT,
+						 sample, kind, node, tuple->node_id, tuple->boot_id,
+						 tuple->admitted_incarnation, tuple->control_connection_generation,
+						 tuple->capability_word, tuple->capability_generation,
+						 tuple->transition_epoch, tuple->record_generation)));
+}
+
+static void
+semantic_stop_log_snapshot(const SemanticStopTrace *trace, bool after)
+{
+	const char *label = after ? "after" : "before";
+	const SemanticActivationAdmissionSnapshot *admission = after ? &trace->after : &trace->before;
+	const ClusterSemanticActivationAckTableV1 *table = after ? &trace->table_after : &trace->table;
+	char binding[65];
+	int i = after ? 1 : 0;
+	if (!(after ? trace->have_after : trace->have_before)) {
+		ereport(LOG, (errmsg("semantic normal-stop snapshot=%s available=0", label)));
+		return;
+	}
+	semantic_stop_hex(table->restart_binding, sizeof(table->restart_binding), binding);
+	ereport(LOG,
+			(errmsg("semantic normal-stop admission.%s.seq=" UINT64_FORMAT
+					" active_bits=" UINT64_FORMAT " record_generation=" UINT64_FORMAT
+					" formation_epoch=" UINT64_FORMAT " transition_closed=%d"
+					" authority.members_lo=" UINT64_FORMAT " authority.members_hi=" UINT64_FORMAT
+					" authority.formation_epoch=" UINT64_FORMAT " authority.coordinator=%d",
+					label, admission->seq, admission->active_bits, admission->record_generation,
+					admission->formation_epoch, admission->transition_closed, trace->members_lo[i],
+					trace->members_hi[i], trace->formation_epoch[i], trace->coordinator[i])));
+	ereport(LOG,
+			(errmsg("semantic normal-stop ack.%s.round_nonce=" UINT64_FORMAT
+					" publication_seq=" UINT64_FORMAT " stage=%u flags=%u coordinator=%u"
+					" transition_epoch=" UINT64_FORMAT " record_generation=" UINT64_FORMAT
+					" source_features=" UINT64_FORMAT " target_features=" UINT64_FORMAT
+					" rollback_features=" UINT64_FORMAT " capability_sample_digest=" UINT64_FORMAT
+					" expected_members_lo=" UINT64_FORMAT " expected_members_hi=" UINT64_FORMAT
+					" observed_members_lo=" UINT64_FORMAT " observed_members_hi=" UINT64_FORMAT
+					" restart_binding=%s",
+					label, table->round_nonce,
+					pg_atomic_read_u64((pg_atomic_uint64 *)&table->publication_seq), table->stage,
+					table->flags, table->coordinator_node, table->transition_epoch,
+					table->record_generation, table->source_feature_bitmap,
+					table->target_feature_bitmap, table->rollback_feature_bitmap,
+					table->capability_sample_digest, table->expected_members_lo,
+					table->expected_members_hi, table->observed_members_lo,
+					table->observed_members_hi, binding)));
+	for (int node = 0; node < CLUSTER_MAX_NODES; node++) {
+		if (!semantic_activation_ack_member_present(table->expected_members_lo,
+													table->expected_members_hi, node))
+			continue;
+		semantic_stop_log_tuple(label, "expected", node, &table->expected[node]);
+		semantic_stop_log_tuple(label, "observed", node, &table->observed[node]);
+	}
+	semantic_stop_log_root(label, after ? trace->root_after : trace->root_before,
+						   trace->system_identifier);
+}
+
+static void
+semantic_stop_log_wal_identity(const char *label, const ClusterControlRootIdentity *identity)
+{
+	char storage[65], authority[65];
+	semantic_stop_hex(identity->storage_uuid, sizeof(identity->storage_uuid), storage);
+	semantic_stop_hex(identity->authority_uuid, sizeof(identity->authority_uuid), authority);
+	ereport(LOG, (errmsg("semantic normal-stop %s.system_identifier=" UINT64_FORMAT
+						 " storage_uuid=%s authority_uuid=%s origin_thread=%u origin_node=%d"
+						 " claim_created_at=" INT64_FORMAT
+						 " claim_crc=%u owner_incarnation=" UINT64_FORMAT
+						 " root_lineage_seq=" UINT64_FORMAT,
+						 label, identity->system_identifier, storage, authority,
+						 identity->origin_thread_id, identity->origin_node_id,
+						 identity->thread_claim_created_at, identity->thread_claim_crc32c,
+						 identity->origin_owner_incarnation, identity->root_lineage_seq)));
+}
+
+static void
+semantic_stop_log_service(const SemanticStopTrace *trace)
+{
+	const ClusterNormalStartCompletion *service = &trace->service;
+	ClusterSemanticActivationRecord open;
+	char binding[65];
+	char predecessor[65], exit_evidence[65];
+	ereport(LOG, (errmsg("semantic normal-stop service.sample_stage=%s service.available=%d"
+						 " writer.available=%d formation.available=%d",
+						 trace->service_stage != NULL ? trace->service_stage : "unavailable",
+						 trace->have_service, trace->have_writer, trace->have_formation)));
+	if (!trace->have_service)
+		return;
+	semantic_stop_hex(service->restart_binding, sizeof(service->restart_binding), binding);
+	semantic_stop_hex(service->clean_input.predecessor_root_sha256, 32, predecessor);
+	semantic_stop_hex(service->clean_input.exit_evidence_sha256, 32, exit_evidence);
+	ereport(
+		LOG,
+		(errmsg("semantic normal-stop service.state=%u node=%d system_identifier=" UINT64_FORMAT
+				" boot_incarnation=" UINT64_FORMAT " epoch=" UINT64_FORMAT " restart_binding=%s"
+				" clean_formation_generation=" UINT64_FORMAT " clean_formation_epoch=" UINT64_FORMAT
+				" clean_members_lo=" UINT64_FORMAT " clean_members_hi=" UINT64_FORMAT
+				" clean_arbiter=" UINT64_FORMAT " clean_arbiter_incarnation=" UINT64_FORMAT
+				" expected_timeline=%u expected_database_incarnation=" UINT64_FORMAT
+				" expected_config_generation=" UINT64_FORMAT
+				" expected_claim_generation=" UINT64_FORMAT,
+				pg_atomic_read_u32((pg_atomic_uint32 *)&service->state), service->node_id,
+				service->system_identifier, service->boot_incarnation, service->epoch, binding,
+				service->clean_formation.formation_marker_generation,
+				service->clean_formation.formation_epoch, service->clean_formation.members_lo,
+				service->clean_formation.members_hi, service->clean_formation.arbiter_node,
+				service->clean_formation.arbiter_incarnation, service->clean_input.timeline,
+				service->clean_input.successor.database_incarnation,
+				service->clean_input.successor.config_generation,
+				service->clean_input.successor.claim_generation)));
+	ereport(
+		LOG,
+		(errmsg(
+			"semantic normal-stop service.binding_input.root_sequence=" UINT64_FORMAT
+			" predecessor_root_sha256=%s exit_evidence_sha256=%s config_generation=" UINT64_FORMAT,
+			service->clean_input.predecessor_root_sequence, predecessor, exit_evidence,
+			service->clean_input.config_generation)));
+	if (cluster_semantic_activation_record_decode(service->pgsa, &open, NULL))
+		semantic_stop_log_open("service.open", &open);
+	semantic_stop_log_root("service", service->pgrd, trace->system_identifier);
+	semantic_stop_log_wal_identity("service.expected_writer",
+								   &service->clean_input.successor.identity);
+	if (trace->have_writer) {
+		semantic_stop_hex(trace->writer.claim.claim_sha256,
+						  sizeof(trace->writer.claim.claim_sha256), binding);
+		ereport(LOG, (errmsg("semantic normal-stop service.current_writer.timeline=%u"
+							 " database_incarnation=" UINT64_FORMAT
+							 " max_config_generation=" UINT64_FORMAT " claim_sha256=%s",
+							 trace->writer.timeline, trace->writer.claim.database_incarnation,
+							 trace->writer.claim.max_config_generation, binding)));
+		semantic_stop_log_wal_identity("service.current_writer", &trace->writer.claim.identity);
+	}
+	if (trace->have_formation) {
+		char pending[65], excluded[65], departed[65], removed[65], reserved[65];
+		semantic_stop_hex(trace->formation.pending_join_bitmap,
+						  sizeof(trace->formation.pending_join_bitmap), pending);
+		semantic_stop_hex(trace->formation.excluded_bitmap,
+						  sizeof(trace->formation.excluded_bitmap), excluded);
+		semantic_stop_hex(trace->formation.clean_departed_bitmap,
+						  sizeof(trace->formation.clean_departed_bitmap), departed);
+		semantic_stop_hex(trace->formation.removed_bitmap, sizeof(trace->formation.removed_bitmap),
+						  removed);
+		semantic_stop_hex(trace->formation.reserved, sizeof(trace->formation.reserved), reserved);
+		ereport(LOG,
+				(errmsg("semantic normal-stop service.current_formation.epoch=" UINT64_FORMAT
+						" generation=" UINT64_FORMAT
+						" self_join_admitted=%u self_join_failed=%u prebump=%u"
+						" pending_join_bitmap=%s excluded_bitmap=%s clean_departed_bitmap=%s "
+						"removed_bitmap=%s reserved=%s",
+						trace->formation.local_epoch, trace->formation.startup_formation_generation,
+						trace->formation.self_join_admitted, trace->formation.self_join_failed,
+						trace->formation.prebump_sync_active, pending, excluded, departed, removed,
+						reserved)));
+	}
+	for (int node = 0; node < CLUSTER_MAX_NODES; node++) {
+		if (node >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT && node != trace->failure_member)
+			continue;
+		ereport(
+			LOG,
+			(errmsg("semantic normal-stop service.member=%d expected_incarnation=" UINT64_FORMAT
+					" current_available=%d current_state=%u current_incarnation=" UINT64_FORMAT,
+					node,
+					node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
+						? service->clean_formation.admitted_incarnation[node]
+						: 0,
+					trace->have_formation,
+					trace->have_formation ? trace->formation.membership.membership_state[node] : 0,
+					trace->have_formation
+						? trace->formation.membership.last_admitted_incarnation[node]
+						: 0)));
+	}
+}
+
+static void
+semantic_stop_note_held_lock(LWLock *lock pg_attribute_unused(),
+							 LWLockMode mode pg_attribute_unused(), void *context)
+{
+	*(bool *)context = true;
+}
+
+static void
+semantic_stop_emit_first_trace(void)
+{
+	const SemanticStopTrace *trace = &semantic_stop_first_trace;
+	char expected[96], current[96];
+	bool held = false;
+	if (semantic_stop_trace_reported || trace->predicate[0] == '\0' || CritSectionCount != 0)
+		return;
+	ForEachLWLockHeldByMe(semantic_stop_note_held_lock, &held);
+	if (held)
+		return;
+	/* Set before LOG hooks can reenter. The stored image stays immutable. */
+	semantic_stop_trace_reported = true;
+	if (trace->byte_count != 0) {
+		uint8 digest[32];
+		if (trace->byte_count <= 32) {
+			semantic_stop_hex(trace->expected_bytes, trace->byte_count, expected);
+			semantic_stop_hex(trace->current_bytes, trace->byte_count, current);
+		} else {
+			strlcpy(expected, "sha256-unavailable", sizeof(expected));
+			strlcpy(current, "sha256-unavailable", sizeof(current));
+			if (normal_start_sha256(trace->expected_bytes, trace->byte_count, digest))
+				semantic_stop_hex(digest, sizeof(digest), expected);
+			if (normal_start_sha256(trace->current_bytes, trace->byte_count, digest))
+				semantic_stop_hex(digest, sizeof(digest), current);
+		}
+	} else {
+		if (trace->range)
+			snprintf(expected, sizeof(expected), UINT64_FORMAT ".." UINT64_FORMAT, trace->expected,
+					 trace->upper);
+		else
+			snprintf(expected, sizeof(expected), UINT64_FORMAT, trace->expected);
+		snprintf(current, sizeof(current), UINT64_FORMAT, trace->current);
+	}
+	ereport(LOG, (errmsg("semantic normal-stop identity rejection node=%d predicate=%s"
+						 " stage=%s member=%d expected=%s current=%s byte_count=%zu",
+						 trace->local_node, trace->predicate, trace->failure_stage,
+						 trace->failure_member, expected, current, trace->byte_count)));
+	if (trace->have_open) {
+		semantic_stop_log_open("open", &trace->open);
+		semantic_stop_log_root("expected", trace->root_expected, trace->system_identifier);
+	}
+	semantic_stop_log_snapshot(trace, false);
+	semantic_stop_log_snapshot(trace, true);
+	ereport(LOG,
+			(errmsg("semantic normal-stop capability.before_available=%d before_word=%u"
+					" after_available=%d after_word=%u",
+					trace->have_caps, trace->caps, trace->have_caps_after, trace->caps_after)));
+	for (int node = 0; node < CLUSTER_MAX_NODES; node++) {
+		if (!trace->live[node].sampled)
+			continue;
+		ereport(LOG,
+				(errmsg("semantic normal-stop sample_stage=%s live.member=%d"
+						" state_available=%d state=%u admitted_incarnation=" UINT64_FORMAT
+						" self_incarnation=" UINT64_FORMAT
+						" capability_available=%d capability_valid=%d"
+						" capability_generation=%u capability_word=%u tuple_available=%d",
+						trace->live[node].stage, node, trace->live[node].have_state,
+						trace->live[node].state, trace->live[node].admitted, trace->live[node].self,
+						trace->live[node].have_capability, trace->live[node].capability.valid,
+						trace->live[node].capability.generation, trace->live[node].capability.bits,
+						trace->live[node].have_tuple)));
+		if (trace->live[node].have_tuple)
+			semantic_stop_log_tuple(trace->live[node].stage, "current", node,
+									&trace->live[node].tuple);
+	}
+	semantic_stop_log_service(trace);
+}
+
+static pg_noinline ClusterNormalStopPollResult
+semantic_normal_stop_match_traced(const ClusterSemanticActivationRecord *open, const uint8 *root,
+								  uint64 *incarnations, const char **reason)
+{
+	SemanticStopTrace trace;
+	ClusterNormalStopPollResult result;
+	memset(&trace, 0, sizeof(trace));
+	trace.stage = "input";
+	trace.member = -1;
+	trace.local_node = cluster_node_id;
+	result = semantic_normal_stop_match_impl(open, root, incarnations, reason, &trace);
+	if (result == CLUSTER_NORMAL_STOP_INVALID && semantic_stop_first_trace.predicate[0] == '\0') {
+		if (trace.predicate[0] == '\0')
+			(void)semantic_stop_bad(&trace, "matcher.unclassified", true);
+		semantic_stop_first_trace = trace;
+	}
+	semantic_stop_emit_first_trace();
+	return result;
+}
+
+ClusterNormalStopPollResult
+cluster_semantic_normal_stop_match(const ClusterSemanticActivationRecord *open,
+								   const uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
+								   uint64 incarnations[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT],
+								   const char **reason)
+{
+	if (!cluster_trace_normal_stop)
+		return semantic_normal_stop_match_impl(open, root, incarnations, reason, NULL);
+	if (!cluster_normal_stop_requested()) {
+		semantic_stop_trace_reported = false;
+		memset(&semantic_stop_first_trace, 0, sizeof(semantic_stop_first_trace));
+		return semantic_normal_stop_match_impl(open, root, incarnations, reason, NULL);
+	}
+	if (semantic_stop_trace_reported)
+		return semantic_normal_stop_match_impl(open, root, incarnations, reason, NULL);
+	return semantic_normal_stop_match_traced(open, root, incarnations, reason);
 }
 
 /* Available before ROOT serving publication; this proves the current semantic

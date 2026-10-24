@@ -59,6 +59,20 @@ def digest(path):
     return h.hexdigest()
 
 
+def catalog_version(header):
+    definitions = []
+    for line in Path(header).read_text().splitlines():
+        definition = re.match(r"^\s*#\s*define[ \t]+CATALOG_VERSION_NO\b(.*)$", line)
+        if definition:
+            definitions.append(definition[1])
+    if len(definitions) != 1:
+        raise ValueError("invalid source catalog version")
+    version = re.fullmatch(r"\s+([1-9][0-9]*)\s*", definitions[0])
+    if not version:
+        raise ValueError("invalid source catalog version")
+    return version[1]
+
+
 class Driver:
     def __init__(self, executable, transcript):
         if not executable or not Path(executable).is_file() or not os.access(executable, os.X_OK):
@@ -106,6 +120,8 @@ class Fixture:
         return self.driver.call(op, self.layout, **args)
 
     def init(self):
+        expected_catalog = catalog_version(Path(__file__).resolve().parents[3] /
+                                           "include/catalog/catversion.h")
         for node in self.layout["nodes"]:
             assert not Path(node["data_dir"]).exists(), "not a fresh PGDATA"
         self.call("fresh_init")
@@ -119,7 +135,8 @@ class Fixture:
             assert not (Path(node["data_dir"]) / "backup_label").exists(), "backup clone used as fresh node"
             value = self.sql(i, "SELECT system_identifier::text||'|'||catalog_version_no FROM pg_control_system()")
             sysid, catalog = value.split("|")
-            assert int(sysid) > 0 and catalog == "202609290", "PRE2 format activation is not complete"
+            assert int(sysid) > 0 and catalog == expected_catalog, (
+                f"PRE2 format activation is not complete (expected catalog {expected_catalog}, observed {catalog!r})")
             identities.append(sysid)
             assert self.sql(i, "SELECT current_setting('cluster.enabled')||'|'||"
                             "current_setting('cluster.shared_catalog')||'|'||current_setting('cluster.shared_config')") == "on|on|on"

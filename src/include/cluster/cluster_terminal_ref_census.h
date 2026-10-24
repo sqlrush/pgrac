@@ -451,6 +451,28 @@ typedef struct ClusterCtrcReceiptHandle {
 	uint8 reserved8[7];
 } ClusterCtrcReceiptHandle;
 
+/* Passive, process-local diagnostic copy, never a receipt/authority token.
+ * Table locks qualify physical key/publication binding and prevent reuse.
+ * APPLY/cancel can update mutable fields without these locks: target/counts
+ * and the two state reads are NOT one atomic snapshot, even if states agree.
+ * No raw shared pointers, wire/shared ABI or persistent format. */
+typedef struct ClusterCtrcReceiptObservation {
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcParticipantIdentity participant;
+	ClusterCtrcPublicationIdV1 publication;
+	ClusterCtrcTargetV1 target;
+	uint32 state_before, state_after, grant_generation;
+	uint8 participant_state, disposition;
+	uint64 receipt_count, prepared_count, applied_count, cancelled_count;
+	uint64 cleaned_count, ack_frozen_count, seal_generation, last_key_sequence;
+	XLogRecPtr highest_local_wal_lsn;
+} ClusterCtrcReceiptObservation;
+
+/* Nonblocking: unknown/unsafe/lock-busy/stale bindings return false with
+ * zero output. Performs no LOG, allocation, state change or authority grant. */
+extern bool cluster_ctrc_receipt_observe_shared(const ClusterCtrcReceiptHandle *handle,
+											  ClusterCtrcReceiptObservation *out);
+
 typedef struct ClusterCtrcDurability {
 	XLogRecPtr highest_local_lsn;
 	XLogRecPtr local_flush_lsn;
@@ -588,6 +610,31 @@ typedef enum ClusterCtrcPrepareResult {
 	CLUSTER_CTRC_PREPARE_DUPLICATE = 2,
 	CLUSTER_CTRC_PREPARE_CAPACITY = 3
 } ClusterCtrcPrepareResult;
+
+/* Call-local observation of the original shared PREPARE return point, not
+ * a receipt or authority. Helper/compound cuts do not identify a leaf predicate. */
+#define CLUSTER_CTRC_PREPARE_PATH_PRESENT 1
+#define CLUSTER_CTRC_PREPARE_TABLE_PATH_PRESENT 1
+typedef enum ClusterCtrcPreparePath {
+	CLUSTER_CTRC_PREPARE_PATH_UNKNOWN = 0,
+	CLUSTER_CTRC_PREPARE_PATH_NAMESPACE = 1,
+	CLUSTER_CTRC_PREPARE_PATH_INPUT = 2,
+	CLUSTER_CTRC_PREPARE_PATH_JOURNAL = 3,
+	CLUSTER_CTRC_PREPARE_PATH_CHAIN = 4,
+	CLUSTER_CTRC_PREPARE_PATH_LOCATOR = 5,
+	CLUSTER_CTRC_PREPARE_PATH_OBJECT_EXISTING = 6,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE = 7,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE_INPUT = 8,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE_PARTICIPANT = 9,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE_PUBLICATION = 10,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE_EMPTY_BYTES = 11,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE_TOMBSTONE_BYTES = 12,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE_OCCUPIED = 13,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE_DUPLICATE_CONFLICT = 14,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE_CAPACITY = 15,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE_SLOT_PREPARE = 16,
+	CLUSTER_CTRC_PREPARE_PATH_ORIGINAL_FULL_XID = 17
+} ClusterCtrcPreparePath;
 
 typedef enum ClusterCtrcApplyResult {
 	CLUSTER_CTRC_APPLY_FAIL_CLOSED = 0,
@@ -1073,6 +1120,11 @@ extern ClusterCtrcPrepareResult cluster_ctrc_receipt_prepare_shared(
 	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *identity,
 	uint32 grant_generation, const ClusterCtrcPublicationIdV1 *publication,
 	const ClusterCtrcTargetV1 *target, ClusterCtrcReceiptHandle *handle);
+extern ClusterCtrcPrepareResult cluster_ctrc_receipt_prepare_shared_observed(
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *identity,
+	uint32 grant_generation, const ClusterCtrcPublicationIdV1 *publication,
+	const ClusterCtrcTargetV1 *target, ClusterCtrcReceiptHandle *handle,
+	ClusterCtrcPreparePath *path_out);
 extern ClusterCtrcApplyResult cluster_ctrc_receipt_apply_prepared(
 	ClusterCtrcParticipantEntry *participant, ClusterCtrcReceipt *receipt,
 	const ClusterCtrcTargetV1 *final_target, ClusterCtrcApplyToken *token);

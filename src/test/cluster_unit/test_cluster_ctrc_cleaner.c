@@ -31,6 +31,9 @@
 #include "storage/proc.h"
 #include "storage/spin.h"
 
+static int observe_busy_kind;
+static unsigned observe_conditional_calls;
+volatile uint32 CritSectionCount;
 static unsigned spin_acquisitions;
 static unsigned sleepable_acquisitions;
 static unsigned held_count;
@@ -74,6 +77,7 @@ static void test_pool_upgrade(void);
 #define clock_gettime test_clock_gettime
 #include "../../backend/cluster/cluster_terminal_ref_census.c"
 #undef clock_gettime
+#include "storage/proc.h"
 
 #undef printf
 #undef fprintf
@@ -81,9 +85,73 @@ static void test_pool_upgrade(void);
 
 UT_DEFINE_GLOBALS();
 
+/* The parent still executes its real shared body, returning no path rather
+ * than failing to compile merely because the diagnostic API is absent. */
+#ifndef CLUSTER_CTRC_PREPARE_PATH_PRESENT
+typedef enum ClusterCtrcPreparePath {
+	CLUSTER_CTRC_PREPARE_PATH_UNKNOWN = 0,
+	CLUSTER_CTRC_PREPARE_PATH_NAMESPACE = 1,
+	CLUSTER_CTRC_PREPARE_PATH_INPUT = 2,
+	CLUSTER_CTRC_PREPARE_PATH_JOURNAL = 3,
+	CLUSTER_CTRC_PREPARE_PATH_CHAIN = 4,
+	CLUSTER_CTRC_PREPARE_PATH_LOCATOR = 5,
+	CLUSTER_CTRC_PREPARE_PATH_OBJECT_EXISTING = 6,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE = 7
+} ClusterCtrcPreparePath;
+
+static ClusterCtrcPrepareResult
+cluster_ctrc_receipt_prepare_shared_observed(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *identity, uint32 grant,
+	const ClusterCtrcPublicationIdV1 *publication, const ClusterCtrcTargetV1 *target,
+	ClusterCtrcReceiptHandle *handle, ClusterCtrcPreparePath *path)
+{
+	if (path != NULL)
+		*path = CLUSTER_CTRC_PREPARE_PATH_UNKNOWN;
+	return cluster_ctrc_receipt_prepare_shared(key, identity, grant, publication, target, handle);
+}
+#endif
+
+
+/* Exact parent executes its original table body once. It has only the
+ * coarse TABLE observation; new expected cuts must fail behaviorally. */
+#ifndef CLUSTER_CTRC_PREPARE_TABLE_PATH_PRESENT
+#define CLUSTER_CTRC_PREPARE_PATH_TABLE_INPUT ((ClusterCtrcPreparePath)8)
+#define CLUSTER_CTRC_PREPARE_PATH_TABLE_PARTICIPANT ((ClusterCtrcPreparePath)9)
+#define CLUSTER_CTRC_PREPARE_PATH_TABLE_PUBLICATION ((ClusterCtrcPreparePath)10)
+#define CLUSTER_CTRC_PREPARE_PATH_TABLE_EMPTY_BYTES ((ClusterCtrcPreparePath)11)
+#define CLUSTER_CTRC_PREPARE_PATH_TABLE_TOMBSTONE_BYTES ((ClusterCtrcPreparePath)12)
+#define CLUSTER_CTRC_PREPARE_PATH_TABLE_OCCUPIED ((ClusterCtrcPreparePath)13)
+#define CLUSTER_CTRC_PREPARE_PATH_TABLE_DUPLICATE_CONFLICT ((ClusterCtrcPreparePath)14)
+#define CLUSTER_CTRC_PREPARE_PATH_TABLE_CAPACITY ((ClusterCtrcPreparePath)15)
+#define CLUSTER_CTRC_PREPARE_PATH_TABLE_SLOT_PREPARE ((ClusterCtrcPreparePath)16)
+
+static ClusterCtrcPrepareResult
+ctrc_receipt_prepare_table_observed(ClusterCtrcParticipantEntry *participant,
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *identity, uint32 grant,
+	const ClusterCtrcPublicationIdV1 *publication, const ClusterCtrcTargetV1 *target,
+	ClusterCtrcReceipt *receipts, uint8 *probe_states, Size count, uint64 journal,
+	uint64 *index, Size *probes, ClusterCtrcPreparePath *path)
+{
+	if (path != NULL)
+		*path = CLUSTER_CTRC_PREPARE_PATH_TABLE;
+	return cluster_ctrc_receipt_prepare_table_locked(participant, key, identity, grant,
+		publication, target, receipts, probe_states, count, journal, index, probes);
+}
+#endif
+
 int NBuffers = 16;
 int MaxBackends = 8;
 int cluster_node_id = 0;
+bool cluster_trace_normal_stop;
+BackendId MyBackendId = InvalidBackendId;
+static bool origin_log_enabled, origin_log_throw, origin_driver_pending, origin_require_dispatch_return;
+static bool origin_dispatch_returned;
+static unsigned origin_log_count, origin_dispatch_calls;
+static char origin_last_log[8192];
+static unsigned reply_log_count;
+static char reply_last_log[8192];
+static unsigned batch_reply_log_count, batch_reply_log_throw_at;
+static char batch_reply_logs[CLUSTER_CTRC_RECLAIM_BATCH_MAX][8192];
 BackendType MyBackendType = B_BACKEND;
 AuxProcType MyAuxProcType = NotAnAuxProcess;
 int MyProcPid = 2901;
@@ -380,7 +448,12 @@ bool
 LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
 {
 	conditional_calls++;
+	observe_conditional_calls++;
 	if (conditional_refuse_call != 0 && conditional_calls == conditional_refuse_call)
+		return false;
+	if ((observe_busy_kind == 1 && lock->tranche == LWTRANCHE_CLUSTER_CTRC_PARTICIPANT)
+		|| (observe_busy_kind == 2 && lock == &CtrcShared->receipt_lock)
+		|| (observe_busy_kind == 3 && lock == &CtrcShared->origin_lock))
 		return false;
 	return LWLockAcquire(lock, mode);
 }
@@ -393,12 +466,25 @@ LWLockRelease(LWLock *lock)
 	test_lock_leave(lock);
 }
 
+void
+ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *context)
+{
+	for (unsigned i = 0; i < held_count; i++)
+		callback((LWLock *)held_locks[i], LW_SHARED, context);
+}
+
 static int
 test_clock_gettime(clockid_t clock_id pg_attribute_unused(), struct timespec *ts)
 {
 	ts->tv_sec = test_now_us / UINT64_C(1000000);
 	ts->tv_nsec = (test_now_us % UINT64_C(1000000)) * 1000;
 	return 0;
+}
+
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	return (TimestampTz)test_now_us;
 }
 
 int
@@ -430,9 +516,9 @@ cluster_undo_cleaner_wakeup(void)
 }
 
 bool
-errstart(int level pg_attribute_unused(), const char *domain pg_attribute_unused())
+errstart(int level, const char *domain pg_attribute_unused())
 {
-	return false;
+	return level == LOG && origin_log_enabled;
 }
 
 bool
@@ -454,8 +540,12 @@ errmsg(const char *fmt pg_attribute_unused(), ...)
 }
 
 int
-errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+errmsg_internal(const char *fmt, ...)
 {
+	va_list arguments;
+	va_start(arguments, fmt);
+	vsnprintf(origin_last_log, sizeof(origin_last_log), fmt, arguments);
+	va_end(arguments);
 	return 0;
 }
 
@@ -463,6 +553,24 @@ void
 errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused(),
 		  const char *func pg_attribute_unused())
 {
+	if (origin_log_enabled) {
+		UT_ASSERT_EQ(held_count, 0); UT_ASSERT_EQ(CritSectionCount, 0);
+		if (strstr(origin_last_log, "PGRAC_FAMILY=CTRC_ORIGIN_REPLY") != NULL) {
+			reply_log_count++;
+			strlcpy(reply_last_log, origin_last_log, sizeof(reply_last_log));
+		} else if (strstr(origin_last_log, "PGRAC_FAMILY=CTRC_ORIGIN_BATCH_REPLY") != NULL) {
+			if (batch_reply_log_count < CLUSTER_CTRC_RECLAIM_BATCH_MAX)
+				strlcpy(batch_reply_logs[batch_reply_log_count], origin_last_log, sizeof(batch_reply_logs[0]));
+			batch_reply_log_count++;
+			if (batch_reply_log_throw_at != 0 && batch_reply_log_count == batch_reply_log_throw_at)
+				pg_re_throw();
+		} else {
+			if (origin_require_dispatch_return) UT_ASSERT(origin_dispatch_returned);
+			origin_log_count++;
+		}
+		if (origin_log_throw) pg_re_throw();
+		return;
+	}
 	abort();
 }
 
@@ -483,6 +591,23 @@ reset_fixture(void)
 	pg_atomic_write_u64(&test_my_proc.cluster_top_full_xid_atomic,
 							U64FromFullTransactionId(test_top_full));
 	top_full_reads = 0;
+	observe_busy_kind = 0;
+	observe_conditional_calls = 0;
+	cluster_trace_normal_stop = origin_log_enabled = origin_log_throw = false;
+	origin_driver_pending = origin_require_dispatch_return = origin_dispatch_returned = false;
+	reply_log_count = 0; reply_last_log[0] = '\0';
+	batch_reply_log_count = batch_reply_log_throw_at = 0;
+	origin_log_count = origin_dispatch_calls = 0; origin_last_log[0] = '\0';
+#ifdef CLUSTER_CTRC_ORIGIN_DISPATCH_TRACE_PRESENT
+	CtrcOriginTraceCriticalSkipped = CtrcOriginTraceLwlockSkipped = 0;
+#endif
+#ifdef CLUSTER_CTRC_ORIGIN_REPLY_TRACE_PRESENT
+	CtrcReplyTraceUnsafeSkipped = 0;
+#endif
+#ifdef CLUSTER_CTRC_LOCAL_BATCH_REPLY_TRACE_PRESENT
+	CtrcBatchReplyTraceSkipped = 0;
+#endif
+	CritSectionCount = 0;
 	allow_new_service_participant = true;
 	new_service_participant_calls = 0;
 	external_lock_hook = NULL;
@@ -1361,9 +1486,9 @@ UT_TEST(test_certificate_scan_bounds_unpublished_candidates)
 /* Build one real pending receipt, cancel it without publishing a page
  * reference, then close and encode its actual nonempty ACK. The fixture
  * owns no disk or page I/O and must not claim durability of an applied row. */
-static ClusterCtrcPrepareResult
-prepare_fixture_receipt(ClusterCtrcOriginEntry *origin, uint64 operation_id,
-						ClusterCtrcReceiptHandle *handle)
+static void
+fixture_receipt_inputs(ClusterCtrcOriginEntry *origin, uint64 operation_id,
+	ClusterCtrcPublicationIdV1 *publication_out, ClusterCtrcTargetV1 *target_out)
 {
 	ClusterCtrcPublicationIdV1 publication = { 0 };
 	ClusterCtrcTargetV1 target = { 0 };
@@ -1390,6 +1515,18 @@ prepare_fixture_receipt(ClusterCtrcOriginEntry *origin, uint64 operation_id,
 	target.relation_persistence = 'p';
 	target.needs_wal = true;
 	target.page_operation_kind = 1;
+	*publication_out = publication;
+	*target_out = target;
+}
+
+static ClusterCtrcPrepareResult
+prepare_fixture_receipt(ClusterCtrcOriginEntry *origin, uint64 operation_id,
+						ClusterCtrcReceiptHandle *handle)
+{
+	ClusterCtrcPublicationIdV1 publication;
+	ClusterCtrcTargetV1 target;
+
+	fixture_receipt_inputs(origin, operation_id, &publication, &target);
 	return cluster_ctrc_receipt_prepare_shared(
 		&origin->key, &origin->touched[0], origin->grant_generation, &publication, &target, handle);
 }
@@ -1470,6 +1607,76 @@ UT_TEST(test_local_receipt_refuses_missing_or_aliased_origin_protection)
 		UT_ASSERT_EQ(ctrc_participant_receipt_heads()[pi], 0);
 		for (uint64 i = 0; i < CtrcShared->receipt_entries; i++)
 			UT_ASSERT(ctrc_bytes_zero(&ctrc_receipt_entries()[i], sizeof(ClusterCtrcReceipt)));
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+static ClusterCtrcPrepareResult
+prepare_fixture_receipt_observed(ClusterCtrcOriginEntry *origin, uint64 operation_id,
+	ClusterCtrcReceiptHandle *handle, ClusterCtrcPreparePath *path)
+{
+	ClusterCtrcPublicationIdV1 publication;
+	ClusterCtrcTargetV1 target;
+
+	fixture_receipt_inputs(origin, operation_id, &publication, &target);
+	return cluster_ctrc_receipt_prepare_shared_observed(&origin->key, &origin->touched[0],
+		origin->grant_generation, &publication, &target, handle, path);
+}
+
+UT_TEST(test_prepare_path_namespace_precedes_input_and_resets_output)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcPublicationIdV1 publication;
+	ClusterCtrcTargetV1 target;
+	ClusterCtrcReceiptHandle handle;
+	ClusterCtrcPreparePath path = CLUSTER_CTRC_PREPARE_PATH_TABLE;
+	uint64 journal;
+
+	reset_fixture(); origin = seed_origin(0, 1);
+	fixture_receipt_inputs(origin, 201, &publication, &target);
+	journal = CtrcShared->global_journal_generation;
+	target.rel_number = InvalidRelFileNumber;
+	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_shared_observed(&origin->key, NULL,
+		origin->grant_generation, &publication, &target, &handle, &path),
+		CLUSTER_CTRC_PREPARE_REFUSED);
+	UT_ASSERT_EQ(path, CLUSTER_CTRC_PREPARE_PATH_NAMESPACE);
+	UT_ASSERT(!handle.valid);
+	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_shared_observed(&origin->key, &origin->touched[0],
+		origin->grant_generation, &publication, NULL, &handle, &path),
+		CLUSTER_CTRC_PREPARE_REFUSED);
+	UT_ASSERT_EQ(path, CLUSTER_CTRC_PREPARE_PATH_INPUT);
+	UT_ASSERT(!handle.valid);
+	UT_ASSERT_EQ(CtrcShared->global_journal_generation, journal);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_prepare_path_input_precedes_journal_exhaustion)
+{
+	const uint64 unavailable[] = {0, UINT64_MAX};
+	const ClusterCtrcPreparePath expected[] = {
+		CLUSTER_CTRC_PREPARE_PATH_INPUT, CLUSTER_CTRC_PREPARE_PATH_JOURNAL
+	};
+	for (unsigned i = 0; i < lengthof(unavailable); i++) {
+		ClusterCtrcOriginEntry *origin;
+		ClusterCtrcReceiptHandle handle;
+		ClusterCtrcPreparePath path = CLUSTER_CTRC_PREPARE_PATH_TABLE;
+		ClusterCtrcParticipantEntry before;
+		uint64 pi;
+
+		reset_fixture(); origin = seed_origin(0, 1);
+		UT_ASSERT(ctrc_participant_index(&origin->key, 0, &pi));
+		before = ctrc_participant_entries()[pi];
+		CtrcShared->global_journal_generation = unavailable[i];
+		/* Zero invalidates the shared header before journal allocation;
+		 * UINT64_MAX is a valid header with an exhausted journal. */
+		UT_ASSERT_EQ(cluster_ctrc_shmem_ready(), unavailable[i] != 0);
+		UT_ASSERT_EQ(prepare_fixture_receipt_observed(origin, 201, &handle, &path),
+			CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT_EQ(path, expected[i]);
+		UT_ASSERT(!handle.valid);
+		UT_ASSERT_EQ(memcmp(&before, &ctrc_participant_entries()[pi], sizeof(before)), 0);
+		UT_ASSERT_EQ(ctrc_participant_receipt_heads()[pi], 0);
+		UT_ASSERT_EQ(CtrcShared->global_journal_generation, unavailable[i]);
 		UT_ASSERT_EQ(held_count, 0);
 	}
 }
@@ -1598,6 +1805,339 @@ UT_TEST(test_local_receipt_keeps_inflight_grant_until_participant_close)
 	}
 }
 
+UT_TEST(test_prepare_path_chain_precedes_locator_and_keeps_blocked_state)
+{
+	for (unsigned kind = 0; kind < 3; kind++) {
+		ClusterCtrcOriginEntry *origin;
+		ClusterCtrcReceiptHandle handle;
+		ClusterCtrcPreparePath path;
+		uint64 pi;
+
+		reset_fixture(); origin = seed_origin(0, 1);
+		UT_ASSERT(ctrc_participant_index(&origin->key, 0, &pi));
+		if (kind != 1)
+			ctrc_participant_receipt_heads()[pi] = 1;
+		if (kind != 0)
+			for (uint64 i = 0; i < CtrcShared->receipt_entries; i++)
+				ctrc_receipt_links()[i].next_plus_one = 1;
+		UT_ASSERT_EQ(prepare_fixture_receipt_observed(origin, 201, &handle, &path),
+			CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT_EQ(path, kind == 1 ? CLUSTER_CTRC_PREPARE_PATH_LOCATOR
+			: CLUSTER_CTRC_PREPARE_PATH_CHAIN);
+		UT_ASSERT(!handle.valid);
+		UT_ASSERT_EQ(ctrc_participant_entries()[pi].state, CTRC_PARTICIPANT_BLOCKED);
+		UT_ASSERT(ctrc_bytes_zero(ctrc_receipt_entries(),
+			CtrcShared->receipt_entries * sizeof(ClusterCtrcReceipt)));
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_prepare_path_object_existing_keeps_refusal_race_and_duplicate)
+{
+	for (unsigned race = 0; race < 2; race++) {
+		ClusterCtrcOriginEntry *origin;
+		ClusterCtrcReceiptHandle handle;
+		ClusterCtrcPreparePath path;
+		ClusterCtrcParticipantEntry before;
+		uint64 pi;
+
+		reset_fixture(); origin = seed_origin(0, 1);
+		UT_ASSERT(ctrc_participant_index(&origin->key, 0, &pi));
+		before = ctrc_participant_entries()[pi];
+		cluster_shared_config = true;
+		publication_fenced = race == 0;
+		fence_at_receipt_lock = race != 0;
+		UT_ASSERT_EQ(prepare_fixture_receipt_observed(origin, 201, &handle, &path),
+			CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT_EQ(path, CLUSTER_CTRC_PREPARE_PATH_OBJECT_EXISTING);
+		UT_ASSERT(!handle.valid);
+		UT_ASSERT_EQ(memcmp(&before, &ctrc_participant_entries()[pi], sizeof(before)), 0);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+	{
+		ClusterCtrcOriginEntry *origin;
+		ClusterCtrcReceiptHandle first, duplicate;
+		ClusterCtrcPreparePath path;
+		ClusterCtrcReceipt before;
+
+		reset_fixture(); origin = seed_origin(0, 1); cluster_shared_config = true;
+		UT_ASSERT_EQ(prepare_fixture_receipt(origin, 201, &first), CLUSTER_CTRC_PREPARE_READY);
+		before = *first.receipt; publication_fenced = true; publication_revision++;
+		UT_ASSERT_EQ(prepare_fixture_receipt_observed(origin, 201, &duplicate, &path),
+			CLUSTER_CTRC_PREPARE_DUPLICATE);
+		UT_ASSERT_EQ(path, CLUSTER_CTRC_PREPARE_PATH_OBJECT_EXISTING);
+		UT_ASSERT_EQ(duplicate.receipt_index, first.receipt_index);
+		UT_ASSERT_EQ(memcmp(&before, first.receipt, sizeof(before)), 0);
+		UT_ASSERT(cluster_ctrc_receipt_cancel_shared(&first));
+	}
+}
+
+UT_TEST(test_prepare_path_table_ready_duplicate_and_refusals)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcReceiptHandle first, handle;
+	ClusterCtrcPreparePath path;
+	ClusterCtrcPublicationIdV1 publication;
+	ClusterCtrcTargetV1 target;
+
+	reset_fixture(); origin = seed_origin(0, 1);
+	UT_ASSERT_EQ(prepare_fixture_receipt_observed(origin, 1, &first, &path), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT_EQ(path, CLUSTER_CTRC_PREPARE_PATH_TABLE);
+	UT_ASSERT_EQ(prepare_fixture_receipt_observed(origin, 1, &handle, &path), CLUSTER_CTRC_PREPARE_DUPLICATE);
+	UT_ASSERT_EQ(path, CLUSTER_CTRC_PREPARE_PATH_TABLE);
+	UT_ASSERT_EQ(handle.receipt_index, first.receipt_index);
+	for (uint64 i = 1; i < CtrcShared->receipt_entries; i++) {
+		UT_ASSERT_EQ(prepare_fixture_receipt_observed(origin, i + 1, &handle, &path), CLUSTER_CTRC_PREPARE_READY);
+		UT_ASSERT_EQ(path, CLUSTER_CTRC_PREPARE_PATH_TABLE);
+		UT_ASSERT(cluster_ctrc_receipt_cancel_shared(&handle));
+	}
+	UT_ASSERT_EQ(prepare_fixture_receipt_observed(origin, CtrcShared->receipt_entries + 1,
+		&handle, &path), CLUSTER_CTRC_PREPARE_CAPACITY);
+	UT_ASSERT_EQ(path, CLUSTER_CTRC_PREPARE_PATH_TABLE_CAPACITY);
+	UT_ASSERT(!handle.valid);
+	fixture_receipt_inputs(origin, 1, &publication, &target);
+	publication.attempt_generation = 0;
+	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_shared_observed(&origin->key, &origin->touched[0],
+		origin->grant_generation, &publication, &target, &handle, &path), CLUSTER_CTRC_PREPARE_REFUSED);
+	UT_ASSERT_EQ(path, CLUSTER_CTRC_PREPARE_PATH_TABLE_PUBLICATION);
+	UT_ASSERT(!handle.valid);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+typedef struct TablePrepareFixture {
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcParticipantEntry participant;
+	ClusterCtrcPublicationIdV1 publication;
+	ClusterCtrcTargetV1 target;
+	ClusterCtrcReceipt receipts[2];
+	uint8 probe_states[2];
+	uint64 index;
+	Size probes;
+	ClusterCtrcPreparePath path;
+} TablePrepareFixture;
+
+static void
+fixture_table_prepare(TablePrepareFixture *f)
+{
+	reset_fixture();
+	MemSet(f, 0, sizeof(*f));
+	f->origin = seed_origin(0, 1);
+	fixture_receipt_inputs(f->origin, 201, &f->publication, &f->target);
+	f->index = 42;
+	f->probes = 42;
+	f->path = CLUSTER_CTRC_PREPARE_PATH_UNKNOWN;
+}
+
+static ClusterCtrcPrepareResult
+prepare_table_fixture(TablePrepareFixture *f, Size count)
+{
+	return ctrc_receipt_prepare_table_observed(&f->participant, &f->origin->key,
+		&f->origin->touched[0], f->origin->grant_generation, &f->publication, &f->target,
+		f->receipts, f->probe_states, count, 500, &f->index, &f->probes, &f->path);
+}
+
+UT_TEST(test_table_path_input_short_circuits_participant_and_publication)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		TablePrepareFixture f;
+		ClusterCtrcParticipantEntry before;
+
+		fixture_table_prepare(&f);
+		f.participant.state = CTRC_PARTICIPANT_CLOSED_DRAINING;
+		f.publication.attempt_generation = 0;
+		before = f.participant;
+		UT_ASSERT_EQ(ctrc_receipt_prepare_table_observed(kind == 0 ? NULL : &f.participant,
+			&f.origin->key, &f.origin->touched[0], f.origin->grant_generation,
+			&f.publication, &f.target, f.receipts, f.probe_states, kind == 1 ? 0 : 1,
+			kind == 2 ? 0 : 500, kind == 3 ? NULL : &f.index, &f.probes, &f.path),
+			CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT_EQ(f.path, CLUSTER_CTRC_PREPARE_PATH_TABLE_INPUT);
+		UT_ASSERT_EQ(memcmp(&before, &f.participant, sizeof(before)), 0);
+		if (kind != 3)
+			UT_ASSERT_EQ(f.index, UINT64_MAX);
+		UT_ASSERT_EQ(f.probes, 0);
+		UT_ASSERT(ctrc_bytes_zero(f.receipts, sizeof(f.receipts)));
+	}
+}
+
+UT_TEST(test_table_path_participant_refusal_precedes_publication)
+{
+	TablePrepareFixture f;
+
+	fixture_table_prepare(&f);
+	f.participant.state = CTRC_PARTICIPANT_CLOSED_DRAINING;
+	f.publication.attempt_generation = 0;
+	UT_ASSERT_EQ(prepare_table_fixture(&f, 1), CLUSTER_CTRC_PREPARE_REFUSED);
+	UT_ASSERT_EQ(f.path, CLUSTER_CTRC_PREPARE_PATH_TABLE_PARTICIPANT);
+	UT_ASSERT_EQ(f.participant.state, CTRC_PARTICIPANT_BLOCKED);
+	UT_ASSERT_EQ(f.participant.next_key_sequence, 0);
+	UT_ASSERT_EQ(f.index, UINT64_MAX);
+	UT_ASSERT_EQ(f.probes, 0);
+	UT_ASSERT(ctrc_bytes_zero(f.receipts, sizeof(f.receipts)));
+}
+
+UT_TEST(test_table_path_publication_refusal_keeps_original_participant_open)
+{
+	TablePrepareFixture f;
+
+	fixture_table_prepare(&f);
+	f.publication.attempt_generation = 0;
+	UT_ASSERT_EQ(prepare_table_fixture(&f, 1), CLUSTER_CTRC_PREPARE_REFUSED);
+	UT_ASSERT_EQ(f.path, CLUSTER_CTRC_PREPARE_PATH_TABLE_PUBLICATION);
+	UT_ASSERT_EQ(f.participant.state, CTRC_PARTICIPANT_OPEN);
+	UT_ASSERT_EQ(f.participant.next_key_sequence, 1);
+	UT_ASSERT_EQ(f.participant.receipt_count, 0);
+	UT_ASSERT_EQ(f.index, UINT64_MAX);
+	UT_ASSERT_EQ(f.probes, 0);
+	UT_ASSERT(ctrc_bytes_zero(f.receipts, sizeof(f.receipts)));
+}
+
+UT_TEST(test_table_path_dirty_or_malformed_probe_keeps_bytes_and_blocks)
+{
+	const uint8 states[] = {CTRC_RECEIPT_PROBE_EMPTY, CTRC_RECEIPT_PROBE_TOMBSTONE,
+		255, CTRC_RECEIPT_PROBE_OCCUPIED, CTRC_RECEIPT_PROBE_OCCUPIED};
+	const ClusterCtrcPreparePath expected[] = {CLUSTER_CTRC_PREPARE_PATH_TABLE_EMPTY_BYTES,
+		CLUSTER_CTRC_PREPARE_PATH_TABLE_TOMBSTONE_BYTES,
+		CLUSTER_CTRC_PREPARE_PATH_TABLE_OCCUPIED, CLUSTER_CTRC_PREPARE_PATH_TABLE_OCCUPIED,
+		CLUSTER_CTRC_PREPARE_PATH_TABLE_OCCUPIED};
+
+	for (unsigned kind = 0; kind < lengthof(states); kind++) {
+		TablePrepareFixture f;
+		ClusterCtrcReceipt before[2];
+
+		fixture_table_prepare(&f);
+		f.probe_states[0] = states[kind];
+		if (kind != 4)
+			f.receipts[0].publication.operation_id = 99;
+		memcpy(before, f.receipts, sizeof(before));
+		UT_ASSERT_EQ(prepare_table_fixture(&f, 1), CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT_EQ(f.path, expected[kind]);
+		UT_ASSERT_EQ(f.participant.state, CTRC_PARTICIPANT_BLOCKED);
+		UT_ASSERT_EQ(f.participant.next_key_sequence, 1);
+		UT_ASSERT_EQ(f.participant.receipt_count, 0);
+		UT_ASSERT_EQ(f.participant.prepared_count, 0);
+		UT_ASSERT_EQ(f.index, UINT64_MAX);
+		UT_ASSERT_EQ(f.probes, 1);
+		UT_ASSERT_EQ(memcmp(before, f.receipts, sizeof(before)), 0);
+		UT_ASSERT_EQ(f.probe_states[0], states[kind]);
+	}
+}
+
+UT_TEST(test_table_path_duplicate_conflict_does_not_publish_again)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		TablePrepareFixture f;
+		ClusterCtrcReceipt before;
+
+		fixture_table_prepare(&f);
+		UT_ASSERT_EQ(prepare_table_fixture(&f, 1), CLUSTER_CTRC_PREPARE_READY);
+		UT_ASSERT_EQ(f.path, CLUSTER_CTRC_PREPARE_PATH_TABLE);
+		if (kind == 1)
+			f.target.block_number++;
+		if (kind == 2)
+			f.receipts[0].publication.journal_sequence = 0;
+		if (kind == 3)
+			f.receipts[0].publication.key_sequence = 0;
+		before = f.receipts[0];
+		UT_ASSERT_EQ(prepare_table_fixture(&f, 1), kind == 0 ? CLUSTER_CTRC_PREPARE_DUPLICATE
+			: CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT_EQ(f.path, kind == 0 ? CLUSTER_CTRC_PREPARE_PATH_TABLE
+			: CLUSTER_CTRC_PREPARE_PATH_TABLE_DUPLICATE_CONFLICT);
+		UT_ASSERT_EQ(f.participant.state, kind == 0 ? CTRC_PARTICIPANT_OPEN : CTRC_PARTICIPANT_BLOCKED);
+		UT_ASSERT_EQ(f.participant.next_key_sequence, 2);
+		UT_ASSERT_EQ(f.participant.receipt_count, 1);
+		UT_ASSERT_EQ(f.participant.prepared_count, 1);
+		UT_ASSERT_EQ(f.index, kind == 0 ? 0 : UINT64_MAX);
+		UT_ASSERT_EQ(f.probes, 1);
+		UT_ASSERT_EQ(memcmp(&before, &f.receipts[0], sizeof(before)), 0);
+	}
+}
+
+UT_TEST(test_table_path_sequence_capacity_and_tombstone_probe_order)
+{
+	const uint64 next[] = {0, UINT64_MAX, 2};
+	for (unsigned kind = 0; kind < lengthof(next); kind++) {
+		TablePrepareFixture f;
+
+		fixture_table_prepare(&f);
+		UT_ASSERT_EQ(cluster_ctrc_participant_open(&f.participant, &f.origin->key,
+			f.origin->grant_generation, &f.origin->touched[0]), CLUSTER_CTRC_PARTICIPANT_OPENED);
+		f.participant.next_key_sequence = next[kind];
+		UT_ASSERT_EQ(prepare_table_fixture(&f, 1), CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT_EQ(f.path, CLUSTER_CTRC_PREPARE_PATH_TABLE_SLOT_PREPARE);
+		UT_ASSERT_EQ(f.participant.state, CTRC_PARTICIPANT_BLOCKED);
+		UT_ASSERT_EQ(f.participant.next_key_sequence, next[kind]);
+		UT_ASSERT_EQ(f.participant.receipt_count, 0);
+		UT_ASSERT_EQ(f.probes, 1);
+		UT_ASSERT_EQ(f.index, UINT64_MAX);
+		UT_ASSERT_EQ(f.probe_states[0], CTRC_RECEIPT_PROBE_EMPTY);
+		UT_ASSERT(ctrc_bytes_zero(f.receipts, sizeof(f.receipts)));
+	}
+	{
+		TablePrepareFixture f;
+		ClusterCtrcReceipt before;
+
+		fixture_table_prepare(&f);
+		UT_ASSERT_EQ(prepare_table_fixture(&f, 1), CLUSTER_CTRC_PREPARE_READY);
+		before = f.receipts[0];
+		f.publication.operation_id++;
+		UT_ASSERT_EQ(prepare_table_fixture(&f, 1), CLUSTER_CTRC_PREPARE_CAPACITY);
+		UT_ASSERT_EQ(f.path, CLUSTER_CTRC_PREPARE_PATH_TABLE_CAPACITY);
+		UT_ASSERT_EQ(f.participant.state, CTRC_PARTICIPANT_OPEN);
+		UT_ASSERT_EQ(f.participant.receipt_count, 1);
+		UT_ASSERT_EQ(f.probes, 1);
+		UT_ASSERT_EQ(f.index, UINT64_MAX);
+		UT_ASSERT_EQ(memcmp(&before, &f.receipts[0], sizeof(before)), 0);
+	}
+	{
+		TablePrepareFixture f;
+		uint64 first;
+
+		fixture_table_prepare(&f);
+		first = ctrc_receipt_probe_hash(&f.origin->key, &f.publication) % 2;
+		f.probe_states[first] = CTRC_RECEIPT_PROBE_TOMBSTONE;
+		UT_ASSERT_EQ(prepare_table_fixture(&f, 2), CLUSTER_CTRC_PREPARE_READY);
+		UT_ASSERT_EQ(f.path, CLUSTER_CTRC_PREPARE_PATH_TABLE);
+		UT_ASSERT_EQ(f.index, first);
+		UT_ASSERT_EQ(f.probes, 2);
+		UT_ASSERT_EQ(f.probe_states[first], CTRC_RECEIPT_PROBE_OCCUPIED);
+		UT_ASSERT_EQ(f.probe_states[1 - first], CTRC_RECEIPT_PROBE_EMPTY);
+		UT_ASSERT_EQ(f.receipts[first].publication.journal_sequence, 500);
+	}
+}
+
+UT_TEST(test_table_path_null_observer_preserves_original_table_effects)
+{
+	for (unsigned kind = 0; kind < 3; kind++) {
+		TablePrepareFixture f, g;
+		ClusterCtrcPrepareResult old_result, observed_result;
+		uint64 journal;
+
+		fixture_table_prepare(&f);
+		if (kind == 1)
+			f.publication.attempt_generation = 0;
+		if (kind == 2)
+			f.receipts[0].publication.operation_id = 99;
+		g = f;
+		journal = CtrcShared->global_journal_generation;
+		old_result = cluster_ctrc_receipt_prepare_table_locked(&f.participant, &f.origin->key,
+			&f.origin->touched[0], f.origin->grant_generation, &f.publication, &f.target,
+			f.receipts, f.probe_states, 1, 500, &f.index, &f.probes);
+		observed_result = ctrc_receipt_prepare_table_observed(&g.participant, &g.origin->key,
+			&g.origin->touched[0], g.origin->grant_generation, &g.publication, &g.target,
+			g.receipts, g.probe_states, 1, 500, &g.index, &g.probes, NULL);
+		UT_ASSERT_EQ(old_result, kind == 0 ? CLUSTER_CTRC_PREPARE_READY : CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT_EQ(observed_result, old_result);
+		UT_ASSERT_EQ(memcmp(&f.participant, &g.participant, sizeof(f.participant)), 0);
+		UT_ASSERT_EQ(memcmp(f.receipts, g.receipts, sizeof(f.receipts)), 0);
+		UT_ASSERT_EQ(memcmp(f.probe_states, g.probe_states, sizeof(f.probe_states)), 0);
+		UT_ASSERT_EQ(f.index, g.index);
+		UT_ASSERT_EQ(f.probes, g.probes);
+		UT_ASSERT_EQ(CtrcShared->global_journal_generation, journal);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
 UT_TEST(test_remote_origin_receipt_does_not_require_local_origin_row)
 {
 	ClusterCtrcOriginEntry request;
@@ -1614,6 +2154,24 @@ UT_TEST(test_remote_origin_receipt_does_not_require_local_origin_row)
 	UT_ASSERT(handle.valid);
 	UT_ASSERT_EQ(memcmp(&handle.receipt->key, &request.key, sizeof(request.key)), 0);
 	UT_ASSERT(ctrc_bytes_zero(&ctrc_origin_entries()[0], sizeof(ClusterCtrcOriginEntry)));
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_prepare_path_null_observer_preserves_exact_shared_effects)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcReceiptHandle first, duplicate;
+	ClusterCtrcReceipt before;
+	uint64 journal;
+
+	reset_fixture(); origin = seed_origin(0, 1);
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 201, &first), CLUSTER_CTRC_PREPARE_READY);
+	before = *first.receipt; journal = CtrcShared->global_journal_generation;
+	UT_ASSERT_EQ(prepare_fixture_receipt_observed(origin, 201, &duplicate, NULL), CLUSTER_CTRC_PREPARE_DUPLICATE);
+	UT_ASSERT_EQ(duplicate.receipt_index, first.receipt_index);
+	UT_ASSERT_EQ(memcmp(&before, first.receipt, sizeof(before)), 0);
+	UT_ASSERT_EQ(CtrcShared->global_journal_generation, journal + 1);
+	UT_ASSERT(cluster_ctrc_receipt_cancel_shared(&first));
 	UT_ASSERT_EQ(held_count, 0);
 }
 
@@ -2981,10 +3539,16 @@ static void
 driver_dispatch_boundary(const ClusterCtrcCloseDispatch *dispatches pg_attribute_unused(),
 						 Size count pg_attribute_unused())
 {
+	origin_dispatch_calls++;
+	if (origin_driver_pending)
+		for (Size i = 0; i < count; i++)
+			UT_ASSERT(cluster_ctrc_origin_note_close_reply_shared(dispatches[i].request_id,
+				dispatches[i].participant.node_id, CTRC_SEAL_REPLY_PENDING_DRAIN));
 	if (driver_other_progress)
 		cluster_ctrc_stat_bump(CTRC_STAT_SEMANTIC_PROGRESS);
 	if (driver_interrupt)
 		pg_re_throw();
+	origin_dispatch_returned = true;
 }
 
 bool ctrc_fixture_run_pass(void);
@@ -4466,6 +5030,546 @@ UT_TEST(test_last_slice_registration_cannot_publish_complete_old_cut)
 	UT_ASSERT_EQ(held_count, 0);
 }
 
+UT_TEST(test_receipt_observation_exact_prepare_is_read_only)
+{
+#ifdef CLUSTER_CTRC_RECEIPT_OBSERVER_PRESENT
+	ClusterCtrcReceiptHandle h;
+	ClusterCtrcReceiptObservation seen;
+	ClusterCtrcParticipantEntry before_part;
+	ClusterCtrcReceipt before_receipt;
+	reset_fixture();
+	UT_ASSERT_EQ(prepare_fixture_receipt(seed_origin(0, 1), 123, &h), CLUSTER_CTRC_PREPARE_READY);
+	before_part = *h.participant; before_receipt = *h.receipt;
+	UT_ASSERT(cluster_ctrc_receipt_observe_shared(&h, &seen));
+	UT_ASSERT_EQ(seen.state_before, CTRC_RECEIPT_PREPARED);
+	UT_ASSERT_EQ(seen.state_after, CTRC_RECEIPT_PREPARED);
+	UT_ASSERT_EQ(seen.publication.operation_id, 123);
+	UT_ASSERT(seen.publication.journal_sequence != 0);
+	UT_ASSERT(seen.publication.key_sequence != 0);
+	UT_ASSERT_EQ(seen.publication.journal_slot_generation, h.journal_slot_generation);
+	UT_ASSERT_EQ(seen.prepared_count, 1);
+	UT_ASSERT_EQ(seen.target.rel_number, 9001);
+	UT_ASSERT_EQ(memcmp(&seen.key, &h.key, sizeof(h.key)), 0);
+	UT_ASSERT_EQ(memcmp(&seen.publication, &before_receipt.publication, sizeof(seen.publication)), 0);
+	UT_ASSERT_EQ(memcmp(&seen.participant, &before_part.identity, sizeof(seen.participant)), 0);
+	UT_ASSERT_EQ(memcmp(h.participant, &before_part, sizeof(before_part)), 0);
+	UT_ASSERT_EQ(memcmp(h.receipt, &before_receipt, sizeof(before_receipt)), 0);
+	UT_ASSERT_EQ(last_pool_mode, LW_SHARED);
+	UT_ASSERT_EQ(held_count, 0);
+#else
+	UT_ASSERT(false); /* Parent lacks the diagnostic, not a substitute verdict. */
+#endif
+}
+
+UT_TEST(test_receipt_observation_real_cancel_keeps_publication_binding)
+{
+#ifdef CLUSTER_CTRC_RECEIPT_OBSERVER_PRESENT
+	ClusterCtrcReceiptHandle h;
+	ClusterCtrcReceiptObservation seen;
+	reset_fixture();
+	UT_ASSERT_EQ(prepare_fixture_receipt(seed_origin(0, 1), 124, &h), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(cluster_ctrc_receipt_cancel_shared(&h));
+	UT_ASSERT(cluster_ctrc_receipt_observe_shared(&h, &seen));
+	UT_ASSERT_EQ(seen.state_before, CTRC_RECEIPT_CANCELLED);
+	UT_ASSERT_EQ(seen.state_after, CTRC_RECEIPT_CANCELLED);
+	UT_ASSERT_EQ(seen.prepared_count, 0);
+	UT_ASSERT_EQ(seen.cancelled_count, 1);
+	UT_ASSERT_EQ(seen.disposition, CTRC_RELEASE_CANCELLED_PREMUTATION);
+	UT_ASSERT_EQ(seen.publication.operation_id, 124);
+	UT_ASSERT_EQ(held_count, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_receipt_observation_duplicate_keeps_same_shared_sequence)
+{
+#ifdef CLUSTER_CTRC_RECEIPT_OBSERVER_PRESENT
+	ClusterCtrcReceiptHandle a, b;
+	ClusterCtrcReceiptObservation x, y;
+	ClusterCtrcOriginEntry *origin;
+	reset_fixture(); origin = seed_origin(0, 1);
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 125, &a), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(cluster_ctrc_receipt_observe_shared(&a, &x));
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 125, &b), CLUSTER_CTRC_PREPARE_DUPLICATE);
+	UT_ASSERT(cluster_ctrc_receipt_observe_shared(&b, &y));
+	UT_ASSERT_EQ(x.publication.journal_sequence, y.publication.journal_sequence);
+	UT_ASSERT_EQ(x.publication.key_sequence, y.publication.key_sequence);
+	UT_ASSERT_EQ(y.receipt_count, 1);
+	UT_ASSERT_EQ(held_count, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_receipt_observation_stale_or_foreign_handle_never_borrows_state)
+{
+#ifdef CLUSTER_CTRC_RECEIPT_OBSERVER_PRESENT
+	for (int leg = 0; leg < 4; leg++) {
+		ClusterCtrcReceiptHandle h, bad;
+		ClusterCtrcReceiptObservation seen, zero = {0};
+		reset_fixture();
+		UT_ASSERT_EQ(prepare_fixture_receipt(seed_origin(0, 1), 126, &h), CLUSTER_CTRC_PREPARE_READY);
+		bad = h;
+		if (leg == 0) bad.key.slot_wrap++;
+		if (leg == 1) bad.journal_slot_generation++;
+		if (leg == 2) bad.receipt = (ClusterCtrcReceipt *)(uintptr_t)1;
+		if (leg == 3) bad.participant_index = UINT64_MAX;
+		memset(&seen, 0x7f, sizeof(seen));
+		UT_ASSERT(!cluster_ctrc_receipt_observe_shared(&bad, &seen));
+		UT_ASSERT_EQ(memcmp(&seen, &zero, sizeof(seen)), 0);
+		UT_ASSERT_EQ(h.receipt->state, CTRC_RECEIPT_PREPARED);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_receipt_observation_busy_locks_return_unknown_without_wait)
+{
+#ifdef CLUSTER_CTRC_RECEIPT_OBSERVER_PRESENT
+	for (int leg = 1; leg <= 2; leg++) {
+		ClusterCtrcReceiptHandle h;
+		ClusterCtrcReceiptObservation seen, zero = {0};
+		reset_fixture();
+		UT_ASSERT_EQ(prepare_fixture_receipt(seed_origin(0, 1), 127, &h), CLUSTER_CTRC_PREPARE_READY);
+		observe_busy_kind = leg;
+		memset(&seen, 0x7f, sizeof(seen));
+		UT_ASSERT(!cluster_ctrc_receipt_observe_shared(&h, &seen));
+		UT_ASSERT_EQ(memcmp(&seen, &zero, sizeof(seen)), 0);
+		UT_ASSERT_EQ(held_count, 0);
+		observe_busy_kind = 0;
+		UT_ASSERT(cluster_ctrc_receipt_observe_shared(&h, &seen));
+		UT_ASSERT_EQ(held_count, 0);
+	}
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_receipt_observation_critical_or_held_lock_does_not_acquire)
+{
+#ifdef CLUSTER_CTRC_RECEIPT_OBSERVER_PRESENT
+	ClusterCtrcReceiptHandle h;
+	ClusterCtrcReceiptObservation seen;
+	reset_fixture();
+	UT_ASSERT_EQ(prepare_fixture_receipt(seed_origin(0, 1), 128, &h), CLUSTER_CTRC_PREPARE_READY);
+	observe_conditional_calls = 0;
+	CritSectionCount = 1;
+	UT_ASSERT(!cluster_ctrc_receipt_observe_shared(&h, &seen));
+	CritSectionCount = 0;
+	LWLockAcquire(&CtrcShared->origin_lock, LW_SHARED);
+	UT_ASSERT(!cluster_ctrc_receipt_observe_shared(&h, &seen));
+	UT_ASSERT_EQ(observe_conditional_calls, 0);
+	LWLockRelease(&CtrcShared->origin_lock);
+	UT_ASSERT_EQ(held_count, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_receipt_observation_does_not_turn_sample_into_apply_authority)
+{
+#ifdef CLUSTER_CTRC_RECEIPT_OBSERVER_PRESENT
+	ClusterCtrcReceiptHandle h;
+	ClusterCtrcReceiptObservation seen;
+	ClusterCtrcApplyToken token;
+	reset_fixture();
+	UT_ASSERT_EQ(prepare_fixture_receipt(seed_origin(0, 1), 129, &h), CLUSTER_CTRC_PREPARE_READY);
+	h.participant->grant_generation++;
+	UT_ASSERT(cluster_ctrc_receipt_observe_shared(&h, &seen));
+	UT_ASSERT(seen.grant_generation != seen.publication.grant_generation);
+	UT_ASSERT_EQ(cluster_ctrc_receipt_apply_shared(&h, &h.receipt->target, &token),
+				 CLUSTER_CTRC_APPLY_FAIL_CLOSED);
+	UT_ASSERT(!token.valid);
+	UT_ASSERT_EQ(h.receipt->state, CTRC_RECEIPT_PREPARED);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_receipt_observation_unattached_or_invalid_output_stays_unknown)
+{
+#ifdef CLUSTER_CTRC_RECEIPT_OBSERVER_PRESENT
+	ClusterCtrcReceiptHandle h;
+	ClusterCtrcReceiptObservation seen, zero = {0};
+	void *saved;
+	reset_fixture();
+	UT_ASSERT_EQ(prepare_fixture_receipt(seed_origin(0, 1), 130, &h), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(!cluster_ctrc_receipt_observe_shared(&h, NULL));
+	UT_ASSERT(!cluster_ctrc_receipt_observe_shared(NULL, &seen));
+	memset(&seen, 0x7f, sizeof(seen));
+	saved = CtrcShared; CtrcShared = NULL;
+	UT_ASSERT(!cluster_ctrc_receipt_observe_shared(&h, &seen));
+	CtrcShared = saved;
+	UT_ASSERT_EQ(memcmp(&seen, &zero, sizeof(seen)), 0);
+	UT_ASSERT_EQ(held_count, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+
+static ClusterCtrcOriginEntry *
+origin_trace_fixture(ClusterCtrcCloseDispatch *dispatch)
+{
+	ClusterCtrcOriginEntry *origin;
+	reset_fixture(); origin = seed_origin(0, 1); UT_ASSERT(bind_test_worker(0));
+	UT_ASSERT(cluster_ctrc_origin_next_close_dispatch_shared(dispatch));
+	origin_log_enabled = cluster_trace_normal_stop = true;
+	return origin;
+}
+
+UT_TEST(test_origin_dispatch_trace_off_keeps_original_batch_effects)
+{
+	reset_fixture(); seed_origin(0, 1); UT_ASSERT(bind_test_worker(0));
+	origin_log_enabled = true; cluster_trace_normal_stop = false;
+	(void)ctrc_fixture_run_pass();
+	UT_ASSERT_EQ(origin_dispatch_calls, 1); UT_ASSERT_EQ(origin_log_count, 0);
+	UT_ASSERT_EQ(ctrc_origin_entries()[0].close_dispatched_bitmap, 1);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_origin_dispatch_trace_exact_row_is_passive_and_constant_scope)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_DISPATCH_TRACE_PRESENT
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcOriginEntry *origin = origin_trace_fixture(&dispatch), before = *origin;
+	uint64 visits[sizeof(table_visits) / sizeof(table_visits[0])];
+	uint64 progress = CtrcLocalProgress;
+	unsigned conditionals = observe_conditional_calls;
+	memcpy(visits, table_visits, sizeof(visits));
+	ctrc_origin_dispatch_trace(&dispatch, 0, 1);
+	UT_ASSERT_EQ(origin_log_count, 1);
+	UT_ASSERT_EQ(memcmp(origin, &before, sizeof(before)), 0);
+	UT_ASSERT_EQ(memcmp(visits, table_visits, sizeof(visits)), 0);
+	UT_ASSERT_EQ(CtrcLocalProgress, progress);
+	UT_ASSERT_EQ(observe_conditional_calls, conditionals + 1);
+	UT_ASSERT(strstr(origin_last_log, "origin_sample_available=1 origin_binding_match=1") != NULL);
+	UT_ASSERT(strstr(origin_last_log, "origin_predicate=snapshot.matches") != NULL);
+	UT_ASSERT(strstr(origin_last_log, "origin_ack=0") != NULL);
+	UT_ASSERT(strstr(origin_last_log, "delivery_known=0 ack_receipt_known=0 authoritative=0") != NULL);
+	UT_ASSERT_EQ(held_count, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_origin_dispatch_trace_busy_is_unknown_without_wait_or_write)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_DISPATCH_TRACE_PRESENT
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcOriginEntry *origin = origin_trace_fixture(&dispatch), before = *origin;
+	unsigned conditionals = observe_conditional_calls;
+	observe_busy_kind = 3;
+	ctrc_origin_dispatch_trace(&dispatch, 0, 1);
+	UT_ASSERT_EQ(origin_log_count, 1); UT_ASSERT_EQ(observe_conditional_calls, conditionals + 1);
+	UT_ASSERT(strstr(origin_last_log, "origin_sample_available=0 origin_binding_match=0") != NULL);
+	UT_ASSERT(strstr(origin_last_log, "origin_predicate=snapshot.lock_busy") != NULL);
+	UT_ASSERT_EQ(memcmp(origin, &before, sizeof(before)), 0); UT_ASSERT_EQ(held_count, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_origin_dispatch_trace_unsafe_gaps_do_not_touch_registry)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_DISPATCH_TRACE_PRESENT
+	ClusterCtrcCloseDispatch dispatch;
+	unsigned conditionals;
+	(void)origin_trace_fixture(&dispatch);
+	conditionals = observe_conditional_calls;
+	CritSectionCount = 1; ctrc_origin_dispatch_trace(&dispatch, 0, 1); CritSectionCount = 0;
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
+	ctrc_origin_dispatch_trace(&dispatch, 0, 1); LWLockRelease(&CtrcShared->receipt_lock);
+	UT_ASSERT_EQ(origin_log_count, 0); UT_ASSERT_EQ(observe_conditional_calls, conditionals);
+	ctrc_origin_dispatch_trace(&dispatch, 0, 1);
+	UT_ASSERT(strstr(origin_last_log, "critical_skipped=1 lwlock_skipped=1") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_origin_dispatch_trace_reused_key_is_not_bound_to_old_dispatch)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_DISPATCH_TRACE_PRESENT
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcOriginEntry *origin = origin_trace_fixture(&dispatch);
+	origin->key.slot_wrap++;
+	ctrc_origin_dispatch_trace(&dispatch, 0, 1);
+	UT_ASSERT(strstr(origin_last_log, "origin_sample_available=1 origin_binding_match=0") != NULL);
+	UT_ASSERT(strstr(origin_last_log, "origin_predicate=snapshot.key") != NULL);
+	UT_ASSERT(strstr(origin_last_log, "expected_tt_wrap=1") != NULL);
+	UT_ASSERT(strstr(origin_last_log, "actual_tt_wrap=2") != NULL);
+	UT_ASSERT_EQ(origin->key.slot_wrap, 2);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_origin_dispatch_trace_driver_returns_after_real_pending_landing)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_DISPATCH_TRACE_PRESENT
+	reset_fixture(); seed_origin(0, 1); UT_ASSERT(bind_test_worker(0));
+	origin_log_enabled = cluster_trace_normal_stop = true;
+	origin_driver_pending = origin_require_dispatch_return = true;
+	(void)ctrc_fixture_run_pass();
+	UT_ASSERT_EQ(origin_dispatch_calls, 1); UT_ASSERT(origin_dispatch_returned);
+	UT_ASSERT_EQ(origin_log_count, 1);
+	UT_ASSERT(strstr(origin_last_log, "event=dispatch.batch_return") != NULL);
+	UT_ASSERT(strstr(origin_last_log, "origin_close_confirmed=1 origin_ack=0") != NULL);
+	UT_ASSERT_EQ(ctrc_origin_entries()[0].close_confirmed_bitmap, 1);
+	UT_ASSERT(!CtrcBatch.active);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_origin_dispatch_trace_log_error_keeps_shared_owner_and_clears_hints)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_DISPATCH_TRACE_PRESENT
+	volatile bool caught = false;
+	reset_fixture(); seed_origin(0, 1); UT_ASSERT(bind_test_worker(0));
+	origin_log_enabled = cluster_trace_normal_stop = origin_log_throw = true;
+	PG_TRY();
+	{
+		(void)ctrc_fixture_run_pass();
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught); UT_ASSERT_EQ(origin_log_count, 1); UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT(ctrc_bytes_zero(&CtrcBatch, sizeof(CtrcBatch)));
+	UT_ASSERT_EQ(ctrc_origin_entries()[0].close_dispatched_bitmap, 1);
+	UT_ASSERT(ctrc_origin_entries()[0].close_request_id[0] != 0);
+	UT_ASSERT_EQ(CtrcLocalPasses, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_origin_dispatch_trace_detached_and_bad_namespace_stay_unknown)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_DISPATCH_TRACE_PRESENT
+	ClusterCtrcCloseDispatch dispatch;
+	void *saved;
+	(void)origin_trace_fixture(&dispatch);
+	saved = CtrcShared; CtrcShared = NULL;
+	ctrc_origin_dispatch_trace(&dispatch, 0, 1);
+	CtrcShared = saved;
+	UT_ASSERT(strstr(origin_last_log, "origin_predicate=snapshot.detached") != NULL);
+	UT_ASSERT(strstr(origin_last_log, "origin_sample_available=0") != NULL);
+	dispatch.key.owner_instance = 0;
+	ctrc_origin_dispatch_trace(&dispatch, 0, 1);
+	UT_ASSERT(strstr(origin_last_log, "origin_predicate=snapshot.key_shape") != NULL);
+	UT_ASSERT_EQ(held_count, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+static ClusterCtrcOriginEntry *
+reply_trace_fixture(ClusterCtrcLocalReleaseAckV1 *ack)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcParticipantEntry participant = {0};
+	ClusterCtrcLocalReleaseAckV1 summary = {0};
+	uint16 reason;
+	reset_fixture(); origin = seed_origin(0, 1);
+	UT_ASSERT(cluster_ctrc_origin_arm_close_entry(origin, 0, 701));
+	UT_ASSERT_EQ(cluster_ctrc_participant_request_apply(
+		&participant, &summary, &origin->key, &origin->touched[0],
+		origin->grant_generation, origin->seal_generation,
+		CTRC_SEAL_CLOSE_AND_CLEAN, &reason, ack), CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK);
+	origin_log_enabled = true;
+	return origin;
+}
+
+UT_TEST(test_reply_trace_off_preserves_ack)
+{
+	ClusterCtrcLocalReleaseAckV1 ack;
+	ClusterCtrcOriginEntry *origin = reply_trace_fixture(&ack);
+	UT_ASSERT(cluster_ctrc_origin_ack_land_shared(701, &ack));
+	UT_ASSERT_EQ(origin->ack_bitmap, 1); UT_ASSERT_EQ(reply_log_count, 0);
+}
+UT_TEST(test_reply_trace_ack_landing_is_original_locked_transition)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_REPLY_TRACE_PRESENT
+	ClusterCtrcLocalReleaseAckV1 ack;
+	ClusterCtrcOriginEntry *origin = reply_trace_fixture(&ack);
+	cluster_trace_normal_stop = true;
+	UT_ASSERT(cluster_ctrc_origin_ack_land_shared(701, &ack));
+	UT_ASSERT_EQ(reply_log_count, 1); UT_ASSERT_EQ(origin->ack_bitmap, 1);
+	UT_ASSERT(strstr(reply_last_log, "event=ack.land") != NULL);
+	UT_ASSERT(strstr(reply_last_log, "accepted=1 progressed=1") != NULL);
+	UT_ASSERT(strstr(reply_last_log, "before_ack=0 after_ack=1") != NULL);
+	UT_ASSERT(strstr(reply_last_log, "system_identifier=42") != NULL);
+	UT_ASSERT(strstr(reply_last_log, "authoritative=0") != NULL);
+	UT_ASSERT_EQ(held_count, 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(test_reply_trace_duplicate_is_not_new_progress)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_REPLY_TRACE_PRESENT
+	ClusterCtrcLocalReleaseAckV1 ack;
+	unsigned wakes;
+	(void)reply_trace_fixture(&ack); cluster_trace_normal_stop = true;
+	UT_ASSERT(cluster_ctrc_origin_ack_land_shared(701, &ack)); wakes = wake_count;
+	UT_ASSERT(cluster_ctrc_origin_ack_land_shared(701, &ack));
+	UT_ASSERT_EQ(reply_log_count, 2); UT_ASSERT_EQ(wake_count, wakes);
+	UT_ASSERT(strstr(reply_last_log, "accepted=1 progressed=0") != NULL);
+	UT_ASSERT(strstr(reply_last_log, "before_ack=1 after_ack=1") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(test_reply_trace_refusal_does_not_become_ack)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_REPLY_TRACE_PRESENT
+	ClusterCtrcLocalReleaseAckV1 ack;
+	ClusterCtrcOriginEntry *origin = reply_trace_fixture(&ack);
+	cluster_trace_normal_stop = true; ack.seal_generation++;
+	UT_ASSERT(!cluster_ctrc_origin_ack_land_shared(701, &ack));
+	UT_ASSERT_EQ(origin->ack_bitmap, 0); UT_ASSERT_EQ(origin->state, CTRC_ORIGIN_BLOCKED);
+	UT_ASSERT(strstr(reply_last_log, "accepted=0 progressed=0") != NULL);
+	UT_ASSERT(strstr(reply_last_log, "input_key_matches_before=1") != NULL);
+	UT_ASSERT(strstr(reply_last_log, "input_seal_matches_before=0") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(test_reply_trace_pending_close_is_not_ack)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_REPLY_TRACE_PRESENT
+	ClusterCtrcLocalReleaseAckV1 ack;
+	(void)reply_trace_fixture(&ack); cluster_trace_normal_stop = true;
+	UT_ASSERT(cluster_ctrc_origin_note_close_reply_shared(701, 0, CTRC_SEAL_REPLY_PENDING_DRAIN));
+	UT_ASSERT_EQ(reply_log_count, 1);
+	UT_ASSERT(strstr(reply_last_log, "event=close.reply") != NULL);
+	UT_ASSERT(strstr(reply_last_log, "before_ack=0 after_ack=0") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(test_reply_trace_certificate_reclaim_keeps_before_identity)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_REPLY_TRACE_PRESENT
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcOriginCertificateSnapshot certificate;
+	ClusterCtrcSealReplyResult result;
+	uint64 participant, receipt;
+	ClusterCtrcOriginEntry *origin;
+	reset_fixture(); UT_ASSERT(seed_frozen_certificate(0, &dispatch, &participant, &receipt));
+	origin = &ctrc_origin_entries()[0];
+	UT_ASSERT(cluster_ctrc_origin_arm_close_entry(origin, 0, 501));
+	UT_ASSERT(cluster_ctrc_origin_ack_land_shared(501, &ctrc_participant_ack_entries()[participant]));
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	(void)ctrc_origin_dispatchable_locked(origin); LWLockRelease(&CtrcShared->origin_lock);
+	UT_ASSERT(ctrc_origin_certificate_snapshot_index_locked(0, &certificate));
+	UT_ASSERT(cluster_ctrc_origin_certificate_commit_entry(origin, &certificate));
+	UT_ASSERT(cluster_ctrc_origin_arm_certificate_entry(origin, 0, dispatch.request_id));
+	UT_ASSERT(cluster_ctrc_participant_certificate_batch_shared(&dispatch, 1, &result));
+	origin_log_enabled = cluster_trace_normal_stop = true;
+	UT_ASSERT(cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id, 0, result));
+	UT_ASSERT_EQ(reply_log_count, 1); UT_ASSERT(ctrc_bytes_zero(origin, sizeof(*origin)));
+	UT_ASSERT(strstr(reply_last_log, "event=certificate.reply") != NULL);
+	UT_ASSERT(strstr(reply_last_log, "after_row_zero=1") != NULL);
+	UT_ASSERT(strstr(reply_last_log, "system_identifier=42") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(test_reply_trace_unsafe_context_is_gap_not_log)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_REPLY_TRACE_PRESENT
+	ClusterCtrcLocalReleaseAckV1 ack;
+	(void)reply_trace_fixture(&ack); cluster_trace_normal_stop = true;
+	CritSectionCount = 1;
+	UT_ASSERT(cluster_ctrc_origin_ack_land_shared(701, &ack));
+	CritSectionCount = 0; UT_ASSERT_EQ(reply_log_count, 0);
+	UT_ASSERT(cluster_ctrc_origin_ack_land_shared(701, &ack));
+	UT_ASSERT(strstr(reply_last_log, "unsafe_skipped=1") != NULL);
+#else
+	UT_ASSERT(false);
+#endif
+}
+UT_TEST(test_reply_trace_log_error_does_not_undo_ack_or_hold_lock)
+{
+#ifdef CLUSTER_CTRC_ORIGIN_REPLY_TRACE_PRESENT
+	ClusterCtrcLocalReleaseAckV1 ack;
+	ClusterCtrcOriginEntry *origin = reply_trace_fixture(&ack);
+	volatile bool caught = false;
+	cluster_trace_normal_stop = origin_log_throw = true;
+	PG_TRY(); { (void)cluster_ctrc_origin_ack_land_shared(701, &ack); }
+	PG_CATCH(); { caught = true; } PG_END_TRY();
+	origin_log_throw = false;
+	UT_ASSERT(caught); UT_ASSERT_EQ(origin->ack_bitmap, 1); UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT_EQ(reply_log_count, 1); UT_ASSERT(wake_count > 0);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
+UT_TEST(test_receipt_observed_identity_refusal_precedes_chain_blocking)
+{
+	ClusterCtrcPreparePath path = CLUSTER_CTRC_PREPARE_PATH_UNKNOWN;
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcReceiptHandle first, refused;
+	ClusterCtrcParticipantEntry before;
+	ClusterCtrcReceipt receipt_before;
+	uint64 participant_index;
+
+	reset_fixture();
+	origin = seed_origin(0, 1);
+	origin->original_full_xid = FullTransactionIdFromEpochAndXid(3, origin->key.xid);
+	UT_ASSERT_EQ(prepare_fixture_receipt_observed(origin, 301, &first, &path), CLUSTER_CTRC_PREPARE_READY);
+	participant_index = first.participant - ctrc_participant_entries();
+	before = *first.participant;
+	receipt_before = *first.receipt;
+	/* A later chain check would BLOCK this owner. Identity must refuse first. */
+	ctrc_participant_receipt_heads()[participant_index] = UINT64_MAX;
+	origin->original_full_xid = FullTransactionIdFromEpochAndXid(4, origin->key.xid);
+	UT_ASSERT_EQ(prepare_fixture_receipt_observed(origin, 302, &refused, &path), CLUSTER_CTRC_PREPARE_REFUSED);
+	UT_ASSERT(ctrc_bytes_zero(&refused, sizeof(refused)));
+	UT_ASSERT_EQ(memcmp(first.participant, &before, sizeof(before)), 0);
+	UT_ASSERT_EQ(memcmp(first.receipt, &receipt_before, sizeof(receipt_before)), 0);
+	UT_ASSERT_EQ(ctrc_participant_receipt_heads()[participant_index], UINT64_MAX);
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT_EQ(path, CLUSTER_CTRC_PREPARE_PATH_ORIGINAL_FULL_XID);
+}
+
+UT_TEST(test_receipt_original_identity_refusal_precedes_chain_blocking)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcReceiptHandle first, refused;
+	ClusterCtrcParticipantEntry before;
+	ClusterCtrcReceipt receipt_before;
+	uint64 participant_index;
+
+	reset_fixture();
+	origin = seed_origin(0, 1);
+	origin->original_full_xid = FullTransactionIdFromEpochAndXid(3, origin->key.xid);
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 301, &first), CLUSTER_CTRC_PREPARE_READY);
+	participant_index = first.participant - ctrc_participant_entries();
+	before = *first.participant;
+	receipt_before = *first.receipt;
+	/* A later chain check would BLOCK this owner. Identity must refuse first. */
+	ctrc_participant_receipt_heads()[participant_index] = UINT64_MAX;
+	origin->original_full_xid = FullTransactionIdFromEpochAndXid(4, origin->key.xid);
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 302, &refused), CLUSTER_CTRC_PREPARE_REFUSED);
+	UT_ASSERT(ctrc_bytes_zero(&refused, sizeof(refused)));
+	UT_ASSERT_EQ(memcmp(first.participant, &before, sizeof(before)), 0);
+	UT_ASSERT_EQ(memcmp(first.receipt, &receipt_before, sizeof(receipt_before)), 0);
+	UT_ASSERT_EQ(ctrc_participant_receipt_heads()[participant_index], UINT64_MAX);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+
 int
 main(void)
 {
@@ -4473,7 +5577,49 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(107);
+	UT_PLAN(146);
+	UT_RUN(test_receipt_observed_identity_refusal_precedes_chain_blocking);
+	UT_RUN(test_receipt_original_identity_refusal_precedes_chain_blocking);
+	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
+	UT_RUN(test_prepare_path_input_precedes_journal_exhaustion);
+	UT_RUN(test_prepare_path_chain_precedes_locator_and_keeps_blocked_state);
+	UT_RUN(test_prepare_path_object_existing_keeps_refusal_race_and_duplicate);
+	UT_RUN(test_prepare_path_table_ready_duplicate_and_refusals);
+	UT_RUN(test_table_path_input_short_circuits_participant_and_publication);
+	UT_RUN(test_table_path_participant_refusal_precedes_publication);
+	UT_RUN(test_table_path_publication_refusal_keeps_original_participant_open);
+	UT_RUN(test_table_path_dirty_or_malformed_probe_keeps_bytes_and_blocks);
+	UT_RUN(test_table_path_duplicate_conflict_does_not_publish_again);
+	UT_RUN(test_table_path_sequence_capacity_and_tombstone_probe_order);
+	UT_RUN(test_table_path_null_observer_preserves_original_table_effects);
+	UT_RUN(test_prepare_path_null_observer_preserves_exact_shared_effects);
+	UT_RUN(test_reply_trace_off_preserves_ack);
+	UT_RUN(test_reply_trace_ack_landing_is_original_locked_transition);
+	UT_RUN(test_reply_trace_duplicate_is_not_new_progress);
+	UT_RUN(test_reply_trace_refusal_does_not_become_ack);
+	UT_RUN(test_reply_trace_pending_close_is_not_ack);
+	UT_RUN(test_reply_trace_certificate_reclaim_keeps_before_identity);
+	UT_RUN(test_reply_trace_unsafe_context_is_gap_not_log);
+	UT_RUN(test_reply_trace_log_error_does_not_undo_ack_or_hold_lock);
+
+	UT_RUN(test_origin_dispatch_trace_off_keeps_original_batch_effects);
+	UT_RUN(test_origin_dispatch_trace_exact_row_is_passive_and_constant_scope);
+	UT_RUN(test_origin_dispatch_trace_busy_is_unknown_without_wait_or_write);
+	UT_RUN(test_origin_dispatch_trace_unsafe_gaps_do_not_touch_registry);
+	UT_RUN(test_origin_dispatch_trace_reused_key_is_not_bound_to_old_dispatch);
+	UT_RUN(test_origin_dispatch_trace_driver_returns_after_real_pending_landing);
+	UT_RUN(test_origin_dispatch_trace_log_error_keeps_shared_owner_and_clears_hints);
+	UT_RUN(test_origin_dispatch_trace_detached_and_bad_namespace_stay_unknown);
+
+	UT_RUN(test_receipt_observation_exact_prepare_is_read_only);
+	UT_RUN(test_receipt_observation_real_cancel_keeps_publication_binding);
+	UT_RUN(test_receipt_observation_duplicate_keeps_same_shared_sequence);
+	UT_RUN(test_receipt_observation_stale_or_foreign_handle_never_borrows_state);
+	UT_RUN(test_receipt_observation_busy_locks_return_unknown_without_wait);
+	UT_RUN(test_receipt_observation_critical_or_held_lock_does_not_acquire);
+	UT_RUN(test_receipt_observation_does_not_turn_sample_into_apply_authority);
+	UT_RUN(test_receipt_observation_unattached_or_invalid_output_stays_unknown);
+
 	printf("# CTRC header_bytes=%zu total_bytes=%zu\n", sizeof(ClusterCtrcSharedHeader),
 		   capacity.total_bytes);
 	UT_RUN(test_origin_reserve_requires_published_local_top_protection);

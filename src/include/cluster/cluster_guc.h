@@ -160,6 +160,7 @@ extern bool cluster_trace_tx_identity;
 /* Empty OID list disables passive visibility diagnostics. */
 /* Passive abort/invalidation phase logging; default off. */
 extern bool cluster_trace_cleanup;
+extern bool cluster_trace_normal_stop;
 extern char *cluster_trace_visibility_relids;
 extern bool cluster_trace_visibility_enabled;
 struct ClusterVisibilityTraceFilter;

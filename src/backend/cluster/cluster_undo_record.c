@@ -61,6 +61,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #include "miscadmin.h"
 #include "access/twophase.h" /* spec-4.12a D1: prepared-xact retention guard */
@@ -2150,6 +2151,628 @@ cluster_undo_record_receipt_extent_matches(const ClusterUndoRecordPrepareReceipt
 		   && live->cur_slot_count == frozen->cur_slot_count;
 }
 
+/* Diagnostic inputs are the original lookup's values, never a second lookup.
+ * No member of this stack-only view supplies authority or a persisted field. */
+typedef struct UndoReceiptOwnerTrace {
+	bool exact;
+	const ClusterTTStatusKey *status_key;
+	const ClusterTTStatusResult *status;
+	uint32 grant;
+	const ClusterCtrcTxnKeyV1 *key;
+	const ClusterCtrcParticipantIdentity *participant;
+} UndoReceiptOwnerTrace;
+
+static void
+undo_receipt_prepare_trace(const char *event, const ClusterUndoRecordPrepareReceipt *receipt,
+	uint8 ordinal, TransactionId xid, const char *predicate, uint64 expected, uint64 current,
+	const UndoReceiptOwnerTrace *owner, Size byte_offset)
+{
+	static uint64 sequence;
+	static uint64 critical_skipped;
+	ClusterCtrcTxnKeyV1 empty_key = {0};
+	ClusterCtrcParticipantIdentity empty_participant = {0};
+	ClusterCtrcTargetV1 empty_target = {0};
+	const ClusterCtrcTxnKeyV1 *key = owner != NULL && owner->exact ? owner->key : &empty_key;
+	const ClusterCtrcParticipantIdentity *participant = owner != NULL && owner->exact
+		? owner->participant : &empty_participant;
+	bool target_known = receipt != NULL && ordinal < CLUSTER_UNDO_RECORD_CTRC_TARGETS;
+	const ClusterCtrcTargetV1 *target = target_known
+		? &receipt->ctrc_pending_targets[ordinal] : &empty_target;
+	struct timespec now;
+	uint64 mono_us = 0;
+	char uba[33];
+	static const char hex[] = "0123456789abcdef";
+
+	if (!cluster_trace_normal_stop)
+		return;
+	/* All current heap prepare callers release content before this call. Do
+	 * not allocate a LOG record if an unsupported caller is still critical;
+	 * expose the diagnostic gap on the next safe event, never claim completeness.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (CritSectionCount != 0) {
+		if (critical_skipped != UINT64_MAX)
+			critical_skipped++;
+		return;
+	}
+	if (clock_gettime(CLOCK_MONOTONIC, &now) == 0 && now.tv_sec >= 0
+		&& (uint64)now.tv_sec <= (UINT64_MAX - 999999) / 1000000)
+		mono_us = (uint64)now.tv_sec * 1000000 + (uint64)now.tv_nsec / 1000;
+	if (sequence != UINT64_MAX)
+		sequence++;
+	for (unsigned i = 0; i < sizeof(target->uba); i++) {
+		uba[2 * i] = hex[target->uba[i] >> 4];
+		uba[2 * i + 1] = hex[target->uba[i] & 15];
+	}
+	uba[32] = '\0';
+	ereport(LOG, (errmsg_internal(
+		"PGRAC_FAMILY=CTRC_RECEIPT event=%s event_seq=" UINT64_FORMAT
+		" sequence_scope=process node_id=%d pid=%d procno=%d backend_id=%d "
+		"wall_us=" INT64_FORMAT " monotonic_us=" UINT64_FORMAT
+		" identity_source=run_manifest run_id_known=0 role=receipt_prepare_caller role_known=0 "
+		"phase=PREPARE authoritative=0 predicate=%s expected=" UINT64_FORMAT
+		" current=" UINT64_FORMAT " receipt_byte_offset_known=%d receipt_byte_offset=%zu "
+		"receipt_known=%d target_ordinal=%u target_known=%d "
+		"reservation_seq=" UINT64_FORMAT " expected_reservation_seq=" UINT64_FORMAT
+		" attempt=%u pending_mask=%u prepared_mask=%u applied_mask=%u reuse_mask=%u "
+		"ref_slot=%d ref_owned=%d undo_content_locked=%d reservation_active=%d "
+		"raw_xid=%u full_xid_known=0 process_incarnation_known=0 heap_content_owner_known=0 "
+		"canonical_key_known=%d system_identifier=" UINT64_FORMAT
+		" origin_node_id=%u owner_instance=%u origin_boot_incarnation=" UINT64_FORMAT
+		" cluster_epoch=%u formation_epoch=" UINT64_FORMAT
+		" admission_record_generation=" UINT64_FORMAT " root_descriptor_incarnation=" UINT64_FORMAT
+		" root_id=" UINT64_FORMAT " root_generation=" UINT64_FORMAT
+		" segment_id=%u segment_generation=%u slot_offset=%u slot_wrap=%u canonical_xid=%u "
+		"participant_node_id=%u participant_boot=" UINT64_FORMAT " capability_generation=%u "
+		"participant_formation=" UINT64_FORMAT " participant_admission=" UINT64_FORMAT
+		" lookup_attempted=%d lookup_exact=%d status=%d grant=%u actual_tt_segment=%u actual_tt_slot=%u "
+		"expected_tt_segment=%u expected_tt_offset=%u spc_oid=%u db_oid=%u rel_number=%u "
+		"fork=%d block=%u page_lsn=" UINT64_FORMAT " page_scn=" UINT64_FORMAT
+		" itl_slot=%u itl_wrap=%u itl_xid=%u offset=%u itemid_flags=%u uba=%s "
+		"trace_critical_skipped=" UINT64_FORMAT " trace_sequence_exhausted=%d",
+		event, sequence, cluster_node_id, (int)getpid(), MyProc != NULL ? MyProc->pgprocno : -1,
+		MyBackendId, GetCurrentTimestamp(), mono_us, predicate, expected, current,
+		byte_offset != (Size)-1, byte_offset != (Size)-1 ? byte_offset : 0,
+		receipt != NULL, ordinal, target_known, receipt != NULL ? receipt->reservation_sequence : 0,
+		cluster_undo_record_reservation.sequence, receipt != NULL ? receipt->ctrc_attempt_generation : 0,
+		receipt != NULL ? receipt->ctrc_pending_mask : 0,
+		receipt != NULL ? receipt->ctrc_prepared_mask : 0,
+		receipt != NULL ? receipt->ctrc_applied_mask : 0,
+		receipt != NULL ? receipt->ctrc_reuse_mask : 0,
+		cluster_undo_record_reservation.ref_slot, cluster_undo_record_reservation.owns_ref,
+		cluster_undo_record_reservation.consume_locked, cluster_undo_record_reservation.active,
+		xid, owner != NULL && owner->exact, key->system_identifier, key->origin_node_id,
+		key->owner_instance, key->origin_boot_incarnation, key->cluster_epoch, key->formation_epoch,
+		key->admission_record_generation, key->root_descriptor_incarnation, key->root_id,
+		key->root_generation, key->segment_id, key->segment_generation, key->slot_offset,
+		key->slot_wrap, key->xid, participant->node_id, participant->boot_incarnation,
+		participant->capability_record_generation, participant->formation_epoch,
+		participant->admission_record_generation, owner != NULL, owner != NULL && owner->exact,
+		owner != NULL ? (int)owner->status->status : -1, owner != NULL ? owner->grant : 0,
+		owner != NULL ? owner->status_key->undo_segment_id : 0,
+		owner != NULL ? owner->status_key->tt_slot_id : 0,
+		receipt != NULL ? receipt->tt_slot_segment_id : 0,
+		receipt != NULL ? receipt->tt_slot_offset : 0, target->spc_oid, target->db_oid,
+		target->rel_number, target->fork_number, target->block_number, target->predecessor_page_lsn,
+		target->predecessor_page_scn, target->itl_slot_index, target->itl_slot_wrap,
+		target->itl_xid, target->offset_number, target->itemid_flags, uba, critical_skipped,
+		sequence == UINT64_MAX)));
+}
+
+/* Owned cancellation inputs survive the original local reset.  No shared
+ * receipt/participant pointer in this copy is ever dereferenced by tracing. */
+typedef struct UndoReceiptCancelTrace {
+	ClusterUndoRecordPrepareReceipt receipt;
+	int ref_slot;
+	bool active, owns_ref, consume_locked, before_known;
+	uint8 attempted, succeeded;
+} UndoReceiptCancelTrace;
+
+static void
+undo_receipt_trace_note_lwlock(LWLock *lock, LWLockMode mode, void *context)
+{
+	(void)lock;
+	(void)mode;
+	*(bool *)context = true;
+}
+
+/* Caller results and owned projections, not a shared-state or retirement
+ * proof.  The actual owner lookup/prepare/cancel executes exactly once. */
+static void
+undo_receipt_lifecycle_trace(const char *event, const char *predicate,
+	const ClusterUndoRecordPrepareReceipt *receipt, uint8 ordinal, TransactionId xid,
+	const UndoReceiptOwnerTrace *owner, const ClusterCtrcPublicationIdV1 *publication,
+	const ClusterCtrcReceiptHandle *handle, int prepare_result,
+	ClusterCtrcPreparePath shared_prepare_path, int sync_result,
+	const UndoReceiptCancelTrace *cancel)
+{
+	static uint64 event_seq;
+	static uint64 critical_skipped;
+	static uint64 lwlock_skipped;
+	ClusterCtrcReceiptObservation shared;
+	bool shared_observed = false;
+	ClusterCtrcTxnKeyV1 empty_key = {0};
+	ClusterCtrcParticipantIdentity empty_participant = {0};
+	ClusterCtrcPublicationIdV1 empty_publication = {0};
+	ClusterCtrcTargetV1 empty_target = {0};
+	const ClusterCtrcTxnKeyV1 *key;
+	const ClusterCtrcParticipantIdentity *participant;
+	const ClusterCtrcPublicationIdV1 *pub;
+	const ClusterCtrcTargetV1 *target;
+	bool key_known, target_known, held = false;
+	struct timespec now;
+	uint64 mono_us = 0;
+	char uba[33], shared_uba[33];
+	static const char hex[] = "0123456789abcdef";
+
+	if (!cluster_trace_normal_stop)
+		return;
+	if (CritSectionCount != 0) {
+		if (critical_skipped != UINT64_MAX)
+			critical_skipped++;
+		return;
+	}
+	ForEachLWLockHeldByMe(undo_receipt_trace_note_lwlock, &held);
+	if (held) {
+		if (lwlock_skipped != UINT64_MAX)
+			lwlock_skipped++;
+		return;
+	}
+	MemSet(&shared, 0, sizeof(shared));
+	/* Original ready registration/local cancellation cleanup already finished.
+	 * Sample no other stage; never add LOG inside shared mutation owners. */
+	if (handle != NULL && handle->valid
+		&& (strcmp(event, "prepare.ready") == 0 || strcmp(event, "cancel.local_retired") == 0))
+		shared_observed = cluster_ctrc_receipt_observe_shared(handle, &shared);
+	key_known = (owner != NULL && owner->exact) || (handle != NULL && handle->valid);
+	key = owner != NULL && owner->exact ? owner->key
+		: handle != NULL && handle->valid ? &handle->key : &empty_key;
+	participant = owner != NULL && owner->exact ? owner->participant : &empty_participant;
+	pub = publication != NULL ? publication : &empty_publication;
+	target_known = receipt != NULL && ordinal < CLUSTER_UNDO_RECORD_CTRC_TARGETS;
+	target = target_known ? &receipt->ctrc_pending_targets[ordinal] : &empty_target;
+	for (unsigned i = 0; i < sizeof(target->uba); i++) {
+		uba[2 * i] = hex[target->uba[i] >> 4];
+		uba[2 * i + 1] = hex[target->uba[i] & 15];
+		shared_uba[2 * i] = hex[shared.target.uba[i] >> 4];
+		shared_uba[2 * i + 1] = hex[shared.target.uba[i] & 15];
+	}
+	uba[32] = '\0';
+	shared_uba[32] = '\0';
+	if (clock_gettime(CLOCK_MONOTONIC, &now) == 0 && now.tv_sec >= 0
+		&& (uint64)now.tv_sec <= (UINT64_MAX - 999999) / 1000000)
+		mono_us = (uint64)now.tv_sec * 1000000 + (uint64)now.tv_nsec / 1000;
+	if (event_seq != UINT64_MAX)
+		event_seq++;
+	ereport(LOG, (errmsg_internal(
+		"PGRAC_FAMILY=CTRC_RECEIPT_LIFECYCLE event=%s predicate=%s "
+		"event_seq=" UINT64_FORMAT " sequence_scope=process sequence_domain=CTRC_RECEIPT_LIFECYCLE "
+		"node_id=%d pid=%d procno=%d backend_id=%d backend_type=%d phase=CALLER_LIFECYCLE wall_us=" INT64_FORMAT
+		" monotonic_us=" UINT64_FORMAT " identity_source=run_manifest "
+		"run_id_known=0 process_incarnation_known=0 full_xid_known=0 heap_content_owner_known=0 "
+		"authoritative=0 transport_receipt=0 shared_state_known=0 shared_retired_known=0 "
+		"receipt_known=%d reservation_seq=" UINT64_FORMAT " attempt=%u target_ordinal=%u "
+		"pending_mask=%u prepared_mask=%u applied_mask=%u reuse_mask=%u raw_xid=%u raw_xid_known=%d "
+		"key_known=%d key_source=%s system_identifier=" UINT64_FORMAT
+		" origin_node_id=%u owner_instance=%u origin_boot_incarnation=" UINT64_FORMAT
+		" cluster_epoch=%u formation_epoch=" UINT64_FORMAT
+		" admission_record_generation=" UINT64_FORMAT " root_descriptor_incarnation=" UINT64_FORMAT
+		" root_id=" UINT64_FORMAT " root_generation=" UINT64_FORMAT
+		" segment_id=%u segment_generation=%u slot_offset=%u slot_wrap=%u canonical_xid=%u "
+		"lookup_attempted=%d lookup_exact=%d owner_status=%d owner_grant=%u "
+		"participant_known=%d participant_node=%u participant_boot=" UINT64_FORMAT
+		" participant_capability_generation=%u participant_formation=" UINT64_FORMAT
+		" participant_admission=" UINT64_FORMAT
+		" publication_known=%d wire_request_id=" UINT64_FORMAT " operation_id=" UINT64_FORMAT
+		" publication_attempt=%u publication_grant=%u publication_backend=%d "
+		"publication_requester=%u publication_boot=" UINT64_FORMAT
+		" publication_capability_generation=%u descriptor_hash=" UINT64_FORMAT
+		" member_ordinal=%u member_role=%u reference_kind=%u target_kind=%u "
+		"publication_journal_sequence=" UINT64_FORMAT " publication_key_sequence=" UINT64_FORMAT
+		" publication_slot_generation=" UINT64_FORMAT
+		" handle_known=%d handle_valid=%d participant_index=" UINT64_FORMAT
+		" receipt_index=" UINT64_FORMAT " journal_slot_generation=" UINT64_FORMAT
+		" prepare_result_known=%d prepare_result=%d shared_prepare_path_known=%d shared_prepare_path=%u "
+		"local_sync_known=%d local_sync_result=%d "
+		"before_local_known=%d before_ref_slot=%d before_ref_owned=%d before_active=%d before_locked=%d "
+		"local_active=%d local_ref_owned=%d local_ref_slot=%d local_locked=%d apply_attempted=%d "
+		"cancel_results_known=%d cancel_attempted_mask=%u cancel_succeeded_mask=%u "
+		"target_known=%d spc=%u db=%u rel=%u fork=%d block=%u "
+		"page_lsn=" UINT64_FORMAT " page_scn=" UINT64_FORMAT
+		" itl_slot=%u itl_wrap=%u itl_xid=%u offset=%u itemid_flags=%u uba=%s "
+		"shared_sample_observed=%d shared_mutable_atomic=0 shared_sample_state_before=%u "
+		"shared_sample_state_after=%u shared_participant_state=%u shared_participant_boot=" UINT64_FORMAT
+		" shared_grant=%u shared_publication_grant=%u shared_journal_sequence=" UINT64_FORMAT
+		" shared_key_sequence=" UINT64_FORMAT " shared_journal_generation=" UINT64_FORMAT
+		" shared_operation=" UINT64_FORMAT " shared_receipt_count=" UINT64_FORMAT
+		" shared_prepared_count=" UINT64_FORMAT " shared_applied_count=" UINT64_FORMAT
+		" shared_cancelled_count=" UINT64_FORMAT " shared_cleaned_count=" UINT64_FORMAT
+		" shared_ack_frozen_count=" UINT64_FORMAT " shared_seal_generation=" UINT64_FORMAT
+		" shared_last_key_sequence=" UINT64_FORMAT " shared_disposition=%u shared_local_lsn=" UINT64_FORMAT
+		" shared_sample_kind=%u shared_sample_spc=%u shared_sample_db=%u shared_sample_rel=%u "
+		"shared_sample_fork=%d shared_sample_block=%u shared_sample_itl_wrap=%u shared_sample_itl_xid=%u "
+		"shared_key_matches_reported=%d shared_participant_node=%u shared_participant_capability=%u "
+		"shared_participant_formation=" UINT64_FORMAT " shared_participant_admission=" UINT64_FORMAT
+		" shared_wire_request=" UINT64_FORMAT " shared_attempt=%u shared_requester_backend=%d "
+		"shared_requester_node=%u shared_requester_boot=" UINT64_FORMAT
+		" shared_requester_capability=%u shared_descriptor_hash=" UINT64_FORMAT
+		" shared_member_ordinal=%u shared_member_role=%u shared_reference_kind=%u shared_publication_kind=%u "
+		"shared_sample_itl_slot=%u shared_sample_offset=%u shared_sample_itemid_flags=%u "
+		"shared_sample_page_lsn=" UINT64_FORMAT " shared_sample_page_scn=" UINT64_FORMAT
+		" shared_sample_own_generation=" UINT64_FORMAT " shared_sample_acquisition_epoch=" UINT64_FORMAT
+		" shared_sample_uba=%s "
+		"trace_critical_skipped=" UINT64_FORMAT " trace_lwlock_skipped=" UINT64_FORMAT
+		" trace_sequence_exhausted=%d",
+		event, predicate, event_seq, cluster_node_id, (int)getpid(),
+		MyProc != NULL ? MyProc->pgprocno : -1, (int)MyBackendId, (int)MyBackendType, GetCurrentTimestamp(), mono_us,
+		receipt != NULL, receipt != NULL ? receipt->reservation_sequence : 0,
+		receipt != NULL ? receipt->ctrc_attempt_generation : 0, ordinal,
+		receipt != NULL ? receipt->ctrc_pending_mask : 0,
+		receipt != NULL ? receipt->ctrc_prepared_mask : 0,
+		receipt != NULL ? receipt->ctrc_applied_mask : 0,
+		receipt != NULL ? receipt->ctrc_reuse_mask : 0, xid, TransactionIdIsValid(xid),
+		key_known, owner != NULL && owner->exact ? "original_owner_lookup"
+			: key_known ? "owned_handle_projection" : "unknown",
+		key->system_identifier, key->origin_node_id, key->owner_instance,
+		key->origin_boot_incarnation, key->cluster_epoch, key->formation_epoch,
+		key->admission_record_generation, key->root_descriptor_incarnation, key->root_id,
+		key->root_generation, key->segment_id, key->segment_generation, key->slot_offset,
+		key->slot_wrap, key->xid, owner != NULL, owner != NULL && owner->exact,
+		owner != NULL && owner->status != NULL ? (int)owner->status->status : -1,
+		owner != NULL ? owner->grant : 0,
+		owner != NULL && owner->exact, participant->node_id, participant->boot_incarnation,
+		participant->capability_record_generation, participant->formation_epoch,
+		participant->admission_record_generation,
+		publication != NULL, pub->wire_request_id, pub->operation_id, pub->attempt_generation,
+		pub->grant_generation, pub->requester_backend_id, pub->requester_node_id,
+		pub->requester_boot_incarnation, pub->capability_record_generation, pub->descriptor_hash,
+		pub->member_ordinal, pub->member_role, pub->reference_kind, pub->target_kind,
+		pub->journal_sequence, pub->key_sequence, pub->journal_slot_generation,
+		handle != NULL, handle != NULL && handle->valid,
+		handle != NULL ? handle->participant_index : 0,
+		handle != NULL ? handle->receipt_index : 0,
+		handle != NULL ? handle->journal_slot_generation : 0,
+		prepare_result >= 0, prepare_result,
+		shared_prepare_path != CLUSTER_CTRC_PREPARE_PATH_UNKNOWN, (unsigned)shared_prepare_path,
+		sync_result >= 0, sync_result,
+		cancel != NULL && cancel->before_known,
+		cancel != NULL && cancel->before_known ? cancel->ref_slot : -1,
+		cancel != NULL && cancel->before_known && cancel->owns_ref,
+		cancel != NULL && cancel->before_known && cancel->active,
+		cancel != NULL && cancel->before_known && cancel->consume_locked,
+		cluster_undo_record_reservation.active, cluster_undo_record_reservation.owns_ref,
+		cluster_undo_record_reservation.ref_slot, cluster_undo_record_reservation.consume_locked,
+		cluster_undo_record_reservation.apply_attempted,
+		cancel != NULL, cancel != NULL ? cancel->attempted : 0, cancel != NULL ? cancel->succeeded : 0,
+		target_known, target->spc_oid, target->db_oid, target->rel_number,
+		target->fork_number, target->block_number, target->predecessor_page_lsn,
+		target->predecessor_page_scn, target->itl_slot_index, target->itl_slot_wrap,
+		target->itl_xid, target->offset_number, target->itemid_flags, uba,
+		shared_observed, shared.state_before, shared.state_after, shared.participant_state,
+		shared.participant.boot_incarnation, shared.grant_generation, shared.publication.grant_generation,
+		shared.publication.journal_sequence, shared.publication.key_sequence,
+		shared.publication.journal_slot_generation, shared.publication.operation_id,
+		shared.receipt_count, shared.prepared_count, shared.applied_count, shared.cancelled_count,
+		shared.cleaned_count, shared.ack_frozen_count, shared.seal_generation, shared.last_key_sequence,
+		shared.disposition, (uint64)shared.highest_local_wal_lsn, shared.target.kind,
+		shared.target.spc_oid, shared.target.db_oid, shared.target.rel_number,
+		shared.target.fork_number, shared.target.block_number, shared.target.itl_slot_wrap,
+		shared.target.itl_xid,
+		shared_observed && key_known && memcmp(key, &shared.key, sizeof(*key)) == 0,
+		shared.participant.node_id, shared.participant.capability_record_generation,
+		shared.participant.formation_epoch, shared.participant.admission_record_generation,
+		shared.publication.wire_request_id, shared.publication.attempt_generation,
+		shared.publication.requester_backend_id, shared.publication.requester_node_id,
+		shared.publication.requester_boot_incarnation, shared.publication.capability_record_generation,
+		shared.publication.descriptor_hash, shared.publication.member_ordinal,
+		shared.publication.member_role, shared.publication.reference_kind, shared.publication.target_kind,
+		shared.target.itl_slot_index, shared.target.offset_number, shared.target.itemid_flags,
+		shared.target.predecessor_page_lsn, shared.target.predecessor_page_scn,
+		shared.target.publication_own_generation, shared.target.publication_acquisition_epoch, shared_uba,
+		critical_skipped, lwlock_skipped, event_seq == UINT64_MAX)));
+}
+
+/* Specific bounded APPLY/consume observation, not a shared obligation or
+ * general event queue. Capture has no LOG/IO/allocation/lock/clock calls. */
+#define CLUSTER_UNDO_RECEIPT_CONSUME_TRACE_PRESENT 1
+typedef struct UndoReceiptConsumerTrace {
+	ClusterCtrcReceiptHandle handles[CLUSTER_UNDO_RECORD_CTRC_TARGETS];
+	ClusterCtrcTargetV1 final_targets[CLUSTER_UNDO_RECORD_CTRC_TARGETS];
+	ClusterUndoRecordTarget data_target;
+	UBA uba;
+	uint64 sequence, sample_sequence;
+	uint32 attempt;
+	uint32 apply_calls[CLUSTER_UNDO_RECORD_CTRC_TARGETS];
+	int shared_result[CLUSTER_UNDO_RECORD_CTRC_TARGETS];
+	uint8 attempted, shared_known, sync_known, sync_ok, reuse_mask, applied_mask;
+	int ref_slot;
+	bool owns_ref, consume_locked, consume_succeeded, valid;
+} UndoReceiptConsumerTrace;
+
+static UndoReceiptConsumerTrace undo_receipt_consumer_trace;
+static uint64 undo_receipt_consumer_sequence;
+static uint64 undo_receipt_consumer_overwritten;
+static uint64 undo_receipt_consumer_critical_skipped;
+static uint64 undo_receipt_consumer_lwlock_skipped;
+
+static void
+undo_receipt_consumer_trace_begin(const ClusterUndoRecordPrepareReceipt *receipt,
+								 uint8 ordinal, const ClusterCtrcTargetV1 *target)
+{
+	UndoReceiptConsumerTrace *sample = &undo_receipt_consumer_trace;
+	const ClusterCtrcReceiptHandle *handle = &receipt->ctrc_handles[ordinal];
+
+	if (!sample->valid || sample->sequence != receipt->reservation_sequence
+		|| sample->attempt != receipt->ctrc_attempt_generation
+		|| memcmp(&sample->handles[ordinal].key, &handle->key, sizeof(handle->key)) != 0
+		|| sample->handles[ordinal].participant_index != handle->participant_index
+		|| sample->handles[ordinal].receipt_index != handle->receipt_index
+		|| sample->handles[ordinal].journal_slot_generation != handle->journal_slot_generation) {
+		if (sample->valid && undo_receipt_consumer_overwritten != UINT64_MAX)
+			undo_receipt_consumer_overwritten++;
+		MemSet(sample, 0, sizeof(*sample));
+		if (undo_receipt_consumer_sequence != UINT64_MAX)
+			undo_receipt_consumer_sequence++;
+		sample->sample_sequence = undo_receipt_consumer_sequence;
+		sample->sequence = receipt->reservation_sequence;
+		sample->attempt = receipt->ctrc_attempt_generation;
+		memcpy(sample->handles, receipt->ctrc_handles, sizeof(sample->handles));
+		sample->valid = true;
+	}
+	sample->attempted |= UINT8_C(1) << ordinal;
+	sample->shared_known &= ~(UINT8_C(1) << ordinal);
+	sample->sync_known &= ~(UINT8_C(1) << ordinal);
+	sample->sync_ok &= ~(UINT8_C(1) << ordinal);
+	sample->shared_result[ordinal] = 0;
+	if (sample->apply_calls[ordinal] != UINT32_MAX)
+		sample->apply_calls[ordinal]++;
+	sample->reuse_mask = receipt->ctrc_reuse_mask;
+	sample->applied_mask = receipt->ctrc_applied_mask;
+	sample->final_targets[ordinal] = *target;
+	sample->ref_slot = cluster_undo_record_reservation.ref_slot;
+	sample->owns_ref = cluster_undo_record_reservation.owns_ref;
+	sample->consume_locked = cluster_undo_record_reservation.consume_locked;
+}
+
+static void
+undo_receipt_consumer_trace_result(const ClusterUndoRecordPrepareReceipt *receipt,
+								  uint8 ordinal, ClusterCtrcApplyResult result, int synced)
+{
+	UndoReceiptConsumerTrace *sample = &undo_receipt_consumer_trace;
+	uint8 bit = UINT8_C(1) << ordinal;
+
+	if (!sample->valid || sample->sequence != receipt->reservation_sequence
+		|| sample->attempt != receipt->ctrc_attempt_generation)
+		return;
+	sample->shared_known |= bit;
+	sample->shared_result[ordinal] = (int)result;
+	if (synced >= 0) {
+		sample->sync_known |= bit;
+		if (synced != 0)
+			sample->sync_ok |= bit;
+	}
+	sample->applied_mask = receipt->ctrc_applied_mask;
+}
+
+static void
+undo_receipt_consumer_trace_consumed(const ClusterUndoRecordPrepareReceipt *receipt,
+									const ClusterUndoRecordTarget *target, UBA uba)
+{
+	UndoReceiptConsumerTrace *sample = &undo_receipt_consumer_trace;
+
+	if (!sample->valid || sample->sequence != receipt->reservation_sequence
+		|| sample->attempt != receipt->ctrc_attempt_generation)
+		return;
+	sample->data_target = *target;
+	sample->uba = uba;
+	sample->applied_mask = receipt->ctrc_applied_mask;
+	sample->consume_succeeded = true;
+}
+
+static void
+undo_receipt_consumer_trace_flush(const char *stage)
+{
+	UndoReceiptConsumerTrace sample;
+	bool held = false;
+	struct timespec now;
+	uint64 mono_us = 0;
+	char uba[2 * sizeof(sample.uba) + 1];
+	static const char hex[] = "0123456789abcdef";
+
+	if (!cluster_trace_normal_stop) {
+		/* Diagnostic state owns no reference or other retirement duty. */
+		if (undo_receipt_consumer_trace.valid)
+			MemSet(&undo_receipt_consumer_trace, 0, sizeof(undo_receipt_consumer_trace));
+		return;
+	}
+	if (!undo_receipt_consumer_trace.valid)
+		return;
+	if (CritSectionCount != 0) {
+		if (undo_receipt_consumer_critical_skipped != UINT64_MAX)
+			undo_receipt_consumer_critical_skipped++;
+		return;
+	}
+	ForEachLWLockHeldByMe(undo_receipt_trace_note_lwlock, &held);
+	if (held) {
+		if (undo_receipt_consumer_lwlock_skipped != UINT64_MAX)
+			undo_receipt_consumer_lwlock_skipped++;
+		return;
+	}
+	if (clock_gettime(CLOCK_MONOTONIC, &now) == 0 && now.tv_sec >= 0
+		&& (uint64)now.tv_sec <= (UINT64_MAX - 999999) / 1000000)
+		mono_us = (uint64)now.tv_sec * 1000000 + (uint64)now.tv_nsec / 1000;
+	sample = undo_receipt_consumer_trace;
+	/* LOG ERROR may truncate this output, but cannot replay it or change
+	 * the original reservation/pending/shared owner. No shared dereference. */
+	MemSet(&undo_receipt_consumer_trace, 0, sizeof(undo_receipt_consumer_trace));
+	for (unsigned i = 0; i < sizeof(sample.uba); i++) {
+		uint8 value = ((const uint8 *)&sample.uba)[i];
+		uba[2 * i] = hex[value >> 4]; uba[2 * i + 1] = hex[value & 15];
+	}
+	uba[sizeof(uba) - 1] = '\0';
+	for (uint8 ordinal = 0; ordinal < CLUSTER_UNDO_RECORD_CTRC_TARGETS; ordinal++) {
+		uint8 bit = UINT8_C(1) << ordinal;
+		const ClusterCtrcReceiptHandle *handle = &sample.handles[ordinal];
+		const ClusterCtrcTxnKeyV1 *key = &handle->key;
+		const ClusterCtrcTargetV1 *target = &sample.final_targets[ordinal];
+
+		if ((sample.attempted & bit) == 0)
+			continue;
+		ereport(LOG, (errmsg_internal(
+			"PGRAC_FAMILY=CTRC_CONSUME event=deferred_apply_consume emit_stage=%s "
+			"event_seq=" UINT64_FORMAT " sequence_scope=process sequence_domain=CTRC_CONSUME "
+			"node_id=%d pid=%d procno=%d backend_id=%d backend_type=%d wall_us=" INT64_FORMAT
+			" monotonic_us=" UINT64_FORMAT " capture_clock_known=0 identity_source=owned_handle_projection "
+			"run_id_known=0 process_incarnation_known=0 full_xid_known=0 "
+			"authoritative=0 shared_retired_known=0 shared_state_known=0 "
+			"consumer_sequence=" UINT64_FORMAT " attempt=%u target_ordinal=%u route_retarget=%d "
+			"key_known=%d system_identifier=" UINT64_FORMAT " origin_node_id=%u owner_instance=%u "
+			"origin_boot_incarnation=" UINT64_FORMAT " cluster_epoch=%u formation_epoch=" UINT64_FORMAT
+			" admission_record_generation=" UINT64_FORMAT " root_descriptor_incarnation=" UINT64_FORMAT
+			" root_id=" UINT64_FORMAT " root_generation=" UINT64_FORMAT
+			" segment_id=%u segment_generation=%u tt_slot_offset=%u tt_wrap=%u raw_xid=%u "
+			"participant_index=" UINT64_FORMAT " receipt_index=" UINT64_FORMAT
+			" journal_slot_generation=" UINT64_FORMAT
+			" apply_call_count=%u shared_result_known=%d shared_result=%d local_sync_known=%d local_sync_ok=%d "
+			"applied_mask=%u consume_result_known=%d consume_succeeded=%d consume_refusal_observed=0 "
+			"capture_ref_slot=%d capture_ref_owned=%d capture_consume_locked=%d "
+			"final_spc=%u final_db=%u final_rel=%u final_fork=%d final_block=%u "
+			"final_itl_slot=%u final_itl_wrap=%u final_itl_xid=%u final_page_lsn=" UINT64_FORMAT
+			" final_page_scn=" UINT64_FORMAT " data_target_known=%d "
+			"data_spc=%u data_db=%u data_rel=%u data_fork=%d data_block=%u data_offset=%u "
+			"consumed_uba_raw=%s overwritten=" UINT64_FORMAT " critical_skipped=" UINT64_FORMAT
+			" lwlock_skipped=" UINT64_FORMAT " sequence_exhausted=%d",
+			stage, sample.sample_sequence, cluster_node_id, (int)getpid(),
+			MyProc != NULL ? MyProc->pgprocno : -1, (int)MyBackendId, (int)MyBackendType,
+			GetCurrentTimestamp(), mono_us, sample.sequence, sample.attempt, ordinal, (sample.reuse_mask & bit) != 0,
+			handle->valid, key->system_identifier, key->origin_node_id, key->owner_instance,
+			key->origin_boot_incarnation, key->cluster_epoch, key->formation_epoch,
+			key->admission_record_generation, key->root_descriptor_incarnation, key->root_id,
+			key->root_generation, key->segment_id, key->segment_generation, key->slot_offset,
+			key->slot_wrap, key->xid, handle->participant_index, handle->receipt_index,
+			handle->journal_slot_generation, sample.apply_calls[ordinal],
+			(sample.shared_known & bit) != 0, sample.shared_result[ordinal],
+			(sample.sync_known & bit) != 0, (sample.sync_ok & bit) != 0, sample.applied_mask,
+			sample.consume_succeeded, sample.consume_succeeded, sample.ref_slot, sample.owns_ref, sample.consume_locked,
+			target->spc_oid, target->db_oid, target->rel_number, target->fork_number,
+			target->block_number, target->itl_slot_index, target->itl_slot_wrap, target->itl_xid,
+			target->predecessor_page_lsn, target->predecessor_page_scn, sample.consume_succeeded,
+			sample.data_target.locator.spcOid, sample.data_target.locator.dbOid,
+			sample.data_target.locator.relNumber, sample.data_target.forknum,
+			sample.data_target.blockno, sample.data_target.offnum, uba, undo_receipt_consumer_overwritten,
+			undo_receipt_consumer_critical_skipped, undo_receipt_consumer_lwlock_skipped,
+			sample.sample_sequence == UINT64_MAX)));
+	}
+}
+
+/* Explain the original short circuit only after it has refused. These inputs
+ * are backend-local and unchanged between the predicate and this diagnostic. */
+static void
+undo_receipt_prepare_local_reject(const ClusterUndoRecordPrepareReceipt *receipt,
+	uint8 ordinal, TransactionId xid)
+{
+	const ClusterUndoRecordReservation *reservation = &cluster_undo_record_reservation;
+	const ClusterUndoExtent *live = &cluster_undo_current_extent;
+	uint8 bit = ordinal < CLUSTER_UNDO_RECORD_CTRC_TARGETS ? UINT8_C(1) << ordinal : 0;
+	const char *predicate = "receipt.extent_unclassified";
+	uint64 expected = 1, current = 0;
+	Size byte_offset = (Size)-1;
+
+#define UNDO_RECEIPT_FIRST(test, name, want, have) \
+	do { \
+		if (test) { \
+			predicate = (name); \
+			expected = (want); \
+			current = (have); \
+			goto report; \
+		} \
+	} while (0)
+	UNDO_RECEIPT_FIRST(ordinal >= CLUSTER_UNDO_RECORD_CTRC_TARGETS, "target.ordinal",
+		CLUSTER_UNDO_RECORD_CTRC_TARGETS - 1, ordinal);
+	UNDO_RECEIPT_FIRST(receipt == NULL, "receipt.present", 1, 0);
+	UNDO_RECEIPT_FIRST((receipt->ctrc_pending_mask & bit) == 0, "mask.pending", bit,
+		receipt->ctrc_pending_mask & bit);
+	UNDO_RECEIPT_FIRST((receipt->ctrc_prepared_mask & bit) != 0, "mask.prepared_zero", 0,
+		receipt->ctrc_prepared_mask & bit);
+	UNDO_RECEIPT_FIRST((receipt->ctrc_applied_mask & bit) != 0, "mask.applied_zero", 0,
+		receipt->ctrc_applied_mask & bit);
+	UNDO_RECEIPT_FIRST((receipt->ctrc_reuse_mask & bit) != 0, "mask.reuse_zero", 0,
+		receipt->ctrc_reuse_mask & bit);
+	UNDO_RECEIPT_FIRST(receipt->ctrc_handles[ordinal].valid, "handle.unprepared", 0, 1);
+	UNDO_RECEIPT_FIRST(!TransactionIdIsValid(xid), "transaction.xid", 1, xid);
+	UNDO_RECEIPT_FIRST(MyBackendId <= 0, "caller.backend_id", 1, MyBackendId);
+	UNDO_RECEIPT_FIRST(receipt->magic != CLUSTER_UNDO_RECORD_RECEIPT_MAGIC, "receipt.magic",
+		CLUSTER_UNDO_RECORD_RECEIPT_MAGIC, receipt->magic);
+	UNDO_RECEIPT_FIRST(!reservation->active, "reservation.active", 1, 0);
+	UNDO_RECEIPT_FIRST(receipt->reservation_sequence == 0, "reservation.sequence_nonzero", 1, 0);
+	UNDO_RECEIPT_FIRST(receipt->reservation_sequence == PG_UINT64_MAX,
+		"reservation.sequence_not_max", PG_UINT64_MAX - 1, receipt->reservation_sequence);
+	UNDO_RECEIPT_FIRST(receipt->reservation_sequence != reservation->sequence,
+		"reservation.sequence", reservation->sequence, receipt->reservation_sequence);
+	if (memcmp(receipt, &reservation->receipt, sizeof(*receipt)) != 0) {
+		const uint8 *have = (const uint8 *)receipt;
+		const uint8 *want = (const uint8 *)&reservation->receipt;
+
+		for (Size i = 0; i < sizeof(*receipt); i++)
+			if (have[i] != want[i]) {
+				/* A padding byte is not a named identity field. Preserve its
+				 * exact offset and values rather than guessing its meaning. */
+				predicate = "reservation.image_byte";
+				byte_offset = i;
+				expected = want[i];
+				current = have[i];
+				goto report;
+			}
+	}
+	UNDO_RECEIPT_FIRST(live->segment_id != receipt->extent.segment_id, "extent.segment",
+		receipt->extent.segment_id, live->segment_id);
+	UNDO_RECEIPT_FIRST(live->first_block != receipt->extent.first_block, "extent.first_block",
+		receipt->extent.first_block, live->first_block);
+	UNDO_RECEIPT_FIRST(live->nblocks != receipt->extent.nblocks, "extent.nblocks",
+		receipt->extent.nblocks, live->nblocks);
+	UNDO_RECEIPT_FIRST(live->cur_block != receipt->extent.cur_block, "extent.cur_block",
+		receipt->extent.cur_block, live->cur_block);
+	UNDO_RECEIPT_FIRST(live->cur_free_offset != receipt->extent.cur_free_offset,
+		"extent.free_offset", receipt->extent.cur_free_offset, live->cur_free_offset);
+	UNDO_RECEIPT_FIRST(live->cur_slot_count != receipt->extent.cur_slot_count,
+		"extent.slot_count", receipt->extent.cur_slot_count, live->cur_slot_count);
+report:
+	undo_receipt_prepare_trace("prepare.reject", receipt, ordinal, xid,
+		predicate, expected, current, NULL, byte_offset);
+#undef UNDO_RECEIPT_FIRST
+}
+
+static void
+undo_receipt_prepare_owner_trace(const char *event,
+	const ClusterUndoRecordPrepareReceipt *receipt, uint8 ordinal, TransactionId xid,
+	const UndoReceiptOwnerTrace *owner, const char *predicate, uint64 expected, uint64 current)
+{
+	if (predicate == NULL) {
+		if (!owner->exact) {
+			predicate = "owner.lookup_exact";
+			expected = 1;
+			current = 0;
+		} else if (owner->status->status != CLUSTER_TT_STATUS_IN_PROGRESS) {
+			predicate = "owner.in_progress";
+			expected = CLUSTER_TT_STATUS_IN_PROGRESS;
+			current = owner->status->status;
+		} else if (owner->grant == 0) {
+			predicate = "owner.grant_nonzero";
+			expected = 1;
+			current = 0;
+		} else if (owner->status_key->undo_segment_id != receipt->tt_slot_segment_id) {
+			predicate = "owner.tt_segment";
+			expected = receipt->tt_slot_segment_id;
+			current = owner->status_key->undo_segment_id;
+		} else {
+			predicate = "owner.tt_slot";
+			expected = cluster_tt_slot_offset_to_id(receipt->tt_slot_offset);
+			current = owner->status_key->tt_slot_id;
+		}
+	}
+	undo_receipt_prepare_trace(event, receipt, ordinal, xid, predicate, expected, current, owner,
+		(Size)-1);
+}
+
 
 static void
 cluster_undo_record_install_prepared_resident_locked(const ClusterUndoRecordPrepareReceipt *receipt,
@@ -2598,33 +3221,50 @@ cluster_undo_record_ctrc_prepare_pending(ClusterUndoRecordPrepareReceipt *receip
 	ClusterCtrcPublicationIdV1 publication;
 	ClusterCtrcReceiptHandle handle;
 	ClusterCtrcPrepareResult result;
+	ClusterCtrcPreparePath shared_prepare_path = CLUSTER_CTRC_PREPARE_PATH_UNKNOWN;
 	TransactionId xid = GetTopTransactionIdIfAny();
 	uint32 grant = 0;
 	uint8 target_bit;
+	bool owner_exact;
 
+	undo_receipt_consumer_trace_flush("next_prepare");
 	cluster_undo_receipt_reason = "CTRC_PENDING_IDENTITY_MISMATCH";
-	if (target_ordinal >= CLUSTER_UNDO_RECORD_CTRC_TARGETS)
+	if (target_ordinal >= CLUSTER_UNDO_RECORD_CTRC_TARGETS) {
+		if (cluster_trace_normal_stop)
+			undo_receipt_prepare_local_reject(receipt, target_ordinal, xid);
 		return false;
+	}
 	target_bit = UINT8_C(1) << target_ordinal;
 	if (receipt == NULL || (receipt->ctrc_pending_mask & target_bit) == 0
 		|| (receipt->ctrc_prepared_mask & target_bit) != 0
 		|| (receipt->ctrc_applied_mask & target_bit) != 0
 		|| (receipt->ctrc_reuse_mask & target_bit) != 0
 		|| receipt->ctrc_handles[target_ordinal].valid || !TransactionIdIsValid(xid)
-		|| MyBackendId <= 0 || !cluster_undo_record_receipt_extent_matches(receipt))
+		|| MyBackendId <= 0 || !cluster_undo_record_receipt_extent_matches(receipt)) {
+		if (cluster_trace_normal_stop)
+			undo_receipt_prepare_local_reject(receipt, target_ordinal, xid);
 		return false;
+	}
 	MemSet(&status_key, 0, sizeof(status_key));
 	MemSet(&status, 0, sizeof(status));
 	MemSet(&key, 0, sizeof(key));
 	MemSet(&participant, 0, sizeof(participant));
 	MemSet(&publication, 0, sizeof(publication));
 	MemSet(&handle, 0, sizeof(handle));
-	if (!cluster_runtime_visibility_current_owner_lookup_exact_ctrc_full(xid, &status_key, &status,
-																		 &grant, &key, &participant)
+	owner_exact = cluster_runtime_visibility_current_owner_lookup_exact_ctrc_full(xid,
+		&status_key, &status, &grant, &key, &participant);
+	if (!owner_exact
 		|| status.status != CLUSTER_TT_STATUS_IN_PROGRESS || grant == 0
 		|| status_key.undo_segment_id != receipt->tt_slot_segment_id
-		|| status_key.tt_slot_id != cluster_tt_slot_offset_to_id(receipt->tt_slot_offset))
+		|| status_key.tt_slot_id != cluster_tt_slot_offset_to_id(receipt->tt_slot_offset)) {
+		if (cluster_trace_normal_stop) {
+			UndoReceiptOwnerTrace trace = { owner_exact, &status_key, &status, grant, &key, &participant };
+
+			undo_receipt_prepare_owner_trace("prepare.reject", receipt, target_ordinal, xid,
+				&trace, NULL, 0, 0);
+		}
 		return false;
+	}
 
 	publication.requester_node_id = participant.node_id;
 	publication.requester_boot_incarnation = participant.boot_incarnation;
@@ -2641,20 +3281,58 @@ cluster_undo_record_ctrc_prepare_pending(ClusterUndoRecordPrepareReceipt *receip
 	publication.reference_kind = CTRC_REF_HEAP_ITL_UBA;
 	publication.target_kind = CTRC_TARGET_PAGE_PENDING_ITL_SLOT;
 	publication.grant_generation = grant;
-	result = cluster_ctrc_receipt_prepare_shared(&key, &participant, grant, &publication,
-												 &receipt->ctrc_pending_targets[target_ordinal],
-												 &handle);
+	if (cluster_trace_normal_stop) {
+		UndoReceiptOwnerTrace trace = { owner_exact, &status_key, &status, grant, &key, &participant };
+
+		undo_receipt_lifecycle_trace("prepare.begin", "original_shared_call", receipt,
+			target_ordinal, xid, &trace, &publication, NULL, -1,
+			CLUSTER_CTRC_PREPARE_PATH_UNKNOWN, -1, NULL);
+	}
+	if (cluster_trace_normal_stop)
+		result = cluster_ctrc_receipt_prepare_shared_observed(&key, &participant, grant,
+			&publication, &receipt->ctrc_pending_targets[target_ordinal], &handle,
+			&shared_prepare_path);
+	else
+		result = cluster_ctrc_receipt_prepare_shared(&key, &participant, grant, &publication,
+			&receipt->ctrc_pending_targets[target_ordinal], &handle);
 	if (result != CLUSTER_CTRC_PREPARE_READY && result != CLUSTER_CTRC_PREPARE_DUPLICATE) {
 		cluster_undo_receipt_reason = "CTRC_PREPARE_REFUSED";
+		if (cluster_trace_normal_stop) {
+			UndoReceiptOwnerTrace trace = { owner_exact, &status_key, &status, grant, &key, &participant };
+
+			undo_receipt_lifecycle_trace("prepare.refused", "original_shared_result", receipt,
+				target_ordinal, xid, &trace, &publication, NULL, (int)result,
+				shared_prepare_path, -1, NULL);
+		}
 		return false;
 	}
 	receipt->ctrc_handles[target_ordinal] = handle;
 	receipt->ctrc_prepared_mask |= target_bit;
 	if (!cluster_undo_record_receipt_sync(receipt)) {
-		(void)cluster_ctrc_receipt_cancel_shared(&handle);
+		bool cancelled = cluster_ctrc_receipt_cancel_shared(&handle);
+
+		if (cluster_trace_normal_stop) {
+			UndoReceiptOwnerTrace trace = { owner_exact, &status_key, &status, grant, &key, &participant };
+			UndoReceiptCancelTrace cancel = {0};
+
+			cancel.attempted = target_bit;
+			cancel.succeeded = cancelled ? target_bit : 0;
+			undo_receipt_lifecycle_trace("prepare.sync_refused", "local_receipt_sync", receipt,
+				target_ordinal, xid, &trace, &publication, &handle, (int)result,
+				shared_prepare_path, 0, &cancel);
+		}
 		return false;
 	}
 	cluster_undo_receipt_reason = "NONE";
+	/* The original exact owner handle is now registered in the local
+	 * reservation before any diagnostic can raise ERROR. */
+	if (cluster_trace_normal_stop) {
+		UndoReceiptOwnerTrace trace = { owner_exact, &status_key, &status, grant, &key, &participant };
+
+		undo_receipt_lifecycle_trace("prepare.ready", "local_handle_registered", receipt,
+			target_ordinal, xid, &trace, &publication, &handle, (int)result,
+			shared_prepare_path, 1, NULL);
+	}
 	return true;
 }
 
@@ -2683,17 +3361,26 @@ cluster_undo_record_ctrc_apply_prepared(ClusterUndoRecordPrepareReceipt *receipt
 	/* PGRAC: even a refusal or failed local mask sync cannot prove that
 	 * an attempted shared APPLY/retarget had no effect. */
 	cluster_undo_record_reservation.apply_attempted = true;
+	if (cluster_trace_normal_stop)
+		undo_receipt_consumer_trace_begin(receipt, target_ordinal, final_target);
 	result = (receipt->ctrc_reuse_mask & target_bit) != 0
 				 ? cluster_ctrc_receipt_retarget_itl_shared(
 					   &receipt->ctrc_handles[target_ordinal],
 					   &receipt->ctrc_pending_targets[target_ordinal], final_target, token)
 				 : cluster_ctrc_receipt_apply_shared(&receipt->ctrc_handles[target_ordinal],
 													 final_target, token);
+	if (cluster_trace_normal_stop)
+		undo_receipt_consumer_trace_result(receipt, target_ordinal, result, -1);
 	if (result != CLUSTER_CTRC_APPLY_APPLIED)
 		return result;
 	receipt->ctrc_applied_mask |= target_bit;
-	if (!cluster_undo_record_receipt_sync(receipt))
+	if (!cluster_undo_record_receipt_sync(receipt)) {
+		if (cluster_trace_normal_stop)
+			undo_receipt_consumer_trace_result(receipt, target_ordinal, result, 0);
 		return CLUSTER_CTRC_APPLY_FAIL_CLOSED;
+	}
+	if (cluster_trace_normal_stop)
+		undo_receipt_consumer_trace_result(receipt, target_ordinal, result, 1);
 	return CLUSTER_CTRC_APPLY_APPLIED;
 }
 
@@ -2930,11 +3617,22 @@ void
 cluster_undo_record_cancel_prepared(ClusterUndoRecordPrepareReceipt *receipt)
 {
 	ClusterUndoRecordReservation *reservation = &cluster_undo_record_reservation;
+	bool trace_enabled = cluster_trace_normal_stop;
+	UndoReceiptCancelTrace trace;
 
 	if (receipt == NULL || !reservation->active || receipt->reservation_sequence == 0
 		|| receipt->reservation_sequence != reservation->sequence
 		|| memcmp(receipt, &reservation->receipt, sizeof(*receipt)) != 0)
 		return;
+	if (trace_enabled) {
+		trace.receipt = *receipt;
+		trace.ref_slot = reservation->ref_slot;
+		trace.active = reservation->active;
+		trace.owns_ref = reservation->owns_ref;
+		trace.consume_locked = reservation->consume_locked;
+		trace.before_known = true;
+		trace.attempted = trace.succeeded = 0;
+	}
 	if (cluster_undo_retry_cancel_snapshot.armed) {
 		if (cluster_undo_retry_cancel_snapshot.sequence == receipt->reservation_sequence
 			&& cluster_undo_retry_cancel_snapshot.exact_ready
@@ -2953,8 +3651,15 @@ cluster_undo_record_cancel_prepared(ClusterUndoRecordPrepareReceipt *receipt)
 			if ((receipt->ctrc_prepared_mask & target_bit) != 0
 				&& (receipt->ctrc_applied_mask & target_bit) == 0
 				&& (receipt->ctrc_reuse_mask & target_bit) == 0
-				&& receipt->ctrc_handles[target_ordinal].valid)
-				(void)cluster_ctrc_receipt_cancel_shared(&receipt->ctrc_handles[target_ordinal]);
+				&& receipt->ctrc_handles[target_ordinal].valid) {
+				bool cancelled = cluster_ctrc_receipt_cancel_shared(&receipt->ctrc_handles[target_ordinal]);
+
+				if (trace_enabled) {
+					trace.attempted |= target_bit;
+					if (cancelled)
+						trace.succeeded |= target_bit;
+				}
+			}
 		}
 	}
 	if (reservation->consume_locked) {
@@ -2971,6 +3676,19 @@ cluster_undo_record_cancel_prepared(ClusterUndoRecordPrepareReceipt *receipt)
 	reservation->consume_effective_prev_uba = InvalidUba;
 	memset(&reservation->receipt, 0, sizeof(reservation->receipt));
 	memset(receipt, 0, sizeof(*receipt));
+	/* Only the owned pre-cleanup snapshot survives. Shared cancellation CAS
+	 * return and local retirement do not prove shared receipt retirement. */
+	if (trace_enabled) {
+		for (uint8 ordinal = 0; ordinal < CLUSTER_UNDO_RECORD_CTRC_TARGETS; ordinal++) {
+			if (((trace.receipt.ctrc_pending_mask | trace.receipt.ctrc_prepared_mask)
+				 & (UINT8_C(1) << ordinal)) == 0)
+				continue;
+			undo_receipt_lifecycle_trace("cancel.local_retired", "original_local_cleanup_complete",
+				&trace.receipt, ordinal, InvalidTransactionId, NULL, NULL,
+				trace.receipt.ctrc_handles[ordinal].valid ? &trace.receipt.ctrc_handles[ordinal] : NULL,
+				-1, CLUSTER_CTRC_PREPARE_PATH_UNKNOWN, -1, &trace);
+		}
+	}
 }
 
 
@@ -3206,6 +3924,8 @@ cluster_undo_record_consume_prepared(ClusterUndoRecordPrepareReceipt *receipt,
 						receipt->tt_slot_offset, new_slot_idx);
 	cluster_undo_local_heads[local_head_idx].head = result;
 	*out_uba = result;
+	if (cluster_trace_normal_stop)
+		undo_receipt_consumer_trace_consumed(receipt, target, result);
 	memset(&reservation->receipt, 0, sizeof(reservation->receipt));
 	memset(receipt, 0, sizeof(*receipt));
 	return CLUSTER_UNDO_RECORD_CONSUME_APPLIED;
@@ -3376,6 +4096,8 @@ cluster_undo_xact_precommit_flush(void)
 						errmsg("cluster undo block remained pending before transaction finish"),
 						errhint("Retry the transaction and inspect the server log for an undo WAL "
 								"flush failure.")));
+
+	undo_receipt_consumer_trace_flush("precommit_after_pending");
 
 	if (cluster_undo_touched_seg_count == 0)
 		return;

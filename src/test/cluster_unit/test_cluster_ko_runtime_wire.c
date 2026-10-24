@@ -405,6 +405,118 @@ UT_TEST(test_committed_discard_resumes_bounded_cursor_without_live_proof)
 	UT_ASSERT_EQ(flush_count + sync_count + drop_count + space_reads + buffer_drain_calls, 0);
 }
 
+/* The physical producer updates its in/out snapshot on every batch. The
+ * original drain must retain progress across that update, through all 1024
+ * batches of a 1GB pool; receiving the first request alone is insufficient. */
+UT_TEST(test_committed_more_reports_each_batch_then_local_progress)
+{
+	ClusterKoSharedMessageV4 request = committed_peer(1700);
+
+	committed_discard_result = CLUSTER_BUFFER_DRAIN_MORE;
+	receive_committed(&request, 0);
+	for (unsigned batch = 1; batch <= 1024; batch++) {
+		UT_ASSERT(fixture_peer_drain());
+		UT_ASSERT_EQ(storage.peer_fences[0].physical_cursor, batch * 128);
+		UT_ASSERT_EQ(storage.send_v3_count, 0);
+	}
+	committed_discard_result = CLUSTER_BUFFER_DRAIN_EMPTY;
+	local_relation_scan_advance = 128;
+	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_MORE;
+	UT_ASSERT(fixture_peer_drain());
+	for (unsigned batch = 2; batch <= 8; batch++) {
+		UT_ASSERT(fixture_peer_drain());
+		UT_ASSERT_EQ(storage.peer_fences[0].local_scan_cursor, batch * 128);
+	}
+	local_relation_scan_result = CLUSTER_PCM_PI_RELATION_EMPTY;
+	UT_ASSERT(fixture_peer_drain());
+	UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
+	UT_ASSERT(!fixture_peer_drain()); /* Already queued, genuinely idle. */
+}
+
+UT_TEST(test_committed_real_wait_and_entered_io_do_not_report_progress)
+{
+	ClusterKoSharedMessageV4 request = committed_peer(1701);
+	ClusterKoDirectoryIoV3 entered;
+
+	UT_ASSERT(cluster_ko_directory_io_begin_v3(request.object.base.key.locator, &entered));
+	receive_committed(&request, 0);
+	UT_ASSERT(fixture_peer_drain()); /* The request itself left the ring. */
+	UT_ASSERT(!fixture_peer_drain());
+	UT_ASSERT_EQ(committed_discard_calls, 0);
+	UT_ASSERT(cluster_ko_directory_io_end_v3(&entered));
+	committed_discard_result = CLUSTER_BUFFER_DRAIN_WAIT;
+	UT_ASSERT(!fixture_peer_drain());
+	UT_ASSERT(!fixture_peer_drain());
+	UT_ASSERT_EQ(storage.send_v3_count, 0);
+}
+
+UT_TEST(test_live_physical_more_retains_progress_across_inout_snapshot)
+{
+	ClusterKoSharedMessageV3 request = peer_fence_fixture(1702);
+
+	buffer_drain_result = CLUSTER_BUFFER_DRAIN_MORE;
+	enqueue_shared_v3(&request);
+	UT_ASSERT(fixture_peer_drain());
+	for (unsigned batch = 2; batch <= 8; batch++) {
+		UT_ASSERT(fixture_peer_drain());
+		UT_ASSERT_EQ(storage.peer_fences[0].physical_cursor, batch * 128);
+	}
+	buffer_drain_result = CLUSTER_BUFFER_DRAIN_WAIT;
+	UT_ASSERT(!fixture_peer_drain());
+	UT_ASSERT_EQ(storage.send_v3_count, 0);
+}
+
+UT_TEST(test_peer_stop_trace_default_off_and_exact_passive_owner_fields)
+{
+	ClusterKoSharedMessageV4 request = committed_peer(1703);
+	ClusterKoPeerFenceV3 before;
+	unsigned logs;
+
+	receive_committed(&request, 0);
+	logs = fixture_log_events;
+	cluster_ko_normal_stop_trace_v1();
+	UT_ASSERT_EQ(fixture_log_events, logs);
+	cluster_trace_normal_stop = true;
+	committed_discard_result = CLUSTER_BUFFER_DRAIN_MORE;
+	UT_ASSERT(fixture_peer_drain());
+	UT_ASSERT(storage.peer_fences[0].last_progress_pg_us > 0);
+	before = storage.peer_fences[0];
+	logs = fixture_log_events;
+	cluster_ko_normal_stop_trace_v1();
+	UT_ASSERT_EQ(fixture_log_events, logs + 1);
+	UT_ASSERT(memcmp(&before, &storage.peer_fences[0], sizeof(before)) == 0);
+	UT_ASSERT(strstr(stop_owner_trace_detail, "batch=1703") != NULL);
+	UT_ASSERT(strstr(stop_owner_trace_detail, "cursor=128") != NULL);
+	UT_ASSERT(strstr(stop_owner_trace_detail, "origin_boot=") != NULL);
+	UT_ASSERT(strstr(stop_owner_trace_detail, "last_progress_pg_us=") != NULL);
+	cluster_trace_normal_stop = false;
+}
+
+UT_TEST(test_peer_stage_timing_default_off_and_covers_real_continuations)
+{
+	for (unsigned enabled = 0; enabled <= 1; enabled++) {
+		ClusterKoSharedMessageV4 request = committed_peer(1710 + enabled);
+
+		receive_committed(&request, 0);
+		cluster_trace_normal_stop = enabled;
+		UT_ASSERT(fixture_peer_drain());
+		UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
+		UT_ASSERT_EQ(peer_stage_trace_events, enabled ? 3 : 0);
+		UT_ASSERT_EQ(peer_stage_trace_mask, enabled ? 0x38 : 0);
+	}
+	for (unsigned enabled = 0; enabled <= 1; enabled++) {
+		ClusterKoSharedMessageV3 request = peer_fence_fixture(1720 + enabled);
+
+		enqueue_shared_v3(&request);
+		cluster_trace_normal_stop = enabled;
+		UT_ASSERT(fixture_peer_drain());
+		UT_ASSERT_EQ(storage.peer_fences[0].state, CLUSTER_KO_PEER_FENCE_READY);
+		UT_ASSERT_EQ(peer_stage_trace_events, enabled ? 5 : 0);
+		UT_ASSERT_EQ(peer_stage_trace_mask, enabled ? 0x37 : 0);
+	}
+	cluster_trace_normal_stop = false;
+}
+
 UT_TEST(test_committed_discard_keeps_local_and_writeback_responsibility)
 {
 	for (unsigned fault = 0; fault < 3; fault++) {
@@ -597,7 +709,12 @@ UT_TEST(test_production_capability_rejects_old_requests_before_any_owner)
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(28);
+	UT_RUN(test_peer_stop_trace_default_off_and_exact_passive_owner_fields);
+	UT_RUN(test_peer_stage_timing_default_off_and_covers_real_continuations);
+	UT_RUN(test_committed_more_reports_each_batch_then_local_progress);
+	UT_RUN(test_committed_real_wait_and_entered_io_do_not_report_progress);
+	UT_RUN(test_live_physical_more_retains_progress_across_inout_snapshot);
 	UT_RUN(test_production_capability_admits_committed_peer_and_ready);
 	UT_RUN(test_production_capability_rejects_old_requests_before_any_owner);
 	UT_RUN(test_committed_request_registers_exact_version_without_legacy_physical_work);

@@ -43,6 +43,374 @@ gate remain prerequisites for four-node workload runs. These scripts neither
 reserve a lab nor establish that gate. A native fixture smoke test or a mock
 adapter does not qualify a physical multi-node deployment.
 
+### Retained workload manifest intake
+
+Verify a retained four-node capture without contacting a server:
+
+```sh
+python3 src/test/cluster_tap/pre2/workload_manifest.py /path/to/capture/manifest.json > capture.json
+python3 -m unittest discover -s src/test/cluster_tap/pre2 -p test_workload_manifest.py
+```
+
+The version-1 JSON manifest contains these fields:
+
+| Field | Contents |
+| --- | --- |
+| `version`, `run_id` | Integer `1` and a nonempty capture identifier |
+| `source` | `commit` and `tree` as full lowercase Git SHA1 strings; `file` references the retained source snapshot |
+| `harness` | File ID of the retained harness snapshot |
+| `files` | Object mapping file IDs to `path`, `sha256`, `size_bytes` descriptors |
+| `nodes` | Four objects with distinct integer `node_id` values 0 through 3, nonempty `boot_id`, decimal-string `cluster_epoch`, and file IDs in `postgres`, `config`, `stderr`, `inventory` |
+
+All nodes must declare the same cluster epoch and provide identical postgres
+bytes. Each file ID has exactly one role: source, harness, or one of the four
+files per node. Paths are relative to the manifest directory and must resolve
+inside it to distinct regular files. The reader verifies every file's byte
+length and SHA256; missing, changed, aliased or unused files are rejected.
+Source snapshots and binaries are hashed in chunks. Stderr and inventory files
+are held in memory. Preserve all input files alongside the resulting JSON.
+
+Each inventory is a JSON object with `run_id`, `node_id`, `boot_id`,
+`cluster_epoch`, `source_commit`, `source_tree`, `postgres_sha256`,
+`config_sha256` and `harness_sha256` matching the manifest declarations and
+verified file hashes. Its `processes` array may be empty. Otherwise each entry
+has a positive integer `pid`, nonnegative integer `procno`, and nonempty
+`backend_start`, `process_incarnation` and `role` strings. Duplicate complete
+process identities are rejected. PID reuse with different identities is
+retained. Duplicate JSON keys and nonstandard numeric constants are rejected
+in both manifest and inventories.
+
+`file_binding=VERIFIED` proves that the files read match the manifest digests.
+These are caller-supplied declarations, not origin or capture-time attestation;
+source commit and binary hashes do not prove built-from-source or the identity
+of a running server. The output therefore retains `build_binding=DECLARED_ONLY`.
+The existing LOG reader parses the exact verified stderr bytes. A supported
+observation naming a different node is rejected. `process_candidates` lists
+inventory indices matching each observation's PID, including all reused-PID
+candidates and empty lists for missing processes. No candidate supplies fields
+to the raw observation or binds its process incarnation, even with one match.
+
+An inventory may additionally declare `trace_identity_assignments`, an array
+of objects with exactly `source` and `identity` members. Use these only for
+explicit per-observation declarations; the reader never generates them from
+PID candidates or timestamps.
+
+| Member | Required fields |
+| --- | --- |
+| `source` | `stderr_file_id`, `stderr_sha256`, `observation_index`, `line`, `byte_offset`, `byte_length`, `sha256` |
+| `identity` | Integer `node_id`, positive integer `pid`, nonnegative integer `procno`; nonempty string `boot_id`, `backend_start`, `process_incarnation`, `role`, `sequence_domain` |
+
+`source` identifies one parsed observation: the zero-based index in that
+node's `trace.observations`, its one-based raw line number, byte offset,
+length and SHA256 including the newline, and the complete stderr file ID and
+SHA256. Every field must match the verified capture. One observation may have
+only one assignment. The complete process tuple and role must match one
+inventory process, the node/boot must match its inventory, and PID and sequence
+domain must match the raw envelope. A missing raw domain cannot be supplied by
+the declaration, including for `CTRC_RECEIPT` and the legacy maintenance formats.
+An existing raw `procno` must agree. Raw `backend_start`, `process_incarnation`
+and `boot_id` must agree when present and their respective known flag is not
+zero. The numeric legacy producer `role` is not translated to an inventory role.
+
+Each node's output has `trace_identity_assignments` in observation order.
+Unassigned observations have `status=UNKNOWN`. Accepted declarations have
+`status=DECLARED_ONLY`, retain their source and identity separately from the raw
+fields, and include the inventory file ID and SHA256. They do not attest process
+birth or fill producer fields marked unknown. All entries keep
+`identity_bound=false`; repeated sequence numbers remain separate raw lines
+and assignments do not establish sequence completeness or causal order.
+
+Each node also has a `trace_sequence_audit` for accepted declarations. Streams
+are separated by the entire declared node, boot, PID, procno, backend start,
+process incarnation, role and sequence domain. Each stream retains its
+`identity`, `observation_indices` and numeric `event_sequences` in original
+observation order; the assignment array's order does not reorder observations.
+No unassigned observation or other process/domain supplies a missing sequence.
+
+Stream `issues` identify `MISSING_START` (first sequence is not 1), `FORWARD_GAP`
+(an adjacent observed sequence jumps forward), `DUPLICATE`, `LOCAL_REVERSAL`
+(an adjacent observed sequence decreases), and `EXHAUSTED` (the producer's
+exhausted/saturated ending flag is 1). Each issue records the observation index
+and sequence; gaps record the expected sequence, duplicates the first retained
+index, and reversals the previous retained index. No ranges are expanded, and
+later observations do not erase earlier issues. Raw lines are never sorted,
+deduplicated or changed. These are observations of retained LOG order, including
+deferred emission; they do not establish execution order or causal edges.
+
+A stream has `prefix_status=OBSERVED_PREFIX` only when it starts at 1 with no
+observed issue; otherwise it is `ROOT_OPEN`. The node audit is `UNKNOWN` without
+declared streams, `PARTIAL` if a stream has issues or any parsed observation is
+unassigned or a record was rejected/unhandled, and otherwise `DECLARED_ONLY`.
+It retains `unassigned_observation_indices`, `rejected_record_count` and
+`unhandled_record_count`. All audits keep `sequence_complete=false` and
+`identity_bound=false`: a contiguous retained prefix does not seal an export,
+detect missing trailing records, or supply barrier/STOP evidence. The producer
+projection reader retains this audit without granting additional credit.
+
+The output always has `identity_bound=false`, `field_root=OPEN` and
+`ready_to_run=false`. It does not produce normalized contract events, request
+or receipt joins, barrier/sequence completeness, STOP evidence or workload
+verdicts. Exit 0 means file verification succeeded, at least one supported
+record parsed, and no known record was malformed; exit 1 means a manifest/file
+error or malformed known record; exit 2 means no supported records or an
+argument error. Unhandled families and empty node logs retain their original
+meaning and cannot establish trace completeness. None of these exit codes
+authorizes a workload or satisfies native runtime gates.
+
+### Structured workload LOG intake
+
+Read one retained PostgreSQL stderr log without starting a server:
+
+```sh
+python3 src/test/cluster_tap/pre2/workload_log.py /path/to/server.log > observations.json
+python3 -m unittest discover -s src/test/cluster_tap/pre2 -p test_workload_log.py
+```
+
+The reader supports the existing READ_IMAGE, R4_UNDO, R4_HEAP_UPDATE, HOT_FULL,
+R4_HEAP_PRUNE, R4_BTREE_DELETE and CTRC trace families listed in
+`workload_log.py`. It accepts `LOG:` records
+whose emitter message starts with `PGRAC_FAMILY=`, preserves field values and nested
+brace blocks, and records the original line, byte offset and SHA256. CSV/JSON
+log formats and multiline messages are not supported. Other families remain
+in `unhandled`; malformed known records remain in `rejections` with their
+original bytes in hex. Preserve the original log alongside the JSON output.
+The optional verbose stderr prefix `SSSSS: ` (five ASCII uppercase letters or
+digits) remains in the original message and is exposed as `log_sqlstate` outside
+the emitter fields. It is log decoration and does not grant error, identity or
+authority credit; plain records do not acquire this metadata. Only one exact
+prefix immediately before `PGRAC_FAMILY=` is accepted.
+The English PostgreSQL stderr suffix ` at character N` is retained in the
+original message and exposed separately as `log_cursor_position`. Its positive
+signed-int position is log decoration, outside the emitter fields; the required
+emitter ending must still be last before this suffix. Other trailing text is
+rejected.
+
+Exit 0 means at least one supported record parsed and no record was rejected;
+exit 1 means rejection; exit 2 means no supported record or a file/argument
+error. Parsing checks the envelope and ending disclosure, not every family
+field or a complete trace. Values such as unknown identities, skipped samples,
+late emission and saturated sequences are retained without granting evidence
+credit. Input order is retained, including repeated sequence numbers. The
+reader does not join processes, sort clocks or produce normalized workload
+events. All results retain `field_root=OPEN`, `identity_bound=false` and
+`ready_to_run=false`; a parsing exit code is not an acceptance verdict.
+The legacy prune/index-delete envelopes retain `node` without adding `node_id`,
+`sequence_scope` or `sequence_domain`. The manifest checks that original `node`
+against the file role; a PID inventory candidate still does not bind identity.
+The existing B-tree summary format concatenates `after_scn` and
+`conflict_horizon_known` without whitespace. For `delete.applied` and
+`vacuum.applied`, the reader recognizes that exact boundary while retaining
+the original message and raw bytes. Other missing separators are rejected.
+
+### Workload producer-field projections
+
+Extract typed fields from a verified retained capture:
+
+```sh
+python3 src/test/cluster_tap/pre2/workload_evidence.py /path/to/capture/manifest.json > evidence.json
+python3 -m unittest discover -s src/test/cluster_tap/pre2 -p test_workload_evidence.py
+python3 -m unittest discover -s src/test/cluster_tap/pre2 -p test_workload_hot_evidence.py
+python3 -m unittest discover -s src/test/cluster_tap/pre2 -p test_workload_maintenance_evidence.py
+```
+
+This uses the manifest format above and preserves its file checks and raw trace
+output. Each node includes `file_ids` for its four retained file roles and a
+`producer_fields` entry for every parsed observation, in the original order.
+Each entry's `source` identifies the manifest hash, stderr file ID and hash,
+observation index, original line, byte offset, byte length and line hash.
+
+The supported projections are:
+
+| Family | Field groups |
+| --- | --- |
+| `READ_IMAGE` | Request scalars, full block tag, reply scalars |
+| `READ_IMAGE_HOP` | Forward/reply request scalars, known block tag, reply scalars |
+| `CTRC_RECEIPT` | Canonical transaction key, local reservation, target |
+| `CTRC_RECEIPT_LIFECYCLE` | Canonical key, reservation, target, handle, publication |
+| `CTRC_CONSUME` | Canonical key, handle, consume scalars, final target, consumed data target |
+| `HOT_FULL` | Snapshot, build/search results, before/FULL pages and their root/queried ItemId, tuple and ITL snapshots |
+| `R4_HEAP_UPDATE` | Update scalars, requested/old/new TIDs, undo words, inserted WAL LSN and four page/ItemId snapshots |
+| `R4_UNDO` | Builder/route/walk scalars, locator, UBA words/decoded fields, record header/target, page/ITL and target ItemId/tuple |
+| `R4_HEAP_PRUNE` | `prune.result` local page/floor/count/context fields; `prune.item` independent before/after ItemId, redirect, tuple and ITL fields |
+| `R4_BTREE_DELETE` | `delete.applied`/`vacuum.applied` local page/horizon/count/inserted-WAL fields; `index.item` original offset, index tuple and captured posting operands |
+
+Each group has `source_fields`, `raw_values`, `guards`, `missing`, `invalid`
+and `status`. `values` contains a complete typed group only when its status is
+`OBSERVED`. Missing components or a missing/false known flag yield `UNKNOWN`
+and empty `values`; malformed known flags or active scalar representations
+yield `INVALID`. Raw values remain available in either case. Numeric checks
+cover the formatter's decimal representation and range, not protocol validity.
+`OBSERVED` means values appeared in one local diagnostic projection; it does
+not establish a transaction identity, delivered request or retired receipt.
+
+Native slash fields retain their component names: tags, TIDs and tuple masks
+are separate objects; raw UBA words are `word0`/`word1`, without conversion to a
+hex UBA or comparison with another projection. ItemId brace fields retain the
+original brace text in `raw_values` and use dotted `source_fields` paths such
+as `full_root.ctid`. Page, ItemId, tuple and slot known flags gate their own
+groups. A redirect or other non-tuple ItemId can expose its flags and storage
+without supplying a tuple or ITL slot. Raw command IDs are not resolved combo
+command IDs. Before/after pages and record targets stay separate. Inserted WAL
+does not establish flush or durability; the original flush flag remains in
+the trace. HOT decision text is retained raw.
+
+Prune/index-delete schemas are selected by event. Summary flags and process
+fields never fill item records. Prune `itl_wrap` remains an ITL slot projection,
+without supplying a TT wrap or FullXid. Encoded `raw_index_tid` stays separate
+from a heap TID, which requires its own `heap_tid_known` flag. Captured posting
+positions retain order, duplicates and explicit unknown TIDs; an `OBSERVED`
+position list can contain `heap_tid_known=false` entries. Its original brace
+text remains available. False posting-shape flags keep the list `UNKNOWN`.
+Counts, omitted items, an original index offset and `operation_seq` do not join
+summary/item lines, establish a complete deletion history, or map a new offset.
+Unknown legacy events remain raw observations with `status=UNSUPPORTED`.
+
+Request and reply IDs remain distinct. Receipt handles do not become receipt
+proofs, and final targets remain separate from consumed data targets after a
+retarget. The legacy `CTRC_RECEIPT` domain remains absent (`null` in the
+projection). Repeated consume sequence numbers remain separate observations.
+Prune/index-delete sequence domains also remain absent.
+Other parsed families have `status=UNSUPPORTED`; unhandled families and
+malformed records remain in the original trace output.
+
+The aggregate `projection_status` is `PROJECTED`, `PARTIAL`, `INVALID` or
+`NOT_OBSERVED`. Exit 0 means supported projections were read without a file,
+parser or scalar error, including partial projections. Exit 1 means one of
+those errors; exit 2 means no supported projection or an argument error.
+Results always retain `identity_bound=false`, `field_root=OPEN` and
+`ready_to_run=false`. Inventory candidates never fill missing producer fields.
+The adapter does not join lines, infer causal edges, produce contract events,
+seal barriers or supply STOP, authority, durability or workload credit.
+
+### Normalized workload contract
+
+Use `contract.check_workload_contract(records)` for caller-supplied normalized
+records. Run its offline tests with:
+
+```sh
+python3 -m unittest discover -s src/test/cluster_tap/pre2 -p test_contract.py
+```
+
+Every event and barrier must carry the same nonempty `run_id`, `source_sha`,
+`source_tree`, `build_sha`, `binary_sha256`, `config_sha256`, `harness_sha256`
+and `cluster_epoch` strings. Source commit/tree use full lowercase Git SHA1;
+binary/config/harness digests use lowercase SHA256; epoch is a decimal string.
+`build_sha` is a caller-supplied build label, independent of the binary digest.
+
+The `IDENTITY_SEAL` lists complete identities with `node`, `boot_id`, positive
+integer `pid`, nonnegative integer `procno`, `backend_start`,
+`process_incarnation`, `sequence_domain` and `role`. All other identity fields
+are nonempty strings. Events and every barrier snapshot repeat the complete
+identity and role. A capture has one boot per node and one role per process.
+Different backend starts or incarnations keep independent sequence prefixes
+even when PID/procno are reused. Each stream begins at sequence 1; a gap remains
+`ROOT_OPEN` and cannot borrow another incarnation's prefix. The fixture in
+`test_contract.py` demonstrates the ordered barriers, disjoint lane objects,
+supplied causal edges and final STOP state.
+
+The result preserves capture and sequence declarations with
+`capture_binding=DECLARED_ONLY`, `identity_binding=DECLARED_ONLY`,
+`field_root=OPEN` and `ready_to_run=false`. A focused diagnostic PASS means the
+supplied records satisfy the checks; it does not attest their origin or prove
+real SQL, transport, authority, durability or shutdown. Raw LOG/projection and
+SQL-journal outputs still require a separately qualified adapter; inventory
+PID candidates cannot fill absent boot, start, incarnation or causal fields.
+
+### Read/image and HOT SQL operations
+
+`WorkloadSql.pm` uses four existing persistent `query_safe` sessions for node
+IDs 0 through 3, plus a separate `hot_reader` session on node 2, in one fresh
+shared database. Supply five distinct dedicated idle sessions
+with autocommit enabled, superuser access and finite query timeouts. The
+module does not form a cluster, open connections or enable trace settings.
+
+```perl
+use WorkloadSql; # add this pre2 directory to @INC
+my $driver = WorkloadSql->new(
+    sessions => \@sessions,
+    hot_reader => $hot_reader, # another backend on node 2
+    schema => 'read_hot_unique_run_name', # must not already exist
+    emit => sub { print {$journal} JSON::PP->new->canonical->encode($_[0]), "\n"
+                  or die "write SQL journal: $!"; },
+    between_lanes => sub { run_caller_owned_itt_barrier(); },
+    receipt_barrier => sub {
+        my ($phase, $sql_facts) = @_;
+        capture_caller_owned_receipt_evidence($phase, $sql_facts);
+    });
+my $result = $driver->run();
+```
+
+Flush and retain the journal on every attempt, including exceptions. Configure
+each `PostgreSQL::Test::BackgroundPsql` session's finite timeout and call
+`set_query_timer_restart()` before use. The caller closes the sessions and
+performs its cluster shutdown and evidence collection even when `run()` dies.
+The module tries one `ROLLBACK` for each reader it opened and any H writer or
+Q transaction without a COMMIT acknowledgement. It preserves original SQL, cleanup and
+journal errors together, and leaves all three relations for inspection.
+A failed connection can prevent cleanup acknowledgement; this is a failure,
+and the caller must retain it. A failed COMMIT has an unknown outcome; a later
+ROLLBACK attempt does not prove it was undone. COMMIT is never retried, and an
+acknowledged commit is recorded before journal emission can fail. The same
+driver object cannot be run twice.
+
+Node 0 mutates `r_img`, read by node 1; node 2 mutates the separate `h_hot`,
+read by the additional node 2 backend. The module validates all five SQL
+identities before creating tables, including the H reader's node, matching
+postmaster birth and distinct PID, and checks for session replacement at the
+end. Both readers hold read-only repeatable-read transactions.
+The module retains each exported snapshot's actual file contents, validates
+its cluster SCN/epoch and backend/database identity, and uses that SCN for
+`cluster_cr_test_target_image()`. This superuser-only diagnostic accepts only
+the target API's FULL/NONE result; refusal, deferral and exceptions fail the
+comparison without a local current-page read, own-instance fallback or retry.
+Its catalog entry requires a fresh homogeneous initdb; it is unavailable in
+older installed catalogs. The existing `cluster_cr_test_image()` continues to
+exercise own-instance construction for its original tests.
+
+The module compares all visible `(id,v)` rows, retaining
+duplicates, across the baseline, ordinary read and FULL reconstruction over
+all relation blocks. The diagnostic returns raw NORMAL tuples, including their
+physical offsets; it is not a complete MVCC visibility scan or proof of remote
+transport, authority or protocol completion. H runs three nonindexed-column
+updates, an indexed key change and a delete in one writer transaction, then
+VACUUM after its COMMIT acknowledgement. Its reader takes the baseline with
+`SET LOCAL cluster.cr_tuple_level_fastpath = off`, then compares reads with
+the setting on and off in the same held snapshot, followed by the target
+FULL diagnostic. A setting error or disagreement fails the attempt. These
+inputs do not guarantee fast path eligibility or execution. Actual HOT/prune/index-delete decisions
+and remote request/serve paths require independent producer LOG evidence.
+
+The separate `q_receipt` relation has one key, seeded before R mutations.
+After H, node 0 executes one ordinary `BEGIN`, reads its actual PostgreSQL full
+transaction ID, updates that key and sends `COMMIT` once. The journal retains
+the baseline locator/rows, full xid as an exact decimal string, mutation
+result and SQL commit acknowledgement. No `PREPARE TRANSACTION` is used.
+`receipt_barrier` is required and runs once with `before_commit` after the
+UPDATE, then once with `after_commit` after COMMIT acknowledgement and result
+journaling. It receives an owned snapshot of Q's SQL facts; its edits and
+return value cannot grant evidence credit. Keep capture work outside these
+five dedicated sessions and bound its duration. A hook exception fails the
+attempt and does not retry the hook or COMMIT.
+
+The journal retains SQL bytes, raw successful output, hashes, SQL identities
+and client-local sequences. `node` remains the server node ID; `client_session`
+identifies slots 0 through 3 and the extra H reader in slot 4. Each slot has its
+own client sequence, including the two node 2 sessions. Client sequences are not producer trace sequences;
+SQL identities lack procno/incarnation/request bindings. Counter snapshots are
+node-wide observations, not attribution to this workload. The between-lanes
+hook schedules caller-owned I/TT work; it does not validate that work. A
+PostgreSQL full xid does not supply an ITL identity or receipt key. Actual
+pending undo, receipt preparation/ACK/retirement, run/build/config identity,
+producer LOG joins and stop seals remain caller responsibilities. Results
+retain `field_root=OPEN`, `trigger_status=UNBOUND`, `receipt_stop_seal=NOT_CHECKED`
+and `ready_to_run=false`, including when SQL rows match and COMMIT is acknowledged.
+
+The SQL-boundary unit test uses no database:
+
+```sh
+perl src/test/cluster_tap/pre2/test_workload_sql.pl
+```
+
 ## TAP fixture entrance
 
 The `PostgreSQL::Test::ClusterPRE2` module defaults to the black-box adapter.
@@ -145,7 +513,7 @@ two contiguous DATA ports per node for the normal TAP default.
 |---|---|
 | fresh_init | `fresh_init`: supported product initialization into all new paths, including new-format identity and per-thread state; no backup clone fallback |
 | shared_start / shared_stop | `shared_start` / `shared_stop`: qualified startup and normal shutdown; no direct serving bypass |
-| root_observation | Current selected `system_identifier`, `root_digest`, `generation`; native SQL independently checks sysid, catalog version 202609290 and the shared settings on every node |
+| root_observation | Current selected `system_identifier`, `root_digest`, `generation`; native SQL independently checks sysid, the exact `CATALOG_VERSION_NO` from this source tree's `src/include/catalog/catversion.h`, and the shared settings on every node |
 | wal_observation | `observe_begin(relation)` and `wal_observation`: complete causally ordered events since the barrier; filter one relation incarnation, retain all writers and WAL generations |
 | current_handoff | Exact `tag`, `space`, `block`, `holder`, `previous_holder`, `handoff_id`, `version`, `writer`; record actual cross-node transfers, not cached-X hits |
 | checkpoint_barrier | Named holder DATA cut plus `current_handoff_pending` returning exact requester/tag/request ID; must not require a lock-held blocked update to finish before releasing the cut |

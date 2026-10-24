@@ -68,6 +68,7 @@
 #include "storage/backendid.h" /* PGRAC: spec-6.14 D9 amend — no-backend-identity guard */
 #include "storage/buf_internals.h"
 #include "storage/condition_variable.h" /* PGRAC: spec-2.31 D1 — wait_cv */
+#include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
@@ -725,6 +726,19 @@ typedef struct ClusterPcmResourceXMasterState {
 	ClusterPageWalRefV1 holder_pi_first;
 	ResourceXIntentSlot holder_image_intent;
 } ClusterPcmResourceXMasterState;
+
+/* Inactive bodies are zeroed and checked before registry publication. Bounded
+ * scans trust that lifecycle transition and read only the dense registry,
+ * avoiding one master-state page touch per inactive slot. */
+static void
+pcm_resource_x_assert_zero_body(const ClusterPcmResourceXMasterState *state pg_attribute_unused())
+{
+#ifdef USE_ASSERT_CHECKING
+	static const ClusterPcmResourceXMasterState empty_state;
+
+	Assert(memcmp(state, &empty_state, sizeof(*state)) == 0);
+#endif
+}
 
 StaticAssertDecl(sizeof(ClusterPcmResourceXMasterRequest) == 352,
 				 "Resource-X master request must retain exact grant physical lineage");
@@ -2360,6 +2374,7 @@ pcm_entry_try_retire_exact(const BufferTag *tag, uint64 binding_generation, PcmR
 		provenance_slot->state = PCM_SIDECAR_TOMBSTONE;
 	}
 	memset(state, 0, sizeof(*state));
+	pcm_resource_x_assert_zero_body(state);
 	registry_slot->retired_authority_generation = authority_generation;
 	pg_write_barrier();
 	registry_slot->state = PCM_REGISTRY_TOMBSTONE;
@@ -5217,11 +5232,19 @@ pcm_frontend_wait_check_shutdown(void)
 				 errmsg("canceling statement during administrator shutdown while waiting for cluster buffer ownership")));
 }
 
+static void
+pcm_entry_wait_before_shmem_exit(int code pg_attribute_unused(), Datum arg)
+{
+	/* A FATAL interrupt does not unwind the wait's PG exception block. */
+	pcm_entry_wait_context_cleanup((PcmEntryWaitContext *)DatumGetPointer(arg));
+}
+
 /* One backend can have at most one ConditionVariable sleep registration.
  * Preserve that registration across the executor probe/wait API boundary,
  * but retain only the exact pinned handle and logical Resource-X identity. */
 static PcmEntryWaitContext pcm_resource_x_executor_wait_context;
 static ResourceXAcquisitionRef pcm_resource_x_executor_wait_ref;
+static bool pcm_resource_x_executor_exit_hook_registered;
 
 static bool
 pcm_resource_x_executor_wait_ref_exact(const ResourceXAcquisitionRef *ref)
@@ -5239,6 +5262,26 @@ pcm_resource_x_executor_wait_cleanup(void)
 {
 	pcm_entry_wait_context_cleanup(&pcm_resource_x_executor_wait_context);
 	memset(&pcm_resource_x_executor_wait_ref, 0, sizeof(pcm_resource_x_executor_wait_ref));
+}
+
+static void
+pcm_resource_x_executor_before_shmem_exit(int code pg_attribute_unused(),
+									  Datum arg pg_attribute_unused())
+{
+	/* FATAL/proc_exit bypasses the PG_TRY/PG_FINALLY around the timed wait. */
+	pcm_resource_x_executor_wait_cleanup();
+}
+
+void
+cluster_pcm_lock_register_backend_exit_hook(void)
+{
+	bool backend_or_lms = MyBackendId > 0 || MyBackendType == B_LMS
+												|| MyBackendType == B_LMS_WORKER;
+
+	if (pcm_resource_x_executor_exit_hook_registered || !IsUnderPostmaster || !backend_or_lms)
+		return;
+	before_shmem_exit(pcm_resource_x_executor_before_shmem_exit, (Datum)0);
+	pcm_resource_x_executor_exit_hook_registered = true;
 }
 
 ResourceXApplyResult
@@ -8013,15 +8056,12 @@ pcm_lock_acquire_local(BufferTag tag, PcmLockMode mode, PcmAuthoritySnapshot *re
 								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 								  cluster_node_id)));
 
-	PG_TRY();
+	PG_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
 	{
 		acquired = pcm_lock_acquire_local_pinned(tag, mode, remote_x_out, &wait_context);
 	}
-	PG_FINALLY();
-	{
-		pcm_entry_wait_context_cleanup(&wait_context);
-	}
-	PG_END_TRY();
+	PG_END_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
+	pcm_entry_wait_context_cleanup(&wait_context);
 	return acquired;
 }
 
@@ -9197,7 +9237,6 @@ pcm_normal_stop_scan(bool require_pi_retired, bool retire_pi, BufferTag *tag_out
 					 const char **reason_out)
 {
 	static const ClusterPcmResourceXSlot empty_slot;
-	static const ClusterPcmResourceXMasterState empty_state;
 	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
 	BufferTag observed = { 0 };
 	uint32 observed_slot = PG_UINT32_MAX;
@@ -9210,6 +9249,8 @@ pcm_normal_stop_scan(bool require_pi_retired, bool retire_pi, BufferTag *tag_out
 	bool additional_invalid = false;
 	bool durable_stop_cut;
 	uint32 gate;
+	bool trace = cluster_trace_normal_stop;
+	TimestampTz trace_started = trace ? GetCurrentTimestamp() : 0;
 
 	if (!IsUnderPostmaster || !cluster_enabled || ClusterPcm == NULL || cluster_pcm_htab == NULL
 		|| cluster_pcm_resource_x_slots == NULL || cluster_pcm_resource_x_master_states == NULL
@@ -9354,10 +9395,12 @@ pcm_normal_stop_scan(bool require_pi_retired, bool retire_pi, BufferTag *tag_out
 	 * No diagnostic slot count participates in this proof. */
 	for (uint32 slot = 0; slot < (uint32)pcm_grd_effective; slot++) {
 		const ClusterPcmResourceXSlot *registry = &cluster_pcm_resource_x_slots[slot];
-		const ClusterPcmResourceXMasterState *state = &cluster_pcm_resource_x_master_states[slot];
 		bool invalid = false;
 
 		if (registry->state == PCM_REGISTRY_LIVE) {
+			const ClusterPcmResourceXMasterState *state
+				= &cluster_pcm_resource_x_master_states[slot];
+
 			entry
 				= (struct GrdEntry *)hash_search(cluster_pcm_htab, &registry->tag, HASH_FIND, NULL);
 			invalid = entry == NULL || registry->reserved != 0 || registry->binding_generation == 0
@@ -9368,14 +9411,12 @@ pcm_normal_stop_scan(bool require_pi_retired, bool retire_pi, BufferTag *tag_out
 						  && (entry->registry_slot != slot
 							  || entry->binding_generation != registry->binding_generation));
 		} else if (registry->state == PCM_REGISTRY_EMPTY) {
-			invalid = memcmp(registry, &empty_slot, sizeof(*registry)) != 0
-					  || memcmp(state, &empty_state, sizeof(*state)) != 0;
+			invalid = memcmp(registry, &empty_slot, sizeof(*registry)) != 0;
 		} else if (registry->state == PCM_REGISTRY_TOMBSTONE) {
 			invalid = registry->reserved != 0 || registry->binding_generation == 0
 					  || registry->binding_generation == UINT64_MAX
 					  || registry->retired_authority_generation == 0
-					  || registry->retired_authority_generation == UINT64_MAX
-					  || memcmp(state, &empty_state, sizeof(*state)) != 0;
+					  || registry->retired_authority_generation == UINT64_MAX;
 		} else
 			invalid = true;
 		if (invalid && result == CLUSTER_NORMAL_STOP_INVALID)
@@ -9407,6 +9448,16 @@ done:
 		*slot_out = observed_slot;
 	if (reason_out != NULL)
 		*reason_out = reason;
+	if (trace && CritSectionCount == 0) {
+		bool trace_held_lock = false;
+
+		ForEachLWLockHeldByMe(pcm_normal_stop_note_held_lock, &trace_held_lock);
+		if (!trace_held_lock)
+			ereport(LOG, (errmsg("PCM normal-stop census node=%d post_checkpoint=%d retire_pi=%d"
+								 " result=%d slots=%d elapsed_us=" INT64_FORMAT,
+								 cluster_node_id, require_pi_retired, retire_pi, result,
+								 pcm_grd_effective, GetCurrentTimestamp() - trace_started)));
+	}
 	return result;
 }
 
@@ -9734,6 +9785,11 @@ cluster_pcm_grd_init(void)
 		 * by HC60 apply-fail-closed.
 		 */
 		memset(ClusterPcm, 0, header_size);
+#ifdef USE_ASSERT_CHECKING
+		/* Establish EMPTY once; do not revalidate whole bodies in scans. */
+		for (int slot = 0; slot < pcm_grd_effective; slot++)
+			pcm_resource_x_assert_zero_body(&cluster_pcm_resource_x_master_states[slot]);
+#endif
 		SpinLockInit(&ClusterPcm->trace_lock);
 		pg_atomic_init_u64(&ClusterPcm->trace_active_epoch, 0);
 		ClusterPcm->trace.capacity = pcm_rx_trace_capacity(pcm_grd_effective);
@@ -11924,7 +11980,6 @@ pcm_pi_relation_scan_role(RelFileLocator locator, uint64 formation, uint32 budge
 											 ClusterPcmPiPendingIdentityV1 *pending_out)
 {
 	static const ClusterPcmResourceXSlot empty_slot;
-	static const ClusterPcmResourceXMasterState empty_state;
 	ResourceXGateSnapshot before, after;
 	ClusterPcmPiRelationScanV2 result = CLUSTER_PCM_PI_RELATION_MORE;
 	uint32 position, end;
@@ -11954,16 +12009,14 @@ pcm_pi_relation_scan_role(RelFileLocator locator, uint64 formation, uint32 budge
 	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
 	for (; position < end; position++) {
 		const ClusterPcmResourceXSlot *slot = &cluster_pcm_resource_x_slots[position];
-		const ClusterPcmResourceXMasterState *state
-			= &cluster_pcm_resource_x_master_states[position];
+		const ClusterPcmResourceXMasterState *state;
 		struct GrdEntry *entry;
 		bool active, retained, valid, pending = false, only_local_pi = false;
 		uint32 mode, s_holders, pi_holders;
 		uint32 predicate_mask = 0, pending_projection = 0;
 
 		if (slot->state == PCM_REGISTRY_EMPTY) {
-			if (memcmp(slot, &empty_slot, sizeof(*slot)) != 0
-				|| memcmp(state, &empty_state, sizeof(*state)) != 0)
+			if (memcmp(slot, &empty_slot, sizeof(*slot)) != 0)
 				goto invalid;
 			continue;
 		}
@@ -11972,18 +12025,18 @@ pcm_pi_relation_scan_role(RelFileLocator locator, uint64 formation, uint32 budge
 			goto invalid;
 		if (slot->state == PCM_REGISTRY_TOMBSTONE) {
 			if (slot->retired_authority_generation == 0
-				|| slot->retired_authority_generation == UINT64_MAX
-				|| memcmp(state, &empty_state, sizeof(*state)) != 0)
+				|| slot->retired_authority_generation == UINT64_MAX)
 				goto invalid;
 			continue;
 		}
+		state = &cluster_pcm_resource_x_master_states[position];
 		if (slot->state != PCM_REGISTRY_LIVE || slot->retired_authority_generation != 0
 			|| state->binding_generation != slot->binding_generation)
 			goto invalid;
-		entry = hash_search(cluster_pcm_htab, &slot->tag, HASH_FIND, NULL);
-		if (entry == NULL || entry->registry_slot != position
-			|| entry->binding_generation != slot->binding_generation)
-			goto invalid;
+		/* The registry tag is stable under htab_lock. This is an object
+		 * proof, not a global hash-association census: unrelated LIVE slots
+		 * need no hash lookup. Every selected member retains the full binding
+		 * and owner checks below, including all forks for object drain. */
 		if (!BufTagMatchesRelFileLocator(&slot->tag, &locator))
 			continue;
 		if (object_drain) {
@@ -11991,6 +12044,10 @@ pcm_pi_relation_scan_role(RelFileLocator locator, uint64 formation, uint32 budge
 				goto invalid;
 		} else if (slot->tag.forkNum != MAIN_FORKNUM && slot->tag.forkNum != VISIBILITYMAP_FORKNUM)
 			continue;
+		entry = hash_search(cluster_pcm_htab, &slot->tag, HASH_FIND, NULL);
+		if (entry == NULL || entry->registry_slot != position
+			|| entry->binding_generation != slot->binding_generation)
+			goto invalid;
 		LWLockAcquire(&entry->entry_lock.lock, discard_local ? LW_EXCLUSIVE : LW_SHARED);
 		/* True only admits a terminal N history after its PI has already
 		 * been retired by its original owner. This read never retires it
@@ -15986,7 +16043,7 @@ round_wait_predicate_done:
 	remaining_us = Max(retry_slice_us, UINT64_C(1000));
 	timeout_ms = (long)Min((uint64)timeout_ms, remaining_us / UINT64_C(1000));
 
-	PG_TRY();
+	PG_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
 	{
 		if (cluster_trace_tx_identity)
 			pcm_trace_wait(entry, CLWAIT_SITE_PCM_BOOTSTRAP, PCM_LOCK_MODE_X,
@@ -16006,11 +16063,8 @@ round_wait_predicate_done:
 									  cluster_node_id)));
 		}
 	}
-	PG_FINALLY();
-	{
-		pcm_entry_wait_context_cleanup(&wait_context);
-	}
-	PG_END_TRY();
+	PG_END_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
+	pcm_entry_wait_context_cleanup(&wait_context);
 	return RESOURCE_X_APPLY_APPLIED;
 }
 
@@ -16153,7 +16207,7 @@ cluster_pcm_lock_resource_x_predecessor_wait_exact(const BufferTag *tag, int32 c
 	}
 	remaining_us = Max(requested_sleep_slice_us, UINT64_C(1000));
 	timeout_ms = (long)Min((uint64)LONG_MAX, remaining_us / UINT64_C(1000));
-	PG_TRY();
+	PG_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
 	{
 		if (cluster_trace_tx_identity)
 			pcm_trace_wait(entry, CLWAIT_SITE_PCM_PREDECESSOR, PCM_LOCK_MODE_X,
@@ -16173,11 +16227,8 @@ cluster_pcm_lock_resource_x_predecessor_wait_exact(const BufferTag *tag, int32 c
 							   cluster_node_id)));
 		}
 	}
-	PG_FINALLY();
-	{
-		pcm_entry_wait_context_cleanup(&wait_context);
-	}
-	PG_END_TRY();
+	PG_END_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
+	pcm_entry_wait_context_cleanup(&wait_context);
 	return RESOURCE_X_APPLY_APPLIED;
 }
 
@@ -17393,7 +17444,7 @@ cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
 	if (deadline_ms < (uint64)sleep_ms)
 		sleep_ms = (long)deadline_ms;
 
-	PG_TRY();
+	PG_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
 	{
 		if (cluster_trace_tx_identity)
 			pcm_trace_wait(entry, CLWAIT_SITE_PCM_INSTALL, PCM_LOCK_MODE_X,
@@ -17413,11 +17464,8 @@ cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
 									  cluster_node_id)));
 		}
 	}
-	PG_FINALLY();
-	{
-		pcm_entry_wait_context_cleanup(&wait_context);
-	}
-	PG_END_TRY();
+	PG_END_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
+	pcm_entry_wait_context_cleanup(&wait_context);
 	return RESOURCE_X_APPLY_APPLIED;
 }
 

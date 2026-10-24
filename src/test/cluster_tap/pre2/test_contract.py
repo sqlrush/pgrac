@@ -1,6 +1,7 @@
 """Harness-only negative tests. These do not count as cluster acceptance."""
 import copy
 import unittest
+import contract
 from contract import check_wal, check_reset, check_membership
 
 
@@ -16,6 +17,139 @@ def wal_events():
         dict(kind="retire", contribution="a", proof="p"),
         dict(kind="wal_release", wal="/tmp/wal1"),
     ]
+
+
+WORKLOAD_LANES = ("R/IMG", "I/TT", "H/HOT", "Q/RECEIPT")
+IDENTITY_FIELDS = ("node", "boot_id", "pid", "procno", "backend_start",
+                   "process_incarnation", "sequence_domain")
+CAPTURE = dict(run_id="capture-1", source_sha="a" * 40, source_tree="b" * 40,
+               build_sha="installed-build-1", binary_sha256="c" * 64,
+               config_sha256="d" * 64, harness_sha256="e" * 64,
+               cluster_epoch="7")
+
+
+def workload_identity(**values):
+    result = dict(node="n1", pid=101, procno=1, sequence_domain="r")
+    result.update(values)
+    identity = dict(boot_id="boot-" + result["node"], backend_start="start-1",
+                    process_incarnation="process-1", role="backend")
+    identity.update(result)
+    return identity
+
+
+def identity_key(value):
+    return tuple(value[field] for field in IDENTITY_FIELDS)
+
+
+def workload_events(include_i=True, late_i=False, cleanup=True):
+    identities = [workload_identity(sequence_domain=domain) for domain in ("r", "i", "h", "q")]
+    seq = {identity_key(item): 0 for item in identities}
+    gaps = {key: False for key in seq}
+    events = []
+    predecessors = {}
+
+    def snapshots():
+        return [dict(item, last_seq=seq[identity_key(item)], gap=gaps[identity_key(item)])
+                for item in identities]
+
+    def barrier(name, **extra):
+        event = dict(CAPTURE, kind="barrier", name=name, snapshots=snapshots())
+        event.update(extra)
+        events.append(event)
+
+    def add_event(lane, phase, relation, key, **extra):
+        domain = {"R/IMG": "r", "I/TT": "i", "H/HOT": "h", "Q/RECEIPT": "q"}[lane]
+        identity = next(item for item in identities if item["sequence_domain"] == domain)
+        key_identity = identity_key(identity)
+        seq[key_identity] += 1
+        event = dict(CAPTURE, **identity, kind="event",
+                     event_id="{}-{}".format(domain, seq[key_identity]),
+                     lane=lane, phase=phase,
+                     event_seq=seq[key_identity], relation_locator=relation,
+                     logical_key=key, chain_id=domain + "-chain-1",
+                     predecessor_event_id=predecessors.get(lane))
+        event.update(extra)
+        events.append(event)
+        if lane != "H/HOT" or phase == "update":
+            predecessors[lane] = event["event_id"]
+
+    relations = {
+        "R/IMG": dict(spcOid=11, dbOid=22, relNumber=301, forkNum=0, blockNum=7),
+        "I/TT": dict(spcOid=11, dbOid=22, relNumber=302, forkNum=0, blockNum=8),
+        "H/HOT": dict(spcOid=11, dbOid=22, relNumber=303, forkNum=0, blockNum=9),
+        "Q/RECEIPT": dict(spcOid=11, dbOid=22, relNumber=304, forkNum=0, blockNum=10),
+    }
+    barrier("IDENTITY_SEAL", identities=identities)
+    barrier("BASELINE")
+    add_event("R/IMG", "seed", relations["R/IMG"], "r-key", actual=True)
+    add_event("R/IMG", "request", relations["R/IMG"], "r-key", actual=True)
+    add_event("R/IMG", "serve", relations["R/IMG"], "r-key", actual=True)
+    add_event("R/IMG", "reply", relations["R/IMG"], "r-key", actual=True)
+    add_event("R/IMG", "consume", relations["R/IMG"], "r-key", actual=True)
+    barrier("R/IMG")
+    if include_i:
+        add_event("I/TT", "admit", relations["I/TT"], "i-key", owner="E", actual=True)
+        add_event("I/TT", "publish", relations["I/TT"], "i-key", owner="E", actual=True)
+        add_event("I/TT", "reread", relations["I/TT"], "i-key", owner="E", actual=True)
+    barrier("I/TT", owner="E")
+    if late_i:
+        add_event("I/TT", "publish", relations["I/TT"], "i-key", owner="E",
+                  actual=True, deferred=True)
+    add_event("H/HOT", "update", relations["H/HOT"], "h-key", actual=True)
+    add_event("H/HOT", "hot", relations["H/HOT"], "h-key", actual=True)
+    add_event("H/HOT", "prune", relations["H/HOT"], "h-key", actual=True)
+    barrier("H/HOT")
+    add_event("Q/RECEIPT", "mutation", relations["Q/RECEIPT"], "q-key",
+              receipt_key="receipt-1", actual=True,
+              state=dict(pending=1, receipt=1, grd=1, pcm=1, tt=1))
+    add_event("Q/RECEIPT", "prepare", relations["Q/RECEIPT"], "q-key",
+              receipt_key="receipt-1", actual=True)
+    add_event("Q/RECEIPT", "publish", relations["Q/RECEIPT"], "q-key",
+              receipt_key="receipt-1", actual=True)
+    add_event("Q/RECEIPT", "apply_consume", relations["Q/RECEIPT"], "q-key",
+              receipt_key="receipt-1", actual=True)
+    add_event("Q/RECEIPT", "close", relations["Q/RECEIPT"], "q-key",
+              receipt_key="receipt-1", actual=True)
+    add_event("Q/RECEIPT", "ack", relations["Q/RECEIPT"], "q-key",
+              receipt_key="receipt-1", actual=True)
+    add_event("Q/RECEIPT", "certificate_retire", relations["Q/RECEIPT"], "q-key",
+              receipt_key="receipt-1", actual=True)
+    if cleanup:
+        add_event("Q/RECEIPT", "state_clear", relations["Q/RECEIPT"], "q-key",
+                  receipt_key="receipt-1", actual=True, cleanup_proof="receipt-1",
+                  state=dict(pending=0, receipt=0, grd=0, pcm=0, tt=0))
+    barrier("Q/RECEIPT")
+    barrier("STOP_SEAL", stop_state=dict(pending=0, receipt=0, grd=0, pcm=0, tt=0))
+    return events
+
+
+def workload_remote_return(lane, append_phases, remote=None):
+    """Keep causal phase links but move the middle phases to another identity."""
+    events = workload_events()
+    lane_events = [event for event in events if event.get("lane") == lane]
+    by_phase = {event["phase"]: event for event in lane_events}
+    fields = IDENTITY_FIELDS + ("role",)
+    local = {field: lane_events[0][field] for field in fields}
+    if remote is None:
+        remote = workload_identity(node="n2", pid=202, procno=2,
+                                   sequence_domain=local["sequence_domain"])
+    ends = {lane_events[0]["phase"], lane_events[-1]["phase"]}
+    for event in lane_events:
+        event.update(local if event["phase"] in ends else remote)
+    start = events.index(lane_events[0])
+    events[start:start + len(lane_events)] = [by_phase[phase] for phase in append_phases]
+    events[0]["identities"].append(remote)
+    counts = {identity_key(identity): 0
+              for identity in events[0]["identities"]}
+    for record in events:
+        if record["kind"] == "event":
+            key = identity_key(record)
+            counts[key] += 1
+            record["event_seq"] = counts[key]
+        else:
+            record["snapshots"] = [dict(identity, last_seq=counts[identity_key(identity)], gap=False)
+                for identity in events[0]["identities"]]
+    return events
 
 
 class EvidenceContract(unittest.TestCase):
@@ -99,6 +233,361 @@ class EvidenceContract(unittest.TestCase):
                 bad.pop()
             with self.subTest(changed=changed), self.assertRaises(AssertionError):
                 check_membership(bad, "leave1", "failure2", 50, 100)
+
+
+class WorkloadBarrierContract(unittest.TestCase):
+    def test_full_workload_returns_focused_pass_for_each_lane(self):
+        result = contract.check_workload_contract(workload_events())
+        self.assertEqual(result["overall"], "PASS_FOCUSED_DIAGNOSTIC")
+        self.assertEqual(set(result["lanes"]), set(WORKLOAD_LANES))
+        self.assertTrue(all(status == "PASS_FOCUSED_DIAGNOSTIC"
+                            for status in result["lanes"].values()))
+
+    def test_identity_and_lane_objects_are_sealed_and_disjoint(self):
+        good = workload_events()
+        identity = copy.deepcopy(good)
+        identity[0].pop("binary_sha256")
+        with self.assertRaises(AssertionError):
+            contract.check_workload_contract(identity)
+        for field in ("relation_locator", "logical_key"):
+            bad = copy.deepcopy(good)
+            r_event = next(event for event in bad
+                           if event.get("kind") == "event" and event["lane"] == "R/IMG")
+            q_event = next(event for event in bad
+                           if event.get("kind") == "event" and event["lane"] == "Q/RECEIPT")
+            q_event[field] = copy.deepcopy(r_event[field])
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                contract.check_workload_contract(bad)
+
+    def test_sequence_domains_are_independent_but_gaps_remain_root_open(self):
+        bad = workload_events()
+        r_events = [event for event in bad
+                    if event.get("kind") == "event" and event["lane"] == "R/IMG"]
+        for event in r_events[1:]:
+            event["event_seq"] += 1
+        for barrier in bad:
+            if barrier.get("kind") == "barrier" and barrier["name"] not in ("IDENTITY_SEAL", "BASELINE"):
+                snapshot = next(item for item in barrier["snapshots"]
+                                if item["sequence_domain"] == "r")
+                snapshot["last_seq"] += 1
+                snapshot["gap"] = True
+        result = contract.check_workload_contract(bad)
+        self.assertEqual(result["lanes"]["R/IMG"], "ROOT_OPEN")
+
+    def test_different_blocks_or_forks_do_not_make_relations_disjoint(self):
+        for fork in (0, 1):
+            bad = workload_events()
+            for event in bad:
+                if event.get("lane") == "Q/RECEIPT":
+                    event["relation_locator"]["relNumber"] = 301
+                    event["relation_locator"]["forkNum"] = fork
+            with self.subTest(fork=fork), self.assertRaises(AssertionError):
+                contract.check_workload_contract(bad)
+
+    def test_sequence_summary_preserves_processes_sharing_a_domain(self):
+        events = workload_events()
+        second = workload_identity(node="n2", pid=202, procno=2, sequence_domain="r")
+        events[0]["identities"].append(second)
+        counts = {identity_key(identity): 0 for identity in events[0]["identities"]}
+        for event in events:
+            if event.get("kind") == "event":
+                if event["lane"] == "R/IMG" and event["phase"] in ("serve", "reply"):
+                    event.update(second)
+                key = identity_key(event)
+                counts[key] += 1
+                event["event_seq"] = counts[key]
+            else:
+                event["snapshots"] = [dict(identity, last_seq=counts[identity_key(identity)], gap=False)
+                                      for identity in events[0]["identities"]]
+        result = contract.check_workload_contract(events)
+        self.assertIsInstance(result["sequences"], list)
+        r = [item for item in result["sequences"] if item["sequence_domain"] == "r"]
+        self.assertEqual(r, [dict(events[0]["identities"][0], last_seq=3, gap=False),
+                             dict(second, last_seq=2, gap=False)])
+        self.assertEqual(result["overall"], "PASS_FOCUSED_DIAGNOSTIC")
+        consume = next(event for event in events if event.get("phase") == "consume")
+        events.remove(consume)
+        serve = next(event for event in events if event.get("phase") == "serve")
+        events.insert(events.index(serve), consume)
+        # Cross-process append positions are not a causal clock. Explicit edges
+        # still link seed/request -> serve/reply -> consume at the same barrier.
+        self.assertEqual(contract.check_workload_contract(events)["overall"],
+                         "PASS_FOCUSED_DIAGNOSTIC")
+
+    def test_phase_sets_cannot_join_unrelated_or_unlinked_events(self):
+        for lane in WORKLOAD_LANES:
+            for changed in ("chain_id", "logical_key", "block", "predecessor", "phase_order"):
+                bad = workload_events()
+                lane_events = [event for event in bad if event.get("lane") == lane]
+                target = lane_events[1]
+                if changed == "chain_id":
+                    target["chain_id"] = "unrelated-chain"
+                elif changed == "logical_key":
+                    target["logical_key"] = "unrelated-key"
+                elif changed == "block":
+                    target["relation_locator"] = dict(target["relation_locator"], blockNum=999)
+                elif changed == "predecessor":
+                    target["predecessor_event_id"] = "missing-event"
+                else:
+                    lane_events[0]["phase"], target["phase"] = target["phase"], lane_events[0]["phase"]
+                with self.subTest(lane=lane, changed=changed):
+                    result = contract.check_workload_contract(bad)
+                    self.assertEqual(result["lanes"][lane], "ROOT_OPEN")
+
+    def test_remote_causal_return_cannot_reverse_nonadjacent_local_order(self):
+        for lane, append_phases in [
+                ("I/TT", ("reread", "admit", "publish")),
+                ("R/IMG", ("consume", "seed", "request", "serve", "reply")),
+                ("Q/RECEIPT", ("state_clear", "mutation", "prepare", "publish",
+                               "apply_consume", "close", "ack", "certificate_retire"))]:
+            # Last causal phase is A1, first is A2, and middle phases are B1...
+            # All direct edges cross A/B or advance in B, but together they
+            # contradict A1 -> A2. I/TT is the B2 witness verbatim.
+            with self.subTest(lane=lane):
+                result = contract.check_workload_contract(
+                    workload_remote_return(lane, append_phases))
+                self.assertEqual(result["lanes"][lane], "ROOT_OPEN")
+                self.assertEqual(result["overall"], "ROOT_OPEN")
+
+    def test_remote_causal_return_accepts_consistent_local_order(self):
+        for lane, append_phases in [
+                ("I/TT", ("admit", "reread", "publish")),
+                ("R/IMG", ("seed", "consume", "request", "serve", "reply")),
+                ("Q/RECEIPT", ("mutation", "state_clear", "prepare", "publish",
+                               "apply_consume", "close", "ack", "certificate_retire"))]:
+            # A1 -> A2 agrees with the causal chain even when B's records
+            # arrive after A2; different processes have no append-time order.
+            with self.subTest(lane=lane):
+                result = contract.check_workload_contract(
+                    workload_remote_return(lane, append_phases))
+                self.assertEqual(result["lanes"][lane], "PASS_FOCUSED_DIAGNOSTIC")
+                self.assertEqual(result["overall"], "PASS_FOCUSED_DIAGNOSTIC")
+
+    def test_local_order_does_not_merge_distinct_process_identities(self):
+        for field, other in (("node", "n2"), ("pid", 202), ("procno", 2)):
+            remote = workload_identity(sequence_domain="i")
+            remote[field] = other
+            with self.subTest(field=field):
+                events = workload_remote_return(
+                    "I/TT", ("admit", "reread", "publish"), remote)
+                self.assertEqual(contract.check_workload_contract(events)["overall"],
+                                 "PASS_FOCUSED_DIAGNOSTIC")
+
+    def test_late_deferred_cleanup_cannot_close_the_sealed_q_lane(self):
+        events = workload_events(cleanup=False)
+        retire = next(event for event in events if event.get("phase") == "certificate_retire")
+        cleanup = dict(retire, event_id="q-8", event_seq=8, phase="state_clear",
+                       predecessor_event_id=retire["event_id"], deferred=True,
+                       cleanup_proof=retire["receipt_key"],
+                       state=dict(pending=0, receipt=0, grd=0, pcm=0, tt=0))
+        events.insert(-1, cleanup)
+        next(item for item in events[-1]["snapshots"]
+             if item["sequence_domain"] == "q")["last_seq"] = 8
+        result = contract.check_workload_contract(events)
+        self.assertEqual(result["overall"], "ROOT_OPEN")
+        self.assertEqual(result["lanes"]["Q/RECEIPT"], "ROOT_OPEN")
+
+    def test_q_cleanup_requires_observed_pending_state_and_zero_result(self):
+        for changed in ("missing_before", "empty_before", "missing_after", "nonzero_after"):
+            bad = workload_events()
+            mutation = next(event for event in bad if event.get("phase") == "mutation")
+            cleanup = next(event for event in bad if event.get("phase") == "state_clear")
+            if changed == "missing_before":
+                mutation.pop("state")
+            elif changed == "empty_before":
+                mutation["state"] = dict(pending=0, receipt=0, grd=0, pcm=0, tt=0)
+            elif changed == "missing_after":
+                cleanup.pop("state")
+            else:
+                cleanup["state"]["pending"] = 1
+            with self.subTest(changed=changed):
+                self.assertEqual(contract.check_workload_contract(bad)["overall"], "ROOT_OPEN")
+
+    def test_missing_or_late_deferred_lane_does_not_become_positive(self):
+        missing = contract.check_workload_contract(workload_events(include_i=False))
+        self.assertEqual(missing["lanes"]["I/TT"], "NOT_TRIGGERED")
+        late = contract.check_workload_contract(workload_events(include_i=False, late_i=True))
+        self.assertEqual(late["lanes"]["I/TT"], "NOT_TRIGGERED")
+        partial = workload_events()
+        i_events = [event for event in partial
+                    if event.get("kind") == "event" and event["lane"] == "I/TT"]
+        partial.remove(i_events[-1])
+        with self.assertRaises(AssertionError):
+            contract.check_workload_contract(partial)
+
+    def test_i_tt_owner_and_q_receipt_identity_are_checked(self):
+        wrong_owner = workload_events()
+        next(event for event in wrong_owner
+             if event.get("kind") == "event" and event["lane"] == "I/TT")["owner"] = "C"
+        with self.assertRaises(AssertionError):
+            contract.check_workload_contract(wrong_owner)
+        wrong_domain = workload_events()
+        next(event for event in wrong_domain
+             if event.get("kind") == "event" and event["lane"] == "R/IMG")["sequence_domain"] = "i"
+        with self.assertRaises(AssertionError):
+            contract.check_workload_contract(wrong_domain)
+        wrong_barrier_owner = workload_events()
+        next(event for event in wrong_barrier_owner
+             if event.get("kind") == "barrier" and event["name"] == "I/TT")["owner"] = "C"
+        with self.assertRaises(AssertionError):
+            contract.check_workload_contract(wrong_barrier_owner)
+        wrong_receipt = workload_events()
+        next(event for event in wrong_receipt
+             if event.get("kind") == "event" and event["phase"] == "ack")["receipt_key"] = "other"
+        with self.assertRaises(AssertionError):
+            contract.check_workload_contract(wrong_receipt)
+
+    def test_stop_seal_cannot_hide_pending_state_and_cannot_be_followed(self):
+        result = contract.check_workload_contract(workload_events(cleanup=False))
+        self.assertEqual(result["overall"], "ROOT_OPEN")
+        for field in ("pending", "receipt", "grd", "pcm", "tt"):
+            residual = workload_events()
+            residual[-1]["stop_state"][field] = 1
+            with self.subTest(residual=field):
+                result = contract.check_workload_contract(residual)
+                self.assertEqual(result["overall"], "ROOT_OPEN")
+                self.assertEqual(result["lanes"]["Q/RECEIPT"], "ROOT_OPEN")
+        late = workload_events() + [dict(kind="event", event_id="late", lane="Q/RECEIPT",
+                                         phase="ack", node="n1", pid=101, procno=1,
+                                         sequence_domain="q", event_seq=99,
+                                         relation_locator=dict(spcOid=11, dbOid=22,
+                                                               relNumber=304, forkNum=0,
+                                                               blockNum=10),
+                                         logical_key="q-key", receipt_key="receipt-1",
+                                         actual=True, deferred=True)]
+        with self.assertRaises(AssertionError):
+            contract.check_workload_contract(late)
+
+    def test_barriers_must_be_ordered_and_snapshots_must_match(self):
+        bad_order = workload_events()
+        baseline = next(event for event in bad_order
+                        if event.get("kind") == "barrier" and event["name"] == "BASELINE")
+        r_barrier = next(event for event in bad_order
+                         if event.get("kind") == "barrier" and event["name"] == "R/IMG")
+        baseline_index, r_barrier_index = bad_order.index(baseline), bad_order.index(r_barrier)
+        bad_order[baseline_index], bad_order[r_barrier_index] = r_barrier, baseline
+        with self.assertRaises(AssertionError):
+            contract.check_workload_contract(bad_order)
+        bad_snapshot = workload_events()
+        r_barrier = next(event for event in bad_snapshot
+                         if event.get("kind") == "barrier" and event["name"] == "R/IMG")
+        r_barrier["snapshots"][0]["last_seq"] = 0
+        with self.assertRaises(AssertionError):
+            contract.check_workload_contract(bad_snapshot)
+
+
+class WorkloadIdentityContract(unittest.TestCase):
+    def test_capture_and_process_declarations_are_preserved_without_attestation(self):
+        events = workload_events()
+        original = copy.deepcopy(events)
+        result = contract.check_workload_contract(events)
+        self.assertEqual(result["capture"], CAPTURE)
+        self.assertEqual(result["capture_binding"], "DECLARED_ONLY")
+        self.assertEqual(result["identity_binding"], "DECLARED_ONLY")
+        self.assertEqual(result["field_root"], "OPEN")
+        self.assertIs(result["ready_to_run"], False)
+        self.assertEqual(result["sequences"][0],
+                         dict(events[0]["identities"][0], last_seq=5, gap=False))
+        self.assertEqual(events, original)
+
+    def test_every_record_requires_the_complete_capture(self):
+        for position in (0, 1, 2, -1):
+            for field in CAPTURE:
+                events = workload_events()
+                del events[position][field]
+                with self.subTest(position=position, field=field), self.assertRaises(AssertionError):
+                    contract.check_workload_contract(events)
+
+    def test_foreign_run_build_or_epoch_cannot_supply_a_phase_or_barrier(self):
+        for position in (1, 2, -1):
+            for field, value in CAPTURE.items():
+                events = workload_events()
+                events[position][field] = "9" * len(value)
+                with self.subTest(position=position, field=field), self.assertRaises(AssertionError):
+                    contract.check_workload_contract(events)
+
+    def test_capture_scalars_have_exact_types_and_digest_representations(self):
+        for field, value in (("run_id", " "), ("build_sha", False),
+                             ("source_sha", "short"), ("source_tree", "A" * 40),
+                             ("binary_sha256", 10), ("config_sha256", "d" * 63),
+                             ("harness_sha256", None), ("cluster_epoch", 7),
+                             ("cluster_epoch", "7.0"), ("cluster_epoch", "-1")):
+            events = workload_events()
+            for event in events:
+                event[field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(AssertionError):
+                contract.check_workload_contract(events)
+
+    def test_full_process_identity_is_required_on_seal_event_and_snapshot(self):
+        for location in ("identity", "event", "snapshot"):
+            for field in IDENTITY_FIELDS + ("role",):
+                events = workload_events()
+                target = (events[0]["identities"][0] if location == "identity" else
+                          events[2] if location == "event" else events[-1]["snapshots"][0])
+                del target[field]
+                with self.subTest(location=location, field=field), self.assertRaises(AssertionError):
+                    contract.check_workload_contract(events)
+
+    def test_stale_birth_or_role_is_not_filled_from_sealed_pid(self):
+        for location in ("event", "snapshot"):
+            for field in ("boot_id", "backend_start", "process_incarnation", "role"):
+                events = workload_events()
+                target = events[2] if location == "event" else events[-1]["snapshots"][0]
+                target[field] = "unsealed-" + target[field]
+                with self.subTest(location=location, field=field), self.assertRaises(AssertionError):
+                    contract.check_workload_contract(events)
+
+    def test_identity_scalars_reject_boolean_numbers_and_empty_birth_fields(self):
+        for field, value in (("pid", True), ("pid", 0), ("procno", False),
+                             ("procno", 1.0), ("node", " "), ("boot_id", ""),
+                             ("backend_start", None), ("process_incarnation", 1),
+                             ("role", " "), ("sequence_domain", " ")):
+            events = workload_events()
+            events[0]["identities"][0][field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(AssertionError):
+                contract.check_workload_contract(events)
+
+    def test_one_node_cannot_seal_two_boots_inside_a_capture(self):
+        events = workload_events()
+        for event in events:
+            if event.get("sequence_domain") == "h":
+                event["boot_id"] = "another-boot"
+            for item in event.get("identities", []) + event.get("snapshots", []):
+                if item["sequence_domain"] == "h":
+                    item["boot_id"] = "another-boot"
+        with self.assertRaises(AssertionError):
+            contract.check_workload_contract(events)
+
+    def test_one_process_keeps_its_role_across_sequence_domains(self):
+        events = workload_events()
+        for event in events:
+            if event.get("sequence_domain") == "h":
+                event["role"] = "LMS"
+            for item in event.get("identities", []) + event.get("snapshots", []):
+                if item["sequence_domain"] == "h":
+                    item["role"] = "LMS"
+        with self.assertRaises(AssertionError):
+            contract.check_workload_contract(events)
+
+    def test_pid_and_procno_reuse_has_independent_birth_qualified_prefixes(self):
+        remote = workload_identity(sequence_domain="i", backend_start="start-2",
+                                   process_incarnation="process-2")
+        events = workload_remote_return("I/TT", ("admit", "reread", "publish"), remote)
+        result = contract.check_workload_contract(events)
+        self.assertEqual(result["overall"], "PASS_FOCUSED_DIAGNOSTIC")
+        streams = [item for item in result["sequences"] if item["sequence_domain"] == "i"]
+        self.assertEqual(streams, [dict(events[0]["identities"][1], last_seq=2, gap=False),
+                                  dict(remote, last_seq=1, gap=False)])
+        # A stale generation cannot borrow the old generation's sequence prefix.
+        publish = next(event for event in events if event.get("phase") == "publish")
+        publish["event_seq"] = 3
+        for barrier in events:
+            if barrier["kind"] == "barrier" and barrier["name"] in (
+                    "I/TT", "H/HOT", "Q/RECEIPT", "STOP_SEAL"):
+                snapshot = next(item for item in barrier["snapshots"]
+                                if identity_key(item) == identity_key(remote))
+                snapshot.update(last_seq=3, gap=True)
+        self.assertEqual(contract.check_workload_contract(events)["lanes"]["I/TT"], "ROOT_OPEN")
 
 
 if __name__ == "__main__":
