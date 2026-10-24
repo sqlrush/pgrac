@@ -3383,7 +3383,9 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(112);
+	UT_PLAN(114);
+	UT_RUN(test_cold_committed_original_wal_factory_and_all_physical_namespaces);
+	UT_RUN(test_cold_committed_original_wal_source_and_other_namespace_drift_refuse);
 	UT_RUN(test_census_open_original_wal_physical_pairs_and_owned_fd);
 	UT_RUN(test_census_open_initial_gates_output_and_budgets);
 	UT_RUN(test_census_open_checkpoint_refusal_and_error_cleanup);

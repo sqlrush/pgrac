@@ -1782,6 +1782,67 @@ census_execute_pending(const ClusterRelmapRetentionCensus *census)
 }
 
 bool
+cluster_relmap_retention_census_committed_cold(ClusterRelmapRetentionCensus *census, Oid dbid,
+											   ClusterRelmapCensusCommitted *out)
+{
+	volatile bool accepted = false;
+
+	if (out == NULL)
+		return false;
+	for (const ClusterRelmapRetentionCensus *current = census; current != NULL;
+		 current = current->cold_parent)
+		if (census_recovery_output_overlap(current, out, sizeof(*out)))
+			return false;
+	memset(out, 0, sizeof(*out));
+	if (census == NULL || census->result != CLUSTER_RELMAP_CENSUS_DRAINED
+		|| !census->cold_input_bound || census->origin_count != 1 || !census_open_context())
+		return false;
+	PG_TRY();
+	{
+		do {
+			ClusterRelmapCensusRecovery pair = { 0 };
+			ClusterRelmapCensusCommitted committed = { 0 };
+			uint8 saved_pins[32], current_pins[32];
+			ClusterRecoveryRootsResult result;
+			ClusterRecoveryRootsEvent event;
+
+			if (!census->checked || !census_recovery_current(census)
+				|| census_execute_pending(census)
+				|| !census_recovery_pins_digest(census, saved_pins)
+				|| !census_recovery_pair(census, dbid, &pair) || pair.pending.has_pending)
+				break;
+			/* A selected clean pair cannot hide drift in another namespace,
+			 * including new physical files with no original WAL reference. */
+			result = cluster_recovery_root_set_recheck_begin(census->roots);
+			while (result < CLUSTER_RECOVERY_ROOTS_OBSERVED) {
+				CHECK_FOR_INTERRUPTS();
+				if (!census_open_context())
+					break;
+				result = cluster_recovery_root_set_step(census->roots, &event);
+			}
+			if (result != CLUSTER_RECOVERY_ROOTS_OBSERVED || !census_recovery_current(census)
+				|| !census_recovery_pins_digest(census, current_pins)
+				|| memcmp(saved_pins, current_pins, sizeof(saved_pins)) != 0
+				|| census_execute_pending(census) || !census_open_context())
+				break;
+			committed.identity = pair.identity;
+			committed.generation = pair.pending.committed_generation;
+			committed.map = pair.pending.committed;
+			committed.present = true;
+			*out = committed;
+			accepted = true;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		if (!accepted)
+			census_failed(census, CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+	}
+	PG_END_TRY();
+	return accepted;
+}
+
+bool
 cluster_relmap_retention_census_execute_cold(uint16 origin, size_t root_budget,
 											 size_t memory_budget, size_t payload_budget,
 											 ClusterRelmapRetentionCensus **out)

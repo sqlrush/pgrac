@@ -1013,11 +1013,18 @@ ProcessInterrupts(void)
 #include "test_cluster_relmap_census_execution_batch.inc"
 #include "test_cluster_relmap_census_cold_initial.inc"
 #include "test_cluster_relmap_census_execute.inc"
+#include "test_cluster_relmap_census_committed_cold.inc"
 
 int
 main(void)
 {
-	UT_PLAN(108);
+	UT_PLAN(114);
+	UT_RUN(test_cold_committed_reads_clean_and_post_clear_exact_namespaces);
+	UT_RUN(test_cold_committed_initial_gates_preserve_unfinished_and_original_custody);
+	UT_RUN(test_cold_committed_pending_and_missing_namespace_never_mean_empty);
+	UT_RUN(test_cold_committed_whole_root_and_pair_changes_are_sticky);
+	UT_RUN(test_cold_committed_io_rechecks_source_context_and_all_ancestor_pins);
+	UT_RUN(test_cold_committed_output_aliases_preserve_current_and_owned_parent_storage);
 	UT_RUN(test_census_execute_clean_input_needs_no_native_attempt);
 	UT_RUN(test_census_execute_all_pending_owns_entire_local_chain);
 	UT_RUN(test_census_execute_entry_gates_and_budgets_preserve_output);

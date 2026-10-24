@@ -114,6 +114,24 @@ extern bool cluster_relmap_retention_census_execute_cold(uint16 origin, size_t r
 														 size_t payload_budget,
 														 ClusterRelmapRetentionCensus **out);
 
+/* Read one committed namespace after the original produced single-origin
+ * census is DRAINED and has no pending pins. Use its original held ROOT/fd,
+ * full pair hashes and decoder, then recheck the entire physical ROOT and
+ * original source/serial/context/all pins before publishing a copied map.
+ * No native call, configured-path read, COMPLETE or release is performed.
+ * All original qualification/lifetime preconditions above still apply.
+ *
+ * NULL/known current or predecessor input overlap refuses unchanged. Other
+ * outputs clear on refusal/ERROR. Missing initial context or an unfinished/
+ * unbound cursor refuses without consuming it; entered failure invalidates
+ * only local observations, preserving pins/debt. Missing namespace is failure,
+ * never an empty map. Earlier copies must be discarded after any later
+ * refusal. Repeated reads remain provisional under the same original owner;
+ * destroy dependents before ending that owner's protections/fd lifetime. */
+extern bool cluster_relmap_retention_census_committed_cold(ClusterRelmapRetentionCensus *census,
+														   Oid dbid,
+														   ClusterRelmapCensusCommitted *out);
+
 /* At most128 metadata candidates, one <=BLCKSZ original file read, or one
  * existing whole-ROOT recheck step. Require global/base and both exact v2
  * copies for global and every canonical physical base/db directory, including
