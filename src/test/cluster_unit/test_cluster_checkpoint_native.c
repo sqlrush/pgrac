@@ -37,6 +37,8 @@
 #include "utils/timestamp.h"
 #include "port/pg_crc32c.h"
 
+struct ClusterRecoveryCheckpointScopeV1;
+
 #undef printf
 #undef fprintf
 #include "unit_test.h"
@@ -854,7 +856,7 @@ publish(void)
 {
 	if (sigsetjmp(error_boundary, 1))
 		return false;
-	ClusterCheckpointV3Publish(&candidate, 220, NULL);
+	ClusterCheckpointV3Publish(&candidate, 220, NULL, NULL);
 	return true;
 }
 
@@ -1242,7 +1244,7 @@ startup_publish(void)
 {
 	if (sigsetjmp(error_boundary, 1))
 		return false;
-	ClusterCheckpointV3Publish(&candidate, 220, NULL);
+	ClusterCheckpointV3Publish(&candidate, 220, NULL, NULL);
 	return true;
 }
 

@@ -8967,9 +8967,12 @@ wait_for_owner:
 	}
 }
 
+struct ClusterRecoveryCheckpointScopeV1;
+
 static void
 ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end,
-						   const uint8 native_window[160])
+						   const uint8 native_window[160],
+						   const struct ClusterRecoveryCheckpointScopeV1 *recovery_scope)
 {
 	ClusterWalSourceRef ref;
 	ControlFileData selected;
@@ -8981,6 +8984,8 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end,
 	bool wait_logged = false;
 	ClusterCfAttemptObservation waiting = { 0 };
 
+	/* This branch's native caller supplies no recovery scope. */
+	(void)recovery_scope;
 	if (MyBackendType == B_STARTUP) {
 		ClusterStartupCheckpointPublish(candidate, end);
 		return;
@@ -9769,7 +9774,7 @@ CreateCheckPoint(int flags)
 		(void)cluster_relmap_recovery_checkpoint_window_finish(
 			&native_window, &checkPoint, ProcLastRecPtr, recptr, native_window_bytes);
 	if (cluster_shared_config)
-		ClusterCheckpointV3Publish(&v3_checkpoint, recptr, native_window_bytes);
+		ClusterCheckpointV3Publish(&v3_checkpoint, recptr, native_window_bytes, NULL);
 
 	/* PGRAC (S07): with this checkpoint's ROOT published, move the physical
 	 * retention lower forward when the complete retained input allows it.

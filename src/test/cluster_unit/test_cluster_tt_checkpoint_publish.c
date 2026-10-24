@@ -148,14 +148,18 @@ publish_flush(XLogRecPtr end)
 	publish_wal_end = end;
 }
 
+struct ClusterRecoveryCheckpointScopeV1;
+
 static void
 ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end,
-						   const uint8 window[160])
+						   const uint8 window[160],
+						   const struct ClusterRecoveryCheckpointScopeV1 *recovery_scope)
 {
 	publish_calls++;
 	publish_order_ok
-		&= !publish_lock_held && CritSectionCount == 0 && publish_tt_durable()
-		   && publish_wal_end == end && end == publish_end && candidate->checkPoint == publish_start
+		&= recovery_scope == NULL && !publish_lock_held && CritSectionCount == 0
+		   && publish_tt_durable() && publish_wal_end == end && end == publish_end
+		   && candidate->checkPoint == publish_start
 		   && memcmp(&candidate->checkPointCopy, &publish_registered, sizeof(publish_registered))
 				  == 0;
 	if (publish_fault == PUBLISH_ROOT)
