@@ -57,6 +57,8 @@ extern bool cluster_relmap_recovery_terminal_scan_get_v1(ClusterRelmapTerminalSc
 														 ClusterRelmapTerminalObservationV1 *out);
 /* Dormant original-cold-scope read. Revalidates the borrowed prefix before
  * and after original native base I/O; requires exact origin/raw xid/status.
+ * Requires the complete retained native stream to preserve the selected CLOG
+ * page after its terminal record; zero/truncate/unknown CLOG carriers refuse.
  * Binds the full disk page into the source fingerprint. No caller-provided
  * image or qualification flag. Once begun, ERROR/refusal invalidates the scan;
  * nonoverlap refusal clears all output, overlap is unchanged. The native

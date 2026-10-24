@@ -2138,6 +2138,10 @@ terminal_prefix_fixture(bool aborting, unsigned fault)
 	at = lower + MAXALIGN(SizeOfXLogRecord + 2 + sizeof(timestamp));
 	if (fault == 4 || fault == 5 || fault == 6)
 		at += MAXALIGN(SizeOfXLogRecord + 2 + sizeof(timestamp));
+	if (fault == 14 || fault == 27)
+		at += MAXALIGN(SizeOfXLogRecord + 2 + sizeof(int));
+	if (fault == 28)
+		at += MAXALIGN(SizeOfXLogRecord + 2 + sizeof(xl_clog_truncate));
 	a->state = DB_IN_PRODUCTION;
 	a->checkpoint = at;
 	a->checkpoint_copy.redo
@@ -2156,9 +2160,20 @@ terminal_prefix_fixture(bool aborting, unsigned fault)
 	source.claim.max_config_generation = root.header.v2.config_generation;
 	memcpy(source.claim.claim_sha256, root.refs[0].claim_sha256, 32);
 	source.timeline = snapshot->tail_tli;
-	terminal = terminal_test_record(
-		&source, lower, 0, RM_XACT_ID, aborting ? XLOG_XACT_ABORT : XLOG_XACT_COMMIT,
-		fault == 2 || fault == 3 ? 98 : 99, &timestamp, sizeof(timestamp));
+	if (fault == 14 || fault == 28) {
+		int page = 0;
+		xl_clog_truncate trunc = { .pageno = 0, .oldestXact = 80, .oldestXactDb = 123 };
+		WalTestRecord before = terminal_test_record(
+			&source, lower, 0, RM_CLOG_ID, fault == 14 ? CLOG_ZEROPAGE : CLOG_TRUNCATE, 0,
+			fault == 14 ? (const void *)&page : (const void *)&trunc,
+			fault == 14 ? sizeof(page) : sizeof(trunc));
+		terminal = terminal_test_record(&source, before.exclusive_end, before.record_start,
+										RM_XACT_ID, aborting ? XLOG_XACT_ABORT : XLOG_XACT_COMMIT,
+										99, &timestamp, sizeof(timestamp));
+	} else
+		terminal = terminal_test_record(
+			&source, lower, 0, RM_XACT_ID, aborting ? XLOG_XACT_ABORT : XLOG_XACT_COMMIT,
+			fault == 2 || fault == 3 ? 98 : 99, &timestamp, sizeof(timestamp));
 	if (fault == 4 || fault == 5 || fault == 6)
 		terminal = terminal_test_record(&source, terminal.exclusive_end, terminal.record_start,
 										fault == 6 ? RM_XLOG_ID : RM_XACT_ID,
@@ -2166,6 +2181,11 @@ terminal_prefix_fixture(bool aborting, unsigned fault)
 										: fault == 4 ? XLOG_XACT_ABORT
 													 : XLOG_XACT_COMMIT,
 										fault == 6 ? 0 : 99, &timestamp, sizeof(timestamp));
+	if (fault == 27) {
+		int page = 0;
+		terminal = terminal_test_record(&source, terminal.exclusive_end, terminal.record_start,
+										RM_CLOG_ID, CLOG_ZEROPAGE, 0, &page, sizeof(page));
+	}
 	checkpoint = terminal_test_record(&source, a->checkpoint, terminal.record_start, RM_XLOG_ID,
 									  XLOG_CHECKPOINT_ONLINE, 0, &a->checkpoint_copy,
 									  sizeof(a->checkpoint_copy));
@@ -2192,6 +2212,25 @@ terminal_prefix_fixture(bool aborting, unsigned fault)
 	if (fault == 11)
 		tail = terminal_test_record(&source, tail.exclusive_end, tail.record_start, RM_XACT_ID,
 									XLOG_XACT_PREPARE, 98, &timestamp, sizeof(timestamp));
+	if (fault >= 12 && fault <= 26 && fault != 14) {
+		int page = fault == 13 ? 1 : fault == 18 ? -1 : fault == 19 ? 131072 : 0;
+		xl_clog_truncate trunc = { .pageno = fault == 22 ? 1 : 0,
+								   .oldestXact = fault == 15   ? 100
+												 : fault == 21 ? 2
+															   : 80,
+								   .oldestXactDb = 123 };
+		bool truncate = fault == 15 || fault == 16 || (fault >= 20 && fault <= 22);
+		uint8 info = fault == 23   ? 0x20
+					 : fault == 26 ? 1
+					 : truncate	   ? CLOG_TRUNCATE
+								   : CLOG_ZEROPAGE;
+		tail = terminal_test_record(
+			&source, tail.exclusive_end, tail.record_start, RM_CLOG_ID, info, fault == 24 ? 98 : 0,
+			truncate || fault == 25 ? (const void *)&trunc : (const void *)&page,
+			fault == 25 ? sizeof(trunc)
+			: truncate	? sizeof(trunc) - (fault == 20)
+						: sizeof(page) - (fault == 17));
+	}
 	tail = terminal_test_record(&source, tail.exclusive_end, tail.record_start, RM_XLOG_ID,
 								XLOG_NOOP, fault == 7 ? 99 : 0, "abc", 3);
 	window.system_identifier = TEST_SYSID;
@@ -2274,6 +2313,9 @@ cluster_clog_native_recovery_base_read_v1(int origin, TransactionId xid,
 											: prefix_base_status;
 	out->page_number = xid / (BLCKSZ * 4) + (prefix_base_fault == 10);
 	memset(out->image, 0x42, sizeof(out->image));
+	/* Model the original native reader's status/image agreement. */
+	out->image[(xid / 4) % BLCKSZ] &= ~(3 << ((xid % 4) * 2));
+	out->image[(xid / 4) % BLCKSZ] |= prefix_base_status << ((xid % 4) * 2);
 	out->image[BLCKSZ - 1] = prefix_base_last_byte;
 	if (prefix_base_fault == 6)
 		inputs_pin_current = false;
@@ -2285,10 +2327,12 @@ cluster_clog_native_recovery_base_read_v1(int origin, TransactionId xid,
 }
 
 static ClusterRelmapTerminalScanV1 *
-prefix_base_setup(ClusterWalInputsV1 **inputs, bool aborted, bool prefix)
+prefix_base_setup_fault(ClusterWalInputsV1 **inputs, bool aborted, bool prefix,
+						unsigned source_fault)
 {
 	ClusterRelmapTerminalScanV1 *scan = NULL;
-	*inputs = prefix ? terminal_prefix_fixture(aborted, 0) : terminal_test_fixture(0, aborted, 0);
+	*inputs = prefix ? terminal_prefix_fixture(aborted, source_fault)
+					 : terminal_test_fixture(0, aborted, 0);
 	prefix_base_expected = *cluster_wal_inputs_at_v1(*inputs, 0);
 	prefix_base_fault = prefix_base_reads = prefix_base_scope_checks = 0;
 	prefix_base_status = aborted ? TRANSACTION_STATUS_ABORTED : TRANSACTION_STATUS_COMMITTED;
@@ -2299,6 +2343,68 @@ prefix_base_setup(ClusterWalInputsV1 **inputs, bool aborted, bool prefix)
 															FullTransactionIdFromU64(99), &scan)))
 		abort();
 	return scan;
+}
+
+static ClusterRelmapTerminalScanV1 *
+prefix_base_setup(ClusterWalInputsV1 **inputs, bool aborted, bool prefix)
+{
+	return prefix_base_setup_fault(inputs, aborted, prefix, 0);
+}
+
+UT_TEST(test_terminal_native_base_retains_only_undestroyed_original_page)
+{
+	const unsigned cases[] = { 12, 13, 14, 15, 16, 27, 28 };
+	int saved = cluster_node_id;
+	cluster_node_id = 1;
+	for (unsigned i = 0; i < lengthof(cases); i++) {
+		unsigned fault = cases[i];
+		bool allowed = fault == 13 || fault == 14 || fault == 28;
+		ClusterWalInputsV1 *inputs = NULL;
+		ClusterRelmapTerminalScanV1 *scan = prefix_base_setup_fault(&inputs, i % 2, true, fault);
+		ClusterRelmapTerminalBaseObservationV1 out, zero = { 0 };
+		ClusterRelmapTerminalObservationV1 terminal;
+		/* A valid terminal observation is still available before requesting
+		 * a native base; page lifetime is an additional independent gate. */
+		UT_ASSERT(cluster_relmap_recovery_terminal_scan_get_v1(scan, &terminal));
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT_EQ(cluster_relmap_recovery_terminal_prefix_base_read_v1(scan, &out), allowed);
+		UT_ASSERT_EQ(prefix_base_reads, allowed ? 1 : 0);
+		if (allowed) {
+			UT_ASSERT_EQ(out.terminal.requested_top_full_xid, 99);
+			UT_ASSERT_EQ(out.native_base.status, prefix_base_status);
+			UT_ASSERT(cluster_relmap_recovery_terminal_scan_get_v1(scan, &terminal));
+		} else {
+			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+			UT_ASSERT(!cluster_relmap_recovery_terminal_prefix_base_read_v1(scan, &out));
+			UT_ASSERT(!cluster_relmap_recovery_terminal_scan_get_v1(scan, &terminal));
+		}
+		cluster_relmap_recovery_terminal_scan_release_v1(&scan);
+		UT_ASSERT(inputs_pin_held);
+		cold_census_done(&inputs);
+	}
+	cluster_node_id = saved;
+}
+
+UT_TEST(test_terminal_native_base_refuses_unknown_or_malformed_clog_carriers)
+{
+	const unsigned cases[] = { 17, 18, 19, 20, 21, 22, 23, 24, 25, 26 };
+	int saved = cluster_node_id;
+	cluster_node_id = 1;
+	for (unsigned i = 0; i < lengthof(cases); i++) {
+		ClusterWalInputsV1 *inputs = NULL;
+		ClusterRelmapTerminalScanV1 *scan = prefix_base_setup_fault(&inputs, false, true, cases[i]);
+		ClusterRelmapTerminalBaseObservationV1 out, zero = { 0 };
+		ClusterRelmapTerminalObservationV1 terminal;
+		UT_ASSERT(cluster_relmap_recovery_terminal_scan_get_v1(scan, &terminal));
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT(!cluster_relmap_recovery_terminal_prefix_base_read_v1(scan, &out));
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0 && prefix_base_reads == 0);
+		UT_ASSERT(!cluster_relmap_recovery_terminal_scan_get_v1(scan, &terminal));
+		cluster_relmap_recovery_terminal_scan_release_v1(&scan);
+		UT_ASSERT(inputs_pin_held);
+		cold_census_done(&inputs);
+	}
+	cluster_node_id = saved;
 }
 
 UT_TEST(test_terminal_prefix_native_base_binds_full_image_and_source)
@@ -2642,7 +2748,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(46);
+	UT_PLAN(48);
 	UT_RUN(test_retained_relmap_matches_each_selected_namespace);
 	UT_RUN(test_retained_relmap_requires_exact_pending);
 	UT_RUN(test_retained_relmap_scans_suffix_and_other_source);
@@ -2677,6 +2783,8 @@ main(int argc, char **argv)
 	UT_RUN(test_census_side_collector_error_invalidates_window);
 	UT_RUN(test_census_side_wal_keeps_real_empty_initializer);
 	UT_RUN(test_census_side_wal_requires_real_empty_initializer);
+	UT_RUN(test_terminal_native_base_retains_only_undestroyed_original_page);
+	UT_RUN(test_terminal_native_base_refuses_unknown_or_malformed_clog_carriers);
 	UT_RUN(test_terminal_prefix_native_base_binds_full_image_and_source);
 	UT_RUN(test_terminal_prefix_native_base_rejects_scope_and_native_mismatch_sticky);
 	UT_RUN(test_terminal_prefix_native_base_error_keeps_output_and_original_pins);

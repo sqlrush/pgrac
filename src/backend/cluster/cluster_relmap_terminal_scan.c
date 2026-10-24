@@ -21,7 +21,7 @@ struct ClusterRelmapTerminalScanV1 {
 	ClusterRelmapTerminalObservationV1 observation;
 	pg_cryptohash_ctx *hash;
 	XLogRecPtr last_end;
-	bool checkpoint_seen, terminal_seen, failed, prefix_only;
+	bool checkpoint_seen, terminal_seen, failed, prefix_only, native_base_retained;
 };
 
 static void
@@ -97,6 +97,47 @@ terminal_scan_xact(ClusterRelmapTerminalScanV1 *scan, XLogReaderState *reader)
 	return true;
 }
 
+/* Native CLOG lifecycle is independent of finding a terminal record. Keep
+ * observing the full source even after a base-invalidating operation, so the
+ * original cut/ROOT checks still apply to the terminal-only observation. */
+static bool
+terminal_scan_clog_retains_base(const ClusterRelmapTerminalScanV1 *scan, XLogReaderState *reader)
+{
+	const char *data = XLogRecGetData(reader);
+	uint32 length = XLogRecGetDataLen(reader);
+	uint8 info = XLogRecGetInfo(reader);
+	uint32 per_page = BLCKSZ * 4; /* Original native two-bit CLOG geometry. */
+	TransactionId target = (TransactionId)scan->observation.requested_top_full_xid;
+
+	if (XLogRecGetXid(reader) != InvalidTransactionId || XLogRecMaxBlockId(reader) >= 0
+		|| reader->record->has_page_version_edge || XLogRecGetOrigin(reader) != InvalidRepOriginId
+		|| TransactionIdIsValid(reader->record->toplevel_xid) || data == NULL)
+		return false;
+	if (info == CLOG_ZEROPAGE) {
+		int page;
+		if (length != sizeof(page))
+			return false;
+		memcpy(&page, data, sizeof(page));
+		if (page < 0 || (uint64)page > UINT32_MAX / per_page)
+			return false;
+		return !scan->terminal_seen || (uint32)page != target / per_page;
+	}
+	if (info == CLOG_TRUNCATE) {
+		xl_clog_truncate trunc;
+		if (length != sizeof(trunc))
+			return false;
+		memcpy(&trunc, data, sizeof(trunc));
+		if (trunc.pageno < 0 || !TransactionIdIsNormal(trunc.oldestXact)
+			|| (uint64)trunc.pageno != trunc.oldestXact / per_page)
+			return false;
+		/* The native cutoff is raw32. Without an independently qualified
+		 * cutoff era, even an apparently older cutoff cannot prove retained
+		 * FullXid lifetime after this terminal. Do not guess wrap ordering. */
+		return !scan->terminal_seen;
+	}
+	return false;
+}
+
 static bool
 terminal_scan_visit(XLogReaderState *reader, void *arg)
 {
@@ -144,6 +185,9 @@ terminal_scan_visit(XLogReaderState *reader, void *arg)
 	if ((scan->terminal_seen && XLogRecGetXid(reader) == target)
 		|| (XLogRecGetRmid(reader) == RM_XACT_ID && !terminal_scan_xact(scan, reader)))
 		return false;
+	if (scan->prefix_only && XLogRecGetRmid(reader) == RM_CLOG_ID
+		&& !terminal_scan_clog_retains_base(scan, reader))
+		scan->native_base_retained = false;
 	if (scan->observation.records == UINT64_MAX
 		|| !cluster_recovery_record_hash_update(scan->hash, reader))
 		return false;
@@ -200,6 +244,7 @@ terminal_scan(ClusterWalInputsV1 *inputs, uint32 index, FullTransactionId reques
 	scan = palloc0(sizeof(*scan));
 	scan->pid = getpid();
 	scan->prefix_only = prefix_only;
+	scan->native_base_retained = prefix_only;
 	scan->inputs = inputs;
 	scan->index = index;
 	scan->count = count;
@@ -296,8 +341,8 @@ cluster_relmap_recovery_terminal_prefix_base_read_v1(ClusterRelmapTerminalScanV1
 	/* Original owner/ROOT/native I/O can ERROR. Never revive this private
 	 * observation until all source and image checks have succeeded. */
 	scan->failed = true;
-	if (CritSectionCount != 0 || !scan->prefix_only || scan->observation.post_flush_issued == 0
-		|| scan->observation.prefix_end == 0
+	if (CritSectionCount != 0 || !scan->prefix_only || !scan->native_base_retained
+		|| scan->observation.post_flush_issued == 0 || scan->observation.prefix_end == 0
 		|| scan->observation.window.origin
 			   != scan->observation.source.claim.identity.origin_node_id)
 		return false;
