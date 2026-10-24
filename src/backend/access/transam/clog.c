@@ -1030,6 +1030,105 @@ cluster_clog_native_terminal_sync_v1(TransactionId xid, ClusterClogNativeTermina
 	return true;
 }
 
+/* D3 durable native base input. No status is taken from the recoverer's
+ * XactCtl/cache, and no missing page can be justified by this read. The
+ * original cold authority and origin truncate owner remain mandatory. */
+bool
+cluster_clog_native_recovery_base_read_v1(int origin, TransactionId xid,
+										  ClusterClogNativeBaseV1 *out)
+{
+	ClusterClogNativeBaseV1 result = { 0 };
+	PGAlignedBlock readback;
+	SlruCtl ctl;
+	LWLock *lock;
+	struct stat before, opened, after;
+	char path[MAXPGPATH];
+	int page, length;
+	volatile int fd = -1;
+	volatile bool locked = false, ok = false;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!enableFsync || CritSectionCount != 0 || !TransactionIdIsNormal(xid)
+		|| LWLockHeldByMe(XidGenLock) || LWLockHeldByMe(XactTruncationLock)
+		|| LWLockHeldByMe(XactSLRULock) || !clog_recovery_permitted(origin))
+		return false;
+	ctl = &ClogRecoveryCtl[origin];
+	lock = &ClogRecoveryLocks[origin * 2 + 1].lock;
+	if (LWLockHeldByMe(lock) || LWLockHeldByMe(ctl->shared->ControlLock))
+		return false;
+	page = TransactionIdToPage(xid);
+	length = snprintf(path, sizeof(path), "%s/%04X", ctl->Dir, page / SLRU_PAGES_PER_SEGMENT);
+	if (length < 0 || length >= sizeof(path))
+		return false;
+
+	PG_TRY();
+	{
+		LWLockAcquire(lock, LW_EXCLUSIVE);
+		locked = true;
+		if (clog_recovery_directory_ready(origin)
+			&& clog_recovery_page_identity(ctl, page, &before)) {
+			fd = OpenTransientFile(path, O_RDWR | O_NOFOLLOW | O_CLOEXEC | PG_BINARY);
+			ok = fd >= 0 && fstat(fd, &opened) == 0 && clog_recovery_same_file(&before, &opened)
+				 && clog_recovery_sync(ctl, -1, NULL);
+			if (ok) {
+				pgstat_report_wait_start(WAIT_EVENT_SLRU_FLUSH_SYNC);
+				ok = pg_fsync(fd) == 0;
+				pgstat_report_wait_end();
+			}
+			if (ok) {
+				ok = pg_pread(fd, readback.data, BLCKSZ,
+							  (off_t)(page % SLRU_PAGES_PER_SEGMENT) * BLCKSZ)
+						 == BLCKSZ
+					 && fstat(fd, &after) == 0 && clog_recovery_same_file(&before, &after)
+					 && clog_recovery_page_identity(ctl, page, &after)
+					 && clog_recovery_same_file(&before, &after);
+				if (ok) {
+					result.status = ((uint8)readback.data[TransactionIdToByte(xid)]
+									 >> (TransactionIdToBIndex(xid) * CLOG_BITS_PER_XACT))
+									& CLOG_XACT_BITMASK;
+					ok = result.status == TRANSACTION_STATUS_COMMITTED
+						 || result.status == TRANSACTION_STATUS_ABORTED;
+				}
+			}
+		}
+		if (fd >= 0) {
+			int closing = fd;
+			fd = -1;
+			if (CloseTransientFile(closing) != 0)
+				ok = false;
+		}
+		if (ok)
+			ok = clog_recovery_directory_ready(origin);
+	}
+	PG_CATCH();
+	{
+		pgstat_report_wait_end();
+		if (fd >= 0) {
+			int closing = fd;
+			fd = -1;
+			(void)CloseTransientFile(closing);
+		}
+		if (locked && LWLockHeldByMe(lock)) {
+			HOLD_INTERRUPTS();
+			LWLockRelease(lock);
+		}
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (locked)
+		LWLockRelease(lock);
+	if (!ok)
+		return false;
+	result.origin = origin;
+	result.xid = xid;
+	result.page_number = page;
+	memcpy(result.image, readback.data, BLCKSZ);
+	*out = result;
+	return true;
+}
+
 typedef enum ClogRecoveryAccess {
 	CLOG_RECOVERY_PREFLIGHT,
 	CLOG_RECOVERY_WRITE,
