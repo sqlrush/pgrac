@@ -876,8 +876,10 @@ cluster_heap_freeze_prepare_xmin_v1(
 	const ClusterHeapFreezeTupleInputV1 *tuple;
 	HeapTupleFreeze plan;
 
+	/* Unselected carriers may remain unproven. Every supplied proof must be
+	 * exact/current, and the selected row must independently match its proof. */
 	if (out == NULL
-		|| freeze_validate_carrier_proofs(page, proofs, current_fence, true)
+		|| freeze_validate_carrier_proofs(page, proofs, current_fence, false)
 			!= CLUSTER_HEAP_FREEZE_PROOF_PROVEN
 		|| page->page_lsn != current_fence->page_lsn
 		|| page->page_version != current_fence->page_version

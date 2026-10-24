@@ -342,6 +342,9 @@ struct HeapTupleFreeze;
  * The independently qualified creator must also equal the complete original
  * FullXid carried by the matched row and its exact canonical creation proof;
  * missing identities or equal raw XIDs from different epochs cannot qualify.
+ * Unselected page carriers may be unproven. Every supplied proof is still
+ * validated, and this row must match its own exact committed creation proof;
+ * accepting a subset does not qualify the whole page or any unselected row.
  */
 extern bool cluster_heap_freeze_prepare_xmin_v1(
 	const ClusterHeapFreezePageBatchV1 *page,
@@ -393,6 +396,8 @@ extern bool cluster_heap_freeze_select_xmin_candidates_v1(
  * later row, duplicate physical offset or ambiguous native conflict horizon.
  * The caller supplies capacity for out_plans and independently qualifies the
  * original identities and finite F/H bounds under the single-target contract.
+ * Proofs may cover only selected carriers; any unproven selected row refuses
+ * the entire batch before publication. Unselected rows are not planned.
  * This performs no page/pin acquisition, mutation, WAL or admission. */
 extern bool cluster_heap_freeze_prepare_xmin_batch_v1(
 	const ClusterHeapFreezePageBatchV1 *page,

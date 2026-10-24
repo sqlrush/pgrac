@@ -1261,6 +1261,73 @@ UT_TEST(test_xmin_batch_later_origin_epoch_mismatch_is_atomic)
 	}
 }
 
+UT_TEST(test_xmin_mixed_page_freezes_only_exact_selected_carriers)
+{
+	for (int resume = 0; resume < 2; resume++) {
+		QualifiedXminFixture f;
+		ClusterHeapFreezeXminTargetV1 targets[3];
+		bool applied;
+
+		qualified_xmin_batch_setup(&f, targets);
+		/* Select physical rows 3 and 1; row 2 has no terminal proof. */
+		f.proofs.proofs[1] = f.proofs.proofs[2];
+		f.proofs.proof_count = 2;
+		if (resume) {
+			ClusterHeapFreezeCanonicalProofV1 swap = f.proofs.proofs[0];
+			f.proofs.proofs[0] = f.proofs.proofs[1];
+			f.proofs.proofs[1] = swap;
+			fixture_release_original_writer(); resume_allowed = true;
+		}
+		UT_ASSERT_EQ(cluster_heap_freeze_validate_conditional_apply_v1(
+			&f.page, &f.proofs, &f.fence), CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+		applied = qualified_xmin_batch_apply(&f, targets, 2);
+		UT_ASSERT(applied);
+		if (!applied)
+			continue;
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT_EQ(conditional_resumes, resume);
+		UT_ASSERT_EQ(conditional_unlocks, resume);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(f.admission.entered);
+		UT_ASSERT_EQ(((xl_heap_freeze_page *)freeze_main_data.data)->snapshotConflictHorizon, 77);
+		for (int i = 1; i <= 3; i++) {
+			HeapTupleHeader tuple = freeze_tuple(current_page.data, i);
+			HeapTupleHeader old = freeze_tuple(before_page.data, i);
+			UT_ASSERT_EQ(tuple->t_infomask,
+				i == 2 ? old->t_infomask : old->t_infomask | HEAP_XMIN_FROZEN);
+			UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(tuple), HeapTupleHeaderGetRawXmin(old));
+			UT_ASSERT_EQ(HeapTupleHeaderGetRawXmax(tuple), HeapTupleHeaderGetRawXmax(old));
+			UT_ASSERT(memcmp(ClusterPageGetItlSlot(current_page.data, i - 1),
+				ClusterPageGetItlSlot(before_page.data, i - 1), sizeof(ClusterItlSlotData)) == 0);
+		}
+		UT_ASSERT(memcmp(freeze_tuple(current_page.data, 2),
+			freeze_tuple(before_page.data, 2), 64) == 0);
+		check_publication(true);
+		replay_freeze_record();
+	}
+}
+
+UT_TEST(test_xmin_mixed_page_refuses_missing_selected_or_invalid_supplied_proof)
+{
+	for (int variant = 0; variant < 3; variant++) {
+		QualifiedXminFixture f;
+		ClusterHeapFreezeXminTargetV1 targets[3];
+		qualified_xmin_batch_setup(&f, targets);
+		f.proofs.proofs[1] = f.proofs.proofs[2];
+		f.proofs.proof_count = 2;
+		if (variant == 1) f.proofs.proofs[1] = f.proofs.proofs[0];
+		if (variant == 2) f.proofs.proofs[1].current_fence.page_version++;
+		fixture_release_original_writer(); resume_allowed = true;
+		UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, variant == 0 ? 3 : 2));
+		UT_ASSERT_EQ(inserts, 0); UT_ASSERT_EQ(flushes, 0);
+		UT_ASSERT_EQ(conditional_resumes, 0);
+		UT_ASSERT_EQ(conditional_unlocks, 0);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
 UT_TEST(test_xmin_batch_one_wal_fence_fullxid_horizon_and_redo)
 {
 	QualifiedXminFixture f;
@@ -2382,7 +2449,9 @@ UT_TEST(test_xmin_existing_share_lock_is_not_a_resume_scope)
 int
 main(void)
 {
-	UT_PLAN(66);
+	UT_PLAN(68);
+	UT_RUN(test_xmin_mixed_page_freezes_only_exact_selected_carriers);
+	UT_RUN(test_xmin_mixed_page_refuses_missing_selected_or_invalid_supplied_proof);
 	UT_RUN(test_xmin_actual_writer_keeps_original_ko_revision_before_lock);
 	UT_RUN(test_xmin_actual_resumer_inner_error_cleans_before_native_wrapper);
 	UT_RUN(test_xmin_released_writer_requires_actual_original_node_grant);

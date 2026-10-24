@@ -2535,7 +2535,7 @@ UT_TEST(xmin_plan_revalidates_physical_target_instead_of_old_binding)
 	}
 }
 
-UT_TEST(xmin_plan_rejects_incomplete_proof_and_changed_final_fence)
+UT_TEST(xmin_plan_rejects_missing_selected_proof_and_changed_final_fence)
 {
 	for (int variant = 0; variant < 14; variant++) {
 		ClusterHeapFreezePageBatchV1 page;
@@ -2555,7 +2555,14 @@ UT_TEST(xmin_plan_rejects_incomplete_proof_and_changed_final_fence)
 		case 5: proofs.proofs[0].resolution.commit_scn = 0; break;
 		case 6: proofs.proofs[0].resolution.local_canonical_valid = false; break;
 		case 7: proofs.proof_count = 0; break;
-		case 8: page.carrier_request_count = 2; break;
+		case 8:
+			/* Missing proof for the selected carrier, not an unrelated row. */
+			page.carrier_request_count = 2;
+			page.carrier_requests[1] = page.carrier_requests[0];
+			page.carrier_requests[1].locator.itl_slot_index = 1;
+			page.tuples[0].carrier_request_index = 1;
+			page.tuples[0].itl_slot_index = 1;
+			break;
 		case 9: fence.holder_sequence++; break;
 		case 10: fence.master_sequence++; break;
 		case 11: fence.admission_generation++; break;
@@ -2923,6 +2930,49 @@ init_xmin_batch_plan_fixture(ClusterHeapFreezePageBatchV1 *page,
 	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(page, proofs, fence), 2);
 	for (int i = 0; i < 2; i++)
 		targets[i] = (ClusterHeapFreezeXminTargetV1){i, page->tuples[i].original_creator_full_xid};
+}
+
+UT_TEST(xmin_batch_plan_keeps_unselected_unproven_carriers)
+{
+	ClusterHeapFreezePageBatchV1 page, before;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+	ClusterHeapFreezeXminTargetV1 targets[2];
+	HeapTupleFreeze plan;
+	TransactionId horizon = InvalidTransactionId;
+
+	init_xmin_batch_plan_fixture(&page, &proofs, &fence, targets);
+	proofs.proof_count = 1;
+	before = page;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_conditional_apply_v1(
+		&page, &proofs, &fence), CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	UT_ASSERT(cluster_heap_freeze_prepare_xmin_batch_v1(&page, &proofs, &fence,
+		targets, 1, FullTransactionIdFromEpochAndXid(1, 100), 10,
+		&plan, 1, &horizon));
+	UT_ASSERT_EQ(plan.offset, page.tuples[0].offset);
+	UT_ASSERT_EQ(plan.t_infomask, page.tuples[0].infomask | HEAP_XMIN_FROZEN);
+	UT_ASSERT_EQ(horizon, 77);
+	UT_ASSERT_EQ(memcmp(&page, &before, sizeof(page)), 0);
+}
+
+UT_TEST(xmin_batch_plan_unproven_selected_carrier_is_atomic)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+	ClusterHeapFreezeXminTargetV1 targets[2];
+	HeapTupleFreeze plans[2], before[2];
+	TransactionId horizon = 991;
+
+	init_xmin_batch_plan_fixture(&page, &proofs, &fence, targets);
+	proofs.proof_count = 1;
+	memset(plans, 0x5a, sizeof(plans));
+	memcpy(before, plans, sizeof(before));
+	UT_ASSERT(!cluster_heap_freeze_prepare_xmin_batch_v1(&page, &proofs, &fence,
+		targets, 2, FullTransactionIdFromEpochAndXid(1, 100), 10,
+		plans, 2, &horizon));
+	UT_ASSERT_EQ(memcmp(plans, before, sizeof(plans)), 0);
+	UT_ASSERT_EQ(horizon, 991);
 }
 
 UT_TEST(xmin_batch_plan_keeps_target_order_and_native_fields)
@@ -3327,7 +3377,9 @@ UT_TEST(aborted_candidates_empty_selection_retires_old_rows_without_plans)
 int
 main(void)
 {
-	UT_PLAN(107);
+	UT_PLAN(109);
+	UT_RUN(xmin_batch_plan_keeps_unselected_unproven_carriers);
+	UT_RUN(xmin_batch_plan_unproven_selected_carrier_is_atomic);
 	UT_RUN(aborted_candidates_revalidate_physical_row_without_saved_binding);
 	UT_RUN(aborted_candidates_keep_row_order_and_separate_equal_raw_carriers);
 	UT_RUN(aborted_candidates_refused_complete_proof_or_fence_preserves_output);
@@ -3433,7 +3485,7 @@ main(void)
 	UT_RUN(xmin_plan_compares_scn_time_without_node_id_ordering);
 	UT_RUN(xmin_plan_preserves_xmax_multi_and_other_header_bits);
 	UT_RUN(xmin_plan_revalidates_physical_target_instead_of_old_binding);
-	UT_RUN(xmin_plan_rejects_incomplete_proof_and_changed_final_fence);
+	UT_RUN(xmin_plan_rejects_missing_selected_proof_and_changed_final_fence);
 	UT_RUN(xmin_plan_rejects_special_raw_fullxids_and_legacy_xmin_states);
 	UT_RUN(xmin_plan_requires_finite_fullxid_and_history_bounds);
 	UT_RUN(xmin_plan_missing_arguments_and_bad_bounds_leave_output_untouched);
