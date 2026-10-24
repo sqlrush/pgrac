@@ -1590,6 +1590,9 @@ ExportSnapshot(Snapshot snapshot)
 
 	snapshot->regd_count++;
 	pairingheap_add(&RegisteredSnapshots, &snapshot->ph_node);
+	/* Publish this original registered protection before its file can become
+	 * visible. ERROR/cancel retains it until the original EOXact cleanup. */
+	cluster_recompute_proc_read_scn();
 
 	/*
 	 * Fill buf with a text serialization of the snapshot, plus identification

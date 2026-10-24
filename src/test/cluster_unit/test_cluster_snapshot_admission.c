@@ -869,6 +869,7 @@ catalog_history_sample(ClusterUndoRetentionSample *sample)
 }
 
 #include "test_cluster_snapshot_import_fixture.inc"
+#include "test_cluster_snapshot_export_fixture.inc"
 
 UT_TEST(catalog_original_publication_completes_the_real_h_sample)
 {
@@ -1006,7 +1007,10 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(74);
+	UT_PLAN(77);
+	UT_RUN(export_original_registration_publishes_h_before_file_visibility);
+	UT_RUN(export_original_registration_preserves_other_older_snapshot);
+	UT_RUN(export_errors_retain_original_h_until_transaction_cleanup);
 	UT_RUN(imported_snapshot_original_xmin_handoff_survives_source_exit);
 	UT_RUN(restored_snapshot_original_xmin_handoff_survives_source_exit);
 	UT_RUN(imported_snapshot_rejects_missing_or_unprotected_original_source);

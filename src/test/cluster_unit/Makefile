@@ -9061,6 +9061,7 @@ test_cluster_snapshot_import_compare.inc: $(top_srcdir)/src/backend/access/trans
 test_cluster_snapshot_admission: test_cluster_snapshot_admission.c unit_test.h \
 		test_cluster_snapshot_import_xmin.inc test_cluster_snapshot_import_compare.inc \
 		$(srcdir)/test_cluster_snapshot_import_fixture.inc \
+		$(srcdir)/test_cluster_snapshot_export_fixture.inc \
 		test_cluster_pgproc_active_types.inc test_cluster_retention_sample.inc \
 		$(top_srcdir)/src/include/cluster/cluster_undo_retention.h $(CLUSTER_UNDO_RETENTION_O) \
 		$(srcdir)/test_cluster_snapshot_vacuum_fixture.inc test_cluster_snapshot_admission_vacuum.inc \
@@ -9068,9 +9069,13 @@ test_cluster_snapshot_admission: test_cluster_snapshot_admission.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe.h \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h $(CLUSTER_XID_STRIPE_O) \
 		$(top_srcdir)/src/backend/utils/time/snapmgr.c $(top_srcdir)/src/include/utils/snapmgr.h \
-		$(top_builddir)/src/backend/lib/pairingheap.o
+		$(top_builddir)/src/backend/lib/pairingheap.o \
+		$(top_builddir)/src/backend/nodes/list.o $(top_builddir)/src/common/stringinfo_srv.o \
+		$(top_builddir)/src/common/psprintf_srv.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(top_builddir)/src/backend/lib/pairingheap.o $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNDO_RETENTION_O) \
+		$(top_builddir)/src/backend/nodes/list.o $(top_builddir)/src/common/stringinfo_srv.o \
+		$(top_builddir)/src/common/psprintf_srv.o \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # PGRAC: execute the real native maintenance entry, with catalogue/I/O leaves.
