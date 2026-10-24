@@ -318,6 +318,10 @@ extern bool cluster_recovery_tx_result_observe_v1(ClusterRecoveryTxResultObserva
  * Startup may query that exact receipt while retaining its original start;
  * neither operation acknowledges other services or grants OPEN. */
 extern bool cluster_recovery_tx_result_accept_v1(void);
+/* LMON-only consumer view: exact original TX value and checkpoint owner after
+ * registration of that same result generation. Zero output on refusal.
+ * A TX component is not completion of the remaining service owners. */
+extern bool cluster_recovery_tx_result_observe_accepted_v1(ClusterRecoveryTxResultObservationV1 *out);
 extern bool cluster_recovery_tx_result_accepted_v1(const struct ClusterRecoveryStartV1 *start);
 /* Original Startup handoff: wait locally for the registered TX component;
  * missing, unresolved or stale results refuse rather than releasing proof. */

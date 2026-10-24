@@ -1570,6 +1570,7 @@ UT_TEST(test_original_lmon_accepts_complete_tx_without_changing_its_owner_result
 {
 	for (unsigned empty = 0; empty < 2; empty++) {
 		ClusterRecoveryTxResultObservationV1 before, after;
+		ClusterRecoveryTxResultObservationV1 unavailable, zero = { 0 };
 		if (empty) {
 			reset(); retain(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
 		} else
@@ -1580,16 +1581,29 @@ UT_TEST(test_original_lmon_accepts_complete_tx_without_changing_its_owner_result
 		UT_ASSERT(!cluster_recovery_tx_result_accepted_v1(info.cluster_tx_start));
 		serving_actor();
 		UT_ASSERT(cluster_recovery_tx_result_observe_v1(&before));
+		memset(&unavailable, 0xa5, sizeof(unavailable));
+		UT_ASSERT(!cluster_recovery_tx_result_observe_accepted_v1(&unavailable));
+		UT_ASSERT(memcmp(&unavailable, &zero, sizeof(zero)) == 0);
 		UT_ASSERT(cluster_recovery_tx_result_accept_v1());
 		UT_ASSERT(cluster_recovery_tx_result_accept_v1());
-		UT_ASSERT(cluster_recovery_tx_result_observe_v1(&after));
+		UT_ASSERT(cluster_recovery_tx_result_observe_accepted_v1(&after));
 		UT_ASSERT(memcmp(&before, &after, sizeof(before)) == 0);
+		/* An old registration cannot cover a new original result generation. */
+		cluster_recovery_plan_shmem->checkpoint_owner.tx_accepted_generation++;
+		memset(&unavailable, 0xa5, sizeof(unavailable));
+		UT_ASSERT(!cluster_recovery_tx_result_observe_accepted_v1(&unavailable));
+		UT_ASSERT(memcmp(&unavailable, &zero, sizeof(zero)) == 0);
+		cluster_recovery_plan_shmem->checkpoint_owner.tx_accepted_generation--;
+		UT_ASSERT(cluster_recovery_tx_result_observe_accepted_v1(&after));
 		startup_actor();
+		memset(&unavailable, 0xa5, sizeof(unavailable));
+		UT_ASSERT(!cluster_recovery_tx_result_observe_accepted_v1(&unavailable));
+		UT_ASSERT(memcmp(&unavailable, &zero, sizeof(zero)) == 0);
 		UT_ASSERT(cluster_recovery_tx_result_accepted_v1(info.cluster_tx_start));
 		ClusterReleaseColdRecoveryInputs(&info);
 		serving_actor();
 		UT_ASSERT(cluster_recovery_tx_result_accept_v1());
-		UT_ASSERT(cluster_recovery_tx_result_observe_v1(&after));
+		UT_ASSERT(cluster_recovery_tx_result_observe_accepted_v1(&after));
 		UT_ASSERT(memcmp(&before, &after, sizeof(before)) == 0);
 		startup_actor();
 	}

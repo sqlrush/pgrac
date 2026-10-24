@@ -14539,6 +14539,7 @@ normal_start_recovered_service_binding_current(const ClusterSemanticActivationRe
 {
 	ClusterRecoveryCheckpointObservationV1 observed;
 	ClusterRecoveryCheckpointObservationV1 observed_after;
+	ClusterRecoveryTxResultObservationV1 tx, tx_after;
 	ClusterFormationSnapshotV1 formation;
 	const ClusterNormalStartCompletion *input = NormalStartCompletion;
 
@@ -14551,6 +14552,9 @@ normal_start_recovered_service_binding_current(const ClusterSemanticActivationRe
 	if (open == NULL || root == NULL || table == NULL || input == NULL
 		|| cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_EXISTING_OTHER
 		|| !cluster_recovery_checkpoint_observe_v1(&observed)
+		|| !cluster_recovery_tx_result_observe_accepted_v1(&tx)
+		|| tx.result.state != CLUSTER_RECOVERY_TX_RESULT_COMPLETE
+		|| memcmp(&tx.checkpoint, &observed, sizeof(observed)) != 0
 		|| observed.slot_generation == 0 || observed.slot_generation == UINT64_MAX
 		|| observed.owner.owner_boot == 0 || observed.owner.owner_boot == UINT64_MAX
 		|| observed.owner.owner_pid <= 0
@@ -14594,11 +14598,13 @@ normal_start_recovered_service_binding_current(const ClusterSemanticActivationRe
 				   != table->expected[node].admitted_incarnation)
 			return false;
 	}
-	/* The formation and membership checks must not outlive the recovered
-	 * checkpoint owner that authorized this service match. */
+	/* Consume the registered original TX component across the formation and
+	 * membership reads. Other service owners remain independently required. */
 	if (!cluster_recovery_checkpoint_observe_v1(&observed_after)
 		|| observed_after.slot_generation != observed.slot_generation
-		|| memcmp(&observed_after.owner, &observed.owner, sizeof(observed.owner)) != 0)
+		|| memcmp(&observed_after.owner, &observed.owner, sizeof(observed.owner)) != 0
+		|| !cluster_recovery_tx_result_observe_accepted_v1(&tx_after)
+		|| memcmp(&tx_after, &tx, sizeof(tx)) != 0)
 		return false;
 	return true;
 }

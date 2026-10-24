@@ -929,6 +929,31 @@ cluster_recovery_tx_result_accept_v1(void)
 	return same;
 }
 
+bool
+cluster_recovery_tx_result_observe_accepted_v1(ClusterRecoveryTxResultObservationV1 *out)
+{
+	ClusterRecoveryTxResultObservationV1 observed;
+	ClusterRecoveryCheckpointSlotV1 *slot;
+	bool same;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || !cluster_recovery_tx_result_observe_v1(&observed)
+		|| observed.result.state != CLUSTER_RECOVERY_TX_RESULT_COMPLETE)
+		return false;
+	slot = &cluster_recovery_plan_shmem->checkpoint_owner;
+	SpinLockAcquire(&slot->lock);
+	same = slot->valid && slot->generation == observed.checkpoint.slot_generation
+		&& memcmp(&slot->owner, &observed.checkpoint.owner, sizeof(slot->owner)) == 0
+		&& memcmp(&slot->tx_result, &observed.result, sizeof(slot->tx_result)) == 0
+		&& slot->tx_accepted_generation == observed.result.result_generation;
+	SpinLockRelease(&slot->lock);
+	if (!same)
+		return false;
+	*out = observed;
+	return true;
+}
+
 typedef enum RecoveryTxHandoffStatus {
 	RECOVERY_TX_HANDOFF_BLOCKED,
 	RECOVERY_TX_HANDOFF_WAIT,
