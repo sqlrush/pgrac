@@ -17,6 +17,7 @@
 
 #include "cluster/cluster_heap_freeze.h"
 #include "cluster/cluster_heap_horizon.h"
+#include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_scn.h"
 #include "commands/vacuum.h"
 #include "cluster/cluster_itl_cleanout.h"
@@ -57,6 +58,10 @@ typedef struct LVRelState
 	FullTransactionId shared_freeze_candidate_limit_full;
 	ClusterHeapFreezeXminCandidateBatchV1 shared_freeze_xmin_candidates;
 	bool shared_freeze_cohort_observed;
+	uint64 shared_freeze_proof_calls;
+	uint64 shared_freeze_proof_requests;
+	uint64 shared_freeze_proof_exchanges;
+	bool shared_freeze_proof_cost_incomplete;
 	struct VacuumCutoffs cutoffs;
 	bool shared_freeze_fence_valid;
 } LVRelState;
@@ -110,6 +115,58 @@ static unsigned clock_reads, clock_observations;
 static bool refuse_clock_observe, error_clock_observe;
 static bool revoke_on_clock_observe, stale_policy_on_clock_observe;
 static bool stale_cohort_on_clock_observe;
+static ClusterGcsUndoHeaderPathCounters transport_header;
+static ClusterGcsUndoVerdictPathCounters transport_verdict;
+static unsigned header_snapshots, verdict_snapshots;
+static bool charge_transport, reset_transport_during_resolve, overflow_transport_sum;
+
+/* Backend-local transport snapshots are leaves; no reset is requested by
+ * the real VACUUM owner. Counter changes below model already paid work. */
+void
+cluster_gcs_block_undo_header_counters_snapshot(ClusterGcsUndoHeaderPathCounters *out)
+{
+	if (guard_held || pin_held || content_locked || (debt != 0 && debt != 1)) abort();
+	header_snapshots++;
+	*out = transport_header;
+}
+
+void
+cluster_gcs_block_undo_verdict_counters_snapshot(ClusterGcsUndoVerdictPathCounters *out)
+{
+	if (guard_held || pin_held || content_locked || (debt != 0 && debt != 1)) abort();
+	verdict_snapshots++;
+	*out = transport_verdict;
+}
+
+static void
+fixture_charge_transport(void)
+{
+	ClusterGcsUndoVerdictExchangeCounters *paths[] = {
+		&transport_verdict.owner_verdict, &transport_verdict.freshref_c1b_pair,
+		&transport_verdict.authority_verdict, &transport_verdict.r4_tx_resolve
+	};
+
+	if (!charge_transport) return;
+	if (reset_transport_during_resolve || overflow_transport_sum) {
+		memset(&transport_header, 0, sizeof(transport_header));
+		memset(&transport_verdict, 0, sizeof(transport_verdict));
+	}
+	if (overflow_transport_sum) {
+		transport_header.calls = UINT64_MAX;
+		transport_verdict.owner_verdict.calls = 1;
+		return;
+	}
+	transport_header.calls += 2;
+	transport_header.request_enqueues++;
+	transport_header.sync_exchanges++;
+	transport_header.matched_replies = UINT64_MAX; /* never folded as requests */
+	for (unsigned i = 0; i < lengthof(paths); i++) {
+		paths[i]->calls += i + 3;
+		paths[i]->request_enqueues += i + 2;
+		paths[i]->sync_exchanges += i + 2;
+		paths[i]->verified_replies = UINT64_MAX; /* not terminal proof */
+	}
+}
 
 static void
 note_cleanup(char event)
@@ -280,6 +337,7 @@ cluster_tx_resolve_exact_admitted(const ClusterTxLocator *locator, ClusterTxReso
 	if (mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS || !admission->entered || debt != 1)
 		abort();
 	resolves++;
+	fixture_charge_transport();
 	memset(&guard, 0, sizeof(guard));
 	cleanup.guard = &guard;
 	cleanup.active = true;
@@ -647,6 +705,10 @@ reset_fixture(void)
 {
 	memset(&relation, 0, sizeof(relation));
 	memset(&vacrel, 0, sizeof(vacrel));
+	memset(&transport_header, 0, sizeof(transport_header));
+	memset(&transport_verdict, 0, sizeof(transport_verdict));
+	header_snapshots = verdict_snapshots = 0;
+	charge_transport = reset_transport_during_resolve = overflow_transport_sum = false;
 	vacrel.rel = &relation;
 	relation.rd_isvalid = true;
 	relation.rd_locator.relNumber = 42;
@@ -2131,10 +2193,146 @@ UT_TEST(clock_observe_revocation_rechecks_same_protection_before_binding)
 	}
 }
 
+UT_TEST(proof_cost_counts_all_five_transport_paths_once)
+{
+	reset_fixture();
+	charge_transport = true;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proof_calls, 20);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proof_requests, 15);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proof_exchanges, 15);
+	UT_ASSERT(!vacrel.shared_freeze_proof_cost_incomplete);
+	UT_ASSERT_EQ(header_snapshots, 2);
+	UT_ASSERT_EQ(verdict_snapshots, 2);
+	UT_ASSERT_EQ(debt, 0);
+	UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+}
+
+UT_TEST(proof_cost_charges_error_and_cancel_before_original_leave)
+{
+	const int codes[] = { ERRCODE_INTERNAL_ERROR, ERRCODE_QUERY_CANCELED };
+
+	for (unsigned i = 0; i < lengthof(codes); i++) {
+		reset_fixture();
+		charge_transport = true;
+		vacrel.shared_freeze_batch.carrier_request_count = 2;
+		fail_resolve = 2;
+		inject_code = codes[i];
+		UT_ASSERT(collect_catches_error());
+		UT_ASSERT_EQ(caught_code, inject_code);
+		UT_ASSERT_EQ(vacrel.shared_freeze_proof_calls, 40);
+		UT_ASSERT_EQ(vacrel.shared_freeze_proof_requests, 30);
+		UT_ASSERT_EQ(vacrel.shared_freeze_proof_exchanges, 30);
+		UT_ASSERT_EQ(header_snapshots, 2);
+		UT_ASSERT_EQ(verdict_snapshots, 2);
+		UT_ASSERT_EQ(transport_verdict.r4_tx_resolve.calls, 12);
+		UT_ASSERT_EQ(leaves, 1);
+		UT_ASSERT_EQ(debt, 0);
+		UT_ASSERT_STR_EQ(cleanup_order, "GA");
+	}
+}
+
+UT_TEST(proof_cost_accumulates_refusal_and_next_success_without_reset)
+{
+	reset_fixture();
+	charge_transport = unknown_outcome = true;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	unknown_outcome = false;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proof_calls, 40);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proof_requests, 30);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proof_exchanges, 30);
+	UT_ASSERT_EQ(header_snapshots, 4);
+	UT_ASSERT_EQ(verdict_snapshots, 4);
+	UT_ASSERT_EQ(leaves, 2);
+	UT_ASSERT_EQ(debt, 0);
+	UT_ASSERT(!vacrel.shared_freeze_proof_cost_incomplete);
+}
+
+UT_TEST(proof_cost_no_admission_does_not_sample_or_change_totals)
+{
+	for (unsigned i = 0; i < 2; i++) {
+		reset_fixture();
+		charge_transport = true;
+		vacrel.shared_freeze_proof_calls = 7;
+		vacrel.shared_freeze_proof_requests = 8;
+		vacrel.shared_freeze_proof_exchanges = 9;
+		if (i == 0) reject_admission = true;
+		else vacrel.shared_freeze_batch.carrier_request_count = 0;
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+		UT_ASSERT_EQ(header_snapshots + verdict_snapshots, 0);
+		UT_ASSERT_EQ(vacrel.shared_freeze_proof_calls, 7);
+		UT_ASSERT_EQ(vacrel.shared_freeze_proof_requests, 8);
+		UT_ASSERT_EQ(vacrel.shared_freeze_proof_exchanges, 9);
+		UT_ASSERT(!vacrel.shared_freeze_proof_cost_incomplete);
+	}
+}
+
+UT_TEST(proof_cost_counter_reset_is_unknown_and_sticky_not_free)
+{
+	reset_fixture();
+	charge_transport = reset_transport_during_resolve = true;
+	transport_header.calls = 100;
+	vacrel.shared_freeze_proof_calls = 7;
+	vacrel.shared_freeze_proof_requests = 8;
+	vacrel.shared_freeze_proof_exchanges = 9;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT(vacrel.shared_freeze_proof_cost_incomplete);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proof_calls, 7);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proof_requests, 8);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proof_exchanges, 9);
+	reset_transport_during_resolve = false;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT(vacrel.shared_freeze_proof_cost_incomplete);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proof_calls, 27);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proof_requests, 23);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proof_exchanges, 24);
+	UT_ASSERT_EQ(debt, 0);
+}
+
+UT_TEST(proof_cost_accumulator_overflow_preserves_all_totals)
+{
+	for (unsigned i = 0; i < 3; i++) {
+		uint64 totals[] = {7, 8, 9};
+
+		reset_fixture();
+		charge_transport = true;
+		totals[i] = UINT64_MAX - 1;
+		vacrel.shared_freeze_proof_calls = totals[0];
+		vacrel.shared_freeze_proof_requests = totals[1];
+		vacrel.shared_freeze_proof_exchanges = totals[2];
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT(vacrel.shared_freeze_proof_cost_incomplete);
+		UT_ASSERT_EQ(vacrel.shared_freeze_proof_calls, totals[0]);
+		UT_ASSERT_EQ(vacrel.shared_freeze_proof_requests, totals[1]);
+		UT_ASSERT_EQ(vacrel.shared_freeze_proof_exchanges, totals[2]);
+		UT_ASSERT_EQ(debt, 0);
+	}
+}
+
+UT_TEST(proof_cost_transport_sum_overflow_is_unknown)
+{
+	reset_fixture();
+	charge_transport = overflow_transport_sum = true;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT(vacrel.shared_freeze_proof_cost_incomplete);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proof_calls, 0);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proof_requests, 0);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proof_exchanges, 0);
+	UT_ASSERT_EQ(debt, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(78);
+	UT_PLAN(85);
+	UT_RUN(proof_cost_counts_all_five_transport_paths_once);
+	UT_RUN(proof_cost_charges_error_and_cancel_before_original_leave);
+	UT_RUN(proof_cost_accumulates_refusal_and_next_success_without_reset);
+	UT_RUN(proof_cost_no_admission_does_not_sample_or_change_totals);
+	UT_RUN(proof_cost_counter_reset_is_unknown_and_sticky_not_free);
+	UT_RUN(proof_cost_accumulator_overflow_preserves_all_totals);
+	UT_RUN(proof_cost_transport_sum_overflow_is_unknown);
 	UT_RUN(clock_observation_uses_same_h_after_local_cleanup);
 	UT_RUN(ready_clock_skips_observe_and_preserves_current_checks);
 	UT_RUN(clock_refusal_keeps_independent_proof_without_candidates);

@@ -9588,8 +9588,9 @@ test_cluster_vacuum_shared_mx.inc: $(top_srcdir)/src/backend/access/heap/vacuuml
 # Real admission/resident-page owners and inner guard cleanup, with injected errors.
 test_cluster_vacuum_proof_cleanup.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
 	awk '/^lazy_cleanout_shared_freeze_page\(/ { print "static bool"; emit=1; cleanout++ } \
+	     /^lazy_shared_freeze_transport_snapshot\(/ { print "static void"; emit=1; cost++ } \
 	     /^(lazy_recheck_shared_freeze_page|lazy_collect_shared_freeze_proofs)\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 2 || cleanout > 1) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (found != 2 || cleanout > 1 || cost > 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_vacuum_proof_cleanout.inc: $(top_srcdir)/src/backend/cluster/cluster_itl_cleanout.c Makefile
@@ -9625,6 +9626,7 @@ test_cluster_vacuum_observed_bounds.inc: $(top_srcdir)/src/backend/cluster/clust
 	mv $@.tmp $@
 
 test_cluster_vacuum_proof_cleanup: test_cluster_vacuum_proof_cleanup.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h \
 		$(top_srcdir)/src/include/cluster/cluster_scn.h test_cluster_heap_small_scn.inc \
 		test_cluster_vacuum_observed_bounds.inc \
 		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \

@@ -76,6 +76,7 @@
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: native maintenance retains pre-lock relation version identity. */
 #include "catalog/pg_control.h"
+#include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_heap_horizon.h"
 #include "cluster/cluster_heap_freeze.h"
@@ -192,6 +193,11 @@ typedef struct LVRelState
 	int64		shared_xmin_deferred_tuples;
 	int64		shared_xmax_deferred_tuples;
 	BlockNumber shared_freeze_changed_pages;
+	/* Query-local diagnostics only; never a message-budget certificate. */
+	uint64 shared_freeze_proof_calls;
+	uint64 shared_freeze_proof_requests;
+	uint64 shared_freeze_proof_exchanges;
+	bool shared_freeze_proof_cost_incomplete;
 #endif
 
 	/* Buffer access strategy and parallel vacuum state */
@@ -790,6 +796,13 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 					(long long) vacrel->shared_xmin_deferred_tuples,
 					(long long) vacrel->shared_xmax_deferred_tuples,
 					vacrel->shared_freeze_changed_pages);
+			if (vacrel->shared_maintenance_restricted)
+				appendStringInfo(&buf,
+					_("shared freeze proof transport (logical undo-header/verdict only): " UINT64_FORMAT " calls, " UINT64_FORMAT " admitted requests, " UINT64_FORMAT " synchronous exchanges%s\n"),
+					vacrel->shared_freeze_proof_calls,
+					vacrel->shared_freeze_proof_requests,
+					vacrel->shared_freeze_proof_exchanges,
+					vacrel->shared_freeze_proof_cost_incomplete ? _("; incomplete counter interval") : "");
 #endif
 			if (vacrel->missed_dead_tuples > 0)
 				appendStringInfo(&buf,
@@ -1805,6 +1818,31 @@ recheck_done:;
 	return status;
 }
 
+/* Five existing backend-local transport legs, three logical counters each.
+ * Snapshots neither reset the providers nor acquire resources or authority. */
+static void
+lazy_shared_freeze_transport_snapshot(uint64 *out)
+{
+	ClusterGcsUndoHeaderPathCounters header;
+	ClusterGcsUndoVerdictPathCounters verdict;
+	const ClusterGcsUndoVerdictExchangeCounters *paths[] = {
+		&verdict.owner_verdict, &verdict.freshref_c1b_pair,
+		&verdict.authority_verdict, &verdict.r4_tx_resolve
+	};
+
+	cluster_gcs_block_undo_header_counters_snapshot(&header);
+	cluster_gcs_block_undo_verdict_counters_snapshot(&verdict);
+	out[0] = header.calls;
+	out[1] = header.request_enqueues;
+	out[2] = header.sync_exchanges;
+	for (unsigned i = 0; i < lengthof(paths); i++)
+	{
+		out[3 * (i + 1)] = paths[i]->calls;
+		out[3 * (i + 1) + 1] = paths[i]->request_enqueues;
+		out[3 * (i + 1) + 2] = paths[i]->sync_exchanges;
+	}
+}
+
 /*
  * Resolve every captured carrier through the terminal-census provider while
  * retaining one R4 admission, then recheck the resident page under local X.
@@ -1830,6 +1868,7 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 	SCN page_scn_before = InvalidScn;
 	bool route_before = false;
 	bool cleaned = false;
+	uint64 proof_cost_before[15];
 
 	memset(&proofs, 0, sizeof(proofs));
 	memset(&admission, 0, sizeof(admission));
@@ -1868,6 +1907,7 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 	admission_result = cluster_semantic_activation_enter_r4_terminal_census(&admission);
 	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
 		goto done;
+	lazy_shared_freeze_transport_snapshot(proof_cost_before);
 	PG_TRY();
 	{
 		cluster_tx_resolve_terminal_census_batch_preflight();
@@ -1998,7 +2038,41 @@ admitted_done:;
 	}
 	PG_FINALLY();
 	{
+		uint64 after[15];
+		uint64 totals[3] = {vacrel->shared_freeze_proof_calls,
+			vacrel->shared_freeze_proof_requests, vacrel->shared_freeze_proof_exchanges};
+		bool complete = true;
+
+		/* Release the original owner first, also on ERROR/cancel. These
+		 * observations are local, allocation-free and cannot dispatch work. */
 		cluster_semantic_activation_leave(&admission);
+		lazy_shared_freeze_transport_snapshot(after);
+		for (unsigned i = 0; i < lengthof(after); i++)
+		{
+			unsigned metric = i % lengthof(totals);
+			uint64 delta;
+
+			if (after[i] < proof_cost_before[i])
+			{
+				complete = false;
+				break;
+			}
+			delta = after[i] - proof_cost_before[i];
+			if (UINT64_MAX - totals[metric] < delta)
+			{
+				complete = false;
+				break;
+			}
+			totals[metric] += delta;
+		}
+		if (complete)
+		{
+			vacrel->shared_freeze_proof_calls = totals[0];
+			vacrel->shared_freeze_proof_requests = totals[1];
+			vacrel->shared_freeze_proof_exchanges = totals[2];
+		}
+		else
+			vacrel->shared_freeze_proof_cost_incomplete = true;
 	}
 	PG_END_TRY();
 
