@@ -86,6 +86,13 @@ static union {
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
+	if (lock == ProcArrayLock) {
+		UT_ASSERT_EQ(mode, LW_EXCLUSIVE);
+		UT_ASSERT(!retention_lock && !vacuum_xid_lock && !vacuum_inplace_lock);
+		retention_lock = true;
+		retention_acquires++;
+		return true;
+	}
 	UT_ASSERT(lock == XidGenLock && mode == LW_SHARED);
 	UT_ASSERT(!vacuum_xid_lock && !vacuum_inplace_lock);
 	vacuum_xid_lock = true;
@@ -95,6 +102,12 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 void
 LWLockRelease(LWLock *lock)
 {
+	if (lock == ProcArrayLock) {
+		UT_ASSERT(retention_lock);
+		retention_lock = false;
+		retention_releases++;
+		return;
+	}
 	UT_ASSERT(lock == XidGenLock && vacuum_xid_lock);
 	vacuum_xid_lock = false;
 	if (vacuum_revoke_on_release)
@@ -146,6 +159,15 @@ GetSnapshotData(Snapshot snapshot)
 	snapshot->xmax = 200;
 	ClusterSnapshotRefreshFields(snapshot);
 	MyProc->xmin = snapshot->xmin;
+	/* Schedule an actual H scan in the original unpublished-reader gap.
+	 * Its decision and output come from the product sampler, not this leaf. */
+	if (retention_probe_before_publish) {
+		ClusterUndoRetentionSample sample, zero = { 0 };
+
+		memset(&sample, 0xa5, sizeof(sample));
+		retention_gap_refused = !cluster_undo_retention_horizon_sample(&sample)
+			&& memcmp(&sample, &zero, sizeof(sample)) == 0;
+	}
 	return snapshot;
 }
 
