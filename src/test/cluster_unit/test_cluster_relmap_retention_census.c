@@ -967,10 +967,20 @@ UT_TEST(test_root_rebuild_preserves_existing_proofs_and_exact_pins)
 }
 
 #ifndef RELMAP_CENSUS_FIXTURE_ONLY
+#include "test_cluster_relmap_census_recovery.inc"
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(34);
+	UT_RUN(test_census_recovery_prepares_only_after_whole_root_drained);
+	UT_RUN(test_census_recovery_exact_namespace_and_partial_publish_base);
+	UT_RUN(test_census_recovery_requires_exact_already_restored_pin);
+	UT_RUN(test_census_recovery_native_refusal_and_error_retain_original_pins);
+	UT_RUN(test_census_recovery_post_native_borrowed_drift_discards_local_handle);
+	UT_RUN(test_census_recovery_changed_pair_and_absent_pending_refuse);
+	UT_RUN(test_census_recovery_full_sha_rejects_valid_crc_read_substitution);
+	UT_RUN(test_census_recovery_requires_original_wal_storage_scope);
 	UT_RUN(test_all_physical_namespaces_and_original_backup_only_pending);
 	UT_RUN(test_all_legal_pair_cuts_keep_pending_without_publishing_complete);
 	UT_RUN(test_clean_census_stays_unpublished);

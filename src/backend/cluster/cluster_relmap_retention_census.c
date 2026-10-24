@@ -6,8 +6,11 @@
 #include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_relmap_owner.h"
 #include "cluster/cluster_relmap_retention_census.h"
+#include "common/cryptohash.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_wal_inputs.h"
+
 typedef struct CensusOrigin {
 	ClusterRelmapRetentionDirectory *directory;
 	uint64 generation;
@@ -102,6 +105,198 @@ census_root_same(const ClusterRelmapRetentionCensus *census)
 		&& cluster_recovery_root_set_count(census->roots) == census->count
 		&& cluster_recovery_root_set_digest(census->roots, digest)
 		&& memcmp(census->digest, digest, sizeof(digest)) == 0;
+}
+
+static bool
+census_recovery_current(const ClusterRelmapRetentionCensus *census)
+{
+	if (!census_root_same(census))
+		return false;
+	for (size_t i = 0; i < census->origin_count; i++)
+		if (!census_origin_same(census, census->nodes[i]))
+			return false;
+	return true;
+}
+
+static bool
+census_recovery_sources(const ClusterRelmapRetentionCensus *census, ClusterWalInputsV1 *inputs)
+{
+	uint32 count;
+
+	if (inputs == NULL || cluster_wal_inputs_revalidate_v1(inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return false;
+	count = cluster_wal_inputs_count_v1(inputs);
+	if (count == 0 || count > CLUSTER_WAL_INPUTS_MAX)
+		return false;
+	for (uint32 i = 0; i < count; i++) {
+		const ClusterWalInputV1 *input = cluster_wal_inputs_at_v1(inputs, i);
+
+		if (input == NULL
+			|| input->source.claim.identity.system_identifier != census->system_identifier
+			|| input->source.claim.database_incarnation != census->database_incarnation
+			|| memcmp(input->source.claim.identity.storage_uuid, census->storage_uuid, 16) != 0)
+			return false;
+	}
+	return count == cluster_wal_inputs_count_v1(inputs);
+}
+
+static const ClusterRelmapRetentionPin *
+census_recovery_pin(const ClusterRelmapRetentionCensus *census, const ClusterRelmapV2Namespace *ns,
+					const ClusterRelmapV2View *view)
+{
+	const ClusterRelmapV2Owner *owner = &view->pending_owner;
+	const ClusterRelmapRetentionDirectory *directory;
+	const ClusterRelmapRetentionPin *found = NULL;
+
+	if (owner->node >= lengthof(census->origins)
+		|| (directory = census->origins[owner->node].directory) == NULL)
+		return NULL;
+	for (size_t i = 0; i < lengthof(directory->pins); i++) {
+		const ClusterRelmapRetentionPin *pin = &directory->pins[i];
+		const ClusterRelmapRetentionKey *key = &pin->key;
+
+		if (!pin->occupied || key->identity.dbid != ns->dbid || key->identity.shared != ns->shared
+			|| key->generation != view->pending_generation)
+			continue;
+		if (found != NULL || !pin->may_be_staged || pin->wal_end != owner->wal_end
+			|| key->identity.system_identifier != ns->system_identifier
+			|| key->identity.database_incarnation != ns->database_incarnation
+			|| key->origin != owner->node || key->top_full_xid != owner->top_full_xid
+			|| key->membership_epoch != owner->membership_epoch
+			|| key->admitted_incarnation != owner->admitted_incarnation
+			|| key->boot_incarnation != owner->boot_incarnation)
+			return NULL;
+		found = pin;
+	}
+	return found;
+}
+
+/* Read the saved physical object, then compare its complete SHA rather than
+ * treating a valid CRC or restored metadata as the original observed bytes. */
+static bool
+census_recovery_read(ClusterRelmapRetentionCensus *census, uint32 index, uint8 *bytes)
+{
+	const ClusterRecoveryRootEntry *entry = cluster_recovery_root_set_entry(census->roots, index);
+	pg_cryptohash_ctx *ctx;
+	uint8 digest[32];
+	bool ok;
+
+	if (entry == NULL
+		|| cluster_recovery_root_set_read(census->roots, index, 0, bytes,
+										  CLUSTER_RELMAP_V2_FILE_SIZE)
+			   != CLUSTER_RECOVERY_ROOTS_BYTES)
+		return false;
+	ctx = pg_cryptohash_create(PG_SHA256);
+	if (ctx == NULL)
+		return false;
+	ok = pg_cryptohash_init(ctx) == 0
+		 && pg_cryptohash_update(ctx, bytes, CLUSTER_RELMAP_V2_FILE_SIZE) == 0
+		 && pg_cryptohash_final(ctx, digest, sizeof(digest)) == 0
+		 && memcmp(digest, entry->content_sha256, sizeof(digest)) == 0;
+	pg_cryptohash_free(ctx);
+	return ok;
+}
+
+bool
+cluster_relmap_retention_census_recovery_prepare(ClusterRelmapRetentionCensus *census,
+												 struct ClusterWalInputsV1 *inputs, Oid dbid,
+												 ClusterRelmapCensusRecovery *out)
+{
+	ClusterRelmapRecoveryHandle *volatile handle = NULL;
+	volatile bool accepted = false;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (census == NULL || census->result != CLUSTER_RELMAP_CENSUS_DRAINED)
+		return false; /* An unfinished scan stays provisional, not failed. */
+	PG_TRY();
+	{
+		do {
+			ClusterRelmapCensusRecovery scratch = { 0 };
+			uint32 indices[2] = { UINT32_MAX, UINT32_MAX };
+			uint8 copies[2][CLUSTER_RELMAP_V2_FILE_SIZE];
+			char path[MAXPGPATH], backup[MAXPGPATH];
+			const ClusterRelmapRetentionPin *pin;
+			ClusterRelmapRetentionPin saved_pin;
+			bool shape = true;
+
+			if (!census->checked || !census_recovery_current(census)
+				|| !census_recovery_sources(census, inputs))
+				break;
+			if (dbid == InvalidOid)
+				strlcpy(path, "global/pgrac_relmap_authority", sizeof(path));
+			else if (snprintf(path, sizeof(path), "base/%u/pgrac_relmap_authority", dbid)
+					 >= sizeof(path))
+				break;
+			if (snprintf(backup, sizeof(backup), "%s.bak", path) >= sizeof(backup))
+				break;
+			scratch.identity = (ClusterRelmapV2Namespace){ census->system_identifier,
+														   census->database_incarnation, dbid,
+														   dbid == InvalidOid };
+			for (uint32 i = 0; i < census->count; i++) {
+				const ClusterRecoveryRootEntry *entry
+					= cluster_recovery_root_set_entry(census->roots, i);
+				unsigned copy;
+
+				if (entry == NULL) {
+					shape = false;
+					break;
+				}
+				if (strcmp(entry->file.path, path) == 0)
+					copy = 0;
+				else if (strcmp(entry->file.path, backup) == 0)
+					copy = 1;
+				else
+					continue;
+				if (indices[copy] != UINT32_MAX
+					|| entry->file.kind
+						   != (copy == 0 ? CLUSTER_RECOVERY_FILE_RELMAP_AUTHORITY
+										 : CLUSTER_RECOVERY_FILE_RELMAP_AUTHORITY_BACKUP)
+					|| (entry->origins & CLUSTER_RECOVERY_ROOT_PHYSICAL) == 0
+					|| !S_ISREG(entry->file.observed.st_mode)
+					|| entry->file.size != CLUSTER_RELMAP_V2_FILE_SIZE
+					|| entry->file.locator.dbOid != dbid
+					|| entry->file.locator.spcOid
+						   != (dbid == InvalidOid ? GLOBALTABLESPACE_OID : DEFAULTTABLESPACE_OID)) {
+					shape = false;
+					break;
+				}
+				indices[copy] = i;
+			}
+			if (!shape || indices[0] == UINT32_MAX || indices[1] == UINT32_MAX
+				|| !census_recovery_read(census, indices[0], copies[0])
+				|| !census_recovery_read(census, indices[1], copies[1])
+				|| cluster_relmap_v2_read_pair(copies[0], sizeof(copies[0]), copies[1],
+											   sizeof(copies[1]), &scratch.identity,
+											   &scratch.pending)
+					   != CLUSTER_RELMAP_V2_PAIR_VALID
+				|| !scratch.pending.pending_complete || !scratch.pending.has_pending
+				|| (pin = census_recovery_pin(census, &scratch.identity, &scratch.pending)) == NULL)
+				break;
+			saved_pin = *pin;
+			if (!census_recovery_current(census)
+				|| !cluster_relmap_recovery_prepare_v1(inputs, &scratch.identity, &scratch.pending,
+													   (ClusterRelmapRecoveryHandle **)&handle)
+				|| !census_recovery_current(census) || !census_recovery_sources(census, inputs)
+				|| census_recovery_pin(census, &scratch.identity, &scratch.pending) != pin
+				|| memcmp(pin, &saved_pin, sizeof(saved_pin)) != 0)
+				break;
+			scratch.handle = handle;
+			*out = scratch;
+			handle = NULL;
+			accepted = true;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		if (handle != NULL)
+			cluster_relmap_recovery_handle_release_v1((ClusterRelmapRecoveryHandle **)&handle);
+		if (!accepted)
+			census_failed(census, CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+	}
+	PG_END_TRY();
+	return accepted;
 }
 
 ClusterRelmapCensusResult

@@ -8,6 +8,7 @@
 #include "cluster/cluster_relmap_pending.h"
 #include "cluster/cluster_relmap_pending_side.h"
 #include "cluster/cluster_relmap_retention_restore.h"
+#include "cluster/cluster_relmap_recovery.h"
 
 #ifdef USE_PGRAC_CLUSTER
 typedef struct ClusterRelmapRetentionCensus ClusterRelmapRetentionCensus;
@@ -96,6 +97,37 @@ extern ClusterRelmapPendingResult cluster_relmap_retention_census_rebuild_pendin
 	const ClusterRelmapPendingDescriptor *descriptors, size_t descriptor_count);
 
 struct ClusterWalInputsV1;
+
+/* Caller-owned arbitration input, published only after whole-ROOT DRAINED.
+ * The full view is the original physical pair, not a caller-built image;
+ * handle authenticates it through the original native cold scope. */
+typedef struct ClusterRelmapCensusRecovery {
+	ClusterRelmapV2Namespace identity;
+	ClusterRelmapV2View pending;
+	ClusterRelmapRecoveryHandle *handle;
+} ClusterRelmapCensusRecovery;
+
+/* Dormant DRAINED-only prepare. Select global for InvalidOid, otherwise the
+ * canonical base/dbid namespace in this original ROOT set. Re-read both exact
+ * observed copies and require their pending's already-restored origin pin;
+ * revalidate every original WAL source's system/incarnation/storage UUID;
+ * prepare opaque native custody and recheck borrowed ROOT/origin state before
+ * publishing. This synchronous operation is not a bounded census tick.
+ *
+ * Before DRAINED returns false without consuming the scan. Any actual input
+ * refusal/ERROR invalidates the census and its directories, retaining pins.
+ * Fresh distinct caller output is cleared on refusal; ERROR propagates after
+ * releasing only local custody. Release output.handle on every later exit.
+ * Keep this census, its original ROOT/directories and the native inputs alive
+ * and exclusively owned until that handle is released or consumed. Original
+ * cold-owner isolation/cut qualifications are not established by this join.
+ * No target write, terminal decision, COMPLETE, release or activation follows.
+ * All census maps/sets are still observations; do not adopt them after a later
+ * arbitration mutates the observed authority files. */
+extern bool cluster_relmap_retention_census_recovery_prepare(ClusterRelmapRetentionCensus *census,
+															 struct ClusterWalInputsV1 *inputs,
+															 Oid dbid,
+															 ClusterRelmapCensusRecovery *out);
 
 /* Same single-use window and provisional structural result. When either copy
  * retains pending, validate that exact union image through the caller's held

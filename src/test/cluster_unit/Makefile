@@ -575,6 +575,7 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
+		test_cluster_relmap_census_recovery.inc \
 		test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c \
 		test_cluster_recovery_crypto_boundary.h unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
@@ -602,6 +603,7 @@ test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
 
 # Keep the original census-only fixture independent of the unused SIDE join.
 test_cluster_relmap_retention_census_product.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_retention_census.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
@@ -614,6 +616,7 @@ test_cluster_relmap_retention_census_product.o: $(top_srcdir)/src/backend/cluste
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_relmap_census_side: test_cluster_relmap_retention_census.c \
+		test_cluster_relmap_census_recovery.inc \
 		test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c \
 		test_cluster_recovery_crypto_boundary.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
