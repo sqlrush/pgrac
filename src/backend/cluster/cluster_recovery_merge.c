@@ -975,15 +975,19 @@ cluster_recovery_merge_project_readonly(uint16 own_thread, XLogRecPtr own_redo,
 		}
 
 		/* The canonical root comes first: in the shared profile it decides
-		 * what the candidate still needs before it can be proven. */
+		 * what the candidate still needs before it can be proven. PRE2's
+		 * reader physically validates the selected generation claim; do not
+		 * reconstruct the legacy claim CRC over this qualified identity.
+		 * Author: SqlRush <sqlrush@gmail.com> */
 		MemSet(&root_identity, 0, sizeof(root_identity));
 		MemSet(&root_snapshot, 0, sizeof(root_snapshot));
 		root_result = cluster_control_root_lookup_owner_by_node_runtime(
 			(int)tid - 1, &root_identity, &root_snapshot, &root_token);
 		root_ok = (root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 				   || root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
-				  && cluster_recovery_duty_key_valid_v1(&root_identity)
-				  && cluster_recovery_duty_key_compare(&root_identity, &root_snapshot.identity)
+				  && cluster_recovery_duty_key_valid_for_claim(&root_identity, cluster_shared_config)
+				  && cluster_recovery_duty_key_compare_for_claim(
+						 &root_identity, &root_snapshot.identity, cluster_shared_config)
 						 == CLUSTER_RECOVERY_DUTY_COMPARE_EXACT;
 
 		/*
@@ -1275,7 +1279,8 @@ recovery_fence_origin_seal(ClusterRecoveryFencePlan *plan, ClusterRecoveryFenceO
 		 && result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		|| snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
 		|| (snapshot.root_flags & required_flags) != required_flags
-		|| cluster_recovery_duty_key_compare(&snapshot.identity, &origin->duty)
+		|| cluster_recovery_duty_key_compare_for_claim(&snapshot.identity, &origin->duty,
+													 cluster_shared_config)
 			   != CLUSTER_RECOVERY_DUTY_COMPARE_EXACT)
 		recovery_fence_seal_failed(plan, &origin->duty, "sealed read-back", (int)result);
 	origin->root_snapshot = snapshot;
@@ -1426,9 +1431,11 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 																		&snapshot, &token);
 		if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
-			|| !cluster_recovery_duty_key_valid_v1(&identity) || identity.origin_thread_id != tid
+			|| !cluster_recovery_duty_key_valid_for_claim(&identity, cluster_shared_config)
+			|| identity.origin_thread_id != tid
 			|| identity.origin_node_id != node_id
-			|| cluster_recovery_duty_key_compare(&snapshot.identity, &identity)
+			|| cluster_recovery_duty_key_compare_for_claim(&snapshot.identity, &identity,
+														 cluster_shared_config)
 				   != CLUSTER_RECOVERY_DUTY_COMPARE_EXACT) {
 			recovery_fence_plan_release_members(plan);
 			MemSet(plan, 0, sizeof(*plan));
@@ -1691,8 +1698,8 @@ cluster_recovery_merge_commit_plan_nowait(ClusterRecoveryFencePlan *plan)
 		if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 			|| snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
-			|| cluster_recovery_duty_key_compare(&snapshot.identity,
-												 &plan->origins[origin_index].duty)
+			|| cluster_recovery_duty_key_compare_for_claim(
+				   &snapshot.identity, &plan->origins[origin_index].duty, cluster_shared_config)
 				   != CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
 			|| memcmp(&token, &plan->origins[origin_index].root_token, sizeof(token)) != 0)
 			return false;
@@ -2075,7 +2082,8 @@ cluster_recovery_merge_begin_internal(const uint64 merge_bitmap[2], const XLogRe
 					(int)tid - 1, &root_identity, &root_snapshot, &root_token);
 				if ((root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 					 || root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
-					&& cluster_recovery_duty_key_compare(&root_identity, &root_snapshot.identity)
+					&& cluster_recovery_duty_key_compare_for_claim(
+						   &root_identity, &root_snapshot.identity, cluster_shared_config)
 						   == CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
 					&& root_snapshot.validated_tail_lsn_exclusive > (uint64)start_lsn[tid])
 					validated_min = (XLogRecPtr)root_snapshot.validated_tail_lsn_exclusive;

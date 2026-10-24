@@ -273,15 +273,72 @@ UT_TEST(test_complete_finalize_failures)
 	drop_plan(&plan);
 }
 
+/* PRE2's canonical reader checks the generation claim. Its CRC is not the
+ * reconstructed legacy claim CRC; this boundary fixture supplies that already
+ * qualified ROOT, while the merge module must retain exact identity checks.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_complete_generation_claim_profile)
+{
+	for (unsigned unsealed = 0; unsealed < 2; unsealed++) {
+		ClusterRecoveryFencePlan *plan = NULL;
+		uint16 thread;
+		int detail;
+
+		fixture();
+		for (uint16 tid = 1; tid <= NODES; tid++) {
+			roots[tid].identity.thread_claim_crc32c ^= UINT32_C(1);
+			UT_ASSERT(cluster_recovery_duty_key_valid_for_claim(&roots[tid].identity, true));
+			UT_ASSERT(!cluster_recovery_duty_key_valid_v1(&roots[tid].identity));
+			if (unsealed && tid != 1)
+				make_open(tid);
+		}
+		expect_engaged(&plan);
+		if (plan == NULL)
+			return;
+		hold(plan);
+		plan->committed = false;
+		UT_ASSERT(cluster_recovery_merge_commit_plan_nowait(plan));
+		UT_ASSERT(cluster_recovery_merge_fence_plan_revalidate_nowait(plan));
+		UT_ASSERT_EQ(complete(plan, &thread, &detail), CLUSTER_RECOVERY_FENCE_COMPLETE_OK);
+		drop_plan(&plan);
+	}
+}
+
+UT_TEST(test_legacy_profile_rejects_generation_claim_crc)
+{
+	ClusterRecoveryDutyKey expected;
+	ClusterRecoveryDutyKey changed;
+
+	fixture();
+	expected = roots[2].identity;
+	UT_ASSERT_EQ(cluster_recovery_duty_key_compare(&expected, &expected),
+				 CLUSTER_RECOVERY_DUTY_COMPARE_EXACT);
+	expected.thread_claim_crc32c ^= UINT32_C(1);
+	UT_ASSERT_EQ(cluster_recovery_duty_key_compare(&expected, &expected),
+				 CLUSTER_RECOVERY_DUTY_COMPARE_INVALID);
+	UT_ASSERT_EQ(cluster_recovery_duty_key_compare_for_claim(&expected, &expected, true),
+				 CLUSTER_RECOVERY_DUTY_COMPARE_EXACT);
+	changed = expected;
+	changed.origin_owner_incarnation++;
+	UT_ASSERT_EQ(cluster_recovery_duty_key_compare_for_claim(&expected, &changed, true),
+				 CLUSTER_RECOVERY_DUTY_COMPARE_DIFFERENT);
+	changed = expected;
+	changed.reserved60 = 1;
+	UT_ASSERT_EQ(cluster_recovery_duty_key_compare_for_claim(&expected, &changed, true),
+				 CLUSTER_RECOVERY_DUTY_COMPARE_INVALID);
+}
+
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(7);
 	UT_RUN(test_complete_publishes_every_origin);
 	UT_RUN(test_complete_after_preflight_seal);
 	UT_RUN(test_complete_refuses_before_any_publication);
 	UT_RUN(test_complete_handoff_failures);
 	UT_RUN(test_complete_finalize_failures);
+	UT_RUN(test_complete_generation_claim_profile);
+	UT_RUN(test_legacy_profile_rejects_generation_claim_crc);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

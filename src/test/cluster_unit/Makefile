@@ -9287,8 +9287,18 @@ test_cluster_cold_recovery_io test_cluster_cold_recovery_complete: %: %.c unit_t
 		test_cluster_cold_recovery_xid_core.o \
 		$(CLUSTER_COLD_PLAN_O) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
+test_cluster_recovery_duty_compare.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_duty.c Makefile
+	awk '/^write_u(16|32|64)_le\(/ { print "static void"; emit=1; n++ } \
+	     /^cluster_recovery_duty_key_encode_for_claim\(/ { print "bool"; emit=1; n++ } \
+	     /^cluster_recovery_duty_key_compare_for_claim\(/ { print "ClusterRecoveryDutyCompare"; emit=1; n++ } \
+	     /^cluster_recovery_duty_key_compare\(/ { print "ClusterRecoveryDutyCompare"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 6 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_recovery_merge_seal test_cluster_recovery_merge_complete: %: %.c unit_test.h \
+		test_cluster_recovery_duty_compare.inc \
 		test_cluster_recovery_merge_seal_boundary.h test_cluster_recovery_merge_cold_fixture.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_duty.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_merge.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_plan.h cluster_unit_port_stubs.o
@@ -9868,6 +9878,8 @@ test_cluster_recovery_plan_publication.inc: $(top_srcdir)/src/backend/cluster/cl
 	mv $@.tmp $@
 
 test_cluster_recovery_plan_merge: test_cluster_recovery_plan_merge.c unit_test.h \
+		test_cluster_recovery_duty_compare.inc \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_duty.h \
         test_cluster_recovery_plan_shmem.inc test_cluster_recovery_plan_publication.inc \
         test_cluster_recovery_plan_generate.inc test_cluster_recovery_merge_seal_boundary.h \
         test_cluster_recovery_merge_cold_fixture.h \

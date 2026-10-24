@@ -269,14 +269,8 @@ GetSystemIdentifier(void)
 }
 
 /* ---- control roots ---- */
-ClusterRecoveryDutyCompare
-cluster_recovery_duty_key_compare(const ClusterRecoveryDutyKey *expected,
-								  const ClusterRecoveryDutyKey *observed)
-{
-	return memcmp(expected, observed, sizeof(*expected)) == 0
-			   ? CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
-			   : CLUSTER_RECOVERY_DUTY_COMPARE_DIFFERENT;
-}
+/* Actual profile-aware encoding/comparison, not a permissive identity double. */
+#include "test_cluster_recovery_duty_compare.inc"
 
 ClusterControlRootResult
 cluster_control_root_lookup_owner_by_node_runtime(int32 old_node_id,
