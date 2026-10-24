@@ -1372,6 +1372,7 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 										  ClusterRecoveryFencePlan **out_plan)
 {
 	ClusterRecoveryFencePlan *plan;
+	ClusterRecoveryPlan observed;
 	ClusterMergeEngage engage;
 	instr_time admission_started;
 	uint16 origin_threads[CLUSTER_WAL_STATE_SLOT_COUNT];
@@ -1385,6 +1386,16 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 					  errdetail("predicate=PLAN_OUTPUT_NOT_EMPTY own_thread=%u output_null=%d",
 								(unsigned)own_thread, out_plan == NULL ? 1 : 0)));
 		return CLUSTER_MERGE_NO_NO_PLAN;
+	}
+	/* The startup observation can span a peer's original self-seal. Before
+	 * interpreting its old ALIVE count, publish one fresh complete census.
+	 * Never clear/reclassify a field locally: a peer still ALIVE in the new
+	 * census keeps the original NO_NOT_COLD refusal. No wait or admission
+	 * is introduced here. Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config && cluster_recovery_plan_snapshot(&observed)
+		&& !observed.failed && observed.own_thread == own_thread && observed.n_alive > 0) {
+		ereport(LOG, (errmsg("refreshing observational recovery census before cold admission")));
+		cluster_recovery_plan_generate(observed.dbstate_at_startup, observed.local_recovery_needed);
 	}
 	plan = palloc0(sizeof(*plan));
 	plan->magic = CLUSTER_RECOVERY_FENCE_PLAN_MAGIC;

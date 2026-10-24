@@ -229,6 +229,15 @@ cluster_recovery_plan_snapshot(ClusterRecoveryPlan *out)
 	*out = census;
 	return true;
 }
+
+/* Non-composition tests supply a fixed census at this owner boundary. The
+ * publication composition test executes the actual producer instead. */
+void
+cluster_recovery_plan_generate(uint32 dbstate, bool recovery_needed)
+{
+	UT_ASSERT_EQ(dbstate, census.dbstate_at_startup);
+	UT_ASSERT_EQ(recovery_needed, census.local_recovery_needed);
+}
 #endif
 
 bool
