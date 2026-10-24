@@ -676,7 +676,9 @@ extern bool cluster_recovery_ctrc_graph_hash_v2(const ClusterRecoveryCTRCRelease
 /* Read the original completed native D0 record and require its embedded graph
  * SHA to equal the original canonical graph hash, then validate every kind2
  * canonical owner envelope against its exact key and this actual D0 payload
- * using owner_evidence_matches_v2, before publishing the result. Generic graph
+ * using owner_evidence_matches_v2, and every kind1 canonical raw1/2 vector
+ * through its full tail, before publishing the result. Canonical reference
+ * structure does not qualify its key, native body or source. Generic graph
  * hashing remains a transcript-only primitive. This structural correspondence
  * does not qualify graph completeness, original
  * source/cut/ROOT/pins, owner/base/floor/issued/terminal or durability/release.
