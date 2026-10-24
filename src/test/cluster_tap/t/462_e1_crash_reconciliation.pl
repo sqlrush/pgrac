@@ -63,6 +63,14 @@ sub log_since
 	return PostgreSQL::Test::Utils::slurp_file($node->logfile, $offset);
 }
 
+sub native_bootstrap_refused
+{
+	my ($log, $result) = @_;
+	# Keep the native FATAL and its typed result in one process and node log.
+	return $log =~ /^[^\n]*\[(\d+)\][ \t]+FATAL:[ \t]+(?:[A-Z0-9]{5}:[ \t]+)?native\ bootstrap\ observation\ failed\r?\n
+		[^\n]*\[\1\][ \t]+DETAIL:[ \t]+Root\ observation\ result=\Q$result\E\.\r?$/mx;
+}
+
 sub process_table
 {
 	my $out = '';
@@ -324,7 +332,9 @@ for my $case ('identity', 'missing_control')
 		}
 		else
 		{
-			my $control = $cluster->shared_data_root . '/global/pg_control';
+			# Remove the canonical record consumed by native bootstrap, leaving
+			# the binding and selected control image intact.
+			my $control = $cluster->shared_data_root . '/global/pgrac_control_root';
 			-f $control or die "missing-control fixture never had $control";
 			unlink($control) or die "cannot remove shared control record: $!";
 		}
@@ -334,8 +344,12 @@ for my $case ('identity', 'missing_control')
 		ok(!$accepted, "$case cold startup is refused");
 		diag($error) if $error;
 		my @nodes = $cluster->nodes;
-		my $all_logs = join("\n", map { log_since($nodes[$_], $offsets->[$_]) } 0 .. $#nodes);
-		like($all_logs, qr/FATAL:/, "$case has a native startup rejection, not just a harness exception");
+		# ClusterControlRootResult: IDENTITY_MISMATCH=12 and ABSENT=3.
+		my $expected_result = $case eq 'identity' ? 12 : 3;
+		my @refusal_nodes = $case eq 'identity' ? (1) : (0 .. $#nodes);
+		ok(scalar(grep { native_bootstrap_refused(
+			log_since($nodes[$_], $offsets->[$_]), $expected_result) } @refusal_nodes),
+			"$case has the expected native bootstrap rejection, not an unrelated FATAL");
 		for my $i (0 .. $#nodes)
 		{
 			unlike(log_since($nodes[$i], $offsets->[$i]), qr/OPEN_APPLIED/,
