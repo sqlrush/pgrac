@@ -739,7 +739,7 @@ cluster_heap_freeze_bind_creation_targets_v1(
 		page->tuples[index].creation_target_proof_index = CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET;
 		page->tuples[index].original_creator_full_xid = InvalidFullTransactionId;
 	}
-	if (freeze_validate_carrier_proofs(page, proofs, current_fence, true)
+	if (freeze_validate_carrier_proofs(page, proofs, current_fence, false)
 		!= CLUSTER_HEAP_FREEZE_PROOF_PROVEN
 		|| page->page_lsn != current_fence->page_lsn
 		|| page->page_version != current_fence->page_version)
@@ -913,7 +913,7 @@ cluster_heap_freeze_select_xmin_candidates_v1(
 		|| !TransactionIdIsNormal(XidFromFullTransactionId(candidate_limit_full))
 		|| U64FromFullTransactionId(candidate_limit_full) == UINT64_MAX
 		|| !SCN_VALID(observed_horizon_scn) || observed_horizon_scn == (SCN)UINT64_MAX
-		|| freeze_validate_carrier_proofs(page, proofs, current_fence, true)
+		|| freeze_validate_carrier_proofs(page, proofs, current_fence, false)
 			!= CLUSTER_HEAP_FREEZE_PROOF_PROVEN
 		|| page->page_lsn != current_fence->page_lsn
 		|| page->page_version != current_fence->page_version)

@@ -1767,7 +1767,7 @@ lazy_recheck_shared_freeze_page(LVRelState *vacrel, Buffer recent_buffer,
 							 ClusterHeapFreezeProofBatchV1 *proofs,
 							 const ClusterTxResolution *retained, uint8 retained_mask,
 							 ClusterHeapFreezeFinalFenceV1 *current_fence,
-							 bool *cleaned)
+							 bool *cleaned, bool *row_inputs_current)
 {
 	ClusterHeapFreezeProofStatusV1 status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
 	volatile bool locked = false;
@@ -1775,6 +1775,7 @@ lazy_recheck_shared_freeze_page(LVRelState *vacrel, Buffer recent_buffer,
 	volatile bool writer_scope = false;
 
 	*cleaned = false;
+	*row_inputs_current = false;
 	if (recent_buffer <= InvalidBuffer || !vacrel->rel->rd_isvalid
 		|| !RelFileLocatorEquals(vacrel->rel->rd_locator, vacrel->identity.key.locator)
 		|| !ReadRecentBuffer(vacrel->rel->rd_locator, MAIN_FORKNUM,
@@ -1851,16 +1852,21 @@ lazy_recheck_shared_freeze_page(LVRelState *vacrel, Buffer recent_buffer,
 				|| current_fence->page_lsn != vacrel->shared_freeze_batch.page_lsn
 				|| current_fence->page_version != vacrel->shared_freeze_batch.page_version))
 			status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
-		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+		/* Only the completed resident/PCM/admission recheck can export a
+		 * current row subset. The page may still be KEEP_UNPROVEN. */
+		*row_inputs_current = status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
 			|| (status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN
-				&& (retained_mask != 0
-					|| cluster_heap_freeze_validate_carrier_cleanout_v1(
-						&vacrel->shared_freeze_batch, proofs, current_fence)
-					== CLUSTER_HEAP_FREEZE_PROOF_PROVEN)))
+				&& cluster_heap_freeze_validate_carrier_cleanout_v1(
+					&vacrel->shared_freeze_batch, proofs, current_fence)
+				== CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		if (*row_inputs_current
+			|| (status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN && retained_mask != 0))
 		{
 			hint_scope = true;
 			*cleaned = lazy_cleanout_shared_freeze_page(vacrel, recent_buffer, proofs,
 				retained, retained_mask);
+			if (*cleaned)
+				*row_inputs_current = false;
 		}
 
 recheck_done:;
@@ -1936,6 +1942,7 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 	SCN page_scn_before = InvalidScn;
 	bool route_before = false;
 	bool cleaned = false;
+	bool row_inputs_current = false;
 	uint64 proof_cost_before[15];
 
 	memset(&proofs, 0, sizeof(proofs));
@@ -2059,12 +2066,12 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 		status = lazy_recheck_shared_freeze_page(vacrel, recent_buffer,
 													 &authority_before, &admission,
 													 &proofs, retained, retained_mask,
-													 &current_fence, &cleaned);
+													 &current_fence, &cleaned, &row_inputs_current);
 		/* Inner cleanup has released the local content lock and pin. Match a
 		 * bounded, read-only cohort observation to this original admission and
 		 * the retained policy bound. Neither grants a positive F/H certificate:
 		 * producer protection/provenance must close before any freeze apply. */
-		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN && !cleaned
+		if (row_inputs_current && !cleaned
 			&& FullTransactionIdIsValid(vacrel->cutoffs.SharedFreezeLimitFull)
 			&& U64FromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull) != UINT64_MAX
 			&& TransactionIdIsNormal(XidFromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull))
@@ -2113,7 +2120,8 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 					if (!cluster_semantic_activation_recheck_r4_terminal_census(&admission))
 						status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
 				}
-				if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+				if ((status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+					 || status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN)
 					&& policy_current && cohort_current && SCN_VALID(wal_clock)
 					&& scn_time_cmp(wal_clock, observed_bounds.horizon_scn) >= 0)
 				{
@@ -2146,15 +2154,20 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 			}
 		}
 		/* This remains only a physical association, never row-freeze permission. */
-		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN && !cleaned)
+		if (row_inputs_current && !cleaned
+			&& (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+				|| status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN))
 		{
 			(void) cluster_heap_freeze_bind_creation_targets_v1(
 				&vacrel->shared_freeze_batch, &proofs, &current_fence);
-			(void) cluster_heap_freeze_bind_aborted_xmax_targets_v1(
-				&vacrel->shared_freeze_batch, &proofs, &current_fence);
-			(void) cluster_heap_freeze_select_aborted_xmax_candidates_v1(
-				&vacrel->shared_freeze_batch, &proofs, &current_fence,
-				&vacrel->shared_freeze_aborted_xmax_candidates);
+			if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN)
+			{
+				(void) cluster_heap_freeze_bind_aborted_xmax_targets_v1(
+					&vacrel->shared_freeze_batch, &proofs, &current_fence);
+				(void) cluster_heap_freeze_select_aborted_xmax_candidates_v1(
+					&vacrel->shared_freeze_batch, &proofs, &current_fence,
+					&vacrel->shared_freeze_aborted_xmax_candidates);
+			}
 			/* Screen the same attempt's original creator identities and observed
 			 * bounds without producing native plans. Positive F/H and producer
 			 * retention admission are still required before any shared write. */
@@ -2166,10 +2179,12 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 					&vacrel->shared_freeze_xmin_candidates);
 		}
 		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
-			|| status == CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED)
+			|| status == CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED
+			|| (row_inputs_current && status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN))
 		{
 			vacrel->shared_freeze_proofs = proofs;
 			vacrel->shared_freeze_fence = current_fence;
+			/* A retained row subset does not qualify the whole page. */
 			vacrel->shared_freeze_fence_valid =
 				status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN && !cleaned;
 		}
@@ -2219,6 +2234,7 @@ admitted_done:;
 done:
 	if (status != CLUSTER_HEAP_FREEZE_PROOF_PROVEN
 		&& status != CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED
+		&& !(status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN && row_inputs_current)
 		&& vacrel != NULL)
 	{
 		vacrel->shared_freeze_proofs.proof_count = 0;

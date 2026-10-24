@@ -2475,6 +2475,109 @@ UT_TEST(next_collection_cannot_reuse_previous_cohort_on_sample_refusal)
 }
 
 
+static void
+setup_partial_xmin_candidates(void)
+{
+	setup_cleanout_page();
+	slot_outcomes[1] = CLUSTER_TX_UNKNOWN;
+	hint_result = CLUSTER_SPACE_HINT_SKIPPED;
+	set_shared_policy(80);
+}
+
+UT_TEST(partial_xmin_candidate_keeps_page_unproven_after_original_release)
+{
+	PGAlignedBlock before;
+	setup_partial_xmin_candidates();
+	memcpy(&before, &resident_page, sizeof(before));
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	UT_ASSERT_EQ(target_bindings, 1); UT_ASSERT_EQ(candidate_selections, 1);
+	UT_ASSERT_EQ(aborted_target_bindings + aborted_candidate_selections, 0);
+	UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.target_count, 1);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proofs.proof_count, 1);
+	UT_ASSERT(vacrel.shared_freeze_cohort_observed);
+	UT_ASSERT(!vacrel.shared_freeze_fence_valid);
+	UT_ASSERT_EQ(hint_finishes, 0);
+	UT_ASSERT_EQ(memcmp(&before, &resident_page, sizeof(before)), 0);
+	UT_ASSERT_EQ(leaves, 1); UT_ASSERT_EQ(debt, 0);
+	UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+}
+
+UT_TEST(partial_xmin_candidates_require_successful_resident_and_pcm_recheck)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		setup_partial_xmin_candidates();
+		if (variant == 0) reject_route_after = true;
+		if (variant == 1) page_match = CLUSTER_HEAP_FREEZE_PAGE_CHANGED;
+		if (variant == 2) changed_holder = true;
+		if (variant == 3) changed_admission = true;
+		UT_ASSERT(!collect_catches_error());
+		UT_ASSERT_EQ(candidate_selections + target_bindings, 0);
+		UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.target_count, 0);
+		UT_ASSERT(!vacrel.shared_freeze_cohort_observed || !vacrel.shared_freeze_fence_valid);
+		UT_ASSERT_EQ(leaves, 1); UT_ASSERT_EQ(debt, 0);
+		UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+	}
+}
+
+UT_TEST(partial_xmin_candidates_keep_original_target_and_source_revocation)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		setup_partial_xmin_candidates();
+		if (variant == 0) target_admission_current = false;
+		if (variant == 1) revoke_on_target_recheck = true;
+		if (variant == 2) target_source_change = 1;
+		if (variant == 3) target_source_change = 2;
+		UT_ASSERT(!collect_catches_error());
+		UT_ASSERT_EQ(target_admission_checks, 1);
+		UT_ASSERT_EQ(candidate_selections, 0);
+		UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.target_count, 0);
+		UT_ASSERT(!vacrel.shared_freeze_cohort_observed);
+		UT_ASSERT(!vacrel.shared_freeze_fence_valid);
+		UT_ASSERT_EQ(leaves, 1); UT_ASSERT_EQ(debt, 0);
+	}
+}
+
+UT_TEST(partial_xmin_target_cancel_unwinds_original_admission)
+{
+	setup_partial_xmin_candidates();
+	error_target_recheck = true;
+	inject_code = ERRCODE_QUERY_CANCELED;
+	UT_ASSERT(collect_catches_error());
+	UT_ASSERT_EQ(caught_code, inject_code);
+	UT_ASSERT_EQ(candidate_selections + target_bindings, 0);
+	UT_ASSERT(!guard_held && !pin_held && !content_locked && !leave_with_ownership);
+	UT_ASSERT_EQ(debt, 0); UT_ASSERT_EQ(leaves, 1);
+	UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+}
+
+UT_TEST(partial_xmin_next_unknown_attempt_retires_previous_subset)
+{
+	setup_partial_xmin_candidates();
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.target_count, 1);
+	slot_outcomes[0] = CLUSTER_TX_UNKNOWN;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.target_count, 0);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proofs.proof_count, 0);
+	UT_ASSERT(!vacrel.shared_freeze_cohort_observed && !vacrel.shared_freeze_fence_valid);
+	UT_ASSERT_EQ(candidate_selections, 1);
+	UT_ASSERT_EQ(debt, 0); UT_ASSERT_EQ(leaves, 2);
+}
+
+UT_TEST(partial_xmin_successful_hint_retires_proofs_and_candidates)
+{
+	setup_partial_xmin_candidates();
+	hint_result = CLUSTER_SPACE_HINT_VERSIONED;
+	UT_ASSERT(!collect_catches_error());
+	UT_ASSERT_EQ(collected_status, CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	UT_ASSERT_EQ(hint_finishes, 1);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proofs.proof_count, 0);
+	UT_ASSERT_EQ(candidate_selections + target_bindings, 0);
+	UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.target_count, 0);
+	UT_ASSERT(!vacrel.shared_freeze_cohort_observed && !vacrel.shared_freeze_fence_valid);
+	UT_ASSERT_EQ(debt, 0); UT_ASSERT_EQ(leaves, 1);
+}
+
 UT_TEST(xmin_candidate_batch_uses_same_bound_proof_and_cohort_after_release)
 {
 	reset_fixture();
@@ -3005,7 +3108,13 @@ UT_TEST(test_writer_resume_error_before_lock_still_unpins_before_admission)
 int
 main(void)
 {
-	UT_PLAN(112);
+	UT_PLAN(118);
+	UT_RUN(partial_xmin_candidate_keeps_page_unproven_after_original_release);
+	UT_RUN(partial_xmin_candidates_require_successful_resident_and_pcm_recheck);
+	UT_RUN(partial_xmin_candidates_keep_original_target_and_source_revocation);
+	UT_RUN(partial_xmin_target_cancel_unwinds_original_admission);
+	UT_RUN(partial_xmin_next_unknown_attempt_retires_previous_subset);
+	UT_RUN(partial_xmin_successful_hint_retires_proofs_and_candidates);
 	UT_RUN(aborted_candidate_refusal_keeps_original_canonical_proof);
 	UT_RUN(aborted_candidates_next_collection_cannot_reuse_preceding_rows);
 	UT_RUN(aborted_modifier_binding_runs_after_local_release_under_original_admission);
