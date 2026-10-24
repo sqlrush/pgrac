@@ -6183,7 +6183,8 @@ $(CLUSTER_R4_SF_DEP_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_sf_dep.c 
 		$(top_srcdir)/src/include/cluster/cluster_sf_dep.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_sf_dep: test_cluster_sf_dep.c unit_test.h $(top_srcdir)/src/backend/cluster/cluster_sf_dep.c
+test_cluster_sf_dep: test_cluster_sf_dep.c unit_test.h $(top_srcdir)/src/backend/cluster/cluster_sf_dep.c \
+		$(top_srcdir)/src/include/cluster/cluster_sf_dep.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \

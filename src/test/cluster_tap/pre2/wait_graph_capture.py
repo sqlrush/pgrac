@@ -216,6 +216,58 @@ def pcm_current_bridge(wait, service, resources, snapshots):
                 peer_capability_current_proven=False, claimed_owner_proven=False)
 
 
+def pcm_source_custody_bridge(wait, service, resources, snapshots, service_owner):
+    """Finite receiver-local capability/owner-slot observations, not a PID claim."""
+    if pcm_current_bridge(wait, service, resources, snapshots) is None:
+        return None
+    source, master = service['source'], wait['expected_master']
+    if (source == master or service_owner.get('node') != source or
+            service_owner.get('pcm_service') != service or service_owner.get('stable') is False or
+            type(service_owner.get('procno')) is not int or service_owner['procno'] < 0):
+        return None
+    local = [s for s in snapshots if s.get('node') == source]
+    copies = [r for r in resources if r.get('kind') == 'pcm' and r.get('node') == source and
+              r.get('tag') == wait['tag'] and r.get('status') == 0 and r.get('stable') is True]
+    if len(local) != 1 or len(copies) != 1 or local[0].get('peer_stable') is not True:
+        return None
+    peer_cut = local[0].get('peer_begin') or {}
+    if any(item.get(key) != peer_cut for item in (local[0], copies[0]) for key in ('peer_begin','peer_end')):
+        return None
+    rows = peer_cut.get('rows')
+    if (peer_cut.get('known') is not True or peer_cut.get('busy') is not False or
+            not isinstance(rows, list) or len(rows) != 128 or
+            any(not isinstance(r, dict) for r in rows) or
+            [r.get('node') for r in rows] != list(range(128))):
+        return None
+    peer = rows[master]
+    generation = peer.get('generation')
+    if (peer.get('valid') is not True or type(peer.get('bits')) is not int or
+            not 0 <= peer['bits'] < 2**32 or not peer['bits'] & 0x20000 or
+            type(generation) is not int or not 0 < generation < 2**32 or
+            generation != service['service_admission']['peer_capability_generation']):
+        return None
+    owner = copies[0].get('local_owner') or {}
+    handle, successor = owner.get('handle') or {}, owner.get('successor') or {}
+    keys = ('tag','requester','request_seq','formation','master_session','r4','base','expected_master')
+    if (owner.get('valid') is not True or owner.get('successor_known') is not True or
+            owner.get('state') != 2 or owner.get('held_buffer_id_plus_one') != 0 or
+            any(successor.get(k) != wait.get(k) for k in keys) or
+            any(successor.get(k) != service.get(k) for k in ('authority','ordered_lane')) or
+            handle.get('tag') != wait['tag'] or handle.get('requester') != source or
+            handle.get('formation') != wait['formation'] or handle.get('r4') != wait['r4'] or
+            handle.get('master_session') != wait['master_session'] or
+            handle.get('procno') != service_owner['procno'] or
+            handle.get('generation') != owner.get('highest_generation') or
+            any(type(handle.get(k)) is not int or not 0 < handle[k] < 2**64-1 for k in
+                ('acquisition','ownership','reservation','generation','deadline'))):
+        return None
+    return dict(quality='native_source_custody_cut', source=source, master=master,
+                peer_capability_generation=generation, owner_procno=handle['procno'],
+                owner_generation=handle['generation'], holder_acquisition=handle['acquisition'],
+                receiver_local_peer_record_at_cuts=True, peer_open_current_proven=False,
+                owner_claim_incarnation_proven=False, physical_frame_receipt_proven=False)
+
+
 def build_graph(snapshots, resources):
     """Join copied native identities only; unknown edges remain in the result."""
     owners, unknown, edges, epochs = {}, [], [], {}
@@ -371,6 +423,7 @@ def build_graph(snapshots, resources):
                         logical_bridge=pcm_logical_bridge(wait, service, resources),
                         native_admission=pcm_admission_bridge(wait, service, resources),
                         current_context=pcm_current_bridge(wait, service, resources, snapshots),
+                        source_custody=pcm_source_custody_bridge(wait, service, resources, snapshots, service_owner),
                         service_wire_sender_connection=service.get('wire_sender_connection')),
                         'candidate_pcm_service')
             unknown.append(dict(process=identity(row), reason='pcm_service_process_edge_unresolved',
@@ -569,6 +622,7 @@ class CaptureSession:
                 matching = [x for x in last['owners'] if x['procno'] == owner['procno']]
                 owner['stable'] = len(matching) == 1 and matching[0] == owner
             first['context_stable'] = all(first.get(k) == last.get(k) for k in CONTEXT_CUTS)
+            first['peer_stable'] = all(first.get(k) == last.get(k) for k in ('peer_begin','peer_end'))
             snapshots.append(first)
         resources = []
         for entry in result['resources']:

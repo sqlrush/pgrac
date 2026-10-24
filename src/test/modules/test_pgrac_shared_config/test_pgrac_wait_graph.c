@@ -15,6 +15,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_wait_graph.h"
 #include "common/hashfn.h"
 #include "storage/proc.h"
@@ -100,7 +101,9 @@ wait_graph_route_snapshot(const BufferTag *tag, WaitGraphRoute *out)
 typedef struct WaitGraphContext {
 	ClusterSemanticWaitGraphSnapshot semantic;
 	ResourceXGateSnapshot gate;
+	ClusterSfPeerCap peers[CLUSTER_MAX_NODES];
 	bool gate_known;
+	bool peers_known, peers_busy;
 } WaitGraphContext;
 
 static void
@@ -109,6 +112,8 @@ wait_graph_context_snapshot(WaitGraphContext *out)
 	memset(out, 0, sizeof(*out));
 	cluster_semantic_activation_wait_graph_snapshot(&out->semantic);
 	out->gate_known = cluster_pcm_lock_resource_x_gate_snapshot(&out->gate);
+	out->peers_known = cluster_sf_peer_capability_table_try_snapshot(
+		out->peers, CLUSTER_MAX_NODES, &out->peers_busy);
 }
 
 static void
@@ -123,6 +128,14 @@ json_context(StringInfo out, const char *side, const WaitGraphContext *cut)
 	appendStringInfo(out, ",\"pcm_gate_%s\":{\"known\":%s,\"phase\":%u,\"formation\":" UINT64_FORMAT
 		",\"freeze\":" UINT64_FORMAT "}", side, cut->gate_known ? "true" : "false",
 		cut->gate.phase, cut->gate.formation, cut->gate.freeze_generation);
+	appendStringInfo(out, ",\"peer_%s\":{\"known\":%s,\"busy\":%s,\"rows\":[", side,
+		cut->peers_known ? "true" : "false", cut->peers_busy ? "true" : "false");
+	for (uint32 i = 0; i < CLUSTER_MAX_NODES; i++) {
+		if (i != 0) appendStringInfoChar(out, ',');
+		appendStringInfo(out, "{\"node\":%u,\"bits\":%u,\"generation\":%u,\"valid\":%s}",
+			i, cut->peers[i].bits, cut->peers[i].generation, cut->peers[i].valid ? "true" : "false");
+	}
+	appendStringInfoString(out, "]}");
 }
 
 static void
@@ -220,6 +233,26 @@ json_wait(StringInfo out, const ClusterWaitTrace *row)
 #undef WG_B
 	appendStringInfoString(out, ",\"service_admission\":");
 	json_pcm_admission(out, &row->service_admission);
+	appendStringInfoChar(out, '}');
+}
+
+static void
+json_pcm_owner(StringInfo out, const ClusterWaitGraphPcmOwner *owner)
+{
+	const ResourceXLocalOwnerHandle *h = &owner->handle;
+	appendStringInfo(out, "{\"valid\":%s,\"successor_known\":%s,\"state\":%u,"
+		"\"highest_generation\":" UINT64_FORMAT ",\"held_buffer_id_plus_one\":%u,\"handle\":{\"tag\":",
+		owner->valid ? "true" : "false", owner->successor_known ? "true" : "false",
+		owner->state, owner->highest_generation, owner->held_buffer_id_plus_one);
+	json_tag(out, &h->ref.assertion.resource);
+	appendStringInfo(out, ",\"requester\":%d,\"formation\":" UINT64_FORMAT
+		",\"acquisition\":" UINT64_FORMAT ",\"master_session\":" UINT64_FORMAT
+		",\"r4\":" UINT64_FORMAT ",\"ownership\":" UINT64_FORMAT ",\"reservation\":" UINT64_FORMAT
+		",\"generation\":" UINT64_FORMAT ",\"deadline\":" UINT64_FORMAT ",\"procno\":%d},\"successor\":",
+		h->ref.assertion.requester_node, h->ref.formation, h->ref.acquisition_generation,
+		h->master_session_incarnation, h->r4_record_generation, h->buffer_ownership_generation,
+		h->reservation_token, h->owner_generation, h->absolute_deadline_us, h->owner_procno);
+	json_wait(out, &owner->successor);
 	appendStringInfoChar(out, '}');
 }
 
@@ -481,6 +514,7 @@ test_pgrac_wait_graph_block(PG_FUNCTION_ARGS)
 	json_context(&out, "end", &end);
 	appendStringInfoString(&out, ",\"view\":");
 	json_wait(&out, &snapshot->view);
+	appendStringInfoString(&out, ",\"local_owner\":"); json_pcm_owner(&out, &snapshot->local_owner);
 	appendStringInfoString(&out, ",\"queue\":[");
 	for (uint32 i = 0; i < snapshot->nqueued; i++) {
 		if (i != 0) appendStringInfoChar(&out, ',');

@@ -72,6 +72,8 @@ static TimestampTz test_sf_now;
 static LWLock *test_sf_held_lock;
 static bool test_sf_control_sealed;
 static bool test_sf_all_checkpoint_proved;
+static bool test_sf_conditional_busy;
+static unsigned test_sf_conditional_calls;
 
 bool
 cluster_normal_stop_pi_retirement_allowed(void)
@@ -153,6 +155,13 @@ LWLockRelease(LWLock *lock)
 	if (test_sf_held_lock != lock)
 		abort();
 	test_sf_held_lock = NULL;
+}
+
+bool
+LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
+{
+	test_sf_conditional_calls++;
+	return !test_sf_conditional_busy && LWLockAcquire(lock, mode);
 }
 bool
 LWLockHeldByMe(LWLock *lock)
@@ -1057,10 +1066,58 @@ UT_TEST(test_sf_stop_satisfied_cache_invalid_residue_and_lock_order)
 	test_sf_cap_store_reset();
 }
 
+UT_TEST(test_wait_graph_capability_table_is_owned_and_never_waits)
+{
+	struct { ClusterSfPeerCap rows[CLUSTER_MAX_NODES]; uint64 canary; } cut;
+	ClusterSfPeerCap saved;
+	uint8 before[TEST_SF_SHMEM_BYTES];
+	bool busy = true;
+	unsigned calls;
+
+	ClusterSfDep = NULL;
+	memset(&cut, 0xff, sizeof(cut));
+	cut.canary = UINT64_C(0x123456789abcdef0);
+	UT_ASSERT(!cluster_sf_peer_capability_table_try_snapshot(cut.rows, CLUSTER_MAX_NODES, &busy));
+	UT_ASSERT(!busy); UT_ASSERT(!cut.rows[127].valid);
+	test_sf_cap_store_reset();
+	cluster_sf_note_peer_hello_capabilities_gen(127, PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1, 61);
+	memcpy(before, test_sf_shmem.bytes, sizeof(before));
+	UT_ASSERT(cluster_sf_peer_capability_table_try_snapshot(cut.rows, CLUSTER_MAX_NODES, &busy));
+	UT_ASSERT(!busy); UT_ASSERT(cut.rows[127].valid);
+	UT_ASSERT_EQ(cut.rows[127].generation, 61);
+	UT_ASSERT_EQ(cut.rows[127].bits, PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1);
+	UT_ASSERT(memcmp(before, test_sf_shmem.bytes, sizeof(before)) == 0);
+	UT_ASSERT(test_sf_held_lock == NULL);
+	saved = cut.rows[127];
+	cluster_sf_note_peer_disconnected_gen(127, 61);
+	UT_ASSERT(saved.valid);
+	UT_ASSERT(cluster_sf_peer_capability_table_try_snapshot(cut.rows, CLUSTER_MAX_NODES, &busy));
+	UT_ASSERT(!cut.rows[127].valid); UT_ASSERT_EQ(cut.rows[127].generation, 61);
+	cluster_sf_note_peer_hello_capabilities_gen(127, PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1, 62);
+	UT_ASSERT(cluster_sf_peer_capability_table_try_snapshot(cut.rows, CLUSTER_MAX_NODES, &busy));
+	UT_ASSERT_EQ(cut.rows[127].generation, 62);
+	UT_ASSERT_EQ(saved.generation, 61);
+	calls = test_sf_conditional_calls;
+	test_sf_conditional_busy = true;
+	UT_ASSERT(!cluster_sf_peer_capability_table_try_snapshot(cut.rows, CLUSTER_MAX_NODES, &busy));
+	UT_ASSERT(busy); UT_ASSERT_EQ(test_sf_conditional_calls, calls + 1);
+	UT_ASSERT_EQ(cut.rows[127].generation, 0); UT_ASSERT(test_sf_held_lock == NULL);
+	test_sf_conditional_busy = false;
+	calls = test_sf_conditional_calls;
+	cut.rows[127].generation = 123;
+	UT_ASSERT(!cluster_sf_peer_capability_table_try_snapshot(cut.rows, CLUSTER_MAX_NODES-1, &busy));
+	UT_ASSERT(!busy); UT_ASSERT_EQ(test_sf_conditional_calls, calls);
+	UT_ASSERT_EQ(cut.rows[127].generation, 123);
+	UT_ASSERT(!cluster_sf_peer_capability_table_try_snapshot(cut.rows, UINT32_MAX, &busy));
+	UT_ASSERT_EQ(test_sf_conditional_calls, calls);
+	UT_ASSERT(!cluster_sf_peer_capability_table_try_snapshot(NULL, CLUSTER_MAX_NODES, &busy));
+	UT_ASSERT_EQ(cut.canary, UINT64_C(0x123456789abcdef0));
+}
+
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(34);
 	UT_RUN(test_a89_capability_record_snapshot_distinguishes_unavailable_and_drift);
 	UT_RUN(test_sf_stop_requires_initialized_store_even_when_disabled);
 	UT_RUN(test_sf_stop_real_install_and_durable_cut_are_read_only);
@@ -1094,6 +1151,7 @@ main(void)
 	UT_RUN(test_lmon_tick_continues_after_recovery_without_commit);
 	UT_RUN(test_durable_publisher_stops_new_work_only_after_final_control_seal);
 	UT_RUN(test_durable_publisher_stops_at_all_member_checkpoint_cut);
+	UT_RUN(test_wait_graph_capability_table_is_owned_and_never_waits);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

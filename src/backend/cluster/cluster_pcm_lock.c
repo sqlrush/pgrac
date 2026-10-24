@@ -10706,6 +10706,34 @@ cluster_pcm_wait_graph_snapshot(const BufferTag *tag, ClusterWaitGraphPcmSnapsho
 	}
 	out->view.binding = entry->binding_generation;
 	out->nqueued = pcm_trace_entry_locked(entry, &out->view, out->queue);
+	/* Same original entry lock; no claim, expiry, clock or native mutation. */
+	{
+		const ClusterPcmResourceXLocalOwner *owner = &entry->resource_x_local_owner;
+		const ClusterPcmResourceXLocalHandoff *handoff = &owner->handoff;
+		ClusterWaitGraphPcmOwner *copy = &out->local_owner;
+		ClusterWaitTrace *successor = &copy->successor;
+
+		copy->handle = owner->handle;
+		copy->state = owner->state;
+		copy->highest_generation = owner->highest_owner_generation;
+		copy->held_buffer_id_plus_one = owner->held_buffer_id_plus_one;
+		copy->valid = pcm_resource_x_local_owner_valid_locked(owner);
+		copy->successor_known = pcm_resource_x_local_handoff_valid(handoff);
+		if (copy->successor_known) {
+			successor->tag = handoff->successor_assertion.resource;
+			successor->tag_known = successor->request_known = true;
+			successor->requester = handoff->successor_assertion.requester_node;
+			successor->request_seq = handoff->assertion_sequence;
+			successor->formation = handoff->holder_ref.formation;
+			successor->master_session = handoff->master_session_incarnation;
+			successor->r4 = handoff->r4_record_generation;
+			successor->base = handoff->base_authority_generation;
+			successor->authority = handoff->delegated_authority_generation != 0 ?
+				handoff->delegated_authority_generation : handoff->base_authority_generation;
+			successor->expected_master = handoff->master_node;
+			successor->ordered_lane = handoff->ordered_lane;
+		}
+	}
 	state = pcm_resource_x_master_state_for_entry(entry);
 	if (state != NULL) {
 		for (int32 node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {

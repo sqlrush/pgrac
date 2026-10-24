@@ -531,6 +531,25 @@ cluster_sf_peer_capability_record_snapshot(int32 peer_id, ClusterSfPeerCap *out)
 	return true;
 }
 
+bool
+cluster_sf_peer_capability_table_try_snapshot(ClusterSfPeerCap *out, uint32 capacity, bool *busy)
+{
+	if (busy != NULL)
+		*busy = false;
+	if (out != NULL)
+		MemSet(out, 0, Min(capacity, (uint32)CLUSTER_MAX_NODES) * sizeof(*out));
+	if (out == NULL || capacity != CLUSTER_MAX_NODES || ClusterSfDep == NULL)
+		return false;
+	if (!LWLockConditionalAcquire(&ClusterSfDep->lock, LW_SHARED)) {
+		if (busy != NULL)
+			*busy = true;
+		return false;
+	}
+	memcpy(out, ClusterSfDep->peer_capabilities, CLUSTER_MAX_NODES * sizeof(*out));
+	LWLockRelease(&ClusterSfDep->lock);
+	return true;
+}
+
 /* Required-capability positive sample; unavailable still exports no proof. */
 bool
 cluster_sf_peer_capability_word_sample(int32 peer_id, uint32 required_capabilities,

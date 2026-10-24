@@ -270,6 +270,120 @@ class GraphTests(unittest.TestCase):
             finally:
                 session.close()
 
+    def source_custody_fixture(self):
+        wait, service, resources, snapshots = self.current_route_fixture()
+        for node in range(4):
+            rows = [dict(node=n, bits=0, generation=0, valid=False) for n in range(128)]
+            rows[2].update(bits=0x20000, generation=61 if node==1 else 30+node, valid=True)
+            peers = dict(known=True, busy=False, rows=rows)
+            snapshot = snapshots[node]
+            snapshot.update(peer_begin=peers, peer_end=copy.deepcopy(peers), peer_stable=True)
+            next(r for r in resources if r['node']==node).update(
+                peer_begin=copy.deepcopy(peers), peer_end=copy.deepcopy(peers))
+        source = next(r for r in resources if r['node']==1)
+        source['status'] = 0
+        source['local_owner'] = dict(valid=True, successor_known=True, state=2,
+            highest_generation=4, held_buffer_id_plus_one=0,
+            handle=dict(tag=wait['tag'], requester=1, formation=7, acquisition=3,
+                master_session=8, r4=12, ownership=60, reservation=19, generation=4,
+                deadline=1000, procno=2),
+            successor=dict(wait, ordered_lane=4, authority=3))
+        return wait, service, resources, snapshots, snapshots[1]['owners'][0]
+
+    def test_source_custody_keeps_holder_successor_and_peer_namespaces_separate(self):
+        wait, service, resources, snapshots, owner = self.source_custody_fixture()
+        proof = graph.pcm_source_custody_bridge(wait, service, resources, snapshots, owner)
+        self.assertEqual(proof['quality'], 'native_source_custody_cut')
+        self.assertEqual(proof['peer_capability_generation'], 61)
+        self.assertEqual(service['wire_sender_connection'], 42)
+        self.assertEqual(proof['holder_acquisition'], 3)
+        self.assertEqual(wait['request_seq'], 9)
+        self.assertEqual(proof['owner_procno'], 2)
+        self.assertFalse(proof['owner_claim_incarnation_proven'])
+        self.assertFalse(proof['physical_frame_receipt_proven'])
+        result = graph.build_graph(snapshots, resources)
+        self.assertEqual(result['edges'][0]['resource']['source_custody'], proof)
+        self.assertEqual(result['edges'][0]['quality'], 'candidate_pcm_service')
+        self.assertFalse(result['complete']); self.assertEqual(result['cycles'], [])
+
+    def test_source_custody_refuses_peer_unavailable_drift_and_generation_alias(self):
+        wait, service, resources, snapshots, owner = self.source_custody_fixture()
+        for where in ('snapshot','resource'):
+            for mutation in ('missing','unknown','busy','drift','duplicate','short','malformed','invalid','bits','wire_alias'):
+                rs, ss = copy.deepcopy(resources), copy.deepcopy(snapshots)
+                item = ss[1] if where=='snapshot' else next(r for r in rs if r['node']==1)
+                if mutation=='missing': del item['peer_begin']
+                elif mutation=='unknown': item['peer_begin']['known']=False
+                elif mutation=='busy': item['peer_begin']['busy']=True
+                elif mutation=='drift': item['peer_end']['rows'][2]['generation']+=1
+                else:
+                    for side in ('begin','end'):
+                        rows=item['peer_'+side]['rows']
+                        if mutation=='duplicate': rows.append(copy.deepcopy(rows[2]))
+                        elif mutation=='short': rows.pop()
+                        elif mutation=='malformed': rows[2]=None
+                        elif mutation=='invalid': rows[2]['valid']=False
+                        elif mutation=='bits': rows[2]['bits']=0
+                        else: rows[2]['generation']=42
+                self.assertIsNone(graph.pcm_source_custody_bridge(wait,service,rs,ss,owner), (where,mutation))
+        snapshots[1]['peer_stable']=False
+        self.assertIsNone(graph.pcm_source_custody_bridge(wait,service,resources,snapshots,owner))
+
+    def test_source_custody_refuses_consistently_malformed_peer_record(self):
+        wait,service,resources,snapshots,owner=self.source_custody_fixture()
+        source=next(r for r in resources if r['node']==1)
+        for item in (snapshots[1],source):
+            for side in ('begin','end'): item['peer_'+side]['rows'][2]=None
+        self.assertIsNone(graph.pcm_source_custody_bridge(wait,service,resources,snapshots,owner))
+
+    def test_source_custody_refuses_nonexecutor_and_owner_key_drift(self):
+        wait, service, resources, snapshots, owner = self.source_custody_fixture()
+        for field,value in (('valid',False),('successor_known',False),('state',0),('state',1),
+                            ('state',3),('state',4),('state',5),('highest_generation',5),
+                            ('held_buffer_id_plus_one',1)):
+            rs=copy.deepcopy(resources)
+            next(r for r in rs if r['node']==1)['local_owner'][field]=value
+            self.assertIsNone(graph.pcm_source_custody_bridge(wait,service,rs,snapshots,owner), (field,value))
+        for field in ('tag','requester','formation','acquisition','master_session','r4','ownership',
+                      'reservation','generation','deadline','procno'):
+            rs=copy.deepcopy(resources); h=next(r for r in rs if r['node']==1)['local_owner']['handle']
+            h[field]=[1,2,3,4,6] if field=='tag' else (0 if field not in ('procno','requester') else 9)
+            self.assertIsNone(graph.pcm_source_custody_bridge(wait,service,rs,snapshots,owner), field)
+        for field in ('tag','requester','request_seq','formation','master_session','r4','base',
+                      'expected_master','ordered_lane','authority'):
+            rs=copy.deepcopy(resources); row=next(r for r in rs if r['node']==1)['local_owner']['successor']
+            row[field]=[1,2,3,4,6] if field=='tag' else row[field]+1
+            self.assertIsNone(graph.pcm_source_custody_bridge(wait,service,rs,snapshots,owner), field)
+        self.assertIsNone(graph.pcm_source_custody_bridge(wait,service,resources,snapshots,dict(owner,procno=3)))
+
+    def test_capture_rejects_peer_change_between_outer_owner_cuts(self):
+        wait, service, resources, snapshots, owner = self.source_custody_fixture()
+        class Reader:
+            def __init__(self,node,directory): self.node,self.calls=node['node'],0
+            def query(self,sql,deadline):
+                if sql.endswith('_prepare()'): return 't'
+                if 'pgrac_wg_block(' in sql:
+                    return graph.json.dumps(next(r for r in resources if r['node']==self.node))
+                if 'pgrac_wg_enqueue(' in sql:
+                    return graph.json.dumps(dict(node=self.node,kind='enqueue',status=1))
+                self.calls+=1
+                value=copy.deepcopy(snapshots[self.node]);value.pop('peer_stable')
+                if self.node==1 and self.calls>1:
+                    for side in ('begin','end'): value['peer_'+side]['rows'][2]['generation']+=1
+                return graph.json.dumps(value)
+            def close(self): pass
+        with tempfile.TemporaryDirectory() as directory,patch.object(graph,'PsqlReader',Reader):
+            session=graph.CaptureSession([dict(node=n,connstr=str(n)) for n in range(4)],Path(directory)/'capture')
+            try:
+                for reader in session.readers: reader.calls=0
+                session.capture()
+                result=graph.json.loads((session.output/'wait-for-graph.json').read_text())
+                evidence=result['edges'][0]['resource']
+                self.assertIsNotNone(evidence['current_context'])
+                self.assertIsNone(evidence['source_custody'])
+                self.assertFalse(result['complete']);self.assertEqual(result['cycles'],[])
+            finally: session.close()
+
     def test_capture_queries_service_tag_without_a_wait_or_hold(self):
         tag = [1,2,3,4,5]
         class Reader:

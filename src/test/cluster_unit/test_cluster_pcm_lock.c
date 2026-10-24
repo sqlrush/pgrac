@@ -21016,6 +21016,60 @@ UT_TEST(test_pcm_wait_graph_retained_block_is_owned_after_slot_retirement)
 	free(cut);
 }
 
+UT_TEST(test_pcm_wait_graph_local_owner_preserves_holder_and_successor)
+{
+	BufferTag tag = make_tag(1100);
+	ResourceXAcquisitionRef holder;
+	ResourceXDecodedFrame successor;
+	ResourceXLocalOwnerHandle handle;
+	ResourceXTerminalXLineage lineage;
+	ClusterWaitGraphPcmSnapshot *cut = calloc(1, sizeof(*cut));
+	ClusterWaitGraphPcmOwner saved;
+
+	UT_ASSERT(cut != NULL);
+	reset_fake_pcm_runtime(4); cluster_node_id = 1;
+	fake_gcs_master_node = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17), RESOURCE_X_APPLY_APPLIED);
+	holder = setup_resource_x_test_terminal_cover(tag, 60);
+	successor = make_resource_x_master_frame(RESOURCE_X_WIRE_BLOCK_TO_N, tag, 2, 1);
+	successor.payload_bytes = RESOURCE_X_CONTROL_V1_BYTES;
+	successor.common.base_authority_generation = 3;
+	successor.common.authority_generation = 3;
+	successor.common.assertion_sequence = 42;
+	successor.common.ordered_lane = 0;
+	successor.common.observed_mode = PCM_STATE_X;
+	successor.common.target_mode = PCM_STATE_N;
+	successor.common.source_candidate = successor.common.retain_pi_if_dirty = 1;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
+		&successor, 0, 77, 60, 19, 9, 127, &lineage, &handle), RESOURCE_X_APPLY_APPLIED);
+	cluster_pcm_wait_graph_snapshot(&tag, cut);
+	UT_ASSERT_EQ(cut->status, CLWG_OBSERVED); UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	UT_ASSERT(cut->local_owner.valid && cut->local_owner.successor_known);
+	UT_ASSERT_EQ(cut->local_owner.state, 2);
+	UT_ASSERT(memcmp(&cut->local_owner.handle, &handle, sizeof(handle)) == 0);
+	UT_ASSERT_EQ(cut->local_owner.handle.ref.acquisition_generation, holder.acquisition_generation);
+	UT_ASSERT_EQ(cut->local_owner.handle.ref.assertion.requester_node, 1);
+	UT_ASSERT_EQ(cut->local_owner.successor.requester, 2);
+	UT_ASSERT_EQ(cut->local_owner.successor.request_seq, 42);
+	UT_ASSERT_EQ(cut->local_owner.successor.expected_master, 0);
+	UT_ASSERT_EQ(cut->local_owner.successor.r4, 77);
+	UT_ASSERT_EQ(cut->local_owner.highest_generation, handle.owner_generation);
+	saved = cut->local_owner;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_terminal_x_revoke_release_exact(&handle), RESOURCE_X_APPLY_APPLIED);
+	cluster_pcm_wait_graph_snapshot(&tag, cut);
+	UT_ASSERT(cut->local_owner.valid); UT_ASSERT_EQ(cut->local_owner.state, 0);
+	UT_ASSERT_EQ(cut->local_owner.handle.owner_generation, 0);
+	UT_ASSERT_EQ(saved.state, 2); UT_ASSERT_EQ(saved.handle.owner_generation, handle.owner_generation);
+	UT_ASSERT_EQ(saved.handle.absolute_deadline_us, handle.absolute_deadline_us);
+	for (int fail_at = 1; fail_at <= 2; fail_at++) {
+		wait_graph_conditional_fail_at = fail_at;
+		cluster_pcm_wait_graph_snapshot(&tag, cut);
+		UT_ASSERT_EQ(cut->status, CLWG_BUSY); UT_ASSERT(!cut->local_owner.valid);
+		UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	}
+	free(cut);
+}
+
 UT_TEST(test_pcm_authority_snapshot_is_one_entry_lock_view)
 {
 	BufferTag tag = make_tag(97);
@@ -24678,7 +24732,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(371);
+	UT_PLAN(372);
 	/* Observe the actual startup state before any runtime fixture overrides
 	 * the postmaster GUC or initializes shared PCM state and counters. */
 	UT_RUN(test_pcm_grd_max_entries_default_is_minus_one);
@@ -25054,6 +25108,7 @@ main(void)
 	UT_RUN(test_pi_relation_scan_never_retires_master_or_local_pi);
 	UT_RUN(test_pi_relation_scan_refuses_orphan_and_preheld_lock);
 	UT_RUN(test_pi_relation_scan_rejects_wrong_gate_and_pending_transfer);
+	UT_RUN(test_pcm_wait_graph_local_owner_preserves_holder_and_successor);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
