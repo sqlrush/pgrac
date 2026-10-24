@@ -83,6 +83,17 @@ struct ClusterRecoveryTTAbortV1;
 extern ClusterControlRootResult cluster_wal_inputs_begin_tx_closure_v1(
 	const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdTopTxCensusEntryV1 *subject, ClusterWalInputsV1 **out);
+struct ClusterColdCtrcWorkV1;
+/* Original post-EOR Startup and its current retained CTRC work only. Reacquire
+ * the complete ROOT-selected input set and WALR read pins, reselect every
+ * original source (including INSTALL history), and bind the original census
+ * ROOT, owner and work generation. No ACTIVE subject is required. Suspend/
+ * resume and reads reject re-prepared work even at the same allocation address.
+ * Retained-only: an OPEN source still waits before any cold-census callback.
+ * This grants no C0/path, live cut/flush, DATA, discharge or completion right. */
+extern ClusterControlRootResult cluster_wal_inputs_begin_ctrc_census_v1(
+	const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 **out);
 /* Exact current C0 candidate only, inside the original TX_CLOSURE read scope.
  * Resolve through the shared undo namespace without borrowing a redo duty.
  * This provisional path grants no write authority: retain target exclusion

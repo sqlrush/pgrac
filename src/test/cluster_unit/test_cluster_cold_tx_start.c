@@ -262,15 +262,16 @@ cluster_cold_typed_ctrc_work_prepare_v1(ClusterColdTypedV1 *input)
 	ctrc_census_calls++;
 	ctrc_before_c0 = stamp_prepares == 0 && wal_inserts == 0;
 	input->ctrc_work = NULL;
-	if (ctrc_census_ok) {
+	if (ctrc_census_ok && input->ctrc_work_generation != UINT64_MAX) {
 		memset(&ctrc_work_storage, 0, sizeof(ctrc_work_storage));
 		native_ctrc_work.plan = input->plan;
 		native_ctrc_work.top_tx_census = input->top_tx_census;
 		native_ctrc_work.counts = ctrc_census;
+		native_ctrc_work.generation = ++input->ctrc_work_generation;
 		input->ctrc_work = &native_ctrc_work;
 	}
 	if (ctrc_census_drift) observed_writer.epoch++;
-	return ctrc_census_ok;
+	return input->ctrc_work != NULL;
 }
 static union {
 	uint64 align;
@@ -1754,7 +1755,7 @@ UT_TEST(test_ctrc_work_is_prepared_before_actual_c0_and_keeps_pending_input)
 
 UT_TEST(test_ctrc_work_requires_original_pointer_and_live_startup_owner)
 {
-	for (unsigned fault = 0; fault < 8; fault++) {
+	for (unsigned fault = 0; fault < 10; fault++) {
 		const ClusterColdCtrcWorkV1 *work;
 		ClusterColdCtrcWorkV1 copy;
 		reset(); retain(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
@@ -1773,6 +1774,8 @@ UT_TEST(test_ctrc_work_requires_original_pointer_and_live_startup_owner)
 		if (fault == 5) observed_writer.epoch++;
 		if (fault == 6) native_recovery = true;
 		if (fault == 7) release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		if (fault == 8) native_ctrc_work.generation = 0;
+		if (fault == 9) typed.ctrc_work_generation++;
 		UT_ASSERT(!ClusterColdRecoveryCtrcWorkCurrent(info.cluster_tx_start, work));
 	}
 }

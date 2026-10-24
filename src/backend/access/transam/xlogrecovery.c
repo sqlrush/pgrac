@@ -826,7 +826,8 @@ ClusterColdRecoveryCtrcWorkCurrent(const struct ClusterRecoveryStartV1 *start,
 	/* Locate the original pointer before reading it, including stale handles. */
 	return ClusterColdRecoveryTxCurrent(start) && work != NULL
 		&& work == start->inputs->ctrc_work && work->plan == start->inputs->plan
-		&& work->top_tx_census == start->census;
+		&& work->top_tx_census == start->census && work->generation != 0
+		&& work->generation == start->inputs->ctrc_work_generation;
 }
 
 const struct ClusterColdCtrcWorkV1 *

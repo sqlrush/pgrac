@@ -930,14 +930,17 @@ cluster_cold_typed_ctrc_work_prepare_v1(ClusterColdTypedV1 *typed)
 	ClusterColdTtBaseV1 *after;
 	ClusterColdCtrcWorkV1 *work;
 	Size bytes, remaining;
+	uint64 generation;
 
 	if (typed == NULL || !cold_tt_ctrc_work_reset(typed))
 		return false;
 	if (typed->context == NULL || typed->tt_base == NULL || typed->tt_after_redo == NULL
+		|| typed->ctrc_work_generation == UINT64_MAX
 		|| !cluster_cold_typed_ctrc_release_census_v1(typed, &census)
 		|| census.subject_count > (MaxAllocSize - offsetof(ClusterColdCtrcWorkV1, entries))
 			/ sizeof(ClusterColdTtSlotInputV1))
 		return false;
+	generation = typed->ctrc_work_generation;
 	after = typed->tt_after_redo;
 	if (typed->tt_base->used > typed->tt_base->budget || after->used > after->budget)
 		return false;
@@ -958,12 +961,14 @@ cluster_cold_typed_ctrc_work_prepare_v1(ClusterColdTypedV1 *typed)
 	work->counts = census;
 	/* Count and fill both traverse the original complete native input. No
 	 * partial array or old attempt can survive an interrupted/refused fill. */
-	if (!cluster_cold_typed_ctrc_work_fill_v1(typed, work) || typed->tt_after_redo != after) {
+	if (!cluster_cold_typed_ctrc_work_fill_v1(typed, work) || typed->tt_after_redo != after
+		|| typed->ctrc_work_generation != generation) {
 		if (typed->tt_after_redo == after)
 			after->used -= bytes;
 		pfree(work);
 		return false;
 	}
+	work->generation = ++typed->ctrc_work_generation;
 	typed->ctrc_work = work;
 	return true;
 }

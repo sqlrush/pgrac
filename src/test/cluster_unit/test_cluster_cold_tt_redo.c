@@ -8912,6 +8912,8 @@ UT_TEST(tt_ctrc_work_retains_exact_first_last_and_unreleased_native_inputs)
 		UT_ASSERT(tt_ctrc_work_prepare(&f));
 		work = f.typed.ctrc_work;
 		UT_ASSERT_NOT_NULL(work);
+		UT_ASSERT_EQ(work->generation, 1);
+		UT_ASSERT_EQ(f.typed.ctrc_work_generation, work->generation);
 		UT_ASSERT(work->plan == f.typed.plan);
 		UT_ASSERT(work->top_tx_census == f.typed.top_tx_census);
 		UT_ASSERT(cluster_cold_typed_ctrc_release_census_v1(&f.typed, &counts));
@@ -8981,15 +8983,36 @@ UT_TEST(tt_ctrc_work_shares_original_budget_and_refused_retry_removes_old_work)
 		tt_census_fail_alloc_size = 0;
 		UT_ASSERT(tt_ctrc_work_prepare(&f));
 		UT_ASSERT_EQ(f.typed.tt_after_redo->used, used + bytes);
+		UT_ASSERT_EQ(f.typed.ctrc_work->generation, 2);
 		UT_ASSERT(cluster_cold_typed_top_tx_census_v1(&f.typed, TT_C0_FENCE));
 		UT_ASSERT_NULL(f.typed.ctrc_work);
 		UT_ASSERT_EQ(f.typed.tt_after_redo->used, used);
 		UT_ASSERT(tt_ctrc_work_prepare(&f));
+		UT_ASSERT_EQ(f.typed.ctrc_work->generation, 3);
 		cluster_cold_tt_after_redo_reset_v1(&f.typed);
 		UT_ASSERT_NULL(f.typed.ctrc_work);
 		UT_ASSERT_NULL(f.typed.top_tx_census);
 		tt_redo_destroy(&f);
 	}
+}
+
+UT_TEST(tt_ctrc_work_generation_cannot_wrap_or_reuse_a_published_version)
+{
+	TtRedoFixture f;
+	Size used;
+
+	tt_ctrc_checkpoint_fixture(&f, TT_SLOT_ABORTED, false, false);
+	used = f.typed.tt_after_redo->used;
+	f.typed.ctrc_work_generation = UINT64_MAX - 1;
+	UT_ASSERT(tt_ctrc_work_prepare(&f));
+	UT_ASSERT_EQ(f.typed.ctrc_work->generation, UINT64_MAX);
+	UT_ASSERT(!tt_ctrc_work_prepare(&f));
+	UT_ASSERT_NULL(f.typed.ctrc_work);
+	UT_ASSERT_EQ(f.typed.ctrc_work_generation, UINT64_MAX);
+	UT_ASSERT_EQ(f.typed.tt_after_redo->used, used);
+	UT_ASSERT(!tt_ctrc_work_prepare(&f));
+	UT_ASSERT_NULL(f.typed.ctrc_work);
+	tt_redo_destroy(&f);
 }
 
 UT_TEST(tt_ctrc_work_source_refusal_cannot_publish_or_keep_a_previous_array)
@@ -9042,7 +9065,8 @@ UT_TEST(tt_ctrc_work_fill_requires_exact_count_without_overwriting_capacity)
 int
 main(void)
 {
-	UT_PLAN(197);
+	UT_PLAN(198);
+	UT_RUN(tt_ctrc_work_generation_cannot_wrap_or_reuse_a_published_version);
 	UT_RUN(tt_ctrc_work_retains_exact_first_last_and_unreleased_native_inputs);
 	UT_RUN(tt_ctrc_work_keeps_history_and_headerless_qualification_debt);
 	UT_RUN(tt_ctrc_work_shares_original_budget_and_refused_retry_removes_old_work);

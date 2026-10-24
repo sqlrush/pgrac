@@ -891,6 +891,7 @@ typedef struct ClusterColdTypedV1 {
 	/* Retained native TT subjects, including terminal and history inputs.
 	 * This is one input component, not complete page-reference coverage. */
 	struct ClusterColdCtrcWorkV1 *ctrc_work;
+	uint64 ctrc_work_generation; /* local lifetime only; survives work reset */
 	bool source_drained[CLUSTER_COLD_MAX_PARTICIPANTS]; /* this pass-2 attempt only */
 	/* Provisional native counters after counted pass-2 drain. Zero means
 	 * missing; these do not prove global effects/durability or all-thread N. */
@@ -1362,6 +1363,7 @@ typedef struct ClusterColdCtrcReleaseCensusV1 {
 typedef struct ClusterColdCtrcWorkV1 {
 	const ClusterColdPlanV1 *plan;
 	const struct ClusterColdTopTxCensusV1 *top_tx_census;
+	uint64 generation; /* nonzero local publication version, never authority */
 	ClusterColdCtrcReleaseCensusV1 counts;
 	ClusterColdTtSlotInputV1 entries[FLEXIBLE_ARRAY_MEMBER];
 } ClusterColdCtrcWorkV1;
@@ -1374,7 +1376,8 @@ extern bool cluster_cold_typed_ctrc_release_census_v1(const ClusterColdTypedV1 *
 
 /* Original input owner only. Retain every nonempty physical TT slot under
  * the original shared TT budget/context. A retry first discards the old
- * array; failure publishes none. This is native input, not online CTRC key,
+ * array; failure publishes none. Successful publication advances its local
+ * generation without wrapping. This is native input, not online CTRC key,
  * page/MX coverage, new release proof or mutation authority. */
 extern bool cluster_cold_typed_ctrc_work_prepare_v1(ClusterColdTypedV1 *typed);
 /* Fill unpublished, exactly sized original-owner storage with the same
