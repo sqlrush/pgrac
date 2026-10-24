@@ -1717,6 +1717,184 @@ test_native_itl_image(ClusterColdTtSlotInputV1 *subject, PGAlignedBlock *image, 
 	slot->undo_segment_head = uba_encode(subject->key.segment_id, 12, 47, 132);
 }
 
+static void
+test_native_itl_batch(ClusterColdTtSlotInputV1 *subjects,
+	ClusterCtrcRecoveryItlPlanV1 *plans, PGAlignedBlock *image, unsigned count)
+{
+	ClusterColdTtSlotInputV1 seed;
+	ClusterItlSlotData slot, *slots;
+
+	test_native_itl_image(&seed, image, 2);
+	slots = ClusterPageGetItlSlots((Page)image->data);
+	slot = slots[2];
+	memset(slots, 0, CLUSTER_ITL_INITRANS_DEFAULT * sizeof(*slots));
+	memset(plans, 0, count * sizeof(*plans));
+	for (unsigned i = 0; i < count; i++) {
+		subjects[i] = seed;
+		subjects[i].key.segment_generation = i;
+		subjects[i].key.slot_offset -= i;
+		subjects[i].key.xid += i;
+		subjects[i].key.slot_wrap += i;
+		subjects[i].slot.xid = subjects[i].key.xid;
+		subjects[i].slot.wrap = subjects[i].key.slot_wrap;
+		if (i % 3 == 1) {
+			subjects[i].slot.status = TT_SLOT_ABORTED;
+			subjects[i].slot.commit_scn = InvalidScn;
+		} else subjects[i].slot.commit_scn += i;
+		subjects[i].slot.first_undo_block = uba_encode(seed.key.segment_id, 40 + i,
+			subjects[i].key.slot_offset, 100);
+		plans[i].subject = &subjects[i];
+		plans[i].itl_index = i;
+		plans[i].expected_itl_wrap = 3 + i;
+		plans[i].itl_class = i % 2 == 0 ? 2 : 1;
+		slots[i] = slot;
+		slots[i].xid = subjects[i].key.xid;
+		slots[i].wrap = plans[i].expected_itl_wrap;
+		slots[i].flags = plans[i].itl_class == 2 ? ITL_FLAG_LOCK_ONLY_ACTIVE : ITL_FLAG_ACTIVE;
+		slots[i].undo_segment_head = uba_encode(seed.key.segment_id, 12 + i,
+			subjects[i].key.slot_offset, 132);
+	}
+}
+
+UT_TEST(test_ctrc_native_itl_batch_merges_mixed_plans_once_per_page)
+{
+	for (unsigned count = 1; count <= CLUSTER_ITL_INITRANS_DEFAULT; count++) {
+		ClusterColdTtSlotInputV1 subjects[CLUSTER_ITL_INITRANS_DEFAULT], saved_subjects[CLUSTER_ITL_INITRANS_DEFAULT];
+		ClusterCtrcRecoveryItlPlanV1 plans[CLUSTER_ITL_INITRANS_DEFAULT], reversed[CLUSTER_ITL_INITRANS_DEFAULT], saved_plans[CLUSTER_ITL_INITRANS_DEFAULT];
+		PGAlignedBlock before, saved, after, expected, repeated;
+
+		test_native_itl_batch(subjects, plans, &before, count);
+		saved = before; expected = before;
+		memcpy(saved_subjects, subjects, count * sizeof(*subjects));
+		memcpy(saved_plans, plans, count * sizeof(*plans));
+		for (unsigned i = 0; i < count; i++) {
+			UT_ASSERT_EQ(cluster_ctrc_recovery_itl_cleanout_image_v1(plans[i].subject,
+				plans[i].itl_index, plans[i].expected_itl_wrap, plans[i].itl_class,
+				expected.data, expected.data), CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN);
+			reversed[count - i - 1] = plans[i];
+		}
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_batch_image_v1(plans, count,
+			before.data, after.data), CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN);
+		UT_ASSERT(memcmp(after.data, expected.data, BLCKSZ) == 0);
+		UT_ASSERT(memcmp(before.data, saved.data, BLCKSZ) == 0);
+		UT_ASSERT(memcmp(before.data, after.data, SizeOfPageHeaderData) == 0);
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_batch_image_v1(reversed, count,
+			before.data, repeated.data), CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN);
+		UT_ASSERT(memcmp(after.data, repeated.data, BLCKSZ) == 0);
+		repeated = before;
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_batch_image_v1(plans, count,
+			repeated.data, repeated.data), CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN);
+		UT_ASSERT(memcmp(after.data, repeated.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_batch_image_v1(plans, count,
+			after.data, repeated.data), CLUSTER_CTRC_ITL_CLEANOUT_ALREADY_TERMINAL);
+		UT_ASSERT(memcmp(after.data, repeated.data, BLCKSZ) == 0);
+		UT_ASSERT(memcmp(plans, saved_plans, count * sizeof(*plans)) == 0);
+		UT_ASSERT(memcmp(subjects, saved_subjects, count * sizeof(*subjects)) == 0);
+	}
+}
+
+UT_TEST(test_ctrc_native_itl_batch_refusal_preserves_whole_page_after_valid_prefix)
+{
+	for (unsigned fault = 0; fault < 15; fault++) {
+		ClusterColdTtSlotInputV1 subjects[3], saved_subjects[3];
+		ClusterCtrcRecoveryItlPlanV1 plans[3], saved_plans[3];
+		PGAlignedBlock before, saved, after, saved_after;
+		ClusterItlSlotData *slot;
+		ItemId item;
+
+		test_native_itl_batch(subjects, plans, &before, 3);
+		slot = &ClusterPageGetItlSlots((Page)before.data)[2];
+		item = PageGetItemId((Page)before.data, FirstOffsetNumber);
+		switch (fault) {
+		case 0: plans[2].subject = NULL; break;
+		case 1: plans[2].itl_index = CLUSTER_ITL_INITRANS_DEFAULT; break;
+		case 2: plans[2].itl_class = 3; break;
+		case 3: plans[2].expected_itl_wrap++; break;
+		case 4: subjects[2].slot.status = TT_SLOT_ACTIVE; break;
+		case 5: subjects[2].slot.commit_scn = InvalidScn; break;
+		case 6: subjects[2].slot.flags = 0x80; break;
+		case 7: subjects[2].key.xid++; break;
+		case 8: subjects[2].slot.wrap++; break;
+		case 9: plans[2] = plans[0]; break;
+		case 10: memset(&slot->undo_segment_head, 0, sizeof(UBA)); break;
+		case 11: ItemIdSetNormal(item, ItemIdGetOffset(item), 0); break;
+		case 12: ((PageHeader)before.data)->pd_special++; break;
+		case 13: slot->commit_scn = 901; break;
+		case 14: slot->flags = ITL_FLAG_ABORTED; break;
+		}
+		saved = before;
+		memset(&after, 0xa5, sizeof(after)); saved_after = after;
+		memcpy(saved_subjects, subjects, sizeof(subjects));
+		memcpy(saved_plans, plans, sizeof(plans));
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_batch_image_v1(plans, 3,
+			before.data, after.data), CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+		UT_ASSERT(memcmp(before.data, saved.data, BLCKSZ) == 0);
+		UT_ASSERT(memcmp(after.data, saved_after.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_batch_image_v1(plans, 3,
+			before.data, before.data), CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+		UT_ASSERT(memcmp(before.data, saved.data, BLCKSZ) == 0);
+		UT_ASSERT(memcmp(subjects, saved_subjects, sizeof(subjects)) == 0);
+		UT_ASSERT(memcmp(plans, saved_plans, sizeof(plans)) == 0);
+	}
+}
+
+UT_TEST(test_ctrc_native_itl_batch_refuses_empty_oversize_and_missing_inputs)
+{
+	ClusterColdTtSlotInputV1 subject;
+	ClusterCtrcRecoveryItlPlanV1 plan;
+	PGAlignedBlock before, saved, after, saved_after;
+
+	test_native_itl_batch(&subject, &plan, &before, 1);
+	saved = before;
+	for (unsigned fault = 0; fault < 5; fault++) {
+		memset(&after, 0xa5, sizeof(after)); saved_after = after;
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_batch_image_v1(fault == 0 ? NULL : &plan,
+			fault == 1 ? 0 : fault == 2 ? CLUSTER_ITL_INITRANS_DEFAULT + 1 : 1,
+			fault == 3 ? NULL : before.data, fault == 4 ? NULL : after.data),
+			CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+		UT_ASSERT(memcmp(before.data, saved.data, BLCKSZ) == 0);
+		UT_ASSERT(memcmp(after.data, saved_after.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_batch_image_v1(&plan, (Size)-1,
+			before.data, after.data), CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+	}
+}
+
+UT_TEST(test_ctrc_native_itl_batch_refuses_page_plan_and_subject_aliases)
+{
+	ClusterColdTtSlotInputV1 subjects[2];
+	ClusterCtrcRecoveryItlPlanV1 plans[2];
+	PGAlignedBlock before, storage[2] = {0}, saved[2];
+
+	test_native_itl_batch(subjects, plans, &before, 2);
+	for (unsigned direction = 0; direction < 2; direction++) {
+		char *source = storage[0].data + (direction ? MAXALIGN(1) : 0);
+		char *dest = storage[0].data + (direction ? 0 : MAXALIGN(1));
+		memcpy(source, before.data, BLCKSZ); memcpy(saved, storage, sizeof(saved));
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_batch_image_v1(plans, 2, source, dest),
+			CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+		UT_ASSERT(memcmp(storage, saved, sizeof(saved)) == 0);
+	}
+	for (unsigned tail = 0; tail < 2; tail++) {
+		Size offset = tail ? BLCKSZ - MAXALIGN(1) : 0;
+		const ClusterColdTtSlotInputV1 *original = plans[1].subject;
+		memset(storage, 0xa5, sizeof(storage));
+		memcpy(storage[0].data + offset, original, sizeof(*original));
+		plans[1].subject = (const ClusterColdTtSlotInputV1 *)(storage[0].data + offset);
+		memcpy(saved, storage, sizeof(saved));
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_batch_image_v1(plans, 2,
+			before.data, storage[0].data), CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+		UT_ASSERT(memcmp(storage, saved, sizeof(saved)) == 0);
+		plans[1].subject = original;
+		memset(storage, 0xa5, sizeof(storage));
+		memcpy(storage[0].data + offset, plans, sizeof(plans));
+		memcpy(saved, storage, sizeof(saved));
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_batch_image_v1(
+			(const ClusterCtrcRecoveryItlPlanV1 *)(storage[0].data + offset), 2,
+			before.data, storage[0].data), CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+		UT_ASSERT(memcmp(storage, saved, sizeof(saved)) == 0);
+	}
+}
+
 UT_TEST(test_ctrc_native_tt_image_matches_original_terminal_rules)
 {
 	for (unsigned leg = 0; leg < 6; leg++) {
@@ -3650,6 +3828,10 @@ main(void)
 		CTRC_TEST_ENTRY(test_ctrc_itl_image_calculation_preserves_input_and_replays_exactly),
 		CTRC_TEST_ENTRY(test_ctrc_itl_image_partial_overlap_is_retained),
 		CTRC_TEST_ENTRY(test_ctrc_native_tt_image_matches_original_terminal_rules),
+		CTRC_TEST_ENTRY(test_ctrc_native_itl_batch_merges_mixed_plans_once_per_page),
+		CTRC_TEST_ENTRY(test_ctrc_native_itl_batch_refusal_preserves_whole_page_after_valid_prefix),
+		CTRC_TEST_ENTRY(test_ctrc_native_itl_batch_refuses_empty_oversize_and_missing_inputs),
+		CTRC_TEST_ENTRY(test_ctrc_native_itl_batch_refuses_page_plan_and_subject_aliases),
 		CTRC_TEST_ENTRY(test_ctrc_native_tt_image_rejects_unqualified_or_mismatched_input),
 		CTRC_TEST_ENTRY(test_ctrc_native_tt_image_retains_invalid_tuple_ranges),
 		CTRC_TEST_ENTRY(test_ctrc_native_tt_image_refuses_aliases_and_missing_arguments),

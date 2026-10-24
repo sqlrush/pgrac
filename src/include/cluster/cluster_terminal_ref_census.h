@@ -1184,6 +1184,22 @@ struct ClusterColdTtSlotInputV1;
 extern ClusterCtrcItlCleanoutApplyResult cluster_ctrc_recovery_itl_cleanout_image_v1(
 	const struct ClusterColdTtSlotInputV1 *subject, uint16 itl_index, uint16 expected_itl_wrap,
 	uint8 itl_class, const char *before_image, char *after_image);
+/* Process-local selected ITL work, borrowing the original native subject.
+ * No persistent identity, online grant or completeness claim is encoded. */
+typedef struct ClusterCtrcRecoveryItlPlanV1 {
+	const struct ClusterColdTtSlotInputV1 *subject;
+	uint16 itl_index;
+	uint16 expected_itl_wrap;
+	uint8 itl_class;
+} ClusterCtrcRecoveryItlPlanV1;
+/* Merge a nonempty batch of distinct selected ITLs into one private image.
+ * Count is bounded by the page's fixed ITL capacity. All plans must succeed
+ * before output changes, including exact in-place output. Partial page and
+ * output/plan/subject overlaps refuse. All original qualification and release
+ * obligations above remain; success covers only these supplied plans. */
+extern ClusterCtrcItlCleanoutApplyResult cluster_ctrc_recovery_itl_batch_image_v1(
+	const ClusterCtrcRecoveryItlPlanV1 *plans, Size count,
+	const char *before_image, char *after_image);
 /* Process-local image observations, never receipt or terminal authority. */
 typedef struct ClusterCtrcItlCarrierImageV1 {
 	uint8 mask;

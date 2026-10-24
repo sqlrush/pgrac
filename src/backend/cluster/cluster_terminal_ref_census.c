@@ -1227,6 +1227,47 @@ cluster_ctrc_recovery_itl_cleanout_image_v1(const ClusterColdTtSlotInputV1 *subj
 	return result;
 }
 
+ClusterCtrcItlCleanoutApplyResult
+cluster_ctrc_recovery_itl_batch_image_v1(const ClusterCtrcRecoveryItlPlanV1 *plans,
+	Size count, const char *before_image, char *after_image)
+{
+	PGAlignedBlock image;
+	ClusterCtrcItlCleanoutApplyResult result = CLUSTER_CTRC_ITL_CLEANOUT_ALREADY_TERMINAL;
+	Size i, j;
+
+	if (plans == NULL || count == 0 || count > CLUSTER_ITL_INITRANS_DEFAULT
+		|| before_image == NULL || after_image == NULL
+		|| ctrc_itl_image_overlaps(after_image, BLCKSZ, plans, count * sizeof(*plans))
+		|| (before_image != after_image
+			&& ctrc_itl_image_overlaps(before_image, BLCKSZ, after_image, BLCKSZ)))
+		return CLUSTER_CTRC_ITL_CLEANOUT_RETAIN;
+	for (i = 0; i < count; i++) {
+		if (plans[i].subject == NULL || plans[i].itl_index >= CLUSTER_ITL_INITRANS_DEFAULT
+			|| (plans[i].itl_class != 1 && plans[i].itl_class != 2)
+			|| ctrc_itl_image_overlaps(after_image, BLCKSZ, plans[i].subject,
+				sizeof(*plans[i].subject)))
+			return CLUSTER_CTRC_ITL_CLEANOUT_RETAIN;
+		for (j = 0; j < i; j++)
+			if (plans[j].itl_index == plans[i].itl_index)
+				return CLUSTER_CTRC_ITL_CLEANOUT_RETAIN;
+	}
+	/* A valid prefix may rewrite its ITL and tuple lock references. Keep all
+	 * such changes private until every remaining selected plan also succeeds. */
+	memcpy(image.data, before_image, BLCKSZ);
+	for (i = 0; i < count; i++) {
+		ClusterCtrcItlCleanoutApplyResult applied = cluster_ctrc_recovery_itl_cleanout_image_v1(
+			plans[i].subject, plans[i].itl_index, plans[i].expected_itl_wrap,
+			plans[i].itl_class, image.data, image.data);
+
+		if (applied == CLUSTER_CTRC_ITL_CLEANOUT_RETAIN)
+			return applied;
+		if (applied == CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN)
+			result = applied;
+	}
+	memcpy(after_image, image.data, BLCKSZ);
+	return result;
+}
+
 static bool
 ctrc_target_pending_offnum_valid(const ClusterCtrcPublicationIdV1 *publication,
 								 const ClusterCtrcTargetV1 *target)
