@@ -2303,7 +2303,13 @@ UT_TEST(creation_binding_rejects_incomplete_or_changed_evidence_and_resets_rows)
 		case 15: fence.master_sequence++; break;
 		case 16: page.page_lsn++; break;
 		case 17: proofs.proofs[0].c1b_finalized = false; break;
-		case 18: page.carrier_request_count = 2; break;
+		case 18:
+			page.carrier_request_count = 2;
+			page.carrier_requests[1] = page.carrier_requests[0];
+			page.carrier_requests[1].locator.itl_slot_index = 1;
+			page.tuples[0].carrier_request_index = 1;
+			page.tuples[0].itl_slot_index = 1;
+			break;
 		}
 		UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 0);
 		UT_ASSERT_EQ(page.tuples[0].creation_target_proof_index, CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET);
@@ -2535,7 +2541,7 @@ UT_TEST(xmin_plan_revalidates_physical_target_instead_of_old_binding)
 	}
 }
 
-UT_TEST(xmin_plan_rejects_incomplete_proof_and_changed_final_fence)
+UT_TEST(xmin_plan_rejects_missing_selected_proof_and_changed_final_fence)
 {
 	for (int variant = 0; variant < 14; variant++) {
 		ClusterHeapFreezePageBatchV1 page;
@@ -2555,7 +2561,14 @@ UT_TEST(xmin_plan_rejects_incomplete_proof_and_changed_final_fence)
 		case 5: proofs.proofs[0].resolution.commit_scn = 0; break;
 		case 6: proofs.proofs[0].resolution.local_canonical_valid = false; break;
 		case 7: proofs.proof_count = 0; break;
-		case 8: page.carrier_request_count = 2; break;
+		case 8:
+			/* Missing proof for the selected carrier, not an unrelated row. */
+			page.carrier_request_count = 2;
+			page.carrier_requests[1] = page.carrier_requests[0];
+			page.carrier_requests[1].locator.itl_slot_index = 1;
+			page.tuples[0].carrier_request_index = 1;
+			page.tuples[0].itl_slot_index = 1;
+			break;
 		case 9: fence.holder_sequence++; break;
 		case 10: fence.master_sequence++; break;
 		case 11: fence.admission_generation++; break;
@@ -2923,6 +2936,121 @@ init_xmin_batch_plan_fixture(ClusterHeapFreezePageBatchV1 *page,
 	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(page, proofs, fence), 2);
 	for (int i = 0; i < 2; i++)
 		targets[i] = (ClusterHeapFreezeXminTargetV1){i, page->tuples[i].original_creator_full_xid};
+}
+
+UT_TEST(xmin_mixed_binding_selects_only_its_exact_proven_carrier)
+{
+	for (int selected = 0; selected < 2; selected++) {
+		ClusterHeapFreezePageBatchV1 page;
+		ClusterHeapFreezeProofBatchV1 proofs;
+		ClusterHeapFreezeFinalFenceV1 fence;
+		ClusterHeapFreezeXminTargetV1 targets[2];
+		ClusterHeapFreezeXminCandidateBatchV1 candidates;
+		init_xmin_batch_plan_fixture(&page, &proofs, &fence, targets);
+		proofs.proofs[0] = proofs.proofs[selected];
+		proofs.proof_count = 1;
+		UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 1);
+		UT_ASSERT_EQ(page.tuples[selected].creation_target_proof_index, 0);
+		UT_ASSERT(FullTransactionIdEquals(page.tuples[selected].original_creator_full_xid,
+			targets[selected].original_creator_full_xid));
+		UT_ASSERT_EQ(page.tuples[1 - selected].creation_target_proof_index,
+			CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET);
+		UT_ASSERT(!FullTransactionIdIsValid(page.tuples[1 - selected].original_creator_full_xid));
+		UT_ASSERT(cluster_heap_freeze_select_xmin_candidates_v1(&page, &proofs, &fence,
+			FullTransactionIdFromEpochAndXid(1, 100), 10, &candidates));
+		UT_ASSERT_EQ(candidates.target_count, 1);
+		UT_ASSERT_EQ(candidates.targets[0].tuple_index, selected);
+		UT_ASSERT_EQ(cluster_heap_freeze_validate_conditional_apply_v1(&page, &proofs,
+			&fence), CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	}
+}
+
+UT_TEST(xmin_mixed_candidates_revalidate_proof_without_stale_associations)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+	ClusterHeapFreezeXminTargetV1 targets[2];
+	ClusterHeapFreezeXminCandidateBatchV1 candidates;
+	init_xmin_batch_plan_fixture(&page, &proofs, &fence, targets);
+	proofs.proof_count = 1;
+	memset(&candidates, 0xa5, sizeof(candidates));
+	UT_ASSERT(cluster_heap_freeze_select_xmin_candidates_v1(&page, &proofs, &fence,
+		FullTransactionIdFromEpochAndXid(1, 100), 10, &candidates));
+	UT_ASSERT_EQ(candidates.target_count, 1);
+	UT_ASSERT_EQ(candidates.targets[0].tuple_index, 0);
+	/* An old binding and equal raw xmin cannot qualify the other carrier. */
+	UT_ASSERT(FullTransactionIdEquals(page.tuples[1].original_creator_full_xid,
+		targets[1].original_creator_full_xid));
+}
+
+UT_TEST(xmin_mixed_invalid_supplied_proof_retires_bindings_preserves_selection)
+{
+	for (int variant = 0; variant < 3; variant++) {
+		ClusterHeapFreezePageBatchV1 page;
+		ClusterHeapFreezeProofBatchV1 proofs;
+		ClusterHeapFreezeFinalFenceV1 fence;
+		ClusterHeapFreezeXminTargetV1 targets[2];
+		ClusterHeapFreezeXminCandidateBatchV1 candidates, before;
+		init_xmin_batch_plan_fixture(&page, &proofs, &fence, targets);
+		proofs.proof_count = 1;
+		if (variant == 0) proofs.proofs[0].c1b_finalized = false;
+		if (variant == 1) proofs.proofs[0].current_fence.page_version++;
+		if (variant == 2) proofs.proofs[0].requested_locator.itl_slot_index = 7;
+		memset(&candidates, 0xa5, sizeof(candidates)); before = candidates;
+		UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 0);
+		for (int i = 0; i < 2; i++) {
+			UT_ASSERT_EQ(page.tuples[i].creation_target_proof_index,
+				CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET);
+			UT_ASSERT(!FullTransactionIdIsValid(page.tuples[i].original_creator_full_xid));
+		}
+		UT_ASSERT(!cluster_heap_freeze_select_xmin_candidates_v1(&page, &proofs, &fence,
+			FullTransactionIdFromEpochAndXid(1, 100), 10, &candidates));
+		UT_ASSERT_EQ(memcmp(&candidates, &before, sizeof(before)), 0);
+	}
+}
+
+UT_TEST(xmin_batch_plan_keeps_unselected_unproven_carriers)
+{
+	ClusterHeapFreezePageBatchV1 page, before;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+	ClusterHeapFreezeXminTargetV1 targets[2];
+	HeapTupleFreeze plan;
+	TransactionId horizon = InvalidTransactionId;
+
+	init_xmin_batch_plan_fixture(&page, &proofs, &fence, targets);
+	proofs.proof_count = 1;
+	before = page;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_conditional_apply_v1(
+		&page, &proofs, &fence), CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	UT_ASSERT(cluster_heap_freeze_prepare_xmin_batch_v1(&page, &proofs, &fence,
+		targets, 1, FullTransactionIdFromEpochAndXid(1, 100), 10,
+		&plan, 1, &horizon));
+	UT_ASSERT_EQ(plan.offset, page.tuples[0].offset);
+	UT_ASSERT_EQ(plan.t_infomask, page.tuples[0].infomask | HEAP_XMIN_FROZEN);
+	UT_ASSERT_EQ(horizon, 77);
+	UT_ASSERT_EQ(memcmp(&page, &before, sizeof(page)), 0);
+}
+
+UT_TEST(xmin_batch_plan_unproven_selected_carrier_is_atomic)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+	ClusterHeapFreezeXminTargetV1 targets[2];
+	HeapTupleFreeze plans[2], before[2];
+	TransactionId horizon = 991;
+
+	init_xmin_batch_plan_fixture(&page, &proofs, &fence, targets);
+	proofs.proof_count = 1;
+	memset(plans, 0x5a, sizeof(plans));
+	memcpy(before, plans, sizeof(before));
+	UT_ASSERT(!cluster_heap_freeze_prepare_xmin_batch_v1(&page, &proofs, &fence,
+		targets, 2, FullTransactionIdFromEpochAndXid(1, 100), 10,
+		plans, 2, &horizon));
+	UT_ASSERT_EQ(memcmp(plans, before, sizeof(plans)), 0);
+	UT_ASSERT_EQ(horizon, 991);
 }
 
 UT_TEST(xmin_batch_plan_keeps_target_order_and_native_fields)
@@ -3324,10 +3452,73 @@ UT_TEST(aborted_candidates_empty_selection_retires_old_rows_without_plans)
 	}
 }
 
+
+UT_TEST(canonical_proof_requires_same_origin_and_known_generation)
+{
+	ClusterHeapFreezeCanonicalProofV1 proof;
+
+	for (int variant = 0; variant < 3; variant++) {
+		init_canonical_proof_fixture(&proof);
+		if (variant == 0) proof.resolution.local_canonical_generation = UINT32_MAX;
+		if (variant == 1) proof.resolution.local_canonical.segment_id = CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+		if (variant == 2) {
+			proof.requested_locator.uba = uba_encode(CLUSTER_UNDO_SEGS_PER_INSTANCE + 1, 1, 0, 1);
+			proof.resolution.locator_echo.uba = proof.requested_locator.uba;
+		}
+		UT_ASSERT_EQ(cluster_heap_freeze_validate_canonical_proof_v1(&proof),
+			CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR);
+	}
+	/* Relocation within an origin remains legal, including the last known
+	 * generation before the existing UINT32_MAX unknown sentinel. */
+	for (int origin = 0; origin < 2; origin++) {
+		init_canonical_proof_fixture(&proof);
+		proof.requested_locator.uba = uba_encode(origin * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1, 1, 0, 1);
+		proof.resolution.locator_echo.uba = proof.requested_locator.uba;
+		proof.resolution.local_canonical.segment_id = (origin + 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE;
+		proof.resolution.local_canonical_generation = UINT32_MAX - 1;
+		UT_ASSERT_EQ(cluster_heap_freeze_validate_canonical_proof_v1(&proof),
+			CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	}
+}
+
+UT_TEST(xmin_origin_or_generation_alias_cannot_retain_or_prepare_identity)
+{
+	for (int variant = 0; variant < 2; variant++) {
+		ClusterHeapFreezePageBatchV1 page;
+		ClusterHeapFreezeProofBatchV1 proofs;
+		ClusterHeapFreezeFinalFenceV1 fence;
+		ClusterHeapFreezeXminCandidateBatchV1 candidates, saved_candidates;
+		HeapTupleFreeze plan, saved_plan;
+
+		init_xmin_plan_fixture(&page, &proofs, &fence);
+		if (variant == 0) proofs.proofs[0].resolution.local_canonical_generation = UINT32_MAX;
+		else proofs.proofs[0].resolution.local_canonical.segment_id = CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+		memset(&saved_plan, 0xa5, sizeof(saved_plan)); plan = saved_plan;
+		UT_ASSERT(!prepare_fixture_xmin(&page, &proofs, &fence, &plan));
+		UT_ASSERT(memcmp(&plan, &saved_plan, sizeof(plan)) == 0);
+		memset(&saved_candidates, 0xa5, sizeof(saved_candidates)); candidates = saved_candidates;
+		UT_ASSERT(!cluster_heap_freeze_select_xmin_candidates_v1(&page, &proofs,
+			&fence, FullTransactionIdFromEpochAndXid(1, 100), 10, &candidates));
+		UT_ASSERT(memcmp(&candidates, &saved_candidates, sizeof(candidates)) == 0);
+		UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 0);
+		for (uint16 i = 0; i < page.tuple_count; i++) {
+			UT_ASSERT_EQ(page.tuples[i].creation_target_proof_index, CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET);
+			UT_ASSERT(!FullTransactionIdIsValid(page.tuples[i].original_creator_full_xid));
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(107);
+	UT_PLAN(114);
+	UT_RUN(canonical_proof_requires_same_origin_and_known_generation);
+	UT_RUN(xmin_origin_or_generation_alias_cannot_retain_or_prepare_identity);
+	UT_RUN(xmin_mixed_binding_selects_only_its_exact_proven_carrier);
+	UT_RUN(xmin_mixed_candidates_revalidate_proof_without_stale_associations);
+	UT_RUN(xmin_mixed_invalid_supplied_proof_retires_bindings_preserves_selection);
+	UT_RUN(xmin_batch_plan_keeps_unselected_unproven_carriers);
+	UT_RUN(xmin_batch_plan_unproven_selected_carrier_is_atomic);
 	UT_RUN(aborted_candidates_revalidate_physical_row_without_saved_binding);
 	UT_RUN(aborted_candidates_keep_row_order_and_separate_equal_raw_carriers);
 	UT_RUN(aborted_candidates_refused_complete_proof_or_fence_preserves_output);
@@ -3433,7 +3624,7 @@ main(void)
 	UT_RUN(xmin_plan_compares_scn_time_without_node_id_ordering);
 	UT_RUN(xmin_plan_preserves_xmax_multi_and_other_header_bits);
 	UT_RUN(xmin_plan_revalidates_physical_target_instead_of_old_binding);
-	UT_RUN(xmin_plan_rejects_incomplete_proof_and_changed_final_fence);
+	UT_RUN(xmin_plan_rejects_missing_selected_proof_and_changed_final_fence);
 	UT_RUN(xmin_plan_rejects_special_raw_fullxids_and_legacy_xmin_states);
 	UT_RUN(xmin_plan_requires_finite_fullxid_and_history_bounds);
 	UT_RUN(xmin_plan_missing_arguments_and_bad_bounds_leave_output_untouched);

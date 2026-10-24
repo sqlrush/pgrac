@@ -60,6 +60,24 @@ UT_DEFINE_GLOBALS();
 #include "test_cluster_heap_small_scn.inc"
 #include "test_cluster_vacuum_freeze_locators.inc"
 bool cluster_enabled = true, cluster_shared_config = true;
+/* Native maintenance here uses the ordinary online TARGET_READY role;
+ * the authority fixtures own cold/recovered admission coverage. */
+BackendType MyBackendType = B_BACKEND;
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return CLUSTER_NORMAL_START_TARGET_READY;
+}
+bool
+cluster_semantic_activation_phase1_pristine(void)
+{
+	return false;
+}
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return false;
+}
 int cluster_node_id = 0, wal_level = WAL_LEVEL_REPLICA, NBuffers = 1, NLocBuffer;
 static BufferDescPadded descriptors[1];
 BufferDescPadded *BufferDescriptors = descriptors;
@@ -98,6 +116,7 @@ ErrorContextCallback *error_context_stack;
 static int32 backend_pin_count;
 static unsigned pin_checks;
 static bool flush_error;
+static bool space_buffer_permanent, space_permanence_error;
 static uint8 writer_state;
 static uint64 route_holder, route_master;
 static unsigned flushes;
@@ -445,7 +464,10 @@ BufferGetTag(Buffer buffer, RelFileLocator *locator, ForkNumber *forknum, BlockN
 bool
 BufferIsPermanent(Buffer buffer)
 {
-	return buffer == 1;
+	UT_ASSERT_EQ(buffer, 1);
+	if (space_permanence_error)
+		elog(ERROR, "injected SPACE buffer observation ERROR");
+	return space_buffer_permanent;
 }
 SCN
 cluster_scn_advance(void)
@@ -553,11 +575,11 @@ static void page_verify_redirects(Page page);
 #include "test_cluster_heap_freeze_helpers.inc"
 
 /* Plans here are fixture-qualified, not shared FullXid/provenance evidence. */
-static void
+static bool
 heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 						   TransactionId snapshotConflictHorizon,
 						   HeapTupleFreeze *tuples, int ntuples,
-						   const ClusterSpaceIdentity *identity)
+						   const ClusterSpaceIdentity *identity, bool conditional)
 #include "test_cluster_heap_freeze_apply.inc"
 
 #include "test_cluster_heap_freeze_xmin_apply.inc"
@@ -720,6 +742,7 @@ reset(uint8 opcode, bool shared)
 	route_holder = 11;
 	route_master = 12;
 	flush_error = false;
+	space_buffer_permanent = true; space_permanence_error = false;
 	tx_checks = redo_dirties = redo_releases = freeze_data_calls = 0;
 	freeze_block_length = 0;
 	expected_nplans = 1;
@@ -850,7 +873,7 @@ UT_TEST(test_qualified_freeze_kernel_changes_only_planned_headers)
 		tuples[i].t_infomask = HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID;
 		tuples[i].checkflags = HEAP_FREEZE_CHECK_XMIN_COMMITTED;
 	}
-	heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 2, &space_identity);
+	heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 2, &space_identity, false);
 	check_publication(true);
 	UT_ASSERT_EQ(tx_checks, 0);
 	UT_ASSERT_EQ(freeze_data_calls, 2);
@@ -955,7 +978,7 @@ UT_TEST(test_exact_xmin_plan_preserves_xmax_through_native_wal_and_redo)
 		if (!prepared)
 			continue;
 		tx_committed = false;
-		heap_freeze_apply_prepared(&relation_data, 1, 70, &plan, 1, &space_identity);
+		heap_freeze_apply_prepared(&relation_data, 1, 70, &plan, 1, &space_identity, false);
 		check_publication(true);
 		UT_ASSERT_EQ(tx_checks, 0);
 		UT_ASSERT_EQ(freeze_data_calls, 2);
@@ -1257,6 +1280,73 @@ UT_TEST(test_xmin_batch_later_origin_epoch_mismatch_is_atomic)
 		}
 		UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
 		UT_ASSERT_EQ(inserts + dirties + flushes + writer_checks + authority_checks, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_mixed_page_freezes_only_exact_selected_carriers)
+{
+	for (int resume = 0; resume < 2; resume++) {
+		QualifiedXminFixture f;
+		ClusterHeapFreezeXminTargetV1 targets[3];
+		bool applied;
+
+		qualified_xmin_batch_setup(&f, targets);
+		/* Select physical rows 3 and 1; row 2 has no terminal proof. */
+		f.proofs.proofs[1] = f.proofs.proofs[2];
+		f.proofs.proof_count = 2;
+		if (resume) {
+			ClusterHeapFreezeCanonicalProofV1 swap = f.proofs.proofs[0];
+			f.proofs.proofs[0] = f.proofs.proofs[1];
+			f.proofs.proofs[1] = swap;
+			fixture_release_original_writer(); resume_allowed = true;
+		}
+		UT_ASSERT_EQ(cluster_heap_freeze_validate_conditional_apply_v1(
+			&f.page, &f.proofs, &f.fence), CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+		applied = qualified_xmin_batch_apply(&f, targets, 2);
+		UT_ASSERT(applied);
+		if (!applied)
+			continue;
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT_EQ(conditional_resumes, resume);
+		UT_ASSERT_EQ(conditional_unlocks, resume);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(f.admission.entered);
+		UT_ASSERT_EQ(((xl_heap_freeze_page *)freeze_main_data.data)->snapshotConflictHorizon, 77);
+		for (int i = 1; i <= 3; i++) {
+			HeapTupleHeader tuple = freeze_tuple(current_page.data, i);
+			HeapTupleHeader old = freeze_tuple(before_page.data, i);
+			UT_ASSERT_EQ(tuple->t_infomask,
+				i == 2 ? old->t_infomask : old->t_infomask | HEAP_XMIN_FROZEN);
+			UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(tuple), HeapTupleHeaderGetRawXmin(old));
+			UT_ASSERT_EQ(HeapTupleHeaderGetRawXmax(tuple), HeapTupleHeaderGetRawXmax(old));
+			UT_ASSERT(memcmp(ClusterPageGetItlSlot(current_page.data, i - 1),
+				ClusterPageGetItlSlot(before_page.data, i - 1), sizeof(ClusterItlSlotData)) == 0);
+		}
+		UT_ASSERT(memcmp(freeze_tuple(current_page.data, 2),
+			freeze_tuple(before_page.data, 2), 64) == 0);
+		check_publication(true);
+		replay_freeze_record();
+	}
+}
+
+UT_TEST(test_xmin_mixed_page_refuses_missing_selected_or_invalid_supplied_proof)
+{
+	for (int variant = 0; variant < 3; variant++) {
+		QualifiedXminFixture f;
+		ClusterHeapFreezeXminTargetV1 targets[3];
+		qualified_xmin_batch_setup(&f, targets);
+		f.proofs.proofs[1] = f.proofs.proofs[2];
+		f.proofs.proof_count = 2;
+		if (variant == 1) f.proofs.proofs[1] = f.proofs.proofs[0];
+		if (variant == 2) f.proofs.proofs[1].current_fence.page_version++;
+		fixture_release_original_writer(); resume_allowed = true;
+		UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, variant == 0 ? 3 : 2));
+		UT_ASSERT_EQ(inserts, 0); UT_ASSERT_EQ(flushes, 0);
+		UT_ASSERT_EQ(conditional_resumes, 0);
+		UT_ASSERT_EQ(conditional_unlocks, 0);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
 		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
 	}
 }
@@ -1634,7 +1724,7 @@ UT_TEST(test_freeze_native_wal_dedup_and_redo)
 			tuples[i].checkflags = HEAP_FREEZE_CHECK_XMIN_COMMITTED;
 		}
 		if (shared)
-			heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 3, &space_identity);
+			heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 3, &space_identity, false);
 		else
 			run_freeze(&relation_data, 1, 70, tuples, 3, NULL);
 		check_publication(shared);
@@ -1706,7 +1796,7 @@ UT_TEST(test_freeze_kernel_rejects_invalid_space_before_write)
 		expecting_error = true;
 		if (setjmp(error_jump) == 0) {
 			heap_freeze_apply_prepared(&relation_data, 1, 70, &tuple, 1,
-									 bad == 4 ? NULL : &space_identity);
+									 bad == 4 ? NULL : &space_identity, false);
 			UT_ASSERT(false);
 		}
 		expecting_error = false;
@@ -2369,6 +2459,116 @@ UT_TEST(test_xmin_existing_local_x_never_reacquires_or_releases_it)
 	UT_ASSERT(fixture_node_grant_matches()); UT_ASSERT_EQ(backend_pin_count, 1);
 }
 
+
+/* Keep all captured/proof inputs mutually exact, but for another physical
+ * relation. The live buffer, original writer and target relation stay put. */
+static void
+qualified_xmin_rebind_foreign_object(QualifiedXminFixture *f, int field)
+{
+	RelFileLocator other = f->input.identity.key.locator;
+
+	if (field == 0) other.spcOid++;
+	if (field == 1) other.dbOid++;
+	if (field == 2) other.relNumber++;
+	f->input.identity.key.locator = other;
+	f->fence.identity.key.locator = other;
+	space_identity.key.locator = other;
+	UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&f->input, &f->page));
+	for (uint8 i = 0; i < f->proofs.proof_count; i++) {
+		ClusterHeapFreezeCanonicalProofV1 *proof = &f->proofs.proofs[i];
+		uint32 wrap = proof->resolution.locator_echo.tt_wrap;
+
+		proof->requested_locator = f->page.carrier_requests[i].locator;
+		proof->resolution.locator_echo = proof->requested_locator;
+		proof->resolution.locator_echo.tt_wrap = wrap;
+		proof->resolution.local_creation_target.locator = other;
+		proof->expected_fence = proof->current_fence = f->fence;
+	}
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f->page,
+		&f->proofs, &f->fence), f->proofs.proof_count);
+}
+
+UT_TEST(test_xmin_foreign_object_refuses_before_writer_or_native_wal)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int released = 0; released < 2; released++) {
+			for (int field = 0; field < 3; field++) {
+				QualifiedXminFixture f;
+				ClusterHeapFreezeXminTargetV1 targets[3];
+				HeapTupleFreeze plans[MaxHeapTuplesPerPage];
+				TransactionId conflict_horizon;
+				bool owned_x;
+				int pins;
+
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else {
+					qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+					targets[0] = (ClusterHeapFreezeXminTargetV1){
+						.tuple_index = 0,
+						.original_creator_full_xid = FullTransactionIdFromEpochAndXid(1, 77) };
+				}
+				qualified_xmin_rebind_foreign_object(&f, field);
+				/* This refusal must come from the live-object boundary, not an
+				 * internally inconsistent proof or an unqualified row plan. */
+				UT_ASSERT(cluster_heap_freeze_prepare_xmin_batch_v1(&f.page, &f.proofs,
+					&f.fence, targets, batch ? 2 : 1,
+					FullTransactionIdFromEpochAndXid(1, 100), 10,
+					plans, lengthof(plans), &conflict_horizon));
+				if (released) { fixture_release_original_writer(); resume_allowed = true; }
+				owned_x = local_x;
+				pins = backend_pin_count;
+				expecting_error = true;
+				if (setjmp(error_jump) == 0) {
+					UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 2)
+						: qualified_xmin_apply(&f, 0)));
+				} else {
+					expecting_error = false;
+					UT_ASSERT(false); /* Conditional refusal must not raise ERROR. */
+				}
+				expecting_error = false;
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+				UT_ASSERT_EQ(writer_checks + route_checks + admission_checks, 0);
+				UT_ASSERT_EQ(backend_pin_count, pins);
+				UT_ASSERT(local_x == owned_x && !resumed_writer && f.admission.entered);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+		}
+	}
+}
+
+
+UT_TEST(test_xmin_locked_kernel_refuses_foreign_proof_before_native_wal)
+{
+	for (int field = 0; field < 3; field++) {
+		QualifiedXminFixture f;
+		ClusterHeapFreezeXminTargetV1 target;
+		HeapTupleFreeze plan;
+		TransactionId conflict_horizon;
+
+		qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		qualified_xmin_rebind_foreign_object(&f, field);
+		target = (ClusterHeapFreezeXminTargetV1){ .tuple_index = 0,
+			.original_creator_full_xid = FullTransactionIdFromEpochAndXid(1, 77) };
+		UT_ASSERT(cluster_heap_freeze_prepare_xmin_batch_v1(&f.page, &f.proofs,
+			&f.fence, &target, 1, FullTransactionIdFromEpochAndXid(1, 100), 10,
+			&plan, 1, &conflict_horizon));
+		expecting_error = true;
+		if (setjmp(error_jump) == 0) {
+			UT_ASSERT(!cluster_heap_freeze_apply_xmin_batch_locked_v1(&relation_data,
+				1, &f.input, &f.page, &f.fence, &f.authority, &f.admission,
+				&target, 1, &plan, conflict_horizon, 10));
+		} else {
+			expecting_error = false;
+			UT_ASSERT(false);
+		}
+		expecting_error = false;
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+		UT_ASSERT_EQ(writer_checks + route_checks + admission_checks, 0);
+		UT_ASSERT(local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
 UT_TEST(test_xmin_existing_share_lock_is_not_a_resume_scope)
 {
 	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
@@ -2379,10 +2579,136 @@ UT_TEST(test_xmin_existing_share_lock_is_not_a_resume_scope)
 	UT_ASSERT_EQ(backend_pin_count, 1);
 }
 
+
+UT_TEST(test_xmin_rejects_unknown_generation_or_foreign_origin_before_writer)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int released = 0; released < 2; released++) {
+			for (int variant = 0; variant < 2; variant++) {
+				QualifiedXminFixture f;
+				ClusterHeapFreezeXminTargetV1 targets[3];
+				bool owned_x;
+				int pins;
+
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+				if (variant == 0) f.proofs.proofs[0].resolution.local_canonical_generation = UINT32_MAX;
+				else f.proofs.proofs[0].resolution.local_canonical.segment_id = CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+				if (released) { fixture_release_original_writer(); resume_allowed = true; }
+				owned_x = local_x; pins = backend_pin_count;
+				UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 2)
+					: qualified_xmin_apply(&f, 0)));
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+				UT_ASSERT_EQ(writer_checks + route_checks + admission_checks, 0);
+				UT_ASSERT_EQ(backend_pin_count, pins);
+				UT_ASSERT(local_x == owned_x && !resumed_writer && f.admission.entered);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_xmin_space_refusal_is_conditional)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int released = 0; released < 2; released++) {
+			QualifiedXminFixture f;
+			ClusterHeapFreezeXminTargetV1 targets[3];
+			volatile bool applied = false, caught = false;
+
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			if (released) { fixture_release_original_writer(); resume_allowed = true; }
+			/* The real SPACE component builder consumes this buffer observation.
+			 * No prepare/stamp/WAL helper is replaced by a refusal stub. */
+			space_buffer_permanent = false; expecting_error = true;
+			PG_TRY();
+			{
+				applied = batch ? qualified_xmin_batch_apply(&f, targets, 2)
+					: qualified_xmin_apply(&f, 0);
+			}
+			PG_CATCH(); { caught = true; } PG_END_TRY();
+			expecting_error = false;
+			UT_ASSERT(!caught && !applied);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT_EQ(CritSectionCount, 0);
+			UT_ASSERT_EQ(next_token, 100);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(f.admission.entered && local_x == !released && !resumed_writer);
+			UT_ASSERT_EQ(conditional_resumes, released);
+			UT_ASSERT_EQ(conditional_unlocks, released);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_xmin_space_error_still_propagates)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int released = 0; released < 2; released++) {
+			QualifiedXminFixture f;
+			ClusterHeapFreezeXminTargetV1 targets[3];
+			volatile bool caught = false;
+
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
+			if (released) { fixture_release_original_writer(); resume_allowed = true; }
+			space_permanence_error = expecting_error = true;
+			PG_TRY();
+			{
+				if (batch) (void)qualified_xmin_batch_apply(&f, targets, 2);
+				else (void)qualified_xmin_apply(&f, 0);
+			}
+			PG_CATCH(); { caught = true; } PG_END_TRY();
+			expecting_error = false;
+			UT_ASSERT(caught);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT_EQ(CritSectionCount, 0);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(f.admission.entered && local_x == !released && !resumed_writer);
+			UT_ASSERT_EQ(conditional_unlocks, released);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_original_freeze_space_refusal_still_errors)
+{
+	QualifiedXminFixture f;
+	HeapTupleFreeze plan;
+	volatile bool caught = false;
+
+	qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
+	UT_ASSERT(cluster_heap_freeze_prepare_xmin_v1(&f.page, &f.proofs, &f.fence,
+		0, FullTransactionIdFromEpochAndXid(1, 77),
+		FullTransactionIdFromEpochAndXid(1, 100), 10, &plan));
+	space_buffer_permanent = false; expecting_error = true;
+	PG_TRY();
+	{
+		heap_freeze_apply_prepared(&relation_data, 1, 77, &plan, 1, &space_identity, false);
+	}
+	PG_CATCH(); { caught = true; } PG_END_TRY();
+	expecting_error = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(f.admission.entered && local_x);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(66);
+	UT_PLAN(74);
+	UT_RUN(test_xmin_space_refusal_is_conditional);
+	UT_RUN(test_xmin_space_error_still_propagates);
+	UT_RUN(test_original_freeze_space_refusal_still_errors);
+	UT_RUN(test_xmin_rejects_unknown_generation_or_foreign_origin_before_writer);
+	UT_RUN(test_xmin_locked_kernel_refuses_foreign_proof_before_native_wal);
+	UT_RUN(test_xmin_foreign_object_refuses_before_writer_or_native_wal);
+	UT_RUN(test_xmin_mixed_page_freezes_only_exact_selected_carriers);
+	UT_RUN(test_xmin_mixed_page_refuses_missing_selected_or_invalid_supplied_proof);
 	UT_RUN(test_xmin_actual_writer_keeps_original_ko_revision_before_lock);
 	UT_RUN(test_xmin_actual_resumer_inner_error_cleans_before_native_wrapper);
 	UT_RUN(test_xmin_released_writer_requires_actual_original_node_grant);

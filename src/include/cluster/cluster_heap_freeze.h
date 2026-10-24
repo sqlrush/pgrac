@@ -275,8 +275,8 @@ cluster_heap_freeze_validate_conditional_apply_v1(
 	const ClusterHeapFreezeFinalFenceV1 *current_fence);
 
 /*
- * Validate a nonempty exact subset for delayed carrier cleanout only.  Every
- * supplied proof must satisfy the same canonical and final-fence checks as
+ * Validate a nonempty exact subset for row inputs or delayed carrier cleanout.
+ * Every supplied proof must satisfy the same canonical and final-fence checks as
  * conditional apply.  Uncovered carriers remain unproven; this predicate
  * grants no whole-page apply, tuple-freeze or retention permission.
  */
@@ -287,7 +287,8 @@ cluster_heap_freeze_validate_carrier_cleanout_v1(
 	const ClusterHeapFreezeFinalFenceV1 *current_fence);
 
 /* Reset prior associations and bind only exact committed creation targets to
- * their physical row/carrier in a complete, validated proof batch. An optional
+ * their physical row/carrier in a validated exact proof subset. Uncovered rows
+ * lose their previous associations and remain unqualified. An optional
  * exact original FullXid follows only that matching row; its absence stays
  * unqualified. No F/H eligibility, final apply ownership or retention is implied. */
 extern uint16 cluster_heap_freeze_bind_creation_targets_v1(
@@ -342,6 +343,9 @@ struct HeapTupleFreeze;
  * The independently qualified creator must also equal the complete original
  * FullXid carried by the matched row and its exact canonical creation proof;
  * missing identities or equal raw XIDs from different epochs cannot qualify.
+ * Unselected page carriers may be unproven. Every supplied proof is still
+ * validated, and this row must match its own exact committed creation proof;
+ * accepting a subset does not qualify the whole page or any unselected row.
  */
 extern bool cluster_heap_freeze_prepare_xmin_v1(
 	const ClusterHeapFreezePageBatchV1 *page,
@@ -378,6 +382,8 @@ typedef struct ClusterHeapFreezeXminCandidateBatchV1
  * only screen candidates; their positive provenance/admission remains the
  * caller's responsibility. Rechecks exact committed creation evidence and
  * the complete original FullXid; never widens raw XIDs or emits native plans.
+ * A validated proof subset selects only matching rows; missing evidence for
+ * another carrier cannot qualify it through an old association or equal raw XID.
  * False preserves *out; true replaces it, including an empty selection.
  * Call without page/pin/census locks before later final ownership checks. */
 extern bool cluster_heap_freeze_select_xmin_candidates_v1(
@@ -393,6 +399,8 @@ extern bool cluster_heap_freeze_select_xmin_candidates_v1(
  * later row, duplicate physical offset or ambiguous native conflict horizon.
  * The caller supplies capacity for out_plans and independently qualifies the
  * original identities and finite F/H bounds under the single-target contract.
+ * Proofs may cover only selected carriers; any unproven selected row refuses
+ * the entire batch before publication. Unselected rows are not planned.
  * This performs no page/pin acquisition, mutation, WAL or admission. */
 extern bool cluster_heap_freeze_prepare_xmin_batch_v1(
 	const ClusterHeapFreezePageBatchV1 *page,

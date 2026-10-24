@@ -20920,12 +20920,12 @@ heap_execute_freeze_tuple(HeapTupleHeader tuple, HeapTupleFreeze *frz)
  * Keep SPACE preparation outside the critical section and page changes in the
  * same native FREEZE_PAGE WAL record.
  */
-static void
+static bool
 heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 						   TransactionId snapshotConflictHorizon,
 						   HeapTupleFreeze *tuples, int ntuples
 #ifdef USE_PGRAC_CLUSTER
-						   , const ClusterSpaceIdentity *identity
+						   , const ClusterSpaceIdentity *identity, bool conditional
 #endif
 						   )
 {
@@ -20949,7 +20949,14 @@ heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 			|| !RelFileLocatorEquals(identity->key.locator, rel->rd_locator)
 			|| !cluster_space_prepare_buffer_versions(identity, &buffer, &block_id, 1,
 				&version_batch))
+		{
+			/* The qualified continuation may miss this last comparison.
+			 * Refuse before the critical section; real ERROR still unwinds
+			 * through its original writer/pin/admission resource owners. */
+			if (conditional)
+				return false;
 			elog(ERROR, "PGRAC shared heap freeze requires exact SPACE identity");
+		}
 	}
 #endif
 	START_CRIT_SECTION();
@@ -21010,6 +21017,7 @@ heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 	}
 
 	END_CRIT_SECTION();
+	return true;
 }
 
 #ifdef USE_PGRAC_CLUSTER
@@ -21057,6 +21065,7 @@ cluster_heap_freeze_apply_xmin_batch_locked_v1(
 		return false;
 	BufferGetTag(buffer, &locator, &fork, &block);
 	if (!RelFileLocatorEquals(locator, rel->rd_locator)
+		|| !RelFileLocatorEquals(locator, fence->identity.key.locator)
 		|| fork != MAIN_FORKNUM || block != fence->block)
 		return false;
 	InitBufferTag(&tag, &locator, fork, block);
@@ -21137,9 +21146,10 @@ cluster_heap_freeze_apply_xmin_batch_locked_v1(
 		return false;
 
 	/* Native redo and the existing SPACE version edge remain the only format. */
-	heap_freeze_apply_prepared(rel, buffer,
+	if (!heap_freeze_apply_prepared(rel, buffer,
 		conflict_horizon, plans, target_count,
-		&fence->identity);
+		&fence->identity, true))
+		return false;
 	XLogFlush(PageGetLSN(live_page));
 	return true;
 }
@@ -21167,6 +21177,11 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 	 * or replace an already-owned local lock. */
 	if (buffer <= 0 || buffer > NBuffers || BufferDescriptors == NULL
 		|| !ClusterBufferHasSharedPin(buffer))
+		return false;
+	/* Exact proof inputs for another relation cannot restore this buffer's
+	 * writer or enter the native maintenance error path. */
+	if (rel == NULL || fence == NULL
+		|| !RelFileLocatorEquals(rel->rd_locator, fence->identity.key.locator))
 		return false;
 	/* Plan only from the caller's immutable captured inputs. Finish the
 	 * whole batch before restoring a writer or taking its local content X;
@@ -21319,7 +21334,7 @@ heap_freeze_execute_prepared(Relation rel, Buffer buffer,
 	heap_freeze_apply_prepared(rel, buffer, snapshotConflictHorizon, tuples,
 							   ntuples
 #ifdef USE_PGRAC_CLUSTER
-							   , identity
+							   , identity, false
 #endif
 							   );
 }
