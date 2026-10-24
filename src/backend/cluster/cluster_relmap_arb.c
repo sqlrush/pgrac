@@ -42,6 +42,7 @@
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_relmap_arb.h"
 #include "cluster/cluster_relmap_authority.h"
+#include "cluster/cluster_relmap_lock.h"
 #include "cluster/cluster_remote_xact.h"
 #include "cluster/cluster_sinval.h"
 #include "storage/fd.h"
@@ -87,6 +88,79 @@ broadcast_relmap_inval(Oid dbid)
 									"arbitration.")));
 	}
 }
+
+#ifdef USE_PGRAC_CLUSTER
+ClusterRelmapV2ClearResult
+cluster_relmap_arbitrate_pending_v2(ClusterRelmapRecoveryHandle **custody,
+									const ClusterRelmapV2Namespace *identity,
+									const ClusterRelmapV2View *pending)
+{
+	ClusterRelmapRecoveryHandle *handle;
+	ClusterRelmapV2ClearResult result = CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+
+	if (custody == NULL || *custody == NULL)
+		return result;
+	/* A failed attempt cannot reuse local custody. The original scope, source
+	 * pins and retention obligation remain the caller's property throughout. */
+	handle = *custody;
+	*custody = NULL;
+	PG_TRY();
+	{
+		do {
+			ClusterRelmapV2Namespace ns;
+			ClusterRelmapV2View view;
+			ClusterRelmapV2Image staged;
+			ClusterRelmapRecoveryTerminalV1 terminal;
+			unsigned char bytes[CLUSTER_RELMAP_V2_FILE_SIZE];
+			bool publish;
+
+			if (identity == NULL || pending == NULL || !cluster_shared_catalog
+				|| !cluster_recovery_merge_claim_is_held() || !cluster_relmap_authority_x_held())
+				break;
+			/* Own one immutable view across native and authority I/O. Neither a
+			 * new on-disk committed map nor a raw local XID may replace its base. */
+			ns = *identity;
+			view = *pending;
+			if (!view.pending_complete || !view.has_pending
+				|| !cluster_relmap_recovery_terminal_read(handle, &ns, &view, &terminal))
+				break;
+			if (terminal.status != TRANSACTION_STATUS_COMMITTED
+				&& terminal.status != TRANSACTION_STATUS_ABORTED)
+				break;
+			publish = terminal.status == TRANSACTION_STATUS_COMMITTED;
+			memset(&staged, 0, sizeof(staged));
+			staged.identity = ns;
+			staged.committed_generation = view.pending_committed_generation;
+			staged.committed = view.pending_committed;
+			staged.pending_generation = view.pending_generation;
+			staged.pending_owner = view.pending_owner;
+			staged.pending = view.pending;
+			if (cluster_relmap_v2_encode(&staged, bytes, sizeof(bytes)) != CLUSTER_RELMAP_V2_VALID
+				|| !cluster_recovery_merge_claim_is_held() || !cluster_relmap_authority_x_held())
+				break;
+			if ((publish ? cluster_relmap_authority_v2_publish(&staged)
+						 : cluster_relmap_authority_v2_discard_pending(&staged))
+				!= CLUSTER_RELMAP_V2_CLEARED_POSTREAD)
+				break;
+			/* A post-write refusal is not rollback. Do not acknowledge clearance
+			 * or retire any original pin after losing the same cold-round proof. */
+			if (!cluster_relmap_recovery_handle_matches_v1(handle, &ns, &view)
+				|| !cluster_recovery_merge_claim_is_held() || !cluster_relmap_authority_x_held())
+				break;
+			if (publish)
+				broadcast_relmap_inval(ns.dbid);
+			if (cluster_recovery_merge_claim_is_held() && cluster_relmap_authority_x_held())
+				result = CLUSTER_RELMAP_V2_CLEARED_POSTREAD;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		cluster_relmap_recovery_handle_release_v1(&handle);
+	}
+	PG_END_TRY();
+	return result;
+}
+#endif
 
 /*
  * arbitrate_one -- resolve one authority's pending image, if any.
