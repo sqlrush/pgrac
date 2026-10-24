@@ -166,6 +166,9 @@ typedef struct ClusterHeapFreezeCohortObservation {
 
 /* Pure match of retained, separately current-checked inputs. These are
  * candidate bounds only, not a positive F/H or producer-retention certificate.
+ * The selected Min(policy,F) must remain strictly inside the original
+ * policy legal-next past half-space; a higher ignored F does not qualify
+ * or invalidate that selected bound.
  * No nextXid/H sample, current fetch, lock or identity callback is performed.
  * Failure preserves *out; the caller still owns the original admission and
  * must qualify provenance/retention before any native plan or shared write. */

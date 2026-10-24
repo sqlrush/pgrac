@@ -3181,12 +3181,35 @@ UT_TEST(native_window_empty_subset_keeps_other_proof_observations)
 	UT_ASSERT_EQ(debt, 0); UT_ASSERT_STR_EQ(cleanup_order, "LPA");
 }
 
+UT_TEST(observed_cutoff_outside_native_window_keeps_proofs_without_candidates)
+{
+	for (unsigned variant = 0; variant < 3; variant++) {
+		uint64 legal;
+		reset_fixture(); set_shared_policy(80);
+		legal = U64FromFullTransactionId(vacrel.cutoffs.SharedFreezePolicySample.legal_next);
+		cohort_value.active_full_xid_min = legal - UINT64CONST(0x80000000) - variant;
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT(!vacrel.shared_freeze_cohort_observed);
+		UT_ASSERT(!FullTransactionIdIsValid(vacrel.shared_freeze_candidate_limit_full));
+		UT_ASSERT(vacrel.shared_freeze_input.freeze_policy == NULL);
+		UT_ASSERT(vacrel.shared_freeze_input.freeze_cohort == NULL);
+		UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.target_count, 0);
+		UT_ASSERT_EQ(vacrel.shared_freeze_proofs.proof_count, 1);
+		UT_ASSERT(vacrel.shared_freeze_fence_valid);
+		UT_ASSERT_EQ(debt, 0); UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+	}
+}
+
 UT_TEST(native_window_subset_uses_original_legal_next_not_freeze_limit)
 {
 	reset_fixture(); set_shared_policy(80);
 	vacrel.cutoffs.SharedFreezePolicySample.legal_next = FullTransactionIdFromU64(
 		U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 77))
 		+ UINT64CONST(0x7fffffff));
+	/* Keep the selected cutoff inside this original N_legal window; only
+	 * the second creator falls outside it. */
+	cohort_value.active_full_xid_min = U64FromFullTransactionId(
+		FullTransactionIdFromEpochAndXid(1, 79));
 	use_candidate_value = true;
 	candidate_value.target_count = 2;
 	vacrel.shared_freeze_batch.tuple_count = 2;
@@ -3205,9 +3228,10 @@ UT_TEST(native_window_subset_uses_original_legal_next_not_freeze_limit)
 int
 main(void)
 {
-	UT_PLAN(123);
+	UT_PLAN(124);
 	UT_RUN(native_window_candidate_subset_keeps_physical_order);
 	UT_RUN(native_window_empty_subset_keeps_other_proof_observations);
+	UT_RUN(observed_cutoff_outside_native_window_keeps_proofs_without_candidates);
 	UT_RUN(native_window_subset_uses_original_legal_next_not_freeze_limit);
 	UT_RUN(bound_sources_borrow_original_owned_policy_and_cohort);
 	UT_RUN(refused_collection_retires_previous_bound_source_borrows);

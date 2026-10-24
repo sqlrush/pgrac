@@ -1032,6 +1032,67 @@ UT_TEST(observed_bounds_cohort_refusal_and_nulls_preserve_output)
 	}
 }
 
+UT_TEST(observed_bounds_selected_cutoff_refuses_native_halfspace_alias)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		ClusterHeapFreezePolicySampleV1 policy;
+		ClusterHeapFreezeCohortObservation cohort;
+		ClusterSemanticAdmissionToken admission;
+		ClusterHeapFreezeObservedBoundsV1 out, saved;
+		uint64 legal;
+		observed_bounds_fixture(&policy, &cohort, &admission);
+		legal = U64FromFullTransactionId(policy.legal_next);
+		switch (variant) {
+		case 0: cohort.active_full_xid_min = legal - UINT64CONST(0x80000000); break;
+		case 1: cohort.active_full_xid_min = legal - UINT64CONST(0x80000001); break;
+		case 2: cohort.active_full_xid_min = legal - UINT64CONST(0x100000000); break;
+		case 3: cohort.active_full_xid_min = FirstNormalTransactionId; break;
+		}
+		memset(&out, 0x5a, sizeof(out)); saved = out;
+		UT_ASSERT(!cluster_heap_freeze_observed_bounds_v1(&policy, &cohort,
+			&admission, 0, &out));
+		UT_ASSERT_EQ(memcmp(&out, &saved, sizeof(out)), 0);
+		UT_ASSERT_EQ(activation_reads, 0);
+	}
+}
+
+UT_TEST(observed_bounds_selected_cutoff_keeps_exact_native_window_edge)
+{
+	for (int variant = 0; variant < 2; variant++) {
+		ClusterHeapFreezePolicySampleV1 policy;
+		ClusterHeapFreezeCohortObservation cohort;
+		ClusterSemanticAdmissionToken admission;
+		ClusterHeapFreezeObservedBoundsV1 out;
+		uint64 legal;
+		observed_bounds_fixture(&policy, &cohort, &admission);
+		legal = U64FromFullTransactionId(policy.legal_next);
+		cohort.active_full_xid_min = variant == 0
+			? legal - UINT64CONST(0x7fffffff)
+			: U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, UINT32_MAX));
+		UT_ASSERT(cluster_heap_freeze_observed_bounds_v1(&policy, &cohort,
+			&admission, 0, &out));
+		UT_ASSERT_EQ(U64FromFullTransactionId(out.freeze_limit), cohort.active_full_xid_min);
+		UT_ASSERT_EQ(out.horizon_scn, cohort.horizon_scn);
+		UT_ASSERT_EQ(activation_reads, 0);
+	}
+}
+
+UT_TEST(observed_bounds_checks_selected_minimum_not_ignored_future_bound)
+{
+	ClusterHeapFreezePolicySampleV1 policy;
+	ClusterHeapFreezeCohortObservation cohort;
+	ClusterSemanticAdmissionToken admission;
+	ClusterHeapFreezeObservedBoundsV1 out;
+	observed_bounds_fixture(&policy, &cohort, &admission);
+	cohort.active_full_xid_min = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(3, 80));
+	cohort.future_full_xid_max = cohort.active_full_xid_min + 1000;
+	UT_ASSERT(cluster_heap_freeze_observed_bounds_v1(&policy, &cohort,
+		&admission, 0, &out));
+	UT_ASSERT(FullTransactionIdEquals(out.freeze_limit, policy.freeze_limit));
+	UT_ASSERT_EQ(out.horizon_scn, cohort.horizon_scn);
+	UT_ASSERT_EQ(activation_reads, 0);
+}
+
 UT_TEST(observed_bounds_keep_fullxid_epoch_and_high_member_bit)
 {
 	ClusterHeapFreezePolicySampleV1 policy;
@@ -1040,7 +1101,7 @@ UT_TEST(observed_bounds_keep_fullxid_epoch_and_high_member_bit)
 	ClusterHeapFreezeObservedBoundsV1 out;
 
 	observed_bounds_fixture(&policy, &cohort, &admission);
-	cohort.active_full_xid_min = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 80));
+	cohort.active_full_xid_min = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, UINT32_MAX - 100));
 	cohort.admitted_members_hi = cohort.admission_fence.admitted_members_hi = UINT64CONST(1) << 63;
 	cohort.admission_fence.local_node_id = 127;
 	UT_ASSERT(cluster_heap_freeze_observed_bounds_v1(&policy, &cohort, &admission, 127, &out));
@@ -1051,11 +1112,14 @@ UT_TEST(observed_bounds_keep_fullxid_epoch_and_high_member_bit)
 int
 main(void)
 {
-	UT_PLAN(52);
+	UT_PLAN(55);
 	UT_RUN(observed_bounds_cap_policy_at_same_cohort_and_preserve_h_domain);
 	UT_RUN(observed_bounds_identity_refusal_preserves_complete_output);
 	UT_RUN(observed_bounds_policy_window_refusal_is_atomic);
 	UT_RUN(observed_bounds_cohort_refusal_and_nulls_preserve_output);
+	UT_RUN(observed_bounds_selected_cutoff_refuses_native_halfspace_alias);
+	UT_RUN(observed_bounds_selected_cutoff_keeps_exact_native_window_edge);
+	UT_RUN(observed_bounds_checks_selected_minimum_not_ignored_future_bound);
 	UT_RUN(observed_bounds_keep_fullxid_epoch_and_high_member_bit);
 	UT_RUN(policy_sample_retains_original_legal_next_and_allocation_fence);
 	UT_RUN(policy_sample_refusal_preserves_complete_output);

@@ -407,6 +407,12 @@ cluster_heap_freeze_observed_bounds_v1(
 	 * domain. Neither numeric match supplies producer-retention authority. */
 	bounds.freeze_limit = FullTransactionIdFromU64(
 		Min(U64FromFullTransactionId(policy->freeze_limit), cohort->active_full_xid_min));
+	/* The policy alone may fit N_legal while an older selected F does not.
+	 * Check the final minimum before any consumer can narrow it to native
+	 * XID semantics. A higher, ignored F must not reject the policy bound. */
+	if (U64FromFullTransactionId(policy->legal_next)
+		- U64FromFullTransactionId(bounds.freeze_limit) >= UINT64CONST(0x80000000))
+		return false;
 	bounds.horizon_scn = cohort->horizon_scn;
 	memcpy(out, &bounds, sizeof(bounds));
 	return true;
