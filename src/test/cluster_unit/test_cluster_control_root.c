@@ -99,10 +99,12 @@ char *cluster_shared_data_dir = NULL;
 char *cluster_wal_threads_dir = NULL;
 char *DataDir = NULL;
 int cluster_node_id = 0;
+int MyProcPid;
 bool enableFsync = true;
 bool cluster_enabled = true;
 bool cluster_controlfile_shared_authority = true;
 bool cluster_shared_config = false;
+bool cluster_trace_control_config = false;
 ResourceOwner CurrentResourceOwner = (ResourceOwner)(uintptr_t)1;
 BackgroundWorker *MyBgworkerEntry;
 
@@ -163,6 +165,12 @@ static LOCKMODE test_actual_cf;
 static bool test_config_failed_acquire_retains;
 static const void *test_cf_local_caller;
 static bool test_cf_tagged_retiring;
+static bool test_cf_owned_acquiring;
+static bool test_capture_cf_config;
+static char test_cf_config_log[3072];
+static unsigned test_cf_config_logs, test_cf_observation_reads, test_cf_usable_reads;
+static unsigned test_cf_clusterwide_refuse_after, test_cf_clusterwide_reads;
+static ClusterCfAttemptObservation test_cf_observation;
 static unsigned test_history_sync_count, test_history_fail_sync;
 static bool test_throw_root_read;
 /* Native MC lifetime boundary only. The standalone fixture uses frontend
@@ -592,6 +600,10 @@ cluster_cf_owner_eor_local_active(void)
 bool
 cluster_cf_held_is_usable(LOCKMODE mode pg_attribute_unused())
 {
+	if (test_capture_cf_config) {
+		++test_cf_usable_reads;
+		return test_actual_cf == mode && !test_cf_tagged_retiring;
+	}
 	/* Native clean-seed publication is outside this root fixture. */
 	abort();
 }
@@ -781,7 +793,7 @@ errstart(int elevel, const char *domain pg_attribute_unused())
 	}
 	if (elevel >= ERROR)
 		abort();
-	return false;
+	return test_capture_cf_config && elevel == LOG;
 }
 
 bool
@@ -795,8 +807,15 @@ cluster_cf_counter_inc(ClusterCfCounter which pg_attribute_unused())
 {}
 
 int
-errmsg(const char *fmt pg_attribute_unused(), ...)
+errmsg(const char *fmt, ...)
 {
+	if (test_capture_cf_config && strstr(fmt, "PGRAC_FAMILY=CF_CONFIG") != NULL) {
+		va_list args;
+		va_start(args, fmt);
+		vsnprintf(test_cf_config_log, sizeof(test_cf_config_log), fmt, args);
+		va_end(args);
+		++test_cf_config_logs;
+	}
 	return 0;
 }
 
@@ -821,7 +840,7 @@ errmsg_internal(const char *fmt pg_attribute_unused(), ...)
 bool
 errstart_cold(int elevel, const char *domain)
 {
-	if (test_capture_error_level)
+	if (test_capture_error_level || test_capture_cf_config)
 		return errstart(elevel, domain);
 	return false;
 }
@@ -1136,11 +1155,44 @@ cluster_cf_lock_poll(LOCKMODE mode)
 bool
 cluster_cf_lock_poll_owned(LOCKMODE mode, const void *caller)
 {
+	if (test_capture_cf_config) {
+		++test_cf_observation.sequence;
+		test_cf_observation.mode = mode;
+		test_cf_observation.cooperative = true;
+		test_cf_observation.caller = caller;
+		test_cf_observation.result = test_cf_grant ? CLUSTER_LOCK_ACQUIRE_OK_GRANTED
+													 : CLUSTER_LOCK_ACQUIRE_PENDING;
+		test_cf_observation.source = CLUSTER_GES_TSRC_NONE;
+		test_cf_observation.owner_state_at_return = test_cf_grant ? CLUSTER_LOCK_OWNER_HELD
+																	 : CLUSTER_LOCK_OWNER_ACQUIRING;
+		test_cf_observation.request_id = 73;
+		test_cf_observation.request_epoch = test_epoch;
+		test_cf_observation.control_owner_id = 101;
+	}
 	if (test_actual_cf != NoLock && test_cf_local_caller != caller)
 		return false;
-	if (!cluster_cf_lock(mode))
+	if (!cluster_cf_lock(mode)) {
+		if (test_config_failed_acquire_retains)
+			test_cf_local_caller = caller;
 		return false;
+	}
 	test_cf_local_caller = caller;
+	return true;
+}
+uint64
+cluster_cf_attempt_sequence(void)
+{
+	++test_cf_observation_reads;
+	return test_cf_observation.sequence;
+}
+bool
+cluster_cf_last_attempt_since(uint64 before, ClusterCfAttemptObservation *out)
+{
+	++test_cf_observation_reads;
+	memset(out, 0, sizeof(*out));
+	if (before >= test_cf_observation.sequence || test_cf_observation.sequence == UINT64_MAX)
+		return false;
+	*out = test_cf_observation;
 	return true;
 }
 bool
@@ -1149,10 +1201,9 @@ cluster_cf_held_by(LOCKMODE mode, const void *caller)
 	return test_actual_cf == mode && test_cf_local_caller == caller;
 }
 bool
-cluster_cf_acquire_pending_owned(LOCKMODE mode pg_attribute_unused(),
-								 const void *caller pg_attribute_unused())
+cluster_cf_acquire_pending_owned(LOCKMODE mode, const void *caller)
 {
-	return false;
+	return test_cf_owned_acquiring && cluster_cf_held_by(mode, caller);
 }
 ClusterCfReleaseResult
 cluster_cf_unlock_owned(LOCKMODE mode, const void *caller)
@@ -1205,6 +1256,9 @@ cluster_grd_lookup_master_gen(const ClusterResId *resid pg_attribute_unused(), u
 bool
 cluster_cf_held_is_clusterwide(LOCKMODE mode)
 {
+	if (test_cf_clusterwide_refuse_after != 0
+		&& ++test_cf_clusterwide_reads > test_cf_clusterwide_refuse_after)
+		return false;
 	if (test_reserve_mode)
 		return test_cf_grant && test_cf_clusterwide && test_actual_cf == mode;
 	return test_cf_grant && test_cf_clusterwide && (test_cf_mode == NoLock || test_cf_mode == mode);
@@ -22101,6 +22155,181 @@ config_poll_fixture(void)
 	return ref;
 }
 
+static ClusterSharedConfigRef
+config_trace_fixture(void)
+{
+	ClusterSharedConfigRef prior = config_poll_fixture();
+	MyProcPid = (int)getpid();
+	test_capture_cf_config = true;
+	cluster_trace_control_config = true;
+	test_cf_config_logs = test_cf_observation_reads = test_cf_usable_reads = 0;
+	test_cf_config_log[0] = '\0';
+	test_cf_release_confirmed = false;
+	test_now += INT64_C(5000001);
+	return prior;
+}
+
+static void
+config_trace_cleanup(void)
+{
+	cluster_trace_control_config = false;
+	test_cf_release_confirmed = true;
+	cluster_control_root_config_cancel();
+	cluster_cf_retirement_poll();
+	test_actual_cf = NoLock;
+	test_cf_local_caller = NULL;
+	test_cf_tagged_retiring = false;
+	test_capture_cf_config = false;
+	test_cf_clusterwide_refuse_after = test_cf_clusterwide_reads = 0;
+	test_config_failed_acquire_retains = test_cf_owned_acquiring = false;
+	MyBackendType = B_INVALID;
+}
+
+UT_TEST(test_config_trace_off_does_not_observe_or_acquire_blocked_hold)
+{
+	ClusterSharedConfigRef prior = config_trace_fixture();
+	ClusterSharedConfigSelected selected;
+	ClusterSharedConfigImage image = { 0 };
+	unsigned calls = test_cf_lock_calls;
+	unsigned order = test_order_seq;
+	cluster_trace_control_config = false;
+	test_actual_cf = ExclusiveLock;
+	UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image),
+				 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	UT_ASSERT_EQ(test_cf_config_logs, 0);
+	UT_ASSERT_EQ(test_cf_observation_reads, 0);
+	UT_ASSERT_EQ(test_cf_usable_reads, 0);
+	UT_ASSERT_EQ(test_cf_lock_calls, calls);
+	UT_ASSERT_EQ(test_order_seq, order);
+	UT_ASSERT_EQ(test_actual_cf, ExclusiveLock);
+	UT_ASSERT(v2_zero(&selected, sizeof(selected)) && v2_zero(&image, sizeof(image)));
+	cluster_trace_control_config = true;
+	CritSectionCount = 1;
+	UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image),
+				 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	CritSectionCount = 0;
+	UT_ASSERT_EQ(test_cf_config_logs, 0);
+	UT_ASSERT_EQ(test_cf_observation_reads, 0);
+	UT_ASSERT_EQ(test_cf_lock_calls, calls);
+	config_trace_cleanup();
+}
+
+UT_TEST(test_config_trace_names_blocked_modes_without_stale_attempt)
+{
+	static const char other_task;
+	for (unsigned mode = 0; mode < 2; ++mode) {
+		ClusterSharedConfigRef prior = config_trace_fixture();
+		ClusterSharedConfigSelected selected;
+		ClusterSharedConfigImage image = { 0 };
+		unsigned calls = test_cf_lock_calls;
+		unsigned order = test_order_seq;
+		test_actual_cf = mode == 0 ? ExclusiveLock : ShareLock;
+		test_cf_local_caller = &other_task;
+		test_cf_observation.sequence = 200;
+		test_cf_observation.request_id = 999;
+		UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image),
+					 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+		UT_ASSERT_EQ(test_cf_config_logs, 1);
+		UT_ASSERT(strstr(test_cf_config_log, mode == 0 ? "stage=blocked_x" : "stage=blocked_s"));
+		UT_ASSERT(strstr(test_cf_config_log, "attempt_present=0"));
+		UT_ASSERT(strstr(test_cf_config_log, "request_id=0"));
+		UT_ASSERT(strstr(test_cf_config_log, "s_own=0"));
+		UT_ASSERT(strstr(test_cf_config_log, "task=config_select"));
+		UT_ASSERT_EQ(test_cf_lock_calls, calls);
+		UT_ASSERT_EQ(test_order_seq, order);
+		UT_ASSERT(v2_zero(&selected, sizeof(selected)) && v2_zero(&image, sizeof(image)));
+		config_trace_cleanup();
+	}
+}
+
+UT_TEST(test_config_trace_same_call_attempt_and_five_second_bound)
+{
+	ClusterSharedConfigRef prior = config_trace_fixture();
+	ClusterSharedConfigSelected selected;
+	ClusterSharedConfigImage image = { 0 };
+	unsigned calls = test_cf_lock_calls;
+	unsigned observations;
+	test_cf_grant = false;
+	UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image),
+				 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	UT_ASSERT_EQ(test_cf_config_logs, 1);
+	UT_ASSERT(strstr(test_cf_config_log, "stage=acquire_poll"));
+	UT_ASSERT(strstr(test_cf_config_log, "attempt_present=1"));
+	UT_ASSERT(strstr(test_cf_config_log, "attempt_own=1"));
+	UT_ASSERT(strstr(test_cf_config_log, "request_id=73"));
+	UT_ASSERT(strstr(test_cf_config_log, "control_owner_id=101"));
+	observations = test_cf_observation_reads;
+	UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image),
+				 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	UT_ASSERT_EQ(test_cf_config_logs, 1);
+	UT_ASSERT_EQ(test_cf_observation_reads, observations);
+	test_now += INT64_C(5000001);
+	UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image),
+				 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	UT_ASSERT_EQ(test_cf_config_logs, 2);
+	UT_ASSERT_EQ(test_cf_lock_calls, calls + 3);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	test_config_failed_acquire_retains = test_cf_owned_acquiring = true;
+	test_now += INT64_C(5000001);
+	UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image),
+				 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	UT_ASSERT_EQ(test_actual_cf, ShareLock);
+	test_now += INT64_C(5000001);
+	UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image),
+				 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	UT_ASSERT(strstr(test_cf_config_log, "stage=acquire_poll"));
+	UT_ASSERT(strstr(test_cf_config_log, "s_own=1"));
+	UT_ASSERT(strstr(test_cf_config_log, "attempt_present=1"));
+	UT_ASSERT_EQ(test_cf_lock_calls, calls + 5);
+	test_cf_grant = true;
+	config_trace_cleanup();
+}
+
+UT_TEST(test_config_trace_retains_exact_release_and_lower_reader_result)
+{
+	for (unsigned fault = 0; fault < 3; ++fault) {
+		ClusterSharedConfigRef prior = config_trace_fixture();
+		ClusterSharedConfigSelected selected;
+		ClusterSharedConfigImage image = { 0 };
+		unsigned calls = test_cf_lock_calls;
+		char expected[80];
+		uint64 cookie;
+		if (fault == 2)
+			test_cf_clusterwide_refuse_after = 1; /* Grant passes, original reader refuses. */
+		UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image),
+					 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+		cookie = test_cf_cookie;
+		snprintf(expected, sizeof(expected), "expected_cookie=%llu", (unsigned long long)cookie);
+		UT_ASSERT_EQ(test_cf_config_logs, 1);
+		UT_ASSERT(strstr(test_cf_config_log, "stage=release_wait"));
+		UT_ASSERT(strstr(test_cf_config_log, expected));
+		UT_ASSERT(strstr(test_cf_config_log, "release_checked=1 release_complete=0"));
+		UT_ASSERT(strstr(test_cf_config_log, fault == 2 ? "reader_result=17" : "reader_result=0"));
+		test_cf_clusterwide_refuse_after = 0;
+		test_now += INT64_C(5000001);
+		if (fault == 1) {
+			test_actual_cf = NoLock;
+			test_cf_completed_cookie = cookie + 1; /* Another completion is insufficient. */
+		}
+		test_cf_release_confirmed = true;
+		UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image),
+					 fault == 1 ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
+								: fault == 2 ? CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE : 0);
+		UT_ASSERT_EQ(test_cf_config_logs, 2);
+		UT_ASSERT(strstr(test_cf_config_log, fault == 1 ? "stage=release_lost" : "stage=reader_result"));
+		UT_ASSERT(strstr(test_cf_config_log, expected));
+		UT_ASSERT(strstr(test_cf_config_log, "attempt_present=0"));
+		UT_ASSERT(strstr(test_cf_config_log, fault == 1 ? "release_complete=0" : "release_complete=1"));
+		UT_ASSERT_EQ(test_cf_lock_calls, calls + 1);
+		if (fault == 0)
+			UT_ASSERT(image.bytes != NULL);
+		else
+			UT_ASSERT(v2_zero(&selected, sizeof(selected)) && v2_zero(&image, sizeof(image)));
+		cluster_shared_config_free(&image);
+		config_trace_cleanup();
+	}
+}
+
 UT_TEST(test_config_poll_delivers_only_after_its_exact_release)
 {
 	for (int recovering = 0; recovering < 2; ++recovering) {
@@ -25124,6 +25353,27 @@ main(int argc, char **argv)
 	if (argc > 1)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_CONFIG_OBSERVATION") != NULL) {
+		UT_PLAN(16);
+		UT_RUN(test_config_trace_off_does_not_observe_or_acquire_blocked_hold);
+		UT_RUN(test_config_trace_names_blocked_modes_without_stale_attempt);
+		UT_RUN(test_config_trace_same_call_attempt_and_five_second_bound);
+		UT_RUN(test_config_trace_retains_exact_release_and_lower_reader_result);
+		UT_RUN(test_config_poll_delivers_only_after_its_exact_release);
+		UT_RUN(test_config_poll_cut_or_prior_drift_discards_retained_observation);
+		UT_RUN(test_config_poll_error_hands_exact_cleanup_to_retirement);
+		UT_RUN(test_config_poll_cancel_discards_bytes_without_stealing_other_duty);
+		UT_RUN(test_config_poll_requires_background_role_and_preserves_aliased_input);
+		UT_RUN(test_config_selected_reads_owned_same_and_newer_object);
+		UT_RUN(test_config_selected_does_not_depend_on_data_writer_permission);
+		UT_RUN(test_config_selected_rejects_identity_and_generation_drift);
+		UT_RUN(test_config_selected_rejects_missing_corrupt_or_unlocked_input);
+		UT_RUN(test_config_selected_rejects_non_online_root);
+		UT_RUN(test_config_selected_alias_is_read_only_and_degraded_is_explicit);
+		UT_RUN(test_config_selected_error_preserves_borrowed_cf_and_empty_outputs);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_RECOVERED_BEGIN") != NULL) {
 		UT_PLAN(12);
 		UT_RUN(test_recovered_begin_mixed_inputs_keep_their_original_kinds);
@@ -25374,7 +25624,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(488);
+	UT_PLAN(492);
 	UT_RUN(test_ctrc_inputs_terminal_work_without_active_reads_all_retained_sources);
 	UT_RUN(test_ctrc_inputs_requires_exact_original_work_and_post_eor_start);
 	UT_RUN(test_ctrc_inputs_each_original_owner_and_work_version_is_rechecked);
@@ -25480,6 +25730,10 @@ main(int argc, char **argv)
 	UT_RUN(test_wal_inputs_rejects_dispatch_and_retires_failed_native_acquire);
 	UT_RUN(test_config_failed_acquire_retires_before_retry);
 	UT_RUN(test_config_poll_delivers_only_after_its_exact_release);
+	UT_RUN(test_config_trace_off_does_not_observe_or_acquire_blocked_hold);
+	UT_RUN(test_config_trace_names_blocked_modes_without_stale_attempt);
+	UT_RUN(test_config_trace_same_call_attempt_and_five_second_bound);
+	UT_RUN(test_config_trace_retains_exact_release_and_lower_reader_result);
 	UT_RUN(test_config_poll_cut_or_prior_drift_discards_retained_observation);
 	UT_RUN(test_config_poll_error_hands_exact_cleanup_to_retirement);
 	UT_RUN(test_config_poll_cancel_discards_bytes_without_stealing_other_duty);

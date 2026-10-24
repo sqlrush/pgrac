@@ -115,6 +115,7 @@ bool cluster_xnode_profile_enabled = false;
 /* Diagnostic per-storage-UPDATE phase trace; default OFF. */
 bool cluster_update_trace_enabled = false;
 bool cluster_trace_normal_stop = false;
+bool cluster_trace_control_config = false;
 /* spec-6.4: ADG physical standby / read-only service knobs. */
 int cluster_dg_role = CLUSTER_DG_ROLE_PRIMARY;
 int cluster_dg_mode = CLUSTER_DG_MODE_ASYNC;
@@ -1710,6 +1711,11 @@ cluster_init_guc(void)
 		gettext_noop("Log passive producer ACK and retained DROP progress during normal stop."),
 		gettext_noop("Correlate peer-local owner records by formation, origin, batch and locator."),
 		&cluster_trace_normal_stop, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable(
+		"cluster.trace_control_config",
+		gettext_noop("Log bounded selected-config CF task observations."),
+		gettext_noop("Reports original attempts and exact release decisions at most every five seconds."),
+		&cluster_trace_control_config, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/*
 	 * spec-6.4 ADG role and read-only service knobs.  Defaults keep existing

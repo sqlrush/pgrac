@@ -157,6 +157,8 @@ extern bool cluster_xnode_profile_enabled;
 extern bool cluster_update_trace_enabled;
 /* Passive normal-stop diagnostics; default off. */
 extern bool cluster_trace_normal_stop;
+/* Bounded process-local selected-config CF diagnostics; default off. */
+extern bool cluster_trace_control_config;
 
 /* spec-6.4: ADG physical standby / read-only service configuration. */
 #define CLUSTER_DG_ROLE_PRIMARY 0
