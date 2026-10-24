@@ -75,6 +75,7 @@
 #include "storage/fd.h"
 
 #include "cluster_recovery_anchor_private.h"
+#include "cluster/cluster_relmap_checkpoint.h"
 
 /* PGRAC: v2 is explicitly encoded, not an overlay on the native v1 struct.
  * These are the frozen homogeneous PG16 CheckPoint offsets; a native layout
@@ -227,6 +228,14 @@ anchor_v2_fields_valid(const ClusterRecoveryAnchorV2 *anchor)
 		|| anchor->max_wal_senders > PG_INT32_MAX || anchor->max_prepared_xacts > PG_INT32_MAX
 		|| anchor->max_locks_per_xact == 0 || anchor->max_locks_per_xact > PG_INT32_MAX)
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	if (!anchor_v2_zero(anchor->native_window, sizeof(anchor->native_window))) {
+		ClusterRelmapCheckpointWindow window;
+		if (!cluster_relmap_checkpoint_window_decode_v1(
+				anchor->native_window, &anchor->checkpoint_copy, anchor->checkpoint,
+				anchor_v2_get(anchor->native_window, 88, 8), &anchor->identity,
+				anchor->database_incarnation, &window))
+			return CLUSTER_CONTROL_ROOT_BAD_BODY_CRC;
+	}
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
@@ -247,7 +256,7 @@ cluster_recovery_anchor_v2_encode(const ClusterRecoveryAnchorV2 *anchor,
 		return result;
 #define AP(offset, field, width) anchor_v2_put(bytes, offset, anchor->field, width)
 	anchor_v2_put(bytes, 0, CLUSTER_RECOVERY_ANCHOR_MAGIC, 4);
-	anchor_v2_put(bytes, 4, 2, 2);
+	anchor_v2_put(bytes, 4, anchor_v2_zero(anchor->native_window, 160) ? 2 : 3, 2);
 	AP(8, identity.origin_node_id, 4);
 	AP(12, state, 4);
 	AP(16, identity.system_identifier, 8);
@@ -295,6 +304,7 @@ cluster_recovery_anchor_v2_encode(const ClusterRecoveryAnchorV2 *anchor,
 	AP(304, max_wal_senders, 4);
 	AP(308, max_prepared_xacts, 4);
 	AP(312, max_locks_per_xact, 4);
+	memcpy(bytes + 316, anchor->native_window, 160);
 #undef AP
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, bytes, 508);
@@ -327,13 +337,16 @@ anchor_v2_decode_with_ctx(const uint8 *bytes, size_t len, const ClusterRecoveryA
 		return CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
 	if (anchor_v2_get(bytes, 0, 4) != CLUSTER_RECOVERY_ANCHOR_MAGIC)
 		return CLUSTER_CONTROL_ROOT_BAD_MAGIC;
-	if (anchor_v2_get(bytes, 4, 2) != 2)
+	if (anchor_v2_get(bytes, 4, 2) != 2 && anchor_v2_get(bytes, 4, 2) != 3)
 		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
 	if (anchor_v2_get(bytes, 212, 4) != UINT64_C(0x01020304))
 		return CLUSTER_CONTROL_ROOT_BAD_ENDIAN;
 	if (!anchor_v2_zero(bytes + 6, 2) || !anchor_v2_zero(bytes + 57, 7)
 		|| !anchor_v2_zero(bytes + 100, 4) || !anchor_v2_zero(bytes + 124, 4)
-		|| !anchor_v2_zero(bytes + 210, 2) || bytes[291] != 0 || !anchor_v2_zero(bytes + 316, 192)
+		|| !anchor_v2_zero(bytes + 210, 2) || bytes[291] != 0
+		|| (anchor_v2_get(bytes, 4, 2) == 2
+				? !anchor_v2_zero(bytes + 316, 192)
+				: (anchor_v2_zero(bytes + 316, 160) || !anchor_v2_zero(bytes + 476, 32)))
 		|| bytes[56] > 1 || bytes[288] > 1 || bytes[289] > 1 || bytes[290] > 1)
 		return CLUSTER_CONTROL_ROOT_BAD_RESERVED;
 	memset(&anchor, 0, sizeof(anchor));
@@ -384,6 +397,7 @@ anchor_v2_decode_with_ctx(const uint8 *bytes, size_t len, const ClusterRecoveryA
 	AG(304, max_wal_senders, 4);
 	AG(308, max_prepared_xacts, 4);
 	AG(312, max_locks_per_xact, 4);
+	memcpy(anchor.native_window, bytes + 316, 160);
 #undef AG
 	result = anchor_v2_fields_valid(&anchor);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -655,7 +669,7 @@ done:
 
 static ClusterControlRootResult
 anchor_v2_read_locked(const ClusterRecoveryAnchorRefV2 *ref, const ControlFileData *common,
-					  ControlFileData *out, bool native_input)
+					  ControlFileData *out, bool native_input, uint8 native_window[160])
 {
 	ClusterControlRootResult result;
 	AnchorV2Dirs dirs;
@@ -685,6 +699,8 @@ anchor_v2_read_locked(const ClusterRecoveryAnchorRefV2 *ref, const ControlFileDa
 			/* The runtime/common projection intentionally keeps aggregated
 			 * counters. It is not the bytes of this origin's WAL checkpoint. */
 			out->checkPointCopy = anchor.checkpoint_copy;
+			if (native_window != NULL)
+				memcpy(native_window, anchor.native_window, 160);
 			INIT_CRC32C(out->crc);
 			COMP_CRC32C(out->crc, out, offsetof(ControlFileData, crc));
 			FIN_CRC32C(out->crc);
@@ -698,7 +714,7 @@ ClusterControlRootResult
 cluster_recovery_anchor_v2_read_locked(const ClusterRecoveryAnchorRefV2 *ref,
 									   const ControlFileData *common, ControlFileData *out)
 {
-	return anchor_v2_read_locked(ref, common, out, false);
+	return anchor_v2_read_locked(ref, common, out, false, NULL);
 }
 
 /* PGRAC: physical input verification uses the selected origin checkpoint,
@@ -708,7 +724,33 @@ ClusterControlRootResult
 cluster_recovery_anchor_v2_read_native_locked(const ClusterRecoveryAnchorRefV2 *ref,
 											  const ControlFileData *common, ControlFileData *out)
 {
-	return anchor_v2_read_locked(ref, common, out, true);
+	return anchor_v2_read_locked(ref, common, out, true, NULL);
+}
+
+static bool
+anchor_window_overlap(const void *a, size_t na, const void *b, size_t nb)
+{
+	uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
+	return a && b && (x <= y ? y - x < na : x - y < nb);
+}
+ClusterControlRootResult
+cluster_recovery_anchor_v3_read_native_window_locked(const ClusterRecoveryAnchorRefV2 *ref,
+													 const ControlFileData *common,
+													 ControlFileData *out, uint8 window[160])
+{
+	if (anchor_window_overlap(window, 160, ref, sizeof(*ref))
+		|| anchor_window_overlap(window, 160, common, sizeof(*common))
+		|| anchor_window_overlap(window, 160, out, sizeof(*out))
+		|| anchor_window_overlap(out, sizeof(*out), common, sizeof(*common))
+		|| anchor_window_overlap(out, sizeof(*out), ref, sizeof(*ref)))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (window != NULL)
+		memset(window, 0, 160);
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || window == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	return anchor_v2_read_locked(ref, common, out, true, window);
 }
 
 /* PGRAC: owned no-clobber immutable installation. Installation and root CAS

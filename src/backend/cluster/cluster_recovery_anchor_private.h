@@ -39,6 +39,7 @@ typedef struct ClusterRecoveryAnchorV2 {
 	uint32 max_wal_senders;
 	uint32 max_prepared_xacts;
 	uint32 max_locks_per_xact;
+	uint8 native_window[160]; /* Explicit on-disk v3; zero retains exact v2. */
 } ClusterRecoveryAnchorV2;
 
 typedef struct ClusterRecoveryAnchorRefV2 {
@@ -108,6 +109,13 @@ cluster_recovery_anchor_v2_read_locked(const ClusterRecoveryAnchorRefV2 *ref,
 extern ClusterControlRootResult
 cluster_recovery_anchor_v2_read_native_locked(const ClusterRecoveryAnchorRefV2 *ref,
 											  const ControlFileData *common, ControlFileData *out);
+
+/* Selected native body and optional v3 window from the SAME immutable anchor.
+ * Zero window for v2. Structural metadata, never a qualified base/terminal. */
+extern ClusterControlRootResult
+cluster_recovery_anchor_v3_read_native_window_locked(const ClusterRecoveryAnchorRefV2 *ref,
+													 const ControlFileData *common,
+													 ControlFileData *out, uint8 window[160]);
 
 extern ClusterControlRootResult
 cluster_recovery_anchor_v2_prepare(const ClusterRecoveryAnchorV2 *anchor,

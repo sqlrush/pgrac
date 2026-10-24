@@ -598,6 +598,17 @@ extern ClusterControlRootResult cluster_control_root_v3_recovery_checkpoint_publ
 	ClusterControlRootSnapshot *out, ClusterControlRootFileToken *out_token,
 	ControlFileData *out_control);
 
+/* Two independent original inputs: borrowed recovery owner and optional
+ * native issuance observation. Neither supplies the other's authority. */
+extern ClusterControlRootResult cluster_control_root_v3_checkpoint_window_publish(
+	const ClusterControlRootIdentity *self, const ControlFileData *control, XLogRecPtr end,
+	const uint8 native_window[160], ClusterControlRootSnapshot *out,
+	ClusterControlRootFileToken *token, ControlFileData *view);
+extern ClusterControlRootResult cluster_control_root_v3_recovery_checkpoint_window_publish(
+	const struct ClusterRecoveryCheckpointScopeV1 *scope, const ClusterControlRootIdentity *self,
+	const ControlFileData *control, XLogRecPtr end, const uint8 native_window[160],
+	ClusterControlRootSnapshot *out, ClusterControlRootFileToken *token, ControlFileData *view);
+
 /* PGRAC: publishes WAL-verified shutdown checkpoint evidence only. Does not
  * close a thread/database or change membership; returned native view still
  * obeys the selected root lifecycle. Normal-stop/close admission is separate.
