@@ -81,8 +81,10 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
+#ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_ko.h"
 #include "cluster/cluster_page_wal.h"
+#endif
 #include "cluster/cluster_space_identity.h"
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/storage/cluster_shared_fs.h"
