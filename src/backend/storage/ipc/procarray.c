@@ -2275,6 +2275,10 @@ cluster_undo_retention_horizon_sample(ClusterUndoRetentionSample *out)
 	sample.clock_scn = cluster_scn_current();
 	sample.horizon_scn = sample.clock_scn;
 	sample.contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK;
+	/* An invalid census cannot prove that the clock is unconstrained. Check
+	 * in the same ProcArray cut before following any membership index. */
+	if (arrayP->numProcs < 0 || arrayP->numProcs > arrayP->maxProcs)
+		sample.horizon_scn = InvalidScn;
 	/* Replication slots can retain history without a live PGPROC. Their
 	 * xmin fields have no associated read SCN, even when an active backend
 	 * publishes the same raw XID. Until the slot owner supplies that proof,

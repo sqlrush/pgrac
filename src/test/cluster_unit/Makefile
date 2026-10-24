@@ -8219,6 +8219,7 @@ test_cluster_retention_sample.inc: $(top_srcdir)/src/backend/storage/ipc/procarr
 
 test_cluster_retention_sample: test_cluster_retention_sample.c unit_test.h \
 		test_cluster_pgproc_active_types.inc test_cluster_retention_sample.inc \
+		$(top_srcdir)/src/include/access/twophase.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_retention.h \
 		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h $(CLUSTER_UNDO_RETENTION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
