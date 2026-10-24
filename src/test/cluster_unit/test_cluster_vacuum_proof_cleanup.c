@@ -108,6 +108,9 @@ static unsigned cohort_calls, bindings_at_cohort;
 static bool error_cohort, revoke_cohort;
 static bool policy_sample_current, revoke_on_policy_check;
 static unsigned policy_checks;
+static unsigned final_policy_checks, final_cohort_checks, final_cohort_fence_checks;
+static unsigned target_source_change;
+static bool after_target_recheck, error_final_policy;
 static bool cohort_fence_current, revoke_on_cohort_fence_check, error_cohort_fence;
 static unsigned cohort_fence_checks, policy_checks_at_cohort_fence;
 static unsigned cohort_receipt_checks;
@@ -336,6 +339,15 @@ cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 		|| clock_reads == 0 || cohort_receipt_checks == 0)
 		abort();
 	target_admission_checks++;
+	after_target_recheck = true;
+	switch (target_source_change) {
+	case 1: policy_sample_current = false; break;
+	case 2: cohort_fence_current = false; break;
+	case 3: revoke_on_policy_check = true; break;
+	case 4: revoke_on_cohort_fence_check = true; break;
+	case 5: error_final_policy = true; break;
+	case 6: error_cohort_fence = true; break;
+	}
 	if (error_target_recheck) throw_error();
 	if (revoke_on_target_recheck) changed_admission = true;
 	return token->entered && token->side == CLUSTER_SEMANTIC_TARGET_SIDE
@@ -761,6 +773,7 @@ cluster_heap_freeze_cohort_observe(ClusterHeapFreezeCohortObservation *out)
 {
 	if (guard_held || pin_held || content_locked || debt != 1)
 		abort();
+	after_target_recheck = false;
 	cohort_calls++;
 	bindings_at_cohort = target_bindings;
 	if (revoke_cohort)
@@ -777,7 +790,9 @@ cluster_heap_freeze_policy_sample_current_v1(const ClusterHeapFreezePolicySample
 {
 	if (guard_held || pin_held || content_locked || debt != 1)
 		abort();
-	policy_checks++;
+	if (after_target_recheck) final_policy_checks++;
+	else policy_checks++;
+	if (after_target_recheck && error_final_policy) throw_error();
 	UT_ASSERT_EQ(sample->allocation_fence.incarnation, 81);
 	if (revoke_on_policy_check)
 		changed_admission = true;
@@ -789,9 +804,10 @@ cluster_semantic_activation_active_sample_current(const ClusterSemanticActiveSam
 {
 	if (guard_held || pin_held || content_locked || debt != 1)
 		abort();
-	cohort_fence_checks++;
-	UT_ASSERT(policy_checks > policy_checks_at_cohort_fence);
-	policy_checks_at_cohort_fence = policy_checks;
+	if (after_target_recheck) final_cohort_fence_checks++;
+	else cohort_fence_checks++;
+	UT_ASSERT(policy_checks + final_policy_checks > policy_checks_at_cohort_fence);
+	policy_checks_at_cohort_fence = policy_checks + final_policy_checks;
 	UT_ASSERT_EQ(target_bindings, 0);
 	UT_ASSERT_EQ(memcmp(expected, &cohort_value.admission_fence, sizeof(*expected)), 0);
 	if (revoke_on_cohort_fence_check)
@@ -805,7 +821,8 @@ ClusterHeapFreezeCohortStatus
 cluster_heap_freeze_cohort_current(const ClusterHeapFreezeCohortObservation *expected)
 {
 	if (guard_held || pin_held || content_locked || debt != 1) abort();
-	cohort_receipt_checks++;
+	if (after_target_recheck) final_cohort_checks++;
+	else cohort_receipt_checks++;
 	UT_ASSERT_EQ(memcmp(expected, &cohort_value, sizeof(*expected)), 0);
 	UT_ASSERT(policy_checks > 0);
 	UT_ASSERT_EQ(target_bindings, 0);
@@ -833,6 +850,9 @@ reset_fixture(void)
 	memset(&transport_verdict, 0, sizeof(transport_verdict));
 	header_snapshots = verdict_snapshots = 0;
 	target_admission_current = true;
+	final_policy_checks = final_cohort_checks = final_cohort_fence_checks = 0;
+	target_source_change = 0;
+	after_target_recheck = error_final_policy = false;
 	error_target_recheck = revoke_on_target_recheck = false;
 	target_admission_checks = 0;
 	charge_transport = reset_transport_during_resolve = overflow_transport_sum = false;
@@ -2668,6 +2688,72 @@ UT_TEST(proof_cost_transport_sum_overflow_is_unknown)
 	UT_ASSERT_EQ(debt, 0);
 }
 
+UT_TEST(target_callback_stale_sources_cannot_retain_freeze_candidate)
+{
+	for (unsigned change = 1; change <= 2; change++) {
+		reset_fixture(); set_shared_policy(80); seed_stale_cohort();
+		target_source_change = change;
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT_EQ(target_admission_checks, 1); UT_ASSERT_EQ(final_policy_checks, 1);
+		UT_ASSERT_EQ(final_cohort_checks, change == 1 ? 0 : 1);
+		check_no_cohort(); UT_ASSERT_EQ(candidate_selections, 0);
+		UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.target_count, 0);
+		UT_ASSERT(vacrel.shared_freeze_fence_valid); UT_ASSERT_EQ(target_bindings, 1);
+		UT_ASSERT_EQ(leaves, 1); UT_ASSERT_EQ(debt, 0);
+		UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+	}
+}
+
+UT_TEST(final_source_checks_recheck_original_census_last)
+{
+	for (unsigned change = 3; change <= 4; change++) {
+		reset_fixture(); set_shared_policy(80); seed_stale_cohort();
+		target_source_change = change;
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+		UT_ASSERT_EQ(final_policy_checks, 1); UT_ASSERT_EQ(final_cohort_checks, 1);
+		check_no_cohort(); UT_ASSERT_EQ(candidate_selections + target_bindings, 0);
+		UT_ASSERT(!vacrel.shared_freeze_fence_valid);
+		UT_ASSERT_EQ(enters, 1); UT_ASSERT_EQ(leaves, 1); UT_ASSERT_EQ(debt, 0);
+		UT_ASSERT(!guard_held && !pin_held && !content_locked);
+		UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+	}
+}
+
+UT_TEST(final_source_error_or_cancel_uses_original_admission_cleanup)
+{
+	const int codes[] = { ERRCODE_INTERNAL_ERROR, ERRCODE_QUERY_CANCELED };
+	for (unsigned change = 5; change <= 6; change++) {
+		for (unsigned i = 0; i < lengthof(codes); i++) {
+			reset_fixture(); set_shared_policy(80); seed_stale_cohort();
+			target_source_change = change; inject_code = codes[i];
+			UT_ASSERT(collect_catches_error()); UT_ASSERT_EQ(caught_code, inject_code);
+			UT_ASSERT_EQ(final_policy_checks, 1);
+			UT_ASSERT_EQ(final_cohort_checks, change == 5 ? 0 : 1);
+			check_no_cohort(); UT_ASSERT_EQ(candidate_selections + target_bindings, 0);
+			UT_ASSERT_EQ(enters, 1); UT_ASSERT_EQ(leaves, 1); UT_ASSERT_EQ(debt, 0);
+			UT_ASSERT(!guard_held && !pin_held && !content_locked);
+			UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+		}
+	}
+}
+
+UT_TEST(target_success_rechecks_same_sources_before_candidate_retention)
+{
+	reset_fixture(); set_shared_policy(80);
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(final_policy_checks, 1); UT_ASSERT_EQ(final_cohort_checks, 1);
+	UT_ASSERT_EQ(final_cohort_fence_checks, 1);
+	UT_ASSERT(vacrel.shared_freeze_cohort_observed && vacrel.shared_freeze_fence_valid);
+	UT_ASSERT_EQ(candidate_selections, 1);
+	UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.target_count, 1);
+	UT_ASSERT_EQ(enters, 1); UT_ASSERT_EQ(leaves, 1); UT_ASSERT_EQ(debt, 0);
+	UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+	reset_fixture(); set_shared_policy(80); target_admission_current = false;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(final_policy_checks + final_cohort_checks, 0);
+	UT_ASSERT_EQ(candidate_selections, 0); check_no_cohort();
+}
+
 UT_TEST(positive_candidate_requires_full_target_admission)
 {
 	reset_fixture();
@@ -2824,11 +2910,15 @@ UT_TEST(test_writer_resume_error_before_lock_still_unpins_before_admission)
 int
 main(void)
 {
-	UT_PLAN(104);
+	UT_PLAN(108);
 	UT_RUN(test_writer_resume_error_before_lock_still_unpins_before_admission);
 	UT_RUN(test_refused_original_writer_never_falls_back_to_read_only_x);
 	UT_RUN(test_original_writer_error_cancel_cleans_local_scope_before_admission);
 	UT_RUN(test_original_writer_input_uses_conditional_writer_resume);
+	UT_RUN(target_callback_stale_sources_cannot_retain_freeze_candidate);
+	UT_RUN(final_source_checks_recheck_original_census_last);
+	UT_RUN(final_source_error_or_cancel_uses_original_admission_cleanup);
+	UT_RUN(target_success_rechecks_same_sources_before_candidate_retention);
 	UT_RUN(positive_candidate_requires_full_target_admission);
 	UT_RUN(positive_candidate_full_target_recheck_uses_original_token_after_clock);
 	UT_RUN(positive_target_recheck_error_and_cancel_use_original_cleanup);
