@@ -2814,7 +2814,7 @@ bt_rootdescend(BtreeCheckState *state, IndexTuple itup)
 	exists = false;
 	stack = _bt_search(state->rel, NULL, key, &lbuf, BT_READ, NULL
 #ifdef USE_PGRAC_CLUSTER
-						  , NULL /* PGRAC: read-only descent has no mutation identity. */
+						  , NULL, NULL /* PGRAC: read-only descent has no mutation owner. */
 #endif
 		);
 

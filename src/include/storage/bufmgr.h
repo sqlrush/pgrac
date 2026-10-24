@@ -205,14 +205,16 @@ extern Buffer ExtendBufferedRel(BufferManagerRelation bmr,
 /* B-tree allocation after its caller acquired exact MAIN HW before page locks.
  * Resolve the complete SPACE identity before HW and pass the owned snapshot;
  * the original reservation consumer must still recheck canonical current bytes.
- * The caller retains ownership and must release HW on every exit, including
- * ERROR. This consumer neither reacquires nor releases the borrowed handle. */
+ * Register the exact KO extension owner before HW; pass its original serial.
+ * The caller retains both owners: release HW and then end KO after dropping
+ * content locks; on ERROR release HW and abort KO for ResourceOwner cleanup.
+ * This consumer neither reacquires HW, waits for KO admission nor ends KO. */
 extern Buffer ExtendBufferedRelWithHW(BufferManagerRelation bmr,
 									 ForkNumber forkNum,
 									 BufferAccessStrategy strategy,
 									 uint32 flags,
 									 const struct HwLock *preheld_hw,
-									 const struct ClusterSpaceIdentity *space_identity);
+									 const struct ClusterSpaceIdentity *space_identity, uint64 preheld_ko_serial);
 #endif
 extern BlockNumber ExtendBufferedRelBy(BufferManagerRelation bmr,
 									   ForkNumber fork,

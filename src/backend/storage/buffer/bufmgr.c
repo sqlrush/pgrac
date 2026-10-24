@@ -5106,7 +5106,7 @@ static BlockNumber ExtendBufferedRelCommon(BufferManagerRelation bmr,
 										   Buffer *buffers,
 										   uint32 *extended_by,
 										   const struct HwLock *preheld_hw,
-										   const struct ClusterSpaceIdentity *preheld_identity);
+										   const struct ClusterSpaceIdentity *preheld_identity, uint64 preheld_ko_serial);
 static BlockNumber ExtendBufferedRelShared(BufferManagerRelation bmr,
 										   ForkNumber fork,
 										   BufferAccessStrategy strategy,
@@ -5116,7 +5116,7 @@ static BlockNumber ExtendBufferedRelShared(BufferManagerRelation bmr,
 										   Buffer *buffers,
 										   uint32 *extended_by,
 										   const struct HwLock *preheld_hw,
-										   const struct ClusterSpaceIdentity *preheld_identity);
+										   const struct ClusterSpaceIdentity *preheld_identity, uint64 preheld_ko_serial);
 typedef enum PinBufferLookupResult {
 	PIN_BUFFER_LOOKUP_RETRY = 0,
 	PIN_BUFFER_LOOKUP_INVALID,
@@ -5598,7 +5598,7 @@ ExtendBufferedRelBy(BufferManagerRelation bmr,
 
 	return ExtendBufferedRelCommon(bmr, fork, strategy, flags,
 								   extend_by, InvalidBlockNumber,
-									   buffers, extended_by, NULL, NULL);
+									   buffers, extended_by, NULL, NULL, 0);
 }
 
 #ifdef USE_PGRAC_CLUSTER
@@ -5606,7 +5606,7 @@ Buffer
 ExtendBufferedRelWithHW(BufferManagerRelation bmr, ForkNumber fork,
 						BufferAccessStrategy strategy, uint32 flags,
 						const struct HwLock *preheld_hw,
-						const struct ClusterSpaceIdentity *preheld_identity)
+						const struct ClusterSpaceIdentity *preheld_identity, uint64 preheld_ko_serial)
 {
 	Buffer buffer;
 	uint32 extended;
@@ -5620,7 +5620,7 @@ ExtendBufferedRelWithHW(BufferManagerRelation bmr, ForkNumber fork,
 	bmr.smgr = RelationGetSmgr(bmr.rel);
 	bmr.relpersistence = bmr.rel->rd_rel->relpersistence;
 	(void)ExtendBufferedRelCommon(bmr, fork, strategy, flags, 1,
-								  InvalidBlockNumber, &buffer, &extended, preheld_hw, preheld_identity);
+								  InvalidBlockNumber, &buffer, &extended, preheld_hw, preheld_identity, preheld_ko_serial);
 	Assert(extended == 1);
 	return buffer;
 }
@@ -5754,7 +5754,7 @@ ExtendBufferedRelTo(BufferManagerRelation bmr,
 
 		first_block = ExtendBufferedRelCommon(bmr, fork, strategy, flags,
 											  num_pages, extend_to,
-											  buffers, &extended_by, NULL, NULL);
+											  buffers, &extended_by, NULL, NULL, 0);
 
 		current_size = first_block + extended_by;
 		Assert(num_pages != 0 || current_size >= extend_to);
@@ -7768,7 +7768,7 @@ ExtendBufferedRelCommon(BufferManagerRelation bmr,
 						BlockNumber extend_upto,
 						Buffer *buffers,
 						uint32 *extended_by, const struct HwLock *preheld_hw,
-						const struct ClusterSpaceIdentity *preheld_identity)
+						const struct ClusterSpaceIdentity *preheld_identity, uint64 preheld_ko_serial)
 {
 	BlockNumber first_block;
 
@@ -7786,7 +7786,7 @@ ExtendBufferedRelCommon(BufferManagerRelation bmr,
 	else
 		first_block = ExtendBufferedRelShared(bmr, fork, strategy, flags,
 											  extend_by, extend_upto,
-											  buffers, &extend_by, preheld_hw, preheld_identity);
+											  buffers, &extend_by, preheld_hw, preheld_identity, preheld_ko_serial);
 	*extended_by = extend_by;
 
 	TRACE_POSTGRESQL_BUFFER_EXTEND_DONE(fork,
@@ -7809,7 +7809,7 @@ ExtendBufferedRelSharedInternal(BufferManagerRelation bmr, ForkNumber fork,
 								BufferAccessStrategy strategy, uint32 flags, uint32 extend_by,
 								BlockNumber extend_upto, Buffer *buffers, uint32 *extended_by,
 								volatile uint64 *ko_serial, const struct HwLock *preheld_hw,
-								const struct ClusterSpaceIdentity *preheld_identity)
+								const struct ClusterSpaceIdentity *preheld_identity, uint64 preheld_ko_serial)
 {
 	BlockNumber first_block;
 	IOContext	io_context = IOContextForStrategy(strategy);
@@ -8415,8 +8415,9 @@ retry_extend_collision:
 	/* Transfer only after materialization: every returned range buffer now
 	 * has its real tag, pin and IO reference, which the original drain sees.
 	 * Retire the call reference before taking returned content locks; never
-	 * acquire the object lock beneath a buffer header/content lock. */
-	if (ko_scoped) {
+	 * acquire the object lock beneath a buffer header/content lock. A borrowed
+	 * caller keeps its original reference until it releases all outer locks. */
+	if (ko_scoped && preheld_ko_serial == 0) {
 		if (!cluster_ko_extend_end_v3(*ko_serial))
 			elog(ERROR, "shared extension could not hand off its materialized range");
 		*ko_serial = 0;
@@ -8502,7 +8503,7 @@ static BlockNumber
 ExtendBufferedRelShared(BufferManagerRelation bmr, ForkNumber fork, BufferAccessStrategy strategy,
 						uint32 flags, uint32 extend_by, BlockNumber extend_upto, Buffer *buffers,
 						uint32 *extended_by, const struct HwLock *preheld_hw,
-						const struct ClusterSpaceIdentity *preheld_identity)
+						const struct ClusterSpaceIdentity *preheld_identity, uint64 preheld_ko_serial)
 {
 #ifdef USE_PGRAC_CLUSTER
 	RelFileLocator locator = bmr.smgr->smgr_rlocator.locator;
@@ -8514,6 +8515,8 @@ ExtendBufferedRelShared(BufferManagerRelation bmr, ForkNumber fork, BufferAccess
 				  && bmr.relpersistence != RELPERSISTENCE_TEMP
 				  && cluster_smgr_which_for(locator, backend) == 1;
 
+	if (preheld_hw == NULL && preheld_ko_serial != 0)
+		elog(ERROR, "borrowed extension object owner requires its caller HW lock");
 	if (preheld_hw != NULL) {
 		ClusterResId expected;
 
@@ -8527,21 +8530,28 @@ ExtendBufferedRelShared(BufferManagerRelation bmr, ForkNumber fork, BufferAccess
 			|| !RelFileLocatorEquals(preheld_identity->key.locator, locator)
 			|| memcmp(&preheld_hw->req.resid, &expected, sizeof(expected)) != 0)
 			elog(ERROR, "preheld HW extension does not match its exact index allocation");
+		/* The outer caller registered KO before acquiring HW/content. Never
+		 * enter the admission wait or retire its owner beneath those locks. */
+		if (!cluster_ko_extend_range_begin_v3(locator, fork, preheld_ko_serial))
+			elog(ERROR, "preheld HW extension requires its exact original object owner");
+		serial = preheld_ko_serial;
 	}
 
 	if (!scoped)
 		return ExtendBufferedRelSharedInternal(bmr, fork, strategy, flags, extend_by, extend_upto,
-											   buffers, extended_by, NULL, preheld_hw, preheld_identity);
-	if (cluster_ko_extend_active_v3())
-		elog(ERROR, "cannot nest shared extension object owners");
-	for (;;) {
-		bool retry;
-		if (cluster_ko_extend_begin_v3(locator, fork, (uint64 *)&serial, &retry))
-			break;
-		if (!retry)
-			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
-							errmsg("cannot qualify the shared extension object owner")));
-		cluster_bufmgr_ko_read_wait();
+											   buffers, extended_by, NULL, preheld_hw, preheld_identity, preheld_ko_serial);
+	if (preheld_hw == NULL) {
+		if (cluster_ko_extend_active_v3())
+			elog(ERROR, "cannot nest shared extension object owners");
+		for (;;) {
+			bool retry;
+			if (cluster_ko_extend_begin_v3(locator, fork, (uint64 *)&serial, &retry))
+				break;
+			if (!retry)
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+								errmsg("cannot qualify the shared extension object owner")));
+			cluster_bufmgr_ko_read_wait();
+		}
 	}
 	PG_TRY();
 	{
@@ -8549,7 +8559,7 @@ ExtendBufferedRelShared(BufferManagerRelation bmr, ForkNumber fork, BufferAccess
 		 * locator/backend, never a possibly retired native SMgr pointer. */
 		bmr.smgr = smgropen(locator, backend);
 		first_block = ExtendBufferedRelSharedInternal(bmr, fork, strategy, flags, extend_by,
-													  extend_upto, buffers, extended_by, &serial, preheld_hw, preheld_identity);
+													  extend_upto, buffers, extended_by, &serial, preheld_hw, preheld_identity, preheld_ko_serial);
 	}
 	PG_CATCH();
 	{
@@ -8557,13 +8567,13 @@ ExtendBufferedRelShared(BufferManagerRelation bmr, ForkNumber fork, BufferAccess
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	if (serial != 0 && !cluster_ko_extend_end_v3(serial))
+	if (preheld_hw == NULL && serial != 0 && !cluster_ko_extend_end_v3(serial))
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
 						errmsg("shared extension requires its original range recovery")));
 	return first_block;
 #else
 	return ExtendBufferedRelSharedInternal(bmr, fork, strategy, flags, extend_by, extend_upto,
-										   buffers, extended_by, NULL, preheld_hw, preheld_identity);
+										   buffers, extended_by, NULL, preheld_hw, preheld_identity, preheld_ko_serial);
 #endif
 }
 

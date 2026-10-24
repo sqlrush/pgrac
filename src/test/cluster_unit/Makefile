@@ -64,7 +64,7 @@ TESTS = test_cluster_vm_read_visibility test_cluster_heap_maintenance test_clust
         test_cluster_heap_prepare_diagnostic test_cluster_generic_version test_cluster_generic_redo test_cluster_recovery_fpi_insert \
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
         test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_ctrc_successor_fence test_cluster_ctrc_dispatch test_cluster_heap_receipt \
-        test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_pgproc_active_sample test_cluster_retention_sample test_cluster_active_sample_fence test_cluster_ctrc_itl_reuse test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_ges_holder test_cluster_ko_relation_scan test_cluster_ko_current_admission test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop \
+        test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_pgproc_active_sample test_cluster_retention_sample test_cluster_active_sample_fence test_cluster_ctrc_itl_reuse test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_ges_holder test_cluster_ko_relation_scan test_cluster_ko_current_admission test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_ko_extend_range test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop \
         test_cluster_bufmgr_stop test_cluster_allocation_stop test_cluster_hw_cold test_cluster_hw_initdb test_cluster_shared_parameters test_cluster_shared_config_alter test_cluster_checkpoint_pi_tick test_cluster_native_wal_stop test_cluster_checkpointer_stop test_cluster_postmaster_stop test_cluster_xnode_profile test_cluster_adg \
         test_cluster_xnode_lever test_cluster_ges_handoff \
         test_cluster_reverse_key test_cluster_hw_lease test_cluster_pi_shadow \
@@ -230,6 +230,7 @@ TESTS += test_cluster_pcm_aux_mutation test_cluster_heap_extend_current test_clu
 TESTS += test_cluster_cr_inline_stop
 TESTS += test_cluster_cr_refusal
 TESTS += test_cluster_cr_image_srf
+TESTS += test_cluster_pcm_stop_cv
 TESTS += test_cluster_catalog_trace
 TESTS += test_cluster_sync_error
 TESTS += test_cluster_cold_tx_start
@@ -436,7 +437,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_heap_cr_reuse test_cluster_snapshot_ad
 SIMPLE_TESTS := $(filter-out test_cluster_native_wal_stop test_cluster_hw_initdb test_cluster_hw_cold test_cluster_cr_inline_stop test_cluster_mrp_stop test_cluster_backup_stop test_cluster_recovery_stop test_cluster_node_remove_stop test_cluster_postmaster_stop test_cluster_checkpointer_stop test_cluster_allocation_stop test_cluster_raw_device_capacity test_cluster_replacement_wire \
 		test_cluster_external_fence test_pgrac_external_fence_protocol \
 		test_cluster_wal_retention test_cluster_terminal_ref_census test_cluster_ctrc_cleaner test_cluster_ctrc_successor_fence test_cluster_ctrc_dispatch test_cluster_heap_receipt \
-		test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_pgproc_active_sample test_cluster_retention_sample test_cluster_active_sample_fence test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_ges_holder test_cluster_ko_relation_scan test_cluster_ko_current_admission test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop,$(SIMPLE_TESTS))
+		test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_pgproc_active_sample test_cluster_retention_sample test_cluster_active_sample_fence test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_ges_holder test_cluster_ko_relation_scan test_cluster_ko_current_admission test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_ko_extend_range test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop,$(SIMPLE_TESTS))
 
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 		test_pgrac_fenced_journal test_pgrac_fenced_provider \
@@ -482,6 +483,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_replay_batch,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_install,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_producer test_cluster_space_fork test_cluster_space_identity test_cluster_space_page_verify test_cluster_space_table_size test_cluster_space_wal test_cluster_space_storage test_cluster_space_recovery test_cluster_space_cache test_cluster_space_recovery_route test_cluster_space_copy test_cluster_space_copy_version test_cluster_heap_insert_version test_cluster_vm_version test_cluster_vm_redo,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_space_lazy_fork,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_pcm_stop_cv,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_generic_version test_cluster_generic_redo test_cluster_recovery_fpi_insert,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_wal_checkpoint_sample,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_wal_retained_cut test_cluster_wal_retained_cut_records,$(SIMPLE_TESTS))
@@ -493,6 +495,8 @@ SIMPLE_TESTS := $(filter-out test_cluster_btree_build_version,$(SIMPLE_TESTS))
 TESTS += test_cluster_space_extend
 SIMPLE_TESTS := $(filter-out test_cluster_btree_leaf_version,$(SIMPLE_TESTS))
 TESTS += test_cluster_btree_structure_version
+TESTS += test_cluster_btree_hw_restart
+TESTS += test_cluster_btree_hw_paths
 TESTS += test_cluster_sequence_version test_cluster_sequence_ddl
 TESTS += test_cluster_relation_wal_policy
 TESTS += test_cluster_heap_small_redo
@@ -1968,6 +1972,38 @@ test_cluster_sequence_version test_cluster_sequence_ddl: %: %.c test_cluster_seq
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 # PGRAC: execute native allocation and structural mutation bodies.
+test_cluster_btree_hw_owner.inc: $(top_srcdir)/src/backend/access/nbtree/nbtinsert.c Makefile
+	awk '/^_bt_(doinsert|insert_alloc_needed)\(/ { print "bool"; emit=1; found++ } \
+	     /^_bt_doinsert_internal\(/ { print "static bool"; emit=1; found++ } \
+	     /^_bt_insert_alloc_(begin|end)\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 5) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_hw_needed.inc: $(top_srcdir)/src/backend/access/nbtree/nbtinsert.c Makefile
+	awk '/^_bt_insert_alloc_needed\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_hw_insert_paths.inc: $(top_srcdir)/src/backend/access/nbtree/nbtinsert.c Makefile
+	awk '/^_bt_(finish_split|getstackbuf)\(/ { print ($$0 ~ /finish_split/ ? "bool" : "Buffer"); emit=1; found++ } \
+	     /^_bt_stepright\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_hw_search_paths.inc: $(top_srcdir)/src/backend/access/nbtree/nbtsearch.c Makefile
+	awk '/^_bt_search\(/ { print "BTStack"; emit=1; found++ } \
+	     /^_bt_moveright\(/ { print "Buffer"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_hw_restart: test_cluster_btree_hw_restart.c unit_test.h \
+		test_cluster_btree_hw_owner.inc \
+		test_cluster_space_bufpage_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
 test_cluster_btree_structure_helpers.inc: $(top_srcdir)/src/backend/access/nbtree/nbtpage.c Makefile
 	awk '/^_bt_(upgrademetapage|pageinit|get_version_identity)\(/ { print "void"; emit=1; found++ } \
 	     /^_bt_prepare_page_versions?\(/ { print "bool"; emit=1; found++ } \
@@ -2015,6 +2051,7 @@ test_cluster_btree_structure_insert.inc: $(top_srcdir)/src/backend/access/nbtree
 	mv $@.tmp $@
 
 test_cluster_btree_structure_version: test_cluster_btree_structure_version.c unit_test.h \
+		test_cluster_btree_hw_needed.inc \
 		test_cluster_btree_structure_helpers.inc test_cluster_btree_structure_alloc.inc \
 		test_cluster_btree_structure_root.inc \
 		test_cluster_btree_structure_delete.inc \
@@ -2022,6 +2059,22 @@ test_cluster_btree_structure_version: test_cluster_btree_structure_version.c uni
 		test_cluster_btree_structure_newlevel.inc test_cluster_btree_structure_insert.inc \
 		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o \
 		test_cluster_space_storage_product.o test_cluster_inplace_itemptr_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
+		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		test_cluster_inplace_itemptr_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+test_cluster_btree_hw_paths: test_cluster_btree_hw_paths.c test_cluster_btree_structure_version.c \
+		test_cluster_btree_hw_insert_paths.inc test_cluster_btree_hw_search_paths.inc \
+		test_cluster_btree_structure_helpers.inc test_cluster_btree_structure_alloc.inc \
+		test_cluster_btree_structure_root.inc test_cluster_btree_structure_delete.inc \
+		test_cluster_btree_structure_add.inc test_cluster_btree_structure_split.inc \
+		test_cluster_btree_structure_newlevel.inc test_cluster_btree_structure_insert.inc \
+		test_cluster_btree_hw_needed.inc test_cluster_space_bufpage_product.o \
+		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		test_cluster_inplace_itemptr_product.o unit_test.h \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
@@ -3069,7 +3122,7 @@ test_cluster_space_extend_zero.inc: $(top_srcdir)/src/backend/storage/buffer/buf
 
 test_cluster_space_extend_handoff.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^ExtendBufferedRelSharedInternal\(/ { inside=1 } \
-	     inside && /^\tif \(ko_scoped\)( \{)?$$/ { emit=1; found++ } \
+	     inside && /^\tif \(ko_scoped && preheld_ko_serial == 0\) \{/ { emit=1; found++ } \
 	     emit { print } emit && /^\t}/ { emit=0; done++ } /^}/ { inside=0 } \
 	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
@@ -5427,6 +5480,8 @@ clean distclean maintainer-clean:
 		test_cluster_btree_structure_delete.inc \
 		test_cluster_btree_structure_add.inc test_cluster_btree_structure_split.inc \
 		test_cluster_btree_structure_newlevel.inc test_cluster_btree_structure_insert.inc
+	rm -f test_cluster_btree_hw_owner.inc test_cluster_btree_hw_needed.inc \
+		test_cluster_btree_hw_insert_paths.inc test_cluster_btree_hw_search_paths.inc
 	rm -f test_cluster_sequence_version_helpers.inc test_cluster_sequence_version_native.inc test_cluster_sequence_hint.inc
 	rm -f test_cluster_relation_wal_types.inc test_cluster_relation_wal_native.inc
 	rm -f test_cluster_heap_small_native.inc test_cluster_heap_small_scn.inc
@@ -6104,7 +6159,7 @@ test_cluster_pcm_settlement_ingress.inc: $(top_srcdir)/src/backend/cluster/clust
 	     END { if (count != 4 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_wait_exit: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_wait_exit test_cluster_pcm_stop_cv: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
 		test_cluster_pcm_master_durable.inc \
 		test_cluster_pcm_bootstrap_tick.inc \
 		test_cluster_pcm_settlement_ingress.inc \
@@ -6130,6 +6185,8 @@ test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_wait_exit:
 		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_pcm_stop_cv: $(top_srcdir)/src/backend/storage/lmgr/condition_variable.c
 
 # spec-2.36a C1/D5a: the real cluster_pcm_own object is linked against a
 # fake shmem region.  The test also reads the production bufmgr source through
@@ -7249,7 +7306,7 @@ test_cluster_ko_writeback_codec.o: $(top_srcdir)/src/backend/cluster/cluster_pi_
 		$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_ko_stop test_cluster_ko_cancel test_cluster_ko_ready_owner test_cluster_ko_drop_io test_cluster_ko_source_io test_cluster_ko_sync_io test_cluster_ko_writeback_io test_cluster_ko_origin_marker test_cluster_ko_native_route test_cluster_ko_origin_checkpoint test_cluster_ko_registration test_cluster_ko_runtime_wire: %: %.c test_cluster_ko_stop.c test_cluster_ko_space.inc test_cluster_ko_abandon.h test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
+test_cluster_ko_stop test_cluster_ko_extend_range test_cluster_ko_cancel test_cluster_ko_ready_owner test_cluster_ko_drop_io test_cluster_ko_source_io test_cluster_ko_sync_io test_cluster_ko_writeback_io test_cluster_ko_origin_marker test_cluster_ko_native_route test_cluster_ko_origin_checkpoint test_cluster_ko_registration test_cluster_ko_runtime_wire: %: %.c test_cluster_ko_stop.c test_cluster_ko_space.inc test_cluster_ko_abandon.h test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
 		test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_ko_lock.c \
 		$(top_srcdir)/src/include/cluster/cluster_ko.h
@@ -7267,7 +7324,7 @@ test_cluster_ko_native_capability.inc: $(top_srcdir)/src/backend/cluster/cluster
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_ko_stop test_cluster_ko_cancel test_cluster_ko_ready_owner test_cluster_ko_drop_io test_cluster_ko_source_io test_cluster_ko_sync_io test_cluster_ko_writeback_io test_cluster_ko_origin_marker test_cluster_ko_native_route test_cluster_ko_origin_checkpoint test_cluster_ko_registration test_cluster_ko_runtime_wire test_cluster_drop_work test_cluster_drop_z test_cluster_drop_z_wb test_cluster_drop_z_full: test_cluster_ko_native_capability.inc
+test_cluster_ko_stop test_cluster_ko_extend_range test_cluster_ko_cancel test_cluster_ko_ready_owner test_cluster_ko_drop_io test_cluster_ko_source_io test_cluster_ko_sync_io test_cluster_ko_writeback_io test_cluster_ko_origin_marker test_cluster_ko_native_route test_cluster_ko_origin_checkpoint test_cluster_ko_registration test_cluster_ko_runtime_wire test_cluster_drop_work test_cluster_drop_z test_cluster_drop_z_wb test_cluster_drop_z_full: test_cluster_ko_native_capability.inc
 
 # Actual original KO owner and storage consumer; syscall faults use real files.
 test_cluster_drop_work test_cluster_drop_z test_cluster_drop_z_wb test_cluster_drop_z_full: %: %.c test_cluster_drop_work.c test_cluster_ko_space.inc test_cluster_ko_abandon.h test_cluster_ko_stop.c test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h \

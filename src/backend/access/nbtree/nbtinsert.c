@@ -35,11 +35,13 @@
 #include "lib/qunique.h"
 #include "miscadmin.h"
 #include "storage/lmgr.h"
+#include "storage/lwlock.h"
 #include "storage/predicate.h"
 #include "storage/smgr.h"
 
 #ifdef USE_PGRAC_CLUSTER
 #include "catalog/pg_control.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_guc.h" /* exact TX wait enable/timeout */
 #include "cluster/cluster_reverse_key.h" /* PGRAC: spec-6.12f reverse-key */
 #include "cluster/cluster_tx_enqueue.h" /* remote SnapshotDirty xmax wait */
@@ -69,7 +71,7 @@ static OffsetNumber _bt_findinsertloc(Relation rel,
 									  bool indexUnchanged,
 									  BTStack stack,
 									  Relation heapRel);
-static void _bt_stepright(Relation rel, Relation heaprel,
+static bool _bt_stepright(Relation rel, Relation heaprel,
 						  BTInsertState insertstate, BTStack stack);
 static void _bt_insertonpg(Relation rel, Relation heaprel, BTScanInsert itup_key,
 						   Buffer buf,
@@ -81,7 +83,7 @@ static void _bt_insertonpg(Relation rel, Relation heaprel, BTScanInsert itup_key
 						   int postingoff,
 						   bool split_only_page
 #ifdef USE_PGRAC_CLUSTER
-							, const ClusterSpaceIdentity *identity
+							, const ClusterSpaceIdentity *identity, BTInsertAlloc *allocation
 #endif
 	);
 static Buffer _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key,
@@ -89,18 +91,18 @@ static Buffer _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key,
 						Size newitemsz, IndexTuple newitem, IndexTuple orignewitem,
 						IndexTuple nposting, uint16 postingoff
 #ifdef USE_PGRAC_CLUSTER
-							, const ClusterSpaceIdentity *identity
+							, const ClusterSpaceIdentity *identity, BTInsertAlloc *allocation
 #endif
 	);
 static void _bt_insert_parent(Relation rel, Relation heaprel, Buffer buf,
 							  Buffer rbuf, BTStack stack, bool isroot, bool isonly
 #ifdef USE_PGRAC_CLUSTER
-							, const ClusterSpaceIdentity *identity
+							, const ClusterSpaceIdentity *identity, BTInsertAlloc *allocation
 #endif
 	);
 static Buffer _bt_newlevel(Relation rel, Relation heaprel, Buffer lbuf, Buffer rbuf
 #ifdef USE_PGRAC_CLUSTER
-							, const ClusterSpaceIdentity *identity
+							, const ClusterSpaceIdentity *identity, BTInsertAlloc *allocation
 #endif
 	);
 static inline bool _bt_pgaddtup(Page page, Size itemsize, IndexTuple itup,
@@ -121,6 +123,61 @@ static BlockNumber *_bt_deadblocks(Page page, OffsetNumber *deletable,
 								   int ndeletable, IndexTuple newitem,
 								   int *nblocks);
 static inline int _bt_blk_cmp(const void *arg1, const void *arg2);
+
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: report allocation need before any split is published. */
+bool
+_bt_insert_alloc_needed(BTInsertAlloc *allocation)
+{
+	if (allocation == NULL || allocation->hw.held)
+		return false;
+	allocation->required = true;
+	return true;
+}
+
+/* PGRAC: called only after caller content, pins and search stack are gone. */
+static void
+_bt_insert_alloc_begin(Relation rel, BTInsertAlloc *allocation)
+{
+	ClusterResId resid;
+
+	for (;;)
+	{
+		bool retry;
+
+		if (cluster_ko_extend_begin_v3(rel->rd_locator, MAIN_FORKNUM,
+									 &allocation->ko_serial, &retry))
+			break;
+		if (!retry)
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+					 errmsg("cannot qualify the index extension object owner")));
+		CHECK_FOR_INTERRUPTS();
+		cluster_ko_peer_admission_wait(100L);
+		CHECK_FOR_INTERRUPTS();
+	}
+	cluster_hw_resid_encode(rel->rd_locator, MAIN_FORKNUM, &resid);
+	if (!cluster_hw_lock(&resid, &allocation->hw))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+				 errmsg("could not acquire the index relation-extend lock")));
+}
+
+/* PGRAC: content ownership must be gone before retiring the finite owner. */
+static void
+_bt_insert_alloc_end(BTInsertAlloc *allocation)
+{
+	if (allocation == NULL)
+		return;
+	cluster_hw_unlock(&allocation->hw);
+	if (allocation->ko_serial != 0 &&
+		!cluster_ko_extend_end_v3(allocation->ko_serial))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+				 errmsg("index extension requires its original range recovery")));
+	allocation->ko_serial = 0;
+}
+#endif
 
 /*
  *	_bt_doinsert() -- Handle insertion of a single index tuple in the tree.
@@ -145,10 +202,14 @@ static inline int _bt_blk_cmp(const void *arg1, const void *arg2);
  *		successful UNIQUE_CHECK_YES or UNIQUE_CHECK_EXISTING call, but
  *		that's just a coding artifact.)
  */
-bool
-_bt_doinsert(Relation rel, IndexTuple itup,
+static bool
+_bt_doinsert_internal(Relation rel, IndexTuple itup,
 			 IndexUniqueCheck checkUnique, bool indexUnchanged,
-			 Relation heapRel)
+			 Relation heapRel
+#ifdef USE_PGRAC_CLUSTER
+			 , BTInsertAlloc *allocation
+#endif
+	)
 {
 	bool		is_unique = false;
 	BTInsertStateData insertstate;
@@ -157,6 +218,7 @@ _bt_doinsert(Relation rel, IndexTuple itup,
 	bool		checkingunique = (checkUnique != UNIQUE_CHECK_NO);
 
 #ifdef USE_PGRAC_CLUSTER
+	insertstate.allocation = allocation;
 	/* PGRAC: one identity value before any index content lock or scankey read. */
 	_bt_get_version_identity(rel, &insertstate.version_identity);
 #endif
@@ -210,6 +272,15 @@ _bt_doinsert(Relation rel, IndexTuple itup,
 	insertstate.postingoff = 0;
 
 search:
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: allocation admission always precedes the fresh content search. */
+	if (allocation != NULL && allocation->required && !allocation->hw.held)
+		_bt_insert_alloc_begin(rel, allocation);
+#endif
+	insertstate.bounds_valid = false;
+	insertstate.postingoff = 0;
+	if (checkingunique)
+		itup_key->scantid = NULL;
 
 	/*
 	 * Find and lock the leaf page that the tuple should be added to by
@@ -217,6 +288,10 @@ search:
 	 * is locked in exclusive mode afterwards.
 	 */
 	stack = _bt_search_insert(rel, heapRel, &insertstate);
+#ifdef USE_PGRAC_CLUSTER
+	if (!BufferIsValid(insertstate.buf) && allocation != NULL && allocation->required)
+		goto allocation_restart;
+#endif
 
 	/*
 	 * checkingunique inserts are not allowed to go ahead when two tuples with
@@ -297,6 +372,10 @@ search:
 				stack = NULL;
 			}
 
+#ifdef USE_PGRAC_CLUSTER
+			_bt_insert_alloc_end(allocation);
+#endif
+
 			do
 			{
 				warm_tid = barrier_tid;
@@ -325,6 +404,10 @@ search:
 				_bt_freestack(stack);
 				stack = NULL;
 			}
+
+#ifdef USE_PGRAC_CLUSTER
+			_bt_insert_alloc_end(allocation);
+#endif
 
 			if (TransactionIdIsValid(xwait))
 				ereport(ERROR,
@@ -372,6 +455,10 @@ search:
 			_bt_relbuf(rel, insertstate.buf);
 			insertstate.buf = InvalidBuffer;
 
+#ifdef USE_PGRAC_CLUSTER
+			_bt_insert_alloc_end(allocation);
+#endif
+
 			/*
 			 * If it's a speculative insertion, wait for it to finish (ie. to
 			 * go ahead with the insertion, or kill the tuple).  Otherwise
@@ -413,11 +500,17 @@ search:
 		 */
 		newitemoff = _bt_findinsertloc(rel, &insertstate, checkingunique,
 									   indexUnchanged, stack, heapRel);
+#ifdef USE_PGRAC_CLUSTER
+		if (newitemoff == InvalidOffsetNumber ||
+			(PageGetFreeSpace(BufferGetPage(insertstate.buf)) < insertstate.itemsz &&
+			 _bt_insert_alloc_needed(allocation)))
+			goto allocation_restart;
+#endif
 		_bt_insertonpg(rel, heapRel, itup_key, insertstate.buf, InvalidBuffer,
 					   stack, itup, insertstate.itemsz, newitemoff,
 					   insertstate.postingoff, false
 #ifdef USE_PGRAC_CLUSTER
-							, &insertstate.version_identity
+							, &insertstate.version_identity, allocation
 #endif
 			);
 	}
@@ -433,6 +526,62 @@ search:
 	pfree(itup_key);
 
 	return is_unique;
+#ifdef USE_PGRAC_CLUSTER
+
+allocation_restart:
+	/* PGRAC: no page/stack-derived insertion position survives re-entry. */
+	if (BufferIsValid(insertstate.buf))
+		_bt_relbuf(rel, insertstate.buf);
+	insertstate.buf = InvalidBuffer;
+	if (stack)
+		_bt_freestack(stack);
+	RelationSetTargetBlock(rel, InvalidBlockNumber);
+	goto search;
+#endif
+}
+
+/*
+ * PGRAC: retain the allocation owner through the complete insertion, including
+ * internal splits and new-root publication. Native callers need no scope.
+ */
+bool
+_bt_doinsert(Relation rel, IndexTuple itup, IndexUniqueCheck checkUnique,
+			 bool indexUnchanged, Relation heapRel)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_enabled && cluster_shared_config &&
+		cluster_interconnect_tier == CLUSTER_IC_TIER_1 && !RecoveryInProgress() &&
+		RelationIsPermanent(rel) &&
+		cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1)
+	{
+		BTInsertAlloc *allocation = palloc0(sizeof(*allocation));
+		bool result;
+
+		PG_TRY();
+		{
+			result = _bt_doinsert_internal(rel, itup, checkUnique, indexUnchanged,
+										 heapRel, allocation);
+			_bt_insert_alloc_end(allocation);
+		}
+		PG_CATCH();
+		{
+			/* The error continues to the normal transaction abort machinery. */
+			LWLockReleaseAll();
+			UnlockBuffers();
+			cluster_hw_unlock(&allocation->hw);
+			cluster_ko_extend_abort_v3(allocation->ko_serial);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		pfree(allocation);
+		return result;
+	}
+#endif
+	return _bt_doinsert_internal(rel, itup, checkUnique, indexUnchanged, heapRel
+#ifdef USE_PGRAC_CLUSTER
+								, NULL
+#endif
+		);
 }
 
 /*
@@ -540,7 +689,7 @@ _bt_search_insert(Relation rel, Relation heaprel, BTInsertState insertstate)
 	return _bt_search(rel, heaprel, insertstate->itup_key, &insertstate->buf,
 					  BT_WRITE, NULL
 #ifdef USE_PGRAC_CLUSTER
-							, &insertstate->version_identity
+							, &insertstate->version_identity, insertstate->allocation
 #endif
 			);
 }
@@ -1155,7 +1304,8 @@ _bt_findinsertloc(Relation rel,
 					_bt_compare(rel, itup_key, page, P_HIKEY) <= 0)
 					break;
 
-				_bt_stepright(rel, heapRel, insertstate, stack);
+				if (!_bt_stepright(rel, heapRel, insertstate, stack))
+					return InvalidOffsetNumber;
 				/* Update local state after stepping right */
 				page = BufferGetPage(insertstate->buf);
 				opaque = BTPageGetOpaque(page);
@@ -1239,7 +1389,8 @@ _bt_findinsertloc(Relation rel,
 				pg_prng_uint32(&pg_global_prng_state) <= (PG_UINT32_MAX / 100))
 				break;
 
-			_bt_stepright(rel, heapRel, insertstate, stack);
+			if (!_bt_stepright(rel, heapRel, insertstate, stack))
+				return InvalidOffsetNumber;
 			/* Update local state after stepping right */
 			page = BufferGetPage(insertstate->buf);
 			opaque = BTPageGetOpaque(page);
@@ -1290,8 +1441,11 @@ _bt_findinsertloc(Relation rel,
  *
  * This is more aggressive than it needs to be for non-unique !heapkeyspace
  * indexes.
+ *
+ * PGRAC: false requests allocation re-entry. The encountered sibling has
+ * been released; insertstate->buf remains owned by the insertion caller.
  */
-static void
+static bool
 _bt_stepright(Relation rel, Relation heaprel, BTInsertState insertstate,
 			  BTStack stack)
 {
@@ -1320,11 +1474,12 @@ _bt_stepright(Relation rel, Relation heaprel, BTInsertState insertstate,
 		 */
 		if (P_INCOMPLETE_SPLIT(opaque))
 		{
-			_bt_finish_split(rel, heaprel, rbuf, stack
+			if (!_bt_finish_split(rel, heaprel, rbuf, stack
 #ifdef USE_PGRAC_CLUSTER
-							, &insertstate->version_identity
+							, &insertstate->version_identity, insertstate->allocation
 #endif
-			);
+				))
+				return false;
 			rbuf = InvalidBuffer;
 			continue;
 		}
@@ -1341,6 +1496,7 @@ _bt_stepright(Relation rel, Relation heaprel, BTInsertState insertstate,
 	_bt_relbuf(rel, insertstate->buf);
 	insertstate->buf = rbuf;
 	insertstate->bounds_valid = false;
+	return true;
 }
 
 /*----------
@@ -1386,7 +1542,7 @@ _bt_insertonpg(Relation rel,
 			   int postingoff,
 			   bool split_only_page
 #ifdef USE_PGRAC_CLUSTER
-							, const ClusterSpaceIdentity *identity
+							, const ClusterSpaceIdentity *identity, BTInsertAlloc *allocation
 #endif
 	)
 {
@@ -1500,7 +1656,7 @@ _bt_insertonpg(Relation rel,
 		rbuf = _bt_split(rel, heaprel, itup_key, buf, cbuf, newitemoff, itemsz,
 						 itup, origitup, nposting, postingoff
 #ifdef USE_PGRAC_CLUSTER
-							, identity
+							, identity, allocation
 #endif
 			);
 		PredicateLockPageSplit(rel,
@@ -1527,7 +1683,7 @@ _bt_insertonpg(Relation rel,
 		 */
 		_bt_insert_parent(rel, heaprel, buf, rbuf, stack, isroot, isonly
 #ifdef USE_PGRAC_CLUSTER
-							, identity
+							, identity, allocation
 #endif
 			);
 	}
@@ -1789,7 +1945,7 @@ _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf,
 		  Buffer cbuf, OffsetNumber newitemoff, Size newitemsz, IndexTuple newitem,
 		  IndexTuple orignewitem, IndexTuple nposting, uint16 postingoff
 #ifdef USE_PGRAC_CLUSTER
-							, const ClusterSpaceIdentity *identity
+							, const ClusterSpaceIdentity *identity, BTInsertAlloc *allocation
 #endif
 	)
 {
@@ -2051,7 +2207,11 @@ _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf,
 	 * way because it avoids an unnecessary PANIC when either origpage or its
 	 * existing sibling page are corrupt.
 	 */
-	rbuf = _bt_allocbuf(rel, heaprel);
+	rbuf = _bt_allocbuf(rel, heaprel
+#ifdef USE_PGRAC_CLUSTER
+						 , identity, allocation
+#endif
+		);
 	rightpage = BufferGetPage(rbuf);
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC: leave the allocated predecessor intact until the native split. */
@@ -2479,7 +2639,7 @@ _bt_insert_parent(Relation rel,
 				  bool isroot,
 				  bool isonly
 #ifdef USE_PGRAC_CLUSTER
-							, const ClusterSpaceIdentity *identity
+							, const ClusterSpaceIdentity *identity, BTInsertAlloc *allocation
 #endif
 	)
 {
@@ -2507,7 +2667,7 @@ _bt_insert_parent(Relation rel,
 		/* create a new root node one level up and update the metapage */
 		rootbuf = _bt_newlevel(rel, heaprel, buf, rbuf
 #ifdef USE_PGRAC_CLUSTER
-							, identity
+							, identity, allocation
 #endif
 			);
 		/* release the split buffers */
@@ -2576,7 +2736,7 @@ _bt_insert_parent(Relation rel,
 		 */
 		pbuf = _bt_getstackbuf(rel, heaprel, stack, bknum
 #ifdef USE_PGRAC_CLUSTER
-							, identity
+							, identity, allocation
 #endif
 			);
 
@@ -2606,7 +2766,7 @@ _bt_insert_parent(Relation rel,
 					   new_item, MAXALIGN(IndexTupleSize(new_item)),
 					   stack->bts_offset + 1, 0, isonly
 #ifdef USE_PGRAC_CLUSTER
-							, identity
+							, identity, allocation
 #endif
 			);
 
@@ -2627,11 +2787,14 @@ _bt_insert_parent(Relation rel,
  *
  * Caller must provide a valid heaprel, since finishing a page split requires
  * allocating a new page if and when the parent page splits in turn.
+ *
+ * PGRAC: return false before mutation when an insertion needs outer HW.
+ * The left buffer is released on either outcome; true means repair completed.
  */
-void
+bool
 _bt_finish_split(Relation rel, Relation heaprel, Buffer lbuf, BTStack stack
 #ifdef USE_PGRAC_CLUSTER
-							, const ClusterSpaceIdentity *identity
+							, const ClusterSpaceIdentity *identity, BTInsertAlloc *allocation
 #endif
 	)
 {
@@ -2645,6 +2808,15 @@ _bt_finish_split(Relation rel, Relation heaprel, Buffer lbuf, BTStack stack
 
 	Assert(P_INCOMPLETE_SPLIT(lpageop));
 	Assert(heaprel != NULL);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: defer the whole repair before taking another buffer or mutating. */
+	if (_bt_insert_alloc_needed(allocation))
+	{
+		_bt_relbuf(rel, lbuf);
+		return false;
+	}
+#endif
 
 	/* Lock right sibling, the one missing the downlink */
 	rbuf = _bt_getbuf(rel, lpageop->btpo_next, BT_WRITE);
@@ -2678,9 +2850,10 @@ _bt_finish_split(Relation rel, Relation heaprel, Buffer lbuf, BTStack stack
 
 	_bt_insert_parent(rel, heaprel, lbuf, rbuf, stack, wasroot, wasonly
 #ifdef USE_PGRAC_CLUSTER
-							, identity
+							, identity, allocation
 #endif
 			);
+	return true;
 }
 
 /*
@@ -2717,7 +2890,7 @@ _bt_finish_split(Relation rel, Relation heaprel, Buffer lbuf, BTStack stack
 Buffer
 _bt_getstackbuf(Relation rel, Relation heaprel, BTStack stack, BlockNumber child
 #ifdef USE_PGRAC_CLUSTER
-							, const ClusterSpaceIdentity *identity
+							, const ClusterSpaceIdentity *identity, BTInsertAlloc *allocation
 #endif
 	)
 {
@@ -2740,11 +2913,12 @@ _bt_getstackbuf(Relation rel, Relation heaprel, BTStack stack, BlockNumber child
 		Assert(heaprel != NULL);
 		if (P_INCOMPLETE_SPLIT(opaque))
 		{
-			_bt_finish_split(rel, heaprel, buf, stack->bts_parent
+			if (!_bt_finish_split(rel, heaprel, buf, stack->bts_parent
 #ifdef USE_PGRAC_CLUSTER
-							, identity
+							, identity, allocation
 #endif
-			);
+				))
+				return InvalidBuffer;
 			continue;
 		}
 
@@ -2850,7 +3024,7 @@ _bt_getstackbuf(Relation rel, Relation heaprel, BTStack stack, BlockNumber child
 static Buffer
 _bt_newlevel(Relation rel, Relation heaprel, Buffer lbuf, Buffer rbuf
 #ifdef USE_PGRAC_CLUSTER
-							, const ClusterSpaceIdentity *identity
+							, const ClusterSpaceIdentity *identity, BTInsertAlloc *allocation
 #endif
 	)
 {
@@ -2882,7 +3056,11 @@ _bt_newlevel(Relation rel, Relation heaprel, Buffer lbuf, Buffer rbuf
 	lopaque = BTPageGetOpaque(lpage);
 
 	/* get a new root page */
-	rootbuf = _bt_allocbuf(rel, heaprel);
+	rootbuf = _bt_allocbuf(rel, heaprel
+#ifdef USE_PGRAC_CLUSTER
+						 , identity, allocation
+#endif
+		);
 	rootpage = BufferGetPage(rootbuf);
 	rootblknum = BufferGetBlockNumber(rootbuf);
 

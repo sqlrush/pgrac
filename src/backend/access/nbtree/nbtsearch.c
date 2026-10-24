@@ -11,6 +11,12 @@
  *	  src/backend/access/nbtree/nbtsearch.c
  *
  *-------------------------------------------------------------------------
+ *
+ * PGRAC MODIFICATIONS
+ *    Modified by: SqlRush <sqlrush@gmail.com>
+ *    Carry explicit insertion allocation restart through write searches.
+ *
+ *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
@@ -95,12 +101,15 @@ _bt_drop_lock_and_maybe_pin(IndexScanDesc scan, BTScanPos sp)
  *
  * heaprel must be provided by callers that pass access = BT_WRITE, since we
  * might need to allocate a new root page for caller -- see _bt_allocbuf.
+ *
+ * PGRAC: InvalidBuffer with allocation->required requests insertion re-entry.
+ * The returned stack is still caller-owned; no buffer lock or pin is retained.
  */
 BTStack
 _bt_search(Relation rel, Relation heaprel, BTScanInsert key, Buffer *bufP,
 		   int access, Snapshot snapshot
 #ifdef USE_PGRAC_CLUSTER
-							, const ClusterSpaceIdentity *identity
+							, const ClusterSpaceIdentity *identity, BTInsertAlloc *allocation
 #endif
 	)
 {
@@ -114,7 +123,7 @@ _bt_search(Relation rel, Relation heaprel, BTScanInsert key, Buffer *bufP,
 	/* Get the root page to start with */
 	*bufP = _bt_getroot(rel, heaprel, access
 #ifdef USE_PGRAC_CLUSTER
-							, identity
+							, identity, allocation
 #endif
 			);
 
@@ -148,9 +157,14 @@ _bt_search(Relation rel, Relation heaprel, BTScanInsert key, Buffer *bufP,
 		*bufP = _bt_moveright(rel, heaprel, key, *bufP, (access == BT_WRITE),
 							  stack_in, page_access, snapshot
 #ifdef USE_PGRAC_CLUSTER
-							, identity
+							, identity, allocation
 #endif
 			);
+
+#ifdef USE_PGRAC_CLUSTER
+		if (!BufferIsValid(*bufP))
+			return stack_in;
+#endif
 
 		/* if this is a leaf page, we're done */
 		page = BufferGetPage(*bufP);
@@ -213,7 +227,7 @@ _bt_search(Relation rel, Relation heaprel, BTScanInsert key, Buffer *bufP,
 		*bufP = _bt_moveright(rel, heaprel, key, *bufP, true, stack_in, BT_WRITE,
 							  snapshot
 #ifdef USE_PGRAC_CLUSTER
-							, identity
+							, identity, allocation
 #endif
 			);
 	}
@@ -266,7 +280,7 @@ _bt_moveright(Relation rel,
 			  int access,
 			  Snapshot snapshot
 #ifdef USE_PGRAC_CLUSTER
-							, const ClusterSpaceIdentity *identity
+							, const ClusterSpaceIdentity *identity, BTInsertAlloc *allocation
 #endif
 	)
 {
@@ -319,11 +333,14 @@ _bt_moveright(Relation rel,
 			}
 
 			if (P_INCOMPLETE_SPLIT(opaque))
-				_bt_finish_split(rel, heaprel, buf, stack
+			{
+				if (!_bt_finish_split(rel, heaprel, buf, stack
 #ifdef USE_PGRAC_CLUSTER
-							, identity
+							, identity, allocation
 #endif
-			);
+					))
+					return InvalidBuffer;
+			}
 			else
 				_bt_relbuf(rel, buf);
 
@@ -1400,7 +1417,7 @@ _bt_first(IndexScanDesc scan, ScanDirection dir)
 	 */
 	stack = _bt_search(rel, NULL, &inskey, &buf, BT_READ, scan->xs_snapshot
 #ifdef USE_PGRAC_CLUSTER
-							, NULL
+							, NULL, NULL
 #endif
 			);
 
@@ -1424,7 +1441,7 @@ _bt_first(IndexScanDesc scan, ScanDirection dir)
 			stack = _bt_search(rel, NULL, &inskey, &buf, BT_READ,
 							   scan->xs_snapshot
 #ifdef USE_PGRAC_CLUSTER
-							, NULL
+							, NULL, NULL
 #endif
 			);
 			_bt_freestack(stack);
@@ -2377,7 +2394,7 @@ _bt_get_endpoint(Relation rel, uint32 level, bool rightmost,
 	if (level == 0)
 		buf = _bt_getroot(rel, NULL, BT_READ
 #ifdef USE_PGRAC_CLUSTER
-							, NULL
+							, NULL, NULL
 #endif
 			);
 	else

@@ -5217,6 +5217,12 @@ pcm_entry_wait_context_cleanup(PcmEntryWaitContext *context)
 		pcm_entry_ref_release(&context->ref);
 }
 
+static bool
+pcm_frontend_wait_can_unwind(void)
+{
+	return MyBackendType == B_BACKEND && InterruptHoldoffCount > 0 && CritSectionCount == 0;
+}
+
 static void
 pcm_frontend_wait_check_shutdown(void)
 {
@@ -5225,8 +5231,7 @@ pcm_frontend_wait_check_shutdown(void)
 	 * reference through PG_FINALLY before native LWLock/transaction cleanup.
 	 * Never clear holdoff counters or the shutdown flag and resume work, and
 	 * never throw through a critical section or change a background role. */
-	if (MyBackendType == B_BACKEND && ProcDiePending && InterruptHoldoffCount > 0
-		&& CritSectionCount == 0)
+	if (ProcDiePending && pcm_frontend_wait_can_unwind())
 		ereport(ERROR,
 				(errcode(ERRCODE_ADMIN_SHUTDOWN),
 				 errmsg("canceling statement during administrator shutdown while waiting for cluster buffer ownership")));
@@ -7993,7 +7998,15 @@ pcm_lock_acquire_local_pinned(BufferTag tag, PcmLockMode mode, PcmAuthoritySnaps
 			pcm_trace_wait(entry, CLWAIT_SITE_PCM_COMPATIBLE, mode, -1,
 				cluster_node_id, 0, false, false, NULL);
 		pcm_frontend_wait_check_shutdown();
-		ConditionVariableSleep(&entry->wait_cv, WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+		/* PGRAC: spec-2.31/spec-5.9. With an outer content lock, native
+		 * interrupt processing defers SIGTERM and a latch-only wake stays
+		 * inside the CV loop. Return to our shutdown check even without a
+		 * producer broadcast. Expiry only rechecks the same predicate. */
+		if (pcm_frontend_wait_can_unwind())
+			(void)ConditionVariableTimedSleep(&entry->wait_cv, 100,
+											  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+		else
+			ConditionVariableSleep(&entry->wait_cv, WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
 		pcm_frontend_wait_check_shutdown();
 		cluster_content_trace_wait_clear(CLCONTENT_PCM);
 		if (!pcm_entry_ref_identity_exact(&wait_context->ref)) {
