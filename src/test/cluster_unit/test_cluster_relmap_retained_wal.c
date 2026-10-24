@@ -1972,6 +1972,14 @@ UT_TEST(test_census_side_wal_requires_real_empty_initializer)
 	relmap_empty_initializer_rebuild(true);
 }
 
+UT_TEST(test_terminal_prefix_scan_requires_original_retained_owner)
+{
+	ClusterRelmapTerminalScanV1 *scan = (void *)1;
+	UT_ASSERT(!cluster_relmap_recovery_terminal_prefix_scan_v2(
+		NULL, 0, FullTransactionIdFromU64(99), &scan));
+	UT_ASSERT(scan == NULL);
+	cluster_relmap_recovery_terminal_scan_release_v1(&scan);
+}
 UT_TEST(test_terminal_scan_requires_original_retained_owner)
 {
 	ClusterRelmapTerminalScanV1 *scan = (void *)1;
@@ -2104,6 +2112,228 @@ terminal_test_fixture(unsigned selected, bool aborting, unsigned fault)
 	return inputs;
 }
 
+static XLogRecPtr prefix_test_checkpoint_end;
+static ClusterWalInputsV1 *
+terminal_prefix_fixture(bool aborting, unsigned fault)
+{
+	uint8 bytes[66048];
+	ClusterRecoveryAnchorV2 anchors[2];
+	ClusterRecoveryAnchorV2 *a = &anchors[0];
+	ClusterRelmapCheckpointWindow window = { 0 };
+	ClusterWalSourceRef source = { 0 };
+	ControlRootImage root;
+	ClusterControlRootSnapshot *snapshot;
+	ControlFileData native = { 0 };
+	ClusterWalInputsV1 *inputs = NULL;
+	TimestampTz timestamp = 123;
+	WalTestRecord terminal, checkpoint, tail;
+	XLogRecPtr lower, at;
+	char path[MAXPGPATH];
+	inputs_closed_wal_fixture(bytes, anchors);
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &root), 0);
+	snapshot = &root.records[0];
+	lower = snapshot->checkpoint_lower_lsn;
+	at = lower + MAXALIGN(SizeOfXLogRecord + 2 + sizeof(timestamp));
+	if (fault == 4 || fault == 5 || fault == 6)
+		at += MAXALIGN(SizeOfXLogRecord + 2 + sizeof(timestamp));
+	a->state = DB_IN_PRODUCTION;
+	a->checkpoint = at;
+	a->checkpoint_copy.redo
+		= fault == 6 ? lower + MAXALIGN(SizeOfXLogRecord + 2 + sizeof(timestamp)) : lower;
+	native.state = a->state;
+	native.checkPoint = a->checkpoint;
+	native.checkPointCopy = a->checkpoint_copy;
+	snprintf(test_checkpoint_prefix_path, sizeof(test_checkpoint_prefix_path),
+			 "%s/thread_%u/generation_" UINT64_FORMAT "/durable_prefix/current",
+			 cluster_wal_threads_dir, a->identity.origin_thread_id,
+			 a->identity.origin_owner_incarnation);
+	v2_checkpoint_wal_record(&a->identity, &native, 0);
+	prefix_test_checkpoint_end = test_checkpoint_end;
+	source.claim.identity = snapshot->identity;
+	source.claim.database_incarnation = root.header.v2.database_incarnation;
+	source.claim.max_config_generation = root.header.v2.config_generation;
+	memcpy(source.claim.claim_sha256, root.refs[0].claim_sha256, 32);
+	source.timeline = snapshot->tail_tli;
+	terminal = terminal_test_record(
+		&source, lower, 0, RM_XACT_ID, aborting ? XLOG_XACT_ABORT : XLOG_XACT_COMMIT,
+		fault == 2 || fault == 3 ? 98 : 99, &timestamp, sizeof(timestamp));
+	if (fault == 4 || fault == 5 || fault == 6)
+		terminal = terminal_test_record(&source, terminal.exclusive_end, terminal.record_start,
+										fault == 6 ? RM_XLOG_ID : RM_XACT_ID,
+										fault == 6	 ? XLOG_NOOP
+										: fault == 4 ? XLOG_XACT_ABORT
+													 : XLOG_XACT_COMMIT,
+										fault == 6 ? 0 : 99, &timestamp, sizeof(timestamp));
+	checkpoint = terminal_test_record(&source, a->checkpoint, terminal.record_start, RM_XLOG_ID,
+									  XLOG_CHECKPOINT_ONLINE, 0, &a->checkpoint_copy,
+									  sizeof(a->checkpoint_copy));
+	UT_ASSERT_EQ(checkpoint.exclusive_end, prefix_test_checkpoint_end);
+	tail = checkpoint;
+	if (fault == 2)
+		tail = terminal_test_record(&source, tail.exclusive_end, tail.record_start, RM_XACT_ID,
+									XLOG_XACT_COMMIT, 99, &timestamp, sizeof(timestamp));
+	if (fault == 8) {
+		uint8 payload[sizeof(timestamp) + sizeof(xl_xact_xinfo) + MinSizeOfXactSubxacts
+					  + sizeof(TransactionId)];
+		xl_xact_xinfo info = { XACT_XINFO_HAS_SUBXACTS };
+		int nsubs = 1;
+		TransactionId child = 99;
+		memcpy(payload, &timestamp, sizeof(timestamp));
+		memcpy(payload + sizeof(timestamp), &info, sizeof(info));
+		memcpy(payload + sizeof(timestamp) + sizeof(info), &nsubs, sizeof(nsubs));
+		memcpy(payload + sizeof(timestamp) + sizeof(info) + MinSizeOfXactSubxacts, &child,
+			   sizeof(child));
+		tail = terminal_test_record(&source, tail.exclusive_end, tail.record_start, RM_XACT_ID,
+									XLOG_XACT_ABORT | XLOG_XACT_HAS_INFO, 98, payload,
+									sizeof(payload));
+	}
+	if (fault == 11)
+		tail = terminal_test_record(&source, tail.exclusive_end, tail.record_start, RM_XACT_ID,
+									XLOG_XACT_PREPARE, 98, &timestamp, sizeof(timestamp));
+	tail = terminal_test_record(&source, tail.exclusive_end, tail.record_start, RM_XLOG_ID,
+								XLOG_NOOP, fault == 7 ? 99 : 0, "abc", 3);
+	window.system_identifier = TEST_SYSID;
+	window.database_incarnation = a->database_incarnation;
+	window.origin = 0;
+	window.admitted_incarnation = a->identity.origin_owner_incarnation;
+	window.boot_incarnation = 411;
+	window.epoch = 97;
+	window.native_floor = 80;
+	window.last_issued = 99;
+	window.allocation_next = 100;
+	if (fault == 1)
+		UT_ASSERT(
+			cluster_relmap_checkpoint_window_encode_v1(&window, &a->checkpoint_copy, a->checkpoint,
+													   checkpoint.exclusive_end, a->native_window));
+	else
+		UT_ASSERT(cluster_relmap_checkpoint_window_encode_v2(
+			&window, &a->checkpoint_copy, a->checkpoint, checkpoint.exclusive_end + (fault == 10),
+			105, a->native_window));
+	v2_anchor_object(bytes, a, &a->identity, path);
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &root), 0);
+	snapshot = &root.records[0];
+	/* An online checkpoint is a recovery input, never a clean CLOSED vote. */
+	snapshot->lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	snapshot->checkpoint_record_crc32c = checkpoint.record_crc;
+	snapshot->tail_last_record_lsn = tail.record_start;
+	snapshot->tail_last_record_crc32c = tail.record_crc;
+	snapshot->validated_tail_lsn_exclusive = tail.exclusive_end;
+	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+	v2_write_roots(root.bytes);
+	if (fault == 9) {
+		int fd;
+		uint8 b;
+		v2_checkpoint_wal_path(&source.claim.identity, tail.record_start, source.timeline, path);
+		fd = open(path, O_RDWR);
+		UT_ASSERT(fd >= 0);
+		UT_ASSERT_EQ(pread(fd, &b, 1, tail.record_start % wal_segment_size + SizeOfXLogRecord + 2),
+					 1);
+		b ^= 1;
+		UT_ASSERT_EQ(pwrite(fd, &b, 1, tail.record_start % wal_segment_size + SizeOfXLogRecord + 2),
+					 1);
+		UT_ASSERT_EQ(close(fd), 0);
+	}
+	test_inputs_startup_cf = true;
+	UT_ASSERT_EQ(inputs_begin_for_role(true, &inputs), 0);
+	return inputs;
+}
+UT_TEST(test_terminal_prefix_scan_binds_actual_checkpoint_end_and_issued_cap)
+{
+	for (unsigned observer = 0; observer < 2; observer++)
+		for (unsigned aborted = 0; aborted < 2; aborted++) {
+			int saved = cluster_node_id;
+			ClusterWalInputsV1 *inputs;
+			ClusterRelmapTerminalScanV1 *scan = NULL;
+			ClusterRelmapTerminalObservationV1 out;
+			bool accepted;
+			cluster_node_id = observer;
+			inputs = terminal_prefix_fixture(aborted, 0);
+			accepted = cluster_relmap_recovery_terminal_prefix_scan_v2(
+				inputs, 0, FullTransactionIdFromU64(99), &scan);
+			if (!accepted) {
+				cold_census_done(&inputs);
+				cluster_node_id = saved;
+			}
+			UT_ASSERT(accepted);
+			if (!accepted)
+				return;
+			UT_ASSERT(cluster_relmap_recovery_terminal_scan_get_v1(scan, &out));
+			UT_ASSERT_EQ(out.status,
+						 aborted ? TRANSACTION_STATUS_ABORTED : TRANSACTION_STATUS_COMMITTED);
+			UT_ASSERT_EQ(out.requested_top_full_xid, 99);
+			UT_ASSERT_EQ(out.post_flush_issued, 105);
+			UT_ASSERT_EQ(out.prefix_end, prefix_test_checkpoint_end);
+			UT_ASSERT(out.terminal_start >= cluster_wal_inputs_at_v1(inputs, 0)->native_redo);
+			UT_ASSERT(out.terminal_end <= cluster_wal_inputs_at_v1(inputs, 0)->checkpoint_start);
+			UT_ASSERT(out.prefix_end < out.cut && out.records == 3);
+			UT_ASSERT(!v2_zero(out.fingerprint, 32));
+			cluster_relmap_recovery_terminal_scan_release_v1(&scan);
+			UT_ASSERT(inputs_pin_held);
+			cold_census_done(&inputs);
+			cluster_node_id = saved;
+		}
+}
+UT_TEST(test_terminal_prefix_scan_refuses_unbounded_or_nonmatching_sources)
+{
+	for (unsigned fault = 1; fault <= 11; fault++) {
+		ClusterWalInputsV1 *inputs = terminal_prefix_fixture(false, fault);
+		ClusterRelmapTerminalScanV1 *scan = (void *)1;
+		if (fault == 2) {
+			/* Check the old mode before a refused visit invalidates this scope. */
+			UT_ASSERT(cluster_relmap_recovery_terminal_scan_v1(
+				inputs, 0, FullTransactionIdFromU64(99), &scan));
+			cluster_relmap_recovery_terminal_scan_release_v1(&scan);
+			scan = (void *)1;
+		}
+		UT_ASSERT(!cluster_relmap_recovery_terminal_prefix_scan_v2(
+			inputs, 0, FullTransactionIdFromU64(99), &scan));
+		UT_ASSERT(scan == NULL && inputs_pin_held);
+		cold_census_done(&inputs);
+	}
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ClusterWalInputsV1 *inputs = terminal_prefix_fixture(false, 0);
+		ClusterRelmapTerminalScanV1 *scan = (void *)1;
+		uint64 full = fault == 0   ? 79
+					  : fault == 1 ? 100
+					  : fault == 2 ? UINT64CONST(0x100000063)
+								   : 99;
+		UT_ASSERT(!cluster_relmap_recovery_terminal_prefix_scan_v2(
+			inputs, fault == 3 ? 2 : 0, FullTransactionIdFromU64(full), &scan));
+		UT_ASSERT(scan == NULL && inputs_pin_held);
+		cold_census_done(&inputs);
+	}
+}
+UT_TEST(test_terminal_prefix_scan_getter_invalidates_cap_and_prefix_together)
+{
+	for (unsigned fault = 0; fault < 2; fault++) {
+		ClusterWalInputsV1 *inputs = terminal_prefix_fixture(false, 0);
+		ClusterRelmapTerminalScanV1 *scan = NULL;
+		ClusterRelmapTerminalObservationV1 out, zero = { 0 };
+		bool accepted = cluster_relmap_recovery_terminal_prefix_scan_v2(
+			inputs, 0, FullTransactionIdFromU64(99), &scan);
+		if (!accepted)
+			cold_census_done(&inputs);
+		UT_ASSERT(accepted);
+		if (!accepted)
+			return;
+		UT_ASSERT(!cluster_relmap_recovery_terminal_scan_get_v1(scan, (void *)scan));
+		UT_ASSERT(cluster_relmap_recovery_terminal_scan_get_v1(scan, &out));
+		if (fault)
+			v2_checkpoint_root_race();
+		else
+			inputs_pin_current = false;
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT(!cluster_relmap_recovery_terminal_scan_get_v1(scan, &out));
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		inputs_pin_current = true;
+		UT_ASSERT(!cluster_relmap_recovery_terminal_scan_get_v1(scan, &out));
+		cluster_relmap_recovery_terminal_scan_release_v1(&scan);
+		UT_ASSERT(inputs_pin_held);
+		cold_census_done(&inputs);
+	}
+}
 UT_TEST(test_terminal_scan_full_native_commit_and_abort_sources)
 {
 	for (unsigned selected = 0; selected < 2; selected++)
@@ -2126,6 +2356,7 @@ UT_TEST(test_terminal_scan_full_native_commit_and_abort_sources)
 						 aborted ? TRANSACTION_STATUS_ABORTED : TRANSACTION_STATUS_COMMITTED);
 			UT_ASSERT_EQ(out.source.claim.identity.origin_node_id, 0);
 			UT_ASSERT_EQ(out.requested_top_full_xid, 99);
+			UT_ASSERT(out.post_flush_issued == 0 && out.prefix_end == 0);
 			UT_ASSERT_EQ(out.records, 3);
 			UT_ASSERT(out.terminal_start < out.terminal_end && out.terminal_end < out.cut);
 			UT_ASSERT(!v2_zero(out.fingerprint, sizeof(out.fingerprint)));
@@ -2229,7 +2460,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(39);
+	UT_PLAN(43);
 	UT_RUN(test_retained_relmap_matches_each_selected_namespace);
 	UT_RUN(test_retained_relmap_requires_exact_pending);
 	UT_RUN(test_retained_relmap_scans_suffix_and_other_source);
@@ -2264,6 +2495,10 @@ main(int argc, char **argv)
 	UT_RUN(test_census_side_collector_error_invalidates_window);
 	UT_RUN(test_census_side_wal_keeps_real_empty_initializer);
 	UT_RUN(test_census_side_wal_requires_real_empty_initializer);
+	UT_RUN(test_terminal_prefix_scan_requires_original_retained_owner);
+	UT_RUN(test_terminal_prefix_scan_binds_actual_checkpoint_end_and_issued_cap);
+	UT_RUN(test_terminal_prefix_scan_refuses_unbounded_or_nonmatching_sources);
+	UT_RUN(test_terminal_prefix_scan_getter_invalidates_cap_and_prefix_together);
 	UT_RUN(test_terminal_scan_requires_original_retained_owner);
 	UT_RUN(test_terminal_scan_full_native_commit_and_abort_sources);
 	UT_RUN(test_terminal_scan_refuses_invalid_window_target_and_suffix);

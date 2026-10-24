@@ -20,7 +20,7 @@ struct ClusterRelmapTerminalScanV1 {
 	ClusterRelmapTerminalObservationV1 observation;
 	pg_cryptohash_ctx *hash;
 	XLogRecPtr last_end;
-	bool checkpoint_seen, terminal_seen, failed;
+	bool checkpoint_seen, terminal_seen, failed, prefix_only;
 };
 
 static void
@@ -83,7 +83,11 @@ terminal_scan_xact(ClusterRelmapTerminalScanV1 *scan, XLogReaderState *reader)
 		}
 		return true;
 	}
-	if (!scan->checkpoint_seen || scan->terminal_seen)
+	if (scan->terminal_seen
+		|| (scan->prefix_only
+				? (scan->checkpoint_seen || reader->ReadRecPtr < scan->selected.native_redo
+				   || reader->EndRecPtr > scan->selected.checkpoint_start)
+				: !scan->checkpoint_seen))
 		return false;
 	scan->terminal_seen = true;
 	scan->observation.status = commit ? TRANSACTION_STATUS_COMMITTED : TRANSACTION_STATUS_ABORTED;
@@ -120,13 +124,20 @@ terminal_scan_visit(XLogReaderState *reader, void *arg)
 			|| TransactionIdIsValid(reader->record->toplevel_xid) || XLogRecGetData(reader) == NULL
 			|| XLogRecGetDataLen(reader) != sizeof(CheckPoint)
 			|| memcmp(XLogRecGetData(reader), &input->native_checkpoint, sizeof(CheckPoint)) != 0
-			|| !cluster_relmap_checkpoint_window_decode_v1(
-				input->native_window, &input->native_checkpoint, reader->ReadRecPtr,
-				reader->EndRecPtr, id, input->source.claim.database_incarnation,
-				&scan->observation.window)
+			|| !(scan->prefix_only
+					 ? cluster_relmap_checkpoint_window_decode_v2(
+						   input->native_window, &input->native_checkpoint, reader->ReadRecPtr,
+						   reader->EndRecPtr, id, input->source.claim.database_incarnation,
+						   &scan->observation.window, &scan->observation.post_flush_issued)
+					 : cluster_relmap_checkpoint_window_decode_v1(
+						   input->native_window, &input->native_checkpoint, reader->ReadRecPtr,
+						   reader->EndRecPtr, id, input->source.claim.database_incarnation,
+						   &scan->observation.window))
 			|| scan->observation.requested_top_full_xid < scan->observation.window.native_floor
 			|| scan->observation.requested_top_full_xid > scan->observation.window.last_issued)
 			return false;
+		if (scan->prefix_only)
+			scan->observation.prefix_end = reader->EndRecPtr;
 		scan->checkpoint_seen = true;
 	}
 	if ((scan->terminal_seen && XLogRecGetXid(reader) == target)
@@ -140,12 +151,14 @@ terminal_scan_visit(XLogReaderState *reader, void *arg)
 	return true;
 }
 
-bool
-cluster_relmap_recovery_terminal_scan_v1(ClusterWalInputsV1 *inputs, uint32 index,
-										 FullTransactionId requested_top,
-										 ClusterRelmapTerminalScanV1 **out)
+static bool
+terminal_scan(ClusterWalInputsV1 *inputs, uint32 index, FullTransactionId requested_top,
+			  bool prefix_only, ClusterRelmapTerminalScanV1 **out)
 {
-	static const uint8 domain[] = "PGRAC-RELMAP-RETAINED-TERMINAL-V1";
+	static const uint8 legacy_domain[] = "PGRAC-RELMAP-RETAINED-TERMINAL-V1";
+	static const uint8 prefix_domain[] = "PGRAC-RELMAP-RETAINED-TERMINAL-PREFIX-V2";
+	const uint8 *domain = prefix_only ? prefix_domain : legacy_domain;
+	size_t domain_bytes = prefix_only ? sizeof(prefix_domain) : sizeof(legacy_domain);
 	const ClusterWalInputV1 *input;
 	ClusterRelmapTerminalScanV1 *scan;
 	uint8 query[8], zero[160] = { 0 };
@@ -168,6 +181,7 @@ cluster_relmap_recovery_terminal_scan_v1(ClusterWalInputsV1 *inputs, uint32 inde
 		|| input->native_checkpoint.redo != input->native_redo
 		|| input->native_redo < input->checkpoint.checkpoint_lower_lsn
 		|| input->native_redo > input->checkpoint_start
+		|| (prefix_only && input->native_redo == input->checkpoint_start)
 		|| memcmp(input->native_window, zero, sizeof(zero)) == 0)
 		return false;
 	count = cluster_wal_inputs_count_v1(inputs);
@@ -184,6 +198,7 @@ cluster_relmap_recovery_terminal_scan_v1(ClusterWalInputsV1 *inputs, uint32 inde
 	}
 	scan = palloc0(sizeof(*scan));
 	scan->pid = getpid();
+	scan->prefix_only = prefix_only;
 	scan->inputs = inputs;
 	scan->index = index;
 	scan->count = count;
@@ -198,7 +213,7 @@ cluster_relmap_recovery_terminal_scan_v1(ClusterWalInputsV1 *inputs, uint32 inde
 		ClusterWalTailObservation observed = { 0 };
 		scan->hash = pg_cryptohash_create(PG_SHA256);
 		if (scan->hash != NULL && pg_cryptohash_init(scan->hash) == 0
-			&& pg_cryptohash_update(scan->hash, domain, sizeof(domain)) == 0
+			&& pg_cryptohash_update(scan->hash, domain, domain_bytes) == 0
 			&& pg_cryptohash_update(scan->hash, input->native_window, 160) == 0
 			&& pg_cryptohash_update(scan->hash, input->source.claim.identity.storage_uuid, 16) == 0
 			&& pg_cryptohash_update(scan->hash, input->source.claim.claim_sha256, 32) == 0
@@ -227,6 +242,22 @@ cluster_relmap_recovery_terminal_scan_v1(ClusterWalInputsV1 *inputs, uint32 inde
 	scan->hash = NULL;
 	*out = scan;
 	return true;
+}
+
+bool
+cluster_relmap_recovery_terminal_scan_v1(ClusterWalInputsV1 *inputs, uint32 index,
+										 FullTransactionId requested_top,
+										 ClusterRelmapTerminalScanV1 **out)
+{
+	return terminal_scan(inputs, index, requested_top, false, out);
+}
+
+bool
+cluster_relmap_recovery_terminal_prefix_scan_v2(ClusterWalInputsV1 *inputs, uint32 index,
+												FullTransactionId requested_top,
+												ClusterRelmapTerminalScanV1 **out)
+{
+	return terminal_scan(inputs, index, requested_top, true, out);
 }
 
 bool

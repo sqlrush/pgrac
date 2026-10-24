@@ -15,6 +15,9 @@ typedef struct ClusterRelmapTerminalObservationV1 {
 	uint64 requested_top_full_xid; /* Query identity, NOT certified terminal era. */
 	XidStatus status;
 	XLogRecPtr terminal_start, terminal_end, cut;
+	/* Nonzero only for a v2 prefix scan; never a bound on the later suffix. */
+	uint64 post_flush_issued;
+	XLogRecPtr prefix_end;
 	uint64 records;
 	uint8 fingerprint[32];
 } ClusterRelmapTerminalObservationV1;
@@ -31,6 +34,15 @@ typedef struct ClusterRelmapTerminalObservationV1 {
 extern bool cluster_relmap_recovery_terminal_scan_v1(ClusterWalInputsV1 *inputs, uint32 index,
 													 FullTransactionId requested_top,
 													 ClusterRelmapTerminalScanV1 **out);
+/* Dormant bounded prefix variant. Only a target terminal at/after the
+ * selected native redo and BEFORE the exact checkpoint record is accepted.
+ * Requires inner v2 actual post-flush issuance bound; legacy windows refuse.
+ * The complete original source, including suffix, is still validated.
+ * No native base/retention-lifetime/full-history/release qualification. */
+extern bool cluster_relmap_recovery_terminal_prefix_scan_v2(ClusterWalInputsV1 *inputs,
+															uint32 index,
+															FullTransactionId requested_top,
+															ClusterRelmapTerminalScanV1 **out);
 /* Original scope/current ROOT/pin recheck before observation publish.
  * Nonoverlap refusal clears the full output; input overlap is unchanged.
  * A failed original recheck permanently invalidates this local scan. */
