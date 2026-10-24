@@ -29,6 +29,7 @@
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_stamp.h"
 #include "cluster/cluster_space_reservation.h"
+#include "cluster/cluster_terminal_ref_census.h"
 #include "miscadmin.h"
 #include "postmaster/interrupt.h"
 #include "utils/memutils.h"
@@ -800,12 +801,13 @@ page_recovery_ctrc_read(const PageRecoveryCtrcReadV1 *context, SMgrRelation rela
 		&& page_recovery_ctrc_current(context);
 }
 
-bool
-rf_page_recovery_ctrc_read_smgr_v1(const struct ClusterRecoveryStartV1 *start,
+static bool
+page_recovery_ctrc_read_image(const struct ClusterRecoveryStartV1 *start,
 	const ClusterColdCtrcWorkV1 *work, const RfPageAuthorityGuardV1 *guard,
 	ClusterRecoverySerialGuard *serial, ClusterWalRetentionPin *pin,
 	const ClusterSpaceIdentity *space, BlockNumber blockno,
-	const RfPageVersionV1 *expected_before, PGAlignedBlock *out)
+	const RfPageVersionV1 *expected_before, PGAlignedBlock *out,
+	PageRecoveryCtrcReadV1 *retained)
 {
 	PageRecoveryCtrcReadV1 context = {0};
 	RfPageInstallStorageOpsV1 storage = {0};
@@ -910,6 +912,132 @@ rf_page_recovery_ctrc_read_smgr_v1(const struct ClusterRecoveryStartV1 *start,
 		|| !page_recovery_ctrc_current(&context))
 		return false;
 	memcpy(out, &page, sizeof(page));
+	if (retained != NULL)
+		*retained = context;
+	return true;
+}
+
+bool
+rf_page_recovery_ctrc_read_smgr_v1(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, const RfPageAuthorityGuardV1 *guard,
+	ClusterRecoverySerialGuard *serial, ClusterWalRetentionPin *pin,
+	const ClusterSpaceIdentity *space, BlockNumber blockno,
+	const RfPageVersionV1 *expected_before, PGAlignedBlock *out)
+{
+	return page_recovery_ctrc_read_image(start, work, guard, serial, pin, space,
+		blockno, expected_before, out, NULL);
+}
+
+typedef struct PageRecoveryCtrcItlInputsV1 {
+	const ClusterColdPlanV1 *plan;
+	const struct ClusterColdTopTxCensusV1 *census;
+	uint64 generation;
+	ClusterColdCtrcReleaseCensusV1 counts;
+	Size count;
+	RfPageRecoveryCtrcItlSelectionV1 selections[CLUSTER_ITL_INITRANS_DEFAULT];
+	ClusterColdTtSlotInputV1 subjects[CLUSTER_ITL_INITRANS_DEFAULT];
+} PageRecoveryCtrcItlInputsV1;
+
+static bool
+page_recovery_ctrc_itl_inputs_current(const PageRecoveryCtrcReadV1 *context,
+	const RfPageRecoveryCtrcItlSelectionV1 *selections, const PageRecoveryCtrcItlInputsV1 *fixed)
+{
+	if (!page_recovery_ctrc_current(context)
+		|| context->work_generation != fixed->generation
+		|| context->work->plan != fixed->plan || context->work->top_tx_census != fixed->census
+		|| memcmp(&context->work->counts, &fixed->counts, sizeof(fixed->counts)) != 0
+		|| memcmp(selections, fixed->selections, fixed->count * sizeof(*selections)) != 0)
+		return false;
+	for (Size i = 0; i < fixed->count; i++)
+		if (memcmp(&context->work->entries[fixed->selections[i].subject_index],
+			&fixed->subjects[i], sizeof(fixed->subjects[i])) != 0)
+			return false;
+	return true;
+}
+
+static bool
+page_recovery_ctrc_itl_output_overlaps(const RfPageRecoveryCtrcItlImageV1 *out,
+	const void *input, Size size)
+{
+	uintptr_t a = (uintptr_t)out, b = (uintptr_t)input;
+
+	return size != 0 && (a <= b ? b - a < sizeof(*out) : a - b < size);
+}
+
+bool
+rf_page_recovery_ctrc_itl_image_smgr_v1(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, const RfPageAuthorityGuardV1 *guard,
+	ClusterRecoverySerialGuard *serial, ClusterWalRetentionPin *pin,
+	const ClusterSpaceIdentity *space, BlockNumber blockno,
+	const RfPageVersionV1 *expected_before, const RfPageRecoveryCtrcItlSelectionV1 *selections,
+	Size count, RfPageRecoveryCtrcItlImageV1 *out)
+{
+	PageRecoveryCtrcReadV1 context;
+	PageRecoveryCtrcItlInputsV1 fixed;
+	ClusterCtrcRecoveryItlPlanV1 plans[CLUSTER_ITL_INITRANS_DEFAULT];
+	RfPageRecoveryCtrcItlImageV1 candidate = {0};
+	ClusterCtrcItlCleanoutApplyResult result;
+	const ClusterColdTypedV1 *typed;
+	PGAlignedBlock before;
+	Size work_bytes;
+
+	if (start == NULL || work == NULL || guard == NULL || serial == NULL || pin == NULL
+		|| space == NULL || expected_before == NULL || selections == NULL || out == NULL
+		|| count == 0 || count > CLUSTER_ITL_INITRANS_DEFAULT
+		|| !page_recovery_ctrc_actor_current()
+		|| !ClusterColdRecoveryCtrcWorkCurrent(start, work))
+		return false;
+	typed = ClusterColdRecoveryTxInputs(start);
+	if (typed == NULL || !ClusterColdRecoveryCtrcWorkCurrent(start, work)
+		|| work->generation == 0 || work->counts.subject_count
+			> (MaxAllocSize - offsetof(ClusterColdCtrcWorkV1, entries)) / sizeof(work->entries[0]))
+		return false;
+	work_bytes = offsetof(ClusterColdCtrcWorkV1, entries)
+		+ (Size)work->counts.subject_count * sizeof(work->entries[0]);
+	if (page_recovery_ctrc_itl_output_overlaps(out, work, work_bytes)
+		|| page_recovery_ctrc_itl_output_overlaps(out, typed, sizeof(*typed))
+		|| page_recovery_ctrc_itl_output_overlaps(out, selections, count * sizeof(*selections))
+		|| page_recovery_ctrc_itl_output_overlaps(out, space, sizeof(*space))
+		|| page_recovery_ctrc_itl_output_overlaps(out, expected_before, sizeof(*expected_before))
+		|| page_recovery_ctrc_itl_output_overlaps(out, serial, sizeof(*serial))
+		|| page_recovery_ctrc_itl_output_overlaps(out, start, 1)
+		|| page_recovery_ctrc_itl_output_overlaps(out, guard, 1)
+		|| page_recovery_ctrc_itl_output_overlaps(out, pin, 1))
+		return false;
+	fixed.plan = work->plan;
+	fixed.census = work->top_tx_census;
+	fixed.generation = work->generation;
+	memcpy(&fixed.counts, &work->counts, sizeof(fixed.counts));
+	fixed.count = count;
+	memcpy(fixed.selections, selections, count * sizeof(*selections));
+	for (Size i = 0; i < count; i++) {
+		const RfPageRecoveryCtrcItlSelectionV1 *selection = &fixed.selections[i];
+
+		if (selection->subject_index >= fixed.counts.subject_count
+			|| selection->itl_index >= CLUSTER_ITL_INITRANS_DEFAULT
+			|| (selection->itl_class != 1 && selection->itl_class != 2))
+			return false;
+		for (Size j = 0; j < i; j++)
+			if (fixed.selections[j].itl_index == selection->itl_index)
+				return false;
+		memcpy(&fixed.subjects[i], &work->entries[selection->subject_index],
+			sizeof(fixed.subjects[i]));
+		plans[i].subject = &fixed.subjects[i];
+		plans[i].itl_index = selection->itl_index;
+		plans[i].expected_itl_wrap = selection->expected_itl_wrap;
+		plans[i].itl_class = selection->itl_class;
+	}
+	if (!page_recovery_ctrc_read_image(start, work, guard, serial, pin, space,
+		blockno, expected_before, &before, &context)
+		|| context.typed != typed
+		|| !page_recovery_ctrc_itl_inputs_current(&context, selections, &fixed))
+		return false;
+	result = cluster_ctrc_recovery_itl_batch_image_v1(plans, count, before.data, candidate.image.data);
+	if (result == CLUSTER_CTRC_ITL_CLEANOUT_RETAIN
+		|| !page_recovery_ctrc_itl_inputs_current(&context, selections, &fixed))
+		return false;
+	candidate.rewritten = result == CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN;
+	memcpy(out, &candidate, sizeof(candidate));
 	return true;
 }
 #endif /* USE_PGRAC_CLUSTER && !USE_CLUSTER_UNIT */

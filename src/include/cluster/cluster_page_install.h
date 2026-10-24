@@ -111,6 +111,32 @@ extern bool rf_page_recovery_ctrc_read_smgr_v1(const struct ClusterRecoveryStart
 	struct ClusterRecoverySerialGuard *serial, struct ClusterWalRetentionPin *pin,
 	const struct ClusterSpaceIdentity *space, BlockNumber blockno,
 	const RfPageVersionV1 *expected_before, PGAlignedBlock *out);
+
+typedef struct RfPageRecoveryCtrcItlSelectionV1 {
+	uint32 subject_index;
+	uint16 itl_index;
+	uint16 expected_itl_wrap;
+	uint8 itl_class;
+} RfPageRecoveryCtrcItlSelectionV1;
+
+typedef struct RfPageRecoveryCtrcItlImageV1 {
+	PGAlignedBlock image;
+	bool rewritten;
+} RfPageRecoveryCtrcItlImageV1;
+
+/* Read the same protected native predecessor and calculate only the selected
+ * original work entries' ITL projections. All selections must succeed before
+ * output changes; no output may overlap borrowed state. Original source,
+ * terminal/history qualification and complete coverage remain the caller's
+ * responsibility. The private candidate retains predecessor header/version
+ * fields; it is not a WAL image, installed page or release/completion proof.
+ * Native ERROR propagates without changing output or retiring any owner. */
+extern bool rf_page_recovery_ctrc_itl_image_smgr_v1(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, const struct RfPageAuthorityGuardV1 *guard,
+	struct ClusterRecoverySerialGuard *serial, struct ClusterWalRetentionPin *pin,
+	const struct ClusterSpaceIdentity *space, BlockNumber blockno,
+	const RfPageVersionV1 *expected_before, const RfPageRecoveryCtrcItlSelectionV1 *selections,
+	Size count, RfPageRecoveryCtrcItlImageV1 *out);
 #endif
 
 #endif /* CLUSTER_PAGE_INSTALL_H */
