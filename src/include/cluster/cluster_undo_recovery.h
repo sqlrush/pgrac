@@ -50,6 +50,14 @@ cluster_undo_recovery_cold_source_matches_v1(const ClusterWalSourceRef *source,
 extern uint64 cluster_undo_recovery_cold_scope_id_v1(const ClusterWalSourceRef *source,
 													 const ClusterControlRootSnapshot *checkpoint,
 													 XLogRecPtr native_redo);
+/* Match an actual completed native COMMIT/ABORT carrier to this original
+ * cold scope's own immutable recovery plan, never a caller-supplied plan or
+ * terminal boolean. Requires the captured round serial and exact source.
+ * Structural source seal only, not native base/era or completion authority. */
+struct XLogReaderState;
+extern bool cluster_undo_recovery_cold_terminal_matches_v1(
+	const ClusterWalSourceRef *source, const ClusterControlRootSnapshot *checkpoint,
+	XLogRecPtr native_redo, uint64 scope_serial, const struct XLogReaderState *reader);
 /* Only the already-durable exact C0 target's top-level native ABORT bit.
  * This does not authorize an origin scope or other native operations. */
 extern bool cluster_undo_recovery_abort_clog_authorized_v1(int origin_node, TransactionId xid);

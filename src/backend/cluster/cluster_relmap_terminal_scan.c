@@ -25,6 +25,7 @@ struct ClusterRelmapTerminalScanV1 {
 	XLogRecPtr last_end;
 	bool checkpoint_seen, terminal_seen, failed, prefix_only, native_base_retained;
 	bool pending_required, pending_seen;
+	uint64 pending_scope_serial;
 	ClusterRelmapV2Image pending;
 };
 
@@ -93,6 +94,11 @@ terminal_scan_xact(ClusterRelmapTerminalScanV1 *scan, XLogReaderState *reader)
 				? (scan->checkpoint_seen || reader->ReadRecPtr < scan->selected.native_redo
 				   || reader->EndRecPtr > scan->selected.checkpoint_start)
 				: !scan->checkpoint_seen))
+		return false;
+	if (scan->pending_required
+		&& !cluster_undo_recovery_cold_terminal_matches_v1(
+			&scan->selected.source, &scan->selected.checkpoint, scan->selected.native_redo,
+			scan->pending_scope_serial, reader))
 		return false;
 	scan->terminal_seen = true;
 	scan->observation.status = commit ? TRANSACTION_STATUS_COMMITTED : TRANSACTION_STATUS_ABORTED;
@@ -208,7 +214,7 @@ terminal_scan_visit(XLogReaderState *reader, void *arg)
 
 static bool
 terminal_scan(ClusterWalInputsV1 *inputs, uint32 index, FullTransactionId requested_top,
-			  bool prefix_only, const ClusterRelmapV2Image *pending,
+			  bool prefix_only, const ClusterRelmapV2Image *pending, uint64 scope_serial,
 			  ClusterRelmapTerminalScanV1 **out)
 {
 	static const uint8 legacy_domain[] = "PGRAC-RELMAP-RETAINED-TERMINAL-V1";
@@ -261,6 +267,7 @@ terminal_scan(ClusterWalInputsV1 *inputs, uint32 index, FullTransactionId reques
 	scan->count = count;
 	scan->selected = *input;
 	scan->pending_required = pending != NULL;
+	scan->pending_scope_serial = scope_serial;
 	if (pending != NULL)
 		scan->pending = *pending;
 	scan->observation.source = input->source;
@@ -318,7 +325,7 @@ cluster_relmap_recovery_terminal_scan_v1(ClusterWalInputsV1 *inputs, uint32 inde
 										 FullTransactionId requested_top,
 										 ClusterRelmapTerminalScanV1 **out)
 {
-	return terminal_scan(inputs, index, requested_top, false, NULL, out);
+	return terminal_scan(inputs, index, requested_top, false, NULL, 0, out);
 }
 
 bool
@@ -326,7 +333,7 @@ cluster_relmap_recovery_terminal_prefix_scan_v2(ClusterWalInputsV1 *inputs, uint
 												FullTransactionId requested_top,
 												ClusterRelmapTerminalScanV1 **out)
 {
-	return terminal_scan(inputs, index, requested_top, true, NULL, out);
+	return terminal_scan(inputs, index, requested_top, true, NULL, 0, out);
 }
 
 static bool
@@ -561,7 +568,7 @@ cluster_relmap_recovery_prepare_v1(ClusterWalInputsV1 *inputs,
 	{
 		accepted = terminal_scan(inputs, index,
 								 FullTransactionIdFromU64(image.pending_owner.top_full_xid), true,
-								 &image, &handle->scan)
+								 &image, serial, &handle->scan)
 				   && recovery_handle_current(handle);
 	}
 	PG_CATCH();

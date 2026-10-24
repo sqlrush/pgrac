@@ -4,6 +4,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "utils/memutils.h"
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -40,6 +41,16 @@
 
 #define RF_SIDE_ONLINE_PLAN_MAGIC UINT32_C(0x53495031)
 
+/* Separate from the exported typed payload: ordinary ABORT identity keeps its
+ * original empty owned_payload contract. Charged to the original plan budget. */
+typedef struct SideNativeTerminalWitness {
+	struct SideNativeTerminalWitness *next;
+	uint32 operation_index;
+	uint32 payload_length;
+	XLogRecord header;
+	uint8 payload[FLEXIBLE_ARRAY_MEMBER];
+} SideNativeTerminalWitness;
+
 struct RfSideOnlinePlanV1 {
 	uint32 magic;
 	bool sealed;
@@ -67,6 +78,7 @@ struct RfSideOnlinePlanV1 {
 	uint32 owned_payload_capacity;
 	ClusterSpaceIdentityKey *space_targets;
 	uint32 space_target_count;
+	SideNativeTerminalWitness *native_terminals;
 };
 
 /* A rejected binding cannot leave an earlier sealed view consumable. */
@@ -1205,6 +1217,31 @@ side_decode_record(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *recor
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
+static bool
+side_capture_native_terminal(RfSideOnlinePlanV1 *plan, const XLogReaderState *reader)
+{
+	uint32 length = XLogRecGetDataLen(reader);
+	Size bytes;
+	SideNativeTerminalWitness *witness;
+
+	if (length == 0 || XLogRecGetData(reader) == NULL
+		|| length > MaxAllocSize - offsetof(SideNativeTerminalWitness, payload))
+		return false;
+	bytes = offsetof(SideNativeTerminalWitness, payload) + (Size)length;
+	if (bytes > plan->memory_budget || !side_plan_reserve(plan, bytes))
+		return false;
+	witness = side_alloc0(bytes);
+	if (witness == NULL)
+		return false;
+	witness->operation_index = plan->operation_count;
+	witness->payload_length = length;
+	memcpy(&witness->header, &reader->record->header, SizeOfXLogRecord);
+	memcpy(witness->payload, XLogRecGetData(reader), length);
+	witness->next = plan->native_terminals;
+	plan->native_terminals = witness;
+	return true;
+}
+
 RfPageProofDetailV1
 rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 								   const RfDetachedRecordPlanV1 *record_plan,
@@ -1254,6 +1291,14 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 				return RF_PAGE_PROOF_DETAIL_CAPACITY;
 			}
 			plan->cold_completion_scratch_bytes = candidate.owned_payload_length;
+		}
+		if (plan->purpose == RF_SIDE_PLAN_RECOVERY && plan->sources != NULL
+			&& candidate.kind == RF_SIDE_ONLINE_OPERATION_XACT
+			&& (candidate.xact.kind == RF_SIDE_XACT_COMMIT
+				|| candidate.xact.kind == RF_SIDE_XACT_ABORT)
+			&& !side_capture_native_terminal(plan, record_plan->source_record)) {
+			(void)side_source_bind_failed(plan);
+			return RF_PAGE_PROOF_DETAIL_CAPACITY;
 		}
 		candidate.owned_payload_offset = plan->owned_payload_bytes;
 		if (candidate.owned_payload_length > 0) {
@@ -1415,6 +1460,76 @@ rf_side_online_plan_recovery_claim_matches_v1(const RfSideOnlinePlanV1 *plan,
 											  const ClusterWalSourceRef *source)
 {
 	return side_recovery_claim_matches(plan, source, true);
+}
+
+/* Exact original decoded carrier correspondence only. The caller retains
+ * reader CRC/source/cut pins and native FullXid/base/era responsibility. */
+bool
+rf_side_online_plan_terminal_matches_v1(const RfSideOnlinePlanV1 *plan,
+										const ClusterWalSourceRef *source,
+										const XLogReaderState *reader)
+{
+	const SideNativeTerminalWitness *selected = NULL;
+	const RfSideOnlineOperationV1 *operation = NULL;
+	const RfPageReplayRecordIdentityV1 *identity;
+	uint8 kind;
+
+	if (!rf_side_online_plan_recovery_claim_matches_v1(plan, source) || reader == NULL
+		|| reader->record == NULL || reader->cluster_record_crc_failed
+		|| reader->system_identifier != source->claim.identity.system_identifier
+		|| reader->cluster_expected_thread_id != source->claim.identity.origin_thread_id
+		|| reader->seg.ws_tli != source->timeline || reader->ReadRecPtr != reader->record->lsn
+		|| reader->EndRecPtr != reader->record->next_lsn || reader->ReadRecPtr == InvalidXLogRecPtr
+		|| reader->EndRecPtr <= reader->ReadRecPtr || XLogRecGetRmid(reader) != RM_XACT_ID
+		|| !TransactionIdIsNormal(XLogRecGetXid(reader)) || XLogRecMaxBlockId(reader) >= 0
+		|| reader->record->has_page_version_edge || XLogRecGetOrigin(reader) != InvalidRepOriginId
+		|| TransactionIdIsValid(reader->record->toplevel_xid) || XLogRecGetData(reader) == NULL)
+		return false;
+	kind = XLogRecGetInfo(reader) & XLOG_XACT_OPMASK;
+	if (kind != XLOG_XACT_COMMIT && kind != XLOG_XACT_ABORT)
+		return false;
+	for (const SideNativeTerminalWitness *witness = plan->native_terminals; witness != NULL;
+		 witness = witness->next) {
+		const RfSideOnlineOperationV1 *op;
+		const RfContributorStreamCutV1 *cut;
+
+		if (witness->operation_index >= plan->operation_count)
+			return false;
+		op = &plan->operations[witness->operation_index];
+		if (op->identity.participant_index >= plan->participant_count)
+			return false;
+		cut = &plan->physical_cuts[op->identity.participant_index];
+		if (op->source_xid != XLogRecGetXid(reader)
+			|| cut->failed_thread != source->claim.identity.origin_thread_id
+			|| cut->origin_owner_incarnation != source->claim.identity.origin_owner_incarnation
+			|| cut->timeline_id != source->timeline)
+			continue;
+		/* A duplicate or opposite terminal for this same physical raw xid is
+		 * ambiguous even when its LSN or payload differs. */
+		if (selected != NULL || op->kind != RF_SIDE_ONLINE_OPERATION_XACT
+			|| op->purpose != RF_SIDE_PLAN_RECOVERY || TransactionIdIsValid(op->source_top_xid)
+			|| op->identity.record.read_rec_ptr < cut->scan_begin_inclusive
+			|| op->identity.record.end_rec_ptr > cut->scan_end_exclusive)
+			return false;
+		selected = witness;
+		operation = op;
+	}
+	if (selected == NULL)
+		return false;
+	identity = &operation->identity.record;
+	return identity->system_identifier == reader->system_identifier
+		   && memcmp(identity->storage_uuid, source->claim.identity.storage_uuid, 16) == 0
+		   && identity->origin_thread == source->claim.identity.origin_thread_id
+		   && identity->timeline_id == source->timeline
+		   && identity->read_rec_ptr == reader->ReadRecPtr
+		   && identity->end_rec_ptr == reader->EndRecPtr
+		   && identity->record_crc == (uint32)reader->record->header.xl_crc
+		   && identity->rmid == XLogRecGetRmid(reader) && identity->info == XLogRecGetInfo(reader)
+		   && operation->xact.kind
+				  == (kind == XLOG_XACT_COMMIT ? RF_SIDE_XACT_COMMIT : RF_SIDE_XACT_ABORT)
+		   && selected->payload_length == XLogRecGetDataLen(reader)
+		   && memcmp(&selected->header, &reader->record->header, SizeOfXLogRecord) == 0
+		   && memcmp(selected->payload, XLogRecGetData(reader), selected->payload_length) == 0;
 }
 
 bool
@@ -3347,6 +3462,11 @@ rf_side_online_plan_destroy_v1(RfSideOnlinePlanV1 **plan_address)
 		side_free(plan->owned_payload);
 	if (plan->space_targets != NULL)
 		side_free(plan->space_targets);
+	while (plan->native_terminals != NULL) {
+		SideNativeTerminalWitness *witness = plan->native_terminals;
+		plan->native_terminals = witness->next;
+		side_free(witness);
+	}
 	memset(plan, 0, sizeof(*plan));
 	side_free(plan);
 	*plan_address = NULL;

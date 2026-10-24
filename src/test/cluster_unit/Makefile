@@ -3145,6 +3145,8 @@ test_cluster_side_xact_stats.inc: $(top_srcdir)/src/backend/utils/activity/pgsta
 	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_side_xact: $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
+
 test_cluster_side_xact test_cluster_pi_contribution test_cluster_recovery_c0_plan test_cluster_cold_tt_redo test_cluster_relmap_pending_side test_cluster_relmap_census_side: %: %.c unit_test.h test_cluster_side_xact.c test_cluster_side_xact_stats.inc test_cluster_undo_header_identity.inc test_cluster_heap_small_scn.inc \
 		test_cluster_side_online_owner_product.o $(CLUSTER_SIDE_HEAD_READER_O) \
 		test_cluster_side_xact_budget_product.o $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \

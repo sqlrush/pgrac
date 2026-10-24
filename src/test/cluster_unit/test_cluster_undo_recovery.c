@@ -44,6 +44,9 @@ static unsigned wal_sync_calls;
 static int wal_sync_fault;
 static ClusterWalSourceRef cold_source;
 static unsigned cold_source_fault, cold_source_reads;
+static bool terminal_enabled, terminal_plan_ok, terminal_redo_ok;
+static unsigned terminal_plan_calls;
+static XLogReaderState terminal_reader;
 
 
 /* The ordinary scope never enters the separate selected-C0 path. */
@@ -67,8 +70,19 @@ bool
 rf_side_online_plan_replay_start_matches_v1(const RfSideOnlinePlanV1 *p, uint32 thread,
 											uint64 incarnation, uint64 db, XLogRecPtr redo)
 {
-	UT_ASSERT(false);
-	return false;
+	UT_ASSERT(terminal_enabled);
+	return terminal_enabled && terminal_redo_ok && p == plan && thread == 3
+		   && incarnation == duty.origin_owner_incarnation && db == 4 && redo == 120;
+}
+
+bool
+rf_side_online_plan_terminal_matches_v1(const RfSideOnlinePlanV1 *p,
+										const ClusterWalSourceRef *source,
+										const XLogReaderState *reader)
+{
+	terminal_plan_calls++;
+	return terminal_plan_ok && p == plan && reader == &terminal_reader
+		   && memcmp(source, &cold_source, sizeof(*source)) == 0;
 }
 
 ClusterControlRootResult
@@ -615,10 +629,63 @@ UT_TEST(test_cold_scope_serial_never_revives_same_address)
 	cluster_undo_recovery_scope_leave_v1(&scope);
 }
 
+UT_TEST(test_cold_terminal_match_uses_only_original_round_and_plan)
+{
+	for (unsigned fault = 0; fault < 9; fault++) {
+		ClusterUndoRecoveryScopeV1 scope = { 0 };
+		ClusterWalSourceRef query;
+		uint64 round;
+		reset_authority();
+		duty.origin_node_id = 2;
+		root.identity = duty;
+		serial.mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+		memset(&cold_source, 0, sizeof(cold_source));
+		cold_source.claim.identity = duty;
+		cold_source.claim.database_incarnation = 4;
+		cold_source.claim.max_config_generation = 8;
+		memset(cold_source.claim.claim_sha256, 0x55, 32);
+		cold_source.timeline = 7;
+		query = cold_source;
+		cold_source_fault = cold_source_reads = 0;
+		terminal_enabled = terminal_plan_ok = terminal_redo_ok = true;
+		terminal_plan_calls = 0;
+		UT_ASSERT(cluster_undo_recovery_scope_enter_v1(&scope, &authority, plan));
+		round = cluster_undo_recovery_cold_scope_id_v1(&query, &root, 120);
+		if (fault == 1)
+			round++;
+		if (fault == 2)
+			terminal_plan_ok = false;
+		if (fault == 3)
+			terminal_redo_ok = false;
+		if (fault == 4)
+			query.claim.claim_sha256[31] ^= 1;
+		if (fault == 5)
+			recovery_purpose = false;
+		if (fault == 6)
+			authority_result = CLUSTER_THREAD_AUTHORITY_FENCE_STALE;
+		if (fault == 7) {
+			cluster_undo_recovery_scope_leave_v1(&scope);
+			UT_ASSERT(cluster_undo_recovery_scope_enter_v1(&scope, &authority, plan));
+		}
+		UT_ASSERT_EQ(cluster_undo_recovery_cold_terminal_matches_v1(
+						 &query, &root, 120, round, fault == 8 ? NULL : &terminal_reader),
+					 fault == 0);
+		if (fault == 0)
+			UT_ASSERT_EQ(terminal_plan_calls, 1);
+		if (fault == 1 || fault >= 4)
+			UT_ASSERT_EQ(terminal_plan_calls, 0);
+		cluster_undo_recovery_scope_leave_v1(&scope);
+		UT_ASSERT(!cluster_undo_recovery_cold_terminal_matches_v1(&query, &root, 120, round,
+																  &terminal_reader));
+		terminal_enabled = false;
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
+	UT_RUN(test_cold_terminal_match_uses_only_original_round_and_plan);
 	UT_RUN(test_cold_scope_serial_never_revives_same_address);
 	UT_RUN(test_cold_source_match_binds_original_scope_and_full_selected_input);
 	UT_RUN(test_cold_source_durability_is_bound_to_original_scope_and_lifetime);
