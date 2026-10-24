@@ -13,6 +13,7 @@
 
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_lmon.h"
+#include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "port/pg_crc32c.h"
 #include "storage/shmem.h"
@@ -27,6 +28,13 @@ bool cluster_enabled = true;
  * Linux retains the whole LMON call graph; reaching one of these is a bug. */
 bool IsUnderPostmaster = false;
 AuxProcType MyAuxProcType = NotAnAuxProcess;
+/* The sample-request tests tick LMON with no recovery result owner. */
+bool
+cluster_recovery_tx_result_accept_v1(void)
+{
+	return false;
+}
+
 uint64
 cluster_membership_cut_generation(void)
 {

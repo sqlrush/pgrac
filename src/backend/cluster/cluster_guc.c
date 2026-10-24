@@ -114,6 +114,7 @@ int cluster_recovery_merge_wait_timeout = 10000;
 bool cluster_xnode_profile_enabled = false;
 /* Diagnostic per-storage-UPDATE phase trace; default OFF. */
 bool cluster_update_trace_enabled = false;
+bool cluster_trace_normal_stop = false;
 /* spec-6.4: ADG physical standby / read-only service knobs. */
 int cluster_dg_role = CLUSTER_DG_ROLE_PRIMARY;
 int cluster_dg_mode = CLUSTER_DG_MODE_ASYNC;
@@ -1704,6 +1705,11 @@ cluster_init_guc(void)
 		"cluster.update_trace", gettext_noop("Enable whole-UPDATE execution phase tracing."),
 		gettext_noop("A full diagnostic capture drops new records, never overwrites."),
 		&cluster_update_trace_enabled, false, PGC_SUSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable(
+		"cluster.trace_normal_stop",
+		gettext_noop("Log passive producer ACK and retained DROP progress during normal stop."),
+		gettext_noop("Correlate peer-local owner records by formation, origin, batch and locator."),
+		&cluster_trace_normal_stop, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/*
 	 * spec-6.4 ADG role and read-only service knobs.  Defaults keep existing
