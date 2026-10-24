@@ -5671,9 +5671,12 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 		(void)pg_atomic_fetch_add_u64((pg_atomic_uint64 *)&CtrcShared->full_refusal_count, 1);
 	}
 	if (result == CLUSTER_CTRC_PREPARE_READY || result == CLUSTER_CTRC_PREPARE_DUPLICATE) {
-		/* Receiver protection is visible before the original origin guard
-		 * leaves. Retain a known identity through CLOSE/ACK until reclamation. */
-		if (FullTransactionIdIsValid(original_full_xid)
+		/* Hand off the original identity only when creating its receiver,
+		 * before the origin guard leaves. A later exact origin cannot prove
+		 * the epoch of receipts already retained by a raw-only participant.
+		 * Keep that participant unqualified until its actual reclamation;
+		 * known matching receivers retain their identity through CLOSE/ACK. */
+		if (participant_was_empty && FullTransactionIdIsValid(original_full_xid)
 			&& !FullTransactionIdIsValid(participant->original_full_xid))
 			participant->original_full_xid = original_full_xid;
 		ctrc_receipt_handle_fill(handle, participant, participant_index, &receipts[receipt_index],

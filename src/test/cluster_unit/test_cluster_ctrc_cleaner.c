@@ -4169,6 +4169,45 @@ UT_TEST(test_active_scan_uses_original_origin_identity_after_pgproc_exit)
 	UT_ASSERT_EQ(durability_calls, 0);
 }
 
+/* A later exact local origin does not retroactively identify receipts that
+ * were registered without original FullXid provenance.  Admission is kept,
+ * but that older participant must remain unqualified for the census. */
+UT_TEST(test_local_receipt_does_not_backfill_older_unknown_receipts)
+{
+	for (unsigned duplicate = 0; duplicate < 2; duplicate++) {
+		ClusterCtrcOriginEntry *origin;
+		ClusterCtrcReceiptHandle first, later;
+		ClusterCtrcActiveScan scan;
+		FullTransactionId original;
+
+		reset_fixture();
+		origin = seed_origin(0, 1);
+		original = origin->original_full_xid;
+		/* Controlled legacy/unknown ingress. The real original protection
+		 * predicate still owns the exact raw key/touch, without an epoch. */
+		origin->original_full_xid = InvalidFullTransactionId;
+		UT_ASSERT_EQ(prepare_fixture_receipt(origin, 701, &first), CLUSTER_CTRC_PREPARE_READY);
+		UT_ASSERT(!FullTransactionIdIsValid(first.participant->original_full_xid));
+		UT_ASSERT(!FullTransactionIdIsValid(first.original_full_xid));
+		origin->original_full_xid = original;
+		UT_ASSERT_EQ(prepare_fixture_receipt(origin, duplicate ? 701 : 702, &later),
+					 duplicate ? CLUSTER_CTRC_PREPARE_DUPLICATE : CLUSTER_CTRC_PREPARE_READY);
+		UT_ASSERT(later.valid);
+		UT_ASSERT_EQ(later.participant, first.participant);
+		UT_ASSERT(!FullTransactionIdIsValid(later.participant->original_full_xid));
+		UT_ASSERT(!FullTransactionIdIsValid(later.original_full_xid));
+		UT_ASSERT_EQ(later.participant->receipt_count, duplicate ? 1 : 2);
+		UT_ASSERT_EQ(later.participant->prepared_count, duplicate ? 1 : 2);
+		UT_ASSERT_EQ(first.receipt->state, CTRC_RECEIPT_PREPARED);
+		UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+		finish_active_scan(&scan);
+		UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+		UT_ASSERT_EQ(scan.unqualified_entries, 1);
+		UT_ASSERT(FullTransactionIdEquals(scan.min_full, original));
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
 UT_TEST(test_local_receipt_hands_original_identity_to_retained_participant)
 {
 	ClusterCtrcOriginEntry *origin;
@@ -4283,10 +4322,10 @@ UT_TEST(test_receipt_known_handle_identity_conflict_cannot_apply)
 	}
 }
 
-UT_TEST(test_receipt_unknown_handle_remains_unknown_after_exact_local_backfill)
+UT_TEST(test_receipt_unknown_handle_remains_unknown_after_later_exact_local_source)
 {
 	ClusterCtrcOriginEntry *origin;
-	ClusterCtrcReceiptHandle unknown, known;
+	ClusterCtrcReceiptHandle unknown, duplicate;
 	FullTransactionId original;
 
 	reset_fixture();
@@ -4296,8 +4335,9 @@ UT_TEST(test_receipt_unknown_handle_remains_unknown_after_exact_local_backfill)
 	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 301, &unknown), CLUSTER_CTRC_PREPARE_READY);
 	UT_ASSERT(!FullTransactionIdIsValid(unknown.original_full_xid));
 	origin->original_full_xid = original;
-	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 301, &known), CLUSTER_CTRC_PREPARE_DUPLICATE);
-	UT_ASSERT(FullTransactionIdEquals(known.original_full_xid, original));
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 301, &duplicate), CLUSTER_CTRC_PREPARE_DUPLICATE);
+	UT_ASSERT(!FullTransactionIdIsValid(duplicate.original_full_xid));
+	UT_ASSERT(!FullTransactionIdIsValid(duplicate.participant->original_full_xid));
 	UT_ASSERT(!FullTransactionIdIsValid(unknown.original_full_xid));
 	/* The original pending publisher can still finish/cancel. Unknown is
 	 * never retrospectively promoted to qualified FullXid provenance. */
@@ -5147,7 +5187,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(124);
+	UT_PLAN(125);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
 	UT_RUN(test_prepare_path_input_precedes_journal_exhaustion);
 	UT_RUN(test_prepare_path_chain_precedes_locator_and_keeps_blocked_state);
@@ -5248,10 +5288,11 @@ main(void)
 	UT_RUN(test_active_scan_corrupt_empty_entry_invalidates_sample);
 	UT_RUN(test_active_scan_fresh_begin_discards_previous_partial_sample);
 	UT_RUN(test_active_scan_uses_original_origin_identity_after_pgproc_exit);
+	UT_RUN(test_local_receipt_does_not_backfill_older_unknown_receipts);
 	UT_RUN(test_local_receipt_hands_original_identity_to_retained_participant);
 	UT_RUN(test_receipt_known_handle_identity_conflict_cannot_cancel);
 	UT_RUN(test_receipt_known_handle_identity_conflict_cannot_apply);
-	UT_RUN(test_receipt_unknown_handle_remains_unknown_after_exact_local_backfill);
+	UT_RUN(test_receipt_unknown_handle_remains_unknown_after_later_exact_local_source);
 	UT_RUN(test_local_receipt_refuses_conflicting_retained_original_identity);
 	UT_RUN(test_receipt_original_identity_refusal_precedes_chain_blocking);
 	UT_RUN(test_receipt_observed_identity_refusal_precedes_chain_blocking);
