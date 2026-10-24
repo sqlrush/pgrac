@@ -98,6 +98,7 @@ ErrorContextCallback *error_context_stack;
 static int32 backend_pin_count;
 static unsigned pin_checks;
 static bool flush_error;
+static bool space_buffer_permanent, space_permanence_error;
 static uint8 writer_state;
 static uint64 route_holder, route_master;
 static unsigned flushes;
@@ -445,7 +446,10 @@ BufferGetTag(Buffer buffer, RelFileLocator *locator, ForkNumber *forknum, BlockN
 bool
 BufferIsPermanent(Buffer buffer)
 {
-	return buffer == 1;
+	UT_ASSERT_EQ(buffer, 1);
+	if (space_permanence_error)
+		elog(ERROR, "injected SPACE buffer observation ERROR");
+	return space_buffer_permanent;
 }
 SCN
 cluster_scn_advance(void)
@@ -553,11 +557,11 @@ static void page_verify_redirects(Page page);
 #include "test_cluster_heap_freeze_helpers.inc"
 
 /* Plans here are fixture-qualified, not shared FullXid/provenance evidence. */
-static void
+static bool
 heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 						   TransactionId snapshotConflictHorizon,
 						   HeapTupleFreeze *tuples, int ntuples,
-						   const ClusterSpaceIdentity *identity)
+						   const ClusterSpaceIdentity *identity, bool conditional)
 #include "test_cluster_heap_freeze_apply.inc"
 
 #include "test_cluster_heap_freeze_xmin_apply.inc"
@@ -720,6 +724,7 @@ reset(uint8 opcode, bool shared)
 	route_holder = 11;
 	route_master = 12;
 	flush_error = false;
+	space_buffer_permanent = true; space_permanence_error = false;
 	tx_checks = redo_dirties = redo_releases = freeze_data_calls = 0;
 	freeze_block_length = 0;
 	expected_nplans = 1;
@@ -850,7 +855,7 @@ UT_TEST(test_qualified_freeze_kernel_changes_only_planned_headers)
 		tuples[i].t_infomask = HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID;
 		tuples[i].checkflags = HEAP_FREEZE_CHECK_XMIN_COMMITTED;
 	}
-	heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 2, &space_identity);
+	heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 2, &space_identity, false);
 	check_publication(true);
 	UT_ASSERT_EQ(tx_checks, 0);
 	UT_ASSERT_EQ(freeze_data_calls, 2);
@@ -955,7 +960,7 @@ UT_TEST(test_exact_xmin_plan_preserves_xmax_through_native_wal_and_redo)
 		if (!prepared)
 			continue;
 		tx_committed = false;
-		heap_freeze_apply_prepared(&relation_data, 1, 70, &plan, 1, &space_identity);
+		heap_freeze_apply_prepared(&relation_data, 1, 70, &plan, 1, &space_identity, false);
 		check_publication(true);
 		UT_ASSERT_EQ(tx_checks, 0);
 		UT_ASSERT_EQ(freeze_data_calls, 2);
@@ -1701,7 +1706,7 @@ UT_TEST(test_freeze_native_wal_dedup_and_redo)
 			tuples[i].checkflags = HEAP_FREEZE_CHECK_XMIN_COMMITTED;
 		}
 		if (shared)
-			heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 3, &space_identity);
+			heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 3, &space_identity, false);
 		else
 			run_freeze(&relation_data, 1, 70, tuples, 3, NULL);
 		check_publication(shared);
@@ -1773,7 +1778,7 @@ UT_TEST(test_freeze_kernel_rejects_invalid_space_before_write)
 		expecting_error = true;
 		if (setjmp(error_jump) == 0) {
 			heap_freeze_apply_prepared(&relation_data, 1, 70, &tuple, 1,
-									 bad == 4 ? NULL : &space_identity);
+									 bad == 4 ? NULL : &space_identity, false);
 			UT_ASSERT(false);
 		}
 		expecting_error = false;
@@ -2585,10 +2590,102 @@ UT_TEST(test_xmin_rejects_unknown_generation_or_foreign_origin_before_writer)
 	}
 }
 
+UT_TEST(test_xmin_space_refusal_is_conditional)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int released = 0; released < 2; released++) {
+			QualifiedXminFixture f;
+			ClusterHeapFreezeXminTargetV1 targets[3];
+			volatile bool applied = false, caught = false;
+
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			if (released) { fixture_release_original_writer(); resume_allowed = true; }
+			/* The real SPACE component builder consumes this buffer observation.
+			 * No prepare/stamp/WAL helper is replaced by a refusal stub. */
+			space_buffer_permanent = false; expecting_error = true;
+			PG_TRY();
+			{
+				applied = batch ? qualified_xmin_batch_apply(&f, targets, 2)
+					: qualified_xmin_apply(&f, 0);
+			}
+			PG_CATCH(); { caught = true; } PG_END_TRY();
+			expecting_error = false;
+			UT_ASSERT(!caught && !applied);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT_EQ(CritSectionCount, 0);
+			UT_ASSERT_EQ(next_token, 100);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(f.admission.entered && local_x == !released && !resumed_writer);
+			UT_ASSERT_EQ(conditional_resumes, released);
+			UT_ASSERT_EQ(conditional_unlocks, released);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_xmin_space_error_still_propagates)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int released = 0; released < 2; released++) {
+			QualifiedXminFixture f;
+			ClusterHeapFreezeXminTargetV1 targets[3];
+			volatile bool caught = false;
+
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
+			if (released) { fixture_release_original_writer(); resume_allowed = true; }
+			space_permanence_error = expecting_error = true;
+			PG_TRY();
+			{
+				if (batch) (void)qualified_xmin_batch_apply(&f, targets, 2);
+				else (void)qualified_xmin_apply(&f, 0);
+			}
+			PG_CATCH(); { caught = true; } PG_END_TRY();
+			expecting_error = false;
+			UT_ASSERT(caught);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT_EQ(CritSectionCount, 0);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(f.admission.entered && local_x == !released && !resumed_writer);
+			UT_ASSERT_EQ(conditional_unlocks, released);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_original_freeze_space_refusal_still_errors)
+{
+	QualifiedXminFixture f;
+	HeapTupleFreeze plan;
+	volatile bool caught = false;
+
+	qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
+	UT_ASSERT(cluster_heap_freeze_prepare_xmin_v1(&f.page, &f.proofs, &f.fence,
+		0, FullTransactionIdFromEpochAndXid(1, 77),
+		FullTransactionIdFromEpochAndXid(1, 100), 10, &plan));
+	space_buffer_permanent = false; expecting_error = true;
+	PG_TRY();
+	{
+		heap_freeze_apply_prepared(&relation_data, 1, 77, &plan, 1, &space_identity, false);
+	}
+	PG_CATCH(); { caught = true; } PG_END_TRY();
+	expecting_error = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(f.admission.entered && local_x);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(71);
+	UT_PLAN(74);
+	UT_RUN(test_xmin_space_refusal_is_conditional);
+	UT_RUN(test_xmin_space_error_still_propagates);
+	UT_RUN(test_original_freeze_space_refusal_still_errors);
 	UT_RUN(test_xmin_rejects_unknown_generation_or_foreign_origin_before_writer);
 	UT_RUN(test_xmin_locked_kernel_refuses_foreign_proof_before_native_wal);
 	UT_RUN(test_xmin_foreign_object_refuses_before_writer_or_native_wal);

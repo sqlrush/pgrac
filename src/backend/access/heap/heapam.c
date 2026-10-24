@@ -20593,12 +20593,12 @@ heap_execute_freeze_tuple(HeapTupleHeader tuple, HeapTupleFreeze *frz)
  * Keep SPACE preparation outside the critical section and page changes in the
  * same native FREEZE_PAGE WAL record.
  */
-static void
+static bool
 heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 						   TransactionId snapshotConflictHorizon,
 						   HeapTupleFreeze *tuples, int ntuples
 #ifdef USE_PGRAC_CLUSTER
-						   , const ClusterSpaceIdentity *identity
+						   , const ClusterSpaceIdentity *identity, bool conditional
 #endif
 						   )
 {
@@ -20622,7 +20622,14 @@ heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 			|| !RelFileLocatorEquals(identity->key.locator, rel->rd_locator)
 			|| !cluster_space_prepare_buffer_versions(identity, &buffer, &block_id, 1,
 				&version_batch))
+		{
+			/* The qualified continuation may miss this last comparison.
+			 * Refuse before the critical section; real ERROR still unwinds
+			 * through its original writer/pin/admission resource owners. */
+			if (conditional)
+				return false;
 			elog(ERROR, "PGRAC shared heap freeze requires exact SPACE identity");
+		}
 	}
 #endif
 	START_CRIT_SECTION();
@@ -20683,6 +20690,7 @@ heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 	}
 
 	END_CRIT_SECTION();
+	return true;
 }
 
 #ifdef USE_PGRAC_CLUSTER
@@ -20811,9 +20819,10 @@ cluster_heap_freeze_apply_xmin_batch_locked_v1(
 		return false;
 
 	/* Native redo and the existing SPACE version edge remain the only format. */
-	heap_freeze_apply_prepared(rel, buffer,
+	if (!heap_freeze_apply_prepared(rel, buffer,
 		conflict_horizon, plans, target_count,
-		&fence->identity);
+		&fence->identity, true))
+		return false;
 	XLogFlush(PageGetLSN(live_page));
 	return true;
 }
@@ -20998,7 +21007,7 @@ heap_freeze_execute_prepared(Relation rel, Buffer buffer,
 	heap_freeze_apply_prepared(rel, buffer, snapshotConflictHorizon, tuples,
 							   ntuples
 #ifdef USE_PGRAC_CLUSTER
-							   , identity
+							   , identity, false
 #endif
 							   );
 }
