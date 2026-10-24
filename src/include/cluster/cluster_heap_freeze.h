@@ -12,6 +12,7 @@
 #include "access/htup_details.h"
 #include "access/transam.h"
 #include "cluster/cluster_space_identity.h"
+#include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_tx_resolve.h"
 #include "storage/buf.h"
 #include "storage/bufpage.h"
@@ -30,6 +31,9 @@ typedef struct ClusterHeapFreezePageInputV1
 	OffsetNumber max_offset;
 	uint16 normal_tuples;
 	uint16 multi_tuples;
+	/* Original post-T3 use context only; never a fresh grant or F/H proof. */
+	bool writer_context_valid;
+	ResourceXWriterUseContext writer_context;
 	PGAlignedBlock image;
 } ClusterHeapFreezePageInputV1;
 

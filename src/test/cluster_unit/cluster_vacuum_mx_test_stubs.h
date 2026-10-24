@@ -231,3 +231,13 @@ lazy_clear_visibility_versioned(Relation rel, const ClusterSpaceIdentity *identi
 #define vac_estimate_reltuples(rel, pages, scanned, tuples) ((double)(tuples))
 
 #endif /* CLUSTER_VACUUM_MX_TEST_STUBS_H */
+
+/* Existing scan locks are controlled leaves, never Resource-X writer grants. */
+bool
+ClusterBufferCaptureMutationContext(Buffer buffer, ResourceXWriterUseContext *out)
+{
+	(void) buffer;
+	(void) out;
+	UT_ASSERT(fixture_locks > 0);
+	return false;
+}

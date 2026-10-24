@@ -298,7 +298,7 @@ typedef struct LVSavedErrInfo
 static void lazy_scan_heap(LVRelState *vacrel);
 #ifdef USE_PGRAC_CLUSTER
 static bool lazy_scan_shared_mx(LVRelState *vacrel, Page page, BlockNumber blkno);
-static void lazy_validate_shared_freeze(LVRelState *vacrel, Page page, BlockNumber blkno);
+static void lazy_validate_shared_freeze(LVRelState *vacrel, Page page, BlockNumber blkno, Buffer buffer);
 static ClusterHeapFreezeProofStatusV1 lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer);
 static void lazy_prepare_shared_freeze(LVRelState *vacrel, Buffer recent_buffer, Buffer *vmbuffer);
 #endif
@@ -1168,7 +1168,7 @@ lazy_scan_heap(LVRelState *vacrel)
 			/* PGRAC: retain references before native member enumeration. */
 			if (lazy_scan_shared_mx(vacrel, page, blkno))
 			{
-				lazy_validate_shared_freeze(vacrel, page, blkno);
+				lazy_validate_shared_freeze(vacrel, page, blkno, buf);
 				UnlockReleaseBuffer(buf);
 				lazy_prepare_shared_freeze(vacrel, buf, &vmbuffer);
 				continue;
@@ -1192,7 +1192,7 @@ lazy_scan_heap(LVRelState *vacrel)
 				if (recordfreespace)
 					freespace = PageGetHeapFreeSpace(page);
 #ifdef USE_PGRAC_CLUSTER
-				lazy_validate_shared_freeze(vacrel, page, blkno);
+				lazy_validate_shared_freeze(vacrel, page, blkno, buf);
 #endif
 				UnlockReleaseBuffer(buf);
 #ifdef USE_PGRAC_CLUSTER
@@ -1227,7 +1227,7 @@ lazy_scan_heap(LVRelState *vacrel)
 		/* PGRAC: cleanup ownership does not prove peer member state. */
 		if (lazy_scan_shared_mx(vacrel, page, blkno))
 		{
-			lazy_validate_shared_freeze(vacrel, page, blkno);
+			lazy_validate_shared_freeze(vacrel, page, blkno, buf);
 			UnlockReleaseBuffer(buf);
 			lazy_prepare_shared_freeze(vacrel, buf, &vmbuffer);
 			continue;
@@ -1294,7 +1294,7 @@ lazy_scan_heap(LVRelState *vacrel)
 				freespace = PageGetHeapFreeSpace(page);
 
 #ifdef USE_PGRAC_CLUSTER
-				lazy_validate_shared_freeze(vacrel, page, blkno);
+				lazy_validate_shared_freeze(vacrel, page, blkno, buf);
 #endif
 				UnlockReleaseBuffer(buf);
 #ifdef USE_PGRAC_CLUSTER
@@ -1480,7 +1480,7 @@ lazy_scan_heap(LVRelState *vacrel)
 			 */
 			Assert(vacrel->nindexes > 0);
 #ifdef USE_PGRAC_CLUSTER
-			lazy_validate_shared_freeze(vacrel, page, blkno);
+			lazy_validate_shared_freeze(vacrel, page, blkno, buf);
 #endif
 			UnlockReleaseBuffer(buf);
 #ifdef USE_PGRAC_CLUSTER
@@ -1492,7 +1492,7 @@ lazy_scan_heap(LVRelState *vacrel)
 			Size		freespace = PageGetHeapFreeSpace(page);
 
 #ifdef USE_PGRAC_CLUSTER
-			lazy_validate_shared_freeze(vacrel, page, blkno);
+			lazy_validate_shared_freeze(vacrel, page, blkno, buf);
 #endif
 			UnlockReleaseBuffer(buf);
 #ifdef USE_PGRAC_CLUSTER
@@ -1587,7 +1587,7 @@ lazy_scan_shared_mx(LVRelState *vacrel, Page page, BlockNumber blkno)
  * This local comparison cannot replace a final holder/master fence after proof.
  */
 static void
-lazy_validate_shared_freeze(LVRelState *vacrel, Page page, BlockNumber blkno)
+lazy_validate_shared_freeze(LVRelState *vacrel, Page page, BlockNumber blkno, Buffer buffer)
 {
 	if (!vacrel->shared_freeze_input_captured)
 		return;
@@ -1595,8 +1595,14 @@ lazy_validate_shared_freeze(LVRelState *vacrel, Page page, BlockNumber blkno)
 												   &vacrel->identity, blkno, page))
 	{
 		case CLUSTER_HEAP_FREEZE_PAGE_MATCHED:
+			/* Preserve only the original writer use proof before unlock.
+			 * SHARE/conditional read-only X cannot create this context. */
+			vacrel->shared_freeze_input.writer_context_valid =
+				ClusterBufferCaptureMutationContext(buffer,
+					&vacrel->shared_freeze_input.writer_context);
 			break;
 		case CLUSTER_HEAP_FREEZE_PAGE_CHANGED:
+			vacrel->shared_freeze_input.writer_context_valid = false;
 			vacrel->shared_freeze_input_captured = false;
 			vacrel->shared_freeze_input_valid = false;
 			vacrel->shared_freeze_proofs.proof_count = 0;

@@ -214,7 +214,7 @@ TESTS += test_cluster_undo_header_durability
 TESTS += test_cluster_tt_2pc_finish
 TESTS += test_cluster_tt_rollback_entry
 TESTS += test_cluster_cr_native_origin test_cluster_cr_mvcc_origin
-TESTS += test_cluster_resident_record_batch
+TESTS += test_cluster_resident_record_batch test_cluster_freeze_writer_context
 # Keep registration before all expands its prerequisite list.
 TESTS += test_cluster_pcm_aux_consumer test_cluster_pcm_aux_reobserve test_cluster_resource_x_terminal_ingress
 TESTS += test_cluster_pcm_aux_mutation test_cluster_heap_extend_current
@@ -433,7 +433,7 @@ SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 		test_pgrac_fenced_ctl,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_buffer_cr test_cluster_buffer_mapping test_cluster_page_edge test_cluster_port_runtime,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_pi_contribution_stream,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_heap_prepare_diagnostic,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_freeze_writer_context test_cluster_heap_prepare_diagnostic,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_horizon,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_resident_record_batch,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_tt_terminal_route,$(SIMPLE_TESTS))
@@ -1958,6 +1958,12 @@ test_cluster_heap_freeze_apply.inc: $(top_srcdir)/src/backend/access/heap/heapam
 	mv $@.tmp $@
 
 # Original backend-private pin observation, not a model of residency.
+test_cluster_heap_writer_context_match.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	@awk '/^ClusterBufferMutationContextMatches\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++; exit } \
+	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_borrowed_pin.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	@awk '/^ClusterBufferHasSharedPin\(/ { print "bool"; emit=1; found++ } \
 	     emit { print } emit && /^}/ { emit=0; done++; exit } \
@@ -1995,7 +2001,7 @@ test_cluster_heap_maintenance_identity.inc: $(top_srcdir)/src/backend/access/hea
 	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c test_cluster_heap_maintenance_policy.inc unit_test.h \
+test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c test_cluster_heap_writer_context_match.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) test_cluster_heap_maintenance_policy.inc unit_test.h \
 		test_cluster_heap_borrowed_pin.inc $(top_srcdir)/src/include/storage/bufmgr.h \
 		test_cluster_vacuum_freeze_locators.inc \
 		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
@@ -2015,7 +2021,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c t
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		test_cluster_inplace_itemptr_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_RESOURCE_X_IDENTITY_O) test_cluster_space_bufpage_product.o \
 		$(top_srcdir)/src/backend/cluster/cluster_heap_freeze.c \
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		test_cluster_inplace_itemptr_product.o \
@@ -9940,3 +9946,25 @@ clean distclean maintainer-clean: clean-retention-sample
 .PHONY: clean-retention-sample
 clean-retention-sample:
 	rm -f test_cluster_retention_sample.inc test_cluster_retention_sample.inc.tmp
+
+# Original backend-local writer, with controlled ownership/object/pin leaves.
+test_cluster_freeze_writer_context.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	@awk '/^typedef enum ClusterPcmXWriterLedgerPhase/ { emit=1; types++ } \
+	     /^typedef struct ClusterPcmXWriterLedgerEntry/ { emit=1; types++ } \
+	     /^static ClusterPcmXWriterLedgerEntry cluster_bufmgr_pcm_x_writer_ledger\[/ { print; array++ } \
+	     /^cluster_bufmgr_pcm_x_writer_find\(/ { print "static ClusterPcmXWriterLedgerEntry *"; emit=1; find++ } \
+	     /^cluster_bufmgr_pcm_x_writer_entry_exact\(/ { print "static bool"; emit=1; exact++ } \
+	     /^ClusterBuffer(CaptureMutationContext|MutationContextMatches)\(/ { print "bool"; emit=1; capture++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (types != 2 || array != 1 || find != 1 || exact != 1 || capture != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_freeze_writer_context: test_cluster_freeze_writer_context.c unit_test.h \
+		test_cluster_freeze_writer_context.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(top_srcdir)/src/include/storage/bufmgr.h \
+		$(top_srcdir)/src/include/storage/buf_internals.h \
+		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_own.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@

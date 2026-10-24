@@ -20796,6 +20796,10 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 			&own_generation, &acquisition_epoch, &pcm_state)
 		|| own_generation == 0 || acquisition_epoch == 0
 		|| pcm_state != (uint8) PCM_STATE_X
+		|| !input->writer_context_valid
+		|| input->writer_context.r4_record_generation != admission->record_generation
+		|| input->writer_context.buffer_ownership_generation != own_generation
+		|| !ClusterBufferMutationContextMatches(buffer, &input->writer_context)
 		|| !cluster_pcm_lock_r4_route_snapshot(tag, &authority_now,
 			&master_sequence, &page_version)
 		|| authority_now.transition_count != fence->holder_sequence

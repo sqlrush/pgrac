@@ -372,6 +372,13 @@ extern bool ConditionalLockBuffer(Buffer buffer);
 /* Read only: an existing shared-buffer pin held by this backend. Does not
  * acquire a pin or grant content/PCM writer authority. */
 extern bool ClusterBufferHasSharedPin(Buffer buffer);
+struct ResourceXWriterUseContext;
+/* Borrow the original ACTIVE writer while its native content-X is held.
+ * Refusal preserves out; neither entry point fetches/grants current. */
+extern bool ClusterBufferCaptureMutationContext(
+	Buffer buffer, struct ResourceXWriterUseContext *out);
+extern bool ClusterBufferMutationContextMatches(
+	Buffer buffer, const struct ResourceXWriterUseContext *expected);
 /* Read-only successful ConditionalLockBuffer() only; no PCM writer cleanup. */
 extern void ClusterUnlockReleaseBufferAfterConditionalRead(Buffer buffer);
 /* Conditional local X plus cluster_space_hint_begin/finish() publication only. */

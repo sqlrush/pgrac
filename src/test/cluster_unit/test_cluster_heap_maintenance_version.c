@@ -126,6 +126,18 @@ LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
 	UT_ASSERT_EQ(mode, LW_EXCLUSIVE);
 	return local_x;
 }
+static ResourceXWriterUseContext original_writer_context;
+bool
+ClusterBufferCaptureMutationContext(Buffer buffer, ResourceXWriterUseContext *out)
+{
+	UT_ASSERT_EQ(buffer, 1);
+	if (!writer_current || !local_x || backend_pin_count <= 0)
+		return false;
+	*out = original_writer_context;
+	return true;
+}
+#include "test_cluster_heap_writer_context_match.inc"
+
 bool
 cluster_bufmgr_terminal_stamp_authority(Buffer buffer, const BufferTag *tag,
 	uint64 *generation, uint64 *epoch, uint8 *state)
@@ -853,6 +865,16 @@ qualified_xmin_setup(QualifiedXminFixture *f, uint16 xmax_mask)
 	memcpy(before_page.data, current_page.data, BLCKSZ);
 	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&space_identity, 7,
 		current_page.data, &f->input));
+	memset(&original_writer_context, 0, sizeof(original_writer_context));
+	InitBufferTag(&original_writer_context.ref.assertion.resource,
+		&relation_data.rd_locator, MAIN_FORKNUM, 7);
+	original_writer_context.ref.assertion.requester_node = 0;
+	original_writer_context.ref.formation = 21;
+	original_writer_context.ref.acquisition_generation = 22;
+	original_writer_context.r4_record_generation = 13;
+	original_writer_context.buffer_ownership_generation = 14;
+	f->input.writer_context = original_writer_context;
+	f->input.writer_context_valid = true;
 	UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&f->input, &f->page));
 	UT_ASSERT_EQ(f->page.carrier_request_count, 1);
 	f->fence = (ClusterHeapFreezeFinalFenceV1){
@@ -922,6 +944,8 @@ qualified_xmin_batch_setup(QualifiedXminFixture *f,
 	memcpy(before_page.data, current_page.data, BLCKSZ);
 	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&space_identity, 7,
 		current_page.data, &f->input));
+	f->input.writer_context = original_writer_context;
+	f->input.writer_context_valid = true;
 	UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&f->input, &f->page));
 	UT_ASSERT_EQ(f->page.carrier_request_count, 3);
 	f->proofs.proof_count = 3;
@@ -1864,10 +1888,58 @@ UT_TEST(test_xmin_bad_final_authority_never_checks_full_target)
 	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
 }
 
+UT_TEST(test_xmin_apply_requires_original_writer_context_before_wal)
+{
+	QualifiedXminFixture f;
+	qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	f.input.writer_context_valid = false;
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(inserts + dirties + flushes + full_target_checks, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_xmin_apply_rejects_replacement_t3_with_same_buffer_generation)
+{
+	QualifiedXminFixture f;
+	qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	original_writer_context.ref.acquisition_generation++;
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(inserts + dirties + flushes + full_target_checks, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_page_recapture_drops_original_writer_context)
+{
+	QualifiedXminFixture f;
+	ResourceXWriterUseContext zero = {0};
+	qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	UT_ASSERT(f.input.writer_context_valid);
+	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&space_identity, 7,
+		current_page.data, &f.input));
+	UT_ASSERT(!f.input.writer_context_valid);
+	UT_ASSERT(memcmp(&f.input.writer_context, &zero, sizeof(zero)) == 0);
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(inserts + dirties + flushes + full_target_checks, 0);
+}
+UT_TEST(test_xmin_batch_rejects_replacement_original_writer_before_wal)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	qualified_xmin_batch_setup(&f, targets);
+	original_writer_context.ref.acquisition_generation++;
+	UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
+	UT_ASSERT_EQ(inserts + dirties + flushes + full_target_checks, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(44);
+	UT_PLAN(48);
+	UT_RUN(test_page_recapture_drops_original_writer_context);
+	UT_RUN(test_xmin_batch_rejects_replacement_original_writer_before_wal);
+	UT_RUN(test_xmin_apply_requires_original_writer_context_before_wal);
+	UT_RUN(test_xmin_apply_rejects_replacement_t3_with_same_buffer_generation);
 	UT_RUN(test_xmin_single_and_batch_require_full_target_not_census_only);
 	UT_RUN(test_xmin_target_admission_keeps_original_census_recheck_last);
 	UT_RUN(test_xmin_full_target_error_keeps_borrowed_resources_before_wal);

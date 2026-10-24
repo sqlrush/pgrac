@@ -15563,6 +15563,61 @@ ClusterBufferHasSharedPin(Buffer buffer)
 	return buffer > 0 && buffer <= NBuffers && GetPrivateRefCount(buffer) > 0;
 }
 
+/* Retain only this backend's original post-T3 use proof.  The caller must
+ * already hold its pin and native content-X; descriptor residency, local-X
+ * alone and a cached node-level X cannot manufacture a writer ledger. */
+bool
+ClusterBufferCaptureMutationContext(Buffer buffer, struct ResourceXWriterUseContext *out)
+{
+#ifdef USE_PGRAC_CLUSTER
+	BufferDesc *buf;
+	ClusterPcmXWriterLedgerEntry *entry;
+	uint64 generation, epoch;
+	uint8 state;
+
+	if (out == NULL || !ClusterBufferHasSharedPin(buffer))
+		return false;
+	buf = GetBufferDescriptor(buffer - 1);
+	if (!LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE))
+		return false;
+	entry = cluster_bufmgr_pcm_x_writer_find(buf);
+	if (entry == NULL || entry->phase != PCM_X_WRITER_LEDGER_ACTIVE
+		|| !cluster_bufmgr_pcm_x_writer_entry_exact(entry, buf)
+		|| (entry->object_checked
+			&& !cluster_ko_peer_delivery_current_v3(entry->object_revision))
+		|| !cluster_bufmgr_terminal_stamp_authority(buffer, &buf->tag,
+			&generation, &epoch, &state)
+		|| generation != entry->authority.buffer_ownership_generation
+		|| epoch == 0 || state != (uint8) PCM_STATE_X)
+		return false;
+	*out = entry->authority;
+	return true;
+#else
+	return false;
+#endif
+}
+
+bool
+ClusterBufferMutationContextMatches(Buffer buffer, const struct ResourceXWriterUseContext *expected)
+{
+#ifdef USE_PGRAC_CLUSTER
+	ResourceXWriterUseContext current;
+
+	if (expected == NULL || !ClusterBufferCaptureMutationContext(buffer, &current))
+		return false;
+	/* Compare logical fields, never C struct padding. */
+	return resource_x_assertion_equal(&current.ref.assertion, &expected->ref.assertion)
+		&& current.ref.formation == expected->ref.formation
+		&& current.ref.acquisition_generation == expected->ref.acquisition_generation
+		&& current.r4_record_generation == expected->r4_record_generation
+		&& current.buffer_ownership_generation == expected->buffer_ownership_generation
+		&& current.writer_activation_token == expected->writer_activation_token
+		&& current.resource_x_activation_generation == expected->resource_x_activation_generation;
+#else
+	return false;
+#endif
+}
+
 /*
  * Release a pin and the local content lock after a read-only successful
  * ConditionalLockBuffer().  That acquisition did not acquire PCM ownership or

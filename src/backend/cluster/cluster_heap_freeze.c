@@ -89,6 +89,8 @@ cluster_heap_freeze_capture_page_v1(const ClusterSpaceIdentity *identity,
 	out->max_offset = maxoff;
 	out->normal_tuples = normal;
 	out->multi_tuples = multi;
+	out->writer_context_valid = false;
+	memset(&out->writer_context, 0, sizeof(out->writer_context));
 	memcpy(out->image.data, page, BLCKSZ);
 	return true;
 }
