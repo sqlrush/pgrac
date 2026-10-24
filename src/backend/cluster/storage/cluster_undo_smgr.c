@@ -851,6 +851,71 @@ refused:
 	return false;
 }
 
+static bool
+recovery_header_stamp_overlap(const void *a, size_t a_length,
+	const void *b, size_t b_length)
+{
+	uintptr_t ap = (uintptr_t)a;
+	uintptr_t bp = (uintptr_t)b;
+
+	return a_length != 0 && b_length != 0
+		&& (ap >= bp ? ap - bp < b_length : bp - ap < a_length);
+}
+
+bool
+cluster_undo_smgr_recovery_ctrc_prepare_record_v2(const XLogReaderState *reader,
+	uint32 source_index, const uint8 source_identity_digest[32], const uint8 *raw,
+	size_t raw_length, ClusterUndoSmgrRecoveryStampV1 *out,
+	ClusterRecoveryCTRCReferenceV2 *reference)
+{
+	ClusterRecoveryCTRCReferenceV2 bound;
+	ClusterUndoSmgrRecoveryStampV1 prepared;
+	uint8 payload[CLUSTER_RECOVERY_CTRC_BYTES];
+	const void *inputs[6];
+	size_t lengths[6];
+	size_t i;
+
+	if (CritSectionCount != 0 || CurrentResourceOwner == NULL
+		|| reader == NULL || reader->record == NULL
+		|| source_identity_digest == NULL || raw == NULL
+		|| raw_length != SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong
+			+ CLUSTER_RECOVERY_CTRC_BYTES
+		|| out == NULL || reference == NULL || recovery_header_stamp.fd >= 0
+		|| recovery_header_stamp_overlap(out, sizeof(*out), reference, sizeof(*reference)))
+		return false;
+
+	/* Publishing either result must not overwrite the original record, its
+	 * provenance, or the held-descriptor state. Do this before hashing or I/O. */
+	inputs[0] = reader; lengths[0] = sizeof(*reader);
+	inputs[1] = reader->record; lengths[1] = sizeof(*reader->record);
+	inputs[2] = reader->record->main_data; lengths[2] = reader->record->main_data_len;
+	inputs[3] = raw; lengths[3] = raw_length;
+	inputs[4] = source_identity_digest; lengths[4] = 32;
+	inputs[5] = &recovery_header_stamp; lengths[5] = sizeof(recovery_header_stamp);
+	for (i = 0; i < lengthof(inputs); i++)
+		if (recovery_header_stamp_overlap(out, sizeof(*out), inputs[i], lengths[i])
+			|| recovery_header_stamp_overlap(reference, sizeof(*reference), inputs[i], lengths[i]))
+			return false;
+
+	/* The existing reference reader binds the full native header, payload and
+	 * CRC to this completed record and its actual positions, before acquiring
+	 * a target descriptor. ROOT/source/cut/graph qualification remains caller's. */
+	if (!cluster_recovery_ctrc_reference_v2(reader, source_index,
+			source_identity_digest, raw, raw_length, &bound))
+		return false;
+	memcpy(payload, raw + SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong,
+		CLUSTER_RECOVERY_CTRC_BYTES);
+	if (!cluster_undo_smgr_recovery_ctrc_prepare_v2(payload, sizeof(payload),
+			reader->system_identifier, &prepared))
+		return false;
+
+	/* Preparation owns the original ResourceOwner cleanup and ERROR behavior.
+	 * No target write has occurred; publish both private results only now. */
+	memcpy(out, &prepared, sizeof(prepared));
+	memcpy(reference, &bound, sizeof(bound));
+	return true;
+}
+
 bool
 cluster_undo_smgr_recovery_ctrc_matches_v2(ClusterUndoSmgrRecoveryStampV1 stamp,
 	const uint8 *payload, size_t length)

@@ -187,6 +187,21 @@ extern bool cluster_undo_smgr_recovery_ctrc_prepare_v2(const uint8 *payload, siz
 /* Read-only pre-insert check of the held D0 stage and all prepared bytes.
  * No IO, lock, codec/hash/allocation, state change or completion authority.
  * Refusal does not poison the stage; post-insert write_bound remains required. */
+struct XLogReaderState;
+struct ClusterRecoveryCTRCReferenceV2;
+/* Dormant recovery preparation from the original completed native D0 reader
+ * and its immutable full raw snapshot. First bind the exact reference using
+ * the existing reader/CRC/SHA, then prepare the original held-FD target from
+ * those same payload bytes. No target write, WAL insertion or live dispatch.
+ * Caller retains qualified ROOT/source/cut/graph/owner/pins and reservation;
+ * byte identity does not prove those prerequisites or typed idempotency.
+ * Private token/reference outputs must be disjoint from reader-owned storage,
+ * input bytes and each other. Both stay unchanged on refusal; original ERROR
+ * and ResourceOwner behavior is preserved. Only exact-before is admitted. */
+extern bool cluster_undo_smgr_recovery_ctrc_prepare_record_v2(
+	const struct XLogReaderState *reader, uint32 source_index,
+	const uint8 source_identity_digest[32], const uint8 *raw, size_t raw_length,
+	ClusterUndoSmgrRecoveryStampV1 *out, struct ClusterRecoveryCTRCReferenceV2 *reference);
 extern bool cluster_undo_smgr_recovery_ctrc_matches_v2(ClusterUndoSmgrRecoveryStampV1 stamp,
 													 const uint8 *payload, size_t length);
 extern bool cluster_undo_smgr_recovery_ctrc_write_v2(ClusterUndoSmgrRecoveryStampV1 stamp);

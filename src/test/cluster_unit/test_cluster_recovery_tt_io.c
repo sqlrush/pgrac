@@ -7,6 +7,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/rmgr.h"
 #include <fcntl.h>
 #include <setjmp.h>
 #include "miscadmin.h"
@@ -973,6 +974,209 @@ UT_TEST(test_d0_matches_token_owner_kind_and_sticky_failure_isolation)
 	UT_ASSERT(cluster_undo_smgr_recovery_abort_close_v1(stamp));
 }
 
+#define D0_NATIVE_RAW_BYTES (SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + 320)
+
+/* Completed decoded state is controlled; the original read/reference codec
+ * consumes it unchanged. This does not run XLogReadRecord or certify source. */
+static void
+seal_native_d0(uint8 raw[D0_NATIVE_RAW_BYTES], DecodedXLogRecord *decoded)
+{
+	XLogRecord header;
+	pg_crc32c crc;
+	memcpy(&header, raw, SizeOfXLogRecord);
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, raw + SizeOfXLogRecord, D0_NATIVE_RAW_BYTES - SizeOfXLogRecord);
+	COMP_CRC32C(crc, &header, offsetof(XLogRecord, xl_crc));
+	FIN_CRC32C(crc);
+	header.xl_crc = crc;
+	memcpy(raw, &header, SizeOfXLogRecord);
+	decoded->header = header;
+}
+
+static void
+native_d0_fixture(XLogReaderState *reader, DecodedXLogRecord *decoded,
+	uint8 raw[D0_NATIVE_RAW_BYTES])
+{
+	ClusterRecoveryCTRCReleaseV2 d0;
+	uint32 length = 320;
+	UT_ASSERT(cluster_recovery_ctrc_decode_v2(d0_payload, sizeof(d0_payload), d0_system, &d0));
+	memset(reader, 0, sizeof(*reader));
+	memset(decoded, 0, sizeof(*decoded));
+	memset(raw, 0, D0_NATIVE_RAW_BYTES);
+	reader->system_identifier = d0_system;
+	reader->cluster_expected_thread_id = d0.writer_thread;
+	reader->ReadRecPtr = UINT64_C(0x1000000);
+	reader->EndRecPtr = reader->ReadRecPtr + 4096;
+	reader->record = decoded;
+	decoded->size = sizeof(*decoded);
+	decoded->lsn = reader->ReadRecPtr;
+	decoded->next_lsn = reader->EndRecPtr;
+	decoded->max_block_id = -1;
+	decoded->main_data = (char *)d0_payload;
+	decoded->main_data_len = sizeof(d0_payload);
+	decoded->header.xl_tot_len = D0_NATIVE_RAW_BYTES;
+	decoded->header.xl_rmid = RM_CLUSTER_UNDO_ID;
+	decoded->header.xl_info = CLUSTER_RECOVERY_CTRC_WAL_INFO;
+	memcpy(raw, &decoded->header, SizeOfXLogRecord);
+	raw[SizeOfXLogRecord] = XLR_BLOCK_ID_DATA_LONG;
+	memcpy(raw + SizeOfXLogRecord + 1, &length, sizeof(length));
+	memcpy(raw + SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong, d0_payload, 320);
+	seal_native_d0(raw, decoded);
+}
+
+UT_TEST(test_d0_record_prepare_binds_native_reference_before_held_target)
+{
+	for (unsigned terminal = 0; terminal < 2; terminal++) {
+		XLogReaderState reader, reader_before;
+		DecodedXLogRecord decoded, decoded_before;
+		ClusterUndoSmgrRecoveryStampV1 stamp = { .token = 91 };
+		ClusterRecoveryCTRCReferenceV2 reference, expected;
+		uint8 source[32], raw[D0_NATIVE_RAW_BYTES];
+		reset_d0(terminal == 0);
+		native_d0_fixture(&reader, &decoded, raw);
+		memset(source, 6, sizeof(source));
+		reader_before = reader;
+		decoded_before = decoded;
+		UT_ASSERT(cluster_recovery_ctrc_reference_v2(&reader, 17, source, raw, sizeof(raw), &expected));
+		memset(&reference, 0xA5, sizeof(reference));
+		UT_ASSERT(cluster_undo_smgr_recovery_ctrc_prepare_record_v2(&reader, 17,
+			source, raw, sizeof(raw), &stamp, &reference));
+		UT_ASSERT(stamp.token != 0 && stamp.token != 91);
+		UT_ASSERT(memcmp(&reference, &expected, sizeof(reference)) == 0);
+		UT_ASSERT(reference.end != reference.start + reference.raw_length);
+		UT_ASSERT_EQ(external_fds, 1);
+		UT_ASSERT_EQ(opens, 1);
+		UT_ASSERT_EQ(writes + syncs, 0);
+		UT_ASSERT(memcmp(&reader, &reader_before, sizeof(reader)) == 0);
+		UT_ASSERT(memcmp(&decoded, &decoded_before, sizeof(decoded)) == 0);
+		UT_ASSERT(cluster_undo_smgr_recovery_ctrc_matches_v2(stamp, d0_payload, 320));
+		UT_ASSERT(cluster_undo_smgr_recovery_ctrc_write_bound_v2(stamp, d0_payload, 320));
+		UT_ASSERT_EQ(writes, 1);
+		UT_ASSERT_EQ(syncs, 1);
+		UT_ASSERT(cluster_undo_smgr_recovery_ctrc_close_v2(stamp));
+		UT_ASSERT_EQ(external_fds, 0);
+	}
+}
+
+UT_TEST(test_d0_record_prepare_native_refusal_precedes_any_target_io)
+{
+	for (unsigned mode = 0; mode < 13; mode++) {
+		XLogReaderState reader;
+		DecodedXLogRecord decoded;
+		ClusterUndoSmgrRecoveryStampV1 stamp = { .token = 91 };
+		ClusterRecoveryCTRCReferenceV2 reference, before;
+		uint8 source[32], raw[D0_NATIVE_RAW_BYTES];
+		const XLogReaderState *input = &reader;
+		const uint8 *identity = source, *snapshot = raw;
+		size_t length = sizeof(raw);
+		reset_d0(true);
+		native_d0_fixture(&reader, &decoded, raw);
+		memset(source, 6, sizeof(source));
+		memset(&reference, 0xA5, sizeof(reference));
+		before = reference;
+		switch (mode) {
+		case 0: input = NULL; break;
+		case 1: identity = NULL; break;
+		case 2: snapshot = NULL; break;
+		case 3: length--; break;
+		case 4: reader.record = NULL; break;
+		case 5: reader.EndRecPtr++; break;
+		case 6: reader.cluster_expected_thread_id++; break;
+		case 7: memset(source, 0, sizeof(source)); break;
+		case 8: raw[sizeof(raw) - 1] ^= 1; break;
+		case 9:
+			raw[sizeof(raw) - 1] ^= 1;
+			seal_native_d0(raw, &decoded); /* valid CRC/header, different actual body */
+			break;
+		case 10: decoded.toplevel_xid = 100; break;
+		case 11: CritSectionCount = 1; break;
+		case 12: CurrentResourceOwner = NULL; break;
+		}
+		UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_prepare_record_v2(input, 17,
+			identity, snapshot, length, &stamp, &reference));
+		UT_ASSERT_EQ(opens + resolves + reads + writes + syncs, 0);
+		UT_ASSERT_EQ(external_fds, 0);
+		UT_ASSERT_EQ(stamp.token, 91);
+		UT_ASSERT(memcmp(&reference, &before, sizeof(reference)) == 0);
+	}
+	CritSectionCount = 0;
+	CurrentResourceOwner = (ResourceOwner)&owner_storage[0];
+}
+
+UT_TEST(test_d0_record_prepare_output_aliases_preserve_reader_and_stage)
+{
+	for (unsigned mode = 0; mode < 10; mode++) {
+		XLogReaderState reader, reader_before;
+		DecodedXLogRecord decoded, decoded_before;
+		ClusterUndoSmgrRecoveryStampV1 stamp = { .token = 91 }, *token_out = &stamp;
+		ClusterRecoveryCTRCReferenceV2 reference, before, *ref_out = &reference;
+		RecoveryHeaderStamp stage_before;
+		uint8 source[32], raw[D0_NATIVE_RAW_BYTES], raw_before[D0_NATIVE_RAW_BYTES];
+		reset_d0(true);
+		native_d0_fixture(&reader, &decoded, raw);
+		memset(source, 6, sizeof(source));
+		memset(&reference, 0xA5, sizeof(reference));
+		before = reference;
+		reader_before = reader;
+		decoded_before = decoded;
+		stage_before = recovery_header_stamp;
+		memcpy(raw_before, raw, sizeof(raw));
+		switch (mode) {
+		case 0: token_out = NULL; break;
+		case 1: ref_out = NULL; break;
+		case 2: ref_out = (void *)&stamp; break;
+		case 3: token_out = (void *)&reader; break;
+		case 4: ref_out = (void *)&decoded; break;
+		case 5: token_out = (void *)d0_payload; break;
+		case 6: ref_out = (void *)raw; break;
+		case 7: token_out = (void *)source; break;
+		case 8: ref_out = (void *)&recovery_header_stamp; break;
+		case 9: token_out = (void *)&decoded; break;
+		}
+		UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_prepare_record_v2(&reader, 17,
+			source, raw, sizeof(raw), token_out, ref_out));
+		UT_ASSERT_EQ(opens + resolves + reads + writes + syncs, 0);
+		UT_ASSERT_EQ(external_fds, 0);
+		UT_ASSERT_EQ(stamp.token, 91);
+		UT_ASSERT(memcmp(&reference, &before, sizeof(reference)) == 0);
+		UT_ASSERT(memcmp(&reader, &reader_before, sizeof(reader)) == 0);
+		UT_ASSERT(memcmp(&decoded, &decoded_before, sizeof(decoded)) == 0);
+		UT_ASSERT(memcmp(raw, raw_before, sizeof(raw)) == 0);
+		UT_ASSERT(memcmp(&recovery_header_stamp, &stage_before, sizeof(stage_before)) == 0);
+	}
+}
+
+UT_TEST(test_d0_record_prepare_target_refusal_never_publishes_reference_or_token)
+{
+	for (unsigned mode = 0; mode < 5; mode++) {
+		XLogReaderState reader;
+		DecodedXLogRecord decoded;
+		ClusterUndoSmgrRecoveryStampV1 stamp = { .token = 91 }, existing;
+		ClusterRecoveryCTRCReferenceV2 reference, before;
+		uint8 source[32], raw[D0_NATIVE_RAW_BYTES];
+		reset_d0(true);
+		native_d0_fixture(&reader, &decoded, raw);
+		memset(source, 6, sizeof(source));
+		memset(&reference, 0xA5, sizeof(reference));
+		before = reference;
+		if (mode == 0) capacity = false;
+		if (mode == 1) open_error = true;
+		if (mode == 2) read_short = true;
+		if (mode == 3) change_byte(BLCKSZ - 1, 0x6b);
+		if (mode == 4) UT_ASSERT(prepare_d0(&existing));
+		UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_prepare_record_v2(&reader, 17,
+			source, raw, sizeof(raw), &stamp, &reference));
+		UT_ASSERT_EQ(stamp.token, 91);
+		UT_ASSERT(memcmp(&reference, &before, sizeof(reference)) == 0);
+		UT_ASSERT_EQ(writes + syncs, 0);
+		UT_ASSERT_EQ(external_fds, mode == 4);
+		if (mode == 4) {
+			UT_ASSERT(cluster_undo_smgr_recovery_ctrc_matches_v2(existing, d0_payload, 320));
+			UT_ASSERT(cluster_undo_smgr_recovery_ctrc_close_v2(existing));
+		}
+	}
+}
+
 int
 main(void)
 {
@@ -982,7 +1186,7 @@ main(void)
 		return 2;
 	snprintf(test_dir, sizeof(test_dir), "%s", dir);
 	snprintf(test_file, sizeof(test_file), "%s/seg_257.dat", dir);
-	UT_PLAN(18);
+	UT_PLAN(22);
 	UT_RUN(test_exact_durable_slot_preserves_whole_header_and_head);
 	UT_RUN(test_idempotent_still_syncs_and_reads_without_rewriting);
 	UT_RUN(test_prepare_refusals_do_not_leak_or_write);
@@ -1001,6 +1205,10 @@ main(void)
 	UT_RUN(test_d0_bound_token_owner_kind_and_length_isolation);
 	UT_RUN(test_d0_matches_is_readonly_and_compares_all_payload_bytes);
 	UT_RUN(test_d0_matches_token_owner_kind_and_sticky_failure_isolation);
+	UT_RUN(test_d0_record_prepare_binds_native_reference_before_held_target);
+	UT_RUN(test_d0_record_prepare_native_refusal_precedes_any_target_io);
+	UT_RUN(test_d0_record_prepare_output_aliases_preserve_reader_and_stage);
+	UT_RUN(test_d0_record_prepare_target_refusal_never_publishes_reference_or_token);
 	CurrentResourceOwner = (ResourceOwner)&owner_storage[0];
 	if (release_callback != NULL)
 		release_callback(RESOURCE_RELEASE_AFTER_LOCKS, false, true, release_arg);
