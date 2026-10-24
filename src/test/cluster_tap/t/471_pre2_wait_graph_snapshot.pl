@@ -23,7 +23,7 @@ my $passed = eval {
 	$_->append_conf('postgresql.conf', "cluster.trace_tx_identity = on\n") for $cluster->nodes;
 	$cluster->start_cluster;
 	my @nodes = $cluster->nodes;
-	sql($nodes[0], 'CREATE EXTENSION test_pgrac_shared_config');
+	sql($nodes[0], slurp_file("$FindBin::RealBin/../pre2/wait_graph_setup.sql"));
 	sql($nodes[0], 'CREATE TABLE wait_graph_extension(id integer)');
 	my @key = split /\|/, sql($nodes[0], q{
 		SELECT d.oid,pg_relation_filenode(c.oid),
