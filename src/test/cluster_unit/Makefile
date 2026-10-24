@@ -4490,6 +4490,14 @@ $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_CONTROL_REQUEST_O) $(C
 		$(top_srcdir)/src/include/cluster/cluster_lock_owner.h \
 		$(top_srcdir)/src/include/cluster/cluster_lock_acquire.h \
 		$(top_srcdir)/src/include/cluster/cluster_control_request.h
+test_cluster_cf_blocker_trace.inc: $(top_srcdir)/src/backend/cluster/cluster_ges.c Makefile
+	awk '/^ges_trace_cf_blockers\(/ { print "static void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cf_enqueue test_cluster_control_walr test_cluster_control_ir: test_cluster_cf_blocker_trace.inc
+
 test_cluster_cf_enqueue: test_cluster_cf_enqueue.c unit_test.h \
 		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(top_builddir)/src/backend/cluster/cluster_control_request.o \
 		$(CLUSTER_LMD_WAIT_STATE_O)

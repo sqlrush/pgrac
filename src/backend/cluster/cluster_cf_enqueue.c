@@ -41,6 +41,7 @@
 #include "miscadmin.h" /* AmStartupProcess / AmCheckpointerProcess */
 #include "storage/fd.h"
 #include "storage/lock.h"
+#include "storage/proc.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
@@ -66,6 +67,10 @@ static CfHoldState cf_hold_x;
 static CfHoldState cf_hold_s;
 static uint64 cf_retired_x, cf_retired_s;
 static ClusterCfAttemptObservation cf_attempt;
+static struct {
+	ClusterGrdHolderId holder;
+	uint64 started_ms, master_generation;
+} cf_trace_origin;
 
 static ClusterCfReleaseResult cf_unlock(LOCKMODE mode, const void *caller);
 
@@ -177,6 +182,11 @@ cf_attempt_owner(const CfHoldState *slot)
 	cf_attempt.request_id = slot->owner.request.request_id;
 	cf_attempt.request_epoch = slot->owner.request.holder.cluster_epoch;
 	cf_attempt.control_owner_id = slot->owner.request.control_owner_id;
+	if (cluster_trace_control_config) {
+		cf_trace_origin.holder = slot->owner.request.holder;
+		cf_trace_origin.started_ms = slot->owner.request.caller_local_start_ts_ms;
+		cf_trace_origin.master_generation = slot->owner.request.master_gen_snapshot;
+	}
 }
 
 /*
@@ -358,10 +368,60 @@ acquire:
 	}
 }
 
+/* Copy original return facts, including requests cleared by EMPTY cleanup.
+ * A grant record maps this exact tuple to its own PID, never a remote procno. */
+static bool
+cf_lock_observed(LOCKMODE mode, bool cooperative, const void *caller)
+{
+	static TimestampTz last_refusal;
+	bool acquired = cf_lock(mode, cooperative, caller);
+	TimestampTz now;
+	uint64 now_ms, age_ms = 0;
+	bool age_known, pid_matches;
+	CfHoldState *slot;
+
+	if (!cluster_trace_control_config || CritSectionCount != 0)
+		return acquired;
+	now = GetCurrentTimestamp();
+	if (!acquired) {
+		if (last_refusal != 0 && now >= last_refusal
+			&& now - last_refusal < INT64_C(5000000))
+			return acquired;
+		last_refusal = now;
+	}
+	now_ms = now >= 0 ? (uint64)(now / 1000) : 0;
+	age_known = cf_trace_origin.started_ms != 0 && now_ms >= cf_trace_origin.started_ms;
+	if (age_known)
+		age_ms = now_ms - cf_trace_origin.started_ms;
+	slot = cf_slot(mode);
+	pid_matches = acquired && slot->coordinated && MyProc != NULL
+		&& cf_trace_origin.holder.node_id == (uint32)cluster_node_id
+		&& cf_trace_origin.holder.procno == (uint32)MyProc->pgprocno
+		&& cf_trace_origin.holder.request_id != 0
+		&& cf_trace_origin.holder.request_id == cf_attempt.request_id;
+	ereport(LOG,
+		(errmsg("PGRAC_FAMILY=CF_RETURN resource=CF res_type=%u lockmethod=%u field1=0 field2=0 field3=0 ts=" INT64_FORMAT
+				" host_node=%d caller_pid=%d role=%d mode=%d acquired=%d cooperative=%d"
+				" result=%d source=%d owner_state=%d retained=%d same_task=%d coordinated=%d"
+				" request_node=%u request_procno=%u request_epoch=" UINT64_FORMAT
+				" request_id=" UINT64_FORMAT " control_owner_id=" UINT64_FORMAT
+				" master_generation=" UINT64_FORMAT " age_known=%d request_age_ms=" UINT64_FORMAT
+				" pid_matches_holder=%d holder_pid=%d",
+				CLUSTER_CF_RESID_TYPE, DEFAULT_LOCKMETHOD, now, cluster_node_id, MyProcPid,
+				(int)MyBackendType, (int)mode, acquired, cooperative, (int)cf_attempt.result,
+				(int)cf_attempt.source, (int)cf_attempt.owner_state_at_return,
+				slot->held, slot->held && slot->caller == caller, slot->coordinated,
+				cf_trace_origin.holder.node_id, cf_trace_origin.holder.procno,
+				cf_trace_origin.holder.cluster_epoch, cf_trace_origin.holder.request_id,
+				cf_attempt.control_owner_id, cf_trace_origin.master_generation, age_known,
+				age_ms, pid_matches, pid_matches ? MyProcPid : 0)));
+	return acquired;
+}
+
 bool
 cluster_cf_lock(LOCKMODE mode)
 {
-	return cf_lock(mode, false, NULL);
+	return cf_lock_observed(mode, false, NULL);
 }
 
 bool
@@ -369,7 +429,7 @@ cluster_cf_lock_poll(LOCKMODE mode)
 {
 	if (!cluster_shared_config || (MyBackendType != B_LMON && MyBackendType != B_LMS))
 		return false;
-	return cf_lock(mode, true, NULL);
+	return cf_lock_observed(mode, true, NULL);
 }
 
 bool
@@ -387,7 +447,7 @@ cluster_cf_lock_poll_owned(LOCKMODE mode, const void *caller)
 	if (caller == NULL || !cluster_shared_config
 		|| (MyBackendType != B_LMON && MyBackendType != B_LMS))
 		return false;
-	return cf_lock(mode, true, caller);
+	return cf_lock_observed(mode, true, caller);
 }
 
 bool

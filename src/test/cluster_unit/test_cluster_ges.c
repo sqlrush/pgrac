@@ -354,6 +354,8 @@ cluster_shmem_register_region(const void *r pg_attribute_unused())
  * ============================================================ */
 
 int cluster_node_id = 0;
+bool cluster_trace_control_config = false;
+volatile uint32 CritSectionCount;
 static uint64 stub_current_epoch = 0;
 static bool stub_authority_managed = false;
 static bool stub_serving_ready = false;
