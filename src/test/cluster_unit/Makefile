@@ -9294,6 +9294,9 @@ test_cluster_cold_source_completion.inc: $(top_srcdir)/src/backend/cluster/clust
 	mv $@.tmp $@
 
 test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_test.h $(CLUSTER_COLD_STARTUP_O) \
+		test_cluster_recovery_duty_compare.inc \
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
+		$(top_builddir)/src/common/libpgcommon.a \
 		test_cluster_cold_source_completion.inc \
 		test_cluster_cold_endpoints.h test_cluster_cold_recovery_xid_core.o \
 		test_cluster_cold_recovery_replay_core.o \
@@ -9305,7 +9308,9 @@ test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_te
 		cluster_unit_port_stubs.o $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_STARTUP_O) \
 		test_cluster_cold_recovery_xid_core.o test_cluster_cold_recovery_replay_core.o \
-		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -lcrypto -o $@
 
 D_COLD_REFAIL_O = test_cluster_cold_recovery_refail_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)
 

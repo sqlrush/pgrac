@@ -226,12 +226,14 @@ cluster_control_root_identity_equal(const ClusterControlRootIdentity *left,
 	return left != NULL && right != NULL && memcmp(left, right, sizeof(*left)) == 0;
 }
 
+#ifndef CLUSTER_COLD_NATIVE_DUTY_COMPARE
 ClusterRecoveryDutyCompare
 cluster_recovery_duty_key_compare(const ClusterRecoveryDutyKey *a, const ClusterRecoveryDutyKey *b)
 {
 	return memcmp(a, b, sizeof(*a)) == 0 ? CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
 										 : CLUSTER_RECOVERY_DUTY_COMPARE_DIFFERENT;
 }
+#endif
 
 ClusterControlRootResult
 cluster_control_root_lookup_owner_by_node_runtime(int32 node, ClusterControlRootIdentity *identity,

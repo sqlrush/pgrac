@@ -142,8 +142,13 @@ cold_own_root(ClusterColdTypedV1 *typed, uint16 own_thread, ColdRoot *out)
 															   &out->root, &out->token);
 	if ((result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		 && result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
-		|| !cluster_recovery_duty_key_valid_v1(&identity) || identity.origin_thread_id != own_thread
-		|| cluster_recovery_duty_key_compare(&identity, &out->root.identity)
+		/* PRE2's canonical reader already authenticates its native v2 claim.
+		 * Its CRC is not the legacy claim CRC reconstructed by the v1 helper.
+		 * Use the same claim domain as the original foreign-root consumer. */
+		|| !cluster_recovery_duty_key_valid_for_claim(&identity, cluster_shared_config)
+		|| identity.origin_thread_id != own_thread
+		|| cluster_recovery_duty_key_compare_for_claim(&identity, &out->root.identity,
+													  cluster_shared_config)
 			   != CLUSTER_RECOVERY_DUTY_COMPARE_EXACT) {
 		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
 					"own thread %u root is unreadable (result %d)", (unsigned)own_thread,

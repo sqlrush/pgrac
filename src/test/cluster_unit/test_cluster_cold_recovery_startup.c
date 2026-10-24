@@ -54,6 +54,7 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+bool cluster_shared_config;
 
 void
 ExceptionalCondition(const char *condition_name, const char *file_name, int line_number)
@@ -62,7 +63,9 @@ ExceptionalCondition(const char *condition_name, const char *file_name, int line
 	abort();
 }
 
+#define CLUSTER_COLD_NATIVE_DUTY_COMPARE 1
 #include "test_cluster_cold_recovery_startup_boundary.h"
+#include "test_cluster_recovery_duty_compare.inc"
 #include "test_cluster_cold_source_completion.inc"
 #include "test_cluster_cold_endpoints.h"
 
@@ -3516,10 +3519,75 @@ UT_TEST(test_checkpoint_export_clears_unsealed_and_failed_output)
 	cluster_cold_typed_destroy_v1(&typed);
 }
 
+UT_TEST(test_prepare_accepts_native_v2_own_claim_without_legacy_crc)
+{
+	for (unsigned native_crc = 0; native_crc < 2; native_crc++) {
+		ClusterColdTypedV1 *typed;
+		fixture();
+		cluster_shared_config = true;
+		roots[1].identity.thread_claim_crc32c = 0;
+		if (native_crc) {
+			ClusterWalThreadClaimV2 claim = {0};
+			uint8 bytes[CLUSTER_WAL_CLAIM_V2_BYTES];
+			claim.identity = roots[1].identity;
+			claim.database_incarnation = 42;
+			claim.config_generation = 1;
+			claim.claim_generation = 7;
+			UT_ASSERT_EQ(cluster_wal_claim_v2_encode(&claim, bytes), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+			for (unsigned i = 0; i < 4; i++)
+				roots[1].identity.thread_claim_crc32c |= (uint32)bytes[104 + i] << (8 * i);
+			UT_ASSERT(roots[1].identity.thread_claim_crc32c != 0);
+		}
+		restart_ref.claim.identity = roots[1].identity;
+		native_checkpoint[1].source.claim.identity = roots[1].identity;
+		UT_ASSERT(!cluster_recovery_duty_key_valid_v1(&roots[1].identity));
+		UT_ASSERT(cluster_recovery_duty_key_valid_for_claim(&roots[1].identity, true));
+		typed = prepare(0x800);
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+		UT_ASSERT_NOT_NULL(typed->plan);
+		cluster_cold_typed_destroy_v1(&typed);
+		cluster_shared_config = false;
+	}
+}
+
+UT_TEST(test_prepare_retains_legacy_own_claim_crc_requirement)
+{
+	ClusterColdTypedV1 *typed;
+	fixture();
+	cluster_shared_config = false;
+	roots[1].identity.thread_claim_crc32c = 0;
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_PARTICIPANT_INVALID);
+	UT_ASSERT_NULL(typed->plan);
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
+UT_TEST(test_prepare_native_v2_own_claim_still_requires_exact_physical_identity)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ClusterColdTypedV1 *typed;
+		fixture();
+		cluster_shared_config = true;
+		roots[1].identity.thread_claim_crc32c = 0;
+		if (fault == 0) roots[1].identity.origin_owner_incarnation = 0;
+		if (fault == 1) roots[1].identity.authority_uuid[6] = 0;
+		if (fault == 2) roots[1].identity.origin_thread_id = 2;
+		if (fault == 3) roots[1].identity.reserved60 = 1;
+		typed = prepare(0x800);
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_PARTICIPANT_INVALID);
+		UT_ASSERT_NULL(typed->plan);
+		cluster_cold_typed_destroy_v1(&typed);
+		cluster_shared_config = false;
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(124);
+	UT_PLAN(127);
+	UT_RUN(test_prepare_accepts_native_v2_own_claim_without_legacy_crc);
+	UT_RUN(test_prepare_retains_legacy_own_claim_crc_requirement);
+	UT_RUN(test_prepare_native_v2_own_claim_still_requires_exact_physical_identity);
 	UT_RUN(test_own_c0_dispatch_uses_restart_source_and_original_target);
 	UT_RUN(test_own_c0_source_or_target_refusal_never_calls_owner);
 	UT_RUN(test_own_c0_rechecks_restart_and_target_after_owner);
