@@ -8842,15 +8842,18 @@ test_cluster_cr_coordinator: test_cluster_cr_coordinator.c unit_test.h \
 # Links cluster_xid_stripe.o standalone; stubs ReadNextFullTransactionId.
 CLUSTER_XID_STRIPE_O = $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o
 test_cluster_xid_allocation.inc: $(top_srcdir)/src/backend/access/transam/varsup.c \
-		$(top_srcdir)/src/backend/access/transam/transam.c Makefile
+		$(top_srcdir)/src/backend/access/transam/transam.c \
+		$(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
 	awk '/^GetNewTransactionId\(/ { print "FullTransactionId"; emit=1; found++ } \
 	     /^TransactionId(Precedes|FollowsOrEquals)\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $(filter %.c,$^) > $@.tmp
+	     /^ProcArrayGetActiveFullXidSample\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 4) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_xid_allocation: test_cluster_xid_allocation.c unit_test.h \
-		test_cluster_xid_allocation.inc $(CLUSTER_XID_STRIPE_O) \
-		$(top_srcdir)/src/include/storage/proc.h
+		test_cluster_xid_allocation.inc test_cluster_pgproc_active_types.inc $(CLUSTER_XID_STRIPE_O) \
+		$(top_srcdir)/src/include/storage/proc.h \
+		$(top_srcdir)/src/include/storage/procarray.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Exercise the original recovery -> seed -> claim -> WAL gate. Dependency
