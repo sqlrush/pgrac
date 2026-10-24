@@ -3373,6 +3373,7 @@ UT_TEST(test_terminal_read_native_error_keeps_output_zero_and_custody_dead)
 #include "test_cluster_relmap_origin_build.inc"
 #include "test_cluster_relmap_execution_custody.inc"
 #include "test_cluster_relmap_execution_targets.inc"
+#include "test_cluster_relmap_execution_observe.inc"
 
 int
 main(int argc, char **argv)
@@ -3381,7 +3382,15 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(97);
+	UT_PLAN(105);
+	UT_RUN(test_execution_observe_complete_wal_and_physical_union);
+	UT_RUN(test_execution_observe_missing_gates_and_invalid_source);
+	UT_RUN(test_execution_observe_fresh_output_aliases_and_budgets);
+	UT_RUN(test_execution_observe_storage_refusal_and_error_cleanup);
+	UT_RUN(test_execution_observe_wal_refusal_and_error_cleanup);
+	UT_RUN(test_execution_observe_physical_read_and_owner_drift_cleanup);
+	UT_RUN(test_execution_observe_physical_change_never_publishes);
+	UT_RUN(test_execution_observe_feeds_original_cold_census);
 	UT_RUN(test_execution_targets_preserve_real_wal_missing_and_short_files);
 	UT_RUN(test_execution_targets_missing_initial_gates_leave_root_unchanged);
 	UT_RUN(test_execution_targets_invalid_source_leaves_unstarted_root);

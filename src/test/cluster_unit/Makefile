@@ -3455,12 +3455,17 @@ test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
 		test_cluster_relmap_origin_build.inc \
 		test_cluster_relmap_execution_custody.inc \
 		test_cluster_relmap_execution_targets.inc \
+		test_cluster_relmap_execution_observe.inc test_cluster_relmap_observation_namespace.o \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_terminal_scan.h \
 		test_cluster_relmap_retained_census.o test_cluster_relmap_pending_product.o \
 		test_cluster_relmap_pending_side_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o
+# Read faults affect only the real namespace reader in this retained-WAL unit.
+test_cluster_relmap_observation_namespace.o: $(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Dpread=test_relmap_observation_pread -c $< -o $@
 # The collector executes normally; inject only its ERROR boundary in this fixture.
 test_cluster_relmap_retained_census.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_retention_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
@@ -3517,7 +3522,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relma
 		$(if $(filter test_cluster_relmap_retained_wal,$@),$(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_census.o test_cluster_relmap_pending_product.o test_cluster_relmap_pending_side_product.o $(top_builddir)/src/backend/cluster/cluster_relmap_retention.o) \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_root_set.o \
-		$(top_builddir)/src/backend/cluster/cluster_recovery_namespace.o \
+		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_observation_namespace.o,$(top_builddir)/src/backend/cluster/cluster_recovery_namespace.o) \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_wal_targets.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_record_hash.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_native_scan.o \

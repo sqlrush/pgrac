@@ -940,6 +940,78 @@ cluster_relmap_recovery_root_targets_cold_v1(ClusterRecoveryRootSet *roots,
 	return accepted;
 }
 
+bool
+cluster_relmap_recovery_root_observe_cold_v1(const ClusterRelmapRecoverySourceObservationV1 *source,
+											 size_t memory_budget, size_t payload_budget,
+											 ClusterRelmapRecoveryRootObservationV1 *out)
+{
+	ClusterRelmapRecoverySourceObservationV1 selected;
+	ClusterRecoveryRootSet *volatile roots = NULL;
+	int volatile fd = -1;
+	volatile bool accepted = false;
+
+	if (out == NULL || source == NULL || memory_budget == 0 || payload_budget == 0
+		|| recovery_overlap(out, sizeof(*out), source, sizeof(*source)))
+		return false;
+	for (size_t i = 0; i < sizeof(*out); i++)
+		if (((const unsigned char *)out)[i] != 0)
+			return false;
+	selected = *source;
+	PG_TRY();
+	{
+		do {
+			ClusterRelmapRecoveryRootObservationV1 observed = { 0 };
+			ClusterRecoveryRootsEvent event;
+			ClusterRecoveryRootsResult result;
+
+			fd = cluster_relmap_recovery_root_open_cold_v1(&selected);
+			if (fd < 0 || memcmp(source, &selected, sizeof(selected)) != 0)
+				break;
+			result = cluster_recovery_root_set_begin(
+				fd, selected.source.claim.identity.system_identifier,
+				selected.source.claim.database_incarnation,
+				selected.source.claim.identity.storage_uuid, memory_budget,
+				(ClusterRecoveryRootSet **)&roots);
+			if (result != CLUSTER_RECOVERY_ROOTS_MORE
+				|| !cluster_relmap_recovery_root_targets_cold_v1(
+					(ClusterRecoveryRootSet *)roots, &selected, payload_budget, &observed.targets))
+				break;
+			/* Complete target union precedes the first physical step. The
+			 * original source owner brackets both full byte observations. */
+			while (result < CLUSTER_RECOVERY_ROOTS_OBSERVED) {
+				CHECK_FOR_INTERRUPTS();
+				if (!recovery_root_targets_context()
+					|| memcmp(source, &selected, sizeof(selected)) != 0)
+					break;
+				result = cluster_recovery_root_set_step((ClusterRecoveryRootSet *)roots, &event);
+			}
+			if (result != CLUSTER_RECOVERY_ROOTS_OBSERVED
+				|| !cluster_recovery_root_set_storage_matches(
+					(ClusterRecoveryRootSet *)roots,
+					selected.source.claim.identity.system_identifier,
+					selected.source.claim.database_incarnation,
+					selected.source.claim.identity.storage_uuid)
+				|| !recovery_root_owner_current(&selected)
+				|| memcmp(source, &selected, sizeof(selected)) != 0)
+				break;
+			observed.roots = (ClusterRecoveryRootSet *)roots;
+			observed.root_fd = fd;
+			*out = observed;
+			accepted = true;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		if (!accepted) {
+			cluster_recovery_root_set_destroy((ClusterRecoveryRootSet *)roots);
+			if (fd >= 0)
+				(void)CloseTransientFile(fd);
+		}
+	}
+	PG_END_TRY();
+	return accepted;
+}
+
 static bool
 terminal_execution_visit(const ClusterWalRecoveryCheckpointV1 *checkpoint,
 						 const ClusterControlRootSnapshot *root, uint64 serial,
