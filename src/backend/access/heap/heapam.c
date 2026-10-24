@@ -20877,6 +20877,14 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 		|| !FullTransactionIdEquals(bounds.freeze_limit, freeze_limit_full)
 		|| bounds.horizon_scn != horizon_scn)
 		return false;
+	/* Reject an obsolete capture before attempting the original writer's
+	 * restoration. This only checks saved bytes; the locked kernel still
+	 * compares the live page and the original final identity fence. */
+	if (cluster_heap_freeze_validate_page_v1(input, &fence->identity,
+		fence->block, (Page)input->image.data) != CLUSTER_HEAP_FREEZE_PAGE_MATCHED
+		|| PageGetLSN((Page)input->image.data) != fence->page_lsn
+		|| ((PageHeader)input->image.data)->pd_block_scn != fence->page_version)
+		return false;
 	/* Plan only from the caller's immutable captured inputs. Finish the
 	 * whole batch before restoring a writer or taking its local content X;
 	 * the locked kernel still rechecks every physical row and final fence. */

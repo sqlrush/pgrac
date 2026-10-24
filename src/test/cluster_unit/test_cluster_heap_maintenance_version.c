@@ -2773,10 +2773,53 @@ UT_TEST(test_recapture_retires_previous_bound_sources)
 	UT_ASSERT(f.input.freeze_policy == NULL && f.input.freeze_cohort == NULL);
 }
 
+UT_TEST(test_xmin_capture_refusal_precedes_writer_resume)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int released = 0; released < 2; released++) {
+			for (int variant = 0; variant < 16; variant++) {
+				QualifiedXminFixture f;
+				ClusterHeapFreezeXminTargetV1 targets[3];
+
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
+				if (released) { fixture_release_original_writer(); resume_allowed = true; }
+				switch (variant) {
+				case 0: f.input.block = InvalidBlockNumber; break;
+				case 1: f.input.block++; break;
+				case 2: f.input.identity.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED; break;
+				case 3: f.input.identity.sequence++; break;
+				case 4: f.input.identity.key.system_identifier++; break;
+				case 5: f.input.identity.key.database_incarnation++; break;
+				case 6: f.input.identity.key.storage_uuid[0] ^= 1; break;
+				case 7: f.input.identity.incarnation[0] ^= 1; break;
+				case 8: f.input.identity.operation++; break;
+				case 9: f.input.max_offset++; break;
+				case 10: f.input.normal_tuples++; break;
+				case 11: f.input.multi_tuples++; break;
+				case 12: ((PageHeader)f.input.image.data)->pd_lower = SizeOfPageHeaderData - 1; break;
+				case 13: f.input.identity.key.locator.relNumber++; break;
+				case 14: PageSetLSN(f.input.image.data, f.fence.page_lsn + 1); break;
+				case 15: ((PageHeader)f.input.image.data)->pd_block_scn++; break;
+				}
+				UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 2)
+					: qualified_xmin_apply(&f, 0)));
+				UT_ASSERT_EQ(conditional_resumes + conditional_unlocks, 0);
+				UT_ASSERT_EQ(writer_checks + route_checks + admission_checks, 0);
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+				UT_ASSERT_EQ(backend_pin_count, 1);
+				UT_ASSERT(f.admission.entered && local_x == !released && !resumed_writer);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(77);
+	UT_PLAN(78);
+	UT_RUN(test_xmin_capture_refusal_precedes_writer_resume);
 	UT_RUN(test_xmin_apply_requires_same_bound_sources);
 	UT_RUN(test_xmin_rechecks_same_bound_sources_after_final_target);
 	UT_RUN(test_recapture_retires_previous_bound_sources);
