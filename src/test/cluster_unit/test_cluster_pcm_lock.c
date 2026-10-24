@@ -577,6 +577,12 @@ static bool fake_cv_timed_sleep_timed_out = false;
 static bool fake_cv_prepared = false;
 static bool fake_cv_signaled = false;
 static uint32 fake_cv_sleep_wait_event = 0;
+static bool fake_cv_shutdown_on_sleep = false;
+static bool fake_error_use_pg_exception_stack = false;
+static int fake_last_sqlerrcode = 0;
+volatile sig_atomic_t ProcDiePending = false;
+volatile uint32 InterruptHoldoffCount = 0;
+volatile uint32 CritSectionCount = 0;
 static void (*fake_cv_prepare_hook)(void) = NULL;
 static struct {
 	BufferTag tag;
@@ -773,6 +779,7 @@ reset_fake_pcm_runtime(int max_entries)
 	fake_lwlock_conditional_fail_once = false;
 	ut_wait_event_info_storage = 0;
 	ut_ereport_fired_count = 0;
+	fake_last_sqlerrcode = 0;
 	ut_ereport_jump_armed = false;
 	fake_cv_init_count = 0;
 	fake_cv_prepare_count = 0;
@@ -784,6 +791,7 @@ reset_fake_pcm_runtime(int max_entries)
 	fake_cv_prepared = false;
 	fake_cv_signaled = false;
 	fake_cv_sleep_wait_event = 0;
+	fake_cv_shutdown_on_sleep = false;
 	fake_cv_prepare_hook = NULL;
 	fake_cv_wake_release.armed = false;
 	fake_cv_wake_pending_x_clear.armed = false;
@@ -1167,6 +1175,10 @@ ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(), long ti
 	fake_cv_sleep_wait_event = wait_event_info;
 	fake_cv_timed_sleep_timed_out = !fake_cv_signaled;
 	fake_cv_signaled = false;
+	if (fake_cv_shutdown_on_sleep) {
+		fake_cv_shutdown_on_sleep = false;
+		ProcDiePending = true;
+	}
 	return fake_cv_timed_sleep_timed_out;
 }
 
@@ -1374,13 +1386,16 @@ errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_un
 		  const char *funcname pg_attribute_unused())
 {
 	ut_ereport_fired_count++;
+	if (fake_error_use_pg_exception_stack && PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
 	if (ut_ereport_jump_armed)
 		siglongjmp(ut_ereport_jump, 1);
 }
 
 int
-errcode(int sqlerrcode pg_attribute_unused())
+errcode(int sqlerrcode)
 {
+	fake_last_sqlerrcode = sqlerrcode;
 	return 0;
 }
 
@@ -4716,6 +4731,74 @@ UT_TEST(test_resource_x_round_wait_rechecks_progress_in_finite_slices)
 					 &assertion, 0, 17, 31, 77, 51, 61, 2000, UINT64_MAX - 1, 50),
 				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(cluster_pcm_rx_take_wait_failure(), PCM_RX_WAIT_FAILURE_NONE);
+}
+
+/* Exercise the real registered wait and its PG_FINALLY, rather than a
+ * standalone interrupt predicate. A content LWLock's holdoff must remain
+ * intact while ERROR returns through exact CV/entry-pin cleanup. */
+UT_TEST(test_resource_x_shutdown_unwinds_bootstrap_cv_and_pin)
+{
+	BackendType saved_backend = MyBackendType;
+	for (int cut = 0; cut < 5; cut++) {
+		BufferTag tag = make_tag(6480 + cut);
+		ResourceXAssertion assertion;
+		ResourceXDecodedFrame request;
+		ResourceXAcquisitionRef terminal;
+		ResourceXBootstrapRoundFailureSnapshot after;
+		struct StopPcmEntryLayout *entry;
+		volatile bool caught = false;
+
+		reset_fake_pcm_runtime(4);
+		cluster_node_id = 1;
+		fake_pcm_clock_us = 100000;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(resource_x_assertion_init(&tag, 1, &assertion));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+						 &assertion, 0, 17, 31, 77, 51, 61, 500000, 5000, 100000, 2000,
+						 false, 0, &request, &terminal),
+					 RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+		/* Cuts 0/1 are SIGTERM before/after sleep. The remaining cuts
+		 * must keep the existing background/native/critical behavior. */
+		MyBackendType = cut == 2 ? B_LMS : B_BACKEND;
+		InterruptHoldoffCount = cut == 3 ? 0 : 1;
+		CritSectionCount = cut == 4 ? 1 : 0;
+		ProcDiePending = cut != 1;
+		fake_cv_shutdown_on_sleep = cut == 1;
+		fake_error_use_pg_exception_stack = true;
+		PG_TRY();
+		{
+			(void)cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
+				&assertion, 0, 17, 31, 77, 51, 61, 2000, UINT64_MAX - 1, 50);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		fake_error_use_pg_exception_stack = false;
+		UT_ASSERT_EQ(caught, cut < 2);
+		if (caught)
+			UT_ASSERT_EQ(fake_last_sqlerrcode, ERRCODE_ADMIN_SHUTDOWN);
+		UT_ASSERT(ProcDiePending); /* native disconnect still owns SIGTERM */
+		UT_ASSERT_EQ(InterruptHoldoffCount, cut == 3 ? 0 : 1);
+		UT_ASSERT_EQ(CritSectionCount, cut == 4 ? 1 : 0);
+		UT_ASSERT_EQ(fake_cv_sleep_count, cut == 0 ? 0 : 1);
+		UT_ASSERT_EQ(fake_cv_prepare_count, fake_cv_cancel_count);
+		UT_ASSERT_EQ(fake_lwlock_depth, 0);
+		entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+		UT_ASSERT_NOT_NULL(entry);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pin_count), 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->wait_refcount), 0);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
+						 &assertion, 0, 17, 31, 77, 51, 61, 50, &after),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(after.head_failure_reason, RESOURCE_X_HEAD_FAILURE_NONE);
+		ProcDiePending = false;
+		InterruptHoldoffCount = 0;
+		CritSectionCount = 0;
+	}
+	MyBackendType = saved_backend;
 }
 
 UT_TEST(test_resource_x_reply_wait_metrics_are_shared_and_bucket_exact)
@@ -24497,7 +24580,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(368);
+	UT_PLAN(369);
 	/* Observe the actual startup state before any runtime fixture overrides
 	 * the postmaster GUC or initializes shared PCM state and counters. */
 	UT_RUN(test_pcm_grd_max_entries_default_is_minus_one);
@@ -24599,6 +24682,7 @@ main(void)
 	UT_RUN(test_resource_x_exact_ack_sample_before_retry_is_not_failure);
 	UT_RUN(test_resource_x_head_budget_and_owned_progress_are_independent);
 	UT_RUN(test_resource_x_round_wait_rechecks_progress_in_finite_slices);
+	UT_RUN(test_resource_x_shutdown_unwinds_bootstrap_cv_and_pin);
 	UT_RUN(test_resource_x_reply_wait_metrics_are_shared_and_bucket_exact);
 	UT_RUN(test_resource_x_expired_follower_cannot_cancel_live_head);
 	UT_RUN(test_resource_x_post_ack_rejected_follower_preserves_shared_head);

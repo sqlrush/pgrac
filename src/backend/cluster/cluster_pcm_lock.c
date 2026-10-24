@@ -5202,6 +5202,21 @@ pcm_entry_wait_context_cleanup(PcmEntryWaitContext *context)
 		pcm_entry_ref_release(&context->ref);
 }
 
+static void
+pcm_frontend_wait_check_shutdown(void)
+{
+	/* An outer buffer content LWLock defers native SIGTERM processing.
+	 * At these unlocked wait boundaries ERROR can unwind the exact CV/entry
+	 * reference through PG_FINALLY before native LWLock/transaction cleanup.
+	 * Never clear holdoff counters or the shutdown flag and resume work, and
+	 * never throw through a critical section or change a background role. */
+	if (MyBackendType == B_BACKEND && ProcDiePending && InterruptHoldoffCount > 0
+		&& CritSectionCount == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_ADMIN_SHUTDOWN),
+				 errmsg("canceling statement during administrator shutdown while waiting for cluster buffer ownership")));
+}
+
 /* One backend can have at most one ConditionVariable sleep registration.
  * Preserve that registration across the executor probe/wait API boundary,
  * but retain only the exact pinned handle and logical Resource-X identity. */
@@ -5398,8 +5413,10 @@ cluster_pcm_lock_resource_x_executor_wait_exact(const ResourceXAcquisitionRef *r
 		if (cluster_trace_tx_identity)
 			pcm_trace_wait(entry, CLWAIT_SITE_PCM_EXECUTOR, PCM_LOCK_MODE_X,
 				-1, ref->assertion.requester_node, 0, false, false, NULL);
+		pcm_frontend_wait_check_shutdown();
 		(void)ConditionVariableTimedSleep(&entry->wait_cv, timeout_ms,
 										  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+		pcm_frontend_wait_check_shutdown();
 	cluster_content_trace_wait_clear(CLCONTENT_PCM);
 		if (!pcm_entry_ref_identity_exact(&pcm_resource_x_executor_wait_context.ref)) {
 			pcm_resource_x_reconfig_block();
@@ -7932,7 +7949,9 @@ pcm_lock_acquire_local_pinned(BufferTag tag, PcmLockMode mode, PcmAuthoritySnaps
 		if (cluster_trace_tx_identity)
 			pcm_trace_wait(entry, CLWAIT_SITE_PCM_COMPATIBLE, mode, -1,
 				cluster_node_id, 0, false, false, NULL);
+		pcm_frontend_wait_check_shutdown();
 		ConditionVariableSleep(&entry->wait_cv, WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+		pcm_frontend_wait_check_shutdown();
 		cluster_content_trace_wait_clear(CLCONTENT_PCM);
 		if (!pcm_entry_ref_identity_exact(&wait_context->ref)) {
 			pcm_resource_x_reconfig_block();
@@ -15972,8 +15991,10 @@ round_wait_predicate_done:
 		if (cluster_trace_tx_identity)
 			pcm_trace_wait(entry, CLWAIT_SITE_PCM_BOOTSTRAP, PCM_LOCK_MODE_X,
 				current_master_node, assertion->requester_node, observed_attempt, true, false, &wait_request);
+		pcm_frontend_wait_check_shutdown();
 		(void)ConditionVariableTimedSleep(&entry->wait_cv, timeout_ms,
 										  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+		pcm_frontend_wait_check_shutdown();
 	cluster_content_trace_wait_clear(CLCONTENT_PCM);
 		if (!pcm_entry_ref_identity_exact(&wait_context.ref)) {
 			pcm_resource_x_reconfig_block();
@@ -16137,8 +16158,10 @@ cluster_pcm_lock_resource_x_predecessor_wait_exact(const BufferTag *tag, int32 c
 		if (cluster_trace_tx_identity)
 			pcm_trace_wait(entry, CLWAIT_SITE_PCM_PREDECESSOR, PCM_LOCK_MODE_X,
 				current_master_node, cluster_node_id, 0, false, false, &wait_request);
+		pcm_frontend_wait_check_shutdown();
 		(void)ConditionVariableTimedSleep(&entry->wait_cv, timeout_ms,
 										  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+		pcm_frontend_wait_check_shutdown();
 		cluster_content_trace_wait_clear(CLCONTENT_PCM);
 		if (!pcm_entry_ref_identity_exact(&wait_context.ref)) {
 			pcm_resource_x_reconfig_block();
@@ -17375,8 +17398,10 @@ cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
 		if (cluster_trace_tx_identity)
 			pcm_trace_wait(entry, CLWAIT_SITE_PCM_INSTALL, PCM_LOCK_MODE_X,
 				continuation->master_node, continuation->requester_node, 0, false, false, &wait_request);
+		pcm_frontend_wait_check_shutdown();
 		(void)ConditionVariableTimedSleep(&entry->wait_cv, sleep_ms,
 										  WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+		pcm_frontend_wait_check_shutdown();
 	cluster_content_trace_wait_clear(CLCONTENT_PCM);
 		if (!pcm_entry_ref_identity_exact(&wait_context.ref)) {
 			pcm_resource_x_reconfig_block();

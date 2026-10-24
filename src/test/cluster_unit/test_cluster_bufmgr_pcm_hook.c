@@ -87,6 +87,9 @@ bool cluster_enabled = true; /* PGRAC: spec-2.31 D2 helper depends on this */
 bool IsUnderPostmaster = false;
 BackendType MyBackendType = B_BACKEND;
 AuxProcType MyAuxProcType = NotAnAuxProcess;
+volatile sig_atomic_t ProcDiePending = false;
+volatile uint32 InterruptHoldoffCount = 0;
+volatile uint32 CritSectionCount = 0;
 
 /* No shared reconfiguration or DATA receipt is supplied by this lock-order
  * fixture. Actual receipt/physical owners run in test_cluster_page_data. */
