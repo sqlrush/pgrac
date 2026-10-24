@@ -571,7 +571,9 @@ undo_horizon_sample_local_report(ClusterUndoRetentionSample *out)
 
 /* Separate observation lane: neither sending nor receiving V2 enables the
  * global F fold or native freeze/truncation. V1 retains its original L2 path.
- * Each attempted V2 send consumes a shared sequence even if transport fails. */
+ * Each attempted V2 send consumes a shared sequence even if transport fails.
+ * An incomplete identity cover cannot export F; refuse it before capability
+ * sampling or consuming a sequence. Read-only cohort observations retain it. */
 static void
 undo_horizon_send_v2(int32 peer, const ClusterUndoCleanerActiveSample *active,
 					 const ClusterUndoRetentionSample *h)
@@ -583,6 +585,7 @@ undo_horizon_send_v2(int32 peer, const ClusterUndoCleanerActiveSample *active,
 	uint64 members = peer < 64 ? fence->admitted_members_lo : fence->admitted_members_hi;
 
 	if (active->scan.status != CTRC_ACTIVE_SCAN_COMPLETE || active->sample_id == 0
+		|| active->scan.unqualified_entries != 0
 		|| fence->local_node_id != cluster_node_id || (members & (UINT64_C(1) << (peer % 64))) == 0
 		|| fence->admitted_incarnation[peer] == 0 || scn_time_cmp(h->horizon_scn, h->clock_scn) > 0
 		|| UndoHorizonShmem->report_sequence == UINT64_MAX
@@ -866,6 +869,7 @@ cluster_heap_freeze_watermark_sample(ClusterHeapFreezeWatermark *out)
 			|| !cluster_semantic_activation_active_sample_current(&fence)
 			|| !cluster_undo_cleaner_active_sample(&active)
 			|| active.sample_id != active_sample_id
+			|| active.scan.unqualified_entries != 0
 			|| memcmp(&active.admission_fence, &fence, sizeof(fence)) != 0
 			|| !cluster_undo_cleaner_active_sample_current(&active))
 			continue;
@@ -1084,6 +1088,7 @@ undo_horizon_publish_freeze_watermark(const ClusterHeapFreezeCohortObservation *
 	future = FullTransactionIdFromU64(cohort->future_full_xid_max);
 	active_min = FullTransactionIdFromU64(cohort->active_full_xid_min);
 	if (active.scan.status != CTRC_ACTIVE_SCAN_COMPLETE || active.sample_id == 0
+		|| active.scan.unqualified_entries != 0 || cohort->local_unqualified_entries != 0
 		|| active.sample_id != observed->active_sample_id || active.worker_pid <= 0
 		|| !FullTransactionIdIsValid(active.scan.future_full)
 		|| !FullTransactionIdIsValid(active.scan.min_full)

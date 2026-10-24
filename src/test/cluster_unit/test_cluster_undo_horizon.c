@@ -959,6 +959,30 @@ reset_v2_sender(void)
 	test_horizon_now += 1000001;
 }
 
+UT_TEST(test_v2_sender_withholds_unqualified_identity_without_consuming_sequence)
+{
+	const uint64 unknown[] = { 1, UINT64_MAX };
+	unsigned variant;
+
+	for (variant = 0; variant < lengthof(unknown); variant++) {
+		unsigned v1_sends;
+
+		reset_v2_sender();
+		v1_sends = test_horizon_sends;
+		test_sender_sample.scan.unqualified_entries = unknown[variant];
+		cluster_undo_horizon_lmon_tick();
+		UT_ASSERT_EQ(test_horizon_sends, v1_sends + 3);
+		UT_ASSERT_EQ(test_v2_sends, 0);
+		UT_ASSERT_EQ(test_horizon_store.report_sequence, 0);
+		test_sender_sample.scan.unqualified_entries = 0;
+		test_horizon_now += 1000001;
+		cluster_undo_horizon_lmon_tick();
+		UT_ASSERT_EQ(test_horizon_sends, v1_sends + 6);
+		UT_ASSERT_EQ(test_v2_sends, 1);
+		UT_ASSERT_EQ(test_v2_sent.report_sequence, 1);
+	}
+}
+
 UT_TEST(test_v2_sender_uses_complete_worker_sample_and_same_typed_h_cut)
 {
 	unsigned v1_sends = test_horizon_sends;
@@ -2328,6 +2352,79 @@ UT_TEST(test_v2_lmon_publishes_identity_bound_global_watermark)
 	UT_ASSERT_EQ(watermark.admitted_members_hi, 0);
 }
 
+UT_TEST(test_v2_unknown_local_identity_blocks_new_watermark_not_observation)
+{
+	ClusterHeapFreezeCohortObservation cohort;
+	ClusterHeapFreezeWatermark watermark, zero = { 0 };
+
+	(void)reset_v2_cohort(false);
+	test_sender_sample.scan.unqualified_entries = 1;
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&cohort),
+				 CLUSTER_HEAP_FREEZE_COHORT_READY);
+	UT_ASSERT_EQ(cohort.local_unqualified_entries, 1);
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_horizon_store.freeze_watermark.publication_sequence, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&test_horizon_store.freeze_watermark_seq), 0);
+	memset(&watermark, 0xa5, sizeof(watermark));
+	UT_ASSERT(!cluster_heap_freeze_watermark_sample(&watermark));
+	UT_ASSERT(memcmp(&watermark, &zero, sizeof(watermark)) == 0);
+	test_sender_sample.scan.unqualified_entries = 0;
+	test_horizon_now += 1000001;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT(cluster_heap_freeze_watermark_sample(&watermark));
+	UT_ASSERT_EQ(watermark.publication_sequence, 1);
+}
+
+UT_TEST(test_v2_publisher_checks_both_identity_coverage_inputs_atomically)
+{
+	ClusterHeapFreezeCohortObservation cohort;
+	UndoHorizonV2MaintenanceObservation observed = { 0 };
+	ClusterHeapFreezeWatermark first;
+	uint32 seq;
+
+	(void)reset_v2_cohort(false);
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&cohort),
+				 CLUSTER_HEAP_FREEZE_COHORT_READY);
+	observed.fence = test_v2_fence;
+	observed.active_sample_id = test_sender_sample.sample_id;
+	UT_ASSERT(undo_horizon_publish_freeze_watermark(&cohort, &observed, test_horizon_now));
+	first = test_horizon_store.freeze_watermark;
+	seq = pg_atomic_read_u32(&test_horizon_store.freeze_watermark_seq);
+	cohort.local_unqualified_entries = UINT64_MAX;
+	UT_ASSERT(!undo_horizon_publish_freeze_watermark(&cohort, &observed, test_horizon_now + 1));
+	UT_ASSERT(memcmp(&first, &test_horizon_store.freeze_watermark, sizeof(first)) == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&test_horizon_store.freeze_watermark_seq), seq);
+	cohort.local_unqualified_entries = 0;
+	test_sender_sample.scan.unqualified_entries = 1;
+	UT_ASSERT(!undo_horizon_publish_freeze_watermark(&cohort, &observed, test_horizon_now + 2));
+	UT_ASSERT(memcmp(&first, &test_horizon_store.freeze_watermark, sizeof(first)) == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&test_horizon_store.freeze_watermark_seq), seq);
+}
+
+UT_TEST(test_v2_watermark_reader_rejects_unknown_identity_and_preserves_candidate)
+{
+	ClusterHeapFreezeWatermark first, out, zero = { 0 };
+	uint32 seq;
+
+	(void)reset_v2_cohort(false);
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT(cluster_heap_freeze_watermark_sample(&first));
+	seq = pg_atomic_read_u32(&test_horizon_store.freeze_watermark_seq);
+	test_sender_sample.scan.unqualified_entries = 1;
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT(!cluster_heap_freeze_watermark_sample(&out));
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	UT_ASSERT(memcmp(&first, &test_horizon_store.freeze_watermark, sizeof(first)) == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&test_horizon_store.freeze_watermark_seq), seq);
+	test_horizon_now += 1000001;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT(memcmp(&first, &test_horizon_store.freeze_watermark, sizeof(first)) == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&test_horizon_store.freeze_watermark_seq), seq);
+	test_sender_sample.scan.unqualified_entries = 0;
+	UT_ASSERT(cluster_heap_freeze_watermark_sample(&out));
+	UT_ASSERT(memcmp(&first, &out, sizeof(out)) == 0);
+}
+
 UT_TEST(test_v2_refused_fold_preserves_watermark_and_identity_failure_blocks_reader)
 {
 	ClusterHeapFreezeWatermark first, after;
@@ -2447,7 +2544,7 @@ UT_TEST(test_v2_lmon_observes_clock_rollback_as_stale)
 int
 main(void)
 {
-	UT_PLAN(88);
+	UT_PLAN(92);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -2494,6 +2591,7 @@ main(void)
 	UT_RUN(test_v2_requires_admitted_peer_in_both_bitmap_halves);
 	UT_RUN(test_v2_sampler_is_bounded_and_f_has_no_age_expiry);
 	UT_RUN(test_original_v1_receiver_remains_separate);
+	UT_RUN(test_v2_sender_withholds_unqualified_identity_without_consuming_sequence);
 	UT_RUN(test_v2_sender_uses_complete_worker_sample_and_same_typed_h_cut);
 	UT_RUN(test_v2_sender_rechecks_capability_and_original_sample_without_stalling_v1);
 	UT_RUN(test_v2_sender_capability_is_independent_of_v1_and_sequence_is_shared);
@@ -2533,6 +2631,9 @@ main(void)
 	UT_RUN(test_v2_summary_refusal_does_not_reuse_observed_values);
 	UT_RUN(test_v2_lmon_observes_once_per_interval_without_an_extra_retention_cut);
 	UT_RUN(test_v2_lmon_publishes_identity_bound_global_watermark);
+	UT_RUN(test_v2_unknown_local_identity_blocks_new_watermark_not_observation);
+	UT_RUN(test_v2_publisher_checks_both_identity_coverage_inputs_atomically);
+	UT_RUN(test_v2_watermark_reader_rejects_unknown_identity_and_preserves_candidate);
 	UT_RUN(test_v2_refused_fold_preserves_watermark_and_identity_failure_blocks_reader);
 	UT_RUN(test_v2_lmon_counts_missing_local_history_without_sending);
 	UT_RUN(test_v2_lmon_records_real_cohort_refusals);
