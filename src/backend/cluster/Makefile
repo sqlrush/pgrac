@@ -290,6 +290,8 @@ OBJS = \
 	cluster_relmap_lock.o \
 	cluster_relmap_owner.o \
 	cluster_relmap_recovery.o \
+	cluster_relmap_checkpoint.o \
+	cluster_relmap_checkpoint_native.o \
 	cluster_relmap_retention.o \
 	cluster_relmap_retention_runtime.o \
 	cluster_relmap_retention_restore.o \

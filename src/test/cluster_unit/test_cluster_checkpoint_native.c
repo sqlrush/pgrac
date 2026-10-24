@@ -854,7 +854,7 @@ publish(void)
 {
 	if (sigsetjmp(error_boundary, 1))
 		return false;
-	ClusterCheckpointV3Publish(&candidate, 220);
+	ClusterCheckpointV3Publish(&candidate, 220, NULL);
 	return true;
 }
 
@@ -1242,7 +1242,7 @@ startup_publish(void)
 {
 	if (sigsetjmp(error_boundary, 1))
 		return false;
-	ClusterCheckpointV3Publish(&candidate, 220);
+	ClusterCheckpointV3Publish(&candidate, 220, NULL);
 	return true;
 }
 

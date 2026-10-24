@@ -6,6 +6,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_relmap_checkpoint.h"
 #include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_wal_cut.h"
@@ -19631,6 +19632,77 @@ v3_retained_checkpoint_fixture(bool shutdown, uint8 before[66048], ClusterContro
 	return lower;
 }
 
+UT_TEST(test_v3_checkpoint_window_binds_original_native_end_and_fence)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		uint8 before[66048], after[66048];
+		ClusterControlRootIdentity self;
+		ClusterControlRootSnapshot out;
+		ClusterControlRootFileToken token;
+		ControlFileData candidate, view, native;
+		ControlRootImage root;
+		uint8 bytes[160], readback[160];
+		ClusterRelmapCheckpointWindow window = { 0 };
+		ClusterRecoveryAnchorRefV2 ref = { 0 };
+		char path[MAXPGPATH];
+		XLogRecPtr lower
+			= v3_retained_checkpoint_fixture(false, before, &self, &candidate);
+		/* This fixture previously needed no XID counters. Bind normal native
+		 * counters in both the candidate and its actual checkpoint WAL. */
+		candidate.checkPointCopy.nextXid = FullTransactionIdFromU64(101);
+		INIT_CRC32C(candidate.crc);
+		COMP_CRC32C(candidate.crc, &candidate, offsetof(ControlFileData, crc));
+		FIN_CRC32C(candidate.crc);
+		v2_checkpoint_wal_record(&self, &candidate, 0);
+		v2_checkpoint_retained_prefix(&self, &candidate, lower);
+		window.system_identifier = self.system_identifier;
+		window.origin = self.origin_node_id;
+		window.database_incarnation = test_checkpoint_prefix_ref.claim.database_incarnation;
+		window.admitted_incarnation = self.origin_owner_incarnation;
+		window.boot_incarnation = cluster_qvotec_get_self_incarnation() + (fault == 3);
+		window.epoch = test_epoch + (fault == 2);
+		window.allocation_next = U64FromFullTransactionId(candidate.checkPointCopy.nextXid);
+		window.last_issued = window.allocation_next - 1;
+		window.native_floor = window.last_issued - 20;
+		UT_ASSERT(cluster_relmap_checkpoint_window_encode_v1(
+			&window, &candidate.checkPointCopy, candidate.checkPoint,
+			test_checkpoint_end + (fault == 1), bytes));
+		if (fault == 4) {
+			memcpy(&out, bytes, 160);
+			UT_ASSERT_EQ(cluster_control_root_v3_checkpoint_window_publish(
+							 &self, &candidate, test_checkpoint_end, (const uint8 *)&out, &out,
+							 &token, &view),
+						 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+			UT_ASSERT(memcmp(&out, bytes, 160) == 0);
+		} else if (fault) {
+			UT_ASSERT_EQ(cluster_control_root_v3_checkpoint_window_publish(
+							 &self, &candidate, test_checkpoint_end, bytes, &out, &token, &view),
+						 CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+			path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+			read_all_or_abort(path, after, sizeof(after));
+			UT_ASSERT(memcmp(before, after, sizeof(before)) == 0);
+		} else {
+			UT_ASSERT_EQ(cluster_control_root_v3_checkpoint_window_publish(
+							 &self, &candidate, test_checkpoint_end, bytes, &out, &token, &view),
+						 0);
+			test_actual_cf = test_cf_mode = ShareLock;
+			UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(&self, &root, &view, &token),
+						 0);
+			ref.identity = self;
+			ref.database_incarnation = root.header.v2.database_incarnation;
+			ref.max_config_generation = root.header.v2.config_generation;
+			ref.anchor_generation = root.refs[self.origin_thread_id - 1].anchor_generation;
+			memcpy(ref.anchor_sha256, root.refs[self.origin_thread_id - 1].anchor_sha256, 32);
+			memcpy(ref.claim_sha256, root.refs[self.origin_thread_id - 1].claim_sha256, 32);
+			UT_ASSERT_EQ(cluster_recovery_anchor_v3_read_native_window_locked(&ref, &view, &native,
+																			  readback),
+						 0);
+			UT_ASSERT(memcmp(bytes, readback, 160) == 0);
+			test_actual_cf = test_cf_mode = NoLock;
+		}
+	}
+}
+
 static char v3_history_path[MAXPGPATH];
 static off_t v3_history_offset;
 
@@ -23391,6 +23463,36 @@ main(int argc, char **argv)
 	if (argc > 1)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_CHECKPOINT_WINDOW") != NULL) {
+		UT_PLAN(25);
+		UT_RUN(test_v3_checkpoint_publish_preserves_pending_and_real_wal_guards);
+		UT_RUN(test_v3_shutdown_observe_uses_native_checkpoint_counters);
+		UT_RUN(test_v3_shutdown_observe_refuses_changed_native_checkpoint_counters);
+		UT_RUN(test_v3_checkpoint_window_binds_original_native_end_and_fence);
+		UT_RUN(test_v3_checkpoint_reads_retained_history_once);
+		UT_RUN(test_v2_checkpoint_advances_one_thread_and_preserves_common);
+		UT_RUN(test_v2_checkpoint_requires_actual_wal_record);
+		UT_RUN(test_v2_checkpoint_accepts_actual_zero_crc);
+		UT_RUN(test_v2_checkpoint_ignores_obsolete_flush_sidefiles);
+		UT_RUN(test_v2_checkpoint_uses_native_flush_without_sidefile);
+		UT_RUN(test_v2_checkpoint_rechecks_native_input);
+		UT_RUN(test_v2_checkpoint_wal_continuation);
+		UT_RUN(test_v2_checkpoint_rejects_replaced_wal_directory);
+		UT_RUN(test_v2_checkpoint_rejects_replaced_wal_segment);
+		UT_RUN(test_v2_checkpoint_preserves_historical_parameter_requirements);
+		UT_RUN(test_v2_checkpoint_rejects_invalid_parameter_before_max);
+		UT_RUN(test_v2_checkpoint_cannot_invent_parameter_transition_proof);
+		UT_RUN(test_v2_checkpoint_rejects_non_owner_facts_before_io);
+		UT_RUN(test_v2_checkpoint_rejects_unflushed_wrong_tli_and_bad_inputs);
+		UT_RUN(test_v2_checkpoint_cas_and_epoch_races_do_not_overwrite);
+		UT_RUN(test_v2_checkpoint_boundaries_refuse_without_mutation);
+		UT_RUN(test_v2_checkpoint_root_io_failure_keeps_old_selection);
+		UT_RUN(test_v2_checkpoint_postwrite_failure_keeps_fact_but_no_success);
+		UT_RUN(test_v2_checkpoint_projection_follows_root_and_cannot_roll_it_back);
+		UT_RUN(test_v2_checkpoint_error_unwind_releases_owned_work);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_RECOVERY_SYNC") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(test_recovery_checkpoint_selects_native_not_common_counters);
@@ -23554,7 +23656,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(470);
+	UT_PLAN(471);
 	UT_RUN(test_cold_sync_retained_files_under_original_owner_without_cf);
 	UT_RUN(test_cold_sync_each_io_failure_root_race_and_error_discard_output);
 	UT_RUN(test_cold_sync_requires_exact_root_fsync_role_and_disjoint_output);
@@ -23753,6 +23855,7 @@ main(int argc, char **argv)
 	UT_RUN(test_v3_checkpoint_publish_preserves_pending_and_real_wal_guards);
 	UT_RUN(test_v3_shutdown_observe_uses_native_checkpoint_counters);
 	UT_RUN(test_v3_shutdown_observe_refuses_changed_native_checkpoint_counters);
+	UT_RUN(test_v3_checkpoint_window_binds_original_native_end_and_fence);
 	UT_RUN(test_v3_checkpoint_reads_retained_history_once);
 	UT_RUN(test_wal_prefix_identity_recheck_detects_a_changed_namespace);
 	UT_RUN(test_wal_prefix_identity_is_absent_after_a_failed_scan);

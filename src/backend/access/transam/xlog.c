@@ -261,6 +261,7 @@
 #include "cluster/cluster_wal_retained_cut.h" /* PGRAC: S07 retention lower */
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_initdb_base.h"
+#include "cluster/cluster_relmap_checkpoint.h"
 #include "cluster/cluster_wal_writer.h" /* PGRAC: durable group-flush promise */
 #include "cluster/cluster_backup.h" /* PGRAC: spec-6.5 durable backup WAL pin */
 #include "cluster/cluster_tt_durable.h" /* PGRAC: spec-4.8 D1 crash-left ACTIVE resolution */
@@ -8967,7 +8968,8 @@ wait_for_owner:
 }
 
 static void
-ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
+ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end,
+						   const uint8 native_window[160])
 {
 	ClusterWalSourceRef ref;
 	ControlFileData selected;
@@ -9028,6 +9030,9 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 		before = cluster_cf_attempt_sequence();
 		if (pending)
 			result = CLUSTER_CONTROL_ROOT_ADMISSION_PENDING;
+		else if (native_window != NULL)
+			result = cluster_control_root_v3_checkpoint_window_publish(
+				&ref.claim.identity, candidate, end, native_window, &published, &token, &selected);
 		else if (candidate->state == DB_SHUTDOWNED)
 			result = cluster_control_root_v3_shutdown_checkpoint_publish(
 				&ref.claim.identity, candidate, end, &published, &token, &selected);
@@ -9116,6 +9121,8 @@ CreateCheckPoint(int flags)
 	bool		cf_x_taken = false; /* PGRAC: spec-5.6 Dc1 — held CF X to release */
 	bool		fpw_off_transition = false; /* RF-ROOT P7 G1a-2: W5b FPW-off happened this checkpoint */
 	ControlFileData v3_checkpoint;
+	ClusterRelmapCheckpointSampleV1 native_window = { 0 };
+	uint8 native_window_bytes[160] = { 0 };
 #endif
 
 	/*
@@ -9317,6 +9324,13 @@ CreateCheckPoint(int flags)
 	 */
 	if (!cluster_shared_config && (flags & CHECKPOINT_END_OF_RECOVERY) == 0)
 		fpw_off_transition = UpdateFullPageWritesForCheckpoint();
+#endif
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Original writer sampling precedes native critical work and I/O. */
+	if (cluster_shared_config)
+		(void)cluster_relmap_recovery_checkpoint_window_capture(GetWALInsertionTimeLine(),
+																&native_window);
 #endif
 
 	/*
@@ -9752,7 +9766,10 @@ CreateCheckPoint(int flags)
 	/* PGRAC: root publication precedes every post-checkpoint cleanup. No
 	 * outer CF, native content lock or critical section encloses this wait. */
 	if (cluster_shared_config)
-		ClusterCheckpointV3Publish(&v3_checkpoint, recptr);
+		(void)cluster_relmap_recovery_checkpoint_window_finish(
+			&native_window, &checkPoint, ProcLastRecPtr, recptr, native_window_bytes);
+	if (cluster_shared_config)
+		ClusterCheckpointV3Publish(&v3_checkpoint, recptr, native_window_bytes);
 
 	/* PGRAC (S07): with this checkpoint's ROOT published, move the physical
 	 * retention lower forward when the complete retained input allows it.

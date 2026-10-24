@@ -11,6 +11,7 @@ int checkpoint_native_fixture_main(int argc, char **argv);
 #define TT_CHECKPOINT_NATIVE_MAIN checkpoint_native_fixture_main
 #define CheckPointGuts coverage_prior_guts
 #include "test_cluster_tt_checkpoint_native.c"
+#include "cluster/cluster_relmap_checkpoint.h"
 #undef CheckPointGuts
 
 #include <time.h>
@@ -47,6 +48,19 @@ static CheckPoint publish_registered;
 static XLogRecPtr publish_wal_end;
 static uint8 publish_info;
 static XLogRecPtr publish_start, publish_end;
+
+/* This existing TT closure fixture models an unavailable optional D3 sample;
+ * execute the actual final call site outside critical/native target locks. */
+bool
+cluster_relmap_recovery_checkpoint_window_finish(const ClusterRelmapCheckpointSampleV1 *s,
+												 const CheckPoint *cp, XLogRecPtr start,
+												 XLogRecPtr end, uint8 out[160])
+{
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT(!publish_lock_held);
+	memset(out, 0, 160);
+	return false;
+}
 
 static bool
 publish_durable_slot(uint32 index, const TTSlot *expected)
@@ -135,7 +149,8 @@ publish_flush(XLogRecPtr end)
 }
 
 static void
-ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
+ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end,
+						   const uint8 window[160])
 {
 	publish_calls++;
 	publish_order_ok
@@ -196,6 +211,8 @@ publish_checkpoint(XLogRecPtr insert, bool shutdown)
 	int oldXLogAllowed = 1;
 	XLogRecPtr recptr;
 	ControlFileData *checkpoint_control = ControlFile, v3_checkpoint = { 0 };
+	ClusterRelmapCheckpointSampleV1 native_window = { 0 };
+	uint8 native_window_bytes[160] = { 0 };
 	CheckPoint checkPoint = { 0 };
 
 	checkPoint.redo = publish_select_redo(insert);

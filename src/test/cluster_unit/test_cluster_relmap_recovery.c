@@ -5,6 +5,8 @@
 #include "access/clog.h"
 #include "cluster/cluster_relmap_owner.h"
 #include "cluster/cluster_relmap_recovery.h"
+#include "cluster/cluster_relmap_checkpoint.h"
+#include "cluster/cluster_qvotec.h"
 #include "storage/lwlock.h"
 #include "miscadmin.h"
 #include "unit_test.h"
@@ -102,6 +104,41 @@ cluster_clog_native_terminal_sync_v1(TransactionId xid, ClusterClogNativeTermina
 	return out->status == TRANSACTION_STATUS_COMMITTED || out->status == TRANSACTION_STATUS_ABORTED;
 }
 
+bool enableFsync = true, cluster_enabled = true, cluster_shared_config = true;
+BackendType MyBackendType = B_CHECKPOINTER;
+volatile uint32 CritSectionCount;
+static bool native_writer_current = true;
+static unsigned native_writer_checks, native_change_check;
+static uint64 native_boot = 55;
+uint64
+cluster_qvotec_get_self_incarnation(void)
+{
+	if (depth)
+		abort();
+	return native_boot;
+}
+ClusterControlRootResult
+cluster_wal_writer_begin(TimeLineID tli, ClusterWalWriterToken *out)
+{
+	if (depth)
+		abort();
+	*out = original.writer;
+	out->ref.timeline = tli;
+	return native_writer_current ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+								 : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+ClusterControlRootResult
+cluster_wal_writer_check(const ClusterWalWriterToken *w)
+{
+	if (depth)
+		abort();
+	return native_writer_current && w->epoch == original.writer.epoch
+				   && ++native_writer_checks != native_change_check
+			   ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			   : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+#include "../../backend/cluster/cluster_relmap_checkpoint_native.c"
+
 #ifndef CLUSTER_RELMAP_RECOVERY_SOURCE
 #define CLUSTER_RELMAP_RECOVERY_SOURCE "../../backend/cluster/cluster_relmap_recovery.c"
 #endif
@@ -113,6 +150,11 @@ setup(void)
 	memset(&variables, 0, sizeof(variables));
 	memset(&original, 0, sizeof(original));
 	owner_current = true;
+	enableFsync = cluster_enabled = cluster_shared_config = native_writer_current = true;
+	MyBackendType = B_CHECKPOINTER;
+	CritSectionCount = 0;
+	native_boot = 55;
+	native_writer_checks = native_change_check = 0;
 	native_status = TRANSACTION_STATUS_COMMITTED;
 	native_lsn = 0;
 	status_reads = interrupt_errors = native_sync_calls = 0;
@@ -450,10 +492,120 @@ native_sync_error_rethrows_without_output_or_lock_debt(void)
 	UT_ASSERT_EQ(InterruptHoldoffCount, 0);
 	UT_ASSERT_EQ(interrupt_errors, 0);
 }
+UT_TEST(checkpoint_native_window_actual_capture_and_finished_body)
+{
+	ClusterRelmapCheckpointSampleV1 sample;
+	ClusterRelmapCheckpointWindow w;
+	CheckPoint cp = { 0 };
+	uint8 bytes[160];
+	setup();
+	publish(UINT64CONST(0x200000068));
+	UT_ASSERT(cluster_relmap_recovery_checkpoint_window_capture(7, &sample));
+	UT_ASSERT_EQ(sample.window.last_issued, UINT64CONST(0x200000068));
+	UT_ASSERT_EQ(sample.window.native_floor, UINT64CONST(0x20000005a));
+	UT_ASSERT_EQ(sample.window.boot_incarnation, 55);
+	UT_ASSERT_EQ(sample.window.admitted_incarnation, 8);
+	cp.redo = 100;
+	cp.ThisTimeLineID = 7;
+	cp.PrevTimeLineID = 7;
+	cp.nextXid = variables.nextXid;
+	variables.nextXid = FullTransactionIdFromU64(UINT64CONST(0x200001000));
+	publish(UINT64CONST(0x200000069));
+	UT_ASSERT(cluster_relmap_recovery_checkpoint_window_finish(&sample, &cp, 200, 240, bytes));
+	UT_ASSERT(cluster_relmap_checkpoint_window_decode_v1(
+		bytes, &cp, 200, 240, &sample.writer.ref.claim.identity, 456, &w));
+	UT_ASSERT_EQ(w.last_issued, UINT64CONST(0x200000068));
+	UT_ASSERT_EQ(depth, 0);
+}
+UT_TEST(checkpoint_unknown_and_wrong_owner_never_become_window)
+{
+	ClusterRelmapCheckpointSampleV1 out, zero = { 0 };
+	for (unsigned i = 0; i < 8; i++) {
+		setup();
+		if (i)
+			publish(UINT64CONST(0x200000068));
+		switch (i) {
+		case 0:
+			break;
+		case 1:
+			MyBackendType = B_STARTUP;
+			break;
+		case 2:
+			enableFsync = false;
+			break;
+		case 3:
+			CritSectionCount = 1;
+			break;
+		case 4:
+			caller_locks = 1;
+			break;
+		case 5:
+			native_change_check = 1;
+			break;
+		case 6:
+			native_boot = 0;
+			break;
+		case 7:
+			variables.oldestClogXid = 0;
+			break;
+		}
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT(!cluster_relmap_recovery_checkpoint_window_capture(7, &out));
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		UT_ASSERT_EQ(depth, 0);
+	}
+}
+UT_TEST(checkpoint_finish_rechecks_window_and_preserves_alias)
+{
+	ClusterRelmapCheckpointSampleV1 sample, saved;
+	CheckPoint cp = { 0 };
+	uint8 b[160], zero[160] = { 0 };
+	for (unsigned i = 0; i < 5; i++) {
+		setup();
+		publish(UINT64CONST(0x200000068));
+		UT_ASSERT(cluster_relmap_recovery_checkpoint_window_capture(7, &sample));
+		cp.redo = 100;
+		cp.ThisTimeLineID = 7;
+		cp.PrevTimeLineID = 7;
+		cp.nextXid = variables.nextXid;
+		switch (i) {
+		case 0:
+			variables.oldestClogXid++;
+			break;
+		case 1:
+			variables.clusterIssuedState = 2;
+			break;
+		case 2:
+			native_boot++;
+			break;
+		case 3:
+			native_writer_current = false;
+			break;
+		case 4:
+			cp.nextXid = FullTransactionIdFromU64(sample.window.last_issued);
+			break;
+		}
+		memset(b, 0xa5, 160);
+		UT_ASSERT(!cluster_relmap_recovery_checkpoint_window_finish(&sample, &cp, 200, 240, b));
+		UT_ASSERT(memcmp(b, zero, 160) == 0);
+		UT_ASSERT_EQ(depth, 0);
+	}
+	setup();
+	publish(UINT64CONST(0x200000068));
+	UT_ASSERT(cluster_relmap_recovery_checkpoint_window_capture(7, &sample));
+	saved = sample;
+	UT_ASSERT(!cluster_relmap_recovery_checkpoint_window_finish(&sample, &cp, 200, 240,
+																(uint8 *)&sample));
+	UT_ASSERT(memcmp(&sample, &saved, sizeof(sample)) == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(16);
+	UT_RUN(checkpoint_native_window_actual_capture_and_finished_body);
+	UT_RUN(checkpoint_unknown_and_wrong_owner_never_become_window);
+	UT_RUN(checkpoint_finish_rechecks_window_and_preserves_alias);
 	UT_RUN(capture_actual_published_window);
 	UT_RUN(rejects_unknown_rewind_and_ambiguous_era);
 	UT_RUN(invalidation_stays_unknown);

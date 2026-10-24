@@ -538,6 +538,8 @@ SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_v2_storage
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2_storage,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_retention
+TESTS += test_cluster_relmap_checkpoint
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_checkpoint,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_recovery
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_recovery,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_retention,$(SIMPLE_TESTS))
@@ -3449,6 +3451,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relma
 		test_cluster_catalog_origin_io.o \
 		$(top_builddir)/src/backend/cluster/cluster_initdb_common.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
+        $(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_tail.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o \
 		$(top_srcdir)/src/include/cluster/cluster_wal_tail.h
@@ -3474,6 +3477,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relma
 		test_cluster_catalog_origin_io.o \
 		$(top_builddir)/src/backend/cluster/cluster_initdb_common.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
+        $(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_tail.o \
 		xlogreader_fs.o \
@@ -3911,9 +3915,10 @@ test_cluster_write_fence_cache: test_cluster_write_fence_cache.c unit_test.h \
 # locally; CRC32C comes from libpgport, so no PG backend is needed.
 CLUSTER_RECOVERY_ANCHOR_O = $(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o
 test_cluster_recovery_anchor: test_cluster_recovery_anchor.c unit_test.h \
-		$(CLUSTER_RECOVERY_ANCHOR_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_RECOVERY_ANCHOR_O) \
+        $(top_srcdir)/src/backend/cluster/cluster_relmap_checkpoint.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_RECOVERY_ANCHOR_O) $(top_srcdir)/src/backend/cluster/cluster_relmap_checkpoint.c \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
@@ -7785,7 +7790,7 @@ test_cluster_tt_checkpoint_guts.inc: $(top_srcdir)/src/backend/access/transam/xl
 test_cluster_tt_checkpoint_publish.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^CreateCheckPoint\(/ { owner=1 } \
 	     owner && /vxids = GetVirtualXIDsDelayingChkpt\(&nvxids, DELAY_CHKPT_START\);/ { emit=1; starts++ } \
-	     emit { print; if (/ClusterCheckpointV3Publish\(&v3_checkpoint, recptr\);/) { print "#endif"; emit=0; done++; exit } } \
+	     emit { print; if (/ClusterCheckpointV3Publish\(&v3_checkpoint, recptr,/) { print "#endif"; emit=0; done++; exit } } \
 	     END { if (starts != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
@@ -10037,5 +10042,18 @@ test_cluster_d0_native_reader: test_cluster_d0_native_reader.c unit_test.h \
 test_cluster_relmap_recovery: test_cluster_relmap_recovery.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_recovery.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
-		$(top_srcdir)/src/include/access/transam.h $(CLUSTER_UNIT_PORT_LIBS)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(top_srcdir)/src/include/access/transam.h $(CLUSTER_UNIT_PORT_LIBS) \
+        $(top_srcdir)/src/backend/cluster/cluster_relmap_checkpoint_native.c \
+        $(top_srcdir)/src/backend/cluster/cluster_relmap_checkpoint.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_srcdir)/src/backend/cluster/cluster_relmap_checkpoint.c \
+        $(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+        $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+# Original checkpoint native-window codec; pure bounded bytes only.
+test_cluster_relmap_checkpoint: test_cluster_relmap_checkpoint.c unit_test.h \
+        $(top_srcdir)/src/backend/cluster/cluster_relmap_checkpoint.c \
+        $(top_srcdir)/src/include/cluster/cluster_relmap_checkpoint.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< \
+        $(top_srcdir)/src/backend/cluster/cluster_relmap_checkpoint.c \
+        $(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+        $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS))

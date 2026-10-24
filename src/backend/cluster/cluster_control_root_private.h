@@ -568,6 +568,12 @@ extern ClusterControlRootResult cluster_control_root_v2_checkpoint_publish(
 	const ClusterControlRootIdentity *self, const ControlFileData *thread_control,
 	XLogRecPtr checkpoint_end, ClusterControlRootSnapshot *out,
 	ClusterControlRootFileToken *out_token, ControlFileData *out_control);
+/* Original checkpoint window is an optional immutable anchor input, not
+ * ControlFileData ABI, a caller completion boolean, or release permission. */
+extern ClusterControlRootResult cluster_control_root_v3_checkpoint_window_publish(
+	const ClusterControlRootIdentity *self, const ControlFileData *control, XLogRecPtr end,
+	const uint8 native_window[160], ClusterControlRootSnapshot *out,
+	ClusterControlRootFileToken *token, ControlFileData *view);
 extern ClusterControlRootResult cluster_control_root_v3_checkpoint_publish(
 	const ClusterControlRootIdentity *self, const ControlFileData *thread_control,
 	XLogRecPtr checkpoint_end, ClusterControlRootSnapshot *out,
