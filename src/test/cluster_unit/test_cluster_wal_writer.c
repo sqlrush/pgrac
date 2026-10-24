@@ -42,11 +42,14 @@ bool cluster_enabled = true, cluster_shared_config = true;
 int cluster_node_id = 0;
 char *cluster_wal_threads_dir, *DataDir;
 int MyProcPid = 79;
+Oid MyDatabaseId = 42;
 BackendType MyBackendType = B_BACKEND;
 static ClusterNormalStartState test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
 static bool test_recovered_open;
+AuxProcType MyAuxProcType = NotAnAuxProcess;
 volatile sig_atomic_t ShutdownRequestPending;
 volatile uint32 CritSectionCount = 1;
+volatile uint32 InterruptHoldoffCount;
 MemoryContext CurrentMemoryContext, TopMemoryContext;
 ResourceOwner CurrentResourceOwner;
 sigjmp_buf *PG_exception_stack;
@@ -54,14 +57,24 @@ ErrorContextCallback *error_context_stack;
 void
 pg_re_throw(void)
 {
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
 	abort();
 }
 static LWLockPadded test_lwlocks[NUM_INDIVIDUAL_LWLOCKS];
 LWLockPadded *MainLWLockArray = test_lwlocks;
+static LWLock relmap_retention_lock;
+static LWLock *relmap_runtime_test_lock;
+static bool relmap_retention_held;
+static unsigned relmap_retention_acquires;
+static bool relmap_xidgen_held;
+static LWLockMode relmap_xidgen_mode;
+static void relmap_retention_lock_enter(void);
 static bool held = true, mapping_held, active = true, member = true, fence = true, prebump,
 			have_ref = true;
 static bool fence_epoch_lag, fence_lease_zero, fence_expired, self_fenced;
 static uint64 epoch = 7, incarnation = 99;
+static uint64 relmap_admission_delta;
 static uint64 initialized_writer_epoch, clean_writer_epoch, recovered_writer_epoch;
 static ClusterWalSourceRef ref;
 static ClusterWalSourceRef restart_ref;
@@ -92,6 +105,10 @@ cluster_semantic_activation_recovered_open_current(void)
 bool
 LWLockHeldByMeInMode(LWLock *l, LWLockMode m)
 {
+	if (l == XidGenLock)
+		return relmap_xidgen_held && m == relmap_xidgen_mode;
+	if (l == relmap_runtime_test_lock)
+		return relmap_retention_held && m == LW_EXCLUSIVE;
 	return m == LW_EXCLUSIVE
 		   && ((l == WALWriteLock && held) || (l == WALBufMappingLock && mapping_held));
 }
@@ -113,7 +130,7 @@ cluster_qvotec_get_self_incarnation(void)
 uint64
 cluster_membership_get_last_admitted_incarnation(int32 n pg_attribute_unused())
 {
-	return incarnation;
+	return incarnation + relmap_admission_delta;
 }
 ClusterMembershipState
 cluster_membership_get_state(int32 n pg_attribute_unused())
@@ -222,7 +239,7 @@ errstart(int level, const char *domain pg_attribute_unused())
 {
 	if (level == DEBUG1)
 		return false;
-	if (!expect_panic || (level != PANIC && level != ERROR))
+	if (!expect_panic || (level != PANIC && level != ERROR && level != FATAL))
 		abort();
 	return true;
 }
@@ -237,6 +254,11 @@ errfinish(const char *f pg_attribute_unused(), int l pg_attribute_unused(),
 {
 	if (!expect_panic)
 		abort();
+	if (PG_exception_stack != NULL) {
+		/* Match native errfinish(ERROR) before its handler longjmp. */
+		InterruptHoldoffCount = 0;
+		siglongjmp(*PG_exception_stack, 1);
+	}
 	siglongjmp(native_error, 1);
 }
 
@@ -381,6 +403,24 @@ bool
 LWLockAcquire(LWLock *l, LWLockMode mode)
 {
 	bool *state = l == WALWriteLock ? &held : &mapping_held;
+
+	if (l == XidGenLock) {
+		if (relmap_xidgen_held || relmap_retention_held)
+			abort();
+		relmap_xidgen_held = true;
+		relmap_xidgen_mode = mode;
+		HOLD_INTERRUPTS();
+		return true;
+	}
+	if (l == &relmap_retention_lock || l == relmap_runtime_test_lock) {
+		if (mode != LW_EXCLUSIVE || relmap_retention_held)
+			abort();
+		relmap_retention_lock_enter();
+		relmap_retention_held = true;
+		relmap_retention_acquires++;
+		HOLD_INTERRUPTS();
+		return true;
+	}
 	Assert((l == WALWriteLock || l == WALBufMappingLock) && mode == LW_EXCLUSIVE && !*state);
 	*state = true;
 	if (l == WALWriteLock && lag_on_lock) {
@@ -399,6 +439,21 @@ void
 LWLockRelease(LWLock *l)
 {
 	bool *state = l == WALWriteLock ? &held : &mapping_held;
+
+	if (l == XidGenLock) {
+		if (!relmap_xidgen_held)
+			abort();
+		relmap_xidgen_held = false;
+		RESUME_INTERRUPTS();
+		return;
+	}
+	if (l == &relmap_retention_lock || l == relmap_runtime_test_lock) {
+		if (!relmap_retention_held)
+			abort();
+		relmap_retention_held = false;
+		RESUME_INTERRUPTS();
+		return;
+	}
 	Assert((l == WALWriteLock || l == WALBufMappingLock) && *state);
 	*state = false;
 }
@@ -526,6 +581,7 @@ fixture(void)
 	ShutdownRequestPending = false;
 	memset(&writer_startup, 0, sizeof(writer_startup));
 	epoch = 7;
+	relmap_admission_delta = 0;
 	initialized_writer_epoch = clean_writer_epoch = recovered_writer_epoch = 0;
 	incarnation = 99;
 	CritSectionCount = 1;
@@ -1462,10 +1518,13 @@ UT_TEST(test_requested_flush_rejects_foreign_or_unsafe_context_without_io)
 	}
 }
 
+#include "test_cluster_relmap_owner.inc"
+#include "test_cluster_relmap_retention_runtime.inc"
+
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(118);
 	UT_RUN(test_clean_writer_requires_selected_exit_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_requires_selected_input_and_installed_same_epoch);
 	UT_RUN(test_recovered_writer_requires_selected_input_and_installed_same_epoch);
@@ -1499,6 +1558,92 @@ main(void)
 	UT_RUN(test_native_device_or_postflush_authority_failure_never_acknowledges);
 	UT_RUN(test_startup_binds_only_revalidated_actual_empty_owner);
 	UT_RUN(test_startup_rejects_changed_selection_route_or_owner);
+	UT_RUN(test_relmap_capture_preserves_original_full_identity);
+	UT_RUN(test_relmap_conversion_uses_original_claim_and_actual_namespace);
+	UT_RUN(test_relmap_conversion_refuses_before_storage_in_unsafe_or_changed_owner);
+	UT_RUN(test_relmap_conversion_storage_refusal_is_not_permission);
+	UT_RUN(test_relmap_conversion_rechecks_owner_and_database_after_storage);
+	UT_RUN(test_relmap_capture_refuses_unsafe_context_before_assigning);
+	UT_RUN(test_relmap_writer_is_sampled_after_original_top_assignment);
+	UT_RUN(test_relmap_invalid_top_or_unqualified_writer_cannot_be_captured);
+	UT_RUN(test_relmap_revalidation_never_adopts_new_writer_or_reassigns_top);
+	UT_RUN(test_relmap_sample_fields_and_original_lock_context_are_exact);
+	UT_RUN(test_relmap_owner_retention_uses_original_key_and_published_receipt);
+	UT_RUN(test_relmap_owner_retention_absent_binding_stays_unresolved);
+	UT_RUN(test_relmap_owner_retention_refuses_stale_or_unsafe_owner);
+	UT_RUN(test_relmap_owner_retention_rejects_foreign_namespace_and_arguments);
+	UT_RUN(test_relmap_owner_retention_rechecks_after_original_binding_read);
+	UT_RUN(test_relmap_owner_retention_preserves_core_refusals);
+	UT_RUN(test_relmap_native_wal_matches_shared_and_database_pending);
+	UT_RUN(test_relmap_native_wal_rejects_foreign_or_unqualified_source);
+	UT_RUN(test_relmap_native_wal_requires_exact_record_range_and_kind);
+	UT_RUN(test_relmap_native_wal_requires_original_raw_and_top_xid);
+	UT_RUN(test_relmap_native_wal_requires_exact_namespace_and_native_length);
+	UT_RUN(test_relmap_native_wal_compares_every_native_map_byte);
+	UT_RUN(test_relmap_native_wal_rejects_invalid_or_absent_pending_image);
+	UT_RUN(test_relmap_native_wal_null_inputs_never_match);
+	UT_RUN(test_relmap_native_wal_is_readonly_and_does_not_qualify_missing_era);
+	UT_RUN(test_relmap_runtime_refuses_before_attachment);
+	UT_RUN(test_relmap_runtime_birth_is_unknown_and_one_lock);
+	UT_RUN(test_relmap_runtime_unknown_never_adds_pin);
+	UT_RUN(test_relmap_runtime_routes_original_origin_and_inherits_binding);
+	UT_RUN(test_relmap_runtime_preserves_pins_and_reservation_on_attach);
+	UT_RUN(test_relmap_runtime_rejects_incompatible_attachment);
+	UT_RUN(test_relmap_runtime_keeps_original_owner_refusals);
+	UT_RUN(test_relmap_runtime_active_binds_all_existing_namespaces_and_staged_pin);
+	UT_RUN(test_relmap_runtime_active_retry_is_idempotent_and_conflict_is_atomic);
+	UT_RUN(test_relmap_runtime_active_empty_set_has_no_new_duty);
+	UT_RUN(test_relmap_runtime_active_refuses_unattached_unknown_and_building);
+	UT_RUN(test_relmap_runtime_active_refuses_unsafe_context_before_receipt_read);
+	UT_RUN(test_relmap_runtime_active_refuses_invalid_top_or_missing_and_invalid_receipt);
+	UT_RUN(test_relmap_runtime_active_rechecks_original_full_and_native_writer_after_receipt);
+	UT_RUN(test_relmap_runtime_active_same_raw_in_another_era_never_attaches_old_pins);
+	UT_RUN(test_relmap_runtime_active_refuses_a_foreign_directory_identity);
+	UT_RUN(test_relmap_runtime_stage_routes_original_owner_namespace_and_lock);
+	UT_RUN(test_relmap_runtime_stage_keeps_original_mapping_lock_order);
+	UT_RUN(test_relmap_runtime_stage_refuses_unattached_unknown_and_building);
+	UT_RUN(test_relmap_runtime_stage_rejects_wrong_inputs_before_storage);
+	UT_RUN(test_relmap_runtime_stage_rejects_nulls_and_reentrant_lock);
+	UT_RUN(test_relmap_runtime_stage_needs_matching_directory_and_exact_pin);
+	UT_RUN(test_relmap_runtime_stage_failure_preserves_marker_before_cancel);
+	UT_RUN(test_relmap_runtime_stage_rechecks_owner_after_storage_success);
+	UT_RUN(test_relmap_runtime_cancel_only_exact_unstaged_preparation);
+	UT_RUN(test_relmap_runtime_tt_empty_complete_is_only_a_readonly_conjunct);
+	UT_RUN(test_relmap_runtime_tt_keeps_staged_and_unstaged_pins_in_every_namespace);
+	UT_RUN(test_relmap_runtime_tt_distinguishes_each_physical_key_component);
+	UT_RUN(test_relmap_runtime_tt_unbound_raw_alias_never_implies_an_empty_set);
+	UT_RUN(test_relmap_runtime_tt_routes_binding_origin_instead_of_current_node);
+	UT_RUN(test_relmap_runtime_tt_refuses_unattached_unknown_and_building);
+	UT_RUN(test_relmap_runtime_tt_rejects_missing_identity_and_origin_before_indexing);
+	UT_RUN(test_relmap_runtime_tt_rejects_a_foreign_directory_identity);
+	UT_RUN(test_relmap_runtime_tt_preserves_original_core_receipt_refusals);
+	UT_RUN(test_relmap_runtime_tt_refuses_corrupt_pins_and_recursive_lock);
+	UT_RUN(test_relmap_runtime_truncate_routes_original_origin_and_completes_exact_cut);
+	UT_RUN(test_relmap_runtime_truncate_clamps_to_each_staged_or_unstaged_namespace);
+	UT_RUN(test_relmap_runtime_truncate_reserves_against_original_begin_and_busy_retry);
+	UT_RUN(test_relmap_runtime_truncate_uncertain_preserves_reservation_and_pins_on_attach);
+	UT_RUN(test_relmap_runtime_truncate_rejects_stale_or_changed_receipts);
+	UT_RUN(test_relmap_runtime_truncate_refuses_unattached_unknown_and_building);
+	UT_RUN(test_relmap_runtime_truncate_checks_identity_origin_and_null_before_indexing);
+	UT_RUN(test_relmap_runtime_truncate_rejects_foreign_directory_or_receipt_identity);
+	UT_RUN(test_relmap_runtime_truncate_preserves_core_cut_and_serial_refusals);
+	UT_RUN(test_relmap_runtime_truncate_never_reacquires_or_releases_callers_lock);
+	UT_RUN(test_relmap_runtime_allocation_snapshot_routes_original_origin_without_mutation);
+	UT_RUN(test_relmap_runtime_allocation_holds_final_window_until_original_stores);
+	UT_RUN(test_relmap_runtime_allocation_checks_each_namespace_and_stage_halfspace);
+	UT_RUN(test_relmap_runtime_allocation_rechecks_changed_pin_and_final_candidate);
+	UT_RUN(test_relmap_runtime_allocation_refuses_unattached_unknown_and_building);
+	UT_RUN(test_relmap_runtime_allocation_rejects_identity_and_origin_before_indexing);
+	UT_RUN(test_relmap_runtime_allocation_preserves_core_candidate_refusals);
+	UT_RUN(test_relmap_runtime_allocation_requires_original_exclusive_lock_and_own_window);
+	UT_RUN(test_relmap_runtime_allocation_error_cleanup_never_rewinds_observation);
+	UT_RUN(test_relmap_runtime_allocation_error_reacquire_cannot_release_an_unrelated_lock);
+	UT_RUN(test_relmap_runtime_recovery_invalidates_every_origin_preserving_obligations);
+	UT_RUN(test_relmap_runtime_recovery_keeps_inflight_across_retry_and_attach);
+	UT_RUN(test_relmap_runtime_recovery_refuses_before_attachment);
+	UT_RUN(test_relmap_runtime_recovery_refuses_other_roles_and_unsafe_locks);
+	UT_RUN(test_relmap_runtime_recovery_never_makes_old_consumers_available);
+	free(relmap_runtime_allocation);
 	if (scratch[0] && !rmtree(scratch, true))
 		abort();
 	pfree(cluster_wal_threads_dir);

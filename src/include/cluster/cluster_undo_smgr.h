@@ -196,6 +196,73 @@ extern bool cluster_undo_smgr_recovery_ctrc_close_v2(ClusterUndoSmgrRecoveryStam
 #endif
 
 
+#ifdef USE_PGRAC_CLUSTER
+/* Storage-only D0 adapter. Prepare canonical bytes and the exact complete
+ * native before/after pages before entering the recovery stamp window.
+ * The caller retains original graph/source/terminal/target authority and
+ * reservation, inserts and flushes WAL before write, and completes/clears
+ * its own window only after successful direct sync and exact readback.
+ * A token supplies none of those proofs. Inputs must not overlap out.
+ *
+ * Shares the single ResourceOwner stage with C0, with distinct token kinds.
+ * No live caller. Write uses only the held FD and original block0 lock;
+ * failures are sticky. D0 fsync failure uses data_sync_elevel(ERROR).
+ * Close/owner cleanup never clears the recovery duty or window. */
+extern bool cluster_undo_smgr_recovery_ctrc_prepare_v2(const uint8 *payload, size_t length,
+													   uint64 system_identifier,
+													   ClusterUndoSmgrRecoveryStampV1 *out);
+/* Read-only pre-insert check of the held D0 stage and all prepared bytes.
+ * No IO, lock, codec/hash/allocation, state change or completion authority.
+ * Refusal does not poison the stage; post-insert write_bound remains required. */
+struct XLogReaderState;
+struct ClusterRecoveryCTRCReferenceV2;
+/* Dormant recovery preparation from the original completed native D0 reader
+ * and its immutable full raw snapshot. First bind the exact reference using
+ * the existing reader/CRC/SHA, then prepare the original held-FD target from
+ * those same payload bytes. No target write, WAL insertion or live dispatch.
+ * Caller retains qualified ROOT/source/cut/graph/owner/pins and reservation;
+ * byte identity does not prove those prerequisites or typed idempotency.
+ * raw==NULL and raw_length==0 borrows the original current native reader's
+ * complete D0 snapshot; other pointer/length pairs require explicit full raw
+ * bytes. This does not relax the completed-reader or qualification contracts.
+ * Private token/reference outputs must be disjoint from reader-owned storage,
+ * input bytes and each other. Both stay unchanged on refusal; original ERROR
+ * and ResourceOwner behavior is preserved. Only exact-before is admitted. */
+extern bool cluster_undo_smgr_recovery_ctrc_prepare_record_v2(
+	const struct XLogReaderState *reader, uint32 source_index,
+	const uint8 source_identity_digest[32], const uint8 *raw, size_t raw_length,
+	ClusterUndoSmgrRecoveryStampV1 *out, struct ClusterRecoveryCTRCReferenceV2 *reference);
+extern bool cluster_undo_smgr_recovery_ctrc_matches_v2(ClusterUndoSmgrRecoveryStampV1 stamp,
+													 const uint8 *payload, size_t length);
+extern bool cluster_undo_smgr_recovery_ctrc_write_v2(ClusterUndoSmgrRecoveryStampV1 stamp);
+/* The durability coordinator must also bind the complete prepared canonical
+ * payload, not just its target before/after page. An exact owned token with
+ * mismatched payload fails sticky before target IO; unrelated tokens/owners
+ * cannot poison this stage. No codec/hash/allocation is performed here. */
+extern bool cluster_undo_smgr_recovery_ctrc_write_bound_v2(ClusterUndoSmgrRecoveryStampV1 stamp,
+														   const uint8 *payload, size_t length);
+extern bool cluster_undo_smgr_recovery_ctrc_close_v2(ClusterUndoSmgrRecoveryStampV1 stamp);
+/* Dormant recovery finish for a caller-owned prepared D0 token. Rebind the
+ * original completed reader/full raw record and compare the exact reference
+ * returned at preparation, then reuse write_bound/direct sync/readback/close.
+ * Caller retains qualified source/cut/ROOT/graph/owner/pins/reservation and
+ * original recovery-window authority. The reference is structural, not a
+ * completion or source qualification. Only a successful write AND close
+ * returns true; this does not clear a window or release any retention pin.
+ * Binding refusal leaves the prepared stage intact. Target failures retain
+ * the original sticky/ERROR behavior; close failure may already close the FD.
+ * Caller still owns the token on false; never infer rollback or retry safety.
+ * NULL/0 raw reacquires the current native snapshot, with the same exact R
+ * recheck; advancing/resetting the reader is not a completion receipt.
+ * No new target preparation, WAL insertion/flush or live redo dispatch. */
+extern bool cluster_undo_smgr_recovery_ctrc_finish_record_v2(
+	ClusterUndoSmgrRecoveryStampV1 stamp, const struct XLogReaderState *reader,
+	uint32 source_index, const uint8 source_identity_digest[32], const uint8 *raw,
+	size_t raw_length, const struct ClusterRecoveryCTRCReferenceV2 *prepared_reference);
+
+#endif
+
+
 /*
  * Redo: block zero already shows a replayed TT record's effect (or a newer
  * state), but those bytes may still be only in the page cache of a crashed

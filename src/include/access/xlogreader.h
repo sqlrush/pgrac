@@ -404,6 +404,16 @@ typedef enum XLogPageReadResult
 extern struct XLogRecord *XLogReadRecord(XLogReaderState *state,
 										 char **errormsg);
 
+#ifdef USE_PGRAC_CLUSTER
+/* Borrow the complete raw bytes retained with the current standalone D0.
+ * Valid only while that decoded record remains current; read-ahead does not
+ * replace it. No reconstruction from decoded fields or mutable read buffer.
+ * Returns NULL for other shapes or incomplete/inconsistent current records.
+ * Native CRC/source/cut/retention and D0 semantic qualification remain the
+ * caller's original reader/owner contracts. No allocation or target I/O. */
+extern const uint8 *XLogReaderGetClusterD0RawRecord(const XLogReaderState *state);
+#endif
+
 /* Consume the next record or error. */
 extern DecodedXLogRecord *XLogNextRecord(XLogReaderState *state,
 										 char **errormsg);

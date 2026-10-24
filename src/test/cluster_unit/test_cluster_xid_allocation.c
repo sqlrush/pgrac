@@ -25,6 +25,8 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_relmap_owner.h"
+#include "cluster/cluster_relmap_recovery.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_xid_stripe_boot.h"
@@ -37,7 +39,33 @@
 #include "unit_test.h"
 UT_DEFINE_GLOBALS();
 
-bool cluster_enabled, cluster_shared_catalog, cluster_xid_striping;
+/* This allocator fixture never reads terminal CLOG or enters ERROR cleanup.
+ * Keep such calls fatal; the integrated producer adds only native link leaves. */
+volatile uint32 InterruptHoldoffCount;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+void
+pg_re_throw(void)
+{
+	abort();
+}
+XidStatus
+TransactionIdGetStatus(TransactionId xid, XLogRecPtr *lsn)
+{
+	(void)xid;
+	(void)lsn;
+	abort();
+}
+
+bool
+cluster_clog_native_terminal_sync_v1(TransactionId xid, ClusterClogNativeTerminalV1 *out)
+{
+	(void)xid;
+	(void)out;
+	abort();
+}
+
+bool cluster_enabled, cluster_shared_config, cluster_shared_catalog, cluster_xid_striping;
 int cluster_node_id = 4, cluster_xid_herding_slack = 4194304;
 bool IsUnderPostmaster;
 ProcessingMode Mode = NormalProcessing;
@@ -54,6 +82,7 @@ LWLockPadded *MainLWLockArray = locks;
 static bool held, reservation, jump, advance_while_unlocked;
 static unsigned waits, extensions, early_extensions, lock_errors;
 static uint64 floor_full, limit_full;
+static unsigned native_publish_count, native_publish_order_errors;
 int cluster_injection_armed_count;
 
 bool
@@ -183,7 +212,45 @@ errfinish(const char *file, int line, const char *function)
 	abort();
 }
 
-#include "test_cluster_xid_allocation.inc"
+bool
+cluster_relmap_owner_terminal_matches_v2(const ClusterRelmapOwnerSampleV2 *owner)
+{
+	(void)owner;
+	return false;
+} /* No original-owner authority in this fixture. */
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	return lock == XidGenLock && held;
+}
+bool
+LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
+{
+	return lock == XidGenLock && mode == LW_EXCLUSIVE && held;
+}
+#include "../../backend/cluster/cluster_relmap_recovery.c"
+
+/* The real allocator calls through this test-only observation, which checks
+ * original ProcArray publication before delegating to the product tracker. */
+static void
+native_publication_checked(FullTransactionId issued)
+{
+	TransactionId xid = XidFromFullTransactionId(issued);
+	bool top = proc.xid == xid && visible_xids[0] == xid;
+	bool child = proc.subxidStatus.count > 0
+				 && proc.subxids.xids[proc.subxidStatus.count - 1] == xid
+				 && subxids[0].count == proc.subxidStatus.count;
+	if (!held || (!top && !child && !proc.subxidStatus.overflowed))
+		native_publish_order_errors++;
+	native_publish_count++;
+	cluster_relmap_recovery_issued_publish(issued);
+}
+#define cluster_relmap_recovery_issued_publish native_publication_checked
+#ifndef CLUSTER_XID_ALLOCATOR_BODY
+#define CLUSTER_XID_ALLOCATOR_BODY "test_cluster_xid_allocation.inc"
+#endif
+#include CLUSTER_XID_ALLOCATOR_BODY
+#undef cluster_relmap_recovery_issued_publish
 
 static void
 reset_allocator(void)
@@ -198,9 +265,10 @@ reset_allocator(void)
 	procs.xids = visible_xids;
 	procs.subxidStates = subxids;
 	held = reservation = jump = advance_while_unlocked = false;
-	cluster_enabled = cluster_shared_catalog = cluster_xid_striping = true;
+	cluster_enabled = cluster_shared_config = cluster_shared_catalog = cluster_xid_striping = true;
 	waits = extensions = early_extensions = lock_errors = 0;
 	floor_full = limit_full = 0;
+	native_publish_count = native_publish_order_errors = 0;
 }
 
 UT_TEST(no_storage_or_procarray_mutation_before_reservation)
@@ -229,6 +297,24 @@ UT_TEST(wait_rederives_native_counter_and_new_boot_floor)
 	UT_ASSERT_EQ(early_extensions, 0);
 	UT_ASSERT_EQ(lock_errors, 0);
 }
+UT_TEST(actual_issuance_is_recorded_after_native_publication)
+{
+	FullTransactionId child;
+	reset_allocator();
+	jump = true;
+	UT_ASSERT_EQ(variables.clusterIssuedState, 0);
+	UT_ASSERT_EQ(U64FromFullTransactionId(GetNewTransactionId(false)), 4100);
+	UT_ASSERT_EQ(U64FromFullTransactionId(variables.clusterLastIssuedXid), 4100);
+	UT_ASSERT_EQ(variables.clusterIssuedState, 1);
+	UT_ASSERT(U64FromFullTransactionId(variables.clusterLastIssuedXid) != limit_full);
+	child = GetNewTransactionId(true);
+	UT_ASSERT_EQ(U64FromFullTransactionId(variables.clusterLastIssuedXid),
+				 U64FromFullTransactionId(child));
+	UT_ASSERT_EQ(native_publish_count, 2);
+	UT_ASSERT_EQ(native_publish_order_errors, 0);
+	UT_ASSERT_EQ(lock_errors, 0);
+	UT_ASSERT(!held);
+}
 UT_TEST(native_allocation_preserves_ordinary_counter)
 {
 	reset_allocator();
@@ -238,14 +324,17 @@ UT_TEST(native_allocation_preserves_ordinary_counter)
 	UT_ASSERT_EQ(waits, 0);
 	UT_ASSERT_EQ(extensions, 3);
 	UT_ASSERT_EQ(lock_errors, 0);
+	UT_ASSERT_EQ(variables.clusterIssuedState, 0);
+	UT_ASSERT_EQ(native_publish_count, 0);
 }
 int
 main(void)
 {
-	UT_PLAN(3);
+	UT_PLAN(4);
 	UT_RUN(no_storage_or_procarray_mutation_before_reservation);
 	UT_RUN(wait_rederives_native_counter_and_new_boot_floor);
 	UT_RUN(native_allocation_preserves_ordinary_counter);
+	UT_RUN(actual_issuance_is_recorded_after_native_publication);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

@@ -59,6 +59,12 @@ extern void XLogRegisterPageVersionEdge(uint64 result_token,
 /* Original native insertion identity, valid only until the next construction
  * or reset. Read-only metadata; no flush, replay or DATA authority. */
 extern bool XLogGetLastInsertRecord(XLogRecPtr end, XLogRecPtr *start, XLogRecord *record);
+/* Copy complete final native bytes immediately after insertion, before any
+ * registered data changes or new construction/reset. Caller-preallocated,
+ * nonaliasing storage; no allocation, crypto, locks, flush or IO. False leaves
+ * both outputs unchanged. The original inserter owns all borrowed fragments. */
+extern bool XLogCopyLastInsertRecord(XLogRecPtr end, void *raw, Size raw_length,
+	XLogRecPtr *start);
 struct RfPageAnchorCacheKeyV1;
 extern void XLogRegisterPageVersionAnchorKey(uint8 block_id,
 	const struct RfPageAnchorCacheKeyV1 *key);

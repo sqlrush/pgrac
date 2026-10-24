@@ -7,7 +7,9 @@
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_worker.h"
 #include "cluster/cluster_thread_recovery.h"
+#include "cluster/cluster_recovery_ctrc_record.h"
 #include "common/cryptohash.h"
+#include "access/xlog_internal.h"
 #include "../../backend/cluster/cluster_recovery_plan.c"
 #undef printf
 #undef fprintf
@@ -34,6 +36,361 @@ static unsigned stamp_hash_calls;
 
 /* Observe the actual D0 codec's provider allocation, rather than replacing
  * its decode result. All original slot locks must already be released. */
+static unsigned hash_calls;
+/* Controlled concurrent mutation during the real lock-free D0 codec. */
+static unsigned stopped_hash_mutation, stopped_hash_mutations;
+
+/* Actual native accessor, with controlled process-local insertion leaves.
+ * This does not execute XLogInsert or supply full raw-record/payload proof. */
+XLogRecPtr ProcLastRecPtr, XactLastRecEnd;
+static XLogRecPtr last_insert_record_end;
+static bool begininsert_called;
+static char *hdr_scratch;
+static XLogRecord native_header;
+static union {
+	uint64 align;
+	char bytes[SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong];
+} native_scratch;
+static XLogRecData hdr_rdt, native_data[3];
+static int max_rdatas = 3, max_registered_buffers;
+static bool insert_allowed;
+static TransactionId insert_xid;
+static unsigned native_calls, native_stage, native_fault, native_throw;
+static uint8 registered_payload[320];
+static sigjmp_buf insert_error_boundary;
+static unsigned flush_calls, writer_checks, cover_calls, writer_reject_on, flush_fault;
+static XLogRecPtr flush_seen, covered_end;
+static TimeLineID covered_timeline;
+static bool cover_enabled;
+/* Storage is an external leaf here; the real held-FD entry is independently
+ * exercised against native temporary undo files in recovery_tt_io. */
+static void flush_unlocked(void);
+static unsigned target_calls, target_fault, target_match_calls;
+static bool target_match_ready;
+static unsigned target_prepare_calls, target_close_calls, target_prepare_fault;
+static bool target_held, target_throw_after_prepare;
+static unsigned hash_throw_at;
+static bool observe_reference_hash, reference_hash_refuse, reference_hash_throw;
+static unsigned reference_hash_calls;
+static const uint8 *reference_raw_output, *reference_metadata_output;
+
+static void
+reference_outputs_unpublished(void)
+{
+	if (reference_raw_output == NULL)
+		return;
+	for (unsigned i = 0; i < SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + 320; i++)
+		UT_ASSERT_EQ(reference_raw_output[i], 0xA5);
+	for (unsigned i = 0; i < sizeof(ClusterRecoveryCTRCReferenceV2); i++)
+		UT_ASSERT_EQ(reference_metadata_output[i], 0xA5);
+}
+static bool target_close_fault, execute_panic_expected;
+static int execute_report_level;
+static sigjmp_buf execute_panic_boundary;
+
+#ifndef CLUSTER_STAMP_EXTERNAL_ERROR_PROVIDER
+bool
+errstart(int elevel, const char *domain pg_attribute_unused())
+{
+	execute_report_level = elevel;
+	return true;
+}
+
+bool
+errstart_cold(int elevel, const char *domain)
+{
+	return errstart(elevel, domain);
+}
+
+int
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+void
+errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused(),
+	const char *func pg_attribute_unused())
+{
+	if (!execute_panic_expected)
+		abort();
+	UT_ASSERT_EQ(execute_report_level, PANIC);
+	UT_ASSERT_EQ(CritSectionCount, 1);
+	siglongjmp(execute_panic_boundary, 1);
+}
+#endif
+
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+void
+pg_re_throw(void)
+{
+	siglongjmp(*PG_exception_stack, 1);
+}
+static uint8 target_payload[320];
+static ClusterUndoSmgrRecoveryStampV1 target_stamp = { .token = 37 };
+static const uint8 *apply_raw, *apply_start;
+
+static void
+apply_outputs_unpublished(void)
+{
+	XLogRecPtr start;
+	reference_outputs_unpublished();
+	if (apply_raw == NULL)
+		return;
+	for (unsigned i = 0; i < SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + 320; i++)
+		UT_ASSERT_EQ(apply_raw[i], 0xA5);
+	memcpy(&start, apply_start, sizeof(start));
+	UT_ASSERT_EQ(start, 91);
+}
+
+bool
+cluster_undo_smgr_recovery_ctrc_prepare_v2(const uint8 *bytes, size_t length,
+	uint64 system_identifier, ClusterUndoSmgrRecoveryStampV1 *out)
+{
+	for (unsigned i = 0; i <= CLUSTER_RECOVERY_STAMP_SLOTS; i++)
+		UT_ASSERT(SpinLockFree(&region.thread_replay[i].stamp.lock));
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(system_identifier, 99);
+	UT_ASSERT_EQ(length, sizeof(target_payload));
+	target_prepare_calls++;
+	out->token = 0;
+	if (target_held || target_prepare_fault)
+		return false;
+	memcpy(target_payload, bytes, sizeof(target_payload));
+	target_held = true;
+	if (target_throw_after_prepare)
+		hash_throw_at = hash_calls + 1;
+	*out = target_stamp;
+	return true;
+}
+
+bool
+cluster_undo_smgr_recovery_ctrc_close_v2(ClusterUndoSmgrRecoveryStampV1 stamp)
+{
+	for (unsigned i = 0; i <= CLUSTER_RECOVERY_STAMP_SLOTS; i++)
+		UT_ASSERT(SpinLockFree(&region.thread_replay[i].stamp.lock));
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	apply_outputs_unpublished();
+	target_close_calls++;
+	UT_ASSERT(target_held);
+	UT_ASSERT_EQ(stamp.token, target_stamp.token);
+	target_held = false;
+	return !target_close_fault;
+}
+
+bool
+cluster_undo_smgr_recovery_ctrc_matches_v2(ClusterUndoSmgrRecoveryStampV1 stamp,
+	const uint8 *bytes, size_t length)
+{
+	flush_unlocked();
+	target_match_calls++;
+	return target_match_ready && stamp.token == target_stamp.token
+		&& bytes != NULL && length == sizeof(target_payload)
+		&& memcmp(bytes, target_payload, sizeof(target_payload)) == 0;
+}
+
+bool
+cluster_undo_smgr_recovery_ctrc_write_bound_v2(ClusterUndoSmgrRecoveryStampV1 stamp,
+											   const uint8 *bytes, size_t length)
+{
+	ClusterRecoveryStampSlotV1 *slot = &region.thread_replay[2].stamp;
+	flush_unlocked();
+	apply_outputs_unpublished();
+	UT_ASSERT_EQ(flush_calls, 1);
+	UT_ASSERT_EQ(cover_calls, 1);
+	UT_ASSERT_EQ(writer_checks, 2);
+	UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+	UT_ASSERT_EQ(length, sizeof(target_payload));
+	UT_ASSERT(memcmp(bytes, target_payload, sizeof(target_payload)) == 0);
+	target_calls++;
+	if (stamp.token != target_stamp.token)
+		return false;
+	switch (target_fault) {
+	case 1:
+		return false;
+	case 2:
+		siglongjmp(insert_error_boundary, 1);
+		break;
+	case 3:
+		slot->record_end++;
+		break;
+	case 4:
+		slot->record_start++;
+		break;
+	case 5:
+		slot->handle.payload[319] ^= 1;
+		break;
+	case 6:
+		slot->handle.key.window_seq++;
+		break;
+	case 7:
+		insert_allowed = false;
+		break;
+	case 8:
+		writer_reject_on = writer_checks + 1;
+		break;
+	case 9:
+		covered_end--;
+		break;
+	case 10:
+		slot->failed = true;
+		break;
+	}
+	return true;
+}
+
+static void
+flush_unlocked(void)
+{
+	UT_ASSERT(CritSectionCount > 0);
+	for (unsigned i = 0; i <= CLUSTER_RECOVERY_STAMP_SLOTS; i++)
+		UT_ASSERT(SpinLockFree(&region.thread_replay[i].stamp.lock));
+}
+
+/* These are original writer/native WAL leaves, not graph or IO authority.
+ * The real startup accessor is separately exercised in its existing suite. */
+ClusterControlRootResult
+cluster_wal_writer_check(const ClusterWalWriterToken *writer)
+{
+	flush_unlocked();
+	writer_checks++;
+	UT_ASSERT(memcmp(writer, &owner.writer, sizeof(*writer)) == 0);
+	return writer_checks == writer_reject_on ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
+											 : CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+void
+XLogFlush(XLogRecPtr end)
+{
+	ClusterRecoveryStampSlotV1 *slot = &region.thread_replay[2].stamp;
+	flush_unlocked();
+	apply_outputs_unpublished();
+	UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+	UT_ASSERT_EQ(end, slot->record_end);
+	flush_calls++;
+	flush_seen = end;
+	switch (flush_fault) {
+	case 1:
+		siglongjmp(insert_error_boundary, 1);
+		break;
+	case 2:
+		slot->record_end++;
+		break;
+	case 3:
+		slot->record_start++;
+		break;
+	case 4:
+		slot->handle.payload[319] ^= 1;
+		break;
+	case 5:
+		slot->handle.key.window_seq++;
+		break;
+	}
+}
+
+bool
+ClusterXLogStartupFlushCovers(XLogRecPtr end, TimeLineID timeline)
+{
+	flush_unlocked();
+	UT_ASSERT_EQ(MyBackendType, B_STARTUP);
+	UT_ASSERT_EQ(end, flush_seen);
+	UT_ASSERT_EQ(timeline, owner.writer.ref.timeline);
+	cover_calls++;
+	return cover_enabled && covered_end >= end && covered_timeline == timeline;
+}
+
+bool
+XLogInsertAllowed(void)
+{
+	return insert_allowed;
+}
+TransactionId
+GetCurrentTransactionIdIfAny(void)
+{
+	return insert_xid;
+}
+static void
+native_insert_boundary(unsigned stage)
+{
+	UT_ASSERT(CritSectionCount > 0);
+	UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_INSERTING);
+	for (unsigned i = 0; i <= CLUSTER_RECOVERY_STAMP_SLOTS; i++)
+		UT_ASSERT(SpinLockFree(&region.thread_replay[i].stamp.lock));
+	UT_ASSERT_EQ(native_stage + 1, stage);
+	native_stage = stage;
+	native_calls++;
+	if (native_throw == stage)
+		siglongjmp(insert_error_boundary, 1);
+}
+void
+XLogBeginInsert(void)
+{
+	native_insert_boundary(1);
+	UT_ASSERT(insert_allowed);
+	UT_ASSERT(!begininsert_called);
+	begininsert_called = true;
+}
+void
+XLogRegisterData(char *data, uint32 length)
+{
+	native_insert_boundary(2);
+	UT_ASSERT(begininsert_called);
+	UT_ASSERT_EQ(length, 320);
+	UT_ASSERT(memcmp(data, region.thread_replay[2].stamp.handle.payload, 320) == 0);
+	memcpy(registered_payload, data, 320);
+}
+XLogRecPtr
+XLogInsert(RmgrId rmid, uint8 info)
+{
+	native_insert_boundary(3);
+	UT_ASSERT(begininsert_called);
+	UT_ASSERT_EQ(rmid, RM_CLUSTER_UNDO_ID);
+	UT_ASSERT_EQ(info, 0xD0);
+	memset(&native_header, 0, sizeof(native_header));
+	native_header.xl_tot_len = SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + 320;
+	native_header.xl_rmid = rmid;
+	native_header.xl_info = info;
+	hdr_scratch = native_scratch.bytes;
+	memcpy(hdr_scratch, &native_header, SizeOfXLogRecord);
+	((uint8 *) hdr_scratch)[SizeOfXLogRecord] = XLR_BLOCK_ID_DATA_LONG;
+	memcpy(hdr_scratch + SizeOfXLogRecord + 1, &((uint32){320}), sizeof(uint32));
+	hdr_rdt = (XLogRecData){ .data = hdr_scratch, .len = sizeof(native_scratch.bytes),
+		.next = &native_data[0] };
+	native_data[0] = (XLogRecData){ .data = (char *)registered_payload, .len = 320 };
+	begininsert_called = false;
+	ProcLastRecPtr = 0x2000018;
+	XactLastRecEnd = last_insert_record_end = 0x2000413;
+	switch (native_fault) {
+	case 1: native_header.xl_rmid = RM_XLOG_ID; break;
+	case 2: native_header.xl_xid = 100; break;
+	case 3: return InvalidXLogRecPtr;
+	case 4: last_insert_record_end++; break;
+	case 5: ProcLastRecPtr = 0x1FFFFFF; break;
+	case 6: native_header.xl_tot_len++; break;
+	case 7: native_header.xl_info ^= 0x10; break;
+	case 8: registered_payload[319] ^= 1; break;
+	case 9: ((uint8 *) hdr_scratch)[SizeOfXLogRecord] = XLR_BLOCK_ID_DATA_SHORT; break;
+	case 10: hdr_scratch[SizeOfXLogRecord + 1] ^= 1; break;
+	case 11: hdr_rdt.next = NULL; break;
+	case 12: native_data[0].next = &native_data[0]; break;
+	case 13: region.thread_replay[2].stamp.handle.key.window_seq++; break;
+	}
+	native_header.xl_prev = 0x1FFFFF0;
+	INIT_CRC32C(native_header.xl_crc);
+	COMP_CRC32C(native_header.xl_crc, hdr_scratch + SizeOfXLogRecord,
+		SizeOfXLogRecordDataHeaderLong);
+	COMP_CRC32C(native_header.xl_crc, registered_payload, sizeof(registered_payload));
+	COMP_CRC32C(native_header.xl_crc, &native_header, offsetof(XLogRecord, xl_crc));
+	FIN_CRC32C(native_header.xl_crc);
+	memcpy(hdr_scratch, &native_header, SizeOfXLogRecord);
+	return XactLastRecEnd;
+}
+#include "test_cluster_recovery_stamp_insert.inc"
+
+/* Use the actual codec/provider. Allocation must be outside every original
+ * slot lock and the insertion critical section, including observer calls. */
 static pg_cryptohash_ctx *
 stamp_hash_create(pg_cryptohash_type type)
 {
@@ -41,6 +398,35 @@ stamp_hash_create(pg_cryptohash_type type)
 	for (unsigned i = 0; i <= CLUSTER_RECOVERY_STAMP_SLOTS; i++)
 		UT_ASSERT(SpinLockFree(&region.thread_replay[i].stamp.lock));
 	stamp_hash_calls++;
+	hash_calls++;
+	if (stopped_hash_mutation != 0) {
+		ClusterRecoveryStampSlotV1 *slot = &region.thread_replay[2].stamp;
+		unsigned mutation = stopped_hash_mutation;
+		stopped_hash_mutation = 0;
+		stopped_hash_mutations++;
+		if (mutation == 1)
+			slot->handle.payload[CLUSTER_RECOVERY_CTRC_BYTES - 1] ^= 1;
+		else if (mutation == 2)
+			slot->handle.key.window_seq++;
+		else if (mutation == 3) {
+			slot->phase = CLUSTER_RECOVERY_STAMP_INSERTED;
+			slot->record_start = 0x2000010;
+			slot->record_end = 0x20000c0;
+		} else
+			slot->failed = true;
+	}
+	if (observe_reference_hash && target_close_calls > 0) {
+		reference_hash_calls++;
+		UT_ASSERT(!target_held);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
+		reference_outputs_unpublished();
+		if (reference_hash_throw)
+			siglongjmp(*PG_exception_stack, 1);
+		if (reference_hash_refuse)
+			return NULL;
+	}
+	if (hash_throw_at != 0 && hash_calls == hash_throw_at)
+		siglongjmp(*PG_exception_stack, 1);
 	return pg_cryptohash_create(type);
 }
 #define pg_cryptohash_create stamp_hash_create
@@ -74,6 +460,37 @@ fresh(void)
 	CritSectionCount = 0;
 	stamp_hash_calls = 0;
 	IsUnderPostmaster = cluster_enabled = cluster_shared_config = true;
+	ProcLastRecPtr = XactLastRecEnd = last_insert_record_end = InvalidXLogRecPtr;
+	begininsert_called = false;
+	hdr_scratch = NULL;
+	memset(&native_header, 0, sizeof(native_header));
+	memset(&native_scratch, 0, sizeof(native_scratch));
+	memset(&hdr_rdt, 0, sizeof(hdr_rdt));
+	memset(native_data, 0, sizeof(native_data));
+	max_rdatas = 3;
+	max_registered_buffers = 0;
+	insert_allowed = true;
+	insert_xid = InvalidTransactionId;
+	native_calls = native_stage = native_fault = native_throw = 0;
+	flush_calls = writer_checks = cover_calls = writer_reject_on = flush_fault = 0;
+	flush_seen = InvalidXLogRecPtr;
+	covered_end = 0x2000413;
+	covered_timeline = 1;
+	cover_enabled = true;
+	target_calls = target_fault = target_match_calls = 0;
+	target_match_ready = true;
+	target_prepare_calls = target_close_calls = target_prepare_fault = 0;
+	target_held = target_throw_after_prepare = false;
+	hash_throw_at = 0;
+	stopped_hash_mutation = stopped_hash_mutations = 0;
+	observe_reference_hash = reference_hash_refuse = reference_hash_throw = false;
+	reference_hash_calls = 0;
+	reference_raw_output = reference_metadata_output = NULL;
+	target_close_fault = execute_panic_expected = false;
+	execute_report_level = 0;
+	apply_raw = apply_start = NULL;
+	memset(target_payload, 0, sizeof(target_payload));
+	memset(registered_payload, 0, sizeof(registered_payload));
 	memset(&owner, 0, sizeof(owner));
 	owner.writer.ref.claim.identity.system_identifier = 99;
 	memset(owner.writer.ref.claim.identity.storage_uuid, 1, 16);
@@ -524,10 +941,2221 @@ UT_TEST(d0_codec_is_unlocked_and_orphan_remains_pending)
 	UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&capture), CLUSTER_RECOVERY_STAMP_INVALID);
 }
 
+static bool
+begin_d0(ClusterRecoveryStampHandleV1 *h, uint8 terminal)
+{
+	ClusterRecoveryCTRCReleaseV2 r = { 0 };
+	uint8 bytes[CLUSTER_RECOVERY_CTRC_BYTES];
+	r.version = CLUSTER_RECOVERY_CTRC_VERSION;
+	r.length = sizeof(bytes);
+	r.flags = CLUSTER_RECOVERY_CTRC_RELEASE_PROVEN;
+	r.root_id = 100;
+	r.root_generation = 200;
+	r.formation_epoch = owner.writer.epoch;
+	r.recovery_serial = owner.recovery_serial;
+	r.database_incarnation = owner.target.database_incarnation;
+	r.writer_boot = owner.executor_boot;
+	r.covered_history = 4;
+	r.highest_fpi_end = 0x10000;
+	r.cohort_bitmap = 3;
+	r.origin_node_id = owner.target.identity.origin_node_id;
+	r.writer_thread = owner.writer.ref.claim.identity.origin_thread_id;
+	r.target_owner = owner.target.identity.origin_thread_id;
+	r.segment_id = (r.target_owner - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	r.slot_offset = 1;
+	r.wrap = 1;
+	r.xid = 100;
+	r.terminal_outcome = terminal;
+	r.before = (TTSlot){ .xid = r.xid,
+						 .wrap = r.wrap,
+						 .status = terminal,
+						 .commit_scn = terminal == TT_SLOT_COMMITTED ? 11 : 0 };
+	r.after = r.before;
+	r.after.flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+	memset(r.graph_sha256, 5, 32);
+	memset(r.input_sha256, 6, 32);
+	UT_ASSERT(cluster_recovery_ctrc_encode_v2(&r, owner.writer.ref.claim.identity.system_identifier,
+											  bytes, sizeof(bytes)));
+	return cluster_recovery_stamp_prepare_v1(&owner, CLUSTER_RECOVERY_STAMP_D0, bytes,
+											 sizeof(bytes), h);
+}
+
+UT_TEST(d0_commit_abort_lifecycle_and_later_window)
+{
+	for (unsigned outcome = TT_SLOT_COMMITTED; outcome <= TT_SLOT_ABORTED; outcome++) {
+		ClusterRecoveryStampHandleV1 h, next;
+		ClusterRecoveryStampCaptureV1 c;
+		unsigned before;
+		fresh();
+		if (!begin_d0(&h, outcome)) {
+			UT_ASSERT(false);
+			return;
+		}
+		UT_ASSERT(cluster_recovery_stamp_capture_v1(&c));
+		UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&c), CLUSTER_RECOVERY_STAMP_PENDING);
+		before = hash_calls;
+		insert(&h);
+		UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+		UT_ASSERT(cluster_recovery_stamp_durable_v1(&h));
+		UT_ASSERT(cluster_recovery_stamp_clear_v1(&h));
+		UT_ASSERT_EQ(hash_calls, before);
+		UT_ASSERT(begin(&next));
+		UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&c), CLUSTER_RECOVERY_STAMP_COMPLETE);
+		UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+		UT_ASSERT(cluster_recovery_stamp_cancel_v1(&next));
+	}
+}
+
+UT_TEST(d0_sticky_failure_and_normal_stop)
+{
+	ClusterRecoveryStampHandleV1 h;
+	ClusterRecoveryStampCaptureV1 c;
+	fresh();
+	if (!begin_d0(&h, TT_SLOT_ABORTED)) {
+		UT_ASSERT(false);
+		return;
+	}
+	UT_ASSERT(cluster_recovery_stamp_capture_v1(&c));
+	MyBackendType = B_LMON;
+	UT_ASSERT_EQ(cluster_recovery_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	MyBackendType = B_STARTUP;
+	insert(&h);
+	UT_ASSERT(cluster_recovery_stamp_fail_v1(&h));
+	UT_ASSERT(!cluster_recovery_stamp_durable_v1(&h));
+	UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+	UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+	UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&c), CLUSTER_RECOVERY_STAMP_INVALID);
+	MyBackendType = B_LMON;
+	UT_ASSERT_EQ(cluster_recovery_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+}
+
+UT_TEST(d0_owner_correspondence_and_preinsert_cancel)
+{
+	ClusterRecoveryStampHandleV1 h, refused;
+	ClusterRecoveryStampOwnerV1 changed;
+	uint8 bytes[CLUSTER_RECOVERY_CTRC_BYTES];
+	fresh();
+	if (!begin_d0(&h, TT_SLOT_COMMITTED)) {
+		UT_ASSERT(false);
+		return;
+	}
+	memcpy(bytes, h.payload, sizeof(bytes));
+	UT_ASSERT(cluster_recovery_stamp_fail_v1(&h));
+	UT_ASSERT(cluster_recovery_stamp_cancel_v1(&h));
+	for (unsigned i = 0; i < 7; i++) {
+		changed = owner;
+		switch (i) {
+		case 0:
+			changed.writer.ref.claim.identity.origin_thread_id = 3;
+			changed.writer.ref.claim.identity.origin_node_id = 2;
+			break;
+		case 1:
+			changed.writer.ref.claim.identity.origin_owner_incarnation++;
+			changed.executor_boot++;
+			break;
+		case 2:
+			changed.target.identity.origin_thread_id = 3;
+			changed.target.identity.origin_node_id = 2;
+			break;
+		case 3:
+			changed.target.database_incarnation++;
+			changed.writer.ref.claim.database_incarnation++;
+			break;
+		case 4:
+			changed.writer.epoch++;
+			break;
+		case 5:
+			changed.recovery_serial++;
+			break;
+		case 6:
+			changed.writer.ref.claim.identity.system_identifier++;
+			changed.target.identity.system_identifier++;
+			break;
+		}
+		UT_ASSERT(stamp_owner_valid(&changed));
+		memset(&refused, 0xa5, sizeof(refused));
+		UT_ASSERT(!cluster_recovery_stamp_prepare_v1(&changed, CLUSTER_RECOVERY_STAMP_D0, bytes,
+													 sizeof(bytes), &refused));
+		for (unsigned j = 0; j < sizeof(refused); j++)
+			UT_ASSERT_EQ(((uint8 *)&refused)[j], 0);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
+	}
+	UT_ASSERT(cluster_recovery_stamp_prepare_v1(&owner, CLUSTER_RECOVERY_STAMP_D0, bytes,
+												sizeof(bytes), &h));
+	UT_ASSERT(cluster_recovery_stamp_cancel_v1(&h));
+}
+
+UT_TEST(prepared_operation_is_exact_and_observers_validate_unlocked)
+{
+	ClusterRecoveryStampHandleV1 h, altered;
+	ClusterRecoveryStampCaptureV1 capture, refused;
+	ClusterRecoveryStampSlotV1 *slot;
+	unsigned before;
+	fresh();
+	if (!begin_d0(&h, TT_SLOT_ABORTED)) {
+		UT_ASSERT(false);
+		return;
+	}
+	slot = &region.thread_replay[2].stamp;
+	UT_ASSERT(cluster_recovery_stamp_capture_v1(&capture));
+	before = hash_calls;
+	CritSectionCount = 1;
+	for (unsigned i = 0; i < sizeof(h.payload); i++) {
+		altered = h;
+		altered.payload[i] ^= 1;
+		UT_ASSERT(!cluster_recovery_stamp_inserting_v1(&altered));
+		UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_PRE_INSERT);
+	}
+	altered = h;
+	altered.kind = CLUSTER_RECOVERY_STAMP_FPI;
+	UT_ASSERT(!cluster_recovery_stamp_inserting_v1(&altered));
+	altered = h;
+	altered.payload_length--;
+	UT_ASSERT(!cluster_recovery_stamp_inserting_v1(&altered));
+	UT_ASSERT_EQ(hash_calls, before);
+	/* Observer misuse in a critical section refuses before allocating SHA. */
+	UT_ASSERT(!cluster_recovery_stamp_capture_v1(&refused));
+	UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&capture), CLUSTER_RECOVERY_STAMP_INVALID);
+	UT_ASSERT_EQ(hash_calls, before);
+	CritSectionCount = 0;
+	slot->handle.payload[100] ^= 1;
+	UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+	UT_ASSERT(!cluster_recovery_stamp_capture_v1(&refused));
+	UT_ASSERT(!refused.captured && refused.count == 0);
+	UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&capture), CLUSTER_RECOVERY_STAMP_INVALID);
+	MyBackendType = B_LMON;
+	UT_ASSERT_EQ(cluster_recovery_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	MyBackendType = B_STARTUP;
+	slot->handle.payload[100] ^= 1;
+	UT_ASSERT(cluster_recovery_stamp_cancel_v1(&h));
+	UT_ASSERT(begin(&h));
+	altered = h;
+	altered.payload[sizeof(altered.payload) - 1] = 1;
+	UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&altered));
+	UT_ASSERT(cluster_recovery_stamp_cancel_v1(&h));
+}
+
+static void
+native_d0_insert(XLogRecPtr start, XLogRecPtr end)
+{
+	memset(&native_header, 0, sizeof(native_header));
+	native_header.xl_tot_len
+		= SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + CLUSTER_RECOVERY_CTRC_BYTES;
+	native_header.xl_rmid = RM_CLUSTER_UNDO_ID;
+	native_header.xl_info = CLUSTER_RECOVERY_CTRC_WAL_INFO;
+	hdr_scratch = (char *)&native_header;
+	begininsert_called = false;
+	cluster_shared_config = true;
+	ProcLastRecPtr = start;
+	XactLastRecEnd = last_insert_record_end = end;
+}
+
+UT_TEST(d0_native_insert_actual_positions_and_outcomes)
+{
+	for (unsigned outcome = TT_SLOT_COMMITTED; outcome <= TT_SLOT_ABORTED; outcome++) {
+		ClusterRecoveryStampHandleV1 h;
+		ClusterRecoveryStampSlotV1 *slot;
+		unsigned before;
+		fresh();
+		if (!begin_d0(&h, outcome)) {
+			UT_ASSERT(false);
+			return;
+		}
+		slot = &region.thread_replay[2].stamp;
+		/* Deliberately not start+raw_length: WAL page headers/alignment are
+		 * the original inserter's concern, never guessed by the adapter. */
+		native_d0_insert(0x2000018, 0x2000413);
+		before = hash_calls;
+		CritSectionCount = 1;
+		UT_ASSERT(cluster_recovery_stamp_inserting_v1(&h));
+		UT_ASSERT(cluster_recovery_stamp_ctrc_inserted_v2(&h, XactLastRecEnd));
+		UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+		UT_ASSERT_EQ(slot->record_start, ProcLastRecPtr);
+		UT_ASSERT_EQ(slot->record_end, XactLastRecEnd);
+		UT_ASSERT(memcmp(&slot->handle, &h, sizeof(h)) == 0);
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_inserted_v2(&h, XactLastRecEnd));
+		CritSectionCount = 0;
+		UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+		UT_ASSERT(cluster_recovery_stamp_durable_v1(&h));
+		UT_ASSERT(cluster_recovery_stamp_clear_v1(&h));
+		UT_ASSERT_EQ(hash_calls, before);
+	}
+}
+
+UT_TEST(d0_native_insert_context_and_position_refusal)
+{
+	ClusterRecoveryStampHandleV1 h;
+	ClusterRecoveryStampSlotV1 *slot;
+	ClusterRecoveryStampSlotV1 saved;
+	unsigned before;
+	fresh();
+	if (!begin_d0(&h, TT_SLOT_ABORTED)) {
+		UT_ASSERT(false);
+		return;
+	}
+	slot = &region.thread_replay[2].stamp;
+	native_d0_insert(0x2000018, 0x2000413);
+	UT_ASSERT(!cluster_recovery_stamp_ctrc_inserted_v2(&h, XactLastRecEnd));
+	CritSectionCount = 1;
+	UT_ASSERT(!cluster_recovery_stamp_ctrc_inserted_v2(&h, XactLastRecEnd));
+	UT_ASSERT(cluster_recovery_stamp_inserting_v1(&h));
+	saved = *slot;
+	before = hash_calls;
+	for (unsigned i = 0; i < 11; i++) {
+		XLogRecPtr end = 0x2000413;
+		native_d0_insert(0x2000018, end);
+		CritSectionCount = 1;
+		switch (i) {
+		case 0:
+			CritSectionCount = 0;
+			break;
+		case 1:
+			cluster_shared_config = false;
+			break;
+		case 2:
+			begininsert_called = true;
+			break;
+		case 3:
+			hdr_scratch = NULL;
+			break;
+		case 4:
+			end = InvalidXLogRecPtr;
+			break;
+		case 5:
+			last_insert_record_end++;
+			break;
+		case 6:
+			XactLastRecEnd++;
+			break;
+		case 7:
+			ProcLastRecPtr = InvalidXLogRecPtr;
+			break;
+		case 8:
+			ProcLastRecPtr = end;
+			break;
+		case 9:
+			ProcLastRecPtr = end + 1;
+			break;
+		case 10:
+			ProcLastRecPtr = owner.writer.startup_first_lsn - 1;
+			break;
+		}
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_inserted_v2(&h, end));
+		UT_ASSERT(memcmp(slot, &saved, sizeof(saved)) == 0);
+	}
+	UT_ASSERT_EQ(hash_calls, before);
+	CritSectionCount = 0;
+	UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+	UT_ASSERT(!cluster_recovery_stamp_durable_v1(&h));
+}
+
+UT_TEST(d0_native_insert_exact_header_refusal)
+{
+	ClusterRecoveryStampHandleV1 h;
+	ClusterRecoveryStampSlotV1 *slot;
+	ClusterRecoveryStampSlotV1 saved;
+	unsigned before;
+	fresh();
+	if (!begin_d0(&h, TT_SLOT_COMMITTED)) {
+		UT_ASSERT(false);
+		return;
+	}
+	slot = &region.thread_replay[2].stamp;
+	CritSectionCount = 1;
+	UT_ASSERT(cluster_recovery_stamp_inserting_v1(&h));
+	saved = *slot;
+	before = hash_calls;
+	for (unsigned i = 0; i < 7; i++) {
+		native_d0_insert(0x2000018, 0x2000413);
+		switch (i) {
+		case 0:
+			native_header.xl_rmid = RM_XLOG_ID;
+			break;
+		case 1:
+			native_header.xl_info ^= 0x10;
+			break;
+		case 2:
+			native_header.xl_info |= XLR_SPECIAL_REL_UPDATE;
+			break;
+		case 3:
+			native_header.xl_xid = 100;
+			break;
+		case 4:
+			native_header.xl_tot_len--;
+			break;
+		case 5:
+			native_header.xl_tot_len++;
+			break;
+		case 6:
+			native_header.xl_tot_len = 0;
+			break;
+		}
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_inserted_v2(&h, XactLastRecEnd));
+		UT_ASSERT(memcmp(slot, &saved, sizeof(saved)) == 0);
+	}
+	native_d0_insert(0x2000018, 0x2000413);
+	UT_ASSERT(cluster_recovery_stamp_ctrc_inserted_v2(&h, XactLastRecEnd));
+	UT_ASSERT_EQ(hash_calls, before);
+	CritSectionCount = 0;
+}
+
+UT_TEST(d0_native_insert_exact_window_and_sticky_refusal)
+{
+	ClusterRecoveryStampHandleV1 h, changed;
+	ClusterRecoveryStampSlotV1 *slot;
+	ClusterRecoveryStampSlotV1 saved;
+	unsigned before;
+	fresh();
+	if (!begin_d0(&h, TT_SLOT_ABORTED)) {
+		UT_ASSERT(false);
+		return;
+	}
+	slot = &region.thread_replay[2].stamp;
+	CritSectionCount = 1;
+	UT_ASSERT(cluster_recovery_stamp_inserting_v1(&h));
+	native_d0_insert(0x2000018, 0x2000413);
+	saved = *slot;
+	before = hash_calls;
+	UT_ASSERT(!cluster_recovery_stamp_ctrc_inserted_v2(NULL, XactLastRecEnd));
+	for (unsigned i = 0; i < 7; i++) {
+		changed = h;
+		switch (i) {
+		case 0:
+			changed.kind = CLUSTER_RECOVERY_STAMP_C0;
+			break;
+		case 1:
+			changed.payload_length--;
+			break;
+		case 2:
+			changed.key.window_seq++;
+			break;
+		case 3:
+			changed.owner.recovery_serial++;
+			break;
+		case 4:
+			changed.payload[319] ^= 1;
+			break;
+		case 5:
+			MyProcPid++;
+			break;
+		case 6:
+			MyBackendType = B_LMON;
+			break;
+		}
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_inserted_v2(&changed, XactLastRecEnd));
+		UT_ASSERT(memcmp(slot, &saved, sizeof(saved)) == 0);
+		MyProcPid = owner.executor_pid;
+		MyBackendType = B_STARTUP;
+	}
+	UT_ASSERT(cluster_recovery_stamp_fail_v1(&h));
+	saved = *slot;
+	UT_ASSERT(!cluster_recovery_stamp_ctrc_inserted_v2(&h, XactLastRecEnd));
+	UT_ASSERT(memcmp(slot, &saved, sizeof(saved)) == 0);
+	UT_ASSERT_EQ(hash_calls, before);
+	CritSectionCount = 0;
+	UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+}
+
+/* The original adapter/codec/window/native accessor are real. The three
+ * native insertion leaves below the adapter are controlled, not disk WAL. */
+UT_TEST(d0_emitter_exact_payload_positions_and_single_insert)
+{
+	for (unsigned outcome = TT_SLOT_COMMITTED; outcome <= TT_SLOT_ABORTED; outcome++) {
+		ClusterRecoveryStampHandleV1 h;
+		ClusterRecoveryStampSlotV1 *slot;
+		unsigned before;
+		fresh();
+		UT_ASSERT(begin_d0(&h, outcome));
+		slot = &region.thread_replay[2].stamp;
+		if (outcome == TT_SLOT_ABORTED)
+			MyBackendType = B_BG_WORKER;
+		before = hash_calls;
+		CritSectionCount = 1;
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_insert_v2(&h), 0x2000413);
+		UT_ASSERT_EQ(native_calls, 3);
+		UT_ASSERT_EQ(native_stage, 3);
+		UT_ASSERT(memcmp(registered_payload, h.payload, 320) == 0);
+		UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+		UT_ASSERT_EQ(slot->record_start, 0x2000018);
+		UT_ASSERT_EQ(slot->record_end, 0x2000413);
+		UT_ASSERT(!slot->failed);
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_insert_v2(&h), InvalidXLogRecPtr);
+		UT_ASSERT_EQ(native_calls, 3);
+		UT_ASSERT_EQ(hash_calls, before);
+		CritSectionCount = 0;
+		UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+		UT_ASSERT(cluster_recovery_stamp_durable_v1(&h));
+		UT_ASSERT(cluster_recovery_stamp_clear_v1(&h));
+	}
+}
+
+UT_TEST(d0_emitter_preinsert_refusal_is_atomic)
+{
+	for (unsigned i = 0; i < 12; i++) {
+		ClusterRecoveryStampHandleV1 h, changed;
+		ClusterRecoveryStampSlotV1 saved;
+		unsigned before;
+		fresh();
+		UT_ASSERT(begin_d0(&h, TT_SLOT_ABORTED));
+		changed = h;
+		CritSectionCount = 1;
+		switch (i) {
+		case 0: CritSectionCount = 0; break;
+		case 1: changed.kind = CLUSTER_RECOVERY_STAMP_C0; break;
+		case 2: changed.payload_length--; break;
+		case 3: changed.payload[319] ^= 1; break;
+		case 4: changed.key.window_seq++; break;
+		case 5: changed.owner.recovery_serial++; break;
+		case 6: MyProcPid++; break;
+		case 7: MyBackendType = B_LMON; break;
+		case 8: insert_allowed = false; break;
+		case 9: insert_xid = 100; break;
+		case 10: UT_ASSERT(cluster_recovery_stamp_fail_v1(&h)); break;
+		case 11: cluster_shared_config = false; break;
+		}
+		saved = region.thread_replay[2].stamp;
+		before = hash_calls;
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_insert_v2(&changed), InvalidXLogRecPtr);
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_insert_v2(NULL), InvalidXLogRecPtr);
+		UT_ASSERT_EQ(native_calls, 0);
+		UT_ASSERT_EQ(hash_calls, before);
+		UT_ASSERT(memcmp(&region.thread_replay[2].stamp, &saved, sizeof(saved)) == 0);
+	}
+	CritSectionCount = 0;
+}
+
+UT_TEST(d0_emitter_postinsert_refusal_retains_failed_window)
+{
+	for (unsigned fault = 1; fault <= 7; fault++) {
+		ClusterRecoveryStampHandleV1 h;
+		ClusterRecoveryStampCaptureV1 capture;
+		ClusterRecoveryStampSlotV1 *slot;
+		unsigned before;
+		fresh();
+		UT_ASSERT(begin_d0(&h, TT_SLOT_COMMITTED));
+		UT_ASSERT(cluster_recovery_stamp_capture_v1(&capture));
+		slot = &region.thread_replay[2].stamp;
+		native_fault = fault;
+		before = hash_calls;
+		CritSectionCount = 1;
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_insert_v2(&h), InvalidXLogRecPtr);
+		UT_ASSERT_EQ(native_calls, 3);
+		UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_INSERTING);
+		UT_ASSERT(slot->failed);
+		UT_ASSERT(memcmp(&slot->handle, &h, sizeof(h)) == 0);
+		UT_ASSERT_EQ(hash_calls, before);
+		CritSectionCount = 0;
+		UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_durable_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+		UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&capture), CLUSTER_RECOVERY_STAMP_INVALID);
+	}
+}
+
+UT_TEST(d0_emitter_native_error_cannot_cancel_or_complete)
+{
+	for (unsigned stage = 1; stage <= 3; stage++) {
+		ClusterRecoveryStampHandleV1 h;
+		fresh();
+		UT_ASSERT(begin_d0(&h, TT_SLOT_ABORTED));
+		native_throw = stage;
+		CritSectionCount = 1;
+		if (sigsetjmp(insert_error_boundary, 0) == 0) {
+			(void)cluster_recovery_stamp_ctrc_insert_v2(&h);
+			UT_ASSERT(false);
+		} else {
+			UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_INSERTING);
+			UT_ASSERT(memcmp(&region.thread_replay[2].stamp.handle, &h, sizeof(h)) == 0);
+			CritSectionCount = 0;
+			UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+			UT_ASSERT(!cluster_recovery_stamp_durable_v1(&h));
+			UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+		}
+	}
+	CritSectionCount = 0;
+}
+
+static bool
+flush_window(ClusterRecoveryStampHandleV1 *h, uint8 outcome)
+{
+	fresh();
+	if (!begin_d0(h, outcome))
+		return false;
+	CritSectionCount = 1;
+	return cluster_recovery_stamp_ctrc_insert_v2(h) == 0x2000413;
+}
+
+UT_TEST(d0_flush_exact_end_preserves_target_duty)
+{
+	for (unsigned outcome = TT_SLOT_COMMITTED; outcome <= TT_SLOT_ABORTED; outcome++) {
+		ClusterRecoveryStampHandleV1 h;
+		ClusterRecoveryStampSlotV1 saved;
+		ClusterRecoveryStampCaptureV1 capture;
+		unsigned before;
+		UT_ASSERT(flush_window(&h, outcome));
+		saved = region.thread_replay[2].stamp;
+		before = hash_calls;
+		UT_ASSERT(cluster_recovery_stamp_ctrc_flush_v2(&h));
+		UT_ASSERT_EQ(flush_seen, 0x2000413);
+		UT_ASSERT_EQ(flush_calls, 1);
+		UT_ASSERT_EQ(writer_checks, 2);
+		UT_ASSERT_EQ(cover_calls, 1);
+		UT_ASSERT(memcmp(&saved, &region.thread_replay[2].stamp, sizeof(saved)) == 0);
+		UT_ASSERT(cluster_recovery_stamp_ctrc_flush_v2(&h));
+		UT_ASSERT_EQ(flush_calls, 2);
+		UT_ASSERT_EQ(native_calls, 3); /* Never inserts a second D0. */
+		UT_ASSERT_EQ(hash_calls, before);
+		CritSectionCount = 0;
+		UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+		UT_ASSERT(cluster_recovery_stamp_capture_v1(&capture));
+		UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&capture), CLUSTER_RECOVERY_STAMP_PENDING);
+	}
+}
+
+UT_TEST(d0_flush_wrong_handle_and_context_do_no_io)
+{
+	ClusterRecoveryStampHandleV1 h, changed;
+	ClusterRecoveryStampSlotV1 saved;
+	UT_ASSERT(flush_window(&h, TT_SLOT_ABORTED));
+	saved = region.thread_replay[2].stamp;
+	UT_ASSERT(!cluster_recovery_stamp_ctrc_flush_v2(NULL));
+	for (unsigned i = 0; i < 332; i++) {
+		changed = h;
+		switch (i) {
+		case 320:
+			changed.key.window_seq++;
+			break;
+		case 321:
+			changed.key.slot_generation++;
+			break;
+		case 322:
+			changed.key.target_thread = 3;
+			break;
+		case 323:
+			changed.owner.recovery_serial++;
+			break;
+		case 324:
+			changed.owner.writer.ref.timeline++;
+			break;
+		case 325:
+			changed.kind = CLUSTER_RECOVERY_STAMP_C0;
+			break;
+		case 326:
+			changed.payload_length--;
+			break;
+		case 327:
+			CritSectionCount = 0;
+			break;
+		case 328:
+			MyBackendType = B_BG_WORKER;
+			break;
+		case 329:
+			MyProcPid++;
+			break;
+		case 330:
+			cluster_enabled = false;
+			break;
+		case 331:
+			IsUnderPostmaster = false;
+			break;
+		default:
+			changed.payload[i] ^= 1;
+			break;
+		}
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_flush_v2(&changed));
+		UT_ASSERT(memcmp(&saved, &region.thread_replay[2].stamp, sizeof(saved)) == 0);
+		CritSectionCount = 1;
+		MyBackendType = B_STARTUP;
+		MyProcPid = owner.executor_pid;
+		cluster_enabled = IsUnderPostmaster = true;
+	}
+	UT_ASSERT_EQ(flush_calls + writer_checks + cover_calls, 0);
+	CritSectionCount = 0;
+}
+
+UT_TEST(d0_flush_noninserted_and_failed_windows_refuse)
+{
+	ClusterRecoveryStampHandleV1 h;
+	ClusterRecoveryStampSlotV1 saved;
+	fresh();
+	UT_ASSERT(begin_d0(&h, TT_SLOT_COMMITTED));
+	CritSectionCount = 1;
+	saved = region.thread_replay[2].stamp;
+	UT_ASSERT(!cluster_recovery_stamp_ctrc_flush_v2(&h));
+	UT_ASSERT(memcmp(&saved, &region.thread_replay[2].stamp, sizeof(saved)) == 0);
+	UT_ASSERT(cluster_recovery_stamp_inserting_v1(&h));
+	saved = region.thread_replay[2].stamp;
+	UT_ASSERT(!cluster_recovery_stamp_ctrc_flush_v2(&h));
+	UT_ASSERT(memcmp(&saved, &region.thread_replay[2].stamp, sizeof(saved)) == 0);
+	UT_ASSERT(flush_window(&h, TT_SLOT_COMMITTED));
+	UT_ASSERT(cluster_recovery_stamp_fail_v1(&h));
+	saved = region.thread_replay[2].stamp;
+	UT_ASSERT(!cluster_recovery_stamp_ctrc_flush_v2(&h));
+	UT_ASSERT(memcmp(&saved, &region.thread_replay[2].stamp, sizeof(saved)) == 0);
+	UT_ASSERT_EQ(flush_calls + writer_checks + cover_calls, 0);
+	UT_ASSERT(flush_window(&h, TT_SLOT_COMMITTED));
+	UT_ASSERT(cluster_recovery_stamp_durable_v1(&h)); /* Fixture-only metadata transition. */
+	saved = region.thread_replay[2].stamp;
+	UT_ASSERT(!cluster_recovery_stamp_ctrc_flush_v2(&h));
+	UT_ASSERT(memcmp(&saved, &region.thread_replay[2].stamp, sizeof(saved)) == 0);
+	UT_ASSERT_EQ(flush_calls + writer_checks + cover_calls, 0);
+	CritSectionCount = 0;
+}
+
+UT_TEST(d0_flush_refusal_retains_sticky_inserted_responsibility)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		ClusterRecoveryStampHandleV1 h;
+		ClusterRecoveryStampSlotV1 *slot;
+		UT_ASSERT(flush_window(&h, TT_SLOT_ABORTED));
+		slot = &region.thread_replay[2].stamp;
+		switch (fault) {
+		case 0:
+			writer_reject_on = 1;
+			break;
+		case 1:
+			insert_allowed = false;
+			break;
+		case 2:
+			covered_end--;
+			break;
+		case 3:
+			covered_timeline++;
+			break;
+		case 4:
+			writer_reject_on = 2;
+			break;
+		}
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_flush_v2(&h));
+		UT_ASSERT_EQ(flush_calls, fault < 2 ? 0 : 1);
+		UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+		UT_ASSERT_EQ(slot->record_end, 0x2000413);
+		UT_ASSERT(slot->failed);
+		UT_ASSERT(memcmp(&slot->handle, &h, sizeof(h)) == 0);
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_flush_v2(&h));
+		UT_ASSERT_EQ(flush_calls, fault < 2 ? 0 : 1);
+		CritSectionCount = 0;
+		UT_ASSERT(!cluster_recovery_stamp_durable_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+	}
+}
+
+UT_TEST(d0_flush_revalidates_window_after_native_wait)
+{
+	for (unsigned fault = 2; fault <= 5; fault++) {
+		ClusterRecoveryStampHandleV1 h;
+		ClusterRecoveryStampSlotV1 *slot;
+		UT_ASSERT(flush_window(&h, TT_SLOT_COMMITTED));
+		slot = &region.thread_replay[2].stamp;
+		flush_fault = fault;
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_flush_v2(&h));
+		UT_ASSERT_EQ(flush_calls, 1);
+		UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+		/* Exact old handles must never poison a changed operation/key. */
+		UT_ASSERT_EQ(slot->failed, fault < 4);
+		UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+		CritSectionCount = 0;
+	}
+}
+
+UT_TEST(d0_flush_native_error_does_not_retire_window)
+{
+	ClusterRecoveryStampHandleV1 h;
+	UT_ASSERT(flush_window(&h, TT_SLOT_ABORTED));
+	flush_fault = 1;
+	if (sigsetjmp(insert_error_boundary, 0) == 0) {
+		(void)cluster_recovery_stamp_ctrc_flush_v2(&h);
+		UT_ASSERT(false);
+	} else {
+		ClusterRecoveryStampSlotV1 *slot = &region.thread_replay[2].stamp;
+		UT_ASSERT_EQ(flush_calls, 1);
+		UT_ASSERT_EQ(cover_calls, 0);
+		UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+		UT_ASSERT_EQ(slot->record_end, 0x2000413);
+		UT_ASSERT(memcmp(&slot->handle, &h, sizeof(h)) == 0);
+		UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+	}
+	/* Synthetic unwind is not real critical-section PANIC process death. */
+	CritSectionCount = 0;
+}
+
+static bool
+finish_window(ClusterRecoveryStampHandleV1 *h, uint8 outcome)
+{
+	if (!flush_window(h, outcome))
+		return false;
+	memcpy(target_payload, h->payload, sizeof(target_payload));
+	return true;
+}
+
+UT_TEST(d0_finish_flushes_bound_target_before_clear)
+{
+	for (unsigned outcome = TT_SLOT_COMMITTED; outcome <= TT_SLOT_ABORTED; outcome++) {
+		ClusterRecoveryStampHandleV1 h;
+		ClusterRecoveryStampCaptureV1 capture;
+		unsigned before;
+		UT_ASSERT(finish_window(&h, outcome));
+		CritSectionCount = 0;
+		UT_ASSERT(cluster_recovery_stamp_capture_v1(&capture));
+		CritSectionCount = 1;
+		before = hash_calls;
+		UT_ASSERT(cluster_recovery_stamp_ctrc_finish_v2(&h, target_stamp));
+		UT_ASSERT_EQ(target_calls, 1);
+		UT_ASSERT_EQ(flush_calls, 1);
+		UT_ASSERT_EQ(writer_checks, 3);
+		UT_ASSERT_EQ(cover_calls, 2);
+		UT_ASSERT_EQ(native_calls, 3);
+		UT_ASSERT_EQ(hash_calls, before);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
+		UT_ASSERT(!region.thread_replay[2].stamp.failed);
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_finish_v2(&h, target_stamp));
+		UT_ASSERT_EQ(target_calls, 1);
+		CritSectionCount = 0;
+		UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&capture), CLUSTER_RECOVERY_STAMP_COMPLETE);
+	}
+}
+UT_TEST(d0_finish_wrong_operation_and_context_do_no_io)
+{
+	ClusterRecoveryStampHandleV1 h, changed;
+	ClusterRecoveryStampSlotV1 saved;
+	UT_ASSERT(finish_window(&h, TT_SLOT_ABORTED));
+	saved = region.thread_replay[2].stamp;
+	UT_ASSERT(!cluster_recovery_stamp_ctrc_finish_v2(NULL, target_stamp));
+	for (unsigned i = 0; i < 329; i++) {
+		changed = h;
+		switch (i) {
+		case 320:
+			changed.key.window_seq++;
+			break;
+		case 321:
+			changed.key.slot_generation++;
+			break;
+		case 322:
+			changed.owner.recovery_serial++;
+			break;
+		case 323:
+			changed.kind = CLUSTER_RECOVERY_STAMP_C0;
+			break;
+		case 324:
+			changed.payload_length--;
+			break;
+		case 325:
+			CritSectionCount = 0;
+			break;
+		case 326:
+			MyBackendType = B_BG_WORKER;
+			break;
+		case 327:
+			MyProcPid++;
+			break;
+		case 328:
+			cluster_enabled = false;
+			break;
+		default:
+			changed.payload[i] ^= 1;
+			break;
+		}
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_finish_v2(&changed, target_stamp));
+		UT_ASSERT(memcmp(&saved, &region.thread_replay[2].stamp, sizeof(saved)) == 0);
+		CritSectionCount = 1;
+		MyBackendType = B_STARTUP;
+		MyProcPid = owner.executor_pid;
+		cluster_enabled = true;
+	}
+	UT_ASSERT_EQ(flush_calls + writer_checks + cover_calls + target_calls, 0);
+	CritSectionCount = 0;
+}
+UT_TEST(d0_finish_refusal_retains_exact_inserted_duty)
+{
+	for (unsigned mode = 0; mode < 6; mode++) {
+		ClusterRecoveryStampHandleV1 h;
+		ClusterUndoSmgrRecoveryStampV1 token = target_stamp;
+		UT_ASSERT(finish_window(&h, TT_SLOT_COMMITTED));
+		switch (mode) {
+		case 0:
+			token.token = 0;
+			break;
+		case 1:
+			token.token++;
+			break;
+		case 2:
+			target_fault = 1;
+			break;
+		case 3:
+			writer_reject_on = 1;
+			break;
+		case 4:
+			covered_end--;
+			break;
+		case 5:
+			writer_reject_on = 2;
+			break;
+		}
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_finish_v2(&h, token));
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+		UT_ASSERT(region.thread_replay[2].stamp.failed);
+		UT_ASSERT(memcmp(&region.thread_replay[2].stamp.handle, &h, sizeof(h)) == 0);
+		UT_ASSERT_EQ(target_calls, mode == 1 || mode == 2 ? 1 : 0);
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_finish_v2(&h, target_stamp));
+		UT_ASSERT(!cluster_recovery_stamp_durable_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+		CritSectionCount = 0;
+	}
+}
+UT_TEST(d0_finish_rechecks_writer_coverage_and_same_window_after_target)
+{
+	for (unsigned fault = 3; fault <= 10; fault++) {
+		ClusterRecoveryStampHandleV1 h;
+		UT_ASSERT(finish_window(&h, TT_SLOT_ABORTED));
+		target_fault = fault;
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_finish_v2(&h, target_stamp));
+		UT_ASSERT_EQ(target_calls, 1);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.failed, fault != 5 && fault != 6);
+		UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+		CritSectionCount = 0;
+	}
+}
+UT_TEST(d0_finish_native_error_never_retires_inserted_window)
+{
+	for (unsigned mode = 0; mode < 2; mode++) {
+		ClusterRecoveryStampHandleV1 h;
+		UT_ASSERT(finish_window(&h, TT_SLOT_ABORTED));
+		if (mode == 0)
+			flush_fault = 1;
+		else
+			target_fault = 2;
+		if (sigsetjmp(insert_error_boundary, 0) == 0) {
+			(void)cluster_recovery_stamp_ctrc_finish_v2(&h, target_stamp);
+			UT_ASSERT(false);
+		} else {
+			UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+			UT_ASSERT_EQ(target_calls, mode);
+			UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+			UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+		}
+		/* Controlled unwind does not prove real PANIC process death. */
+		CritSectionCount = 0;
+	}
+}
+
+
+#define D0_RAW_BYTES (SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + 320)
+
+/* Native insertion/flush/storage remain controlled leaves. The chain copy,
+ * stamp owner and CRC/SHA implementation are actual production functions. */
+static void
+snapshot_insert(ClusterRecoveryStampHandleV1 *h)
+{
+	fresh();
+	UT_ASSERT(begin_d0(h, TT_SLOT_COMMITTED));
+	CritSectionCount = 1;
+	UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_insert_v2(h), 0x2000413);
+}
+
+UT_TEST(d0_snapshot_exact_final_raw_survives_native_reuse)
+{
+	for (unsigned outcome = TT_SLOT_COMMITTED; outcome <= TT_SLOT_ABORTED; outcome++) {
+		ClusterRecoveryStampHandleV1 h;
+		uint8 raw[D0_RAW_BYTES], saved[D0_RAW_BYTES], digest[32], again[32];
+		XLogRecord copied;
+		XLogRecPtr start = 0, end;
+		unsigned before;
+		fresh();
+		UT_ASSERT(begin_d0(&h, outcome));
+		before = hash_calls;
+		CritSectionCount = 1;
+		end = cluster_recovery_stamp_ctrc_insert_record_v2(&h, raw, sizeof(raw), &start);
+		UT_ASSERT_EQ(end, 0x2000413);
+		UT_ASSERT_EQ(start, 0x2000018);
+		if (end == 0) { CritSectionCount = 0; continue; }
+		UT_ASSERT_EQ(native_calls, 3);
+		UT_ASSERT_EQ(flush_calls + target_calls, 0);
+		UT_ASSERT_EQ(hash_calls, before);
+		memcpy(&copied, raw, SizeOfXLogRecord);
+		UT_ASSERT_EQ(copied.xl_prev, native_header.xl_prev);
+		UT_ASSERT_EQ(copied.xl_crc, native_header.xl_crc);
+		UT_ASSERT(memcmp(raw, native_scratch.bytes, sizeof(native_scratch.bytes)) == 0);
+		UT_ASSERT(memcmp(raw + sizeof(native_scratch.bytes), h.payload, 320) == 0);
+		memcpy(saved, raw, sizeof(raw));
+		memcpy(target_payload, h.payload, 320);
+		UT_ASSERT(cluster_recovery_stamp_ctrc_finish_v2(&h, target_stamp));
+		UT_ASSERT_EQ(hash_calls, before);
+		CritSectionCount = 0;
+		UT_ASSERT(cluster_recovery_ctrc_record_hash_v2(h.owner.target.claim_sha256,
+			start, end, raw, sizeof(raw), digest));
+		/* Construction storage is no longer a durable reference after reuse. */
+		memset(&native_scratch, 0xCC, sizeof(native_scratch));
+		memset(registered_payload, 0xDD, sizeof(registered_payload));
+		last_insert_record_end = InvalidXLogRecPtr;
+		UT_ASSERT(memcmp(raw, saved, sizeof(raw)) == 0);
+		UT_ASSERT(cluster_recovery_ctrc_record_hash_v2(h.owner.target.claim_sha256,
+			start, end, raw, sizeof(raw), again));
+		UT_ASSERT(memcmp(digest, again, 32) == 0);
+		raw[sizeof(raw)-1] ^= 1;
+		UT_ASSERT(!cluster_recovery_ctrc_record_hash_v2(h.owner.target.claim_sha256,
+			start, end, raw, sizeof(raw), again));
+	}
+}
+
+UT_TEST(d0_snapshot_preinsert_refusal_is_atomic)
+{
+	for (unsigned mode = 0; mode < 9; mode++) {
+		ClusterRecoveryStampHandleV1 h, saved;
+		ClusterRecoveryStampSlotV1 slot;
+		uint8 raw[D0_RAW_BYTES], before[D0_RAW_BYTES];
+		void *out = raw;
+		XLogRecPtr start = 91, *start_out = &start;
+		Size len = sizeof(raw);
+		fresh();
+		UT_ASSERT(begin_d0(&h, TT_SLOT_COMMITTED));
+		CritSectionCount = 1;
+		memset(raw, 0xA5, sizeof(raw));
+		memcpy(before, raw, sizeof(raw));
+		switch (mode) {
+		case 0: out = NULL; break;
+		case 1: len--; break;
+		case 2: len++; break;
+		case 3: start_out = NULL; break;
+		case 4: start_out = (XLogRecPtr *)raw; break;
+		case 5: out = &h; break;
+		case 6: start_out = (XLogRecPtr *)&h; break;
+		case 7: CritSectionCount = 0; break;
+		case 8: out = &region.thread_replay[2].stamp; break;
+		}
+		saved = h;
+		stamp_snapshot(&region.thread_replay[2].stamp, &slot);
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_insert_record_v2(&h, out, len, start_out), 0);
+		UT_ASSERT_EQ(native_calls + flush_calls + target_calls, 0);
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(raw, before, sizeof(raw)) == 0);
+		UT_ASSERT(memcmp(&h, &saved, sizeof(h)) == 0);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, slot.phase);
+		UT_ASSERT(!region.thread_replay[2].stamp.failed);
+		CritSectionCount = 0;
+	}
+}
+
+UT_TEST(d0_snapshot_postinsert_refusal_is_sticky_and_atomic)
+{
+	for (unsigned fault = 1; fault <= 13; fault++) {
+		ClusterRecoveryStampHandleV1 h;
+		uint8 raw[D0_RAW_BYTES], before[D0_RAW_BYTES];
+		XLogRecPtr start = 91;
+		fresh();
+		UT_ASSERT(begin_d0(&h, TT_SLOT_ABORTED));
+		memset(raw, 0xA5, sizeof(raw));
+		memcpy(before, raw, sizeof(raw));
+		native_fault = fault;
+		CritSectionCount = 1;
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_insert_record_v2(&h, raw, sizeof(raw), &start), 0);
+		UT_ASSERT_EQ(native_calls, 3);
+		UT_ASSERT_EQ(flush_calls + target_calls, 0);
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(raw, before, sizeof(raw)) == 0);
+		UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_durable_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+		if (fault == 13)
+			UT_ASSERT(!region.thread_replay[2].stamp.failed);
+		else
+			UT_ASSERT(region.thread_replay[2].stamp.failed);
+		CritSectionCount = 0;
+	}
+}
+
+UT_TEST(native_record_copy_exact_split_zero_fragments_unaligned)
+{
+	ClusterRecoveryStampHandleV1 h;
+	uint8 output[D0_RAW_BYTES + 2], expected[D0_RAW_BYTES];
+	XLogRecPtr start = 0;
+	snapshot_insert(&h);
+	memcpy(expected, native_scratch.bytes, sizeof(native_scratch.bytes));
+	memcpy(expected + sizeof(native_scratch.bytes), registered_payload, 320);
+	native_data[0].len = 127;
+	native_data[0].next = &native_data[1];
+	native_data[1] = (XLogRecData){ .data = NULL, .len = 0, .next = &native_data[2] };
+	native_data[2] = (XLogRecData){ .data = (char *)registered_payload + 127, .len = 193 };
+	memset(output, 0xA5, sizeof(output));
+	UT_ASSERT(XLogCopyLastInsertRecord(XactLastRecEnd, output + 1, D0_RAW_BYTES, &start));
+	UT_ASSERT_EQ(start, ProcLastRecPtr);
+	UT_ASSERT(memcmp(output + 1, expected, sizeof(expected)) == 0);
+	UT_ASSERT_EQ(output[0], 0xA5);
+	UT_ASSERT_EQ(output[sizeof(output)-1], 0xA5);
+	CritSectionCount = 0;
+}
+
+UT_TEST(native_record_copy_rejects_incomplete_extra_and_cyclic_chains)
+{
+	for (unsigned mode = 0; mode < 11; mode++) {
+		ClusterRecoveryStampHandleV1 h;
+		uint8 output[D0_RAW_BYTES], before[D0_RAW_BYTES];
+		XLogRecPtr start = 91;
+		snapshot_insert(&h);
+		memset(output, 0xA5, sizeof(output));
+		memcpy(before, output, sizeof(output));
+		switch (mode) {
+		case 0: hdr_rdt.next = NULL; break;
+		case 1: native_data[0].len--; break;
+		case 2: native_data[0].len++; break;
+		case 3: native_data[0].data = NULL; break;
+		case 4: native_data[0].next = &native_data[0]; break;
+		case 5: hdr_rdt.len = SizeOfXLogRecord - 1; break;
+		case 6: hdr_rdt.data++; break;
+		case 7: max_rdatas = 0; break;
+		case 8: native_data[0].next = &native_data[1];
+			native_data[1].len = 1; native_data[1].data = (char *)output; break;
+		case 9: ((XLogRecord *)hdr_scratch)->xl_tot_len--; break;
+		case 10: native_data[0].next = &native_data[1];
+			native_data[1].next = &native_data[1]; break;
+		}
+		UT_ASSERT(!XLogCopyLastInsertRecord(XactLastRecEnd, output, sizeof(output), &start));
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(output, before, sizeof(output)) == 0);
+		CritSectionCount = 0;
+	}
+}
+
+UT_TEST(native_record_copy_refuses_stale_construction_and_lengths)
+{
+	for (unsigned mode = 0; mode < 12; mode++) {
+		ClusterRecoveryStampHandleV1 h;
+		uint8 output[D0_RAW_BYTES], before[D0_RAW_BYTES];
+		XLogRecPtr start = 91, end;
+		Size length = sizeof(output);
+		snapshot_insert(&h);
+		end = XactLastRecEnd;
+		memset(output, 0xA5, sizeof(output));
+		memcpy(before, output, sizeof(output));
+		switch (mode) {
+		case 0: begininsert_called = true; break;
+		case 1: last_insert_record_end = 0; break;
+		case 2: end++; break;
+		case 3: XactLastRecEnd++; break;
+		case 4: ProcLastRecPtr = 0; break;
+		case 5: ProcLastRecPtr = end; break;
+		case 6: cluster_shared_config = false; break;
+		case 7: hdr_scratch = NULL; break;
+		case 8: length--; break;
+		case 9: length++; break;
+		case 10: length = SizeOfXLogRecord - 1; break;
+		case 11: length = XLogRecordMaxSize + (Size)1; break;
+		}
+		UT_ASSERT(!XLogCopyLastInsertRecord(end, output, length, &start));
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(output, before, sizeof(output)) == 0);
+		CritSectionCount = 0;
+	}
+}
+
+UT_TEST(native_record_copy_refuses_input_and_output_aliases)
+{
+	for (unsigned mode = 0; mode < 8; mode++) {
+		ClusterRecoveryStampHandleV1 h;
+		uint8 output[D0_RAW_BYTES], before[D0_RAW_BYTES], source[320];
+		XLogRecData nodes[4];
+		XLogRecPtr start = 91, *start_out = &start;
+		void *raw = output;
+		snapshot_insert(&h);
+		memset(output, 0xA5, sizeof(output));
+		memcpy(before, output, sizeof(output));
+		memcpy(source, registered_payload, sizeof(source));
+		nodes[0] = hdr_rdt;
+		memcpy(nodes + 1, native_data, sizeof(native_data));
+		switch (mode) {
+		case 0: raw = hdr_scratch; break;
+		case 1: raw = registered_payload; break;
+		case 2: raw = &native_data[0]; break;
+		case 3: start_out = (XLogRecPtr *)output; break;
+		case 4: start_out = (XLogRecPtr *)registered_payload; break;
+		case 5: start_out = (XLogRecPtr *)&native_data[0]; break;
+		case 6: raw = NULL; break;
+		case 7: start_out = NULL; break;
+		}
+		UT_ASSERT(!XLogCopyLastInsertRecord(XactLastRecEnd, raw, sizeof(output), start_out));
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(output, before, sizeof(output)) == 0);
+		UT_ASSERT(memcmp(source, registered_payload, sizeof(source)) == 0);
+		UT_ASSERT(memcmp(&nodes[0], &hdr_rdt, sizeof(hdr_rdt)) == 0);
+		UT_ASSERT(memcmp(nodes + 1, native_data, sizeof(native_data)) == 0);
+		CritSectionCount = 0;
+	}
+}
+
+UT_TEST(d0_apply_publishes_only_after_exact_finish)
+{
+	for (unsigned outcome = TT_SLOT_COMMITTED; outcome <= TT_SLOT_ABORTED; outcome++) {
+		ClusterRecoveryStampHandleV1 h;
+		uint8 raw[D0_RAW_BYTES + 2], saved[D0_RAW_BYTES], address[sizeof(XLogRecPtr) + 2];
+		uint8 digest[32];
+		XLogRecPtr start = 91, end;
+		unsigned before;
+		fresh();
+		UT_ASSERT(begin_d0(&h, outcome));
+		memcpy(target_payload, h.payload, sizeof(target_payload));
+		memset(raw, 0xA5, sizeof(raw));
+		memset(address, 0xA5, sizeof(address));
+		memcpy(address + 1, &start, sizeof(start));
+		apply_raw = raw + 1;
+		apply_start = address + 1;
+		before = hash_calls;
+		CritSectionCount = 2;
+		end = cluster_recovery_stamp_ctrc_apply_v2(&h, target_stamp, raw + 1,
+			D0_RAW_BYTES, (XLogRecPtr *)(address + 1));
+		UT_ASSERT_EQ(end, 0x2000413);
+		UT_ASSERT_EQ(CritSectionCount, 2);
+		if (end == 0) { CritSectionCount = 0; continue; }
+		memcpy(&start, address + 1, sizeof(start));
+		UT_ASSERT_EQ(start, 0x2000018);
+		UT_ASSERT_EQ(native_calls, 3);
+		UT_ASSERT_EQ(flush_calls, 1);
+		UT_ASSERT_EQ(target_calls, 1);
+		UT_ASSERT_EQ(writer_checks, 3);
+		UT_ASSERT_EQ(cover_calls, 2);
+		UT_ASSERT_EQ(hash_calls, before);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
+		UT_ASSERT(!region.thread_replay[2].stamp.failed);
+		UT_ASSERT(memcmp(raw + 1, native_scratch.bytes, sizeof(native_scratch.bytes)) == 0);
+		UT_ASSERT(memcmp(raw + 1 + sizeof(native_scratch.bytes), h.payload, 320) == 0);
+		UT_ASSERT_EQ(raw[0], 0xA5);
+		UT_ASSERT_EQ(raw[sizeof(raw)-1], 0xA5);
+		UT_ASSERT_EQ(address[0], 0xA5);
+		UT_ASSERT_EQ(address[sizeof(address)-1], 0xA5);
+		memcpy(saved, raw + 1, sizeof(saved));
+		/* An already completed handle cannot insert again or touch outputs. */
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_apply_v2(&h, target_stamp, raw + 1,
+			D0_RAW_BYTES, (XLogRecPtr *)(address + 1)), 0);
+		UT_ASSERT_EQ(native_calls, 3);
+		UT_ASSERT_EQ(flush_calls + target_calls, 2);
+		UT_ASSERT(memcmp(saved, raw + 1, sizeof(saved)) == 0);
+		CritSectionCount = 0;
+		UT_ASSERT(cluster_recovery_ctrc_record_hash_v2(h.owner.target.claim_sha256,
+			start, end, raw + 1, D0_RAW_BYTES, digest));
+		memset(&native_scratch, 0xCC, sizeof(native_scratch));
+		memset(registered_payload, 0xDD, sizeof(registered_payload));
+		UT_ASSERT(memcmp(saved, raw + 1, sizeof(saved)) == 0);
+	}
+	apply_raw = apply_start = NULL;
+}
+
+UT_TEST(d0_apply_preinsert_refusal_preserves_outputs_and_window)
+{
+	for (unsigned mode = 0; mode < 19; mode++) {
+		ClusterRecoveryStampHandleV1 h, saved;
+		const ClusterRecoveryStampHandleV1 *input = &h;
+		ClusterUndoSmgrRecoveryStampV1 token = target_stamp;
+		uint8 raw[D0_RAW_BYTES], before[D0_RAW_BYTES];
+		void *out = raw;
+		XLogRecPtr start = 91, *start_out = &start;
+		Size length = sizeof(raw);
+		fresh();
+		UT_ASSERT(begin_d0(&h, TT_SLOT_COMMITTED));
+		memcpy(target_payload, h.payload, sizeof(target_payload));
+		memset(raw, 0xA5, sizeof(raw));
+		memcpy(before, raw, sizeof(raw));
+		CritSectionCount = 1;
+		switch (mode) {
+		case 0: input = NULL; break;
+		case 1: out = NULL; break;
+		case 2: start_out = NULL; break;
+		case 3: length--; break;
+		case 4: length++; break;
+		case 5: start_out = (XLogRecPtr *)raw; break;
+		case 6: out = &h; break;
+		case 7: start_out = (XLogRecPtr *)&h; break;
+		case 8: out = &region.thread_replay[2].stamp; break;
+		case 9: start_out = (XLogRecPtr *)&region.thread_replay[2].stamp; break;
+		case 10: token.token = 0; break;
+		case 11: CritSectionCount = 0; break;
+		case 12: MyBackendType = B_BACKEND; break;
+		case 13: MyProcPid++; break;
+		case 14: cluster_enabled = false; break;
+		case 15: insert_allowed = false; break;
+		case 16: insert_xid = 100; break;
+		case 17: h.key.target_thread = 0; break;
+		case 18: cluster_shared_config = false; break;
+		}
+		saved = h;
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_apply_v2(input, token, out, length, start_out), 0);
+		UT_ASSERT_EQ(native_calls + flush_calls + target_calls, 0);
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(raw, before, sizeof(raw)) == 0);
+		UT_ASSERT(memcmp(&saved, &h, sizeof(h)) == 0);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_PRE_INSERT);
+		UT_ASSERT(!region.thread_replay[2].stamp.failed);
+		CritSectionCount = 0;
+	}
+}
+
+UT_TEST(d0_apply_bound_target_refusal_is_preinsert_and_cancelable)
+{
+	for (unsigned mode = 0; mode < 5; mode++) {
+		ClusterRecoveryStampHandleV1 h;
+		ClusterUndoSmgrRecoveryStampV1 token = target_stamp;
+		uint8 raw[D0_RAW_BYTES], before[D0_RAW_BYTES];
+		XLogRecPtr start = 91;
+
+		fresh();
+		UT_ASSERT(begin_d0(&h, TT_SLOT_COMMITTED));
+		memcpy(target_payload, h.payload, sizeof(target_payload));
+		memset(raw, 0xA5, sizeof(raw));
+		memcpy(before, raw, sizeof(raw));
+		switch (mode) {
+		case 0: token.token++; break;
+		case 1: target_payload[0] ^= 1; break;
+		case 2: target_payload[224] ^= 1; break;
+		case 3: target_payload[288] ^= 1; break;
+		case 4: target_match_ready = false; break;
+		}
+		CritSectionCount = 1;
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_apply_v2(&h, token, raw, sizeof(raw), &start), 0);
+		UT_ASSERT_EQ(target_match_calls, 1);
+		UT_ASSERT_EQ(native_calls + flush_calls + target_calls, 0);
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(raw, before, sizeof(raw)) == 0);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_PRE_INSERT);
+		UT_ASSERT(!region.thread_replay[2].stamp.failed);
+		CritSectionCount = 0;
+		UT_ASSERT(cluster_recovery_stamp_cancel_v1(&h));
+	}
+}
+
+UT_TEST(d0_apply_snapshot_refusal_never_flushes_or_publishes)
+{
+	const unsigned faults[] = { 1, 8, 12, 13 };
+	for (unsigned i = 0; i < lengthof(faults); i++) {
+		ClusterRecoveryStampHandleV1 h;
+		uint8 raw[D0_RAW_BYTES], before[D0_RAW_BYTES];
+		XLogRecPtr start = 91;
+		fresh();
+		UT_ASSERT(begin_d0(&h, TT_SLOT_ABORTED));
+		memcpy(target_payload, h.payload, sizeof(target_payload));
+		memset(raw, 0xA5, sizeof(raw));
+		memcpy(before, raw, sizeof(raw));
+		native_fault = faults[i];
+		CritSectionCount = 1;
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_apply_v2(&h, target_stamp, raw, sizeof(raw), &start), 0);
+		UT_ASSERT_EQ(native_calls, 3);
+		UT_ASSERT_EQ(flush_calls + target_calls, 0);
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(raw, before, sizeof(raw)) == 0);
+		UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.failed, faults[i] != 13);
+		CritSectionCount = 0;
+	}
+}
+
+UT_TEST(d0_apply_finish_refusal_retains_duty_and_private_snapshot)
+{
+	for (unsigned mode = 1; mode < 8; mode++) {
+		ClusterRecoveryStampHandleV1 h;
+		ClusterUndoSmgrRecoveryStampV1 token = target_stamp;
+		uint8 raw[D0_RAW_BYTES], before[D0_RAW_BYTES];
+		XLogRecPtr start = 91;
+		unsigned calls;
+		fresh();
+		UT_ASSERT(begin_d0(&h, TT_SLOT_COMMITTED));
+		memcpy(target_payload, h.payload, sizeof(target_payload));
+		memset(raw, 0xA5, sizeof(raw));
+		memcpy(before, raw, sizeof(raw));
+		apply_raw = raw;
+		apply_start = (uint8 *)&start;
+		switch (mode) {
+		case 1: writer_reject_on = 1; break;
+		case 2: covered_end--; break;
+		case 3: flush_fault = 2; break;
+		case 4: target_fault = 1; break;
+		case 5: target_fault = 6; break;
+		case 6: target_fault = 8; break;
+		case 7: target_fault = 9; break;
+		}
+		CritSectionCount = 1;
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_apply_v2(&h, token, raw, sizeof(raw), &start), 0);
+		UT_ASSERT_EQ(native_calls, 3);
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(raw, before, sizeof(raw)) == 0);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.failed, mode != 5);
+		UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+		UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+		calls = native_calls + flush_calls + target_calls;
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_apply_v2(&h, token, raw, sizeof(raw), &start), 0);
+		UT_ASSERT_EQ(native_calls + flush_calls + target_calls, calls);
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(raw, before, sizeof(raw)) == 0);
+		CritSectionCount = 0;
+	}
+	apply_raw = apply_start = NULL;
+}
+
+UT_TEST(d0_apply_native_errors_propagate_without_retirement)
+{
+	for (unsigned mode = 0; mode < 5; mode++) {
+		ClusterRecoveryStampHandleV1 h;
+		uint8 raw[D0_RAW_BYTES], before[D0_RAW_BYTES];
+		XLogRecPtr start = 91;
+		fresh();
+		UT_ASSERT(begin_d0(&h, TT_SLOT_ABORTED));
+		memcpy(target_payload, h.payload, sizeof(target_payload));
+		memset(raw, 0xA5, sizeof(raw));
+		memcpy(before, raw, sizeof(raw));
+		apply_raw = raw;
+		apply_start = (uint8 *)&start;
+		if (mode < 3) native_throw = mode + 1;
+		else if (mode == 3) flush_fault = 1;
+		else target_fault = 2;
+		CritSectionCount = 1;
+		if (sigsetjmp(insert_error_boundary, 1) == 0) {
+			(void)cluster_recovery_stamp_ctrc_apply_v2(&h, target_stamp, raw, sizeof(raw), &start);
+			UT_ASSERT(false);
+		} else {
+			UT_ASSERT_EQ(CritSectionCount, 1);
+			UT_ASSERT_EQ(region.thread_replay[2].stamp.phase,
+				mode < 3 ? CLUSTER_RECOVERY_STAMP_INSERTING : CLUSTER_RECOVERY_STAMP_INSERTED);
+			UT_ASSERT_EQ(start, 91);
+			UT_ASSERT(memcmp(raw, before, sizeof(raw)) == 0);
+			UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+			UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+		}
+		/* Controlled unwind checks ownership, not real PANIC process death. */
+		CritSectionCount = 0;
+	}
+	apply_raw = apply_start = NULL;
+}
+
+/* The storage leaf is controlled here; actual held-FD preparation, payload
+ * binding and close are covered by recovery_tt_io's native temporary files. */
+static void
+prepare_d0_inputs(ClusterRecoveryStampHandleV1 *input)
+{
+	fresh();
+	UT_ASSERT(begin_d0(input, TT_SLOT_COMMITTED));
+	UT_ASSERT(cluster_recovery_stamp_cancel_v1(input));
+}
+
+UT_TEST(d0_prepare_target_and_window_publish_together)
+{
+	for (uint8 outcome = TT_SLOT_COMMITTED; outcome <= TT_SLOT_ABORTED; outcome++) {
+		ClusterRecoveryStampHandleV1 input, h;
+		ClusterUndoSmgrRecoveryStampV1 token = { .token = 91 };
+		fresh();
+		UT_ASSERT(begin_d0(&input, outcome));
+		UT_ASSERT(cluster_recovery_stamp_cancel_v1(&input));
+		memset(&h, 0xA5, sizeof(h));
+		UT_ASSERT(cluster_recovery_stamp_ctrc_prepare_v2(&owner, input.payload,
+			input.payload_length, &h, &token));
+		UT_ASSERT_EQ(target_prepare_calls, 1);
+		UT_ASSERT_EQ(target_close_calls, 0);
+		UT_ASSERT(target_held);
+		UT_ASSERT_EQ(token.token, target_stamp.token);
+		UT_ASSERT_EQ(h.key.window_seq, input.key.window_seq + 1);
+		UT_ASSERT_EQ(h.kind, CLUSTER_RECOVERY_STAMP_D0);
+		UT_ASSERT(memcmp(h.payload, input.payload, sizeof(target_payload)) == 0);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_PRE_INSERT);
+		UT_ASSERT(!region.thread_replay[2].stamp.failed);
+		UT_ASSERT_EQ(native_calls + flush_calls + target_calls, 0);
+		UT_ASSERT(cluster_recovery_stamp_cancel_v1(&h));
+		UT_ASSERT(cluster_undo_smgr_recovery_ctrc_close_v2(token));
+	}
+}
+
+UT_TEST(d0_prepare_target_refusal_keeps_existing_owner_and_outputs)
+{
+	for (unsigned mode = 0; mode < 2; mode++) {
+		ClusterRecoveryStampHandleV1 input, h, saved;
+		ClusterRecoveryStampSlotV1 before;
+		ClusterUndoSmgrRecoveryStampV1 token = { .token = 91 };
+		prepare_d0_inputs(&input);
+		memset(&h, 0xA5, sizeof(h));
+		saved = h;
+		before = region.thread_replay[2].stamp;
+		target_held = mode == 1;
+		target_prepare_fault = mode == 0;
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_prepare_v2(&owner, input.payload,
+			input.payload_length, &h, &token));
+		UT_ASSERT_EQ(target_prepare_calls, 1);
+		UT_ASSERT_EQ(target_close_calls, 0);
+		UT_ASSERT_EQ(target_held, mode == 1);
+		UT_ASSERT_EQ(token.token, 91);
+		UT_ASSERT(memcmp(&h, &saved, sizeof(h)) == 0);
+		UT_ASSERT(memcmp(&region.thread_replay[2].stamp, &before, sizeof(before)) == 0);
+	}
+}
+
+UT_TEST(d0_prepare_window_refusal_closes_only_new_target)
+{
+	for (unsigned mode = 0; mode < 2; mode++) {
+		ClusterRecoveryStampHandleV1 input, h, saved;
+		ClusterRecoveryStampSlotV1 before;
+		ClusterUndoSmgrRecoveryStampV1 token = { .token = 91 };
+		prepare_d0_inputs(&input);
+		if (mode == 0)
+			region.thread_replay[2].stamp.handle.key.window_seq = UINT64_MAX;
+		else
+			UT_ASSERT(begin_d0(&h, TT_SLOT_COMMITTED));
+		before = region.thread_replay[2].stamp;
+		memset(&h, 0xA5, sizeof(h));
+		saved = h;
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_prepare_v2(&owner, input.payload,
+			input.payload_length, &h, &token));
+		UT_ASSERT_EQ(target_prepare_calls, 1);
+		UT_ASSERT_EQ(target_close_calls, 1);
+		UT_ASSERT(!target_held);
+		UT_ASSERT_EQ(token.token, 91);
+		UT_ASSERT(memcmp(&h, &saved, sizeof(h)) == 0);
+		UT_ASSERT(memcmp(&region.thread_replay[2].stamp, &before, sizeof(before)) == 0);
+	}
+}
+
+UT_TEST(d0_prepare_window_error_releases_target_and_propagates)
+{
+	ClusterRecoveryStampHandleV1 input, h, saved;
+	ClusterRecoveryStampSlotV1 before;
+	ClusterUndoSmgrRecoveryStampV1 token = { .token = 91 };
+	volatile bool caught = false;
+	prepare_d0_inputs(&input);
+	memset(&h, 0xA5, sizeof(h));
+	saved = h;
+	before = region.thread_replay[2].stamp;
+	target_throw_after_prepare = true; /* original window decode, after storage prepare */
+	PG_TRY();
+	{
+		(void)cluster_recovery_stamp_ctrc_prepare_v2(&owner, input.payload,
+			input.payload_length, &h, &token);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(target_prepare_calls, 1);
+	UT_ASSERT_EQ(target_close_calls, 1);
+	UT_ASSERT(!target_held);
+	UT_ASSERT_EQ(token.token, 91);
+	UT_ASSERT(memcmp(&h, &saved, sizeof(h)) == 0);
+	UT_ASSERT(memcmp(&region.thread_replay[2].stamp, &before, sizeof(before)) == 0);
+}
+
+UT_TEST(d0_prepare_invalid_context_input_and_aliases_do_no_io)
+{
+	for (unsigned mode = 0; mode < 13; mode++) {
+		ClusterRecoveryStampHandleV1 input, h, saved;
+		ClusterRecoveryStampOwnerV1 changed;
+		ClusterRecoveryStampSlotV1 before;
+		ClusterUndoSmgrRecoveryStampV1 token = { .token = 91 };
+		ClusterRecoveryStampHandleV1 *out = &h;
+		ClusterUndoSmgrRecoveryStampV1 *stage_out = &token;
+		const ClusterRecoveryStampOwnerV1 *who = &changed;
+		const uint8 *bytes;
+		Size length;
+		prepare_d0_inputs(&input);
+		memset(&h, 0xA5, sizeof(h));
+		saved = h;
+		changed = owner;
+		before = region.thread_replay[2].stamp;
+		bytes = input.payload;
+		length = input.payload_length;
+		switch (mode) {
+		case 0: who = NULL; break;
+		case 1: out = NULL; break;
+		case 2: stage_out = NULL; break;
+		case 3: bytes = NULL; break;
+		case 4: length--; break;
+		case 5: changed.executor_pid++; break;
+		case 6: MyBackendType = B_LMON; break;
+		case 7: CritSectionCount = 1; break;
+		case 8: input.payload[0] ^= 1; break;
+		case 9: stage_out = (void *)&h; break;
+		case 10: stage_out = (void *)&input.payload[0]; break;
+		case 11: out = (void *)&changed; break;
+		case 12: stage_out = (void *)&region.thread_replay[2].stamp; break;
+		}
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_prepare_v2(who, bytes, length, out, stage_out));
+		UT_ASSERT_EQ(target_prepare_calls + target_close_calls + native_calls + flush_calls + target_calls, 0);
+		UT_ASSERT_EQ(token.token, 91);
+		UT_ASSERT(memcmp(&h, &saved, sizeof(h)) == 0);
+		UT_ASSERT(memcmp(&changed, &owner, sizeof(owner)) == 0 || mode == 5);
+		UT_ASSERT(memcmp(&region.thread_replay[2].stamp, &before, sizeof(before)) == 0);
+	}
+	CritSectionCount = 0;
+}
+
+/* Native PANIC/ERROR leaves below use controlled longjmp. These assertions
+ * prove phase/ownership/visibility, not native process death or crash recovery. */
+UT_TEST(d0_execute_prepares_applies_closes_before_publication)
+{
+	for (uint8 outcome = TT_SLOT_COMMITTED; outcome <= TT_SLOT_ABORTED; outcome++) {
+		ClusterRecoveryStampHandleV1 input;
+		uint8 raw[D0_RAW_BYTES];
+		XLogRecPtr start = 91, end;
+		XLogRecord header;
+		fresh();
+		UT_ASSERT(begin_d0(&input, outcome));
+		UT_ASSERT(cluster_recovery_stamp_cancel_v1(&input));
+		memset(raw, 0xA5, sizeof(raw));
+		apply_raw = raw;
+		apply_start = (const uint8 *)&start;
+		end = cluster_recovery_stamp_ctrc_execute_v2(&owner, input.payload,
+			input.payload_length, raw, sizeof(raw), &start);
+		UT_ASSERT_EQ(end, XactLastRecEnd);
+		UT_ASSERT_EQ(start, ProcLastRecPtr);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT_EQ(target_prepare_calls, 1);
+		UT_ASSERT_EQ(native_calls, 3);
+		UT_ASSERT_EQ(flush_calls, 1);
+		UT_ASSERT_EQ(target_calls, 1);
+		UT_ASSERT_EQ(target_close_calls, 1);
+		UT_ASSERT(!target_held);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
+		memcpy(&header, raw, sizeof(header));
+		UT_ASSERT_EQ(header.xl_tot_len, sizeof(raw));
+		UT_ASSERT(memcmp(raw + SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong,
+			input.payload, sizeof(target_payload)) == 0);
+	}
+	apply_raw = apply_start = NULL;
+}
+
+UT_TEST(d0_execute_admission_and_output_aliases_refuse_before_prepare)
+{
+	for (unsigned mode = 0; mode < 15; mode++) {
+		ClusterRecoveryStampHandleV1 input, saved;
+		ClusterRecoveryStampOwnerV1 changed;
+		uint8 raw[D0_RAW_BYTES], before[D0_RAW_BYTES];
+		XLogRecPtr start = 91;
+		void *out = raw;
+		XLogRecPtr *start_out = &start;
+		const ClusterRecoveryStampOwnerV1 *who = &changed;
+		const uint8 *bytes;
+		Size length, capacity = sizeof(raw);
+		prepare_d0_inputs(&input);
+		memset(raw, 0xA5, sizeof(raw));
+		memcpy(before, raw, sizeof(raw));
+		changed = owner;
+		bytes = input.payload;
+		length = input.payload_length;
+		switch (mode) {
+		case 0: who = NULL; break;
+		case 1: bytes = NULL; break;
+		case 2: length--; break;
+		case 3: out = NULL; break;
+		case 4: start_out = NULL; break;
+		case 5: capacity--; break;
+		case 6: changed.executor_pid++; break;
+		case 7: MyBackendType = B_LMON; break;
+		case 8: CritSectionCount = 1; break;
+		case 9: input.payload[0] ^= 1; break;
+		case 10: start_out = (void *)&raw[1]; break;
+		case 11: out = input.payload; break;
+		case 12: start_out = (void *)&changed; break;
+		case 13: out = &changed; break;
+		case 14: start_out = (void *)&region.thread_replay[2].stamp; break;
+		}
+		saved = input;
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_execute_v2(who, bytes, length,
+			out, capacity, start_out), InvalidXLogRecPtr);
+		UT_ASSERT_EQ(target_prepare_calls + target_close_calls + native_calls + flush_calls + target_calls, 0);
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(raw, before, sizeof(raw)) == 0);
+		UT_ASSERT(memcmp(&input, &saved, sizeof(input)) == 0);
+		UT_ASSERT(memcmp(&changed, &owner, sizeof(owner)) == 0 || mode == 6);
+	}
+	CritSectionCount = 0;
+}
+
+UT_TEST(d0_execute_prepare_refusal_preserves_original_owners)
+{
+	for (unsigned mode = 0; mode < 3; mode++) {
+		ClusterRecoveryStampHandleV1 input, prior;
+		ClusterRecoveryStampSlotV1 before;
+		uint8 raw[D0_RAW_BYTES], saved[D0_RAW_BYTES];
+		XLogRecPtr start = 91;
+		prepare_d0_inputs(&input);
+		if (mode == 0) target_prepare_fault = 1;
+		if (mode == 1) target_held = true;
+		if (mode == 2) UT_ASSERT(begin_d0(&prior, TT_SLOT_COMMITTED));
+		before = region.thread_replay[2].stamp;
+		memset(raw, 0xA5, sizeof(raw));
+		memcpy(saved, raw, sizeof(raw));
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_execute_v2(&owner, input.payload,
+			input.payload_length, raw, sizeof(raw), &start), InvalidXLogRecPtr);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT_EQ(target_prepare_calls, 1);
+		UT_ASSERT_EQ(target_close_calls, mode == 2);
+		UT_ASSERT_EQ(target_held, mode == 1);
+		UT_ASSERT_EQ(native_calls + flush_calls + target_calls, 0);
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(raw, saved, sizeof(raw)) == 0);
+		UT_ASSERT(memcmp(&region.thread_replay[2].stamp, &before, sizeof(before)) == 0);
+	}
+}
+
+UT_TEST(d0_execute_preinsert_refusal_cancels_only_prepared_window)
+{
+	ClusterRecoveryStampHandleV1 input;
+	uint8 raw[D0_RAW_BYTES], saved[D0_RAW_BYTES];
+	XLogRecPtr start = 91;
+	prepare_d0_inputs(&input);
+	memset(raw, 0xA5, sizeof(raw));
+	memcpy(saved, raw, sizeof(raw));
+	target_match_ready = false;
+	UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_execute_v2(&owner, input.payload,
+		input.payload_length, raw, sizeof(raw), &start), InvalidXLogRecPtr);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(target_prepare_calls, 1);
+	UT_ASSERT_EQ(target_match_calls, 1);
+	UT_ASSERT_EQ(target_close_calls, 1);
+	UT_ASSERT(!target_held);
+	UT_ASSERT_EQ(native_calls + flush_calls + target_calls, 0);
+	UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
+	UT_ASSERT_EQ(execute_report_level, 0);
+	UT_ASSERT_EQ(start, 91);
+	UT_ASSERT(memcmp(raw, saved, sizeof(raw)) == 0);
+}
+
+UT_TEST(d0_execute_postinsert_refusal_panics_without_retiring_duty)
+{
+	for (unsigned mode = 0; mode < 3; mode++) {
+		ClusterRecoveryStampHandleV1 input;
+		uint8 raw[D0_RAW_BYTES], saved[D0_RAW_BYTES];
+		XLogRecPtr start = 91;
+		prepare_d0_inputs(&input);
+		memset(raw, 0xA5, sizeof(raw));
+		memcpy(saved, raw, sizeof(raw));
+		if (mode == 0) native_fault = 1;
+		if (mode == 1) cover_enabled = false;
+		if (mode == 2) target_fault = 1;
+		execute_panic_expected = true;
+		if (sigsetjmp(execute_panic_boundary, 1) == 0) {
+			(void)cluster_recovery_stamp_ctrc_execute_v2(&owner, input.payload,
+				input.payload_length, raw, sizeof(raw), &start);
+			UT_ASSERT(false);
+		}
+		UT_ASSERT_EQ(execute_report_level, PANIC);
+		UT_ASSERT_EQ(CritSectionCount, 1);
+		UT_ASSERT(target_held);
+		UT_ASSERT_EQ(target_close_calls, 0);
+		UT_ASSERT(region.thread_replay[2].stamp.phase >= CLUSTER_RECOVERY_STAMP_INSERTING);
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(raw, saved, sizeof(raw)) == 0);
+	}
+	CritSectionCount = 0;
+}
+
+UT_TEST(d0_execute_native_errors_propagate_in_original_critical_section)
+{
+	for (unsigned mode = 1; mode <= 2; mode++) {
+		ClusterRecoveryStampHandleV1 input;
+		uint8 raw[D0_RAW_BYTES], saved[D0_RAW_BYTES];
+		XLogRecPtr start = 91;
+		prepare_d0_inputs(&input);
+		memset(raw, 0xA5, sizeof(raw));
+		memcpy(saved, raw, sizeof(raw));
+		native_throw = mode;
+		if (sigsetjmp(insert_error_boundary, 1) == 0) {
+			(void)cluster_recovery_stamp_ctrc_execute_v2(&owner, input.payload,
+				input.payload_length, raw, sizeof(raw), &start);
+			UT_ASSERT(false);
+		}
+		UT_ASSERT_EQ(CritSectionCount, 1);
+		UT_ASSERT(target_held);
+		UT_ASSERT_EQ(target_close_calls, 0);
+		UT_ASSERT_EQ(execute_report_level, 0);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_INSERTING);
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(raw, saved, sizeof(raw)) == 0);
+	}
+	CritSectionCount = 0;
+}
+
+UT_TEST(d0_execute_close_refusal_does_not_publish_durable_result)
+{
+	ClusterRecoveryStampHandleV1 input;
+	uint8 raw[D0_RAW_BYTES], saved[D0_RAW_BYTES];
+	XLogRecPtr start = 91;
+	prepare_d0_inputs(&input);
+	memset(raw, 0xA5, sizeof(raw));
+	memcpy(saved, raw, sizeof(raw));
+	target_close_fault = true;
+	apply_raw = raw;
+	apply_start = (const uint8 *)&start;
+	UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_execute_v2(&owner, input.payload,
+		input.payload_length, raw, sizeof(raw), &start), InvalidXLogRecPtr);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(target_close_calls, 1);
+	UT_ASSERT(!target_held);
+	UT_ASSERT_EQ(target_calls, 1);
+	UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
+	UT_ASSERT_EQ(start, 91);
+	UT_ASSERT(memcmp(raw, saved, sizeof(raw)) == 0);
+	apply_raw = apply_start = NULL;
+}
+
+UT_TEST(d0_execute_prepare_error_propagates_without_critical_entry)
+{
+	ClusterRecoveryStampHandleV1 input;
+	uint8 raw[D0_RAW_BYTES], saved[D0_RAW_BYTES];
+	XLogRecPtr start = 91;
+	volatile bool caught = false;
+	prepare_d0_inputs(&input);
+	memset(raw, 0xA5, sizeof(raw));
+	memcpy(saved, raw, sizeof(raw));
+	target_throw_after_prepare = true;
+	PG_TRY();
+	{
+		(void)cluster_recovery_stamp_ctrc_execute_v2(&owner, input.payload,
+			input.payload_length, raw, sizeof(raw), &start);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(target_close_calls, 1);
+	UT_ASSERT(!target_held);
+	UT_ASSERT_EQ(native_calls + flush_calls + target_calls, 0);
+	UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
+	UT_ASSERT_EQ(start, 91);
+	UT_ASSERT(memcmp(raw, saved, sizeof(raw)) == 0);
+}
+
+UT_TEST(d0_execute_reference_binds_source_actual_positions_and_complete_raw)
+{
+	uint8 digests[2][32];
+	for (uint8 outcome = TT_SLOT_COMMITTED; outcome <= TT_SLOT_ABORTED; outcome++) {
+		for (unsigned variant = 0; variant < 2; variant++) {
+			ClusterRecoveryStampHandleV1 input;
+			uint8 source[32], raw[D0_RAW_BYTES + 1], metadata[sizeof(ClusterRecoveryCTRCReferenceV2) + 1];
+			ClusterRecoveryCTRCReferenceV2 reference;
+			uint8 expected[32];
+			fresh();
+			UT_ASSERT(begin_d0(&input, outcome));
+			UT_ASSERT(cluster_recovery_stamp_cancel_v1(&input));
+			memset(source, 6 + variant, sizeof(source));
+			memset(raw, 0xA5, sizeof(raw));
+			memset(metadata, 0xA5, sizeof(metadata));
+			observe_reference_hash = true;
+			reference_raw_output = raw + 1;
+			reference_metadata_output = metadata + 1;
+			UT_ASSERT(cluster_recovery_stamp_ctrc_execute_reference_v2(&owner,
+				input.payload, input.payload_length, 17, source, raw + 1, D0_RAW_BYTES,
+				(void *)(metadata + 1)));
+			UT_ASSERT_EQ(CritSectionCount, 0);
+			UT_ASSERT_EQ(reference_hash_calls, 1);
+			UT_ASSERT_EQ(native_calls, 3);
+			UT_ASSERT_EQ(flush_calls, 1);
+			UT_ASSERT_EQ(target_calls, 1);
+			UT_ASSERT_EQ(target_close_calls, 1);
+			UT_ASSERT(!target_held);
+			memcpy(&reference, metadata + 1, sizeof(reference));
+			UT_ASSERT_EQ(reference.source_index, 17);
+			UT_ASSERT_EQ(reference.start, ProcLastRecPtr);
+			UT_ASSERT_EQ(reference.end, XactLastRecEnd);
+			UT_ASSERT_EQ(reference.raw_length, D0_RAW_BYTES);
+			UT_ASSERT(reference.end != reference.start + D0_RAW_BYTES);
+			UT_ASSERT_EQ(raw[0], 0xA5);
+			UT_ASSERT_EQ(metadata[0], 0xA5);
+			UT_ASSERT(memcmp(raw + 1 + SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong,
+				input.payload, sizeof(target_payload)) == 0);
+			observe_reference_hash = false;
+			reference_raw_output = reference_metadata_output = NULL;
+			/* The standalone frozen hash has its own codec tests; here it is
+			 * the oracle for source/raw/actual-position coupling, after close. */
+			UT_ASSERT(cluster_recovery_ctrc_record_hash_v2(source, reference.start,
+				reference.end, raw + 1, D0_RAW_BYTES, expected));
+			UT_ASSERT(memcmp(expected, reference.raw_record_sha256, 32) == 0);
+			memcpy(digests[variant], reference.raw_record_sha256, 32);
+		}
+		UT_ASSERT(memcmp(digests[0], digests[1], 32) != 0);
+	}
+}
+
+UT_TEST(d0_execute_reference_invalid_inputs_aliases_refuse_before_wal)
+{
+	for (unsigned mode = 0; mode < 17; mode++) {
+		ClusterRecoveryStampHandleV1 input, saved;
+		ClusterRecoveryStampOwnerV1 changed;
+		uint8 source[32], source_before[32], raw[D0_RAW_BYTES], before[D0_RAW_BYTES];
+		ClusterRecoveryCTRCReferenceV2 reference, reference_before;
+		const ClusterRecoveryStampOwnerV1 *who = &changed;
+		const uint8 *bytes, *identity = source;
+		void *out = raw;
+		ClusterRecoveryCTRCReferenceV2 *ref_out = &reference;
+		Size length, capacity = sizeof(raw);
+		prepare_d0_inputs(&input);
+		changed = owner;
+		bytes = input.payload;
+		length = input.payload_length;
+		memset(source, 6, sizeof(source));
+		memset(raw, 0xA5, sizeof(raw));
+		memcpy(before, raw, sizeof(raw));
+		memset(&reference, 0xA5, sizeof(reference));
+		reference_before = reference;
+		switch (mode) {
+		case 0: who = NULL; break;
+		case 1: bytes = NULL; break;
+		case 2: length--; break;
+		case 3: identity = NULL; break;
+		case 4: memset(source, 0, sizeof(source)); break;
+		case 5: out = NULL; break;
+		case 6: capacity--; break;
+		case 7: ref_out = NULL; break;
+		case 8: CritSectionCount = 1; break;
+		case 9: MyBackendType = B_LMON; break;
+		case 10: ref_out = (void *)(raw + 1); break;
+		case 11: ref_out = (void *)source; break;
+		case 12: out = source; break;
+		case 13: ref_out = (void *)&changed; break;
+		case 14: out = input.payload; break;
+		case 15: ref_out = (void *)&region.thread_replay[2].stamp; break;
+		case 16: changed.executor_pid++; break;
+		}
+		saved = input;
+		memcpy(source_before, source, sizeof(source));
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_execute_reference_v2(who, bytes,
+			length, 17, identity, out, capacity, ref_out));
+		UT_ASSERT_EQ(target_prepare_calls + target_close_calls + native_calls + flush_calls + target_calls, 0);
+		UT_ASSERT_EQ(reference_hash_calls, 0);
+		UT_ASSERT(memcmp(raw, before, sizeof(raw)) == 0);
+		UT_ASSERT(memcmp(&reference, &reference_before, sizeof(reference)) == 0);
+		UT_ASSERT(memcmp(source, source_before, sizeof(source)) == 0);
+		UT_ASSERT(memcmp(&input, &saved, sizeof(input)) == 0);
+		UT_ASSERT(memcmp(&changed, &owner, sizeof(owner)) == 0 || mode == 16);
+	}
+	CritSectionCount = 0;
+}
+
+static void
+reference_fixture_inputs(ClusterRecoveryStampHandleV1 *input, uint8 source[32],
+	uint8 raw[D0_RAW_BYTES], ClusterRecoveryCTRCReferenceV2 *reference)
+{
+	prepare_d0_inputs(input);
+	memset(source, 6, 32);
+	memset(raw, 0xA5, D0_RAW_BYTES);
+	memset(reference, 0xA5, sizeof(*reference));
+	observe_reference_hash = true;
+	reference_raw_output = raw;
+	reference_metadata_output = (const uint8 *)reference;
+}
+
+UT_TEST(d0_execute_reference_original_refusal_never_hashes_or_publishes)
+{
+	for (unsigned mode = 0; mode < 3; mode++) {
+		ClusterRecoveryStampHandleV1 input;
+		uint8 source[32], raw[D0_RAW_BYTES];
+		ClusterRecoveryCTRCReferenceV2 reference;
+		reference_fixture_inputs(&input, source, raw, &reference);
+		if (mode == 0) target_prepare_fault = 1;
+		if (mode == 1) target_match_ready = false;
+		if (mode == 2) target_close_fault = true;
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_execute_reference_v2(&owner,
+			input.payload, input.payload_length, 17, source, raw, sizeof(raw), &reference));
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT_EQ(reference_hash_calls, 0);
+		UT_ASSERT_EQ(target_calls, mode == 2);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
+		reference_outputs_unpublished();
+	}
+	reference_raw_output = reference_metadata_output = NULL;
+}
+
+UT_TEST(d0_execute_reference_hash_refusal_keeps_completed_operation_and_outputs)
+{
+	ClusterRecoveryStampHandleV1 input;
+	uint8 source[32], raw[D0_RAW_BYTES];
+	ClusterRecoveryCTRCReferenceV2 reference;
+	reference_fixture_inputs(&input, source, raw, &reference);
+	reference_hash_refuse = true;
+	UT_ASSERT(!cluster_recovery_stamp_ctrc_execute_reference_v2(&owner,
+		input.payload, input.payload_length, 17, source, raw, sizeof(raw), &reference));
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(reference_hash_calls, 1);
+	UT_ASSERT_EQ(native_calls, 3);
+	UT_ASSERT_EQ(target_calls, 1);
+	UT_ASSERT_EQ(target_close_calls, 1);
+	UT_ASSERT(!target_held);
+	UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
+	reference_outputs_unpublished();
+	reference_raw_output = reference_metadata_output = NULL;
+}
+
+UT_TEST(d0_execute_reference_hash_error_propagates_after_completed_close)
+{
+	ClusterRecoveryStampHandleV1 input;
+	uint8 source[32], raw[D0_RAW_BYTES];
+	ClusterRecoveryCTRCReferenceV2 reference;
+	volatile bool caught = false;
+	reference_fixture_inputs(&input, source, raw, &reference);
+	reference_hash_throw = true;
+	PG_TRY();
+	{
+		(void)cluster_recovery_stamp_ctrc_execute_reference_v2(&owner,
+			input.payload, input.payload_length, 17, source, raw, sizeof(raw), &reference);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(reference_hash_calls, 1);
+	UT_ASSERT_EQ(native_calls, 3);
+	UT_ASSERT_EQ(target_calls, 1);
+	UT_ASSERT_EQ(target_close_calls, 1);
+	UT_ASSERT(!target_held);
+	UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
+	reference_outputs_unpublished();
+	reference_raw_output = reference_metadata_output = NULL;
+}
+
+UT_TEST(d0_execute_reference_postinsert_panic_preserves_original_duty)
+{
+	ClusterRecoveryStampHandleV1 input;
+	uint8 source[32], raw[D0_RAW_BYTES];
+	ClusterRecoveryCTRCReferenceV2 reference;
+	reference_fixture_inputs(&input, source, raw, &reference);
+	cover_enabled = false;
+	execute_panic_expected = true;
+	if (sigsetjmp(execute_panic_boundary, 1) == 0) {
+		(void)cluster_recovery_stamp_ctrc_execute_reference_v2(&owner,
+			input.payload, input.payload_length, 17, source, raw, sizeof(raw), &reference);
+		UT_ASSERT(false);
+	}
+	UT_ASSERT_EQ(CritSectionCount, 1);
+	UT_ASSERT_EQ(execute_report_level, PANIC);
+	UT_ASSERT_EQ(reference_hash_calls, 0);
+	UT_ASSERT_EQ(target_close_calls, 0);
+	UT_ASSERT(target_held);
+	UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+	reference_outputs_unpublished();
+	CritSectionCount = 0;
+	reference_raw_output = reference_metadata_output = NULL;
+}
+
+UT_TEST(orphan_c0_d0_preserve_exact_payload_and_checkpoint_debt)
+{
+	for (unsigned d0 = 0; d0 < 2; d0++)
+		for (unsigned phase = CLUSTER_RECOVERY_STAMP_PRE_INSERT;
+			 phase <= CLUSTER_RECOVERY_STAMP_DURABLE; phase++) {
+			ClusterRecoveryStampHandleV1 h;
+			ClusterRecoveryStampCaptureV1 capture;
+			ClusterRecoveryStampSlotV1 *slot;
+			unsigned hashes;
+			fresh();
+			UT_ASSERT(d0 ? begin_d0(&h, TT_SLOT_ABORTED) : begin(&h));
+			slot = &region.thread_replay[2].stamp;
+			if (phase > CLUSTER_RECOVERY_STAMP_PRE_INSERT) {
+				CritSectionCount = 1;
+				UT_ASSERT(cluster_recovery_stamp_inserting_v1(&h));
+				if (phase >= CLUSTER_RECOVERY_STAMP_INSERTED)
+					UT_ASSERT(cluster_recovery_stamp_inserted_v1(&h, 0x2000010, 0x20000c0));
+				CritSectionCount = 0;
+				if (phase == CLUSTER_RECOVERY_STAMP_DURABLE)
+					UT_ASSERT(cluster_recovery_stamp_durable_v1(&h));
+			}
+			slot->executor_attempt_stamp = 41;
+			slot->adopt_from = slot->phase;
+			slot->phase = CLUSTER_RECOVERY_STAMP_ADOPT_PENDING;
+			slot->failed = true;
+			UT_ASSERT(cluster_recovery_stamp_capture_v1(&capture));
+			UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&capture), CLUSTER_RECOVERY_STAMP_PENDING);
+			hashes = hash_calls;
+			UT_ASSERT(!cluster_recovery_stamp_fail_v1(&h));
+			UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+			UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+			UT_ASSERT(!cluster_recovery_stamp_durable_v1(&h));
+			CritSectionCount = 1;
+			UT_ASSERT(!cluster_recovery_stamp_inserting_v1(&h));
+			UT_ASSERT(!cluster_recovery_stamp_inserted_v1(&h, 0x2000010, 0x20000c0));
+			CritSectionCount = 0;
+			UT_ASSERT_EQ(hash_calls, hashes);
+			UT_ASSERT(memcmp(&slot->handle, &h, sizeof(h)) == 0);
+			UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_ADOPT_PENDING);
+		}
+}
+UT_TEST(worker_attempt_mismatch_cannot_advance_exact_d0)
+{
+	ClusterRecoveryStampHandleV1 h;
+	ClusterRecoveryStampSlotV1 *slot;
+	unsigned hashes;
+	fresh();
+	UT_ASSERT(begin_d0(&h, TT_SLOT_COMMITTED));
+	slot = &region.thread_replay[2].stamp;
+	slot->executor_attempt_stamp = 41;
+	slot->bound_worker_attempt = 42;
+	slot->bound_worker_pid = MyProcPid;
+	hashes = hash_calls;
+	CritSectionCount = 1;
+	UT_ASSERT(!cluster_recovery_stamp_inserting_v1(&h));
+	CritSectionCount = 0;
+	UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_PRE_INSERT);
+	UT_ASSERT_EQ(hash_calls, hashes);
+	UT_ASSERT(memcmp(&slot->handle, &h, sizeof(h)) == 0);
+}
+UT_TEST(worker_prepare_requires_original_bound_replay_attempt)
+{
+	ClusterRecoveryStampHandleV1 h, zero = { 0 };
+	fresh();
+	MyBackendType = B_BG_WORKER;
+	pg_atomic_write_u64(&region.thread_replay[2].episode_epoch, 41);
+	pg_atomic_write_u32(&region.thread_replay[2].state, CLUSTER_THREADREC_REPLAY_REPLAYING);
+	UT_ASSERT(!cluster_recovery_stamp_prepare_v1(&owner, CLUSTER_RECOVERY_STAMP_C0, payload,
+												 sizeof(payload), &h));
+	UT_ASSERT(memcmp(&h, &zero, sizeof(h)) == 0);
+	UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
+}
+
+UT_TEST(original_worker_stop_keeps_c0_d0_and_blocks_replacement)
+{
+	for (unsigned d0 = 0; d0 < 2; d0++) {
+		ClusterRecoveryStampHandleV1 h, later;
+		ClusterRecoveryStampCaptureV1 capture;
+		ClusterRecoveryStampSlotV1 *slot;
+		unsigned hashes;
+		fresh();
+		MyBackendType = B_BG_WORKER;
+		pg_atomic_write_u64(&region.thread_replay[2].episode_epoch, 41);
+		pg_atomic_write_u32(&region.thread_replay[2].state, CLUSTER_THREADREC_REPLAY_REPLAYING);
+		hashes = hash_calls;
+		UT_ASSERT(!cluster_recovery_stamp_worker_begin_v1(2, 42));
+		UT_ASSERT(cluster_recovery_stamp_worker_begin_v1(2, 41));
+		UT_ASSERT_EQ(hash_calls, hashes);
+		UT_ASSERT(d0 ? begin_d0(&h, TT_SLOT_COMMITTED) : begin(&h));
+		slot = &region.thread_replay[2].stamp;
+		UT_ASSERT_EQ(slot->executor_attempt_stamp, 41);
+		CritSectionCount = 1;
+		UT_ASSERT(cluster_recovery_stamp_inserting_v1(&h));
+		CritSectionCount = 0;
+		MyBackendType = B_LMON;
+		MyProcPid = 19;
+		hashes = hash_calls;
+		UT_ASSERT(!cluster_recovery_stamp_worker_stopped_v1(2, 42));
+		UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_INSERTING);
+		UT_ASSERT(cluster_recovery_stamp_worker_stopped_v1(2, 41));
+		UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_ADOPT_PENDING);
+		UT_ASSERT_EQ(slot->adopt_from, CLUSTER_RECOVERY_STAMP_INSERTING);
+		UT_ASSERT_EQ(slot->bound_worker_attempt, 0);
+		UT_ASSERT_EQ(slot->bound_worker_pid, 0);
+		UT_ASSERT(d0 ? hash_calls > hashes : hash_calls == hashes);
+		UT_ASSERT(memcmp(&slot->handle, &h, sizeof(h)) == 0);
+		UT_ASSERT(cluster_recovery_stamp_worker_stopped_v1(2, 42));
+		UT_ASSERT(cluster_recovery_stamp_capture_v1(&capture));
+		UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&capture), CLUSTER_RECOVERY_STAMP_PENDING);
+		MyBackendType = B_BG_WORKER;
+		owner.executor_pid = ++MyProcPid;
+		pg_atomic_write_u64(&region.thread_replay[2].episode_epoch, 42);
+		UT_ASSERT(!cluster_recovery_stamp_worker_begin_v1(2, 42));
+		UT_ASSERT(!cluster_recovery_stamp_prepare_v1(&owner, CLUSTER_RECOVERY_STAMP_C0, payload,
+													 sizeof(payload), &later));
+		UT_ASSERT(memcmp(&slot->handle, &h, sizeof(h)) == 0);
+	}
+}
+
+/* Original LMON native-handle STOPPED provenance remains a fixture premise.
+ * A corrupt native operation must not become an accepted orphan. */
+UT_TEST(worker_stop_rejects_corrupt_c0_d0_without_changing_debt)
+{
+	for (unsigned d0 = 0; d0 < 2; d0++)
+		for (unsigned phase = CLUSTER_RECOVERY_STAMP_PRE_INSERT;
+			 phase <= CLUSTER_RECOVERY_STAMP_DURABLE; phase++) {
+			ClusterRecoveryStampHandleV1 h, corrupt;
+			ClusterRecoveryStampSlotV1 *slot;
+			fresh();
+			MyBackendType = B_BG_WORKER;
+			pg_atomic_write_u64(&region.thread_replay[2].episode_epoch, 41);
+			pg_atomic_write_u32(&region.thread_replay[2].state,
+								CLUSTER_THREADREC_REPLAY_REPLAYING);
+			UT_ASSERT(cluster_recovery_stamp_worker_begin_v1(2, 41));
+			UT_ASSERT(d0 ? begin_d0(&h, TT_SLOT_COMMITTED) : begin(&h));
+			slot = &region.thread_replay[2].stamp;
+			if (phase >= CLUSTER_RECOVERY_STAMP_INSERTING) {
+				CritSectionCount = 1;
+				UT_ASSERT(cluster_recovery_stamp_inserting_v1(&h));
+				if (phase >= CLUSTER_RECOVERY_STAMP_INSERTED)
+					UT_ASSERT(cluster_recovery_stamp_inserted_v1(&h, 0x2000010, 0x20000c0));
+				CritSectionCount = 0;
+				if (phase == CLUSTER_RECOVERY_STAMP_DURABLE)
+					UT_ASSERT(cluster_recovery_stamp_durable_v1(&h));
+			}
+			slot->handle.payload[slot->handle.payload_length - 1] ^= 1;
+			corrupt = slot->handle;
+			slot->failed = true;
+			MyBackendType = B_LMON;
+			MyProcPid = 19;
+			UT_ASSERT(!cluster_recovery_stamp_worker_stopped_v1(2, 41));
+			UT_ASSERT_EQ(slot->phase, phase);
+			UT_ASSERT_EQ(slot->adopt_from, CLUSTER_RECOVERY_STAMP_EMPTY);
+			UT_ASSERT_EQ(slot->executor_attempt_stamp, 41);
+			UT_ASSERT_EQ(slot->bound_worker_attempt, 41);
+			UT_ASSERT_EQ(slot->bound_worker_pid, 11);
+			UT_ASSERT(slot->failed);
+			UT_ASSERT(memcmp(&slot->handle, &corrupt, sizeof(corrupt)) == 0);
+			UT_ASSERT_EQ(slot->record_start,
+				phase >= CLUSTER_RECOVERY_STAMP_INSERTED ? 0x2000010 : 0);
+			UT_ASSERT_EQ(slot->record_end,
+				phase >= CLUSTER_RECOVERY_STAMP_INSERTED ? 0x20000c0 : 0);
+			UT_ASSERT(SpinLockFree(&slot->lock));
+		}
+}
+
+UT_TEST(worker_stop_rejects_snapshot_drift_without_poisoning_current_window)
+{
+	for (unsigned mutation = 1; mutation <= 4; mutation++) {
+		ClusterRecoveryStampHandleV1 h, expected;
+		ClusterRecoveryStampSlotV1 *slot;
+		fresh();
+		MyBackendType = B_BG_WORKER;
+		pg_atomic_write_u64(&region.thread_replay[2].episode_epoch, 41);
+		pg_atomic_write_u32(&region.thread_replay[2].state, CLUSTER_THREADREC_REPLAY_REPLAYING);
+		UT_ASSERT(cluster_recovery_stamp_worker_begin_v1(2, 41));
+		UT_ASSERT(begin_d0(&h, TT_SLOT_ABORTED));
+		slot = &region.thread_replay[2].stamp;
+		expected = h;
+		if (mutation == 1)
+			expected.payload[CLUSTER_RECOVERY_CTRC_BYTES - 1] ^= 1;
+		else if (mutation == 2)
+			expected.key.window_seq++;
+		MyBackendType = B_LMON;
+		MyProcPid = 19;
+		stopped_hash_mutation = mutation;
+		UT_ASSERT(!cluster_recovery_stamp_worker_stopped_v1(2, 41));
+		UT_ASSERT_EQ(stopped_hash_mutations, 1);
+		UT_ASSERT_EQ(stopped_hash_mutation, 0);
+		UT_ASSERT(memcmp(&slot->handle, &expected, sizeof(expected)) == 0);
+		UT_ASSERT_EQ(slot->phase, mutation == 3 ? CLUSTER_RECOVERY_STAMP_INSERTED
+												 : CLUSTER_RECOVERY_STAMP_PRE_INSERT);
+		UT_ASSERT_EQ(slot->record_start, mutation == 3 ? 0x2000010 : 0);
+		UT_ASSERT_EQ(slot->record_end, mutation == 3 ? 0x20000c0 : 0);
+		UT_ASSERT_EQ(slot->adopt_from, CLUSTER_RECOVERY_STAMP_EMPTY);
+		UT_ASSERT_EQ(slot->executor_attempt_stamp, 41);
+		UT_ASSERT_EQ(slot->bound_worker_attempt, 41);
+		UT_ASSERT_EQ(slot->bound_worker_pid, 11);
+		UT_ASSERT_EQ(slot->failed, mutation == 4);
+		UT_ASSERT(SpinLockFree(&slot->lock));
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(71);
+	UT_RUN(worker_stop_rejects_corrupt_c0_d0_without_changing_debt);
+	UT_RUN(worker_stop_rejects_snapshot_drift_without_poisoning_current_window);
+	UT_RUN(original_worker_stop_keeps_c0_d0_and_blocks_replacement);
+	UT_RUN(orphan_c0_d0_preserve_exact_payload_and_checkpoint_debt);
+	UT_RUN(worker_attempt_mismatch_cannot_advance_exact_d0);
+	UT_RUN(worker_prepare_requires_original_bound_replay_attempt);
 	UT_RUN(exact_lifecycle_and_owned_payload);
 	UT_RUN(preinsert_cancel_capture_and_new_sequence);
 	UT_RUN(inserting_failure_exit_and_replay_reset_cannot_retire);
@@ -538,6 +3166,61 @@ main(void)
 	UT_RUN(normal_stop_observes_windows_separately);
 	UT_RUN(immutable_operation_survives_worker_stop);
 	UT_RUN(d0_codec_is_unlocked_and_orphan_remains_pending);
+	UT_RUN(d0_commit_abort_lifecycle_and_later_window);
+	UT_RUN(d0_sticky_failure_and_normal_stop);
+	UT_RUN(d0_owner_correspondence_and_preinsert_cancel);
+	UT_RUN(prepared_operation_is_exact_and_observers_validate_unlocked);
+	UT_RUN(d0_native_insert_actual_positions_and_outcomes);
+	UT_RUN(d0_native_insert_context_and_position_refusal);
+	UT_RUN(d0_native_insert_exact_header_refusal);
+	UT_RUN(d0_native_insert_exact_window_and_sticky_refusal);
+	UT_RUN(d0_emitter_exact_payload_positions_and_single_insert);
+	UT_RUN(d0_emitter_preinsert_refusal_is_atomic);
+	UT_RUN(d0_emitter_postinsert_refusal_retains_failed_window);
+	UT_RUN(d0_emitter_native_error_cannot_cancel_or_complete);
+	UT_RUN(d0_flush_exact_end_preserves_target_duty);
+	UT_RUN(d0_flush_wrong_handle_and_context_do_no_io);
+	UT_RUN(d0_flush_noninserted_and_failed_windows_refuse);
+	UT_RUN(d0_flush_refusal_retains_sticky_inserted_responsibility);
+	UT_RUN(d0_flush_revalidates_window_after_native_wait);
+	UT_RUN(d0_flush_native_error_does_not_retire_window);
+	UT_RUN(d0_finish_flushes_bound_target_before_clear);
+	UT_RUN(d0_finish_wrong_operation_and_context_do_no_io);
+	UT_RUN(d0_finish_refusal_retains_exact_inserted_duty);
+	UT_RUN(d0_finish_rechecks_writer_coverage_and_same_window_after_target);
+	UT_RUN(d0_finish_native_error_never_retires_inserted_window);
+	UT_RUN(d0_snapshot_exact_final_raw_survives_native_reuse);
+	UT_RUN(d0_snapshot_preinsert_refusal_is_atomic);
+	UT_RUN(d0_snapshot_postinsert_refusal_is_sticky_and_atomic);
+	UT_RUN(native_record_copy_exact_split_zero_fragments_unaligned);
+	UT_RUN(native_record_copy_rejects_incomplete_extra_and_cyclic_chains);
+	UT_RUN(native_record_copy_refuses_stale_construction_and_lengths);
+	UT_RUN(native_record_copy_refuses_input_and_output_aliases);
+	UT_RUN(d0_apply_publishes_only_after_exact_finish);
+	UT_RUN(d0_apply_preinsert_refusal_preserves_outputs_and_window);
+	UT_RUN(d0_apply_bound_target_refusal_is_preinsert_and_cancelable);
+	UT_RUN(d0_apply_snapshot_refusal_never_flushes_or_publishes);
+	UT_RUN(d0_apply_finish_refusal_retains_duty_and_private_snapshot);
+	UT_RUN(d0_apply_native_errors_propagate_without_retirement);
+	UT_RUN(d0_prepare_target_and_window_publish_together);
+	UT_RUN(d0_prepare_target_refusal_keeps_existing_owner_and_outputs);
+	UT_RUN(d0_prepare_window_refusal_closes_only_new_target);
+	UT_RUN(d0_prepare_window_error_releases_target_and_propagates);
+	UT_RUN(d0_prepare_invalid_context_input_and_aliases_do_no_io);
+	UT_RUN(d0_execute_prepares_applies_closes_before_publication);
+	UT_RUN(d0_execute_admission_and_output_aliases_refuse_before_prepare);
+	UT_RUN(d0_execute_prepare_refusal_preserves_original_owners);
+	UT_RUN(d0_execute_preinsert_refusal_cancels_only_prepared_window);
+	UT_RUN(d0_execute_postinsert_refusal_panics_without_retiring_duty);
+	UT_RUN(d0_execute_native_errors_propagate_in_original_critical_section);
+	UT_RUN(d0_execute_close_refusal_does_not_publish_durable_result);
+	UT_RUN(d0_execute_prepare_error_propagates_without_critical_entry);
+	UT_RUN(d0_execute_reference_binds_source_actual_positions_and_complete_raw);
+	UT_RUN(d0_execute_reference_invalid_inputs_aliases_refuse_before_wal);
+	UT_RUN(d0_execute_reference_original_refusal_never_hashes_or_publishes);
+	UT_RUN(d0_execute_reference_hash_refusal_keeps_completed_operation_and_outputs);
+	UT_RUN(d0_execute_reference_hash_error_propagates_after_completed_close);
+	UT_RUN(d0_execute_reference_postinsert_panic_preserves_original_duty);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

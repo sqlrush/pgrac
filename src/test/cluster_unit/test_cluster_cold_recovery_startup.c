@@ -48,6 +48,7 @@
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_recovery_merge.h"
+#include "cluster/cluster_relmap_retention_runtime.h"
 #include "cluster/cluster_wal_tail.h"
 #include "utils/memutils.h"
 
@@ -68,6 +69,56 @@ ExceptionalCondition(const char *condition_name, const char *file_name, int line
 #include "test_cluster_recovery_duty_compare.inc"
 #include "test_cluster_cold_source_completion.inc"
 #include "test_cluster_cold_endpoints.h"
+
+UT_TEST(test_prepare_invalidates_old_retention_before_first_root)
+{
+	ClusterColdTypedV1 *typed;
+
+	fixture();
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(retention_invalidations, 1);
+	UT_ASSERT(retention_root_reads > 0);
+	cluster_cold_typed_destroy_v1(&typed);
+	UT_ASSERT_EQ(contexts_alive, 0);
+}
+
+UT_TEST(test_prepare_retention_refusal_stops_before_any_recovery_input)
+{
+	ClusterColdTypedV1 *typed;
+
+	fixture();
+	retention_invalidate_ok = false;
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
+	UT_ASSERT_EQ(retention_invalidations, 1);
+	UT_ASSERT_EQ(retention_root_reads + census_begins + tt_base_captures + side_creates, 0);
+	UT_ASSERT_EQ(typed->scanned_records, 0);
+	UT_ASSERT_EQ(typed->participant_count, 0);
+	UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
+	UT_ASSERT_NULL(typed->plan);
+	cluster_cold_typed_destroy_v1(&typed);
+	UT_ASSERT_EQ(contexts_alive, 0);
+}
+
+UT_TEST(test_prepare_input_refusal_and_retry_repeat_retention_invalidation)
+{
+	ClusterColdTypedV1 *typed;
+
+	fixture();
+	restart_ref_present = false;
+	typed = prepare(0x800);
+	UT_ASSERT_NE(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(retention_invalidations, 1);
+	cluster_cold_typed_destroy_v1(&typed);
+	restart_ref_present = true;
+	retention_root_reads = 0; /* A new attempt, without resetting invalidations. */
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(retention_invalidations, 2);
+	cluster_cold_typed_destroy_v1(&typed);
+	UT_ASSERT_EQ(contexts_alive, 0);
+}
 
 UT_TEST(test_prepare_rechecks_physical_profiles_of_every_original_origin)
 {
@@ -3779,7 +3830,7 @@ UT_TEST(test_own_root_seal_diagnostic_separates_lifecycle_and_flags)
 int
 main(void)
 {
-	UT_PLAN(133);
+	UT_PLAN(136);
 	UT_RUN(test_own_root_lookup_diagnostic_does_not_read_failed_outputs);
 	UT_RUN(test_own_root_key_format_diagnostic_names_the_field);
 	UT_RUN(test_own_root_legacy_crc_diagnostic_uses_native_claim_crc);
@@ -3792,6 +3843,9 @@ main(void)
 	UT_RUN(test_own_c0_dispatch_uses_restart_source_and_original_target);
 	UT_RUN(test_own_c0_source_or_target_refusal_never_calls_owner);
 	UT_RUN(test_own_c0_rechecks_restart_and_target_after_owner);
+	UT_RUN(test_prepare_invalidates_old_retention_before_first_root);
+	UT_RUN(test_prepare_retention_refusal_stops_before_any_recovery_input);
+	UT_RUN(test_prepare_input_refusal_and_retry_repeat_retention_invalidation);
 	UT_RUN(test_prepare_rechecks_physical_profiles_of_every_original_origin);
 	UT_RUN(test_prepare_checks_empty_physical_profiles_including_history_only_origin);
 	UT_RUN(test_endpoints_recheck_physical_profiles_and_discard_stale_inputs);

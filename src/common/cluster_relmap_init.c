@@ -160,6 +160,39 @@ validate_native_map(const RelMapFile *map, bool shared)
 }
 
 ClusterRelmapInitResult
+cluster_relmap_authority_v2_init_image(const ClusterRelmapV2Namespace *identity,
+									 const void *native_map, size_t native_len,
+									 void *output, size_t output_len)
+{
+	ClusterRelmapV2Image image = { 0 };
+	char bytes[CLUSTER_RELMAP_V2_FILE_SIZE];
+	ClusterRelmapInitResult result;
+	const unsigned char *destination = output;
+
+	if (identity == NULL || native_map == NULL || output == NULL
+		|| identity->system_identifier == 0 || identity->database_incarnation == 0)
+		return CLUSTER_RELMAP_INIT_INVALID_ARGUMENT;
+	if (native_len != sizeof(image.committed) || output_len != sizeof(bytes))
+		return CLUSTER_RELMAP_INIT_INVALID_LENGTH;
+	if (identity->shared != (identity->dbid == InvalidOid))
+		return CLUSTER_RELMAP_INIT_NAMESPACE_MISMATCH;
+	memcpy(&image.committed, native_map, sizeof(image.committed));
+	result = validate_native_map(&image.committed, identity->shared);
+	if (result != CLUSTER_RELMAP_INIT_OK)
+		return result;
+	for (size_t i = 0; i < output_len; ++i)
+		if (destination[i] != 0)
+			return CLUSTER_RELMAP_INIT_OUTPUT_NOT_EMPTY;
+
+	image.identity = *identity;
+	image.committed_generation = 1;
+	if (cluster_relmap_v2_encode(&image, bytes, sizeof(bytes)) != CLUSTER_RELMAP_V2_VALID)
+		return CLUSTER_RELMAP_INIT_INVALID_ARGUMENT;
+	memcpy(output, bytes, sizeof(bytes));
+	return CLUSTER_RELMAP_INIT_OK;
+}
+
+ClusterRelmapInitResult
 cluster_relmap_authority_init_image(bool shared_map, Oid dbid, const void *native_map,
 									size_t native_len, void *output, size_t output_len)
 {

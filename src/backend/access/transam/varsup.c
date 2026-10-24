@@ -69,6 +69,7 @@
 /* PGRAC (spec-6.14 D6): shared-catalog OID lease path for GetNewObjectId. */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_oid_lease.h"
+#include "cluster/cluster_relmap_recovery.h"
 #endif
 
 
@@ -470,6 +471,13 @@ retry_cluster_xid_reservation:
 		else
 			MyProc->subxidStatus.overflowed = substat->overflowed = true;
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Actual native publication only. A reserved stripe candidate, legal
+	 * future ceiling or replay endpoint must never populate this receipt. */
+	if (cluster_enabled && cluster_shared_config)
+		cluster_relmap_recovery_issued_publish(full_xid);
+#endif
 
 	LWLockRelease(XidGenLock);
 

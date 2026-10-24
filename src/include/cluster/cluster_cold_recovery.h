@@ -804,6 +804,9 @@ typedef struct ClusterColdScanResultV1 {
 	 * discard the entire optional SIDE plan; it cannot authorize replay. */
 	uint8 side_capture_detail;
 	XLogRecPtr side_capture_read_rec_ptr;
+	/* Same-anchor bytes bound to the actual checkpoint in the complete original
+	 * retained visit. Still provisional; no base/terminal/release authority. */
+	uint8 native_window[160];
 } ClusterColdScanResultV1;
 
 struct RfSideOnlinePlanV1;

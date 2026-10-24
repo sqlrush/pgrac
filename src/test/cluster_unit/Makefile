@@ -91,7 +91,7 @@ TESTS = test_cluster_vm_read_visibility test_cluster_heap_maintenance test_clust
 	        test_cluster_subtrans test_cluster_multixact test_cluster_multixact_current test_cluster_multixact_current_stats test_cluster_multixact_served test_cluster_mxid_stripe \
 		test_cluster_r4_d10_hint_source test_cluster_r4_d10_tt_source test_cluster_r4_d10_multi_source \
         test_cluster_undo_format \
-        test_cluster_recovery_c0_plan test_cluster_checkpoint_stamp test_cluster_recovery_stamp test_cluster_recovery_tt_record test_cluster_recovery_tt_io \
+        test_cluster_recovery_c0_plan test_cluster_checkpoint_stamp test_cluster_recovery_stamp test_cluster_recovery_tt_record test_cluster_recovery_ctrc_record test_cluster_d0_native_reader test_cluster_recovery_tt_io \
 		test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_undo_block0 test_cluster_undo_block0_current test_cluster_undo_smgr_publication test_cluster_terminal_ref_census test_cluster_cr test_cluster_cr_cache test_cluster_cr_shared_route test_cluster_cr_key test_cluster_cr_pool test_cluster_cr_lifecycle test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_resolver_cache test_cluster_cr_coordinator test_cluster_r4_static_model test_cluster_r4_tx_locator test_cluster_r4_tx_outcome test_cluster_r4_tx_enqueue test_cluster_r4_wire_codec test_cluster_r4_route_policy test_cluster_r4_slot_machine test_cluster_r4_lms_controls test_cluster_r4_slot_reservation test_cluster_r4_observe test_cluster_r4_cr_walk test_cluster_r4_multi_subx_2pc test_cluster_r4_activation_record test_cluster_r4_activation_fsm test_cluster_r4_lock_order test_cluster_r4_scratch_resolver test_cluster_tt_durable test_cluster_terminal_authority test_cluster_sf_dep \
         test_cluster_r4_itl_capacity \
         test_cluster_retention test_cluster_undo_cleaner test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc \
@@ -404,7 +404,7 @@ test_cluster_backup: test_cluster_backup.c unit_test.h $(CLUSTER_VERSION_O) \
 # separate rules because they also link additional cluster_*.o
 # objects (the test files stub the PG backend symbols those
 # objects reference).
-SIMPLE_TESTS = $(filter-out test_cluster_recovery_ctrc_record test_cluster_tt_checkpoint_native test_cluster_cold_tt_redo test_cluster_cold_tt_base test_cluster_tt_checkpoint_cuts test_cluster_recovery_c0_plan test_cluster_checkpoint_stamp test_cluster_recovery_stamp test_cluster_recovery_tt_record test_cluster_recovery_tt_io test_cluster_grd_capacity test_cluster_grd_dsa test_cluster_cr_shared_route test_cluster_tt_rollback_entry test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_shared_fs_cold_drop test_cluster_formation_restart test_cluster_cold_recovery_validate test_cluster_cold_recovery_io test_cluster_cold_recovery_complete test_cluster_recovery_merge_seal test_cluster_recovery_merge_complete test_cluster_typed_redo test_cluster_cold_recovery_space test_cluster_cold_recovery_space_refail test_cluster_cold_recovery_refail test_cluster_cold_recovery_replay test_cluster_cold_recovery_plan test_cluster_cold_recovery_decode test_cluster_cold_recovery_effects test_cluster_cold_recovery_startup test_cluster_update_trace test_cluster_ic_tier1_partial test_cluster_lms_outbound test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_shared_fs_sharedfs test_cluster_shared_fs_block_device test_cluster_smgr test_cluster_startup_phase test_cluster_authority_storage test_cluster_serving_sample test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision test_cluster_scn test_cluster_scn_frontier test_cluster_adg test_cluster_epoch test_cluster_epoch_ballot_codec test_cluster_fence test_cluster_reconfig test_cluster_ges test_cluster_grd_outbound test_cluster_grd test_cluster_grd_starvation test_cluster_lmd test_cluster_lmd_graph test_cluster_lmd_groups test_cluster_lmd_wait_state test_cluster_cancel_token test_cluster_lmd_probe_collector test_cluster_lock_acquire test_cluster_advisory test_cluster_terminal_authority test_cluster_retention test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay test_cluster_thread_driver test_cluster_thread_orchestrator test_cluster_write_fence test_cluster_write_fence_durable test_cluster_write_fence_cache test_cluster_stage4_acceptance test_cluster_stage5_integrated_acceptance test_cluster_stage5_beta_acceptance test_cluster_ges_mode test_cluster_sequence test_cluster_shared_catalog test_cluster_hw test_cluster_dl test_cluster_extend_gate test_cluster_recovery_serial test_cluster_ts test_cluster_ko test_cluster_hw_snapshot test_cluster_cf_authority test_cluster_control_root test_cluster_recovery_duty test_cluster_formation_witness test_cluster_cf_storage test_cluster_cf_enqueue test_cluster_cf_phase2 test_cluster_cf_stats test_cluster_hang test_cluster_hang_resolve test_cluster_cr_server_policy test_cluster_touched_peers test_cluster_clean_leave test_cluster_membership test_cluster_node_remove test_cluster_resolver_cache test_cluster_backup test_cluster_hang_acceptance test_cluster_gcs_reqid test_cluster_runtime_visibility test_cluster_xid_stripe test_cluster_mxid_stripe test_cluster_share_barrier test_cluster_heap_barrier test_cluster_bufmgr_pcm_hook test_cluster_cr test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_cache test_cluster_cr_coordinator test_cluster_cr_key test_cluster_cr_lifecycle test_cluster_cr_pool test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_gcs_block test_cluster_gcs_block_2way test_cluster_gcs_block_3way test_cluster_gcs_block_lost_write test_cluster_gcs_block_retransmit test_cluster_gcs_block_dedup_reclaim test_cluster_gcs_block_dedup_htab test_cluster_gcs_dispatch test_cluster_ges_handoff test_cluster_heap_lock_tuple test_cluster_hw_lease test_cluster_ic_envelope test_cluster_ic_router test_cluster_itl_cleanout test_cluster_itl_cleanout_perf test_cluster_itl_reader_real_triple test_cluster_itl_touch test_cluster_active_itl_transfer test_cluster_itl_wal test_cluster_multixact test_cluster_multixact_current test_cluster_multixact_served test_cluster_pcm_lock test_cluster_pcm_own test_cluster_pcm_direct_init test_cluster_perf_gates test_cluster_recovery_merge test_cluster_recovery_plan test_cluster_recovery_worker test_cluster_reverse_key test_cluster_sinval test_cluster_sinval_ack test_cluster_snapshot_source test_cluster_stage2_acceptance test_cluster_stage5_5_cr_acceptance test_cluster_subtrans test_cluster_tt_durable test_cluster_tt_slot_allocator test_cluster_tt_status test_cluster_tt_status_hint test_cluster_uba test_cluster_undo_format test_cluster_undo_lifecycle test_cluster_undo_record test_cluster_undo_block0 test_cluster_undo_smgr_publication test_cluster_visibility_decide_scn test_cluster_visibility_fork test_cluster_visibility_inject test_cluster_wal_state test_cluster_wal_thread test_cluster_xnode_lever test_cluster_xnode_profile test_cluster_pi_shadow test_cluster_oid_lease test_cluster_xid_authority test_cluster_recovery_anchor test_cluster_relmap_authority test_cluster_lms_shard test_cluster_gcs_block_dedup test_cluster_gcs_block_shard test_cluster_undo_resid test_cluster_undo_authority test_cluster_undo_gcs test_cluster_undo_verdict test_cluster_vis_undo_verdict_map test_cluster_undo_horizon test_cluster_r4_static_model test_cluster_r4_tx_locator test_cluster_r4_tx_outcome test_cluster_r4_cr_walk test_cluster_r4_activation_record test_cluster_r4_activation_fsm test_cluster_r4_lock_order,$(TESTS))
+SIMPLE_TESTS = $(filter-out test_cluster_d0_native_reader test_cluster_tt_checkpoint_native test_cluster_cold_tt_redo test_cluster_cold_tt_base test_cluster_tt_checkpoint_cuts test_cluster_recovery_c0_plan test_cluster_checkpoint_stamp test_cluster_recovery_stamp test_cluster_recovery_tt_record test_cluster_recovery_ctrc_record test_cluster_recovery_tt_io test_cluster_grd_capacity test_cluster_grd_dsa test_cluster_cr_shared_route test_cluster_tt_rollback_entry test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_shared_fs_cold_drop test_cluster_formation_restart test_cluster_cold_recovery_validate test_cluster_cold_recovery_io test_cluster_cold_recovery_complete test_cluster_recovery_merge_seal test_cluster_recovery_merge_complete test_cluster_typed_redo test_cluster_cold_recovery_space test_cluster_cold_recovery_space_refail test_cluster_cold_recovery_refail test_cluster_cold_recovery_replay test_cluster_cold_recovery_plan test_cluster_cold_recovery_decode test_cluster_cold_recovery_effects test_cluster_cold_recovery_startup test_cluster_update_trace test_cluster_ic_tier1_partial test_cluster_lms_outbound test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_shared_fs_sharedfs test_cluster_shared_fs_block_device test_cluster_smgr test_cluster_startup_phase test_cluster_authority_storage test_cluster_serving_sample test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision test_cluster_scn test_cluster_scn_frontier test_cluster_adg test_cluster_epoch test_cluster_epoch_ballot_codec test_cluster_fence test_cluster_reconfig test_cluster_ges test_cluster_grd_outbound test_cluster_grd test_cluster_grd_starvation test_cluster_lmd test_cluster_lmd_graph test_cluster_lmd_groups test_cluster_lmd_wait_state test_cluster_cancel_token test_cluster_lmd_probe_collector test_cluster_lock_acquire test_cluster_advisory test_cluster_terminal_authority test_cluster_retention test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay test_cluster_thread_driver test_cluster_thread_orchestrator test_cluster_write_fence test_cluster_write_fence_durable test_cluster_write_fence_cache test_cluster_stage4_acceptance test_cluster_stage5_integrated_acceptance test_cluster_stage5_beta_acceptance test_cluster_ges_mode test_cluster_sequence test_cluster_shared_catalog test_cluster_hw test_cluster_dl test_cluster_extend_gate test_cluster_recovery_serial test_cluster_ts test_cluster_ko test_cluster_hw_snapshot test_cluster_cf_authority test_cluster_control_root test_cluster_recovery_duty test_cluster_formation_witness test_cluster_cf_storage test_cluster_cf_enqueue test_cluster_cf_phase2 test_cluster_cf_stats test_cluster_hang test_cluster_hang_resolve test_cluster_cr_server_policy test_cluster_touched_peers test_cluster_clean_leave test_cluster_membership test_cluster_node_remove test_cluster_resolver_cache test_cluster_backup test_cluster_hang_acceptance test_cluster_gcs_reqid test_cluster_runtime_visibility test_cluster_xid_stripe test_cluster_mxid_stripe test_cluster_share_barrier test_cluster_heap_barrier test_cluster_bufmgr_pcm_hook test_cluster_cr test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_cache test_cluster_cr_coordinator test_cluster_cr_key test_cluster_cr_lifecycle test_cluster_cr_pool test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_gcs_block test_cluster_gcs_block_2way test_cluster_gcs_block_3way test_cluster_gcs_block_lost_write test_cluster_gcs_block_retransmit test_cluster_gcs_block_dedup_reclaim test_cluster_gcs_block_dedup_htab test_cluster_gcs_dispatch test_cluster_ges_handoff test_cluster_heap_lock_tuple test_cluster_hw_lease test_cluster_ic_envelope test_cluster_ic_router test_cluster_itl_cleanout test_cluster_itl_cleanout_perf test_cluster_itl_reader_real_triple test_cluster_itl_touch test_cluster_active_itl_transfer test_cluster_itl_wal test_cluster_multixact test_cluster_multixact_current test_cluster_multixact_served test_cluster_pcm_lock test_cluster_pcm_own test_cluster_pcm_direct_init test_cluster_perf_gates test_cluster_recovery_merge test_cluster_recovery_plan test_cluster_recovery_worker test_cluster_reverse_key test_cluster_sinval test_cluster_sinval_ack test_cluster_snapshot_source test_cluster_stage2_acceptance test_cluster_stage5_5_cr_acceptance test_cluster_subtrans test_cluster_tt_durable test_cluster_tt_slot_allocator test_cluster_tt_status test_cluster_tt_status_hint test_cluster_uba test_cluster_undo_format test_cluster_undo_lifecycle test_cluster_undo_record test_cluster_undo_block0 test_cluster_undo_smgr_publication test_cluster_visibility_decide_scn test_cluster_visibility_fork test_cluster_visibility_inject test_cluster_wal_state test_cluster_wal_thread test_cluster_xnode_lever test_cluster_xnode_profile test_cluster_pi_shadow test_cluster_oid_lease test_cluster_xid_authority test_cluster_recovery_anchor test_cluster_relmap_authority test_cluster_lms_shard test_cluster_gcs_block_dedup test_cluster_gcs_block_shard test_cluster_undo_resid test_cluster_undo_authority test_cluster_undo_gcs test_cluster_undo_verdict test_cluster_vis_undo_verdict_map test_cluster_undo_horizon test_cluster_r4_static_model test_cluster_r4_tx_locator test_cluster_r4_tx_outcome test_cluster_r4_cr_walk test_cluster_r4_activation_record test_cluster_r4_activation_fsm test_cluster_r4_lock_order,$(TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_cr_reuse test_cluster_snapshot_admission test_cluster_undo_header_durability test_cluster_tt_2pc_finish test_cluster_control_transport test_cluster_cr_native_origin test_cluster_cr_mvcc_origin test_cluster_tt_abort_owner test_cluster_tt_active_owner test_cluster_pcm_aux_consumer test_cluster_pcm_aux_reobserve test_cluster_multixact_current_stats \
 		test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
 		test_cluster_pcm_aux_mutation test_cluster_heap_extend_current test_cluster_heap_inplace \
@@ -540,10 +540,177 @@ SIMPLE_TESTS := $(filter-out test_cluster_service_observe,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_catalog_manifest test_cluster_catalog_init test_cluster_catalog_startup,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_init,$(SIMPLE_TESTS))
+TESTS += test_cluster_relmap_xid_order
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_xid_order,$(SIMPLE_TESTS))
+TESTS += test_cluster_relmap_arb
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_arb,$(SIMPLE_TESTS))
+TESTS += test_cluster_relmap_v2
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2,$(SIMPLE_TESTS))
+TESTS += test_cluster_relmap_v2_storage
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2_storage,$(SIMPLE_TESTS))
+TESTS += test_cluster_relmap_retention
+TESTS += test_cluster_relmap_checkpoint
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_checkpoint,$(SIMPLE_TESTS))
+TESTS += test_cluster_relmap_recovery
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_recovery,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_retention,$(SIMPLE_TESTS))
+TESTS += test_cluster_relmap_retention_census
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_retention_census,$(SIMPLE_TESTS))
+TESTS += test_cluster_relmap_pending
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_pending,$(SIMPLE_TESTS))
+TESTS += test_cluster_relmap_pending_side
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_pending_side,$(SIMPLE_TESTS))
+TESTS += test_cluster_relmap_census_side
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_census_side,$(SIMPLE_TESTS))
+TESTS += test_cluster_relmap_retained_wal
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_retained_wal,$(SIMPLE_TESTS))
+
+test_cluster_relmap_arb: test_cluster_relmap_arb.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_arb.c \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_authority.c \
+		$(top_srcdir)/src/backend/access/transam/transam.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_arb.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
+		$(top_srcdir)/src/backend/utils/cache/relmapper.c \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_writer.c \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_writer.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_claim.h $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
+		test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c \
+		test_cluster_recovery_crypto_boundary.h unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_pending.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_pending_side.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_restore.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		test_cluster_relmap_retention_census_product.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_pending.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_CRYPTOHASH_O) cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		test_cluster_relmap_retention_census_product.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_pending.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(LDFLAGS) $(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+# Keep the original census-only fixture independent of the unused SIDE join.
+test_cluster_relmap_retention_census_product.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_retention_census.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_pending_side.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_pending.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_restore.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_relmap_census_side: test_cluster_relmap_retention_census.c \
+		test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c \
+		test_cluster_recovery_crypto_boundary.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h \
+		test_cluster_relmap_retention_census_product.o \
+		test_cluster_relmap_pending_side_product.o \
+		test_cluster_relmap_pending_product.o test_cluster_relmap_v2_codec_product.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(CLUSTER_UNIT_CRYPTOHASH_O)
+
+test_cluster_relmap_retention: test_cluster_relmap_retention.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_local.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_relmap_pending: test_cluster_relmap_pending.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_pending.h \
+		$(top_srcdir)/src/include/cluster/cluster_space_identity.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		test_cluster_relmap_pending_product.o test_cluster_relmap_v2_codec_product.o \
+		$(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
+		test_cluster_relmap_pending_product.o \
+		test_cluster_relmap_v2_codec_product.o \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_relmap_pending_product.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_pending.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_pending.h \
+		$(top_srcdir)/src/include/cluster/cluster_space_identity.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -c $< -o $@
+
+test_cluster_relmap_v2_codec_product.o: $(top_srcdir)/src/common/cluster_relmap_v2.c \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_srcdir)/src/include/common/relmap.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND -c $< -o $@
+
+# Compile the real storage module with pass-through syscall fault boundaries.
+test_cluster_relmap_v2_storage_product.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_authority.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_pending.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -Dwrite=relmap_test_write -Dread=relmap_test_read \
+		-Drenameat=relmap_test_renameat -Dclose=relmap_test_close -c $< -o $@
+
+test_cluster_relmap_v2_storage: test_cluster_relmap_v2_storage.c unit_test.h \
+		test_cluster_relmap_runtime_storage.inc \
+		test_cluster_relmap_owner_conversion.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_writer.h \
+		$(top_srcdir)/src/include/cluster/cluster_shmem.h \
+		test_cluster_relmap_v2_storage_product.o $(top_builddir)/src/common/libpgcommon_srv.a \
+		test_cluster_relmap_pending_product.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention_restore.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_restore.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -ffunction-sections -fdata-sections $< test_cluster_relmap_v2_storage_product.o \
+		test_cluster_relmap_pending_product.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention_restore.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(filter -lcrypto,$(LIBS)) -o $@
+
+test_cluster_relmap_v2: test_cluster_relmap_v2.c unit_test.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_srcdir)/src/include/common/relmap.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a -o $@
 
 # Fresh image constructor must link as a frontend, without backend services.
 test_cluster_relmap_init: test_cluster_relmap_init.c unit_test.h \
 		$(top_srcdir)/src/include/common/relmap.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
 		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
@@ -1293,6 +1460,7 @@ test_cluster_recovery_stop: test_cluster_recovery_stop.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_thread_recovery_orchestrator.c \
 		$(top_srcdir)/src/include/cluster/cluster_clean_leave.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
+        $(top_srcdir)/src/include/cluster/cluster_undo_smgr.h \
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
         $(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h $(CLUSTER_UNIT_CRYPTOHASH_O) Makefile
@@ -2916,6 +3084,7 @@ test_cluster_recovery_c0_apply: test_cluster_recovery_c0_apply.c unit_test.h \
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_undo_recovery: test_cluster_undo_recovery.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
 		test_cluster_undo_path_native.inc test_cluster_undo_fd_native.inc test_cluster_undo_dir_native.inc \
 		test_cluster_undo_recovery_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_undo_gcs.o \
@@ -3015,7 +3184,16 @@ CLUSTER_SIDE_HEAD_READER_O = $(top_builddir)/src/backend/cluster/cluster_recover
 		$(top_builddir)/src/backend/cluster/cluster_uba.o
 
 test_cluster_pi_contribution: test_cluster_page_data_stable.o
-test_cluster_recovery_c0_plan test_cluster_cold_tt_redo: $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
+test_cluster_recovery_c0_plan test_cluster_cold_tt_redo test_cluster_relmap_pending_side: $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
+
+test_cluster_relmap_pending_side: test_cluster_relmap_pending_side_product.o \
+		test_cluster_relmap_pending_product.o test_cluster_relmap_v2_codec_product.o \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_pending_side.h
+test_cluster_relmap_pending_side_product.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_pending_side.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_pending_side.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_pending.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 test_cluster_cold_tt_redo: test_cluster_cold_tt_redo_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o \
@@ -3037,7 +3215,9 @@ test_cluster_side_xact_stats.inc: $(top_srcdir)/src/backend/utils/activity/pgsta
 	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_side_xact test_cluster_pi_contribution test_cluster_recovery_c0_plan test_cluster_cold_tt_redo: %: %.c unit_test.h test_cluster_side_xact.c test_cluster_side_xact_stats.inc test_cluster_undo_header_identity.inc test_cluster_heap_small_scn.inc \
+test_cluster_side_xact: $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
+
+test_cluster_side_xact test_cluster_pi_contribution test_cluster_recovery_c0_plan test_cluster_cold_tt_redo test_cluster_relmap_pending_side test_cluster_relmap_census_side: %: %.c unit_test.h test_cluster_side_xact.c test_cluster_side_xact_stats.inc test_cluster_undo_header_identity.inc test_cluster_heap_small_scn.inc \
 		test_cluster_side_online_owner_product.o $(CLUSTER_SIDE_HEAD_READER_O) \
 		test_cluster_side_xact_budget_product.o $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
@@ -3050,7 +3230,7 @@ test_cluster_side_xact test_cluster_pi_contribution test_cluster_recovery_c0_pla
 		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_COLD_EXTRA_O) \
-		$(filter test_cluster_page_data_stable.o test_cluster_cold_tt_redo_product.o test_cluster_cold_recovery_%.o $(CLUSTER_WAL_CLAIM_O) $(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o,$^) \
+		$(filter test_cluster_page_data_stable.o test_cluster_cold_tt_redo_product.o test_cluster_cold_recovery_%.o test_cluster_relmap_retention_census_product.o test_cluster_relmap_pending_side_product.o test_cluster_relmap_pending_product.o test_cluster_relmap_v2_codec_product.o $(CLUSTER_WAL_CLAIM_O) $(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/backend/cluster/cluster_relmap_retention.o $(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o,$^) \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) -lssl -lcrypto -o $@
@@ -3311,7 +3491,36 @@ test_cluster_recovery_native_inputs: test_cluster_recovery_manifest_inputs.inc t
 test_cluster_recovery_native_inputs: $(RECOVERY_CENSUS_TEST_OBJS) test_cluster_recovery_prepare_fixture.h test_cluster_recovery_prepare_inputs.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_xact_join_inputs.inc test_cluster_recovery_relmap_physical_inputs.inc test_cluster_recovery_relmap_inputs.inc test_cluster_recovery_relmap_fixture.h
 
-test_cluster_control_root test_cluster_recovery_native_inputs: %: %.c test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc test_cluster_control_root_serving.inc \
+# The prefix/base composition consumes both public native-owner declarations.
+$(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o: \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_terminal_scan.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
+		$(top_srcdir)/src/include/access/clog.h
+
+test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_terminal_scan.h \
+		test_cluster_relmap_retained_census.o test_cluster_relmap_pending_product.o \
+		test_cluster_relmap_pending_side_product.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o
+# The collector executes normally; inject only its ERROR boundary in this fixture.
+test_cluster_relmap_retained_census.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_retention_census.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_pending_side.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		-Dcluster_relmap_pending_collect_side=test_relmap_pending_collect_side -c $< -o $@
+test_cluster_relmap_retained_owner.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_pending_side.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relmap_retained_wal: %: %.c test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc test_cluster_control_root_serving.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_census.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_native_inventory.c \
@@ -3346,6 +3555,9 @@ test_cluster_control_root test_cluster_recovery_native_inputs: %: %.c test_clust
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o \
 		$(top_srcdir)/src/include/cluster/cluster_wal_tail.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
+		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_owner.o) \
+		$(if $(filter test_cluster_relmap_retained_wal,$@),$(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o) \
+		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_census.o test_cluster_relmap_pending_product.o test_cluster_relmap_pending_side_product.o $(top_builddir)/src/backend/cluster/cluster_relmap_retention.o) \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_root_set.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_namespace.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_wal_targets.o \
@@ -3384,7 +3596,9 @@ cluster_control_bootstrap_read_test.o: cluster_control_bootstrap_read_test.c \
 
 xlogreader_fs.o: $(top_srcdir)/src/backend/access/transam/xlogreader.c \
 		$(top_srcdir)/src/include/access/xlog_internal.h \
-		$(top_srcdir)/src/include/access/xlogrecord.h
+		$(top_srcdir)/src/include/access/xlogrecord.h \
+		$(top_srcdir)/src/include/access/xlogreader.h \
+		$(top_srcdir)/src/include/cluster/cluster_xlog.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND -c $< -o $@
 
 CLUSTER_WAL_RETENTION_O = $(top_builddir)/src/backend/cluster/cluster_wal_retention.o
@@ -3801,7 +4015,9 @@ test_cluster_write_fence_cache: test_cluster_write_fence_cache.c unit_test.h \
 CLUSTER_RECOVERY_ANCHOR_O = $(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
 	$(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o
 test_cluster_recovery_anchor: test_cluster_recovery_anchor.c unit_test.h \
-		$(CLUSTER_RECOVERY_ANCHOR_O)
+		$(top_srcdir)/src/include/cluster/cluster_relmap_checkpoint.h \
+		$(CLUSTER_RECOVERY_ANCHOR_O) \
+        $(top_srcdir)/src/backend/cluster/cluster_relmap_checkpoint.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_RECOVERY_ANCHOR_O) \
 		$(top_builddir)/src/common/libpgcommon.a \
@@ -3857,9 +4073,12 @@ test_cluster_xid_authority: test_cluster_xid_authority.c unit_test.h \
 
 # spec-6.14 D5: test_cluster_relmap_authority links cluster_relmap_authority.o
 # (the two-phase pending/committed authority substrate).  fd.c + ereport
-# stubbed locally; CRC32C from libpgport.  The write-path activation (relmapper
+# stubbed locally; CRC32C from libpgport. The authority object includes dormant
+# v2 staging, so link its real retention dependency and abort-stub unused locks.
+# The write-path activation (relmapper
 # hook, publish-then-invalidate, crash arbitration) is exercised by TAP.
-CLUSTER_RELMAP_AUTHORITY_O = $(top_builddir)/src/backend/cluster/cluster_relmap_authority.o
+CLUSTER_RELMAP_AUTHORITY_O = $(top_builddir)/src/backend/cluster/cluster_relmap_authority.o \
+	$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o
 test_cluster_relmap_consumer.inc: $(top_srcdir)/src/backend/utils/cache/relmapper.c Makefile
 	awk '/^cluster_read_relmap_from_authority\(/ { print "static void"; emit=1; n++ } \
 	     emit { print } /^}/ { emit=0 } END { if (n != 1) exit 1 }' $< > $@.tmp
@@ -4350,7 +4569,8 @@ test_cluster_guc: test_cluster_guc.c unit_test.h $(CLUSTER_VERSION_O) \
 # cluster_elog.o (the test stubs RequestAddinShmemSpace, ShmemInitStruct,
 # GetCurrentTimestamp, and elog so no PG backend is needed).
 test_cluster_shmem: test_cluster_shmem.c unit_test.h $(CLUSTER_VERSION_O) \
-		$(CLUSTER_SHMEM_O) $(CLUSTER_GUC_O) $(CLUSTER_ELOG_O)
+		$(CLUSTER_SHMEM_O) $(CLUSTER_GUC_O) $(CLUSTER_ELOG_O) \
+		../../../src/include/cluster/cluster_relmap_retention_runtime.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_SHMEM_O) $(CLUSTER_GUC_O) $(CLUSTER_ELOG_O) -o $@
 
@@ -4891,6 +5111,8 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_typed_redo_reader.inc test_cluster_typed_redo_fpi.inc test_cluster_cold_init_native.inc
 	rm -f test_cluster_current_mx_local_sample.inc test_cluster_current_mx_reply_builder.inc
 	rm -f test_cluster_page_cold_redo_product.o
+	rm -f test_cluster_relmap_v2_storage_product.o
+	rm -f test_cluster_relmap_retained_owner.o
 	rm -f $(CLUSTER_COLD_PLAN_O) $(CLUSTER_COLD_DECODE_O) $(CLUSTER_COLD_STARTUP_O) test_cluster_cold_recovery_io_core.o
 	rm -f $(D_COLD_REFAIL_O) $(D_COLD_REPLAY_O)
 	rm -f test_cluster_block_redeclare_scan.inc
@@ -6385,7 +6607,10 @@ test_cluster_r4_cr_walk: test_cluster_r4_cr_walk.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_initdb_relmap: test_cluster_initdb_relmap.c unit_test.h \
-		$(top_srcdir)/src/bin/initdb/pgrac_relmap.c $(top_srcdir)/src/bin/initdb/pgrac_relmap.h
+		$(top_srcdir)/src/bin/initdb/pgrac_relmap.c $(top_srcdir)/src/bin/initdb/pgrac_relmap.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< $(LDFLAGS) \
 		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
@@ -7443,16 +7668,97 @@ test_cluster_r4_d10_multi_source: test_cluster_r4_d10_multi_source.c unit_test.h
 
 # Original rmgr descriptor plus the bounded recovery payload codec.
 test_cluster_recovery_tt_desc.o: $(top_srcdir)/src/backend/access/rmgrdesc/clusterundodesc.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_tt_record.h \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 test_cluster_recovery_tt_record: test_cluster_recovery_tt_record.c unit_test.h \
 		test_cluster_recovery_tt_desc.o \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_tt_record.h \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_recovery_tt_desc.o \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# D0 codec, native references, record/graph hashes and native target match.
+test_cluster_recovery_ctrc_record_product.o: $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
+		$(top_srcdir)/src/include/cluster/cluster_xlog.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_undo_scan.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
+		$(top_srcdir)/src/include/access/xlogdefs.h \
+		$(top_srcdir)/src/include/access/xlogrecord.h \
+		$(top_srcdir)/src/include/access/xlogreader.h \
+		$(top_srcdir)/src/include/access/rmgr.h \
+		$(top_srcdir)/src/include/replication/origin.h \
+		$(top_srcdir)/src/include/port/pg_crc32c.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
+		$(top_srcdir)/src/include/cluster/cluster_uba.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
+		$(top_srcdir)/src/include/common/cryptohash.h \
+		$(top_srcdir)/src/include/utils/memutils.h \
+		$(top_srcdir)/src/include/utils/palloc.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+test_cluster_recovery_ctrc_header.o: $(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
+		$(top_srcdir)/src/include/storage/bufpage.h \
+		$(top_srcdir)/src/include/storage/checksum_impl.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+# Link the original read-only BIND decoder without the TT transition fixture.
+test_cluster_recovery_ctrc_bind_decoder.o: $(top_srcdir)/src/backend/cluster/cluster_side_undo.c \
+		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_route.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_recovery_ctrc_namespace.o: $(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+# Reuse the original full 48-slot scan; unrelated record readers are dead-stripped.
+test_cluster_recovery_ctrc_undo_scan.o: $(top_srcdir)/src/backend/cluster/cluster_recovery_undo_scan.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_undo_scan.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
+		$(top_srcdir)/src/include/cluster/cluster_uba.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_alloc.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_recovery_ctrc_record: test_cluster_recovery_ctrc_record.c unit_test.h \
+		test_cluster_recovery_ctrc_record_product.o test_cluster_recovery_ctrc_header.o \
+		test_cluster_recovery_ctrc_namespace.o test_cluster_recovery_ctrc_undo_scan.o \
+		xlogreader_fs.o test_cluster_recovery_ctrc_bind_decoder.o \
+		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
+		$(top_srcdir)/src/include/access/xlogrecord.h \
+		$(top_srcdir)/src/include/access/xlogreader.h \
+		$(top_srcdir)/src/include/access/xlog_internal.h \
+		$(top_srcdir)/src/include/access/rmgr.h \
+		$(top_srcdir)/src/include/port/pg_crc32c.h \
+		$(top_srcdir)/src/include/utils/memutils.h \
+		$(top_srcdir)/src/include/utils/palloc.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_recovery_ctrc_record_product.o \
+		test_cluster_recovery_ctrc_header.o test_cluster_recovery_ctrc_namespace.o \
+		test_cluster_recovery_ctrc_undo_scan.o xlogreader_fs.o \
+		test_cluster_recovery_ctrc_bind_decoder.o $(CLUSTER_SIDE_ROUTE_O) \
+		$(CLUSTER_RF_ROUTE_O) $(LDFLAGS) \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon.a \
+		$(CLUSTER_UNIT_PORT_LIBS) \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # spec-3.7 D12: test_cluster_undo_format — 12 pure ABI / offsetof /
 # sizeof / magic / enum / SQLSTATE tests for Undo Record Format +
@@ -7597,7 +7903,7 @@ test_cluster_tt_checkpoint_guts.inc: $(top_srcdir)/src/backend/access/transam/xl
 test_cluster_tt_checkpoint_publish.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^CreateCheckPoint\(/ { owner=1 } \
 	     owner && /vxids = GetVirtualXIDsDelayingChkpt\(&nvxids, DELAY_CHKPT_START\);/ { emit=1; starts++ } \
-	     emit { print; if (/ClusterCheckpointV3Publish\(&v3_checkpoint, recptr, recovery_checkpoint_scope\);/) { print "#endif"; emit=0; done++; exit } } \
+	     emit { print; if (/ClusterCheckpointV3Publish\(&v3_checkpoint, recptr,/) publishing=1; if (publishing && /\);[[:space:]]*$$/) { print "#endif"; emit=0; done++; exit } } \
 	     END { if (starts != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
@@ -8600,15 +8906,34 @@ test_cluster_wal_cut: test_cluster_wal_cut.c unit_test.h \
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # PGRAC: writer runtime checks with native caller boundaries. Author: SqlRush <sqlrush@gmail.com>
-test_cluster_wal_writer: unit_test.h \
+test_cluster_wal_writer: test_cluster_wal_writer.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_writer.c \
 		$(top_srcdir)/src/include/cluster/cluster_wal_writer.h \
 		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
+		test_cluster_relmap_owner.inc \
+		test_cluster_relmap_retention_runtime.inc \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_srcdir)/src/include/common/relmap.h \
+		$(top_srcdir)/src/include/utils/relmapper.h \
+		$(top_srcdir)/src/include/access/xlogreader.h \
+		$(top_builddir)/src/include/catalog/pg_tablespace_d.h \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_local.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(CLUSTER_WAL_CLAIM_O) xlogreader_fs.o \
 		test_cluster_wal_publish_tail.inc test_cluster_wal_publish_callers.inc test_cluster_wal_publish_entry.inc
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(srcdir)/$@.c $(CLUSTER_WAL_CLAIM_O) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $(srcdir)/$@.c $(CLUSTER_WAL_CLAIM_O) \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		xlogreader_fs.o $(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
-		$(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 test_cluster_wal_thread: test_cluster_wal_thread.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_WAL_CLAIM_O)
@@ -8828,7 +9153,10 @@ test_cluster_xid_allocation.inc: $(top_srcdir)/src/backend/access/transam/varsup
 	mv $@.tmp $@
 
 test_cluster_xid_allocation: test_cluster_xid_allocation.c unit_test.h \
-		test_cluster_xid_allocation.inc $(CLUSTER_XID_STRIPE_O)
+		test_cluster_xid_allocation.inc $(CLUSTER_XID_STRIPE_O) \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_recovery.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
+		$(top_srcdir)/src/include/access/transam.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Exercise the original recovery -> seed -> claim -> WAL gate. Dependency
@@ -9286,6 +9614,7 @@ test_cluster_cold_tt_base: test_cluster_cold_tt_base.c unit_test.h test_cluster_
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
 
 test_cluster_cold_recovery_startup_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
 		$(top_srcdir)/src/backend/cluster/cluster_control_bootstrap_private.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_census.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
@@ -9307,6 +9636,7 @@ test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_te
 		test_cluster_recovery_duty_compare.inc \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
 		test_cluster_cold_source_completion.inc \
 		test_cluster_cold_endpoints.h test_cluster_cold_recovery_xid_core.o \
 		test_cluster_cold_recovery_replay_core.o \
@@ -9404,6 +9734,9 @@ test_cluster_cold_recovery_validate: test_cluster_cold_recovery_validate.c unit_
 
 test_cluster_cold_recovery_io_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_io.c \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_tail.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_checkpoint.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_census.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 
@@ -9411,11 +9744,14 @@ test_cluster_cold_recovery_io test_cluster_cold_recovery_complete: %: %.c unit_t
 		test_cluster_cold_recovery_io_boundary.h test_cluster_cold_recovery_io_core.o \
 		test_cluster_cold_recovery_xid_core.o \
 		$(CLUSTER_COLD_PLAN_O) cluster_unit_port_stubs.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o \
+		$(top_builddir)/src/common/libpgcommon.a \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_census.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< test_cluster_cold_recovery_io_core.o \
 		test_cluster_cold_recovery_xid_core.o \
-		$(CLUSTER_COLD_PLAN_O) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$(CLUSTER_COLD_PLAN_O) $(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 test_cluster_recovery_duty_compare.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_duty.c Makefile
 	awk '/^write_u(16|32|64)_le\(/ { print "static void"; emit=1; n++ } \
@@ -9835,7 +10171,7 @@ test_cluster_ko_space.inc: $(top_srcdir)/src/backend/cluster/cluster_space_stora
 # Exact held-FD storage seam; recovery authority/path and ResourceOwner
 # callbacks are fixtures, while the file and smgr operations are real.
 test_cluster_recovery_tt_io: test_cluster_recovery_tt_io.c unit_test.h \
-		test_cluster_undo_segment_init.o \
+		test_cluster_undo_segment_init.o test_cluster_d0_native_reader_fixture.h xlogreader_fs.o \
 		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
 		$(top_srcdir)/src/include/cluster/cluster_undo_smgr.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
@@ -9843,17 +10179,29 @@ test_cluster_recovery_tt_io: test_cluster_recovery_tt_io.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h \
 		test_cluster_recovery_ctrc_record_product.o $(CLUSTER_UNIT_CRYPTOHASH_O) Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
-		$(CLUSTER_UNDO_TEST_GC_SECTIONS) \
-		test_cluster_undo_segment_init.o \
-		test_cluster_recovery_ctrc_record_product.o $(CLUSTER_UNIT_CRYPTOHASH_O) \
-		$(top_builddir)/src/common/libpgcommon_srv.a \
+		test_cluster_undo_segment_init.o xlogreader_fs.o test_cluster_recovery_ctrc_record_product.o \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # PGRAC: real shared stamp owner; immutable claim shape code is linked unchanged.
+test_cluster_recovery_stamp_insert.inc: $(top_srcdir)/src/backend/access/transam/xloginsert.c Makefile
+	awk '/^XLogLastInsertRangesOverlap\(/ { print "static bool"; emit=1; functions++ } \
+         /^XLog(Get|Copy)LastInsertRecord\(/ { print "bool"; emit=1; functions++ } \
+         emit { print } /^}/ { emit=0 } \
+         END { if (functions != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_recovery_stamp: test_cluster_recovery_stamp.c unit_test.h \
+        test_cluster_recovery_stamp_insert.inc \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
+        $(top_srcdir)/src/include/access/xact.h \
+        $(top_srcdir)/src/include/access/xlog.h \
+        $(top_srcdir)/src/include/access/xlog_internal.h \
+        $(top_srcdir)/src/include/access/xloginsert.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
+        $(top_srcdir)/src/include/cluster/cluster_undo_smgr.h \
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
         $(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h $(CLUSTER_UNIT_CRYPTOHASH_O) Makefile
@@ -9905,11 +10253,15 @@ test_cluster_checkpoint_stamp_boundary.inc: $(top_srcdir)/src/backend/access/tra
 	mv $@.tmp $@
 
 test_cluster_checkpoint_stamp: test_cluster_checkpoint_stamp.c test_cluster_recovery_stamp.c unit_test.h \
+        $(top_srcdir)/src/include/access/xlog_internal.h \
+        $(top_srcdir)/src/include/access/xloginsert.h \
         test_cluster_checkpoint_stamp.inc test_cluster_checkpoint_stamp_boundary.inc \
+        test_cluster_recovery_stamp_insert.inc \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
         $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
         $(top_srcdir)/src/include/cluster/cluster_epoch.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
+        $(top_srcdir)/src/include/cluster/cluster_undo_smgr.h \
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
         $(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h $(CLUSTER_UNIT_CRYPTOHASH_O) Makefile
@@ -10064,78 +10416,49 @@ test_cluster_cold_start_prepare: test_cluster_cold_start_prepare.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 # Original D0 codec and canonical owner-evidence fixture. No live D0 admission.
-test_cluster_recovery_ctrc_record_product.o: $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
-		$(top_srcdir)/src/include/cluster/cluster_recovery_undo_scan.h \
-		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h \
-		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h \
-		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
-		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
-		$(top_srcdir)/src/include/access/xlogdefs.h \
-		$(top_srcdir)/src/include/access/xlogrecord.h \
-		$(top_srcdir)/src/include/access/xlogreader.h \
-		$(top_srcdir)/src/include/access/rmgr.h \
-		$(top_srcdir)/src/include/replication/origin.h \
-		$(top_srcdir)/src/include/port/pg_crc32c.h \
-		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
-		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
-		$(top_srcdir)/src/include/cluster/cluster_uba.h \
-		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
-		$(top_srcdir)/src/include/common/cryptohash.h \
-		$(top_srcdir)/src/include/utils/memutils.h \
-		$(top_srcdir)/src/include/utils/palloc.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
-test_cluster_recovery_ctrc_header.o: $(top_srcdir)/src/common/cluster_undo_segment_init.c \
-		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
-		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
-		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
-		$(top_srcdir)/src/include/storage/bufpage.h \
-		$(top_srcdir)/src/include/storage/checksum_impl.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
-test_cluster_recovery_ctrc_bind_decoder.o: $(top_srcdir)/src/backend/cluster/cluster_side_undo.c \
-		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
-		$(top_srcdir)/src/include/cluster/cluster_side_route.h \
-		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_recovery_ctrc_namespace.o: $(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
-		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_recovery_ctrc_undo_scan.o: $(top_srcdir)/src/backend/cluster/cluster_recovery_undo_scan.c \
-		$(top_srcdir)/src/include/cluster/cluster_recovery_undo_scan.h \
-		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
-		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
-		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
-		$(top_srcdir)/src/include/cluster/cluster_uba.h \
-		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
-		$(top_srcdir)/src/include/cluster/storage/cluster_undo_alloc.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+
+
+
+
 
 test_cluster_recovery_ctrc_record: LDFLAGS += $(CLUSTER_UNDO_TEST_GC_SECTIONS)
-test_cluster_recovery_ctrc_record: test_cluster_recovery_ctrc_record.c unit_test.h \
-		test_cluster_recovery_ctrc_record_product.o test_cluster_recovery_ctrc_header.o \
-		test_cluster_recovery_ctrc_namespace.o test_cluster_recovery_ctrc_undo_scan.o \
-		xlogreader_fs.o test_cluster_recovery_ctrc_bind_decoder.o \
-		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
-		$(top_builddir)/src/common/libpgcommon.a \
+
+
+# D2: original native completed-reader custody of exact D0 raw bytes.
+test_cluster_d0_native_reader: test_cluster_d0_native_reader.c unit_test.h \
+		test_cluster_d0_native_reader_fixture.h \
+		xlogreader_fs.o test_cluster_recovery_ctrc_record_product.o \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h \
-		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h \
-		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
-		$(top_srcdir)/src/include/access/xlogrecord.h \
-		$(top_srcdir)/src/include/access/xlogreader.h \
-		$(top_srcdir)/src/include/access/xlog_internal.h \
-		$(top_srcdir)/src/include/access/rmgr.h \
-		$(top_srcdir)/src/include/port/pg_crc32c.h \
-		$(top_srcdir)/src/include/utils/memutils.h \
-		$(top_srcdir)/src/include/utils/palloc.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_recovery_ctrc_record_product.o \
-		test_cluster_recovery_ctrc_header.o test_cluster_recovery_ctrc_namespace.o \
-		test_cluster_recovery_ctrc_undo_scan.o xlogreader_fs.o \
-		test_cluster_recovery_ctrc_bind_decoder.o $(CLUSTER_SIDE_ROUTE_O) \
-		$(CLUSTER_RF_ROUTE_O) $(LDFLAGS) \
-		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon.a \
-		$(CLUSTER_UNIT_PORT_LIBS) \
+		$(top_srcdir)/src/include/cluster/cluster_xlog.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< xlogreader_fs.o \
+		test_cluster_recovery_ctrc_record_product.o $(LDFLAGS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+# Original native issuance/floor observations, no recovery authority provider.
+test_cluster_relmap_recovery: test_cluster_relmap_recovery.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_checkpoint.h \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_recovery.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
+		$(top_srcdir)/src/include/access/transam.h $(CLUSTER_UNIT_PORT_LIBS) \
+        $(top_srcdir)/src/backend/cluster/cluster_relmap_checkpoint_native.c \
+        $(top_srcdir)/src/backend/cluster/cluster_relmap_checkpoint.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_srcdir)/src/backend/cluster/cluster_relmap_checkpoint.c \
+        $(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+        $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+# Original checkpoint native-window codec; pure bounded bytes only.
+test_cluster_relmap_checkpoint: test_cluster_relmap_checkpoint.c unit_test.h \
+        $(top_srcdir)/src/backend/cluster/cluster_relmap_checkpoint.c \
+        $(top_srcdir)/src/include/cluster/cluster_relmap_checkpoint.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< \
+        $(top_srcdir)/src/backend/cluster/cluster_relmap_checkpoint.c \
+        $(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+        $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS))

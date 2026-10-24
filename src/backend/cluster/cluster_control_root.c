@@ -48,6 +48,7 @@
 #include "cluster_control_root_private.h"
 #include "cluster/cluster_relmap_checkpoint.h"
 #include "cluster_recovery_anchor_private.h"
+#include "cluster/cluster_relmap_checkpoint.h"
 #include "cluster/storage/cluster_shared_fs.h"
 #include "common/cryptohash.h"
 #include "common/sha2.h"
@@ -2249,9 +2250,9 @@ read_control_version(const uint8 storage_uuid[16], uint64 system_identifier, Con
  * Author: SqlRush <sqlrush@gmail.com>
  */
 static ClusterControlRootResult
-read_thread_input(const ClusterControlRootIdentity *self, ControlRootImage *root,
-				  ControlFileData *out, ClusterControlRootFileToken *token, uint16 version,
-				  bool native_input)
+read_thread_input_window(const ClusterControlRootIdentity *self, ControlRootImage *root,
+						 ControlFileData *out, ClusterControlRootFileToken *token, uint16 version,
+						 bool native_input, uint8 native_window[160])
 {
 	ControlFileData common;
 	ClusterRecoveryAnchorRefV2 ref;
@@ -2260,6 +2261,8 @@ read_thread_input(const ClusterControlRootIdentity *self, ControlRootImage *root
 	ClusterControlRootResult result, root_result;
 	int index;
 
+	if (native_window != NULL)
+		memset(native_window, 0, 160);
 	if (root != NULL)
 		memset(root, 0, sizeof(*root));
 	if (out != NULL)
@@ -2303,8 +2306,12 @@ read_thread_input(const ClusterControlRootIdentity *self, ControlRootImage *root
 	ref.anchor_generation = root->refs[index].anchor_generation;
 	memcpy(ref.anchor_sha256, root->refs[index].anchor_sha256, 32);
 	memcpy(ref.claim_sha256, root->refs[index].claim_sha256, 32);
-	result = native_input ? cluster_recovery_anchor_v2_read_native_locked(&ref, &common, out)
-						  : cluster_recovery_anchor_v2_read_locked(&ref, &common, out);
+	if (native_input && native_window != NULL)
+		result = cluster_recovery_anchor_v3_read_native_window_locked(&ref, &common, out,
+																	  native_window);
+	else
+		result = native_input ? cluster_recovery_anchor_v2_read_native_locked(&ref, &common, out)
+							  : cluster_recovery_anchor_v2_read_locked(&ref, &common, out);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto fail;
 	result = cluster_recovery_anchor_v2_thread_state(&ref, &root->records[index], out);
@@ -2312,10 +2319,20 @@ read_thread_input(const ClusterControlRootIdentity *self, ControlRootImage *root
 		goto fail;
 	return root_result;
 fail:
+	if (native_window != NULL)
+		memset(native_window, 0, 160);
 	memset(root, 0, sizeof(*root));
 	memset(out, 0, sizeof(*out));
 	memset(token, 0, sizeof(*token));
 	return result;
+}
+
+static ClusterControlRootResult
+read_thread_input(const ClusterControlRootIdentity *self, ControlRootImage *root,
+				  ControlFileData *out, ClusterControlRootFileToken *token, uint16 version,
+				  bool native_input)
+{
+	return read_thread_input_window(self, root, out, token, version, native_input, NULL);
 }
 
 static ClusterControlRootResult
@@ -11730,6 +11747,7 @@ typedef struct RecoveryWalVisitWork {
 	ClusterWalTailObservation tail;
 	LOCKMODE cf_mode;
 	bool native_checkpoint;
+	uint8 native_window[160];
 } RecoveryWalVisitWork;
 
 static ClusterControlRootResult
@@ -11742,8 +11760,10 @@ recovery_wal_visit_root(RecoveryWalVisitWork *work)
 	if (!acquire_clusterwide_cf(ShareLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	work->cf_mode = ShareLock;
-	result = read_thread_input(&work->expected.identity, &work->image, &work->control, &file_token,
-							   CONTROL_ROOT_HEADER_VERSION_V3, work->native_checkpoint);
+	result = read_thread_input_window(&work->expected.identity, &work->image, &work->control,
+									  &file_token, CONTROL_ROOT_HEADER_VERSION_V3,
+									  work->native_checkpoint,
+									  work->native_checkpoint ? work->native_window : NULL);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		make_read_token(&work->image, node + 1, CONTROL_ROOT_SOURCE_PRIMARY, &actual);
 		if (!read_token_equal(&work->token, &actual)
@@ -11867,6 +11887,7 @@ cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *ex
 		out->source = work->ref;
 		out->checkpoint_start = work->control.checkPoint;
 		memcpy(&out->checkpoint, &work->control.checkPointCopy, sizeof(out->checkpoint));
+		memcpy(out->native_window, work->native_window, sizeof(out->native_window));
 	}
 	pfree(work);
 	return result;

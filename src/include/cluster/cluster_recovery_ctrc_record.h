@@ -13,15 +13,16 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "access/xlogreader.h"
+#include "cluster/cluster_xlog.h"
 #include "cluster/cluster_recovery_namespace.h"
 #include "cluster/cluster_recovery_reference_graph.h"
 #include "cluster/cluster_recovery_tt_record.h"
 
 #define CLUSTER_RECOVERY_CTRC_VERSION UINT16_C(2)
-#define CLUSTER_RECOVERY_CTRC_BYTES 320
+#define CLUSTER_RECOVERY_CTRC_BYTES CLUSTER_XLOG_D0_PAYLOAD_BYTES
 #define CLUSTER_RECOVERY_CTRC_RELEASE_PROVEN UINT32_C(1)
 /* Frozen D0 opcode; live redo dispatch remains disabled. */
-#define CLUSTER_RECOVERY_CTRC_WAL_INFO UINT8_C(0xD0)
+#define CLUSTER_RECOVERY_CTRC_WAL_INFO CLUSTER_XLOG_D0_WAL_INFO
 
 /* Logical fields, never an on-disk struct. Reserved bytes and the payload/
  * identity hashes are derived by the codec, not supplied by the caller. */
@@ -674,8 +675,13 @@ extern bool cluster_recovery_ctrc_graph_hash_v2(const ClusterRecoveryCTRCRelease
 												uint8 out[32]);
 
 /* Read the original completed native D0 record and require its embedded graph
- * SHA to equal the original canonical graph hash before publishing the result.
- * This structural correspondence does not qualify graph completeness, original
+ * SHA to equal the original canonical graph hash, then validate every kind2
+ * canonical owner envelope against its exact key and this actual D0 payload
+ * using owner_evidence_matches_v2, and every kind1 canonical raw1/2 vector
+ * through its full tail, before publishing the result. Canonical reference
+ * structure does not qualify its key, native body or source. Generic graph
+ * hashing remains a transcript-only primitive. This structural correspondence
+ * does not qualify graph completeness, original
  * source/cut/ROOT/pins, owner/base/floor/issued/terminal or durability/release.
  * All original read_v2 and graph_hash_v2 prerequisites and ERROR behavior apply;
  * no live caller or execution authority. Outside critical sections/spinlocks.

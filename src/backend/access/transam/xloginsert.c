@@ -17,6 +17,12 @@
  *-------------------------------------------------------------------------
  */
 
+/* PGRAC MODIFICATIONS
+ * Author: SqlRush <sqlrush@gmail.com>
+ * Expose the original inserter's final record bytes without replay or IO
+ * authority; borrowed fragments remain owned by the immediate inserter.
+ */
+
 #include "postgres.h"
 
 #ifdef USE_LZ4
@@ -826,6 +832,65 @@ XLogGetLastInsertRecord(XLogRecPtr end, XLogRecPtr *start, XLogRecord *record)
 		return false;
 	*record = *(XLogRecord *) hdr_scratch;
 	*start = ProcLastRecPtr;
+	return true;
+}
+
+static bool
+XLogLastInsertRangesOverlap(const void *a, Size a_length, const void *b, Size b_length)
+{
+	uintptr_t av = (uintptr_t) a, bv = (uintptr_t) b;
+
+	return a_length != 0 && b_length != 0
+		&& (av >= bv ? av - bv < b_length : bv - av < a_length);
+}
+
+bool
+XLogCopyLastInsertRecord(XLogRecPtr end, void *raw, Size raw_length, XLogRecPtr *start)
+{
+	XLogRecord record;
+	XLogRecPtr actual_start;
+	XLogRecData *rdt;
+	uint64 count = 0, limit;
+	Size total = 0;
+	char *dest = raw;
+
+	if (raw == NULL || start == NULL || raw_length < SizeOfXLogRecord
+		|| raw_length > XLogRecordMaxSize
+		|| !XLogGetLastInsertRecord(end, &actual_start, &record)
+		|| record.xl_tot_len != raw_length || hdr_rdt.data != hdr_scratch
+		|| hdr_rdt.len < SizeOfXLogRecord || max_rdatas < 0 || max_registered_buffers < 0
+		|| XLogLastInsertRangesOverlap(raw, raw_length, start, sizeof(*start)))
+		return false;
+
+	/* The original assembler can use one header, two backup fragments per
+	 * registered buffer and the allocated registered-data nodes. Reset clears
+	 * the used counts, so bound traversal by the surviving allocation limits.
+	 * Check every byte and node before writing, including zero-length cycles. */
+	limit = (uint64) max_rdatas + 2 * (uint64) max_registered_buffers + 1;
+	for (rdt = &hdr_rdt; rdt != NULL; rdt = rdt->next)
+	{
+		if (++count > limit || rdt->len > raw_length - total
+			|| (rdt->len != 0 && rdt->data == NULL)
+			|| XLogLastInsertRangesOverlap(raw, raw_length, rdt, sizeof(*rdt))
+			|| XLogLastInsertRangesOverlap(start, sizeof(*start), rdt, sizeof(*rdt))
+			|| XLogLastInsertRangesOverlap(raw, raw_length, rdt->data, rdt->len)
+			|| XLogLastInsertRangesOverlap(start, sizeof(*start), rdt->data, rdt->len))
+			return false;
+		total += rdt->len;
+	}
+	if (total != raw_length)
+		return false;
+
+	/* No native page headers or alignment padding belong to the raw record.
+	 * Its finalized header, including xl_prev and CRC, is already in hdr_rdt.
+	 * No allocation, crypto, lock, wait or IO is introduced by this copy. */
+	for (rdt = &hdr_rdt; rdt != NULL; rdt = rdt->next)
+	{
+		if (rdt->len != 0)
+			memcpy(dest, rdt->data, rdt->len);
+		dest += rdt->len;
+	}
+	memcpy(start, &actual_start, sizeof(actual_start));
 	return true;
 }
 #endif

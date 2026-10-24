@@ -56,6 +56,7 @@
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_page_guard.h"
+#include "cluster/cluster_relmap_retention_runtime.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_update_trace.h"
@@ -464,6 +465,12 @@ cluster_tt_status_shmem_register(void)
 {}
 void
 cluster_tt_local_shmem_register(void)
+{}
+
+/* Dormant relmap runtime is exercised by the native writer/owner fixture;
+ * this standalone registry link test does not initialize shared regions. */
+void
+cluster_relmap_retention_runtime_shmem_register(void)
 {}
 /* spec-5.22b D2-6 stub: cluster_init_shmem_module also calls
  * cluster_undo_gcs_shmem_register. */

@@ -32,6 +32,18 @@ static MemoryContextData fixture_context;
 MemoryContext TopMemoryContext = &fixture_context;
 MemoryContext CurrentMemoryContext = &fixture_context;
 static int contexts_alive;
+/* Only this orchestration boundary is controlled. The writer/runtime suite
+ * exercises the actual shared invalidation implementation and lock. */
+static bool retention_invalidate_ok;
+static unsigned retention_invalidations, retention_root_reads;
+
+bool
+cluster_relmap_retention_runtime_recovery_invalidate_v2(void)
+{
+	UT_ASSERT_EQ(retention_root_reads, 0);
+	retention_invalidations++;
+	return retention_invalidate_ok;
+}
 
 MemoryContext
 AllocSetContextCreateInternal(MemoryContext parent, const char *name, Size min_context_size,
@@ -243,6 +255,7 @@ cluster_control_root_lookup_owner_by_node_runtime(int32 node, ClusterControlRoot
 												  ClusterControlRootSnapshot *snapshot,
 												  ClusterControlRootReadToken *token)
 {
+	retention_root_reads++;
 	if (node < 0 || node >= NROOTS)
 		return CLUSTER_CONTROL_ROOT_ABSENT;
 	if (node == 0 && own_lookup_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
@@ -1314,6 +1327,8 @@ fixture(void)
 	own_lookup_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 	own_lookup_override = false;
 	memset(&own_lookup_identity, 0, sizeof(own_lookup_identity));
+	retention_invalidate_ok = true;
+	retention_invalidations = retention_root_reads = 0;
 	serial_input_calls = serial_input_count = 0;
 	serial_input_ok = true;
 	memset(serial_input_threads, 0, sizeof(serial_input_threads));
@@ -1418,6 +1433,7 @@ fixture(void)
 static ClusterColdTypedV1 *
 prepare(XLogRecPtr own_redo)
 {
+	retention_root_reads = 0; /* Count input reads in this attempt. */
 	return cluster_cold_typed_prepare_v1((struct ClusterRecoveryFencePlan *)&fixture_context, 1,
 										 own_redo);
 }

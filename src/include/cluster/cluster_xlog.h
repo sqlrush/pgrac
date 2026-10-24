@@ -53,6 +53,12 @@
 
 #include "c.h" /* uint16, bool */
 
+/* Existing D0 native carrier shape, shared with its codec and core reader.
+ * Recognizing/copying bytes does not enable redo or qualify the source. */
+#define CLUSTER_XLOG_D0_WAL_INFO UINT8_C(0xD0)
+#define CLUSTER_XLOG_D0_PAYLOAD_BYTES 320
+
+
 /* Sentinel constants are defined in access/xlog_internal.h alongside the
  * XLogPageHeaderData struct so frontend code (pg_waldump / pg_resetwal)
  * can use them without pulling in cluster headers.  We re-export only the

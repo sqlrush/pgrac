@@ -38,6 +38,8 @@
 #include "utils/timestamp.h"
 #include "port/pg_crc32c.h"
 
+struct ClusterRecoveryCheckpointScopeV1;
+
 #undef printf
 #undef fprintf
 #include "unit_test.h"

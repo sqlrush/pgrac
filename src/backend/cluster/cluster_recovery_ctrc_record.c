@@ -46,6 +46,8 @@ typedef struct CTRCGraphEdgeWork {
 	size_t next;
 } CTRCGraphEdgeWork;
 
+static bool ctrc_reference_evidence_valid_v2(const uint8 *evidence, size_t evidence_length);
+
 /* Bound the combined scratch before allocation, including multiplication. */
 static bool
 ctrc_graph_size_add(size_t *total, size_t count, size_t width)
@@ -353,19 +355,42 @@ cluster_recovery_ctrc_read_graph_v2(const XLogReaderState *reader,
 	const ClusterRecoveryCTRCGraphV2 *graph, ClusterRecoveryCTRCReleaseV2 *out)
 {
 	ClusterRecoveryCTRCReleaseV2 record;
+	ClusterRecoveryCTRCGraphV2 view;
 	uint8 digest[32];
 
 	if (out == NULL)
 		return false;
 	if (!cluster_recovery_ctrc_read_v2(reader, &record)
 		|| !cluster_recovery_ctrc_graph_hash_v2(&record, reader->system_identifier, graph, digest)
-		|| memcmp(digest, record.graph_sha256, sizeof(digest)) != 0) {
-		memset(out, 0, sizeof(*out));
-		return false;
+		|| memcmp(digest, record.graph_sha256, sizeof(digest)) != 0)
+		goto refused;
+
+	/* The original hash has bounded and checked the graph arrays. A matching
+	 * digest does not validate opaque owner bytes: consume every original
+	 * owner envelope against its exact key and the actual native D0 payload.
+	 * Original completion predicates and witness qualification remain caller
+	 * prerequisites; this checks only their canonical structural binding. */
+	view = *graph;
+	for (size_t i = 0; i < view.node_count; i++) {
+		const ClusterRecoveryCTRCGraphNodeV2 *node = &view.nodes[i];
+
+		if (node->kind == 1
+			&& !ctrc_reference_evidence_valid_v2(node->evidence.data, node->evidence.length))
+			goto refused;
+		if (node->kind == 2
+			&& !cluster_recovery_ctrc_owner_evidence_matches_v2(node->evidence.data,
+				node->evidence.length, node->key.data, node->key.length,
+				(const uint8 *)XLogRecGetData(reader), XLogRecGetDataLen(reader),
+				reader->system_identifier))
+			goto refused;
 	}
 	/* Graph inputs may alias out; consume everything before publication. */
 	memcpy(out, &record, sizeof(record));
 	return true;
+
+refused:
+	memset(out, 0, sizeof(*out));
+	return false;
 }
 
 bool
@@ -2002,6 +2027,23 @@ ctrc_raw_evidence_next_v2(CTRCRawEvidenceCursor *cursor,
 	cursor->previous = atom;
 	cursor->previous_identity_length = identity_length;
 	*identity = (ClusterRecoveryCTRCGraphBytesV2){atom.data, identity_length};
+	return true;
+}
+
+/* Reference nodes carry the original canonical raw1/2 list. Validate the
+ * entire vector even when no owner witness happens to select its final atom.
+ * Native body/key/source qualification remains with the original producers. */
+static bool
+ctrc_reference_evidence_valid_v2(const uint8 *evidence, size_t evidence_length)
+{
+	CTRCRawEvidenceCursor cursor;
+	ClusterRecoveryCTRCGraphBytesV2 identity;
+
+	if (!ctrc_raw_evidence_cursor_v2(evidence, evidence_length, &cursor))
+		return false;
+	while (cursor.remaining != 0)
+		if (!ctrc_raw_evidence_next_v2(&cursor, &identity))
+			return false;
 	return true;
 }
 

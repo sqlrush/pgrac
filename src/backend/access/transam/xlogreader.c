@@ -63,6 +63,7 @@
 #include <zstd.h>
 #endif
 
+#include "access/rmgr.h"
 #include "access/transam.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
@@ -657,6 +658,57 @@ XLogReadRecord(XLogReaderState *state, char **errormsg)
 
 	return NULL;
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/* Borrow only bytes retained in this current decoded record's own arena. */
+const uint8 *
+XLogReaderGetClusterD0RawRecord(const XLogReaderState *state)
+{
+	const DecodedXLogRecord *decoded;
+	const size_t prefix = SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong;
+	const size_t raw_len = prefix + CLUSTER_XLOG_D0_PAYLOAD_BYTES;
+	uintptr_t	base;
+	uintptr_t	data;
+	size_t		offset;
+	const uint8 *raw;
+	uint32		main_len;
+
+	if (state == NULL || (decoded = state->record) == NULL ||
+		state->ReadRecPtr == InvalidXLogRecPtr ||
+		state->EndRecPtr <= state->ReadRecPtr ||
+		decoded->lsn != state->ReadRecPtr ||
+		decoded->next_lsn != state->EndRecPtr ||
+		decoded->header.xl_rmid != RM_CLUSTER_UNDO_ID ||
+		decoded->header.xl_info != CLUSTER_XLOG_D0_WAL_INFO ||
+		decoded->header.xl_tot_len != raw_len ||
+		TransactionIdIsValid(decoded->header.xl_xid) ||
+		decoded->main_data_len != CLUSTER_XLOG_D0_PAYLOAD_BYTES ||
+		decoded->max_block_id != -1 || decoded->has_page_version_edge ||
+		TransactionIdIsValid(decoded->toplevel_xid) ||
+		decoded->record_origin != InvalidRepOriginId ||
+		decoded->main_data == NULL)
+		return NULL;
+
+	base = (uintptr_t) decoded;
+	data = (uintptr_t) decoded->main_data;
+	if (data < base)
+		return NULL;
+	offset = data - base;
+	if (offset < offsetof(DecodedXLogRecord, blocks) + prefix ||
+		offset > decoded->size ||
+		decoded->main_data_len > decoded->size - offset ||
+		decoded->size > DecodeXLogRecordRequiredSpace(raw_len))
+		return NULL;
+
+	raw = (const uint8 *) decoded->main_data - prefix;
+	memcpy(&main_len, raw + SizeOfXLogRecord + sizeof(uint8), sizeof(main_len));
+	if (memcmp(raw, &decoded->header, SizeOfXLogRecord) != 0 ||
+		raw[SizeOfXLogRecord] != XLR_BLOCK_ID_DATA_LONG ||
+		main_len != CLUSTER_XLOG_D0_PAYLOAD_BYTES)
+		return NULL;
+	return raw;
+}
+#endif
 
 /*
  * Allocate space for a decoded record.  The only member of the returned
@@ -2337,11 +2389,38 @@ DecodeXLogRecord(XLogReaderState *state,
 	/* and finally, the main data */
 	if (decoded->main_data_len > 0)
 	{
-		out = (char *) MAXALIGN(out);
-		decoded->main_data = out;
-		memcpy(decoded->main_data, ptr, decoded->main_data_len);
+#ifdef USE_PGRAC_CLUSTER
+		const size_t prefix = SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong;
+
+		/*
+		 * A standalone D0 needs its complete original record for later hashing.
+		 * The existing allocation already budgets xl_tot_len plus alignment.
+		 * Keep main_data aligned and the raw prefix in the same queue arena;
+		 * read-ahead may overwrite the original readRecordBuf at any time.
+		 */
+		if (record->xl_rmid == RM_CLUSTER_UNDO_ID &&
+			record->xl_info == CLUSTER_XLOG_D0_WAL_INFO &&
+			record->xl_tot_len == prefix + CLUSTER_XLOG_D0_PAYLOAD_BYTES &&
+			!TransactionIdIsValid(record->xl_xid) &&
+			decoded->main_data_len == CLUSTER_XLOG_D0_PAYLOAD_BYTES &&
+			decoded->max_block_id == -1 && !decoded->has_page_version_edge &&
+			!TransactionIdIsValid(decoded->toplevel_xid) &&
+			decoded->record_origin == InvalidRepOriginId)
+		{
+			out = (char *) MAXALIGN(out + prefix) - prefix;
+			memcpy(out, record, record->xl_tot_len);
+			decoded->main_data = out + prefix;
+			out += record->xl_tot_len;
+		}
+		else
+#endif
+		{
+			out = (char *) MAXALIGN(out);
+			decoded->main_data = out;
+			memcpy(decoded->main_data, ptr, decoded->main_data_len);
+			out += decoded->main_data_len;
+		}
 		ptr += decoded->main_data_len;
-		out += decoded->main_data_len;
 	}
 
 	/* Report the actual size we used. */

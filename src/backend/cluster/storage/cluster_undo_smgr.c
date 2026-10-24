@@ -47,6 +47,7 @@
 #include "utils/resowner.h"
 
 #include "cluster/cluster_undo_gcs.h"		 /* cluster_undo_intent_for_owner (D2-2) */
+#include "cluster/cluster_recovery_ctrc_record.h"
 #include "cluster/cluster_undo_record_api.h" /* smgr syscall counter bumps */
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_recovery_ctrc_record.h"
@@ -954,6 +955,123 @@ cluster_undo_smgr_recovery_ctrc_close_v2(ClusterUndoSmgrRecoveryStampV1 stamp)
 	return recovery_header_stamp_close(stamp, RECOVERY_HEADER_CTRC_D0);
 }
 
+static bool
+recovery_header_stamp_overlap(const void *a, size_t a_length,
+	const void *b, size_t b_length)
+{
+	uintptr_t ap = (uintptr_t)a;
+	uintptr_t bp = (uintptr_t)b;
+
+	return a_length != 0 && b_length != 0
+		&& (ap >= bp ? ap - bp < b_length : bp - ap < a_length);
+}
+
+bool
+cluster_undo_smgr_recovery_ctrc_prepare_record_v2(const XLogReaderState *reader,
+	uint32 source_index, const uint8 source_identity_digest[32], const uint8 *raw,
+	size_t raw_length, ClusterUndoSmgrRecoveryStampV1 *out,
+	ClusterRecoveryCTRCReferenceV2 *reference)
+{
+	ClusterRecoveryCTRCReferenceV2 bound;
+	ClusterUndoSmgrRecoveryStampV1 prepared;
+	uint8 payload[CLUSTER_RECOVERY_CTRC_BYTES];
+	const void *inputs[6];
+	size_t lengths[6];
+	size_t i;
+
+	if (CritSectionCount != 0 || CurrentResourceOwner == NULL
+		|| reader == NULL || reader->record == NULL
+		|| source_identity_digest == NULL
+		|| out == NULL || reference == NULL || recovery_header_stamp.fd >= 0
+		|| recovery_header_stamp_overlap(out, sizeof(*out), reference, sizeof(*reference)))
+		return false;
+
+	/* NULL/0 selects the original current-reader snapshot, never a rebuilt
+	 * header or the mutable read buffer. Other pointer/length pairs retain
+	 * the explicit immutable-snapshot contract. Resolve before alias checks. */
+	if (raw == NULL && raw_length == 0) {
+		raw = XLogReaderGetClusterD0RawRecord(reader);
+		raw_length = SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong
+			+ CLUSTER_RECOVERY_CTRC_BYTES;
+	}
+	if (raw == NULL || raw_length != SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong
+			+ CLUSTER_RECOVERY_CTRC_BYTES)
+		return false;
+
+	/* Publishing either result must not overwrite the original record, its
+	 * provenance, or the held-descriptor state. Do this before hashing or I/O. */
+	inputs[0] = reader; lengths[0] = sizeof(*reader);
+	inputs[1] = reader->record; lengths[1] = sizeof(*reader->record);
+	inputs[2] = reader->record->main_data; lengths[2] = reader->record->main_data_len;
+	inputs[3] = raw; lengths[3] = raw_length;
+	inputs[4] = source_identity_digest; lengths[4] = 32;
+	inputs[5] = &recovery_header_stamp; lengths[5] = sizeof(recovery_header_stamp);
+	for (i = 0; i < lengthof(inputs); i++)
+		if (recovery_header_stamp_overlap(out, sizeof(*out), inputs[i], lengths[i])
+			|| recovery_header_stamp_overlap(reference, sizeof(*reference), inputs[i], lengths[i]))
+			return false;
+
+	/* The existing reference reader binds the full native header, payload and
+	 * CRC to this completed record and its actual positions, before acquiring
+	 * a target descriptor. ROOT/source/cut/graph qualification remains caller's. */
+	if (!cluster_recovery_ctrc_reference_v2(reader, source_index,
+			source_identity_digest, raw, raw_length, &bound))
+		return false;
+	memcpy(payload, raw + SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong,
+		CLUSTER_RECOVERY_CTRC_BYTES);
+	if (!cluster_undo_smgr_recovery_ctrc_prepare_v2(payload, sizeof(payload),
+			reader->system_identifier, &prepared))
+		return false;
+
+	/* Preparation owns the original ResourceOwner cleanup and ERROR behavior.
+	 * No target write has occurred; publish both private results only now. */
+	memcpy(out, &prepared, sizeof(prepared));
+	memcpy(reference, &bound, sizeof(bound));
+	return true;
+}
+
+bool
+cluster_undo_smgr_recovery_ctrc_finish_record_v2(ClusterUndoSmgrRecoveryStampV1 stamp,
+	const XLogReaderState *reader, uint32 source_index,
+	const uint8 source_identity_digest[32], const uint8 *raw, size_t raw_length,
+	const ClusterRecoveryCTRCReferenceV2 *prepared_reference)
+{
+	ClusterRecoveryCTRCReferenceV2 prepared, observed;
+	uint8 payload[CLUSTER_RECOVERY_CTRC_BYTES];
+
+	if (CritSectionCount != 0 || CurrentResourceOwner == NULL || prepared_reference == NULL)
+		return false;
+	/* Preparation may have borrowed the native snapshot. Reacquire only the
+	 * current record; the original R comparison below rejects any advance. */
+	if (raw == NULL && raw_length == 0) {
+		raw = XLogReaderGetClusterD0RawRecord(reader);
+		raw_length = SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong
+			+ CLUSTER_RECOVERY_CTRC_BYTES;
+	}
+	/* The caller retains this structural reference from preparation. Rebuild
+	 * it from the original completed reader, not a window or a guessed end.
+	 * No target I/O or ownership change may precede the full-record binding. */
+	memcpy(&prepared, prepared_reference, sizeof(prepared));
+	if (!cluster_recovery_ctrc_reference_v2(reader, source_index,
+			source_identity_digest, raw, raw_length, &observed)
+		/* Compare logical members, never ABI-dependent structure padding. */
+		|| observed.source_index != prepared.source_index || observed.start != prepared.start
+		|| observed.end != prepared.end || observed.raw_length != prepared.raw_length
+		|| memcmp(observed.raw_record_sha256, prepared.raw_record_sha256,
+			sizeof(observed.raw_record_sha256)) != 0)
+		return false;
+	memcpy(payload, raw + SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong,
+		CLUSTER_RECOVERY_CTRC_BYTES);
+	if (!cluster_undo_smgr_recovery_ctrc_matches_v2(stamp, payload, sizeof(payload)))
+		return false;
+
+	/* Leave the caller's exact stage/token available on target refusal or
+	 * native ERROR. Only a durable readback permits the original close; false
+	 * after close is still not completion. No window or pin is retired here. */
+	if (!cluster_undo_smgr_recovery_ctrc_write_bound_v2(stamp, payload, sizeof(payload)))
+		return false;
+	return cluster_undo_smgr_recovery_ctrc_close_v2(stamp);
+}
 #endif
 
 bool

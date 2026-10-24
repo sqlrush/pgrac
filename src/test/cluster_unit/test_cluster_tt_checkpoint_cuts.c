@@ -224,6 +224,8 @@ coverage_setup(void)
 	/* Native ordinary terminal preparation requires a headless ACTIVE slot. */
 	coverage_head = coverage_invalid_head;
 	before->first_undo_block = coverage_head;
+	if (!cluster_undo_segment_header_seal(resident))
+		abort();
 	memcpy(model_files[1].cache, resident, BLCKSZ);
 	memcpy(model_files[1].durable, resident, BLCKSZ);
 	/* The precommit's already-verified reservation is an explicit boundary. */

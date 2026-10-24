@@ -218,6 +218,12 @@ typedef struct VariableCacheData
 	 * These fields are protected by XidGenLock.
 	 */
 	FullTransactionId nextXid;	/* next XID to assign */
+#ifdef USE_PGRAC_CLUSTER
+	/* Actual native ProcArray publications in this shared-memory lifetime.
+	 * Never initialized from nextXid, a lease/JUMP or a replay endpoint. */
+	FullTransactionId clusterLastIssuedXid;
+	uint8		clusterIssuedState; /* 0 unknown, 1 observed, 2 invalidated */
+#endif
 
 	TransactionId oldestXid;	/* cluster-wide minimum datfrozenxid */
 	TransactionId xidVacLimit;	/* start forcing autovacuums here */

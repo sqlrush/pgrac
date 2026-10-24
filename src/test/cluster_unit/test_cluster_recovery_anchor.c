@@ -82,6 +82,7 @@
 #undef strerror_r
 
 #include "unit_test.h"
+#include "cluster/cluster_relmap_checkpoint.h"
 
 UT_DEFINE_GLOBALS();
 
@@ -2039,12 +2040,151 @@ UT_TEST(test_v2_parameter_boolean_and_reserved_bytes)
 	}
 }
 
+static void
+v3_window(ClusterRecoveryAnchorV2 *a)
+{
+	ClusterRelmapCheckpointWindow w = { 0 };
+	w.system_identifier = a->identity.system_identifier;
+	w.database_incarnation = a->database_incarnation;
+	w.admitted_incarnation = a->identity.origin_owner_incarnation;
+	w.boot_incarnation = 91;
+	w.epoch = 92;
+	w.origin = a->identity.origin_node_id;
+	w.allocation_next = U64FromFullTransactionId(a->checkpoint_copy.nextXid);
+	w.last_issued = w.allocation_next - 1;
+	w.native_floor = w.last_issued - 20;
+	UT_ASSERT(cluster_relmap_checkpoint_window_encode_v1(&w, &a->checkpoint_copy, a->checkpoint,
+														 a->checkpoint + 64, a->native_window));
+}
+UT_TEST(test_v3_window_roundtrip_and_legacy_clear)
+{
+	uint8 b[512];
+	ClusterRecoveryAnchorRefV2 ref;
+	ClusterRecoveryAnchorV2 a, out;
+	ControlFileData common, view;
+	v2_fixture(b, &ref);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(b, 512, &ref, &a), 0);
+	v3_window(&a);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_encode(&a, b), 0);
+	UT_ASSERT_EQ((b[4] | ((unsigned)b[5] << 8)), 3);
+	v2_fix_crc_hash(b, &ref);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(b, 512, &ref, &out), 0);
+	UT_ASSERT(memcmp(a.native_window, out.native_window, 160) == 0);
+	v2_common(&common);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_project(b, 512, &ref, &common, &view), 0);
+	UT_ASSERT_EQ(view.checkPoint, a.checkpoint);
+	v2_fixture(b, &ref);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_project(b, 512, &ref, &common, &view), 0);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(b, 512, &ref, &out), 0);
+	UT_ASSERT(v2_zero(out.native_window, 160));
+}
+UT_TEST(test_v3_window_inner_corruption_cannot_hide_behind_outer_hash)
+{
+	uint8 b[512], good[512];
+	ClusterRecoveryAnchorRefV2 ref;
+	ClusterRecoveryAnchorV2 a, out;
+	v2_fixture(b, &ref);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(b, 512, &ref, &a), 0);
+	v3_window(&a);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_encode(&a, good), 0);
+	for (size_t i = 316; i < 508; i++) {
+		memcpy(b, good, 512);
+		b[i] ^= 1;
+		v2_fix_crc_hash(b, &ref);
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT(cluster_recovery_anchor_v2_decode(b, 512, &ref, &out) != 0);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+	}
+	memcpy(b, good, 512);
+	v2_put(b, 4, 2, 2);
+	v2_fix_crc_hash(b, &ref);
+	UT_ASSERT(cluster_recovery_anchor_v2_decode(b, 512, &ref, &out) != 0);
+}
+UT_TEST(test_v3_window_uses_original_immutable_install_and_native_readback)
+{
+	ClusterRecoveryAnchorV2 a;
+	ClusterRecoveryAnchorStageV2 stage;
+	uint8 uuid[16];
+	ControlFileData common, out;
+	uint8 window[160];
+	v2_stage_fixture(&a, uuid, &common);
+	v3_window(&a);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_prepare(&a, uuid, &stage), 0);
+	test_cf_x_held = true;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_install(&stage), 0);
+	UT_ASSERT_EQ(
+		cluster_recovery_anchor_v3_read_native_window_locked(&stage.ref, &common, &out, window), 0);
+	UT_ASSERT(memcmp(a.native_window, window, 160) == 0);
+	memset(window, 0xa5, 160);
+	UT_ASSERT_EQ(
+		cluster_recovery_anchor_v3_read_native_window_locked(&stage.ref, &common, NULL, window),
+		CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT(v2_zero(window, 160));
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT_EQ(
+		cluster_recovery_anchor_v3_read_native_window_locked(&stage.ref, &common, &out, NULL),
+		CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	{
+		ControlFileData saved = common;
+		UT_ASSERT_EQ(cluster_recovery_anchor_v3_read_native_window_locked(&stage.ref, &common,
+																		  &common, window),
+					 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+		UT_ASSERT(memcmp(&common, &saved, sizeof(common)) == 0);
+	}
+	test_cf_x_held = false;
+	v2_stage_fixture(&a, uuid, &common);
+	UT_ASSERT(v2_zero(a.native_window, 160));
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_prepare(&a, uuid, &stage), 0);
+	test_cf_x_held = true;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_install(&stage), 0);
+	memset(window, 0xa5, 160);
+	UT_ASSERT_EQ(
+		cluster_recovery_anchor_v3_read_native_window_locked(&stage.ref, &common, &out, window), 0);
+	UT_ASSERT(v2_zero(window, 160));
+	test_cf_x_held = false;
+}
+
+UT_TEST(test_v3_postflush_issued_uses_original_immutable_readback)
+{
+	ClusterRecoveryAnchorV2 a;
+	ClusterRecoveryAnchorStageV2 stage;
+	ClusterRelmapCheckpointWindow initial, read;
+	uint8 uuid[16], bytes[160];
+	uint64 issued, observed = 0;
+	ControlFileData common, control;
+	v2_stage_fixture(&a, uuid, &common);
+	v3_window(&a);
+	UT_ASSERT(cluster_relmap_checkpoint_window_decode_v1(
+		a.native_window, &a.checkpoint_copy, a.checkpoint, a.checkpoint + 64, &a.identity,
+		a.database_incarnation, &initial));
+	issued = initial.last_issued + 9;
+	UT_ASSERT(cluster_relmap_checkpoint_window_encode_v2(
+		&initial, &a.checkpoint_copy, a.checkpoint, a.checkpoint + 64, issued, a.native_window));
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_prepare(&a, uuid, &stage), 0);
+	test_cf_x_held = true;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_install(&stage), 0);
+	UT_ASSERT_EQ(
+		cluster_recovery_anchor_v3_read_native_window_locked(&stage.ref, &common, &control, bytes),
+		0);
+	UT_ASSERT(memcmp(a.native_window, bytes, 160) == 0);
+	UT_ASSERT(cluster_relmap_checkpoint_window_decode_v2(
+		bytes, &control.checkPointCopy, a.checkpoint, a.checkpoint + 64, &a.identity,
+		a.database_incarnation, &read, &observed));
+	UT_ASSERT_EQ(observed, issued);
+	UT_ASSERT_EQ(read.last_issued, initial.last_issued);
+	test_cf_x_held = false;
+}
 int
 main(void)
 {
 	setup_shared_root();
 
-	UT_PLAN(36);
+	UT_PLAN(40);
+	UT_RUN(test_v3_postflush_issued_uses_original_immutable_readback);
+	UT_RUN(test_v3_window_roundtrip_and_legacy_clear);
+	UT_RUN(test_v3_window_inner_corruption_cannot_hide_behind_outer_hash);
+	UT_RUN(test_v3_window_uses_original_immutable_install_and_native_readback);
 	UT_RUN(test_layout);
 	UT_RUN(test_write_read_roundtrip);
 	UT_RUN(test_classify);

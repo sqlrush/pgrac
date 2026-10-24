@@ -21,6 +21,8 @@
 #include "cluster/storage/cluster_shared_fs.h"
 
 static ClusterUndoRecoveryScopeV1 *active_scope;
+/* Never reuse an original-round identity within this backend process. */
+static uint64 undo_scope_serial;
 
 /* A selected C0 grants a path to one target segment only. It never becomes
  * the ordinary origin scope used by native CLOG/MX or general UNDO redo. */
@@ -409,7 +411,8 @@ cluster_undo_recovery_scope_enter_v1(ClusterUndoRecoveryScopeV1 *scope,
 {
 	ClusterUndoRecoveryScopeV1 candidate = { 0 };
 
-	if (active_scope != NULL || active_abort != NULL || active_tx_abort != NULL
+	if (undo_scope_serial == UINT64_MAX || active_scope != NULL
+		|| active_abort != NULL || active_tx_abort != NULL
 		|| scope == NULL || authority == NULL
 		|| plan == NULL || authority->duty == NULL || authority->root_token == NULL
 		|| authority->root_snapshot == NULL || authority->duty->origin_thread_id == 0
@@ -432,6 +435,7 @@ cluster_undo_recovery_scope_enter_v1(ClusterUndoRecoveryScopeV1 *scope,
 	cluster_undo_smgr_fd_cache_reset();
 	*scope = candidate;
 	active_scope = scope;
+	undo_scope_serial++;
 	return true;
 }
 
@@ -470,6 +474,90 @@ cluster_undo_recovery_cold_origin_authorized_v1(int origin_node)
 		   && rf_side_online_plan_recovery_source_matches_v1(
 			   active_scope->plan, active_scope->duty.system_identifier,
 			   active_scope->duty.storage_uuid, &active_scope->cut);
+}
+
+bool
+cluster_undo_recovery_cold_source_matches_v1(const ClusterWalSourceRef *source,
+											 const ClusterControlRootSnapshot *checkpoint,
+											 XLogRecPtr native_redo)
+{
+	const ClusterUndoRecoveryScopeV1 *scope = active_scope;
+	ClusterWalSourceRef observed;
+	XLogRecPtr redo;
+
+	if (source == NULL || checkpoint == NULL || native_redo == InvalidXLogRecPtr
+		|| !cluster_undo_recovery_cold_origin_authorized_v1(source->claim.identity.origin_node_id)
+		|| active_scope != scope
+		|| memcmp(checkpoint, scope->authority->root_snapshot, sizeof(*checkpoint)) != 0
+		|| cluster_control_root_recovery_source_v1(scope->authority->root_snapshot,
+												   &scope->root_token, &observed, &redo)
+			   != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| !undo_source_equal(&observed, source) || redo != native_redo)
+		return false;
+	/* The original source accessor performs I/O; do not accept authority or
+	 * snapshot changes across it. No new scope or authority is manufactured. */
+	return active_scope == scope
+		   && cluster_undo_recovery_cold_origin_authorized_v1(source->claim.identity.origin_node_id)
+		   && memcmp(checkpoint, scope->authority->root_snapshot, sizeof(*checkpoint)) == 0;
+}
+
+uint64
+cluster_undo_recovery_cold_scope_id_v1(const ClusterWalSourceRef *source,
+									   const ClusterControlRootSnapshot *checkpoint,
+									   XLogRecPtr native_redo)
+{
+	const ClusterUndoRecoveryScopeV1 *scope = active_scope;
+	uint64 serial = undo_scope_serial;
+	if (serial == 0
+		|| !cluster_undo_recovery_cold_source_matches_v1(source, checkpoint, native_redo)
+		|| active_scope != scope || undo_scope_serial != serial)
+		return 0;
+	return serial;
+}
+
+bool
+cluster_undo_recovery_cold_terminal_matches_v1(const ClusterWalSourceRef *source,
+											   const ClusterControlRootSnapshot *checkpoint,
+											   XLogRecPtr native_redo, uint64 scope_serial,
+											   const XLogReaderState *reader)
+{
+	const ClusterUndoRecoveryScopeV1 *scope = active_scope;
+
+	if (reader == NULL || scope_serial == 0
+		|| cluster_undo_recovery_cold_scope_id_v1(source, checkpoint, native_redo) != scope_serial
+		|| active_scope != scope
+		|| !rf_side_online_plan_replay_start_matches_v1(
+			scope->plan, source->claim.identity.origin_thread_id,
+			source->claim.identity.origin_owner_incarnation, source->claim.database_incarnation,
+			native_redo)
+		|| !rf_side_online_plan_terminal_matches_v1(scope->plan, source, reader))
+		return false;
+	return active_scope == scope && undo_scope_serial == scope_serial
+		   && cluster_undo_recovery_cold_scope_id_v1(source, checkpoint, native_redo)
+				  == scope_serial;
+}
+
+uint32
+cluster_undo_recovery_cold_terminal_count_v1(const ClusterWalSourceRef *source,
+											 const ClusterControlRootSnapshot *checkpoint,
+											 XLogRecPtr native_redo, uint64 scope_serial)
+{
+	const ClusterUndoRecoveryScopeV1 *scope = active_scope;
+	uint32 count;
+
+	if (scope_serial == 0
+		|| cluster_undo_recovery_cold_scope_id_v1(source, checkpoint, native_redo) != scope_serial
+		|| active_scope != scope
+		|| !rf_side_online_plan_replay_start_matches_v1(
+			scope->plan, source->claim.identity.origin_thread_id,
+			source->claim.identity.origin_owner_incarnation, source->claim.database_incarnation,
+			native_redo))
+		return UINT32_MAX;
+	count = rf_side_online_plan_native_terminal_count_v1(scope->plan, source);
+	if (active_scope != scope || undo_scope_serial != scope_serial
+		|| cluster_undo_recovery_cold_scope_id_v1(source, checkpoint, native_redo) != scope_serial)
+		return UINT32_MAX;
+	return count;
 }
 
 bool
@@ -563,4 +651,5 @@ cluster_undo_recovery_multixact_page_retired_v1(int origin_node, XLogRecPtr sour
 		   && rf_side_online_plan_multixact_page_retired_v1(
 			   active_scope->plan, origin_node + 1, source_lsn, source_end_lsn, members, page);
 }
+
 #endif

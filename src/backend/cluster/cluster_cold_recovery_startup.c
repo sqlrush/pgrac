@@ -54,6 +54,7 @@
 #include "cluster/cluster_page_cold_redo.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_recovery_merge.h"
+#include "cluster/cluster_relmap_retention_runtime.h"
 #include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_wal_tail.h"
 #include "cluster/cluster_wal_thread.h"
@@ -1010,6 +1011,10 @@ cluster_cold_typed_prepare_v1(ClusterRecoveryFencePlan *fence, uint16 own_thread
 	typed->context = context;
 	roots = (ColdRoot *)palloc0(sizeof(ColdRoot) * CLUSTER_COLD_MAX_PARTICIPANTS);
 	typed->replay_roots = roots;
+	if (!cluster_relmap_retention_runtime_recovery_invalidate_v2()) {
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "shared relmap retention invalidation refused");
+		goto done;
+	}
 	if (!cold_collect_roots(typed, fence, own_thread, roots))
 		goto done;
 	typed->replay_root_count = typed->participant_count;

@@ -181,6 +181,17 @@ extern bool rf_side_online_plan_recovery_claim_matches_v1(const RfSideOnlinePlan
  * This supplies neither physical participation nor cut/base/owner authority. */
 extern bool rf_side_online_plan_recovery_bound_claim_matches_v1(const RfSideOnlinePlanV1 *plan,
 																const ClusterWalSourceRef *source);
+/* Read-only native terminal source witness. Only the original sealed,
+ * source-bound RECOVERY plan; exact physical participant, native header,
+ * frame and complete main payload, with a unique terminal for this raw xid.
+ * Does not qualify FullXid era/base, effects, completion or release. */
+extern bool rf_side_online_plan_terminal_matches_v1(const RfSideOnlinePlanV1 *plan,
+													const ClusterWalSourceRef *source,
+													const XLogReaderState *reader);
+/* Exact source-bound native terminal inventory; UINT32_MAX on unavailable
+ * original sealed RECOVERY plan/source. Structural count only, no completion. */
+extern uint32 rf_side_online_plan_native_terminal_count_v1(const RfSideOnlinePlanV1 *plan,
+														   const ClusterWalSourceRef *source);
 /* UINT32_MAX for an invalid or unsealed plan. */
 extern uint32 rf_side_online_plan_participant_count_v1(const RfSideOnlinePlanV1 *plan);
 /* The physical lower alone must not authorize replay of retained history. */

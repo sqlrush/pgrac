@@ -43,6 +43,38 @@ extern XidStatus TransactionIdGetStatus(TransactionId xid, XLogRecPtr *lsn);
 extern void ClusterClogAdoptNativeStatus(TransactionId xid, XidStatus status);
 
 #ifdef USE_PGRAC_CLUSTER
+/* Original local XactCtl only, never native_side projection. Caller holds
+ * XactTruncationLock across qualified FullXid floor check and this I/O; no
+ * XidGenLock/SLRU lock may already be held. Native status is derived here.
+ * The group LSN is a hint, not an exact terminal WAL record. A complete
+ * original page must exist and fsync must be enabled. False may already
+ * have written/synced bytes;
+ * it does not promise rollback or a safe automatic retry. */
+typedef struct ClusterClogNativeTerminalV1 {
+	XidStatus status;
+	XLogRecPtr status_lsn;
+} ClusterClogNativeTerminalV1;
+extern bool cluster_clog_native_terminal_sync_v1(TransactionId xid,
+												 ClusterClogNativeTerminalV1 *out);
+
+/* Dormant original cold-origin durable base input. This is a complete native
+ * page read under that origin's existing truncation lock and original cold
+ * authorization, never a recoverer-local CLOG or visibility fallback. Status
+ * is derived from the selected on-disk page; nonterminal/missing/short refuse.
+ * No native XidGen/truncation/SLRU or selected-origin lock may be held.
+ * ERROR releases only this call's
+ * FD/lock. False may follow sync and does not imply rollback/safe retry.
+ * This raw page does not certify FullXid era, retained floor or a source seal. */
+typedef struct ClusterClogNativeBaseV1 {
+	int origin;
+	TransactionId xid;
+	uint32 page_number;
+	XidStatus status;
+	uint8 image[BLCKSZ];
+} ClusterClogNativeBaseV1;
+extern bool cluster_clog_native_recovery_base_read_v1(int origin, TransactionId xid,
+													  ClusterClogNativeBaseV1 *out);
+
 /* Original-origin storage only. The recovery owner must first prove the
  * complete terminal record, original source/base/era and mutation authority.
  * These calls neither resolve an unknown transaction nor publish visibility.

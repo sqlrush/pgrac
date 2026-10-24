@@ -290,6 +290,17 @@ OBJS = \
 	cluster_relmap_arb.o \
 	cluster_relmap_authority.o \
 	cluster_relmap_lock.o \
+	cluster_relmap_owner.o \
+	cluster_relmap_recovery.o \
+	cluster_relmap_terminal_scan.o \
+	cluster_relmap_checkpoint.o \
+	cluster_relmap_checkpoint_native.o \
+	cluster_relmap_retention.o \
+	cluster_relmap_retention_runtime.o \
+	cluster_relmap_retention_restore.o \
+	cluster_relmap_retention_census.o \
+	cluster_relmap_pending.o \
+	cluster_relmap_pending_side.o \
 	cluster_sequence.o \
 	cluster_sequence_shmem.o \
 	cluster_shared_catalog.o \

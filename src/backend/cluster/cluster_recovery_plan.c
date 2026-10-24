@@ -46,6 +46,8 @@
 #include "access/xlogrecovery.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_qvotec.h"
+#include "access/xact.h"
+#include "access/xloginsert.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_clean_leave.h"
 #include "miscadmin.h"
@@ -1469,6 +1471,7 @@ cluster_recovery_stamp_prepare_v1(const ClusterRecoveryStampOwnerV1 *owner,
 	slot->handle.owner = *owner;
 	slot->handle.kind = kind;
 	slot->handle.payload_length = length;
+	memset(slot->handle.payload, 0, sizeof(slot->handle.payload));
 	memcpy(slot->handle.payload, payload, length);
 	slot->phase = CLUSTER_RECOVERY_STAMP_PRE_INSERT;
 	slot->adopt_from = CLUSTER_RECOVERY_STAMP_EMPTY;
@@ -1542,6 +1545,398 @@ cluster_recovery_stamp_inserted_v1(const ClusterRecoveryStampHandleV1 *handle, X
 		   && stamp_transition(handle, CLUSTER_RECOVERY_STAMP_INSERTING,
 							   CLUSTER_RECOVERY_STAMP_INSERTED, start, end, false);
 }
+bool
+cluster_recovery_stamp_ctrc_inserted_v2(const ClusterRecoveryStampHandleV1 *handle, XLogRecPtr end)
+{
+	XLogRecPtr start;
+	XLogRecord record;
+
+	/* The native accessor only copies the immediate inserter's header and
+	 * actual positions. It cannot establish the prepared payload's identity
+	 * or the full raw record's CRC/SHA; those remain independent premises. */
+	if (CritSectionCount == 0 || handle == NULL || handle->kind != CLUSTER_RECOVERY_STAMP_D0
+		|| handle->payload_length != CLUSTER_RECOVERY_CTRC_BYTES
+		|| !XLogGetLastInsertRecord(end, &start, &record) || record.xl_rmid != RM_CLUSTER_UNDO_ID
+		|| record.xl_info != CLUSTER_RECOVERY_CTRC_WAL_INFO || TransactionIdIsValid(record.xl_xid)
+		|| record.xl_tot_len
+			   != SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + CLUSTER_RECOVERY_CTRC_BYTES)
+		return false;
+	return cluster_recovery_stamp_inserted_v1(handle, start, end);
+}
+XLogRecPtr
+cluster_recovery_stamp_ctrc_insert_v2(const ClusterRecoveryStampHandleV1 *handle)
+{
+	XLogRecPtr end;
+
+	/* The caller owns every readiness proof. This adapter only consumes an
+	 * immutable prepared handle while the original executor is in its critical
+	 * section; it does not manufacture recovery, graph, retention or IO
+	 * authority. A live native XID would make this a different WAL operation,
+	 * so refuse before changing the window. */
+	if (CritSectionCount == 0 || handle == NULL
+		|| handle->kind != CLUSTER_RECOVERY_STAMP_D0
+		|| handle->payload_length != CLUSTER_RECOVERY_CTRC_BYTES
+		|| !XLogInsertAllowed() || TransactionIdIsValid(GetCurrentTransactionIdIfAny())
+		|| !cluster_recovery_stamp_inserting_v1(handle))
+		return InvalidXLogRecPtr;
+
+	/* The original XLogInsert assembler was prepared before PRE_INSERT. The
+	 * borrowed payload remains owned by the handle until this call returns;
+	 * no allocation, wait, flush, or target write is introduced here. */
+	XLogBeginInsert();
+	XLogRegisterData((char *) handle->payload, CLUSTER_RECOVERY_CTRC_BYTES);
+	end = XLogInsert(RM_CLUSTER_UNDO_ID, CLUSTER_RECOVERY_CTRC_WAL_INFO);
+	if (end == InvalidXLogRecPtr || !cluster_recovery_stamp_ctrc_inserted_v2(handle, end)) {
+		/* Once native insertion began, neither an ERROR/PANIC boundary nor a
+		 * post-insert mismatch may cancel or fake completion of this window. */
+		(void) cluster_recovery_stamp_fail_v1(handle);
+		return InvalidXLogRecPtr;
+	}
+	return end;
+}
+
+static bool
+stamp_ranges_overlap(const void *a, Size a_length, const void *b, Size b_length)
+{
+	uintptr_t av = (uintptr_t) a, bv = (uintptr_t) b;
+
+	return a_length != 0 && b_length != 0
+		&& (av >= bv ? av - bv < b_length : bv - av < a_length);
+}
+
+XLogRecPtr
+cluster_recovery_stamp_ctrc_insert_record_v2(const ClusterRecoveryStampHandleV1 *handle,
+											  void *raw, Size raw_length, XLogRecPtr *start)
+{
+	uint8 copy[SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + CLUSTER_RECOVERY_CTRC_BYTES];
+	ClusterThreadReplaySlot *replay;
+	ClusterRecoveryStampSlotV1 snapshot;
+	XLogRecPtr actual_start, end;
+	uint32 payload_length;
+
+	if (CritSectionCount == 0 || handle == NULL || raw == NULL || start == NULL
+		|| handle->kind != CLUSTER_RECOVERY_STAMP_D0
+		|| handle->payload_length != CLUSTER_RECOVERY_CTRC_BYTES || raw_length != sizeof(copy)
+		|| (replay = cluster_thread_recovery_replay_slot(handle->key.target_thread)) == NULL
+		|| stamp_ranges_overlap(raw, raw_length, start, sizeof(*start))
+		|| stamp_ranges_overlap(raw, raw_length, handle, sizeof(*handle))
+		|| stamp_ranges_overlap(start, sizeof(*start), handle, sizeof(*handle))
+		|| stamp_ranges_overlap(raw, raw_length, &replay->stamp, sizeof(replay->stamp))
+		|| stamp_ranges_overlap(start, sizeof(*start), &replay->stamp, sizeof(replay->stamp)))
+		return InvalidXLogRecPtr;
+
+	/* Preserve the original single insertion and all post-insert duty. A
+	 * fixed private temporary keeps caller outputs unchanged on any refusal.
+	 * All fragment storage must remain immutable until this copy returns. */
+	end = cluster_recovery_stamp_ctrc_insert_v2(handle);
+	if (end == InvalidXLogRecPtr)
+		return InvalidXLogRecPtr;
+	if (!XLogCopyLastInsertRecord(end, copy, sizeof(copy), &actual_start))
+		goto failed;
+	memcpy(&payload_length, copy + SizeOfXLogRecord + 1, sizeof(payload_length));
+	if (copy[SizeOfXLogRecord] != XLR_BLOCK_ID_DATA_LONG
+		|| payload_length != CLUSTER_RECOVERY_CTRC_BYTES
+		|| memcmp(copy + SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong,
+				  handle->payload, CLUSTER_RECOVERY_CTRC_BYTES) != 0)
+		goto failed;
+	stamp_snapshot(&replay->stamp, &snapshot);
+	if (!stamp_handle_matches(&snapshot, handle) || snapshot.failed
+		|| snapshot.phase != CLUSTER_RECOVERY_STAMP_INSERTED
+		|| snapshot.record_start != actual_start || snapshot.record_end != end)
+		goto failed;
+
+	/* The existing finish still owes WAL flush, target sync/readback and
+	 * exact retirement. CRC/SHA may only run after its original critical exit. */
+	memcpy(raw, copy, sizeof(copy));
+	memcpy(start, &actual_start, sizeof(actual_start));
+	return end;
+failed:
+	(void) cluster_recovery_stamp_fail_v1(handle);
+	return InvalidXLogRecPtr;
+}
+
+bool
+cluster_recovery_stamp_ctrc_flush_v2(const ClusterRecoveryStampHandleV1 *handle)
+{
+	ClusterThreadReplaySlot *replay;
+	ClusterRecoveryStampSlotV1 before, after;
+
+	if (!stamp_actor() || MyBackendType != B_STARTUP || CritSectionCount == 0 || handle == NULL
+		|| handle->owner.executor_pid != MyProcPid || handle->kind != CLUSTER_RECOVERY_STAMP_D0
+		|| handle->payload_length != CLUSTER_RECOVERY_CTRC_BYTES
+		|| (replay = cluster_thread_recovery_replay_slot(handle->key.target_thread)) == NULL)
+		return false;
+	stamp_snapshot(&replay->stamp, &before);
+	if (!stamp_handle_matches(&before, handle) || before.phase != CLUSTER_RECOVERY_STAMP_INSERTED
+		|| before.failed)
+		return false;
+
+	/* Keep native insertion/flush waits and errors intact. XLogFlush can
+	 * return without flushing when insertion is forbidden, so require both
+	 * the original writer and independent startup durable coverage. Never
+	 * carry a slot lock across these calls or change the inserted addresses. */
+	if (!XLogInsertAllowed()
+		|| cluster_wal_writer_check(&before.handle.owner.writer) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto failed;
+	XLogFlush(before.record_end);
+	if (!ClusterXLogStartupFlushCovers(before.record_end, before.handle.owner.writer.ref.timeline)
+		|| cluster_wal_writer_check(&before.handle.owner.writer) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto failed;
+	stamp_snapshot(&replay->stamp, &after);
+	if (!stamp_handle_matches(&after, &before.handle)
+		|| after.phase != CLUSTER_RECOVERY_STAMP_INSERTED || after.failed
+		|| after.record_start != before.record_start || after.record_end != before.record_end)
+		goto failed;
+	/* Target sync and postread are still owed; no durable/clear transition. */
+	return true;
+failed:
+	/* The saved exact operation cannot mark a different window failed. */
+	(void)cluster_recovery_stamp_fail_v1(&before.handle);
+	return false;
+}
+bool
+cluster_recovery_stamp_ctrc_finish_v2(const ClusterRecoveryStampHandleV1 *handle,
+									  ClusterUndoSmgrRecoveryStampV1 stamp)
+{
+	ClusterThreadReplaySlot *replay;
+	ClusterRecoveryStampSlotV1 before, after;
+
+	if (!stamp_actor() || MyBackendType != B_STARTUP || CritSectionCount == 0 || handle == NULL
+		|| handle->owner.executor_pid != MyProcPid || handle->kind != CLUSTER_RECOVERY_STAMP_D0
+		|| handle->payload_length != CLUSTER_RECOVERY_CTRC_BYTES
+		|| (replay = cluster_thread_recovery_replay_slot(handle->key.target_thread)) == NULL)
+		return false;
+	stamp_snapshot(&replay->stamp, &before);
+	if (!stamp_handle_matches(&before, handle) || before.phase != CLUSTER_RECOVERY_STAMP_INSERTED
+		|| before.failed)
+		return false;
+
+	/* Preparation owns the held descriptor and complete payload. Flush the
+	 * actual native end before the bound target write; no slot lock spans
+	 * either operation, and native ERROR/PANIC retains the inserted duty. */
+	if (stamp.token == 0 || !cluster_recovery_stamp_ctrc_flush_v2(&before.handle)
+		|| !cluster_undo_smgr_recovery_ctrc_write_bound_v2(stamp, before.handle.payload,
+														   before.handle.payload_length))
+		goto failed;
+	if (!XLogInsertAllowed()
+		|| cluster_wal_writer_check(&before.handle.owner.writer) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| !ClusterXLogStartupFlushCovers(before.record_end,
+										  before.handle.owner.writer.ref.timeline))
+		goto failed;
+	stamp_snapshot(&replay->stamp, &after);
+	if (!stamp_handle_matches(&after, &before.handle)
+		|| after.phase != CLUSTER_RECOVERY_STAMP_INSERTED || after.failed
+		|| after.record_start != before.record_start || after.record_end != before.record_end)
+		goto failed;
+	if (!cluster_recovery_stamp_durable_v1(&before.handle)
+		|| !cluster_recovery_stamp_clear_v1(&before.handle))
+		goto failed;
+	return true;
+
+failed:
+	(void)cluster_recovery_stamp_fail_v1(&before.handle);
+	return false;
+}
+bool
+cluster_recovery_stamp_ctrc_prepare_v2(const ClusterRecoveryStampOwnerV1 *owner,
+	const uint8 *payload, Size length, ClusterRecoveryStampHandleV1 *out,
+	ClusterUndoSmgrRecoveryStampV1 *target)
+{
+	ClusterUndoSmgrRecoveryStampV1 prepared;
+	ClusterRecoveryStampHandleV1 handle;
+	uint16 target_thread;
+	volatile bool accepted = false;
+
+	/* Keep public outputs private and unchanged until both original owners
+	 * have accepted. In particular, do not zero an aliased input/live slot. */
+	if (!stamp_actor() || MyBackendType != B_STARTUP || CritSectionCount != 0
+		|| owner == NULL || payload == NULL || out == NULL || target == NULL
+		|| owner->executor_pid != MyProcPid || length != CLUSTER_RECOVERY_CTRC_BYTES
+		|| stamp_ranges_overlap(out, sizeof(*out), target, sizeof(*target))
+		|| stamp_ranges_overlap(out, sizeof(*out), owner, sizeof(*owner))
+		|| stamp_ranges_overlap(target, sizeof(*target), owner, sizeof(*owner))
+		|| stamp_ranges_overlap(out, sizeof(*out), payload, length)
+		|| stamp_ranges_overlap(target, sizeof(*target), payload, length)
+		|| stamp_ranges_overlap(out, sizeof(*out), cluster_recovery_plan_shmem,
+			   sizeof(*cluster_recovery_plan_shmem))
+		|| stamp_ranges_overlap(target, sizeof(*target), cluster_recovery_plan_shmem,
+			   sizeof(*cluster_recovery_plan_shmem))
+		|| !stamp_payload_matches(owner, CLUSTER_RECOVERY_STAMP_D0, payload, length,
+			   &target_thread))
+		return false;
+
+	/* All codec work and descriptor acquisition precede PRE_INSERT. The
+	 * target API owns its own failed preparation; only a successful token
+	 * belongs to this wrapper and may be closed on window refusal/ERROR. */
+	if (!cluster_undo_smgr_recovery_ctrc_prepare_v2(payload, length,
+			owner->writer.ref.claim.identity.system_identifier, &prepared))
+		return false;
+	PG_TRY();
+	{
+		accepted = cluster_recovery_stamp_prepare_v1(owner, CLUSTER_RECOVERY_STAMP_D0,
+			payload, length, &handle);
+	}
+	PG_CATCH();
+	{
+		(void)cluster_undo_smgr_recovery_ctrc_close_v2(prepared);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!accepted) {
+		(void)cluster_undo_smgr_recovery_ctrc_close_v2(prepared);
+		return false;
+	}
+
+	memcpy(out, &handle, sizeof(handle));
+	memcpy(target, &prepared, sizeof(prepared));
+	return true;
+}
+
+XLogRecPtr
+cluster_recovery_stamp_ctrc_apply_v2(const ClusterRecoveryStampHandleV1 *handle,
+								   ClusterUndoSmgrRecoveryStampV1 stamp,
+								   void *raw, Size raw_length, XLogRecPtr *start)
+{
+	uint8 copy[SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + CLUSTER_RECOVERY_CTRC_BYTES];
+	ClusterThreadReplaySlot *replay;
+	XLogRecPtr actual_start, end;
+
+	/* Validate public outputs before the one native insertion. The nested
+	 * snapshot uses private storage; it must not hide a caller alias until
+	 * after the original window has already been retired. */
+	if (!stamp_actor() || MyBackendType != B_STARTUP || CritSectionCount == 0
+		|| handle == NULL || raw == NULL || start == NULL || stamp.token == 0
+		|| handle->owner.executor_pid != MyProcPid || handle->kind != CLUSTER_RECOVERY_STAMP_D0
+		|| handle->payload_length != CLUSTER_RECOVERY_CTRC_BYTES || raw_length != sizeof(copy)
+		|| (replay = cluster_thread_recovery_replay_slot(handle->key.target_thread)) == NULL
+		|| stamp_ranges_overlap(raw, raw_length, start, sizeof(*start))
+		|| stamp_ranges_overlap(raw, raw_length, handle, sizeof(*handle))
+		|| stamp_ranges_overlap(start, sizeof(*start), handle, sizeof(*handle))
+		|| stamp_ranges_overlap(raw, raw_length, &replay->stamp, sizeof(replay->stamp))
+		|| stamp_ranges_overlap(start, sizeof(*start), &replay->stamp, sizeof(replay->stamp)))
+		return InvalidXLogRecPtr;
+
+	/* Refuse a stale token or another prepared payload before the first
+	 * irreversible WAL insertion. This read-only check leaves PRE_INSERT
+	 * cancelable; finish still rechecks the bound stage after WAL flush. */
+	if (!cluster_undo_smgr_recovery_ctrc_matches_v2(stamp, handle->payload,
+			handle->payload_length))
+		return InvalidXLogRecPtr;
+
+	/* Keep the caller's original critical section and post-insert duty. No
+	 * hash/allocation, cancellation or error interception is introduced. */
+	end = cluster_recovery_stamp_ctrc_insert_record_v2(handle, copy, sizeof(copy), &actual_start);
+	if (end == InvalidXLogRecPtr || !cluster_recovery_stamp_ctrc_finish_v2(handle, stamp))
+		return InvalidXLogRecPtr;
+	memcpy(raw, copy, sizeof(copy));
+	memcpy(start, &actual_start, sizeof(actual_start));
+	return end;
+}
+
+XLogRecPtr
+cluster_recovery_stamp_ctrc_execute_v2(const ClusterRecoveryStampOwnerV1 *owner,
+	const uint8 *payload, Size length, void *raw, Size raw_length, XLogRecPtr *start)
+{
+	uint8 copy[SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + CLUSTER_RECOVERY_CTRC_BYTES];
+	ClusterRecoveryStampHandleV1 handle;
+	ClusterUndoSmgrRecoveryStampV1 target;
+	XLogRecPtr actual_start, end;
+
+	/* Check every public output before descriptor acquisition or PRE_INSERT.
+	 * Both original nested operations receive only private stack storage. */
+	if (!stamp_actor() || MyBackendType != B_STARTUP || CritSectionCount != 0
+		|| cluster_recovery_plan_shmem == NULL || owner == NULL || payload == NULL
+		|| raw == NULL || start == NULL || length != CLUSTER_RECOVERY_CTRC_BYTES
+		|| raw_length != sizeof(copy)
+		|| stamp_ranges_overlap(raw, raw_length, start, sizeof(*start))
+		|| stamp_ranges_overlap(raw, raw_length, owner, sizeof(*owner))
+		|| stamp_ranges_overlap(start, sizeof(*start), owner, sizeof(*owner))
+		|| stamp_ranges_overlap(raw, raw_length, payload, length)
+		|| stamp_ranges_overlap(start, sizeof(*start), payload, length)
+		|| stamp_ranges_overlap(raw, raw_length, cluster_recovery_plan_shmem,
+			   sizeof(*cluster_recovery_plan_shmem))
+		|| stamp_ranges_overlap(start, sizeof(*start), cluster_recovery_plan_shmem,
+			   sizeof(*cluster_recovery_plan_shmem)))
+		return InvalidXLogRecPtr;
+	if (!cluster_recovery_stamp_ctrc_prepare_v2(owner, payload, length, &handle, &target))
+		return InvalidXLogRecPtr;
+
+	/* The original insertion/flush/target sequence owns one critical section.
+	 * Only an exact PRE_INSERT cancellation permits a normal refusal. Once
+	 * insertion starts, never exit the section or close the held target on
+	 * failure; native ERROR/PANIC is not intercepted or converted to success. */
+	START_CRIT_SECTION();
+	end = cluster_recovery_stamp_ctrc_apply_v2(&handle, target, copy, sizeof(copy), &actual_start);
+	if (end == InvalidXLogRecPtr) {
+		if (!cluster_recovery_stamp_cancel_v1(&handle))
+			ereport(PANIC, (errmsg("D0 recovery stamp could not complete its inserted operation")));
+		END_CRIT_SECTION();
+		(void)cluster_undo_smgr_recovery_ctrc_close_v2(target);
+		return InvalidXLogRecPtr;
+	}
+	END_CRIT_SECTION();
+
+	/* Real target durability and exact-window clear preceded this close.
+	 * A close refusal cannot undo them, but must not publish partial outputs. */
+	if (!cluster_undo_smgr_recovery_ctrc_close_v2(target))
+		return InvalidXLogRecPtr;
+	memcpy(raw, copy, sizeof(copy));
+	memcpy(start, &actual_start, sizeof(actual_start));
+	return end;
+}
+
+bool
+cluster_recovery_stamp_ctrc_execute_reference_v2(const ClusterRecoveryStampOwnerV1 *owner,
+	const uint8 *payload, Size length, uint32 source_index,
+	const uint8 source_identity_digest[32], void *raw, Size raw_length,
+	ClusterRecoveryCTRCReferenceV2 *out)
+{
+	uint8 copy[SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + CLUSTER_RECOVERY_CTRC_BYTES];
+	ClusterRecoveryCTRCReferenceV2 reference = { 0 };
+	uint8 source_nonzero = 0;
+
+	/* A malformed external source/output must not be discovered only after
+	 * emitting a durable record. Do not overwrite an input or a live slot. */
+	if (!stamp_actor() || MyBackendType != B_STARTUP || CritSectionCount != 0
+		|| cluster_recovery_plan_shmem == NULL || owner == NULL || payload == NULL
+		|| source_identity_digest == NULL || raw == NULL || out == NULL
+		|| length != CLUSTER_RECOVERY_CTRC_BYTES || raw_length != sizeof(copy)
+		|| stamp_ranges_overlap(raw, raw_length, out, sizeof(*out))
+		|| stamp_ranges_overlap(raw, raw_length, owner, sizeof(*owner))
+		|| stamp_ranges_overlap(out, sizeof(*out), owner, sizeof(*owner))
+		|| stamp_ranges_overlap(raw, raw_length, payload, length)
+		|| stamp_ranges_overlap(out, sizeof(*out), payload, length)
+		|| stamp_ranges_overlap(raw, raw_length, source_identity_digest, 32)
+		|| stamp_ranges_overlap(out, sizeof(*out), source_identity_digest, 32)
+		|| stamp_ranges_overlap(raw, raw_length, cluster_recovery_plan_shmem,
+			   sizeof(*cluster_recovery_plan_shmem))
+		|| stamp_ranges_overlap(out, sizeof(*out), cluster_recovery_plan_shmem,
+			   sizeof(*cluster_recovery_plan_shmem)))
+		return false;
+	for (unsigned i = 0; i < 32; i++)
+		source_nonzero |= source_identity_digest[i];
+	if (source_nonzero == 0)
+		return false;
+
+	/* Only the original owner supplies the final raw bytes and actual end.
+	 * No source qualification is inferred from a nonzero digest/index. */
+	reference.end = cluster_recovery_stamp_ctrc_execute_v2(owner, payload, length,
+		copy, sizeof(copy), &reference.start);
+	if (reference.end == InvalidXLogRecPtr)
+		return false;
+	reference.source_index = source_index;
+	reference.raw_length = sizeof(copy);
+	/* The window is already complete and the target closed. The existing
+	 * full-record SHA may refuse/raise ERROR here; never reopen or relabel
+	 * that completed operation, or publish either partial public output. */
+	if (!cluster_recovery_ctrc_record_hash_v2(source_identity_digest, reference.start,
+			reference.end, copy, sizeof(copy), reference.raw_record_sha256))
+		return false;
+	memcpy(raw, copy, sizeof(copy));
+	memcpy(out, &reference, sizeof(reference));
+	return true;
+}
+
 bool
 cluster_recovery_stamp_durable_v1(const ClusterRecoveryStampHandleV1 *handle)
 {
