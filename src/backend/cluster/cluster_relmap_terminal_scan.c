@@ -958,6 +958,33 @@ cluster_relmap_recovery_prepare_cold_v1(const ClusterRelmapV2Namespace *identity
 }
 
 bool
+cluster_relmap_recovery_handle_source_v1(ClusterRelmapRecoveryHandle *handle,
+										 ClusterRelmapRecoverySourceObservationV1 *out)
+{
+	ClusterRelmapRecoverySourceObservationV1 result = { 0 };
+
+	if (out == NULL || recovery_overlap(out, sizeof(*out), handle, sizeof(*handle))
+		|| (handle != NULL && handle->scan != NULL
+			&& recovery_overlap(out, sizeof(*out), handle->scan, sizeof(*handle->scan))))
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (handle == NULL || handle->pid != getpid() || handle->failed || handle->scan == NULL)
+		return false;
+	/* Original source/owner checks may ERROR. No native page I/O or status is
+	 * needed to identify this already selected, still borrowed source. */
+	handle->failed = true;
+	if (CritSectionCount != 0 || !recovery_handle_current(handle))
+		return false;
+	result.source = handle->scan->selected.source;
+	result.checkpoint = handle->scan->selected.checkpoint;
+	result.native_redo = handle->scan->selected.native_redo;
+	result.scope_serial = handle->scope_serial;
+	handle->failed = false;
+	*out = result;
+	return true;
+}
+
+bool
 cluster_relmap_recovery_handle_matches_v1(ClusterRelmapRecoveryHandle *handle,
 										  const ClusterRelmapV2Namespace *identity,
 										  const ClusterRelmapV2View *pending)

@@ -577,11 +577,14 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
 		test_cluster_relmap_census_recovery.inc \
 		test_cluster_relmap_census_batch.inc \
+		test_cluster_relmap_census_cold.inc \
 		test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c \
 		test_cluster_recovery_crypto_boundary.h unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_pending.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_pending_side.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
@@ -604,6 +607,7 @@ test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
 
 # Keep the original census-only fixture independent of the unused SIDE join.
 test_cluster_relmap_retention_census_product.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_retention_census.c \
+		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_guc.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_merge.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_arb.h \
@@ -624,6 +628,7 @@ test_cluster_relmap_retention_census_product.o: $(top_srcdir)/src/backend/cluste
 test_cluster_relmap_census_side: test_cluster_relmap_retention_census.c \
 		test_cluster_relmap_census_recovery.inc \
 		test_cluster_relmap_census_batch.inc \
+		test_cluster_relmap_census_cold.inc \
 		test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c \
 		test_cluster_recovery_crypto_boundary.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
@@ -3442,6 +3447,8 @@ test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o
 # The collector executes normally; inject only its ERROR boundary in this fixture.
 test_cluster_relmap_retained_census.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_retention_census.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_pending_side.h Makefile

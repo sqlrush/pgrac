@@ -239,3 +239,103 @@ UT_TEST(test_execution_pending_alias_refusal_preserves_inputs)
 	UT_ASSERT(!inputs_pin_held && test_actual_cf == NoLock);
 	execution_build_done();
 }
+
+UT_TEST(test_custody_source_observes_original_tuple_without_native_page_io)
+{
+	for (unsigned execution = 0; execution < 2; execution++) {
+		ClusterWalInputsV1 *inputs = NULL;
+		ClusterRelmapRecoveryHandle *handle = NULL;
+		ClusterRelmapRecoverySourceObservationV1 out;
+		ClusterRelmapV2View view;
+		if (execution)
+			execution_pending_setup(true, false, 0);
+		else
+			inputs = custody_setup(false, true);
+		view = custody_view(true);
+		UT_ASSERT(execution ? cluster_relmap_recovery_prepare_cold_v1(&custody_image.identity,
+																	  &view, &handle)
+							: cluster_relmap_recovery_prepare_v1(inputs, &custody_image.identity,
+																 &view, &handle));
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT(cluster_relmap_recovery_handle_source_v1(handle, &out));
+		UT_ASSERT_EQ(memcmp(&out.source, &prefix_base_expected.source, sizeof(out.source)), 0);
+		UT_ASSERT_EQ(
+			memcmp(&out.checkpoint, &prefix_base_expected.checkpoint, sizeof(out.checkpoint)), 0);
+		UT_ASSERT_EQ(out.native_redo, prefix_base_expected.native_redo);
+		UT_ASSERT_EQ(out.scope_serial, 7);
+		UT_ASSERT_EQ(prefix_base_reads, 1);
+		UT_ASSERT_EQ(inputs_pin_held, !execution);
+		cluster_relmap_recovery_handle_release_v1(&handle);
+		if (execution)
+			execution_build_done();
+		else
+			custody_done(&inputs);
+	}
+}
+
+UT_TEST(test_custody_source_refusal_and_error_are_sticky)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		ClusterRelmapRecoveryHandle *handle = NULL;
+		ClusterRelmapRecoverySourceObservationV1 out, zero = { 0 };
+		ClusterRelmapV2View view;
+		volatile bool threw = false;
+		execution_pending_setup(false, false, 0);
+		view = custody_view(false);
+		UT_ASSERT(cluster_relmap_recovery_prepare_cold_v1(&custody_image.identity, &view, &handle));
+		if (fault == 0)
+			custody_scope++;
+		if (fault == 1)
+			v2_checkpoint_root_race();
+		if (fault == 2)
+			execution_pending_guard_fault = 1;
+		if (fault == 3)
+			CritSectionCount = 1;
+		if (fault == 4)
+			execution_pending_guard_fault = 3;
+		memset(&out, 0xa5, sizeof(out));
+		test_capture_error_level = true;
+		PG_TRY();
+		{
+			UT_ASSERT(!cluster_relmap_recovery_handle_source_v1(handle, &out));
+		}
+		PG_CATCH();
+		{
+			threw = true;
+		}
+		PG_END_TRY();
+		test_capture_error_level = false;
+		UT_ASSERT_EQ(threw, fault == 4);
+		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		custody_scope = 7;
+		CritSectionCount = execution_pending_guard_fault = 0;
+		UT_ASSERT(!cluster_relmap_recovery_handle_source_v1(handle, &out));
+		UT_ASSERT(
+			!cluster_relmap_recovery_handle_matches_v1(handle, &custody_image.identity, &view));
+		UT_ASSERT_EQ(prefix_base_reads, 1);
+		UT_ASSERT(!inputs_pin_held && test_actual_cf == NoLock);
+		cluster_relmap_recovery_handle_release_v1(&handle);
+		execution_build_done();
+	}
+}
+
+UT_TEST(test_custody_source_alias_refusal_keeps_handle_usable)
+{
+	ClusterRelmapRecoveryHandle *handle = NULL;
+	ClusterRelmapRecoverySourceObservationV1 out, before, zero = { 0 };
+	ClusterRelmapV2View view;
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT(!cluster_relmap_recovery_handle_source_v1(NULL, &out));
+	UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+	execution_pending_setup(false, false, 0);
+	view = custody_view(false);
+	UT_ASSERT(cluster_relmap_recovery_prepare_cold_v1(&custody_image.identity, &view, &handle));
+	memcpy(&before, handle, sizeof(before));
+	UT_ASSERT(!cluster_relmap_recovery_handle_source_v1(handle, (void *)handle));
+	UT_ASSERT(!cluster_relmap_recovery_handle_source_v1(handle, NULL));
+	UT_ASSERT_EQ(memcmp(&before, handle, sizeof(before)), 0);
+	UT_ASSERT(cluster_relmap_recovery_handle_source_v1(handle, &out));
+	UT_ASSERT_EQ(prefix_base_reads, 1);
+	cluster_relmap_recovery_handle_release_v1(&handle);
+	execution_build_done();
+}

@@ -969,11 +969,20 @@ UT_TEST(test_root_rebuild_preserves_existing_proofs_and_exact_pins)
 #ifndef RELMAP_CENSUS_FIXTURE_ONLY
 #include "test_cluster_relmap_census_recovery.inc"
 #include "test_cluster_relmap_census_batch.inc"
+#include "test_cluster_relmap_census_cold.inc"
 
 int
 main(void)
 {
-	UT_PLAN(51);
+	UT_PLAN(59);
+	UT_RUN(test_census_cold_requires_drained_and_original_ownership);
+	UT_RUN(test_census_cold_selects_original_full_physical_pair_and_retains_all_pins);
+	UT_RUN(test_census_cold_source_scope_refusal_and_error_release_only_local_custody);
+	UT_RUN(test_census_cold_rechecks_new_namespace_same_bytes_inode_and_unrelated_root);
+	UT_RUN(test_census_cold_rechecks_all_original_pins_including_late_root_io);
+	UT_RUN(test_census_cold_rechecks_original_ownership_metadata_and_source_after_io);
+	UT_RUN(test_census_cold_missing_original_pending_pin_and_native_prepare_failure);
+	UT_RUN(test_census_cold_known_output_overlap_never_changes_borrowed_inputs);
 	UT_RUN(test_census_batch_consume_all_original_namespaces);
 	UT_RUN(test_census_batch_consume_stops_at_first_unknown_or_error);
 	UT_RUN(test_census_batch_consume_missing_ownership_cancels_local_custody_only);

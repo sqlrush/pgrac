@@ -13,6 +13,7 @@
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_relmap_arb.h"
 #include "cluster/cluster_relmap_lock.h"
+#include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_wal_inputs.h"
 
 typedef struct CensusOrigin {
@@ -323,6 +324,138 @@ cluster_relmap_retention_census_recovery_prepare(ClusterRelmapRetentionCensus *c
 			cluster_relmap_recovery_handle_release_v1((ClusterRelmapRecoveryHandle **)&handle);
 		if (!accepted)
 			census_failed(census, CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+	}
+	PG_END_TRY();
+	return accepted;
+}
+
+static bool
+census_recovery_overlap(const void *a, size_t an, const void *b, size_t bn)
+{
+	uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
+	return a != NULL && b != NULL && ((x <= y && y - x < an) || (y <= x && x - y < bn));
+}
+
+static bool
+census_recovery_output_overlap(const ClusterRelmapRetentionCensus *census,
+							   const ClusterRelmapCensusRecovery *out)
+{
+	if (census == NULL)
+		return false;
+	if (census_recovery_overlap(out, sizeof(*out), census, sizeof(*census))
+		|| census_recovery_overlap(out, sizeof(*out), census->roots, 1))
+		return true;
+	for (size_t i = 0; i < census->origin_count; i++)
+		if (census_recovery_overlap(out, sizeof(*out), census->origins[census->nodes[i]].directory,
+									sizeof(ClusterRelmapRetentionDirectory)))
+			return true;
+	return false;
+}
+
+/* Compare all original pin bytes in this exclusive in-process observation,
+ * including unselected origins/slots. This is not a persistent encoding. */
+static bool
+census_recovery_pins_digest(const ClusterRelmapRetentionCensus *census, uint8 digest[32])
+{
+	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_SHA256);
+	bool ok;
+
+	if (ctx == NULL)
+		return false;
+	ok = pg_cryptohash_init(ctx) == 0;
+	for (size_t i = 0; ok && i < census->origin_count; i++) {
+		const ClusterRelmapRetentionDirectory *directory
+			= census->origins[census->nodes[i]].directory;
+		ok = directory != NULL
+			 && pg_cryptohash_update(ctx, (const uint8 *)directory->pins, sizeof(directory->pins))
+					== 0;
+	}
+	ok = ok && pg_cryptohash_final(ctx, digest, 32) == 0;
+	pg_cryptohash_free(ctx);
+	return ok;
+}
+
+static bool
+census_cold_source_current(const ClusterRelmapRetentionCensus *census,
+						   const ClusterRelmapV2View *pending,
+						   const ClusterRelmapRecoverySourceObservationV1 *source)
+{
+	return source->scope_serial != 0
+		   && source->source.claim.identity.system_identifier == census->system_identifier
+		   && source->source.claim.database_incarnation == census->database_incarnation
+		   && source->source.claim.identity.origin_node_id == pending->pending_owner.node
+		   && memcmp(source->source.claim.identity.storage_uuid, census->storage_uuid, 16) == 0
+		   && cluster_undo_recovery_cold_single_source_v1(
+			   &source->source, &source->checkpoint, source->native_redo, source->scope_serial);
+}
+
+bool
+cluster_relmap_retention_census_recovery_prepare_cold(ClusterRelmapRetentionCensus *census,
+													  Oid dbid, ClusterRelmapCensusRecovery *out)
+{
+	ClusterRelmapRecoveryHandle *volatile handle = NULL;
+	volatile bool accepted = false;
+
+	if (out == NULL || census_recovery_output_overlap(census, out))
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (census == NULL || census->result != CLUSTER_RELMAP_CENSUS_DRAINED || !cluster_shared_catalog
+		|| !cluster_recovery_merge_claim_is_held() || !cluster_relmap_authority_x_held())
+		return false;
+	PG_TRY();
+	{
+		do {
+			ClusterRelmapCensusRecovery scratch = { 0 };
+			ClusterRelmapRecoverySourceObservationV1 source, current;
+			const ClusterRelmapRetentionPin *pin;
+			uint8 saved_pins[32], current_pins[32];
+			ClusterRecoveryRootsResult root_result;
+
+			if (!census->checked || !census_recovery_current(census)
+				|| !census_recovery_pins_digest(census, saved_pins)
+				|| !census_recovery_pair(census, dbid, &scratch) || !scratch.pending.has_pending
+				|| (pin = census_recovery_pin(census, &scratch.identity, &scratch.pending)) == NULL
+				|| !census_recovery_current(census)
+				|| !cluster_relmap_recovery_prepare_cold_v1(&scratch.identity, &scratch.pending,
+															(ClusterRelmapRecoveryHandle **)&handle)
+				|| !cluster_relmap_recovery_handle_source_v1(handle, &source)
+				|| !census_cold_source_current(census, &scratch.pending, &source))
+				break;
+			/* A saved OBSERVED digest cannot conceal physical changes during
+			 * native preparation, including unrelated/new namespaces. */
+			root_result = cluster_recovery_root_set_recheck_begin(census->roots);
+			while (root_result == CLUSTER_RECOVERY_ROOTS_MORE
+				   || root_result == CLUSTER_RECOVERY_ROOTS_ENTRY
+				   || root_result == CLUSTER_RECOVERY_ROOTS_BYTES) {
+				ClusterRecoveryRootsEvent event;
+				root_result = cluster_recovery_root_set_step(census->roots, &event);
+			}
+			if (root_result != CLUSTER_RECOVERY_ROOTS_OBSERVED
+				|| !cluster_relmap_recovery_handle_source_v1(handle, &current)
+				|| memcmp(&source.source, &current.source, sizeof(source.source)) != 0
+				|| memcmp(&source.checkpoint, &current.checkpoint, sizeof(source.checkpoint)) != 0
+				|| source.native_redo != current.native_redo
+				|| source.scope_serial != current.scope_serial
+				|| !census_cold_source_current(census, &scratch.pending, &current)
+				|| !census_recovery_current(census)
+				|| !census_recovery_pins_digest(census, current_pins)
+				|| memcmp(saved_pins, current_pins, sizeof(saved_pins)) != 0
+				|| census_recovery_pin(census, &scratch.identity, &scratch.pending) != pin
+				|| !cluster_shared_catalog || !cluster_recovery_merge_claim_is_held()
+				|| !cluster_relmap_authority_x_held())
+				break;
+			scratch.handle = handle;
+			*out = scratch;
+			handle = NULL;
+			accepted = true;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		if (!accepted)
+			census_failed(census, CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+		if (handle != NULL)
+			cluster_relmap_recovery_handle_release_v1((ClusterRelmapRecoveryHandle **)&handle);
 	}
 	PG_END_TRY();
 	return accepted;

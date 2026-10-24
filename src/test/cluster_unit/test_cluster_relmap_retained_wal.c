@@ -3364,7 +3364,10 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(80);
+	UT_PLAN(83);
+	UT_RUN(test_custody_source_observes_original_tuple_without_native_page_io);
+	UT_RUN(test_custody_source_refusal_and_error_are_sticky);
+	UT_RUN(test_custody_source_alias_refusal_keeps_handle_usable);
 	UT_RUN(test_execution_pending_original_source_and_native_terminal_read);
 	UT_RUN(test_execution_pending_requires_original_owner_and_single_source);
 	UT_RUN(test_execution_pending_refuses_wrong_complete_view_and_era);

@@ -130,6 +130,27 @@ extern bool cluster_relmap_retention_census_recovery_prepare(ClusterRelmapRetent
 															 Oid dbid,
 															 ClusterRelmapCensusRecovery *out);
 
+/* Dormant original execution-owner prepare after pass-1 read pins are gone.
+ * Require DRAINED and the original sole-merger claim/namespace X/shared
+ * catalog. Select the exact original physical pair and restored pending pin;
+ * use only the original cold execution prepare, then match its original
+ * source/sysid/dbinc/storage/serial. After native I/O, freshly recheck the
+ * entire physical ROOT and every original pin before one output publication.
+ * No arbitration, target write, COMPLETE, pin release or activation follows.
+ *
+ * Missing initial ownership/before DRAINED leaves the scan unconsumed. Entered
+ * refusal/ERROR invalidates old ROOT/census/directories and retains all pins;
+ * only local custody is freed. False is not rollback or retry permission.
+ * Output must be fresh exclusive storage, disjoint from all borrowed objects;
+ * known census/directory overlaps or an output spanning the ROOT pointer stay
+ * unchanged. Distinct refusal clears output. Original isolation and complete
+ * origin/native qualification remain caller obligations, never established by
+ * this join. Keep census/ROOT/directories/original execution owner alive until
+ * the returned handle is released or consumed. */
+extern bool
+cluster_relmap_retention_census_recovery_prepare_cold(ClusterRelmapRetentionCensus *census,
+													  Oid dbid, ClusterRelmapCensusRecovery *out);
+
 /* Dormant original-owner consumer: while holding the original sole-merger
  * claim and namespace X, prepare the selected DRAINED namespace above, then
  * consume its opaque handle through original v2 arbitration. No supplied
