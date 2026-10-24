@@ -752,14 +752,27 @@ cluster_recovery_stamp_worker_stopped_v1(uint16 thread, uint64 attempt)
 {
 	ClusterThreadReplaySlot *replay;
 	ClusterRecoveryStampSlotV1 *slot;
+	ClusterRecoveryStampSlotV1 snapshot;
 	bool accepted = false;
 	if (!cluster_shared_config || !cluster_enabled || !IsUnderPostmaster || MyProcPid <= 0
 		|| MyBackendType != B_LMON || CritSectionCount != 0 || attempt == 0
 		|| (replay = cluster_thread_recovery_replay_slot(thread)) == NULL)
 		return false;
 	slot = &replay->stamp;
+	stamp_snapshot(slot, &snapshot);
+	if (!stamp_shape(&snapshot, thread))
+		return false;
 	SpinLockAcquire(&slot->lock);
-	if (!stamp_state_shape(slot, thread))
+	/* Validate payload outside the lock, then consume that exact operation
+	 * and worker binding. A stopped worker cannot gain a replacement window. */
+	if (!stamp_state_shape(slot, thread)
+		|| memcmp(&slot->handle, &snapshot.handle, sizeof(slot->handle)) != 0
+		|| slot->phase != snapshot.phase || slot->adopt_from != snapshot.adopt_from
+		|| slot->executor_attempt_stamp != snapshot.executor_attempt_stamp
+		|| slot->bound_worker_attempt != snapshot.bound_worker_attempt
+		|| slot->bound_worker_pid != snapshot.bound_worker_pid
+		|| slot->record_start != snapshot.record_start || slot->record_end != snapshot.record_end
+		|| slot->failed != snapshot.failed)
 		goto done;
 	if (slot->bound_worker_attempt == 0) {
 		/* Entry may have refused before registering, including a replacement

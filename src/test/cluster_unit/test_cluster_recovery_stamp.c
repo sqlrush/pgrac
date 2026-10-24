@@ -33,6 +33,8 @@ static bool found_region;
 static ClusterRecoveryStampOwnerV1 owner;
 static uint8 payload[CLUSTER_RECOVERY_TT_ABORT_BYTES];
 static unsigned hash_calls;
+/* Controlled concurrent mutation during the real lock-free D0 codec. */
+static unsigned stopped_hash_mutation, stopped_hash_mutations;
 
 /* Actual native accessor, with controlled process-local insertion leaves.
  * This does not execute XLogInsert or supply full raw-record/payload proof. */
@@ -392,6 +394,22 @@ stamp_hash_create(pg_cryptohash_type type)
 	for (unsigned i = 0; i <= CLUSTER_RECOVERY_STAMP_SLOTS; i++)
 		UT_ASSERT(SpinLockFree(&region.thread_replay[i].stamp.lock));
 	hash_calls++;
+	if (stopped_hash_mutation != 0) {
+		ClusterRecoveryStampSlotV1 *slot = &region.thread_replay[2].stamp;
+		unsigned mutation = stopped_hash_mutation;
+		stopped_hash_mutation = 0;
+		stopped_hash_mutations++;
+		if (mutation == 1)
+			slot->handle.payload[CLUSTER_RECOVERY_CTRC_BYTES - 1] ^= 1;
+		else if (mutation == 2)
+			slot->handle.key.window_seq++;
+		else if (mutation == 3) {
+			slot->phase = CLUSTER_RECOVERY_STAMP_INSERTED;
+			slot->record_start = 0x2000010;
+			slot->record_end = 0x20000c0;
+		} else
+			slot->failed = true;
+	}
 	if (observe_reference_hash && target_close_calls > 0) {
 		reference_hash_calls++;
 		UT_ASSERT(!target_held);
@@ -458,6 +476,7 @@ fresh(void)
 	target_prepare_calls = target_close_calls = target_prepare_fault = 0;
 	target_held = target_throw_after_prepare = false;
 	hash_throw_at = 0;
+	stopped_hash_mutation = stopped_hash_mutations = 0;
 	observe_reference_hash = reference_hash_refuse = reference_hash_throw = false;
 	reference_hash_calls = 0;
 	reference_raw_output = reference_metadata_output = NULL;
@@ -2909,7 +2928,7 @@ UT_TEST(original_worker_stop_keeps_c0_d0_and_blocks_replacement)
 		UT_ASSERT_EQ(slot->adopt_from, CLUSTER_RECOVERY_STAMP_INSERTING);
 		UT_ASSERT_EQ(slot->bound_worker_attempt, 0);
 		UT_ASSERT_EQ(slot->bound_worker_pid, 0);
-		UT_ASSERT_EQ(hash_calls, hashes);
+		UT_ASSERT(d0 ? hash_calls > hashes : hash_calls == hashes);
 		UT_ASSERT(memcmp(&slot->handle, &h, sizeof(h)) == 0);
 		UT_ASSERT(cluster_recovery_stamp_worker_stopped_v1(2, 42));
 		UT_ASSERT(cluster_recovery_stamp_capture_v1(&capture));
@@ -2924,10 +2943,96 @@ UT_TEST(original_worker_stop_keeps_c0_d0_and_blocks_replacement)
 	}
 }
 
+/* Original LMON native-handle STOPPED provenance remains a fixture premise.
+ * A corrupt native operation must not become an accepted orphan. */
+UT_TEST(worker_stop_rejects_corrupt_c0_d0_without_changing_debt)
+{
+	for (unsigned d0 = 0; d0 < 2; d0++)
+		for (unsigned phase = CLUSTER_RECOVERY_STAMP_PRE_INSERT;
+			 phase <= CLUSTER_RECOVERY_STAMP_DURABLE; phase++) {
+			ClusterRecoveryStampHandleV1 h, corrupt;
+			ClusterRecoveryStampSlotV1 *slot;
+			fresh();
+			MyBackendType = B_BG_WORKER;
+			pg_atomic_write_u64(&region.thread_replay[2].episode_epoch, 41);
+			pg_atomic_write_u32(&region.thread_replay[2].state,
+								CLUSTER_THREADREC_REPLAY_REPLAYING);
+			UT_ASSERT(cluster_recovery_stamp_worker_begin_v1(2, 41));
+			UT_ASSERT(d0 ? begin_d0(&h, TT_SLOT_COMMITTED) : begin(&h));
+			slot = &region.thread_replay[2].stamp;
+			if (phase >= CLUSTER_RECOVERY_STAMP_INSERTING) {
+				CritSectionCount = 1;
+				UT_ASSERT(cluster_recovery_stamp_inserting_v1(&h));
+				if (phase >= CLUSTER_RECOVERY_STAMP_INSERTED)
+					UT_ASSERT(cluster_recovery_stamp_inserted_v1(&h, 0x2000010, 0x20000c0));
+				CritSectionCount = 0;
+				if (phase == CLUSTER_RECOVERY_STAMP_DURABLE)
+					UT_ASSERT(cluster_recovery_stamp_durable_v1(&h));
+			}
+			slot->handle.payload[slot->handle.payload_length - 1] ^= 1;
+			corrupt = slot->handle;
+			slot->failed = true;
+			MyBackendType = B_LMON;
+			MyProcPid = 19;
+			UT_ASSERT(!cluster_recovery_stamp_worker_stopped_v1(2, 41));
+			UT_ASSERT_EQ(slot->phase, phase);
+			UT_ASSERT_EQ(slot->adopt_from, CLUSTER_RECOVERY_STAMP_EMPTY);
+			UT_ASSERT_EQ(slot->executor_attempt_stamp, 41);
+			UT_ASSERT_EQ(slot->bound_worker_attempt, 41);
+			UT_ASSERT_EQ(slot->bound_worker_pid, 11);
+			UT_ASSERT(slot->failed);
+			UT_ASSERT(memcmp(&slot->handle, &corrupt, sizeof(corrupt)) == 0);
+			UT_ASSERT_EQ(slot->record_start,
+				phase >= CLUSTER_RECOVERY_STAMP_INSERTED ? 0x2000010 : 0);
+			UT_ASSERT_EQ(slot->record_end,
+				phase >= CLUSTER_RECOVERY_STAMP_INSERTED ? 0x20000c0 : 0);
+			UT_ASSERT(SpinLockFree(&slot->lock));
+		}
+}
+
+UT_TEST(worker_stop_rejects_snapshot_drift_without_poisoning_current_window)
+{
+	for (unsigned mutation = 1; mutation <= 4; mutation++) {
+		ClusterRecoveryStampHandleV1 h, expected;
+		ClusterRecoveryStampSlotV1 *slot;
+		fresh();
+		MyBackendType = B_BG_WORKER;
+		pg_atomic_write_u64(&region.thread_replay[2].episode_epoch, 41);
+		pg_atomic_write_u32(&region.thread_replay[2].state, CLUSTER_THREADREC_REPLAY_REPLAYING);
+		UT_ASSERT(cluster_recovery_stamp_worker_begin_v1(2, 41));
+		UT_ASSERT(begin_d0(&h, TT_SLOT_ABORTED));
+		slot = &region.thread_replay[2].stamp;
+		expected = h;
+		if (mutation == 1)
+			expected.payload[CLUSTER_RECOVERY_CTRC_BYTES - 1] ^= 1;
+		else if (mutation == 2)
+			expected.key.window_seq++;
+		MyBackendType = B_LMON;
+		MyProcPid = 19;
+		stopped_hash_mutation = mutation;
+		UT_ASSERT(!cluster_recovery_stamp_worker_stopped_v1(2, 41));
+		UT_ASSERT_EQ(stopped_hash_mutations, 1);
+		UT_ASSERT_EQ(stopped_hash_mutation, 0);
+		UT_ASSERT(memcmp(&slot->handle, &expected, sizeof(expected)) == 0);
+		UT_ASSERT_EQ(slot->phase, mutation == 3 ? CLUSTER_RECOVERY_STAMP_INSERTED
+												 : CLUSTER_RECOVERY_STAMP_PRE_INSERT);
+		UT_ASSERT_EQ(slot->record_start, mutation == 3 ? 0x2000010 : 0);
+		UT_ASSERT_EQ(slot->record_end, mutation == 3 ? 0x20000c0 : 0);
+		UT_ASSERT_EQ(slot->adopt_from, CLUSTER_RECOVERY_STAMP_EMPTY);
+		UT_ASSERT_EQ(slot->executor_attempt_stamp, 41);
+		UT_ASSERT_EQ(slot->bound_worker_attempt, 41);
+		UT_ASSERT_EQ(slot->bound_worker_pid, 11);
+		UT_ASSERT_EQ(slot->failed, mutation == 4);
+		UT_ASSERT(SpinLockFree(&slot->lock));
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(67);
+	UT_PLAN(69);
+	UT_RUN(worker_stop_rejects_corrupt_c0_d0_without_changing_debt);
+	UT_RUN(worker_stop_rejects_snapshot_drift_without_poisoning_current_window);
 	UT_RUN(original_worker_stop_keeps_c0_d0_and_blocks_replacement);
 	UT_RUN(orphan_c0_d0_preserve_exact_payload_and_checkpoint_debt);
 	UT_RUN(worker_attempt_mismatch_cannot_advance_exact_d0);

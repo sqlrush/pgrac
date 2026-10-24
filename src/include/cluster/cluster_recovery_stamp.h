@@ -80,7 +80,9 @@ typedef struct ClusterRecoveryStampCaptureV1 {
 
 /* Original validated BGW entry binds its scheduler attempt. Only the
  * original LMON reports exact native-handle BGWH_STOPPED. Unfinished
- * C0/D0 windows remain pending; this grants no adoption/write authority. */
+ * C0/D0 windows remain pending; this grants no adoption/write authority.
+ * STOPPED validates a full snapshot outside slot locks, then rechecks the
+ * exact operation/binding before recording debt. Refusal never retires it. */
 extern bool cluster_recovery_stamp_worker_begin_v1(uint16 thread, uint64 attempt);
 extern bool cluster_recovery_stamp_worker_stopped_v1(uint16 thread, uint64 attempt);
 
