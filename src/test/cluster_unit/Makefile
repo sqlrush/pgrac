@@ -216,6 +216,7 @@ TESTS += test_cluster_tt_abort_owner test_cluster_tt_active_owner
 TESTS += test_cluster_undo_header_durability
 TESTS += test_cluster_tt_checkpoint_cuts
 TESTS += test_cluster_tt_checkpoint_native
+TESTS += test_cluster_recovery_plan_source
 TESTS += test_cluster_tt_checkpoint_publish
 TESTS += test_cluster_tt_2pc_finish
 TESTS += test_cluster_tt_rollback_entry
@@ -454,6 +455,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_detached,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_guard,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_authority,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_thread_recovery_fabric_plan,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_recovery_plan_source,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_thread_recovery_fabric_apply,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_thread_recovery_fabric_scan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_thread_recovery_fabric_execute,$(SIMPLE_TESTS))
@@ -9845,6 +9847,15 @@ test_cluster_cold_start_replay_entry.inc: $(top_srcdir)/src/backend/access/trans
 	     emit && /^[ \t]*$$/ { emit=0; ended++ } \
 	     emit { print } /^}/ { owner=0 } END { if (count != 1 || ended != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+
+test_cluster_recovery_plan_generate.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c Makefile
+	awk '/^cluster_recovery_plan_generate\(/ { print "void"; emit=1; count++ } emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_recovery_plan_source: test_cluster_recovery_plan_source.c unit_test.h \
+        test_cluster_recovery_plan_generate.inc \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 test_cluster_cold_start_prepare: test_cluster_cold_start_prepare.c unit_test.h \
         test_cluster_cold_start_prepare_types.inc test_cluster_cold_start_prepare_owner.inc \

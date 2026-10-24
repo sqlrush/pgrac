@@ -290,7 +290,7 @@ cluster_recovery_plan_generate(uint32 dbstate_at_startup, bool local_recovery_ne
 	uint16 own_thread;
 	int64 now_us;
 	uint16 tid;
-	bool bit22_active;
+	bool root_source;
 
 	if (cluster_wal_threads_dir == NULL || cluster_wal_threads_dir[0] == '\0')
 		return;
@@ -307,18 +307,15 @@ cluster_recovery_plan_generate(uint32 dbstate_at_startup, bool local_recovery_ne
 	now_us = (int64)GetCurrentTimestamp();
 	plan.generated_at = now_us;
 
-	/* RF-ROOT P9 verification (contract): the bit22 latch is shmem-only and dies
-	 * with the postmaster — re-arm it from the durable root when the
-	 * cutover round completed (ACTIVE + bit22 target) before the dual-path
-	 * sample below.  Fail-closed: absent/not-ACTIVE/census-RED roots leave
-	 * the gate pre-bit22 (frozen registry authority). */
-	cluster_control_root_restore_bit22_latch_if_active();
-
-	/* RF-ROOT P7 (contract §B / follow-up): dual-path by the bit22 cutover
-	 * latch, sampled once per pass so one plan is coherent.  false =
-	 * pre-bit22 (frozen §17.8: the wal-state registry remains the selected
-	 * authority); true = post-bit22 (root-only). */
-	bit22_active = cluster_r4_bit22_cutover_active();
+	/* PRE2 has a CREATION or migrated v3 canonical ROOT, independently of
+	 * the volatile legacy migration latch. The original discovered reader
+	 * already selects v3 under shared_config and validates the exact ROOT;
+	 * a failed read remains UNKNOWN, never a registry fallback. This only
+	 * selects observational inputs, not service/replay/claim authority.
+	 * Non-PRE2 retains its original durable migration-OPEN restoration. */
+	if (!cluster_shared_config)
+		cluster_control_root_restore_bit22_latch_if_active();
+	root_source = cluster_shared_config || cluster_r4_bit22_cutover_active();
 
 	/*
 	 * Defensive pass-level gate.  Under today's startup ordering the
@@ -329,7 +326,7 @@ cluster_recovery_plan_generate(uint32 dbstate_at_startup, bool local_recovery_ne
 	 * (read_slot maps a missing file to EMPTY).  Post-bit22 the registry
 	 * is telemetry-only (§17.9), so the precondition no longer applies.
 	 */
-	if (!bit22_active && !cluster_wal_state_registry_ready()) {
+	if (!root_source && !cluster_wal_state_registry_ready()) {
 		plan.failed = true;
 		plan.generated = true;
 		publish_plan(&plan);
@@ -345,7 +342,7 @@ cluster_recovery_plan_generate(uint32 dbstate_at_startup, bool local_recovery_ne
 		ClusterRecoveryThreadVerdict verdict;
 		int read_verdict; /* root result or slot verdict, for the DEBUG1 line */
 
-		if (bit22_active) {
+		if (root_source) {
 			ClusterControlRootSnapshot snapshot;
 			ClusterControlRootReadToken token;
 			ClusterControlRootResult root_result;
@@ -423,8 +420,8 @@ cluster_recovery_plan_generate(uint32 dbstate_at_startup, bool local_recovery_ne
 
 		if (verdict != CLUSTER_RECOVERY_THREAD_EMPTY)
 			ereport(DEBUG1,
-					(errmsg("recovery plan: thread %u verdict %d (read verdict %d, bit22=%d)",
-							(unsigned)tid, (int)verdict, read_verdict, bit22_active ? 1 : 0)));
+					(errmsg("recovery plan: thread %u verdict %d (read verdict %d, root_source=%d)",
+							(unsigned)tid, (int)verdict, read_verdict, root_source ? 1 : 0)));
 	}
 	plan.generated = true;
 
