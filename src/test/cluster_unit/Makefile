@@ -2530,11 +2530,17 @@ test_cluster_space_storage_product.o: $(top_srcdir)/src/backend/cluster/cluster_
 		$(top_srcdir)/src/include/cluster/cluster_page_wal.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_space_producer_product.o: $(top_srcdir)/src/backend/cluster/cluster_page_producer.c
+test_cluster_space_producer_product.o: $(top_srcdir)/src/backend/cluster/cluster_page_producer.c \
+		$(top_srcdir)/src/include/cluster/cluster_page_producer.h \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
+		$(top_srcdir)/src/include/miscadmin.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 # PGRAC: native generic producer, with only buffer/WAL I/O replaced by fixtures.
-test_cluster_generic_product.o: $(top_srcdir)/src/backend/access/transam/generic_xlog.c
+test_cluster_generic_product.o: $(top_srcdir)/src/backend/access/transam/generic_xlog.c \
+		$(top_srcdir)/src/include/access/generic_xlog.h \
+		$(top_srcdir)/src/include/cluster/cluster_page_producer.h \
+		$(top_srcdir)/src/include/cluster/cluster_space_identity.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_generic_redo: test_cluster_generic_redo.c unit_test.h \
@@ -2547,6 +2553,7 @@ test_cluster_generic_redo: test_cluster_generic_redo.c unit_test.h \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 test_cluster_generic_version: test_cluster_generic_version.c unit_test.h \
+		$(top_srcdir)/src/include/access/generic_xlog.h \
 		test_cluster_generic_product.o test_cluster_space_storage_product.o test_cluster_space_producer_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_generic_product.o \
