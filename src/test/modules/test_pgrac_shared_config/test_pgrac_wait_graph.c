@@ -112,6 +112,15 @@ json_owner(const ClusterContentTraceOwner *row, void *context)
 		if (i != 0) appendStringInfoChar(out, ',');
 		json_lock(out, &row->locks[i]);
 	}
+	appendStringInfo(out, "],\"omitted_grants\":%u,\"grants\":[", row->omitted_grants);
+	for (uint32 i = 0; i < row->ngrants; i++) {
+		const ClusterContentTraceGrant *grant = &row->grants[i];
+		if (i != 0) appendStringInfoChar(out, ',');
+		appendStringInfo(out, "{\"resid\":[%u,%u,%u,%u,%u,%u],\"holder\":[%u,%u,"
+			UINT64_FORMAT "," UINT64_FORMAT "],\"mode\":%d}", grant->field1, grant->field2,
+			grant->field3, grant->field4, grant->type, grant->lockmethodid, grant->holder_node,
+			grant->holder_procno, grant->holder_epoch, grant->holder_request, grant->mode);
+	}
 	appendStringInfoString(out, "],\"native_wait\":");
 	if (row->native_waiting) json_lock(out, &row->native_wait);
 	else appendStringInfoString(out, "null");
@@ -244,9 +253,12 @@ test_pgrac_wait_graph_enqueue(PG_FUNCTION_ARGS)
 	appendStringInfo(&out, "{\"kind\":\"enqueue\",\"node\":%d,\"epoch\":" UINT64_FORMAT
 		",\"resid\":[%u,%u,%u,%u,%u,%u],\"status\":%d,\"generation\":" UINT64_FORMAT
 		",\"last_modified_scn\":" UINT64_FORMAT
+		",\"master\":%d,\"master_generation\":%u,\"shard_phase\":%u,\"route_known\":%s"
 		",\"copied\":%d,\"required\":%d,\"members\":[", cluster_node_id,
 		cluster_epoch_get_current(), key.field1, key.field2, key.field3, key.field4,
-		key.type, key.lockmethodid, status, snapshot.generation, snapshot.last_modified_scn, snapshot.copied, snapshot.required);
+		key.type, key.lockmethodid, status, snapshot.generation, snapshot.last_modified_scn,
+		snapshot.master_node, snapshot.master_generation, snapshot.shard_phase,
+		snapshot.route_known ? "true" : "false", snapshot.copied, snapshot.required);
 	for (int i = 0; i < snapshot.copied; i++) {
 		const ClusterGrdQueueMemberSnapshot *row = &members[i];
 		if (i != 0) appendStringInfoChar(&out, ',');

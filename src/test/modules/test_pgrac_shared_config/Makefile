@@ -19,4 +19,5 @@ endif
 test_pgrac_wal_history_native.o: $(top_srcdir)/src/backend/cluster/cluster_wal_history.c
 
 test_pgrac_wait_graph.o: $(top_srcdir)/src/include/cluster/cluster_wait_graph.h \
-	$(top_srcdir)/src/include/cluster/cluster_content_trace.h
+	$(top_srcdir)/src/include/cluster/cluster_content_trace.h \
+	$(top_srcdir)/src/include/cluster/cluster_grd.h

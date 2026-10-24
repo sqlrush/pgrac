@@ -50,3 +50,6 @@ clean distclean:
 
 maintainer-clean: clean
 	rm -f lwlocknames.h lwlocknames.c
+
+# Native opt-in diagnostic publisher layout.
+lwlock.o proc.o: $(top_srcdir)/src/include/cluster/cluster_content_trace.h

@@ -461,10 +461,86 @@ UT_TEST(pair_post_cleanup_emit_uses_owned_copy)
 	emitted_rows = CLUSTER_WAIT_TRACE_LIMIT; cluster_content_trace_emit(&guard, &cut);
 	UT_ASSERT_STR_CONTAINS(last, "event=LIMIT");
 }
+UT_TEST(hw_ko_grants_keep_native_identity_and_retire_exactly)
+{
+	ClusterResId hw = {1, 2, 3, 0, 0xf2, 1}, ko = {1, 2, 3, 0, 0xf6, 1};
+	ClusterGrdHolderId holder = {0, 0, 17, 19};
+	reset();
+	cluster_content_trace_enqueue_granted(&hw, &holder, ExclusiveLock);
+	cluster_content_trace_enqueue_granted(&hw, &holder, ExclusiveLock);
+	cluster_content_trace_enqueue_granted(&ko, &holder, ExclusiveLock);
+	cluster_content_trace_error_cleanup();
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.nowners, 1); UT_ASSERT_EQ(cut.owners[0].ngrants, 2);
+	UT_ASSERT_EQ(cut.owners[0].grants[0].holder_request, 19);
+	UT_ASSERT_EQ(cut.owners[0].grants[0].holder_epoch, 17);
+	UT_ASSERT_EQ(cut.owners[0].grants[0].type, 0xf2);
+	UT_ASSERT_EQ(cut.owners[0].grants[0].mode, ExclusiveLock);
+	holder.request_id++;
+	cluster_content_trace_enqueue_releasing(&hw, &holder);
+	UT_ASSERT_EQ(local_owner.ngrants, 2);
+	holder.request_id--;
+	cluster_content_trace_enqueue_releasing(&hw, &holder);
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.owners[0].ngrants, 1);
+	UT_ASSERT_EQ(cut.owners[0].grants[0].type, 0xf6);
+	holder.procno++;
+	cluster_content_trace_enqueue_granted(&hw, &holder, ExclusiveLock);
+	UT_ASSERT_EQ(local_owner.ngrants, 1); /* Never publish another process's hold. */
+}
+UT_TEST(hw_ko_grant_cap_and_missed_release_are_unknown)
+{
+	ClusterResId key = {1, 2, 3, 0, 0xf2, 1};
+	ClusterGrdHolderId holder = {0, 0, 17, 1};
+	reset();
+	for (unsigned i = 0; i <= CLUSTER_CONTENT_TRACE_GRANTS; i++) {
+		holder.request_id = i + 1;
+		cluster_content_trace_enqueue_granted(&key, &holder, ExclusiveLock);
+	}
+	UT_ASSERT_EQ(local_owner.ngrants, CLUSTER_CONTENT_TRACE_GRANTS);
+	UT_ASSERT_EQ(local_owner.omitted_grants, 1);
+	pg_atomic_write_u32(&content_trace->slots[0].busy, 1);
+	holder.request_id = 1;
+	cluster_content_trace_enqueue_releasing(&key, &holder);
+	pg_atomic_write_u32(&content_trace->slots[0].busy, 0);
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.changed, 1); UT_ASSERT_EQ(cut.nowners, 0);
+	cluster_content_trace_lock_changed(&buf(0)->content_lock);
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.owners[0].ngrants, CLUSTER_CONTENT_TRACE_GRANTS - 1);
+	UT_ASSERT_EQ(cut.owners[0].omitted_grants, 1); /* Sticky until process exit/disable. */
+}
+
+UT_TEST(process_start_invalidates_even_identical_reused_native_identity)
+{
+	reset(); hold(0, LW_EXCLUSIVE);
+	cluster_content_trace_lock_changed(&buf(0)->content_lock);
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.nowners, 1);
+	/* Native pid and backendId may both repeat in a recycled PGPROC. */
+	cluster_trace_tx_identity = false;
+	pg_atomic_write_u32(&content_trace->slots[0].busy, 1);
+	cluster_content_trace_process_start(0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&content_trace->slots[0].busy), 1);
+	pg_atomic_write_u32(&content_trace->slots[0].busy, 0);
+	cluster_trace_tx_identity = true;
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.nowners, 0); UT_ASSERT_EQ(cut.changed, 1);
+	MyStartTimestamp++;
+	memset(&local_owner, 0, sizeof(local_owner));
+	cluster_content_trace_lock_changed(&buf(0)->content_lock);
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.nowners, 1); UT_ASSERT_EQ(cut.owners[0].backend_start, 1001);
+	cluster_content_trace_process_start(content_trace->nslots); /* Range check is not assert-only. */
+}
+
 int main(void)
 {
 	cluster_content_trace_shmem_register(); assert(registered && registered->lwlock_count == 0);
-	UT_PLAN(26);
+	UT_PLAN(29);
+	UT_RUN(process_start_invalidates_even_identical_reused_native_identity);
+	UT_RUN(hw_ko_grants_keep_native_identity_and_retire_exactly);
+	UT_RUN(hw_ko_grant_cap_and_missed_release_are_unknown);
 	UT_RUN(actual_content_owner); UT_RUN(exact_tag_and_lock_kind); UT_RUN(release_removes_owner);
 	UT_RUN(all_owner_cut_includes_waiters_without_content_holds);
 	UT_RUN(native_reporter_keeps_exact_space_target_and_mode);

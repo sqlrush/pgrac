@@ -24,3 +24,6 @@ OBJS = \
 	visibilitymap.o
 
 include $(top_srcdir)/src/backend/common.mk
+
+# Native opt-in diagnostic publisher layout.
+hio.o: $(top_srcdir)/src/include/cluster/cluster_content_trace.h

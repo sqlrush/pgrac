@@ -131,6 +131,91 @@ class GraphTests(unittest.TestCase):
             finally:
                 session.close()
 
+    def test_hw_grant_requires_exact_live_identity_and_canonical_master(self):
+        grant = dict(resid=[1,2,3,0,242,1], holder=[1,2,7,101], mode=7)
+        waiter = dict(node=0, pid=10, procno=1, backend_id=2, backend_start=3, locks=[],
+                      enqueue=dict(resid=grant['resid'], holder=[0,1,7,0], request=10,
+                                   wait_seq=20, mode=7, epoch=7))
+        holder = dict(node=1, pid=11, procno=2, backend_id=3, backend_start=4, locks=[],
+                      grants=[grant], omitted_grants=0)
+        snapshots = [dict(node=n, epoch_begin=7, epoch_end=7, owners=[row])
+                     for n,row in enumerate([waiter, holder])]
+        resource = dict(kind='enqueue', node=2, resid=grant['resid'], status=0,
+                        route_known=True, master=2, master_generation=1, shard_phase=0, epoch=7,
+                        members=[dict(kind=1, id=[0,1,7,10], mode=7, wait_seq=20, lock_group=0),
+                                 dict(kind=0, id=[1,2,7,101], mode=7, lock_group=0)])
+        result = graph.build_graph(snapshots, [resource])
+        self.assertEqual(result['edges'][0]['quality'], 'exact_ges_holder')
+        for mutation in ('wrong_request', 'nonmaster', 'unknown_route', 'wrong_epoch', 'non_hw_ko'):
+            changed = graph.json.loads(graph.json.dumps(resource))
+            if mutation == 'wrong_request': changed['members'][1]['id'][3] += 1
+            if mutation == 'nonmaster': changed['master'] = 3
+            if mutation == 'unknown_route': changed['route_known'] = False
+            if mutation == 'wrong_epoch': changed['epoch'] += 1
+            if mutation == 'non_hw_ko':
+                changed['resid'] = [1,2,3,0,1,1]
+                waiter['enqueue']['resid'] = changed['resid']
+                grant['resid'] = changed['resid']
+            result = graph.build_graph(snapshots, [changed])
+            self.assertFalse(any(e['quality'] == 'exact_ges_holder' for e in result['edges']), mutation)
+
+    def test_ges_native_parallel_group_cannot_be_a_blocker(self):
+        resid = [1,2,3,0,242,1]
+        waiter = dict(node=0, pid=10, procno=1, backend_id=2, backend_start=3, locks=[],
+                      enqueue=dict(resid=resid, holder=[0,1,7,0], request=10, epoch=7,
+                                   wait_seq=20, mode=7))
+        holder = dict(node=0, pid=11, procno=2, backend_id=3, backend_start=4, locks=[],
+                      grants=[dict(resid=resid, holder=[0,2,7,101], mode=7)])
+        resource = dict(kind='enqueue', node=2, resid=resid, status=0, epoch=7,
+                        route_known=True, master=2, master_generation=1, shard_phase=0,
+                        members=[dict(kind=1, id=[0,1,7,10], mode=7, wait_seq=20, lock_group=3),
+                                 dict(kind=0, id=[0,2,7,101], mode=7, lock_group=0)])
+        result = graph.build_graph([dict(node=0, epoch_begin=7, epoch_end=7,
+                                         owners=[waiter, holder])], [resource])
+        self.assertEqual(result['edges'], [])
+
+    def test_exact_cross_node_hw_ko_cycle_uses_full_local_grants(self):
+        keys = [[1,2,3,0,242,1], [1,2,3,0,246,1]]
+        owners, resources = [], []
+        for node in range(2):
+            owners.append(dict(node=node, pid=10+node, procno=1, backend_id=2, backend_start=3,
+                               enqueue=dict(resid=keys[node], holder=[node,1,7,0], request=10+node,
+                                            wait_seq=20+node, mode=7, epoch=7),
+                               grants=[dict(resid=keys[1-node], holder=[node,1,7,100+node], mode=7)]))
+            resources.append(dict(kind='enqueue', node=2+node, resid=keys[node], status=0, epoch=7,
+                                  route_known=True, master=2+node, master_generation=0, shard_phase=0,
+                                  members=[dict(kind=1, id=[node,1,7,10+node], mode=7, wait_seq=20+node),
+                                           dict(kind=0, id=[1-node,1,7,101-node], mode=7)]))
+        snapshots = [dict(node=n, epoch_begin=7, epoch_end=7, owners=[owners[n]]) for n in range(2)]
+        result = graph.build_graph(snapshots, resources)
+        self.assertEqual(len(result['cycles']), 1)
+        self.assertTrue(all(e['quality'] == 'exact_ges_holder' for e in result['edges']))
+        owners[1]['grants'][0]['holder'][3] += 1
+        self.assertEqual(graph.build_graph(snapshots, resources)['cycles'], [])
+
+    def test_capture_queries_held_grant_keys_without_an_enqueue_wait(self):
+        resid = [1,2,3,0,242,1]
+        class Reader:
+            def __init__(self, node, directory): self.node = node['node']
+            def query(self, sql, deadline):
+                if sql.endswith('_prepare()'): return 't'
+                if 'pgrac_wg_enqueue(' in sql:
+                    return graph.json.dumps(dict(kind='enqueue', node=self.node, resid=resid, status=1))
+                return graph.json.dumps(dict(node=self.node, epoch_begin=7, epoch_end=7, stats={},
+                    owners=[dict(node=self.node, pid=10+self.node, procno=1, backend_id=2, backend_start=3,
+                                 grants=[dict(resid=resid, holder=[self.node,1,7,101], mode=7)])]))
+            def close(self): pass
+        with tempfile.TemporaryDirectory() as directory, patch.object(graph, 'PsqlReader', Reader):
+            session = graph.CaptureSession([dict(node=n, connstr=str(n)) for n in range(4)],
+                                           Path(directory)/'capture')
+            try:
+                self.assertFalse(session.capture()['complete'])
+                raw = graph.json.loads((session.output/'capture.json').read_text())
+                self.assertEqual(raw['resource_keys'], [['enqueue', resid]])
+                self.assertEqual(len(raw['resources']), 2)
+            finally:
+                session.close()
+
     def test_owned_pipe_reader_frames_split_output_and_passes_native_dbname(self):
         # A real owned pipe process checks the connection argument and emits
         # split stdout chunks; it does not connect to any database.

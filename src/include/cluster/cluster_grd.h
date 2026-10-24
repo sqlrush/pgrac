@@ -1553,6 +1553,9 @@ typedef struct ClusterGrdQueueSnapshot {
 	int nreservations;
 	int copied;
 	int required;
+	int32 master_node;
+	uint32 master_generation, shard_phase;
+	bool route_known;
 } ClusterGrdQueueSnapshot;
 
 typedef enum ClusterGrdQueueObservationStatus {

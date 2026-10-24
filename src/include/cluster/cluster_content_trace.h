@@ -13,6 +13,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #define CLUSTER_CONTENT_TRACE_LOCKS 32
+#define CLUSTER_CONTENT_TRACE_GRANTS 32
 #define CLUSTER_CONTENT_TRACE_OWNERS 8
 #define CLUSTER_CONTENT_TRACE_PAIR_CYCLES 4
 #define CLUSTER_CONTENT_TRACE_PAIR_REQUESTS 2
@@ -77,6 +78,16 @@ typedef struct ClusterContentTraceEnqueue {
 	uint64 request, epoch, wait_seq;
 } ClusterContentTraceEnqueue;
 
+/* Positive native S5 observation, never permission to use/release a grant. */
+typedef struct ClusterContentTraceGrant {
+	uint32 field1, field2, field3;
+	uint16 field4;
+	uint8 type, lockmethodid;
+	uint32 holder_node, holder_procno;
+	uint64 holder_epoch, holder_request;
+	int32 mode;
+} ClusterContentTraceGrant;
+
 typedef struct ClusterContentTracePairCycleData {
 	uint64 invocation, cycle;
 	ClusterContentTraceLock targets[2];
@@ -98,6 +109,8 @@ typedef struct ClusterContentTraceOwner {
 	uint32 npair_cycles;
 	ClusterContentTracePairCycleData pair[CLUSTER_CONTENT_TRACE_PAIR_CYCLES];
 	uint32 nlocks, omitted_locks, wait_mask;
+	uint32 ngrants, omitted_grants;
+	ClusterContentTraceGrant grants[CLUSTER_CONTENT_TRACE_GRANTS];
 	bool native_waiting, enqueue_waiting;
 	ClusterContentTraceLock native_wait;
 	ClusterContentTraceEnqueue enqueue;
@@ -123,6 +136,8 @@ typedef void (*ClusterContentTraceVisitor)(const ClusterContentTraceOwner *owner
 	void *context);
 
 extern void cluster_content_trace_shmem_register(void);
+/* Native PGPROC allocation, before publishing the new PID; also when disabled. */
+extern void cluster_content_trace_process_start(uint32 procno);
 extern void cluster_content_trace_lock_changed(LWLock *lock);
 extern void cluster_content_trace_lock_invalidating(LWLock *lock);
 extern void cluster_content_trace_native_wait_set(LWLock *lock, LWLockMode mode);
@@ -131,6 +146,11 @@ extern void cluster_content_trace_enqueue_wait_set(const struct ClusterResId *re
 	const struct ClusterGrdHolderId *holder, int32 mode, int32 current_mode,
 	bool convert, uint64 request, uint64 epoch, uint64 wait_seq);
 extern void cluster_content_trace_enqueue_wait_clear(void);
+extern void cluster_content_trace_enqueue_granted(const struct ClusterResId *resid,
+	const struct ClusterGrdHolderId *holder, int32 mode);
+extern void cluster_content_trace_enqueue_releasing(const struct ClusterResId *resid,
+	const struct ClusterGrdHolderId *holder);
+
 extern void cluster_content_trace_wait_set(ClusterContentTraceWait kind,
 	const ClusterWaitTrace *wait);
 extern void cluster_content_trace_wait_clear(ClusterContentTraceWait kind);

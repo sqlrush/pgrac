@@ -73,6 +73,15 @@ cluster_content_trace_shmem_register(void)
 	cluster_shmem_register_region(&region);
 }
 
+void
+cluster_content_trace_process_start(uint32 procno)
+{
+	/* Invalidate a prior incarnation even if its PID/backendId are reused.
+	 * Never take busy away from a reader or a previous, interrupted publisher. */
+	if (content_trace != NULL && procno < content_trace->nslots)
+		(void)pg_atomic_fetch_add_u64(&content_trace->slots[procno].revision, 1);
+}
+
 static bool
 content_trace_tag_equal(const BufferTag *a, const BufferTag *b)
 {
@@ -221,6 +230,71 @@ cluster_content_trace_enqueue_wait_set(const ClusterResId *resid,
 	wait->wait_seq = wait_seq;
 	local_owner.enqueue_waiting = true;
 	content_trace_publish(true);
+}
+
+static bool
+content_trace_grant_matches(const ClusterContentTraceGrant *row,
+	const ClusterResId *resid, const ClusterGrdHolderId *holder)
+{
+	return row->field1 == resid->field1 && row->field2 == resid->field2 &&
+		row->field3 == resid->field3 && row->field4 == resid->field4 &&
+		row->type == resid->type && row->lockmethodid == resid->lockmethodid &&
+		row->holder_node == holder->node_id && row->holder_procno == holder->procno &&
+		row->holder_epoch == holder->cluster_epoch && row->holder_request == holder->request_id;
+}
+
+void
+cluster_content_trace_enqueue_granted(const ClusterResId *resid,
+	const ClusterGrdHolderId *holder, int32 mode)
+{
+	ClusterContentTraceGrant *row;
+	uint32 i;
+
+	if (!cluster_trace_tx_identity || resid == NULL || holder == NULL || MyProc == NULL ||
+		holder->node_id != (uint32)cluster_node_id || holder->procno != (uint32)MyProc->pgprocno ||
+		holder->request_id == 0 || holder->cluster_epoch == 0 ||
+		mode < AccessShareLock || mode > AccessExclusiveLock)
+		return;
+	for (i = 0; i < local_owner.ngrants; i++)
+		if (content_trace_grant_matches(&local_owner.grants[i], resid, holder))
+			break;
+	if (i == CLUSTER_CONTENT_TRACE_GRANTS) {
+		/* Identity of omitted rows is unknown. Keep this sticky until process
+		 * exit/trace disable, rather than guess which later release retires it. */
+		if (local_owner.omitted_grants != UINT32_MAX)
+			local_owner.omitted_grants++;
+	} else {
+		if (i == local_owner.ngrants) local_owner.ngrants++;
+		row = &local_owner.grants[i];
+		memset(row, 0, sizeof(*row));
+		row->field1 = resid->field1; row->field2 = resid->field2; row->field3 = resid->field3;
+		row->field4 = resid->field4; row->type = resid->type; row->lockmethodid = resid->lockmethodid;
+		row->holder_node = holder->node_id; row->holder_procno = holder->procno;
+		row->holder_epoch = holder->cluster_epoch; row->holder_request = holder->request_id;
+		row->mode = mode;
+	}
+	content_trace_publish(false);
+}
+
+void
+cluster_content_trace_enqueue_releasing(const ClusterResId *resid,
+	const ClusterGrdHolderId *holder)
+{
+	if (resid == NULL || holder == NULL)
+		return;
+	if (!cluster_trace_tx_identity) {
+		if (local_owner.pid != 0) content_trace_publish(false);
+		return;
+	}
+	for (uint32 i = 0; i < local_owner.ngrants; i++) {
+		if (!content_trace_grant_matches(&local_owner.grants[i], resid, holder)) continue;
+		local_owner.ngrants--;
+		memmove(&local_owner.grants[i], &local_owner.grants[i + 1],
+			(local_owner.ngrants - i) * sizeof(local_owner.grants[0]));
+		memset(&local_owner.grants[local_owner.ngrants], 0, sizeof(local_owner.grants[0]));
+		content_trace_publish(false); /* Invalidate before original S6 can mutate/wait. */
+		return;
+	}
 }
 
 void
@@ -440,6 +514,11 @@ cluster_content_trace_walk(ClusterContentTraceVisitor visitor, void *context,
 	ClusterContentTraceWalkStats *stats)
 {
 	memset(stats, 0, sizeof(*stats));
+#ifdef EXEC_BACKEND
+	/* This build attaches the diagnostic mapping after native PID publication.
+	 * Pre-PID incarnation invalidation is unproved, so return UNKNOWN. */
+	return;
+#endif
 	if (!cluster_trace_tx_identity || content_trace == NULL ||
 		ProcGlobal == NULL || visitor == NULL)
 		return;
@@ -472,6 +551,13 @@ cluster_content_trace_walk(ClusterContentTraceVisitor visitor, void *context,
 			ProcGlobal->allProcs[i].pid != owner.pid ||
 			ProcGlobal->allProcs[i].backendId != owner.backend_id) {
 			stats->dead++;
+			continue;
+		}
+		/* Process allocation invalidates before publishing its native identity.
+		 * Recheck after the census reads so a simultaneous reuse stays UNKNOWN. */
+		pg_read_barrier();
+		if (revision != pg_atomic_read_u64(&slot->revision)) {
+			stats->changed++;
 			continue;
 		}
 		stats->omitted_locks += owner.omitted_locks;

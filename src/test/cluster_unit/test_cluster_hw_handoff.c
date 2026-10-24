@@ -209,6 +209,16 @@ cluster_content_trace_enqueue_wait_clear(void)
 {
 }
 
+void
+cluster_content_trace_enqueue_granted(const ClusterResId *resid pg_attribute_unused(),
+	const ClusterGrdHolderId *holder pg_attribute_unused(), int32 mode pg_attribute_unused())
+{}
+
+void
+cluster_content_trace_enqueue_releasing(const ClusterResId *resid pg_attribute_unused(),
+	const ClusterGrdHolderId *holder pg_attribute_unused())
+{}
+
 /* Real S3/GES/S5, with the KO owner an explicit boundary. Acceptance must
  * arrive before consumption, after both exact promotion/proof checks. */
 uint64

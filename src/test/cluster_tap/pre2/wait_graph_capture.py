@@ -60,13 +60,14 @@ RESOURCE_WAITS = {'BufferContent', 'PcmBlockConvertWait', 'ClusterRelExtendWait'
 
 def build_graph(snapshots, resources):
     """Join copied native identities only; unknown edges remain in the result."""
-    owners, unknown, edges = {}, [], []
+    owners, unknown, edges, epochs = {}, [], [], {}
     for snapshot in snapshots:
         node = snapshot['node']
         stats = snapshot.get('stats', {})
         if snapshot.get('epoch_begin') != snapshot.get('epoch_end'):
             unknown.append(dict(node=node, reason='node_epoch_changed'))
             continue
+        epochs[node] = snapshot.get('epoch_begin')
         for field in ('busy', 'changed', 'dead', 'omitted_locks'):
             if stats.get(field, 0):
                 unknown.append(dict(node=node, reason=field, count=stats[field]))
@@ -83,6 +84,9 @@ def build_graph(snapshots, resources):
                 unknown.append(dict(node=node, reason='owner_changed_or_wrong_node', pid=row.get('pid')))
                 continue
             owners[(node, row['procno'])] = row
+            if row.get('omitted_grants', 0):
+                unknown.append(dict(process=identity(row), reason='omitted_grants',
+                                    count=row['omitted_grants']))
         for proc in snapshot.get('procs', []):
             if proc.get('wait_name') in RESOURCE_WAITS and (node, proc['procno']) not in owners:
                 unknown.append(dict(node=node, pid=proc['pid'], procno=proc['procno'],
@@ -133,12 +137,21 @@ def build_graph(snapshots, resources):
                 for member in resource['members']:
                     if (member['kind'] in (1, 2) and member['id'] == wait['holder'][:3] + [wait['request']]
                             and member['mode'] == wait['mode'] and member['wait_seq'] == wait['wait_seq']):
-                        matches.append(resource)
+                        matches.append((resource, member))
             if len(matches) != 1:
                 unknown.append(dict(process=identity(row), reason='enqueue_master_wait_not_unique', wait=wait))
                 continue
+            master, queued = matches[0]
+            canonical = (master.get('route_known') is True and
+                         master.get('master') == master.get('node') and
+                         isinstance(master.get('master_generation'), int) and
+                         master['master_generation'] >= 0 and master.get('shard_phase') == 0 and
+                         master.get('epoch', 0) == wait.get('epoch', 0) != 0 and
+                         epochs.get(row['node']) == wait.get('epoch') and
+                         wait['holder'][:2] == [row['node'], row['procno']] and
+                         wait['holder'][2] == wait.get('epoch'))
             matched = False
-            for member in matches[0]['members']:
+            for member in master['members']:
                 if member['kind'] != 0 or member['mode'] not in CONFLICTS.get(wait['mode'], set()):
                     continue
                 node, procno, epoch, request = member['id']
@@ -147,21 +160,26 @@ def build_graph(snapshots, resources):
                     unknown.append(dict(process=identity(row), reason='enqueue_holder_process_unmapped', holder=member))
                     continue
                 # The instance epoch is a different namespace from a request ID.
-                holder_snapshot = next(x for x in snapshots if x['node'] == node)
-                if holder_snapshot.get('epoch_begin') != epoch:
+                if epochs.get(node) != epoch:
                     unknown.append(dict(process=identity(row), reason='holder_epoch_mismatch', holder=member))
                     continue
-                if (node, procno) == (row['node'], row['procno']):
+                # Native GRD excludes the same instance's lock group; an
+                # ungrouped holder is its own leader (procno+1).
+                if node == row['node'] and (procno == row['procno'] or
+                        (member.get('lock_group') or procno + 1) ==
+                        (queued.get('lock_group') or row['procno'] + 1)):
                     continue
-                # A current proc slot plus instance epoch does not prove the
-                # retained GRD holder belongs to this backend incarnation. Keep
-                # the candidate outside exact cycle detection until a local
-                # held-enqueue identity publisher supplies that proof.
+                grants = [grant for grant in holder.get('grants', []) if
+                          grant.get('resid') == wait['resid'] and
+                          grant.get('holder') == member['id'] and grant.get('mode') == member['mode']]
+                exact = (canonical and wait['resid'][4] in (0xf2, 0xf6) and
+                         member['mode'] == 7 and len(grants) == 1)
                 add(row, holder, dict(kind='enqueue', resid=wait['resid'],
-                                    master=matches[0]['node'], holder_request=request),
-                    'candidate_ges_process')
-                unknown.append(dict(process=identity(row), reason='enqueue_holder_incarnation_unproven',
-                                    holder=member))
+                                    master=master['node'], holder_request=request),
+                    'exact_ges_holder' if exact else 'candidate_ges_process')
+                if not exact:
+                    unknown.append(dict(process=identity(row), reason='enqueue_holder_identity_or_route_unproven',
+                                        holder=member))
                 matched = True
             if not matched:
                 unknown.append(dict(process=identity(row), reason='enqueue_no_proven_conflicting_holder', wait=wait))
@@ -323,6 +341,8 @@ class CaptureSession:
                         for lock in owner.get('locks', []) + [owner.get('native_wait') or {}, owner.get('pcm_wait') or {}]:
                             if lock.get('tag') is not None:
                                 keys.add(('pcm', tuple(lock['tag'])))
+                        for grant in owner.get('grants', []):
+                            keys.add(('enqueue', tuple(grant['resid'])))
                         if owner.get('enqueue'):
                             keys.add(('enqueue', tuple(owner['enqueue']['resid'])))
                 result['resource_keys'] = [[kind, list(key)] for kind, key in sorted(keys)]
@@ -373,7 +393,7 @@ class CaptureSession:
         graph['observed_edges_resolved'] = graph['complete']
         graph['complete'] = False
         graph['unknown'].append(dict(reason='s2_source_join_qualification_pending',
-                                    sources=['pcm_service', 'ges_holder_incarnation', 'auxiliary', 'tx']))
+                                    sources=['pcm_service', 'other_ges_holder_lifecycles', 'auxiliary', 'tx']))
         if result['errors'] or len(snapshots) != 4:
             graph['complete'] = False
             graph['unknown'].append(dict(reason='capture_incomplete', errors=result['errors']))

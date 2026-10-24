@@ -6082,10 +6082,13 @@ grd_queue_snapshot(const ClusterResId *resid, ClusterGrdQueueSnapshot *out,
 	uint32 shard;
 	int64 total = 0;
 	bool found;
+	uint32 route_initialized;
+	uint64 route_epoch;
 
 	if (out == NULL)
 		return CLUSTER_GRD_QUEUE_INVALID;
 	memset(out, 0, sizeof(*out));
+	out->master_node = -1;
 	if (resid == NULL || capacity < 0 || (capacity > 0 && members == NULL))
 		return CLUSTER_GRD_QUEUE_INVALID;
 	out->resid = *resid;
@@ -6100,6 +6103,13 @@ grd_queue_snapshot(const ClusterResId *resid, ClusterGrdQueueSnapshot *out,
 		grd_slot_area_attach();
 	hash64 = cluster_grd_hash_resource(resid);
 	shard = (uint32)(hash64 % PGRAC_GRD_SHARD_COUNT);
+	/* Counter-free native routing cut. The directory's generation protects
+	 * master moves; the caller also compares the complete repeated cut. */
+	route_epoch = cluster_epoch_get_current();
+	route_initialized = pg_atomic_read_u32(&cluster_grd_state->master_map_initialized);
+	out->master_node = (int32)pg_atomic_read_u32(&cluster_grd_state->master[shard]);
+	out->master_generation = pg_atomic_read_u32(&cluster_grd_state->master_generation[shard]);
+	out->shard_phase = pg_atomic_read_u32(&cluster_grd_state->shard_phase[shard]);
 	if (nowait) {
 		if (!LWLockConditionalAcquire(&cluster_grd_shard_locks[shard].lock, LW_SHARED))
 			return CLUSTER_GRD_QUEUE_BUSY;
@@ -6217,6 +6227,13 @@ grd_queue_snapshot(const ClusterResId *resid, ClusterGrdQueueSnapshot *out,
 done:
 	SpinLockRelease(&entry->lock);
 	LWLockRelease(&cluster_grd_shard_locks[shard].lock);
+	out->route_known = route_epoch != 0 && route_epoch == cluster_epoch_get_current() &&
+		route_initialized == 1 && out->master_node >= 0 && out->master_node < CLUSTER_MAX_NODES &&
+		out->shard_phase == GRD_SHARD_NORMAL &&
+		pg_atomic_read_u32(&cluster_grd_state->master_map_initialized) == route_initialized &&
+		(int32)pg_atomic_read_u32(&cluster_grd_state->master[shard]) == out->master_node &&
+		pg_atomic_read_u32(&cluster_grd_state->master_generation[shard]) == out->master_generation &&
+		pg_atomic_read_u32(&cluster_grd_state->shard_phase[shard]) == out->shard_phase;
 	return status;
 }
 
