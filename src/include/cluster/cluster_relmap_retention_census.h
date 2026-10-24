@@ -169,6 +169,21 @@ extern bool cluster_relmap_retention_census_recovery_prepare_all(
 extern void
 cluster_relmap_retention_census_recovery_batch_release(ClusterRelmapCensusRecoveryBatch **batch);
 
+/* Consume the original prepared set once under the same borrowed lifetimes.
+ * Always clear *batch and free all local custody, including refusal/ERROR.
+ * Missing initial shared-catalog/merger/X ownership leaves observations alone.
+ * Otherwise recheck the whole original ROOT, sources and exact pins before
+ * targets. Revoke physical census/ROOT/directory observations BEFORE the first
+ * native arbiter call; native cold authority and all original pins survive.
+ * Check original ownership/source/origin metadata and every saved pin across
+ * each call. Stop on UNKNOWN/ERROR: earlier target writes may be durable and
+ * must not be rolled back or automatically retried. ERROR propagates.
+ * A valid empty batch performs no target write or observation invalidation.
+ * CLEARED_POSTREAD concerns only these pairs, never directory COMPLETE,
+ * global floor/issued, G_ref/owner completion, pin release or activation. */
+extern ClusterRelmapV2ClearResult cluster_relmap_retention_census_recovery_arbitrate_all(
+	ClusterRelmapCensusRecoveryBatch **batch);
+
 /* Same single-use window and provisional structural result. When either copy
  * retains pending, validate that exact union image through the caller's held
  * original cold WAL scope before rebuilding. Use the pending copy's original

@@ -25,8 +25,11 @@ static ClusterRelmapV2View census_native_pending;
 static ClusterWalInputV1 census_native_sources[2];
 static uint32 census_native_source_count;
 static bool census_native_scope_current;
+static bool census_native_scope_error;
 static bool census_merger_held = true, census_namespace_x = true;
 static unsigned census_arbitrations, census_arbitration_mode;
+static bool census_batch_consuming;
+static unsigned census_arbitration_after, census_arbitration_drift, census_arbitration_drift_after;
 bool cluster_shared_catalog = true;
 
 bool
@@ -47,17 +50,48 @@ cluster_relmap_arbitrate_pending_v2(ClusterRelmapRecoveryHandle **handle,
 									const ClusterRelmapV2View *pending)
 {
 	uint8 digest[32];
+	CensusNativeHandleFixture *selected = NULL;
 
 	census_arbitrations++;
-	UT_ASSERT(handle != NULL
-			  && *handle == (ClusterRelmapRecoveryHandle *)&census_native_handles[0]);
-	UT_ASSERT_EQ(memcmp(identity, &census_native_identity, sizeof(*identity)), 0);
-	UT_ASSERT_EQ(memcmp(pending, &census_native_pending, sizeof(*pending)), 0);
+	for (size_t i = 0; handle != NULL && i < lengthof(census_native_handles); i++)
+		if (*handle == (ClusterRelmapRecoveryHandle *)&census_native_handles[i])
+			selected = &census_native_handles[i];
+	UT_ASSERT(selected != NULL && selected->live);
+	if (selected == NULL)
+		return CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+	UT_ASSERT_EQ(memcmp(identity, &selected->identity, sizeof(*identity)), 0);
+	UT_ASSERT_EQ(memcmp(pending, &selected->pending, sizeof(*pending)), 0);
 	UT_ASSERT(cluster_shared_catalog && census_merger_held && census_namespace_x);
-	UT_ASSERT(cluster_recovery_root_set_digest(census_native_fixture->roots, digest));
+	UT_ASSERT_EQ(cluster_recovery_root_set_digest(census_native_fixture->roots, digest),
+				 !census_batch_consuming);
 	for (unsigned i = 0; i < 2; i++)
-		UT_ASSERT_EQ(census_native_fixture->origin[i].state, CLUSTER_RELMAP_RETENTION_BUILDING);
+		UT_ASSERT_EQ(census_native_fixture->origin[i].state,
+					 census_batch_consuming ? CLUSTER_RELMAP_RETENTION_UNKNOWN
+											: CLUSTER_RELMAP_RETENTION_BUILDING);
 	cluster_relmap_recovery_handle_release_v1(handle);
+	if (census_arbitration_drift != 0 && census_arbitrations == census_arbitration_drift_after) {
+		if (census_arbitration_drift == 1)
+			census_native_scope_current = false;
+		if (census_arbitration_drift == 2)
+			census_native_fixture->origin[1].last_issued++;
+		if (census_arbitration_drift == 3) {
+			census_native_mutated_pin = (ClusterRelmapRetentionPin *)census_pin(
+				&census_native_fixture->origin[0], census_native_handles[0].identity.dbid);
+			UT_ASSERT(census_native_mutated_pin != NULL);
+			if (census_native_mutated_pin != NULL)
+				census_native_mutated_pin->wal_end++;
+		}
+		if (census_arbitration_drift == 4)
+			cluster_shared_catalog = false;
+		if (census_arbitration_drift == 5)
+			census_merger_held = false;
+		if (census_arbitration_drift == 6)
+			census_namespace_x = false;
+		if (census_arbitration_drift == 7)
+			census_native_fixture->origin[0].state = CLUSTER_RELMAP_RETENTION_COMPLETE;
+	}
+	if (census_arbitrations < census_arbitration_after)
+		return CLUSTER_RELMAP_V2_CLEARED_POSTREAD;
 	if (census_arbitration_mode == 2)
 		siglongjmp(*PG_exception_stack, 1);
 	return census_arbitration_mode == 0 ? CLUSTER_RELMAP_V2_CLEARED_POSTREAD
@@ -71,6 +105,8 @@ ClusterControlRootResult
 cluster_wal_inputs_revalidate_v1(ClusterWalInputsV1 *inputs)
 {
 	UT_ASSERT(inputs == (ClusterWalInputsV1 *)&census_inputs_cookie);
+	if (census_native_scope_error)
+		siglongjmp(*PG_exception_stack, 1);
 	return census_native_scope_current ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 }
 
@@ -179,6 +215,9 @@ census_native_reset(CensusFixture *f)
 	census_native_mutated_pin = NULL;
 	memset(census_native_handles, 0, sizeof(census_native_handles));
 	census_arbitrations = census_arbitration_mode = 0;
+	census_batch_consuming = census_native_scope_error = false;
+	census_arbitration_after = census_arbitration_drift_after = 1;
+	census_arbitration_drift = 0;
 	census_merger_held = census_namespace_x = cluster_shared_catalog = true;
 	memset(census_native_sources, 0, sizeof(census_native_sources));
 	for (size_t i = 0; i < lengthof(census_native_sources); i++) {

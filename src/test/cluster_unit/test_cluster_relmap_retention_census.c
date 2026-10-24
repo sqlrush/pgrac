@@ -973,7 +973,14 @@ UT_TEST(test_root_rebuild_preserves_existing_proofs_and_exact_pins)
 int
 main(void)
 {
-	UT_PLAN(44);
+	UT_PLAN(51);
+	UT_RUN(test_census_batch_consume_all_original_namespaces);
+	UT_RUN(test_census_batch_consume_stops_at_first_unknown_or_error);
+	UT_RUN(test_census_batch_consume_missing_ownership_cancels_local_custody_only);
+	UT_RUN(test_census_batch_consume_rechecks_original_whole_root_sources_and_pins);
+	UT_RUN(test_census_batch_consume_post_native_drift_stops_and_never_completes_directory);
+	UT_RUN(test_census_batch_consume_empty_set_does_not_publish_completion);
+	UT_RUN(test_census_batch_consume_preflight_error_releases_every_handle);
 	UT_RUN(test_census_recovery_batch_null_refusal);
 	UT_RUN(test_census_recovery_batch_captures_every_namespace_before_publication);
 	UT_RUN(test_census_recovery_batch_late_native_failure_cleans_every_local_handle);
