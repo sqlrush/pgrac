@@ -39,6 +39,24 @@
 #include "unit_test.h"
 UT_DEFINE_GLOBALS();
 
+/* This allocator fixture never reads terminal CLOG or enters ERROR cleanup.
+ * Keep such calls fatal; the integrated producer adds only native link leaves. */
+volatile uint32 InterruptHoldoffCount;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+void
+pg_re_throw(void)
+{
+	abort();
+}
+XidStatus
+TransactionIdGetStatus(TransactionId xid, XLogRecPtr *lsn)
+{
+	(void)xid;
+	(void)lsn;
+	abort();
+}
+
 bool cluster_enabled, cluster_shared_config, cluster_shared_catalog, cluster_xid_striping;
 int cluster_node_id = 4, cluster_xid_herding_slack = 4194304;
 bool IsUnderPostmaster;

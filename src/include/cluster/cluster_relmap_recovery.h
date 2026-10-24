@@ -6,6 +6,7 @@
 #ifndef CLUSTER_RELMAP_RECOVERY_H
 #define CLUSTER_RELMAP_RECOVERY_H
 #include "access/transam.h"
+#include "access/clog.h"
 #ifdef USE_PGRAC_CLUSTER
 struct ClusterRelmapOwnerSampleV2;
 typedef struct ClusterRelmapRecoveryNativeBounds {
@@ -18,6 +19,17 @@ typedef struct ClusterRelmapRecoveryNativeBounds {
 	uint64 native_floor;
 	uint64 last_issued;
 } ClusterRelmapRecoveryNativeBounds;
+
+/* Current native CLOG fact under its original truncation lock. status is
+ * COMMITTED or ABORTED, derived by the native reader, never supplied by caller.
+ * status_lsn is the native group hint (possibly zero), NOT a durability receipt.
+ * This value does not certify a persisted checkpoint/base or sealed redo. */
+typedef struct ClusterRelmapRecoveryNativeTerminal {
+	ClusterRelmapRecoveryNativeBounds bounds;
+	uint64 top_full_xid;
+	XidStatus status;
+	XLogRecPtr status_lsn;
+} ClusterRelmapRecoveryNativeTerminal;
 
 /* Original allocator, XidGenLock held, AFTER native ProcArray publication.
  * Shared volatile provenance only: no WAL, allocation, lock or ERROR. Never
@@ -35,5 +47,15 @@ extern void cluster_relmap_recovery_issued_publish(FullTransactionId issued);
  * Nonalias refusal clears output. Original input overlap is unchanged. */
 extern bool cluster_relmap_recovery_native_bounds(const struct ClusterRelmapOwnerSampleV2 *owner,
 												  ClusterRelmapRecoveryNativeBounds *out);
+/* Same exact current owner as native_bounds. Native floor/issuance are sampled
+ * while XactTruncationLock spans TransactionIdGetStatus; XidGenLock is released
+ * before native CLOG I/O. Recheck original owner after unlocking; publish last.
+ * IN_PROGRESS/SUB_COMMITTED/unknown refuse. Current native observation only,
+ * not the frozen opaque cold terminal_read or COMPLETE/release permission.
+ * Neither native lock nor XactSLRULock may be held by caller. Nonalias refusal clears output;
+ * original input overlap stays unchanged. Native ERROR propagates unchanged. */
+extern bool
+cluster_relmap_recovery_native_terminal_capture(const struct ClusterRelmapOwnerSampleV2 *owner,
+												ClusterRelmapRecoveryNativeTerminal *out);
 #endif
 #endif
