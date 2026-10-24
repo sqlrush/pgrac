@@ -167,6 +167,26 @@ extern ClusterRelmapV2ClearResult
 cluster_relmap_retention_census_recovery_arbitrate(ClusterRelmapRetentionCensus *census,
 												   struct ClusterWalInputsV1 *inputs, Oid dbid);
 
+/* Dormant original execution-owner single-namespace consumer, after pass-1
+ * read pins are gone. Under original merger/X/shared-catalog ownership, use
+ * prepare_cold and its fresh whole physical ROOT check, then recheck original
+ * source/serial/metadata and every pin before native arbitration. Revoke old
+ * census/ROOT/directory observations BEFORE that first native call; original
+ * native authority/pins survive. Check identical original source/metadata/pins
+ * and ownership after it, without qualifying the now-UNKNOWN directories.
+ *
+ * Missing initial ownership/before DRAINED leaves the scan unconsumed. Every
+ * entered refusal/ERROR invalidates old observations and frees local custody
+ * only. ERROR propagates; prior target writes may already be durable. All pins
+ * remain, with no rollback/retry or scope replacement. CLEARED_POSTREAD means
+ * only this pending pair cleared, never COMPLETE/release, whole-origin/native
+ * qualification, allocator/G_ref/owner completion, D0 discharge or activation.
+ * Fresh physical re-observation into new storage remains the original owner's
+ * responsibility. No old map/set/directory or consumed handle may be reused. */
+extern ClusterRelmapV2ClearResult
+cluster_relmap_retention_census_recovery_arbitrate_cold(ClusterRelmapRetentionCensus *census,
+														Oid dbid);
+
 /* Opaque, local-only preparation of every pending namespace in the original
  * DRAINED physical census, including backup-only pending. No caller namespace
  * list is accepted. Hold original merger claim and namespace X across this

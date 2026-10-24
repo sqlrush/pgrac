@@ -5,6 +5,7 @@
 
 static ClusterRelmapRecoverySourceObservationV1 census_cold_selected;
 static unsigned census_cold_fault, census_cold_reads, census_cold_checks;
+static unsigned census_cold_getter_fault_after = 1;
 
 static void
 census_cold_late_pin(void *buffer, size_t length, off_t offset)
@@ -69,26 +70,28 @@ bool
 cluster_relmap_recovery_handle_source_v1(ClusterRelmapRecoveryHandle *handle,
 										 ClusterRelmapRecoverySourceObservationV1 *out)
 {
+	unsigned fault;
 	UT_ASSERT(handle == (void *)&census_native_handles[0] && census_native_handles[0].live);
 	UT_ASSERT(out != NULL);
 	memset(out, 0, sizeof(*out));
 	census_cold_reads++;
-	if (census_cold_fault == 1)
+	fault = census_cold_reads >= census_cold_getter_fault_after ? census_cold_fault : 0;
+	if (fault == 1)
 		return false;
-	if (census_cold_fault == 2)
+	if (fault == 2)
 		siglongjmp(*PG_exception_stack, 1);
 	*out = census_cold_selected;
-	if (census_cold_fault == 3)
+	if (fault == 3)
 		out->source.claim.identity.system_identifier++;
-	if (census_cold_fault == 4)
+	if (fault == 4)
 		out->source.claim.database_incarnation++;
-	if (census_cold_fault == 5)
+	if (fault == 5)
 		out->source.claim.identity.storage_uuid[0] ^= 1;
-	if (census_cold_fault == 6)
+	if (fault == 6)
 		out->source.claim.identity.origin_node_id++;
-	if (census_cold_fault == 7)
+	if (fault == 7)
 		census_native_scope_current = false;
-	if (census_cold_fault == 18 && census_cold_reads == 2)
+	if (fault == 18 && census_cold_reads == 2)
 		out->scope_serial++;
 	return true;
 }
@@ -112,6 +115,7 @@ static void
 census_cold_reset(void)
 {
 	census_cold_fault = census_cold_reads = census_cold_checks = 0;
+	census_cold_getter_fault_after = 1;
 	namespace_read_transform = NULL;
 }
 

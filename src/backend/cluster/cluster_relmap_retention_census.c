@@ -461,6 +461,85 @@ cluster_relmap_retention_census_recovery_prepare_cold(ClusterRelmapRetentionCens
 	return accepted;
 }
 
+/* After this call revokes physical observations, UNKNOWN is a required state,
+ * never a qualification. Original native authority and every pin stay held. */
+static bool
+census_cold_consumer_current(const ClusterRelmapRetentionCensus *census,
+							 const ClusterRelmapCensusRecovery *input,
+							 const ClusterRelmapRecoverySourceObservationV1 *source,
+							 const uint8 saved_pins[32], ClusterRelmapRetentionState state)
+{
+	uint8 pins[32];
+
+	/* Complete original source/owner I/O before the final local pin check. */
+	if (!census_cold_source_current(census, &input->pending, source))
+		return false;
+	for (size_t i = 0; i < census->origin_count; i++)
+		if (!census_origin_same_in_state(census, census->nodes[i], state))
+			return false;
+	return census_recovery_pins_digest(census, pins) && memcmp(pins, saved_pins, sizeof(pins)) == 0
+		   && cluster_shared_catalog && cluster_recovery_merge_claim_is_held()
+		   && cluster_relmap_authority_x_held();
+}
+
+ClusterRelmapV2ClearResult
+cluster_relmap_retention_census_recovery_arbitrate_cold(ClusterRelmapRetentionCensus *census,
+														Oid dbid)
+{
+	ClusterRelmapRecoveryHandle *volatile handle = NULL;
+	ClusterRelmapV2ClearResult result = CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+
+	if (census == NULL || census->result != CLUSTER_RELMAP_CENSUS_DRAINED || !cluster_shared_catalog
+		|| !cluster_recovery_merge_claim_is_held() || !cluster_relmap_authority_x_held())
+		return result;
+	PG_TRY();
+	{
+		do {
+			ClusterRelmapCensusRecovery input = { 0 };
+			ClusterRelmapRecoverySourceObservationV1 source;
+			uint8 saved_pins[32];
+			ClusterRelmapV2ClearResult native_result;
+
+			if (!census->checked || !census_recovery_current(census)
+				|| !census_recovery_pins_digest(census, saved_pins)
+				|| !cluster_relmap_retention_census_recovery_prepare_cold(census, dbid, &input))
+				break;
+			handle = input.handle;
+			input.handle = NULL;
+			/* Preparation just freshly checked the full physical ROOT after
+			 * native base I/O, within this same original isolated call. */
+			if (!cluster_relmap_recovery_handle_source_v1(handle, &source)
+				|| !census_recovery_current(census)
+				|| !census_cold_consumer_current(census, &input, &source, saved_pins,
+												 CLUSTER_RELMAP_RETENTION_BUILDING))
+				break;
+			/* Native control-ROOT authority is independent of these physical
+			 * observations. Revoke them BEFORE the first arbiter attempt. */
+			census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
+			if (!census_cold_consumer_current(census, &input, &source, saved_pins,
+											  CLUSTER_RELMAP_RETENTION_UNKNOWN))
+				break;
+			native_result = cluster_relmap_arbitrate_pending_v2(
+				(ClusterRelmapRecoveryHandle **)&handle, &input.identity, &input.pending);
+			if (!census_cold_consumer_current(census, &input, &source, saved_pins,
+											  CLUSTER_RELMAP_RETENTION_UNKNOWN))
+				break;
+			if (native_result == CLUSTER_RELMAP_V2_CLEARED_POSTREAD)
+				result = CLUSTER_RELMAP_V2_CLEARED_POSTREAD;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		/* UNKNOWN/ERROR may follow durable target writes; never restore an
+		 * old observation or discharge an original pin from a pair result. */
+		census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
+		if (handle != NULL)
+			cluster_relmap_recovery_handle_release_v1((ClusterRelmapRecoveryHandle **)&handle);
+	}
+	PG_END_TRY();
+	return result;
+}
+
 void
 cluster_relmap_retention_census_recovery_batch_release(ClusterRelmapCensusRecoveryBatch **out)
 {

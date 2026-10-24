@@ -29,6 +29,7 @@ static bool census_native_scope_error;
 static bool census_merger_held = true, census_namespace_x = true;
 static unsigned census_arbitrations, census_arbitration_mode;
 static bool census_batch_consuming;
+static void (*census_native_after_arbitration)(void);
 static unsigned census_arbitration_after, census_arbitration_drift, census_arbitration_drift_after;
 bool cluster_shared_catalog = true;
 
@@ -90,6 +91,8 @@ cluster_relmap_arbitrate_pending_v2(ClusterRelmapRecoveryHandle **handle,
 		if (census_arbitration_drift == 7)
 			census_native_fixture->origin[0].state = CLUSTER_RELMAP_RETENTION_COMPLETE;
 	}
+	if (census_native_after_arbitration != NULL)
+		census_native_after_arbitration();
 	if (census_arbitrations < census_arbitration_after)
 		return CLUSTER_RELMAP_V2_CLEARED_POSTREAD;
 	if (census_arbitration_mode == 2)
@@ -216,6 +219,7 @@ census_native_reset(CensusFixture *f)
 	memset(census_native_handles, 0, sizeof(census_native_handles));
 	census_arbitrations = census_arbitration_mode = 0;
 	census_batch_consuming = census_native_scope_error = false;
+	census_native_after_arbitration = NULL;
 	census_arbitration_after = census_arbitration_drift_after = 1;
 	census_arbitration_drift = 0;
 	census_merger_held = census_namespace_x = cluster_shared_catalog = true;

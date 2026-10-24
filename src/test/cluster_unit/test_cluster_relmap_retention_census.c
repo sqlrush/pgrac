@@ -970,11 +970,19 @@ UT_TEST(test_root_rebuild_preserves_existing_proofs_and_exact_pins)
 #include "test_cluster_relmap_census_recovery.inc"
 #include "test_cluster_relmap_census_batch.inc"
 #include "test_cluster_relmap_census_cold.inc"
+#include "test_cluster_relmap_census_cold_consume.inc"
 
 int
 main(void)
 {
-	UT_PLAN(59);
+	UT_PLAN(66);
+	UT_RUN(test_census_cold_consumer_invalidates_before_original_native_attempt);
+	UT_RUN(test_census_cold_consumer_missing_initial_ownership_keeps_scan_unconsumed);
+	UT_RUN(test_census_cold_consumer_pre_native_refusal_error_never_attempts_target);
+	UT_RUN(test_census_cold_consumer_native_unknown_error_preserve_original_debt);
+	UT_RUN(test_census_cold_consumer_post_native_source_metadata_pins_and_ownership_drift);
+	UT_RUN(test_census_cold_consumer_post_native_error_cannot_restore_observations);
+	UT_RUN(test_census_cold_consumer_cannot_reuse_old_observations_or_infer_empty_completion);
 	UT_RUN(test_census_cold_requires_drained_and_original_ownership);
 	UT_RUN(test_census_cold_selects_original_full_physical_pair_and_retains_all_pins);
 	UT_RUN(test_census_cold_source_scope_refusal_and_error_release_only_local_custody);
