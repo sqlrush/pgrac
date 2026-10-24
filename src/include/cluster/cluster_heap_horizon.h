@@ -130,6 +130,16 @@ typedef enum ClusterHeapFreezeCohortStatus {
 	CLUSTER_HEAP_FREEZE_COHORT_INVALID
 } ClusterHeapFreezeCohortStatus;
 
+/* Same receive publication used by the original fold. Process-local only;
+ * covered is maintenance intent coverage, never freeze permission. */
+typedef struct ClusterHeapFreezeCohortPeerObservation {
+	uint64 recv_at_us;
+	uint32 interval_ms;
+	uint32 generation;
+	uint32 seq;
+	uint64 covered;
+} ClusterHeapFreezeCohortPeerObservation;
+
 /* Read-only observation of the entire admitted cohort, never a freeze or
  * truncation certificate. Producer protection closure is still required
  * before these values may authorize a global floor. F and H use different
@@ -148,6 +158,10 @@ typedef struct ClusterHeapFreezeCohortObservation {
 	/* Original fixed-cohort cut, retained verbatim for the existing current
 	 * getter. Keep unchanged; not a producer-retention certificate. */
 	ClusterSemanticActiveSampleFence admission_fence;
+	uint64 source_local_sample_id;
+	uint64 source_started_at_us;
+	uint32 source_interval_ms;
+	ClusterHeapFreezeCohortPeerObservation source_peers[CLUSTER_MAX_NODES];
 } ClusterHeapFreezeCohortObservation;
 
 /* Bounded reads, fixed required set, current connection/admission rechecks.
@@ -155,6 +169,14 @@ typedef struct ClusterHeapFreezeCohortObservation {
  * remains usable with fresh H; F itself has no age expiry. */
 extern ClusterHeapFreezeCohortStatus
 cluster_heap_freeze_cohort_observe(ClusterHeapFreezeCohortObservation *out);
+
+/* Keep the original observation unchanged. Recheck its completed local sample,
+ * exact peer publications/connections and H age after local identity checks;
+ * never resample N/H or refold reports. Call without page/census locks.
+ * Replacing a source publication invalidates this combined observation; there
+ * is no age expiry on F itself. This still grants no retention/freeze authority. */
+extern ClusterHeapFreezeCohortStatus
+cluster_heap_freeze_cohort_current(const ClusterHeapFreezeCohortObservation *expected);
 
 /*
  * A published, identity-bound candidate from one READY fixed-cohort fold.

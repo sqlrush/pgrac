@@ -95,6 +95,9 @@ static bool policy_sample_current, revoke_on_policy_check;
 static unsigned policy_checks;
 static bool cohort_fence_current, revoke_on_cohort_fence_check, error_cohort_fence;
 static unsigned cohort_fence_checks, policy_checks_at_cohort_fence;
+static unsigned cohort_receipt_checks;
+static ClusterHeapFreezeCohortStatus cohort_receipt_status;
+static bool revoke_on_receipt_check;
 
 static void
 note_cleanup(char event)
@@ -559,6 +562,21 @@ cluster_semantic_activation_active_sample_current(const ClusterSemanticActiveSam
 	return cohort_fence_current;
 }
 
+ClusterHeapFreezeCohortStatus
+cluster_heap_freeze_cohort_current(const ClusterHeapFreezeCohortObservation *expected)
+{
+	if (guard_held || pin_held || content_locked || debt != 1) abort();
+	cohort_receipt_checks++;
+	UT_ASSERT_EQ(memcmp(expected, &cohort_value, sizeof(*expected)), 0);
+	UT_ASSERT(policy_checks > 0);
+	UT_ASSERT_EQ(target_bindings, 0);
+	if (revoke_on_receipt_check) changed_admission = true;
+	if (cohort_receipt_status != CLUSTER_HEAP_FREEZE_COHORT_READY)
+		return cohort_receipt_status;
+	return cluster_semantic_activation_active_sample_current(&expected->admission_fence)
+		? CLUSTER_HEAP_FREEZE_COHORT_READY : CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
+}
+
 #include "test_cluster_vacuum_proof_cleanup.inc"
 
 static void
@@ -625,6 +643,9 @@ reset_fixture(void)
 	cohort_fence_current = true;
 	revoke_on_cohort_fence_check = error_cohort_fence = false;
 	cohort_fence_checks = policy_checks_at_cohort_fence = 0;
+	cohort_receipt_checks = 0;
+	cohort_receipt_status = CLUSTER_HEAP_FREEZE_COHORT_READY;
+	revoke_on_receipt_check = false;
 	enters = leaves = debt = resolves = routes = fail_resolve = 0;
 	reject_admission = reject_route_after = unknown_outcome = false;
 	error_preflight = error_validate = guard_held = false;
@@ -1534,6 +1555,50 @@ UT_TEST(cohort_observation_uses_original_admission_after_local_release)
 	UT_ASSERT_STR_EQ(cleanup_order, "LPA");
 }
 
+UT_TEST(saved_cohort_receipt_checked_before_creation_binding)
+{
+	reset_fixture();
+	set_shared_policy(80);
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(cohort_receipt_checks, 1);
+	UT_ASSERT(vacrel.shared_freeze_cohort_observed);
+	UT_ASSERT_EQ(target_bindings, 1);
+	UT_ASSERT_EQ(debt, 0);
+}
+
+UT_TEST(saved_cohort_receipt_refusals_keep_independent_proof_only)
+{
+	for (int status = CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE; status <= CLUSTER_HEAP_FREEZE_COHORT_INVALID; status++)
+	{
+		reset_fixture();
+		set_shared_policy(80);
+		seed_stale_cohort();
+		cohort_receipt_status = status;
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT_EQ(cohort_receipt_checks, 1);
+		check_no_cohort();
+		UT_ASSERT_EQ(target_bindings, 1);
+		UT_ASSERT(vacrel.shared_freeze_fence_valid);
+		UT_ASSERT_EQ(debt, 0);
+		UT_ASSERT_EQ(leaves, 1);
+	}
+}
+
+UT_TEST(admission_recheck_follows_refused_saved_cohort_receipt)
+{
+	reset_fixture();
+	set_shared_policy(80);
+	seed_stale_cohort();
+	cohort_receipt_status = CLUSTER_HEAP_FREEZE_COHORT_H_STALE;
+	revoke_on_receipt_check = true;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	UT_ASSERT_EQ(cohort_receipt_checks, 1);
+	UT_ASSERT_EQ(target_bindings, 0);
+	check_no_cohort();
+	UT_ASSERT_EQ(debt, 0);
+	UT_ASSERT_EQ(leaves, 1);
+}
+
 UT_TEST(cohort_source_fence_is_rechecked_after_policy_before_binding)
 {
 	reset_fixture();
@@ -1816,7 +1881,7 @@ UT_TEST(next_collection_cannot_reuse_previous_cohort_on_sample_refusal)
 int
 main(void)
 {
-	UT_PLAN(65);
+	UT_PLAN(68);
 	UT_RUN(invalid_input_does_not_leave);
 	UT_RUN(rejected_admission_does_not_leave);
 	UT_RUN(normal_success_leaves_once);
@@ -1866,6 +1931,9 @@ main(void)
 	UT_RUN(creation_binding_runs_after_local_release_before_admission_leave);
 	UT_RUN(rejected_or_cleaned_collection_cannot_reuse_creation_indexes);
 	UT_RUN(cohort_observation_uses_original_admission_after_local_release);
+	UT_RUN(saved_cohort_receipt_checked_before_creation_binding);
+	UT_RUN(saved_cohort_receipt_refusals_keep_independent_proof_only);
+	UT_RUN(admission_recheck_follows_refused_saved_cohort_receipt);
 	UT_RUN(cohort_source_fence_is_rechecked_after_policy_before_binding);
 	UT_RUN(stale_cohort_source_fence_keeps_proof_without_saving_candidate);
 	UT_RUN(admission_change_during_cohort_fence_recheck_precedes_binding);

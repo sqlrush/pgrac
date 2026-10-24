@@ -875,13 +875,7 @@ cluster_heap_freeze_watermark_sample(ClusterHeapFreezeWatermark *out)
 	return false;
 }
 
-typedef struct UndoHorizonV2PeerObservation {
-	uint64 recv_at_us;
-	uint32 interval_ms;
-	uint32 generation;
-	uint32 seq;
-	uint64 covered;
-} UndoHorizonV2PeerObservation;
+typedef ClusterHeapFreezeCohortPeerObservation UndoHorizonV2PeerObservation;
 
 static bool
 undo_horizon_v2_required(const ClusterSemanticActiveSampleFence *fence, int32 peer)
@@ -934,19 +928,17 @@ undo_horizon_v2_observe_peer(int32 peer, const ClusterSemanticActiveSampleFence 
  * H is checked against the END clock, not a pre-lock/pre-traversal clock. */
 static ClusterHeapFreezeCohortStatus
 undo_horizon_v2_cohort_current(const ClusterSemanticActiveSampleFence *fence,
-							   const UndoHorizonV2PeerObservation *peers, TimestampTz started)
+							   const UndoHorizonV2PeerObservation *peers, TimestampTz started,
+							   uint32 source_interval_ms)
 {
-	TimestampTz now = GetCurrentTimestamp();
+	TimestampTz now;
 	uint32 local_ms
 		= Max(CLUSTER_UNDO_HORIZON_INTERVAL_MIN_MS,
 			  Min(cluster_lmon_main_loop_interval, CLUSTER_UNDO_HORIZON_INTERVAL_MAX_MS));
 	int32 peer;
 
-	if (now <= 0 || now < started)
-		return CLUSTER_HEAP_FREEZE_COHORT_H_STALE;
 	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
 		const UndoHorizonV2PeerObservation *p = &peers[peer];
-		uint64 window;
 
 		if (peer == fence->local_node_id || !undo_horizon_v2_required(fence, peer))
 			continue;
@@ -956,6 +948,21 @@ undo_horizon_v2_cohort_current(const ClusterSemanticActiveSampleFence *fence,
 		if (!cluster_sf_peer_capability_generation_matches(
 				peer, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2, p->generation))
 			return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
+	}
+	/* Read the end clock after identity callbacks, including for a single
+	 * local member. This expires the retained H cut, never F by its age. */
+	now = GetCurrentTimestamp();
+	if (now <= 0 || now < started
+		|| (uint64)(now - started)
+			> (uint64)CLUSTER_UNDO_HORIZON_FRESHNESS_FACTOR
+				* Max(source_interval_ms, local_ms) * 1000)
+		return CLUSTER_HEAP_FREEZE_COHORT_H_STALE;
+	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+		const UndoHorizonV2PeerObservation *p = &peers[peer];
+		uint64 window;
+
+		if (peer == fence->local_node_id || !undo_horizon_v2_required(fence, peer))
+			continue;
 		window
 			= (uint64)CLUSTER_UNDO_HORIZON_FRESHNESS_FACTOR * Max(p->interval_ms, local_ms) * 1000;
 		if (p->recv_at_us == 0 || (uint64)now < p->recv_at_us
@@ -974,7 +981,6 @@ undo_horizon_v2_cohort_observe(ClusterHeapFreezeCohortObservation *out,
 	ClusterSemanticActiveSampleFence fence;
 	ClusterUndoCleanerActiveSample active;
 	ClusterUndoRetentionSample history;
-	UndoHorizonV2PeerObservation peers[CLUSTER_MAX_NODES] = { { 0 } };
 	UndoHorizonV2MaintenanceObservation observed = { 0 };
 	ClusterHeapFreezeCohortStatus status;
 	TimestampTz started;
@@ -1008,6 +1014,10 @@ undo_horizon_v2_cohort_observe(ClusterHeapFreezeCohortObservation *out,
 		|| history.horizon_scn == CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED
 		|| scn_time_cmp(history.horizon_scn, history.clock_scn) > 0)
 		return CLUSTER_HEAP_FREEZE_COHORT_INVALID;
+	candidate.source_local_sample_id = active.sample_id;
+	candidate.source_started_at_us = (uint64)started;
+	candidate.source_interval_ms = Max(CLUSTER_UNDO_HORIZON_INTERVAL_MIN_MS,
+		Min(cluster_lmon_main_loop_interval, CLUSTER_UNDO_HORIZON_INTERVAL_MAX_MS));
 	candidate.future_full_xid_max = U64FromFullTransactionId(active.scan.future_full);
 	observed.fence = fence;
 	observed.active_sample_id = active.sample_id;
@@ -1033,12 +1043,13 @@ undo_horizon_v2_cohort_observe(ClusterHeapFreezeCohortObservation *out,
 			return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
 		if (peer == cluster_node_id)
 			continue;
-		status = undo_horizon_v2_observe_peer(peer, &fence, &peers[peer], &candidate);
+		status = undo_horizon_v2_observe_peer(peer, &fence, &candidate.source_peers[peer], &candidate);
 		if (status != CLUSTER_HEAP_FREEZE_COHORT_READY)
 			return status;
-		observed.covered = Min(observed.covered, peers[peer].covered);
+		observed.covered = Min(observed.covered, candidate.source_peers[peer].covered);
 	}
-	status = undo_horizon_v2_cohort_current(&fence, peers, started);
+	status = undo_horizon_v2_cohort_current(&fence, candidate.source_peers, started,
+											  candidate.source_interval_ms);
 	if (status != CLUSTER_HEAP_FREEZE_COHORT_READY)
 		return status;
 	if (!cluster_undo_cleaner_active_sample_current(&active)
@@ -1120,6 +1131,51 @@ ClusterHeapFreezeCohortStatus
 cluster_heap_freeze_cohort_observe(ClusterHeapFreezeCohortObservation *out)
 {
 	return undo_horizon_v2_cohort_observe(out, NULL, NULL);
+}
+
+ClusterHeapFreezeCohortStatus
+cluster_heap_freeze_cohort_current(const ClusterHeapFreezeCohortObservation *expected)
+{
+	ClusterUndoCleanerActiveSample active;
+	const ClusterSemanticActiveSampleFence *fence;
+	int32 peer;
+
+	if (expected == NULL || !cluster_enabled || UndoHorizonShmem == NULL
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| expected->source_local_sample_id == 0 || expected->source_started_at_us == 0
+		|| expected->source_started_at_us > INT64_MAX
+		|| expected->source_interval_ms < CLUSTER_UNDO_HORIZON_INTERVAL_MIN_MS
+		|| expected->source_interval_ms > CLUSTER_UNDO_HORIZON_INTERVAL_MAX_MS)
+		return CLUSTER_HEAP_FREEZE_COHORT_INVALID;
+	fence = &expected->admission_fence;
+	if (fence->local_node_id != cluster_node_id
+		|| !undo_horizon_v2_required(fence, cluster_node_id)
+		|| expected->record_generation != fence->record_generation
+		|| expected->formation_epoch != fence->formation_epoch
+		|| expected->admitted_members_lo != fence->admitted_members_lo
+		|| expected->admitted_members_hi != fence->admitted_members_hi)
+		return CLUSTER_HEAP_FREEZE_COHORT_INVALID;
+	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+		const ClusterHeapFreezeCohortPeerObservation *p = &expected->source_peers[peer];
+
+		if (peer == cluster_node_id || !undo_horizon_v2_required(fence, peer))
+			continue;
+		if (p->seq == 0 || (p->seq & 1) != 0 || p->generation == 0 || p->recv_at_us == 0
+			|| p->interval_ms < CLUSTER_UNDO_HORIZON_INTERVAL_MIN_MS
+			|| p->interval_ms > CLUSTER_UNDO_HORIZON_INTERVAL_MAX_MS)
+			return CLUSTER_HEAP_FREEZE_COHORT_INVALID;
+	}
+	/* This reads the completed publication, not nextXid, PGPROC or H. Its
+	 * original current getter checks lease/admission then the same worker cut. */
+	if (!cluster_undo_cleaner_active_sample(&active))
+		return CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE;
+	if (active.sample_id != expected->source_local_sample_id
+		|| active.scan.status != CTRC_ACTIVE_SCAN_COMPLETE
+		|| memcmp(&active.admission_fence, fence, sizeof(*fence)) != 0
+		|| !cluster_undo_cleaner_active_sample_current(&active))
+		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
+	return undo_horizon_v2_cohort_current(fence, expected->source_peers,
+		(TimestampTz)expected->source_started_at_us, expected->source_interval_ms);
 }
 
 bool

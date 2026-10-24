@@ -100,6 +100,7 @@ static uint32 test_cohort_generations[CLUSTER_MAX_NODES];
 static int32 test_cohort_trigger_peer = -1, test_cohort_changed_peer = -1;
 static int test_cohort_change;
 static int64 test_cohort_clock_shift;
+static int64 test_source_current_clock_shift;
 static unsigned test_maintenance_calls;
 static uint64 test_maintenance_requested;
 static ClusterSemanticActiveSampleFence test_maintenance_identity;
@@ -138,6 +139,8 @@ cluster_undo_cleaner_active_sample_current(const ClusterUndoCleanerActiveSample 
 {
 	if (test_sender_change_on_recheck)
 		test_sender_sample.sample_id++;
+	test_horizon_now += test_source_current_clock_shift;
+	test_source_current_clock_shift = 0;
 	return test_sender_sample_current && expected->sample_id == test_sender_sample.sample_id
 		   && cluster_semantic_activation_active_sample_current(&expected->admission_fence);
 }
@@ -368,6 +371,7 @@ reset_v2_receiver(void)
 	test_cohort_trigger_peer = test_cohort_changed_peer = -1;
 	test_cohort_change = 0;
 	test_cohort_clock_shift = 0;
+	test_source_current_clock_shift = 0;
 	test_v2_source = (ClusterICControlIngress){ .serial = 19,
 												.epoch = 7,
 												.owner_pid = MyProcPid,
@@ -1887,6 +1891,127 @@ UT_TEST(test_v2_cohort_requires_both_mask_halves_and_keeps_domains_separate)
 	UT_ASSERT(cluster_conf_lookup_node(65) == NULL);
 }
 
+UT_TEST(test_v2_cohort_retains_original_publication_receipts)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
+	ClusterHeapFreezeCohortObservation out;
+	cohort_receive(65, report);
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	UT_ASSERT_EQ(out.source_local_sample_id, test_sender_sample.sample_id);
+	UT_ASSERT_EQ(out.source_started_at_us, test_horizon_now);
+	UT_ASSERT_EQ(out.source_interval_ms, 1000);
+	for (unsigned peer = 1; peer <= 65; peer += 64)
+	{
+		UT_ASSERT_EQ(out.source_peers[peer].seq, pg_atomic_read_u32(&test_horizon_store.freeze_slots[peer].seq));
+		UT_ASSERT_EQ(out.source_peers[peer].generation, test_cohort_generations[peer]);
+		UT_ASSERT_EQ(out.source_peers[peer].recv_at_us, test_horizon_store.freeze_slots[peer].view.recv_at_us);
+		UT_ASSERT_EQ(out.source_peers[peer].interval_ms, report.sender_interval_ms);
+	}
+}
+
+UT_TEST(test_v2_saved_cohort_current_does_not_resample_or_expire_f_by_age)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_cohort(false);
+	ClusterHeapFreezeCohortObservation out, saved;
+	unsigned cuts;
+
+	/* Fresh H may still use the same old immutable completed F generation. */
+	test_horizon_now += INT64CONST(86400000000);
+	report.report_sequence++;
+	cohort_receive(1, report);
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	memcpy(&saved, &out, sizeof(saved));
+	cuts = test_retention_sample_calls;
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_current(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	UT_ASSERT_EQ(test_retention_sample_calls, cuts);
+	UT_ASSERT_EQ(out.source_local_sample_id, 17);
+	UT_ASSERT_EQ(memcmp(&out, &saved, sizeof(out)), 0);
+}
+
+UT_TEST(test_v2_saved_cohort_rejects_peer_publish_and_connection_changes)
+{
+	for (unsigned variant = 0; variant < 3; variant++)
+	{
+		ClusterHeapFreezeCohortObservation out, saved;
+		(void)reset_v2_cohort(false);
+		UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
+		memcpy(&saved, &out, sizeof(saved));
+		if (variant < 2)
+			pg_atomic_write_u32(&test_horizon_store.freeze_slots[1].seq, out.source_peers[1].seq + variant + 1);
+		else test_cohort_generations[1]++;
+		UT_ASSERT_EQ(cluster_heap_freeze_cohort_current(&out), variant < 2 ? CLUSTER_HEAP_FREEZE_COHORT_BUSY_PUBLISH : CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED);
+		UT_ASSERT_EQ(memcmp(&out, &saved, sizeof(out)), 0);
+	}
+}
+
+UT_TEST(test_v2_saved_cohort_rejects_replaced_or_revoked_local_source)
+{
+	for (unsigned variant = 0; variant < 4; variant++)
+	{
+		ClusterHeapFreezeCohortObservation out;
+		(void)reset_v2_cohort(false);
+		UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
+		if (variant == 0) test_sender_sample.sample_id++;
+		if (variant == 1) test_sender_sample_current = false;
+		if (variant == 2) test_sender_sample_valid = false;
+		if (variant == 3) test_v2_fence.membership_cut_generation++;
+		UT_ASSERT_EQ(cluster_heap_freeze_cohort_current(&out), variant == 2 ? CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE : CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED);
+	}
+}
+
+UT_TEST(test_v2_saved_cohort_h_age_boundary_and_clock_rollback)
+{
+	ClusterHeapFreezeCohortObservation out;
+	(void)reset_v2_cohort(false);
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	test_horizon_now += 3000000;
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_current(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	test_horizon_now++;
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_current(&out), CLUSTER_HEAP_FREEZE_COHORT_H_STALE);
+	test_horizon_now = out.source_started_at_us - 1;
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_current(&out), CLUSTER_HEAP_FREEZE_COHORT_H_STALE);
+}
+
+UT_TEST(test_v2_saved_single_member_h_expires_without_aging_f)
+{
+	ClusterHeapFreezeCohortObservation out;
+	(void)reset_v2_cohort(false);
+	test_v2_fence.admitted_members_lo = 1;
+	test_v2_fence.admitted_incarnation[1] = 0;
+	test_sender_sample.admission_fence = test_v2_fence;
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	test_horizon_now += 3000001;
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_current(&out), CLUSTER_HEAP_FREEZE_COHORT_H_STALE);
+	UT_ASSERT_EQ(out.source_local_sample_id, test_sender_sample.sample_id);
+}
+
+UT_TEST(test_v2_saved_cohort_checks_end_clock_after_local_source_callbacks)
+{
+	ClusterHeapFreezeCohortObservation out;
+	(void)reset_v2_cohort(false);
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	test_source_current_clock_shift = 3000001;
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_current(&out), CLUSTER_HEAP_FREEZE_COHORT_H_STALE);
+}
+
+UT_TEST(test_v2_saved_cohort_rejects_missing_source_metadata)
+{
+	for (unsigned variant = 0; variant < 6; variant++)
+	{
+		ClusterHeapFreezeCohortObservation out;
+		(void)reset_v2_cohort(false);
+		UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
+		if (variant == 0) out.source_local_sample_id = 0;
+		if (variant == 1) out.source_started_at_us = 0;
+		if (variant == 2) out.source_started_at_us = UINT64_MAX;
+		if (variant == 3) out.source_interval_ms = 0;
+		if (variant == 4) out.source_peers[1].seq = 0;
+		if (variant == 5) out.source_peers[1].interval_ms = 0;
+		UT_ASSERT_EQ(cluster_heap_freeze_cohort_current(&out), CLUSTER_HEAP_FREEZE_COHORT_INVALID);
+	}
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_current(NULL), CLUSTER_HEAP_FREEZE_COHORT_INVALID);
+}
+
 UT_TEST(test_v2_cohort_retains_complete_original_admission_fence)
 {
 	ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
@@ -2322,7 +2447,7 @@ UT_TEST(test_v2_lmon_observes_clock_rollback_as_stale)
 int
 main(void)
 {
-	UT_PLAN(80);
+	UT_PLAN(88);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -2389,6 +2514,14 @@ main(void)
 	UT_RUN(test_v2_lmon_relay_rechecks_admission_before_handoff);
 	UT_RUN(test_v2_lmon_relay_uses_original_cadence_and_no_completion_cache);
 	UT_RUN(test_v2_cohort_missing_members_never_shrink_required_set);
+	UT_RUN(test_v2_cohort_retains_original_publication_receipts);
+	UT_RUN(test_v2_saved_cohort_current_does_not_resample_or_expire_f_by_age);
+	UT_RUN(test_v2_saved_cohort_rejects_peer_publish_and_connection_changes);
+	UT_RUN(test_v2_saved_cohort_rejects_replaced_or_revoked_local_source);
+	UT_RUN(test_v2_saved_cohort_h_age_boundary_and_clock_rollback);
+	UT_RUN(test_v2_saved_single_member_h_expires_without_aging_f);
+	UT_RUN(test_v2_saved_cohort_checks_end_clock_after_local_source_callbacks);
+	UT_RUN(test_v2_saved_cohort_rejects_missing_source_metadata);
 	UT_RUN(test_v2_cohort_retains_complete_original_admission_fence);
 	UT_RUN(test_v2_cohort_retains_same_local_sample_identity_coverage);
 	UT_RUN(test_v2_cohort_h_freshness_does_not_expire_f_sample);

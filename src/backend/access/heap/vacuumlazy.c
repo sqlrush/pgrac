@@ -1921,10 +1921,10 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 			cohort_status = cluster_heap_freeze_cohort_observe(&cohort);
 			policy_current = cohort_status == CLUSTER_HEAP_FREEZE_COHORT_READY
 				&& cluster_heap_freeze_policy_sample_current_v1(&vacrel->cutoffs.SharedFreezePolicySample);
-			/* Preserve and recheck the original full member/incarnation cut,
-			 * then recheck our entered token after this read-only callback. */
+			/* Recheck the same local/peer publications and H end-clock after
+			 * identity callbacks, then recheck our original entered token. */
 			cohort_current = policy_current
-				&& cluster_semantic_activation_active_sample_current(&cohort.admission_fence);
+				&& cluster_heap_freeze_cohort_current(&cohort) == CLUSTER_HEAP_FREEZE_COHORT_READY;
 			if (!cluster_semantic_activation_recheck_r4_terminal_census(&admission))
 				status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
 			else if (cohort_status == CLUSTER_HEAP_FREEZE_COHORT_READY
