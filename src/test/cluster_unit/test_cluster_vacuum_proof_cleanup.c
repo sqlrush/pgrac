@@ -73,6 +73,9 @@ volatile uint32 CritSectionCount;
 static RelationData relation;
 static LVRelState vacrel;
 static unsigned enters, leaves, debt, resolves, routes, target_bindings;
+static unsigned writer_resumes, writer_releases;
+static bool writer_scope_active;
+static bool writer_resume_allowed, writer_resume_error;
 static unsigned fail_resolve;
 static PGAlignedBlock resident_page;
 static unsigned repins, lock_attempts, page_checks, validations;
@@ -312,7 +315,7 @@ cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
 	if (guard_held || !token->entered || token->record_generation != 17 || debt != 1)
 		abort();
 	/* Record a violated ordering so the exact-parent RED can report it. */
-	leave_with_ownership |= pin_held || content_locked;
+	leave_with_ownership |= pin_held || content_locked || writer_scope_active;
 	leaves++;
 	debt--;
 	token->entered = false;
@@ -508,6 +511,23 @@ ReadRecentBuffer(RelFileLocator locator, ForkNumber fork, BlockNumber block, Buf
 }
 
 bool
+ClusterConditionalLockBufferWithMutationContext(Buffer buffer,
+	const struct ResourceXWriterUseContext *expected, uint64 object_revision, bool object_checked)
+{
+	UT_ASSERT(expected == &vacrel.shared_freeze_input.writer_context);
+	UT_ASSERT_EQ(object_revision, vacrel.shared_freeze_input.writer_object_revision);
+	UT_ASSERT_EQ(object_checked, vacrel.shared_freeze_input.writer_object_checked);
+	writer_resumes++;
+	if (writer_resume_error)
+		ereport(ERROR, (errcode(inject_code), errmsg("pre-lock writer resume fixture")));
+	if (!writer_resume_allowed)
+		return false;
+	if (!ConditionalLockBuffer(buffer)) return false;
+	writer_scope_active = true;
+	return true;
+}
+
+bool
 ConditionalLockBuffer(Buffer buffer)
 {
 	if (buffer != 1 || !pin_held || content_locked)
@@ -537,7 +557,7 @@ void
 LWLockRelease(LWLock *lock)
 {
 	if (lock != BufferDescriptorGetContentLock(GetBufferDescriptor(0))
-		|| !pin_held || !content_locked || debt != 1)
+		|| !pin_held || !content_locked || debt != 1 || writer_scope_active)
 		abort();
 	content_locked = false;
 	note_cleanup('L');
@@ -591,6 +611,29 @@ LockBuffer(Buffer buffer, int mode)
 	fixture_lockbuffer_unlock_tail(GetBufferDescriptor(0), mode, false);
 }
 
+/* The paired release body is real; its backend-local ledger is a leaf here
+ * and independently exercised with real ledger bodies in the writer fixture. */
+enum { PCM_X_WRITER_LEDGER_ACTIVE = 3 };
+typedef struct { int phase; } ClusterPcmXWriterLedgerEntry;
+static ClusterPcmXWriterLedgerEntry fixture_writer_entry = { PCM_X_WRITER_LEDGER_ACTIVE };
+static ClusterPcmXWriterLedgerEntry *
+cluster_bufmgr_pcm_x_writer_find(BufferDesc *buf)
+{
+	UT_ASSERT(buf == GetBufferDescriptor(0));
+	return writer_scope_active ? &fixture_writer_entry : NULL;
+}
+static void
+cluster_bufmgr_pcm_x_writer_clear(ClusterPcmXWriterLedgerEntry *entry)
+{
+	UT_ASSERT(entry == &fixture_writer_entry && writer_scope_active);
+	writer_scope_active = false; writer_releases++; note_cleanup('W');
+}
+bool
+LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
+{
+	UT_ASSERT(lock == BufferDescriptorGetContentLock(GetBufferDescriptor(0)));
+	UT_ASSERT_EQ(mode, LW_EXCLUSIVE); return content_locked;
+}
 #include "test_cluster_vacuum_proof_release.inc"
 
 static Page
@@ -780,6 +823,10 @@ cluster_heap_freeze_cohort_current(const ClusterHeapFreezeCohortObservation *exp
 static void
 reset_fixture(void)
 {
+	writer_resumes = writer_releases = 0;
+	writer_scope_active = false;
+	writer_resume_allowed = true;
+	writer_resume_error = false;
 	memset(&relation, 0, sizeof(relation));
 	memset(&vacrel, 0, sizeof(vacrel));
 	memset(&transport_header, 0, sizeof(transport_header));
@@ -2718,10 +2765,70 @@ UT_TEST(positive_target_readiness_change_allows_same_backend_next_attempt)
 	UT_ASSERT_EQ(debt, 0);
 }
 
+UT_TEST(test_original_writer_input_uses_conditional_writer_resume)
+{
+	reset_fixture();
+	vacrel.shared_freeze_input.writer_context_valid = true;
+	/* The physical input now names an original writer use. The actual
+	 * recheck must resume that exact use instead of taking read-only X. */
+	UT_ASSERT(!collect_catches_error());
+	UT_ASSERT_EQ(writer_resumes, 1);
+	UT_ASSERT_EQ(writer_releases, 1);
+	UT_ASSERT(!writer_scope_active && !pin_held && !content_locked && !leave_with_ownership);
+	UT_ASSERT_EQ(generic_unlocks + remote_releases, 0);
+}
+
+UT_TEST(test_refused_original_writer_never_falls_back_to_read_only_x)
+{
+	reset_fixture();
+	vacrel.shared_freeze_input.writer_context_valid = true;
+	writer_resume_allowed = false;
+	UT_ASSERT(!collect_catches_error());
+	UT_ASSERT_EQ(collected_status, CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	UT_ASSERT_EQ(writer_resumes, 1);
+	UT_ASSERT_EQ(lock_attempts + writer_releases + generic_unlocks + remote_releases, 0);
+	UT_ASSERT(!pin_held && !content_locked && !leave_with_ownership);
+	UT_ASSERT_EQ(debt, 0);
+}
+UT_TEST(test_original_writer_error_cancel_cleans_local_scope_before_admission)
+{
+	for (int which = 0; which < 2; which++) {
+		reset_fixture();
+		vacrel.shared_freeze_input.writer_context_valid = true;
+		error_page_check = true;
+		inject_code = which ? ERRCODE_QUERY_CANCELED : ERRCODE_DATA_EXCEPTION;
+		cluster_gcs_block_local_cache = false; remote_release_error = true;
+		UT_ASSERT(collect_catches_error());
+		UT_ASSERT_EQ(caught_code, inject_code);
+		UT_ASSERT_EQ(writer_resumes, 1); UT_ASSERT_EQ(writer_releases, 1);
+		UT_ASSERT_EQ(generic_unlocks + remote_releases, 0);
+		UT_ASSERT(!writer_scope_active && !pin_held && !content_locked && !leave_with_ownership);
+		UT_ASSERT_EQ(debt, 0); UT_ASSERT_EQ(leaves, 1);
+		UT_ASSERT(strstr(cleanup_order, "WLPA") != NULL);
+	}
+}
+
+UT_TEST(test_writer_resume_error_before_lock_still_unpins_before_admission)
+{
+	reset_fixture();
+	vacrel.shared_freeze_input.writer_context_valid = true;
+	writer_resume_error = true; inject_code = ERRCODE_QUERY_CANCELED;
+	UT_ASSERT(collect_catches_error());
+	UT_ASSERT_EQ(caught_code, inject_code);
+	UT_ASSERT_EQ(writer_resumes, 1);
+	UT_ASSERT_EQ(lock_attempts + writer_releases + generic_unlocks + remote_releases, 0);
+	UT_ASSERT(!writer_scope_active && !pin_held && !content_locked && !leave_with_ownership);
+	UT_ASSERT_EQ(debt, 0); UT_ASSERT_EQ(leaves, 1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(100);
+	UT_PLAN(104);
+	UT_RUN(test_writer_resume_error_before_lock_still_unpins_before_admission);
+	UT_RUN(test_refused_original_writer_never_falls_back_to_read_only_x);
+	UT_RUN(test_original_writer_error_cancel_cleans_local_scope_before_admission);
+	UT_RUN(test_original_writer_input_uses_conditional_writer_resume);
 	UT_RUN(positive_candidate_requires_full_target_admission);
 	UT_RUN(positive_candidate_full_target_recheck_uses_original_token_after_clock);
 	UT_RUN(positive_target_recheck_error_and_cancel_use_original_cleanup);

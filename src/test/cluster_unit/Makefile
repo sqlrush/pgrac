@@ -9633,8 +9633,8 @@ test_cluster_vacuum_proof_guard.inc: $(top_srcdir)/src/backend/cluster/cluster_r
 # Keep the parent reproducible: its two native wrappers precede the new pair.
 # The production caller links the new pair when present, so it cannot be stubbed.
 test_cluster_vacuum_proof_release.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
-	awk '/^(ReleaseBuffer|UnlockReleaseBuffer|ClusterUnlockReleaseBufferAfterConditionalRead|ClusterUnlockReleaseBufferAfterConditionalHint)\(/ { print "void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found < 2 || found > 4) exit 1 }' $< > $@.tmp
+	awk '/^(ReleaseBuffer|UnlockReleaseBuffer|ClusterUnlockReleaseBufferAfterConditionalRead|ClusterUnlockReleaseBufferAfterConditionalHint|ClusterUnlockReleaseBufferAfterConditionalMutation)\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found < 2 || found > 5) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Actual generic-unlock cache-off decision; only the remote/mirror leaves vary.
@@ -9952,11 +9952,14 @@ test_cluster_freeze_writer_context.inc: $(top_srcdir)/src/backend/storage/buffer
 	@awk '/^typedef enum ClusterPcmXWriterLedgerPhase/ { emit=1; types++ } \
 	     /^typedef struct ClusterPcmXWriterLedgerEntry/ { emit=1; types++ } \
 	     /^static ClusterPcmXWriterLedgerEntry cluster_bufmgr_pcm_x_writer_ledger\[/ { print; array++ } \
-	     /^cluster_bufmgr_pcm_x_writer_find\(/ { print "static ClusterPcmXWriterLedgerEntry *"; emit=1; find++ } \
+	     /^cluster_bufmgr_pcm_x_writer_(find|free_entry)\(/ { print "static ClusterPcmXWriterLedgerEntry *"; emit=1; find++ } \
 	     /^cluster_bufmgr_pcm_x_writer_entry_exact\(/ { print "static bool"; emit=1; exact++ } \
 	     /^ClusterBuffer(CaptureMutationContext|MutationContextMatches)\(/ { print "bool"; emit=1; capture++ } \
+	     /^ClusterConditionalLockBufferWithMutationContext\(/ { print "bool"; emit=1; resume++ } \
+	     /^ClusterUnlockReleaseBufferAfterConditionalMutation\(/ { print "void"; emit=1; cleanup++ } \
+	     /^cluster_bufmgr_pcm_x_writer_(clear|object_sample)\(/ { print "static void"; emit=1; cleanup++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (types != 2 || array != 1 || find != 1 || exact != 1 || capture != 2) exit 1 }' $< > $@.tmp
+	     END { if (types != 2 || array != 1 || find != 2 || exact != 1 || capture != 2 || resume != 1 || cleanup != 3) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_freeze_writer_context: test_cluster_freeze_writer_context.c unit_test.h \
@@ -9965,6 +9968,9 @@ test_cluster_freeze_writer_context: test_cluster_freeze_writer_context.c unit_te
 		$(top_srcdir)/src/include/storage/buf_internals.h \
 		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h \
 		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
-		$(top_srcdir)/src/include/cluster/cluster_pcm_own.h
+		$(top_srcdir)/src/include/cluster/cluster_pcm_own.h \
+		$(top_srcdir)/src/include/cluster/cluster_ko.h \
+		$(top_srcdir)/src/include/cluster/cluster_ic.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_smgr.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@

@@ -15567,7 +15567,8 @@ ClusterBufferHasSharedPin(Buffer buffer)
  * already hold its pin and native content-X; descriptor residency, local-X
  * alone and a cached node-level X cannot manufacture a writer ledger. */
 bool
-ClusterBufferCaptureMutationContext(Buffer buffer, struct ResourceXWriterUseContext *out)
+ClusterBufferCaptureMutationContext(Buffer buffer, struct ResourceXWriterUseContext *out,
+	uint64 *object_revision, bool *object_checked)
 {
 #ifdef USE_PGRAC_CLUSTER
 	BufferDesc *buf;
@@ -15575,7 +15576,8 @@ ClusterBufferCaptureMutationContext(Buffer buffer, struct ResourceXWriterUseCont
 	uint64 generation, epoch;
 	uint8 state;
 
-	if (out == NULL || !ClusterBufferHasSharedPin(buffer))
+	if (out == NULL || object_revision == NULL || object_checked == NULL
+		|| !ClusterBufferHasSharedPin(buffer))
 		return false;
 	buf = GetBufferDescriptor(buffer - 1);
 	if (!LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE))
@@ -15591,6 +15593,8 @@ ClusterBufferCaptureMutationContext(Buffer buffer, struct ResourceXWriterUseCont
 		|| epoch == 0 || state != (uint8) PCM_STATE_X)
 		return false;
 	*out = entry->authority;
+	*object_revision = entry->object_revision;
+	*object_checked = entry->object_checked;
 	return true;
 #else
 	return false;
@@ -15598,12 +15602,16 @@ ClusterBufferCaptureMutationContext(Buffer buffer, struct ResourceXWriterUseCont
 }
 
 bool
-ClusterBufferMutationContextMatches(Buffer buffer, const struct ResourceXWriterUseContext *expected)
+ClusterBufferMutationContextMatches(Buffer buffer, const struct ResourceXWriterUseContext *expected,
+	uint64 object_revision, bool object_checked)
 {
 #ifdef USE_PGRAC_CLUSTER
 	ResourceXWriterUseContext current;
+	uint64 current_object_revision;
+	bool current_object_checked;
 
-	if (expected == NULL || !ClusterBufferCaptureMutationContext(buffer, &current))
+	if (expected == NULL || !ClusterBufferCaptureMutationContext(buffer, &current,
+			&current_object_revision, &current_object_checked))
 		return false;
 	/* Compare logical fields, never C struct padding. */
 	return resource_x_assertion_equal(&current.ref.assertion, &expected->ref.assertion)
@@ -15612,9 +15620,98 @@ ClusterBufferMutationContextMatches(Buffer buffer, const struct ResourceXWriterU
 		&& current.r4_record_generation == expected->r4_record_generation
 		&& current.buffer_ownership_generation == expected->buffer_ownership_generation
 		&& current.writer_activation_token == expected->writer_activation_token
-		&& current.resource_x_activation_generation == expected->resource_x_activation_generation;
+		&& current.resource_x_activation_generation == expected->resource_x_activation_generation
+		&& current_object_revision == object_revision
+		&& current_object_checked == object_checked;
 #else
 	return false;
+#endif
+}
+
+/* Continue a previously captured post-T3 use without acquiring current again.
+ * Sample object admission before content-X. The provisional backend-local
+ * ledger is never exposed to a mutator before the original full writer check;
+ * refusal/ERROR removes only this scope and leaves the caller's pin intact. */
+bool
+ClusterConditionalLockBufferWithMutationContext(Buffer buffer,
+	const struct ResourceXWriterUseContext *expected,
+	uint64 object_revision, bool object_checked)
+{
+#ifdef USE_PGRAC_CLUSTER
+	BufferDesc *buf;
+	ClusterPcmXWriterLedgerEntry prepared;
+	ClusterPcmXWriterLedgerEntry *entry;
+	volatile bool bound = false;
+	volatile bool resumed = false;
+
+	if (expected == NULL || !ClusterBufferHasSharedPin(buffer))
+		return false;
+	buf = GetBufferDescriptor(buffer - 1);
+	if (LWLockHeldByMe(BufferDescriptorGetContentLock(buf))
+		|| cluster_bufmgr_pcm_x_writer_find(buf) != NULL
+		|| (entry = cluster_bufmgr_pcm_x_writer_free_entry()) == NULL)
+		return false;
+	MemSet(&prepared, 0, sizeof(prepared));
+	prepared.phase = PCM_X_WRITER_LEDGER_ACTIVE;
+	prepared.buffer_id = buf->buf_id;
+	prepared.content_lock = BufferDescriptorGetContentLock(buf);
+	prepared.authority = *expected;
+	if (cluster_bufmgr_pcm_own_snapshot(buf, &prepared.granted) != CLUSTER_PCM_OWN_OK
+		|| !cluster_bufmgr_pcm_x_writer_entry_exact(&prepared, buf))
+		return false;
+	cluster_bufmgr_pcm_x_writer_object_sample(&prepared);
+	/* A current sample may only validate the original object cut. It must
+	 * never refresh an older proof into a newly admitted incarnation. */
+	if (prepared.object_checked != object_checked
+		|| prepared.object_revision != object_revision)
+		return false;
+
+	PG_TRY();
+	{
+		if (ConditionalLockBuffer(buffer))
+		{
+			*entry = prepared;
+			bound = true;
+			resumed = ClusterBufferMutationContextMatches(buffer, expected,
+				object_revision, object_checked);
+		}
+	}
+	PG_FINALLY();
+	{
+		if (!resumed)
+		{
+			if (bound)
+				cluster_bufmgr_pcm_x_writer_clear(entry);
+			/* Also unwind an ERROR raised inside the local conditional lock
+			 * before it returned. No lock was held at this scope's entry. */
+			if (LWLockHeldByMeInMode(prepared.content_lock, LW_EXCLUSIVE))
+				LWLockRelease(prepared.content_lock);
+		}
+	}
+	PG_END_TRY();
+	return resumed;
+#else
+	return false;
+#endif
+}
+
+/* This scope owns only the restored local use, content-X and original pin.
+ * The retained node-level T3 remains with its normal owner/revoker lifecycle;
+ * generic cache-off PCM release must not intervene in ERROR/cancel cleanup. */
+void
+ClusterUnlockReleaseBufferAfterConditionalMutation(Buffer buffer)
+{
+#ifdef USE_PGRAC_CLUSTER
+	BufferDesc *buf = GetBufferDescriptor(buffer - 1);
+	ClusterPcmXWriterLedgerEntry *entry = cluster_bufmgr_pcm_x_writer_find(buf);
+
+	Assert(entry != NULL && entry->phase == PCM_X_WRITER_LEDGER_ACTIVE);
+	Assert(LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE));
+	cluster_bufmgr_pcm_x_writer_clear(entry);
+	LWLockRelease(BufferDescriptorGetContentLock(buf));
+	ReleaseBuffer(buffer);
+#else
+	Assert(false);
 #endif
 }
 

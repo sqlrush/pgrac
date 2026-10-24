@@ -20799,7 +20799,8 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 		|| !input->writer_context_valid
 		|| input->writer_context.r4_record_generation != admission->record_generation
 		|| input->writer_context.buffer_ownership_generation != own_generation
-		|| !ClusterBufferMutationContextMatches(buffer, &input->writer_context)
+		|| !ClusterBufferMutationContextMatches(buffer, &input->writer_context,
+			input->writer_object_revision, input->writer_object_checked)
 		|| !cluster_pcm_lock_r4_route_snapshot(tag, &authority_now,
 			&master_sequence, &page_version)
 		|| authority_now.transition_count != fence->holder_sequence

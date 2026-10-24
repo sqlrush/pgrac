@@ -34,6 +34,8 @@ typedef struct ClusterHeapFreezePageInputV1
 	/* Original post-T3 use context only; never a fresh grant or F/H proof. */
 	bool writer_context_valid;
 	ResourceXWriterUseContext writer_context;
+	uint64 writer_object_revision;
+	bool writer_object_checked;
 	PGAlignedBlock image;
 } ClusterHeapFreezePageInputV1;
 

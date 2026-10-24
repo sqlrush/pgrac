@@ -234,10 +234,13 @@ lazy_clear_visibility_versioned(Relation rel, const ClusterSpaceIdentity *identi
 
 /* Existing scan locks are controlled leaves, never Resource-X writer grants. */
 bool
-ClusterBufferCaptureMutationContext(Buffer buffer, ResourceXWriterUseContext *out)
+ClusterBufferCaptureMutationContext(Buffer buffer, ResourceXWriterUseContext *out,
+	uint64 *object_revision, bool *object_checked)
 {
 	(void) buffer;
 	(void) out;
+	(void) object_revision;
+	(void) object_checked;
 	UT_ASSERT(fixture_locks > 0);
 	return false;
 }

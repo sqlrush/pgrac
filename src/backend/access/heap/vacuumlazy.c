@@ -1599,7 +1599,9 @@ lazy_validate_shared_freeze(LVRelState *vacrel, Page page, BlockNumber blkno, Bu
 			 * SHARE/conditional read-only X cannot create this context. */
 			vacrel->shared_freeze_input.writer_context_valid =
 				ClusterBufferCaptureMutationContext(buffer,
-					&vacrel->shared_freeze_input.writer_context);
+					&vacrel->shared_freeze_input.writer_context,
+					&vacrel->shared_freeze_input.writer_object_revision,
+					&vacrel->shared_freeze_input.writer_object_checked);
 			break;
 		case CLUSTER_HEAP_FREEZE_PAGE_CHANGED:
 			vacrel->shared_freeze_input.writer_context_valid = false;
@@ -1766,6 +1768,7 @@ lazy_recheck_shared_freeze_page(LVRelState *vacrel, Buffer recent_buffer,
 	ClusterHeapFreezeProofStatusV1 status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
 	volatile bool locked = false;
 	volatile bool hint_scope = false;
+	volatile bool writer_scope = false;
 
 	*cleaned = false;
 	if (recent_buffer <= InvalidBuffer || !vacrel->rel->rd_isvalid
@@ -1784,7 +1787,16 @@ lazy_recheck_shared_freeze_page(LVRelState *vacrel, Buffer recent_buffer,
 		bool authority_current,
 			admission_current;
 
-		if (!ConditionalLockBuffer(recent_buffer))
+		if (vacrel->shared_freeze_input.writer_context_valid)
+		{
+			if (!ClusterConditionalLockBufferWithMutationContext(recent_buffer,
+					&vacrel->shared_freeze_input.writer_context,
+					vacrel->shared_freeze_input.writer_object_revision,
+					vacrel->shared_freeze_input.writer_object_checked))
+				goto recheck_done;
+			writer_scope = true;
+		}
+		else if (!ConditionalLockBuffer(recent_buffer))
 			goto recheck_done;
 		locked = true;
 		page = BufferGetPage(recent_buffer);
@@ -1853,7 +1865,9 @@ recheck_done:;
 	{
 		if (locked)
 		{
-			if (hint_scope)
+			if (writer_scope)
+				ClusterUnlockReleaseBufferAfterConditionalMutation(recent_buffer);
+			else if (hint_scope)
 				ClusterUnlockReleaseBufferAfterConditionalHint(recent_buffer);
 			else
 				ClusterUnlockReleaseBufferAfterConditionalRead(recent_buffer);

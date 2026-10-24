@@ -90,6 +90,8 @@ cluster_heap_freeze_capture_page_v1(const ClusterSpaceIdentity *identity,
 	out->normal_tuples = normal;
 	out->multi_tuples = multi;
 	out->writer_context_valid = false;
+	out->writer_object_revision = 0;
+	out->writer_object_checked = false;
 	memset(&out->writer_context, 0, sizeof(out->writer_context));
 	memcpy(out->image.data, page, BLCKSZ);
 	return true;

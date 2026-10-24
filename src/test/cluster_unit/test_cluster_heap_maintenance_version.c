@@ -128,12 +128,15 @@ LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
 }
 static ResourceXWriterUseContext original_writer_context;
 bool
-ClusterBufferCaptureMutationContext(Buffer buffer, ResourceXWriterUseContext *out)
+ClusterBufferCaptureMutationContext(Buffer buffer, ResourceXWriterUseContext *out,
+	uint64 *object_revision, bool *object_checked)
 {
 	UT_ASSERT_EQ(buffer, 1);
 	if (!writer_current || !local_x || backend_pin_count <= 0)
 		return false;
 	*out = original_writer_context;
+	*object_revision = 7;
+	*object_checked = true;
 	return true;
 }
 #include "test_cluster_heap_writer_context_match.inc"
@@ -875,6 +878,8 @@ qualified_xmin_setup(QualifiedXminFixture *f, uint16 xmax_mask)
 	original_writer_context.buffer_ownership_generation = 14;
 	f->input.writer_context = original_writer_context;
 	f->input.writer_context_valid = true;
+	f->input.writer_object_revision = 7;
+	f->input.writer_object_checked = true;
 	UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&f->input, &f->page));
 	UT_ASSERT_EQ(f->page.carrier_request_count, 1);
 	f->fence = (ClusterHeapFreezeFinalFenceV1){
@@ -946,6 +951,8 @@ qualified_xmin_batch_setup(QualifiedXminFixture *f,
 		current_page.data, &f->input));
 	f->input.writer_context = original_writer_context;
 	f->input.writer_context_valid = true;
+	f->input.writer_object_revision = 7;
+	f->input.writer_object_checked = true;
 	UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&f->input, &f->page));
 	UT_ASSERT_EQ(f->page.carrier_request_count, 3);
 	f->proofs.proof_count = 3;
@@ -1917,6 +1924,8 @@ UT_TEST(test_page_recapture_drops_original_writer_context)
 	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&space_identity, 7,
 		current_page.data, &f.input));
 	UT_ASSERT(!f.input.writer_context_valid);
+	UT_ASSERT_EQ(f.input.writer_object_revision, 0);
+	UT_ASSERT(!f.input.writer_object_checked);
 	UT_ASSERT(memcmp(&f.input.writer_context, &zero, sizeof(zero)) == 0);
 	UT_ASSERT(!qualified_xmin_apply(&f, 0));
 	UT_ASSERT_EQ(inserts + dirties + flushes + full_target_checks, 0);
@@ -1932,10 +1941,28 @@ UT_TEST(test_xmin_batch_rejects_replacement_original_writer_before_wal)
 	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
 }
 
+UT_TEST(test_xmin_single_batch_keep_original_writer_object_fence)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	for (int batch = 0; batch < 2; batch++)
+		for (int which = 0; which < 2; which++) {
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			if (which) f.input.writer_object_checked = false;
+			else f.input.writer_object_revision++;
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3)
+				: qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(inserts + dirties + flushes + full_target_checks, 0);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+}
+
 int
 main(void)
 {
-	UT_PLAN(48);
+	UT_PLAN(49);
+	UT_RUN(test_xmin_single_batch_keep_original_writer_object_fence);
 	UT_RUN(test_page_recapture_drops_original_writer_context);
 	UT_RUN(test_xmin_batch_rejects_replacement_original_writer_before_wal);
 	UT_RUN(test_xmin_apply_requires_original_writer_context_before_wal);

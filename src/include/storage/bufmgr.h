@@ -376,9 +376,18 @@ struct ResourceXWriterUseContext;
 /* Borrow the original ACTIVE writer while its native content-X is held.
  * Refusal preserves out; neither entry point fetches/grants current. */
 extern bool ClusterBufferCaptureMutationContext(
-	Buffer buffer, struct ResourceXWriterUseContext *out);
+	Buffer buffer, struct ResourceXWriterUseContext *out,
+	uint64 *object_revision, bool *object_checked);
 extern bool ClusterBufferMutationContextMatches(
-	Buffer buffer, const struct ResourceXWriterUseContext *expected);
+	Buffer buffer, const struct ResourceXWriterUseContext *expected,
+	uint64 object_revision, bool object_checked);
+/* Resume only the original retained T3 use; failure leaves the borrowed pin,
+ * no ledger or content lock, with no current acquisition or remote wait. */
+extern bool ClusterConditionalLockBufferWithMutationContext(
+	Buffer buffer, const struct ResourceXWriterUseContext *expected,
+	uint64 object_revision, bool object_checked);
+/* Pair only a successful conditional writer resume; local unlock/unpin only. */
+extern void ClusterUnlockReleaseBufferAfterConditionalMutation(Buffer buffer);
 /* Read-only successful ConditionalLockBuffer() only; no PCM writer cleanup. */
 extern void ClusterUnlockReleaseBufferAfterConditionalRead(Buffer buffer);
 /* Conditional local X plus cluster_space_hint_begin/finish() publication only. */
