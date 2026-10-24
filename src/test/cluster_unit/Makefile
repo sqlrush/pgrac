@@ -8341,14 +8341,16 @@ check_ctrc_source_census:
 
 $(CLUSTER_CTRC_TEST_O): \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
-		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_itl.h \
+		$(top_srcdir)/src/include/cluster/cluster_itl_slot.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		-DCLUSTER_CTRC_UNIT_TEST=1 \
 		-c $< -o $@
 
 test_cluster_ctrc_terminal_image.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
 	awk '/^ctrc_cleaner_clean_itl_receipt\(/ { in_cleaner=1 } \
-	     in_cleaner && /^\tapply_result = cluster_ctrc_itl_cleanout_slot\(/ { emit=1; found++ } \
+	     in_cleaner && /^\tapply_result = cluster_ctrc_itl_cleanout_image_v1\(/ { emit=1; found++ } \
 	     emit { print } emit && /^\tcleanout_lsn = GenericXLogFinish/ { emit=0; complete++ } \
 	     /^}/ { in_cleaner=0 } END { if (found != 1 || complete != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@

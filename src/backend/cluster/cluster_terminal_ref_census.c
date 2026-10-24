@@ -24,6 +24,7 @@
 #include "../../common/sha2_int.h"
 
 #include "catalog/pg_tablespace_d.h"
+#include "cluster/cluster_itl.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/storage/cluster_undo_alloc.h"
@@ -48,7 +49,6 @@
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_space_storage.h"
-#include "cluster/cluster_itl.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_mxid_stripe.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
@@ -1060,6 +1060,52 @@ cluster_ctrc_itl_cleanout_slot(const ClusterCtrcTxnKeyV1 *key, const ClusterCtrc
 	slot->commit_scn = InvalidScn;
 	slot->flags = aborted_flag;
 	return CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN;
+}
+
+/* Calculate only the private image. Page custody, original terminal evidence,
+ * WAL durability and reference discharge remain the executing owner's work. */
+ClusterCtrcItlCleanoutApplyResult
+cluster_ctrc_itl_cleanout_image_v1(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcTargetV1 *target, ClusterCtrcTerminalStatus terminal_status,
+	SCN commit_scn, const char *before_image, char *after_image)
+{
+	PGAlignedBlock image;
+	Page page;
+	PageHeader header;
+	ClusterItlSlotData *slot;
+	ClusterCtrcItlCleanoutApplyResult result;
+	uintptr_t distance;
+
+	if (before_image == NULL || after_image == NULL || target == NULL)
+		return CLUSTER_CTRC_ITL_CLEANOUT_RETAIN;
+	distance = (uintptr_t)before_image > (uintptr_t)after_image
+		? (uintptr_t)before_image - (uintptr_t)after_image
+		: (uintptr_t)after_image - (uintptr_t)before_image;
+	if (before_image != after_image && distance < BLCKSZ)
+		return CLUSTER_CTRC_ITL_CLEANOUT_RETAIN;
+	/* The ordinary cleaner already owns a private GenericXLog image. Keep
+	 * that in-place path free of an additional full-page copy. */
+	page = before_image == after_image ? (Page)after_image : (Page)image.data;
+	if (page != before_image)
+		memcpy(page, before_image, BLCKSZ);
+	header = (PageHeader)page;
+	if (PageIsNew(page) || !PageHasItl(page) || PageGetPageSize(page) != BLCKSZ
+		|| PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION
+		|| header->pd_lower < SizeOfPageHeaderData || header->pd_lower > header->pd_upper
+		|| header->pd_upper > header->pd_special
+		|| header->pd_special != BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE
+		|| (header->pd_lower - SizeOfPageHeaderData) % sizeof(ItemIdData) != 0
+		|| target->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT)
+		return CLUSTER_CTRC_ITL_CLEANOUT_RETAIN;
+	slot = &ClusterPageGetItlSlots(page)[target->itl_slot_index];
+	result = cluster_ctrc_itl_cleanout_slot(key, target, terminal_status, commit_scn, slot);
+	if (result == CLUSTER_CTRC_ITL_CLEANOUT_RETAIN)
+		return result;
+	if (target->itl_class == 2 && cluster_itl_clear_terminal_lock_refs(page, slot) != 0)
+		result = CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN;
+	if (after_image != page)
+		memcpy(after_image, page, BLCKSZ);
+	return result;
 }
 
 static bool
@@ -8587,17 +8633,13 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	}
 	xlog_state = GenericXLogStartInternal(receipt->target.needs_wal, GENERIC_XLOG_CTRC_ITL);
 	image = GenericXLogRegisterBufferVersioned(xlog_state, buffer, 0, &space_identity);
-	apply_result = cluster_ctrc_itl_cleanout_slot(
-		&receipt->key, &receipt->target, terminal_status, commit_scn,
-		&ClusterPageGetItlSlots(image)[receipt->target.itl_slot_index]);
+	apply_result = cluster_ctrc_itl_cleanout_image_v1(
+		&receipt->key, &receipt->target, terminal_status, commit_scn, image, image);
 	if (apply_result == CLUSTER_CTRC_ITL_CLEANOUT_RETAIN) {
 		GenericXLogAbort(xlog_state);
 		retain_stage = "SLOT_REVALIDATE";
 		goto itl_retain_locked;
 	}
-	if (receipt->target.itl_class == 2)
-		(void)cluster_itl_clear_terminal_lock_refs(
-			image, &ClusterPageGetItlSlots(image)[receipt->target.itl_slot_index]);
 	cleanout_lsn = GenericXLogFinish(xlog_state);
 	UnlockReleaseBuffer(buffer);
 	cluster_semantic_activation_leave(&admission);

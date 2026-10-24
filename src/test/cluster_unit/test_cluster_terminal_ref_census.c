@@ -1549,6 +1549,101 @@ UT_TEST(test_real_cleaner_terminal_image_closes_plain_lock_reference)
 	}
 }
 
+/* M5-E 7.5: ordinary and recovery owners need the same complete, private
+ * ITL image calculation. Computing an image is not page or release authority. */
+UT_TEST(test_ctrc_itl_image_calculation_preserves_input_and_replays_exactly)
+{
+	for (unsigned leg = 0; leg < 4; leg++) {
+		PGAlignedBlock before = { 0 }, saved, after, repeated;
+		Page page = (Page)before.data;
+		PageHeader header = (PageHeader)page;
+		ClusterCtrcTxnKeyV1 key = test_key();
+		ClusterCtrcTargetV1 target = test_exact_itl_target();
+		ClusterCtrcTerminalStatus status = leg & 1 ? CTRC_TERMINAL_ABORTED : CTRC_TERMINAL_COMMITTED;
+		SCN scn = leg & 1 ? InvalidScn : 900;
+		ClusterItlSlotData *slot;
+		HeapTupleHeader tuple;
+		uint8 expected_flags;
+
+		target.itl_class = leg < 2 ? 1 : 2;
+		header->pd_flags = PD_HAS_ITL;
+		header->pd_special = BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE;
+		header->pd_lower = SizeOfPageHeaderData + sizeof(ItemIdData);
+		header->pd_upper = header->pd_special - MAXALIGN(SizeofHeapTupleHeader);
+		PageSetPageSizeAndVersion(page, BLCKSZ, PG_PAGE_LAYOUT_VERSION);
+		ItemIdSetNormal(PageGetItemId(page, FirstOffsetNumber), header->pd_upper,
+						SizeofHeapTupleHeader);
+		tuple = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, FirstOffsetNumber));
+		tuple->t_hoff = SizeofHeapTupleHeader;
+		tuple->t_infomask = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK;
+		HeapTupleHeaderSetXmin(tuple, 800);
+		HeapTupleHeaderSetXmax(tuple, target.itl_xid);
+		slot = &ClusterPageGetItlSlots(page)[target.itl_slot_index];
+		slot->xid = target.itl_xid;
+		slot->wrap = target.itl_slot_wrap;
+		slot->flags = target.itl_class == 1 ? ITL_FLAG_ACTIVE : ITL_FLAG_LOCK_ONLY_ACTIVE;
+		memcpy(&slot->undo_segment_head, target.uba, sizeof(slot->undo_segment_head));
+		saved = before;
+		UT_ASSERT_EQ(cluster_ctrc_itl_cleanout_image_v1(&key, &target, status, scn,
+			before.data, after.data), CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN);
+		UT_ASSERT(memcmp(before.data, saved.data, BLCKSZ) == 0);
+		slot = &ClusterPageGetItlSlots((Page)after.data)[target.itl_slot_index];
+		expected_flags = leg == 0 ? ITL_FLAG_COMMITTED : leg == 1 ? ITL_FLAG_ABORTED
+			: leg == 2 ? ITL_FLAG_LOCK_ONLY_COMMITTED : ITL_FLAG_LOCK_ONLY_ABORTED;
+		UT_ASSERT_EQ(slot->flags, expected_flags);
+		UT_ASSERT_EQ(slot->commit_scn, scn);
+		UT_ASSERT(memcmp(&slot->undo_segment_head, target.uba, sizeof(slot->undo_segment_head)) == 0);
+		tuple = (HeapTupleHeader)PageGetItem((Page)after.data,
+			PageGetItemId((Page)after.data, FirstOffsetNumber));
+		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(tuple), 800);
+		UT_ASSERT_EQ((tuple->t_infomask & HEAP_XMAX_INVALID) != 0, target.itl_class == 2);
+		UT_ASSERT(memcmp(before.data, after.data, SizeOfPageHeaderData) == 0);
+		repeated = before;
+		UT_ASSERT_EQ(cluster_ctrc_itl_cleanout_image_v1(&key, &target, status, scn,
+			repeated.data, repeated.data), CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN);
+		UT_ASSERT(memcmp(after.data, repeated.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(cluster_ctrc_itl_cleanout_image_v1(&key, &target, status, scn,
+			after.data, repeated.data), CLUSTER_CTRC_ITL_CLEANOUT_ALREADY_TERMINAL);
+		UT_ASSERT(memcmp(after.data, repeated.data, BLCKSZ) == 0);
+
+		memset(after.data, 0xa5, BLCKSZ);
+		repeated = after;
+		target.itl_slot_wrap++;
+		UT_ASSERT_EQ(cluster_ctrc_itl_cleanout_image_v1(&key, &target, status, scn,
+			before.data, after.data), CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+		UT_ASSERT(memcmp(after.data, repeated.data, BLCKSZ) == 0);
+		UT_ASSERT(memcmp(before.data, saved.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_ctrc_itl_image_partial_overlap_is_retained)
+{
+	for (unsigned direction = 0; direction < 2; direction++) {
+		PGAlignedBlock storage[2] = { 0 }, saved[2];
+		Page before = (Page)storage + (direction ? MAXALIGN(1) : 0);
+		Page after = (Page)storage + (direction ? 0 : MAXALIGN(1));
+		PageHeader header = (PageHeader)before;
+		ClusterCtrcTxnKeyV1 key = test_key();
+		ClusterCtrcTargetV1 target = test_exact_itl_target();
+		ClusterItlSlotData *slot;
+
+		header->pd_flags = PD_HAS_ITL;
+		header->pd_special = BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE;
+		header->pd_lower = SizeOfPageHeaderData;
+		header->pd_upper = header->pd_special;
+		PageSetPageSizeAndVersion(before, BLCKSZ, PG_PAGE_LAYOUT_VERSION);
+		slot = &ClusterPageGetItlSlots(before)[target.itl_slot_index];
+		slot->xid = target.itl_xid;
+		slot->wrap = target.itl_slot_wrap;
+		slot->flags = ITL_FLAG_ACTIVE;
+		memcpy(&slot->undo_segment_head, target.uba, sizeof(slot->undo_segment_head));
+		memcpy(saved, storage, sizeof(storage));
+		UT_ASSERT_EQ(cluster_ctrc_itl_cleanout_image_v1(&key, &target,
+			CTRC_TERMINAL_COMMITTED, 900, before, after), CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+		UT_ASSERT(memcmp(storage, saved, sizeof(storage)) == 0);
+	}
+}
+
 UT_TEST(test_ctrc_close_race_drains_prepared_without_timeout_cancellation)
 {
 	ClusterCtrcParticipantEntry participant;
@@ -3288,6 +3383,8 @@ main(void)
 		CTRC_TEST_ENTRY(
 			test_ctrc_itl_uba_registers_before_mutation_and_only_exact_projection_discharges),
 		CTRC_TEST_ENTRY(test_ctrc_itl_cleanout_rewrites_only_exact_terminal_slot),
+		CTRC_TEST_ENTRY(test_ctrc_itl_image_calculation_preserves_input_and_replays_exactly),
+		CTRC_TEST_ENTRY(test_ctrc_itl_image_partial_overlap_is_retained),
 		CTRC_TEST_ENTRY(test_real_cleaner_terminal_image_closes_plain_lock_reference),
 		CTRC_TEST_ENTRY(test_ctrc_close_race_drains_prepared_without_timeout_cancellation),
 		CTRC_TEST_ENTRY(test_ctrc_exact_target_absence_and_ambiguity_cleanout_table),
