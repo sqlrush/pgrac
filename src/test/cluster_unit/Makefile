@@ -8214,9 +8214,11 @@ test_cluster_pgproc_active_sample.inc: $(top_srcdir)/src/backend/access/transam/
 	     /^ProcArrayGetActiveFullXidSample\(/ { print "bool"; emit=1; count++ } \
 	     /^ProcArrayEndTransactionInternal\(/ { print "static inline void"; emit=1; count++ } \
 	     /^ProcArrayClearTransaction\(/ { print "void"; emit=1; count++ } \
+	     /^ProcArrayAdd\(/ { print "void"; emit=1; count++ } \
 	     /^MarkAsPreparingGuts\(/ { print "static void"; emit=1; count++ } \
+	     /^MarkAsPrepared\(/ { print "static void"; emit=1; count++ } \
 	     emit { print } /^}$$/ { emit=0 } \
-	     END { if (count != 5 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	     END { if (count != 7 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pgproc_active_sample: test_cluster_pgproc_active_sample.c unit_test.h \
