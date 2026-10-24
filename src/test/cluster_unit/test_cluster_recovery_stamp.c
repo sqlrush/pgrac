@@ -3,6 +3,7 @@
  * are fixture boundaries; this is not a recovery or checkpoint field test. */
 #include "postgres.h"
 #include "miscadmin.h"
+#include "access/generic_xlog.h"
 #include "storage/shmem.h"
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_worker.h"
@@ -15,6 +16,8 @@
 #undef fprintf
 #include "unit_test.h"
 UT_DEFINE_GLOBALS();
+StaticAssertDecl(CLUSTER_RECOVERY_STAMP_PAYLOAD_BYTES >= sizeof(GenericXLogRecoveryImageDescriptorV1),
+				 "F4 must fit the typed page descriptor, not the local full image");
 /* Single-thread fixture: a contended slot means an illegal retained lock. */
 int
 s_lock(volatile slock_t *lock, const char *file, int line, const char *func)

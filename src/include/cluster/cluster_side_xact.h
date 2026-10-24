@@ -15,6 +15,8 @@
 #include "cluster/cluster_tt_2pc.h"
 
 #define CLUSTER_SIDE_XACT_INTERFACE_V1 1
+/* Compile-time API availability, not runtime recovery authority. */
+#define CLUSTER_SIDE_XACT_COLD_COMPLETION_V1 1
 
 typedef enum RfSideXactKindV1 {
 	RF_SIDE_XACT_INVALID = 0,

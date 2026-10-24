@@ -2851,11 +2851,12 @@ test_cluster_generic_redo: test_cluster_generic_redo.c unit_test.h \
 test_cluster_generic_version: test_cluster_generic_version.c unit_test.h \
 		$(top_srcdir)/src/include/access/generic_xlog.h \
 		test_cluster_generic_product.o test_cluster_space_storage_product.o test_cluster_space_producer_product.o \
-		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_generic_product.o \
 		test_cluster_space_storage_product.o test_cluster_space_producer_product.o \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
-		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 test_cluster_space_copy_buffer.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^RelationCopyStorageUsingBuffer\(/ { print "static void"; emit=1; count++ } \
@@ -3470,6 +3471,9 @@ test_cluster_side_xact test_cluster_pi_contribution test_cluster_recovery_c0_pla
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) -lssl -lcrypto -o $@
+
+test_cluster_pi_contribution: test_cluster_pi_cold_owner.inc \
+		$(top_srcdir)/src/include/cluster/cluster_side_xact.h
 
 CLUSTER_SIDE_ONLINE_OWNER_O = test_cluster_side_online_owner_product.o
 # The DATA integration uses the actual immutable fabric and typed SIDE
@@ -10904,6 +10908,7 @@ test_cluster_recovery_stamp_insert.inc: $(top_srcdir)/src/backend/access/transam
 
 test_cluster_recovery_stamp: test_cluster_recovery_stamp.c unit_test.h \
         test_cluster_recovery_stamp_insert.inc \
+		$(top_srcdir)/src/include/access/generic_xlog.h \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
         $(top_srcdir)/src/include/access/xact.h \
         $(top_srcdir)/src/include/access/xlog.h \
@@ -10980,6 +10985,9 @@ test_cluster_checkpoint_stamp: test_cluster_checkpoint_stamp.c test_cluster_reco
         $(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
         $(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
         $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+test_cluster_recovery_stamp test_cluster_recovery_stamp_exit test_cluster_checkpoint_stamp: \
+		$(top_srcdir)/src/include/access/generic_xlog.h
 
 # Original retained-input owner and installed native writer, without I/O grants.
 test_cluster_cold_tx_owner.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile

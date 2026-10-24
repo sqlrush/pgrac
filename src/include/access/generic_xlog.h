@@ -59,6 +59,27 @@ typedef struct GenericXLogRecoveryImageV1
 	PGAlignedBlock image;
 } GenericXLogRecoveryImageV1;
 
+/* Pointer-free local comparison descriptor for the original F4 window.
+ * The full image stays in the executor's plan. This value does not retain
+ * page custody/pins or authorize insertion, installation or retirement. */
+typedef struct GenericXLogRecoveryImageDescriptorV1
+{
+	uint8 space_identity[CLUSTER_SPACE_IDENTITY_BYTES];
+	GenericXLogInternalOwner owner;
+	ForkNumber fork_number;
+	BlockNumber block_number;
+	uint64 result_token;
+	RfPageVersionEdgeEntryV1 version;
+	uint8 after_sha256[32];
+} GenericXLogRecoveryImageDescriptorV1;
+
+/* Outside critical sections and caller locks: hashing may allocate. Refusal
+ * leaves output unchanged. No WAL registration or mutation is performed. */
+extern bool GenericXLogRecoveryImageDescribe(const GenericXLogRecoveryImageV1 *image,
+	GenericXLogRecoveryImageDescriptorV1 *out);
+extern bool GenericXLogRecoveryImageMatchesDescriptor(const GenericXLogRecoveryImageV1 *image,
+	const GenericXLogRecoveryImageDescriptorV1 *descriptor);
+
 extern bool GenericXLogRecoveryImagePrepare(GenericXLogInternalOwner owner,
 	const ClusterSpaceIdentity *identity, ForkNumber fork_number, BlockNumber block_number,
 	const char *before_image, const char *after_image, GenericXLogRecoveryImageV1 *out);
