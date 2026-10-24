@@ -1,13 +1,16 @@
 /* Actual native transaction parsers -> cold decoder -> ordered counter fold.
- * Reader envelopes, route selection, ABORT shape verdict and non-counter owner
- * callbacks remain fixture leaves. This is neither a raw WAL-reader/CRC test
+ * Reader envelopes, route selection and non-counter owner callbacks remain
+ * fixture leaves. This is neither a raw WAL-reader/CRC test
  * nor a replay, allocator or recovery-authority proof. */
 #define CLUSTER_COLD_NATIVE_XACT_PARSER 1
+#define CLUSTER_COLD_NATIVE_XACT_SHAPE 1
 int cold_decode_fixture_main(void);
 #define main cold_decode_fixture_main
 #include "test_cluster_cold_recovery_decode.c"
 #undef main
+#include "access/twophase.h"
 #include "test_cluster_cold_xid_completion_children.inc"
+#include "test_cluster_cold_xid_completion_shape.inc"
 
 static void
 native_completion(FakeRecord *r, bool commit, TransactionId top,
@@ -118,14 +121,57 @@ UT_TEST(test_truncated_native_completion_supplies_no_endpoint)
 	cluster_cold_decoded_release_v1(&decoded);
 }
 
+UT_TEST(test_abort_shape_refusals_supply_no_endpoint)
+{
+	TransactionId children[] = { 104, 110 };
+
+	for (int malformed = 0; malformed < 4; malformed++)
+	{
+		FakeRecord r;
+		ClusterColdDecodedV1 decoded = { 0 };
+		ClusterColdDetailV1 detail;
+		ClusterColdParticipantV1 source = { .thread_id = 3, .timeline = 7,
+			.owner_incarnation = 19, .physical_lower = 0xf80, .native_redo = 0x1000,
+			.tail_end = 0x1080 };
+		ClusterColdXidProgressV1 progress;
+		uint64 next = 99;
+
+		native_completion(&r, false, 100, children, lengthof(children));
+		if (malformed == 0)
+			r.storage.decoded.main_data_len--;
+		else if (malformed == 1)
+			r.storage.decoded.main_data_len = MinSizeOfXactAbort + sizeof(xl_xact_xinfo) - 1;
+		else if (malformed == 2)
+			r.storage.decoded.main_data_len++;
+		else
+		{
+			xl_xact_xinfo info = { .xinfo = XACT_XINFO_HAS_SUBXACTS | UINT32_C(0x10000000) };
+
+			memcpy(r.data + MinSizeOfXactAbort, &info, sizeof(info));
+		}
+		detail = cluster_cold_recovery_decode_v1(&r.reader, 99, UUID, false, false, &decoded);
+		UT_ASSERT(detail != CLUSTER_COLD_OK);
+		UT_ASSERT(!decoded.xid_input.complete);
+		UT_ASSERT(cluster_cold_xid_begin_v1(&progress, &source,
+										   (UINT64_C(7) << 32) | 100, 1));
+		if (detail == CLUSTER_COLD_OK)
+			UT_ASSERT(!cluster_cold_xid_record_v1(&progress, &source, &decoded.record,
+												 &decoded.xid_input));
+		UT_ASSERT(!cluster_cold_xid_candidate_v1(&progress, &source, &next));
+		UT_ASSERT_EQ(next, 0);
+		cluster_cold_decoded_release_v1(&decoded);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(5);
 	UT_RUN(test_native_commit_children_supply_counter_payload);
 	UT_RUN(test_native_abort_children_cross_counter_wrap);
 	UT_RUN(test_native_multixact_members_supply_counter_payload);
 	UT_RUN(test_truncated_native_completion_supplies_no_endpoint);
+	UT_RUN(test_abort_shape_refusals_supply_no_endpoint);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

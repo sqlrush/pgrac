@@ -9144,18 +9144,31 @@ test_cluster_cold_xid_completion_children.inc: $(top_srcdir)/src/backend/cluster
 	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_cold_xid_completion_shape.inc: $(top_srcdir)/src/backend/cluster/cluster_side_xact.c Makefile
+	awk '/^#define RF_SIDE_XACT_(KNOWN_XINFO|COMPLETION_FLAGS) / { macro=1; count++ } \
+	     macro { print; if ($$0 !~ /\\$$/) macro=0; next } \
+	     /^typedef struct RfSideXactCursorV1 \{/ { emit=1; count++ } \
+	     /^side_xact_(take|take_counted|completion_shape_for_use|completion_shape_valid)\(/ \
+	       { print "static bool"; emit=1; count++ } \
+	     /^rf_side_xact_completion_shape_v1\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (count != 8 || emit || macro) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_cold_xid_completion_parse.o: $(top_srcdir)/src/backend/access/rmgrdesc/xactdesc.c \
 		$(top_srcdir)/src/include/access/xact.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_cold_xid_native_completion: test_cluster_cold_xid_native_completion.c \
-		test_cluster_cold_recovery_decode.c test_cluster_cold_xid_completion_children.inc unit_test.h \
+		test_cluster_cold_recovery_decode.c test_cluster_cold_xid_completion_children.inc \
+		test_cluster_cold_xid_completion_shape.inc unit_test.h \
 		test_cluster_cold_xid_completion_parse.o $(CLUSTER_COLD_DECODE_O) \
 		test_cluster_cold_recovery_xid_core.o $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
 		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_xact.h \
 		$(top_srcdir)/src/include/access/xact.h $(top_srcdir)/src/include/access/multixact.h \
+		$(top_srcdir)/src/include/access/twophase.h \
 		$(top_builddir)/src/common/libpgcommon_srv.a cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_DECODE_O) \
 		test_cluster_cold_recovery_xid_core.o test_cluster_cold_xid_completion_parse.o \
@@ -9167,6 +9180,7 @@ test_cluster_cold_xid_native_completion: test_cluster_cold_xid_native_completion
 clean: clean-cold-xid-native-completion
 clean-cold-xid-native-completion:
 	rm -f test_cluster_cold_xid_completion_children.inc test_cluster_cold_xid_completion_children.inc.tmp \
+		test_cluster_cold_xid_completion_shape.inc test_cluster_cold_xid_completion_shape.inc.tmp \
 		test_cluster_cold_xid_completion_parse.o
 
 # Exercise Startup's original replay-input lifetime across EOR and exit.

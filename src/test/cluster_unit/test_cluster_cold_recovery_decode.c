@@ -113,12 +113,14 @@ rf_side_xact_assignment_preflight_v1(const uint8 *payload, uint32 length)
 	abort();
 }
 
+#ifndef CLUSTER_COLD_NATIVE_XACT_SHAPE
 bool
 rf_side_xact_completion_shape_v1(XLogReaderState *record, bool commit)
 {
 	UT_ASSERT(record != NULL && !commit);
 	return abort_shape_ok;
 }
+#endif
 
 /* Real child lists and the shared validator are linked in the effects test;
  * these parser stubs intentionally produce no children. */
