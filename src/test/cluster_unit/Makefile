@@ -3458,6 +3458,8 @@ test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
 		test_cluster_relmap_execution_custody.inc \
 		test_cluster_relmap_execution_targets.inc \
 		test_cluster_relmap_execution_observe.inc test_cluster_relmap_census_open.inc \
+		test_cluster_relmap_cold_native.inc \
+		test_cluster_relmap_retained_arb.o test_cluster_relmap_retained_authority.o \
 		test_cluster_relmap_observation_namespace.o \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o \
@@ -3465,6 +3467,20 @@ test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
 		test_cluster_relmap_retained_census.o test_cluster_relmap_pending_product.o \
 		test_cluster_relmap_pending_side_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o
+
+# Compose the cold executor with the actual native arbiter and pair storage.
+test_cluster_relmap_retained_arb.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_arb.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_arb.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_relmap_retained_authority.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_authority.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
 # Read faults affect only the real namespace reader in this retained-WAL unit.
 test_cluster_relmap_observation_namespace.o: $(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h Makefile
@@ -3522,6 +3538,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relma
 		$(top_srcdir)/src/include/cluster/cluster_wal_tail.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_owner.o) \
+		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_arb.o test_cluster_relmap_retained_authority.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),$(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_census.o test_cluster_relmap_pending_product.o test_cluster_relmap_pending_side_product.o $(top_builddir)/src/backend/cluster/cluster_relmap_retention.o) \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_root_set.o \

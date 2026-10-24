@@ -28,6 +28,9 @@ int control_fixture_main(int argc, char **argv);
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_relmap_lock.h"
+#include "cluster/cluster_relmap_authority.h"
+#include "cluster/cluster_sinval.h"
+#include "cluster/cluster_conf.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
 #include "utils/relmapper.h"
@@ -3375,6 +3378,7 @@ UT_TEST(test_terminal_read_native_error_keeps_output_zero_and_custody_dead)
 #include "test_cluster_relmap_execution_targets.inc"
 #include "test_cluster_relmap_execution_observe.inc"
 #include "test_cluster_relmap_census_open.inc"
+#include "test_cluster_relmap_cold_native.inc"
 
 int
 main(int argc, char **argv)
@@ -3383,7 +3387,12 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(114);
+	UT_PLAN(119);
+	UT_RUN(test_cold_native_commit_abort_actual_pair_and_fresh_committed);
+	UT_RUN(test_cold_native_clean_does_not_read_clog_or_write_pairs);
+	UT_RUN(test_cold_native_unknown_and_native_error_keep_pending);
+	UT_RUN(test_cold_native_each_sync_cut_returns_no_observation_or_retry);
+	UT_RUN(test_cold_native_postwrite_scope_loss_or_error_keeps_original_debt);
 	UT_RUN(test_cold_committed_original_wal_factory_and_all_physical_namespaces);
 	UT_RUN(test_cold_committed_original_wal_source_and_other_namespace_drift_refuse);
 	UT_RUN(test_census_open_original_wal_physical_pairs_and_owned_fd);
