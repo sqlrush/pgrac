@@ -384,9 +384,12 @@ freeze_canonical_locator_shape_valid(const ClusterTxLocator *request,
 		|| resolution->locator_echo.tt_wrap > TT_WRAP_MAX
 		|| !resolution->local_canonical_valid
 		|| resolution->local_canonical_generation == 0
+		|| resolution->local_canonical_generation == UINT32_MAX
 		|| resolution->local_canonical.reserved32 != 0
 		|| resolution->local_canonical.segment_id == 0
 		|| resolution->local_canonical.segment_id > UINT16_MAX
+		|| (resolution->local_canonical.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE
+			!= (segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE
 		|| resolution->local_canonical.xid != request->xid
 		|| resolution->local_canonical.slot_offset >= TT_SLOTS_PER_SEGMENT
 		|| resolution->local_canonical.wrap == TT_WRAP_INVALID

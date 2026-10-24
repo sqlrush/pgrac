@@ -2556,10 +2556,40 @@ UT_TEST(test_xmin_existing_share_lock_is_not_a_resume_scope)
 	UT_ASSERT_EQ(backend_pin_count, 1);
 }
 
+
+UT_TEST(test_xmin_rejects_unknown_generation_or_foreign_origin_before_writer)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int released = 0; released < 2; released++) {
+			for (int variant = 0; variant < 2; variant++) {
+				QualifiedXminFixture f;
+				ClusterHeapFreezeXminTargetV1 targets[3];
+				bool owned_x;
+				int pins;
+
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+				if (variant == 0) f.proofs.proofs[0].resolution.local_canonical_generation = UINT32_MAX;
+				else f.proofs.proofs[0].resolution.local_canonical.segment_id = CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+				if (released) { fixture_release_original_writer(); resume_allowed = true; }
+				owned_x = local_x; pins = backend_pin_count;
+				UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 2)
+					: qualified_xmin_apply(&f, 0)));
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+				UT_ASSERT_EQ(writer_checks + route_checks + admission_checks, 0);
+				UT_ASSERT_EQ(backend_pin_count, pins);
+				UT_ASSERT(local_x == owned_x && !resumed_writer && f.admission.entered);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(70);
+	UT_PLAN(71);
+	UT_RUN(test_xmin_rejects_unknown_generation_or_foreign_origin_before_writer);
 	UT_RUN(test_xmin_locked_kernel_refuses_foreign_proof_before_native_wal);
 	UT_RUN(test_xmin_foreign_object_refuses_before_writer_or_native_wal);
 	UT_RUN(test_xmin_mixed_page_freezes_only_exact_selected_carriers);
