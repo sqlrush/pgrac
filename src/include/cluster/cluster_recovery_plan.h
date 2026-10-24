@@ -294,6 +294,29 @@ typedef struct ClusterRecoveryTxResultObservationV1 {
 	ClusterRecoveryTxResultValueV1 result;
 } ClusterRecoveryTxResultObservationV1;
 
+/* Independent CTRC component. Neither TX COMPLETE nor a newly empty shared
+ * census proves that the old durable reference responsibilities ended. */
+typedef enum ClusterRecoveryCtrcResultStateV1 {
+	CLUSTER_RECOVERY_CTRC_RESULT_EMPTY = 0,
+	CLUSTER_RECOVERY_CTRC_RESULT_PENDING,
+	CLUSTER_RECOVERY_CTRC_RESULT_COMPLETE
+} ClusterRecoveryCtrcResultStateV1;
+
+typedef struct ClusterRecoveryCtrcResultValueV1 {
+	uint64 result_generation;
+	uint32 subject_count;
+	uint32 released_count;
+	uint32 unresolved_count;
+	uint32 unqualified_count;
+	ClusterRecoveryCtrcResultStateV1 state;
+	uint8 input_root_sha256[32];
+} ClusterRecoveryCtrcResultValueV1;
+
+typedef struct ClusterRecoveryCtrcResultObservationV1 {
+	ClusterRecoveryCheckpointObservationV1 checkpoint;
+	ClusterRecoveryCtrcResultValueV1 result;
+} ClusterRecoveryCtrcResultObservationV1;
+
 /* LMON-only read of the original recovered INSTALL/native-DONE input.
  * Consumers must retain and revalidate the complete value across I/O; this
  * does not prove another member's INSTALL or any service completion. */
@@ -301,6 +324,10 @@ extern bool cluster_recovery_checkpoint_observe_v1(ClusterRecoveryCheckpointObse
 
 struct ClusterRecoveryStartV1;
 struct ClusterRecoveryCheckpointScopeV1;
+/* Original Startup only; derives retained native release facts independently
+ * of the TX result. Pending/unknown is observable, never service permission. */
+extern bool cluster_recovery_ctrc_result_collect_v1(const struct ClusterRecoveryStartV1 *start);
+extern bool cluster_recovery_ctrc_result_observe_v1(ClusterRecoveryCtrcResultObservationV1 *out);
 extern bool cluster_recovery_checkpoint_register_v1(const struct ClusterRecoveryStartV1 *start);
 /* Successful Startup private-input release transfers only this original
  * checkpoint observation. It is neither service completion nor OPEN proof. */

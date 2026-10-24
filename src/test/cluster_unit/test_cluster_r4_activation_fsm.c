@@ -173,6 +173,8 @@ static ClusterRecoveryCheckpointObservationV1 test_recovered_checkpoint;
 static ClusterRecoveryTxResultObservationV1 test_recovered_tx_result;
 static bool test_recovered_tx_available;
 static bool test_recovered_tx_change_after_read;
+static ClusterRecoveryCtrcResultObservationV1 test_recovered_ctrc_result;
+static bool test_recovered_ctrc_available, test_recovered_ctrc_change_after_read;
 static unsigned test_recovered_checkpoint_observe_calls;
 static unsigned test_recovery_tx_accept_calls;
 static bool test_recovered_checkpoint_fail_after_first;
@@ -224,6 +226,16 @@ cluster_recovery_tx_result_observe_accepted_v1(ClusterRecoveryTxResultObservatio
 	*out = test_recovered_tx_result;
 	if (test_recovered_tx_change_after_read)
 		test_recovered_tx_result.result.result_generation++;
+	return true;
+}
+
+bool
+cluster_recovery_ctrc_result_observe_v1(ClusterRecoveryCtrcResultObservationV1 *out)
+{
+	if (out == NULL || !test_recovered_ctrc_available) return false;
+	*out = test_recovered_ctrc_result;
+	if (test_recovered_ctrc_change_after_read)
+		test_recovered_ctrc_result.result.result_generation++;
 	return true;
 }
 
@@ -9446,6 +9458,14 @@ ut_normal_start_recovered_owner_setup(ClusterSemanticActivationRecord *open,
 	test_recovered_tx_result.result.result_generation = 1;
 	test_recovered_tx_available = true;
 	test_recovered_tx_change_after_read = false;
+	memset(&test_recovered_ctrc_result, 0, sizeof(test_recovered_ctrc_result));
+	test_recovered_ctrc_result.checkpoint = test_recovered_checkpoint;
+	test_recovered_ctrc_result.result.state = CLUSTER_RECOVERY_CTRC_RESULT_COMPLETE;
+	test_recovered_ctrc_result.result.result_generation = 1;
+	memcpy(test_recovered_ctrc_result.result.input_root_sha256,
+		test_recovered_tx_result.result.input_root_sha256, 32);
+	test_recovered_ctrc_available = true;
+	test_recovered_ctrc_change_after_read = false;
 	for (int node = 0; node < 4; node++)
 		table->expected[node].admitted_incarnation
 			= cluster_membership_get_last_admitted_incarnation(node);
@@ -9470,6 +9490,23 @@ UT_TEST(test_recovered_service_consumes_accepted_tx_component)
 	ut_normal_start_recovered_owner_setup(&open, &table);
 	test_recovered_tx_change_after_read = true;
 	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+	ut_normal_start_recovered_owner_setup(&open, &table);
+	UT_ASSERT(normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+}
+
+UT_TEST(test_recovered_service_consumes_independent_ctrc_completion)
+{
+	ClusterSemanticActivationRecord open;
+	ClusterSemanticActivationAckTableV1 table;
+	for (unsigned fault = 0; fault < 5; fault++) {
+		ut_normal_start_recovered_owner_setup(&open, &table);
+		if (fault == 0) test_recovered_ctrc_available = false;
+		if (fault == 1) test_recovered_ctrc_result.result.state = CLUSTER_RECOVERY_CTRC_RESULT_PENDING;
+		if (fault == 2) test_recovered_ctrc_result.checkpoint.slot_generation++;
+		if (fault == 3) test_recovered_ctrc_result.result.input_root_sha256[0] ^= 1;
+		if (fault == 4) test_recovered_ctrc_change_after_read = true;
+		UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+	}
 	ut_normal_start_recovered_owner_setup(&open, &table);
 	UT_ASSERT(normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
 }
@@ -11743,7 +11780,7 @@ static void test_serving_finish_root(void);
 int
 main(void)
 {
-	UT_PLAN(402);
+	UT_PLAN(403);
 	UT_RUN(test_member_commit_gap_before_all_peer_receipts);
 	UT_RUN(test_member_commit_request_waits_for_real_predecessor_receipts);
 	UT_RUN(test_member_commit_request_rejects_old_or_changed_identity);
@@ -12097,6 +12134,7 @@ main(void)
 	UT_RUN(test_normal_start_recovered_owner_observation_accepts_exact_binding);
 	UT_RUN(test_recovered_prepare_supplies_service_binding_input);
 	UT_RUN(test_recovered_service_consumes_accepted_tx_component);
+	UT_RUN(test_recovered_service_consumes_independent_ctrc_completion);
 	UT_RUN(test_recovered_prepare_requires_original_pgrd);
 	UT_RUN(test_normal_start_recovered_owner_observation_fails_closed_without_observation);
 	UT_RUN(test_normal_start_recovered_owner_observation_rejects_foreign_system);

@@ -6833,7 +6833,10 @@ cluster_cold_recovery_consume_loser_inputs_v1(
 	typed = ClusterColdRecoveryTxInputs(start);
 	if (typed == NULL || typed->top_tx_census == NULL)
 		return false;
-	if (!cluster_recovery_tx_result_begin_v1(start))
+	/* Retained CTRC responsibilities are independent of the C0 TX result.
+	 * Preserve their original input before C0 changes any target. */
+	if (!cluster_recovery_ctrc_result_collect_v1(start)
+		|| !cluster_recovery_tx_result_begin_v1(start))
 		return false;
 
 	for (uint32 i = 0; i < typed->top_tx_census->count; i++)

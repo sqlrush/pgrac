@@ -80,6 +80,7 @@ typedef struct ClusterRecoveryCheckpointSlotV1 {
 	ClusterRecoveryCheckpointOwnerV1 owner;
 	ClusterRecoveryTxResultValueV1 tx_result;
 	uint64 tx_accepted_generation;
+	ClusterRecoveryCtrcResultValueV1 ctrc_result;
 } ClusterRecoveryCheckpointSlotV1;
 
 typedef struct ClusterRecoveryPlanShmem {
@@ -622,6 +623,7 @@ cluster_recovery_checkpoint_revoke_v1(const struct ClusterRecoveryStartV1 *start
 			memset(&slot->owner, 0, sizeof(slot->owner));
 			memset(&slot->tx_result, 0, sizeof(slot->tx_result));
 			slot->tx_accepted_generation = 0;
+			memset(&slot->ctrc_result, 0, sizeof(slot->ctrc_result));
 		}
 		SpinLockRelease(&slot->lock);
 	}
@@ -647,6 +649,7 @@ cluster_recovery_checkpoint_register_v1(const struct ClusterRecoveryStartV1 *sta
 		slot->owner = owner;
 		memset(&slot->tx_result, 0, sizeof(slot->tx_result));
 		slot->tx_accepted_generation = 0;
+		memset(&slot->ctrc_result, 0, sizeof(slot->ctrc_result));
 		slot->valid = true;
 		published = true;
 	}
@@ -696,6 +699,61 @@ typedef enum RecoveryTxResultAction {
 	RECOVERY_TX_RESULT_STEP,
 	RECOVERY_TX_RESULT_FINISH
 } RecoveryTxResultAction;
+
+bool
+cluster_recovery_ctrc_result_collect_v1(const struct ClusterRecoveryStartV1 *start)
+{
+	ClusterRecoveryCheckpointSlotV1 *slot;
+	ClusterRecoveryCheckpointOwnerV1 owner, confirmed;
+	ClusterRecoveryCtrcResultValueV1 result;
+	ClusterColdCtrcReleaseCensusV1 census;
+	const ClusterColdTypedV1 *typed;
+	uint8 zero[32] = {0};
+	bool qualified, ok = false;
+
+	if (MyBackendType != B_STARTUP || !IsUnderPostmaster
+		|| start == NULL || start != checkpoint_registered_start
+		|| cluster_recovery_plan_shmem == NULL
+		|| !ClusterColdRecoveryTxCheckpointOwnerV1(start, &owner)
+		|| memcmp(&owner, &checkpoint_registered_owner, sizeof(owner)) != 0)
+		return false;
+	typed = ClusterColdRecoveryTxInputs(start);
+	if (typed == NULL || typed->top_tx_census == NULL
+		|| typed->top_tx_census->plan != typed->plan || !typed->census_root_captured
+		|| typed->census_root.system_identifier != owner.writer.ref.claim.identity.system_identifier
+		|| memcmp(typed->census_root.image_sha256, zero, sizeof(zero)) == 0)
+		return false;
+
+	/* No caller polarity, fresh shared-memory emptiness or TX result is evidence
+	 * for this component.  Sampling is outside the shared slot lock. */
+	memset(&result, 0, sizeof(result));
+	memset(&census, 0, sizeof(census));
+	qualified = cluster_cold_typed_ctrc_release_census_v1(typed, &census);
+	result.subject_count = census.subject_count;
+	result.released_count = census.released_count;
+	result.unresolved_count = census.unresolved_count;
+	result.unqualified_count = qualified ? census.unqualified_count : 1;
+	result.state = qualified && result.unresolved_count == 0
+		&& result.unqualified_count == 0
+		&& result.released_count == result.subject_count
+		? CLUSTER_RECOVERY_CTRC_RESULT_COMPLETE : CLUSTER_RECOVERY_CTRC_RESULT_PENDING;
+	memcpy(result.input_root_sha256, typed->census_root.image_sha256, 32);
+	if (!ClusterColdRecoveryTxCheckpointOwnerV1(start, &confirmed)
+		|| memcmp(&owner, &confirmed, sizeof(owner)) != 0
+		|| ClusterColdRecoveryTxInputs(start) != typed)
+		return false;
+
+	slot = &cluster_recovery_plan_shmem->checkpoint_owner;
+	SpinLockAcquire(&slot->lock);
+	if (slot->valid && memcmp(&slot->owner, &owner, sizeof(owner)) == 0
+		&& slot->ctrc_result.result_generation != PG_UINT64_MAX) {
+		result.result_generation = slot->ctrc_result.result_generation + 1;
+		slot->ctrc_result = result;
+		ok = true;
+	}
+	SpinLockRelease(&slot->lock);
+	return ok;
+}
 
 static bool
 recovery_tx_result_update(const struct ClusterRecoveryStartV1 *start, uint32 ordinal,
@@ -900,6 +958,40 @@ cluster_recovery_tx_result_observe_v1(ClusterRecoveryTxResultObservationV1 *out)
 	same = slot->valid && slot->generation == before.slot_generation
 		&& memcmp(&slot->owner, &before.owner, sizeof(slot->owner)) == 0
 		&& memcmp(&slot->tx_result, &result, sizeof(result)) == 0;
+	SpinLockRelease(&slot->lock);
+	if (!same)
+		return false;
+	out->checkpoint = after;
+	out->result = result;
+	return true;
+}
+
+bool
+cluster_recovery_ctrc_result_observe_v1(ClusterRecoveryCtrcResultObservationV1 *out)
+{
+	ClusterRecoveryCheckpointObservationV1 before, after;
+	ClusterRecoveryCtrcResultValueV1 result;
+	ClusterRecoveryCheckpointSlotV1 *slot;
+	bool same;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || !cluster_recovery_checkpoint_observe_v1(&before))
+		return false;
+	slot = &cluster_recovery_plan_shmem->checkpoint_owner;
+	SpinLockAcquire(&slot->lock);
+	same = slot->valid && slot->generation == before.slot_generation
+		&& memcmp(&slot->owner, &before.owner, sizeof(slot->owner)) == 0;
+	result = slot->ctrc_result;
+	SpinLockRelease(&slot->lock);
+	if (!same || result.state == CLUSTER_RECOVERY_CTRC_RESULT_EMPTY
+		|| result.result_generation == 0 || !cluster_recovery_checkpoint_observe_v1(&after)
+		|| memcmp(&before, &after, sizeof(before)) != 0)
+		return false;
+	SpinLockAcquire(&slot->lock);
+	same = slot->valid && slot->generation == before.slot_generation
+		&& memcmp(&slot->owner, &before.owner, sizeof(slot->owner)) == 0
+		&& memcmp(&slot->ctrc_result, &result, sizeof(result)) == 0;
 	SpinLockRelease(&slot->lock);
 	if (!same)
 		return false;

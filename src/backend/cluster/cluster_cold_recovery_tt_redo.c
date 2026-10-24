@@ -1181,6 +1181,94 @@ cold_top_tx_checkpoint_base_v1(const ClusterColdTypedV1 *typed,
 }
 
 bool
+cluster_cold_typed_ctrc_release_census_v1(const ClusterColdTypedV1 *typed,
+									   ClusterColdCtrcReleaseCensusV1 *out)
+{
+	ClusterColdCtrcReleaseCensusV1 value = { 0 };
+	uint32 headers;
+
+	if (out == NULL) return false;
+	memset(out, 0, sizeof(*out));
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK || typed->plan == NULL
+		|| typed->top_tx_census == NULL || typed->top_tx_census->plan != typed->plan
+		|| typed->replay_count == 0 || typed->replay_count > typed->participant_count
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| !cluster_cold_typed_xid_sources_ready_v1(typed)
+		|| !cluster_cold_typed_effects_ready_v1(typed)
+		|| !cluster_cold_tt_after_redo_namespace_matches_v1(typed))
+		return false;
+	/* These are immutable pass-2 inputs retained across native EOR/INSTALL,
+	 * not a new read of a target modified by C0 or D0. Missing qualification
+	 * is counted, never turned into an empty successful namespace. */
+	for (uint32 p = 0; p < typed->replay_count; p++)
+		if (!cold_top_tx_checkpoint_v1(typed, p)) value.unqualified_count++;
+	for (uint32 p = typed->replay_count; p < typed->participant_count; p++) {
+		bool covered = false;
+		for (uint32 q = 0; q < typed->replay_count; q++)
+			if (typed->participants[p].thread_id == typed->participants[q].thread_id) {
+				covered = true;
+				break;
+			}
+		/* A retained source without surviving TT files can still name old
+		 * responsibilities. Only its origin's qualified current namespace
+		 * covers that absence; an unrelated empty source proves nothing. */
+		if (!covered) value.unqualified_count++;
+	}
+	headers = cluster_cold_tt_after_redo_count_v1(typed);
+	for (uint32 index = 0; index < headers; index++) {
+		const UndoSegmentHeaderData *post, *base;
+		RfSideUndoHeaderImageV1 folded, initial;
+		uint32 segment, participant = UINT32_MAX;
+		uint8 owner;
+		bool qualified;
+
+		post = cluster_cold_tt_after_redo_header_v1(typed, index, &owner, &segment);
+		if (post == NULL) return false;
+		for (uint32 p = 0; p < typed->replay_count; p++)
+			if (typed->participants[p].thread_id == owner) {
+				if (participant != UINT32_MAX) return false;
+				participant = p;
+			}
+		if (cluster_undo_segment_header_integrity(post) != CLUSTER_UNDO_HEADER_VALID)
+			return false;
+		base = cluster_cold_tt_header_find_v1(typed, false, owner, segment, NULL);
+		if (participant == UINT32_MAX) {
+			/* The original inventory permits history-only unchanged bytes.
+			 * Keep their subjects visible, but do not borrow a current replay
+			 * checkpoint or execute/fold history as a new owner. */
+			if (base == NULL || memcmp(post, base, BLCKSZ) != 0) return false;
+			value.unqualified_count++;
+		} else if (!cluster_cold_typed_tt_after_redo_readback_v1(typed, participant, index, &folded))
+			return false;
+		qualified = base != NULL
+			&& cluster_undo_segment_header_integrity(base) == CLUSTER_UNDO_HEADER_VALID;
+		if (!qualified && participant != UINT32_MAX)
+			qualified = rf_side_online_plan_prepare_undo_header_v1(
+				typed->side_plans[participant], owner, segment, NULL, &initial)
+				== RF_PAGE_PROOF_DETAIL_OK;
+		if (!qualified) value.unqualified_count++;
+		for (uint32 slot = 0; slot < TT_SLOTS_PER_SEGMENT; slot++) {
+			const TTSlot *subject = &post->tt_slots[slot];
+			TTSlot unused = { 0 };
+			unused.wrap = subject->wrap;
+			if (memcmp(subject, &unused, sizeof(unused)) == 0) continue;
+			if (value.subject_count == UINT32_MAX) return false;
+			value.subject_count++;
+			if (TransactionIdIsNormal(subject->xid)
+				&& ((subject->status == TT_SLOT_COMMITTED && SCN_VALID(subject->commit_scn))
+					|| ((subject->status == TT_SLOT_ABORTED || subject->status == TT_SLOT_RECYCLABLE)
+						&& !SCN_VALID(subject->commit_scn)))
+				&& (subject->flags & TT_SLOT_FLAG_CTRC_RELEASE_PROVEN) != 0
+				&& (subject->flags & ~TT_SLOT_FLAGS_KNOWN) == 0)
+				value.released_count++;
+			else value.unresolved_count++;
+		}
+	}
+	*out = value;
+	return true;
+}
+
+bool
 cluster_cold_typed_top_tx_loser_producer_v1(
 	ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence, uint32 participant,
 	const ClusterColdTopTxProofV1 *proof, ClusterColdTopTxLoserProducerResultV1 *out)

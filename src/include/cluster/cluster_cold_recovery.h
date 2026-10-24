@@ -1349,6 +1349,19 @@ extern bool cluster_cold_typed_tt_after_redo_readback_v1(const ClusterColdTypedV
  * the caller's obligations; no completion flag is stored. */
 extern bool cluster_cold_typed_tt_redo_inventory_v1(const ClusterColdTypedV1 *typed);
 
+typedef struct ClusterColdCtrcReleaseCensusV1 {
+	uint32 subject_count;
+	uint32 released_count;
+	uint32 unresolved_count;
+	uint32 unqualified_count;
+} ClusterColdCtrcReleaseCensusV1;
+
+/* Retained native input only, no live allocator/admission or new release.
+ * The original registered Startup must supply its complete pass-2 census.
+ * This cannot replace the independent D2 proof for newly discharged work. */
+extern bool cluster_cold_typed_ctrc_release_census_v1(const ClusterColdTypedV1 *typed,
+												  ClusterColdCtrcReleaseCensusV1 *out);
+
 /* Copy any physical slot after the same selected source's sealed ordinary
  * redo, or match its resulting physical key. No status is filtered during
  * enumeration, and generation zero is valid. A pre-redo key is insufficient

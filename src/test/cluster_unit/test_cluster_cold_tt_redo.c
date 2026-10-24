@@ -8692,10 +8692,204 @@ UT_TEST(tt_top_tx_census_budget_and_oom_never_publish_a_partial_list)
 	}
 }
 
+/* Native header bytes are written before the original base capture. The
+ * retained NOOP and real fold/readback preserve the checkpoint predecessor;
+ * no caller-provided release count participates in these cases. */
+static void
+tt_ctrc_checkpoint_fixture_with_history(TtRedoFixture *f, uint8 status, bool released,
+	bool legacy, uint16 history_thread)
+{
+	FakeXactRecord fake;
+	RfPageOnlineRecordIdentityV1 identity;
+	RfDetachedRecordPlanV1 record;
+	UndoSegmentHeaderData *header;
+
+	tt_redo_fixture_with_history_thread(f, 200, RF_SIDE_PLAN_RECOVERY, 100, history_thread);
+	header = (UndoSegmentHeaderData *)f->base.data;
+	memset(header->tt_slots, 0, sizeof(header->tt_slots));
+	for (uint32 slot = 0; slot < TT_SLOTS_PER_SEGMENT; slot += TT_SLOTS_PER_SEGMENT - 1) {
+		header->tt_slots[slot].xid = 900 + slot;
+		header->tt_slots[slot].wrap = 3;
+		header->tt_slots[slot].status = status;
+		header->tt_slots[slot].commit_scn = status == TT_SLOT_COMMITTED ? 123456 : 0;
+		header->tt_slots[slot].flags = released ? TT_SLOT_FLAG_CTRC_RELEASE_PROVEN : 0;
+	}
+	UT_ASSERT(cluster_undo_segment_header_seal(f->base.data));
+	if (legacy) header->pd_checksum = 0;
+	tt_readback_write(513, &f->base, false);
+	tt_redo_seed_recapture(f);
+	make_projection_record(&fake, RM_XLOG_ID, XLOG_NOOP, NULL, 0);
+	fake.u.decoded.max_block_id = -1;
+	fake.u.decoded.header.xl_xid = fake.u.decoded.toplevel_xid = InvalidTransactionId;
+	identity = make_identity(&fake, f->typed.observer.storage_uuid);
+	set_identity_range(&fake, &identity, 100, 200);
+	record = make_projection_record_plan(&fake);
+	UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(f->typed.side_plans[0], &record, &identity),
+		RF_PAGE_PROOF_DETAIL_OK);
+	tt_redo_seal(f);
+	tt_top_tx_write_fold(f);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f->typed), CLUSTER_COLD_OK);
+	tt_top_tx_effects_complete(f);
+	tt_top_tx_endpoints_complete(f);
+	UT_ASSERT(cluster_cold_typed_top_tx_census_v1(&f->typed, TT_C0_FENCE));
+}
+
+static void
+tt_ctrc_checkpoint_fixture(TtRedoFixture *f, uint8 status, bool released, bool legacy)
+{
+	tt_ctrc_checkpoint_fixture_with_history(f, status, released, legacy, 3);
+}
+
+UT_TEST(tt_ctrc_native_release_census_counts_first_and_last_terminal_slots)
+{
+	for (unsigned terminal = 0; terminal < 3; terminal++) {
+		TtRedoFixture f;
+		ClusterColdCtrcReleaseCensusV1 out;
+		tt_ctrc_checkpoint_fixture(&f, terminal == 0 ? TT_SLOT_ABORTED
+			: terminal == 1 ? TT_SLOT_COMMITTED : TT_SLOT_RECYCLABLE, true, false);
+		UT_ASSERT(cluster_cold_typed_ctrc_release_census_v1(&f.typed, &out));
+		UT_ASSERT_EQ(out.subject_count, 2);
+		UT_ASSERT_EQ(out.released_count, 2);
+		UT_ASSERT_EQ(out.unresolved_count, 0);
+		UT_ASSERT_EQ(out.unqualified_count, 0);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_ctrc_native_release_census_keeps_active_and_unreleased_pending)
+{
+	for (unsigned active = 0; active < 2; active++) {
+		TtRedoFixture f;
+		ClusterColdCtrcReleaseCensusV1 out;
+		tt_ctrc_checkpoint_fixture(&f, active ? TT_SLOT_ACTIVE : TT_SLOT_ABORTED, false, false);
+		UT_ASSERT(cluster_cold_typed_ctrc_release_census_v1(&f.typed, &out));
+		UT_ASSERT_EQ(out.subject_count, 2);
+		UT_ASSERT_EQ(out.released_count, 0);
+		UT_ASSERT_EQ(out.unresolved_count, 2);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_ctrc_native_release_census_requires_original_base_qualification)
+{
+	for (unsigned missing_checkpoint = 0; missing_checkpoint < 2; missing_checkpoint++) {
+		TtRedoFixture f;
+		ClusterColdCtrcReleaseCensusV1 out;
+		tt_ctrc_checkpoint_fixture(&f, TT_SLOT_ABORTED, true, !missing_checkpoint);
+		if (missing_checkpoint) f.checkpoints[0].captured = false;
+		if (!missing_checkpoint) {
+			ClusterColdCtrcReleaseCensusV1 zero = {0};
+			UT_ASSERT(!cluster_cold_typed_ctrc_release_census_v1(&f.typed, &out));
+			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		} else {
+			UT_ASSERT(cluster_cold_typed_ctrc_release_census_v1(&f.typed, &out));
+			UT_ASSERT_EQ(out.released_count, 2);
+			UT_ASSERT(out.unqualified_count != 0);
+		}
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_ctrc_native_release_census_accepts_complete_empty_native_init)
+{
+	TtRedoFixture f;
+	ClusterColdCtrcReleaseCensusV1 out;
+	tt_top_tx_initialized_fixture(&f, 100, 100, 3);
+	tt_redo_seal(&f);
+	tt_top_tx_write_fold(&f);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+	tt_top_tx_effects_complete(&f);
+	tt_top_tx_endpoints_complete(&f);
+	UT_ASSERT(cluster_cold_typed_top_tx_census_v1(&f.typed, TT_C0_FENCE));
+	UT_ASSERT(cluster_cold_typed_ctrc_release_census_v1(&f.typed, &out));
+	UT_ASSERT_EQ(out.subject_count + out.released_count + out.unresolved_count + out.unqualified_count, 0);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_ctrc_native_release_census_refuses_missing_cut_and_clears_output)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		TtRedoFixture f;
+		ClusterColdCtrcReleaseCensusV1 out, zero = {0};
+		tt_ctrc_checkpoint_fixture(&f, TT_SLOT_ABORTED, true, false);
+		if (fault == 0) f.typed.xid_receipt.plan = NULL;
+		if (fault == 1) f.typed.effects_receipt.plan = NULL;
+		if (fault == 2) f.typed.top_tx_census->plan = NULL;
+		if (fault == 3) f.typed.participants[0].thread_id = 1;
+		if (fault == 4) cluster_cold_tt_after_redo_reset_v1(&f.typed);
+		memset(&out, 0xa9, sizeof(out));
+		UT_ASSERT(!cluster_cold_typed_ctrc_release_census_v1(&f.typed, &out));
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_ctrc_native_release_census_includes_another_physical_segment)
+{
+	TtRedoFixture f;
+	PGAlignedBlock extra;
+	ClusterColdCtrcReleaseCensusV1 out;
+	tt_ctrc_checkpoint_fixture(&f, TT_SLOT_ABORTED, true, false);
+	tt_inventory_extra(514, 3, &extra);
+	UT_ASSERT(cluster_undo_segment_header_seal(extra.data));
+	tt_readback_write(514, &extra, false);
+	tt_redo_seed_recapture(&f);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_typed_top_tx_census_v1(&f.typed, TT_C0_FENCE));
+	UT_ASSERT(cluster_cold_typed_ctrc_release_census_v1(&f.typed, &out));
+	UT_ASSERT_EQ(out.subject_count, 3);
+	UT_ASSERT_EQ(out.released_count, 2);
+	UT_ASSERT_EQ(out.unresolved_count, 1);
+	tt_inventory_remove(514);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_ctrc_native_release_census_retains_unqualified_history_subjects)
+{
+	TtRedoFixture f;
+	PGAlignedBlock extra;
+	ClusterColdCtrcReleaseCensusV1 out;
+	tt_ctrc_checkpoint_fixture_with_history(&f, TT_SLOT_ABORTED, true, false, 2);
+	tt_inventory_extra(257, 2, &extra);
+	UT_ASSERT(cluster_undo_segment_header_seal(extra.data));
+	tt_readback_write(257, &extra, false);
+	tt_redo_seed_recapture(&f);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_typed_top_tx_census_v1(&f.typed, TT_C0_FENCE));
+	UT_ASSERT(cluster_cold_typed_ctrc_release_census_v1(&f.typed, &out));
+	UT_ASSERT_EQ(out.subject_count, 3);
+	UT_ASSERT_EQ(out.released_count, 2);
+	UT_ASSERT_EQ(out.unresolved_count, 1);
+	UT_ASSERT_EQ(out.unqualified_count, 2);
+	tt_inventory_remove(257);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_ctrc_native_release_census_does_not_drop_headerless_history_origin)
+{
+	TtRedoFixture f;
+	ClusterColdCtrcReleaseCensusV1 out;
+	tt_ctrc_checkpoint_fixture_with_history(&f, TT_SLOT_ABORTED, true, false, 2);
+	UT_ASSERT_EQ(cluster_cold_tt_after_redo_count_v1(&f.typed), 1);
+	UT_ASSERT(cluster_cold_typed_ctrc_release_census_v1(&f.typed, &out));
+	UT_ASSERT_EQ(out.subject_count, 2);
+	UT_ASSERT_EQ(out.released_count, 2);
+	UT_ASSERT_EQ(out.unqualified_count, 1);
+	tt_redo_destroy(&f);
+}
+
 int
 main(void)
 {
-	UT_PLAN(184);
+	UT_PLAN(192);
+	UT_RUN(tt_ctrc_native_release_census_counts_first_and_last_terminal_slots);
+	UT_RUN(tt_ctrc_native_release_census_keeps_active_and_unreleased_pending);
+	UT_RUN(tt_ctrc_native_release_census_requires_original_base_qualification);
+	UT_RUN(tt_ctrc_native_release_census_accepts_complete_empty_native_init);
+	UT_RUN(tt_ctrc_native_release_census_refuses_missing_cut_and_clears_output);
+	UT_RUN(tt_ctrc_native_release_census_includes_another_physical_segment);
+	UT_RUN(tt_ctrc_native_release_census_retains_unqualified_history_subjects);
+	UT_RUN(tt_ctrc_native_release_census_does_not_drop_headerless_history_origin);
 	UT_RUN(tt_top_tx_census_consumes_native_empty_loser_without_c0_fields);
 	UT_RUN(tt_top_tx_census_retains_all_unproven_active_slots);
 	UT_RUN(tt_top_tx_census_clears_prior_input_on_incomplete_cut);

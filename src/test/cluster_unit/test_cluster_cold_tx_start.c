@@ -243,6 +243,21 @@ static void actual_startup_tx_begin(EndOfWalRecoveryInfo *endOfRecoveryInfo)
 }
 
 static ClusterColdTypedV1 typed;
+static bool ctrc_census_ok, ctrc_census_drift;
+static unsigned ctrc_census_calls;
+static ClusterColdCtrcReleaseCensusV1 ctrc_census;
+
+/* The independent retained-native leg has its own actual TT/fold suite. */
+bool
+cluster_cold_typed_ctrc_release_census_v1(const ClusterColdTypedV1 *input,
+	ClusterColdCtrcReleaseCensusV1 *out)
+{
+	if (input != &typed) abort();
+	ctrc_census_calls++;
+	*out = ctrc_census;
+	if (ctrc_census_drift) observed_writer.epoch++;
+	return ctrc_census_ok;
+}
 static union {
 	uint64 align;
 	unsigned char bytes[offsetof(ClusterColdTopTxCensusV1, entries)
@@ -409,6 +424,10 @@ bool cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 st
 
 static void reset(void)
 {
+	ctrc_census_calls = 0;
+	ctrc_census_ok = true;
+	ctrc_census_drift = false;
+	memset(&ctrc_census, 0, sizeof(ctrc_census));
 	tx_waits = tx_interrupts = 0;
 	tx_wait_drift = false;
 	if (reserved_target != NULL || stamp_live) abort();
@@ -1641,9 +1660,76 @@ UT_TEST(test_original_lmon_does_not_accept_unfinished_or_unproven_tx)
 	}
 }
 
+UT_TEST(test_ctrc_component_is_independent_of_complete_tx_and_fresh_shmem)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ClusterRecoveryCtrcResultObservationV1 out;
+		c0_subject();
+		ctrc_census.subject_count = 1;
+		if (fault == 0) ctrc_census.unresolved_count = 1;
+		if (fault == 1) ctrc_census.unqualified_count = 1;
+		if (fault == 2) ctrc_census_ok = false;
+		UT_ASSERT(cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+		UT_ASSERT_EQ(window_region.checkpoint_owner.tx_result.state,
+			CLUSTER_RECOVERY_TX_RESULT_COMPLETE);
+		UT_ASSERT_EQ(ctrc_census_calls, 1);
+		serving_actor();
+		UT_ASSERT(cluster_recovery_ctrc_result_observe_v1(&out));
+		UT_ASSERT_EQ(out.result.state, CLUSTER_RECOVERY_CTRC_RESULT_PENDING);
+		UT_ASSERT_EQ(out.result.released_count, 0);
+		startup_actor();
+	}
+}
+
+UT_TEST(test_ctrc_component_publishes_only_registered_original_input)
+{
+	for (unsigned empty = 0; empty < 2; empty++) {
+		ClusterRecoveryCtrcResultObservationV1 before, after, zero = {0};
+		reset(); retain(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
+		if (!empty) ctrc_census.subject_count = ctrc_census.released_count = 48;
+		UT_ASSERT(cluster_recovery_ctrc_result_collect_v1(info.cluster_tx_start));
+		serving_actor();
+		UT_ASSERT(cluster_recovery_ctrc_result_observe_v1(&before));
+		UT_ASSERT_EQ(before.result.state, CLUSTER_RECOVERY_CTRC_RESULT_COMPLETE);
+		UT_ASSERT_EQ(before.result.subject_count, empty ? 0 : 48);
+		UT_ASSERT_EQ(before.result.result_generation, 1);
+		UT_ASSERT(memcmp(before.result.input_root_sha256, typed.census_root.image_sha256, 32) == 0);
+		UT_ASSERT(!cluster_recovery_ctrc_result_collect_v1(info.cluster_tx_start));
+		startup_actor();
+		ClusterReleaseColdRecoveryInputs(&info);
+		serving_actor();
+		UT_ASSERT(cluster_recovery_ctrc_result_observe_v1(&after));
+		UT_ASSERT(memcmp(&before, &after, sizeof(before)) == 0);
+		owner_boot++;
+		UT_ASSERT(!cluster_recovery_ctrc_result_observe_v1(&after));
+		UT_ASSERT(memcmp(&after, &zero, sizeof(after)) == 0);
+		startup_actor();
+	}
+}
+
+UT_TEST(test_ctrc_component_rejects_original_source_and_owner_drift)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		reset(); retain(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
+		if (fault == 0) typed.census_root_captured = false;
+		if (fault == 1) memset(typed.census_root.image_sha256, 0, 32);
+		if (fault == 2) typed.census_root.system_identifier++;
+		if (fault == 3) census.plan = NULL;
+		if (fault == 4) ctrc_census_drift = true;
+		if (fault == 5) CurrentResourceOwner = NULL;
+		if (fault == 6) window_region.checkpoint_owner.ctrc_result.result_generation = PG_UINT64_MAX;
+		UT_ASSERT(!cluster_recovery_ctrc_result_collect_v1(info.cluster_tx_start));
+		UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_result.state,
+			CLUSTER_RECOVERY_CTRC_RESULT_EMPTY);
+	}
+}
+
 int main(void)
 {
-	UT_PLAN(45);
+	UT_PLAN(48);
+	UT_RUN(test_ctrc_component_is_independent_of_complete_tx_and_fresh_shmem);
+	UT_RUN(test_ctrc_component_publishes_only_registered_original_input);
+	UT_RUN(test_ctrc_component_rejects_original_source_and_owner_drift);
 	UT_RUN(test_original_owner_binds_complete_empty_census_after_done);
 	UT_RUN(test_native_owner_rejects_uninstalled_recovery_and_writer_drift);
 	UT_RUN(test_current_rechecks_owner_process_boot_and_exact_writer);
