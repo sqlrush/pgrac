@@ -1126,6 +1126,7 @@ stop_pcm_retire(void)
  *	Counter variable declarations live above (before reset_fake_pcm_runtime).
  * ----------
  */
+#ifndef PCM_NATIVE_CV_TEST
 void
 ConditionVariableInit(ConditionVariable *cv pg_attribute_unused())
 {
@@ -1204,6 +1205,7 @@ ConditionVariableSignal(ConditionVariable *cv pg_attribute_unused())
 {
 	/* unused by cluster_pcm_lock.c but linker may require */
 }
+#endif /* PCM_NATIVE_CV_TEST */
 
 TimestampTz
 GetCurrentTimestamp(void)
