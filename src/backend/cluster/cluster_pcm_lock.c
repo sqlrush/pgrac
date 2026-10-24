@@ -414,6 +414,8 @@ struct GrdEntry {
 	uint32 resource_x_dispatch_phase;
 	ClusterPcmResourceXBootstrapRound resource_x_bootstrap_round;
 	ClusterPcmResourceXLocalOwner resource_x_local_owner;
+	/* Observation only; excluded from all native owner validity/authority. */
+	ClusterWaitGraphClaimIdentity resource_x_owner_claim_trace;
 	ResourceXSourceDrainWork resource_x_source_drain;
 	uint64 resource_x_source_drain_release_generation;
 	pg_atomic_uint32 lifecycle;
@@ -448,8 +450,8 @@ struct GrdEntry {
  *	expected constant on this build platform, so silent layout drift
  *	(e.g. a future struct change in a dependency) cannot slip past CI.
  */
-StaticAssertDecl(sizeof(struct GrdEntry) == 1432,
-				 "Stage 8 D2 GrdEntry size must include pinned binding identity");
+StaticAssertDecl(sizeof(struct GrdEntry) == 1456,
+				 "GrdEntry size must include diagnostic claim identity");
 
 
 /*
@@ -10714,6 +10716,7 @@ cluster_pcm_wait_graph_snapshot(const BufferTag *tag, ClusterWaitGraphPcmSnapsho
 		ClusterWaitTrace *successor = &copy->successor;
 
 		copy->handle = owner->handle;
+		copy->claim = entry->resource_x_owner_claim_trace;
 		copy->state = owner->state;
 		copy->highest_generation = owner->highest_owner_generation;
 		copy->held_buffer_id_plus_one = owner->held_buffer_id_plus_one;
@@ -14806,6 +14809,7 @@ pcm_resource_x_local_owner_reset_locked(struct GrdEntry *entry, bool retire_sour
 		pcm_resource_x_source_drain_clear_locked(entry);
 	highest_owner_generation = owner->highest_owner_generation;
 	memset(owner, 0, sizeof(*owner));
+	memset(&entry->resource_x_owner_claim_trace, 0, sizeof(entry->resource_x_owner_claim_trace));
 	owner->highest_owner_generation = highest_owner_generation;
 	if (changed)
 		(void)pcm_resource_x_head_changed_locked(entry, true, pcm_resource_x_monotonic_us());
@@ -15002,6 +15006,24 @@ pcm_resource_x_local_handoff_freeze_locked(struct GrdEntry *entry,
 			   : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 }
 
+/* Diagnostic identity only. Never wait, allocate, resample another process,
+ * refresh a native deadline, or let a missing observation affect the claim. */
+static void
+pcm_wait_graph_claim_record_locked(struct GrdEntry *entry)
+{
+	ClusterWaitGraphClaimIdentity *trace = &entry->resource_x_owner_claim_trace;
+	const ResourceXLocalOwnerHandle *handle = &entry->resource_x_local_owner.handle;
+
+	memset(trace, 0, sizeof(*trace));
+	if (!cluster_trace_tx_identity || MyProc == NULL || MyProcPid <= 0 ||
+		MyProc->pgprocno != handle->owner_procno || MyProc->pid != MyProcPid ||
+		MyProc->cluster_grd_generation == 0 || MyProc->cluster_grd_generation == UINT64_MAX)
+		return;
+	trace->owner_generation = handle->owner_generation;
+	trace->proc_generation = MyProc->cluster_grd_generation;
+	trace->pid = MyProcPid;
+}
+
 static ResourceXApplyResult
 pcm_resource_x_local_owner_claim_locked(struct GrdEntry *entry, uint8 state,
 										const ResourceXAcquisitionRef *ref,
@@ -15052,6 +15074,7 @@ pcm_resource_x_local_owner_claim_locked(struct GrdEntry *entry, uint8 state,
 		= entry->resource_x_bootstrap_round.head_no_progress_deadline_us;
 	owner->handle.owner_procno = owner_procno;
 	owner->state = state;
+	pcm_wait_graph_claim_record_locked(entry);
 	*handle_out = owner->handle;
 	return RESOURCE_X_APPLY_APPLIED;
 }
@@ -18092,6 +18115,7 @@ cluster_pcm_lock_resource_x_itl_recycle_finish_exact(const ResourceXLocalOwnerHa
 				result = RESOURCE_X_APPLY_STALE;
 			} else {
 				memset(&owner->handle, 0, sizeof(owner->handle));
+				memset(&entry->resource_x_owner_claim_trace, 0, sizeof(entry->resource_x_owner_claim_trace));
 				owner->state = RESOURCE_X_LOCAL_OWNER_HANDOFF;
 				result = pcm_resource_x_local_owner_valid_locked(owner)
 								 && pcm_resource_x_head_changed_locked(entry, true, now_us)
@@ -18497,6 +18521,7 @@ cluster_pcm_lock_resource_x_terminal_x_revoke_yield_exact(const ResourceXLocalOw
 			result = RESOURCE_X_APPLY_STALE;
 		} else {
 			memset(&owner->handle, 0, sizeof(owner->handle));
+			memset(&entry->resource_x_owner_claim_trace, 0, sizeof(entry->resource_x_owner_claim_trace));
 			owner->state = RESOURCE_X_LOCAL_OWNER_HANDOFF;
 			result = pcm_resource_x_local_owner_valid_locked(owner)
 							 && pcm_resource_x_head_changed_locked(entry, true, now_us)
@@ -21362,6 +21387,7 @@ cluster_pcm_lock_resource_x_source_finish_claim_exact(const ResourceXAcquisition
 		owner->highest_owner_generation++;
 		owner->handle.owner_generation = owner->highest_owner_generation;
 		owner->handle.owner_procno = owner_procno;
+		pcm_wait_graph_claim_record_locked(entry);
 		out->owner = owner->handle;
 		out->buffer_id = (int32)owner->held_buffer_id_plus_one - 1;
 		owner->held_buffer_id_plus_one = 0;

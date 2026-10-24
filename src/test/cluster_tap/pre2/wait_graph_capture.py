@@ -268,6 +268,27 @@ def pcm_source_custody_bridge(wait, service, resources, snapshots, service_owner
                 owner_claim_incarnation_proven=False, physical_frame_receipt_proven=False)
 
 
+def pcm_claim_incarnation_bridge(wait, service, resources, snapshots, service_owner):
+    """Bind the original native claim to a stable current process observation."""
+    custody = pcm_source_custody_bridge(wait, service, resources, snapshots, service_owner)
+    if custody is None or service_owner.get('stable') is not True:
+        return None
+    source = next(r for r in resources if r.get('kind') == 'pcm' and
+                  r.get('node') == custody['source'] and r.get('tag') == wait['tag'])
+    claim = source['local_owner'].get('claim')
+    if (not isinstance(claim, dict) or
+            any(type(claim.get(k)) is not int or not 0 < claim[k] < 2**64-1 for k in
+                ('pid','proc_generation','owner_generation')) or claim['pid'] >= 2**31 or
+            claim['pid'] != service_owner.get('pid') or
+            claim['proc_generation'] != service_owner.get('proc_generation') or
+            claim['owner_generation'] != custody['owner_generation']):
+        return None
+    return dict(quality='native_claim_incarnation_cut', pid=claim['pid'],
+                procno=custody['owner_procno'], proc_generation=claim['proc_generation'],
+                owner_generation=claim['owner_generation'], incarnation_matches_at_cut=True,
+                peer_open_current_proven=False, physical_frame_receipt_proven=False)
+
+
 def build_graph(snapshots, resources):
     """Join copied native identities only; unknown edges remain in the result."""
     owners, unknown, edges, epochs = {}, [], [], {}
@@ -424,6 +445,7 @@ def build_graph(snapshots, resources):
                         native_admission=pcm_admission_bridge(wait, service, resources),
                         current_context=pcm_current_bridge(wait, service, resources, snapshots),
                         source_custody=pcm_source_custody_bridge(wait, service, resources, snapshots, service_owner),
+                        claim_incarnation=pcm_claim_incarnation_bridge(wait, service, resources, snapshots, service_owner),
                         service_wire_sender_connection=service.get('wire_sender_connection')),
                         'candidate_pcm_service')
             unknown.append(dict(process=identity(row), reason='pcm_service_process_edge_unresolved',

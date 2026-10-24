@@ -26,10 +26,17 @@ typedef struct ClusterWaitGraphPcmBlock {
 	bool decoded, slot_matches, neutral_sender;
 } ClusterWaitGraphPcmBlock;
 
-/* Original holder handle and retained successor use different request spaces.
- * This copy does not bind a historical claim to a current PGPROC incarnation. */
+/* Captured only at an original successful native claim, never reconstructed
+ * from a proc slot at snapshot time. Zero means no observation, not no owner. */
+typedef struct ClusterWaitGraphClaimIdentity {
+	uint64 owner_generation, proc_generation;
+	int32 pid;
+} ClusterWaitGraphClaimIdentity;
+
+/* Original holder handle and retained successor use different request spaces. */
 typedef struct ClusterWaitGraphPcmOwner {
 	ResourceXLocalOwnerHandle handle;
+	ClusterWaitGraphClaimIdentity claim;
 	ClusterWaitTrace successor;
 	uint64 highest_generation;
 	uint32 held_buffer_id_plus_one;

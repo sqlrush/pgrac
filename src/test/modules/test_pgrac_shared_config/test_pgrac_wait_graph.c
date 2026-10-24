@@ -241,9 +241,12 @@ json_pcm_owner(StringInfo out, const ClusterWaitGraphPcmOwner *owner)
 {
 	const ResourceXLocalOwnerHandle *h = &owner->handle;
 	appendStringInfo(out, "{\"valid\":%s,\"successor_known\":%s,\"state\":%u,"
-		"\"highest_generation\":" UINT64_FORMAT ",\"held_buffer_id_plus_one\":%u,\"handle\":{\"tag\":",
+		"\"highest_generation\":" UINT64_FORMAT ",\"held_buffer_id_plus_one\":%u,"
+		"\"claim\":{\"pid\":%d,\"proc_generation\":" UINT64_FORMAT
+		",\"owner_generation\":" UINT64_FORMAT "},\"handle\":{\"tag\":",
 		owner->valid ? "true" : "false", owner->successor_known ? "true" : "false",
-		owner->state, owner->highest_generation, owner->held_buffer_id_plus_one);
+		owner->state, owner->highest_generation, owner->held_buffer_id_plus_one,
+		owner->claim.pid, owner->claim.proc_generation, owner->claim.owner_generation);
 	json_tag(out, &h->ref.assertion.resource);
 	appendStringInfo(out, ",\"requester\":%d,\"formation\":" UINT64_FORMAT
 		",\"acquisition\":" UINT64_FORMAT ",\"master_session\":" UINT64_FORMAT

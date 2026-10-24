@@ -290,6 +290,46 @@ class GraphTests(unittest.TestCase):
             successor=dict(wait, ordered_lane=4, authority=3))
         return wait, service, resources, snapshots, snapshots[1]['owners'][0]
 
+    def claim_incarnation_fixture(self):
+        wait, service, resources, snapshots, owner = self.source_custody_fixture()
+        owner['stable'] = True
+        next(r for r in resources if r['node']==1)['local_owner']['claim'] = dict(
+            pid=20, proc_generation=18, owner_generation=4)
+        return wait, service, resources, snapshots, owner
+
+    def test_claim_incarnation_binds_original_claim_and_keeps_candidate_boundary(self):
+        wait, service, resources, snapshots, owner = self.claim_incarnation_fixture()
+        proof = graph.pcm_claim_incarnation_bridge(wait, service, resources, snapshots, owner)
+        self.assertEqual(proof['quality'], 'native_claim_incarnation_cut')
+        self.assertEqual([proof[k] for k in ('pid','procno','proc_generation','owner_generation')],
+                         [20,2,18,4])
+        self.assertTrue(proof['incarnation_matches_at_cut'])
+        self.assertFalse(proof['physical_frame_receipt_proven'])
+        self.assertFalse(proof['peer_open_current_proven'])
+        result = graph.build_graph(snapshots, resources)
+        self.assertEqual(result['edges'][0]['resource']['claim_incarnation'], proof)
+        self.assertEqual(result['edges'][0]['quality'], 'candidate_pcm_service')
+        self.assertFalse(result['complete']); self.assertEqual(result['cycles'], [])
+
+    def test_claim_incarnation_rejects_reused_slots_and_unknown_native_claim(self):
+        wait, service, resources, snapshots, owner = self.claim_incarnation_fixture()
+        for field in ('pid','proc_generation','owner_generation'):
+            for value in (None, False, 0, -1, '18', 2**64-1, 999):
+                rs=copy.deepcopy(resources)
+                next(r for r in rs if r['node']==1)['local_owner']['claim'][field]=value
+                self.assertIsNone(graph.pcm_claim_incarnation_bridge(wait,service,rs,snapshots,owner),
+                                  (field,value))
+        for claim in (None, [], {}, dict(pid=20,proc_generation=18)):
+            rs=copy.deepcopy(resources)
+            next(r for r in rs if r['node']==1)['local_owner']['claim']=claim
+            self.assertIsNone(graph.pcm_claim_incarnation_bridge(wait,service,rs,snapshots,owner))
+        for field,value in (('pid',21),('proc_generation',19),('stable',False),('stable',None)):
+            self.assertIsNone(graph.pcm_claim_incarnation_bridge(
+                wait,service,resources,snapshots,dict(owner,**{field:value})), (field,value))
+        # Matching process identity cannot override an unproved native source owner.
+        next(r for r in resources if r['node']==1)['local_owner']['state']=5
+        self.assertIsNone(graph.pcm_claim_incarnation_bridge(wait,service,resources,snapshots,owner))
+
     def test_source_custody_keeps_holder_successor_and_peer_namespaces_separate(self):
         wait, service, resources, snapshots, owner = self.source_custody_fixture()
         proof = graph.pcm_source_custody_bridge(wait, service, resources, snapshots, owner)
