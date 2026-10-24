@@ -20823,6 +20823,17 @@ cluster_heap_freeze_apply_xmin_batch_locked_v1(
 		|| bounds.horizon_scn != horizon_scn)
 		return false;
 
+	/* Native FREEZE_PAGE keeps a raw conflict horizon. Recheck the original
+	 * creator against the same legal-next window after the final callbacks;
+	 * equality of F/H alone cannot qualify this narrowing. */
+	for (uint16 i = 0; i < target_count; i++)
+		if (!FullTransactionIdPrecedes(targets[i].original_creator_full_xid,
+			input->freeze_policy->legal_next)
+			|| U64FromFullTransactionId(input->freeze_policy->legal_next)
+				- U64FromFullTransactionId(targets[i].original_creator_full_xid)
+				>= UINT64CONST(0x80000000))
+			return false;
+
 	/* XLogInsertRecord stamps the existing local SCN clock, not H. The
 	 * caller must have observed H before borrowing the page lock; do not
 	 * advance the clock or introduce callbacks/waits under that lock here. */
@@ -20892,6 +20903,16 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 		targets, target_count, freeze_limit_full, horizon_scn,
 		plans, lengthof(plans), &conflict_horizon))
 		return false;
+	/* Each retained creator must be in the same sampled native past window,
+	 * not merely close to the other creators in this batch. No original
+	 * identity is derived from a raw XID by this comparison. */
+	for (uint16 i = 0; i < target_count; i++)
+		if (!FullTransactionIdPrecedes(targets[i].original_creator_full_xid,
+			input->freeze_policy->legal_next)
+			|| U64FromFullTransactionId(input->freeze_policy->legal_next)
+				- U64FromFullTransactionId(targets[i].original_creator_full_xid)
+				>= UINT64CONST(0x80000000))
+			return false;
 	buf = GetBufferDescriptor(buffer - 1);
 	if (LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
 		return cluster_heap_freeze_apply_xmin_batch_locked_v1(rel, buffer,

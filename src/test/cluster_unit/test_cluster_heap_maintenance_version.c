@@ -111,6 +111,7 @@ static unsigned full_target_checks;
 static unsigned target_preflight_checks, census_preflight_checks;
 static bool preflight_target_error, preflight_revoke_census, allow_preflight_target;
 static ClusterHeapFreezeCohortObservation *retire_bounds_after_target;
+static ClusterHeapFreezePolicySampleV1 *advance_legal_next_after_target;
 
 /* The real native apply reads this clock before mutation. WAL insertion's
  * existing production xl_scn stamp uses the same clock; this leaf captures
@@ -338,6 +339,9 @@ cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 	if (revoke_target_census) admission_current = false;
 	if (retire_bounds_after_target != NULL)
 		retire_bounds_after_target->horizon_scn++;
+	if (advance_legal_next_after_target != NULL)
+		advance_legal_next_after_target->legal_next = FullTransactionIdFromU64(
+			U64FromFullTransactionId(advance_legal_next_after_target->legal_next) + 1);
 	return full_target_current;
 }
 
@@ -713,6 +717,7 @@ reset(uint8 opcode, bool shared)
 	target_preflight_checks = census_preflight_checks = 0;
 	preflight_target_error = preflight_revoke_census = allow_preflight_target = false;
 	retire_bounds_after_target = NULL;
+	advance_legal_next_after_target = NULL;
 	local_x = writer_current = route_current = authority_current = admission_current = true;
 	local_share = resume_allowed = resume_error = resumed_writer = false;
 	node_grant_current = true;
@@ -2815,10 +2820,102 @@ UT_TEST(test_xmin_capture_refusal_precedes_writer_resume)
 	}
 }
 
+UT_TEST(test_xmin_native_horizon_refuses_creator_outside_legal_window)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int released = 0; released < 2; released++) {
+			for (int past_half = 0; past_half < 2; past_half++) {
+				QualifiedXminFixture f;
+				ClusterHeapFreezeXminTargetV1 targets[3];
+				uint64 creator;
+
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
+			creator = batch ? Min(U64FromFullTransactionId(targets[0].original_creator_full_xid),
+				U64FromFullTransactionId(targets[1].original_creator_full_xid))
+				: U64FromFullTransactionId(f.page.tuples[0].original_creator_full_xid);
+				f.policy.legal_next = FullTransactionIdFromU64(creator + UINT64CONST(0x80000000) + past_half);
+				f.cohort.future_full_xid_max = U64FromFullTransactionId(f.policy.legal_next);
+				if (released) { fixture_release_original_writer(); resume_allowed = true; }
+				UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 2)
+					: qualified_xmin_apply(&f, 0)));
+				UT_ASSERT_EQ(writer_checks + route_checks + admission_checks, 0);
+				UT_ASSERT_EQ(conditional_resumes + conditional_unlocks, 0);
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+				UT_ASSERT_EQ(backend_pin_count, 1);
+				UT_ASSERT(f.admission.entered && local_x == !released && !resumed_writer);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_xmin_native_horizon_keeps_strictly_inside_legal_window)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int released = 0; released < 2; released++) {
+			for (int inside = 0; inside < 2; inside++) {
+				QualifiedXminFixture f;
+				ClusterHeapFreezeXminTargetV1 targets[3];
+				uint64 creator;
+
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
+			creator = batch ? Min(U64FromFullTransactionId(targets[0].original_creator_full_xid),
+				U64FromFullTransactionId(targets[1].original_creator_full_xid))
+				: U64FromFullTransactionId(f.page.tuples[0].original_creator_full_xid);
+				f.policy.legal_next = FullTransactionIdFromU64(creator + UINT64CONST(0x7fffffff) - inside);
+				f.cohort.future_full_xid_max = U64FromFullTransactionId(f.policy.legal_next);
+				if (released) { fixture_release_original_writer(); resume_allowed = true; }
+				UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 2)
+					: qualified_xmin_apply(&f, 0));
+				UT_ASSERT_EQ(inserts, 1);
+				UT_ASSERT_EQ(flushes, 1);
+				UT_ASSERT_EQ(conditional_resumes, released);
+				UT_ASSERT_EQ(conditional_unlocks, released);
+				UT_ASSERT_EQ(backend_pin_count, 1);
+				UT_ASSERT(f.admission.entered && local_x == !released && !resumed_writer);
+			}
+		}
+	}
+}
+
+UT_TEST(test_xmin_native_horizon_rechecks_legal_window_after_final_target)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int released = 0; released < 2; released++) {
+			QualifiedXminFixture f;
+			ClusterHeapFreezeXminTargetV1 targets[3];
+			uint64 creator;
+
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
+			creator = batch ? Min(U64FromFullTransactionId(targets[0].original_creator_full_xid),
+				U64FromFullTransactionId(targets[1].original_creator_full_xid))
+				: U64FromFullTransactionId(f.page.tuples[0].original_creator_full_xid);
+			f.policy.legal_next = FullTransactionIdFromU64(creator + UINT64CONST(0x7fffffff));
+			f.cohort.future_full_xid_max = U64FromFullTransactionId(f.policy.legal_next);
+			advance_legal_next_after_target = &f.policy;
+			if (released) { fixture_release_original_writer(); resume_allowed = true; }
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 2)
+				: qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(full_target_checks, 1);
+			UT_ASSERT_EQ(conditional_unlocks, released);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(f.admission.entered && local_x == !released && !resumed_writer);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(78);
+	UT_PLAN(81);
+	UT_RUN(test_xmin_native_horizon_refuses_creator_outside_legal_window);
+	UT_RUN(test_xmin_native_horizon_keeps_strictly_inside_legal_window);
+	UT_RUN(test_xmin_native_horizon_rechecks_legal_window_after_final_target);
 	UT_RUN(test_xmin_capture_refusal_precedes_writer_resume);
 	UT_RUN(test_xmin_apply_requires_same_bound_sources);
 	UT_RUN(test_xmin_rechecks_same_bound_sources_after_final_target);

@@ -439,6 +439,9 @@ extern bool cluster_heap_freeze_prepare_xmin_batch_v1(
  * The input must borrow the original policy/cohort companions for the whole
  * attempt. Their pure same-admission match must reproduce both complete F
  * and H arguments, before writer use and after the final identity callbacks.
+ * Every selected creator must also be strictly within that policy legal-next
+ * past half-space before a raw native WAL conflict horizon is used. This
+ * comparison preserves the original FullXid; it does not infer its epoch.
  * Their separate current/provenance/retention qualification remains required;
  * the match performs no sampling or callback under page locks.
  *
