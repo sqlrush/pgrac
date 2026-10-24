@@ -115,6 +115,8 @@ static ClusterHeapFreezePolicySampleV1 *advance_legal_next_after_target;
 static uint64 registration_generation;
 static unsigned registration_checks;
 static bool advance_registration_after_target, advance_registration_in_clock;
+static bool advance_registration_in_space;
+static unsigned space_observation_checks;
 
 /* The real shared-engine cut check is covered by the cleaner fixture.
  * This leaf controls concurrent ingress while the actual native body runs. */
@@ -474,8 +476,10 @@ bool
 BufferIsPermanent(Buffer buffer)
 {
 	UT_ASSERT_EQ(buffer, 1);
+	space_observation_checks++;
 	if (space_permanence_error)
 		elog(ERROR, "injected SPACE buffer observation ERROR");
+	if (advance_registration_in_space) registration_generation++;
 	return space_buffer_permanent;
 }
 SCN
@@ -588,7 +592,8 @@ static bool
 heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 						   TransactionId snapshotConflictHorizon,
 						   HeapTupleFreeze *tuples, int ntuples,
-						   const ClusterSpaceIdentity *identity, bool conditional)
+						   const ClusterSpaceIdentity *identity, bool conditional,
+						   const ClusterCtrcActiveScan *registration_cut)
 #include "test_cluster_heap_freeze_apply.inc"
 
 #include "test_cluster_heap_freeze_xmin_apply.inc"
@@ -739,6 +744,7 @@ reset(uint8 opcode, bool shared)
 	advance_legal_next_after_target = NULL;
 	registration_generation = 41; registration_checks = 0;
 	advance_registration_after_target = advance_registration_in_clock = false;
+	advance_registration_in_space = false; space_observation_checks = 0;
 	local_x = writer_current = route_current = authority_current = admission_current = true;
 	local_share = resume_allowed = resume_error = resumed_writer = false;
 	node_grant_current = true;
@@ -886,7 +892,7 @@ UT_TEST(test_qualified_freeze_kernel_changes_only_planned_headers)
 		tuples[i].t_infomask = HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID;
 		tuples[i].checkflags = HEAP_FREEZE_CHECK_XMIN_COMMITTED;
 	}
-	heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 2, &space_identity, false);
+	heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 2, &space_identity, false, NULL);
 	check_publication(true);
 	UT_ASSERT_EQ(tx_checks, 0);
 	UT_ASSERT_EQ(freeze_data_calls, 2);
@@ -991,7 +997,7 @@ UT_TEST(test_exact_xmin_plan_preserves_xmax_through_native_wal_and_redo)
 		if (!prepared)
 			continue;
 		tx_committed = false;
-		heap_freeze_apply_prepared(&relation_data, 1, 70, &plan, 1, &space_identity, false);
+		heap_freeze_apply_prepared(&relation_data, 1, 70, &plan, 1, &space_identity, false, NULL);
 		check_publication(true);
 		UT_ASSERT_EQ(tx_checks, 0);
 		UT_ASSERT_EQ(freeze_data_calls, 2);
@@ -1757,7 +1763,7 @@ UT_TEST(test_freeze_native_wal_dedup_and_redo)
 			tuples[i].checkflags = HEAP_FREEZE_CHECK_XMIN_COMMITTED;
 		}
 		if (shared)
-			heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 3, &space_identity, false);
+			heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 3, &space_identity, false, NULL);
 		else
 			run_freeze(&relation_data, 1, 70, tuples, 3, NULL);
 		check_publication(shared);
@@ -1829,7 +1835,7 @@ UT_TEST(test_freeze_kernel_rejects_invalid_space_before_write)
 		expecting_error = true;
 		if (setjmp(error_jump) == 0) {
 			heap_freeze_apply_prepared(&relation_data, 1, 70, &tuple, 1,
-									 bad == 4 ? NULL : &space_identity, false);
+									 bad == 4 ? NULL : &space_identity, false, NULL);
 			UT_ASSERT(false);
 		}
 		expecting_error = false;
@@ -2676,6 +2682,33 @@ UT_TEST(test_xmin_space_refusal_is_conditional)
 	}
 }
 
+UT_TEST(test_xmin_registration_cut_rechecked_after_actual_space_prepare)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int released = 0; released < 2; released++) {
+			QualifiedXminFixture f;
+			ClusterHeapFreezeXminTargetV1 targets[3];
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
+			if (released) { fixture_release_original_writer(); resume_allowed = true; }
+			/* Keep the real SPACE component/prepare path. Only its original
+			 * buffer observation leaf advances the controlled ingress cut. */
+			advance_registration_in_space = true;
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 2)
+				: qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(space_observation_checks, 1);
+			UT_ASSERT_EQ(registration_checks, 2);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT_EQ(CritSectionCount, 0);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(f.admission.entered && local_x == !released && !resumed_writer);
+			UT_ASSERT_EQ(conditional_resumes, released);
+			UT_ASSERT_EQ(conditional_unlocks, released);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
 UT_TEST(test_xmin_space_error_still_propagates)
 {
 	for (int batch = 0; batch < 2; batch++) {
@@ -2719,7 +2752,7 @@ UT_TEST(test_original_freeze_space_refusal_still_errors)
 	space_buffer_permanent = false; expecting_error = true;
 	PG_TRY();
 	{
-		heap_freeze_apply_prepared(&relation_data, 1, 77, &plan, 1, &space_identity, false);
+		heap_freeze_apply_prepared(&relation_data, 1, 77, &plan, 1, &space_identity, false, NULL);
 	}
 	PG_CATCH(); { caught = true; } PG_END_TRY();
 	expecting_error = false;
@@ -2990,7 +3023,7 @@ UT_TEST(test_xmin_native_horizon_rechecks_legal_window_after_final_target)
 int
 main(void)
 {
-	UT_PLAN(83);
+	UT_PLAN(84);
 	UT_RUN(test_xmin_native_horizon_refuses_creator_outside_legal_window);
 	UT_RUN(test_xmin_native_horizon_keeps_strictly_inside_legal_window);
 	UT_RUN(test_xmin_native_horizon_rechecks_legal_window_after_final_target);
@@ -2998,6 +3031,7 @@ main(void)
 	UT_RUN(test_xmin_apply_requires_same_bound_sources);
 	UT_RUN(test_xmin_registration_cut_refusal_precedes_writer_use);
 	UT_RUN(test_xmin_registration_cut_rechecked_after_final_callbacks);
+	UT_RUN(test_xmin_registration_cut_rechecked_after_actual_space_prepare);
 	UT_RUN(test_xmin_rechecks_same_bound_sources_after_final_target);
 	UT_RUN(test_recapture_retires_previous_bound_sources);
 	UT_RUN(test_xmin_space_refusal_is_conditional);

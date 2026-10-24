@@ -20599,7 +20599,8 @@ heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 						   TransactionId snapshotConflictHorizon,
 						   HeapTupleFreeze *tuples, int ntuples
 #ifdef USE_PGRAC_CLUSTER
-						   , const ClusterSpaceIdentity *identity, bool conditional
+						   , const ClusterSpaceIdentity *identity, bool conditional,
+						   const ClusterCtrcActiveScan *registration_cut
 #endif
 						   )
 {
@@ -20632,6 +20633,15 @@ heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 			elog(ERROR, "PGRAC shared heap freeze requires exact SPACE identity");
 		}
 	}
+	/* SPACE preparation also observes live state. Retain the same original
+	 * local ingress cut until immediately before the critical section; this
+	 * bounded atomic check adds no protection or producer qualification. */
+	if (conditional
+		&& (registration_cut == NULL
+			|| registration_cut->status != CTRC_ACTIVE_SCAN_COMPLETE
+			|| registration_cut->unqualified_entries != 0
+			|| !cluster_ctrc_active_scan_registration_current(registration_cut)))
+		return false;
 #endif
 	START_CRIT_SECTION();
 #ifdef USE_PGRAC_CLUSTER
@@ -20841,19 +20851,10 @@ cluster_heap_freeze_apply_xmin_batch_locked_v1(
 	if (!SCN_VALID(wal_clock) || scn_time_cmp(wal_clock, horizon_scn) < 0)
 		return false;
 
-	/* TARGET/clock observations can overlap new local unknown ingress.
-	 * Recheck the same retained cut before entering the native WAL kernel;
-	 * no source fetch, census lock or new admission is introduced here. */
-	if (input->freeze_cohort->local_registration_cut.status != CTRC_ACTIVE_SCAN_COMPLETE
-		|| input->freeze_cohort->local_registration_cut.unqualified_entries != 0
-		|| !cluster_ctrc_active_scan_registration_current(
-			&input->freeze_cohort->local_registration_cut))
-		return false;
-
 	/* Native redo and the existing SPACE version edge remain the only format. */
 	if (!heap_freeze_apply_prepared(rel, buffer,
 		conflict_horizon, plans, target_count,
-		&fence->identity, true))
+		&fence->identity, true, &input->freeze_cohort->local_registration_cut))
 		return false;
 	XLogFlush(PageGetLSN(live_page));
 	return true;
@@ -21073,7 +21074,7 @@ heap_freeze_execute_prepared(Relation rel, Buffer buffer,
 	heap_freeze_apply_prepared(rel, buffer, snapshotConflictHorizon, tuples,
 							   ntuples
 #ifdef USE_PGRAC_CLUSTER
-							   , identity, false
+							   , identity, false, NULL
 #endif
 							   );
 }
