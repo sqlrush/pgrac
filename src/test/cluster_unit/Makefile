@@ -68,7 +68,7 @@ TESTS = test_cluster_vm_read_visibility test_cluster_heap_maintenance test_clust
         test_cluster_bufmgr_stop test_cluster_allocation_stop test_cluster_hw_cold test_cluster_hw_initdb test_cluster_shared_parameters test_cluster_shared_config_alter test_cluster_checkpoint_pi_tick test_cluster_native_wal_stop test_cluster_checkpointer_stop test_cluster_postmaster_stop test_cluster_xnode_profile test_cluster_adg \
         test_cluster_xnode_lever test_cluster_ges_handoff \
         test_cluster_reverse_key test_cluster_hw_lease test_cluster_pi_shadow \
-        test_cluster_wait_events test_cluster_postmaster_lwlock test_cluster_phase_publication test_cluster_checkpoint_cleanup test_cluster_checkpoint_wait_budget test_cluster_checkpoint_error test_cluster_errcodes test_cluster_guc \
+        test_cluster_wait_events test_cluster_postmaster_lwlock test_cluster_phase_publication test_cluster_checkpoint_cleanup test_cluster_checkpoint_wait_budget test_cluster_checkpoint_error test_cluster_abort_exit_guard test_cluster_errcodes test_cluster_guc \
         test_cluster_shmem test_cluster_signal test_cluster_views \
         test_cluster_gviews test_cluster_ic test_cluster_ic_envelope \
         test_cluster_ic_router test_cluster_ic_rdma \
@@ -440,6 +440,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_buffer_cr test_cluster_buffer_mapping 
 SIMPLE_TESTS := $(filter-out test_cluster_pi_contribution_stream,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_prepare_diagnostic,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_horizon,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_abort_exit_guard,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_tt_terminal_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_pacemaker test_pgrac_fenced_cib,$(SIMPLE_TESTS))
@@ -994,6 +995,17 @@ test_cluster_checkpoint_request.inc: $(top_srcdir)/src/backend/postmaster/checkp
 	mv $@.tmp $@
 
 test_cluster_checkpoint_error: test_cluster_checkpoint_error.c test_cluster_checkpointer_stop.c test_cluster_checkpointer_stop.inc test_cluster_cf_observation.inc test_cluster_checkpoint_error_state.inc test_cluster_checkpoint_error.inc test_cluster_checkpoint_request.inc unit_test.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
+# Actual EXIT guard and its non-reporting native pipe probe, in child processes.
+test_cluster_abort_exit_guard.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
+	awk '/^cluster_abort_postmaster_dead\(/ { print "static bool"; emit=1; probes++ } \
+	     /^cluster_abort_exit_guard\(/ { print "static void"; emit=1; guards++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (guards != 1 || probes > 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_abort_exit_guard: test_cluster_abort_exit_guard.c test_cluster_abort_exit_guard.inc unit_test.h $(top_srcdir)/src/include/postmaster/postmaster.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 # PGRAC: execute the native adapter, not source-string assertions.
@@ -4828,6 +4840,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_tt_rollback_entry.inc
 	rm -f test_cluster_tt_resolve_entry.inc
 	rm -f test_cluster_tt_terminal_route.inc test_cluster_tt_terminal_route.inc.tmp
+	rm -f test_cluster_abort_exit_guard.inc
 	rm -f test_cluster_tt_checkpoint_apply.inc test_cluster_tt_checkpoint_wait.inc \
 		test_cluster_tt_checkpoint_redo.inc test_cluster_tt_checkpoint_native.inc \
 		test_cluster_tt_checkpoint_select.inc test_cluster_tt_checkpoint_guts.inc \

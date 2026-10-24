@@ -140,6 +140,7 @@
 #include "libpq/be-fsstubs.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
+#include "postmaster/postmaster.h"
 #include "pg_trace.h"
 #include "pgstat.h"
 #include "replication/logical.h"
@@ -3456,11 +3457,38 @@ cluster_abort_completion_failed(const char *stage)
 	pg_unreachable();
 }
 
+/* The native monitor fd is nonblocking. Do not call the reporting wrapper
+ * here: its FATAL on a pipe error could resume remaining exit callbacks. */
+static bool
+cluster_abort_postmaster_dead(void)
+{
+	if (!IsUnderPostmaster)
+		return false;
+#ifndef WIN32
+	{
+		char byte;
+
+		return read(postmaster_alive_fds[POSTMASTER_FD_WATCH], &byte, 1) == 0;
+	}
+#else
+	return WaitForSingleObject(PostmasterHandle, 0) == WAIT_OBJECT_0;
+#endif
+}
+
 static void
 cluster_abort_exit_guard(int code, Datum arg)
 {
 	if (cluster_abort_in_progress)
+	{
+		/* With the postmaster gone, shared-memory cleanup cannot complete
+		 * reliably. Follow native quickdie's crash exit, leaving the original
+		 * transaction debt to recovery; do not report a terminal or continue
+		 * exit callbacks. Probe the native pipe directly: the possible-death
+		 * signal hint alone is not a positive liveness observation here. */
+		if (cluster_abort_postmaster_dead())
+			_exit(2);
 		cluster_abort_completion_failed("EXIT");
+	}
 }
 
 void
