@@ -302,7 +302,161 @@ extend(bool private, ForkNumber fork)
 								  .relpersistence = RELPERSISTENCE_PERMANENT };
 
 	return ExtendBufferedRelShared(bmr, fork, NULL, EB_SKIP_EXTENSION_LOCK, 2, InvalidBlockNumber,
-								   buffers, &extended);
+								   buffers, &extended, NULL, NULL);
+}
+
+static BlockNumber
+extend_preheld_identity(ForkNumber fork, const HwLock *lock,
+						const ClusterSpaceIdentity *captured)
+{
+	Buffer buffers[2];
+	uint32 extended;
+	BufferManagerRelation bmr = { .rel = &relation, .smgr = &storage,
+								  .relpersistence = RELPERSISTENCE_PERMANENT };
+
+	return ExtendBufferedRelShared(bmr, fork, NULL, EB_SKIP_EXTENSION_LOCK, 2,
+								   InvalidBlockNumber, buffers, &extended, lock, captured);
+}
+
+static BlockNumber
+extend_preheld(ForkNumber fork, const HwLock *lock)
+{
+	ClusterSpaceIdentity captured = identity;
+
+	return extend_preheld_identity(fork, lock, &captured);
+}
+
+static HwLock
+preheld_hw(void)
+{
+	HwLock lock = { 0 };
+
+	lock.held = lock.coordinated = hw_held = true;
+	form.relkind = RELKIND_INDEX;
+	identity.state = CLUSTER_SPACE_IDENTITY_LIVE;
+	lock.req.lockmode = ExclusiveLock;
+	lock.req.request_id = 123;
+	cluster_hw_resid_encode(identity.key.locator, MAIN_FORKNUM, &lock.req.resid);
+	return lock;
+}
+
+UT_TEST(test_preheld_hw_is_not_reacquired_or_released_by_extension)
+{
+	HwLock lock, before;
+
+	reset();
+	owner_expected = true;
+	lock = preheld_hw();
+	memcpy(&before, &lock, sizeof(before));
+	UT_ASSERT_EQ(extend_preheld(MAIN_FORKNUM, &lock), 200);
+	UT_ASSERT(hw_held);
+	UT_ASSERT(memcmp(&lock, &before, sizeof(lock)) == 0);
+	UT_ASSERT_EQ(reservations, 1);
+	UT_ASSERT_EQ(identity_reads, 0); /* Identity was captured before HW. */
+	UT_ASSERT_EQ(owner_enters, 1);
+	UT_ASSERT_EQ(owner_ends, 1);
+	cluster_hw_unlock(&lock); /* Only the enclosing owner releases HW. */
+	UT_ASSERT(!hw_held);
+}
+
+UT_TEST(test_preheld_hw_survives_extension_error_for_outer_unwind)
+{
+	HwLock lock, before;
+	volatile bool caught = false;
+
+	reset();
+	owner_expected = true;
+	lock = preheld_hw();
+	memcpy(&before, &lock, sizeof(before));
+	throw_grant = true;
+	PG_TRY();
+	{
+		(void)extend_preheld(MAIN_FORKNUM, &lock);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT(hw_held);
+	UT_ASSERT(memcmp(&lock, &before, sizeof(lock)) == 0);
+	UT_ASSERT_EQ(owner_aborts, 1);
+	cluster_hw_unlock(&lock);
+}
+
+UT_TEST(test_preheld_hw_rejects_invalid_handle_and_noncanonical_scope)
+{
+	for (int variant = 0; variant < 10; variant++) {
+		HwLock lock, before;
+		volatile bool caught = false;
+		ForkNumber fork = MAIN_FORKNUM;
+		const ClusterSpaceIdentity *captured = &identity;
+
+		reset();
+		lock = preheld_hw();
+		if (variant == 0)
+			lock.held = false;
+		else if (variant == 1)
+			lock.coordinated = false;
+		else if (variant == 2)
+			lock.req.lockmode = ShareLock;
+		else if (variant == 3) {
+			RelFileLocator other = identity.key.locator;
+			other.relNumber++;
+			cluster_hw_resid_encode(other, MAIN_FORKNUM, &lock.req.resid);
+		}
+		else if (variant == 4)
+			fork = FSM_FORKNUM;
+		else if (variant == 5)
+			cluster_shared_config = false;
+		else if (variant == 6)
+			form.relkind = RELKIND_RELATION;
+		else if (variant == 7)
+			identity.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+		else if (variant == 8)
+			identity.key.locator.relNumber++;
+		else
+			captured = NULL;
+		memcpy(&before, &lock, sizeof(before));
+		PG_TRY();
+		{
+			(void)extend_preheld_identity(fork, &lock, captured);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT(hw_held);
+		UT_ASSERT(memcmp(&lock, &before, sizeof(lock)) == 0);
+		UT_ASSERT_EQ(victims + reservations + legacy_allocations + size_reads, 0);
+	}
+}
+
+UT_TEST(test_preheld_hw_reservation_refusal_has_no_native_fallback)
+{
+	HwLock lock;
+	volatile bool caught = false;
+
+	reset();
+	lock = preheld_hw();
+	refuse_grant = true;
+	PG_TRY();
+	{
+		(void)extend_preheld(MAIN_FORKNUM, &lock);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT(hw_held && lock.held);
+	UT_ASSERT_EQ(size_reads + legacy_allocations + identity_reads, 0);
+	UT_ASSERT_EQ(victims, unpins);
+	cluster_hw_unlock(&lock);
 }
 
 UT_TEST(test_single_live_and_private_callers_use_canonical_reservations)
@@ -686,7 +840,11 @@ UT_TEST(test_invalid_extension_owner_does_not_wait_as_if_only_fenced)
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(15);
+	UT_RUN(test_preheld_hw_is_not_reacquired_or_released_by_extension);
+	UT_RUN(test_preheld_hw_survives_extension_error_for_outer_unwind);
+	UT_RUN(test_preheld_hw_rejects_invalid_handle_and_noncanonical_scope);
+	UT_RUN(test_preheld_hw_reservation_refusal_has_no_native_fallback);
 	UT_RUN(test_single_live_and_private_callers_use_canonical_reservations);
 	UT_RUN(test_nonshared_and_auxiliary_keep_native_extension);
 	UT_RUN(test_refusals_do_not_fall_back_to_file_size);

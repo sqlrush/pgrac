@@ -349,8 +349,10 @@ extern void cluster_hw_apply_hwm(const ClusterResId *resid, BlockNumber hwm);
 
 /*
  * HwLock -- a held HW(X) acquire, returned by cluster_hw_lock and passed to
- * cluster_hw_unlock.  Stack-allocated by the extend caller; HW is acquired and
- * released within one ExtendBufferedRelShared, so it is not reentrant.
+ * cluster_hw_unlock. Primary acquisition is not reentrant. Ordinary extension
+ * owns its stack handle and releases it within ExtendBufferedRelShared. An
+ * explicit preheld index-extension consumer only borrows the caller's handle;
+ * that enclosing caller remains responsible for its lifetime and release.
  */
 typedef struct HwLock {
 	bool held;

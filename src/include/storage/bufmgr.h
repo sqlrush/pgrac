@@ -28,6 +28,8 @@
 #include "utils/snapmgr.h"
 
 typedef void *Block;
+struct HwLock;
+struct ClusterSpaceIdentity;
 
 /*
  * Possible arguments for GetAccessStrategy().
@@ -199,6 +201,19 @@ extern Buffer ExtendBufferedRel(BufferManagerRelation bmr,
 								ForkNumber forkNum,
 								BufferAccessStrategy strategy,
 								uint32 flags);
+#ifdef USE_PGRAC_CLUSTER
+/* B-tree allocation after its caller acquired exact MAIN HW before page locks.
+ * Resolve the complete SPACE identity before HW and pass the owned snapshot;
+ * the original reservation consumer must still recheck canonical current bytes.
+ * The caller retains ownership and must release HW on every exit, including
+ * ERROR. This consumer neither reacquires nor releases the borrowed handle. */
+extern Buffer ExtendBufferedRelWithHW(BufferManagerRelation bmr,
+									 ForkNumber forkNum,
+									 BufferAccessStrategy strategy,
+									 uint32 flags,
+									 const struct HwLock *preheld_hw,
+									 const struct ClusterSpaceIdentity *space_identity);
+#endif
 extern BlockNumber ExtendBufferedRelBy(BufferManagerRelation bmr,
 									   ForkNumber fork,
 									   BufferAccessStrategy strategy,
