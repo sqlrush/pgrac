@@ -465,6 +465,10 @@ cluster_semantic_activation.o cluster_recovery_merge.o cluster_control_root.o: \
 	$(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h
 cluster_recovery_plan.o: $(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h
 
+storage/cluster_undo_smgr.o: $(top_srcdir)/src/include/cluster/cluster_undo_smgr.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_tt_record.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h
+
 cluster_page_authority.o cluster_ir_lock.o cluster_recovery_merge.o \
 cluster_wal_retention.o cluster_thread_recovery_worker.o cluster_control_root.o \
 cluster_thread_recovery_authority.o cluster_thread_recovery_finalize.o: \

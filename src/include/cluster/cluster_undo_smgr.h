@@ -177,6 +177,24 @@ extern bool cluster_undo_smgr_recovery_abort_durable_v1(ClusterUndoSmgrRecoveryS
  * recovery duty/window or turns a failed write into completion. */
 extern bool cluster_undo_smgr_recovery_abort_close_v1(ClusterUndoSmgrRecoveryStampV1 stamp);
 
+#ifdef USE_PGRAC_CLUSTER
+/* Original dormant D0 storage adapter. Shares the ResourceOwner stage with
+ * C0 using a distinct kind; no cross-kind write/close/durability observation.
+ * Caller keeps source/graph/target authority, reservation and flushed WAL.
+ * Inputs/output must not overlap. Prepare alone is not completion.
+ * Write uses the held FD and block0 lock;
+ * fsync errors use the original data_sync_elevel(ERROR) after unlocking and
+ * retaining sticky failure. Cleanup never clears a recovery duty/window. */
+extern bool cluster_undo_smgr_recovery_ctrc_prepare_v2(const uint8 *payload, size_t length,
+	uint64 system_identifier, ClusterUndoSmgrRecoveryStampV1 *out);
+extern bool cluster_undo_smgr_recovery_ctrc_matches_v2(ClusterUndoSmgrRecoveryStampV1 stamp,
+	const uint8 *payload, size_t length);
+extern bool cluster_undo_smgr_recovery_ctrc_write_v2(ClusterUndoSmgrRecoveryStampV1 stamp);
+extern bool cluster_undo_smgr_recovery_ctrc_write_bound_v2(ClusterUndoSmgrRecoveryStampV1 stamp,
+	const uint8 *payload, size_t length);
+extern bool cluster_undo_smgr_recovery_ctrc_close_v2(ClusterUndoSmgrRecoveryStampV1 stamp);
+#endif
+
 
 /*
  * Redo: block zero already shows a replayed TT record's effect (or a newer
