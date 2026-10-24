@@ -2761,6 +2761,29 @@ done:
 }
 
 bool
+cluster_ko_extend_range_begin_v3(RelFileLocator locator, ForkNumber fork, uint64 serial)
+{
+	ClusterWalSourceRef writer;
+
+	/* Process-local lifetime check only. The caller may already hold HW
+	 * and content locks: no object lock, allocation, IO or admission wait.
+	 * SPACE/current consumers still validate their original shared proof. */
+	if (ko_state == NULL || serial == 0 || serial != ko_extend_local.serial
+		|| !ko_extend_local_exact(locator, fork) || CurrentResourceOwner != ko_extend_owner
+		|| !cluster_enabled || !cluster_shared_config || RecoveryInProgress()
+		|| cluster_interconnect_tier != CLUSTER_IC_TIER_1
+		|| cluster_epoch_get_current() != ko_extend_local.epoch
+		|| !cluster_wal_thread_current_v2_ref(&writer)
+		|| memcmp(&writer, &ko_extend_local.writer, sizeof(writer)) != 0
+		|| (ko_extend_write_armed && !ko_extend_materialized))
+		return false;
+	/* A completed earlier range cannot make a later interrupted reservation
+	 * appear materialized. Keep the same shared reference until outer end. */
+	ko_extend_write_armed = ko_extend_materialized = false;
+	return true;
+}
+
+bool
 cluster_ko_extend_write_begin_v3(RelFileLocator locator, ForkNumber fork)
 {
 	if (!ko_extend_local_exact(locator, fork) || ko_extend_materialized)

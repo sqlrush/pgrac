@@ -26,9 +26,20 @@ bool cluster_enabled = true;
 int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 static bool owner_expected, owner_live, owner_armed, owner_end_ok = true;
 static bool owner_wait_retire, owner_invalid_admission;
+static bool owner_range_done;
+static uint64 borrowed_serial;
 static void owner_retire_handle(void);
 static unsigned owner_enters, owner_ends, owner_refusals, owner_waits, owner_materialized,
 	owner_aborts;
+
+bool
+cluster_ko_extend_range_begin_v3(RelFileLocator locator, ForkNumber fork, uint64 serial)
+{
+	if (!owner_live || serial != 42 || (owner_armed && !owner_range_done))
+		return false;
+	owner_armed = owner_range_done = false;
+	return true;
+}
 
 bool
 cluster_ko_extend_begin_v3(RelFileLocator locator, ForkNumber fork, uint64 *serial, bool *retry)
@@ -65,6 +76,7 @@ cluster_ko_extend_write_done_v3(RelFileLocator locator, ForkNumber fork)
 {
 	UT_ASSERT(owner_live && owner_armed);
 	owner_materialized++;
+	owner_range_done = true;
 	return true;
 }
 void
@@ -284,6 +296,8 @@ reset(void)
 		descriptors[i].bufferdesc.buf_id = i;
 	cluster_shared_config = true;
 	owner_expected = owner_live = owner_armed = owner_wait_retire = owner_invalid_admission = false;
+	owner_range_done = false;
+	borrowed_serial = 0;
 	owner_end_ok = true;
 	owner_enters = owner_ends = owner_refusals = owner_waits = owner_materialized = owner_aborts
 		= 0;
@@ -302,7 +316,7 @@ extend(bool private, ForkNumber fork)
 								  .relpersistence = RELPERSISTENCE_PERMANENT };
 
 	return ExtendBufferedRelShared(bmr, fork, NULL, EB_SKIP_EXTENSION_LOCK, 2, InvalidBlockNumber,
-								   buffers, &extended, NULL, NULL);
+								   buffers, &extended, NULL, NULL, 0);
 }
 
 static BlockNumber
@@ -315,7 +329,7 @@ extend_preheld_identity(ForkNumber fork, const HwLock *lock,
 								  .relpersistence = RELPERSISTENCE_PERMANENT };
 
 	return ExtendBufferedRelShared(bmr, fork, NULL, EB_SKIP_EXTENSION_LOCK, 2,
-								   InvalidBlockNumber, buffers, &extended, lock, captured);
+								   InvalidBlockNumber, buffers, &extended, lock, captured, borrowed_serial);
 }
 
 static BlockNumber
@@ -330,7 +344,9 @@ static HwLock
 preheld_hw(void)
 {
 	HwLock lock = { 0 };
+	bool retry;
 
+	UT_ASSERT(cluster_ko_extend_begin_v3(identity.key.locator, MAIN_FORKNUM, &borrowed_serial, &retry));
 	lock.held = lock.coordinated = hw_held = true;
 	form.relkind = RELKIND_INDEX;
 	identity.state = CLUSTER_SPACE_IDENTITY_LIVE;
@@ -343,18 +359,29 @@ preheld_hw(void)
 UT_TEST(test_preheld_hw_is_not_reacquired_or_released_by_extension)
 {
 	HwLock lock, before;
+	volatile bool caught = false;
 
 	reset();
 	owner_expected = true;
 	lock = preheld_hw();
 	memcpy(&before, &lock, sizeof(before));
-	UT_ASSERT_EQ(extend_preheld(MAIN_FORKNUM, &lock), 200);
+	PG_TRY();
+	{
+		UT_ASSERT_EQ(extend_preheld(MAIN_FORKNUM, &lock), 200);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(!caught);
 	UT_ASSERT(hw_held);
 	UT_ASSERT(memcmp(&lock, &before, sizeof(lock)) == 0);
 	UT_ASSERT_EQ(reservations, 1);
 	UT_ASSERT_EQ(identity_reads, 0); /* Identity was captured before HW. */
 	UT_ASSERT_EQ(owner_enters, 1);
-	UT_ASSERT_EQ(owner_ends, 1);
+	UT_ASSERT_EQ(owner_ends, 0);
+	UT_ASSERT(owner_live);
 	cluster_hw_unlock(&lock); /* Only the enclosing owner releases HW. */
 	UT_ASSERT(!hw_held);
 }
@@ -720,19 +747,19 @@ UT_TEST(test_original_resize_keeps_entire_durable_grant_materialized)
 }
 
 static void
-materialize_original_range(void)
+materialize_original_range(uint32 hw_lease_tail)
 {
 	BufferManagerRelation bmr = { .smgr = &reopened };
 	ForkNumber fork = MAIN_FORKNUM;
 	BlockNumber first_block = 200;
-	uint32 extend_by = 2, hw_lease_tail = 3;
+	uint32 extend_by = 2;
 	bool ko_scoped = true;
 
 #include "test_cluster_space_extend_zero.inc"
 }
 
 static void
-handoff_original_range(volatile uint64 *ko_serial)
+handoff_original_range(volatile uint64 *ko_serial, uint64 preheld_ko_serial)
 {
 	bool ko_scoped = true;
 
@@ -750,7 +777,7 @@ UT_TEST(test_original_materialization_precedes_handoff_and_tail_error_retains_ow
 		zero_fail_at = fail;
 		PG_TRY();
 		{
-			materialize_original_range();
+			materialize_original_range(3);
 		}
 		PG_CATCH();
 		{
@@ -763,7 +790,7 @@ UT_TEST(test_original_materialization_precedes_handoff_and_tail_error_retains_ow
 		UT_ASSERT(owner_live);
 		if (fail == 0) {
 			UT_ASSERT_EQ(zero_blocks, 5);
-			handoff_original_range(&serial);
+			handoff_original_range(&serial, 0);
 			UT_ASSERT_EQ(serial, 0);
 			UT_ASSERT_EQ(owner_ends, 1);
 			UT_ASSERT(!owner_live);
@@ -771,6 +798,75 @@ UT_TEST(test_original_materialization_precedes_handoff_and_tail_error_retains_ow
 	}
 	zero_fail_at = 0;
 	owner_live = false;
+}
+
+UT_TEST(test_borrowed_materialization_keeps_outer_owner_and_never_waits)
+{
+	HwLock lock;
+	volatile uint64 serial = 42;
+	volatile bool caught = false;
+
+	reset();
+	owner_expected = true;
+	lock = preheld_hw();
+	zero_calls = zero_blocks = zero_fail_at = 0;
+	PG_TRY();
+	{
+		UT_ASSERT_EQ(extend_preheld(MAIN_FORKNUM, &lock), 200);
+		materialize_original_range(0);
+		handoff_original_range(&serial, borrowed_serial);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(!caught);
+	UT_ASSERT_EQ(zero_blocks, 2);
+	UT_ASSERT_EQ(owner_materialized, 1);
+	UT_ASSERT_EQ(serial, 42);
+	UT_ASSERT_EQ(owner_enters, 1);
+	UT_ASSERT_EQ(owner_ends + owner_waits, 0);
+	UT_ASSERT(owner_live && hw_held);
+	cluster_hw_unlock(&lock);
+	UT_ASSERT(cluster_ko_extend_end_v3(serial));
+	UT_ASSERT(!owner_live);
+}
+
+UT_TEST(test_borrowed_extension_refuses_missing_or_unfinished_exact_ko_owner)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		HwLock lock;
+		const HwLock *borrowed_hw = &lock;
+		volatile bool caught = false;
+
+		reset();
+		lock = preheld_hw();
+		if (fault == 0)
+			borrowed_serial = 0;
+		else if (fault == 1)
+			borrowed_serial++;
+		else if (fault == 2)
+			owner_live = false;
+		else if (fault == 3)
+			owner_armed = true;
+		else
+			borrowed_hw = NULL;
+		PG_TRY();
+		{
+			(void)extend_preheld_identity(MAIN_FORKNUM, borrowed_hw, &identity);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(owner_enters, 1);
+		UT_ASSERT_EQ(owner_waits + owner_ends + victims + reservations, 0);
+		UT_ASSERT(hw_held && lock.held);
+		cluster_hw_unlock(&lock);
+	}
 }
 
 UT_TEST(test_original_extension_registers_before_identity_and_reservation)
@@ -840,7 +936,7 @@ UT_TEST(test_invalid_extension_owner_does_not_wait_as_if_only_fenced)
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(17);
 	UT_RUN(test_preheld_hw_is_not_reacquired_or_released_by_extension);
 	UT_RUN(test_preheld_hw_survives_extension_error_for_outer_unwind);
 	UT_RUN(test_preheld_hw_rejects_invalid_handle_and_noncanonical_scope);
@@ -853,6 +949,8 @@ main(void)
 	UT_RUN(test_extension_error_releases_current_and_earlier_content_locks);
 	UT_RUN(test_original_resize_keeps_entire_durable_grant_materialized);
 	UT_RUN(test_original_materialization_precedes_handoff_and_tail_error_retains_owner);
+	UT_RUN(test_borrowed_materialization_keeps_outer_owner_and_never_waits);
+	UT_RUN(test_borrowed_extension_refuses_missing_or_unfinished_exact_ko_owner);
 	UT_RUN(test_original_extension_registers_before_identity_and_reservation);
 	UT_RUN(test_original_extension_cleanup_keeps_error_and_ends_exact_attempt);
 	UT_RUN(test_invalid_extension_owner_does_not_wait_as_if_only_fenced);

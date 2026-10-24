@@ -202,9 +202,11 @@ ReleaseBuffer(Buffer buffer)
 static BlockNumber
 ExtendBufferedRelCommon(BufferManagerRelation bmr, ForkNumber fork, BufferAccessStrategy strategy,
 						uint32 flags, uint32 count, BlockNumber upto, Buffer *buffers,
-						uint32 *extended)
+						uint32 *extended, const struct HwLock *hw,
+						const struct ClusterSpaceIdentity *identity, uint64 ko_serial)
 {
 	BlockNumber first = file_blocks;
+	UT_ASSERT(hw == NULL && identity == NULL && ko_serial == 0);
 	UT_ASSERT(!live && !locked && present);
 	UT_ASSERT(bmr.smgr == (replaced ? &reopened : &storage));
 	UT_ASSERT_EQ(fork, expected_fork);

@@ -306,12 +306,18 @@ extern bool cluster_ko_cleaner_enter_v3(RelFileLocator locator,
 extern void cluster_ko_cleaner_leave_v3(RelFileLocator locator,
 										const struct ClusterCtrcCleanerReadScopeV3 *scope);
 
-/* One original extension call, from before its first SPACE read until the
- * physical range is materialized. No IO or current permission is implied.
- * A false begin is waitable only when retry is explicitly true. */
+/* One finite allocation caller, registered before its first SPACE read.
+ * Ordinary extension retires after its physical range is materialized.
+ * A false begin is waitable only when retry is explicitly true.
+ * No IO or current permission is implied. */
 extern bool cluster_ko_extend_active_v3(void);
 extern bool cluster_ko_extend_begin_v3(RelFileLocator locator, ForkNumber fork, uint64 *serial,
 									   bool *retry);
+/* Borrow an exact original lifetime without locks, IO or admission waits.
+ * A completed range can start another; unfinished work cannot be replaced.
+ * The outer caller must end outside content/HW locks, or abort on ERROR and
+ * let its original ResourceOwner retain unfinished work after local unwind. */
+extern bool cluster_ko_extend_range_begin_v3(RelFileLocator locator, ForkNumber fork, uint64 serial);
 extern bool cluster_ko_extend_write_begin_v3(RelFileLocator locator, ForkNumber fork);
 extern bool cluster_ko_extend_write_done_v3(RelFileLocator locator, ForkNumber fork);
 extern bool cluster_ko_extend_end_v3(uint64 serial);
