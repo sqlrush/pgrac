@@ -228,6 +228,7 @@ TESTS += test_cluster_pcm_aux_mutation test_cluster_heap_extend_current
 TESTS += test_cluster_cr_inline_stop
 TESTS += test_cluster_sync_error
 TESTS += test_cluster_cold_tx_start
+TESTS += test_cluster_recovery_worker_pre2
 
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
 
@@ -600,6 +601,7 @@ test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 SIMPLE_TESTS := $(filter-out test_cluster_wal_restart_read test_cluster_wal_writer test_cluster_wal_cut test_cluster_pi_data test_cluster_thread_tail,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_tt_checkpoint_publish test_cluster_checkpoint_native test_cluster_startup_sync test_cluster_checkpoint_buffers test_cluster_page_data test_cluster_pi_writeback test_cluster_block_redeclare test_cluster_page_wal,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_request,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_recovery_worker_pre2,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_retire,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_retire_master,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_cf_poll,$(SIMPLE_TESTS))
@@ -8371,6 +8373,20 @@ test_cluster_recovery_worker: test_cluster_recovery_worker.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # spec-4.3 D6: test_cluster_recovery_plan — 16 pure-classifier tests
+test_cluster_recovery_worker_pre2: test_cluster_recovery_worker_pre2.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_worker.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_restart_read.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_source.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_claim.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_worker.c \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_restart_read.c $(CLUSTER_WAL_CLAIM_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_restart_read.c $(CLUSTER_WAL_CLAIM_O) \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
 # for the recovery plan (§3.2 truth table 1:1: own-priority family,
 # identity-invariant -> UNKNOWN, stale boundary, bitmap addressing,
 # sweep conservation + bitmap<->verdict coherence).  Header-only
@@ -9299,6 +9315,7 @@ test_cluster_recovery_merge_seal test_cluster_recovery_merge_complete: %: %.c un
 		test_cluster_recovery_duty_compare.inc \
 		test_cluster_recovery_merge_seal_boundary.h test_cluster_recovery_merge_cold_fixture.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_duty.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_worker.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_merge.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_plan.h cluster_unit_port_stubs.o
@@ -9880,6 +9897,7 @@ test_cluster_recovery_plan_publication.inc: $(top_srcdir)/src/backend/cluster/cl
 test_cluster_recovery_plan_merge: test_cluster_recovery_plan_merge.c unit_test.h \
 		test_cluster_recovery_duty_compare.inc \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_duty.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_worker.h \
         test_cluster_recovery_plan_shmem.inc test_cluster_recovery_plan_publication.inc \
         test_cluster_recovery_plan_generate.inc test_cluster_recovery_merge_seal_boundary.h \
         test_cluster_recovery_merge_cold_fixture.h \

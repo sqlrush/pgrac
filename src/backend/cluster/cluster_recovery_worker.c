@@ -57,6 +57,8 @@
 #include "cluster/cluster_recovery_worker.h"
 #include "cluster/cluster_semantic_activation.h" /* bit22 cutover latch (contract §B) */
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_restart_read.h"
+#include "cluster_control_root_private.h"
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/bgwriter.h" /* CheckPointTimeout (contract liveness threshold) */
@@ -118,24 +120,32 @@ validate_claim_content(uint16 tid)
  *	header check.  Returns a stream verdict (OK/SUSPECT/UNREADABLE).
  */
 static ClusterRecoveryStreamVerdict
-check_written_page(const char *segpath, uint32 page_offset, uint64 expected_pageaddr, uint16 tid)
+check_written_fd(int fd, uint32 page_offset, uint64 expected_pageaddr, uint16 tid)
 {
 	char page[XLOG_BLCKSZ];
-	int fd;
 	ssize_t nread;
 
-	fd = BasicOpenFile(segpath, O_RDONLY | PG_BINARY);
-	if (fd < 0)
-		return CLUSTER_RECOVERY_STREAM_UNREADABLE;
 	/* P2: reusing the core WAL-read wait event requires explicit
 	 * reporting -- raw pread carries nothing by itself. */
 	pgstat_report_wait_start(WAIT_EVENT_WAL_READ);
 	nread = pg_pread(fd, page, XLOG_BLCKSZ, (off_t)page_offset);
 	pgstat_report_wait_end();
-	close(fd);
 	if (nread != (ssize_t)XLOG_BLCKSZ)
 		return CLUSTER_RECOVERY_STREAM_UNREADABLE;
 	return cluster_recovery_stream_page_check(page, expected_pageaddr, tid);
+}
+
+static ClusterRecoveryStreamVerdict
+check_written_page(const char *segpath, uint32 page_offset, uint64 expected_pageaddr, uint16 tid)
+{
+	int fd = BasicOpenFile(segpath, O_RDONLY | PG_BINARY);
+	ClusterRecoveryStreamVerdict result;
+
+	if (fd < 0)
+		return CLUSTER_RECOVERY_STREAM_UNREADABLE;
+	result = check_written_fd(fd, page_offset, expected_pageaddr, tid);
+	close(fd);
+	return result;
 }
 
 /* RF-ROOT P7 (contract §B / follow-up): dual-path by the bit22 cutover
@@ -248,9 +258,66 @@ validate_stream_from_root(uint16 tid, const ClusterControlRootSnapshot *snapshot
  *	post-bit22 the canonical control root is the only source (STRONG read
  *	via the contract §A two-step discovered-identity pattern).
  */
+/* PRE2's canonical v3 reader/source owner qualifies the exact generation
+ * before IR. The background consumer must not reacquire CF in its episode.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+capture_pre2_stream(uint16 tid, ClusterRecoveryWorkerInput *out)
+{
+	ClusterControlRootReadToken token;
+	ClusterControlRootResult result;
+	XLogRecPtr redo;
+
+	memset(out, 0, sizeof(*out));
+	result = cluster_control_root_read_canonical_discovered(tid, &out->snapshot, &token);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return false;
+	out->root_valid = true;
+	if (!cluster_recovery_worker_root_anchor_valid(&out->snapshot))
+		return false;
+	result = cluster_control_root_recovery_source_v1(&out->snapshot, &token, &out->source, &redo);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return false;
+	/* The qualified ROOT selects the tail TLI as well as the generation. */
+	out->source.timeline = out->snapshot.tail_tli;
+	out->source_valid = true;
+	return true;
+}
+
+static ClusterRecoveryStreamVerdict
+validate_pre2_stream(uint16 tid, const ClusterRecoveryWorkerInput *input)
+{
+	uint64 segno, pageaddr;
+	uint32 page_offset;
+	int fd = -1;
+	ClusterRecoveryStreamVerdict result;
+
+	if (!input->root_valid || !input->source_valid
+		|| !cluster_recovery_worker_target_page(input->snapshot.validated_tail_lsn_exclusive,
+											  wal_segment_size, &segno, &page_offset, &pageaddr))
+		return CLUSTER_RECOVERY_STREAM_UNREADABLE;
+	if (cluster_wal_restart_segment_open(cluster_wal_threads_dir, &input->source,
+										input->snapshot.tail_tli, segno, wal_segment_size, &fd)
+		!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return CLUSTER_RECOVERY_STREAM_UNREADABLE;
+	result = check_written_fd(fd, page_offset, pageaddr, tid);
+	if (result == CLUSTER_RECOVERY_STREAM_OK && page_offset != 0)
+		result = check_written_fd(fd, 0, segno * wal_segment_size, tid);
+	close(fd);
+	return result;
+}
+
 ClusterRecoveryStreamVerdict
 cluster_recovery_worker_revalidate(uint16 thread_id)
 {
+	if (cluster_shared_config) {
+		ClusterRecoveryWorkerInput input;
+
+		if (!capture_pre2_stream(thread_id, &input))
+			return CLUSTER_RECOVERY_STREAM_UNREADABLE;
+		return validate_pre2_stream(thread_id, &input);
+	}
 	if (cluster_r4_bit22_cutover_active()) {
 		ClusterControlRootSnapshot snapshot;
 		ClusterControlRootReadToken token;
@@ -323,7 +390,19 @@ cluster_recovery_worker_main(Datum main_arg)
 		 * (frozen §17.8; the bgworker needs no CF for registry reads);
 		 * post-bit22 the pre-IR pinned projection is consumed.
 		 */
-		if (cluster_r4_bit22_cutover_active()) {
+		if (cluster_shared_config) {
+			const ClusterRecoveryWorkerInput *input = &pool->pre2_input[tid];
+
+			pg_read_barrier();
+			if (input->generation != pool->generation || !input->root_valid)
+				sv = CLUSTER_RECOVERY_STREAM_UNREADABLE;
+			else if (cluster_recovery_classify_root_slot(CLUSTER_CONTROL_ROOT_OK_PRIMARY,
+						 &input->snapshot, own_thread, tid, now_us, CheckPointTimeout)
+					 != CLUSTER_RECOVERY_THREAD_CRASHED_CANDIDATE)
+				sv = CLUSTER_RECOVERY_STREAM_SKIPPED;
+			else
+				sv = validate_pre2_stream(tid, input);
+		} else if (cluster_r4_bit22_cutover_active()) {
 			ClusterControlRootReadToken pin_token;
 			uint64 pin_validated_tail;
 			uint64 pin_checkpoint_lower;
@@ -452,6 +531,7 @@ cluster_recovery_workers_launch(void)
 	/* Coordinator-only writers: set up the pool before any spawn. */
 	pool->generation++;
 	memset(pool->stream_verdict, 0, sizeof(pool->stream_verdict));
+	memset(pool->pre2_input, 0, sizeof(pool->pre2_input));
 	n_workers = cluster_recovery_worker_assign(plan.candidate_bitmap, plan.n_crashed_candidate,
 											   cluster_recovery_workers_max, pool->assigned_bitmap);
 	pool->workers_requested = (uint16)n_workers;
@@ -476,10 +556,14 @@ cluster_recovery_workers_launch(void)
 	for (tid = XLP_THREAD_ID_FIRST_REAL; tid <= CLUSTER_WAL_THREAD_MAX; tid++) {
 		if ((plan.candidate_bitmap[(tid - 1) / 64] & (UINT64_C(1) << ((tid - 1) % 64))) == 0)
 			continue;
-		if (cluster_r4_bit22_cutover_active()) {
+		if (cluster_shared_config) {
+			(void)capture_pre2_stream(tid, &pool->pre2_input[tid]);
+			pool->pre2_input[tid].generation = pool->generation;
+		} else if (cluster_r4_bit22_cutover_active()) {
 			(void)cluster_thread_recovery_pin_projection(tid, (uint64)pool->generation);
 		}
 	}
+	pg_write_barrier();
 
 	for (slot = 0; slot < n_workers; slot++) {
 		BackgroundWorker bgw;
