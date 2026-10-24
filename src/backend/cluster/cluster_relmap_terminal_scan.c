@@ -645,6 +645,91 @@ cluster_relmap_recovery_handle_matches_v1(ClusterRelmapRecoveryHandle *handle,
 	return true;
 }
 
+/* The era is taken from the original authenticated window, not guessed from
+ * this raw xid. Bound every native checkpoint/issuance reference in its one
+ * half-space; sparse allocation may never stand in for actual last-issued. */
+static bool
+recovery_terminal_window(const ClusterRelmapRecoveryHandle *handle)
+{
+	const ClusterRelmapTerminalScanV1 *scan = handle->scan;
+	const ClusterRelmapTerminalObservationV1 *terminal = &scan->observation;
+	const ClusterRelmapCheckpointWindow *window = &terminal->window;
+	const ClusterRelmapV2Owner *owner = &scan->pending.pending_owner;
+	uint64 next = U64FromFullTransactionId(scan->selected.native_checkpoint.nextXid);
+	uint64 upper = Max(next, terminal->post_flush_issued);
+
+	return scan->pending_required && scan->pending_seen && scan->prefix_only
+		&& scan->native_base_retained && scan->checkpoint_seen && scan->terminal_seen
+		&& scan->expected_native_terminals != 0
+		&& scan->expected_native_terminals == scan->native_terminals
+		&& handle->scope_serial == scan->pending_scope_serial
+		&& window->system_identifier == scan->pending.identity.system_identifier
+		&& window->database_incarnation == scan->pending.identity.database_incarnation
+		&& window->origin == owner->node
+		&& window->epoch == owner->membership_epoch
+		&& window->admitted_incarnation == owner->admitted_incarnation
+		&& window->boot_incarnation == owner->boot_incarnation
+		&& TransactionIdIsNormal((TransactionId)next)
+		&& window->native_floor <= owner->top_full_xid
+		&& owner->top_full_xid <= window->last_issued
+		&& owner->top_full_xid == terminal->requested_top_full_xid
+		&& window->last_issued < window->allocation_next && window->allocation_next <= next
+		&& terminal->post_flush_issued >= window->last_issued
+		&& upper >= window->native_floor
+		&& upper - window->native_floor < UINT64CONST(0x80000000)
+		&& owner->wal_end <= terminal->terminal_start
+		&& terminal->terminal_start >= scan->selected.native_redo
+		&& terminal->terminal_start < terminal->terminal_end
+		&& terminal->terminal_end <= scan->selected.checkpoint_start
+		&& terminal->prefix_end <= terminal->cut
+		&& (terminal->status == TRANSACTION_STATUS_COMMITTED
+			|| terminal->status == TRANSACTION_STATUS_ABORTED);
+}
+
+bool
+cluster_relmap_recovery_terminal_read(ClusterRelmapRecoveryHandle *handle,
+	const ClusterRelmapV2Namespace *identity, const ClusterRelmapV2View *pending,
+	ClusterRelmapRecoveryTerminalV1 *out)
+{
+	ClusterRelmapRecoveryTerminalV1 result = { 0 };
+	const ClusterRelmapTerminalObservationV1 *terminal;
+	const ClusterRelmapCheckpointWindow *window;
+	if (out == NULL || recovery_overlap(out, sizeof(*out), handle, sizeof(*handle))
+		|| (handle != NULL && handle->scan != NULL
+			&& recovery_overlap(out, sizeof(*out), handle->scan, sizeof(*handle->scan)))
+		|| recovery_overlap(out, sizeof(*out), identity, sizeof(*identity))
+		|| recovery_overlap(out, sizeof(*out), pending, sizeof(*pending)))
+		return false;
+	memset(out, 0, sizeof(*out));
+	/* This exact original operation/source/round check also synchronizes and
+	 * rereads the original native base, with source checks around that I/O.
+	 * Corruption, drift or ERROR leaves original pins and debt in place. */
+	if (!cluster_relmap_recovery_handle_matches_v1(handle, identity, pending))
+		return false;
+	handle->failed = true;
+	if (!recovery_terminal_window(handle) || !recovery_handle_current(handle))
+		return false;
+	terminal = &handle->scan->observation;
+	window = &terminal->window;
+	result.bounds.system_identifier = window->system_identifier;
+	result.bounds.database_incarnation = window->database_incarnation;
+	result.bounds.origin = window->origin;
+	result.bounds.membership_epoch = window->epoch;
+	result.bounds.admitted_incarnation = window->admitted_incarnation;
+	result.bounds.boot_incarnation = window->boot_incarnation;
+	result.bounds.native_floor = window->native_floor;
+	result.bounds.last_issued = window->last_issued;
+	result.top_full_xid = terminal->requested_top_full_xid;
+	result.status = terminal->status;
+	result.terminal_start = terminal->terminal_start;
+	result.terminal_end = terminal->terminal_end;
+	result.source_cut = terminal->cut;
+	memcpy(result.fingerprint, handle->native_base_fingerprint, sizeof(result.fingerprint));
+	handle->failed = false;
+	*out = result;
+	return true;
+}
+
 void
 cluster_relmap_recovery_handle_release_v1(ClusterRelmapRecoveryHandle **handle)
 {

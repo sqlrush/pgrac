@@ -62,6 +62,31 @@ typedef struct ClusterRelmapRecoveryNativeTerminal {
 	XLogRecPtr status_lsn;
 } ClusterRelmapRecoveryNativeTerminal;
 
+/* Per-call result from the original opaque cold handle, never a reusable
+ * completion or release token. Bounds come only from its persisted original
+ * checkpoint window; nextXid/legal ceilings are not last-issued substitutes. */
+typedef struct ClusterRelmapRecoveryTerminalV1 {
+	ClusterRelmapRecoveryNativeBounds bounds;
+	uint64 top_full_xid;
+	XidStatus status;
+	XLogRecPtr terminal_start, terminal_end, source_cut;
+	uint8 fingerprint[32];
+} ClusterRelmapRecoveryTerminalV1;
+
+/* Dormant frozen terminal_read: exact namespace/full pending and one original
+ * physical owner-origin source only. Require its complete original sealed
+ * fold, unchanged durable native base/lifetime and a unique FullXid window
+ * through actual checkpoint nextXid and post-flush actual issuance. Unsupported
+ * history, missing/reused/truncated/ambiguous inputs refuse. No status or bound
+ * is accepted from caller. Original scope/pins must outlive this read; no new
+ * scope/pin or COMPLETE/release/allocator authority is created.
+ * Distinct caller-owned output is published last; nonalias refusal clears it.
+ * Original handle/namespace/view overlap is unchanged. Refusal after entry
+ * invalidates local custody; native ERROR propagates with debt/pins retained. */
+extern bool cluster_relmap_recovery_terminal_read(ClusterRelmapRecoveryHandle *handle,
+	const ClusterRelmapV2Namespace *identity, const ClusterRelmapV2View *pending,
+	ClusterRelmapRecoveryTerminalV1 *out);
+
 /* Original allocator, XidGenLock held, AFTER native ProcArray publication.
  * Shared volatile provenance only: no WAL, allocation, lock or ERROR. Never
  * call for a candidate, lease/JUMP limit, checkpoint or replay endpoint. */
