@@ -146,6 +146,29 @@ extern ClusterRelmapV2ClearResult
 cluster_relmap_retention_census_recovery_arbitrate(ClusterRelmapRetentionCensus *census,
 												   struct ClusterWalInputsV1 *inputs, Oid dbid);
 
+/* Opaque, local-only preparation of every pending namespace in the original
+ * DRAINED physical census, including backup-only pending. No caller namespace
+ * list is accepted. Hold original merger claim and namespace X across this
+ * synchronous operation and all later uses; keep census/ROOT/directories and
+ * inputs alive and exclusively owned. The budget bounds this batch storage,
+ * not native prepare's separately owned allocations or synchronous I/O.
+ *
+ * Re-read every exact pair, prepare every selected original native handle,
+ * recheck the whole ROOT and all selected pins/sources, then publish once.
+ * Clean namespaces need no handle. Any late refusal/ERROR frees all local
+ * handles, invalidates old observations and retains every pin. Before
+ * DRAINED or without original ownership, leave the scan unconsumed.
+ * A successful (possibly empty) batch is preparation only: no arbitration,
+ * target write, directory COMPLETE, global floor/issued or release follows.
+ * This local container is not complete semantic G_ref/owner completion.
+ * Release cancels only this container/custody; never releases original pins. */
+typedef struct ClusterRelmapCensusRecoveryBatch ClusterRelmapCensusRecoveryBatch;
+extern bool cluster_relmap_retention_census_recovery_prepare_all(
+	ClusterRelmapRetentionCensus *census, struct ClusterWalInputsV1 *inputs, size_t memory_budget,
+	ClusterRelmapCensusRecoveryBatch **out);
+extern void
+cluster_relmap_retention_census_recovery_batch_release(ClusterRelmapCensusRecoveryBatch **batch);
+
 /* Same single-use window and provisional structural result. When either copy
  * retains pending, validate that exact union image through the caller's held
  * original cold WAL scope before rebuilding. Use the pending copy's original

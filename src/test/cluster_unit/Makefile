@@ -576,6 +576,7 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 
 test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
 		test_cluster_relmap_census_recovery.inc \
+		test_cluster_relmap_census_batch.inc \
 		test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c \
 		test_cluster_recovery_crypto_boundary.h unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
@@ -622,6 +623,7 @@ test_cluster_relmap_retention_census_product.o: $(top_srcdir)/src/backend/cluste
 
 test_cluster_relmap_census_side: test_cluster_relmap_retention_census.c \
 		test_cluster_relmap_census_recovery.inc \
+		test_cluster_relmap_census_batch.inc \
 		test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c \
 		test_cluster_recovery_crypto_boundary.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \

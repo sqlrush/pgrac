@@ -968,11 +968,18 @@ UT_TEST(test_root_rebuild_preserves_existing_proofs_and_exact_pins)
 
 #ifndef RELMAP_CENSUS_FIXTURE_ONLY
 #include "test_cluster_relmap_census_recovery.inc"
+#include "test_cluster_relmap_census_batch.inc"
 
 int
 main(void)
 {
-	UT_PLAN(38);
+	UT_PLAN(44);
+	UT_RUN(test_census_recovery_batch_null_refusal);
+	UT_RUN(test_census_recovery_batch_captures_every_namespace_before_publication);
+	UT_RUN(test_census_recovery_batch_late_native_failure_cleans_every_local_handle);
+	UT_RUN(test_census_recovery_batch_original_gates_and_memory_budget);
+	UT_RUN(test_census_recovery_batch_final_whole_root_and_earlier_pin_recheck);
+	UT_RUN(test_census_recovery_batch_clean_namespaces_need_no_native_handle);
 	UT_RUN(test_census_recovery_arbitration_requires_drained);
 	UT_RUN(test_census_recovery_arbitration_missing_original_gates_preserves_scan);
 	UT_RUN(test_census_recovery_arbitration_always_retires_old_observations_only);

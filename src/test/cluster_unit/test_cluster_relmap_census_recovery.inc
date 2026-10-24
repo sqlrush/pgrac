@@ -8,7 +8,15 @@
 #include "cluster/cluster_relmap_arb.h"
 #include "cluster/cluster_relmap_lock.h"
 
-static unsigned char census_native_cookie, census_inputs_cookie;
+static unsigned char census_inputs_cookie;
+typedef struct CensusNativeHandleFixture {
+	bool live;
+	ClusterRelmapV2Namespace identity;
+	ClusterRelmapV2View pending;
+} CensusNativeHandleFixture;
+static CensusNativeHandleFixture census_native_handles[8];
+static unsigned census_native_fault_after;
+static ClusterRelmapRetentionPin *census_native_mutated_pin;
 static unsigned census_native_prepares, census_native_releases;
 static unsigned census_native_fault;
 static CensusFixture *census_native_fixture;
@@ -41,7 +49,8 @@ cluster_relmap_arbitrate_pending_v2(ClusterRelmapRecoveryHandle **handle,
 	uint8 digest[32];
 
 	census_arbitrations++;
-	UT_ASSERT(handle != NULL && *handle == (ClusterRelmapRecoveryHandle *)&census_native_cookie);
+	UT_ASSERT(handle != NULL
+			  && *handle == (ClusterRelmapRecoveryHandle *)&census_native_handles[0]);
 	UT_ASSERT_EQ(memcmp(identity, &census_native_identity, sizeof(*identity)), 0);
 	UT_ASSERT_EQ(memcmp(pending, &census_native_pending, sizeof(*pending)), 0);
 	UT_ASSERT(cluster_shared_catalog && census_merger_held && census_namespace_x);
@@ -94,35 +103,91 @@ cluster_relmap_recovery_prepare_v1(struct ClusterWalInputsV1 *inputs,
 								   const ClusterRelmapV2View *view,
 								   ClusterRelmapRecoveryHandle **out)
 {
+	unsigned fault;
+
 	census_native_prepares++;
 	UT_ASSERT(inputs == (struct ClusterWalInputsV1 *)&census_inputs_cookie);
 	UT_ASSERT(ns != NULL && view != NULL && out != NULL);
 	*out = NULL;
-	if (census_native_fault == 1)
+	fault = census_native_prepares >= census_native_fault_after ? census_native_fault : 0;
+	UT_ASSERT(census_native_prepares <= lengthof(census_native_handles));
+	if (fault == 1)
 		return false;
-	if (census_native_fault == 2)
+	if (fault == 2)
 		siglongjmp(*PG_exception_stack, 1);
 	census_native_identity = *ns;
 	census_native_pending = *view;
-	*out = (ClusterRelmapRecoveryHandle *)&census_native_cookie;
-	if (census_native_fault == 3)
+	census_native_handles[census_native_prepares - 1].live = true;
+	census_native_handles[census_native_prepares - 1].identity = *ns;
+	census_native_handles[census_native_prepares - 1].pending = *view;
+	*out = (ClusterRelmapRecoveryHandle *)&census_native_handles[census_native_prepares - 1];
+	if (fault == 3)
 		census_native_fixture->origin[1].last_issued++;
-	if (census_native_fault == 4)
+	if (fault == 4)
 		((ClusterRelmapRetentionPin *)census_pin(&census_native_fixture->origin[0], ns->dbid))
 			->wal_end++;
-	if (census_native_fault == 5)
+	if (fault == 5)
 		cluster_recovery_root_set_invalidate(census_native_fixture->roots);
-	if (census_native_fault == 6)
+	if (fault == 6)
 		census_native_sources[1].source.claim.identity.storage_uuid[0] ^= 1;
+	if (fault == 7) {
+		Oid first = census_native_handles[0].identity.dbid;
+		for (unsigned o = 0; o < 2; o++)
+			for (size_t i = 0; i < CLUSTER_RELMAP_RETENTION_CAPACITY; i++) {
+				ClusterRelmapRetentionPin *pin = &census_native_fixture->origin[o].pins[i];
+				if (pin->occupied && pin->key.identity.dbid == first) {
+					pin->wal_end++;
+					census_native_mutated_pin = pin;
+				}
+			}
+	}
+	if (fault == 8) {
+		int fd
+			= openat(census_native_fixture->fd, "base/5/99999", O_WRONLY | O_CREAT | O_EXCL, 0600);
+		UT_ASSERT(fd >= 0);
+		if (fd >= 0) {
+			UT_ASSERT_EQ(write(fd, "x", 1), 1);
+			UT_ASSERT_EQ(close(fd), 0);
+		}
+	}
 	return true;
 }
 
 void
 cluster_relmap_recovery_handle_release_v1(ClusterRelmapRecoveryHandle **handle)
 {
-	UT_ASSERT(handle != NULL && *handle == (ClusterRelmapRecoveryHandle *)&census_native_cookie);
+	bool found = false;
+	UT_ASSERT(handle != NULL && *handle != NULL);
+	for (size_t i = 0; i < lengthof(census_native_handles); i++) {
+		if (*handle == (ClusterRelmapRecoveryHandle *)&census_native_handles[i]) {
+			UT_ASSERT(census_native_handles[i].live);
+			census_native_handles[i].live = false;
+			found = true;
+		}
+	}
+	UT_ASSERT(found);
 	census_native_releases++;
 	*handle = NULL;
+}
+
+static void
+census_native_reset(CensusFixture *f)
+{
+	census_native_fixture = f;
+	census_native_prepares = census_native_releases = census_native_fault = 0;
+	census_native_fault_after = 1;
+	census_native_mutated_pin = NULL;
+	memset(census_native_handles, 0, sizeof(census_native_handles));
+	census_arbitrations = census_arbitration_mode = 0;
+	census_merger_held = census_namespace_x = cluster_shared_catalog = true;
+	memset(census_native_sources, 0, sizeof(census_native_sources));
+	for (size_t i = 0; i < lengthof(census_native_sources); i++) {
+		census_native_sources[i].source.claim.identity.system_identifier = 817;
+		census_native_sources[i].source.claim.database_incarnation = 91;
+		memcpy(census_native_sources[i].source.claim.identity.storage_uuid, root_uuid, 16);
+	}
+	census_native_source_count = lengthof(census_native_sources);
+	census_native_scope_current = true;
 }
 
 static bool
@@ -134,18 +199,7 @@ census_native_begin(CensusFixture *f, Oid dbid, unsigned cut, bool drain)
 		census_pair(f->fd, InvalidOid, 3, cut == 0, cut != 0, cut == 1);
 	} else
 		census_pair(f->fd, 5, 3, cut == 0, cut != 0, cut == 1);
-	census_native_fixture = f;
-	census_native_prepares = census_native_releases = census_native_fault = 0;
-	census_arbitrations = census_arbitration_mode = 0;
-	census_merger_held = census_namespace_x = cluster_shared_catalog = true;
-	memset(census_native_sources, 0, sizeof(census_native_sources));
-	for (size_t i = 0; i < lengthof(census_native_sources); i++) {
-		census_native_sources[i].source.claim.identity.system_identifier = 817;
-		census_native_sources[i].source.claim.database_incarnation = 91;
-		memcpy(census_native_sources[i].source.claim.identity.storage_uuid, root_uuid, 16);
-	}
-	census_native_source_count = lengthof(census_native_sources);
-	census_native_scope_current = true;
+	census_native_reset(f);
 	return census_observe_begin(f) && (!drain || census_drain(f) == CLUSTER_RELMAP_CENSUS_DRAINED);
 }
 
