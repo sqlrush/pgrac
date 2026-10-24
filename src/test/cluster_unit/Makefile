@@ -5360,6 +5360,7 @@ HW_HANDOFF_OBJECTS = $(addprefix hw_handoff_,cluster_grd.o cluster_ges.o \
     cluster_ges_reply_wait.o cluster_lock_acquire.o cluster_lock_owner.o cluster_ges_mode.o cluster_lmd_wait_state.o \
     cluster_control_request.o cluster_control_retire.o)
 $(HW_HANDOFF_OBJECTS): hw_handoff_%.o: $(top_srcdir)/src/backend/cluster/%.c \
+        $(top_srcdir)/src/include/cluster/cluster_content_trace.h \
         $(top_srcdir)/src/include/cluster/cluster_grd.h \
         $(top_srcdir)/src/include/cluster/cluster_ges_handoff.h \
         $(top_srcdir)/src/include/cluster/cluster_ges.h \
@@ -9613,9 +9614,17 @@ test_cluster_wait_resources: test_cluster_wait_resources.c test_cluster_wait_res
 		$(top_srcdir)/src/include/cluster/cluster_wait_trace.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
 
+# Native wait reporters, unchanged bodies with backend-state fixtures.
+test_cluster_content_trace_lw_wait.inc: $(top_srcdir)/src/backend/storage/lmgr/lwlock.c Makefile
+	awk '/^LWLockReportWait(Start|End)\(/ { print "static inline void"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 # Read/publish the actual diagnostic owner table with backend-state fixtures.
 test_cluster_content_trace: test_cluster_content_trace.c unit_test.h \
+        test_cluster_content_trace_lw_wait.inc \
         $(top_srcdir)/src/backend/cluster/cluster_content_trace.c \
         $(top_srcdir)/src/include/cluster/cluster_content_trace.h \
+        $(top_srcdir)/src/include/cluster/cluster_grd.h \
         $(top_srcdir)/src/include/cluster/cluster_wait_trace.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@

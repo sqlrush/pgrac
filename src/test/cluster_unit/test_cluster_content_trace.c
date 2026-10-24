@@ -6,6 +6,7 @@
 #include "miscadmin.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
+#include "utils/wait_event.h"
 #include <assert.h>
 #include <stdarg.h>
 #undef printf
@@ -32,6 +33,8 @@ static char last[8192];
 static char pair_request_log[8192];
 static unsigned pair_cycle_logs, pair_request_logs;
 static const ClusterShmemRegion *registered;
+static uint32 native_wait_event;
+uint32 *my_wait_event_info = &native_wait_event;
 
 void ExceptionalCondition(const char *condition, const char *file, int line)
 { fprintf(stderr, "%s:%d: %s\n", file, line, condition); abort(); }
@@ -55,6 +58,7 @@ void errfinish(const char *file, int line, const char *func)
 }
 
 #include "../../backend/cluster/cluster_content_trace.c"
+#include "test_cluster_content_trace_lw_wait.inc"
 
 static BufferDesc *buf(unsigned i) { return &descriptors[i].bufferdesc; }
 static void actor(unsigned i)
@@ -71,6 +75,7 @@ static void reset(void)
 	proc_header.allProcs = procs; proc_header.allProcCount = MaxBackends + NUM_AUXILIARY_PROCS;
 	ProcGlobal = &proc_header; BufferDescriptors = descriptors; nheld = logs = 0;
 	emitted_rows = pair_cycle_logs = pair_request_logs = 0;
+	native_wait_event = 0;
 	pair_request_log[0] = '\0';
 	cluster_trace_tx_identity = true;
 	for (unsigned i = 0; i < lengthof(descriptors); i++) {
@@ -94,6 +99,18 @@ UT_TEST(actual_content_owner)
 	UT_ASSERT_EQ(cut.owners[0].backend_start, 1000); UT_ASSERT_EQ(cut.owners[0].nlocks, 1);
 	UT_ASSERT_EQ(cut.owners[0].locks[0].mode, LW_EXCLUSIVE);
 }
+UT_TEST(all_owner_cut_includes_waiters_without_content_holds)
+{
+	ClusterWaitTrace wait = {0};
+	reset(); hold(0, LW_EXCLUSIVE);
+	cluster_content_trace_lock_changed(&buf(0)->content_lock);
+	actor(1); nheld = 0; wait.tag = buf(2)->tag; wait.tag_known = true;
+	cluster_content_trace_wait_set(CLCONTENT_PCM, &wait);
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.nowners, 2); UT_ASSERT_EQ(cut.matches, 2);
+	UT_ASSERT_EQ(cut.owners[1].pid, 101); UT_ASSERT_EQ(cut.owners[1].nlocks, 0);
+	UT_ASSERT_EQ(cut.owners[1].waits[CLCONTENT_PCM].tag.blockNum, 2);
+}
 UT_TEST(exact_tag_and_lock_kind)
 {
 	BufferTag target;
@@ -106,6 +123,133 @@ UT_TEST(exact_tag_and_lock_kind)
 	cluster_content_trace_capture(&buf(0)->tag, &cut); UT_ASSERT_EQ(cut.nowners, 1);
 	UT_ASSERT_EQ(cut.owners[0].nlocks, 1); UT_ASSERT_EQ(cut.owners[0].locks[0].mode, LW_SHARED);
 	cluster_content_trace_capture(&buf(1)->tag, &cut); UT_ASSERT_EQ(cut.matches, 0);
+}
+UT_TEST(native_reporter_keeps_exact_space_target_and_mode)
+{
+	reset(); hold(0, LW_SHARED);
+	buf(2)->tag.forkNum = SPACE_FORKNUM;
+	MyProc->lwWaitMode = LW_EXCLUSIVE;
+	buf(2)->content_lock.tranche = LWTRANCHE_BUFFER_CONTENT;
+	LWLockReportWaitStart(&buf(2)->content_lock);
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.nowners, 1); UT_ASSERT_EQ(cut.owners[0].nlocks, 1);
+	UT_ASSERT(cut.owners[0].native_waiting);
+	UT_ASSERT_EQ(cut.owners[0].native_wait.buffer, 3);
+	UT_ASSERT_EQ(cut.owners[0].native_wait.mode, LW_EXCLUSIVE);
+	UT_ASSERT(cut.owners[0].native_wait.tag_known);
+	UT_ASSERT_EQ(cut.owners[0].native_wait.tag.forkNum, SPACE_FORKNUM);
+	UT_ASSERT_EQ(cut.owners[0].native_wait.tag.blockNum, 2);
+	UT_ASSERT_EQ(native_wait_event, PG_WAIT_LWLOCK | LWTRANCHE_BUFFER_CONTENT);
+	LWLockReportWaitEnd(); cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT(!cut.owners[0].native_waiting); UT_ASSERT_EQ(native_wait_event, 0);
+}
+UT_TEST(native_free_wait_unknown_tag_and_noncontent)
+{
+	reset(); MyProc->lwWaitMode = LW_WAIT_UNTIL_FREE;
+	pg_atomic_write_u32(&buf(1)->state, 0);
+	LWLockReportWaitStart(&buf(1)->content_lock);
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.nowners, 1); UT_ASSERT_EQ(cut.owners[0].nlocks, 0);
+	UT_ASSERT(cut.owners[0].native_waiting);
+	UT_ASSERT_EQ(cut.owners[0].native_wait.mode, LW_WAIT_UNTIL_FREE);
+	UT_ASSERT(!cut.owners[0].native_wait.tag_known);
+	LWLockReportWaitEnd(); LWLockReportWaitStart(&other_lock);
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT(!cut.owners[0].native_waiting);
+	LWLockReportWaitEnd();
+}
+UT_TEST(enqueue_keys_survive_nested_native_wait)
+{
+	ClusterResId res = {UINT32_MAX, 22, 33, UINT16_MAX, 0xF2, 1};
+	ClusterGrdHolderId holder = {3, 17, 91, 92};
+	const ClusterContentTraceEnqueue *wait;
+	reset(); cluster_content_trace_enqueue_wait_set(&res, &holder,
+		ExclusiveLock, ShareLock, true, 101, 102, 103);
+	MyProc->lwWaitMode = LW_SHARED;
+	LWLockReportWaitStart(&buf(1)->content_lock);
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.nowners, 1); UT_ASSERT(cut.owners[0].enqueue_waiting);
+	UT_ASSERT(cut.owners[0].native_waiting);
+	wait = &cut.owners[0].enqueue;
+	UT_ASSERT_EQ(wait->field1, UINT32_MAX); UT_ASSERT_EQ(wait->field2, 22);
+	UT_ASSERT_EQ(wait->field3, 33); UT_ASSERT_EQ(wait->field4, UINT16_MAX);
+	UT_ASSERT_EQ(wait->type, 0xF2); UT_ASSERT_EQ(wait->lockmethodid, 1);
+	UT_ASSERT_EQ(wait->mode, ExclusiveLock); UT_ASSERT_EQ(wait->current_mode, ShareLock);
+	UT_ASSERT(wait->convert); UT_ASSERT_EQ(wait->holder_node, 3);
+	UT_ASSERT_EQ(wait->holder_procno, 17); UT_ASSERT_EQ(wait->holder_epoch, 91);
+	UT_ASSERT_EQ(wait->holder_request, 92); UT_ASSERT_EQ(wait->request, 101);
+	UT_ASSERT_EQ(wait->epoch, 102); UT_ASSERT_EQ(wait->wait_seq, 103);
+	LWLockReportWaitEnd(); cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT(cut.owners[0].enqueue_waiting); UT_ASSERT(!cut.owners[0].native_waiting);
+	cluster_content_trace_enqueue_wait_clear(); cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT(!cut.owners[0].enqueue_waiting); UT_ASSERT_EQ(cut.owners[0].enqueue.request, 0);
+}
+UT_TEST(error_clears_each_active_wait)
+{
+	ClusterResId res = {0}; ClusterGrdHolderId holder = {0};
+	ClusterWaitTrace pcm = {0};
+	reset(); cluster_content_trace_enqueue_wait_set(&res, &holder, 8, 0, false, 1, 2, 3);
+	cluster_content_trace_native_wait_set(&buf(1)->content_lock, LW_EXCLUSIVE);
+	cluster_content_trace_wait_set(CLCONTENT_PCM, &pcm);
+	cluster_content_trace_error_cleanup(); cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.nowners, 1); UT_ASSERT_EQ(cut.owners[0].wait_mask, 0);
+	UT_ASSERT(!cut.owners[0].native_waiting); UT_ASSERT(!cut.owners[0].enqueue_waiting);
+	UT_ASSERT_EQ(cut.owners[0].enqueue.request, 0); UT_ASSERT_EQ(logs, 0);
+}
+UT_TEST(release_gap_is_unknown_until_republication)
+{
+	reset(); hold(0, LW_EXCLUSIVE); cluster_content_trace_lock_changed(&buf(0)->content_lock);
+	cluster_content_trace_lock_invalidating(&other_lock);
+	cluster_content_trace_capture(&buf(0)->tag, &cut); UT_ASSERT_EQ(cut.matches, 1);
+	cluster_content_trace_lock_invalidating(&buf(0)->content_lock);
+	cluster_content_trace_capture(&buf(0)->tag, &cut);
+	UT_ASSERT_EQ(cut.changed, 1); UT_ASSERT_EQ(cut.matches, 0);
+	nheld = 0; cluster_content_trace_lock_changed(&buf(0)->content_lock);
+	cluster_content_trace_capture(&buf(0)->tag, &cut);
+	UT_ASSERT_EQ(cut.changed, 0); UT_ASSERT_EQ(cut.matches, 0);
+}
+
+static void walk_owner(const ClusterContentTraceOwner *owner, void *context)
+{
+	unsigned *seen = context;
+	ContentTraceSlot *slot = &content_trace->slots[owner->procno];
+	int32 pid = owner->pid;
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->busy), 0);
+	*seen |= 1U << owner->procno;
+	/* Callback can alter the source; its owned argument remains intact. */
+	memset(&slot->owner, 0, sizeof(slot->owner));
+	UT_ASSERT_EQ(owner->pid, pid);
+}
+UT_TEST(walk_visits_beyond_legacy_cap_without_holding_slot)
+{
+	ClusterContentTraceWalkStats stats; unsigned seen = 0;
+	reset(); hold(0, LW_SHARED);
+	for (unsigned i = 0; i < 10; i++) { actor(i); cluster_content_trace_lock_changed(&buf(0)->content_lock); }
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.nowners, 8); UT_ASSERT_EQ(cut.omitted_owners, 2);
+	cluster_content_trace_walk(walk_owner, &seen, &stats);
+	UT_ASSERT(stats.available); UT_ASSERT_EQ(stats.owners, 10);
+	UT_ASSERT_EQ(stats.scanned, content_trace->nslots);
+	UT_ASSERT_EQ(stats.busy + stats.changed + stats.dead, 0);
+	UT_ASSERT_EQ(seen, (1U << 10) - 1);
+}
+UT_TEST(walk_distinguishes_unknown_and_unavailable)
+{
+	ClusterContentTraceWalkStats stats; unsigned seen = 0;
+	reset();
+	for (unsigned i = 0; i < 4; i++) { actor(i); cluster_content_trace_native_wait_set(&buf(0)->content_lock, LW_SHARED); }
+	pg_atomic_write_u32(&content_trace->slots[0].busy, 1);
+	(void)pg_atomic_fetch_add_u64(&content_trace->slots[1].revision, 1);
+	procs[2].pid = 0;
+	cluster_content_trace_walk(walk_owner, &seen, &stats);
+	UT_ASSERT(stats.available); UT_ASSERT_EQ(stats.owners, 1);
+	UT_ASSERT_EQ(stats.busy, 1); UT_ASSERT_EQ(stats.changed, 1); UT_ASSERT_EQ(stats.dead, 1);
+	UT_ASSERT_EQ(seen, 1U << 3);
+	cluster_trace_tx_identity = false;
+	cluster_content_trace_walk(walk_owner, &seen, &stats);
+	UT_ASSERT(!stats.available); UT_ASSERT_EQ(stats.scanned, 0);
+	cluster_trace_tx_identity = true; ProcGlobal = NULL;
+	cluster_content_trace_walk(walk_owner, &seen, &stats); UT_ASSERT(!stats.available);
 }
 UT_TEST(release_removes_owner)
 {
@@ -208,6 +352,9 @@ UT_TEST(disabled_and_disable_transition)
 {
 	reset(); cluster_trace_tx_identity = false;
 	cluster_content_trace_capture(NULL, &cut); cluster_content_trace_wait_set(CLCONTENT_TX, NULL);
+	cluster_content_trace_native_wait_set(&buf(0)->content_lock, LW_EXCLUSIVE);
+	cluster_content_trace_enqueue_wait_set(NULL, NULL, 0, 0, false, 0, 0, 0);
+	UT_ASSERT(!local_owner.native_waiting); UT_ASSERT(!local_owner.enqueue_waiting);
 	UT_ASSERT_EQ(cut.scanned, 0); UT_ASSERT_EQ(logs, 0);
 	cluster_trace_tx_identity = true; hold(0, LW_EXCLUSIVE);
 	cluster_content_trace_lock_changed(&buf(0)->content_lock);
@@ -317,8 +464,15 @@ UT_TEST(pair_post_cleanup_emit_uses_owned_copy)
 int main(void)
 {
 	cluster_content_trace_shmem_register(); assert(registered && registered->lwlock_count == 0);
-	UT_PLAN(18);
+	UT_PLAN(26);
 	UT_RUN(actual_content_owner); UT_RUN(exact_tag_and_lock_kind); UT_RUN(release_removes_owner);
+	UT_RUN(all_owner_cut_includes_waiters_without_content_holds);
+	UT_RUN(native_reporter_keeps_exact_space_target_and_mode);
+	UT_RUN(native_free_wait_unknown_tag_and_noncontent);
+	UT_RUN(enqueue_keys_survive_nested_native_wait); UT_RUN(error_clears_each_active_wait);
+	UT_RUN(release_gap_is_unknown_until_republication);
+	UT_RUN(walk_visits_beyond_legacy_cap_without_holding_slot);
+	UT_RUN(walk_distinguishes_unknown_and_unavailable);
 	UT_RUN(nested_wait_keys); UT_RUN(pair_attempt_and_miss); UT_RUN(busy_cut_never_waits);
 	UT_RUN(missed_publish_marks_stale_unknown); UT_RUN(dead_process_not_current_owner);
 	UT_RUN(reused_pid_with_new_backend_is_unknown);

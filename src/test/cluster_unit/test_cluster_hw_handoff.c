@@ -195,6 +195,20 @@ cluster_content_trace_wait_clear(ClusterContentTraceWait kind)
 {
 }
 
+void
+cluster_content_trace_enqueue_wait_set(const ClusterResId *resid pg_attribute_unused(),
+	const ClusterGrdHolderId *holder pg_attribute_unused(),
+	int32 mode pg_attribute_unused(), int32 current_mode pg_attribute_unused(),
+	bool convert pg_attribute_unused(), uint64 request pg_attribute_unused(),
+	uint64 epoch pg_attribute_unused(), uint64 wait_seq pg_attribute_unused())
+{
+}
+
+void
+cluster_content_trace_enqueue_wait_clear(void)
+{
+}
+
 /* Real S3/GES/S5, with the KO owner an explicit boundary. Acceptance must
  * arrive before consumption, after both exact promotion/proof checks. */
 uint64
