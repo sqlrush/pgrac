@@ -441,6 +441,9 @@ typedef struct ClusterCtrcReceiptHandle {
 	ClusterCtrcParticipantEntry *participant;
 	ClusterCtrcReceipt *receipt;
 	ClusterCtrcTxnKeyV1 key;
+	/* Optional identity retained at original publication, never inferred.
+	 * Invalid remains unknown; it is not a freeze/retention certificate. */
+	FullTransactionId original_full_xid;
 	uint64 participant_index;
 	uint64 receipt_index;
 	uint64 journal_slot_generation;

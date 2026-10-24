@@ -5264,6 +5264,11 @@ ctrc_receipt_handle_fill(ClusterCtrcReceiptHandle *handle, ClusterCtrcParticipan
 	handle->participant = participant;
 	handle->receipt = receipt;
 	handle->key = receipt->key;
+	/* The original participant protection still spans this publication.
+	 * Copy only its already known identity, before making the handle valid. */
+	if (FullTransactionIdIsNormal(participant->original_full_xid)
+		&& XidFromFullTransactionId(participant->original_full_xid) == receipt->key.xid)
+		handle->original_full_xid = participant->original_full_xid;
 	handle->participant_index = participant_index;
 	handle->receipt_index = receipt_index;
 	handle->journal_slot_generation = receipt->publication.journal_slot_generation;
@@ -5283,7 +5288,14 @@ ctrc_receipt_handle_exact(const ClusterCtrcReceiptHandle *handle)
 		   && handle->receipt->publication.journal_slot_generation
 				  == handle->journal_slot_generation
 		   && memcmp(&handle->participant->key, &handle->key, sizeof(handle->key)) == 0
-		   && memcmp(&handle->receipt->key, &handle->key, sizeof(handle->key)) == 0;
+		   && memcmp(&handle->receipt->key, &handle->key, sizeof(handle->key)) == 0
+		   /* An unknown old handle may finish after exact local backfill, but
+			* a known snapshot cannot silently change epochs or lose its source. */
+		   && (!FullTransactionIdIsValid(handle->original_full_xid)
+			   || (FullTransactionIdIsNormal(handle->original_full_xid)
+				   && XidFromFullTransactionId(handle->original_full_xid) == handle->key.xid
+				   && FullTransactionIdEquals(handle->original_full_xid,
+											  handle->participant->original_full_xid)));
 }
 
 /* Check the locator bytes of the original allocation probe before that

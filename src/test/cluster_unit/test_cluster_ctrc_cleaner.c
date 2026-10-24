@@ -1426,6 +1426,8 @@ observe_receipt_origin_guard(LWLock *lock, LWLockMode mode, bool acquiring)
 		guarded_receipt_publications++;
 		if (FullTransactionIdIsValid(watched_receipt->participant->original_full_xid)
 			&& FullTransactionIdEquals(watched_receipt->participant->original_full_xid,
+									   ctrc_origin_entries()[0].original_full_xid)
+			&& FullTransactionIdEquals(watched_receipt->original_full_xid,
 									   ctrc_origin_entries()[0].original_full_xid))
 			guarded_original_identity_publications++;
 	}
@@ -3665,6 +3667,7 @@ UT_TEST(test_local_receipt_hands_original_identity_to_retained_participant)
 	external_lock_hook = observe_receipt_origin_guard;
 	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 301, &handle), CLUSTER_CTRC_PREPARE_READY);
 	UT_ASSERT(FullTransactionIdEquals(handle.participant->original_full_xid, original));
+	UT_ASSERT(FullTransactionIdEquals(handle.original_full_xid, original));
 	UT_ASSERT_EQ(guarded_original_identity_publications, 1);
 	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 301, &handle), CLUSTER_CTRC_PREPARE_DUPLICATE);
 	UT_ASSERT_EQ(guarded_original_identity_publications, 2);
@@ -3678,6 +3681,110 @@ UT_TEST(test_local_receipt_hands_original_identity_to_retained_participant)
 	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
 	UT_ASSERT(FullTransactionIdEquals(scan.min_full, original));
 	UT_ASSERT_EQ(top_full_reads, 0);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+static void
+receipt_handle_identity_fault(ClusterCtrcReceiptHandle *handle, unsigned fault)
+{
+	/* Isolate consumer sensitivity from the separate producer-copy test. */
+	handle->original_full_xid = FullTransactionIdFromEpochAndXid(3, handle->key.xid);
+	switch (fault) {
+		case 0:
+			handle->original_full_xid = FullTransactionIdFromEpochAndXid(4, handle->key.xid);
+			break;
+		case 1:
+			handle->original_full_xid = FullTransactionIdFromEpochAndXid(3, handle->key.xid + 1);
+			break;
+		case 2:
+			handle->original_full_xid = FullTransactionIdFromU64(1);
+			break;
+		case 3:
+			handle->participant->original_full_xid = FullTransactionIdFromEpochAndXid(4, handle->key.xid);
+			break;
+		case 4:
+			handle->participant->original_full_xid = InvalidFullTransactionId;
+			break;
+	}
+}
+
+UT_TEST(test_receipt_known_handle_identity_conflict_cannot_cancel)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		ClusterCtrcOriginEntry *origin;
+		ClusterCtrcReceiptHandle handle;
+		ClusterCtrcParticipantEntry participant_before;
+		ClusterCtrcReceipt receipt_before;
+
+		reset_fixture();
+		origin = seed_origin(0, 1);
+		origin->original_full_xid = FullTransactionIdFromEpochAndXid(3, origin->key.xid);
+		UT_ASSERT_EQ(prepare_fixture_receipt(origin, 301, &handle), CLUSTER_CTRC_PREPARE_READY);
+		receipt_handle_identity_fault(&handle, fault);
+		participant_before = *handle.participant;
+		receipt_before = *handle.receipt;
+		UT_ASSERT(!cluster_ctrc_receipt_cancel_shared(&handle));
+		UT_ASSERT(memcmp(&participant_before, handle.participant, sizeof(participant_before)) == 0);
+		UT_ASSERT(memcmp(&receipt_before, handle.receipt, sizeof(receipt_before)) == 0);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_receipt_known_handle_identity_conflict_cannot_apply)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		ClusterCtrcOriginEntry *origin;
+		ClusterCtrcReceiptHandle handle;
+		ClusterCtrcParticipantEntry participant_before;
+		ClusterCtrcReceipt receipt_before;
+		ClusterCtrcApplyToken token, zero = { 0 };
+		ClusterCtrcTargetV1 target;
+
+		reset_fixture();
+		origin = seed_origin(0, 1);
+		origin->original_full_xid = FullTransactionIdFromEpochAndXid(3, origin->key.xid);
+		UT_ASSERT_EQ(prepare_fixture_receipt(origin, 301, &handle), CLUSTER_CTRC_PREPARE_READY);
+		target = handle.receipt->target;
+		target.kind = CTRC_TARGET_EXACT_ITL_SLOT;
+		target.itl_xid = origin->key.xid;
+		target.itl_class = 1;
+		target.itl_slot_wrap = 1;
+		target.uba[0] = 1;
+		target.planned_predecessor_sha256[0] = 1;
+		target.planned_successor_sha256[0] = 2;
+		receipt_handle_identity_fault(&handle, fault);
+		participant_before = *handle.participant;
+		receipt_before = *handle.receipt;
+		memset(&token, 0xa5, sizeof(token));
+		UT_ASSERT_EQ(cluster_ctrc_receipt_apply_shared(&handle, &target, &token),
+					 CLUSTER_CTRC_APPLY_FAIL_CLOSED);
+		UT_ASSERT(memcmp(&token, &zero, sizeof(token)) == 0);
+		UT_ASSERT(memcmp(&participant_before, handle.participant, sizeof(participant_before)) == 0);
+		UT_ASSERT(memcmp(&receipt_before, handle.receipt, sizeof(receipt_before)) == 0);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_receipt_unknown_handle_remains_unknown_after_exact_local_backfill)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcReceiptHandle unknown, known;
+	FullTransactionId original;
+
+	reset_fixture();
+	origin = seed_origin(0, 1);
+	original = FullTransactionIdFromEpochAndXid(3, origin->key.xid);
+	origin->original_full_xid = InvalidFullTransactionId;
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 301, &unknown), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(!FullTransactionIdIsValid(unknown.original_full_xid));
+	origin->original_full_xid = original;
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 301, &known), CLUSTER_CTRC_PREPARE_DUPLICATE);
+	UT_ASSERT(FullTransactionIdEquals(known.original_full_xid, original));
+	UT_ASSERT(!FullTransactionIdIsValid(unknown.original_full_xid));
+	/* The original pending publisher can still finish/cancel. Unknown is
+	 * never retrospectively promoted to qualified FullXid provenance. */
+	UT_ASSERT(cluster_ctrc_receipt_cancel_shared(&unknown));
+	UT_ASSERT(!FullTransactionIdIsValid(unknown.original_full_xid));
 	UT_ASSERT_EQ(held_count, 0);
 }
 
@@ -3723,6 +3830,7 @@ UT_TEST(test_receipt_never_guesses_missing_or_foreign_original_identity)
 			origin->original_full_xid = InvalidFullTransactionId;
 		UT_ASSERT_EQ(prepare_fixture_receipt(origin, 301, &handle), CLUSTER_CTRC_PREPARE_READY);
 		UT_ASSERT(!FullTransactionIdIsValid(handle.participant->original_full_xid));
+		UT_ASSERT(!FullTransactionIdIsValid(handle.original_full_xid));
 		UT_ASSERT_EQ(top_full_reads, 0);
 		UT_ASSERT_EQ(held_count, 0);
 	}
@@ -3851,7 +3959,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(90);
+	UT_PLAN(93);
 	printf("# CTRC header_bytes=%zu total_bytes=%zu\n", sizeof(ClusterCtrcSharedHeader),
 		   capacity.total_bytes);
 	UT_RUN(test_origin_reserve_requires_published_local_top_protection);
@@ -3938,6 +4046,9 @@ main(void)
 	UT_RUN(test_active_scan_fresh_begin_discards_previous_partial_sample);
 	UT_RUN(test_active_scan_uses_original_origin_identity_after_pgproc_exit);
 	UT_RUN(test_local_receipt_hands_original_identity_to_retained_participant);
+	UT_RUN(test_receipt_known_handle_identity_conflict_cannot_cancel);
+	UT_RUN(test_receipt_known_handle_identity_conflict_cannot_apply);
+	UT_RUN(test_receipt_unknown_handle_remains_unknown_after_exact_local_backfill);
 	UT_RUN(test_local_receipt_refuses_conflicting_retained_original_identity);
 	UT_RUN(test_receipt_never_guesses_missing_or_foreign_original_identity);
 	UT_RUN(test_active_scan_refuses_malformed_known_participant_identity);
