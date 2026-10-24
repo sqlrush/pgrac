@@ -8964,10 +8964,17 @@ test_cluster_heap_horizon_compare.inc: $(top_srcdir)/src/backend/access/transam/
 		END { if (starts != 4 || done != 4 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
+# Real SCN-time comparator used by the retained-source H minimum.
+test_cluster_heap_horizon_scn_time.inc: $(top_srcdir)/src/backend/cluster/cluster_scn.c Makefile
+	@awk '/^scn_time_cmp\(/ { print "int"; emit=1; starts++ } \
+		emit { print } emit && /^}$$/ { emit=0; done++; exit } \
+		END { if (starts != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_horizon: test_cluster_heap_horizon.c test_cluster_xid_stripe.c unit_test.h \
 		$(top_srcdir)/src/include/commands/vacuum.h \
 		test_cluster_heap_horizon_create.inc test_cluster_heap_horizon_vacuum.inc \
-		test_cluster_heap_horizon_compare.inc \
+		test_cluster_heap_horizon_compare.inc test_cluster_heap_horizon_scn_time.inc \
 		test_cluster_heap_horizon_vacuum_fixture.inc \
 		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \

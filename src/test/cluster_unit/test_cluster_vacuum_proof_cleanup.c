@@ -930,6 +930,8 @@ reset_fixture(void)
 	cohort_value.requested_full_xid_max = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 1100));
 	cohort_value.active_full_xid_min = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 60));
 	cohort_value.horizon_scn = 500;
+	cohort_value.source_local_horizon_scn = 600;
+	cohort_value.source_peer_horizon_scn[1] = 500;
 	cohort_value.record_generation = 17;
 	cohort_value.formation_epoch = 9;
 	cohort_value.admitted_members_lo = 3;

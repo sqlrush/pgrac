@@ -372,6 +372,7 @@ cluster_heap_freeze_observed_bounds_v1(
 	ClusterHeapFreezeObservedBoundsV1 *out)
 {
 	ClusterHeapFreezeObservedBoundsV1 bounds = { 0 };
+	SCN source_horizon;
 
 	if (policy == NULL || cohort == NULL || admission == NULL || out == NULL
 		|| !admission->entered || admission->record_generation == 0
@@ -403,6 +404,29 @@ cluster_heap_freeze_observed_bounds_v1(
 			 : cohort->admitted_members_hi >> (local_node_id - 64)) & 1) == 0)
 		return false;
 
+	/* Reproduce H from the same saved local cut and original required peer
+	 * publications, in the original fold order and SCN time domain. Values
+	 * from outside that fixed cohort cannot change this bound. This is a
+	 * pure source match, not contributor-lifetime or retention authority. */
+	source_horizon = (SCN)cohort->source_local_horizon_scn;
+	if (!SCN_VALID(source_horizon) || source_horizon == UINT64_MAX)
+		return false;
+	for (int peer = 0; peer < CLUSTER_MAX_NODES; peer++)
+	{
+		uint64 members = peer < 64 ? cohort->admitted_members_lo : cohort->admitted_members_hi;
+		SCN peer_horizon;
+
+		if (peer == local_node_id || (members & (UINT64CONST(1) << (peer % 64))) == 0)
+			continue;
+		peer_horizon = (SCN)cohort->source_peer_horizon_scn[peer];
+		if (!SCN_VALID(peer_horizon) || peer_horizon == UINT64_MAX)
+			return false;
+		if (scn_time_cmp(peer_horizon, source_horizon) < 0)
+			source_horizon = peer_horizon;
+	}
+	if ((uint64)source_horizon != cohort->horizon_scn)
+		return false;
+
 	/* F only caps the original policy; H remains in its independent SCN
 	 * domain. Neither numeric match supplies producer-retention authority. */
 	bounds.freeze_limit = FullTransactionIdFromU64(
@@ -413,7 +437,7 @@ cluster_heap_freeze_observed_bounds_v1(
 	if (U64FromFullTransactionId(policy->legal_next)
 		- U64FromFullTransactionId(bounds.freeze_limit) >= UINT64CONST(0x80000000))
 		return false;
-	bounds.horizon_scn = cohort->horizon_scn;
+	bounds.horizon_scn = (uint64)source_horizon;
 	memcpy(out, &bounds, sizeof(bounds));
 	return true;
 }

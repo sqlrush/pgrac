@@ -131,7 +131,7 @@ typedef enum ClusterHeapFreezeCohortStatus {
 	CLUSTER_HEAP_FREEZE_COHORT_INVALID
 } ClusterHeapFreezeCohortStatus;
 
-/* Same receive publication used by the original fold. Process-local only;
+/* Same receive publication identity used by the original fold and watermark;
  * covered is maintenance intent coverage, never freeze permission. */
 typedef struct ClusterHeapFreezeCohortPeerObservation {
 	uint64 recv_at_us;
@@ -162,6 +162,10 @@ typedef struct ClusterHeapFreezeCohortObservation {
 	/* Original fixed-cohort cut, retained verbatim for the existing current
 	 * getter. Keep unchanged; not a producer-retention certificate. */
 	ClusterSemanticActiveSampleFence admission_fence;
+	/* Original local H from the same single history sample used by the fold. */
+	uint64 source_local_horizon_scn;
+	/* Kept outside the peer identity type, which is also stored in shmem. */
+	uint64 source_peer_horizon_scn[CLUSTER_MAX_NODES];
 	uint64 source_local_sample_id;
 	uint64 source_started_at_us;
 	uint32 source_interval_ms;
@@ -172,7 +176,9 @@ typedef struct ClusterHeapFreezeCohortObservation {
  * candidate bounds only, not a positive F/H or producer-retention certificate.
  * The selected Min(policy,F) must remain strictly inside the original
  * policy legal-next past half-space; a higher ignored F does not qualify
- * or invalidate that selected bound.
+ * or invalidate that selected bound. The retained H must equal the original
+ * SCN-time minimum of its local sample and exactly the required peer sources,
+ * preserving the original fold order for equal-time values.
  * No nextXid/H sample, current fetch, lock or identity callback is performed.
  * Failure preserves *out; the caller still owns the original admission and
  * must qualify provenance/retention before any native plan or shared write. */

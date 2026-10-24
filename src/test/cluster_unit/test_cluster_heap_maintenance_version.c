@@ -1117,6 +1117,7 @@ qualified_xmin_setup(QualifiedXminFixture *f, uint16 xmax_mask)
 	f->cohort.active_full_xid_min = U64FromFullTransactionId(f->policy.freeze_limit);
 	f->cohort.future_full_xid_max = U64FromFullTransactionId(f->policy.legal_next);
 	f->cohort.horizon_scn = 10;
+	f->cohort.source_local_horizon_scn = 10;
 	f->cohort.record_generation = 13; f->cohort.formation_epoch = 21;
 	f->cohort.admitted_members_lo = 1;
 	f->cohort.admission_fence.record_generation = 13;
@@ -1578,6 +1579,7 @@ UT_TEST(test_xmin_single_and_batch_wal_clock_accept_time_equal_or_ahead)
 			else
 				qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
 			f.cohort.horizon_scn = horizon;
+			f.cohort.source_local_horizon_scn = horizon;
 			/* A lower node id at the same time is still sufficient. */
 			fixture_wal_clock = scn_encode(0, 10 + ahead);
 			applied = batch ? cluster_heap_freeze_apply_xmin_batch_v1(
@@ -2800,6 +2802,35 @@ UT_TEST(test_xmin_apply_requires_same_bound_sources)
 	}
 }
 
+UT_TEST(test_xmin_original_h_source_refusal_precedes_writer_use)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int released = 0; released < 2; released++) {
+			for (int variant = 0; variant < 4; variant++) {
+				QualifiedXminFixture f;
+				ClusterHeapFreezeXminTargetV1 targets[3];
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
+				if (released) { fixture_release_original_writer(); resume_allowed = true; }
+				switch (variant) {
+				case 0: f.cohort.source_local_horizon_scn = 0; break;
+				case 1: f.cohort.source_local_horizon_scn = UINT64_MAX; break;
+				case 2: f.cohort.source_local_horizon_scn = 9; break;
+				case 3: f.cohort.source_local_horizon_scn = 11; break;
+				}
+				UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 2)
+					: qualified_xmin_apply(&f, 0)));
+				UT_ASSERT_EQ(writer_checks + route_checks + admission_checks, 0);
+				UT_ASSERT_EQ(conditional_resumes + conditional_unlocks, 0);
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+				UT_ASSERT_EQ(backend_pin_count, 1);
+				UT_ASSERT(f.admission.entered && local_x == !released && !resumed_writer);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+		}
+	}
+}
+
 UT_TEST(test_xmin_registration_cut_refusal_precedes_writer_use)
 {
 	for (int batch = 0; batch < 2; batch++) {
@@ -3023,12 +3054,13 @@ UT_TEST(test_xmin_native_horizon_rechecks_legal_window_after_final_target)
 int
 main(void)
 {
-	UT_PLAN(84);
+	UT_PLAN(85);
 	UT_RUN(test_xmin_native_horizon_refuses_creator_outside_legal_window);
 	UT_RUN(test_xmin_native_horizon_keeps_strictly_inside_legal_window);
 	UT_RUN(test_xmin_native_horizon_rechecks_legal_window_after_final_target);
 	UT_RUN(test_xmin_capture_refusal_precedes_writer_resume);
 	UT_RUN(test_xmin_apply_requires_same_bound_sources);
+	UT_RUN(test_xmin_original_h_source_refusal_precedes_writer_use);
 	UT_RUN(test_xmin_registration_cut_refusal_precedes_writer_use);
 	UT_RUN(test_xmin_registration_cut_rechecked_after_final_callbacks);
 	UT_RUN(test_xmin_registration_cut_rechecked_after_actual_space_prepare);

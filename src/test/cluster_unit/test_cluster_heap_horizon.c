@@ -9,6 +9,9 @@ int heap_horizon_stripe_fixture_main(void);
 #include "access/multixact.h"
 #include "utils/rel.h"
 
+/* Compile the actual production SCN-time comparator, including cross-node ties. */
+#include "test_cluster_heap_horizon_scn_time.inc"
+
 TransactionId RecentXmin;
 MultiXactId
 GetOldestMultiXactId(void)
@@ -920,6 +923,9 @@ observed_bounds_fixture(ClusterHeapFreezePolicySampleV1 *policy,
 	cohort->active_full_xid_min = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(2, 60));
 	cohort->future_full_xid_max = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(2, 2000));
 	cohort->horizon_scn = 500;
+	cohort->source_local_horizon_scn = 700;
+	cohort->source_peer_horizon_scn[0] = 700;
+	cohort->source_peer_horizon_scn[1] = 500;
 	cohort->record_generation = admission->record_generation = 17;
 	cohort->formation_epoch = admission->formation_epoch = 9;
 	cohort->admitted_members_lo = 3;
@@ -948,6 +954,55 @@ UT_TEST(observed_bounds_cap_policy_at_same_cohort_and_preserve_h_domain)
 	UT_ASSERT(FullTransactionIdEquals(out.freeze_limit, policy.freeze_limit));
 	UT_ASSERT_EQ(out.horizon_scn, cohort.horizon_scn);
 	UT_ASSERT_EQ(activation_reads, before);
+}
+
+UT_TEST(observed_bounds_reproduces_original_fixed_cohort_h_minimum)
+{
+	ClusterHeapFreezePolicySampleV1 policy;
+	ClusterHeapFreezeCohortObservation cohort;
+	ClusterSemanticAdmissionToken admission;
+	ClusterHeapFreezeObservedBoundsV1 out;
+	unsigned before = activation_reads;
+
+	observed_bounds_fixture(&policy, &cohort, &admission);
+	cohort.source_local_horizon_scn = scn_encode(7, 90);
+	cohort.source_peer_horizon_scn[1] = scn_encode(1, 100);
+	cohort.source_peer_horizon_scn[2] = 0; /* not required */
+	cohort.horizon_scn = cohort.source_local_horizon_scn;
+	UT_ASSERT(cluster_heap_freeze_observed_bounds_v1(&policy, &cohort, &admission, 0, &out));
+	UT_ASSERT_EQ(out.horizon_scn, cohort.source_local_horizon_scn);
+	cohort.source_peer_horizon_scn[1] = scn_encode(1, 90);
+	UT_ASSERT(cluster_heap_freeze_observed_bounds_v1(&policy, &cohort, &admission, 0, &out));
+	UT_ASSERT_EQ(out.horizon_scn, cohort.source_local_horizon_scn); /* same-time tie */
+	cohort.admitted_members_hi = cohort.admission_fence.admitted_members_hi = UINT64CONST(1) << 63;
+	cohort.source_peer_horizon_scn[127] = scn_encode(9, 80);
+	cohort.horizon_scn = cohort.source_peer_horizon_scn[127];
+	UT_ASSERT(cluster_heap_freeze_observed_bounds_v1(&policy, &cohort, &admission, 0, &out));
+	UT_ASSERT_EQ(out.horizon_scn, cohort.source_peer_horizon_scn[127]);
+	UT_ASSERT_EQ(activation_reads, before);
+}
+
+UT_TEST(observed_bounds_rejects_changed_or_missing_original_h_atomically)
+{
+	for (int variant = 0; variant < 7; variant++) {
+		ClusterHeapFreezePolicySampleV1 policy;
+		ClusterHeapFreezeCohortObservation cohort;
+		ClusterSemanticAdmissionToken admission;
+		ClusterHeapFreezeObservedBoundsV1 out, saved;
+		observed_bounds_fixture(&policy, &cohort, &admission);
+		memset(&out, 0xa5, sizeof(out)); saved = out;
+		switch (variant) {
+		case 0: cohort.source_local_horizon_scn = 0; break;
+		case 1: cohort.source_local_horizon_scn = UINT64_MAX; break;
+		case 2: cohort.source_local_horizon_scn = 400; break;
+		case 3: cohort.source_peer_horizon_scn[1] = 0; break;
+		case 4: cohort.source_peer_horizon_scn[1] = UINT64_MAX; break;
+		case 5: cohort.source_peer_horizon_scn[1] = 400; break;
+		case 6: cohort.horizon_scn++; break;
+		}
+		UT_ASSERT(!cluster_heap_freeze_observed_bounds_v1(&policy, &cohort, &admission, 0, &out));
+		UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+	}
 }
 
 UT_TEST(observed_bounds_identity_refusal_preserves_complete_output)
@@ -1112,8 +1167,10 @@ UT_TEST(observed_bounds_keep_fullxid_epoch_and_high_member_bit)
 int
 main(void)
 {
-	UT_PLAN(55);
+	UT_PLAN(57);
 	UT_RUN(observed_bounds_cap_policy_at_same_cohort_and_preserve_h_domain);
+	UT_RUN(observed_bounds_reproduces_original_fixed_cohort_h_minimum);
+	UT_RUN(observed_bounds_rejects_changed_or_missing_original_h_atomically);
 	UT_RUN(observed_bounds_identity_refusal_preserves_complete_output);
 	UT_RUN(observed_bounds_policy_window_refusal_is_atomic);
 	UT_RUN(observed_bounds_cohort_refusal_and_nulls_preserve_output);

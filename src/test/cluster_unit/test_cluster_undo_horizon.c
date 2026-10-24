@@ -1913,6 +1913,22 @@ UT_TEST(test_v2_lmon_relay_uses_original_cadence_and_no_completion_cache)
 	}
 }
 
+UT_TEST(test_v2_cohort_retains_original_local_and_peer_history_values)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
+	ClusterHeapFreezeCohortObservation out;
+	unsigned calls = test_retention_sample_calls;
+	report.horizon_scn = scn_encode(65, 250);
+	cohort_receive(65, report);
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	UT_ASSERT_EQ(test_retention_sample_calls, calls + 1);
+	UT_ASSERT_EQ(out.source_local_horizon_scn, test_retention_sample.horizon_scn);
+	UT_ASSERT_EQ(out.source_peer_horizon_scn[1], 300);
+	UT_ASSERT_EQ(out.source_peer_horizon_scn[65], report.horizon_scn);
+	UT_ASSERT_EQ(out.source_peer_horizon_scn[2], 0);
+	UT_ASSERT_EQ(out.horizon_scn, report.horizon_scn);
+}
+
 UT_TEST(test_v2_cohort_requires_both_mask_halves_and_keeps_domains_separate)
 {
 	ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
@@ -2792,7 +2808,7 @@ UT_TEST(test_watermark_reader_clears_output_on_late_registration)
 int
 main(void)
 {
-	UT_PLAN(103);
+	UT_PLAN(104);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -2844,6 +2860,7 @@ main(void)
 	UT_RUN(test_v2_sender_rechecks_capability_and_original_sample_without_stalling_v1);
 	UT_RUN(test_v2_sender_capability_is_independent_of_v1_and_sequence_is_shared);
 	UT_RUN(test_v2_summary_observes_complete_fixed_cohort);
+	UT_RUN(test_v2_cohort_retains_original_local_and_peer_history_values);
 	UT_RUN(test_v2_cohort_requires_both_mask_halves_and_keeps_domains_separate);
 	UT_RUN(test_v2_cohort_reports_only_complete_observed_future_ceiling);
 	UT_RUN(test_vacuum_intent_uses_complete_future_and_original_sender);
