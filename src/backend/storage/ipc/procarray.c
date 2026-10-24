@@ -2272,7 +2272,15 @@ cluster_undo_retention_horizon_sample(ClusterUndoRetentionSample *out)
 	sample.clock_scn = cluster_scn_current();
 	sample.horizon_scn = sample.clock_scn;
 	sample.contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK;
-	for (index = 0; index < arrayP->numProcs; index++)
+	/* Replication slots can retain history without a live PGPROC. Their
+	 * xmin fields have no associated read SCN, even when an active backend
+	 * publishes the same raw XID. Until the slot owner supplies that proof,
+	 * refuse H in this same cut; neither the clock nor another reader can
+	 * stand in for the slot's history protection. */
+	if (TransactionIdIsValid(arrayP->replication_slot_xmin) ||
+		TransactionIdIsValid(arrayP->replication_slot_catalog_xmin))
+		sample.horizon_scn = InvalidScn;
+	for (index = 0; SCN_VALID(sample.horizon_scn) && index < arrayP->numProcs; index++)
 	{
 		int			pgprocno = arrayP->pgprocnos[index];
 		PGPROC	   *proc = &allProcs[pgprocno];

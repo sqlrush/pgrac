@@ -59,7 +59,7 @@ LWLockRelease(LWLock *lock)
 SCN
 cluster_scn_current(void)
 {
-	if (!held || clock_reads != 0)
+	if (!held || clock_reads != acquires - 1)
 		lock_errors++;
 	clock_reads++;
 	return sample_clock;
@@ -249,6 +249,91 @@ UT_TEST(test_unlock_cannot_change_sample_or_scalar_wrapper)
 	UT_ASSERT_EQ(lock_errors, 0);
 }
 
+UT_TEST(test_replication_slot_pin_without_backend_refuses_horizon)
+{
+	ClusterUndoRetentionSample sample;
+
+	reset_fixture();
+	procArray->replication_slot_xmin = FirstNormalTransactionId + 17;
+	MemSet(&sample, 0xa5, sizeof(sample));
+	UT_ASSERT(!cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT(empty_sample(&sample));
+	UT_ASSERT_EQ(cluster_undo_retention_horizon(), InvalidScn);
+	UT_ASSERT_EQ(acquires, 2);
+	UT_ASSERT_EQ(releases, 2);
+	UT_ASSERT_EQ(clock_reads, 2);
+	UT_ASSERT_EQ(lock_errors, 0);
+	UT_ASSERT(!held);
+}
+
+UT_TEST(test_catalog_slot_pin_cannot_borrow_backend_read_scn)
+{
+	ClusterUndoRetentionSample sample;
+
+	reset_fixture();
+	procArray->numProcs = 1;
+	entries[0].xmin = FirstNormalTransactionId + 17;
+	pg_atomic_write_u64(&entries[0].cluster_read_scn_atomic, 100);
+	procArray->replication_slot_catalog_xmin = entries[0].xmin;
+	MemSet(&sample, 0xa5, sizeof(sample));
+	UT_ASSERT(!cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT(empty_sample(&sample));
+	UT_ASSERT_EQ(acquires, 1);
+	UT_ASSERT_EQ(releases, 1);
+	UT_ASSERT_EQ(lock_errors, 0);
+	UT_ASSERT(!held);
+}
+
+UT_TEST(test_any_noninvalid_slot_pin_requires_its_own_scn_proof)
+{
+	const TransactionId pins[] = {BootstrapTransactionId, FrozenTransactionId,
+								  FirstNormalTransactionId, MaxTransactionId};
+	ClusterUndoRetentionSample sample;
+
+	for (unsigned i = 0; i < lengthof(pins); i++) {
+		for (unsigned catalog = 0; catalog < 2; catalog++) {
+			reset_fixture();
+			if (catalog)
+				procArray->replication_slot_catalog_xmin = pins[i];
+			else
+				procArray->replication_slot_xmin = pins[i];
+			MemSet(&sample, 0xa5, sizeof(sample));
+			UT_ASSERT(!cluster_undo_retention_horizon_sample(&sample));
+			UT_ASSERT(empty_sample(&sample));
+			UT_ASSERT_EQ(acquires, 1);
+			UT_ASSERT_EQ(releases, 1);
+			UT_ASSERT_EQ(lock_errors, 0);
+			UT_ASSERT(!held);
+		}
+	}
+}
+
+UT_TEST(test_horizon_resamples_after_both_slot_pins_are_removed)
+{
+	ClusterUndoRetentionSample sample;
+
+	reset_fixture();
+	procArray->replication_slot_xmin = FirstNormalTransactionId + 17;
+	procArray->replication_slot_catalog_xmin = FirstNormalTransactionId + 19;
+	UT_ASSERT(!cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT(empty_sample(&sample));
+	procArray->replication_slot_xmin = InvalidTransactionId;
+	UT_ASSERT(!cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT(empty_sample(&sample));
+	procArray->replication_slot_catalog_xmin = InvalidTransactionId;
+	sample_clock = 800;
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 800);
+	UT_ASSERT_EQ(sample.clock_scn, 800);
+	UT_ASSERT_EQ(sample.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+	UT_ASSERT_EQ(sample.contributor_token, 0);
+	UT_ASSERT_EQ(acquires, 3);
+	UT_ASSERT_EQ(releases, 3);
+	UT_ASSERT_EQ(clock_reads, 3);
+	UT_ASSERT_EQ(lock_errors, 0);
+	UT_ASSERT(!held);
+}
+
 UT_TEST(test_null_output_and_disabled_cluster_do_not_scan)
 {
 	ClusterUndoRetentionSample sample;
@@ -267,7 +352,7 @@ UT_TEST(test_null_output_and_disabled_cluster_do_not_scan)
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(13);
 	UT_RUN(test_empty_array_has_one_prescan_clock);
 	UT_RUN(test_all_database_and_vacuum_snapshot_minima_are_included);
 	UT_RUN(test_equal_time_prefers_snapshot_without_changing_scalar_bits);
@@ -276,6 +361,10 @@ main(void)
 	UT_RUN(test_missing_read_scn_clears_partial_minimum);
 	UT_RUN(test_invalid_clock_never_borrows_a_snapshot_time);
 	UT_RUN(test_unlock_cannot_change_sample_or_scalar_wrapper);
+	UT_RUN(test_replication_slot_pin_without_backend_refuses_horizon);
+	UT_RUN(test_catalog_slot_pin_cannot_borrow_backend_read_scn);
+	UT_RUN(test_any_noninvalid_slot_pin_requires_its_own_scn_proof);
+	UT_RUN(test_horizon_resamples_after_both_slot_pins_are_removed);
 	UT_RUN(test_null_output_and_disabled_cluster_do_not_scan);
 	free(procArray);
 	UT_DONE();
