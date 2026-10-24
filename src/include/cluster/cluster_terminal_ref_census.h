@@ -589,6 +589,28 @@ typedef enum ClusterCtrcPrepareResult {
 	CLUSTER_CTRC_PREPARE_CAPACITY = 3
 } ClusterCtrcPrepareResult;
 
+/* Process-local first-refusal observation; not a wire or stored value. */
+typedef enum ClusterCtrcPreparePath {
+	CLUSTER_CTRC_PREPARE_PATH_UNKNOWN = 0,
+	CLUSTER_CTRC_PREPARE_PATH_NAMESPACE = 1,
+	CLUSTER_CTRC_PREPARE_PATH_INPUT = 2,
+	CLUSTER_CTRC_PREPARE_PATH_JOURNAL = 3,
+	CLUSTER_CTRC_PREPARE_PATH_CHAIN = 4,
+	CLUSTER_CTRC_PREPARE_PATH_LOCATOR = 5,
+	CLUSTER_CTRC_PREPARE_PATH_OBJECT_EXISTING = 6,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE = 7,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE_INPUT = 8,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE_PARTICIPANT = 9,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE_PUBLICATION = 10,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE_EMPTY_BYTES = 11,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE_TOMBSTONE_BYTES = 12,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE_OCCUPIED = 13,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE_DUPLICATE_CONFLICT = 14,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE_CAPACITY = 15,
+	CLUSTER_CTRC_PREPARE_PATH_TABLE_SLOT_PREPARE = 16,
+	CLUSTER_CTRC_PREPARE_PATH_ORIGINAL_FULL_XID = 17
+} ClusterCtrcPreparePath;
+
 typedef enum ClusterCtrcApplyResult {
 	CLUSTER_CTRC_APPLY_FAIL_CLOSED = 0,
 	CLUSTER_CTRC_APPLY_APPLIED = 1,
@@ -1073,6 +1095,12 @@ extern ClusterCtrcPrepareResult cluster_ctrc_receipt_prepare_shared(
 	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *identity,
 	uint32 grant_generation, const ClusterCtrcPublicationIdV1 *publication,
 	const ClusterCtrcTargetV1 *target, ClusterCtrcReceiptHandle *handle);
+
+extern ClusterCtrcPrepareResult cluster_ctrc_receipt_prepare_shared_observed(
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *identity,
+	uint32 grant_generation, const ClusterCtrcPublicationIdV1 *publication,
+	const ClusterCtrcTargetV1 *target, ClusterCtrcReceiptHandle *handle,
+	ClusterCtrcPreparePath *path_out);
 extern ClusterCtrcApplyResult cluster_ctrc_receipt_apply_prepared(
 	ClusterCtrcParticipantEntry *participant, ClusterCtrcReceipt *receipt,
 	const ClusterCtrcTargetV1 *final_target, ClusterCtrcApplyToken *token);
