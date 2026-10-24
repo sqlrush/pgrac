@@ -134,8 +134,10 @@ extern bool cluster_recovery_stamp_ctrc_flush_v2(const ClusterRecoveryStampHandl
 extern bool cluster_recovery_stamp_ctrc_finish_v2(const ClusterRecoveryStampHandleV1 *handle,
 												  ClusterUndoSmgrRecoveryStampV1 stamp);
 /* Dormant single Startup operation in the caller's original critical section:
- * insert and privately snapshot the native record, then finish that exact
- * window. Publish the complete raw record and actual start only after target
+ * read-only match the caller-owned held D0 stage and complete payload before
+ * the native insertion, then snapshot the record and finish that exact window.
+ * Pre-insert mismatch leaves the window cancelable. Publish the complete raw
+ * record and actual start only after target
  * sync/readback and clear succeed; refusal leaves both outputs unchanged.
  * raw_length must equal the native header, long data header and 320B payload.
  * Outputs must be private and disjoint from each other, handle and live slot.

@@ -184,6 +184,11 @@ extern bool cluster_undo_smgr_recovery_abort_close_v1(ClusterUndoSmgrRecoverySta
 extern bool cluster_undo_smgr_recovery_ctrc_prepare_v2(const uint8 *payload, size_t length,
 													   uint64 system_identifier,
 													   ClusterUndoSmgrRecoveryStampV1 *out);
+/* Read-only pre-insert check of the held D0 stage and all prepared bytes.
+ * No IO, lock, codec/hash/allocation, state change or completion authority.
+ * Refusal does not poison the stage; post-insert write_bound remains required. */
+extern bool cluster_undo_smgr_recovery_ctrc_matches_v2(ClusterUndoSmgrRecoveryStampV1 stamp,
+													 const uint8 *payload, size_t length);
 extern bool cluster_undo_smgr_recovery_ctrc_write_v2(ClusterUndoSmgrRecoveryStampV1 stamp);
 /* The durability coordinator must also bind the complete prepared canonical
  * payload, not just its target before/after page. An exact owned token with

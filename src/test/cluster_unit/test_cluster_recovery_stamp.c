@@ -59,7 +59,8 @@ static bool cover_enabled;
 /* Storage is an external leaf here; the real held-FD entry is independently
  * exercised against native temporary undo files in recovery_tt_io. */
 static void flush_unlocked(void);
-static unsigned target_calls, target_fault;
+static unsigned target_calls, target_fault, target_match_calls;
+static bool target_match_ready;
 static uint8 target_payload[320];
 static ClusterUndoSmgrRecoveryStampV1 target_stamp = { .token = 37 };
 static const uint8 *apply_raw, *apply_start;
@@ -74,6 +75,17 @@ apply_outputs_unpublished(void)
 		UT_ASSERT_EQ(apply_raw[i], 0xA5);
 	memcpy(&start, apply_start, sizeof(start));
 	UT_ASSERT_EQ(start, 91);
+}
+
+bool
+cluster_undo_smgr_recovery_ctrc_matches_v2(ClusterUndoSmgrRecoveryStampV1 stamp,
+	const uint8 *bytes, size_t length)
+{
+	flush_unlocked();
+	target_match_calls++;
+	return target_match_ready && stamp.token == target_stamp.token
+		&& bytes != NULL && length == sizeof(target_payload)
+		&& memcmp(bytes, target_payload, sizeof(target_payload)) == 0;
 }
 
 bool
@@ -332,7 +344,8 @@ fresh(void)
 	covered_end = 0x2000413;
 	covered_timeline = 1;
 	cover_enabled = true;
-	target_calls = target_fault = 0;
+	target_calls = target_fault = target_match_calls = 0;
+	target_match_ready = true;
 	apply_raw = apply_start = NULL;
 	memset(target_payload, 0, sizeof(target_payload));
 	memset(registered_payload, 0, sizeof(registered_payload));
@@ -1886,6 +1899,7 @@ UT_TEST(d0_apply_preinsert_refusal_preserves_outputs_and_window)
 		Size length = sizeof(raw);
 		fresh();
 		UT_ASSERT(begin_d0(&h, TT_SLOT_COMMITTED));
+		memcpy(target_payload, h.payload, sizeof(target_payload));
 		memset(raw, 0xA5, sizeof(raw));
 		memcpy(before, raw, sizeof(raw));
 		CritSectionCount = 1;
@@ -1922,6 +1936,39 @@ UT_TEST(d0_apply_preinsert_refusal_preserves_outputs_and_window)
 	}
 }
 
+UT_TEST(d0_apply_bound_target_refusal_is_preinsert_and_cancelable)
+{
+	for (unsigned mode = 0; mode < 5; mode++) {
+		ClusterRecoveryStampHandleV1 h;
+		ClusterUndoSmgrRecoveryStampV1 token = target_stamp;
+		uint8 raw[D0_RAW_BYTES], before[D0_RAW_BYTES];
+		XLogRecPtr start = 91;
+
+		fresh();
+		UT_ASSERT(begin_d0(&h, TT_SLOT_COMMITTED));
+		memcpy(target_payload, h.payload, sizeof(target_payload));
+		memset(raw, 0xA5, sizeof(raw));
+		memcpy(before, raw, sizeof(raw));
+		switch (mode) {
+		case 0: token.token++; break;
+		case 1: target_payload[0] ^= 1; break;
+		case 2: target_payload[224] ^= 1; break;
+		case 3: target_payload[288] ^= 1; break;
+		case 4: target_match_ready = false; break;
+		}
+		CritSectionCount = 1;
+		UT_ASSERT_EQ(cluster_recovery_stamp_ctrc_apply_v2(&h, token, raw, sizeof(raw), &start), 0);
+		UT_ASSERT_EQ(target_match_calls, 1);
+		UT_ASSERT_EQ(native_calls + flush_calls + target_calls, 0);
+		UT_ASSERT_EQ(start, 91);
+		UT_ASSERT(memcmp(raw, before, sizeof(raw)) == 0);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_PRE_INSERT);
+		UT_ASSERT(!region.thread_replay[2].stamp.failed);
+		CritSectionCount = 0;
+		UT_ASSERT(cluster_recovery_stamp_cancel_v1(&h));
+	}
+}
+
 UT_TEST(d0_apply_snapshot_refusal_never_flushes_or_publishes)
 {
 	const unsigned faults[] = { 1, 8, 12, 13 };
@@ -1931,6 +1978,7 @@ UT_TEST(d0_apply_snapshot_refusal_never_flushes_or_publishes)
 		XLogRecPtr start = 91;
 		fresh();
 		UT_ASSERT(begin_d0(&h, TT_SLOT_ABORTED));
+		memcpy(target_payload, h.payload, sizeof(target_payload));
 		memset(raw, 0xA5, sizeof(raw));
 		memcpy(before, raw, sizeof(raw));
 		native_fault = faults[i];
@@ -1949,7 +1997,7 @@ UT_TEST(d0_apply_snapshot_refusal_never_flushes_or_publishes)
 
 UT_TEST(d0_apply_finish_refusal_retains_duty_and_private_snapshot)
 {
-	for (unsigned mode = 0; mode < 8; mode++) {
+	for (unsigned mode = 1; mode < 8; mode++) {
 		ClusterRecoveryStampHandleV1 h;
 		ClusterUndoSmgrRecoveryStampV1 token = target_stamp;
 		uint8 raw[D0_RAW_BYTES], before[D0_RAW_BYTES];
@@ -1963,7 +2011,6 @@ UT_TEST(d0_apply_finish_refusal_retains_duty_and_private_snapshot)
 		apply_raw = raw;
 		apply_start = (uint8 *)&start;
 		switch (mode) {
-		case 0: token.token++; break;
 		case 1: writer_reject_on = 1; break;
 		case 2: covered_end--; break;
 		case 3: flush_fault = 2; break;
@@ -2029,7 +2076,7 @@ UT_TEST(d0_apply_native_errors_propagate_without_retirement)
 int
 main(void)
 {
-	UT_PLAN(43);
+	UT_PLAN(44);
 	UT_RUN(exact_lifecycle_and_owned_payload);
 	UT_RUN(preinsert_cancel_capture_and_new_sequence);
 	UT_RUN(inserting_failure_exit_and_replay_reset_cannot_retire);
@@ -2070,6 +2117,7 @@ main(void)
 	UT_RUN(native_record_copy_refuses_input_and_output_aliases);
 	UT_RUN(d0_apply_publishes_only_after_exact_finish);
 	UT_RUN(d0_apply_preinsert_refusal_preserves_outputs_and_window);
+	UT_RUN(d0_apply_bound_target_refusal_is_preinsert_and_cancelable);
 	UT_RUN(d0_apply_snapshot_refusal_never_flushes_or_publishes);
 	UT_RUN(d0_apply_finish_refusal_retains_duty_and_private_snapshot);
 	UT_RUN(d0_apply_native_errors_propagate_without_retirement);

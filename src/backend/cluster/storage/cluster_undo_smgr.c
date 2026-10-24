@@ -852,6 +852,22 @@ refused:
 }
 
 bool
+cluster_undo_smgr_recovery_ctrc_matches_v2(ClusterUndoSmgrRecoveryStampV1 stamp,
+	const uint8 *payload, size_t length)
+{
+	const RecoveryHeaderStamp *stage = &recovery_header_stamp;
+
+	/* Only inspect the caller-owned prepared stage. This does not replace
+	 * the post-insert exact-before/write/sync/readback checks or reserve a
+	 * new target, and refusal must not poison a still-cancelable operation. */
+	return stamp.token != 0 && stage->fd >= 0 && stage->token == stamp.token
+		&& CurrentResourceOwner != NULL && stage->owner == CurrentResourceOwner
+		&& stage->kind == RECOVERY_HEADER_CTRC_D0 && !stage->failed
+		&& payload != NULL && length == CLUSTER_RECOVERY_CTRC_BYTES
+		&& memcmp(stage->ctrc_payload, payload, CLUSTER_RECOVERY_CTRC_BYTES) == 0;
+}
+
+bool
 cluster_undo_smgr_recovery_ctrc_write_v2(ClusterUndoSmgrRecoveryStampV1 stamp)
 {
 	return recovery_header_stamp_write(stamp, RECOVERY_HEADER_CTRC_D0);

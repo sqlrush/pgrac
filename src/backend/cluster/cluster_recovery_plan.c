@@ -1040,6 +1040,13 @@ cluster_recovery_stamp_ctrc_apply_v2(const ClusterRecoveryStampHandleV1 *handle,
 		|| stamp_ranges_overlap(start, sizeof(*start), &replay->stamp, sizeof(replay->stamp)))
 		return InvalidXLogRecPtr;
 
+	/* Refuse a stale token or another prepared payload before the first
+	 * irreversible WAL insertion. This read-only check leaves PRE_INSERT
+	 * cancelable; finish still rechecks the bound stage after WAL flush. */
+	if (!cluster_undo_smgr_recovery_ctrc_matches_v2(stamp, handle->payload,
+			handle->payload_length))
+		return InvalidXLogRecPtr;
+
 	/* Keep the caller's original critical section and post-insert duty. No
 	 * hash/allocation, cancellation or error interception is introduced. */
 	end = cluster_recovery_stamp_ctrc_insert_record_v2(handle, copy, sizeof(copy), &actual_start);

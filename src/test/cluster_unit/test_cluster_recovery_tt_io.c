@@ -897,6 +897,82 @@ UT_TEST(test_d0_bound_token_owner_kind_and_length_isolation)
 	}
 }
 
+UT_TEST(test_d0_matches_is_readonly_and_compares_all_payload_bytes)
+{
+	for (int committed = 0; committed < 2; committed++) {
+		ClusterUndoSmgrRecoveryStampV1 stamp;
+		RecoveryHeaderStamp saved;
+		uint8 bytes[322];
+		int old_opens, old_resolves, old_reads, old_writes, old_syncs, old_closes;
+
+		reset_d0(committed);
+		if (!prepare_d0(&stamp))
+			continue;
+		memcpy(bytes + 1, d0_payload, 320);
+		saved = recovery_header_stamp;
+		old_opens = opens; old_resolves = resolves; old_reads = reads;
+		old_writes = writes; old_syncs = syncs; old_closes = closes;
+		CritSectionCount = 1;
+		UT_ASSERT(cluster_undo_smgr_recovery_ctrc_matches_v2(stamp, bytes + 1, 320));
+		for (size_t i = 0; i < 320; i++) {
+			bytes[i + 1] ^= 1;
+			UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_matches_v2(stamp, bytes + 1, 320));
+			bytes[i + 1] ^= 1;
+		}
+		UT_ASSERT(cluster_undo_smgr_recovery_ctrc_matches_v2(stamp, bytes + 1, 320));
+		UT_ASSERT(memcmp(&saved, &recovery_header_stamp, sizeof(saved)) == 0);
+		UT_ASSERT_EQ(opens, old_opens); UT_ASSERT_EQ(resolves, old_resolves);
+		UT_ASSERT_EQ(reads, old_reads); UT_ASSERT_EQ(writes, old_writes);
+		UT_ASSERT_EQ(syncs, old_syncs); UT_ASSERT_EQ(closes, old_closes);
+		UT_ASSERT_EQ(memcmp(bytes + 1, d0_payload, 320), 0);
+		CritSectionCount = 0;
+		UT_ASSERT(cluster_undo_smgr_recovery_ctrc_close_v2(stamp));
+	}
+}
+
+UT_TEST(test_d0_matches_token_owner_kind_and_sticky_failure_isolation)
+{
+	ClusterUndoSmgrRecoveryStampV1 stamp, wrong;
+	RecoveryHeaderStamp saved;
+	uint8 bytes[320];
+	int io;
+
+	reset_d0(false);
+	if (!prepare_d0(&stamp))
+		return;
+	saved = recovery_header_stamp;
+	io = opens + resolves + reads + writes + syncs + closes;
+	wrong.token = 0;
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_matches_v2(wrong, d0_payload, 320));
+	wrong.token = stamp.token + 1;
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_matches_v2(wrong, d0_payload, 320));
+	CurrentResourceOwner = (ResourceOwner)&owner_storage[1];
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_matches_v2(stamp, d0_payload, 320));
+	CurrentResourceOwner = NULL;
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_matches_v2(stamp, d0_payload, 320));
+	CurrentResourceOwner = (ResourceOwner)&owner_storage[0];
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_matches_v2(stamp, NULL, 320));
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_matches_v2(stamp, d0_payload, 319));
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_matches_v2(stamp, d0_payload, 321));
+	UT_ASSERT(memcmp(&saved, &recovery_header_stamp, sizeof(saved)) == 0);
+	UT_ASSERT_EQ(io, opens + resolves + reads + writes + syncs + closes);
+	UT_ASSERT(cluster_undo_smgr_recovery_ctrc_matches_v2(stamp, d0_payload, 320));
+	memcpy(bytes, d0_payload, 320); bytes[224] ^= 1;
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_write_bound_v2(stamp, bytes, 320));
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_matches_v2(stamp, d0_payload, 320));
+	UT_ASSERT(cluster_undo_smgr_recovery_ctrc_close_v2(stamp));
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_matches_v2(stamp, d0_payload, 320));
+
+	reset_file(false);
+	if (!prepare(&stamp))
+		return;
+	saved = recovery_header_stamp;
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_matches_v2(stamp, d0_payload, 320));
+	UT_ASSERT(memcmp(&saved, &recovery_header_stamp, sizeof(saved)) == 0);
+	UT_ASSERT(cluster_undo_smgr_recovery_abort_write_v1(stamp));
+	UT_ASSERT(cluster_undo_smgr_recovery_abort_close_v1(stamp));
+}
+
 int
 main(void)
 {
@@ -906,7 +982,7 @@ main(void)
 		return 2;
 	snprintf(test_dir, sizeof(test_dir), "%s", dir);
 	snprintf(test_file, sizeof(test_file), "%s/seg_257.dat", dir);
-	UT_PLAN(16);
+	UT_PLAN(18);
 	UT_RUN(test_exact_durable_slot_preserves_whole_header_and_head);
 	UT_RUN(test_idempotent_still_syncs_and_reads_without_rewriting);
 	UT_RUN(test_prepare_refusals_do_not_leak_or_write);
@@ -923,6 +999,8 @@ main(void)
 	UT_RUN(test_d0_bound_write_exact_canonical_payload_on_held_fd);
 	UT_RUN(test_d0_bound_same_page_different_graph_or_identity_refuses_before_io);
 	UT_RUN(test_d0_bound_token_owner_kind_and_length_isolation);
+	UT_RUN(test_d0_matches_is_readonly_and_compares_all_payload_bytes);
+	UT_RUN(test_d0_matches_token_owner_kind_and_sticky_failure_isolation);
 	CurrentResourceOwner = (ResourceOwner)&owner_storage[0];
 	if (release_callback != NULL)
 		release_callback(RESOURCE_RELEASE_AFTER_LOCKS, false, true, release_arg);
