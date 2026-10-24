@@ -82,6 +82,7 @@
 #include "port/atomics.h"
 #include "storage/shmem.h"
 #include "utils/elog.h"
+#include "utils/timeout.h"
 #include "utils/wait_event.h"
 
 
@@ -2654,6 +2655,46 @@ ges_arm_local_request_grant(ClusterGesHwGrant *grant, const ClusterResId *resid,
 	grant->cleanup_pending = true;
 }
 
+static void
+ges_hw_wait_check_interrupts(const ClusterResId *resid)
+{
+	/* An index split may hold its original content LWLock while acquiring
+	 * HW. Native ProcessInterrupts defers under that lock. At this wait
+	 * boundary no extension has been performed: ERROR can use S4's exact
+	 * waiter/grant cleanup, followed by native transaction/LWLock cleanup.
+	 * Never clear the caller's holdoff counts and resume its protected work.
+	 * Keep ProcDiePending set so native shutdown disconnects after unwind. */
+	if (resid == NULL || resid->type != CLUSTER_HW_RESID_TYPE
+		|| MyBackendType != B_BACKEND || InterruptHoldoffCount == 0
+		|| CritSectionCount != 0 || QueryCancelHoldoffCount != 0)
+		return;
+	if (ProcDiePending)
+		ereport(ERROR,
+				(errcode(ERRCODE_ADMIN_SHUTDOWN),
+				 errmsg("canceling statement during administrator shutdown while waiting for cluster relation extension")));
+	if (QueryCancelPending) {
+		bool lock_timeout, statement_timeout;
+
+		/* Match native cancellation consumption, including EXCEPTION
+		 * handlers that catch this ERROR without reaching PostgresMain. */
+		QueryCancelPending = false;
+		lock_timeout = get_timeout_indicator(LOCK_TIMEOUT, true);
+		statement_timeout = get_timeout_indicator(STATEMENT_TIMEOUT, true);
+		if (lock_timeout && statement_timeout
+			&& get_timeout_finish_time(STATEMENT_TIMEOUT) < get_timeout_finish_time(LOCK_TIMEOUT))
+			lock_timeout = false;
+		if (lock_timeout)
+			ereport(ERROR, (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+							errmsg("canceling statement due to lock timeout")));
+		if (statement_timeout)
+			ereport(ERROR, (errcode(ERRCODE_QUERY_CANCELED),
+							errmsg("canceling statement due to statement timeout")));
+		ereport(ERROR,
+				(errcode(ERRCODE_QUERY_CANCELED),
+				 errmsg("canceling statement while waiting for cluster relation extension")));
+	}
+}
+
 /* Startup uses private signal flags. Check both sides of each real sleep so
  * a reply racing SIGTERM cannot turn a cancelled wait into further recovery.
  * Original proc_exit owns CV/native-lock cleanup and shared CONTROL transfer. */
@@ -2957,7 +2998,9 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 						sleep_ms = (int)remaining_ms;
 				}
 
+				ges_hw_wait_check_interrupts(resid);
 				(void)ges_timed_sleep(&entry->cv, sleep_ms, wait_ev, resid, request_id);
+				ges_hw_wait_check_interrupts(resid);
 				CHECK_FOR_INTERRUPTS();
 			}
 		}
@@ -3160,6 +3203,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 	while (!entry->ready) {
 		int sleep_ms;
 		long remaining_ms;
+		bool sleep_timed_out;
 
 		/*
 		 * spec-5.7 Direction B — dead-master native-safe abort.
@@ -3246,7 +3290,10 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 				sleep_ms = (int)remaining_ms;
 		}
 
-		if (!ges_timed_sleep(&entry->cv, sleep_ms, wait_ev, resid, request_id)) {
+		ges_hw_wait_check_interrupts(resid);
+		sleep_timed_out = ges_timed_sleep(&entry->cv, sleep_ms, wait_ev, resid, request_id);
+		ges_hw_wait_check_interrupts(resid);
+		if (!sleep_timed_out) {
 			/* CV signaled — re-check loop predicate. */
 			continue;
 		}
