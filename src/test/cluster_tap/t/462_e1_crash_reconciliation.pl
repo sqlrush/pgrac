@@ -82,7 +82,7 @@ sub process_table
 
 sub crash_all
 {
-	my ($cluster) = @_;
+	my ($cluster, $allow_stopped) = @_;
 	my $table = process_table();
 	my %owned;
 	my @roots;
@@ -90,8 +90,11 @@ sub crash_all
 	{
 		$node->_update_pid(-1);
 		my $pid = $node->{_pid};
-		die 'crash requires all four live postmasters'
-		  unless defined($pid) && exists($table->{$pid});
+		if (!defined($pid) || !exists($table->{$pid}))
+		{
+			die 'crash requires all four live postmasters' unless $allow_stopped;
+			next;
+		}
 		push @roots, $pid;
 		$owned{$pid} = $table->{$pid}{birth};
 	}
@@ -138,6 +141,7 @@ sub clean_after_failure
 	my ($cluster) = @_;
 	return unless defined $cluster;
 	my @cleanup_errors;
+	my $survived = 0;
 	for my $node ($cluster->nodes)
 	{
 		# A failed member must not prevent stop attempts for its peers.
@@ -145,13 +149,22 @@ sub clean_after_failure
 			$node->_update_pid(-1);
 			$node->stop('immediate', fail_ok => 1) if defined $node->{_pid};
 			$node->_update_pid(-1);
-			die "postmaster remains alive (PID $node->{_pid})\n" if defined $node->{_pid};
+			$survived = 1 if defined $node->{_pid};
 			1;
 		};
 		push @cleanup_errors, $@ || 'cleanup did not complete' unless $stopped;
 	}
 	BAIL_OUT('failed cohort cleanup; refusing to reformat shared votes: ' . join('; ', @cleanup_errors))
 		if @cleanup_errors;
+	if ($survived)
+	{
+		# Rejected startup can leave some members stopped and others unable to
+		# consume pg_ctl.  Reuse the test-owned crash inventory without granting
+		# a normal-stop receipt; the positive crash still requires four live members.
+		my $stopped = eval { crash_all($cluster, 1); 1; };
+		BAIL_OUT('failed cohort forced cleanup; refusing to reformat shared votes: ' .
+			($@ || 'cleanup did not complete')) unless $stopped;
+	}
 	$cluster->{running} = 0;
 }
 
