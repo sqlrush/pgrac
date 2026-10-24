@@ -89,6 +89,8 @@ pi_identity(FakeXactRecord *fake)
 	return make_identity(fake, uuid);
 }
 
+#include "test_cluster_pi_cold_owner.inc"
+
 UT_TEST(test_pi_commit_keeps_complete_flags_and_invalidation_payload)
 {
 	SharedInvalidationMessage messages[4] = { 0 };
@@ -108,7 +110,7 @@ UT_TEST(test_pi_commit_keeps_complete_flags_and_invalidation_payload)
 		FakeXactRecord fake;
 		RfPageOnlineRecordIdentityV1 identity;
 		RfDetachedRecordPlanV1 record;
-		RfSideOnlinePlanV1 *plan, *recovery;
+		RfSideOnlinePlanV1 *plan;
 		RfSideOnlineOperationV1 op;
 		RfSideContributionOwnersV1 owners;
 		RfPageProofDetailV1 detail;
@@ -141,7 +143,6 @@ UT_TEST(test_pi_commit_keeps_complete_flags_and_invalidation_payload)
 			UT_ASSERT_EQ(rf_side_xact_apply_owned_v1(&op.xact, op.owned_payload,
 												   op.owned_payload_length), RF_SIDE_XACT_APPLY_BLOCKED);
 		}
-		recovery = pi_side_plan(&identity, false);
 		/* Cache and FORCE_SYNC records have the separate cold consumer. The strict
 		 * decoder and every generic/PI apply entry remain unavailable. */
 		{
@@ -149,20 +150,7 @@ UT_TEST(test_pi_commit_keeps_complete_flags_and_invalidation_payload)
 			UT_ASSERT(!rf_side_xact_decode_v1(&fake.reader, identity.record.system_identifier,
 											  identity.record.origin_thread, &strict));
 		}
-		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(recovery, &record, &identity),
-					 variant != 3 ? RF_PAGE_PROOF_DETAIL_OK : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
-		if (variant != 3) {
-			UT_ASSERT_EQ(rf_side_online_plan_seal_v1(recovery), RF_PAGE_PROOF_DETAIL_OK);
-			UT_ASSERT(rf_side_online_plan_operation_v1(recovery, 0, &op));
-			UT_ASSERT(op.xact.cold_completion_effects && !op.xact.pi_read_only);
-			UT_ASSERT_EQ(
-				rf_side_xact_apply_owned_v1(&op.xact, op.owned_payload, op.owned_payload_length),
-				RF_SIDE_XACT_APPLY_BLOCKED);
-			UT_ASSERT_EQ(rf_side_xact_apply_cold_completion_v1(&op.xact, op.owned_payload,
-															   op.owned_payload_length, NULL, NULL),
-						 RF_SIDE_XACT_APPLY_BLOCKED);
-		}
-		rf_side_online_plan_destroy_v1(&recovery);
+		pi_assert_recovery_completion_owner(&fake, &identity, &record, variant != 3);
 		rf_side_online_plan_destroy_v1(&plan);
 	}
 }
@@ -549,6 +537,8 @@ UT_TEST(test_pi_relation_stats_keep_complete_payload_without_execution)
 			UT_ASSERT_EQ(capture.begin_count + capture.count, 0);
 			UT_ASSERT(!capture.end_complete);
 		}
+		UT_ASSERT_EQ(cold_stats_calls + prepare_apply.terminal_projection_stores, 0);
+		pi_assert_recovery_completion_owner(&fake, &identity, &record, true);
 		UT_ASSERT_EQ(cold_stats_calls + prepare_apply.terminal_projection_stores, 0);
 		rf_side_online_plan_destroy_v1(&plan);
 	}

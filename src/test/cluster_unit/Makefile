@@ -3062,6 +3062,9 @@ test_cluster_side_xact test_cluster_pi_contribution test_cluster_recovery_c0_pla
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) -lssl -lcrypto -o $@
 
+test_cluster_pi_contribution: test_cluster_pi_cold_owner.inc \
+		$(top_srcdir)/src/include/cluster/cluster_side_xact.h
+
 CLUSTER_SIDE_ONLINE_OWNER_O = test_cluster_side_online_owner_product.o
 # The DATA integration uses the actual immutable fabric and typed SIDE
 # planner. The writeback scheduling fixture keeps its explicit input boundary.
