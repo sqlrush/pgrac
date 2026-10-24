@@ -13,7 +13,9 @@
 #include "utils/wait_event.h"
 int stamp_state_fixture_main(void);
 #define main stamp_state_fixture_main
+#define CLUSTER_STAMP_EXTERNAL_ERROR_PROVIDER
 #include "test_cluster_recovery_stamp.c"
+#undef CLUSTER_STAMP_EXTERNAL_ERROR_PROVIDER
 #undef main
 
 static sigjmp_buf error_boundary;

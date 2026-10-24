@@ -159,6 +159,20 @@ extern bool cluster_recovery_stamp_ctrc_finish_v2(const ClusterRecoveryStampHand
 extern XLogRecPtr cluster_recovery_stamp_ctrc_apply_v2(
 	const ClusterRecoveryStampHandleV1 *handle, ClusterUndoSmgrRecoveryStampV1 stamp,
 	void *raw, Size raw_length, XLogRecPtr *start);
+/* Dormant Startup executor, entered outside any critical section after the
+ * caller has established and retained all original qualification/proofs/pins.
+ * Prepare the held target and window, own exactly one critical section around
+ * the original apply, then close the held target and publish private outputs.
+ * Pre-insert refusal cancels that exact window; refusal after INSERTING is
+ * PANIC with duty retained. Native errors propagate in their original section.
+ * Output contract is the same 357B raw/actual-start pair as apply_v2, disjoint
+ * from each other, immutable inputs and live replay region. Refusal preserves
+ * both outputs. A close refusal may follow already-durable completion; it
+ * does not undo or reclassify that completed operation. Hash after return.
+ * No live caller, producer qualification, graph or release authority is added. */
+extern XLogRecPtr cluster_recovery_stamp_ctrc_execute_v2(
+	const ClusterRecoveryStampOwnerV1 *owner, const uint8 *payload, Size length,
+	void *raw, Size raw_length, XLogRecPtr *start);
 /* Only the original executor calls durable after real WAL flush and exact
  * target sync/postread. These APIs record completion, never prove it. */
 extern bool cluster_recovery_stamp_durable_v1(const ClusterRecoveryStampHandleV1 *handle);

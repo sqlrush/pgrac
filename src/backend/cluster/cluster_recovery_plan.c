@@ -1112,6 +1112,58 @@ cluster_recovery_stamp_ctrc_apply_v2(const ClusterRecoveryStampHandleV1 *handle,
 	return end;
 }
 
+XLogRecPtr
+cluster_recovery_stamp_ctrc_execute_v2(const ClusterRecoveryStampOwnerV1 *owner,
+	const uint8 *payload, Size length, void *raw, Size raw_length, XLogRecPtr *start)
+{
+	uint8 copy[SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + CLUSTER_RECOVERY_CTRC_BYTES];
+	ClusterRecoveryStampHandleV1 handle;
+	ClusterUndoSmgrRecoveryStampV1 target;
+	XLogRecPtr actual_start, end;
+
+	/* Check every public output before descriptor acquisition or PRE_INSERT.
+	 * Both original nested operations receive only private stack storage. */
+	if (!stamp_actor() || MyBackendType != B_STARTUP || CritSectionCount != 0
+		|| cluster_recovery_plan_shmem == NULL || owner == NULL || payload == NULL
+		|| raw == NULL || start == NULL || length != CLUSTER_RECOVERY_CTRC_BYTES
+		|| raw_length != sizeof(copy)
+		|| stamp_ranges_overlap(raw, raw_length, start, sizeof(*start))
+		|| stamp_ranges_overlap(raw, raw_length, owner, sizeof(*owner))
+		|| stamp_ranges_overlap(start, sizeof(*start), owner, sizeof(*owner))
+		|| stamp_ranges_overlap(raw, raw_length, payload, length)
+		|| stamp_ranges_overlap(start, sizeof(*start), payload, length)
+		|| stamp_ranges_overlap(raw, raw_length, cluster_recovery_plan_shmem,
+			   sizeof(*cluster_recovery_plan_shmem))
+		|| stamp_ranges_overlap(start, sizeof(*start), cluster_recovery_plan_shmem,
+			   sizeof(*cluster_recovery_plan_shmem)))
+		return InvalidXLogRecPtr;
+	if (!cluster_recovery_stamp_ctrc_prepare_v2(owner, payload, length, &handle, &target))
+		return InvalidXLogRecPtr;
+
+	/* The original insertion/flush/target sequence owns one critical section.
+	 * Only an exact PRE_INSERT cancellation permits a normal refusal. Once
+	 * insertion starts, never exit the section or close the held target on
+	 * failure; native ERROR/PANIC is not intercepted or converted to success. */
+	START_CRIT_SECTION();
+	end = cluster_recovery_stamp_ctrc_apply_v2(&handle, target, copy, sizeof(copy), &actual_start);
+	if (end == InvalidXLogRecPtr) {
+		if (!cluster_recovery_stamp_cancel_v1(&handle))
+			ereport(PANIC, (errmsg("D0 recovery stamp could not complete its inserted operation")));
+		END_CRIT_SECTION();
+		(void)cluster_undo_smgr_recovery_ctrc_close_v2(target);
+		return InvalidXLogRecPtr;
+	}
+	END_CRIT_SECTION();
+
+	/* Real target durability and exact-window clear preceded this close.
+	 * A close refusal cannot undo them, but must not publish partial outputs. */
+	if (!cluster_undo_smgr_recovery_ctrc_close_v2(target))
+		return InvalidXLogRecPtr;
+	memcpy(raw, copy, sizeof(copy));
+	memcpy(start, &actual_start, sizeof(actual_start));
+	return end;
+}
+
 bool
 cluster_recovery_stamp_durable_v1(const ClusterRecoveryStampHandleV1 *handle)
 {
