@@ -888,6 +888,9 @@ typedef struct ClusterColdTypedV1 {
 	/* Complete read-only ACTIVE input census from the still-held pass-2 cut.
 	 * It survives EOR as input only, never as execution or write authority. */
 	struct ClusterColdTopTxCensusV1 *top_tx_census;
+	/* Retained native TT subjects, including terminal and history inputs.
+	 * This is one input component, not complete page-reference coverage. */
+	struct ClusterColdCtrcWorkV1 *ctrc_work;
 	bool source_drained[CLUSTER_COLD_MAX_PARTICIPANTS]; /* this pass-2 attempt only */
 	/* Provisional native counters after counted pass-2 drain. Zero means
 	 * missing; these do not prove global effects/durability or all-thread N. */
@@ -1356,11 +1359,30 @@ typedef struct ClusterColdCtrcReleaseCensusV1 {
 	uint32 unqualified_count;
 } ClusterColdCtrcReleaseCensusV1;
 
+typedef struct ClusterColdCtrcWorkV1 {
+	const ClusterColdPlanV1 *plan;
+	const struct ClusterColdTopTxCensusV1 *top_tx_census;
+	ClusterColdCtrcReleaseCensusV1 counts;
+	ClusterColdTtSlotInputV1 entries[FLEXIBLE_ARRAY_MEMBER];
+} ClusterColdCtrcWorkV1;
+
 /* Retained native input only, no live allocator/admission or new release.
  * The original registered Startup must supply its complete pass-2 census.
  * This cannot replace the independent D2 proof for newly discharged work. */
 extern bool cluster_cold_typed_ctrc_release_census_v1(const ClusterColdTypedV1 *typed,
 												  ClusterColdCtrcReleaseCensusV1 *out);
+
+/* Original input owner only. Retain every nonempty physical TT slot under
+ * the original shared TT budget/context. A retry first discards the old
+ * array; failure publishes none. This is native input, not online CTRC key,
+ * page/MX coverage, new release proof or mutation authority. */
+extern bool cluster_cold_typed_ctrc_work_prepare_v1(ClusterColdTypedV1 *typed);
+/* Fill unpublished, exactly sized original-owner storage with the same
+ * native census traversal. False may leave partial private entries; the
+ * owner must discard them. Plan, original ACTIVE census and all counts
+ * must agree before publication. No receipt/completion authority. */
+extern bool cluster_cold_typed_ctrc_work_fill_v1(const ClusterColdTypedV1 *typed,
+	ClusterColdCtrcWorkV1 *work);
 
 /* Copy any physical slot after the same selected source's sealed ordinary
  * redo, or match its resulting physical key. No status is filtered during

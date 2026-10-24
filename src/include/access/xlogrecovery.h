@@ -178,6 +178,15 @@ extern bool ClusterColdRecoveryTxTopProofCurrent(
 extern const struct ClusterColdTypedV1 *
 ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start);
 
+struct ClusterColdCtrcWorkV1;
+/* Original RECOVERED/native-DONE Startup only. Prepare retained TT-native
+ * work before C0; this grants no page, receipt, I/O or release authority.
+ * A subsequent prepare or input reset invalidates the previous pointer. */
+extern const struct ClusterColdCtrcWorkV1 *
+ClusterColdRecoveryCtrcWorkPrepare(const struct ClusterRecoveryStartV1 *start);
+extern bool ClusterColdRecoveryCtrcWorkCurrent(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work);
+
 /* Original post-EOR owner only: require the complete sealed ordinary-effects
  * receipt before consuming any proven physical loser.  This is a read-only
  * input check; the restricted empty-effects proof remains a per-entry

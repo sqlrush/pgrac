@@ -708,6 +708,7 @@ cluster_recovery_ctrc_result_collect_v1(const struct ClusterRecoveryStartV1 *sta
 	ClusterRecoveryCheckpointOwnerV1 owner, confirmed;
 	ClusterRecoveryCtrcResultValueV1 result;
 	ClusterColdCtrcReleaseCensusV1 census;
+	const ClusterColdCtrcWorkV1 *work;
 	const ClusterColdTypedV1 *typed;
 	uint8 zero[32] = {0};
 	bool qualified, ok = false;
@@ -729,7 +730,9 @@ cluster_recovery_ctrc_result_collect_v1(const struct ClusterRecoveryStartV1 *sta
 	 * for this component.  Sampling is outside the shared slot lock. */
 	memset(&result, 0, sizeof(result));
 	memset(&census, 0, sizeof(census));
-	qualified = cluster_cold_typed_ctrc_release_census_v1(typed, &census);
+	work = ClusterColdRecoveryCtrcWorkPrepare(start);
+	qualified = work != NULL;
+	if (qualified) census = work->counts;
 	result.subject_count = census.subject_count;
 	result.released_count = census.released_count;
 	result.unresolved_count = census.unresolved_count;
@@ -741,7 +744,8 @@ cluster_recovery_ctrc_result_collect_v1(const struct ClusterRecoveryStartV1 *sta
 	memcpy(result.input_root_sha256, typed->census_root.image_sha256, 32);
 	if (!ClusterColdRecoveryTxCheckpointOwnerV1(start, &confirmed)
 		|| memcmp(&owner, &confirmed, sizeof(owner)) != 0
-		|| ClusterColdRecoveryTxInputs(start) != typed)
+		|| ClusterColdRecoveryTxInputs(start) != typed
+		|| (qualified && !ClusterColdRecoveryCtrcWorkCurrent(start, work)))
 		return false;
 
 	slot = &cluster_recovery_plan_shmem->checkpoint_owner;
