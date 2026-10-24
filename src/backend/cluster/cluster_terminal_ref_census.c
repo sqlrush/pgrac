@@ -1865,6 +1865,7 @@ cluster_ctrc_active_scan_step(ClusterCtrcActiveScan *scan)
 				full = cluster_xid_widen(key.xid, scan->reference_full);
 				if (!FullTransactionIdIsValid(full))
 					goto invalid;
+				scan->unqualified_entries++;
 			}
 			if (FullTransactionIdPrecedes(full, scan->min_full))
 				scan->min_full = full;

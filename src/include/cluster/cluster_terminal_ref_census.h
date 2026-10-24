@@ -766,6 +766,9 @@ typedef struct ClusterCtrcActiveScan {
 	FullTransactionId min_full;
 	uint64 next_index;
 	uint64 total_entries;
+	/* Complete candidate scans may still include raw-only participant keys.
+	 * Zero counts original identity coverage, not freeze/retention authority. */
+	uint64 unqualified_entries;
 	bool lock_busy;
 } ClusterCtrcActiveScan;
 

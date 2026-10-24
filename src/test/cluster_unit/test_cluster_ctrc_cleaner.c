@@ -3806,6 +3806,44 @@ UT_TEST(test_active_scan_participant_widens_old_epoch_and_rejects_unrepresentabl
 	UT_ASSERT_EQ(held_count, 0);
 }
 
+UT_TEST(test_active_scan_counts_raw_only_identity_coverage)
+{
+	ClusterCtrcActiveScan scan;
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcParticipantEntry *known, *unknown;
+	uint64 index;
+
+	reset_fixture();
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+	finish_active_scan(&scan);
+	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(scan.unqualified_entries, 0);
+	origin = seed_origin(0, 0);
+	UT_ASSERT(ctrc_participant_index(&origin->key, 0, &index));
+	known = &ctrc_participant_entries()[index];
+	known->key = origin->key;
+	known->state = CTRC_PARTICIPANT_OPEN;
+	known->original_full_xid = FullTransactionIdFromEpochAndXid(3, origin->key.xid);
+	MemSet(origin, 0, sizeof(*origin));
+	origin = seed_origin(1, 0);
+	UT_ASSERT(ctrc_participant_index(&origin->key, 0, &index));
+	unknown = &ctrc_participant_entries()[index];
+	unknown->key = origin->key;
+	unknown->state = CTRC_PARTICIPANT_OPEN;
+	MemSet(origin, 0, sizeof(*origin));
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+	finish_active_scan(&scan);
+	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(scan.unqualified_entries, 1);
+	UT_ASSERT(FullTransactionIdEquals(scan.min_full, known->original_full_xid));
+	unknown->original_full_xid = FullTransactionIdFromEpochAndXid(3, unknown->key.xid);
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+	finish_active_scan(&scan);
+	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(scan.unqualified_entries, 0);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
 int
 main(void)
 {
@@ -3813,7 +3851,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(89);
+	UT_PLAN(90);
 	printf("# CTRC header_bytes=%zu total_bytes=%zu\n", sizeof(ClusterCtrcSharedHeader),
 		   capacity.total_bytes);
 	UT_RUN(test_origin_reserve_requires_published_local_top_protection);
@@ -3905,6 +3943,7 @@ main(void)
 	UT_RUN(test_active_scan_refuses_malformed_known_participant_identity);
 	UT_RUN(test_active_scan_refuses_unknown_or_mismatched_origin_fullxid);
 	UT_RUN(test_active_scan_participant_widens_old_epoch_and_rejects_unrepresentable_xids);
+	UT_RUN(test_active_scan_counts_raw_only_identity_coverage);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

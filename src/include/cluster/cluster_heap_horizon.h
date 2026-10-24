@@ -126,6 +126,8 @@ typedef struct ClusterHeapFreezeCohortObservation {
 	uint64 formation_epoch;
 	uint64 admitted_members_lo;
 	uint64 admitted_members_hi;
+	/* Same local completed sample; remote reports do not prove identity coverage. */
+	uint64 local_unqualified_entries;
 } ClusterHeapFreezeCohortObservation;
 
 /* Bounded reads, fixed required set, current connection/admission rechecks.

@@ -1512,7 +1512,7 @@ UT_TEST(cohort_refusals_clear_observation_without_rejecting_original_proof)
 
 UT_TEST(mismatched_or_malformed_cohort_never_publishes_candidate)
 {
-	for (int variant = 0; variant < 12; variant++)
+	for (int variant = 0; variant < 14; variant++)
 	{
 		reset_fixture();
 		set_shared_policy(80);
@@ -1530,6 +1530,8 @@ UT_TEST(mismatched_or_malformed_cohort_never_publishes_candidate)
 		case 9: cohort_value.active_full_xid_min = cohort_value.future_full_xid_max + 1; break;
 		case 10: cohort_value.admitted_members_lo = 0; break;
 		case 11: cohort_value.admitted_members_lo = 2; break;
+		case 12: cohort_value.local_unqualified_entries = 1; break;
+		case 13: cohort_value.local_unqualified_entries = UINT64_MAX; break;
 		}
 		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
 		UT_ASSERT_EQ(cohort_calls, 1);

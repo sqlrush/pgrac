@@ -1019,6 +1019,7 @@ undo_horizon_v2_cohort_observe(ClusterHeapFreezeCohortObservation *out,
 	observed.covered
 		= undo_horizon_maintenance_coverage(cluster_node_id, candidate.future_full_xid_max);
 	candidate.active_full_xid_min = U64FromFullTransactionId(active.scan.min_full);
+	candidate.local_unqualified_entries = active.scan.unqualified_entries;
 	candidate.horizon_scn = history.horizon_scn;
 	candidate.record_generation = fence.record_generation;
 	candidate.formation_epoch = fence.formation_epoch;

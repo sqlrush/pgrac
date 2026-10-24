@@ -1918,6 +1918,7 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 			if (!cluster_semantic_activation_recheck_r4_terminal_census(&admission))
 				status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
 			else if (cohort_status == CLUSTER_HEAP_FREEZE_COHORT_READY
+					 && cohort.local_unqualified_entries == 0
 					 && cohort.record_generation == admission.record_generation
 					 && cohort.formation_epoch == admission.formation_epoch
 					 && SCN_VALID(cohort.horizon_scn) && cohort.horizon_scn != UINT64_MAX

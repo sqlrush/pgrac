@@ -9051,6 +9051,7 @@ test_cluster_undo_horizon: test_cluster_undo_horizon.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c \
 		$(top_srcdir)/src/include/cluster/cluster_undo_retention.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
 		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
 		$(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_HORIZON_O)
