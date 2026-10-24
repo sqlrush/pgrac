@@ -137,6 +137,7 @@ content_trace_publish(bool entering_wait)
 		local_owner.procno = MyProc->pgprocno;
 		local_owner.backend_id = MyProc->backendId;
 		local_owner.backend_start = MyStartTimestamp;
+		local_owner.proc_generation = MyProc->cluster_grd_generation;
 		local_owner.nlocks = local_owner.omitted_locks = 0;
 		memset(local_owner.locks, 0, sizeof(local_owner.locks));
 		ForEachLWLockHeldByMe(content_trace_collect_lock, &local_owner);
@@ -544,10 +545,13 @@ cluster_content_trace_walk(ClusterContentTraceVisitor visitor, void *context,
 		}
 		if (owner.pid == 0)
 			continue;
-		/* PID alone is not an incarnation key: reject a reused proc slot or
-		 * an auxiliary owner without a stable backend identity as UNKNOWN. */
+		/* Native generation also identifies auxiliaries without a backendId.
+		 * Zero/uninitialized or reused native identities remain UNKNOWN. */
 		if (i >= ProcGlobal->allProcCount ||
-			owner.backend_id <= 0 ||
+			(owner.backend_id <= 0 && owner.backend_id != InvalidBackendId) ||
+			owner.proc_generation == 0 || owner.procno != i ||
+			ProcGlobal->allProcs[i].pgprocno != i ||
+			ProcGlobal->allProcs[i].cluster_grd_generation != owner.proc_generation ||
 			ProcGlobal->allProcs[i].pid != owner.pid ||
 			ProcGlobal->allProcs[i].backendId != owner.backend_id) {
 			stats->dead++;

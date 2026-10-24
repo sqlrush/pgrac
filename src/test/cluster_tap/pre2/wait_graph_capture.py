@@ -17,8 +17,8 @@ CONFLICTS = {1: {8}, 2: {7, 8}, 3: {5, 6, 7, 8},
 
 
 def identity(row):
-    return 'n%d:p%d:s%d:b%d:t%d' % tuple(row[x] for x in
-                                        ('node', 'pid', 'procno', 'backend_id', 'backend_start'))
+    return 'n%d:p%d:s%d:b%d:t%d:g%d' % tuple(row[x] for x in
+                                        ('node', 'pid', 'procno', 'backend_id', 'backend_start', 'proc_generation'))
 
 
 def _cycles(edges):
@@ -83,6 +83,12 @@ def build_graph(snapshots, resources):
             if row.get('node') != node or row.get('stable', True) is not True:
                 unknown.append(dict(node=node, reason='owner_changed_or_wrong_node', pid=row.get('pid')))
                 continue
+            generation = row.get('proc_generation')
+            if (not isinstance(generation, int) or generation <= 0 or
+                    (row['backend_id'] <= 0 and row['backend_id'] != -1)):
+                unknown.append(dict(node=node, pid=row.get('pid'), procno=row.get('procno'),
+                                    reason='owner_native_identity_unproven'))
+                continue
             owners[(node, row['procno'])] = row
             if row.get('omitted_grants', 0):
                 unknown.append(dict(process=identity(row), reason='omitted_grants',
@@ -94,7 +100,8 @@ def build_graph(snapshots, resources):
                                     reason='unpublished_waiter'))
             owner = owners.get((node, proc['procno']))
             if owner is not None and (proc.get('stable') is False or
-                    (proc['pid'], proc['backend_id']) != (owner['pid'], owner['backend_id'])):
+                    (proc['pid'], proc['backend_id'], proc.get('proc_generation')) !=
+                    (owner['pid'], owner['backend_id'], owner['proc_generation'])):
                 unknown.append(dict(node=node, procno=proc['procno'], reason='process_census_changed'))
                 owners.pop((node, proc['procno']), None)
             elif owner is not None and proc.get('wait_name') in RESOURCE_WAITS and not any(
@@ -194,7 +201,7 @@ def build_graph(snapshots, resources):
         absent = 1 if resource.get('kind') == 'enqueue' else 2
         if resource.get('status') not in (0, absent) or resource.get('stable', True) is not True:
             unknown.append(dict(reason='resource_unavailable_or_changed', resource=resource))
-    return dict(version=1, atomic_graph=False, complete=not unknown,
+    return dict(version=2, atomic_graph=False, complete=not unknown,
                 vertices=[dict(id=identity(x), **x) for x in owners.values()],
                 edges=edges, cycles=_cycles(edges), unknown=unknown)
 
@@ -393,7 +400,7 @@ class CaptureSession:
         graph['observed_edges_resolved'] = graph['complete']
         graph['complete'] = False
         graph['unknown'].append(dict(reason='s2_source_join_qualification_pending',
-                                    sources=['pcm_service', 'other_ges_holder_lifecycles', 'auxiliary', 'tx']))
+                                    sources=['pcm_service', 'other_ges_holder_lifecycles', 'tx']))
         if result['errors'] or len(snapshots) != 4:
             graph['complete'] = False
             graph['unknown'].append(dict(reason='capture_incomplete', errors=result['errors']))

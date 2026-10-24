@@ -8,10 +8,10 @@ import wait_graph_capture as graph
 
 class GraphTests(unittest.TestCase):
     def test_native_content_cycle_requires_real_owner_modes(self):
-        owners = [dict(node=0, pid=10, procno=1, backend_id=2, backend_start=3,
+        owners = [dict(node=0, pid=10, procno=1, backend_id=2, backend_start=3, proc_generation=17,
                        locks=[dict(tag=[1, 2, 3, 0, 5], mode=0)],
                        native_wait=dict(tag=[1, 2, 3, 4, 1], mode=0)),
-                  dict(node=0, pid=20, procno=2, backend_id=3, backend_start=4,
+                  dict(node=0, pid=20, procno=2, backend_id=3, backend_start=4, proc_generation=17,
                        locks=[dict(tag=[1, 2, 3, 4, 1], mode=0)],
                        native_wait=dict(tag=[1, 2, 3, 0, 5], mode=0))]
         result = graph.build_graph([dict(node=0, owners=owners, procs=[], stats={})], [])
@@ -29,7 +29,7 @@ class GraphTests(unittest.TestCase):
         self.assertFalse(graph.build_graph([snapshot], [])['complete'])
 
     def test_ges_candidate_does_not_prove_backend_incarnation_or_cycle(self):
-        owners = [dict(node=n, pid=10+n, procno=1, backend_id=2, backend_start=3,
+        owners = [dict(node=n, pid=10+n, procno=1, backend_id=2, backend_start=3, proc_generation=17,
                        locks=[], enqueue=dict(resid=[1,2,3,n,4,1], mode=8,
                            holder=[n,1,7,0], request=10+n, wait_seq=20+n)) for n in range(2)]
         snapshots = [dict(node=n, owners=[owners[n]], epoch_begin=7, epoch_end=7) for n in range(2)]
@@ -50,7 +50,7 @@ class GraphTests(unittest.TestCase):
             self.assertFalse(graph.build_graph([], [resource])['complete'])
 
     def test_changed_owner_or_census_cannot_form_a_content_cycle(self):
-        owner = dict(node=0, pid=10, procno=1, backend_id=2, backend_start=3,
+        owner = dict(node=0, pid=10, procno=1, backend_id=2, backend_start=3, proc_generation=17,
                      stable=False, locks=[], native_wait=dict(tag=[1,2,3,0,1], mode=0))
         result = graph.build_graph([dict(node=0, owners=[owner])], [])
         self.assertFalse(result['complete'])
@@ -83,7 +83,7 @@ class GraphTests(unittest.TestCase):
                         raise RuntimeError('busy connection')
                     return graph.json.dumps(dict(kind='pcm', node=self.node, status=2))
                 owner = dict(node=self.node, pid=10+self.node, procno=1, backend_id=2,
-                             backend_start=3, locks=[dict(tag=[1,2,3,0,1], mode=1)])
+                             backend_start=3, proc_generation=17, locks=[dict(tag=[1,2,3,0,1], mode=1)])
                 return graph.json.dumps(dict(node=self.node, epoch_begin=7, epoch_end=7,
                                              owners=[owner], stats=dict(available=True)))
             def close(self):
@@ -133,10 +133,10 @@ class GraphTests(unittest.TestCase):
 
     def test_hw_grant_requires_exact_live_identity_and_canonical_master(self):
         grant = dict(resid=[1,2,3,0,242,1], holder=[1,2,7,101], mode=7)
-        waiter = dict(node=0, pid=10, procno=1, backend_id=2, backend_start=3, locks=[],
+        waiter = dict(node=0, pid=10, procno=1, backend_id=2, backend_start=3, proc_generation=17, locks=[],
                       enqueue=dict(resid=grant['resid'], holder=[0,1,7,0], request=10,
                                    wait_seq=20, mode=7, epoch=7))
-        holder = dict(node=1, pid=11, procno=2, backend_id=3, backend_start=4, locks=[],
+        holder = dict(node=1, pid=11, procno=2, backend_id=3, backend_start=4, proc_generation=17, locks=[],
                       grants=[grant], omitted_grants=0)
         snapshots = [dict(node=n, epoch_begin=7, epoch_end=7, owners=[row])
                      for n,row in enumerate([waiter, holder])]
@@ -161,10 +161,10 @@ class GraphTests(unittest.TestCase):
 
     def test_ges_native_parallel_group_cannot_be_a_blocker(self):
         resid = [1,2,3,0,242,1]
-        waiter = dict(node=0, pid=10, procno=1, backend_id=2, backend_start=3, locks=[],
+        waiter = dict(node=0, pid=10, procno=1, backend_id=2, backend_start=3, proc_generation=17, locks=[],
                       enqueue=dict(resid=resid, holder=[0,1,7,0], request=10, epoch=7,
                                    wait_seq=20, mode=7))
-        holder = dict(node=0, pid=11, procno=2, backend_id=3, backend_start=4, locks=[],
+        holder = dict(node=0, pid=11, procno=2, backend_id=3, backend_start=4, proc_generation=17, locks=[],
                       grants=[dict(resid=resid, holder=[0,2,7,101], mode=7)])
         resource = dict(kind='enqueue', node=2, resid=resid, status=0, epoch=7,
                         route_known=True, master=2, master_generation=1, shard_phase=0,
@@ -178,7 +178,7 @@ class GraphTests(unittest.TestCase):
         keys = [[1,2,3,0,242,1], [1,2,3,0,246,1]]
         owners, resources = [], []
         for node in range(2):
-            owners.append(dict(node=node, pid=10+node, procno=1, backend_id=2, backend_start=3,
+            owners.append(dict(node=node, pid=10+node, procno=1, backend_id=2, backend_start=3, proc_generation=17,
                                enqueue=dict(resid=keys[node], holder=[node,1,7,0], request=10+node,
                                             wait_seq=20+node, mode=7, epoch=7),
                                grants=[dict(resid=keys[1-node], holder=[node,1,7,100+node], mode=7)]))
@@ -202,7 +202,7 @@ class GraphTests(unittest.TestCase):
                 if 'pgrac_wg_enqueue(' in sql:
                     return graph.json.dumps(dict(kind='enqueue', node=self.node, resid=resid, status=1))
                 return graph.json.dumps(dict(node=self.node, epoch_begin=7, epoch_end=7, stats={},
-                    owners=[dict(node=self.node, pid=10+self.node, procno=1, backend_id=2, backend_start=3,
+                    owners=[dict(node=self.node, pid=10+self.node, procno=1, backend_id=2, backend_start=3, proc_generation=17,
                                  grants=[dict(resid=resid, holder=[self.node,1,7,101], mode=7)])]))
             def close(self): pass
         with tempfile.TemporaryDirectory() as directory, patch.object(graph, 'PsqlReader', Reader):
@@ -215,6 +215,28 @@ class GraphTests(unittest.TestCase):
                 self.assertEqual(len(raw['resources']), 2)
             finally:
                 session.close()
+
+    def test_auxiliary_cycle_requires_native_generation_and_matching_census(self):
+        owners = [dict(node=0, pid=10+n, procno=1+n, backend_id=-1 if n else 2,
+                       backend_start=0 if n else 3, proc_generation=17+n,
+                       locks=[dict(tag=[1,2,3,0,n], mode=0)],
+                       native_wait=dict(tag=[1,2,3,0,1-n], mode=0)) for n in range(2)]
+        census = [dict(procno=row['procno'], pid=row['pid'], backend_id=row['backend_id'],
+                       proc_generation=row['proc_generation'], stable=True) for row in owners]
+        snapshot = dict(node=0, owners=owners, procs=census)
+        result = graph.build_graph([snapshot], [])
+        self.assertEqual(len(result['cycles']), 1)
+        self.assertIn('g18', result['edges'][0]['to'])
+        census[1]['proc_generation'] += 1
+        result = graph.build_graph([snapshot], [])
+        self.assertEqual(result['cycles'], [])
+        self.assertTrue(any(x['reason']=='process_census_changed' for x in result['unknown']))
+        census[1]['proc_generation'] -= 1
+        for invalid in (0, None):
+            owners[1]['proc_generation'] = invalid
+            result = graph.build_graph([snapshot], [])
+            self.assertEqual(result['cycles'], [])
+            self.assertTrue(any(x['reason']=='owner_native_identity_unproven' for x in result['unknown']))
 
     def test_owned_pipe_reader_frames_split_output_and_passes_native_dbname(self):
         # A real owned pipe process checks the connection argument and emits

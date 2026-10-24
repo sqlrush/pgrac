@@ -103,6 +103,7 @@ typedef struct ClusterContentTraceOwner {
 	uint32 procno;
 	int32 backend_id;
 	int64 backend_start;
+	uint64 proc_generation;
 	uint64 revision;
 	uint64 waits_with_locks, pair_attempts, pair_misses;
 	uint64 pair_invocations, pair_cycles, pair_omitted, pair_nested_omitted;

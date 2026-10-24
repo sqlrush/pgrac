@@ -105,9 +105,9 @@ json_owner(const ClusterContentTraceOwner *row, void *context)
 	StringInfo out = writer->out;
 	if (writer->count++ != 0) appendStringInfoChar(out, ',');
 	appendStringInfo(out, "{\"node\":%d,\"pid\":%d,\"procno\":%u,\"backend_id\":%d,"
-		"\"backend_start\":" INT64_FORMAT ",\"revision\":" UINT64_FORMAT
+		"\"backend_start\":" INT64_FORMAT ",\"proc_generation\":" UINT64_FORMAT ",\"revision\":" UINT64_FORMAT
 		",\"omitted_locks\":%u,\"locks\":[", cluster_node_id, row->pid, row->procno,
-		row->backend_id, row->backend_start, row->revision, row->omitted_locks);
+		row->backend_id, row->backend_start, row->proc_generation, row->revision, row->omitted_locks);
 	for (uint32 i = 0; i < row->nlocks; i++) {
 		if (i != 0) appendStringInfoChar(out, ',');
 		json_lock(out, &row->locks[i]);
@@ -193,7 +193,7 @@ test_pgrac_wait_graph(PG_FUNCTION_ARGS)
 	ko = palloc0(sizeof(*ko));
 	epoch = cluster_epoch_get_current();
 	initStringInfo(&out);
-	appendStringInfo(&out, "{\"version\":1,\"node\":%d,\"epoch_begin\":" UINT64_FORMAT
+	appendStringInfo(&out, "{\"version\":2,\"node\":%d,\"epoch_begin\":" UINT64_FORMAT
 		",\"atomic_graph\":false,\"observed_at\":" INT64_FORMAT ",\"owners\":[",
 		cluster_node_id, epoch, GetCurrentTimestamp());
 	cluster_content_trace_walk(json_owner, &writer, &stats);
@@ -206,16 +206,19 @@ test_pgrac_wait_graph(PG_FUNCTION_ARGS)
 			const PGPROC *proc = &ProcGlobal->allProcs[i];
 			int pid = proc->pid;
 			BackendId backend = proc->backendId;
+			uint64 generation = *(volatile const uint64 *)&proc->cluster_grd_generation;
 			uint32 wait = *(volatile const uint32 *)&proc->wait_event_info;
 			bool stable;
 			const char *wait_name = pgstat_get_wait_event(wait);
 			if (pid <= 0) continue;
 			pg_read_barrier();
-			stable = pid == proc->pid && backend == proc->backendId;
+			stable = pid == proc->pid && backend == proc->backendId &&
+				generation == *(volatile const uint64 *)&proc->cluster_grd_generation;
 			if (!first) appendStringInfoChar(&out, ',');
 			first = false;
 			appendStringInfo(&out, "{\"procno\":%u,\"pid\":%d,\"backend_id\":%d,"
-				"\"wait_event_info\":%u,\"wait_name\":", i, pid, backend, wait);
+				"\"proc_generation\":" UINT64_FORMAT ",\"wait_event_info\":%u,\"wait_name\":",
+				i, pid, backend, generation, wait);
 			escape_json(&out, wait_name != NULL ? wait_name : "");
 			appendStringInfo(&out, ",\"stable\":%s}", stable ? "true" : "false");
 		}

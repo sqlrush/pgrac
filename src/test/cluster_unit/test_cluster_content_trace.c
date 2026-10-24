@@ -67,6 +67,7 @@ static void actor(unsigned i)
 	pair_depth = 0; pair_recording = false; pair_slot = -1;
 	MyProc = &procs[i]; MyProc->pgprocno = i; MyProc->pid = MyProcPid = 100 + i; MyProc->backendId = 1 + i;
 	MyStartTimestamp = 1000 + i;
+	MyProc->cluster_grd_generation = 10000 + i;
 }
 static void reset(void)
 {
@@ -527,6 +528,7 @@ UT_TEST(process_start_invalidates_even_identical_reused_native_identity)
 	cluster_content_trace_capture(NULL, &cut);
 	UT_ASSERT_EQ(cut.nowners, 0); UT_ASSERT_EQ(cut.changed, 1);
 	MyStartTimestamp++;
+	MyProc->cluster_grd_generation++;
 	memset(&local_owner, 0, sizeof(local_owner));
 	cluster_content_trace_lock_changed(&buf(0)->content_lock);
 	cluster_content_trace_capture(NULL, &cut);
@@ -534,10 +536,46 @@ UT_TEST(process_start_invalidates_even_identical_reused_native_identity)
 	cluster_content_trace_process_start(content_trace->nslots); /* Range check is not assert-only. */
 }
 
+UT_TEST(auxiliary_native_generation_authenticates_timestamp_zero)
+{
+	reset(); MyProc->backendId = InvalidBackendId; MyStartTimestamp = 0;
+	MyProc->cluster_grd_generation = 77; hold(0, LW_EXCLUSIVE);
+	cluster_content_trace_native_wait_set(&buf(1)->content_lock, LW_EXCLUSIVE);
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.nowners, 1); UT_ASSERT_EQ(cut.owners[0].backend_id, InvalidBackendId);
+	UT_ASSERT_EQ(cut.owners[0].backend_start, 0); UT_ASSERT_EQ(cut.owners[0].proc_generation, 77);
+	UT_ASSERT_EQ(cut.owners[0].native_wait.tag.blockNum, 1);
+	UT_ASSERT_EQ(cut.owners[0].nlocks, 1);
+}
+UT_TEST(reused_auxiliary_generation_rejects_same_pid_and_backend)
+{
+	reset(); MyProc->backendId = InvalidBackendId; hold(0, LW_EXCLUSIVE);
+	cluster_content_trace_lock_changed(&buf(0)->content_lock);
+	MyProc->cluster_grd_generation++;
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.nowners, 0); UT_ASSERT_EQ(cut.dead, 1);
+	cluster_content_trace_lock_changed(&buf(0)->content_lock);
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.nowners, 1); UT_ASSERT_EQ(cut.owners[0].proc_generation, 10001);
+}
+UT_TEST(zero_native_generation_never_authenticates_a_process)
+{
+	reset(); hold(0, LW_EXCLUSIVE); MyProc->cluster_grd_generation = 0;
+	for (unsigned i = 0; i < 2; i++) {
+		if (i == 1) MyProc->backendId = InvalidBackendId;
+		cluster_content_trace_lock_changed(&buf(0)->content_lock);
+		cluster_content_trace_capture(NULL, &cut);
+		UT_ASSERT_EQ(cut.nowners, 0); UT_ASSERT_EQ(cut.dead, 1);
+	}
+}
+
 int main(void)
 {
 	cluster_content_trace_shmem_register(); assert(registered && registered->lwlock_count == 0);
-	UT_PLAN(29);
+	UT_PLAN(32);
+	UT_RUN(auxiliary_native_generation_authenticates_timestamp_zero);
+	UT_RUN(reused_auxiliary_generation_rejects_same_pid_and_backend);
+	UT_RUN(zero_native_generation_never_authenticates_a_process);
 	UT_RUN(process_start_invalidates_even_identical_reused_native_identity);
 	UT_RUN(hw_ko_grants_keep_native_identity_and_retire_exactly);
 	UT_RUN(hw_ko_grant_cap_and_missed_release_are_unknown);

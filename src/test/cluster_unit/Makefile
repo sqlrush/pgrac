@@ -9641,3 +9641,6 @@ test_cluster_content_trace_exec: test_cluster_content_trace_exec.c test_cluster_
         $(top_srcdir)/src/include/cluster/cluster_grd.h \
         $(top_srcdir)/src/include/cluster/cluster_wait_trace.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+
+# Native PCM diagnostic stack copies share the process-owner layout.
+test_cluster_pcm_lock_clock_product.o: $(top_srcdir)/src/include/cluster/cluster_content_trace.h
