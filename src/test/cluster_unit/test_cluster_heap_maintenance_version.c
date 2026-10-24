@@ -83,11 +83,24 @@ static bool begun, expecting_error, tx_committed;
 static bool redoing, redo_locked;
 static jmp_buf error_jump;
 static bool local_x, writer_current, route_current, authority_current, admission_current;
+static int32 backend_pin_count;
+static unsigned pin_checks;
 static bool flush_error;
 static uint8 writer_state;
 static uint64 route_holder, route_master;
 static unsigned flushes;
 static unsigned writer_checks, route_checks, authority_checks, admission_checks;
+
+/* Only the process-local private refcount is a leaf double. Compile the
+ * actual pin reader as well as the native apply bodies below. */
+static int32
+GetPrivateRefCount(Buffer buffer)
+{
+	pin_checks++;
+	UT_ASSERT_EQ(buffer, 1);
+	return backend_pin_count;
+}
+#include "test_cluster_heap_borrowed_pin.inc"
 
 bool
 LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
@@ -499,6 +512,8 @@ reset(uint8 opcode, bool shared)
 	edges = inserts = dirties = hints = flushes = 0;
 	writer_checks = route_checks = authority_checks = admission_checks = 0;
 	local_x = writer_current = route_current = authority_current = admission_current = true;
+	backend_pin_count = 1;
+	pin_checks = 0;
 	writer_state = PCM_STATE_X;
 	route_holder = 11;
 	route_master = 12;
@@ -895,6 +910,37 @@ qualified_xmin_batch_apply(QualifiedXminFixture *f,
 	return cluster_heap_freeze_apply_xmin_batch_v1(&relation_data, 1, &f->input,
 		&f->page, &f->proofs, &f->fence, &f->authority, &f->admission, targets,
 		count, FullTransactionIdFromEpochAndXid(1, 100), 10);
+}
+
+UT_TEST(test_xmin_apply_requires_original_backend_pin_before_page_or_writer_use)
+{
+	QualifiedXminFixture f;
+
+	qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	backend_pin_count = 0;
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(pin_checks, 1);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes + writer_checks
+		+ route_checks + authority_checks + admission_checks, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	UT_ASSERT(local_x && f.admission.entered);
+	UT_ASSERT_EQ(backend_pin_count, 0);
+}
+
+UT_TEST(test_xmin_batch_requires_original_backend_pin_without_repin_or_write)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+
+	qualified_xmin_batch_setup(&f, targets);
+	backend_pin_count = 0;
+	UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
+	UT_ASSERT_EQ(pin_checks, 1);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes + writer_checks
+		+ route_checks + authority_checks + admission_checks, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	UT_ASSERT(local_x && f.admission.entered);
+	UT_ASSERT_EQ(backend_pin_count, 0);
 }
 
 UT_TEST(test_xmin_apply_rejects_unbounded_cutoffs_before_native_write)
@@ -1656,7 +1702,7 @@ UT_TEST(test_deferred_request_preserves_shared_freeze_restriction)
 int
 main(void)
 {
-	UT_PLAN(36);
+	UT_PLAN(38);
 	UT_RUN(test_prune_native_plan_and_version);
 	UT_RUN(test_shared_freeze_refuses_before_tuple_or_wal);
 	UT_RUN(test_vacuum_native_unused_and_version);
@@ -1670,6 +1716,8 @@ main(void)
 	UT_RUN(test_qualified_freeze_kernel_changes_only_planned_headers);
 	UT_RUN(test_exact_xmin_plan_preserves_xmax_through_native_wal_and_redo);
 	UT_RUN(test_qualified_xmin_apply_wal_flush_and_redo);
+	UT_RUN(test_xmin_apply_requires_original_backend_pin_before_page_or_writer_use);
+	UT_RUN(test_xmin_batch_requires_original_backend_pin_without_repin_or_write);
 	UT_RUN(test_qualified_xmin_rejects_missing_or_changed_ownership);
 	UT_RUN(test_qualified_xmin_rejects_stale_physical_row_and_bounds);
 	UT_RUN(test_qualified_xmin_flush_error_propagates_after_native_write);

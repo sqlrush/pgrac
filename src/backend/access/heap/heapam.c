@@ -20724,7 +20724,8 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 		|| rel->rd_rel->relpersistence != RELPERSISTENCE_PERMANENT
 		|| cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) != 1
 		|| !RelationNeedsWAL(rel)
-		|| buffer <= 0 || buffer > NBuffers || BufferDescriptors == NULL)
+		|| buffer <= 0 || buffer > NBuffers || BufferDescriptors == NULL
+		|| !ClusterBufferHasSharedPin(buffer))
 		return false;
 	buf = GetBufferDescriptor(buffer - 1);
 	if (!LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE))

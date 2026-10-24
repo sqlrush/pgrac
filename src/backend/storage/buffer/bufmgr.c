@@ -15555,6 +15555,14 @@ ConditionalLockBuffer(Buffer buffer)
 	return acquired;
 }
 
+/* Borrowed-resource consumers must prove their own original pin, rather than
+ * descriptor residency or another backend's shared refcount. Never repin. */
+bool
+ClusterBufferHasSharedPin(Buffer buffer)
+{
+	return buffer > 0 && buffer <= NBuffers && GetPrivateRefCount(buffer) > 0;
+}
+
 /*
  * Release a pin and the local content lock after a read-only successful
  * ConditionalLockBuffer().  That acquisition did not acquire PCM ownership or

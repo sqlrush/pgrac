@@ -369,6 +369,9 @@ extern bool ClusterLockBufferShareBarrierAware(Buffer buffer);
 extern Buffer LockBufferForVisibilityMapPageInit(Buffer buffer);
 extern Buffer LockBufferForFreeSpaceMapPageInit(Buffer buffer);
 extern bool ConditionalLockBuffer(Buffer buffer);
+/* Read only: an existing shared-buffer pin held by this backend. Does not
+ * acquire a pin or grant content/PCM writer authority. */
+extern bool ClusterBufferHasSharedPin(Buffer buffer);
 /* Read-only successful ConditionalLockBuffer() only; no PCM writer cleanup. */
 extern void ClusterUnlockReleaseBufferAfterConditionalRead(Buffer buffer);
 /* Conditional local X plus cluster_space_hint_begin/finish() publication only. */

@@ -1957,6 +1957,13 @@ test_cluster_heap_freeze_apply.inc: $(top_srcdir)/src/backend/access/heap/heapam
 	     END { if (found != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Original backend-private pin observation, not a model of residency.
+test_cluster_heap_borrowed_pin.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	@awk '/^ClusterBufferHasSharedPin\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++; exit } \
+	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_freeze_xmin_apply.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
 	awk '/^cluster_heap_freeze_apply_xmin(_batch)?_v1\(/ { print "bool"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
@@ -1989,6 +1996,7 @@ test_cluster_heap_maintenance_identity.inc: $(top_srcdir)/src/backend/access/hea
 	mv $@.tmp $@
 
 test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c test_cluster_heap_maintenance_policy.inc unit_test.h \
+		test_cluster_heap_borrowed_pin.inc $(top_srcdir)/src/include/storage/bufmgr.h \
 		test_cluster_vacuum_freeze_locators.inc \
 		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
 		$(top_srcdir)/src/include/cluster/cluster_scn.h test_cluster_heap_small_scn.inc \
