@@ -71,6 +71,19 @@ typedef struct ClusterRecoveryStampFpiV1 {
 StaticAssertDecl(sizeof(ClusterRecoveryStampFpiV1) <= CLUSTER_RECOVERY_STAMP_PAYLOAD_BYTES,
 	"recovery FPI envelope must fit the existing stamp payload");
 
+/* Process-local WAL-leg result, never embedded in shared memory. The exact
+ * image copy remains available for subsequent typed installation. The caller
+ * retains the original preflight/serial/pin and this promoted guard on success,
+ * refusal after promotion, or ERROR. WAL flush does not retire the window. */
+typedef struct ClusterRecoveryFpiInsertV1 {
+	GenericXLogRecoveryImageV1 image;
+	RfPageAuthorityGuardV1 *guard;
+	ClusterRecoveryStampHandleV1 window;
+	XLogRecPtr record_start;
+	XLogRecPtr record_end;
+	bool wal_flushed;
+} ClusterRecoveryFpiInsertV1;
+
 /* Embedded in the original per-thread replay slot. No pointers or callbacks. */
 typedef struct ClusterRecoveryStampSlotV1 {
 	slock_t lock;
