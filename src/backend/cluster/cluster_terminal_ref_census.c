@@ -25,8 +25,10 @@
 
 #include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_itl.h"
+#include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_tt_slot.h"
+#include "cluster/cluster_uba.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "port/atomics.h"
 #include "port/pg_crc32c.h"
@@ -66,7 +68,6 @@
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "cluster/cluster_undo_segment.h"
-#include "cluster/cluster_uba.h"
 #include "cluster/cluster_xid_stripe.h"
 #include "storage/bufmgr.h"
 #include "storage/buf_internals.h"
@@ -1016,23 +1017,19 @@ ctrc_target_itl_finalizes_prepared(const ClusterCtrcTargetV1 *pending,
 		   && ctrc_target_itl_finalizes_exact(&observed, final_target);
 }
 
-ClusterCtrcItlCleanoutApplyResult
-cluster_ctrc_itl_cleanout_slot(const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcTargetV1 *target,
-							   ClusterCtrcTerminalStatus terminal_status, SCN commit_scn,
-							   ClusterItlSlotData *slot)
+static ClusterCtrcItlCleanoutApplyResult
+ctrc_itl_terminal_projection(uint8 itl_class, ClusterCtrcTerminalStatus terminal_status,
+	SCN commit_scn, ClusterItlSlotData *slot)
 {
 	uint8 active_flag;
 	uint8 committed_flag;
 	uint8 aborted_flag;
 
-	if (!ctrc_target_exact_itl_valid(key, target) || slot == NULL || slot->xid != target->itl_xid
-		|| slot->wrap != target->itl_slot_wrap
-		|| memcmp(&slot->undo_segment_head, target->uba, sizeof(slot->undo_segment_head)) != 0
-		|| (target->itl_class != 1 && target->itl_class != 2))
+	if (slot == NULL || (itl_class != 1 && itl_class != 2))
 		return CLUSTER_CTRC_ITL_CLEANOUT_RETAIN;
-	active_flag = target->itl_class == 1 ? ITL_FLAG_ACTIVE : ITL_FLAG_LOCK_ONLY_ACTIVE;
-	committed_flag = target->itl_class == 1 ? ITL_FLAG_COMMITTED : ITL_FLAG_LOCK_ONLY_COMMITTED;
-	aborted_flag = target->itl_class == 1 ? ITL_FLAG_ABORTED : ITL_FLAG_LOCK_ONLY_ABORTED;
+	active_flag = itl_class == 1 ? ITL_FLAG_ACTIVE : ITL_FLAG_LOCK_ONLY_ACTIVE;
+	committed_flag = itl_class == 1 ? ITL_FLAG_COMMITTED : ITL_FLAG_LOCK_ONLY_COMMITTED;
+	aborted_flag = itl_class == 1 ? ITL_FLAG_ABORTED : ITL_FLAG_LOCK_ONLY_ABORTED;
 
 	if (terminal_status == CTRC_TERMINAL_COMMITTED) {
 		if (!SCN_VALID(commit_scn))
@@ -1041,7 +1038,7 @@ cluster_ctrc_itl_cleanout_slot(const ClusterCtrcTxnKeyV1 *key, const ClusterCtrc
 			return slot->commit_scn == commit_scn ? CLUSTER_CTRC_ITL_CLEANOUT_ALREADY_TERMINAL
 												  : CLUSTER_CTRC_ITL_CLEANOUT_RETAIN;
 		if (slot->flags != active_flag
-			&& !(target->itl_class == 1 && slot->flags == ITL_FLAG_NEEDS_CLEANOUT
+			&& !(itl_class == 1 && slot->flags == ITL_FLAG_NEEDS_CLEANOUT
 				 && slot->commit_scn == commit_scn))
 			return CLUSTER_CTRC_ITL_CLEANOUT_RETAIN;
 		if (slot->flags == active_flag && SCN_VALID(slot->commit_scn))
@@ -1062,30 +1059,39 @@ cluster_ctrc_itl_cleanout_slot(const ClusterCtrcTxnKeyV1 *key, const ClusterCtrc
 	return CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN;
 }
 
-/* Calculate only the private image. Page custody, original terminal evidence,
- * WAL durability and reference discharge remain the executing owner's work. */
 ClusterCtrcItlCleanoutApplyResult
-cluster_ctrc_itl_cleanout_image_v1(const ClusterCtrcTxnKeyV1 *key,
-	const ClusterCtrcTargetV1 *target, ClusterCtrcTerminalStatus terminal_status,
-	SCN commit_scn, const char *before_image, char *after_image)
+cluster_ctrc_itl_cleanout_slot(const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcTargetV1 *target,
+	ClusterCtrcTerminalStatus terminal_status, SCN commit_scn, ClusterItlSlotData *slot)
 {
-	PGAlignedBlock image;
+	if (!ctrc_target_exact_itl_valid(key, target) || slot == NULL || slot->xid != target->itl_xid
+		|| slot->wrap != target->itl_slot_wrap
+		|| memcmp(&slot->undo_segment_head, target->uba, sizeof(slot->undo_segment_head)) != 0)
+		return CLUSTER_CTRC_ITL_CLEANOUT_RETAIN;
+	return ctrc_itl_terminal_projection(target->itl_class, terminal_status, commit_scn, slot);
+}
+
+static bool
+ctrc_itl_image_overlaps(const void *a, Size a_size, const void *b, Size b_size)
+{
+	uintptr_t left = (uintptr_t)a, right = (uintptr_t)b;
+
+	return left <= right ? right - left < a_size : left - right < b_size;
+}
+
+static ClusterItlSlotData *
+ctrc_itl_image_slot(const char *before_image, char *after_image, uint16 itl_index,
+	PGAlignedBlock *scratch, Page *out_page)
+{
 	Page page;
 	PageHeader header;
-	ClusterItlSlotData *slot;
-	ClusterCtrcItlCleanoutApplyResult result;
-	uintptr_t distance;
 
-	if (before_image == NULL || after_image == NULL || target == NULL)
-		return CLUSTER_CTRC_ITL_CLEANOUT_RETAIN;
-	distance = (uintptr_t)before_image > (uintptr_t)after_image
-		? (uintptr_t)before_image - (uintptr_t)after_image
-		: (uintptr_t)after_image - (uintptr_t)before_image;
-	if (before_image != after_image && distance < BLCKSZ)
-		return CLUSTER_CTRC_ITL_CLEANOUT_RETAIN;
+	if (before_image == NULL || after_image == NULL
+		|| (before_image != after_image
+			&& ctrc_itl_image_overlaps(before_image, BLCKSZ, after_image, BLCKSZ)))
+		return NULL;
 	/* The ordinary cleaner already owns a private GenericXLog image. Keep
 	 * that in-place path free of an additional full-page copy. */
-	page = before_image == after_image ? (Page)after_image : (Page)image.data;
+	page = before_image == after_image ? (Page)after_image : (Page)scratch->data;
 	if (page != before_image)
 		memcpy(page, before_image, BLCKSZ);
 	header = (PageHeader)page;
@@ -1095,13 +1101,100 @@ cluster_ctrc_itl_cleanout_image_v1(const ClusterCtrcTxnKeyV1 *key,
 		|| header->pd_upper > header->pd_special
 		|| header->pd_special != BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE
 		|| (header->pd_lower - SizeOfPageHeaderData) % sizeof(ItemIdData) != 0
-		|| target->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT)
+		|| itl_index >= CLUSTER_ITL_INITRANS_DEFAULT)
+		return NULL;
+	*out_page = page;
+	return &ClusterPageGetItlSlots(page)[itl_index];
+}
+
+/* Calculate only the private image. Page custody, original terminal evidence,
+ * WAL durability and reference discharge remain the executing owner's work. */
+ClusterCtrcItlCleanoutApplyResult
+cluster_ctrc_itl_cleanout_image_v1(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcTargetV1 *target, ClusterCtrcTerminalStatus terminal_status,
+	SCN commit_scn, const char *before_image, char *after_image)
+{
+	PGAlignedBlock image;
+	Page page;
+	ClusterItlSlotData *slot;
+	ClusterCtrcItlCleanoutApplyResult result;
+
+	if (target == NULL
+		|| (slot = ctrc_itl_image_slot(before_image, after_image, target->itl_slot_index,
+			&image, &page)) == NULL)
 		return CLUSTER_CTRC_ITL_CLEANOUT_RETAIN;
-	slot = &ClusterPageGetItlSlots(page)[target->itl_slot_index];
 	result = cluster_ctrc_itl_cleanout_slot(key, target, terminal_status, commit_scn, slot);
 	if (result == CLUSTER_CTRC_ITL_CLEANOUT_RETAIN)
 		return result;
 	if (target->itl_class == 2 && cluster_itl_clear_terminal_lock_refs(page, slot) != 0)
+		result = CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN;
+	if (after_image != page)
+		memcpy(after_image, page, BLCKSZ);
+	return result;
+}
+
+/* The recovery image has no online buffer admission. Check every tuple that
+ * the common lock-reference cleaner could inspect before any in-place edit. */
+static bool
+ctrc_recovery_itl_tuples_valid(Page page)
+{
+	PageHeader header = (PageHeader)page;
+	OffsetNumber offset, maxoff = PageGetMaxOffsetNumber(page);
+
+	for (offset = FirstOffsetNumber; offset <= maxoff; offset++) {
+		ItemId item = PageGetItemId(page, offset);
+		uint16 start, length;
+
+		if (!ItemIdIsNormal(item))
+			continue;
+		start = ItemIdGetOffset(item);
+		length = ItemIdGetLength(item);
+		if (start < header->pd_upper || start > header->pd_special
+			|| length < SizeofHeapTupleHeader || length > header->pd_special - start)
+			return false;
+	}
+	return true;
+}
+
+ClusterCtrcItlCleanoutApplyResult
+cluster_ctrc_recovery_itl_cleanout_image_v1(const ClusterColdTtSlotInputV1 *subject,
+	uint16 itl_index, uint16 expected_itl_wrap, uint8 itl_class,
+	const char *before_image, char *after_image)
+{
+	PGAlignedBlock image;
+	Page page;
+	ClusterItlSlotData *slot;
+	ClusterCtrcTerminalStatus status;
+	ClusterCtrcItlCleanoutApplyResult result;
+	uint32 segment_id, blockno;
+	uint16 tt_slot, row_offset;
+
+	if (subject == NULL || after_image == NULL || (itl_class != 1 && itl_class != 2)
+		|| ctrc_itl_image_overlaps(after_image, BLCKSZ, subject, sizeof(*subject))
+		|| subject->key.owner_instance == 0 || subject->key.owner_instance > UNDO_OWNER_INSTANCE_MAX
+		|| subject->key.segment_id == 0 || subject->key.segment_id > UINT16_MAX
+		|| (subject->key.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1
+			!= subject->key.owner_instance
+		|| subject->key.segment_generation == UINT32_MAX
+		|| subject->key.slot_offset >= TT_SLOTS_PER_SEGMENT
+		|| !TransactionIdIsNormal(subject->key.xid) || subject->key.slot_wrap == TT_WRAP_INVALID
+		|| subject->slot.xid != subject->key.xid || subject->slot.wrap != subject->key.slot_wrap
+		|| (subject->slot.flags & ~TT_SLOT_FLAGS_KNOWN) != 0
+		|| (subject->slot.status != TT_SLOT_COMMITTED && subject->slot.status != TT_SLOT_ABORTED)
+		|| (subject->slot.status == TT_SLOT_COMMITTED) != SCN_VALID(subject->slot.commit_scn)
+		|| (slot = ctrc_itl_image_slot(before_image, after_image, itl_index, &image, &page)) == NULL
+		|| !ctrc_recovery_itl_tuples_valid(page)
+		|| slot->xid != subject->key.xid || slot->wrap != expected_itl_wrap
+		|| !uba_decode(slot->undo_segment_head, &segment_id, &blockno, &tt_slot, &row_offset)
+		|| segment_id != subject->key.segment_id || tt_slot != subject->key.slot_offset)
+		return CLUSTER_CTRC_ITL_CLEANOUT_RETAIN;
+	/* The TT global undo head can be on another page. Neither it nor this
+	 * local ITL wrap can stand in for complete original history qualification. */
+	status = subject->slot.status == TT_SLOT_COMMITTED ? CTRC_TERMINAL_COMMITTED : CTRC_TERMINAL_ABORTED;
+	result = ctrc_itl_terminal_projection(itl_class, status, subject->slot.commit_scn, slot);
+	if (result == CLUSTER_CTRC_ITL_CLEANOUT_RETAIN)
+		return result;
+	if (itl_class == 2 && cluster_itl_clear_terminal_lock_refs(page, slot) != 0)
 		result = CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN;
 	if (after_image != page)
 		memcpy(after_image, page, BLCKSZ);

@@ -1040,6 +1040,17 @@ extern ClusterCtrcItlCleanoutApplyResult cluster_ctrc_itl_cleanout_image_v1(
 	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcTargetV1 *target,
 	ClusterCtrcTerminalStatus terminal_status, SCN commit_scn,
 	const char *before_image, char *after_image);
+struct ClusterColdTtSlotInputV1;
+/* Pure native TT-input variant; never reconstruct an online grant key.
+ * Validate terminal polarity and native key/ITL UBA segment+slot+xid. The
+ * expected page ITL wrap is independent of the TT slot's own reuse wrap.
+ * Generation/namespace freshness, original source/terminal durability and
+ * complete reference/history coverage still belong to the recovery owner.
+ * No WAL, token, mutation or release authority. Exact in-place is supported;
+ * refusal preserves output and all inputs, including output/subject overlap. */
+extern ClusterCtrcItlCleanoutApplyResult cluster_ctrc_recovery_itl_cleanout_image_v1(
+	const struct ClusterColdTtSlotInputV1 *subject, uint16 itl_index, uint16 expected_itl_wrap,
+	uint8 itl_class, const char *before_image, char *after_image);
 /* Process-local image observations, never receipt or terminal authority. */
 typedef struct ClusterCtrcItlCarrierImageV1 {
 	uint8 mask;
