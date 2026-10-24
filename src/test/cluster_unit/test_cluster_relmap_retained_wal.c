@@ -24,6 +24,7 @@ int control_fixture_main(int argc, char **argv);
 #include "cluster/cluster_relmap_owner.h"
 #include "cluster/cluster_relmap_terminal_scan.h"
 #include "cluster/cluster_relmap_retention_census.h"
+#include "cluster/cluster_undo_recovery.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
 #include "utils/relmapper.h"
@@ -2239,6 +2240,187 @@ terminal_prefix_fixture(bool aborting, unsigned fault)
 	UT_ASSERT_EQ(inputs_begin_for_role(true, &inputs), 0);
 	return inputs;
 }
+/* Native disk I/O and the cold owner are controlled leaf boundaries here.
+ * Actual owner/source matching and actual CLOG disk reads have separate tests. */
+static ClusterWalInputV1 prefix_base_expected;
+static unsigned prefix_base_fault, prefix_base_reads, prefix_base_scope_checks;
+static XidStatus prefix_base_status;
+static uint8 prefix_base_last_byte;
+
+bool
+cluster_undo_recovery_cold_source_matches_v1(const ClusterWalSourceRef *source,
+											 const ClusterControlRootSnapshot *checkpoint,
+											 XLogRecPtr native_redo)
+{
+	prefix_base_scope_checks++;
+	return prefix_base_fault != 1 && !(prefix_base_fault == 9 && prefix_base_scope_checks > 1)
+		   && memcmp(source, &prefix_base_expected.source, sizeof(*source)) == 0
+		   && memcmp(checkpoint, &prefix_base_expected.checkpoint, sizeof(*checkpoint)) == 0
+		   && native_redo == prefix_base_expected.native_redo;
+}
+
+bool
+cluster_clog_native_recovery_base_read_v1(int origin, TransactionId xid,
+										  ClusterClogNativeBaseV1 *out)
+{
+	prefix_base_reads++;
+	memset(out, 0, sizeof(*out));
+	if (origin == cluster_node_id || prefix_base_fault == 2)
+		return false;
+	out->origin = prefix_base_fault == 3 ? origin + 1 : origin;
+	out->xid = prefix_base_fault == 4 ? xid + 1 : xid;
+	out->status = prefix_base_fault == 5	? TRANSACTION_STATUS_IN_PROGRESS
+				  : prefix_base_fault == 14 ? TRANSACTION_STATUS_ABORTED
+											: prefix_base_status;
+	out->page_number = xid / (BLCKSZ * 4) + (prefix_base_fault == 10);
+	memset(out->image, 0x42, sizeof(out->image));
+	out->image[BLCKSZ - 1] = prefix_base_last_byte;
+	if (prefix_base_fault == 6)
+		inputs_pin_current = false;
+	if (prefix_base_fault == 7)
+		v2_checkpoint_root_race();
+	if (prefix_base_fault == 8)
+		ereport(ERROR, (errmsg("injected native base ERROR")));
+	return true;
+}
+
+static ClusterRelmapTerminalScanV1 *
+prefix_base_setup(ClusterWalInputsV1 **inputs, bool aborted, bool prefix)
+{
+	ClusterRelmapTerminalScanV1 *scan = NULL;
+	*inputs = prefix ? terminal_prefix_fixture(aborted, 0) : terminal_test_fixture(0, aborted, 0);
+	prefix_base_expected = *cluster_wal_inputs_at_v1(*inputs, 0);
+	prefix_base_fault = prefix_base_reads = prefix_base_scope_checks = 0;
+	prefix_base_status = aborted ? TRANSACTION_STATUS_ABORTED : TRANSACTION_STATUS_COMMITTED;
+	prefix_base_last_byte = 0x24;
+	if (!(prefix ? cluster_relmap_recovery_terminal_prefix_scan_v2(
+					   *inputs, 0, FullTransactionIdFromU64(99), &scan)
+				 : cluster_relmap_recovery_terminal_scan_v1(*inputs, 0,
+															FullTransactionIdFromU64(99), &scan)))
+		abort();
+	return scan;
+}
+
+UT_TEST(test_terminal_prefix_native_base_binds_full_image_and_source)
+{
+	int saved = cluster_node_id;
+	cluster_node_id = 1;
+	for (unsigned aborted = 0; aborted < 2; aborted++) {
+		ClusterWalInputsV1 *inputs = NULL;
+		ClusterRelmapTerminalScanV1 *scan = prefix_base_setup(&inputs, aborted, true);
+		ClusterRelmapTerminalBaseObservationV1 out, again;
+		uint8 transcript[sizeof("PGRAC-RELMAP-PREFIX-NATIVE-BASE-V1") + 32 + 13 + BLCKSZ];
+		uint8 expected[32];
+		size_t at = 0;
+		UT_ASSERT(!cluster_relmap_recovery_terminal_prefix_base_read_v1(scan, (void *)scan));
+		UT_ASSERT(cluster_relmap_recovery_terminal_prefix_base_read_v1(scan, &out));
+		UT_ASSERT_EQ(prefix_base_reads, 1);
+		UT_ASSERT_EQ(prefix_base_scope_checks, 2);
+		UT_ASSERT_EQ(out.terminal.requested_top_full_xid, 99);
+		UT_ASSERT_EQ(out.terminal.post_flush_issued, 105);
+		UT_ASSERT_EQ(out.native_base.origin, 0);
+		UT_ASSERT_EQ(out.native_base.xid, 99);
+		UT_ASSERT_EQ(out.native_base.page_number, 0);
+		UT_ASSERT_EQ(out.native_base.status, out.terminal.status);
+		memcpy(transcript, "PGRAC-RELMAP-PREFIX-NATIVE-BASE-V1",
+			   sizeof("PGRAC-RELMAP-PREFIX-NATIVE-BASE-V1"));
+		at += sizeof("PGRAC-RELMAP-PREFIX-NATIVE-BASE-V1");
+		memcpy(transcript + at, out.terminal.fingerprint, 32);
+		at += 32;
+		memset(transcript + at, 0, 13);
+		transcript[at + 4] = 99;
+		transcript[at + 12] = out.terminal.status;
+		at += 13;
+		memcpy(transcript + at, out.native_base.image, BLCKSZ);
+		at += BLCKSZ;
+		sha256_bytes(transcript, at, expected);
+		UT_ASSERT(memcmp(out.fingerprint, expected, 32) == 0);
+		prefix_base_last_byte ^= 1;
+		UT_ASSERT(cluster_relmap_recovery_terminal_prefix_base_read_v1(scan, &again));
+		UT_ASSERT(memcmp(out.terminal.fingerprint, again.terminal.fingerprint, 32) == 0);
+		UT_ASSERT(memcmp(out.fingerprint, again.fingerprint, 32) != 0);
+		cluster_relmap_recovery_terminal_scan_release_v1(&scan);
+		UT_ASSERT(inputs_pin_held);
+		cold_census_done(&inputs);
+	}
+	cluster_node_id = saved;
+}
+
+UT_TEST(test_terminal_prefix_native_base_rejects_scope_and_native_mismatch_sticky)
+{
+	int saved = cluster_node_id;
+	cluster_node_id = 1;
+	for (unsigned fault = 1; fault <= 13; fault++) {
+		ClusterWalInputsV1 *inputs = NULL;
+		ClusterRelmapTerminalScanV1 *scan = prefix_base_setup(&inputs, false, fault != 11);
+		ClusterRelmapTerminalBaseObservationV1 out, zero = { 0 };
+		ClusterRelmapTerminalObservationV1 terminal;
+		prefix_base_fault = fault;
+		if (fault == 8)
+			prefix_base_fault = 14; /* Opposite terminal, ERROR tested separately. */
+		if (fault == 12)
+			inputs_pin_current = false;
+		if (fault == 13)
+			cluster_node_id = 0; /* Original reader rejects own origin. */
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT(!cluster_relmap_recovery_terminal_prefix_base_read_v1(scan, &out));
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		if (fault == 1 || fault == 11 || fault == 12)
+			UT_ASSERT_EQ(prefix_base_reads, 0);
+		prefix_base_fault = 0;
+		inputs_pin_current = true;
+		cluster_node_id = 1;
+		UT_ASSERT(!cluster_relmap_recovery_terminal_prefix_base_read_v1(scan, &out));
+		UT_ASSERT(!cluster_relmap_recovery_terminal_scan_get_v1(scan, &terminal));
+		cluster_relmap_recovery_terminal_scan_release_v1(&scan);
+		UT_ASSERT(inputs_pin_held);
+		cold_census_done(&inputs);
+	}
+	cluster_node_id = saved;
+}
+
+UT_TEST(test_terminal_prefix_native_base_error_keeps_output_and_original_pins)
+{
+	int saved = cluster_node_id;
+	cluster_node_id = 1;
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterWalInputsV1 *inputs = NULL;
+		ClusterRelmapTerminalScanV1 *scan = prefix_base_setup(&inputs, false, true);
+		ClusterRelmapTerminalBaseObservationV1 out, zero = { 0 };
+		volatile bool threw = false;
+		prefix_base_fault = fault == 1 ? 8 : 0;
+		test_capture_error_level = fault == 1;
+		test_last_error_level = 0;
+		test_throw_root_read = fault == 0;
+		if (fault == 2)
+			CritSectionCount++;
+		memset(&out, 0xa5, sizeof(out));
+		PG_TRY();
+		{
+			UT_ASSERT(!cluster_relmap_recovery_terminal_prefix_base_read_v1(scan, &out));
+		}
+		PG_CATCH();
+		{
+			threw = true;
+		}
+		PG_END_TRY();
+		if (fault == 2)
+			CritSectionCount--;
+		test_capture_error_level = false;
+		test_throw_root_read = false;
+		UT_ASSERT_EQ(threw, fault != 2);
+		if (fault == 1)
+			UT_ASSERT_EQ(test_last_error_level, ERROR);
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock);
+		prefix_base_fault = 0;
+		UT_ASSERT(!cluster_relmap_recovery_terminal_prefix_base_read_v1(scan, &out));
+		cluster_relmap_recovery_terminal_scan_release_v1(&scan);
+		cold_census_done(&inputs);
+	}
+	cluster_node_id = saved;
+}
+
 UT_TEST(test_terminal_prefix_scan_binds_actual_checkpoint_end_and_issued_cap)
 {
 	for (unsigned observer = 0; observer < 2; observer++)
@@ -2460,7 +2642,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(43);
+	UT_PLAN(46);
 	UT_RUN(test_retained_relmap_matches_each_selected_namespace);
 	UT_RUN(test_retained_relmap_requires_exact_pending);
 	UT_RUN(test_retained_relmap_scans_suffix_and_other_source);
@@ -2495,6 +2677,9 @@ main(int argc, char **argv)
 	UT_RUN(test_census_side_collector_error_invalidates_window);
 	UT_RUN(test_census_side_wal_keeps_real_empty_initializer);
 	UT_RUN(test_census_side_wal_requires_real_empty_initializer);
+	UT_RUN(test_terminal_prefix_native_base_binds_full_image_and_source);
+	UT_RUN(test_terminal_prefix_native_base_rejects_scope_and_native_mismatch_sticky);
+	UT_RUN(test_terminal_prefix_native_base_error_keeps_output_and_original_pins);
 	UT_RUN(test_terminal_prefix_scan_requires_original_retained_owner);
 	UT_RUN(test_terminal_prefix_scan_binds_actual_checkpoint_end_and_issued_cap);
 	UT_RUN(test_terminal_prefix_scan_refuses_unbounded_or_nonmatching_sources);

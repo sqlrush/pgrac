@@ -3403,6 +3403,12 @@ test_cluster_recovery_native_inputs: test_cluster_recovery_manifest_inputs.inc t
 test_cluster_recovery_native_inputs: $(RECOVERY_CENSUS_TEST_OBJS) test_cluster_recovery_prepare_fixture.h test_cluster_recovery_prepare_inputs.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_xact_join_inputs.inc test_cluster_recovery_relmap_physical_inputs.inc test_cluster_recovery_relmap_inputs.inc test_cluster_recovery_relmap_fixture.h
 
+# The prefix/base composition consumes both public native-owner declarations.
+$(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o: \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_terminal_scan.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
+		$(top_srcdir)/src/include/access/clog.h
+
 test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_terminal_scan.h \

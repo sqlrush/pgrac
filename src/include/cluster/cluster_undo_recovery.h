@@ -37,6 +37,13 @@ extern bool cluster_undo_recovery_origin_authorized_v1(int origin_node);
 /* Native cold consumers also require the original cold serial mode and
  * an executable recovery plan; PI inspection cannot qualify this scope. */
 extern bool cluster_undo_recovery_cold_origin_authorized_v1(int origin_node);
+/* Read-only exact selected-source match inside that same original cold scope.
+ * Reuses the original ROOT-selected native source accessor and rechecks the
+ * authority afterwards. No scope is acquired, extended, or granted here. */
+extern bool
+cluster_undo_recovery_cold_source_matches_v1(const ClusterWalSourceRef *source,
+											 const ClusterControlRootSnapshot *checkpoint,
+											 XLogRecPtr native_redo);
 /* Only the already-durable exact C0 target's top-level native ABORT bit.
  * This does not authorize an origin scope or other native operations. */
 extern bool cluster_undo_recovery_abort_clog_authorized_v1(int origin_node, TransactionId xid);

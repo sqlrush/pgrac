@@ -21,6 +21,13 @@ typedef struct ClusterRelmapTerminalObservationV1 {
 	uint64 records;
 	uint8 fingerprint[32];
 } ClusterRelmapTerminalObservationV1;
+/* A single-call native image bound to the original retained prefix. This is
+ * an observation, not a retained lifetime or a certified FullXid era. */
+typedef struct ClusterRelmapTerminalBaseObservationV1 {
+	ClusterRelmapTerminalObservationV1 terminal;
+	ClusterClogNativeBaseV1 native_base;
+	uint8 fingerprint[32];
+} ClusterRelmapTerminalBaseObservationV1;
 /* Dormant full original retained scan; one physical input for this origin
  * only. Complete native checkpoint and bounded COMMIT/ABORT carrier required.
  * Every native XACT carrier must be bounded COMMIT/ABORT; unsupported XACT
@@ -48,6 +55,16 @@ extern bool cluster_relmap_recovery_terminal_prefix_scan_v2(ClusterWalInputsV1 *
  * A failed original recheck permanently invalidates this local scan. */
 extern bool cluster_relmap_recovery_terminal_scan_get_v1(ClusterRelmapTerminalScanV1 *scan,
 														 ClusterRelmapTerminalObservationV1 *out);
+/* Dormant original-cold-scope read. Revalidates the borrowed prefix before
+ * and after original native base I/O; requires exact origin/raw xid/status.
+ * Binds the full disk page into the source fingerprint. No caller-provided
+ * image or qualification flag. Once begun, ERROR/refusal invalidates the scan;
+ * nonoverlap refusal clears all output, overlap is unchanged. The native
+ * truncation lock protects only its original I/O call, not a retained lifetime.
+ * Does not certify FullXid era/floor/history/COMPLETE/release. */
+extern bool
+cluster_relmap_recovery_terminal_prefix_base_read_v1(ClusterRelmapTerminalScanV1 *scan,
+													 ClusterRelmapTerminalBaseObservationV1 *out);
 /* Caller frees only this private object, never the original owner/pins. */
 extern void cluster_relmap_recovery_terminal_scan_release_v1(ClusterRelmapTerminalScanV1 **scan);
 #endif

@@ -344,6 +344,31 @@ cluster_undo_recovery_cold_origin_authorized_v1(int origin_node)
 }
 
 bool
+cluster_undo_recovery_cold_source_matches_v1(const ClusterWalSourceRef *source,
+											 const ClusterControlRootSnapshot *checkpoint,
+											 XLogRecPtr native_redo)
+{
+	const ClusterUndoRecoveryScopeV1 *scope = active_scope;
+	ClusterWalSourceRef observed;
+	XLogRecPtr redo;
+
+	if (source == NULL || checkpoint == NULL || native_redo == InvalidXLogRecPtr
+		|| !cluster_undo_recovery_cold_origin_authorized_v1(source->claim.identity.origin_node_id)
+		|| active_scope != scope
+		|| memcmp(checkpoint, scope->authority->root_snapshot, sizeof(*checkpoint)) != 0
+		|| cluster_control_root_recovery_source_v1(scope->authority->root_snapshot,
+												   &scope->root_token, &observed, &redo)
+			   != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| !undo_source_equal(&observed, source) || redo != native_redo)
+		return false;
+	/* The original source accessor performs I/O; do not accept authority or
+	 * snapshot changes across it. No new scope or authority is manufactured. */
+	return active_scope == scope
+		   && cluster_undo_recovery_cold_origin_authorized_v1(source->claim.identity.origin_node_id)
+		   && memcmp(checkpoint, scope->authority->root_snapshot, sizeof(*checkpoint)) == 0;
+}
+
+bool
 cluster_undo_recovery_abort_clog_authorized_v1(int origin_node, TransactionId xid)
 {
 	return origin_node >= 0 && origin_node < 128 && active_abort != NULL
@@ -425,4 +450,5 @@ cluster_undo_recovery_multixact_page_retired_v1(int origin_node, XLogRecPtr sour
 		   && rf_side_online_plan_multixact_page_retired_v1(
 			   active_scope->plan, origin_node + 1, source_lsn, source_end_lsn, members, page);
 }
+
 #endif

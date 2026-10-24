@@ -9,6 +9,7 @@
 #include "access/xlog.h"
 #include "cluster/cluster_recovery_record_hash.h"
 #include "cluster/cluster_side_xact.h"
+#include "cluster/cluster_undo_recovery.h"
 #include "miscadmin.h"
 #include "replication/origin.h"
 
@@ -260,11 +261,100 @@ cluster_relmap_recovery_terminal_prefix_scan_v2(ClusterWalInputsV1 *inputs, uint
 	return terminal_scan(inputs, index, requested_top, true, out);
 }
 
+static bool
+terminal_scan_current(ClusterRelmapTerminalScanV1 *scan)
+{
+	const ClusterWalInputV1 *current;
+	if (cluster_wal_inputs_revalidate_v1(scan->inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| cluster_wal_inputs_count_v1(scan->inputs) != scan->count)
+		return false;
+	current = cluster_wal_inputs_at_v1(scan->inputs, scan->index);
+	return current != NULL && memcmp(current, &scan->selected, sizeof(*current)) == 0;
+}
+
+bool
+cluster_relmap_recovery_terminal_prefix_base_read_v1(ClusterRelmapTerminalScanV1 *scan,
+													 ClusterRelmapTerminalBaseObservationV1 *out)
+{
+	static const uint8 domain[] = "PGRAC-RELMAP-PREFIX-NATIVE-BASE-V1";
+	ClusterRelmapTerminalBaseObservationV1 result = { 0 };
+	pg_cryptohash_ctx *volatile hash = NULL;
+	bool accepted = false;
+	uint8 identity[13];
+	uint32 fields[3];
+
+	if (scan != NULL && out != NULL) {
+		uintptr_t a = (uintptr_t)scan, b = (uintptr_t)out;
+		if ((a <= b && b - a < sizeof(*scan)) || (b <= a && a - b < sizeof(*out)))
+			return false;
+	}
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (scan == NULL || scan->pid != getpid() || scan->failed)
+		return false;
+	/* Original owner/ROOT/native I/O can ERROR. Never revive this private
+	 * observation until all source and image checks have succeeded. */
+	scan->failed = true;
+	if (CritSectionCount != 0 || !scan->prefix_only || scan->observation.post_flush_issued == 0
+		|| scan->observation.prefix_end == 0
+		|| scan->observation.window.origin
+			   != scan->observation.source.claim.identity.origin_node_id)
+		return false;
+	PG_TRY();
+	{
+		TransactionId xid = (TransactionId)scan->observation.requested_top_full_xid;
+		int origin = scan->observation.window.origin;
+		if (terminal_scan_current(scan)
+			&& cluster_undo_recovery_cold_source_matches_v1(
+				&scan->selected.source, &scan->selected.checkpoint, scan->selected.native_redo)
+			&& cluster_clog_native_recovery_base_read_v1(origin, xid, &result.native_base)
+			&& result.native_base.origin == origin
+			&& result.native_base.xid == xid
+			/* Native CLOG stores four two-bit transactions per byte. */
+			&& result.native_base.page_number == xid / (BLCKSZ * 4)
+			&& result.native_base.status == scan->observation.status) {
+			result.terminal = scan->observation;
+			fields[0] = (uint32)origin;
+			fields[1] = xid;
+			fields[2] = result.native_base.page_number;
+			for (unsigned f = 0; f < 3; f++)
+				for (unsigned i = 0; i < 4; i++)
+					identity[f * 4 + i] = (uint8)(fields[f] >> (8 * i));
+			identity[12] = result.native_base.status;
+			hash = pg_cryptohash_create(PG_SHA256);
+			if (hash != NULL && pg_cryptohash_init(hash) == 0
+				&& pg_cryptohash_update(hash, domain, sizeof(domain)) == 0
+				&& pg_cryptohash_update(hash, result.terminal.fingerprint, 32) == 0
+				&& pg_cryptohash_update(hash, identity, sizeof(identity)) == 0
+				&& pg_cryptohash_update(hash, result.native_base.image, BLCKSZ) == 0
+				&& pg_cryptohash_final(hash, result.fingerprint, 32) == 0
+				&& terminal_scan_current(scan)
+				&& cluster_undo_recovery_cold_source_matches_v1(
+					&scan->selected.source, &scan->selected.checkpoint, scan->selected.native_redo))
+				accepted = true;
+		}
+	}
+	PG_CATCH();
+	{
+		if (hash != NULL)
+			pg_cryptohash_free(hash);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (hash != NULL)
+		pg_cryptohash_free(hash);
+	if (!accepted)
+		return false;
+	scan->failed = false;
+	*out = result;
+	return true;
+}
+
 bool
 cluster_relmap_recovery_terminal_scan_get_v1(ClusterRelmapTerminalScanV1 *scan,
 											 ClusterRelmapTerminalObservationV1 *out)
 {
-	const ClusterWalInputV1 *current;
 	if (scan != NULL && out != NULL) {
 		uintptr_t a = (uintptr_t)scan, b = (uintptr_t)out;
 		if ((a <= b && b - a < sizeof(*scan)) || (b <= a && a - b < sizeof(*out)))
@@ -277,11 +367,7 @@ cluster_relmap_recovery_terminal_scan_get_v1(ClusterRelmapTerminalScanV1 *scan,
 		return false;
 	/* Sticky even if the original owner throws; no local hash/FD is held. */
 	scan->failed = true;
-	if (cluster_wal_inputs_revalidate_v1(scan->inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
-		|| cluster_wal_inputs_count_v1(scan->inputs) != scan->count)
-		return false;
-	current = cluster_wal_inputs_at_v1(scan->inputs, scan->index);
-	if (current == NULL || memcmp(current, &scan->selected, sizeof(*current)) != 0)
+	if (!terminal_scan_current(scan))
 		return false;
 	*out = scan->observation;
 	scan->failed = false;
@@ -298,4 +384,5 @@ cluster_relmap_recovery_terminal_scan_release_v1(ClusterRelmapTerminalScanV1 **s
 	*scan = NULL;
 	terminal_scan_free(old);
 }
+
 #endif
