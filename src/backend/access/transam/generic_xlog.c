@@ -24,6 +24,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_page_cold_redo.h"
 #include "cluster/cluster_space_storage.h"
+#include "common/cryptohash.h"
 #endif
 
 /*-------------------------------------------------------------------------
@@ -507,17 +508,14 @@ GenericXLogRecoveryImagePrepare(GenericXLogInternalOwner owner,
 	return true;
 }
 
-bool
-GenericXLogRecoveryImageRegister(GenericXLogRecoveryImageV1 *image)
+static bool
+genericXLogRecoveryImageValid(const GenericXLogRecoveryImageV1 *image)
 {
-	RfPageProducerBatchV1 batch;
 	RfPageVersionEdgeEntryV1 expected;
 	const PageHeaderData *header;
 	uint8 encoded_identity[CLUSTER_SPACE_IDENTITY_BYTES];
 
-	/* Payload registration only. The actual owner begins the native record
-	 * and records F4 INSERTING before entering this critical section. */
-	if (image == NULL || CritSectionCount == 0
+	if (image == NULL
 		|| (image->owner != GENERIC_XLOG_CTRC_ITL && image->owner != GENERIC_XLOG_CTRC_MX)
 		|| image->identity.state != CLUSTER_SPACE_IDENTITY_LIVE
 		|| image->fork_number != MAIN_FORKNUM || image->block_number == InvalidBlockNumber
@@ -539,6 +537,67 @@ GenericXLogRecoveryImageRegister(GenericXLogRecoveryImageV1 *image)
 	for (uint16 pos = header->pd_lower; pos < header->pd_upper; pos++)
 		if (image->image.data[pos] != 0)
 			return false;
+	return true;
+}
+
+bool
+GenericXLogRecoveryImageDescribe(const GenericXLogRecoveryImageV1 *image,
+	GenericXLogRecoveryImageDescriptorV1 *out)
+{
+	GenericXLogRecoveryImageDescriptorV1 value;
+	pg_cryptohash_ctx *hash;
+	bool ok;
+
+	if (CritSectionCount != 0 || out == NULL || !genericXLogRecoveryImageValid(image)
+		|| genericXLogImageRangesOverlap(out, sizeof(*out), image, sizeof(*image)))
+		return false;
+	memset(&value, 0, sizeof(value));
+	if (!cluster_space_identity_encode(&image->identity, value.space_identity,
+									   sizeof(value.space_identity)))
+		return false;
+	hash = pg_cryptohash_create(PG_SHA256);
+	if (hash == NULL)
+		return false;
+	ok = pg_cryptohash_init(hash) == 0
+		 && pg_cryptohash_update(hash, (const uint8 *)image->image.data, BLCKSZ) == 0
+		 && pg_cryptohash_final(hash, value.after_sha256, sizeof(value.after_sha256)) == 0;
+	pg_cryptohash_free(hash);
+	if (!ok)
+		return false;
+	value.owner = image->owner;
+	value.fork_number = image->fork_number;
+	value.block_number = image->block_number;
+	value.result_token = image->result_token;
+	value.version = image->version;
+	*out = value;
+	return true;
+}
+
+bool
+GenericXLogRecoveryImageMatchesDescriptor(const GenericXLogRecoveryImageV1 *image,
+	const GenericXLogRecoveryImageDescriptorV1 *descriptor)
+{
+	GenericXLogRecoveryImageDescriptorV1 value;
+
+	return descriptor != NULL && GenericXLogRecoveryImageDescribe(image, &value)
+		&& value.owner == descriptor->owner
+		&& value.fork_number == descriptor->fork_number
+		&& value.block_number == descriptor->block_number
+		&& value.result_token == descriptor->result_token
+		&& memcmp(value.space_identity, descriptor->space_identity, sizeof(value.space_identity)) == 0
+		&& memcmp(&value.version, &descriptor->version, sizeof(value.version)) == 0
+		&& memcmp(value.after_sha256, descriptor->after_sha256, sizeof(value.after_sha256)) == 0;
+}
+
+bool
+GenericXLogRecoveryImageRegister(GenericXLogRecoveryImageV1 *image)
+{
+	RfPageProducerBatchV1 batch;
+
+	/* Payload registration only. The actual owner begins the native record
+	 * and records F4 INSERTING before entering this critical section. */
+	if (CritSectionCount == 0 || !genericXLogRecoveryImageValid(image))
+		return false;
 	memset(&batch, 0, sizeof(batch));
 	batch.result_token = image->result_token;
 	batch.entry_count = 1;

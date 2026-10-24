@@ -2555,11 +2555,12 @@ test_cluster_generic_redo: test_cluster_generic_redo.c unit_test.h \
 test_cluster_generic_version: test_cluster_generic_version.c unit_test.h \
 		$(top_srcdir)/src/include/access/generic_xlog.h \
 		test_cluster_generic_product.o test_cluster_space_storage_product.o test_cluster_space_producer_product.o \
-		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_generic_product.o \
 		test_cluster_space_storage_product.o test_cluster_space_producer_product.o \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
-		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 test_cluster_space_copy_buffer.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^RelationCopyStorageUsingBuffer\(/ { print "static void"; emit=1; count++ } \
@@ -9862,6 +9863,7 @@ test_cluster_recovery_tt_io: test_cluster_recovery_tt_io.c unit_test.h \
 
 # PGRAC: real shared stamp owner; immutable claim shape code is linked unchanged.
 test_cluster_recovery_stamp: test_cluster_recovery_stamp.c unit_test.h \
+		$(top_srcdir)/src/include/access/generic_xlog.h \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
         $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
@@ -9929,6 +9931,9 @@ test_cluster_checkpoint_stamp: test_cluster_checkpoint_stamp.c test_cluster_reco
         $(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
         $(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
         $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+test_cluster_recovery_stamp test_cluster_recovery_stamp_exit test_cluster_checkpoint_stamp: \
+		$(top_srcdir)/src/include/access/generic_xlog.h
 
 # Original retained-input owner and installed native writer, without I/O grants.
 test_cluster_cold_tx_owner.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile

@@ -545,6 +545,63 @@ UT_TEST(test_recovery_full_image_frame_uses_native_block_without_publication)
 	}
 }
 
+UT_TEST(test_recovery_frame_descriptor_retains_exact_target_version_and_digest)
+{
+	GenericXLogRecoveryImageV1 frame, saved;
+	GenericXLogRecoveryImageDescriptorV1 descriptor, again;
+	PGAlignedBlock changed;
+	uint8 identity[CLUSTER_SPACE_IDENTITY_BYTES];
+	reset();
+	changed = pages[0];
+	changed.data[SizeOfPageHeaderData] = 77;
+	UT_ASSERT(GenericXLogRecoveryImagePrepare(GENERIC_XLOG_CTRC_ITL, &identities[0],
+		MAIN_FORKNUM, 7, pages[0].data, changed.data, &frame));
+	saved = frame;
+	UT_ASSERT(GenericXLogRecoveryImageDescribe(&frame, &descriptor));
+	UT_ASSERT(GenericXLogRecoveryImageDescribe(&frame, &again));
+	UT_ASSERT(memcmp(&descriptor, &again, sizeof(descriptor)) == 0);
+	UT_ASSERT(cluster_space_identity_encode(&identities[0], identity, sizeof(identity)));
+	UT_ASSERT(memcmp(descriptor.space_identity, identity, sizeof(identity)) == 0);
+	UT_ASSERT_EQ(descriptor.owner, GENERIC_XLOG_CTRC_ITL);
+	UT_ASSERT_EQ(descriptor.fork_number, MAIN_FORKNUM);
+	UT_ASSERT_EQ(descriptor.block_number, 7);
+	UT_ASSERT_EQ(descriptor.result_token, frame.result_token);
+	UT_ASSERT(memcmp(&descriptor.version, &frame.version, sizeof(frame.version)) == 0);
+	UT_ASSERT(GenericXLogRecoveryImageMatchesDescriptor(&frame, &descriptor));
+	frame.image.data[SizeOfPageHeaderData] ^= 1;
+	UT_ASSERT(!GenericXLogRecoveryImageMatchesDescriptor(&frame, &descriptor));
+	frame = saved;
+	frame.block_number++;
+	UT_ASSERT(!GenericXLogRecoveryImageMatchesDescriptor(&frame, &descriptor));
+	frame = saved;
+	descriptor.after_sha256[31] ^= 1;
+	UT_ASSERT(!GenericXLogRecoveryImageMatchesDescriptor(&frame, &descriptor));
+	UT_ASSERT(memcmp(&frame, &saved, sizeof(frame)) == 0);
+	UT_ASSERT_EQ(raw_blocks + inserts + dirties, 0);
+}
+
+UT_TEST(test_recovery_descriptor_requires_valid_image_outside_insertion)
+{
+	GenericXLogRecoveryImageV1 frame;
+	GenericXLogRecoveryImageDescriptorV1 descriptor, saved;
+	reset();
+	UT_ASSERT(GenericXLogRecoveryImagePrepare(GENERIC_XLOG_CTRC_MX, &identities[0],
+		MAIN_FORKNUM, 7, pages[0].data, pages[0].data, &frame));
+	memset(&descriptor, 0xa5, sizeof(descriptor));
+	saved = descriptor;
+	CritSectionCount++;
+	UT_ASSERT(!GenericXLogRecoveryImageDescribe(&frame, &descriptor));
+	CritSectionCount--;
+	UT_ASSERT(memcmp(&descriptor, &saved, sizeof(descriptor)) == 0);
+	frame.version.before.mutation_token = 0;
+	UT_ASSERT(!GenericXLogRecoveryImageDescribe(&frame, &descriptor));
+	UT_ASSERT(memcmp(&descriptor, &saved, sizeof(descriptor)) == 0);
+	UT_ASSERT(!GenericXLogRecoveryImageDescribe(NULL, &descriptor));
+	UT_ASSERT(!GenericXLogRecoveryImageDescribe(&frame, NULL));
+	UT_ASSERT(!GenericXLogRecoveryImageMatchesDescriptor(&frame, NULL));
+	UT_ASSERT_EQ(raw_blocks + inserts + dirties, 0);
+}
+
 UT_TEST(test_recovery_frame_refuses_bad_inputs_before_token_or_registration)
 {
 	for (unsigned fault = 0; fault < 9; fault++) {
@@ -618,7 +675,7 @@ UT_TEST(test_recovery_frame_output_overlap_leaves_both_images_unchanged)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(14);
 	UT_RUN(test_delta_carries_result_version);
 	UT_RUN(test_multiple_relations_share_one_batch_token);
 	UT_RUN(test_abort_preserves_all_page_bytes);
@@ -628,6 +685,8 @@ main(void)
 	UT_RUN(test_second_page_drift_refuses_before_any_publication);
 	UT_RUN(test_all_three_internal_owners_and_duplicate_registration);
 	UT_RUN(test_recovery_full_image_frame_uses_native_block_without_publication);
+	UT_RUN(test_recovery_frame_descriptor_retains_exact_target_version_and_digest);
+	UT_RUN(test_recovery_descriptor_requires_valid_image_outside_insertion);
 	UT_RUN(test_recovery_frame_refuses_bad_inputs_before_token_or_registration);
 	UT_RUN(test_recovery_frame_registration_rejects_bad_metadata_before_native_calls);
 	UT_RUN(test_recovery_frame_output_overlap_leaves_both_images_unchanged);
