@@ -260,6 +260,25 @@ typedef struct ClusterRelmapCensusRecoveryBatch ClusterRelmapCensusRecoveryBatch
 extern bool cluster_relmap_retention_census_recovery_prepare_all(
 	ClusterRelmapRetentionCensus *census, struct ClusterWalInputsV1 *inputs, size_t memory_budget,
 	ClusterRelmapCensusRecoveryBatch **out);
+/* Execution-owner variant after pass-1 read pins are gone. Only an original
+ * complete single-origin census is supported. Prepare every actual pending
+ * pair through that same original cold source/full control ROOT/redo/serial;
+ * retain ALL original pins, including unused slots. No namespace list, new
+ * read pin or scope is accepted. A final whole physical ROOT pass follows
+ * all native preparations before one opaque output publication.
+ *
+ * Unsupported multiple origins/missing initial ownership/before DRAINED
+ * leave the scan unconsumed. Empty pending refuses, never cold completion.
+ * Known census/directory/ROOT-pointer aliases stay unchanged; distinct false
+ * clears output. Entered refusal/ERROR frees every new handle, invalidates
+ * old observations and preserves original pins/debt; ERROR propagates.
+ * Budget covers local batch/provenance/items, not native handle allocations.
+ * Original complete qualifications and all borrowed lifetimes above remain
+ * caller obligations. No arbitration/COMPLETE/release/live authority follows. */
+extern bool
+cluster_relmap_retention_census_recovery_prepare_all_cold(ClusterRelmapRetentionCensus *census,
+														  size_t memory_budget,
+														  ClusterRelmapCensusRecoveryBatch **out);
 extern void
 cluster_relmap_retention_census_recovery_batch_release(ClusterRelmapCensusRecoveryBatch **batch);
 
@@ -276,6 +295,24 @@ cluster_relmap_retention_census_recovery_batch_release(ClusterRelmapCensusRecove
  * CLEARED_POSTREAD concerns only these pairs, never directory COMPLETE,
  * global floor/issued, G_ref/owner completion, pin release or activation. */
 extern ClusterRelmapV2ClearResult cluster_relmap_retention_census_recovery_arbitrate_all(
+	ClusterRelmapCensusRecoveryBatch **batch);
+/* Consume only the execution-owner batch once. Fresh exclusive custody
+ * pointer, disjoint from every borrowed object and batch storage; known
+ * aliases refuse unchanged. Wrong retained/execution entry cancels local
+ * custody only. Missing initial ownership also leaves observations alone.
+ * Otherwise freshly recheck whole physical ROOT and original source/full
+ * control ROOT/redo/serial/metadata/ALL pins. Revoke old observations before
+ * first native attempt; recheck original source/metadata/pins/ownership
+ * before/after EVERY normal native return, including UNKNOWN. Stop on the
+ * first UNKNOWN/ERROR, release all local custody; old pins/debt remain.
+ *
+ * Only all native CLEAR plus final original checks and normal cleanup enable
+ * the existing one-shot reobserve_cold/restart_cold follow-on. Earlier target
+ * writes may be durable; refusal/ERROR permits no retry or scope replacement.
+ * This grants no directory COMPLETE, native/all-origin/G_ref/owner completion,
+ * old pin retirement, D0, allocator/live or v2 activation. Original owner/
+ * source/cuts/fd/census/directories/pins outlive batch and every follow-on. */
+extern ClusterRelmapV2ClearResult cluster_relmap_retention_census_recovery_arbitrate_all_cold(
 	ClusterRelmapCensusRecoveryBatch **batch);
 
 /* Same single-use window and provisional structural result. When either copy

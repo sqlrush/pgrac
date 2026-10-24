@@ -973,11 +973,20 @@ UT_TEST(test_root_rebuild_preserves_existing_proofs_and_exact_pins)
 #include "test_cluster_relmap_census_cold_consume.inc"
 #include "test_cluster_relmap_census_cold_reobserve.inc"
 #include "test_cluster_relmap_census_cold_restart.inc"
+#include "test_cluster_relmap_census_execution_batch.inc"
 
 int
 main(void)
 {
-	UT_PLAN(81);
+	UT_PLAN(89);
+	UT_RUN(test_execution_batch_all_pending_then_one_fresh_census_keeps_old_debt);
+	UT_RUN(test_execution_batch_initial_gates_unsupported_and_empty_do_not_complete);
+	UT_RUN(test_execution_batch_late_native_source_or_root_failure_releases_every_handle);
+	UT_RUN(test_execution_batch_unknown_or_error_stops_and_cannot_seed_observation);
+	UT_RUN(test_execution_batch_checks_after_last_clear_and_unknown_including_error);
+	UT_RUN(test_execution_batch_preflight_whole_root_source_and_all_pins_are_current);
+	UT_RUN(test_execution_batch_wrong_consumer_cancels_only_local_custody);
+	UT_RUN(test_execution_batch_known_aliases_and_null_custody_preserve_borrowed_storage);
 	UT_RUN(test_census_restart_new_physical_census_restores_remaining_pin);
 	UT_RUN(test_census_restart_initial_gates_and_multi_origin_preserve_follow_on);
 	UT_RUN(test_census_restart_checkpoint_range_serial_and_builder_error_refuse_once);
