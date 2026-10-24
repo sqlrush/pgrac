@@ -4614,7 +4614,7 @@ exercise_original_producer_retention_lifecycle(bool applied)
 	ClusterCtrcOriginCertificateSnapshot certificate = { 0 };
 	ClusterCtrcCloseDispatch dispatch = { 0 };
 	ClusterCtrcSealReplyResult reply;
-	ClusterCtrcActiveScan retained, fresh;
+	ClusterCtrcActiveScan retained, fresh, registration_cut, retirement_cut;
 	ClusterSemanticActiveSampleFence source;
 	FullTransactionId original, reference = FullTransactionIdFromEpochAndXid(9, 10000);
 	uint32 grant;
@@ -4629,6 +4629,15 @@ exercise_original_producer_retention_lifecycle(bool applied)
 	test_top_full = original;
 	pg_atomic_write_u64(&test_my_proc.cluster_top_full_xid_atomic,
 						U64FromFullTransactionId(original));
+	/* Pause the real cursor before any entry, then publish through the
+	 * original reservation/receipt owners before retiring PGPROC. */
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&registration_cut, reference));
+	conditional_refuse_call = conditional_calls + 1;
+	cluster_ctrc_active_scan_step_source(&registration_cut, &source);
+	UT_ASSERT_EQ(registration_cut.status, CTRC_ACTIVE_SCAN_INCOMPLETE);
+	UT_ASSERT(registration_cut.lock_busy);
+	UT_ASSERT_EQ(registration_cut.next_index, 0);
+	conditional_refuse_call = 0;
 	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &reservation),
 				 CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
 	origin = &ctrc_origin_entries()[reservation.origin_index];
@@ -4653,6 +4662,28 @@ exercise_original_producer_retention_lifecycle(bool applied)
 	test_my_proc.xid = InvalidTransactionId;
 	test_top_full = InvalidFullTransactionId;
 	pg_atomic_write_u64(&test_my_proc.cluster_top_full_xid_atomic, 0);
+	finish_source_active_scan(&registration_cut, &source);
+	UT_ASSERT_EQ(registration_cut.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(registration_cut.unqualified_entries, 0);
+	UT_ASSERT(cluster_ctrc_active_scan_registration_current(&registration_cut));
+	UT_ASSERT(FullTransactionIdEquals(registration_cut.min_full, original));
+	/* Pause immediately after this origin entry was sampled.  Its original
+	 * minimum must survive receipt cleanup and final source retirement. */
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&retirement_cut, reference));
+	while (reservation.origin_index - retirement_cut.next_index
+		   >= CLUSTER_CTRC_ACTIVE_SCAN_SLICE)
+		cluster_ctrc_active_scan_step_source(&retirement_cut, &source);
+	conditional_refuse_call = conditional_calls
+		+ (reservation.origin_index - retirement_cut.next_index) + 2;
+	do {
+		cluster_ctrc_active_scan_step_source(&retirement_cut, &source);
+	} while (retirement_cut.status == CTRC_ACTIVE_SCAN_INCOMPLETE
+			 && !retirement_cut.lock_busy);
+	UT_ASSERT_EQ(retirement_cut.status, CTRC_ACTIVE_SCAN_INCOMPLETE);
+	UT_ASSERT(retirement_cut.lock_busy);
+	UT_ASSERT_EQ(retirement_cut.next_index, reservation.origin_index + 1);
+	UT_ASSERT(FullTransactionIdEquals(retirement_cut.min_full, original));
+	conditional_refuse_call = 0;
 	UT_ASSERT(cluster_ctrc_origin_begin_seal_shared(&key));
 	if (applied) {
 		ClusterCtrcTargetV1 target = handle.receipt->target;
@@ -4759,6 +4790,11 @@ exercise_original_producer_retention_lifecycle(bool applied)
 	UT_ASSERT(cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id,
 																 identity.node_id, reply));
 	UT_ASSERT(ctrc_bytes_zero(origin, sizeof(*origin)));
+	finish_source_active_scan(&retirement_cut, &source);
+	UT_ASSERT_EQ(retirement_cut.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(retirement_cut.unqualified_entries, 0);
+	UT_ASSERT(cluster_ctrc_active_scan_registration_current(&retirement_cut));
+	UT_ASSERT(FullTransactionIdEquals(retirement_cut.min_full, original));
 	/* A completed observation stays conservative after retirement; only a
 	 * fresh full cover can advance to the original reference. */
 	UT_ASSERT(cluster_ctrc_active_scan_registration_current(&retained));
