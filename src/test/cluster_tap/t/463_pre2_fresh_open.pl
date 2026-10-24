@@ -20,12 +20,16 @@ run_scenario('pre2_fresh_open', [], sub {
 			"fresh node $i is SQL-ready after OPEN");
 	}
 	# The first shared DDL must also acquire and activate its first TT segment.
-	# This catches a sealed disk header differing from its resident predecessor.
-	sql($nodes[0], 'CREATE TABLE pre2_first_bind (id integer PRIMARY KEY)');
+	# Catalog writes exercise BIND followed by record-segment activation;
+	# later transactions also exercise terminal stamps on that resident page.
+	sql($nodes[0], 'CREATE TABLE pre2_first_bind (id integer PRIMARY KEY, payload text NOT NULL)');
 	require_equal(sql($nodes[0], 'SELECT count(*) FROM pre2_first_bind'), '0',
 		'first shared DDL commits after fresh OPEN');
-	sql($nodes[0], 'INSERT INTO pre2_first_bind VALUES (1)');
+	sql($nodes[0], q{INSERT INTO pre2_first_bind VALUES (1, 'first')});
 	require_equal(sql($nodes[0], 'SELECT id FROM pre2_first_bind'), '1',
 		'first shared INSERT commits after fresh OPEN');
+	sql($nodes[0], q{INSERT INTO pre2_first_bind VALUES (2, 'second')});
+	require_equal(sql($nodes[0], 'SELECT count(*) FROM pre2_first_bind'), '2',
+		'next transaction remains writable after its predecessor commit stamp');
 	$cluster->stop_cluster;
 });

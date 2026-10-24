@@ -1288,6 +1288,18 @@ UT_TEST(test_block0_provision_absent_creator_publishes_after_wal_flush)
 	/* The first lifecycle mutation compares the physical and resident pages.
 	 * A private INIT image with checksum zero cannot replace the sealed file. */
 	UT_ASSERT_EQ(memcmp(copied, smgr_written_image, BLCKSZ), 0);
+	/* A subsequent current writer must pin the exact published bytes too. */
+	{
+		ClusterUndoBlock0Generation expected = pin.observed_generation;
+
+		page = NULL;
+		UT_ASSERT_EQ(cluster_undo_block0_pin(&logical, &root, &expected,
+						 CLUSTER_UNDO_BLOCK0_EXCLUSIVE, &proof, &pin, &page),
+			CLUSTER_UNDO_BLOCK0_OK);
+		UT_ASSERT_NOT_NULL(page);
+		UT_ASSERT_EQ(memcmp(page, smgr_written_image, BLCKSZ), 0);
+		cluster_undo_block0_unpin(&pin);
+	}
 }
 
 UT_TEST(test_block0_provision_eexist_loser_installs_exact_winner_image)
@@ -1701,6 +1713,9 @@ UT_TEST(test_block0_flush_publishes_successor_generation)
 	UT_ASSERT(cluster_undo_segment_header_seal(sealed.data));
 	UT_ASSERT_EQ(memcmp(copied, sealed.data, BLCKSZ), 0);
 	UT_ASSERT_EQ(memcmp(copied, smgr_written_image, BLCKSZ), 0);
+	/* Resident and smgr each seal their private copy of the same image. */
+	UT_ASSERT(cluster_undo_segment_header_seal(sealed.data));
+	UT_ASSERT_EQ(memcmp(copied, sealed.data, BLCKSZ), 0);
 }
 
 UT_TEST(test_block0_flush_failure_preserves_resident_predecessor_and_dirty_lsn)

@@ -116,7 +116,7 @@ select_physical_fixture(uint32 segment)
 	UndoSegmentHeaderData *disk = (UndoSegmentHeaderData *)g_canned_block;
 
 	g_current_segment = g_canned_block_segment = segment;
-	memset(g_canned_block, 0, BLCKSZ);
+	cluster_undo_segment_make_header_bytes(segment, 1, g_canned_block);
 	disk->segment_id = segment;
 	disk->owner_instance = 1;
 	disk->tt_slots_count = TT_SLOTS_PER_SEGMENT;

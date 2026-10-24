@@ -75,6 +75,7 @@ scn_time_cmp(SCN a, SCN b)
 }
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_undo_segment.h"
+#include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_alloc.h" /* spec-3.22: file_exists prototype */
 #include "cluster/storage/cluster_undo_block0_current.h"
@@ -553,6 +554,7 @@ static int g_read_hdr_calls = 0;
 static int g_read_hdr_fail_on_call = 0;
 
 static char g_canned_block[BLCKSZ];		  /* returned by read_block for segment 1 */
+static bool g_sealed_header_io;
 static uint32 g_canned_block_segment = 1; /* which segment_id the canned block answers */
 static bool g_read_block_ok = true;
 static int g_read_block_calls = 0;
@@ -863,6 +865,11 @@ cluster_undo_smgr_write_header_bytes(ClusterUndoPathIntent intent pg_attribute_u
 		return false;
 	if (buf != NULL && len == sizeof(TTSlot))
 		memcpy(&g_last_written_slot, buf, sizeof(TTSlot));
+	if (g_sealed_header_io && g_write_hdr_ok && buf != NULL && len == sizeof(TTSlot)) {
+		UT_ASSERT((uint64)offset + len <= BLCKSZ);
+		memcpy(g_canned_block + offset, buf, len);
+		UT_ASSERT(cluster_undo_segment_header_seal(g_canned_block));
+	}
 	return g_write_hdr_ok && buf != NULL && len == sizeof(TTSlot);
 }
 
@@ -983,6 +990,7 @@ mock_xid_committed(TransactionId xid)
 static void
 reset_header_read_mock(void)
 {
+	g_sealed_header_io = false;
 	g_read_hdr_ok = true;
 	g_read_hdr_second_enabled = false;
 	g_read_hdr_calls = 0;
@@ -1009,6 +1017,7 @@ reset_current_write_mock(void)
 	g_current_segment = 1;
 	g_canned_block_segment = 1;
 	g_write_hdr_ok = true;
+	g_sealed_header_io = false;
 	g_write_hdr_calls = 0;
 	memset(&g_last_written_slot, 0, sizeof(g_last_written_slot));
 	g_current_root = (ClusterUndoBlock0ResolvedRoot){
@@ -1018,7 +1027,8 @@ reset_current_write_mock(void)
 	};
 	g_current_generation = (ClusterUndoBlock0Generation){ true, 4 };
 	memset(g_current_resident, 0, sizeof(g_current_resident));
-	memset(g_canned_block, 0, sizeof(g_canned_block));
+	cluster_undo_segment_make_header_bytes(1, 1, g_canned_block);
+	memcpy(g_current_resident, g_canned_block, BLCKSZ);
 	g_read_block_ok = true;
 	g_read_block_calls = 0;
 	g_allocator_owner = (ClusterTTSlotCurrentOwner){
@@ -1148,6 +1158,36 @@ seed_current_exact_active(uint16 slot_offset, TransactionId xid, uint16 wrap)
 	g_allocator_owner.wrap = wrap;
 	g_allocator_owner.status = CTS_ACTIVE;
 	g_allocator_owner.commit_scn = InvalidScn;
+}
+
+/* Model the storage owner's whole-page seal, rather than only its slot write.
+ * The publisher itself is the linked production implementation. */
+static void
+enable_sealed_header_io(void)
+{
+	PGAlignedBlock initialized;
+
+	cluster_undo_segment_make_header_bytes(g_canned_block_segment, 1, initialized.data);
+	memcpy(g_canned_block, initialized.data, SizeOfPageHeaderData);
+	UT_ASSERT(cluster_undo_segment_header_seal(g_canned_block));
+	memcpy(g_current_resident, g_canned_block, BLCKSZ);
+	g_sealed_header_io = true;
+}
+
+static void
+assert_sealed_resident_matches_disk(void)
+{
+	Size checksum_offset = offsetof(PageHeaderData, pd_checksum);
+	Size after_checksum = checksum_offset + sizeof(uint16);
+
+	/* Pinpoint the regression: the slot and every non-checksum byte agree. */
+	UT_ASSERT_EQ(memcmp(g_canned_block, g_current_resident, checksum_offset), 0);
+	UT_ASSERT_EQ(memcmp(g_canned_block + after_checksum,
+					 g_current_resident + after_checksum, BLCKSZ - after_checksum), 0);
+	UT_ASSERT_EQ(memcmp(g_canned_block, g_current_resident, BLCKSZ), 0);
+	UT_ASSERT_EQ(cluster_undo_segment_header_integrity(g_current_resident),
+		CLUSTER_UNDO_HEADER_VALID);
+	g_sealed_header_io = false;
 }
 
 
@@ -1637,6 +1677,7 @@ UT_TEST(test_active_publish_wal_precedes_identical_disk_and_resident_successor)
 	disk->tt_slots_count = TT_SLOTS_PER_SEGMENT;
 	disk->wrap_count = 4;
 	memcpy(resident, disk, BLCKSZ);
+	enable_sealed_header_io();
 
 	lsn = cluster_tt_slot_durable_publish_active(&g_allocator_owner, &admission, &generation,
 												 &successor);
@@ -1657,6 +1698,7 @@ UT_TEST(test_active_publish_wal_precedes_identical_disk_and_resident_successor)
 	UT_ASSERT(UBA_is_invalid(successor.first_undo_block));
 	UT_ASSERT_EQ(memcmp(&successor, &g_last_written_slot, sizeof(successor)), 0);
 	UT_ASSERT_EQ(memcmp(&successor, &resident->tt_slots[7], sizeof(successor)), 0);
+	assert_sealed_resident_matches_disk();
 	UT_ASSERT_EQ(g_allocator_owner_calls, 3);
 	UT_ASSERT_EQ(g_current_recheck_calls, 1);
 	UT_ASSERT_EQ(g_ctrc_reserve_calls, 1);
@@ -2243,6 +2285,7 @@ UT_TEST(test_commit_stage_then_apply_publishes_identical_durable_and_resident_su
 
 	reset_current_write_mock();
 	seed_current_exact_active(7, 100, 5);
+	enable_sealed_header_io();
 	memset(&successor, 0xa5, sizeof(successor));
 
 	owner = cluster_tt_slot_durable_commit_stage(1, 4, 7, 100, 5, scn_encode(1, 42), &admission,
@@ -2259,6 +2302,7 @@ UT_TEST(test_commit_stage_then_apply_publishes_identical_durable_and_resident_su
 	UT_ASSERT_EQ(CritSectionCount, 0);
 	UT_ASSERT_EQ(memcmp(&successor, &g_last_written_slot, sizeof(successor)), 0);
 	UT_ASSERT_EQ(memcmp(&resident->tt_slots[7], &successor, sizeof(successor)), 0);
+	assert_sealed_resident_matches_disk();
 	UT_ASSERT(cluster_tt_durable_slot_match(successor.status, successor.xid, successor.wrap,
 											successor.commit_scn, 100, 5));
 	UT_ASSERT(!cluster_tt_slot_durable_commit_staged(1, 7, 100, 5));
@@ -2839,6 +2883,7 @@ UT_TEST(test_ordinary_abort_flushes_exact_carrier_before_terminal_write)
 
 	reset_current_write_mock();
 	seed_current_exact_active(7, 100, 5);
+	enable_sealed_header_io();
 	g_require_abort_flush_before_write = true;
 	memset(&successor, 0xa5, sizeof(successor));
 
@@ -2854,6 +2899,7 @@ UT_TEST(test_ordinary_abort_flushes_exact_carrier_before_terminal_write)
 	UT_ASSERT_EQ(successor.wrap, 5);
 	UT_ASSERT(!SCN_VALID(successor.commit_scn));
 	UT_ASSERT_EQ(memcmp(&resident->tt_slots[7], &successor, sizeof(successor)), 0);
+	assert_sealed_resident_matches_disk();
 	UT_ASSERT_EQ(g_current_acquire_calls, 2);
 	UT_ASSERT_EQ(g_current_cancel_calls, 2);
 }

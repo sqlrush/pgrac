@@ -7162,11 +7162,13 @@ test_cluster_uba: test_cluster_uba.c unit_test.h \
 # closed) is exercised end-to-end without postmaster.
 CLUSTER_TT_SLOT_O = $(top_builddir)/src/backend/cluster/cluster_tt_slot.o
 CLUSTER_TT_DURABLE_O = $(top_builddir)/src/backend/cluster/cluster_tt_durable.o
+$(CLUSTER_TT_DURABLE_O): $(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h
 
 # spec-3.11 D2/D9: test_cluster_tt_durable — pure decision predicates
 # (redo wrap table / slot match) + lookup / by-xid scan with a mocked
 # cluster_undo_smgr.  File-I/O behavior is e2e in cluster_tap t/219.
 test_cluster_tt_durable: test_cluster_tt_durable.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
 		$(CLUSTER_TT_DURABLE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_TT_DURABLE_O) \

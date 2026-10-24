@@ -53,6 +53,7 @@
 #include "cluster/cluster_tt_slot.h" /* TTSlot, TT_SLOT_COMMITTED, TT_SLOTS_PER_SEGMENT */
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_undo_segment.h"		/* UndoSegmentHeaderData */
+#include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_undo_smgr.h"			/* header-bytes + block I/O */
 #include "cluster/storage/cluster_undo_alloc.h" /* CLUSTER_UNDO_SEGS_PER_INSTANCE */
 #include "cluster/storage/cluster_undo_block0_current.h"
@@ -65,6 +66,19 @@ tt_slot_file_offset(uint16 slot_offset)
 {
 	return (uint32)offsetof(UndoSegmentHeaderData, tt_slots)
 		   + (uint32)slot_offset * (uint32)sizeof(TTSlot);
+}
+
+/* The storage owner persists a sealed whole page even for a slot write.
+ * Mirror its checksum while the original content-X pin is still held, so
+ * the next lifecycle writer sees the same physical predecessor. */
+static void
+tt_slot_install_resident(UndoSegmentHeaderData *resident, uint16 slot_offset,
+						 const TTSlot *successor)
+{
+	memcpy(&resident->tt_slots[slot_offset], successor, sizeof(*successor));
+	if (!cluster_undo_segment_header_seal(resident))
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cannot seal canonical TT resident header")));
 }
 
 /*
@@ -638,8 +652,7 @@ cluster_tt_slot_durable_publish_active(const ClusterTTSlotCurrentOwner *expected
 								errmsg("cannot write canonical ACTIVE TT slot")));
 			}
 			cluster_tt_durable_io_wait_end();
-			memcpy(&resident_header->tt_slots[expected_owner->slot_offset], &successor,
-				   sizeof(successor));
+			tt_slot_install_resident(resident_header, expected_owner->slot_offset, &successor);
 		}
 
 		if (!(target_side ? cluster_semantic_activation_resolve_shared_undo_root(
@@ -1282,7 +1295,7 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation, uin
 								errmsg("cannot write canonical terminal TT slot")));
 			}
 			cluster_tt_durable_io_wait_end();
-			memcpy(&resident_header->tt_slots[slot_offset], &successor, sizeof(successor));
+			tt_slot_install_resident(resident_header, slot_offset, &successor);
 		}
 
 		memset(&final_root, 0, sizeof(final_root));
@@ -1422,7 +1435,7 @@ cluster_tt_slot_durable_commit_apply(XLogRecPtr commit_end)
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not write canonical TT commit stamp of undo segment %u: %m",
 							   stage->segment_id)));
-	memcpy(&resident->tt_slots[stage->slot_offset], &stage->successor, sizeof(TTSlot));
+	tt_slot_install_resident(resident, stage->slot_offset, &stage->successor);
 	cluster_undo_block0_unpin(&stage->pin);
 	tt_commit_stage_clear(stage);
 	cluster_tt_durable_count_commit();
