@@ -269,6 +269,7 @@ with_cohort('e1_pre2_crash_462', 0, sub {
 	my ($cluster) = @_;
 	seed_committed($cluster);
 	my @sessions;
+	my @loser_xids;
 	my @nodes = $cluster->nodes;
 	for my $i (0 .. $#nodes)
 	{
@@ -276,12 +277,25 @@ with_cohort('e1_pre2_crash_462', 0, sub {
 		$session->query_safe('BEGIN');
 		my $id = 1001 + $i;
 		$session->query_safe("INSERT INTO e1_reconcile VALUES ($id, 'uncommitted-$id')");
+		my $fullxid = $session->query_safe('SELECT pg_current_xact_id_if_assigned()::text');
+		die "node$i loser has no assigned FullXid" unless $fullxid =~ /\A[1-9][0-9]*\z/;
+		push @loser_xids, $fullxid;
 		push @sessions, $session;
 	}
 	pass('all four members hold an acknowledged but uncommitted INSERT');
 	# Make the loser effects eligible for real on-disk recovery; disappearing
 	# backend buffers alone must not satisfy the reconciliation assertions.
 	$_->safe_psql('postgres', 'CHECKPOINT', timeout => 30) for @nodes;
+	for my $i (0 .. $#nodes)
+	{
+		my $id = 1001 + $i;
+		my $loser = $sessions[$i]->query_safe(qq{
+			SELECT pg_current_xact_id_if_assigned()::text || '|' || id::text || '|' || payload
+			FROM e1_reconcile WHERE id = $id});
+		is($loser, "$loser_xids[$i]|$id|uncommitted-$id",
+			"node$i retains its original loser transaction and row after CHECKPOINT")
+			or die "node$i loser is no longer held before SIGKILL";
+	}
 	pass('all four members checkpoint while loser transactions remain open');
 	my $data_identity = $cluster->_data_identity;
 	my @old_writers = map { +{%$_} } @{$cluster->{writers}};
