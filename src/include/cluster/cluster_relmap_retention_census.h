@@ -213,6 +213,33 @@ extern bool cluster_relmap_retention_census_reobserve_cold(ClusterRelmapRetentio
 														   size_t root_budget,
 														   ClusterRecoveryRootSet **out);
 
+/* Original-owner restart into new local BUILDING storage, once after the
+ * same successful consumer. Only a previous complete single-origin input set
+ * matching that consumer's original source is supported. Original native /
+ * SIDE / history / lifetime qualifications remain the caller's preconditions;
+ * this authenticates checkpoint provenance and unchanged bounds only.
+ *
+ * Consume the follow-on before allocation or I/O. Use the original execution
+ * checkpoint producer for a fresh directory; require its original serial and
+ * identical floor / actual-issued bounds. Recheck old source / metadata / all
+ * pins and ownership around that I/O and fresh complete ROOT observation.
+ * Publish a new census only after all checks. Missing initial ownership or
+ * unsupported multiple origins leaves the follow-on unconsumed. Known output
+ * aliases stay unchanged; distinct refusal sets *out NULL. Entered refusal /
+ * ERROR consumes it, frees only new local storage and preserves all old pins.
+ * memory_budget covers the new census plus directory, root_budget its ROOT.
+ *
+ * The new census owns its new ROOT and directory; destroy it on every exit,
+ * before the previous census. Keep the original owner / source / fd / cuts /
+ * previous directories and pins alive, unchanged and exclusively held through
+ * the new census. Its images / sets remain provisional until whole-ROOT
+ * DRAINED; even then the new directory stays BUILDING. No COMPLETE, old pin
+ * retirement, mixed-origin qualification, G_ref / owner completion, D0,
+ * allocator / live activation or replacement recovery scope is granted. */
+extern bool cluster_relmap_retention_census_restart_cold(ClusterRelmapRetentionCensus *census,
+														 size_t root_budget, size_t memory_budget,
+														 ClusterRelmapRetentionCensus **out);
+
 /* Opaque, local-only preparation of every pending namespace in the original
  * DRAINED physical census, including backup-only pending. No caller namespace
  * list is accepted. Hold original merger claim and namespace X across this

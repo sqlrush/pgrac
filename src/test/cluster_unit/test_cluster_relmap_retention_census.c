@@ -972,11 +972,19 @@ UT_TEST(test_root_rebuild_preserves_existing_proofs_and_exact_pins)
 #include "test_cluster_relmap_census_cold.inc"
 #include "test_cluster_relmap_census_cold_consume.inc"
 #include "test_cluster_relmap_census_cold_reobserve.inc"
+#include "test_cluster_relmap_census_cold_restart.inc"
 
 int
 main(void)
 {
-	UT_PLAN(74);
+	UT_PLAN(81);
+	UT_RUN(test_census_restart_new_physical_census_restores_remaining_pin);
+	UT_RUN(test_census_restart_initial_gates_and_multi_origin_preserve_follow_on);
+	UT_RUN(test_census_restart_checkpoint_range_serial_and_builder_error_refuse_once);
+	UT_RUN(test_census_restart_post_physical_io_checks_and_error_keep_old_debt);
+	UT_RUN(test_census_restart_budget_read_and_missing_path_refuse_without_retry);
+	UT_RUN(test_census_restart_alias_and_null_output_preserve_original_storage);
+	UT_RUN(test_census_restart_interrupted_new_cursor_destroys_only_local_storage);
 	UT_RUN(test_census_cold_consumer_invalidates_before_original_native_attempt);
 	UT_RUN(test_census_cold_consumer_missing_initial_ownership_keeps_scan_unconsumed);
 	UT_RUN(test_census_cold_consumer_pre_native_refusal_error_never_attempts_target);

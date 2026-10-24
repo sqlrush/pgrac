@@ -580,12 +580,14 @@ test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
 		test_cluster_relmap_census_cold.inc \
 		test_cluster_relmap_census_cold_consume.inc \
 		test_cluster_relmap_census_cold_reobserve.inc \
+		test_cluster_relmap_census_cold_restart.inc \
 		test_cluster_recovery_root_reobserve.inc \
 		test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c \
 		test_cluster_recovery_crypto_boundary.h unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_terminal_scan.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_pending.h \
@@ -618,6 +620,7 @@ test_cluster_relmap_retention_census_product.o: $(top_srcdir)/src/backend/cluste
 		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_terminal_scan.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_pending_side.h \
@@ -634,12 +637,14 @@ test_cluster_relmap_census_side: test_cluster_relmap_retention_census.c \
 		test_cluster_relmap_census_cold.inc \
 		test_cluster_relmap_census_cold_consume.inc \
 		test_cluster_relmap_census_cold_reobserve.inc \
+		test_cluster_relmap_census_cold_restart.inc \
 		test_cluster_recovery_root_reobserve.inc \
 		test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c \
 		test_cluster_recovery_crypto_boundary.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_terminal_scan.h \
 		test_cluster_relmap_retention_census_product.o \
 		test_cluster_relmap_pending_side_product.o \
 		test_cluster_relmap_pending_product.o test_cluster_relmap_v2_codec_product.o \
@@ -3456,6 +3461,7 @@ test_cluster_relmap_retained_census.o: $(top_srcdir)/src/backend/cluster/cluster
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_terminal_scan.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_pending_side.h Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
