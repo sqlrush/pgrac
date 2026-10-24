@@ -106,6 +106,8 @@ static SCN fixture_wal_clock, inserted_wal_clock;
 static unsigned wal_clock_reads;
 static bool full_target_current, target_recheck_error, revoke_target_census;
 static unsigned full_target_checks;
+static unsigned target_preflight_checks, census_preflight_checks;
+static bool preflight_target_error, preflight_revoke_census, allow_preflight_target;
 
 /* The real native apply reads this clock before mutation. WAL insertion's
  * existing production xl_scn stamp uses the same clock; this leaf captures
@@ -294,6 +296,12 @@ bool
 cluster_semantic_activation_recheck_r4_terminal_census(
 	const ClusterSemanticAdmissionToken *token)
 {
+	if (!local_x) {
+		census_preflight_checks++;
+		UT_ASSERT(token != NULL && token->entered && backend_pin_count == 1);
+		UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+		return admission_current;
+	}
 	admission_checks++;
 	UT_ASSERT(token != NULL && token->entered);
 	return admission_current;
@@ -302,6 +310,17 @@ cluster_semantic_activation_recheck_r4_terminal_census(
 bool
 cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 {
+	if (!local_x) {
+		target_preflight_checks++;
+		UT_ASSERT(token != NULL && token->entered && backend_pin_count == 1);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+		UT_ASSERT_EQ(writer_checks + route_checks + authority_checks + admission_checks, 0);
+		UT_ASSERT_EQ(wal_clock_reads + inserts + dirties + edges + flushes, 0);
+		if (preflight_target_error) elog(ERROR, "injected unlocked TARGET preflight error");
+		if (preflight_revoke_census) admission_current = false;
+		return full_target_current || allow_preflight_target;
+	}
 	full_target_checks++;
 	UT_ASSERT(token != NULL && token->entered);
 	UT_ASSERT(local_x && backend_pin_count == 1);
@@ -683,6 +702,8 @@ reset(uint8 opcode, bool shared)
 	full_target_current = true;
 	target_recheck_error = revoke_target_census = false;
 	full_target_checks = 0;
+	target_preflight_checks = census_preflight_checks = 0;
+	preflight_target_error = preflight_revoke_census = allow_preflight_target = false;
 	local_x = writer_current = route_current = authority_current = admission_current = true;
 	local_share = resume_allowed = resume_error = resumed_writer = false;
 	node_grant_current = true;
@@ -2196,6 +2217,105 @@ UT_TEST(test_xmin_missing_proof_refuses_before_writer_resume)
 	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
 }
 
+UT_TEST(test_xmin_released_writer_requires_target_and_census_before_resume)
+{
+	QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int batch = 0; batch < 2; batch++) {
+		for (int variant = 0; variant < 3; variant++) {
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			fixture_release_original_writer(); resume_allowed = true;
+			if (variant == 0) full_target_current = false;
+			else if (variant == 1) admission_current = false;
+			else preflight_revoke_census = true;
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3)
+				: qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(target_preflight_checks, 1);
+			UT_ASSERT_EQ(census_preflight_checks, variant == 0 ? 0 : 1);
+			UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+			UT_ASSERT_EQ(full_target_checks + writer_checks + route_checks + authority_checks, 0);
+			UT_ASSERT_EQ(inserts + dirties + flushes, 0);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_xmin_released_writer_rejects_missing_or_different_original_token)
+{
+	QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int variant = 0; variant < 4; variant++) {
+		qualified_xmin_batch_setup(&f, targets);
+		fixture_release_original_writer(); resume_allowed = true;
+		if (variant == 0) f.admission.entered = false;
+		else if (variant == 1) f.admission.record_generation++;
+		else if (variant == 2) f.input.writer_context.r4_record_generation++;
+		UT_ASSERT(!cluster_heap_freeze_apply_xmin_batch_v1(&relation_data, 1,
+			&f.input, &f.page, &f.proofs, &f.fence, &f.authority,
+			variant == 3 ? NULL : &f.admission, targets, 3,
+			FullTransactionIdFromEpochAndXid(1, 100), 10));
+		UT_ASSERT_EQ(target_preflight_checks + census_preflight_checks, 0);
+		UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+		UT_ASSERT_EQ(inserts + dirties + flushes, 0);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(!local_x && !resumed_writer);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_unlocked_target_error_never_restores_writer)
+{
+	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	fixture_release_original_writer(); resume_allowed = preflight_target_error = expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		(void) qualified_xmin_apply(&f, 0); UT_ASSERT(false);
+	} else {
+		UT_ASSERT_EQ(target_preflight_checks, 1);
+		UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks, 0);
+		UT_ASSERT_EQ(local_lock_attempts + inserts + dirties + flushes, 0);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+	expecting_error = false;
+}
+
+UT_TEST(test_xmin_successful_preflight_still_requires_final_target)
+{
+	QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int batch = 0; batch < 2; batch++) {
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		fixture_release_original_writer(); resume_allowed = allow_preflight_target = true;
+		full_target_current = false;
+		UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3)
+			: qualified_xmin_apply(&f, 0)));
+		UT_ASSERT_EQ(target_preflight_checks, 1); UT_ASSERT_EQ(census_preflight_checks, 1);
+		UT_ASSERT_EQ(full_target_checks, 1);
+		UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
+		UT_ASSERT_EQ(inserts + dirties + flushes, 0); UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_successful_preflight_still_requires_final_census)
+{
+	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	fixture_release_original_writer(); resume_allowed = revoke_target_census = true;
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(target_preflight_checks, 1); UT_ASSERT_EQ(census_preflight_checks, 1);
+	UT_ASSERT_EQ(full_target_checks, 1); UT_ASSERT_EQ(admission_checks, 1);
+	UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
+	UT_ASSERT_EQ(inserts + dirties + flushes, 0); UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
 UT_TEST(test_xmin_resumed_writer_target_error_runs_finally)
 {
 	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
@@ -2262,7 +2382,7 @@ UT_TEST(test_xmin_existing_share_lock_is_not_a_resume_scope)
 int
 main(void)
 {
-	UT_PLAN(61);
+	UT_PLAN(66);
 	UT_RUN(test_xmin_actual_writer_keeps_original_ko_revision_before_lock);
 	UT_RUN(test_xmin_actual_resumer_inner_error_cleans_before_native_wrapper);
 	UT_RUN(test_xmin_released_writer_requires_actual_original_node_grant);
@@ -2270,6 +2390,11 @@ main(void)
 	UT_RUN(test_xmin_released_writer_refusal_never_fetches_or_writes);
 	UT_RUN(test_xmin_plan_refusal_before_resume_keeps_original_pin);
 	UT_RUN(test_xmin_missing_proof_refuses_before_writer_resume);
+	UT_RUN(test_xmin_released_writer_requires_target_and_census_before_resume);
+	UT_RUN(test_xmin_released_writer_rejects_missing_or_different_original_token);
+	UT_RUN(test_xmin_unlocked_target_error_never_restores_writer);
+	UT_RUN(test_xmin_successful_preflight_still_requires_final_target);
+	UT_RUN(test_xmin_successful_preflight_still_requires_final_census);
 	UT_RUN(test_xmin_resumed_writer_target_error_runs_finally);
 	UT_RUN(test_xmin_resumed_writer_flush_error_runs_finally_after_wal);
 	UT_RUN(test_xmin_resume_error_keeps_original_pin_and_admission);

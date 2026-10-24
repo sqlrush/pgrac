@@ -377,8 +377,9 @@ extern bool cluster_heap_freeze_prepare_xmin_batch_v1(
  * WAL flush. The caller always owns the original pin and the same R4 TARGET
  * token accepted by ordinary write policy and terminal-census recheck. If it
  * already holds content-X/ACTIVE PCM-X ledger, those resources are borrowed
- * unchanged. Otherwise only the saved original writer/KO fence is conditionally
- * resumed under local content-X; that temporary ledger/lock is released on
+ * unchanged. Otherwise the same entered token must pass full TARGET and
+ * terminal-census policy before the saved original writer/KO fence is
+ * conditionally resumed under local content-X; that temporary ledger/lock is released on
  * success, refusal and ERROR, preserving the caller pin/token. No fresh grant,
  * current fetch or proof request is permitted. A preexisting share lock cannot
  * be upgraded. The original ERROR/cancel continues after local cleanup.

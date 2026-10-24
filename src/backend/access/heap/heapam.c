@@ -20855,6 +20855,15 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 			targets, target_count, plans, conflict_horizon, horizon_scn);
 	if (input == NULL || !input->writer_context_valid)
 		return false;
+	/* A census-read token cannot restore an ordinary writer. Validate the
+	 * same captured TARGET generation while no local content lock/ledger is
+	 * owned; the locked kernel must still repeat both policies before WAL. */
+	if (admission == NULL || !admission->entered
+		|| admission->record_generation != fence->admission_generation
+		|| input->writer_context.r4_record_generation != admission->record_generation
+		|| !cluster_semantic_activation_recheck(admission)
+		|| !cluster_semantic_activation_recheck_r4_terminal_census(admission))
+		return false;
 
 	PG_TRY();
 	{
