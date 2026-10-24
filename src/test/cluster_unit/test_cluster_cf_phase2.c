@@ -38,9 +38,11 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_cf_storage.h"
 #include "datatype/timestamp.h"
+#include "miscadmin.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
 #include "utils/elog.h"
+#include "utils/timestamp.h"
 
 #undef printf
 #undef fprintf
@@ -57,15 +59,27 @@
 
 UT_DEFINE_GLOBALS();
 
-/* ---- globals phase2.o references (verify_or_fail path; not exercised here) ---- */
+/* ---- globals phase2.o references ---- */
 int cluster_node_id = 0;
 bool cluster_enabled = false;
 char *cluster_shared_data_dir = NULL;
 bool cluster_controlfile_shared_authority = false;
 int cluster_cf_enqueue_timeout_ms = 30000;
+bool cluster_trace_control_config = false;
 volatile sig_atomic_t InterruptPending = 0;
+volatile uint32 CritSectionCount = 0;
+int MyProcPid = 4242;
 int pg_dir_create_mode = 0700;
 int MyAuxProcType = 0; /* RF-ROOT P6: phase2.o samples it */
+
+static bool capture_trace, trace_changes_errno;
+static unsigned trace_count, clock_calls, open_calls, rename_calls;
+static unsigned random_calls, contract_calls;
+static bool random_ok = true, random_zero, contract_ok = true;
+static ClusterCfContractState contract_state;
+static char trace_message[2048];
+static TimestampTz clock_now = 1;
+static int64 clock_step;
 
 /* ---- Assert + ereport + fd.c stubs (same pattern as the storage test) ---- */
 void
@@ -82,7 +96,7 @@ errstart(int elevel, const char *domain pg_attribute_unused())
 		printf("# unexpected ereport(elevel=%d) -- aborting\n", elevel);
 		abort();
 	}
-	return false;
+	return elevel == LOG && capture_trace;
 }
 
 bool
@@ -105,8 +119,18 @@ errcode_for_file_access(void)
 	return 0;
 }
 int
-errmsg(const char *fmt pg_attribute_unused(), ...)
+errmsg(const char *fmt, ...)
 {
+	if (strncmp(fmt, "PGRAC_FAMILY=CF_PHASE2 ", sizeof("PGRAC_FAMILY=CF_PHASE2 ") - 1) == 0) {
+		va_list args;
+
+		trace_count++;
+		va_start(args, fmt);
+		vsnprintf(trace_message, sizeof(trace_message), fmt, args);
+		va_end(args);
+		if (trace_changes_errno)
+			errno = EINTR;
+	}
 	return 0;
 }
 int
@@ -131,6 +155,7 @@ ProcessInterrupts(void)
 int
 OpenTransientFile(const char *fileName, int fileFlags)
 {
+	open_calls++;
 	return open(fileName, fileFlags, 0600);
 }
 int
@@ -166,6 +191,7 @@ pg_fsync(int fd)
 int
 durable_rename(const char *o, const char *n, int e pg_attribute_unused())
 {
+	rename_calls++;
 	return rename(o, n) == 0 ? 0 : -1;
 }
 
@@ -174,16 +200,21 @@ durable_rename(const char *o, const char *n, int e pg_attribute_unused())
 TimestampTz
 GetCurrentTimestamp(void)
 {
-	return 1;
+	TimestampTz now = clock_now;
+
+	clock_calls++;
+	clock_now += clock_step;
+	return now;
 }
 
-/* contract update_state/load: not reached by these tests (only verify_or_fail
- * uses them); stub to satisfy the link without pulling in cluster_cf_storage.o. */
+/* Observe the original verifier's state update without linking storage.o. */
 bool
 cluster_cf_contract_update_state(const char *p pg_attribute_unused(),
-								 ClusterCfContractState s pg_attribute_unused())
+								 ClusterCfContractState s)
 {
-	return true;
+	contract_calls++;
+	contract_state = s;
+	return contract_ok;
 }
 ClusterCfContractState
 cluster_cf_contract_load(const char *p pg_attribute_unused())
@@ -209,12 +240,14 @@ cluster_conf_node_count(void)
 	return stub_node_count;
 }
 
-/* pg_strong_random is only used by verify_or_fail (not exercised); a local stub
- * resolves the link without dragging OpenSSL into this standalone unit. */
+/* Deterministic fresh-round input; actual probe/ACK I/O is not stubbed. */
 bool
 pg_strong_random(void *buf, size_t len)
 {
-	memset(buf, 0x5a, len);
+	random_calls++;
+	if (!random_ok)
+		return false;
+	memset(buf, random_zero ? 0 : 0x5a, len);
 	return true;
 }
 
@@ -601,10 +634,194 @@ UT_TEST(test_respond_tick)
 	cluster_controlfile_shared_authority = true;
 }
 
+static void
+prepare_verify_case(bool trace)
+{
+	make_shared_root();
+	configure_nodes(4);
+	cluster_node_id = 2;
+	cluster_controlfile_shared_authority = true;
+	cluster_enabled = true;
+	cluster_shared_data_dir = shared_root;
+	cluster_cf_enqueue_timeout_ms = 0;
+	cluster_trace_control_config = trace;
+	CritSectionCount = 0;
+	capture_trace = true;
+	trace_changes_errno = false;
+	trace_count = clock_calls = open_calls = rename_calls = 0;
+	random_calls = contract_calls = 0;
+	random_ok = contract_ok = true;
+	random_zero = false;
+	clock_now = 1;
+	clock_step = 0;
+	trace_message[0] = '\0';
+}
+
+static void
+seed_verify_ack(void)
+{
+	uint64 nonce = UINT64CONST(0x5a5a5a5a5a5a5a5a);
+
+	if (!cluster_cf_phase2_write_probe(shared_root, 2, nonce)
+		|| !cluster_cf_phase2_write_ack(shared_root, 2, 0, nonce))
+		abort();
+	open_calls = rename_calls = 0;
+}
+
+UT_TEST(test_verify_trace_off_critical_and_original_gates)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		prepare_verify_case(fault != 0);
+		if (fault == 1)
+			CritSectionCount = 1;
+		if (fault == 2)
+			cluster_controlfile_shared_authority = false;
+		if (fault == 3)
+			cluster_enabled = false;
+		if (fault == 4)
+			configure_nodes(1);
+		cluster_cf_phase2_verify_or_fail(shared_root);
+		UT_ASSERT_EQ(trace_count, 0);
+		UT_ASSERT_EQ(contract_calls, 0);
+		UT_ASSERT_EQ(random_calls, fault < 2 ? 1 : 0);
+		UT_ASSERT_EQ(clock_calls, fault < 2 ? 2 : 0);
+		UT_ASSERT_EQ(rename_calls, fault < 2 ? 1 : 0);
+	}
+	CritSectionCount = 0;
+}
+
+UT_TEST(test_verify_trace_original_ack_deadline_and_late_ack)
+{
+	ClusterCfPhase2RecordV2 probe;
+	char nonce_field[80];
+	bool prior = cluster_cf_phase2_peer_verified();
+
+	prepare_verify_case(true);
+	cluster_cf_phase2_verify_or_fail(shared_root);
+	UT_ASSERT_EQ(trace_count, 1);
+	UT_ASSERT(strstr(trace_message, "node=2 pid=4242 peer=0") != NULL);
+	UT_ASSERT(strstr(trace_message, "reason=ack_deadline") != NULL);
+	UT_ASSERT(strstr(trace_message, "timeout_ms=0") != NULL);
+	UT_ASSERT(strstr(trace_message, "probe_published=1 ack_accepted=0") != NULL);
+	UT_ASSERT(strstr(trace_message, "clock_present=1 elapsed_us=0") != NULL);
+	UT_ASSERT(strstr(trace_message, "polls=1") != NULL);
+	UT_ASSERT(strstr(trace_message, "contract_attempted=0 contract_updated=0") != NULL);
+	UT_ASSERT_EQ(contract_calls, 0);
+	UT_ASSERT_EQ(clock_calls, 2);
+	UT_ASSERT(cluster_cf_phase2_read_probe(shared_root, 2, &probe));
+	snprintf(nonce_field, sizeof(nonce_field), "nonce=" UINT64_FORMAT, probe.probe_nonce);
+	UT_ASSERT(strstr(trace_message, nonce_field) != NULL);
+	/* A later exact ACK cannot rewrite the saved call's outcome or state. */
+	UT_ASSERT(cluster_cf_phase2_write_ack(shared_root, 2, 0, probe.probe_nonce));
+	UT_ASSERT(cluster_cf_phase2_read_exact_ack(shared_root, 2, 0, probe.probe_nonce));
+	UT_ASSERT_EQ(cluster_cf_phase2_peer_verified(), prior);
+	UT_ASSERT_EQ(trace_count, 1);
+	UT_ASSERT_EQ(contract_calls, 0);
+}
+
+UT_TEST(test_verify_trace_probe_write_refusal_has_no_wait)
+{
+	char blocked[MAXPGPATH];
+
+	prepare_verify_case(true);
+	snprintf(blocked, sizeof(blocked), "%s/%s", shared_root, CLUSTER_CF_PHASE2_DIR);
+	UT_ASSERT_EQ(rmdir(blocked), 0);
+	write_test_bytes(blocked, "x", 1);
+	cluster_cf_phase2_verify_or_fail(shared_root);
+	UT_ASSERT_EQ(trace_count, 1);
+	UT_ASSERT(strstr(trace_message, "reason=probe_write_failed") != NULL);
+	UT_ASSERT(strstr(trace_message, "probe_published=0 ack_accepted=0") != NULL);
+	UT_ASSERT(strstr(trace_message, "clock_present=0 elapsed_us=0") != NULL);
+	UT_ASSERT(strstr(trace_message, "polls=0") != NULL);
+	UT_ASSERT_EQ(clock_calls, 0);
+	UT_ASSERT_EQ(contract_calls, 0);
+}
+
+UT_TEST(test_verify_trace_peer_random_and_zero_nonce_refusals)
+{
+	const char *reasons[] = {"reason=no_peer", "reason=nonce_unavailable", "reason=invalid_round"};
+
+	for (unsigned fault = 0; fault < lengthof(reasons); fault++) {
+		prepare_verify_case(true);
+		if (fault == 0) {
+			memset(stub_configured_nodes, 0, sizeof(stub_configured_nodes));
+			stub_configured_nodes[2] = true;
+		} else if (fault == 1)
+			random_ok = false;
+		else
+			random_zero = true;
+		cluster_cf_phase2_verify_or_fail(shared_root);
+		UT_ASSERT_EQ(trace_count, 1);
+		UT_ASSERT(strstr(trace_message, reasons[fault]) != NULL);
+		UT_ASSERT(strstr(trace_message, "probe_published=0 ack_accepted=0") != NULL);
+		UT_ASSERT(strstr(trace_message, "contract_attempted=0 contract_updated=0") != NULL);
+		UT_ASSERT_EQ(open_calls, 0);
+		UT_ASSERT_EQ(clock_calls, 0);
+		UT_ASSERT_EQ(contract_calls, 0);
+		UT_ASSERT_EQ(random_calls, fault == 0 ? 0 : 1);
+	}
+}
+
+UT_TEST(test_verify_trace_original_success_and_contract_update)
+{
+	for (unsigned variant = 0; variant < 3; variant++) {
+		prepare_verify_case(true);
+		seed_verify_ack();
+		clock_now = 9000;
+		clock_step = variant == 0 ? 0 : variant == 1 ? 2500 : -3000;
+		cluster_cf_phase2_verify_or_fail(shared_root);
+		UT_ASSERT_EQ(trace_count, 1);
+		UT_ASSERT(strstr(trace_message, "reason=acknowledged") != NULL);
+		UT_ASSERT(strstr(trace_message, "probe_published=1 ack_accepted=1") != NULL);
+		UT_ASSERT(strstr(trace_message, "contract_attempted=1 contract_updated=1") != NULL);
+		UT_ASSERT(strstr(trace_message, "peer_verified=1") != NULL);
+		UT_ASSERT(strstr(trace_message, variant == 1 ? "elapsed_us=2500" : "elapsed_us=0") != NULL);
+		UT_ASSERT(strstr(trace_message, variant == 2 ? "clock_reversed=1" : "clock_reversed=0") != NULL);
+		UT_ASSERT_EQ(contract_calls, 1);
+		UT_ASSERT_EQ(contract_state, CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED);
+		UT_ASSERT(cluster_cf_phase2_peer_verified());
+	}
+}
+
+UT_TEST(test_verify_trace_contract_update_failure_does_not_change_behavior)
+{
+	prepare_verify_case(true);
+	seed_verify_ack();
+	contract_ok = false;
+	cluster_cf_phase2_verify_or_fail(shared_root);
+	UT_ASSERT_EQ(trace_count, 1);
+	UT_ASSERT(strstr(trace_message, "reason=acknowledged") != NULL);
+	UT_ASSERT(strstr(trace_message, "contract_attempted=1 contract_updated=0") != NULL);
+	UT_ASSERT_EQ(contract_calls, 1);
+	/* Observe the existing flag/update distinction without changing it. */
+	UT_ASSERT(cluster_cf_phase2_peer_verified());
+}
+
+UT_TEST(test_verify_trace_no_extra_IO_or_polls_and_errno_preserved)
+{
+	unsigned original_opens, original_renames, original_clocks;
+	int original_errno;
+
+	prepare_verify_case(false);
+	cluster_cf_phase2_verify_or_fail(shared_root);
+	original_opens = open_calls;
+	original_renames = rename_calls;
+	original_clocks = clock_calls;
+	original_errno = errno;
+	prepare_verify_case(true);
+	trace_changes_errno = true;
+	cluster_cf_phase2_verify_or_fail(shared_root);
+	UT_ASSERT_EQ(trace_count, 1);
+	UT_ASSERT_EQ(open_calls, original_opens);
+	UT_ASSERT_EQ(rename_calls, original_renames);
+	UT_ASSERT_EQ(clock_calls, original_clocks);
+	UT_ASSERT_EQ(errno, original_errno);
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(18);
 	UT_RUN(test_probe_ack_roundtrip);
 	UT_RUN(test_four_responders_publish_distinct_exact_acks);
 	UT_RUN(test_nonselected_responder_cannot_complete_rendezvous);
@@ -616,6 +833,13 @@ main(void)
 	UT_RUN(test_rendezvous_success);
 	UT_RUN(test_rendezvous_timeout);
 	UT_RUN(test_respond_tick);
+	UT_RUN(test_verify_trace_off_critical_and_original_gates);
+	UT_RUN(test_verify_trace_original_ack_deadline_and_late_ack);
+	UT_RUN(test_verify_trace_probe_write_refusal_has_no_wait);
+	UT_RUN(test_verify_trace_peer_random_and_zero_nonce_refusals);
+	UT_RUN(test_verify_trace_original_success_and_contract_update);
+	UT_RUN(test_verify_trace_contract_update_failure_does_not_change_behavior);
+	UT_RUN(test_verify_trace_no_extra_IO_or_polls_and_errno_preserved);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

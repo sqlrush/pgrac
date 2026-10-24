@@ -424,29 +424,57 @@ cluster_cf_phase2_read_exact_ack(const char *shared_dir, int probe_owner, int ex
 								 expected_responder, expected_nonce, true, NULL);
 }
 
-/*
- * cluster_cf_phase2_rendezvous -- symmetric nonce+ack handshake (see header).
- */
-bool
-cluster_cf_phase2_rendezvous(const char *shared_dir, int self_id, int peer_id, uint64 nonce,
-							 int timeout_ms)
+/* Original-call values only; never persisted or used as a handshake input. */
+typedef struct CfPhase2Trace {
+	const char *reason;
+	int peer_id;
+	int timeout_ms;
+	uint64 nonce;
+	uint64 polls;
+	TimestampTz started;
+	TimestampTz finished;
+	bool clock_present;
+	bool probe_published;
+	bool ack_accepted;
+	bool contract_attempted;
+	bool contract_updated;
+} CfPhase2Trace;
+
+static bool
+cf_phase2_rendezvous(const char *shared_dir, int self_id, int peer_id, uint64 nonce,
+					int timeout_ms, CfPhase2Trace *trace)
 {
-	TimestampTz deadline;
+	TimestampTz started, now, deadline;
 
 	if (shared_dir == NULL || shared_dir[0] == '\0' || !cf_phase2_node_valid(self_id)
-		|| !cf_phase2_node_valid(peer_id) || self_id == peer_id || nonce == 0)
+		|| !cf_phase2_node_valid(peer_id) || self_id == peer_id || nonce == 0) {
+		if (trace != NULL)
+			trace->reason = "invalid_round";
 		return false;
+	}
 
 	ensure_p2_dir(shared_dir);
 
 	/* Publish my probe (durable_rename) so the peer can see it cross-node. */
-	if (!cluster_cf_phase2_write_probe(shared_dir, self_id, nonce))
+	if (!cluster_cf_phase2_write_probe(shared_dir, self_id, nonce)) {
+		if (trace != NULL)
+			trace->reason = "probe_write_failed";
 		return false;
+	}
 
-	deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), timeout_ms);
+	started = GetCurrentTimestamp();
+	deadline = TimestampTzPlusMilliseconds(started, timeout_ms);
+	if (trace != NULL) {
+		trace->probe_published = true;
+		trace->clock_present = true;
+		trace->started = trace->finished = started;
+	}
 
 	for (;;) {
 		int id;
+
+		if (trace != NULL && trace->polls != UINT64_MAX)
+			trace->polls++;
 
 		/* Every responder has its own pairwise ACK namespace. */
 		for (id = 0; id < CLUSTER_MAX_NODES; id++) {
@@ -459,15 +487,37 @@ cluster_cf_phase2_rendezvous(const char *shared_dir, int self_id, int peer_id, u
 		}
 
 		/* Only the selected peer can complete this exact round trip. */
-		if (cluster_cf_phase2_read_exact_ack(shared_dir, self_id, peer_id, nonce))
+		if (cluster_cf_phase2_read_exact_ack(shared_dir, self_id, peer_id, nonce)) {
+			if (trace != NULL) {
+				trace->reason = "acknowledged";
+				trace->ack_accepted = true;
+				trace->finished = GetCurrentTimestamp();
+			}
 			return true;
+		}
 
-		if (GetCurrentTimestamp() >= deadline)
+		now = GetCurrentTimestamp();
+		if (trace != NULL)
+			trace->finished = now;
+		if (now >= deadline) {
+			if (trace != NULL)
+				trace->reason = "ack_deadline";
 			return false; /* no peer / no cross-node visibility */
+		}
 
 		CHECK_FOR_INTERRUPTS();
 		pg_usleep(CLUSTER_CF_PHASE2_POLL_US);
 	}
+}
+
+/*
+ * cluster_cf_phase2_rendezvous -- symmetric nonce+ack handshake (see header).
+ */
+bool
+cluster_cf_phase2_rendezvous(const char *shared_dir, int self_id, int peer_id, uint64 nonce,
+							 int timeout_ms)
+{
+	return cf_phase2_rendezvous(shared_dir, self_id, peer_id, nonce, timeout_ms, NULL);
 }
 
 /*
@@ -503,6 +553,30 @@ cluster_cf_phase2_peer_verified(void)
 	return cf_phase2_peer_verified;
 }
 
+static void
+cf_phase2_trace_end(const CfPhase2Trace *trace)
+{
+	uint64 elapsed_us = 0;
+	int save_errno = errno;
+
+	if (trace == NULL || CritSectionCount != 0)
+		return;
+	if (trace->clock_present && trace->finished >= trace->started)
+		elapsed_us = (uint64)trace->finished - (uint64)trace->started;
+	/* One record per original verifier call, no probe/ACK reread for logging. */
+	ereport(LOG,
+		(errmsg("PGRAC_FAMILY=CF_PHASE2 node=%d pid=%d peer=%d nonce=" UINT64_FORMAT
+				" reason=%s timeout_ms=%d probe_published=%d ack_accepted=%d"
+				" clock_present=%d elapsed_us=" UINT64_FORMAT " clock_reversed=%d polls=" UINT64_FORMAT
+				" contract_attempted=%d contract_updated=%d peer_verified=%d",
+				cluster_node_id, MyProcPid, trace->peer_id, trace->nonce,
+				trace->reason, trace->timeout_ms, trace->probe_published, trace->ack_accepted,
+				trace->clock_present, elapsed_us,
+				trace->clock_present && trace->finished < trace->started, trace->polls,
+				trace->contract_attempted, trace->contract_updated, cf_phase2_peer_verified)));
+	errno = save_errno;
+}
+
 /*
  * cluster_cf_phase2_verify_or_fail -- backend entry (see header).
  */
@@ -510,14 +584,21 @@ void
 cluster_cf_phase2_verify_or_fail(const char *pgdata)
 {
 	int peer_id;
+	int timeout_ms;
 	uint64 nonce;
 	uint8 raw[8];
+	CfPhase2Trace observation = { 0 };
+	CfPhase2Trace *trace = NULL;
 
 	if (!cluster_controlfile_shared_authority) {
 		return;
 	}
 	if (!cluster_enabled || cluster_conf_node_count() <= 1)
 		return; /* single-node: no cross-node contract needed */
+	if (cluster_trace_control_config && CritSectionCount == 0) {
+		trace = &observation;
+		trace->timeout_ms = cluster_cf_enqueue_timeout_ms;
+	}
 
 	/*
 	 * Always run a FRESH rendezvous on a multi-node bootstrap (do not short-
@@ -528,13 +609,24 @@ cluster_cf_phase2_verify_or_fail(const char *pgdata)
 	 * survivor should perform).
 	 */
 	peer_id = find_peer_node();
+	if (trace != NULL)
+		trace->peer_id = peer_id;
 	if (peer_id < 0) {
+		if (trace != NULL)
+			trace->reason = "no_peer";
+		cf_phase2_trace_end(trace);
 		return; /* no peer configured -> gate fails closed */
 	}
 
-	if (!pg_strong_random(raw, sizeof(raw)))
+	if (!pg_strong_random(raw, sizeof(raw))) {
+		if (trace != NULL)
+			trace->reason = "nonce_unavailable";
+		cf_phase2_trace_end(trace);
 		return; /* no fresh nonce -> leave unverified */
+	}
 	memcpy(&nonce, raw, sizeof(nonce));
+	if (trace != NULL)
+		trace->nonce = nonce;
 
 	/*
 	 * Run the rendezvous bounded by cluster.cf_enqueue_timeout_ms.  The poll
@@ -544,8 +636,13 @@ cluster_cf_phase2_verify_or_fail(const char *pgdata)
 	 * rename visibility, times out and leaves the contract unverified (the
 	 * role gate then fails closed -- never a false CROSSNODE_VERIFIED).
 	 */
-	if (cluster_cf_phase2_rendezvous(cluster_shared_data_dir, cluster_node_id, peer_id, nonce,
-									 cluster_cf_enqueue_timeout_ms)) {
+	timeout_ms = cluster_cf_enqueue_timeout_ms;
+	if (trace != NULL)
+		trace->timeout_ms = timeout_ms;
+	if (cf_phase2_rendezvous(cluster_shared_data_dir, cluster_node_id, peer_id, nonce,
+							 timeout_ms, trace)) {
+		bool updated;
+
 		/*
 		 * Peer alive + storage cross-node verified this run.  Update only the
 		 * contract STATE (preserving the identity anchor written at migration --
@@ -554,12 +651,17 @@ cluster_cf_phase2_verify_or_fail(const char *pgdata)
 		 * during recovery; steady-state writes go through CF X after PM_RUN).
 		 */
 		cf_phase2_peer_verified = true;
-		(void)cluster_cf_contract_update_state(pgdata, CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED);
+		if (trace != NULL)
+			trace->contract_attempted = true;
+		updated = cluster_cf_contract_update_state(pgdata, CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED);
+		if (trace != NULL)
+			trace->contract_updated = updated;
 		ereport(
 			LOG,
 			(errmsg("cluster cf phase-2: cross-node storage rename contract verified with node %d",
 					peer_id)));
 	}
+	cf_phase2_trace_end(trace);
 }
 
 /*
