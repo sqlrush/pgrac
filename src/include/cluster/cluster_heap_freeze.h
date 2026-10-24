@@ -442,6 +442,11 @@ extern bool cluster_heap_freeze_prepare_xmin_batch_v1(
  * Every selected creator must also be strictly within that policy legal-next
  * past half-space before a raw native WAL conflict horizon is used. This
  * comparison preserves the original FullXid; it does not infer its epoch.
+ * The same cohort must retain its original completed local census cut with
+ * zero unqualified entries. Its original registration generation is rechecked
+ * before writer use and after TARGET/clock observations before the native
+ * WAL kernel. This local point check does not serialize later ingress or
+ * supply remote/provenance/producer-retention qualification.
  * Their separate current/provenance/retention qualification remains required;
  * the match performs no sampling or callback under page locks.
  *

@@ -20841,6 +20841,15 @@ cluster_heap_freeze_apply_xmin_batch_locked_v1(
 	if (!SCN_VALID(wal_clock) || scn_time_cmp(wal_clock, horizon_scn) < 0)
 		return false;
 
+	/* TARGET/clock observations can overlap new local unknown ingress.
+	 * Recheck the same retained cut before entering the native WAL kernel;
+	 * no source fetch, census lock or new admission is introduced here. */
+	if (input->freeze_cohort->local_registration_cut.status != CTRC_ACTIVE_SCAN_COMPLETE
+		|| input->freeze_cohort->local_registration_cut.unqualified_entries != 0
+		|| !cluster_ctrc_active_scan_registration_current(
+			&input->freeze_cohort->local_registration_cut))
+		return false;
+
 	/* Native redo and the existing SPACE version edge remain the only format. */
 	if (!heap_freeze_apply_prepared(rel, buffer,
 		conflict_horizon, plans, target_count,
@@ -20887,6 +20896,13 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 			input->freeze_cohort, admission, cluster_node_id, &bounds)
 		|| !FullTransactionIdEquals(bounds.freeze_limit, freeze_limit_full)
 		|| bounds.horizon_scn != horizon_scn)
+		return false;
+	/* Retain only the original completed local ingress cut. This bounded
+	 * atomic check does not acquire protection or qualify remote producers. */
+	if (input->freeze_cohort->local_registration_cut.status != CTRC_ACTIVE_SCAN_COMPLETE
+		|| input->freeze_cohort->local_registration_cut.unqualified_entries != 0
+		|| !cluster_ctrc_active_scan_registration_current(
+			&input->freeze_cohort->local_registration_cut))
 		return false;
 	/* Reject an obsolete capture before attempting the original writer's
 	 * restoration. This only checks saved bytes; the locked kernel still

@@ -2099,8 +2099,31 @@ UT_TEST(test_v2_cohort_retains_same_local_sample_identity_coverage)
 		cohort_receive(65, report);
 		UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
 		UT_ASSERT_EQ(out.local_unqualified_entries, unqualified);
+		UT_ASSERT(memcmp(&out.local_registration_cut, &test_sender_sample.scan,
+			sizeof(out.local_registration_cut)) == 0);
 		UT_ASSERT_EQ(out.active_full_xid_min, UINT64CONST(0x100000080));
 		UT_ASSERT_EQ(out.admitted_members_hi, 2);
+	}
+}
+
+UT_TEST(test_v2_saved_cohort_matches_complete_original_local_registration_cut)
+{
+	for (unsigned variant = 0; variant < 9; variant++) {
+		ClusterHeapFreezeCohortObservation out;
+		(void)reset_v2_cohort(false);
+		UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
+		switch (variant) {
+		case 0: out.local_registration_cut.unqualified_registration_generation++; break;
+		case 1: out.local_registration_cut.reference_full.value++; break;
+		case 2: out.local_registration_cut.future_full.value++; break;
+		case 3: out.local_registration_cut.min_full.value++; break;
+		case 4: out.local_registration_cut.next_index++; break;
+		case 5: out.local_registration_cut.total_entries++; break;
+		case 6: out.local_registration_cut.unqualified_entries++; break;
+		case 7: out.local_registration_cut.lock_busy = !out.local_registration_cut.lock_busy; break;
+		case 8: out.local_registration_cut.status = CTRC_ACTIVE_SCAN_INCOMPLETE; break;
+		}
+		UT_ASSERT_EQ(cluster_heap_freeze_cohort_current(&out), CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED);
 	}
 }
 
@@ -2769,7 +2792,7 @@ UT_TEST(test_watermark_reader_clears_output_on_late_registration)
 int
 main(void)
 {
-	UT_PLAN(102);
+	UT_PLAN(103);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -2847,6 +2870,7 @@ main(void)
 	UT_RUN(test_v2_saved_cohort_rejects_missing_source_metadata);
 	UT_RUN(test_v2_cohort_retains_complete_original_admission_fence);
 	UT_RUN(test_v2_cohort_retains_same_local_sample_identity_coverage);
+	UT_RUN(test_v2_saved_cohort_matches_complete_original_local_registration_cut);
 	UT_RUN(test_v2_cohort_h_freshness_does_not_expire_f_sample);
 	UT_RUN(test_v2_cohort_uses_end_clock_and_rejects_rollback);
 	UT_RUN(test_v2_cohort_rechecks_earlier_peers_after_later_reads);
