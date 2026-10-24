@@ -4708,6 +4708,75 @@ typedef struct ConfigAuxRead {
 
 static ConfigAuxRead config_aux_read;
 
+/* Process-local observations only; no diagnostic operation advances CF. */
+typedef struct ConfigAuxTrace {
+	TimestampTz now;
+	uint64 before;
+	const char *stage;
+	uint64 cookie;
+	bool reader_present, release_checked, release_complete, cut_present;
+	ClusterControlRootResult reader_result;
+	ConfigAuxCut cut;
+} ConfigAuxTrace;
+
+static ConfigAuxTrace *
+config_aux_trace_begin(ConfigAuxTrace *trace)
+{
+	static TimestampTz last_log;
+	TimestampTz now;
+
+	if (!cluster_trace_control_config || CritSectionCount != 0)
+		return NULL;
+	now = GetCurrentTimestamp();
+	if (last_log != 0 && now >= last_log && now - last_log < INT64_C(5000000))
+		return NULL;
+	last_log = now;
+	memset(trace, 0, sizeof(*trace));
+	trace->now = now;
+	trace->before = cluster_cf_attempt_sequence();
+	trace->stage = "acquire_poll";
+	return trace;
+}
+
+static void
+config_aux_trace_end(ConfigAuxTrace *trace, const ClusterSharedConfigRef *prior,
+					 ClusterControlRootResult result)
+{
+	ClusterCfAttemptObservation attempt;
+	bool present;
+
+	if (trace == NULL || CritSectionCount != 0)
+		return;
+	present = cluster_cf_last_attempt_since(trace->before, &attempt);
+	ereport(LOG,
+			(errmsg("PGRAC_FAMILY=CF_CONFIG task=config_select ts=" INT64_FORMAT
+					" node=%d pid=%d role=%d config_generation=" UINT64_FORMAT
+					" stage=%s result=%d s_held=%d s_usable=%d s_own=%d s_cookie=" UINT64_FORMAT
+					" x_held=%d x_usable=%d x_own=%d x_cookie=" UINT64_FORMAT
+					" expected_cookie=" UINT64_FORMAT
+					" reader_present=%d reader_result=%d release_checked=%d release_complete=%d"
+					" cut_present=%d cut_epoch=" UINT64_FORMAT " cut_generation=" UINT64_FORMAT
+					" cut_routing=" UINT64_FORMAT " cut_incarnation=" UINT64_FORMAT " cut_master=%d"
+					" attempt_present=%d attempt_own=%d attempt_sequence=" UINT64_FORMAT
+					" attempt_mode=%d cooperative=%d acquire_result=%d acquire_source=%d owner_state=%d"
+					" request_id=" UINT64_FORMAT " request_epoch=" UINT64_FORMAT
+					" control_owner_id=" UINT64_FORMAT,
+					trace->now, cluster_node_id, MyProcPid, (int)MyBackendType,
+					prior->identity.generation, trace->stage, (int)result,
+					cluster_cf_held(ShareLock), cluster_cf_held_is_usable(ShareLock),
+					cluster_cf_held_by(ShareLock, &config_aux_caller), cluster_cf_owner_cookie(ShareLock),
+					cluster_cf_held(ExclusiveLock), cluster_cf_held_is_usable(ExclusiveLock),
+					cluster_cf_held_by(ExclusiveLock, &config_aux_caller), cluster_cf_owner_cookie(ExclusiveLock),
+					trace->cookie, trace->reader_present, (int)trace->reader_result,
+					trace->release_checked, trace->release_complete, trace->cut_present,
+					trace->cut.epoch, trace->cut.generation, trace->cut.routing,
+					trace->cut.incarnation, trace->cut.master, present,
+					present && attempt.caller == &config_aux_caller,
+					attempt.sequence, (int)attempt.mode, attempt.cooperative,
+					(int)attempt.result, (int)attempt.source, (int)attempt.owner_state_at_return,
+					attempt.request_id, attempt.request_epoch, attempt.control_owner_id)));
+}
+
 static bool
 config_aux_cut(ConfigAuxCut *cut)
 {
@@ -4731,22 +4800,39 @@ config_aux_clear(void)
 
 static ClusterControlRootResult
 config_aux_finish(const ClusterSharedConfigRef *prior, ClusterSharedConfigSelected *out,
-				  ClusterSharedConfigImage *image)
+				  ClusterSharedConfigImage *image, ConfigAuxTrace *trace)
 {
 	ConfigAuxRead *pending = &config_aux_read;
 	ConfigAuxCut now;
 	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 
+	if (trace != NULL) {
+		trace->cookie = pending->cookie;
+		trace->reader_present = true;
+		trace->reader_result = pending->result;
+		trace->cut_present = true;
+		trace->cut = pending->cut;
+		trace->release_checked = true;
+		trace->stage = "release_wait";
+	}
 	cluster_cf_retirement_poll();
 	if (!cluster_cf_release_completed(ShareLock, pending->cookie)) {
 		if (cluster_cf_held_by(ShareLock, &config_aux_caller))
 			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		if (trace != NULL)
+			trace->stage = "release_lost";
 		config_aux_clear(); /* A different owner's completion is not ours. */
 		return result;
+	}
+	if (trace != NULL) {
+		trace->release_complete = true;
+		trace->stage = "cut_stale";
 	}
 	if (memcmp(prior, &pending->prior, sizeof(*prior)) == 0 && config_aux_cut(&now)
 		&& memcmp(&now, &pending->cut, sizeof(now)) == 0) {
 		result = pending->result;
+		if (trace != NULL)
+			trace->stage = "reader_result";
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
 			*out = pending->selected;
@@ -4765,6 +4851,8 @@ cluster_control_root_config_poll(const ClusterSharedConfigRef *prior,
 	MemoryContext caller = CurrentMemoryContext;
 	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	ConfigAuxRead *pending = &config_aux_read;
+	ConfigAuxTrace observed;
+	ConfigAuxTrace *trace;
 
 	if (history_ranges_overlap(prior, sizeof(*prior), out, sizeof(*out))
 		|| history_ranges_overlap(prior, sizeof(*prior), image, sizeof(*image))
@@ -4777,20 +4865,27 @@ cluster_control_root_config_poll(const ClusterSharedConfigRef *prior,
 	if (prior == NULL || out == NULL || image == NULL || prior->identity.generation == 0
 		|| !cluster_shared_config || !cluster_enabled || MyBackendType != B_LMON)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	trace = config_aux_trace_begin(&observed);
 	PG_TRY();
 	{
 		/* An acquisition invalidated by control reconstruction may already
 		 * have been abandoned before any image existed. Keep that duty moving. */
 		cluster_cf_retirement_poll();
 		if (pending->pending)
-			result = config_aux_finish(prior, out, image);
-		else if (!cluster_cf_held(ExclusiveLock)
-				 && (!cluster_cf_held(ShareLock)
-					 || cluster_cf_acquire_pending_owned(ShareLock, &config_aux_caller))
-				 && cluster_cf_lock_poll_owned(ShareLock, &config_aux_caller)) {
+			result = config_aux_finish(prior, out, image, trace);
+		else if (cluster_cf_held(ExclusiveLock)) {
+			if (trace != NULL)
+				trace->stage = "blocked_x";
+		} else if (cluster_cf_held(ShareLock)
+				   && !cluster_cf_acquire_pending_owned(ShareLock, &config_aux_caller)) {
+			if (trace != NULL)
+				trace->stage = "blocked_s";
+		} else if (cluster_cf_lock_poll_owned(ShareLock, &config_aux_caller)) {
 			pending->cookie = cluster_cf_owner_cookie(ShareLock);
 			if (!cluster_cf_held_is_clusterwide(ShareLock) || pending->cookie == 0
 				|| !config_aux_cut(&pending->cut)) {
+				if (trace != NULL)
+					trace->stage = "grant_unproven";
 				cluster_control_root_config_cancel();
 				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 			} else {
@@ -4803,7 +4898,7 @@ cluster_control_root_config_poll(const ClusterSharedConfigRef *prior,
 				MemoryContextSwitchTo(caller);
 				pending->pending = true;
 				(void)cluster_cf_unlock_owned(ShareLock, &config_aux_caller);
-				result = config_aux_finish(prior, out, image);
+				result = config_aux_finish(prior, out, image, trace);
 			}
 		}
 	}
@@ -4814,6 +4909,7 @@ cluster_control_root_config_poll(const ClusterSharedConfigRef *prior,
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	config_aux_trace_end(trace, prior, result);
 	return result;
 }
 

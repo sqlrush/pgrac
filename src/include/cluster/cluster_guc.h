@@ -165,6 +165,8 @@ extern char *cluster_trace_visibility_relids;
 extern bool cluster_trace_visibility_enabled;
 struct ClusterVisibilityTraceFilter;
 extern struct ClusterVisibilityTraceFilter cluster_trace_visibility_filter;
+/* Bounded process-local selected-config CF diagnostics; default off. */
+extern bool cluster_trace_control_config;
 
 /* spec-6.4: ADG physical standby / read-only service configuration. */
 #define CLUSTER_DG_ROLE_PRIMARY 0
