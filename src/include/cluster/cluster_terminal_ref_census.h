@@ -773,12 +773,17 @@ typedef struct ClusterCtrcActiveScan {
 	 * Worker source mode also requires the original semantic source/cohort.
 	 * Zero counts coverage, not producer-retention or freeze authority. */
 	uint64 unqualified_entries;
+	/* Local unknown-identity ingress cut; not a retention certificate. */
+	uint64 unqualified_registration_generation;
 	bool lock_busy;
 } ClusterCtrcActiveScan;
 
 extern bool cluster_ctrc_active_scan_begin(ClusterCtrcActiveScan *scan,
 										   FullTransactionId reference_full);
 extern void cluster_ctrc_active_scan_step(ClusterCtrcActiveScan *scan);
+/* No locks or callbacks. New unqualified participants revoke an older cut,
+ * including completed local samples. This does not revoke remote reports. */
+extern bool cluster_ctrc_active_scan_registration_current(const ClusterCtrcActiveScan *scan);
 /* The worker borrows its original semantic source cut for every slice.
  * Source coverage is not a producer-retention or freeze certificate. */
 struct ClusterSemanticActiveSampleFence;

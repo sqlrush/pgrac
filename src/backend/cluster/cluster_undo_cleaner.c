@@ -263,7 +263,9 @@ cluster_undo_cleaner_active_sample_current(const ClusterUndoCleanerActiveSample 
 			  && undo_cleaner_state->workers[0].pid == expected->worker_pid
 			  && memcmp(&undo_cleaner_state->active_sample, expected, sizeof(*expected)) == 0;
 	LWLockRelease(&undo_cleaner_state->lwlock);
-	return current;
+	/* Check after all callbacks/cleaner ownership: late unknown ingress must
+	 * also revoke a completed sample retained by LMON or a local consumer. */
+	return current && cluster_ctrc_active_scan_registration_current(&expected->scan);
 }
 
 /* Worker0 is the sole publisher. Keep the last completed image while the

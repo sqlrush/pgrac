@@ -86,7 +86,7 @@
 #endif
 
 #define CLUSTER_CTRC_SHMEM_MAGIC UINT32_C(0x43545243)
-#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(11)
+#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(12)
 #ifndef CLUSTER_CTRC_TEST_TABLE_VISIT
 #define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) ((void)0)
 #endif
@@ -1447,6 +1447,8 @@ typedef struct ClusterCtrcSharedHeader {
 	uint64 global_request_generation;
 	uint64 full_refusal_count;
 	pg_atomic_uint64 stats[CTRC_STAT_COUNT];
+	/* Saturating, postmaster-local identity-ingress invalidation sequence. */
+	pg_atomic_uint64 unqualified_registration_generation;
 	pg_atomic_uint64 test_barrier_hit_count;
 	pg_atomic_uint32 test_barrier_phase;
 	CtrcCleanerWorkerObservationShared workers[CLUSTER_CTRC_CLEANER_WORKERS];
@@ -1769,6 +1771,35 @@ ctrc_participant_locks_release(uint32 mask)
 			LWLockRelease(&CtrcShared->participant_locks[i].lock);
 }
 
+/* Called under the original participant shard lock, before publication.
+ * A foreign/unknown receiver has no local origin/PGPROC handoff that an
+ * earlier cursor can rely on. Revoke local observations even if its slot
+ * was already visited. Exact local origin -> participant transfers retain
+ * the original ordered-scan protection and need no restart. */
+static void
+ctrc_note_unqualified_registration(void)
+{
+	uint64 generation;
+
+	generation = pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation);
+	while (generation != UINT64_MAX
+		&& !pg_atomic_compare_exchange_u64(&CtrcShared->unqualified_registration_generation,
+			&generation, generation + 1))
+		;
+	/* Saturation permanently refuses new samples; never wrap into an old cut. */
+}
+
+bool
+cluster_ctrc_active_scan_registration_current(const ClusterCtrcActiveScan *scan)
+{
+	return scan != NULL && ctrc_runtime_attached()
+		&& (scan->status == CTRC_ACTIVE_SCAN_INCOMPLETE || scan->status == CTRC_ACTIVE_SCAN_COMPLETE)
+		&& scan->unqualified_registration_generation != 0
+		&& scan->unqualified_registration_generation != UINT64_MAX
+		&& scan->unqualified_registration_generation
+			== pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation);
+}
+
 /* A sample scans the original fixed arrays without consuming cleaner budgets.
  * The captured reference is only the widening anchor, not a legal future xid. */
 bool
@@ -1782,6 +1813,11 @@ cluster_ctrc_active_scan_begin(ClusterCtrcActiveScan *scan, FullTransactionId re
 		|| !TransactionIdIsNormal(XidFromFullTransactionId(reference_full))
 		|| !cluster_ctrc_shmem_ready()
 		|| CtrcShared->origin_key_entries > UINT64_MAX - CtrcShared->participant_key_entries)
+		return false;
+	scan->unqualified_registration_generation
+		= pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation);
+	if (scan->unqualified_registration_generation == 0
+		|| scan->unqualified_registration_generation == UINT64_MAX)
 		return false;
 	scan->reference_full = reference_full;
 	scan->min_full = reference_full;
@@ -1810,7 +1846,7 @@ ctrc_active_scan_step(ClusterCtrcActiveScan *scan,
 			|| source->admitted_incarnation[source->local_node_id]
 				   != source->local_boot_incarnation))
 		goto invalid;
-	if (!ctrc_runtime_attached()
+	if (!cluster_ctrc_active_scan_registration_current(scan)
 		|| CtrcShared->origin_key_entries > UINT64_MAX - CtrcShared->participant_key_entries
 		|| scan->total_entries
 			   != CtrcShared->origin_key_entries + CtrcShared->participant_key_entries
@@ -1905,6 +1941,9 @@ ctrc_active_scan_step(ClusterCtrcActiveScan *scan,
 		}
 		scan->next_index++;
 	}
+	/* Also cover a registration between the first check and the last row. */
+	if (!cluster_ctrc_active_scan_registration_current(scan))
+		goto invalid;
 	if (scan->next_index == scan->total_entries)
 		scan->status = CTRC_ACTIVE_SCAN_COMPLETE;
 	return;
@@ -2316,6 +2355,7 @@ cluster_ctrc_shmem_init(void)
 		CtrcShared->global_request_generation = 1;
 		for (int i = 0; i < CTRC_STAT_COUNT; i++)
 			pg_atomic_init_u64(&CtrcShared->stats[i], 0);
+		pg_atomic_init_u64(&CtrcShared->unqualified_registration_generation, 1);
 		pg_atomic_init_u64(&CtrcShared->test_barrier_hit_count, 0);
 		pg_atomic_init_u32(&CtrcShared->test_barrier_phase, CTRC_TEST_BARRIER_NONE);
 		for (unsigned i = 0; i < CLUSTER_CTRC_CLEANER_WORKERS; i++) {
@@ -5472,6 +5512,7 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 	bool check_object;
 	bool sampled = false;
 	bool local_origin;
+	bool participant_was_empty;
 
 	if (handle != NULL)
 		MemSet(handle, 0, sizeof(*handle));
@@ -5518,6 +5559,7 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 	receipts = ctrc_receipt_entries();
 	ctrc_participant_locks_acquire(ctrc_participant_lock_mask(participant_index));
 	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
+	participant_was_empty = ctrc_bytes_zero(participant, sizeof(*participant));
 	if (FullTransactionIdIsValid(original_full_xid)
 		&& FullTransactionIdIsValid(participant->original_full_xid)
 		&& !FullTransactionIdEquals(original_full_xid, participant->original_full_xid)) {
@@ -5567,6 +5609,10 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 		ctrc_receipt_handle_fill(handle, participant, participant_index, &receipts[receipt_index],
 								 receipt_index);
 	}
+	if (participant_was_empty && !ctrc_bytes_zero(participant, sizeof(*participant))
+		&& (!FullTransactionIdIsNormal(participant->original_full_xid)
+			|| XidFromFullTransactionId(participant->original_full_xid) != participant->key.xid))
+		ctrc_note_unqualified_registration();
 
 	LWLockRelease(&CtrcShared->receipt_lock);
 	ctrc_participant_locks_release(ctrc_participant_lock_mask(participant_index));
@@ -6446,10 +6492,18 @@ cluster_ctrc_participant_request_shared(const ClusterCtrcTxnKeyV1 *key,
 		&& !cluster_normal_stop_service_new_work(true)) {
 		*first_reason = CTRC_SEAL_REASON_ACK_UNAVAILABLE;
 		result = CTRC_SEAL_REPLY_DENIED;
-	} else
+	} else {
+		/* CLOSE may create its tombstone before a durability callback throws.
+		 * Revoke first, while the original shard still hides the empty slot.
+		 * A later refusal may conservatively revoke, but never changes the FSM. */
+		if (ctrc_bytes_zero(&participant_before, sizeof(participant_before))
+			&& ctrc_participant_identity_valid(key, identity)
+			&& grant_generation != 0 && seal_generation != 0)
+			ctrc_note_unqualified_registration();
 		result = cluster_ctrc_participant_request_apply(participant, ack_summary, key, identity,
 														grant_generation, seal_generation,
 														suboperation, first_reason, ack_out);
+	}
 	progressed = result != CTRC_SEAL_REPLY_BLOCKED_RETAIN && result != CTRC_SEAL_REPLY_DENIED
 				 && memcmp(participant, &participant_before, sizeof(participant_before)) != 0;
 	LWLockRelease(&CtrcShared->receipt_lock);

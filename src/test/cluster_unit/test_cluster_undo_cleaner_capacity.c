@@ -167,6 +167,18 @@ cluster_semantic_activation_active_sample_current(const ClusterSemanticActiveSam
 		   && expected->admission_publication_seq == test_sample_admission_identity;
 }
 
+static bool test_census_registration_current = true;
+
+/* Actual shared ingress/generation behavior is covered by ctrc_cleaner.
+ * This leaf only observes whether the real worker consults that last fence. */
+bool
+cluster_ctrc_active_scan_registration_current(const ClusterCtrcActiveScan *scan)
+{
+	if (test_lock_depth != 0 || scan == NULL)
+		abort();
+	return test_census_registration_current;
+}
+
 bool
 cluster_ctrc_active_scan_begin(ClusterCtrcActiveScan *scan, FullTransactionId reference)
 {
@@ -551,6 +563,7 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 static void
 reset_wait_fixture(void)
 {
+	test_census_registration_current = true;
 	free(undo_cleaner_state);
 	undo_cleaner_state = NULL;
 	cluster_undo_cleaner_shmem_init();
@@ -1233,7 +1246,7 @@ UT_TEST(test_complete_sample_is_shared_without_publishing_partial_round)
 
 UT_TEST(test_complete_sample_rechecks_original_fences_and_worker_lifecycle)
 {
-	for (int fault = 0; fault < 9; fault++) {
+	for (int fault = 0; fault < 10; fault++) {
 		ClusterUndoCleanerActiveSample sample, rejected;
 		bool remaining;
 
@@ -1269,6 +1282,9 @@ UT_TEST(test_complete_sample_rechecks_original_fences_and_worker_lifecycle)
 			break;
 		case 8:
 			test_maintenance_cut = true;
+			break;
+		case 9:
+			test_census_registration_current = false;
 			break;
 		}
 		UT_ASSERT(!cluster_undo_cleaner_active_sample_current(&sample));
