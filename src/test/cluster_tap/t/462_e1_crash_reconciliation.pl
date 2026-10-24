@@ -265,12 +265,13 @@ with_cohort('e1_pre2_crash_462', 0, sub {
 	my $data_identity = $cluster->_data_identity;
 	my @old_writers = map { +{%$_} } @{$cluster->{writers}};
 	my $old_generation = $cluster->{selected_root}{generation};
+	# Include crash-time backend exits and dead-client cleanup in the PANIC window.
+	my $offsets = log_offsets($cluster);
 	ok(crash_all($cluster), 'SIGKILL all four instances and observe owned process exit');
 	# Finish dead client pipes before creating any new postmaster; errors are
 	# expected here and never count as a recovery result.
 	for my $session (@sessions) { eval { $session->quit; }; }
 	@sessions = ();
-	my $offsets = log_offsets($cluster);
 	is_deeply($cluster->_data_identity, $data_identity, 'cold start retains the same DATA and WAL objects');
 	$cluster->start_cluster;
 	pass('cold native shared_start returns all four members to OPEN');
@@ -291,7 +292,7 @@ with_cohort('e1_pre2_crash_462', 0, sub {
 		is($rows, join("\n", map { "$_|committed-$_" } 1 .. 64),
 			"node$i sees every committed row and no uncommitted row");
 		unlike(log_since($nodes[$i], $offsets->[$i]), qr/PANIC:/,
-			"node$i emits no PANIC during cold recovery and reconciliation");
+			"node$i emits no PANIC during crash, cold recovery and reconciliation");
 	}
 	$cluster->stop_cluster;
 	pass('all four recovered writers close through native shared_stop');
