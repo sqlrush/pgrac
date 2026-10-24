@@ -1016,6 +1016,61 @@ failed:
 	(void)cluster_recovery_stamp_fail_v1(&before.handle);
 	return false;
 }
+bool
+cluster_recovery_stamp_ctrc_prepare_v2(const ClusterRecoveryStampOwnerV1 *owner,
+	const uint8 *payload, Size length, ClusterRecoveryStampHandleV1 *out,
+	ClusterUndoSmgrRecoveryStampV1 *target)
+{
+	ClusterUndoSmgrRecoveryStampV1 prepared;
+	ClusterRecoveryStampHandleV1 handle;
+	uint16 target_thread;
+	volatile bool accepted = false;
+
+	/* Keep public outputs private and unchanged until both original owners
+	 * have accepted. In particular, do not zero an aliased input/live slot. */
+	if (!stamp_actor() || MyBackendType != B_STARTUP || CritSectionCount != 0
+		|| owner == NULL || payload == NULL || out == NULL || target == NULL
+		|| owner->executor_pid != MyProcPid || length != CLUSTER_RECOVERY_CTRC_BYTES
+		|| stamp_ranges_overlap(out, sizeof(*out), target, sizeof(*target))
+		|| stamp_ranges_overlap(out, sizeof(*out), owner, sizeof(*owner))
+		|| stamp_ranges_overlap(target, sizeof(*target), owner, sizeof(*owner))
+		|| stamp_ranges_overlap(out, sizeof(*out), payload, length)
+		|| stamp_ranges_overlap(target, sizeof(*target), payload, length)
+		|| stamp_ranges_overlap(out, sizeof(*out), cluster_recovery_plan_shmem,
+			   sizeof(*cluster_recovery_plan_shmem))
+		|| stamp_ranges_overlap(target, sizeof(*target), cluster_recovery_plan_shmem,
+			   sizeof(*cluster_recovery_plan_shmem))
+		|| !stamp_payload_matches(owner, CLUSTER_RECOVERY_STAMP_D0, payload, length,
+			   &target_thread))
+		return false;
+
+	/* All codec work and descriptor acquisition precede PRE_INSERT. The
+	 * target API owns its own failed preparation; only a successful token
+	 * belongs to this wrapper and may be closed on window refusal/ERROR. */
+	if (!cluster_undo_smgr_recovery_ctrc_prepare_v2(payload, length,
+			owner->writer.ref.claim.identity.system_identifier, &prepared))
+		return false;
+	PG_TRY();
+	{
+		accepted = cluster_recovery_stamp_prepare_v1(owner, CLUSTER_RECOVERY_STAMP_D0,
+			payload, length, &handle);
+	}
+	PG_CATCH();
+	{
+		(void)cluster_undo_smgr_recovery_ctrc_close_v2(prepared);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!accepted) {
+		(void)cluster_undo_smgr_recovery_ctrc_close_v2(prepared);
+		return false;
+	}
+
+	memcpy(out, &handle, sizeof(handle));
+	memcpy(target, &prepared, sizeof(prepared));
+	return true;
+}
+
 XLogRecPtr
 cluster_recovery_stamp_ctrc_apply_v2(const ClusterRecoveryStampHandleV1 *handle,
 								   ClusterUndoSmgrRecoveryStampV1 stamp,

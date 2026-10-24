@@ -95,6 +95,17 @@ extern bool cluster_recovery_stamp_inserted_v1(const ClusterRecoveryStampHandleV
  * the original inserter and the remaining independent proofs are required. */
 extern bool cluster_recovery_stamp_ctrc_inserted_v2(const ClusterRecoveryStampHandleV1 *handle,
 													XLogRecPtr end);
+/* Dormant Startup preparation before any critical section. Prepare the
+ * original held-FD D0 target first, then the original exact PRE_INSERT window.
+ * If window preparation refuses or raises ERROR, close only this call's
+ * newly prepared target; propagate ERROR. Both private outputs publish only
+ * together on success and remain unchanged on refusal. Inputs/outputs must
+ * be disjoint from each other and the live replay region. The immutable
+ * owner/payload and original authority, graph, pins and target reservation
+ * remain caller prerequisites. Does not insert WAL or authorize a live path. */
+extern bool cluster_recovery_stamp_ctrc_prepare_v2(const ClusterRecoveryStampOwnerV1 *owner,
+	const uint8 *payload, Size length, ClusterRecoveryStampHandleV1 *out,
+	ClusterUndoSmgrRecoveryStampV1 *target);
 /* The original executor's dormant D0 emitter. The caller must have completed
  * all readiness/authority/capacity checks and hold the immutable prepared
  * payload while in its critical section. This performs exactly one native
