@@ -187,6 +187,32 @@ extern ClusterRelmapV2ClearResult
 cluster_relmap_retention_census_recovery_arbitrate_cold(ClusterRelmapRetentionCensus *census,
 														Oid dbid);
 
+/* Original execution-owner follow-on, once after that consumer returns
+ * CLEARED_POSTREAD. Retain its exact source/full control ROOT/redo/serial and
+ * every old pin; require original merger/X/shared-catalog ownership. Under
+ * that same owner, synchronously build a distinct OBSERVED ROOT using the
+ * original held-fd two-pass producer. Recheck source, all UNKNOWN directory
+ * metadata/pins and ownership before and after physical I/O. UNKNOWN is a
+ * required old state, never floor/lifetime or native qualification.
+ *
+ * Missing initial ownership leaves the follow-on unconsumed. Once entered,
+ * success/refusal/ERROR consumes it: no automatic retry, scope replacement or
+ * old observation revival. UNKNOWN/ERROR arbitration provides no follow-on.
+ * All old observations stay invalid; all pins/debt remain. Refusal/ERROR frees
+ * only new local storage; ERROR propagates. Output is published only after
+ * complete observation and final original checks. Fresh exclusive output;
+ * known census/directory/ROOT-pointer overlap refuses unchanged, distinct
+ * refusal sets *out NULL. root_budget covers the new ROOT producer only.
+ *
+ * Keep the original owner, held fd/cuts/pins and old census/directories alive
+ * through the new cursor's lifetime. Destroy it on every exit, including
+ * PG_FINALLY. This returns only candidate observation, never fresh qualified
+ * census publication, all-origin/native completion, COMPLETE/release, G_ref,
+ * D0 discharge, allocator or activation authority. */
+extern bool cluster_relmap_retention_census_reobserve_cold(ClusterRelmapRetentionCensus *census,
+														   size_t root_budget,
+														   ClusterRecoveryRootSet **out);
+
 /* Opaque, local-only preparation of every pending namespace in the original
  * DRAINED physical census, including backup-only pending. No caller namespace
  * list is accepted. Hold original merger claim and namespace X across this

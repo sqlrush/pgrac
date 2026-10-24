@@ -579,6 +579,7 @@ test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
 		test_cluster_relmap_census_batch.inc \
 		test_cluster_relmap_census_cold.inc \
 		test_cluster_relmap_census_cold_consume.inc \
+		test_cluster_relmap_census_cold_reobserve.inc \
 		test_cluster_recovery_root_reobserve.inc \
 		test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c \
 		test_cluster_recovery_crypto_boundary.h unit_test.h \
@@ -632,6 +633,7 @@ test_cluster_relmap_census_side: test_cluster_relmap_retention_census.c \
 		test_cluster_relmap_census_batch.inc \
 		test_cluster_relmap_census_cold.inc \
 		test_cluster_relmap_census_cold_consume.inc \
+		test_cluster_relmap_census_cold_reobserve.inc \
 		test_cluster_recovery_root_reobserve.inc \
 		test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c \
 		test_cluster_recovery_crypto_boundary.h \

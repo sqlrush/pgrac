@@ -50,6 +50,11 @@ struct ClusterRelmapRetentionCensus {
 	/* Valid only between an emitted namespace and the next cursor advance. */
 	ClusterRelmapV2View rebuild_view;
 	bool rebuild_ready;
+	/* One-shot, original execution-owner observation provenance only. */
+	ClusterRelmapRecoverySourceObservationV1 cold_observe_source;
+	uint8 cold_observe_pins[32];
+	uint16 cold_observe_origin;
+	bool cold_observe_ready;
 };
 
 typedef struct CensusRecoveryItem {
@@ -81,6 +86,7 @@ census_failed(ClusterRelmapRetentionCensus *census, ClusterRelmapCensusResult re
 {
 	census->result = result;
 	census->rebuild_ready = false;
+	census->cold_observe_ready = false;
 	memset(&census->rebuild_view, 0, sizeof(census->rebuild_view));
 	for (size_t i = 0; i < census->origin_count; i++)
 		cluster_relmap_retention_invalidate(census->origins[census->nodes[i]].directory);
@@ -337,16 +343,16 @@ census_recovery_overlap(const void *a, size_t an, const void *b, size_t bn)
 }
 
 static bool
-census_recovery_output_overlap(const ClusterRelmapRetentionCensus *census,
-							   const ClusterRelmapCensusRecovery *out)
+census_recovery_output_overlap(const ClusterRelmapRetentionCensus *census, const void *out,
+							   size_t bytes)
 {
 	if (census == NULL)
 		return false;
-	if (census_recovery_overlap(out, sizeof(*out), census, sizeof(*census))
-		|| census_recovery_overlap(out, sizeof(*out), census->roots, 1))
+	if (census_recovery_overlap(out, bytes, census, sizeof(*census))
+		|| census_recovery_overlap(out, bytes, census->roots, 1))
 		return true;
 	for (size_t i = 0; i < census->origin_count; i++)
-		if (census_recovery_overlap(out, sizeof(*out), census->origins[census->nodes[i]].directory,
+		if (census_recovery_overlap(out, bytes, census->origins[census->nodes[i]].directory,
 									sizeof(ClusterRelmapRetentionDirectory)))
 			return true;
 	return false;
@@ -376,14 +382,13 @@ census_recovery_pins_digest(const ClusterRelmapRetentionCensus *census, uint8 di
 }
 
 static bool
-census_cold_source_current(const ClusterRelmapRetentionCensus *census,
-						   const ClusterRelmapV2View *pending,
+census_cold_source_current(const ClusterRelmapRetentionCensus *census, uint16 origin,
 						   const ClusterRelmapRecoverySourceObservationV1 *source)
 {
 	return source->scope_serial != 0
 		   && source->source.claim.identity.system_identifier == census->system_identifier
 		   && source->source.claim.database_incarnation == census->database_incarnation
-		   && source->source.claim.identity.origin_node_id == pending->pending_owner.node
+		   && source->source.claim.identity.origin_node_id == origin
 		   && memcmp(source->source.claim.identity.storage_uuid, census->storage_uuid, 16) == 0
 		   && cluster_undo_recovery_cold_single_source_v1(
 			   &source->source, &source->checkpoint, source->native_redo, source->scope_serial);
@@ -396,7 +401,7 @@ cluster_relmap_retention_census_recovery_prepare_cold(ClusterRelmapRetentionCens
 	ClusterRelmapRecoveryHandle *volatile handle = NULL;
 	volatile bool accepted = false;
 
-	if (out == NULL || census_recovery_output_overlap(census, out))
+	if (out == NULL || census_recovery_output_overlap(census, out, sizeof(*out)))
 		return false;
 	memset(out, 0, sizeof(*out));
 	if (census == NULL || census->result != CLUSTER_RELMAP_CENSUS_DRAINED || !cluster_shared_catalog
@@ -419,7 +424,7 @@ cluster_relmap_retention_census_recovery_prepare_cold(ClusterRelmapRetentionCens
 				|| !cluster_relmap_recovery_prepare_cold_v1(&scratch.identity, &scratch.pending,
 															(ClusterRelmapRecoveryHandle **)&handle)
 				|| !cluster_relmap_recovery_handle_source_v1(handle, &source)
-				|| !census_cold_source_current(census, &scratch.pending, &source))
+				|| !census_cold_source_current(census, scratch.pending.pending_owner.node, &source))
 				break;
 			/* A saved OBSERVED digest cannot conceal physical changes during
 			 * native preparation, including unrelated/new namespaces. */
@@ -436,7 +441,7 @@ cluster_relmap_retention_census_recovery_prepare_cold(ClusterRelmapRetentionCens
 				|| memcmp(&source.checkpoint, &current.checkpoint, sizeof(source.checkpoint)) != 0
 				|| source.native_redo != current.native_redo
 				|| source.scope_serial != current.scope_serial
-				|| !census_cold_source_current(census, &scratch.pending, &current)
+				|| !census_cold_source_current(census, scratch.pending.pending_owner.node, &current)
 				|| !census_recovery_current(census)
 				|| !census_recovery_pins_digest(census, current_pins)
 				|| memcmp(saved_pins, current_pins, sizeof(saved_pins)) != 0
@@ -464,15 +469,14 @@ cluster_relmap_retention_census_recovery_prepare_cold(ClusterRelmapRetentionCens
 /* After this call revokes physical observations, UNKNOWN is a required state,
  * never a qualification. Original native authority and every pin stay held. */
 static bool
-census_cold_consumer_current(const ClusterRelmapRetentionCensus *census,
-							 const ClusterRelmapCensusRecovery *input,
+census_cold_consumer_current(const ClusterRelmapRetentionCensus *census, uint16 origin,
 							 const ClusterRelmapRecoverySourceObservationV1 *source,
 							 const uint8 saved_pins[32], ClusterRelmapRetentionState state)
 {
 	uint8 pins[32];
 
 	/* Complete original source/owner I/O before the final local pin check. */
-	if (!census_cold_source_current(census, &input->pending, source))
+	if (!census_cold_source_current(census, origin, source))
 		return false;
 	for (size_t i = 0; i < census->origin_count; i++)
 		if (!census_origin_same_in_state(census, census->nodes[i], state))
@@ -510,22 +514,26 @@ cluster_relmap_retention_census_recovery_arbitrate_cold(ClusterRelmapRetentionCe
 			 * native base I/O, within this same original isolated call. */
 			if (!cluster_relmap_recovery_handle_source_v1(handle, &source)
 				|| !census_recovery_current(census)
-				|| !census_cold_consumer_current(census, &input, &source, saved_pins,
-												 CLUSTER_RELMAP_RETENTION_BUILDING))
+				|| !census_cold_consumer_current(census, input.pending.pending_owner.node, &source,
+												 saved_pins, CLUSTER_RELMAP_RETENTION_BUILDING))
 				break;
 			/* Native control-ROOT authority is independent of these physical
 			 * observations. Revoke them BEFORE the first arbiter attempt. */
 			census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
-			if (!census_cold_consumer_current(census, &input, &source, saved_pins,
-											  CLUSTER_RELMAP_RETENTION_UNKNOWN))
+			if (!census_cold_consumer_current(census, input.pending.pending_owner.node, &source,
+											  saved_pins, CLUSTER_RELMAP_RETENTION_UNKNOWN))
 				break;
 			native_result = cluster_relmap_arbitrate_pending_v2(
 				(ClusterRelmapRecoveryHandle **)&handle, &input.identity, &input.pending);
-			if (!census_cold_consumer_current(census, &input, &source, saved_pins,
-											  CLUSTER_RELMAP_RETENTION_UNKNOWN))
+			if (!census_cold_consumer_current(census, input.pending.pending_owner.node, &source,
+											  saved_pins, CLUSTER_RELMAP_RETENTION_UNKNOWN))
 				break;
-			if (native_result == CLUSTER_RELMAP_V2_CLEARED_POSTREAD)
+			if (native_result == CLUSTER_RELMAP_V2_CLEARED_POSTREAD) {
+				census->cold_observe_source = source;
+				memcpy(census->cold_observe_pins, saved_pins, sizeof(saved_pins));
+				census->cold_observe_origin = input.pending.pending_owner.node;
 				result = CLUSTER_RELMAP_V2_CLEARED_POSTREAD;
+			}
 		} while (false);
 	}
 	PG_FINALLY();
@@ -537,7 +545,63 @@ cluster_relmap_retention_census_recovery_arbitrate_cold(ClusterRelmapRetentionCe
 			cluster_relmap_recovery_handle_release_v1((ClusterRelmapRecoveryHandle **)&handle);
 	}
 	PG_END_TRY();
+	/* Cleanup above revokes all old observations. Only a normal successful
+	 * original-owner return may expose this one-shot follow-on; never ERROR. */
+	if (result == CLUSTER_RELMAP_V2_CLEARED_POSTREAD)
+		census->cold_observe_ready = true;
 	return result;
+}
+
+bool
+cluster_relmap_retention_census_reobserve_cold(ClusterRelmapRetentionCensus *census,
+											   size_t root_budget, ClusterRecoveryRootSet **out)
+{
+	ClusterRecoveryRootSet *volatile fresh = NULL;
+	volatile bool accepted = false;
+
+	if (out == NULL || census_recovery_output_overlap(census, out, sizeof(*out)))
+		return false;
+	*out = NULL;
+	if (census == NULL || !census->cold_observe_ready
+		|| census->result != CLUSTER_RELMAP_CENSUS_CHANGED || !cluster_shared_catalog
+		|| !cluster_recovery_merge_claim_is_held() || !cluster_relmap_authority_x_held())
+		return false;
+	/* Consume before any source/hash/I/O work, including work which ERRORs. */
+	census->cold_observe_ready = false;
+	PG_TRY();
+	{
+		do {
+			ClusterRecoveryRootsResult result;
+
+			if (!census_cold_consumer_current(
+					census, census->cold_observe_origin, &census->cold_observe_source,
+					census->cold_observe_pins, CLUSTER_RELMAP_RETENTION_UNKNOWN))
+				break;
+			result = cluster_recovery_root_set_reobserve_begin(census->roots, root_budget,
+															   (ClusterRecoveryRootSet **)&fresh);
+			while (result == CLUSTER_RECOVERY_ROOTS_MORE || result == CLUSTER_RECOVERY_ROOTS_ENTRY
+				   || result == CLUSTER_RECOVERY_ROOTS_BYTES) {
+				ClusterRecoveryRootsEvent event;
+				result = cluster_recovery_root_set_step((ClusterRecoveryRootSet *)fresh, &event);
+			}
+			if (result != CLUSTER_RECOVERY_ROOTS_OBSERVED
+				|| !census_cold_consumer_current(
+					census, census->cold_observe_origin, &census->cold_observe_source,
+					census->cold_observe_pins, CLUSTER_RELMAP_RETENTION_UNKNOWN))
+				break;
+			*out = (ClusterRecoveryRootSet *)fresh;
+			fresh = NULL;
+			accepted = true;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		if (!accepted)
+			census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
+		cluster_recovery_root_set_destroy((ClusterRecoveryRootSet *)fresh);
+	}
+	PG_END_TRY();
+	return accepted;
 }
 
 void
