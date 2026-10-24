@@ -93,6 +93,8 @@ cluster_gcs_block_resource_x_bootstrap_tick(const ResourceXBootstrapWork *work);
 /* One bounded source-side callback; claims the existing continuous pin. */
 extern ResourceXApplyResult
 cluster_gcs_block_resource_x_source_finish_tick(const ResourceXAcquisitionRef *ref);
+extern ResourceXApplyResult
+cluster_gcs_block_resource_x_source_drain_tick(const ResourceXSourceDrainWork *work);
 
 /* Stage 8 8.15-PRE-CAP D1: diagnostic-only failure axes.  These values are
  * process-internal observability, not wire outcomes or a second authority.

@@ -576,6 +576,19 @@ typedef struct ResourceXSourceFinishClaim {
 	int32 buffer_id;
 } ResourceXSourceFinishClaim;
 
+/* A retained authenticated control request, never an authority or raw pin.
+ * Every retry must enter current semantic admission and recheck the peer. */
+typedef struct ResourceXSourceDrainWork {
+	ResourceXDecodedCommon request;
+	uint64 r4_record_generation;
+	uint64 attempt_generation;
+	uint32 authenticated_connection_generation;
+	int32 master_node;
+} ResourceXSourceDrainWork;
+
+StaticAssertDecl(sizeof(ResourceXSourceDrainWork) == 120,
+				 "Resource-X local source-drain work must remain bounded");
+
 #define RESOURCE_X_PROGRESS_BOUND UINT32_C(0x00000001)
 #define RESOURCE_X_PROGRESS_T1 UINT32_C(0x00000002)
 #define RESOURCE_X_PROGRESS_T2 UINT32_C(0x00000004)
@@ -814,7 +827,8 @@ typedef enum ResourceXIntentProbeResult {
 	RESOURCE_X_INTENT_PROBE_SOURCE_FINISH = 6,
 	RESOURCE_X_INTENT_PROBE_SOURCE_SETTLEMENT = 7,
 	RESOURCE_X_INTENT_PROBE_MASTER_DURABLE = 8,
-	RESOURCE_X_INTENT_PROBE_BOOTSTRAP = 9
+	RESOURCE_X_INTENT_PROBE_BOOTSTRAP = 9,
+	RESOURCE_X_INTENT_PROBE_SOURCE_DRAIN = 10
 } ResourceXIntentProbeResult;
 
 typedef enum ResourceXIntentState {
@@ -1827,6 +1841,12 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_finish_defer_exac
 	const ResourceXDecodedFrame *block, int32 master_node,
 	const struct ClusterPcmOwnSnapshot *revoking, const ResourceXLocalOwnerHandle *owner,
 	int buffer_id);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_drain_defer_exact(
+	const ResourceXDecodedFrame *block, int32 master_node, uint64 r4_record_generation,
+	uint32 authenticated_connection_generation);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_drain_complete_exact(
+	const ResourceXSourceDrainWork *work, ResourceXApplyResult result);
+extern void cluster_pcm_lock_resource_x_source_drain_content_released(void);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_finish_claim_exact(
 	const ResourceXAcquisitionRef *successor, int32 owner_procno, ResourceXSourceFinishClaim *out);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_terminal_x_revoke_finish_drop_exact(

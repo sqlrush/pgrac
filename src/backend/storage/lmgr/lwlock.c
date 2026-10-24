@@ -92,6 +92,7 @@
 #include "postgres.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_content_trace.h"
+#include "cluster/cluster_pcm_lock.h"
 #endif
 
 #include "miscadmin.h"
@@ -1909,6 +1910,10 @@ LWLockRelease(LWLock *lock)
 	}
 
 #ifdef USE_PGRAC_CLUSTER
+	/* Publish only after the lock and its native waiter handoff are released.
+	 * The notifier is lock-free and is inert without a deferred source task. */
+	if (lock->tranche == LWTRANCHE_BUFFER_CONTENT)
+		cluster_pcm_lock_resource_x_source_drain_content_released();
 	cluster_content_trace_lock_changed(lock);
 #endif
 

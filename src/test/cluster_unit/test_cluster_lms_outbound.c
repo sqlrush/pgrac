@@ -194,6 +194,7 @@ static int ut_resource_x_probe_call_count = 0;
 static int ut_resource_x_probe_more_prefix = 0;
 static int ut_resource_x_delivery_tick_count = 0;
 static int ut_resource_x_source_finish_tick_count = 0;
+static int ut_resource_x_source_drain_tick_count = 0;
 static uint32 ut_resource_x_probe_max_budget = 0;
 static int ut_resource_x_rebind_count = 0;
 static uint32 ut_resource_x_rebind_generation = 0;
@@ -437,6 +438,20 @@ cluster_pcm_lock_resource_x_outbound_work_probe_exact(uint32 probe_budget,
 		probe_budget, slot_out, payload_out, payload_capacity, examined_out);
 
 	memset(delivery_out, 0, sizeof(*delivery_out));
+	if (result == RESOURCE_X_INTENT_PROBE_SOURCE_DRAIN) {
+		ResourceXSourceDrainWork work = { 0 };
+
+		UT_ASSERT(payload_capacity >= sizeof(work));
+		work.request.resource_formation = 17;
+		work.request.assertion_sequence = 41;
+		work.r4_record_generation = 77;
+		work.authenticated_connection_generation = 51;
+		work.master_node = 0;
+		memcpy(payload_out, &work, sizeof(work));
+		*examined_out = 1;
+		if (ut_resource_x_probe_script_pos >= ut_resource_x_probe_script_len)
+			ut_resource_x_probe_mode = RESOURCE_X_INTENT_PROBE_COMPLETE;
+	}
 	if (result == RESOURCE_X_INTENT_PROBE_DELIVERY
 		|| result == RESOURCE_X_INTENT_PROBE_SOURCE_FINISH) {
 		delivery_out->formation = 17;
@@ -470,6 +485,18 @@ cluster_gcs_block_resource_x_source_finish_tick(const ResourceXAcquisitionRef *r
 	UT_ASSERT_EQ(ref->formation, UINT64_C(17));
 	UT_ASSERT_EQ(ref->acquisition_generation, UINT64_C(41));
 	ut_resource_x_source_finish_tick_count++;
+	return RESOURCE_X_APPLY_BAD_STATE;
+}
+
+ResourceXApplyResult
+cluster_gcs_block_resource_x_source_drain_tick(const ResourceXSourceDrainWork *work)
+{
+	UT_ASSERT_EQ(work->request.resource_formation, UINT64_C(17));
+	UT_ASSERT_EQ(work->request.assertion_sequence, UINT64_C(41));
+	UT_ASSERT_EQ(work->r4_record_generation, UINT64_C(77));
+	UT_ASSERT_EQ(work->authenticated_connection_generation, UINT32_C(51));
+	UT_ASSERT_EQ(work->master_node, 0);
+	ut_resource_x_source_drain_tick_count++;
 	return RESOURCE_X_APPLY_BAD_STATE;
 }
 
@@ -912,6 +939,7 @@ ut_reset_log(void)
 	ut_resource_x_probe_max_budget = 0;
 	ut_resource_x_delivery_tick_count = 0;
 	ut_resource_x_source_finish_tick_count = 0;
+	ut_resource_x_source_drain_tick_count = 0;
 	ut_resource_x_rebind_count = 0;
 	ut_resource_x_rebind_generation = 0;
 	ut_resource_x_decode_count = 0;
@@ -1944,16 +1972,18 @@ UT_TEST(test_resource_x_intent_pump_drives_local_delivery_without_wire_or_busy_s
 UT_TEST(test_resource_x_intent_pump_defers_busy_and_serves_next_work)
 {
 	ut_reset_log();
-	ut_resource_x_probe_script[0] = RESOURCE_X_INTENT_PROBE_SOURCE_FINISH;
+	ut_resource_x_probe_script[0] = RESOURCE_X_INTENT_PROBE_SOURCE_DRAIN;
 	ut_resource_x_probe_script[1] = RESOURCE_X_INTENT_PROBE_DELIVERY;
-	ut_resource_x_probe_script[2] = RESOURCE_X_INTENT_PROBE_COMPLETE;
-	ut_resource_x_probe_script_len = 3;
+	ut_resource_x_probe_script[2] = RESOURCE_X_INTENT_PROBE_SOURCE_FINISH;
+	ut_resource_x_probe_script[3] = RESOURCE_X_INTENT_PROBE_COMPLETE;
+	ut_resource_x_probe_script_len = 4;
 	ut_wakeup_count = 0;
 
 	UT_ASSERT_EQ(cluster_lms_outbound_resource_x_intent_pump(), 0);
+	UT_ASSERT_EQ(ut_resource_x_source_drain_tick_count, 1);
 	UT_ASSERT_EQ(ut_resource_x_source_finish_tick_count, 1);
 	UT_ASSERT_EQ(ut_resource_x_delivery_tick_count, 1);
-	UT_ASSERT_EQ(ut_resource_x_probe_call_count, 3);
+	UT_ASSERT_EQ(ut_resource_x_probe_call_count, 4);
 	UT_ASSERT_EQ(ut_wakeup_count, 0);
 	UT_ASSERT_EQ(ut_sent_n, 0);
 }
@@ -1962,7 +1992,8 @@ UT_TEST(test_resource_x_intent_pump_reschedules_every_exhausted_last_result)
 {
 	ResourceXIntentProbeResult results[]
 		= { RESOURCE_X_INTENT_PROBE_DELIVERY, RESOURCE_X_INTENT_PROBE_SOURCE_FINISH,
-			RESOURCE_X_INTENT_PROBE_FOUND, RESOURCE_X_INTENT_PROBE_MORE };
+			RESOURCE_X_INTENT_PROBE_SOURCE_DRAIN, RESOURCE_X_INTENT_PROBE_FOUND,
+			RESOURCE_X_INTENT_PROBE_MORE };
 	int i;
 
 	for (i = 0; i < lengthof(results); i++) {

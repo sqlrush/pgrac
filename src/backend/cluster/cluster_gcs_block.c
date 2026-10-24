@@ -13076,6 +13076,70 @@ cluster_gcs_block_resource_x_source_finish_tick(const ResourceXAcquisitionRef *r
 	return result;
 }
 
+/* Retrying a retained control request supplies no authority. Use the same
+ * current admission, master/session and authenticated peer checks as ingress
+ * before re-entering the ordinary source path, which claims a fresh exact
+ * BufferDesc/terminal owner. No service pin survives a pre-image BUSY. */
+ResourceXApplyResult
+cluster_gcs_block_resource_x_source_drain_tick(const ResourceXSourceDrainWork *work)
+{
+	ClusterSemanticAdmissionToken admission;
+	ResourceXGateSnapshot gate = { 0 };
+	ResourceXDecodedFrame block = { 0 };
+	PcmXSessionAuthResult sample;
+	volatile ResourceXApplyResult result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	uint64 session = 0;
+	uint32 connection = 0;
+	int32 master = -1;
+
+	if (MyBackendType != B_LMS || work == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	memset(&admission, 0, sizeof(admission));
+	if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+										  CLUSTER_SEMANTIC_TARGET_SIDE, &admission)
+		!= CLUSTER_SEMANTIC_ADMISSION_OK) {
+		(void)cluster_pcm_lock_resource_x_source_drain_complete_exact(work, RESOURCE_X_APPLY_STALE);
+		return RESOURCE_X_APPLY_STALE;
+	}
+	PG_TRY();
+	{
+		sample = gcs_block_resource_x_gate_session_snapshot_result(
+			&work->request.logical_assertion.resource, &gate, &master, &session);
+		if (!cluster_semantic_activation_recheck(&admission)
+			|| admission.record_generation != work->r4_record_generation
+			|| gate.formation != work->request.resource_formation)
+			result = RESOURCE_X_APPLY_STALE;
+		else if (cluster_gcs_pcm_x_auth_result_retryable(sample))
+			result = RESOURCE_X_APPLY_BAD_STATE;
+		else if (sample != PCM_X_SESSION_AUTH_OK || master != work->master_node
+				 || session != work->request.master_session_incarnation)
+			result = RESOURCE_X_APPLY_STALE;
+		else if (!gcs_block_pcm_x_resource_x_peer_ready_exact(master, &connection))
+			result = RESOURCE_X_APPLY_BAD_STATE;
+		else if (connection != work->authenticated_connection_generation)
+			result = RESOURCE_X_APPLY_STALE;
+		else {
+			result = gcs_block_resource_x_target_peer_result_exact(&admission, master, connection);
+			if (result == RESOURCE_X_APPLY_APPLIED) {
+				block.kind = RESOURCE_X_WIRE_BLOCK_TO_N;
+				block.payload_bytes = RESOURCE_X_CONTROL_V1_BYTES;
+				block.common = work->request;
+				result = gcs_block_pcm_x_resource_x_source_block_to_n(
+					&block, master, admission.record_generation);
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&admission);
+		(void)cluster_pcm_lock_resource_x_source_drain_complete_exact(work, result);
+	}
+	PG_END_TRY();
+	if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
+		gcs_block_resource_x_stage_ready_tag(&work->request.logical_assertion.resource);
+	return result;
+}
+
 /* Called only under a current target admission in the existing LMS process.
  * Claim creation precedes PG_TRY, so every ordinary unwind returns exactly
  * that owner; process death without unwind stays frozen recovery debt. */
@@ -13379,10 +13443,14 @@ gcs_block_resource_x_type17_ingress(const ClusterICEnvelope *env,
 		if (admission_exact) {
 			if ((frame->common.observed_mode == (uint8)PCM_STATE_X
 				 || frame->common.observed_mode == (uint8)PCM_STATE_S)
-				&& frame->common.source_candidate == 1 && frame->common.retain_pi_if_dirty == 1)
+				&& frame->common.source_candidate == 1 && frame->common.retain_pi_if_dirty == 1) {
 				result = gcs_block_pcm_x_resource_x_source_block_to_n(frame, master_node,
 																	  admission.record_generation);
-			else if (frame->common.observed_mode == (uint8)PCM_STATE_S
+				if (result == RESOURCE_X_APPLY_BAD_STATE && frame->common.observed_mode == PCM_STATE_X)
+					(void)cluster_pcm_lock_resource_x_source_drain_defer_exact(
+						frame, master_node, admission.record_generation,
+						authenticated_connection_generation);
+			} else if (frame->common.observed_mode == (uint8)PCM_STATE_S
 					 && frame->common.logical_assertion.requester_node != cluster_node_id)
 				result = gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 					frame, master_node, authenticated_connection_generation,
