@@ -464,10 +464,25 @@ UT_TEST(test_no_plan_refusal_identifies_snapshot_and_output_cut)
 	free(plan);
 }
 
+UT_TEST(test_pre2_preflight_uses_cold_cohort_and_prior_writer_needs)
+{
+	ClusterRecoveryFencePlan *plan = NULL;
+
+	fixture();
+	expect_engaged(&plan);
+	UT_ASSERT_EQ(cold_formations_built, NODES - 1);
+	UT_ASSERT_EQ(online_formations_built, 0);
+	UT_ASSERT_EQ(cold_needs_built, NODES - 1);
+	UT_ASSERT_EQ(online_needs_built, 0);
+	cluster_recovery_merge_fence_plan_destroy(&plan);
+	UT_ASSERT_EQ(formations_destroyed, formations_built);
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
+	UT_RUN(test_pre2_preflight_uses_cold_cohort_and_prior_writer_needs);
 	UT_RUN(test_no_plan_refusal_identifies_snapshot_and_output_cut);
 	UT_RUN(test_open_generations_are_sealed_after_admission);
 	UT_RUN(test_partial_seal_resumes);

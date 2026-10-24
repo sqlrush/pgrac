@@ -26,6 +26,10 @@
 
 #include "unit_test.h"
 
+/* Exact original key codec/comparator; physical ROOT and provider I/O below
+ * remain controlled leaves of this unit fixture. */
+#include "test_cluster_external_fence_duty.inc"
+
 UT_DEFINE_GLOBALS();
 
 bool cluster_shared_config = false;
@@ -59,6 +63,11 @@ static uint64 stub_admitted_floor;
 static uint64 stub_cluster_epoch;
 static bool stub_protected_set_identity_available;
 static ClusterProtectedSetIdentityV1 stub_protected_set_identity;
+static ClusterControlRootSnapshot stub_cold_roots[4];
+static ClusterControlRootResult stub_cold_root_result;
+static unsigned stub_cold_root_reads;
+static ClusterFormationWitnessResult stub_cold_classification_result;
+
 
 extern bool cluster_external_fence_runtime_active(void);
 extern bool
@@ -190,6 +199,29 @@ cluster_formation_witness_revalidate_nowait(const ClusterFormationWitnessV1 *wit
 {
 	(void)witness;
 	return stub_formation_result;
+}
+
+ClusterFormationWitnessResult
+cluster_formation_classification_revalidate_nowait(
+	uint16 origin_thread pg_attribute_unused(),
+	const ClusterFenceAuthorityProof *authority pg_attribute_unused(),
+	const ClusterFormationSnapshotV1 *snapshot pg_attribute_unused())
+{
+	return stub_cold_classification_result;
+}
+
+ClusterControlRootResult
+cluster_control_root_lookup_owner_by_node_runtime(int32 node, ClusterControlRootIdentity *identity,
+												ClusterControlRootSnapshot *snapshot,
+												ClusterControlRootReadToken *token)
+{
+	stub_cold_root_reads++;
+	if (node < 0 || node >= 4)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	*identity = stub_cold_roots[node].identity;
+	*snapshot = stub_cold_roots[node];
+	memset(token, 0, sizeof(*token));
+	return stub_cold_root_result;
 }
 
 bool
@@ -790,6 +822,105 @@ UT_TEST(test_external_fence_v2_claim_still_requires_exact_writer)
 				 PGRAC_EXTERNAL_FENCE_NEED_SET_DUTY_INVALID);
 	stub_runtime_active = false;
 	stub_protected_set_identity_available = false;
+}
+
+static void
+prepare_cold_formation(ClusterRecoveryDutyKey *duty)
+{
+	fill_valid_duty(duty);
+	duty->thread_claim_crc32c = 0;
+	prepare_two_writer_formation(duty);
+	cluster_shared_config = true;
+	memset(stub_formation_authority.marker.fenced_dead_bitmap, 0,
+		   sizeof(stub_formation_authority.marker.fenced_dead_bitmap));
+	stub_formation_authority.marker.marker_kind = CLUSTER_FENCE_MARKER_KIND_BASELINE;
+	memset(&stub_formation_snapshot, 0, sizeof(stub_formation_snapshot));
+	stub_formation_snapshot.local_epoch = stub_formation_authority.marker.fence_epoch;
+	stub_formation_snapshot.startup_formation_generation = 1;
+	stub_formation_snapshot.reserved[0] = CLUSTER_FORMATION_SNAPSHOT_RECOVERY_CONTROL;
+	memset(stub_cold_roots, 0, sizeof(stub_cold_roots));
+	for (int n = 0; n < 4; n++) {
+		ClusterControlRootSnapshot *root = &stub_cold_roots[n];
+		root->identity = *duty;
+		root->identity.origin_node_id = n;
+		root->identity.origin_thread_id = n + 1;
+		root->identity.origin_owner_incarnation += n;
+		root->lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+		root->root_flags = CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
+			| CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
+			| CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+		stub_formation_snapshot.membership.membership_state[n] = CLUSTER_MEMBER_MEMBER;
+		stub_formation_snapshot.membership.last_admitted_incarnation[n]
+			= root->identity.origin_owner_incarnation + 100;
+	}
+	stub_cold_root_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	stub_cold_root_reads = 0;
+	stub_cold_classification_result = CLUSTER_FORMATION_WITNESS_READY;
+}
+
+UT_TEST(test_external_fence_cold_need_set_keeps_old_writers_and_live_cohort_separate)
+{
+	ClusterRecoveryDutyKey duty;
+	PgracExternalFenceNeedSetV1 *needs = NULL;
+	const ClusterFormationWitnessV1 *formation = (const ClusterFormationWitnessV1 *)(uintptr_t)1;
+
+	prepare_cold_formation(&duty);
+	/* Online DEAD-only classification cannot represent these four new boots. */
+	UT_ASSERT_EQ(cluster_external_fence_need_set_build(&duty, formation, &needs),
+				 PGRAC_EXTERNAL_FENCE_NEED_SET_WRITER_COUNT_INVALID);
+	UT_ASSERT_EQ(cluster_external_fence_need_set_build_cold(&duty, formation, &needs),
+				 PGRAC_EXTERNAL_FENCE_NEED_SET_OK);
+	UT_ASSERT_EQ(stub_cold_root_reads, 4);
+	UT_ASSERT_EQ(cluster_external_fence_need_set_count(needs), 4);
+	for (int n = 0; n < 4; n++) {
+		const PgracExternalFenceNeedV1 *need = cluster_external_fence_need_set_at(needs, n);
+		UT_ASSERT(need != NULL);
+		if (need != NULL) {
+			UT_ASSERT_EQ(need->victim_node_id, n);
+			UT_ASSERT_EQ(need->victim_incarnation, duty.origin_owner_incarnation + n);
+		}
+		UT_ASSERT_EQ(stub_formation_snapshot.membership.membership_state[n], CLUSTER_MEMBER_MEMBER);
+	}
+	{
+		PgracExternalFenceDenyReason reason;
+		UT_ASSERT(cluster_external_fence_need_set_revalidate_nowait(needs, formation, &reason));
+		stub_cold_classification_result = CLUSTER_FORMATION_WITNESS_UNSTABLE;
+		UT_ASSERT(!cluster_external_fence_need_set_revalidate_nowait(needs, formation, &reason));
+	}
+	cluster_external_fence_need_set_release(&needs);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_external_fence_cold_need_set_requires_sealed_prior_boot_and_provider)
+{
+	ClusterRecoveryDutyKey duty;
+	PgracExternalFenceNeedSetV1 *needs = NULL;
+	const ClusterFormationWitnessV1 *formation = (const ClusterFormationWitnessV1 *)(uintptr_t)1;
+
+	for (int fault = 0; fault < 9; fault++) {
+		prepare_cold_formation(&duty);
+		switch (fault) {
+		case 0: stub_cold_roots[2].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN; break;
+		case 1: stub_cold_roots[2].root_flags &= ~CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID; break;
+		case 2: stub_formation_snapshot.membership.last_admitted_incarnation[2]
+				= stub_cold_roots[2].identity.origin_owner_incarnation; break;
+		case 3: stub_cold_root_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN; break;
+		case 4: stub_formation_snapshot.startup_formation_generation = 0; break;
+		case 5: stub_formation_snapshot.reserved[0] = 0; break;
+		case 6: stub_runtime_active = false; break;
+		case 7: stub_cold_roots[0].identity.root_lineage_seq++; break;
+		case 8: stub_cold_classification_result = CLUSTER_FORMATION_WITNESS_UNSTABLE; break;
+		}
+		UT_ASSERT_EQ(cluster_external_fence_need_set_build_cold(&duty, formation, &needs),
+			fault == 6 ? PGRAC_EXTERNAL_FENCE_NEED_SET_CAPABILITY_UNAVAILABLE
+			: (fault == 4 || fault == 5 || fault == 8)
+				? PGRAC_EXTERNAL_FENCE_NEED_SET_MEMBERSHIP_UNSTABLE
+				: PGRAC_EXTERNAL_FENCE_NEED_SET_WRITER_INCAR_UNPROVEN);
+		UT_ASSERT(needs == NULL);
+		UT_ASSERT_EQ(stub_cold_root_reads, fault < 3 ? 3 : fault == 3 || fault == 7 ? 1
+													 : fault == 8 ? 4 : 0);
+	}
+	cluster_shared_config = false;
 }
 
 UT_TEST(test_external_fence_provider_zero_is_unavailable_without_admission)
@@ -1922,7 +2053,7 @@ cleanup:
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(28);
 	UT_RUN(test_external_fence_literals);
 	UT_RUN(test_external_fence_enum_ordinals);
 	UT_RUN(test_external_fence_recovery_layouts);
@@ -1933,6 +2064,8 @@ main(void)
 	UT_RUN(test_external_fence_need_set_builds_complete_sorted_writers);
 	UT_RUN(test_external_fence_need_set_rejects_incomplete_authority);
 	UT_RUN(test_external_fence_v2_claim_still_requires_exact_writer);
+	UT_RUN(test_external_fence_cold_need_set_keeps_old_writers_and_live_cohort_separate);
+	UT_RUN(test_external_fence_cold_need_set_requires_sealed_prior_boot_and_provider);
 	UT_RUN(test_external_fence_provider_zero_is_unavailable_without_admission);
 	UT_RUN(test_external_fence_nonproof_signals_never_admit);
 	UT_RUN(test_external_fence_test_only_exact_response_creates_live_admission);

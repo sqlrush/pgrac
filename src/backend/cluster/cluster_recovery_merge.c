@@ -1648,8 +1648,13 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 		ClusterRecoveryFenceOrigin *origin = &plan->origins[tid];
 		ClusterFormationWitnessResult formation_result;
 
-		formation_result = cluster_formation_witness_build_wait(
-			origin->origin_thread, false, plan->acquire_timeout_ms_snapshot, &origin->formation);
+		/* E1's accepted new cohort coordinates recovery. The old incarnations
+		 * come from prior-death-sealed ROOTs, not online CSS DEAD membership. */
+		formation_result = cluster_shared_config
+			? cluster_formation_witness_build_recovery_control_wait(
+				  origin->origin_thread, plan->acquire_timeout_ms_snapshot, &origin->formation)
+			: cluster_formation_witness_build_wait(
+				  origin->origin_thread, false, plan->acquire_timeout_ms_snapshot, &origin->formation);
 		if (formation_result != CLUSTER_FORMATION_WITNESS_READY) {
 			int32 node_id = origin->duty.origin_node_id;
 			uint64 incarnation = origin->duty.origin_owner_incarnation;
@@ -1665,8 +1670,9 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 		ClusterRecoveryFenceOrigin *origin = &plan->origins[tid];
 		PgracExternalFenceNeedSetResult need_result;
 
-		need_result = cluster_external_fence_need_set_build(&origin->duty, origin->formation,
-															&origin->needs);
+		need_result = cluster_shared_config
+			? cluster_external_fence_need_set_build_cold(&origin->duty, origin->formation, &origin->needs)
+			: cluster_external_fence_need_set_build(&origin->duty, origin->formation, &origin->needs);
 		if (need_result != PGRAC_EXTERNAL_FENCE_NEED_SET_OK) {
 			int32 node_id = origin->duty.origin_node_id;
 			uint64 incarnation = origin->duty.origin_owner_incarnation;

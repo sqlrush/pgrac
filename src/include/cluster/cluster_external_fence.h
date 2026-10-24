@@ -395,6 +395,14 @@ extern PgracExternalFenceNeedSetResult
 cluster_external_fence_need_set_build(const ClusterRecoveryDutyKey *duty,
 									  const ClusterFormationWitnessV1 *formation,
 									  PgracExternalFenceNeedSetV1 **out);
+/* E1 only: an exact cold-cohort coordination witness plus canonical prior
+ * ROOTs selects the old writer set (including the founder's predecessor).
+ * This builder performs bounded ROOT reads; it neither relabels new MEMBERs
+ * DEAD nor substitutes self-seal/prior-death for provider admission. */
+extern PgracExternalFenceNeedSetResult
+cluster_external_fence_need_set_build_cold(const ClusterRecoveryDutyKey *duty,
+										   const ClusterFormationWitnessV1 *formation,
+										   PgracExternalFenceNeedSetV1 **out);
 extern bool
 cluster_external_fence_need_set_revalidate_nowait(const PgracExternalFenceNeedSetV1 *needs,
 												  const ClusterFormationWitnessV1 *formation,

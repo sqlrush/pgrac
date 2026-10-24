@@ -73,6 +73,7 @@ static int tail_calls[NODES + 1];
 static int source_calls[NODES + 1];
 static int revalidate_calls[NODES + 1];
 static int formations_built, formations_destroyed;
+static int online_formations_built, cold_formations_built, online_needs_built, cold_needs_built;
 static void (*cold_wait_hook)(void);
 static unsigned cold_input_waits;
 static ClusterFormationSnapshotV1 cold_cohort;
@@ -528,6 +529,21 @@ cluster_formation_witness_build_wait(uint16 origin_thread, bool opening_new_duty
 {
 	UT_ASSERT(origin_thread > 1 && origin_thread <= NODES);
 	UT_ASSERT(!opening_new_duty);
+	online_formations_built++;
+	formations_built++;
+	event("formation:%u;", (unsigned)origin_thread);
+	*out = (ClusterFormationWitnessV1 *)&formation_obj[origin_thread];
+	return CLUSTER_FORMATION_WITNESS_READY;
+}
+
+ClusterFormationWitnessResult
+cluster_formation_witness_build_recovery_control_wait(uint16 origin_thread,
+													int timeout_ms pg_attribute_unused(),
+													ClusterFormationWitnessV1 **out)
+{
+	UT_ASSERT(cluster_shared_config);
+	UT_ASSERT(origin_thread > 1 && origin_thread <= NODES);
+	cold_formations_built++;
 	formations_built++;
 	event("formation:%u;", (unsigned)origin_thread);
 	*out = (ClusterFormationWitnessV1 *)&formation_obj[origin_thread];
@@ -557,6 +573,22 @@ cluster_external_fence_need_set_build(const ClusterRecoveryDutyKey *duty,
 	uint16 tid = fence_thread(formation, formation_obj);
 
 	UT_ASSERT_EQ(duty->origin_thread_id, tid);
+	online_needs_built++;
+	event("needs:%u;", (unsigned)tid);
+	*out = (PgracExternalFenceNeedSetV1 *)&needs_obj[tid];
+	return PGRAC_EXTERNAL_FENCE_NEED_SET_OK;
+}
+
+PgracExternalFenceNeedSetResult
+cluster_external_fence_need_set_build_cold(const ClusterRecoveryDutyKey *duty,
+										   const ClusterFormationWitnessV1 *formation,
+										   PgracExternalFenceNeedSetV1 **out)
+{
+	uint16 tid = fence_thread(formation, formation_obj);
+
+	UT_ASSERT(cluster_shared_config);
+	UT_ASSERT_EQ(duty->origin_thread_id, tid);
+	cold_needs_built++;
 	event("needs:%u;", (unsigned)tid);
 	*out = (PgracExternalFenceNeedSetV1 *)&needs_obj[tid];
 	return PGRAC_EXTERNAL_FENCE_NEED_SET_OK;

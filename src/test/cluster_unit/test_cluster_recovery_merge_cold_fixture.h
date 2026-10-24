@@ -78,6 +78,7 @@ fixture(void)
 		open_calls[tid] = tail_calls[tid] = source_calls[tid] = revalidate_calls[tid] = 0;
 	}
 	formations_built = formations_destroyed = 0;
+	online_formations_built = cold_formations_built = online_needs_built = cold_needs_built = 0;
 	cold_input_waits = 0;
 	cold_wait_hook = NULL;
 	memset(&cold_cohort, 0, sizeof(cold_cohort));

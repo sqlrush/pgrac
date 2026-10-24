@@ -759,7 +759,13 @@ $(CLUSTER_EXTERNAL_FENCE_O): \
 		$(top_srcdir)/src/include/cluster/cluster_external_fence.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT \
 		-c $(top_srcdir)/src/backend/cluster/cluster_external_fence.c -o $@
+test_cluster_external_fence_duty.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_duty.c
+	$(AWK) '/^write_u16_le\(/ { print "static void"; emit=1 } \
+		emit { print } /^cluster_recovery_duty_key_compare_for_claim\(/ { last=1 } \
+		emit && last && /^}/ { exit }' $< > $@
+
 test_cluster_external_fence: test_cluster_external_fence.c unit_test.h \
+		test_cluster_external_fence_duty.inc \
 		$(CLUSTER_EXTERNAL_FENCE_O) $(PGRAC_EXTERNAL_FENCE_PROTOCOL_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_EXTERNAL_FENCE_O) \
 		$(PGRAC_EXTERNAL_FENCE_PROTOCOL_O) \
@@ -4835,6 +4841,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_external_fence_duty.inc
 	rm -f test_cluster_data_sync_policy.inc test_cluster_sync_providers.inc \
 		test_cluster_sync_dispatch.inc test_cluster_sync_smgr.inc
 	rm -f test_cluster_tt_rollback_entry.inc
@@ -5056,6 +5063,7 @@ test_cluster_storage_quorum_product.o: $(top_srcdir)/src/backend/cluster/cluster
 
 test_cluster_qvotec: test_cluster_qvotec.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_qvotec.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
 		$(top_srcdir)/src/include/cluster/cluster_storage_quorum.h \
 		cluster_unit_no_normal_stop.h \
 		$(CLUSTER_VERSION_O) cluster_qvotec_poll_test.o $(CLUSTER_QUORUM_DECISION_O) \
