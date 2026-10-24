@@ -81,6 +81,8 @@ cluster_cf_normal_stop_shared_poll(bool post_checkpoint, const char **reason)
 }
 bool cluster_controlfile_shared_authority = false;
 bool cluster_shared_config = false;
+bool cluster_trace_control_config = false;
+volatile uint32 CritSectionCount;
 int cluster_node_id = 0;
 char *cluster_config_file = NULL;
 static int g_node_count = 1;
@@ -118,6 +120,8 @@ int MyProcPid = 0;
 
 static bool g_capture_log;
 static char g_log_detail[1024];
+static char g_cf_trace_log[2048];
+static unsigned g_cf_trace_logs;
 static ClusterGesTimeoutDetail g_timeout_detail;
 
 const ClusterGesTimeoutDetail *
@@ -138,8 +142,16 @@ errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_un
 {}
 
 int
-errmsg(const char *fmt pg_attribute_unused(), ...)
+errmsg(const char *fmt, ...)
 {
+	if (strstr(fmt, "PGRAC_FAMILY=CF_RETURN") != NULL
+		|| strstr(fmt, "PGRAC_FAMILY=CF_BLOCKER") != NULL) {
+		va_list args;
+		va_start(args, fmt);
+		vsnprintf(g_cf_trace_log, sizeof(g_cf_trace_log), fmt, args);
+		va_end(args);
+		++g_cf_trace_logs;
+	}
 	return 0;
 }
 
@@ -1958,6 +1970,127 @@ UT_TEST(shared_cf_late_and_duplicate_ack_keep_the_new_owner)
 	cluster_shared_config = false;
 }
 
+#include "test_cluster_cf_blocker_trace.inc"
+
+UT_TEST(test_cf_blocker_snapshot_is_bounded_and_has_no_pid_guess)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId waiter = { .node_id = 2, .procno = 6, .cluster_epoch = 9, .request_id = 71 };
+	ClusterGrdConflictHolder holders[17] = { 0 };
+	int prepares = g_seven_count, releases = g_s6_count;
+	cluster_cf_resid_encode(&resid);
+	for (unsigned i = 0; i < lengthof(holders); ++i) {
+		holders[i].holder = (ClusterGrdHolderId){ 3, 100 + i, 9, 80 + i };
+		holders[i].source_node_id = 3;
+		holders[i].held_mode = ExclusiveLock;
+	}
+	g_capture_log = true;
+	g_cf_trace_logs = 0;
+	cluster_trace_control_config = false;
+	ges_trace_cf_blockers(&resid, ShareLock, &waiter, 2, holders, lengthof(holders));
+	UT_ASSERT_EQ(g_cf_trace_logs, 0);
+	cluster_trace_control_config = true;
+	CritSectionCount = 1;
+	ges_trace_cf_blockers(&resid, ShareLock, &waiter, 2, holders, lengthof(holders));
+	CritSectionCount = 0;
+	UT_ASSERT_EQ(g_cf_trace_logs, 0);
+	ges_trace_cf_blockers(&resid, ShareLock, &waiter, 2, holders, lengthof(holders));
+	UT_ASSERT_EQ(g_cf_trace_logs, 16);
+	UT_ASSERT(strstr(g_cf_trace_log, "waiter_node=2 waiter_procno=6"));
+	UT_ASSERT(strstr(g_cf_trace_log, "holder_node=3 holder_procno=115"));
+	UT_ASSERT(strstr(g_cf_trace_log, "holder_pid=0 pid_known=0"));
+	UT_ASSERT(strstr(g_cf_trace_log, "conflicts=17 omitted=1"));
+	ges_trace_cf_blockers(&resid, ShareLock, &waiter, 2, NULL, 0);
+	UT_ASSERT_EQ(g_cf_trace_logs, 17);
+	UT_ASSERT(strstr(g_cf_trace_log, "holder_present=0"));
+	resid.type = CLUSTER_SQ_RESID_TYPE;
+	ges_trace_cf_blockers(&resid, ShareLock, &waiter, 2, holders, lengthof(holders));
+	UT_ASSERT_EQ(g_cf_trace_logs, 17);
+	UT_ASSERT_EQ(g_seven_count, prepares);
+	UT_ASSERT_EQ(g_s6_count, releases);
+	cluster_trace_control_config = g_capture_log = false;
+}
+
+UT_TEST(test_cf_trace_off_and_critical_keep_original_operations)
+{
+	int acquires = g_seven_count, releases = g_s6_count;
+	g_capture_log = true;
+	g_cf_trace_logs = 0;
+	cluster_trace_control_config = false;
+	cluster_shared_config = false;
+	g_seven_result = g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	UT_ASSERT(cluster_cf_lock(ShareLock));
+	cluster_cf_unlock(ShareLock);
+	UT_ASSERT_EQ(g_cf_trace_logs, 0);
+	cluster_trace_control_config = true;
+	CritSectionCount = 1;
+	UT_ASSERT(cluster_cf_lock(ExclusiveLock));
+	cluster_cf_unlock(ExclusiveLock);
+	CritSectionCount = 0;
+	UT_ASSERT_EQ(g_cf_trace_logs, 0);
+	UT_ASSERT_EQ(g_seven_count, acquires + 2);
+	UT_ASSERT_EQ(g_s6_count, releases + 2);
+	cluster_trace_control_config = g_capture_log = false;
+}
+
+UT_TEST(test_cf_trace_original_pending_age_and_grant_pid)
+{
+	unsigned polls = cf_acquire_polls, logs;
+	int prepares = g_seven_count;
+	long saved_step = owner_clock_step;
+	uint64 cookie;
+	const char *age;
+	char expected_pid[64];
+	cluster_shared_config = true;
+	MyBackendType = B_LMON;
+	UT_ASSERT(MyProcPid > 0); /* Keep the original registry driver's process identity. */
+	g_next_request_id++;
+	g_seven_result = g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	owner_clock += INT64_C(10000000);
+	owner_clock_step = 1000;
+	g_cf_trace_logs = 0;
+	g_capture_log = cluster_trace_control_config = true;
+	cf_poll_result = CLUSTER_GES_ACQUIRE_PENDING;
+	UT_ASSERT(!cluster_cf_lock_poll(ShareLock));
+	UT_ASSERT_EQ(g_cf_trace_logs, 1);
+	UT_ASSERT(strstr(g_cf_trace_log, "resource=CF"));
+	UT_ASSERT(strstr(g_cf_trace_log, "acquired=0"));
+	UT_ASSERT(strstr(g_cf_trace_log, "age_known=1"));
+	snprintf(expected_pid, sizeof(expected_pid), "caller_pid=%d", MyProcPid);
+	UT_ASSERT(strstr(g_cf_trace_log, expected_pid));
+	logs = g_cf_trace_logs;
+	UT_ASSERT(!cluster_cf_lock_poll(ShareLock));
+	UT_ASSERT_EQ(g_cf_trace_logs, logs);
+	owner_clock += INT64_C(6000000);
+	UT_ASSERT(!cluster_cf_lock_poll(ShareLock));
+	UT_ASSERT_EQ(g_cf_trace_logs, logs + 1);
+	age = strstr(g_cf_trace_log, "request_age_ms=");
+	UT_ASSERT(age != NULL);
+	if (age != NULL)
+		UT_ASSERT(strtoull(age + strlen("request_age_ms="), NULL, 10) >= 6000);
+	cf_poll_result = CLUSTER_GES_ACQUIRE_GRANTED;
+	UT_ASSERT(cluster_cf_lock_poll(ShareLock));
+	UT_ASSERT_EQ(g_cf_trace_logs, logs + 2); /* The original grant is never sampled away. */
+	UT_ASSERT(strstr(g_cf_trace_log, "acquired=1"));
+	snprintf(expected_pid, sizeof(expected_pid), "holder_pid=%d", MyProcPid);
+	UT_ASSERT(strstr(g_cf_trace_log, expected_pid));
+	UT_ASSERT(strstr(g_cf_trace_log, "pid_matches_holder=1"));
+	UT_ASSERT(strstr(g_cf_trace_log, "request_procno=42"));
+	UT_ASSERT_EQ(g_seven_count, prepares + 1);
+	UT_ASSERT_EQ(cf_acquire_polls, polls + 4);
+	cookie = cluster_cf_owner_cookie(ShareLock);
+	UT_ASSERT(cookie != 0);
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock), CLUSTER_CF_RELEASE_UNCONFIRMED);
+	UT_ASSERT(acknowledge_retirements());
+	cluster_cf_retirement_poll();
+	UT_ASSERT(cluster_cf_release_completed(ShareLock, cookie));
+	UT_ASSERT(!cluster_cf_held(ShareLock));
+	cluster_trace_control_config = g_capture_log = false;
+	owner_clock_step = saved_step;
+	MyBackendType = B_INVALID;
+	cluster_shared_config = false;
+}
+
 int
 main(void)
 {
@@ -1965,7 +2098,7 @@ main(void)
 	pg_atomic_init_u32(&owner_proc.cluster_grd_registered_count, 0);
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked, 0);
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
-	UT_PLAN(45);
+	UT_PLAN(48);
 	UT_RUN(test_cf_resid_encode);
 	UT_RUN(test_lock_grant_then_release);
 	UT_RUN(test_held_and_write_permitted);
@@ -2011,6 +2144,9 @@ main(void)
 	UT_RUN(cf_attempt_other_refusals_never_become_waiting);
 	UT_RUN(cf_attempt_error_and_foreign_duty_cannot_reuse_prior_wait);
 	UT_RUN(shared_cf_late_and_duplicate_ack_keep_the_new_owner);
+	UT_RUN(test_cf_blocker_snapshot_is_bounded_and_has_no_pid_guess);
+	UT_RUN(test_cf_trace_off_and_critical_keep_original_operations);
+	UT_RUN(test_cf_trace_original_pending_age_and_grant_pid);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

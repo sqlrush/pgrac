@@ -1713,8 +1713,8 @@ cluster_init_guc(void)
 		&cluster_trace_normal_stop, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable(
 		"cluster.trace_control_config",
-		gettext_noop("Log bounded selected-config CF task observations."),
-		gettext_noop("Reports original attempts and exact release decisions at most every five seconds."),
+		gettext_noop("Log CF configuration, acquisition and holder observations."),
+		gettext_noop("Samples config/refusals and records original grants and bounded conflict snapshots."),
 		&cluster_trace_control_config, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/*

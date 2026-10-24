@@ -1602,6 +1602,40 @@ ges_mutation_drain_refusal(const ClusterResId *resid, const ClusterGrdHolderId *
 	return GES_REJECT_REASON_NONE;
 }
 
+/* Original enqueue snapshot only. Remote procno never indexes local ProcGlobal;
+ * its PID is joined with the exact CF_RETURN grant on the hosting node. */
+static void
+ges_trace_cf_blockers(const ClusterResId *resid, int mode, const ClusterGrdHolderId *waiter,
+					  int32 waiter_host, const ClusterGrdConflictHolder *holders, int n_holders)
+{
+	ClusterGrdConflictHolder empty = { 0 };
+	TimestampTz now;
+	int rows;
+
+	if (!cluster_trace_control_config || CritSectionCount != 0 || resid == NULL
+		|| resid->type != CLUSTER_CF_RESID_TYPE || waiter == NULL || n_holders < 0
+		|| (n_holders > 0 && holders == NULL))
+		return;
+	now = GetCurrentTimestamp();
+	rows = Min(n_holders, 16);
+	for (int i = 0; i < Max(rows, 1); ++i) {
+		const ClusterGrdConflictHolder *h = rows == 0 ? &empty : &holders[i];
+		ereport(LOG,
+			(errmsg("PGRAC_FAMILY=CF_BLOCKER resource=CF res_type=%u lockmethod=%u field1=%u field2=%u field3=%u ts=" INT64_FORMAT
+					" master_node=%d wanted_mode=%d waiter_host_node=%d waiter_node=%u waiter_procno=%u"
+					" waiter_epoch=" UINT64_FORMAT " waiter_request_id=" UINT64_FORMAT
+					" holder_present=%d holder_host_node=%d holder_node=%u holder_procno=%u"
+					" holder_epoch=" UINT64_FORMAT " holder_request_id=" UINT64_FORMAT
+					" held_mode=%d holder_pid=0 pid_known=0 conflicts=%d omitted=%d",
+					resid->type, resid->lockmethodid, resid->field1, resid->field2, resid->field3,
+					now, cluster_node_id, mode, waiter_host,
+					waiter->node_id, waiter->procno, waiter->cluster_epoch, waiter->request_id,
+					rows != 0, rows == 0 ? -1 : h->source_node_id, h->holder.node_id,
+					h->holder.procno, h->holder.cluster_epoch, h->holder.request_id,
+					(int)h->held_mode, n_holders, n_holders - rows)));
+	}
+}
+
 int
 cluster_ges_lmon_drain_work_queue(void)
 {
@@ -1814,6 +1848,8 @@ cluster_ges_lmon_drain_work_queue(void)
 					ges_record_dedup_reply_for_request((uint32)item.source_node_id, req, &reply);
 				}
 			} else if (action == CLUSTER_GRD_ENQUEUED_WAITER) {
+				ges_trace_cf_blockers(&resid, (int)req->lockmode, &holder, (int32)item.source_node_id,
+									  conflict_holders, n_conflict);
 				/*
 					 * spec-2.23 D4 / HC18 — targeted BAST.  conflict_holders
 					 * was captured under entry->lock in enqueue_or_grant;
@@ -2860,6 +2896,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 			return GES_REJECT_REASON_WORK_QUEUE_FULL;
 		}
 
+		ges_trace_cf_blockers(resid, (int)lockmode, holder, cluster_node_id, conflict_holders, n_conflict);
 		/*
 		 * Conflict — a local waiter is queued.  Register a local reply-wait
 		 * entry (keyed so the release drain's local-wake finds it), advisory-
@@ -3690,6 +3727,7 @@ cluster_ges_cf_request_poll(ClusterGesAcquireAttempt *owned, const ClusterResId 
 			attempt->confirmed = true;
 			result = CLUSTER_GES_REDECLARE_CONFIRMED;
 		} else if (action == CLUSTER_GRD_ENQUEUED_WAITER) {
+			ges_trace_cf_blockers(resid, mode, holder, cluster_node_id, conflicts, nconflicts);
 			if (nconflicts > 0)
 				cluster_ges_send_bast_targeted(resid, mode, conflicts, nconflicts);
 		} else {
