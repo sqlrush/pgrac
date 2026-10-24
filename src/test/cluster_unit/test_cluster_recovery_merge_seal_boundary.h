@@ -522,6 +522,15 @@ cluster_control_root_v3_failure_tail_publish(const ClusterRecoverySerialRequest 
 }
 
 /* ---- external write exclusion ---- */
+static PgracExternalFenceNeedSetResult cold_need_result = PGRAC_EXTERNAL_FENCE_NEED_SET_OK;
+static const char *cold_need_predicate = "NONE";
+
+const char *
+cluster_external_fence_need_set_last_predicate(void)
+{
+	return cold_need_predicate;
+}
+
 ClusterFormationWitnessResult
 cluster_formation_witness_build_wait(uint16 origin_thread, bool opening_new_duty,
 									 int timeout_ms pg_attribute_unused(),
@@ -590,6 +599,8 @@ cluster_external_fence_need_set_build_cold(const ClusterRecoveryDutyKey *duty,
 	UT_ASSERT_EQ(duty->origin_thread_id, tid);
 	cold_needs_built++;
 	event("needs:%u;", (unsigned)tid);
+	if (cold_need_result != PGRAC_EXTERNAL_FENCE_NEED_SET_OK)
+		return cold_need_result;
 	*out = (PgracExternalFenceNeedSetV1 *)&needs_obj[tid];
 	return PGRAC_EXTERNAL_FENCE_NEED_SET_OK;
 }

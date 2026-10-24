@@ -765,6 +765,7 @@ test_cluster_external_fence_duty.inc: $(top_srcdir)/src/backend/cluster/cluster_
 		emit && last && /^}/ { exit }' $< > $@
 
 test_cluster_external_fence: test_cluster_external_fence.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_external_fence.h \
 		test_cluster_external_fence_duty.inc \
 		$(CLUSTER_EXTERNAL_FENCE_O) $(PGRAC_EXTERNAL_FENCE_PROTOCOL_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_EXTERNAL_FENCE_O) \
@@ -9337,6 +9338,7 @@ test_cluster_recovery_duty_compare.inc: $(top_srcdir)/src/backend/cluster/cluste
 	mv $@.tmp $@
 
 test_cluster_recovery_merge_seal test_cluster_recovery_merge_complete: %: %.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_external_fence.h \
 		$(top_srcdir)/src/include/cluster/cluster_cf_enqueue.h \
 		$(top_srcdir)/src/include/cluster/cluster_reconfig.h \
 		$(top_srcdir)/src/include/cluster/cluster_startup_phase.h \

@@ -478,10 +478,35 @@ UT_TEST(test_pre2_preflight_uses_cold_cohort_and_prior_writer_needs)
 	UT_ASSERT_EQ(formations_destroyed, formations_built);
 }
 
+UT_TEST(test_pre2_need_set_refusal_reports_original_provider_predicate)
+{
+	const char *predicates[] = {
+		"CONTROL_ROOT_CAPABILITY_UNAVAILABLE",
+		"ROOT_FENCING_PROVIDER_INACTIVE"
+	};
+
+	for (unsigned n = 0; n < lengthof(predicates); n++) {
+		ClusterRecoveryFencePlan *plan = NULL;
+		char detail[128];
+
+		fixture();
+		cold_need_result = PGRAC_EXTERNAL_FENCE_NEED_SET_CAPABILITY_UNAVAILABLE;
+		cold_need_predicate = predicates[n];
+		snprintf(detail, sizeof(detail), "predicate=%s", predicates[n]);
+		expect_refused(&plan, ERRCODE_CLUSTER_EXTERNAL_FENCE_UNAVAILABLE, detail);
+		UT_ASSERT(strstr(last_detail, "stage need-set") != NULL);
+		UT_ASSERT_EQ(cold_needs_built, 1);
+		UT_ASSERT_EQ(formations_destroyed, NODES - 1);
+	}
+	cold_need_result = PGRAC_EXTERNAL_FENCE_NEED_SET_OK;
+	cold_need_predicate = "NONE";
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
+	UT_RUN(test_pre2_need_set_refusal_reports_original_provider_predicate);
 	UT_RUN(test_pre2_preflight_uses_cold_cohort_and_prior_writer_needs);
 	UT_RUN(test_no_plan_refusal_identifies_snapshot_and_output_cut);
 	UT_RUN(test_open_generations_are_sealed_after_admission);

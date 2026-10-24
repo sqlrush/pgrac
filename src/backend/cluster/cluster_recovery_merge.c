@@ -1148,14 +1148,14 @@ recovery_fence_plan_release_members(ClusterRecoveryFencePlan *plan)
 
 static void
 pg_attribute_noreturn() recovery_fence_unavailable(int32 node_id, uint64 incarnation, int verdict,
-												   int reason, const char *stage)
+												   int reason, const char *stage, const char *predicate)
 {
 	ereport(FATAL,
 			(errcode(ERRCODE_CLUSTER_EXTERNAL_FENCE_UNAVAILABLE),
 			 errmsg("external write exclusion is not proven for node %d incarnation " UINT64_FORMAT,
 					node_id, incarnation),
-			 errdetail("Cold recovery external-fence stage %s returned verdict %d, reason %d.",
-					   stage, verdict, reason),
+			 errdetail("Cold recovery external-fence stage %s returned verdict %d, reason %d; predicate=%s.",
+					   stage, verdict, reason, predicate != NULL ? predicate : "NOT_EXPORTED"),
 			 errhint("Restore the configured root fencing provider and retry; do not disable "
 					 "the fence or force recovery.")));
 	pg_unreachable();
@@ -1333,7 +1333,7 @@ recovery_fence_plan_seal_inputs(ClusterRecoveryFencePlan *plan, uint16 own_threa
 			MemSet(plan, 0, sizeof(*plan));
 			pfree(plan);
 			recovery_fence_unavailable(node_id, incarnation, PGRAC_EXTERNAL_FENCE_UNAVAILABLE,
-									   (int)reason, "seal");
+									   (int)reason, "seal", NULL);
 		}
 	}
 	for (i = 0; i < plan->origin_count; i++) {
@@ -1601,7 +1601,7 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 			pfree(plan);
 			recovery_fence_unavailable(node_id, identity.origin_owner_incarnation,
 									   PGRAC_EXTERNAL_FENCE_UNAVAILABLE, (int)root_result,
-									   "root-classification");
+									   "root-classification", NULL);
 		}
 		if (snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE) {
 			plan->replay_thread_bitmap[(tid - 1) / 64] &= ~(UINT64_C(1) << ((tid - 1) % 64));
@@ -1615,7 +1615,7 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 			pfree(plan);
 			recovery_fence_unavailable(
 				node_id, identity.origin_owner_incarnation, PGRAC_EXTERNAL_FENCE_UNAVAILABLE,
-				PGRAC_EXTERNAL_FENCE_DENY_ROOT_NOT_COMPLETE, "root-lifecycle");
+				PGRAC_EXTERNAL_FENCE_DENY_ROOT_NOT_COMPLETE, "root-lifecycle", NULL);
 		}
 		origin = &plan->origins[plan->origin_count];
 		origin->origin_thread = tid;
@@ -1663,7 +1663,7 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 			MemSet(plan, 0, sizeof(*plan));
 			pfree(plan);
 			recovery_fence_unavailable(node_id, incarnation, PGRAC_EXTERNAL_FENCE_UNAVAILABLE,
-									   (int)formation_result, "formation");
+									   (int)formation_result, "formation", NULL);
 		}
 	}
 	for (tid = 0; tid < plan->origin_count; tid++) {
@@ -1676,12 +1676,13 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 		if (need_result != PGRAC_EXTERNAL_FENCE_NEED_SET_OK) {
 			int32 node_id = origin->duty.origin_node_id;
 			uint64 incarnation = origin->duty.origin_owner_incarnation;
+			const char *predicate = cluster_external_fence_need_set_last_predicate();
 
 			recovery_fence_plan_release_members(plan);
 			MemSet(plan, 0, sizeof(*plan));
 			pfree(plan);
 			recovery_fence_unavailable(node_id, incarnation, PGRAC_EXTERNAL_FENCE_UNAVAILABLE,
-									   (int)need_result, "need-set");
+									   (int)need_result, "need-set", predicate);
 		}
 	}
 	INSTR_TIME_SET_CURRENT(admission_started);
@@ -1717,7 +1718,7 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 			MemSet(plan, 0, sizeof(*plan));
 			pfree(plan);
 			recovery_fence_unavailable(node_id, incarnation, (int)verdict, (int)reason,
-									   "admission-set");
+									   "admission-set", NULL);
 		}
 	}
 

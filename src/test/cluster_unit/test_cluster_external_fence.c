@@ -891,6 +891,40 @@ UT_TEST(test_external_fence_cold_need_set_keeps_old_writers_and_live_cohort_sepa
 	cluster_shared_config = false;
 }
 
+UT_TEST(test_external_fence_need_set_reports_capability_refusal_without_stale_predicate)
+{
+	ClusterRecoveryDutyKey duty;
+	PgracExternalFenceNeedSetV1 *needs = NULL;
+	const ClusterFormationWitnessV1 *formation = (const ClusterFormationWitnessV1 *)(uintptr_t)1;
+
+	prepare_cold_formation(&duty);
+	stub_local_capabilities = 0;
+	stub_runtime_active = false;
+	UT_ASSERT_EQ(cluster_external_fence_need_set_build_cold(&duty, formation, &needs),
+				 PGRAC_EXTERNAL_FENCE_NEED_SET_CAPABILITY_UNAVAILABLE);
+	UT_ASSERT(strcmp(cluster_external_fence_need_set_last_predicate(),
+					 "CONTROL_ROOT_CAPABILITY_UNAVAILABLE") == 0);
+	UT_ASSERT(needs == NULL && stub_cold_root_reads == 0);
+
+	stub_local_capabilities = PGRAC_IC_HELLO_CAP_CONTROL_ROOT_V1;
+	UT_ASSERT_EQ(cluster_external_fence_need_set_build_cold(&duty, formation, &needs),
+				 PGRAC_EXTERNAL_FENCE_NEED_SET_CAPABILITY_UNAVAILABLE);
+	UT_ASSERT(strcmp(cluster_external_fence_need_set_last_predicate(),
+					 "ROOT_FENCING_PROVIDER_INACTIVE") == 0);
+	UT_ASSERT(needs == NULL && stub_cold_root_reads == 0);
+
+	/* A later refusal must not borrow the preceding provider observation. */
+	UT_ASSERT_EQ(cluster_external_fence_need_set_build_cold(NULL, formation, &needs),
+				 PGRAC_EXTERNAL_FENCE_NEED_SET_BAD_ARGUMENT);
+	UT_ASSERT(strcmp(cluster_external_fence_need_set_last_predicate(), "NOT_EXPORTED") == 0);
+	stub_runtime_active = true;
+	UT_ASSERT_EQ(cluster_external_fence_need_set_build_cold(&duty, formation, &needs),
+				 PGRAC_EXTERNAL_FENCE_NEED_SET_OK);
+	UT_ASSERT(strcmp(cluster_external_fence_need_set_last_predicate(), "NONE") == 0);
+	cluster_external_fence_need_set_release(&needs);
+	cluster_shared_config = false;
+}
+
 UT_TEST(test_external_fence_cold_need_set_requires_sealed_prior_boot_and_provider)
 {
 	ClusterRecoveryDutyKey duty;
@@ -2053,7 +2087,7 @@ cleanup:
 int
 main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(29);
 	UT_RUN(test_external_fence_literals);
 	UT_RUN(test_external_fence_enum_ordinals);
 	UT_RUN(test_external_fence_recovery_layouts);
@@ -2065,6 +2099,7 @@ main(void)
 	UT_RUN(test_external_fence_need_set_rejects_incomplete_authority);
 	UT_RUN(test_external_fence_v2_claim_still_requires_exact_writer);
 	UT_RUN(test_external_fence_cold_need_set_keeps_old_writers_and_live_cohort_separate);
+	UT_RUN(test_external_fence_need_set_reports_capability_refusal_without_stale_predicate);
 	UT_RUN(test_external_fence_cold_need_set_requires_sealed_prior_boot_and_provider);
 	UT_RUN(test_external_fence_provider_zero_is_unavailable_without_admission);
 	UT_RUN(test_external_fence_nonproof_signals_never_admit);

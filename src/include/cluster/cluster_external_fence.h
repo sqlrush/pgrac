@@ -403,6 +403,10 @@ extern PgracExternalFenceNeedSetResult
 cluster_external_fence_need_set_build_cold(const ClusterRecoveryDutyKey *duty,
 										   const ClusterFormationWitnessV1 *formation,
 										   PgracExternalFenceNeedSetV1 **out);
+/* Last build attempt in this process: a static diagnostic string, not a proof.
+ * Capability/provider refusals name the first failed predicate; other refusals
+ * return NOT_EXPORTED, success returns NONE.  Capture before another build. */
+extern const char *cluster_external_fence_need_set_last_predicate(void);
 extern bool
 cluster_external_fence_need_set_revalidate_nowait(const PgracExternalFenceNeedSetV1 *needs,
 												  const ClusterFormationWitnessV1 *formation,

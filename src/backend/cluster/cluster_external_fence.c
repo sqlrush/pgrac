@@ -39,6 +39,14 @@
 #include "common/pgrac_external_fence_protocol.h"
 
 static PgracExternalFenceDenyReason external_fence_last_deny = PGRAC_EXTERNAL_FENCE_DENY_NONE;
+/* Process-local diagnostics only; never an admission or a current-state proof. */
+static const char *external_fence_need_set_predicate = "NOT_EXPORTED";
+
+const char *
+cluster_external_fence_need_set_last_predicate(void)
+{
+	return external_fence_need_set_predicate;
+}
 
 #ifdef USE_CLUSTER_UNIT
 extern bool cluster_external_fence_test_runtime_active(void);
@@ -753,6 +761,7 @@ external_fence_need_set_build(const ClusterRecoveryDutyKey *duty,
 	uint64 writer_incarnations[CLUSTER_MAX_NODES] = { 0 };
 	int32 node_id;
 
+	external_fence_need_set_predicate = "NOT_EXPORTED";
 	if (out == NULL || *out != NULL || duty == NULL || formation == NULL)
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_BAD_ARGUMENT;
 	if (!cluster_recovery_duty_key_valid_for_claim(duty, cluster_shared_config))
@@ -763,9 +772,14 @@ external_fence_need_set_build(const ClusterRecoveryDutyKey *duty,
 	if (formation_result != CLUSTER_FORMATION_WITNESS_READY)
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_FENCE_AUTHORITY_UNAVAILABLE;
 
-	if ((cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_CONTROL_ROOT_V1) == 0
-		|| !cluster_external_fence_runtime_active())
+	if ((cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_CONTROL_ROOT_V1) == 0) {
+		external_fence_need_set_predicate = "CONTROL_ROOT_CAPABILITY_UNAVAILABLE";
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_CAPABILITY_UNAVAILABLE;
+	}
+	if (!cluster_external_fence_runtime_active()) {
+		external_fence_need_set_predicate = "ROOT_FENCING_PROVIDER_INACTIVE";
+		return PGRAC_EXTERNAL_FENCE_NEED_SET_CAPABILITY_UNAVAILABLE;
+	}
 	if (!cluster_formation_witness_copy_classification_v1(formation, &formation_origin_thread,
 														  &authority, &classification))
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_FENCE_AUTHORITY_UNAVAILABLE;
@@ -856,6 +870,7 @@ external_fence_need_set_build(const ClusterRecoveryDutyKey *duty,
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_STORAGE_UNAVAILABLE;
 	}
 	*out = set;
+	external_fence_need_set_predicate = "NONE";
 	return PGRAC_EXTERNAL_FENCE_NEED_SET_OK;
 }
 
