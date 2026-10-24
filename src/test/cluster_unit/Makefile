@@ -6817,7 +6817,8 @@ test_cluster_gcs_shared_registration.inc: $(top_srcdir)/src/backend/cluster/clus
 # Compile the actual terminal ingress verbatim. Dependencies are explicit
 # fixture doubles; the master/source decision and call sequence are product C.
 test_cluster_resource_x_terminal_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
-	awk '/^gcs_block_resource_x_requester_terminal_try\(/ { print "static ResourceXApplyResult"; emit=1; owner++ } \
+	awk '/^gcs_block_pcm_service_admission\(/ { print "static void"; emit=1; service_admission++ } \
+	     /^gcs_block_resource_x_requester_terminal_try\(/ { print "static ResourceXApplyResult"; emit=1; owner++ } \
 	     /^gcs_block_resource_x_target_peer_result_exact\(/ { print "static ResourceXApplyResult"; emit=1 } \
 	     /^gcs_block_resource_x_target_peer_matches_exact\(/ { print "static bool"; emit=1; peer++ } \
 	     /^gcs_block_resource_x_delivery_finish_exact\(/ { print "static ResourceXApplyResult"; emit=1; finish++ } \
@@ -6826,6 +6827,7 @@ test_cluster_resource_x_terminal_owner.inc: $(top_srcdir)/src/backend/cluster/cl
 	     /^gcs_block_resource_x_cleanup_frame_exact\(/ { print "static ResourceXApplyResult"; emit=1; cleanup++ } \
 	     /^gcs_block_resource_x_kind9_ingress\(/ { print "static void"; emit=1; admission++ } \
 	     /^gcs_block_resource_x_type17_ingress\(/ { print "static ResourceXApplyResult"; emit=1; type17++ } \
+	     /^cluster_gcs_block_resource_x_source_(drain|finish)_tick\(/ { print "ResourceXApplyResult"; emit=1; service_tick++ } \
 	     /^gcs_block_resource_x_bootstrapped_assert_ingress\(/ { print "static ResourceXApplyResult"; emit=1; assertion++ } \
 	     /^gcs_block_resource_x_requester_join_ingress\(/ { print "static ResourceXApplyResult"; emit=1; join++ } \
 	     /^cluster_gcs_resource_x_target_context_recheck_result_exact\(/ { print "ResourceXApplyResult"; emit=1; context++ } \
@@ -6834,7 +6836,7 @@ test_cluster_resource_x_terminal_owner.inc: $(top_srcdir)/src/backend/cluster/cl
 	     /^gcs_block_resource_x_target_recycle_inputs_result_exact\(/ { print "static ResourceXApplyResult"; emit=1; recycle_input++ } \
 	     /^cluster_gcs_resource_x_target_itl_recycle_(begin|finish)_exact\(/ { print "ResourceXApplyResult"; emit=1; recycle++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (owner != 1 || admission != 1 || join != 1 || finish != 1 || run != 1 || tick != 1 || cleanup != 1 || context != 1 || context_bool != 1 || peer != 1 || type17 != 1 || assertion != 1 || recycle_input != 1 || recycle != 2) exit 1 }' $< > $@.tmp
+	     END { if (service_admission != 1 || service_tick != 2 || owner != 1 || admission != 1 || join != 1 || finish != 1 || run != 1 || tick != 1 || cleanup != 1 || context != 1 || context_bool != 1 || peer != 1 || type17 != 1 || assertion != 1 || recycle_input != 1 || recycle != 2) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_resource_x_terminal_gate_consumer.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
@@ -9648,9 +9650,9 @@ test_cluster_pcm_lock_clock_product.o: $(top_srcdir)/src/include/cluster/cluster
 
 # Actual opt-in GCS service wrappers; native service work is a fixture boundary.
 test_cluster_pcm_service_trace.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
-	awk '/^gcs_block_pcm_service_begin\(/ { print "static void"; emit=1; n++ } \
+	awk '/^gcs_block_pcm_service_(begin|admission)\(/ { print "static void"; emit=1; n++ } \
 	     /^gcs_block_(pcm_x_resource_x_source_block_to_n|resource_x_source_finish_owned)_observed\(/ { print "static ResourceXApplyResult"; emit=1; n++ } \
-	     emit { print } /^}/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (n != 4 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pcm_service_trace: test_cluster_pcm_service_trace.c test_cluster_content_trace.c \
@@ -9658,6 +9660,12 @@ test_cluster_pcm_service_trace: test_cluster_pcm_service_trace.c test_cluster_co
         $(top_srcdir)/src/backend/cluster/cluster_content_trace.c \
         $(top_srcdir)/src/include/cluster/cluster_content_trace.h \
         $(top_srcdir)/src/include/cluster/cluster_wait_trace.h \
+        $(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
         $(top_srcdir)/src/include/cluster/cluster_pcm_x_bufmgr.h \
         $(top_srcdir)/src/include/cluster/cluster_resource_x_node_wire.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+
+# These native fixture objects contain the diagnostic value layout directly.
+test_cluster_resource_x_terminal_ingress test_cluster_pcm_lock \
+test_cluster_pcm_lock_clock_product.o test_cluster_ko_extend_recovery: \
+        $(top_srcdir)/src/include/cluster/cluster_wait_trace.h

@@ -330,6 +330,25 @@ cluster_content_trace_wait_clear(ClusterContentTraceWait kind)
 	content_trace_publish(false);
 }
 
+/* A nested finish can carry the enclosing entry checks only for the same
+ * complete native request. Unknown or distinct work must not borrow them. */
+static bool
+content_trace_same_pcm_service(const ClusterWaitTrace *a, const ClusterWaitTrace *b)
+{
+	return a->tag_known && b->tag_known && a->request_known && b->request_known
+		&& a->request_seq != 0 && a->formation != 0 && a->master_session != 0 && a->r4 != 0
+		&& content_trace_tag_equal(&a->tag, &b->tag)
+		&& a->request_seq == b->request_seq && a->requester == b->requester
+		&& a->formation == b->formation && a->master_session == b->master_session
+		&& a->r4 == b->r4 && a->base == b->base && a->authority == b->authority
+		&& a->expected_master == b->expected_master && a->source == b->source
+		&& a->wire_sender_connection == b->wire_sender_connection
+		&& a->ordered_lane == b->ordered_lane && a->semantic_crc32c == b->semantic_crc32c
+		&& a->source_candidate == b->source_candidate && a->retain_pi_if_dirty == b->retain_pi_if_dirty
+		&& a->common_flags == b->common_flags && a->common_outcome == b->common_outcome
+		&& a->state == b->state && a->mode == b->mode;
+}
+
 void
 cluster_content_trace_service_begin(ClusterContentTraceServiceScope *scope,
 	const ClusterWaitTrace *service)
@@ -351,6 +370,9 @@ cluster_content_trace_service_begin(ClusterContentTraceServiceScope *scope,
 	scope->previous = local_owner.pcm_service;
 	service_current = scope->serial;
 	local_owner.pcm_service = *service;
+	if (!service->service_admission.supplied && scope->previous_active
+		&& content_trace_same_pcm_service(service, &scope->previous))
+		local_owner.pcm_service.service_admission = scope->previous.service_admission;
 	local_owner.pcm_serving = true;
 	content_trace_publish(false);
 }

@@ -82,9 +82,27 @@ typedef struct ClusterWaitRequesterGate {
 	bool known;
 } ClusterWaitRequesterGate;
 
+typedef enum ClusterWaitPcmServiceOrigin {
+	CLWAIT_PCM_SERVICE_UNKNOWN, CLWAIT_PCM_SERVICE_INGRESS,
+	CLWAIT_PCM_SERVICE_DRAIN, CLWAIT_PCM_SERVICE_FINISH
+} ClusterWaitPcmServiceOrigin;
+
+/* Owned values from an already accepted native call. Receiver-local peer
+ * capability generation is not the sender's wire connection generation.
+ * This records entry checks, not ongoing route freshness or authority. */
+typedef struct ClusterWaitPcmAdmission {
+	uint64 feature_bit, record_generation, formation_epoch;
+	uint64 gate_formation, gate_freeze, master_session;
+	uint32 gate_phase, peer_capability_generation;
+	int32 origin, master_node;
+	uint8 side;
+	bool supplied, entered, known;
+} ClusterWaitPcmAdmission;
+
 typedef struct ClusterWaitTrace {
 	BufferTag tag;
 	ClusterWaitAdmissionBridge admission;
+	ClusterWaitPcmAdmission service_admission;
 	uint64 snapshot, wait_seq, request_seq;
 	uint64 binding, formation, master_session, r4, acquisition;
 	uint64 base, authority, head, enqueue_order;

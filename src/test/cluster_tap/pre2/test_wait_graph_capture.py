@@ -102,6 +102,54 @@ class GraphTests(unittest.TestCase):
         service['stable'] = False
         self.assertEqual(graph.build_graph(snapshots, [])['edges'], [])
 
+    def admitted_service_fixture(self):
+        wait, service, resources = self.pcm_bridge_fixture()
+        service['service_admission'] = dict(supplied=True, known=True, entered=True,
+            feature_bit=1024, record_generation=12, formation_epoch=7, side=1,
+            gate_phase=0, gate_formation=7, gate_freeze=19, master_node=2,
+            master_session=8, peer_capability_generation=61, origin=1)
+        return wait, service, resources
+
+    def test_pcm_native_admission_distinguishes_ingress_and_retained_retries(self):
+        wait, service, resources = self.admitted_service_fixture()
+        for origin, name in ((1, 'ingress'), (2, 'source_drain'), (3, 'source_finish')):
+            service['service_admission']['origin'] = origin
+            proof = graph.pcm_admission_bridge(wait, service, resources)
+            self.assertEqual(proof['quality'], 'native_admitted_service')
+            self.assertEqual(proof['origin'], name)
+            self.assertEqual(proof['peer_capability_generation'], 61)
+            self.assertEqual(proof['service_sender'], 42)
+            self.assertEqual(proof['new_inbound_frame'], origin == 1)
+            self.assertTrue(proof['route_checked_at_entry'])
+            self.assertFalse(proof['current_route_proven'])
+        snapshots = [dict(node=0, owners=[dict(node=0,pid=10,procno=1,backend_id=2,
+                        backend_start=3,proc_generation=17,pcm_wait=wait)]),
+                     dict(node=1, owners=[dict(node=1,pid=20,procno=2,backend_id=-1,
+                        backend_start=0,proc_generation=18,pcm_service=service)])]
+        result = graph.build_graph(snapshots, resources)
+        self.assertEqual(result['edges'][0]['resource']['native_admission'], proof)
+        self.assertEqual(result['edges'][0]['quality'], 'candidate_pcm_service')
+        self.assertEqual(result['cycles'], []); self.assertFalse(result['complete'])
+
+    def test_pcm_native_admission_rejects_unknown_drift_and_logical_gaps(self):
+        wait, service, resources = self.admitted_service_fixture()
+        for field in service['service_admission']:
+            changed = copy.deepcopy(service)
+            value = changed['service_admission'][field]
+            if field in ('origin', 'peer_capability_generation'):
+                changed['service_admission'][field] = 0
+            elif field == 'gate_freeze':
+                changed['service_admission'][field] = -1
+            else:
+                changed['service_admission'][field] = False if isinstance(value, bool) else value + 1
+            self.assertIsNone(graph.pcm_admission_bridge(wait, changed, resources), field)
+            del changed['service_admission'][field]
+            self.assertIsNone(graph.pcm_admission_bridge(wait, changed, resources), 'missing '+field)
+        changed = copy.deepcopy(service); changed.pop('service_admission')
+        self.assertIsNone(graph.pcm_admission_bridge(wait, changed, resources))
+        self.assertIsNone(graph.pcm_admission_bridge(wait, service, []))
+        self.assertIsNone(graph.pcm_admission_bridge(wait, service, resources + resources))
+
     def test_capture_queries_service_tag_without_a_wait_or_hold(self):
         tag = [1,2,3,4,5]
         class Reader:

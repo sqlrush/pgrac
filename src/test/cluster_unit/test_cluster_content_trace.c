@@ -647,10 +647,69 @@ UT_TEST(pcm_service_disabled_and_cleanup_do_not_resurrect)
 	UT_ASSERT(!local_owner.pcm_serving); UT_ASSERT_EQ(inner.serial, 0);
 }
 
+UT_TEST(pcm_nested_finish_inherits_only_same_native_request_admission)
+{
+	ClusterContentTraceServiceScope outer, inner;
+	ClusterWaitTrace service = {0}, nested;
+	reset(); service.tag = buf(2)->tag; service.tag_known = true;
+	service.request_known = true; service.request_seq = 81;
+	service.formation = 82; service.master_session = 83; service.r4 = 84;
+	service.requester = 3; service.source = 0; service.expected_master = 2;
+	service.service_admission.supplied = service.service_admission.known = true;
+	service.service_admission.origin = CLWAIT_PCM_SERVICE_INGRESS;
+	service.service_admission.peer_capability_generation = 61;
+	cluster_content_trace_service_begin(&outer, &service);
+	nested = service; memset(&nested.service_admission, 0, sizeof(nested.service_admission));
+	nested.site = CLWAIT_SITE_PCM_SOURCE_FINISH;
+	cluster_content_trace_service_begin(&inner, &nested);
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT(cut.owners[0].pcm_service.service_admission.known);
+	UT_ASSERT_EQ(cut.owners[0].pcm_service.service_admission.peer_capability_generation, 61);
+	cluster_content_trace_service_end(&inner);
+	for (int drift = 0; drift < 21; drift++) {
+		ClusterWaitTrace changed = nested;
+		switch (drift) {
+		case 0: changed.tag.forkNum++; break;
+		case 1: changed.tag_known = false; break;
+		case 2: changed.request_known = false; break;
+		case 3: changed.request_seq++; break;
+		case 4: changed.requester++; break;
+		case 5: changed.formation++; break;
+		case 6: changed.master_session++; break;
+		case 7: changed.r4++; break;
+		case 8: changed.base++; break;
+		case 9: changed.authority++; break;
+		case 10: changed.expected_master++; break;
+		case 11: changed.source++; break;
+		case 12: changed.wire_sender_connection++; break;
+		case 13: changed.ordered_lane++; break;
+		case 14: changed.semantic_crc32c++; break;
+		case 15: changed.source_candidate++; break;
+		case 16: changed.retain_pi_if_dirty++; break;
+		case 17: changed.common_flags++; break;
+		case 18: changed.common_outcome++; break;
+		case 19: changed.state++; break;
+		case 20: changed.mode++; break;
+		}
+		cluster_content_trace_service_begin(&inner, &changed);
+		cluster_content_trace_capture(NULL, &cut);
+		UT_ASSERT(!cut.owners[0].pcm_service.service_admission.known);
+		cluster_content_trace_service_end(&inner);
+	}
+	/* An explicitly supplied unknown must not borrow the enclosing proof. */
+	nested.service_admission.supplied = true;
+	cluster_content_trace_service_begin(&inner, &nested);
+	UT_ASSERT(!local_owner.pcm_service.service_admission.known);
+	cluster_content_trace_service_end(&inner);
+	cluster_content_trace_error_cleanup(); cluster_content_trace_service_end(&outer);
+	UT_ASSERT(!local_owner.pcm_serving);
+}
+
 int main(void)
 {
 	cluster_content_trace_shmem_register(); assert(registered && registered->lwlock_count == 0);
-	UT_PLAN(36);
+	UT_PLAN(37);
+	UT_RUN(pcm_nested_finish_inherits_only_same_native_request_admission);
 	UT_RUN(pcm_service_is_active_without_a_content_hold);
 	UT_RUN(pcm_service_nested_scope_restores_only_live_outer);
 	UT_RUN(pcm_service_missed_retirement_is_unknown);

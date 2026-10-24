@@ -121,6 +121,41 @@ def pcm_logical_bridge(wait, service, resources):
                 canonical_route_proven=False, physical_send_proven=False)
 
 
+def pcm_admission_bridge(wait, service, resources):
+    """Already accepted native entry context, without ongoing route authority."""
+    logical = pcm_logical_bridge(wait, service, resources)
+    admission = service.get('service_admission') or {}
+    if logical is None or any(admission.get(k) is not True for k in ('supplied', 'known', 'entered')):
+        return None
+    fields = ('feature_bit', 'record_generation', 'formation_epoch', 'gate_formation',
+              'gate_freeze', 'master_session', 'peer_capability_generation',
+              'gate_phase', 'origin', 'master_node', 'side')
+    if any(type(admission.get(k)) is not int for k in fields):
+        return None
+    if (admission['feature_bit'] != 1024 or admission['side'] != 1 or
+            admission['gate_phase'] != 0 or admission['origin'] not in (1, 2, 3) or
+            not 0 <= admission['gate_freeze'] < 2**64 or
+            not 0 < admission['record_generation'] < 2**64-1 or
+            not 0 < admission['peer_capability_generation'] < 2**32 or
+            not isinstance(service.get('wire_sender_connection'), int) or
+            not 0 < service['wire_sender_connection'] < 2**32 or
+            admission['record_generation'] != wait.get('r4') or
+            admission['record_generation'] != service.get('r4') or
+            admission['formation_epoch'] != wait.get('formation') or
+            admission['gate_formation'] != wait.get('formation') or
+            admission['master_session'] != wait.get('master_session') or
+            admission['master_node'] != wait.get('expected_master') or
+            admission['master_node'] != logical['master']):
+        return None
+    return dict(quality='native_admitted_service',
+                origin={1: 'ingress', 2: 'source_drain', 3: 'source_finish'}[admission['origin']],
+                checked_master=admission['master_node'],
+                peer_capability_generation=admission['peer_capability_generation'],
+                service_sender=service['wire_sender_connection'],
+                new_inbound_frame=admission['origin'] == 1,
+                route_checked_at_entry=True, current_route_proven=False)
+
+
 def build_graph(snapshots, resources):
     """Join copied native identities only; unknown edges remain in the result."""
     owners, unknown, edges, epochs = {}, [], [], {}
@@ -274,6 +309,7 @@ def build_graph(snapshots, resources):
                         formation=wait['formation'], master_session=wait['master_session'],
                         base=wait['base'], master=wait['expected_master'],
                         logical_bridge=pcm_logical_bridge(wait, service, resources),
+                        native_admission=pcm_admission_bridge(wait, service, resources),
                         service_wire_sender_connection=service.get('wire_sender_connection')),
                         'candidate_pcm_service')
             unknown.append(dict(process=identity(row), reason='pcm_service_process_edge_unresolved',

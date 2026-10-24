@@ -48,6 +48,24 @@ json_lock(StringInfo out, const ClusterContentTraceLock *lock)
 }
 
 static void
+json_pcm_admission(StringInfo out, const ClusterWaitPcmAdmission *row)
+{
+	appendStringInfoString(out, "{\"entry_checks_only\":true");
+#define WG_U(f) appendStringInfo(out, ",\"" #f "\":" UINT64_FORMAT, (uint64)row->f)
+#define WG_I(f) appendStringInfo(out, ",\"" #f "\":%d", row->f)
+#define WG_B(f) appendStringInfo(out, ",\"" #f "\":%s", row->f ? "true" : "false")
+	WG_U(feature_bit); WG_U(record_generation); WG_U(formation_epoch);
+	WG_U(gate_formation); WG_U(gate_freeze); WG_U(master_session);
+	WG_U(gate_phase); WG_U(peer_capability_generation);
+	WG_I(origin); WG_I(master_node); WG_I(side);
+	WG_B(supplied); WG_B(entered); WG_B(known);
+#undef WG_U
+#undef WG_I
+#undef WG_B
+	appendStringInfoChar(out, '}');
+}
+
+static void
 json_wait(StringInfo out, const ClusterWaitTrace *row)
 {
 	appendStringInfoString(out, "{\"tag\":");
@@ -92,6 +110,8 @@ json_wait(StringInfo out, const ClusterWaitTrace *row)
 #undef WG_U
 #undef WG_I
 #undef WG_B
+	appendStringInfoString(out, ",\"service_admission\":");
+	json_pcm_admission(out, &row->service_admission);
 	appendStringInfoChar(out, '}');
 }
 
