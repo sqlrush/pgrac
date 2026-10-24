@@ -6,6 +6,8 @@
 #include <sys/stat.h>
 #include "common/cryptohash.h"
 #include "common/sha2.h"
+#include "utils/memutils.h"
+#include "utils/resowner_private.h"
 #include "cluster/cluster_wal_source.h"
 #include "../../backend/cluster/cluster_control_root_private.h"
 #include "unit_test.h"
@@ -40,7 +42,35 @@ int errhint(const char *fmt, ...) { (void)fmt; return 0; }
 TimestampTz GetCurrentTimestamp(void) { return INT64CONST(1000000000); }
 uint16 cluster_wal_thread_id(void) { return 1; }
 ClusterRecoveryWorkerPool *cluster_recovery_worker_pool_ptr(void) { return &worker_pool; }
-void BackgroundWorkerUnblockSignals(void) { }
+static char owner_token;
+ResourceOwner CurrentResourceOwner;
+MemoryContext TopMemoryContext;
+static unsigned owner_creates, crypto_owned, crypto_unowned, crypto_handles;
+void CreateAuxProcessResourceOwner(void)
+{
+	/* Allocation can ERROR: the claimed slot must already have exit cleanup. */
+	UT_ASSERT_EQ(exit_callbacks, 1);
+	UT_ASSERT_NULL(CurrentResourceOwner);
+	CurrentResourceOwner = (ResourceOwner)&owner_token;
+	owner_creates++;
+}
+void BackgroundWorkerUnblockSignals(void)
+{
+	UT_ASSERT_NOT_NULL(CurrentResourceOwner);
+}
+void *MemoryContextAlloc(MemoryContext context, Size size)
+{ (void)context; return malloc(size); }
+/* Link the backend hash provider, retaining its real resource-owner calls.
+ * These are bounded owner bookkeeping doubles, not a replacement digest. */
+void ResourceOwnerEnlargeCryptoHash(ResourceOwner owner)
+{
+	if (owner == NULL) crypto_unowned++; else crypto_owned++;
+	UT_ASSERT_NOT_NULL(owner);
+}
+void ResourceOwnerRememberCryptoHash(ResourceOwner owner, Datum handle)
+{ UT_ASSERT_NOT_NULL(owner); UT_ASSERT_NE(handle, 0); crypto_handles++; }
+void ResourceOwnerForgetCryptoHash(ResourceOwner owner, Datum handle)
+{ UT_ASSERT_NOT_NULL(owner); UT_ASSERT_NE(handle, 0); crypto_handles--; }
 void before_shmem_exit(pg_on_exit_callback callback, Datum arg)
 { (void)callback; (void)arg; exit_callbacks++; }
 bool RegisterDynamicBackgroundWorker(BackgroundWorker *worker, BackgroundWorkerHandle **handle)
@@ -105,6 +135,10 @@ fixture(void)
 	char name[MAXFNAMELEN], pages[2 * XLOG_BLCKSZ];
 	uint64 start = 2 * (uint64)wal_segment_size;
 
+	/* The launching Startup has an owner; the spawned SHMEM-only worker does
+	 * not inherit that process-local lifetime. */
+	CurrentResourceOwner = (ResourceOwner)&owner_token;
+	owner_creates = crypto_owned = crypto_unowned = crypto_handles = 0;
 	if (scratch[0] && !rmtree(scratch, true)) abort();
 	strlcpy(scratch, "/tmp/pgrac-worker-pre2-XXXXXX", sizeof(scratch));
 	if (!mkdtemp(scratch)) abort();
@@ -230,7 +264,15 @@ UT_TEST(test_launch_pins_complete_pre2_input_before_background_reads)
 	/* A CF read from the worker would now refuse. The original launch cut
 	 * remains its only ROOT/source input; physical claim/page reads continue. */
 	root_result = source_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	CurrentResourceOwner = NULL;
+	crypto_owned = crypto_unowned = 0;
 	cluster_recovery_worker_main(Int32GetDatum(0));
+	UT_ASSERT_EQ(owner_creates, 1);
+#if defined(USE_OPENSSL) || defined(PGRAC_TEST_BACKEND_HASH_OWNER)
+	UT_ASSERT(crypto_owned > 0);
+#endif
+	UT_ASSERT_EQ(crypto_unowned, 0);
+	UT_ASSERT_EQ(crypto_handles, 0);
 	UT_ASSERT_EQ(worker_pool.stream_verdict[2], CLUSTER_RECOVERY_STREAM_OK);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&worker_pool.slot_state[0]), CLUSTER_RECOVERY_WORKER_DONE);
 	UT_ASSERT_EQ(root_reads, 1); UT_ASSERT_EQ(source_reads, 1); UT_ASSERT_EQ(registry_reads, 0);
@@ -240,12 +282,14 @@ UT_TEST(test_background_keeps_stale_launch_and_alive_refusals)
 {
 	fixture(); cluster_recovery_workers_launch();
 	worker_pool.pre2_input[2].generation--;
+	CurrentResourceOwner = NULL;
 	cluster_recovery_worker_main(Int32GetDatum(0));
 	UT_ASSERT_EQ(worker_pool.stream_verdict[2], CLUSTER_RECOVERY_STREAM_UNREADABLE);
 	UT_ASSERT_EQ(root_reads, 1); UT_ASSERT_EQ(source_reads, 1);
 	fixture(); root.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
 	root.published_at_usec = GetCurrentTimestamp();
 	cluster_recovery_workers_launch();
+	CurrentResourceOwner = NULL;
 	cluster_recovery_worker_main(Int32GetDatum(0));
 	UT_ASSERT_EQ(worker_pool.stream_verdict[2], CLUSTER_RECOVERY_STREAM_SKIPPED);
 	UT_ASSERT_EQ(root_reads, 1); UT_ASSERT_EQ(registry_reads, 0);

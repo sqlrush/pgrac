@@ -8379,11 +8379,15 @@ test_cluster_recovery_worker_pre2: test_cluster_recovery_worker_pre2.c unit_test
 		$(top_srcdir)/src/include/cluster/cluster_wal_restart_read.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_source.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_claim.h \
+		$(top_srcdir)/src/include/utils/resowner.h \
+		$(top_srcdir)/src/include/utils/resowner_private.h \
 		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_worker.c \
-		$(top_srcdir)/src/backend/cluster/cluster_wal_restart_read.c $(CLUSTER_WAL_CLAIM_O)
+		$(top_srcdir)/src/backend/cluster/cluster_wal_restart_read.c $(CLUSTER_WAL_CLAIM_O) \
+		$(CLUSTER_UNIT_CRYPTOHASH_O:.o=_srv.o)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_restart_read.c $(CLUSTER_WAL_CLAIM_O) \
+		$(CLUSTER_UNIT_CRYPTOHASH_O:.o=_srv.o) \
 		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 

@@ -64,6 +64,7 @@
 #include "postmaster/bgwriter.h" /* CheckPointTimeout (contract liveness threshold) */
 #include "storage/fd.h"
 #include "storage/ipc.h"
+#include "utils/resowner.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
@@ -369,6 +370,12 @@ cluster_recovery_worker_main(Datum main_arg)
 		return;
 
 	before_shmem_exit(mark_failed_on_exit, Int32GetDatum(slot));
+
+	/* SHMEM-only workers do not run InitPostgres. Establish the native
+	 * cleanup lifetime before generation-claim hashing can acquire a backend
+	 * cryptohash context (OpenSSL tracks it in CurrentResourceOwner). Keep
+	 * slot cleanup registered even if owner allocation itself raises ERROR. */
+	CreateAuxProcessResourceOwner();
 
 	/* Round-2 P1-2: the bgworker framework starts the entry point with
 	 * signals blocked; unblock before any file I/O so SIGTERM during a
