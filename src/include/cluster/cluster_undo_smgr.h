@@ -212,6 +212,22 @@ extern bool cluster_undo_smgr_recovery_ctrc_write_v2(ClusterUndoSmgrRecoveryStam
 extern bool cluster_undo_smgr_recovery_ctrc_write_bound_v2(ClusterUndoSmgrRecoveryStampV1 stamp,
 														   const uint8 *payload, size_t length);
 extern bool cluster_undo_smgr_recovery_ctrc_close_v2(ClusterUndoSmgrRecoveryStampV1 stamp);
+/* Dormant recovery finish for a caller-owned prepared D0 token. Rebind the
+ * original completed reader/full raw record and compare the exact reference
+ * returned at preparation, then reuse write_bound/direct sync/readback/close.
+ * Caller retains qualified source/cut/ROOT/graph/owner/pins/reservation and
+ * original recovery-window authority. The reference is structural, not a
+ * completion or source qualification. Only a successful write AND close
+ * returns true; this does not clear a window or release any retention pin.
+ * Binding refusal leaves the prepared stage intact. Target failures retain
+ * the original sticky/ERROR behavior; close failure may already close the FD.
+ * Caller still owns the token on false; never infer rollback or retry safety.
+ * No new target preparation, WAL insertion/flush or live redo dispatch. */
+extern bool cluster_undo_smgr_recovery_ctrc_finish_record_v2(
+	ClusterUndoSmgrRecoveryStampV1 stamp, const struct XLogReaderState *reader,
+	uint32 source_index, const uint8 source_identity_digest[32], const uint8 *raw,
+	size_t raw_length, const struct ClusterRecoveryCTRCReferenceV2 *prepared_reference);
+
 #endif
 
 

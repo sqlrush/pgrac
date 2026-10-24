@@ -964,6 +964,42 @@ cluster_undo_smgr_recovery_ctrc_close_v2(ClusterUndoSmgrRecoveryStampV1 stamp)
 {
 	return recovery_header_stamp_close(stamp, RECOVERY_HEADER_CTRC_D0);
 }
+
+bool
+cluster_undo_smgr_recovery_ctrc_finish_record_v2(ClusterUndoSmgrRecoveryStampV1 stamp,
+	const XLogReaderState *reader, uint32 source_index,
+	const uint8 source_identity_digest[32], const uint8 *raw, size_t raw_length,
+	const ClusterRecoveryCTRCReferenceV2 *prepared_reference)
+{
+	ClusterRecoveryCTRCReferenceV2 prepared, observed;
+	uint8 payload[CLUSTER_RECOVERY_CTRC_BYTES];
+
+	if (CritSectionCount != 0 || CurrentResourceOwner == NULL || prepared_reference == NULL)
+		return false;
+	/* The caller retains this structural reference from preparation. Rebuild
+	 * it from the original completed reader, not a window or a guessed end.
+	 * No target I/O or ownership change may precede the full-record binding. */
+	memcpy(&prepared, prepared_reference, sizeof(prepared));
+	if (!cluster_recovery_ctrc_reference_v2(reader, source_index,
+			source_identity_digest, raw, raw_length, &observed)
+		/* Compare logical members, never ABI-dependent structure padding. */
+		|| observed.source_index != prepared.source_index || observed.start != prepared.start
+		|| observed.end != prepared.end || observed.raw_length != prepared.raw_length
+		|| memcmp(observed.raw_record_sha256, prepared.raw_record_sha256,
+			sizeof(observed.raw_record_sha256)) != 0)
+		return false;
+	memcpy(payload, raw + SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong,
+		CLUSTER_RECOVERY_CTRC_BYTES);
+	if (!cluster_undo_smgr_recovery_ctrc_matches_v2(stamp, payload, sizeof(payload)))
+		return false;
+
+	/* Leave the caller's exact stage/token available on target refusal or
+	 * native ERROR. Only a durable readback permits the original close; false
+	 * after close is still not completion. No window or pin is retired here. */
+	if (!cluster_undo_smgr_recovery_ctrc_write_bound_v2(stamp, payload, sizeof(payload)))
+		return false;
+	return cluster_undo_smgr_recovery_ctrc_close_v2(stamp);
+}
 #endif
 
 bool
