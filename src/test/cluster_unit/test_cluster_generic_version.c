@@ -17,6 +17,7 @@
 
 #include "access/generic_xlog.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -26,6 +27,9 @@
 
 UT_DEFINE_GLOBALS();
 bool cluster_enabled = true, cluster_shared_config = true;
+BackendType MyBackendType = B_BACKEND;
+static ClusterNormalStartState fixture_start_state = CLUSTER_NORMAL_START_SOURCE_ZERO;
+static bool fixture_pristine = true;
 int cluster_node_id = 0, NBuffers = 4, NLocBuffer;
 char *BufferBlocks;
 Block *LocalBufferBlockPointers;
@@ -39,9 +43,32 @@ static Size delta_lengths[4];
 static ClusterSpaceIdentity identities[4];
 static RfPageVersionEdgeEntryV1 entries[4];
 static unsigned edge_count, inserts, dirties;
+static unsigned raw_blocks;
+static RelFileLocator raw_locator;
+static ForkNumber raw_fork;
+static BlockNumber raw_block;
+static uint8 raw_flags;
 static uint64 next_token, wal_token;
 static bool begun, expecting_error;
 static jmp_buf error_jump;
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return fixture_start_state;
+}
+
+bool
+cluster_semantic_activation_phase1_pristine(void)
+{
+	return fixture_pristine;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return false;
+}
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -152,6 +179,20 @@ XLogRegisterBufData(uint8 id, char *data, uint32 length)
 }
 
 void
+XLogRegisterBlock(uint8 id, RelFileLocator *locator, ForkNumber fork_number,
+				  BlockNumber block_number, char *page, uint8 flags)
+{
+	if (!begun || id != 0 || CritSectionCount == 0)
+		abort();
+	raw_blocks++;
+	raw_locator = *locator;
+	raw_fork = fork_number;
+	raw_block = block_number;
+	raw_flags = flags;
+	memcpy(wal_images[id].data, page, BLCKSZ);
+}
+
+void
 XLogRegisterPageVersionEdge(uint64 token, const RfPageVersionEdgeEntryV1 *edges, uint8 count)
 {
 	if (!begun || count > 4)
@@ -244,8 +285,12 @@ reset(void)
 	}
 	memcpy(before, pages, sizeof(pages));
 	cluster_shared_config = true;
+	MyBackendType = B_BACKEND;
+	fixture_start_state = CLUSTER_NORMAL_START_SOURCE_ZERO;
+	fixture_pristine = true;
 	CritSectionCount = 0;
 	edge_count = inserts = dirties = 0;
+	raw_blocks = 0;
 	wal_token = 0;
 	next_token = 100;
 	begun = expecting_error = false;
@@ -456,10 +501,124 @@ UT_TEST(test_all_three_internal_owners_and_duplicate_registration)
 	}
 }
 
+UT_TEST(test_recovery_full_image_frame_uses_native_block_without_publication)
+{
+	for (int owner = GENERIC_XLOG_CTRC_MX; owner <= GENERIC_XLOG_CTRC_ITL; owner++) {
+		PGAlignedBlock changed;
+		GenericXLogRecoveryImageV1 frame;
+		reset();
+		MyBackendType = B_STARTUP;
+		fixture_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+		fixture_pristine = false;
+		changed = pages[0];
+		changed.data[SizeOfPageHeaderData] = 77;
+		memset(changed.data + ((PageHeader)changed.data)->pd_lower, 0xa5,
+			((PageHeader)changed.data)->pd_upper - ((PageHeader)changed.data)->pd_lower);
+		UT_ASSERT(GenericXLogRecoveryImagePrepare((GenericXLogInternalOwner)owner,
+			&identities[0], MAIN_FORKNUM, 7, pages[0].data, changed.data, &frame));
+		UT_ASSERT(memcmp(pages, before, sizeof(pages)) == 0);
+		UT_ASSERT_EQ(changed.data[SizeOfPageHeaderData], 77);
+		UT_ASSERT_EQ((unsigned char)changed.data[((PageHeader)changed.data)->pd_lower], 0xa5);
+		UT_ASSERT_EQ(frame.result_token, 101);
+		UT_ASSERT_EQ(frame.version.before.mutation_token, 20);
+		UT_ASSERT_EQ(((PageHeader)frame.image.data)->pd_block_scn, 101);
+		for (unsigned i = ((PageHeader)frame.image.data)->pd_lower;
+			 i < ((PageHeader)frame.image.data)->pd_upper; i++)
+			UT_ASSERT_EQ(frame.image.data[i], 0);
+		UT_ASSERT_EQ(raw_blocks, 0);
+		UT_ASSERT_EQ(inserts, 0);
+		XLogBeginInsert();
+		CritSectionCount++;
+		UT_ASSERT(GenericXLogRecoveryImageRegister(&frame));
+		CritSectionCount--;
+		UT_ASSERT_EQ(raw_blocks, 1);
+		UT_ASSERT(memcmp(&raw_locator, &identities[0].key.locator, sizeof(raw_locator)) == 0);
+		UT_ASSERT_EQ(raw_fork, MAIN_FORKNUM);
+		UT_ASSERT_EQ(raw_block, 7);
+		UT_ASSERT_EQ(raw_flags, REGBUF_FORCE_IMAGE | REGBUF_STANDARD);
+		UT_ASSERT_EQ(edge_count, 1);
+		UT_ASSERT_EQ(wal_token, 101);
+		UT_ASSERT(memcmp(wal_images[0].data, frame.image.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(inserts, 0);
+		UT_ASSERT_EQ(dirties, 0);
+		UT_ASSERT(memcmp(pages, before, sizeof(pages)) == 0);
+	}
+}
+
+UT_TEST(test_recovery_frame_refuses_bad_inputs_before_token_or_registration)
+{
+	for (unsigned fault = 0; fault < 9; fault++) {
+		GenericXLogRecoveryImageV1 frame, saved;
+		PGAlignedBlock changed;
+		reset();
+		changed = pages[0];
+		memset(&frame, 0xa5, sizeof(frame));
+		saved = frame;
+		if (fault == 1) memset(identities[0].incarnation, 0, 16);
+		if (fault == 2) ((PageHeader)pages[0].data)->pd_block_scn = 0;
+		if (fault == 3) ((PageHeader)changed.data)->pd_block_scn++;
+		if (fault == 4) ((PageHeader)changed.data)->pd_lower = BLCKSZ;
+		if (fault == 5) identities[0].state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+		if (fault == 8) fixture_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+		UT_ASSERT(!GenericXLogRecoveryImagePrepare(
+			fault == 0 ? GENERIC_XLOG_ITL_FINISH : GENERIC_XLOG_CTRC_ITL,
+			fault == 6 ? NULL : &identities[0], fault == 7 ? FSM_FORKNUM : MAIN_FORKNUM,
+			7, pages[0].data, changed.data, &frame));
+		UT_ASSERT(memcmp(&frame, &saved, sizeof(frame)) == 0);
+		UT_ASSERT_EQ(next_token, 100);
+		UT_ASSERT_EQ(raw_blocks, 0);
+		UT_ASSERT_EQ(edge_count, 0);
+		UT_ASSERT_EQ(inserts, 0);
+	}
+}
+
+UT_TEST(test_recovery_frame_registration_rejects_bad_metadata_before_native_calls)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		GenericXLogRecoveryImageV1 frame;
+		reset();
+		UT_ASSERT(GenericXLogRecoveryImagePrepare(GENERIC_XLOG_CTRC_ITL,
+			&identities[0], MAIN_FORKNUM, 7, pages[0].data, pages[0].data, &frame));
+		if (fault == 0) frame.owner = GENERIC_XLOG_ITL_FINISH;
+		if (fault == 1) frame.result_token = 0;
+		if (fault == 2) frame.version.block_id = 1;
+		if (fault == 3) frame.version.result_incarnation[0] ^= 1;
+		if (fault == 4) ((PageHeader)frame.image.data)->pd_block_scn++;
+		if (fault == 6) frame.image.data[((PageHeader)frame.image.data)->pd_lower] = 1;
+		XLogBeginInsert();
+		if (fault != 5) CritSectionCount++;
+		UT_ASSERT(!GenericXLogRecoveryImageRegister(&frame));
+		if (fault != 5) CritSectionCount--;
+		UT_ASSERT_EQ(raw_blocks, 0);
+		UT_ASSERT_EQ(edge_count, 0);
+		UT_ASSERT_EQ(inserts, 0);
+		UT_ASSERT_EQ(dirties, 0);
+	}
+}
+
+UT_TEST(test_recovery_frame_output_overlap_leaves_both_images_unchanged)
+{
+	for (unsigned leg = 0; leg < 4; leg++) {
+		PGAlignedBlock storage[3] = { 0 }, saved[3];
+		Page input = (Page)storage + (leg & 1 ? MAXALIGN(1) : 0);
+		GenericXLogRecoveryImageV1 *out
+			= (GenericXLogRecoveryImageV1 *)((char *)storage + (leg & 1 ? 0 : MAXALIGN(1)));
+		reset();
+		memcpy(input, pages[0].data, BLCKSZ);
+		memcpy(saved, storage, sizeof(storage));
+		UT_ASSERT(!GenericXLogRecoveryImagePrepare(GENERIC_XLOG_CTRC_ITL, &identities[0],
+			MAIN_FORKNUM, 7, leg < 2 ? input : pages[0].data,
+			leg < 2 ? pages[0].data : input, out));
+		UT_ASSERT(memcmp(storage, saved, sizeof(storage)) == 0);
+		UT_ASSERT_EQ(next_token, 100);
+		UT_ASSERT_EQ(raw_blocks, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(12);
 	UT_RUN(test_delta_carries_result_version);
 	UT_RUN(test_multiple_relations_share_one_batch_token);
 	UT_RUN(test_abort_preserves_all_page_bytes);
@@ -468,6 +627,10 @@ main(void)
 	UT_RUN(test_wrong_namespace_missing_identity_and_zero_before_refuse);
 	UT_RUN(test_second_page_drift_refuses_before_any_publication);
 	UT_RUN(test_all_three_internal_owners_and_duplicate_registration);
+	UT_RUN(test_recovery_full_image_frame_uses_native_block_without_publication);
+	UT_RUN(test_recovery_frame_refuses_bad_inputs_before_token_or_registration);
+	UT_RUN(test_recovery_frame_registration_rejects_bad_metadata_before_native_calls);
+	UT_RUN(test_recovery_frame_output_overlap_leaves_both_images_unchanged);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

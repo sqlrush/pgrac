@@ -5,6 +5,34 @@ int side_xact_fixture_main(void);
 #include "test_cluster_side_xact.c"
 #undef main
 
+/* Insert the native counted array before invalidations/SCN/TT/typed drops. */
+static Size
+pi_commit_add_stats(FakeXactRecord *fake, const xl_xact_stats_item *items, int count)
+{
+	uint32 xinfo;
+	Size offset = MinSizeOfXactCommit + sizeof(xl_xact_xinfo);
+	Size extra = sizeof(count) + count * sizeof(*items);
+
+	memcpy(&xinfo, fake->data + MinSizeOfXactCommit, sizeof(xinfo));
+	UT_ASSERT((xinfo & (XACT_XINFO_HAS_SUBXACTS | XACT_XINFO_HAS_DROPPED_STATS)) == 0);
+	if ((xinfo & XACT_XINFO_HAS_DBINFO) != 0)
+		offset += sizeof(xl_xact_dbinfo);
+	if ((xinfo & XACT_XINFO_HAS_RELFILELOCATORS) != 0) {
+		int nrels;
+		memcpy(&nrels, fake->data + offset, sizeof(nrels));
+		offset += sizeof(nrels) + nrels * sizeof(RelFileLocator);
+	}
+	UT_ASSERT(fake->u.decoded.main_data_len + extra <= sizeof(fake->data));
+	memmove(fake->data + offset + extra, fake->data + offset,
+			fake->u.decoded.main_data_len - offset);
+	memcpy(fake->data + offset, &count, sizeof(count));
+	memcpy(fake->data + offset + sizeof(count), items, count * sizeof(*items));
+	xinfo |= XACT_XINFO_HAS_DROPPED_STATS;
+	memcpy(fake->data + MinSizeOfXactCommit, &xinfo, sizeof(xinfo));
+	fake->u.decoded.main_data_len += extra;
+	return offset;
+}
+
 static void
 pi_commit(FakeXactRecord *fake, uint32 flags, const SharedInvalidationMessage *messages, int count)
 {
@@ -467,10 +495,151 @@ UT_TEST(test_pi_commit_keeps_all_drop_locators_and_exact_namespace)
 	}
 }
 
+UT_TEST(test_pi_relation_stats_keep_complete_payload_without_execution)
+{
+	for (int variant = 0; variant < 3; variant++) {
+		xl_xact_stats_item items[] = { { PGSTAT_KIND_RELATION, 5, 76543 },
+									 { PGSTAT_KIND_RELATION, InvalidOid, 1260 } };
+		SharedInvalidationMessage msg = { 0 };
+		FakeXactRecord fake;
+		RfPageOnlineRecordIdentityV1 identity;
+		RfDetachedRecordPlanV1 record;
+		RfSideOnlinePlanV1 *plan;
+		RfSideOnlineOperationV1 op;
+		RfSideContributionOwnersV1 owners;
+		RfSideOnlineApplyOpsV1 ops = { 0 };
+		ApplyCapture capture = { 0 };
+		RfPageProofDetailV1 detail;
+
+		reset_prepare_apply();
+		msg.rc.id = SHAREDINVALRELCACHE_ID;
+		msg.rc.dbId = 5;
+		msg.rc.relId = 76543;
+		if (variant == 2) {
+			make_commit(&fake, 801, 901, 123456, false);
+			items[0].dboid = InvalidOid;
+		} else
+			pi_commit(&fake, variant == 1 ? XACT_COMPLETION_FORCE_SYNC_COMMIT : 0,
+					  variant == 1 ? &msg : NULL, variant == 1 ? 1 : 0);
+		pi_commit_add_stats(&fake, items, lengthof(items));
+		identity = pi_identity(&fake);
+		record = make_record_plan(&fake);
+		plan = pi_side_plan(&identity, true);
+		detail = rf_side_online_plan_feed_record_v1(plan, &record, &identity);
+		UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_OK);
+		if (detail == RF_PAGE_PROOF_DETAIL_OK) {
+			UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &op));
+			UT_ASSERT(op.xact.pi_read_only && !op.xact.cold_completion_effects);
+			UT_ASSERT_EQ(op.owned_payload_length, fake.u.decoded.main_data_len);
+			UT_ASSERT(memcmp(op.owned_payload, fake.data, op.owned_payload_length) == 0);
+			UT_ASSERT(rf_side_online_plan_contribution_owners_v1(plan, 0, &owners));
+			UT_ASSERT((owners.owners & RF_SIDE_CONTRIBUTION_COMPLETION) != 0);
+			UT_ASSERT_EQ(op.xact.invalidation_count, variant == 1 ? 1 : 0);
+			UT_ASSERT_EQ(rf_side_online_plan_space_contribution_count_v1(plan, 0), 0);
+			UT_ASSERT_EQ(rf_side_xact_apply_owned_v1(&op.xact, op.owned_payload,
+												   op.owned_payload_length), RF_SIDE_XACT_APPLY_BLOCKED);
+			ops.arg = &capture;
+			ops.begin_protected_set = capture_begin;
+			ops.end_protected_set = capture_end;
+			ops.preflight_xact = accept_preflight;
+			ops.apply_xact = capture_apply;
+			UT_ASSERT_NE(rf_side_online_plan_preflight_v1(plan, &ops), RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT_NE(rf_side_online_plan_apply_v1(plan, &ops), RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT_EQ(capture.begin_count + capture.count, 0);
+			UT_ASSERT(!capture.end_complete);
+		}
+		UT_ASSERT_EQ(cold_stats_calls + prepare_apply.terminal_projection_stores, 0);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_pi_relation_stats_check_every_item_and_original_scope)
+{
+	for (int variant = 0; variant < 12; variant++) {
+		xl_xact_stats_item items[] = { { PGSTAT_KIND_RELATION, 5, 76543 },
+									 { PGSTAT_KIND_RELATION, 5, 76544 } };
+		SharedInvalidationMessage msg = { .id = -99 };
+		FakeXactRecord fake;
+		RfPageOnlineRecordIdentityV1 identity;
+		RfDetachedRecordPlanV1 record;
+		RfSideOnlinePlanV1 *plan;
+		Size offset;
+		int count;
+		Oid database = InvalidOid;
+
+		if (variant == 0) items[1].kind = PGSTAT_KIND_DATABASE;
+		if (variant == 1) items[1].kind = -1;
+		if (variant == 2) items[1].objoid = InvalidOid;
+		if (variant == 3) items[1].dboid = 6;
+		if (variant == 10) items[1].kind = PGSTAT_KIND_FUNCTION;
+		if (variant == 4)
+			make_commit(&fake, 801, 901, 123456, false);
+		else
+			pi_commit(&fake, 0, variant == 11 ? &msg : NULL, variant == 11 ? 1 : 0);
+		if (variant == 5)
+			memcpy(fake.data + MinSizeOfXactCommit + sizeof(xl_xact_xinfo),
+				   &database, sizeof(database));
+		offset = pi_commit_add_stats(&fake, items, lengthof(items));
+		if (variant == 6 || variant == 7) {
+			count = variant == 6 ? -1 : INT_MAX;
+			memcpy(fake.data + offset, &count, sizeof(count));
+		}
+		if (variant == 8)
+			fake.u.decoded.main_data_len = offset + sizeof(count) + sizeof(items) - 1;
+		if (variant == 9)
+			fake.data[fake.u.decoded.main_data_len++] = 0;
+		identity = pi_identity(&fake);
+		record = make_record_plan(&fake);
+		plan = pi_side_plan(&identity, true);
+		UT_ASSERT_NE(rf_side_online_plan_feed_record_v1(plan, &record, &identity),
+					 RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_NE(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_cold_completion_and_pi_stats_keep_separate_child_and_kind_contracts)
+{
+	for (int children = 0; children < 2; children++)
+		for (int function = 0; function < 2; function++) {
+			FakeXactRecord fake;
+			RfSideXactOperationV1 cold, pi, strict;
+			xl_xact_stats_item item;
+			Size offset = MinSizeOfXactCommit + sizeof(xl_xact_xinfo)
+						  + sizeof(xl_xact_dbinfo) + sizeof(int) + sizeof(item);
+			bool inspected;
+
+			reset_prepare_apply();
+			cold_completion_commit(&fake, true, true, true);
+			if (!function) {
+				memcpy(&item, fake.data + offset, sizeof(item));
+				item.kind = PGSTAT_KIND_RELATION;
+				memcpy(fake.data + offset, &item, sizeof(item));
+			}
+			if (children)
+				cold_terminal_children(&fake, false);
+			UT_ASSERT(rf_side_xact_decode_recovery_v1(&fake.reader, UINT64_C(0x11223344), 3, &cold));
+			UT_ASSERT(cold.cold_completion_effects && !cold.pi_read_only);
+			UT_ASSERT(rf_side_xact_cold_completion_preflight_v1(&cold, fake.data,
+																fake.u.decoded.main_data_len));
+			inspected = rf_side_xact_inspect_pi_v1(&fake.reader, UINT64_C(0x11223344), 3, &pi);
+			UT_ASSERT_EQ(inspected, !children && !function);
+			if (inspected) {
+				UT_ASSERT(pi.pi_read_only && !pi.cold_completion_effects);
+				UT_ASSERT_EQ(pi.completion_payload_length, fake.u.decoded.main_data_len);
+			}
+			UT_ASSERT(!rf_side_xact_decode_v1(&fake.reader, UINT64_C(0x11223344), 3, &strict));
+			UT_ASSERT_EQ(rf_side_xact_apply_owned_v1(&cold, fake.data,
+													fake.u.decoded.main_data_len), RF_SIDE_XACT_APPLY_BLOCKED);
+			UT_ASSERT_EQ(cold_stats_calls + prepare_apply.terminal_projection_stores, 0);
+		}
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(12);
 	UT_RUN(test_pi_commit_keeps_complete_flags_and_invalidation_payload);
 	UT_RUN(test_pi_side_plan_rejects_execution_before_callbacks);
 	UT_RUN(test_pi_commit_unknown_or_damaged_effects_still_refuse);
@@ -480,6 +649,9 @@ main(void)
 	UT_RUN(test_pi_ctrc_other_fields_still_refuse);
 	UT_RUN(test_pi_create_namespace_modifier_and_page_reuse_boundaries);
 	UT_RUN(test_pi_commit_keeps_all_drop_locators_and_exact_namespace);
+	UT_RUN(test_pi_relation_stats_keep_complete_payload_without_execution);
+	UT_RUN(test_pi_relation_stats_check_every_item_and_original_scope);
+	UT_RUN(test_cold_completion_and_pi_stats_keep_separate_child_and_kind_contracts);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -430,6 +430,127 @@ GenericXLogRegisterBufferVersioned(GenericXLogState *state, Buffer buffer,
 	return NULL;
 }
 
+/* The native full-image representation has a zeroed page hole. Keep the
+ * ordinary buffer and the recovery frame on the same byte calculation. */
+static void
+genericXLogCopyImage(Page destination, const char *source)
+{
+	const PageHeaderData *header = (const PageHeaderData *)source;
+
+	memcpy(destination, source, header->pd_lower);
+	memset(destination + header->pd_lower, 0, header->pd_upper - header->pd_lower);
+	memcpy(destination + header->pd_upper, source + header->pd_upper,
+		   BLCKSZ - header->pd_upper);
+}
+
+#ifdef USE_PGRAC_CLUSTER
+static bool
+genericXLogImageLayoutValid(const char *image)
+{
+	const PageHeaderData *header = (const PageHeaderData *)image;
+
+	return image != NULL && !PageIsNew((Page)image)
+		&& PageGetPageSize((Page)image) == BLCKSZ
+		&& PageGetPageLayoutVersion((Page)image) == PG_PAGE_LAYOUT_VERSION
+		&& header->pd_lower >= SizeOfPageHeaderData && header->pd_lower <= header->pd_upper
+		&& header->pd_upper <= header->pd_special && header->pd_special <= BLCKSZ;
+}
+
+static bool
+genericXLogImageRangesOverlap(const void *a, Size a_size, const void *b, Size b_size)
+{
+	uintptr_t left = (uintptr_t)a, right = (uintptr_t)b;
+
+	return left <= right ? right - left < a_size : left - right < b_size;
+}
+
+bool
+GenericXLogRecoveryImagePrepare(GenericXLogInternalOwner owner,
+	const ClusterSpaceIdentity *identity, ForkNumber fork_number, BlockNumber block_number,
+	const char *before_image, const char *after_image, GenericXLogRecoveryImageV1 *out)
+{
+	GenericXLogRecoveryImageV1 value;
+	RfPageProducerComponentV1 component;
+	RfPageProducerBatchV1 batch;
+	uint8 encoded_identity[CLUSTER_SPACE_IDENTITY_BYTES];
+
+	if ((owner != GENERIC_XLOG_CTRC_ITL && owner != GENERIC_XLOG_CTRC_MX)
+		|| identity == NULL || out == NULL || before_image == NULL || after_image == NULL
+		|| identity->state != CLUSTER_SPACE_IDENTITY_LIVE || fork_number != MAIN_FORKNUM
+		|| block_number == InvalidBlockNumber
+		|| genericXLogImageRangesOverlap(out, sizeof(*out), before_image, BLCKSZ)
+		|| genericXLogImageRangesOverlap(out, sizeof(*out), after_image, BLCKSZ)
+		|| !cluster_space_identity_encode(identity, encoded_identity, sizeof(encoded_identity))
+		|| !genericXLogImageLayoutValid(before_image) || !genericXLogImageLayoutValid(after_image)
+		|| ((const PageHeaderData *)before_image)->pd_block_scn == 0
+		|| ((const PageHeaderData *)after_image)->pd_block_scn
+			!= ((const PageHeaderData *)before_image)->pd_block_scn)
+		return false;
+
+	memset(&value, 0, sizeof(value));
+	value.owner = owner;
+	value.identity = *identity;
+	value.fork_number = fork_number;
+	value.block_number = block_number;
+	genericXLogCopyImage(value.image.data, after_image);
+	memset(&component, 0, sizeof(component));
+	component.page_class = RF_PAGE_CLASS_ORDINARY;
+	component.before_kind = RF_PAGE_STATE_PRESENT;
+	memcpy(component.segment_incarnation, identity->incarnation, 16);
+	component.page = value.image.data;
+	if (!rf_page_producer_prepare_v1(&component, 1, &batch)
+		|| !rf_page_producer_stamp_v1(&batch))
+		return false;
+	value.result_token = batch.result_token;
+	value.version = batch.entries[0];
+	*out = value;
+	return true;
+}
+
+bool
+GenericXLogRecoveryImageRegister(GenericXLogRecoveryImageV1 *image)
+{
+	RfPageProducerBatchV1 batch;
+	RfPageVersionEdgeEntryV1 expected;
+	const PageHeaderData *header;
+	uint8 encoded_identity[CLUSTER_SPACE_IDENTITY_BYTES];
+
+	/* Payload registration only. The actual owner begins the native record
+	 * and records F4 INSERTING before entering this critical section. */
+	if (image == NULL || CritSectionCount == 0
+		|| (image->owner != GENERIC_XLOG_CTRC_ITL && image->owner != GENERIC_XLOG_CTRC_MX)
+		|| image->identity.state != CLUSTER_SPACE_IDENTITY_LIVE
+		|| image->fork_number != MAIN_FORKNUM || image->block_number == InvalidBlockNumber
+		|| image->result_token == 0 || image->version.before.mutation_token == 0
+		|| !cluster_space_identity_encode(&image->identity, encoded_identity, sizeof(encoded_identity))
+		|| !genericXLogImageLayoutValid(image->image.data)
+		|| ((PageHeader)image->image.data)->pd_block_scn != image->result_token)
+		return false;
+	memset(&expected, 0, sizeof(expected));
+	expected.page_class = RF_PAGE_CLASS_ORDINARY;
+	expected.before_kind = RF_PAGE_STATE_PRESENT;
+	expected.result_kind = RF_PAGE_STATE_PRESENT;
+	memcpy(expected.before.segment_incarnation, image->identity.incarnation, 16);
+	expected.before.mutation_token = image->version.before.mutation_token;
+	memcpy(expected.result_incarnation, image->identity.incarnation, 16);
+	if (memcmp(&expected, &image->version, sizeof(expected)) != 0)
+		return false;
+	header = (const PageHeaderData *)image->image.data;
+	for (uint16 pos = header->pd_lower; pos < header->pd_upper; pos++)
+		if (image->image.data[pos] != 0)
+			return false;
+	memset(&batch, 0, sizeof(batch));
+	batch.result_token = image->result_token;
+	batch.entry_count = 1;
+	batch.prepared = batch.stamped = true;
+	batch.entries[0] = image->version;
+	batch.ordinary_pages[0] = image->image.data;
+	XLogRegisterBlock(0, &image->identity.key.locator, image->fork_number,
+		image->block_number, image->image.data, REGBUF_FORCE_IMAGE | REGBUF_STANDARD);
+	return rf_page_producer_register_wal_v1(&batch);
+}
+#endif
+
 /*
  * Apply changes represented by GenericXLogState to the actual buffers,
  * and emit a generic xlog record.
@@ -488,13 +609,11 @@ GenericXLogFinish(GenericXLogState *state)
 		{
 			PageData   *pageData = &state->pages[i];
 			Page		page;
-			PageHeader	pageHeader;
 
 			if (BufferIsInvalid(pageData->buffer))
 				continue;
 
 			page = BufferGetPage(pageData->buffer);
-			pageHeader = (PageHeader) pageData->image;
 
 			/*
 			 * Compute delta while we still have both the unmodified page and
@@ -508,12 +627,7 @@ GenericXLogFinish(GenericXLogState *state)
 			 * pd_lower and pd_upper in order to avoid divergence between
 			 * actual page state and what replay would produce.
 			 */
-			memcpy(page, pageData->image, pageHeader->pd_lower);
-			memset(page + pageHeader->pd_lower, 0,
-				   pageHeader->pd_upper - pageHeader->pd_lower);
-			memcpy(page + pageHeader->pd_upper,
-				   pageData->image + pageHeader->pd_upper,
-				   BLCKSZ - pageHeader->pd_upper);
+			genericXLogCopyImage(page, pageData->image);
 
 			MarkBufferDirty(pageData->buffer);
 

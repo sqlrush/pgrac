@@ -32,6 +32,7 @@ typedef struct GenericXLogState GenericXLogState;
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: only existing internal cleanup owners may emit shared generic WAL. */
 #include "cluster/cluster_space_identity.h"
+#include "cluster/cluster_page_producer.h"
 typedef enum GenericXLogInternalOwner
 {
 	GENERIC_XLOG_ITL_FINISH = 1,
@@ -42,6 +43,26 @@ extern GenericXLogState *GenericXLogStartInternal(bool is_logged,
 												GenericXLogInternalOwner owner);
 extern Page GenericXLogRegisterBufferVersioned(GenericXLogState *state, Buffer buffer,
 												 int flags, const ClusterSpaceIdentity *identity);
+
+/* One caller-owned full-image frame, never recovery/write/release authority.
+ * Preparation leaves inputs and output unchanged on refusal. Registration
+ * only borrows the frame until native insert/reset; the executing owner must
+ * supply page custody, F4 INSERTING, insertion, flush and durable installation. */
+typedef struct GenericXLogRecoveryImageV1
+{
+	GenericXLogInternalOwner owner;
+	ClusterSpaceIdentity identity;
+	ForkNumber fork_number;
+	BlockNumber block_number;
+	uint64 result_token;
+	RfPageVersionEdgeEntryV1 version;
+	PGAlignedBlock image;
+} GenericXLogRecoveryImageV1;
+
+extern bool GenericXLogRecoveryImagePrepare(GenericXLogInternalOwner owner,
+	const ClusterSpaceIdentity *identity, ForkNumber fork_number, BlockNumber block_number,
+	const char *before_image, const char *after_image, GenericXLogRecoveryImageV1 *out);
+extern bool GenericXLogRecoveryImageRegister(GenericXLogRecoveryImageV1 *image);
 #endif
 
 /* API for construction of generic xlog records */
