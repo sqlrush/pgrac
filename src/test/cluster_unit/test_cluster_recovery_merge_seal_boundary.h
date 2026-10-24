@@ -88,6 +88,7 @@ static int last_elevel;
 static int last_sqlstate;
 static char last_message[512];
 static char last_detail[1024];
+static char last_plan_log_detail[1024];
 
 static void event(const char *fmt, ...) pg_attribute_printf(1, 2);
 
@@ -106,6 +107,8 @@ static void
 test_ereport_begin(int elevel)
 {
 	last_elevel = elevel;
+	if (elevel == LOG)
+		last_plan_log_detail[0] = '\0';
 	if (elevel >= ERROR) {
 		last_sqlstate = 0;
 		last_message[0] = '\0';
@@ -157,10 +160,13 @@ errdetail(const char *fmt, ...)
 {
 	va_list args;
 
-	if (last_elevel < ERROR)
+	if (last_elevel < ERROR && last_elevel != LOG)
 		return 0;
 	va_start(args, fmt);
-	vsnprintf(last_detail, sizeof(last_detail), fmt, args);
+	if (last_elevel == LOG)
+		vsnprintf(last_plan_log_detail, sizeof(last_plan_log_detail), fmt, args);
+	else
+		vsnprintf(last_detail, sizeof(last_detail), fmt, args);
 	va_end(args);
 	return 0;
 }
@@ -212,9 +218,13 @@ appendStringInfo(StringInfo str, const char *fmt, ...)
 }
 
 /* ---- recovery plan, stream checks, shared root membership ---- */
+static bool plan_snapshot_available = true;
+
 bool
 cluster_recovery_plan_snapshot(ClusterRecoveryPlan *out)
 {
+	if (!plan_snapshot_available)
+		return false;
 	*out = census;
 	return true;
 }

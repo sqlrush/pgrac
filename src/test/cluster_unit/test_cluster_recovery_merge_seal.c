@@ -417,10 +417,58 @@ UT_TEST(test_unsafe_history_refused_before_seal)
 	UT_ASSERT_EQ(open_calls[2], 0);
 }
 
+UT_TEST(test_no_plan_refusal_identifies_snapshot_and_output_cut)
+{
+	ClusterRecoveryFencePlan *plan = NULL;
+	ClusterMergeEngage engage;
+
+	fixture();
+	plan_snapshot_available = true;
+	last_plan_log_detail[0] = '\0';
+	census.failed = census.generated = true;
+	UT_ASSERT(preflight(&plan, &engage));
+	UT_ASSERT_EQ(engage, CLUSTER_MERGE_NO_NO_PLAN);
+	UT_ASSERT(plan == NULL && events[0] == '\0');
+	UT_ASSERT(strstr(last_plan_log_detail, "predicate=PLAN_FAILED") != NULL);
+	UT_ASSERT(strstr(last_plan_log_detail, "generated=1") != NULL);
+
+	fixture();
+	last_plan_log_detail[0] = '\0';
+	plan_snapshot_available = false;
+	UT_ASSERT(preflight(&plan, &engage));
+	plan_snapshot_available = true;
+	UT_ASSERT_EQ(engage, CLUSTER_MERGE_NO_NO_PLAN);
+	UT_ASSERT(plan == NULL && events[0] == '\0');
+	UT_ASSERT(strstr(last_plan_log_detail, "predicate=PLAN_SNAPSHOT_UNAVAILABLE") != NULL);
+
+	fixture();
+	last_plan_log_detail[0] = '\0';
+	UT_ASSERT_EQ(cluster_recovery_merge_preflight_readonly(1, 100, NULL),
+		CLUSTER_MERGE_NO_NO_PLAN);
+	UT_ASSERT(strstr(last_plan_log_detail, "predicate=PLAN_OUTPUT_NOT_EMPTY") != NULL);
+	UT_ASSERT(strstr(last_plan_log_detail, "output_null=1") != NULL);
+	UT_ASSERT(events[0] == '\0');
+
+	plan = malloc(1);
+	UT_ASSERT(plan != NULL);
+	{
+		ClusterRecoveryFencePlan *original = plan;
+
+		last_plan_log_detail[0] = '\0';
+		UT_ASSERT_EQ(cluster_recovery_merge_preflight_readonly(1, 100, &plan),
+			CLUSTER_MERGE_NO_NO_PLAN);
+		UT_ASSERT(plan == original);
+		UT_ASSERT(strstr(last_plan_log_detail, "output_null=0") != NULL);
+		UT_ASSERT(events[0] == '\0');
+	}
+	free(plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
+	UT_RUN(test_no_plan_refusal_identifies_snapshot_and_output_cut);
 	UT_RUN(test_open_generations_are_sealed_after_admission);
 	UT_RUN(test_partial_seal_resumes);
 	UT_RUN(test_stale_admission_refuses_before_any_seal);

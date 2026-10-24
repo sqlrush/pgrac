@@ -895,8 +895,21 @@ cluster_recovery_merge_project_readonly(uint16 own_thread, XLogRecPtr own_redo,
 	if (cluster_wal_threads_dir == NULL || cluster_wal_threads_dir[0] == '\0'
 		|| own_thread == XLP_THREAD_ID_LEGACY)
 		return CLUSTER_MERGE_NO_NOT_CONFIGURED;
-	if (!cluster_recovery_plan_snapshot(&plan) || plan.failed)
+	if (!cluster_recovery_plan_snapshot(&plan)) {
+		ereport(LOG, (errmsg("cold recovery plan input refused"),
+					  errdetail("predicate=PLAN_SNAPSHOT_UNAVAILABLE own_thread=%u",
+								(unsigned)own_thread)));
 		return CLUSTER_MERGE_NO_NO_PLAN;
+	}
+	if (plan.failed) {
+		ereport(LOG, (errmsg("cold recovery plan input refused"),
+					  errdetail("predicate=PLAN_FAILED own_thread=%u plan_thread=%u "
+								"generated=%d threads_scanned=%u generated_at=" INT64_FORMAT,
+								(unsigned)own_thread, (unsigned)plan.own_thread,
+								plan.generated ? 1 : 0, (unsigned)plan.threads_scanned,
+								plan.generated_at)));
+		return CLUSTER_MERGE_NO_NO_PLAN;
+	}
 	if (plan.n_crashed_candidate == 0)
 		return CLUSTER_MERGE_NO_NO_CANDIDATES;
 	if (plan.n_alive > 0)
@@ -1362,8 +1375,12 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 		= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
 		  | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
 
-	if (out_plan == NULL || *out_plan != NULL)
+	if (out_plan == NULL || *out_plan != NULL) {
+		ereport(LOG, (errmsg("cold recovery plan output refused"),
+					  errdetail("predicate=PLAN_OUTPUT_NOT_EMPTY own_thread=%u output_null=%d",
+								(unsigned)own_thread, out_plan == NULL ? 1 : 0)));
 		return CLUSTER_MERGE_NO_NO_PLAN;
+	}
 	plan = palloc0(sizeof(*plan));
 	plan->magic = CLUSTER_RECOVERY_FENCE_PLAN_MAGIC;
 	plan->owner_pid = MyProcPid;
@@ -1451,6 +1468,9 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 	if (!cluster_recovery_fence_plan_shape_valid(own_thread, plan->replay_thread_bitmap,
 												 plan->foreign_origin_bitmap, origin_threads,
 												 plan->origin_count)) {
+		ereport(LOG, (errmsg("cold recovery plan shape refused"),
+					  errdetail("predicate=PLAN_ORIGIN_SHAPE own_thread=%u origins=%u",
+								(unsigned)own_thread, (unsigned)plan->origin_count)));
 		MemSet(plan, 0, sizeof(*plan));
 		pfree(plan);
 		return CLUSTER_MERGE_NO_NO_PLAN;
