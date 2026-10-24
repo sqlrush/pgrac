@@ -1908,16 +1908,22 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 			&& U64FromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull) != UINT64_MAX
 			&& TransactionIdIsNormal(XidFromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull))
 			&& XidFromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull)
-			== vacrel->cutoffs.FreezeLimit)
+			== vacrel->cutoffs.FreezeLimit
+			&& FullTransactionIdEquals(vacrel->cutoffs.SharedFreezePolicySample.freeze_limit,
+									   vacrel->cutoffs.SharedFreezeLimitFull))
 		{
 			ClusterHeapFreezeCohortObservation cohort;
 			ClusterHeapFreezeCohortStatus cohort_status;
+			bool policy_current;
 
 			memset(&cohort, 0, sizeof(cohort));
 			cohort_status = cluster_heap_freeze_cohort_observe(&cohort);
+			policy_current = cohort_status == CLUSTER_HEAP_FREEZE_COHORT_READY
+				&& cluster_heap_freeze_policy_sample_current_v1(&vacrel->cutoffs.SharedFreezePolicySample);
 			if (!cluster_semantic_activation_recheck_r4_terminal_census(&admission))
 				status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
 			else if (cohort_status == CLUSTER_HEAP_FREEZE_COHORT_READY
+					 && policy_current
 					 && cohort.local_unqualified_entries == 0
 					 && cohort.record_generation == admission.record_generation
 					 && cohort.formation_epoch == admission.formation_epoch

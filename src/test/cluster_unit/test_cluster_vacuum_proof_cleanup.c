@@ -91,6 +91,8 @@ static ClusterHeapFreezeCohortObservation cohort_value;
 static ClusterHeapFreezeCohortStatus cohort_status;
 static unsigned cohort_calls, bindings_at_cohort;
 static bool error_cohort, revoke_cohort;
+static bool policy_sample_current, revoke_on_policy_check;
+static unsigned policy_checks;
 
 static void
 note_cleanup(char event)
@@ -526,6 +528,18 @@ cluster_heap_freeze_cohort_observe(ClusterHeapFreezeCohortObservation *out)
 	return cohort_status;
 }
 
+bool
+cluster_heap_freeze_policy_sample_current_v1(const ClusterHeapFreezePolicySampleV1 *sample)
+{
+	if (guard_held || pin_held || content_locked || debt != 1)
+		abort();
+	policy_checks++;
+	UT_ASSERT_EQ(sample->allocation_fence.incarnation, 81);
+	if (revoke_on_policy_check)
+		changed_admission = true;
+	return policy_sample_current;
+}
+
 #include "test_cluster_vacuum_proof_cleanup.inc"
 
 static void
@@ -575,6 +589,9 @@ reset_fixture(void)
 	cohort_status = CLUSTER_HEAP_FREEZE_COHORT_READY;
 	cohort_calls = bindings_at_cohort = 0;
 	error_cohort = revoke_cohort = false;
+	policy_sample_current = true;
+	revoke_on_policy_check = false;
+	policy_checks = 0;
 	enters = leaves = debt = resolves = routes = fail_resolve = 0;
 	reject_admission = reject_route_after = unknown_outcome = false;
 	error_preflight = error_validate = guard_held = false;
@@ -1442,6 +1459,9 @@ set_shared_policy(TransactionId xid)
 {
 	vacrel.cutoffs.SharedFreezeLimitFull = FullTransactionIdFromEpochAndXid(1, xid);
 	vacrel.cutoffs.FreezeLimit = xid;
+	vacrel.cutoffs.SharedFreezePolicySample.legal_next = FullTransactionIdFromEpochAndXid(1, 1000);
+	vacrel.cutoffs.SharedFreezePolicySample.freeze_limit = vacrel.cutoffs.SharedFreezeLimitFull;
+	vacrel.cutoffs.SharedFreezePolicySample.allocation_fence.incarnation = 81;
 }
 
 static void
@@ -1539,6 +1559,43 @@ UT_TEST(mismatched_or_malformed_cohort_never_publishes_candidate)
 		UT_ASSERT(vacrel.shared_freeze_fence_valid);
 		UT_ASSERT_EQ(debt, 0);
 	}
+}
+
+UT_TEST(revoked_or_mismatched_original_policy_cannot_publish_cohort)
+{
+	for (unsigned variant = 0; variant < 3; variant++)
+	{
+		reset_fixture();
+		set_shared_policy(80);
+		seed_stale_cohort();
+		if (variant == 0) policy_sample_current = false;
+		if (variant == 1)
+			vacrel.cutoffs.SharedFreezePolicySample.freeze_limit = InvalidFullTransactionId;
+		if (variant == 2)
+			vacrel.cutoffs.SharedFreezePolicySample.freeze_limit = FullTransactionIdFromEpochAndXid(2, 80);
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		check_no_cohort();
+		UT_ASSERT_EQ(cohort_calls, variant == 0 ? 1 : 0);
+		UT_ASSERT_EQ(policy_checks, variant == 0 ? 1 : 0);
+		UT_ASSERT_EQ(target_bindings, 1);
+		UT_ASSERT(vacrel.shared_freeze_fence_valid);
+		UT_ASSERT_EQ(debt, 0);
+		UT_ASSERT_EQ(leaves, 1);
+	}
+}
+
+UT_TEST(original_admission_recheck_follows_policy_fence_recheck)
+{
+	reset_fixture();
+	set_shared_policy(80);
+	seed_stale_cohort();
+	revoke_on_policy_check = true;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	check_no_cohort();
+	UT_ASSERT_EQ(policy_checks, 1);
+	UT_ASSERT_EQ(target_bindings, 0);
+	UT_ASSERT_EQ(debt, 0);
+	UT_ASSERT_EQ(leaves, 1);
 }
 
 UT_TEST(unavailable_or_mismatched_full_policy_skips_cohort_sample)
@@ -1661,7 +1718,7 @@ UT_TEST(next_collection_cannot_reuse_previous_cohort_on_sample_refusal)
 int
 main(void)
 {
-	UT_PLAN(59);
+	UT_PLAN(61);
 	UT_RUN(invalid_input_does_not_leave);
 	UT_RUN(rejected_admission_does_not_leave);
 	UT_RUN(normal_success_leaves_once);
@@ -1714,6 +1771,8 @@ main(void)
 	UT_RUN(cohort_candidate_cannot_raise_original_full_policy_bound);
 	UT_RUN(cohort_refusals_clear_observation_without_rejecting_original_proof);
 	UT_RUN(mismatched_or_malformed_cohort_never_publishes_candidate);
+	UT_RUN(revoked_or_mismatched_original_policy_cannot_publish_cohort);
+	UT_RUN(original_admission_recheck_follows_policy_fence_recheck);
 	UT_RUN(unavailable_or_mismatched_full_policy_skips_cohort_sample);
 	UT_RUN(rejected_changed_or_cleaned_collection_retires_old_cohort);
 	UT_RUN(admission_change_during_cohort_sample_requests_retry_before_binding);

@@ -4,6 +4,7 @@
 #define CLUSTER_HEAP_HORIZON_H
 
 #include "access/transam.h"
+#include "cluster/cluster_xid_stripe_boot.h"
 
 /* Before heap mutation, cap a local proposal at the immutable activation
  * floor: another slot can still issue an XID below this node's proposal.
@@ -26,6 +27,21 @@ extern bool cluster_heap_freeze_policy_v1(TransactionId ceiling, TransactionId f
  * on refusal. This is a conservative policy observation, not F/H admission. */
 extern bool cluster_heap_freeze_policy_full_v1(TransactionId ceiling, TransactionId frozen,
 	int min_age, int table_age, FullTransactionId *freeze_limit, bool *aggressive);
+
+/* Same original legal-next cut and allocation fence; still not F/H authority. */
+typedef struct ClusterHeapFreezePolicySampleV1 {
+	FullTransactionId legal_next;
+	FullTransactionId freeze_limit;
+	ClusterXidStripeSampleFence allocation_fence;
+	bool aggressive;
+} ClusterHeapFreezePolicySampleV1;
+
+/* Failure preserves out. Keep the returned witness unchanged. The current
+ * check never samples nextXid again; call without page/census locks. */
+extern bool cluster_heap_freeze_policy_sample_v1(TransactionId ceiling, TransactionId frozen,
+	int min_age, int table_age, ClusterHeapFreezePolicySampleV1 *out);
+extern bool cluster_heap_freeze_policy_sample_current_v1(
+	const ClusterHeapFreezePolicySampleV1 *sample);
 
 /*
  * Frozen 2.14 M1 waterline report.  The wire image is deliberately encoded

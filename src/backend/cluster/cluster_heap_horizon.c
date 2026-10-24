@@ -251,16 +251,17 @@ cluster_heap_freeze_cutoff_v1(TransactionId proposed, TransactionId *out)
  * neither observation is a terminal or freeze certificate.
  */
 bool
-cluster_heap_freeze_policy_full_v1(TransactionId ceiling, TransactionId frozen,
-	int min_age, int table_age, FullTransactionId *freeze_limit, bool *aggressive)
+cluster_heap_freeze_policy_sample_v1(TransactionId ceiling, TransactionId frozen,
+	int min_age, int table_age, ClusterHeapFreezePolicySampleV1 *out)
 {
-	ClusterXidStripeSampleFence fence;
+	ClusterXidStripeSampleFence fence = {0};
+	ClusterHeapFreezePolicySampleV1 sample;
 	ClusterHeapFreezeWatermark watermark;
 	FullTransactionId legal_next, frozen_full, ceiling_full;
 	uint64 next, oldest, bound, candidate;
 	bool sampled, have_watermark;
 
-	if (freeze_limit == NULL || aggressive == NULL || min_age < 0 || table_age < 0
+	if (out == NULL || min_age < 0 || table_age < 0
 		|| !TransactionIdIsNormal(ceiling) || !TransactionIdIsNormal(frozen)
 		|| !cluster_shared_config || !cluster_enabled || !cluster_xid_striping
 		|| ShmemVariableCache == NULL)
@@ -306,8 +307,26 @@ cluster_heap_freeze_policy_full_v1(TransactionId ceiling, TransactionId frozen,
 	if (candidate < FirstNormalTransactionId || !TransactionIdIsNormal((TransactionId)candidate)
 		|| candidate > next || next - candidate >= UINT64CONST(0x80000000))
 		return false;
-	*freeze_limit = FullTransactionIdFromU64(candidate);
-	*aggressive = next - oldest >= (uint64)table_age;
+	memset(&sample, 0, sizeof(sample));
+	sample.legal_next = legal_next;
+	sample.freeze_limit = FullTransactionIdFromU64(candidate);
+	sample.allocation_fence = fence;
+	sample.aggressive = next - oldest >= (uint64)table_age;
+	*out = sample;
+	return true;
+}
+
+bool
+cluster_heap_freeze_policy_full_v1(TransactionId ceiling, TransactionId frozen,
+	int min_age, int table_age, FullTransactionId *freeze_limit, bool *aggressive)
+{
+	ClusterHeapFreezePolicySampleV1 sample;
+
+	if (freeze_limit == NULL || aggressive == NULL
+		|| !cluster_heap_freeze_policy_sample_v1(ceiling, frozen, min_age, table_age, &sample))
+		return false;
+	*freeze_limit = sample.freeze_limit;
+	*aggressive = sample.aggressive;
 	return true;
 }
 
@@ -326,4 +345,21 @@ cluster_heap_freeze_policy_v1(TransactionId ceiling, TransactionId frozen, int m
 	*freeze_limit = XidFromFullTransactionId(full);
 	*aggressive = scan;
 	return true;
+}
+
+bool
+cluster_heap_freeze_policy_sample_current_v1(const ClusterHeapFreezePolicySampleV1 *sample)
+{
+	if (sample == NULL || !cluster_shared_config || !cluster_enabled || !cluster_xid_striping
+		|| !FullTransactionIdIsValid(sample->legal_next)
+		|| !FullTransactionIdIsValid(sample->freeze_limit)
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(sample->legal_next))
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(sample->freeze_limit))
+		|| U64FromFullTransactionId(sample->legal_next) == UINT64_MAX
+		|| U64FromFullTransactionId(sample->freeze_limit) == UINT64_MAX
+		|| FullTransactionIdFollows(sample->freeze_limit, sample->legal_next)
+		|| U64FromFullTransactionId(sample->legal_next) - U64FromFullTransactionId(sample->freeze_limit)
+		   >= UINT64CONST(0x80000000))
+		return false;
+	return cluster_xid_stripe_sample_fence_current(&sample->allocation_fence);
 }

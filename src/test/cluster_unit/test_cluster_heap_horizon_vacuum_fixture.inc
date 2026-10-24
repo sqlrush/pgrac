@@ -22,6 +22,7 @@ LWLockPadded *MainLWLockArray = age_locks;
 static bool age_xid_lock, age_promise_ready, age_promise_current, age_revoke_on_release;
 static unsigned age_sample_reads, age_fence_reads, age_lock_acquires, age_lock_releases;
 static FullTransactionId age_future;
+static ClusterXidStripeSampleFence age_sample_fence;
 static TransactionId age_oldest_xmin;
 static ClusterHeapFreezeWatermark age_watermark;
 static bool age_watermark_ready, age_revoke_on_watermark;
@@ -58,7 +59,7 @@ cluster_xid_stripe_sample_future(FullTransactionId reference, FullTransactionId 
 	if (!age_promise_ready)
 		return false;
 	*future = age_future;
-	fence->incarnation = 81;
+	*fence = age_sample_fence;
 	return true;
 }
 
@@ -172,6 +173,8 @@ setup_age(void)
 	stub_next_full = FullTransactionIdFromU64(200);
 	age_cache.nextXid = stub_next_full;
 	age_future = FullTransactionIdFromU64(1000);
+	memset(&age_sample_fence, 0, sizeof(age_sample_fence));
+	age_sample_fence.incarnation = 81;
 	age_oldest_xmin = 80;
 	age_xid_lock = age_revoke_on_release = false;
 	age_promise_ready = age_promise_current = true;

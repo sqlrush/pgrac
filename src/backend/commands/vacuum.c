@@ -1118,6 +1118,7 @@ vacuum_get_cutoffs(Relation rel, const VacuumParams *params,
 #ifdef USE_PGRAC_CLUSTER
 	/* Never reuse a preceding relation's observed FullXid policy cut. */
 	cutoffs->SharedFreezeLimitFull = InvalidFullTransactionId;
+	memset(&cutoffs->SharedFreezePolicySample, 0, sizeof(cutoffs->SharedFreezePolicySample));
 #endif
 
 	/* Use mutable copies of freeze age parameters */
@@ -1273,16 +1274,15 @@ vacuum_get_cutoffs(Relation rel, const VacuumParams *params,
 	Assert(freeze_table_age >= 0);
 #ifdef USE_PGRAC_CLUSTER
 	if (cluster_shared_config && rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT) {
-		bool aggressive;
-		FullTransactionId full_limit;
+		ClusterHeapFreezePolicySampleV1 sample;
 
 		/*
 		 * Use one legal-next sample for both age policies, still capped
 		 * by the original activation-clamped OldestXmin. Missing evidence
 		 * requests a full scan without advancing the freeze boundary.
 		 */
-		if (!cluster_heap_freeze_policy_full_v1(cutoffs->OldestXmin, cutoffs->relfrozenxid,
-											freeze_min_age, freeze_table_age, &full_limit, &aggressive)) {
+		if (!cluster_heap_freeze_policy_sample_v1(cutoffs->OldestXmin, cutoffs->relfrozenxid,
+											freeze_min_age, freeze_table_age, &sample)) {
 			cutoffs->FreezeLimit = cutoffs->relfrozenxid;
 			if (TransactionIdPrecedes(cutoffs->OldestXmin, cutoffs->FreezeLimit))
 				cutoffs->FreezeLimit = cutoffs->OldestXmin;
@@ -1290,9 +1290,10 @@ vacuum_get_cutoffs(Relation rel, const VacuumParams *params,
 		}
 		/* Preserve the same sample for later shared preparation; this does
 		 * not qualify the global candidate as F/H or authorize mutation. */
-		cutoffs->SharedFreezeLimitFull = full_limit;
-		cutoffs->FreezeLimit = XidFromFullTransactionId(full_limit);
-		if (aggressive)
+		cutoffs->SharedFreezePolicySample = sample;
+		cutoffs->SharedFreezeLimitFull = sample.freeze_limit;
+		cutoffs->FreezeLimit = XidFromFullTransactionId(sample.freeze_limit);
+		if (sample.aggressive)
 			return true;
 	} else
 #endif

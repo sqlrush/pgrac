@@ -21,6 +21,9 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_type.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_heap_horizon.h"
+#endif
 #include "parser/parse_node.h"
 #include "storage/buf.h"
 #include "storage/lock.h"
@@ -283,6 +286,8 @@ struct VacuumCutoffs
 	/* Same-sample shared policy cutoff, or Invalid when unavailable/native.
 	 * Retains epoch only; this is not positive F/H or row-freeze authority. */
 	FullTransactionId SharedFreezeLimitFull;
+	/* Original allocation witness, cleared with the same policy cutoff. */
+	ClusterHeapFreezePolicySampleV1 SharedFreezePolicySample;
 #endif
 };
 
