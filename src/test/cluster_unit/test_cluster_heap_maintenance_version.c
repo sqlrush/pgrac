@@ -83,6 +83,10 @@ static bool begun, expecting_error, tx_committed;
 static bool redoing, redo_locked;
 static jmp_buf error_jump;
 static bool local_x, writer_current, route_current, authority_current, admission_current;
+static bool local_share, resume_allowed, resume_error, resumed_writer;
+static unsigned conditional_resumes, conditional_unlocks;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
 static int32 backend_pin_count;
 static unsigned pin_checks;
 static bool flush_error;
@@ -126,6 +130,50 @@ LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
 	UT_ASSERT_EQ(mode, LW_EXCLUSIVE);
 	return local_x;
 }
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	UT_ASSERT(lock == BufferDescriptorGetContentLock(GetBufferDescriptor(0)));
+	return local_x || local_share;
+}
+
+/* The original conditional resumer is tested with its real ledger body in
+ * the writer fixture. This leaf supplies only that acquisition boundary. */
+bool
+ClusterConditionalLockBufferWithMutationContext(Buffer buffer,
+	const ResourceXWriterUseContext *expected, uint64 revision, bool checked)
+{
+	UT_ASSERT_EQ(buffer, 1);
+	UT_ASSERT(backend_pin_count == 1 && !local_x && !local_share);
+	UT_ASSERT(expected != NULL && revision == 7 && checked);
+	UT_ASSERT_EQ(inserts + dirties + flushes, 0);
+	conditional_resumes++;
+	if (resume_error)
+		ereport(ERROR, (errmsg("conditional resume ERROR fixture")));
+	if (!resume_allowed)
+		return false;
+	local_x = resumed_writer = true;
+	return true;
+}
+
+void ClusterUnlockBufferAfterConditionalMutation(Buffer buffer);
+void
+ClusterUnlockBufferAfterConditionalMutation(Buffer buffer)
+{
+	UT_ASSERT_EQ(buffer, 1);
+	UT_ASSERT(local_x && resumed_writer && backend_pin_count == 1);
+	conditional_unlocks++;
+	local_x = resumed_writer = false;
+}
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	longjmp(error_jump, 1);
+}
+
 static ResourceXWriterUseContext original_writer_context;
 bool
 ClusterBufferCaptureMutationContext(Buffer buffer, ResourceXWriterUseContext *out,
@@ -265,7 +313,7 @@ errfinish(const char *file, int line, const char *function)
 		printf("# unexpected error %s:%d %s\n", file, line, function);
 		abort();
 	}
-	longjmp(error_jump, 1);
+	pg_re_throw();
 }
 bool
 RecoveryInProgress(void)
@@ -569,6 +617,8 @@ reset(uint8 opcode, bool shared)
 	target_recheck_error = revoke_target_census = false;
 	full_target_checks = 0;
 	local_x = writer_current = route_current = authority_current = admission_current = true;
+	local_share = resume_allowed = resume_error = resumed_writer = false;
+	conditional_resumes = conditional_unlocks = 0;
 	backend_pin_count = 1;
 	pin_checks = 0;
 	writer_state = PCM_STATE_X;
@@ -1958,10 +2008,122 @@ UT_TEST(test_xmin_single_batch_keep_original_writer_object_fence)
 		}
 }
 
+UT_TEST(test_xmin_released_writer_single_and_batch_reach_native_wal)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f;
+		ClusterHeapFreezeXminTargetV1 targets[3];
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		local_x = false; resume_allowed = true;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3)
+			: qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
+UT_TEST(test_xmin_released_writer_refusal_never_fetches_or_writes)
+{
+	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	local_x = false;
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(conditional_resumes, 1);
+	UT_ASSERT_EQ(conditional_unlocks + full_target_checks + inserts + dirties + flushes, 0);
+	UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_xmin_resumed_writer_plan_refusal_unlocks_without_unpin)
+{
+	QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+	qualified_xmin_batch_setup(&f, targets);
+	local_x = false; resume_allowed = true;
+	targets[2].original_creator_full_xid = InvalidFullTransactionId;
+	UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
+	UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
+	UT_ASSERT_EQ(inserts + dirties + flushes, 0); UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_xmin_resumed_writer_target_error_runs_finally)
+{
+	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	local_x = false; resume_allowed = target_recheck_error = expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		(void) qualified_xmin_apply(&f, 0); UT_ASSERT(false);
+	} else {
+		UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
+		UT_ASSERT_EQ(inserts + dirties + flushes, 0); UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+	}
+	expecting_error = false;
+}
+
+UT_TEST(test_xmin_resumed_writer_flush_error_runs_finally_after_wal)
+{
+	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	local_x = false; resume_allowed = flush_error = expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		(void) qualified_xmin_apply(&f, 0); UT_ASSERT(false);
+	} else {
+		UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+	}
+	expecting_error = false;
+}
+
+UT_TEST(test_xmin_resume_error_keeps_original_pin_and_admission)
+{
+	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	local_x = false; resume_error = expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		(void) qualified_xmin_apply(&f, 0); UT_ASSERT(false);
+	} else {
+		UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 0);
+		UT_ASSERT_EQ(inserts + dirties + flushes, 0); UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+	}
+	expecting_error = false;
+}
+
+UT_TEST(test_xmin_existing_local_x_never_reacquires_or_releases_it)
+{
+	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	resume_allowed = true;
+	UT_ASSERT(qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks, 0);
+	UT_ASSERT(local_x && f.admission.entered); UT_ASSERT_EQ(backend_pin_count, 1);
+}
+
+UT_TEST(test_xmin_existing_share_lock_is_not_a_resume_scope)
+{
+	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	local_x = false; local_share = resume_allowed = true;
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + inserts + dirties + flushes, 0);
+	UT_ASSERT(!local_x && local_share && f.admission.entered);
+	UT_ASSERT_EQ(backend_pin_count, 1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(49);
+	UT_PLAN(57);
+	UT_RUN(test_xmin_released_writer_single_and_batch_reach_native_wal);
+	UT_RUN(test_xmin_released_writer_refusal_never_fetches_or_writes);
+	UT_RUN(test_xmin_resumed_writer_plan_refusal_unlocks_without_unpin);
+	UT_RUN(test_xmin_resumed_writer_target_error_runs_finally);
+	UT_RUN(test_xmin_resumed_writer_flush_error_runs_finally_after_wal);
+	UT_RUN(test_xmin_resume_error_keeps_original_pin_and_admission);
+	UT_RUN(test_xmin_existing_local_x_never_reacquires_or_releases_it);
+	UT_RUN(test_xmin_existing_share_lock_is_not_a_resume_scope);
 	UT_RUN(test_xmin_single_batch_keep_original_writer_object_fence);
 	UT_RUN(test_page_recapture_drops_original_writer_context);
 	UT_RUN(test_xmin_batch_rejects_replacement_original_writer_before_wal);

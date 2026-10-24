@@ -15695,11 +15695,11 @@ ClusterConditionalLockBufferWithMutationContext(Buffer buffer,
 #endif
 }
 
-/* This scope owns only the restored local use, content-X and original pin.
- * The retained node-level T3 remains with its normal owner/revoker lifecycle;
- * generic cache-off PCM release must not intervene in ERROR/cancel cleanup. */
+/* Restore only the local writer-use/content-X bracket to its caller. The
+ * original pin and node-level T3 remain under their existing owners. No
+ * generic cache-off PCM release may intervene in ERROR/cancel cleanup. */
 void
-ClusterUnlockReleaseBufferAfterConditionalMutation(Buffer buffer)
+ClusterUnlockBufferAfterConditionalMutation(Buffer buffer)
 {
 #ifdef USE_PGRAC_CLUSTER
 	BufferDesc *buf = GetBufferDescriptor(buffer - 1);
@@ -15709,6 +15709,18 @@ ClusterUnlockReleaseBufferAfterConditionalMutation(Buffer buffer)
 	Assert(LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE));
 	cluster_bufmgr_pcm_x_writer_clear(entry);
 	LWLockRelease(BufferDescriptorGetContentLock(buf));
+#else
+	Assert(false);
+#endif
+}
+
+/* The VACUUM recheck additionally owns one original pin. Its outer census
+ * owner still leaves admission after this local cleanup. */
+void
+ClusterUnlockReleaseBufferAfterConditionalMutation(Buffer buffer)
+{
+#ifdef USE_PGRAC_CLUSTER
+	ClusterUnlockBufferAfterConditionalMutation(buffer);
 	ReleaseBuffer(buffer);
 #else
 	Assert(false);

@@ -20686,8 +20686,8 @@ heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 }
 
 #ifdef USE_PGRAC_CLUSTER
-bool
-cluster_heap_freeze_apply_xmin_batch_v1(
+static bool
+cluster_heap_freeze_apply_xmin_batch_locked_v1(
 	Relation rel, Buffer buffer,
 	const ClusterHeapFreezePageInputV1 *input,
 	const ClusterHeapFreezePageBatchV1 *page,
@@ -20824,6 +20824,58 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 		&fence->identity);
 	XLogFlush(PageGetLSN(live_page));
 	return true;
+}
+
+bool
+cluster_heap_freeze_apply_xmin_batch_v1(
+	Relation rel, Buffer buffer,
+	const ClusterHeapFreezePageInputV1 *input,
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *fence,
+	const PcmAuthoritySnapshot *authority_before,
+	const ClusterSemanticAdmissionToken *admission,
+	const ClusterHeapFreezeXminTargetV1 *targets, uint16 target_count,
+	FullTransactionId freeze_limit_full, SCN horizon_scn)
+{
+	BufferDesc *buf;
+	volatile bool resumed = false;
+	volatile bool applied = false;
+
+	/* The original pin is borrowed on every path, including ERROR. Neither
+	 * this continuation nor its cleanup may repin, fetch current or proof,
+	 * or replace an already-owned local lock. */
+	if (buffer <= 0 || buffer > NBuffers || BufferDescriptors == NULL
+		|| !ClusterBufferHasSharedPin(buffer))
+		return false;
+	buf = GetBufferDescriptor(buffer - 1);
+	if (LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
+		return cluster_heap_freeze_apply_xmin_batch_locked_v1(rel, buffer,
+			input, page, proofs, fence, authority_before, admission,
+			targets, target_count, freeze_limit_full, horizon_scn);
+	if (input == NULL || !input->writer_context_valid)
+		return false;
+
+	PG_TRY();
+	{
+		resumed = ClusterConditionalLockBufferWithMutationContext(buffer,
+			&input->writer_context, input->writer_object_revision,
+			input->writer_object_checked);
+		if (resumed)
+			applied = cluster_heap_freeze_apply_xmin_batch_locked_v1(rel, buffer,
+				input, page, proofs, fence, authority_before, admission,
+				targets, target_count, freeze_limit_full, horizon_scn);
+	}
+	PG_FINALLY();
+	{
+		/* A resumer ERROR unwinds its partial ledger/local lock internally.
+		 * Only a returned successful scope is ours to release here. Keep
+		 * the caller's original pin/admission after refusal, WAL or ERROR. */
+		if (resumed)
+			ClusterUnlockBufferAfterConditionalMutation(buffer);
+	}
+	PG_END_TRY();
+	return applied;
 }
 
 bool

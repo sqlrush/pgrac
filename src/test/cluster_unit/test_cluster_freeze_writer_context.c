@@ -289,6 +289,20 @@ resume_setup(void)
 	exclusive = false; terminal_reads = descriptor_reads = 0;
 	return context;
 }
+UT_TEST(unlock_only_preserves_original_pin_and_original_node_grant)
+{
+	ResourceXWriterUseContext context = resume_setup();
+	ResourceXWriterUseContext original = fixture_node_context;
+	UT_ASSERT(ClusterConditionalLockBufferWithMutationContext(1, &context,
+		original_object_revision, original_object_checked));
+	ClusterUnlockBufferAfterConditionalMutation(1);
+	UT_ASSERT(pinned && !exclusive && !fixture_ledger_live());
+	UT_ASSERT(memcmp(&original, &fixture_node_context, sizeof(original)) == 0);
+	/* The caller can still retire its one original pin after local cleanup. */
+	ReleaseBuffer(1);
+	UT_ASSERT(!pinned);
+}
+
 UT_TEST(resume_original_and_cleanup_only_its_local_scope)
 {
 	ResourceXWriterUseContext context = resume_setup();
@@ -373,7 +387,8 @@ UT_TEST(resume_does_not_replace_original_object_fence_with_new_sample)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
+	UT_RUN(unlock_only_preserves_original_pin_and_original_node_grant);
 	UT_RUN(resume_does_not_replace_original_object_fence_with_new_sample);
 	UT_RUN(resume_original_and_cleanup_only_its_local_scope);
 	UT_RUN(resume_refuses_without_original_pin_or_quiescent_scope);

@@ -1971,8 +1971,9 @@ test_cluster_heap_borrowed_pin.inc: $(top_srcdir)/src/backend/storage/buffer/buf
 	mv $@.tmp $@
 
 test_cluster_heap_freeze_xmin_apply.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
-	awk '/^cluster_heap_freeze_apply_xmin(_batch)?_v1\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
+	awk '/^cluster_heap_freeze_apply_xmin_batch_locked_v1\(/ { print "static bool"; emit=1; found++ } \
+	     /^cluster_heap_freeze_apply_xmin(_batch)?_v1\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_freeze_redo.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
@@ -9633,8 +9634,8 @@ test_cluster_vacuum_proof_guard.inc: $(top_srcdir)/src/backend/cluster/cluster_r
 # Keep the parent reproducible: its two native wrappers precede the new pair.
 # The production caller links the new pair when present, so it cannot be stubbed.
 test_cluster_vacuum_proof_release.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
-	awk '/^(ReleaseBuffer|UnlockReleaseBuffer|ClusterUnlockReleaseBufferAfterConditionalRead|ClusterUnlockReleaseBufferAfterConditionalHint|ClusterUnlockReleaseBufferAfterConditionalMutation)\(/ { print "void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found < 2 || found > 5) exit 1 }' $< > $@.tmp
+	awk '/^(ReleaseBuffer|UnlockReleaseBuffer|ClusterUnlockReleaseBufferAfterConditionalRead|ClusterUnlockReleaseBufferAfterConditionalHint|ClusterUnlockBufferAfterConditionalMutation|ClusterUnlockReleaseBufferAfterConditionalMutation)\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found < 2 || found > 6) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Actual generic-unlock cache-off decision; only the remote/mirror leaves vary.
@@ -9956,10 +9957,10 @@ test_cluster_freeze_writer_context.inc: $(top_srcdir)/src/backend/storage/buffer
 	     /^cluster_bufmgr_pcm_x_writer_entry_exact\(/ { print "static bool"; emit=1; exact++ } \
 	     /^ClusterBuffer(CaptureMutationContext|MutationContextMatches)\(/ { print "bool"; emit=1; capture++ } \
 	     /^ClusterConditionalLockBufferWithMutationContext\(/ { print "bool"; emit=1; resume++ } \
-	     /^ClusterUnlockReleaseBufferAfterConditionalMutation\(/ { print "void"; emit=1; cleanup++ } \
+	     /^ClusterUnlock(Release)?BufferAfterConditionalMutation\(/ { print "void"; emit=1; cleanup++ } \
 	     /^cluster_bufmgr_pcm_x_writer_(clear|object_sample)\(/ { print "static void"; emit=1; cleanup++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (types != 2 || array != 1 || find != 2 || exact != 1 || capture != 2 || resume != 1 || cleanup != 3) exit 1 }' $< > $@.tmp
+	     END { if (types != 2 || array != 1 || find != 2 || exact != 1 || capture != 2 || resume != 1 || cleanup != 4) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_freeze_writer_context: test_cluster_freeze_writer_context.c unit_test.h \

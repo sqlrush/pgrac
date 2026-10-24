@@ -387,6 +387,8 @@ extern bool ClusterConditionalLockBufferWithMutationContext(
 	Buffer buffer, const struct ResourceXWriterUseContext *expected,
 	uint64 object_revision, bool object_checked);
 /* Pair only a successful conditional writer resume; local unlock/unpin only. */
+/* Successful conditional mutation scope only; preserve the original pin. */
+extern void ClusterUnlockBufferAfterConditionalMutation(Buffer buffer);
 extern void ClusterUnlockReleaseBufferAfterConditionalMutation(Buffer buffer);
 /* Read-only successful ConditionalLockBuffer() only; no PCM writer cleanup. */
 extern void ClusterUnlockReleaseBufferAfterConditionalRead(Buffer buffer);
