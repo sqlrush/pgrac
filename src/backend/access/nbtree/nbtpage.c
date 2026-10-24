@@ -444,7 +444,7 @@ _bt_set_cleanup_info(Relation rel, BlockNumber num_delpages)
 Buffer
 _bt_getroot(Relation rel, Relation heaprel, int access
 #ifdef USE_PGRAC_CLUSTER
-							, const ClusterSpaceIdentity *identity
+							, const ClusterSpaceIdentity *identity, BTInsertAlloc *allocation
 #endif
 	)
 {
@@ -523,6 +523,15 @@ _bt_getroot(Relation rel, Relation heaprel, int access
 			return InvalidBuffer;
 		}
 
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: first-root allocation restarts before the metapage upgrade. */
+		if (_bt_insert_alloc_needed(allocation))
+		{
+			_bt_relbuf(rel, metabuf);
+			return InvalidBuffer;
+		}
+#endif
+
 		/* trade in our read lock for a write lock */
 		_bt_unlockbuf(rel, metabuf);
 		_bt_lockbuf(rel, metabuf, BT_WRITE);
@@ -543,7 +552,7 @@ _bt_getroot(Relation rel, Relation heaprel, int access
 			_bt_relbuf(rel, metabuf);
 			return _bt_getroot(rel, heaprel, access
 #ifdef USE_PGRAC_CLUSTER
-							, identity
+							, identity, allocation
 #endif
 			);
 		}
@@ -553,7 +562,11 @@ _bt_getroot(Relation rel, Relation heaprel, int access
 		 * the new root page.  Since this is the first page in the tree, it's
 		 * a leaf as well as the root.
 		 */
-		rootbuf = _bt_allocbuf(rel, heaprel);
+		rootbuf = _bt_allocbuf(rel, heaprel
+#ifdef USE_PGRAC_CLUSTER
+						 , identity, allocation
+#endif
+		);
 		rootblkno = BufferGetBlockNumber(rootbuf);
 		rootpage = BufferGetPage(rootbuf);
 		/* Get raw page pointer for metapage */
@@ -1002,7 +1015,11 @@ _bt_getbuf(Relation rel, BlockNumber blkno, int access)
  * from the FSM safe for queries that may be running on standbys.
  */
 Buffer
-_bt_allocbuf(Relation rel, Relation heaprel)
+_bt_allocbuf(Relation rel, Relation heaprel
+#ifdef USE_PGRAC_CLUSTER
+				 , const ClusterSpaceIdentity *identity, BTInsertAlloc *allocation
+#endif
+	)
 {
 	Buffer		buf;
 	BlockNumber blkno;
@@ -1122,6 +1139,18 @@ _bt_allocbuf(Relation rel, Relation heaprel)
 	 * otherwise would make, as we can't use _bt_lockbuf() without introducing
 	 * a race.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	if (allocation != NULL)
+	{
+		if (!allocation->hw.held || allocation->ko_serial == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+					 errmsg("index allocation requires its enclosing extension owner")));
+		buf = ExtendBufferedRelWithHW(BMR_REL(rel), MAIN_FORKNUM, NULL, EB_LOCK_FIRST,
+									 &allocation->hw, identity, allocation->ko_serial);
+	}
+	else
+#endif
 	buf = ExtendBufferedRel(BMR_REL(rel), MAIN_FORKNUM, NULL, EB_LOCK_FIRST);
 	if (!RelationUsesLocalBuffers(rel))
 		VALGRIND_MAKE_MEM_DEFINED(BufferGetPage(buf), BLCKSZ);
@@ -2156,7 +2185,7 @@ _bt_pagedel(Relation rel, Buffer leafbuf, BTVacState *vstate)
 				stack = _bt_search(rel, NULL, itup_key, &sleafbuf, BT_READ,
 								   NULL
 #ifdef USE_PGRAC_CLUSTER
-							, NULL
+							, NULL, NULL
 #endif
 			);
 				/* won't need a second lock or pin on leafbuf */
@@ -3099,7 +3128,7 @@ _bt_lock_subtree_parent(Relation rel, Relation heaprel, BlockNumber child,
 	 */
 	pbuf = _bt_getstackbuf(rel, heaprel, stack, child
 #ifdef USE_PGRAC_CLUSTER
-							, identity
+							, identity, NULL
 #endif
 			);
 	if (pbuf == InvalidBuffer)

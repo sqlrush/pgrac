@@ -12,6 +12,7 @@
  * PGRAC MODIFICATIONS
  *	  Modified by: SqlRush <sqlrush@gmail.com>
  *	  - BTOptions: add cluster_reverse_key + BTGetClusterReverseKey().
+ *    - Carry explicit insertion allocation ownership and restart results.
  *	    Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (wave f)
  *
  *-------------------------------------------------------------------------
@@ -33,6 +34,7 @@
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: original mutation owners carry a pre-lock SPACE identity value. */
 #include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_hw.h"
 #endif
 
 /* There's room for a 16-bit vacuum cycle ID in BTPageOpaqueData */
@@ -813,6 +815,16 @@ typedef struct BTScanInsertData
 
 typedef BTScanInsertData *BTScanInsert;
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: one explicit insertion owner, shared by all allocation steps. */
+typedef struct BTInsertAlloc
+{
+	HwLock		hw;
+	uint64		ko_serial;
+	bool		required;
+} BTInsertAlloc;
+#endif
+
 /*
  * BTInsertStateData is a working area used during insertion.
  *
@@ -850,6 +862,7 @@ typedef struct BTInsertStateData
 	int			postingoff;
 #ifdef USE_PGRAC_CLUSTER
 	ClusterSpaceIdentity version_identity;
+	BTInsertAlloc *allocation;
 #endif
 } BTInsertStateData;
 
@@ -1227,19 +1240,22 @@ extern IndexTuple _bt_swap_posting(IndexTuple newitem, IndexTuple oposting,
 /*
  * prototypes for functions in nbtinsert.c
  */
+#ifdef USE_PGRAC_CLUSTER
+extern bool _bt_insert_alloc_needed(BTInsertAlloc *allocation);
+#endif
 extern bool _bt_doinsert(Relation rel, IndexTuple itup,
 						 IndexUniqueCheck checkUnique, bool indexUnchanged,
 						 Relation heapRel);
-extern void _bt_finish_split(Relation rel, Relation heaprel, Buffer lbuf,
+extern bool _bt_finish_split(Relation rel, Relation heaprel, Buffer lbuf,
 							 BTStack stack
 #ifdef USE_PGRAC_CLUSTER
-							, const ClusterSpaceIdentity *identity
+							, const ClusterSpaceIdentity *identity, BTInsertAlloc *allocation
 #endif
 	);
 extern Buffer _bt_getstackbuf(Relation rel, Relation heaprel, BTStack stack,
 							  BlockNumber child
 #ifdef USE_PGRAC_CLUSTER
-							, const ClusterSpaceIdentity *identity
+							, const ClusterSpaceIdentity *identity, BTInsertAlloc *allocation
 #endif
 	);
 
@@ -1260,7 +1276,7 @@ extern void _bt_set_cleanup_info(Relation rel, BlockNumber num_delpages);
 extern void _bt_upgrademetapage(Page page);
 extern Buffer _bt_getroot(Relation rel, Relation heaprel, int access
 #ifdef USE_PGRAC_CLUSTER
-							, const ClusterSpaceIdentity *identity
+							, const ClusterSpaceIdentity *identity, BTInsertAlloc *allocation
 #endif
 	);
 extern Buffer _bt_gettrueroot(Relation rel);
@@ -1269,7 +1285,11 @@ extern void _bt_metaversion(Relation rel, bool *heapkeyspace,
 							bool *allequalimage);
 extern void _bt_checkpage(Relation rel, Buffer buf);
 extern Buffer _bt_getbuf(Relation rel, BlockNumber blkno, int access);
-extern Buffer _bt_allocbuf(Relation rel, Relation heaprel);
+extern Buffer _bt_allocbuf(Relation rel, Relation heaprel
+#ifdef USE_PGRAC_CLUSTER
+				 , const ClusterSpaceIdentity *identity, BTInsertAlloc *allocation
+#endif
+	);
 extern Buffer _bt_relandgetbuf(Relation rel, Buffer obuf,
 							   BlockNumber blkno, int access);
 extern void _bt_relbuf(Relation rel, Buffer buf);
@@ -1313,14 +1333,14 @@ extern void _bt_pendingfsm_finalize(Relation rel, BTVacState *vstate);
 extern BTStack _bt_search(Relation rel, Relation heaprel, BTScanInsert key,
 						  Buffer *bufP, int access, Snapshot snapshot
 #ifdef USE_PGRAC_CLUSTER
-							, const ClusterSpaceIdentity *identity
+							, const ClusterSpaceIdentity *identity, BTInsertAlloc *allocation
 #endif
 	);
 extern Buffer _bt_moveright(Relation rel, Relation heaprel, BTScanInsert key,
 							Buffer buf, bool forupdate, BTStack stack,
 							int access, Snapshot snapshot
 #ifdef USE_PGRAC_CLUSTER
-							, const ClusterSpaceIdentity *identity
+							, const ClusterSpaceIdentity *identity, BTInsertAlloc *allocation
 #endif
 	);
 extern OffsetNumber _bt_binsrch_insert(Relation rel, BTInsertState insertstate);

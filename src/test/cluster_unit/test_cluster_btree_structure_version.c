@@ -62,6 +62,8 @@ static bool locked[6], new_from_fsm, recyclable = true, error_expected, begun;
 volatile sig_atomic_t InterruptPending;
 static unsigned pending_fsm;
 static unsigned minimal_new_relation;
+static const HwLock *expected_hw;
+static unsigned borrowed_extensions;
 static jmp_buf error_jump;
 static const BlockNumber blocks[6] = { 7, 8, 9, 0, 6, 10 };
 
@@ -255,7 +257,8 @@ _bt_relbuf(Relation rel, Buffer buffer)
 Buffer
 _bt_relandgetbuf(Relation rel, Buffer old, BlockNumber block, int access)
 {
-	_bt_relbuf(rel, old);
+	if (BufferIsValid(old))
+		_bt_relbuf(rel, old);
 	return _bt_getbuf(rel, block, access);
 }
 bool
@@ -286,6 +289,16 @@ ExtendBufferedRel(BufferManagerRelation bmr, ForkNumber forknum, BufferAccessStr
 	UT_ASSERT(PageIsNew(pages[1].data));
 	locked[1] = true;
 	return 2;
+}
+Buffer
+ExtendBufferedRelWithHW(BufferManagerRelation bmr, ForkNumber forknum,
+						BufferAccessStrategy strategy, uint32 flags,
+						const HwLock *hw, const ClusterSpaceIdentity *identity, uint64 serial)
+{
+	UT_ASSERT(hw == expected_hw && hw->held && hw->coordinated);
+	UT_ASSERT(identity == &space_identity && serial == 42);
+	borrowed_extensions++;
+	return ExtendBufferedRel(bmr, forknum, strategy, flags);
 }
 void
 MarkBufferDirty(Buffer buffer)
@@ -473,6 +486,7 @@ _bt_pendingfsm_add(BTVacState *vstate, BlockNumber target, FullTransactionId xid
 #define cluster_space_relation_get_identity fixture_get_identity
 #include "test_cluster_btree_structure_helpers.inc"
 #undef cluster_space_relation_get_identity
+#include "test_cluster_btree_hw_needed.inc"
 #include "test_cluster_btree_structure_alloc.inc"
 #include "test_cluster_btree_structure_root.inc"
 #include "test_cluster_btree_structure_delete.inc"
@@ -482,11 +496,13 @@ static Buffer
 run_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf, Buffer cbuf,
 		  OffsetNumber newitemoff, Size newitemsz, IndexTuple newitem, IndexTuple orignewitem,
 		  IndexTuple nposting, uint16 postingoff,
-		  const ClusterSpaceIdentity *identity pg_attribute_unused())
+		  const ClusterSpaceIdentity *identity pg_attribute_unused(),
+		  BTInsertAlloc *allocation pg_attribute_unused())
 #include "test_cluster_btree_structure_split.inc"
 
 	static Buffer run_newlevel(Relation rel, Relation heaprel, Buffer lbuf, Buffer rbuf,
-							   const ClusterSpaceIdentity *identity pg_attribute_unused())
+							   const ClusterSpaceIdentity *identity pg_attribute_unused(),
+		  BTInsertAlloc *allocation pg_attribute_unused())
 #include "test_cluster_btree_structure_newlevel.inc"
 
 #define _bt_split fixture_split
@@ -494,7 +510,8 @@ run_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf, Buf
 		static void run_insert(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf,
 							   Buffer cbuf, BTStack stack, IndexTuple itup, Size itemsz,
 							   OffsetNumber newitemoff, int postingoff, bool split_only_page,
-							   const ClusterSpaceIdentity *identity pg_attribute_unused())
+							   const ClusterSpaceIdentity *identity pg_attribute_unused(),
+		  BTInsertAlloc *allocation pg_attribute_unused())
 #include "test_cluster_btree_structure_insert.inc"
 #undef _bt_split
 #undef _bt_insert_parent
@@ -547,6 +564,8 @@ run_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf, Buf
 	recyclable = cluster_shared_config = true;
 	BufferBlocks = pages[0].data;
 	pending_fsm = 0;
+	expected_hw = NULL;
+	borrowed_extensions = 0;
 }
 static void
 save_before(void)
@@ -588,7 +607,7 @@ UT_TEST(test_shared_allocator_preserves_exact_predecessor)
 			((PageHeader)pages[1].data)->pd_block_scn = 88;
 		}
 		save_before();
-		UT_ASSERT_EQ(_bt_allocbuf(&relation_data, &relation_data), 2);
+		UT_ASSERT_EQ(_bt_allocbuf(&relation_data, &relation_data, &space_identity, NULL), 2);
 		UT_ASSERT(memcmp(before[1].data, pages[1].data, BLCKSZ) == 0);
 		UT_ASSERT(locked[1]);
 		UT_ASSERT_EQ(dirties, 0);
@@ -603,7 +622,7 @@ UT_TEST(test_native_insert_has_one_version)
 	save_before();
 	expected_info = XLOG_BTREE_INSERT_LEAF;
 	run_insert(&relation_data, &relation_data, NULL, 1, InvalidBuffer, NULL, item, 16, 1, 0, false,
-			   &space_identity);
+			   &space_identity, NULL);
 	UT_ASSERT_EQ(PageGetMaxOffsetNumber(pages[0].data), 1);
 	check_version(1, 1);
 	pfree(item);
@@ -625,7 +644,7 @@ UT_TEST(test_native_split_captures_zero_new_page)
 	save_before();
 	expected_info = XLOG_BTREE_SPLIT_R;
 	UT_ASSERT_EQ(run_split(&relation_data, &relation_data, &key, 1, InvalidBuffer, 4, 16, item,
-						   NULL, NULL, 0, &space_identity),
+						   NULL, NULL, 0, &space_identity, NULL),
 				 2);
 	UT_ASSERT_EQ(BTPageGetOpaque(pages[0].data)->btpo_next, 8);
 	UT_ASSERT_EQ(BTPageGetOpaque(pages[1].data)->btpo_prev, 7);
@@ -646,7 +665,7 @@ UT_TEST(test_native_newlevel_versions_root_child_and_meta)
 	pfree(high);
 	save_before();
 	expected_info = XLOG_BTREE_NEWROOT;
-	UT_ASSERT_EQ(run_newlevel(&relation_data, &relation_data, 1, 3, &space_identity), 2);
+	UT_ASSERT_EQ(run_newlevel(&relation_data, &relation_data, 1, 3, &space_identity, NULL), 2);
 	UT_ASSERT_EQ(BTPageGetMeta(pages[3].data)->btm_root, 8);
 	UT_ASSERT_EQ(PageGetMaxOffsetNumber(pages[1].data), 2);
 	check_version(3, 7);
@@ -667,7 +686,7 @@ UT_TEST(test_first_root_preserves_zero_or_recycled_predecessor)
 		}
 		save_before();
 		expected_info = XLOG_BTREE_NEWROOT;
-		UT_ASSERT_EQ(_bt_getroot(&relation_data, &relation_data, BT_WRITE, &space_identity), 2);
+		UT_ASSERT_EQ(_bt_getroot(&relation_data, &relation_data, BT_WRITE, &space_identity, NULL), 2);
 		check_version(2, 5);
 		UT_ASSERT_EQ(edges[0].before_kind,
 					 reused ? RF_PAGE_STATE_PRESENT : RF_PAGE_STATE_UNFORMATTED);
@@ -695,7 +714,7 @@ UT_TEST(test_upper_insert_versions_child_and_fastroot)
 	save_before();
 	expected_info = XLOG_BTREE_INSERT_META;
 	run_insert(&relation_data, &relation_data, NULL, 1, 5, NULL, item, 16, 2, 0, true,
-			   &space_identity);
+			   &space_identity, NULL);
 	check_version(3, 7);
 	UT_ASSERT(!P_INCOMPLETE_SPLIT(BTPageGetOpaque(pages[4].data)));
 	UT_ASSERT_EQ(BTPageGetMeta(pages[3].data)->btm_fastlevel, 1);
@@ -723,7 +742,7 @@ UT_TEST(test_internal_split_versions_all_four_native_blocks)
 	save_before();
 	expected_info = XLOG_BTREE_SPLIT_R;
 	UT_ASSERT_EQ(run_split(&relation_data, &relation_data, NULL, 1, 5, 5, 16, item, NULL, NULL, 0,
-						   &space_identity),
+						   &space_identity, NULL),
 				 2);
 	check_version(4, 15);
 	UT_ASSERT_EQ(BTPageGetOpaque(pages[2].data)->btpo_prev, 8);
@@ -745,7 +764,7 @@ UT_TEST(test_bad_first_root_predecessor_or_identity_changes_no_page)
 		error_expected = true;
 		if (setjmp(error_jump) == 0) {
 			_bt_getroot(&relation_data, &relation_data, BT_WRITE,
-						kind == 2 ? NULL : &space_identity);
+						kind == 2 ? NULL : &space_identity, NULL);
 			UT_ASSERT(false);
 		}
 		error_expected = false;
@@ -763,7 +782,7 @@ UT_TEST(test_nonshared_first_root_preserves_native_wal)
 	BTPageGetMeta(pages[3].data)->btm_root = P_NONE;
 	save_before();
 	expected_info = XLOG_BTREE_NEWROOT;
-	UT_ASSERT_EQ(_bt_getroot(&relation_data, &relation_data, BT_WRITE, NULL), 2);
+	UT_ASSERT_EQ(_bt_getroot(&relation_data, &relation_data, BT_WRITE, NULL, NULL), 2);
 	UT_ASSERT_EQ(edge_count + edge_blocks, 0);
 	UT_ASSERT_EQ(wal_count, 1);
 	UT_ASSERT_EQ(PageGetLSN(pages[1].data), 0x9000);

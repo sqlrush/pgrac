@@ -470,6 +470,8 @@ SIMPLE_TESTS := $(filter-out test_cluster_btree_build_version,$(SIMPLE_TESTS))
 TESTS += test_cluster_space_extend
 SIMPLE_TESTS := $(filter-out test_cluster_btree_leaf_version,$(SIMPLE_TESTS))
 TESTS += test_cluster_btree_structure_version
+TESTS += test_cluster_btree_hw_restart
+TESTS += test_cluster_btree_hw_paths
 TESTS += test_cluster_sequence_version test_cluster_sequence_ddl
 TESTS += test_cluster_relation_wal_policy
 TESTS += test_cluster_heap_small_redo
@@ -1669,6 +1671,38 @@ test_cluster_sequence_version test_cluster_sequence_ddl: %: %.c test_cluster_seq
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 # PGRAC: execute native allocation and structural mutation bodies.
+test_cluster_btree_hw_owner.inc: $(top_srcdir)/src/backend/access/nbtree/nbtinsert.c Makefile
+	awk '/^_bt_(doinsert|insert_alloc_needed)\(/ { print "bool"; emit=1; found++ } \
+	     /^_bt_doinsert_internal\(/ { print "static bool"; emit=1; found++ } \
+	     /^_bt_insert_alloc_(begin|end)\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 5) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_hw_needed.inc: $(top_srcdir)/src/backend/access/nbtree/nbtinsert.c Makefile
+	awk '/^_bt_insert_alloc_needed\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_hw_insert_paths.inc: $(top_srcdir)/src/backend/access/nbtree/nbtinsert.c Makefile
+	awk '/^_bt_(finish_split|getstackbuf)\(/ { print ($$0 ~ /finish_split/ ? "bool" : "Buffer"); emit=1; found++ } \
+	     /^_bt_stepright\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_hw_search_paths.inc: $(top_srcdir)/src/backend/access/nbtree/nbtsearch.c Makefile
+	awk '/^_bt_search\(/ { print "BTStack"; emit=1; found++ } \
+	     /^_bt_moveright\(/ { print "Buffer"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_hw_restart: test_cluster_btree_hw_restart.c unit_test.h \
+		test_cluster_btree_hw_owner.inc \
+		test_cluster_space_bufpage_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
 test_cluster_btree_structure_helpers.inc: $(top_srcdir)/src/backend/access/nbtree/nbtpage.c Makefile
 	awk '/^_bt_(upgrademetapage|pageinit|get_version_identity)\(/ { print "void"; emit=1; found++ } \
 	     /^_bt_prepare_page_versions?\(/ { print "bool"; emit=1; found++ } \
@@ -1716,6 +1750,7 @@ test_cluster_btree_structure_insert.inc: $(top_srcdir)/src/backend/access/nbtree
 	mv $@.tmp $@
 
 test_cluster_btree_structure_version: test_cluster_btree_structure_version.c unit_test.h \
+		test_cluster_btree_hw_needed.inc \
 		test_cluster_btree_structure_helpers.inc test_cluster_btree_structure_alloc.inc \
 		test_cluster_btree_structure_root.inc \
 		test_cluster_btree_structure_delete.inc \
@@ -1723,6 +1758,22 @@ test_cluster_btree_structure_version: test_cluster_btree_structure_version.c uni
 		test_cluster_btree_structure_newlevel.inc test_cluster_btree_structure_insert.inc \
 		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o \
 		test_cluster_space_storage_product.o test_cluster_inplace_itemptr_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
+		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		test_cluster_inplace_itemptr_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+test_cluster_btree_hw_paths: test_cluster_btree_hw_paths.c test_cluster_btree_structure_version.c \
+		test_cluster_btree_hw_insert_paths.inc test_cluster_btree_hw_search_paths.inc \
+		test_cluster_btree_structure_helpers.inc test_cluster_btree_structure_alloc.inc \
+		test_cluster_btree_structure_root.inc test_cluster_btree_structure_delete.inc \
+		test_cluster_btree_structure_add.inc test_cluster_btree_structure_split.inc \
+		test_cluster_btree_structure_newlevel.inc test_cluster_btree_structure_insert.inc \
+		test_cluster_btree_hw_needed.inc test_cluster_space_bufpage_product.o \
+		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		test_cluster_inplace_itemptr_product.o unit_test.h \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
@@ -4795,6 +4846,8 @@ clean distclean maintainer-clean:
 		test_cluster_btree_structure_delete.inc \
 		test_cluster_btree_structure_add.inc test_cluster_btree_structure_split.inc \
 		test_cluster_btree_structure_newlevel.inc test_cluster_btree_structure_insert.inc
+	rm -f test_cluster_btree_hw_owner.inc test_cluster_btree_hw_needed.inc \
+		test_cluster_btree_hw_insert_paths.inc test_cluster_btree_hw_search_paths.inc
 	rm -f test_cluster_sequence_version_helpers.inc test_cluster_sequence_version_native.inc test_cluster_sequence_hint.inc
 	rm -f test_cluster_relation_wal_types.inc test_cluster_relation_wal_native.inc
 	rm -f test_cluster_heap_small_native.inc test_cluster_heap_small_scn.inc
