@@ -54,6 +54,7 @@
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_recovery_plan.h"
+#include "cluster/cluster_recovery_ctrc_record.h"
 #include "cluster/cluster_recovery_worker.h" /* pool lives in this wrapper (spec-4.4 D5) */
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_semantic_activation.h" /* bit22 cutover latch (contract §B) */
@@ -102,6 +103,7 @@ typedef struct ClusterRecoveryPlanShmem {
 static ClusterRecoveryPlanShmem *cluster_recovery_plan_shmem = NULL;
 
 static bool stamp_shape(const ClusterRecoveryStampSlotV1 *slot, uint16 thread);
+static void stamp_snapshot(ClusterRecoveryStampSlotV1 *slot, ClusterRecoveryStampSlotV1 *out);
 StaticAssertDecl(CLUSTER_RECOVERY_STAMP_SLOTS == CLUSTER_RECOVERY_PLAN_THREADS,
 				 "stamp windows use the original recovery slots");
 
@@ -173,12 +175,11 @@ cluster_recovery_normal_stop_poll(const char **domain, uint64 *key, const char *
 		recovery_stop_note(result, "THREAD_REPLAY", tid, why, &aggregate, &first_domain, &first_key,
 						   &first_reason);
 		if (tid != 0) {
-			ClusterRecoveryStampSlotV1 *stamp = &slot->stamp;
-			SpinLockAcquire(&stamp->lock);
-			result = !stamp_shape(stamp, tid) || stamp->failed		? CLUSTER_NORMAL_STOP_INVALID
-					 : stamp->phase != CLUSTER_RECOVERY_STAMP_EMPTY ? CLUSTER_NORMAL_STOP_PENDING
+			ClusterRecoveryStampSlotV1 stamp;
+			stamp_snapshot(&slot->stamp, &stamp);
+			result = !stamp_shape(&stamp, tid) || stamp.failed		? CLUSTER_NORMAL_STOP_INVALID
+					 : stamp.phase != CLUSTER_RECOVERY_STAMP_EMPTY ? CLUSTER_NORMAL_STOP_PENDING
 																	: CLUSTER_NORMAL_STOP_READY;
-			SpinLockRelease(&stamp->lock);
 			recovery_stop_note(result, "RECOVERY_STAMP", tid,
 							   result == CLUSTER_NORMAL_STOP_INVALID ? "RECOVERY_STAMP_INVALID"
 																	 : "RECOVERY_STAMP_PENDING",
@@ -1212,12 +1213,48 @@ stamp_owner_payload_matches(const ClusterRecoveryStampOwnerV1 *owner,
 		   && memcmp(record->target_claim_sha256, owner->target.claim_sha256, 32) == 0;
 }
 
-/* Constant-sized, pure checks; caller holds only the slot spinlock. */
+/* Decode only caller-owned inputs or snapshots. D0 hashing may allocate;
+ * neither a slot spinlock nor an insertion critical section may cover it. */
 static bool
-stamp_shape(const ClusterRecoveryStampSlotV1 *slot, uint16 thread)
+stamp_payload_matches(const ClusterRecoveryStampOwnerV1 *owner, ClusterRecoveryStampKindV1 kind,
+					  const uint8 *payload, Size length, uint16 *target_thread)
 {
-	const ClusterRecoveryStampKeyV1 *key = &slot->handle.key;
-	ClusterRecoveryTTAbortV1 record;
+	if (!stamp_owner_valid(owner))
+		return false;
+	if (kind == CLUSTER_RECOVERY_STAMP_C0 && length == CLUSTER_RECOVERY_TT_ABORT_BYTES) {
+		ClusterRecoveryTTAbortV1 record;
+		if (!cluster_recovery_tt_abort_decode_v1(payload, length, &record)
+			|| !stamp_owner_payload_matches(owner, &record))
+			return false;
+		*target_thread = record.target_thread;
+		return true;
+	}
+	if (kind == CLUSTER_RECOVERY_STAMP_D0 && length == CLUSTER_RECOVERY_CTRC_BYTES
+		&& CritSectionCount == 0) {
+		ClusterRecoveryCTRCReleaseV2 record;
+		if (!cluster_recovery_ctrc_decode_v2(
+				payload, length, owner->writer.ref.claim.identity.system_identifier, &record)
+			|| record.writer_thread != owner->writer.ref.claim.identity.origin_thread_id
+			|| record.writer_boot != owner->executor_boot
+			|| record.target_owner != owner->target.identity.origin_thread_id
+			|| record.origin_node_id != owner->target.identity.origin_node_id
+			|| record.database_incarnation != owner->target.database_incarnation
+			|| record.formation_epoch != owner->writer.epoch
+			|| record.recovery_serial != owner->recovery_serial)
+			return false;
+		*target_thread = record.target_owner;
+		return true;
+	}
+	return false;
+}
+
+/* Constant-sized pure metadata checks under the slot spinlock. Keep the
+ * original worker attempt/adoption contract independent of payload decoding. */
+static bool
+stamp_state_shape(const ClusterRecoveryStampSlotV1 *slot, uint16 thread)
+{
+	const ClusterRecoveryStampHandleV1 *handle = &slot->handle;
+	const ClusterRecoveryStampKeyV1 *key = &handle->key;
 	ClusterRecoveryStampPhaseV1 effective = slot->phase;
 	if (slot->phase < CLUSTER_RECOVERY_STAMP_EMPTY
 		|| slot->phase > CLUSTER_RECOVERY_STAMP_ADOPT_PENDING
@@ -1233,16 +1270,17 @@ stamp_shape(const ClusterRecoveryStampSlotV1 *slot, uint16 thread)
 	} else if (slot->adopt_from != CLUSTER_RECOVERY_STAMP_EMPTY)
 		return false;
 	if (slot->phase == CLUSTER_RECOVERY_STAMP_EMPTY)
-		return !slot->failed && slot->record_start == 0 && slot->record_end == 0 && slot->kind == 0
-			   && slot->payload_length == 0 && slot->executor_attempt_stamp == 0
+		return !slot->failed && slot->record_start == 0 && slot->record_end == 0 && handle->kind == 0
+			   && handle->payload_length == 0 && slot->executor_attempt_stamp == 0
 			   && ((key->slot_generation == 0 && key->window_seq == 0 && key->target_thread == 0)
 				   || (key->slot_generation > 0 && key->window_seq >= key->slot_generation
 					   && key->target_thread == thread && stamp_owner_valid(&slot->handle.owner)));
 	if (key->target_thread != thread || key->slot_generation == 0
-		|| key->window_seq < key->slot_generation || slot->kind != CLUSTER_RECOVERY_STAMP_C0
-		|| slot->payload_length != CLUSTER_RECOVERY_TT_ABORT_BYTES
-		|| !cluster_recovery_tt_abort_decode_v1(slot->payload, slot->payload_length, &record)
-		|| !stamp_owner_payload_matches(&slot->handle.owner, &record))
+		|| key->window_seq < key->slot_generation || !stamp_owner_valid(&handle->owner)
+		|| !((handle->kind == CLUSTER_RECOVERY_STAMP_C0
+			  && handle->payload_length == CLUSTER_RECOVERY_TT_ABORT_BYTES)
+			 || (handle->kind == CLUSTER_RECOVERY_STAMP_D0
+				 && handle->payload_length == CLUSTER_RECOVERY_CTRC_BYTES)))
 		return false;
 	if (slot->phase != CLUSTER_RECOVERY_STAMP_ADOPT_PENDING && slot->executor_attempt_stamp != 0
 		&& (slot->executor_attempt_stamp != slot->bound_worker_attempt
@@ -1252,6 +1290,49 @@ stamp_shape(const ClusterRecoveryStampSlotV1 *slot, uint16 thread)
 		return slot->record_start == 0 && slot->record_end == 0;
 	return slot->record_start >= slot->handle.owner.writer.startup_first_lsn
 		   && slot->record_end > slot->record_start;
+}
+
+static bool
+stamp_shape(const ClusterRecoveryStampSlotV1 *slot, uint16 thread)
+{
+	uint16 target_thread;
+	return stamp_state_shape(slot, thread)
+		   && (slot->phase == CLUSTER_RECOVERY_STAMP_EMPTY
+			   || (stamp_payload_matches(&slot->handle.owner, slot->handle.kind,
+										 slot->handle.payload, slot->handle.payload_length,
+										 &target_thread)
+				   && target_thread == thread));
+}
+
+static void
+stamp_snapshot(ClusterRecoveryStampSlotV1 *slot, ClusterRecoveryStampSlotV1 *out)
+{
+	SpinLockAcquire(&slot->lock);
+	out->handle = slot->handle;
+	out->phase = slot->phase;
+	out->adopt_from = slot->adopt_from;
+	out->executor_attempt_stamp = slot->executor_attempt_stamp;
+	out->bound_worker_attempt = slot->bound_worker_attempt;
+	out->bound_worker_pid = slot->bound_worker_pid;
+	out->record_start = slot->record_start;
+	out->record_end = slot->record_end;
+	out->failed = slot->failed;
+	SpinLockRelease(&slot->lock);
+}
+
+static bool
+stamp_handle_matches(const ClusterRecoveryStampSlotV1 *slot,
+					 const ClusterRecoveryStampHandleV1 *handle)
+{
+	return stamp_state_shape(slot, handle->key.target_thread)
+		   && slot->phase != CLUSTER_RECOVERY_STAMP_EMPTY
+		   && slot->handle.key.slot_generation == handle->key.slot_generation
+		   && slot->handle.key.window_seq == handle->key.window_seq
+		   && slot->handle.key.target_thread == handle->key.target_thread
+		   && stamp_owner_equal(&slot->handle.owner, &handle->owner)
+		   && slot->handle.kind == handle->kind
+		   && slot->handle.payload_length == handle->payload_length
+		   && memcmp(slot->handle.payload, handle->payload, sizeof(handle->payload)) == 0;
 }
 
 bool
@@ -1267,7 +1348,7 @@ cluster_recovery_stamp_worker_begin_v1(uint16 thread, uint64 attempt)
 	SpinLockAcquire(&slot->lock);
 	if (pg_atomic_read_u64(&replay->episode_epoch) == attempt
 		&& pg_atomic_read_u32(&replay->state) == CLUSTER_THREADREC_REPLAY_REPLAYING
-		&& stamp_shape(slot, thread) && slot->phase == CLUSTER_RECOVERY_STAMP_EMPTY
+		&& stamp_state_shape(slot, thread) && slot->phase == CLUSTER_RECOVERY_STAMP_EMPTY
 		&& (slot->bound_worker_attempt == 0
 			|| (slot->bound_worker_attempt == attempt && slot->bound_worker_pid == MyProcPid))) {
 		slot->bound_worker_attempt = attempt;
@@ -1283,14 +1364,27 @@ cluster_recovery_stamp_worker_stopped_v1(uint16 thread, uint64 attempt)
 {
 	ClusterThreadReplaySlot *replay;
 	ClusterRecoveryStampSlotV1 *slot;
+	ClusterRecoveryStampSlotV1 snapshot;
 	bool accepted = false;
 	if (!cluster_shared_config || !cluster_enabled || !IsUnderPostmaster || MyProcPid <= 0
 		|| MyBackendType != B_LMON || CritSectionCount != 0 || attempt == 0
 		|| (replay = cluster_thread_recovery_replay_slot(thread)) == NULL)
 		return false;
 	slot = &replay->stamp;
+	stamp_snapshot(slot, &snapshot);
+	if (!stamp_shape(&snapshot, thread))
+		return false;
 	SpinLockAcquire(&slot->lock);
-	if (!stamp_shape(slot, thread))
+	/* Validate payload outside the lock, then consume that exact operation
+	 * and worker binding. A stopped worker cannot gain a replacement window. */
+	if (!stamp_state_shape(slot, thread)
+		|| memcmp(&slot->handle, &snapshot.handle, sizeof(slot->handle)) != 0
+		|| slot->phase != snapshot.phase || slot->adopt_from != snapshot.adopt_from
+		|| slot->executor_attempt_stamp != snapshot.executor_attempt_stamp
+		|| slot->bound_worker_attempt != snapshot.bound_worker_attempt
+		|| slot->bound_worker_pid != snapshot.bound_worker_pid
+		|| slot->record_start != snapshot.record_start || slot->record_end != snapshot.record_end
+		|| slot->failed != snapshot.failed)
 		goto done;
 	if (slot->bound_worker_attempt == 0) {
 		/* Entry may have refused before registering, including a replacement
@@ -1322,7 +1416,7 @@ cluster_recovery_stamp_prepare_v1(const ClusterRecoveryStampOwnerV1 *owner,
 								  ClusterRecoveryStampKindV1 kind, const uint8 *payload,
 								  Size length, ClusterRecoveryStampHandleV1 *out)
 {
-	ClusterRecoveryTTAbortV1 record;
+	uint16 target_thread;
 	ClusterThreadReplaySlot *replay;
 	ClusterRecoveryStampSlotV1 *slot;
 	bool accepted = false;
@@ -1332,29 +1426,27 @@ cluster_recovery_stamp_prepare_v1(const ClusterRecoveryStampOwnerV1 *owner,
 		return false;
 	memset(out, 0, sizeof(*out));
 	if (!stamp_actor() || CritSectionCount != 0 || owner == NULL || owner->executor_pid != MyProcPid
-		|| kind != CLUSTER_RECOVERY_STAMP_C0 || length != CLUSTER_RECOVERY_TT_ABORT_BYTES
-		|| !cluster_recovery_tt_abort_decode_v1(payload, length, &record)
-		|| !stamp_owner_payload_matches(owner, &record))
+		|| !stamp_payload_matches(owner, kind, payload, length, &target_thread))
 		return false;
-	replay = cluster_thread_recovery_replay_slot(record.target_thread);
+	replay = cluster_thread_recovery_replay_slot(target_thread);
 	if (replay == NULL)
 		return false;
 	/* The native executor is single-threaded; only this live PID can publish
 	 * its windows. Check every original slot before starting another target. */
 	for (uint16 tid = 1; tid <= CLUSTER_RECOVERY_STAMP_SLOTS; tid++) {
 		ClusterRecoveryStampSlotV1 *other = &cluster_recovery_plan_shmem->thread_replay[tid].stamp;
+		ClusterRecoveryStampSlotV1 snapshot;
 		bool unavailable;
-		SpinLockAcquire(&other->lock);
-		unavailable = !stamp_shape(other, tid)
-					  || (other->phase != CLUSTER_RECOVERY_STAMP_EMPTY
-						  && other->handle.owner.executor_pid == MyProcPid);
-		SpinLockRelease(&other->lock);
+		stamp_snapshot(other, &snapshot);
+		unavailable = !stamp_shape(&snapshot, tid)
+					  || (snapshot.phase != CLUSTER_RECOVERY_STAMP_EMPTY
+						  && snapshot.handle.owner.executor_pid == MyProcPid);
 		if (unavailable)
 			return false;
 	}
 	slot = &replay->stamp;
 	SpinLockAcquire(&slot->lock);
-	if (!stamp_shape(slot, record.target_thread) || slot->phase != CLUSTER_RECOVERY_STAMP_EMPTY
+	if (!stamp_state_shape(slot, target_thread) || slot->phase != CLUSTER_RECOVERY_STAMP_EMPTY
 		|| slot->handle.key.window_seq == UINT64_MAX)
 		goto done;
 	if (MyBackendType == B_BG_WORKER
@@ -1373,12 +1465,11 @@ cluster_recovery_stamp_prepare_v1(const ClusterRecoveryStampOwnerV1 *owner,
 	memset(&slot->handle, 0, sizeof(slot->handle));
 	slot->handle.key.slot_generation = generation;
 	slot->handle.key.window_seq = sequence;
-	slot->handle.key.target_thread = record.target_thread;
+	slot->handle.key.target_thread = target_thread;
 	slot->handle.owner = *owner;
-	slot->kind = kind;
-	slot->payload_length = length;
-	memset(slot->payload, 0, sizeof(slot->payload));
-	memcpy(slot->payload, payload, length);
+	slot->handle.kind = kind;
+	slot->handle.payload_length = length;
+	memcpy(slot->handle.payload, payload, length);
 	slot->phase = CLUSTER_RECOVERY_STAMP_PRE_INSERT;
 	slot->adopt_from = CLUSTER_RECOVERY_STAMP_EMPTY;
 	slot->executor_attempt_stamp = MyBackendType == B_BG_WORKER ? slot->bound_worker_attempt : 0;
@@ -1401,12 +1492,7 @@ stamp_transition(const ClusterRecoveryStampHandleV1 *handle, ClusterRecoveryStam
 		return false;
 	slot = &replay->stamp;
 	SpinLockAcquire(&slot->lock);
-	if (!stamp_shape(slot, handle->key.target_thread)
-		|| slot->handle.key.slot_generation != handle->key.slot_generation
-		|| slot->handle.key.window_seq != handle->key.window_seq
-		|| slot->handle.key.target_thread != handle->key.target_thread
-		|| !stamp_owner_equal(&slot->handle.owner, &handle->owner)
-		|| slot->phase == CLUSTER_RECOVERY_STAMP_EMPTY
+	if (!stamp_handle_matches(slot, handle)
 		|| slot->phase == CLUSTER_RECOVERY_STAMP_ADOPT_PENDING)
 		goto done;
 	if (failed) {
@@ -1428,9 +1514,9 @@ stamp_transition(const ClusterRecoveryStampHandleV1 *handle, ClusterRecoveryStam
 	slot->phase = next;
 	if (next == CLUSTER_RECOVERY_STAMP_EMPTY) {
 		slot->record_start = slot->record_end = 0;
-		slot->kind = 0;
-		slot->payload_length = 0;
-		memset(slot->payload, 0, sizeof(slot->payload));
+		slot->handle.kind = 0;
+		slot->handle.payload_length = 0;
+		memset(slot->handle.payload, 0, sizeof(slot->handle.payload));
 		slot->failed = false;
 		slot->executor_attempt_stamp = 0;
 		slot->adopt_from = CLUSTER_RECOVERY_STAMP_EMPTY;
@@ -1491,15 +1577,15 @@ cluster_recovery_stamp_capture_v1(ClusterRecoveryStampCaptureV1 *out)
 		return false;
 	for (uint16 tid = 1; tid <= CLUSTER_RECOVERY_STAMP_SLOTS; tid++) {
 		ClusterRecoveryStampSlotV1 *slot = &cluster_recovery_plan_shmem->thread_replay[tid].stamp;
+		ClusterRecoveryStampSlotV1 snapshot;
 		bool valid;
-		SpinLockAcquire(&slot->lock);
-		valid = stamp_shape(slot, tid);
-		if (valid && slot->phase != CLUSTER_RECOVERY_STAMP_EMPTY) {
-			out->keys[out->count++] = slot->handle.key;
-			if (slot->handle.owner.executor_pid == MyProcPid)
+		stamp_snapshot(slot, &snapshot);
+		valid = stamp_shape(&snapshot, tid);
+		if (valid && snapshot.phase != CLUSTER_RECOVERY_STAMP_EMPTY) {
+			out->keys[out->count++] = snapshot.handle.key;
+			if (snapshot.handle.owner.executor_pid == MyProcPid)
 				out->caller_owned = true;
 		}
-		SpinLockRelease(&slot->lock);
 		if (!valid) {
 			memset(out, 0, sizeof(*out));
 			return false;
@@ -1519,24 +1605,23 @@ cluster_recovery_stamp_poll_v1(const ClusterRecoveryStampCaptureV1 *capture)
 		return CLUSTER_RECOVERY_STAMP_INVALID;
 	for (uint32 i = 0; i < capture->count; i++) {
 		const ClusterRecoveryStampKeyV1 *key = &capture->keys[i];
-		ClusterRecoveryStampSlotV1 *slot;
+		ClusterRecoveryStampSlotV1 snapshot;
 		bool valid, pending;
 		if (key->target_thread <= previous || key->target_thread > CLUSTER_RECOVERY_STAMP_SLOTS
 			|| key->slot_generation == 0 || key->window_seq < key->slot_generation)
 			return CLUSTER_RECOVERY_STAMP_INVALID;
 		previous = key->target_thread;
-		slot = &cluster_recovery_plan_shmem->thread_replay[key->target_thread].stamp;
-		SpinLockAcquire(&slot->lock);
-		valid = stamp_shape(slot, key->target_thread)
-				&& slot->handle.key.slot_generation >= key->slot_generation
-				&& slot->handle.key.window_seq >= key->window_seq
-				&& (slot->handle.key.slot_generation == key->slot_generation
-					|| slot->handle.key.window_seq > key->window_seq);
-		pending = valid && slot->handle.key.window_seq == key->window_seq
-				  && slot->phase != CLUSTER_RECOVERY_STAMP_EMPTY;
-		if (pending && slot->failed && slot->phase != CLUSTER_RECOVERY_STAMP_ADOPT_PENDING)
+		stamp_snapshot(&cluster_recovery_plan_shmem->thread_replay[key->target_thread].stamp,
+					   &snapshot);
+		valid = stamp_shape(&snapshot, key->target_thread)
+				&& snapshot.handle.key.slot_generation >= key->slot_generation
+				&& snapshot.handle.key.window_seq >= key->window_seq
+				&& (snapshot.handle.key.slot_generation == key->slot_generation
+					|| snapshot.handle.key.window_seq > key->window_seq);
+		pending = valid && snapshot.handle.key.window_seq == key->window_seq
+				  && snapshot.phase != CLUSTER_RECOVERY_STAMP_EMPTY;
+		if (pending && snapshot.failed && snapshot.phase != CLUSTER_RECOVERY_STAMP_ADOPT_PENDING)
 			valid = false;
-		SpinLockRelease(&slot->lock);
 		if (!valid)
 			return CLUSTER_RECOVERY_STAMP_INVALID;
 		if (pending)

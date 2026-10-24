@@ -1293,11 +1293,15 @@ test_cluster_recovery_stop: test_cluster_recovery_stop.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_thread_recovery_orchestrator.c \
 		$(top_srcdir)/src/include/cluster/cluster_clean_leave.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
-        $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c
+        $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
+        $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h $(CLUSTER_UNIT_CRYPTOHASH_O) Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
-        $(top_builddir)/src/common/libpgcommon_srv.a \
-		$(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+        $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
+        $(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+        $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 CLUSTER_NODE_REMOVE_POLICY_O = $(top_builddir)/src/backend/cluster/cluster_node_remove_policy.o
 test_cluster_node_remove_stop: test_cluster_node_remove_stop.c unit_test.h \
@@ -9845,11 +9849,14 @@ test_cluster_recovery_stamp: test_cluster_recovery_stamp.c unit_test.h \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
         $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
-        $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c
+        $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
+        $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h $(CLUSTER_UNIT_CRYPTOHASH_O) Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
-        $(top_builddir)/src/common/libpgcommon_srv.a \
-        $(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+        $(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+        $(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+        $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # Original scheduler status/CAS and exact native BGW handle reaper.
 test_cluster_recovery_stamp_reap.inc: $(top_srcdir)/src/backend/cluster/cluster_thread_recovery_worker.c \
@@ -9870,11 +9877,14 @@ test_cluster_recovery_stamp_exit: test_cluster_recovery_stamp_exit.c test_cluste
         $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
         $(top_srcdir)/src/include/cluster/cluster_epoch.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
-        $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c
+        $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
+        $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h $(CLUSTER_UNIT_CRYPTOHASH_O) Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
-        $(top_builddir)/src/common/libpgcommon_srv.a \
-        $(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+        $(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+        $(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+        $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 test_cluster_checkpoint_stamp.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^ClusterCheckpointWaitRecoveryStamps\(/ { print "static void"; emit=1; functions++ } \
@@ -9895,11 +9905,14 @@ test_cluster_checkpoint_stamp: test_cluster_checkpoint_stamp.c test_cluster_reco
         $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
         $(top_srcdir)/src/include/cluster/cluster_epoch.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
-        $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c
+        $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
+        $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h $(CLUSTER_UNIT_CRYPTOHASH_O) Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
-        $(top_builddir)/src/common/libpgcommon_srv.a \
-        $(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+        $(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+        $(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+        $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # Original retained-input owner and installed native writer, without I/O grants.
 test_cluster_cold_tx_owner.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile
@@ -9961,11 +9974,15 @@ test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_ow
         $(top_srcdir)/src/include/cluster/cluster_epoch.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
         $(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
-        $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c
+        $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
+        $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h $(CLUSTER_UNIT_CRYPTOHASH_O) Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
-        $(top_builddir)/src/common/libpgcommon_srv.a \
-        $(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+        $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
+        $(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+        $(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+        $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # PGRAC: actual early typed preparation and the original replay entry handoff.
 test_cluster_cold_start_prepare_types.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile

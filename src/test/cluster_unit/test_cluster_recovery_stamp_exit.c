@@ -99,7 +99,7 @@ UT_TEST(stopped_preserves_each_original_phase_and_payload)
 		UT_ASSERT_EQ(pg_atomic_read_u32(&region.thread_replay[2].state), CLUSTER_THREADREC_REPLAY_IDLE);
 		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_ADOPT_PENDING);
 		UT_ASSERT(memcmp(&before.handle, &region.thread_replay[2].stamp.handle, sizeof(h)) == 0);
-		UT_ASSERT(memcmp(before.payload, region.thread_replay[2].stamp.payload, sizeof(before.payload)) == 0);
+		UT_ASSERT(memcmp(before.handle.payload, region.thread_replay[2].stamp.handle.payload, sizeof(before.handle.payload)) == 0);
 		UT_ASSERT_EQ(before.record_start, region.thread_replay[2].stamp.record_start);
 		UT_ASSERT_EQ(before.record_end, region.thread_replay[2].stamp.record_end);
 		UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&capture), CLUSTER_RECOVERY_STAMP_PENDING);

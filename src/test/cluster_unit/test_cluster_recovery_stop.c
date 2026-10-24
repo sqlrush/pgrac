@@ -24,6 +24,7 @@ s_lock(volatile slock_t *lock, const char *file, int line, const char *func)
 
 
 bool IsUnderPostmaster = true;
+volatile uint32 CritSectionCount;
 BackendType MyBackendType = B_LMON;
 static ClusterRecoveryPlanShmem region;
 static bool found_region;
