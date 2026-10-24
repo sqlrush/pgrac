@@ -2883,10 +2883,160 @@ UT_TEST(xmin_candidates_revalidate_even_without_cached_binding_index)
 	UT_ASSERT_EQ(out.target_count, 1);
 }
 
+static void
+init_xmin_batch_plan_fixture(ClusterHeapFreezePageBatchV1 *page,
+	ClusterHeapFreezeProofBatchV1 *proofs, ClusterHeapFreezeFinalFenceV1 *fence,
+	ClusterHeapFreezeXminTargetV1 targets[2])
+{
+	init_creation_binding_fixture(page, proofs, fence);
+	page->carrier_request_count = proofs->proof_count = 2;
+	page->carrier_requests[1] = page->carrier_requests[0];
+	page->carrier_requests[1].locator.itl_slot_index = 1;
+	proofs->proofs[0].resolution.local_original_full_xid = FullTransactionIdFromEpochAndXid(1, 77);
+	proofs->proofs[1] = proofs->proofs[0];
+	proofs->proofs[1].requested_locator.itl_slot_index = 1;
+	proofs->proofs[1].resolution.locator_echo.itl_slot_index = 1;
+	proofs->proofs[1].resolution.local_canonical.slot_offset = 1;
+	proofs->proofs[1].resolution.local_creation_target.offset = 2;
+	page->tuples[1].carrier_request_index = 1;
+	page->tuples[1].itl_slot_index = 1;
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(page, proofs, fence), 2);
+	for (int i = 0; i < 2; i++)
+		targets[i] = (ClusterHeapFreezeXminTargetV1){i, page->tuples[i].original_creator_full_xid};
+}
+
+UT_TEST(xmin_batch_plan_keeps_target_order_and_native_fields)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+	ClusterHeapFreezeXminTargetV1 targets[2], swap;
+	HeapTupleFreeze plans[3], expected[2], tail;
+	TransactionId horizon = InvalidTransactionId;
+	FullTransactionId limit = FullTransactionIdFromEpochAndXid(1, 100);
+
+	init_xmin_batch_plan_fixture(&page, &proofs, &fence, targets);
+	swap = targets[0]; targets[0] = targets[1]; targets[1] = swap;
+	memset(plans, 0x5a, sizeof(plans)); tail = plans[2];
+	for (int i = 0; i < 2; i++)
+		UT_ASSERT(cluster_heap_freeze_prepare_xmin_v1(&page, &proofs, &fence,
+			targets[i].tuple_index, targets[i].original_creator_full_xid, limit, 10, &expected[i]));
+	UT_ASSERT(cluster_heap_freeze_prepare_xmin_batch_v1(&page, &proofs, &fence,
+		targets, 2, limit, 10, plans, lengthof(plans), &horizon));
+	UT_ASSERT_EQ(memcmp(plans, expected, sizeof(expected)), 0);
+	UT_ASSERT_EQ(memcmp(&plans[2], &tail, sizeof(tail)), 0);
+	UT_ASSERT_EQ(horizon, 77);
+}
+
+UT_TEST(xmin_batch_plan_later_refusal_preserves_all_outputs)
+{
+	for (int variant = 0; variant < 8; variant++) {
+		ClusterHeapFreezePageBatchV1 page;
+		ClusterHeapFreezeProofBatchV1 proofs;
+		ClusterHeapFreezeFinalFenceV1 fence;
+		ClusterHeapFreezeXminTargetV1 targets[2];
+		HeapTupleFreeze plans[2], saved[2];
+		TransactionId horizon = 12345;
+		SCN h = 10;
+
+		init_xmin_batch_plan_fixture(&page, &proofs, &fence, targets);
+		memset(plans, 0x5a, sizeof(plans)); memcpy(saved, plans, sizeof(saved));
+		switch (variant) {
+		case 0: targets[1].original_creator_full_xid = FullTransactionIdFromEpochAndXid(2, 77); break;
+		case 1: targets[1] = targets[0]; break;
+		case 2: targets[1].tuple_index = page.tuple_count; break;
+		case 3: page.tuples[1].offset = page.tuples[0].offset; break;
+		case 4: fence.page_version++; break;
+		case 5: proofs.proofs[1].resolution.outcome = CLUSTER_TX_ABORTED; break;
+		case 6: page.tuples[1].original_creator_full_xid = InvalidFullTransactionId; break;
+		case 7: h = proofs.proofs[1].resolution.commit_scn; break;
+		}
+		UT_ASSERT(!cluster_heap_freeze_prepare_xmin_batch_v1(&page, &proofs, &fence,
+			targets, 2, FullTransactionIdFromEpochAndXid(3, 100), h,
+			plans, lengthof(plans), &horizon));
+		UT_ASSERT_EQ(memcmp(plans, saved, sizeof(plans)), 0);
+		UT_ASSERT_EQ(horizon, 12345);
+	}
+}
+
+UT_TEST(xmin_batch_plan_runtime_counts_and_capacity_are_bounded)
+{
+	for (int variant = 0; variant < 9; variant++) {
+		ClusterHeapFreezePageBatchV1 page;
+		ClusterHeapFreezeProofBatchV1 proofs;
+		ClusterHeapFreezeFinalFenceV1 fence;
+		ClusterHeapFreezeXminTargetV1 targets[2];
+		HeapTupleFreeze plans[2], saved[2];
+		TransactionId horizon = 12345;
+		uint16 count = variant == 0 ? 0 : variant == 1 ? MaxHeapTuplesPerPage + 1 : 2;
+
+		init_xmin_batch_plan_fixture(&page, &proofs, &fence, targets);
+		memset(plans, 0x5a, sizeof(plans)); memcpy(saved, plans, sizeof(saved));
+		UT_ASSERT(!cluster_heap_freeze_prepare_xmin_batch_v1(
+			variant == 3 ? NULL : &page, variant == 4 ? NULL : &proofs,
+			variant == 5 ? NULL : &fence, variant == 6 ? NULL : targets, count,
+			FullTransactionIdFromEpochAndXid(1, 100), 10,
+			variant == 7 ? NULL : plans, variant == 2 ? 1 : lengthof(plans),
+			variant == 8 ? NULL : &horizon));
+		UT_ASSERT_EQ(memcmp(plans, saved, sizeof(plans)), 0);
+		UT_ASSERT_EQ(horizon, 12345);
+	}
+}
+
+UT_TEST(xmin_batch_plan_rejects_individually_valid_raw_alias_epochs)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+	ClusterHeapFreezeXminTargetV1 targets[2];
+	HeapTupleFreeze plans[2], saved[2], single;
+	TransactionId horizon = 12345;
+	FullTransactionId limit = FullTransactionIdFromEpochAndXid(3, 100);
+
+	init_xmin_batch_plan_fixture(&page, &proofs, &fence, targets);
+	proofs.proofs[1].resolution.local_original_full_xid = FullTransactionIdFromEpochAndXid(2, 77);
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 2);
+	targets[1].original_creator_full_xid = page.tuples[1].original_creator_full_xid;
+	for (int i = 0; i < 2; i++)
+		UT_ASSERT(cluster_heap_freeze_prepare_xmin_v1(&page, &proofs, &fence,
+			i, targets[i].original_creator_full_xid, limit, 10, &single));
+	memset(plans, 0x5a, sizeof(plans)); memcpy(saved, plans, sizeof(saved));
+	UT_ASSERT(!cluster_heap_freeze_prepare_xmin_batch_v1(&page, &proofs, &fence,
+		targets, 2, limit, 10, plans, lengthof(plans), &horizon));
+	UT_ASSERT_EQ(memcmp(plans, saved, sizeof(plans)), 0);
+	UT_ASSERT_EQ(horizon, 12345);
+}
+
+UT_TEST(xmin_batch_plan_single_target_preserves_original_plan)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+	ClusterHeapFreezeXminTargetV1 targets[2];
+	HeapTupleFreeze plans[2], expected, tail;
+	TransactionId horizon = InvalidTransactionId;
+	FullTransactionId limit = FullTransactionIdFromEpochAndXid(1, 100);
+
+	init_xmin_batch_plan_fixture(&page, &proofs, &fence, targets);
+	UT_ASSERT(cluster_heap_freeze_prepare_xmin_v1(&page, &proofs, &fence,
+		0, targets[0].original_creator_full_xid, limit, 10, &expected));
+	memset(plans, 0x5a, sizeof(plans)); tail = plans[1];
+	UT_ASSERT(cluster_heap_freeze_prepare_xmin_batch_v1(&page, &proofs, &fence,
+		targets, 1, limit, 10, plans, lengthof(plans), &horizon));
+	UT_ASSERT_EQ(memcmp(&plans[0], &expected, sizeof(expected)), 0);
+	UT_ASSERT_EQ(memcmp(&plans[1], &tail, sizeof(tail)), 0);
+	UT_ASSERT_EQ(horizon, 77);
+}
+
 int
 main(void)
 {
-	UT_PLAN(92);
+	UT_PLAN(97);
+	UT_RUN(xmin_batch_plan_keeps_target_order_and_native_fields);
+	UT_RUN(xmin_batch_plan_later_refusal_preserves_all_outputs);
+	UT_RUN(xmin_batch_plan_runtime_counts_and_capacity_are_bounded);
+	UT_RUN(xmin_batch_plan_rejects_individually_valid_raw_alias_epochs);
+	UT_RUN(xmin_batch_plan_single_target_preserves_original_plan);
 	UT_RUN(xmin_candidates_keep_exact_physical_origin_without_native_plans);
 	UT_RUN(xmin_candidates_require_strict_observed_fullxid_and_scn_age);
 	UT_RUN(xmin_candidates_cannot_use_raw_alias_or_saved_creation_index);

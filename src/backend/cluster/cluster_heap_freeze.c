@@ -822,3 +822,55 @@ cluster_heap_freeze_select_xmin_candidates_v1(
 	memcpy(out, &candidates, sizeof(candidates));
 	return true;
 }
+
+bool
+cluster_heap_freeze_prepare_xmin_batch_v1(
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *current_fence,
+	const ClusterHeapFreezeXminTargetV1 *targets, uint16 target_count,
+	FullTransactionId freeze_limit_full, SCN horizon_scn,
+	HeapTupleFreeze *out_plans, uint16 out_capacity,
+	TransactionId *out_conflict_horizon)
+{
+	HeapTupleFreeze plans[MaxHeapTuplesPerPage];
+	bool seen[MaxHeapTuplesPerPage] = { false };
+	FullTransactionId min_creator = InvalidFullTransactionId;
+	FullTransactionId max_creator = InvalidFullTransactionId;
+
+	if (page == NULL || proofs == NULL || current_fence == NULL
+		|| targets == NULL || out_plans == NULL || out_conflict_horizon == NULL
+		|| target_count == 0 || target_count > MaxHeapTuplesPerPage
+		|| target_count > page->tuple_count || target_count > out_capacity)
+		return false;
+
+	for (uint16 i = 0; i < target_count; i++)
+	{
+		const ClusterHeapFreezeXminTargetV1 *target = &targets[i];
+		FullTransactionId creator = target->original_creator_full_xid;
+		OffsetNumber offset;
+
+		if (!cluster_heap_freeze_prepare_xmin_v1(page, proofs, current_fence,
+			target->tuple_index, creator, freeze_limit_full, horizon_scn, &plans[i]))
+			return false;
+		offset = plans[i].offset;
+		/* Input indexes cannot alias the same physical row. */
+		if (!OffsetNumberIsValid(offset) || offset > MaxHeapTuplesPerPage
+			|| seen[offset - 1])
+			return false;
+		seen[offset - 1] = true;
+		if (i == 0 || FullTransactionIdPrecedes(creator, min_creator))
+			min_creator = creator;
+		if (i == 0 || FullTransactionIdFollows(creator, max_creator))
+			max_creator = creator;
+	}
+	/* Native WAL records a raw conflict horizon. Compare complete identities
+	 * before narrowing, including distinct epochs with identical raw XIDs. */
+	if (U64FromFullTransactionId(max_creator) - U64FromFullTransactionId(min_creator)
+		>= UINT64CONST(0x80000000))
+		return false;
+
+	memcpy(out_plans, plans, target_count * sizeof(*plans));
+	*out_conflict_horizon = XidFromFullTransactionId(max_creator);
+	return true;
+}

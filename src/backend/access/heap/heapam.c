@@ -20706,8 +20706,7 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 	Page live_page;
 	HeapTupleFreeze plans[MaxHeapTuplesPerPage];
 	bool seen[MaxHeapTuplesPerPage] = { false };
-	FullTransactionId min_creator = InvalidFullTransactionId;
-	FullTransactionId max_creator = InvalidFullTransactionId;
+	TransactionId conflict_horizon;
 	PcmAuthoritySnapshot authority_now;
 	uint64 own_generation;
 	uint64 acquisition_epoch;
@@ -20743,18 +20742,19 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 			live_page) != CLUSTER_HEAP_FREEZE_PAGE_MATCHED)
 		return false;
 
-	/* Prepare the entire bounded batch before any authority check or mutation. */
+	/* Prepare the complete qualified batch before any authority check or write.
+	 * Preparation owns its output atomically and never acquires a page/proof. */
+	if (!cluster_heap_freeze_prepare_xmin_batch_v1(page, proofs, fence,
+		targets, target_count, freeze_limit_full, horizon_scn,
+		plans, lengthof(plans), &conflict_horizon))
+		return false;
 	for (uint16 i = 0; i < target_count; i++)
 	{
 		const ClusterHeapFreezeXminTargetV1 *target = &targets[i];
 		const ClusterHeapFreezeTupleInputV1 *saved;
-		FullTransactionId creator = target->original_creator_full_xid;
 		ItemId item;
 		HeapTupleHeader tuple;
 
-		if (!cluster_heap_freeze_prepare_xmin_v1(page, proofs, fence,
-			target->tuple_index, creator, freeze_limit_full, horizon_scn, &plans[i]))
-			return false;
 		saved = &page->tuples[target->tuple_index];
 		/* Different input indexes cannot name the same physical tuple twice. */
 		if (!OffsetNumberIsValid(saved->offset)
@@ -20784,15 +20784,7 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 				&saved->carrier, sizeof(saved->carrier)) != 0)
 			return false;
 
-		if (i == 0 || FullTransactionIdPrecedes(creator, min_creator))
-			min_creator = creator;
-		if (i == 0 || FullTransactionIdFollows(creator, max_creator))
-			max_creator = creator;
 	}
-	/* Native WAL has a raw conflict horizon: order FullXids before narrowing. */
-	if (U64FromFullTransactionId(max_creator) - U64FromFullTransactionId(min_creator)
-		>= UINT64CONST(0x80000000))
-		return false;
 
 	/* Final synchronous fence.  No current fetch or proof request is allowed. */
 	if (!admission->entered
@@ -20812,7 +20804,7 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 
 	/* Native redo and the existing SPACE version edge remain the only format. */
 	heap_freeze_apply_prepared(rel, buffer,
-		XidFromFullTransactionId(max_creator), plans, target_count,
+		conflict_horizon, plans, target_count,
 		&fence->identity);
 	XLogFlush(PageGetLSN(live_page));
 	return true;

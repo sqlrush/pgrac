@@ -351,6 +351,21 @@ extern bool cluster_heap_freeze_select_xmin_candidates_v1(
 	SCN observed_horizon_scn,
 	ClusterHeapFreezeXminCandidateBatchV1 *out);
 
+/* Prepare an independently qualified target batch atomically, preserving
+ * target order. All outputs remain unchanged on refusal, including an invalid
+ * later row, duplicate physical offset or ambiguous native conflict horizon.
+ * The caller supplies capacity for out_plans and independently qualifies the
+ * original identities and finite F/H bounds under the single-target contract.
+ * This performs no page/pin acquisition, mutation, WAL or admission. */
+extern bool cluster_heap_freeze_prepare_xmin_batch_v1(
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *current_fence,
+	const ClusterHeapFreezeXminTargetV1 *targets, uint16 target_count,
+	FullTransactionId freeze_limit_full, SCN horizon_scn,
+	struct HeapTupleFreeze *out_plans, uint16 out_capacity,
+	TransactionId *out_conflict_horizon);
+
 /*
  * Qualified xmin-only mutation using native FREEZE_PAGE WAL and synchronous
  * WAL flush.  The caller owns the pin, exclusive content lock, ACTIVE PCM-X
