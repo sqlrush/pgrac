@@ -11,7 +11,8 @@ cluster_undo_recovery_cold_single_source_v1(const ClusterWalSourceRef *source,
 	ClusterWalSourceRef observed;
 	XLogRecPtr redo;
 	UT_ASSERT(!inputs_pin_held && inputs_pin_refuse);
-	if (execution_pending_guard_fault == 3 && prefix_base_reads > 0)
+	if (execution_pending_guard_fault == 4
+		|| (execution_pending_guard_fault == 3 && prefix_base_reads > 0))
 		ereport(ERROR, (errmsg("injected execution single-source ERROR")));
 	return execution_pending_guard_fault != 1
 		   && !(execution_pending_guard_fault == 2 && prefix_base_reads > 0) && serial != 0
@@ -338,4 +339,250 @@ UT_TEST(test_custody_source_alias_refusal_keeps_handle_usable)
 	UT_ASSERT_EQ(prefix_base_reads, 1);
 	cluster_relmap_recovery_handle_release_v1(&handle);
 	execution_build_done();
+}
+
+UT_TEST(test_execution_build_source_publishes_same_original_provenance)
+{
+	for (unsigned sample = 0; sample < 3; sample++) {
+		ClusterRelmapRetentionDirectory directory = { 0 };
+		ClusterRelmapRecoverySourceObservationV1 source = { 0 };
+		custody_era_offset = sample == 1 ? UINT64CONST(1) << 32 : 0;
+		execution_build_setup(29, sample == 2);
+		execution_pending_guard_fault = 0;
+		UT_ASSERT(
+			cluster_relmap_recovery_retention_build_start_cold_source_v1(0, &directory, &source));
+		UT_ASSERT_EQ(directory.state, CLUSTER_RELMAP_RETENTION_BUILDING);
+		UT_ASSERT_EQ(directory.generation, source.scope_serial);
+		UT_ASSERT_EQ(source.scope_serial, custody_scope);
+		UT_ASSERT_EQ(directory.last_issued, sample == 1 ? (UINT64CONST(1) << 32) + 99 : 99);
+		UT_ASSERT_EQ(memcmp(&source.checkpoint, &execution_root, sizeof(execution_root)), 0);
+		UT_ASSERT_EQ(memcmp(&source.source, &prefix_base_expected.source, sizeof(source.source)),
+					 0);
+		UT_ASSERT_EQ(source.native_redo, prefix_base_expected.native_redo);
+		UT_ASSERT(execution_records >= (sample == 2 ? 1 : 3) && !inputs_pin_held
+				  && test_actual_cf == NoLock);
+		UT_ASSERT_EQ(prefix_base_reads + custody_terminal_calls, 0);
+		execution_build_done();
+	}
+}
+
+UT_TEST(test_execution_build_source_refusal_and_error_keep_both_outputs_atomic)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		ClusterRelmapRetentionDirectory directory = { 0 }, zero_directory = { 0 };
+		ClusterRelmapRecoverySourceObservationV1 source = { 0 }, zero_source = { 0 };
+		volatile bool threw = false;
+		execution_build_setup(29, false);
+		execution_pending_guard_fault = fault == 1 ? 1 : fault == 2 ? 4 : 0;
+		if (fault == 3)
+			execution_fault = 2;
+		if (fault == 4)
+			execution_fault = 3;
+		if (fault == 5)
+			execution_fault = 5;
+		test_capture_error_level = true;
+		PG_TRY();
+		{
+			UT_ASSERT_EQ(cluster_relmap_recovery_retention_build_start_cold_source_v1(0, &directory,
+																					  &source),
+						 fault == 0);
+		}
+		PG_CATCH();
+		{
+			threw = true;
+		}
+		PG_END_TRY();
+		test_capture_error_level = false;
+		UT_ASSERT_EQ(threw, fault == 2 || fault == 4);
+		if (fault != 0) {
+			UT_ASSERT_EQ(memcmp(&directory, &zero_directory, sizeof(directory)), 0);
+			UT_ASSERT_EQ(memcmp(&source, &zero_source, sizeof(source)), 0);
+		}
+		UT_ASSERT(execution_visits == 1 && !inputs_pin_held && custody_scope == 7);
+		execution_pending_guard_fault = 0;
+		execution_build_done();
+	}
+}
+
+UT_TEST(test_execution_build_source_rejects_nonzero_overlap_and_missing_outputs)
+{
+	ClusterRelmapRetentionDirectory directory = { 0 }, saved_directory;
+	ClusterRelmapRecoverySourceObservationV1 source = { 0 }, saved_source;
+	execution_build_setup(29, false);
+	execution_pending_guard_fault = 0;
+	for (unsigned fault = 0; fault < 4; fault++) {
+		memset(&directory, 0, sizeof(directory));
+		memset(&source, 0, sizeof(source));
+		if (fault == 0)
+			directory.pins[63].wal_end = 1;
+		if (fault == 1)
+			source.scope_serial = 1;
+		saved_directory = directory;
+		saved_source = source;
+		UT_ASSERT(!cluster_relmap_recovery_retention_build_start_cold_source_v1(
+			0, fault == 2 ? NULL : &directory, fault == 3 ? NULL : &source));
+		UT_ASSERT_EQ(memcmp(&directory, &saved_directory, sizeof(directory)), 0);
+		UT_ASSERT_EQ(memcmp(&source, &saved_source, sizeof(source)), 0);
+	}
+	memset(&directory, 0, sizeof(directory));
+	UT_ASSERT(!cluster_relmap_recovery_retention_build_start_cold_source_v1(
+		0, &directory, (void *)((char *)&directory + sizeof(directory) - 1)));
+	UT_ASSERT_EQ(execution_visits, 0);
+	memset(&source, 0, sizeof(source));
+	UT_ASSERT(cluster_relmap_recovery_retention_build_start_cold_source_v1(0, &directory, &source));
+	execution_build_done();
+}
+
+/* Original storage opener is a controlled leaf in this WAL/owner fixture;
+ * the separate recovery-root unit executes its actual POSIX/sentinel body. */
+static unsigned execution_root_fault, execution_root_opens;
+static int execution_root_fd = -1;
+int
+cluster_shared_fs_recovery_root_open_v1(const uint8 expected_uuid[16])
+{
+	UT_ASSERT_EQ(memcmp(expected_uuid, execution_root.identity.storage_uuid, 16), 0);
+	execution_root_opens++;
+	if (execution_root_fault == 1)
+		return -1;
+	if (execution_root_fault == 2)
+		ereport(ERROR, (errmsg("injected storage-open ERROR")));
+	execution_root_fd = OpenTransientFile(test_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (execution_root_fault == 3)
+		custody_scope++;
+	if (execution_root_fault == 4)
+		execution_pending_guard_fault = 1;
+	if (execution_root_fault == 5)
+		execution_pending_guard_fault = 4;
+	if (execution_root_fault == 6)
+		relmap_root_merger = false;
+	if (execution_root_fault == 7)
+		relmap_root_namespace_x = false;
+	if (execution_root_fault == 8)
+		cluster_shared_catalog = false;
+	if (execution_root_fault == 9)
+		MyBackendType = B_BG_WORKER;
+	if (execution_root_fault == 10)
+		inputs_native_recovery = false;
+	if (execution_root_fault == 11)
+		CritSectionCount = 1;
+	if (execution_root_fault == 12)
+		v2_checkpoint_root_race();
+	return execution_root_fd;
+}
+
+static ClusterRelmapRecoverySourceObservationV1
+execution_root_setup(void)
+{
+	ClusterRelmapRecoverySourceObservationV1 source = { 0 };
+	ClusterRelmapRetentionDirectory directory = { 0 };
+	execution_build_setup(29, false);
+	execution_pending_guard_fault = 0;
+	UT_ASSERT(cluster_relmap_recovery_retention_build_start_cold_source_v1(0, &directory, &source));
+	execution_root_fault = execution_root_opens = 0;
+	execution_root_fd = -1;
+	relmap_root_merger = relmap_root_namespace_x = cluster_shared_catalog = true;
+	return source;
+}
+
+static void
+execution_root_done(void)
+{
+	execution_pending_guard_fault = 0;
+	relmap_root_merger = relmap_root_namespace_x = cluster_shared_catalog = false;
+	execution_build_done();
+}
+
+UT_TEST(test_execution_root_fd_original_source_and_owner)
+{
+	ClusterRelmapRecoverySourceObservationV1 source = execution_root_setup(), before = source;
+	int fd = cluster_relmap_recovery_root_open_cold_v1(&source);
+	UT_ASSERT(fd >= 0 && fd == execution_root_fd);
+	if (fd >= 0) {
+		UT_ASSERT_EQ(fcntl(fd, F_GETFL) & O_ACCMODE, O_RDONLY);
+		UT_ASSERT(fcntl(fd, F_GETFD) & FD_CLOEXEC);
+		UT_ASSERT_EQ(CloseTransientFile(fd), 0);
+	}
+	UT_ASSERT_EQ(execution_root_opens, 1);
+	UT_ASSERT_EQ(memcmp(&source, &before, sizeof(source)), 0);
+	UT_ASSERT(!inputs_pin_held && custody_scope == 7 && prefix_base_reads == 0);
+	execution_root_done();
+}
+
+UT_TEST(test_execution_root_fd_missing_initial_gates_does_no_storage_io)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		ClusterRelmapRecoverySourceObservationV1 source = execution_root_setup();
+		int fd;
+		if (fault == 1)
+			relmap_root_merger = false;
+		if (fault == 2)
+			relmap_root_namespace_x = false;
+		if (fault == 3)
+			cluster_shared_catalog = false;
+		if (fault == 4)
+			MyBackendType = B_BG_WORKER;
+		if (fault == 5)
+			inputs_native_recovery = false;
+		if (fault == 6)
+			CritSectionCount = 1;
+		fd = cluster_relmap_recovery_root_open_cold_v1(&source);
+		UT_ASSERT_EQ(fd >= 0, fault == 0);
+		UT_ASSERT_EQ(execution_root_opens, fault == 0 ? 1 : 0);
+		if (fd >= 0)
+			UT_ASSERT_EQ(CloseTransientFile(fd), 0);
+		execution_root_done();
+	}
+}
+
+UT_TEST(test_execution_root_fd_post_io_drift_or_error_closes_only_new_fd)
+{
+	for (unsigned fault = 0; fault <= 12; fault++) {
+		ClusterRelmapRecoverySourceObservationV1 source = execution_root_setup(), before = source;
+		volatile bool threw = false;
+		volatile int fd = -1;
+		execution_root_fault = fault;
+		test_capture_error_level = true;
+		PG_TRY();
+		{
+			fd = cluster_relmap_recovery_root_open_cold_v1(&source);
+		}
+		PG_CATCH();
+		{
+			threw = true;
+		}
+		PG_END_TRY();
+		test_capture_error_level = false;
+		UT_ASSERT_EQ(threw, fault == 2 || fault == 5);
+		UT_ASSERT_EQ(fd >= 0, fault == 0);
+		UT_ASSERT_EQ(execution_root_opens, 1);
+		if (fd >= 0)
+			UT_ASSERT_EQ(CloseTransientFile(fd), 0);
+		if (execution_root_fd >= 0)
+			UT_ASSERT(fcntl(execution_root_fd, F_GETFD) < 0 && errno == EBADF);
+		UT_ASSERT_EQ(memcmp(&source, &before, sizeof(source)), 0);
+		UT_ASSERT(!inputs_pin_held && prefix_base_reads == 0);
+		execution_root_done();
+	}
+}
+
+UT_TEST(test_execution_root_fd_invalid_provenance_cannot_open_storage)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		ClusterRelmapRecoverySourceObservationV1 source = execution_root_setup();
+		int fd;
+		if (fault == 1)
+			source.scope_serial++;
+		if (fault == 2)
+			source.checkpoint.root_publish_seq++;
+		if (fault == 3)
+			source.native_redo++;
+		if (fault == 4)
+			source.source.claim.identity.storage_uuid[0]++;
+		fd = cluster_relmap_recovery_root_open_cold_v1(fault == 5 ? NULL : &source);
+		UT_ASSERT_EQ(fd >= 0, fault == 0);
+		UT_ASSERT_EQ(execution_root_opens, fault == 0 ? 1 : 0);
+		if (fd >= 0)
+			UT_ASSERT_EQ(CloseTransientFile(fd), 0);
+		execution_root_done();
+	}
 }

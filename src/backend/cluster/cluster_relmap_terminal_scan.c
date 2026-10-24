@@ -8,13 +8,19 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "cluster/cluster_recovery_record_hash.h"
+#include "cluster/cluster_recovery_wal_targets.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_recovery_merge.h"
+#include "cluster/cluster_relmap_lock.h"
 #include "cluster/cluster_relmap_recovery.h"
 #include "cluster/cluster_relmap_owner.h"
 #include "cluster/cluster_relmap_retention.h"
 #include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_undo_recovery.h"
+#include "cluster/storage/cluster_shared_fs.h"
 #include "miscadmin.h"
 #include "replication/origin.h"
+#include "storage/fd.h"
 
 struct ClusterRelmapTerminalScanV1 {
 	pid_t pid;
@@ -695,19 +701,24 @@ retention_execution_checkpoint_visit(const ClusterWalRecoveryCheckpointV1 *check
 	return work->serial == serial && retention_checkpoint_visit(reader, &work->input);
 }
 
-bool
-cluster_relmap_recovery_retention_build_start_cold_v1(uint16 origin,
-													  ClusterRelmapRetentionDirectory *out)
+static bool
+retention_build_start_cold(uint16 origin, ClusterRelmapRetentionDirectory *out,
+						   ClusterRelmapRecoverySourceObservationV1 *source)
 {
 	RelmapExecutionCheckpointInput work = { 0 };
 	ClusterRelmapRetentionDirectory directory = { 0 };
+	ClusterRelmapRecoverySourceObservationV1 observed = { 0 };
 
 	if (out == NULL || origin >= 128 || MyBackendType != B_STARTUP || !RecoveryInProgress()
-		|| CritSectionCount != 0)
+		|| CritSectionCount != 0 || recovery_overlap(out, sizeof(*out), source, sizeof(*source)))
 		return false;
 	for (size_t i = 0; i < sizeof(*out); i++)
 		if (((const unsigned char *)out)[i] != 0)
 			return false;
+	if (source != NULL)
+		for (size_t i = 0; i < sizeof(*source); i++)
+			if (((const unsigned char *)source)[i] != 0)
+				return false;
 	work.origin = origin;
 	if (!cluster_undo_recovery_cold_checkpoint_visit_v1(origin,
 														retention_execution_checkpoint_visit, &work)
@@ -720,8 +731,285 @@ cluster_relmap_recovery_retention_build_start_cold_v1(uint16 origin,
 			   work.input.window.native_floor, work.input.window.last_issued)
 			   != CLUSTER_RELMAP_RETENTION_OK)
 		return false;
+	if (source != NULL) {
+		observed.source = work.input.selected.source;
+		observed.checkpoint = work.input.selected.checkpoint;
+		observed.native_redo = work.input.selected.native_redo;
+		observed.scope_serial = work.serial;
+		if (!cluster_undo_recovery_cold_single_source_v1(
+				&observed.source, &observed.checkpoint, observed.native_redo, observed.scope_serial)
+			|| MyBackendType != B_STARTUP || !RecoveryInProgress() || CritSectionCount != 0)
+			return false;
+	}
+	/* Both carriers are private until these final, non-fallible stores. */
 	*out = directory;
+	if (source != NULL)
+		*source = observed;
 	return true;
+}
+
+bool
+cluster_relmap_recovery_retention_build_start_cold_v1(uint16 origin,
+													  ClusterRelmapRetentionDirectory *out)
+{
+	return retention_build_start_cold(origin, out, NULL);
+}
+
+bool
+cluster_relmap_recovery_retention_build_start_cold_source_v1(
+	uint16 origin, ClusterRelmapRetentionDirectory *directory,
+	ClusterRelmapRecoverySourceObservationV1 *source)
+{
+	return source != NULL && retention_build_start_cold(origin, directory, source);
+}
+
+static bool
+recovery_root_owner_current(const ClusterRelmapRecoverySourceObservationV1 *source)
+{
+	return MyBackendType == B_STARTUP && RecoveryInProgress() && CritSectionCount == 0
+		   && cluster_shared_catalog && cluster_recovery_merge_claim_is_held()
+		   && cluster_relmap_authority_x_held()
+		   && cluster_undo_recovery_cold_single_source_v1(&source->source, &source->checkpoint,
+														  source->native_redo, source->scope_serial)
+		   && MyBackendType == B_STARTUP && RecoveryInProgress() && CritSectionCount == 0
+		   && cluster_shared_catalog && cluster_recovery_merge_claim_is_held()
+		   && cluster_relmap_authority_x_held();
+}
+
+int
+cluster_relmap_recovery_root_open_cold_v1(const ClusterRelmapRecoverySourceObservationV1 *source)
+{
+	ClusterRelmapRecoverySourceObservationV1 selected;
+	int volatile fd = -1;
+	volatile bool accepted = false;
+
+	if (source == NULL)
+		return -1;
+	selected = *source;
+	PG_TRY();
+	{
+		if (recovery_root_owner_current(&selected)) {
+			fd = cluster_shared_fs_recovery_root_open_v1(
+				selected.source.claim.identity.storage_uuid);
+			accepted = fd >= 0 && memcmp(source, &selected, sizeof(selected)) == 0
+					   && recovery_root_owner_current(&selected)
+					   && memcmp(source, &selected, sizeof(selected)) == 0;
+		}
+	}
+	PG_FINALLY();
+	{
+		if (!accepted && fd >= 0)
+			(void)CloseTransientFile(fd);
+	}
+	PG_END_TRY();
+	return accepted ? fd : -1;
+}
+
+typedef struct RelmapExecutionRootTargets {
+	ClusterRecoveryRootSet *roots;
+	ClusterRelmapRecoverySourceObservationV1 selected;
+	const ClusterRelmapRecoverySourceObservationV1 *borrowed;
+	RfContributorStreamCutV1 cut;
+	size_t payload_budget;
+	ClusterRelmapRecoveryRootTargetsV1 counts;
+	RelmapRetentionCheckpointInput checkpoint_input;
+} RelmapExecutionRootTargets;
+
+static bool
+recovery_root_targets_context(void)
+{
+	return MyBackendType == B_STARTUP && RecoveryInProgress() && CritSectionCount == 0
+		   && cluster_shared_catalog && cluster_recovery_merge_claim_is_held()
+		   && cluster_relmap_authority_x_held();
+}
+
+static bool
+recovery_root_targets_add(uint64 *total, uint32 amount)
+{
+	if (*total > UINT64_MAX - amount)
+		return false;
+	*total += amount;
+	return true;
+}
+
+static bool
+recovery_root_targets_visit(const ClusterWalRecoveryCheckpointV1 *checkpoint,
+							const ClusterControlRootSnapshot *root, uint64 serial,
+							XLogReaderState *reader, void *arg)
+{
+	RelmapExecutionRootTargets *work = arg;
+	const ClusterRelmapRecoverySourceObservationV1 *selected = &work->selected;
+	ClusterWalInputV1 input = { 0 };
+	ClusterRecoveryWalTargetsDiag diag;
+
+	CHECK_FOR_INTERRUPTS();
+	if (serial != selected->scope_serial || !retention_execution_input_set(&input, checkpoint, root)
+		|| memcmp(&checkpoint->source, &selected->source, sizeof(selected->source)) != 0
+		|| memcmp(root, &selected->checkpoint, sizeof(*root)) != 0
+		|| checkpoint->checkpoint.redo != selected->native_redo
+		|| memcmp(work->borrowed, selected, sizeof(*selected)) != 0 || reader == NULL
+		|| reader->record == NULL || reader->cluster_record_crc_failed
+		|| reader->cluster_expected_thread_id != selected->source.claim.identity.origin_thread_id
+		|| work->counts.records == UINT64_MAX || !recovery_root_targets_context())
+		return false;
+	if (work->counts.records == 0)
+		work->checkpoint_input.selected = input;
+	else if (memcmp(&input.native_checkpoint, &work->checkpoint_input.selected.native_checkpoint,
+					sizeof(input.native_checkpoint))
+				 != 0
+			 || memcmp(input.native_window, work->checkpoint_input.selected.native_window,
+					   sizeof(input.native_window))
+					!= 0)
+		return false;
+	/* Match the original checkpoint's exact WAL payload/window as well as
+	 * its shape. All earlier target additions remain provisional. */
+	if (!retention_checkpoint_visit(reader, &work->checkpoint_input)
+		|| !cluster_recovery_wal_targets_collect(work->roots, reader, &selected->source, &work->cut,
+												 work->payload_budget, &diag)
+		|| !recovery_root_targets_context()
+		|| memcmp(work->borrowed, selected, sizeof(*selected)) != 0)
+		return false;
+	if (!recovery_root_targets_add(&work->counts.page_targets, diag.page_targets)
+		|| !recovery_root_targets_add(&work->counts.rebuildable_targets, diag.rebuildable_targets)
+		|| !recovery_root_targets_add(&work->counts.structural_effects, diag.structural_effects)
+		|| !recovery_root_targets_add(&work->counts.undo_targets, diag.undo_targets)
+		|| !recovery_root_targets_add(&work->counts.native_effects, diag.native_effects)
+		|| !recovery_root_targets_add(&work->counts.other_native_effects, diag.other_native_effects)
+		|| !recovery_root_targets_add(&work->counts.unowned_records, diag.unowned_records))
+		return false;
+	work->counts.records++;
+	return true;
+}
+
+bool
+cluster_relmap_recovery_root_targets_cold_v1(ClusterRecoveryRootSet *roots,
+											 const ClusterRelmapRecoverySourceObservationV1 *source,
+											 size_t payload_budget,
+											 ClusterRelmapRecoveryRootTargetsV1 *out)
+{
+	RelmapExecutionRootTargets work = { 0 };
+	volatile bool entered = false, accepted = false;
+
+	if (out == NULL || recovery_overlap(out, sizeof(*out), source, sizeof(*source))
+		|| recovery_overlap(out, sizeof(*out), roots, 1))
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (source == NULL || payload_budget == 0)
+		return false;
+	work.selected = *source;
+	work.borrowed = source;
+	work.roots = roots;
+	work.payload_budget = payload_budget;
+	work.cut.failed_thread = source->source.claim.identity.origin_thread_id;
+	work.cut.timeline_id = source->source.timeline;
+	work.cut.origin_owner_incarnation = source->source.claim.identity.origin_owner_incarnation;
+	work.cut.scan_begin_inclusive = source->checkpoint.checkpoint_lower_lsn;
+	work.cut.scan_end_exclusive = source->checkpoint.validated_tail_lsn_exclusive;
+	work.cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+	PG_TRY();
+	{
+		if (cluster_recovery_root_set_targets_match(
+				roots, work.selected.source.claim.identity.system_identifier,
+				work.selected.source.claim.database_incarnation,
+				work.selected.source.claim.identity.storage_uuid)
+			&& recovery_root_owner_current(&work.selected)
+			&& memcmp(source, &work.selected, sizeof(*source)) == 0) {
+			entered = true;
+			if (cluster_undo_recovery_cold_checkpoint_visit_v1(
+					work.selected.source.claim.identity.origin_node_id, recovery_root_targets_visit,
+					&work)
+				&& work.counts.records != 0 && work.checkpoint_input.checkpoint_seen
+				&& work.checkpoint_input.last_end == work.cut.scan_end_exclusive
+				&& recovery_root_owner_current(&work.selected)
+				&& memcmp(source, &work.selected, sizeof(*source)) == 0
+				&& cluster_recovery_root_set_targets_match(
+					roots, work.selected.source.claim.identity.system_identifier,
+					work.selected.source.claim.database_incarnation,
+					work.selected.source.claim.identity.storage_uuid)) {
+				*out = work.counts;
+				accepted = true;
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		if (entered && !accepted)
+			cluster_recovery_root_set_invalidate(roots);
+	}
+	PG_END_TRY();
+	return accepted;
+}
+
+bool
+cluster_relmap_recovery_root_observe_cold_v1(const ClusterRelmapRecoverySourceObservationV1 *source,
+											 size_t memory_budget, size_t payload_budget,
+											 ClusterRelmapRecoveryRootObservationV1 *out)
+{
+	ClusterRelmapRecoverySourceObservationV1 selected;
+	ClusterRecoveryRootSet *volatile roots = NULL;
+	int volatile fd = -1;
+	volatile bool accepted = false;
+
+	if (out == NULL || source == NULL || memory_budget == 0 || payload_budget == 0
+		|| recovery_overlap(out, sizeof(*out), source, sizeof(*source)))
+		return false;
+	for (size_t i = 0; i < sizeof(*out); i++)
+		if (((const unsigned char *)out)[i] != 0)
+			return false;
+	selected = *source;
+	PG_TRY();
+	{
+		do {
+			ClusterRelmapRecoveryRootObservationV1 observed = { 0 };
+			ClusterRecoveryRootsEvent event;
+			ClusterRecoveryRootsResult result;
+
+			fd = cluster_relmap_recovery_root_open_cold_v1(&selected);
+			if (fd < 0 || memcmp(source, &selected, sizeof(selected)) != 0)
+				break;
+			result = cluster_recovery_root_set_begin(
+				fd, selected.source.claim.identity.system_identifier,
+				selected.source.claim.database_incarnation,
+				selected.source.claim.identity.storage_uuid, memory_budget,
+				(ClusterRecoveryRootSet **)&roots);
+			if (result != CLUSTER_RECOVERY_ROOTS_MORE
+				|| !cluster_relmap_recovery_root_targets_cold_v1(
+					(ClusterRecoveryRootSet *)roots, &selected, payload_budget, &observed.targets))
+				break;
+			/* Complete target union precedes the first physical step. The
+			 * original source owner brackets both full byte observations. */
+			while (result < CLUSTER_RECOVERY_ROOTS_OBSERVED) {
+				CHECK_FOR_INTERRUPTS();
+				if (!recovery_root_targets_context()
+					|| memcmp(source, &selected, sizeof(selected)) != 0)
+					break;
+				result = cluster_recovery_root_set_step((ClusterRecoveryRootSet *)roots, &event);
+			}
+			if (result != CLUSTER_RECOVERY_ROOTS_OBSERVED
+				|| !cluster_recovery_root_set_storage_matches(
+					(ClusterRecoveryRootSet *)roots,
+					selected.source.claim.identity.system_identifier,
+					selected.source.claim.database_incarnation,
+					selected.source.claim.identity.storage_uuid)
+				|| !recovery_root_owner_current(&selected)
+				|| memcmp(source, &selected, sizeof(selected)) != 0)
+				break;
+			observed.roots = (ClusterRecoveryRootSet *)roots;
+			observed.root_fd = fd;
+			*out = observed;
+			accepted = true;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		if (!accepted) {
+			cluster_recovery_root_set_destroy((ClusterRecoveryRootSet *)roots);
+			if (fd >= 0)
+				(void)CloseTransientFile(fd);
+		}
+	}
+	PG_END_TRY();
+	return accepted;
 }
 
 static bool

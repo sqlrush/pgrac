@@ -92,6 +92,16 @@ RegisterSyncRequest(const FileTag *tag pg_attribute_unused(),
 char *cluster_shared_data_dir = NULL;
 char *cluster_shared_storage_uuid = NULL;
 int cluster_node_id = 0;
+int cluster_shared_storage_backend = CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
 bool enableFsync = true;
 bool cluster_shared_catalog = false;
 bool IsUnderPostmaster = false;

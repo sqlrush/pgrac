@@ -4,6 +4,16 @@
 #include "cluster/cluster_ko.h"
 #include "storage/fd.h"
 
+/* No original work can be acquired here, so its trace boundary is unexpected. */
+void
+cluster_ko_drop_work_note_v1(ClusterKoDropWorkV2 *work pg_attribute_unused(),
+							  uint32 phase pg_attribute_unused(), uint32 step pg_attribute_unused(),
+							  ForkNumber fork pg_attribute_unused(), bool io_attempted pg_attribute_unused(),
+							  int io_error pg_attribute_unused())
+{
+	abort();
+}
+
 bool
 cluster_ko_shared_drop_work_begin_v2(uint32 *cursor pg_attribute_unused(),
 									 Size size pg_attribute_unused(),

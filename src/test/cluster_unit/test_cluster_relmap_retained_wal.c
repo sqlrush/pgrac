@@ -26,9 +26,25 @@ int control_fixture_main(int argc, char **argv);
 #include "cluster/cluster_relmap_terminal_scan.h"
 #include "cluster/cluster_relmap_retention_census.h"
 #include "cluster/cluster_undo_recovery.h"
+#include "cluster/cluster_recovery_merge.h"
+#include "cluster/cluster_relmap_lock.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
 #include "utils/relmapper.h"
+
+/* This retained-WAL fixture grants no physical execution census ownership. */
+bool cluster_shared_catalog;
+static bool relmap_root_merger, relmap_root_namespace_x;
+bool
+cluster_recovery_merge_claim_is_held(void)
+{
+	return relmap_root_merger;
+}
+bool
+cluster_relmap_authority_x_held(void)
+{
+	return relmap_root_namespace_x;
+}
 
 static ClusterWalSourceRef relmap_test_source[2];
 static WalTestRecord relmap_test_record[2];
@@ -3356,6 +3372,8 @@ UT_TEST(test_terminal_read_native_error_keeps_output_zero_and_custody_dead)
 
 #include "test_cluster_relmap_origin_build.inc"
 #include "test_cluster_relmap_execution_custody.inc"
+#include "test_cluster_relmap_execution_targets.inc"
+#include "test_cluster_relmap_execution_observe.inc"
 
 int
 main(int argc, char **argv)
@@ -3364,7 +3382,22 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(83);
+	UT_PLAN(105);
+	UT_RUN(test_execution_observe_complete_wal_and_physical_union);
+	UT_RUN(test_execution_observe_missing_gates_and_invalid_source);
+	UT_RUN(test_execution_observe_fresh_output_aliases_and_budgets);
+	UT_RUN(test_execution_observe_storage_refusal_and_error_cleanup);
+	UT_RUN(test_execution_observe_wal_refusal_and_error_cleanup);
+	UT_RUN(test_execution_observe_physical_read_and_owner_drift_cleanup);
+	UT_RUN(test_execution_observe_physical_change_never_publishes);
+	UT_RUN(test_execution_observe_feeds_original_cold_census);
+	UT_RUN(test_execution_targets_preserve_real_wal_missing_and_short_files);
+	UT_RUN(test_execution_targets_missing_initial_gates_leave_root_unchanged);
+	UT_RUN(test_execution_targets_invalid_source_leaves_unstarted_root);
+	UT_RUN(test_execution_targets_late_visit_refusal_or_error_revokes_partial_root);
+	UT_RUN(test_execution_targets_payload_refusal_preserves_original_owner);
+	UT_RUN(test_execution_targets_late_context_or_input_drift_revokes_root);
+	UT_RUN(test_execution_targets_alias_and_started_root_refuse_safely);
 	UT_RUN(test_custody_source_observes_original_tuple_without_native_page_io);
 	UT_RUN(test_custody_source_refusal_and_error_are_sticky);
 	UT_RUN(test_custody_source_alias_refusal_keeps_handle_usable);
@@ -3375,6 +3408,13 @@ main(int argc, char **argv)
 	UT_RUN(test_execution_pending_drift_is_sticky_and_keeps_original_owner);
 	UT_RUN(test_execution_pending_error_releases_only_local_custody);
 	UT_RUN(test_execution_pending_alias_refusal_preserves_inputs);
+	UT_RUN(test_execution_root_fd_original_source_and_owner);
+	UT_RUN(test_execution_root_fd_missing_initial_gates_does_no_storage_io);
+	UT_RUN(test_execution_root_fd_post_io_drift_or_error_closes_only_new_fd);
+	UT_RUN(test_execution_root_fd_invalid_provenance_cannot_open_storage);
+	UT_RUN(test_execution_build_source_publishes_same_original_provenance);
+	UT_RUN(test_execution_build_source_refusal_and_error_keep_both_outputs_atomic);
+	UT_RUN(test_execution_build_source_rejects_nonzero_overlap_and_missing_outputs);
 	UT_RUN(test_execution_build_uses_original_inputs_without_census_read_scope);
 	UT_RUN(test_execution_build_refuses_wrong_role_and_original_owner);
 	UT_RUN(test_execution_build_validates_checkpoint_window_and_complete_suffix);

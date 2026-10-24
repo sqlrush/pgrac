@@ -6,6 +6,7 @@
 static ClusterRelmapRecoverySourceObservationV1 census_cold_selected;
 static unsigned census_cold_fault, census_cold_reads, census_cold_checks;
 static unsigned census_cold_getter_fault_after = 1;
+static unsigned census_cold_check_error_after;
 
 static void
 census_cold_late_pin(void *buffer, size_t length, off_t offset)
@@ -63,6 +64,22 @@ cluster_relmap_recovery_prepare_cold_v1(const ClusterRelmapV2Namespace *identity
 		f->origin[1].last_issued++;
 	if (census_cold_fault == 19)
 		namespace_read_transform = census_cold_late_pin;
+	if (census_native_prepares >= 2) {
+		if (census_cold_fault == 30)
+			census_cold_selected.scope_serial++;
+		if (census_cold_fault == 31)
+			census_cold_selected.checkpoint.root_publish_seq++;
+		if (census_cold_fault == 32)
+			census_cold_selected.native_redo++;
+		if (census_cold_fault == 33)
+			root_file(f->fd, "unrelated", "warm", 4);
+		if (census_cold_fault == 34)
+			f->origin[0].pins[CLUSTER_RELMAP_RETENTION_CAPACITY - 1].wal_end++;
+		if (census_cold_fault == 35)
+			census_merger_held = false;
+		if (census_cold_fault == 36)
+			siglongjmp(*PG_exception_stack, 1);
+	}
 	return true;
 }
 
@@ -71,7 +88,11 @@ cluster_relmap_recovery_handle_source_v1(ClusterRelmapRecoveryHandle *handle,
 										 ClusterRelmapRecoverySourceObservationV1 *out)
 {
 	unsigned fault;
-	UT_ASSERT(handle == (void *)&census_native_handles[0] && census_native_handles[0].live);
+	bool live = false;
+	for (size_t i = 0; i < lengthof(census_native_handles); i++)
+		if (handle == (void *)&census_native_handles[i] && census_native_handles[i].live)
+			live = true;
+	UT_ASSERT(live);
 	UT_ASSERT(out != NULL);
 	memset(out, 0, sizeof(*out));
 	census_cold_reads++;
@@ -102,7 +123,9 @@ cluster_undo_recovery_cold_single_source_v1(const ClusterWalSourceRef *source,
 											XLogRecPtr redo, uint64 serial)
 {
 	census_cold_checks++;
-	if (census_cold_fault == 8)
+	if (census_cold_fault == 8
+		|| (census_cold_check_error_after != 0
+			&& census_cold_checks >= census_cold_check_error_after))
 		siglongjmp(*PG_exception_stack, 1);
 	return census_native_scope_current
 		   && memcmp(source, &census_cold_selected.source, sizeof(*source)) == 0
@@ -114,6 +137,7 @@ cluster_undo_recovery_cold_single_source_v1(const ClusterWalSourceRef *source,
 static void
 census_cold_reset(void)
 {
+	census_cold_check_error_after = 0;
 	census_cold_fault = census_cold_reads = census_cold_checks = 0;
 	census_cold_getter_fault_after = 1;
 	namespace_read_transform = NULL;

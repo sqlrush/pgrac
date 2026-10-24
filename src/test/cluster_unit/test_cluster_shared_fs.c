@@ -131,6 +131,15 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 }
 
 /* ereport machinery (the fast-path stubs are sufficient -- never invoked). */
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+void
+pg_re_throw(void)
+{
+	abort();
+}
+
 bool
 errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
 {

@@ -10,6 +10,7 @@
 #include "cluster/cluster_wal_inputs.h"
 typedef struct ClusterRelmapTerminalScanV1 ClusterRelmapTerminalScanV1;
 struct ClusterRelmapRetentionDirectory;
+struct ClusterRelmapRecoverySourceObservationV1;
 /* Dormant Startup-only checkpoint input to a NEW, entirely zeroed and
  * exclusively owned directory. Select one physical checkpoint for origin;
  * require the original cold scope and its unchanged serial, then validate
@@ -37,6 +38,64 @@ cluster_relmap_recovery_retention_build_start_v1(ClusterWalInputsV1 *inputs, uin
 extern bool
 cluster_relmap_recovery_retention_build_start_cold_v1(uint16 origin,
 													  struct ClusterRelmapRetentionDirectory *out);
+/* Same checkpoint projection, with its original source/full ROOT/redo/serial
+ * and the original single-source guard. Both outputs must be NEW, entirely
+ * zero, exclusive and disjoint; false/ERROR leaves both unchanged. Publication
+ * has no fallible work between the two assignments. This snapshot grants no
+ * additional native/history/lifetime/origin-set qualification or authority. */
+extern bool cluster_relmap_recovery_retention_build_start_cold_source_v1(
+	uint16 origin, struct ClusterRelmapRetentionDirectory *directory,
+	struct ClusterRelmapRecoverySourceObservationV1 *source);
+/* Dormant original cold execution owner only, Startup/recovery/no-CRIT with
+ * shared-catalog/sole-merger/namespace X. Authenticate the supplied original
+ * source/full ROOT/redo/nonreused serial before and after original storage
+ * namespace I/O. Return only a new tracked read-only directory fd, or -1;
+ * refusal/ERROR closes local fds, never original protections. It is a physical
+ * input, not isolation/native/lifetime/all-origin/ROOT authority. Retain the
+ * exact original owner/protections through all later ROOT/census use, destroy
+ * all dependent cursors and CloseTransientFile on every exit, including
+ * PG_FINALLY and before the original fd.c lifetime ends. No live caller. */
+extern int cluster_relmap_recovery_root_open_cold_v1(
+	const struct ClusterRelmapRecoverySourceObservationV1 *source);
+struct ClusterRecoveryRootSet;
+typedef struct ClusterRelmapRecoveryRootTargetsV1 {
+	uint64 records, page_targets, rebuildable_targets, structural_effects;
+	uint64 undo_targets, native_effects, other_native_effects, unowned_records;
+} ClusterRelmapRecoveryRootTargetsV1;
+/* Dormant original single-source execution owner: enumerate its complete
+ * retained WAL into an unstarted matching held-fd ROOT, before physical scan.
+ * Preserve missing/beyond-EOF targets and report unresolved non-file/unowned
+ * effects; these counts confer no semantic/native/isolation/completion proof.
+ * Original source/full ROOT/redo/serial and ownership bracket the visit.
+ * Missing initial gates/wrong ROOT stage leave ROOT unchanged; entered
+ * false/ERROR invalidates every partial target, never original pins/debt.
+ * Distinct refusal clears out; known source/ROOT-start overlap refuses
+ * unchanged. All storage is exclusive, original owner/cuts/protections/fd
+ * remain held through downstream use. No new scope/pin, apply or live caller. */
+extern bool cluster_relmap_recovery_root_targets_cold_v1(
+	struct ClusterRecoveryRootSet *roots,
+	const struct ClusterRelmapRecoverySourceObservationV1 *source, size_t payload_budget,
+	ClusterRelmapRecoveryRootTargetsV1 *out);
+typedef struct ClusterRelmapRecoveryRootObservationV1 {
+	struct ClusterRecoveryRootSet *roots;
+	int root_fd; /* Owned only when roots != NULL; the empty carrier is all zero. */
+	ClusterRelmapRecoveryRootTargetsV1 targets;
+} ClusterRelmapRecoveryRootObservationV1;
+/* Dormant original single-source owner: open its storage namespace, collect
+ * its complete WAL targets, then observe the entire physical union twice.
+ * out must be NEW, entirely zero, exclusive and disjoint from source. Any
+ * refusal/ERROR leaves it unchanged and destroys/closes only local inputs.
+ * Success transfers the new ROOT/fd custody, not original pins or authority.
+ * Destroy every dependent census/batch, then ROOT, then CloseTransientFile
+ * on every exit (including PG_FINALLY), before fd.c's native lifetime ends.
+ * Do not copy custody or reuse/rebind a nonempty carrier. Retain original
+ * source/owner/isolation/cuts/protections throughout every downstream use.
+ * OBSERVED and target counts remain provisional; complete origins, native,
+ * base, history and lifetime qualification still belong to the cold owner.
+ * No apply, COMPLETE, release, new scope/pin, activation or live caller. */
+extern bool cluster_relmap_recovery_root_observe_cold_v1(
+	const struct ClusterRelmapRecoverySourceObservationV1 *source, size_t memory_budget,
+	size_t payload_budget, ClusterRelmapRecoveryRootObservationV1 *out);
 typedef struct ClusterRelmapTerminalObservationV1 {
 	ClusterWalSourceRef source;
 	ClusterRelmapCheckpointWindow window;
