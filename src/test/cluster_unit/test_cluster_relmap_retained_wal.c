@@ -26,9 +26,24 @@ int control_fixture_main(int argc, char **argv);
 #include "cluster/cluster_relmap_terminal_scan.h"
 #include "cluster/cluster_relmap_retention_census.h"
 #include "cluster/cluster_undo_recovery.h"
+#include "cluster/cluster_recovery_merge.h"
+#include "cluster/cluster_relmap_lock.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
 #include "utils/relmapper.h"
+
+/* This retained-WAL fixture grants no physical execution census ownership. */
+bool cluster_shared_catalog;
+bool
+cluster_recovery_merge_claim_is_held(void)
+{
+	return false;
+}
+bool
+cluster_relmap_authority_x_held(void)
+{
+	return false;
+}
 
 static ClusterWalSourceRef relmap_test_source[2];
 static WalTestRecord relmap_test_record[2];
@@ -3364,7 +3379,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(83);
+	UT_PLAN(86);
 	UT_RUN(test_custody_source_observes_original_tuple_without_native_page_io);
 	UT_RUN(test_custody_source_refusal_and_error_are_sticky);
 	UT_RUN(test_custody_source_alias_refusal_keeps_handle_usable);
@@ -3375,6 +3390,9 @@ main(int argc, char **argv)
 	UT_RUN(test_execution_pending_drift_is_sticky_and_keeps_original_owner);
 	UT_RUN(test_execution_pending_error_releases_only_local_custody);
 	UT_RUN(test_execution_pending_alias_refusal_preserves_inputs);
+	UT_RUN(test_execution_build_source_publishes_same_original_provenance);
+	UT_RUN(test_execution_build_source_refusal_and_error_keep_both_outputs_atomic);
+	UT_RUN(test_execution_build_source_rejects_nonzero_overlap_and_missing_outputs);
 	UT_RUN(test_execution_build_uses_original_inputs_without_census_read_scope);
 	UT_RUN(test_execution_build_refuses_wrong_role_and_original_owner);
 	UT_RUN(test_execution_build_validates_checkpoint_window_and_complete_suffix);

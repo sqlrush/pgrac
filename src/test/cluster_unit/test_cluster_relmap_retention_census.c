@@ -967,6 +967,14 @@ UT_TEST(test_root_rebuild_preserves_existing_proofs_and_exact_pins)
 }
 
 #ifndef RELMAP_CENSUS_FIXTURE_ONLY
+#include "miscadmin.h"
+volatile sig_atomic_t InterruptPending;
+void
+ProcessInterrupts(void)
+{
+	InterruptPending = false;
+	siglongjmp(*PG_exception_stack, 1);
+}
 #include "test_cluster_relmap_census_recovery.inc"
 #include "test_cluster_relmap_census_batch.inc"
 #include "test_cluster_relmap_census_cold.inc"
@@ -974,11 +982,18 @@ UT_TEST(test_root_rebuild_preserves_existing_proofs_and_exact_pins)
 #include "test_cluster_relmap_census_cold_reobserve.inc"
 #include "test_cluster_relmap_census_cold_restart.inc"
 #include "test_cluster_relmap_census_execution_batch.inc"
+#include "test_cluster_relmap_census_cold_initial.inc"
 
 int
 main(void)
 {
-	UT_PLAN(89);
+	UT_PLAN(95);
+	UT_RUN(test_census_initial_owner_inputs_restore_all_pending_without_old_directory);
+	UT_RUN(test_census_initial_entry_gates_budget_aliases_and_null_preserve_borrowed_inputs);
+	UT_RUN(test_census_initial_producer_refusal_metadata_and_error_revoke_only_observation);
+	UT_RUN(test_census_initial_full_root_io_and_post_io_original_checks_are_mandatory);
+	UT_RUN(test_census_initial_original_scope_is_rechecked_before_drained_and_on_reuse);
+	UT_RUN(test_census_initial_budget_and_interrupted_cleanup_never_release_original_owner);
 	UT_RUN(test_execution_batch_all_pending_then_one_fresh_census_keeps_old_debt);
 	UT_RUN(test_execution_batch_initial_gates_unsupported_and_empty_do_not_complete);
 	UT_RUN(test_execution_batch_late_native_source_or_root_failure_releases_every_handle);

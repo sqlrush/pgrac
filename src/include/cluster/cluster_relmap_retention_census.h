@@ -46,6 +46,27 @@ extern ClusterRelmapCensusResult cluster_relmap_retention_census_begin(
 	const uint8 storage_uuid[16], ClusterRelmapRetentionDirectory *const directories[],
 	size_t count, size_t memory_budget, ClusterRelmapRetentionCensus **out);
 
+/* Initial single-origin census from the original execution checkpoint/WAL
+ * producer, without caller-filled directory bounds. Borrow the original
+ * isolated OBSERVED ROOT, never a configured path. The caller still qualifies
+ * the complete single-origin set and all native/SIDE/history/base lifetimes;
+ * a larger cohort is unsupported. Original shared-catalog/sole-merger/namespace
+ * X ownership and original execution scope/pins/ROOT must outlive this cursor.
+ * Keep ROOT exclusive and destroy cursor before ROOT on every exit.
+ *
+ * Missing initial ownership/invalid origin/known ROOT-pointer alias refuses
+ * unchanged. Other distinct refusal clears *out; once entered, false/ERROR
+ * invalidates ROOT and frees only new local storage. Success owns its new
+ * directory/cursor, borrows ROOT, and rechecks original source/serial/ownership
+ * before DRAINED and later native preparation. A whole physical ROOT recheck
+ * follows producer I/O before initial publication. budget covers directory
+ * and cursor, not borrowed ROOT/native I/O. Fresh exclusive out must not
+ * overlap any borrowed storage. No COMPLETE, release, live caller or native
+ * qualification; all images remain provisional and directory stays BUILDING. */
+extern bool cluster_relmap_retention_census_begin_cold(ClusterRecoveryRootSet *roots, uint16 origin,
+													   size_t memory_budget,
+													   ClusterRelmapRetentionCensus **out);
+
 /* At most128 metadata candidates, one <=BLCKSZ original file read, or one
  * existing whole-ROOT recheck step. Require global/base and both exact v2
  * copies for global and every canonical physical base/db directory, including

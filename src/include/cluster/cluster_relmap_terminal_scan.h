@@ -10,6 +10,7 @@
 #include "cluster/cluster_wal_inputs.h"
 typedef struct ClusterRelmapTerminalScanV1 ClusterRelmapTerminalScanV1;
 struct ClusterRelmapRetentionDirectory;
+struct ClusterRelmapRecoverySourceObservationV1;
 /* Dormant Startup-only checkpoint input to a NEW, entirely zeroed and
  * exclusively owned directory. Select one physical checkpoint for origin;
  * require the original cold scope and its unchanged serial, then validate
@@ -37,6 +38,14 @@ cluster_relmap_recovery_retention_build_start_v1(ClusterWalInputsV1 *inputs, uin
 extern bool
 cluster_relmap_recovery_retention_build_start_cold_v1(uint16 origin,
 													  struct ClusterRelmapRetentionDirectory *out);
+/* Same checkpoint projection, with its original source/full ROOT/redo/serial
+ * and the original single-source guard. Both outputs must be NEW, entirely
+ * zero, exclusive and disjoint; false/ERROR leaves both unchanged. Publication
+ * has no fallible work between the two assignments. This snapshot grants no
+ * additional native/history/lifetime/origin-set qualification or authority. */
+extern bool cluster_relmap_recovery_retention_build_start_cold_source_v1(
+	uint16 origin, struct ClusterRelmapRetentionDirectory *directory,
+	struct ClusterRelmapRecoverySourceObservationV1 *source);
 typedef struct ClusterRelmapTerminalObservationV1 {
 	ClusterWalSourceRef source;
 	ClusterRelmapCheckpointWindow window;

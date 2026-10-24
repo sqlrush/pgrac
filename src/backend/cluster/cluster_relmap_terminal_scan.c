@@ -695,19 +695,24 @@ retention_execution_checkpoint_visit(const ClusterWalRecoveryCheckpointV1 *check
 	return work->serial == serial && retention_checkpoint_visit(reader, &work->input);
 }
 
-bool
-cluster_relmap_recovery_retention_build_start_cold_v1(uint16 origin,
-													  ClusterRelmapRetentionDirectory *out)
+static bool
+retention_build_start_cold(uint16 origin, ClusterRelmapRetentionDirectory *out,
+						   ClusterRelmapRecoverySourceObservationV1 *source)
 {
 	RelmapExecutionCheckpointInput work = { 0 };
 	ClusterRelmapRetentionDirectory directory = { 0 };
+	ClusterRelmapRecoverySourceObservationV1 observed = { 0 };
 
 	if (out == NULL || origin >= 128 || MyBackendType != B_STARTUP || !RecoveryInProgress()
-		|| CritSectionCount != 0)
+		|| CritSectionCount != 0 || recovery_overlap(out, sizeof(*out), source, sizeof(*source)))
 		return false;
 	for (size_t i = 0; i < sizeof(*out); i++)
 		if (((const unsigned char *)out)[i] != 0)
 			return false;
+	if (source != NULL)
+		for (size_t i = 0; i < sizeof(*source); i++)
+			if (((const unsigned char *)source)[i] != 0)
+				return false;
 	work.origin = origin;
 	if (!cluster_undo_recovery_cold_checkpoint_visit_v1(origin,
 														retention_execution_checkpoint_visit, &work)
@@ -720,8 +725,36 @@ cluster_relmap_recovery_retention_build_start_cold_v1(uint16 origin,
 			   work.input.window.native_floor, work.input.window.last_issued)
 			   != CLUSTER_RELMAP_RETENTION_OK)
 		return false;
+	if (source != NULL) {
+		observed.source = work.input.selected.source;
+		observed.checkpoint = work.input.selected.checkpoint;
+		observed.native_redo = work.input.selected.native_redo;
+		observed.scope_serial = work.serial;
+		if (!cluster_undo_recovery_cold_single_source_v1(
+				&observed.source, &observed.checkpoint, observed.native_redo, observed.scope_serial)
+			|| MyBackendType != B_STARTUP || !RecoveryInProgress() || CritSectionCount != 0)
+			return false;
+	}
+	/* Both carriers are private until these final, non-fallible stores. */
 	*out = directory;
+	if (source != NULL)
+		*source = observed;
 	return true;
+}
+
+bool
+cluster_relmap_recovery_retention_build_start_cold_v1(uint16 origin,
+													  ClusterRelmapRetentionDirectory *out)
+{
+	return retention_build_start_cold(origin, out, NULL);
+}
+
+bool
+cluster_relmap_recovery_retention_build_start_cold_source_v1(
+	uint16 origin, ClusterRelmapRetentionDirectory *directory,
+	ClusterRelmapRecoverySourceObservationV1 *source)
+{
+	return source != NULL && retention_build_start_cold(origin, directory, source);
 }
 
 static bool
