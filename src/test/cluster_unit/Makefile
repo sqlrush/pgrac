@@ -9944,14 +9944,16 @@ test_cluster_ko_space.inc: $(top_srcdir)/src/backend/cluster/cluster_space_stora
 # Exact held-FD storage seam; recovery authority/path and ResourceOwner
 # callbacks are fixtures, while the file and smgr operations are real.
 test_cluster_recovery_tt_io: test_cluster_recovery_tt_io.c unit_test.h \
+		test_cluster_d0_native_reader_fixture.h xlogreader_fs.o \
 		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
 		$(top_srcdir)/src/include/cluster/cluster_undo_smgr.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_tt_record.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h \
 		test_cluster_recovery_ctrc_record_product.o $(CLUSTER_UNIT_CRYPTOHASH_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
-		test_cluster_recovery_ctrc_record_product.o $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
-		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_CRYPTOHASH_O) \
+		xlogreader_fs.o test_cluster_recovery_ctrc_record_product.o $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/common/libpgcommon.a \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # PGRAC: real shared stamp owner; immutable claim shape code is linked unchanged.
@@ -10015,6 +10017,7 @@ test_cluster_checkpoint_stamp: test_cluster_checkpoint_stamp.c test_cluster_reco
 
 # D2: original native completed-reader custody of exact D0 raw bytes.
 test_cluster_d0_native_reader: test_cluster_d0_native_reader.c unit_test.h \
+		test_cluster_d0_native_reader_fixture.h \
 		xlogreader_fs.o test_cluster_recovery_ctrc_record_product.o \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h \

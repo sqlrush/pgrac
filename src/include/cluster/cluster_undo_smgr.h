@@ -195,6 +195,9 @@ struct ClusterRecoveryCTRCReferenceV2;
  * those same payload bytes. No target write, WAL insertion or live dispatch.
  * Caller retains qualified ROOT/source/cut/graph/owner/pins and reservation;
  * byte identity does not prove those prerequisites or typed idempotency.
+ * raw==NULL and raw_length==0 borrows the original current native reader's
+ * complete D0 snapshot; other pointer/length pairs require explicit full raw
+ * bytes. This does not relax the completed-reader or qualification contracts.
  * Private token/reference outputs must be disjoint from reader-owned storage,
  * input bytes and each other. Both stay unchanged on refusal; original ERROR
  * and ResourceOwner behavior is preserved. Only exact-before is admitted. */
@@ -222,6 +225,8 @@ extern bool cluster_undo_smgr_recovery_ctrc_close_v2(ClusterUndoSmgrRecoveryStam
  * Binding refusal leaves the prepared stage intact. Target failures retain
  * the original sticky/ERROR behavior; close failure may already close the FD.
  * Caller still owns the token on false; never infer rollback or retry safety.
+ * NULL/0 raw reacquires the current native snapshot, with the same exact R
+ * recheck; advancing/resetting the reader is not a completion receipt.
  * No new target preparation, WAL insertion/flush or live redo dispatch. */
 extern bool cluster_undo_smgr_recovery_ctrc_finish_record_v2(
 	ClusterUndoSmgrRecoveryStampV1 stamp, const struct XLogReaderState *reader,

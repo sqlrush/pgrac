@@ -28,6 +28,7 @@
 #undef snprintf
 #include "unit_test.h"
 UT_DEFINE_GLOBALS();
+#include "test_cluster_d0_native_reader_fixture.h"
 
 static char test_dir[MAXPGPATH];
 static char test_file[MAXPGPATH];
@@ -1376,6 +1377,161 @@ UT_TEST(test_d0_record_finish_preserves_native_sync_error_and_close_refusal)
 	}
 }
 
+
+/* Real original WAL reader, with the existing target fixture's canonical D0. */
+static bool
+open_native_target_fixture(NativeFixture *f)
+{
+	ClusterRecoveryCTRCReleaseV2 value;
+	const size_t first_part = 128;
+
+	memset(f, 0, sizeof(*f)); f->fd = -1;
+	if (!cluster_recovery_ctrc_decode_v2(d0_payload, sizeof(d0_payload), d0_system, &value))
+		return false;
+	value.writer_thread = 3;
+	if (!cluster_recovery_ctrc_encode_v2(&value, d0_system, d0_payload, sizeof(d0_payload))
+		|| !open_fixture(f, CLUSTER_RECOVERY_CTRC_WAL_INFO, 0, true))
+		return false;
+	for (unsigned i = 0; i < 2; i++) {
+		memcpy(f->raw[i] + SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong,
+			d0_payload, sizeof(d0_payload));
+		seal_raw(f->raw[i]);
+	}
+	if (pwrite(f->fd, f->raw[0], first_part, XLOG_BLCKSZ - first_part) != first_part
+		|| pwrite(f->fd, f->raw[0] + first_part, RAW_BYTES - first_part,
+			XLOG_BLCKSZ + SizeOfXLogShortPHD) != RAW_BYTES - first_part
+		|| pwrite(f->fd, f->raw[1], RAW_BYTES, f->second - SEG_START) != RAW_BYTES) {
+		close_fixture(f);
+		return false;
+	}
+	return true;
+}
+
+UT_TEST(test_d0_native_custody_prepares_and_finishes_original_target)
+{
+	for (unsigned terminal = 0; terminal < 2; terminal++) {
+		NativeFixture f;
+		ClusterUndoSmgrRecoveryStampV1 stamp = { .token = 91 };
+		ClusterRecoveryCTRCReferenceV2 reference, expected_reference;
+		PGAlignedBlock expected, observed;
+		uint8 source[32]; char *error = NULL; int fd;
+		bool prepared;
+
+		reset_d0(terminal == 0);
+		UT_ASSERT(open_native_target_fixture(&f));
+		if (f.reader == NULL) continue;
+		UT_ASSERT(XLogReadRecord(f.reader, &error) != NULL);
+		memset(source, 6, sizeof(source));
+		UT_ASSERT(cluster_recovery_ctrc_reference_v2(f.reader, 17, source,
+			f.raw[0], RAW_BYTES, &expected_reference));
+		prepared = cluster_undo_smgr_recovery_ctrc_prepare_record_v2(f.reader, 17,
+			source, NULL, 0, &stamp, &reference);
+		UT_ASSERT(prepared);
+		if (!prepared) { close_fixture(&f); continue; }
+		UT_ASSERT(reference.start == expected_reference.start);
+		UT_ASSERT(reference.end == expected_reference.end);
+		UT_ASSERT(reference.raw_length == expected_reference.raw_length);
+		UT_ASSERT(memcmp(reference.raw_record_sha256,
+			expected_reference.raw_record_sha256, 32) == 0);
+		UT_ASSERT(reference.end > reference.start + reference.raw_length);
+		expected = recovery_header_stamp.after;
+		UT_ASSERT(XLogReadAhead(f.reader, false) != NULL);
+		memset(f.reader->readRecordBuf, 0xEE, RAW_BYTES);
+		UT_ASSERT(cluster_undo_smgr_recovery_ctrc_finish_record_v2(stamp, f.reader,
+			17, source, NULL, 0, &reference));
+		UT_ASSERT_EQ(opens, 1); UT_ASSERT_EQ(writes, 1);
+		UT_ASSERT_EQ(syncs, 1); UT_ASSERT_EQ(closes, 1);
+		UT_ASSERT_EQ(external_fds, 0);
+		fd = open(test_file, O_RDONLY); UT_ASSERT(fd >= 0);
+		if (fd >= 0) {
+			UT_ASSERT_EQ(pread(fd, observed.data, BLCKSZ, 0), BLCKSZ);
+			UT_ASSERT(memcmp(observed.data, expected.data, BLCKSZ) == 0);
+			close(fd);
+		}
+		close_fixture(&f);
+	}
+}
+
+UT_TEST(test_d0_native_custody_refuses_before_io_or_output_publication)
+{
+	for (unsigned mode = 0; mode < 11; mode++) {
+		NativeFixture f;
+		ClusterUndoSmgrRecoveryStampV1 stamp = { .token = 91 };
+		ClusterRecoveryCTRCReferenceV2 reference, before;
+		ClusterRecoveryCTRCReferenceV2 *out = &reference;
+		XLogReaderState *reader;
+		const uint8 *raw = NULL; size_t length = 0;
+		uint8 source[32]; char *error = NULL;
+
+		reset_d0(true);
+		UT_ASSERT(open_native_target_fixture(&f));
+		if (f.reader == NULL) continue;
+		UT_ASSERT(XLogReadRecord(f.reader, &error) != NULL);
+		reader = f.reader;
+		memset(source, 6, sizeof(source)); memset(&reference, 0xA5, sizeof(reference));
+		before = reference;
+		switch (mode) {
+		case 0: reader = NULL; break;
+		case 1: length = RAW_BYTES; break;
+		case 2: raw = f.raw[0]; break;
+		case 3: memset(source, 0, sizeof(source)); break;
+		case 4: reader->EndRecPtr++; break;
+		case 5: XLogBeginRead(reader, f.first); break;
+		case 6: CritSectionCount = 1; break;
+		case 7: CurrentResourceOwner = NULL; break;
+		case 8: raw = f.raw[1]; length = RAW_BYTES; break;
+		case 9: out = (void *)(XLogReaderGetClusterD0RawRecord(reader) + 1); break;
+		case 10: reader->cluster_expected_thread_id = 4; break;
+		}
+		UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_prepare_record_v2(reader, 17,
+			source, raw, length, &stamp, out));
+		UT_ASSERT_EQ(stamp.token, 91);
+		UT_ASSERT(memcmp(&reference, &before, sizeof(reference)) == 0);
+		UT_ASSERT_EQ(opens + reads + writes + syncs + closes, 0);
+		UT_ASSERT_EQ(external_fds, 0);
+		CritSectionCount = 0;
+		CurrentResourceOwner = (ResourceOwner)&owner_storage[0];
+		close_fixture(&f);
+	}
+}
+
+UT_TEST(test_d0_native_custody_finish_rebinds_current_record_before_io)
+{
+	NativeFixture f;
+	ClusterUndoSmgrRecoveryStampV1 stamp;
+	ClusterRecoveryCTRCReferenceV2 reference;
+	uint8 source[32]; char *error = NULL; int before_io;
+	bool prepared;
+
+	reset_d0(false);
+	UT_ASSERT(open_native_target_fixture(&f));
+	if (f.reader == NULL) return;
+	UT_ASSERT(XLogReadRecord(f.reader, &error) != NULL);
+	memset(source, 6, sizeof(source));
+	prepared = cluster_undo_smgr_recovery_ctrc_prepare_record_v2(f.reader, 17,
+		source, NULL, 0, &stamp, &reference);
+	UT_ASSERT(prepared);
+	if (!prepared) { close_fixture(&f); return; }
+	before_io = reads + writes + syncs + closes;
+	UT_ASSERT(XLogReadRecord(f.reader, &error) != NULL);
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_finish_record_v2(stamp, f.reader,
+		17, source, NULL, 0, &reference));
+	UT_ASSERT_EQ(reads + writes + syncs + closes, before_io);
+	UT_ASSERT(cluster_undo_smgr_recovery_ctrc_matches_v2(stamp, d0_payload, 320));
+	UT_ASSERT_EQ(external_fds, 1);
+	XLogBeginRead(f.reader, f.first);
+	UT_ASSERT(XLogReadRecord(f.reader, &error) != NULL);
+	source[31] ^= 1;
+	UT_ASSERT(!cluster_undo_smgr_recovery_ctrc_finish_record_v2(stamp, f.reader,
+		17, source, NULL, 0, &reference));
+	UT_ASSERT_EQ(reads + writes + syncs + closes, before_io);
+	source[31] ^= 1;
+	UT_ASSERT(cluster_undo_smgr_recovery_ctrc_finish_record_v2(stamp, f.reader,
+		17, source, NULL, 0, &reference));
+	UT_ASSERT_EQ(external_fds, 0);
+	close_fixture(&f);
+}
+
 int
 main(void)
 {
@@ -1385,7 +1541,7 @@ main(void)
 		return 2;
 	snprintf(test_dir, sizeof(test_dir), "%s", dir);
 	snprintf(test_file, sizeof(test_file), "%s/seg_257.dat", dir);
-	UT_PLAN(26);
+	UT_PLAN(29);
 	UT_RUN(test_exact_durable_slot_preserves_whole_header_and_head);
 	UT_RUN(test_idempotent_still_syncs_and_reads_without_rewriting);
 	UT_RUN(test_prepare_refusals_do_not_leak_or_write);
@@ -1412,6 +1568,9 @@ main(void)
 	UT_RUN(test_d0_record_finish_rebinding_refusal_preserves_owned_stage);
 	UT_RUN(test_d0_record_finish_target_failures_stay_sticky_without_closing);
 	UT_RUN(test_d0_record_finish_preserves_native_sync_error_and_close_refusal);
+	UT_RUN(test_d0_native_custody_prepares_and_finishes_original_target);
+	UT_RUN(test_d0_native_custody_refuses_before_io_or_output_publication);
+	UT_RUN(test_d0_native_custody_finish_rebinds_current_record_before_io);
 	CurrentResourceOwner = (ResourceOwner)&owner_storage[0];
 	if (release_callback != NULL)
 		release_callback(RESOURCE_RELEASE_AFTER_LOCKS, false, true, release_arg);

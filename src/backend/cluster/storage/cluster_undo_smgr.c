@@ -877,11 +877,21 @@ cluster_undo_smgr_recovery_ctrc_prepare_record_v2(const XLogReaderState *reader,
 
 	if (CritSectionCount != 0 || CurrentResourceOwner == NULL
 		|| reader == NULL || reader->record == NULL
-		|| source_identity_digest == NULL || raw == NULL
-		|| raw_length != SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong
-			+ CLUSTER_RECOVERY_CTRC_BYTES
+		|| source_identity_digest == NULL
 		|| out == NULL || reference == NULL || recovery_header_stamp.fd >= 0
 		|| recovery_header_stamp_overlap(out, sizeof(*out), reference, sizeof(*reference)))
+		return false;
+
+	/* NULL/0 selects the original current-reader snapshot, never a rebuilt
+	 * header or the mutable read buffer. Other pointer/length pairs retain
+	 * the explicit immutable-snapshot contract. Resolve before alias checks. */
+	if (raw == NULL && raw_length == 0) {
+		raw = XLogReaderGetClusterD0RawRecord(reader);
+		raw_length = SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong
+			+ CLUSTER_RECOVERY_CTRC_BYTES;
+	}
+	if (raw == NULL || raw_length != SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong
+			+ CLUSTER_RECOVERY_CTRC_BYTES)
 		return false;
 
 	/* Publishing either result must not overwrite the original record, its
@@ -976,6 +986,13 @@ cluster_undo_smgr_recovery_ctrc_finish_record_v2(ClusterUndoSmgrRecoveryStampV1 
 
 	if (CritSectionCount != 0 || CurrentResourceOwner == NULL || prepared_reference == NULL)
 		return false;
+	/* Preparation may have borrowed the native snapshot. Reacquire only the
+	 * current record; the original R comparison below rejects any advance. */
+	if (raw == NULL && raw_length == 0) {
+		raw = XLogReaderGetClusterD0RawRecord(reader);
+		raw_length = SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong
+			+ CLUSTER_RECOVERY_CTRC_BYTES;
+	}
 	/* The caller retains this structural reference from preparation. Rebuild
 	 * it from the original completed reader, not a window or a guessed end.
 	 * No target I/O or ownership change may precede the full-record binding. */
