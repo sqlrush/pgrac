@@ -82,6 +82,7 @@ rf_page_detached_preflight_v1(XLogReaderState *record, bool space_active,
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
+#ifndef CLUSTER_COLD_NATIVE_XACT_PARSER
 bool
 ParseCommitRecord(uint8 info, xl_xact_commit *xlrec, Size len, xl_xact_parsed_commit *parsed)
 {
@@ -96,6 +97,7 @@ ParseCommitRecord(uint8 info, xl_xact_commit *xlrec, Size len, xl_xact_parsed_co
 	parsed->space_drops = commit_space_drops;
 	return true;
 }
+#endif
 
 /* The bounded completion check itself is exercised with real records in
  * test_cluster_wal_retained_cut_records; here only its verdict is used. */
@@ -120,6 +122,7 @@ rf_side_xact_completion_shape_v1(XLogReaderState *record, bool commit)
 
 /* Real child lists and the shared validator are linked in the effects test;
  * these parser stubs intentionally produce no children. */
+#ifndef CLUSTER_COLD_NATIVE_XACT_PARSER
 bool
 rf_side_xact_children_preflight_v1(TransactionId top, int count, const TransactionId *children)
 {
@@ -127,6 +130,7 @@ rf_side_xact_children_preflight_v1(TransactionId top, int count, const Transacti
 	UT_ASSERT(count == 0 && children == NULL);
 	return true;
 }
+#endif
 
 /* Native message kinds are exercised by the real validator in the effects
  * test. This isolated decoder fixture supplies only its accepted verdict. */
@@ -151,6 +155,7 @@ rf_side_xact_tt_commit_preflight_v1(const xl_xact_tt_commit *delta, uint16 origi
 	abort();
 }
 
+#ifndef CLUSTER_COLD_NATIVE_XACT_PARSER
 void
 ParseAbortRecord(uint8 info, xl_xact_abort *xlrec, xl_xact_parsed_abort *parsed)
 {
@@ -159,6 +164,7 @@ ParseAbortRecord(uint8 info, xl_xact_abort *xlrec, xl_xact_parsed_abort *parsed)
 	memset(parsed, 0, sizeof(*parsed));
 	parsed->nrels = abort_nrels;
 }
+#endif
 
 bool
 rf_side_xact_decode_recovery_v1(XLogReaderState *record, uint64 system_identifier,

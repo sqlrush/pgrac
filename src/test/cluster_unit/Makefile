@@ -228,6 +228,7 @@ TESTS += test_cluster_pcm_aux_mutation test_cluster_heap_extend_current
 TESTS += test_cluster_cr_inline_stop
 TESTS += test_cluster_sync_error
 TESTS += test_cluster_cold_tx_start
+TESTS += test_cluster_cold_xid_native_completion
 TESTS += test_cluster_recovery_worker_pre2
 
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
@@ -4175,6 +4176,8 @@ test_cluster_thread_orchestrator: test_cluster_thread_orchestrator.c unit_test.h
 # judge cluster_write_fence_decide (a header inline -- no cluster object needed;
 # only libpgcommon/libpgport for the unit harness).  The token region + qvotec
 # refresh + hot-path gating land as cluster_tap (D8).
+SIMPLE_TESTS := $(filter-out test_cluster_cold_xid_native_completion,$(SIMPLE_TESTS))
+
 test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
@@ -9134,6 +9137,37 @@ test_cluster_cold_recovery_decode: test_cluster_cold_recovery_decode.c unit_test
 		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+test_cluster_cold_xid_completion_children.inc: $(top_srcdir)/src/backend/cluster/cluster_side_xact.c Makefile
+	awk '/^rf_side_xact_children_preflight_v1\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cold_xid_completion_parse.o: $(top_srcdir)/src/backend/access/rmgrdesc/xactdesc.c \
+		$(top_srcdir)/src/include/access/xact.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_cold_xid_native_completion: test_cluster_cold_xid_native_completion.c \
+		test_cluster_cold_recovery_decode.c test_cluster_cold_xid_completion_children.inc unit_test.h \
+		test_cluster_cold_xid_completion_parse.o $(CLUSTER_COLD_DECODE_O) \
+		test_cluster_cold_recovery_xid_core.o $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
+		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_xact.h \
+		$(top_srcdir)/src/include/access/xact.h $(top_srcdir)/src/include/access/multixact.h \
+		$(top_builddir)/src/common/libpgcommon_srv.a cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_DECODE_O) \
+		test_cluster_cold_recovery_xid_core.o test_cluster_cold_xid_completion_parse.o \
+		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) \
+		$(CLUSTER_RF_ROUTE_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+.PHONY: clean-cold-xid-native-completion
+clean: clean-cold-xid-native-completion
+clean-cold-xid-native-completion:
+	rm -f test_cluster_cold_xid_completion_children.inc test_cluster_cold_xid_completion_children.inc.tmp \
+		test_cluster_cold_xid_completion_parse.o
 
 # Exercise Startup's original replay-input lifetime across EOR and exit.
 test_cluster_cold_eor_inputs.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile
