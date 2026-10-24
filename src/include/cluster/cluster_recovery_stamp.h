@@ -47,10 +47,14 @@ typedef struct ClusterRecoveryStampKeyV1 {
 	uint16 target_thread;
 } ClusterRecoveryStampKeyV1;
 
-/* Returned by prepare, copied unchanged by the one original executor. */
+/* Returned by prepare, copied unchanged by the one original executor.
+ * The complete operation is value-owned and immutable until retirement. */
 typedef struct ClusterRecoveryStampHandleV1 {
 	ClusterRecoveryStampKeyV1 key;
 	ClusterRecoveryStampOwnerV1 owner;
+	ClusterRecoveryStampKindV1 kind;
+	uint32 payload_length;
+	uint8 payload[CLUSTER_RECOVERY_STAMP_PAYLOAD_BYTES];
 } ClusterRecoveryStampHandleV1;
 
 /* Embedded in the original per-thread replay slot. No pointers or callbacks. */
@@ -62,9 +66,6 @@ typedef struct ClusterRecoveryStampSlotV1 {
 	uint64 executor_attempt_stamp;
 	uint64 bound_worker_attempt;
 	int32 bound_worker_pid;
-	ClusterRecoveryStampKindV1 kind;
-	uint32 payload_length;
-	uint8 payload[CLUSTER_RECOVERY_STAMP_PAYLOAD_BYTES];
 	XLogRecPtr record_start;
 	XLogRecPtr record_end;
 	bool failed;
@@ -84,7 +85,10 @@ extern bool cluster_recovery_stamp_worker_begin_v1(uint16 thread, uint64 attempt
 extern bool cluster_recovery_stamp_worker_stopped_v1(uint16 thread, uint64 attempt);
 
 /* Call only after original authority, reservation and held-FD preparation.
- * Currently admits exact C0; FPI/D0 and unknown shapes refuse. No WAL or IO.
+ * Admits exact C0/D0 bound to the original writer/target/boot/serial;
+ * FPI and unknown shapes refuse. Complete codec validation is outside every
+ * slot lock; transitions compare the prepared operation without decoding.
+ * No WAL or IO and no authority, graph-completion or release qualification.
  * Inputs/output must not alias. Output is zero on refusal. */
 extern bool cluster_recovery_stamp_prepare_v1(const ClusterRecoveryStampOwnerV1 *owner,
 											  ClusterRecoveryStampKindV1 kind, const uint8 *payload,

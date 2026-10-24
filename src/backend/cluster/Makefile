@@ -457,6 +457,14 @@ cluster_pi_rebuild.o: $(top_srcdir)/src/include/cluster/cluster_semantic_activat
 cluster_reconfig.o cluster_thread_recovery_worker.o: \
 	$(top_srcdir)/src/include/cluster/cluster_thread_recovery.h
 
+# The stamp operation and worker binding share the original replay-slot layout.
+cluster_recovery_plan.o cluster_recovery_worker.o cluster_thread_recovery_worker.o \
+cluster_thread_recovery_orchestrator.o cluster_shmem.o cluster_debug.o \
+cluster_semantic_activation.o cluster_recovery_merge.o cluster_control_root.o: \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h
+cluster_recovery_plan.o: $(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h
+
 cluster_page_authority.o cluster_ir_lock.o cluster_recovery_merge.o \
 cluster_wal_retention.o cluster_thread_recovery_worker.o cluster_control_root.o \
 cluster_thread_recovery_authority.o cluster_thread_recovery_finalize.o: \

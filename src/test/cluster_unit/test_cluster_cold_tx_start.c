@@ -382,7 +382,7 @@ XLogRecPtr XLogInsert(RmgrId rmid, uint8 record_info)
 	UT_ASSERT_EQ(rmid, RM_CLUSTER_UNDO_ID);
 	UT_ASSERT_EQ(record_info, XLOG_UNDO_RECOVERY_TT_ABORT);
 	UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_INSERTING);
-	UT_ASSERT(memcmp(slot->payload, wal_payload, sizeof(wal_payload)) == 0);
+	UT_ASSERT(memcmp(slot->handle.payload, wal_payload, sizeof(wal_payload)) == 0);
 	UT_ASSERT(cluster_recovery_tt_abort_decode_v1(wal_payload, sizeof(wal_payload), &record));
 	UT_ASSERT(memcmp(&record, &prepared_record, sizeof(record)) == 0);
 	UT_ASSERT_EQ(slot->handle.owner.writer.epoch, observed_writer.epoch);

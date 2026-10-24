@@ -47,6 +47,10 @@ xlog.o: xlog.c $(top_srcdir)/src/include/catalog/catversion.h
 # changes even when autodepend is disabled. Author: SqlRush <sqlrush@gmail.com>
 xlog.o: $(top_srcdir)/src/include/cluster/cluster_ir.h
 
+# Native recovery and checkpoint retain value-owned recovery stamp handles.
+xlog.o xlogrecovery.o: $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_plan.h
+
 # PGRAC: keep native predicates and physical origin inspection identical.
 # Author: SqlRush <sqlrush@gmail.com>
 clog.o subtrans.o multixact.o commit_ts.o: \
