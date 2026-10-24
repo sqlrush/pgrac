@@ -31,6 +31,8 @@
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_itl.h"
 #include "cluster/cluster_terminal_ref_census.h"
+#include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_uba.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "port/pg_crc32c.h"
 
@@ -1670,6 +1672,228 @@ UT_TEST(test_ctrc_itl_image_partial_overlap_is_retained)
 		UT_ASSERT_EQ(cluster_ctrc_itl_cleanout_image_v1(&key, &target,
 			CTRC_TERMINAL_COMMITTED, 900, before, after), CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
 		UT_ASSERT(memcmp(storage, saved, sizeof(storage)) == 0);
+	}
+}
+
+static void
+test_native_itl_image(ClusterColdTtSlotInputV1 *subject, PGAlignedBlock *image, uint8 itl_class)
+{
+	Page page = (Page)image->data;
+	PageHeader header = (PageHeader)page;
+	ClusterItlSlotData *slot;
+	HeapTupleHeader tuple;
+
+	memset(subject, 0, sizeof(*subject));
+	memset(image, 0, sizeof(*image));
+	subject->key.owner_instance = 2;
+	subject->key.segment_id = CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	subject->key.segment_generation = 5;
+	subject->key.slot_offset = TT_SLOTS_PER_SEGMENT - 1;
+	subject->key.xid = 7001;
+	subject->key.slot_wrap = 9;
+	subject->slot.xid = subject->key.xid;
+	subject->slot.wrap = subject->key.slot_wrap;
+	subject->slot.status = TT_SLOT_COMMITTED;
+	subject->slot.commit_scn = 900;
+	/* Global TX head and this page's ITL head are distinct physical records. */
+	subject->slot.first_undo_block = uba_encode(subject->key.segment_id, 40, 47, 100);
+	header->pd_flags = PD_HAS_ITL;
+	header->pd_special = BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE;
+	header->pd_lower = SizeOfPageHeaderData + sizeof(ItemIdData);
+	header->pd_upper = header->pd_special - MAXALIGN(SizeofHeapTupleHeader);
+	header->pd_block_scn = 20;
+	PageSetPageSizeAndVersion(page, BLCKSZ, PG_PAGE_LAYOUT_VERSION);
+	ItemIdSetNormal(PageGetItemId(page, FirstOffsetNumber), header->pd_upper, SizeofHeapTupleHeader);
+	tuple = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, FirstOffsetNumber));
+	tuple->t_hoff = SizeofHeapTupleHeader;
+	tuple->t_infomask = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK;
+	HeapTupleHeaderSetXmin(tuple, 800);
+	HeapTupleHeaderSetXmax(tuple, subject->key.xid);
+	slot = &ClusterPageGetItlSlots(page)[2];
+	slot->xid = subject->key.xid;
+	/* Page ITL wrap is independent of the native TT slot wrap. */
+	slot->wrap = 3;
+	slot->flags = itl_class == 1 ? ITL_FLAG_ACTIVE : ITL_FLAG_LOCK_ONLY_ACTIVE;
+	slot->undo_segment_head = uba_encode(subject->key.segment_id, 12, 47, 132);
+}
+
+UT_TEST(test_ctrc_native_tt_image_matches_original_terminal_rules)
+{
+	for (unsigned leg = 0; leg < 6; leg++) {
+		ClusterColdTtSlotInputV1 subject, saved_subject;
+		PGAlignedBlock before, saved, after, ordinary, repeated;
+		ClusterCtrcTxnKeyV1 key = test_key();
+		ClusterCtrcTargetV1 target = test_exact_itl_target();
+		uint8 itl_class = leg < 3 ? 1 : 2;
+		ClusterCtrcTerminalStatus status = leg % 3 == 1 ? CTRC_TERMINAL_ABORTED : CTRC_TERMINAL_COMMITTED;
+		ClusterItlSlotData *slot;
+
+		test_native_itl_image(&subject, &before, itl_class);
+		if (status == CTRC_TERMINAL_ABORTED) {
+			subject.slot.status = TT_SLOT_ABORTED;
+			subject.slot.commit_scn = InvalidScn;
+		}
+		if (leg == 2) {
+			slot = &ClusterPageGetItlSlots((Page)before.data)[2];
+			slot->flags = ITL_FLAG_NEEDS_CLEANOUT;
+			slot->commit_scn = subject.slot.commit_scn;
+		}
+		subject.slot.flags = leg % 3 == 2 ? TT_SLOT_FLAG_CTRC_RELEASE_PROVEN : 0;
+		key.owner_instance = subject.key.owner_instance;
+		key.origin_node_id = key.owner_instance - 1;
+		key.segment_id = subject.key.segment_id;
+		key.segment_generation = subject.key.segment_generation;
+		key.slot_offset = subject.key.slot_offset;
+		key.slot_wrap = subject.key.slot_wrap;
+		target.itl_class = itl_class;
+		slot = &ClusterPageGetItlSlots((Page)before.data)[2];
+		memcpy(target.uba, &slot->undo_segment_head, sizeof(target.uba));
+		saved = before; saved_subject = subject;
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_cleanout_image_v1(&subject, 2, 3, itl_class,
+			before.data, after.data), CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN);
+		UT_ASSERT_EQ(cluster_ctrc_itl_cleanout_image_v1(&key, &target, status,
+			subject.slot.commit_scn, before.data, ordinary.data), CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN);
+		UT_ASSERT(memcmp(after.data, ordinary.data, BLCKSZ) == 0);
+		UT_ASSERT(memcmp(before.data, saved.data, BLCKSZ) == 0);
+		UT_ASSERT(memcmp(&subject, &saved_subject, sizeof(subject)) == 0);
+		repeated = before;
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_cleanout_image_v1(&subject, 2, 3, itl_class,
+			repeated.data, repeated.data), CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN);
+		UT_ASSERT(memcmp(repeated.data, after.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_cleanout_image_v1(&subject, 2, 3, itl_class,
+			after.data, repeated.data), CLUSTER_CTRC_ITL_CLEANOUT_ALREADY_TERMINAL);
+	}
+}
+
+UT_TEST(test_ctrc_native_tt_image_rejects_unqualified_or_mismatched_input)
+{
+	for (unsigned fault = 0; fault < 26; fault++) {
+		ClusterColdTtSlotInputV1 subject, saved_subject;
+		PGAlignedBlock before, saved, after, saved_after;
+		ClusterItlSlotData *slot;
+		test_native_itl_image(&subject, &before, 1);
+		slot = &ClusterPageGetItlSlots((Page)before.data)[2];
+		switch (fault) {
+		case 0: subject.slot.status = TT_SLOT_ACTIVE; break;
+		case 1: subject.slot.status = TT_SLOT_UNUSED; break;
+		case 2: subject.slot.status = TT_SLOT_RECYCLABLE; break;
+		case 3: subject.slot.status = TT_SLOT_INVALID; break;
+		case 4: subject.slot.commit_scn = InvalidScn; break;
+		case 5: subject.slot.status = TT_SLOT_ABORTED; break;
+		case 6: subject.slot.flags = 0x80; break;
+		case 7: subject.slot.xid++; break;
+		case 8: subject.slot.wrap++; break;
+		case 9: subject.key.owner_instance = 0; break;
+		case 10: subject.key.owner_instance++; break;
+		case 11: subject.key.segment_id = 0; break;
+		case 12: subject.key.segment_generation = UINT32_MAX; break;
+		case 13: subject.key.slot_offset = TT_SLOTS_PER_SEGMENT; break;
+		case 14: subject.key.xid = FrozenTransactionId; subject.slot.xid = FrozenTransactionId; break;
+		case 15: subject.key.slot_wrap = TT_WRAP_INVALID; subject.slot.wrap = TT_WRAP_INVALID; break;
+		case 16: slot->xid++; break;
+		case 17: slot->wrap++; break;
+		case 18: slot->undo_segment_head = uba_encode(subject.key.segment_id + 1, 12, 47, 132); break;
+		case 19: slot->undo_segment_head = uba_encode(subject.key.segment_id, 12, 46, 132); break;
+		case 20: memset(&slot->undo_segment_head, 0, sizeof(UBA)); break;
+		case 21: slot->undo_segment_head.raw[1] |= UINT64CONST(1) << 32; break;
+		case 22: ((PageHeader)before.data)->pd_upper = 0; break;
+		case 23: ((PageHeader)before.data)->pd_special++; break;
+		case 24: slot->flags = ITL_FLAG_ABORTED; break;
+		case 25: slot->commit_scn = 901; break;
+		}
+		saved_subject = subject; saved = before;
+		memset(&after, 0xa5, sizeof(after)); saved_after = after;
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_cleanout_image_v1(&subject, 2, 3, 1,
+			before.data, after.data), CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+		UT_ASSERT(memcmp(before.data, saved.data, BLCKSZ) == 0);
+		UT_ASSERT(memcmp(after.data, saved_after.data, BLCKSZ) == 0);
+		UT_ASSERT(memcmp(&subject, &saved_subject, sizeof(subject)) == 0);
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_cleanout_image_v1(&subject, 2, 3, 1,
+			before.data, before.data), CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+		UT_ASSERT(memcmp(before.data, saved.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_ctrc_native_tt_image_retains_invalid_tuple_ranges)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		for (uint8 itl_class = 1; itl_class <= 2; itl_class++) {
+			ClusterColdTtSlotInputV1 subject, saved_subject;
+			PGAlignedBlock before, saved, after, saved_after;
+			PageHeader header;
+			ItemId item;
+			uint16 offset, length;
+
+			test_native_itl_image(&subject, &before, itl_class);
+			header = (PageHeader)before.data;
+			item = PageGetItemId((Page)before.data, FirstOffsetNumber);
+			offset = ItemIdGetOffset(item);
+			length = ItemIdGetLength(item);
+			switch (fault) {
+			case 0: offset = header->pd_special; break;
+			case 1: offset = header->pd_upper - 1; break;
+			case 2: offset = BLCKSZ - 1; break;
+			case 3: length = SizeofHeapTupleHeader - 1; break;
+			case 4: length = 0; break;
+			case 5: length = header->pd_special - offset + 1; break;
+			case 6: offset = SizeOfPageHeaderData; break;
+			}
+			ItemIdSetNormal(item, offset, length);
+			saved = before; saved_subject = subject;
+			memset(&after, 0xa5, sizeof(after)); saved_after = after;
+			UT_ASSERT_EQ(cluster_ctrc_recovery_itl_cleanout_image_v1(&subject, 2, 3,
+				itl_class, before.data, after.data), CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+			UT_ASSERT(memcmp(before.data, saved.data, BLCKSZ) == 0);
+			UT_ASSERT(memcmp(after.data, saved_after.data, BLCKSZ) == 0);
+			UT_ASSERT_EQ(cluster_ctrc_recovery_itl_cleanout_image_v1(&subject, 2, 3,
+				itl_class, before.data, before.data), CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+			UT_ASSERT(memcmp(before.data, saved.data, BLCKSZ) == 0);
+			UT_ASSERT(memcmp(&subject, &saved_subject, sizeof(subject)) == 0);
+		}
+	}
+}
+
+UT_TEST(test_ctrc_native_tt_image_refuses_aliases_and_missing_arguments)
+{
+	ClusterColdTtSlotInputV1 subject;
+	PGAlignedBlock before, output[2], saved[2];
+	test_native_itl_image(&subject, &before, 2);
+	for (unsigned fault = 0; fault < 6; fault++) {
+		memset(output, 0xa5, sizeof(output)); memcpy(saved, output, sizeof(saved));
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_cleanout_image_v1(fault == 0 ? NULL : &subject,
+			fault == 1 ? CLUSTER_ITL_INITRANS_DEFAULT : 2, 3, fault == 2 ? 3 : 2,
+			fault == 3 ? NULL : before.data, fault == 4 ? NULL : output[0].data),
+			fault == 5 ? CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN : CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+		if (fault != 5) UT_ASSERT(memcmp(output, saved, sizeof(saved)) == 0);
+	}
+	for (unsigned direction = 0; direction < 2; direction++) {
+		char *source = output[0].data + (direction ? MAXALIGN(1) : 0);
+		char *dest = output[0].data + (direction ? 0 : MAXALIGN(1));
+		memcpy(source, before.data, BLCKSZ); memcpy(saved, output, sizeof(saved));
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_cleanout_image_v1(&subject, 2, 3, 2, source, dest),
+			CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+		UT_ASSERT(memcmp(output, saved, sizeof(saved)) == 0);
+	}
+	memcpy(output[0].data, &subject, sizeof(subject)); memcpy(saved, output, sizeof(saved));
+	UT_ASSERT_EQ(cluster_ctrc_recovery_itl_cleanout_image_v1((ClusterColdTtSlotInputV1 *)output[0].data,
+		2, 3, 2, before.data, output[0].data), CLUSTER_CTRC_ITL_CLEANOUT_RETAIN);
+	UT_ASSERT(memcmp(output, saved, sizeof(saved)) == 0);
+}
+
+UT_TEST(test_ctrc_native_tt_image_keeps_local_wrap_and_global_tx_head_separate)
+{
+	for (uint16 wrap = 0; wrap < 12; wrap++) {
+		ClusterColdTtSlotInputV1 subject;
+		PGAlignedBlock before, after;
+		ClusterItlSlotData *slot;
+		test_native_itl_image(&subject, &before, 1);
+		if (wrap == 0) subject.key.segment_generation = 0;
+		slot = &ClusterPageGetItlSlots((Page)before.data)[2];
+		slot->wrap = wrap;
+		UT_ASSERT(memcmp(&subject.slot.first_undo_block, &slot->undo_segment_head, sizeof(UBA)) != 0);
+		UT_ASSERT_EQ(cluster_ctrc_recovery_itl_cleanout_image_v1(&subject, 2, wrap, 1,
+			before.data, after.data), CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN);
+		UT_ASSERT_EQ(ClusterPageGetItlSlots((Page)after.data)[2].wrap, wrap);
 	}
 }
 
@@ -3425,6 +3649,11 @@ main(void)
 		CTRC_TEST_ENTRY(test_ctrc_itl_cleanout_rewrites_only_exact_terminal_slot),
 		CTRC_TEST_ENTRY(test_ctrc_itl_image_calculation_preserves_input_and_replays_exactly),
 		CTRC_TEST_ENTRY(test_ctrc_itl_image_partial_overlap_is_retained),
+		CTRC_TEST_ENTRY(test_ctrc_native_tt_image_matches_original_terminal_rules),
+		CTRC_TEST_ENTRY(test_ctrc_native_tt_image_rejects_unqualified_or_mismatched_input),
+		CTRC_TEST_ENTRY(test_ctrc_native_tt_image_retains_invalid_tuple_ranges),
+		CTRC_TEST_ENTRY(test_ctrc_native_tt_image_refuses_aliases_and_missing_arguments),
+		CTRC_TEST_ENTRY(test_ctrc_native_tt_image_keeps_local_wrap_and_global_tx_head_separate),
 		CTRC_TEST_ENTRY(test_real_cleaner_terminal_image_closes_plain_lock_reference),
 		CTRC_TEST_ENTRY(test_ctrc_close_race_drains_prepared_without_timeout_cancellation),
 		CTRC_TEST_ENTRY(test_ctrc_exact_target_absence_and_ambiguity_cleanout_table),

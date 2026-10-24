@@ -9309,6 +9309,9 @@ check_ctrc_source_census:
 $(CLUSTER_CTRC_TEST_O): \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_uba.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
 		$(top_srcdir)/src/include/cluster/cluster_itl.h \
 		$(top_srcdir)/src/include/cluster/cluster_itl_slot.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
