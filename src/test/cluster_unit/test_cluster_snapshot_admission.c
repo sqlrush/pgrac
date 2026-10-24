@@ -31,9 +31,17 @@ MemoryContext TopTransactionContext = (MemoryContext)1;
 MemoryContext CurrentMemoryContext = (MemoryContext)1;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
-static PGPROC proc;
+static PGPROC snapshot_procs[2];
+#define proc snapshot_procs[0]
 static PGPROC *allProcs = &proc;
 static ProcArrayStruct *procArray;
+PROC_HDR *ProcGlobal;
+static PROC_HDR snapshot_proc_header;
+static uint8 snapshot_status_flags[2];
+static bool import_install_active, import_restored, import_probe_after_install;
+static bool import_gap_refused, import_gap_xmin_installed;
+static LWLockMode import_install_mode;
+static void snapshot_import_after_procarray_unlock(void);
 static bool retention_lock, retention_probe_before_publish, retention_gap_refused;
 static unsigned retention_acquires, retention_releases, retention_clocks;
 static unsigned remembered;
@@ -763,7 +771,10 @@ UT_TEST(cr_identity_restore_and_snapshot_refresh_start_new_lifetimes)
 
 /* PGRAC: catalogue I/O leaves around the real maintenance entry and snapshots. */
 #include "test_cluster_snapshot_vacuum_fixture.inc"
+#undef proc
 #include "test_cluster_retention_sample.inc"
+#include "test_cluster_snapshot_import_xmin.inc"
+#define proc snapshot_procs[0]
 
 /* Use the actual catalog getter, pairing heap, publisher and invalidation;
  * GetSnapshotData supplies controlled source fields through the existing
@@ -856,6 +867,8 @@ catalog_history_sample(ClusterUndoRetentionSample *sample)
 	UT_ASSERT(!retention_lock);
 	return valid;
 }
+
+#include "test_cluster_snapshot_import_fixture.inc"
 
 UT_TEST(catalog_original_publication_completes_the_real_h_sample)
 {
@@ -978,18 +991,26 @@ main(void)
 {
 	MyProc = &proc;
 	proc.pid = 1234;
-	procArray = calloc(1, sizeof(ProcArrayStruct) + sizeof(int));
+	procArray = calloc(1, sizeof(ProcArrayStruct) + 2 * sizeof(int));
 	if (procArray == NULL)
 		abort();
-	procArray->maxProcs = procArray->numProcs = 1;
+	procArray->maxProcs = 2;
+	procArray->numProcs = 1;
 	procArray->pgprocnos[0] = 0;
+	procArray->pgprocnos[1] = 1;
+	ProcGlobal = &snapshot_proc_header;
+	ProcGlobal->statusFlags = snapshot_status_flags;
 	pg_atomic_init_u64(&proc.cluster_read_scn_atomic, 0);
 	UndoHorizonShmem = &horizon;
 	pg_atomic_init_u64(&horizon.self_admitted_epoch, 8);
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(70);
+	UT_PLAN(74);
+	UT_RUN(imported_snapshot_original_xmin_handoff_survives_source_exit);
+	UT_RUN(restored_snapshot_original_xmin_handoff_survives_source_exit);
+	UT_RUN(imported_snapshot_rejects_missing_or_unprotected_original_source);
+	UT_RUN(restored_snapshot_rejects_unprotected_original_source);
 	UT_RUN(original_catalog_pin_cannot_supply_a_missing_finite_clock);
 	UT_RUN(original_registered_nonfinite_reader_keeps_h_unqualified_until_retirement);
 	UT_RUN(catalog_original_publication_completes_the_real_h_sample);

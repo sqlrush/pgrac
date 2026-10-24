@@ -9048,7 +9048,19 @@ test_cluster_snapshot_admission_vacuum.inc: $(top_srcdir)/src/backend/commands/v
 		if (has_internal) print "static void vac_update_datfrozenxid_internal(void);"; \
 		printf "%s", body }' $< > $@
 
+test_cluster_snapshot_import_xmin.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
+	@awk '/^ProcArrayInstall(Imported|Restored)Xmin\(/ { print "bool"; emit=1; starts++ } \
+		emit { print } emit && /^}$$/ { emit=0 } \
+		END { if (emit || starts != 2) exit 1 }' $< > $@
+
+test_cluster_snapshot_import_compare.inc: $(top_srcdir)/src/backend/access/transam/transam.c Makefile
+	@awk '/^TransactionIdPrecedesOrEquals\(/ { print "bool"; emit=1; starts++ } \
+		emit { print } emit && /^}$$/ { emit=0 } \
+		END { if (emit || starts != 1) exit 1 }' $< > $@
+
 test_cluster_snapshot_admission: test_cluster_snapshot_admission.c unit_test.h \
+		test_cluster_snapshot_import_xmin.inc test_cluster_snapshot_import_compare.inc \
+		$(srcdir)/test_cluster_snapshot_import_fixture.inc \
 		test_cluster_pgproc_active_types.inc test_cluster_retention_sample.inc \
 		$(top_srcdir)/src/include/cluster/cluster_undo_retention.h $(CLUSTER_UNDO_RETENTION_O) \
 		$(srcdir)/test_cluster_snapshot_vacuum_fixture.inc test_cluster_snapshot_admission_vacuum.inc \

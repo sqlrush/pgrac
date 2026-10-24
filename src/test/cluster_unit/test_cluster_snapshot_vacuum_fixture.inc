@@ -87,7 +87,12 @@ bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
 	if (lock == ProcArrayLock) {
-		UT_ASSERT_EQ(mode, LW_EXCLUSIVE);
+		if (mode == LW_SHARED)
+			UT_ASSERT(import_install_active && !import_restored);
+		else
+			UT_ASSERT_EQ(mode, LW_EXCLUSIVE);
+		if (import_probe_after_install)
+			import_install_mode = mode;
 		UT_ASSERT(!retention_lock && !vacuum_xid_lock && !vacuum_inplace_lock);
 		retention_lock = true;
 		retention_acquires++;
@@ -106,6 +111,7 @@ LWLockRelease(LWLock *lock)
 		UT_ASSERT(retention_lock);
 		retention_lock = false;
 		retention_releases++;
+		snapshot_import_after_procarray_unlock();
 		return;
 	}
 	UT_ASSERT(lock == XidGenLock && vacuum_xid_lock);
