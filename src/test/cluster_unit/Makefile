@@ -3035,6 +3035,7 @@ test_cluster_recovery_c0_apply: test_cluster_recovery_c0_apply.c unit_test.h \
 
 test_cluster_undo_recovery: test_cluster_undo_recovery.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
+		test_cluster_undo_checkpoint_visit.inc \
 		test_cluster_undo_path_native.inc test_cluster_undo_fd_native.inc test_cluster_undo_dir_native.inc \
 		test_cluster_undo_recovery_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_undo_gcs.o \

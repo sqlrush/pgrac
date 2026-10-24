@@ -28,6 +28,15 @@ struct ClusterRelmapRetentionDirectory;
 extern bool
 cluster_relmap_recovery_retention_build_start_v1(ClusterWalInputsV1 *inputs, uint16 origin,
 												 struct ClusterRelmapRetentionDirectory *out);
+/* Same provisional checkpoint BUILDING projection under the original cold
+ * execution owner, after its census read scope has been released. Uses only
+ * that owner's exact ROOT/source/serial and complete retained WAL visit; no
+ * read pin or replacement scope is acquired. out must be NEW, entirely zero
+ * exclusive storage. False/ERROR leaves it unchanged. All qualification and
+ * lifetime limits above still apply; original owner/pins remain caller-owned. */
+extern bool
+cluster_relmap_recovery_retention_build_start_cold_v1(uint16 origin,
+													  struct ClusterRelmapRetentionDirectory *out);
 typedef struct ClusterRelmapTerminalObservationV1 {
 	ClusterWalSourceRef source;
 	ClusterRelmapCheckpointWindow window;

@@ -385,6 +385,101 @@ cluster_undo_recovery_cold_scope_id_v1(const ClusterWalSourceRef *source,
 	return serial;
 }
 
+typedef struct UndoRecoveryCheckpointVisit {
+	const ClusterUndoRecoveryScopeV1 *scope;
+	ClusterControlRootSnapshot root;
+	ClusterControlRootReadToken token;
+	ClusterWalRecoveryCheckpointV1 checkpoint;
+	ClusterUndoRecoveryCheckpointVisitorV1 visitor;
+	void *arg;
+	uint64 serial;
+	uint64 records;
+	int origin;
+} UndoRecoveryCheckpointVisit;
+
+static bool
+undo_checkpoint_same(const UndoRecoveryCheckpointVisit *work)
+{
+	return active_scope == work->scope && undo_scope_serial == work->serial
+		   && work->scope->authority != NULL && work->scope->authority->root_snapshot != NULL
+		   && memcmp(&work->root, work->scope->authority->root_snapshot, sizeof(work->root)) == 0
+		   && memcmp(&work->token, &work->scope->root_token, sizeof(work->token)) == 0;
+}
+
+static bool
+undo_checkpoint_current(const UndoRecoveryCheckpointVisit *work)
+{
+	return undo_checkpoint_same(work)
+		   && cluster_undo_recovery_cold_origin_authorized_v1(work->origin)
+		   && undo_checkpoint_same(work);
+}
+
+static bool
+undo_checkpoint_record(XLogReaderState *reader, void *arg)
+{
+	UndoRecoveryCheckpointVisit *work = arg;
+
+	/* No authority can be cached across leave/reenter, even at the same
+	 * address. Full owner/source checks bracket the original complete visit. */
+	if (reader == NULL || !undo_checkpoint_same(work) || work->records == UINT64_MAX
+		|| !work->visitor(&work->checkpoint, &work->root, work->serial, reader, work->arg)
+		|| !undo_checkpoint_same(work))
+		return false;
+	work->records++;
+	return true;
+}
+
+bool
+cluster_undo_recovery_cold_checkpoint_visit_v1(int origin_node,
+											   ClusterUndoRecoveryCheckpointVisitorV1 visitor,
+											   void *arg)
+{
+	UndoRecoveryCheckpointVisit work = { 0 };
+	ClusterWalRecoveryCheckpointV1 after = { 0 };
+	ClusterWalTailObservation observed = { 0 };
+	const ClusterUndoRecoveryScopeV1 *scope = active_scope;
+	uint64 serial = undo_scope_serial;
+
+	if (visitor == NULL || serial == 0
+		|| !cluster_undo_recovery_cold_origin_authorized_v1(origin_node) || active_scope != scope
+		|| undo_scope_serial != serial)
+		return false;
+	work.scope = scope;
+	work.root = *scope->authority->root_snapshot;
+	work.token = scope->root_token;
+	work.serial = serial;
+	work.origin = origin_node;
+	work.visitor = visitor;
+	work.arg = arg;
+	/* The caller already holds the original execution retention/IR owner.
+	 * In particular, do not reacquire pass-1's census WAL read set here. */
+	if (cluster_control_root_recovery_checkpoint_v1(&work.root, &work.token, &work.checkpoint)
+			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| !undo_checkpoint_current(&work)
+		|| cluster_undo_recovery_cold_scope_id_v1(&work.checkpoint.source, &work.root,
+												  work.checkpoint.checkpoint.redo)
+			   != serial
+		|| cluster_control_root_recovery_visit(&work.root, &work.token, undo_checkpoint_record,
+											   &work, &observed)
+			   != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| !undo_checkpoint_current(&work) || work.records == 0 || observed.records != work.records
+		|| observed.complete_end != work.root.validated_tail_lsn_exclusive
+		|| observed.last_record_start != work.root.tail_last_record_lsn
+		|| observed.last_record_crc != work.root.tail_last_record_crc32c
+		|| observed.database_incarnation != work.checkpoint.source.claim.database_incarnation
+		|| cluster_control_root_recovery_checkpoint_v1(&work.root, &work.token, &after)
+			   != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| memcmp(&after, &work.checkpoint, sizeof(after)) != 0
+		|| cluster_undo_recovery_cold_scope_id_v1(&work.checkpoint.source, &work.root,
+												  work.checkpoint.checkpoint.redo)
+			   != serial
+		|| !undo_checkpoint_current(&work))
+		return false;
+	/* Only stack-owned provisional work; original readers own their ERROR
+	 * cleanup and the caller retains the original scope and every pin. */
+	return true;
+}
+
 bool
 cluster_undo_recovery_cold_terminal_matches_v1(const ClusterWalSourceRef *source,
 											   const ClusterControlRootSnapshot *checkpoint,

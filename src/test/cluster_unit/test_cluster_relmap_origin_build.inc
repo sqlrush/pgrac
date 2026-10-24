@@ -253,3 +253,223 @@ UT_TEST(test_origin_build_error_keeps_output_and_original_pins)
 			return;
 	}
 }
+
+/* Execution-owner authority is a controlled leaf here. Its selected ROOT,
+ * anchor, checkpoint and entire retained WAL use the production readers.
+ * The actual original-scope provider is tested by test_cluster_undo_recovery. */
+static ClusterControlRootSnapshot execution_root;
+static ClusterControlRootReadToken execution_token;
+static unsigned execution_fault, execution_visits, execution_records;
+typedef struct ExecutionCheckpointDelivery {
+	ClusterWalRecoveryCheckpointV1 checkpoint;
+	ClusterUndoRecoveryCheckpointVisitorV1 visitor;
+	void *arg;
+} ExecutionCheckpointDelivery;
+
+static bool
+execution_checkpoint_record(XLogReaderState *reader, void *arg)
+{
+	ExecutionCheckpointDelivery *work = arg;
+	bool ok;
+	execution_records++;
+	UT_ASSERT(!inputs_pin_held && inputs_pin_refuse && test_actual_cf == NoLock);
+	if (execution_fault == 9)
+		ereport(ERROR, (errmsg("injected execution-owner WAL callback ERROR")));
+	ok = work->visitor(&work->checkpoint, &execution_root, custody_scope, reader, work->arg);
+	if (ok && execution_fault == 8 && execution_records == 1)
+		v2_checkpoint_root_race();
+	return ok;
+}
+
+bool
+cluster_undo_recovery_cold_checkpoint_visit_v1(int origin,
+											   ClusterUndoRecoveryCheckpointVisitorV1 visitor,
+											   void *arg)
+{
+	ExecutionCheckpointDelivery work = { 0 };
+	ClusterWalTailObservation observed = { 0 };
+	execution_visits++;
+	UT_ASSERT(!inputs_pin_held && inputs_pin_refuse);
+	if (execution_fault == 1 || custody_scope == 0
+		|| origin != execution_root.identity.origin_node_id || visitor == NULL)
+		return false;
+	if (cluster_control_root_recovery_checkpoint_v1(&execution_root, &execution_token,
+													&work.checkpoint)
+		!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return false;
+	if (execution_fault == 4)
+		work.checkpoint.checkpoint.nextXid = FullTransactionIdFromU64(101);
+	if (execution_fault == 5)
+		work.checkpoint.native_window[159] ^= 1;
+	if (execution_fault == 6)
+		work.checkpoint.source.timeline++;
+	work.visitor = visitor;
+	work.arg = arg;
+	if (cluster_control_root_recovery_visit(&execution_root, &execution_token,
+											execution_checkpoint_record, &work, &observed)
+		!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return false;
+	if (execution_fault == 2)
+		return false; /* Late original owner refusal after all physical input. */
+	if (execution_fault == 3)
+		ereport(ERROR, (errmsg("injected execution-owner post-visit ERROR")));
+	if (execution_fault == 7)
+		MyBackendType = B_BG_WORKER;
+	return true;
+}
+
+static void
+execution_build_setup(unsigned input_fault, bool clean)
+{
+	ClusterWalInputsV1 *inputs = origin_build_setup(input_fault, clean);
+	uint8 bytes[66048];
+	ControlRootImage root;
+	char path[MAXPGPATH];
+	UT_ASSERT(inputs != NULL);
+	cluster_wal_inputs_release_v1(&inputs);
+	UT_ASSERT(!inputs_pin_held);
+	inputs_pin_refuse = true; /* Execution may not reacquire pass-1 census pins. */
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+	read_all_or_abort(path, bytes, sizeof(bytes));
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &root), 0);
+	root.records[0].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+	memcpy(bytes, root.bytes, sizeof(bytes));
+	v2_write_roots(bytes);
+	UT_ASSERT_EQ(cluster_control_root_v3_read_canonical(1, &root.records[0].identity,
+														&execution_root, &execution_token),
+				 0);
+	execution_fault = execution_visits = execution_records = 0;
+}
+
+static void
+execution_build_done(void)
+{
+	ClusterWalInputsV1 *inputs = NULL;
+	inputs_pin_refuse = false;
+	origin_build_done(&inputs);
+}
+
+UT_TEST(test_execution_build_uses_original_inputs_without_census_read_scope)
+{
+	for (unsigned sample = 0; sample < 3; sample++) {
+		ClusterRelmapRetentionDirectory out = { 0 };
+		custody_era_offset = sample == 1 ? UINT64CONST(1) << 32 : 0;
+		execution_build_setup(29, sample == 2);
+		UT_ASSERT(cluster_relmap_recovery_retention_build_start_cold_v1(0, &out));
+		UT_ASSERT_EQ(out.state, CLUSTER_RELMAP_RETENTION_BUILDING);
+		UT_ASSERT_EQ(out.system_identifier, TEST_SYSID);
+		UT_ASSERT_EQ(out.database_incarnation,
+					 prefix_base_expected.source.claim.database_incarnation);
+		UT_ASSERT_EQ(out.origin, 0);
+		UT_ASSERT_EQ(out.generation, custody_scope);
+		UT_ASSERT_EQ(out.native_floor, custody_era_offset + 80);
+		UT_ASSERT_EQ(out.last_issued, custody_era_offset + 99);
+		UT_ASSERT_EQ(cluster_relmap_retention_allocation_check(&out, out.last_issued + 1),
+					 CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+		UT_ASSERT_EQ(execution_visits, 1);
+		UT_ASSERT(execution_records > 0 && !inputs_pin_held && test_actual_cf == NoLock);
+		UT_ASSERT_EQ(prefix_base_reads + custody_terminal_calls + custody_inventory_calls, 0);
+		UT_ASSERT_EQ(inputs_peer_begins + inputs_native_begin_calls + inputs_native_flush_calls, 0);
+		execution_build_done();
+	}
+}
+
+UT_TEST(test_execution_build_refuses_wrong_role_and_original_owner)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		ClusterRelmapRetentionDirectory out = { 0 }, zero = { 0 };
+		execution_build_setup(29, false);
+		if (fault == 0)
+			MyBackendType = B_BG_WORKER;
+		if (fault == 1)
+			inputs_native_recovery = false;
+		if (fault == 2)
+			CritSectionCount = 1;
+		if (fault == 3)
+			custody_scope = 0;
+		if (fault == 4)
+			execution_fault = 1;
+		UT_ASSERT(
+			!cluster_relmap_recovery_retention_build_start_cold_v1(fault == 5 ? 128 : 0, &out));
+		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		UT_ASSERT_EQ(execution_records + prefix_base_reads, 0);
+		UT_ASSERT(!inputs_pin_held && test_actual_cf == NoLock);
+		execution_build_done();
+	}
+}
+
+UT_TEST(test_execution_build_validates_checkpoint_window_and_complete_suffix)
+{
+	for (unsigned fault = 0; fault < 8; fault++) {
+		ClusterRelmapRetentionDirectory out = { 0 }, zero = { 0 };
+		execution_build_setup(fault == 0 ? 1 : fault == 1 ? 9 : fault == 2 ? 10 : 29, false);
+		if (fault >= 3)
+			execution_fault = fault + 1;
+		UT_ASSERT(!cluster_relmap_recovery_retention_build_start_cold_v1(0, &out));
+		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		UT_ASSERT_EQ(prefix_base_reads + custody_terminal_calls, 0);
+		UT_ASSERT(!inputs_pin_held && test_actual_cf == NoLock);
+		execution_build_done();
+	}
+}
+
+UT_TEST(test_execution_build_never_resets_old_storage)
+{
+	ClusterRelmapRetentionDirectory out = { 0 }, saved;
+	execution_build_setup(29, false);
+	for (unsigned fault = 0; fault < 4; fault++) {
+		memset(&out, 0, sizeof(out));
+		if (fault == 0)
+			out.state = CLUSTER_RELMAP_RETENTION_BUILDING;
+		if (fault == 1)
+			out.generation = 17;
+		if (fault == 2)
+			out.pins[63].wal_end = 99;
+		if (fault == 3)
+			out.state = CLUSTER_RELMAP_RETENTION_COMPLETE;
+		saved = out;
+		UT_ASSERT(!cluster_relmap_recovery_retention_build_start_cold_v1(0, &out));
+		UT_ASSERT_EQ(memcmp(&out, &saved, sizeof(out)), 0);
+	}
+	UT_ASSERT(!cluster_relmap_recovery_retention_build_start_cold_v1(0, NULL));
+	{
+		ClusterControlRootSnapshot before = execution_root;
+		UT_ASSERT(
+			!cluster_relmap_recovery_retention_build_start_cold_v1(0, (void *)&execution_root));
+		UT_ASSERT_EQ(memcmp(&before, &execution_root, sizeof(before)), 0);
+	}
+	UT_ASSERT_EQ(execution_visits + execution_records, 0);
+	UT_ASSERT(!inputs_pin_held && test_actual_cf == NoLock);
+	execution_build_done();
+}
+
+UT_TEST(test_execution_build_late_refusal_and_error_publish_nothing)
+{
+	const unsigned faults[] = { 2, 3, 9 };
+	for (unsigned i = 0; i < lengthof(faults); i++) {
+		ClusterRelmapRetentionDirectory out = { 0 }, zero = { 0 };
+		volatile bool threw = false;
+		execution_build_setup(29, false);
+		execution_fault = faults[i];
+		test_capture_error_level = true;
+		PG_TRY();
+		{
+			UT_ASSERT(!cluster_relmap_recovery_retention_build_start_cold_v1(0, &out));
+		}
+		PG_CATCH();
+		{
+			threw = true;
+		}
+		PG_END_TRY();
+		test_capture_error_level = false;
+		UT_ASSERT_EQ(threw, faults[i] != 2);
+		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		UT_ASSERT((faults[i] == 9 ? execution_records == 1 : execution_records >= 3)
+				  && custody_scope == 7);
+		UT_ASSERT(!inputs_pin_held && test_actual_cf == NoLock);
+		UT_ASSERT_EQ(prefix_base_reads + custody_terminal_calls, 0);
+		execution_build_done();
+	}
+}

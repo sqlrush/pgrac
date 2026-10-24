@@ -505,6 +505,20 @@ typedef struct RelmapRetentionCheckpointInput {
 } RelmapRetentionCheckpointInput;
 
 static bool
+retention_checkpoint_input_valid(const ClusterWalInputV1 *input)
+{
+	return input->kind == CLUSTER_WAL_INPUT_CHECKPOINT
+		   && input->checkpoint.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+		   && cluster_control_root_identity_equal(&input->source.claim.identity,
+												  &input->checkpoint.identity)
+		   && input->source.timeline == input->checkpoint.checkpoint_tli
+		   && input->native_checkpoint.ThisTimeLineID == input->source.timeline
+		   && input->native_checkpoint.redo == input->native_redo
+		   && input->native_redo >= input->checkpoint.checkpoint_lower_lsn
+		   && input->native_redo <= input->checkpoint_start;
+}
+
+static bool
 retention_checkpoint_visit(XLogReaderState *reader, void *arg)
 {
 	RelmapRetentionCheckpointInput *work = arg;
@@ -579,15 +593,7 @@ cluster_relmap_recovery_retention_build_start_v1(ClusterWalInputsV1 *inputs, uin
 			index = i;
 		}
 	}
-	if (selected == NULL || selected->kind != CLUSTER_WAL_INPUT_CHECKPOINT
-		|| selected->checkpoint.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
-		|| !cluster_control_root_identity_equal(&selected->source.claim.identity,
-												&selected->checkpoint.identity)
-		|| selected->source.timeline != selected->checkpoint.checkpoint_tli
-		|| selected->native_checkpoint.ThisTimeLineID != selected->source.timeline
-		|| selected->native_checkpoint.redo != selected->native_redo
-		|| selected->native_redo < selected->checkpoint.checkpoint_lower_lsn
-		|| selected->native_redo > selected->checkpoint_start)
+	if (selected == NULL || !retention_checkpoint_input_valid(selected))
 		return false;
 	/* Old UNKNOWN/BUILDING storage and unoccupied stale pins are not a new
 	 * directory. Do not call the resetting core on caller storage. */
@@ -621,6 +627,67 @@ cluster_relmap_recovery_retention_build_start_v1(ClusterWalInputsV1 *inputs, uin
 		return false;
 	/* No local allocation, FD, scope or pin needs cleanup on an earlier ERROR.
 	 * Only the original caller can qualify and eventually publish this build. */
+	*out = directory;
+	return true;
+}
+
+typedef struct RelmapExecutionCheckpointInput {
+	RelmapRetentionCheckpointInput input;
+	uint64 serial;
+	uint16 origin;
+} RelmapExecutionCheckpointInput;
+
+static bool
+retention_execution_checkpoint_visit(const ClusterWalRecoveryCheckpointV1 *checkpoint,
+									 const ClusterControlRootSnapshot *root, uint64 serial,
+									 XLogReaderState *reader, void *arg)
+{
+	RelmapExecutionCheckpointInput *work = arg;
+	ClusterWalInputV1 *selected = &work->input.selected;
+
+	if (checkpoint == NULL || root == NULL || serial == 0
+		|| checkpoint->source.claim.identity.origin_node_id != work->origin)
+		return false;
+	if (work->input.records == 0) {
+		selected->kind = CLUSTER_WAL_INPUT_CHECKPOINT;
+		selected->source = checkpoint->source;
+		selected->checkpoint = *root;
+		selected->checkpoint_start = checkpoint->checkpoint_start;
+		selected->native_redo = checkpoint->checkpoint.redo;
+		selected->native_checkpoint = checkpoint->checkpoint;
+		memcpy(selected->native_window, checkpoint->native_window, sizeof(selected->native_window));
+		if (!retention_checkpoint_input_valid(selected))
+			return false;
+		work->serial = serial;
+	}
+	return work->serial == serial && retention_checkpoint_visit(reader, &work->input);
+}
+
+bool
+cluster_relmap_recovery_retention_build_start_cold_v1(uint16 origin,
+													  ClusterRelmapRetentionDirectory *out)
+{
+	RelmapExecutionCheckpointInput work = { 0 };
+	ClusterRelmapRetentionDirectory directory = { 0 };
+
+	if (out == NULL || origin >= 128 || MyBackendType != B_STARTUP || !RecoveryInProgress()
+		|| CritSectionCount != 0)
+		return false;
+	for (size_t i = 0; i < sizeof(*out); i++)
+		if (((const unsigned char *)out)[i] != 0)
+			return false;
+	work.origin = origin;
+	if (!cluster_undo_recovery_cold_checkpoint_visit_v1(origin,
+														retention_execution_checkpoint_visit, &work)
+		|| !work.input.checkpoint_seen || work.serial == 0
+		|| work.input.last_end != work.input.selected.checkpoint.validated_tail_lsn_exclusive
+		|| MyBackendType != B_STARTUP || !RecoveryInProgress() || CritSectionCount != 0
+		|| cluster_relmap_retention_build_start(
+			   &directory, work.input.window.system_identifier,
+			   work.input.window.database_incarnation, work.input.window.origin, work.serial,
+			   work.input.window.native_floor, work.input.window.last_issued)
+			   != CLUSTER_RELMAP_RETENTION_OK)
+		return false;
 	*out = directory;
 	return true;
 }

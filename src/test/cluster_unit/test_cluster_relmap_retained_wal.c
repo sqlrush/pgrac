@@ -3355,7 +3355,12 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(68);
+	UT_PLAN(73);
+	UT_RUN(test_execution_build_uses_original_inputs_without_census_read_scope);
+	UT_RUN(test_execution_build_refuses_wrong_role_and_original_owner);
+	UT_RUN(test_execution_build_validates_checkpoint_window_and_complete_suffix);
+	UT_RUN(test_execution_build_never_resets_old_storage);
+	UT_RUN(test_execution_build_late_refusal_and_error_publish_nothing);
 	UT_RUN(test_origin_build_uses_original_checkpoint_and_round);
 	UT_RUN(test_origin_build_clean_checkpoint_needs_no_terminal_or_pending);
 	UT_RUN(test_origin_build_refuses_wrong_owner_and_scope);
