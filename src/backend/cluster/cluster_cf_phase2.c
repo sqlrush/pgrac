@@ -577,27 +577,25 @@ cf_phase2_trace_end(const CfPhase2Trace *trace)
 	errno = save_errno;
 }
 
-/*
- * cluster_cf_phase2_verify_or_fail -- backend entry (see header).
- */
-void
-cluster_cf_phase2_verify_or_fail(const char *pgdata)
+/* One original fresh round, including the original contract publication. */
+static bool
+cf_phase2_verify_once(const char *pgdata, int timeout_ms)
 {
 	int peer_id;
-	int timeout_ms;
 	uint64 nonce;
 	uint8 raw[8];
 	CfPhase2Trace observation = { 0 };
 	CfPhase2Trace *trace = NULL;
+	bool verified = false;
 
 	if (!cluster_controlfile_shared_authority) {
-		return;
+		return true;
 	}
 	if (!cluster_enabled || cluster_conf_node_count() <= 1)
-		return; /* single-node: no cross-node contract needed */
+		return true; /* single-node: no cross-node contract needed */
 	if (cluster_trace_control_config && CritSectionCount == 0) {
 		trace = &observation;
-		trace->timeout_ms = cluster_cf_enqueue_timeout_ms;
+		trace->timeout_ms = timeout_ms;
 	}
 
 	/*
@@ -615,14 +613,14 @@ cluster_cf_phase2_verify_or_fail(const char *pgdata)
 		if (trace != NULL)
 			trace->reason = "no_peer";
 		cf_phase2_trace_end(trace);
-		return; /* no peer configured -> gate fails closed */
+		return false; /* no peer configured -> gate fails closed */
 	}
 
 	if (!pg_strong_random(raw, sizeof(raw))) {
 		if (trace != NULL)
 			trace->reason = "nonce_unavailable";
 		cf_phase2_trace_end(trace);
-		return; /* no fresh nonce -> leave unverified */
+		return false; /* no fresh nonce -> leave unverified */
 	}
 	memcpy(&nonce, raw, sizeof(nonce));
 	if (trace != NULL)
@@ -636,7 +634,6 @@ cluster_cf_phase2_verify_or_fail(const char *pgdata)
 	 * rename visibility, times out and leaves the contract unverified (the
 	 * role gate then fails closed -- never a false CROSSNODE_VERIFIED).
 	 */
-	timeout_ms = cluster_cf_enqueue_timeout_ms;
 	if (trace != NULL)
 		trace->timeout_ms = timeout_ms;
 	if (cf_phase2_rendezvous(cluster_shared_data_dir, cluster_node_id, peer_id, nonce,
@@ -654,6 +651,7 @@ cluster_cf_phase2_verify_or_fail(const char *pgdata)
 		if (trace != NULL)
 			trace->contract_attempted = true;
 		updated = cluster_cf_contract_update_state(pgdata, CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED);
+		verified = updated;
 		if (trace != NULL)
 			trace->contract_updated = updated;
 		ereport(
@@ -662,6 +660,46 @@ cluster_cf_phase2_verify_or_fail(const char *pgdata)
 					peer_id)));
 	}
 	cf_phase2_trace_end(trace);
+	return verified;
+}
+
+void
+cluster_cf_phase2_verify_or_fail(const char *pgdata)
+{
+	(void)cf_phase2_verify_once(pgdata, cluster_cf_enqueue_timeout_ms);
+}
+
+/* Complete a missed early round while the original phase-3 owner still
+ * exists. A peer may already have left its own rendezvous, with CSSD's next
+ * responder tick later than one CF round. Never reuse that expired nonce or
+ * stretch a round's timeout: each retry is fresh and shares the caller's
+ * original phase deadline. Only actual persistence completes this wait. */
+bool
+cluster_cf_phase2_verify_pending(const char *pgdata, TimestampTz deadline)
+{
+	if (!cluster_controlfile_shared_authority || !cluster_enabled || cluster_conf_node_count() <= 1)
+		return true;
+	for (;;) {
+		TimestampTz now = GetCurrentTimestamp();
+		uint64 remaining_us;
+		int timeout_ms;
+
+		if (now >= deadline || cluster_cf_enqueue_timeout_ms <= 0)
+			return false;
+		remaining_us = (uint64)deadline - (uint64)now;
+		if (remaining_us < 1000)
+			return false;
+		timeout_ms = (int)Min((uint64)cluster_cf_enqueue_timeout_ms, remaining_us / 1000);
+		if (cf_phase2_verify_once(pgdata, timeout_ms))
+			return GetCurrentTimestamp() < deadline;
+
+		now = GetCurrentTimestamp();
+		if (now >= deadline)
+			return false;
+		CHECK_FOR_INTERRUPTS();
+		remaining_us = (uint64)deadline - (uint64)now;
+		pg_usleep((long)Min((uint64)CLUSTER_CF_PHASE2_POLL_US, remaining_us));
+	}
 }
 
 /*
