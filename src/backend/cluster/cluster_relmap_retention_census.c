@@ -66,6 +66,8 @@ struct ClusterRelmapRetentionCensus {
 	int owned_root_fd; /* -1 unless full initial construction transfers custody. */
 	bool cold_input_bound;
 	ClusterRelmapRecoverySourceObservationV1 cold_input_source;
+	/* Borrowed original protection; dependents are destroyed first. */
+	const ClusterRelmapRetentionCensus *cold_parent;
 };
 
 typedef struct CensusRecoveryItem {
@@ -419,7 +421,45 @@ census_open_context(void)
 		   && cluster_relmap_authority_x_held();
 }
 
-/* A new initial cursor cannot outlive or replace its original source owner.
+static bool
+census_cold_input_context(const ClusterRelmapRetentionCensus *census)
+{
+	for (const ClusterRelmapRetentionCensus *current = census; current != NULL;
+		 current = current->cold_parent)
+		if (current->owned_root_fd >= 0)
+			return census_open_context();
+	return true;
+}
+
+/* Original source I/O must precede these exclusively held local checks.
+ * Old physical observations stay invalid; their pins are still protection. */
+static bool
+census_cold_ancestors_current(const ClusterRelmapRetentionCensus *census)
+{
+	const ClusterRelmapRecoverySourceObservationV1 *source = &census->cold_input_source;
+
+	for (const ClusterRelmapRetentionCensus *parent = census->cold_parent; parent != NULL;
+		 parent = parent->cold_parent) {
+		const ClusterRelmapRecoverySourceObservationV1 *saved = &parent->cold_observe_source;
+		uint8 pins[32];
+
+		if (parent->result != CLUSTER_RELMAP_CENSUS_CHANGED || parent->origin_count != 1
+			|| parent->nodes[0] != census->nodes[0]
+			|| parent->cold_observe_origin != census->nodes[0]
+			|| memcmp(&saved->source, &source->source, sizeof(source->source)) != 0
+			|| memcmp(&saved->checkpoint, &source->checkpoint, sizeof(source->checkpoint)) != 0
+			|| saved->native_redo != source->native_redo
+			|| saved->scope_serial != source->scope_serial
+			|| !census_origin_same_in_state(parent, parent->nodes[0],
+											CLUSTER_RELMAP_RETENTION_UNKNOWN)
+			|| !census_recovery_pins_digest(parent, pins)
+			|| memcmp(pins, parent->cold_observe_pins, sizeof(pins)) != 0)
+			return false;
+	}
+	return true;
+}
+
+/* A produced cursor cannot outlive or replace its original source owner.
  * The source check does I/O; revoke observations even when it raises ERROR. */
 static bool
 census_initial_current(ClusterRelmapRetentionCensus *census)
@@ -433,11 +473,11 @@ census_initial_current(ClusterRelmapRetentionCensus *census)
 		accepted
 			= census->origin_count == 1 && cluster_shared_catalog
 			  && cluster_recovery_merge_claim_is_held() && cluster_relmap_authority_x_held()
-			  && (census->owned_root_fd < 0 || census_open_context())
+			  && census_cold_input_context(census)
 			  && census_cold_source_current(census, census->nodes[0], &census->cold_input_source)
-			  && cluster_shared_catalog && cluster_recovery_merge_claim_is_held()
-			  && cluster_relmap_authority_x_held()
-			  && (census->owned_root_fd < 0 || census_open_context());
+			  && census_cold_ancestors_current(census) && cluster_shared_catalog
+			  && cluster_recovery_merge_claim_is_held() && cluster_relmap_authority_x_held()
+			  && census_cold_input_context(census);
 	}
 	PG_FINALLY();
 	{
@@ -695,14 +735,15 @@ census_cold_consumer_current(const ClusterRelmapRetentionCensus *census, uint16 
 	uint8 pins[32];
 
 	/* Complete original source/owner I/O before the final local pin check. */
-	if (!census_cold_source_current(census, origin, source))
+	if (!census_cold_input_context(census) || !census_cold_source_current(census, origin, source)
+		|| !census_cold_ancestors_current(census))
 		return false;
 	for (size_t i = 0; i < census->origin_count; i++)
 		if (!census_origin_same_in_state(census, census->nodes[i], state))
 			return false;
 	return census_recovery_pins_digest(census, pins) && memcmp(pins, saved_pins, sizeof(pins)) == 0
 		   && cluster_shared_catalog && cluster_recovery_merge_claim_is_held()
-		   && cluster_relmap_authority_x_held();
+		   && cluster_relmap_authority_x_held() && census_cold_input_context(census);
 }
 
 ClusterRelmapV2ClearResult
@@ -893,6 +934,9 @@ cluster_relmap_retention_census_restart_cold(ClusterRelmapRetentionCensus *censu
 				break;
 			fresh->owned_directory = (ClusterRelmapRetentionDirectory *)directory;
 			fresh->owns_roots = true;
+			fresh->cold_input_source = census->cold_observe_source;
+			fresh->cold_input_bound = true;
+			fresh->cold_parent = census;
 			directory = NULL;
 			roots = NULL;
 			if (!census_cold_consumer_current(
@@ -1438,8 +1482,8 @@ cluster_relmap_retention_census_next_committed(ClusterRelmapRetentionCensus *cen
 	if (census->result > CLUSTER_RELMAP_CENSUS_DRAINED)
 		return census->result;
 	if (census->checked || census->result == CLUSTER_RELMAP_CENSUS_DRAINED) {
-		/* Separate from the last physical I/O tick. Initial cold cursors also
-		 * recheck their original execution source, which can perform CF I/O. */
+		/* Separate from the last physical I/O tick. Produced cold cursors
+		 * recheck original source/protection, which can perform CF I/O. */
 		if (!census_recovery_current(census))
 			return census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
 		census->result = CLUSTER_RELMAP_CENSUS_DRAINED;

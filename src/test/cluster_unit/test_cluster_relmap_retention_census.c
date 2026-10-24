@@ -1008,7 +1008,12 @@ ProcessInterrupts(void)
 int
 main(void)
 {
-	UT_PLAN(95);
+	UT_PLAN(100);
+	UT_RUN(test_census_restart_native_return_checks_original_ancestor_pins);
+	UT_RUN(test_census_restart_original_source_is_required_after_publication);
+	UT_RUN(test_census_restart_original_pin_and_metadata_checks_continue_until_native);
+	UT_RUN(test_census_restart_later_source_error_revokes_only_new_observation);
+	UT_RUN(test_census_repeated_restart_keeps_earliest_original_protection);
 	UT_RUN(test_census_initial_owner_inputs_restore_all_pending_without_old_directory);
 	UT_RUN(test_census_initial_entry_gates_budget_aliases_and_null_preserve_borrowed_inputs);
 	UT_RUN(test_census_initial_producer_refusal_metadata_and_error_revoke_only_observation);

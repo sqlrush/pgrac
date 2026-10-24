@@ -276,7 +276,12 @@ extern bool cluster_relmap_retention_census_reobserve_cold(ClusterRelmapRetentio
  * The new census owns its new ROOT and directory; destroy it on every exit,
  * before the previous census. Keep the original owner / source / fd / cuts /
  * previous directories and pins alive, unchanged and exclusively held through
- * the new census. Its images / sets remain provisional until whole-ROOT
+ * the new census. Before DRAINED and around later native preparation/consumption,
+ * recheck the original source and every predecessor's metadata / full pin bytes.
+ * Repeated restarts retain all predecessors and any original fd-owner context;
+ * destroy them in reverse order. Refusal/ERROR revokes only the new observation,
+ * without repairing or releasing changed original protection.
+ * Its images / sets remain provisional until whole-ROOT
  * DRAINED; even then the new directory stays BUILDING. No COMPLETE, old pin
  * retirement, mixed-origin qualification, G_ref / owner completion, D0,
  * allocator / live activation or replacement recovery scope is granted. */
