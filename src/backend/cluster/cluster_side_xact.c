@@ -481,13 +481,28 @@ side_xact_pi_effects_valid(const xl_xact_parsed_commit *parsed, uint64 system_id
 {
 	uint32 kinds = 0;
 
-	/* These additional transaction owners are not proved by this consumer. */
+	/* Cold completion has its own child and native stats owners. PI retains
+	 * only validated relation stats and never acquires those execution owners. */
 	if ((!cold_completion && parsed->nsubxacts != 0)
-		|| (cold_completion ? !side_xact_cold_stats_valid(parsed->nstats, parsed->stats,
-														  parsed->xinfo, parsed->dbId)
-							: parsed->nstats != 0)
+		|| (cold_completion && !side_xact_cold_stats_valid(parsed->nstats, parsed->stats,
+														 parsed->xinfo, parsed->dbId))
 		|| (parsed->xinfo & XACT_XINFO_HAS_ORIGIN) != 0)
 		return false;
+	if (!cold_completion) {
+		/* Logical pgstat keys are not physical locators or version edges.
+		 * Shared keys use dboid zero; scoped keys need the original COMMIT
+		 * database. Their original native owner still owes every deletion. */
+		for (int i = 0; i < parsed->nstats; i++) {
+			xl_xact_stats_item item;
+
+			memcpy(&item, &parsed->stats[i], sizeof(item));
+			if (item.kind != PGSTAT_KIND_RELATION || !OidIsValid(item.objoid)
+				|| (OidIsValid(item.dboid)
+					&& ((parsed->xinfo & XACT_XINFO_HAS_DBINFO) == 0
+						|| item.dboid != parsed->dbId)))
+				return false;
+		}
+	}
 	/* Every physical deletion must have its typed identity and version pair;
 	 * a prefix of the locator array cannot discharge the rest. */
 	if (parsed->nrels != 0 || parsed->nspace_drops != 0) {
