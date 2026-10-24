@@ -64,6 +64,20 @@ static bool target_match_ready;
 static unsigned target_prepare_calls, target_close_calls, target_prepare_fault;
 static bool target_held, target_throw_after_prepare;
 static unsigned hash_throw_at;
+static bool observe_reference_hash, reference_hash_refuse, reference_hash_throw;
+static unsigned reference_hash_calls;
+static const uint8 *reference_raw_output, *reference_metadata_output;
+
+static void
+reference_outputs_unpublished(void)
+{
+	if (reference_raw_output == NULL)
+		return;
+	for (unsigned i = 0; i < SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + 320; i++)
+		UT_ASSERT_EQ(reference_raw_output[i], 0xA5);
+	for (unsigned i = 0; i < sizeof(ClusterRecoveryCTRCReferenceV2); i++)
+		UT_ASSERT_EQ(reference_metadata_output[i], 0xA5);
+}
 static bool target_close_fault, execute_panic_expected;
 static int execute_report_level;
 static sigjmp_buf execute_panic_boundary;
@@ -116,6 +130,7 @@ static void
 apply_outputs_unpublished(void)
 {
 	XLogRecPtr start;
+	reference_outputs_unpublished();
 	if (apply_raw == NULL)
 		return;
 	for (unsigned i = 0; i < SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + 320; i++)
@@ -377,6 +392,16 @@ stamp_hash_create(pg_cryptohash_type type)
 	for (unsigned i = 0; i <= CLUSTER_RECOVERY_STAMP_SLOTS; i++)
 		UT_ASSERT(SpinLockFree(&region.thread_replay[i].stamp.lock));
 	hash_calls++;
+	if (observe_reference_hash && target_close_calls > 0) {
+		reference_hash_calls++;
+		UT_ASSERT(!target_held);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
+		reference_outputs_unpublished();
+		if (reference_hash_throw)
+			siglongjmp(*PG_exception_stack, 1);
+		if (reference_hash_refuse)
+			return NULL;
+	}
 	if (hash_throw_at != 0 && hash_calls == hash_throw_at)
 		siglongjmp(*PG_exception_stack, 1);
 	return pg_cryptohash_create(type);
@@ -433,6 +458,9 @@ fresh(void)
 	target_prepare_calls = target_close_calls = target_prepare_fault = 0;
 	target_held = target_throw_after_prepare = false;
 	hash_throw_at = 0;
+	observe_reference_hash = reference_hash_refuse = reference_hash_throw = false;
+	reference_hash_calls = 0;
+	reference_raw_output = reference_metadata_output = NULL;
 	target_close_fault = execute_panic_expected = false;
 	execute_report_level = 0;
 	apply_raw = apply_start = NULL;
@@ -2560,10 +2588,224 @@ UT_TEST(d0_execute_prepare_error_propagates_without_critical_entry)
 	UT_ASSERT(memcmp(raw, saved, sizeof(raw)) == 0);
 }
 
+UT_TEST(d0_execute_reference_binds_source_actual_positions_and_complete_raw)
+{
+	uint8 digests[2][32];
+	for (uint8 outcome = TT_SLOT_COMMITTED; outcome <= TT_SLOT_ABORTED; outcome++) {
+		for (unsigned variant = 0; variant < 2; variant++) {
+			ClusterRecoveryStampHandleV1 input;
+			uint8 source[32], raw[D0_RAW_BYTES + 1], metadata[sizeof(ClusterRecoveryCTRCReferenceV2) + 1];
+			ClusterRecoveryCTRCReferenceV2 reference;
+			uint8 expected[32];
+			fresh();
+			UT_ASSERT(begin_d0(&input, outcome));
+			UT_ASSERT(cluster_recovery_stamp_cancel_v1(&input));
+			memset(source, 6 + variant, sizeof(source));
+			memset(raw, 0xA5, sizeof(raw));
+			memset(metadata, 0xA5, sizeof(metadata));
+			observe_reference_hash = true;
+			reference_raw_output = raw + 1;
+			reference_metadata_output = metadata + 1;
+			UT_ASSERT(cluster_recovery_stamp_ctrc_execute_reference_v2(&owner,
+				input.payload, input.payload_length, 17, source, raw + 1, D0_RAW_BYTES,
+				(void *)(metadata + 1)));
+			UT_ASSERT_EQ(CritSectionCount, 0);
+			UT_ASSERT_EQ(reference_hash_calls, 1);
+			UT_ASSERT_EQ(native_calls, 3);
+			UT_ASSERT_EQ(flush_calls, 1);
+			UT_ASSERT_EQ(target_calls, 1);
+			UT_ASSERT_EQ(target_close_calls, 1);
+			UT_ASSERT(!target_held);
+			memcpy(&reference, metadata + 1, sizeof(reference));
+			UT_ASSERT_EQ(reference.source_index, 17);
+			UT_ASSERT_EQ(reference.start, ProcLastRecPtr);
+			UT_ASSERT_EQ(reference.end, XactLastRecEnd);
+			UT_ASSERT_EQ(reference.raw_length, D0_RAW_BYTES);
+			UT_ASSERT(reference.end != reference.start + D0_RAW_BYTES);
+			UT_ASSERT_EQ(raw[0], 0xA5);
+			UT_ASSERT_EQ(metadata[0], 0xA5);
+			UT_ASSERT(memcmp(raw + 1 + SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong,
+				input.payload, sizeof(target_payload)) == 0);
+			observe_reference_hash = false;
+			reference_raw_output = reference_metadata_output = NULL;
+			/* The standalone frozen hash has its own codec tests; here it is
+			 * the oracle for source/raw/actual-position coupling, after close. */
+			UT_ASSERT(cluster_recovery_ctrc_record_hash_v2(source, reference.start,
+				reference.end, raw + 1, D0_RAW_BYTES, expected));
+			UT_ASSERT(memcmp(expected, reference.raw_record_sha256, 32) == 0);
+			memcpy(digests[variant], reference.raw_record_sha256, 32);
+		}
+		UT_ASSERT(memcmp(digests[0], digests[1], 32) != 0);
+	}
+}
+
+UT_TEST(d0_execute_reference_invalid_inputs_aliases_refuse_before_wal)
+{
+	for (unsigned mode = 0; mode < 17; mode++) {
+		ClusterRecoveryStampHandleV1 input, saved;
+		ClusterRecoveryStampOwnerV1 changed;
+		uint8 source[32], source_before[32], raw[D0_RAW_BYTES], before[D0_RAW_BYTES];
+		ClusterRecoveryCTRCReferenceV2 reference, reference_before;
+		const ClusterRecoveryStampOwnerV1 *who = &changed;
+		const uint8 *bytes, *identity = source;
+		void *out = raw;
+		ClusterRecoveryCTRCReferenceV2 *ref_out = &reference;
+		Size length, capacity = sizeof(raw);
+		prepare_d0_inputs(&input);
+		changed = owner;
+		bytes = input.payload;
+		length = input.payload_length;
+		memset(source, 6, sizeof(source));
+		memset(raw, 0xA5, sizeof(raw));
+		memcpy(before, raw, sizeof(raw));
+		memset(&reference, 0xA5, sizeof(reference));
+		reference_before = reference;
+		switch (mode) {
+		case 0: who = NULL; break;
+		case 1: bytes = NULL; break;
+		case 2: length--; break;
+		case 3: identity = NULL; break;
+		case 4: memset(source, 0, sizeof(source)); break;
+		case 5: out = NULL; break;
+		case 6: capacity--; break;
+		case 7: ref_out = NULL; break;
+		case 8: CritSectionCount = 1; break;
+		case 9: MyBackendType = B_LMON; break;
+		case 10: ref_out = (void *)(raw + 1); break;
+		case 11: ref_out = (void *)source; break;
+		case 12: out = source; break;
+		case 13: ref_out = (void *)&changed; break;
+		case 14: out = input.payload; break;
+		case 15: ref_out = (void *)&region.thread_replay[2].stamp; break;
+		case 16: changed.executor_pid++; break;
+		}
+		saved = input;
+		memcpy(source_before, source, sizeof(source));
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_execute_reference_v2(who, bytes,
+			length, 17, identity, out, capacity, ref_out));
+		UT_ASSERT_EQ(target_prepare_calls + target_close_calls + native_calls + flush_calls + target_calls, 0);
+		UT_ASSERT_EQ(reference_hash_calls, 0);
+		UT_ASSERT(memcmp(raw, before, sizeof(raw)) == 0);
+		UT_ASSERT(memcmp(&reference, &reference_before, sizeof(reference)) == 0);
+		UT_ASSERT(memcmp(source, source_before, sizeof(source)) == 0);
+		UT_ASSERT(memcmp(&input, &saved, sizeof(input)) == 0);
+		UT_ASSERT(memcmp(&changed, &owner, sizeof(owner)) == 0 || mode == 16);
+	}
+	CritSectionCount = 0;
+}
+
+static void
+reference_fixture_inputs(ClusterRecoveryStampHandleV1 *input, uint8 source[32],
+	uint8 raw[D0_RAW_BYTES], ClusterRecoveryCTRCReferenceV2 *reference)
+{
+	prepare_d0_inputs(input);
+	memset(source, 6, 32);
+	memset(raw, 0xA5, D0_RAW_BYTES);
+	memset(reference, 0xA5, sizeof(*reference));
+	observe_reference_hash = true;
+	reference_raw_output = raw;
+	reference_metadata_output = (const uint8 *)reference;
+}
+
+UT_TEST(d0_execute_reference_original_refusal_never_hashes_or_publishes)
+{
+	for (unsigned mode = 0; mode < 3; mode++) {
+		ClusterRecoveryStampHandleV1 input;
+		uint8 source[32], raw[D0_RAW_BYTES];
+		ClusterRecoveryCTRCReferenceV2 reference;
+		reference_fixture_inputs(&input, source, raw, &reference);
+		if (mode == 0) target_prepare_fault = 1;
+		if (mode == 1) target_match_ready = false;
+		if (mode == 2) target_close_fault = true;
+		UT_ASSERT(!cluster_recovery_stamp_ctrc_execute_reference_v2(&owner,
+			input.payload, input.payload_length, 17, source, raw, sizeof(raw), &reference));
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT_EQ(reference_hash_calls, 0);
+		UT_ASSERT_EQ(target_calls, mode == 2);
+		UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
+		reference_outputs_unpublished();
+	}
+	reference_raw_output = reference_metadata_output = NULL;
+}
+
+UT_TEST(d0_execute_reference_hash_refusal_keeps_completed_operation_and_outputs)
+{
+	ClusterRecoveryStampHandleV1 input;
+	uint8 source[32], raw[D0_RAW_BYTES];
+	ClusterRecoveryCTRCReferenceV2 reference;
+	reference_fixture_inputs(&input, source, raw, &reference);
+	reference_hash_refuse = true;
+	UT_ASSERT(!cluster_recovery_stamp_ctrc_execute_reference_v2(&owner,
+		input.payload, input.payload_length, 17, source, raw, sizeof(raw), &reference));
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(reference_hash_calls, 1);
+	UT_ASSERT_EQ(native_calls, 3);
+	UT_ASSERT_EQ(target_calls, 1);
+	UT_ASSERT_EQ(target_close_calls, 1);
+	UT_ASSERT(!target_held);
+	UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
+	reference_outputs_unpublished();
+	reference_raw_output = reference_metadata_output = NULL;
+}
+
+UT_TEST(d0_execute_reference_hash_error_propagates_after_completed_close)
+{
+	ClusterRecoveryStampHandleV1 input;
+	uint8 source[32], raw[D0_RAW_BYTES];
+	ClusterRecoveryCTRCReferenceV2 reference;
+	volatile bool caught = false;
+	reference_fixture_inputs(&input, source, raw, &reference);
+	reference_hash_throw = true;
+	PG_TRY();
+	{
+		(void)cluster_recovery_stamp_ctrc_execute_reference_v2(&owner,
+			input.payload, input.payload_length, 17, source, raw, sizeof(raw), &reference);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(reference_hash_calls, 1);
+	UT_ASSERT_EQ(native_calls, 3);
+	UT_ASSERT_EQ(target_calls, 1);
+	UT_ASSERT_EQ(target_close_calls, 1);
+	UT_ASSERT(!target_held);
+	UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
+	reference_outputs_unpublished();
+	reference_raw_output = reference_metadata_output = NULL;
+}
+
+UT_TEST(d0_execute_reference_postinsert_panic_preserves_original_duty)
+{
+	ClusterRecoveryStampHandleV1 input;
+	uint8 source[32], raw[D0_RAW_BYTES];
+	ClusterRecoveryCTRCReferenceV2 reference;
+	reference_fixture_inputs(&input, source, raw, &reference);
+	cover_enabled = false;
+	execute_panic_expected = true;
+	if (sigsetjmp(execute_panic_boundary, 1) == 0) {
+		(void)cluster_recovery_stamp_ctrc_execute_reference_v2(&owner,
+			input.payload, input.payload_length, 17, source, raw, sizeof(raw), &reference);
+		UT_ASSERT(false);
+	}
+	UT_ASSERT_EQ(CritSectionCount, 1);
+	UT_ASSERT_EQ(execute_report_level, PANIC);
+	UT_ASSERT_EQ(reference_hash_calls, 0);
+	UT_ASSERT_EQ(target_close_calls, 0);
+	UT_ASSERT(target_held);
+	UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_INSERTED);
+	reference_outputs_unpublished();
+	CritSectionCount = 0;
+	reference_raw_output = reference_metadata_output = NULL;
+}
+
 int
 main(void)
 {
-	UT_PLAN(57);
+	UT_PLAN(63);
 	UT_RUN(exact_lifecycle_and_owned_payload);
 	UT_RUN(preinsert_cancel_capture_and_new_sequence);
 	UT_RUN(inserting_failure_exit_and_replay_reset_cannot_retire);
@@ -2621,6 +2863,12 @@ main(void)
 	UT_RUN(d0_execute_native_errors_propagate_in_original_critical_section);
 	UT_RUN(d0_execute_close_refusal_does_not_publish_durable_result);
 	UT_RUN(d0_execute_prepare_error_propagates_without_critical_entry);
+	UT_RUN(d0_execute_reference_binds_source_actual_positions_and_complete_raw);
+	UT_RUN(d0_execute_reference_invalid_inputs_aliases_refuse_before_wal);
+	UT_RUN(d0_execute_reference_original_refusal_never_hashes_or_publishes);
+	UT_RUN(d0_execute_reference_hash_refusal_keeps_completed_operation_and_outputs);
+	UT_RUN(d0_execute_reference_hash_error_propagates_after_completed_close);
+	UT_RUN(d0_execute_reference_postinsert_panic_preserves_original_duty);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

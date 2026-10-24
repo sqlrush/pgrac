@@ -7,6 +7,7 @@
 #include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_recovery_tt_record.h"
+#include "cluster/cluster_recovery_ctrc_record.h"
 #include "storage/spin.h"
 
 #define CLUSTER_RECOVERY_STAMP_PAYLOAD_BYTES 320
@@ -173,6 +174,20 @@ extern XLogRecPtr cluster_recovery_stamp_ctrc_apply_v2(
 extern XLogRecPtr cluster_recovery_stamp_ctrc_execute_v2(
 	const ClusterRecoveryStampOwnerV1 *owner, const uint8 *payload, Size length,
 	void *raw, Size raw_length, XLogRecPtr *start);
+/* Complete the original dormant executor, then hash its owned full native
+ * record outside the critical section and publish raw bytes + exact R together.
+ * The caller retains the ROOT-selected source index/identity, original writer,
+ * cut/pins/qualification and immutable inputs; this does not establish them.
+ * The 357B raw buffer and reference output must be private and disjoint from
+ * each other, all inputs and the live replay region. Both remain unchanged
+ * on refusal/ERROR. A refused hash after completion does not undo/redo or mark
+ * the completed operation failed. Native postinsert PANIC remains unchanged.
+ * Never backfill this external reference into its D0 payload or same graph;
+ * no live caller, semantic completion, floor/issued or release authority. */
+extern bool cluster_recovery_stamp_ctrc_execute_reference_v2(
+	const ClusterRecoveryStampOwnerV1 *owner, const uint8 *payload, Size length,
+	uint32 source_index, const uint8 source_identity_digest[32], void *raw,
+	Size raw_length, ClusterRecoveryCTRCReferenceV2 *out);
 /* Only the original executor calls durable after real WAL flush and exact
  * target sync/postread. These APIs record completion, never prove it. */
 extern bool cluster_recovery_stamp_durable_v1(const ClusterRecoveryStampHandleV1 *handle);

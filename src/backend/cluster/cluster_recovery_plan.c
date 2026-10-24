@@ -1165,6 +1165,58 @@ cluster_recovery_stamp_ctrc_execute_v2(const ClusterRecoveryStampOwnerV1 *owner,
 }
 
 bool
+cluster_recovery_stamp_ctrc_execute_reference_v2(const ClusterRecoveryStampOwnerV1 *owner,
+	const uint8 *payload, Size length, uint32 source_index,
+	const uint8 source_identity_digest[32], void *raw, Size raw_length,
+	ClusterRecoveryCTRCReferenceV2 *out)
+{
+	uint8 copy[SizeOfXLogRecord + SizeOfXLogRecordDataHeaderLong + CLUSTER_RECOVERY_CTRC_BYTES];
+	ClusterRecoveryCTRCReferenceV2 reference = { 0 };
+	uint8 source_nonzero = 0;
+
+	/* A malformed external source/output must not be discovered only after
+	 * emitting a durable record. Do not overwrite an input or a live slot. */
+	if (!stamp_actor() || MyBackendType != B_STARTUP || CritSectionCount != 0
+		|| cluster_recovery_plan_shmem == NULL || owner == NULL || payload == NULL
+		|| source_identity_digest == NULL || raw == NULL || out == NULL
+		|| length != CLUSTER_RECOVERY_CTRC_BYTES || raw_length != sizeof(copy)
+		|| stamp_ranges_overlap(raw, raw_length, out, sizeof(*out))
+		|| stamp_ranges_overlap(raw, raw_length, owner, sizeof(*owner))
+		|| stamp_ranges_overlap(out, sizeof(*out), owner, sizeof(*owner))
+		|| stamp_ranges_overlap(raw, raw_length, payload, length)
+		|| stamp_ranges_overlap(out, sizeof(*out), payload, length)
+		|| stamp_ranges_overlap(raw, raw_length, source_identity_digest, 32)
+		|| stamp_ranges_overlap(out, sizeof(*out), source_identity_digest, 32)
+		|| stamp_ranges_overlap(raw, raw_length, cluster_recovery_plan_shmem,
+			   sizeof(*cluster_recovery_plan_shmem))
+		|| stamp_ranges_overlap(out, sizeof(*out), cluster_recovery_plan_shmem,
+			   sizeof(*cluster_recovery_plan_shmem)))
+		return false;
+	for (unsigned i = 0; i < 32; i++)
+		source_nonzero |= source_identity_digest[i];
+	if (source_nonzero == 0)
+		return false;
+
+	/* Only the original owner supplies the final raw bytes and actual end.
+	 * No source qualification is inferred from a nonzero digest/index. */
+	reference.end = cluster_recovery_stamp_ctrc_execute_v2(owner, payload, length,
+		copy, sizeof(copy), &reference.start);
+	if (reference.end == InvalidXLogRecPtr)
+		return false;
+	reference.source_index = source_index;
+	reference.raw_length = sizeof(copy);
+	/* The window is already complete and the target closed. The existing
+	 * full-record SHA may refuse/raise ERROR here; never reopen or relabel
+	 * that completed operation, or publish either partial public output. */
+	if (!cluster_recovery_ctrc_record_hash_v2(source_identity_digest, reference.start,
+			reference.end, copy, sizeof(copy), reference.raw_record_sha256))
+		return false;
+	memcpy(raw, copy, sizeof(copy));
+	memcpy(out, &reference, sizeof(reference));
+	return true;
+}
+
+bool
 cluster_recovery_stamp_durable_v1(const ClusterRecoveryStampHandleV1 *handle)
 {
 	return stamp_transition(handle, CLUSTER_RECOVERY_STAMP_INSERTED, CLUSTER_RECOVERY_STAMP_DURABLE,
