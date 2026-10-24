@@ -43,27 +43,46 @@ UT_DEFINE_GLOBALS();
 bool cluster_enabled, cluster_shared_catalog, cluster_xid_striping;
 int cluster_node_id = 4, cluster_xid_herding_slack = 4194304;
 bool IsUnderPostmaster;
+bool IsPostmasterEnvironment;
+AuxProcType MyAuxProcType = NotAnAuxProcess;
 ProcessingMode Mode = NormalProcessing;
 static VariableCacheData variables;
 VariableCache ShmemVariableCache = &variables;
-static PGPROC proc;
-PGPROC *MyProc = &proc;
+static PGPROC entries[2];
+PGPROC *MyProc = &entries[0];
 static PROC_HDR procs;
 PROC_HDR *ProcGlobal = &procs;
-static TransactionId visible_xids[1];
-static XidCacheStatus subxids[1];
+static TransactionId visible_xids[2];
+static XidCacheStatus subxids[2];
+static uint8 status_flags[2];
 static LWLockPadded locks[NUM_INDIVIDUAL_LWLOCKS];
 LWLockPadded *MainLWLockArray = locks;
 static bool held, reservation, jump, advance_while_unlocked;
 static unsigned waits, extensions, early_extensions, lock_errors;
-static bool sampling;
+static bool sampling, lifecycle;
 static LWLock *held_lock;
+static LWLockMode held_mode;
 static unsigned sample_lock_phase;
-static char array_storage[offsetof(ProcArrayStruct, pgprocnos) + sizeof(int)]
+static char array_storage[offsetof(ProcArrayStruct, pgprocnos) + 2 * sizeof(int)]
 	pg_attribute_aligned(MAXIMUM_ALIGNOF);
 static ProcArrayStruct *procArray = (ProcArrayStruct *) array_storage;
 static uint64 floor_full, limit_full;
 int cluster_injection_armed_count;
+BackendId MyBackendId;
+static GlobalTransaction MyLockedGxact;
+static TransactionId completed_xid;
+
+static void
+MaintainLatestCompletedXid(TransactionId xid)
+{
+	completed_xid = xid;
+}
+
+bool
+LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
+{
+	return held && held_lock == lock && held_mode == mode;
+}
 
 bool
 IsInParallelMode(void)
@@ -78,13 +97,16 @@ RecoveryInProgress(void)
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
-	if (held || (!sampling && (lock != XidGenLock || mode != LW_EXCLUSIVE))
+	if (held || (lifecycle && (mode != LW_EXCLUSIVE
+			|| (lock != ProcArrayLock && lock != TwoPhaseStateLock)))
+		|| (!lifecycle && !sampling && (lock != XidGenLock || mode != LW_EXCLUSIVE))
 		|| (sampling && (mode != LW_SHARED
 			|| (sample_lock_phase == 0 ? lock != XidGenLock
 				: sample_lock_phase != 2 || lock != ProcArrayLock))))
 		lock_errors++;
 	held = true;
 	held_lock = lock;
+	held_mode = mode;
 	if (sampling)
 		sample_lock_phase++;
 	return false;
@@ -93,14 +115,14 @@ void
 LWLockRelease(LWLock *lock)
 {
 	FullTransactionId published = FullTransactionIdFromU64(
-		pg_atomic_read_u64(&proc.cluster_top_full_xid_atomic));
+		pg_atomic_read_u64(&entries[0].cluster_top_full_xid_atomic));
 
 	if (!held || lock != held_lock)
 		lock_errors++;
 	/* Observe the publication itself, not an epoch guessed from the already
 	 * advanced nextXid. Tests below compare the exact allocator return too. */
-	if (TransactionIdIsNormal(proc.xid) &&
-		(!FullTransactionIdIsNormal(published) || XidFromFullTransactionId(published) != proc.xid))
+	if (TransactionIdIsNormal(entries[0].xid) &&
+		(!FullTransactionIdIsNormal(published) || XidFromFullTransactionId(published) != entries[0].xid))
 		lock_errors++;
 	if (sampling)
 		sample_lock_phase++;
@@ -225,25 +247,30 @@ static void
 reset_allocator(void)
 {
 	memset(&variables, 0, sizeof(variables));
-	memset(&proc, 0, sizeof(proc));
+	memset(entries, 0, sizeof(entries));
 	memset(&procs, 0, sizeof(procs));
 	memset(subxids, 0, sizeof(subxids));
 	memset(visible_xids, 0, sizeof(visible_xids));
+	memset(status_flags, 0, sizeof(status_flags));
 	memset(array_storage, 0, sizeof(array_storage));
 	procArray->numProcs = procArray->maxProcs = 1;
 	procArray->pgprocnos[0] = 0;
 	variables.nextXid = FullTransactionIdFromU64(2052);
 	variables.xidVacLimit = UINT32_MAX / 4;
 	procs.xids = visible_xids;
-	procs.allProcs = &proc;
+	procs.allProcs = &entries[0];
 	procs.subxidStates = subxids;
+	procs.statusFlags = status_flags;
 	held = reservation = jump = advance_while_unlocked = false;
 	cluster_enabled = cluster_shared_catalog = cluster_xid_striping = true;
 	waits = extensions = early_extensions = lock_errors = 0;
 	floor_full = limit_full = 0;
-	sampling = false;
+	sampling = lifecycle = false;
 	held_lock = NULL;
 	sample_lock_phase = 0;
+	MyBackendId = 19;
+	MyLockedGxact = NULL;
+	completed_xid = InvalidTransactionId;
 }
 
 UT_TEST(no_storage_or_procarray_mutation_before_reservation)
@@ -254,7 +281,7 @@ UT_TEST(no_storage_or_procarray_mutation_before_reservation)
 	UT_ASSERT_EQ(early_extensions, 0);
 	UT_ASSERT_EQ(lock_errors, 0);
 	UT_ASSERT(!held);
-	UT_ASSERT_EQ(proc.xid, 2052);
+	UT_ASSERT_EQ(entries[0].xid, 2052);
 	UT_ASSERT_EQ(visible_xids[0], 2052);
 }
 UT_TEST(wait_rederives_native_counter_and_new_boot_floor)
@@ -263,7 +290,7 @@ UT_TEST(wait_rederives_native_counter_and_new_boot_floor)
 	advance_while_unlocked = true;
 	UT_ASSERT_EQ(U64FromFullTransactionId(GetNewTransactionId(true)), 2084);
 	UT_ASSERT_EQ(subxids[0].count, 1);
-	UT_ASSERT_EQ(proc.subxids.xids[0], 2084);
+	UT_ASSERT_EQ(entries[0].subxids.xids[0], 2084);
 	UT_ASSERT_EQ(lock_errors, 0);
 	reset_allocator();
 	jump = true;
@@ -290,13 +317,13 @@ UT_TEST(original_top_fullxid_is_published_and_subxid_does_not_replace_it)
 	cluster_enabled = cluster_shared_catalog = cluster_xid_striping = false;
 	variables.nextXid = FullTransactionIdFromEpochAndXid(7, 2053);
 	top = GetNewTransactionId(false);
-	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_top_full_xid_atomic),
+	UT_ASSERT_EQ(pg_atomic_read_u64(&entries[0].cluster_top_full_xid_atomic),
 				 U64FromFullTransactionId(top));
 	child = GetNewTransactionId(true);
 	UT_ASSERT(FullTransactionIdFollows(child, top));
-	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_top_full_xid_atomic),
+	UT_ASSERT_EQ(pg_atomic_read_u64(&entries[0].cluster_top_full_xid_atomic),
 				 U64FromFullTransactionId(top));
-	UT_ASSERT_EQ(proc.xid, XidFromFullTransactionId(top));
+	UT_ASSERT_EQ(entries[0].xid, XidFromFullTransactionId(top));
 	UT_ASSERT_EQ(lock_errors, 0);
 	UT_ASSERT(!held);
 }
@@ -313,9 +340,9 @@ UT_TEST(raw_wrap_preserves_the_allocated_top_epoch)
 	UT_ASSERT_EQ(U64FromFullTransactionId(top), (UINT64CONST(7) << 32) + UINT32_MAX);
 	UT_ASSERT_EQ(EpochFromFullTransactionId(child), 8);
 	UT_ASSERT_EQ(XidFromFullTransactionId(child), FirstNormalTransactionId);
-	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_top_full_xid_atomic),
+	UT_ASSERT_EQ(pg_atomic_read_u64(&entries[0].cluster_top_full_xid_atomic),
 				 U64FromFullTransactionId(top));
-	UT_ASSERT_EQ(proc.xid, UINT32_MAX);
+	UT_ASSERT_EQ(entries[0].xid, UINT32_MAX);
 	{
 		FullTransactionId n, future, minimum;
 		ClusterXidStripeSampleFence fence;
@@ -341,9 +368,9 @@ UT_TEST(real_sample_keeps_original_top_when_child_cache_overflows)
 	top = GetNewTransactionId(false);
 	for (unsigned i = 0; i < PGPROC_MAX_CACHED_SUBXIDS + 2; i++)
 		(void) GetNewTransactionId(true);
-	UT_ASSERT(proc.subxidStatus.overflowed);
-	UT_ASSERT_EQ(proc.subxidStatus.count, PGPROC_MAX_CACHED_SUBXIDS);
-	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_top_full_xid_atomic),
+	UT_ASSERT(entries[0].subxidStatus.overflowed);
+	UT_ASSERT_EQ(entries[0].subxidStatus.count, PGPROC_MAX_CACHED_SUBXIDS);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&entries[0].cluster_top_full_xid_atomic),
 				 U64FromFullTransactionId(top));
 	sampling = true;
 	UT_ASSERT(ProcArrayGetActiveFullXidSample(&n, &future, &minimum, &fence));
@@ -374,10 +401,83 @@ UT_TEST(real_sample_refuses_raw_publication_that_does_not_match_allocation)
 	UT_ASSERT(!held);
 }
 
+static void
+assert_sample_minimum(FullTransactionId expected)
+{
+	FullTransactionId reference, future, minimum;
+	ClusterXidStripeSampleFence fence;
+
+	sampling = true;
+	sample_lock_phase = 0;
+	UT_ASSERT(ProcArrayGetActiveFullXidSample(&reference, &future, &minimum, &fence));
+	sampling = false;
+	UT_ASSERT(FullTransactionIdEquals(minimum, expected));
+	UT_ASSERT(FullTransactionIdEquals(reference, variables.nextXid));
+	UT_ASSERT(FullTransactionIdEquals(future, reference));
+	UT_ASSERT_EQ(sample_lock_phase, 4);
+	UT_ASSERT_EQ(lock_errors, 0);
+	UT_ASSERT(!held);
+}
+
+UT_TEST(real_prepare_retains_the_allocated_identity_until_its_own_retirement)
+{
+	GlobalTransactionData gxact = {0};
+	FullTransactionId top;
+	PGPROC *prepared = &entries[1];
+
+	reset_allocator();
+	cluster_enabled = cluster_shared_catalog = cluster_xid_striping = false;
+	variables.nextXid = FullTransactionIdFromEpochAndXid(7, UINT32_MAX);
+	top = GetNewTransactionId(false);
+	for (unsigned i = 0; i <= PGPROC_MAX_CACHED_SUBXIDS; i++)
+		(void) GetNewTransactionId(true);
+	UT_ASSERT_EQ(U64FromFullTransactionId(top), (UINT64CONST(7) << 32) | UINT32_MAX);
+	UT_ASSERT(entries[0].subxidStatus.overflowed);
+	assert_sample_minimum(top);
+
+	lifecycle = true;
+	entries[0].lxid = 8;
+	gxact.pgprocno = 1;
+	LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);
+	MarkAsPreparingGuts(&gxact, XidFromFullTransactionId(top), "actual", 123, 456, 789);
+	LWLockRelease(TwoPhaseStateLock);
+	lifecycle = false;
+	UT_ASSERT(MyLockedGxact == &gxact);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&prepared->cluster_top_full_xid_atomic),
+				 U64FromFullTransactionId(top));
+	/* ProcArray membership is a fixture boundary. Neither original identity
+	 * is supplied here: the dummy's raw/full values came from the real body. */
+	procArray->numProcs = procArray->maxProcs = 2;
+	procArray->pgprocnos[1] = 1;
+	prepared->pgxactoff = 1;
+	visible_xids[1] = prepared->xid;
+	assert_sample_minimum(top);
+
+	lifecycle = true;
+	ProcArrayClearTransaction(MyProc);
+	lifecycle = false;
+	UT_ASSERT_EQ(pg_atomic_read_u64(&entries[0].cluster_top_full_xid_atomic), 0);
+	UT_ASSERT_EQ(visible_xids[0], InvalidTransactionId);
+	UT_ASSERT_EQ(entries[0].subxidStatus.count, 0);
+	UT_ASSERT(!entries[0].subxidStatus.overflowed);
+	UT_ASSERT_EQ(variables.xactCompletionCount, 1);
+	assert_sample_minimum(top);
+
+	lifecycle = true;
+	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+	ProcArrayEndTransactionInternal(prepared, XidFromFullTransactionId(top));
+	LWLockRelease(ProcArrayLock);
+	lifecycle = false;
+	UT_ASSERT_EQ(pg_atomic_read_u64(&prepared->cluster_top_full_xid_atomic), 0);
+	UT_ASSERT_EQ(visible_xids[1], InvalidTransactionId);
+	UT_ASSERT_EQ(completed_xid, XidFromFullTransactionId(top));
+	assert_sample_minimum(variables.nextXid);
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
 	UT_RUN(no_storage_or_procarray_mutation_before_reservation);
 	UT_RUN(wait_rederives_native_counter_and_new_boot_floor);
 	UT_RUN(native_allocation_preserves_ordinary_counter);
@@ -385,6 +485,7 @@ main(void)
 	UT_RUN(raw_wrap_preserves_the_allocated_top_epoch);
 	UT_RUN(real_sample_keeps_original_top_when_child_cache_overflows);
 	UT_RUN(real_sample_refuses_raw_publication_that_does_not_match_allocation);
+	UT_RUN(real_prepare_retains_the_allocated_identity_until_its_own_retirement);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
