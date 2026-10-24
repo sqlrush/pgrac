@@ -28,6 +28,8 @@
 #define cluster_lms_get_shard_master_generation retained_grd_generation
 #define errfinish retained_grd_errfinish
 #define ProcGlobal retained_grd_proc_global
+#define InterruptPending retained_grd_interrupt_pending
+#define ProcessInterrupts retained_grd_process_interrupts
 #include "test_cluster_grd.c"
 #undef main
 #undef ShmemInitStruct
@@ -39,11 +41,14 @@
 #undef cluster_lms_get_shard_master_generation
 #undef errfinish
 #undef ProcGlobal
+#undef InterruptPending
+#undef ProcessInterrupts
 
 #include <sys/wait.h>
 #include <unistd.h>
 #include "access/xact.h"
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_ges_holder.h"
 #include "cluster/cluster_ges_dedup.h"
@@ -168,6 +173,25 @@ static bool relation_case;
 static int ko_sample_calls;
 static int ko_accept_calls;
 
+/* This composition has no KO shared registry or content-trace publisher.
+ * Keep those external boundaries explicitly empty; GRD/GES are real. */
+bool
+cluster_ko_ax_native_wait_v3(const LOCKTAG *tag, bool dontwait)
+{
+	return true;
+}
+
+bool
+cluster_ko_ax_acquire_pending_v3(const ClusterResId *resid, uint32 procno, uint32 group)
+{
+	return false;
+}
+
+void
+cluster_content_trace_wait_clear(ClusterContentTraceWait kind)
+{
+}
+
 /* Real S3/GES/S5, with the KO owner an explicit boundary. Acceptance must
  * arrive before consumption, after both exact promotion/proof checks. */
 uint64
@@ -215,6 +239,9 @@ static bool release_case;
 static ReleaseFault release_fault;
 static bool release_route_changed;
 static int cooperative_sleeps;
+static int hw_release_after_sleeps;
+static ConditionVariable *hw_wait_cv;
+static unsigned hw_wait_broadcasts;
 static int cooperative_drift;
 static bool guard_armed;
 static int guard_reads;
@@ -397,15 +424,16 @@ ConditionVariableCancelSleep(void)
 void
 ConditionVariableBroadcast(ConditionVariable *cv)
 {
-	(void)cv;
+	if (hw_local_case && cv == hw_wait_cv)
+		hw_wait_broadcasts++;
 }
 bool
 ConditionVariableTimedSleep(ConditionVariable *cv, long ms, uint32 event)
 {
-	(void)cv;
+	hw_wait_cv = cv;
 	(void)event;
 	cooperative_sleeps++;
-	if (hw_release_on_wait != NULL) {
+	if (hw_release_on_wait != NULL && cooperative_sleeps >= hw_release_after_sleeps) {
 		const ClusterLockAcquireRequest *owner = hw_release_on_wait;
 		int procno = MyProc->pgprocno;
 		hw_release_on_wait = NULL;
@@ -1859,6 +1887,9 @@ hw_local_competitors(ClusterLockAcquireRequest *a, ClusterLockAcquireRequest *b)
 	hw_local_case = true;
 	hw_release_on_wait = NULL;
 	cooperative_sleeps = 0;
+	hw_release_after_sleeps = 0;
+	hw_wait_cv = NULL;
+	hw_wait_broadcasts = 0;
 	*b = *a;
 	b->holder = grd_lifecycle_holder(3, 22, 202);
 	b->holder.cluster_epoch = 1;
@@ -1903,6 +1934,37 @@ UT_TEST(hw_local_two_reservations_survive_exact_grants)
 	UT_ASSERT_EQ(request_sent, 0);
 	UT_ASSERT_EQ(ut_mock_epoch, 1);
 	MyProc = NULL;
+}
+
+UT_TEST(hw_blocking_queue_survives_retry_ticks_until_holder_wakes_it)
+{
+	ClusterLockAcquireRequest a, b;
+	ClusterLockAcquireResult a3, b3;
+	TimestampTz started;
+
+	hw_local_competitors(&a, &b);
+	b.timeout_ms = -1; /* The HW wrapper's blocking policy. */
+	cluster_ges_request_timeout_ms = 1;
+	a3 = cluster_lock_acquire_s3_partition_reservation(&a);
+	MyProc->pgprocno = 22;
+	b3 = cluster_lock_acquire_s3_partition_reservation(&b);
+	hw_dispatch_reserved(&a, a3);
+	UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&a), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	hw_release_on_wait = &a;
+	hw_release_after_sleeps = 4;
+	started = GetCurrentTimestamp();
+	/* Real GRD queue + S6 drain + reply publication; only scheduling and
+	 * CV sleep are cooperative fixtures. Three recovery ticks are not errors. */
+	hw_dispatch_reserved(&b, b3);
+	UT_ASSERT_EQ(cooperative_sleeps, 4);
+	UT_ASSERT(GetCurrentTimestamp() - started >= 3000000);
+	UT_ASSERT(hw_wait_broadcasts > 0);
+	UT_ASSERT(hw_release_on_wait == NULL);
+	UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&b), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(cluster_lock_acquire_s6_release(&b), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+	UT_ASSERT_EQ(request_sent, 0); /* Local-master wait needs no polling messages. */
+	cluster_ges_request_timeout_ms = 5000;
 }
 
 UT_TEST(object_startup_compatible_reservations_survive_registration)
@@ -2527,7 +2589,7 @@ main(void)
 	MyBackendType = B_BACKEND; /* Definition belongs to the embedded GRD fixture. */
 	setvbuf(stdout, NULL, _IONBF, 0);
 	alarm(30); /* Standalone fixture owner, not a database deadline. */
-	UT_PLAN(51);
+	UT_PLAN(52);
 	UT_RUN(no_sibling_control);
 	UT_RUN(real_grant_sibling_promotes);
 	UT_RUN(relation_share_grant_survives_compatible_sibling);
@@ -2568,6 +2630,7 @@ main(void)
 	UT_RUN(hw_local_cancel_after_grant_keeps_exact_cleanup_owner);
 	UT_RUN(hw_local_grant_rejects_epoch_change_before_promotion);
 	UT_RUN(hw_local_two_reservations_survive_exact_grants);
+	UT_RUN(hw_blocking_queue_survives_retry_ticks_until_holder_wakes_it);
 	UT_RUN(object_startup_compatible_reservations_survive_registration);
 	UT_RUN(native_request_reservation_capacity_remains_bounded);
 	UT_RUN(hw_local_release_does_not_invalidate_another_reserved_request);

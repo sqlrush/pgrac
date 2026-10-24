@@ -354,16 +354,21 @@ extern void cluster_hw_apply_hwm(const ClusterResId *resid, BlockNumber hwm);
  */
 typedef struct HwLock {
 	bool held;
-	bool coordinated;			   /* false on OK_NATIVE: release is a no-op */
+	bool coordinated;			   /* held GLOBALIZE HW always requires GES coordination */
 	ClusterLockAcquireRequest req; /* resid + holder + request_id for the release */
 } HwLock;
 
 /*
  * cluster_hw_lock / cluster_hw_unlock -- acquire/release HW(X) on a (rel,fork)
  * over the spec-5.3 GES substrate (mirrors cluster_cf_lock).  cluster_hw_lock
- * fills *lk and returns true if HW(X) is held (whether GES-coordinated or, when
- * the cluster/LMS layer is inactive, locally), false when it could not be proven
- * held so the caller fails closed (53RA6).  cluster_hw_unlock releases it
+ * fills *lk and returns true only if HW(X) is proven GES-coordinated. An
+ * inactive cluster/LMS layer is not a native grant for GLOBALIZE. Returns false
+ * when HW(X) could not be proven
+ * held so the caller fails closed (53RA6). Ordinary contention waits for
+ * the holder's release/grant event without a request deadline; timed GES
+ * sleeps only recover lost transport/wakeup. Retransmission must be enabled,
+ * matching the existing GES perpetual-wait configuration invariant.
+ * cluster_hw_unlock releases it
  * (draining/waking cross-node waiters via S6); a no-op if not held.
  */
 extern bool cluster_hw_lock(const ClusterResId *resid, HwLock *lk);
