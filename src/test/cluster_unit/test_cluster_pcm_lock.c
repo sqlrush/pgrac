@@ -68,6 +68,7 @@
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_wait_trace.h"
+#include "cluster/cluster_wait_graph.h"
 #include "port/pg_crc32c.h"
 #include "miscadmin.h"
 #include "storage/backendid.h"	   /* spec-6.14 D9 amend — MyBackendId stub */
@@ -1040,9 +1041,12 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 	return true;
 }
 
+static int wait_graph_conditional_fail_at;
 bool
 LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
 {
+	if (wait_graph_conditional_fail_at > 0 && --wait_graph_conditional_fail_at == 0)
+		return false;
 	if (fake_lwlock_conditional_fail_once) {
 		fake_lwlock_conditional_fail_once = false;
 		return false;
@@ -20920,6 +20924,40 @@ UT_TEST(test_pcm_dead_node_cleanup_drops_holder_records)
 	UT_ASSERT_EQ(cluster_pcm_lock_clear_pending_x_if(stag, 2), false);
 }
 
+UT_TEST(test_pcm_wait_graph_copy_is_owned_and_busy_never_waits)
+{
+	BufferTag tag = make_tag(1097), absent = make_tag(1098);
+	ClusterWaitGraphPcmSnapshot *snapshot = calloc(1, sizeof(*snapshot));
+	uint64 transitions;
+	UT_ASSERT(snapshot != NULL);
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 1;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	cluster_node_id = 2;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	cluster_pcm_lock_set_pending_x(tag, 3, 0x1234);
+	transitions = cluster_pcm_get_trans_n_to_s_count();
+	cluster_pcm_wait_graph_snapshot(&tag, snapshot);
+	UT_ASSERT_EQ(snapshot->status, CLWG_OBSERVED);
+	UT_ASSERT(snapshot->view.tag_known && snapshot->view.entry_known);
+	UT_ASSERT_EQ(snapshot->view.s_holders, (1U << 1) | (1U << 2));
+	UT_ASSERT_EQ(snapshot->view.pending_requester, 3);
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	for (int fail_at = 1; fail_at <= 2; fail_at++) {
+		wait_graph_conditional_fail_at = fail_at;
+		cluster_pcm_wait_graph_snapshot(&tag, snapshot);
+		UT_ASSERT_EQ(snapshot->status, CLWG_BUSY);
+		UT_ASSERT_EQ(snapshot->nqueued, 0);
+		UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	}
+	cluster_pcm_wait_graph_snapshot(&absent, snapshot);
+	UT_ASSERT_EQ(snapshot->status, CLWG_ABSENT);
+	cluster_pcm_wait_graph_snapshot(NULL, snapshot);
+	UT_ASSERT_EQ(snapshot->status, CLWG_INVALID);
+	UT_ASSERT_EQ(cluster_pcm_get_trans_n_to_s_count(), transitions);
+	free(snapshot);
+}
+
 UT_TEST(test_pcm_authority_snapshot_is_one_entry_lock_view)
 {
 	BufferTag tag = make_tag(97);
@@ -24582,12 +24620,13 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(369);
+	UT_PLAN(370);
 	/* Observe the actual startup state before any runtime fixture overrides
 	 * the postmaster GUC or initializes shared PCM state and counters. */
 	UT_RUN(test_pcm_grd_max_entries_default_is_minus_one);
 	UT_RUN(test_pcm_disable_path_counters_return_zero);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
+	UT_RUN(test_pcm_wait_graph_copy_is_owned_and_busy_never_waits);
 
 	UT_RUN(test_resource_x_pi_complete_resumes_native_master_without_new_assert);
 	UT_RUN(test_resource_x_master_work_never_substitutes_for_pi_or_admission);

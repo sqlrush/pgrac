@@ -9628,3 +9628,7 @@ test_cluster_content_trace: test_cluster_content_trace.c unit_test.h \
         $(top_srcdir)/src/include/cluster/cluster_grd.h \
         $(top_srcdir)/src/include/cluster/cluster_wait_trace.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+
+# Native snapshot layout dependencies for the diagnostic provider fixtures.
+test_cluster_ko_extend_recovery test_cluster_pcm_lock test_cluster_pcm_lock_clock_product.o: $(top_srcdir)/src/include/cluster/cluster_wait_graph.h
+test_cluster_grd: $(top_srcdir)/src/include/cluster/cluster_grd.h $(top_srcdir)/src/include/storage/spin.h

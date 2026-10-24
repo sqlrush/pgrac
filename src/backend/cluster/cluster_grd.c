@@ -6072,9 +6072,9 @@ cluster_grd_sweep_runs(void)
 /* Unlike the SQL summary walker, diagnostics must not pin/release an entry:
  * releasing a lookup pin could retire a cold entry. The shard lock protects
  * its address against HASH_REMOVE; the entry lock protects every vector. */
-ClusterGrdQueueObservationStatus
-cluster_grd_queue_snapshot(const ClusterResId *resid, ClusterGrdQueueSnapshot *out,
-						   ClusterGrdQueueMemberSnapshot *members, int capacity)
+static ClusterGrdQueueObservationStatus
+grd_queue_snapshot(const ClusterResId *resid, ClusterGrdQueueSnapshot *out,
+	ClusterGrdQueueMemberSnapshot *members, int capacity, bool nowait)
 {
 	ClusterGrdEntry *entry;
 	ClusterGrdQueueObservationStatus status;
@@ -6092,17 +6092,32 @@ cluster_grd_queue_snapshot(const ClusterResId *resid, ClusterGrdQueueSnapshot *o
 	if (cluster_grd_entry_htab == NULL || cluster_grd_shard_locks == NULL
 		|| cluster_grd_state == NULL)
 		return CLUSTER_GRD_QUEUE_UNAVAILABLE;
-	grd_slot_area_attach();
+	/* A hang reader must not lazily attach DSA (which can wait). Prepare its
+	 * process mapping before clients start, through the original read API. */
+	if (nowait && grd_slot_area == NULL && grd_slot_pool != NULL)
+		return CLUSTER_GRD_QUEUE_UNAVAILABLE;
+	if (!nowait)
+		grd_slot_area_attach();
 	hash64 = cluster_grd_hash_resource(resid);
 	shard = (uint32)(hash64 % PGRAC_GRD_SHARD_COUNT);
-	LWLockAcquire(&cluster_grd_shard_locks[shard].lock, LW_SHARED);
+	if (nowait) {
+		if (!LWLockConditionalAcquire(&cluster_grd_shard_locks[shard].lock, LW_SHARED))
+			return CLUSTER_GRD_QUEUE_BUSY;
+	} else
+		LWLockAcquire(&cluster_grd_shard_locks[shard].lock, LW_SHARED);
 	entry = hash_search_with_hash_value(cluster_grd_entry_htab, resid, (uint32)hash64, HASH_FIND,
 										&found);
 	if (entry == NULL) {
 		LWLockRelease(&cluster_grd_shard_locks[shard].lock);
 		return CLUSTER_GRD_QUEUE_ABSENT;
 	}
-	SpinLockAcquire(&entry->lock);
+	if (nowait) {
+		if (!SpinLockTryAcquire(&entry->lock)) {
+			LWLockRelease(&cluster_grd_shard_locks[shard].lock);
+			return CLUSTER_GRD_QUEUE_BUSY;
+		}
+	} else
+		SpinLockAcquire(&entry->lock);
 	out->generation = entry->generation;
 	out->last_modified_scn = entry->last_modified_scn;
 	out->state_flags = entry->state_flags;
@@ -6203,6 +6218,20 @@ done:
 	SpinLockRelease(&entry->lock);
 	LWLockRelease(&cluster_grd_shard_locks[shard].lock);
 	return status;
+}
+
+ClusterGrdQueueObservationStatus
+cluster_grd_queue_snapshot(const ClusterResId *resid, ClusterGrdQueueSnapshot *out,
+	ClusterGrdQueueMemberSnapshot *members, int capacity)
+{
+	return grd_queue_snapshot(resid, out, members, capacity, false);
+}
+
+ClusterGrdQueueObservationStatus
+cluster_grd_queue_try_snapshot(const ClusterResId *resid, ClusterGrdQueueSnapshot *out,
+	ClusterGrdQueueMemberSnapshot *members, int capacity)
+{
+	return grd_queue_snapshot(resid, out, members, capacity, true);
 }
 
 bool

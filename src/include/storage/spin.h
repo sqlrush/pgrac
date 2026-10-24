@@ -61,6 +61,10 @@
 
 #define SpinLockAcquire(lock) S_LOCK(lock)
 
+/* One attempt, without spinning or sleeping. A spurious failure is allowed;
+ * callers must treat false as unavailable, not as an ownership observation. */
+#define SpinLockTryAcquire(lock) (TAS(lock) == 0)
+
 #define SpinLockRelease(lock) S_UNLOCK(lock)
 
 #define SpinLockFree(lock)	S_LOCK_FREE(lock)

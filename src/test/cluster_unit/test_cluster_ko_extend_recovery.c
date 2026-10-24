@@ -259,10 +259,44 @@ UT_TEST(test_create_exit_preserves_unarmed_original_retirement)
 	UT_ASSERT(!storage.extend_work[slot].used);
 }
 
+UT_TEST(test_ko_wait_graph_preserves_failed_reservation_and_busy)
+{
+	ClusterWaitGraphKoSnapshot *snapshot = calloc(1, sizeof(*snapshot));
+	uint32 slot = prepare_reserved_failure(1691);
+	bool found = false;
+	UT_ASSERT(snapshot != NULL);
+	cluster_ko_wait_graph_snapshot(snapshot);
+	UT_ASSERT_EQ(snapshot->status, CLWG_OBSERVED);
+	for (uint32 i = 0; i < snapshot->nrows; i++) {
+		const ClusterWaitGraphKoRow *row = &snapshot->rows[i];
+		if (row->kind != 0 || row->slot != slot) continue;
+		found = true;
+		UT_ASSERT(row->failed && row->observed && row->reserved);
+		UT_ASSERT_EQ(row->first, 10);
+		UT_ASSERT_EQ(row->count, 3);
+		UT_ASSERT_EQ(row->lsn, 0x100);
+		UT_ASSERT_EQ(row->serial, storage.extend_work[slot].serial);
+	}
+	UT_ASSERT(found);
+	UT_ASSERT_EQ(recovery_pages + recovery_syncs, 0);
+	SpinLockAcquire(&storage.shared_lock);
+	cluster_ko_wait_graph_snapshot(snapshot);
+	SpinLockRelease(&storage.shared_lock);
+	UT_ASSERT_EQ(snapshot->status, CLWG_BUSY);
+	UT_ASSERT_EQ(snapshot->nrows, 0);
+	UT_ASSERT(storage.extend_work[slot].used && storage.extend_work[slot].failed);
+	ko_state = NULL;
+	cluster_ko_wait_graph_snapshot(snapshot);
+	UT_ASSERT_EQ(snapshot->status, CLWG_UNAVAILABLE);
+	ko_state = &storage;
+	free(snapshot);
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
+	UT_RUN(test_ko_wait_graph_preserves_failed_reservation_and_busy);
 	UT_RUN(test_exit_keeps_unarmed_work_until_original_resource_cleanup);
 	UT_RUN(test_exit_retires_completed_range_only_after_original_locks);
 	UT_RUN(test_exit_does_not_drop_unproved_unfinished_physical_work);

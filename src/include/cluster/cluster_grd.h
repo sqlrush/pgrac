@@ -1560,12 +1560,16 @@ typedef enum ClusterGrdQueueObservationStatus {
 	CLUSTER_GRD_QUEUE_ABSENT,
 	CLUSTER_GRD_QUEUE_UNAVAILABLE,
 	CLUSTER_GRD_QUEUE_TRUNCATED,
-	CLUSTER_GRD_QUEUE_INVALID
+	CLUSTER_GRD_QUEUE_INVALID,
+	CLUSTER_GRD_QUEUE_BUSY
 } ClusterGrdQueueObservationStatus;
 
 extern ClusterGrdQueueObservationStatus
 cluster_grd_queue_snapshot(const ClusterResId *resid, ClusterGrdQueueSnapshot *out,
 						   ClusterGrdQueueMemberSnapshot *members, int capacity);
+extern ClusterGrdQueueObservationStatus
+cluster_grd_queue_try_snapshot(const ClusterResId *resid, ClusterGrdQueueSnapshot *out,
+							   ClusterGrdQueueMemberSnapshot *members, int capacity);
 
 /* The key walk is not a globally atomic graph. Every callback receives its
  * own status/generation and runs after all native locks have been released.

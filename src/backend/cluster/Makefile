@@ -455,3 +455,7 @@ cluster_initdb_wal.o: $(top_srcdir)/src/bin/initdb/pgrac_wal.c $(top_srcdir)/src
 
 cluster_initdb_side.o: $(top_srcdir)/src/bin/initdb/pgrac_side.c $(top_srcdir)/src/bin/initdb/pgrac_side.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+# Native owned diagnostic copy layouts.
+cluster_pcm_lock.o cluster_ko_lock.o: $(top_srcdir)/src/include/cluster/cluster_wait_graph.h
+cluster_grd.o cluster_ko_lock.o: $(top_srcdir)/src/include/storage/spin.h

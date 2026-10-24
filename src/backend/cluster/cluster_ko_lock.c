@@ -62,6 +62,7 @@
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_ko.h"
+#include "cluster/cluster_wait_graph.h"
 #include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_space_reservation.h"
@@ -10141,4 +10142,68 @@ cluster_ko_drain_inbound_and_apply(void)
 		tail = pg_atomic_read_u32(&ko_state->inbound_tail);
 	}
 	ko_peer_fence_local_ready_tick_v3();
+}
+
+/* Explicit diagnostics only: no retirement, physical IO or callback under the
+ * native source lock. Caller supplies the bounded copy before acquisition. */
+void
+cluster_ko_wait_graph_snapshot(ClusterWaitGraphKoSnapshot *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->status = CLWG_UNAVAILABLE;
+	if (ko_state == NULL)
+		return;
+	out->status = CLWG_BUSY;
+	if (!SpinLockTryAcquire(&ko_state->shared_lock))
+		return;
+	for (uint32 i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		const ClusterKoExtendWorkV3 *work = &ko_state->extend_work[i];
+		const KoExtendRecovery *recovery = &ko_state->extend_recovery[i];
+		const ClusterKoSharedContext *context = &ko_state->contexts[i];
+		const KoDirectoryIo *io = &ko_state->directory_io[i];
+		ClusterWaitGraphKoRow *row;
+
+		if (work->used) {
+			if (out->nrows == CLWG_KO_ROWS) { out->omitted++; }
+			else {
+				row = &out->rows[out->nrows++];
+				row->kind = 0; row->slot = i; row->pid = work->pid;
+				row->serial = work->serial; row->epoch = work->epoch;
+				row->locator = work->locator; row->fork = work->fork;
+				row->failed = work->failed; row->raw_copy = work->raw_copy;
+				row->buffer_copy = work->buffer_copy;
+				row->executor = recovery->executor_pid; row->cursor = recovery->cursor;
+				row->observed = recovery->observed; row->reserved = recovery->reserved;
+				row->invalid = recovery->invalid; row->lsn = recovery->lsn;
+				row->first = recovery->reservation.first_block;
+				row->count = recovery->reservation.granted;
+			}
+		}
+		if (context->used) {
+			if (out->nrows == CLWG_KO_ROWS) { out->omitted++; }
+			else {
+				row = &out->rows[out->nrows++];
+				row->kind = 1; row->slot = i; row->pid = context->pid;
+				row->serial = context->serial; row->complete = context->complete;
+				row->locator = context->request.key.locator; row->fork = -1;
+				row->epoch = context->request.epoch;
+				row->executor = context->drop_executor_pid;
+				row->failed = context->ax_failed || context->structure_drop_failed;
+				row->sent = context->request_sent_peers;
+				row->done = context->request_done_peers;
+				row->uncertain = context->request_uncertain_peers;
+				row->failed_peers = context->request_failed_peers;
+			}
+		}
+		if (io->serial != 0) {
+			if (out->nrows == CLWG_KO_ROWS) { out->omitted++; }
+			else {
+				row = &out->rows[out->nrows++];
+				row->kind = 2; row->slot = i; row->pid = io->pid;
+				row->serial = io->serial; row->locator = io->locator; row->fork = -1;
+			}
+		}
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	out->status = CLWG_OBSERVED;
 }
