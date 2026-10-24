@@ -305,6 +305,24 @@ extern uint16 cluster_heap_freeze_bind_aborted_xmax_targets_v1(
 	const ClusterHeapFreezeProofBatchV1 *proofs,
 	const ClusterHeapFreezeFinalFenceV1 *current_fence);
 
+/* Physical rows awaiting independent rollback-completion proof. No native
+ * plan, header bits or canonical identity is synthesized by this list. */
+typedef struct ClusterHeapFreezeAbortedXmaxCandidateBatchV1
+{
+	uint16 target_count;
+	uint16 tuple_indexes[MaxHeapTuplesPerPage];
+} ClusterHeapFreezeAbortedXmaxCandidateBatchV1;
+
+/* Revalidate the complete proof/fence and exact physical modifier target;
+ * never trust an earlier aborted_xmax_target_proof_index. Successful empty
+ * selection replaces old candidates; any refusal leaves *out unchanged.
+ * These are not rollback-completion, xmax-clear or retention certificates. */
+extern bool cluster_heap_freeze_select_aborted_xmax_candidates_v1(
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *current_fence,
+	ClusterHeapFreezeAbortedXmaxCandidateBatchV1 *out);
+
 struct HeapTupleFreeze;
 
 /*

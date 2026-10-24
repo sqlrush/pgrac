@@ -3220,10 +3220,118 @@ UT_TEST(aborted_xmax_binding_missing_inputs_retire_only_their_association)
 	}
 }
 
+
+UT_TEST(aborted_candidates_revalidate_physical_row_without_saved_binding)
+{
+	ClusterHeapFreezePageBatchV1 page, before;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+	ClusterHeapFreezeAbortedXmaxCandidateBatchV1 out;
+
+	init_aborted_xmax_binding_fixture(&page, &proofs, &fence);
+	page.tuples[0].aborted_xmax_target_proof_index = CLUSTER_HEAP_FREEZE_NO_ABORTED_XMAX_TARGET;
+	page.tuples[1].aborted_xmax_target_proof_index = 0;
+	before = page;
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT(cluster_heap_freeze_select_aborted_xmax_candidates_v1(&page, &proofs, &fence, &out));
+	UT_ASSERT_EQ(out.target_count, 1);
+	UT_ASSERT_EQ(out.tuple_indexes[0], 0);
+	UT_ASSERT_EQ(memcmp(&page, &before, sizeof(page)), 0);
+	proofs.proofs[0].resolution.local_aborted_xmax_target.offset = 2;
+	UT_ASSERT(cluster_heap_freeze_select_aborted_xmax_candidates_v1(&page, &proofs, &fence, &out));
+	UT_ASSERT_EQ(out.target_count, 1);
+	UT_ASSERT_EQ(out.tuple_indexes[0], 1);
+}
+
+UT_TEST(aborted_candidates_keep_row_order_and_separate_equal_raw_carriers)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+	ClusterHeapFreezeAbortedXmaxCandidateBatchV1 out;
+	ClusterHeapFreezeCanonicalProofV1 swap;
+
+	init_aborted_xmax_binding_fixture(&page, &proofs, &fence);
+	page.carrier_request_count = proofs.proof_count = 2;
+	page.carrier_requests[1] = page.carrier_requests[0];
+	page.carrier_requests[1].locator.itl_slot_index = 1;
+	proofs.proofs[1] = proofs.proofs[0];
+	proofs.proofs[1].requested_locator.itl_slot_index = 1;
+	proofs.proofs[1].resolution.locator_echo.itl_slot_index = 1;
+	proofs.proofs[1].resolution.local_aborted_xmax_target.offset = 2;
+	page.tuples[1].carrier_request_index = page.tuples[1].itl_slot_index = 1;
+	swap = proofs.proofs[0]; proofs.proofs[0] = proofs.proofs[1]; proofs.proofs[1] = swap;
+	UT_ASSERT(cluster_heap_freeze_select_aborted_xmax_candidates_v1(&page, &proofs, &fence, &out));
+	UT_ASSERT_EQ(out.target_count, 2);
+	UT_ASSERT_EQ(out.tuple_indexes[0], 0);
+	UT_ASSERT_EQ(out.tuple_indexes[1], 1);
+	/* Saved index and equal raw xmax cannot borrow the other carrier's row. */
+	proofs.proofs[1].resolution.local_aborted_xmax_target.offset = 2;
+	UT_ASSERT(cluster_heap_freeze_select_aborted_xmax_candidates_v1(&page, &proofs, &fence, &out));
+	UT_ASSERT_EQ(out.target_count, 1);
+	UT_ASSERT_EQ(out.tuple_indexes[0], 1);
+}
+
+UT_TEST(aborted_candidates_refused_complete_proof_or_fence_preserves_output)
+{
+	for (int variant = 0; variant < 10; variant++) {
+		ClusterHeapFreezePageBatchV1 page;
+		ClusterHeapFreezeProofBatchV1 proofs;
+		ClusterHeapFreezeFinalFenceV1 fence;
+		ClusterHeapFreezeAbortedXmaxCandidateBatchV1 out, before;
+
+		init_aborted_xmax_binding_fixture(&page, &proofs, &fence);
+		memset(&out, 0xa5, sizeof(out)); before = out;
+		switch (variant) {
+		case 0: proofs.proofs[0].c1b_finalized = false; break;
+		case 1: proofs.proofs[0].resolution.local_canonical_valid = false; break;
+		case 2: fence.page_version++; break;
+		case 3: page.page_lsn++; break;
+		case 4: page.carrier_request_count = 2; break;
+		case 5: page.tuple_count = MaxHeapTuplesPerPage + 1; break;
+		case 6: proofs.proof_count = CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH + 1; break;
+		case 7: break; /* missing page */
+		case 8: break; /* missing proofs */
+		case 9: break; /* missing fence */
+		}
+		UT_ASSERT(!cluster_heap_freeze_select_aborted_xmax_candidates_v1(variant == 7 ? NULL : &page,
+			variant == 8 ? NULL : &proofs, variant == 9 ? NULL : &fence, &out));
+		UT_ASSERT_EQ(memcmp(&out, &before, sizeof(out)), 0);
+		UT_ASSERT(!cluster_heap_freeze_select_aborted_xmax_candidates_v1(&page, &proofs, &fence, NULL));
+	}
+}
+
+UT_TEST(aborted_candidates_empty_selection_retires_old_rows_without_plans)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+	ClusterHeapFreezeAbortedXmaxCandidateBatchV1 out, empty = {0};
+
+	for (int variant = 0; variant < 4; variant++) {
+		init_aborted_xmax_binding_fixture(&page, &proofs, &fence);
+		memset(&out, 0xa5, sizeof(out));
+		switch (variant) {
+		case 0: proofs.proofs[0].resolution.outcome = CLUSTER_TX_COMMITTED;
+			proofs.proofs[0].resolution.commit_scn = 5; break;
+		case 1: page.tuples[0].infomask |= HEAP_XMAX_LOCK_ONLY; break;
+		case 2: page.tuples[0].infomask |= HEAP_XMAX_IS_MULTI; break;
+		case 3: proofs.proofs[0].resolution.local_aborted_xmax_target.valid = false; break;
+		}
+		UT_ASSERT(cluster_heap_freeze_select_aborted_xmax_candidates_v1(&page, &proofs, &fence, &out));
+		UT_ASSERT_EQ(memcmp(&out, &empty, sizeof(out)), 0);
+		UT_ASSERT_EQ(page.tuples[0].raw_xmax, 77);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(103);
+	UT_PLAN(107);
+	UT_RUN(aborted_candidates_revalidate_physical_row_without_saved_binding);
+	UT_RUN(aborted_candidates_keep_row_order_and_separate_equal_raw_carriers);
+	UT_RUN(aborted_candidates_refused_complete_proof_or_fence_preserves_output);
+	UT_RUN(aborted_candidates_empty_selection_retires_old_rows_without_plans);
 	UT_RUN(aborted_xmax_binding_names_old_physical_row_without_changing_headers);
 	UT_RUN(aborted_xmax_binding_rejects_wrong_target_and_nonmodifier_states);
 	UT_RUN(aborted_xmax_binding_keeps_distinct_carriers_and_exact_proof_order);

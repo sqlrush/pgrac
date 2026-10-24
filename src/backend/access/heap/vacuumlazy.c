@@ -183,6 +183,7 @@ typedef struct LVRelState
 	FullTransactionId shared_freeze_candidate_limit_full;
 	/* Pre-admission row requests only; never native freeze plans. */
 	ClusterHeapFreezeXminCandidateBatchV1 shared_freeze_xmin_candidates;
+	ClusterHeapFreezeAbortedXmaxCandidateBatchV1 shared_freeze_aborted_xmax_candidates;
 	bool		shared_freeze_cohort_observed;
 	ClusterHeapFreezeProofStatusV1 shared_freeze_apply_status;
 	bool		shared_freeze_input_captured;
@@ -1044,6 +1045,7 @@ lazy_scan_heap(LVRelState *vacrel)
 		vacrel->shared_freeze_fence_valid = false;
 		vacrel->shared_freeze_cohort_observed = false;
 		vacrel->shared_freeze_xmin_candidates.target_count = 0;
+		vacrel->shared_freeze_aborted_xmax_candidates.target_count = 0;
 		vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
 		memset(&vacrel->shared_freeze_cohort, 0, sizeof(vacrel->shared_freeze_cohort));
 		vacrel->shared_freeze_apply_status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
@@ -1560,6 +1562,7 @@ lazy_scan_shared_mx(LVRelState *vacrel, Page page, BlockNumber blkno)
 	vacrel->shared_freeze_fence_valid = false;
 	vacrel->shared_freeze_cohort_observed = false;
 	vacrel->shared_freeze_xmin_candidates.target_count = 0;
+	vacrel->shared_freeze_aborted_xmax_candidates.target_count = 0;
 	vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
 	memset(&vacrel->shared_freeze_cohort, 0, sizeof(vacrel->shared_freeze_cohort));
 	vacrel->shared_freeze_apply_status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
@@ -1611,6 +1614,7 @@ lazy_validate_shared_freeze(LVRelState *vacrel, Page page, BlockNumber blkno, Bu
 			vacrel->shared_freeze_fence_valid = false;
 			vacrel->shared_freeze_cohort_observed = false;
 			vacrel->shared_freeze_xmin_candidates.target_count = 0;
+			vacrel->shared_freeze_aborted_xmax_candidates.target_count = 0;
 			vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
 			memset(&vacrel->shared_freeze_cohort, 0, sizeof(vacrel->shared_freeze_cohort));
 			vacrel->shared_freeze_apply_status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
@@ -1944,6 +1948,7 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 	{
 		vacrel->shared_freeze_cohort_observed = false;
 		vacrel->shared_freeze_xmin_candidates.target_count = 0;
+		vacrel->shared_freeze_aborted_xmax_candidates.target_count = 0;
 		vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
 		memset(&vacrel->shared_freeze_cohort, 0, sizeof(vacrel->shared_freeze_cohort));
 		for (uint16 index = 0;
@@ -2147,6 +2152,9 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 				&vacrel->shared_freeze_batch, &proofs, &current_fence);
 			(void) cluster_heap_freeze_bind_aborted_xmax_targets_v1(
 				&vacrel->shared_freeze_batch, &proofs, &current_fence);
+			(void) cluster_heap_freeze_select_aborted_xmax_candidates_v1(
+				&vacrel->shared_freeze_batch, &proofs, &current_fence,
+				&vacrel->shared_freeze_aborted_xmax_candidates);
 			/* Screen the same attempt's original creator identities and observed
 			 * bounds without producing native plans. Positive F/H and producer
 			 * retention admission are still required before any shared write. */
@@ -2217,6 +2225,7 @@ done:
 		vacrel->shared_freeze_fence_valid = false;
 		vacrel->shared_freeze_cohort_observed = false;
 		vacrel->shared_freeze_xmin_candidates.target_count = 0;
+		vacrel->shared_freeze_aborted_xmax_candidates.target_count = 0;
 		vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
 		memset(&vacrel->shared_freeze_cohort, 0, sizeof(vacrel->shared_freeze_cohort));
 	}
@@ -2252,6 +2261,7 @@ lazy_prepare_shared_freeze(LVRelState *vacrel, Buffer recent_buffer, Buffer *vmb
 	vacrel->shared_freeze_fence_valid = false;
 	vacrel->shared_freeze_cohort_observed = false;
 	vacrel->shared_freeze_xmin_candidates.target_count = 0;
+	vacrel->shared_freeze_aborted_xmax_candidates.target_count = 0;
 	vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
 	memset(&vacrel->shared_freeze_cohort, 0, sizeof(vacrel->shared_freeze_cohort));
 	vacrel->shared_freeze_apply_status = lazy_collect_shared_freeze_proofs(vacrel, recent_buffer);

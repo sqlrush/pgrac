@@ -612,6 +612,81 @@ cluster_heap_freeze_validate_carrier_cleanout_v1(
 	return freeze_validate_carrier_proofs(page, proofs, current_fence, false);
 }
 
+/* The caller has validated the complete bounded proof batch and current fence.
+ * Earlier row associations are hints only and are never consulted here. */
+static uint8
+freeze_aborted_xmax_row_proof(
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	uint16 tuple_index)
+{
+	const ClusterHeapFreezeTupleInputV1 *tuple = &page->tuples[tuple_index];
+	const ClusterHeapFreezeCarrierRequestV1 *request;
+
+	if (!OffsetNumberIsValid(tuple->offset) || tuple->offset > MaxHeapTuplesPerPage
+		|| tuple->tuple_offset < SizeOfPageHeaderData
+		|| tuple->tuple_offset != MAXALIGN(tuple->tuple_offset)
+		|| tuple->tuple_length < SizeofHeapTupleHeader
+		|| tuple->header_length < SizeofHeapTupleHeader
+		|| tuple->header_length > tuple->tuple_length
+		|| (unsigned) tuple->tuple_offset + tuple->tuple_length
+			> BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE
+		|| !TransactionIdIsNormal(tuple->raw_xmax)
+		|| (tuple->infomask & (HEAP_XMAX_INVALID | HEAP_XMAX_COMMITTED | HEAP_XMAX_IS_MULTI))
+		|| HEAP_XMAX_IS_LOCKED_ONLY(tuple->infomask)
+		|| !tuple->has_carrier
+		|| tuple->carrier_request_index >= page->carrier_request_count)
+		return CLUSTER_HEAP_FREEZE_NO_ABORTED_XMAX_TARGET;
+	request = &page->carrier_requests[tuple->carrier_request_index];
+	if (tuple->itl_slot_index != request->locator.itl_slot_index
+		|| memcmp(&tuple->carrier, &request->carrier, sizeof(tuple->carrier)) != 0)
+		return CLUSTER_HEAP_FREEZE_NO_ABORTED_XMAX_TARGET;
+
+	for (uint8 proof_index = 0; proof_index < proofs->proof_count; proof_index++)
+	{
+		const ClusterHeapFreezeCanonicalProofV1 *proof = &proofs->proofs[proof_index];
+		const ClusterTxModificationTarget *target = &proof->resolution.local_aborted_xmax_target;
+
+		if (!freeze_locator_equal_exact(&request->locator, &proof->requested_locator)
+			|| proof->resolution.outcome != CLUSTER_TX_ABORTED
+			|| tuple->raw_xmax != proof->resolution.locator_echo.xid || !target->valid
+			|| !RelFileLocatorEquals(target->locator, page->identity.key.locator)
+			|| target->fork != MAIN_FORKNUM || target->block != page->block
+			|| target->offset != tuple->offset || target->tuple_length != tuple->tuple_length)
+			continue;
+		return proof_index;
+	}
+	return CLUSTER_HEAP_FREEZE_NO_ABORTED_XMAX_TARGET;
+}
+
+bool
+cluster_heap_freeze_select_aborted_xmax_candidates_v1(
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *current_fence,
+	ClusterHeapFreezeAbortedXmaxCandidateBatchV1 *out)
+{
+	ClusterHeapFreezeAbortedXmaxCandidateBatchV1 candidates;
+
+	if (out == NULL
+		|| freeze_validate_carrier_proofs(page, proofs, current_fence, true)
+			!= CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+		|| page->page_lsn != current_fence->page_lsn
+		|| page->page_version != current_fence->page_version)
+		return false;
+
+	memset(&candidates, 0, sizeof(candidates));
+	for (uint16 index = 0; index < page->tuple_count; index++)
+	{
+		if (freeze_aborted_xmax_row_proof(page, proofs, index)
+			!= CLUSTER_HEAP_FREEZE_NO_ABORTED_XMAX_TARGET)
+			candidates.tuple_indexes[candidates.target_count++] = index;
+	}
+	/* These physical rows still need independent rollback-completion proof. */
+	memcpy(out, &candidates, sizeof(candidates));
+	return true;
+}
+
 uint16
 cluster_heap_freeze_bind_aborted_xmax_targets_v1(
 	ClusterHeapFreezePageBatchV1 *page,
@@ -635,45 +710,12 @@ cluster_heap_freeze_bind_aborted_xmax_targets_v1(
 
 	for (uint16 index = 0; index < bound; index++)
 	{
-		ClusterHeapFreezeTupleInputV1 *tuple = &page->tuples[index];
-		const ClusterHeapFreezeCarrierRequestV1 *request;
+		uint8 proof_index = freeze_aborted_xmax_row_proof(page, proofs, index);
 
-		if (!OffsetNumberIsValid(tuple->offset) || tuple->offset > MaxHeapTuplesPerPage
-			|| tuple->tuple_offset < SizeOfPageHeaderData
-			|| tuple->tuple_offset != MAXALIGN(tuple->tuple_offset)
-			|| tuple->tuple_length < SizeofHeapTupleHeader
-			|| tuple->header_length < SizeofHeapTupleHeader
-			|| tuple->header_length > tuple->tuple_length
-			|| (unsigned) tuple->tuple_offset + tuple->tuple_length
-				> BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE
-			|| !TransactionIdIsNormal(tuple->raw_xmax)
-			|| (tuple->infomask & (HEAP_XMAX_INVALID | HEAP_XMAX_COMMITTED | HEAP_XMAX_IS_MULTI))
-			|| HEAP_XMAX_IS_LOCKED_ONLY(tuple->infomask)
-			|| !tuple->has_carrier
-			|| tuple->carrier_request_index >= page->carrier_request_count)
-			continue;
-		request = &page->carrier_requests[tuple->carrier_request_index];
-		if (tuple->itl_slot_index != request->locator.itl_slot_index
-			|| memcmp(&tuple->carrier, &request->carrier, sizeof(tuple->carrier)) != 0)
-			continue;
-
-		for (uint8 proof_index = 0; proof_index < proofs->proof_count; proof_index++)
+		if (proof_index != CLUSTER_HEAP_FREEZE_NO_ABORTED_XMAX_TARGET)
 		{
-			const ClusterHeapFreezeCanonicalProofV1 *proof = &proofs->proofs[proof_index];
-			const ClusterTxModificationTarget *target = &proof->resolution.local_aborted_xmax_target;
-
-			if (!freeze_locator_equal_exact(&request->locator, &proof->requested_locator)
-				|| proof->resolution.outcome != CLUSTER_TX_ABORTED
-				|| tuple->raw_xmax != proof->resolution.locator_echo.xid || !target->valid
-				|| !RelFileLocatorEquals(target->locator, page->identity.key.locator)
-				|| target->fork != MAIN_FORKNUM || target->block != page->block
-				|| target->offset != tuple->offset || target->tuple_length != tuple->tuple_length)
-				continue;
-			/* This associates the old row only; rollback completion must be
-			 * independently proved before any xmax plan or native write. */
-			tuple->aborted_xmax_target_proof_index = proof_index;
+			page->tuples[index].aborted_xmax_target_proof_index = proof_index;
 			matched++;
-			break;
 		}
 	}
 	return matched;
