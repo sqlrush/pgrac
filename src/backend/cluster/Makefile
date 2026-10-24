@@ -191,7 +191,6 @@ OBJS = \
 	cluster_recovery_worker.o \
 	cluster_recovery_merge.o \
 	cluster_recovery_anchor.o \
-	cluster_relmap_checkpoint.o \
 	cluster_block_apply.o \
 	cluster_block_apply_heap.o \
 	cluster_block_apply_btree.o \
