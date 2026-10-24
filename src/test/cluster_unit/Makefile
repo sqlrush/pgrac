@@ -3918,6 +3918,7 @@ test_cluster_write_fence_cache: test_cluster_write_fence_cache.c unit_test.h \
 # locally; CRC32C comes from libpgport, so no PG backend is needed.
 CLUSTER_RECOVERY_ANCHOR_O = $(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o
 test_cluster_recovery_anchor: test_cluster_recovery_anchor.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_checkpoint.h \
 		$(CLUSTER_RECOVERY_ANCHOR_O) \
         $(top_srcdir)/src/backend/cluster/cluster_relmap_checkpoint.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
@@ -10049,6 +10050,7 @@ test_cluster_d0_native_reader: test_cluster_d0_native_reader.c unit_test.h \
 
 # Original native issuance/floor observations, no recovery authority provider.
 test_cluster_relmap_recovery: test_cluster_relmap_recovery.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_checkpoint.h \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_recovery.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
 		$(top_srcdir)/src/include/access/transam.h $(CLUSTER_UNIT_PORT_LIBS) \

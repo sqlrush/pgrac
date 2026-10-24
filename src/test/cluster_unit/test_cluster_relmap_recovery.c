@@ -515,6 +515,13 @@ UT_TEST(checkpoint_native_window_actual_capture_and_finished_body)
 	UT_ASSERT(cluster_relmap_checkpoint_window_decode_v1(
 		bytes, &cp, 200, 240, &sample.writer.ref.claim.identity, 456, &w));
 	UT_ASSERT_EQ(w.last_issued, UINT64CONST(0x200000068));
+	{
+		uint64 post = 0;
+		UT_ASSERT(cluster_relmap_checkpoint_window_decode_v2(
+			bytes, &cp, 200, 240, &sample.writer.ref.claim.identity, 456, &w, &post));
+		UT_ASSERT_EQ(post, UINT64CONST(0x200000069));
+		UT_ASSERT(post != U64FromFullTransactionId(variables.nextXid) - 1);
+	}
 	UT_ASSERT_EQ(depth, 0);
 }
 UT_TEST(checkpoint_unknown_and_wrong_owner_never_become_window)

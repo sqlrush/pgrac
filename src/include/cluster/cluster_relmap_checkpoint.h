@@ -24,9 +24,23 @@ extern bool cluster_relmap_checkpoint_window_decode_v1(
 	const uint8 bytes[CLUSTER_RELMAP_CHECKPOINT_WINDOW_SIZE], const CheckPoint *checkpoint,
 	XLogRecPtr start, XLogRecPtr end, const ClusterControlRootIdentity *identity, uint64 dbinc,
 	ClusterRelmapCheckpointWindow *out);
+/* Explicit v2 adds actual published last-issued sampled after the original
+ * checkpoint WAL flush. It is not inferred from checkpoint nextXid/lease.
+ * v1 encode stays exact legacy bytes; v1 decode accepts validated v1/v2 but
+ * does not expose the extra bound. v2 decode refuses legacy/unknown windows.
+ * Scalar bound is structural unless supplied by the original publisher.
+ * Output overlap preserves inputs; other refusal zeroes available outputs. */
+extern bool cluster_relmap_checkpoint_window_encode_v2(
+	const ClusterRelmapCheckpointWindow *window, const CheckPoint *checkpoint, XLogRecPtr start,
+	XLogRecPtr end, uint64 post_flush_issued, uint8 out[CLUSTER_RELMAP_CHECKPOINT_WINDOW_SIZE]);
+extern bool cluster_relmap_checkpoint_window_decode_v2(
+	const uint8 bytes[CLUSTER_RELMAP_CHECKPOINT_WINDOW_SIZE], const CheckPoint *checkpoint,
+	XLogRecPtr start, XLogRecPtr end, const ClusterControlRootIdentity *identity, uint64 dbinc,
+	ClusterRelmapCheckpointWindow *out, uint64 *post_flush_issued);
 /* Ephemeral original Checkpointer sample; not a persistence receipt. Capture
  * before checkpoint critical work, finish after the actual WAL flush and all
- * native locks/critical sections are released. Unknown stays all-zero/v2. */
+ * native locks/critical sections are released. Finish emits inner v2 from the
+ * actual second issuance sample. Unknown stays all-zero. */
 typedef struct ClusterRelmapCheckpointSampleV1 {
 	ClusterWalWriterToken writer;
 	ClusterRelmapCheckpointWindow window;

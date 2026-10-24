@@ -2,6 +2,7 @@
 #include "postgres.h"
 #include "cluster/cluster_relmap_checkpoint.h"
 #include "unit_test.h"
+#include "port/pg_crc32c.h"
 UT_DEFINE_GLOBALS();
 static CheckPoint cp;
 static ClusterControlRootIdentity id;
@@ -104,10 +105,111 @@ UT_TEST(overlap_preserves_input_and_null_refuses)
 	UT_ASSERT(memcmp(saved, &u, sizeof(u)) == 0);
 	UT_ASSERT(!cluster_relmap_checkpoint_window_encode_v1(&w, &cp, 200, 240, NULL));
 }
+static void
+rewrite_field(uint8 b[160], unsigned offset, uint64 value)
+{
+	pg_crc32c crc;
+	for (unsigned i = 0; i < 8; i++)
+		b[offset + i] = (uint8)(value >> (8 * i));
+	memset(b + 136, 0, 4);
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, b, 160);
+	FIN_CRC32C(crc);
+	for (unsigned i = 0; i < 4; i++)
+		b[136 + i] = (uint8)((uint32)crc >> (8 * i));
+}
+UT_TEST(v2_preserves_actual_postflush_issuance_without_ceiling_inference)
+{
+	uint8 b[160], legacy[160];
+	uint64 issued = UINT64CONST(0x100001000), out_issued = 0;
+	ClusterRelmapCheckpointWindow out;
+	setup();
+	UT_ASSERT(cluster_relmap_checkpoint_window_encode_v2(&w, &cp, 200, 240, issued, b));
+	UT_ASSERT(memcmp(b, "RMWIN002", 8) == 0 && b[8] == 2);
+	UT_ASSERT(
+		cluster_relmap_checkpoint_window_decode_v2(b, &cp, 200, 240, &id, 11, &out, &out_issued));
+	UT_ASSERT_EQ(out_issued, issued);
+	UT_ASSERT_EQ(out.last_issued, w.last_issued);
+	UT_ASSERT(out_issued > U64FromFullTransactionId(cp.nextXid));
+	UT_ASSERT(cluster_relmap_checkpoint_window_decode_v1(b, &cp, 200, 240, &id, 11, &out));
+	UT_ASSERT(cluster_relmap_checkpoint_window_encode_v1(&w, &cp, 200, 240, legacy));
+	UT_ASSERT(memcmp(legacy, "RMWIN001", 8) == 0 && legacy[8] == 1);
+	for (unsigned i = 140; i < 160; i++)
+		UT_ASSERT_EQ(legacy[i], 0);
+}
+UT_TEST(v2_rejects_valid_crc_wrong_issued_and_reserved_fields)
+{
+	uint8 b[160], saved[160], zero_bytes[160] = { 0 };
+	uint64 bad_values[]
+		= { 0, 1, UINT64CONST(0x100000101), UINT64CONST(0x17ffffffe), PG_UINT64_MAX };
+	ClusterRelmapCheckpointWindow out, zero_window = { 0 };
+	uint64 out_issued;
+	setup();
+	UT_ASSERT(cluster_relmap_checkpoint_window_encode_v2(&w, &cp, 200, 240, w.last_issued, saved));
+	for (unsigned i = 0; i < lengthof(bad_values); i++) {
+		memset(b, 0xa5, sizeof(b));
+		UT_ASSERT(!cluster_relmap_checkpoint_window_encode_v2(&w, &cp, 200, 240, bad_values[i], b));
+		UT_ASSERT(memcmp(b, zero_bytes, sizeof(b)) == 0);
+		memcpy(b, saved, sizeof(b));
+		rewrite_field(b, 140, bad_values[i]);
+		memset(&out, 0xa5, sizeof(out));
+		out_issued = 99;
+		UT_ASSERT(!cluster_relmap_checkpoint_window_decode_v2(b, &cp, 200, 240, &id, 11, &out,
+															  &out_issued));
+		UT_ASSERT(memcmp(&out, &zero_window, sizeof(out)) == 0 && out_issued == 0);
+		UT_ASSERT(!cluster_relmap_checkpoint_window_decode_v1(b, &cp, 200, 240, &id, 11, &out));
+	}
+	memcpy(b, saved, sizeof(b));
+	rewrite_field(b, 148, 1);
+	out_issued = 99;
+	UT_ASSERT(
+		!cluster_relmap_checkpoint_window_decode_v2(b, &cp, 200, 240, &id, 11, &out, &out_issued));
+	UT_ASSERT(out_issued == 0 && memcmp(&out, &zero_window, sizeof(out)) == 0);
+	for (unsigned i = 0; i < 160; i++) {
+		memcpy(b, saved, sizeof(b));
+		b[i] ^= 1;
+		out_issued = 99;
+		UT_ASSERT(!cluster_relmap_checkpoint_window_decode_v2(b, &cp, 200, 240, &id, 11, &out,
+															  &out_issued));
+		UT_ASSERT(out_issued == 0 && memcmp(&out, &zero_window, sizeof(out)) == 0);
+	}
+}
+UT_TEST(v2_legacy_refusal_and_alias_keep_inputs)
+{
+	union {
+		uint8 b[160];
+		uint64 issued;
+		ClusterRelmapCheckpointWindow w;
+	} u;
+	uint8 saved[160];
+	ClusterRelmapCheckpointWindow out, zero_window = { 0 };
+	uint64 issued = 99;
+	setup();
+	UT_ASSERT(cluster_relmap_checkpoint_window_encode_v1(&w, &cp, 200, 240, u.b));
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT(
+		!cluster_relmap_checkpoint_window_decode_v2(u.b, &cp, 200, 240, &id, 11, &out, &issued));
+	UT_ASSERT(issued == 0 && memcmp(&out, &zero_window, sizeof(out)) == 0);
+	UT_ASSERT(cluster_relmap_checkpoint_window_encode_v2(&w, &cp, 200, 240, w.last_issued, u.b));
+	memcpy(saved, u.b, 160);
+	UT_ASSERT(
+		!cluster_relmap_checkpoint_window_decode_v2(u.b, &cp, 200, 240, &id, 11, &out, &u.issued));
+	UT_ASSERT(memcmp(saved, u.b, 160) == 0);
+	UT_ASSERT(
+		!cluster_relmap_checkpoint_window_decode_v2(u.b, &cp, 200, 240, &id, 11, &u.w, &issued));
+	UT_ASSERT(memcmp(saved, u.b, 160) == 0);
+	UT_ASSERT(!cluster_relmap_checkpoint_window_decode_v2(u.b, &cp, 200, 240, &id, 11, &out,
+														  (uint64 *)&out));
+	UT_ASSERT(!cluster_relmap_checkpoint_window_decode_v2(u.b, &cp, 200, 240, &id, 11, &out, NULL));
+	UT_ASSERT(memcmp(&out, &zero_window, sizeof(out)) == 0);
+}
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(8);
+	UT_RUN(v2_preserves_actual_postflush_issuance_without_ceiling_inference);
+	UT_RUN(v2_rejects_valid_crc_wrong_issued_and_reserved_fields);
+	UT_RUN(v2_legacy_refusal_and_alias_keep_inputs);
 	UT_RUN(roundtrip_binds_native_checkpoint);
 	UT_RUN(rejects_corruption_and_all_zero_legacy);
 	UT_RUN(rejects_wrong_source_position_and_complete_body);

@@ -2145,12 +2145,43 @@ UT_TEST(test_v3_window_uses_original_immutable_install_and_native_readback)
 	test_cf_x_held = false;
 }
 
+UT_TEST(test_v3_postflush_issued_uses_original_immutable_readback)
+{
+	ClusterRecoveryAnchorV2 a;
+	ClusterRecoveryAnchorStageV2 stage;
+	ClusterRelmapCheckpointWindow initial, read;
+	uint8 uuid[16], bytes[160];
+	uint64 issued, observed = 0;
+	ControlFileData common, control;
+	v2_stage_fixture(&a, uuid, &common);
+	v3_window(&a);
+	UT_ASSERT(cluster_relmap_checkpoint_window_decode_v1(
+		a.native_window, &a.checkpoint_copy, a.checkpoint, a.checkpoint + 64, &a.identity,
+		a.database_incarnation, &initial));
+	issued = initial.last_issued + 9;
+	UT_ASSERT(cluster_relmap_checkpoint_window_encode_v2(
+		&initial, &a.checkpoint_copy, a.checkpoint, a.checkpoint + 64, issued, a.native_window));
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_prepare(&a, uuid, &stage), 0);
+	test_cf_x_held = true;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_install(&stage), 0);
+	UT_ASSERT_EQ(
+		cluster_recovery_anchor_v3_read_native_window_locked(&stage.ref, &common, &control, bytes),
+		0);
+	UT_ASSERT(memcmp(a.native_window, bytes, 160) == 0);
+	UT_ASSERT(cluster_relmap_checkpoint_window_decode_v2(
+		bytes, &control.checkPointCopy, a.checkpoint, a.checkpoint + 64, &a.identity,
+		a.database_incarnation, &read, &observed));
+	UT_ASSERT_EQ(observed, issued);
+	UT_ASSERT_EQ(read.last_issued, initial.last_issued);
+	test_cf_x_held = false;
+}
 int
 main(void)
 {
 	setup_shared_root();
 
-	UT_PLAN(39);
+	UT_PLAN(40);
+	UT_RUN(test_v3_postflush_issued_uses_original_immutable_readback);
 	UT_RUN(test_v3_window_roundtrip_and_legacy_clear);
 	UT_RUN(test_v3_window_inner_corruption_cannot_hide_behind_outer_hash);
 	UT_RUN(test_v3_window_uses_original_immutable_install_and_native_readback);

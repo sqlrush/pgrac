@@ -62,20 +62,24 @@ valid(const ClusterRelmapCheckpointWindow *w, const CheckPoint *cp, XLogRecPtr s
 		   && cp->redo <= start && start < end && cp->ThisTimeLineID && cp->PrevTimeLineID
 		   && cp->PrevTimeLineID <= cp->ThisTimeLineID;
 }
-bool
-cluster_relmap_checkpoint_window_encode_v1(const ClusterRelmapCheckpointWindow *w,
-										   const CheckPoint *cp, XLogRecPtr start, XLogRecPtr end,
-										   uint8 out[160])
+static bool
+encode_window(const ClusterRelmapCheckpointWindow *w, const CheckPoint *cp, XLogRecPtr start,
+			  XLogRecPtr end, uint64 post_issued, unsigned version, uint8 out[160])
 {
 	uint8 b[160] = { 0 };
 	pg_crc32c crc;
 	if (!out || overlaps(out, 160, w, sizeof(*w)) || overlaps(out, 160, cp, sizeof(*cp)))
 		return false;
 	memset(out, 0, 160);
-	if (!valid(w, cp, start, end))
+	if (!valid(w, cp, start, end)
+		|| (version == 2
+			&& (!TransactionIdIsNormal((TransactionId)post_issued) || post_issued < w->last_issued
+				|| post_issued - w->native_floor >= UINT64CONST(0x80000000))))
 		return false;
-	memcpy(b, "RMWIN001", 8);
-	put(b + 8, 1, 2);
+	memcpy(b, version == 2 ? "RMWIN002" : "RMWIN001", 8);
+	put(b + 8, version, 2);
+	if (version == 2)
+		put(b + 140, post_issued, 8);
 	put(b + 10, 160, 2);
 	put(b + 12, w->origin, 2);
 	put(b + 16, w->system_identifier, 8);
@@ -99,23 +103,50 @@ cluster_relmap_checkpoint_window_encode_v1(const ClusterRelmapCheckpointWindow *
 	return true;
 }
 bool
-cluster_relmap_checkpoint_window_decode_v1(const uint8 b[160], const CheckPoint *cp,
-										   XLogRecPtr start, XLogRecPtr end,
-										   const ClusterControlRootIdentity *id, uint64 dbinc,
-										   ClusterRelmapCheckpointWindow *out)
+cluster_relmap_checkpoint_window_encode_v1(const ClusterRelmapCheckpointWindow *w,
+										   const CheckPoint *cp, XLogRecPtr start, XLogRecPtr end,
+										   uint8 out[160])
+{
+	return encode_window(w, cp, start, end, 0, 1, out);
+}
+bool
+cluster_relmap_checkpoint_window_encode_v2(const ClusterRelmapCheckpointWindow *w,
+										   const CheckPoint *cp, XLogRecPtr start, XLogRecPtr end,
+										   uint64 post_issued, uint8 out[160])
+{
+	return encode_window(w, cp, start, end, post_issued, 2, out);
+}
+static bool
+decode_window(const uint8 b[160], const CheckPoint *cp, XLogRecPtr start, XLogRecPtr end,
+			  const ClusterControlRootIdentity *id, uint64 dbinc,
+			  ClusterRelmapCheckpointWindow *out, uint64 *post_out, bool require_v2)
 {
 	uint8 copy[160], hash[32];
 	ClusterRelmapCheckpointWindow w = { 0 };
 	pg_crc32c crc;
-	if (!out || overlaps(out, sizeof(*out), b, 160) || overlaps(out, sizeof(*out), cp, sizeof(*cp))
-		|| overlaps(out, sizeof(*out), id, sizeof(*id)))
+	unsigned version;
+	uint64 post_issued = 0;
+	if (overlaps(out, sizeof(*out), b, 160) || overlaps(out, sizeof(*out), cp, sizeof(*cp))
+		|| overlaps(out, sizeof(*out), id, sizeof(*id))
+		|| overlaps(post_out, sizeof(*post_out), b, 160)
+		|| overlaps(post_out, sizeof(*post_out), cp, sizeof(*cp))
+		|| overlaps(post_out, sizeof(*post_out), id, sizeof(*id))
+		|| overlaps(out, sizeof(*out), post_out, sizeof(*post_out)))
 		return false;
-	memset(out, 0, sizeof(*out));
-	if (!b || !cp || !id)
+	if (out)
+		memset(out, 0, sizeof(*out));
+	if (post_out)
+		*post_out = 0;
+	if (!out || (require_v2 && !post_out) || !b || !cp || !id)
 		return false;
-	if (memcmp(b, "RMWIN001", 8) || get(b + 8, 2) != 1 || get(b + 10, 2) != 160 || !zero(b + 14, 2)
-		|| !zero(b + 100, 4) || !zero(b + 140, 20))
+	version = get(b + 8, 2);
+	if ((version != 1 && version != 2) || (require_v2 && version != 2)
+		|| memcmp(b, version == 2 ? "RMWIN002" : "RMWIN001", 8) || get(b + 10, 2) != 160
+		|| !zero(b + 14, 2) || !zero(b + 100, 4)
+		|| (version == 1 ? !zero(b + 140, 20) : !zero(b + 148, 12)))
 		return false;
+	if (version == 2)
+		post_issued = get(b + 140, 8);
 	memcpy(copy, b, 160);
 	memset(copy + 136, 0, 4);
 	INIT_CRC32C(crc);
@@ -136,8 +167,30 @@ cluster_relmap_checkpoint_window_decode_v1(const uint8 b[160], const CheckPoint 
 		|| w.system_identifier != id->system_identifier || w.database_incarnation != dbinc
 		|| w.admitted_incarnation != id->origin_owner_incarnation || start != get(b + 80, 8)
 		|| end != get(b + 88, 8) || cp->ThisTimeLineID != get(b + 96, 4)
-		|| !valid(&w, cp, start, get(b + 88, 8)) || !digest(cp, hash) || memcmp(hash, b + 104, 32))
+		|| !valid(&w, cp, start, get(b + 88, 8))
+		|| (version == 2
+			&& (!TransactionIdIsNormal((TransactionId)post_issued) || post_issued < w.last_issued
+				|| post_issued - w.native_floor >= UINT64CONST(0x80000000)))
+		|| !digest(cp, hash) || memcmp(hash, b + 104, 32))
 		return false;
 	*out = w;
+	if (post_out)
+		*post_out = post_issued;
 	return true;
+}
+bool
+cluster_relmap_checkpoint_window_decode_v1(const uint8 b[160], const CheckPoint *cp,
+										   XLogRecPtr start, XLogRecPtr end,
+										   const ClusterControlRootIdentity *id, uint64 dbinc,
+										   ClusterRelmapCheckpointWindow *out)
+{
+	return decode_window(b, cp, start, end, id, dbinc, out, NULL, false);
+}
+bool
+cluster_relmap_checkpoint_window_decode_v2(const uint8 b[160], const CheckPoint *cp,
+										   XLogRecPtr start, XLogRecPtr end,
+										   const ClusterControlRootIdentity *id, uint64 dbinc,
+										   ClusterRelmapCheckpointWindow *out, uint64 *post_out)
+{
+	return decode_window(b, cp, start, end, id, dbinc, out, post_out, true);
 }

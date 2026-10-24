@@ -99,6 +99,7 @@ cluster_relmap_recovery_checkpoint_window_finish(const ClusterRelmapCheckpointSa
 		|| cluster_wal_writer_check(&s->writer) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		|| cluster_qvotec_get_self_incarnation() != s->window.boot_incarnation)
 		return false;
-	return cluster_relmap_checkpoint_window_encode_v1(&s->window, cp, start, end, out);
+	return cluster_relmap_checkpoint_window_encode_v2(&s->window, cp, start, end, now.last_issued,
+													  out);
 }
 #endif
