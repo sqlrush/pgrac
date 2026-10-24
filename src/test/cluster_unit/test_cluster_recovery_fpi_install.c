@@ -8,6 +8,9 @@ int recovery_fpi_insert_fixture_main(void);
 #undef ClusterStartupInstalledRecoveryWriterV1
 
 #include "cluster/cluster_page_install.h"
+#include "access/xlogrecovery.h"
+#include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_space_reservation.h"
 #include "storage/checksum.h"
 #include "storage/smgr.h"
 #include <fcntl.h>
@@ -27,6 +30,43 @@ static bool throw_write, throw_sync, drift_after_read, drift_after_sync, drift_a
 static bool writer_drift_after_read, missing_target;
 static XLogRecPtr native_flush_end;
 static TimeLineID native_flush_timeline;
+static bool reading_input, input_current;
+static unsigned input_reads, input_throw_at, input_drift_at, input_drift_kind;
+static int input_space_fd = -1;
+static char input_space_path[64], input_start_object;
+static ClusterColdTypedV1 input_typed;
+static PGAlignedBlock input_work_storage;
+static ClusterRecoveryCheckpointOwnerV1 input_owner;
+static BlockNumber input_space_blocks;
+static bool input_missing_space;
+#define input_start ((struct ClusterRecoveryStartV1 *)&input_start_object)
+#define input_work ((ClusterColdCtrcWorkV1 *)input_work_storage.data)
+
+/* Original opaque Start/work admission is a controlled boundary here; its
+ * native implementation is tested separately by test_cluster_cold_tx_start. */
+bool
+ClusterColdRecoveryCtrcWorkCurrent(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work)
+{
+	return input_current && start == input_start && work == input_work;
+}
+
+const ClusterColdTypedV1 *
+ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start)
+{
+	return input_current && start == input_start ? &input_typed : NULL;
+}
+
+bool
+ClusterColdRecoveryTxCheckpointOwnerV1(const struct ClusterRecoveryStartV1 *start,
+	ClusterRecoveryCheckpointOwnerV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!input_current || start != input_start)
+		return false;
+	*out = input_owner;
+	return true;
+}
 
 pg_cryptohash_ctx *recovery_fpi_hash_create(pg_cryptohash_type type);
 bool ClusterStartupInstalledRecoveryWriterV1(ClusterWalWriterToken *writer,
@@ -69,6 +109,10 @@ GetFlushRecPtr(TimeLineID *timeline)
 static void
 install_io_check(void)
 {
+	if (reading_input) {
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		return;
+	}
 	UT_ASSERT(installing && promoted && flushes == 1);
 	UT_ASSERT_EQ(CritSectionCount, 0);
 	UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_INSERTED);
@@ -91,6 +135,10 @@ bool
 smgrexists(SMgrRelation relation, ForkNumber forknum)
 {
 	install_io_check();
+	if (reading_input && forknum == SPACE_FORKNUM) {
+		UT_ASSERT(relation == &install_relation);
+		return !input_missing_space;
+	}
 	UT_ASSERT(relation == &install_relation && forknum == MAIN_FORKNUM);
 	return !missing_target;
 }
@@ -99,6 +147,10 @@ BlockNumber
 smgrnblocks(SMgrRelation relation, ForkNumber forknum)
 {
 	install_io_check();
+	if (reading_input && forknum == SPACE_FORKNUM) {
+		UT_ASSERT(relation == &install_relation);
+		return input_space_blocks;
+	}
 	UT_ASSERT(relation == &install_relation && forknum == MAIN_FORKNUM);
 	return 8;
 }
@@ -107,6 +159,31 @@ void
 smgrread(SMgrRelation relation, ForkNumber forknum, BlockNumber block, void *buffer)
 {
 	install_io_check();
+	if (reading_input) {
+		int fd = forknum == SPACE_FORKNUM ? input_space_fd : install_fd;
+		UT_ASSERT(relation == &install_relation);
+		UT_ASSERT((forknum == SPACE_FORKNUM && block < 2)
+			|| (forknum == MAIN_FORKNUM && block == 7));
+		input_reads++;
+		if (input_reads == input_throw_at)
+			ereport(ERROR, (errmsg("test recovery page input read error")));
+		UT_ASSERT_EQ(pread(fd, buffer, BLCKSZ, (off_t)block * BLCKSZ), BLCKSZ);
+		if (input_reads == input_drift_at) {
+			switch (input_drift_kind) {
+			case 0: input_current = false; break;
+			case 1: input_work->generation++; break;
+			case 2: input_owner.install_generation++; break;
+			case 3: input_owner.writer.epoch++; break;
+			case 4: input_owner.operation_uuid[15]++; break;
+			case 5: fpi_protection_current = false; break;
+			case 6: fpi_serial.duty.root_lineage_seq++; break;
+			case 7: input_typed.sources[0].claim.identity.root_lineage_seq++; break;
+			case 8: input_space_blocks++; break;
+			case 9: ((char *)buffer)[BLCKSZ - 1] ^= 1; break;
+			}
+		}
+		return;
+	}
 	UT_ASSERT(relation == &install_relation && forknum == MAIN_FORKNUM && block == 7);
 	reads++;
 	if (reads == throw_read_at)
@@ -160,6 +237,11 @@ smgrextend(SMgrRelation relation, ForkNumber forknum, BlockNumber block, const v
 static void
 install_file_close(void)
 {
+	if (input_space_fd >= 0) {
+		close(input_space_fd);
+		unlink(input_space_path);
+		input_space_fd = -1;
+	}
 	if (install_fd >= 0) {
 		close(install_fd);
 		unlink(install_path);
@@ -171,7 +253,9 @@ static void
 install_file_write(PGAlignedBlock *page)
 {
 	((PageHeader)page->data)->pd_checksum = 0;
-	if (checksums)
+	/* Native checksum requires an initialized page; preserve the zero-page
+	 * negative input so the product installer, rather than this fixture, refuses it. */
+	if (checksums && !PageIsNew((Page)page->data))
 		((PageHeader)page->data)->pd_checksum = pg_checksum_page(page->data, 7);
 	UT_ASSERT_EQ(pwrite(install_fd, page->data, BLCKSZ, (off_t)7 * BLCKSZ), BLCKSZ);
 	UT_ASSERT_EQ(fsync(install_fd), 0);
@@ -182,6 +266,7 @@ reset_install(bool enable_checksums)
 {
 	PGAlignedBlock before;
 	install_file_close();
+	reading_input = false;
 	installing = false;
 	reset_insert();
 	UT_ASSERT(finish_image(&inserted));
@@ -374,11 +459,13 @@ UT_TEST(fpi_inserted_observer_is_exact_and_never_advances_window)
 	UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_ADOPT_PENDING);
 }
 
+#include "test_cluster_recovery_ctrc_read.inc"
+
 int
 main(void)
 {
 	atexit(install_file_close);
-	UT_PLAN(7);
+	UT_PLAN(16);
 	UT_RUN(fpi_install_syncs_exact_native_lsn_and_checksum_without_retiring_window);
 	UT_RUN(fpi_install_exact_result_retries_sync_and_postread_without_rewriting);
 	UT_RUN(fpi_install_refuses_wrong_window_flush_frame_actor_or_serial_before_io);
@@ -386,6 +473,15 @@ main(void)
 	UT_RUN(fpi_install_authority_or_writer_drift_never_claims_completion);
 	UT_RUN(fpi_install_io_exceptions_rethrow_and_keep_inserted_debt);
 	UT_RUN(fpi_inserted_observer_is_exact_and_never_advances_window);
+	UT_RUN(ctrc_input_reads_exact_native_page_without_mutation);
+	UT_RUN(ctrc_input_refuses_wrong_original_scope_before_io);
+	UT_RUN(ctrc_input_refuses_wrong_space_or_page);
+	UT_RUN(ctrc_input_rechecks_scope_at_every_read);
+	UT_RUN(ctrc_input_rechecks_namespace_bytes_after_main);
+	UT_RUN(ctrc_input_errors_preserve_output_and_debt);
+	UT_RUN(ctrc_input_refuses_known_output_aliases);
+	UT_RUN(ctrc_input_accepts_only_original_replay_serial);
+	UT_RUN(ctrc_input_refuses_absent_or_foreign_handles);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

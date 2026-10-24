@@ -89,6 +89,10 @@ rf_page_storage_install_smgr_v1(const RfPageStorageInstallRequestV1 *request,
 struct ClusterRecoveryFpiInsertV1;
 struct ClusterRecoverySerialGuard;
 struct ClusterWalRetentionPin;
+struct ClusterRecoveryStartV1;
+struct ClusterColdCtrcWorkV1;
+struct RfPageAuthorityGuardV1;
+struct ClusterSpaceIdentity;
 /* Native E1 recovered Startup only. Consume the original pending FPI and
  * still-held PAGE/serial/pin; install exact before/result, sync and postread.
  * Retain the original image, guard and INSERTED window on every path. Success
@@ -96,6 +100,17 @@ struct ClusterWalRetentionPin;
  * Failure marks the exact window failed where still owned; ERROR rethrows. */
 extern bool rf_page_recovery_fpi_install_smgr_v1(struct ClusterRecoveryFpiInsertV1 *inserted,
 	struct ClusterRecoverySerialGuard *serial, struct ClusterWalRetentionPin *pin);
+/* Provisional native MAIN predecessor input only, under the original
+ * RECOVERED/native-DONE Start/work and promoted PAGE/serial/pin. Verify exact
+ * LIVE SPACE identity/reservation, page version/checksum and unchanged SPACE
+ * rereads. Retain every borrowed owner; no install, WAL or release proof.
+ * Caller supplies distinct output storage, disjoint from all borrowed state.
+ * Refusal/ERROR leaves output unchanged; native ERROR propagates. */
+extern bool rf_page_recovery_ctrc_read_smgr_v1(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, const struct RfPageAuthorityGuardV1 *guard,
+	struct ClusterRecoverySerialGuard *serial, struct ClusterWalRetentionPin *pin,
+	const struct ClusterSpaceIdentity *space, BlockNumber blockno,
+	const RfPageVersionV1 *expected_before, PGAlignedBlock *out);
 #endif
 
 #endif /* CLUSTER_PAGE_INSTALL_H */

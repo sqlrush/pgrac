@@ -2583,11 +2583,16 @@ test_cluster_recovery_fpi_insert: test_cluster_recovery_fpi_insert.c test_cluste
 
 test_cluster_recovery_fpi_install_product.o: $(top_srcdir)/src/backend/cluster/cluster_page_install.c \
 		$(top_srcdir)/src/include/cluster/cluster_page_install.h \
+		$(top_srcdir)/src/include/access/xlogrecovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
+		$(top_srcdir)/src/include/cluster/cluster_space_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_space_reservation.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_recovery_fpi_install: test_cluster_recovery_fpi_install.c test_cluster_recovery_fpi_insert.c \
-		test_cluster_recovery_stamp.c unit_test.h test_cluster_recovery_fpi_generic.o \
+		test_cluster_recovery_stamp.c test_cluster_recovery_ctrc_read.inc unit_test.h test_cluster_recovery_fpi_generic.o \
 		test_cluster_recovery_fpi_install_product.o test_cluster_space_producer_product.o \
 		cluster_page_stable_base_test.o \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
