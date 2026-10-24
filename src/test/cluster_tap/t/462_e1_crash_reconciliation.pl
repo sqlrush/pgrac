@@ -137,13 +137,21 @@ sub clean_after_failure
 {
 	my ($cluster) = @_;
 	return unless defined $cluster;
+	my @cleanup_errors;
 	for my $node ($cluster->nodes)
 	{
-		$node->_update_pid(-1);
-		$node->stop('immediate', fail_ok => 1) if defined $node->{_pid};
-		$node->_update_pid(-1);
-		BAIL_OUT('failed cohort cleanup; refusing to reformat shared votes') if defined $node->{_pid};
+		# A failed member must not prevent stop attempts for its peers.
+		my $stopped = eval {
+			$node->_update_pid(-1);
+			$node->stop('immediate', fail_ok => 1) if defined $node->{_pid};
+			$node->_update_pid(-1);
+			die "postmaster remains alive (PID $node->{_pid})\n" if defined $node->{_pid};
+			1;
+		};
+		push @cleanup_errors, $@ || 'cleanup did not complete' unless $stopped;
 	}
+	BAIL_OUT('failed cohort cleanup; refusing to reformat shared votes: ' . join('; ', @cleanup_errors))
+		if @cleanup_errors;
 	$cluster->{running} = 0;
 }
 
