@@ -45,6 +45,7 @@
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "cluster/cluster_control_root.h"
+#include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_tier1.h" /* spec-6.14 D9 amend: claim-holder liveness poll */
@@ -53,6 +54,8 @@
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_recovery_worker.h"
+#include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_thread_recovery_authority.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_tail.h"
@@ -64,6 +67,7 @@
 #include "port/pg_crc32c.h"
 #include "portability/instr_time.h"
 #include "storage/fd.h"
+#include "storage/latch.h"
 #include "utils/errcodes.h"
 #include "utils/wait_event.h"
 
@@ -1362,6 +1366,148 @@ recovery_fence_plan_seal_inputs(ClusterRecoveryFencePlan *plan, uint16 own_threa
 	memcpy(plan->start_lsn, start, sizeof(start));
 }
 
+/* Observe the complete original metadata union under one CF-S cut. A peer's
+ * old OPEN, or its unfinished self-seal, is pending only inside this exact
+ * accepted cold cohort. A writer from the admitted boot is never pending.
+ * History/terminal/pending objects are decoded by their original reader;
+ * they remain obligations of the later typed input/graph owners. This read
+ * grants no replay, physical isolation, completion or writer authority.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterControlRootResult
+recovery_merge_cold_inputs_observe(const ClusterWalSourceRef *restart,
+	const ClusterFormationSnapshotV1 *cohort, ControlRootImage *root,
+	ClusterWalOriginInputs *inputs, bool *pending)
+{
+	ControlFileData common;
+	ClusterControlRootFileToken token;
+	ClusterControlRootResult result;
+
+	*pending = false;
+	result = cluster_control_root_v3_read_control_locked(restart->claim.identity.storage_uuid,
+		restart->claim.identity.system_identifier, root, &common, &token);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return result;
+	for (uint32 node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; ++node) {
+		const ClusterControlRootSnapshot *current;
+		uint64 boot = cohort->membership.last_admitted_incarnation[node];
+		bool member = cohort->membership.membership_state[node] == CLUSTER_MEMBER_MEMBER;
+
+		if (!root->present[node]) {
+			if (member)
+				return CLUSTER_CONTROL_ROOT_ABSENT;
+			continue;
+		}
+		result = cluster_wal_origin_inputs_read_locked(root, node, inputs);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		current = &inputs->current.snapshot;
+		if (member && (current->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+			|| (current->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+				&& !cluster_recovery_worker_root_anchor_valid(current)))) {
+			if (boot == 0 || current->identity.origin_owner_incarnation >= boot)
+				return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+			*pending = true;
+		}
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+/* Each Startup can self-seal before any peer replays. Wait for that original
+ * producer across the whole admitted cohort, not for a number of census
+ * retries or an age threshold. No CF/WALR/IR hold spans the local wait. A
+ * changed cohort, unavailable source or live current-boot writer refuses;
+ * elapsed time never supplies missing evidence. The independent fence and
+ * full retained-source/graph gates remain in the original preflight below. */
+static bool
+recovery_merge_wait_cold_inputs(uint16 own_thread)
+{
+	ClusterFormationSnapshotV1 cohort, current;
+	ClusterWalSourceRef restart;
+	ControlRootImage *root;
+	ClusterWalOriginInputs *inputs;
+	volatile bool cf_attempted = false;
+	bool ready = false;
+	bool reported = false;
+
+	if (!cluster_wal_thread_restart_v2_ref(&restart)
+		|| !cluster_reconfig_capture_formation_snapshot_v1(own_thread, &cohort)
+		|| cohort.startup_formation_generation == 0)
+		return false;
+	root = palloc(sizeof(*root));
+	inputs = palloc(sizeof(*inputs));
+	PG_TRY();
+	{
+		for (;;) {
+			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+			ClusterFormationWitnessResult proof;
+			bool pending = true;
+
+			HandleStartupProcInterrupts();
+			CHECK_FOR_INTERRUPTS();
+			proof = cluster_authority_startup_refresh_recovery(100);
+			if (!cluster_reconfig_capture_formation_snapshot_v1(own_thread, &current)
+				|| !cluster_formation_snapshot_matches_v1(&cohort, &current))
+				break;
+			if (proof == CLUSTER_FORMATION_WITNESS_READY) {
+				ClusterCfReleaseResult released = CLUSTER_CF_RELEASE_NOT_HELD;
+
+				cf_attempted = true;
+				if (cluster_cf_lock(ShareLock) && cluster_cf_held_is_clusterwide(ShareLock))
+					result = recovery_merge_cold_inputs_observe(&restart, &cohort, root,
+						inputs, &pending);
+				if (cluster_cf_held(ShareLock))
+					released = cluster_cf_unlock_confirmed(ShareLock);
+				cf_attempted = false;
+				if (released != CLUSTER_CF_RELEASE_CONFIRMED
+					&& released != CLUSTER_CF_RELEASE_NOT_HELD)
+					ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						errmsg("cold input observation could not release CF")));
+				if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+					&& released != CLUSTER_CF_RELEASE_CONFIRMED)
+					result = CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN;
+			} else if (proof != CLUSTER_FORMATION_WITNESS_READY
+				&& proof != CLUSTER_FORMATION_WITNESS_UNSTABLE
+				&& proof != CLUSTER_FORMATION_WITNESS_CACHE_EXPIRED
+				&& proof != CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN)
+				break;
+			if (!cluster_reconfig_capture_formation_snapshot_v1(own_thread, &current)
+				|| !cluster_formation_snapshot_matches_v1(&cohort, &current))
+				break;
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && !pending) {
+				ready = true;
+				break;
+			}
+			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				&& result != CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE) {
+				ereport(LOG, (errmsg("cold input observation refused"),
+					errdetail("result=%d own_thread=%u", (int)result, (unsigned)own_thread)));
+				break;
+			}
+			if (!reported) {
+				ereport(LOG, (errmsg("waiting for the cold cohort's original input seals"),
+					errdetail("formation_generation=" UINT64_FORMAT " own_thread=%u",
+						cohort.startup_formation_generation, (unsigned)own_thread)));
+				reported = true;
+			}
+			ResetLatch(MyLatch);
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+				100, WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+		}
+	}
+	PG_FINALLY();
+	{
+		if (cf_attempted && cluster_cf_held(ShareLock)
+			&& cluster_cf_unlock_confirmed(ShareLock) != CLUSTER_CF_RELEASE_CONFIRMED)
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+				errmsg("cold input observation cleanup could not release CF")));
+		pfree(inputs);
+		pfree(root);
+	}
+	PG_END_TRY();
+	return ready;
+}
+
 /*
  * RF-ROOT P4 S04-11 cold readonly preflight.  Candidate/WAL validation and
  * all root classifications finish before the first daemon admission.  One
@@ -1387,14 +1533,13 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 								(unsigned)own_thread, out_plan == NULL ? 1 : 0)));
 		return CLUSTER_MERGE_NO_NO_PLAN;
 	}
-	/* The startup observation can span a peer's original self-seal. Before
-	 * interpreting its old ALIVE count, publish one fresh complete census.
-	 * Never clear/reclassify a field locally: a peer still ALIVE in the new
-	 * census keeps the original NO_NOT_COLD refusal. No wait or admission
-	 * is introduced here. Author: SqlRush <sqlrush@gmail.com> */
+	/* Only the same complete cohort's original input producers can make a
+	 * fresh census usable. Re-publish once after readiness, never to age or
+	 * override an ALIVE verdict. No claim or fence has been acquired yet. */
 	if (cluster_shared_config && cluster_recovery_plan_snapshot(&observed)
 		&& !observed.failed && observed.own_thread == own_thread && observed.n_alive > 0) {
-		ereport(LOG, (errmsg("refreshing observational recovery census before cold admission")));
+		if (!recovery_merge_wait_cold_inputs(own_thread))
+			return CLUSTER_MERGE_NO_NOT_COLD;
 		cluster_recovery_plan_generate(observed.dbstate_at_startup, observed.local_recovery_needed);
 	}
 	plan = palloc0(sizeof(*plan));

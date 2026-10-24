@@ -9316,6 +9316,10 @@ test_cluster_recovery_duty_compare.inc: $(top_srcdir)/src/backend/cluster/cluste
 	mv $@.tmp $@
 
 test_cluster_recovery_merge_seal test_cluster_recovery_merge_complete: %: %.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_cf_enqueue.h \
+		$(top_srcdir)/src/include/cluster/cluster_reconfig.h \
+		$(top_srcdir)/src/include/cluster/cluster_startup_phase.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h \
 		test_cluster_recovery_duty_compare.inc \
 		test_cluster_recovery_merge_seal_boundary.h test_cluster_recovery_merge_cold_fixture.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_duty.h \
@@ -9899,6 +9903,10 @@ test_cluster_recovery_plan_publication.inc: $(top_srcdir)/src/backend/cluster/cl
 	mv $@.tmp $@
 
 test_cluster_recovery_plan_merge: test_cluster_recovery_plan_merge.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_cf_enqueue.h \
+		$(top_srcdir)/src/include/cluster/cluster_reconfig.h \
+		$(top_srcdir)/src/include/cluster/cluster_startup_phase.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h \
 		test_cluster_recovery_duty_compare.inc \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_duty.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_worker.h \

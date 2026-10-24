@@ -8,6 +8,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include "storage/spin.h"
+#include "storage/latch.h"
 
 static void test_ereport_begin(int elevel);
 static void test_ereport_end(void);
@@ -215,6 +216,9 @@ UT_TEST(test_generated_alive_peer_keeps_cold_preflight_closed)
 
 	pipeline_fixture();
 	roots[2].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	/* This is the admitted boot's actual writer, not its predecessor
+	 * waiting for the original Startup self-seal. */
+	roots[2].identity.origin_owner_incarnation = 12;
 	roots[2].published_at_usec = GetCurrentTimestamp();
 	cluster_recovery_plan_generate(DB_IN_PRODUCTION, true);
 	UT_ASSERT(cluster_recovery_plan_snapshot(&observed));
@@ -222,6 +226,7 @@ UT_TEST(test_generated_alive_peer_keeps_cold_preflight_closed)
 	UT_ASSERT(preflight(&plan, &engage));
 	UT_ASSERT_EQ(engage, CLUSTER_MERGE_NO_NOT_COLD);
 	UT_ASSERT(plan == NULL && formations_built == 0);
+	UT_ASSERT_EQ(cold_input_waits, 0);
 }
 
 UT_TEST(test_published_alive_observation_is_refreshed_before_admission)
@@ -253,10 +258,172 @@ UT_TEST(test_published_alive_observation_is_refreshed_before_admission)
 	cluster_recovery_merge_fence_plan_destroy(&plan);
 }
 
+static void
+seal_next_cohort_input(void)
+{
+	ClusterRecoveryPlan observed;
+	uint16 tid = (uint16)cold_input_waits + 1;
+	UT_ASSERT(cluster_recovery_plan_snapshot(&observed));
+	UT_ASSERT_EQ(observed.n_alive, 3);
+	UT_ASSERT_EQ(observed.n_crashed_candidate, 0);
+	UT_ASSERT(tid >= 2 && tid <= NODES);
+	roots[tid].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	roots[tid].root_publish_seq++;
+	tokens[tid].lifecycle = roots[tid].lifecycle;
+	tokens[tid].root_publish_seq++;
+}
+
+UT_TEST(test_cold_admission_waits_for_all_original_peer_self_seals)
+{
+	ClusterRecoveryPlan observed;
+	ClusterRecoveryFencePlan *plan = NULL;
+	ClusterMergeEngage engage;
+
+	pipeline_fixture();
+	for (uint16 tid = 2; tid <= NODES; tid++) {
+		roots[tid].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+		roots[tid].published_at_usec = GetCurrentTimestamp();
+	}
+	cluster_recovery_plan_generate(DB_IN_PRODUCTION, true);
+	UT_ASSERT(cluster_recovery_plan_snapshot(&observed));
+	UT_ASSERT_EQ(observed.n_alive, 3);
+	cold_wait_hook = seal_next_cohort_input;
+	UT_ASSERT(preflight(&plan, &engage));
+	UT_ASSERT_EQ(engage, CLUSTER_MERGE_ENGAGE);
+	UT_ASSERT_EQ(cold_input_waits, 3);
+	UT_ASSERT(!cold_cf_held);
+	UT_ASSERT_EQ(cold_cf_releases, 4);
+	UT_ASSERT_EQ(cold_origin_reads, 4 * NODES);
+	UT_ASSERT(cluster_recovery_plan_snapshot(&observed));
+	UT_ASSERT_EQ(observed.n_alive, 0);
+	UT_ASSERT_EQ(observed.n_crashed_candidate, 3);
+	UT_ASSERT(plan != NULL);
+	cluster_recovery_merge_fence_plan_destroy(&plan);
+}
+
+static void
+change_cohort_while_waiting(void)
+{
+	cold_cohort.membership.last_admitted_incarnation[1]++;
+}
+
+UT_TEST(test_cold_input_wait_rejects_boot_cohort_drift)
+{
+	ClusterRecoveryFencePlan *plan = NULL;
+	ClusterMergeEngage engage;
+	pipeline_fixture();
+	make_open(2);
+	roots[2].published_at_usec = GetCurrentTimestamp();
+	cluster_recovery_plan_generate(DB_IN_PRODUCTION, true);
+	cold_wait_hook = change_cohort_while_waiting;
+	UT_ASSERT(preflight(&plan, &engage));
+	UT_ASSERT_EQ(engage, CLUSTER_MERGE_NO_NOT_COLD);
+	UT_ASSERT_EQ(cold_input_waits, 1);
+	UT_ASSERT(!cold_cf_held && plan == NULL && formations_built == 0);
+}
+
+UT_TEST(test_cold_input_wait_preserves_selected_history_refusal)
+{
+	ClusterRecoveryFencePlan *plan = NULL;
+	ClusterMergeEngage engage;
+	pipeline_fixture();
+	make_open(2);
+	roots[2].published_at_usec = GetCurrentTimestamp();
+	cluster_recovery_plan_generate(DB_IN_PRODUCTION, true);
+	/* The complete original reader refuses a selected history/terminal/
+	 * pending object, even though every current ROOT alone is readable. */
+	cold_bad_origin = 2;
+	UT_ASSERT(preflight(&plan, &engage));
+	UT_ASSERT_EQ(engage, CLUSTER_MERGE_NO_NOT_COLD);
+	UT_ASSERT_EQ(cold_input_waits, 0);
+	UT_ASSERT_EQ(cold_cf_releases, 1);
+	UT_ASSERT(!cold_cf_held && plan == NULL && formations_built == 0);
+}
+
+UT_TEST(test_cold_input_wait_never_waits_after_uncertain_cf_release)
+{
+	ClusterRecoveryFencePlan *plan = NULL;
+	ClusterMergeEngage engage;
+	pipeline_fixture();
+	make_open(2);
+	roots[2].published_at_usec = GetCurrentTimestamp();
+	cluster_recovery_plan_generate(DB_IN_PRODUCTION, true);
+	cold_release_result = CLUSTER_CF_RELEASE_UNCONFIRMED;
+	UT_ASSERT(!preflight(&plan, &engage));
+	UT_ASSERT_EQ(cold_cf_releases, 1);
+	UT_ASSERT_EQ(cold_input_waits, 0);
+	UT_ASSERT(plan == NULL && formations_built == 0);
+}
+
+UT_TEST(test_cold_input_error_unwinds_original_cf_before_propagating)
+{
+	ClusterRecoveryFencePlan *plan = NULL;
+	ClusterMergeEngage engage;
+	pipeline_fixture();
+	make_open(2);
+	roots[2].published_at_usec = GetCurrentTimestamp();
+	cluster_recovery_plan_generate(DB_IN_PRODUCTION, true);
+	cold_metadata_error = true;
+	UT_ASSERT(!preflight(&plan, &engage));
+	UT_ASSERT_EQ(last_elevel, ERROR);
+	UT_ASSERT_EQ(cold_cf_releases, 1);
+	UT_ASSERT_EQ(cold_input_waits, 0);
+	UT_ASSERT(!cold_cf_held && plan == NULL && formations_built == 0);
+}
+
+UT_TEST(test_missing_accepted_cold_cohort_cannot_start_a_wait)
+{
+	ClusterRecoveryFencePlan *plan = NULL;
+	ClusterMergeEngage engage;
+	pipeline_fixture();
+	make_open(2);
+	roots[2].published_at_usec = GetCurrentTimestamp();
+	cluster_recovery_plan_generate(DB_IN_PRODUCTION, true);
+	cold_cohort.startup_formation_generation = 0;
+	UT_ASSERT(preflight(&plan, &engage));
+	UT_ASSERT_EQ(engage, CLUSTER_MERGE_NO_NOT_COLD);
+	UT_ASSERT_EQ(cold_cf_reads + cold_input_waits, 0);
+	UT_ASSERT(plan == NULL && formations_built == 0);
+}
+
+static ClusterControlRootSnapshot saved_sealed_tail;
+static void
+complete_two_original_seal_stages(void)
+{
+	if (cold_input_waits == 1) {
+		roots[2].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+		roots[2].root_flags |= TAIL_FLAGS;
+		tokens[2].lifecycle = roots[2].lifecycle;
+		tokens[2].root_flags = roots[2].root_flags;
+	} else {
+		UT_ASSERT_EQ(cold_input_waits, 2);
+		roots[3] = saved_sealed_tail;
+		tokens[3].root_flags = roots[3].root_flags;
+	}
+}
+
+UT_TEST(test_cold_wait_includes_peers_unfinished_tail_seal)
+{
+	ClusterRecoveryFencePlan *plan = NULL;
+	pipeline_fixture();
+	make_open(2);
+	roots[2].published_at_usec = GetCurrentTimestamp();
+	saved_sealed_tail = roots[3];
+	make_sealed_without_tail(3);
+	cluster_recovery_plan_generate(DB_IN_PRODUCTION, true);
+	cold_wait_hook = complete_two_original_seal_stages;
+	expect_engaged(&plan);
+	if (plan == NULL) return;
+	UT_ASSERT_EQ(cold_input_waits, 2);
+	UT_ASSERT_EQ(cold_cf_releases, 3);
+	UT_ASSERT(!cold_cf_held && plan != NULL);
+	cluster_recovery_merge_fence_plan_destroy(&plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(14);
 	UT_RUN(test_published_pre2_census_reaches_actual_cold_preflight);
 	UT_RUN(test_snapshot_is_a_copy_and_unpublished_input_is_not_consumed);
 	UT_RUN(test_published_census_reprojects_after_original_foreign_seals);
@@ -264,6 +431,13 @@ main(void)
 	UT_RUN(test_generated_unknown_never_reaches_fence_admission);
 	UT_RUN(test_generated_alive_peer_keeps_cold_preflight_closed);
 	UT_RUN(test_published_alive_observation_is_refreshed_before_admission);
+	UT_RUN(test_cold_admission_waits_for_all_original_peer_self_seals);
+	UT_RUN(test_cold_input_wait_rejects_boot_cohort_drift);
+	UT_RUN(test_cold_input_wait_preserves_selected_history_refusal);
+	UT_RUN(test_cold_input_wait_never_waits_after_uncertain_cf_release);
+	UT_RUN(test_cold_input_error_unwinds_original_cf_before_propagating);
+	UT_RUN(test_missing_accepted_cold_cohort_cannot_start_a_wait);
+	UT_RUN(test_cold_wait_includes_peers_unfinished_tail_seal);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
