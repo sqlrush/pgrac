@@ -36,6 +36,9 @@
 #include "cluster/cluster_heap_freeze.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_pcm_own.h"
+#include "cluster/cluster_ko.h"
+#include "cluster/cluster_ic.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_heap_horizon.h"
 #include "cluster/cluster_scn.h"
@@ -84,6 +87,11 @@ static bool redoing, redo_locked;
 static jmp_buf error_jump;
 static bool local_x, writer_current, route_current, authority_current, admission_current;
 static bool local_share, resume_allowed, resume_error, resumed_writer;
+static bool node_grant_current, object_current, error_after_local_lock, error_after_ledger_bind;
+static uint64 current_object_revision;
+static unsigned local_lock_attempts, local_unlocks;
+int cluster_interconnect_tier;
+static bool fixture_node_grant_matches(void);
 static unsigned conditional_resumes, conditional_unlocks;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
@@ -137,34 +145,7 @@ LWLockHeldByMe(LWLock *lock)
 	return local_x || local_share;
 }
 
-/* The original conditional resumer is tested with its real ledger body in
- * the writer fixture. This leaf supplies only that acquisition boundary. */
-bool
-ClusterConditionalLockBufferWithMutationContext(Buffer buffer,
-	const ResourceXWriterUseContext *expected, uint64 revision, bool checked)
-{
-	UT_ASSERT_EQ(buffer, 1);
-	UT_ASSERT(backend_pin_count == 1 && !local_x && !local_share);
-	UT_ASSERT(expected != NULL && revision == 7 && checked);
-	UT_ASSERT_EQ(inserts + dirties + flushes, 0);
-	conditional_resumes++;
-	if (resume_error)
-		ereport(ERROR, (errmsg("conditional resume ERROR fixture")));
-	if (!resume_allowed)
-		return false;
-	local_x = resumed_writer = true;
-	return true;
-}
-
-void ClusterUnlockBufferAfterConditionalMutation(Buffer buffer);
-void
-ClusterUnlockBufferAfterConditionalMutation(Buffer buffer)
-{
-	UT_ASSERT_EQ(buffer, 1);
-	UT_ASSERT(local_x && resumed_writer && backend_pin_count == 1);
-	conditional_unlocks++;
-	local_x = resumed_writer = false;
-}
+static ResourceXWriterUseContext original_writer_context;
 
 void
 pg_re_throw(void)
@@ -174,20 +155,50 @@ pg_re_throw(void)
 	longjmp(error_jump, 1);
 }
 
-static ResourceXWriterUseContext original_writer_context;
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_snapshot(BufferDesc *buf, ClusterPcmOwnSnapshot *out)
+{
+	UT_ASSERT(buf == GetBufferDescriptor(0) && !local_x && backend_pin_count == 1);
+	if (resume_error)
+		ereport(ERROR, (errmsg("pre-lock snapshot ERROR fixture")));
+	memset(out, 0, sizeof(*out)); out->tag = buf->tag;
+	out->generation = original_writer_context.buffer_ownership_generation;
+	out->pcm_state = writer_state;
+	return node_grant_current ? CLUSTER_PCM_OWN_OK : CLUSTER_PCM_OWN_STALE;
+}
+
 bool
-ClusterBufferCaptureMutationContext(Buffer buffer, ResourceXWriterUseContext *out,
-	uint64 *object_revision, bool *object_checked)
+cluster_ko_peer_delivery_begin_v3(RelFileLocator locator, uint64 *revision)
+{
+	UT_ASSERT(RelFileLocatorEquals(locator, relation_data.rd_locator));
+	UT_ASSERT(!local_x); *revision = current_object_revision;
+	return object_current;
+}
+
+bool
+cluster_ko_peer_delivery_current_v3(uint64 revision)
+{
+	return object_current && revision == current_object_revision;
+}
+
+bool
+ConditionalLockBuffer(Buffer buffer)
 {
 	UT_ASSERT_EQ(buffer, 1);
-	if (!writer_current || !local_x || backend_pin_count <= 0)
-		return false;
-	*out = original_writer_context;
-	*object_revision = 7;
-	*object_checked = true;
-	return true;
+	UT_ASSERT(backend_pin_count == 1 && !local_x && !local_share);
+	local_lock_attempts++; local_x = resume_allowed;
+	if (error_after_local_lock)
+		ereport(ERROR, (errmsg("post-local-lock ERROR fixture")));
+	return local_x;
 }
-#include "test_cluster_heap_writer_context_match.inc"
+
+void
+LWLockRelease(LWLock *lock)
+{
+	UT_ASSERT(lock == BufferDescriptorGetContentLock(GetBufferDescriptor(0)));
+	UT_ASSERT(local_x && backend_pin_count == 1);
+	local_unlocks++; local_x = resumed_writer = false;
+}
 
 bool
 cluster_bufmgr_terminal_stamp_authority(Buffer buffer, const BufferTag *tag,
@@ -202,8 +213,63 @@ cluster_bufmgr_terminal_stamp_authority(Buffer buffer, const BufferTag *tag,
 	*generation = 14;
 	*epoch = 15;
 	*state = writer_state;
-	return writer_current;
+	if (error_after_ledger_bind)
+		ereport(ERROR, (errmsg("post-ledger-bind ERROR fixture")));
+	return writer_current && node_grant_current && fixture_node_grant_matches();
 }
+
+/* Compile the actual bufmgr ledger, pin-independent capture/match, original
+ * writer resumer and both paired cleanups into the same native WAL fixture.
+ * Only these API counters wrap the real functions; no authority is created. */
+static bool fixture_actual_resume(Buffer, const ResourceXWriterUseContext *, uint64, bool);
+static void fixture_actual_unlock(Buffer);
+#define ClusterConditionalLockBufferWithMutationContext fixture_actual_resume
+#define ClusterUnlockBufferAfterConditionalMutation fixture_actual_unlock
+#include "test_cluster_freeze_writer_context.inc"
+#undef ClusterUnlockBufferAfterConditionalMutation
+#undef ClusterConditionalLockBufferWithMutationContext
+
+static bool
+fixture_node_grant_matches(void)
+{
+	ClusterPcmXWriterLedgerEntry *e = cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0));
+	return e != NULL && e->phase == PCM_X_WRITER_LEDGER_ACTIVE
+		&& resource_x_assertion_equal(&e->authority.ref.assertion,
+			&original_writer_context.ref.assertion)
+		&& e->authority.ref.formation == original_writer_context.ref.formation
+		&& e->authority.ref.acquisition_generation == original_writer_context.ref.acquisition_generation
+		&& e->authority.r4_record_generation == original_writer_context.r4_record_generation
+		&& e->authority.buffer_ownership_generation == original_writer_context.buffer_ownership_generation;
+}
+
+bool
+ClusterConditionalLockBufferWithMutationContext(Buffer buffer,
+	const ResourceXWriterUseContext *expected, uint64 revision, bool checked)
+{
+	conditional_resumes++;
+	resumed_writer = fixture_actual_resume(buffer, expected, revision, checked);
+	return resumed_writer;
+}
+
+void ClusterUnlockBufferAfterConditionalMutation(Buffer buffer);
+void
+ClusterUnlockBufferAfterConditionalMutation(Buffer buffer)
+{
+	conditional_unlocks++;
+	fixture_actual_unlock(buffer);
+	UT_ASSERT(!local_x && backend_pin_count == 1);
+	UT_ASSERT(cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0)) == NULL);
+}
+
+static void
+fixture_release_original_writer(void)
+{
+	/* Initial unlock is a controlled seam; actual release/resume bodies and
+	 * the node's original T3 are checked independently and below. */
+	memset(cluster_bufmgr_pcm_x_writer_ledger, 0, sizeof(cluster_bufmgr_pcm_x_writer_ledger));
+	local_x = false;
+}
+
 bool
 cluster_pcm_lock_r4_route_snapshot(BufferTag tag, PcmAuthoritySnapshot *out,
 	uint64 *master, SCN *scn)
@@ -240,7 +306,8 @@ cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 	UT_ASSERT(token != NULL && token->entered);
 	UT_ASSERT(local_x && backend_pin_count == 1);
 	UT_ASSERT_EQ(CritSectionCount, 0);
-	UT_ASSERT_EQ(writer_checks, 1);
+	/* Native final authority + real capture; a resumed scope checked once more. */
+	UT_ASSERT_EQ(writer_checks, resumed_writer ? 3 : 2);
 	UT_ASSERT_EQ(route_checks, 1);
 	UT_ASSERT_EQ(authority_checks, 1);
 	UT_ASSERT_EQ(admission_checks, 0);
@@ -618,6 +685,13 @@ reset(uint8 opcode, bool shared)
 	full_target_checks = 0;
 	local_x = writer_current = route_current = authority_current = admission_current = true;
 	local_share = resume_allowed = resume_error = resumed_writer = false;
+	node_grant_current = true;
+	object_current = true; current_object_revision = 7;
+	error_after_local_lock = error_after_ledger_bind = false;
+	local_lock_attempts = local_unlocks = 0;
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+	memset(cluster_bufmgr_pcm_x_writer_ledger, 0, sizeof(cluster_bufmgr_pcm_x_writer_ledger));
+	memset(descriptors, 0, sizeof(descriptors));
 	conditional_resumes = conditional_unlocks = 0;
 	backend_pin_count = 1;
 	pin_checks = 0;
@@ -926,6 +1000,17 @@ qualified_xmin_setup(QualifiedXminFixture *f, uint16 xmax_mask)
 	original_writer_context.ref.acquisition_generation = 22;
 	original_writer_context.r4_record_generation = 13;
 	original_writer_context.buffer_ownership_generation = 14;
+	{
+		BufferDesc *buf = GetBufferDescriptor(0);
+		ClusterPcmXWriterLedgerEntry *e = &cluster_bufmgr_pcm_x_writer_ledger[0];
+		buf->tag = original_writer_context.ref.assertion.resource;
+		e->phase = PCM_X_WRITER_LEDGER_ACTIVE; e->buffer_id = 0;
+		e->content_lock = BufferDescriptorGetContentLock(buf);
+		e->authority = original_writer_context;
+		e->granted.tag = buf->tag; e->granted.generation = 14;
+		e->granted.pcm_state = PCM_STATE_X;
+		e->object_checked = true; e->object_revision = 7;
+	}
 	f->input.writer_context = original_writer_context;
 	f->input.writer_context_valid = true;
 	f->input.writer_object_revision = 7;
@@ -1164,7 +1249,7 @@ UT_TEST(test_xmin_batch_one_wal_fence_fullxid_horizon_and_redo)
 	UT_ASSERT(qualified_xmin_batch_apply(&f, targets, 3));
 	UT_ASSERT_EQ(inserts, 1);
 	UT_ASSERT_EQ(flushes, 1);
-	UT_ASSERT_EQ(writer_checks, 1);
+	UT_ASSERT_EQ(writer_checks, 2);
 	UT_ASSERT_EQ(route_checks, 1);
 	UT_ASSERT_EQ(authority_checks, 1);
 	UT_ASSERT_EQ(admission_checks, 1);
@@ -1296,7 +1381,7 @@ UT_TEST(test_xmin_batch_final_authority_refusal_changes_nothing)
 		else
 			route_master++;
 		UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
-		UT_ASSERT_EQ(writer_checks, 1);
+		UT_ASSERT_EQ(writer_checks, 2);
 		UT_ASSERT_EQ(route_checks, 1);
 		UT_ASSERT_EQ(wal_clock_reads, 0);
 		UT_ASSERT_EQ(inserts + dirties + flushes, 0);
@@ -1376,7 +1461,7 @@ UT_TEST(test_xmin_batch_flush_error_keeps_borrowed_resources)
 		UT_ASSERT_EQ(CritSectionCount, 0);
 		UT_ASSERT_EQ(inserts, 1);
 		UT_ASSERT_EQ(flushes, 1);
-		UT_ASSERT_EQ(writer_checks, 1);
+		UT_ASSERT_EQ(writer_checks, 2);
 		UT_ASSERT_EQ(admission_checks, 1);
 		for (int i = 1; i <= 3; i++)
 			UT_ASSERT(HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, i)));
@@ -2008,6 +2093,52 @@ UT_TEST(test_xmin_single_batch_keep_original_writer_object_fence)
 		}
 }
 
+UT_TEST(test_xmin_actual_writer_keeps_original_ko_revision_before_lock)
+{
+	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	fixture_release_original_writer(); resume_allowed = true;
+	current_object_revision = 8;
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(conditional_resumes, 1);
+	UT_ASSERT_EQ(local_lock_attempts + local_unlocks + conditional_unlocks, 0);
+	UT_ASSERT_EQ(inserts + dirties + flushes, 0); UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+	UT_ASSERT(cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0)) == NULL);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_xmin_actual_resumer_inner_error_cleans_before_native_wrapper)
+{
+	for (int after_bind = 0; after_bind < 2; after_bind++) {
+		QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		fixture_release_original_writer(); resume_allowed = expecting_error = true;
+		error_after_local_lock = !after_bind; error_after_ledger_bind = after_bind;
+		if (setjmp(error_jump) == 0) {
+			(void) qualified_xmin_apply(&f, 0); UT_ASSERT(false);
+		} else {
+			UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(local_lock_attempts, 1);
+			UT_ASSERT_EQ(local_unlocks, 1); UT_ASSERT_EQ(conditional_unlocks, 0);
+			UT_ASSERT_EQ(inserts + dirties + flushes, 0); UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT(cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0)) == NULL);
+			UT_ASSERT(PG_exception_stack == NULL);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+		expecting_error = false;
+	}
+}
+
+UT_TEST(test_xmin_released_writer_requires_actual_original_node_grant)
+{
+	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	fixture_release_original_writer(); resume_allowed = true; node_grant_current = false;
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(inserts + dirties + flushes, 0);
+	UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
 UT_TEST(test_xmin_released_writer_single_and_batch_reach_native_wal)
 {
 	for (int batch = 0; batch < 2; batch++) {
@@ -2015,7 +2146,7 @@ UT_TEST(test_xmin_released_writer_single_and_batch_reach_native_wal)
 		ClusterHeapFreezeXminTargetV1 targets[3];
 		if (batch) qualified_xmin_batch_setup(&f, targets);
 		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
-		local_x = false; resume_allowed = true;
+		fixture_release_original_writer(); resume_allowed = true;
 		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3)
 			: qualified_xmin_apply(&f, 0));
 		UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
@@ -2028,7 +2159,7 @@ UT_TEST(test_xmin_released_writer_single_and_batch_reach_native_wal)
 UT_TEST(test_xmin_released_writer_refusal_never_fetches_or_writes)
 {
 	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
-	local_x = false;
+	fixture_release_original_writer();
 	UT_ASSERT(!qualified_xmin_apply(&f, 0));
 	UT_ASSERT_EQ(conditional_resumes, 1);
 	UT_ASSERT_EQ(conditional_unlocks + full_target_checks + inserts + dirties + flushes, 0);
@@ -2041,7 +2172,7 @@ UT_TEST(test_xmin_resumed_writer_plan_refusal_unlocks_without_unpin)
 {
 	QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
 	qualified_xmin_batch_setup(&f, targets);
-	local_x = false; resume_allowed = true;
+	fixture_release_original_writer(); resume_allowed = true;
 	targets[2].original_creator_full_xid = InvalidFullTransactionId;
 	UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
 	UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
@@ -2053,7 +2184,7 @@ UT_TEST(test_xmin_resumed_writer_plan_refusal_unlocks_without_unpin)
 UT_TEST(test_xmin_resumed_writer_target_error_runs_finally)
 {
 	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
-	local_x = false; resume_allowed = target_recheck_error = expecting_error = true;
+	fixture_release_original_writer(); resume_allowed = target_recheck_error = expecting_error = true;
 	if (setjmp(error_jump) == 0) {
 		(void) qualified_xmin_apply(&f, 0); UT_ASSERT(false);
 	} else {
@@ -2067,7 +2198,7 @@ UT_TEST(test_xmin_resumed_writer_target_error_runs_finally)
 UT_TEST(test_xmin_resumed_writer_flush_error_runs_finally_after_wal)
 {
 	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
-	local_x = false; resume_allowed = flush_error = expecting_error = true;
+	fixture_release_original_writer(); resume_allowed = flush_error = expecting_error = true;
 	if (setjmp(error_jump) == 0) {
 		(void) qualified_xmin_apply(&f, 0); UT_ASSERT(false);
 	} else {
@@ -2082,7 +2213,7 @@ UT_TEST(test_xmin_resumed_writer_flush_error_runs_finally_after_wal)
 UT_TEST(test_xmin_resume_error_keeps_original_pin_and_admission)
 {
 	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
-	local_x = false; resume_error = expecting_error = true;
+	fixture_release_original_writer(); resume_error = expecting_error = true;
 	if (setjmp(error_jump) == 0) {
 		(void) qualified_xmin_apply(&f, 0); UT_ASSERT(false);
 	} else {
@@ -2099,13 +2230,14 @@ UT_TEST(test_xmin_existing_local_x_never_reacquires_or_releases_it)
 	resume_allowed = true;
 	UT_ASSERT(qualified_xmin_apply(&f, 0));
 	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks, 0);
-	UT_ASSERT(local_x && f.admission.entered); UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(local_x && f.admission.entered);
+	UT_ASSERT(fixture_node_grant_matches()); UT_ASSERT_EQ(backend_pin_count, 1);
 }
 
 UT_TEST(test_xmin_existing_share_lock_is_not_a_resume_scope)
 {
 	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
-	local_x = false; local_share = resume_allowed = true;
+	fixture_release_original_writer(); local_share = resume_allowed = true;
 	UT_ASSERT(!qualified_xmin_apply(&f, 0));
 	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + inserts + dirties + flushes, 0);
 	UT_ASSERT(!local_x && local_share && f.admission.entered);
@@ -2115,7 +2247,10 @@ UT_TEST(test_xmin_existing_share_lock_is_not_a_resume_scope)
 int
 main(void)
 {
-	UT_PLAN(57);
+	UT_PLAN(60);
+	UT_RUN(test_xmin_actual_writer_keeps_original_ko_revision_before_lock);
+	UT_RUN(test_xmin_actual_resumer_inner_error_cleans_before_native_wrapper);
+	UT_RUN(test_xmin_released_writer_requires_actual_original_node_grant);
 	UT_RUN(test_xmin_released_writer_single_and_batch_reach_native_wal);
 	UT_RUN(test_xmin_released_writer_refusal_never_fetches_or_writes);
 	UT_RUN(test_xmin_resumed_writer_plan_refusal_unlocks_without_unpin);

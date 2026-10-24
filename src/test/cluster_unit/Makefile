@@ -1958,12 +1958,6 @@ test_cluster_heap_freeze_apply.inc: $(top_srcdir)/src/backend/access/heap/heapam
 	mv $@.tmp $@
 
 # Original backend-private pin observation, not a model of residency.
-test_cluster_heap_writer_context_match.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
-	@awk '/^ClusterBufferMutationContextMatches\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } emit && /^}/ { emit=0; done++; exit } \
-	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
-	mv $@.tmp $@
-
 test_cluster_heap_borrowed_pin.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	@awk '/^ClusterBufferHasSharedPin\(/ { print "bool"; emit=1; found++ } \
 	     emit { print } emit && /^}/ { emit=0; done++; exit } \
@@ -2002,7 +1996,7 @@ test_cluster_heap_maintenance_identity.inc: $(top_srcdir)/src/backend/access/hea
 	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c test_cluster_heap_writer_context_match.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) test_cluster_heap_maintenance_policy.inc unit_test.h \
+test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c test_cluster_freeze_writer_context.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) test_cluster_heap_maintenance_policy.inc unit_test.h \
 		test_cluster_heap_borrowed_pin.inc $(top_srcdir)/src/include/storage/bufmgr.h \
 		test_cluster_vacuum_freeze_locators.inc \
 		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
@@ -2010,6 +2004,10 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c t
 		$(top_srcdir)/src/include/cluster/cluster_heap_freeze.h \
 		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
 		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_own.h \
+		$(top_srcdir)/src/include/cluster/cluster_ko.h \
+		$(top_srcdir)/src/include/cluster/cluster_ic.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_smgr.h \
 		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
 		$(top_srcdir)/src/include/storage/buf_internals.h \
 		$(top_srcdir)/src/backend/cluster/cluster_heap_freeze.c \
