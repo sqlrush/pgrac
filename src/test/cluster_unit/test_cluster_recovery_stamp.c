@@ -675,6 +675,9 @@ UT_TEST(identity_role_kind_and_payload_refusal)
 	MyBackendType = B_BACKEND;
 	UT_ASSERT(!cluster_recovery_stamp_prepare_v1(&owner, 1, payload, sizeof(payload), &h));
 	MyBackendType = B_BG_WORKER;
+	pg_atomic_write_u64(&region.thread_replay[2].episode_epoch, 41);
+	pg_atomic_write_u32(&region.thread_replay[2].state, CLUSTER_THREADREC_REPLAY_REPLAYING);
+	UT_ASSERT(cluster_recovery_stamp_worker_begin_v1(2, 41));
 	if (!begin(&h))
 		return;
 	MyProcPid++;
@@ -2802,10 +2805,133 @@ UT_TEST(d0_execute_reference_postinsert_panic_preserves_original_duty)
 	reference_raw_output = reference_metadata_output = NULL;
 }
 
+UT_TEST(orphan_c0_d0_preserve_exact_payload_and_checkpoint_debt)
+{
+	for (unsigned d0 = 0; d0 < 2; d0++)
+		for (unsigned phase = CLUSTER_RECOVERY_STAMP_PRE_INSERT;
+			 phase <= CLUSTER_RECOVERY_STAMP_DURABLE; phase++) {
+			ClusterRecoveryStampHandleV1 h;
+			ClusterRecoveryStampCaptureV1 capture;
+			ClusterRecoveryStampSlotV1 *slot;
+			unsigned hashes;
+			fresh();
+			UT_ASSERT(d0 ? begin_d0(&h, TT_SLOT_ABORTED) : begin(&h));
+			slot = &region.thread_replay[2].stamp;
+			if (phase > CLUSTER_RECOVERY_STAMP_PRE_INSERT) {
+				CritSectionCount = 1;
+				UT_ASSERT(cluster_recovery_stamp_inserting_v1(&h));
+				if (phase >= CLUSTER_RECOVERY_STAMP_INSERTED)
+					UT_ASSERT(cluster_recovery_stamp_inserted_v1(&h, 0x2000010, 0x20000c0));
+				CritSectionCount = 0;
+				if (phase == CLUSTER_RECOVERY_STAMP_DURABLE)
+					UT_ASSERT(cluster_recovery_stamp_durable_v1(&h));
+			}
+			slot->executor_attempt_stamp = 41;
+			slot->adopt_from = slot->phase;
+			slot->phase = CLUSTER_RECOVERY_STAMP_ADOPT_PENDING;
+			slot->failed = true;
+			UT_ASSERT(cluster_recovery_stamp_capture_v1(&capture));
+			UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&capture), CLUSTER_RECOVERY_STAMP_PENDING);
+			hashes = hash_calls;
+			UT_ASSERT(!cluster_recovery_stamp_fail_v1(&h));
+			UT_ASSERT(!cluster_recovery_stamp_cancel_v1(&h));
+			UT_ASSERT(!cluster_recovery_stamp_clear_v1(&h));
+			UT_ASSERT(!cluster_recovery_stamp_durable_v1(&h));
+			CritSectionCount = 1;
+			UT_ASSERT(!cluster_recovery_stamp_inserting_v1(&h));
+			UT_ASSERT(!cluster_recovery_stamp_inserted_v1(&h, 0x2000010, 0x20000c0));
+			CritSectionCount = 0;
+			UT_ASSERT_EQ(hash_calls, hashes);
+			UT_ASSERT(memcmp(&slot->handle, &h, sizeof(h)) == 0);
+			UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_ADOPT_PENDING);
+		}
+}
+UT_TEST(worker_attempt_mismatch_cannot_advance_exact_d0)
+{
+	ClusterRecoveryStampHandleV1 h;
+	ClusterRecoveryStampSlotV1 *slot;
+	unsigned hashes;
+	fresh();
+	UT_ASSERT(begin_d0(&h, TT_SLOT_COMMITTED));
+	slot = &region.thread_replay[2].stamp;
+	slot->executor_attempt_stamp = 41;
+	slot->bound_worker_attempt = 42;
+	slot->bound_worker_pid = MyProcPid;
+	hashes = hash_calls;
+	CritSectionCount = 1;
+	UT_ASSERT(!cluster_recovery_stamp_inserting_v1(&h));
+	CritSectionCount = 0;
+	UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_PRE_INSERT);
+	UT_ASSERT_EQ(hash_calls, hashes);
+	UT_ASSERT(memcmp(&slot->handle, &h, sizeof(h)) == 0);
+}
+UT_TEST(worker_prepare_requires_original_bound_replay_attempt)
+{
+	ClusterRecoveryStampHandleV1 h, zero = { 0 };
+	fresh();
+	MyBackendType = B_BG_WORKER;
+	pg_atomic_write_u64(&region.thread_replay[2].episode_epoch, 41);
+	pg_atomic_write_u32(&region.thread_replay[2].state, CLUSTER_THREADREC_REPLAY_REPLAYING);
+	UT_ASSERT(!cluster_recovery_stamp_prepare_v1(&owner, CLUSTER_RECOVERY_STAMP_C0, payload,
+												 sizeof(payload), &h));
+	UT_ASSERT(memcmp(&h, &zero, sizeof(h)) == 0);
+	UT_ASSERT_EQ(region.thread_replay[2].stamp.phase, CLUSTER_RECOVERY_STAMP_EMPTY);
+}
+
+UT_TEST(original_worker_stop_keeps_c0_d0_and_blocks_replacement)
+{
+	for (unsigned d0 = 0; d0 < 2; d0++) {
+		ClusterRecoveryStampHandleV1 h, later;
+		ClusterRecoveryStampCaptureV1 capture;
+		ClusterRecoveryStampSlotV1 *slot;
+		unsigned hashes;
+		fresh();
+		MyBackendType = B_BG_WORKER;
+		pg_atomic_write_u64(&region.thread_replay[2].episode_epoch, 41);
+		pg_atomic_write_u32(&region.thread_replay[2].state, CLUSTER_THREADREC_REPLAY_REPLAYING);
+		hashes = hash_calls;
+		UT_ASSERT(!cluster_recovery_stamp_worker_begin_v1(2, 42));
+		UT_ASSERT(cluster_recovery_stamp_worker_begin_v1(2, 41));
+		UT_ASSERT_EQ(hash_calls, hashes);
+		UT_ASSERT(d0 ? begin_d0(&h, TT_SLOT_COMMITTED) : begin(&h));
+		slot = &region.thread_replay[2].stamp;
+		UT_ASSERT_EQ(slot->executor_attempt_stamp, 41);
+		CritSectionCount = 1;
+		UT_ASSERT(cluster_recovery_stamp_inserting_v1(&h));
+		CritSectionCount = 0;
+		MyBackendType = B_LMON;
+		MyProcPid = 19;
+		hashes = hash_calls;
+		UT_ASSERT(!cluster_recovery_stamp_worker_stopped_v1(2, 42));
+		UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_INSERTING);
+		UT_ASSERT(cluster_recovery_stamp_worker_stopped_v1(2, 41));
+		UT_ASSERT_EQ(slot->phase, CLUSTER_RECOVERY_STAMP_ADOPT_PENDING);
+		UT_ASSERT_EQ(slot->adopt_from, CLUSTER_RECOVERY_STAMP_INSERTING);
+		UT_ASSERT_EQ(slot->bound_worker_attempt, 0);
+		UT_ASSERT_EQ(slot->bound_worker_pid, 0);
+		UT_ASSERT_EQ(hash_calls, hashes);
+		UT_ASSERT(memcmp(&slot->handle, &h, sizeof(h)) == 0);
+		UT_ASSERT(cluster_recovery_stamp_worker_stopped_v1(2, 42));
+		UT_ASSERT(cluster_recovery_stamp_capture_v1(&capture));
+		UT_ASSERT_EQ(cluster_recovery_stamp_poll_v1(&capture), CLUSTER_RECOVERY_STAMP_PENDING);
+		MyBackendType = B_BG_WORKER;
+		owner.executor_pid = ++MyProcPid;
+		pg_atomic_write_u64(&region.thread_replay[2].episode_epoch, 42);
+		UT_ASSERT(!cluster_recovery_stamp_worker_begin_v1(2, 42));
+		UT_ASSERT(!cluster_recovery_stamp_prepare_v1(&owner, CLUSTER_RECOVERY_STAMP_C0, payload,
+													 sizeof(payload), &later));
+		UT_ASSERT(memcmp(&slot->handle, &h, sizeof(h)) == 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(63);
+	UT_PLAN(67);
+	UT_RUN(original_worker_stop_keeps_c0_d0_and_blocks_replacement);
+	UT_RUN(orphan_c0_d0_preserve_exact_payload_and_checkpoint_debt);
+	UT_RUN(worker_attempt_mismatch_cannot_advance_exact_d0);
+	UT_RUN(worker_prepare_requires_original_bound_replay_attempt);
 	UT_RUN(exact_lifecycle_and_owned_payload);
 	UT_RUN(preinsert_cancel_capture_and_new_sequence);
 	UT_RUN(inserting_failure_exit_and_replay_reset_cannot_retire);

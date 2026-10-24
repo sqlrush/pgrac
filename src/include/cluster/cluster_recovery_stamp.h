@@ -24,7 +24,8 @@ typedef enum ClusterRecoveryStampPhaseV1 {
 	CLUSTER_RECOVERY_STAMP_PRE_INSERT,
 	CLUSTER_RECOVERY_STAMP_INSERTING,
 	CLUSTER_RECOVERY_STAMP_INSERTED,
-	CLUSTER_RECOVERY_STAMP_DURABLE
+	CLUSTER_RECOVERY_STAMP_DURABLE,
+	CLUSTER_RECOVERY_STAMP_ADOPT_PENDING
 } ClusterRecoveryStampPhaseV1;
 
 typedef enum ClusterRecoveryStampPollV1 {
@@ -61,6 +62,10 @@ typedef struct ClusterRecoveryStampSlotV1 {
 	slock_t lock;
 	ClusterRecoveryStampHandleV1 handle;
 	ClusterRecoveryStampPhaseV1 phase;
+	ClusterRecoveryStampPhaseV1 adopt_from;
+	uint64 executor_attempt_stamp;
+	uint64 bound_worker_attempt;
+	int32 bound_worker_pid;
 	XLogRecPtr record_start;
 	XLogRecPtr record_end;
 	bool failed;
@@ -72,6 +77,12 @@ typedef struct ClusterRecoveryStampCaptureV1 {
 	uint32 count;
 	ClusterRecoveryStampKeyV1 keys[CLUSTER_RECOVERY_STAMP_SLOTS];
 } ClusterRecoveryStampCaptureV1;
+
+/* Original validated BGW entry binds its scheduler attempt. Only the
+ * original LMON reports exact native-handle BGWH_STOPPED. Unfinished
+ * C0/D0 windows remain pending; this grants no adoption/write authority. */
+extern bool cluster_recovery_stamp_worker_begin_v1(uint16 thread, uint64 attempt);
+extern bool cluster_recovery_stamp_worker_stopped_v1(uint16 thread, uint64 attempt);
 
 /* Call only after original authority, reservation and held-FD preparation.
  * Admits exact C0 or D0 bound to the original writer/target/boot/serial;
