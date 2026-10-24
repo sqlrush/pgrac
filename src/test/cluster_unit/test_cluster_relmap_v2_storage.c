@@ -2244,12 +2244,23 @@ UT_TEST(test_changed_wal_cannot_rebind_staged_pin)
 }
 
 #include "test_cluster_relmap_runtime_storage.inc"
+#include "test_cluster_relmap_recovery_arbitration.inc"
 #include "test_cluster_relmap_owner_conversion.inc"
 
 int
 main(void)
 {
-	UT_PLAN(79);
+	UT_PLAN(89);
+	UT_RUN(test_recovery_arbitration_clears_both_namespaces_from_native_outcome);
+	UT_RUN(test_recovery_arbitration_preserves_pending_original_base_at_publish_cut);
+	UT_RUN(test_recovery_arbitration_requires_original_merger_and_namespace_x);
+	UT_RUN(test_recovery_arbitration_unknown_never_becomes_abort);
+	UT_RUN(test_recovery_arbitration_full_view_or_namespace_drift_refuses);
+	UT_RUN(test_recovery_arbitration_rechecks_claim_and_x_after_terminal_io);
+	UT_RUN(test_recovery_arbitration_foreign_pair_replacement_is_not_cleared);
+	UT_RUN(test_recovery_arbitration_io_unknown_keeps_pin_and_consumes_custody);
+	UT_RUN(test_recovery_arbitration_postwrite_source_drift_cannot_acknowledge);
+	UT_RUN(test_recovery_arbitration_error_consumes_only_local_custody);
 	UT_RUN(test_owner_conversion_real_pair_preserves_building_directory);
 	UT_RUN(test_owner_conversion_real_pending_refusal_preserves_both_copies);
 	UT_RUN(test_owner_conversion_real_mixed_cut_requires_distinct_retry);

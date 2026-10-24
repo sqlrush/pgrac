@@ -10,6 +10,7 @@
 #include "cluster/cluster_recovery_record_hash.h"
 #include "cluster/cluster_relmap_recovery.h"
 #include "cluster/cluster_relmap_owner.h"
+#include "cluster/cluster_relmap_retention.h"
 #include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "miscadmin.h"
@@ -24,7 +25,7 @@ struct ClusterRelmapTerminalScanV1 {
 	pg_cryptohash_ctx *hash;
 	XLogRecPtr last_end;
 	bool checkpoint_seen, terminal_seen, failed, prefix_only, native_base_retained;
-	bool pending_required, pending_seen;
+	bool pending_required, pending_seen, execution_owner;
 	uint64 pending_scope_serial;
 	uint32 native_terminals, expected_native_terminals;
 	ClusterRelmapV2Image pending;
@@ -217,17 +218,65 @@ terminal_scan_visit(XLogReaderState *reader, void *arg)
 }
 
 static bool
+terminal_scan_begin(ClusterRelmapTerminalScanV1 *scan)
+{
+	static const uint8 legacy_domain[] = "PGRAC-RELMAP-RETAINED-TERMINAL-V1";
+	static const uint8 prefix_domain[] = "PGRAC-RELMAP-RETAINED-TERMINAL-PREFIX-V2";
+	static const uint8 execution_domain[] = "PGRAC-RELMAP-EXECUTION-TERMINAL-PREFIX-V1";
+	const uint8 *domain = scan->execution_owner ? execution_domain
+						  : scan->prefix_only	? prefix_domain
+												: legacy_domain;
+	size_t domain_bytes = scan->execution_owner ? sizeof(execution_domain)
+						  : scan->prefix_only	? sizeof(prefix_domain)
+												: sizeof(legacy_domain);
+	const ClusterWalInputV1 *input = &scan->selected;
+	uint8 query[8];
+
+	for (unsigned i = 0; i < sizeof(query); i++)
+		query[i] = (uint8)(scan->observation.requested_top_full_xid >> (8 * i));
+	scan->hash = pg_cryptohash_create(PG_SHA256);
+	return scan->hash != NULL
+		   && (!scan->pending_required
+			   || ((scan->expected_native_terminals = cluster_undo_recovery_cold_terminal_count_v1(
+						&input->source, &input->checkpoint, input->native_redo,
+						scan->pending_scope_serial))
+					   != UINT32_MAX
+				   && scan->expected_native_terminals != 0))
+		   && pg_cryptohash_init(scan->hash) == 0
+		   && pg_cryptohash_update(scan->hash, domain, domain_bytes) == 0
+		   && pg_cryptohash_update(scan->hash, input->native_window, 160) == 0
+		   && pg_cryptohash_update(scan->hash, input->source.claim.identity.storage_uuid, 16) == 0
+		   && pg_cryptohash_update(scan->hash, input->source.claim.claim_sha256, 32) == 0
+		   && pg_cryptohash_update(scan->hash, query, sizeof(query)) == 0;
+}
+
+static bool
+terminal_scan_fold_complete(ClusterRelmapTerminalScanV1 *scan)
+{
+	return scan->checkpoint_seen && scan->terminal_seen
+		   && (!scan->pending_required
+			   || (scan->native_terminals == scan->expected_native_terminals
+				   && cluster_undo_recovery_cold_terminal_count_v1(
+						  &scan->selected.source, &scan->selected.checkpoint,
+						  scan->selected.native_redo, scan->pending_scope_serial)
+						  == scan->expected_native_terminals
+				   && scan->pending_seen && scan->native_base_retained
+				   && scan->pending.pending_owner.wal_end <= scan->observation.terminal_start
+				   && scan->pending.pending_owner.membership_epoch == scan->observation.window.epoch
+				   && scan->pending.pending_owner.boot_incarnation
+						  == scan->observation.window.boot_incarnation
+				   && scan->pending.pending_owner.admitted_incarnation
+						  == scan->observation.window.admitted_incarnation));
+}
+
+static bool
 terminal_scan(ClusterWalInputsV1 *inputs, uint32 index, FullTransactionId requested_top,
 			  bool prefix_only, const ClusterRelmapV2Image *pending, uint64 scope_serial,
 			  ClusterRelmapTerminalScanV1 **out)
 {
-	static const uint8 legacy_domain[] = "PGRAC-RELMAP-RETAINED-TERMINAL-V1";
-	static const uint8 prefix_domain[] = "PGRAC-RELMAP-RETAINED-TERMINAL-PREFIX-V2";
-	const uint8 *domain = prefix_only ? prefix_domain : legacy_domain;
-	size_t domain_bytes = prefix_only ? sizeof(prefix_domain) : sizeof(legacy_domain);
 	const ClusterWalInputV1 *input;
 	ClusterRelmapTerminalScanV1 *scan;
-	uint8 query[8], zero[160] = { 0 };
+	uint8 zero[160] = { 0 };
 	uint64 full = U64FromFullTransactionId(requested_top);
 	uint32 count;
 	bool accepted = false;
@@ -277,44 +326,14 @@ terminal_scan(ClusterWalInputsV1 *inputs, uint32 index, FullTransactionId reques
 	scan->observation.source = input->source;
 	scan->observation.requested_top_full_xid = full;
 	scan->observation.cut = input->checkpoint.validated_tail_lsn_exclusive;
-	for (unsigned i = 0; i < sizeof(query); i++)
-		query[i] = (uint8)(full >> (8 * i));
 	PG_TRY();
 	{
 		ClusterWalTailObservation observed = { 0 };
-		scan->hash = pg_cryptohash_create(PG_SHA256);
-		if (scan->hash != NULL
-			&& (!scan->pending_required
-				|| ((scan->expected_native_terminals = cluster_undo_recovery_cold_terminal_count_v1(
-						 &scan->selected.source, &scan->selected.checkpoint,
-						 scan->selected.native_redo, scan->pending_scope_serial))
-						!= UINT32_MAX
-					&& scan->expected_native_terminals != 0))
-			&& pg_cryptohash_init(scan->hash) == 0
-			&& pg_cryptohash_update(scan->hash, domain, domain_bytes) == 0
-			&& pg_cryptohash_update(scan->hash, input->native_window, 160) == 0
-			&& pg_cryptohash_update(scan->hash, input->source.claim.identity.storage_uuid, 16) == 0
-			&& pg_cryptohash_update(scan->hash, input->source.claim.claim_sha256, 32) == 0
-			&& pg_cryptohash_update(scan->hash, query, sizeof(query)) == 0
+		if (terminal_scan_begin(scan)
 			&& cluster_wal_inputs_visit_retained_v1(inputs, index, terminal_scan_visit, scan,
 													&observed)
 				   == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			&& scan->checkpoint_seen && scan->terminal_seen
-			&& (!scan->pending_required
-				|| (scan->native_terminals == scan->expected_native_terminals
-					&& cluster_undo_recovery_cold_terminal_count_v1(
-						   &scan->selected.source, &scan->selected.checkpoint,
-						   scan->selected.native_redo, scan->pending_scope_serial)
-						   == scan->expected_native_terminals
-					&& scan->pending_seen && scan->native_base_retained
-					&& scan->pending.pending_owner.wal_end <= scan->observation.terminal_start
-					&& scan->pending.pending_owner.membership_epoch
-						   == scan->observation.window.epoch
-					&& scan->pending.pending_owner.boot_incarnation
-						   == scan->observation.window.boot_incarnation
-					&& scan->pending.pending_owner.admitted_incarnation
-						   == scan->observation.window.admitted_incarnation))
-			&& observed.records == scan->observation.records
+			&& terminal_scan_fold_complete(scan) && observed.records == scan->observation.records
 			&& observed.complete_end == scan->observation.cut
 			&& scan->last_end == scan->observation.cut
 			&& pg_cryptohash_final(scan->hash, scan->observation.fingerprint, 32) == 0)
@@ -356,6 +375,10 @@ static bool
 terminal_scan_current(ClusterRelmapTerminalScanV1 *scan)
 {
 	const ClusterWalInputV1 *current;
+	if (scan->execution_owner)
+		return cluster_undo_recovery_cold_single_source_v1(
+			&scan->selected.source, &scan->selected.checkpoint, scan->selected.native_redo,
+			scan->pending_scope_serial);
 	if (cluster_wal_inputs_revalidate_v1(scan->inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		|| cluster_wal_inputs_count_v1(scan->inputs) != scan->count)
 		return false;
@@ -495,6 +518,276 @@ recovery_overlap(const void *a, size_t an, const void *b, size_t bn)
 	return a != NULL && b != NULL && ((x <= y && y - x < an) || (y <= x && x - y < bn));
 }
 
+typedef struct RelmapRetentionCheckpointInput {
+	ClusterWalInputV1 selected;
+	ClusterRelmapCheckpointWindow window;
+	XLogRecPtr last_end;
+	uint64 records;
+	bool checkpoint_seen;
+} RelmapRetentionCheckpointInput;
+
+static bool
+retention_checkpoint_input_valid(const ClusterWalInputV1 *input)
+{
+	return input->kind == CLUSTER_WAL_INPUT_CHECKPOINT
+		   && input->checkpoint.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+		   && cluster_control_root_identity_equal(&input->source.claim.identity,
+												  &input->checkpoint.identity)
+		   && input->source.timeline == input->checkpoint.checkpoint_tli
+		   && input->native_checkpoint.ThisTimeLineID == input->source.timeline
+		   && input->native_checkpoint.redo == input->native_redo
+		   && input->native_redo >= input->checkpoint.checkpoint_lower_lsn
+		   && input->native_redo <= input->checkpoint_start;
+}
+
+static bool
+retention_checkpoint_visit(XLogReaderState *reader, void *arg)
+{
+	RelmapRetentionCheckpointInput *work = arg;
+	const ClusterWalInputV1 *input = &work->selected;
+	const ClusterControlRootIdentity *id = &input->source.claim.identity;
+
+	CHECK_FOR_INTERRUPTS();
+	if (reader == NULL || reader->record == NULL || reader->cluster_record_crc_failed
+		|| reader->cluster_expected_thread_id != id->origin_thread_id
+		|| reader->ReadRecPtr != reader->record->lsn
+		|| reader->EndRecPtr != reader->record->next_lsn
+		|| reader->ReadRecPtr < input->checkpoint.checkpoint_lower_lsn
+		|| reader->ReadRecPtr < work->last_end || reader->EndRecPtr <= reader->ReadRecPtr
+		|| reader->EndRecPtr > input->checkpoint.validated_tail_lsn_exclusive
+		|| work->records == UINT64_MAX)
+		return false;
+	if (reader->ReadRecPtr == input->checkpoint_start) {
+		uint8 info = XLogRecGetInfo(reader);
+		uint64 post_issued, next = U64FromFullTransactionId(input->native_checkpoint.nextXid);
+		uint64 upper;
+		if (work->checkpoint_seen || XLogRecGetRmid(reader) != RM_XLOG_ID
+			|| (info != XLOG_CHECKPOINT_ONLINE && info != XLOG_CHECKPOINT_SHUTDOWN)
+			|| XLogRecGetXid(reader) != InvalidTransactionId || XLogRecMaxBlockId(reader) >= 0
+			|| reader->record->has_page_version_edge
+			|| XLogRecGetOrigin(reader) != InvalidRepOriginId
+			|| TransactionIdIsValid(reader->record->toplevel_xid) || XLogRecGetData(reader) == NULL
+			|| XLogRecGetDataLen(reader) != sizeof(CheckPoint)
+			|| memcmp(XLogRecGetData(reader), &input->native_checkpoint, sizeof(CheckPoint)) != 0
+			|| !cluster_relmap_checkpoint_window_decode_v2(
+				input->native_window, &input->native_checkpoint, reader->ReadRecPtr,
+				reader->EndRecPtr, id, input->source.claim.database_incarnation, &work->window,
+				&post_issued))
+			return false;
+		/* These original references must share one half-space. Neither the
+		 * checkpoint's nextXid nor the post-flush sample replaces last-issued. */
+		upper = Max(next, post_issued);
+		if (!TransactionIdIsNormal((TransactionId)next) || upper < work->window.native_floor
+			|| upper - work->window.native_floor >= UINT64CONST(0x80000000))
+			return false;
+		work->checkpoint_seen = true;
+	}
+	work->records++;
+	work->last_end = reader->EndRecPtr;
+	return true;
+}
+
+bool
+cluster_relmap_recovery_retention_build_start_v1(ClusterWalInputsV1 *inputs, uint16 origin,
+												 ClusterRelmapRetentionDirectory *out)
+{
+	RelmapRetentionCheckpointInput work = { 0 };
+	ClusterRelmapRetentionDirectory directory = { 0 };
+	ClusterWalTailObservation observed = { 0 };
+	const ClusterWalInputV1 *selected = NULL;
+	uint32 index = 0, count;
+	uint64 serial;
+
+	if (out == NULL || origin >= 128 || MyBackendType != B_STARTUP || !RecoveryInProgress()
+		|| CritSectionCount != 0)
+		return false;
+	count = cluster_wal_inputs_count_v1(inputs);
+	if (count == 0 || count > CLUSTER_WAL_INPUTS_MAX)
+		return false;
+	for (uint32 i = 0; i < count; i++) {
+		const ClusterWalInputV1 *input = cluster_wal_inputs_at_v1(inputs, i);
+		if (input == NULL || recovery_overlap(out, sizeof(*out), input, sizeof(*input)))
+			return false;
+		if (input->source.claim.identity.origin_node_id == origin) {
+			if (selected != NULL)
+				return false; /* No partial origin/history directory. */
+			selected = input;
+			index = i;
+		}
+	}
+	if (selected == NULL || !retention_checkpoint_input_valid(selected))
+		return false;
+	/* Old UNKNOWN/BUILDING storage and unoccupied stale pins are not a new
+	 * directory. Do not call the resetting core on caller storage. */
+	for (size_t i = 0; i < sizeof(*out); i++)
+		if (((const unsigned char *)out)[i] != 0)
+			return false;
+	work.selected = *selected;
+	if (cluster_wal_inputs_revalidate_v1(inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| (serial = cluster_undo_recovery_cold_scope_id_v1(
+				&work.selected.source, &work.selected.checkpoint, work.selected.native_redo))
+			   == 0
+		|| cluster_wal_inputs_visit_retained_v1(inputs, index, retention_checkpoint_visit, &work,
+												&observed)
+			   != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| !work.checkpoint_seen || observed.records != work.records
+		|| observed.complete_end != work.selected.checkpoint.validated_tail_lsn_exclusive
+		|| work.last_end != observed.complete_end
+		|| cluster_wal_inputs_revalidate_v1(inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| cluster_undo_recovery_cold_scope_id_v1(&work.selected.source, &work.selected.checkpoint,
+												  work.selected.native_redo)
+			   != serial
+		|| cluster_wal_inputs_revalidate_v1(inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| cluster_wal_inputs_count_v1(inputs) != count
+		|| (selected = cluster_wal_inputs_at_v1(inputs, index)) == NULL
+		|| memcmp(selected, &work.selected, sizeof(*selected)) != 0 || MyBackendType != B_STARTUP
+		|| !RecoveryInProgress() || CritSectionCount != 0
+		|| cluster_relmap_retention_build_start(
+			   &directory, work.window.system_identifier, work.window.database_incarnation,
+			   work.window.origin, serial, work.window.native_floor, work.window.last_issued)
+			   != CLUSTER_RELMAP_RETENTION_OK)
+		return false;
+	/* No local allocation, FD, scope or pin needs cleanup on an earlier ERROR.
+	 * Only the original caller can qualify and eventually publish this build. */
+	*out = directory;
+	return true;
+}
+
+typedef struct RelmapExecutionCheckpointInput {
+	RelmapRetentionCheckpointInput input;
+	uint64 serial;
+	uint16 origin;
+} RelmapExecutionCheckpointInput;
+
+static bool
+retention_execution_input_set(ClusterWalInputV1 *selected,
+							  const ClusterWalRecoveryCheckpointV1 *checkpoint,
+							  const ClusterControlRootSnapshot *root)
+{
+	if (checkpoint == NULL || root == NULL)
+		return false;
+	selected->kind = CLUSTER_WAL_INPUT_CHECKPOINT;
+	selected->source = checkpoint->source;
+	selected->checkpoint = *root;
+	selected->checkpoint_start = checkpoint->checkpoint_start;
+	selected->native_redo = checkpoint->checkpoint.redo;
+	selected->native_checkpoint = checkpoint->checkpoint;
+	memcpy(selected->native_window, checkpoint->native_window, sizeof(selected->native_window));
+	return retention_checkpoint_input_valid(selected);
+}
+
+static bool
+retention_execution_checkpoint_visit(const ClusterWalRecoveryCheckpointV1 *checkpoint,
+									 const ClusterControlRootSnapshot *root, uint64 serial,
+									 XLogReaderState *reader, void *arg)
+{
+	RelmapExecutionCheckpointInput *work = arg;
+	ClusterWalInputV1 *selected = &work->input.selected;
+
+	if (checkpoint == NULL || root == NULL || serial == 0
+		|| checkpoint->source.claim.identity.origin_node_id != work->origin)
+		return false;
+	if (work->input.records == 0) {
+		if (!retention_execution_input_set(selected, checkpoint, root))
+			return false;
+		work->serial = serial;
+	}
+	return work->serial == serial && retention_checkpoint_visit(reader, &work->input);
+}
+
+bool
+cluster_relmap_recovery_retention_build_start_cold_v1(uint16 origin,
+													  ClusterRelmapRetentionDirectory *out)
+{
+	RelmapExecutionCheckpointInput work = { 0 };
+	ClusterRelmapRetentionDirectory directory = { 0 };
+
+	if (out == NULL || origin >= 128 || MyBackendType != B_STARTUP || !RecoveryInProgress()
+		|| CritSectionCount != 0)
+		return false;
+	for (size_t i = 0; i < sizeof(*out); i++)
+		if (((const unsigned char *)out)[i] != 0)
+			return false;
+	work.origin = origin;
+	if (!cluster_undo_recovery_cold_checkpoint_visit_v1(origin,
+														retention_execution_checkpoint_visit, &work)
+		|| !work.input.checkpoint_seen || work.serial == 0
+		|| work.input.last_end != work.input.selected.checkpoint.validated_tail_lsn_exclusive
+		|| MyBackendType != B_STARTUP || !RecoveryInProgress() || CritSectionCount != 0
+		|| cluster_relmap_retention_build_start(
+			   &directory, work.input.window.system_identifier,
+			   work.input.window.database_incarnation, work.input.window.origin, work.serial,
+			   work.input.window.native_floor, work.input.window.last_issued)
+			   != CLUSTER_RELMAP_RETENTION_OK)
+		return false;
+	*out = directory;
+	return true;
+}
+
+static bool
+terminal_execution_visit(const ClusterWalRecoveryCheckpointV1 *checkpoint,
+						 const ClusterControlRootSnapshot *root, uint64 serial,
+						 XLogReaderState *reader, void *arg)
+{
+	ClusterRelmapTerminalScanV1 *scan = arg;
+
+	if (serial == 0)
+		return false;
+	if (scan->observation.records == 0) {
+		if (!retention_execution_input_set(&scan->selected, checkpoint, root)
+			|| scan->selected.native_redo == scan->selected.checkpoint_start
+			|| scan->selected.source.claim.identity.origin_node_id
+				   != scan->pending.pending_owner.node
+			|| scan->selected.source.claim.identity.system_identifier
+				   != scan->pending.identity.system_identifier
+			|| scan->selected.source.claim.database_incarnation
+				   != scan->pending.identity.database_incarnation)
+			return false;
+		scan->pending_scope_serial = serial;
+		scan->observation.source = scan->selected.source;
+		scan->observation.cut = scan->selected.checkpoint.validated_tail_lsn_exclusive;
+		if (!terminal_scan_current(scan) || !terminal_scan_begin(scan))
+			return false;
+	}
+	return scan->pending_scope_serial == serial && terminal_scan_visit(reader, scan);
+}
+
+static bool
+terminal_scan_cold(const ClusterRelmapV2Image *pending, ClusterRelmapTerminalScanV1 **out)
+{
+	ClusterRelmapTerminalScanV1 *scan = palloc0(sizeof(*scan));
+	bool accepted = false;
+
+	scan->pid = getpid();
+	scan->execution_owner = scan->prefix_only = scan->native_base_retained = true;
+	scan->pending_required = true;
+	scan->pending = *pending;
+	scan->observation.requested_top_full_xid = pending->pending_owner.top_full_xid;
+	PG_TRY();
+	{
+		accepted = cluster_undo_recovery_cold_checkpoint_visit_v1(pending->pending_owner.node,
+																  terminal_execution_visit, scan)
+				   && scan->observation.records != 0 && terminal_scan_current(scan)
+				   && terminal_scan_fold_complete(scan) && scan->last_end == scan->observation.cut
+				   && MyBackendType == B_STARTUP && RecoveryInProgress() && CritSectionCount == 0
+				   && pg_cryptohash_final(scan->hash, scan->observation.fingerprint, 32) == 0;
+	}
+	PG_CATCH();
+	{
+		terminal_scan_free(scan);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!accepted) {
+		terminal_scan_free(scan);
+		return false;
+	}
+	pg_cryptohash_free(scan->hash);
+	scan->hash = NULL;
+	*out = scan;
+	return true;
+}
+
 static bool
 recovery_pending_encode(const ClusterRelmapV2Namespace *identity, const ClusterRelmapV2View *view,
 						ClusterRelmapV2Image *image,
@@ -617,6 +910,77 @@ cluster_relmap_recovery_prepare_v1(ClusterWalInputsV1 *inputs,
 		return false;
 	}
 	*out = handle;
+	return true;
+}
+
+bool
+cluster_relmap_recovery_prepare_cold_v1(const ClusterRelmapV2Namespace *identity,
+										const ClusterRelmapV2View *pending,
+										ClusterRelmapRecoveryHandle **out)
+{
+	ClusterRelmapV2Image image;
+	uint8 pending_wire[CLUSTER_RELMAP_V2_FILE_SIZE], committed_wire[CLUSTER_RELMAP_V2_FILE_SIZE];
+	ClusterRelmapRecoveryHandle *handle;
+	bool accepted = false;
+
+	if (out == NULL || recovery_overlap(out, sizeof(*out), identity, sizeof(*identity))
+		|| recovery_overlap(out, sizeof(*out), pending, sizeof(*pending)))
+		return false;
+	*out = NULL;
+	if (MyBackendType != B_STARTUP || !RecoveryInProgress() || CritSectionCount != 0
+		|| !recovery_pending_encode(identity, pending, &image, pending_wire, committed_wire))
+		return false;
+	handle = palloc0(sizeof(*handle));
+	handle->pid = getpid();
+	memcpy(handle->pending_wire, pending_wire, sizeof(pending_wire));
+	memcpy(handle->committed_wire, committed_wire, sizeof(committed_wire));
+	PG_TRY();
+	{
+		if (terminal_scan_cold(&image, &handle->scan)) {
+			handle->scope_serial = handle->scan->pending_scope_serial;
+			accepted = recovery_handle_base_fingerprint(handle, handle->native_base_fingerprint);
+		}
+	}
+	PG_CATCH();
+	{
+		terminal_scan_free(handle->scan);
+		pfree(handle);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!accepted) {
+		terminal_scan_free(handle->scan);
+		pfree(handle);
+		return false;
+	}
+	*out = handle;
+	return true;
+}
+
+bool
+cluster_relmap_recovery_handle_source_v1(ClusterRelmapRecoveryHandle *handle,
+										 ClusterRelmapRecoverySourceObservationV1 *out)
+{
+	ClusterRelmapRecoverySourceObservationV1 result = { 0 };
+
+	if (out == NULL || recovery_overlap(out, sizeof(*out), handle, sizeof(*handle))
+		|| (handle != NULL && handle->scan != NULL
+			&& recovery_overlap(out, sizeof(*out), handle->scan, sizeof(*handle->scan))))
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (handle == NULL || handle->pid != getpid() || handle->failed || handle->scan == NULL)
+		return false;
+	/* Original source/owner checks may ERROR. No native page I/O or status is
+	 * needed to identify this already selected, still borrowed source. */
+	handle->failed = true;
+	if (CritSectionCount != 0 || !recovery_handle_current(handle))
+		return false;
+	result.source = handle->scan->selected.source;
+	result.checkpoint = handle->scan->selected.checkpoint;
+	result.native_redo = handle->scan->selected.native_redo;
+	result.scope_serial = handle->scope_serial;
+	handle->failed = false;
+	*out = result;
 	return true;
 }
 

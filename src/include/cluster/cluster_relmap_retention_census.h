@@ -8,8 +8,10 @@
 #include "cluster/cluster_relmap_pending.h"
 #include "cluster/cluster_relmap_pending_side.h"
 #include "cluster/cluster_relmap_retention_restore.h"
+#include "cluster/cluster_relmap_recovery.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_relmap_authority.h"
 typedef struct ClusterRelmapRetentionCensus ClusterRelmapRetentionCensus;
 
 typedef enum ClusterRelmapCensusResult {
@@ -96,6 +98,132 @@ extern ClusterRelmapPendingResult cluster_relmap_retention_census_rebuild_pendin
 	const ClusterRelmapPendingDescriptor *descriptors, size_t descriptor_count);
 
 struct ClusterWalInputsV1;
+
+/* Caller-owned arbitration input, published only after whole-ROOT DRAINED.
+ * The full view is the original physical pair, not a caller-built image;
+ * handle authenticates it through the original native cold scope. */
+typedef struct ClusterRelmapCensusRecovery {
+	ClusterRelmapV2Namespace identity;
+	ClusterRelmapV2View pending;
+	ClusterRelmapRecoveryHandle *handle;
+} ClusterRelmapCensusRecovery;
+
+/* Dormant DRAINED-only prepare. Select global for InvalidOid, otherwise the
+ * canonical base/dbid namespace in this original ROOT set. Re-read both exact
+ * observed copies and require their pending's already-restored origin pin;
+ * revalidate every original WAL source's system/incarnation/storage UUID;
+ * prepare opaque native custody and recheck borrowed ROOT/origin state before
+ * publishing. This synchronous operation is not a bounded census tick.
+ *
+ * Before DRAINED returns false without consuming the scan. Any actual input
+ * refusal/ERROR invalidates the census and its directories, retaining pins.
+ * Fresh distinct caller output is cleared on refusal; ERROR propagates after
+ * releasing only local custody. Release output.handle on every later exit.
+ * Keep this census, its original ROOT/directories and the native inputs alive
+ * and exclusively owned until that handle is released or consumed. Original
+ * cold-owner isolation/cut qualifications are not established by this join.
+ * No target write, terminal decision, COMPLETE, release or activation follows.
+ * All census maps/sets are still observations; do not adopt them after a later
+ * arbitration mutates the observed authority files. */
+extern bool cluster_relmap_retention_census_recovery_prepare(ClusterRelmapRetentionCensus *census,
+															 struct ClusterWalInputsV1 *inputs,
+															 Oid dbid,
+															 ClusterRelmapCensusRecovery *out);
+
+/* Dormant original execution-owner prepare after pass-1 read pins are gone.
+ * Require DRAINED and the original sole-merger claim/namespace X/shared
+ * catalog. Select the exact original physical pair and restored pending pin;
+ * use only the original cold execution prepare, then match its original
+ * source/sysid/dbinc/storage/serial. After native I/O, freshly recheck the
+ * entire physical ROOT and every original pin before one output publication.
+ * No arbitration, target write, COMPLETE, pin release or activation follows.
+ *
+ * Missing initial ownership/before DRAINED leaves the scan unconsumed. Entered
+ * refusal/ERROR invalidates old ROOT/census/directories and retains all pins;
+ * only local custody is freed. False is not rollback or retry permission.
+ * Output must be fresh exclusive storage, disjoint from all borrowed objects;
+ * known census/directory overlaps or an output spanning the ROOT pointer stay
+ * unchanged. Distinct refusal clears output. Original isolation and complete
+ * origin/native qualification remain caller obligations, never established by
+ * this join. Keep census/ROOT/directories/original execution owner alive until
+ * the returned handle is released or consumed. */
+extern bool
+cluster_relmap_retention_census_recovery_prepare_cold(ClusterRelmapRetentionCensus *census,
+													  Oid dbid, ClusterRelmapCensusRecovery *out);
+
+/* Dormant original-owner consumer: while holding the original sole-merger
+ * claim and namespace X, prepare the selected DRAINED namespace above, then
+ * consume its opaque handle through original v2 arbitration. No supplied
+ * outcome, map or terminal boolean is accepted. Missing locks/master switch
+ * or an unfinished scan returns UNKNOWN without consuming that scan.
+ *
+ * EVERY attempted arbitration invalidates the old census/ROOT/directories,
+ * on success, UNKNOWN and ERROR alike: target bytes may already have changed.
+ * All original pins remain. Re-observe under original recovery ownership;
+ * never adopt old maps/sets or treat false as rollback/automatic retry.
+ * CLEARED_POSTREAD is only this pair's result, not directory COMPLETE,
+ * release, global floor/issued, live activation or whole-cold completion. */
+extern ClusterRelmapV2ClearResult
+cluster_relmap_retention_census_recovery_arbitrate(ClusterRelmapRetentionCensus *census,
+												   struct ClusterWalInputsV1 *inputs, Oid dbid);
+
+/* Dormant original execution-owner single-namespace consumer, after pass-1
+ * read pins are gone. Under original merger/X/shared-catalog ownership, use
+ * prepare_cold and its fresh whole physical ROOT check, then recheck original
+ * source/serial/metadata and every pin before native arbitration. Revoke old
+ * census/ROOT/directory observations BEFORE that first native call; original
+ * native authority/pins survive. Check identical original source/metadata/pins
+ * and ownership after it, without qualifying the now-UNKNOWN directories.
+ *
+ * Missing initial ownership/before DRAINED leaves the scan unconsumed. Every
+ * entered refusal/ERROR invalidates old observations and frees local custody
+ * only. ERROR propagates; prior target writes may already be durable. All pins
+ * remain, with no rollback/retry or scope replacement. CLEARED_POSTREAD means
+ * only this pending pair cleared, never COMPLETE/release, whole-origin/native
+ * qualification, allocator/G_ref/owner completion, D0 discharge or activation.
+ * Fresh physical re-observation into new storage remains the original owner's
+ * responsibility. No old map/set/directory or consumed handle may be reused. */
+extern ClusterRelmapV2ClearResult
+cluster_relmap_retention_census_recovery_arbitrate_cold(ClusterRelmapRetentionCensus *census,
+														Oid dbid);
+
+/* Opaque, local-only preparation of every pending namespace in the original
+ * DRAINED physical census, including backup-only pending. No caller namespace
+ * list is accepted. Hold original merger claim and namespace X across this
+ * synchronous operation and all later uses; keep census/ROOT/directories and
+ * inputs alive and exclusively owned. The budget bounds this batch storage,
+ * not native prepare's separately owned allocations or synchronous I/O.
+ *
+ * Re-read every exact pair, prepare every selected original native handle,
+ * recheck the whole ROOT and all selected pins/sources, then publish once.
+ * Clean namespaces need no handle. Any late refusal/ERROR frees all local
+ * handles, invalidates old observations and retains every pin. Before
+ * DRAINED or without original ownership, leave the scan unconsumed.
+ * A successful (possibly empty) batch is preparation only: no arbitration,
+ * target write, directory COMPLETE, global floor/issued or release follows.
+ * This local container is not complete semantic G_ref/owner completion.
+ * Release cancels only this container/custody; never releases original pins. */
+typedef struct ClusterRelmapCensusRecoveryBatch ClusterRelmapCensusRecoveryBatch;
+extern bool cluster_relmap_retention_census_recovery_prepare_all(
+	ClusterRelmapRetentionCensus *census, struct ClusterWalInputsV1 *inputs, size_t memory_budget,
+	ClusterRelmapCensusRecoveryBatch **out);
+extern void
+cluster_relmap_retention_census_recovery_batch_release(ClusterRelmapCensusRecoveryBatch **batch);
+
+/* Consume the original prepared set once under the same borrowed lifetimes.
+ * Always clear *batch and free all local custody, including refusal/ERROR.
+ * Missing initial shared-catalog/merger/X ownership leaves observations alone.
+ * Otherwise recheck the whole original ROOT, sources and exact pins before
+ * targets. Revoke physical census/ROOT/directory observations BEFORE the first
+ * native arbiter call; native cold authority and all original pins survive.
+ * Check original ownership/source/origin metadata and every saved pin across
+ * each call. Stop on UNKNOWN/ERROR: earlier target writes may be durable and
+ * must not be rolled back or automatically retried. ERROR propagates.
+ * A valid empty batch performs no target write or observation invalidation.
+ * CLEARED_POSTREAD concerns only these pairs, never directory COMPLETE,
+ * global floor/issued, G_ref/owner completion, pin release or activation. */
+extern ClusterRelmapV2ClearResult cluster_relmap_retention_census_recovery_arbitrate_all(
+	ClusterRelmapCensusRecoveryBatch **batch);
 
 /* Same single-use window and provisional structural result. When either copy
  * retains pending, validate that exact union image through the caller's held

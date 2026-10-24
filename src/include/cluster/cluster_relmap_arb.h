@@ -53,4 +53,26 @@
  */
 extern void cluster_relmap_arbitrate_pendings(void);
 
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_relmap_authority.h"
+#include "cluster/cluster_relmap_recovery.h"
+
+/* Dormant single-pending cold consumer. The original sole-merger claim and
+ * namespace X lock must cover the call. Consume *custody on every attempted
+ * arbitration, including ERROR, freeing only its local memory, never the
+ * original borrowed cold inputs/scope/pins. custody is caller-owned and
+ * distinct from identity/pending. No caller-supplied outcome is accepted.
+ *
+ * Only the opaque terminal_read result selects publish versus discard. Use
+ * the pending copy's original committed base even at a partial publish cut;
+ * retain the original double-copy sync/readback and commit invalidation.
+ * CLEARED_POSTREAD supplies no COMPLETE/TT/pin release or live activation.
+ * UNKNOWN may follow durable writes: preserve the original obligation and
+ * fail-closed recovery posture, not rollback or automatic retry. */
+extern ClusterRelmapV2ClearResult
+cluster_relmap_arbitrate_pending_v2(ClusterRelmapRecoveryHandle **custody,
+									const ClusterRelmapV2Namespace *identity,
+									const ClusterRelmapV2View *pending);
+#endif
+
 #endif /* CLUSTER_RELMAP_ARB_H */

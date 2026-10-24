@@ -601,11 +601,17 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
+		test_cluster_relmap_census_recovery.inc \
+		test_cluster_relmap_census_batch.inc \
+		test_cluster_relmap_census_cold.inc \
+		test_cluster_relmap_census_cold_consume.inc \
 		test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c \
 		test_cluster_recovery_crypto_boundary.h unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_pending.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_pending_side.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
@@ -628,6 +634,13 @@ test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
 
 # Keep the original census-only fixture independent of the unused SIDE join.
 test_cluster_relmap_retention_census_product.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_retention_census.c \
+		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_guc.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_merge.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_arb.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_lock.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
@@ -640,6 +653,10 @@ test_cluster_relmap_retention_census_product.o: $(top_srcdir)/src/backend/cluste
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_relmap_census_side: test_cluster_relmap_retention_census.c \
+		test_cluster_relmap_census_recovery.inc \
+		test_cluster_relmap_census_batch.inc \
+		test_cluster_relmap_census_cold.inc \
+		test_cluster_relmap_census_cold_consume.inc \
 		test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c \
 		test_cluster_recovery_crypto_boundary.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
@@ -691,6 +708,10 @@ test_cluster_relmap_v2_storage_product.o: $(top_srcdir)/src/backend/cluster/clus
 
 test_cluster_relmap_v2_storage: test_cluster_relmap_v2_storage.c unit_test.h \
 		test_cluster_relmap_runtime_storage.inc \
+		test_cluster_relmap_recovery_arbitration.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_arb.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_arb.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
 		test_cluster_relmap_owner_conversion.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c \
@@ -3392,6 +3413,7 @@ test_cluster_recovery_c0_apply: test_cluster_recovery_c0_apply.c unit_test.h \
 
 test_cluster_undo_recovery: test_cluster_undo_recovery.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
+		test_cluster_undo_checkpoint_visit.inc \
 		test_cluster_undo_path_native.inc test_cluster_undo_fd_native.inc test_cluster_undo_dir_native.inc \
 		test_cluster_undo_recovery_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_undo_gcs.o \
@@ -3812,6 +3834,7 @@ test_cluster_recovery_native_inputs: test_cluster_recovery_xact_join_inputs.inc 
 
 # The prefix/base composition consumes both public native-owner declarations.
 $(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o: \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
 		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
@@ -3820,6 +3843,8 @@ $(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o: \
 		$(top_srcdir)/src/include/access/clog.h
 
 test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
+		test_cluster_relmap_origin_build.inc \
+		test_cluster_relmap_execution_custody.inc \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_terminal_scan.h \
@@ -3828,6 +3853,8 @@ test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o
 # The collector executes normally; inject only its ERROR boundary in this fixture.
 test_cluster_relmap_retained_census.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_retention_census.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_pending_side.h Makefile

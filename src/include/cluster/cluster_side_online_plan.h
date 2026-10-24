@@ -177,6 +177,12 @@ extern bool rf_side_online_plan_recovery_source_matches_v1(const RfSideOnlinePla
  * final source revalidation remain separate owner obligations. */
 extern bool rf_side_online_plan_recovery_claim_matches_v1(const RfSideOnlinePlanV1 *plan,
 														  const ClusterWalSourceRef *source);
+/* Exact physical recovery claim and only one physical cut/bound source for
+ * this origin. Same-origin retained history refuses; other origins may exist.
+ * Original sealed RECOVERY plan only. Source-set structure, not complete
+ * native era/base/lifetime, ROOT retention, execution or release authority. */
+extern bool rf_side_online_plan_recovery_single_source_v1(const RfSideOnlinePlanV1 *plan,
+														  const ClusterWalSourceRef *source);
 /* Match any original bound recovery claim, including retained-only inputs.
  * This supplies neither physical participation nor cut/base/owner authority. */
 extern bool rf_side_online_plan_recovery_bound_claim_matches_v1(const RfSideOnlinePlanV1 *plan,

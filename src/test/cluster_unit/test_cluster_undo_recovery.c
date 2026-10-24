@@ -703,10 +703,18 @@ UT_TEST(test_cold_terminal_match_uses_only_original_round_and_plan)
 	}
 }
 
+#include "test_cluster_undo_checkpoint_visit.inc"
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(18);
+	UT_RUN(test_cold_single_source_uses_only_original_round_and_plan);
+	UT_RUN(test_checkpoint_visit_uses_original_execution_owner);
+	UT_RUN(test_checkpoint_visit_refuses_missing_original_owner);
+	UT_RUN(test_checkpoint_visit_refuses_changed_metadata_and_sealed_cut);
+	UT_RUN(test_checkpoint_visit_refuses_callback_and_same_address_reentry);
+	UT_RUN(test_checkpoint_visit_error_keeps_original_owner);
 	UT_RUN(test_cold_terminal_match_uses_only_original_round_and_plan);
 	UT_RUN(test_cold_scope_serial_never_revives_same_address);
 	UT_RUN(test_cold_source_match_binds_original_scope_and_full_selected_input);

@@ -12405,11 +12405,12 @@ UT_TEST(test_cold_terminal_frame_refusal_preserves_pi_inspection)
 
 /* Native reader/raw CRC is a leaf boundary in this planner fixture. */
 static RfSideOnlinePlanV1 *
-terminal_witness_plan(ClusterWalSourceRef *source, Size budget)
+terminal_witness_plan_shape(ClusterWalSourceRef *source, Size budget, unsigned shape)
 {
 	RfSideOnlinePlanV1 *plan = NULL;
 	RfContributorStreamCutV1 cut = { 0 };
 	RfSideOnlinePlanRequestV1 request = { 0 };
+	ClusterWalSourceRef sources[2];
 	XLogRecPtr redo = 100;
 
 	memset(source, 0, sizeof(*source));
@@ -12437,10 +12438,58 @@ terminal_witness_plan(ClusterWalSourceRef *source, Size budget)
 	request.participant_count = 1;
 	request.redo_starts = &redo;
 	request.memory_budget = budget;
+	request.purpose = shape == 3 ? RF_SIDE_PLAN_PI_CONTRIBUTIONS : RF_SIDE_PLAN_RECOVERY;
+	if (shape == 3)
+		request.redo_starts = NULL;
 	UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
-	UT_ASSERT(rf_side_online_plan_bind_sources_v1(plan, source, 1));
+	sources[0] = *source;
+	sources[1] = *source;
+	sources[1].claim.identity.origin_owner_incarnation++;
+	sources[1].claim.identity.root_lineage_seq++;
+	sources[1].claim.claim_sha256[31] ^= 1;
+	if (shape == 2) {
+		sources[1].claim.identity.origin_node_id = 1;
+		sources[1].claim.identity.origin_thread_id = 2;
+	}
+	if (shape != 3)
+		UT_ASSERT(rf_side_online_plan_bind_sources_v1(plan, sources, shape == 0 ? 1 : 2));
 	return plan;
+}
+
+static RfSideOnlinePlanV1 *
+terminal_witness_plan(ClusterWalSourceRef *source, Size budget)
+{
+	return terminal_witness_plan_shape(source, budget, 0);
+}
+
+UT_TEST(test_recovery_single_source_uses_complete_original_bound_origin)
+{
+	for (unsigned shape = 0; shape < 4; shape++) {
+		ClusterWalSourceRef source, other;
+		RfSideOnlinePlanV1 *plan = terminal_witness_plan_shape(&source, 0, shape);
+		FakeXactRecord fake;
+		RfPageOnlineRecordIdentityV1 identity;
+		RfDetachedRecordPlanV1 record;
+		UT_ASSERT(!rf_side_online_plan_recovery_single_source_v1(plan, &source));
+		cold_terminal_frame(&fake, false, false, -1);
+		fake.reader.cluster_expected_thread_id = 3;
+		fake.reader.seg.ws_tli = 7;
+		identity = make_identity(&fake, source.claim.identity.storage_uuid);
+		set_identity_range(&fake, &identity, 100, 512);
+		record = make_record_plan(&fake);
+		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &record, &identity),
+					 RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(rf_side_online_plan_recovery_single_source_v1(plan, &source),
+					 shape == 0 || shape == 2);
+		other = source;
+		other.claim.claim_sha256[31] ^= 1;
+		UT_ASSERT(!rf_side_online_plan_recovery_single_source_v1(plan, &other));
+		UT_ASSERT(!rf_side_online_plan_recovery_single_source_v1(plan, NULL));
+		UT_ASSERT(!rf_side_online_plan_recovery_single_source_v1(NULL, &source));
+		rf_side_online_plan_destroy_v1(&plan);
+	}
 }
 
 UT_TEST(test_native_terminal_witness_owns_exact_original_header_and_payload)
@@ -12613,7 +12662,8 @@ UT_TEST(test_native_terminal_witness_rejects_unbound_plan)
 int
 main(void)
 {
-	UT_PLAN(188);
+	UT_PLAN(189);
+	UT_RUN(test_recovery_single_source_uses_complete_original_bound_origin);
 	UT_RUN(test_native_terminal_witness_uses_original_bound_plan_budget);
 	UT_RUN(test_native_terminal_witness_rejects_duplicate_physical_raw_terminal);
 	UT_RUN(test_native_terminal_witness_owns_exact_original_header_and_payload);

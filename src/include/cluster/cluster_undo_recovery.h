@@ -10,6 +10,7 @@
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_thread_recovery_authority.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/cluster_wal_tail.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 
 typedef struct ClusterUndoRecoveryScopeV1 {
@@ -64,6 +65,26 @@ cluster_undo_recovery_cold_source_matches_v1(const ClusterWalSourceRef *source,
 extern uint64 cluster_undo_recovery_cold_scope_id_v1(const ClusterWalSourceRef *source,
 													 const ClusterControlRootSnapshot *checkpoint,
 													 XLogRecPtr native_redo);
+/* Same original cold source/ROOT/nonreused serial plus its own immutable
+ * plan's single-physical/bound-source origin check. No caller plan or new
+ * scope, retention, era/base or completion permission is accepted/created. */
+extern bool
+cluster_undo_recovery_cold_single_source_v1(const ClusterWalSourceRef *source,
+											const ClusterControlRootSnapshot *checkpoint,
+											XLogRecPtr native_redo, uint64 scope_serial);
+/* Provisional, read-only original execution-owner input. No census read pin
+ * or replacement scope is acquired. The callback must neither publish shared
+ * state nor mutate/retire its borrowed owner or inputs; all observations are
+ * invalid unless the complete visit returns true. The same original cold
+ * scope/serial, full ROOT/source and checkpoint/window are checked after I/O.
+ * False/ERROR leaves original ownership and retention obligations to caller.
+ * This supplies checkpoint/WAL input, never terminal/base/era/completion or
+ * release authority. Captured metadata is valid only during each callback. */
+typedef bool (*ClusterUndoRecoveryCheckpointVisitorV1)(
+	const ClusterWalRecoveryCheckpointV1 *checkpoint, const ClusterControlRootSnapshot *root,
+	uint64 scope_serial, struct XLogReaderState *reader, void *arg);
+extern bool cluster_undo_recovery_cold_checkpoint_visit_v1(
+	int origin_node, ClusterUndoRecoveryCheckpointVisitorV1 visitor, void *arg);
 /* Match an actual completed native COMMIT/ABORT carrier to this original
  * cold scope's own immutable recovery plan, never a caller-supplied plan or
  * terminal boolean. Requires the captured round serial and exact source.

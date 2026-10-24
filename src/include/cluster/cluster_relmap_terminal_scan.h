@@ -9,6 +9,34 @@
 #include "cluster/cluster_relmap_checkpoint.h"
 #include "cluster/cluster_wal_inputs.h"
 typedef struct ClusterRelmapTerminalScanV1 ClusterRelmapTerminalScanV1;
+struct ClusterRelmapRetentionDirectory;
+/* Dormant Startup-only checkpoint input to a NEW, entirely zeroed and
+ * exclusively owned directory. Select one physical checkpoint for origin;
+ * require the original cold scope and its unchanged serial, then validate
+ * the complete selected retained source and exact native checkpoint/window.
+ * Derive BUILDING generation/floor/actual-last-issued from those originals;
+ * no caller supplies these values. Output is published once, after source,
+ * whole ROOT/pin and original-round rechecks. False/ERROR leaves it unchanged.
+ * Nonzero/overlapping storage is refused, never reset or reused.
+ *
+ * These are checkpoint observations, not a bound on later suffix issuance,
+ * qualified native base/lifetime/era, full semantic fold or complete origins.
+ * Original cold scope/inputs/ResourceOwner must remain held through later
+ * census use. Physical census/pending restore and final owner qualification
+ * remain required. No target/native write, COMPLETE, pin release, allocator
+ * admission, new scope or activation; do not hold a retention lock over I/O. */
+extern bool
+cluster_relmap_recovery_retention_build_start_v1(ClusterWalInputsV1 *inputs, uint16 origin,
+												 struct ClusterRelmapRetentionDirectory *out);
+/* Same provisional checkpoint BUILDING projection under the original cold
+ * execution owner, after its census read scope has been released. Uses only
+ * that owner's exact ROOT/source/serial and complete retained WAL visit; no
+ * read pin or replacement scope is acquired. out must be NEW, entirely zero
+ * exclusive storage. False/ERROR leaves it unchanged. All qualification and
+ * lifetime limits above still apply; original owner/pins remain caller-owned. */
+extern bool
+cluster_relmap_recovery_retention_build_start_cold_v1(uint16 origin,
+													  struct ClusterRelmapRetentionDirectory *out);
 typedef struct ClusterRelmapTerminalObservationV1 {
 	ClusterWalSourceRef source;
 	ClusterRelmapCheckpointWindow window;

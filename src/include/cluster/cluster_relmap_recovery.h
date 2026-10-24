@@ -9,6 +9,7 @@
 #include "access/clog.h"
 #include "common/cluster_relmap_v2.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_wal_source.h"
 struct ClusterRelmapOwnerSampleV2;
 
 /* Original-round recovery custody; no caller-supplied terminal authority. */
@@ -28,6 +29,35 @@ extern bool cluster_relmap_recovery_prepare_v1(struct ClusterWalInputsV1 *inputs
 											   const ClusterRelmapV2Namespace *identity,
 											   const ClusterRelmapV2View *pending,
 											   ClusterRelmapRecoveryHandle **out);
+/* Dormant Startup-only execution-owner variant, after pass-1 census read
+ * pins have been released. Select the full pending's origin in the original
+ * executable cold scope; require its own sealed plan to have one physical
+ * and one bound source for that origin. Read the entire original source and
+ * reuse exact pending/native terminal/window/lifetime and durable page checks.
+ * No read pin or replacement scope is acquired. Original owner/pins must
+ * outlive the handle; existing matches/terminal_read/release apply. The same
+ * refusal/alias/ERROR contracts and qualification limits above remain.
+ * No target write, COMPLETE, pin release, allocator or activation follows. */
+extern bool cluster_relmap_recovery_prepare_cold_v1(const ClusterRelmapV2Namespace *identity,
+													const ClusterRelmapV2View *pending,
+													ClusterRelmapRecoveryHandle **out);
+
+/* Provisional identity observation only, never a terminal/release capability.
+ * The original process, handle, scope and pins must still be alive/current.
+ * No native page is reread and no base/lifetime qualification is inferred. */
+typedef struct ClusterRelmapRecoverySourceObservationV1 {
+	ClusterWalSourceRef source;
+	ClusterControlRootSnapshot checkpoint;
+	XLogRecPtr native_redo;
+	uint64 scope_serial;
+} ClusterRelmapRecoverySourceObservationV1;
+
+/* Copy the original selected source/full ROOT/redo/serial after its own current
+ * checks. Publish last; distinct refusal clears output, handle/scan overlap
+ * stays unchanged. Once entered, false/ERROR invalidates local custody only.
+ * Original owner/pins are never retired; ERROR propagates unchanged. */
+extern bool cluster_relmap_recovery_handle_source_v1(ClusterRelmapRecoveryHandle *handle,
+													 ClusterRelmapRecoverySourceObservationV1 *out);
 /* Exact full namespace/view, original-round current checks and an unchanged
  * internally reread native base fingerprint. Page drift (even another slot)
  * conservatively refuses this snapshot; false is not rollback/retry permission.
