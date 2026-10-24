@@ -20,7 +20,10 @@
 #include <unistd.h>
 static int fixture_unlink(const char *path);
 #define unlink fixture_unlink
-#include "../../backend/access/transam/clog.c"
+#ifndef CLUSTER_CLOG_SOURCE
+#define CLUSTER_CLOG_SOURCE "../../backend/access/transam/clog.c"
+#endif
+#include CLUSTER_CLOG_SOURCE
 #include "../../backend/access/transam/slru.c"
 
 #undef unlink
@@ -30,6 +33,7 @@ static int fixture_unlink(const char *path);
 #include "unit_test.h"
 UT_DEFINE_GLOBALS();
 
+bool enableFsync = true;
 bool cluster_shared_config = true;
 int cluster_node_id = 0;
 char *cluster_shared_data_dir;
@@ -47,6 +51,10 @@ CheckpointStatsData CheckpointStats;
 static uint32 wait_event;
 uint32 *my_wait_event_info = &wait_event;
 static char fixture_root[MAXPGPATH];
+static bool native_fixture, native_corrupt, native_short;
+static unsigned native_wal_flushes, native_sync_requests;
+static LWLockPadded native_locks[NUM_INDIVIDUAL_LWLOCKS];
+LWLockPadded *MainLWLockArray = native_locks;
 static bool authority = true, revoke_on_lock, expect_error, fail_open, fail_sync, fail_dirsync;
 static bool c0_authority;
 static bool revoke_after_read, revoke_after_sync;
@@ -82,8 +90,11 @@ errstart(int level, const char *domain pg_attribute_unused())
 {
 	if (level < ERROR)
 		return false;
-	if (expect_error && PG_exception_stack != NULL)
+	if (expect_error && PG_exception_stack != NULL) {
+		if (native_fixture)
+			InterruptHoldoffCount = 0;
 		siglongjmp(*PG_exception_stack, 1);
+	}
 	abort();
 }
 bool
@@ -197,6 +208,8 @@ LWLockAcquire(LWLock *lock, LWLockMode mode pg_attribute_unused())
 	unsigned i = fixture_lock_index(lock);
 	UT_ASSERT(!fixture_locks[i].held);
 	fixture_locks[i].held = true;
+	if (native_fixture)
+		HOLD_INTERRUPTS();
 	if (revoke_on_lock && lock == &ClogRecoveryLocks[3].lock)
 		authority = c0_authority = false;
 	return true;
@@ -207,6 +220,8 @@ LWLockRelease(LWLock *lock)
 	unsigned i = fixture_lock_index(lock);
 	UT_ASSERT(fixture_locks[i].held);
 	fixture_locks[i].held = false;
+	if (native_fixture)
+		RESUME_INTERRUPTS();
 }
 bool
 LWLockHeldByMe(LWLock *lock)
@@ -272,13 +287,18 @@ pgstat_count_slru_truncate(int i pg_attribute_unused())
 void
 XLogFlush(XLogRecPtr lsn pg_attribute_unused())
 {
-	abort();
+	if (!native_fixture)
+		abort();
+	++native_wal_flushes;
 }
 bool
 RegisterSyncRequest(const FileTag *tag pg_attribute_unused(),
 					SyncRequestType type pg_attribute_unused(), bool retry pg_attribute_unused())
 {
-	abort();
+	if (!native_fixture)
+		abort();
+	++native_sync_requests;
+	return true;
 }
 
 int
@@ -302,7 +322,9 @@ OpenTransientFile(const char *path, int flags)
 int
 CloseTransientFile(int fd)
 {
-	bool fail = fail_sync_close && fd == synced_fd;
+	struct stat close_st;
+	bool fail = fail_sync_close && fd == synced_fd
+				&& (!native_fixture || (fstat(fd, &close_st) == 0 && S_ISREG(close_st.st_mode)));
 	int rc;
 	if (fd == synced_fd)
 		synced_fd = -1;
@@ -319,6 +341,9 @@ int
 pg_fsync(int fd)
 {
 	struct stat st;
+	int result;
+	if (!enableFsync)
+		return 0;
 	UT_ASSERT_EQ(fstat(fd, &st), 0);
 	synced_fd = fd;
 	if (S_ISDIR(st.st_mode)) {
@@ -347,7 +372,16 @@ pg_fsync(int fd)
 	}
 	if (revoke_after_sync)
 		authority = c0_authority = false;
-	return fsync(fd);
+	result = fsync(fd);
+	if (native_fixture && result == 0) {
+		if (native_short)
+			UT_ASSERT_EQ(ftruncate(fd, BLCKSZ - 1), 0);
+		if (native_corrupt) {
+			uint8 byte = 0;
+			UT_ASSERT_EQ(pwrite(fd, &byte, 1, TransactionIdToByte(100)), 1);
+		}
+	}
+	return result;
 }
 void
 fsync_fname(const char *path, bool isdir)
@@ -1103,10 +1137,177 @@ fixture_cleanup(void)
 		free(allocations[i]);
 }
 
+static void
+native_input(XidStatus status)
+{
+	int slot, fd;
+	PGAlignedBlock stale = { 0 };
+	fd = open("pg_xact/0000", O_RDWR | O_CREAT | O_TRUNC, 0600);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(pwrite(fd, stale.data, BLCKSZ, 0), BLCKSZ);
+	UT_ASSERT_EQ(close(fd), 0);
+	fail_open = fail_sync = fail_read = fail_dirsync = fail_sync_close = false;
+	directory_open_error = directory_sync_error = 0;
+	native_short = native_corrupt = false;
+	expect_error = false;
+	synced_fd = -1;
+	LWLockAcquire(XactSLRULock, LW_EXCLUSIVE);
+	slot = SimpleLruZeroPage(XactCtl, 0);
+	XactCtl->shared->page_buffer[slot][TransactionIdToByte(100)]
+		= status << (TransactionIdToBIndex(100) * CLOG_BITS_PER_XACT);
+	XactCtl->shared->group_lsn[GetLSNIndex(slot, 100)] = 1234;
+	LWLockRelease(XactSLRULock);
+}
+static void
+native_terminal_writes_original_clog_and_directly_syncs(void)
+{
+	for (unsigned aborted = 0; aborted < 2; ++aborted) {
+		ClusterClogNativeTerminalV1 out;
+		XidStatus status = aborted ? TRANSACTION_STATUS_ABORTED : TRANSACTION_STATUS_COMMITTED;
+		XidStatus foreign_before = fixture_status(100);
+		unsigned before_wal = native_wal_flushes, before_requests = native_sync_requests;
+		unsigned before_sync = syncs, before_dirsync = dirsyncs;
+		uint8 byte = 0;
+		int fd;
+		native_input(status);
+		LWLockAcquire(XactTruncationLock, LW_SHARED);
+		UT_ASSERT(cluster_clog_native_terminal_sync_v1(100, &out));
+		UT_ASSERT(LWLockHeldByMe(XactTruncationLock));
+		UT_ASSERT(!LWLockHeldByMe(XactSLRULock));
+		LWLockRelease(XactTruncationLock);
+		UT_ASSERT_EQ(out.status, status);
+		UT_ASSERT_EQ(out.status_lsn, 1234);
+		UT_ASSERT_EQ(native_wal_flushes, before_wal + 1);
+		UT_ASSERT_EQ(native_sync_requests, before_requests + 1);
+		UT_ASSERT(syncs > before_sync && dirsyncs > before_dirsync);
+		fd = open("pg_xact/0000", O_RDONLY);
+		UT_ASSERT(fd >= 0);
+		UT_ASSERT_EQ(pread(fd, &byte, 1, TransactionIdToByte(100)), 1);
+		UT_ASSERT_EQ(close(fd), 0);
+		UT_ASSERT_EQ((byte >> (TransactionIdToBIndex(100) * CLOG_BITS_PER_XACT))
+						 & CLOG_XACT_BITMASK,
+					 status);
+		UT_ASSERT_EQ(fixture_status(100), foreign_before);
+		UT_ASSERT_EQ(transient_fds, 0);
+		UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+	}
+}
+static void
+native_terminal_requires_floor_and_rejects_nonterminal_before_write(void)
+{
+	ClusterClogNativeTerminalV1 out, zero = { 0 };
+	unsigned before;
+	native_input(TRANSACTION_STATUS_COMMITTED);
+	before = native_sync_requests;
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT(!cluster_clog_native_terminal_sync_v1(100, &out));
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	LWLockAcquire(XactTruncationLock, LW_SHARED);
+	for (unsigned cut = 0; cut < 3; ++cut) {
+		if (cut == 0)
+			LWLockAcquire(XidGenLock, LW_SHARED);
+		if (cut == 1)
+			LWLockAcquire(XactSLRULock, LW_EXCLUSIVE);
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT(!cluster_clog_native_terminal_sync_v1(cut == 2 ? 2 : 100, &out));
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		if (cut == 0)
+			LWLockRelease(XidGenLock);
+		if (cut == 1)
+			LWLockRelease(XactSLRULock);
+	}
+	LWLockRelease(XactTruncationLock);
+	for (unsigned sub = 0; sub < 2; ++sub) {
+		native_input(sub ? TRANSACTION_STATUS_SUB_COMMITTED : TRANSACTION_STATUS_IN_PROGRESS);
+		LWLockAcquire(XactTruncationLock, LW_SHARED);
+		UT_ASSERT(!cluster_clog_native_terminal_sync_v1(100, &out));
+		LWLockRelease(XactTruncationLock);
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	}
+	/* Match the native fd.c fast success when fsync is administratively off. */
+	native_input(TRANSACTION_STATUS_COMMITTED);
+	enableFsync = false;
+	LWLockAcquire(XactTruncationLock, LW_SHARED);
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT(!cluster_clog_native_terminal_sync_v1(100, &out));
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	LWLockRelease(XactTruncationLock);
+	enableFsync = true;
+	UT_ASSERT_EQ(native_sync_requests, before);
+	/* A symlinked native directory must refuse before even the native write. */
+	native_input(TRANSACTION_STATUS_COMMITTED);
+	UT_ASSERT_EQ(rename("pg_xact", "pg_xact.native"), 0);
+	UT_ASSERT_EQ(symlink("pg_xact.native", "pg_xact"), 0);
+	LWLockAcquire(XactTruncationLock, LW_SHARED);
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT(!cluster_clog_native_terminal_sync_v1(100, &out));
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	LWLockRelease(XactTruncationLock);
+	UT_ASSERT_EQ(unlink("pg_xact"), 0);
+	UT_ASSERT_EQ(rename("pg_xact.native", "pg_xact"), 0);
+	UT_ASSERT_EQ(native_sync_requests, before);
+	UT_ASSERT_EQ(transient_fds, 0);
+}
+static void
+native_terminal_sync_readback_and_close_refuse_atomically(void)
+{
+	for (unsigned cut = 0; cut < 5; ++cut) {
+		ClusterClogNativeTerminalV1 out, zero = { 0 };
+		native_input(TRANSACTION_STATUS_COMMITTED);
+		if (cut == 0)
+			fail_sync = true;
+		if (cut == 1)
+			directory_sync_error = EINVAL;
+		if (cut == 2)
+			fail_sync_close = true;
+		if (cut == 3)
+			native_short = true;
+		if (cut == 4)
+			native_corrupt = true;
+		LWLockAcquire(XactTruncationLock, LW_SHARED);
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT(!cluster_clog_native_terminal_sync_v1(100, &out));
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		UT_ASSERT(!LWLockHeldByMe(XactSLRULock));
+		LWLockRelease(XactTruncationLock);
+		UT_ASSERT_EQ(transient_fds, 0);
+		UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+	}
+}
+static void
+native_terminal_original_slru_error_rethrows_and_cleans_owned_lock(void)
+{
+	ClusterClogNativeTerminalV1 out, zero = { 0 };
+	volatile bool caught = false;
+	native_input(TRANSACTION_STATUS_ABORTED);
+	fail_open = expect_error = true;
+	memset(&out, 0xa5, sizeof(out));
+	LWLockAcquire(XactTruncationLock, LW_SHARED);
+	PG_TRY();
+	{
+		(void)cluster_clog_native_terminal_sync_v1(100, &out);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+		HOLD_INTERRUPTS();
+		LWLockRelease(XactTruncationLock);
+	}
+	PG_END_TRY();
+	if (!caught)
+		LWLockRelease(XactTruncationLock);
+	UT_ASSERT(caught);
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	UT_ASSERT(!LWLockHeldByMe(XactSLRULock));
+	UT_ASSERT_EQ(transient_fds, 0);
+	UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+	fail_open = expect_error = false;
+}
 int
 main(void)
 {
 	char path[MAXPGPATH];
+	int original_cwd;
 	const char *dirs[] = { "native_side", "native_side/origin_1", "native_side/origin_1/pg_xact" };
 	strlcpy(fixture_root, "/tmp/pgrac-clog-recovery.XXXXXX", sizeof(fixture_root));
 	if (!mkdtemp(fixture_root))
@@ -1118,7 +1319,7 @@ main(void)
 			return 2;
 	}
 	clog_recovery_shmem_init();
-	UT_PLAN(21);
+	UT_PLAN(25);
 	UT_RUN(separate_original_origin_controls);
 	UT_RUN(commit_and_abort_persist_full_tree_without_local_pollution);
 	UT_RUN(conflicting_late_child_refuses_before_any_tree_write);
@@ -1140,6 +1341,25 @@ main(void)
 	UT_RUN(c0_exact_native_abort_does_not_authorize_an_origin);
 	UT_RUN(c0_native_abort_retains_conflict_and_durability_refusal);
 	UT_RUN(c0_native_abort_revocation_and_error_keep_original_cleanup);
+	native_fixture = true;
+	original_cwd = open(".", O_RDONLY | O_DIRECTORY);
+	UT_ASSERT(original_cwd >= 0 && chdir(fixture_root) == 0);
+	UT_ASSERT_EQ(mkdir("pg_xact", 0700), 0);
+	LWLockInitialize(XactSLRULock, LWTRANCHE_XACT_BUFFER);
+	LWLockInitialize(XactTruncationLock, LWTRANCHE_XACT_BUFFER);
+	LWLockInitialize(XidGenLock, LWTRANCHE_XACT_BUFFER);
+	XactCtl->PagePrecedes = CLOGPagePrecedes;
+	SimpleLruInit(XactCtl, "Original native CLOG test", 2, CLOG_LSNS_PER_PAGE, XactSLRULock,
+				  "pg_xact", LWTRANCHE_XACT_BUFFER, SYNC_HANDLER_CLOG);
+	UT_RUN(native_terminal_writes_original_clog_and_directly_syncs);
+	UT_RUN(native_terminal_requires_floor_and_rejects_nonterminal_before_write);
+	UT_RUN(native_terminal_sync_readback_and_close_refuse_atomically);
+	UT_RUN(native_terminal_original_slru_error_rethrows_and_cleans_owned_lock);
+	UT_ASSERT_EQ(unlink("pg_xact/0000"), 0);
+	UT_ASSERT_EQ(rmdir("pg_xact"), 0);
+	UT_ASSERT_EQ(fchdir(original_cwd), 0);
+	UT_ASSERT_EQ(close(original_cwd), 0);
+	native_fixture = false;
 	fixture_cleanup();
 	UT_DONE();
 	return ut_failed_count != 0;

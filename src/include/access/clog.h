@@ -43,6 +43,20 @@ extern XidStatus TransactionIdGetStatus(TransactionId xid, XLogRecPtr *lsn);
 extern void ClusterClogAdoptNativeStatus(TransactionId xid, XidStatus status);
 
 #ifdef USE_PGRAC_CLUSTER
+/* Original local XactCtl only, never native_side projection. Caller holds
+ * XactTruncationLock across qualified FullXid floor check and this I/O; no
+ * XidGenLock/SLRU lock may already be held. Native status is derived here.
+ * The group LSN is a hint, not an exact terminal WAL record. A complete
+ * original page must exist and fsync must be enabled. False may already
+ * have written/synced bytes;
+ * it does not promise rollback or a safe automatic retry. */
+typedef struct ClusterClogNativeTerminalV1 {
+	XidStatus status;
+	XLogRecPtr status_lsn;
+} ClusterClogNativeTerminalV1;
+extern bool cluster_clog_native_terminal_sync_v1(TransactionId xid,
+												 ClusterClogNativeTerminalV1 *out);
+
 /* Original-origin storage only. The recovery owner must first prove the
  * complete terminal record, original source/base/era and mutation authority.
  * These calls neither resolve an unknown transaction nor publish visibility.

@@ -18,7 +18,8 @@ static unsigned depth, checks, change_check, caller_locks;
 static ClusterRelmapOwnerSampleV2 original;
 static XidStatus native_status;
 static XLogRecPtr native_lsn;
-static unsigned status_reads, interrupt_errors;
+static unsigned status_reads, interrupt_errors, native_sync_calls;
+static bool native_sync_fail;
 volatile uint32 InterruptHoldoffCount;
 static bool status_error, invalidate_on_read;
 sigjmp_buf *PG_exception_stack;
@@ -89,6 +90,18 @@ LWLockRelease(LWLock *lock)
 	else
 		RESUME_INTERRUPTS();
 }
+bool
+cluster_clog_native_terminal_sync_v1(TransactionId xid, ClusterClogNativeTerminalV1 *out)
+{
+	if (depth != 1 || xid != expected_status_xid)
+		abort();
+	++native_sync_calls;
+	if (native_sync_fail)
+		return false;
+	out->status = TransactionIdGetStatus(xid, &out->status_lsn);
+	return out->status == TRANSACTION_STATUS_COMMITTED || out->status == TRANSACTION_STATUS_ABORTED;
+}
+
 #ifndef CLUSTER_RELMAP_RECOVERY_SOURCE
 #define CLUSTER_RELMAP_RECOVERY_SOURCE "../../backend/cluster/cluster_relmap_recovery.c"
 #endif
@@ -102,7 +115,8 @@ setup(void)
 	owner_current = true;
 	native_status = TRANSACTION_STATUS_COMMITTED;
 	native_lsn = 0;
-	status_reads = interrupt_errors = 0;
+	status_reads = interrupt_errors = native_sync_calls = 0;
+	native_sync_fail = false;
 	InterruptHoldoffCount = 0;
 	status_error = invalidate_on_read = false;
 	expected_status_xid = 100;
@@ -387,10 +401,59 @@ native_terminal_error_keeps_output_empty_and_rethrows(void)
 	UT_ASSERT_EQ(interrupt_errors, 0);
 	UT_ASSERT_EQ(InterruptHoldoffCount, 0);
 }
+static void
+native_sync_uses_original_window_and_publishes_only_success(void)
+{
+	for (unsigned cut = 0; cut < 4; ++cut) {
+		ClusterRelmapRecoveryNativeTerminal out, zero = { 0 };
+		setup();
+		publish(UINT64CONST(0x200000068));
+		if (cut == 1)
+			native_sync_fail = true;
+		if (cut == 2)
+			change_check = 2;
+		if (cut == 3)
+			variables.oldestClogXid = 101;
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT_EQ(cluster_relmap_recovery_native_terminal_sync(&original, &out), cut == 0);
+		if (cut == 0) {
+			UT_ASSERT_EQ(out.top_full_xid, original.owner.top_full_xid);
+			UT_ASSERT_EQ(out.status, TRANSACTION_STATUS_COMMITTED);
+			UT_ASSERT_EQ(out.bounds.last_issued, UINT64CONST(0x200000068));
+		} else
+			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		UT_ASSERT_EQ(native_sync_calls, cut == 3 ? 0 : 1);
+		UT_ASSERT_EQ(depth, 0);
+	}
+}
+static void
+native_sync_error_rethrows_without_output_or_lock_debt(void)
+{
+	ClusterRelmapRecoveryNativeTerminal out, zero = { 0 };
+	volatile bool caught = false;
+	setup();
+	publish(UINT64CONST(0x200000068));
+	status_error = true;
+	memset(&out, 0xa5, sizeof(out));
+	PG_TRY();
+	{
+		(void)cluster_relmap_recovery_native_terminal_sync(&original, &out);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	UT_ASSERT_EQ(depth, 0);
+	UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+	UT_ASSERT_EQ(interrupt_errors, 0);
+}
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(13);
 	UT_RUN(capture_actual_published_window);
 	UT_RUN(rejects_unknown_rewind_and_ambiguous_era);
 	UT_RUN(invalidation_stays_unknown);
@@ -402,6 +465,8 @@ main(void)
 	UT_RUN(native_terminal_rechecks_owner_before_publishing);
 	UT_RUN(native_terminal_preserves_alias_and_caller_locks);
 	UT_RUN(native_terminal_error_keeps_output_empty_and_rethrows);
+	UT_RUN(native_sync_uses_original_window_and_publishes_only_success);
+	UT_RUN(native_sync_error_rethrows_without_output_or_lock_debt);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

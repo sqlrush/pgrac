@@ -119,9 +119,9 @@ cluster_relmap_recovery_native_bounds(const ClusterRelmapOwnerSampleV2 *owner,
 	return true;
 }
 
-bool
-cluster_relmap_recovery_native_terminal_capture(const ClusterRelmapOwnerSampleV2 *owner,
-												ClusterRelmapRecoveryNativeTerminal *out)
+static bool
+relmap_recovery_terminal(const ClusterRelmapOwnerSampleV2 *owner,
+						 ClusterRelmapRecoveryNativeTerminal *out, bool sync)
 {
 	ClusterRelmapRecoveryNativeTerminal result = { 0 };
 	volatile bool valid = false;
@@ -145,8 +145,16 @@ cluster_relmap_recovery_native_terminal_capture(const ClusterRelmapOwnerSampleV2
 	{
 		if (relmap_recovery_bounds_locked(owner, &result.bounds)) {
 			result.top_full_xid = owner->owner.top_full_xid;
-			result.status
-				= TransactionIdGetStatus((TransactionId)result.top_full_xid, &result.status_lsn);
+			if (sync) {
+				ClusterClogNativeTerminalV1 native;
+				if (cluster_clog_native_terminal_sync_v1((TransactionId)result.top_full_xid,
+														 &native)) {
+					result.status = native.status;
+					result.status_lsn = native.status_lsn;
+				}
+			} else
+				result.status = TransactionIdGetStatus((TransactionId)result.top_full_xid,
+													   &result.status_lsn);
 			/* Native allocation can advance while the CLOG reader runs. Recheck
 			 * its provenance before publishing, including sticky invalidation. */
 			valid = (result.status == TRANSACTION_STATUS_COMMITTED
@@ -168,5 +176,18 @@ cluster_relmap_recovery_native_terminal_capture(const ClusterRelmapOwnerSampleV2
 		return false;
 	*out = result;
 	return true;
+}
+bool
+cluster_relmap_recovery_native_terminal_capture(const ClusterRelmapOwnerSampleV2 *owner,
+												ClusterRelmapRecoveryNativeTerminal *out)
+{
+	return relmap_recovery_terminal(owner, out, false);
+}
+
+bool
+cluster_relmap_recovery_native_terminal_sync(const ClusterRelmapOwnerSampleV2 *owner,
+											 ClusterRelmapRecoveryNativeTerminal *out)
+{
+	return relmap_recovery_terminal(owner, out, true);
 }
 #endif

@@ -57,6 +57,14 @@ TransactionIdGetStatus(TransactionId xid, XLogRecPtr *lsn)
 	abort();
 }
 
+bool
+cluster_clog_native_terminal_sync_v1(TransactionId xid, ClusterClogNativeTerminalV1 *out)
+{
+	(void)xid;
+	(void)out;
+	abort();
+}
+
 bool cluster_enabled, cluster_shared_config, cluster_shared_catalog, cluster_xid_striping;
 int cluster_node_id = 4, cluster_xid_herding_slack = 4194304;
 bool IsUnderPostmaster;

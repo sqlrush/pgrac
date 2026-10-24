@@ -57,5 +57,14 @@ extern bool cluster_relmap_recovery_native_bounds(const struct ClusterRelmapOwne
 extern bool
 cluster_relmap_recovery_native_terminal_capture(const struct ClusterRelmapOwnerSampleV2 *owner,
 												ClusterRelmapRecoveryNativeTerminal *out);
+/* Dormant original-owner terminal persistence. Uses the same native floor and
+ * actual-issued window as capture, but writes the original native CLOG slot
+ * through its SLRU owner, then directly syncs and reads back the same native
+ * file. Success is that terminal slot's native durability observation only;
+ * not a persisted FullXid base/source seal or cold recovery authority.
+ * Caller lock/alias/refusal/ERROR contracts are the same as capture. */
+extern bool
+cluster_relmap_recovery_native_terminal_sync(const struct ClusterRelmapOwnerSampleV2 *owner,
+											 ClusterRelmapRecoveryNativeTerminal *out);
 #endif
 #endif
