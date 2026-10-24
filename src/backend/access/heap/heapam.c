@@ -20691,12 +20691,11 @@ cluster_heap_freeze_apply_xmin_batch_locked_v1(
 	Relation rel, Buffer buffer,
 	const ClusterHeapFreezePageInputV1 *input,
 	const ClusterHeapFreezePageBatchV1 *page,
-	const ClusterHeapFreezeProofBatchV1 *proofs,
 	const ClusterHeapFreezeFinalFenceV1 *fence,
 	const PcmAuthoritySnapshot *authority_before,
 	const ClusterSemanticAdmissionToken *admission,
 	const ClusterHeapFreezeXminTargetV1 *targets, uint16 target_count,
-	FullTransactionId freeze_limit_full, SCN horizon_scn)
+	HeapTupleFreeze *plans, TransactionId conflict_horizon, SCN horizon_scn)
 {
 	RelFileLocator locator;
 	ForkNumber fork;
@@ -20704,9 +20703,7 @@ cluster_heap_freeze_apply_xmin_batch_locked_v1(
 	BufferTag tag;
 	BufferDesc *buf;
 	Page live_page;
-	HeapTupleFreeze plans[MaxHeapTuplesPerPage];
 	bool seen[MaxHeapTuplesPerPage] = { false };
-	TransactionId conflict_horizon;
 	PcmAuthoritySnapshot authority_now;
 	uint64 own_generation;
 	uint64 acquisition_epoch;
@@ -20717,7 +20714,7 @@ cluster_heap_freeze_apply_xmin_batch_locked_v1(
 
 	/* Borrow a real writer's resources; a local conditional lock is not X. */
 	if (rel == NULL || rel->rd_rel == NULL || input == NULL || page == NULL
-		|| proofs == NULL || fence == NULL || authority_before == NULL
+		|| plans == NULL || fence == NULL || authority_before == NULL
 		|| admission == NULL || targets == NULL || target_count == 0
 		|| target_count > MaxHeapTuplesPerPage
 		|| target_count > page->tuple_count
@@ -20744,12 +20741,6 @@ cluster_heap_freeze_apply_xmin_batch_locked_v1(
 			live_page) != CLUSTER_HEAP_FREEZE_PAGE_MATCHED)
 		return false;
 
-	/* Prepare the complete qualified batch before any authority check or write.
-	 * Preparation owns its output atomically and never acquires a page/proof. */
-	if (!cluster_heap_freeze_prepare_xmin_batch_v1(page, proofs, fence,
-		targets, target_count, freeze_limit_full, horizon_scn,
-		plans, lengthof(plans), &conflict_horizon))
-		return false;
 	for (uint16 i = 0; i < target_count; i++)
 	{
 		const ClusterHeapFreezeXminTargetV1 *target = &targets[i];
@@ -20839,6 +20830,8 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 	FullTransactionId freeze_limit_full, SCN horizon_scn)
 {
 	BufferDesc *buf;
+	HeapTupleFreeze plans[MaxHeapTuplesPerPage];
+	TransactionId conflict_horizon;
 	volatile bool resumed = false;
 	volatile bool applied = false;
 
@@ -20848,11 +20841,18 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 	if (buffer <= 0 || buffer > NBuffers || BufferDescriptors == NULL
 		|| !ClusterBufferHasSharedPin(buffer))
 		return false;
+	/* Plan only from the caller's immutable captured inputs. Finish the
+	 * whole batch before restoring a writer or taking its local content X;
+	 * the locked kernel still rechecks every physical row and final fence. */
+	if (!cluster_heap_freeze_prepare_xmin_batch_v1(page, proofs, fence,
+		targets, target_count, freeze_limit_full, horizon_scn,
+		plans, lengthof(plans), &conflict_horizon))
+		return false;
 	buf = GetBufferDescriptor(buffer - 1);
 	if (LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
 		return cluster_heap_freeze_apply_xmin_batch_locked_v1(rel, buffer,
-			input, page, proofs, fence, authority_before, admission,
-			targets, target_count, freeze_limit_full, horizon_scn);
+			input, page, fence, authority_before, admission,
+			targets, target_count, plans, conflict_horizon, horizon_scn);
 	if (input == NULL || !input->writer_context_valid)
 		return false;
 
@@ -20863,8 +20863,8 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 			input->writer_object_checked);
 		if (resumed)
 			applied = cluster_heap_freeze_apply_xmin_batch_locked_v1(rel, buffer,
-				input, page, proofs, fence, authority_before, admission,
-				targets, target_count, freeze_limit_full, horizon_scn);
+				input, page, fence, authority_before, admission,
+				targets, target_count, plans, conflict_horizon, horizon_scn);
 	}
 	PG_FINALLY();
 	{

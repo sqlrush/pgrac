@@ -2168,15 +2168,30 @@ UT_TEST(test_xmin_released_writer_refusal_never_fetches_or_writes)
 	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
 }
 
-UT_TEST(test_xmin_resumed_writer_plan_refusal_unlocks_without_unpin)
+UT_TEST(test_xmin_plan_refusal_before_resume_keeps_original_pin)
 {
 	QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
 	qualified_xmin_batch_setup(&f, targets);
 	fixture_release_original_writer(); resume_allowed = true;
 	targets[2].original_creator_full_xid = InvalidFullTransactionId;
 	UT_ASSERT(!qualified_xmin_batch_apply(&f, targets, 3));
-	UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
+	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+	UT_ASSERT_EQ(writer_checks + route_checks + authority_checks + full_target_checks, 0);
 	UT_ASSERT_EQ(inserts + dirties + flushes, 0); UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_xmin_missing_proof_refuses_before_writer_resume)
+{
+	QualifiedXminFixture f; qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	fixture_release_original_writer(); resume_allowed = true;
+	f.proofs.proof_count = 0;
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+	UT_ASSERT_EQ(writer_checks + route_checks + authority_checks + full_target_checks, 0);
+	UT_ASSERT_EQ(inserts + dirties + flushes, 0);
+	UT_ASSERT_EQ(backend_pin_count, 1);
 	UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
 	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
 }
@@ -2247,13 +2262,14 @@ UT_TEST(test_xmin_existing_share_lock_is_not_a_resume_scope)
 int
 main(void)
 {
-	UT_PLAN(60);
+	UT_PLAN(61);
 	UT_RUN(test_xmin_actual_writer_keeps_original_ko_revision_before_lock);
 	UT_RUN(test_xmin_actual_resumer_inner_error_cleans_before_native_wrapper);
 	UT_RUN(test_xmin_released_writer_requires_actual_original_node_grant);
 	UT_RUN(test_xmin_released_writer_single_and_batch_reach_native_wal);
 	UT_RUN(test_xmin_released_writer_refusal_never_fetches_or_writes);
-	UT_RUN(test_xmin_resumed_writer_plan_refusal_unlocks_without_unpin);
+	UT_RUN(test_xmin_plan_refusal_before_resume_keeps_original_pin);
+	UT_RUN(test_xmin_missing_proof_refuses_before_writer_resume);
 	UT_RUN(test_xmin_resumed_writer_target_error_runs_finally);
 	UT_RUN(test_xmin_resumed_writer_flush_error_runs_finally_after_wal);
 	UT_RUN(test_xmin_resume_error_keeps_original_pin_and_admission);
