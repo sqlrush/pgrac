@@ -538,6 +538,8 @@ SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_v2_storage
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2_storage,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_retention
+TESTS += test_cluster_relmap_recovery
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_recovery,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_retention,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_retention_census
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_retention_census,$(SIMPLE_TESTS))
@@ -9007,7 +9009,10 @@ test_cluster_xid_allocation.inc: $(top_srcdir)/src/backend/access/transam/varsup
 	mv $@.tmp $@
 
 test_cluster_xid_allocation: test_cluster_xid_allocation.c unit_test.h \
-		test_cluster_xid_allocation.inc $(CLUSTER_XID_STRIPE_O)
+		test_cluster_xid_allocation.inc $(CLUSTER_XID_STRIPE_O) \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_recovery.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
+		$(top_srcdir)/src/include/access/transam.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Exercise the original recovery -> seed -> claim -> WAL gate. Dependency
@@ -10027,3 +10032,10 @@ test_cluster_d0_native_reader: test_cluster_d0_native_reader.c unit_test.h \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+# Original native issuance/floor observations, no recovery authority provider.
+test_cluster_relmap_recovery: test_cluster_relmap_recovery.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_recovery.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
+		$(top_srcdir)/src/include/access/transam.h $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
