@@ -424,8 +424,11 @@ UT_TEST(fpi_native_insert_exceptions_keep_guard_and_exact_uncertain_phase)
 	}
 }
 
+#ifndef RECOVERY_FPI_INSERT_MAIN
+#define RECOVERY_FPI_INSERT_MAIN main
+#endif
 int
-main(void)
+RECOVERY_FPI_INSERT_MAIN(void)
 {
 	UT_PLAN(6);
 	UT_RUN(fpi_native_insert_retains_exact_image_and_pending_window);

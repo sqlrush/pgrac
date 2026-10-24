@@ -22,6 +22,12 @@
 #include "access/xlog.h"
 #include "storage/checksum.h"
 #include "storage/smgr.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_recovery_stamp.h"
+#include "miscadmin.h"
+#include "postmaster/interrupt.h"
+#endif
 #endif
 
 static bool
@@ -562,3 +568,144 @@ rf_page_storage_install_smgr_v1(const RfPageStorageInstallRequestV1 *request,
 }
 
 #endif /* !USE_CLUSTER_UNIT */
+
+#if defined(USE_PGRAC_CLUSTER) && !defined(USE_CLUSTER_UNIT)
+static bool
+page_recovery_fpi_current(const ClusterRecoveryFpiInsertV1 *inserted,
+	ClusterRecoverySerialGuard *serial, ClusterWalRetentionPin *pin,
+	const RfPageIdentityV1 *identity)
+{
+	ClusterRecoveryStampFpiV1 envelope;
+	RfPageRecoveryReferenceV1 reference;
+	TimeLineID timeline;
+
+	if (!cluster_enabled || !cluster_shared_config || !IsUnderPostmaster
+		|| MyBackendType != B_STARTUP || MyProcPid <= 0 || CritSectionCount != 0
+		|| ShutdownRequestPending || RecoveryInProgress() || inserted->guard == NULL
+		|| !inserted->wal_flushed || serial == NULL || pin == NULL || !serial->held
+		|| serial->release_uncertain || serial->mode != CLUSTER_RECOVERY_SERIAL_COLD_FORMED
+		|| inserted->window.owner.executor_pid != MyProcPid
+		|| memcmp(&serial->duty, &inserted->window.owner.target.identity, sizeof(serial->duty)) != 0
+		|| inserted->window.payload_length != sizeof(envelope)
+		|| !cluster_recovery_stamp_fpi_inserted_current_v1(&inserted->window,
+			inserted->record_start, inserted->record_end)
+		|| GetFlushRecPtr(&timeline) < inserted->record_end
+		|| timeline != inserted->window.owner.writer.ref.timeline
+		|| cluster_wal_writer_check(&inserted->window.owner.writer)
+			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return false;
+	memcpy(&envelope, inserted->window.payload, sizeof(envelope));
+	return rf_page_authority_recovery_reference_v1(inserted->guard, serial, pin, identity,
+			&envelope.image.version.before, &reference)
+		&& memcmp(&reference, &envelope.protection, sizeof(reference)) == 0;
+}
+
+/* The cleanup publisher already holds PAGE and owns an actual flushed record.
+ * Reuse native typed storage primitives, retaining that same protection until
+ * the caller completes the original first/pin/companion responsibilities. */
+static bool
+page_recovery_fpi_install(ClusterRecoveryFpiInsertV1 *inserted,
+	ClusterRecoverySerialGuard *serial, ClusterWalRetentionPin *pin)
+{
+	ClusterRecoveryStampFpiV1 envelope;
+	RfPageStorageInstallComponentV1 component = {0};
+	RfPageStorageInstallRequestV1 request = {0};
+	RfPageInstallStorageOpsV1 storage = {0};
+	RfPageSmgrPreopenV1 context = {0};
+	ClusterWalWriterToken installed;
+	uint8 operation_uuid[16];
+	uint64 install_generation;
+	SMgrRelation relation;
+	PGAlignedBlock canonical, current;
+	bool opened = true, exists;
+	uint64 token;
+
+	component.page_identity.system_identifier = inserted->image.identity.key.system_identifier;
+	memcpy(component.page_identity.storage_uuid, inserted->image.identity.key.storage_uuid, 16);
+	component.page_identity.locator = inserted->image.identity.key.locator;
+	component.page_identity.forknum = inserted->image.fork_number;
+	component.page_identity.blockno = inserted->image.block_number;
+	if (!page_recovery_fpi_current(inserted, serial, pin, &component.page_identity))
+		return false;
+	if (!ClusterStartupInstalledRecoveryWriterV1(&installed, operation_uuid, &install_generation)
+		|| install_generation == 0 || installed.epoch != inserted->window.owner.writer.epoch
+		|| installed.startup_first_lsn != inserted->window.owner.writer.startup_first_lsn
+		|| memcmp(&installed.ref, &inserted->window.owner.writer.ref, sizeof(installed.ref)) != 0)
+		return false;
+	memcpy(&envelope, inserted->window.payload, sizeof(envelope));
+	if (!GenericXLogRecoveryImageMatchesDescriptor(&inserted->image, &envelope.image))
+		return false;
+	component.before_kind = RF_PAGE_STATE_PRESENT;
+	component.expected_before = inserted->image.version.before;
+	memcpy(component.expected_result.segment_incarnation,
+		inserted->image.version.result_incarnation, 16);
+	component.expected_result.mutation_token = inserted->image.result_token;
+	/* Reuse current as private staging, then as target-read scratch. */
+	current = inserted->image.image;
+	PageSetLSN(current.data, inserted->record_end);
+	component.canonical_page = current.data;
+	storage.arg = &context;
+	storage.checksums_enabled = DataChecksumsEnabled();
+	storage.checksum = page_smgr_checksum;
+	if (!component_versions_valid(&component)
+		|| !canonicalize_page(&storage, &component, canonical.data)
+		|| !page_recovery_fpi_current(inserted, serial, pin, &component.page_identity))
+		return false;
+	request.components = &component;
+	request.component_count = 1;
+	context.request = &request;
+	context.relations = &relation;
+	context.opened = &opened;
+	relation = smgropen(component.page_identity.locator, InvalidBackendId);
+	if (!page_recovery_fpi_current(inserted, serial, pin, &component.page_identity)
+		|| !page_smgr_read(&context, 0, &component.page_identity, current.data, &exists)
+		|| !exists || !page_layout_valid(current.data)
+		|| !page_checksum_valid(&storage, &component.page_identity, current.data))
+		return false;
+	token = ((PageHeader)current.data)->pd_block_scn;
+	if (token == component.expected_result.mutation_token) {
+		if (memcmp(current.data, canonical.data, BLCKSZ) != 0)
+			return false;
+	} else if (token == component.expected_before.mutation_token) {
+		if (!page_recovery_fpi_current(inserted, serial, pin, &component.page_identity)
+			|| !page_smgr_write(&context, 0, &component.page_identity, canonical.data, false))
+			return false;
+	} else
+		return false;
+	if (!page_recovery_fpi_current(inserted, serial, pin, &component.page_identity)
+		|| !page_smgr_sync(&context, 0, &component.page_identity)
+		|| !page_recovery_fpi_current(inserted, serial, pin, &component.page_identity)
+		|| !page_smgr_read(&context, 0, &component.page_identity, current.data, &exists)
+		|| !exists || !page_layout_valid(current.data)
+		|| !page_checksum_valid(&storage, &component.page_identity, current.data)
+		|| memcmp(current.data, canonical.data, BLCKSZ) != 0
+		|| !page_recovery_fpi_current(inserted, serial, pin, &component.page_identity))
+		return false;
+	return true;
+}
+
+bool
+rf_page_recovery_fpi_install_smgr_v1(ClusterRecoveryFpiInsertV1 *inserted,
+	ClusterRecoverySerialGuard *serial, ClusterWalRetentionPin *pin)
+{
+	volatile bool completed = false;
+
+	if (inserted == NULL)
+		return false;
+	inserted->target_synced = false;
+	PG_TRY();
+	{
+		completed = page_recovery_fpi_install(inserted, serial, pin);
+		if (!completed)
+			(void)cluster_recovery_stamp_fail_v1(&inserted->window);
+	}
+	PG_CATCH();
+	{
+		(void)cluster_recovery_stamp_fail_v1(&inserted->window);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	inserted->target_synced = completed;
+	return completed;
+}
+#endif /* USE_PGRAC_CLUSTER && !USE_CLUSTER_UNIT */

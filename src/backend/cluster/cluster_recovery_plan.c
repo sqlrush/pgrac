@@ -1645,6 +1645,27 @@ cluster_recovery_stamp_durable_v1(const ClusterRecoveryStampHandleV1 *handle)
 	return stamp_transition(handle, CLUSTER_RECOVERY_STAMP_INSERTED, CLUSTER_RECOVERY_STAMP_DURABLE,
 							0, 0, false);
 }
+
+bool
+cluster_recovery_stamp_fpi_inserted_current_v1(const ClusterRecoveryStampHandleV1 *handle,
+	XLogRecPtr start, XLogRecPtr end)
+{
+	ClusterThreadReplaySlot *replay;
+	ClusterRecoveryStampSlotV1 snapshot;
+
+	if (!stamp_actor() || CritSectionCount != 0 || handle == NULL
+		|| handle->owner.executor_pid != MyProcPid || handle->kind != CLUSTER_RECOVERY_STAMP_FPI
+		|| start < handle->owner.writer.startup_first_lsn || end <= start
+		|| (replay = cluster_thread_recovery_replay_slot(handle->key.target_thread)) == NULL)
+		return false;
+	stamp_snapshot(&replay->stamp, &snapshot);
+	/* Complete codec checks apply to this copied snapshot outside the slot lock. */
+	return stamp_shape(&snapshot, handle->key.target_thread)
+		&& stamp_handle_matches(&snapshot, handle) && !snapshot.failed
+		&& snapshot.phase == CLUSTER_RECOVERY_STAMP_INSERTED
+		&& snapshot.record_start == start && snapshot.record_end == end;
+}
+
 bool
 cluster_recovery_stamp_clear_v1(const ClusterRecoveryStampHandleV1 *handle)
 {

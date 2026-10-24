@@ -61,7 +61,7 @@ TESTS = test_cluster_vm_read_visibility test_cluster_heap_maintenance test_clust
         test_pgrac_fenced_target_request \
         test_pgrac_fenced_pacemaker_owned \
         test_cluster_update_trace test_cluster_cr_dependency test_cluster_startup_exit test_cluster_config_members test_cluster_config_mount \
-        test_cluster_heap_prepare_diagnostic test_cluster_generic_version test_cluster_generic_redo test_cluster_recovery_fpi_insert \
+        test_cluster_heap_prepare_diagnostic test_cluster_generic_version test_cluster_generic_redo test_cluster_recovery_fpi_insert test_cluster_recovery_fpi_install \
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
         test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_ctrc_dispatch test_cluster_heap_receipt \
         test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_ctrc_itl_reuse test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop \
@@ -471,7 +471,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_online_plan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_replay_batch,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_install,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_producer test_cluster_space_fork test_cluster_space_identity test_cluster_space_page_verify test_cluster_space_table_size test_cluster_space_wal test_cluster_space_storage test_cluster_space_recovery test_cluster_space_cache test_cluster_space_recovery_route test_cluster_space_copy test_cluster_space_copy_version test_cluster_heap_insert_version test_cluster_vm_version test_cluster_vm_redo,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_generic_version test_cluster_generic_redo test_cluster_recovery_fpi_insert,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_generic_version test_cluster_generic_redo test_cluster_recovery_fpi_insert test_cluster_recovery_fpi_install,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_wal_checkpoint_sample,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_wal_retained_cut test_cluster_wal_retained_cut_records,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_cold_recovery_xid,$(SIMPLE_TESTS))
@@ -2578,6 +2578,28 @@ test_cluster_recovery_fpi_insert: test_cluster_recovery_fpi_insert.c test_cluste
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		test_cluster_recovery_fpi_generic.o test_cluster_space_producer_product.o \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_claim.c $(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+test_cluster_recovery_fpi_install_product.o: $(top_srcdir)/src/backend/cluster/cluster_page_install.c \
+		$(top_srcdir)/src/include/cluster/cluster_page_install.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_recovery_fpi_install: test_cluster_recovery_fpi_install.c test_cluster_recovery_fpi_insert.c \
+		test_cluster_recovery_stamp.c unit_test.h test_cluster_recovery_fpi_generic.o \
+		test_cluster_recovery_fpi_install_product.o test_cluster_space_producer_product.o \
+		cluster_page_stable_base_test.o \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_claim.c $(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(top_builddir)/src/backend/storage/page/checksum.o Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		test_cluster_recovery_fpi_generic.o test_cluster_recovery_fpi_install_product.o \
+		cluster_page_stable_base_test.o \
+		test_cluster_space_producer_product.o $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/backend/storage/page/checksum.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
