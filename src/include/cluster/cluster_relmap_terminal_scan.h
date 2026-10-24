@@ -46,6 +46,17 @@ cluster_relmap_recovery_retention_build_start_cold_v1(uint16 origin,
 extern bool cluster_relmap_recovery_retention_build_start_cold_source_v1(
 	uint16 origin, struct ClusterRelmapRetentionDirectory *directory,
 	struct ClusterRelmapRecoverySourceObservationV1 *source);
+/* Dormant original cold execution owner only, Startup/recovery/no-CRIT with
+ * shared-catalog/sole-merger/namespace X. Authenticate the supplied original
+ * source/full ROOT/redo/nonreused serial before and after original storage
+ * namespace I/O. Return only a new tracked read-only directory fd, or -1;
+ * refusal/ERROR closes local fds, never original protections. It is a physical
+ * input, not isolation/native/lifetime/all-origin/ROOT authority. Retain the
+ * exact original owner/protections through all later ROOT/census use, destroy
+ * all dependent cursors and CloseTransientFile on every exit, including
+ * PG_FINALLY and before the original fd.c lifetime ends. No live caller. */
+extern int cluster_relmap_recovery_root_open_cold_v1(
+	const struct ClusterRelmapRecoverySourceObservationV1 *source);
 typedef struct ClusterRelmapTerminalObservationV1 {
 	ClusterWalSourceRef source;
 	ClusterRelmapCheckpointWindow window;

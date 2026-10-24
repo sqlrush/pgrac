@@ -418,6 +418,15 @@ extern bool cluster_shared_fs_sentinel_has_participant(int node_id);
 extern void cluster_shared_fs_get_storage_uuid(char *out, size_t outlen);
 extern bool cluster_shared_fs_get_protected_set_identity(ClusterProtectedSetIdentityV1 *out);
 
+/* Read-only original cluster_fs namespace observation, never recovery or
+ * isolation authority. Open its fixed configured root and sentinel, require
+ * exact UUID/full sentinel bytes/stat/path rechecks, and return a tracked raw
+ * read-only directory fd, or -1. No attach, creation, write or sync. ERROR
+ * closes local descriptors. Caller retains original source/isolation/cuts and
+ * closes with CloseTransientFile after destroying every dependent cursor,
+ * before the original fd.c transaction/subtransaction lifetime ends. */
+extern int cluster_shared_fs_recovery_root_open_v1(const uint8 expected_uuid[16]);
+
 /* Backend-private identity source used by the provider-neutral dispatcher.
  * It returns only a strict configured UUID already matched to the CRC-valid
  * raw superblock; the legacy "raw-block-device" fallback returns false. */

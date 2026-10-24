@@ -1361,6 +1361,104 @@ sharedfs_preset_uuid(const char *text, char out[CLUSTER_SHARED_UUID_LEN])
 	return used == 32 && nonzero;
 }
 
+static bool
+sharedfs_recovery_stat_same(const struct stat *before, const struct stat *after)
+{
+	if (before->st_dev != after->st_dev || before->st_ino != after->st_ino
+		|| before->st_mode != after->st_mode || before->st_uid != after->st_uid
+		|| before->st_gid != after->st_gid || before->st_nlink != after->st_nlink
+		|| before->st_size != after->st_size)
+		return false;
+#ifdef __APPLE__
+	return before->st_mtimespec.tv_sec == after->st_mtimespec.tv_sec
+		   && before->st_mtimespec.tv_nsec == after->st_mtimespec.tv_nsec
+		   && before->st_ctimespec.tv_sec == after->st_ctimespec.tv_sec
+		   && before->st_ctimespec.tv_nsec == after->st_ctimespec.tv_nsec;
+#else
+	return before->st_mtim.tv_sec == after->st_mtim.tv_sec
+		   && before->st_mtim.tv_nsec == after->st_mtim.tv_nsec
+		   && before->st_ctim.tv_sec == after->st_ctim.tv_sec
+		   && before->st_ctim.tv_nsec == after->st_ctim.tv_nsec;
+#endif
+}
+
+static bool
+sharedfs_recovery_root_matches(int root_fd, int sentinel_fd, const char *path,
+							   const struct stat *root, const struct stat *sentinel)
+{
+	struct stat current;
+
+	return fstat(root_fd, &current) == 0 && sharedfs_recovery_stat_same(root, &current)
+		   && lstat(path, &current) == 0 && sharedfs_recovery_stat_same(root, &current)
+		   && fstat(sentinel_fd, &current) == 0 && sharedfs_recovery_stat_same(sentinel, &current)
+		   && fstatat(root_fd, PGRAC_SHARED_CONTROL_FILE, &current, AT_SYMLINK_NOFOLLOW) == 0
+		   && sharedfs_recovery_stat_same(sentinel, &current);
+}
+
+int
+cluster_shared_fs_recovery_root_open_v1(const uint8 expected_uuid[16])
+{
+	static const char hex[] = "0123456789abcdef";
+	char path[MAXPGPATH], sentinel_path[MAXPGPATH], uuid[CLUSTER_SHARED_UUID_LEN];
+	int volatile root_fd = -1, sentinel_fd = -1;
+	volatile bool observed = false;
+	bool nonzero = false;
+	struct stat root, sentinel;
+	PgracSharedControl before, after;
+	const char *reason = NULL;
+
+	if (expected_uuid == NULL
+		|| cluster_shared_storage_backend != CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS
+		|| cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] != '/')
+		return -1;
+	if (strlcpy(path, cluster_shared_data_dir, sizeof(path)) >= sizeof(path)
+		|| snprintf(sentinel_path, sizeof(sentinel_path), "%s/%s", path, PGRAC_SHARED_CONTROL_FILE)
+			   >= sizeof(sentinel_path))
+		return -1;
+	for (unsigned i = 0; i < 16; i++) {
+		nonzero |= expected_uuid[i] != 0;
+		uuid[i * 2] = hex[expected_uuid[i] >> 4];
+		uuid[i * 2 + 1] = hex[expected_uuid[i] & 15];
+	}
+	uuid[32] = '\0';
+	if (!nonzero)
+		return -1;
+	PG_TRY();
+	{
+		do {
+			/* fd.c tracks these raw descriptors, without VFD eviction/reopen.
+			 * No caller path, sentinel attach or namespace mutation is used. */
+			root_fd = OpenTransientFile(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+												  | PG_BINARY);
+			if (root_fd < 0 || fstat(root_fd, &root) != 0 || !S_ISDIR(root.st_mode))
+				break;
+			sentinel_fd = OpenTransientFile(sentinel_path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK
+															   | O_CLOEXEC | PG_BINARY);
+			if (sentinel_fd < 0 || fstat(sentinel_fd, &sentinel) != 0 || !S_ISREG(sentinel.st_mode)
+				|| sentinel.st_nlink != 1 || sentinel.st_size != sizeof(before)
+				|| !sharedfs_recovery_root_matches(root_fd, sentinel_fd, path, &root, &sentinel)
+				|| !cluster_shared_fs_sentinel_read(sentinel_fd, &before, &reason)
+				|| memcmp(before.storage_uuid, uuid, sizeof(uuid)) != 0
+				|| !cluster_shared_fs_sentinel_read(sentinel_fd, &after, &reason)
+				|| memcmp(&before, &after, sizeof(before)) != 0
+				|| !sharedfs_recovery_root_matches(root_fd, sentinel_fd, path, &root, &sentinel)
+				|| cluster_shared_storage_backend != CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS
+				|| cluster_shared_data_dir == NULL || strcmp(cluster_shared_data_dir, path) != 0)
+				break;
+			observed = true;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		if (sentinel_fd >= 0 && CloseTransientFile(sentinel_fd) != 0)
+			observed = false;
+		if (!observed && root_fd >= 0)
+			(void)CloseTransientFile(root_fd);
+	}
+	PG_END_TRY();
+	return observed ? root_fd : -1;
+}
+
 /*
  * cluster_shared_fs_sentinel_attach -- record this node in the shared-root
  *	participant set (postmaster-once; see the init callback).

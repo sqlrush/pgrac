@@ -34,15 +34,16 @@ int control_fixture_main(int argc, char **argv);
 
 /* This retained-WAL fixture grants no physical execution census ownership. */
 bool cluster_shared_catalog;
+static bool relmap_root_merger, relmap_root_namespace_x;
 bool
 cluster_recovery_merge_claim_is_held(void)
 {
-	return false;
+	return relmap_root_merger;
 }
 bool
 cluster_relmap_authority_x_held(void)
 {
-	return false;
+	return relmap_root_namespace_x;
 }
 
 static ClusterWalSourceRef relmap_test_source[2];
@@ -3379,7 +3380,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(86);
+	UT_PLAN(90);
 	UT_RUN(test_custody_source_observes_original_tuple_without_native_page_io);
 	UT_RUN(test_custody_source_refusal_and_error_are_sticky);
 	UT_RUN(test_custody_source_alias_refusal_keeps_handle_usable);
@@ -3390,6 +3391,10 @@ main(int argc, char **argv)
 	UT_RUN(test_execution_pending_drift_is_sticky_and_keeps_original_owner);
 	UT_RUN(test_execution_pending_error_releases_only_local_custody);
 	UT_RUN(test_execution_pending_alias_refusal_preserves_inputs);
+	UT_RUN(test_execution_root_fd_original_source_and_owner);
+	UT_RUN(test_execution_root_fd_missing_initial_gates_does_no_storage_io);
+	UT_RUN(test_execution_root_fd_post_io_drift_or_error_closes_only_new_fd);
+	UT_RUN(test_execution_root_fd_invalid_provenance_cannot_open_storage);
 	UT_RUN(test_execution_build_source_publishes_same_original_provenance);
 	UT_RUN(test_execution_build_source_refusal_and_error_keep_both_outputs_atomic);
 	UT_RUN(test_execution_build_source_rejects_nonzero_overlap_and_missing_outputs);

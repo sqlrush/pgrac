@@ -8,13 +8,18 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "cluster/cluster_recovery_record_hash.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_recovery_merge.h"
+#include "cluster/cluster_relmap_lock.h"
 #include "cluster/cluster_relmap_recovery.h"
 #include "cluster/cluster_relmap_owner.h"
 #include "cluster/cluster_relmap_retention.h"
 #include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_undo_recovery.h"
+#include "cluster/storage/cluster_shared_fs.h"
 #include "miscadmin.h"
 #include "replication/origin.h"
+#include "storage/fd.h"
 
 struct ClusterRelmapTerminalScanV1 {
 	pid_t pid;
@@ -755,6 +760,48 @@ cluster_relmap_recovery_retention_build_start_cold_source_v1(
 	ClusterRelmapRecoverySourceObservationV1 *source)
 {
 	return source != NULL && retention_build_start_cold(origin, directory, source);
+}
+
+static bool
+recovery_root_owner_current(const ClusterRelmapRecoverySourceObservationV1 *source)
+{
+	return MyBackendType == B_STARTUP && RecoveryInProgress() && CritSectionCount == 0
+		   && cluster_shared_catalog && cluster_recovery_merge_claim_is_held()
+		   && cluster_relmap_authority_x_held()
+		   && cluster_undo_recovery_cold_single_source_v1(&source->source, &source->checkpoint,
+														  source->native_redo, source->scope_serial)
+		   && MyBackendType == B_STARTUP && RecoveryInProgress() && CritSectionCount == 0
+		   && cluster_shared_catalog && cluster_recovery_merge_claim_is_held()
+		   && cluster_relmap_authority_x_held();
+}
+
+int
+cluster_relmap_recovery_root_open_cold_v1(const ClusterRelmapRecoverySourceObservationV1 *source)
+{
+	ClusterRelmapRecoverySourceObservationV1 selected;
+	int volatile fd = -1;
+	volatile bool accepted = false;
+
+	if (source == NULL)
+		return -1;
+	selected = *source;
+	PG_TRY();
+	{
+		if (recovery_root_owner_current(&selected)) {
+			fd = cluster_shared_fs_recovery_root_open_v1(
+				selected.source.claim.identity.storage_uuid);
+			accepted = fd >= 0 && memcmp(source, &selected, sizeof(selected)) == 0
+					   && recovery_root_owner_current(&selected)
+					   && memcmp(source, &selected, sizeof(selected)) == 0;
+		}
+	}
+	PG_FINALLY();
+	{
+		if (!accepted && fd >= 0)
+			(void)CloseTransientFile(fd);
+	}
+	PG_END_TRY();
+	return accepted ? fd : -1;
 }
 
 static bool
