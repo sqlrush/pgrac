@@ -65,6 +65,7 @@ static void actor(unsigned i)
 {
 	memset(&local_owner, 0, sizeof(local_owner));
 	pair_depth = 0; pair_recording = false; pair_slot = -1;
+	service_serial = service_current = 0;
 	MyProc = &procs[i]; MyProc->pgprocno = i; MyProc->pid = MyProcPid = 100 + i; MyProc->backendId = 1 + i;
 	MyStartTimestamp = 1000 + i;
 	MyProc->cluster_grd_generation = 10000 + i;
@@ -569,10 +570,91 @@ UT_TEST(zero_native_generation_never_authenticates_a_process)
 	}
 }
 
+UT_TEST(pcm_service_is_active_without_a_content_hold)
+{
+	ClusterContentTraceServiceScope scope;
+	ClusterWaitTrace service = {0};
+	reset(); service.tag = buf(2)->tag; service.tag_known = true;
+	service.requester = 3; service.request_seq = 91; service.formation = 92;
+	service.master_session = 93; service.wire_sender_connection = 94;
+	cluster_content_trace_service_begin(&scope, &service);
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.nowners, 1); UT_ASSERT(cut.owners[0].pcm_serving);
+	UT_ASSERT_EQ(cut.owners[0].nlocks, 0);
+	UT_ASSERT_EQ(cut.owners[0].pcm_service.request_seq, 91);
+	UT_ASSERT_EQ(cut.owners[0].pcm_service.wire_sender_connection, 94);
+	UT_ASSERT_EQ(cut.owners[0].pcm_service.requester_connection, 0);
+	cluster_content_trace_service_end(&scope);
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT(!cut.owners[0].pcm_serving);
+}
+
+UT_TEST(pcm_service_nested_scope_restores_only_live_outer)
+{
+	ClusterContentTraceServiceScope outer, inner;
+	ClusterWaitTrace service = {0};
+	reset(); service.request_seq = 81;
+	cluster_content_trace_service_begin(&outer, &service);
+	service.request_seq = 82; cluster_content_trace_service_begin(&inner, &service);
+	UT_ASSERT_EQ(local_owner.pcm_service.request_seq, 82);
+	cluster_content_trace_service_end(&inner);
+	UT_ASSERT(local_owner.pcm_serving); UT_ASSERT_EQ(local_owner.pcm_service.request_seq, 81);
+	cluster_content_trace_service_end(&inner); /* Idempotent retirement. */
+	UT_ASSERT_EQ(local_owner.pcm_service.request_seq, 81);
+	cluster_content_trace_service_begin(&inner, &service);
+	cluster_content_trace_error_cleanup();
+	cluster_content_trace_service_end(&inner); cluster_content_trace_service_end(&outer);
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT(!cut.owners[0].pcm_serving);
+	UT_ASSERT_EQ(cut.owners[0].pcm_service.request_seq, 0);
+}
+
+UT_TEST(pcm_service_missed_retirement_is_unknown)
+{
+	ClusterContentTraceServiceScope scope;
+	ClusterWaitTrace service = {0};
+	reset(); service.request_seq = 81;
+	cluster_content_trace_service_begin(&scope, &service);
+	pg_atomic_write_u32(&content_trace->slots[0].busy, 1);
+	cluster_content_trace_service_end(&scope);
+	pg_atomic_write_u32(&content_trace->slots[0].busy, 0);
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.changed, 1); UT_ASSERT_EQ(cut.nowners, 0);
+	UT_ASSERT(!local_owner.pcm_serving);
+}
+
+UT_TEST(pcm_service_disabled_and_cleanup_do_not_resurrect)
+{
+	ClusterContentTraceServiceScope outer, inner;
+	ClusterWaitTrace service = {0};
+	reset(); cluster_trace_tx_identity = false;
+	cluster_content_trace_service_begin(&outer, &service);
+	UT_ASSERT_EQ(outer.serial, 0); cluster_content_trace_service_end(&outer);
+	cluster_trace_tx_identity = true;
+	cluster_content_trace_service_begin(&outer, &service);
+	cluster_content_trace_error_cleanup();
+	cluster_content_trace_service_begin(&inner, &service);
+	cluster_content_trace_service_end(&inner); cluster_content_trace_service_end(&outer);
+	UT_ASSERT(!local_owner.pcm_serving);
+	cluster_content_trace_service_begin(&outer, &service);
+	cluster_trace_tx_identity = false; cluster_content_trace_service_end(&outer);
+	cluster_trace_tx_identity = true; cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.nowners, 0); UT_ASSERT_EQ(logs, 0);
+	cluster_content_trace_service_begin(&outer, &service);
+	service_serial = PG_UINT64_MAX;
+	cluster_content_trace_service_begin(&inner, &service);
+	cluster_content_trace_service_end(&outer);
+	UT_ASSERT(!local_owner.pcm_serving); UT_ASSERT_EQ(inner.serial, 0);
+}
+
 int main(void)
 {
 	cluster_content_trace_shmem_register(); assert(registered && registered->lwlock_count == 0);
-	UT_PLAN(32);
+	UT_PLAN(36);
+	UT_RUN(pcm_service_is_active_without_a_content_hold);
+	UT_RUN(pcm_service_nested_scope_restores_only_live_outer);
+	UT_RUN(pcm_service_missed_retirement_is_unknown);
+	UT_RUN(pcm_service_disabled_and_cleanup_do_not_resurrect);
 	UT_RUN(auxiliary_native_generation_authenticates_timestamp_zero);
 	UT_RUN(reused_auxiliary_generation_rejects_same_pid_and_backend);
 	UT_RUN(zero_native_generation_never_authenticates_a_process);

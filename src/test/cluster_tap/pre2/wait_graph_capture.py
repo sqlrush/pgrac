@@ -191,8 +191,27 @@ def build_graph(snapshots, resources):
             if not matched:
                 unknown.append(dict(process=identity(row), reason='enqueue_no_proven_conflicting_holder', wait=wait))
         if row.get('pcm_wait'):
-            # A cached instance holder and canonical FIFO source are not a PID.
-            # Keep the original request and all resource frames for the service join.
+            wait = row['pcm_wait']
+            keys = ('tag', 'requester', 'request_seq', 'formation',
+                    'master_session', 'base', 'expected_master')
+            for service_owner in owners.values():
+                service = service_owner.get('pcm_service')
+                if (service and wait.get('requester') == row['node'] and
+                        wait.get('tag') is not None and
+                        isinstance(wait.get('base'), int) and wait['base'] >= 0 and
+                        isinstance(wait.get('expected_master'), int) and wait['expected_master'] >= 0 and
+                        service.get('source') == service_owner['node'] and
+                        all(isinstance(wait.get(key), int) and wait[key] > 0
+                            for key in ('request_seq', 'formation', 'master_session')) and
+                        all(wait.get(key) == service.get(key) for key in keys)):
+                    # This is an active native call, not a grant or canonical
+                    # route/transport receipt. Master sender != requester wire.
+                    add(row, service_owner, dict(kind='pcm', tag=wait['tag'],
+                        request_seq=wait['request_seq'], requester=wait['requester'],
+                        formation=wait['formation'], master_session=wait['master_session'],
+                        base=wait['base'], master=wait['expected_master'],
+                        service_wire_sender_connection=service.get('wire_sender_connection')),
+                        'candidate_pcm_service')
             unknown.append(dict(process=identity(row), reason='pcm_service_process_edge_unresolved',
                                 wait=row['pcm_wait']))
         if row.get('tx_wait'):
@@ -345,7 +364,8 @@ class CaptureSession:
                 keys = set()
                 for frame in result['rounds'][0]:
                     for owner in frame.get('value', {}).get('owners', []):
-                        for lock in owner.get('locks', []) + [owner.get('native_wait') or {}, owner.get('pcm_wait') or {}]:
+                        for lock in owner.get('locks', []) + [owner.get('native_wait') or {},
+                                owner.get('pcm_wait') or {}, owner.get('pcm_service') or {}]:
                             if lock.get('tag') is not None:
                                 keys.add(('pcm', tuple(lock['tag'])))
                         for grant in owner.get('grants', []):
@@ -395,8 +415,8 @@ class CaptureSession:
                     value['stable'] = final.get(frame['node']) == value
                     resources.append(value)
         graph = build_graph(snapshots, resources)
-        # Native source/service and auxiliary incarnation joins are still being
-        # implemented. Even a quiet cut cannot qualify full S2 in this slice.
+        # Canonical source/service transport joins remain unqualified. Even a
+        # quiet cut cannot qualify full S2 in this slice.
         graph['observed_edges_resolved'] = graph['complete']
         graph['complete'] = False
         graph['unknown'].append(dict(reason='s2_source_join_qualification_pending',

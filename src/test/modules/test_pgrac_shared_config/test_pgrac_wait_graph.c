@@ -138,6 +138,9 @@ json_owner(const ClusterContentTraceOwner *row, void *context)
 	appendStringInfoString(out, ",\"pcm_wait\":");
 	if (row->wait_mask & (1U << CLCONTENT_PCM)) json_wait(out, &row->waits[CLCONTENT_PCM]);
 	else appendStringInfoString(out, "null");
+	appendStringInfoString(out, ",\"pcm_service\":");
+	if (row->pcm_serving) json_wait(out, &row->pcm_service);
+	else appendStringInfoString(out, "null");
 	appendStringInfoString(out, ",\"tx_wait\":");
 	if (row->wait_mask & (1U << CLCONTENT_TX)) json_wait(out, &row->waits[CLCONTENT_TX]);
 	else appendStringInfoString(out, "null");

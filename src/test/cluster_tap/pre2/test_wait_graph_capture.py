@@ -7,6 +7,59 @@ import wait_graph_capture as graph
 
 
 class GraphTests(unittest.TestCase):
+    def test_pcm_active_service_is_candidate_and_never_an_exact_cycle(self):
+        key = dict(tag=[1,2,3,4,5], requester=0, request_seq=9, formation=7,
+                   master_session=8, base=0, expected_master=2, request_known=True)
+        requester = dict(node=0, pid=10, procno=1, backend_id=2, backend_start=3,
+                         proc_generation=17, pcm_wait=dict(key), locks=[],
+                         pcm_service=dict(key, requester=1, source=0))
+        service = dict(node=1, pid=20, procno=2, backend_id=-1, backend_start=0,
+                       proc_generation=18, pcm_service=dict(key, wire_sender_connection=42, source=1),
+                       pcm_wait=dict(key, requester=1), locks=[])
+        snapshots = [dict(node=n, owners=[row]) for n, row in enumerate((requester, service))]
+        result = graph.build_graph(snapshots, [])
+        self.assertEqual(len(result['edges']), 2)
+        self.assertTrue(all(x['quality']=='candidate_pcm_service' for x in result['edges']))
+        self.assertEqual(result['cycles'], [])
+        self.assertFalse(result['complete'])
+        self.assertEqual(result['edges'][0]['resource']['service_wire_sender_connection'], 42)
+        # Distinct transport namespaces are not silently compared or filled in.
+        requester['pcm_wait']['requester_connection'] = 99
+        self.assertEqual(len(graph.build_graph(snapshots, [])['edges']), 2)
+        for field in ('tag', 'requester', 'request_seq', 'formation', 'master_session', 'base', 'expected_master'):
+            original = service['pcm_service'][field]
+            service['pcm_service'][field] = [1,2,3,0,5] if field=='tag' else original+1
+            self.assertEqual(len(graph.build_graph(snapshots, [])['edges']), 1, field)
+            service['pcm_service'][field] = original
+        for field in ('request_seq', 'formation', 'master_session'):
+            service['pcm_service'][field] = 0
+            self.assertEqual(len(graph.build_graph(snapshots, [])['edges']), 1, field)
+            service['pcm_service'][field] = key[field]
+        service['stable'] = False
+        self.assertEqual(graph.build_graph(snapshots, [])['edges'], [])
+
+    def test_capture_queries_service_tag_without_a_wait_or_hold(self):
+        tag = [1,2,3,4,5]
+        class Reader:
+            def __init__(self, node, directory): self.node = node['node']
+            def query(self, sql, deadline):
+                if sql.endswith('_prepare()'): return 't'
+                if 'pgrac_wg_block(' in sql:
+                    return graph.json.dumps(dict(kind='pcm', node=self.node, status=2))
+                return graph.json.dumps(dict(node=self.node, epoch_begin=7, epoch_end=7, stats={},
+                    owners=[dict(node=self.node, pid=10+self.node, procno=1, backend_id=-1,
+                                 backend_start=0, proc_generation=17, pcm_service=dict(tag=tag))]))
+            def close(self): pass
+        with tempfile.TemporaryDirectory() as directory, patch.object(graph, 'PsqlReader', Reader):
+            session = graph.CaptureSession([dict(node=n, connstr=str(n)) for n in range(4)], Path(directory)/'capture')
+            try:
+                self.assertFalse(session.capture()['complete'])
+                raw = graph.json.loads((session.output/'capture.json').read_text())
+                self.assertEqual(raw['resource_keys'], [['pcm', tag]])
+                self.assertEqual(len(raw['resources']), 2)
+            finally:
+                session.close()
+
     def test_native_content_cycle_requires_real_owner_modes(self):
         owners = [dict(node=0, pid=10, procno=1, backend_id=2, backend_start=3, proc_generation=17,
                        locks=[dict(tag=[1, 2, 3, 0, 5], mode=0)],

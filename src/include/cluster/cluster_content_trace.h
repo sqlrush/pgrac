@@ -88,6 +88,14 @@ typedef struct ClusterContentTraceGrant {
 	int32 mode;
 } ClusterContentTraceGrant;
 
+/* Caller-stack diagnostic lifetime only. ERROR cleanup invalidates serials;
+ * unwinding an older scope must not resurrect a cleared outer service. */
+typedef struct ClusterContentTraceServiceScope {
+	uint64 serial, previous_serial;
+	bool previous_active;
+	ClusterWaitTrace previous;
+} ClusterContentTraceServiceScope;
+
 typedef struct ClusterContentTracePairCycleData {
 	uint64 invocation, cycle;
 	ClusterContentTraceLock targets[2];
@@ -112,11 +120,12 @@ typedef struct ClusterContentTraceOwner {
 	uint32 nlocks, omitted_locks, wait_mask;
 	uint32 ngrants, omitted_grants;
 	ClusterContentTraceGrant grants[CLUSTER_CONTENT_TRACE_GRANTS];
-	bool native_waiting, enqueue_waiting;
+	bool native_waiting, enqueue_waiting, pcm_serving;
 	ClusterContentTraceLock native_wait;
 	ClusterContentTraceEnqueue enqueue;
 	ClusterContentTraceLock locks[CLUSTER_CONTENT_TRACE_LOCKS];
 	ClusterWaitTrace waits[CLCONTENT_NWAITS];
+	ClusterWaitTrace pcm_service;
 } ClusterContentTraceOwner;
 
 /* A non-atomic, bounded cut. busy/changed/dead/omitted mean UNKNOWN, never
@@ -155,6 +164,9 @@ extern void cluster_content_trace_enqueue_releasing(const struct ClusterResId *r
 extern void cluster_content_trace_wait_set(ClusterContentTraceWait kind,
 	const ClusterWaitTrace *wait);
 extern void cluster_content_trace_wait_clear(ClusterContentTraceWait kind);
+extern void cluster_content_trace_service_begin(ClusterContentTraceServiceScope *scope,
+	const ClusterWaitTrace *service);
+extern void cluster_content_trace_service_end(ClusterContentTraceServiceScope *scope);
 extern void cluster_content_trace_error_cleanup(void);
 extern void cluster_content_trace_pair(Buffer target, bool missed);
 extern void cluster_content_trace_pair_begin(Buffer first, Buffer second);

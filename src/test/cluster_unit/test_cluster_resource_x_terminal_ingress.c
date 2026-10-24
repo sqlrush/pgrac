@@ -11,6 +11,7 @@
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_content_trace.h"
 #include "miscadmin.h"
 #include "storage/proc.h"
 #include "unit_test.h"
@@ -658,6 +659,19 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 	authority_mutations++;
 	return RESOURCE_X_APPLY_APPLIED;
 }
+
+/* Service-scope behavior executes in test_cluster_pcm_service_trace. This
+ * fixture keeps the original native mutation boundary for routing tests. */
+static ResourceXApplyResult
+gcs_block_pcm_x_resource_x_source_block_to_n_observed(
+	const ResourceXDecodedFrame *frame, int32 node, uint64 r4)
+{
+	return gcs_block_pcm_x_resource_x_source_block_to_n(frame, node, r4);
+}
+
+bool cluster_content_trace_pair_active(Buffer target pg_attribute_unused()) { return false; }
+void cluster_content_trace_pair_request(Buffer target pg_attribute_unused(),
+	const ClusterContentTracePairRequest *request pg_attribute_unused()) {}
 
 static ResourceXApplyResult
 gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
@@ -1844,6 +1858,9 @@ UT_TEST(test_actual_foreground_retained_and_predecessor_wait_reobserve_without_f
 static ResourceXApplyResult
 run_actual_dispatch_observation(ResourceXBootstrapRoundAction action, bool join_only)
 {
+	BufferDesc descriptor = {0};
+	BufferDesc *buf = &descriptor;
+	ClusterPcmOwnSnapshot own = {0};
 	ClusterSemanticAdmissionToken admission = { .entered = true };
 	BufferTag resource = { 0 };
 	ResourceXGateSnapshot gate = { 0 }, rebound_gate;

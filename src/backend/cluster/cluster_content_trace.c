@@ -34,6 +34,7 @@ static uint32 pair_depth;
 static bool pair_recording;
 static int pair_slot = -1;
 static Buffer pair_buffers[2];
+static uint64 service_serial, service_current;
 
 static Size
 content_trace_size(void)
@@ -330,6 +331,45 @@ cluster_content_trace_wait_clear(ClusterContentTraceWait kind)
 }
 
 void
+cluster_content_trace_service_begin(ClusterContentTraceServiceScope *scope,
+	const ClusterWaitTrace *service)
+{
+	memset(scope, 0, sizeof(*scope));
+	if (!cluster_trace_tx_identity || service == NULL)
+		return;
+	/* Exhaustion cannot create an alias to an outstanding diagnostic scope. */
+	if (service_serial == PG_UINT64_MAX) {
+		service_current = 0;
+		local_owner.pcm_serving = false;
+		memset(&local_owner.pcm_service, 0, sizeof(local_owner.pcm_service));
+		content_trace_publish(false);
+		return;
+	}
+	scope->serial = ++service_serial;
+	scope->previous_serial = service_current;
+	scope->previous_active = local_owner.pcm_serving;
+	scope->previous = local_owner.pcm_service;
+	service_current = scope->serial;
+	local_owner.pcm_service = *service;
+	local_owner.pcm_serving = true;
+	content_trace_publish(false);
+}
+
+void
+cluster_content_trace_service_end(ClusterContentTraceServiceScope *scope)
+{
+	if (scope->serial == 0)
+		return;
+	if (service_current == scope->serial) {
+		service_current = scope->previous_serial;
+		local_owner.pcm_serving = scope->previous_active;
+		local_owner.pcm_service = scope->previous;
+		content_trace_publish(false);
+	}
+	scope->serial = 0;
+}
+
+void
 cluster_content_trace_error_cleanup(void)
 {
 	if (pair_recording && pair_slot >= 0) {
@@ -341,6 +381,9 @@ cluster_content_trace_error_cleanup(void)
 	pair_slot = -1;
 	local_owner.wait_mask = 0;
 	local_owner.native_waiting = local_owner.enqueue_waiting = false;
+	service_current = 0;
+	local_owner.pcm_serving = false;
+	memset(&local_owner.pcm_service, 0, sizeof(local_owner.pcm_service));
 	memset(&local_owner.native_wait, 0, sizeof(local_owner.native_wait));
 	memset(&local_owner.enqueue, 0, sizeof(local_owner.enqueue));
 	content_trace_publish(false);

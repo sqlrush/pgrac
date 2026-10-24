@@ -10075,6 +10075,34 @@ gcs_block_pcm_trace_refusal(const ClusterPcmOwnFinishRefusal *refusal)
 	}
 }
 
+/* Live call identity, never a resource grant or transport receipt. No log
+ * budget, allocation, new authority lookup or waiting in this publisher. */
+static void
+gcs_block_pcm_service_begin(ClusterContentTraceServiceScope *scope,
+	const ResourceXDecodedCommon *common, ClusterWaitTraceSite site,
+	int32 master_node, uint64 r4)
+{
+	ClusterWaitTrace service = {0};
+
+	service.site = site;
+	service.tag = common->logical_assertion.resource;
+	service.tag_known = true;
+	service.requester = common->logical_assertion.requester_node;
+	service.request_seq = common->assertion_sequence;
+	service.request_known = common->assertion_sequence != 0;
+	service.formation = common->resource_formation;
+	service.master_session = common->master_session_incarnation;
+	service.base = common->base_authority_generation;
+	/* This is the master's wire sender, never the requester connection. */
+	service.wire_sender_connection = common->sender_connection_generation;
+	service.expected_master = master_node;
+	service.r4 = r4;
+	service.source = common->action_node;
+	service.mode = common->target_mode;
+	service.state = common->observed_mode;
+	cluster_content_trace_service_begin(scope, &service);
+}
+
 /* The initial callback and the winning LMS retry use one finish/publish
  * boundary. Ownership of the supplied pin and local handle moves into this
  * call; the caller must return immediately and must not unwind them again.
@@ -10292,6 +10320,40 @@ source_finish_refusal_done:
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
 	return result;
+}
+
+/* The original finish retains all native pin/owner and ERROR obligations.
+ * This wrapper only retires its diagnostic scope, including nested calls. */
+static ResourceXApplyResult
+gcs_block_resource_x_source_finish_owned_observed(
+	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
+	uint64 writer_r4_generation, BufferDesc *buf, ClusterPcmOwnSnapshot revoking,
+	const ResourceXDecodedFrame *image, ClusterPcmOwnHeldXRevoke held_x_revoke,
+	ResourceXLocalOwnerHandle target_revoke_owner, volatile bool held_x_revoke_active,
+	bool target_revoke_owner_held, bool tagless_target_x, bool target_x_drop,
+	ResourceXApplyResult result)
+{
+	ClusterContentTraceServiceScope scope;
+	volatile ResourceXApplyResult observed;
+
+	if (!cluster_trace_tx_identity || block == NULL)
+		return gcs_block_resource_x_source_finish_owned(block, authenticated_master_node,
+			writer_r4_generation, buf, revoking, image, held_x_revoke, target_revoke_owner,
+			held_x_revoke_active, target_revoke_owner_held, tagless_target_x, target_x_drop, result);
+	gcs_block_pcm_service_begin(&scope, &block->common, CLWAIT_SITE_PCM_SOURCE_FINISH,
+		authenticated_master_node, writer_r4_generation);
+	PG_TRY();
+	{
+		observed = gcs_block_resource_x_source_finish_owned(block, authenticated_master_node,
+			writer_r4_generation, buf, revoking, image, held_x_revoke, target_revoke_owner,
+			held_x_revoke_active, target_revoke_owner_held, tagless_target_x, target_x_drop, result);
+	}
+	PG_FINALLY();
+	{
+		cluster_content_trace_service_end(&scope);
+	}
+	PG_END_TRY();
+	return observed;
 }
 
 static ResourceXApplyResult
@@ -10859,7 +10921,7 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 		return result;
 	}
 
-	return gcs_block_resource_x_source_finish_owned(
+	return gcs_block_resource_x_source_finish_owned_observed(
 		block, authenticated_master_node, writer_r4_generation, buf, revoking, &image,
 		held_x_revoke, target_revoke_owner, held_x_revoke_active, target_revoke_owner_held,
 		tagless_target_x, target_x_drop, result);
@@ -10920,6 +10982,33 @@ pre_retained_done:
 		cluster_wait_trace_emit(CLWAIT_PCM_GUARD, &retained_drain_trace);
 	cluster_content_trace_emit(&retained_drain_trace, &retained_content_cut);
 	return failure_result;
+}
+
+/* Deferred work alone has no executor PID. Publish only while the native
+ * source service actually runs on this process, and retire before returning. */
+static ResourceXApplyResult
+gcs_block_pcm_x_resource_x_source_block_to_n_observed(const ResourceXDecodedFrame *block,
+	int32 authenticated_master_node, uint64 r4_record_generation)
+{
+	ClusterContentTraceServiceScope scope;
+	volatile ResourceXApplyResult result;
+
+	if (!cluster_trace_tx_identity || block == NULL)
+		return gcs_block_pcm_x_resource_x_source_block_to_n(block, authenticated_master_node,
+			r4_record_generation);
+	gcs_block_pcm_service_begin(&scope, &block->common, CLWAIT_SITE_PCM_SOURCE_SERVICE,
+		authenticated_master_node, r4_record_generation);
+	PG_TRY();
+	{
+		result = gcs_block_pcm_x_resource_x_source_block_to_n(block, authenticated_master_node,
+			r4_record_generation);
+	}
+	PG_FINALLY();
+	{
+		cluster_content_trace_service_end(&scope);
+	}
+	PG_END_TRY();
+	return result;
 }
 
 /* Install the exact retained remote carrier while the target is still a
@@ -13020,7 +13109,7 @@ gcs_block_resource_x_source_finish_run_exact(const ResourceXAcquisitionRef *ref,
 		(void)gcs_block_resource_x_terminal_owner_release(&claim.owner, &owner_held);
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
-	return gcs_block_resource_x_source_finish_owned(
+	return gcs_block_resource_x_source_finish_owned_observed(
 		&claim.block, master_node, admission->record_generation,
 		GetBufferDescriptor(claim.buffer_id), held.revoking, &claim.image, held, claim.owner, true,
 		true, true, false, RESOURCE_X_APPLY_APPLIED);
@@ -13124,7 +13213,7 @@ cluster_gcs_block_resource_x_source_drain_tick(const ResourceXSourceDrainWork *w
 				block.kind = RESOURCE_X_WIRE_BLOCK_TO_N;
 				block.payload_bytes = RESOURCE_X_CONTROL_V1_BYTES;
 				block.common = work->request;
-				result = gcs_block_pcm_x_resource_x_source_block_to_n(
+				result = gcs_block_pcm_x_resource_x_source_block_to_n_observed(
 					&block, master, admission.record_generation);
 			}
 		}
@@ -13444,7 +13533,7 @@ gcs_block_resource_x_type17_ingress(const ClusterICEnvelope *env,
 			if ((frame->common.observed_mode == (uint8)PCM_STATE_X
 				 || frame->common.observed_mode == (uint8)PCM_STATE_S)
 				&& frame->common.source_candidate == 1 && frame->common.retain_pi_if_dirty == 1) {
-				result = gcs_block_pcm_x_resource_x_source_block_to_n(frame, master_node,
+				result = gcs_block_pcm_x_resource_x_source_block_to_n_observed(frame, master_node,
 																	  admission.record_generation);
 				if (result == RESOURCE_X_APPLY_BAD_STATE && frame->common.observed_mode == PCM_STATE_X)
 					(void)cluster_pcm_lock_resource_x_source_drain_defer_exact(
