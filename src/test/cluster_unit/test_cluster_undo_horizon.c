@@ -92,6 +92,7 @@ static bool test_v2_cap_change_on_recheck;
 static int32 test_v2_peer = 1;
 static ClusterUndoCleanerActiveSample test_sender_sample;
 static bool test_sender_sample_valid, test_sender_sample_current = true;
+static uint64 test_registration_generation = 1;
 static bool test_sender_change_on_recheck;
 static unsigned test_v2_sends;
 static ClusterHeapFreezeReportV2 test_v2_sent;
@@ -134,6 +135,16 @@ cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out)
 	return true;
 }
 
+/* Actual shared registration/scanning is exercised by ctrc_cleaner.
+ * This leaf models the same retained cut without resampling PGPROC/N/H. */
+bool
+cluster_ctrc_active_scan_registration_current(const ClusterCtrcActiveScan *scan)
+{
+	return scan != NULL && scan->unqualified_registration_generation != 0
+		&& scan->unqualified_registration_generation != UINT64_MAX
+		&& scan->unqualified_registration_generation == test_registration_generation;
+}
+
 bool
 cluster_undo_cleaner_active_sample_current(const ClusterUndoCleanerActiveSample *expected)
 {
@@ -142,6 +153,7 @@ cluster_undo_cleaner_active_sample_current(const ClusterUndoCleanerActiveSample 
 	test_horizon_now += test_source_current_clock_shift;
 	test_source_current_clock_shift = 0;
 	return test_sender_sample_current && expected->sample_id == test_sender_sample.sample_id
+		   && cluster_ctrc_active_scan_registration_current(&expected->scan)
 		   && cluster_semantic_activation_active_sample_current(&expected->admission_fence);
 }
 
@@ -185,6 +197,8 @@ cluster_sf_peer_capability_generation_matches(int32 peer, uint32 required, uint3
 				pg_atomic_fetch_add_u32(&test_horizon_store.freeze_slots[changed].seq, 2);
 			else if (test_cohort_change == 3)
 				test_v2_fence.admission_publication_seq += 2;
+			else if (test_cohort_change == 5)
+				test_registration_generation++;
 			else if (test_cohort_change == 4) {
 				test_horizon_store.freeze_watermark.publication_sequence++;
 				pg_atomic_fetch_add_u32(&test_horizon_store.freeze_watermark_seq, 2);
@@ -374,6 +388,7 @@ reset_v2_receiver(void)
 	test_cohort_all_caps = false;
 	test_cohort_trigger_peer = test_cohort_changed_peer = -1;
 	test_cohort_change = 0;
+	test_registration_generation = 1;
 	test_cohort_clock_shift = 0;
 	test_source_current_clock_shift = 0;
 	test_v2_source = (ClusterICControlIngress){ .serial = 19,
@@ -939,6 +954,7 @@ reset_v2_sender(void)
 	(void)reset_v2_receiver();
 	MemSet(&test_sender_sample, 0, sizeof(test_sender_sample));
 	test_sender_sample.scan.status = CTRC_ACTIVE_SCAN_COMPLETE;
+	test_sender_sample.scan.unqualified_registration_generation = test_registration_generation;
 	test_sender_sample.scan.reference_full = FullTransactionIdFromEpochAndXid(1, 4096);
 	test_sender_sample.scan.future_full = FullTransactionIdFromEpochAndXid(1, 4096);
 	test_sender_sample.scan.min_full = FullTransactionIdFromEpochAndXid(1, 256);
@@ -2686,10 +2702,74 @@ UT_TEST(test_v2_watermark_reader_retries_own_publication_after_callbacks)
 	UT_ASSERT(memcmp(&out, &test_horizon_store.freeze_watermark, sizeof(out)) == 0);
 }
 
+
+/* Inject registration after the real caller's local getter and during
+ * original peer validation. It does not replace the actual caller body. */
+static void
+revoke_registration_at_last_required_peer(void)
+{
+	test_cohort_trigger_peer = 65;
+	test_cohort_changed_peer = 1;
+	test_cohort_change = 5;
+}
+
+UT_TEST(test_saved_cohort_rejects_registration_after_local_check)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
+	ClusterHeapFreezeCohortObservation cohort;
+
+	cohort_receive(65, report);
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&cohort), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	revoke_registration_at_last_required_peer();
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_current(&cohort),
+		CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED);
+	UT_ASSERT_EQ(test_registration_generation, 2);
+	UT_ASSERT_EQ(cohort.source_local_sample_id, test_sender_sample.sample_id);
+}
+
+UT_TEST(test_watermark_publisher_keeps_old_candidate_on_late_registration)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
+	ClusterHeapFreezeCohortObservation cohort;
+	UndoHorizonV2MaintenanceObservation observed;
+	ClusterHeapFreezeWatermark old;
+	uint32 old_seq;
+
+	cohort_receive(65, report);
+	UT_ASSERT_EQ(undo_horizon_v2_cohort_observe(&cohort, NULL, &observed),
+		CLUSTER_HEAP_FREEZE_COHORT_READY);
+	UT_ASSERT(undo_horizon_publish_freeze_watermark(&cohort, &observed, test_horizon_now));
+	old = test_horizon_store.freeze_watermark;
+	old_seq = pg_atomic_read_u32(&test_horizon_store.freeze_watermark_seq);
+	revoke_registration_at_last_required_peer();
+	UT_ASSERT(!undo_horizon_publish_freeze_watermark(&cohort, &observed, test_horizon_now + 1));
+	UT_ASSERT(memcmp(&old, &test_horizon_store.freeze_watermark, sizeof(old)) == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&test_horizon_store.freeze_watermark_seq), old_seq);
+	UT_ASSERT_EQ(test_registration_generation, 2);
+}
+
+UT_TEST(test_watermark_reader_clears_output_on_late_registration)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
+	ClusterHeapFreezeWatermark out, zero = {0};
+	uint64 sample_id;
+
+	cohort_receive(65, report);
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT(cluster_heap_freeze_watermark_sample(&out));
+	sample_id = out.f_sample_id;
+	revoke_registration_at_last_required_peer();
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT(!cluster_heap_freeze_watermark_sample(&out));
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	UT_ASSERT_EQ(test_registration_generation, 2);
+	UT_ASSERT_EQ(test_sender_sample.sample_id, sample_id);
+}
+
 int
 main(void)
 {
-	UT_PLAN(99);
+	UT_PLAN(102);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -2787,6 +2867,9 @@ main(void)
 	UT_RUN(test_v2_watermark_publish_rejects_retired_source_without_sequence_debt);
 	UT_RUN(test_v2_watermark_publish_rechecks_source_after_identity_callbacks);
 	UT_RUN(test_v2_watermark_reader_retries_own_publication_after_callbacks);
+	UT_RUN(test_saved_cohort_rejects_registration_after_local_check);
+	UT_RUN(test_watermark_publisher_keeps_old_candidate_on_late_registration);
+	UT_RUN(test_watermark_reader_clears_output_on_late_registration);
 	UT_RUN(test_v2_lmon_counts_missing_local_history_without_sending);
 	UT_RUN(test_v2_lmon_records_real_cohort_refusals);
 	UT_RUN(test_v2_lmon_observation_respects_original_shutdown_and_enable_gates);

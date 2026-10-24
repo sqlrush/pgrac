@@ -926,7 +926,10 @@ cluster_heap_freeze_watermark_sample(ClusterHeapFreezeWatermark *out)
 			|| active.scan.unqualified_entries != 0
 			|| memcmp(&active.admission_fence, &fence, sizeof(fence)) != 0
 			|| !cluster_undo_cleaner_active_sample_current(&active)
-			|| !undo_horizon_watermark_sources_current(&fence, sources))
+			|| !undo_horizon_watermark_sources_current(&fence, sources)
+			/* Peer observers may overlap new unknown local registration.
+			 * This last read has no callbacks, locks, or replacement sample. */
+			|| !cluster_ctrc_active_scan_registration_current(&active.scan))
 			continue;
 		/* Connection/admission observers may overlap another publication.
 		 * Never return bytes from an earlier cut after those callbacks. */
@@ -1164,7 +1167,9 @@ undo_horizon_publish_freeze_watermark(const ClusterHeapFreezeCohortObservation *
 		|| cohort->admitted_members_hi != observed->fence.admitted_members_hi
 		|| memcmp(&active.admission_fence, &observed->fence, sizeof(active.admission_fence)) != 0
 		|| !cluster_undo_cleaner_active_sample_current(&active)
-		|| !undo_horizon_watermark_sources_current(&observed->fence, cohort->source_peers))
+		|| !undo_horizon_watermark_sources_current(&observed->fence, cohort->source_peers)
+		/* Keep the old candidate if peer validation overlapped local ingress. */
+		|| !cluster_ctrc_active_scan_registration_current(&active.scan))
 		return false;
 	seq = pg_atomic_read_u32(&UndoHorizonShmem->freeze_watermark_seq);
 	if ((seq & 1) != 0 || seq >= UINT32_MAX - 1)
@@ -1205,6 +1210,7 @@ ClusterHeapFreezeCohortStatus
 cluster_heap_freeze_cohort_current(const ClusterHeapFreezeCohortObservation *expected)
 {
 	ClusterUndoCleanerActiveSample active;
+	ClusterHeapFreezeCohortStatus status;
 	const ClusterSemanticActiveSampleFence *fence;
 	int32 peer;
 
@@ -1242,8 +1248,15 @@ cluster_heap_freeze_cohort_current(const ClusterHeapFreezeCohortObservation *exp
 		|| memcmp(&active.admission_fence, fence, sizeof(*fence)) != 0
 		|| !cluster_undo_cleaner_active_sample_current(&active))
 		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
-	return undo_horizon_v2_cohort_current(fence, expected->source_peers,
+	status = undo_horizon_v2_cohort_current(fence, expected->source_peers,
 		(TimestampTz)expected->source_started_at_us, expected->source_interval_ms);
+	if (status != CLUSTER_HEAP_FREEZE_COHORT_READY)
+		return status;
+	/* The original local getter ran before peer observers. Recheck only
+	 * its retained ingress cut now; never resample N/PGPROC/H or a peer. */
+	if (!cluster_ctrc_active_scan_registration_current(&active.scan))
+		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
+	return CLUSTER_HEAP_FREEZE_COHORT_READY;
 }
 
 bool
