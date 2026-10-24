@@ -260,6 +260,7 @@ UT_TEST(test_origin_build_error_keeps_output_and_original_pins)
 static ClusterControlRootSnapshot execution_root;
 static ClusterControlRootReadToken execution_token;
 static unsigned execution_fault, execution_visits, execution_records;
+static void (*execution_checkpoint_after_hook)(void);
 typedef struct ExecutionCheckpointDelivery {
 	ClusterWalRecoveryCheckpointV1 checkpoint;
 	ClusterUndoRecoveryCheckpointVisitorV1 visitor;
@@ -315,6 +316,8 @@ cluster_undo_recovery_cold_checkpoint_visit_v1(int origin,
 		ereport(ERROR, (errmsg("injected execution-owner post-visit ERROR")));
 	if (execution_fault == 7)
 		MyBackendType = B_BG_WORKER;
+	if (execution_checkpoint_after_hook != NULL)
+		execution_checkpoint_after_hook();
 	return true;
 }
 

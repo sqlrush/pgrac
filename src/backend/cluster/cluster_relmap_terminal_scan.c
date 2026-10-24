@@ -8,6 +8,7 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "cluster/cluster_recovery_record_hash.h"
+#include "cluster/cluster_recovery_wal_targets.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_relmap_lock.h"
@@ -802,6 +803,141 @@ cluster_relmap_recovery_root_open_cold_v1(const ClusterRelmapRecoverySourceObser
 	}
 	PG_END_TRY();
 	return accepted ? fd : -1;
+}
+
+typedef struct RelmapExecutionRootTargets {
+	ClusterRecoveryRootSet *roots;
+	ClusterRelmapRecoverySourceObservationV1 selected;
+	const ClusterRelmapRecoverySourceObservationV1 *borrowed;
+	RfContributorStreamCutV1 cut;
+	size_t payload_budget;
+	ClusterRelmapRecoveryRootTargetsV1 counts;
+	RelmapRetentionCheckpointInput checkpoint_input;
+} RelmapExecutionRootTargets;
+
+static bool
+recovery_root_targets_context(void)
+{
+	return MyBackendType == B_STARTUP && RecoveryInProgress() && CritSectionCount == 0
+		   && cluster_shared_catalog && cluster_recovery_merge_claim_is_held()
+		   && cluster_relmap_authority_x_held();
+}
+
+static bool
+recovery_root_targets_add(uint64 *total, uint32 amount)
+{
+	if (*total > UINT64_MAX - amount)
+		return false;
+	*total += amount;
+	return true;
+}
+
+static bool
+recovery_root_targets_visit(const ClusterWalRecoveryCheckpointV1 *checkpoint,
+							const ClusterControlRootSnapshot *root, uint64 serial,
+							XLogReaderState *reader, void *arg)
+{
+	RelmapExecutionRootTargets *work = arg;
+	const ClusterRelmapRecoverySourceObservationV1 *selected = &work->selected;
+	ClusterWalInputV1 input = { 0 };
+	ClusterRecoveryWalTargetsDiag diag;
+
+	CHECK_FOR_INTERRUPTS();
+	if (serial != selected->scope_serial || !retention_execution_input_set(&input, checkpoint, root)
+		|| memcmp(&checkpoint->source, &selected->source, sizeof(selected->source)) != 0
+		|| memcmp(root, &selected->checkpoint, sizeof(*root)) != 0
+		|| checkpoint->checkpoint.redo != selected->native_redo
+		|| memcmp(work->borrowed, selected, sizeof(*selected)) != 0 || reader == NULL
+		|| reader->record == NULL || reader->cluster_record_crc_failed
+		|| reader->cluster_expected_thread_id != selected->source.claim.identity.origin_thread_id
+		|| work->counts.records == UINT64_MAX || !recovery_root_targets_context())
+		return false;
+	if (work->counts.records == 0)
+		work->checkpoint_input.selected = input;
+	else if (memcmp(&input.native_checkpoint, &work->checkpoint_input.selected.native_checkpoint,
+					sizeof(input.native_checkpoint))
+				 != 0
+			 || memcmp(input.native_window, work->checkpoint_input.selected.native_window,
+					   sizeof(input.native_window))
+					!= 0)
+		return false;
+	/* Match the original checkpoint's exact WAL payload/window as well as
+	 * its shape. All earlier target additions remain provisional. */
+	if (!retention_checkpoint_visit(reader, &work->checkpoint_input)
+		|| !cluster_recovery_wal_targets_collect(work->roots, reader, &selected->source, &work->cut,
+												 work->payload_budget, &diag)
+		|| !recovery_root_targets_context()
+		|| memcmp(work->borrowed, selected, sizeof(*selected)) != 0)
+		return false;
+	if (!recovery_root_targets_add(&work->counts.page_targets, diag.page_targets)
+		|| !recovery_root_targets_add(&work->counts.rebuildable_targets, diag.rebuildable_targets)
+		|| !recovery_root_targets_add(&work->counts.structural_effects, diag.structural_effects)
+		|| !recovery_root_targets_add(&work->counts.undo_targets, diag.undo_targets)
+		|| !recovery_root_targets_add(&work->counts.native_effects, diag.native_effects)
+		|| !recovery_root_targets_add(&work->counts.other_native_effects, diag.other_native_effects)
+		|| !recovery_root_targets_add(&work->counts.unowned_records, diag.unowned_records))
+		return false;
+	work->counts.records++;
+	return true;
+}
+
+bool
+cluster_relmap_recovery_root_targets_cold_v1(ClusterRecoveryRootSet *roots,
+											 const ClusterRelmapRecoverySourceObservationV1 *source,
+											 size_t payload_budget,
+											 ClusterRelmapRecoveryRootTargetsV1 *out)
+{
+	RelmapExecutionRootTargets work = { 0 };
+	volatile bool entered = false, accepted = false;
+
+	if (out == NULL || recovery_overlap(out, sizeof(*out), source, sizeof(*source))
+		|| recovery_overlap(out, sizeof(*out), roots, 1))
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (source == NULL || payload_budget == 0)
+		return false;
+	work.selected = *source;
+	work.borrowed = source;
+	work.roots = roots;
+	work.payload_budget = payload_budget;
+	work.cut.failed_thread = source->source.claim.identity.origin_thread_id;
+	work.cut.timeline_id = source->source.timeline;
+	work.cut.origin_owner_incarnation = source->source.claim.identity.origin_owner_incarnation;
+	work.cut.scan_begin_inclusive = source->checkpoint.checkpoint_lower_lsn;
+	work.cut.scan_end_exclusive = source->checkpoint.validated_tail_lsn_exclusive;
+	work.cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+	PG_TRY();
+	{
+		if (cluster_recovery_root_set_targets_match(
+				roots, work.selected.source.claim.identity.system_identifier,
+				work.selected.source.claim.database_incarnation,
+				work.selected.source.claim.identity.storage_uuid)
+			&& recovery_root_owner_current(&work.selected)
+			&& memcmp(source, &work.selected, sizeof(*source)) == 0) {
+			entered = true;
+			if (cluster_undo_recovery_cold_checkpoint_visit_v1(
+					work.selected.source.claim.identity.origin_node_id, recovery_root_targets_visit,
+					&work)
+				&& work.counts.records != 0 && work.checkpoint_input.checkpoint_seen
+				&& work.checkpoint_input.last_end == work.cut.scan_end_exclusive
+				&& recovery_root_owner_current(&work.selected)
+				&& memcmp(source, &work.selected, sizeof(*source)) == 0
+				&& cluster_recovery_root_set_targets_match(
+					roots, work.selected.source.claim.identity.system_identifier,
+					work.selected.source.claim.database_incarnation,
+					work.selected.source.claim.identity.storage_uuid)) {
+				*out = work.counts;
+				accepted = true;
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		if (entered && !accepted)
+			cluster_recovery_root_set_invalidate(roots);
+	}
+	PG_END_TRY();
+	return accepted;
 }
 
 static bool

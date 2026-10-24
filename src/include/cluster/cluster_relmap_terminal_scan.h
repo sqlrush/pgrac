@@ -57,6 +57,25 @@ extern bool cluster_relmap_recovery_retention_build_start_cold_source_v1(
  * PG_FINALLY and before the original fd.c lifetime ends. No live caller. */
 extern int cluster_relmap_recovery_root_open_cold_v1(
 	const struct ClusterRelmapRecoverySourceObservationV1 *source);
+struct ClusterRecoveryRootSet;
+typedef struct ClusterRelmapRecoveryRootTargetsV1 {
+	uint64 records, page_targets, rebuildable_targets, structural_effects;
+	uint64 undo_targets, native_effects, other_native_effects, unowned_records;
+} ClusterRelmapRecoveryRootTargetsV1;
+/* Dormant original single-source execution owner: enumerate its complete
+ * retained WAL into an unstarted matching held-fd ROOT, before physical scan.
+ * Preserve missing/beyond-EOF targets and report unresolved non-file/unowned
+ * effects; these counts confer no semantic/native/isolation/completion proof.
+ * Original source/full ROOT/redo/serial and ownership bracket the visit.
+ * Missing initial gates/wrong ROOT stage leave ROOT unchanged; entered
+ * false/ERROR invalidates every partial target, never original pins/debt.
+ * Distinct refusal clears out; known source/ROOT-start overlap refuses
+ * unchanged. All storage is exclusive, original owner/cuts/protections/fd
+ * remain held through downstream use. No new scope/pin, apply or live caller. */
+extern bool cluster_relmap_recovery_root_targets_cold_v1(
+	struct ClusterRecoveryRootSet *roots,
+	const struct ClusterRelmapRecoverySourceObservationV1 *source, size_t payload_budget,
+	ClusterRelmapRecoveryRootTargetsV1 *out);
 typedef struct ClusterRelmapTerminalObservationV1 {
 	ClusterWalSourceRef source;
 	ClusterRelmapCheckpointWindow window;

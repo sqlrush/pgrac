@@ -3372,6 +3372,7 @@ UT_TEST(test_terminal_read_native_error_keeps_output_zero_and_custody_dead)
 
 #include "test_cluster_relmap_origin_build.inc"
 #include "test_cluster_relmap_execution_custody.inc"
+#include "test_cluster_relmap_execution_targets.inc"
 
 int
 main(int argc, char **argv)
@@ -3380,7 +3381,14 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(90);
+	UT_PLAN(97);
+	UT_RUN(test_execution_targets_preserve_real_wal_missing_and_short_files);
+	UT_RUN(test_execution_targets_missing_initial_gates_leave_root_unchanged);
+	UT_RUN(test_execution_targets_invalid_source_leaves_unstarted_root);
+	UT_RUN(test_execution_targets_late_visit_refusal_or_error_revokes_partial_root);
+	UT_RUN(test_execution_targets_payload_refusal_preserves_original_owner);
+	UT_RUN(test_execution_targets_late_context_or_input_drift_revokes_root);
+	UT_RUN(test_execution_targets_alias_and_started_root_refuse_safely);
 	UT_RUN(test_custody_source_observes_original_tuple_without_native_page_io);
 	UT_RUN(test_custody_source_refusal_and_error_are_sticky);
 	UT_RUN(test_custody_source_alias_refusal_keeps_handle_usable);
