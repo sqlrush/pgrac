@@ -87,6 +87,7 @@ typedef struct ClusterWalRecoveryCheckpointV1 {
 	ClusterWalSourceRef source;
 	XLogRecPtr checkpoint_start;
 	CheckPoint checkpoint;
+	uint8 native_window[160]; /* Provisional same-anchor observation, not authority. */
 } ClusterWalRecoveryCheckpointV1;
 
 extern ClusterControlRootResult

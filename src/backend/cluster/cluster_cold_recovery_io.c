@@ -38,6 +38,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_relmap_checkpoint.h"
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -340,6 +341,7 @@ typedef struct ColdScanWork {
 	ClusterWalRecoveryCheckpointV1 checkpoint;
 	bool checkpoint_required;
 	bool checkpoint_seen;
+	ClusterControlRootIdentity source_identity;
 	ClusterColdDecodedV1 decoded;
 } ColdScanWork;
 
@@ -365,6 +367,21 @@ cold_scan_visit(XLogReaderState *reader, void *arg)
 			work->detail = CLUSTER_COLD_SOURCE_GAP;
 			work->result->failed_read_rec_ptr = reader->ReadRecPtr;
 			return false;
+		}
+		{
+			const uint8 zero[160] = { 0 };
+			ClusterRelmapCheckpointWindow window;
+			if (memcmp(work->checkpoint.native_window, zero, 160) != 0
+				&& (!cluster_control_root_identity_equal(&work->source_identity,
+														 &work->checkpoint.source.claim.identity)
+					|| !cluster_relmap_checkpoint_window_decode_v1(
+						work->checkpoint.native_window, &work->checkpoint.checkpoint,
+						reader->ReadRecPtr, reader->EndRecPtr, &work->source_identity,
+						work->checkpoint.source.claim.database_incarnation, &window))) {
+				work->detail = CLUSTER_COLD_SOURCE_GAP;
+				work->result->failed_read_rec_ptr = reader->ReadRecPtr;
+				return false;
+			}
 		}
 		work->checkpoint_seen = true;
 	}
@@ -438,6 +455,7 @@ cold_scan_work(ClusterColdPlanV1 *plan, uint32 participant, const ClusterControl
 	work->plan = plan;
 	work->participant = participant;
 	work->system_identifier = id->system_identifier;
+	work->source_identity = *id;
 	memcpy(work->storage_uuid, id->storage_uuid, 16);
 	work->space_active = space_active;
 	work->foreign = foreign;
@@ -474,6 +492,9 @@ cold_scan_finish(ColdScanWork *work, ClusterControlRootResult visit,
 		if (cluster_cold_xid_candidate_v1(xid, &xid->source, &next))
 			result->history_xid = *xid;
 	}
+	if (detail == CLUSTER_COLD_OK && work->checkpoint_required && work->checkpoint_seen)
+		memcpy(result->native_window, work->checkpoint.native_window,
+			   sizeof(result->native_window));
 	pfree(work);
 	return detail;
 }
@@ -568,6 +589,8 @@ cluster_cold_scan_input_v1(ClusterColdPlanV1 *plan, uint32 participant, ClusterW
 	input = inputs != NULL ? cluster_wal_inputs_at_v1(inputs, index) : NULL;
 	if (plan == NULL || input == NULL || input->kind != CLUSTER_WAL_INPUT_CHECKPOINT)
 		return CLUSTER_COLD_INVALID_ARGUMENT;
+	checkpoint.source = input->source;
+	memcpy(checkpoint.native_window, input->native_window, sizeof(checkpoint.native_window));
 	checkpoint.checkpoint_start = input->checkpoint_start;
 	memcpy(&checkpoint.checkpoint, &input->native_checkpoint, sizeof(checkpoint.checkpoint));
 	if (!cold_scan_checkpoint_valid(&input->checkpoint, &checkpoint))

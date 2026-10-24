@@ -379,7 +379,8 @@ inputs_checkpoint(ClusterWalInputsV1 *inputs, const WalInputsWork *work,
 	anchor.anchor_generation = record->refs.anchor_generation;
 	memcpy(anchor.anchor_sha256, record->refs.anchor_sha256, 32);
 	memcpy(anchor.claim_sha256, record->refs.claim_sha256, 32);
-	result = cluster_recovery_anchor_v2_read_native_locked(&anchor, &work->common, &native);
+	result = cluster_recovery_anchor_v3_read_native_window_locked(&anchor, &work->common, &native,
+																  item->native_window);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		result = cluster_recovery_anchor_v2_thread_state(&anchor, &record->snapshot, &native);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -1329,6 +1330,7 @@ cluster_wal_inputs_cold_checkpoint_v1(const ClusterControlRootSnapshot *expected
 		out->source = scratch->items[0].source;
 		out->checkpoint_start = scratch->items[0].checkpoint_start;
 		memcpy(&out->checkpoint, &scratch->items[0].native_checkpoint, sizeof(out->checkpoint));
+		memcpy(out->native_window, scratch->items[0].native_window, sizeof(out->native_window));
 	}
 	pfree(work);
 	pfree(scratch);

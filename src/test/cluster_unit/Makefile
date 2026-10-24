@@ -9539,6 +9539,9 @@ test_cluster_cold_recovery_validate: test_cluster_cold_recovery_validate.c unit_
 
 test_cluster_cold_recovery_io_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_io.c \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_tail.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_checkpoint.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_census.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 
@@ -9546,11 +9549,14 @@ test_cluster_cold_recovery_io test_cluster_cold_recovery_complete: %: %.c unit_t
 		test_cluster_cold_recovery_io_boundary.h test_cluster_cold_recovery_io_core.o \
 		test_cluster_cold_recovery_xid_core.o \
 		$(CLUSTER_COLD_PLAN_O) cluster_unit_port_stubs.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o \
+		$(top_builddir)/src/common/libpgcommon.a \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_census.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< test_cluster_cold_recovery_io_core.o \
 		test_cluster_cold_recovery_xid_core.o \
-		$(CLUSTER_COLD_PLAN_O) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$(CLUSTER_COLD_PLAN_O) $(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 test_cluster_recovery_merge_seal test_cluster_recovery_merge_complete: %: %.c unit_test.h \
 		test_cluster_recovery_merge_seal_boundary.h test_cluster_recovery_merge_cold_fixture.h \

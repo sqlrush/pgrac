@@ -21,6 +21,7 @@ typedef struct ClusterWalInputV1 {
 	XLogRecPtr checkpoint_start;
 	XLogRecPtr native_redo;
 	CheckPoint native_checkpoint; /* complete original immutable-anchor input */
+	uint8 native_window[160];	  /* Same selected anchor; zero is unqualified legacy. */
 	/* Only the terminal alternative uses these fields. It has no checkpoint. */
 	XLogRecPtr first_segment;
 	ClusterWalStartupObservation terminal;

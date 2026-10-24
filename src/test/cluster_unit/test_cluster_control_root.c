@@ -22588,6 +22588,74 @@ inputs_cold_checkpoint_done(void)
 	MyBackendType = B_INVALID;
 }
 
+UT_TEST(test_selected_native_window_survives_both_original_checkpoint_selectors)
+{
+	uint8 bytes[66048];
+	ClusterRecoveryAnchorV2 anchors[2];
+	ClusterRelmapCheckpointWindow window = { 0 };
+	ClusterWalInputsV1 *inputs = NULL;
+	ClusterWalInputV1 input;
+	ClusterWalRecoveryCheckpointV1 out, zero = { 0 };
+	ClusterControlRootFileToken token, bad;
+	ClusterControlRootSnapshot expected;
+	ClusterControlRootReadToken read_token;
+	ControlRootImage root;
+	char path[MAXPGPATH];
+	inputs_closed_wal_fixture(bytes, anchors);
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &root), 0);
+	window.system_identifier = anchors[0].identity.system_identifier;
+	window.database_incarnation = anchors[0].database_incarnation;
+	window.origin = anchors[0].identity.origin_node_id;
+	window.admitted_incarnation = anchors[0].identity.origin_owner_incarnation;
+	window.boot_incarnation = 411;
+	window.epoch = 97;
+	window.native_floor = 79;
+	window.last_issued = 99;
+	window.allocation_next = 100;
+	UT_ASSERT(cluster_relmap_checkpoint_window_encode_v1(
+		&window, &anchors[0].checkpoint_copy, anchors[0].checkpoint,
+		root.records[0].validated_tail_lsn_exclusive, anchors[0].native_window));
+	v2_anchor_object(bytes, &anchors[0], &anchors[0].identity, path);
+	v2_write_roots(bytes);
+	test_inputs_startup_cf = true;
+	UT_ASSERT_EQ(inputs_begin_for_role(true, &inputs), 0);
+	if (inputs == NULL)
+		return;
+	input = *cluster_wal_inputs_at_v1(inputs, 0);
+	UT_ASSERT(memcmp(input.native_window, anchors[0].native_window, 160) == 0);
+	UT_ASSERT_EQ(cluster_wal_inputs_root_token_v1(inputs, &token), 0);
+	UT_ASSERT_EQ(cluster_wal_inputs_revalidate_v1(inputs), 0);
+	cluster_wal_inputs_release_v1(&inputs);
+	inputs_pin_held = inputs_pin_current = inputs_pin_refuse = true;
+	UT_ASSERT_EQ(cluster_wal_inputs_cold_checkpoint_v1(&input.checkpoint, &token, &out), 0);
+	UT_ASSERT(memcmp(out.native_window, anchors[0].native_window, 160) == 0);
+	UT_ASSERT(memcmp(&out.checkpoint, &anchors[0].checkpoint_copy, sizeof(out.checkpoint)) == 0);
+	bad = token;
+	bad.image_sha256[0] ^= 1;
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT(cluster_wal_inputs_cold_checkpoint_v1(&input.checkpoint, &bad, &out) != 0);
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	inputs_cold_checkpoint_done();
+	MyBackendType = B_BG_WORKER;
+	/* Same immutable anchor and actual WAL; only original recovery metadata changes. */
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &root), 0);
+	root.records[0].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+	memcpy(bytes, root.bytes, sizeof(bytes));
+	v2_write_roots(bytes);
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_read_canonical(1, &anchors[0].identity, &expected, &read_token), 0);
+	UT_ASSERT_EQ(cluster_control_root_recovery_checkpoint_v1(&expected, &read_token, &out), 0);
+	UT_ASSERT(memcmp(out.native_window, anchors[0].native_window, 160) == 0);
+	((uint8 *)&read_token)[0] ^= 1;
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT(cluster_control_root_recovery_checkpoint_v1(&expected, &read_token, &out) != 0);
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	MyBackendType = B_INVALID;
+}
+
 UT_TEST(test_cold_checkpoint_selects_exact_retained_native_input_without_read_pin)
 {
 	ClusterControlRootFileToken token;
@@ -23579,7 +23647,8 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_COLD_CHECKPOINT") != NULL) {
-		UT_PLAN(4);
+		UT_PLAN(5);
+		UT_RUN(test_selected_native_window_survives_both_original_checkpoint_selectors);
 		UT_RUN(test_cold_checkpoint_selects_exact_retained_native_input_without_read_pin);
 		UT_RUN(test_cold_checkpoint_rejects_changed_root_snapshot_and_role_without_output);
 		UT_RUN(test_cold_checkpoint_requires_physical_claim_and_anchor);
@@ -23656,10 +23725,11 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(471);
+	UT_PLAN(472);
 	UT_RUN(test_cold_sync_retained_files_under_original_owner_without_cf);
 	UT_RUN(test_cold_sync_each_io_failure_root_race_and_error_discard_output);
 	UT_RUN(test_cold_sync_requires_exact_root_fsync_role_and_disjoint_output);
+	UT_RUN(test_selected_native_window_survives_both_original_checkpoint_selectors);
 	UT_RUN(test_cold_checkpoint_selects_exact_retained_native_input_without_read_pin);
 	UT_RUN(test_cold_checkpoint_rejects_changed_root_snapshot_and_role_without_output);
 	UT_RUN(test_cold_checkpoint_requires_physical_claim_and_anchor);

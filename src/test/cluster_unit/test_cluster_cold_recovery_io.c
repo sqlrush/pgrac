@@ -48,6 +48,7 @@
 #include "storage/smgr.h"
 
 #include "unit_test.h"
+#include "cluster/cluster_relmap_checkpoint.h"
 
 UT_DEFINE_GLOBALS();
 
@@ -1246,10 +1247,81 @@ UT_TEST(test_root_scan_captures_original_identity_and_refuses_side_failure)
 	}
 }
 
+
+/* This source observation is not a terminal/COMPLETE or durable-base proof. */
+static void
+native_window_fixture(ClusterWalInputV1 *input, XLogRecPtr end)
+{
+	ClusterRelmapCheckpointWindow window = { 0 };
+	input->source.claim.database_incarnation = 3;
+	window.system_identifier = input->source.claim.identity.system_identifier;
+	window.database_incarnation = 3;
+	window.origin = input->source.claim.identity.origin_node_id;
+	window.admitted_incarnation = input->source.claim.identity.origin_owner_incarnation;
+	window.boot_incarnation = 41; /* Distinct retained boot, not current admission. */
+	window.epoch = 7;
+	window.allocation_next = U64FromFullTransactionId(input->native_checkpoint.nextXid);
+	window.last_issued = window.allocation_next - 1;
+	window.native_floor = window.last_issued - 20;
+	UT_ASSERT(cluster_relmap_checkpoint_window_encode_v1(
+		&window, &input->native_checkpoint, input->checkpoint_start, end, input->native_window));
+}
+
+UT_TEST(test_native_window_exports_only_after_complete_original_retained_visit)
+{
+	for (unsigned route = 0; route < 2; route++)
+		for (unsigned fault = 0; fault < 10; fault++) {
+			ClusterColdScanResultV1 result;
+			ClusterColdPlanV1 *plan;
+			ClusterWalInputV1 *input;
+			ClusterControlRootReadToken token = { 0 };
+			ClusterColdDetailV1 detail;
+			uint8 zero[160] = { 0 };
+			scope_reset();
+			input = generation(2, 12, false, REQUIRED, 0x1000, 0x1000, 0x1300);
+			scan_reset();
+			scoped_checkpoint_wal(input);
+			native_window_fixture(input, 0x1100 + (fault == 1));
+			if (fault == 2)
+				visit_result = retained_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			else if (fault == 3)
+				observed_end--;
+			else if (fault == 4)
+				observed_records_delta = 1;
+			else if (fault == 5)
+				decode_refusal_at[1] = CLUSTER_COLD_OPCODE_UNSUPPORTED;
+			else if (fault == 6)
+				input->native_window[159] ^= 1;
+			else if (fault == 7)
+				input->source.claim.identity.origin_owner_incarnation++;
+			else if (fault == 8)
+				input->source.claim.database_incarnation++;
+			else if (fault == 9)
+				memset(input->native_window, 0, 160); /* Legacy remains unqualified. */
+			plan = scan_plan();
+			if (route) {
+				selected_checkpoint.source = input->source;
+				selected_checkpoint.checkpoint_start = input->checkpoint_start;
+				selected_checkpoint.checkpoint = input->native_checkpoint;
+				memcpy(selected_checkpoint.native_window, input->native_window, 160);
+				detail = cluster_cold_scan_root_v1(plan, 0, &input->checkpoint, &token, false, true,
+												   NULL, &result);
+			} else
+				detail = cluster_cold_scan_input_v1(plan, 0, SCOPE, 0, false, true, NULL, &result);
+			UT_ASSERT_EQ(detail, fault == 0 || fault == 9 ? CLUSTER_COLD_OK
+								 : fault == 5			  ? CLUSTER_COLD_OPCODE_UNSUPPORTED
+														  : CLUSTER_COLD_SOURCE_GAP);
+			UT_ASSERT(memcmp(result.native_window, fault == 0 ? input->native_window : zero, 160)
+					  == 0);
+			cluster_cold_plan_destroy_v1(&plan);
+		}
+}
+
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(25);
+	UT_RUN(test_native_window_exports_only_after_complete_original_retained_visit);
 	UT_RUN(test_root_checkpoint_copy_matches_every_native_byte);
 	UT_RUN(test_root_checkpoint_requires_exact_native_record_and_address);
 	UT_RUN(test_root_checkpoint_selection_failure_does_not_feed_records);
