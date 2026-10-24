@@ -74,6 +74,7 @@
 
 #include "unit_test.h"
 #include "test_cluster_data_sync_policy.inc"
+#define CLUSTER_EXTENSION_TARGET_FIXTURE
 #include "test_cluster_drop_work_unavailable.h"
 #include "storage/sync.h"
 
@@ -106,6 +107,16 @@ static int open_calls;
 static int io_fault;
 static bool reject_direct_open;
 static const void *last_io_buffer;
+static bool extension_target;
+static RelFileLocator extension_locator;
+static BlockNumber extension_block;
+
+bool
+cluster_ko_extend_recovery_target_v3(RelFileLocator locator, ForkNumber fork, BlockNumber block)
+{
+	return extension_target && fork == MAIN_FORKNUM && block == extension_block
+		&& RelFileLocatorEquals(locator, extension_locator);
+}
 
 /* Scripted FileSize/pg_usleep surface for the concurrent-extend EOF tests. */
 static off_t file_size_script[8];
@@ -679,6 +690,89 @@ UT_TEST(test_sharedfs_extend_zero_fills)
 	ops->unlink(rl, MAIN_FORKNUM);
 }
 
+UT_TEST(test_failed_extension_allocation_preserves_data_and_later_eof)
+{
+	const ClusterSharedFsOps *ops = &cluster_shared_fs_sharedfs_ops;
+	RelFileLocator locator = {1663, 5, 24590};
+	ClusterSharedFsHandle *handle = NULL;
+	PGAlignedBlock original, actual, zero = {0};
+
+	fresh_root("extension_preserve");
+	memset(original.data, 0x5a, BLCKSZ);
+	ops->create(locator, MAIN_FORKNUM, false, &handle);
+	UT_ASSERT_EQ(ops->write(handle, 2, original.data), BLCKSZ);
+	extension_target = true;
+	extension_locator = locator;
+	extension_block = 2;
+#if defined(__linux__)
+	UT_ASSERT(cluster_shared_fs_sharedfs_preserve_extension_v3(handle, extension_block));
+	UT_ASSERT_EQ(ops->read(handle, 2, actual.data), BLCKSZ);
+	UT_ASSERT(memcmp(original.data, actual.data, BLCKSZ) == 0);
+	extension_block = 8;
+	UT_ASSERT(cluster_shared_fs_sharedfs_preserve_extension_v3(handle, extension_block));
+	UT_ASSERT_EQ(ops->nblocks(handle), 9);
+	UT_ASSERT_EQ(ops->read(handle, 8, actual.data), BLCKSZ);
+	UT_ASSERT(memcmp(zero.data, actual.data, BLCKSZ) == 0);
+	/* Replaying an earlier abandoned range never shrinks a newer tail. */
+	extension_block = 2;
+	UT_ASSERT(cluster_shared_fs_sharedfs_preserve_extension_v3(handle, extension_block));
+	UT_ASSERT_EQ(ops->nblocks(handle), 9);
+#else
+	UT_ASSERT(!cluster_shared_fs_sharedfs_preserve_extension_v3(handle, extension_block));
+	UT_ASSERT_EQ(ops->nblocks(handle), 3);
+	(void)zero;
+#endif
+	UT_ASSERT_EQ(ops->read(handle, 2, actual.data), BLCKSZ);
+	UT_ASSERT(memcmp(original.data, actual.data, BLCKSZ) == 0);
+	extension_target = false;
+	UT_ASSERT(!cluster_shared_fs_sharedfs_preserve_extension_v3(handle, extension_block));
+	UT_ASSERT(!cluster_shared_fs_sharedfs_preserve_extension_v3(NULL, extension_block));
+	ops->close(handle);
+	ops->unlink(locator, MAIN_FORKNUM);
+}
+
+UT_TEST(test_failed_extension_allocation_does_not_clobber_concurrent_writer)
+{
+#if defined(__linux__)
+	const ClusterSharedFsOps *ops = &cluster_shared_fs_sharedfs_ops;
+	RelFileLocator locator = {1663, 5, 24591};
+	ClusterSharedFsHandle *handle = NULL;
+	PGAlignedBlock original, actual;
+	pid_t child;
+	int status;
+
+	fresh_root("extension_concurrent");
+	memset(original.data, 0x27, BLCKSZ);
+	ops->create(locator, MAIN_FORKNUM, false, &handle);
+	UT_ASSERT_EQ(ops->write(handle, 2, original.data), BLCKSZ);
+	extension_target = true;
+	extension_locator = locator;
+	extension_block = 2;
+	child = fork();
+	UT_ASSERT(child >= 0);
+	if (child == 0) {
+		for (unsigned i = 0; i < 1024; i++)
+			if (ops->write(handle, 2, original.data) != BLCKSZ)
+				_exit(1);
+		_exit(0);
+	}
+	if (child > 0) {
+		for (unsigned i = 0; i < 1024; i++)
+			UT_ASSERT(cluster_shared_fs_sharedfs_preserve_extension_v3(handle, 2));
+		UT_ASSERT_EQ(waitpid(child, &status, 0), child);
+		UT_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	}
+	UT_ASSERT_EQ(ops->read(handle, 2, actual.data), BLCKSZ);
+	UT_ASSERT(memcmp(original.data, actual.data, BLCKSZ) == 0);
+	extension_target = false;
+	ops->close(handle);
+	ops->unlink(locator, MAIN_FORKNUM);
+#else
+	/* Unsupported platform is a real refusal, covered by the previous test. */
+	UT_ASSERT(!extension_target);
+#endif
+}
+
 /* An 8 KiB pwrite that extends a regular file can expose its first 4 KiB
  * page through i_size while the syscall is still completing.  nblocks must
  * re-sample that in-flight tail rather than classify it as durable damage. */
@@ -1086,9 +1180,11 @@ UT_TEST(test_direct_data_leaves_small_sentinel_buffered)
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(21);
 	UT_RUN(test_sharedfs_roundtrip_and_owner_agnostic);
 	UT_RUN(test_sharedfs_extend_zero_fills);
+	UT_RUN(test_failed_extension_allocation_preserves_data_and_later_eof);
+	UT_RUN(test_failed_extension_allocation_does_not_clobber_concurrent_writer);
 	UT_RUN(test_shared_catalog_create_rejects_existing_main);
 	UT_RUN(test_nblocks_rechecks_transient_partial_extend);
 	UT_RUN(test_nblocks_persistent_partial_tail_stays_failclosed);

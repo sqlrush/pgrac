@@ -88,6 +88,44 @@ bool IsBinaryUpgrade = false;
 volatile uint32 InterruptHoldoffCount = 0;
 volatile uint32 QueryCancelHoldoffCount = 0;
 
+/* Link-only fixture: it has no live storage owner or recovery executor. */
+bool
+RecoveryInProgress(void)
+{
+	return false;
+}
+
+bool
+cluster_ko_directory_io_begin_v3(RelFileLocator locator pg_attribute_unused(),
+								 ClusterKoDirectoryIoV3 *out pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_ko_directory_io_end_v3(const ClusterKoDirectoryIoV3 *call pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_ko_directory_drop_committed_v3(RelFileLocator locator pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+smgrexists(SMgrRelation reln pg_attribute_unused(), ForkNumber fork pg_attribute_unused())
+{
+	return false;
+}
+
+SMgrRelation
+smgropen(RelFileLocator locator pg_attribute_unused(), BackendId backend pg_attribute_unused())
+{
+	return NULL;
+}
+
 /* This link-only fixture has no original postcommit DROP owner. */
 bool
 cluster_ko_shared_pending_drop_v2(RelFileLocator locator pg_attribute_unused(),

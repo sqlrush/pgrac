@@ -409,6 +409,43 @@ cluster_shared_fs_sharedfs_extend(ClusterSharedFsHandle *handle, BlockNumber blo
 	cluster_shared_fs_sharedfs_write(handle, blocknum, zerobuf.data);
 }
 
+bool
+cluster_shared_fs_sharedfs_preserve_extension_v3(ClusterSharedFsHandle *handle, BlockNumber block)
+{
+	if (handle == NULL || !handle->opened || handle->forknum != MAIN_FORKNUM
+		|| !cluster_ko_extend_recovery_target_v3(handle->rlocator, handle->forknum, block))
+		return false;
+#if defined(__linux__)
+	{
+		int fd;
+		int result;
+		int saved_errno;
+
+		/* Native mode zero allocates only absent storage and grows EOF
+		 * atomically; it never zeroes existing bytes or shrinks a later tail.
+		 * FileFallocate cannot be used: its FileZero fallback overwrites data. */
+		do {
+			CHECK_FOR_INTERRUPTS();
+			fd = FileGetRawDesc(handle->vfd);
+			if (fd < 0)
+				ereport(ERROR, (errcode_for_file_access(),
+								errmsg("could not open abandoned extension file: %m")));
+			pgstat_report_wait_start(WAIT_EVENT_DATA_FILE_EXTEND);
+			result = fallocate(fd, 0, (off_t)block * BLCKSZ, BLCKSZ);
+			saved_errno = errno;
+			pgstat_report_wait_end();
+			errno = saved_errno;
+		} while (result < 0 && errno == EINTR);
+		if (result < 0)
+			ereport(ERROR, (errcode_for_file_access(),
+							errmsg("could not finish abandoned extension block %u: %m", block)));
+		return true;
+	}
+#else
+	return false;
+#endif
+}
+
 
 static BlockNumber
 cluster_shared_fs_sharedfs_nblocks(ClusterSharedFsHandle *handle)

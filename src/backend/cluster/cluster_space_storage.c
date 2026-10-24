@@ -22,6 +22,7 @@
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_hw.h"
+#include "cluster/cluster_inject.h"
 #include "cluster/cluster_page_producer.h"
 #include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
@@ -803,8 +804,9 @@ cluster_space_reserve(const ClusterSpaceIdentity *identity, const struct HwLock 
 	uint8 bytes[CLUSTER_SPACE_RESERVATION_WAL_BYTES];
 	BlockNumber first = InvalidBlockNumber;
 	Buffer buffer;
-	XLogRecPtr lsn;
+	XLogRecPtr lsn = InvalidXLogRecPtr;
 	bool object_gated;
+	bool extension_owner;
 
 	if (granted == NULL)
 		return InvalidBlockNumber;
@@ -824,6 +826,9 @@ cluster_space_reserve(const ClusterSpaceIdentity *identity, const struct HwLock 
 	if (object_gated
 		&& !cluster_ko_peer_current_begin_v3(expected.locator, SPACE_FORKNUM,
 											 CLUSTER_SPACE_RESERVATION_BLOCK, &admission))
+		return InvalidBlockNumber;
+	extension_owner = object_gated && cluster_ko_extend_active_v3();
+	if (extension_owner && !cluster_ko_extend_reserve_begin_v3(&checked))
 		return InvalidBlockNumber;
 
 	/* Existing HW(X) serializes reservations; existing GCS current/content-X
@@ -866,6 +871,8 @@ cluster_space_reserve(const ClusterSpaceIdentity *identity, const struct HwLock 
 	MarkBufferDirty(buffer);
 	XLogRegisterData((char *)bytes, sizeof(bytes));
 	lsn = XLogInsert(RM_SMGR_ID, XLOG_SMGR_SPACE_RESERVATION | XLR_SPECIAL_REL_UPDATE);
+	if (extension_owner && !cluster_ko_extend_reserve_record_v3(&change, lsn))
+		elog(PANIC, "shared extension lost its native reservation recovery owner");
 	space_set_lsn(BufferGetPage(buffer), lsn, change.result_token);
 	space_capture_native(buffer, &expected, lsn);
 	END_CRIT_SECTION();
@@ -882,6 +889,13 @@ cluster_space_reserve(const ClusterSpaceIdentity *identity, const struct HwLock 
 	}
 done:
 	UnlockReleaseBuffer(buffer);
+	if (extension_owner && !XLogRecPtrIsInvalid(lsn) && cluster_injection_armed_count > 0) {
+		if (cluster_injection_is_armed("cluster-ko-extension-reserved"))
+			elog(LOG, "KO extension reservation injection: pid=%d locator=%u/%u/%u first=%u count=%u",
+				 MyProcPid, expected.locator.spcOid, expected.locator.dbOid,
+				 expected.locator.relNumber, change.first_block, change.granted);
+		CLUSTER_INJECTION_POINT("cluster-ko-extension-reserved");
+	}
 	return first;
 }
 

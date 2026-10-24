@@ -209,11 +209,20 @@ static bool ko_offer_ack_fixture(const ClusterPiWritebackJobV1 *, uint32, uint64
 								 ClusterWalWriterToken *);
 static bool ko_drop_poll_fixture(uint32 *, bool *);
 static bool (*ko_drop_poll_boundary)(uint32 *, bool *);
+static bool (*ko_extension_page_boundary)(RelFileLocator, BlockNumber);
+static void (*ko_extension_flush_boundary)(XLogRecPtr);
+static void (*ko_extension_sync_boundary)(SMgrRelation, ForkNumber);
+static bool ko_extension_page_fixture(RelFileLocator, BlockNumber);
+static void ko_extension_flush_fixture(XLogRecPtr);
+static void ko_extension_sync_fixture(SMgrRelation, ForkNumber);
 #ifndef Z_REAL_WB_PROOF
 static bool ko_local_closed_fixture(RelFileLocator, uint64, uint64 *);
 static bool ko_local_revision_fixture(uint64);
 #endif
 #define cluster_smgr_drop_work_poll ko_drop_poll_fixture
+#define cluster_smgr_finish_extension_page_v3 ko_extension_page_fixture
+#define XLogFlush ko_extension_flush_fixture
+#define smgrimmedsync ko_extension_sync_fixture
 #define cluster_pi_writeback_structure_offer_read_v2 ko_offer_notice_fixture
 #define cluster_pi_writeback_structure_offer_ack_v2 ko_offer_ack_fixture
 #ifndef Z_REAL_WB_PROOF
@@ -222,12 +231,42 @@ static bool ko_local_revision_fixture(uint64);
 #endif
 #include "../../backend/cluster/cluster_ko_lock.c"
 #undef cluster_smgr_drop_work_poll
+#undef cluster_smgr_finish_extension_page_v3
+#undef XLogFlush
+#undef smgrimmedsync
 #undef cluster_pi_writeback_structure_offer_read_v2
 #undef cluster_pi_writeback_structure_offer_ack_v2
 #undef printf
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+static bool
+ko_extension_page_fixture(RelFileLocator locator, BlockNumber block)
+{
+	Assert(SpinLockFree(&ko_state->shared_lock));
+	return ko_extension_page_boundary != NULL && ko_extension_page_boundary(locator, block);
+}
+
+static void
+ko_extension_flush_fixture(XLogRecPtr lsn)
+{
+	Assert(SpinLockFree(&ko_state->shared_lock));
+	if (ko_extension_flush_boundary != NULL)
+		ko_extension_flush_boundary(lsn);
+}
+
+static void
+ko_extension_sync_fixture(SMgrRelation smgr, ForkNumber fork)
+{
+	if (ko_extend_executor.active) {
+		Assert(SpinLockFree(&ko_state->shared_lock));
+		if (ko_extension_sync_boundary != NULL)
+			ko_extension_sync_boundary(smgr, fork);
+		return;
+	}
+	smgrimmedsync(smgr, fork);
+}
 PGPROC *MyProc;
 static ClusterGesRedeclareResult release_poll_result = CLUSTER_GES_REDECLARE_PENDING;
 static int release_poll_calls;
@@ -276,6 +315,12 @@ bool cluster_ic_suppress_gcs_done_cap;
 bool cluster_ic_suppress_xid_flock_cap;
 int cluster_space_affinity = CLUSTER_SPACE_AFFINITY_STATIC;
 int cluster_injection_armed_count = 0;
+
+bool
+cluster_injection_is_armed(const char *name pg_attribute_unused())
+{
+	return false;
+}
 static ClusterKoShared storage;
 static ClusterHwLeaseShared leases;
 static ClusterNodeInfo peer;
@@ -1626,6 +1671,12 @@ reset_test(void)
 	origin_sync_hook = NULL;
 	origin_wait_hook = NULL;
 	ko_drop_poll_boundary = NULL;
+	ko_extension_page_boundary = NULL;
+	ko_extension_flush_boundary = NULL;
+	ko_extension_sync_boundary = NULL;
+	memset(&ko_extend_executor, 0, sizeof(ko_extend_executor));
+	memset(&ko_extend_recovery, 0, sizeof(ko_extend_recovery));
+	ko_extend_recovery_scan = 0;
 	fixture_log_events = 0;
 	native_failure_log_events = 0;
 	native_fixture_error_multibyte_offset = 0;
@@ -7716,6 +7767,7 @@ UT_TEST(test_create_backend_exit_never_retires_partial_creation)
 	UT_ASSERT(cluster_ko_create_begin_v3(locator, &serial));
 	UT_ASSERT(cluster_ko_create_write_begin_v3(locator, serial));
 	ko_shared_backend_exit(1, (Datum)0);
+	ko_shared_resource_release(RESOURCE_RELEASE_AFTER_LOCKS, false, true, NULL);
 	UT_ASSERT(storage.extend_work[ko_create_slot].used);
 	UT_ASSERT(storage.extend_work[ko_create_slot].failed);
 	UT_ASSERT_EQ(storage.extend_work[ko_create_slot].serial, serial);
@@ -7984,6 +8036,7 @@ UT_TEST(test_extension_backend_exit_retains_exact_unfinished_work_for_recovery)
 	UT_ASSERT(resource_callback == ko_shared_resource_release);
 	UT_ASSERT(exit_callback == ko_shared_backend_exit);
 	ko_shared_backend_exit(1, (Datum)0);
+	ko_shared_resource_release(RESOURCE_RELEASE_AFTER_LOCKS, false, true, NULL);
 	UT_ASSERT(storage.extend_work[ko_extend_slot].used);
 	UT_ASSERT(storage.extend_work[ko_extend_slot].failed);
 	UT_ASSERT_EQ(storage.extend_work[ko_extend_slot].serial, serial);

@@ -320,6 +320,17 @@ extern bool cluster_ko_extend_begin_v3(RelFileLocator locator, ForkNumber fork, 
 extern bool cluster_ko_extend_range_begin_v3(RelFileLocator locator, ForkNumber fork, uint64 serial);
 extern bool cluster_ko_extend_write_begin_v3(RelFileLocator locator, ForkNumber fork);
 extern bool cluster_ko_extend_write_done_v3(RelFileLocator locator, ForkNumber fork);
+struct ClusterSpaceReservationChange;
+/* Original canonical MAIN reservation only. Memory-only hooks bracket its
+ * native WAL mutation; record runs inside the original critical section. */
+extern bool cluster_ko_extend_reserve_begin_v3(const ClusterSpaceIdentity *identity);
+extern bool cluster_ko_extend_reserve_record_v3(const struct ClusterSpaceReservationChange *change,
+												 XLogRecPtr lsn);
+/* Existing checkpointer owner, one reserved page per call, before producer cut. */
+extern bool cluster_ko_extend_recovery_poll_v3(void);
+/* Only the selected recovery page; memory-only, no grant or new reservation. */
+extern bool cluster_ko_extend_recovery_target_v3(RelFileLocator locator, ForkNumber fork,
+												 BlockNumber block);
 extern bool cluster_ko_extend_end_v3(uint64 serial);
 extern void cluster_ko_extend_abort_v3(uint64 serial);
 

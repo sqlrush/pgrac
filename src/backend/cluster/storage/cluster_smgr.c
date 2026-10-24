@@ -850,6 +850,43 @@ cluster_smgr_zeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber block
 	PG_END_TRY();
 }
 
+bool
+cluster_smgr_finish_extension_page_v3(RelFileLocator locator, BlockNumber block)
+{
+	ClusterSmgrRelationState *state;
+	ClusterSharedFsHandle *handle;
+	ClusterKoDirectoryIoV3 io;
+	SMgrRelation reln;
+	bool finished = false;
+
+	if (!cluster_ko_extend_recovery_target_v3(locator, MAIN_FORKNUM, block)
+		|| cluster_shared_fs_get_active_ops() != &cluster_shared_fs_sharedfs_ops)
+		return false;
+	reln = smgropen(locator, InvalidBackendId);
+	if (reln->smgr_which != CLUSTER_SMGR_SMGRSW_INDEX || !smgrexists(reln, MAIN_FORKNUM))
+		return false;
+	cluster_write_fence_reject_if_fenced("finish extension");
+	cluster_mrp_standby_shared_write_gate("finish extension");
+	cluster_smgr_begin_write_io(reln, "finish extension", &io);
+	PG_TRY();
+	{
+		state = cluster_smgr_state_lookup(reln, true);
+		handle = cluster_smgr_ensure_handle(state, MAIN_FORKNUM);
+		finished = cluster_shared_fs_sharedfs_preserve_extension_v3(handle, block);
+		if (finished) {
+			cluster_smgr_register_dirty(reln, MAIN_FORKNUM, handle);
+			reln->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
+			cluster_smgr_invalidate_relation(locator, MAIN_FORKNUM);
+		}
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
+	return finished;
+}
+
 
 bool
 cluster_smgr_prefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)

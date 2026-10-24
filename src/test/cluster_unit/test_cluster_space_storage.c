@@ -23,6 +23,7 @@
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_inject.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_ko.h"
 #include "cluster/cluster_hw.h"
@@ -119,6 +120,53 @@ static unsigned shared_identity_locks, maintenance_identity_locks;
 static bool refuse_maintenance_lock;
 static uint64 next_token;
 static bool reserve_owner, writer_allowed, revoke_on_flush;
+static bool extend_recovery_live;
+static unsigned extend_recovery_begins, extend_recovery_records;
+static ClusterSpaceReservationChange extend_recovery_record;
+static XLogRecPtr extend_recovery_lsn;
+int cluster_injection_armed_count;
+int MyProcPid = 1234;
+
+void
+cluster_injection_run(const char *name)
+{
+	UT_ASSERT_STR_EQ(name, "cluster-ko-extension-reserved");
+	UT_ASSERT(!pinned && !locked && CritSectionCount == 0);
+}
+
+bool
+cluster_injection_is_armed(const char *name)
+{
+	UT_ASSERT_STR_EQ(name, "cluster-ko-extension-reserved");
+	return cluster_injection_armed_count > 0;
+}
+
+bool
+cluster_ko_extend_active_v3(void)
+{
+	return extend_recovery_live;
+}
+
+bool
+cluster_ko_extend_reserve_begin_v3(const ClusterSpaceIdentity *identity)
+{
+	UT_ASSERT(extend_recovery_live && reserve_owner && !pinned && !locked);
+	UT_ASSERT(RelFileLocatorEquals(identity->key.locator, locator));
+	extend_recovery_begins++;
+	return true;
+}
+
+bool
+cluster_ko_extend_reserve_record_v3(const ClusterSpaceReservationChange *change, XLogRecPtr lsn)
+{
+	UT_ASSERT(extend_recovery_live && CritSectionCount == 1 && pinned == 2 && locked == 2);
+	UT_ASSERT_EQ(wal_info, XLOG_SMGR_SPACE_RESERVATION | XLR_SPECIAL_REL_UPDATE);
+	UT_ASSERT_EQ(lsn, UINT64_C(0x10000200));
+	extend_recovery_records++;
+	extend_recovery_record = *change;
+	extend_recovery_lsn = lsn;
+	return true;
+}
 static bool ko_reserve_refused, ko_reserve_revoke_on_lock, ko_reserve_revoke_on_flush;
 static uint64 ko_reserve_revision;
 static unsigned ko_reserve_begins, ko_reserve_checks, buffer_reads;
@@ -321,6 +369,7 @@ TransactionIdCommitTree(TransactionId xid, int count, TransactionId *children)
 	commit_decisions++;
 }
 
+#undef CLUSTER_INJECTION_POINT
 #define CLUSTER_INJECTION_POINT(name) ((void)0)
 #include "test_cluster_space_commit_emit.inc"
 
@@ -1607,6 +1656,9 @@ reset(void)
 	reject_current_ref = false;
 	next_token = 17;
 	reserve_owner = revoke_on_flush = false;
+	extend_recovery_live = false;
+	extend_recovery_begins = extend_recovery_records = 0;
+	extend_recovery_lsn = InvalidXLogRecPtr;
 	ko_reserve_refused = ko_reserve_revoke_on_lock = ko_reserve_revoke_on_flush = false;
 	ko_reserve_revision = 1;
 	ko_reserve_begins = ko_reserve_checks = buffer_reads = 0;
@@ -2565,6 +2617,52 @@ UT_TEST(test_reservation_owner_requires_identity_hw_and_exact_pcm_permission)
 		UT_ASSERT_EQ(flush_calls, 0);
 		UT_ASSERT(memcmp(saved, pages, sizeof(pages)) == 0);
 		UT_ASSERT(!pinned && !locked);
+	}
+}
+
+UT_TEST(test_extension_reservation_publishes_recovery_before_flush_or_grant)
+{
+	for (unsigned variant = 0; variant < 4; variant++) {
+		ClusterSpaceIdentity identity;
+		HwLock lock;
+		uint32 granted = 99;
+		volatile BlockNumber first = InvalidBlockNumber;
+		volatile bool caught = false;
+
+		reservation_owner(&identity, &lock);
+		extend_recovery_live = true;
+		revoke_on_flush = variant == 1;
+		ko_reserve_revoke_on_flush = variant == 2;
+		throw_reserve_flush = variant == 3;
+		PG_TRY();
+		{
+			first = cluster_space_reserve(&identity, &lock, 7, &granted);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, variant == 3);
+		UT_ASSERT_EQ(first, variant == 0 ? 0 : InvalidBlockNumber);
+		UT_ASSERT_EQ(granted, variant == 0 ? 7 : 0);
+		UT_ASSERT_EQ(extend_recovery_begins, 1);
+		UT_ASSERT_EQ(extend_recovery_records, 1);
+		UT_ASSERT_EQ(extend_recovery_lsn, UINT64_C(0x10000200));
+		UT_ASSERT_EQ(extend_recovery_record.action, CLUSTER_SPACE_RESERVATION_ADVANCE);
+		UT_ASSERT_EQ(extend_recovery_record.first_block, 0);
+		UT_ASSERT_EQ(extend_recovery_record.granted, 7);
+		UT_ASSERT_EQ(extend_recovery_record.before.next_block, 0);
+		UT_ASSERT_EQ(extend_recovery_record.result.next_block, 7);
+		UT_ASSERT_EQ(extend_recovery_record.before_token, 17);
+		UT_ASSERT_EQ(extend_recovery_record.result_token, 18);
+		UT_ASSERT(memcmp(&extend_recovery_record.before.identity, &identity, sizeof(identity)) == 0);
+		UT_ASSERT_EQ(flush_calls, 1);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		if (variant != 3)
+			UT_ASSERT(!pinned && !locked);
+		/* The throwing boundary deliberately leaves the native pin/content
+		 * lock to the ResourceOwner, as the real abort path does. */
 	}
 }
 
@@ -4631,7 +4729,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(93);
+	UT_PLAN(94);
 	UT_RUN(test_observed_create_captures_original_birth_without_owning_scope);
 	UT_RUN(test_observed_create_refuses_unbound_owner_before_effects);
 	UT_RUN(test_native_pending_delete_keeps_birth_before_create_scope_ends);
@@ -4691,6 +4789,7 @@ main(void)
 	UT_RUN(test_truncate_partial_restart_finishes_original_physical_owner);
 	UT_RUN(test_reservation_owner_uses_exact_page_and_flushes_before_grant);
 	UT_RUN(test_reservation_owner_requires_identity_hw_and_exact_pcm_permission);
+	UT_RUN(test_extension_reservation_publishes_recovery_before_flush_or_grant);
 	UT_RUN(test_reservation_object_refusal_precedes_read_and_mutation);
 	UT_RUN(test_reservation_object_drift_under_content_lock_precedes_token);
 	UT_RUN(test_reservation_object_drift_after_flush_never_grants_or_reuses);

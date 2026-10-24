@@ -3,6 +3,33 @@
  * Author: SqlRush <sqlrush@gmail.com> */
 #include "cluster/cluster_ko.h"
 #include "storage/fd.h"
+#include "miscadmin.h"
+
+#ifndef CLUSTER_EXTENSION_TARGET_FIXTURE
+bool
+cluster_ko_extend_recovery_target_v3(RelFileLocator locator pg_attribute_unused(),
+								   ForkNumber fork pg_attribute_unused(),
+								   BlockNumber block pg_attribute_unused())
+{
+	return false;
+}
+#endif
+
+static uint32 extension_wait_event;
+uint32 *my_wait_event_info = &extension_wait_event;
+volatile sig_atomic_t InterruptPending;
+
+void
+ProcessInterrupts(void)
+{
+	abort();
+}
+
+int
+FileGetRawDesc(File file)
+{
+	return (int)file;
+}
 
 bool
 cluster_ko_shared_drop_work_begin_v2(uint32 *cursor pg_attribute_unused(),
@@ -62,4 +89,12 @@ bool
 cluster_ko_shared_native_drop_deferred_v2(RelFileLocator locator pg_attribute_unused())
 {
 	return false;
+}
+
+void
+cluster_ko_drop_work_note_v1(ClusterKoDropWorkV2 *work pg_attribute_unused(),
+							uint32 phase pg_attribute_unused(), uint32 step pg_attribute_unused(),
+							ForkNumber fork pg_attribute_unused(), bool io_attempted pg_attribute_unused(),
+							int io_error pg_attribute_unused())
+{
 }
