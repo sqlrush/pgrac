@@ -1790,12 +1790,26 @@ cluster_ctrc_active_scan_begin(ClusterCtrcActiveScan *scan, FullTransactionId re
 	return true;
 }
 
-void
-cluster_ctrc_active_scan_step(ClusterCtrcActiveScan *scan)
+static void
+ctrc_active_scan_step(ClusterCtrcActiveScan *scan,
+					  const ClusterSemanticActiveSampleFence *source)
 {
 	if (scan == NULL || scan->status != CTRC_ACTIVE_SCAN_INCOMPLETE)
 		return;
 	scan->lock_busy = false;
+	/* The source is the worker's original semantic cut, not a newly sampled
+	 * lease owner. Validate it before acquiring any census entry lock. */
+	if (source != NULL
+		&& (source->system_identifier == 0 || source->record_generation == 0
+			|| source->formation_epoch == 0 || source->formation_epoch > UINT32_MAX
+			|| source->local_boot_incarnation == 0 || source->local_node_id < 0
+			|| source->local_node_id >= CLUSTER_MAX_NODES
+			|| ((source->local_node_id < 64 ? source->admitted_members_lo
+											 : source->admitted_members_hi)
+				& (UINT64_C(1) << (source->local_node_id % 64))) == 0
+			|| source->admitted_incarnation[source->local_node_id]
+				   != source->local_boot_incarnation))
+		goto invalid;
 	if (!ctrc_runtime_attached()
 		|| CtrcShared->origin_key_entries > UINT64_MAX - CtrcShared->participant_key_entries
 		|| scan->total_entries
@@ -1848,6 +1862,8 @@ cluster_ctrc_active_scan_step(ClusterCtrcActiveScan *scan)
 		}
 		LWLockRelease(lock);
 		if (occupied) {
+			bool unqualified = false;
+
 			if (!valid || !ctrc_txn_key_valid(&key) || !TransactionIdIsNormal(key.xid)
 				|| ((is_origin || FullTransactionIdIsValid(full))
 					&& (!FullTransactionIdIsNormal(full)
@@ -1865,8 +1881,25 @@ cluster_ctrc_active_scan_step(ClusterCtrcActiveScan *scan)
 				full = cluster_xid_widen(key.xid, scan->reference_full);
 				if (!FullTransactionIdIsValid(full))
 					goto invalid;
-				scan->unqualified_entries++;
+				unqualified = true;
 			}
+			/* A retained older source still constrains the minimum. It cannot
+			 * qualify this round's producer coverage merely by knowing FullXid.
+			 * Foreign origins use their own original admitted incarnation. */
+			if (source != NULL
+				&& (key.system_identifier != source->system_identifier
+					|| key.admission_record_generation != source->record_generation
+					|| key.formation_epoch != source->formation_epoch
+					|| key.cluster_epoch != source->formation_epoch
+					|| key.origin_node_id >= CLUSTER_MAX_NODES
+					|| ((key.origin_node_id < 64 ? source->admitted_members_lo
+												 : source->admitted_members_hi)
+						& (UINT64_C(1) << (key.origin_node_id % 64))) == 0
+					|| key.origin_boot_incarnation
+						   != source->admitted_incarnation[key.origin_node_id]))
+				unqualified = true;
+			if (unqualified)
+				scan->unqualified_entries++;
 			if (FullTransactionIdPrecedes(full, scan->min_full))
 				scan->min_full = full;
 		}
@@ -1879,6 +1912,28 @@ cluster_ctrc_active_scan_step(ClusterCtrcActiveScan *scan)
 invalid:
 	scan->min_full = InvalidFullTransactionId;
 	scan->status = CTRC_ACTIVE_SCAN_INVALID;
+}
+
+/* Standalone census remains an observation with its original coverage rules. */
+void
+cluster_ctrc_active_scan_step(ClusterCtrcActiveScan *scan)
+{
+	ctrc_active_scan_step(scan, NULL);
+}
+
+void
+cluster_ctrc_active_scan_step_source(ClusterCtrcActiveScan *scan,
+									const ClusterSemanticActiveSampleFence *source)
+{
+	if (source == NULL) {
+		if (scan != NULL && scan->status == CTRC_ACTIVE_SCAN_INCOMPLETE) {
+			scan->lock_busy = false;
+			scan->min_full = InvalidFullTransactionId;
+			scan->status = CTRC_ACTIVE_SCAN_INVALID;
+		}
+		return;
+	}
+	ctrc_active_scan_step(scan, source);
 }
 
 /*

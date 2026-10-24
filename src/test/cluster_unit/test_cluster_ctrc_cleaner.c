@@ -3021,6 +3021,7 @@ UT_TEST(test_worker_binding_and_bad_keys_never_change_ownership)
 	/* A foreign origin's participant uses its canonical segment ordinal,
 	 * not this node's segment range or its slot number. */
 	key.owner_instance = 2;
+	key.segment_id = CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
 	key.origin_node_id = 1;
 	key.segment_id = 257;
 	UT_ASSERT(ctrc_cleaner_owns_key(&key));
@@ -3952,6 +3953,218 @@ UT_TEST(test_active_scan_counts_raw_only_identity_coverage)
 	UT_ASSERT_EQ(held_count, 0);
 }
 
+
+/* Exercise the shared scanner with the worker's original semantic source cut.
+ * The lease first-owner incarnation is deliberately absent from this input. */
+static ClusterSemanticActiveSampleFence
+active_source_for_key(const ClusterCtrcTxnKeyV1 *key)
+{
+	ClusterSemanticActiveSampleFence source;
+
+	MemSet(&source, 0, sizeof(source));
+	source.system_identifier = key->system_identifier;
+	source.record_generation = key->admission_record_generation;
+	source.formation_epoch = key->formation_epoch;
+	source.local_boot_incarnation = key->origin_boot_incarnation;
+	source.local_node_id = key->origin_node_id;
+	source.admitted_members_lo = UINT64_C(1) << key->origin_node_id;
+	source.admitted_incarnation[key->origin_node_id] = key->origin_boot_incarnation;
+	return source;
+}
+
+static void
+finish_source_active_scan(ClusterCtrcActiveScan *scan,
+						  const ClusterSemanticActiveSampleFence *source)
+{
+	unsigned slices = 0;
+
+	while (scan->status == CTRC_ACTIVE_SCAN_INCOMPLETE) {
+		cluster_ctrc_active_scan_step_source(scan, source);
+		if (++slices > 1000)
+			abort();
+	}
+}
+
+UT_TEST(test_active_scan_source_matches_original_not_reference_epoch)
+{
+	ClusterCtrcActiveScan scan;
+	ClusterCtrcOriginEntry *origin;
+	ClusterSemanticActiveSampleFence source;
+
+	reset_fixture();
+	origin = seed_origin(0, 0);
+	origin->key.cluster_epoch = (uint32)origin->key.formation_epoch;
+	origin->original_full_xid = FullTransactionIdFromEpochAndXid(3, origin->key.xid);
+	source = active_source_for_key(&origin->key);
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+	finish_source_active_scan(&scan, &source);
+	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(scan.unqualified_entries, 0);
+	UT_ASSERT(FullTransactionIdEquals(scan.min_full, origin->original_full_xid));
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_active_scan_source_mismatch_retains_original_minimum)
+{
+	unsigned mismatch;
+
+	for (mismatch = 0; mismatch < 6; mismatch++) {
+		ClusterCtrcActiveScan scan;
+		ClusterCtrcOriginEntry *origin;
+		ClusterCtrcTxnKeyV1 before;
+		ClusterSemanticActiveSampleFence source;
+
+		reset_fixture();
+		origin = seed_origin(0, 0);
+		origin->key.cluster_epoch = (uint32)origin->key.formation_epoch;
+		origin->original_full_xid = FullTransactionIdFromEpochAndXid(3, origin->key.xid);
+		before = origin->key;
+		source = active_source_for_key(&origin->key);
+		switch (mismatch) {
+		case 0: source.system_identifier++; break;
+		case 1: source.record_generation++; break;
+		case 2: source.formation_epoch++; break;
+		case 3:
+			source.local_boot_incarnation++;
+			source.admitted_incarnation[source.local_node_id]++;
+			break;
+		case 4:
+			source.admitted_members_lo = 0;
+			source.local_node_id = (source.local_node_id + 1) % 4;
+			source.admitted_members_lo = UINT64_C(1) << source.local_node_id;
+			source.admitted_incarnation[source.local_node_id] = source.local_boot_incarnation;
+			break;
+		case 5:
+			/* A valid key can retain an older cluster epoch. It still constrains F. */
+			origin->key.cluster_epoch++;
+			before = origin->key;
+			break;
+		}
+		UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+		finish_source_active_scan(&scan, &source);
+		UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+		UT_ASSERT_EQ(scan.unqualified_entries, 1);
+		UT_ASSERT(FullTransactionIdEquals(scan.min_full, origin->original_full_xid));
+		UT_ASSERT_EQ(memcmp(&before, &origin->key, sizeof(before)), 0);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_active_scan_unknown_and_foreign_source_count_once)
+{
+	ClusterCtrcActiveScan scan;
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcParticipantEntry *entry;
+	ClusterSemanticActiveSampleFence source;
+	uint64 index;
+
+	reset_fixture();
+	origin = seed_origin(0, 0);
+	origin->key.cluster_epoch = (uint32)origin->key.formation_epoch;
+	UT_ASSERT(ctrc_participant_index(&origin->key, 0, &index));
+	entry = &ctrc_participant_entries()[index];
+	entry->key = origin->key;
+	entry->state = CTRC_PARTICIPANT_OPEN;
+	source = active_source_for_key(&origin->key);
+	source.local_boot_incarnation++;
+	source.admitted_incarnation[source.local_node_id]++;
+	MemSet(origin, 0, sizeof(*origin));
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+	finish_source_active_scan(&scan, &source);
+	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(scan.unqualified_entries, 1);
+	UT_ASSERT(!FullTransactionIdIsValid(entry->original_full_xid));
+	UT_ASSERT_EQ(XidFromFullTransactionId(scan.min_full), entry->key.xid);
+	entry->original_full_xid = FullTransactionIdFromEpochAndXid(3, entry->key.xid);
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+	finish_source_active_scan(&scan, &source);
+	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(scan.unqualified_entries, 1);
+	UT_ASSERT(FullTransactionIdEquals(scan.min_full, entry->original_full_xid));
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_active_scan_foreign_origin_uses_original_cohort_member)
+{
+	ClusterCtrcActiveScan scan;
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcParticipantEntry *entry;
+	ClusterCtrcTxnKeyV1 key;
+	ClusterSemanticActiveSampleFence source;
+	uint64 index;
+
+	reset_fixture();
+	origin = seed_origin(0, 0);
+	origin->key.cluster_epoch = (uint32)origin->key.formation_epoch;
+	source = active_source_for_key(&origin->key);
+	key = origin->key;
+	key.owner_instance = 2;
+	key.segment_id = CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	key.origin_node_id = 1;
+	key.origin_boot_incarnation = 5100;
+	UT_ASSERT(ctrc_participant_index(&key, 0, &index));
+	entry = &ctrc_participant_entries()[index];
+	entry->key = key;
+	entry->state = CTRC_PARTICIPANT_OPEN;
+	entry->original_full_xid = FullTransactionIdFromEpochAndXid(3, key.xid);
+	MemSet(origin, 0, sizeof(*origin));
+	source.admitted_members_lo |= UINT64_C(2);
+	source.admitted_incarnation[1] = 5100;
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+	finish_source_active_scan(&scan, &source);
+	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(scan.unqualified_entries, 0);
+	UT_ASSERT(FullTransactionIdEquals(scan.min_full, entry->original_full_xid));
+	source.admitted_incarnation[1]++;
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+	finish_source_active_scan(&scan, &source);
+	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(scan.unqualified_entries, 1);
+	UT_ASSERT(FullTransactionIdEquals(scan.min_full, entry->original_full_xid));
+	source.admitted_members_lo &= ~UINT64_C(2);
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+	finish_source_active_scan(&scan, &source);
+	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(scan.unqualified_entries, 1);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_active_scan_missing_source_refuses_before_shared_locks)
+{
+	unsigned missing;
+
+	for (missing = 0; missing < 8; missing++) {
+		ClusterCtrcActiveScan scan;
+		ClusterSemanticActiveSampleFence source;
+		ClusterCtrcOriginEntry *origin;
+		unsigned before;
+
+		reset_fixture();
+		origin = seed_origin(0, 0);
+		origin->key.cluster_epoch = (uint32)origin->key.formation_epoch;
+		origin->original_full_xid = FullTransactionIdFromEpochAndXid(3, origin->key.xid);
+		source = active_source_for_key(&origin->key);
+		switch (missing) {
+		case 0: source.system_identifier = 0; break;
+		case 1: source.record_generation = 0; break;
+		case 2: source.formation_epoch = 0; break;
+		case 3: source.local_boot_incarnation = 0; break;
+		case 4: source.local_node_id = -1; break;
+		case 5: source.local_node_id = CLUSTER_MAX_NODES; break;
+		case 6: source.formation_epoch = (uint64)UINT32_MAX + 1; break;
+		case 7: break;
+		}
+		UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+		before = conditional_calls;
+		cluster_ctrc_active_scan_step_source(&scan, missing == 7 ? NULL : &source);
+		UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_INVALID);
+		UT_ASSERT_EQ(scan.next_index, 0);
+		UT_ASSERT(!FullTransactionIdIsValid(scan.min_full));
+		UT_ASSERT_EQ(conditional_calls, before);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
 int
 main(void)
 {
@@ -3959,7 +4172,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(93);
+	UT_PLAN(98);
 	printf("# CTRC header_bytes=%zu total_bytes=%zu\n", sizeof(ClusterCtrcSharedHeader),
 		   capacity.total_bytes);
 	UT_RUN(test_origin_reserve_requires_published_local_top_protection);
@@ -4055,6 +4268,11 @@ main(void)
 	UT_RUN(test_active_scan_refuses_unknown_or_mismatched_origin_fullxid);
 	UT_RUN(test_active_scan_participant_widens_old_epoch_and_rejects_unrepresentable_xids);
 	UT_RUN(test_active_scan_counts_raw_only_identity_coverage);
+	UT_RUN(test_active_scan_source_matches_original_not_reference_epoch);
+	UT_RUN(test_active_scan_source_mismatch_retains_original_minimum);
+	UT_RUN(test_active_scan_unknown_and_foreign_source_count_once);
+	UT_RUN(test_active_scan_foreign_origin_uses_original_cohort_member);
+	UT_RUN(test_active_scan_missing_source_refuses_before_shared_locks);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

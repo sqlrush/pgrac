@@ -718,7 +718,10 @@ undo_cleaner_run_pass(bool *out_work_remaining, bool maintenance_due)
 			undo_cleaner_active_scan.min_full = active_min;
 		}
 	}
-	cluster_ctrc_active_scan_step(&undo_cleaner_active_scan);
+	/* Qualify against the same semantic source saved before N, including each
+	 * origin's admitted incarnation. The stripe first-owner is not this boot. */
+	cluster_ctrc_active_scan_step_source(&undo_cleaner_active_scan,
+										 &undo_cleaner_active_admission_fence);
 	/* Recheck the original admission/cohort and lease after the slice has
 	 * released every census lock. No replacement may complete an old sample. */
 	if ((undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_INCOMPLETE

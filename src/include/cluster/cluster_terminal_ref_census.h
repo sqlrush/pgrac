@@ -770,7 +770,8 @@ typedef struct ClusterCtrcActiveScan {
 	uint64 next_index;
 	uint64 total_entries;
 	/* Complete candidate scans may still include raw-only participant keys.
-	 * Zero counts original identity coverage, not freeze/retention authority. */
+	 * Worker source mode also requires the original semantic source/cohort.
+	 * Zero counts coverage, not producer-retention or freeze authority. */
 	uint64 unqualified_entries;
 	bool lock_busy;
 } ClusterCtrcActiveScan;
@@ -778,6 +779,12 @@ typedef struct ClusterCtrcActiveScan {
 extern bool cluster_ctrc_active_scan_begin(ClusterCtrcActiveScan *scan,
 										   FullTransactionId reference_full);
 extern void cluster_ctrc_active_scan_step(ClusterCtrcActiveScan *scan);
+/* The worker borrows its original semantic source cut for every slice.
+ * Source coverage is not a producer-retention or freeze certificate. */
+struct ClusterSemanticActiveSampleFence;
+extern void cluster_ctrc_active_scan_step_source(
+	ClusterCtrcActiveScan *scan, const struct ClusterSemanticActiveSampleFence *source);
+
 
 typedef struct ClusterCtrcDebugSnapshot {
 	uint64 origin_open;

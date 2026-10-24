@@ -75,6 +75,8 @@ static uint64 test_lease_identity;
 static bool test_sample_admission_current;
 static uint64 test_sample_admission_identity;
 static unsigned test_sample_admission_captures;
+static unsigned test_source_steps;
+static ClusterSemanticActiveSampleFence test_sample_source, test_first_source, test_last_source;
 static bool test_change_admission_after_n;
 static bool test_census_busy, test_census_invalid;
 bool cluster_undo_record_segment_commit_on_rollover;
@@ -151,6 +153,7 @@ cluster_semantic_activation_active_sample_capture(ClusterSemanticActiveSampleFen
 	MemSet(out, 0, sizeof(*out));
 	if (!test_sample_admission_current)
 		return false;
+	*out = test_sample_source;
 	out->admission_publication_seq = test_sample_admission_identity;
 	return true;
 }
@@ -193,6 +196,20 @@ cluster_ctrc_active_scan_step(ClusterCtrcActiveScan *scan)
 		if (scan->next_index == scan->total_entries)
 			scan->status = CTRC_ACTIVE_SCAN_COMPLETE;
 	}
+}
+
+/* Real worker receives the original source snapshot; scanner details are
+ * exercised separately by the complete shared-census fixture. */
+void
+cluster_ctrc_active_scan_step_source(ClusterCtrcActiveScan *scan,
+									const ClusterSemanticActiveSampleFence *source)
+{
+	if (source == NULL || test_lock_depth != 0)
+		abort();
+	if (test_source_steps++ == 0)
+		test_first_source = *source;
+	test_last_source = *source;
+	cluster_ctrc_active_scan_step(scan);
 }
 
 ClusterJoinGateVerdict
@@ -573,7 +590,18 @@ reset_wait_fixture(void)
 	test_lease_current = test_sample_admission_current = true;
 	test_lease_identity = 31;
 	test_sample_admission_identity = 2;
-	test_sample_admission_captures = 0;
+	test_sample_admission_captures = test_source_steps = 0;
+	MemSet(&test_sample_source, 0, sizeof(test_sample_source));
+	MemSet(&test_first_source, 0, sizeof(test_first_source));
+	MemSet(&test_last_source, 0, sizeof(test_last_source));
+	test_sample_source.system_identifier = 91;
+	test_sample_source.record_generation = 17;
+	test_sample_source.formation_epoch = 9;
+	test_sample_source.local_boot_incarnation = 47;
+	test_sample_source.local_node_id = 0;
+	test_sample_source.admitted_members_lo = 3;
+	test_sample_source.admitted_incarnation[0] = 47;
+	test_sample_source.admitted_incarnation[1] = 53;
 	test_change_admission_after_n = false;
 	test_census_busy = test_census_invalid = test_maintenance_cut = test_ctrc_progress = false;
 	test_reference = FullTransactionIdFromEpochAndXid(7, 100);
@@ -1283,10 +1311,63 @@ UT_TEST(test_sample_sequence_survives_worker0_respawn_and_never_wraps)
 	UT_ASSERT_EQ(undo_cleaner_state->active_sample_sequence, UINT64_MAX);
 }
 
+UT_TEST(test_worker_census_borrows_semantic_boot_not_lease_owner)
+{
+	ClusterUndoCleanerActiveSample sample;
+	bool remaining;
+
+	reset_wait_fixture();
+	undo_cleaner_worker = 0;
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT_EQ(test_source_steps, 1);
+	UT_ASSERT_EQ(test_sample_admission_captures, 1);
+	UT_ASSERT_EQ(test_first_source.system_identifier, test_sample_source.system_identifier);
+	UT_ASSERT_EQ(test_first_source.record_generation, test_sample_source.record_generation);
+	UT_ASSERT_EQ(test_first_source.formation_epoch, test_sample_source.formation_epoch);
+	UT_ASSERT_EQ(test_first_source.local_boot_incarnation, 47);
+	UT_ASSERT_EQ(undo_cleaner_active_lease_fence.incarnation, 31);
+	UT_ASSERT_EQ(test_first_source.admitted_incarnation[1], 53);
+	UT_ASSERT_EQ(test_first_source.admission_publication_seq, test_sample_admission_identity);
+	UT_ASSERT(!cluster_undo_cleaner_active_sample(&sample));
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT_EQ(test_source_steps, 2);
+	UT_ASSERT_EQ(test_sample_admission_captures, 1);
+	UT_ASSERT_EQ(memcmp(&test_first_source, &test_last_source, sizeof(test_first_source)), 0);
+	UT_ASSERT(cluster_undo_cleaner_active_sample(&sample));
+	UT_ASSERT(cluster_undo_cleaner_active_sample_current(&sample));
+	UT_ASSERT_EQ(test_modifier_entries, 0);
+}
+
+UT_TEST(test_worker_census_source_republication_discards_before_replacement)
+{
+	bool remaining;
+
+	reset_wait_fixture();
+	undo_cleaner_worker = 0;
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT_EQ(test_source_steps, 1);
+	test_sample_admission_identity += 2;
+	test_sample_source.local_boot_incarnation++;
+	test_sample_source.admitted_incarnation[0]++;
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.status, CTRC_ACTIVE_SCAN_INVALID);
+	UT_ASSERT_EQ(test_source_steps, 2);
+	UT_ASSERT_EQ(test_last_source.local_boot_incarnation, 47);
+	UT_ASSERT_EQ(test_sample_admission_captures, 1);
+	UT_ASSERT_EQ(undo_cleaner_active_admission_fence.local_boot_incarnation, 0);
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT_EQ(test_source_steps, 3);
+	UT_ASSERT_EQ(test_last_source.local_boot_incarnation, 48);
+	UT_ASSERT_EQ(test_last_source.admission_publication_seq, test_sample_admission_identity);
+	UT_ASSERT_EQ(test_sample_admission_captures, 2);
+	UT_ASSERT_EQ(test_pgproc_samples, 2);
+	UT_ASSERT_EQ(test_modifier_entries, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(26);
 	UT_RUN(test_capacity_wait_retries_signals_and_cadence_without_authorizing_free);
 	UT_RUN(test_capacity_sleep_reports_frontend_undo_event);
 	UT_RUN(test_capacity_sleep_restores_outer_event_on_normal_return);
@@ -1311,6 +1392,8 @@ main(void)
 	UT_RUN(test_complete_sample_is_shared_without_publishing_partial_round);
 	UT_RUN(test_complete_sample_rechecks_original_fences_and_worker_lifecycle);
 	UT_RUN(test_sample_sequence_survives_worker0_respawn_and_never_wraps);
+	UT_RUN(test_worker_census_borrows_semantic_boot_not_lease_owner);
+	UT_RUN(test_worker_census_source_republication_discards_before_replacement);
 	free(undo_cleaner_state);
 	UT_DONE();
 	return ut_failed_count != 0;
