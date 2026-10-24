@@ -5,6 +5,9 @@ int side_xact_fixture_main(void);
 #include "test_cluster_side_xact.c"
 #undef main
 #include "pgstat.h"
+#include "utils/syscache.h"
+
+#include "test_cluster_side_xact_effects.inc"
 
 /* Insert the native counted array before invalidations/SCN/TT/typed drops. */
 static Size
@@ -656,10 +659,133 @@ UT_TEST(test_pi_relation_stats_preserves_other_commit_effect_checks)
 	}
 }
 
+
+UT_TEST(test_pi_and_cold_effects_keep_distinct_stats_and_children_contracts)
+{
+	for (int cold = 0; cold < 2; cold++) {
+		for (int variant = 0; variant < 9; variant++) {
+			xl_xact_stats_item items[2] = {
+				{ PGSTAT_KIND_RELATION, 5, 76543 }, { PGSTAT_KIND_RELATION, InvalidOid, 1260 }
+			};
+			xl_xact_parsed_commit parsed = {0};
+			RfSideXactOperationV1 out = {0};
+			bool expected = true;
+
+			parsed.xinfo = XACT_XINFO_HAS_DBINFO;
+			parsed.dbId = 5;
+			parsed.nstats = 2;
+			parsed.stats = items;
+			switch (variant) {
+			case 0: break;
+			case 1: parsed.nsubxacts = 1; expected = cold; break;
+			case 2: items[0].kind = PGSTAT_KIND_FUNCTION; expected = cold; break;
+			case 3: parsed.nsubxacts = 2; items[0].kind = PGSTAT_KIND_FUNCTION; expected = cold; break;
+			case 4: items[0].kind = PGSTAT_KIND_FUNCTION; items[0].dboid = InvalidOid; expected = false; break;
+			case 5: items[0].kind = PGSTAT_KIND_DATABASE; expected = false; break;
+			case 6: items[1].objoid = InvalidOid; expected = false; break;
+			case 7: items[1].dboid = 6; expected = false; break;
+			case 8: parsed.xinfo = 0; expected = cold; break;
+			}
+			/* A cold caller still owes its original bounded child-list and
+			 * execution preflight; this is only the shared effects predicate. */
+			UT_ASSERT_EQ(side_xact_pi_effects_valid(&parsed, UINT64_C(0x11223344), cold, &out), expected);
+		}
+	}
+}
+
+UT_TEST(test_cold_effects_reject_unsupported_stats_without_changing_owner)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		xl_xact_stats_item item = { PGSTAT_KIND_FUNCTION, 5, 99 };
+		xl_xact_parsed_commit parsed = {0};
+		RfSideXactOperationV1 out = {0};
+
+		parsed.xinfo = XACT_XINFO_HAS_DBINFO;
+		parsed.dbId = 5;
+		parsed.nstats = 1;
+		parsed.stats = &item;
+		switch (variant) {
+		case 0: item.dboid = InvalidOid; break;
+		case 1: item.objoid = InvalidOid; break;
+		case 2: item.kind = PGSTAT_KIND_ARCHIVER; break;
+		case 3: item.kind = PGSTAT_KIND_SUBSCRIPTION; break;
+		}
+		UT_ASSERT(!side_xact_pi_effects_valid(&parsed, UINT64_C(0x11223344), true, &out));
+		UT_ASSERT_EQ(out.kind, 0);
+	}
+}
+
+UT_TEST(test_effect_modes_preserve_origin_physical_and_invalidation_checks)
+{
+	for (int cold = 0; cold < 2; cold++) {
+		for (int variant = 0; variant < 7; variant++) {
+			xl_xact_parsed_commit parsed = {0};
+			SharedInvalidationMessage msg = {0};
+			RfSideXactOperationV1 out = {0};
+			bool expected = false;
+
+			parsed.xinfo = XACT_XINFO_HAS_DBINFO;
+			parsed.dbId = 5; parsed.tsId = DEFAULTTABLESPACE_OID;
+			switch (variant) {
+			case 0: parsed.xinfo |= XACT_XINFO_HAS_ORIGIN; break;
+			case 1: parsed.nrels = 1; break;
+			case 2: parsed.nrels = 1; parsed.nspace_drops = 1; break;
+			case 3: parsed.nmsgs = 1; parsed.msgs = &msg; msg.cc.id = 0; msg.cc.dbId = 6; break;
+			case 4: parsed.nmsgs = 1; parsed.msgs = &msg; msg.cc.id = SHAREDINVALSMGR_ID; break;
+			case 5: parsed.nmsgs = 1; parsed.msgs = &msg; parsed.xinfo = 0; break;
+			case 6: parsed.nmsgs = 1; parsed.msgs = &msg; msg.cc.id = 0; msg.cc.dbId = 5; expected = true; break;
+			}
+			UT_ASSERT_EQ(side_xact_pi_effects_valid(&parsed, UINT64_C(0x11223344), cold, &out), expected);
+			if (expected) {
+				UT_ASSERT_EQ(out.invalidation_count, 1);
+				UT_ASSERT_EQ(out.invalidation_kinds, 1);
+			}
+		}
+	}
+}
+
+UT_TEST(test_live_pi_entry_never_selects_cold_children_or_function_stats)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		xl_xact_stats_item item = { variant & 1 ? PGSTAT_KIND_FUNCTION : PGSTAT_KIND_RELATION, 5, 76543 };
+		FakeXactRecord fake;
+		RfPageOnlineRecordIdentityV1 identity;
+		RfSideXactOperationV1 operation;
+
+		pi_commit(&fake, 0, NULL, 0);
+		pi_commit_add_stats(&fake, &item, 1);
+		if (variant & 2) {
+			uint32 xinfo;
+			int count = 1;
+			TransactionId child = 802;
+			Size offset = MinSizeOfXactCommit + sizeof(xl_xact_xinfo) + sizeof(xl_xact_dbinfo);
+			Size extra = sizeof(count) + sizeof(child);
+
+			memcpy(&xinfo, fake.data + MinSizeOfXactCommit, sizeof(xinfo));
+			UT_ASSERT(fake.u.decoded.main_data_len + extra <= sizeof(fake.data));
+			memmove(fake.data + offset + extra, fake.data + offset, fake.u.decoded.main_data_len - offset);
+			memcpy(fake.data + offset, &count, sizeof(count));
+			memcpy(fake.data + offset + sizeof(count), &child, sizeof(child));
+			xinfo |= XACT_XINFO_HAS_SUBXACTS;
+			memcpy(fake.data + MinSizeOfXactCommit, &xinfo, sizeof(xinfo));
+			fake.u.decoded.main_data_len += extra;
+		}
+		identity = pi_identity(&fake);
+		UT_ASSERT_EQ(rf_side_xact_inspect_pi_v1(&fake.reader, identity.record.system_identifier,
+			identity.record.origin_thread, &operation), variant == 0);
+		if (variant == 0) UT_ASSERT(operation.pi_read_only);
+		else UT_ASSERT_EQ(operation.kind, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(17);
+	UT_RUN(test_pi_and_cold_effects_keep_distinct_stats_and_children_contracts);
+	UT_RUN(test_cold_effects_reject_unsupported_stats_without_changing_owner);
+	UT_RUN(test_effect_modes_preserve_origin_physical_and_invalidation_checks);
+	UT_RUN(test_live_pi_entry_never_selects_cold_children_or_function_stats);
 	UT_RUN(test_pi_commit_keeps_complete_flags_and_invalidation_payload);
 	UT_RUN(test_pi_side_plan_rejects_execution_before_callbacks);
 	UT_RUN(test_pi_commit_unknown_or_damaged_effects_still_refuse);

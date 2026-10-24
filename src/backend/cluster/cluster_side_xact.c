@@ -327,32 +327,64 @@ side_xact_no_abort_effects(const xl_xact_parsed_abort *parsed)
 	return parsed->nsubxacts == 0 && parsed->nrels == 0 && parsed->nstats == 0;
 }
 
+static bool
+side_xact_cold_stats_valid(int count, const xl_xact_stats_item *items, uint32 xinfo, Oid database)
+{
+	if (count < 0 || (count != 0 && items == NULL))
+		return false;
+	for (int i = 0; i < count; i++) {
+		xl_xact_stats_item item;
+
+		memcpy(&item, &items[i], sizeof(item));
+		/* Only the supported native transactional object owners. Fixed stats,
+		 * unknown kinds and unsupported subscription/slot effects cannot reach
+		 * pgstat's unchecked kind table. No catalog read or alternate owner. */
+		if ((item.kind != PGSTAT_KIND_RELATION && item.kind != PGSTAT_KIND_FUNCTION)
+			|| !OidIsValid(item.objoid)
+			|| (item.kind == PGSTAT_KIND_FUNCTION && !OidIsValid(item.dboid))
+			|| ((xinfo & XACT_XINFO_HAS_DBINFO) != 0 && item.dboid != InvalidOid
+				&& item.dboid != database))
+			return false;
+	}
+	return true;
+}
+
+
 /* Transactional invalidations affect logical caches, not a physical PAGE or
  * SPACE version. Preserve every message and its scope; inspection never
  * asserts that the original cache owner delivered it. SMGR/RELMAP messages
  * are nontransactional and need a separate dependency classification. */
 static bool
 side_xact_pi_effects_valid(const xl_xact_parsed_commit *parsed, uint64 system_identifier,
-						   RfSideXactOperationV1 *out)
+						   bool cold_completion, RfSideXactOperationV1 *out)
 {
 	uint32 kinds = 0;
 
 	/* These additional transaction owners are not proved by this consumer. */
-	if (parsed->nsubxacts != 0 || (parsed->xinfo & XACT_XINFO_HAS_ORIGIN) != 0)
+	if ((!cold_completion && parsed->nsubxacts != 0)
+		|| (parsed->xinfo & XACT_XINFO_HAS_ORIGIN) != 0)
 		return false;
-	/* Relation statistics are logical pgstat keys, not physical locators.
-	 * Their original transaction/recovery owner still owes every deletion;
-	 * keeping the complete payload does not execute it or add a version edge.
-	 * Shared keys use dboid zero; other keys need the original COMMIT scope. */
-	for (int i = 0; i < parsed->nstats; i++) {
-		xl_xact_stats_item item;
-
-		memcpy(&item, &parsed->stats[i], sizeof(item));
-		if (item.kind != PGSTAT_KIND_RELATION || !OidIsValid(item.objoid)
-			|| (OidIsValid(item.dboid)
-				&& ((parsed->xinfo & XACT_XINFO_HAS_DBINFO) == 0
-					|| item.dboid != parsed->dbId)))
+	/* Keep the original cold completion and PI obligations separate. The
+	 * cold caller must still validate its native child list and execution
+	 * owner; this effects predicate cannot qualify a cold completion. */
+	if (cold_completion) {
+		if (!side_xact_cold_stats_valid(parsed->nstats, parsed->stats, parsed->xinfo, parsed->dbId))
 			return false;
+	} else {
+		/* Relation statistics are logical pgstat keys, not physical locators.
+		 * Their original transaction/recovery owner still owes every deletion;
+		 * keeping the complete payload does not execute it or add a version edge.
+		 * Shared keys use dboid zero; other keys need the original COMMIT scope. */
+		for (int i = 0; i < parsed->nstats; i++) {
+			xl_xact_stats_item item;
+
+			memcpy(&item, &parsed->stats[i], sizeof(item));
+			if (item.kind != PGSTAT_KIND_RELATION || !OidIsValid(item.objoid)
+				|| (OidIsValid(item.dboid)
+					&& ((parsed->xinfo & XACT_XINFO_HAS_DBINFO) == 0
+						|| item.dboid != parsed->dbId)))
+				return false;
+		}
 	}
 	/* Every physical deletion must have its typed identity and version pair;
 	 * a prefix of the locator array cannot discharge the rest. */
@@ -660,7 +692,7 @@ side_xact_decode(XLogReaderState *record, uint64 system_identifier, uint16 origi
 							   XLogRecGetDataLen(record), &parsed))
 			return false;
 		if ((pi_read_only
-			 ? !side_xact_pi_effects_valid(&parsed, system_identifier, &candidate)
+			 ? !side_xact_pi_effects_valid(&parsed, system_identifier, false, &candidate)
 			 : (!side_xact_no_commit_effects(&parsed)
 				&& !side_xact_space_drops_valid(&parsed, system_identifier)))
 			|| (parsed.xinfo & XACT_XINFO_HAS_TWOPHASE) != 0 || !SCN_VALID(parsed.scn)

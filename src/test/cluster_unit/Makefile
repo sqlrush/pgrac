@@ -3069,7 +3069,15 @@ test_cluster_wal_checkpoint_sample: test_cluster_wal_checkpoint_sample.c unit_te
 		test_cluster_wal_checkpoint_sample.inc test_cluster_wal_checkpoint_dump.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
-test_cluster_pi_contribution: test_cluster_page_data_stable.o
+# Execute both modes of the actual shared effects predicate. The optional
+# cold stats helper permits the signature-only parent RED, without copying it.
+test_cluster_side_xact_effects.inc: $(top_srcdir)/src/backend/cluster/cluster_side_xact.c Makefile
+	awk '/^side_xact_(space_drops|cold_stats|pi_effects)_valid\(/ { print "static bool"; emit=1; count[$$0]++; found++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (found < 2 || found > 3) exit 1; for (name in count) if (count[name] != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pi_contribution: test_cluster_page_data_stable.o test_cluster_side_xact_effects.inc
 
 test_cluster_side_xact test_cluster_pi_contribution: %: %.c unit_test.h test_cluster_side_xact.c test_cluster_undo_header_identity.inc \
 		test_cluster_side_online_owner_product.o \
