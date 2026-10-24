@@ -20730,6 +20730,7 @@ cluster_heap_freeze_apply_xmin_batch_locked_v1(
 		return false;
 	BufferGetTag(buffer, &locator, &fork, &block);
 	if (!RelFileLocatorEquals(locator, rel->rd_locator)
+		|| !RelFileLocatorEquals(locator, fence->identity.key.locator)
 		|| fork != MAIN_FORKNUM || block != fence->block)
 		return false;
 	InitBufferTag(&tag, &locator, fork, block);
@@ -20840,6 +20841,11 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 	 * or replace an already-owned local lock. */
 	if (buffer <= 0 || buffer > NBuffers || BufferDescriptors == NULL
 		|| !ClusterBufferHasSharedPin(buffer))
+		return false;
+	/* Exact proof inputs for another relation cannot restore this buffer's
+	 * writer or enter the native maintenance error path. */
+	if (rel == NULL || fence == NULL
+		|| !RelFileLocatorEquals(rel->rd_locator, fence->identity.key.locator))
 		return false;
 	/* Plan only from the caller's immutable captured inputs. Finish the
 	 * whole batch before restoring a writer or taking its local content X;
