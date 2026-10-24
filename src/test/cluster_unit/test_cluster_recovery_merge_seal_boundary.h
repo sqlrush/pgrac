@@ -218,6 +218,7 @@ appendStringInfo(StringInfo str, const char *fmt, ...)
 }
 
 /* ---- recovery plan, stream checks, shared root membership ---- */
+#ifndef TEST_RECOVERY_PLAN_PUBLISHED
 static bool plan_snapshot_available = true;
 
 bool
@@ -228,6 +229,7 @@ cluster_recovery_plan_snapshot(ClusterRecoveryPlan *out)
 	*out = census;
 	return true;
 }
+#endif
 
 bool
 cluster_recovery_worker_pool_snapshot(ClusterRecoveryWorkerPool *out)

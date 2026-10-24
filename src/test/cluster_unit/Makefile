@@ -217,6 +217,7 @@ TESTS += test_cluster_undo_header_durability
 TESTS += test_cluster_tt_checkpoint_cuts
 TESTS += test_cluster_tt_checkpoint_native
 TESTS += test_cluster_recovery_plan_source
+TESTS += test_cluster_recovery_plan_merge
 TESTS += test_cluster_tt_checkpoint_publish
 TESTS += test_cluster_tt_2pc_finish
 TESTS += test_cluster_tt_rollback_entry
@@ -456,6 +457,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_guard,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_authority,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_thread_recovery_fabric_plan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_plan_source,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_recovery_plan_merge,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_thread_recovery_fabric_apply,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_thread_recovery_fabric_scan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_thread_recovery_fabric_execute,$(SIMPLE_TESTS))
@@ -9855,6 +9857,26 @@ test_cluster_recovery_plan_generate.inc: $(top_srcdir)/src/backend/cluster/clust
 test_cluster_recovery_plan_source: test_cluster_recovery_plan_source.c unit_test.h \
         test_cluster_recovery_plan_generate.inc \
         $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
+test_cluster_recovery_plan_shmem.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c Makefile
+	awk '/^typedef struct ClusterRecoveryCheckpointSlotV1 \{/ { emit=1; count++ } emit { print } /^static ClusterRecoveryPlanShmem \*cluster_recovery_plan_shmem = NULL;/ { if (emit) exit } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_recovery_plan_publication.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c Makefile
+	awk '/^publish_plan\(/ { print "static void"; emit=1; count++ } /^cluster_recovery_plan_snapshot\(/ { print "bool"; emit=1; count++ } emit { print } /^}/ { emit=0 } END { if (count != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_recovery_plan_merge: test_cluster_recovery_plan_merge.c unit_test.h \
+        test_cluster_recovery_plan_shmem.inc test_cluster_recovery_plan_publication.inc \
+        test_cluster_recovery_plan_generate.inc test_cluster_recovery_merge_seal_boundary.h \
+        test_cluster_recovery_merge_cold_fixture.h \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_merge.h \
+        $(top_srcdir)/src/include/cluster/cluster_control_root.h \
+        $(top_srcdir)/src/include/cluster/cluster_thread_recovery.h \
+        $(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
+        $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 test_cluster_cold_start_prepare: test_cluster_cold_start_prepare.c unit_test.h \
