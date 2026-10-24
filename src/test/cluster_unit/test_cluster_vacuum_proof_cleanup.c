@@ -93,6 +93,8 @@ static unsigned cohort_calls, bindings_at_cohort;
 static bool error_cohort, revoke_cohort;
 static bool policy_sample_current, revoke_on_policy_check;
 static unsigned policy_checks;
+static bool cohort_fence_current, revoke_on_cohort_fence_check, error_cohort_fence;
+static unsigned cohort_fence_checks, policy_checks_at_cohort_fence;
 
 static void
 note_cleanup(char event)
@@ -540,6 +542,23 @@ cluster_heap_freeze_policy_sample_current_v1(const ClusterHeapFreezePolicySample
 	return policy_sample_current;
 }
 
+bool
+cluster_semantic_activation_active_sample_current(const ClusterSemanticActiveSampleFence *expected)
+{
+	if (guard_held || pin_held || content_locked || debt != 1)
+		abort();
+	cohort_fence_checks++;
+	UT_ASSERT(policy_checks > policy_checks_at_cohort_fence);
+	policy_checks_at_cohort_fence = policy_checks;
+	UT_ASSERT_EQ(target_bindings, 0);
+	UT_ASSERT_EQ(memcmp(expected, &cohort_value.admission_fence, sizeof(*expected)), 0);
+	if (revoke_on_cohort_fence_check)
+		changed_admission = true;
+	if (error_cohort_fence)
+		throw_error();
+	return cohort_fence_current;
+}
+
 #include "test_cluster_vacuum_proof_cleanup.inc"
 
 static void
@@ -586,12 +605,26 @@ reset_fixture(void)
 	cohort_value.record_generation = 17;
 	cohort_value.formation_epoch = 9;
 	cohort_value.admitted_members_lo = 3;
+	cohort_value.admission_fence.system_identifier = 9101;
+	cohort_value.admission_fence.admission_publication_seq = 9102;
+	cohort_value.admission_fence.active_bits = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	cohort_value.admission_fence.record_generation = cohort_value.record_generation;
+	cohort_value.admission_fence.formation_epoch = cohort_value.formation_epoch;
+	cohort_value.admission_fence.membership_cut_generation = 9103;
+	cohort_value.admission_fence.local_boot_incarnation = 81;
+	cohort_value.admission_fence.admitted_members_lo = cohort_value.admitted_members_lo;
+	cohort_value.admission_fence.admitted_incarnation[0] = 81;
+	cohort_value.admission_fence.admitted_incarnation[1] = 82;
+	cohort_value.admission_fence.local_node_id = 0;
 	cohort_status = CLUSTER_HEAP_FREEZE_COHORT_READY;
 	cohort_calls = bindings_at_cohort = 0;
 	error_cohort = revoke_cohort = false;
 	policy_sample_current = true;
 	revoke_on_policy_check = false;
 	policy_checks = 0;
+	cohort_fence_current = true;
+	revoke_on_cohort_fence_check = error_cohort_fence = false;
+	cohort_fence_checks = policy_checks_at_cohort_fence = 0;
 	enters = leaves = debt = resolves = routes = fail_resolve = 0;
 	reject_admission = reject_route_after = unknown_outcome = false;
 	error_preflight = error_validate = guard_held = false;
@@ -1501,6 +1534,71 @@ UT_TEST(cohort_observation_uses_original_admission_after_local_release)
 	UT_ASSERT_STR_EQ(cleanup_order, "LPA");
 }
 
+UT_TEST(cohort_source_fence_is_rechecked_after_policy_before_binding)
+{
+	reset_fixture();
+	set_shared_policy(80);
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(cohort_fence_checks, 1);
+	UT_ASSERT(vacrel.shared_freeze_cohort_observed);
+	UT_ASSERT_EQ(memcmp(&vacrel.shared_freeze_cohort.admission_fence,
+		&cohort_value.admission_fence, sizeof(cohort_value.admission_fence)), 0);
+	UT_ASSERT_EQ(target_bindings, 1);
+	UT_ASSERT_EQ(debt, 0);
+}
+
+UT_TEST(stale_cohort_source_fence_keeps_proof_without_saving_candidate)
+{
+	reset_fixture();
+	set_shared_policy(80);
+	seed_stale_cohort();
+	cohort_fence_current = false;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(cohort_fence_checks, 1);
+	check_no_cohort();
+	UT_ASSERT_EQ(target_bindings, 1);
+	UT_ASSERT(vacrel.shared_freeze_fence_valid);
+	UT_ASSERT_EQ(debt, 0);
+	UT_ASSERT_EQ(leaves, 1);
+	UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+}
+
+UT_TEST(admission_change_during_cohort_fence_recheck_precedes_binding)
+{
+	reset_fixture();
+	set_shared_policy(80);
+	seed_stale_cohort();
+	revoke_on_cohort_fence_check = true;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	UT_ASSERT_EQ(cohort_fence_checks, 1);
+	check_no_cohort();
+	UT_ASSERT_EQ(target_bindings, 0);
+	UT_ASSERT_EQ(debt, 0);
+	UT_ASSERT_EQ(leaves, 1);
+}
+
+UT_TEST(cohort_source_fence_error_and_cancel_unwind_original_admission)
+{
+	for (unsigned variant = 0; variant < 2; variant++)
+	{
+		reset_fixture();
+		set_shared_policy(80);
+		seed_stale_cohort();
+		error_cohort_fence = true;
+		if (variant == 1) inject_code = ERRCODE_QUERY_CANCELED;
+		check_error_cleanup("LPA");
+		UT_ASSERT_EQ(cohort_fence_checks, 1);
+		UT_ASSERT_EQ(target_bindings, 0);
+		check_no_cohort();
+		error_cohort_fence = false;
+		UT_ASSERT(!collect_catches_error());
+		UT_ASSERT_EQ(collected_status, CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT_EQ(enters, 2);
+		UT_ASSERT_EQ(leaves, 2);
+		UT_ASSERT_EQ(debt, 0);
+	}
+}
+
 UT_TEST(cohort_candidate_cannot_raise_original_full_policy_bound)
 {
 	reset_fixture();
@@ -1718,7 +1816,7 @@ UT_TEST(next_collection_cannot_reuse_previous_cohort_on_sample_refusal)
 int
 main(void)
 {
-	UT_PLAN(61);
+	UT_PLAN(65);
 	UT_RUN(invalid_input_does_not_leave);
 	UT_RUN(rejected_admission_does_not_leave);
 	UT_RUN(normal_success_leaves_once);
@@ -1768,6 +1866,10 @@ main(void)
 	UT_RUN(creation_binding_runs_after_local_release_before_admission_leave);
 	UT_RUN(rejected_or_cleaned_collection_cannot_reuse_creation_indexes);
 	UT_RUN(cohort_observation_uses_original_admission_after_local_release);
+	UT_RUN(cohort_source_fence_is_rechecked_after_policy_before_binding);
+	UT_RUN(stale_cohort_source_fence_keeps_proof_without_saving_candidate);
+	UT_RUN(admission_change_during_cohort_fence_recheck_precedes_binding);
+	UT_RUN(cohort_source_fence_error_and_cancel_unwind_original_admission);
 	UT_RUN(cohort_candidate_cannot_raise_original_full_policy_bound);
 	UT_RUN(cohort_refusals_clear_observation_without_rejecting_original_proof);
 	UT_RUN(mismatched_or_malformed_cohort_never_publishes_candidate);

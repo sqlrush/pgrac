@@ -1887,6 +1887,37 @@ UT_TEST(test_v2_cohort_requires_both_mask_halves_and_keeps_domains_separate)
 	UT_ASSERT(cluster_conf_lookup_node(65) == NULL);
 }
 
+UT_TEST(test_v2_cohort_retains_complete_original_admission_fence)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
+	ClusterHeapFreezeCohortObservation out;
+	ClusterSemanticActiveSampleFence expected;
+
+	/* Distinct source sentinels, while retaining the same legitimate cohort. */
+	test_v2_fence.admission_publication_seq = 7102;
+	test_v2_fence.membership_cut_generation = 7103;
+	test_sender_sample.admission_fence = test_v2_fence;
+	test_horizon_store.freeze_slots[1].fence = test_v2_fence;
+	cohort_receive(65, report);
+	expected = test_v2_fence;
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
+#define CHECK_FENCE_FIELD(field) UT_ASSERT_EQ(out.admission_fence.field, expected.field)
+	CHECK_FENCE_FIELD(system_identifier);
+	CHECK_FENCE_FIELD(admission_publication_seq);
+	CHECK_FENCE_FIELD(active_bits);
+	CHECK_FENCE_FIELD(record_generation);
+	CHECK_FENCE_FIELD(formation_epoch);
+	CHECK_FENCE_FIELD(membership_cut_generation);
+	CHECK_FENCE_FIELD(local_boot_incarnation);
+	CHECK_FENCE_FIELD(admitted_members_lo);
+	CHECK_FENCE_FIELD(admitted_members_hi);
+	CHECK_FENCE_FIELD(local_node_id);
+#undef CHECK_FENCE_FIELD
+	for (unsigned peer = 0; peer < CLUSTER_MAX_NODES; peer++)
+		UT_ASSERT_EQ(out.admission_fence.admitted_incarnation[peer], expected.admitted_incarnation[peer]);
+}
+
 UT_TEST(test_v2_cohort_retains_same_local_sample_identity_coverage)
 {
 	for (unsigned variant = 0; variant < 3; variant++)
@@ -2291,7 +2322,7 @@ UT_TEST(test_v2_lmon_observes_clock_rollback_as_stale)
 int
 main(void)
 {
-	UT_PLAN(79);
+	UT_PLAN(80);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -2358,6 +2389,7 @@ main(void)
 	UT_RUN(test_v2_lmon_relay_rechecks_admission_before_handoff);
 	UT_RUN(test_v2_lmon_relay_uses_original_cadence_and_no_completion_cache);
 	UT_RUN(test_v2_cohort_missing_members_never_shrink_required_set);
+	UT_RUN(test_v2_cohort_retains_complete_original_admission_fence);
 	UT_RUN(test_v2_cohort_retains_same_local_sample_identity_coverage);
 	UT_RUN(test_v2_cohort_h_freshness_does_not_expire_f_sample);
 	UT_RUN(test_v2_cohort_uses_end_clock_and_rejects_rollback);

@@ -5,6 +5,7 @@
 
 #include "access/transam.h"
 #include "cluster/cluster_xid_stripe_boot.h"
+#include "cluster/cluster_semantic_activation.h"
 
 /* Before heap mutation, cap a local proposal at the immutable activation
  * floor: another slot can still issue an XID below this node's proposal.
@@ -144,6 +145,9 @@ typedef struct ClusterHeapFreezeCohortObservation {
 	uint64 admitted_members_hi;
 	/* Same local completed sample; remote reports do not prove identity coverage. */
 	uint64 local_unqualified_entries;
+	/* Original fixed-cohort cut, retained verbatim for the existing current
+	 * getter. Keep unchanged; not a producer-retention certificate. */
+	ClusterSemanticActiveSampleFence admission_fence;
 } ClusterHeapFreezeCohortObservation;
 
 /* Bounded reads, fixed required set, current connection/admission rechecks.

@@ -1020,6 +1020,7 @@ undo_horizon_v2_cohort_observe(ClusterHeapFreezeCohortObservation *out,
 		= undo_horizon_maintenance_coverage(cluster_node_id, candidate.future_full_xid_max);
 	candidate.active_full_xid_min = U64FromFullTransactionId(active.scan.min_full);
 	candidate.local_unqualified_entries = active.scan.unqualified_entries;
+	memcpy(&candidate.admission_fence, &fence, sizeof(fence));
 	candidate.horizon_scn = history.horizon_scn;
 	candidate.record_generation = fence.record_generation;
 	candidate.formation_epoch = fence.formation_epoch;
@@ -1043,7 +1044,7 @@ undo_horizon_v2_cohort_observe(ClusterHeapFreezeCohortObservation *out,
 	if (!cluster_undo_cleaner_active_sample_current(&active)
 		|| !cluster_semantic_activation_active_sample_current(&fence))
 		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
-	*out = candidate;
+	memcpy(out, &candidate, sizeof(candidate));
 	if (maintenance != NULL)
 		*maintenance = observed;
 	return CLUSTER_HEAP_FREEZE_COHORT_READY;

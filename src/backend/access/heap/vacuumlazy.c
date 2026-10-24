@@ -1915,15 +1915,25 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 			ClusterHeapFreezeCohortObservation cohort;
 			ClusterHeapFreezeCohortStatus cohort_status;
 			bool policy_current;
+			bool cohort_current;
 
 			memset(&cohort, 0, sizeof(cohort));
 			cohort_status = cluster_heap_freeze_cohort_observe(&cohort);
 			policy_current = cohort_status == CLUSTER_HEAP_FREEZE_COHORT_READY
 				&& cluster_heap_freeze_policy_sample_current_v1(&vacrel->cutoffs.SharedFreezePolicySample);
+			/* Preserve and recheck the original full member/incarnation cut,
+			 * then recheck our entered token after this read-only callback. */
+			cohort_current = policy_current
+				&& cluster_semantic_activation_active_sample_current(&cohort.admission_fence);
 			if (!cluster_semantic_activation_recheck_r4_terminal_census(&admission))
 				status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
 			else if (cohort_status == CLUSTER_HEAP_FREEZE_COHORT_READY
-					 && policy_current
+					 && cohort_current
+					 && cohort.admission_fence.record_generation == cohort.record_generation
+					 && cohort.admission_fence.formation_epoch == cohort.formation_epoch
+					 && cohort.admission_fence.admitted_members_lo == cohort.admitted_members_lo
+					 && cohort.admission_fence.admitted_members_hi == cohort.admitted_members_hi
+					 && cohort.admission_fence.local_node_id == cluster_node_id
 					 && cohort.local_unqualified_entries == 0
 					 && cohort.record_generation == admission.record_generation
 					 && cohort.formation_epoch == admission.formation_epoch
@@ -1937,7 +1947,7 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 						  ? cohort.admitted_members_lo >> cluster_node_id
 						  : cohort.admitted_members_hi >> (cluster_node_id - 64)) & 1) != 0)
 			{
-				vacrel->shared_freeze_cohort = cohort;
+				memcpy(&vacrel->shared_freeze_cohort, &cohort, sizeof(cohort));
 				vacrel->shared_freeze_candidate_limit_full = FullTransactionIdFromU64(
 					Min(U64FromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull),
 						cohort.active_full_xid_min));
