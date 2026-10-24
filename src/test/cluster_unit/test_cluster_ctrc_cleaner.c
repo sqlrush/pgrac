@@ -4556,6 +4556,192 @@ finish_source_active_scan(ClusterCtrcActiveScan *scan,
 	}
 }
 
+/* Compose the original registration and release owners, rather than seeding
+ * an OPEN row or clearing it to simulate source retirement.  PGPROC removal
+ * and block-0 certificate durability remain controlled fixture boundaries. */
+static void
+exercise_original_producer_retention_lifecycle(bool applied)
+{
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcOriginReservation reservation;
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcParticipantIdentity identity = { 0 };
+	ClusterCtrcReceiptHandle handle;
+	ClusterCtrcParticipantEntry snapshot;
+	ClusterCtrcReceipt copied;
+	ClusterCtrcDurability durability = { 0 };
+	ClusterCtrcLocalReleaseAckV1 ack;
+	ClusterCtrcOriginCertificateSnapshot certificate = { 0 };
+	ClusterCtrcCloseDispatch dispatch = { 0 };
+	ClusterCtrcSealReplyResult reply;
+	ClusterCtrcActiveScan retained, fresh;
+	ClusterSemanticActiveSampleFence source;
+	FullTransactionId original, reference = FullTransactionIdFromEpochAndXid(9, 10000);
+	uint32 grant;
+	uint16 reason;
+
+	reset_fixture();
+	key = fresh_origin_key();
+	key.formation_epoch = key.cluster_epoch;
+	source = active_source_for_key(&key);
+	original = FullTransactionIdFromEpochAndXid(7, key.xid);
+	test_my_proc.xid = key.xid;
+	test_top_full = original;
+	pg_atomic_write_u64(&test_my_proc.cluster_top_full_xid_atomic,
+						U64FromFullTransactionId(original));
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &reservation),
+				 CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	origin = &ctrc_origin_entries()[reservation.origin_index];
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&retained, reference));
+	finish_source_active_scan(&retained, &source);
+	UT_ASSERT_EQ(retained.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(retained.unqualified_entries, 0);
+	UT_ASSERT(FullTransactionIdEquals(retained.min_full, original));
+	UT_ASSERT(cluster_ctrc_origin_open_reserved(&reservation, &grant));
+	identity.node_id = key.origin_node_id;
+	identity.boot_incarnation = key.origin_boot_incarnation;
+	identity.capability_record_generation = test_capability_generation;
+	identity.formation_epoch = key.formation_epoch;
+	identity.admission_record_generation = key.admission_record_generation;
+	UT_ASSERT_EQ(cluster_ctrc_origin_touch_exact(&key, &identity, CTRC_PROOF_ACTIVE, &grant),
+				 CLUSTER_CTRC_TOUCH_RECORDED);
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 701, &handle), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(FullTransactionIdEquals(handle.original_full_xid, original));
+	UT_ASSERT(FullTransactionIdEquals(handle.participant->original_full_xid, original));
+	/* Only after both actual shared owners retain the source may this
+	 * controlled backend retire its original transaction protection. */
+	test_my_proc.xid = InvalidTransactionId;
+	test_top_full = InvalidFullTransactionId;
+	pg_atomic_write_u64(&test_my_proc.cluster_top_full_xid_atomic, 0);
+	UT_ASSERT(cluster_ctrc_origin_begin_seal_shared(&key));
+	if (applied) {
+		ClusterCtrcTargetV1 target = handle.receipt->target;
+		ClusterCtrcItlTargetIdentity expected = { 0 };
+		ClusterCtrcApplyToken token;
+
+		target.kind = CTRC_TARGET_EXACT_ITL_SLOT;
+		target.itl_xid = key.xid;
+		target.itl_class = 1;
+		target.itl_slot_wrap = 1;
+		target.uba[0] = 1;
+		target.planned_predecessor_sha256[0] = 1;
+		target.planned_successor_sha256[0] = 2;
+		UT_ASSERT_EQ(cluster_ctrc_receipt_apply_shared(&handle, &target, &token),
+					 CLUSTER_CTRC_APPLY_APPLIED);
+		UT_ASSERT_EQ(cluster_ctrc_participant_request_shared(
+						 &key, &identity, grant, origin->seal_generation,
+						 CTRC_SEAL_CLOSE_AND_CLEAN, &reason, &ack),
+					 CTRC_SEAL_REPLY_PENDING_DRAIN);
+		expected.spc_oid = target.spc_oid;
+		expected.db_oid = target.db_oid;
+		expected.rel_number = target.rel_number;
+		expected.fork_number = target.fork_number;
+		expected.block_number = target.block_number;
+		expected.itl_xid = target.itl_xid;
+		expected.itl_slot_index = target.itl_slot_index;
+		expected.itl_slot_wrap = target.itl_slot_wrap;
+		expected.itl_class = target.itl_class;
+		expected.needs_wal = target.needs_wal;
+		memcpy(expected.uba, target.uba, sizeof(expected.uba));
+		/* No durable rewrite witness: the actual shared discharge must
+		 * retain APPLIED debt and the original source minimum. */
+		UT_ASSERT_EQ(cluster_ctrc_receipt_discharge_itl_shared(
+						 &handle, &expected, CTRC_ITL_TERMINAL_INDEPENDENT, &durability),
+					 CLUSTER_CTRC_DISCHARGE_RETAIN);
+		UT_ASSERT_EQ(handle.receipt->state, CTRC_RECEIPT_APPLIED);
+		UT_ASSERT(cluster_ctrc_active_scan_begin(&fresh, reference));
+		finish_source_active_scan(&fresh, &source);
+		UT_ASSERT_EQ(fresh.status, CTRC_ACTIVE_SCAN_COMPLETE);
+		UT_ASSERT_EQ(fresh.unqualified_entries, 0);
+		UT_ASSERT(FullTransactionIdEquals(fresh.min_full, original));
+		/* Controlled durability leaf, not a real page/WAL rewrite. */
+		durability.highest_local_lsn = durability.local_flush_lsn = 100;
+		UT_ASSERT_EQ(cluster_ctrc_receipt_discharge_itl_shared(
+						 &handle, &expected, CTRC_ITL_TERMINAL_INDEPENDENT, &durability),
+					 CLUSTER_CTRC_DISCHARGE_CLEANED);
+	} else
+		UT_ASSERT(cluster_ctrc_receipt_cancel_shared(&handle));
+	UT_ASSERT_EQ(cluster_ctrc_participant_request_shared(
+					 &key, &identity, grant, origin->seal_generation,
+					 CTRC_SEAL_CLOSE_AND_CLEAN, &reason, &ack),
+				 CTRC_SEAL_REPLY_PENDING_DRAIN);
+	/* Nonempty ranges require the original cleaner copy/hash/double-sample
+	 * ACK producer; CLOSE alone cannot skip it. */
+	snapshot = *handle.participant;
+	UT_ASSERT(ctrc_participant_copy_receipts(handle.participant_index, &snapshot, &copied, 1));
+	UT_ASSERT_EQ(cluster_ctrc_participant_ack_from_snapshot(&snapshot, &copied, 1, &durability, &ack),
+				 CLUSTER_CTRC_ACK_RELEASED);
+	UT_ASSERT(ctrc_participant_freeze_ack_exact(handle.participant_index, &snapshot, &copied, 1, &ack));
+	UT_ASSERT_EQ(cluster_ctrc_participant_request_shared(
+					 &key, &identity, grant, origin->seal_generation,
+					 CTRC_SEAL_CLOSE_AND_CLEAN, &reason, &ack),
+				 CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK);
+	UT_ASSERT(cluster_ctrc_origin_arm_close_entry(origin, identity.node_id, 501));
+	UT_ASSERT(cluster_ctrc_origin_ack_land_shared(501, &ack));
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	(void)ctrc_origin_dispatchable_locked(origin);
+	LWLockRelease(&CtrcShared->origin_lock);
+	UT_ASSERT(ctrc_origin_certificate_snapshot_index_locked(reservation.origin_index, &certificate));
+
+	/* Neither a closed receipt nor the local ACK is final reclamation. */
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&fresh, reference));
+	finish_source_active_scan(&fresh, &source);
+	UT_ASSERT_EQ(fresh.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(fresh.unqualified_entries, 0);
+	UT_ASSERT(FullTransactionIdEquals(fresh.min_full, original));
+	/* Actual volatile commit edge after the fixture's durable boundary;
+	 * this does not establish a real block-0 write or flush. */
+	UT_ASSERT(cluster_ctrc_origin_certificate_commit_entry(origin, &certificate));
+	dispatch.key = key;
+	dispatch.participant = identity;
+	dispatch.grant_generation = grant;
+	dispatch.seal_generation = origin->seal_generation;
+	dispatch.suboperation = CTRC_SEAL_CERTIFICATE_COMMITTED;
+	dispatch.request_id = 1234;
+	UT_ASSERT(cluster_ctrc_origin_arm_certificate_entry(origin, identity.node_id, dispatch.request_id));
+	UT_ASSERT(cluster_ctrc_participant_certificate_batch_shared(&dispatch, 1, &reply));
+	UT_ASSERT_EQ(reply, CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED);
+	UT_ASSERT(ctrc_bytes_zero(handle.participant, sizeof(*handle.participant)));
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&fresh, reference));
+	finish_source_active_scan(&fresh, &source);
+	UT_ASSERT_EQ(fresh.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(fresh.unqualified_entries, 0);
+	UT_ASSERT(FullTransactionIdEquals(fresh.min_full, original));
+	UT_ASSERT_EQ(origin->state, CTRC_ORIGIN_RELEASE_PROVEN);
+
+	{
+		ClusterCtrcOriginEntry before = *origin;
+
+		UT_ASSERT(!cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id + 1,
+																	  identity.node_id, reply));
+		UT_ASSERT(memcmp(origin, &before, sizeof(before)) == 0);
+	}
+	UT_ASSERT(cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id,
+																 identity.node_id, reply));
+	UT_ASSERT(ctrc_bytes_zero(origin, sizeof(*origin)));
+	/* A completed observation stays conservative after retirement; only a
+	 * fresh full cover can advance to the original reference. */
+	UT_ASSERT(cluster_ctrc_active_scan_registration_current(&retained));
+	UT_ASSERT(FullTransactionIdEquals(retained.min_full, original));
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&fresh, reference));
+	finish_source_active_scan(&fresh, &source);
+	UT_ASSERT_EQ(fresh.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(fresh.unqualified_entries, 0);
+	UT_ASSERT(FullTransactionIdEquals(fresh.min_full, reference));
+	UT_ASSERT_EQ(top_full_reads, 1);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_original_cancelled_producer_retains_fullxid_until_final_certificate_reply)
+{
+	exercise_original_producer_retention_lifecycle(false);
+}
+
+UT_TEST(test_original_applied_producer_retains_fullxid_until_final_certificate_reply)
+{
+	exercise_original_producer_retention_lifecycle(true);
+}
+
 UT_TEST(test_active_scan_source_matches_original_not_reference_epoch)
 {
 	ClusterCtrcActiveScan scan;
@@ -4961,7 +5147,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(122);
+	UT_PLAN(124);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
 	UT_RUN(test_prepare_path_input_precedes_journal_exhaustion);
 	UT_RUN(test_prepare_path_chain_precedes_locator_and_keeps_blocked_state);
@@ -5074,6 +5260,8 @@ main(void)
 	UT_RUN(test_active_scan_refuses_unknown_or_mismatched_origin_fullxid);
 	UT_RUN(test_active_scan_participant_widens_old_epoch_and_rejects_unrepresentable_xids);
 	UT_RUN(test_active_scan_counts_raw_only_identity_coverage);
+	UT_RUN(test_original_cancelled_producer_retains_fullxid_until_final_certificate_reply);
+	UT_RUN(test_original_applied_producer_retains_fullxid_until_final_certificate_reply);
 	UT_RUN(test_active_scan_source_matches_original_not_reference_epoch);
 	UT_RUN(test_active_scan_source_mismatch_retains_original_minimum);
 	UT_RUN(test_active_scan_unknown_and_foreign_source_count_once);
