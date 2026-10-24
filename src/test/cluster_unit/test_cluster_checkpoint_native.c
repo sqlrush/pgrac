@@ -80,6 +80,8 @@ static bool recovery_revoke_read, recovery_change_read;
 static bool recovery_revoke_release, recovery_revoke_wait, recovery_change_wait;
 static bool recovery_revoke_publish, recovery_change_publish;
 static unsigned recovery_reads, recovery_publishes, recovery_begins, recovery_ends;
+static unsigned window_publishes;
+static const uint8 *expected_native_window;
 static ClusterWalWriterToken recovery_writer;
 static char recovery_scope_identity;
 #define FIXTURE_RECOVERY_SCOPE ((struct ClusterRecoveryCheckpointScopeV1 *) &recovery_scope_identity)
@@ -624,6 +626,28 @@ cluster_control_root_v3_recovery_checkpoint_publish(
 }
 
 ClusterControlRootResult
+cluster_control_root_v3_recovery_checkpoint_window_publish(
+	const struct ClusterRecoveryCheckpointScopeV1 *scope, const ClusterControlRootIdentity *self,
+	const ControlFileData *c, XLogRecPtr end, const uint8 native_window[160],
+	ClusterControlRootSnapshot *out, ClusterControlRootFileToken *token, ControlFileData *control)
+{
+	UT_ASSERT(native_window == expected_native_window);
+	if (native_window != NULL)
+		window_publishes++;
+	return cluster_control_root_v3_recovery_checkpoint_publish(scope, self, c, end, out, token, control);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_checkpoint_window_publish(const ClusterControlRootIdentity *self,
+	const ControlFileData *c, XLogRecPtr end, const uint8 native_window[160],
+	ClusterControlRootSnapshot *out, ClusterControlRootFileToken *token, ControlFileData *control)
+{
+	UT_ASSERT(native_window == expected_native_window);
+	window_publishes++;
+	return cluster_control_root_v3_checkpoint_publish(self, c, end, out, token, control);
+}
+
+ClusterControlRootResult
 cluster_control_root_v3_shutdown_checkpoint_publish(const ClusterControlRootIdentity *self,
 													const ControlFileData *c, XLogRecPtr end,
 													ClusterControlRootSnapshot *out,
@@ -897,6 +921,8 @@ reset_fixture(void)
 	recovery_revoke_wait = recovery_change_wait = false;
 	recovery_revoke_publish = recovery_change_publish = false;
 	recovery_reads = recovery_publishes = recovery_begins = recovery_ends = 0;
+	window_publishes = 0;
+	expected_native_window = NULL;
 	memset(&recovery_writer, 0, sizeof(recovery_writer));
 	recovery_writer.ref = ref;
 	recovery_writer.epoch = epoch;
@@ -956,7 +982,7 @@ publish(void)
 {
 	if (sigsetjmp(error_boundary, 1))
 		return false;
-	ClusterCheckpointV3Publish(&candidate, 220, NULL);
+	ClusterCheckpointV3Publish(&candidate, 220, NULL, NULL);
 	return true;
 }
 
@@ -974,7 +1000,7 @@ recovery_publish(void)
 {
 	if (sigsetjmp(error_boundary, 1))
 		return false;
-	ClusterCheckpointV3Publish(&candidate, 220, FIXTURE_RECOVERY_SCOPE);
+	ClusterCheckpointV3Publish(&candidate, 220, NULL, FIXTURE_RECOVERY_SCOPE);
 	return true;
 }
 static void
@@ -1043,6 +1069,32 @@ UT_TEST(recovery_checkpoint_closed_admission_uses_only_original_scope)
 	UT_ASSERT_EQ(current.checkPointCopy.nextOid, 60001);
 	UT_ASSERT(!serving_ok);
 }
+UT_TEST(recovery_checkpoint_window_and_scope_reach_the_same_publisher)
+{
+	uint8 window[160] = {1};
+
+	for (unsigned stale = 0; stale < 2; stale++) {
+		bool ok = false;
+
+		recovery_setup();
+		UT_ASSERT(recovery_prepare(CHECKPOINT_FORCE));
+		candidate = selected;
+		candidate.checkPoint = 200;
+		expected_native_window = window;
+		if (stale)
+			recovery_scope_valid = false;
+		if (!sigsetjmp(error_boundary, 1)) {
+			ClusterCheckpointV3Publish(&candidate, 220, window, FIXTURE_RECOVERY_SCOPE);
+			ok = true;
+		}
+		UT_ASSERT_EQ(ok, !stale);
+		UT_ASSERT_EQ(window_publishes, !stale);
+		UT_ASSERT_EQ(recovery_publishes, !stale);
+		UT_ASSERT_EQ(root_calls, !stale);
+		UT_ASSERT(!serving_ok);
+	}
+}
+
 UT_TEST(recovery_checkpoint_preserves_owner_and_native_guards)
 {
 	for (int stage = 0; stage < 2; stage++) {
@@ -1583,7 +1635,7 @@ startup_publish(void)
 {
 	if (sigsetjmp(error_boundary, 1))
 		return false;
-	ClusterCheckpointV3Publish(&candidate, 220, NULL);
+	ClusterCheckpointV3Publish(&candidate, 220, NULL, NULL);
 	return true;
 }
 
@@ -3024,9 +3076,10 @@ int
 main(void)
 {
 	if (getenv("PGRAC_RECOVERY_CHECKPOINT_ONLY") != NULL) {
-		UT_PLAN(8);
+		UT_PLAN(9);
 		UT_RUN(recovery_checkpoint_selects_scope_only_for_closed_online_owner);
 		UT_RUN(recovery_checkpoint_closed_admission_uses_only_original_scope);
+	UT_RUN(recovery_checkpoint_window_and_scope_reach_the_same_publisher);
 		UT_RUN(recovery_checkpoint_preserves_owner_and_native_guards);
 		UT_RUN(recovery_checkpoint_exact_recovered_owner_without_transport);
 		UT_RUN(recovery_checkpoint_rechecks_read_and_confirmed_release);
@@ -3047,9 +3100,10 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(84);
+	UT_PLAN(85);
 	UT_RUN(recovery_checkpoint_selects_scope_only_for_closed_online_owner);
 	UT_RUN(recovery_checkpoint_closed_admission_uses_only_original_scope);
+	UT_RUN(recovery_checkpoint_window_and_scope_reach_the_same_publisher);
 	UT_RUN(recovery_checkpoint_preserves_owner_and_native_guards);
 	UT_RUN(recovery_checkpoint_exact_recovered_owner_without_transport);
 	UT_RUN(recovery_checkpoint_rechecks_read_and_confirmed_release);

@@ -3229,7 +3229,10 @@ test_cluster_cf_authority: test_cluster_cf_authority.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
-CLUSTER_CONTROL_ROOT_O = $(top_builddir)/src/backend/cluster/cluster_control_root.o
+CLUSTER_CONTROL_ROOT_O = $(top_builddir)/src/backend/cluster/cluster_control_root.o \
+	$(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o
+cluster_control_bootstrap_read_test.o test_cluster_wal_inputs_product.o: \
+	$(top_srcdir)/src/backend/cluster/cluster_recovery_anchor_private.h
 $(CLUSTER_CONTROL_ROOT_O): $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
 		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h
 # migration_wal_scan (contract) drives a real XLogReader over the thread
@@ -3791,7 +3794,8 @@ test_cluster_write_fence_cache: test_cluster_write_fence_cache.c unit_test.h \
 # write round trip (with .bak fallback) against a temp dir.  The fd.c
 # openers, pg_fsync, durable_rename and the ereport machinery are stubbed
 # locally; CRC32C comes from libpgport, so no PG backend is needed.
-CLUSTER_RECOVERY_ANCHOR_O = $(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o
+CLUSTER_RECOVERY_ANCHOR_O = $(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
+	$(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o
 test_cluster_recovery_anchor: test_cluster_recovery_anchor.c unit_test.h \
 		$(CLUSTER_RECOVERY_ANCHOR_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \

@@ -189,6 +189,7 @@ OBJS = \
 	cluster_recovery_worker.o \
 	cluster_recovery_merge.o \
 	cluster_recovery_anchor.o \
+	cluster_relmap_checkpoint.o \
 	cluster_block_apply.o \
 	cluster_block_apply_heap.o \
 	cluster_block_apply_btree.o \
@@ -475,7 +476,9 @@ cluster_control_root.o cluster_control_bootstrap.o cluster_control_bootstrap_rea
 cluster_wal_history.o cluster_thread_recovery_worker.o cluster_control_observe.o \
 cluster_control_bootstrap_native.o cluster_control_catalog_read.o cluster_cf_storage.o cluster_wal_thread.o: \
 	$(srcdir)/cluster_control_bootstrap_private.h
-cluster_control_root.o cluster_recovery_anchor.o: $(srcdir)/cluster_recovery_anchor_private.h
+cluster_control_root.o cluster_recovery_anchor.o cluster_control_bootstrap.o \
+	cluster_control_bootstrap_read.o cluster_wal_inputs.o cluster_initdb_origin.o: \
+	$(srcdir)/cluster_recovery_anchor_private.h
 
 # Both original creation processes use the same exact native record reader.
 cluster_initdb_wal.o: $(top_srcdir)/src/bin/initdb/pgrac_wal.c $(top_srcdir)/src/bin/initdb/pgrac_wal.h

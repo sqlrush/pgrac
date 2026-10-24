@@ -9344,6 +9344,7 @@ wait_for_owner:
 
 static void
 ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end,
+						   const uint8 native_window[160],
 						   const struct ClusterRecoveryCheckpointScopeV1 *recovery_scope)
 {
 	ClusterWalSourceRef ref;
@@ -9421,8 +9422,11 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end,
 		if (pending)
 			result = CLUSTER_CONTROL_ROOT_ADMISSION_PENDING;
 		else if (recovery_scope != NULL)
-			result = cluster_control_root_v3_recovery_checkpoint_publish(recovery_scope,
-				&ref.claim.identity, candidate, end, &published, &token, &selected);
+			result = cluster_control_root_v3_recovery_checkpoint_window_publish(recovery_scope,
+				&ref.claim.identity, candidate, end, native_window, &published, &token, &selected);
+		else if (native_window != NULL)
+			result = cluster_control_root_v3_checkpoint_window_publish(
+				&ref.claim.identity, candidate, end, native_window, &published, &token, &selected);
 		else if (candidate->state == DB_SHUTDOWNED)
 			result = cluster_control_root_v3_shutdown_checkpoint_publish(
 				&ref.claim.identity, candidate, end, &published, &token, &selected);
@@ -10160,7 +10164,7 @@ CreateCheckPoint(int flags)
 	/* PGRAC: root publication precedes every post-checkpoint cleanup. No
 	 * outer CF, native content lock or critical section encloses this wait. */
 	if (cluster_shared_config)
-		ClusterCheckpointV3Publish(&v3_checkpoint, recptr, recovery_checkpoint_scope);
+		ClusterCheckpointV3Publish(&v3_checkpoint, recptr, NULL, recovery_checkpoint_scope);
 	cluster_recovery_checkpoint_end_v1(&recovery_checkpoint_scope);
 
 	/* PGRAC (S07): with this checkpoint's ROOT published, move the physical

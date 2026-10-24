@@ -46,6 +46,7 @@
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_write_fence.h"
 #include "cluster_control_root_private.h"
+#include "cluster/cluster_relmap_checkpoint.h"
 #include "cluster_recovery_anchor_private.h"
 #include "cluster/storage/cluster_shared_fs.h"
 #include "common/cryptohash.h"
@@ -5358,6 +5359,7 @@ typedef struct CheckpointV2Work {
 	bool serving_admitted;
 	CheckpointV2Purpose purpose;
 	uint16 format_version;
+	uint8 native_window[160];
 	/* Borrowed from the checkpointer; this work never ends the caller's scope. */
 	const struct ClusterRecoveryCheckpointScopeV1 *recovery_scope;
 	ClusterWalWriterToken recovery_writer;
@@ -8251,6 +8253,20 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 	anchor.write_time = cf->time;
 	anchor.checkpoint = cf->checkPoint;
 	anchor.checkpoint_copy = cf->checkPointCopy;
+	if (work->format_version == 3) {
+		ClusterRelmapCheckpointWindow window;
+
+		/* Existing D window and A recovered-owner scope are independent
+		 * inputs to the same verified anchor/CAS operation. */
+		if (!bytes_are_zero(work->native_window, 160)
+			&& (!cluster_relmap_checkpoint_window_decode_v1(
+					work->native_window, &cf->checkPointCopy, cf->checkPoint, end, self,
+					anchor.database_incarnation, &window)
+				|| window.epoch != epoch
+				|| window.boot_incarnation != cluster_qvotec_get_self_incarnation()))
+			return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		memcpy(anchor.native_window, work->native_window, 160);
+	}
 	anchor.unlogged_lsn = cf->unloggedLSN;
 	anchor.min_recovery_point = cf->minRecoveryPoint;
 	anchor.min_recovery_tli = cf->minRecoveryPointTLI;
@@ -8407,7 +8423,8 @@ checkpoint_v2_publish(CheckpointV2Purpose purpose, const ClusterControlRootIdent
 					  const ControlFileData *thread_control, XLogRecPtr checkpoint_end,
 					  ClusterControlRootSnapshot *out, ClusterControlRootFileToken *out_token,
 					  ControlFileData *out_control, uint16 version,
-					  const struct ClusterRecoveryCheckpointScopeV1 *recovery_scope)
+					  const struct ClusterRecoveryCheckpointScopeV1 *recovery_scope,
+					  const uint8 native_window[160])
 {
 	CheckpointV2Work *work;
 	ClusterControlRootResult result;
@@ -8463,6 +8480,8 @@ checkpoint_v2_publish(CheckpointV2Purpose purpose, const ClusterControlRootIdent
 	work->serving_admitted = true;
 	work->purpose = purpose;
 	work->format_version = version;
+	if (native_window != NULL)
+		memcpy(work->native_window, native_window, sizeof(work->native_window));
 	work->recovery_scope = recovery_scope;
 	work->recovery_writer = recovery_writer;
 	for (size_t i = 0; i < lengthof(work->wal_dirs); ++i)
@@ -8501,7 +8520,7 @@ cluster_control_root_v2_checkpoint_publish(const ClusterControlRootIdentity *sel
 										   ControlFileData *out_control)
 {
 	return checkpoint_v2_publish(CHECKPOINT_V2_ONLINE, self, thread_control, checkpoint_end, out,
-								 out_token, out_control, 2, NULL);
+								 out_token, out_control, 2, NULL, NULL);
 }
 
 /* PGRAC: shutdown WAL and anchor evidence precede, but never substitute for,
@@ -8517,7 +8536,7 @@ cluster_control_root_v2_shutdown_checkpoint_publish(const ClusterControlRootIden
 													ControlFileData *out_control)
 {
 	return checkpoint_v2_publish(CHECKPOINT_V2_SHUTDOWN_EVIDENCE, self, thread_control,
-								 checkpoint_end, out, out_token, out_control, 2, NULL);
+								 checkpoint_end, out, out_token, out_control, 2, NULL, NULL);
 }
 
 /* PGRAC: failure input is a purpose-bound root transition, not a v1 patch
@@ -10379,7 +10398,7 @@ cluster_control_root_v3_checkpoint_publish(const ClusterControlRootIdentity *sel
 										   ClusterControlRootFileToken *token,
 										   ControlFileData *view)
 {
-	return checkpoint_v2_publish(CHECKPOINT_V2_ONLINE, self, control, end, out, token, view, 3, NULL);
+	return checkpoint_v2_publish(CHECKPOINT_V2_ONLINE, self, control, end, out, token, view, 3, NULL, NULL);
 }
 
 ClusterControlRootResult
@@ -10388,8 +10407,43 @@ cluster_control_root_v3_recovery_checkpoint_publish(
 	const ControlFileData *control, XLogRecPtr end, ClusterControlRootSnapshot *out,
 	ClusterControlRootFileToken *token, ControlFileData *view)
 {
-	return checkpoint_v2_publish(CHECKPOINT_V3_RECOVERY_ONLINE, self, control, end, out, token, view,
-								 3, scope);
+	return cluster_control_root_v3_recovery_checkpoint_window_publish(scope, self, control,
+		end, NULL, out, token, view);
+}
+
+static bool
+checkpoint_window_alias(const uint8 *window, const void *ptr, size_t len)
+{
+	uintptr_t x = (uintptr_t)window, y = (uintptr_t)ptr;
+	return window && ptr && (x <= y ? y - x < 160 : x - y < len);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_checkpoint_window_publish(const ClusterControlRootIdentity *self,
+	const ControlFileData *control, XLogRecPtr end, const uint8 native_window[160],
+	ClusterControlRootSnapshot *out, ClusterControlRootFileToken *token, ControlFileData *view)
+{
+	if (checkpoint_window_alias(native_window, out, sizeof(*out))
+		|| checkpoint_window_alias(native_window, token, sizeof(*token))
+		|| checkpoint_window_alias(native_window, view, sizeof(*view)))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	return checkpoint_v2_publish(control != NULL && control->state == DB_SHUTDOWNED
+		? CHECKPOINT_V2_SHUTDOWN_EVIDENCE : CHECKPOINT_V2_ONLINE,
+		self, control, end, out, token, view, 3, NULL, native_window);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_recovery_checkpoint_window_publish(
+	const struct ClusterRecoveryCheckpointScopeV1 *scope, const ClusterControlRootIdentity *self,
+	const ControlFileData *control, XLogRecPtr end, const uint8 native_window[160],
+	ClusterControlRootSnapshot *out, ClusterControlRootFileToken *token, ControlFileData *view)
+{
+	if (checkpoint_window_alias(native_window, out, sizeof(*out))
+		|| checkpoint_window_alias(native_window, token, sizeof(*token))
+		|| checkpoint_window_alias(native_window, view, sizeof(*view)))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	return checkpoint_v2_publish(CHECKPOINT_V3_RECOVERY_ONLINE, self, control, end,
+		out, token, view, 3, scope, native_window);
 }
 
 ClusterControlRootResult
@@ -10400,7 +10454,7 @@ cluster_control_root_v3_shutdown_checkpoint_publish(const ClusterControlRootIden
 													ControlFileData *view)
 {
 	return checkpoint_v2_publish(CHECKPOINT_V2_SHUTDOWN_EVIDENCE, self, control, end, out, token,
-								 view, 3, NULL);
+								 view, 3, NULL, NULL);
 }
 
 /* PGRAC (S07): move this thread's physical retention lower forward to a
