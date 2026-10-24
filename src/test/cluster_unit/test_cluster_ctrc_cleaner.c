@@ -481,11 +481,13 @@ test_clock_gettime(clockid_t clock_id pg_attribute_unused(), struct timespec *ts
 	return 0;
 }
 
+#ifndef CTRC_CLEANER_EXTERNAL_CURRENT_TIMESTAMP
 TimestampTz
 GetCurrentTimestamp(void)
 {
 	return (TimestampTz)test_now_us;
 }
+#endif
 
 int
 s_lock(volatile slock_t *lock pg_attribute_unused(), const char *file pg_attribute_unused(),

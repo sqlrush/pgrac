@@ -710,6 +710,7 @@ cluster_recovery_ctrc_result_collect_v1(const struct ClusterRecoveryStartV1 *sta
 	ClusterRecoveryCheckpointOwnerV1 owner, confirmed;
 	ClusterRecoveryCtrcResultValueV1 result;
 	ClusterColdCtrcReleaseCensusV1 census;
+	const ClusterColdCtrcWorkV1 *work;
 	const ClusterColdTypedV1 *typed;
 	uint8 zero[32] = {0};
 	bool qualified, ok = false;
@@ -731,7 +732,9 @@ cluster_recovery_ctrc_result_collect_v1(const struct ClusterRecoveryStartV1 *sta
 	 * for this component.  Sampling is outside the shared slot lock. */
 	memset(&result, 0, sizeof(result));
 	memset(&census, 0, sizeof(census));
-	qualified = cluster_cold_typed_ctrc_release_census_v1(typed, &census);
+	work = ClusterColdRecoveryCtrcWorkPrepare(start);
+	qualified = work != NULL;
+	if (qualified) census = work->counts;
 	result.subject_count = census.subject_count;
 	result.released_count = census.released_count;
 	result.unresolved_count = census.unresolved_count;
@@ -743,7 +746,8 @@ cluster_recovery_ctrc_result_collect_v1(const struct ClusterRecoveryStartV1 *sta
 	memcpy(result.input_root_sha256, typed->census_root.image_sha256, 32);
 	if (!ClusterColdRecoveryTxCheckpointOwnerV1(start, &confirmed)
 		|| memcmp(&owner, &confirmed, sizeof(owner)) != 0
-		|| ClusterColdRecoveryTxInputs(start) != typed)
+		|| ClusterColdRecoveryTxInputs(start) != typed
+		|| (qualified && !ClusterColdRecoveryCtrcWorkCurrent(start, work)))
 		return false;
 
 	slot = &cluster_recovery_plan_shmem->checkpoint_owner;
@@ -2040,6 +2044,27 @@ cluster_recovery_stamp_durable_v1(const ClusterRecoveryStampHandleV1 *handle)
 	return stamp_transition(handle, CLUSTER_RECOVERY_STAMP_INSERTED, CLUSTER_RECOVERY_STAMP_DURABLE,
 							0, 0, false);
 }
+
+bool
+cluster_recovery_stamp_fpi_inserted_current_v1(const ClusterRecoveryStampHandleV1 *handle,
+	XLogRecPtr start, XLogRecPtr end)
+{
+	ClusterThreadReplaySlot *replay;
+	ClusterRecoveryStampSlotV1 snapshot;
+
+	if (!stamp_actor() || CritSectionCount != 0 || handle == NULL
+		|| handle->owner.executor_pid != MyProcPid || handle->kind != CLUSTER_RECOVERY_STAMP_FPI
+		|| start < handle->owner.writer.startup_first_lsn || end <= start
+		|| (replay = cluster_thread_recovery_replay_slot(handle->key.target_thread)) == NULL)
+		return false;
+	stamp_snapshot(&replay->stamp, &snapshot);
+	/* Complete codec checks apply to this copied snapshot outside the slot lock. */
+	return stamp_shape(&snapshot, handle->key.target_thread)
+		&& stamp_handle_matches(&snapshot, handle) && !snapshot.failed
+		&& snapshot.phase == CLUSTER_RECOVERY_STAMP_INSERTED
+		&& snapshot.record_start == start && snapshot.record_end == end;
+}
+
 bool
 cluster_recovery_stamp_clear_v1(const ClusterRecoveryStampHandleV1 *handle)
 {

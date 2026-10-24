@@ -25053,7 +25053,9 @@ UT_TEST(test_tx_inputs_c0_path_refuses_stale_scope_and_post_resolve_drift)
 		test_inputs_startup_cf = false;
 	}
 }
-UT_TEST(test_tx_inputs_reselects_original_history_after_actual_install)
+static void ctrc_inputs_activate_work(void);
+static void
+inputs_reselects_original_history_after_actual_install(bool ctrc)
 {
 	uint8 before[66048];
 	ControlRootImage root, selected_root;
@@ -25107,7 +25109,10 @@ UT_TEST(test_tx_inputs_reselects_original_history_after_actual_install)
 		tx_inputs_typed.census_root = original;
 		cluster_wal_inputs_release_v1(&inputs);
 		tx_inputs_activate();
-		UT_ASSERT_EQ(tx_inputs_begin(&inputs), 0);
+		if (ctrc)
+			ctrc_inputs_activate_work();
+		UT_ASSERT_EQ(ctrc ? cluster_wal_inputs_begin_ctrc_census_v1(tx_inputs_start,
+			tx_inputs_typed.ctrc_work, &inputs) : tx_inputs_begin(&inputs), 0);
 		if (inputs != NULL) {
 			UT_ASSERT_EQ(cluster_wal_inputs_root_token_v1(inputs, &selected), 0);
 			UT_ASSERT(memcmp(&selected, &current, sizeof(current)) == 0);
@@ -25120,6 +25125,10 @@ UT_TEST(test_tx_inputs_reselects_original_history_after_actual_install)
 	UT_ASSERT(!inputs_pin_held && test_actual_cf == NoLock);
 	test_inputs_startup_cf = false;
 	test_reserve_mode = false;
+}
+UT_TEST(test_tx_inputs_reselects_original_history_after_actual_install)
+{
+	inputs_reselects_original_history_after_actual_install(false);
 }
 UT_TEST(test_tx_inputs_after_done_keeps_retained_read_purpose)
 {
@@ -25188,6 +25197,8 @@ UT_TEST(test_tx_inputs_parent_subject_and_wait_revalidation)
 	}
 	test_inputs_startup_cf = false;
 }
+
+#include "test_cluster_control_ctrc_inputs.inc"
 
 /*
  * Keep the long control-root suite deterministic when an individual test
@@ -25306,6 +25317,18 @@ main(int argc, char **argv)
 	if (getenv("PGRAC_PRE2_TEST_STAMP_WORKER_ENTRY") != NULL) {
 		UT_PLAN(1);
 		UT_RUN(test_runtime_v3_failure_worker_entry_establishes_resource_owner);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_CTRC_INPUTS") != NULL) {
+		UT_PLAN(7);
+		UT_RUN(test_ctrc_inputs_terminal_work_without_active_reads_all_retained_sources);
+		UT_RUN(test_ctrc_inputs_requires_exact_original_work_and_post_eor_start);
+		UT_RUN(test_ctrc_inputs_each_original_owner_and_work_version_is_rechecked);
+		UT_RUN(test_ctrc_inputs_preserves_original_source_selection_and_post_io_check);
+		UT_RUN(test_ctrc_inputs_wait_resume_keeps_original_work_and_whole_root);
+		UT_RUN(test_ctrc_inputs_open_wait_has_no_partial_census_or_mutation_permission);
+		UT_RUN(test_ctrc_inputs_reselects_original_history_after_actual_install);
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
@@ -25521,7 +25544,14 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(483);
+	UT_PLAN(490);
+	UT_RUN(test_ctrc_inputs_terminal_work_without_active_reads_all_retained_sources);
+	UT_RUN(test_ctrc_inputs_requires_exact_original_work_and_post_eor_start);
+	UT_RUN(test_ctrc_inputs_each_original_owner_and_work_version_is_rechecked);
+	UT_RUN(test_ctrc_inputs_preserves_original_source_selection_and_post_io_check);
+	UT_RUN(test_ctrc_inputs_wait_resume_keeps_original_work_and_whole_root);
+	UT_RUN(test_ctrc_inputs_open_wait_has_no_partial_census_or_mutation_permission);
+	UT_RUN(test_ctrc_inputs_reselects_original_history_after_actual_install);
 	UT_RUN(test_cold_sync_retained_files_under_original_owner_without_cf);
 	UT_RUN(test_cold_sync_each_io_failure_root_race_and_error_discard_output);
 	UT_RUN(test_cold_sync_requires_exact_root_fsync_role_and_disjoint_output);

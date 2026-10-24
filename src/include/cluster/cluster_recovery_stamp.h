@@ -84,6 +84,8 @@ typedef struct ClusterRecoveryFpiInsertV1 {
 	XLogRecPtr record_start;
 	XLogRecPtr record_end;
 	bool wal_flushed;
+	/* Local target I/O progress only; original discharge/window remain pending. */
+	bool target_synced;
 } ClusterRecoveryFpiInsertV1;
 
 /* Embedded in the original per-thread replay slot. No pointers or callbacks. */
@@ -240,6 +242,10 @@ extern bool cluster_recovery_stamp_ctrc_execute_reference_v2(
 	const ClusterRecoveryStampOwnerV1 *owner, const uint8 *payload, Size length,
 	uint32 source_index, const uint8 source_identity_digest[32], void *raw,
 	Size raw_length, ClusterRecoveryCTRCReferenceV2 *out);
+/* Read-only exact original FPI INSERTED/range observation. No flush, PAGE
+ * authority, transition or completion is supplied by this observation. */
+extern bool cluster_recovery_stamp_fpi_inserted_current_v1(
+	const ClusterRecoveryStampHandleV1 *handle, XLogRecPtr start, XLogRecPtr end);
 /* Only the original executor calls durable after real WAL flush and exact
  * target sync/postread. These APIs record completion, never prove it. */
 extern bool cluster_recovery_stamp_durable_v1(const ClusterRecoveryStampHandleV1 *handle);

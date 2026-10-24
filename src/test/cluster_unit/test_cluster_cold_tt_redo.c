@@ -54,6 +54,7 @@ cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
 
 
 static Size tt_census_fail_alloc_size;
+static ClusterColdTypedV1 *tt_ctrc_drift_on_alloc;
 
 void *
 palloc_extended(Size size, int flags)
@@ -61,6 +62,15 @@ palloc_extended(Size size, int flags)
 	if (tt_census_fail_alloc_size != 0 && size == tt_census_fail_alloc_size)
 		return NULL;
 	return (flags & MCXT_ALLOC_ZERO) ? calloc(1, size) : malloc(size);
+}
+
+void *
+MemoryContextAllocExtended(MemoryContext context, Size size, int flags)
+{
+	UT_ASSERT_NOT_NULL(context);
+	if (tt_ctrc_drift_on_alloc != NULL)
+		tt_ctrc_drift_on_alloc->effects_receipt.plan = NULL;
+	return palloc_extended(size, flags);
 }
 
 void
@@ -8803,6 +8813,10 @@ UT_TEST(tt_ctrc_native_release_census_accepts_complete_empty_native_init)
 	UT_ASSERT(cluster_cold_typed_top_tx_census_v1(&f.typed, TT_C0_FENCE));
 	UT_ASSERT(cluster_cold_typed_ctrc_release_census_v1(&f.typed, &out));
 	UT_ASSERT_EQ(out.subject_count + out.released_count + out.unresolved_count + out.unqualified_count, 0);
+	f.typed.context = (MemoryContext)&f.typed;
+	UT_ASSERT(cluster_cold_typed_ctrc_work_prepare_v1(&f.typed));
+	UT_ASSERT_NOT_NULL(f.typed.ctrc_work);
+	UT_ASSERT(memcmp(&out, &f.typed.ctrc_work->counts, sizeof(out)) == 0);
 	tt_redo_destroy(&f);
 }
 
@@ -8878,10 +8892,186 @@ UT_TEST(tt_ctrc_native_release_census_does_not_drop_headerless_history_origin)
 	tt_redo_destroy(&f);
 }
 
+static bool
+tt_ctrc_work_prepare(TtRedoFixture *f)
+{
+	f->typed.context = (MemoryContext)&f->typed;
+	return cluster_cold_typed_ctrc_work_prepare_v1(&f->typed);
+}
+
+UT_TEST(tt_ctrc_work_retains_exact_first_last_and_unreleased_native_inputs)
+{
+	for (unsigned state = 0; state < 4; state++) {
+		TtRedoFixture f;
+		ClusterColdTtSlotInputV1 expected;
+		ClusterColdCtrcReleaseCensusV1 counts;
+		const ClusterColdCtrcWorkV1 *work;
+		uint8 status = state == 0 ? TT_SLOT_ACTIVE : state == 1 ? TT_SLOT_ABORTED
+			: state == 2 ? TT_SLOT_COMMITTED : TT_SLOT_RECYCLABLE;
+		tt_ctrc_checkpoint_fixture(&f, status, state >= 2, false);
+		UT_ASSERT(tt_ctrc_work_prepare(&f));
+		work = f.typed.ctrc_work;
+		UT_ASSERT_NOT_NULL(work);
+		UT_ASSERT_EQ(work->generation, 1);
+		UT_ASSERT_EQ(f.typed.ctrc_work_generation, work->generation);
+		UT_ASSERT(work->plan == f.typed.plan);
+		UT_ASSERT(work->top_tx_census == f.typed.top_tx_census);
+		UT_ASSERT(cluster_cold_typed_ctrc_release_census_v1(&f.typed, &counts));
+		UT_ASSERT(memcmp(&counts, &work->counts, sizeof(counts)) == 0);
+		UT_ASSERT_EQ(work->counts.subject_count, 2);
+		UT_ASSERT_EQ(work->counts.released_count, state >= 2 ? 2 : 0);
+		for (unsigned n = 0; n < 2; n++) {
+			UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0,
+				n == 0 ? 0 : TT_SLOTS_PER_SEGMENT - 1, &expected));
+			UT_ASSERT(memcmp(&expected, &work->entries[n], sizeof(expected)) == 0);
+		}
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_ctrc_work_keeps_history_and_headerless_qualification_debt)
+{
+	for (unsigned header = 0; header < 2; header++) {
+		TtRedoFixture f;
+		PGAlignedBlock extra;
+		ClusterColdTtSlotInputV1 expected;
+		tt_ctrc_checkpoint_fixture_with_history(&f, TT_SLOT_ABORTED, true, false, 2);
+		if (header) {
+			tt_inventory_extra(257, 2, &extra);
+			UT_ASSERT(cluster_undo_segment_header_seal(extra.data));
+			tt_readback_write(257, &extra, false);
+			tt_redo_seed_recapture(&f);
+			UT_ASSERT_EQ(cluster_cold_tt_after_redo_capture_v1(&f.typed), CLUSTER_COLD_OK);
+			UT_ASSERT(cluster_cold_typed_top_tx_census_v1(&f.typed, TT_C0_FENCE));
+		}
+		UT_ASSERT(tt_ctrc_work_prepare(&f));
+		UT_ASSERT_EQ(f.typed.ctrc_work->counts.subject_count, header ? 3 : 2);
+		UT_ASSERT_EQ(f.typed.ctrc_work->counts.unqualified_count, header ? 2 : 1);
+		UT_ASSERT_EQ(f.typed.ctrc_work->counts.unresolved_count, header ? 1 : 0);
+		if (header) {
+			UT_ASSERT(cluster_cold_tt_after_redo_slot_v1(&f.typed, 0, 47, &expected));
+			UT_ASSERT_EQ(expected.key.owner_instance, 2);
+			UT_ASSERT(memcmp(&expected, &f.typed.ctrc_work->entries[0], sizeof(expected)) == 0);
+			tt_inventory_remove(257);
+		}
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_ctrc_work_shares_original_budget_and_refused_retry_removes_old_work)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		TtRedoFixture f;
+		Size used, base_budget, after_budget;
+		Size bytes = offsetof(ClusterColdCtrcWorkV1, entries)
+			+ 2 * sizeof(ClusterColdTtSlotInputV1);
+		tt_ctrc_checkpoint_fixture(&f, TT_SLOT_ABORTED, false, false);
+		used = f.typed.tt_after_redo->used;
+		UT_ASSERT(tt_ctrc_work_prepare(&f));
+		UT_ASSERT_EQ(f.typed.tt_after_redo->used, used + bytes);
+		base_budget = f.typed.tt_base->budget;
+		after_budget = f.typed.tt_after_redo->budget;
+		if (fault == 0) f.typed.tt_base->budget = f.typed.tt_base->used + used + bytes - 1;
+		if (fault == 1) f.typed.tt_after_redo->budget = used + bytes - 1;
+		if (fault == 2) tt_census_fail_alloc_size = bytes;
+		UT_ASSERT(!tt_ctrc_work_prepare(&f));
+		UT_ASSERT_NULL(f.typed.ctrc_work);
+		UT_ASSERT_NOT_NULL(f.typed.top_tx_census);
+		UT_ASSERT_EQ(f.typed.tt_after_redo->used, used);
+		f.typed.tt_base->budget = base_budget;
+		f.typed.tt_after_redo->budget = after_budget;
+		tt_census_fail_alloc_size = 0;
+		UT_ASSERT(tt_ctrc_work_prepare(&f));
+		UT_ASSERT_EQ(f.typed.tt_after_redo->used, used + bytes);
+		UT_ASSERT_EQ(f.typed.ctrc_work->generation, 2);
+		UT_ASSERT(cluster_cold_typed_top_tx_census_v1(&f.typed, TT_C0_FENCE));
+		UT_ASSERT_NULL(f.typed.ctrc_work);
+		UT_ASSERT_EQ(f.typed.tt_after_redo->used, used);
+		UT_ASSERT(tt_ctrc_work_prepare(&f));
+		UT_ASSERT_EQ(f.typed.ctrc_work->generation, 3);
+		cluster_cold_tt_after_redo_reset_v1(&f.typed);
+		UT_ASSERT_NULL(f.typed.ctrc_work);
+		UT_ASSERT_NULL(f.typed.top_tx_census);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_ctrc_work_generation_cannot_wrap_or_reuse_a_published_version)
+{
+	TtRedoFixture f;
+	Size used;
+
+	tt_ctrc_checkpoint_fixture(&f, TT_SLOT_ABORTED, false, false);
+	used = f.typed.tt_after_redo->used;
+	f.typed.ctrc_work_generation = UINT64_MAX - 1;
+	UT_ASSERT(tt_ctrc_work_prepare(&f));
+	UT_ASSERT_EQ(f.typed.ctrc_work->generation, UINT64_MAX);
+	UT_ASSERT(!tt_ctrc_work_prepare(&f));
+	UT_ASSERT_NULL(f.typed.ctrc_work);
+	UT_ASSERT_EQ(f.typed.ctrc_work_generation, UINT64_MAX);
+	UT_ASSERT_EQ(f.typed.tt_after_redo->used, used);
+	UT_ASSERT(!tt_ctrc_work_prepare(&f));
+	UT_ASSERT_NULL(f.typed.ctrc_work);
+	tt_redo_destroy(&f);
+}
+
+UT_TEST(tt_ctrc_work_source_refusal_cannot_publish_or_keep_a_previous_array)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		TtRedoFixture f;
+		Size used;
+		tt_ctrc_checkpoint_fixture(&f, TT_SLOT_ABORTED, true, false);
+		used = f.typed.tt_after_redo->used;
+		UT_ASSERT(tt_ctrc_work_prepare(&f));
+		if (fault == 0) f.typed.xid_receipt.plan = NULL;
+		if (fault == 1) f.typed.effects_receipt.plan = NULL;
+		if (fault == 2) f.typed.top_tx_census->plan = NULL;
+		if (fault == 3) f.typed.participants[0].thread_id = 1;
+		if (fault == 4) tt_ctrc_drift_on_alloc = &f.typed;
+		UT_ASSERT(!tt_ctrc_work_prepare(&f));
+		tt_ctrc_drift_on_alloc = NULL;
+		UT_ASSERT_NULL(f.typed.ctrc_work);
+		UT_ASSERT_EQ(f.typed.tt_after_redo->used, used);
+		tt_redo_destroy(&f);
+	}
+}
+
+UT_TEST(tt_ctrc_work_fill_requires_exact_count_without_overwriting_capacity)
+{
+	TtRedoFixture f;
+	union {
+		uint64 align;
+		unsigned char bytes[offsetof(ClusterColdCtrcWorkV1, entries)
+			+ 3 * sizeof(ClusterColdTtSlotInputV1)];
+	} storage;
+	ClusterColdCtrcWorkV1 *work = (ClusterColdCtrcWorkV1 *)storage.bytes;
+	tt_ctrc_checkpoint_fixture(&f, TT_SLOT_ABORTED, true, false);
+	for (unsigned capacity = 0; capacity < 4; capacity++) {
+		memset(&storage, 0, sizeof(storage));
+		work->plan = f.typed.plan;
+		work->top_tx_census = f.typed.top_tx_census;
+		UT_ASSERT(cluster_cold_typed_ctrc_release_census_v1(&f.typed, &work->counts));
+		work->counts.subject_count = capacity;
+		memset(&work->entries[capacity < 3 ? capacity : 2], 0xa7,
+			sizeof(ClusterColdTtSlotInputV1));
+		UT_ASSERT_EQ(cluster_cold_typed_ctrc_work_fill_v1(&f.typed, work), capacity == 2);
+		if (capacity < 2)
+			for (unsigned n = 0; n < sizeof(ClusterColdTtSlotInputV1); n++)
+				UT_ASSERT_EQ(((unsigned char *)&work->entries[capacity])[n], 0xa7);
+	}
+	tt_redo_destroy(&f);
+}
+
 int
 main(void)
 {
-	UT_PLAN(192);
+	UT_PLAN(198);
+	UT_RUN(tt_ctrc_work_generation_cannot_wrap_or_reuse_a_published_version);
+	UT_RUN(tt_ctrc_work_retains_exact_first_last_and_unreleased_native_inputs);
+	UT_RUN(tt_ctrc_work_keeps_history_and_headerless_qualification_debt);
+	UT_RUN(tt_ctrc_work_shares_original_budget_and_refused_retry_removes_old_work);
+	UT_RUN(tt_ctrc_work_source_refusal_cannot_publish_or_keep_a_previous_array);
+	UT_RUN(tt_ctrc_work_fill_requires_exact_count_without_overwriting_capacity);
 	UT_RUN(tt_ctrc_native_release_census_counts_first_and_last_terminal_slots);
 	UT_RUN(tt_ctrc_native_release_census_keeps_active_and_unreleased_pending);
 	UT_RUN(tt_ctrc_native_release_census_requires_original_base_qualification);

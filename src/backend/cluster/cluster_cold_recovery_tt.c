@@ -344,10 +344,34 @@ cold_tt_destroy(ClusterColdTtBaseV1 **target)
 	pfree(base);
 }
 
+static bool
+cold_tt_ctrc_work_reset(ClusterColdTypedV1 *typed)
+{
+	ClusterColdCtrcWorkV1 *work = typed->ctrc_work;
+	Size bytes;
+
+	if (work == NULL)
+		return true;
+	typed->ctrc_work = NULL;
+	if (work->counts.subject_count > (MaxAllocSize - offsetof(ClusterColdCtrcWorkV1, entries))
+			/ sizeof(ClusterColdTtSlotInputV1)) {
+		pfree(work);
+		return false;
+	}
+	bytes = offsetof(ClusterColdCtrcWorkV1, entries)
+		+ sizeof(ClusterColdTtSlotInputV1) * work->counts.subject_count;
+	pfree(work);
+	if (typed->tt_after_redo == NULL || typed->tt_after_redo->used < bytes)
+		return false;
+	typed->tt_after_redo->used -= bytes;
+	return true;
+}
+
 void
 cluster_cold_tt_after_redo_reset_v1(ClusterColdTypedV1 *typed)
 {
 	if (typed != NULL) {
+		(void)cold_tt_ctrc_work_reset(typed);
 		if (typed->top_tx_census != NULL) {
 			pfree(typed->top_tx_census);
 			typed->top_tx_census = NULL;
@@ -899,6 +923,56 @@ cold_tt_census_allocate(ClusterColdTypedV1 *typed, uint32 count, Size *allocated
 	return census;
 }
 
+bool
+cluster_cold_typed_ctrc_work_prepare_v1(ClusterColdTypedV1 *typed)
+{
+	ClusterColdCtrcReleaseCensusV1 census;
+	ClusterColdTtBaseV1 *after;
+	ClusterColdCtrcWorkV1 *work;
+	Size bytes, remaining;
+	uint64 generation;
+
+	if (typed == NULL || !cold_tt_ctrc_work_reset(typed))
+		return false;
+	if (typed->context == NULL || typed->tt_base == NULL || typed->tt_after_redo == NULL
+		|| typed->ctrc_work_generation == UINT64_MAX
+		|| !cluster_cold_typed_ctrc_release_census_v1(typed, &census)
+		|| census.subject_count > (MaxAllocSize - offsetof(ClusterColdCtrcWorkV1, entries))
+			/ sizeof(ClusterColdTtSlotInputV1))
+		return false;
+	generation = typed->ctrc_work_generation;
+	after = typed->tt_after_redo;
+	if (typed->tt_base->used > typed->tt_base->budget || after->used > after->budget)
+		return false;
+	bytes = offsetof(ClusterColdCtrcWorkV1, entries)
+		+ sizeof(ClusterColdTtSlotInputV1) * census.subject_count;
+	remaining = typed->tt_base->budget - typed->tt_base->used;
+	if (after->used > remaining)
+		return false;
+	remaining = Min(remaining - after->used, after->budget - after->used);
+	if (bytes > remaining)
+		return false;
+	work = MemoryContextAllocExtended(typed->context, bytes, MCXT_ALLOC_NO_OOM | MCXT_ALLOC_ZERO);
+	if (work == NULL)
+		return false;
+	after->used += bytes;
+	work->plan = typed->plan;
+	work->top_tx_census = typed->top_tx_census;
+	work->counts = census;
+	/* Count and fill both traverse the original complete native input. No
+	 * partial array or old attempt can survive an interrupted/refused fill. */
+	if (!cluster_cold_typed_ctrc_work_fill_v1(typed, work) || typed->tt_after_redo != after
+		|| typed->ctrc_work_generation != generation) {
+		if (typed->tt_after_redo == after)
+			after->used -= bytes;
+		pfree(work);
+		return false;
+	}
+	work->generation = ++typed->ctrc_work_generation;
+	typed->ctrc_work = work;
+	return true;
+}
+
 /* The original inventory owner retains every ACTIVE, not just those the
  * current physical producer can prove. This is an input census, never a
  * TX_CLOSURE completion receipt or permission to reuse pass-2 authority. */
@@ -912,6 +986,8 @@ cluster_cold_typed_top_tx_census_v1(ClusterColdTypedV1 *typed,
 	Size bytes;
 
 	if (typed == NULL)
+		return false;
+	if (!cold_tt_ctrc_work_reset(typed))
 		return false;
 	/* A refused retry cannot expose a preceding attempt's census. The
 	 * allocation is charged to the post-capture's original shared budget. */

@@ -1180,9 +1180,9 @@ cold_top_tx_checkpoint_base_v1(const ClusterColdTypedV1 *typed,
 		   && cold_top_tx_key_equal_v1(&original.key, key);
 }
 
-bool
-cluster_cold_typed_ctrc_release_census_v1(const ClusterColdTypedV1 *typed,
-									   ClusterColdCtrcReleaseCensusV1 *out)
+static bool
+cold_ctrc_release_census_v1(const ClusterColdTypedV1 *typed, ClusterColdCtrcWorkV1 *work,
+	ClusterColdCtrcReleaseCensusV1 *out)
 {
 	ClusterColdCtrcReleaseCensusV1 value = { 0 };
 	uint32 headers;
@@ -1253,6 +1253,14 @@ cluster_cold_typed_ctrc_release_census_v1(const ClusterColdTypedV1 *typed,
 			unused.wrap = subject->wrap;
 			if (memcmp(subject, &unused, sizeof(unused)) == 0) continue;
 			if (value.subject_count == UINT32_MAX) return false;
+			if (work != NULL) {
+				ClusterColdTtSlotInputV1 input;
+				if (value.subject_count >= work->counts.subject_count
+					|| !cluster_cold_tt_after_redo_slot_v1(typed, index, slot, &input)
+					|| memcmp(&input.slot, subject, sizeof(*subject)) != 0)
+					return false;
+				work->entries[value.subject_count] = input;
+			}
 			value.subject_count++;
 			if (TransactionIdIsNormal(subject->xid)
 				&& ((subject->status == TT_SLOT_COMMITTED && SCN_VALID(subject->commit_scn))
@@ -1266,6 +1274,24 @@ cluster_cold_typed_ctrc_release_census_v1(const ClusterColdTypedV1 *typed,
 	}
 	*out = value;
 	return true;
+}
+
+bool
+cluster_cold_typed_ctrc_release_census_v1(const ClusterColdTypedV1 *typed,
+	ClusterColdCtrcReleaseCensusV1 *out)
+{
+	return cold_ctrc_release_census_v1(typed, NULL, out);
+}
+
+bool
+cluster_cold_typed_ctrc_work_fill_v1(const ClusterColdTypedV1 *typed, ClusterColdCtrcWorkV1 *work)
+{
+	ClusterColdCtrcReleaseCensusV1 census;
+
+	return typed != NULL && work != NULL && work->plan == typed->plan
+		&& work->top_tx_census == typed->top_tx_census
+		&& cold_ctrc_release_census_v1(typed, work, &census)
+		&& memcmp(&census, &work->counts, sizeof(census)) == 0;
 }
 
 bool

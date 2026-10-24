@@ -820,6 +820,27 @@ ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start)
 }
 
 bool
+ClusterColdRecoveryCtrcWorkCurrent(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work)
+{
+	/* Locate the original pointer before reading it, including stale handles. */
+	return ClusterColdRecoveryTxCurrent(start) && work != NULL
+		&& work == start->inputs->ctrc_work && work->plan == start->inputs->plan
+		&& work->top_tx_census == start->census && work->generation != 0
+		&& work->generation == start->inputs->ctrc_work_generation;
+}
+
+const struct ClusterColdCtrcWorkV1 *
+ClusterColdRecoveryCtrcWorkPrepare(const struct ClusterRecoveryStartV1 *start)
+{
+	if (!ClusterColdRecoveryTxCurrent(start)
+		|| !cluster_cold_typed_ctrc_work_prepare_v1(cluster_recovery_cold_inputs)
+		|| !ClusterColdRecoveryCtrcWorkCurrent(start, cluster_recovery_cold_inputs->ctrc_work))
+		return NULL;
+	return cluster_recovery_cold_inputs->ctrc_work;
+}
+
+bool
 ClusterColdRecoveryTxEffectsCurrent(const struct ClusterRecoveryStartV1 *start)
 {
 	const ClusterColdTypedV1 *typed = ClusterColdRecoveryTxInputs(start);

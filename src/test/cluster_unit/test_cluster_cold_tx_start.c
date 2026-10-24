@@ -246,17 +246,32 @@ static ClusterColdTypedV1 typed;
 static bool ctrc_census_ok, ctrc_census_drift;
 static unsigned ctrc_census_calls;
 static ClusterColdCtrcReleaseCensusV1 ctrc_census;
+static bool ctrc_before_c0;
+static union {
+	uint64 align;
+	unsigned char bytes[offsetof(ClusterColdCtrcWorkV1, entries)
+		+ 48 * sizeof(ClusterColdTtSlotInputV1)];
+} ctrc_work_storage;
+#define native_ctrc_work (*(ClusterColdCtrcWorkV1 *)ctrc_work_storage.bytes)
 
 /* The independent retained-native leg has its own actual TT/fold suite. */
 bool
-cluster_cold_typed_ctrc_release_census_v1(const ClusterColdTypedV1 *input,
-	ClusterColdCtrcReleaseCensusV1 *out)
+cluster_cold_typed_ctrc_work_prepare_v1(ClusterColdTypedV1 *input)
 {
 	if (input != &typed) abort();
 	ctrc_census_calls++;
-	*out = ctrc_census;
+	ctrc_before_c0 = stamp_prepares == 0 && wal_inserts == 0;
+	input->ctrc_work = NULL;
+	if (ctrc_census_ok && input->ctrc_work_generation != UINT64_MAX) {
+		memset(&ctrc_work_storage, 0, sizeof(ctrc_work_storage));
+		native_ctrc_work.plan = input->plan;
+		native_ctrc_work.top_tx_census = input->top_tx_census;
+		native_ctrc_work.counts = ctrc_census;
+		native_ctrc_work.generation = ++input->ctrc_work_generation;
+		input->ctrc_work = &native_ctrc_work;
+	}
 	if (ctrc_census_drift) observed_writer.epoch++;
-	return ctrc_census_ok;
+	return input->ctrc_work != NULL;
 }
 static union {
 	uint64 align;
@@ -1724,9 +1739,52 @@ UT_TEST(test_ctrc_component_rejects_original_source_and_owner_drift)
 	}
 }
 
+UT_TEST(test_ctrc_work_is_prepared_before_actual_c0_and_keeps_pending_input)
+{
+	c0_subject();
+	ctrc_census.subject_count = ctrc_census.unresolved_count = 1;
+	UT_ASSERT(cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+	UT_ASSERT_EQ(ctrc_census_calls, 1);
+	UT_ASSERT(ctrc_before_c0);
+	UT_ASSERT(stamp_prepares != 0 && wal_inserts != 0);
+	UT_ASSERT(ClusterColdRecoveryCtrcWorkCurrent(info.cluster_tx_start, &native_ctrc_work));
+	UT_ASSERT_EQ(native_ctrc_work.counts.unresolved_count, 1);
+	UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_result.state,
+		CLUSTER_RECOVERY_CTRC_RESULT_PENDING);
+}
+
+UT_TEST(test_ctrc_work_requires_original_pointer_and_live_startup_owner)
+{
+	for (unsigned fault = 0; fault < 10; fault++) {
+		const ClusterColdCtrcWorkV1 *work;
+		ClusterColdCtrcWorkV1 copy;
+		reset(); retain(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
+		work = ClusterColdRecoveryCtrcWorkPrepare(info.cluster_tx_start);
+		UT_ASSERT(work == &native_ctrc_work);
+		UT_ASSERT(ClusterColdRecoveryCtrcWorkCurrent(info.cluster_tx_start, work));
+		copy = *work;
+		UT_ASSERT(!ClusterColdRecoveryCtrcWorkCurrent(info.cluster_tx_start, &copy));
+		UT_ASSERT(!ClusterColdRecoveryCtrcWorkCurrent(info.cluster_tx_start,
+			(const ClusterColdCtrcWorkV1 *)(uintptr_t)1));
+		if (fault == 0) native_ctrc_work.plan = NULL;
+		if (fault == 1) native_ctrc_work.top_tx_census = NULL;
+		if (fault == 2) typed.ctrc_work = NULL;
+		if (fault == 3) CurrentResourceOwner = NULL;
+		if (fault == 4) owner_boot++;
+		if (fault == 5) observed_writer.epoch++;
+		if (fault == 6) native_recovery = true;
+		if (fault == 7) release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		if (fault == 8) native_ctrc_work.generation = 0;
+		if (fault == 9) typed.ctrc_work_generation++;
+		UT_ASSERT(!ClusterColdRecoveryCtrcWorkCurrent(info.cluster_tx_start, work));
+	}
+}
+
 int main(void)
 {
-	UT_PLAN(48);
+	UT_PLAN(50);
+	UT_RUN(test_ctrc_work_is_prepared_before_actual_c0_and_keeps_pending_input);
+	UT_RUN(test_ctrc_work_requires_original_pointer_and_live_startup_owner);
 	UT_RUN(test_ctrc_component_is_independent_of_complete_tx_and_fresh_shmem);
 	UT_RUN(test_ctrc_component_publishes_only_registered_original_input);
 	UT_RUN(test_ctrc_component_rejects_original_source_and_owner_drift);
