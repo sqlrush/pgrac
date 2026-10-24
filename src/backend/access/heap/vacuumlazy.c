@@ -1625,7 +1625,8 @@ lazy_validate_shared_freeze(LVRelState *vacrel, Page page, BlockNumber blkno)
  */
 static bool
 lazy_cleanout_shared_freeze_page(LVRelState *vacrel, Buffer buffer,
-							   const ClusterHeapFreezeProofBatchV1 *proofs)
+							   const ClusterHeapFreezeProofBatchV1 *proofs,
+							   const ClusterTxResolution *retained, uint8 retained_mask)
 {
 	const ClusterHeapFreezePageBatchV1 *batch = &vacrel->shared_freeze_batch;
 	Page page = BufferGetPage(buffer);
@@ -1640,7 +1641,9 @@ lazy_cleanout_shared_freeze_page(LVRelState *vacrel, Buffer buffer,
 
 	if (batch->carrier_request_count == 0
 		|| batch->carrier_request_count > CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH
-		|| proofs->proof_count == 0
+		|| (proofs->proof_count == 0 && retained_mask == 0)
+		|| (retained_mask != 0 && retained == NULL)
+		|| (retained_mask >> batch->carrier_request_count) != 0
 		|| proofs->proof_count > batch->carrier_request_count
 		|| !PageHasItl(page) || header->pd_special > BLCKSZ
 		|| header->pd_special < SizeOfPageHeaderData
@@ -1676,9 +1679,36 @@ lazy_cleanout_shared_freeze_page(LVRelState *vacrel, Buffer buffer,
 				return false;
 			resolution = &proof->resolution;
 		}
-		if (resolution == NULL)
+		if (resolution != NULL)
+		{
+			if ((retained_mask & (1U << index)) != 0)
+				return false;
+			matched_proofs++;
+		}
+		else if ((retained_mask & (1U << index)) != 0)
+		{
+			/* A retained C1b pair is only an ITL hint. It never enters the
+			 * canonical batch or supplies creator/FullXid freeze evidence. */
+			resolution = &retained[index];
+			if (request->carrier.flags != ITL_FLAG_NEEDS_CLEANOUT
+				|| request->locator.itl_kind != ITL_FLAG_NEEDS_CLEANOUT
+				|| request->locator.tt_wrap != TT_WRAP_INVALID
+				|| resolution->locator_echo.tt_wrap != TT_WRAP_INVALID
+				|| resolution->locator_echo.uba.raw[0] != request->locator.uba.raw[0]
+				|| resolution->locator_echo.uba.raw[1] != request->locator.uba.raw[1]
+				|| resolution->locator_echo.xid != request->locator.xid
+				|| resolution->locator_echo.itl_kind != request->locator.itl_kind
+				|| resolution->locator_echo.itl_slot_index != slot_index
+				|| resolution->local_canonical_valid
+				|| resolution->outcome != CLUSTER_TX_COMMITTED
+				|| resolution->proof_kind != CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG
+				|| resolution->top_xid != request->locator.xid
+				|| !SCN_VALID(resolution->commit_scn)
+				|| resolution->commit_scn != request->carrier.commit_scn)
+				return false;
+		}
+		else
 			continue;
-		matched_proofs++;
 		if (resolution->outcome == CLUSTER_TX_COMMITTED
 			&& cluster_itl_cleanout_can_stamp(&slots[slot_index], request->carrier.xid,
 										 resolution->commit_scn))
@@ -1723,6 +1753,7 @@ lazy_recheck_shared_freeze_page(LVRelState *vacrel, Buffer recent_buffer,
 							 const PcmAuthoritySnapshot *authority_before,
 							 const ClusterSemanticAdmissionToken *admission,
 							 ClusterHeapFreezeProofBatchV1 *proofs,
+							 const ClusterTxResolution *retained, uint8 retained_mask,
 							 ClusterHeapFreezeFinalFenceV1 *current_fence,
 							 bool *cleaned)
 {
@@ -1790,14 +1821,24 @@ lazy_recheck_shared_freeze_page(LVRelState *vacrel, Buffer recent_buffer,
 		}
 		status = cluster_heap_freeze_validate_conditional_apply_v1(
 			&vacrel->shared_freeze_batch, proofs, current_fence);
+		/* Hint-only pairs have no canonical expected-fence member. Recheck
+		 * their original page version explicitly, along with the same PCM
+		 * authority and admission, before permitting even an ITL hint. */
+		if (retained_mask != 0 && status != CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR
+			&& (!authority_current || !admission_current
+				|| current_fence->page_lsn != vacrel->shared_freeze_batch.page_lsn
+				|| current_fence->page_version != vacrel->shared_freeze_batch.page_version))
+			status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
 		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
 			|| (status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN
-				&& cluster_heap_freeze_validate_carrier_cleanout_v1(
-					&vacrel->shared_freeze_batch, proofs, current_fence)
-				== CLUSTER_HEAP_FREEZE_PROOF_PROVEN))
+				&& (retained_mask != 0
+					|| cluster_heap_freeze_validate_carrier_cleanout_v1(
+						&vacrel->shared_freeze_batch, proofs, current_fence)
+					== CLUSTER_HEAP_FREEZE_PROOF_PROVEN)))
 		{
 			hint_scope = true;
-			*cleaned = lazy_cleanout_shared_freeze_page(vacrel, recent_buffer, proofs);
+			*cleaned = lazy_cleanout_shared_freeze_page(vacrel, recent_buffer, proofs,
+				retained, retained_mask);
 		}
 
 recheck_done:;
@@ -1861,6 +1902,9 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 	ClusterHeapFreezeFinalFenceV1 expected_fence,
 							 current_fence;
 	ClusterHeapFreezeProofBatchV1 proofs;
+	/* Private, bounded hint-only evidence; never exported as canonical proof. */
+	ClusterTxResolution retained[CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH];
+	uint8 retained_mask = 0;
 	ClusterHeapFreezeObservedBoundsV1 observed_bounds = { 0 };
 	ClusterHeapFreezeProofStatusV1 status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
 	ClusterTxResolveReason reason;
@@ -1871,6 +1915,7 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 	uint64 proof_cost_before[15];
 
 	memset(&proofs, 0, sizeof(proofs));
+	memset(retained, 0, sizeof(retained));
 	memset(&admission, 0, sizeof(admission));
 	memset(&expected_fence, 0, sizeof(expected_fence));
 	memset(&current_fence, 0, sizeof(current_fence));
@@ -1924,29 +1969,70 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 		for (uint8 index = 0;
 			 index < vacrel->shared_freeze_batch.carrier_request_count; index++)
 		{
+			const ClusterHeapFreezeCarrierRequestV1 *request =
+				&vacrel->shared_freeze_batch.carrier_requests[index];
 			ClusterTxResolution resolution;
 			ClusterTxOutcome outcome;
+			bool retained_eligible;
 
 			memset(&resolution, 0, sizeof(resolution));
 			reason = CLUSTER_TX_RESOLVE_PROTOCOL;
-			outcome = cluster_tx_resolve_exact_admitted(
-				&vacrel->shared_freeze_batch.carrier_requests[index].locator,
-				CLUSTER_TX_RESOLVE_TERMINAL_CENSUS, &admission, &resolution, &reason);
+			/* As in the heap ITL census, retain only this carrier's captured
+			 * SCN. The existing entry first runs the ordinary exact resolver;
+			 * its fallback requires an exact origin C1b pair. The copied SCN
+			 * itself is never terminal authority or a creator identity. */
+			retained_eligible = request->carrier.flags == ITL_FLAG_NEEDS_CLEANOUT
+				&& request->locator.itl_kind == ITL_FLAG_NEEDS_CLEANOUT
+				&& request->locator.tt_wrap == TT_WRAP_INVALID
+				&& SCN_VALID(request->carrier.commit_scn);
+			if (retained_eligible)
+				outcome = cluster_tx_resolve_terminal_census_retained_admitted(
+					&request->locator, request->carrier.commit_scn,
+					&admission, &resolution, &reason);
+			else
+				outcome = cluster_tx_resolve_exact_admitted(
+					&request->locator, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+					&admission, &resolution, &reason);
 			if ((outcome != CLUSTER_TX_COMMITTED && outcome != CLUSTER_TX_ABORTED)
-				|| reason != CLUSTER_TX_RESOLVE_NONE
-				|| !cluster_heap_freeze_build_canonical_proof_v1(
-					&vacrel->shared_freeze_batch.carrier_requests[index].locator,
+				|| reason != CLUSTER_TX_RESOLVE_NONE)
+				continue;
+			if (!resolution.local_canonical_valid
+				|| resolution.locator_echo.tt_wrap == TT_WRAP_INVALID)
+			{
+				/* The retained fallback deliberately supplies no canonical TT
+				 * identity. Keep it out of that batch, including mixed pages. */
+				if (retained_eligible && outcome == CLUSTER_TX_COMMITTED
+					&& resolution.outcome == outcome && !resolution.local_canonical_valid
+					&& resolution.locator_echo.tt_wrap == TT_WRAP_INVALID
+					&& resolution.locator_echo.uba.raw[0] == request->locator.uba.raw[0]
+					&& resolution.locator_echo.uba.raw[1] == request->locator.uba.raw[1]
+					&& resolution.locator_echo.xid == request->locator.xid
+					&& resolution.locator_echo.itl_kind == request->locator.itl_kind
+					&& resolution.locator_echo.itl_slot_index == request->locator.itl_slot_index
+					&& resolution.top_xid == request->locator.xid
+					&& resolution.proof_kind == CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG
+					&& resolution.commit_scn == request->carrier.commit_scn
+					&& resolution.authority.origin_epoch == admission.formation_epoch
+					&& !XLogRecPtrIsInvalid(resolution.authority.live_hwm_lsn)
+					&& SCN_VALID(resolution.authority.authority_scn))
+				{
+					retained[index] = resolution;
+					retained_mask |= 1U << index;
+				}
+				continue;
+			}
+			if (cluster_heap_freeze_build_canonical_proof_v1(&request->locator,
 					&resolution, &expected_fence, &expected_fence, true, true, true,
 					&proofs.proofs[proofs.proof_count]))
-				continue;
-			proofs.proof_count++;
+				proofs.proof_count++;
 		}
-		if (proofs.proof_count == 0)
+		if (proofs.proof_count == 0 && retained_mask == 0)
 			goto admitted_done;
 
 		status = lazy_recheck_shared_freeze_page(vacrel, recent_buffer,
 													 &authority_before, &admission,
-													 &proofs, &current_fence, &cleaned);
+													 &proofs, retained, retained_mask,
+													 &current_fence, &cleaned);
 		/* Inner cleanup has released the local content lock and pin. Match a
 		 * bounded, read-only cohort observation to this original admission and
 		 * the retained policy bound. Neither grants a positive F/H certificate:

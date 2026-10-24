@@ -2146,6 +2146,25 @@ UT_TEST(cleanout_subset_requires_the_same_final_current_fence)
 				 CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
 }
 
+UT_TEST(retained_c1b_reply_is_not_a_canonical_freeze_or_cleanout_proof)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+
+	init_subset_proof_fixture(&page, &proofs, &fence);
+	proofs.proofs[0].requested_locator.itl_kind = ITL_FLAG_NEEDS_CLEANOUT;
+	page.carrier_requests[0].locator = proofs.proofs[0].requested_locator;
+	proofs.proofs[0].resolution.locator_echo = proofs.proofs[0].requested_locator;
+	proofs.proofs[0].resolution.local_canonical_valid = false;
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_canonical_proof_v1(&proofs.proofs[0]),
+		CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR);
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_conditional_apply_v1(&page, &proofs, &fence),
+		CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR);
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_carrier_cleanout_v1(&page, &proofs, &fence),
+		CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR);
+}
+
 UT_TEST(cleanout_subset_never_promotes_missing_canonical_evidence)
 {
 	ClusterHeapFreezePageBatchV1 page;
@@ -3031,7 +3050,7 @@ UT_TEST(xmin_batch_plan_single_target_preserves_original_plan)
 int
 main(void)
 {
-	UT_PLAN(97);
+	UT_PLAN(98);
 	UT_RUN(xmin_batch_plan_keeps_target_order_and_native_fields);
 	UT_RUN(xmin_batch_plan_later_refusal_preserves_all_outputs);
 	UT_RUN(xmin_batch_plan_runtime_counts_and_capacity_are_bounded);
@@ -3116,6 +3135,7 @@ main(void)
 	UT_RUN(exact_subset_can_cleanout_without_proving_the_whole_page);
 	UT_RUN(cleanout_subset_rejects_duplicate_or_unrequested_proofs);
 	UT_RUN(cleanout_subset_requires_the_same_final_current_fence);
+	UT_RUN(retained_c1b_reply_is_not_a_canonical_freeze_or_cleanout_proof);
 	UT_RUN(cleanout_subset_never_promotes_missing_canonical_evidence);
 	UT_RUN(creation_binding_is_physical_even_with_equal_raw_xids_and_carriers);
 	UT_RUN(creation_binding_keeps_own_carrier_and_proof_order);

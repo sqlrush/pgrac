@@ -95,6 +95,10 @@ static ClusterSpaceHintResult hint_result;
 static bool error_hint_begin, mismatch_requested_locator;
 static ClusterTxOutcome slot_outcomes[CLUSTER_ITL_INITRANS_DEFAULT];
 static SCN slot_scns[CLUSTER_ITL_INITRANS_DEFAULT];
+static bool slot_requires_retained_scn[CLUSTER_ITL_INITRANS_DEFAULT];
+static SCN retained_scns[CLUSTER_ITL_INITRANS_DEFAULT];
+static unsigned retained_resolves;
+static unsigned retained_shape_fault;
 static ClusterHeapFreezeCohortObservation cohort_value;
 static ClusterHeapFreezeCohortStatus cohort_status;
 static unsigned cohort_calls, bindings_at_cohort;
@@ -342,10 +346,11 @@ cluster_tx_resolve_terminal_census_batch_preflight(void)
 		throw_error();
 }
 
-ClusterTxOutcome
-cluster_tx_resolve_exact_admitted(const ClusterTxLocator *locator, ClusterTxResolveMode mode,
-								const ClusterSemanticAdmissionToken *admission,
-								ClusterTxResolution *out, ClusterTxResolveReason *reason)
+static ClusterTxOutcome
+fixture_resolve_admitted(const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+						const ClusterSemanticAdmissionToken *admission,
+						ClusterTxResolution *out, ClusterTxResolveReason *reason,
+						SCN retained_scn)
 {
 	ClusterUndoBlock0CurrentGuard guard;
 	ClusterRuntimeCandidateCleanup cleanup;
@@ -373,8 +378,56 @@ cluster_tx_resolve_exact_admitted(const ClusterTxLocator *locator, ClusterTxReso
 	out->locator_echo = *locator;
 	out->outcome = slot_outcomes[locator->itl_slot_index];
 	out->commit_scn = slot_scns[locator->itl_slot_index];
+	if (slot_requires_retained_scn[locator->itl_slot_index]
+		&& retained_scn != slot_scns[locator->itl_slot_index])
+	{
+		*reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+		return CLUSTER_TX_UNKNOWN;
+	}
+	out->top_xid = locator->xid;
+	out->proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
+	out->authority.origin_epoch = admission->formation_epoch;
+	out->authority.live_hwm_lsn = 123;
+	out->authority.authority_scn = 321;
+	/* The real retained fallback has no canonical TT metadata or wrap.
+	 * Ordinary exact success supplies those separately. */
+	if (!slot_requires_retained_scn[locator->itl_slot_index])
+	{
+		out->local_canonical_valid = true;
+		out->locator_echo.tt_wrap = 4 + locator->itl_slot_index;
+	}
+	else if (locator->itl_slot_index == 1)
+	{
+		if (retained_shape_fault == 1) out->locator_echo.xid++;
+		if (retained_shape_fault == 2) out->top_xid++;
+		if (retained_shape_fault == 3) out->proof_kind = CLUSTER_TX_PROOF_NONE;
+		if (retained_shape_fault == 4) out->authority.origin_epoch++;
+		if (retained_shape_fault == 5) out->authority.live_hwm_lsn = InvalidXLogRecPtr;
+		if (retained_shape_fault == 6) out->commit_scn++;
+		if (retained_shape_fault == 7) out->locator_echo.tt_wrap = 4;
+		if (retained_shape_fault == 8) out->locator_echo.uba.raw[1]++;
+	}
 	*reason = unknown_outcome ? CLUSTER_TX_RESOLVE_PROTOCOL : CLUSTER_TX_RESOLVE_NONE;
 	return unknown_outcome ? CLUSTER_TX_UNKNOWN : out->outcome;
+}
+
+ClusterTxOutcome
+cluster_tx_resolve_exact_admitted(const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+								const ClusterSemanticAdmissionToken *admission,
+								ClusterTxResolution *out, ClusterTxResolveReason *reason)
+{
+	return fixture_resolve_admitted(locator, mode, admission, out, reason, InvalidScn);
+}
+
+ClusterTxOutcome
+cluster_tx_resolve_terminal_census_retained_admitted(const ClusterTxLocator *locator,
+	SCN retained_scn, const ClusterSemanticAdmissionToken *admission,
+	ClusterTxResolution *out, ClusterTxResolveReason *reason)
+{
+	retained_resolves++;
+	retained_scns[locator->itl_slot_index] = retained_scn;
+	return fixture_resolve_admitted(locator, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+		admission, out, reason, retained_scn);
 }
 
 bool
@@ -406,6 +459,14 @@ validate_fixture_proofs(
 	validation_under_lock = pin_held && content_locked;
 	if (error_validate)
 		throw_error();
+	if (proofs->proof_count == 0)
+		return CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
+	/* Match the actual canonical validator's two reviewed requirements.
+	 * Its full unchanged contract is exercised by shared-MX's real object. */
+	for (unsigned index = 0; index < proofs->proof_count; index++)
+		if (!proofs->proofs[index].resolution.local_canonical_valid
+			|| proofs->proofs[index].resolution.locator_echo.tt_wrap == TT_WRAP_INVALID)
+			return CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR;
 	if (!proofs->proofs[0].authority_current || !proofs->proofs[0].admission_current
 		|| proofs->proofs[0].expected_fence.page_lsn != fence->page_lsn
 		|| proofs->proofs[0].expected_fence.page_version != fence->page_version)
@@ -809,7 +870,7 @@ reset_fixture(void)
 	cleanup_count = 0;
 	cleanup_order[0] = '\0';
 	exit_callback = NULL;
-	hint_begins = hint_finishes = 0;
+	hint_begins = hint_finishes = retained_resolves = retained_shape_fault = 0;
 	hint_result = CLUSTER_SPACE_HINT_VERSIONED;
 	error_hint_begin = mismatch_requested_locator = false;
 	CritSectionCount = 0;
@@ -817,6 +878,8 @@ reset_fixture(void)
 	{
 		slot_outcomes[index] = CLUSTER_TX_COMMITTED;
 		slot_scns[index] = 200 + index;
+		slot_requires_retained_scn[index] = false;
+		retained_scns[index] = InvalidScn;
 	}
 	PG_exception_stack = NULL;
 	error_context_stack = NULL;
@@ -1277,6 +1340,223 @@ expected_cleanout(PGAlignedBlock *expected, bool second)
 	}
 	((PageHeader)expected->data)->pd_block_scn++;
 	PageSetLSN((Page)expected->data, 102);
+}
+
+UT_TEST(needs_cleanout_uses_captured_scn_under_original_admission)
+{
+	PGAlignedBlock expected;
+	ClusterItlSlotData *slots = setup_cleanout_page();
+
+	vacrel.shared_freeze_batch.carrier_request_count = 1;
+	slots[0].flags = ITL_FLAG_NEEDS_CLEANOUT;
+	slots[0].commit_scn = slot_scns[0];
+	vacrel.shared_freeze_batch.carrier_requests[0].carrier = slots[0];
+	vacrel.shared_freeze_batch.carrier_requests[0].locator.itl_kind = slots[0].flags;
+	slot_requires_retained_scn[0] = true;
+	expected_cleanout(&expected, false);
+	UT_ASSERT(!collect_catches_error());
+	UT_ASSERT_EQ(retained_resolves, 1);
+	UT_ASSERT_EQ(retained_scns[0], slot_scns[0]);
+	UT_ASSERT_EQ(resolves, 1);
+	UT_ASSERT_EQ(hint_begins, 1);
+	UT_ASSERT_EQ(hint_finishes, 1);
+	UT_ASSERT_EQ(memcmp(resident_page.data, expected.data, BLCKSZ), 0);
+	UT_ASSERT(!vacrel.shared_freeze_fence_valid);
+	check_local_cleanup_without_pcm_release("LPA");
+}
+
+UT_TEST(retained_scn_never_merges_equal_xids_in_different_carriers)
+{
+	PGAlignedBlock expected;
+	ClusterItlSlotData *slots = setup_cleanout_page();
+
+	for (unsigned index = 0; index < 2; index++)
+	{
+		slots[index].flags = ITL_FLAG_NEEDS_CLEANOUT;
+		slots[index].commit_scn = slot_scns[index];
+		vacrel.shared_freeze_batch.carrier_requests[index].carrier = slots[index];
+		vacrel.shared_freeze_batch.carrier_requests[index].locator.itl_kind = slots[index].flags;
+		slot_requires_retained_scn[index] = true;
+	}
+	expected_cleanout(&expected, true);
+	UT_ASSERT(!collect_catches_error());
+	UT_ASSERT_EQ(retained_resolves, 2);
+	UT_ASSERT_EQ(retained_scns[0], slot_scns[0]);
+	UT_ASSERT_EQ(retained_scns[1], slot_scns[1]);
+	UT_ASSERT(retained_scns[0] != retained_scns[1]);
+	UT_ASSERT_EQ(resolves, 2);
+	UT_ASSERT_EQ(hint_finishes, 1);
+	UT_ASSERT_EQ(memcmp(resident_page.data, expected.data, BLCKSZ), 0);
+	check_local_cleanup_without_pcm_release("LPA");
+}
+
+UT_TEST(unrelated_or_incomplete_carriers_keep_original_exact_route)
+{
+	for (unsigned variant = 0; variant < 5; variant++)
+	{
+		ClusterItlSlotData *slots = setup_cleanout_page();
+		ClusterHeapFreezeCarrierRequestV1 *request =
+			&vacrel.shared_freeze_batch.carrier_requests[0];
+
+		vacrel.shared_freeze_batch.carrier_request_count = 1;
+		slots[0].flags = ITL_FLAG_NEEDS_CLEANOUT;
+		slots[0].commit_scn = slot_scns[0];
+		request->carrier = slots[0];
+		request->locator.itl_kind = slots[0].flags;
+		slot_requires_retained_scn[0] = true;
+		if (variant == 0) request->carrier.flags = ITL_FLAG_ACTIVE;
+		if (variant == 1) request->locator.itl_kind = ITL_FLAG_ACTIVE;
+		if (variant == 2) request->carrier.commit_scn = InvalidScn;
+		if (variant == 3) request->locator.tt_wrap = 4;
+		if (variant == 4)
+		{
+			request->carrier.flags = ITL_FLAG_COMMITTED;
+			request->locator.itl_kind = ITL_FLAG_COMMITTED;
+		}
+		UT_ASSERT(!collect_catches_error());
+		UT_ASSERT_EQ(retained_resolves, 0);
+		UT_ASSERT_EQ(resolves, 1);
+		UT_ASSERT_EQ(hint_begins, 0);
+		UT_ASSERT_EQ(collected_status, CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+		UT_ASSERT_EQ(leaves, 1);
+		UT_ASSERT_EQ(debt, 0);
+	}
+}
+
+UT_TEST(refused_retained_pair_keeps_other_exact_carrier_without_retrying)
+{
+	PGAlignedBlock expected;
+	ClusterItlSlotData *slots = setup_cleanout_page();
+
+	for (unsigned index = 0; index < 2; index++)
+	{
+		slots[index].flags = ITL_FLAG_NEEDS_CLEANOUT;
+		slots[index].commit_scn = slot_scns[index] + index;
+		vacrel.shared_freeze_batch.carrier_requests[index].carrier = slots[index];
+		vacrel.shared_freeze_batch.carrier_requests[index].locator.itl_kind = slots[index].flags;
+		slot_requires_retained_scn[index] = true;
+	}
+	expected_cleanout(&expected, false);
+	UT_ASSERT(!collect_catches_error());
+	UT_ASSERT_EQ(retained_resolves, 2);
+	UT_ASSERT_EQ(resolves, 2);
+	UT_ASSERT_EQ(hint_finishes, 1);
+	UT_ASSERT_EQ(memcmp(resident_page.data, expected.data, BLCKSZ), 0);
+	UT_ASSERT(!vacrel.shared_freeze_fence_valid);
+	check_local_cleanup_without_pcm_release("LPA");
+}
+
+UT_TEST(retained_pair_error_and_cancel_unwind_guard_before_admission)
+{
+	const int codes[] = {ERRCODE_INTERNAL_ERROR, ERRCODE_QUERY_CANCELED};
+
+	for (unsigned index = 0; index < lengthof(codes); index++)
+	{
+		ClusterItlSlotData *slots = setup_cleanout_page();
+
+		vacrel.shared_freeze_batch.carrier_request_count = 1;
+		slots[0].flags = ITL_FLAG_NEEDS_CLEANOUT;
+		slots[0].commit_scn = slot_scns[0];
+		vacrel.shared_freeze_batch.carrier_requests[0].carrier = slots[0];
+		vacrel.shared_freeze_batch.carrier_requests[0].locator.itl_kind = slots[0].flags;
+		slot_requires_retained_scn[0] = true;
+		fail_resolve = 1;
+		inject_code = codes[index];
+		check_error_cleanup("GA");
+		UT_ASSERT_EQ(retained_resolves, 1);
+		UT_ASSERT_EQ(resolves, 1);
+		UT_ASSERT_EQ(hint_begins, 0);
+	}
+}
+
+UT_TEST(retained_pair_still_requires_final_resident_authority)
+{
+	ClusterItlSlotData *slots = setup_cleanout_page();
+
+	vacrel.shared_freeze_batch.carrier_request_count = 1;
+	slots[0].flags = ITL_FLAG_NEEDS_CLEANOUT;
+	slots[0].commit_scn = slot_scns[0];
+	vacrel.shared_freeze_batch.carrier_requests[0].carrier = slots[0];
+	vacrel.shared_freeze_batch.carrier_requests[0].locator.itl_kind = slots[0].flags;
+	slot_requires_retained_scn[0] = true;
+	changed_holder = true;
+	UT_ASSERT(!collect_catches_error());
+	UT_ASSERT_EQ(retained_resolves, 1);
+	UT_ASSERT_EQ(hint_begins, 0);
+	UT_ASSERT_EQ(collected_status, CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	check_local_cleanup_without_pcm_release("LPA");
+}
+
+UT_TEST(canonical_and_retained_evidence_share_only_one_hint_write)
+{
+	PGAlignedBlock expected;
+	ClusterItlSlotData *slots = setup_cleanout_page();
+
+	for (unsigned index = 0; index < 2; index++)
+	{
+		slots[index].flags = ITL_FLAG_NEEDS_CLEANOUT;
+		slots[index].commit_scn = slot_scns[index];
+		vacrel.shared_freeze_batch.carrier_requests[index].carrier = slots[index];
+		vacrel.shared_freeze_batch.carrier_requests[index].locator.itl_kind = slots[index].flags;
+	}
+	slot_requires_retained_scn[1] = true;
+	expected_cleanout(&expected, true);
+	UT_ASSERT(!collect_catches_error());
+	UT_ASSERT_EQ(retained_resolves, 2);
+	UT_ASSERT_EQ(hint_finishes, 1);
+	UT_ASSERT_EQ(memcmp(resident_page.data, expected.data, BLCKSZ), 0);
+	UT_ASSERT(!vacrel.shared_freeze_fence_valid);
+	UT_ASSERT(!vacrel.shared_freeze_cohort_observed);
+	UT_ASSERT_EQ(vacrel.shared_freeze_xmin_candidates.target_count, 0);
+	check_local_cleanup_without_pcm_release("LPA");
+}
+
+UT_TEST(retained_only_hint_requires_original_lsn_version_and_admission)
+{
+	for (unsigned variant = 0; variant < 4; variant++)
+	{
+		ClusterItlSlotData *slots = setup_cleanout_page();
+
+		vacrel.shared_freeze_batch.carrier_request_count = 1;
+		slots[0].flags = ITL_FLAG_NEEDS_CLEANOUT;
+		slots[0].commit_scn = slot_scns[0];
+		vacrel.shared_freeze_batch.carrier_requests[0].carrier = slots[0];
+		vacrel.shared_freeze_batch.carrier_requests[0].locator.itl_kind = slots[0].flags;
+		slot_requires_retained_scn[0] = true;
+		if (variant == 0) PageSetLSN((Page)resident_page.data, 102);
+		if (variant == 1) ((PageHeader)resident_page.data)->pd_block_scn++;
+		if (variant == 2) changed_admission = true;
+		if (variant == 3) changed_master = true;
+		UT_ASSERT(!collect_catches_error());
+		UT_ASSERT_EQ(hint_begins, 0);
+		UT_ASSERT_EQ(collected_status, CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+		check_local_cleanup_without_pcm_release("LPA");
+	}
+}
+
+UT_TEST(malformed_retained_pair_cannot_poison_other_canonical_carrier)
+{
+	for (unsigned fault = 1; fault <= 8; fault++)
+	{
+		PGAlignedBlock expected;
+		ClusterItlSlotData *slots = setup_cleanout_page();
+
+		for (unsigned index = 0; index < 2; index++)
+		{
+			slots[index].flags = ITL_FLAG_NEEDS_CLEANOUT;
+			slots[index].commit_scn = slot_scns[index];
+			vacrel.shared_freeze_batch.carrier_requests[index].carrier = slots[index];
+			vacrel.shared_freeze_batch.carrier_requests[index].locator.itl_kind = slots[index].flags;
+		}
+		slot_requires_retained_scn[1] = true;
+		retained_shape_fault = fault;
+		expected_cleanout(&expected, false);
+		UT_ASSERT(!collect_catches_error());
+		UT_ASSERT_EQ(hint_finishes, 1);
+		UT_ASSERT_EQ(memcmp(resident_page.data, expected.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(collected_status, CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+		check_local_cleanup_without_pcm_release("LPA");
+	}
 }
 
 UT_TEST(committed_carriers_use_one_versioned_hint_and_invalidate_saved_fence)
@@ -2441,7 +2721,7 @@ UT_TEST(positive_target_readiness_change_allows_same_backend_next_attempt)
 int
 main(void)
 {
-	UT_PLAN(91);
+	UT_PLAN(100);
 	UT_RUN(positive_candidate_requires_full_target_admission);
 	UT_RUN(positive_candidate_full_target_recheck_uses_original_token_after_clock);
 	UT_RUN(positive_target_recheck_error_and_cancel_use_original_cleanup);
@@ -2494,6 +2774,15 @@ main(void)
 	UT_RUN(cache_off_validation_error_preserves_original_error);
 	UT_RUN(cache_off_page_cancel_preserves_error_and_backend_reuse);
 	UT_RUN(cache_off_refused_local_lock_releases_only_pin);
+	UT_RUN(needs_cleanout_uses_captured_scn_under_original_admission);
+	UT_RUN(retained_scn_never_merges_equal_xids_in_different_carriers);
+	UT_RUN(unrelated_or_incomplete_carriers_keep_original_exact_route);
+	UT_RUN(refused_retained_pair_keeps_other_exact_carrier_without_retrying);
+	UT_RUN(retained_pair_error_and_cancel_unwind_guard_before_admission);
+	UT_RUN(retained_pair_still_requires_final_resident_authority);
+	UT_RUN(canonical_and_retained_evidence_share_only_one_hint_write);
+	UT_RUN(retained_only_hint_requires_original_lsn_version_and_admission);
+	UT_RUN(malformed_retained_pair_cannot_poison_other_canonical_carrier);
 	UT_RUN(committed_carriers_use_one_versioned_hint_and_invalidate_saved_fence);
 	UT_RUN(every_carrier_witness_byte_is_checked_before_first_stamp);
 	UT_RUN(requested_locator_must_match_exactly_before_any_stamp);
