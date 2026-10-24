@@ -82,6 +82,7 @@
 #include "cluster/cluster_itl_cleanout.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_scn.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_tx_resolve.h"
@@ -1940,9 +1941,33 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 						 &vacrel->cutoffs.SharedFreezePolicySample, &cohort,
 						 &admission, cluster_node_id, &observed_bounds))
 			{
-				memcpy(&vacrel->shared_freeze_cohort, &cohort, sizeof(cohort));
-				vacrel->shared_freeze_candidate_limit_full = observed_bounds.freeze_limit;
-				vacrel->shared_freeze_cohort_observed = true;
+				SCN wal_clock = cluster_scn_current();
+
+				/* Observe this same H after releasing page/proof ownership.
+				 * The native apply entry only checks the clock under its lock.
+				 * Clock callbacks can invalidate the original protection, so
+				 * repeat the same checks before retaining any candidate. */
+				if (!SCN_VALID(wal_clock)
+					|| scn_time_cmp(wal_clock, observed_bounds.horizon_scn) < 0)
+				{
+					cluster_scn_observe(observed_bounds.horizon_scn);
+					wal_clock = cluster_scn_current();
+					policy_current = cluster_heap_freeze_policy_sample_current_v1(
+						&vacrel->cutoffs.SharedFreezePolicySample);
+					cohort_current = policy_current
+						&& cluster_heap_freeze_cohort_current(&cohort)
+						== CLUSTER_HEAP_FREEZE_COHORT_READY;
+					if (!cluster_semantic_activation_recheck_r4_terminal_census(&admission))
+						status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
+				}
+				if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+					&& policy_current && cohort_current && SCN_VALID(wal_clock)
+					&& scn_time_cmp(wal_clock, observed_bounds.horizon_scn) >= 0)
+				{
+					memcpy(&vacrel->shared_freeze_cohort, &cohort, sizeof(cohort));
+					vacrel->shared_freeze_candidate_limit_full = observed_bounds.freeze_limit;
+					vacrel->shared_freeze_cohort_observed = true;
+				}
 			}
 		}
 		/* This remains only a physical association, never row-freeze permission. */
