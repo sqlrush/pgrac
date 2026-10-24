@@ -3105,10 +3105,37 @@ UT_TEST(test_writer_resume_error_before_lock_still_unpins_before_admission)
 	UT_ASSERT_EQ(debt, 0); UT_ASSERT_EQ(leaves, 1);
 }
 
+UT_TEST(bound_sources_borrow_original_owned_policy_and_cohort)
+{
+	reset_fixture(); set_shared_policy(80);
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT(vacrel.shared_freeze_cohort_observed);
+	UT_ASSERT(vacrel.shared_freeze_input.freeze_policy == &vacrel.cutoffs.SharedFreezePolicySample);
+	UT_ASSERT(vacrel.shared_freeze_input.freeze_cohort == &vacrel.shared_freeze_cohort);
+	UT_ASSERT_EQ(debt, 0); UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+}
+
+UT_TEST(refused_collection_retires_previous_bound_source_borrows)
+{
+	for (int early = 0; early < 2; early++) {
+		reset_fixture(); set_shared_policy(80);
+		vacrel.shared_freeze_input.freeze_policy = &vacrel.cutoffs.SharedFreezePolicySample;
+		vacrel.shared_freeze_input.freeze_cohort = &vacrel.shared_freeze_cohort;
+		if (early) vacrel.shared_freeze_batch.carrier_request_count = 0;
+		else target_admission_current = false;
+		(void)lazy_collect_shared_freeze_proofs(&vacrel, 1);
+		UT_ASSERT(vacrel.shared_freeze_input.freeze_policy == NULL);
+		UT_ASSERT(vacrel.shared_freeze_input.freeze_cohort == NULL);
+		UT_ASSERT_EQ(debt, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(118);
+	UT_PLAN(120);
+	UT_RUN(bound_sources_borrow_original_owned_policy_and_cohort);
+	UT_RUN(refused_collection_retires_previous_bound_source_borrows);
 	UT_RUN(partial_xmin_candidate_keeps_page_unproven_after_original_release);
 	UT_RUN(partial_xmin_candidates_require_successful_resident_and_pcm_recheck);
 	UT_RUN(partial_xmin_candidates_keep_original_target_and_source_revocation);

@@ -97,6 +97,7 @@
 #include "cluster/cluster_mode.h"		/* cluster_storage_mode_enabled / cluster_peer_mode_enabled */
 #include "cluster/cluster_guc.h"		/* cluster_enabled */
 #include "cluster/cluster_heap_freeze.h" /* qualified conditional xmin write */
+#include "cluster/cluster_heap_horizon.h" /* original observed F/H companions */
 #include "cluster/cluster_pcm_lock.h" /* final holder/master authority */
 #include "cluster/cluster_gcs_block.h" /* ACTIVE local writer ledger */
 #include "cluster/cluster_itl.h"		/* alloc_or_reuse_slot / stamp_active */
@@ -20703,7 +20704,8 @@ cluster_heap_freeze_apply_xmin_batch_locked_v1(
 	const PcmAuthoritySnapshot *authority_before,
 	const ClusterSemanticAdmissionToken *admission,
 	const ClusterHeapFreezeXminTargetV1 *targets, uint16 target_count,
-	HeapTupleFreeze *plans, TransactionId conflict_horizon, SCN horizon_scn)
+	HeapTupleFreeze *plans, TransactionId conflict_horizon,
+	FullTransactionId freeze_limit_full, SCN horizon_scn)
 {
 	RelFileLocator locator;
 	ForkNumber fork;
@@ -20719,6 +20721,7 @@ cluster_heap_freeze_apply_xmin_batch_locked_v1(
 	uint8 pcm_state;
 	SCN page_version;
 	SCN wal_clock;
+	ClusterHeapFreezeObservedBoundsV1 bounds;
 
 	/* Borrow a real writer's resources; a local conditional lock is not X. */
 	if (rel == NULL || rel->rd_rel == NULL || input == NULL || page == NULL
@@ -20811,6 +20814,15 @@ cluster_heap_freeze_apply_xmin_batch_locked_v1(
 		|| !cluster_semantic_activation_recheck_r4_terminal_census(admission))
 		return false;
 
+	/* Repeat only the pure source match after the final identity callbacks.
+	 * No source sampling, protection acquisition or callback is permitted
+	 * under the page lock; positive provenance remains the caller's duty. */
+	if (!cluster_heap_freeze_observed_bounds_v1(input->freeze_policy,
+		input->freeze_cohort, admission, cluster_node_id, &bounds)
+		|| !FullTransactionIdEquals(bounds.freeze_limit, freeze_limit_full)
+		|| bounds.horizon_scn != horizon_scn)
+		return false;
+
 	/* XLogInsertRecord stamps the existing local SCN clock, not H. The
 	 * caller must have observed H before borrowing the page lock; do not
 	 * advance the clock or introduce callbacks/waits under that lock here. */
@@ -20842,6 +20854,7 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 	BufferDesc *buf;
 	HeapTupleFreeze plans[MaxHeapTuplesPerPage];
 	TransactionId conflict_horizon;
+	ClusterHeapFreezeObservedBoundsV1 bounds;
 	volatile bool resumed = false;
 	volatile bool applied = false;
 
@@ -20856,6 +20869,14 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 	if (rel == NULL || fence == NULL
 		|| !RelFileLocatorEquals(rel->rd_locator, fence->identity.key.locator))
 		return false;
+	/* Scalars alone cannot substitute for the retained same-admission
+	 * observations. This is a pure match, not F/H or retention qualification. */
+	if (input == NULL
+		|| !cluster_heap_freeze_observed_bounds_v1(input->freeze_policy,
+			input->freeze_cohort, admission, cluster_node_id, &bounds)
+		|| !FullTransactionIdEquals(bounds.freeze_limit, freeze_limit_full)
+		|| bounds.horizon_scn != horizon_scn)
+		return false;
 	/* Plan only from the caller's immutable captured inputs. Finish the
 	 * whole batch before restoring a writer or taking its local content X;
 	 * the locked kernel still rechecks every physical row and final fence. */
@@ -20867,7 +20888,7 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 	if (LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
 		return cluster_heap_freeze_apply_xmin_batch_locked_v1(rel, buffer,
 			input, page, fence, authority_before, admission,
-			targets, target_count, plans, conflict_horizon, horizon_scn);
+			targets, target_count, plans, conflict_horizon, freeze_limit_full, horizon_scn);
 	if (input == NULL || !input->writer_context_valid)
 		return false;
 	/* A census-read token cannot restore an ordinary writer. Validate the
@@ -20888,7 +20909,7 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 		if (resumed)
 			applied = cluster_heap_freeze_apply_xmin_batch_locked_v1(rel, buffer,
 				input, page, fence, authority_before, admission,
-				targets, target_count, plans, conflict_horizon, horizon_scn);
+				targets, target_count, plans, conflict_horizon, freeze_limit_full, horizon_scn);
 	}
 	PG_FINALLY();
 	{

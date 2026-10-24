@@ -55,6 +55,7 @@
 #include "cluster/cluster_mode.h"
 #include "access/visibilitymap.h"
 #include "test_cluster_heap_maintenance_policy.inc"
+#include "test_cluster_vacuum_observed_bounds.inc"
 
 UT_DEFINE_GLOBALS();
 #include "test_cluster_heap_small_scn.inc"
@@ -109,6 +110,7 @@ static bool full_target_current, target_recheck_error, revoke_target_census;
 static unsigned full_target_checks;
 static unsigned target_preflight_checks, census_preflight_checks;
 static bool preflight_target_error, preflight_revoke_census, allow_preflight_target;
+static ClusterHeapFreezeCohortObservation *retire_bounds_after_target;
 
 /* The real native apply reads this clock before mutation. WAL insertion's
  * existing production xl_scn stamp uses the same clock; this leaf captures
@@ -334,6 +336,8 @@ cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 	UT_ASSERT_EQ(wal_clock_reads + inserts + dirties + edges + flushes, 0);
 	if (target_recheck_error) elog(ERROR, "injected full TARGET recheck error");
 	if (revoke_target_census) admission_current = false;
+	if (retire_bounds_after_target != NULL)
+		retire_bounds_after_target->horizon_scn++;
 	return full_target_current;
 }
 
@@ -708,6 +712,7 @@ reset(uint8 opcode, bool shared)
 	full_target_checks = 0;
 	target_preflight_checks = census_preflight_checks = 0;
 	preflight_target_error = preflight_revoke_census = allow_preflight_target = false;
+	retire_bounds_after_target = NULL;
 	local_x = writer_current = route_current = authority_current = admission_current = true;
 	local_share = resume_allowed = resume_error = resumed_writer = false;
 	node_grant_current = true;
@@ -989,6 +994,8 @@ typedef struct QualifiedXminFixture
 	ClusterHeapFreezeFinalFenceV1 fence;
 	PcmAuthoritySnapshot authority;
 	ClusterSemanticAdmissionToken admission;
+	ClusterHeapFreezePolicySampleV1 policy;
+	ClusterHeapFreezeCohortObservation cohort;
 } QualifiedXminFixture;
 
 static void
@@ -1072,6 +1079,19 @@ qualified_xmin_setup(QualifiedXminFixture *f, uint16 xmax_mask)
 	f->authority.transition_count = 11;
 	f->admission.entered = true;
 	f->admission.record_generation = 13;
+	f->admission.formation_epoch = 21;
+	f->policy.legal_next = FullTransactionIdFromEpochAndXid(1, 200);
+	f->policy.freeze_limit = FullTransactionIdFromEpochAndXid(1, 100);
+	f->cohort.active_full_xid_min = U64FromFullTransactionId(f->policy.freeze_limit);
+	f->cohort.future_full_xid_max = U64FromFullTransactionId(f->policy.legal_next);
+	f->cohort.horizon_scn = 10;
+	f->cohort.record_generation = 13; f->cohort.formation_epoch = 21;
+	f->cohort.admitted_members_lo = 1;
+	f->cohort.admission_fence.record_generation = 13;
+	f->cohort.admission_fence.formation_epoch = 21;
+	f->cohort.admission_fence.admitted_members_lo = 1;
+	f->cohort.admission_fence.local_node_id = 0;
+	f->input.freeze_policy = &f->policy; f->input.freeze_cohort = &f->cohort;
 	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f->page, &f->proofs, &f->fence), 1);
 }
 
@@ -1114,6 +1134,8 @@ qualified_xmin_batch_setup(QualifiedXminFixture *f,
 	f->input.writer_context_valid = true;
 	f->input.writer_object_revision = 7;
 	f->input.writer_object_checked = true;
+	f->input.freeze_policy = &f->policy;
+	f->input.freeze_cohort = &f->cohort;
 	UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&f->input, &f->page));
 	UT_ASSERT_EQ(f->page.carrier_request_count, 3);
 	f->proofs.proof_count = 3;
@@ -1521,6 +1543,7 @@ UT_TEST(test_xmin_single_and_batch_wal_clock_accept_time_equal_or_ahead)
 				qualified_xmin_batch_setup(&f, targets);
 			else
 				qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
+			f.cohort.horizon_scn = horizon;
 			/* A lower node id at the same time is still sufficient. */
 			fixture_wal_clock = scn_encode(0, 10 + ahead);
 			applied = batch ? cluster_heap_freeze_apply_xmin_batch_v1(
@@ -2538,7 +2561,8 @@ UT_TEST(test_xmin_locked_kernel_refuses_foreign_proof_before_native_wal)
 		if (setjmp(error_jump) == 0) {
 			UT_ASSERT(!cluster_heap_freeze_apply_xmin_batch_locked_v1(&relation_data,
 				1, &f.input, &f.page, &f.fence, &f.authority, &f.admission,
-				&target, 1, &plan, conflict_horizon, 10));
+				&target, 1, &plan, conflict_horizon,
+				FullTransactionIdFromEpochAndXid(1, 100), 10));
 		} else {
 			expecting_error = false;
 			UT_ASSERT(false);
@@ -2679,10 +2703,83 @@ UT_TEST(test_original_freeze_space_refusal_still_errors)
 	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
 }
 
+UT_TEST(test_xmin_apply_requires_same_bound_sources)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int released = 0; released < 2; released++) {
+			for (int variant = 0; variant < 10; variant++) {
+				QualifiedXminFixture f;
+				ClusterHeapFreezeXminTargetV1 targets[3];
+
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+				if (released) { fixture_release_original_writer(); resume_allowed = true; }
+				switch (variant) {
+				case 0: f.input.freeze_policy = NULL; break;
+				case 1: f.input.freeze_cohort = NULL; break;
+				case 2: f.policy.legal_next = InvalidFullTransactionId; break;
+				case 3: f.policy.freeze_limit = FullTransactionIdFromEpochAndXid(1, 99); break;
+				case 4: f.cohort.horizon_scn++; break;
+				case 5: f.cohort.record_generation++; break;
+				case 6: f.cohort.formation_epoch++; break;
+				case 7: f.cohort.admitted_members_lo = 0; break;
+				case 8: f.cohort.local_unqualified_entries = 1; break;
+				case 9: f.cohort.active_full_xid_min--; break;
+				}
+				UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 2)
+					: qualified_xmin_apply(&f, 0)));
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+				UT_ASSERT_EQ(writer_checks + route_checks + admission_checks, 0);
+				UT_ASSERT_EQ(conditional_resumes + conditional_unlocks, 0);
+				UT_ASSERT_EQ(backend_pin_count, 1);
+				UT_ASSERT(f.admission.entered && local_x == !released && !resumed_writer);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_xmin_rechecks_same_bound_sources_after_final_target)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int released = 0; released < 2; released++) {
+			QualifiedXminFixture f;
+			ClusterHeapFreezeXminTargetV1 targets[3];
+
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
+			if (released) { fixture_release_original_writer(); resume_allowed = true; }
+			retire_bounds_after_target = &f.cohort;
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 2)
+				: qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT_EQ(full_target_checks, 1);
+			UT_ASSERT_EQ(conditional_unlocks, released);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(f.admission.entered && local_x == !released && !resumed_writer);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_recapture_retires_previous_bound_sources)
+{
+	QualifiedXminFixture f;
+
+	qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
+	UT_ASSERT(f.input.freeze_policy != NULL && f.input.freeze_cohort != NULL);
+	UT_ASSERT(cluster_heap_freeze_capture_page_v1(&space_identity, 7,
+		current_page.data, &f.input));
+	UT_ASSERT(f.input.freeze_policy == NULL && f.input.freeze_cohort == NULL);
+}
+
 int
 main(void)
 {
-	UT_PLAN(74);
+	UT_PLAN(77);
+	UT_RUN(test_xmin_apply_requires_same_bound_sources);
+	UT_RUN(test_xmin_rechecks_same_bound_sources_after_final_target);
+	UT_RUN(test_recapture_retires_previous_bound_sources);
 	UT_RUN(test_xmin_space_refusal_is_conditional);
 	UT_RUN(test_xmin_space_error_still_propagates);
 	UT_RUN(test_original_freeze_space_refusal_still_errors);

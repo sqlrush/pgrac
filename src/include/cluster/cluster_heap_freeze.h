@@ -24,6 +24,9 @@
  * Reuse is bounded to one image in the original VACUUM context. No borrowed
  * page pointer survives capture; no durable or wire representation is implied.
  */
+struct ClusterHeapFreezePolicySampleV1;
+struct ClusterHeapFreezeCohortObservation;
+
 typedef struct ClusterHeapFreezePageInputV1
 {
 	ClusterSpaceIdentity identity;
@@ -36,6 +39,12 @@ typedef struct ClusterHeapFreezePageInputV1
 	ResourceXWriterUseContext writer_context;
 	uint64 writer_object_revision;
 	bool writer_object_checked;
+	/* Borrowed immutable companions in the same original VACUUM context.
+	 * Retire with this attempt, before replacing either source. They only
+	 * bind numeric bounds to their observation; they grant no F/H,
+	 * retention or mutation authority and are never serialized. */
+	const struct ClusterHeapFreezePolicySampleV1 *freeze_policy;
+	const struct ClusterHeapFreezeCohortObservation *freeze_cohort;
 	PGAlignedBlock image;
 } ClusterHeapFreezePageInputV1;
 
@@ -426,6 +435,12 @@ extern bool cluster_heap_freeze_prepare_xmin_batch_v1(
  * captured physical image, exact row/carrier and current authority before the
  * native write.  False means no mutation; ERROR propagates to the resource
  * owner.  Success changes the page version/LSN and invalidates the old proof.
+ *
+ * The input must borrow the original policy/cohort companions for the whole
+ * attempt. Their pure same-admission match must reproduce both complete F
+ * and H arguments, before writer use and after the final identity callbacks.
+ * Their separate current/provenance/retention qualification remains required;
+ * the match performs no sampling or callback under page locks.
  *
  * Dormant: production VACUUM must not call this until ORIGINAL FullXid,
  * cutoff/H provenance and admission are closed independently of raw XIDs.
