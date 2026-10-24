@@ -1032,6 +1032,14 @@ extern ClusterCtrcItlCleanoutApplyResult
 cluster_ctrc_itl_cleanout_slot(const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcTargetV1 *target,
 							   ClusterCtrcTerminalStatus terminal_status, SCN commit_scn,
 							   ClusterItlSlotData *slot);
+/* Pure whole-page calculation for the original cleaner and recovery owner.
+ * Distinct input is unchanged; RETAIN leaves output unchanged. In-place output
+ * is supported, partial overlap is refused. This grants no page/WAL/terminal/
+ * release authority. */
+extern ClusterCtrcItlCleanoutApplyResult cluster_ctrc_itl_cleanout_image_v1(
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcTargetV1 *target,
+	ClusterCtrcTerminalStatus terminal_status, SCN commit_scn,
+	const char *before_image, char *after_image);
 extern ClusterCtrcCloseResult
 cluster_ctrc_participant_close(ClusterCtrcParticipantEntry *participant,
 							   const ClusterCtrcParticipantIdentity *identity,
