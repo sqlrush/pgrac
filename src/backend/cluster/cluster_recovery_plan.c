@@ -1213,6 +1213,42 @@ stamp_owner_payload_matches(const ClusterRecoveryStampOwnerV1 *owner,
 		   && memcmp(record->target_claim_sha256, owner->target.claim_sha256, 32) == 0;
 }
 
+/* Canonical SPACE and version checks only. The digest is a comparison value,
+ * never custody; the dedicated preparation path consumes live protection. */
+static bool
+stamp_fpi_image_matches(const ClusterRecoveryStampOwnerV1 *owner,
+	const ClusterRecoveryStampFpiV1 *fpi)
+{
+	const GenericXLogRecoveryImageDescriptorV1 *image = &fpi->image;
+	ClusterSpaceIdentityKey key = {0};
+	ClusterSpaceIdentity identity;
+	RfPageVersionEdgeEntryV1 expected = {0};
+	uint8 digest = 0;
+
+	key.system_identifier = owner->target.identity.system_identifier;
+	key.database_incarnation = owner->target.database_incarnation;
+	memcpy(key.storage_uuid, owner->target.identity.storage_uuid, 16);
+	key.locator = fpi->locator;
+	if ((image->owner != GENERIC_XLOG_CTRC_MX && image->owner != GENERIC_XLOG_CTRC_ITL)
+		|| image->fork_number != MAIN_FORKNUM || image->block_number == InvalidBlockNumber
+		|| image->result_token == 0 || image->version.before.mutation_token == 0
+		|| image->result_token == image->version.before.mutation_token
+		|| fpi->reserved_zero != 0
+		|| !cluster_space_identity_decode(image->space_identity, sizeof(image->space_identity),
+			&key, &identity) || identity.state != CLUSTER_SPACE_IDENTITY_LIVE)
+		return false;
+	expected.page_class = RF_PAGE_CLASS_ORDINARY;
+	expected.before_kind = expected.result_kind = RF_PAGE_STATE_PRESENT;
+	memcpy(expected.before.segment_incarnation, identity.incarnation, 16);
+	expected.before.mutation_token = image->version.before.mutation_token;
+	memcpy(expected.result_incarnation, identity.incarnation, 16);
+	if (memcmp(&expected, &image->version, sizeof(expected)) != 0)
+		return false;
+	for (unsigned i = 0; i < sizeof(image->after_sha256); i++)
+		digest |= image->after_sha256[i];
+	return digest != 0;
+}
+
 /* Decode only caller-owned inputs or snapshots. D0 hashing may allocate;
  * neither a slot spinlock nor an insertion critical section may cover it. */
 static bool
@@ -1221,6 +1257,19 @@ stamp_payload_matches(const ClusterRecoveryStampOwnerV1 *owner, ClusterRecoveryS
 {
 	if (!stamp_owner_valid(owner))
 		return false;
+	if (kind == CLUSTER_RECOVERY_STAMP_FPI && length == sizeof(ClusterRecoveryStampFpiV1)
+		&& payload != NULL && CritSectionCount == 0) {
+		ClusterRecoveryStampFpiV1 fpi;
+		memcpy(&fpi, payload, sizeof(fpi));
+		if (!stamp_fpi_image_matches(owner, &fpi)
+			|| fpi.protection.source_binding_cookie == 0
+			|| fpi.protection.protection_fingerprint == 0
+			|| fpi.protection.partition >= RF_PAGE_GUARD_PARTITIONS
+			|| fpi.protection.reserved_zero != 0)
+			return false;
+		*target_thread = owner->target.identity.origin_thread_id;
+		return true;
+	}
 	if (kind == CLUSTER_RECOVERY_STAMP_C0 && length == CLUSTER_RECOVERY_TT_ABORT_BYTES) {
 		ClusterRecoveryTTAbortV1 record;
 		if (!cluster_recovery_tt_abort_decode_v1(payload, length, &record)
@@ -1279,6 +1328,8 @@ stamp_state_shape(const ClusterRecoveryStampSlotV1 *slot, uint16 thread)
 		|| key->window_seq < key->slot_generation || !stamp_owner_valid(&handle->owner)
 		|| !((handle->kind == CLUSTER_RECOVERY_STAMP_C0
 			  && handle->payload_length == CLUSTER_RECOVERY_TT_ABORT_BYTES)
+			 || (handle->kind == CLUSTER_RECOVERY_STAMP_FPI
+				 && handle->payload_length == sizeof(ClusterRecoveryStampFpiV1))
 			 || (handle->kind == CLUSTER_RECOVERY_STAMP_D0
 				 && handle->payload_length == CLUSTER_RECOVERY_CTRC_BYTES)))
 		return false;
@@ -1411,8 +1462,8 @@ done:
 	return accepted;
 }
 
-bool
-cluster_recovery_stamp_prepare_v1(const ClusterRecoveryStampOwnerV1 *owner,
+static bool
+stamp_prepare(const ClusterRecoveryStampOwnerV1 *owner,
 								  ClusterRecoveryStampKindV1 kind, const uint8 *payload,
 								  Size length, ClusterRecoveryStampHandleV1 *out)
 {
@@ -1478,6 +1529,52 @@ cluster_recovery_stamp_prepare_v1(const ClusterRecoveryStampOwnerV1 *owner,
 done:
 	SpinLockRelease(&slot->lock);
 	return accepted;
+}
+
+bool
+cluster_recovery_stamp_prepare_v1(const ClusterRecoveryStampOwnerV1 *owner,
+	ClusterRecoveryStampKindV1 kind, const uint8 *payload, Size length,
+	ClusterRecoveryStampHandleV1 *out)
+{
+	if (kind == CLUSTER_RECOVERY_STAMP_FPI) {
+		if (out != NULL)
+			memset(out, 0, sizeof(*out));
+		return false;
+	}
+	return stamp_prepare(owner, kind, payload, length, out);
+}
+
+/* All fallible owner checks precede the original short publication lock.
+ * No image hash, new protection acquisition or target mutation occurs here. */
+bool
+cluster_recovery_stamp_prepare_fpi_v1(const ClusterRecoveryStampOwnerV1 *owner,
+	const RfPageIdentityV1 *target, const GenericXLogRecoveryImageDescriptorV1 *image,
+	const RfPageAuthorityGuardV1 *guard, ClusterRecoverySerialGuard *serial_guard,
+	ClusterWalRetentionPin *retention_pin, ClusterRecoveryStampHandleV1 *out)
+{
+	ClusterRecoveryStampFpiV1 fpi = {0};
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!stamp_actor() || CritSectionCount != 0 || !stamp_owner_valid(owner)
+		|| owner->executor_pid != MyProcPid || target == NULL || image == NULL
+		|| serial_guard == NULL || !serial_guard->held || serial_guard->release_uncertain
+		|| (serial_guard->mode != CLUSTER_RECOVERY_SERIAL_ONLINE
+			&& serial_guard->mode != CLUSTER_RECOVERY_SERIAL_COLD_FORMED)
+		|| memcmp(&serial_guard->duty, &owner->target.identity, sizeof(serial_guard->duty)) != 0
+		|| target->system_identifier != owner->target.identity.system_identifier
+		|| memcmp(target->storage_uuid, owner->target.identity.storage_uuid, 16) != 0
+		|| target->reserved_zero != 0 || target->forknum != image->fork_number
+		|| target->blockno != image->block_number)
+		return false;
+	fpi.image = *image;
+	fpi.locator = target->locator;
+	if (!stamp_fpi_image_matches(owner, &fpi)
+		|| !rf_page_authority_recovery_reference_v1(guard, serial_guard, retention_pin, target,
+			&image->version.before, &fpi.protection))
+		return false;
+	return stamp_prepare(owner, CLUSTER_RECOVERY_STAMP_FPI, (const uint8 *)&fpi, sizeof(fpi), out);
 }
 
 static bool

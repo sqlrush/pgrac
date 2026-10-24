@@ -64,6 +64,15 @@ typedef struct RfPageAuthorityBatchRequestV1 {
 typedef struct RfPageAuthorityPreflightV1 RfPageAuthorityPreflightV1;
 typedef struct RfPageAuthorityGuardV1 RfPageAuthorityGuardV1;
 
+/* Value references to already held objects, never a replacement for them.
+ * No observer may dereference the cookie or acquire authority from this value. */
+typedef struct RfPageRecoveryReferenceV1 {
+	uint64 source_binding_cookie;
+	uint64 protection_fingerprint;
+	uint32 partition;
+	uint32 reserved_zero;
+} RfPageRecoveryReferenceV1;
+
 typedef struct RfPageInstallAuthorityAdapterV1 {
 	RfPageInstallAuthorityOpsV1 ops;
 	RfPageAuthorityPreflightV1 *preflight;
@@ -83,6 +92,13 @@ rf_page_authority_batch_promote_nowait_v1(RfPageAuthorityPreflightV1 *preflight,
 extern RfPageAuthorityVerdictV1
 rf_page_authority_batch_revalidate_nowait_v1(const RfPageAuthorityGuardV1 *guard,
 											 ClusterRecoverySerialGuard *serial_guard);
+/* Match the exact predecessor, not merely an incarnation or shared partition.
+ * Borrows the original promoted guard/serial/pin; refusal leaves out unchanged.
+ * No allocation, I/O, new lock acquisition, ownership transfer or completion. */
+extern bool rf_page_authority_recovery_reference_v1(const RfPageAuthorityGuardV1 *guard,
+	ClusterRecoverySerialGuard *serial_guard, ClusterWalRetentionPin *retention_pin,
+	const RfPageIdentityV1 *identity, const RfPageVersionV1 *expected_before,
+	RfPageRecoveryReferenceV1 *out);
 extern bool
 rf_page_authority_preflight_matches_target_v1(const RfPageAuthorityPreflightV1 *preflight,
 											  const RfPageIdentityV1 *identity,

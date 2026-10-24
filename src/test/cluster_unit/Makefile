@@ -9933,7 +9933,8 @@ test_cluster_checkpoint_stamp: test_cluster_checkpoint_stamp.c test_cluster_reco
         $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 test_cluster_recovery_stamp test_cluster_recovery_stamp_exit test_cluster_checkpoint_stamp: \
-		$(top_srcdir)/src/include/access/generic_xlog.h
+		$(top_srcdir)/src/include/access/generic_xlog.h \
+		$(top_srcdir)/src/include/cluster/cluster_page_authority.h
 
 # Original retained-input owner and installed native writer, without I/O grants.
 test_cluster_cold_tx_owner.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile

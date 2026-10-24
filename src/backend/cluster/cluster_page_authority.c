@@ -396,6 +396,51 @@ rf_page_authority_batch_revalidate_nowait_v1(const RfPageAuthorityGuardV1 *guard
 	return RF_PAGE_AUTHORITY_OK;
 }
 
+/* Export only references from the exact still-promoted original owner set.
+ * The output cannot qualify a later write without those same live objects. */
+bool
+rf_page_authority_recovery_reference_v1(const RfPageAuthorityGuardV1 *guard,
+	ClusterRecoverySerialGuard *serial_guard, ClusterWalRetentionPin *retention_pin,
+	const RfPageIdentityV1 *identity, const RfPageVersionV1 *expected_before,
+	RfPageRecoveryReferenceV1 *out)
+{
+	const RfPageAuthorityPreflightV1 *preflight;
+	ClusterWalRetentionPin *held_pin;
+
+	if (out == NULL || identity == NULL || expected_before == NULL || retention_pin == NULL
+		|| rf_page_authority_batch_revalidate_nowait_v1(guard, serial_guard)
+			!= RF_PAGE_AUTHORITY_OK)
+		return false;
+	preflight = guard->preflight;
+	held_pin = preflight->source_authorities != NULL
+		? preflight->source_authorities[0].retention_pin : preflight->retention_pin;
+	if (retention_pin != held_pin)
+		return false;
+	for (uint32 i = 0; i < preflight->target_count; i++) {
+		const RfPageAuthorityTargetV1 *target = &preflight->targets[i];
+		const RfPagePinnedSourceV1 *source = target->source;
+		uint8 index = guard->target_guard_index[i];
+		RfPageRecoveryReferenceV1 value = {0};
+
+		if (!authority_identity_equal(&target->page_identity, identity)
+			|| target->expected_result.mutation_token != expected_before->mutation_token
+			|| memcmp(target->expected_result.segment_incarnation,
+				expected_before->segment_incarnation, 16) != 0)
+			continue;
+		if (source == NULL || source->binding_cookie == 0
+			|| source->binding_cookie != source->current_binding_cookie
+			|| index >= guard->guard_count
+			|| !rf_page_guard_covers_nowait_v1(&guard->page_guards[index], identity))
+			return false;
+		value.source_binding_cookie = source->binding_cookie;
+		value.protection_fingerprint = guard->page_guards[index].identity_fingerprint;
+		value.partition = guard->page_guards[index].partition;
+		*out = value;
+		return true;
+	}
+	return false;
+}
+
 bool
 rf_page_authority_preflight_matches_target_v1(const RfPageAuthorityPreflightV1 *preflight,
 											  const RfPageIdentityV1 *identity,
