@@ -2961,6 +2961,7 @@ test_cluster_recovery_fpi_insert: test_cluster_recovery_fpi_insert.c test_cluste
 
 test_cluster_recovery_fpi_install_product.o: $(top_srcdir)/src/backend/cluster/cluster_page_install.c \
 		$(top_srcdir)/src/include/cluster/cluster_page_install.h \
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
 		$(top_srcdir)/src/include/access/xlogrecovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
@@ -2970,7 +2971,8 @@ test_cluster_recovery_fpi_install_product.o: $(top_srcdir)/src/backend/cluster/c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_recovery_fpi_install: test_cluster_recovery_fpi_install.c test_cluster_recovery_fpi_insert.c \
-		test_cluster_recovery_stamp.c test_cluster_recovery_ctrc_read.inc unit_test.h test_cluster_recovery_fpi_generic.o \
+		test_cluster_recovery_stamp.c test_cluster_recovery_ctrc_read.inc test_cluster_recovery_ctrc_itl.inc \
+		unit_test.h test_cluster_recovery_fpi_generic.o test_cluster_terminal_ref_census_product.o \
 		test_cluster_recovery_fpi_install_product.o test_cluster_space_producer_product.o \
 		cluster_page_stable_base_test.o \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
@@ -2980,6 +2982,7 @@ test_cluster_recovery_fpi_install: test_cluster_recovery_fpi_install.c test_clus
 		$(top_builddir)/src/backend/storage/page/checksum.o Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		test_cluster_recovery_fpi_generic.o test_cluster_recovery_fpi_install_product.o \
+		test_cluster_terminal_ref_census_product.o \
 		cluster_page_stable_base_test.o \
 		test_cluster_space_producer_product.o $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/backend/storage/page/checksum.o \

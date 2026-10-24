@@ -32,6 +32,7 @@ static XLogRecPtr native_flush_end;
 static TimeLineID native_flush_timeline;
 static bool reading_input, input_current;
 static unsigned input_reads, input_throw_at, input_drift_at, input_drift_kind;
+static unsigned input_current_checks;
 static int input_space_fd = -1;
 static char input_space_path[64], input_start_object;
 static ClusterColdTypedV1 input_typed;
@@ -39,6 +40,7 @@ static PGAlignedBlock input_work_storage;
 static ClusterRecoveryCheckpointOwnerV1 input_owner;
 static BlockNumber input_space_blocks;
 static bool input_missing_space;
+static RfPageRecoveryCtrcItlSelectionV1 input_itls[CLUSTER_ITL_INITRANS_DEFAULT + 1];
 #define input_start ((struct ClusterRecoveryStartV1 *)&input_start_object)
 #define input_work ((ClusterColdCtrcWorkV1 *)input_work_storage.data)
 
@@ -48,6 +50,7 @@ bool
 ClusterColdRecoveryCtrcWorkCurrent(const struct ClusterRecoveryStartV1 *start,
 	const ClusterColdCtrcWorkV1 *work)
 {
+	input_current_checks++;
 	return input_current && start == input_start && work == input_work;
 }
 
@@ -180,6 +183,11 @@ smgrread(SMgrRelation relation, ForkNumber forknum, BlockNumber block, void *buf
 			case 7: input_typed.sources[0].claim.identity.root_lineage_seq++; break;
 			case 8: input_space_blocks++; break;
 			case 9: ((char *)buffer)[BLCKSZ - 1] ^= 1; break;
+			case 10: input_work->counts.unresolved_count++; break;
+			case 11: input_work->entries[0].slot.commit_scn++; break;
+			case 12: input_itls[0].subject_index++; break;
+			case 13: input_work->entries[0].key.segment_generation++; break;
+			case 14: input_itls[0].expected_itl_wrap++; break;
 			}
 		}
 		return;
@@ -460,12 +468,13 @@ UT_TEST(fpi_inserted_observer_is_exact_and_never_advances_window)
 }
 
 #include "test_cluster_recovery_ctrc_read.inc"
+#include "test_cluster_recovery_ctrc_itl.inc"
 
 int
 main(void)
 {
 	atexit(install_file_close);
-	UT_PLAN(16);
+	UT_PLAN(23);
 	UT_RUN(fpi_install_syncs_exact_native_lsn_and_checksum_without_retiring_window);
 	UT_RUN(fpi_install_exact_result_retries_sync_and_postread_without_rewriting);
 	UT_RUN(fpi_install_refuses_wrong_window_flush_frame_actor_or_serial_before_io);
@@ -482,6 +491,13 @@ main(void)
 	UT_RUN(ctrc_input_refuses_known_output_aliases);
 	UT_RUN(ctrc_input_accepts_only_original_replay_serial);
 	UT_RUN(ctrc_input_refuses_absent_or_foreign_handles);
+	UT_RUN(ctrc_itl_input_projects_only_original_selected_entries);
+	UT_RUN(ctrc_itl_input_reports_idempotence_without_writing_storage);
+	UT_RUN(ctrc_itl_input_late_refusal_preserves_complete_output);
+	UT_RUN(ctrc_itl_input_refuses_bounds_duplicates_and_aliases_before_io);
+	UT_RUN(ctrc_itl_input_refuses_wrong_actor_before_borrowing_work);
+	UT_RUN(ctrc_itl_input_rechecks_original_scope_and_selected_bytes);
+	UT_RUN(ctrc_itl_input_errors_preserve_output_and_owners);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
