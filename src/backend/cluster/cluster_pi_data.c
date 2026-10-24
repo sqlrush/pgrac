@@ -15,6 +15,7 @@
 #include "cluster/cluster_pi_data.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_writer.h"
@@ -271,6 +272,11 @@ cluster_pi_data_begin_v1(const ClusterSpaceIdentityKey *key, const ClusterPcmPiW
 	if (key == NULL || cut == NULL || out == NULL || *out != NULL || !pi_data_background()
 		|| pi_data_shared == NULL || MyProcPid <= 0)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	/* A remote DATA job performs physical page/WAL work; recovered nodes must
+	 * not create it until semantic activation has reached OPEN. */
+	if (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& !cluster_semantic_activation_recovered_open_current())
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	if (pi_data_active != NULL)
 		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
 	request.verb = CLUSTER_PI_DATA_WRITE;

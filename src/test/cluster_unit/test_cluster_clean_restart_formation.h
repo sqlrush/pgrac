@@ -32,6 +32,14 @@ cluster_wal_thread_clean_writer_matches(const ClusterWalSourceRef *expected, uin
 		   && memcmp(expected, &test_first_writer, sizeof(*expected)) == 0;
 }
 
+bool
+cluster_wal_thread_recovered_writer_matches(const ClusterWalSourceRef *expected, uint64 epoch)
+{
+	return expected != NULL && test_first_writer_installed && test_first_writer_recovered
+		   && epoch == test_first_writer_epoch
+		   && memcmp(expected, &test_first_writer, sizeof(*expected)) == 0;
+}
+
 static void
 test_clean_formation_bind(void)
 {

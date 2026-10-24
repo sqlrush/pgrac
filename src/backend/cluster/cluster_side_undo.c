@@ -80,11 +80,14 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 	uint16 opcode;
 	ClusterUndoDecodedKind kind;
 
-	if (record == NULL || out == NULL)
+	if (record == NULL || record->record == NULL || out == NULL)
 		return false;
 	memset(out, 0, sizeof(*out));
 	if (XLogRecGetRmid(record) != RM_CLUSTER_UNDO_ID)
 		return false; /* not a cluster-undo record */
+	/* Every supported kind requires a nonempty main payload. */
+	if (XLogRecGetData(record) == NULL)
+		return false;
 	opcode = XLogRecGetInfo(record) & XLR_RMGR_INFO_MASK;
 	kind = cluster_undo_kind_for_opcode(opcode);
 	if (kind == CLUSTER_UNDO_KIND_UNKNOWN)
@@ -340,7 +343,7 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 }
 
 static bool
-cluster_undo_preflight_for_use(const ClusterUndoDecoded *decoded, bool pi_inspection)
+cluster_undo_preflight_fields(const ClusterUndoDecoded *decoded)
 {
 	ClusterSideRouteRow route;
 	uint16 opcode;
@@ -407,10 +410,10 @@ cluster_undo_preflight_for_use(const ClusterUndoDecoded *decoded, bool pi_inspec
 			return false;
 		break;
 	case CLUSTER_UNDO_KIND_TT_CTRC_RELEASE:
+		/* INIT publishes generation zero. Keep that exact identity for
+		 * native redo; only the unknown generation sentinel is invalid. */
 		if (decoded->slot_offset >= TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(decoded->xid)
-			|| (pi_inspection ? decoded->expected_generation == UINT32_MAX
-							  : decoded->expected_generation == 0)
-			|| decoded->wrap == TT_WRAP_INVALID
+			|| decoded->expected_generation == UINT32_MAX || decoded->wrap == TT_WRAP_INVALID
 			|| decoded->cluster_epoch == 0 || decoded->root_id == 0 || decoded->root_generation == 0
 			|| decoded->formation_epoch == 0 || decoded->admission_record_generation == 0
 			|| decoded->seal_generation == 0 || decoded->touched_nodes_high != 0
@@ -449,17 +452,17 @@ cluster_undo_preflight_for_use(const ClusterUndoDecoded *decoded, bool pi_inspec
 bool
 cluster_undo_preflight(const ClusterUndoDecoded *decoded)
 {
-	return cluster_undo_preflight_for_use(decoded, false);
+	return cluster_undo_preflight_fields(decoded);
 }
 
 bool
 cluster_undo_inspect_pi(const ClusterUndoDecoded *decoded)
 {
-	/* Initial segment generation zero is an exact historical identity.
-	 * Execution still crosses the unchanged stricter transition gate. */
+	/* Field validity is shared with redo. Inspection alone does not
+	 * provide source authority or an exact target transition. */
 	uint8 digest = 0;
 
-	if (!cluster_undo_preflight_for_use(decoded, true))
+	if (!cluster_undo_preflight_fields(decoded))
 		return false;
 	if (decoded->kind != CLUSTER_UNDO_KIND_TT_CTRC_RELEASE)
 		return true;

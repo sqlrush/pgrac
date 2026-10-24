@@ -110,9 +110,33 @@ OBJS = \
 	cluster_cold_recovery_plan_space.o \
 	cluster_cold_recovery_plan_schedule.o \
 	cluster_cold_recovery_decode.o \
+	cluster_cold_recovery_xid.o \
 	cluster_cold_recovery_io.o \
+	cluster_recovery_namespace.o \
+	cluster_recovery_root_set.o \
+	cluster_recovery_native_scan.o \
+	cluster_recovery_native_inventory.o \
+	cluster_recovery_multixact_scan.o \
+	cluster_recovery_slru_scan.o \
+	cluster_recovery_relmap_scan.o \
+	cluster_recovery_multixact_join.o \
+	cluster_recovery_xact_join.o \
+	cluster_recovery_wal_targets.o \
+	cluster_recovery_record_hash.o \
+	cluster_recovery_ctrc_record.o \
+	cluster_recovery_undo_store.o \
+	cluster_recovery_relation_scan.o \
+	cluster_recovery_heap_scan.o \
+	cluster_recovery_undo_scan.o \
+	cluster_recovery_reference_graph.o \
+	cluster_recovery_page_history.o \
+	cluster_recovery_page_census.o \
+	cluster_recovery_census.o \
+	cluster_recovery_relation_census.o \
 	cluster_cold_recovery_space.o \
 	cluster_cold_recovery_startup.o \
+	cluster_cold_recovery_tt.o \
+	cluster_cold_recovery_tt_redo.o \
 	cluster_cold_recovery_replay.o \
 	cluster_recovery_duty.o \
 	cluster_cf_enqueue.o \
@@ -135,6 +159,7 @@ OBJS = \
 	cluster_epoch.o \
 	cluster_extend_gate.o \
 	cluster_external_fence.o \
+	cluster_same_host_fence.o \
 	cluster_fence.o \
 	cluster_fence_authority.o \
 	cluster_write_fence.o \
@@ -415,11 +440,18 @@ cluster_wal_thread.o cluster_wal_writer.o cluster_wal_retention.o: \
 cluster_control_bootstrap.o cluster_control_bootstrap_read.o cluster_control_root.o \
 cluster_wal_tail.o: $(top_srcdir)/src/include/cluster/cluster_wal_tail.h
 cluster_wal_inputs.o: $(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+	$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
 	$(srcdir)/cluster_control_root_private.h $(srcdir)/cluster_recovery_anchor_private.h
+cluster_wal_writer.o: $(top_srcdir)/src/include/cluster/cluster_semantic_activation.h
+cluster_stats.o: $(top_srcdir)/src/include/cluster/cluster_semantic_activation.h
+cluster_recovery_namespace.o: $(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h
 cluster_wal_cut.o: $(top_srcdir)/src/include/cluster/cluster_wal_cut.h \
+	$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
 	$(top_srcdir)/src/include/cluster/cluster_wal_writer.h
 cluster_pi_data.o cluster_pi_writeback.o: $(srcdir)/cluster_pi_data_wire.h \
-	$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h
+	$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h \
+	$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h
+cluster_pi_rebuild.o: $(top_srcdir)/src/include/cluster/cluster_semantic_activation.h
 
 cluster_reconfig.o cluster_thread_recovery_worker.o: \
 	$(top_srcdir)/src/include/cluster/cluster_thread_recovery.h

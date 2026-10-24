@@ -62,6 +62,10 @@ cluster_wal_writer_check(const ClusterWalWriterToken *work)
 	const ClusterControlRootIdentity *id = &work->ref.claim.identity;
 	fresh.epoch = work->epoch;
 
+	/* This physical token also belongs to checkpoint and ROOT control owners
+	 * that must finish before semantic OPEN. DATA admission is enforced by
+	 * its original consumers, not by the proof they need to publish OPEN. */
+
 	if (!cluster_enabled || !cluster_shared_config || !enableFsync
 		|| cluster_node_id != id->origin_node_id || id->system_identifier != GetSystemIdentifier()
 		|| cluster_qvotec_get_self_incarnation() != id->origin_owner_incarnation
@@ -78,9 +82,11 @@ cluster_wal_writer_check(const ClusterWalWriterToken *work)
 	if (!cluster_external_fence_runtime_active()
 		&& (MyBackendType == B_STARTUP
 				? (writer_startup.input_kind != CLUSTER_WAL_STARTUP_INITIALIZED
-				   && writer_startup.input_kind != CLUSTER_WAL_STARTUP_CLEAN)
+				   && writer_startup.input_kind != CLUSTER_WAL_STARTUP_CLEAN
+				   && writer_startup.input_kind != CLUSTER_WAL_STARTUP_RECOVERED)
 				: (!cluster_wal_thread_initialized_writer_matches(&work->ref, work->epoch)
-				   && !cluster_wal_thread_clean_writer_matches(&work->ref, work->epoch))))
+				   && !cluster_wal_thread_clean_writer_matches(&work->ref, work->epoch)
+				   && !cluster_wal_thread_recovered_writer_matches(&work->ref, work->epoch))))
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	cluster_write_fence_observe(&fence);
 	if (!fence.enforcing || !fence.attached || !fence.engaged || fence.self_fenced

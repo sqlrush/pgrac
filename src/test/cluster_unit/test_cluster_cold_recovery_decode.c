@@ -26,7 +26,10 @@
 #define USE_PGRAC_CLUSTER 1
 
 #include "postgres.h"
+#include <limits.h>
 
+#include "access/clog.h"
+#include "access/multixact.h"
 #include "access/xact.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
@@ -60,6 +63,11 @@ static bool commit_parse_ok = true;
 static int abort_nrels;
 static uint32 commit_nspace_drops;
 static const char *commit_space_drops;
+static bool side_xact_decode_ok;
+static RfSideXactKindV1 side_xact_decode_kind;
+static uint32 side_xact_decode_relation_count;
+static uint32 side_xact_decode_space_drop_count;
+static uint16 side_xact_decode_origin_required;
 
 RfPageProofDetailV1
 rf_page_detached_preflight_v1(XLogReaderState *record, bool space_active,
@@ -74,6 +82,7 @@ rf_page_detached_preflight_v1(XLogReaderState *record, bool space_active,
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
+#ifndef CLUSTER_COLD_NATIVE_XACT_PARSER
 bool
 ParseCommitRecord(uint8 info, xl_xact_commit *xlrec, Size len, xl_xact_parsed_commit *parsed)
 {
@@ -88,18 +97,67 @@ ParseCommitRecord(uint8 info, xl_xact_commit *xlrec, Size len, xl_xact_parsed_co
 	parsed->space_drops = commit_space_drops;
 	return true;
 }
+#endif
 
 /* The bounded completion check itself is exercised with real records in
  * test_cluster_wal_retained_cut_records; here only its verdict is used. */
 static bool abort_shape_ok;
 
+/* The original assignment validator is linked with real records in
+ * test_cluster_wal_retained_cut_records; no assignment is mocked here. */
+bool
+rf_side_xact_assignment_preflight_v1(const uint8 *payload, uint32 length)
+{
+	(void)payload;
+	(void)length;
+	abort();
+}
+
+#ifndef CLUSTER_COLD_NATIVE_XACT_SHAPE
 bool
 rf_side_xact_completion_shape_v1(XLogReaderState *record, bool commit)
 {
 	UT_ASSERT(record != NULL && !commit);
 	return abort_shape_ok;
 }
+#endif
 
+/* Real child lists and the shared validator are linked in the effects test;
+ * these parser stubs intentionally produce no children. */
+#ifndef CLUSTER_COLD_NATIVE_XACT_PARSER
+bool
+rf_side_xact_children_preflight_v1(TransactionId top, int count, const TransactionId *children)
+{
+	(void)top;
+	UT_ASSERT(count == 0 && children == NULL);
+	return true;
+}
+#endif
+
+/* Native message kinds are exercised by the real validator in the effects
+ * test. This isolated decoder fixture supplies only its accepted verdict. */
+bool
+rf_side_xact_invalidation_messages_preflight_v1(int count,
+												const SharedInvalidationMessage *messages)
+{
+	UT_ASSERT(count >= 0 && (count == 0 || messages != NULL));
+	return true;
+}
+
+bool
+rf_side_xact_tt_commit_preflight_v1(const xl_xact_tt_commit *delta, uint16 origin_thread,
+									TransactionId xid, SCN scn)
+{
+	/* Real TT carriers are exercised in the effects test. This parser stub
+	 * never supplies a folded TT delta. */
+	(void)delta;
+	(void)origin_thread;
+	(void)xid;
+	(void)scn;
+	abort();
+}
+
+#ifndef CLUSTER_COLD_NATIVE_XACT_PARSER
 void
 ParseAbortRecord(uint8 info, xl_xact_abort *xlrec, xl_xact_parsed_abort *parsed)
 {
@@ -107,6 +165,25 @@ ParseAbortRecord(uint8 info, xl_xact_abort *xlrec, xl_xact_parsed_abort *parsed)
 	(void)xlrec;
 	memset(parsed, 0, sizeof(*parsed));
 	parsed->nrels = abort_nrels;
+}
+#endif
+
+bool
+rf_side_xact_decode_recovery_v1(XLogReaderState *record, uint64 system_identifier,
+								uint16 origin_thread, RfSideXactOperationV1 *operation)
+{
+	(void)record;
+	if (!side_xact_decode_ok || operation == NULL
+		|| (side_xact_decode_origin_required != 0
+			&& origin_thread != side_xact_decode_origin_required))
+		return false;
+	memset(operation, 0, sizeof(*operation));
+	operation->system_identifier = system_identifier;
+	operation->origin_thread = origin_thread;
+	operation->kind = side_xact_decode_kind;
+	operation->relation_count = side_xact_decode_relation_count;
+	operation->space_drop_count = side_xact_decode_space_drop_count;
+	return true;
 }
 
 typedef struct FakeRecord {
@@ -161,6 +238,11 @@ fake_record(FakeRecord *record, uint8 rmid, uint8 info, int blocks)
 	commit_parse_ok = true;
 	commit_nspace_drops = 0;
 	commit_space_drops = NULL;
+	side_xact_decode_ok = false;
+	side_xact_decode_kind = RF_SIDE_XACT_INVALID;
+	side_xact_decode_relation_count = 0;
+	side_xact_decode_space_drop_count = 0;
+	side_xact_decode_origin_required = 0;
 }
 
 static void
@@ -182,6 +264,60 @@ plan_component(uint32 index, uint8 owner, uint8 page_class, uint64 before, uint6
 	component->result.mutation_token = result;
 	preflight_plan.component_count = index + 1;
 	preflight_plan.result_token = result;
+}
+
+static void
+standby_append(FakeRecord *r, const void *bytes, Size len)
+{
+	memcpy(r->data + r->storage.decoded.main_data_len, bytes, len);
+	r->storage.decoded.main_data_len += len;
+}
+
+static void
+standby_record(FakeRecord *r, uint8 info, bool empty)
+{
+	fake_record(r, RM_STANDBY_ID, info, 0);
+	preflight_plan.route.codec_id = RF_ROUTE_CODEC_SIDE_STANDARD;
+	r->storage.decoded.main_data_len = 0;
+	if (info == XLOG_STANDBY_LOCK) {
+		xl_standby_locks locks = { .nlocks = empty ? 0 : 1 };
+		xl_standby_lock lock = { .xid = 100, .dbOid = InvalidOid, .relOid = 123 };
+		standby_append(r, &locks, offsetof(xl_standby_locks, locks));
+		if (!empty)
+			standby_append(r, &lock, sizeof(lock));
+	} else if (info == XLOG_RUNNING_XACTS) {
+		xl_running_xacts running = { .xcnt = empty ? 0 : 1,
+									 .subxcnt = empty ? 0 : 1,
+									 .subxid_overflow = !empty,
+									 .nextXid = 4,
+									 .oldestRunningXid = empty ? 4 : UINT32_MAX,
+									 .latestCompletedXid = empty ? FrozenTransactionId : UINT32_MAX - 1 };
+		TransactionId xids[2] = { UINT32_MAX, FirstNormalTransactionId };
+		standby_append(r, &running, offsetof(xl_running_xacts, xids));
+		if (!empty)
+			standby_append(r, xids, sizeof(xids));
+	} else {
+		xl_invalidations inval = { .dbId = 5, .tsId = 1663,
+								   .relcacheInitFileInval = !empty, .nmsgs = empty ? 0 : 1 };
+		SharedInvalidationMessage msg = { 0 };
+		standby_append(r, &inval, MinSizeOfInvalidations);
+		if (!empty)
+			standby_append(r, &msg, sizeof(msg));
+	}
+}
+
+static bool
+standby_refused(FakeRecord *r)
+{
+	ClusterColdDecodedV1 out = { 0 };
+	for (unsigned foreign = 0; foreign < 2; foreign++) {
+		if (cluster_cold_recovery_decode_v1(&r->reader, 99, UUID, true, foreign != 0, &out)
+				== CLUSTER_COLD_OK
+			|| out.effects.required != 0 || out.effects.native_apply != 0
+			|| out.effects.no_effect != 0)
+			return false;
+	}
+	return true;
 }
 
 UT_TEST(test_page_record_maps_ordinary_components)
@@ -219,6 +355,9 @@ UT_TEST(test_page_record_maps_ordinary_components)
 	UT_ASSERT_EQ(out.components[1].page.locator.relNumber, 101);
 	UT_ASSERT_EQ(out.components[1].result.mutation_token, 9);
 	UT_ASSERT_EQ(out.components[1].page_class, RF_PAGE_CLASS_ORDINARY);
+	UT_ASSERT_EQ(out.effects.page_apply,
+				 CLUSTER_COLD_EFFECT_RECORD | CLUSTER_COLD_EFFECT_PAGE | CLUSTER_COLD_EFFECT_FSM);
+	UT_ASSERT_EQ(out.effects.required, out.effects.page_apply);
 }
 
 UT_TEST(test_registry_refusal_is_opcode_unsupported)
@@ -310,6 +449,26 @@ UT_TEST(test_transaction_lifecycle_classification)
 	}
 }
 
+static void
+native_smgr_record(FakeRecord *record, bool truncate)
+{
+	RelFileLocator locator = { .spcOid = DEFAULTTABLESPACE_OID, .dbOid = 5, .relNumber = 100 };
+
+	fake_record(record, RM_SMGR_ID,
+				(truncate ? XLOG_SMGR_TRUNCATE : XLOG_SMGR_CREATE) | XLR_SPECIAL_REL_UPDATE, 0);
+	if (truncate) {
+		xl_smgr_truncate data = { .blkno = 2, .rlocator = locator, .flags = SMGR_TRUNCATE_ALL };
+
+		memcpy(record->data, &data, sizeof(data));
+		record->storage.decoded.main_data_len = sizeof(data);
+	} else {
+		xl_smgr_create data = { .rlocator = locator, .forkNum = MAIN_FORKNUM };
+
+		memcpy(record->data, &data, sizeof(data));
+		record->storage.decoded.main_data_len = sizeof(data);
+	}
+}
+
 UT_TEST(test_storage_lifecycle_classification)
 {
 	FakeRecord record;
@@ -327,12 +486,19 @@ UT_TEST(test_storage_lifecycle_classification)
 				  { RM_HEAP2_ID, XLOG_HEAP2_REWRITE, CLUSTER_COLD_RECORD_STRUCTURAL },
 				  { RM_CLUSTER_XID_STRIPE_ID, 0x00, CLUSTER_COLD_RECORD_STRUCTURAL },
 				  { RM_CLUSTER_XID_STRIPE_ID, 0x10, CLUSTER_COLD_RECORD_STRUCTURAL },
-				  { RM_XLOG_ID, 0x30, 0 },
-				  { RM_STANDBY_ID, 0x10, 0 } };
+				  { RM_XLOG_ID, XLOG_NEXTOID, 0 },
+				  { RM_STANDBY_ID, XLOG_RUNNING_XACTS, 0 } };
 	Size i;
 
 	for (i = 0; i < lengthof(cases); i++) {
-		fake_record(&record, cases[i].rmid, cases[i].info, 0);
+		if (cases[i].rmid == RM_SMGR_ID)
+			native_smgr_record(&record, cases[i].info == XLOG_SMGR_TRUNCATE);
+		else if (cases[i].rmid == RM_STANDBY_ID)
+			standby_record(&record, cases[i].info, true);
+		else
+			fake_record(&record, cases[i].rmid, cases[i].info, 0);
+		if (cases[i].rmid == RM_XLOG_ID)
+			record.storage.decoded.main_data_len = sizeof(Oid);
 		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
 					 CLUSTER_COLD_OK);
 		if (out.record.record_flags != cases[i].flags)
@@ -373,11 +539,11 @@ UT_TEST(test_foreign_side_records_have_no_cold_owner)
 	fake_record(&record, RM_XLOG_ID, XLOG_CHECKPOINT_ONLINE, 0);
 	record.storage.decoded.main_data_len = sizeof(CheckPoint) + 1; /* not a checkpoint */
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
-				 CLUSTER_COLD_OK);
-	UT_ASSERT_EQ(out.record.record_flags, 0);
+				 CLUSTER_COLD_COMPONENT_INVALID);
+	UT_ASSERT_EQ(out.effects.required, 0);
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
-				 CLUSTER_COLD_OK);
-	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+				 CLUSTER_COLD_COMPONENT_INVALID);
+	UT_ASSERT_EQ(out.effects.required, 0);
 
 	fake_record(&record, RM_XACT_ID, XLOG_XACT_COMMIT, 0);
 	commit_nrels = 1;
@@ -385,29 +551,28 @@ UT_TEST(test_foreign_side_records_have_no_cold_owner)
 				 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
 
-	/* An XLOG record outside the native control set (or with blocks) is no
-	 * control record. */
+	/* Malformed controls fail before effect classification. */
 	fake_record(&record, RM_XLOG_ID, 0xE0, 0);
 	record.storage.decoded.main_data_len = 0;
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
-				 CLUSTER_COLD_OK);
-	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+				 CLUSTER_COLD_COMPONENT_INVALID);
+	UT_ASSERT_EQ(out.effects.required, 0);
 	fake_record(&record, RM_STANDBY_ID, 0x30, 0);
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
-				 CLUSTER_COLD_OK);
-	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+				 CLUSTER_COLD_COMPONENT_INVALID);
+	UT_ASSERT_EQ(out.effects.required, 0);
 	fake_record(&record, RM_XLOG_ID, XLOG_NOOP, 0);
 	record.storage.decoded.header.xl_info |= XLR_SPECIAL_REL_UPDATE;
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
-				 CLUSTER_COLD_OK);
-	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
-	/* a side record routed with block references, or not routed as a side
-	 * record at all, is no control record */
+				 CLUSTER_COLD_COMPONENT_INVALID);
+	UT_ASSERT_EQ(out.effects.required, 0);
+	/* Block references invalidate a control frame. A valid control with
+	 * no matching side owner retains the existing unowned route. */
 	fake_record(&record, RM_XLOG_ID, XLOG_NOOP, 1);
 	preflight_plan.route.record_owner = RF_ROUTE_OWNER_SIDE_TYPED;
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
-				 CLUSTER_COLD_OK);
-	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+				 CLUSTER_COLD_COMPONENT_INVALID);
+	UT_ASSERT_EQ(out.effects.required, 0);
 	fake_record(&record, RM_XLOG_ID, XLOG_NOOP, 0);
 	preflight_plan.route.record_owner = 0;
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
@@ -421,7 +586,7 @@ UT_TEST(test_foreign_side_records_have_no_cold_owner)
 	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
 
 	/* Creating a relation file is idempotent: its native redo is the owner. */
-	fake_record(&record, RM_SMGR_ID, XLOG_SMGR_CREATE, 0);
+	native_smgr_record(&record, false);
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
 				 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.record.record_flags, 0);
@@ -434,6 +599,78 @@ UT_TEST(test_foreign_side_records_have_no_cold_owner)
 	UT_ASSERT_EQ(out.record.component_count, 1);
 }
 
+UT_TEST(test_foreign_commit_side_owner_requires_record_local_shape)
+{
+	FakeRecord record;
+	ClusterColdDecodedV1 out = { 0 };
+
+	fake_record(&record, RM_XACT_ID, XLOG_XACT_COMMIT, 0);
+	preflight_plan.route.codec_id = RF_ROUTE_CODEC_SIDE_STANDARD;
+	side_xact_decode_ok = true;
+	side_xact_decode_kind = RF_SIDE_XACT_COMMIT;
+	record.reader.cluster_expected_thread_id = 1;
+	side_xact_decode_origin_required = 1;
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+					 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
+
+	/* A relation/SPACE suffix belongs to the structural owner, not the
+	 * record-local foreign side consumer. */
+	side_xact_decode_relation_count = 1;
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+					 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+
+	/* A decoder result whose kind does not match the opcode is fail-closed. */
+	side_xact_decode_relation_count = 0;
+	side_xact_decode_kind = RF_SIDE_XACT_ABORT;
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+					 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+}
+
+UT_TEST(test_foreign_commit_shape_uses_reader_origin_thread)
+{
+	FakeRecord record;
+	ClusterColdDecodedV1 out = { 0 };
+
+	fake_record(&record, RM_XACT_ID, XLOG_XACT_COMMIT, 0);
+	preflight_plan.route.codec_id = RF_ROUTE_CODEC_SIDE_STANDARD;
+	side_xact_decode_ok = true;
+	side_xact_decode_kind = RF_SIDE_XACT_COMMIT;
+	record.reader.cluster_expected_thread_id = 2;
+	side_xact_decode_origin_required = 2;
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
+}
+
+UT_TEST(test_foreign_projection_requires_complete_payload_shape)
+{
+	FakeRecord record;
+	ClusterColdDecodedV1 out = { 0 };
+	int page = 0;
+	const uint8 rmids[] = { RM_CLOG_ID, RM_MULTIXACT_ID };
+	const uint8 infos[] = { CLOG_ZEROPAGE, XLOG_MULTIXACT_ZERO_OFF_PAGE };
+
+	for (uint32 i = 0; i < lengthof(rmids); i++) {
+		fake_record(&record, rmids[i], infos[i], 0);
+		preflight_plan.route.codec_id = RF_ROUTE_CODEC_SIDE_STANDARD;
+		record.storage.decoded.main_data_len = 0;
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+					 CLUSTER_COLD_COMPONENT_INVALID);
+		UT_ASSERT_EQ(out.effects.required | out.effects.native_apply | out.effects.no_effect
+						 | out.effects.refused,
+					 0);
+		UT_ASSERT(!out.xid_input.complete);
+		memcpy(record.data, &page, sizeof(page));
+		record.storage.decoded.main_data_len = sizeof(page);
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+					 CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
+	}
+}
+
 /*
  * Another generation's native control records -- checkpoints, NEXTOID,
  * parameter, FPW and timeline records, segment switches, restore points,
@@ -441,10 +678,128 @@ UT_TEST(test_foreign_side_records_have_no_cold_owner)
  * crash recovery does with them: nothing.  Only their native shape is
  * accepted; the founder's own keep their native owner.
  */
+UT_TEST(test_complete_standby_payloads_keep_original_effect_routes)
+{
+	static const uint8 infos[] = { XLOG_STANDBY_LOCK, XLOG_RUNNING_XACTS, XLOG_INVALIDATIONS };
+	FakeRecord r;
+	ClusterColdDecodedV1 out = { 0 };
+	for (Size i = 0; i < lengthof(infos); i++)
+		for (unsigned empty = 0; empty < 2; empty++)
+			for (unsigned foreign = 0; foreign < 2; foreign++) {
+				uint32 expected = CLUSTER_COLD_EFFECT_RECORD;
+				standby_record(&r, infos[i], empty != 0);
+				UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, UUID, true,
+															foreign != 0, &out), CLUSTER_COLD_OK);
+				if (infos[i] == XLOG_INVALIDATIONS) {
+					expected |= CLUSTER_COLD_EFFECT_INVALIDATIONS;
+					if (!empty)
+						expected |= CLUSTER_COLD_EFFECT_RELCACHE;
+					UT_ASSERT_EQ(out.record.record_flags,
+								 foreign ? CLUSTER_COLD_RECORD_FOREIGN_SIDE : 0);
+				} else {
+					UT_ASSERT_EQ(out.record.record_flags,
+								 foreign ? CLUSTER_COLD_RECORD_FOREIGN_CONTROL : 0);
+				}
+				UT_ASSERT_EQ(out.effects.required, expected);
+				UT_ASSERT_EQ(out.effects.no_effect,
+							 foreign && infos[i] != XLOG_INVALIDATIONS ? expected : 0);
+				UT_ASSERT_EQ(out.effects.native_apply, out.effects.no_effect ? 0 : expected);
+			}
+}
+
+UT_TEST(test_standby_lock_bad_payload_never_gets_effect_route)
+{
+	FakeRecord r;
+	static const struct { Size offset; int value; } bad[] = {
+		{ offsetof(xl_standby_locks, nlocks), -1 },
+		{ offsetof(xl_standby_locks, nlocks), INT_MAX },
+		{ offsetof(xl_standby_locks, locks) + offsetof(xl_standby_lock, xid), InvalidTransactionId },
+		{ offsetof(xl_standby_locks, locks) + offsetof(xl_standby_lock, xid), FrozenTransactionId },
+		{ offsetof(xl_standby_locks, locks) + offsetof(xl_standby_lock, relOid), InvalidOid }
+	};
+	uint32 full;
+	standby_record(&r, XLOG_STANDBY_LOCK, false);
+	full = r.storage.decoded.main_data_len;
+	for (uint32 len = 0; len < full; len++) {
+		r.storage.decoded.main_data_len = len;
+		UT_ASSERT(standby_refused(&r));
+	}
+	r.storage.decoded.main_data_len = full + 1;
+	UT_ASSERT(standby_refused(&r));
+	for (Size i = 0; i < lengthof(bad); i++) {
+		standby_record(&r, XLOG_STANDBY_LOCK, false);
+		memcpy(r.data + bad[i].offset, &bad[i].value, sizeof(bad[i].value));
+		UT_ASSERT(standby_refused(&r));
+	}
+	r.storage.decoded.main_data = NULL;
+	UT_ASSERT(standby_refused(&r));
+}
+
+UT_TEST(test_running_xacts_bad_payload_never_gets_effect_route)
+{
+	FakeRecord r;
+	static const struct { Size offset; int value; } bad[] = {
+		{ offsetof(xl_running_xacts, xcnt), -1 },
+		{ offsetof(xl_running_xacts, subxcnt), -1 },
+		{ offsetof(xl_running_xacts, xcnt), 0 },
+		{ offsetof(xl_running_xacts, xcnt), INT_MAX },
+		{ offsetof(xl_running_xacts, subxcnt), INT_MAX },
+		{ offsetof(xl_running_xacts, nextXid), FrozenTransactionId },
+		{ offsetof(xl_running_xacts, oldestRunningXid), InvalidTransactionId },
+		{ offsetof(xl_running_xacts, latestCompletedXid), InvalidTransactionId },
+		{ offsetof(xl_running_xacts, xids), FrozenTransactionId },
+		{ offsetof(xl_running_xacts, xids) + sizeof(TransactionId), InvalidTransactionId }
+	};
+	uint32 full;
+	standby_record(&r, XLOG_RUNNING_XACTS, false);
+	full = r.storage.decoded.main_data_len;
+	for (uint32 len = 0; len < full; len++) {
+		r.storage.decoded.main_data_len = len;
+		UT_ASSERT(standby_refused(&r));
+	}
+	r.storage.decoded.main_data_len = full + 1;
+	UT_ASSERT(standby_refused(&r));
+	for (Size i = 0; i < lengthof(bad); i++) {
+		standby_record(&r, XLOG_RUNNING_XACTS, false);
+		memcpy(r.data + bad[i].offset, &bad[i].value, sizeof(bad[i].value));
+		UT_ASSERT(standby_refused(&r));
+	}
+	standby_record(&r, XLOG_RUNNING_XACTS, false);
+	r.data[offsetof(xl_running_xacts, subxid_overflow)] = 2;
+	UT_ASSERT(standby_refused(&r));
+	r.storage.decoded.main_data = NULL;
+	UT_ASSERT(standby_refused(&r));
+}
+
+UT_TEST(test_standby_invalidations_bad_payload_never_gets_effect_route)
+{
+	FakeRecord r;
+	uint32 full;
+	standby_record(&r, XLOG_INVALIDATIONS, false);
+	full = r.storage.decoded.main_data_len;
+	for (uint32 len = 0; len < full; len++) {
+		r.storage.decoded.main_data_len = len;
+		UT_ASSERT(standby_refused(&r));
+	}
+	r.storage.decoded.main_data_len = full + 1;
+	UT_ASSERT(standby_refused(&r));
+	for (int count = -1; count <= 2; count += 3) {
+		standby_record(&r, XLOG_INVALIDATIONS, false);
+		memcpy(r.data + offsetof(xl_invalidations, nmsgs), &count, sizeof(count));
+		UT_ASSERT(standby_refused(&r));
+	}
+	standby_record(&r, XLOG_INVALIDATIONS, false);
+	r.data[offsetof(xl_invalidations, relcacheInitFileInval)] = 2;
+	UT_ASSERT(standby_refused(&r));
+	r.storage.decoded.main_data = NULL;
+	UT_ASSERT(standby_refused(&r));
+}
+
 UT_TEST(test_foreign_native_control_is_typed_noop)
 {
 	FakeRecord record;
 	ClusterColdDecodedV1 out = { 0 };
+	xl_logical_message message = { .dbId = 5, .prefix_size = 1 };
 	static const struct {
 		uint8 rmid;
 		uint8 info;
@@ -460,14 +815,15 @@ UT_TEST(test_foreign_native_control_is_typed_noop)
 				  { RM_XLOG_ID, XLOG_FPW_CHANGE, sizeof(bool) },
 				  { RM_XLOG_ID, XLOG_END_OF_RECOVERY, sizeof(xl_end_of_recovery) },
 				  { RM_XLOG_ID, XLOG_OVERWRITE_CONTRECORD, sizeof(xl_overwrite_contrecord) },
-				  { RM_STANDBY_ID, XLOG_STANDBY_LOCK, 0 },
-				  { RM_STANDBY_ID, XLOG_RUNNING_XACTS, 0 },
-				  { RM_STANDBY_ID, XLOG_INVALIDATIONS, 0 } };
+				  { RM_STANDBY_ID, XLOG_STANDBY_LOCK, offsetof(xl_standby_locks, locks) },
+				  { RM_STANDBY_ID, XLOG_RUNNING_XACTS, offsetof(xl_running_xacts, xids) } };
 	Size i;
 
 	for (i = 0; i < lengthof(cases); i++) {
 		fake_record(&record, cases[i].rmid, cases[i].info, 0);
 		record.storage.decoded.main_data_len = cases[i].length;
+		if (cases[i].rmid == RM_STANDBY_ID)
+			standby_record(&record, cases[i].info, true);
 		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
 					 CLUSTER_COLD_OK);
 		if (out.record.record_flags != CLUSTER_COLD_RECORD_FOREIGN_CONTROL)
@@ -483,12 +839,14 @@ UT_TEST(test_foreign_native_control_is_typed_noop)
 			record.storage.decoded.main_data_len = cases[i].length + 1;
 			UT_ASSERT_EQ(
 				cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
-				CLUSTER_COLD_OK);
-			UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+				CLUSTER_COLD_COMPONENT_INVALID);
+			UT_ASSERT_EQ(out.effects.required, 0);
 		}
 	}
 
 	fake_record(&record, RM_LOGICALMSG_ID, XLOG_LOGICAL_MESSAGE, 0);
+	memcpy(record.data, &message, SizeOfLogicalMessage);
+	record.storage.decoded.main_data_len = SizeOfLogicalMessage + 1;
 	preflight_plan.route.record_owner = RF_ROUTE_OWNER_LOGICAL_NOOP;
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
 				 CLUSTER_COLD_OK);
@@ -598,6 +956,8 @@ UT_TEST(test_space_identity_changes_are_typed)
 				 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.record.record_flags, 0);
 	UT_ASSERT_EQ(out.record.space_count, 1);
+	UT_ASSERT_EQ(out.effects.space_apply, CLUSTER_COLD_EFFECT_SPACE | CLUSTER_COLD_EFFECT_RECORD);
+	UT_ASSERT_EQ(out.effects.native_apply, 0);
 	UT_ASSERT(out.record.space_ops == out.space_ops);
 	UT_ASSERT_EQ(out.space_ops[0].kind, CLUSTER_COLD_SPACE_CREATE);
 	UT_ASSERT_EQ(out.space_ops[0].locator.relNumber, 16384);
@@ -731,10 +1091,35 @@ UT_TEST(test_commit_space_drops_are_typed)
 	UT_ASSERT_EQ(out.space_capacity, 0);
 }
 
+
+UT_TEST(test_detached_capture_borrows_only_a_complete_decode)
+{
+	FakeRecord record;
+	ClusterColdDecodedV1 out = { 0 };
+	fake_record(&record, RM_XLOG_ID, XLOG_NOOP, 0);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT(out.detached.preflight_complete);
+	UT_ASSERT(out.detached.source_record == &record.reader);
+	UT_ASSERT_EQ(out.detached.route.rmid, RM_XLOG_ID);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_CONTROL);
+	preflight_result = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	UT_ASSERT(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out)
+			  != CLUSTER_COLD_OK);
+	UT_ASSERT(!out.detached.preflight_complete);
+	UT_ASSERT_NULL(out.detached.source_record);
+	cluster_cold_decoded_release_v1(&out);
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(19);
+	UT_RUN(test_complete_standby_payloads_keep_original_effect_routes);
+	UT_RUN(test_standby_lock_bad_payload_never_gets_effect_route);
+	UT_RUN(test_running_xacts_bad_payload_never_gets_effect_route);
+	UT_RUN(test_standby_invalidations_bad_payload_never_gets_effect_route);
+	UT_RUN(test_detached_capture_borrows_only_a_complete_decode);
 	UT_RUN(test_page_record_maps_ordinary_components);
 	UT_RUN(test_registry_refusal_is_opcode_unsupported);
 	UT_RUN(test_cold_owner_policy);
@@ -742,6 +1127,9 @@ main(void)
 	UT_RUN(test_storage_lifecycle_classification);
 	UT_RUN(test_malformed_plan_refused);
 	UT_RUN(test_foreign_side_records_have_no_cold_owner);
+	UT_RUN(test_foreign_commit_side_owner_requires_record_local_shape);
+	UT_RUN(test_foreign_commit_shape_uses_reader_origin_thread);
+	UT_RUN(test_foreign_projection_requires_complete_payload_shape);
 	UT_RUN(test_foreign_native_control_is_typed_noop);
 	UT_RUN(test_space_identity_changes_are_typed);
 	UT_RUN(test_space_reservation_advance_is_typed);

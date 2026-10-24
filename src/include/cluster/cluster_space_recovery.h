@@ -39,6 +39,44 @@ extern bool cluster_space_recovery_cold_drop_already_v1(const ClusterSpaceIdenti
 														const ClusterSpaceRecoveryInput *input,
 														const ClusterSpaceColdSourceV1 *source);
 
+/* Physical preflight of one original native ABORT pending-delete item.
+ * The sealed source supplies its CREATE incarnation and complete preceding
+ * CREATE/ADVANCE chain. Both exact SPACE pages must already be durable;
+ * borrow the original whole cold owner set and retained ABORT endpoint.
+ * Never installs bytes, deletes storage, changes TT/CLOG or seals recovery. */
+extern bool cluster_space_recovery_cold_abort_preflight_v1(const RfSideOnlinePlanV1 *side,
+														   uint32 index, uint32 relation);
+
+/* Read-only final physical result of one original native ABORT item, under
+ * its sealed CREATE/ADVANCE ancestry and original complete cold source owner.
+ * Requires occupied empty MAIN and every auxiliary absent. This is a result
+ * check only: caller must have executed the original sequencer and drained all
+ * sources. It grants no retry, deletion, durability or recovery completion. */
+extern bool cluster_space_recovery_cold_abort_result_v1(const RfSideOnlinePlanV1 *side,
+														uint32 index, uint32 relation);
+
+/* Execute only the original ABORT's qualified native pending-delete group.
+ * Sync the retained source before native unlink, retain occupied MAIN and
+ * verify/sync the complete physical result and directory. No TT/CLOG or
+ * terminal completion is granted; an absent SPACE proof cannot be retried
+ * as success. All original cold authorities must remain held throughout. */
+extern bool cluster_space_recovery_cold_abort_delete_v1(const RfSideOnlinePlanV1 *side,
+														uint32 index);
+
+/* Optional before_delete runs after complete source/physical qualification,
+ * before native unlink. Both it and required finish run under the original
+ * all-source owner, with the entire physical group rechecked after each hook.
+ * Reserve finish_bytes of simultaneous extra scratch before any hook/mutation;
+ * the callbacks must prove their own TT/CLOG/terminal obligations within it.
+ * No receipt survives this call or permits retry without the original SPACE
+ * proof. NULL finish is refused. */
+typedef bool (*ClusterSpaceColdAbortFinishV1)(void *arg, const RfSideOnlinePlanV1 *side,
+											  uint32 index);
+extern bool cluster_space_recovery_cold_abort_finish_v1(const RfSideOnlinePlanV1 *side,
+														uint32 index, Size finish_bytes, void *arg,
+														ClusterSpaceColdAbortFinishV1 before_delete,
+														ClusterSpaceColdAbortFinishV1 finish);
+
 extern bool cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *plan,
 												const ClusterThreadRecoveryAuthorityV1 *sources,
 												uint32 count, ClusterSpaceRecoveryBatchV1 **out);
@@ -53,6 +91,9 @@ extern bool cluster_space_recovery_apply_through_v1(ClusterSpaceRecoveryBatchV1 
  * Borrows that plan and the sealed SIDE inputs until batch destruction;
  * neither an origin number nor a caller-provided mode grants mutation.
  * Accepts CREATE plus ADVANCE; ADVANCE alone needs a durable identity page.
+ * A same-source native MAIN CREATE is executed only with its exact typed
+ * CREATE pair. Original source sync precedes all target mutation; MAIN
+ * creation never truncates an existing fork or certifies final ROOT publish.
  * TRUNCATE and DROP need their separate structural retirement owner. */
 extern bool cluster_space_recovery_cold_preflight_v1(const RfSideOnlinePlanV1 *side,
 													 struct ClusterRecoveryFencePlan *fence,

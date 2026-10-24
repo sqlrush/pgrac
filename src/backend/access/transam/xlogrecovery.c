@@ -143,7 +143,9 @@
  *	              history only) before the serial set is taken; pass 2
  *	              (cluster_recovery_typed_replay) replays the sealed
  *	              schedule, matching every page record to its pass-1
- *	              identity; SPACE changes are installed by the SPACE owner
+ *	              identity. An exact C0 dependency may finish a target
+ *	              source whose scheduled steps already ran, without changing
+ *	              the PAGE/SPACE schedule. The SPACE owner installs changes
  *	              at their steps (repeating a TRUNCATE's shrink only where
  *	              nothing proves it durable) and in full at the end, never
  *	              replayed natively; another generation's native control
@@ -200,10 +202,18 @@
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_space_identity.h"
 #include "cluster/cluster_space_reservation.h"
+#include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_wal_writer.h"
+#include "cluster/storage/cluster_undo_block0.h"
+#include "utils/memutils.h"
+#include "utils/resowner.h"
+#include "cluster/cluster_wal_tail.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_recovery_worker.h"
 #include "cluster/storage/cluster_smgr.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_restart_read.h"
 #include "cluster/cluster_write_fence.h"
@@ -653,10 +663,421 @@ static XLogRecPtr cluster_recovery_merged_replay(const uint64 *bitmap, const XLo
 												 TimeLineID tli, uint16 own_thread,
 												 TimeLineID *replayTLI, bool restore_mode,
 												 ClusterRecoveryFencePlan **fence_plan);
+/* Startup-process local, one-shot handoff of the original typed preparation.
+ * Nothing here is a durable certificate or a successor writer capability. */
+typedef struct ClusterColdStartupPreparationV1 {
+	bool started;
+	bool ready;
+	ResourceOwner owner;
+	int pid;
+	XLogRecPtr checkpoint;
+	XLogRecPtr redo;
+	TimeLineID checkpoint_tli;
+	TimeLineID redo_tli;
+	ClusterMergeEngage engage;
+	ClusterRecoveryFencePlan *fence;
+	ClusterColdTypedV1 *typed;
+} ClusterColdStartupPreparationV1;
+static ClusterColdStartupPreparationV1 cluster_recovery_cold_preparation;
+static void cluster_recovery_typed_fail(ClusterRecoveryFencePlan **fence_plan,
+									  ClusterColdTypedV1 **typed,
+									  const char *message, const char *detail);
 static ClusterColdTypedV1 *cluster_recovery_typed_begin(ClusterRecoveryFencePlan **fence_plan);
 static XLogRecPtr cluster_recovery_typed_replay(ClusterColdTypedV1 **typed,
 												TimeLineID *replayTLI,
 												ClusterRecoveryFencePlan **fence_plan);
+static ClusterColdTypedV1 *cluster_recovery_cold_inputs;
+
+/* Input identity for the original post-EOR attempt. Old subject identities
+ * stay in inputs; writer is a separate, actual installed successor. No child
+ * read/flush/write scope can be obtained from this resource yet. */
+struct ClusterRecoveryStartV1 {
+	const ClusterColdTypedV1 *inputs;
+	const ClusterColdTopTxCensusV1 *census;
+	ResourceOwner owner;
+	int pid;
+	uint64 owner_boot;
+	uint64 generation;
+	uint64 serial;
+	uint64 install_generation;
+	ClusterWalWriterToken writer;
+	uint8 operation_uuid[16];
+	bool revoked;
+};
+static struct ClusterRecoveryStartV1 *cluster_recovery_cold_start;
+static uint64 cluster_recovery_cold_generation;
+static bool cluster_recovery_cold_callback_registered;
+
+static bool
+cluster_recovery_cold_writer_same(const ClusterWalWriterToken *a,
+								const ClusterWalWriterToken *b)
+{
+	return memcmp(&a->ref.claim.identity, &b->ref.claim.identity,
+				  sizeof(a->ref.claim.identity)) == 0
+		&& a->ref.claim.database_incarnation == b->ref.claim.database_incarnation
+		&& a->ref.claim.max_config_generation == b->ref.claim.max_config_generation
+		&& memcmp(a->ref.claim.claim_sha256, b->ref.claim.claim_sha256, 32) == 0
+		&& a->ref.timeline == b->ref.timeline && a->epoch == b->epoch
+		&& a->startup_first_lsn == b->startup_first_lsn;
+}
+
+/* ERROR/release invalidates only the process resource, never persistent debt.
+ * The original input owner remains responsible for its eventual destruction. */
+static void
+cluster_recovery_cold_resource_release(ResourceReleasePhase phase, bool isCommit,
+									   bool isTopLevel, void *arg)
+{
+	(void)isCommit;
+	(void)isTopLevel;
+	(void)arg;
+	if (phase == RESOURCE_RELEASE_BEFORE_LOCKS && cluster_recovery_cold_start != NULL
+		&& cluster_recovery_cold_start->owner == CurrentResourceOwner)
+	{
+		cluster_recovery_checkpoint_revoke_v1(cluster_recovery_cold_start);
+		cluster_recovery_cold_start->revoked = true;
+	}
+}
+
+static void
+cluster_recovery_cold_inputs_cleanup(int code, Datum arg)
+{
+	(void)code;
+	(void)arg;
+	if (cluster_recovery_cold_start != NULL) {
+		cluster_recovery_checkpoint_revoke_v1(cluster_recovery_cold_start);
+		cluster_recovery_cold_start->revoked = true;
+		pfree(cluster_recovery_cold_start);
+		cluster_recovery_cold_start = NULL;
+	}
+	cluster_cold_typed_destroy_v1(&cluster_recovery_cold_inputs);
+}
+
+/* Keep only original read-only inputs across EOR, never a live read scope.
+ * The fence plan's execution guards and retention pin are released normally.
+ * Any later consumer must obtain fresh source and writer authorization. */
+static void
+cluster_recovery_cold_inputs_retain(ClusterColdTypedV1 **typed)
+{
+	if (typed == NULL || *typed == NULL || (*typed)->inputs != NULL
+		|| cluster_recovery_cold_inputs != NULL)
+		ereport(FATAL, (errmsg("could not retain original cold recovery inputs")));
+	before_shmem_exit(cluster_recovery_cold_inputs_cleanup, (Datum)0);
+	cluster_recovery_cold_inputs = *typed;
+	*typed = NULL;
+}
+
+static void
+cluster_recovery_cold_inputs_handoff(EndOfWalRecoveryInfo *info)
+{
+	info->cluster_cold_inputs = cluster_recovery_cold_inputs;
+	info->cluster_tx_start = NULL;
+}
+
+bool
+ClusterColdRecoveryTxCurrent(const struct ClusterRecoveryStartV1 *start)
+{
+	ClusterWalWriterToken writer;
+	uint8 operation_uuid[16];
+	uint64 install_generation;
+
+	/* Compare the opaque pointer before any dereference, including stale ones. */
+	if (start == NULL || start != cluster_recovery_cold_start || start->revoked
+		|| start->generation == 0 || start->serial == 0 || start->pid != MyProcPid
+		|| start->owner != CurrentResourceOwner || start->owner_boot == 0
+		|| start->owner_boot != cluster_qvotec_get_self_incarnation()
+		|| start->inputs != cluster_recovery_cold_inputs || start->inputs == NULL
+		|| start->inputs->inputs != NULL || start->inputs->plan == NULL
+		|| start->census != start->inputs->top_tx_census || start->census == NULL
+		|| start->census->plan != start->inputs->plan
+		|| !ClusterStartupInstalledRecoveryWriterV1(&writer, operation_uuid, &install_generation))
+		return false;
+	return start->install_generation == install_generation
+		&& cluster_recovery_cold_writer_same(&start->writer, &writer)
+		&& memcmp(start->operation_uuid, operation_uuid, 16) == 0;
+}
+
+bool
+ClusterColdRecoveryTxCheckpointOwnerV1(const struct ClusterRecoveryStartV1 *start,
+	ClusterRecoveryCheckpointOwnerV1 *out)
+{
+	if (out != NULL) memset(out, 0, sizeof(*out));
+	if (out == NULL || !ClusterColdRecoveryTxCurrent(start))
+		return false;
+	out->writer = start->writer;
+	memcpy(out->operation_uuid, start->operation_uuid, 16);
+	out->install_generation = start->install_generation;
+	out->start_generation = start->generation;
+	out->start_serial = start->serial;
+	out->owner_boot = start->owner_boot;
+	out->owner_pid = start->pid;
+	return true;
+}
+
+const struct ClusterColdTypedV1 *
+ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start)
+{
+	return ClusterColdRecoveryTxCurrent(start) ? start->inputs : NULL;
+}
+
+bool
+ClusterColdRecoveryTxEffectsCurrent(const struct ClusterRecoveryStartV1 *start)
+{
+	const ClusterColdTypedV1 *typed = ClusterColdRecoveryTxInputs(start);
+
+	/* The receipt is independently sealed to the original plan/result.  Do
+	 * not infer completeness from a caller bit or from a proven loser. */
+	return typed != NULL && cluster_cold_typed_effects_ready_v1(typed);
+}
+
+bool
+ClusterColdRecoveryTxSubjectCurrent(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject, uint64 *generation, uint64 *serial)
+{
+	if (generation != NULL) *generation = 0;
+	if (serial != NULL) *serial = 0;
+	if (generation == NULL || serial == NULL || subject == NULL
+		|| !ClusterColdRecoveryTxCurrent(start))
+		return false;
+	/* Never dereference a caller's subject before locating it in the original
+	 * complete census. Unproven ACTIVE inputs may be read to build a proof;
+	 * this check grants neither loser status nor permission to change TT. */
+	for (uint32 i = 0; i < start->census->count; i++) {
+		const ClusterColdTopTxCensusEntryV1 *entry = &start->census->entries[i];
+		const ClusterColdTtSlotKeyV1 *key = &entry->input.key;
+		if (entry != subject)
+			continue;
+		if (key->owner_instance == 0 || key->owner_instance > UNDO_OWNER_INSTANCE_MAX
+			|| key->segment_id == 0
+			|| (key->segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 != key->owner_instance
+			|| key->segment_generation == UINT32_MAX || key->slot_offset >= TT_SLOTS_PER_SEGMENT
+			|| !TransactionIdIsNormal(key->xid) || key->slot_wrap == TT_WRAP_INVALID
+			|| entry->input.slot.status != TT_SLOT_ACTIVE
+			|| entry->input.slot.xid != key->xid || entry->input.slot.wrap != key->slot_wrap)
+			return false;
+		*generation = start->generation;
+		*serial = start->serial;
+		return true;
+	}
+	return false;
+}
+
+bool
+ClusterColdRecoveryTxLoserCurrent(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject)
+{
+	uint64 generation;
+	uint64 serial;
+
+	if (!ClusterColdRecoveryTxSubjectCurrent(start, subject, &generation, &serial)
+		|| !subject->loser_proven)
+		return false;
+
+	/* The producer's loser is a physical identity only.  Keep this helper
+	 * independent of C0, FullXid, TT mutation and checkpoint authority. */
+	return memcmp(&subject->loser.key, &subject->input.key,
+				  sizeof(subject->input.key)) == 0;
+}
+
+bool
+ClusterColdRecoveryTxTopProofCurrent(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject)
+{
+	/* Physical loser identity is a prerequisite, but it is not the complete
+	 * old-ACTIVE qualification.  Require every independent producer gate from
+	 * the same retained census entry and never consult caller assertions. */
+	if (!ClusterColdRecoveryTxLoserCurrent(start, subject)
+		|| memcmp(&subject->proof.key, &subject->input.key,
+				  sizeof(subject->input.key)) != 0
+		|| !subject->proof.producer_top
+		|| !subject->proof.qualified_base
+		|| !subject->proof.sealed_redo
+		|| !subject->proof.ordinary_effects
+		|| !subject->proof.old_writer_isolated
+		|| !subject->proof.terminal_match)
+		return false;
+	return true;
+}
+
+bool
+ClusterColdRecoveryTxC0Candidate(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject,
+	struct ClusterRecoveryTTAbortDerivationV1 *out)
+{
+	const ClusterColdTypedV1 *typed;
+	const ClusterColdTtSlotKeyV1 *key;
+	ClusterRecoveryTTAbortV1 shape;
+	ClusterRecoveryTTAbortDerivationV1 candidate;
+	uint64 next_xid;
+	uint32 target = UINT32_MAX;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	/* Locate the subject in the retained census before dereferencing it.
+	 * Numeric completeness is a C0 requirement, never a physical loser gate. */
+	if (!ClusterColdRecoveryTxTopProofCurrent(start, subject)
+		|| !ClusterColdRecoveryTxEffectsCurrent(start))
+		return false;
+	typed = start->inputs;
+	key = &subject->input.key;
+	if (typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->replay_count == 0 || typed->replay_count > typed->participant_count
+		|| !cluster_cold_typed_xid_maximum_v1(typed, &next_xid))
+		return false;
+	for (uint32 p = 0; p < typed->replay_count; p++) {
+		if (typed->participants[p].thread_id != key->owner_instance)
+			continue;
+		if (target != UINT32_MAX)
+			return false;
+		target = p;
+	}
+	if (target == UINT32_MAX
+		|| typed->sources[target].claim.identity.origin_thread_id != key->owner_instance
+		|| typed->sources[target].claim.identity.origin_owner_incarnation
+			!= typed->participants[target].owner_incarnation)
+		return false;
+
+	memset(&shape, 0, sizeof(shape));
+	shape.version = CLUSTER_RECOVERY_TT_ABORT_VERSION;
+	shape.length = CLUSTER_RECOVERY_TT_ABORT_BYTES;
+	shape.flags = CLUSTER_RECOVERY_TT_ABORT_TOP_KNOWN;
+	shape.target_thread = key->owner_instance;
+	shape.target_incarnation = typed->participants[target].owner_incarnation;
+	memcpy(shape.target_claim_sha256, typed->sources[target].claim.claim_sha256,
+		   sizeof(shape.target_claim_sha256));
+	shape.writer_thread = start->writer.ref.claim.identity.origin_thread_id;
+	shape.writer_incarnation = start->writer.ref.claim.identity.origin_owner_incarnation;
+	shape.recovery_serial = start->serial;
+	/* In E1 this field means the actual recoverer's epoch, not bind time. */
+	shape.target_epoch = start->writer.epoch;
+	shape.exact.segment_id = key->segment_id;
+	shape.exact.segment_generation = key->segment_generation;
+	shape.exact.xid = key->xid;
+	shape.exact.slot_offset = key->slot_offset;
+	shape.exact.wrap = key->slot_wrap;
+	shape.exact.instance = key->owner_instance;
+	shape.exact.format_version = CLUSTER_UNDO_TT_ABORT_EXACT_VERSION;
+	memcpy(&shape.before, &subject->input.slot, sizeof(shape.before));
+	/* No independently retained L is available here. Preserve the existing
+	 * AD-012 exception 10/spec-6.15 dependency in the derivation result. */
+	if (!cluster_recovery_tt_abort_derive_fields_v1(&shape, next_xid, true, false,
+			InvalidTransactionId, start->writer.epoch, &candidate)
+		|| cluster_recovery_tt_abort_match_v1(&candidate.record, key->segment_generation,
+			&subject->input.slot) != CLUSTER_RECOVERY_TT_ABORT_APPLY
+		|| !ClusterColdRecoveryTxTopProofCurrent(start, subject)
+		|| !ClusterColdRecoveryTxEffectsCurrent(start))
+		return false;
+	*out = candidate;
+	return true;
+}
+
+bool
+ClusterColdRecoveryTxC0Reserve(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject, struct ClusterUndoBlock0Pin *pin)
+{
+	ClusterUndoBlock0LogicalKey logical;
+	ClusterUndoBlock0AuthorityProof proof;
+
+	/* Validate the retained subject pointer before reading its physical key. */
+	if (pin == NULL || !ClusterColdRecoveryTxTopProofCurrent(start, subject)
+		|| !ClusterColdRecoveryTxEffectsCurrent(start))
+		return false;
+	memset(&logical, 0, sizeof(logical));
+	logical.owner_instance = subject->input.key.owner_instance;
+	logical.segment_id = subject->input.key.segment_id;
+	memset(&proof, 0, sizeof(proof));
+	proof.kind = CLUSTER_UNDO_BLOCK0_STARTUP_REDO;
+	proof.owner_instance = logical.owner_instance;
+	proof.cluster_epoch_present = true;
+	proof.cluster_epoch = start->writer.epoch;
+	proof.recovery_generation = start->generation;
+	if (cluster_undo_block0_recovery_reserve(&logical, &proof, pin) != CLUSTER_UNDO_BLOCK0_OK)
+		return false;
+	if (!ClusterColdRecoveryTxTopProofCurrent(start, subject)
+		|| !ClusterColdRecoveryTxEffectsCurrent(start)) {
+		cluster_undo_block0_release_reservation(pin);
+		return false;
+	}
+	return true;
+}
+
+bool
+ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
+{
+	struct ClusterRecoveryStartV1 *start;
+	ClusterWalWriterToken writer;
+	uint8 operation_uuid[16];
+	uint64 owner_boot, install_generation;
+
+	if (info == NULL)
+		return false;
+	/* Non-cold/clean startup has no retained attempt and needs no resource. */
+	if (info->cluster_cold_inputs == NULL)
+		return cluster_recovery_cold_inputs == NULL && cluster_recovery_cold_start == NULL
+			&& info->cluster_tx_start == NULL;
+	if (info->cluster_cold_inputs != cluster_recovery_cold_inputs
+		|| cluster_recovery_cold_start != NULL || info->cluster_tx_start != NULL
+		|| cluster_recovery_cold_inputs->inputs != NULL
+		|| cluster_recovery_cold_inputs->plan == NULL
+		|| cluster_recovery_cold_inputs->participant_count == 0
+		|| cluster_recovery_cold_inputs->top_tx_census == NULL
+		|| cluster_recovery_cold_inputs->top_tx_census->plan != cluster_recovery_cold_inputs->plan
+		|| CurrentResourceOwner == NULL || MyProcPid <= 0
+		|| cluster_recovery_cold_generation == PG_UINT64_MAX
+		|| !ClusterStartupInstalledRecoveryWriterV1(&writer, operation_uuid, &install_generation))
+		return false;
+	owner_boot = cluster_qvotec_get_self_incarnation();
+	if (owner_boot == 0 || owner_boot != writer.ref.claim.identity.origin_owner_incarnation)
+		return false;
+	if (!cluster_recovery_cold_callback_registered) {
+		RegisterResourceReleaseCallback(cluster_recovery_cold_resource_release, NULL);
+		cluster_recovery_cold_callback_registered = true;
+	}
+	start = MemoryContextAllocExtended(TopMemoryContext, sizeof(*start),
+										MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+	if (start == NULL)
+		return false;
+	start->inputs = cluster_recovery_cold_inputs;
+	start->census = cluster_recovery_cold_inputs->top_tx_census;
+	start->owner = CurrentResourceOwner;
+	start->pid = MyProcPid;
+	start->owner_boot = owner_boot;
+	start->generation = ++cluster_recovery_cold_generation;
+	start->serial = 1;
+	start->install_generation = install_generation;
+	start->writer = writer;
+	memcpy(start->operation_uuid, operation_uuid, 16);
+	cluster_recovery_cold_start = start;
+	if (!ClusterColdRecoveryTxCurrent(start)
+		|| !cluster_recovery_checkpoint_register_v1(start)) {
+		cluster_recovery_cold_start = NULL;
+		pfree(start);
+		return false;
+	}
+	info->cluster_tx_start = start;
+	return true;
+}
+
+void
+ClusterReleaseColdRecoveryInputs(EndOfWalRecoveryInfo *info)
+{
+	if (info == NULL || info->cluster_cold_inputs != cluster_recovery_cold_inputs
+		|| info->cluster_tx_start != cluster_recovery_cold_start)
+		ereport(FATAL, (errmsg("cold recovery input handoff belongs to another attempt")));
+	/* Preserve the original registered checkpoint owner after successful
+	 * Startup completion, before destroying its private source inputs.
+	 * An already-revoked attempt is cleanup only and transfers nothing. */
+	if (cluster_recovery_cold_start != NULL && !cluster_recovery_cold_start->revoked
+		&& !cluster_recovery_checkpoint_handoff_v1(cluster_recovery_cold_start))
+		ereport(FATAL, (errmsg("could not hand off the original recovered checkpoint owner")));
+	info->cluster_tx_start = NULL;
+	info->cluster_cold_inputs = NULL;
+	if (cluster_recovery_cold_inputs != NULL) {
+		cluster_recovery_cold_inputs_cleanup(0, (Datum)0);
+		cancel_before_shmem_exit(cluster_recovery_cold_inputs_cleanup, (Datum)0);
+	}
+}
+
 static bool cluster_backup_recovery_have_manifest = false;
 static ClusterBackupManifest cluster_backup_recovery_manifest;
 static bool cluster_backup_recovery_target_active = false;
@@ -1585,13 +2006,13 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 		 * (see the backup_label arm above for why). */
 		cluster_scn_recovery_replay_observe(record->xl_scn);
 		/* Capture the actual own WAL record, not a shared control-file copy.
-		 * StartupXLOG separately confirms the completed clean-start decision. */
-		if (wasShutdown) {
+		 * Semantic recovery retains the initial online checkpoint too; neither
+		 * capture certifies CLEAN. StartupXLOG separately confirms clean start. */
+		if (wasShutdown)
 			cluster_tt_slot_capture_startup_checkpoint(record->xl_scn, checkPoint.nextXid);
-			cluster_semantic_normal_start_capture(CheckPointLoc, checkPoint.redo,
-												  U64FromFullTransactionId(checkPoint.nextXid),
-												  record->xl_scn);
-		}
+		cluster_semantic_normal_start_capture(CheckPointLoc, checkPoint.redo,
+											  U64FromFullTransactionId(checkPoint.nextXid),
+											  record->xl_scn);
 #endif
 
 		/* Make sure that REDO location exists. */
@@ -2385,6 +2806,9 @@ FinishWalRecovery(void)
 
 	result->standby_signal_file_found = standby_signal_file_found;
 	result->recovery_signal_file_found = recovery_signal_file_found;
+#ifdef USE_PGRAC_CLUSTER
+	cluster_recovery_cold_inputs_handoff(result);
+#endif
 
 	return result;
 }
@@ -2431,64 +2855,19 @@ ShutdownWalRecovery(void)
 		DisownLatch(&XLogRecoveryCtl->recoveryWakeupLatch);
 }
 
-/*
- * Perform WAL recovery.
- *
- * If the system was shut down cleanly, this is never called.
- */
-void
-PerformWalRecovery(void)
-{
-	XLogRecord *record;
-	bool		reachedRecoveryTarget = false;
-	TimeLineID	replayTLI;
 #ifdef USE_PGRAC_CLUSTER
+/* The same readonly/claim/typed preparation is used by native replay and by
+ * the earlier shared Startup control boundary. It creates no successor WAL
+ * writer or control publication. */
+static void
+cluster_recovery_prepare_cold(ClusterMergeEngage *engage,
+							 ClusterRecoveryFencePlan **fence_plan,
+							 ClusterColdTypedV1 **typed)
+{
 	ClusterMergeEngage cluster_engage = CLUSTER_MERGE_NO_DISABLED;
 	ClusterRecoveryFencePlan *cluster_fence_plan = NULL;
 	ClusterColdTypedV1 *cluster_typed = NULL;
-#endif
 
-	/*
-	 * Initialize shared variables for tracking progress of WAL replay, as if
-	 * we had just replayed the record before the REDO location (or the
-	 * checkpoint record itself, if it's a shutdown checkpoint).
-	 */
-	SpinLockAcquire(&XLogRecoveryCtl->info_lck);
-	if (RedoStartLSN < CheckPointLoc)
-	{
-		XLogRecoveryCtl->lastReplayedReadRecPtr = InvalidXLogRecPtr;
-		XLogRecoveryCtl->lastReplayedEndRecPtr = RedoStartLSN;
-		XLogRecoveryCtl->lastReplayedTLI = RedoStartTLI;
-	}
-	else
-	{
-		XLogRecoveryCtl->lastReplayedReadRecPtr = xlogreader->ReadRecPtr;
-		XLogRecoveryCtl->lastReplayedEndRecPtr = xlogreader->EndRecPtr;
-		XLogRecoveryCtl->lastReplayedTLI = CheckPointTLI;
-	}
-	XLogRecoveryCtl->replayEndRecPtr = XLogRecoveryCtl->lastReplayedEndRecPtr;
-	XLogRecoveryCtl->replayEndTLI = XLogRecoveryCtl->lastReplayedTLI;
-	XLogRecoveryCtl->recoveryLastXTime = 0;
-	XLogRecoveryCtl->currentChunkStartTime = 0;
-	XLogRecoveryCtl->recoveryPauseState = RECOVERY_NOT_PAUSED;
-	SpinLockRelease(&XLogRecoveryCtl->info_lck);
-
-	/* Also ensure XLogReceiptTime has a sane value */
-	XLogReceiptTime = GetCurrentTimestamp();
-
-	/*
-	 * Let postmaster know we've started redo now, so that it can launch the
-	 * archiver if necessary.
-	 */
-	if (IsUnderPostmaster)
-		SendPostmasterSignal(PMSIGNAL_RECOVERY_STARTED);
-
-	/*
-	 * Allow read-only connections immediately if we're consistent already.
-	 */
-	CheckRecoveryConsistency();
-
-#ifdef USE_PGRAC_CLUSTER
 	/*
 	 * RF-ROOT P4 S04-11: the sole cold readonly producer freezes the exact
 	 * replay/proof-origin set and obtains all external admissions before the
@@ -2560,6 +2939,148 @@ PerformWalRecovery(void)
 	else
 		ereport(DEBUG1, (errmsg("cluster merged recovery: not engaged (reason %d)",
 								(int) cluster_engage)));
+
+	*engage = cluster_engage;
+	*fence_plan = cluster_fence_plan;
+	*typed = cluster_typed;
+}
+
+static bool
+cluster_recovery_cold_preparation_context(void)
+{
+	return cluster_shared_config && AmStartupProcess() && InRecovery
+		&& !ArchiveRecoveryRequested && !StandbyMode
+		&& !cluster_backup_recovery_merge_required && !cluster_mrp_should_start()
+		&& CurrentResourceOwner != NULL && MyProcPid > 0
+		&& !XLogRecPtrIsInvalid(CheckPointLoc) && !XLogRecPtrIsInvalid(RedoStartLSN)
+		&& CheckPointTLI != 0 && RedoStartTLI != 0;
+}
+
+/* Prepare once, before Startup's shared crash control site. The original
+ * typed owner retains its source/retention/IR set until that exact plan is
+ * consumed by replay; caller flags cannot substitute for its readiness. */
+void
+ClusterPrepareColdWalRecovery(void)
+{
+	ClusterColdStartupPreparationV1 *prepared = &cluster_recovery_cold_preparation;
+	ClusterMergeEngage engage;
+	ClusterRecoveryFencePlan *fence_plan = NULL;
+	ClusterColdTypedV1 *typed = NULL;
+
+	if (prepared->started || !cluster_recovery_cold_preparation_context())
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+				 errmsg("shared cold recovery preparation has no current Startup input")));
+	prepared->started = true;
+	prepared->owner = CurrentResourceOwner;
+	prepared->pid = MyProcPid;
+	prepared->checkpoint = CheckPointLoc;
+	prepared->redo = RedoStartLSN;
+	prepared->checkpoint_tli = CheckPointTLI;
+	prepared->redo_tli = RedoStartTLI;
+	cluster_recovery_prepare_cold(&engage, &fence_plan, &typed);
+	if (!cluster_recovery_cold_preparation_context()
+		|| prepared->owner != CurrentResourceOwner || prepared->pid != MyProcPid
+		|| prepared->checkpoint != CheckPointLoc || prepared->redo != RedoStartLSN
+		|| prepared->checkpoint_tli != CheckPointTLI || prepared->redo_tli != RedoStartTLI
+		|| engage != CLUSTER_MERGE_ENGAGE || fence_plan == NULL || typed == NULL)
+		cluster_recovery_typed_fail(&fence_plan, &typed,
+									"shared cold recovery preparation changed", NULL);
+	prepared->engage = engage;
+	prepared->fence = fence_plan;
+	prepared->typed = typed;
+	prepared->ready = true;
+}
+
+static void
+cluster_recovery_take_cold_preparation(ClusterMergeEngage *engage,
+									 ClusterRecoveryFencePlan **fence_plan,
+									 ClusterColdTypedV1 **typed)
+{
+	ClusterColdStartupPreparationV1 *prepared = &cluster_recovery_cold_preparation;
+
+	if (!prepared->started || !prepared->ready
+		|| !cluster_recovery_cold_preparation_context()
+		|| prepared->owner != CurrentResourceOwner || prepared->pid != MyProcPid
+		|| prepared->checkpoint != CheckPointLoc || prepared->redo != RedoStartLSN
+		|| prepared->checkpoint_tli != CheckPointTLI || prepared->redo_tli != RedoStartTLI
+		|| prepared->engage != CLUSTER_MERGE_ENGAGE
+		|| prepared->fence == NULL || prepared->typed == NULL)
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+				 errmsg("shared cold replay has no exact prepared Startup input")));
+	*engage = prepared->engage;
+	*fence_plan = prepared->fence;
+	*typed = prepared->typed;
+	prepared->ready = false;
+	prepared->fence = NULL;
+	prepared->typed = NULL;
+}
+#endif
+
+/*
+ * Perform WAL recovery.
+ *
+ * If the system was shut down cleanly, this is never called.
+ */
+void
+PerformWalRecovery(void)
+{
+	XLogRecord *record;
+	bool		reachedRecoveryTarget = false;
+	TimeLineID	replayTLI;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterMergeEngage cluster_engage = CLUSTER_MERGE_NO_DISABLED;
+	ClusterRecoveryFencePlan *cluster_fence_plan = NULL;
+	ClusterColdTypedV1 *cluster_typed = NULL;
+#endif
+
+	/*
+	 * Initialize shared variables for tracking progress of WAL replay, as if
+	 * we had just replayed the record before the REDO location (or the
+	 * checkpoint record itself, if it's a shutdown checkpoint).
+	 */
+	SpinLockAcquire(&XLogRecoveryCtl->info_lck);
+	if (RedoStartLSN < CheckPointLoc)
+	{
+		XLogRecoveryCtl->lastReplayedReadRecPtr = InvalidXLogRecPtr;
+		XLogRecoveryCtl->lastReplayedEndRecPtr = RedoStartLSN;
+		XLogRecoveryCtl->lastReplayedTLI = RedoStartTLI;
+	}
+	else
+	{
+		XLogRecoveryCtl->lastReplayedReadRecPtr = xlogreader->ReadRecPtr;
+		XLogRecoveryCtl->lastReplayedEndRecPtr = xlogreader->EndRecPtr;
+		XLogRecoveryCtl->lastReplayedTLI = CheckPointTLI;
+	}
+	XLogRecoveryCtl->replayEndRecPtr = XLogRecoveryCtl->lastReplayedEndRecPtr;
+	XLogRecoveryCtl->replayEndTLI = XLogRecoveryCtl->lastReplayedTLI;
+	XLogRecoveryCtl->recoveryLastXTime = 0;
+	XLogRecoveryCtl->currentChunkStartTime = 0;
+	XLogRecoveryCtl->recoveryPauseState = RECOVERY_NOT_PAUSED;
+	SpinLockRelease(&XLogRecoveryCtl->info_lck);
+
+	/* Also ensure XLogReceiptTime has a sane value */
+	XLogReceiptTime = GetCurrentTimestamp();
+
+	/*
+	 * Let postmaster know we've started redo now, so that it can launch the
+	 * archiver if necessary.
+	 */
+	if (IsUnderPostmaster)
+		SendPostmasterSignal(PMSIGNAL_RECOVERY_STARTED);
+
+	/*
+	 * Allow read-only connections immediately if we're consistent already.
+	 */
+	CheckRecoveryConsistency();
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config || cluster_recovery_cold_preparation.started)
+		cluster_recovery_take_cold_preparation(&cluster_engage, &cluster_fence_plan,
+											 &cluster_typed);
+	else
+		cluster_recovery_prepare_cold(&cluster_engage, &cluster_fence_plan, &cluster_typed);
 
 	/*
 	 * RF A1 W6: merge_recovered_lsn is a retained on-disk compatibility
@@ -3087,12 +3608,13 @@ cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
 
 /*
  * Consumers this cold driver calls (cluster_cold_typed_ready_v1).  The
- * per-block redo consultation and the restartpoint hold exist once their
- * owners publish the handshake macros; pass 1 takes every generation with
- * retained WAL from the participant census, and fenced generations are
- * published recovered after replay.  Other generations' typed side owners
- * with the XID/OID/MX/SCN bound merge are not wired yet, so every typed
- * plan currently refuses before IR.
+ * per-block redo consultation is provided by xlogutils.h, while xlog.c owns
+ * the restartpoint hold for the typed replay window.  Pass 1 takes every
+ * generation with retained WAL from the participant census, and fenced
+ * generations are published recovered after replay.  The typed side-record
+ * owner is already called by cluster_typed_replay_unscheduled() for admitted
+ * side routes; exact route/source/authority/proof gates still decide whether
+ * a plan may proceed, and unknown or incomplete side plans remain fail-closed.
  */
 static const ClusterColdHandshakeV1 cluster_cold_handshake = {
 #ifdef CLUSTER_COLD_REDO_HOOK_CONSUMER_V1
@@ -3101,13 +3623,13 @@ static const ClusterColdHandshakeV1 cluster_cold_handshake = {
 	.redo_block_hook = false,
 #endif
 	.participant_census = true,
-	.side_owners = false,
+	/* cluster_cold_typed_side_record_v1 is the existing pass-2 owner for
+	 * every side route admitted by the sealed plan. */
+	.side_owners = true,
 	.completion_publish = true,
-#ifdef CLUSTER_COLD_RESTARTPOINT_HOLD_CONSUMER_V1
+	/* xlog.c rejects own-thread restartpoint publication while the typed
+	 * replay window is active; this is the R-A9 consumer. */
 	.restartpoint_hold = true,
-#else
-	.restartpoint_hold = false,
-#endif
 };
 
 /*
@@ -3176,7 +3698,9 @@ cluster_recovery_typed_begin(ClusterRecoveryFencePlan **fence_plan)
 	if (!cluster_cold_typed_ready_v1(typed, &handshake, readiness, sizeof(readiness)))
 		cluster_recovery_typed_fail(fence_plan, &typed,
 									"typed cold recovery cannot replay this plan yet", readiness);
-	serial_acquired = cluster_recovery_merge_fence_plan_acquire_serial(*fence_plan);
+	/* Recheck/release the census, then retain all physical input threads
+	 * before taking the unchanged foreign-origin IR set. */
+	serial_acquired = cluster_cold_typed_acquire_serial_v1(typed, *fence_plan);
 	if (serial_acquired)
 		plan_committed = cluster_recovery_merge_commit_plan_nowait(*fence_plan);
 	if (!serial_acquired || !plan_committed)
@@ -3205,11 +3729,49 @@ typedef struct ClusterColdTypedReplay
 	ClusterColdReaderV1 *readers[CLUSTER_COLD_MAX_PARTICIPANTS];
 	XLogReaderState *current[CLUSTER_COLD_MAX_PARTICIPANTS];
 	char	   *errormsg[CLUSTER_COLD_MAX_PARTICIPANTS];
+	ClusterColdXidProgressV1 xid_progress[CLUSTER_COLD_MAX_PARTICIPANTS];
 	bool		foreign_mutation_started;
 	bool		apply_foreign;	/* the record being applied is another generation's */
+	ClusterColdEffectsProofV1 effects;	/* complete pass-2 ordinary-effect coverage */
 	ClusterColdDecodedV1 decoded;	/* scratch for unscheduled records */
 	ClusterColdTouchedV1 touched;	/* files pass 2 changed, made durable before completion */
 } ClusterColdTypedReplay;
+
+static bool
+cluster_typed_replay_xid_begin(ClusterColdTypedReplay *rep)
+{
+	ClusterColdTypedV1 *typed = rep->typed;
+
+	memset(&typed->xid_receipt, 0, sizeof(typed->xid_receipt));
+	memset(&typed->effects_receipt, 0, sizeof(typed->effects_receipt));
+	memset(rep->xid_progress, 0, sizeof(rep->xid_progress));
+	memset(typed->xid_next_at_drain, 0, sizeof(typed->xid_next_at_drain));
+	typed->xid_next_after_redo = 0;
+	if (typed->participant_count == 0
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->replay_count > typed->participant_count)
+		return false;
+	for (uint32 i = 0; i < typed->participant_count; i++)
+	{
+		ClusterControlRootSnapshot root;
+		ClusterWalRecoveryCheckpointV1 checkpoint;
+		if (!cluster_cold_typed_checkpoint_v1(typed, i, &root, &checkpoint))
+			return false;
+		/* History normally has its native replay cut at the tail. Its
+		 * checkpoint seed alone cannot stand in for the omitted records. */
+		if (checkpoint.checkpoint.redo != typed->participants[i].native_redo)
+		{
+			if (i < typed->replay_count)
+				return false;
+			continue;
+		}
+		if (!cluster_cold_xid_begin_v1(&rep->xid_progress[i], &typed->participants[i],
+									 U64FromFullTransactionId(checkpoint.checkpoint.nextXid),
+									 cluster_cold_plan_replay_record_count_v1(typed->plan, i)))
+			return false;
+	}
+	return true;
+}
 
 static void
 pg_attribute_noreturn()
@@ -3276,6 +3838,27 @@ cluster_typed_replay_next(void *arg, uint32 participant, ClusterColdReplayRecord
 	out->record_crc = (uint32) r->record->header.xl_crc;
 	out->rmid = r->record->header.xl_rmid;
 	out->info = r->record->header.xl_info;
+	/* Fold the original reader's ordered inputs even for records whose
+	 * pages will be skipped. This is provisional until consumption and
+	 * the original source owner's counted drain both succeed. */
+	if (rep->xid_progress[participant].begun)
+	{
+		ClusterColdTypedV1 *typed = rep->typed;
+		bool is_own = participant == typed->own_participant;
+
+		if (cluster_cold_recovery_decode_v1(r, typed->system_identifier,
+											typed->sources[participant].claim.identity.storage_uuid,
+											false, !is_own, &rep->decoded) != CLUSTER_COLD_OK)
+		{
+			rep->xid_progress[participant].failed = true;
+			rep->xid_progress[participant].next_xid = 0;
+			return false;
+		}
+		if (!cluster_cold_xid_record_v1(&rep->xid_progress[participant],
+									  &typed->participants[participant], &rep->decoded.record,
+									  &rep->decoded.xid_input))
+			return false;
+	}
 	return true;
 }
 
@@ -3284,7 +3867,8 @@ cluster_typed_replay_next(void *arg, uint32 participant, ClusterColdReplayRecord
  * prepared-transaction and unowned side record after native redo, so what
  * reaches here is the founder's own record (native owner), another
  * generation's rebuildable FSM-only page record, relation file creation or
- * native control record (no effect on the founder), or a SPACE change the
+ * native control record (no effect on the founder), an explicitly owned
+ * record-local native SIDE effect, or a SPACE change the
  * SPACE owner installs later or the SPACE pages on disk already cover (never
  * replayed natively); anything else means pass 1 saw other input
  * (cluster_cold_unscheduled_v1).
@@ -3303,6 +3887,10 @@ cluster_typed_replay_unscheduled(void *arg, uint32 participant)
 										&rep->decoded) != CLUSTER_COLD_OK)
 		cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
 									  "an unscheduled record no longer decodes");
+	if (rep->effects.invalid || !cluster_cold_replay_effects_v1(&rep->decoded, NULL, is_own))
+		cluster_typed_replay_mismatch(
+			rep, participant, r->ReadRecPtr,
+			"an unscheduled record has effects without a replay consumer");
 	switch (cluster_cold_unscheduled_v1(&rep->decoded.record))
 	{
 		case CLUSTER_COLD_UNSCHEDULED_REFUSE:
@@ -3313,20 +3901,37 @@ cluster_typed_replay_unscheduled(void *arg, uint32 participant)
 		case CLUSTER_COLD_UNSCHEDULED_SPACE_SKIP:
 			if (is_own)
 				AdvanceNextFullTransactionIdPastXid(r->record->header.xl_xid);
-			return true;
+			break;
 		case CLUSTER_COLD_UNSCHEDULED_FOREIGN_NOOP:
-			/* Another generation's native control record: no effect here
-			 * (its SCN is covered by the plan's bound). */
-			return true;
+			/* Consume the exact captured control through its original cold
+			 * owner; no-effect classification is not a source completion. */
+			if (!cluster_cold_typed_side_record_v1(typed, *rep->fence_plan, participant,
+												   &rep->decoded.record))
+				return false;
+			break;
+		case CLUSTER_COLD_UNSCHEDULED_FOREIGN_SIDE:
+			/* Keep the original pre-mutation fence and source-local consumer;
+			 * never run another origin's SLRU through founder native redo. */
+			cluster_typed_replay_foreign_gate(rep);
+			if (!cluster_cold_typed_side_record_v1(typed, *rep->fence_plan, participant,
+												   &rep->decoded.record))
+				return false;
+			break;
 		case CLUSTER_COLD_UNSCHEDULED_NATIVE:
+			if (!is_own)
+				cluster_typed_replay_foreign_gate(rep);
+			rep->apply_foreign = !is_own;
+			cluster_typed_replay_apply(r, rep);
+			if (!is_own)
+				cluster_vis_bump_merged_records_applied();
 			break;
 	}
-	if (!is_own)
-		cluster_typed_replay_foreign_gate(rep);
-	rep->apply_foreign = !is_own;
-	cluster_typed_replay_apply(r, rep);
-	if (!is_own)
-		cluster_vis_bump_merged_records_applied();
+	/* Coverage follows a returned original owner or the validated skip,
+	 * never a refused or interrupted record. Durability is checked later. */
+	if (!cluster_cold_effects_proof_record_v1(&rep->effects, participant, &rep->decoded, NULL,
+											  is_own))
+		cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
+									  "a consumed record lost its complete effect route");
 	return true;
 }
 
@@ -3366,9 +3971,10 @@ cluster_typed_replay_space_install(ClusterColdTypedReplay *rep, uint32 relation,
 /*
  * A CREATE, TRUNCATE or a commit's relation drops.  The SPACE owner brings
  * each relation through this step's input first (never further, so pages
- * of an incarnation never see a later one); a drop's commit then replays
- * natively, its files and outcome still owned by the commit redo.  Without
- * a cold SPACE install the readiness gate refused such a plan before IR.
+ * of an incarnation never see a later one). The complete COMMIT then uses
+ * native own-thread redo or the exact captured foreign cold SIDE owner,
+ * retaining all native effects. Without a cold SPACE install the readiness
+ * gate refused such a plan before IR.
  */
 static void
 cluster_typed_replay_space_step(ClusterColdTypedReplay *rep, uint32 participant,
@@ -3377,10 +3983,6 @@ cluster_typed_replay_space_step(ClusterColdTypedReplay *rep, uint32 participant,
 	bool		is_own = participant == rep->typed->own_participant;
 	uint32		i;
 
-	/* Pass 1 refuses another generation's commit (R-A5). */
-	if (step->space_kind == CLUSTER_COLD_SPACE_DROP && !is_own)
-		cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
-									  "another generation's relation drops reached replay");
 	if (!is_own)
 		cluster_typed_replay_foreign_gate(rep);
 	for (i = 0; i < step->space_count; i++)
@@ -3396,6 +3998,14 @@ cluster_typed_replay_space_step(ClusterColdTypedReplay *rep, uint32 participant,
 	}
 	if (step->space_kind == CLUSTER_COLD_SPACE_DROP)
 	{
+		if (!is_own)
+		{
+			if (!cluster_cold_typed_side_record_v1(rep->typed, *rep->fence_plan,
+												 participant, &rep->decoded.record))
+				cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
+												  "a complete foreign DROP COMMIT consumer refused");
+			return;
+		}
 		rep->apply_foreign = false;
 		cluster_typed_replay_apply(r, rep);
 	}
@@ -3403,17 +4013,54 @@ cluster_typed_replay_space_step(ClusterColdTypedReplay *rep, uint32 participant,
 		AdvanceNextFullTransactionIdPastXid(r->record->header.xl_xid);
 }
 
-/* Every SPACE relation's remaining inputs, after all streams are drained. */
+/* Every scheduled record already succeeded and all sources were drained
+ * by the original sequencer. A final DROP's complete COMMIT has therefore
+ * deleted SPACE in this invocation: sync and recheck its result, never
+ * reinstall the deleted fork. A final CREATE/ADVANCE may instead have been
+ * consumed by its exact native ABORT; its original owner checks that result.
+ * Neither check authorizes replay from absent SPACE. */
 static bool
 cluster_typed_replay_space_final(void *arg, uint32 relation)
 {
 	ClusterColdTypedReplay *rep = (ClusterColdTypedReplay *) arg;
 	RelFileLocator locator;
 	uint32		count = 0;
+	ClusterColdSpaceInputV1 last;
+	bool		aborted = false;
 
 	if (!cluster_cold_plan_space_relation_v1(rep->typed->plan, relation, &locator, &count) ||
-		count == 0)
+		count == 0 ||
+		!cluster_cold_plan_space_input_v1(rep->typed->plan, relation, count - 1, &last))
 		return false;
+	if (last.kind == CLUSTER_COLD_SPACE_DROP)
+	{
+		ClusterSpaceIdentityKey key = {0};
+		ClusterSpaceRecoveryInput input = {last.payload, last.payload_length};
+		ClusterSpaceColdSourceV1 source;
+		const ClusterColdParticipantV1 *participant;
+
+		if (last.participant >= rep->typed->participant_count)
+			return false;
+		if (last.participant != rep->typed->own_participant)
+			return cluster_cold_typed_drop_final_v1(rep->typed, *rep->fence_plan, relation);
+		/* The original native branch remains bound to its own replayed stream. */
+		participant = &rep->typed->participants[last.participant];
+		if (XLogRecPtrIsInvalid(last.read_rec_ptr) ||
+			last.read_rec_ptr < participant->native_redo ||
+			last.end_rec_ptr <= last.read_rec_ptr || last.end_rec_ptr > participant->tail_end)
+			return false;
+		key.system_identifier = rep->typed->observer.system_identifier;
+		key.database_incarnation = rep->typed->observer.database_incarnation;
+		memcpy(key.storage_uuid, rep->typed->observer.storage_uuid, sizeof(key.storage_uuid));
+		key.locator = locator;
+		source.origin_thread = participant->thread_id;
+		source.end_rec_ptr = last.end_rec_ptr;
+		return cluster_space_cold_drop_sync_v1(&key, &input, &source);
+	}
+	if (!cluster_cold_typed_space_abort_final_v1(rep->typed, relation, &aborted))
+		return false;
+	if (aborted)
+		return true;
 	cluster_typed_replay_space_install(rep, relation, count - 1, false);
 	return true;
 }
@@ -3424,13 +4071,27 @@ cluster_typed_replay_scheduled(void *arg, uint32 participant, const ClusterColdS
 							   ClusterColdPageActionV1 action)
 {
 	ClusterColdTypedReplay *rep = (ClusterColdTypedReplay *) arg;
+	ClusterColdTypedV1 *typed = rep->typed;
+	const ClusterWalSourceRef *source = &typed->sources[participant];
+	bool is_own = participant == typed->own_participant;
 	XLogReaderState *r = rep->current[participant];
+
+	/* Check the whole record before the first consumer or skip, including a
+	 * COMMIT's native effects before installing any of its SPACE drops. */
+	if (cluster_cold_recovery_decode_v1(r, typed->system_identifier,
+										source->claim.identity.storage_uuid, false, !is_own,
+										&rep->decoded)
+			!= CLUSTER_COLD_OK
+		|| rep->effects.invalid || !cluster_cold_replay_effects_v1(&rep->decoded, step, is_own)
+		|| action != cluster_cold_page_action_v1(step, is_own))
+		cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
+									  "a scheduled record has effects without a replay consumer");
 
 	switch (action)
 	{
 		case CLUSTER_COLD_SPACE_STEP:
 			cluster_typed_replay_space_step(rep, participant, step, r);
-			return true;
+			break;
 		case CLUSTER_COLD_PAGE_SKIP_ADVANCE_XID:
 
 			/*
@@ -3438,38 +4099,119 @@ cluster_typed_replay_scheduled(void *arg, uint32 participant, const ClusterColdS
 			 * be behind nextXid, exactly as replaying it would have left it.
 			 */
 			AdvanceNextFullTransactionIdPastXid(r->record->header.xl_xid);
-			return true;
-		case CLUSTER_COLD_PAGE_SKIP:
-			return true;
-		case CLUSTER_COLD_PAGE_APPLY:
 			break;
-	}
+		case CLUSTER_COLD_PAGE_SKIP:
+			break;
+		case CLUSTER_COLD_PAGE_APPLY:
 #ifdef CLUSTER_COLD_REDO_HOOK_CONSUMER_V1
-	rep->apply_foreign = participant != rep->typed->own_participant;
-	if (rep->apply_foreign)
-		cluster_typed_replay_foreign_gate(rep);
-	cluster_cold_apply_step_v1(step, r, cluster_typed_replay_apply, rep);
-	return true;
+			rep->apply_foreign = participant != rep->typed->own_participant;
+			if (rep->apply_foreign)
+				cluster_typed_replay_foreign_gate(rep);
+			cluster_cold_apply_step_v1(step, r, cluster_typed_replay_apply, rep);
+			break;
 #else
-	ereport(FATAL,
-			(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
-			 errmsg("typed cold recovery cannot apply page record %X/%X of thread %u",
-					LSN_FORMAT_ARGS(step->read_rec_ptr),
-					(unsigned) rep->typed->participants[participant].thread_id),
-			 errdetail("This build has no per-block typed redo consultation; applying the "
-					   "record through the freshness checks could skip or overwrite a newer "
-					   "page version."),
-			 errhint("Preserve all original thread WAL and start with a build that supports "
-					 "typed cold replay.")));
-	pg_unreachable();
+			ereport(
+				FATAL,
+				(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+				 errmsg("typed cold recovery cannot apply page record %X/%X of thread %u",
+						LSN_FORMAT_ARGS(step->read_rec_ptr),
+						(unsigned)rep->typed->participants[participant].thread_id),
+				 errdetail("This build has no per-block typed redo consultation; applying the "
+						   "record through the freshness checks could skip or overwrite a newer "
+						   "page version."),
+				 errhint("Preserve all original thread WAL and start with a build that supports "
+						 "typed cold replay.")));
+			pg_unreachable();
 #endif
+		}
+		if (!cluster_cold_effects_proof_record_v1(&rep->effects, participant, &rep->decoded, step,
+												  is_own))
+			cluster_typed_replay_mismatch(
+				rep, participant, r->ReadRecPtr,
+				"a consumed scheduled record lost its complete effect route");
+		return true;
+}
+
+/* PGRAC: bind the current C0 before the sequencer touches its target. */
+static bool
+cluster_typed_replay_dependency(void *arg, uint32 participant,
+								const ClusterColdReplayRecordV1 *record, uint32 *target)
+{
+	ClusterColdTypedReplay *rep = (ClusterColdTypedReplay *)arg;
+	ClusterColdTypedV1 *typed;
+	XLogReaderState *r;
+	bool is_own;
+
+	if (target != NULL)
+		*target = CLUSTER_COLD_NO_INDEX;
+	if (rep == NULL || rep->typed == NULL || record == NULL || target == NULL
+		|| participant >= rep->typed->participant_count
+		|| participant >= CLUSTER_COLD_MAX_PARTICIPANTS || rep->fence_plan == NULL
+		|| *rep->fence_plan == NULL)
+		return false;
+	typed = rep->typed;
+	r = rep->current[participant];
+	if (r == NULL || r->record == NULL || record->read_rec_ptr != r->ReadRecPtr
+		|| record->end_rec_ptr != r->EndRecPtr
+		|| record->record_crc != (uint32)r->record->header.xl_crc
+		|| record->rmid != r->record->header.xl_rmid || record->info != r->record->header.xl_info)
+		return false;
+	if (record->rmid != RM_CLUSTER_UNDO_ID
+		|| (record->info & ~XLR_INFO_MASK) != XLOG_UNDO_RECOVERY_TT_ABORT)
+		return true;
+	/* Validate the complete current carrier before touching another stream.
+	 * The ordinary consumer decodes it again after the target drain, since
+	 * that drain uses the same scratch but preserves this source's reader. */
+	is_own = participant == typed->own_participant;
+	if (cluster_cold_recovery_decode_v1(r, typed->system_identifier,
+										typed->sources[participant].claim.identity.storage_uuid,
+										false, !is_own, &rep->decoded)
+			!= CLUSTER_COLD_OK
+		|| !cluster_cold_replay_effects_v1(&rep->decoded, NULL, is_own))
+		return false;
+	return cluster_cold_typed_record_target_v1(typed, *rep->fence_plan, participant,
+											   &rep->decoded.record, target);
+}
+
+/* Preserve the original drain owner; a counted counter is still neither
+ * global replay completion nor a qualified all-thread endpoint. */
+static bool
+cluster_typed_replay_source_drained(void *arg, uint32 participant,
+									const ClusterColdReplayResultV1 *progress, uint64 records)
+{
+	ClusterColdTypedReplay *rep = (ClusterColdTypedReplay *)arg;
+	const ClusterColdXidProgressV1 *xid = &rep->xid_progress[participant];
+	uint64 next_xid;
+
+	rep->typed->xid_next_at_drain[participant] = 0;
+	if (!cluster_cold_typed_source_drained_v1(rep->typed, *rep->fence_plan, participant, progress,
+												 records))
+		return false;
+	if (!xid->begun)
+		return true; /* Missing history coverage stays missing, never a seed-only endpoint. */
+	/* The sequencer's result cursors stay zero for an empty source. The
+	 * candidate still proves that its checkpoint redo equals the tail. */
+	if (records != xid->records || progress->last_read[participant] != xid->last_read
+		|| progress->last_end[participant] != (records != 0 ? xid->last_end : InvalidXLogRecPtr)
+		|| !cluster_cold_xid_candidate_v1(xid, &rep->typed->participants[participant], &next_xid))
+		return false;
+	rep->typed->xid_next_at_drain[participant] = next_xid;
+	return true;
+}
+
+static bool
+cluster_typed_replay_source_order(void *arg, uint32 *order, uint32 count)
+{
+	ClusterColdTypedReplay *rep = (ClusterColdTypedReplay *)arg;
+
+	return cluster_cold_typed_drain_order_v1(rep->typed, *rep->fence_plan, order, count);
 }
 
 static const ClusterColdReplayOpsV1 cluster_typed_replay_ops = {
-	cluster_typed_replay_next,
-	cluster_typed_replay_unscheduled,
-	cluster_typed_replay_scheduled,
-	cluster_typed_replay_space_final,
+	cluster_typed_replay_next,			 cluster_typed_replay_unscheduled,
+	cluster_typed_replay_scheduled,		 cluster_typed_replay_space_final,
+	cluster_typed_replay_source_drained, cluster_typed_replay_source_order,
+	cluster_typed_replay_dependency,
 };
 
 /* A sequencer stop is fatal: report it in pass-1 terms. */
@@ -3522,6 +4264,18 @@ cluster_typed_replay_unpublished(uint16 thread, const char *what, int detail)
 	pg_unreachable();
 }
 
+/* Keep the original durability barrier, then final PAGE readback, before
+ * counter publication. Neither step grants recovered-generation authority. */
+static bool
+cluster_typed_replay_durable_endpoints(ClusterColdTypedReplay *rep,
+									   const ClusterColdReplayResultV1 *result)
+{
+	return cluster_cold_durable_barrier_v1(&rep->touched)
+		   && cluster_cold_data_readback_v1(rep->typed)
+		   && cluster_cold_typed_xid_endpoints_v1(rep->typed, *rep->fence_plan, result,
+												  rep->xid_progress);
+}
+
 /*
  * Publish every fenced generation recovered: pass 2 must have ended exactly
  * at its sealed tail, every file pass 2 changed (and every SPACE relation)
@@ -3537,10 +4291,23 @@ cluster_typed_replay_publish(ClusterColdTypedReplay *rep, const ClusterColdRepla
 	uint16		thread = 0;
 	int			detail = 0;
 
+	if (!cluster_cold_typed_effects_complete_v1(rep->typed, &rep->effects, result))
+		cluster_typed_replay_unpublished(
+			rep->typed->participants[rep->typed->own_participant].thread_id,
+			"Complete ordinary effect coverage is missing or inconsistent", (int) result->detail);
 	if (!cluster_cold_completion_ready_v1(rep->typed, plan, result, &rep->touched, &thread))
 		cluster_typed_replay_unpublished(thread, "Replay did not end at its sealed tail",
 										 (int) result->detail);
-	cluster_cold_durable_barrier_v1(&rep->touched);
+	if (!cluster_typed_replay_durable_endpoints(rep, result))
+		cluster_typed_replay_unpublished(
+			thread, "Native durability, PAGE readback or source counter endpoints are incomplete",
+			(int)rep->typed->refusal);
+	/* Retain read-only ACTIVE inputs before the original pass-2 authority
+	 * is released. Unproven tops stay explicit; C0 requires its own later
+	 * TX_CLOSURE source/isolation and writer authority after native EOR. */
+	if (!cluster_cold_typed_top_tx_census_v1(rep->typed, plan))
+		cluster_typed_replay_unpublished(
+			thread, "Post-redo ACTIVE input census is incomplete", (int)rep->typed->refusal);
 	switch (cluster_recovery_merge_fence_plan_complete_v1(plan, &thread, &detail))
 	{
 		case CLUSTER_RECOVERY_FENCE_COMPLETE_OK:
@@ -3628,6 +4395,7 @@ cluster_recovery_typed_replay(ClusterColdTypedV1 **typed_address, TimeLineID *re
 	rep->typed = typed;
 	rep->fence_plan = fence_plan;
 	rep->replayTLI = replayTLI;
+	cluster_cold_effects_proof_init_v1(&rep->effects);
 	for (i = 0; i < typed->participant_count; i++)
 	{
 		rep->readers[i] = cluster_cold_reader_open_v1(&typed->sources[i],
@@ -3638,6 +4406,14 @@ cluster_recovery_typed_replay(ClusterColdTypedV1 **typed_address, TimeLineID *re
 										  "the selected source cannot be opened");
 	}
 	cluster_cold_replay_window_enter_v1();
+	if (!cluster_cold_typed_sync_sources_v1(typed, *fence_plan))
+		cluster_recovery_typed_fail(fence_plan, typed_address,
+									"typed cold recovery source durability refused",
+									typed->refusal_detail);
+	if (!cluster_typed_replay_xid_begin(rep))
+		cluster_recovery_typed_fail(fence_plan, typed_address,
+									"typed cold recovery counter input refused",
+									"An original checkpoint seed or replay cut is missing or invalid.");
 	cluster_recovery_merge_window_enter();
 	cluster_recovery_merge_set_own_lsn((uint64) typed->participants[typed->own_participant].native_redo);
 	if (cluster_cold_replay_run_v1(typed->plan, typed->participants, typed->participant_count,
@@ -3661,7 +4437,7 @@ cluster_recovery_typed_replay(ClusterColdTypedV1 **typed_address, TimeLineID *re
 	if (rep->touched.rels != NULL)
 		pfree(rep->touched.rels);
 	pfree(rep);
-	cluster_cold_typed_destroy_v1(typed_address);
+	cluster_recovery_cold_inputs_retain(typed_address);
 	return own_end;
 }
 

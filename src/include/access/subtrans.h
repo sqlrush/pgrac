@@ -27,6 +27,14 @@ extern void ExtendSUBTRANS(TransactionId newestXact);
 extern void TruncateSUBTRANS(TransactionId oldestXact);
 
 #ifdef USE_PGRAC_CLUSTER
+/* Exact original-origin ASSIGNMENT storage, under the executable cold owner.
+ * Existing base/era qualification remains the caller's responsibility. */
+extern bool cluster_subtrans_native_recovery_preflight_v1(int origin, TransactionId top, int count,
+														 const TransactionId *children);
+extern bool cluster_subtrans_native_recovery_apply_v1(int origin, TransactionId top, int count,
+													 const TransactionId *children);
+extern bool cluster_subtrans_native_recovery_verify_v1(int origin, TransactionId top, int count,
+													  const TransactionId *children);
 /* PGRAC: retained shared-origin parentage joins native checkpoint fsync.
  * Author: SqlRush <sqlrush@gmail.com> */
 struct FileTag;

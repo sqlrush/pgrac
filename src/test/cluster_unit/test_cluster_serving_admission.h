@@ -133,6 +133,61 @@ UT_TEST(test_serving_owner_waits_for_exact_root_release_and_frees_mailbox)
 	}
 }
 
+/* Isolate the downstream reader from source selection: the existing LMON
+ * producer has already completed the exact ROOT/ACK/native-gate cut. */
+static void
+test_recovered_serving_reader_setup(bool complete)
+{
+	test_serving_setup(false);
+	if (complete)
+		test_serving_finish_root();
+	NormalStartCompletion->node_id = cluster_node_id;
+	NormalStartCompletion->system_identifier = test_system_identifier;
+	NormalStartCompletion->boot_incarnation = cluster_qvotec_get_self_incarnation();
+	NormalStartCompletion->epoch = test_current_epoch;
+	memcpy(NormalStartCompletion->pgrd, test_serving_expected_root,
+		   sizeof(NormalStartCompletion->pgrd));
+	pg_atomic_write_u32(&NormalStartCompletion->state, CLUSTER_NORMAL_START_EXISTING_OTHER);
+	/* A postmaster/backend must not invoke LMON's original owner observer. */
+	test_recovered_checkpoint_observed = false;
+	test_recovered_checkpoint_observe_calls = 0;
+}
+
+UT_TEST(test_recovered_readers_consume_original_serving_completion)
+{
+	ClusterSemanticActivationRefusal refusal;
+	test_recovered_serving_reader_setup(false);
+	UT_ASSERT(!cluster_semantic_activation_recovered_open_current());
+	test_first_open_finish();
+	test_recovered_serving_reader_setup(true);
+	/* Serving completion is consumed from shared memory, without new disk reads. */
+	test_r4fsm_bootstrap_read_ok = false;
+	IsUnderPostmaster = true;
+	UT_ASSERT(cluster_semantic_activation_recovered_open_current());
+	IsUnderPostmaster = false;
+	UT_ASSERT(cluster_semantic_activation_recovered_open_current());
+	UT_ASSERT(cluster_semantic_activation_startup_poll(&refusal));
+	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(test_recovered_checkpoint_observe_calls, 0);
+	test_first_open_finish();
+}
+
+UT_TEST(test_recovered_readers_reject_changed_serving_cut)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		test_recovered_serving_reader_setup(true);
+		switch (fault) {
+		case 0: test_current_epoch++; break;
+		case 1: test_qvotec_self_incarnation++; break;
+		case 2: pg_atomic_fetch_add_u64(&SemanticActivationAckTable->publication_seq, 2); break;
+		case 3: test_resource_x_gate_snapshot.freeze_generation++; break;
+		case 4: NormalStartCompletion->system_identifier++; break;
+		}
+		UT_ASSERT(!cluster_semantic_activation_recovered_open_current());
+		test_first_open_finish();
+	}
+}
+
 UT_TEST(test_serving_rejects_failed_or_empty_completion)
 {
 	for (unsigned fault = 0; fault < 3; fault++) {

@@ -29,6 +29,10 @@
 #ifndef TEST_CLUSTER_RECOVERY_MERGE_SEAL_BOUNDARY_H
 #define TEST_CLUSTER_RECOVERY_MERGE_SEAL_BOUNDARY_H
 
+#include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_startup_phase.h"
+
 #define NODES 4
 #define SEAL_FLAGS                                                                                 \
 	(CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID)
@@ -69,6 +73,16 @@ static int tail_calls[NODES + 1];
 static int source_calls[NODES + 1];
 static int revalidate_calls[NODES + 1];
 static int formations_built, formations_destroyed;
+static int online_formations_built, cold_formations_built, online_needs_built, cold_needs_built;
+static void (*cold_wait_hook)(void);
+static unsigned cold_input_waits;
+static ClusterFormationSnapshotV1 cold_cohort;
+static bool cold_cf_held;
+static unsigned cold_cf_reads, cold_origin_reads, cold_cf_releases;
+static int cold_bad_origin;
+static bool cold_pending_initializer;
+static bool cold_metadata_error;
+static ClusterCfReleaseResult cold_release_result;
 /* Faults: flags missing from a read-back root; a generation another
  * founder recovers while this one seals thread `tid`. */
 static uint32 readback_cleared[NODES + 1];
@@ -86,8 +100,11 @@ static jmp_buf fatal_jump;
 static bool fatal_armed;
 static int last_elevel;
 static int last_sqlstate;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
 static char last_message[512];
 static char last_detail[1024];
+static char last_plan_log_detail[1024];
 
 static void event(const char *fmt, ...) pg_attribute_printf(1, 2);
 
@@ -106,6 +123,8 @@ static void
 test_ereport_begin(int elevel)
 {
 	last_elevel = elevel;
+	if (elevel == LOG)
+		last_plan_log_detail[0] = '\0';
 	if (elevel >= ERROR) {
 		last_sqlstate = 0;
 		last_message[0] = '\0';
@@ -119,6 +138,14 @@ test_ereport_end(void)
 	if (last_elevel < ERROR)
 		return;
 	event("FATAL;");
+	pg_re_throw();
+}
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
 	if (!fatal_armed)
 		abort();
 	fatal_armed = false;
@@ -157,10 +184,13 @@ errdetail(const char *fmt, ...)
 {
 	va_list args;
 
-	if (last_elevel < ERROR)
+	if (last_elevel < ERROR && last_elevel != LOG)
 		return 0;
 	va_start(args, fmt);
-	vsnprintf(last_detail, sizeof(last_detail), fmt, args);
+	if (last_elevel == LOG)
+		vsnprintf(last_plan_log_detail, sizeof(last_plan_log_detail), fmt, args);
+	else
+		vsnprintf(last_detail, sizeof(last_detail), fmt, args);
 	va_end(args);
 	return 0;
 }
@@ -172,6 +202,13 @@ errhint(const char *fmt pg_attribute_unused(), ...)
 }
 
 /* ---- memory and strings ---- */
+void *palloc(Size size)
+{
+	void *p = malloc(size);
+	if (p == NULL) abort();
+	return p;
+}
+
 void *
 palloc0(Size size)
 {
@@ -212,12 +249,83 @@ appendStringInfo(StringInfo str, const char *fmt, ...)
 }
 
 /* ---- recovery plan, stream checks, shared root membership ---- */
+volatile sig_atomic_t InterruptPending;
+void ProcessInterrupts(void) { abort(); }
+
+bool cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->claim.identity = roots[1].identity;
+	return true;
+}
+bool cluster_reconfig_capture_formation_snapshot_v1(uint16 tid, ClusterFormationSnapshotV1 *out)
+{ UT_ASSERT_EQ(tid, 1); *out = cold_cohort; return true; }
+bool cluster_formation_snapshot_matches_v1(const ClusterFormationSnapshotV1 *a,
+	const ClusterFormationSnapshotV1 *b)
+{ return memcmp(a, b, sizeof(*a)) == 0; }
+ClusterFormationWitnessResult cluster_authority_startup_refresh_recovery(int timeout_ms)
+{ UT_ASSERT(!cold_cf_held); UT_ASSERT(timeout_ms > 0); return CLUSTER_FORMATION_WITNESS_READY; }
+bool cluster_cf_lock(LOCKMODE mode)
+{ UT_ASSERT_EQ(mode, ShareLock); UT_ASSERT(!cold_cf_held); cold_cf_held = true; return true; }
+bool cluster_cf_held(LOCKMODE mode)
+{ return mode == ShareLock && cold_cf_held; }
+bool cluster_cf_held_is_clusterwide(LOCKMODE mode)
+{ return mode == ShareLock && cold_cf_held; }
+ClusterCfReleaseResult cluster_cf_unlock_confirmed(LOCKMODE mode)
+{
+	UT_ASSERT_EQ(mode, ShareLock); UT_ASSERT(cold_cf_held);
+	cold_cf_releases++;
+	if (cold_release_result == CLUSTER_CF_RELEASE_CONFIRMED) cold_cf_held = false;
+	return cold_release_result;
+}
+ClusterControlRootResult cluster_control_root_v3_read_control_locked(const uint8 uuid[16],
+	uint64 system_id, ControlRootImage *out, ControlFileData *common,
+	ClusterControlRootFileToken *file_token)
+{
+	UT_ASSERT(cold_cf_held); UT_ASSERT_EQ(system_id, 9); UT_ASSERT_EQ(uuid[0], 1);
+	cold_cf_reads++;
+	memset(out, 0, sizeof(*out)); memset(common, 0, sizeof(*common));
+	memset(file_token, 0, sizeof(*file_token));
+	out->header.format_version = 3;
+	for (unsigned n = 0; n < NODES; n++) {
+		out->present[n] = true; out->records[n] = roots[n + 1];
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+ClusterControlRootResult cluster_wal_origin_inputs_read_locked(const ControlRootImage *root,
+	uint32 node, ClusterWalOriginInputs *out)
+{
+	UT_ASSERT(cold_cf_held); UT_ASSERT(node < NODES); cold_origin_reads++;
+	memset(out, 0, sizeof(*out));
+	if (cold_metadata_error)
+		ereport(ERROR, (errcode(ERRCODE_IO_ERROR), errmsg("fixture selected input read error")));
+	if ((int)node == cold_bad_origin) return CLUSTER_CONTROL_ROOT_BAD_BODY_CRC;
+	out->current.snapshot = root->records[node];
+	out->has_pending = cold_pending_initializer;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+#ifndef TEST_RECOVERY_PLAN_PUBLISHED
+static bool plan_snapshot_available = true;
+
 bool
 cluster_recovery_plan_snapshot(ClusterRecoveryPlan *out)
 {
+	if (!plan_snapshot_available)
+		return false;
 	*out = census;
 	return true;
 }
+
+/* Non-composition tests supply a fixed census at this owner boundary. The
+ * publication composition test executes the actual producer instead. */
+void
+cluster_recovery_plan_generate(uint32 dbstate, bool recovery_needed)
+{
+	UT_ASSERT_EQ(dbstate, census.dbstate_at_startup);
+	UT_ASSERT_EQ(recovery_needed, census.local_recovery_needed);
+}
+#endif
 
 bool
 cluster_recovery_worker_pool_snapshot(ClusterRecoveryWorkerPool *out)
@@ -257,14 +365,8 @@ GetSystemIdentifier(void)
 }
 
 /* ---- control roots ---- */
-ClusterRecoveryDutyCompare
-cluster_recovery_duty_key_compare(const ClusterRecoveryDutyKey *expected,
-								  const ClusterRecoveryDutyKey *observed)
-{
-	return memcmp(expected, observed, sizeof(*expected)) == 0
-			   ? CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
-			   : CLUSTER_RECOVERY_DUTY_COMPARE_DIFFERENT;
-}
+/* Actual profile-aware encoding/comparison, not a permissive identity double. */
+#include "test_cluster_recovery_duty_compare.inc"
 
 ClusterControlRootResult
 cluster_control_root_lookup_owner_by_node_runtime(int32 old_node_id,
@@ -420,6 +522,15 @@ cluster_control_root_v3_failure_tail_publish(const ClusterRecoverySerialRequest 
 }
 
 /* ---- external write exclusion ---- */
+static PgracExternalFenceNeedSetResult cold_need_result = PGRAC_EXTERNAL_FENCE_NEED_SET_OK;
+static const char *cold_need_predicate = "NONE";
+
+const char *
+cluster_external_fence_need_set_last_predicate(void)
+{
+	return cold_need_predicate;
+}
+
 ClusterFormationWitnessResult
 cluster_formation_witness_build_wait(uint16 origin_thread, bool opening_new_duty,
 									 int timeout_ms pg_attribute_unused(),
@@ -427,6 +538,21 @@ cluster_formation_witness_build_wait(uint16 origin_thread, bool opening_new_duty
 {
 	UT_ASSERT(origin_thread > 1 && origin_thread <= NODES);
 	UT_ASSERT(!opening_new_duty);
+	online_formations_built++;
+	formations_built++;
+	event("formation:%u;", (unsigned)origin_thread);
+	*out = (ClusterFormationWitnessV1 *)&formation_obj[origin_thread];
+	return CLUSTER_FORMATION_WITNESS_READY;
+}
+
+ClusterFormationWitnessResult
+cluster_formation_witness_build_recovery_control_wait(uint16 origin_thread,
+													int timeout_ms pg_attribute_unused(),
+													ClusterFormationWitnessV1 **out)
+{
+	UT_ASSERT(cluster_shared_config);
+	UT_ASSERT(origin_thread > 1 && origin_thread <= NODES);
+	cold_formations_built++;
 	formations_built++;
 	event("formation:%u;", (unsigned)origin_thread);
 	*out = (ClusterFormationWitnessV1 *)&formation_obj[origin_thread];
@@ -456,7 +582,25 @@ cluster_external_fence_need_set_build(const ClusterRecoveryDutyKey *duty,
 	uint16 tid = fence_thread(formation, formation_obj);
 
 	UT_ASSERT_EQ(duty->origin_thread_id, tid);
+	online_needs_built++;
 	event("needs:%u;", (unsigned)tid);
+	*out = (PgracExternalFenceNeedSetV1 *)&needs_obj[tid];
+	return PGRAC_EXTERNAL_FENCE_NEED_SET_OK;
+}
+
+PgracExternalFenceNeedSetResult
+cluster_external_fence_need_set_build_cold(const ClusterRecoveryDutyKey *duty,
+										   const ClusterFormationWitnessV1 *formation,
+										   PgracExternalFenceNeedSetV1 **out)
+{
+	uint16 tid = fence_thread(formation, formation_obj);
+
+	UT_ASSERT(cluster_shared_config);
+	UT_ASSERT_EQ(duty->origin_thread_id, tid);
+	cold_needs_built++;
+	event("needs:%u;", (unsigned)tid);
+	if (cold_need_result != PGRAC_EXTERNAL_FENCE_NEED_SET_OK)
+		return cold_need_result;
 	*out = (PgracExternalFenceNeedSetV1 *)&needs_obj[tid];
 	return PGRAC_EXTERNAL_FENCE_NEED_SET_OK;
 }
@@ -690,6 +834,15 @@ cluster_wal_retention_pin_acquire(
 }
 
 ClusterWalPinResult
+cluster_wal_retention_pin_acquire_inputs_v1(
+	const ClusterWalRetentionPinThreadRequest *requests pg_attribute_unused(),
+	uint16 nthreads pg_attribute_unused(), const uint16 *input_threads pg_attribute_unused(),
+	uint16 ninput_threads pg_attribute_unused(), ClusterWalRetentionPin **out_pin pg_attribute_unused())
+{
+	UNREACHED();
+}
+
+ClusterWalPinResult
 cluster_wal_retention_pin_bind_one(ClusterWalRetentionPin *pin pg_attribute_unused(),
 								   ClusterRecoverySerialGuard *held_serial pg_attribute_unused())
 {
@@ -712,7 +865,20 @@ cluster_ic_tier1_peer_get(int32 peer_id pg_attribute_unused())
 void
 HandleStartupProcInterrupts(void)
 {
-	UNREACHED();
+}
+
+Latch *MyLatch;
+void ResetLatch(Latch *latch) { (void)latch; }
+int WaitLatch(Latch *latch, int wake_events, long timeout, uint32 wait_event_info)
+{
+	(void)latch; (void)wait_event_info;
+	UT_ASSERT((wake_events & WL_EXIT_ON_PM_DEATH) != 0);
+	UT_ASSERT(timeout > 0);
+	UT_ASSERT_EQ(formations_built, 0);
+	UT_ASSERT(!cold_cf_held);
+	cold_input_waits++;
+	if (cold_wait_hook != NULL) cold_wait_hook(); else UNREACHED();
+	return WL_TIMEOUT;
 }
 
 int

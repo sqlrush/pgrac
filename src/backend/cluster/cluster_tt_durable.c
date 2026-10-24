@@ -53,6 +53,7 @@
 #include "cluster/cluster_tt_slot.h" /* TTSlot, TT_SLOT_COMMITTED, TT_SLOTS_PER_SEGMENT */
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_undo_segment.h"		/* UndoSegmentHeaderData */
+#include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_undo_smgr.h"			/* header-bytes + block I/O */
 #include "cluster/storage/cluster_undo_alloc.h" /* CLUSTER_UNDO_SEGS_PER_INSTANCE */
 #include "cluster/storage/cluster_undo_block0_current.h"
@@ -65,6 +66,19 @@ tt_slot_file_offset(uint16 slot_offset)
 {
 	return (uint32)offsetof(UndoSegmentHeaderData, tt_slots)
 		   + (uint32)slot_offset * (uint32)sizeof(TTSlot);
+}
+
+/* The storage owner persists a sealed whole page even for a slot write.
+ * Mirror its checksum while the original content-X pin is still held, so
+ * the next lifecycle writer sees the same physical predecessor. */
+static void
+tt_slot_install_resident(UndoSegmentHeaderData *resident, uint16 slot_offset,
+						 const TTSlot *successor)
+{
+	memcpy(&resident->tt_slots[slot_offset], successor, sizeof(*successor));
+	if (!cluster_undo_segment_header_seal(resident))
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cannot seal canonical TT resident header")));
 }
 
 /*
@@ -638,8 +652,7 @@ cluster_tt_slot_durable_publish_active(const ClusterTTSlotCurrentOwner *expected
 								errmsg("cannot write canonical ACTIVE TT slot")));
 			}
 			cluster_tt_durable_io_wait_end();
-			memcpy(&resident_header->tt_slots[expected_owner->slot_offset], &successor,
-				   sizeof(successor));
+			tt_slot_install_resident(resident_header, expected_owner->slot_offset, &successor);
 		}
 
 		if (!(target_side ? cluster_semantic_activation_resolve_shared_undo_root(
@@ -1282,7 +1295,7 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation, uin
 								errmsg("cannot write canonical terminal TT slot")));
 			}
 			cluster_tt_durable_io_wait_end();
-			memcpy(&resident_header->tt_slots[slot_offset], &successor, sizeof(successor));
+			tt_slot_install_resident(resident_header, slot_offset, &successor);
 		}
 
 		memset(&final_root, 0, sizeof(final_root));
@@ -1387,6 +1400,15 @@ cluster_tt_slot_durable_commit_apply(XLogRecPtr commit_end)
 	if (!stage->armed)
 		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("no canonical TT commit stamp is staged for this commit record")));
+	/* The native checkpoint wait ignores processes without a valid VXID.
+	 * Recovery executors must use their separately captured stamp window. */
+	if (MyProc == NULL || !LocalTransactionIdIsValid(MyProc->lxid) || CritSectionCount == 0
+		|| (MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0)
+		ereport(PANIC,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("canonical TT commit stamp has no native checkpoint protection"),
+				 errhint("Apply the ordinary commit stamp inside its transaction's checkpoint "
+						 "delay window, after flushing the commit record.")));
 	if (XLogRecPtrIsInvalid(commit_end) || GetFlushRecPtr(NULL) < commit_end)
 		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("canonical TT commit stamp would precede its commit record"),
@@ -1413,7 +1435,7 @@ cluster_tt_slot_durable_commit_apply(XLogRecPtr commit_end)
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not write canonical TT commit stamp of undo segment %u: %m",
 							   stage->segment_id)));
-	memcpy(&resident->tt_slots[stage->slot_offset], &stage->successor, sizeof(TTSlot));
+	tt_slot_install_resident(resident, stage->slot_offset, &stage->successor);
 	cluster_undo_block0_unpin(&stage->pin);
 	tt_commit_stage_clear(stage);
 	cluster_tt_durable_count_commit();
@@ -1484,6 +1506,15 @@ cluster_tt_slot_durable_abort(uint32 segment_id, uint16 slot_offset, Transaction
 	uint32 off = tt_slot_file_offset(slot_offset);
 	TTSlot slot;
 
+	/* This legacy raw-xid writer clears the undo head and has no exact
+	 * generation, top/base, or recovery-source proof. Shared recovery must
+	 * use the qualified typed transition, never this local compatibility path. */
+	if (cluster_shared_config)
+		ereport(
+			ERROR,
+			(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+			 errmsg("legacy TT abort cannot supply shared recovery proof"),
+			 errhint("Preserve the original DATA and WAL for exact shared transaction recovery.")));
 	Assert(slot_offset < TT_SLOTS_PER_SEGMENT);
 	Assert(TransactionIdIsValid(xid));
 

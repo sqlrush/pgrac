@@ -20,6 +20,7 @@ typedef struct ClusterWalInputV1 {
 	ClusterControlRootSnapshot checkpoint;
 	XLogRecPtr checkpoint_start;
 	XLogRecPtr native_redo;
+	CheckPoint native_checkpoint; /* complete original immutable-anchor input */
 	/* Only the terminal alternative uses these fields. It has no checkpoint. */
 	XLogRecPtr first_segment;
 	ClusterWalStartupObservation terminal;
@@ -69,6 +70,46 @@ extern ClusterControlRootResult cluster_wal_inputs_begin_v1(const uint8 storage_
 extern ClusterControlRootResult cluster_wal_inputs_cold_begin_v1(const uint8 storage_uuid[16],
 																 uint64 system_identifier,
 																 ClusterWalInputsV1 **out);
+struct ClusterRecoveryStartV1;
+struct ClusterColdTopTxCensusEntryV1;
+struct ClusterRecoveryTTAbortV1;
+/* Post-EOR Startup only, bound to its original installed-writer start resource
+ * and an exact original ACTIVE census entry. Reacquire all original ROOT
+ * inputs and WALR read pins; reject another cut or changed subject/start.
+ * The caller's ResourceOwner remains current through release. Suspend/resume
+ * rechecks the start and input version as well as ROOT. Retained-only: OPEN
+ * visitation still waits, and live writer/flush/retirement APIs stay refused.
+ * This grants no loser, C0, checkpoint, DATA or reclamation authority. */
+extern ClusterControlRootResult cluster_wal_inputs_begin_tx_closure_v1(
+	const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject, ClusterWalInputsV1 **out);
+/* Exact current C0 candidate only, inside the original TX_CLOSURE read scope.
+ * Resolve through the shared undo namespace without borrowing a redo duty.
+ * This provisional path grants no write authority: retain target exclusion
+ * and revalidate the whole source ROOT before and after descriptor I/O. */
+extern bool cluster_wal_inputs_tx_abort_path_v1(ClusterWalInputsV1 *inputs,
+	const struct ClusterRecoveryTTAbortV1 *record, char *out, size_t out_size);
+/* Local scope/candidate checks only; no ROOT read or new permission. The
+ * caller still revalidates the whole selected input outside native locks. */
+extern bool cluster_wal_inputs_tx_abort_current_v1(ClusterWalInputsV1 *inputs,
+	const struct ClusterRecoveryTTAbortV1 *record);
+
+/* Startup in recovery, under the caller's existing execution WALR retention
+ * owner. Select one exact CLOSED/RECOVERY_REQUIRED/RECOVERY_COMPLETE checkpoint
+ * from the original whole ROOT, validate its native anchor and physical claim,
+ * and recheck ROOT after claim I/O outside CF. Acquires no WALR scope or recovery
+ * permission. The caller must revalidate its original execution owner before
+ * and after the call; output is provisional metadata, never an endpoint proof. */
+extern ClusterControlRootResult cluster_wal_inputs_cold_checkpoint_v1(
+	const ClusterControlRootSnapshot *expected, const ClusterControlRootFileToken *root_token,
+	ClusterWalRecoveryCheckpointV1 *out);
+/* Original execution owner only; sync exact retained WAL/claim/namespace and
+ * reselect the same native checkpoint and whole ROOT after I/O outside CF.
+ * Acquires no scope and grants no endpoint or recovery authority. */
+extern ClusterControlRootResult
+cluster_wal_inputs_cold_sync_v1(const ClusterControlRootSnapshot *expected,
+								const ClusterControlRootFileToken *root_token,
+								ClusterWalTailObservation *out);
 /* Metadata token of the whole selected ROOT, not a publication capability.
  * Like at_v1, this requires the same live scope/owner; call revalidate_v1
  * before consuming provisional results. Invalid scopes produce no token. */
@@ -165,6 +206,26 @@ extern ClusterControlRootResult cluster_wal_inputs_census_v1(ClusterWalInputsV1 
 															 ClusterWalCensusVisitorV1 visitor,
 															 void *arg, uint64 *out_record_count,
 															 RfPageProofDetailV1 *out_detail);
+
+/* Cold-only, read-only enumeration of every selected source. completed is
+ * NULL before its physical visit and non-NULL after the original reader has
+ * verified its entire cut. Explicit empty initializer terminals also receive
+ * both callbacks; they are not missing participants. Each event is provisional
+ * until the complete census returns OK and the caller revalidates its scope.
+ * No callback may release or mutate the scope, apply effects or publish a
+ * completion. The caller must discard all additions on failure/ERROR. */
+typedef RfPageProofDetailV1 (*ClusterWalCensusSourceVisitorV1)(
+	const ClusterWalSourceRef *source, const RfContributorStreamCutV1 *cut,
+	const ClusterWalTailObservation *completed, void *arg);
+/* Requires the original startup cold scope. OPEN sources return WAIT before
+ * any callbacks; this does not request live writer sampling or borrow online
+ * PI/replay authority. The original physical, claim, ROOT, pin and final
+ * all-source checks remain mandatory. An empty callback list alone proves
+ * nothing about namespace coverage or recovery completion. */
+extern ClusterControlRootResult
+cluster_wal_inputs_cold_census_v1(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitorV1 visitor,
+								  ClusterWalCensusSourceVisitorV1 source_visitor, void *arg,
+								  uint64 *out_record_count, RfPageProofDetailV1 *out_detail);
 /* Local prior-executor retirement only. Consume original prior-exit evidence
  * and the ROOT-selected native INSTALL predecessor chain under this scope.
  * This does not prove DATA coverage, remove PI, or permit WAL reclamation. */

@@ -315,6 +315,73 @@ retained_preflight_rebuildable(void *arg pg_attribute_unused(), const RfOpcodeRo
 			   : RF_PAGE_PROOF_DETAIL_CLASS_UNKNOWN;
 }
 
+/*
+ * D1 read-only coverage census.  These are observations of native producer
+ * shapes, not retention or recovery proof.  In particular, a non-zero
+ * counter never authorizes dropping a WAL edge, and a parser failure is
+ * surfaced separately so callers cannot mistake an empty count for a
+ * complete producer scan.
+ */
+static void
+retained_native_effect_observe(RetainedCutWork *work, XLogReaderState *record)
+{
+	uint8 info;
+
+	if (XLogRecHasAnyBlockRefs(record))
+		return;
+	info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
+	if (XLogRecGetRmid(record) == RM_SMGR_ID) {
+		if (info == XLOG_SMGR_CREATE)
+			work->native_smgr_create_records++;
+		return;
+	}
+	if (XLogRecGetRmid(record) != RM_XACT_ID)
+		return;
+	switch (info & XLOG_XACT_OPMASK) {
+	case XLOG_XACT_INVALIDATIONS:
+		work->native_xact_invalidation_records++;
+		return;
+	case XLOG_XACT_ASSIGNMENT:
+		work->native_xact_assignment_records++;
+		return;
+	case XLOG_XACT_COMMIT:
+	case XLOG_XACT_COMMIT_PREPARED: {
+		xl_xact_parsed_commit parsed;
+
+		if (!ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)XLogRecGetData(record),
+							   XLogRecGetDataLen(record), &parsed)) {
+			work->native_effects_incomplete++;
+			return;
+		}
+		if (parsed.nstats > 0 || parsed.nabortstats > 0) {
+			work->native_dropped_stats_records++;
+			work->native_dropped_stats_items += (uint64)parsed.nstats;
+			work->native_dropped_stats_items += (uint64)parsed.nabortstats;
+		}
+		return;
+	}
+	case XLOG_XACT_ABORT:
+	case XLOG_XACT_ABORT_PREPARED: {
+		xl_xact_parsed_abort parsed;
+
+		/* ParseAbortRecord is intentionally used only after the bounded
+		 * shape check; it is a decoder, not a damage detector. */
+		if (!rf_side_xact_completion_shape_v1(record, false)) {
+			work->native_effects_incomplete++;
+			return;
+		}
+		ParseAbortRecord(XLogRecGetInfo(record), (xl_xact_abort *)XLogRecGetData(record), &parsed);
+		if (parsed.nstats > 0) {
+			work->native_dropped_stats_records++;
+			work->native_dropped_stats_items += (uint64)parsed.nstats;
+		}
+		return;
+	}
+	default:
+		return;
+	}
+}
+
 /* Field comparison: the reference has trailing padding. */
 static bool
 retained_source_equal(const ClusterWalSourceRef *a, const ClusterWalSourceRef *b)
@@ -380,6 +447,7 @@ retained_record(XLogReaderState *record, const ClusterWalSourceRef *source,
 	detail = retained_classify(work, record, source, cut);
 	if (detail != RF_PAGE_PROOF_DETAIL_OK)
 		return work->detail = detail;
+	retained_native_effect_observe(work, record);
 	ops.preflight_side_record = retained_preflight_side_record;
 	ops.preflight_side_component = retained_preflight_side_component;
 	ops.preflight_rebuildable_component = retained_preflight_rebuildable;
@@ -627,6 +695,12 @@ retained_census(RetainedCutWork *work, ClusterWalInputsV1 *inputs, const Cluster
 	out->dirty_buffers = work->dirty.dirty;
 	out->dirty_foreign = work->dirty.foreign;
 	out->dirty_unattributed = work->dirty.unattributed;
+	out->native_smgr_create_records = work->native_smgr_create_records;
+	out->native_xact_invalidation_records = work->native_xact_invalidation_records;
+	out->native_xact_assignment_records = work->native_xact_assignment_records;
+	out->native_dropped_stats_records = work->native_dropped_stats_records;
+	out->native_dropped_stats_items = work->native_dropped_stats_items;
+	out->native_effects_incomplete = work->native_effects_incomplete;
 	retained_unneeded(work, inputs, out);
 	if (out->pin == CLUSTER_WAL_RETAINED_PIN_STRUCTURE)
 		retained_structure_pins++;
@@ -689,7 +763,8 @@ retained_dirty_merge_presync(ClusterPageWalDirtyFloorV1 *dirty)
 
 ClusterControlRootResult
 cluster_wal_retained_cut_compute_v1(const ClusterWalSourceRef *self, ClusterWalRetainedCutV1 *out,
-									RfPageProofDetailV1 *detail)
+									RfPageProofDetailV1 *detail,
+									ClusterWalRetainedCutDiagnosticsV1 *diagnostics)
 {
 	ClusterWalInputsV1 *inputs = NULL;
 	RetainedCutWork *work;
@@ -697,6 +772,8 @@ cluster_wal_retained_cut_compute_v1(const ClusterWalSourceRef *self, ClusterWalR
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
+	if (diagnostics != NULL)
+		memset(diagnostics, 0, sizeof(*diagnostics));
 	if (detail != NULL)
 		*detail = RF_PAGE_PROOF_DETAIL_OK;
 	if (self == NULL || out == NULL || detail == NULL
@@ -720,9 +797,13 @@ cluster_wal_retained_cut_compute_v1(const ClusterWalSourceRef *self, ClusterWalR
 	PG_TRY();
 	{
 		result = retained_census(work, inputs, self, out, detail);
+		if (diagnostics != NULL)
+			diagnostics->native_effects_incomplete = work->native_effects_incomplete;
 	}
 	PG_CATCH();
 	{
+		if (diagnostics != NULL)
+			diagnostics->native_effects_incomplete = work->native_effects_incomplete;
 		retained_work_release(work, &inputs);
 		pfree(work);
 		PG_RE_THROW();
@@ -806,14 +887,21 @@ retained_report_readings(const ClusterWalRetainedCutV1 *cut, ClusterControlRootR
 			 "result %d, %llu records, %llu history edges, %llu needed, spool %llu "
 			 "bytes, census %lld ms, publication %lld ms, local PI floor %X/%X "
 			 "(%llu bounded, %llu unbounded, %llu pending), dirty floor %X/%X (%u "
-			 "buffers, %u foreign, %u unattributed), %u older generations unneeded.",
+			 "buffers, %u foreign, %u unattributed), native effects (CREATE %llu, "
+			 "INVAL %llu, ASSIGN %llu, dropped-stats %llu/%llu, incomplete %u), "
+			 "%u older generations unneeded.",
 			 (int)result, (unsigned long long)cut->records, (unsigned long long)cut->history_edges,
 			 (unsigned long long)cut->retained_edges, (unsigned long long)cut->spool_bytes,
 			 (long long)(census_us / 1000), (long long)(publication_us / 1000),
 			 LSN_FORMAT_ARGS(cut->local_pi_floor), (unsigned long long)cut->local_pi_bounded,
 			 (unsigned long long)cut->local_pi_unbounded, (unsigned long long)cut->local_pi_pending,
 			 LSN_FORMAT_ARGS(cut->dirty_floor), cut->dirty_buffers, cut->dirty_foreign,
-			 cut->dirty_unattributed, cut->unneeded_generations)));
+			 cut->dirty_unattributed, (unsigned long long)cut->native_smgr_create_records,
+			 (unsigned long long)cut->native_xact_invalidation_records,
+			 (unsigned long long)cut->native_xact_assignment_records,
+			 (unsigned long long)cut->native_dropped_stats_records,
+			 (unsigned long long)cut->native_dropped_stats_items, cut->native_effects_incomplete,
+			 cut->unneeded_generations)));
 }
 
 void
@@ -831,7 +919,7 @@ cluster_wal_retained_cut_after_checkpoint_v1(void)
 		|| !cluster_wal_thread_current_v2_ref(&self))
 		return;
 	started = GetCurrentTimestamp();
-	result = cluster_wal_retained_cut_compute_v1(&self, &cut, &detail);
+	result = cluster_wal_retained_cut_compute_v1(&self, &cut, &detail, NULL);
 	censused = GetCurrentTimestamp();
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && cut.lower > cut.old_lower)
 		result = cluster_control_root_v3_retained_lower_publish(

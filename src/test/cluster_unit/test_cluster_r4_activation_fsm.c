@@ -24,6 +24,7 @@
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_control_root.h" /* bit22 (G3 accessor test) */
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_replacement_wire.h"
 #include "cluster/cluster_semantic_activation.h"
@@ -165,8 +166,18 @@ static uint8 test_terminal_peer_root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
 static bool test_stop_real_observation;
 bool cluster_shared_config;
 static ClusterWalSourceRef test_first_writer;
-static bool test_first_writer_installed, test_first_writer_initialized;
+static bool test_first_writer_installed, test_first_writer_initialized, test_first_writer_recovered;
 static uint64 test_first_writer_epoch;
+static bool test_recovered_checkpoint_observed;
+static ClusterRecoveryCheckpointObservationV1 test_recovered_checkpoint;
+static ClusterRecoveryTxResultObservationV1 test_recovered_tx_result;
+static bool test_recovered_tx_available;
+static bool test_recovered_tx_change_after_read;
+static ClusterRecoveryCtrcResultObservationV1 test_recovered_ctrc_result;
+static bool test_recovered_ctrc_available, test_recovered_ctrc_change_after_read;
+static unsigned test_recovered_checkpoint_observe_calls;
+static unsigned test_recovery_tx_accept_calls;
+static bool test_recovered_checkpoint_fail_after_first;
 static int test_first_live_checks;
 static ClusterControlRootResult test_first_live_result;
 
@@ -185,6 +196,47 @@ cluster_wal_thread_initialized_writer_matches(const ClusterWalSourceRef *expecte
 	return test_first_writer_installed && test_first_writer_initialized
 		   && epoch == test_first_writer_epoch
 		   && memcmp(expected, &test_first_writer, sizeof(*expected)) == 0;
+}
+
+bool
+cluster_recovery_checkpoint_observe_v1(ClusterRecoveryCheckpointObservationV1 *out)
+{
+	if (out == NULL || !test_recovered_checkpoint_observed)
+		return false;
+	++test_recovered_checkpoint_observe_calls;
+	if (test_recovered_checkpoint_fail_after_first
+		&& test_recovered_checkpoint_observe_calls > 1)
+		return false;
+	*out = test_recovered_checkpoint;
+	return true;
+}
+
+bool
+cluster_recovery_tx_result_accept_v1(void)
+{
+	test_recovery_tx_accept_calls++;
+	return false;
+}
+
+bool
+cluster_recovery_tx_result_observe_accepted_v1(ClusterRecoveryTxResultObservationV1 *out)
+{
+	if (out == NULL || !test_recovered_tx_available)
+		return false;
+	*out = test_recovered_tx_result;
+	if (test_recovered_tx_change_after_read)
+		test_recovered_tx_result.result.result_generation++;
+	return true;
+}
+
+bool
+cluster_recovery_ctrc_result_observe_v1(ClusterRecoveryCtrcResultObservationV1 *out)
+{
+	if (out == NULL || !test_recovered_ctrc_available) return false;
+	*out = test_recovered_ctrc_result;
+	if (test_recovered_ctrc_change_after_read)
+		test_recovered_ctrc_result.result.result_generation++;
+	return true;
 }
 
 ClusterControlRootResult
@@ -1258,6 +1310,16 @@ test_gate_reset(void)
 	test_capability_missing_bitmap = 0;
 	memset(&test_normal_start_completion, 0, sizeof(test_normal_start_completion));
 	test_normal_start_found = false;
+	memset(&test_first_writer, 0, sizeof(test_first_writer));
+	test_first_writer_installed = false;
+	test_first_writer_initialized = false;
+	test_first_writer_recovered = false;
+	test_first_writer_epoch = 0;
+	test_recovered_checkpoint_observed = false;
+	test_recovered_checkpoint_observe_calls = 0;
+	test_recovery_tx_accept_calls = 0;
+	test_recovered_checkpoint_fail_after_first = false;
+	memset(&test_recovered_checkpoint, 0, sizeof(test_recovered_checkpoint));
 	test_serving_found = false;
 	test_serving_formation_valid = false;
 	test_serving_formation = 2;
@@ -9350,6 +9412,234 @@ UT_TEST(test_normal_start_existing_other_is_not_target_completion)
 	UT_ASSERT_EQ(cluster_semantic_normal_start_state(), 5);
 }
 
+static void
+ut_normal_start_recovered_owner_setup(ClusterSemanticActivationRecord *open,
+								  ClusterSemanticActivationAckTableV1 *table)
+{
+	uint64 owner_boot;
+
+	ut_normal_start_setup();
+	test_system_identifier = UINT64_C(0x8070605040302010);
+	NormalStartCompletion->system_identifier = test_system_identifier;
+	memcpy(NormalStartCompletion->pgrd, test_normal_pgrd_bytes,
+		   sizeof(test_normal_pgrd_bytes));
+	cluster_shared_config = true;
+	test_current_epoch = 9;
+	test_serving_formation_valid = true;
+	test_serving_formation = 9;
+	test_clean_admitted = true;
+
+	memset(open, 0, sizeof(*open));
+	open->transition_epoch = 8;
+	memset(table, 0, sizeof(*table));
+	table->transition_epoch = 9;
+	pg_atomic_write_u32(&NormalStartCompletion->state, CLUSTER_NORMAL_START_EXISTING_OTHER);
+
+	test_recovered_checkpoint_observed = true;
+	test_recovered_checkpoint_observe_calls = 0;
+	test_recovered_checkpoint_fail_after_first = false;
+	test_recovered_checkpoint.slot_generation = 1;
+	owner_boot = cluster_qvotec_get_self_incarnation();
+	test_recovered_checkpoint.owner.owner_boot = owner_boot;
+	test_recovered_checkpoint.owner.owner_pid = MyProcPid;
+	test_recovered_checkpoint.owner.writer.epoch = 9;
+	test_recovered_checkpoint.owner.writer.ref.claim.identity.system_identifier
+		= test_system_identifier;
+	test_recovered_checkpoint.owner.writer.ref.claim.identity.origin_node_id = cluster_node_id;
+	test_recovered_checkpoint.owner.writer.ref.claim.identity.origin_thread_id = cluster_node_id + 1;
+	test_recovered_checkpoint.owner.writer.ref.claim.identity.origin_owner_incarnation = owner_boot;
+	test_first_writer = test_recovered_checkpoint.owner.writer.ref;
+	test_first_writer_installed = true;
+	test_first_writer_recovered = true;
+	test_first_writer_epoch = 9;
+	memset(&test_recovered_tx_result, 0, sizeof(test_recovered_tx_result));
+	test_recovered_tx_result.checkpoint = test_recovered_checkpoint;
+	test_recovered_tx_result.result.state = CLUSTER_RECOVERY_TX_RESULT_COMPLETE;
+	test_recovered_tx_result.result.result_generation = 1;
+	test_recovered_tx_available = true;
+	test_recovered_tx_change_after_read = false;
+	memset(&test_recovered_ctrc_result, 0, sizeof(test_recovered_ctrc_result));
+	test_recovered_ctrc_result.checkpoint = test_recovered_checkpoint;
+	test_recovered_ctrc_result.result.state = CLUSTER_RECOVERY_CTRC_RESULT_COMPLETE;
+	test_recovered_ctrc_result.result.result_generation = 1;
+	memcpy(test_recovered_ctrc_result.result.input_root_sha256,
+		test_recovered_tx_result.result.input_root_sha256, 32);
+	test_recovered_ctrc_available = true;
+	test_recovered_ctrc_change_after_read = false;
+	for (int node = 0; node < 4; node++)
+		table->expected[node].admitted_incarnation
+			= cluster_membership_get_last_admitted_incarnation(node);
+}
+
+UT_TEST(test_recovered_service_consumes_accepted_tx_component)
+{
+	ClusterSemanticActivationRecord open;
+	ClusterSemanticActivationAckTableV1 table;
+
+	ut_normal_start_recovered_owner_setup(&open, &table);
+	UT_ASSERT(normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+	/* A recovered checkpoint alone must not match the new service episode. */
+	test_recovered_tx_available = false;
+	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+	test_recovered_tx_available = true;
+	test_recovered_tx_result.result.state = CLUSTER_RECOVERY_TX_RESULT_PENDING;
+	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+	ut_normal_start_recovered_owner_setup(&open, &table);
+	test_recovered_tx_result.checkpoint.slot_generation++;
+	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+	ut_normal_start_recovered_owner_setup(&open, &table);
+	test_recovered_tx_change_after_read = true;
+	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+	ut_normal_start_recovered_owner_setup(&open, &table);
+	UT_ASSERT(normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+}
+
+UT_TEST(test_recovered_service_consumes_independent_ctrc_completion)
+{
+	ClusterSemanticActivationRecord open;
+	ClusterSemanticActivationAckTableV1 table;
+	for (unsigned fault = 0; fault < 5; fault++) {
+		ut_normal_start_recovered_owner_setup(&open, &table);
+		if (fault == 0) test_recovered_ctrc_available = false;
+		if (fault == 1) test_recovered_ctrc_result.result.state = CLUSTER_RECOVERY_CTRC_RESULT_PENDING;
+		if (fault == 2) test_recovered_ctrc_result.checkpoint.slot_generation++;
+		if (fault == 3) test_recovered_ctrc_result.result.input_root_sha256[0] ^= 1;
+		if (fault == 4) test_recovered_ctrc_change_after_read = true;
+		UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+	}
+	ut_normal_start_recovered_owner_setup(&open, &table);
+	UT_ASSERT(normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+}
+
+UT_TEST(test_normal_start_recovered_owner_observation_accepts_exact_binding)
+{
+	ClusterSemanticActivationRecord open;
+	ClusterSemanticActivationAckTableV1 table;
+
+	ut_normal_start_recovered_owner_setup(&open, &table);
+	UT_ASSERT(normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+}
+
+UT_TEST(test_recovered_prepare_supplies_service_binding_input)
+{
+	ClusterSemanticActivationRecord open;
+	ClusterSemanticActivationAckTableV1 table;
+	const char *failure;
+
+	ut_normal_start_recovered_owner_setup(&open, &table);
+	/* Use the real producer, rather than the hand-filled consumer payload. */
+	memset(NormalStartCompletion, 0, sizeof(*NormalStartCompletion));
+	pg_atomic_init_u32(&NormalStartCompletion->state, CLUSTER_NORMAL_START_UNCLASSIFIED);
+	UT_ASSERT(cluster_semantic_normal_start_prepare(false, 0, &failure));
+	UT_ASSERT_EQ(cluster_semantic_normal_start_state(), CLUSTER_NORMAL_START_EXISTING_OTHER);
+	UT_ASSERT_EQ(NormalStartCompletion->system_identifier, test_system_identifier);
+	UT_ASSERT_EQ(NormalStartCompletion->node_id, cluster_node_id);
+	UT_ASSERT_EQ(NormalStartCompletion->boot_incarnation, cluster_qvotec_get_self_incarnation());
+	UT_ASSERT_EQ(NormalStartCompletion->epoch, test_current_epoch);
+	UT_ASSERT_EQ(memcmp(NormalStartCompletion->pgrd, test_normal_pgrd_bytes, 512), 0);
+	UT_ASSERT(normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+}
+
+UT_TEST(test_recovered_prepare_requires_original_pgrd)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		ClusterSemanticActivationRecord open;
+		ClusterSemanticActivationAckTableV1 table;
+		const char *failure;
+
+		ut_normal_start_recovered_owner_setup(&open, &table);
+		memset(NormalStartCompletion, 0, sizeof(*NormalStartCompletion));
+		pg_atomic_init_u32(&NormalStartCompletion->state, CLUSTER_NORMAL_START_UNCLASSIFIED);
+		if (fault == 0)
+			test_normal_pgrd_state = CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
+		if (fault == 1)
+			test_pgrd_candidate_state = CLUSTER_UNDO_SMGR_ROOT_MIRROR_ABSENT;
+		if (fault == 2)
+			test_pgrd_candidate[40] ^= 1;
+		UT_ASSERT(!cluster_semantic_normal_start_prepare(false, 0, &failure));
+		UT_ASSERT_EQ(cluster_semantic_normal_start_state(), CLUSTER_NORMAL_START_FAILED);
+	}
+}
+
+UT_TEST(test_normal_start_recovered_owner_observation_fails_closed_without_observation)
+{
+	ClusterSemanticActivationRecord open;
+	ClusterSemanticActivationAckTableV1 table;
+
+	ut_normal_start_recovered_owner_setup(&open, &table);
+	test_recovered_checkpoint_observed = false;
+	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+}
+
+UT_TEST(test_normal_start_recovered_owner_observation_rejects_foreign_system)
+{
+	ClusterSemanticActivationRecord open;
+	ClusterSemanticActivationAckTableV1 table;
+
+	ut_normal_start_recovered_owner_setup(&open, &table);
+	test_recovered_checkpoint.owner.writer.ref.claim.identity.system_identifier
+		^= UINT64_C(1);
+	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+}
+
+UT_TEST(test_normal_start_recovered_owner_observation_rejects_invalid_local_node)
+{
+	ClusterSemanticActivationRecord open;
+	ClusterSemanticActivationAckTableV1 table;
+	int saved_node = cluster_node_id;
+
+	ut_normal_start_recovered_owner_setup(&open, &table);
+	cluster_node_id = -1;
+	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+	cluster_node_id = CLUSTER_MAX_NODES;
+	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+	cluster_node_id = saved_node;
+}
+
+UT_TEST(test_normal_start_recovered_owner_observation_rechecks_after_formation)
+{
+	ClusterSemanticActivationRecord open;
+	ClusterSemanticActivationAckTableV1 table;
+
+	ut_normal_start_recovered_owner_setup(&open, &table);
+	test_recovered_checkpoint_fail_after_first = true;
+	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+	UT_ASSERT(test_recovered_checkpoint_observe_calls > 1);
+}
+
+UT_TEST(test_normal_start_recovered_owner_equal_epoch_does_not_use_fast_path)
+{
+	ClusterSemanticActivationRecord open;
+	ClusterSemanticActivationAckTableV1 table;
+
+	ut_normal_start_recovered_owner_setup(&open, &table);
+	table.transition_epoch = open.transition_epoch;
+	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+}
+
+UT_TEST(test_normal_start_recovered_open_consumer_requires_completed_root)
+{
+	ClusterSemanticActivationRecord open;
+	ClusterSemanticActivationAckTableV1 table;
+
+	ut_normal_start_recovered_owner_setup(&open, &table);
+	/* The durable record is read after the recovered-start state is entered. */
+	ut_a142_open_bytes(test_r4fsm_bootstrap_bytes, 0);
+	memcpy(SemanticActivationAckTable, &table, sizeof(table));
+	pg_atomic_write_u64(&SemanticActivationAckTable->publication_seq, 0);
+	/* Historical OPEN plus an INSTALL observation is not serving completion. */
+	UT_ASSERT(!cluster_semantic_activation_recovered_open_current());
+
+	/* A non-OPEN durable phase must never satisfy the downstream consumer. */
+	ut_a142_open_bytes(test_r4fsm_bootstrap_bytes, 1);
+	UT_ASSERT(!cluster_semantic_activation_recovered_open_current());
+
+	/* An implicit-zero source is not a recovered OPEN record. */
+	memset(test_r4fsm_bootstrap_bytes, 0, sizeof(test_r4fsm_bootstrap_bytes));
+	test_r4fsm_bootstrap_implicit_open = true;
+	UT_ASSERT(!cluster_semantic_activation_recovered_open_current());
+}
+
 UT_TEST(test_normal_start_capture_drift_and_wrong_writer_refuse)
 {
 	const char *failure;
@@ -10265,6 +10555,68 @@ UT_TEST(test_a142_clean_start_observation_is_not_rearmable)
 	cluster_semantic_activation_note_clean_start(true);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&test_semantic_clean_start), 2);
 	test_gate_reset();
+}
+
+UT_TEST(test_restart_retains_clean_source_in_original_round)
+{
+	ut_a142_setup(0);
+	UT_ASSERT(semantic_activation_restart_current());
+	UT_ASSERT_EQ(semantic_activation_restart.source, CLUSTER_SEMANTIC_RESTART_SOURCE_CLEAN);
+	test_gate_reset();
+}
+
+UT_TEST(test_restart_classifies_recovered_owner_without_manufacturing_ready)
+{
+	for (unsigned variant = 0; variant < 3; variant++) {
+		ClusterSemanticActivationRecord open;
+		ClusterSemanticActivationAckTableV1 table;
+		ut_normal_start_recovered_owner_setup(&open, &table);
+		NormalStartCompletion->node_id = cluster_node_id;
+		NormalStartCompletion->epoch = test_current_epoch;
+		NormalStartCompletion->boot_incarnation = cluster_qvotec_get_self_incarnation();
+		cluster_semantic_activation_note_clean_start(false);
+		test_restart_unclean = true;
+		MyAuxProcType = LmonProcess;
+		IsUnderPostmaster = true;
+		if (variant == 1)
+			test_recovered_checkpoint_observed = false;
+		if (variant == 2)
+			pg_atomic_write_u32(SemanticActivationCleanStart, 1); /* Own old WAL was clean. */
+		/* INSTALL identifies the source; complete service results are separate. */
+		UT_ASSERT(!semantic_activation_restart_current());
+		UT_ASSERT_EQ(semantic_activation_restart.source,
+			variant == 1 ? CLUSTER_SEMANTIC_RESTART_SOURCE_NONE
+				: CLUSTER_SEMANTIC_RESTART_SOURCE_RECOVERED);
+		UT_ASSERT_EQ(pg_atomic_read_u32(SemanticActivationCleanStart), variant == 2 ? 1 : 2);
+		UT_ASSERT(!semantic_activation_restart.requested && !semantic_activation_restart.opened);
+		/* Reuse the exact captured historical OPEN as a round input only. */
+		ut_a142_open_bytes(NormalStartCompletion->pgsa, 0);
+		UT_ASSERT(cluster_semantic_activation_record_decode(NormalStartCompletion->pgsa,
+			&open, NULL));
+		UT_ASSERT_EQ(normal_start_record_matches(&open), variant != 1);
+		open.record_generation++;
+		UT_ASSERT(!normal_start_record_matches(&open));
+		/* An exact PREPARE/COMMIT input is still owned by the original FSM. */
+		ut_a142_open_bytes(NormalStartCompletion->pgsa, 1);
+		UT_ASSERT(cluster_semantic_activation_record_decode(NormalStartCompletion->pgsa,
+			&open, NULL));
+		UT_ASSERT(!normal_start_record_matches(&open));
+		test_gate_reset();
+	}
+}
+
+UT_TEST(test_lmon_collects_original_tx_result_while_recovered_open_is_pending)
+{
+	ut_a142_setup(0);
+	cluster_semantic_activation_note_clean_start(false);
+	test_restart_unclean = true;
+	MyAuxProcType = LmonProcess;
+	IsUnderPostmaster = true;
+	test_recovery_tx_accept_calls = 0;
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT_EQ(test_recovery_tx_accept_calls, 1);
+	UT_ASSERT(!semantic_activation_restart.requested && !semantic_activation_restart.opened);
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_u32(TEST_GATE_CLOSED_OFFSET)), 1);
 }
 
 UT_TEST(test_a142_unsafe_or_missing_startup_never_requests_open)
@@ -11428,7 +11780,7 @@ static void test_serving_finish_root(void);
 int
 main(void)
 {
-	UT_PLAN(386);
+	UT_PLAN(403);
 	UT_RUN(test_member_commit_gap_before_all_peer_receipts);
 	UT_RUN(test_member_commit_request_waits_for_real_predecessor_receipts);
 	UT_RUN(test_member_commit_request_rejects_old_or_changed_identity);
@@ -11479,6 +11831,7 @@ main(void)
 	UT_RUN(test_normal_start_pending_ack_does_not_reuse_root_after_valid_mirror_drift);
 	UT_RUN(test_normal_start_confirmed_new_root_permanently_rejects_old_completion);
 	UT_RUN(test_normal_actual_own_wal_capture_not_peer_control);
+	UT_RUN(test_normal_actual_online_checkpoint_invalid_is_not_replaced);
 	UT_RUN(test_normal_actual_prepare_uses_all_original_clean_inputs);
 	UT_RUN(test_normal_actual_postjobs_exclude_shared_legacy_page_rollback);
 	UT_RUN(test_normal_actual_finish_requires_cf_and_hw_and_keeps_disk_history);
@@ -11778,6 +12131,19 @@ main(void)
 	UT_RUN(test_normal_start_bad_identity_and_debt_never_load);
 	UT_RUN(test_normal_start_incomplete_or_changed_root_is_sticky);
 	UT_RUN(test_normal_start_existing_other_is_not_target_completion);
+	UT_RUN(test_normal_start_recovered_owner_observation_accepts_exact_binding);
+	UT_RUN(test_recovered_prepare_supplies_service_binding_input);
+	UT_RUN(test_recovered_service_consumes_accepted_tx_component);
+	UT_RUN(test_recovered_service_consumes_independent_ctrc_completion);
+	UT_RUN(test_recovered_prepare_requires_original_pgrd);
+	UT_RUN(test_normal_start_recovered_owner_observation_fails_closed_without_observation);
+	UT_RUN(test_normal_start_recovered_owner_observation_rejects_foreign_system);
+	UT_RUN(test_normal_start_recovered_owner_observation_rejects_invalid_local_node);
+	UT_RUN(test_normal_start_recovered_owner_observation_rechecks_after_formation);
+	UT_RUN(test_normal_start_recovered_owner_equal_epoch_does_not_use_fast_path);
+	UT_RUN(test_normal_start_recovered_open_consumer_requires_completed_root);
+	UT_RUN(test_recovered_readers_consume_original_serving_completion);
+	UT_RUN(test_recovered_readers_reject_changed_serving_cut);
 	UT_RUN(test_normal_start_capture_drift_and_wrong_writer_refuse);
 	UT_RUN(test_normal_start_identity_rechecked_after_real_root_read);
 	UT_RUN(test_normal_start_bootstrap_requires_strict_source_at_entry_and_recheck);
@@ -11785,6 +12151,9 @@ main(void)
 	UT_RUN(test_normal_start_closed_modes_block_regular_and_terminal_census);
 	UT_RUN(test_normal_start_publish_and_legacy_sync_cannot_bypass_mode);
 	UT_RUN(test_a142_clean_start_observation_is_not_rearmable);
+	UT_RUN(test_restart_retains_clean_source_in_original_round);
+	UT_RUN(test_restart_classifies_recovered_owner_without_manufacturing_ready);
+	UT_RUN(test_lmon_collects_original_tx_result_while_recovered_open_is_pending);
 	UT_RUN(test_a142_unsafe_or_missing_startup_never_requests_open);
 	UT_RUN(test_a142_wrong_durable_phase_member_or_old_boot_stays_closed);
 	UT_RUN(test_a142_root_mismatch_cannot_emit_a_self_ack);

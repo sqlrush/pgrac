@@ -60,6 +60,8 @@
 #include "cluster/cluster_wal_state.h" /* spec-4.2 ensure() */
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_writer.h"
+#include "cluster/cluster_same_host_fence.h"
+#include "cluster/cluster_external_fence.h"
 #include "cluster_control_bootstrap_private.h"
 #include "cluster_control_root_private.h"
 #include "miscadmin.h" /* IsUnderPostmaster, DataDir */
@@ -101,6 +103,7 @@ typedef struct ClusterWalThreadShmemData {
 	ClusterWalThreadCheckpointSampleV1 checkpoint_sample;
 	uint64 initialized_writer_epoch; /* zero unless installed from never-served input */
 	uint64 clean_writer_epoch;		 /* zero unless installed from collective CLEAN exit */
+	uint64 recovered_writer_epoch;	 /* zero unless installed from RECOVERED input */
 } ClusterWalThreadShmemData;
 
 static ClusterWalThreadShmemData *cluster_wal_thread_shmem = NULL;
@@ -136,6 +139,7 @@ cluster_wal_thread_shmem_init(void)
 			   sizeof(cluster_wal_thread_shmem->checkpoint_sample));
 		cluster_wal_thread_shmem->initialized_writer_epoch = 0;
 		cluster_wal_thread_shmem->clean_writer_epoch = 0;
+		cluster_wal_thread_shmem->recovered_writer_epoch = 0;
 	}
 }
 
@@ -447,6 +451,18 @@ cluster_wal_thread_clean_writer_matches(const ClusterWalSourceRef *expected, uin
 }
 
 bool
+cluster_wal_thread_recovered_writer_matches(const ClusterWalSourceRef *expected, uint64 epoch)
+{
+	ClusterWalSourceRef current;
+	/* RECOVERED remains a distinct Startup input after OPEN. Its immutable
+	 * INSTALL epoch is only a qualification; callers still perform the live
+	 * membership and write-fence checks at the mutation boundary. */
+	return expected != NULL && epoch != 0 && cluster_wal_thread_current_v2_ref(&current)
+		   && cluster_wal_thread_shmem->recovered_writer_epoch == epoch
+		   && memcmp(expected, &current, sizeof(current)) == 0;
+}
+
+bool
 cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
 {
 	if (out == NULL)
@@ -512,7 +528,7 @@ cluster_wal_thread_install_startup(const ClusterWalStartupImage *expected)
 	ClusterWalSourceRef installed;
 	ClusterControlRootResult result;
 	uint32 state = 0;
-	uint64 initialized_epoch, clean_epoch;
+	uint64 initialized_epoch, clean_epoch, recovered_epoch;
 	if (expected == NULL || !cluster_enabled || !cluster_shared_config
 		|| cluster_wal_thread_shmem == NULL || !cluster_wal_thread_shmem->restart_ref_valid
 		|| !cluster_wal_thread_shmem->dir_validated)
@@ -522,6 +538,16 @@ cluster_wal_thread_install_startup(const ClusterWalStartupImage *expected)
 	result = cluster_control_root_v3_startup_install_writer(expected, &installed);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
+	/* RECOVERED must retain the selected physical owner through route setup;
+	 * a successful route alone cannot qualify a replacement incarnation. */
+	if (expected->input_kind == CLUSTER_WAL_STARTUP_RECOVERED
+		&& (expected->formation_epoch == 0
+			|| expected->claim.identity.origin_owner_incarnation == 0
+			|| installed.claim.identity.system_identifier
+				   != expected->claim.identity.system_identifier
+			|| installed.claim.identity.origin_owner_incarnation
+				   != expected->claim.identity.origin_owner_incarnation))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = cluster_control_bootstrap_wal_route(DataDir, cluster_wal_threads_dir, &installed);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
@@ -533,6 +559,20 @@ cluster_wal_thread_install_startup(const ClusterWalStartupImage *expected)
 	initialized_epoch
 		= expected->input_kind == CLUSTER_WAL_STARTUP_INITIALIZED ? expected->formation_epoch : 0;
 	clean_epoch = expected->input_kind == CLUSTER_WAL_STARTUP_CLEAN ? expected->formation_epoch : 0;
+	recovered_epoch = expected->input_kind == CLUSTER_WAL_STARTUP_RECOVERED ? expected->formation_epoch : 0;
+	/* Publish the actual postmaster identity before this process-local writer
+	 * becomes READY. Missing OS evidence leaves only this provider unavailable;
+	 * it must never fabricate historical identity on the recovery read path. */
+	if (cluster_same_host_fence_available()) {
+		ClusterSameHostKeyV1 key = { .system_identifier = installed.claim.identity.system_identifier,
+			.origin_node_id = (uint32)installed.claim.identity.origin_node_id,
+			.incarnation = installed.claim.identity.origin_owner_incarnation };
+
+		if (!cluster_external_fence_rejoin_protected_set_digest(key.protected_set_digest)
+			|| !cluster_same_host_fence_record_writer_v1(cluster_wal_threads_dir, &key, PostmasterPid))
+			ereport(WARNING, (errmsg("same-host process identity unavailable for writer origin %u incarnation " UINT64_FORMAT,
+									key.origin_node_id, key.incarnation)));
+	}
 	if (!pg_atomic_compare_exchange_u32(&cluster_wal_thread_shmem->writer_ref_state, &state, 1)) {
 		if (state != 2)
 			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
@@ -540,6 +580,7 @@ cluster_wal_thread_install_startup(const ClusterWalStartupImage *expected)
 		return memcmp(&installed, &cluster_wal_thread_shmem->v2_ref, sizeof(installed)) == 0
 					   && initialized_epoch == cluster_wal_thread_shmem->initialized_writer_epoch
 					   && clean_epoch == cluster_wal_thread_shmem->clean_writer_epoch
+					   && recovered_epoch == cluster_wal_thread_shmem->recovered_writer_epoch
 				   ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
 				   : CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	}
@@ -549,6 +590,7 @@ cluster_wal_thread_install_startup(const ClusterWalStartupImage *expected)
 	cluster_wal_thread_shmem->v2_ref = installed;
 	cluster_wal_thread_shmem->initialized_writer_epoch = initialized_epoch;
 	cluster_wal_thread_shmem->clean_writer_epoch = clean_epoch;
+	cluster_wal_thread_shmem->recovered_writer_epoch = recovered_epoch;
 	pg_write_barrier();
 	pg_atomic_write_u32(&cluster_wal_thread_shmem->writer_ref_state, 2);
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;

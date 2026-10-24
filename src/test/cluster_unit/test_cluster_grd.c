@@ -6992,6 +6992,57 @@ UT_TEST(test_recovery_authority_cold_start_before_serving)
 	UT_ASSERT(cluster_grd_recovery_authority_is_current(11, 7));
 }
 
+/* Exercise every local member of the cold-start cohort through the actual
+ * request/tick/DONE owners. Peer delivery is the transport boundary here;
+ * a missing or wrong composite must never substitute for the final member.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_recovery_authority_cold_four_node_cohort_requires_every_done)
+{
+	int saved_node = cluster_node_id;
+
+	for (int local = 0; local < 4; local++) {
+		ClusterFormationSnapshotV1 formation;
+		uint64 bitmap_hash;
+		int delivered = 0;
+
+		cluster_node_id = local;
+		setup_recovery_authority_four_node_fixture(&formation);
+		/* Keep this fixture distinct from the epoch-77 echo tests: the
+		 * production per-requester echo suppression survives shmem reset. */
+		formation.local_epoch = ut_mock_epoch = 177;
+		mock_lms_shard_master_generation = (UINT64_C(177) << 32) | 7;
+		formation.applied.new_epoch = 0;
+		formation.startup_formation_generation = 4;
+		bitmap_hash = cluster_grd_dead_bitmap_hash(formation.applied.dead_bitmap);
+		UT_ASSERT(bitmap_hash != 0);
+		ut_drive_authority_lmon_tick = true;
+		cluster_enabled = true;
+		UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(&formation, 11, 7, 10));
+		cluster_grd_recovery_authority_lmon_tick(); /* terminalize cancellation */
+		for (int peer = 0; peer < 4; peer++) {
+			bool complete;
+
+			if (peer == local)
+				continue;
+			cluster_grd_recovery_mark_peer_done(peer, formation.local_epoch - 1, bitmap_hash);
+			cluster_grd_recovery_mark_peer_done(peer, formation.local_epoch, bitmap_hash ^ 1);
+			UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(&formation, 11, 7, 10));
+			cluster_grd_recovery_authority_lmon_tick();
+			UT_ASSERT(!cluster_grd_recovery_authority_is_current(11, 7));
+			cluster_grd_recovery_mark_peer_done(peer, formation.local_epoch, bitmap_hash);
+			complete = ++delivered == 3;
+			UT_ASSERT_EQ(cluster_grd_recovery_authority_barrier_wait(&formation, 11, 7, 10),
+						 complete);
+			if (!complete)
+				cluster_grd_recovery_authority_lmon_tick();
+			UT_ASSERT_EQ(cluster_grd_recovery_authority_is_current(11, 7), complete);
+		}
+		ut_drive_authority_lmon_tick = false;
+		cluster_enabled = false;
+	}
+	cluster_node_id = saved_node;
+}
+
 UT_TEST(test_recovery_authority_rejects_missing_peer_or_unremastered_map)
 {
 	ClusterFormationSnapshotV1 formation;
@@ -7980,7 +8031,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(171);
+	UT_PLAN(172);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
 	UT_RUN(test_parallel_group_worker_cannot_wait_behind_blocked_ddl);
 	UT_RUN(test_parallel_group_convert_uses_original_holder_group);
@@ -8155,6 +8206,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_recovery_authority_lmon_tick_is_sole_blocking_executor);
 	UT_RUN(test_recovery_authority_initial_epoch_zero_is_valid);
 	UT_RUN(test_recovery_authority_cold_start_before_serving);
+	UT_RUN(test_recovery_authority_cold_four_node_cohort_requires_every_done);
 	UT_RUN(test_recovery_authority_done_echo_is_bounded_per_requester);
 	/* RF-ROOT P6 contract — same-composite re-post retains done slots;
 	 * composite-change re-post zeroes and requires fresh evidence. */

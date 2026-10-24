@@ -75,6 +75,7 @@
 #define XLOG_UNDO_TT_SLOT_CTRC_RELEASE 0xA0
 /* spec-5.7a D1 (§3.1a M1c; amend #3): HW relation-extend authority durable record. */
 #define XLOG_HW_RESERVE 0xB0 /* per-batch HWM advance, flushed before the master replies */
+#define XLOG_UNDO_RECOVERY_TT_ABORT 0xC0
 
 StaticAssertDecl((XLOG_UNDO_SEGMENT_INIT & XLR_INFO_MASK) == 0,
 				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
@@ -95,6 +96,8 @@ StaticAssertDecl((XLOG_UNDO_TT_SLOT_SET_HEAD & XLR_INFO_MASK) == 0,
 StaticAssertDecl((XLOG_UNDO_TT_SLOT_CTRC_RELEASE & XLR_INFO_MASK) == 0,
 				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
 StaticAssertDecl((XLOG_HW_RESERVE & XLR_INFO_MASK) == 0,
+				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
+StaticAssertDecl((XLOG_UNDO_RECOVERY_TT_ABORT & XLR_INFO_MASK) == 0,
 				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
 
 

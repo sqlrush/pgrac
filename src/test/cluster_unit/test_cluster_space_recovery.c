@@ -14,10 +14,12 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/storage/cluster_shared_fs.h"
 #include "cluster/cluster_page_wal.h"
 #include <unistd.h>
 
 #include "access/xlog.h"
+#include "access/xact.h"
 #include "access/twophase.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
@@ -28,6 +30,7 @@
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_wal_tail.h"
@@ -41,6 +44,7 @@
 #include "storage/bufmgr.h"
 #include "storage/buf_internals.h"
 #include "storage/smgr.h"
+#include "storage/md.h"
 #include "storage/checksum.h"
 #include "storage/checksum_impl.h"
 #include "utils/resowner.h"
@@ -56,6 +60,7 @@ int NBuffers = 2, NLocBuffer;
 char *BufferBlocks;
 Block *LocalBufferBlockPointers;
 bool cluster_enabled = true, cluster_shared_config = true;
+BackendType MyBackendType = B_BG_WRITER;
 static BufferDescPadded descriptors[2];
 BufferDescPadded *BufferDescriptors = descriptors;
 static PGAlignedBlock pages[2];
@@ -68,6 +73,7 @@ static ClusterRecoveryDutyKey duties[2];
 static ClusterControlRootSnapshot roots[2];
 static ClusterControlRootReadToken root_tokens[2];
 static ClusterThreadRecoveryAuthorityV1 sources[2];
+static ClusterWalSourceRef source_claims[2];
 static ClusterRecoverySerialGuard serials[2];
 AuxProcType MyAuxProcType = NotAnAuxProcess;
 static bool recovery = true, cold_current = true;
@@ -83,6 +89,39 @@ static bool source_unavailable;
 static unsigned pins, locks, writes, syncs, reads, lock_calls;
 static bool hw_held, permitted, stale, exists, corrupt_disk, structural, wrong_cut;
 static bool creating;
+static FILE *main_file;
+static bool main_exists, stale_after_main_create, stale_after_main_sync, hide_main_after_sync;
+static ClusterNormalStartState flush_start_state = CLUSTER_NORMAL_START_UNCLASSIFIED;
+static bool flush_recovered_open;
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return flush_start_state;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return flush_recovered_open;
+}
+static unsigned main_creates, main_syncs, create_source_syncs;
+static unsigned create_namespace_syncs[2];
+static int fail_create_namespace, stale_create_namespace;
+static bool wrong_create_backend;
+static bool fail_create_source_sync, wrong_create_source_sync;
+static unsigned source_sync_mask, required_source_sync_mask;
+static uint16 source_sync_fault_thread;
+static int source_sync_fault;
+static unsigned abort_deletes, abort_directory_syncs;
+static int abort_delete_fault, abort_directory_fault;
+static unsigned abort_finishes;
+static int abort_finish_fault;
+static unsigned abort_before_calls;
+static bool abort_second_target;
+static Size abort_plan_budget;
+static SMgrRelationData missing_relation;
+
 static BlockNumber existing_blocks;
 static unsigned creates, extensions, x_locks;
 static int fail_write_block;
@@ -93,7 +132,7 @@ int cluster_node_id;
 bool cluster_smart_fusion, cluster_past_image;
 ClusterPcmOwnEntry *ClusterPcmOwnArray;
 BufferUsage pgBufferUsage;
-static bool sf_blocked, stale_during_io, stale_after_write;
+static bool sf_blocked, stale_during_io, stale_after_write, stale_after_space_sync;
 static unsigned cold_truncates;
 static int cold_last_truncate_flags;
 static bool fail_cold_truncate, stale_after_truncate;
@@ -172,12 +211,54 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *root,
 	for (int i = 0; i < 2; i++)
 		if (!source_unavailable && memcmp(root, &roots[i], sizeof(*root)) == 0
 			&& memcmp(token, &root_tokens[i], sizeof(*token)) == 0) {
-			memset(out, 0, sizeof(*out));
+			*out = source_claims[i];
 			out->claim.identity = duties[i];
 			out->claim.database_incarnation = source_database[i];
+			out->timeline = root->checkpoint_tli;
 			*redo = source_redo[i];
 			return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 		}
+	return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+
+ClusterControlRootResult
+cluster_control_root_recovery_sync_v1(const ClusterControlRootSnapshot *root,
+									  const ClusterControlRootReadToken *token,
+									  ClusterWalTailObservation *out)
+{
+	UT_ASSERT(CurrentResourceOwner == source_owner && !pins && !locks && !hw_held);
+	UT_ASSERT(cold_protected());
+	for (int i = 0; i < 2; i++) {
+		if (memcmp(root, sources[i].root_snapshot, sizeof(*root)) != 0
+			|| memcmp(token, sources[i].root_token, sizeof(*token)) != 0)
+			continue;
+		create_source_syncs++;
+		memset(out, 0, sizeof(*out));
+		out->complete_end = root->validated_tail_lsn_exclusive + wrong_create_source_sync;
+		out->last_record_start = root->tail_last_record_lsn;
+		out->last_record_crc = root->tail_last_record_crc32c;
+		if (root->identity.origin_thread_id == source_sync_fault_thread) {
+			if (source_sync_fault == 1)
+				return CLUSTER_CONTROL_ROOT_IO_ERROR;
+			if (source_sync_fault == 2)
+				out->complete_end++;
+			if (source_sync_fault == 3)
+				out->last_record_start++;
+			if (source_sync_fault == 4)
+				out->last_record_crc++;
+			if (source_sync_fault == 5)
+				stale = true;
+			if (source_sync_fault == 6)
+				pg_re_throw();
+			if (source_sync_fault == 7)
+				merge_claim = false;
+			if (source_sync_fault == 8)
+				corrupt_disk = true;
+		}
+		source_sync_mask |= 1u << i;
+		return fail_create_source_sync ? CLUSTER_CONTROL_ROOT_IO_ERROR
+									   : CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	}
 	return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 }
 
@@ -374,28 +455,116 @@ cluster_smgr_which_for(RelFileLocator r, BackendId b)
 {
 	return 1;
 }
+
+const ClusterSharedFsOps *
+cluster_shared_fs_get_active_ops(void)
+{
+	static const ClusterSharedFsOps ops = { .id = CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS };
+	return wrong_create_backend ? NULL : &ops;
+}
+
+bool
+cluster_shared_fs_sharedfs_sync_create_result(RelFileLocator locator, ForkNumber fork)
+{
+	int index = fork == MAIN_FORKNUM ? 0 : 1;
+	UT_ASSERT(RelFileLocatorEquals(locator, key.locator));
+	UT_ASSERT(cold_protected() && CurrentResourceOwner == child_owner);
+	UT_ASSERT(fork == MAIN_FORKNUM || fork == SPACE_FORKNUM);
+	UT_ASSERT(main_exists && main_syncs != 0);
+	if (index == 1)
+		UT_ASSERT(exists && syncs != 0);
+	create_namespace_syncs[index]++;
+	if (stale_create_namespace == index)
+		stale = true;
+	return fail_create_namespace != index;
+}
 SMgrRelation
 smgropen(RelFileLocator r, BackendId b)
 {
-	UT_ASSERT(RelFileLocatorEquals(r, key.locator));
-	return &relation;
+	return RelFileLocatorEquals(r, key.locator) ? &relation : &missing_relation;
+}
+void
+smgrrelease(SMgrRelation r)
+{
+	UT_ASSERT(r == &relation || r == &missing_relation);
 }
 bool
 smgrexists(SMgrRelation r, ForkNumber f)
 {
-	return exists;
+	if (r == &missing_relation)
+		return false;
+	return f == MAIN_FORKNUM ? main_exists : exists;
 }
 BlockNumber
 smgrnblocks(SMgrRelation r, ForkNumber f)
 {
+	if (f == MAIN_FORKNUM) {
+		long length;
+		UT_ASSERT(main_exists && main_file != NULL);
+		UT_ASSERT_EQ(fseek(main_file, 0, SEEK_END), 0);
+		length = ftell(main_file);
+		UT_ASSERT(length >= 0 && length % BLCKSZ == 0);
+		return length / BLCKSZ;
+	}
 	return existing_blocks;
+}
+void
+DropRelationFiles(RelFileLocator *locators, int count, bool redo)
+{
+	UT_ASSERT(cold_protected() && CurrentResourceOwner == source_owner);
+	UT_ASSERT(!pins && !locks && !hw_held && redo && count == 1);
+	UT_ASSERT(RelFileLocatorEquals(locators[0], key.locator));
+	UT_ASSERT_EQ(source_sync_mask, 1);
+	abort_deletes++;
+	if (abort_delete_fault == 1)
+		pg_re_throw();
+	if (abort_delete_fault != 2)
+		UT_ASSERT_EQ(ftruncate(fileno(main_file), 0), 0);
+	if (abort_delete_fault != 3) {
+		exists = false;
+		existing_blocks = 0;
+	}
+	if (abort_delete_fault == 4)
+		main_exists = false;
+	if (abort_delete_fault == 5)
+		stale = true;
+}
+bool
+cluster_shared_fs_sharedfs_sync_drop_result(RelFileLocator locator)
+{
+	UT_ASSERT(cold_protected() && CurrentResourceOwner == source_owner);
+	UT_ASSERT(!pins && !locks && !hw_held && abort_deletes == 1);
+	UT_ASSERT(RelFileLocatorEquals(locator, key.locator));
+	UT_ASSERT(main_exists && !exists && smgrnblocks(&relation, MAIN_FORKNUM) == 0);
+	abort_directory_syncs++;
+	if (abort_directory_fault == 2)
+		stale = true;
+	if (abort_directory_fault == 3)
+		pg_re_throw();
+	if (abort_directory_fault == 4)
+		exists = true;
+	return abort_directory_fault != 1;
 }
 void
 smgrcreate(SMgrRelation r, ForkNumber fork, bool is_redo)
 {
+	UT_ASSERT((source_sync_mask & required_source_sync_mask) == required_source_sync_mask);
 	UT_ASSERT((hw_held || cold_protected()) && CurrentResourceOwner == child_owner);
+	if (fork == MAIN_FORKNUM) {
+		UT_ASSERT(cold_protected() && is_redo);
+		fault(7);
+		if (!main_exists) {
+			UT_ASSERT_EQ(ftruncate(fileno(main_file), 0), 0);
+			main_exists = true;
+		}
+		main_creates++;
+		if (stale_after_main_create)
+			stale = true;
+		return;
+	}
 	UT_ASSERT_EQ(fork, SPACE_FORKNUM);
 	UT_ASSERT(is_redo && !exists && existing_blocks == 0);
+	UT_ASSERT_EQ(ftruncate(fileno(file), 0), 0);
 	exists = true;
 	creates++;
 }
@@ -480,6 +649,7 @@ BufferGetTag(Buffer b, RelFileLocator *r, ForkNumber *f, BlockNumber *n)
 void
 MarkBufferDirty(Buffer b)
 {
+	UT_ASSERT((source_sync_mask & required_source_sync_mask) == required_source_sync_mask);
 	UT_ASSERT(b == 2 || ((creating || structural) && b == 1));
 	UT_ASSERT(x_locks & (1 << (b - 1)));
 	UT_ASSERT(CritSectionCount > 0);
@@ -515,10 +685,23 @@ void
 smgrimmedsync(SMgrRelation r, ForkNumber f)
 {
 	UT_ASSERT(CurrentResourceOwner == child_owner);
+	if (f == MAIN_FORKNUM) {
+		UT_ASSERT(cold_protected() && main_exists);
+		fault(8);
+		UT_ASSERT_EQ(fsync(fileno(main_file)), 0);
+		main_syncs++;
+		if (stale_after_main_sync)
+			stale = true;
+		if (hide_main_after_sync)
+			main_exists = false;
+		return;
+	}
 	UT_ASSERT(locks == 3 && (hw_held || cold_protected()));
 	fault(5);
 	UT_ASSERT_EQ(fsync(fileno(file)), 0);
 	syncs++;
+	if (stale_after_space_sync)
+		stale = true;
 }
 void
 smgrwrite(SMgrRelation r, ForkNumber f, BlockNumber b, const void *data, bool skip)
@@ -551,6 +734,7 @@ smgr_redo_cold_truncate(const xl_smgr_truncate *truncate, const ClusterSpaceReco
 {
 	xl_smgr_truncate wrong = *truncate;
 
+	UT_ASSERT((source_sync_mask & required_source_sync_mask) == required_source_sync_mask);
 	UT_ASSERT(cluster_space_recovery_truncate_permitted_v1(batch, truncate));
 	wrong.blkno++;
 	UT_ASSERT(!cluster_space_recovery_truncate_permitted_v1(batch, &wrong));
@@ -770,6 +954,9 @@ static void
 reset(void)
 {
 	MyAuxProcType = NotAnAuxProcess;
+	MyBackendType = B_BG_WRITER;
+	flush_start_state = CLUSTER_NORMAL_START_UNCLASSIFIED;
+	flush_recovered_open = false;
 	recovery = cold_current = true;
 	cold_window = merge_claim = true;
 	cold_truncates = 0;
@@ -790,11 +977,33 @@ reset(void)
 		abort();
 	pins = locks = writes = syncs = reads = lock_calls = 0;
 	wal_flushes = io_aborts = 0;
-	sf_blocked = stale_during_io = stale_after_write = false;
+	sf_blocked = stale_during_io = stale_after_write = stale_after_space_sync = false;
 	InterruptHoldoffCount = 0;
 	cluster_smart_fusion = false;
 	hw_held = stale = corrupt_disk = structural = wrong_cut = false;
 	creating = false;
+	main_exists = true;
+	main_creates = main_syncs = create_source_syncs = 0;
+	memset(create_namespace_syncs, 0, sizeof(create_namespace_syncs));
+	fail_create_namespace = stale_create_namespace = -1;
+	wrong_create_backend = false;
+	source_sync_mask = required_source_sync_mask = 0;
+	source_sync_fault_thread = 0;
+	source_sync_fault = 0;
+	abort_deletes = abort_directory_syncs = 0;
+	abort_delete_fault = abort_directory_fault = 0;
+	abort_finishes = 0;
+	abort_finish_fault = 0;
+	abort_before_calls = 0;
+	abort_second_target = false;
+	abort_plan_budget = 0;
+	fail_create_source_sync = wrong_create_source_sync = false;
+	stale_after_main_create = stale_after_main_sync = hide_main_after_sync = false;
+	if (main_file)
+		fclose(main_file);
+	main_file = tmpfile();
+	if (main_file == NULL)
+		abort();
 	existing_blocks = 2;
 	creates = extensions = x_locks = 0;
 	fail_write_block = -1;
@@ -807,6 +1016,7 @@ reset(void)
 	memset(roots, 0, sizeof(roots));
 	memset(root_tokens, 0, sizeof(root_tokens));
 	memset(sources, 0, sizeof(sources));
+	memset(source_claims, 0, sizeof(source_claims));
 	memset(cuts, 0, sizeof(cuts));
 	changes[0].action = CLUSTER_SPACE_RESERVATION_ADVANCE;
 	changes[0].before.identity.key.system_identifier = 17;
@@ -1152,6 +1362,27 @@ UT_TEST(test_ordinary_native_flush_keeps_local_wal)
 	UT_ASSERT_EQ(wal_flushes, 1);
 	UT_ASSERT_EQ(writes, 1);
 	UT_ASSERT_EQ(io_aborts, 0);
+}
+
+UT_TEST(test_existing_other_flush_waits_for_recovered_open)
+{
+	uint32 before_state;
+
+	reset();
+	recovery = false;
+	flush_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	flush_recovered_open = false;
+	pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_DIRTY);
+	before_state = pg_atomic_read_u32(&descriptors[1].bufferdesc.state);
+	FlushBufferWithRecovery(&descriptors[1].bufferdesc, &relation, IOOBJECT_RELATION,
+							IOCONTEXT_NORMAL, NULL, NULL, NULL, NULL);
+	UT_ASSERT_EQ(writes, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&descriptors[1].bufferdesc.state), before_state);
+	flush_recovered_open = true;
+	FlushBufferWithRecovery(&descriptors[1].bufferdesc, &relation, IOOBJECT_RELATION,
+							IOCONTEXT_NORMAL, NULL, NULL, NULL, NULL);
+	UT_ASSERT_EQ(writes, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&descriptors[1].bufferdesc.state) & BM_DIRTY, 0);
 }
 
 UT_TEST(test_cold_violation_blocks_native_write_even_for_already_dirty_page)
@@ -1522,6 +1753,319 @@ create_preflight(bool cold, ClusterSpaceRecoveryBatchV1 **batch)
 		return cluster_space_recovery_cold_preflight_v1(side, cold_fence, batch);
 	}
 	return cluster_space_recovery_preflight_v1(fabric, sources, 2, batch);
+}
+
+/* Original bounded SIDE parser, exact typed codec and cold SPACE owner.
+ * Only the native smgr/ROOT environment is supplied by this fixture. */
+static bool
+native_create_plan(int variant)
+{
+	RfSideOnlinePlanRequestV1 request = { .system_identifier = 17,
+										  .physical_cuts = cuts,
+										  .participant_count = 2,
+										  .redo_starts = native_redo };
+	ClusterSpaceStructureChange create = { 0 };
+	uint8 typed[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	xl_smgr_create native = { key.locator, MAIN_FORKNUM };
+
+	rf_side_online_plan_destroy_v1(&side);
+	memcpy(request.storage_uuid, key.storage_uuid, 16);
+	if (variant == 8) {
+		request.purpose = RF_SIDE_PLAN_PI_CONTRIBUTIONS;
+		request.redo_starts = NULL;
+	}
+	if (variant == 9)
+		native_redo[0] = source_redo[0] = 120;
+	UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &side), RF_PAGE_PROOF_DETAIL_OK);
+	create.identity.action = CLUSTER_SPACE_WAL_CREATE;
+	create.identity.nblocks = InvalidBlockNumber;
+	create.identity.result = changes[0].before.identity;
+	create.identity.result_token = changes[0].before_token;
+	create.reservation.action = CLUSTER_SPACE_RESERVATION_INIT;
+	create.reservation.result = changes[0].before;
+	create.reservation.result_token = changes[0].before_token;
+	UT_ASSERT(cluster_space_structure_wal_encode(&create, typed, sizeof(typed)));
+	if (variant == 1)
+		native.rlocator.relNumber++;
+	if (variant == 2)
+		native.forkNum = FSM_FORKNUM;
+	for (int i = 0; i < 3; i++) {
+		XLogReaderState reader = { 0 };
+		DecodedXLogRecord decoded = { 0 };
+		RfDetachedRecordPlanV1 record = { 0 };
+		RfPageOnlineRecordIdentityV1 identity = operations[i == 2 ? 1 : 0].identity;
+		RfPageProofDetailV1 detail;
+
+		identity.record.read_rec_ptr = i == 1 ? 120 : 100;
+		identity.record.end_rec_ptr = i == 0 ? 120 : 200;
+		identity.record.info = (i == 0	 ? XLOG_SMGR_CREATE
+								: i == 1 ? XLOG_SMGR_SPACE_IDENTITY
+										 : XLOG_SMGR_SPACE_RESERVATION)
+							   | XLR_SPECIAL_REL_UPDATE;
+		if (variant == 3 && i == 0)
+			identity.record.info &= ~XLR_SPECIAL_REL_UPDATE;
+		decoded.main_data = i == 0 ? (char *)&native : i == 1 ? (char *)typed : (char *)payload[1];
+		decoded.main_data_len = i == 0	 ? sizeof(native)
+								: i == 1 ? sizeof(typed)
+										 : sizeof(payload[1]);
+		if (variant == 4 && i == 0)
+			decoded.main_data_len--;
+		decoded.max_block_id = variant == 5 && i == 0 ? 0 : -1;
+		decoded.header.xl_xid = variant == 6 && i == 1 ? 810 : 809;
+		decoded.header.xl_rmid = identity.record.rmid;
+		decoded.header.xl_info = identity.record.info;
+		decoded.header.xl_crc = identity.record.record_crc;
+		decoded.lsn = identity.record.read_rec_ptr;
+		decoded.next_lsn = identity.record.end_rec_ptr;
+		reader.record = &decoded;
+		reader.system_identifier = identity.record.system_identifier;
+		reader.ReadRecPtr = decoded.lsn;
+		reader.EndRecPtr = decoded.next_lsn;
+		record.source_record = &reader;
+		record.preflight_complete = true;
+		record.route.rmid = identity.record.rmid;
+		record.route.normalized_info = identity.record.info & ~XLR_INFO_MASK;
+		record.route.record_owner = RF_ROUTE_OWNER_SIDE_TYPED;
+		record.route.block_policy = RF_ROUTE_BLOCKS_FORBIDDEN;
+		record.route.codec_id = RF_ROUTE_CODEC_SIDE_STANDARD;
+		if (variant == 7 && i == 1)
+			continue;
+		if (variant == 10 && i == 1) {
+			decoded.header.xl_info = identity.record.info
+				= XLOG_SMGR_CREATE | XLR_SPECIAL_REL_UPDATE;
+			record.route.normalized_info = XLOG_SMGR_CREATE;
+			decoded.main_data = (char *)&native;
+			decoded.main_data_len = sizeof(native);
+		}
+		detail = rf_side_online_plan_feed_record_v1(side, &record, &identity);
+		if (detail != RF_PAGE_PROOF_DETAIL_OK)
+			return false;
+	}
+	return rf_side_online_plan_bind_database_v1(side, 42)
+		   && rf_side_online_plan_seal_v1(side) == RF_PAGE_PROOF_DETAIL_OK;
+}
+
+UT_TEST(test_cold_native_create_pairs_and_precedes_space_install)
+{
+	for (int shape = 0; shape < 7; shape++) {
+		ClusterSpaceRecoveryBatchV1 *batch = NULL;
+		RfSideOnlineOperationV1 op;
+		RfSideOnlineApplyOpsV1 ops
+			= { .begin_protected_set = space_begin,
+				.end_protected_set = space_end,
+				.preflight_space = cluster_space_recovery_preflight_operation_v1,
+				.apply_space = cluster_space_recovery_applied_operation_v1 };
+		char sentinel[BLCKSZ], readback[BLCKSZ];
+
+		create_input(shape);
+		memset(sentinel, 0x5a, sizeof(sentinel));
+		UT_ASSERT_EQ(pwrite(fileno(main_file), sentinel, sizeof(sentinel), 0), sizeof(sentinel));
+		UT_ASSERT(native_create_plan(0));
+		if (rf_side_online_plan_operation_count_v1(side) != 3)
+			continue;
+		UT_ASSERT(create_preflight(true, &batch));
+		if (batch == NULL)
+			continue;
+		ops.arg = batch;
+		/* Native structure cannot fall through to a projection callback. */
+		{
+			RfSideOnlineApplyOpsV1 bad = ops;
+			bad.preflight_projection = cluster_space_recovery_preflight_operation_v1;
+			bad.apply_projection = cluster_space_recovery_applied_operation_v1;
+			bad.preflight_space = NULL;
+			bad.apply_space = NULL;
+			UT_ASSERT_EQ(rf_side_online_plan_preflight_v1(side, &bad),
+						 RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT);
+			UT_ASSERT_EQ(rf_side_online_plan_apply_v1(side, &bad),
+						 RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT);
+		}
+		UT_ASSERT_EQ(main_creates + main_syncs + writes, 0);
+		UT_ASSERT_EQ(rf_side_online_plan_preflight_v1(side, &ops), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_NE(rf_side_online_plan_apply_v1(side, &ops), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(cluster_space_recovery_apply_v1(batch));
+		UT_ASSERT_EQ(main_creates, 1);
+		UT_ASSERT_EQ(main_syncs, 1);
+		UT_ASSERT_EQ(pread(fileno(main_file), readback, sizeof(readback), 0), sizeof(readback));
+		UT_ASSERT(memcmp(readback, sentinel, sizeof(readback)) == 0);
+		UT_ASSERT_EQ(rf_side_online_plan_apply_v1(side, &ops), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(rf_side_online_plan_operation_v1(side, 0, &op));
+		op.source_xid++;
+		UT_ASSERT(!cluster_space_recovery_applied_operation_v1(batch, &op));
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+		cluster_space_recovery_destroy_v1(&batch);
+	}
+}
+
+UT_TEST(test_cold_native_create_missing_main_and_pair_refusals)
+{
+	for (int variant = 0; variant < 11; variant++) {
+		ClusterSpaceRecoveryBatchV1 *batch = NULL;
+		bool sealed;
+		create_input(0);
+		main_exists = variant == 9;
+		sealed = native_create_plan(variant);
+		if ((variant > 0 && variant < 8) || variant == 10) {
+			UT_ASSERT(!sealed);
+			continue;
+		}
+		UT_ASSERT(sealed);
+		if (!sealed)
+			continue;
+		if (variant == 8) {
+			UT_ASSERT(!create_preflight(true, &batch));
+			UT_ASSERT_NULL(batch);
+			continue;
+		}
+		UT_ASSERT(create_preflight(true, &batch));
+		if (batch == NULL)
+			continue;
+		UT_ASSERT(cluster_space_recovery_apply_v1(batch));
+		UT_ASSERT_EQ(main_creates, variant == 9 ? 0 : 1);
+		UT_ASSERT_EQ(main_syncs, variant == 9 ? 0 : 1);
+		UT_ASSERT(main_exists);
+		cluster_space_recovery_destroy_v1(&batch);
+	}
+}
+
+UT_TEST(test_cold_native_create_refuses_lost_data_and_wrong_execution_owner)
+{
+	for (int variant = 0; variant < 5; variant++) {
+		ClusterSpaceRecoveryBatchV1 *batch = NULL;
+		create_input(variant == 0 ? 6 : 0);
+		main_exists = variant != 0;
+		UT_ASSERT(native_create_plan(0));
+		MyAuxProcType = StartupProcess;
+		if (variant == 1) {
+			UT_ASSERT(!cluster_space_recovery_preflight_v1(fabric, sources, 2, &batch));
+		} else {
+			if (variant == 2)
+				serials[0].mode = CLUSTER_RECOVERY_SERIAL_ONLINE;
+			if (variant == 3)
+				cold_current = false;
+			if (variant == 4)
+				roots[0].identity.origin_owner_incarnation++;
+			UT_ASSERT(!cluster_space_recovery_cold_preflight_v1(side, cold_fence, &batch));
+		}
+		UT_ASSERT_NULL(batch);
+		UT_ASSERT_EQ(writes + main_creates + main_syncs, 0);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_native_create_namespace_sync_is_required_and_retryable)
+{
+	for (int variant = 0; variant < 6; variant++) {
+		ClusterSpaceRecoveryBatchV1 *batch = NULL;
+		RfSideOnlineOperationV1 op;
+
+		create_input(0);
+		main_exists = variant == 5;
+		UT_ASSERT(native_create_plan(0));
+		UT_ASSERT(create_preflight(true, &batch));
+		UT_ASSERT_EQ(create_namespace_syncs[0] + create_namespace_syncs[1], 0);
+		if (batch == NULL)
+			continue;
+		UT_ASSERT(rf_side_online_plan_operation_v1(side, 0, &op));
+		if (variant < 2)
+			fail_create_namespace = variant;
+		else if (variant < 4)
+			stale_create_namespace = variant - 2;
+		if (variant < 4) {
+			UT_ASSERT(!cluster_space_recovery_apply_v1(batch));
+			UT_ASSERT(!cluster_space_recovery_applied_operation_v1(batch, &op));
+			if (variant == 0 || variant == 2)
+				UT_ASSERT_EQ(writes + creates + extensions, 0);
+			UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+			stale = false;
+			fail_create_namespace = stale_create_namespace = -1;
+		}
+		UT_ASSERT(cluster_space_recovery_apply_v1(batch));
+		UT_ASSERT(create_namespace_syncs[0] != 0 && create_namespace_syncs[1] != 0);
+		UT_ASSERT(cluster_space_recovery_applied_operation_v1(batch, &op));
+		cluster_space_recovery_destroy_v1(&batch);
+	}
+}
+
+UT_TEST(test_cold_native_create_unknown_storage_backend_refuses_before_io)
+{
+	ClusterSpaceRecoveryBatchV1 *batch = NULL;
+
+	create_input(0);
+	main_exists = false;
+	UT_ASSERT(native_create_plan(0));
+	wrong_create_backend = true;
+	UT_ASSERT(!create_preflight(true, &batch));
+	UT_ASSERT_NULL(batch);
+	UT_ASSERT_EQ(main_creates + main_syncs + writes + creates + extensions, 0);
+}
+
+UT_TEST(test_cold_native_create_failed_sync_or_expiry_keeps_responsibility)
+{
+	for (int variant = 0; variant < 6; variant++) {
+		ClusterSpaceRecoveryBatchV1 *batch = NULL;
+		RfSideOnlineOperationV1 op;
+		create_input(0);
+		main_exists = false;
+		UT_ASSERT(native_create_plan(0));
+		UT_ASSERT(create_preflight(true, &batch));
+		if (batch == NULL)
+			continue;
+		UT_ASSERT(rf_side_online_plan_operation_v1(side, 0, &op));
+		fail_create_source_sync = variant == 0;
+		wrong_create_source_sync = variant == 1;
+		stale_after_main_create = variant == 2;
+		stale_after_main_sync = variant == 3;
+		hide_main_after_sync = variant == 4;
+		if (variant == 5)
+			stale = true;
+		UT_ASSERT(!cluster_space_recovery_apply_v1(batch));
+		UT_ASSERT(!cluster_space_recovery_applied_operation_v1(batch, &op));
+		UT_ASSERT_EQ(writes + creates + extensions, 0);
+		UT_ASSERT_EQ(main_creates, variant >= 2 && variant <= 4);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+		stale = fail_create_source_sync = wrong_create_source_sync = false;
+		stale_after_main_create = stale_after_main_sync = hide_main_after_sync = false;
+		UT_ASSERT(!cluster_space_recovery_applied_operation_v1(batch, &op));
+		UT_ASSERT(cluster_space_recovery_apply_v1(batch));
+		UT_ASSERT(cluster_space_recovery_applied_operation_v1(batch, &op));
+		cluster_space_recovery_destroy_v1(&batch);
+	}
+}
+
+UT_TEST(test_cold_native_create_error_unwinds_and_repeats_without_truncation)
+{
+	for (int at = 7; at <= 8; at++) {
+		ClusterSpaceRecoveryBatchV1 *volatile batch = NULL;
+		RfSideOnlineOperationV1 op;
+		volatile bool caught = false;
+		create_input(0);
+		main_exists = false;
+		UT_ASSERT(native_create_plan(0));
+		UT_ASSERT(create_preflight(true, (ClusterSpaceRecoveryBatchV1 **)&batch));
+		if (batch == NULL)
+			continue;
+		UT_ASSERT(rf_side_online_plan_operation_v1(side, 0, &op));
+		throw_at = at;
+		PG_TRY();
+		{
+			(void)cluster_space_recovery_apply_v1(batch);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT(!cluster_space_recovery_applied_operation_v1(batch, &op));
+		UT_ASSERT_EQ(writes + creates + extensions, 0);
+		UT_ASSERT_EQ(main_creates, at == 8);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+		throw_at = 0;
+		UT_ASSERT(cluster_space_recovery_apply_v1(batch));
+		UT_ASSERT(cluster_space_recovery_applied_operation_v1(batch, &op));
+		UT_ASSERT_EQ(smgrnblocks(&relation, MAIN_FORKNUM), 0);
+		cluster_space_recovery_destroy_v1((ClusterSpaceRecoveryBatchV1 **)&batch);
+	}
 }
 
 UT_TEST(test_create_missing_partial_and_complete_space_then_cross_source_advance)
@@ -2384,10 +2928,1559 @@ UT_TEST(test_compact_cold_physical_refusal_precedes_all_prefix_mutations)
 	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 3, 2, 0));
 }
 
+UT_TEST(test_compact_cold_syncs_complete_chain_before_prefix_or_shrink)
+{
+	for (int truncate = 0; truncate < 2; truncate++) {
+		ClusterSpaceRecoveryInput inputs[4];
+		ClusterSpaceColdSourceV1 origins[4];
+		uint8 bytes[4][CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+
+		compact_lifecycle(inputs, origins, bytes);
+		required_source_sync_mask = 3;
+		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 4, truncate,
+												truncate ? SMGR_TRUNCATE_ALL : 0));
+		/* Four records, two original sources. Even the later source supports
+		 * the complete history proof used for an earlier prefix. */
+		UT_ASSERT_EQ(create_source_syncs, 2);
+		UT_ASSERT_EQ(source_sync_mask, 3);
+		UT_ASSERT_EQ(cold_truncates, truncate);
+		UT_ASSERT_EQ(wal_flushes, 0);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_compact_cold_sync_refusal_leaves_space_and_data_untouched)
+{
+	for (int failure = 1; failure <= 7; failure++) {
+		ClusterSpaceRecoveryInput inputs[4];
+		ClusterSpaceColdSourceV1 origins[4];
+		uint8 bytes[4][CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+		PGAlignedBlock before[2], disk_before[2], disk[2];
+		volatile bool caught = false;
+		volatile bool installed = false;
+
+		compact_lifecycle(inputs, origins, bytes);
+		source_sync_fault_thread = origins[1].origin_thread;
+		source_sync_fault = failure;
+		memcpy(before, pages, sizeof(before));
+		UT_ASSERT_EQ(pread(fileno(file), disk_before, sizeof(disk_before), 0), sizeof(disk_before));
+		PG_TRY();
+		{
+			installed
+				= cluster_space_cold_install_v1(&key, inputs, origins, 4, 1, SMGR_TRUNCATE_ALL);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, failure == 6);
+		UT_ASSERT(!installed);
+		UT_ASSERT_EQ(create_source_syncs, 2);
+		UT_ASSERT_EQ(writes + creates + extensions + cold_truncates, 0);
+		UT_ASSERT_EQ(cold_main_blocks, 7);
+		UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+		UT_ASSERT_EQ(pread(fileno(file), disk, sizeof(disk), 0), sizeof(disk));
+		UT_ASSERT(memcmp(disk_before, disk, sizeof(disk_before)) == 0);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+		UT_ASSERT_EQ(wal_flushes, 0);
+		/* No sticky target mutation or leaked child prevents the original
+		 * owner from retrying after an ordinary failure or ERROR. */
+		source_sync_fault = 0;
+		stale = false;
+		merge_claim = true;
+		required_source_sync_mask = 3;
+		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 4, 1, SMGR_TRUNCATE_ALL));
+		UT_ASSERT_EQ(cold_truncates, 1);
+	}
+}
+
+UT_TEST(test_compact_cold_sync_before_creating_missing_space)
+{
+	ClusterSpaceRecoveryInput inputs[2];
+	ClusterSpaceColdSourceV1 origins[2];
+
+	create_input(0);
+	MyAuxProcType = StartupProcess;
+	compact_inputs(inputs, origins);
+	required_source_sync_mask = 3;
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 2, 0, 0));
+	UT_ASSERT_EQ(create_source_syncs, 2);
+	UT_ASSERT_EQ(creates, 1);
+	UT_ASSERT_EQ(extensions, 2);
+}
+
+UT_TEST(test_compact_cold_syncs_only_referenced_sources)
+{
+	ClusterSpaceRecoveryInput inputs[2];
+	ClusterSpaceColdSourceV1 origins[2];
+
+	create_input(0);
+	MyAuxProcType = StartupProcess;
+	compact_inputs(inputs, origins);
+	required_source_sync_mask = 1;
+	/* The second owner is still in the qualified cohort, but contributes
+	 * no record to this single-input relation. */
+	source_sync_fault_thread = origins[1].origin_thread;
+	source_sync_fault = 1;
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 1, 0, 0));
+	UT_ASSERT_EQ(create_source_syncs, 1);
+	UT_ASSERT_EQ(source_sync_mask, 1);
+}
+
+UT_TEST(test_cold_drop_already_is_read_only_even_with_source_sync_fault)
+{
+	ClusterSpaceRecoveryInput inputs[4];
+	ClusterSpaceColdSourceV1 origins[4];
+	uint8 bytes[4][CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	unsigned prior_writes, prior_syncs;
+
+	compact_lifecycle(inputs, origins, bytes);
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 4, 3, 0));
+	prior_writes = writes;
+	prior_syncs = create_source_syncs;
+	source_sync_fault_thread = origins[3].origin_thread;
+	source_sync_fault = 1;
+	UT_ASSERT(cluster_space_recovery_cold_drop_already_v1(&key, &inputs[3], &origins[3]));
+	UT_ASSERT_EQ(create_source_syncs, prior_syncs);
+	UT_ASSERT_EQ(writes, prior_writes);
+	UT_ASSERT_EQ(cold_truncates, 0);
+	UT_ASSERT_EQ(wal_flushes, 0);
+}
+
+/* Complete native records and the original sealed SIDE plan, with only
+ * ROOT/retention/buffer/storage I/O replaced by this file's normal fixture. */
+static uint32
+abort_create_plan_sources(bool advance, bool with_abort, bool after_abort, bool single)
+{
+	RfSideOnlinePlanRequestV1 request = { .system_identifier = 17,
+										  .physical_cuts = cuts,
+										  .participant_count = single ? 1 : 2,
+										  .redo_starts = native_redo,
+										  .memory_budget = abort_plan_budget };
+	ClusterSpaceStructureChange create = { 0 };
+	xl_smgr_create native = { key.locator, MAIN_FORKNUM };
+	xl_smgr_create other_native = native;
+	uint8 typed[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	uint8 other_typed[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	uint8 abort_bytes[MinSizeOfXactAbort + sizeof(xl_xact_xinfo) + sizeof(xl_xact_dbinfo)
+					  + sizeof(int) + 2 * sizeof(RelFileLocator) + sizeof(xl_xact_scn)]
+		= { 0 };
+	xl_xact_xinfo xinfo
+		= { XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_RELFILELOCATORS | XACT_XINFO_HAS_SCN };
+	xl_xact_dbinfo db = { .dbId = key.locator.dbOid, .tsId = key.locator.spcOid };
+	xl_xact_scn scn = { .scn = 901 };
+	Oid next_oid = 20000;
+	int nrels = 2;
+	uint32 abort_index = advance ? 3 : 2;
+	uint32 first_other = abort_index;
+	Size offset = MinSizeOfXactAbort;
+
+	memcpy(request.storage_uuid, key.storage_uuid, 16);
+	rf_side_online_plan_destroy_v1(&side);
+	UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &side), RF_PAGE_PROOF_DETAIL_OK);
+	for (int i = 0; i < 2; i++) {
+		duties[i].origin_node_id = duties[i].origin_thread_id - 1;
+		duties[i].thread_claim_created_at = 17;
+		duties[i].thread_claim_crc32c = 23;
+		duties[i].root_lineage_seq = 1;
+		memset(duties[i].authority_uuid, 0x61 + i, 16);
+		roots[i].identity = serials[i].duty = duties[i];
+		source_claims[i].claim.identity = duties[i];
+		source_claims[i].claim.database_incarnation = source_database[i];
+		source_claims[i].claim.max_config_generation = 4;
+		memset(source_claims[i].claim.claim_sha256, 0x71 + i, 32);
+		source_claims[i].timeline = roots[i].checkpoint_tli;
+	}
+	UT_ASSERT(rf_side_online_plan_bind_sources_v1(side, source_claims, 2));
+	create.identity.action = CLUSTER_SPACE_WAL_CREATE;
+	create.identity.nblocks = InvalidBlockNumber;
+	create.identity.result = changes[0].before.identity;
+	create.identity.result_token = changes[0].before_token;
+	create.reservation.action = CLUSTER_SPACE_RESERVATION_INIT;
+	create.reservation.result = changes[0].before;
+	create.reservation.result_token = changes[0].before_token;
+	UT_ASSERT(cluster_space_structure_wal_encode(&create, typed, sizeof(typed)));
+	other_native.rlocator.relNumber += 10;
+	create.identity.result.key.locator = other_native.rlocator;
+	create.reservation.result.identity.key.locator = other_native.rlocator;
+	UT_ASSERT(cluster_space_structure_wal_encode(&create, other_typed, sizeof(other_typed)));
+	if (abort_second_target) {
+		UT_ASSERT(!advance);
+		abort_index += 2;
+	}
+	memcpy(abort_bytes + offset, &xinfo, sizeof(xinfo));
+	offset += sizeof(xinfo);
+	memcpy(abort_bytes + offset, &db, sizeof(db));
+	offset += sizeof(db);
+	memcpy(abort_bytes + offset, &nrels, sizeof(nrels));
+	offset += sizeof(nrels);
+	for (int r = 0; r < nrels; r++, offset += sizeof(key.locator))
+		memcpy(abort_bytes + offset,
+			   abort_second_target && r == 1 ? &other_native.rlocator : &key.locator,
+			   sizeof(key.locator));
+	memcpy(abort_bytes + offset, &scn, sizeof(scn));
+	for (uint32 i = 0; i <= abort_index + (after_abort ? 1 : 0) + (single ? 0 : 1); i++) {
+		XLogReaderState reader = { 0 };
+		DecodedXLogRecord decoded = { 0 };
+		RfDetachedRecordPlanV1 record = { 0 };
+		RfPageOnlineRecordIdentityV1 identity = operations[0].identity;
+		bool terminal = i == abort_index && with_abort;
+		bool other = i > abort_index && !(after_abort && i == abort_index + 1);
+
+		identity.record.read_rec_ptr = 100 + 20 * i;
+		identity.record.end_rec_ptr = identity.record.read_rec_ptr + 20;
+		identity.record.rmid = terminal ? RM_XACT_ID : RM_SMGR_ID;
+		identity.record.info = (terminal ? XLOG_XACT_ABORT | XLOG_XACT_HAS_INFO
+								: i == 0 ? XLOG_SMGR_CREATE
+								: i == 1 ? XLOG_SMGR_SPACE_IDENTITY
+										 : XLOG_SMGR_SPACE_RESERVATION)
+							   | XLR_SPECIAL_REL_UPDATE;
+		decoded.main_data = terminal ? (char *)abort_bytes
+							: i == 0 ? (char *)&native
+							: i == 1 ? (char *)typed
+									 : (char *)payload[1];
+		decoded.main_data_len = terminal ? sizeof(abort_bytes)
+								: i == 0 ? sizeof(native)
+								: i == 1 ? sizeof(typed)
+										 : sizeof(payload[1]);
+		if (abort_second_target && i >= first_other && i < abort_index) {
+			identity.record.info = (i == first_other ? XLOG_SMGR_CREATE : XLOG_SMGR_SPACE_IDENTITY)
+								   | XLR_SPECIAL_REL_UPDATE;
+			decoded.main_data = i == first_other ? (char *)&other_native : (char *)other_typed;
+			decoded.main_data_len = i == first_other ? sizeof(other_native) : sizeof(other_typed);
+		}
+		if ((!after_abort && i == abort_index) || (after_abort && i == abort_index + 1))
+			identity.record.end_rec_ptr = 200;
+		if (i == abort_index && !with_abort) {
+			identity.record.rmid = RM_XLOG_ID;
+			identity.record.info = XLOG_NEXTOID;
+			decoded.main_data = (char *)&next_oid;
+			decoded.main_data_len = sizeof(next_oid);
+		}
+		if (other) {
+			identity = operations[1].identity;
+			identity.record.rmid = RM_XLOG_ID;
+			identity.record.info = XLOG_NEXTOID;
+			decoded.main_data = (char *)&next_oid;
+			decoded.main_data_len = sizeof(next_oid);
+		}
+		decoded.max_block_id = -1;
+		decoded.header.xl_xid = 809;
+		decoded.header.xl_rmid = identity.record.rmid;
+		decoded.header.xl_info = identity.record.info;
+		decoded.header.xl_crc = identity.record.record_crc;
+		decoded.lsn = identity.record.read_rec_ptr;
+		decoded.next_lsn = identity.record.end_rec_ptr;
+		reader.record = &decoded;
+		reader.system_identifier = identity.record.system_identifier;
+		reader.ReadRecPtr = decoded.lsn;
+		reader.EndRecPtr = decoded.next_lsn;
+		record.source_record = &reader;
+		record.preflight_complete = true;
+		record.route.rmid = identity.record.rmid;
+		record.route.normalized_info
+			= terminal ? XLOG_XACT_ABORT : identity.record.info & ~XLR_INFO_MASK;
+		record.route.legal_info_flags = terminal ? XLOG_XACT_HAS_INFO : 0;
+		record.route.record_owner = RF_ROUTE_OWNER_SIDE_TYPED;
+		record.route.block_policy = RF_ROUTE_BLOCKS_FORBIDDEN;
+		record.route.codec_id = RF_ROUTE_CODEC_SIDE_STANDARD;
+		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(side, &record, &identity),
+					 RF_PAGE_PROOF_DETAIL_OK);
+	}
+	UT_ASSERT(rf_side_online_plan_bind_database_v1(side, 42));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(side), RF_PAGE_PROOF_DETAIL_OK);
+	return abort_index;
+}
+
+static uint32
+abort_create_plan_mode(bool advance, bool with_abort, bool after_abort)
+{
+	return abort_create_plan_sources(advance, with_abort, after_abort, false);
+}
+
+static uint32
+abort_create_plan(bool advance)
+{
+	return abort_create_plan_mode(advance, true, false);
+}
+
+static bool
+abort_install_original_space_prefix(bool advance)
+{
+	ClusterSpaceRecoveryInput inputs[2];
+	ClusterSpaceColdSourceV1 origins[2];
+
+	for (uint32 i = 0; i < (advance ? 2 : 1); i++) {
+		RfSideOnlineOperationV1 op;
+		UT_ASSERT(rf_side_online_plan_operation_v1(side, i + 1, &op));
+		inputs[i] = (ClusterSpaceRecoveryInput){ op.owned_payload, op.owned_payload_length };
+		origins[i] = (ClusterSpaceColdSourceV1){ op.identity.record.origin_thread,
+												 op.identity.record.end_rec_ptr };
+	}
+	return cluster_space_cold_install_v1(&key, inputs, origins, advance ? 2 : 1, advance ? 1 : 0,
+										 0);
+}
+
+static uint32
+abort_create_installed_targets(bool advance, bool second)
+{
+	uint32 index;
+
+	create_input(0);
+	abort_second_target = second;
+	MyAuxProcType = StartupProcess;
+	index = abort_create_plan(advance);
+	UT_ASSERT(abort_install_original_space_prefix(advance));
+	return index;
+}
+
+static uint32
+abort_create_installed(bool advance)
+{
+	return abort_create_installed_targets(advance, false);
+}
+
+typedef struct AbortFinishExpected {
+	const RfSideOnlinePlanV1 *side;
+	uint32 index;
+} AbortFinishExpected;
+
+static bool
+abort_finish(void *arg, const RfSideOnlinePlanV1 *plan, uint32 index)
+{
+	AbortFinishExpected *expected = arg;
+
+	UT_ASSERT(expected != NULL && plan == expected->side && index == expected->index);
+	UT_ASSERT(cold_protected() && CurrentResourceOwner == source_owner);
+	UT_ASSERT(!pins && !locks && !hw_held);
+	UT_ASSERT_EQ(abort_deletes, 1);
+	UT_ASSERT_EQ(abort_directory_syncs, 1);
+	UT_ASSERT_EQ(source_sync_mask, 1);
+	UT_ASSERT(main_exists && !exists && smgrnblocks(&relation, MAIN_FORKNUM) == 0);
+	abort_finishes++;
+	if (abort_finish_fault == 2)
+		stale = true;
+	if (abort_finish_fault == 3)
+		exists = true;
+	if (abort_finish_fault == 4)
+		pg_re_throw();
+	return abort_finish_fault != 1;
+}
+
+static bool
+abort_before(void *arg, const RfSideOnlinePlanV1 *plan, uint32 index)
+{
+	AbortFinishExpected *expected = arg;
+
+	UT_ASSERT(expected != NULL && plan == expected->side && index == expected->index);
+	UT_ASSERT(cold_protected() && CurrentResourceOwner == source_owner);
+	UT_ASSERT_EQ(source_sync_mask, 1);
+	UT_ASSERT(exists && main_exists);
+	UT_ASSERT_EQ(abort_deletes + abort_directory_syncs + abort_finishes, 0);
+	abort_before_calls++;
+	if (abort_finish_fault == 2)
+		stale = true;
+	if (abort_finish_fault == 3)
+		exists = false;
+	if (abort_finish_fault == 4)
+		pg_re_throw();
+	return abort_finish_fault != 1;
+}
+
+UT_TEST(test_space_final_abort_selects_original_terminal_prefix)
+{
+	for (int advance = 0; advance < 2; advance++) {
+		uint32 operation = 19, relation_index = 23;
+		uint32 index;
+
+		create_input(0);
+		index = abort_create_plan(advance);
+		/* The original plan is sufficient for this input lookup even before
+		 * replay installs SPACE or the native consumer deletes anything. */
+		UT_ASSERT(
+			rf_side_online_plan_space_abort_v1(side, advance ? 2 : 1, &operation, &relation_index));
+		UT_ASSERT_EQ(operation, index);
+		UT_ASSERT_EQ(relation_index, 0);
+		UT_ASSERT_EQ(writes + creates + extensions + abort_deletes + abort_directory_syncs, 0);
+		UT_ASSERT(!pins && !locks && !hw_held);
+	}
+}
+
+UT_TEST(test_space_final_abort_keeps_distinct_native_pending_ordinals)
+{
+	uint32 index = abort_create_installed_targets(false, true);
+
+	for (uint32 target = 0; target < 2; target++) {
+		uint32 operation = 19, relation_index = 23;
+
+		UT_ASSERT(
+			rf_side_online_plan_space_abort_v1(side, target ? 3 : 1, &operation, &relation_index));
+		UT_ASSERT_EQ(operation, index);
+		UT_ASSERT_EQ(relation_index, target);
+	}
+	UT_ASSERT_EQ(abort_deletes + abort_directory_syncs, 0);
+}
+
+UT_TEST(test_space_final_abort_without_native_terminal_has_no_delete_binding)
+{
+	for (int advance = 0; advance < 2; advance++) {
+		uint32 operation = 19, relation_index = 23;
+
+		create_input(0);
+		(void)abort_create_plan_mode(advance, false, false);
+		UT_ASSERT(
+			rf_side_online_plan_space_abort_v1(side, advance ? 2 : 1, &operation, &relation_index));
+		UT_ASSERT_EQ(operation, UINT32_MAX);
+		UT_ASSERT_EQ(relation_index, UINT32_MAX);
+		UT_ASSERT_EQ(writes + creates + extensions + abort_deletes + abort_directory_syncs, 0);
+	}
+}
+
+UT_TEST(test_space_final_abort_refusal_preserves_outputs)
+{
+	uint32 index = abort_create_installed(true);
+	uint32 invalid[] = { 0, 1, index, index + 1, UINT32_MAX };
+	uint32 operation = 19, relation_index = 23;
+
+	for (uint32 i = 0; i < lengthof(invalid); i++) {
+		UT_ASSERT(
+			!rf_side_online_plan_space_abort_v1(side, invalid[i], &operation, &relation_index));
+		UT_ASSERT_EQ(operation, 19);
+		UT_ASSERT_EQ(relation_index, 23);
+	}
+	UT_ASSERT(!rf_side_online_plan_space_abort_v1(NULL, 2, &operation, &relation_index));
+	UT_ASSERT(!rf_side_online_plan_space_abort_v1(side, 2, NULL, &relation_index));
+	UT_ASSERT(!rf_side_online_plan_space_abort_v1(side, 2, &operation, NULL));
+	UT_ASSERT(!rf_side_online_plan_space_abort_v1(side, 2, &operation, &operation));
+	UT_ASSERT_EQ(operation, 19);
+	UT_ASSERT_EQ(relation_index, 23);
+	UT_ASSERT_EQ(abort_deletes + abort_directory_syncs, 0);
+}
+
+UT_TEST(test_space_final_abort_lookup_cannot_authorize_absence_retry)
+{
+	uint32 index = abort_create_installed(true);
+	uint32 operation = 19, relation_index = 23;
+	unsigned prior_writes, prior_syncs;
+
+	UT_ASSERT(cluster_space_recovery_cold_abort_delete_v1(side, index));
+	UT_ASSERT(!exists && main_exists && smgrnblocks(&relation, MAIN_FORKNUM) == 0);
+	prior_writes = writes;
+	prior_syncs = create_source_syncs;
+	UT_ASSERT(rf_side_online_plan_space_abort_v1(side, 2, &operation, &relation_index));
+	UT_ASSERT_EQ(operation, index);
+	UT_ASSERT_EQ(relation_index, 0);
+	/* An immutable binding survives deletion; it cannot let the original
+	 * consumer retry from missing SPACE or manufacture durable completion. */
+	UT_ASSERT(!cluster_space_recovery_cold_abort_delete_v1(side, index));
+	UT_ASSERT_EQ(abort_deletes, 1);
+	UT_ASSERT_EQ(abort_directory_syncs, 1);
+	UT_ASSERT_EQ(writes, prior_writes);
+	UT_ASSERT_EQ(create_source_syncs, prior_syncs);
+	UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+}
+
+/* Cold-plan input lookup is a boundary fixture; the sealed SIDE query and
+ * physical result owner linked below are the original production functions. */
+static ClusterColdSpaceInputV1 final_inputs[2];
+static uint32 final_count;
+static RelFileLocator final_locator;
+
+bool
+cluster_cold_plan_space_relation_v1(const ClusterColdPlanV1 *plan, uint32 relation_index,
+									RelFileLocator *locator, uint32 *count)
+{
+	if (plan != (const ClusterColdPlanV1 *)42 || relation_index != 0)
+		return false;
+	*locator = final_locator;
+	*count = final_count;
+	return true;
+}
+
+bool
+cluster_cold_plan_space_input_v1(const ClusterColdPlanV1 *plan, uint32 relation_index, uint32 input,
+								 ClusterColdSpaceInputV1 *out)
+{
+	if (plan != (const ClusterColdPlanV1 *)42 || relation_index != 0 || input >= final_count)
+		return false;
+	*out = final_inputs[input];
+	return true;
+}
+
+static void
+abort_final_fixture(ClusterColdTypedV1 *typed, bool advance)
+{
+	memset(typed, 0, sizeof(*typed));
+	typed->plan = (ClusterColdPlanV1 *)42;
+	typed->participant_count = 2;
+	typed->observer.system_identifier = key.system_identifier;
+	typed->observer.database_incarnation = key.database_incarnation;
+	memcpy(typed->observer.storage_uuid, key.storage_uuid, 16);
+	for (uint32 i = 0; i < 2; i++) {
+		typed->participants[i].thread_id = cuts[i].failed_thread;
+		typed->participants[i].timeline = cuts[i].timeline_id;
+		typed->participants[i].owner_incarnation = cuts[i].origin_owner_incarnation;
+		typed->participants[i].physical_lower = cuts[i].scan_begin_inclusive;
+		typed->participants[i].tail_end = cuts[i].scan_end_exclusive;
+		typed->participants[i].native_redo = native_redo[i];
+	}
+	typed->side_plans[0] = side;
+	final_count = advance ? 2 : 1;
+	final_locator = key.locator;
+	for (uint32 i = 0; i < final_count; i++) {
+		RfSideOnlineOperationV1 op;
+		UT_ASSERT(rf_side_online_plan_operation_v1(side, i + 1, &op));
+		final_inputs[i]
+			= (ClusterColdSpaceInputV1){ .kind = i == 0 ? CLUSTER_COLD_SPACE_CREATE
+														: CLUSTER_COLD_SPACE_ADVANCE,
+										 .participant = 0,
+										 .read_rec_ptr = op.identity.record.read_rec_ptr,
+										 .end_rec_ptr = op.identity.record.end_rec_ptr,
+										 .payload = op.owned_payload,
+										 .payload_length = op.owned_payload_length };
+	}
+}
+
+UT_TEST(test_cold_final_abort_binds_original_input_before_result_check)
+{
+	for (int advance = 0; advance < 2; advance++) {
+		ClusterColdTypedV1 typed;
+		bool aborted = false;
+		uint32 index = abort_create_installed(advance);
+		unsigned prior_writes;
+
+		abort_final_fixture(&typed, advance);
+		UT_ASSERT(!cluster_cold_typed_space_abort_final_v1(&typed, 0, &aborted));
+		UT_ASSERT(!aborted);
+		UT_ASSERT(cluster_space_recovery_cold_abort_delete_v1(side, index));
+		prior_writes = writes;
+		UT_ASSERT(cluster_cold_typed_space_abort_final_v1(&typed, 0, &aborted));
+		UT_ASSERT(aborted);
+		UT_ASSERT_EQ(writes, prior_writes);
+		UT_ASSERT_EQ(abort_deletes, 1);
+		UT_ASSERT_EQ(abort_directory_syncs, 1);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_final_abort_accepts_actual_per_source_capture)
+{
+	for (int advance = 0; advance < 2; advance++) {
+		ClusterColdTypedV1 typed;
+		bool aborted = false;
+		uint32 index = abort_create_installed(advance);
+		unsigned prior_writes, prior_syncs;
+
+		UT_ASSERT(cluster_space_recovery_cold_abort_delete_v1(side, index));
+		prior_writes = writes;
+		prior_syncs = create_source_syncs;
+		/* Production captures one stream, retaining both source claims.
+		 * This equivalent immutable capture does not execute the ABORT. */
+		UT_ASSERT_EQ(abort_create_plan_sources(advance, true, false, true), index);
+		UT_ASSERT_EQ(rf_side_online_plan_participant_count_v1(side), 1);
+		UT_ASSERT(!rf_side_online_plan_recovery_claim_matches_v1(side, &source_claims[1]));
+		abort_final_fixture(&typed, advance);
+		UT_ASSERT(cluster_cold_typed_space_abort_final_v1(&typed, 0, &aborted));
+		UT_ASSERT(aborted);
+		UT_ASSERT_EQ(writes, prior_writes);
+		UT_ASSERT_EQ(create_source_syncs, prior_syncs);
+		UT_ASSERT_EQ(abort_deletes, 1);
+		UT_ASSERT_EQ(abort_directory_syncs, 1);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_final_per_source_capture_keeps_complete_owner_and_exact_cut)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		ClusterColdTypedV1 typed;
+		bool aborted = false;
+		uint32 index = abort_create_installed(true);
+		unsigned prior_writes, prior_syncs;
+
+		UT_ASSERT(cluster_space_recovery_cold_abort_delete_v1(side, index));
+		UT_ASSERT_EQ(abort_create_plan_sources(true, true, false, true), index);
+		abort_final_fixture(&typed, true);
+		prior_writes = writes;
+		prior_syncs = create_source_syncs;
+		if (fault == 0)
+			cold_current = false;
+		else if (fault == 1)
+			serials[1].held = false;
+		else if (fault == 2)
+			roots[1].identity.origin_owner_incarnation++;
+		else if (fault == 3)
+			serials[1].root_read_token.record_crc32c++;
+		else if (fault == 4)
+			source_redo[1] = 201;
+		else
+			roots[0].validated_tail_lsn_exclusive++;
+		UT_ASSERT(!cluster_cold_typed_space_abort_final_v1(&typed, 0, &aborted));
+		UT_ASSERT(!aborted);
+		UT_ASSERT_EQ(writes, prior_writes);
+		UT_ASSERT_EQ(create_source_syncs, prior_syncs);
+		UT_ASSERT_EQ(abort_deletes, 1);
+		UT_ASSERT_EQ(abort_directory_syncs, 1);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_final_without_abort_retains_original_space_install_route)
+{
+	for (int advance = 0; advance < 2; advance++) {
+		ClusterColdTypedV1 typed;
+		bool aborted = true;
+
+		create_input(0);
+		(void)abort_create_plan_mode(advance, false, false);
+		abort_final_fixture(&typed, advance);
+		UT_ASSERT(cluster_cold_typed_space_abort_final_v1(&typed, 0, &aborted));
+		UT_ASSERT(!aborted);
+		UT_ASSERT_EQ(writes + abort_deletes + abort_directory_syncs, 0);
+	}
+}
+
+UT_TEST(test_cold_final_abort_refuses_mismatched_input_source_or_missing_plan)
+{
+	for (int fault = 0; fault < 12; fault++) {
+		ClusterColdTypedV1 typed;
+		bool aborted = false;
+		uint32 index = abort_create_installed(true);
+		unsigned prior_writes;
+
+		UT_ASSERT(cluster_space_recovery_cold_abort_delete_v1(side, index));
+		prior_writes = writes;
+		abort_final_fixture(&typed, true);
+		if (fault == 0)
+			final_inputs[1].read_rec_ptr++;
+		else if (fault == 1)
+			final_inputs[1].end_rec_ptr++;
+		else if (fault == 2)
+			final_inputs[1].payload_length--;
+		else if (fault == 3)
+			final_inputs[1].participant = 2;
+		else if (fault == 4)
+			final_locator.relNumber++;
+		else if (fault == 5)
+			typed.observer.database_incarnation++;
+		else if (fault == 6)
+			typed.side_plans[0] = NULL;
+		else if (fault == 7)
+			typed.side_capture_detail[0] = 1;
+		else if (fault == 8)
+			typed.participants[0].tail_end++;
+		else if (fault == 9)
+			typed.participants[0].native_redo++;
+		else if (fault == 10)
+			final_inputs[1].payload = NULL;
+		else
+			final_count = 0;
+		UT_ASSERT(!cluster_cold_typed_space_abort_final_v1(&typed, 0, &aborted));
+		UT_ASSERT(!aborted);
+		UT_ASSERT(!cluster_cold_typed_space_abort_final_v1(NULL, 0, &aborted));
+		UT_ASSERT(!cluster_cold_typed_space_abort_final_v1(&typed, 0, NULL));
+		UT_ASSERT_EQ(writes, prior_writes);
+		UT_ASSERT_EQ(abort_deletes, 1);
+		UT_ASSERT_EQ(abort_directory_syncs, 1);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_final_result_requires_original_delete_and_never_replays)
+{
+	for (int advance = 0; advance < 2; advance++) {
+		uint32 index = abort_create_installed(advance);
+		unsigned prior_writes, prior_syncs;
+
+		UT_ASSERT(!cluster_space_recovery_cold_abort_result_v1(side, index, 0));
+		UT_ASSERT(cluster_space_recovery_cold_abort_delete_v1(side, index));
+		prior_writes = writes;
+		prior_syncs = create_source_syncs;
+		for (int repeat = 0; repeat < 2; repeat++)
+			UT_ASSERT(cluster_space_recovery_cold_abort_result_v1(side, index, 0));
+		UT_ASSERT_EQ(writes, prior_writes);
+		UT_ASSERT_EQ(create_source_syncs, prior_syncs);
+		UT_ASSERT_EQ(abort_deletes, 1);
+		UT_ASSERT_EQ(abort_directory_syncs, 1);
+		UT_ASSERT(!cluster_space_recovery_cold_abort_delete_v1(side, index));
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_final_result_requires_original_whole_source_owner)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		uint32 index = abort_create_installed(true);
+		unsigned prior_writes, prior_syncs;
+
+		UT_ASSERT(cluster_space_recovery_cold_abort_delete_v1(side, index));
+		prior_writes = writes;
+		prior_syncs = create_source_syncs;
+		if (fault == 0)
+			cold_current = false;
+		else if (fault == 1)
+			stale = true;
+		else if (fault == 2)
+			serials[1].held = false;
+		else if (fault == 3)
+			source_redo[0] = 180;
+		else
+			CurrentResourceOwner = NULL;
+		UT_ASSERT(!cluster_space_recovery_cold_abort_result_v1(side, index, 0));
+		UT_ASSERT_EQ(writes, prior_writes);
+		UT_ASSERT_EQ(create_source_syncs, prior_syncs);
+		UT_ASSERT_EQ(abort_deletes, 1);
+		UT_ASSERT_EQ(abort_directory_syncs, 1);
+		UT_ASSERT(!pins && !locks && !hw_held);
+		CurrentResourceOwner = source_owner;
+	}
+}
+
+UT_TEST(test_cold_abort_final_result_rejects_absent_or_nonempty_main_and_auxiliary)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		uint32 index = abort_create_installed(true);
+		unsigned prior_writes;
+
+		UT_ASSERT(cluster_space_recovery_cold_abort_delete_v1(side, index));
+		prior_writes = writes;
+		if (fault == 0)
+			main_exists = false;
+		else if (fault == 1)
+			UT_ASSERT_EQ(ftruncate(fileno(main_file), BLCKSZ), 0);
+		else
+			exists = true;
+		UT_ASSERT(!cluster_space_recovery_cold_abort_result_v1(side, index, 0));
+		UT_ASSERT(!cluster_space_recovery_cold_abort_result_v1(NULL, index, 0));
+		UT_ASSERT(!cluster_space_recovery_cold_abort_result_v1(side, index, 1));
+		UT_ASSERT(!cluster_space_recovery_cold_abort_result_v1(side, index - 1, 0));
+		UT_ASSERT_EQ(writes, prior_writes);
+		UT_ASSERT_EQ(abort_deletes, 1);
+		UT_ASSERT_EQ(abort_directory_syncs, 1);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_space_final_abort_refuses_prefix_advanced_after_native_abort)
+{
+	uint32 operation = 19, relation_index = 23;
+
+	create_input(0);
+	(void)abort_create_plan_mode(false, true, true);
+	UT_ASSERT(!rf_side_online_plan_space_abort_v1(side, 3, &operation, &relation_index));
+	UT_ASSERT_EQ(operation, 19);
+	UT_ASSERT_EQ(relation_index, 23);
+	UT_ASSERT_EQ(writes + creates + extensions + abort_deletes + abort_directory_syncs, 0);
+}
+
+UT_TEST(test_space_final_abort_does_not_promote_history_to_current_input)
+{
+	for (int advance = 0; advance < 2; advance++) {
+		uint32 operation = 19, relation_index = 23;
+		RfSideOnlineOperationV1 creation;
+
+		create_input(0);
+		native_redo[0] = 140;
+		(void)abort_create_plan(advance);
+		UT_ASSERT(rf_side_online_plan_operation_v1(side, 1, &creation));
+		UT_ASSERT(creation.history_only);
+		UT_ASSERT(!rf_side_online_plan_space_abort_v1(side, advance ? 2 : 1, &operation,
+													  &relation_index));
+		UT_ASSERT_EQ(operation, 19);
+		UT_ASSERT_EQ(relation_index, 23);
+		UT_ASSERT_EQ(writes + creates + extensions + abort_deletes + abort_directory_syncs, 0);
+	}
+}
+
+UT_TEST(test_cold_abort_before_hook_precedes_unlink_under_original_owner)
+{
+	uint32 index = abort_create_installed(false);
+	AbortFinishExpected expected = { side, index };
+
+	UT_ASSERT(cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected,
+														  abort_before, abort_finish));
+	UT_ASSERT_EQ(abort_before_calls, 1);
+	UT_ASSERT_EQ(abort_finishes, 1);
+}
+
+UT_TEST(test_cold_abort_before_refusal_drift_or_error_prevents_unlink)
+{
+	for (int fault = 1; fault <= 4; fault++) {
+		uint32 index = abort_create_installed(false);
+		AbortFinishExpected expected = { side, index };
+		volatile bool caught = false, result = false;
+
+		abort_finish_fault = fault;
+		PG_TRY();
+		{
+			result = cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected,
+																 abort_before, abort_finish);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(!result);
+		UT_ASSERT_EQ(caught, fault == 4);
+		UT_ASSERT_EQ(abort_before_calls, 1);
+		UT_ASSERT_EQ(abort_deletes + abort_directory_syncs + abort_finishes, 0);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_before_hook_requires_full_proof_and_upfront_budget)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		uint32 index = abort_create_installed_targets(false, fault == 1);
+		AbortFinishExpected expected = { side, index };
+		Size bytes = fault == 0 ? rf_side_online_plan_scratch_available_v1(side) : 2048;
+
+		if (fault == 2) {
+			source_sync_fault_thread = duties[0].origin_thread_id;
+			source_sync_fault = 1;
+		}
+		UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, bytes, &expected,
+															   abort_before, abort_finish));
+		UT_ASSERT_EQ(abort_before_calls + abort_deletes + abort_finishes, 0);
+		UT_ASSERT(exists && main_exists);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_per_source_preflight_and_delete_keep_complete_owner)
+{
+	for (int advance = 0; advance < 2; advance++) {
+		uint32 index = abort_create_installed(advance);
+		unsigned prior_syncs = create_source_syncs, prior_writes = writes;
+
+		UT_ASSERT_EQ(abort_create_plan_sources(advance, true, false, true), index);
+		UT_ASSERT_EQ(rf_side_online_plan_participant_count_v1(side), 1);
+		/* An original retained claim does not become a physical participant. */
+		UT_ASSERT(!rf_side_online_plan_recovery_claim_matches_v1(side, &source_claims[1]));
+		UT_ASSERT(cluster_space_recovery_cold_abort_preflight_v1(side, index, 0));
+		UT_ASSERT_EQ(create_source_syncs, prior_syncs);
+		UT_ASSERT_EQ(writes, prior_writes);
+		UT_ASSERT(cluster_space_recovery_cold_abort_delete_v1(side, index));
+		UT_ASSERT_EQ(create_source_syncs, prior_syncs + 1);
+		UT_ASSERT_EQ(source_sync_mask, 1);
+		UT_ASSERT_EQ(abort_deletes, 1);
+		UT_ASSERT_EQ(abort_directory_syncs, 1);
+		UT_ASSERT(cluster_space_recovery_cold_abort_result_v1(side, index, 0));
+		UT_ASSERT(!cluster_space_recovery_cold_abort_delete_v1(side, index));
+		UT_ASSERT_EQ(abort_deletes, 1);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_per_source_finish_preserves_native_callback_order)
+{
+	for (int advance = 0; advance < 2; advance++) {
+		uint32 index = abort_create_installed(advance);
+		AbortFinishExpected expected;
+
+		UT_ASSERT_EQ(abort_create_plan_sources(advance, true, false, true), index);
+		expected = (AbortFinishExpected){ side, index };
+		UT_ASSERT(cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected,
+															  abort_before, abort_finish));
+		UT_ASSERT_EQ(abort_before_calls, 1);
+		UT_ASSERT_EQ(abort_finishes, 1);
+		UT_ASSERT_EQ(abort_deletes, 1);
+		UT_ASSERT_EQ(abort_directory_syncs, 1);
+		UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected,
+															   abort_before, abort_finish));
+		UT_ASSERT_EQ(abort_before_calls, 1);
+		UT_ASSERT_EQ(abort_finishes, 1);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_per_source_refuses_unbound_owner_or_physical_cut_before_sync)
+{
+	for (int fault = 0; fault < 16; fault++) {
+		uint32 index = abort_create_installed(true);
+		unsigned prior_syncs = create_source_syncs, prior_writes = writes;
+		AbortFinishExpected expected;
+
+		UT_ASSERT_EQ(abort_create_plan_sources(true, true, false, true), index);
+		expected = (AbortFinishExpected){ side, index };
+		if (fault == 0)
+			serials[1].held = false;
+		if (fault == 1)
+			duties[1].origin_owner_incarnation++;
+		if (fault == 2)
+			source_claims[1].claim.claim_sha256[0]++;
+		if (fault == 3)
+			source_claims[1].claim.max_config_generation++;
+		if (fault == 4)
+			duties[1].authority_uuid[0]++;
+		if (fault == 5)
+			duties[1].root_lineage_seq++;
+		if (fault == 6)
+			duties[1].thread_claim_created_at++;
+		if (fault == 7)
+			duties[1].thread_claim_crc32c++;
+		if (fault == 8)
+			source_redo[1] = 201;
+		if (fault == 9)
+			roots[0].checkpoint_lower_lsn = 90;
+		if (fault == 10)
+			source_redo[0] = 110;
+		if (fault == 11)
+			cold_window = false;
+		if (fault == 12)
+			roots[1].checkpoint_tli++;
+		if (fault == 13)
+			source_database[1]++;
+		if (fault == 14)
+			roots[0].validated_tail_lsn_exclusive = 240;
+		if (fault == 15)
+			cold_current = false;
+		roots[1].identity = serials[1].duty = duties[1];
+		UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected,
+															   abort_before, abort_finish));
+		UT_ASSERT_EQ(create_source_syncs, prior_syncs);
+		UT_ASSERT_EQ(writes, prior_writes);
+		UT_ASSERT_EQ(abort_before_calls + abort_deletes + abort_directory_syncs + abort_finishes,
+					 0);
+		UT_ASSERT(exists && main_exists);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_finish_holds_original_owner_after_durable_native_result)
+{
+	for (int advance = 0; advance < 2; advance++) {
+		uint32 index = abort_create_installed(advance);
+		AbortFinishExpected expected = { side, index };
+
+		UT_ASSERT(cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected, NULL,
+															  abort_finish));
+		UT_ASSERT_EQ(abort_finishes, 1);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+		/* The synchronous continuation is not a retained deletion receipt. */
+		UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected, NULL,
+															   abort_finish));
+		UT_ASSERT_EQ(abort_finishes, 1);
+		UT_ASSERT_EQ(abort_deletes, 1);
+	}
+}
+
+UT_TEST(test_cold_abort_finish_reserves_scratch_and_requires_callback_before_mutation)
+{
+	for (int problem = 0; problem < 3; problem++) {
+		uint32 index = abort_create_installed_targets(false, problem == 2);
+		AbortFinishExpected expected = { side, index };
+		unsigned before = create_source_syncs;
+		Size bytes = problem == 1 ? rf_side_online_plan_scratch_available_v1(side) : 2048;
+
+		UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, bytes, &expected, NULL,
+															   problem == 0 ? NULL : abort_finish));
+		UT_ASSERT_EQ(create_source_syncs, before);
+		UT_ASSERT_EQ(abort_deletes + abort_directory_syncs + abort_finishes, 0);
+		UT_ASSERT(exists && main_exists);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_finish_never_runs_before_complete_source_and_physical_result)
+{
+	for (int problem = 0; problem < 4; problem++) {
+		uint32 index = abort_create_installed(false);
+		AbortFinishExpected expected = { side, index };
+
+		UT_ASSERT_EQ(ftruncate(fileno(main_file), 3 * BLCKSZ), 0);
+		if (problem == 0) {
+			source_sync_fault_thread = duties[0].origin_thread_id;
+			source_sync_fault = 1;
+		} else if (problem == 1)
+			abort_delete_fault = 2;
+		else
+			abort_directory_fault = problem == 2 ? 1 : 4;
+		UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected, NULL,
+															   abort_finish));
+		UT_ASSERT_EQ(abort_finishes, 0);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_finish_refusal_or_late_drift_cannot_complete)
+{
+	for (int problem = 1; problem <= 3; problem++) {
+		uint32 index = abort_create_installed(false);
+		AbortFinishExpected expected = { side, index };
+
+		abort_finish_fault = problem;
+		UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected, NULL,
+															   abort_finish));
+		UT_ASSERT_EQ(abort_finishes, 1);
+		UT_ASSERT_EQ(abort_deletes, 1);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_finish_error_unwinds_owner_without_absence_retry)
+{
+	uint32 index = abort_create_installed(false);
+	AbortFinishExpected expected = { side, index };
+	volatile bool caught = false;
+
+	abort_finish_fault = 4;
+	PG_TRY();
+	{
+		(void)cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected, NULL,
+														  abort_finish);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(abort_finishes, 1);
+	UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	abort_finish_fault = 0;
+	UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected, NULL,
+														   abort_finish));
+	UT_ASSERT_EQ(abort_deletes, 1);
+	UT_ASSERT_EQ(abort_finishes, 1);
+}
+
+/* Count a new component attempt without replacing its physical fixture, sealed
+ * plan, original WAL payloads, ROOTs, claims or guards. This is not a recovery
+ * sequencer or a persistent deletion receipt. */
+static void
+abort_clear_attempt_counts(void)
+{
+	abort_before_calls = abort_deletes = abort_directory_syncs = abort_finishes = 0;
+}
+
+UT_TEST(test_cold_abort_consumed_space_requires_original_prefix_before_retry)
+{
+	for (int advance = 0; advance < 2; advance++) {
+		for (int interruption = 0; interruption < 4; interruption++) {
+			uint32 index = abort_create_installed(advance);
+			AbortFinishExpected expected = { side, index };
+			FILE *original_space = file, *original_main = main_file;
+			PGAlignedBlock original_pages[2];
+			unsigned prior_creates = creates, prior_writes = writes;
+			volatile bool caught = false;
+
+			memcpy(original_pages, pages, sizeof(original_pages));
+			UT_ASSERT_EQ(ftruncate(fileno(main_file), 3 * BLCKSZ), 0);
+			abort_delete_fault = interruption == 0 ? 2 : 0;
+			abort_directory_fault = interruption == 1 ? 1 : 0;
+			abort_finish_fault = interruption == 2 ? 1 : (interruption == 3 ? 4 : 0);
+			PG_TRY();
+			{
+				UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected,
+																	   NULL, abort_finish));
+			}
+			PG_CATCH();
+			{
+				caught = true;
+			}
+			PG_END_TRY();
+			UT_ASSERT_EQ(caught, interruption == 3);
+			UT_ASSERT_EQ(abort_deletes, 1);
+			UT_ASSERT_EQ(abort_directory_syncs, interruption == 0 ? 0 : 1);
+			UT_ASSERT_EQ(abort_finishes, interruption >= 2 ? 1 : 0);
+			UT_ASSERT(main_exists && !exists && existing_blocks == 0);
+			UT_ASSERT_EQ(smgrnblocks(&relation, MAIN_FORKNUM), interruption == 0 ? 3 : 0);
+			UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+
+			abort_delete_fault = abort_directory_fault = abort_finish_fault = 0;
+			UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected,
+																   NULL, abort_finish));
+			UT_ASSERT_EQ(abort_deletes, 1);
+			UT_ASSERT_EQ(abort_finishes, interruption >= 2 ? 1 : 0);
+			abort_clear_attempt_counts();
+			UT_ASSERT(abort_install_original_space_prefix(advance));
+			UT_ASSERT(file == original_space && main_file == original_main
+					  && side == expected.side);
+			UT_ASSERT_EQ(creates, prior_creates + 1);
+			UT_ASSERT_EQ(writes, prior_writes + (advance ? 4 : 2));
+			UT_ASSERT_EQ(existing_blocks, 2);
+			UT_ASSERT(memcmp(original_pages, pages, sizeof(original_pages)) == 0);
+			UT_ASSERT_EQ(smgrnblocks(&relation, MAIN_FORKNUM), interruption == 0 ? 3 : 0);
+			UT_ASSERT(cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected,
+																  abort_before, abort_finish));
+			UT_ASSERT_EQ(abort_before_calls, 1);
+			UT_ASSERT_EQ(abort_deletes, 1);
+			UT_ASSERT_EQ(abort_directory_syncs, 1);
+			UT_ASSERT_EQ(abort_finishes, 1);
+			UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected,
+																   NULL, abort_finish));
+			UT_ASSERT_EQ(abort_deletes, 1);
+			UT_ASSERT_EQ(abort_finishes, 1);
+			UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+		}
+	}
+}
+
+UT_TEST(test_cold_abort_original_prefix_partial_write_cannot_complete_delete)
+{
+	for (int block = 0; block < 2; block++) {
+		uint32 index = abort_create_installed(true);
+		AbortFinishExpected expected = { side, index };
+		FILE *original_space = file, *original_main = main_file;
+		volatile bool caught = false;
+
+		abort_directory_fault = 1;
+		UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected, NULL,
+															   abort_finish));
+		UT_ASSERT(!exists && abort_deletes == 1 && abort_finishes == 0);
+		abort_directory_fault = 0;
+		abort_clear_attempt_counts();
+		fail_write_block = block;
+		PG_TRY();
+		{
+			(void)abort_install_original_space_prefix(true);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught && exists);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+		fail_write_block = -1;
+		UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected, NULL,
+															   abort_finish));
+		UT_ASSERT_EQ(abort_deletes + abort_finishes, 0);
+		UT_ASSERT(abort_install_original_space_prefix(true));
+		UT_ASSERT(file == original_space && main_file == original_main && side == expected.side);
+		UT_ASSERT(cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected,
+															  abort_before, abort_finish));
+		UT_ASSERT_EQ(abort_finishes, 1);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_replayed_prefix_refuses_missing_main_or_foreign_space)
+{
+	for (int problem = 0; problem < 2; problem++) {
+		uint32 index = abort_create_installed(true);
+		AbortFinishExpected expected = { side, index };
+		PGAlignedBlock before[2];
+		unsigned prior_writes;
+
+		abort_directory_fault = 1;
+		UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected, NULL,
+															   abort_finish));
+		UT_ASSERT(!exists && abort_deletes == 1 && abort_finishes == 0);
+		abort_directory_fault = 0;
+		abort_clear_attempt_counts();
+		UT_ASSERT(abort_install_original_space_prefix(true));
+		if (problem == 0)
+			main_exists = false;
+		else {
+			ClusterSpaceIdentity foreign = changes[0].before.identity;
+
+			memset(foreign.incarnation, 0x62, sizeof(foreign.incarnation));
+			UT_ASSERT(cluster_space_identity_page_encode(&foreign, 140, pages[0].data, BLCKSZ));
+			UT_ASSERT_EQ(pwrite(fileno(file), PageSetChecksumCopy(pages[0].data, 0), BLCKSZ, 0),
+						 BLCKSZ);
+			UT_ASSERT_EQ(fsync(fileno(file)), 0);
+		}
+		memcpy(before, pages, sizeof(before));
+		prior_writes = writes;
+		if (problem == 1)
+			UT_ASSERT(!abort_install_original_space_prefix(true));
+		UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected,
+															   abort_before, abort_finish));
+		UT_ASSERT_EQ(abort_before_calls + abort_deletes + abort_directory_syncs + abort_finishes,
+					 0);
+		UT_ASSERT_EQ(writes, prior_writes);
+		UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_replayed_prefix_still_requires_exact_original_source)
+{
+	for (int problem = 0; problem < 5; problem++) {
+		uint32 index = abort_create_installed(true);
+		AbortFinishExpected expected = { side, index };
+		unsigned prior_writes;
+
+		abort_directory_fault = 1;
+		UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected, NULL,
+															   abort_finish));
+		UT_ASSERT(!exists && abort_deletes == 1 && abort_finishes == 0);
+		abort_directory_fault = 0;
+		abort_clear_attempt_counts();
+		UT_ASSERT(abort_install_original_space_prefix(true));
+		prior_writes = writes;
+		if (problem == 0)
+			stale = true;
+		if (problem == 1)
+			serials[1].held = false;
+		if (problem == 2)
+			source_claims[1].claim.claim_sha256[0]++;
+		if (problem == 3) {
+			duties[1].authority_uuid[0]++;
+			roots[1].identity = serials[1].duty = duties[1];
+		}
+		if (problem == 4)
+			roots[0].validated_tail_lsn_exclusive = 160;
+		UT_ASSERT(!cluster_space_recovery_cold_abort_finish_v1(side, index, 2048, &expected,
+															   abort_before, abort_finish));
+		UT_ASSERT_EQ(abort_before_calls + abort_deletes + abort_directory_syncs + abort_finishes,
+					 0);
+		UT_ASSERT_EQ(writes, prior_writes);
+		UT_ASSERT(exists && main_exists);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_delete_syncs_original_source_and_distinct_native_result)
+{
+	for (int advance = 0; advance < 2; advance++) {
+		uint32 index = abort_create_installed(advance);
+		unsigned before = create_source_syncs;
+
+		UT_ASSERT_EQ(ftruncate(fileno(main_file), 3 * BLCKSZ), 0);
+		UT_ASSERT(cluster_space_recovery_cold_abort_delete_v1(side, index));
+		UT_ASSERT_EQ(abort_deletes, 1);
+		UT_ASSERT_EQ(abort_directory_syncs, 1);
+		UT_ASSERT_EQ(create_source_syncs, before + 1);
+		UT_ASSERT_EQ(source_sync_mask, 1);
+		UT_ASSERT(main_exists && !exists && smgrnblocks(&relation, MAIN_FORKNUM) == 0);
+		UT_ASSERT_EQ(wal_flushes + main_creates + cold_truncates, 0);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+		/* Native deletion consumed the only incarnation proof. Absence alone
+		 * cannot grant a second delete or terminal completion. */
+		UT_ASSERT(!cluster_space_recovery_cold_abort_delete_v1(side, index));
+		UT_ASSERT_EQ(abort_deletes, 1);
+	}
+}
+
+UT_TEST(test_cold_abort_delete_preflights_entire_group_before_source_sync)
+{
+	uint32 index = abort_create_installed_targets(false, true);
+	unsigned before = create_source_syncs;
+	uint32 creation;
+
+	UT_ASSERT(rf_side_online_plan_abort_creation_v1(side, index, 1, &creation));
+	UT_ASSERT(!cluster_space_recovery_cold_abort_delete_v1(side, index));
+	UT_ASSERT_EQ(create_source_syncs, before);
+	UT_ASSERT_EQ(abort_deletes + abort_directory_syncs, 0);
+	UT_ASSERT(exists && main_exists);
+	UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+}
+
+UT_TEST(test_cold_abort_delete_refuses_unknown_owner_main_or_backend_before_sync)
+{
+	for (int problem = 0; problem < 5; problem++) {
+		uint32 index = abort_create_installed(true);
+		unsigned before = create_source_syncs;
+
+		if (problem == 0)
+			main_exists = false;
+		if (problem == 1)
+			wrong_create_backend = true;
+		if (problem == 2)
+			merge_claim = false;
+		if (problem == 3)
+			serials[1].held = false;
+		if (problem == 4)
+			index--;
+		UT_ASSERT(!cluster_space_recovery_cold_abort_delete_v1(side, index));
+		UT_ASSERT_EQ(create_source_syncs, before);
+		UT_ASSERT_EQ(abort_deletes + abort_directory_syncs, 0);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_delete_source_refusal_and_staleness_never_unlink)
+{
+	for (int problem = 1; problem <= 8; problem++) {
+		uint32 index = abort_create_installed(false);
+		unsigned before = create_source_syncs;
+
+		if (problem == 6)
+			continue; /* ERROR cleanup is checked below. */
+		source_sync_fault_thread = duties[0].origin_thread_id;
+		source_sync_fault = problem;
+		UT_ASSERT(!cluster_space_recovery_cold_abort_delete_v1(side, index));
+		UT_ASSERT_EQ(create_source_syncs, before + 1);
+		UT_ASSERT_EQ(abort_deletes + abort_directory_syncs, 0);
+		UT_ASSERT(exists && main_exists);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_delete_bounded_scratch_refuses_before_source_sync)
+{
+	uint32 index = abort_create_installed(false);
+	unsigned before = create_source_syncs;
+	Size used = RF_SIDE_ONLINE_PLAN_MAX_BYTES - rf_side_online_plan_scratch_available_v1(side);
+
+	/* Reconstruct the same immutable source with a small real plan budget;
+	 * no test-only scratch getter or deletion permission is substituted. */
+	abort_plan_budget = used + 32768;
+	UT_ASSERT_EQ(abort_create_plan(false), index);
+	UT_ASSERT_EQ(rf_side_online_plan_scratch_available_v1(side), 32768);
+	UT_ASSERT(!cluster_space_recovery_cold_abort_delete_v1(side, index));
+	UT_ASSERT_EQ(create_source_syncs, before);
+	UT_ASSERT_EQ(abort_deletes + abort_directory_syncs, 0);
+	UT_ASSERT(main_exists && exists);
+	UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+}
+
+UT_TEST(test_cold_abort_delete_requires_complete_physical_and_directory_result)
+{
+	for (int problem = 2; problem <= 9; problem++) {
+		uint32 index = abort_create_installed(false);
+		unsigned before = create_source_syncs;
+
+		UT_ASSERT_EQ(ftruncate(fileno(main_file), 3 * BLCKSZ), 0);
+		if (problem <= 5)
+			abort_delete_fault = problem;
+		else
+			abort_directory_fault = problem - 5;
+		if (abort_directory_fault == 3)
+			continue; /* ERROR cleanup is checked below. */
+		UT_ASSERT(!cluster_space_recovery_cold_abort_delete_v1(side, index));
+		UT_ASSERT_EQ(create_source_syncs, before + 1);
+		UT_ASSERT_EQ(abort_deletes, 1);
+		UT_ASSERT_EQ(abort_directory_syncs, problem <= 5 ? 0 : 1);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_delete_error_unwinds_original_owner_without_absence_success)
+{
+	for (int stage = 0; stage < 3; stage++) {
+		uint32 index = abort_create_installed(false);
+		volatile bool caught = false;
+
+		if (stage == 0) {
+			source_sync_fault_thread = duties[0].origin_thread_id;
+			source_sync_fault = 6;
+		} else if (stage == 1)
+			abort_delete_fault = 1;
+		else
+			abort_directory_fault = 3;
+		PG_TRY();
+		{
+			(void)cluster_space_recovery_cold_abort_delete_v1(side, index);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+		UT_ASSERT_EQ(abort_deletes, stage == 0 ? 0 : 1);
+		UT_ASSERT_EQ(abort_directory_syncs, stage == 2 ? 1 : 0);
+		if (stage == 2) {
+			abort_directory_fault = 0;
+			UT_ASSERT(!cluster_space_recovery_cold_abort_delete_v1(side, index));
+			UT_ASSERT_EQ(abort_deletes, 1);
+		}
+	}
+}
+
+UT_TEST(test_cold_abort_preflight_binds_exact_durable_create_and_advance)
+{
+	for (int advance = 0; advance < 2; advance++) {
+		uint32 index = abort_create_installed(advance);
+		PGAlignedBlock before[2];
+		unsigned prior_writes = writes, prior_source_syncs = create_source_syncs;
+
+		memcpy(before, pages, sizeof(before));
+		for (uint32 r = 0; r < 2; r++)
+			UT_ASSERT(cluster_space_recovery_cold_abort_preflight_v1(side, index, r));
+		UT_ASSERT_EQ(writes, prior_writes);
+		UT_ASSERT_EQ(create_source_syncs, prior_source_syncs);
+		UT_ASSERT_EQ(cold_truncates + main_creates + main_syncs + wal_flushes, 0);
+		UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_preflight_refuses_missing_reused_or_not_durable_space)
+{
+	for (int fault = 0; fault < 10; fault++) {
+		uint32 index = abort_create_installed(true);
+		PGAlignedBlock before[2];
+		unsigned prior_writes = writes;
+
+		if (fault == 0)
+			exists = false;
+		if (fault == 1)
+			existing_blocks = 1;
+		if (fault == 2)
+			existing_blocks = 3;
+		if (fault == 3)
+			memset(pages[1].data, 0, BLCKSZ);
+		if (fault == 4) {
+			ClusterSpaceIdentity reused = changes[0].before.identity;
+			memset(reused.incarnation, 0x62, sizeof(reused.incarnation));
+			UT_ASSERT(cluster_space_identity_page_encode(&reused, 100, pages[0].data, BLCKSZ));
+		}
+		if (fault == 5)
+			corrupt_disk = true;
+		if (fault == 6)
+			corrupt_after_sync_block = 1;
+		if (fault == 7)
+			permitted = false;
+		if (fault == 8)
+			PageSetLSNPreserveOrigin(pages[1].data, 190);
+		if (fault == 9)
+			UT_ASSERT(PageSetLSNOrigin(pages[1].data, 2));
+		memcpy(before, pages, sizeof(before));
+		UT_ASSERT(!cluster_space_recovery_cold_abort_preflight_v1(side, index, 0));
+		UT_ASSERT_EQ(writes, prior_writes);
+		UT_ASSERT_EQ(cold_truncates + main_creates + wal_flushes, 0);
+		UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_preflight_retains_whole_original_source_and_terminal_interval)
+{
+	for (int fault = 0; fault < 20; fault++) {
+		uint32 index = abort_create_installed(true);
+		unsigned prior_writes = writes;
+
+		if (fault == 0)
+			roots[0].validated_tail_lsn_exclusive = 160;
+		if (fault == 1)
+			source_redo[0] = 180;
+		if (fault == 2)
+			source_database[0]++;
+		if (fault == 3)
+			serials[1].held = false;
+		if (fault == 4)
+			cold_window = false;
+		if (fault == 5)
+			merge_claim = false;
+		if (fault == 6)
+			stale_after_space_sync = true;
+		if (fault == 9) {
+			duties[1].origin_owner_incarnation++;
+			roots[1].identity = serials[1].duty = duties[1];
+		}
+		if (fault == 10)
+			roots[1].checkpoint_lower_lsn = 90;
+		if (fault == 11)
+			source_redo[1] = 110;
+		if (fault == 12)
+			roots[0].validated_tail_lsn_exclusive = 240;
+		if (fault == 13)
+			cold_origins = 1;
+		/* Keep current ROOT/guard internally coherent while changing the
+		 * exact claim captured by SIDE; an unchanged cut is insufficient. */
+		if (fault == 14)
+			duties[1].authority_uuid[0]++;
+		if (fault == 15)
+			source_claims[1].claim.claim_sha256[0]++;
+		if (fault == 16)
+			source_claims[1].claim.max_config_generation++;
+		if (fault == 17)
+			duties[1].root_lineage_seq++;
+		if (fault == 18)
+			duties[1].thread_claim_created_at++;
+		if (fault == 19)
+			duties[1].thread_claim_crc32c++;
+		if (fault >= 14)
+			roots[1].identity = serials[1].duty = duties[1];
+		UT_ASSERT(!cluster_space_recovery_cold_abort_preflight_v1(side, fault == 7 ? 0 : index,
+																  fault == 8 ? 2 : 0));
+		UT_ASSERT_EQ(writes, prior_writes);
+		UT_ASSERT_EQ(cold_truncates + main_creates + wal_flushes, 0);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_abort_preflight_io_error_unwinds_original_owner_for_retry)
+{
+	const int faults[] = { 1, 2, 3, 5, 6 };
+	for (unsigned i = 0; i < lengthof(faults); i++) {
+		uint32 index = abort_create_installed(true);
+		unsigned prior_writes = writes;
+		volatile bool caught = false;
+
+		throw_at = faults[i];
+		PG_TRY();
+		{
+			(void)cluster_space_recovery_cold_abort_preflight_v1(side, index, 0);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(writes, prior_writes);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+		throw_at = 0;
+		UT_ASSERT(cluster_space_recovery_cold_abort_preflight_v1(side, index, 0));
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(48);
+	UT_PLAN(102);
+	UT_RUN(test_cold_final_abort_binds_original_input_before_result_check);
+	UT_RUN(test_cold_final_abort_accepts_actual_per_source_capture);
+	UT_RUN(test_cold_final_per_source_capture_keeps_complete_owner_and_exact_cut);
+	UT_RUN(test_cold_final_without_abort_retains_original_space_install_route);
+	UT_RUN(test_cold_final_abort_refuses_mismatched_input_source_or_missing_plan);
+	UT_RUN(test_cold_abort_final_result_requires_original_delete_and_never_replays);
+	UT_RUN(test_cold_abort_final_result_requires_original_whole_source_owner);
+	UT_RUN(test_cold_abort_final_result_rejects_absent_or_nonempty_main_and_auxiliary);
+	UT_RUN(test_space_final_abort_selects_original_terminal_prefix);
+	UT_RUN(test_space_final_abort_keeps_distinct_native_pending_ordinals);
+	UT_RUN(test_space_final_abort_without_native_terminal_has_no_delete_binding);
+	UT_RUN(test_space_final_abort_refusal_preserves_outputs);
+	UT_RUN(test_space_final_abort_lookup_cannot_authorize_absence_retry);
+	UT_RUN(test_space_final_abort_refuses_prefix_advanced_after_native_abort);
+	UT_RUN(test_space_final_abort_does_not_promote_history_to_current_input);
+	UT_RUN(test_cold_abort_consumed_space_requires_original_prefix_before_retry);
+	UT_RUN(test_cold_abort_original_prefix_partial_write_cannot_complete_delete);
+	UT_RUN(test_cold_abort_replayed_prefix_refuses_missing_main_or_foreign_space);
+	UT_RUN(test_cold_abort_replayed_prefix_still_requires_exact_original_source);
+	UT_RUN(test_cold_abort_before_hook_precedes_unlink_under_original_owner);
+	UT_RUN(test_cold_abort_before_refusal_drift_or_error_prevents_unlink);
+	UT_RUN(test_cold_abort_before_hook_requires_full_proof_and_upfront_budget);
+	UT_RUN(test_cold_abort_per_source_preflight_and_delete_keep_complete_owner);
+	UT_RUN(test_cold_abort_per_source_finish_preserves_native_callback_order);
+	UT_RUN(test_cold_abort_per_source_refuses_unbound_owner_or_physical_cut_before_sync);
+	UT_RUN(test_cold_abort_finish_holds_original_owner_after_durable_native_result);
+	UT_RUN(test_cold_abort_finish_reserves_scratch_and_requires_callback_before_mutation);
+	UT_RUN(test_cold_abort_finish_never_runs_before_complete_source_and_physical_result);
+	UT_RUN(test_cold_abort_finish_refusal_or_late_drift_cannot_complete);
+	UT_RUN(test_cold_abort_finish_error_unwinds_owner_without_absence_retry);
+	UT_RUN(test_cold_abort_delete_syncs_original_source_and_distinct_native_result);
+	UT_RUN(test_cold_abort_delete_preflights_entire_group_before_source_sync);
+	UT_RUN(test_cold_abort_delete_refuses_unknown_owner_main_or_backend_before_sync);
+	UT_RUN(test_cold_abort_delete_source_refusal_and_staleness_never_unlink);
+	UT_RUN(test_cold_abort_delete_bounded_scratch_refuses_before_source_sync);
+	UT_RUN(test_cold_abort_delete_requires_complete_physical_and_directory_result);
+	UT_RUN(test_cold_abort_delete_error_unwinds_original_owner_without_absence_success);
+	UT_RUN(test_cold_abort_preflight_binds_exact_durable_create_and_advance);
+	UT_RUN(test_cold_abort_preflight_refuses_missing_reused_or_not_durable_space);
+	UT_RUN(test_cold_abort_preflight_retains_whole_original_source_and_terminal_interval);
+	UT_RUN(test_cold_abort_preflight_io_error_unwinds_original_owner_for_retry);
+	UT_RUN(test_cold_native_create_namespace_sync_is_required_and_retryable);
+	UT_RUN(test_cold_native_create_unknown_storage_backend_refuses_before_io);
+	UT_RUN(test_compact_cold_syncs_complete_chain_before_prefix_or_shrink);
+	UT_RUN(test_compact_cold_sync_refusal_leaves_space_and_data_untouched);
+	UT_RUN(test_compact_cold_sync_before_creating_missing_space);
+	UT_RUN(test_compact_cold_syncs_only_referenced_sources);
+	UT_RUN(test_cold_drop_already_is_read_only_even_with_source_sync_fault);
+	UT_RUN(test_cold_native_create_refuses_lost_data_and_wrong_execution_owner);
+	UT_RUN(test_cold_native_create_failed_sync_or_expiry_keeps_responsibility);
+	UT_RUN(test_cold_native_create_error_unwinds_and_repeats_without_truncation);
+	UT_RUN(test_cold_native_create_pairs_and_precedes_space_install);
+	UT_RUN(test_cold_native_create_missing_main_and_pair_refusals);
 	UT_RUN(test_compact_cold_vm_shrink_does_not_shrink_main);
 	UT_RUN(test_compact_cold_named_shrink_runs_even_when_space_is_already_durable);
 	UT_RUN(test_compact_cold_unrequested_shrink_does_not_inspect_or_modify_data);
@@ -2434,10 +4527,13 @@ main(void)
 	UT_RUN(test_error_releases_original_resources);
 	UT_RUN(test_native_flush_wait_and_stale_source_unwind);
 	UT_RUN(test_ordinary_native_flush_keeps_local_wal);
+	UT_RUN(test_existing_other_flush_waits_for_recovered_open);
 	UT_RUN(test_reject_unrelated_resource_owner);
 	UT_RUN(test_physical_checksum_is_strict);
 	if (file)
 		fclose(file);
+	if (main_file)
+		fclose(main_file);
 	rf_side_online_plan_destroy_v1(&side);
 	UT_DONE();
 	return ut_failed_count != 0;

@@ -38,6 +38,25 @@ static void fixture_lru_init(SlruCtl ctl, const char *name, int slots, int lsn_g
 UT_DEFINE_GLOBALS();
 
 bool cluster_shared_config;
+char *cluster_shared_data_dir = "/fixture/subtrans-recovery";
+static LWLockPadded recovery_locks[2 * SUBTRANS_RECOVERY_ORIGINS];
+static SlruSharedData recovery_shared[SUBTRANS_RECOVERY_ORIGINS];
+
+/* Native local write/sync is this fixture's target; isolated recovery SLRU
+ * files and allocations execute in test_cluster_subtrans_recovery. */
+void *
+ShmemInitStruct(const char *name, Size size, bool *found)
+{
+	UT_ASSERT(strcmp(name, "SUBTRANS recovery locks") == 0);
+	UT_ASSERT_EQ(size, sizeof(recovery_locks));
+	*found = true;
+	return recovery_locks;
+}
+void
+LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche pg_attribute_unused())
+{
+	UT_ASSERT(false);
+}
 volatile uint32 CritSectionCount;
 int pg_file_create_mode = 0600;
 static LWLockPadded locks[128];
@@ -105,7 +124,17 @@ static void
 fixture_lru_init(SlruCtl ctl, const char *name, int slots, int lsn_groups, LWLock *lock,
 				 const char *dir, int tranche, SyncRequestHandler handler)
 {
-	UT_ASSERT(ctl == SubTransCtl);
+	if (ctl != SubTransCtl) {
+		int origin = ctl - SubtransRecoveryCtl;
+		UT_ASSERT(origin >= 0 && origin < SUBTRANS_RECOVERY_ORIGINS);
+		UT_ASSERT(strncmp(name, "SUBTRANS recovery ", 18) == 0);
+		UT_ASSERT_EQ(slots, SUBTRANS_RECOVERY_BUFFERS);
+		UT_ASSERT_EQ(handler, SYNC_HANDLER_NONE);
+		ctl->shared = &recovery_shared[origin];
+		strlcpy(ctl->Dir, dir, sizeof(ctl->Dir));
+		ctl->sync_handler = handler;
+		return;
+	}
 	UT_ASSERT(strcmp(name, "Subtrans") == 0 && strcmp(dir, "pg_subtrans") == 0);
 	UT_ASSERT_EQ(slots, NUM_SUBTRANS_BUFFERS);
 	UT_ASSERT_EQ(lsn_groups, 0);

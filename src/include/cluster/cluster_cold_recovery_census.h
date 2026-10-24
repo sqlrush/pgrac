@@ -8,8 +8,8 @@
  *	  generations the recovery fence plan names: older generations of each
  *	  thread kept in its ROOT history, and closed or already recovered
  *	  generations whose retained range still precedes later changes.  Those
- *	  are history only: every retained record of theirs is durable and may
- *	  only prove page ancestry.
+ *	  are history only: their durable retained records contribute read-only
+ *	  recovery inputs and never authorize replay.
  *
  *	  The selection works on the inputs of one cold read scope
  *	  (cluster_wal_inputs_cold_begin_v1) and is pure; the startup adapter
@@ -95,11 +95,13 @@ cluster_cold_census_cover_v1(const ClusterColdCensusEntryV1 *entries, uint32 cou
  * of input `index` of the cold read scope and feed the plan as participant
  * `participant`, as cluster_cold_scan_root_v1 does for a crashed root.
  * Accepted only when the visit and its observed cut (record count, complete
- * end) match the input's ROOT record.
+ * end) match the input's ROOT record. An optional SIDE plan captures the same
+ * original records without granting history mutation authority.
  */
 extern ClusterColdDetailV1 cluster_cold_scan_input_v1(ClusterColdPlanV1 *plan, uint32 participant,
 													  ClusterWalInputsV1 *inputs, uint32 index,
 													  bool space_active, bool foreign,
+													  struct RfSideOnlinePlanV1 *side_plan,
 													  ClusterColdScanResultV1 *result);
 
 #endif /* CLUSTER_COLD_RECOVERY_CENSUS_H */

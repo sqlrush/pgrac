@@ -88,6 +88,17 @@ typedef struct ClusterMultiXactShmem {
 
 static HTAB *ClusterMultiXactHTAB = NULL;
 static LWLock *ClusterMultiXactLock = NULL;
+
+/* Ordinary heap visibility must not fall back to the dormant SOURCE side
+ * while a recovered member is still proving the durable OPEN binding. */
+static bool
+cluster_multixact_recovered_open_admitted(void)
+{
+	if (MyBackendType == B_STARTUP || !cluster_shared_config
+		|| cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_EXISTING_OTHER)
+		return true;
+	return cluster_semantic_activation_recovered_open_current();
+}
 static ClusterMultiXactShmem *ClusterMultiXactState = NULL;
 
 /* ------------------------------------------------------------ */
@@ -707,10 +718,14 @@ cluster_multixact_recovery_projection_apply(void *arg, int origin_slot, uint32 c
 			|| !cluster_multixact_projection_build_members(cluster_epoch, native_members,
 														   operation->member_count, members, wraps))
 			return false;
+		/* Do not expose a derived change before native sync/readback. */
 		if (cluster_shared_config
-			&& !cluster_multixact_native_recovery_apply(origin_slot, operation, owned_payload,
-														owned_payload_length, source_lsn,
-														source_end_lsn))
+			&& (!cluster_multixact_native_recovery_apply(origin_slot, operation, owned_payload,
+														 owned_payload_length, source_lsn,
+														 source_end_lsn)
+				|| !cluster_multixact_native_recovery_verify(origin_slot, operation, owned_payload,
+															 owned_payload_length, source_lsn,
+															 source_end_lsn)))
 			return false;
 		memset(&key, 0, sizeof(key));
 		key.origin_node_id = (uint16)origin_slot;
@@ -727,10 +742,14 @@ cluster_multixact_recovery_projection_apply(void *arg, int origin_slot, uint32 c
 		HASH_SEQ_STATUS sequence;
 		ClusterMultiXactOverlayEntry *entry;
 
+		/* Do not expose a derived change before native sync/readback. */
 		if (cluster_shared_config
-			&& !cluster_multixact_native_recovery_apply(origin_slot, operation, owned_payload,
-														owned_payload_length, source_lsn,
-														source_end_lsn))
+			&& (!cluster_multixact_native_recovery_apply(origin_slot, operation, owned_payload,
+														 owned_payload_length, source_lsn,
+														 source_end_lsn)
+				|| !cluster_multixact_native_recovery_verify(origin_slot, operation, owned_payload,
+															 owned_payload_length, source_lsn,
+															 source_end_lsn)))
 			return false;
 		LWLockAcquire(ClusterMultiXactLock, LW_EXCLUSIVE);
 		hash_seq_init(&sequence, ClusterMultiXactHTAB);
@@ -1098,6 +1117,8 @@ cluster_multixact_source_dispatch(ClusterMultiXactSourceOp op,
 	memset(&local_result, 0, sizeof(local_result));
 	if (result != NULL)
 		memset(result, 0, sizeof(*result));
+	if (!cluster_multixact_recovered_open_admitted())
+		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 
 	admission = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
 												  CLUSTER_SEMANTIC_SOURCE_SIDE, &token);
@@ -1155,6 +1176,8 @@ cluster_multixact_remote_xmax_visibility_dispatch(const ClusterMultiXactSourceRe
 	memset(&local_result, 0, sizeof(local_result));
 	if (result != NULL)
 		memset(result, 0, sizeof(*result));
+	if (!cluster_multixact_recovered_open_admitted())
+		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 
 	admission = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
 												  CLUSTER_SEMANTIC_TARGET_SIDE, &token);

@@ -29,6 +29,9 @@ static int page_seal_step;
 static int side_seal_step;
 static bool fail_page_feed;
 static bool fail_side_feed;
+static bool fail_side_bind;
+static unsigned side_bind_calls;
+static const ClusterWalSourceRef *observed_sources;
 static bool fail_lifecycle;
 static unsigned lifecycle_calls;
 static bool census_mode, census_refuse;
@@ -64,6 +67,17 @@ rf_page_online_plan_bind_sources_v1(RfPageOnlinePlanV1 *plan, const ClusterWalSo
 	UT_ASSERT(plan == (RfPageOnlinePlanV1 *)&page_plan_object);
 	UT_ASSERT_EQ(step, 0);
 	return sources != NULL && count == 1;
+}
+
+bool
+rf_side_online_plan_bind_sources_v1(RfSideOnlinePlanV1 *plan, const ClusterWalSourceRef *sources,
+									uint32 count)
+{
+	UT_ASSERT(plan == (RfSideOnlinePlanV1 *)&side_plan_object);
+	UT_ASSERT_EQ(step, 0);
+	side_bind_calls++;
+	observed_sources = sources;
+	return !fail_side_bind && sources != NULL && count == 1;
 }
 
 RfPageProofDetailV1
@@ -442,10 +456,38 @@ UT_TEST(test_pi_creation_boundary_must_close_before_exposing_page_graph)
 	fail_lifecycle = false;
 }
 
+UT_TEST(test_full_sources_reach_side_before_feed_and_failure_cleans_plan)
+{
+	ClusterThreadRecoveryFabricPlanRequestV1 request = { 0 };
+	ClusterWalSourceRef source = { 0 };
+	RfContributorStreamCutV1 cut = { 0 };
+	ClusterThreadRecoveryFabricPlanV1 *plan = NULL;
+	reset_steps();
+	request.system_identifier = 99;
+	request.physical_cuts = &cut;
+	request.participant_count = 1;
+	request.retention_binding_cookie = 41;
+	request.sources = &source;
+	side_bind_calls = 0;
+	observed_sources = NULL;
+	UT_ASSERT_EQ(cluster_thread_recovery_fabric_plan_create_v1(&request, &plan),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(side_bind_calls, 1);
+	UT_ASSERT(observed_sources == &source);
+	cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
+	fail_side_bind = true;
+	UT_ASSERT_EQ(cluster_thread_recovery_fabric_plan_create_v1(&request, &plan),
+				 RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
+	UT_ASSERT_NULL(plan);
+	UT_ASSERT_EQ(side_bind_calls, 2);
+	cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
+	fail_side_bind = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
 	UT_RUN(test_pi_purpose_is_bound_to_the_side_child_at_creation);
 	UT_RUN(test_pi_creation_boundary_must_close_before_exposing_page_graph);
 	UT_RUN(test_record_is_preflighted_then_fed_to_page_and_side);
@@ -453,6 +495,7 @@ main(void)
 	UT_RUN(test_side_failure_poisons_whole_plan);
 	UT_RUN(test_seal_closes_page_before_side_and_exposes_both);
 	UT_RUN(test_census_binds_original_source_and_validates_global_pages);
+	UT_RUN(test_full_sources_reach_side_before_feed_and_failure_cleans_plan);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -579,7 +579,8 @@ v_zero(const void *ptr, size_t len)
 static ClusterControlRootResult
 compute(ClusterWalRetainedCutV1 *cut, RfPageProofDetailV1 *detail)
 {
-	ClusterControlRootResult result = cluster_wal_retained_cut_compute_v1(&self_ref, cut, detail);
+	ClusterControlRootResult result
+		= cluster_wal_retained_cut_compute_v1(&self_ref, cut, detail, NULL);
 
 	UT_ASSERT_EQ(scopes_open, 0);
 	return result;

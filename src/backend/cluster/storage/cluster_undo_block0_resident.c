@@ -21,6 +21,7 @@
 #include "access/xlog.h"
 #include "miscadmin.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_undo_root_descriptor.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
@@ -886,6 +887,7 @@ cluster_undo_block0_provision_publish(ClusterUndoBlock0Pin *pin, XLogRecPtr init
 	ClusterUndoBlock0SlotData *meta;
 	ClusterUndoBlock0Generation generation;
 	ClusterUndoSmgrPublishResult publish_result;
+	PGAlignedBlock sealed;
 	char *frame;
 
 	if (Block0Ctl == NULL || pin == NULL || pin->slot < 0
@@ -901,11 +903,16 @@ cluster_undo_block0_provision_publish(ClusterUndoBlock0Pin *pin, XLogRecPtr init
 	frame = BLOCK0_FRAME_DATA(meta->frame_index);
 	if (!block0_page_identity(frame, &meta->logical, &generation) || generation.value == UINT32_MAX)
 		ereport(ERROR, (errmsg("invalid undo block-zero provision image")));
+	/* The storage owner seals block zero. Publish those same bytes in the
+	 * resident frame so the first lifecycle writer has an exact predecessor. */
+	memcpy(sealed.data, frame, BLCKSZ);
+	if (!cluster_undo_segment_header_seal(sealed.data))
+		ereport(ERROR, (errmsg("could not seal undo block-zero provision image")));
 
 	XLogFlush(init_lsn);
 	publish_result = cluster_undo_smgr_provision_temp_publish(
 		meta->resolved_root.intent, meta->logical.segment_id, meta->logical.owner_instance,
-		owned->temp_path, frame);
+		owned->temp_path, sealed.data);
 	if (publish_result == CLUSTER_UNDO_SMGR_PUBLISH_EXISTS) {
 		if (cluster_undo_smgr_probe_segment(meta->resolved_root.intent, meta->logical.segment_id,
 											meta->logical.owner_instance, frame)
@@ -915,6 +922,8 @@ cluster_undo_block0_provision_publish(ClusterUndoBlock0Pin *pin, XLogRecPtr init
 			ereport(ERROR, (errmsg("undo block-zero provision winner is not exact")));
 	} else if (publish_result != CLUSTER_UNDO_SMGR_PUBLISH_PUBLISHED)
 		ereport(ERROR, (errmsg("could not publish undo block-zero provision image")));
+	else
+		memcpy(frame, sealed.data, BLCKSZ);
 
 	meta->generation = generation;
 	meta->last_wal_lsn = InvalidXLogRecPtr;
@@ -1015,6 +1024,60 @@ cluster_undo_block0_reserve(const ClusterUndoBlock0LogicalKey *logical,
 		owned->slot = slotno;
 		block0_resource_link(owned);
 	}
+	LWLockRelease(&meta->content_lock);
+	return CLUSTER_UNDO_BLOCK0_OK;
+}
+
+
+ClusterUndoBlock0Result
+cluster_undo_block0_recovery_reserve(const ClusterUndoBlock0LogicalKey *logical,
+	const ClusterUndoBlock0AuthorityProof *proof, ClusterUndoBlock0Pin *pin)
+{
+	ClusterUndoBlock0SlotData *meta;
+	ClusterUndoBlock0OwnedResource *owned;
+	uint32 slotno;
+
+	/* Do not erase a handle that already owns a pin or an unpublished fill. */
+	if (pin != NULL
+		&& (block0_resource_find(pin, CLUSTER_UNDO_BLOCK0_OWNED_RESERVED_PIN) != NULL
+			|| block0_resource_find(pin, CLUSTER_UNDO_BLOCK0_OWNED_LOCKED_PIN) != NULL
+			|| block0_resource_find(pin, CLUSTER_UNDO_BLOCK0_OWNED_FILL) != NULL
+			|| block0_resource_find(pin, CLUSTER_UNDO_BLOCK0_OWNED_PROVISION) != NULL))
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	block0_pin_clear(pin);
+	if (Block0Ctl == NULL)
+		return CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+	if (pin == NULL
+		|| cluster_undo_block0_logical_slot(logical, &slotno) != CLUSTER_UNDO_BLOCK0_OK)
+		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+	if (!block0_authority_proof_valid(logical, proof)
+		|| (proof->kind != CLUSTER_UNDO_BLOCK0_RECOVERY_OWNER
+			&& proof->kind != CLUSTER_UNDO_BLOCK0_STARTUP_REDO)
+		|| proof->recovery_generation == 0)
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	owned = block0_resource_prepare(pin, CLUSTER_UNDO_BLOCK0_OWNED_RESERVED_PIN);
+	if (owned == NULL)
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	/* Register before acquiring the lock: ERROR can then reclaim the metadata
+	 * even before a slot is owned. The original callback ignores an unset slot. */
+	block0_resource_link(owned);
+	meta = &Block0Slots[slotno].data;
+	LWLockAcquire(&meta->content_lock, LW_EXCLUSIVE);
+	if (pg_atomic_read_u32(&meta->state) != CLUSTER_UNDO_BLOCK0_SLOT_EMPTY
+		|| pg_atomic_read_u32(&meta->pincount) != 0
+		|| meta->frame_index != CLUSTER_UNDO_BLOCK0_FRAME_INVALID
+		|| !XLogRecPtrIsInvalid(meta->last_wal_lsn)) {
+		LWLockRelease(&meta->content_lock);
+		block0_resource_forget(owned);
+		return CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+	}
+	pg_atomic_write_u32(&meta->pincount, 1);
+	owned->slot = slotno;
+	pin->slot = (int)slotno;
+	pin->logical = *logical;
+	pin->proof = *proof;
+	/* EMPTY state, frame bank, root and generation are deliberately untouched.
+	 * WAL insertion must not retain the content lock. */
 	LWLockRelease(&meta->content_lock);
 	return CLUSTER_UNDO_BLOCK0_OK;
 }
@@ -1765,6 +1828,7 @@ cluster_undo_block0_flush_sync(ClusterUndoBlock0Pin *pin, const char *successor_
 	ClusterUndoBlock0Generation successor_generation;
 	XLogRecPtr flush_lsn;
 	uint32 state;
+	PGAlignedBlock sealed;
 
 	if (Block0Ctl == NULL || pin == NULL || pin->slot < 0
 		|| pin->slot >= CLUSTER_UNDO_BLOCK0_SLOT_COUNT || pin->mode != CLUSTER_UNDO_BLOCK0_EXCLUSIVE
@@ -1782,6 +1846,9 @@ cluster_undo_block0_flush_sync(ClusterUndoBlock0Pin *pin, const char *successor_
 		ereport(ERROR, (errmsg("undo block-zero synchronous flush found invalid resident state")));
 	if (XLogRecPtrIsInvalid(required_wal_lsn) && state == CLUSTER_UNDO_BLOCK0_SLOT_VALID_DIRTY)
 		ereport(ERROR, (errmsg("undo block-zero dirty flush requires a valid WAL LSN")));
+	memcpy(sealed.data, successor_page, BLCKSZ);
+	if (!cluster_undo_segment_header_seal(sealed.data))
+		ereport(ERROR, (errmsg("could not seal undo block-zero synchronous flush image")));
 
 	flush_lsn = required_wal_lsn;
 	if (!XLogRecPtrIsInvalid(meta->last_wal_lsn)
@@ -1790,10 +1857,10 @@ cluster_undo_block0_flush_sync(ClusterUndoBlock0Pin *pin, const char *successor_
 	if (!XLogRecPtrIsInvalid(flush_lsn))
 		XLogFlush(flush_lsn);
 	if (!cluster_undo_smgr_write_block(meta->resolved_root.intent, meta->logical.segment_id,
-									   meta->logical.owner_instance, 0, successor_page, true))
+									   meta->logical.owner_instance, 0, sealed.data, true))
 		ereport(ERROR, (errmsg("could not flush undo block zero")));
 
-	memcpy(BLOCK0_FRAME_DATA(meta->frame_index), successor_page, BLCKSZ);
+	memcpy(BLOCK0_FRAME_DATA(meta->frame_index), sealed.data, BLCKSZ);
 	meta->generation = successor_generation;
 	pin->observed_generation = successor_generation;
 	meta->last_wal_lsn = InvalidXLogRecPtr;
@@ -1840,6 +1907,43 @@ cluster_undo_block0_release_reservation(ClusterUndoBlock0Pin *pin)
 	block0_pin_clear(pin);
 }
 
+
+/* Reuse even an EMPTY slot's initialized content lock. This is I/O
+ * serialization only: residency, current authority and generation stay with
+ * their original callers. Never acquire frame_lock under this lock. */
+bool
+cluster_undo_block0_header_write_lock(uint32 segment_id, uint8 owner_instance,
+	uint32 *acquired_slot)
+{
+	ClusterUndoBlock0LogicalKey logical = { 0 };
+	LWLock *lock;
+	uint32 slotno;
+
+	if (acquired_slot == NULL)
+		return false;
+	*acquired_slot = UINT32_MAX;
+	logical.segment_id = segment_id;
+	logical.owner_instance = owner_instance;
+	if (cluster_undo_block0_logical_slot(&logical, &slotno) != CLUSTER_UNDO_BLOCK0_OK)
+		return false;
+	if (Block0Ctl == NULL)
+		return !IsUnderPostmaster;
+	lock = &Block0Slots[slotno].data.content_lock;
+	if (LWLockHeldByMeInMode(lock, LW_EXCLUSIVE))
+		return true;
+	if (LWLockHeldByMe(lock))
+		return false;
+	LWLockAcquire(lock, LW_EXCLUSIVE);
+	*acquired_slot = slotno;
+	return true;
+}
+
+void
+cluster_undo_block0_header_write_unlock(uint32 acquired_slot)
+{
+	if (acquired_slot != UINT32_MAX)
+		LWLockRelease(&Block0Slots[acquired_slot].data.content_lock);
+}
 
 /*
  * Record that header bytes of one segment reached its file without an fsync.

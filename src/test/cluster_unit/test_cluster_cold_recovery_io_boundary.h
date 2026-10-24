@@ -27,6 +27,14 @@
 #ifndef TEST_CLUSTER_COLD_RECOVERY_IO_BOUNDARY_H
 #define TEST_CLUSTER_COLD_RECOVERY_IO_BOUNDARY_H
 
+#include "cluster/cluster_side_online_plan.h"
+#include "access/clog.h"
+#include "access/commit_ts.h"
+#include "access/multixact.h"
+#include "access/subtrans.h"
+#include "cluster/storage/cluster_undo_buf.h"
+#include "postmaster/bgwriter.h"
+
 /* ---- process and memory boundaries ---- */
 volatile sig_atomic_t InterruptPending = false;
 static uint32 wait_event_slot;
@@ -301,11 +309,48 @@ static ClusterControlRootResult visit_result;
 static uint64 observed_records_delta;
 static XLogRecPtr observed_end;
 static ClusterColdDetailV1 decode_refusal_at[MAX_VISIT];
+static ClusterColdXidInputV1 decode_xid_input[MAX_VISIT];
 static bool decode_saw_foreign;
 static bool decode_saw_space_active;
 static uint64 decode_saw_system;
 static uint8 decode_saw_uuid0;
 static int decode_releases;
+static ClusterWalRecoveryCheckpointV1 selected_checkpoint;
+static ClusterControlRootResult checkpoint_result;
+static XLogRecord visit_headers[MAX_VISIT];
+static CheckPoint visit_checkpoints[MAX_VISIT];
+static uint32 visit_lengths[MAX_VISIT];
+static int visit_blocks[MAX_VISIT];
+
+ClusterControlRootResult
+cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *expected,
+											const ClusterControlRootReadToken *token,
+											ClusterWalRecoveryCheckpointV1 *out)
+{
+	(void)expected;
+	(void)token;
+	*out = selected_checkpoint;
+	return checkpoint_result;
+}
+
+
+static int side_capture_token, side_capture_calls, side_capture_fail_at;
+static RfPageOnlineRecordIdentityV1 captured_identity[4];
+static RfPageProofDetailV1 side_capture_refusal;
+
+RfPageProofDetailV1
+rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *record,
+								   const RfPageOnlineRecordIdentityV1 *identity)
+{
+	UT_ASSERT(plan == (RfSideOnlinePlanV1 *)&side_capture_token);
+	UT_ASSERT(record->preflight_complete && record->source_record != NULL);
+	UT_ASSERT_EQ(record->source_record->ReadRecPtr, identity->record.read_rec_ptr);
+	UT_ASSERT_EQ(record->source_record->EndRecPtr, identity->record.end_rec_ptr);
+	UT_ASSERT(side_capture_calls < 4);
+	captured_identity[side_capture_calls++] = *identity;
+	return side_capture_calls == side_capture_fail_at ? side_capture_refusal
+													  : RF_PAGE_PROOF_DETAIL_OK;
+}
 
 ClusterControlRootResult
 cluster_control_root_recovery_visit(const ClusterControlRootSnapshot *expected,
@@ -314,21 +359,28 @@ cluster_control_root_recovery_visit(const ClusterControlRootSnapshot *expected,
 									ClusterWalTailObservation *out)
 {
 	XLogReaderState reader;
+	DecodedXLogRecord *record = calloc(1, sizeof(*record));
 	int i;
 
 	(void)expected;
 	(void)token;
 	memset(out, 0, sizeof(*out));
 	memset(&reader, 0, sizeof(reader));
+	reader.record = record;
 	for (i = 0; i < visit_count; i++) {
 		reader.ReadRecPtr = visit_read[i];
 		reader.EndRecPtr = visit_end[i];
+		record->header = visit_headers[i];
+		record->main_data = (char *)&visit_checkpoints[i];
+		record->main_data_len = visit_lengths[i];
+		record->max_block_id = visit_blocks[i];
 		out->records++;
 		if (!visitor(&reader, arg))
 			break;
 	}
 	out->records += observed_records_delta;
 	out->complete_end = observed_end;
+	free(record);
 	return visit_result;
 }
 
@@ -357,6 +409,11 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 	out->record.prev_rec_ptr = i == 0 ? reader->ReadRecPtr - 0x40 : visit_read[i - 1];
 	out->record.scn = 1;
 	out->record.rmid = RM_HEAP_ID;
+	out->record.info = 0x10;
+	out->record.record_crc = 0x9876;
+	out->xid_input = decode_xid_input[i];
+	out->detached.source_record = reader;
+	out->detached.preflight_complete = true;
 	return CLUSTER_COLD_OK;
 }
 
@@ -492,6 +549,55 @@ cluster_recovery_merge_fence_plan_origin(const ClusterRecoveryFencePlan *plan, u
 #define MAX_BARRIER_EVENTS 32
 static char barrier_events[MAX_BARRIER_EVENTS][32];
 static int barrier_event_count;
+static char native_barrier_events[32];
+static unsigned native_barrier_count;
+static int native_sync_relation_events;
+static bool native_sync_ok = true;
+
+static void
+native_barrier_event(char event)
+{
+	if (native_barrier_count + 1 >= sizeof(native_barrier_events))
+		abort();
+	native_barrier_events[native_barrier_count++] = event;
+	native_barrier_events[native_barrier_count] = '\0';
+}
+
+void
+CheckPointCLOG(void)
+{
+	native_barrier_event('c');
+}
+void
+CheckPointCommitTs(void)
+{
+	native_barrier_event('t');
+}
+void
+CheckPointSUBTRANS(void)
+{
+	native_barrier_event('p');
+}
+void
+CheckPointMultiXact(void)
+{
+	native_barrier_event('m');
+}
+
+void
+cluster_undo_buf_flush_all(bool checkpoint)
+{
+	UT_ASSERT(checkpoint);
+	native_barrier_event('u');
+}
+
+bool
+RequestStartupSync(void)
+{
+	native_barrier_event('s');
+	native_sync_relation_events = barrier_event_count;
+	return native_sync_ok;
+}
 
 static void
 barrier_event(char kind, const RelFileLocator *locator, int fork)

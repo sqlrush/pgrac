@@ -14,6 +14,14 @@
 #undef fprintf
 #include "unit_test.h"
 UT_DEFINE_GLOBALS();
+/* Single-thread fixture: a contended slot means an illegal retained lock. */
+int
+s_lock(volatile slock_t *lock, const char *file, int line, const char *func)
+{
+	fprintf(stderr, "unexpected slot lock at %s:%d %s\n", file, line, func);
+	abort();
+}
+
 
 bool IsUnderPostmaster = true;
 BackendType MyBackendType = B_LMON;

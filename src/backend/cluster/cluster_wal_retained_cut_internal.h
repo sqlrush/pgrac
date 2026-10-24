@@ -129,6 +129,13 @@ typedef struct RetainedCutWork {
 	bool prepared_overflow;
 	RetainedPrepare prepares[RETAINED_PREPARED_MAX];
 	TransactionId resolved[RETAINED_PREPARED_MAX];
+	/* D1 native producer observations; never used as a proof or cut input. */
+	uint64 native_smgr_create_records;
+	uint64 native_xact_invalidation_records;
+	uint64 native_xact_assignment_records;
+	uint64 native_dropped_stats_records;
+	uint64 native_dropped_stats_items;
+	uint32 native_effects_incomplete;
 	/* Decoder scratch, too large for the stack. */
 	RfSideXactOperationV1 xact;
 } RetainedCutWork;

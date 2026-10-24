@@ -193,4 +193,41 @@ extern void cluster_space_drop_finish(ClusterSpaceDropState *state);
  * No previous record or process-local intent is required at a checkpoint cut. */
 extern bool cluster_space_drop_replay_commit(XLogReaderState *record, TransactionId xid);
 
+/* Cold native COMMIT postcondition only, after the qualified deletion.
+ * Neither replay authority nor a durable completion / missing-SPACE proof. */
+extern bool cluster_space_drop_replay_verify_v1(XLogReaderState *record, TransactionId xid);
+
+/* Original native cold COMMIT, after its qualified deletion: bind every
+ * native/typed target, sync existing results, then recheck the whole set.
+ * Not replay-from-absence authority or the final cold ROOT seal. */
+extern bool cluster_space_drop_replay_finish_v1(XLogReaderState *record, TransactionId xid);
+
+/* Executable cold foreign-source owner only, borrowing its immutable,
+ * fully decoded selected COMMIT (reader must not advance). Qualifies every original
+ * native/typed shared target, syncs that source, then performs the native
+ * deletion and strict whole-result sync/readback. Structural effect only:
+ * caller still owes canonical TT/CLOG, remaining COMMIT effects and final
+ * cold seal. Does not authorize replay from missing SPACE. */
+extern bool cluster_space_cold_drop_foreign_v1(XLogReaderState *record, TransactionId xid);
+/* Same complete structural proof without mutation, before the selected
+ * compound record changes canonical TT/CLOG. Execution rechecks it again. */
+extern bool cluster_space_cold_drop_foreign_preflight_v1(XLogReaderState *record,
+														 TransactionId xid);
+
+/* Same physical postcondition at the original sequencer's final callback,
+ * after all scheduled records executed and every source was fully drained.
+ * The sealed final TOMBSTONE binds the target, not execution authority. */
+extern bool cluster_space_cold_drop_postcondition_v1(const ClusterSpaceIdentityKey *key,
+													 const ClusterSpaceRecoveryInput *input,
+													 const ClusterSpaceColdSourceV1 *source);
+
+/* Final executed DROP result: verify, sync MAIN and its directory, then
+ * recheck the same cold namespace/source. No deletion or completion publish. */
+extern bool cluster_space_cold_drop_foreign_sync_v1(const ClusterSpaceIdentityKey *key,
+													const ClusterSpaceRecoveryInput *input,
+													const ClusterSpaceColdSourceV1 *source);
+extern bool cluster_space_cold_drop_sync_v1(const ClusterSpaceIdentityKey *key,
+											const ClusterSpaceRecoveryInput *input,
+											const ClusterSpaceColdSourceV1 *source);
+
 #endif /* CLUSTER_SPACE_STORAGE_H */

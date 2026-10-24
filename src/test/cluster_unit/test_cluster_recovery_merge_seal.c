@@ -417,10 +417,98 @@ UT_TEST(test_unsafe_history_refused_before_seal)
 	UT_ASSERT_EQ(open_calls[2], 0);
 }
 
+UT_TEST(test_no_plan_refusal_identifies_snapshot_and_output_cut)
+{
+	ClusterRecoveryFencePlan *plan = NULL;
+	ClusterMergeEngage engage;
+
+	fixture();
+	plan_snapshot_available = true;
+	last_plan_log_detail[0] = '\0';
+	census.failed = census.generated = true;
+	UT_ASSERT(preflight(&plan, &engage));
+	UT_ASSERT_EQ(engage, CLUSTER_MERGE_NO_NO_PLAN);
+	UT_ASSERT(plan == NULL && events[0] == '\0');
+	UT_ASSERT(strstr(last_plan_log_detail, "predicate=PLAN_FAILED") != NULL);
+	UT_ASSERT(strstr(last_plan_log_detail, "generated=1") != NULL);
+
+	fixture();
+	last_plan_log_detail[0] = '\0';
+	plan_snapshot_available = false;
+	UT_ASSERT(preflight(&plan, &engage));
+	plan_snapshot_available = true;
+	UT_ASSERT_EQ(engage, CLUSTER_MERGE_NO_NO_PLAN);
+	UT_ASSERT(plan == NULL && events[0] == '\0');
+	UT_ASSERT(strstr(last_plan_log_detail, "predicate=PLAN_SNAPSHOT_UNAVAILABLE") != NULL);
+
+	fixture();
+	last_plan_log_detail[0] = '\0';
+	UT_ASSERT_EQ(cluster_recovery_merge_preflight_readonly(1, 100, NULL),
+		CLUSTER_MERGE_NO_NO_PLAN);
+	UT_ASSERT(strstr(last_plan_log_detail, "predicate=PLAN_OUTPUT_NOT_EMPTY") != NULL);
+	UT_ASSERT(strstr(last_plan_log_detail, "output_null=1") != NULL);
+	UT_ASSERT(events[0] == '\0');
+
+	plan = malloc(1);
+	UT_ASSERT(plan != NULL);
+	{
+		ClusterRecoveryFencePlan *original = plan;
+
+		last_plan_log_detail[0] = '\0';
+		UT_ASSERT_EQ(cluster_recovery_merge_preflight_readonly(1, 100, &plan),
+			CLUSTER_MERGE_NO_NO_PLAN);
+		UT_ASSERT(plan == original);
+		UT_ASSERT(strstr(last_plan_log_detail, "output_null=0") != NULL);
+		UT_ASSERT(events[0] == '\0');
+	}
+	free(plan);
+}
+
+UT_TEST(test_pre2_preflight_uses_cold_cohort_and_prior_writer_needs)
+{
+	ClusterRecoveryFencePlan *plan = NULL;
+
+	fixture();
+	expect_engaged(&plan);
+	UT_ASSERT_EQ(cold_formations_built, NODES - 1);
+	UT_ASSERT_EQ(online_formations_built, 0);
+	UT_ASSERT_EQ(cold_needs_built, NODES - 1);
+	UT_ASSERT_EQ(online_needs_built, 0);
+	cluster_recovery_merge_fence_plan_destroy(&plan);
+	UT_ASSERT_EQ(formations_destroyed, formations_built);
+}
+
+UT_TEST(test_pre2_need_set_refusal_reports_original_provider_predicate)
+{
+	const char *predicates[] = {
+		"CONTROL_ROOT_CAPABILITY_UNAVAILABLE",
+		"ROOT_FENCING_PROVIDER_INACTIVE"
+	};
+
+	for (unsigned n = 0; n < lengthof(predicates); n++) {
+		ClusterRecoveryFencePlan *plan = NULL;
+		char detail[128];
+
+		fixture();
+		cold_need_result = PGRAC_EXTERNAL_FENCE_NEED_SET_CAPABILITY_UNAVAILABLE;
+		cold_need_predicate = predicates[n];
+		snprintf(detail, sizeof(detail), "predicate=%s", predicates[n]);
+		expect_refused(&plan, ERRCODE_CLUSTER_EXTERNAL_FENCE_UNAVAILABLE, detail);
+		UT_ASSERT(strstr(last_detail, "stage need-set") != NULL);
+		UT_ASSERT_EQ(cold_needs_built, 1);
+		UT_ASSERT_EQ(formations_destroyed, NODES - 1);
+	}
+	cold_need_result = PGRAC_EXTERNAL_FENCE_NEED_SET_OK;
+	cold_need_predicate = "NONE";
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(13);
+	UT_RUN(test_pre2_need_set_refusal_reports_original_provider_predicate);
+	UT_RUN(test_pre2_preflight_uses_cold_cohort_and_prior_writer_needs);
+	UT_RUN(test_no_plan_refusal_identifies_snapshot_and_output_cut);
 	UT_RUN(test_open_generations_are_sealed_after_admission);
 	UT_RUN(test_partial_seal_resumes);
 	UT_RUN(test_stale_admission_refuses_before_any_seal);

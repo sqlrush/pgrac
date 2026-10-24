@@ -29,12 +29,16 @@
 #include "cluster/cluster_ko.h"
 #include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_space_reservation.h"
+#include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
+#include "cluster/storage/cluster_shared_fs.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/buf_internals.h"
 #include "storage/checksum.h"
+#include "storage/md.h"
 #include "storage/smgr.h"
 #include "storage/proc.h"
 #include "utils/catcache.h"
@@ -52,6 +56,18 @@ typedef struct SpaceIdentityCacheEntry {
 
 static HTAB *space_identity_cache;
 static uint64 space_identity_invalidations;
+
+static bool
+space_online_recovered_open(void)
+{
+	if (MyBackendType == B_STARTUP
+		|| cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_EXISTING_OTHER)
+		return true;
+	/* A fresh cohort has no semantic publication to recover yet. Permit the
+	 * initial SPACE identity, but never reopen this window after any publish. */
+	return cluster_semantic_activation_phase1_pristine()
+		   || cluster_semantic_activation_recovered_open_current();
+}
 
 bool
 cluster_space_cold_install_v1(const ClusterSpaceIdentityKey *key,
@@ -412,7 +428,8 @@ cluster_space_buffer_version_component(const ClusterSpaceIdentity *identity, Buf
 	Page page;
 	RfPageProducerComponentV1 captured;
 
-	if (identity == NULL || component == NULL || RecoveryInProgress()
+	if (!space_online_recovered_open()
+		|| identity == NULL || component == NULL || RecoveryInProgress()
 		|| !space_namespace(identity->key.locator, false, &expected, NULL)
 		|| !cluster_space_identity_encode(identity, encoded, sizeof(encoded))
 		|| !cluster_space_identity_decode(encoded, sizeof(encoded), &expected, &checked)
@@ -482,7 +499,8 @@ space_copy_page_wal(const ClusterSpaceIdentity *identity, ForkNumber forknum, Bl
 	PGAlignedBlock result;
 	XLogRecPtr recptr;
 
-	if (lsn == NULL
+	if (!space_online_recovered_open()
+		|| lsn == NULL
 		|| !space_copy_prepare(identity, forknum, block, page, (Page)zero_before,
 							   zero_before == NULL ? RF_PAGE_STATE_ABSENT
 												   : RF_PAGE_STATE_UNFORMATTED,
@@ -521,7 +539,8 @@ cluster_space_copy_buffer_wal(const ClusterSpaceIdentity *identity, const void *
 	Page target;
 	XLogRecPtr lsn;
 
-	if (identity == NULL || !BufferIsValid(destination) || BufferIsLocal(destination)
+	if (!space_online_recovered_open()
+		|| identity == NULL || !BufferIsValid(destination) || BufferIsLocal(destination)
 		|| !BufferIsPermanent(destination))
 		return false;
 	BufferGetTag(destination, &locator, &forknum, &block);
@@ -606,6 +625,8 @@ cluster_space_relation_create(RelFileLocator locator)
 	XLogRecPtr lsn;
 	bool success = false;
 
+	if (!space_online_recovered_open())
+		return false;
 	if (!cluster_shared_config || cluster_smgr_which_for(locator, InvalidBackendId) != 1)
 		return true;
 	if (RecoveryInProgress() || !space_namespace(locator, false, &identity->result.key, NULL))
@@ -681,7 +702,8 @@ cluster_space_reserve(const ClusterSpaceIdentity *identity, const struct HwLock 
 	if (granted == NULL)
 		return InvalidBlockNumber;
 	*granted = 0;
-	if (identity == NULL || lock == NULL || !lock->held || !lock->coordinated
+	if (!space_online_recovered_open()
+		|| identity == NULL || lock == NULL || !lock->held || !lock->coordinated
 		|| lock->req.lockmode != ExclusiveLock || want == 0 || RecoveryInProgress()
 		|| !space_namespace(identity->key.locator, false, &expected, NULL)
 		|| !cluster_space_identity_encode(identity, expected_identity, sizeof(expected_identity))
@@ -812,6 +834,8 @@ space_structure_prepare(const ClusterSpaceIdentityKey *expected, ClusterSpaceWal
 	uint8 apply_mask;
 
 	Assert(action == CLUSTER_SPACE_WAL_TRUNCATE || action == CLUSTER_SPACE_WAL_TOMBSTONE);
+	if (!space_online_recovered_open())
+		return NULL;
 	smgr = smgropen(expected->locator, InvalidBackendId);
 	if (!smgrexists(smgr, SPACE_FORKNUM) || smgrnblocks(smgr, SPACE_FORKNUM) != 2)
 		return NULL;
@@ -1229,8 +1253,31 @@ refused:
 	return NULL;
 }
 
-bool
-cluster_space_drop_replay_commit(XLogReaderState *record, TransactionId xid)
+/* Only the explicit foreign cold consumer can select another source. The
+ * local restart ref still binds the protected namespace; the original cold
+ * SPACE owner separately proves this exact source/record/target. */
+static bool
+space_drop_namespace(RelFileLocator locator, uint16 origin_thread, bool cold_foreign,
+					 ClusterSpaceIdentityKey *out, uint16 *local_thread)
+{
+	uint16 thread;
+
+	if (!space_namespace(locator, true, out, &thread) || thread == 0 || origin_thread == 0)
+		return false;
+	if (cold_foreign) {
+		if (origin_thread > 128 || origin_thread == thread
+			|| !cluster_cold_replay_window_active_v1()
+			|| !cluster_undo_recovery_cold_origin_authorized_v1(origin_thread - 1))
+			return false;
+	} else if (origin_thread != thread)
+		return false;
+	if (local_thread != NULL)
+		*local_thread = thread;
+	return true;
+}
+
+static bool
+space_drop_replay_commit(XLogReaderState *record, TransactionId xid, bool cold_foreign)
 {
 	ClusterSpaceDropState *state;
 	RelFileLocator *sorted;
@@ -1250,7 +1297,7 @@ cluster_space_drop_replay_commit(XLogReaderState *record, TransactionId xid)
 	count = parsed.nrels;
 	if (count == 0)
 		return parsed.nspace_drops == 0;
-	if (cluster_recmerge_apply_foreign
+	if ((cluster_recmerge_apply_foreign && !cold_foreign) || (cold_foreign && !cold)
 		|| (Size)count
 			   > (MaxAllocSize - sizeof(*state)) / (sizeof(*sorted) + sizeof(*state->entries)))
 		return false;
@@ -1263,13 +1310,18 @@ cluster_space_drop_replay_commit(XLogReaderState *record, TransactionId xid)
 		ClusterSpaceStructureChange change;
 		ClusterSpaceTruncateState *entry;
 		SMgrRelation smgr;
-		uint16 local_thread;
 
-		if ((i != 0 && RelFileLocatorEquals(sorted[i], sorted[i - 1]))
-			|| cluster_smgr_which_for(sorted[i], InvalidBackendId) != 1)
+		if (i != 0 && RelFileLocatorEquals(sorted[i], sorted[i - 1]))
 			continue;
-		if (!space_namespace(sorted[i], true, &expected, &local_thread) || local_thread == 0
-			|| local_thread != record->cluster_expected_thread_id
+		if (cluster_smgr_which_for(sorted[i], InvalidBackendId) != 1) {
+			/* An origin's local file cannot be deleted through the founder's
+			 * native path. Every target of this adapter must be shared. */
+			if (cold_foreign)
+				goto refused;
+			continue;
+		}
+		if (!space_drop_namespace(sorted[i], record->cluster_expected_thread_id, cold_foreign,
+								  &expected, NULL)
 			|| record->system_identifier != expected.system_identifier)
 			goto refused;
 		if (consumed >= parsed.nspace_drops
@@ -1284,7 +1336,8 @@ cluster_space_drop_replay_commit(XLogReaderState *record, TransactionId xid)
 			ClusterSpaceRecoveryInput input
 				= { parsed.space_drops + (Size)(consumed - 1) * CLUSTER_SPACE_STRUCTURE_WAL_BYTES,
 					CLUSTER_SPACE_STRUCTURE_WAL_BYTES };
-			ClusterSpaceColdSourceV1 source = { local_thread, record->EndRecPtr };
+			ClusterSpaceColdSourceV1 source
+				= { record->cluster_expected_thread_id, record->EndRecPtr };
 
 			if (!cluster_space_recovery_cold_drop_already_v1(&expected, &input, &source))
 				goto refused;
@@ -1333,6 +1386,292 @@ refused:
 	pfree(sorted);
 	cluster_space_drop_finish(state);
 	return false;
+}
+
+bool
+cluster_space_drop_replay_commit(XLogReaderState *record, TransactionId xid)
+{
+	return space_drop_replay_commit(record, xid, false);
+}
+
+/* A postcondition only. The caller already executed the qualified native
+ * deletion; this must never be used as permission to replay absent SPACE. */
+static bool
+space_drop_physical_result(const ClusterSpaceIdentityKey *key, uint16 origin_thread,
+						   bool cold_foreign)
+{
+	ClusterSpaceIdentityKey expected, after;
+	uint16 thread, after_thread;
+	SMgrRelation smgr;
+
+	if (!space_drop_namespace(key->locator, origin_thread, cold_foreign, &expected, &thread)
+		|| !space_identity_key_matches(key, &expected))
+		return false;
+	smgr = smgropen(expected.locator, InvalidBackendId);
+	/* The final check can revisit the handle used just after deletion.
+	 * Discard recovery's cached nblocks and old fork handles before reading. */
+	smgrrelease(smgr);
+	if (!smgrexists(smgr, MAIN_FORKNUM) || smgrnblocks(smgr, MAIN_FORKNUM) != 0)
+		return false;
+	for (ForkNumber fork = MAIN_FORKNUM + 1; fork <= MAX_FORKNUM; fork++)
+		if (smgrexists(smgr, fork))
+			return false;
+	return space_drop_namespace(key->locator, origin_thread, cold_foreign, &after, &after_thread)
+		   && after_thread == thread && space_identity_key_matches(&expected, &after);
+}
+
+static bool
+space_cold_drop_postcondition(const ClusterSpaceIdentityKey *key,
+							  const ClusterSpaceRecoveryInput *input,
+							  const ClusterSpaceColdSourceV1 *source, bool cold_foreign)
+{
+	ClusterSpaceStructureChange change;
+
+	if (!cluster_shared_config || !cluster_cold_replay_window_active_v1()
+		|| (cluster_recmerge_apply_foreign && !cold_foreign) || !RecoveryInProgress() || key == NULL
+		|| input == NULL || source == NULL || source->origin_thread == 0
+		|| XLogRecPtrIsInvalid(source->end_rec_ptr)
+		|| !cluster_space_structure_wal_decode(input->data, input->length, &change)
+		|| change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE
+		|| !space_identity_key_matches(key, &change.identity.result.key))
+		return false;
+	return space_drop_physical_result(key, source->origin_thread, cold_foreign);
+}
+
+bool
+cluster_space_cold_drop_postcondition_v1(const ClusterSpaceIdentityKey *key,
+										 const ClusterSpaceRecoveryInput *input,
+										 const ClusterSpaceColdSourceV1 *source)
+{
+	return space_cold_drop_postcondition(key, input, source, false);
+}
+
+/* Record-level completion and the original sequencer's final callback both
+ * retain the cold proof across physical sync. Neither grants replay from
+ * absence or final ROOT publication. */
+static bool
+space_cold_drop_sync(const ClusterSpaceIdentityKey *key, const ClusterSpaceRecoveryInput *input,
+					 const ClusterSpaceColdSourceV1 *source, bool cold_foreign)
+{
+	const ClusterSharedFsOps *ops = cluster_shared_fs_get_active_ops();
+
+	if (ops == NULL || ops->id != CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS
+		|| !space_cold_drop_postcondition(key, input, source, cold_foreign)
+		|| !cluster_shared_fs_sharedfs_sync_drop_result(key->locator))
+		return false;
+	return space_cold_drop_postcondition(key, input, source, cold_foreign);
+}
+
+bool
+cluster_space_cold_drop_sync_v1(const ClusterSpaceIdentityKey *key,
+								const ClusterSpaceRecoveryInput *input,
+								const ClusterSpaceColdSourceV1 *source)
+{
+	return space_cold_drop_sync(key, input, source, false);
+}
+
+bool
+cluster_space_cold_drop_foreign_sync_v1(const ClusterSpaceIdentityKey *key,
+										const ClusterSpaceRecoveryInput *input,
+										const ClusterSpaceColdSourceV1 *source)
+{
+	return space_cold_drop_sync(key, input, source, true);
+}
+
+static bool
+space_drop_replay_verify(XLogReaderState *record, TransactionId xid, bool cold_foreign)
+{
+	xl_xact_parsed_commit parsed;
+
+	/* This only checks the result of the native deletion above its I/O
+	 * boundary. The original preflight must already have proved every
+	 * tombstone; absent files are never a substitute for that authority. */
+	if (!cluster_shared_config || !cluster_cold_replay_window_active_v1()
+		|| (cluster_recmerge_apply_foreign && !cold_foreign) || record == NULL
+		|| record->record == NULL || !RecoveryInProgress() || !TransactionIdIsNormal(xid)
+		|| XLogRecGetRmid(record) != RM_XACT_ID
+		|| (XLogRecGetInfo(record) & XLOG_XACT_OPMASK) != XLOG_XACT_COMMIT
+		|| XLogRecGetXid(record) != xid || XLogRecHasAnyBlockRefs(record)
+		|| XLogRecPtrIsInvalid(record->ReadRecPtr) || record->EndRecPtr <= record->ReadRecPtr
+		|| !ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)XLogRecGetData(record),
+							  XLogRecGetDataLen(record), &parsed)
+		|| parsed.nrels <= 0)
+		return false;
+	for (int i = 0; i < parsed.nrels; i++) {
+		ClusterSpaceIdentityKey expected;
+
+		if (cluster_smgr_which_for(parsed.xlocators[i], InvalidBackendId) != 1) {
+			if (cold_foreign)
+				return false;
+			continue;
+		}
+		if (!space_drop_namespace(parsed.xlocators[i], record->cluster_expected_thread_id,
+								  cold_foreign, &expected, NULL)
+			|| expected.system_identifier != record->system_identifier)
+			return false;
+		/* Shared redo keeps MAIN as an empty relfilenumber placeholder.
+		 * Auxiliary unlink can report WARNING, so returning from the native
+		 * delete is not sufficient to establish this physical postcondition. */
+		if (!space_drop_physical_result(&expected, record->cluster_expected_thread_id,
+										cold_foreign))
+			return false;
+	}
+	/* No sync, completion publication or replay-from-absence permission.
+	 * The original cold owner still owes its final durability/ROOT seal. */
+	return true;
+}
+
+bool
+cluster_space_drop_replay_verify_v1(XLogReaderState *record, TransactionId xid)
+{
+	return space_drop_replay_verify(record, xid, false);
+}
+
+/* Complete this COMMIT's structural effect before its caller continues to
+ * later effects. The record-ordered cold owner already installed every exact
+ * TOMBSTONE and performed native deletion. A final full-source seal is still
+ * required; neither empty files nor this sync authorize replay from absence. */
+static bool
+space_drop_replay_finish(XLogReaderState *record, TransactionId xid, bool cold_foreign)
+{
+	typedef struct ColdDropResult {
+		ClusterSpaceIdentityKey key;
+		ClusterSpaceRecoveryInput input;
+		ClusterSpaceColdSourceV1 source;
+	} ColdDropResult;
+	xl_xact_parsed_commit parsed;
+	const ClusterSharedFsOps *ops;
+	ColdDropResult *results;
+	RelFileLocator *sorted;
+	uint32 count = 0;
+	volatile bool ok = false;
+
+	if (!space_drop_replay_verify(record, xid, cold_foreign)
+		|| !ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)XLogRecGetData(record),
+							  XLogRecGetDataLen(record), &parsed)
+		|| (Size)parsed.nrels > MaxAllocSize / (sizeof(*results) + sizeof(*sorted)))
+		return false;
+	ops = cluster_shared_fs_get_active_ops();
+	if (ops == NULL || ops->id != CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS)
+		return false;
+	/* One bounded allocation, including the native sort view, is released on
+ * every refusal and ERROR. The complete WAL payload is borrowed unchanged. */
+	results = palloc0((Size)parsed.nrels * (sizeof(*results) + sizeof(*sorted)));
+	sorted = (RelFileLocator *)(results + parsed.nrels);
+	PG_TRY();
+	{
+		memcpy(sorted, parsed.xlocators, (Size)parsed.nrels * sizeof(*sorted));
+		qsort(sorted, parsed.nrels, sizeof(*sorted), space_locator_compare);
+		/* Match the original COMMIT preflight's sorted distinct shared targets.
+ * A later malformed/unbound target must refuse before the first sync. */
+		for (int i = 0; i < parsed.nrels; i++) {
+			ColdDropResult *target = &results[count];
+
+			if ((i != 0 && RelFileLocatorEquals(sorted[i], sorted[i - 1]))
+				|| cluster_smgr_which_for(sorted[i], InvalidBackendId) != 1)
+				continue;
+			if (count >= parsed.nspace_drops
+				|| !space_drop_namespace(sorted[i], record->cluster_expected_thread_id,
+										 cold_foreign, &target->key, NULL)
+				|| target->key.system_identifier != record->system_identifier)
+				goto done;
+			target->input = (ClusterSpaceRecoveryInput){
+				parsed.space_drops + (Size)count * CLUSTER_SPACE_STRUCTURE_WAL_BYTES,
+				CLUSTER_SPACE_STRUCTURE_WAL_BYTES
+			};
+			target->source = (ClusterSpaceColdSourceV1){ record->cluster_expected_thread_id,
+														 record->EndRecPtr };
+			if (!space_cold_drop_postcondition(&target->key, &target->input, &target->source,
+											   cold_foreign))
+				goto done;
+			count++;
+		}
+		if (count != parsed.nspace_drops)
+			goto done;
+		for (uint32 i = 0; i < count; i++)
+			if (!space_cold_drop_sync(&results[i].key, &results[i].input, &results[i].source,
+									  cold_foreign))
+				goto done;
+		/* Revisit earlier targets after the last target's I/O. No partial set
+ * can be returned as complete, even if an earlier fsync itself succeeded. */
+		for (uint32 i = 0; i < count; i++)
+			if (!space_cold_drop_postcondition(&results[i].key, &results[i].input,
+											   &results[i].source, cold_foreign))
+				goto done;
+		ok = space_drop_replay_verify(record, xid, cold_foreign);
+	done:;
+	}
+	PG_FINALLY();
+	{
+		pfree(results);
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+bool
+cluster_space_drop_replay_finish_v1(XLogReaderState *record, TransactionId xid)
+{
+	return space_drop_replay_finish(record, xid, false);
+}
+
+bool
+cluster_space_cold_drop_foreign_preflight_v1(XLogReaderState *record, TransactionId xid)
+{
+	return cluster_shared_config && cluster_cold_replay_window_active_v1()
+		   && space_drop_replay_commit(record, xid, true);
+}
+
+bool
+cluster_space_cold_drop_foreign_v1(XLogReaderState *record, TransactionId xid)
+{
+	xl_xact_parsed_commit parsed;
+	RelFileLocator *targets;
+	uint32 count = 0;
+	uint16 origin;
+	volatile bool ok = false;
+
+	if (!cluster_shared_config || !cluster_cold_replay_window_active_v1() || !RecoveryInProgress()
+		|| record == NULL || record->record == NULL
+		|| (origin = record->cluster_expected_thread_id) == 0 || origin > 128
+		|| !cluster_undo_recovery_cold_origin_authorized_v1(origin - 1)
+		|| !space_drop_replay_commit(record, xid, true)
+		|| !ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)XLogRecGetData(record),
+							  XLogRecGetDataLen(record), &parsed)
+		|| parsed.nrels <= 0)
+		return false;
+	/* The native pending-delete list can repeat a locator; its typed tail
+	 * proves distinct targets. Keep the original record for every check, but
+	 * never pass duplicate SMgrRelation handles to native close/unlink. The
+	 * complete preflight above bounds nrels before this private allocation. */
+	targets = palloc((Size)parsed.nrels * sizeof(*targets));
+	PG_TRY();
+	{
+		memcpy(targets, parsed.xlocators, (Size)parsed.nrels * sizeof(*targets));
+		qsort(targets, parsed.nrels, sizeof(*targets), space_locator_compare);
+		for (int i = 0; i < parsed.nrels; i++)
+			if (count == 0 || !RelFileLocatorEquals(targets[i], targets[count - 1]))
+				targets[count++] = targets[i];
+		/* Sync the actual retained source outside CF, then prove every target
+		 * again. A source/namespace/tombstone lost during that I/O cannot delete.
+		 * Never flush this foreign record through local XLogFlush or alter the
+		 * ambient replay flag to enter an otherwise forbidden native route. */
+		if (cluster_undo_recovery_cold_source_sync_v1(origin - 1)
+			&& cluster_undo_recovery_cold_source_synced_v1(origin - 1)
+			&& space_drop_replay_commit(record, xid, true) && cluster_cold_replay_window_active_v1()
+			&& cluster_undo_recovery_cold_source_synced_v1(origin - 1)) {
+			DropRelationFiles(targets, count, true);
+			ok = cluster_undo_recovery_cold_source_synced_v1(origin - 1)
+				 && space_drop_replay_finish(record, xid, true)
+				 && cluster_undo_recovery_cold_source_synced_v1(origin - 1);
+		}
+	}
+	PG_FINALLY();
+	{
+		pfree(targets);
+	}
+	PG_END_TRY();
+	return ok;
 }
 
 static bool

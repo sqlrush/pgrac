@@ -2223,6 +2223,13 @@ cluster_undo_record_prepare_trace_impl(uint8 record_type, uint16 payload_capacit
 	if (receipt == NULL)
 		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
 	memset(receipt, 0, sizeof(*receipt));
+	/* Existing-other starts keep ordinary undo creation closed until the
+	 * recovered semantic OPEN cut is visible.  Startup/recovery-owned undo
+	 * preparation retains its original authority path. */
+	if (MyBackendType != B_STARTUP && cluster_shared_config
+		&& cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& !cluster_semantic_activation_recovered_open_current())
+		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
 	if (record_type == UNDO_RECORD_INVALID || record_type > UNDO_RECORD_ITL
 		|| payload_capacity > (uint16)cluster_undo_record_inline_max_bytes
 		|| UndoRecordShared == NULL || absolute_deadline_us == 0)

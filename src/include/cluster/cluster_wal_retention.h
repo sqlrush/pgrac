@@ -346,6 +346,13 @@ extern ClusterWalrReleaseResult cluster_wal_read_pin_release_v1(ClusterWalReadPi
 extern ClusterWalPinResult
 cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *requests,
 								  uint16 nthreads, ClusterWalRetentionPin **out_pin);
+/* Acquire one ordered WALR-S union before IR. input_threads is the sorted,
+ * distinct physical source set and must contain every recovery request.
+ * Extra threads protect retained inputs only: they never add IR, recovery
+ * duties or publication authority. Qualify ROOT/claims/durability separately. */
+extern ClusterWalPinResult cluster_wal_retention_pin_acquire_inputs_v1(
+	const ClusterWalRetentionPinThreadRequest *requests, uint16 nthreads,
+	const uint16 *input_threads, uint16 ninput_threads, ClusterWalRetentionPin **out_pin);
 extern ClusterWalPinResult
 cluster_wal_retention_pin_bind_one(ClusterWalRetentionPin *pin,
 								   ClusterRecoverySerialGuard *held_serial);
@@ -380,6 +387,20 @@ extern ClusterWalPinResult
 cluster_wal_retention_root_publish_begin_exact(const ClusterControlRootReadToken *expected_root,
 											   bool require_sealed_pin,
 											   ClusterWalRootPublishGuard **out_guard);
+/* PGRAC: one original sealed cold-input owner protects an entire sorted
+ * COMPLETE/CLOSED ROOT cut through CF/CAS/readback. COMPLETE members convert
+ * their original S holders only after every IR release; CLOSED inputs retain
+ * their original reader S holders and gain no recovery authority. The cut
+ * must exactly cover the pin's recovery and read-only inputs. No CF I/O here.
+ * A failed/partial conversion can return an owned guard: end it before retry.
+ * End restores converted members in reverse order; uncertainty is cleanup-only.
+ * This does not authorize ROOT publication or qualify any recovery evidence.
+ * Author: SqlRush <sqlrush@gmail.com> */
+extern ClusterWalPinResult cluster_wal_retention_root_publish_begin_set_v1(
+	const ClusterControlRootReadToken *roots, uint16 nroots,
+	ClusterWalRootPublishGuard **out_guard);
+extern bool
+cluster_wal_retention_root_publish_set_current_v1(const ClusterWalRootPublishGuard *guard);
 extern ClusterWalrReleaseResult
 cluster_wal_retention_root_publish_end(ClusterWalRootPublishGuard **guard);
 /* PGRAC: post-IR sealed-pin exclusive observation; no CF acquisition or new authority.

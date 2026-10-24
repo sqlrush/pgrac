@@ -7,6 +7,8 @@
  */
 #include "postgres.h"
 #include "access/xloginsert.h"
+#include "cluster/cluster_semantic_activation.h"
+#include "miscadmin.h"
 
 #if defined(__has_include)
 #if __has_include("cluster/cluster_page_producer.h")
@@ -53,6 +55,21 @@ static uint32 register_calls;
 static uint64 registered_token;
 static uint8 registered_count;
 static RfPageVersionEdgeEntryV1 registered_entries[RF_PAGE_PRODUCER_MAX_COMPONENTS];
+BackendType MyBackendType = B_BACKEND;
+static ClusterNormalStartState producer_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+static bool producer_recovered_open = true;
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return producer_start_state;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return producer_recovered_open;
+}
 
 SCN
 cluster_scn_advance(void)
@@ -129,6 +146,31 @@ ordinary_component(uint8 block_id, uint8 before_kind, Page page, uint8 seed)
 	component.page = page;
 	set_incarnation(component.segment_incarnation, seed);
 	return component;
+}
+
+UT_TEST(test_prepare_requires_recovered_open)
+{
+	PGAlignedBlock page;
+	RfPageProducerComponentV1 component;
+	RfPageProducerBatchV1 batch;
+	ClusterNormalStartState saved_state = producer_start_state;
+	bool saved_open = producer_recovered_open;
+	BackendType saved_backend = MyBackendType;
+
+	make_page(&page, 40);
+	component = ordinary_component(0, RF_PAGE_STATE_PRESENT, page.data, 3);
+	MyBackendType = B_BACKEND;
+	producer_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	producer_recovered_open = false;
+	reset_allocator((SCN)41);
+	UT_ASSERT(!rf_page_producer_prepare_v1(&component, 1, &batch));
+	UT_ASSERT_EQ(advance_calls, 0);
+	producer_recovered_open = true;
+	UT_ASSERT(rf_page_producer_prepare_v1(&component, 1, &batch));
+
+	producer_start_state = saved_state;
+	producer_recovered_open = saved_open;
+	MyBackendType = saved_backend;
 }
 
 UT_TEST(test_token_next_delegates_once)
@@ -389,7 +431,8 @@ UT_TEST(test_wal_registration_revalidates_stamped_pages)
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(18);
+	UT_RUN(test_prepare_requires_recovered_open);
 	UT_RUN(test_token_next_delegates_once);
 	UT_RUN(test_token_observe_delegates_exact_value);
 	UT_RUN(test_prepare_captures_before_without_mutation);

@@ -500,10 +500,23 @@ qvotec_pgstat_lookup_all(void)
 #define CLUSTER_QVOTEC_DEFAULT_POLL_INTERVAL_MS 2000
 
 /*
- * The real poll owner publishes a thirty-period laboratory lease. Observers never
- * renew it. This is PGRAC policy, not a verified Oracle internal lease value.
+ * AD-025 2026-10-24: the write publisher uses six polls (12s at 2000ms),
+ * independently of the fifteen-poll prior-death floor (30s). The latter aligns
+ * with Oracle CSS's documented default misscount, not an Oracle write lease.
+ * These ratios are user-approved PGRAC policy; observers renew neither clock.
  */
-#define QVOTEC_LEASE_POLL_PERIODS 30
+#define QVOTEC_WRITE_LEASE_POLL_PERIODS 6
+#define QVOTEC_LEASE_POLL_PERIODS 15
+
+StaticAssertDecl(QVOTEC_LEASE_POLL_PERIODS >= 2 * QVOTEC_WRITE_LEASE_POLL_PERIODS,
+				 "prior-death floor must cover twice the actual write lease");
+
+static bool
+qvotec_death_policy_valid(uint64 write_lease_us, uint64 death_floor_us)
+{
+	return write_lease_us != 0 && write_lease_us <= UINT64_MAX / 2
+		   && death_floor_us >= 2 * write_lease_us;
+}
 
 /* One QVOTEC writer owns the counter. Observers can only latch a proven
  * negative lease observation for that owner to consume, never clear it.
@@ -553,7 +566,7 @@ static void
 qvotec_publish_poll_lease(uint64 now_us)
 {
 	uint64 duration_us
-		= (uint64)cluster_quorum_poll_interval_ms * QVOTEC_LEASE_POLL_PERIODS * 1000ULL;
+		= (uint64)cluster_quorum_poll_interval_ms * QVOTEC_WRITE_LEASE_POLL_PERIODS * 1000ULL;
 	uint64 next_lease_expire = now_us + duration_us;
 	uint64 previous_expiry = pg_atomic_read_u64(&QvotecShmem->lease_expire_at_us);
 	uint64 previous_poll = pg_atomic_read_u64(&QvotecShmem->last_poll_ts_us);
@@ -1202,10 +1215,13 @@ cluster_qvotec_prior_death_observe(uint32 node_id, uint64 prior_incarnation,
 {
 	const ClusterQvotecPriorExitObservation *observed;
 	uint64 dead_us = (uint64)cluster_quorum_poll_interval_ms * QVOTEC_LEASE_POLL_PERIODS * 1000ULL;
+	uint64 write_us
+		= (uint64)cluster_quorum_poll_interval_ms * QVOTEC_WRITE_LEASE_POLL_PERIODS * 1000ULL;
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
-	if (out == NULL || QvotecShmem == NULL || !cluster_shared_config || node_id >= CLUSTER_MAX_NODES
+	if (cluster_quorum_poll_interval_ms <= 0 || !qvotec_death_policy_valid(write_us, dead_us)
+		|| out == NULL || QvotecShmem == NULL || !cluster_shared_config || node_id >= CLUSTER_MAX_NODES
 		|| cluster_node_id != (int)node_id || prior_incarnation == 0 || observing_incarnation == 0
 		|| prior_incarnation == observing_incarnation
 		|| pg_atomic_read_u32(&QvotecShmem->prior_exit_state) != 2)
@@ -1228,7 +1244,7 @@ cluster_qvotec_prior_death_observe(uint32 node_id, uint64 prior_incarnation,
 			|| (slot->flags
 				& ~(CLUSTER_VOTING_SLOT_FLAG_ALIVE | CLUSTER_VOTING_SLOT_FLAG_WRITE_FROZEN))
 				   != 0
-			|| slot->heartbeat_ts_us > now_us || now_us - slot->heartbeat_ts_us <= dead_us
+			|| slot->heartbeat_ts_us > now_us || now_us - slot->heartbeat_ts_us < dead_us
 			|| slot->crc32c != cluster_voting_disk_compute_crc32c(slot))
 			return false;
 	}
@@ -2902,6 +2918,7 @@ qvotec_replacement_request_preserve(ClusterVotingSlot *next, const ClusterVoting
 #ifdef CLUSTER_QVOTEC_PGSA_UNIT_TEST
 void cluster_qvotec_test_poll_pre_injection(void);
 void cluster_qvotec_test_publish_poll_lease(uint64 now_us);
+bool cluster_qvotec_test_death_policy_valid(uint64 write_lease_us, uint64 death_floor_us);
 void cluster_qvotec_test_diagnostic_phase_enter(uint32 phase);
 void cluster_qvotec_test_diagnostic_format(char *out, size_t size);
 
@@ -2921,6 +2938,12 @@ void
 cluster_qvotec_test_publish_poll_lease(uint64 now_us)
 {
 	qvotec_publish_poll_lease(now_us);
+}
+
+bool
+cluster_qvotec_test_death_policy_valid(uint64 write_lease_us, uint64 death_floor_us)
+{
+	return qvotec_death_policy_valid(write_lease_us, death_floor_us);
 }
 
 void
@@ -4881,6 +4904,15 @@ ClusterQvotecMain(void)
 	long timeout_ms = CLUSTER_QVOTEC_DEFAULT_POLL_INTERVAL_MS;
 
 	Assert(IsUnderPostmaster);
+	/* Fail before opening/overwriting any predecessor slot or publishing READY.
+	 * Keep this runtime check as well as the compile-time ratio assertion. */
+	if (cluster_quorum_poll_interval_ms <= 0
+		|| !qvotec_death_policy_valid(
+			(uint64)cluster_quorum_poll_interval_ms * QVOTEC_WRITE_LEASE_POLL_PERIODS * 1000ULL,
+			(uint64)cluster_quorum_poll_interval_ms * QVOTEC_LEASE_POLL_PERIODS * 1000ULL))
+		ereport(FATAL,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("prior-death observation floor is shorter than twice the write lease")));
 
 	QvotecPid = MyProcPid;
 	MyBackendType = B_QVOTEC;

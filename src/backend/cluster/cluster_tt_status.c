@@ -1435,6 +1435,12 @@ cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op,
 	if (result != NULL)
 		memset(result, 0, sizeof(*result));
 	memset(&local_result, 0, sizeof(local_result));
+	/* Existing-other recovery cannot read or mutate the dormant SOURCE TT
+	 * state until the durable semantic OPEN binding is current. */
+	if (MyBackendType != B_STARTUP && cluster_shared_config
+		&& cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& !cluster_semantic_activation_recovered_open_current())
+		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 
 	admission = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
 												  CLUSTER_SEMANTIC_SOURCE_SIDE, &token);

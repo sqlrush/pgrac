@@ -30,6 +30,14 @@ cluster_wal_tail_visit_sealed(const char *wal_root, const ClusterWalSourceRef *r
 							  XLogRecPtr checkpoint_start, ClusterWalRecordVisitor visitor,
 							  void *arg, ClusterWalTailObservation *out);
 
+/* Original recovery owner only: validate the full sealed source, sync its
+ * actual segments/claim/directories, then revalidate their identities. This
+ * does not publish a recovery frontier or authorize any consumer. */
+extern ClusterControlRootResult
+cluster_wal_tail_sync_sealed_v1(const char *wal_root, const ClusterWalSourceRef *ref,
+								int segment_size, const ClusterControlRootSnapshot *sealed,
+								XLogRecPtr checkpoint_start, ClusterWalTailObservation *out);
+
 /* Read-only retained input, not recovery authority. Accept exact CLOSED,
  * RECOVERY_REQUIRED or RECOVERY_COMPLETE cuts without changing their lifecycle.
  * All sealed physical checks remain mandatory; OPEN needs its writer's native
@@ -40,12 +48,27 @@ cluster_wal_retained_visit_v1(const char *wal_root, const ClusterWalSourceRef *r
 							  XLogRecPtr checkpoint_start, ClusterWalRecordVisitor visitor,
 							  void *arg, ClusterWalTailObservation *out);
 
+/* Sync the same read-only retained cut and its actual claim/namespace, then
+ * recheck physical identities. The caller retains its original owner/scope;
+ * synchronization does not change lifecycle or authorize recovery. */
+extern ClusterControlRootResult
+cluster_wal_retained_sync_v1(const char *wal_root, const ClusterWalSourceRef *ref, int segment_size,
+							 const ClusterControlRootSnapshot *retained,
+							 XLogRecPtr checkpoint_start, ClusterWalTailObservation *out);
+
 /* Resolve the selected v3 claim/anchor under CF-S, scan without CF, then
  * reobserve the exact root token/record. Caller retains and revalidates its
  * separate IR/fencing/WALR owner bundle. This supplies input, not permission. */
 extern ClusterControlRootResult cluster_control_root_recovery_visit(
 	const ClusterControlRootSnapshot *expected, const ClusterControlRootReadToken *token,
 	ClusterWalRecordVisitor visitor, void *arg, ClusterWalTailObservation *out);
+
+/* Same exact ROOT selection and post-read; physical sync happens outside CF.
+ * Caller still owns and revalidates isolation, WALR and recovery serialization. */
+extern ClusterControlRootResult
+cluster_control_root_recovery_sync_v1(const ClusterControlRootSnapshot *expected,
+									  const ClusterControlRootReadToken *token,
+									  ClusterWalTailObservation *out);
 
 /* Select the full source named by this same exact ROOT token before feeding
  * a closed plan. This reads no WAL and grants no retention/replay authority;
@@ -56,6 +79,20 @@ extern ClusterControlRootResult
 cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *expected,
 										const ClusterControlRootReadToken *token,
 										ClusterWalSourceRef *out, XLogRecPtr *native_redo);
+
+/* Exact selected origin checkpoint, not the common allocator projection.
+ * This is provisional input only: its nextXid is not proof of a TT slot's
+ * FullXid/era, terminal state, retention, or permission to recover it. */
+typedef struct ClusterWalRecoveryCheckpointV1 {
+	ClusterWalSourceRef source;
+	XLogRecPtr checkpoint_start;
+	CheckPoint checkpoint;
+} ClusterWalRecoveryCheckpointV1;
+
+extern ClusterControlRootResult
+cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *expected,
+											const ClusterControlRootReadToken *token,
+											ClusterWalRecoveryCheckpointV1 *out);
 
 /* Startup-only physical input, never a close/recovery/serving permission.
  * Zero maxima mean no PARAMETER_CHANGE record was observed; the caller must

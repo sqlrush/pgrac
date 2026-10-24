@@ -48,6 +48,7 @@
 
 #include "access/xlog_internal.h"
 #include "cluster/cluster_control_root.h" /* RF-ROOT P7 G1b: canonical root anchor */
+#include "cluster/cluster_wal_source.h"
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_xlog.h"
 #include "port/atomics.h"
@@ -78,6 +79,17 @@ typedef enum ClusterRecoveryStreamVerdict {
 
 #define CLUSTER_RECOVERY_WORKER_MAX_SLOTS 16
 
+/* Original pre-IR owner captures PRE2's complete selected input. Volatile
+ * observation only: no disk ABI, writer permission or isolation proof.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct ClusterRecoveryWorkerInput {
+	uint32 generation;
+	bool root_valid;
+	bool source_valid;
+	ClusterControlRootSnapshot snapshot;
+	ClusterWalSourceRef source;
+} ClusterRecoveryWorkerInput;
+
 typedef struct ClusterRecoveryWorkerPool {
 	uint32 generation;		  /* coordinator-only writer; +1 per launch  */
 	uint16 workers_requested; /* coordinator-only writer                 */
@@ -85,6 +97,7 @@ typedef struct ClusterRecoveryWorkerPool {
 	pg_atomic_uint32 slot_state[CLUSTER_RECOVERY_WORKER_MAX_SLOTS];
 	uint64 assigned_bitmap[CLUSTER_RECOVERY_WORKER_MAX_SLOTS][2];
 	uint8 stream_verdict[CLUSTER_WAL_STATE_SLOT_COUNT + 1]; /* by thread */
+	ClusterRecoveryWorkerInput pre2_input[CLUSTER_WAL_STATE_SLOT_COUNT + 1];
 } ClusterRecoveryWorkerPool;
 
 /* ---- pure helpers (header-only; unit-testable, no backend deps) ---- */

@@ -42,6 +42,24 @@ extern XidStatus TransactionIdGetStatus(TransactionId xid, XLogRecPtr *lsn);
 /* PGRAC: startup-only native-prehistory repair write (GCS-race round-2 RC-E) */
 extern void ClusterClogAdoptNativeStatus(TransactionId xid, XidStatus status);
 
+#ifdef USE_PGRAC_CLUSTER
+/* Original-origin storage only. The recovery owner must first prove the
+ * complete terminal record, original source/base/era and mutation authority.
+ * These calls neither resolve an unknown transaction nor publish visibility.
+ * Own-origin redo retains the ordinary native CLOG owner; an exact durable
+ * C0 top ABORT uses that same cache without discarding unrelated dirty bits. */
+extern bool cluster_clog_native_recovery_apply_v1(int origin, TransactionId xid, int nsubxids,
+												  const TransactionId *subxids, XidStatus status);
+extern bool cluster_clog_native_recovery_verify_v1(int origin, TransactionId xid, int nsubxids,
+												   const TransactionId *subxids, XidStatus status);
+struct ClusterSideProjectionOperationV1;
+/* Exact retained native ZERO/TRUNCATE only, under the same cold scope. */
+extern bool cluster_clog_native_recovery_record_apply_v1(
+	int origin, const struct ClusterSideProjectionOperationV1 *operation);
+extern bool cluster_clog_native_recovery_record_verify_v1(
+	int origin, const struct ClusterSideProjectionOperationV1 *operation);
+#endif
+
 extern Size CLOGShmemBuffers(void);
 extern Size CLOGShmemSize(void);
 extern void CLOGShmemInit(void);

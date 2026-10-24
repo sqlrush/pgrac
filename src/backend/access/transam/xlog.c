@@ -253,10 +253,12 @@
 #include "cluster/cluster_inject.h"
 /* PGRAC: spec-3.18 D2b undo buffer pool checkpoint write-back flush. */
 #include "cluster/storage/cluster_undo_buf.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 /* PGRAC: spec-4.1 per-thread WAL routing page-header stamp. */
 #include "cluster/cluster_scn.h" /* PGRAC: xl_scn stamp (spec-4.5) */
 #include "cluster/cluster_wal_state.h" /* PGRAC: checkpoint redo / fpw sticky (spec-4.5) */
 #include "cluster/cluster_wal_retention.h" /* PGRAC: STOP-05 guarded WAL reuse */
+#include "cluster/cluster_recovery_stamp.h"
 #include "cluster/cluster_wal_retained_cut.h" /* PGRAC: S07 retention lower */
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_initdb_base.h"
@@ -273,6 +275,12 @@
 #include "cluster/cluster_cf_phase2.h" /* PGRAC: spec-5.6 T6 cross-node verify */
 #include "cluster/cluster_cf_storage.h" /* PGRAC: spec-5.6 bootstrap authority window */
 #include "cluster/cluster_conf.h" /* PGRAC: RF-B exact one-node gate */
+#include "cluster/cluster_cold_recovery.h" /* PGRAC: hold restartpoint during typed cold replay */
+#include "cluster/cluster_wal_inputs.h" /* PGRAC: post-EOR retained loser read scope */
+#include "cluster/cluster_recovery_plan.h"
+#include "cluster/cluster_undo_smgr.h"
+#include "cluster/cluster_undo_recovery.h"
+#include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/cluster_gcs_block.h" /* PGRAC: spec-6.12h D-h2 PI-discard checkpoint seal */
 #include "cluster/cluster_guc.h" /* PGRAC: spec-5.6 cluster_controlfile_shared_authority */
 #include "cluster/cluster_hw_snapshot.h" /* PGRAC: spec-5.7 D3 HW authority checkpoint snapshot */
@@ -6259,6 +6267,7 @@ static void
 ClusterStartupConfigurationRequire(void)
 {
 	ClusterFormationWitnessResult last_proof = CLUSTER_FORMATION_WITNESS_READY;
+	bool wait_reported = false;
 
 	for (;;) {
 		ClusterConfigMountResult result;
@@ -6290,6 +6299,14 @@ ClusterStartupConfigurationRequire(void)
 			ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 							errmsg("shared configuration is incompatible with mounted members"),
 							errdetail("PGRAC_REASON=CONFIG_COMMON_MISMATCH")));
+		if (!wait_reported) {
+			ereport(LOG, (errmsg("native startup is waiting for mounted configuration"),
+						  errdetail("PGRAC_FAMILY=STARTUP_CONTROL operation=config_mount "
+									"mount_result=%d witness_result=%d readiness=%d",
+									(int)result, (int)proof,
+									(int)cluster_authority_readiness_get())));
+			wait_reported = true;
+		}
 		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
 						WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
 	}
@@ -6305,17 +6322,23 @@ ClusterStartupWriterSelect(void)
 	ClusterWalSourceRef restart;
 	ClusterWalStartupImage selected;
 	ClusterControlRootResult result;
+	bool native_recovery = InRecovery;
+	bool wait_reported = false;
+	TimestampTz last_wait_report = 0;
 
 	if (MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
 		|| !cluster_controlfile_shared_authority || clusterStartupWriterSelected
 		|| clusterStartupWriterBound || clusterStartupWriterInstalled || CritSectionCount != 0
-		|| ShutdownRequestPending || InRecovery || ArchiveRecoveryRequested
-		|| ControlFile->state != DB_SHUTDOWNED || LWLockHeldByMe(ControlFileLock)
+		|| ShutdownRequestPending || ArchiveRecoveryRequested
+		|| ControlFile->state != (native_recovery ? DB_IN_CRASH_RECOVERY : DB_SHUTDOWNED)
+		|| LWLockHeldByMe(ControlFileLock)
 		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
 		|| !cluster_wal_thread_restart_v2_ref(&restart))
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-						errmsg("native clean startup has no exact immutable input")));
+						errmsg("native startup has no exact immutable input")));
 	for (;;) {
+		TimestampTz now;
+
 		HandleStartupProcInterrupts();
 		CHECK_FOR_INTERRUPTS();
 		ClusterStartupConfigurationRequire();
@@ -6324,6 +6347,15 @@ ClusterStartupWriterSelect(void)
 			&& result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT
 			&& result != CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE)
 			break;
+		now = GetCurrentTimestamp();
+		if (!wait_reported || now < last_wait_report
+			|| now - last_wait_report >= INT64CONST(5000000)) {
+			ereport(LOG, (errmsg("native startup initialization is pending"),
+						  errdetail("PGRAC_FAMILY=STARTUP_CONTROL operation=writer_select "
+									"result=%d recovery=%d", (int)result, native_recovery)));
+			last_wait_report = now;
+			wait_reported = true;
+		}
 		/* The original attempt dropped CF/WALR. Lock contention or a
 		 * pending collective exit witness grants no side effects. A missing
 		 * peer target is not permission to reduce the startup cohort. */
@@ -6339,20 +6371,27 @@ ClusterStartupWriterSelect(void)
 			 errdetail("PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=STARTUP_COHORT_UNPROVEN result=%d",
 					   (int)result)));
 	if (selected.phase != CLUSTER_WAL_STARTUP_INITIALIZING
+		|| (native_recovery && selected.input_kind != CLUSTER_WAL_STARTUP_RECOVERED)
 		|| (selected.input_kind != CLUSTER_WAL_STARTUP_CLEAN
-			&& selected.input_kind != CLUSTER_WAL_STARTUP_INITIALIZED)
+			&& selected.input_kind != CLUSTER_WAL_STARTUP_INITIALIZED
+			&& selected.input_kind != CLUSTER_WAL_STARTUP_RECOVERED)
 		|| selected.segment_size != wal_segment_size || !IsValidWalSegSize(wal_segment_size)
 		|| selected.first_segment_lsn == 0 || selected.first_segment_lsn % wal_segment_size != 0
 		|| selected.first_segment_lsn < selected.sealed_input_end
 		|| selected.first_segment_lsn > UINT64_MAX - wal_segment_size
-		|| selected.sealed_input_end != selected.input_record_end
+		|| selected.input_record_end <= selected.input_record_start
+		|| selected.input_record_end > selected.sealed_input_end
+		|| (selected.input_kind != CLUSTER_WAL_STARTUP_RECOVERED
+			&& (ControlFile->state != DB_SHUTDOWNED
+				|| selected.sealed_input_end != selected.input_record_end
+				|| ControlFile->checkPoint != selected.predecessor.snapshot.tail_last_record_lsn))
 		|| selected.timeline != selected.input_timeline
-		|| ControlFile->checkPoint != selected.predecessor.snapshot.tail_last_record_lsn
+		|| ControlFile->checkPoint != selected.input_record_start
 		|| selected.predecessor.snapshot.checkpoint_lower_lsn == InvalidXLogRecPtr
 		|| selected.predecessor.snapshot.checkpoint_lower_lsn > ControlFile->checkPoint
 		|| ControlFile->checkPointCopy.ThisTimeLineID != selected.timeline)
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-						errmsg("native startup contradicts its selected clean input")));
+						errmsg("native startup contradicts its selected startup input")));
 	clusterStartupWriter = selected;
 	clusterStartupWriterSelected = true;
 }
@@ -6485,30 +6524,47 @@ ClusterStartupWriterBegin(const EndOfWalRecoveryInfo *input)
 	const char *operation = "read";
 	unsigned step = 0;
 	bool wait_logged = false;
+	bool native_recovery = InRecovery;
 	ClusterCfAttemptObservation waiting = { 0 };
 
 	if (input == NULL || MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
-		|| !cluster_controlfile_shared_authority || !clusterStartupWriterSelected
+		|| !cluster_controlfile_shared_authority
 		|| clusterStartupWriterBound || clusterStartupWriterInstalled || CritSectionCount != 0
-		|| ShutdownRequestPending || InRecovery || ArchiveRecoveryRequested
+		|| ShutdownRequestPending || ArchiveRecoveryRequested
 		|| input->standby_signal_file_found || input->recovery_signal_file_found
 		|| input->abortedRecPtr != InvalidXLogRecPtr
-		|| input->missingContrecPtr != InvalidXLogRecPtr || ControlFile->state != DB_SHUTDOWNED
+		|| input->missingContrecPtr != InvalidXLogRecPtr
+		|| ControlFile->state != (native_recovery ? DB_IN_CRASH_RECOVERY : DB_SHUTDOWNED)
 		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock)
 		|| cluster_cf_held(ExclusiveLock))
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-						errmsg("native clean startup has no selected initialization owner")));
+						errmsg("native startup has no selected initialization owner")));
+	/* The crash branch sealed its old stream before native directory work.
+	 * Its RECOVERED successor can only be selected after redo has completed
+	 * the retained input cache, while native recovery is still in progress. */
+	if (native_recovery && !clusterStartupWriterSelected)
+		ClusterStartupWriterSelect();
+	if (!clusterStartupWriterSelected
+		|| (native_recovery && clusterStartupWriter.input_kind != CLUSTER_WAL_STARTUP_RECOVERED))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("native startup has no selected initialization owner")));
 	selected = clusterStartupWriter;
-	if (input->endOfLog != selected.sealed_input_end || input->endOfLog != selected.input_record_end
-		|| input->lastRec != selected.input_record_start
+	/* A RECOVERED input retains its exact checkpoint and its later sealed
+	 * WAL tail separately. Binding its successor still precedes native EOR;
+	 * it must not manufacture a clean shutdown or recovery-DONE state. */
+	if (input->endOfLog != selected.sealed_input_end
+		|| input->lastRec != selected.predecessor.snapshot.tail_last_record_lsn
+		|| (selected.input_kind != CLUSTER_WAL_STARTUP_RECOVERED
+			&& (input->endOfLog != selected.input_record_end
+				|| input->lastRec != selected.input_record_start))
 		|| input->lastRecTLI != selected.input_timeline
 		|| input->endOfLogTLI != selected.input_timeline
-		|| ControlFile->checkPoint != selected.predecessor.snapshot.tail_last_record_lsn
+		|| ControlFile->checkPoint != selected.input_record_start
 		|| selected.predecessor.snapshot.checkpoint_lower_lsn == InvalidXLogRecPtr
 		|| selected.predecessor.snapshot.checkpoint_lower_lsn > ControlFile->checkPoint
 		|| ControlFile->checkPointCopy.ThisTimeLineID != selected.timeline)
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-						errmsg("native recovery result contradicts its selected clean input")));
+						errmsg("native recovery result contradicts its selected input")));
 	for (;;) {
 		uint64 before;
 
@@ -6520,11 +6576,15 @@ ClusterStartupWriterBegin(const EndOfWalRecoveryInfo *input)
 		ClusterStartupConfigurationRequire();
 		if (memcmp(&selected, &clusterStartupWriter, sizeof(selected)) != 0
 			|| !clusterStartupWriterSelected || clusterStartupWriterBound
-			|| clusterStartupWriterInstalled || ControlFile->state != DB_SHUTDOWNED
-			|| ControlFile->checkPoint != selected.predecessor.snapshot.tail_last_record_lsn
+			|| clusterStartupWriterInstalled || InRecovery != native_recovery
+			|| ControlFile->state != (native_recovery ? DB_IN_CRASH_RECOVERY : DB_SHUTDOWNED)
+			|| ControlFile->checkPoint != selected.input_record_start
 			|| ControlFile->checkPointCopy.ThisTimeLineID != selected.timeline
 			|| input->endOfLog != selected.sealed_input_end
-			|| input->endOfLog != selected.input_record_end || input->lastRec != selected.input_record_start
+			|| input->lastRec != selected.predecessor.snapshot.tail_last_record_lsn
+			|| (selected.input_kind != CLUSTER_WAL_STARTUP_RECOVERED
+				&& (input->endOfLog != selected.input_record_end
+					|| input->lastRec != selected.input_record_start))
 			|| input->lastRecTLI != selected.input_timeline || input->endOfLogTLI != selected.input_timeline)
 			ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 							errmsg("native initialization owner changed before WAL binding")));
@@ -6617,6 +6677,258 @@ ClusterXLogStartupNativeEmptyMultiXactInput(void)
 	return ClusterXLogNativeEmptyMultiXactInputMatches(&input, selected, bound, installed, &control)
 		   && cluster_wal_writer_startup_matches(&input.claim.identity, input.operation_uuid,
 												 input.first_segment_lsn);
+}
+
+/* Observe only this Startup's actual INSTALL/native DONE writer. The original
+ * INSTALL readback sets Installed; current native binding and writer checks
+ * remain mandatory. This observation grants neither I/O nor WAL insertion. */
+bool
+ClusterStartupInstalledWriterV1(ClusterWalWriterToken *writer, uint8 operation_uuid[16])
+{
+	ClusterWalWriterToken current;
+
+	if (writer != NULL)
+		memset(writer, 0, sizeof(*writer));
+	if (operation_uuid != NULL)
+		memset(operation_uuid, 0, 16);
+	if (writer == NULL || operation_uuid == NULL || MyBackendType != B_STARTUP
+		|| !cluster_enabled || !cluster_shared_config || CritSectionCount != 0
+		|| ShutdownRequestPending || RecoveryInProgress() || !clusterStartupWriterSelected
+		|| !clusterStartupWriterBound || !clusterStartupWriterInstalled
+		|| !cluster_wal_writer_startup_matches(&clusterStartupWriter.claim.identity,
+				clusterStartupWriter.operation_uuid, clusterStartupWriter.first_segment_lsn)
+		|| cluster_wal_writer_begin(clusterStartupWriter.timeline, &current)
+			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| memcmp(&current.ref.claim.identity, &clusterStartupWriter.claim.identity,
+				  sizeof(current.ref.claim.identity)) != 0
+		|| current.ref.claim.database_incarnation != clusterStartupWriter.database_incarnation
+		|| current.ref.claim.max_config_generation != clusterStartupWriter.config_generation
+		|| current.ref.timeline != clusterStartupWriter.timeline
+		|| current.epoch != clusterStartupWriter.formation_epoch
+		|| current.startup_first_lsn != clusterStartupWriter.first_segment_lsn)
+		return false;
+	*writer = current;
+	memcpy(operation_uuid, clusterStartupWriter.operation_uuid, 16);
+	return true;
+}
+
+/* Keep INSTALL generation and input kind at their original native owner.
+ * A CLEAN/creation writer cannot authorize recovery-online checkpoint input. */
+bool
+ClusterStartupInstalledRecoveryWriterV1(ClusterWalWriterToken *writer,
+	uint8 operation_uuid[16], uint64 *install_generation)
+{
+	if (writer != NULL) memset(writer, 0, sizeof(*writer));
+	if (operation_uuid != NULL) memset(operation_uuid, 0, 16);
+	if (install_generation != NULL) *install_generation = 0;
+	if (writer == NULL || operation_uuid == NULL || install_generation == NULL
+		|| clusterStartupWriter.input_kind != CLUSTER_WAL_STARTUP_RECOVERED
+		|| clusterStartupWriter.generation == 0
+		|| !ClusterStartupInstalledWriterV1(writer, operation_uuid))
+		return false;
+	*install_generation = clusterStartupWriter.generation;
+	return true;
+}
+
+/* Execute only the confirmed C0 candidate under the original source/target
+ * reservations and held FD. Every fallible preparation and ROOT check has
+ * finished before PRE_INSERT. The window itself uses local identity checks,
+ * native WAL, and the held descriptor, never another source/ROOT acquisition. */
+static bool
+cluster_cold_recovery_stamp_c0_v1(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdTopTxCensusEntryV1 *entry, const ClusterRecoveryTTAbortV1 *record,
+	ClusterUndoSmgrRecoveryStampV1 stamp)
+{
+	const ClusterColdTypedV1 *typed = ClusterColdRecoveryTxInputs(start);
+	ClusterRecoveryStampOwnerV1 owner = {0};
+	ClusterRecoveryStampHandleV1 window;
+	uint8 operation_uuid[16];
+	uint8 payload[CLUSTER_RECOVERY_TT_ABORT_BYTES];
+	uint32 participant = UINT32_MAX;
+	volatile bool completed = false;
+
+	if (typed == NULL || record == NULL || typed->replay_count == 0
+		|| typed->replay_count > typed->participant_count
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS)
+		return false;
+	for (uint32 i = 0; i < typed->replay_count; i++)
+	{
+		if (typed->participants[i].thread_id != record->target_thread)
+			continue;
+		if (participant != UINT32_MAX)
+			return false;
+		participant = i;
+	}
+	if (participant == UINT32_MAX
+		|| !ClusterStartupInstalledWriterV1(&owner.writer, operation_uuid)
+		|| !cluster_recovery_tt_abort_encode_v1(record, payload, sizeof(payload)))
+		return false;
+	owner.target = typed->sources[participant].claim;
+	owner.executor_pid = MyProcPid;
+	owner.executor_boot = owner.writer.ref.claim.identity.origin_owner_incarnation;
+	owner.recovery_serial = record->recovery_serial;
+	if (!cluster_recovery_stamp_prepare_v1(&owner, CLUSTER_RECOVERY_STAMP_C0,
+			payload, sizeof(payload), &window))
+		return false;
+
+	PG_TRY();
+	{
+		/* Only this branch proves that insertion and target mutation did not
+		 * begin. Once INSERTING is set, every refusal retains the responsibility. */
+		if (!ClusterColdRecoveryTxTopProofCurrent(start, entry)
+			|| !ClusterColdRecoveryTxEffectsCurrent(start))
+		{
+			if (!cluster_recovery_stamp_cancel_v1(&window))
+				(void)cluster_recovery_stamp_fail_v1(&window);
+		}
+		else
+		{
+			XLogRecPtr end;
+
+			START_CRIT_SECTION();
+			if (!cluster_recovery_stamp_inserting_v1(&window))
+				ereport(PANIC, (errmsg("could not begin cold recovery C0 insertion")));
+			XLogBeginInsert();
+			XLogRegisterData((char *)payload, sizeof(payload));
+			end = XLogInsert(RM_CLUSTER_UNDO_ID, XLOG_UNDO_RECOVERY_TT_ABORT);
+			if (!cluster_recovery_stamp_inserted_v1(&window, ProcLastRecPtr, end))
+				ereport(PANIC, (errmsg("could not record cold recovery C0 insertion")));
+			END_CRIT_SECTION();
+			XLogFlush(end);
+			if (ClusterColdRecoveryTxTopProofCurrent(start, entry)
+				&& ClusterColdRecoveryTxEffectsCurrent(start)
+				&& cluster_undo_smgr_recovery_abort_write_v1(stamp)
+				&& ClusterColdRecoveryTxTopProofCurrent(start, entry)
+				&& ClusterColdRecoveryTxEffectsCurrent(start)
+				&& cluster_recovery_stamp_durable_v1(&window)
+				&& cluster_recovery_stamp_clear_v1(&window))
+				completed = true;
+			else
+				(void)cluster_recovery_stamp_fail_v1(&window);
+		}
+	}
+	PG_CATCH();
+	{
+		(void)cluster_recovery_stamp_fail_v1(&window);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return completed;
+}
+
+/* Reacquire the original owner/source scope for every physical loser proved
+ * by the pre-EOR census. All original proof/effects/endpoint/writer gates and
+ * exact target preparation precede execution. Unproven ACTIVE remains explicit;
+ * C0 completion grants no cleanup, checkpoint, reclamation or OPEN authority. */
+static bool
+cluster_cold_recovery_consume_loser_inputs_v1(
+	const struct ClusterRecoveryStartV1 *start)
+{
+	const ClusterColdTypedV1 *typed;
+	bool has_loser = false;
+
+	/* Clean/non-cold startup has no retained loser inputs to consume. */
+	if (start == NULL)
+		return true;
+	typed = ClusterColdRecoveryTxInputs(start);
+	if (typed == NULL || typed->top_tx_census == NULL)
+		return false;
+	/* Retained CTRC responsibilities are independent of the C0 TX result.
+	 * Preserve their original input before C0 changes any target. */
+	if (!cluster_recovery_ctrc_result_collect_v1(start)
+		|| !cluster_recovery_tx_result_begin_v1(start))
+		return false;
+
+	for (uint32 i = 0; i < typed->top_tx_census->count; i++)
+	{
+		if (typed->top_tx_census->entries[i].loser_proven)
+		{
+			has_loser = true;
+			break;
+		}
+	}
+	/* Every physical loser consumer shares the same complete ordinary-effects
+	 * receipt.  A restricted empty-effects result is still admitted only by
+	 * its independent per-entry TopTxProof below. */
+	if (has_loser && !ClusterColdRecoveryTxEffectsCurrent(start))
+		return false;
+
+	for (uint32 i = 0; i < typed->top_tx_census->count; i++)
+	{
+		const ClusterColdTopTxCensusEntryV1 *entry = &typed->top_tx_census->entries[i];
+		ClusterWalInputsV1 *inputs = NULL;
+		ClusterControlRootResult result;
+		ClusterRecoveryTTAbortDerivationV1 candidate;
+		ClusterRecoveryTTAbortDerivationV1 confirmed;
+		ClusterUndoBlock0Pin target = { .slot = -1 };
+		ClusterUndoSmgrRecoveryStampV1 stamp = {0};
+
+		/* A retained ACTIVE without an independent loser proof stays
+		 * unresolved; it must not be promoted by this consumer. */
+		if (!entry->loser_proven) {
+			if (!cluster_recovery_tx_result_step_v1(start, i))
+				return false;
+			continue;
+		}
+		/* A physical loser is necessary but not sufficient: the consumer
+		 * accepts only the complete independently retained TopTxProof for
+		 * this exact old-ACTIVE entry before preparing its C0 execution. */
+		if (!ClusterColdRecoveryTxTopProofCurrent(start, entry))
+			return false;
+
+		result = cluster_wal_inputs_begin_tx_closure_v1(start, entry, &inputs);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || inputs == NULL)
+		{
+			if (inputs != NULL)
+				cluster_wal_inputs_release_v1(&inputs);
+			return false;
+		}
+		result = cluster_wal_inputs_revalidate_v1(inputs);
+		/* Derive fields from this original proof and actual installed writer,
+		 * inside its original source scope. The candidate is not a write grant. */
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& !ClusterColdRecoveryTxC0Candidate(start, entry, &candidate))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		/* Local target exclusion only. Retain no content lock across the later
+		 * C0 preparation/insertion seam, and grant no mutation authority here. */
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& !ClusterColdRecoveryTxC0Reserve(start, entry, &target))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cluster_wal_inputs_revalidate_v1(inputs);
+		/* All fallible descriptor preparation precedes the later PRE_INSERT
+		 * seam. Keep the original source and target exclusion throughout I/O. */
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& !cluster_undo_smgr_recovery_abort_prepare_tx_v1(inputs, &candidate.record, &stamp))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			XLogEnsureRecordSpace(0, 1);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cluster_wal_inputs_revalidate_v1(inputs);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& (!ClusterColdRecoveryTxC0Candidate(start, entry, &confirmed)
+				|| memcmp(&candidate.record, &confirmed.record, sizeof(candidate.record)) != 0))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& !cluster_cold_recovery_stamp_c0_v1(start, entry, &confirmed.record, stamp))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& !cluster_undo_recovery_abort_project_tx_v1(inputs, &confirmed.record, stamp))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		/* Close before releasing exclusion, including every post-I/O refusal.
+		 * The stamp owner independently retains every incomplete inserted C0. */
+		if (stamp.token != 0 && !cluster_undo_smgr_recovery_abort_close_v1(stamp))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		cluster_undo_block0_release_reservation(&target);
+		cluster_wal_inputs_release_v1(&inputs);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return false;
+		/* Record only the original owner's successful complete operation,
+		 * after target close and both original guards have been released. */
+		if (!cluster_recovery_tx_result_step_v1(start, i))
+			return false;
+	}
+	return cluster_recovery_tx_result_finish_v1(start);
 }
 
 #endif
@@ -7161,22 +7473,14 @@ StartupXLOG(void)
 		 *
 		 * No need to hold ControlFileLock yet, we aren't up far enough.
 		 *
-		 * PGRAC: self-sealing the crashed input does not publish a typed
-		 * recovery-start control purpose or select a RECOVERED successor.
-		 * Until that owner is wired, reject here outside critical sections;
-		 * never send this known unsupported purpose to the unclassified
-		 * UpdateControlFile PANIC, nor reinterpret it as clean startup.
+		 * PGRAC: shared crash startup prepares the original typed input and
+		 * keeps this recovery control image private. The sealed input ROOT
+		 * is unchanged; no successor writer is selected by this preparation.
 		 */
 #ifdef USE_PGRAC_CLUSTER
 		if (cluster_shared_config)
-			ereport(FATAL,
-					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-					 errmsg("shared crash recovery startup control purpose is not available"),
-					 errdetail("PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=COLD_START_PURPOSE_PENDING "
-							   "native_state=%d checkpoint=%X/%X",
-							   (int) ControlFile->state, LSN_FORMAT_ARGS(ControlFile->checkPoint)),
-					 errhint("Preserve the sealed WAL and ROOT. Shared crash restart requires "
-							 "typed recovery completion and its recovered successor.")));
+			ClusterPrepareColdWalRecovery();
+		else
 #endif
 		UpdateControlFile();
 
@@ -7803,6 +8107,21 @@ StartupXLOG(void)
 	LWLockRelease(ControlFileLock);
 
 #ifdef USE_PGRAC_CLUSTER
+	/* Bind original TX inputs only after actual INSTALL and native DONE.
+	 * This resource is not a read scope, C0 grant or checkpoint permission. */
+	if (!ClusterBeginColdRecoveryTx(endOfRecoveryInfo))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("could not bind original Startup transaction recovery inputs")));
+	/* Shared cold recovery consumes only the proven physical losers through a
+	 * fresh original-owner TX_CLOSURE scope. Exact C0 execution and terminal
+	 * reconstruction retain that scope through their final readback; release
+	 * precedes later Startup work and grants no checkpoint or OPEN authority. */
+	/* The original retained attempt, rather than the historical semantic
+	 * classification, selects this work. Clean/no-cold has a NULL start. */
+	if (cluster_shared_config
+		&& !cluster_cold_recovery_consume_loser_inputs_v1(endOfRecoveryInfo->cluster_tx_start))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						 errmsg("could not consume post-EOR physical loser inputs")));
 
 	/*
 	 * PGRAC MODIFICATIONS (spec-4.8 D1): resolve crash-left undo TT slots.
@@ -7821,7 +8140,8 @@ StartupXLOG(void)
 	 */
 	/* A classified normal TARGET validates terminal history without changing
 	 * it. Its strict complete census below replaces these recovery-only jobs. */
-	if (cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_TARGET_LOADING)
+	if (!cluster_shared_config
+		&& cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_TARGET_LOADING)
 		cluster_tt_recovery_resolve_active_slots();
 
 	/*
@@ -7922,6 +8242,10 @@ StartupXLOG(void)
 					 errdetail("reason=%s",
 							   normal_failure != NULL ? normal_failure : "INVALID_STARTUP_STATE")));
 	}
+	/* Complete original TX component handoff before releasing private input. */
+	if (!cluster_recovery_tx_result_wait_v1(endOfRecoveryInfo->cluster_tx_start))
+		ereport(FATAL, (errmsg("could not complete original Startup transaction result handoff")));
+	ClusterReleaseColdRecoveryInputs(endOfRecoveryInfo);
 #endif
 }
 
@@ -8793,21 +9117,101 @@ ClusterCheckpointYieldForShutdown(bool online)
 						errmsg("checkpoint interrupted to service normal shutdown")));
 }
 
+/* PGRAC: captured recovery writers complete before checkpoint target IO.
+ * Author: SqlRush <sqlrush@gmail.com> */
 static void
-ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
+ClusterCheckpointWaitRecoveryStamps(int flags)
+{
+	ClusterRecoveryStampCaptureV1 capture;
+	ClusterWalSourceRef ref;
+	uint64 epoch = 0;
+	bool stopping = (flags & CHECKPOINT_IS_SHUTDOWN) != 0;
+	bool online = (flags & (CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_END_OF_RECOVERY)) == 0;
+
+	if (!cluster_recovery_stamp_capture_v1(&capture))
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("could not capture recovery stamp windows")));
+	if (capture.count == 0)
+		return;
+	if (MyBackendType == B_STARTUP && capture.caller_owned)
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("startup checkpoint cannot wait for its own recovery stamp")));
+	if (stopping) {
+		epoch = cluster_epoch_get_current();
+		if (epoch == 0 || !cluster_wal_thread_current_v2_ref(&ref))
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+							errmsg("recovery stamp checkpoint wait has no writer identity")));
+	}
+	for (;;) {
+		ClusterRecoveryStampPollV1 result;
+		uint64 started_us = stopping ? cluster_checkpoint_wait_budget_now() : 0;
+		long timeout_ms = 20;
+
+		CHECK_FOR_INTERRUPTS();
+		if (MyBackendType == B_STARTUP)
+			HandleStartupProcInterrupts();
+		ClusterCheckpointYieldForShutdown(online);
+		ResetLatch(MyLatch);
+		result = cluster_recovery_stamp_poll_v1(&capture);
+		if (result == CLUSTER_RECOVERY_STAMP_INVALID)
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+							errmsg("captured recovery stamp window is unproven")));
+		if (result == CLUSTER_RECOVERY_STAMP_COMPLETE) {
+			if (stopping)
+				(void)cluster_checkpoint_wait_budget_charge(false, started_us, &ref, epoch);
+			return;
+		}
+		AbsorbSyncRequests();
+		ClusterCheckpointYieldForShutdown(online);
+		if (stopping)
+			timeout_ms = cluster_checkpoint_wait_budget_charge(true, started_us, &ref, epoch);
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, timeout_ms,
+						WAIT_EVENT_RECOVERY_STAMP);
+	}
+}
+
+/* PGRAC: closed SQL admission is not checkpoint authority. Only the original
+ * installed recovery owner can supply this separate checkpointer scope.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+ClusterCheckpointRecoveryBegin(int flags, struct ClusterRecoveryCheckpointScopeV1 **scope)
+{
+	bool pending = false;
+
+	*scope = NULL;
+	if (!AmCheckpointerProcess() || (flags & (CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_END_OF_RECOVERY))
+		|| cluster_serving_ready_check(&pending, NULL) || pending)
+		return;
+	if (!cluster_recovery_checkpoint_begin_v1(scope))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("checkpoint lacks its installed recovery owner")));
+}
+
+static void
+ClusterCheckpointV3Prepare(int flags, ControlFileData *selected,
+						   const struct ClusterRecoveryCheckpointScopeV1 *recovery_scope)
 {
 	ClusterWalSourceRef ref;
+	ClusterWalWriterToken writer;
+	ClusterWalWriterToken observed_writer;
 	uint64 epoch = cluster_epoch_get_current();
 	bool shutdown = (flags & CHECKPOINT_IS_SHUTDOWN) != 0;
 	bool wait_logged = false;
 	ClusterCfAttemptObservation waiting = { 0 };
 
+	memset(selected, 0, sizeof(*selected));
+	if (recovery_scope != NULL
+		&& (!AmCheckpointerProcess()
+			|| (flags & (CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_END_OF_RECOVERY)) != 0))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("recovery checkpoint scope cannot replace another checkpoint purpose")));
 	if (MyBackendType == B_STARTUP && (flags & CHECKPOINT_END_OF_RECOVERY) != 0) {
 		ClusterStartupCheckpointPrepare(flags, selected);
 		return;
 	}
 
-	memset(selected, 0, sizeof(*selected));
 	if (!AmCheckpointerProcess() || !cluster_shared_config || !cluster_enabled
 		|| !cluster_controlfile_shared_authority || CritSectionCount != 0
 		|| (flags & CHECKPOINT_END_OF_RECOVERY) != 0
@@ -8815,12 +9219,18 @@ ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock)
 		|| cluster_cf_held(ExclusiveLock) || epoch == 0
 		|| !cluster_wal_thread_current_v2_ref(&ref)
-		/* Use the same exact, original-epoch CLEAN or INITIALIZED qualification
-		 * as native WAL I/O. RECOVERED inputs cannot borrow either fact.
+		|| (recovery_scope != NULL
+			&& (!cluster_recovery_checkpoint_current_v1(recovery_scope, &writer)
+				|| writer.epoch != epoch || memcmp(&writer.ref, &ref, sizeof(ref)) != 0))
+		/* Use the same exact, original-epoch writer qualification as native WAL
+		 * I/O; a recovered writer is accepted only through its own exact ref/epoch.
 		 * Author: SqlRush <sqlrush@gmail.com> */
 		|| (!cluster_external_fence_runtime_active()
-			&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch)
-			&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)))
+			&& (recovery_scope != NULL
+				? !cluster_wal_thread_recovered_writer_matches(&ref, epoch)
+				: (!cluster_wal_thread_initialized_writer_matches(&ref, epoch)
+					&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)
+					&& !cluster_wal_thread_recovered_writer_matches(&ref, epoch)))))
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 						errmsg("root-v3 checkpoint requires its admitted native owner")));
 	for (;;)
@@ -8841,11 +9251,17 @@ ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 		if (cluster_epoch_get_current() != epoch
 			|| !cluster_wal_thread_current_v2_ref(&observed)
 			|| memcmp(&observed, &ref, sizeof(ref)) != 0
+			|| (recovery_scope != NULL
+				&& (!cluster_recovery_checkpoint_current_v1(recovery_scope, &observed_writer)
+					|| memcmp(&observed_writer, &writer, sizeof(writer)) != 0))
 			|| cluster_reconfig_has_pending_prebump_stage()
 			|| !cluster_write_fence_allowed()
 			|| (!cluster_external_fence_runtime_active()
-				&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch)
-				&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)))
+				&& (recovery_scope != NULL
+					? !cluster_wal_thread_recovered_writer_matches(&ref, epoch)
+					: (!cluster_wal_thread_initialized_writer_matches(&ref, epoch)
+						&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)
+						&& !cluster_wal_thread_recovered_writer_matches(&ref, epoch)))))
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 					 errmsg("checkpoint authority changed before control-root read")));
@@ -8862,8 +9278,15 @@ ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 		}
 		PG_TRY();
 		{
-			readable = cluster_cf_held_is_clusterwide(ShareLock)
-				&& cluster_cf_authority_read_check(selected, &pending);
+			readable = cluster_cf_held_is_clusterwide(ShareLock);
+			if (readable && recovery_scope != NULL) {
+				ClusterControlRootResult result =
+					cluster_control_root_v3_read_recovery_checkpoint_locked(recovery_scope, selected);
+
+				readable = result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+					|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED;
+			} else if (readable)
+				readable = cluster_cf_authority_read_check(selected, &pending);
 		}
 		PG_CATCH();
 		{
@@ -8875,7 +9298,10 @@ ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 		if (cluster_cf_unlock_confirmed(ShareLock) != CLUSTER_CF_RELEASE_CONFIRMED
 			|| (!readable && !pending) || cluster_epoch_get_current() != epoch
 			|| !cluster_wal_thread_current_v2_ref(&observed)
-			|| memcmp(&observed, &ref, sizeof(ref)) != 0) {
+			|| memcmp(&observed, &ref, sizeof(ref)) != 0
+			|| (recovery_scope != NULL
+				&& (!cluster_recovery_checkpoint_current_v1(recovery_scope, &observed_writer)
+					|| memcmp(&observed_writer, &writer, sizeof(writer)) != 0))) {
 			memset(selected, 0, sizeof(*selected));
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
@@ -8900,9 +9326,15 @@ wait_for_owner:
 		|| selected->minRecoveryPoint != InvalidXLogRecPtr || selected->minRecoveryPointTLI != 0
 		|| selected->backupStartPoint != 0 || selected->backupEndPoint != 0
 		|| selected->backupEndRequired || cluster_epoch_get_current() != epoch
+		|| (recovery_scope != NULL
+			&& (!cluster_recovery_checkpoint_current_v1(recovery_scope, &observed_writer)
+				|| memcmp(&observed_writer, &writer, sizeof(writer)) != 0))
 		|| (!cluster_external_fence_runtime_active()
-			&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch)
-			&& !cluster_wal_thread_clean_writer_matches(&ref, epoch))) {
+			&& (recovery_scope != NULL
+				? !cluster_wal_thread_recovered_writer_matches(&ref, epoch)
+				: (!cluster_wal_thread_initialized_writer_matches(&ref, epoch)
+					&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)
+					&& !cluster_wal_thread_recovered_writer_matches(&ref, epoch))))) {
 		memset(selected, 0, sizeof(*selected));
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
@@ -8911,9 +9343,12 @@ wait_for_owner:
 }
 
 static void
-ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
+ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end,
+						   const struct ClusterRecoveryCheckpointScopeV1 *recovery_scope)
 {
 	ClusterWalSourceRef ref;
+	ClusterWalWriterToken writer;
+	ClusterWalWriterToken observed_writer;
 	ControlFileData selected;
 	ClusterControlRootSnapshot published;
 	ClusterControlRootFileToken token;
@@ -8923,6 +9358,10 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 	bool wait_logged = false;
 	ClusterCfAttemptObservation waiting = { 0 };
 
+	if (recovery_scope != NULL && (!AmCheckpointerProcess() || shutdown))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("recovery checkpoint scope cannot replace another checkpoint purpose")));
 	if (MyBackendType == B_STARTUP) {
 		ClusterStartupCheckpointPublish(candidate, end);
 		return;
@@ -8934,7 +9373,10 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 		|| cluster_cf_held(ExclusiveLock) || epoch == 0
 		|| (candidate->state != DB_IN_PRODUCTION && candidate->state != DB_SHUTDOWNED)
 		|| (candidate->state == DB_SHUTDOWNED && !ShutdownRequestPending)
-		|| !cluster_wal_thread_current_v2_ref(&ref))
+		|| !cluster_wal_thread_current_v2_ref(&ref)
+		|| (recovery_scope != NULL
+			&& (!cluster_recovery_checkpoint_current_v1(recovery_scope, &writer)
+				|| writer.epoch != epoch || memcmp(&writer.ref, &ref, sizeof(ref)) != 0)))
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 				 errmsg("root-v3 checkpoint publication requires its native owner")));
@@ -8953,12 +9395,18 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 		ClusterCheckpointYieldForShutdown(!shutdown);
 		retiring = ClusterCfRetirementPending(&waiting);
 		ClusterCheckpointYieldForShutdown(!shutdown);
-		serving = cluster_serving_ready_check(&pending, NULL);
+		serving = recovery_scope != NULL
+			? cluster_recovery_checkpoint_current_v1(recovery_scope, &observed_writer)
+				&& memcmp(&observed_writer, &writer, sizeof(writer)) == 0
+			: cluster_serving_ready_check(&pending, NULL);
 		if (cluster_epoch_get_current() != epoch || cluster_reconfig_has_pending_prebump_stage()
 			|| !cluster_wal_thread_current_v2_ref(&observed) || memcmp(&observed, &ref, sizeof(ref)) != 0
 			|| (!cluster_external_fence_runtime_active()
-				&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch)
-				&& !cluster_wal_thread_clean_writer_matches(&ref, epoch))
+				&& (recovery_scope != NULL
+					? !cluster_wal_thread_recovered_writer_matches(&ref, epoch)
+					: (!cluster_wal_thread_initialized_writer_matches(&ref, epoch)
+						&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)
+						&& !cluster_wal_thread_recovered_writer_matches(&ref, epoch))))
 			|| (!serving && !pending) || !cluster_write_fence_allowed())
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
@@ -8972,6 +9420,9 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 		before = cluster_cf_attempt_sequence();
 		if (pending)
 			result = CLUSTER_CONTROL_ROOT_ADMISSION_PENDING;
+		else if (recovery_scope != NULL)
+			result = cluster_control_root_v3_recovery_checkpoint_publish(recovery_scope,
+				&ref.claim.identity, candidate, end, &published, &token, &selected);
 		else if (candidate->state == DB_SHUTDOWNED)
 			result = cluster_control_root_v3_shutdown_checkpoint_publish(
 				&ref.claim.identity, candidate, end, &published, &token, &selected);
@@ -9002,6 +9453,16 @@ wait_for_owner:
 				 errmsg("could not publish the native checkpoint in the control root"),
 				 errdetail("PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=CHECKPOINT_UNPROVEN result=%d",
 						   (int) result)));
+	if (recovery_scope != NULL
+		&& (!cluster_recovery_checkpoint_current_v1(recovery_scope, &observed_writer)
+			|| memcmp(&observed_writer, &writer, sizeof(writer)) != 0
+			|| (!cluster_external_fence_runtime_active()
+				&& !cluster_wal_thread_recovered_writer_matches(&writer.ref, writer.epoch))
+			|| !cluster_write_fence_allowed()
+			|| cluster_reconfig_has_pending_prebump_stage()))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("recovery checkpoint owner changed before native projection")));
 	/* No native projection or WAL cleanup precedes the durable root result.
 	 * A later lifecycle change does not roll back that durable fact. */
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
@@ -9060,6 +9521,7 @@ CreateCheckPoint(int flags)
 	bool		cf_x_taken = false; /* PGRAC: spec-5.6 Dc1 — held CF X to release */
 	bool		fpw_off_transition = false; /* RF-ROOT P7 G1a-2: W5b FPW-off happened this checkpoint */
 	ControlFileData v3_checkpoint;
+	struct ClusterRecoveryCheckpointScopeV1 *recovery_checkpoint_scope = NULL;
 #endif
 
 	/*
@@ -9081,7 +9543,8 @@ CreateCheckPoint(int flags)
 	 * transitions still need their separate owner. No CF skip grants permission. */
 	if (cluster_shared_config)
 	{
-		ClusterCheckpointV3Prepare(flags, &v3_checkpoint);
+		ClusterCheckpointRecoveryBegin(flags, &recovery_checkpoint_scope);
+		ClusterCheckpointV3Prepare(flags, &v3_checkpoint, recovery_checkpoint_scope);
 		if (fullPageWrites != Insert->fullPageWrites)
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
@@ -9328,6 +9791,7 @@ CreateCheckPoint(int flags)
 			/* PGRAC: spec-5.6 Dc1 — release CF X on the idle-skip exit. */
 			if (cf_x_taken)
 				cluster_cf_unlock(ExclusiveLock);
+			cluster_recovery_checkpoint_end_v1(&recovery_checkpoint_scope);
 #endif
 			ereport(DEBUG1,
 					(errmsg_internal("checkpoint skipped because system is idle")));
@@ -9512,6 +9976,8 @@ CreateCheckPoint(int flags)
 	pfree(vxids);
 
 #ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config)
+		ClusterCheckpointWaitRecoveryStamps(flags);
 	/* PGRAC (S07 R-A22): snapshot the buffers' first own records before the
 	 * sync barrier, so a page this checkpoint does not write but someone
 	 * writes after the barrier is still counted by its census.
@@ -9694,7 +10160,8 @@ CreateCheckPoint(int flags)
 	/* PGRAC: root publication precedes every post-checkpoint cleanup. No
 	 * outer CF, native content lock or critical section encloses this wait. */
 	if (cluster_shared_config)
-		ClusterCheckpointV3Publish(&v3_checkpoint, recptr);
+		ClusterCheckpointV3Publish(&v3_checkpoint, recptr, recovery_checkpoint_scope);
+	cluster_recovery_checkpoint_end_v1(&recovery_checkpoint_scope);
 
 	/* PGRAC (S07): with this checkpoint's ROOT published, move the physical
 	 * retention lower forward when the complete retained input allows it.
@@ -10177,6 +10644,19 @@ static void
 RecoveryRestartPoint(const CheckPoint *checkPoint, XLogReaderState *record)
 {
 #ifdef USE_PGRAC_CLUSTER
+	/* A typed cold replay window owns the retained cut.  Do not publish an
+	 * own-thread checkpoint from inside that window as a restartpoint: doing
+	 * so would let a later restart skip records that pass two has not yet
+	 * consumed.  The startup owner closes the window after the full replay;
+	 * no checkpointer wait is introduced here. */
+	if (cluster_cold_replay_window_active_v1())
+	{
+		elog(trace_recovery(DEBUG2),
+			 "skipping restart point from typed cold replay window at %X/%X",
+			 LSN_FORMAT_ARGS(checkPoint->redo));
+		return;
+	}
+
 	/*
 	 * PGRAC: spec-6.4 P1-c -- a FOREIGN WAL thread's checkpoint record must
 	 * never become this node's restartpoint anchor.  Its redo/record LSNs

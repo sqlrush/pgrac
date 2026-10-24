@@ -623,12 +623,15 @@ cluster_undo_smgr_fsync_segment_file(uint32 segment_id, uint8 owner_instance)
 	return segment_id == 1 && owner_instance == 1;
 }
 
+static ClusterUndoBlock0Result undo_test_lifecycle_ensure_result = CLUSTER_UNDO_BLOCK0_OK;
+static ClusterUndoBlock0Result undo_test_lifecycle_mutate_result = CLUSTER_UNDO_BLOCK0_OK;
+
 ClusterUndoBlock0Result
 cluster_undo_block0_current_live_owner_ensure_resident(const ClusterUndoBlock0LogicalKey *key,
 													   int timeout_ms)
 {
 	return key != NULL && key->segment_id == 1 && key->owner_instance == 1 && timeout_ms > 0
-			   ? CLUSTER_UNDO_BLOCK0_OK
+			   ? undo_test_lifecycle_ensure_result
 			   : CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
 }
 
@@ -652,6 +655,8 @@ cluster_undo_block0_current_live_owner_mutate_exact(const ClusterUndoBlock0Logic
 		|| successor_page == NULL || timeout_ms <= 0 || key->segment_id != current->segment_id
 		|| key->owner_instance != current->owner_instance || expected->value != current->wrap_count)
 		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+	if (undo_test_lifecycle_mutate_result != CLUSTER_UNDO_BLOCK0_OK)
+		return undo_test_lifecycle_mutate_result;
 	memcpy(rebased.data, successor_page, BLCKSZ);
 	memcpy(next->tt_slots, current->tt_slots, sizeof(next->tt_slots));
 	memcpy(undo_test_lifecycle_disk.data, rebased.data, BLCKSZ);
@@ -1699,6 +1704,35 @@ UT_TEST(test_record_prepare_owns_extent_and_block0_slow_paths)
 	free(source);
 }
 
+/* Ordinary existing-other starts must not reach segment creation before the
+ * recovered semantic OPEN cut is visible; the STARTUP owner remains exempt. */
+UT_TEST(test_record_prepare_recovered_open_gate_precedes_segment_creation)
+{
+	char *source = read_undo_record_source();
+	const char *prepare;
+	const char *guard;
+	const char *gate;
+	const char *segment_create;
+
+	if (source == NULL)
+		return;
+	prepare = strstr(source, "cluster_undo_record_prepare_trace_impl(");
+	guard = prepare == NULL ? NULL : strstr(prepare, "if (MyBackendType != B_STARTUP");
+	gate = guard == NULL ? NULL : strstr(guard, "cluster_semantic_normal_start_state()");
+	segment_create = prepare == NULL
+					 ? NULL
+					 : strstr(prepare, "cluster_undo_active_segment_for_node_or_create(");
+	UT_ASSERT_NOT_NULL(prepare);
+	UT_ASSERT_NOT_NULL(guard);
+	UT_ASSERT_NOT_NULL(gate);
+	UT_ASSERT_NOT_NULL(segment_create);
+	if (prepare != NULL && guard != NULL && gate != NULL && segment_create != NULL)
+		UT_ASSERT(prepare < guard && guard < gate && gate < segment_create);
+	UT_ASSERT(strstr(gate == NULL ? "" : gate,
+					"!cluster_semantic_activation_recovered_open_current()") != NULL);
+	free(source);
+}
+
 /* A prepared receipt is an exact, one-shot identity.  The in-lock consumer
  * must compare the backend reservation sequence, complete extent cursor and
  * exact block0 publication before the first record byte or UBA is exposed. */
@@ -2381,6 +2415,34 @@ UT_TEST(test_prepared_receipt_retains_exact_admission_until_close)
 		UT_ASSERT(strstr(consume, "cluster_undo_record_prepare_deadline_us(") == NULL);
 	}
 	free(source);
+}
+
+UT_TEST(test_lifecycle_activation_refusal_reports_original_current_stage)
+{
+	for (unsigned fault = 0; fault < 2; fault++) {
+		PGAlignedBlock before;
+		char expected[64];
+		ClusterUndoBlock0Result failure = fault == 0 ? CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED
+													   : CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+
+		undo_test_make_header(1, 1, SEGMENT_ALLOCATED, undo_test_lifecycle_disk.data);
+		memcpy(before.data, undo_test_lifecycle_disk.data, BLCKSZ);
+		undo_test_lifecycle_mutate_calls = 0;
+		undo_test_lifecycle_ensure_result = fault == 0 ? failure : CLUSTER_UNDO_BLOCK0_OK;
+		undo_test_lifecycle_mutate_result = fault == 1 ? failure : CLUSTER_UNDO_BLOCK0_OK;
+		receipt_last_log[0] = '\0';
+		receipt_log_enabled = true;
+		UT_ASSERT(!cluster_undo_segment_mark_active(1, 1));
+		receipt_log_enabled = false;
+		UT_ASSERT_EQ(undo_test_lifecycle_mutate_calls, fault);
+		UT_ASSERT_EQ(memcmp(before.data, undo_test_lifecycle_disk.data, BLCKSZ), 0);
+		UT_ASSERT(strstr(receipt_last_log, fault == 0 ? "stage=ensure_resident"
+														  : "stage=mutate_exact") != NULL);
+		snprintf(expected, sizeof(expected), "result=%d", (int)failure);
+		UT_ASSERT(strstr(receipt_last_log, expected) != NULL);
+		UT_ASSERT(strstr(receipt_last_log, "segment=1 owner=1 generation=0") != NULL);
+	}
+	undo_test_lifecycle_ensure_result = undo_test_lifecycle_mutate_result = CLUSTER_UNDO_BLOCK0_OK;
 }
 
 /* A lifecycle RMW may have read block zero just before a canonical publisher
@@ -3789,7 +3851,8 @@ UT_TEST(test_a148_undo_stop_does_not_confuse_extent_and_cursor_cache_with_writer
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(77);
+	UT_PLAN(79);
+	UT_RUN(test_lifecycle_activation_refusal_reports_original_current_stage);
 	UT_RUN(test_abort_prepared_after_lock_release_is_idempotent);
 	UT_RUN(test_abort_prepared_cancel_failure_and_borrowed_owner_do_not_panic);
 	UT_RUN(test_abort_attempted_or_applied_retains_debt_and_panics);
@@ -3836,6 +3899,7 @@ main(int argc, char **argv)
 	UT_RUN(test_extend_selects_reuse_without_mutating_block0);
 	UT_RUN(test_reuse_wrapper_routes_only_through_exact_current_owner);
 	UT_RUN(test_record_prepare_owns_extent_and_block0_slow_paths);
+	UT_RUN(test_record_prepare_recovered_open_gate_precedes_segment_creation);
 	UT_RUN(test_prepared_consumer_rechecks_exact_receipt_before_record_mutation);
 	UT_RUN(test_prepared_consume_lock_precedes_first_receipt_apply);
 	UT_RUN(test_terminal_census_precedes_final_receipt_recheck_and_itl_allocation);

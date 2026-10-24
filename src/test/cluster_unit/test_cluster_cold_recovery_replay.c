@@ -79,6 +79,20 @@ typedef struct Harness {
 	bool refuse_unscheduled;
 	bool refuse_scheduled;
 	bool refuse_space_final;
+	bool refuse_source_drained;
+	int order_mode;
+	uint32 order_calls;
+	XLogRecPtr target_gated_read;
+	bool dependency_enabled;
+	bool dependency_cycle;
+	bool dependency_refuse;
+	uint32 dependency_target;
+	uint32 dependency_calls;
+	uint32 drain_calls[2];
+	bool drained[2];
+	uint64 drained_records[2];
+	XLogRecPtr drained_end[2];
+	uint32 drained_steps[2];
 } Harness;
 
 static RfPageVersionV1
@@ -179,7 +193,7 @@ identity(const FixRecord *r)
 	id.read_rec_ptr = r->read;
 	id.end_rec_ptr = r->end;
 	id.record_crc = (uint32)(r->read ^ r->end);
-	id.rmid = RM_HEAP_ID;
+	id.rmid = r->space && r->op.kind == CLUSTER_COLD_SPACE_DROP ? RM_XACT_ID : RM_HEAP_ID;
 	return id;
 }
 
@@ -205,7 +219,7 @@ observe(void *arg, const RfPageIdentityV1 *page, ClusterColdDataV1 *out)
  * chain makes thread 2's record depend on thread 1's image.
  */
 static ClusterColdParticipantV1 cuts[2];
-static FixRecord fix[2][4];
+static FixRecord fix[2][MAX_STREAM];
 static int fix_count[2];
 
 static void
@@ -307,7 +321,9 @@ op_unscheduled(void *arg, uint32 participant)
 	e->kind = T_UNSCHEDULED;
 	e->participant = participant;
 	e->read = h->current[participant];
-	return !h->refuse_unscheduled;
+	return !h->refuse_unscheduled
+		   && !(participant == 0 && h->target_gated_read == h->current[participant]
+				&& !h->drained[1]);
 }
 
 static bool
@@ -335,7 +351,58 @@ op_space_final(void *arg, uint32 relation)
 	return !h->refuse_space_final;
 }
 
-static const ClusterColdReplayOpsV1 ops = { op_next, op_unscheduled, op_scheduled, op_space_final };
+static bool
+op_source_drained(void *arg, uint32 participant, const ClusterColdReplayResultV1 *progress,
+				  uint64 records)
+{
+	Harness *h = arg;
+	h->drain_calls[participant]++;
+	h->drained[participant] = true;
+	h->drained_records[participant] = records;
+	h->drained_end[participant] = progress->last_end[participant];
+	h->drained_steps[participant] = progress->steps_done;
+	return !h->refuse_source_drained;
+}
+
+static bool
+op_source_order(void *arg, uint32 *order, uint32 count)
+{
+	Harness *h = arg;
+	h->order_calls++;
+	UT_ASSERT_EQ(count, 2);
+	order[0] = h->order_mode == 1 ? 1 : 0;
+	if (h->order_mode != 4)
+		order[1] = h->order_mode == 1 ? 0 : 1;
+	if (h->order_mode == 2)
+		order[1] = order[0];
+	if (h->order_mode == 3)
+		order[1] = count;
+	return h->order_mode != 5;
+}
+
+static bool
+op_record_dependency(void *arg, uint32 participant, const ClusterColdReplayRecordV1 *record,
+					 uint32 *target)
+{
+	Harness *h = arg;
+	h->dependency_calls++;
+	*target = CLUSTER_COLD_NO_INDEX;
+	if (!h->dependency_enabled)
+		return true;
+	if (record->read_rec_ptr != h->current[participant])
+		return false;
+	if (participant == 0 && record->read_rec_ptr == h->target_gated_read) {
+		*target = h->dependency_target;
+		return !h->dependency_refuse;
+	}
+	if (participant == 1 && h->dependency_cycle)
+		*target = 0;
+	return true;
+}
+
+static const ClusterColdReplayOpsV1 ops
+	= { op_next,		   op_unscheduled,	op_scheduled,		 op_space_final,
+		op_source_drained, op_source_order, op_record_dependency };
 
 static bool
 event_is(const Harness *h, int i, TraceKind kind, uint32 participant, XLogRecPtr read)
@@ -348,6 +415,139 @@ static ClusterColdReplayDetailV1
 run(ClusterColdPlanV1 *plan, Harness *h, ClusterColdReplayResultV1 *result)
 {
 	return cluster_cold_replay_run_v1(plan, cuts, 2, 0, &ops, h, result);
+}
+
+static bool
+proof_step_for(const ClusterColdPlanV1 *plan, uint32 participant, const FixRecord *record,
+			   ClusterColdStepV1 *out)
+{
+	uint32 i;
+
+	for (i = 0; i < cluster_cold_plan_step_count_v1(plan); i++) {
+		ClusterColdStepV1 step;
+
+		if (!cluster_cold_plan_step_v1(plan, i, &step))
+			return false;
+		if (step.participant == participant && step.read_rec_ptr == record->read
+			&& step.end_rec_ptr == record->end)
+			{
+				*out = step;
+				return true;
+			}
+	}
+	return false;
+}
+
+static void
+proof_decoded(const FixRecord *record, ClusterColdDecodedV1 *decoded,
+			  ClusterColdComponentV1 *page_component)
+{
+	memset(decoded, 0, sizeof(*decoded));
+	decoded->record.read_rec_ptr = record->read;
+	decoded->record.end_rec_ptr = record->end;
+	decoded->record.record_crc = (uint32)(record->read ^ record->end);
+	decoded->record.rmid = identity(record).rmid;
+	decoded->record.record_flags = 0;
+	decoded->effects.required = CLUSTER_COLD_EFFECT_RECORD;
+	if (!record->page) {
+		decoded->effects.native_apply = decoded->effects.required;
+		return;
+	}
+	*page_component = record->component;
+	decoded->record.component_count = 1;
+	decoded->record.components = page_component;
+	decoded->effects.required |= CLUSTER_COLD_EFFECT_PAGE;
+	decoded->effects.page_apply = decoded->effects.required;
+}
+
+/* Every pass-2 record must be admitted to the attempt-local effect proof;
+ * matching the plan count is what prevents a partial route matrix from
+ * reaching the completion consumer. */
+UT_TEST(test_effect_proof_requires_every_plan_record)
+{
+	ClusterColdPlanV1 *plan;
+	ClusterColdEffectsProofV1 proof;
+	ClusterColdReplayResultV1 result = { 0 };
+
+	fixture(false);
+	plan = seal();
+	cluster_cold_effects_proof_init_v1(&proof);
+	result.detail = CLUSTER_COLD_REPLAY_OK;
+	result.steps_done = cluster_cold_plan_step_count_v1(plan);
+	UT_ASSERT(!cluster_cold_effects_proof_finish_v1(&proof, plan, &result, 2));
+	for (uint32 p = 0; p < 2; p++) {
+		for (int i = 0; i < fix_count[p]; i++) {
+			ClusterColdDecodedV1 decoded;
+			ClusterColdComponentV1 page_component;
+			ClusterColdStepV1 step;
+			ClusterColdStepV1 *step_ptr = NULL;
+
+			proof_decoded(&fix[p][i], &decoded, &page_component);
+			if (fix[p][i].page) {
+				UT_ASSERT(proof_step_for(plan, p, &fix[p][i], &step));
+				step_ptr = &step;
+			}
+			/* This fixture models both streams as the original native owner; the
+			 * production caller supplies the real per-participant ownership bit. */
+			UT_ASSERT(cluster_cold_effects_proof_record_v1(&proof, p, &decoded, step_ptr, true));
+		}
+	}
+	UT_ASSERT(cluster_cold_effects_proof_finish_v1(&proof, plan, &result, 2));
+	{
+		ClusterColdTypedV1 typed = { .plan = plan, .participant_count = 2 };
+		ClusterColdEffectsReceiptV1 empty = { 0 };
+		ClusterColdPlanV1 *other = seal();
+
+		UT_ASSERT(!cluster_cold_typed_effects_ready_v1(NULL));
+		UT_ASSERT(!cluster_cold_typed_effects_complete_v1(NULL, &proof, &result));
+		UT_ASSERT(!cluster_cold_typed_effects_ready_v1(&typed));
+		UT_ASSERT(cluster_cold_typed_effects_complete_v1(&typed, &proof, &result));
+		UT_ASSERT(cluster_cold_typed_effects_ready_v1(&typed));
+		UT_ASSERT(cluster_cold_typed_effects_complete_v1(&typed, &typed.effects_receipt.proof,
+														   &typed.effects_receipt.result));
+		UT_ASSERT(cluster_cold_typed_effects_ready_v1(&typed));
+		/* The adapter can release its scratch; the typed owner copied it. */
+		proof.records_seen[0]--;
+		result.steps_done++;
+		UT_ASSERT(cluster_cold_typed_effects_ready_v1(&typed));
+		proof.records_seen[0]++;
+		result.steps_done--;
+		/* Even an equivalent replacement plan is another attempt. */
+		typed.plan = other;
+		UT_ASSERT(!cluster_cold_typed_effects_ready_v1(&typed));
+		typed.plan = plan;
+		typed.participant_count++;
+		UT_ASSERT(!cluster_cold_typed_effects_ready_v1(&typed));
+		typed.participant_count--;
+		typed.refusal = CLUSTER_COLD_SOURCE_GAP;
+		UT_ASSERT(!cluster_cold_typed_effects_ready_v1(&typed));
+		UT_ASSERT(!cluster_cold_typed_effects_complete_v1(&typed, &proof, &result));
+		UT_ASSERT(memcmp(&typed.effects_receipt, &empty, sizeof(empty)) == 0);
+		typed.refusal = CLUSTER_COLD_OK;
+		for (int fault = 0; fault < 4; fault++) {
+			UT_ASSERT(cluster_cold_typed_effects_complete_v1(&typed, &proof, &result));
+			if (fault == 0)
+				proof.records_seen[1]--;
+			if (fault == 1)
+				proof.invalid = true;
+			if (fault == 2)
+				result.steps_done++;
+			UT_ASSERT(!cluster_cold_typed_effects_complete_v1(&typed, fault == 3 ? NULL : &proof,
+																	 &result));
+			UT_ASSERT(memcmp(&typed.effects_receipt, &empty, sizeof(empty)) == 0);
+			UT_ASSERT(!cluster_cold_typed_effects_ready_v1(&typed));
+			if (fault == 0)
+				proof.records_seen[1]++;
+			if (fault == 1)
+				proof.invalid = false;
+			if (fault == 2)
+				result.steps_done--;
+		}
+		cluster_cold_plan_destroy_v1(&other);
+	}
+	proof.records_seen[1]--;
+	UT_ASSERT(!cluster_cold_effects_proof_finish_v1(&proof, plan, &result, 2));
+	cluster_cold_plan_destroy_v1(&plan);
 }
 
 /*
@@ -453,6 +653,140 @@ UT_TEST(test_replay_scheduled_record_must_match)
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
+/* Unscheduled native/SIDE inputs need the same identity check as PAGE/SPACE,
+ * before even a dependency callback can drain another source. */
+UT_TEST(test_replay_unscheduled_record_must_match_before_callbacks)
+{
+	static const uint32 participant[] = { 0, 0, 1 };
+	static const uint32 position[] = { 0, 2, 1 };
+	static const int events[] = { 0, 3, 5 };
+	static const XLogRecPtr last_read[] = { InvalidXLogRecPtr, 0x1100, 0x1000 };
+	ClusterColdPlanV1 *plan;
+	ClusterColdReplayResultV1 result;
+	Harness h;
+	uint32 at;
+	uint32 field;
+
+	fixture(false);
+	plan = seal();
+	for (at = 0; at < lengthof(participant); at++) {
+		for (field = 0; field < 5; field++) {
+			ClusterColdReplayRecordV1 *record;
+			uint32 p = participant[at];
+
+			harness_init(&h);
+			record = &h.stream[p].record[position[at]];
+			switch (field) {
+			case 0:
+				record->record_crc ^= 1;
+				break;
+			case 1:
+				record->rmid ^= 1;
+				break;
+			case 2:
+				record->info ^= 0x10;
+				break;
+			case 3:
+				record->read_rec_ptr += 8;
+				break;
+			case 4:
+				record->end_rec_ptr -= 8;
+				break;
+			}
+			UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_IDENTITY);
+			UT_ASSERT_EQ(result.participant, p);
+			UT_ASSERT_EQ(result.rec_ptr, record->read_rec_ptr);
+			UT_ASSERT_EQ(h.events, events[at]);
+			UT_ASSERT_EQ(h.dependency_calls, at);
+			UT_ASSERT_EQ(result.last_read[p], last_read[at]);
+			UT_ASSERT_EQ(h.drain_calls[p], 0);
+		}
+	}
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_replay_missing_or_extra_input_stops_before_effects)
+{
+	ClusterColdPlanV1 *plan;
+	ClusterColdReplayResultV1 result;
+	Harness h;
+
+	fixture(false);
+	plan = seal();
+	/* A scheduled frame cannot silently replace its omitted native prefix. */
+	harness_init(&h);
+	h.stream[0].next = 1;
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_IDENTITY);
+	UT_ASSERT_EQ(result.participant, 0);
+	UT_ASSERT_EQ(result.rec_ptr, 0x1100);
+	UT_ASSERT_EQ(h.events, 0);
+	UT_ASSERT_EQ(h.dependency_calls, 0);
+	UT_ASSERT_EQ(result.last_read[0], InvalidXLogRecPtr);
+
+	/* A duplicate terminal frame has the same tail, but no pass-1 input. */
+	harness_init(&h);
+	h.stream[1].record[2] = h.stream[1].record[1];
+	h.stream[1].count = 3;
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_IDENTITY);
+	UT_ASSERT_EQ(result.participant, 1);
+	UT_ASSERT_EQ(result.rec_ptr, 0x1100);
+	UT_ASSERT_EQ(h.events, 6);
+	UT_ASSERT_EQ(h.dependency_calls, 3);
+	UT_ASSERT_EQ(h.drain_calls[1], 0);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
+/* Metadata feed order is not replay order or canonical participant order.
+ * Cursor-only streams still skip their own retained historical prefix. */
+UT_TEST(test_replay_interleaved_cursor_only_inputs_skip_history)
+{
+	ClusterColdPlanV1 *plan = NULL;
+	ClusterColdReplayResultV1 result;
+	ClusterColdDiagV1 diag;
+	Harness h;
+	uint32 p;
+	int i;
+
+	fixture(false);
+	cuts[0].thread_id = 2;
+	cuts[1].thread_id = 1;
+	cuts[0].native_redo = cuts[1].native_redo = 0x1100;
+	UT_ASSERT_EQ(cluster_cold_plan_create_v1(cuts, 2, BUDGET, &plan), CLUSTER_COLD_OK);
+	for (i = 0; i < MAX_STREAM; i++) {
+		for (p = 0; p < 2; p++) {
+			ClusterColdRecordV1 record;
+			ClusterColdReplayRecordV1 id;
+
+			if (i >= fix_count[p])
+				continue;
+			fix[p][i] = plain(fix[p][i].read, fix[p][i].end);
+			id = identity(&fix[p][i]);
+			memset(&record, 0, sizeof(record));
+			record.read_rec_ptr = id.read_rec_ptr;
+			record.end_rec_ptr = id.end_rec_ptr;
+			record.prev_rec_ptr = i == 0 ? cuts[p].physical_lower - 0x40 : fix[p][i - 1].read;
+			record.record_crc = id.record_crc;
+			record.rmid = id.rmid;
+			UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, p, &record), CLUSTER_COLD_OK);
+		}
+	}
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, NULL, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 0);
+	harness_init(&h);
+	h.stream[0].next = h.stream[1].next = 1;
+	h.order_mode = 1; /* drain caller participant 1 before participant 0 */
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_OK);
+	UT_ASSERT_EQ(h.events, 4);
+	UT_ASSERT_EQ(h.dependency_calls, 4);
+	UT_ASSERT(event_is(&h, 0, T_UNSCHEDULED, 1, 0x1100));
+	UT_ASSERT(event_is(&h, 1, T_UNSCHEDULED, 0, 0x1100));
+	UT_ASSERT_EQ(h.drained_records[0], 3);
+	UT_ASSERT_EQ(h.drained_records[1], 1);
+	UT_ASSERT_EQ(h.drained_end[0], cuts[0].tail_end);
+	UT_ASSERT_EQ(h.drained_end[1], cuts[1].tail_end);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
 /* Draining proves the cut: nothing past the tail, same end, same count. */
 UT_TEST(test_replay_drain_proves_the_cut)
 {
@@ -478,21 +812,24 @@ UT_TEST(test_replay_drain_proves_the_cut)
 	UT_ASSERT_EQ(result.participant, 1);
 	UT_ASSERT_EQ(result.rec_ptr, 0x1100);
 
-	/* Same tail, one more record than pass 1 saw. */
+	/* Same tail, one more record: the changed frame is refused first. */
 	harness_init(&h);
 	h.stream[1].record[1].end_rec_ptr = 0x1200;
 	h.stream[1].record[2].read_rec_ptr = 0x1200;
 	h.stream[1].record[2].end_rec_ptr = 0x1300;
 	h.stream[1].count = 3;
-	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_CUT_DIFFERS);
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_IDENTITY);
 	UT_ASSERT_EQ(result.participant, 1);
+	UT_ASSERT_EQ(result.rec_ptr, 0x1100);
+	UT_ASSERT_EQ(h.events, 5);
 
-	/* As many records as pass 1 saw, but the last ends short of the tail. */
+	/* Same count, short tail: refuse identity before its effect callback. */
 	harness_init(&h);
 	h.stream[1].record[1].end_rec_ptr = 0x1200;
-	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_CUT_DIFFERS);
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_IDENTITY);
 	UT_ASSERT_EQ(result.participant, 1);
-	UT_ASSERT_EQ(result.rec_ptr, 0x1200);
+	UT_ASSERT_EQ(result.rec_ptr, 0x1100);
+	UT_ASSERT_EQ(h.events, 5);
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
@@ -611,6 +948,138 @@ UT_TEST(test_replay_space_steps_and_final_installs)
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
+/* A terminal DROP is never finalized merely because its input is present
+ * in the plan: its actual callback and the complete source drains must
+ * have succeeded in this invocation. This runs the original sequencer. */
+UT_TEST(test_replay_drop_final_requires_execution_and_all_source_drains)
+{
+	ClusterColdPlanV1 *plan;
+	ClusterColdReplayResultV1 result;
+	Harness h;
+
+	space_fixture();
+	fix[0][1] = spaced(0x1100, 0x1200, CLUSTER_COLD_SPACE_DROP, 100);
+	memset(fix[0][1].op.before_incarnation, INC, 16);
+	memset(fix[0][1].op.result_incarnation, 0, 16);
+	plan = seal();
+	for (unsigned fault = 0; fault < 4; fault++) {
+		harness_init(&h);
+		if (fault == 0)
+			h.refuse_scheduled = true;
+		else if (fault == 1)
+			h.stream[0].record[1].record_crc ^= 1;
+		else if (fault == 2)
+			h.stream[0].count--;
+		else
+			h.stream[1].count--;
+		UT_ASSERT(run(plan, &h, &result) != CLUSTER_COLD_REPLAY_OK);
+		UT_ASSERT_EQ(result.space_relations_finished, 0);
+		for (int i = 0; i < h.events; i++)
+			UT_ASSERT(h.trace[i].kind != T_SPACE_FINAL);
+	}
+	harness_init(&h);
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_OK);
+	UT_ASSERT_EQ(result.space_relations_finished, 2);
+	UT_ASSERT_EQ(result.steps_done, 2);
+	UT_ASSERT_EQ(h.trace[h.events - 1].kind, T_SPACE_FINAL);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_replay_rebinds_every_original_cut_before_callbacks)
+{
+	static const Size fields[] = { offsetof(ClusterColdParticipantV1, thread_id),
+								   offsetof(ClusterColdParticipantV1, reserved_zero),
+								   offsetof(ClusterColdParticipantV1, timeline),
+								   offsetof(ClusterColdParticipantV1, owner_incarnation),
+								   offsetof(ClusterColdParticipantV1, physical_lower),
+								   offsetof(ClusterColdParticipantV1, native_redo),
+								   offsetof(ClusterColdParticipantV1, tail_end) };
+
+	for (unsigned empty = 0; empty < 2; empty++) {
+		ClusterColdPlanV1 *plan;
+		fixture(false);
+		if (empty) {
+			for (unsigned p = 0; p < 2; p++) {
+				cuts[p].tail_end = cuts[p].native_redo;
+				fix_count[p] = 0;
+			}
+		}
+		plan = seal();
+		for (unsigned p = 0; p < 2; p++) {
+			for (unsigned field = 0; field < lengthof(fields); field++) {
+				ClusterColdParticipantV1 passed[2];
+				ClusterColdReplayResultV1 result;
+				Harness h;
+				memcpy(passed, cuts, sizeof(passed));
+				((unsigned char *)&passed[p])[fields[field]] ^= 1;
+				harness_init(&h);
+				UT_ASSERT_EQ(cluster_cold_replay_run_v1(plan, passed, 2, 0, &ops, &h, &result),
+							 CLUSTER_COLD_REPLAY_CUT_DIFFERS);
+				UT_ASSERT_EQ(result.participant, p);
+				UT_ASSERT_EQ(result.steps_done, 0);
+				UT_ASSERT_EQ(h.order_calls, 0);
+				UT_ASSERT_EQ(h.events, 0);
+				UT_ASSERT_EQ(h.stream[0].next + h.stream[1].next, 0);
+				UT_ASSERT_EQ(h.drain_calls[0] + h.drain_calls[1], 0);
+			}
+		}
+		cluster_cold_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_replay_rebinds_history_only_cut_before_scheduled_work)
+{
+	ClusterColdPlanV1 *plan;
+	ClusterColdReplayResultV1 result;
+	Harness h;
+	fixture(false);
+	cuts[1].native_redo = cuts[1].tail_end;
+	data_token[0] = 3;
+	plan = seal();
+	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 1), 0);
+	cuts[1].owner_incarnation++;
+	harness_init(&h);
+	h.stream[1].count = 0;
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_CUT_DIFFERS);
+	UT_ASSERT_EQ(result.participant, 1);
+	UT_ASSERT_EQ(h.order_calls, 0);
+	UT_ASSERT_EQ(h.events, 0);
+	UT_ASSERT_EQ(h.drain_calls[0] + h.drain_calls[1], 0);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_replay_cut_binding_uses_sealed_caller_order_and_value)
+{
+	ClusterColdPlanV1 *plan;
+	ClusterColdParticipantV1 passed[2];
+	ClusterColdParticipantV1 first;
+	ClusterColdReplayResultV1 result;
+	Harness h;
+	fixture(false);
+	/* The plan's canonical thread order now differs from its caller order. */
+	cuts[0].thread_id = 9;
+	plan = seal();
+	memcpy(passed, cuts, sizeof(passed));
+	/* Neither the create() input address nor its current bytes are authority. */
+	cuts[0].thread_id++;
+	harness_init(&h);
+	UT_ASSERT_EQ(cluster_cold_replay_run_v1(plan, passed, 2, 0, &ops, &h, &result),
+				 CLUSTER_COLD_REPLAY_OK);
+	UT_ASSERT_EQ(h.order_calls, 1);
+	UT_ASSERT_EQ(h.drain_calls[0], 1);
+	UT_ASSERT_EQ(h.drain_calls[1], 1);
+	/* Reordering the caller's sources must fail before the first consumer. */
+	first = passed[0];
+	passed[0] = passed[1];
+	passed[1] = first;
+	harness_init(&h);
+	UT_ASSERT_EQ(cluster_cold_replay_run_v1(plan, passed, 2, 0, &ops, &h, &result),
+				 CLUSTER_COLD_REPLAY_CUT_DIFFERS);
+	UT_ASSERT_EQ(h.order_calls, 0);
+	UT_ASSERT_EQ(h.events, 0);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
 UT_TEST(test_replay_argument_checks)
 {
 	ClusterColdPlanV1 *plan;
@@ -711,16 +1180,255 @@ UT_TEST(test_unscheduled_record_handling)
 	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(NULL), CLUSTER_COLD_UNSCHEDULED_REFUSE);
 }
 
+UT_TEST(test_source_drain_notification_is_after_complete_replay)
+{
+	ClusterColdPlanV1 *plan;
+	ClusterColdReplayResultV1 result;
+	Harness h;
+	fixture(false);
+	plan = seal();
+	harness_init(&h);
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_OK);
+	UT_ASSERT(h.drained[0] && h.drained[1]);
+	UT_ASSERT_EQ(h.drained_records[0], 4);
+	UT_ASSERT_EQ(h.drained_records[1], 2);
+	UT_ASSERT_EQ(h.drained_end[0], 0x1500);
+	UT_ASSERT_EQ(h.drained_end[1], 0x1300);
+	UT_ASSERT_EQ(h.drained_steps[0], 3);
+	UT_ASSERT_EQ(h.drained_steps[1], 3);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_failed_source_or_notification_never_finishes_later_work)
+{
+	ClusterColdPlanV1 *plan;
+	ClusterColdReplayResultV1 result;
+	Harness h;
+	fixture(false);
+	plan = seal();
+	for (int fault = 0; fault < 5; fault++) {
+		harness_init(&h);
+		if (fault == 0)
+			h.refuse_unscheduled = true;
+		else if (fault == 1)
+			h.refuse_scheduled = true;
+		else if (fault == 2)
+			h.stream[1].count--;
+		else if (fault == 3)
+			h.stream[1].record[1].end_rec_ptr = 0x1400;
+		else
+			h.refuse_source_drained = true;
+		UT_ASSERT_NE(run(plan, &h, &result), CLUSTER_COLD_REPLAY_OK);
+		UT_ASSERT(!h.drained[1]);
+		if (fault == 4) {
+			UT_ASSERT(h.drained[0]);
+			UT_ASSERT_EQ(result.detail, CLUSTER_COLD_REPLAY_CALLBACK);
+		} else if (fault < 2)
+			UT_ASSERT(!h.drained[0]);
+	}
+	cluster_cold_plan_destroy_v1(&plan);
+
+	space_fixture();
+	plan = seal();
+	harness_init(&h);
+	h.refuse_source_drained = true;
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_CALLBACK);
+	UT_ASSERT_EQ(result.space_relations_finished, 0);
+	for (int i = 0; i < h.events; i++)
+		UT_ASSERT(h.trace[i].kind != T_SPACE_FINAL);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
+
+UT_TEST(test_remainder_dependency_order_preserves_scheduled_prefix)
+{
+	Harness h;
+	ClusterColdReplayResultV1 result;
+	ClusterColdPlanV1 *plan;
+	fixture(false);
+	fix[0][4] = plain(0x1500, 0x1600);
+	fix_count[0] = 5;
+	cuts[0].tail_end = 0x1600;
+	plan = seal();
+	harness_init(&h);
+	h.order_mode = 1;
+	h.target_gated_read = 0x1500;
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_OK);
+	UT_ASSERT_EQ(result.steps_done, 3);
+	UT_ASSERT_EQ(h.events, 7);
+	UT_ASSERT(event_is(&h, 0, T_UNSCHEDULED, 0, 0x1000));
+	UT_ASSERT(event_is(&h, 1, T_SCHEDULED, 0, 0x1100));
+	UT_ASSERT(event_is(&h, 2, T_SCHEDULED, 1, 0x1000));
+	UT_ASSERT(event_is(&h, 3, T_UNSCHEDULED, 0, 0x1200));
+	UT_ASSERT(event_is(&h, 4, T_SCHEDULED, 0, 0x1300));
+	UT_ASSERT(event_is(&h, 5, T_UNSCHEDULED, 1, 0x1100));
+	UT_ASSERT(event_is(&h, 6, T_UNSCHEDULED, 0, 0x1500));
+	UT_ASSERT_EQ(h.drained_records[0], 5);
+	UT_ASSERT_EQ(h.drained_records[1], 2);
+	UT_ASSERT_EQ(result.last_end[0], 0x1600);
+	UT_ASSERT_EQ(result.last_end[1], 0x1300);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_invalid_order_refuses_before_any_record_callback)
+{
+	Harness h;
+	ClusterColdReplayResultV1 result;
+	ClusterColdPlanV1 *plan;
+	fixture(false);
+	plan = seal();
+	for (int mode = 2; mode <= 5; mode++) {
+		harness_init(&h);
+		h.order_mode = mode;
+		UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_CALLBACK);
+		UT_ASSERT_EQ(h.events, 0);
+		UT_ASSERT_EQ(h.stream[0].next, 0);
+		UT_ASSERT_EQ(h.stream[1].next, 0);
+		UT_ASSERT_EQ(result.steps_done, 0);
+		UT_ASSERT(!h.drained[0] && !h.drained[1]);
+	}
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_order_neither_bypasses_target_failure_nor_reorders_prefix)
+{
+	Harness h;
+	ClusterColdReplayResultV1 result;
+	ClusterColdPlanV1 *plan;
+	fixture(false);
+	plan = seal();
+	harness_init(&h);
+	h.order_mode = 1;
+	h.refuse_source_drained = true;
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_CALLBACK);
+	UT_ASSERT(h.drained[1] && !h.drained[0]);
+	UT_ASSERT_EQ(result.participant, 1);
+	harness_init(&h);
+	h.order_mode = 1;
+	h.target_gated_read = 0x1000;
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_CALLBACK);
+	UT_ASSERT_EQ(result.steps_done, 0);
+	UT_ASSERT(!h.drained[0] && !h.drained[1]);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
+/* A C0-like dependent record precedes the writer's next PAGE step, but
+ * its target's last PAGE has already run. The actual sequencer must drain
+ * and validate that target without moving either scheduled step. */
+UT_TEST(test_prefix_dependency_drains_ready_target_once)
+{
+	Harness h;
+	ClusterColdReplayResultV1 result;
+	ClusterColdPlanV1 *plan;
+	fixture(false);
+	plan = seal();
+	harness_init(&h);
+	h.dependency_enabled = true;
+	h.dependency_target = 1;
+	h.target_gated_read = 0x1200;
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_OK);
+	UT_ASSERT_EQ(result.steps_done, 3);
+	UT_ASSERT_EQ(h.events, 6);
+	UT_ASSERT(event_is(&h, 0, T_UNSCHEDULED, 0, 0x1000));
+	UT_ASSERT(event_is(&h, 1, T_SCHEDULED, 0, 0x1100));
+	UT_ASSERT(event_is(&h, 2, T_SCHEDULED, 1, 0x1000));
+	UT_ASSERT(event_is(&h, 3, T_UNSCHEDULED, 1, 0x1100));
+	UT_ASSERT(event_is(&h, 4, T_UNSCHEDULED, 0, 0x1200));
+	UT_ASSERT(event_is(&h, 5, T_SCHEDULED, 0, 0x1300));
+	UT_ASSERT_EQ(h.drained_steps[1], 2);
+	UT_ASSERT_EQ(h.drained_records[1], 2);
+	UT_ASSERT_EQ(h.drained_end[1], 0x1300);
+	UT_ASSERT_EQ(h.drain_calls[0], 1);
+	UT_ASSERT_EQ(h.drain_calls[1], 1);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_prefix_dependency_never_skips_future_steps_or_failed_cut)
+{
+	ClusterColdPlanV1 *plan;
+	ClusterColdReplayResultV1 result;
+	Harness h;
+	fixture(false);
+	plan = seal();
+	for (int fault = 0; fault < 7; fault++) {
+		harness_init(&h);
+		h.dependency_enabled = true;
+		h.dependency_target = 1;
+		h.target_gated_read = fault == 0 ? 0x1000 : 0x1200;
+		if (fault == 1)
+			h.stream[1].count--;
+		if (fault == 2)
+			h.stream[1].record[1].end_rec_ptr++;
+		if (fault == 3)
+			h.refuse_source_drained = true;
+		if (fault == 4)
+			h.dependency_refuse = true;
+		if (fault == 5)
+			h.dependency_target = 2;
+		if (fault == 6) {
+			h.stream[1].record[2] = h.stream[1].record[1];
+			h.stream[1].count++;
+		}
+		UT_ASSERT_NE(run(plan, &h, &result), CLUSTER_COLD_REPLAY_OK);
+		UT_ASSERT_EQ(h.drain_calls[0], 0);
+		UT_ASSERT_EQ(result.space_relations_finished, 0);
+		for (int i = 0; i < h.events; i++)
+			UT_ASSERT(!event_is(&h, i, T_UNSCHEDULED, 0, h.target_gated_read));
+		if (fault == 0)
+			UT_ASSERT_EQ(h.stream[1].next, 0);
+	}
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_dependency_cycle_is_bounded_without_consuming_waiting_record)
+{
+	ClusterColdPlanV1 *plan;
+	ClusterColdReplayResultV1 result;
+	Harness h;
+	fixture(false);
+	fix[0][0] = plain(0x1000, 0x1500);
+	fix[1][0] = plain(0x1000, 0x1300);
+	fix_count[0] = fix_count[1] = 1;
+	plan = seal();
+	harness_init(&h);
+	h.dependency_enabled = h.dependency_cycle = true;
+	h.dependency_target = 1;
+	h.target_gated_read = 0x1000;
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_CALLBACK);
+	UT_ASSERT_EQ(h.events, 0);
+	UT_ASSERT_EQ(h.stream[0].next, 1);
+	UT_ASSERT_EQ(h.stream[1].next, 1);
+	UT_ASSERT_EQ(h.drain_calls[0] + h.drain_calls[1], 0);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
 int
 main(void)
 {
+	UT_PLAN(26);
+	UT_RUN(test_effect_proof_requires_every_plan_record);
+	UT_RUN(test_replay_rebinds_every_original_cut_before_callbacks);
+	UT_RUN(test_replay_rebinds_history_only_cut_before_scheduled_work);
+	UT_RUN(test_replay_cut_binding_uses_sealed_caller_order_and_value);
+	UT_RUN(test_prefix_dependency_drains_ready_target_once);
+	UT_RUN(test_prefix_dependency_never_skips_future_steps_or_failed_cut);
+	UT_RUN(test_dependency_cycle_is_bounded_without_consuming_waiting_record);
+	UT_RUN(test_remainder_dependency_order_preserves_scheduled_prefix);
+	UT_RUN(test_invalid_order_refuses_before_any_record_callback);
+	UT_RUN(test_order_neither_bypasses_target_failure_nor_reorders_prefix);
+	UT_RUN(test_source_drain_notification_is_after_complete_replay);
+	UT_RUN(test_failed_source_or_notification_never_finishes_later_work);
 	UT_RUN(test_replay_follows_schedule_and_drains);
 	UT_RUN(test_replay_page_actions);
 	UT_RUN(test_replay_scheduled_record_must_match);
+	UT_RUN(test_replay_unscheduled_record_must_match_before_callbacks);
+	UT_RUN(test_replay_missing_or_extra_input_stops_before_effects);
+	UT_RUN(test_replay_interleaved_cursor_only_inputs_skip_history);
 	UT_RUN(test_replay_drain_proves_the_cut);
 	UT_RUN(test_replay_history_only_generation);
 	UT_RUN(test_replay_callback_refusal_stops);
 	UT_RUN(test_replay_space_steps_and_final_installs);
+	UT_RUN(test_replay_drop_final_requires_execution_and_all_source_drains);
 	UT_RUN(test_unscheduled_record_handling);
 	UT_RUN(test_replay_argument_checks);
 	UT_RUN(test_skipped_own_record_advances_next_xid);

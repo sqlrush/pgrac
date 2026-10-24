@@ -66,7 +66,7 @@ struct ClusterWalPrefixIdentity {
  * physical fsync is not an isolation certificate or a new durable promise.
  * Descriptor ownership stays in work across ERROR/cancellation.
  * Author: SqlRush <sqlrush@gmail.com> */
-static ClusterControlRootResult wal_startup_sync_inputs(WalTailWork *work);
+static ClusterControlRootResult wal_tail_sync_inputs(WalTailWork *work);
 
 static bool
 wal_tail_zero(const char *bytes, size_t size)
@@ -686,7 +686,7 @@ wal_tail_scan(WalTailWork *work, int segment_size, XLogRecPtr lower, XLogRecPtr 
 	if (!wal_tail_paths_current(work))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (work->sync_inputs) {
-		result = wal_startup_sync_inputs(work);
+		result = wal_tail_sync_inputs(work);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 	}
@@ -699,8 +699,8 @@ wal_tail_scan(WalTailWork *work, int segment_size, XLogRecPtr lower, XLogRecPtr 
 }
 
 static ClusterControlRootResult
-wal_startup_sync_file(WalTailWork *work, int dir, const char *name, const struct stat *expected,
-					  off_t size)
+wal_tail_sync_file(WalTailWork *work, int dir, const char *name, const struct stat *expected,
+				   off_t size)
 {
 	struct stat before, after, named;
 	CHECK_FOR_INTERRUPTS();
@@ -728,20 +728,27 @@ wal_startup_sync_file(WalTailWork *work, int dir, const char *name, const struct
 }
 
 static ClusterControlRootResult
-wal_startup_sync_inputs(WalTailWork *work)
+wal_tail_sync_inputs(WalTailWork *work)
 {
 	ClusterControlRootResult result;
-	if (!enableFsync || !work->startup_mode || !wal_tail_paths_current(work))
+	if (!enableFsync
+		|| (!work->startup_mode
+			&& (work->sealed == NULL
+				|| (work->sealed->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+					&& work->sealed->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
+					&& work->sealed->lifecycle
+						   != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE)))
+		|| !wal_tail_paths_current(work))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	for (WalTailSegment *s = work->segments; s != NULL; s = s->next) {
 		char filename[MAXFNAMELEN];
 		XLogFileName(filename, work->ref.timeline, s->number, work->reader->segcxt.ws_segsize);
-		result = wal_startup_sync_file(work, work->dirs[2], filename, &s->identity, -1);
+		result = wal_tail_sync_file(work, work->dirs[2], filename, &s->identity, -1);
 		if (result != 0)
 			return result;
 	}
-	result = wal_startup_sync_file(work, work->dirs[2], CLUSTER_WAL_THREAD_CLAIM_FILENAME, NULL,
-								   CLUSTER_WAL_CLAIM_V2_BYTES);
+	result = wal_tail_sync_file(work, work->dirs[2], CLUSTER_WAL_THREAD_CLAIM_FILENAME, NULL,
+								CLUSTER_WAL_CLAIM_V2_BYTES);
 	if (result != 0)
 		return result;
 	for (int i = lengthof(work->dirs) - 1; i >= 0; --i) {
@@ -963,7 +970,7 @@ static ClusterControlRootResult
 wal_tail_visit_exact(const char *wal_root, const ClusterWalSourceRef *ref, int segment_size,
 					 const ClusterControlRootSnapshot *sealed, XLogRecPtr checkpoint_start,
 					 ClusterWalRecordVisitor visitor, void *arg, ClusterWalTailObservation *out,
-					 bool recovery_only)
+					 bool recovery_only, bool sync_inputs)
 {
 	ClusterControlRootSnapshot expected = { 0 };
 	const uint32 flags
@@ -975,6 +982,7 @@ wal_tail_visit_exact(const char *wal_root, const ClusterWalSourceRef *ref, int s
 		expected = *sealed;
 	memset(out, 0, sizeof(*out));
 	if (sealed == NULL || ref == NULL || checkpoint_start == 0
+		|| (sync_inputs && (!enableFsync || visitor != NULL))
 		|| (expected.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
 			&& (recovery_only
 				|| (expected.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
@@ -988,7 +996,7 @@ wal_tail_visit_exact(const char *wal_root, const ClusterWalSourceRef *ref, int s
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	return wal_tail_observe_common(wal_root, ref, segment_size, expected.checkpoint_lower_lsn,
 								   expected.validated_tail_lsn_exclusive, checkpoint_start,
-								   expected.checkpoint_record_crc32c, out, NULL, false, false,
+								   expected.checkpoint_record_crc32c, out, NULL, sync_inputs, false,
 								   &expected, visitor, arg, InvalidXLogRecPtr);
 }
 
@@ -999,7 +1007,16 @@ cluster_wal_tail_visit_sealed(const char *wal_root, const ClusterWalSourceRef *r
 							  void *arg, ClusterWalTailObservation *out)
 {
 	return wal_tail_visit_exact(wal_root, ref, segment_size, sealed, checkpoint_start, visitor, arg,
-								out, true);
+								out, true, false);
+}
+
+ClusterControlRootResult
+cluster_wal_tail_sync_sealed_v1(const char *wal_root, const ClusterWalSourceRef *ref,
+								int segment_size, const ClusterControlRootSnapshot *sealed,
+								XLogRecPtr checkpoint_start, ClusterWalTailObservation *out)
+{
+	return wal_tail_visit_exact(wal_root, ref, segment_size, sealed, checkpoint_start, NULL, NULL,
+								out, true, true);
 }
 
 ClusterControlRootResult
@@ -1009,7 +1026,16 @@ cluster_wal_retained_visit_v1(const char *wal_root, const ClusterWalSourceRef *r
 							  void *arg, ClusterWalTailObservation *out)
 {
 	return wal_tail_visit_exact(wal_root, ref, segment_size, retained, checkpoint_start, visitor,
-								arg, out, false);
+								arg, out, false, false);
+}
+
+ClusterControlRootResult
+cluster_wal_retained_sync_v1(const char *wal_root, const ClusterWalSourceRef *ref, int segment_size,
+							 const ClusterControlRootSnapshot *retained,
+							 XLogRecPtr checkpoint_start, ClusterWalTailObservation *out)
+{
+	return wal_tail_visit_exact(wal_root, ref, segment_size, retained, checkpoint_start, NULL, NULL,
+								out, false, true);
 }
 
 ClusterControlRootResult

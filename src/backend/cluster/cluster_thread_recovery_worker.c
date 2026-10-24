@@ -441,6 +441,9 @@ cluster_thread_recovery_worker_main(Datum main_arg)
 	if (!cluster_thread_recovery_worker_start_valid_for_claim(
 			&eligibility, (uint16)dead_tid, slot_read, state, launch_epoch, cluster_shared_config))
 		return;
+	if (cluster_shared_config
+		&& !cluster_recovery_stamp_worker_begin_v1((uint16)dead_tid, eligibility.attempt_stamp))
+		return;
 
 	/* PGRAC: SHMEM-only workers do not enter InitPostgres, which normally
 	 * establishes this lifetime. WAL retention and replay resources must have
@@ -568,6 +571,13 @@ thread_recovery_reap_one(uint16 dead_tid, bool *retained_out)
 								  " status=%d slot_read=%s slot_state=%d slot_stamp=" UINT64_FORMAT,
 								  (unsigned)dead_tid, owned->attempt_stamp, (int)status,
 								  slot_read ? "true" : "false", (int)state, slot_stamp)));
+	/* Native handle STOPPED is the lifetime witness. Preserve any exact
+	 * launch's F4 obligation before resetting its scheduler slot or handle. */
+	if (cluster_shared_config
+		&& !cluster_recovery_stamp_worker_stopped_v1(dead_tid, owned->attempt_stamp))
+		ereport(FATAL, (errmsg("online thread-recovery STOPPED stamp could not be retained"),
+						errdetail("thread=%u stamp=" UINT64_FORMAT, (unsigned)dead_tid,
+								  owned->attempt_stamp)));
 	if (decision == CLUSTER_THREADREC_REAP_RESET_IDLE) {
 		ClusterThreadReplayMatchResult match_result
 			= cluster_thread_recovery_replay_transition_if_match(dead_tid, owned->attempt_stamp,

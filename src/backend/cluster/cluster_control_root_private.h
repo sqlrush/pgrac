@@ -109,6 +109,16 @@ extern ClusterControlRootResult
 cluster_control_root_v3_reserve_clean(const ClusterStartupExitCut *expected,
 									  ClusterControlRootFileToken *out);
 
+/* PGRAC: cache-complete cohort input reservation; no writer/serving grant.
+ * Owns CF and retains every predecessor WALR through publication/readback.
+ * Caller supplies the current StartupProcess identity and exact ROOT token;
+ * real anchor/WAL and the complete current formation are selected internally.
+ * Author: SqlRush <sqlrush@gmail.com> */
+extern ClusterControlRootResult
+cluster_control_root_v3_reserve_recovered(const ClusterControlRootIdentity *self,
+										 const ClusterControlRootFileToken *expected,
+										 ClusterControlRootFileToken *out);
+
 /* PGRAC: bounded retained-writer input, never an authority/retirement proof.
  * Author: SqlRush <sqlrush@gmail.com>
  */
@@ -304,7 +314,9 @@ cluster_control_root_v3_startup_prepare_target(const ClusterControlRootIdentity 
 											   const uint8 operation_uuid[16],
 											   ClusterWalStartupImage *out);
 /* Coordinator StartupProcess: actual all-target EMPTY readback followed by
- * exact root CAS to INITIALIZING. Still not an ordinary writer/serving grant. */
+ * exact root CAS to INITIALIZING. Consumes CLEAN, original INITIALIZED or a
+ * same-reservation RECOVERED/CLEAN cohort without changing any input kind.
+ * Still not an ordinary writer/serving grant. */
 extern ClusterControlRootResult cluster_control_root_v3_startup_begin_clean(
 	const ClusterControlRootIdentity *self, const uint8 operation_uuid[16],
 	const ClusterControlRootFileToken *expected, ClusterControlRootFileToken *out);
@@ -572,6 +584,19 @@ extern ClusterControlRootResult cluster_control_root_v3_checkpoint_publish(
 	const ClusterControlRootIdentity *self, const ControlFileData *thread_control,
 	XLogRecPtr checkpoint_end, ClusterControlRootSnapshot *out,
 	ClusterControlRootFileToken *out_token, ControlFileData *out_control);
+
+/* Original recovered INSTALL/native-DONE owner only. ONLINE evidence retains
+ * common MOUNTED/RECOVERING and local serving=0; not CLEAN/first creation,
+ * shutdown, C0 execution or semantic OPEN authority. Caller owns the scope. */
+struct ClusterRecoveryCheckpointScopeV1;
+/* Borrowed CF-S/X and exact recovered owner; never an ordinary serving read. */
+extern ClusterControlRootResult cluster_control_root_v3_read_recovery_checkpoint_locked(
+	const struct ClusterRecoveryCheckpointScopeV1 *scope, ControlFileData *out);
+extern ClusterControlRootResult cluster_control_root_v3_recovery_checkpoint_publish(
+	const struct ClusterRecoveryCheckpointScopeV1 *scope, const ClusterControlRootIdentity *self,
+	const ControlFileData *thread_control, XLogRecPtr checkpoint_end,
+	ClusterControlRootSnapshot *out, ClusterControlRootFileToken *out_token,
+	ControlFileData *out_control);
 
 /* PGRAC: publishes WAL-verified shutdown checkpoint evidence only. Does not
  * close a thread/database or change membership; returned native view still

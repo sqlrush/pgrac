@@ -3,11 +3,10 @@
  * cluster_external_fence.c
  *	  Provider-neutral external I/O fence backend boundary (RF-ROOT P4).
  *
- * The current approved package deliberately has no production provider:
- * provider id 0 is UNAVAILABLE and bit 24 is not advertised.  Consequently
- * this file keeps production fail-closed.  A compile-time unit-test seam may
- * supply an authenticated transport for the frozen protocol's positive-path
- * witnesses; it is absent from the production object and link map.
+ * The transport provider remains UNAVAILABLE and bit 24 is not advertised.
+ * Cold recovery additionally accepts exact same-host process exclusion;
+ * remote, missing and unreadable identities remain unavailable.  The online
+ * transport's affirmative unit-test seam is absent from production objects.
  *
  *-------------------------------------------------------------------------
  */
@@ -31,6 +30,7 @@
 #endif
 
 #include "cluster/cluster_external_fence.h"
+#include "cluster/cluster_same_host_fence.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/storage/cluster_shared_fs.h"
@@ -39,14 +39,33 @@
 #include "common/pgrac_external_fence_protocol.h"
 
 static PgracExternalFenceDenyReason external_fence_last_deny = PGRAC_EXTERNAL_FENCE_DENY_NONE;
+/* Process-local diagnostics only; never an admission or a current-state proof. */
+static const char *external_fence_need_set_predicate = "NOT_EXPORTED";
+
+const char *
+cluster_external_fence_need_set_last_predicate(void)
+{
+	return external_fence_need_set_predicate;
+}
 
 #ifdef USE_CLUSTER_UNIT
 extern bool cluster_external_fence_test_runtime_active(void);
+extern bool cluster_external_fence_test_same_host_available(void);
 extern int cluster_external_fence_test_connect_root_daemon(int timeout_ms);
 extern bool cluster_external_fence_test_root_peer_authenticated(int fd);
 extern int
 cluster_external_fence_test_admission_lease_ms(const PgracExternalFenceAdmissionV1 *admission);
 #endif
+
+static bool
+external_fence_same_host_available(void)
+{
+#ifdef USE_CLUSTER_UNIT
+	return cluster_external_fence_test_same_host_available();
+#else
+	return cluster_same_host_fence_available();
+#endif
+}
 
 bool
 cluster_external_fence_runtime_active(void)
@@ -125,6 +144,8 @@ struct PgracExternalFenceAdmissionV1 {
 	uint64 cached_mapping_generation;
 	int32 cooperative_lease_ms_snapshot;
 	int32 socket_fd;
+	bool same_host;
+	ClusterSameHostRecordV1 same_host_record;
 };
 
 struct PgracExternalFenceNeedSetV1 {
@@ -132,6 +153,7 @@ struct PgracExternalFenceNeedSetV1 {
 	int32 owner_pid;
 	uint32 released;
 	uint32 count;
+	bool cold;
 	ClusterRecoveryDutyKey duty;
 	ClusterRecoveryDutyDigest duty_digest;
 	PgracExternalFenceWriterSetDigest writer_set_digest;
@@ -613,7 +635,9 @@ external_fence_admission_valid(const PgracExternalFenceAdmissionV1 *admission)
 {
 	return admission != NULL && admission->magic == PGRAC_EXTERNAL_FENCE_ADMISSION_MAGIC
 		   && admission->owner_pid == external_fence_owner_pid() && admission->released == 0
-		   && admission->socket_fd >= 0;
+		   && (admission->socket_fd >= 0 || (admission->same_host
+			&& cluster_same_host_record_matches_v1(&admission->same_host_record,
+												 &admission->same_host_record.key)));
 }
 
 static bool
@@ -675,10 +699,70 @@ external_fence_writer_set_digest_v1(
 	return true;
 }
 
-PgracExternalFenceNeedSetResult
-cluster_external_fence_need_set_build(const ClusterRecoveryDutyKey *duty,
-									  const ClusterFormationWitnessV1 *formation,
-									  PgracExternalFenceNeedSetV1 **out)
+/* E1's new MEMBER boots coordinate recovery; they are not the old writers.
+ * Read the original canonical roots, whose crashed inputs were self-sealed
+ * only after the owning Startup proved prior-death. Include the founder's
+ * old writer too. These facts select provider needs, never grant isolation. */
+static PgracExternalFenceNeedSetResult
+external_fence_cold_writers(const ClusterRecoveryDutyKey *duty,
+						   const ClusterFormationSnapshotV1 *classification,
+						   uint64 writer_incarnations[CLUSTER_MAX_NODES])
+{
+	const uint32 sealed = CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
+		| CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
+		| CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+
+	if (!cluster_shared_config || classification->startup_formation_generation == 0
+		|| classification->reserved[0] != CLUSTER_FORMATION_SNAPSHOT_RECOVERY_CONTROL
+		|| classification->reserved[1] != 0)
+		return PGRAC_EXTERNAL_FENCE_NEED_SET_MEMBERSHIP_UNSTABLE;
+	for (int32 n = 0; n < CLUSTER_MAX_NODES; n++) {
+		ClusterControlRootIdentity identity;
+		ClusterControlRootSnapshot root;
+		ClusterControlRootReadToken token;
+		ClusterControlRootResult result;
+
+		if (external_fence_bitmap_member(classification->excluded_bitmap, n))
+			return PGRAC_EXTERNAL_FENCE_NEED_SET_MEMBERSHIP_UNSTABLE;
+		if (classification->membership.membership_state[n] != CLUSTER_MEMBER_MEMBER)
+			continue;
+		memset(&identity, 0, sizeof(identity));
+		memset(&root, 0, sizeof(root));
+		memset(&token, 0, sizeof(token));
+		result = cluster_control_root_lookup_owner_by_node_runtime(n, &identity, &root, &token);
+		if ((result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			 && result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+			|| !cluster_recovery_duty_key_valid_for_claim(&identity, true)
+			|| identity.origin_node_id != n || identity.origin_thread_id != n + 1
+			|| identity.system_identifier != duty->system_identifier
+			|| memcmp(identity.storage_uuid, duty->storage_uuid, sizeof(identity.storage_uuid)) != 0
+			|| cluster_recovery_duty_key_compare_for_claim(&identity, &root.identity, true)
+				   != CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
+			|| classification->membership.last_admitted_incarnation[n]
+				   <= identity.origin_owner_incarnation
+			|| (root.root_flags & (CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
+								  | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID))
+				   != (CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
+					   | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID)
+			|| (root.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
+				&& root.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
+				&& (root.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+					|| (root.root_flags & sealed) != sealed))
+			|| (n == duty->origin_node_id
+				&& (root.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+					|| (root.root_flags & sealed) != sealed
+					|| cluster_recovery_duty_key_compare_for_claim(&identity, duty, true)
+						   != CLUSTER_RECOVERY_DUTY_COMPARE_EXACT)))
+			return PGRAC_EXTERNAL_FENCE_NEED_SET_WRITER_INCAR_UNPROVEN;
+		writer_incarnations[n] = identity.origin_owner_incarnation;
+	}
+	return PGRAC_EXTERNAL_FENCE_NEED_SET_OK;
+}
+
+static PgracExternalFenceNeedSetResult
+external_fence_need_set_build(const ClusterRecoveryDutyKey *duty,
+							  const ClusterFormationWitnessV1 *formation, bool cold,
+							  PgracExternalFenceNeedSetV1 **out)
 {
 	ClusterFenceAuthorityProof authority;
 	ClusterFormationSnapshotV1 classification;
@@ -689,8 +773,10 @@ cluster_external_fence_need_set_build(const ClusterRecoveryDutyKey *duty,
 	uint8 protected_set_digest[PGRAC_EXTERNAL_FENCE_DIGEST_BYTES];
 	uint16 formation_origin_thread;
 	uint32 count = 0;
+	uint64 writer_incarnations[CLUSTER_MAX_NODES] = { 0 };
 	int32 node_id;
 
+	external_fence_need_set_predicate = "NOT_EXPORTED";
 	if (out == NULL || *out != NULL || duty == NULL || formation == NULL)
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_BAD_ARGUMENT;
 	if (!cluster_recovery_duty_key_valid_for_claim(duty, cluster_shared_config))
@@ -701,9 +787,15 @@ cluster_external_fence_need_set_build(const ClusterRecoveryDutyKey *duty,
 	if (formation_result != CLUSTER_FORMATION_WITNESS_READY)
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_FENCE_AUTHORITY_UNAVAILABLE;
 
-	if ((cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_CONTROL_ROOT_V1) == 0
-		|| !cluster_external_fence_runtime_active())
+	if ((cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_CONTROL_ROOT_V1) == 0) {
+		external_fence_need_set_predicate = "CONTROL_ROOT_CAPABILITY_UNAVAILABLE";
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_CAPABILITY_UNAVAILABLE;
+	}
+	if (!cluster_external_fence_runtime_active()
+		&& !(cold && external_fence_same_host_available())) {
+		external_fence_need_set_predicate = "ROOT_FENCING_PROVIDER_INACTIVE";
+		return PGRAC_EXTERNAL_FENCE_NEED_SET_CAPABILITY_UNAVAILABLE;
+	}
 	if (!cluster_formation_witness_copy_classification_v1(formation, &formation_origin_thread,
 														  &authority, &classification))
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_FENCE_AUTHORITY_UNAVAILABLE;
@@ -719,23 +811,35 @@ cluster_external_fence_need_set_build(const ClusterRecoveryDutyKey *duty,
 		|| authority.marker.fence_epoch != classification.local_epoch)
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_MEMBERSHIP_UNSTABLE;
 
-	for (node_id = 0; node_id < CLUSTER_MAX_NODES; node_id++) {
+	if (cold) {
+		PgracExternalFenceNeedSetResult result
+			= external_fence_cold_writers(duty, &classification, writer_incarnations);
+		if (result != PGRAC_EXTERNAL_FENCE_NEED_SET_OK)
+			return result;
+	} else for (node_id = 0; node_id < CLUSTER_MAX_NODES; node_id++) {
 		if (!external_fence_bitmap_member(classification.excluded_bitmap, node_id))
 			continue;
-		count++;
 		if (classification.membership.membership_state[node_id] != CLUSTER_MEMBER_DEAD
 			&& classification.membership.membership_state[node_id] != CLUSTER_MEMBER_REMOVED)
 			return PGRAC_EXTERNAL_FENCE_NEED_SET_MEMBERSHIP_UNSTABLE;
 		if (classification.membership.last_admitted_incarnation[node_id] == 0)
 			return PGRAC_EXTERNAL_FENCE_NEED_SET_WRITER_INCAR_UNPROVEN;
+		writer_incarnations[node_id] = classification.membership.last_admitted_incarnation[node_id];
 	}
+	for (node_id = 0; node_id < CLUSTER_MAX_NODES; node_id++)
+		if (writer_incarnations[node_id] != 0)
+			count++;
 	if (count < 1 || count > CLUSTER_MAX_NODES)
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_WRITER_COUNT_INVALID;
-	if (!external_fence_bitmap_member(classification.excluded_bitmap, duty->origin_node_id))
+	if (writer_incarnations[duty->origin_node_id] == 0)
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_ORIGINAL_OWNER_MISSING;
-	if (classification.membership.last_admitted_incarnation[duty->origin_node_id]
-		!= duty->origin_owner_incarnation)
+	if (writer_incarnations[duty->origin_node_id] != duty->origin_owner_incarnation)
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_WRITER_INCAR_UNPROVEN;
+	/* Root reads must not carry a changed cohort into the provider request. */
+	if (cold && cluster_formation_classification_revalidate_nowait(
+					formation_origin_thread, &authority, &classification)
+					!= CLUSTER_FORMATION_WITNESS_READY)
+		return PGRAC_EXTERNAL_FENCE_NEED_SET_MEMBERSHIP_UNSTABLE;
 	memset(&protected_identity, 0, sizeof(protected_identity));
 	if (!cluster_shared_fs_get_protected_set_identity(&protected_identity)
 		|| (protected_identity.backend_id != CLUSTER_SHARED_FS_BACKEND_BLOCK_DEVICE
@@ -753,6 +857,7 @@ cluster_external_fence_need_set_build(const ClusterRecoveryDutyKey *duty,
 	set->magic = PGRAC_EXTERNAL_FENCE_NEED_SET_MAGIC;
 	set->owner_pid = external_fence_owner_pid();
 	set->count = count;
+	set->cold = cold;
 	set->duty = *duty;
 	set->duty_digest = duty_digest;
 	set->authority = authority;
@@ -762,13 +867,13 @@ cluster_external_fence_need_set_build(const ClusterRecoveryDutyKey *duty,
 	for (node_id = 0; node_id < CLUSTER_MAX_NODES; node_id++) {
 		PgracExternalFenceNeedV1 *need;
 
-		if (!external_fence_bitmap_member(classification.excluded_bitmap, node_id))
+		if (writer_incarnations[node_id] == 0)
 			continue;
 		need = &set->needs[count++];
 		need->system_identifier = duty->system_identifier;
 		need->canonical_duty_digest = duty_digest;
 		need->victim_node_id = node_id;
-		need->victim_incarnation = classification.membership.last_admitted_incarnation[node_id];
+		need->victim_incarnation = writer_incarnations[node_id];
 		memcpy(need->protected_set_digest, protected_set_digest,
 			   sizeof(need->protected_set_digest));
 		need->predicate_id = PGRAC_EXTERNAL_FENCE_PREDICATE_WRITE_EXCLUDED;
@@ -781,7 +886,24 @@ cluster_external_fence_need_set_build(const ClusterRecoveryDutyKey *duty,
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_STORAGE_UNAVAILABLE;
 	}
 	*out = set;
+	external_fence_need_set_predicate = "NONE";
 	return PGRAC_EXTERNAL_FENCE_NEED_SET_OK;
+}
+
+PgracExternalFenceNeedSetResult
+cluster_external_fence_need_set_build(const ClusterRecoveryDutyKey *duty,
+									  const ClusterFormationWitnessV1 *formation,
+									  PgracExternalFenceNeedSetV1 **out)
+{
+	return external_fence_need_set_build(duty, formation, false, out);
+}
+
+PgracExternalFenceNeedSetResult
+cluster_external_fence_need_set_build_cold(const ClusterRecoveryDutyKey *duty,
+										   const ClusterFormationWitnessV1 *formation,
+										   PgracExternalFenceNeedSetV1 **out)
+{
+	return external_fence_need_set_build(duty, formation, true, out);
 }
 
 bool
@@ -799,7 +921,10 @@ cluster_external_fence_need_set_revalidate_nowait(const PgracExternalFenceNeedSe
 	}
 	if (formation != needs->formation
 		|| cluster_formation_witness_revalidate_nowait(formation)
-			   != CLUSTER_FORMATION_WITNESS_READY) {
+			   != CLUSTER_FORMATION_WITNESS_READY
+		|| (needs->cold && cluster_formation_classification_revalidate_nowait(
+							needs->duty.origin_thread_id, &needs->authority, &needs->classification)
+							!= CLUSTER_FORMATION_WITNESS_READY)) {
 		*reason = PGRAC_EXTERNAL_FENCE_DENY_WRITER_SET_STALE;
 		return false;
 	}
@@ -1242,6 +1367,21 @@ cluster_external_fence_revalidate_nowait(const PgracExternalFenceAdmissionV1 *ad
 		*reason = PGRAC_EXTERNAL_FENCE_DENY_MAPPING_CHANGED;
 		return false;
 	}
+	if (admission->same_host) {
+		ClusterSameHostKeyV1 key = { .system_identifier = current->system_identifier,
+			.origin_node_id = (uint32)current->victim_node_id, .incarnation = current->victim_incarnation };
+
+		memcpy(key.protected_set_digest, current->protected_set_digest, 32);
+		/* A fixed exited process cannot return. This proof is private to this
+		 * recovering process; reboot kills it, and the original NeedSet/formation
+		 * is independently revalidated. No IO is added to this nowait accessor. */
+		if (!cluster_same_host_record_matches_v1(&admission->same_host_record, &key)) {
+			*reason = PGRAC_EXTERNAL_FENCE_DENY_BINDING_MISMATCH;
+			return false;
+		}
+		*reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
+		return true;
+	}
 	if (!bytes_nonzero(admission->daemon_boot_id, sizeof(admission->daemon_boot_id))
 		|| admission->journal_seq == 0 || admission->proof_generation == 0) {
 		*reason = PGRAC_EXTERNAL_FENCE_DENY_PROTOCOL;
@@ -1279,6 +1419,47 @@ cluster_external_fence_revalidate_nowait(const PgracExternalFenceAdmissionV1 *ad
 #endif
 	*reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
 	return true;
+}
+
+/* Only the full cold NeedSet owner can select the local process provider.
+ * The public single-victim, online and rejoin transports remain unchanged. */
+static PgracExternalFenceVerdict
+external_fence_admit_same_host(const PgracExternalFenceNeedV1 *need,
+							 PgracExternalFenceAdmissionV1 **out)
+{
+	ClusterSameHostKeyV1 key = { .system_identifier = need->system_identifier,
+		.origin_node_id = (uint32)need->victim_node_id, .incarnation = need->victim_incarnation };
+	ClusterSameHostRecordV1 record;
+	ClusterSameHostResultV1 result;
+	PgracExternalFenceAdmissionV1 *admission;
+
+	*out = NULL;
+	memcpy(key.protected_set_digest, need->protected_set_digest, 32);
+	result = cluster_same_host_fence_prove_v1(cluster_wal_threads_dir, &key, &record);
+	if (result != CLUSTER_SAME_HOST_WRITE_EXCLUDED)
+		return external_fence_admit_result(result == CLUSTER_SAME_HOST_STILL_ALIVE
+				? PGRAC_EXTERNAL_FENCE_REJECTED : PGRAC_EXTERNAL_FENCE_UNAVAILABLE,
+				result == CLUSTER_SAME_HOST_STILL_ALIVE
+				? PGRAC_EXTERNAL_FENCE_DENY_PROVIDER_REJECTED : PGRAC_EXTERNAL_FENCE_DENY_STORAGE_IDENTITY,
+				0, 0);
+	admission = palloc0(sizeof(*admission));
+	admission->magic = PGRAC_EXTERNAL_FENCE_ADMISSION_MAGIC;
+	admission->owner_pid = external_fence_owner_pid();
+	admission->socket_fd = -1;
+	admission->same_host = true;
+	admission->same_host_record = record;
+	admission->binding.system_identifier = need->system_identifier;
+	admission->binding.canonical_duty_digest = need->canonical_duty_digest;
+	admission->binding.victim_node_id = need->victim_node_id;
+	admission->binding.victim_incarnation = need->victim_incarnation;
+	admission->binding.target_mapping_generation = key.incarnation;
+	admission->cached_mapping_generation = key.incarnation;
+	memcpy(admission->binding.protected_set_digest, need->protected_set_digest, 32);
+	admission->binding.predicate_id = need->predicate_id;
+	admission->binding.predicate_version = need->predicate_version;
+	*out = admission;
+	return external_fence_admit_result(PGRAC_EXTERNAL_FENCE_WRITE_EXCLUDED,
+									 PGRAC_EXTERNAL_FENCE_DENY_NONE, 0, 0);
 }
 
 PgracExternalFenceVerdict
@@ -1341,8 +1522,11 @@ cluster_external_fence_admit_set_wait(const PgracExternalFenceNeedSetV1 *needs,
 		remaining_ms = (remaining_ns + UINT64_C(999999)) / UINT64_C(1000000);
 		if (remaining_ms > PGRAC_EXTERNAL_FENCE_TIMEOUT_MAX_MS)
 			remaining_ms = PGRAC_EXTERNAL_FENCE_TIMEOUT_MAX_MS;
-		verdict = cluster_external_fence_admit_wait(&needs->needs[i], (int)remaining_ms,
-													&set->admissions[i]);
+		if (needs->cold && !cluster_external_fence_runtime_active())
+			verdict = external_fence_admit_same_host(&needs->needs[i], &set->admissions[i]);
+		else
+			verdict = cluster_external_fence_admit_wait(&needs->needs[i], (int)remaining_ms,
+														&set->admissions[i]);
 		if (verdict != PGRAC_EXTERNAL_FENCE_WRITE_EXCLUDED || set->admissions[i] == NULL) {
 			cluster_external_fence_admission_set_release(&set);
 			return verdict;

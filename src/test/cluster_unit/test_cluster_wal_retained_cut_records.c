@@ -5,8 +5,9 @@
  *
  *	  The product census source is compiled into this test and linked with
  *	  the actual page route and detached preflight, the typed SIDE planner
- *	  and transaction decoder, the SPACE codecs and xactdesc parsing.  Only
- *	  the retained input scope is a fixture: it feeds decoded records built
+ *	  and transaction decoder, the cold classifier, the SPACE codecs and
+ *	  xactdesc parsing. Only the retained input scope is a fixture: it feeds
+ *	  decoded records built
  *	  from real record layouts (xl_xact_commit/abort with their xinfo
  *	  sections, xl_smgr_create/truncate, typed SPACE drops) as if read from
  *	  each source, so every classification below comes from the real
@@ -36,11 +37,17 @@
 #include "../../backend/cluster/cluster_wal_retained_generation.c"
 
 #include "access/xact.h"
+#include "access/multixact.h"
+#include "access/xlog_internal.h"
+#include "catalog/pg_control.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_block_apply.h"
+#include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/storage/cluster_undo_xlog.h"
+#include "storage/proc.h"
+#include "storage/standbydefs.h"
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
@@ -52,11 +59,25 @@ UT_DEFINE_GLOBALS();
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(23);
+	UT_RUN(test_records_cold_prepared_tt_sources_refuse_history_and_redo);
+	UT_RUN(test_records_cold_exact_abort_sources_stay_supported);
+	UT_RUN(test_records_cold_tt_terminal_carriers_require_full_payload);
+	UT_RUN(test_records_cold_ordered_counter_candidate);
+	UT_RUN(test_records_cold_terminal_counter_inputs);
+	UT_RUN(test_records_cold_abort_children_require_native_tree_shape);
+	UT_RUN(test_records_cold_commit_children_require_native_tree_shape);
+	UT_RUN(test_records_cold_multixact_counter_inputs);
+	UT_RUN(test_records_cold_checkpoint_counter_inputs);
+	UT_RUN(test_records_cold_counter_header_and_assignment);
+	UT_RUN(test_records_cold_counter_incomplete_clears_inputs);
+	UT_RUN(test_records_cold_assignment_rejects_malformed_xids);
+	UT_RUN(test_records_cold_assignment_keeps_valid_wrap_and_ownership);
 	UT_RUN(test_records_commit_tombstone_pins_its_source);
 	UT_RUN(test_records_commit_with_invalidations_is_classified);
 	UT_RUN(test_records_abort_with_relations_pins_its_source);
 	UT_RUN(test_records_native_smgr_create_and_truncate);
+	UT_RUN(test_records_native_effect_coverage_is_read_only);
 	UT_RUN(test_records_foreign_source_pins_only_itself);
 	UT_RUN(test_records_unknown_native_record_still_refuses);
 	UT_RUN(test_records_short_abort_does_not_advance_retention);

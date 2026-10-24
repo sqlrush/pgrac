@@ -49,6 +49,9 @@ typedef struct RfSideXactOperationV1 {
 	/* Read-only classification retains the complete native payload. These
 	 * fields never certify delivery, a terminal projection, or retirement. */
 	bool pi_read_only;
+	/* Retained native completion effects require the cold owner, never
+	 * generic apply. FORCE_SYNC/stats additionally require source durability. */
+	bool cold_completion_effects;
 	uint32 invalidation_kinds;
 	uint32 invalidation_count;
 	uint32 relation_count;
@@ -64,6 +67,24 @@ typedef struct RfSideXactOperationV1 {
 
 extern bool rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier,
 								   uint16 origin_thread, RfSideXactOperationV1 *out);
+extern bool rf_side_xact_decode_recovery_v1(XLogReaderState *record, uint64 system_identifier,
+											uint16 origin_thread, RfSideXactOperationV1 *out);
+/* Complete immutable carrier validation only; execution still requires the
+ * original runtime preflight and the consumer for every retained effect. */
+extern bool rf_side_xact_cold_completion_payload_v1(const RfSideXactOperationV1 *operation,
+													const uint8 *payload, uint32 length);
+extern bool rf_side_xact_cold_completion_preflight_v1(const RfSideXactOperationV1 *operation,
+													  const uint8 *payload, uint32 length);
+/* Full bounded native ASSIGNMENT only, without terminal or parent-chain authority. */
+extern bool rf_side_xact_assignment_preflight_v1(const uint8 *payload, uint32 length);
+/* The caller first bounds the complete array in its native carrier. This
+ * checks original transactional message kinds only, not scope or delivery. */
+extern bool
+rf_side_xact_invalidation_messages_preflight_v1(int count,
+												const SharedInvalidationMessage *messages);
+/* Native standalone invalidations use the same message/scope rules as
+ * transactional invalidations. Shape validation grants no replay authority. */
+extern bool rf_side_standby_invalidation_preflight_v1(const uint8 *payload, uint32 length);
 extern bool rf_side_xact_structural_preflight_v1(const RfSideXactOperationV1 *operation);
 extern bool rf_side_xact_inspect_pi_v1(XLogReaderState *record, uint64 system_identifier,
 									uint16 origin_thread, RfSideXactOperationV1 *out);
@@ -71,6 +92,14 @@ extern bool rf_side_xact_inspection_preflight_v1(const RfSideXactOperationV1 *op
 /* Every xinfo section of a COMMIT/ABORT lies within its main data and no
  * unknown or misplaced section is present. */
 extern bool rf_side_xact_completion_shape_v1(XLogReaderState *record, bool commit);
+/* The bounded native terminal child list advances from a normal top within
+ * its XID half-circle. This proves neither immediate parents nor replay authority. */
+extern bool rf_side_xact_children_preflight_v1(TransactionId top, int count,
+											   const TransactionId *children);
+/* A folded TT commit identifies an exact physical owner and carries the
+ * same normal xid and valid SCN as its native commit. No replay authority. */
+extern bool rf_side_xact_tt_commit_preflight_v1(const xl_xact_tt_commit *delta,
+												uint16 origin_thread, TransactionId xid, SCN scn);
 
 typedef enum RfSideXactApplyResultV1 {
 	RF_SIDE_XACT_APPLY_OK = 0,
@@ -120,6 +149,40 @@ typedef bool (*RfSideXactVerifyCommitCoverageV1)(void *arg, const RfSideXactOper
 extern RfSideXactApplyResultV1
 rf_side_xact_apply_covered_commit_v1(const RfSideXactOperationV1 *operation, void *arg,
 									 RfSideXactVerifyCommitCoverageV1 verify);
+extern RfSideXactApplyResultV1
+rf_side_xact_apply_cold_completion_v1(const RfSideXactOperationV1 *operation, const uint8 *payload,
+									  uint32 length, void *arg,
+									  RfSideXactVerifyCommitCoverageV1 verify);
+/* Selected immutable cold foreign COMMIT only. The structural proof runs
+ * before canonical TT coverage and native CLOG; actual deletion/sync completes
+ * before stats/derived terminal. Not the generic/whole-source consumer. */
+extern RfSideXactApplyResultV1
+rf_side_xact_apply_cold_drop_completion_v1(const RfSideXactOperationV1 *operation,
+										   XLogReaderState *record, void *arg,
+										   RfSideXactVerifyCommitCoverageV1 verify);
+/* Ordinary ABORT has no native TT locator. Only an original cold owner that
+ * proved its exact preceding carrier and native CLOG may publish this result. */
+extern bool rf_side_xact_preflight_covered_abort_v1(const RfSideXactOperationV1 *operation);
+typedef bool (*RfSideXactVerifyAbortCoverageV1)(void *arg, const RfSideXactOperationV1 *operation);
+extern RfSideXactApplyResultV1
+rf_side_xact_apply_covered_abort_v1(const RfSideXactOperationV1 *operation, void *arg,
+									RfSideXactVerifyAbortCoverageV1 verify);
+/* Native complete ABORT tree only; caller must first install its exact TT
+ * carrier. Source durability and cold-origin authority remain mandatory. */
+extern bool rf_side_xact_cold_abort_clog_v1(const RfSideXactOperationV1 *operation,
+											const uint8 *payload, uint32 length);
+extern RfSideXactApplyResultV1
+rf_side_xact_apply_cold_abort_completion_v1(const RfSideXactOperationV1 *operation,
+											const uint8 *payload, uint32 length, void *arg,
+											RfSideXactVerifyAbortCoverageV1 verify);
+/* Selected sealed ABORT with native pending deletes. TT coverage and CLOG/locks
+ * precede unlink; stats/terminal follow durable deletion in the original SPACE
+ * owner. Reserve owner_bytes for all caller storage still live during it. */
+struct RfSideOnlinePlanV1;
+extern RfSideXactApplyResultV1
+rf_side_xact_apply_cold_abort_delete_completion_v1(const struct RfSideOnlinePlanV1 *plan,
+												   uint32 index, Size owner_bytes, void *arg,
+												   RfSideXactVerifyAbortCoverageV1 verify);
 extern RfSideXactApplyResultV1
 rf_side_xact_target_preflight_owned_v1(const RfSideXactOperationV1 *operation,
 									   const uint8 *owned_payload, uint32 owned_payload_length);

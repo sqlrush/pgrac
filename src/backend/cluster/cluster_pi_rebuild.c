@@ -6,6 +6,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_pi_rebuild.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_wal_thread.h"
 #include "miscadmin.h"
@@ -218,6 +219,9 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 
 	if (MyBackendType != B_BG_WRITER || !cluster_enabled || !cluster_shared_config
 		|| CurrentResourceOwner == NULL || CritSectionCount != 0)
+		return CLUSTER_PI_REBUILD_IDLE;
+	if (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& !cluster_semantic_activation_recovered_open_current())
 		return CLUSTER_PI_REBUILD_IDLE;
 	if (!pi_rebuild_callback_registered) {
 		RegisterResourceReleaseCallback(pi_rebuild_owner_release, NULL);

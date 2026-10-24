@@ -57,6 +57,7 @@ ErrorContextCallback *error_context_stack = NULL;
 
 bool cluster_enabled = true;
 bool cluster_shared_config;
+BackendType MyBackendType = B_BACKEND;
 int cluster_node_id = 0;
 int cluster_multixact_member_overlay_max_entries = 16;
 int cluster_multixact_member_overlay_max_members = 32;
@@ -69,6 +70,8 @@ static ClusterSemanticAdmissionResult target_admission_result;
 static ClusterSemanticAdmissionResult source_admission_result;
 static bool admission_result_by_side;
 static bool admission_recheck_ok;
+static ClusterNormalStartState test_normal_start_state;
+static bool test_recovered_open;
 static int admission_enter_count;
 static int admission_recheck_count;
 static int admission_leave_count;
@@ -95,7 +98,8 @@ static union {
 
 static HTAB *const fake_hash = (HTAB *)(uintptr_t)1;
 
-static bool native_apply_ok, native_verify_ok;
+static bool native_apply_ok, native_verify_ok, native_verify_throw, native_verify_before_overlay;
+static int native_hash_baseline;
 static unsigned native_apply_calls, native_verify_calls;
 
 bool cluster_multixact_native_recovery_apply(int origin,
@@ -134,6 +138,10 @@ cluster_multixact_native_recovery_verify(int origin,
 	(void)payload;
 	(void)length;
 	native_verify_calls++;
+	if (native_verify_before_overlay)
+		UT_ASSERT_EQ(fake_hash_search_count, native_hash_baseline);
+	if (native_verify_throw)
+		pg_re_throw();
 	return native_verify_ok;
 }
 
@@ -168,6 +176,10 @@ reset_admission(ClusterSemanticAdmissionResult result, bool recheck_ok)
 	source_admission_result = result;
 	admission_result_by_side = false;
 	admission_recheck_ok = recheck_ok;
+	test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+	test_recovered_open = true;
+	cluster_shared_config = false;
+	MyBackendType = B_BACKEND;
 	admission_enter_count = 0;
 	admission_recheck_count = 0;
 	admission_leave_count = 0;
@@ -215,6 +227,18 @@ cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSi
 		token->entered = true;
 	}
 	return selected_result;
+}
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return test_normal_start_state;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return test_recovered_open;
 }
 
 bool
@@ -839,6 +863,30 @@ UT_TEST(t11_remote_visibility_follows_current_semantic_side)
 	UT_ASSERT(!result.overlay_hit);
 }
 
+UT_TEST(t12_recovered_remote_visibility_refuses_source_fallback_before_open)
+{
+	ClusterMultiXactSourceRequest request;
+	ClusterMultiXactSourceResult result;
+	SnapshotData snapshot;
+
+	memset(&snapshot, 0, sizeof(snapshot));
+	memset(&request, 0, sizeof(request));
+	request.snapshot = &snapshot;
+	request.origin_slot = 3;
+	request.mxid = 91;
+	memset(&result, 0x7f, sizeof(result));
+	reset_admission_sides(CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED,
+						  CLUSTER_SEMANTIC_ADMISSION_OK, true);
+	cluster_shared_config = true;
+	test_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	test_recovered_open = false;
+	UT_ASSERT_EQ((int)cluster_multixact_remote_xmax_visibility_dispatch(&request, &result),
+				 (int)CLUSTER_SEMANTIC_ADMISSION_CLOSED);
+	UT_ASSERT_EQ(admission_enter_count, 0);
+	UT_ASSERT(!result.overlay_hit);
+	cluster_shared_config = false;
+}
+
 UT_TEST(t12_shared_projection_requires_native_persistence_and_postread)
 {
 	ClusterSideProjectionOperationV1 op = { 0 };
@@ -860,12 +908,20 @@ UT_TEST(t12_shared_projection_requires_native_persistence_and_postread)
 	UT_ASSERT_EQ(native_apply_calls, 1);
 	UT_ASSERT_EQ(fake_hash_search_count, hashes);
 	native_apply_ok = true;
-	UT_ASSERT(cluster_multixact_recovery_projection_apply(NULL, 0, 19, &op, (const uint8 *)&member,
-														  sizeof(member), 100, 200));
+	UT_ASSERT(!cluster_multixact_recovery_projection_apply(NULL, 0, 19, &op, (const uint8 *)&member,
+														   sizeof(member), 100, 200));
+	UT_ASSERT_EQ(fake_hash_search_count, hashes);
+	UT_ASSERT_EQ(native_verify_calls, 1);
 	UT_ASSERT(!cluster_multixact_recovery_projection_verify(
 		NULL, 0, 19, &op, (const uint8 *)&member, sizeof(member), 100, 200));
-	UT_ASSERT_EQ(native_verify_calls, 1);
+	UT_ASSERT_EQ(native_verify_calls, 2);
 	native_verify_ok = true;
+	native_verify_before_overlay = true;
+	native_hash_baseline = fake_hash_search_count;
+	UT_ASSERT(cluster_multixact_recovery_projection_apply(NULL, 0, 19, &op, (const uint8 *)&member,
+														  sizeof(member), 100, 200));
+	native_verify_before_overlay = false;
+	UT_ASSERT_EQ(native_verify_calls, 3);
 	UT_ASSERT(cluster_multixact_recovery_projection_verify(NULL, 0, 19, &op, (const uint8 *)&member,
 														   sizeof(member), 100, 200));
 	cluster_shared_config = false;
@@ -874,23 +930,80 @@ UT_TEST(t12_shared_projection_requires_native_persistence_and_postread)
 UT_TEST(t13_shared_zero_and_truncate_cannot_only_purge_overlay)
 {
 	ClusterSideProjectionOperationV1 op = { 0 };
+	uint8 saved[sizeof(fake_hash_entry.bytes)];
 
 	cluster_shared_config = true;
-	native_apply_ok = native_verify_ok = false;
-	for (int i = 0; i < 2; i++) {
+	for (int i = 0; i < 3; i++) {
+		int hashes = fake_hash_search_count;
 		op.kind = CLUSTER_SIDE_PROJECTION_MULTIXACT;
-		op.action = i == 0 ? CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE
-						   : CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE;
-		op.normalized_info = i == 0 ? XLOG_MULTIXACT_ZERO_MEM_PAGE : XLOG_MULTIXACT_TRUNCATE_ID;
+		op.action = i == 2 ? CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE
+						   : CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE;
+		op.normalized_info = i == 2	  ? XLOG_MULTIXACT_TRUNCATE_ID
+							 : i == 0 ? XLOG_MULTIXACT_ZERO_OFF_PAGE
+									  : XLOG_MULTIXACT_ZERO_MEM_PAGE;
+		op.page_number = 0;
+		op.truncate_start_multixact = 1;
+		op.truncate_end_multixact = 99;
+		op.truncate_start_member = 1;
+		op.truncate_end_member = 99;
+		native_apply_ok = native_verify_ok = false;
 		native_apply_calls = native_verify_calls = 0;
+		memcpy(saved, fake_hash_entry.bytes, sizeof(saved));
 		UT_ASSERT(
 			!cluster_multixact_recovery_projection_apply(NULL, 0, 19, &op, NULL, 0, 201, 202));
 		UT_ASSERT_EQ(native_apply_calls, 1);
 		UT_ASSERT(
 			!cluster_multixact_recovery_projection_verify(NULL, 0, 19, &op, NULL, 0, 201, 202));
 		UT_ASSERT_EQ(native_verify_calls, 1);
+		native_apply_ok = true;
+		UT_ASSERT(
+			!cluster_multixact_recovery_projection_apply(NULL, 0, 19, &op, NULL, 0, 201, 202));
+		UT_ASSERT_EQ(native_verify_calls, 2);
+		UT_ASSERT_EQ(fake_hash_search_count, hashes);
+		UT_ASSERT(memcmp(saved, fake_hash_entry.bytes, sizeof(saved)) == 0);
+		native_verify_ok = native_verify_before_overlay = true;
+		native_hash_baseline = hashes;
+		UT_ASSERT(cluster_multixact_recovery_projection_apply(NULL, 0, 19, &op, NULL, 0, 201, 202));
+		native_verify_before_overlay = false;
+		UT_ASSERT_EQ(native_verify_calls, 3);
+		UT_ASSERT(
+			cluster_multixact_recovery_projection_verify(NULL, 0, 19, &op, NULL, 0, 201, 202));
 	}
 	cluster_shared_config = false;
+}
+
+UT_TEST(t14_native_readback_error_leaves_derived_overlay_untouched)
+{
+	ClusterSideProjectionOperationV1 op = { 0 };
+	MultiXactMember member = { 800, MultiXactStatusForShare };
+	uint8 saved[sizeof(fake_hash_entry.bytes)];
+	volatile bool caught = false;
+	int hashes = fake_hash_search_count;
+
+	op.kind = CLUSTER_SIDE_PROJECTION_MULTIXACT;
+	op.action = CLUSTER_SIDE_PROJECTION_ACTION_CREATE;
+	op.normalized_info = XLOG_MULTIXACT_CREATE_ID;
+	op.multixact_id = 33;
+	op.member_offset = 71;
+	op.member_count = 1;
+	cluster_shared_config = true;
+	native_apply_ok = native_verify_ok = native_verify_throw = true;
+	native_apply_calls = native_verify_calls = 0;
+	memcpy(saved, fake_hash_entry.bytes, sizeof(saved));
+	PG_TRY();
+	{
+		(void)cluster_multixact_recovery_projection_apply(NULL, 0, 19, &op, (uint8 *)&member,
+														  sizeof(member), 100, 200);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught && native_apply_calls == 1 && native_verify_calls == 1);
+	UT_ASSERT_EQ(fake_hash_search_count, hashes);
+	UT_ASSERT(memcmp(saved, fake_hash_entry.bytes, sizeof(saved)) == 0);
+	native_verify_throw = cluster_shared_config = false;
 }
 
 int
@@ -901,7 +1014,7 @@ main(void)
 	memset(&fake_hash_entry, 0, sizeof(fake_hash_entry));
 	cluster_multixact_shmem_init();
 
-	UT_PLAN(13);
+	UT_PLAN(15);
 	UT_RUN(t1_frozen_dispatch_surface);
 	UT_RUN(t2_dormant_refuses_before_request_and_mutation);
 	UT_RUN(t3_invalid_after_admission_closes_and_leaves);
@@ -913,8 +1026,10 @@ main(void)
 	UT_RUN(t9_null_result_is_closed_after_balanced_admission);
 	UT_RUN(t10_recovery_projection_create_has_exact_postread);
 	UT_RUN(t11_remote_visibility_follows_current_semantic_side);
+	UT_RUN(t12_recovered_remote_visibility_refuses_source_fallback_before_open);
 	UT_RUN(t12_shared_projection_requires_native_persistence_and_postread);
 	UT_RUN(t13_shared_zero_and_truncate_cannot_only_purge_overlay);
+	UT_RUN(t14_native_readback_error_leaves_derived_overlay_untouched);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

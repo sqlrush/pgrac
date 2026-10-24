@@ -44,6 +44,7 @@ sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 bool cluster_undo_cleaner_enabled = true;
 bool cluster_enabled = true;
+bool cluster_shared_config = false;
 bool cluster_undo_retention_horizon_enabled = true;
 int cluster_lmon_main_loop_interval = 2000;
 int cluster_node_id = 0;
@@ -65,6 +66,20 @@ static uint64 test_gc_reclaimed;
 static ClusterUndoSegTryRecycle test_recycle_result;
 bool cluster_undo_record_segment_commit_on_rollover;
 int cluster_undo_cleaner_batch_segments = 8;
+static ClusterNormalStartState cleaner_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+static bool cleaner_recovered_open = true;
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return cleaner_start_state;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return cleaner_recovered_open;
+}
 
 /* The normal-stop state observer is a boundary input here. Its real shared
  * state/identity tests live in test_cluster_normal_stop. The complete actual
@@ -434,6 +449,9 @@ reset_wait_fixture(void)
 	test_lock_count = test_lock_depth = test_scan_ends = 0;
 	test_foreign_lwlock = test_fence = false;
 	cluster_enabled = test_floor = true;
+	cluster_shared_config = false;
+	cleaner_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+	cleaner_recovered_open = true;
 	cluster_undo_cleaner_enabled = cluster_undo_retention_horizon_enabled = true;
 	subscribed = early_signal = test_cancel = test_pin_after_probe = false;
 	prepared = cancelled = slept = signalled = broadcasts = 0;
@@ -447,6 +465,25 @@ reset_wait_fixture(void)
 		undo_cleaner_state->workers[i].status = UNDO_CLEANER_READY;
 		undo_cleaner_state->workers[i].latch = &test_proc.procLatch;
 	}
+}
+
+UT_TEST(test_recovered_open_gate_precedes_cleaner_ctrc_pass)
+{
+	bool remaining = false;
+
+	reset_wait_fixture();
+	undo_cleaner_worker = 0;
+	cluster_shared_config = true;
+	cleaner_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	cleaner_recovered_open = false;
+	test_ctrc_progress = true;
+	UT_ASSERT(!undo_cleaner_run_pass(&remaining));
+	UT_ASSERT(!remaining);
+	UT_ASSERT_EQ(test_ctrc_passes, 0);
+	UT_ASSERT_EQ(test_modifier_entries, 0);
+	cluster_shared_config = false;
+	cleaner_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+	cleaner_recovered_open = true;
 }
 
 UT_TEST(test_capacity_wait_retries_signals_and_cadence_without_authorizing_free)
@@ -718,7 +755,8 @@ UT_TEST(test_real_recycle_progress_continues_then_yields)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
+	UT_RUN(test_recovered_open_gate_precedes_cleaner_ctrc_pass);
 	UT_RUN(test_capacity_wait_retries_signals_and_cadence_without_authorizing_free);
 	UT_RUN(test_capacity_every_blocking_hold_refuses_without_sleep);
 	UT_RUN(test_heavyweight_lock_identity_and_mode_are_exact);

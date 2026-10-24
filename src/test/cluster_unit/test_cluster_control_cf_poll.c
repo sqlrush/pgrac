@@ -251,6 +251,19 @@ UT_TEST(initial_shared_formation_uses_real_empty_control_census)
 	cluster_shared_config = false;
 }
 
+UT_TEST(cold_shared_four_node_formation_requires_all_done)
+{
+	cluster_control_request_shmem_init();
+	ProcGlobal = retained_grd_proc_global;
+	cluster_shared_config = true;
+	/* Route REDECLARE_DONE through the fixture's control transport, rather
+	 * than its ordinary lock-request child process. */
+	cooperative_case = cf_case = true;
+	test_recovery_authority_cold_four_node_cohort_requires_every_done();
+	cooperative_case = cf_case = false;
+	cluster_shared_config = false;
+}
+
 UT_TEST(cf_owner_poll_retains_grant_when_s5_observation_is_pending)
 {
 	ClusterLockAcquireRequest req;
@@ -354,12 +367,13 @@ int
 main(void)
 {
 	MyBackendType = B_LMON;
-	UT_PLAN(7);
+	UT_PLAN(8);
 	UT_RUN(cf_poll_yields_until_remote_exact_grant);
 	UT_RUN(cf_poll_local_conflict_does_not_wait_for_its_own_drain);
 	UT_RUN(cf_poll_cut_change_keeps_the_original_attempt);
 	UT_RUN(cf_request_common_barrier_blocks_every_entry_then_admits_control_only);
 	UT_RUN(initial_shared_formation_uses_real_empty_control_census);
+	UT_RUN(cold_shared_four_node_formation_requires_all_done);
 	UT_RUN(cf_owner_poll_retains_grant_when_s5_observation_is_pending);
 	UT_RUN(cf_s5_second_observation_pending_retains_exact_registration);
 	UT_DONE();

@@ -4,7 +4,11 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/subtrans.h"
+#include "access/xlogutils.h"
 
+#include "access/clog.h"
+#include "cluster/cluster_multixact.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_side_online_owner.h"
 #include "cluster/cluster_undo_segment_init.h"
@@ -15,6 +19,7 @@
 
 UT_DEFINE_GLOBALS();
 #include "test_cluster_undo_header_identity.inc"
+#include "test_cluster_heap_small_scn.inc"
 
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
@@ -70,6 +75,156 @@ cluster_undo_recovery_origin_authorized_v1(int origin_node pg_attribute_unused()
 	return false;
 }
 
+char *DatabasePath;
+int cluster_node_id = 0;
+HotStandbyState standbyState = STANDBY_DISABLED;
+
+bool
+rf_side_xact_assignment_preflight_v1(const uint8 *payload pg_attribute_unused(),
+									 uint32 length pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
+bool
+cluster_subtrans_native_recovery_preflight_v1(int o pg_attribute_unused(),
+											  TransactionId t pg_attribute_unused(),
+											  int n pg_attribute_unused(),
+											  const TransactionId *c pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
+bool
+cluster_subtrans_native_recovery_apply_v1(int o pg_attribute_unused(),
+										  TransactionId t pg_attribute_unused(),
+										  int n pg_attribute_unused(),
+										  const TransactionId *c pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
+bool
+cluster_subtrans_native_recovery_verify_v1(int o pg_attribute_unused(),
+										   TransactionId t pg_attribute_unused(),
+										   int n pg_attribute_unused(),
+										   const TransactionId *c pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+bool
+rf_side_standby_invalidation_preflight_v1(const uint8 *payload pg_attribute_unused(),
+										  uint32 length pg_attribute_unused())
+{
+	UT_ASSERT(false); /* Full native cache integration is in test_cluster_side_xact. */
+	return false;
+}
+
+void
+ProcessCommittedInvalidationMessages(const SharedInvalidationMessage *msgs pg_attribute_unused(),
+									 int nmsgs pg_attribute_unused(),
+									 bool initfile pg_attribute_unused(),
+									 Oid dbid pg_attribute_unused(), Oid tsid pg_attribute_unused())
+{
+	UT_ASSERT(false);
+}
+
+bool
+rf_side_xact_cold_completion_preflight_v1(
+	const RfSideXactOperationV1 *operation pg_attribute_unused(),
+	const uint8 *payload pg_attribute_unused(), uint32 length pg_attribute_unused())
+{
+	UT_ASSERT(false); /* Full cache integration is in test_cluster_side_xact. */
+	return false;
+}
+
+RfSideXactApplyResultV1
+rf_side_xact_apply_cold_completion_v1(const RfSideXactOperationV1 *operation pg_attribute_unused(),
+									  const uint8 *payload pg_attribute_unused(),
+									  uint32 length pg_attribute_unused(),
+									  void *arg pg_attribute_unused(),
+									  RfSideXactVerifyCommitCoverageV1 verify pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return RF_SIDE_XACT_APPLY_BLOCKED;
+}
+
+RfSideXactApplyResultV1
+rf_side_xact_apply_cold_drop_completion_v1(
+	const RfSideXactOperationV1 *operation pg_attribute_unused(),
+	XLogReaderState *record pg_attribute_unused(), void *arg pg_attribute_unused(),
+	RfSideXactVerifyCommitCoverageV1 verify pg_attribute_unused())
+{
+	UT_ASSERT(false); /* Full compound execution uses test_cluster_side_xact. */
+	return RF_SIDE_XACT_APPLY_BLOCKED;
+}
+
+bool
+cluster_undo_recovery_cold_source_sync_v1(int origin_node pg_attribute_unused())
+{
+	UT_ASSERT(false); /* This isolated fixture has no cold completion payload. */
+	return false;
+}
+
+bool
+cluster_undo_recovery_cold_origin_authorized_v1(int origin_node pg_attribute_unused())
+{
+	UT_ASSERT(false); /* Cold source/owner coverage is in test_cluster_side_xact. */
+	return false;
+}
+
+bool
+cluster_multixact_native_recovery_preflight(
+	int origin pg_attribute_unused(),
+	const ClusterSideProjectionOperationV1 *op pg_attribute_unused(),
+	const uint8 *payload pg_attribute_unused(), uint32 length pg_attribute_unused(),
+	XLogRecPtr begin pg_attribute_unused(), XLogRecPtr end pg_attribute_unused())
+{
+	UT_ASSERT(false); /* Native-control integration is in test_cluster_side_xact. */
+	return false;
+}
+
+bool
+cluster_clog_native_recovery_record_apply_v1(int origin pg_attribute_unused(),
+											 const ClusterSideProjectionOperationV1 *op
+												 pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
+bool
+cluster_clog_native_recovery_record_verify_v1(int origin pg_attribute_unused(),
+											  const ClusterSideProjectionOperationV1 *op
+												  pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+bool
+cluster_clog_native_recovery_apply_v1(int origin pg_attribute_unused(),
+									  TransactionId xid pg_attribute_unused(),
+									  int count pg_attribute_unused(),
+									  const TransactionId *children pg_attribute_unused(),
+									  XidStatus status pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+bool
+cluster_clog_native_recovery_verify_v1(int origin pg_attribute_unused(),
+									   TransactionId xid pg_attribute_unused(),
+									   int count pg_attribute_unused(),
+									   const TransactionId *children pg_attribute_unused(),
+									   XidStatus status pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
+
 void
 cluster_scn_recovery_replay_observe(SCN scn pg_attribute_unused())
 {
@@ -81,6 +236,37 @@ rf_side_online_plan_prepare_undo_block_v1(const RfSideOnlinePlanV1 *plan, uint8 
 										  uint32 segment, uint32 block, RfSideUndoBlockImageV1 *out)
 {
 	UT_ASSERT(false); /* This fixture contains TT records only. */
+	return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_record_v1(
+	const RfSideOnlinePlanV1 *plan pg_attribute_unused(), uint32 index pg_attribute_unused(),
+	const RfPageOnlineRecordIdentityV1 *identity pg_attribute_unused(),
+	const char *base pg_attribute_unused(), RfSideUndoHeaderImageV1 *out)
+{
+	UT_ASSERT(false); /* Record-local integration is in test_cluster_side_xact. */
+	memset(out, 0, sizeof(*out));
+	return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_head_block_v1(
+	const RfSideOnlinePlanV1 *plan pg_attribute_unused(), uint32 index pg_attribute_unused(),
+	const RfPageOnlineRecordIdentityV1 *identity pg_attribute_unused(),
+	RfSideUndoBlockImageV1 *out pg_attribute_unused())
+{
+	return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_record_header_v1(
+	const RfSideOnlinePlanV1 *plan pg_attribute_unused(), uint32 index pg_attribute_unused(),
+	const RfPageOnlineRecordIdentityV1 *identity pg_attribute_unused(),
+	const char *base pg_attribute_unused(), RfSideUndoHeaderImageV1 *out)
+{
+	UT_ASSERT(false); /* The whole-source fixture must not dispatch a record. */
+	memset(out, 0, sizeof(*out));
 	return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 }
 
@@ -115,6 +301,41 @@ rf_side_online_plan_contains_commit_v1(const RfSideOnlinePlanV1 *plan,
 									   const RfSideXactOperationV1 *operation)
 {
 	return plan != NULL && operation->kind == RF_SIDE_XACT_COMMIT && operation->has_tt_delta;
+}
+
+/* Cold ordinary ABORT integration uses the real plan/xact/owner fixture. */
+bool
+rf_side_online_plan_abort_target_v1(const RfSideOnlinePlanV1 *plan,
+									const RfSideOnlineOperationV1 *operation,
+									ClusterUndoDecoded *out)
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+bool
+rf_side_xact_preflight_covered_abort_v1(const RfSideXactOperationV1 *operation)
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+RfSideXactApplyResultV1
+rf_side_xact_apply_covered_abort_v1(const RfSideXactOperationV1 *operation, void *arg,
+									RfSideXactVerifyAbortCoverageV1 verify)
+{
+	UT_ASSERT(false);
+	return RF_SIDE_XACT_APPLY_BLOCKED;
+}
+
+RfSideXactApplyResultV1
+rf_side_xact_apply_cold_abort_completion_v1(
+	const RfSideXactOperationV1 *operation pg_attribute_unused(),
+	const uint8 *payload pg_attribute_unused(), uint32 length pg_attribute_unused(),
+	void *arg pg_attribute_unused(), RfSideXactVerifyAbortCoverageV1 verify pg_attribute_unused())
+{
+	UT_ASSERT(false); /* Full payload/owner integration is in test_cluster_side_xact. */
+	return RF_SIDE_XACT_APPLY_BLOCKED;
 }
 
 Size

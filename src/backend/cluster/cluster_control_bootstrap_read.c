@@ -555,12 +555,22 @@ read_same_dir(int parent, const char *name, int fd)
 			   : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 }
 
+/* Match the file selected for the whole segment, not just a single page.
+ * The caller still needs its original isolation/lifetime proof. */
+static bool
+read_native_same_segment(const struct stat *expected, const struct stat *current)
+{
+	return read_owned(current, false) && current->st_nlink == 1
+		   && expected->st_dev == current->st_dev && expected->st_ino == current->st_ino
+		   && expected->st_size == current->st_size;
+}
+
 /* No backend ERROR-capable operation while a raw descriptor is owned. The
  * caller's exact isolation is still required: two matching reads alone are
  * not permission to race a writer or publish a recovery terminal. */
 static ClusterControlRootResult
 read_native_page(int dir, uint32 family, uint32 page_no, uint8 page[BLCKSZ],
-				 pg_cryptohash_ctx *hash, uint32 *reads, bool sync)
+				 pg_cryptohash_ctx *hash, uint32 *reads, bool sync, const struct stat *expected)
 {
 	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_IO_ERROR;
 	char name[16];
@@ -575,6 +585,10 @@ read_native_page(int dir, uint32 family, uint32 page_no, uint8 page[BLCKSZ],
 		return read_error();
 	if (fstat(fd, &before) != 0 || !read_owned(&before, false) || before.st_nlink != 1)
 		goto done;
+	if (expected != NULL && !read_native_same_segment(expected, &before)) {
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		goto done;
+	}
 	if (before.st_size < offset + BLCKSZ || before.st_size % BLCKSZ != 0
 		|| before.st_size > (off_t)SLRU_PAGES_PER_SEGMENT * BLCKSZ) {
 		result = CLUSTER_CONTROL_ROOT_BAD_SIZE;
@@ -615,6 +629,208 @@ read_native_page(int dir, uint32 family, uint32 page_no, uint8 page[BLCKSZ],
 	result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 done:
 	read_close(fd, &result);
+	return result;
+}
+
+/*
+ * D1 native-side coverage is a physical observation, not a promise that the
+ * observed bytes are safe to apply.  Enumerate every regular segment in each
+ * native family, in a deterministic order, and read every page through the
+ * same identity/short-read/revalidation path used by the cursor checks.  A
+ * second directory pass compares names and every segment's device/inode/size
+ * with the identities used for its pages. Neither this check nor matching
+ * page reads substitute for the caller's writer isolation. The bound is
+ * deliberately finite: exhaustion is a refusal, never a truncated positive
+ * observation.
+ */
+#define CLUSTER_NATIVE_SIDE_MAX_SEGMENTS 4096U
+
+typedef struct ClusterNativeSegmentList {
+	uint32 values[CLUSTER_NATIVE_SIDE_MAX_SEGMENTS];
+	size_t count;
+} ClusterNativeSegmentList;
+
+static bool
+parse_native_segment_name(const char *name, uint32 *segment)
+{
+	uint32 value = 0;
+	char canonical[5];
+
+	if (name == NULL || strlen(name) != 4)
+		return false;
+	for (unsigned i = 0; i < 4; i++) {
+		unsigned digit;
+
+		if (name[i] >= '0' && name[i] <= '9')
+			digit = (unsigned)(name[i] - '0');
+		else if (name[i] >= 'A' && name[i] <= 'F')
+			digit = (unsigned)(name[i] - 'A') + 10;
+		else
+			return false;
+		value = (value << 4) | digit;
+	}
+	snprintf(canonical, sizeof(canonical), "%04X", value);
+	if (memcmp(canonical, name, sizeof(canonical) - 1) != 0)
+		return false;
+	*segment = value;
+	return true;
+}
+
+static int
+native_segment_compare(const void *left, const void *right)
+{
+	const uint32 a = *(const uint32 *)left;
+	const uint32 b = *(const uint32 *)right;
+
+	return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+static ClusterControlRootResult
+collect_native_segments(int dir, ClusterNativeSegmentList *out)
+{
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	int scan_fd;
+	DIR *scan;
+	struct dirent *entry;
+
+	memset(out, 0, sizeof(*out));
+	/* Do not dup(dir): directory offsets belong to the shared open file
+	 * description, so a first census would leave the second pass at EOF.
+	 * Open a fresh descriptor for each snapshot instead. */
+	scan_fd = openat(dir, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (scan_fd < 0)
+		return result;
+	scan = fdopendir(scan_fd);
+	if (scan == NULL) {
+		read_close(scan_fd, &result);
+		return result;
+	}
+	for (;;) {
+		uint32 segment;
+
+		errno = 0;
+		entry = readdir(scan);
+		if (entry == NULL) {
+			result = errno == 0 ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_IO_ERROR;
+			break;
+		}
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+			continue;
+		if (!parse_native_segment_name(entry->d_name, &segment)) {
+			result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+			break;
+		}
+		if (out->count >= lengthof(out->values)) {
+			result = CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+			break;
+		}
+		out->values[out->count++] = segment;
+	}
+	if (closedir(scan) != 0)
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		qsort(out->values, out->count, sizeof(out->values[0]), native_segment_compare);
+	return result;
+}
+
+static ClusterControlRootResult
+read_native_family_files(int dir, uint32 family, pg_cryptohash_ctx *hash, uint32 *reads,
+						 uint32 *file_count, uint32 *page_count, uint32 *subtrans_parent_entries,
+						 bool sync)
+{
+	ClusterNativeSegmentList before, after;
+	struct stat *identities = NULL;
+	ClusterControlRootResult result;
+
+	*file_count = 0;
+	*page_count = 0;
+	if (subtrans_parent_entries != NULL)
+		*subtrans_parent_entries = 0;
+	result = collect_native_segments(dir, &before);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	/* Keep the bounded identity vector off the backend stack. Raw allocation
+	 * cannot raise ERROR while the caller owns directory descriptors. */
+	if (before.count != 0) {
+		identities = malloc(before.count * sizeof(*identities));
+		if (identities == NULL)
+			return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	}
+	for (size_t i = 0; i < before.count; i++) {
+		char name[16];
+		struct stat *st = &identities[i];
+		uint64 first_page;
+		uint64 pages;
+
+		snprintf(name, sizeof(name), "%04X", before.values[i]);
+		if (fstatat(dir, name, st, AT_SYMLINK_NOFOLLOW) != 0) {
+			result = read_error();
+			goto done;
+		}
+		if (!read_owned(st, false) || st->st_nlink != 1) {
+			result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+			goto done;
+		}
+		if (st->st_size <= 0 || st->st_size % BLCKSZ != 0
+			|| st->st_size > (off_t)SLRU_PAGES_PER_SEGMENT * BLCKSZ) {
+			result = CLUSTER_CONTROL_ROOT_BAD_SIZE;
+			goto done;
+		}
+		first_page = (uint64)before.values[i] * SLRU_PAGES_PER_SEGMENT;
+		pages = (uint64)st->st_size / BLCKSZ;
+		for (uint64 page = 0; page < pages; page++) {
+			uint64 page_no = first_page + page;
+
+			if (page_no > PG_UINT32_MAX) {
+				result = CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+				goto done;
+			}
+			{
+				uint8 bytes[BLCKSZ];
+
+				result
+					= read_native_page(dir, family, (uint32)page_no, bytes, hash, reads, sync, st);
+				if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && family == 2
+					&& subtrans_parent_entries != NULL) {
+					for (uint32 slot = 0; slot < CLUSTER_NATIVE_SUBTRANS_PER_PAGE; slot++) {
+						TransactionId parent;
+
+						memcpy(&parent, bytes + slot * sizeof(parent), sizeof(parent));
+						if (TransactionIdIsValid(parent))
+							(*subtrans_parent_entries)++;
+					}
+				}
+			}
+			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+				goto done;
+			(*page_count)++;
+		}
+		(*file_count)++;
+	}
+	result = collect_native_segments(dir, &after);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
+	if (before.count != after.count
+		|| memcmp(before.values, after.values, before.count * sizeof(before.values[0])) != 0) {
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		goto done;
+	}
+	for (size_t i = 0; i < after.count; i++) {
+		char name[16];
+		struct stat current;
+
+		snprintf(name, sizeof(name), "%04X", after.values[i]);
+		if (fstatat(dir, name, &current, AT_SYMLINK_NOFOLLOW) != 0) {
+			result = read_error();
+			goto done;
+		}
+		if (!read_native_same_segment(&identities[i], &current)) {
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			goto done;
+		}
+	}
+done:
+	free(identities);
 	return result;
 }
 
@@ -713,7 +929,7 @@ read_native_cursors(const int dirs[9], const ControlFileData *input, pg_cryptoha
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	if (next % CLUSTER_NATIVE_CLOG_PER_PAGE != 0) {
 		result = read_native_page(dirs[3], 1, next / CLUSTER_NATIVE_CLOG_PER_PAGE, page, hash,
-								  reads, sync);
+								  reads, sync, NULL);
 		if (result != 0)
 			return result;
 		if (!cluster_native_clog_suffix_unused((const char *)page, next))
@@ -721,14 +937,14 @@ read_native_cursors(const int dirs[9], const ControlFileData *input, pg_cryptoha
 	}
 	if (next % CLUSTER_NATIVE_SUBTRANS_PER_PAGE != 0) {
 		result = read_native_page(dirs[4], 2, next / CLUSTER_NATIVE_SUBTRANS_PER_PAGE, page, hash,
-								  reads, sync);
+								  reads, sync, NULL);
 		if (result != 0)
 			return result;
 		if (!cluster_native_subtrans_suffix_unused((const char *)page, next))
 			return CLUSTER_CONTROL_ROOT_COPY_DIVERGENT;
 	}
 	result = read_native_page(dirs[7], 3, sentinel / CLUSTER_NATIVE_MX_OFFSETS_PER_PAGE, page, hash,
-							  reads, sync);
+							  reads, sync, NULL);
 	if (result != 0)
 		return result;
 	memcpy(&observed, page + (sentinel % CLUSTER_NATIVE_MX_OFFSETS_PER_PAGE) * sizeof(uint32),
@@ -739,7 +955,7 @@ read_native_cursors(const int dirs[9], const ControlFileData *input, pg_cryptoha
 		return CLUSTER_CONTROL_ROOT_COPY_DIVERGENT;
 	if (cp->oldestMulti != cp->nextMulti) {
 		result = read_native_page(dirs[7], 3, cp->oldestMulti / CLUSTER_NATIVE_MX_OFFSETS_PER_PAGE,
-								  page, hash, reads, sync);
+								  page, hash, reads, sync, NULL);
 		if (result != 0)
 			return result;
 		memcpy(&oldest,
@@ -748,12 +964,12 @@ read_native_cursors(const int dirs[9], const ControlFileData *input, pg_cryptoha
 		if (oldest == 0)
 			return CLUSTER_CONTROL_ROOT_COPY_DIVERGENT;
 		result = read_native_page(dirs[8], 4, oldest / CLUSTER_NATIVE_MX_MEMBERS_PER_PAGE, page,
-								  hash, reads, sync);
+								  hash, reads, sync, NULL);
 		if (result != 0)
 			return result;
 		result = read_native_page(
 			dirs[8], 4, (uint32)(cp->nextMultiOffset - 1) / CLUSTER_NATIVE_MX_MEMBERS_PER_PAGE,
-			page, hash, reads, sync);
+			page, hash, reads, sync, NULL);
 		if (result != 0)
 			return result;
 	}
@@ -771,6 +987,10 @@ native_side_inspect(const char *shared_root, uint32 node_id, const ControlFileDa
 	static const char *const families[]
 		= { "pg_xact", "pg_subtrans", "pg_multixact", "pg_commit_ts", "offsets", "members" };
 	static const unsigned parents[] = { 2, 2, 2, 2, 5, 5 };
+	/* pg_multixact is the parent of the two physical segment families; it is
+	 * validated as a directory above, but its offsets/members children are
+	 * the only entries that may be enumerated as native segments. */
+	static const int segment_dirs[] = { 3, 4, -1, 6, 7, 8 };
 	int dirs[9] = { -1, -1, -1, -1, -1, -1, -1, -1, -1 };
 	ClusterNativeSideObservation observed = { 0 };
 	ControlFileData effective;
@@ -799,12 +1019,29 @@ native_side_inspect(const char *shared_root, uint32 node_id, const ControlFileDa
 		result = read_dir(dirs[0], "native_side", &dirs[1]);
 	if (result == 0)
 		result = read_dir(dirs[1], origin, &dirs[2]);
-	for (unsigned i = 0; result == 0 && i < lengthof(families); ++i)
+	for (unsigned i = 0; result == 0 && i < lengthof(families); ++i) {
 		result = read_dir(dirs[parents[i]], families[i], &dirs[3 + i]);
+		if (result == 0)
+			observed.family_mask |= UINT32_C(1) << i;
+	}
 	if (result == 0)
 		result = read_native_horizon(dirs[0], input, &effective, hash, sync);
 	if (result == 0) {
 		observed.effective_next_xid = U64FromFullTransactionId(effective.checkPointCopy.nextXid);
+		for (unsigned i = 0; result == 0 && i < lengthof(families); i++) {
+			if (segment_dirs[i] < 0)
+				continue;
+			result = read_native_family_files(
+				dirs[segment_dirs[i]], i + 1, hash, &observed.page_reads,
+				&observed.family_file_counts[i], &observed.family_page_counts[i],
+				i == 1 ? &observed.subtrans_parent_entries : NULL, sync);
+		}
+		if (result == 0)
+			observed.native_file_count = 0;
+		for (unsigned i = 0; result == 0 && i < lengthof(families); i++)
+			observed.native_file_count += observed.family_file_counts[i];
+	}
+	if (result == 0) {
 		result = read_native_cursors(dirs, &effective, hash, &observed.page_reads, sync);
 	}
 	/* Before-checkpoint native startup performs no writes outside these
@@ -1170,6 +1407,36 @@ read_terminal_capacity(BootstrapReadWork *work, const char *shared_root, const c
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
+/* Disabled tracking does not erase an older physical source. This bounded
+ * physical observation grants no replay/NO_EFFECT or OPEN authority. */
+static ClusterControlRootResult
+read_commit_ts_profile(const struct stat *expected_shared, const char *shared_root, uint32 node)
+{
+	int dirs[] = { -1, -1, -1, -1 };
+	char origin[32];
+	const char *names[] = { "native_side", origin, "pg_commit_ts" };
+	ClusterControlRootResult result;
+
+	snprintf(origin, sizeof(origin), "origin_%u", node);
+	result = read_dir(-1, shared_root, &dirs[0]);
+	if (result == 0 && expected_shared != NULL)
+		result = read_dir_identity(dirs[0], expected_shared);
+	for (size_t i = 0; result == 0 && i < lengthof(names); i++)
+		result = read_dir(dirs[i], names[i], &dirs[i + 1]);
+	for (int pass = 0; result == 0 && pass < 2; pass++) {
+		result = read_empty(dirs[3]);
+		if (result == CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID)
+			result = CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED;
+	}
+	if (result == 0)
+		result = read_same_dir(AT_FDCWD, shared_root, dirs[0]);
+	for (size_t i = 0; result == 0 && i < lengthof(names); i++)
+		result = read_same_dir(dirs[i], names[i], dirs[i + 1]);
+	for (size_t i = 0; i < lengthof(dirs); i++)
+		read_close(dirs[i], &result);
+	return result;
+}
+
 static ClusterControlRootResult
 read_capacities(BootstrapReadWork *work, const char *shared_root, const char *wal_root,
 				ClusterControlRecoveryCapacity *required, ClusterControlBootstrapSnapshot *snapshot)
@@ -1183,6 +1450,11 @@ read_capacities(BootstrapReadWork *work, const char *shared_root, const char *wa
 			continue;
 		result = read_source_capacity(work, shared_root, wal_root, &root->records[node],
 									  &root->refs[node], required);
+		if (result != 0)
+			return result;
+		/* All selected current/retained/pending writers of an origin share
+		 * its original physical family. Check even retired/non-serving nodes. */
+		result = read_commit_ts_profile(&work->shared_dir, shared_root, node);
 		if (result != 0)
 			return result;
 		required->current_sources++;
@@ -1254,6 +1526,18 @@ read_capacities(BootstrapReadWork *work, const char *shared_root, const char *wa
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 #endif
+
+ClusterControlRootResult
+cluster_control_native_commit_ts_profile_v1(const char *shared_root, uint32 node)
+{
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+#if !defined(WIN32) && defined(O_NOFOLLOW) && defined(O_DIRECTORY) && defined(O_CLOEXEC)           \
+	&& defined(AT_SYMLINK_NOFOLLOW)
+	if (read_path_valid(shared_root, NULL) && node < CLUSTER_CONTROL_ROOT_RECORD_COUNT)
+		result = read_commit_ts_profile(NULL, shared_root, node);
+#endif
+	return result;
+}
 
 ClusterControlRootResult
 cluster_control_bootstrap_read(const char *pgdata, const char *shared_root, const char *wal_root,

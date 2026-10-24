@@ -180,6 +180,12 @@ extern ClusterUndoBlock0Result cluster_undo_block0_admit_runtime(
 extern ClusterUndoBlock0Result cluster_undo_block0_reserve(
 	const ClusterUndoBlock0LogicalKey *logical, const ClusterUndoBlock0ResolvedRoot *expected_root,
 	const ClusterUndoBlock0AuthorityProof *proof, ClusterUndoBlock0Pin *pin);
+/* Reserve an EMPTY recovery target without a frame or a retained content
+ * lock. ResourceOwner cleanup uses the original reservation release path.
+ * This grants no root, generation, resident-page, WAL or I/O authority. */
+extern ClusterUndoBlock0Result cluster_undo_block0_recovery_reserve(
+	const ClusterUndoBlock0LogicalKey *logical,
+	const ClusterUndoBlock0AuthorityProof *proof, ClusterUndoBlock0Pin *pin);
 extern ClusterUndoBlock0Result
 cluster_undo_block0_lock_content(ClusterUndoBlock0Pin *pin,
 								 const ClusterUndoBlock0Generation *expected,
@@ -237,6 +243,13 @@ extern void cluster_undo_block0_flush_sync(ClusterUndoBlock0Pin *pin, const char
 extern void cluster_undo_block0_unpin(ClusterUndoBlock0Pin *pin);
 extern void cluster_undo_block0_pin_downgrade(ClusterUndoBlock0Pin *pin);
 extern void cluster_undo_block0_release_reservation(ClusterUndoBlock0Pin *pin);
+/* Serialize physical header RMW with the existing content owner. Already-X
+ * callers retain their lock; SHARED cannot be upgraded. No authority granted.
+ * UINT32_MAX means no lock was acquired (already-X or single-user bootstrap). */
+extern bool cluster_undo_block0_header_write_lock(uint32 segment_id, uint8 owner_instance,
+	uint32 *acquired_slot);
+extern void cluster_undo_block0_header_write_unlock(uint32 acquired_slot);
+
 /* Checkpoint coverage of header bytes written without an fsync. */
 extern bool cluster_undo_block0_note_unsynced_header(uint32 segment_id, uint8 owner_instance,
 													 ClusterUndoPathIntent intent);

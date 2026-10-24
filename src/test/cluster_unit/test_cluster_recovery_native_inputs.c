@@ -1,0 +1,921 @@
+/* Native effects through real ROOT/claim/anchor files and XLogReader.
+ * Only the between-pass fault injector wraps a call boundary; both passes
+ * still execute the original complete cold census.
+ * Author: SqlRush <sqlrush@gmail.com>
+ * Copyright (c) 2026, pgrac contributors. */
+int control_fixture_main(int argc, char **argv);
+#define main control_fixture_main
+#include "test_cluster_control_root.c"
+#undef main
+#include "catalog/storage_xlog.h"
+#include "access/multixact.h"
+#include "access/clog.h"
+#include "access/commit_ts.h"
+#include "cluster/cluster_native_startup.h"
+#include "cluster/cluster_recovery_native_inventory.h"
+#include "cluster/cluster_side_undo.h"
+#include "cluster/cluster_recovery_record_hash.h"
+#include "cluster/storage/cluster_undo_xlog.h"
+#include "cluster/storage/cluster_undo_alloc.h"
+#include "../../backend/cluster/cluster_uba.c"
+#include "test_cluster_heap_small_scn.inc"
+#include "test_cluster_recovery_relmap_fixture.h"
+#include "test_cluster_recovery_prepare_fixture.h"
+
+static unsigned inventory_census_calls;
+static void (*inventory_between_passes)(void);
+
+static ClusterControlRootResult
+inventory_test_census(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitorV1 visitor,
+					  ClusterWalCensusSourceVisitorV1 source_visitor, void *arg, uint64 *records,
+					  RfPageProofDetailV1 *detail)
+{
+	ClusterControlRootResult result;
+
+	inventory_census_calls++;
+	result
+		= cluster_wal_inputs_cold_census_v1(inputs, visitor, source_visitor, arg, records, detail);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && inventory_census_calls == 1
+		&& inventory_between_passes != NULL)
+		inventory_between_passes();
+	return result;
+}
+
+#define cluster_wal_inputs_cold_census_v1 inventory_test_census
+#include "../../backend/cluster/cluster_recovery_native_inventory.c"
+#undef cluster_wal_inputs_cold_census_v1
+#include "../../backend/cluster/cluster_recovery_census.c"
+
+static ClusterWalSourceRef inventory_fault_source;
+static XLogRecPtr inventory_commit_start, inventory_commit_previous;
+static unsigned inventory_fault;
+static unsigned inventory_extra;
+static unsigned inventory_binding_case;
+static XLogRecPtr inventory_extra_start, inventory_extra_previous;
+static XLogRecPtr inventory_mx_start, inventory_mx_previous;
+static XLogRecPtr inventory_slru_start[4], inventory_slru_previous[4];
+static unsigned inventory_slru_fault;
+static unsigned inventory_relmap_fault;
+static unsigned inventory_prepare_fault;
+static unsigned inventory_terminal_mode;
+
+/* These small records stay within the original checkpoint's first WAL page.
+ * Header, main-data framing and CRC are actual native-reader inputs. */
+static WalTestRecord
+inventory_write_record(const ClusterWalSourceRef *source, XLogRecPtr at, XLogRecPtr previous,
+					   RmgrId rmid, uint8 info, const void *payload, uint32 length)
+{
+	uint8 bytes[2048] = { 0 };
+	size_t framing = length <= UINT8_MAX ? 2 : 5;
+	XLogRecord record = { 0 };
+	char path[MAXPGPATH];
+	int fd;
+
+	UT_ASSERT(length <= sizeof(bytes) - SizeOfXLogRecord - framing);
+	record.xl_tot_len = SizeOfXLogRecord + framing + length;
+	record.xl_prev = previous;
+	record.xl_rmid = rmid;
+	record.xl_info = info;
+	record.xl_xid = 4195136;
+	record.xl_scn = 5906;
+	bytes[SizeOfXLogRecord]
+		= length <= UINT8_MAX ? XLR_BLOCK_ID_DATA_SHORT : XLR_BLOCK_ID_DATA_LONG;
+	if (length <= UINT8_MAX)
+		bytes[SizeOfXLogRecord + 1] = length;
+	else
+		memcpy(bytes + SizeOfXLogRecord + 1, &length, sizeof(length));
+	memcpy(bytes + SizeOfXLogRecord + framing, payload, length);
+	INIT_CRC32C(record.xl_crc);
+	COMP_CRC32C(record.xl_crc, bytes + SizeOfXLogRecord, framing + length);
+	COMP_CRC32C(record.xl_crc, &record, offsetof(XLogRecord, xl_crc));
+	FIN_CRC32C(record.xl_crc);
+	memcpy(bytes, &record, SizeOfXLogRecord);
+	v2_checkpoint_wal_path(&source->claim.identity, at, source->timeline, path);
+	UT_ASSERT(at % XLOG_BLCKSZ + record.xl_tot_len < XLOG_BLCKSZ);
+	fd = open(path, O_WRONLY);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(pwrite(fd, bytes, record.xl_tot_len, at % wal_segment_size), record.xl_tot_len);
+	UT_ASSERT_EQ(close(fd), 0);
+	return (WalTestRecord){ 1, MAXALIGN(at + record.xl_tot_len), at, record.xl_crc };
+}
+
+/* A real FSM record, including the original fixed PageVersion wire edge. */
+static WalTestRecord
+inventory_write_fsm(const ClusterWalSourceRef *source, XLogRecPtr at, XLogRecPtr previous,
+					BlockNumber block)
+{
+	uint8 bytes[256] = { 0 };
+	uint8 *edge = bytes + SizeOfXLogRecord;
+	XLogRecord record = { 0 };
+	XLogRecordBlockHeader header = { .id = 0, .fork_flags = FSM_FORKNUM, .data_length = 0 };
+	RelFileLocator locator = { 1663, 5, 16386 };
+	size_t used = SizeOfXLogRecord + 64;
+	char path[MAXPGPATH];
+	int fd;
+
+	edge[0] = XLR_BLOCK_ID_PAGE_VERSION_EDGE;
+	edge[1] = XLR_PAGE_VERSION_EDGE_FORMAT_V1;
+	edge[2] = 1;
+	edge[3] = XLR_PAGE_VERSION_EDGE_ENTRY_SIZE;
+	edge[8] = 31; /* LE result_token */
+	edge[17] = RF_PAGE_CLASS_REBUILDABLE_FSM;
+	edge[18] = edge[19] = RF_PAGE_STATE_REBUILDABLE;
+	memcpy(bytes + used, &header, SizeOfXLogRecordBlockHeader);
+	used += SizeOfXLogRecordBlockHeader;
+	memcpy(bytes + used, &locator, sizeof(locator));
+	used += sizeof(locator);
+	memcpy(bytes + used, &block, sizeof(block));
+	used += sizeof(block);
+	record.xl_tot_len = used;
+	record.xl_prev = previous;
+	record.xl_rmid = RM_GENERIC_ID;
+	record.xl_scn = 5906;
+	INIT_CRC32C(record.xl_crc);
+	COMP_CRC32C(record.xl_crc, bytes + SizeOfXLogRecord, used - SizeOfXLogRecord);
+	COMP_CRC32C(record.xl_crc, &record, offsetof(XLogRecord, xl_crc));
+	FIN_CRC32C(record.xl_crc);
+	memcpy(bytes, &record, SizeOfXLogRecord);
+	v2_checkpoint_wal_path(&source->claim.identity, at, source->timeline, path);
+	UT_ASSERT(at % XLOG_BLCKSZ + used < XLOG_BLCKSZ);
+	fd = open(path, O_WRONLY);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(pwrite(fd, bytes, used, at % wal_segment_size), used);
+	UT_ASSERT_EQ(close(fd), 0);
+	return (WalTestRecord){ 1, MAXALIGN(at + used), at, record.xl_crc };
+}
+
+static WalTestRecord
+inventory_write_commit(const ClusterWalSourceRef *source, XLogRecPtr at, XLogRecPtr previous,
+					   TimestampTz time, bool unsupported)
+{
+	uint8 payload[128] = { 0 };
+	uint32 xinfo = XACT_XINFO_HAS_INVALS | XACT_XINFO_HAS_SCN | XACT_COMPLETION_FORCE_SYNC_COMMIT;
+	SharedInvalidationMessage msgs[2] = { 0 };
+	xl_xact_scn scn = { 5906 };
+	int nmsgs = 2;
+	size_t used = 0;
+	if (inventory_terminal_mode == 21)
+		xinfo |= XACT_XINFO_HAS_TT_COMMIT;
+
+	msgs[0].id = SHAREDINVALRELCACHE_ID;
+	msgs[0].rc.dbId = 5;
+	msgs[0].rc.relId = 16385;
+	msgs[1].id = SHAREDINVALCATALOG_ID;
+	memcpy(payload + used, &time, sizeof(time));
+	used += sizeof(time);
+	memcpy(payload + used, &xinfo, sizeof(xinfo));
+	used += sizeof(xinfo);
+	memcpy(payload + used, &nmsgs, sizeof(nmsgs));
+	used += sizeof(nmsgs);
+	memcpy(payload + used, msgs, sizeof(msgs));
+	used += sizeof(msgs);
+	memcpy(payload + used, &scn, sizeof(scn));
+	used += sizeof(scn);
+	if (inventory_terminal_mode == 21) {
+		xl_xact_tt_commit tt = { 0 };
+		tt.instance = source->claim.identity.origin_thread_id;
+		tt.segment_id = (tt.instance - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+		tt.xid = 4195136;
+		tt.wrap = 1;
+		tt.commit_scn = 5906;
+		tt.format_version = CLUSTER_XACT_TT_COMMIT_VERSION;
+		memcpy(payload + used, &tt, sizeof(tt));
+		used += sizeof(tt);
+	}
+	return inventory_write_record(
+		source, at, previous, RM_XACT_ID,
+		unsupported ? XLOG_XACT_PREPARE : XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO, payload, used);
+}
+
+static WalTestRecord
+inventory_write_bound_head(const ClusterWalSourceRef *source, WalTestRecord previous, unsigned node)
+{
+	xl_undo_tt_slot_bind binding = { 0 };
+	xl_undo_tt_slot_set_head head = { 0 };
+	WalTestRecord next = previous;
+	bool missing = inventory_binding_case == 1 || (inventory_binding_case == 8 && node == 127);
+
+	binding.segment_id = node * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	binding.instance = node + 1;
+	binding.xid = 4195136;
+	binding.wrap = 1;
+	binding.format_version = CLUSTER_UNDO_TT_BIND_VERSION;
+	head.segment_id = binding.segment_id;
+	head.instance = binding.instance;
+	head.xid = binding.xid;
+	head.wrap = binding.wrap;
+	head.first_undo_block = uba_encode(binding.segment_id, 1, 0, 0);
+	if (inventory_binding_case == 7)
+		next = inventory_write_record(source, next.exclusive_end, next.record_start,
+									  RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_SET_HEAD, &head,
+									  sizeof(head));
+	if (!missing)
+		next = inventory_write_record(source, next.exclusive_end, next.record_start,
+									  RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND, &binding,
+									  sizeof(binding));
+	if (inventory_binding_case == 2 || inventory_binding_case == 3) {
+		if (inventory_binding_case == 2)
+			binding.xid++;
+		else
+			binding.wrap++;
+		next = inventory_write_record(source, next.exclusive_end, next.record_start,
+									  RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND, &binding,
+									  sizeof(binding));
+	}
+	if (inventory_binding_case == 4) {
+		xl_undo_segment_recycle recycle = { 0 };
+		recycle.segment_id = binding.segment_id;
+		recycle.instance = binding.instance;
+		recycle.old_state = SEGMENT_COMMITTED;
+		recycle.new_state = SEGMENT_RECYCLABLE;
+		next = inventory_write_record(source, next.exclusive_end, next.record_start,
+									  RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_RECYCLE, &recycle,
+									  sizeof(recycle));
+	}
+	return inventory_write_record(source, next.exclusive_end, next.record_start, RM_CLUSTER_UNDO_ID,
+								  XLOG_UNDO_TT_SLOT_SET_HEAD, &head, sizeof(head));
+}
+
+/* Four original TT terminal carriers plus native-only ABORT. Conflicting
+ * endpoints intentionally coexist: observation must never choose a winner. */
+static WalTestRecord
+inventory_write_terminal_sequence(const ClusterWalSourceRef *source, WalTestRecord next,
+								  unsigned node)
+{
+	uint32 segment = node * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	uint8 payload[128] = { 0 };
+	TimestampTz time = 8765;
+	uint32 xinfo = XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_TT_COMMIT;
+	xl_xact_scn scn = { 5906 };
+	xl_xact_tt_commit folded = { 0 };
+	xl_undo_tt_slot_bind bind = { 0 };
+	xl_undo_tt_slot_commit commit = { 0 };
+	xl_undo_tt_slot_abort abort_record = { 0 };
+	xl_undo_tt_slot_abort_exact exact = { 0 };
+	size_t used = 0;
+	if (inventory_terminal_mode == 20) {
+		bind.segment_id = segment;
+		bind.instance = node + 1;
+		bind.xid = 4195136;
+		bind.wrap = 1;
+		bind.format_version = CLUSTER_UNDO_TT_BIND_VERSION;
+		for (unsigned i = 0; i < 72; i++)
+			next = inventory_write_record(source, next.exclusive_end, next.record_start,
+										  RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND, &bind,
+										  sizeof(bind));
+	}
+	folded.segment_id = segment;
+	folded.xid = 4195136;
+	folded.wrap = 1;
+	folded.instance = node + 1;
+	folded.format_version = CLUSTER_XACT_TT_COMMIT_VERSION;
+	folded.commit_scn = scn.scn;
+	switch (inventory_terminal_mode) {
+	case 6:
+		folded.instance = node == 0 ? 2 : 1;
+		break;
+	case 7:
+		folded.segment_id = node == 0 ? 257 : 1;
+		break;
+	case 8:
+		folded.segment_generation = UINT32_MAX;
+		break;
+	case 9:
+		folded.slot_offset = TT_SLOTS_PER_SEGMENT;
+		break;
+	case 10:
+		folded.wrap = TT_WRAP_INVALID;
+		break;
+	case 11:
+		folded.xid++;
+		break;
+	case 12:
+		folded.format_version++;
+		break;
+	case 13:
+		folded.flags = 1;
+		break;
+	case 14:
+		folded.reserved = 1;
+		break;
+	case 15:
+		folded.commit_scn++;
+		break;
+	default:
+		break;
+	}
+	memcpy(payload + used, &time, sizeof(time));
+	used += sizeof(time);
+	memcpy(payload + used, &xinfo, sizeof(xinfo));
+	used += sizeof(xinfo);
+	memcpy(payload + used, &scn, sizeof(scn));
+	used += sizeof(scn);
+	memcpy(payload + used, &folded, sizeof(folded));
+	used += sizeof(folded);
+	if (inventory_terminal_mode != 18)
+		next = inventory_write_record(source, next.exclusive_end, next.record_start, RM_XACT_ID,
+									  XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO, payload, used);
+	if (inventory_terminal_mode == 2 || (inventory_terminal_mode == 5 && node == 127)) {
+		xl_undo_segment_recycle recycle = { 0 };
+		recycle.segment_id = segment;
+		recycle.instance = node + 1;
+		recycle.old_state = SEGMENT_COMMITTED;
+		recycle.new_state = SEGMENT_RECYCLABLE;
+		next = inventory_write_record(source, next.exclusive_end, next.record_start,
+									  RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_RECYCLE, &recycle,
+									  sizeof(recycle));
+	}
+	if (inventory_terminal_mode == 3 || inventory_terminal_mode == 4) {
+		bind.segment_id = segment;
+		bind.instance = node + 1;
+		bind.xid = 4195136 + (inventory_terminal_mode == 3);
+		bind.wrap = 1 + (inventory_terminal_mode == 4);
+		bind.format_version = CLUSTER_UNDO_TT_BIND_VERSION;
+		next = inventory_write_record(source, next.exclusive_end, next.record_start,
+									  RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND, &bind,
+									  sizeof(bind));
+	}
+	commit.segment_id = segment;
+	commit.instance = node + 1;
+	commit.xid = 4195136;
+	commit.wrap = 1;
+	commit.commit_scn = inventory_terminal_mode == 17 ? 5907 : 5906;
+	if (inventory_terminal_mode != 18)
+		next = inventory_write_record(source, next.exclusive_end, next.record_start,
+									  RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_COMMIT, &commit,
+									  sizeof(commit));
+	if (inventory_terminal_mode == 16 || inventory_terminal_mode == 17
+		|| inventory_terminal_mode == 21)
+		return next;
+	abort_record.segment_id = segment;
+	abort_record.instance = node + 1;
+	abort_record.xid = 4195136;
+	abort_record.wrap = 1;
+	next = inventory_write_record(source, next.exclusive_end, next.record_start, RM_CLUSTER_UNDO_ID,
+								  XLOG_UNDO_TT_SLOT_ABORT, &abort_record, sizeof(abort_record));
+	exact.segment_id = segment;
+	exact.instance = node + 1;
+	exact.xid = 4195136;
+	exact.wrap = 1;
+	exact.format_version = CLUSTER_UNDO_TT_ABORT_EXACT_VERSION;
+	next = inventory_write_record(source, next.exclusive_end, next.record_start, RM_CLUSTER_UNDO_ID,
+								  XLOG_UNDO_TT_SLOT_ABORT, &exact, sizeof(exact));
+	return inventory_write_record(source, next.exclusive_end, next.record_start, RM_XACT_ID,
+								  XLOG_XACT_ABORT, &time, sizeof(time));
+}
+
+static void
+inventory_mx_payload(char *bytes, bool invalid, bool changed)
+{
+	xl_multixact_create create = { 0 };
+	MultiXactMember members[2]
+		= { { 4195136, MultiXactStatusForShare }, { 4195138, MultiXactStatusUpdate } };
+
+	create.mid = 42;
+	create.moff = invalid ? 0 : 108;
+	create.nmembers = 2;
+	if (changed)
+		members[1].xid++;
+	memcpy(bytes, &create, SizeOfMultiXactCreate);
+	memcpy(bytes + SizeOfMultiXactCreate, members, sizeof(members));
+}
+
+static WalTestRecord
+inventory_write_mx_sequence(const ClusterWalSourceRef *source, WalTestRecord next, unsigned node)
+{
+	char bytes[SizeOfMultiXactCreate + 2 * sizeof(MultiXactMember)];
+	xl_multixact_truncate trunc = { 5, 1, 40, 1, 106 };
+	int page = 0;
+
+	inventory_mx_payload(bytes, inventory_extra == 7, false);
+	if (node == 0) {
+		inventory_mx_start = next.exclusive_end;
+		inventory_mx_previous = next.record_start;
+	}
+	next = inventory_write_record(source, next.exclusive_end, next.record_start, RM_MULTIXACT_ID,
+								  inventory_extra == 8 ? 0x40 : XLOG_MULTIXACT_CREATE_ID, bytes,
+								  sizeof(bytes));
+	next = inventory_write_record(source, next.exclusive_end, next.record_start, RM_MULTIXACT_ID,
+								  XLOG_MULTIXACT_ZERO_OFF_PAGE, &page, sizeof(page));
+	next = inventory_write_record(source, next.exclusive_end, next.record_start, RM_MULTIXACT_ID,
+								  XLOG_MULTIXACT_ZERO_MEM_PAGE, &page, sizeof(page));
+	return inventory_write_record(source, next.exclusive_end, next.record_start, RM_MULTIXACT_ID,
+								  XLOG_MULTIXACT_TRUNCATE_ID, &trunc, sizeof(trunc));
+}
+
+static uint8
+inventory_slru_payload(unsigned shape, char *bytes, bool changed)
+{
+	int page = 33;
+	xl_clog_truncate clog = { page, page * CLUSTER_NATIVE_CLOG_PER_PAGE, changed ? 6 : 5 };
+	xl_commit_ts_truncate cts
+		= { page, page * CLUSTER_NATIVE_COMMIT_TS_PER_PAGE + (changed ? 1 : 0) };
+	if (shape % 2 == 0) {
+		memcpy(bytes, &page, sizeof(page));
+		return sizeof(page);
+	}
+	if (shape == 1) {
+		memcpy(bytes, &clog, sizeof(clog));
+		return sizeof(clog);
+	}
+	memcpy(bytes, &cts, SizeOfCommitTsTruncate);
+	return SizeOfCommitTsTruncate;
+}
+
+static WalTestRecord
+inventory_write_slru_sequence(const ClusterWalSourceRef *source, WalTestRecord next, unsigned node)
+{
+	unsigned first = inventory_extra == 10 ? 0 : inventory_extra == 11 ? 2 : 3;
+	unsigned limit = inventory_extra == 10 ? 2 : first + 1;
+	for (unsigned shape = first; shape < limit; shape++) {
+		char bytes[sizeof(xl_clog_truncate)];
+		uint8 length = inventory_slru_payload(shape, bytes, false);
+		uint8 opcode = shape % 2 ? 0x10 : 0;
+		if (node == 0) {
+			inventory_slru_start[shape] = next.exclusive_end;
+			inventory_slru_previous[shape] = next.record_start;
+		}
+		if ((inventory_slru_fault == 1 && shape == 0) || (inventory_slru_fault == 2 && shape == 2))
+			opcode = 0xF0;
+		if ((inventory_slru_fault == 3 && shape == 1) || (inventory_slru_fault == 4 && shape == 3))
+			length--;
+		next = inventory_write_record(source, next.exclusive_end, next.record_start,
+									  shape < 2 ? RM_CLOG_ID : RM_COMMIT_TS_ID, opcode, bytes,
+									  length);
+	}
+	return next;
+}
+
+static ClusterWalInputsV1 *
+inventory_fixture(bool unsupported, bool open_source)
+{
+	uint8 bytes[66048];
+	ClusterRecoveryAnchorV2 anchors[2];
+	ClusterWalInputsV1 *inputs = NULL;
+	ControlRootImage root;
+
+	inputs_closed_wal_fixture(bytes, anchors);
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &root), 0);
+	for (unsigned i = 0; i < 2; i++) {
+		unsigned node = i == 0 ? 0 : 127;
+		ClusterWalSourceRef source = { 0 };
+		ClusterControlRootSnapshot *snapshot = &root.records[node];
+		WalTestRecord commit, extra, create;
+		xl_smgr_create payload = { .rlocator = { 1663, 5, 16385 }, .forkNum = MAIN_FORKNUM };
+
+		source.claim.identity = snapshot->identity;
+		source.timeline = snapshot->tail_tli;
+		commit = inventory_write_commit(&source, snapshot->validated_tail_lsn_exclusive,
+										snapshot->tail_last_record_lsn, 8765, unsupported);
+		extra = commit;
+		if (inventory_extra == 1)
+			extra = inventory_write_record(&source, commit.exclusive_end, commit.record_start,
+										   RM_XLOG_ID, XLOG_NOOP, "abc", 3);
+		else if (inventory_extra == 2)
+			extra = inventory_write_fsm(&source, commit.exclusive_end, commit.record_start, 31);
+		else if (inventory_extra == 3 || inventory_extra == 4) {
+			xl_undo_tt_slot_bind binding = { 0 };
+
+			binding.segment_id = node * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+			binding.instance = node + 1;
+			if (inventory_extra == 4) {
+				binding.instance = node == 0 ? 128 : 1;
+				binding.segment_id = node == 0 ? 32513 : 1;
+			}
+			binding.xid = 4195136;
+			binding.wrap = 1;
+			binding.format_version = CLUSTER_UNDO_TT_BIND_VERSION;
+			extra = inventory_write_record(&source, commit.exclusive_end, commit.record_start,
+										   RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND, &binding,
+										   sizeof(binding));
+		}
+		if (inventory_extra == 5 || inventory_extra == 9 || inventory_extra == 16)
+			extra = inventory_write_bound_head(&source, commit, node);
+		if ((inventory_extra >= 6 && inventory_extra <= 9) || inventory_extra == 16)
+			extra = inventory_write_mx_sequence(&source, extra, node);
+		if (inventory_extra >= 10 && inventory_extra <= 12)
+			extra = inventory_write_slru_sequence(&source, extra, node);
+		if (inventory_extra == 13) {
+			/* A separate assigned transaction, not a terminal/parent proof. */
+			char bytes[MinSizeOfXactAssignment + 2 * sizeof(TransactionId)] = { 0 };
+			TransactionId top = 4196000, children[] = { 4196001, 4196352 };
+			int count = 2;
+			memcpy(bytes, &top, sizeof(top));
+			memcpy(bytes + sizeof(top), &count, sizeof(count));
+			memcpy(bytes + MinSizeOfXactAssignment, children, sizeof(children));
+			extra = inventory_write_record(&source, extra.exclusive_end, extra.record_start,
+										   RM_XACT_ID, XLOG_XACT_ASSIGNMENT, bytes, sizeof(bytes));
+		}
+		if (inventory_extra == 14) {
+			char bytes[TEST_RELMAP_LENGTH];
+			uint8 opcode = inventory_relmap_fault == 1 ? 0x10 : XLOG_RELMAP_UPDATE;
+			test_relmap_payload(bytes, node == 0, 2);
+			if (inventory_relmap_fault == 2)
+				bytes[TEST_RELMAP_LENGTH - 1] ^= 1;
+			extra = inventory_write_record(&source, extra.exclusive_end, extra.record_start,
+										   RM_RELMAP_ID, opcode, bytes, sizeof(bytes));
+		}
+		if (inventory_extra == 15) {
+			char bytes[TEST_PREPARE_MAX];
+			uint32 length = test_prepare_payload(bytes, true, 13);
+			uint8 opcode = XLOG_XACT_PREPARE;
+			if (inventory_prepare_fault == 1)
+				bytes[length - MAXALIGN(sizeof(TwoPhaseRecordOnDisk))
+					  + offsetof(TwoPhaseRecordOnDisk, rmid)] = 0xff;
+			if (inventory_prepare_fault == 2) {
+				int bad = -1;
+				memcpy(bytes + offsetof(xl_xact_prepare, nabortrels), &bad, sizeof(bad));
+			}
+			if (inventory_prepare_fault == 3)
+				opcode = XLOG_XACT_COMMIT_PREPARED;
+			extra = inventory_write_record(&source, extra.exclusive_end, extra.record_start,
+										   RM_XACT_ID, opcode, bytes, length);
+		}
+		if (inventory_extra == 16)
+			extra = inventory_write_terminal_sequence(&source, extra, node);
+		create = inventory_write_record(&source, extra.exclusive_end, extra.record_start,
+										RM_SMGR_ID, XLOG_SMGR_CREATE, &payload, sizeof(payload));
+		if (i == 0) {
+			inventory_fault_source = source;
+			inventory_commit_start = commit.record_start;
+			inventory_extra_start = extra.record_start;
+			inventory_extra_previous = commit.record_start;
+			inventory_commit_previous = snapshot->tail_last_record_lsn;
+		}
+		snapshot->tail_last_record_lsn = create.record_start;
+		snapshot->tail_last_record_crc32c = create.record_crc;
+		snapshot->validated_tail_lsn_exclusive = create.exclusive_end;
+	}
+	if (open_source)
+		root.records[127].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+	v2_write_roots(root.bytes);
+	test_inputs_startup_cf = true;
+	UT_ASSERT_EQ(inputs_begin_for_role(true, &inputs), 0);
+	inventory_census_calls = 0;
+	inventory_between_passes = NULL;
+	return inputs;
+}
+
+static void
+inventory_drift(void)
+{
+	char path[MAXPGPATH];
+
+	switch (inventory_fault) {
+	case 0:
+		/* Non-tail record: its new CRC is valid; ROOT's last-record CRC is
+		 * unchanged. Full native bytes must still detect this rewrite. */
+		(void)inventory_write_commit(&inventory_fault_source, inventory_commit_start,
+									 inventory_commit_previous, 9876, false);
+		break;
+	case 1:
+		v2_checkpoint_wal_path(&inventory_fault_source.claim.identity, inventory_commit_start,
+							   inventory_fault_source.timeline, path);
+		UT_ASSERT_EQ(unlink(path), 0);
+		break;
+	case 2:
+		v2_checkpoint_root_race();
+		break;
+	case 3:
+		inputs_pin_current = false;
+		break;
+	case 4:
+		pg_re_throw();
+		break;
+	case 6:
+		(void)inventory_write_record(&inventory_fault_source, inventory_extra_start,
+									 inventory_extra_previous, RM_XLOG_ID, XLOG_NOOP, "abd", 3);
+		break;
+	case 7:
+		(void)inventory_write_fsm(&inventory_fault_source, inventory_extra_start,
+								  inventory_extra_previous, 32);
+		break;
+	case 5: {
+		/* Same ordinal and byte length, but no longer this native family.
+		 * Record-count equality must not erase the previously seen effect. */
+		uint8 bytes[128];
+		uint8 length;
+		int fd;
+
+		v2_checkpoint_wal_path(&inventory_fault_source.claim.identity, inventory_commit_start,
+							   inventory_fault_source.timeline, path);
+		fd = open(path, O_RDONLY);
+		UT_ASSERT(fd >= 0);
+		UT_ASSERT_EQ(
+			pread(fd, &length, 1, inventory_commit_start % wal_segment_size + SizeOfXLogRecord + 1),
+			1);
+		UT_ASSERT(length <= sizeof(bytes));
+		UT_ASSERT_EQ(pread(fd, bytes, length,
+						   inventory_commit_start % wal_segment_size + SizeOfXLogRecord + 2),
+					 length);
+		UT_ASSERT_EQ(close(fd), 0);
+		(void)inventory_write_record(&inventory_fault_source, inventory_commit_start,
+									 inventory_commit_previous, RM_XLOG_ID, XLOG_NOOP, bytes,
+									 length);
+		break;
+	}
+	}
+}
+
+UT_TEST(test_native_inventory_uses_two_real_cold_passes)
+{
+	ClusterWalInputsV1 *inputs = inventory_fixture(false, false);
+	ClusterRecoveryNativeInventory *inventory = NULL;
+	ClusterRecoveryNativeInventoryDiag diag;
+	ClusterRecoveryNativeEffect effect;
+	unsigned effects = 0, terminals = 0, messages = 0, creates = 0;
+	ClusterRecoveryNativeInventoryResult result;
+
+	UT_ASSERT_EQ(cluster_recovery_native_inventory_build(inputs, 1024 * 1024, &inventory, &diag),
+				 CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED);
+	UT_ASSERT_EQ(inventory_census_calls, 2);
+	UT_ASSERT_EQ(diag.sources, 2);
+	UT_ASSERT_EQ(diag.records, 6);
+	UT_ASSERT_EQ(diag.native_records, 4);
+	UT_ASSERT_EQ(diag.other_records, 2); /* checkpoints remain other obligations */
+	if (inventory != NULL) {
+		while ((result = cluster_recovery_native_inventory_next(inventory, &effect))
+			   == CLUSTER_RECOVERY_NATIVE_INVENTORY_EFFECT) {
+			effects++;
+			UT_ASSERT_EQ(effect.record->source.claim.identity.origin_thread_id,
+						 effect.record->cut.failed_thread);
+			UT_ASSERT(effect.record->read_lsn >= effect.record->cut.scan_begin_inclusive);
+			if (effect.kind == CLUSTER_RECOVERY_NATIVE_TERMINAL) {
+				terminals++;
+				UT_ASSERT(effect.record->xinfo & XACT_COMPLETION_FORCE_SYNC_COMMIT);
+				UT_ASSERT_EQ(effect.record->xact_time, 8765);
+				UT_ASSERT_EQ(effect.record->terminal_scn, 5906);
+			} else if (effect.kind == CLUSTER_RECOVERY_NATIVE_INVALIDATION)
+				messages++;
+			else if (effect.kind == CLUSTER_RECOVERY_NATIVE_CREATE)
+				creates++;
+		}
+		UT_ASSERT_EQ(result, CLUSTER_RECOVERY_NATIVE_INVENTORY_END);
+		UT_ASSERT_EQ(effects, 8);
+		UT_ASSERT_EQ(terminals, 2);
+		UT_ASSERT_EQ(messages, 4);
+		UT_ASSERT_EQ(creates, 2);
+	}
+	UT_ASSERT_EQ(inputs_peer_begins + inputs_native_begin_calls + inputs_native_flush_calls, 0);
+	cluster_recovery_native_inventory_destroy(inventory);
+	cold_census_done(&inputs);
+}
+
+UT_TEST(test_native_inventory_never_returns_partial_on_drift_io_or_error)
+{
+	for (inventory_fault = 0; inventory_fault < 6; inventory_fault++) {
+		ClusterWalInputsV1 *inputs = inventory_fixture(false, false);
+		ClusterRecoveryNativeInventory *inventory = NULL;
+		ClusterRecoveryNativeInventoryDiag diag;
+		bool threw = false;
+
+		inventory_between_passes = inventory_drift;
+		PG_TRY();
+		{
+			UT_ASSERT_NE(
+				cluster_recovery_native_inventory_build(inputs, 1024 * 1024, &inventory, &diag),
+				CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED);
+			if (inventory_fault == 0)
+				UT_ASSERT_EQ(diag.native_result, CLUSTER_RECOVERY_NATIVE_CHANGED);
+		}
+		PG_CATCH();
+		{
+			threw = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(threw, inventory_fault == 4);
+		UT_ASSERT(inventory == NULL);
+		inventory_between_passes = NULL;
+		inputs_pin_current = true;
+		cold_census_done(&inputs);
+	}
+}
+
+UT_TEST(test_native_inventory_capacity_is_not_partial_success)
+{
+	size_t required = 0;
+
+	for (unsigned mode = 0; mode < 3; mode++) {
+		ClusterWalInputsV1 *inputs = inventory_fixture(false, false);
+		ClusterRecoveryNativeInventory *inventory = NULL;
+		ClusterRecoveryNativeInventoryDiag diag;
+		size_t budget = mode == 0 ? 1024 * 1024 : required - (mode == 1);
+
+		UT_ASSERT_EQ(cluster_recovery_native_inventory_build(inputs, budget, &inventory, &diag),
+					 mode == 1 ? CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY
+							   : CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED);
+		if (mode == 0) {
+			required = diag.owned_bytes;
+			UT_ASSERT(required > 0 && required < budget);
+		} else if (mode == 1)
+			UT_ASSERT(inventory == NULL);
+		else
+			UT_ASSERT_EQ(diag.owned_bytes, budget);
+		cluster_recovery_native_inventory_destroy(inventory);
+		cold_census_done(&inputs);
+		if (required == 0)
+			break;
+	}
+}
+
+UT_TEST(test_native_inventory_open_unknown_and_online_never_observed)
+{
+	for (unsigned mode = 0; mode < 3; mode++) {
+		ClusterWalInputsV1 *inputs = inventory_fixture(mode == 1, mode == 0);
+		ClusterRecoveryNativeInventory *inventory = NULL;
+		ClusterRecoveryNativeInventoryDiag diag;
+
+		if (mode == 2) {
+			cold_census_done(&inputs);
+			UT_ASSERT_EQ(inputs_begin_for_role(false, &inputs), 0);
+		}
+		UT_ASSERT_NE(
+			cluster_recovery_native_inventory_build(inputs, 1024 * 1024, &inventory, &diag),
+			CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED);
+		UT_ASSERT(inventory == NULL);
+		if (mode == 0)
+			UT_ASSERT_EQ(diag.input_result, CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+		if (mode == 1) /* COMMIT bytes under a now-recognized PREPARE opcode */
+			UT_ASSERT_EQ(diag.native_result, CLUSTER_RECOVERY_NATIVE_SHAPE);
+		cold_census_done(&inputs);
+	}
+}
+
+static ClusterRecoveryRootSet *inventory_roots(ClusterWalInputsV1 *inputs, char path[MAXPGPATH],
+											   int *fd, bool mismatch);
+static void inventory_roots_done(ClusterRecoveryRootSet *roots, int fd, const char *path);
+
+UT_TEST(test_native_inventory_keeps_real_empty_sources_and_other_obligations)
+{
+	int saved_node = cluster_node_id;
+	uint64 saved_incarnation = test_self_incarnation;
+	ClusterRecoverySerialGuard serial;
+	ClusterThreadRecLaunchEligibility eligibility;
+	ClusterWalInputsV1 *inputs = NULL;
+	ClusterRecoveryNativeInventory *inventory = NULL;
+	ClusterRecoveryNativeInventoryDiag diag;
+	ClusterRecoveryNativeEffect effect;
+	ClusterRecoveryRootSet *roots = NULL;
+	char root_path[MAXPGPATH];
+	int root_fd = -1;
+	ControlRootImage root;
+	ControlFileData control;
+	ClusterControlRootFileToken token;
+	uint32 selected;
+
+	(void)pending_worker_fixture(&serial, &eligibility);
+	if (ut_current_failed)
+		goto cleanup;
+	test_worker_pin_held = false;
+	test_history_sync_count = 0;
+	test_history_fail_sync = UINT_MAX;
+	UT_ASSERT_EQ(thread_recovery_worker_run(&eligibility), CLUSTER_THREADREC_DONE);
+	test_history_fail_sync = 0;
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID, &root,
+															 &control, &token),
+				 0);
+	memset(&root.startup[3], 0, sizeof(root.startup[3]));
+	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+	v2_write_roots(root.bytes);
+	test_actual_cf = test_cf_mode = NoLock;
+	test_inputs_startup_cf = true;
+	UT_ASSERT_EQ(inputs_begin_for_role(true, &inputs), 0);
+	if (inputs == NULL)
+		goto cleanup;
+	selected = cluster_wal_inputs_count_v1(inputs);
+	inventory_census_calls = 0;
+	inventory_between_passes = NULL;
+	roots = inventory_roots(inputs, root_path, &root_fd, false);
+	UT_ASSERT_EQ(cluster_recovery_native_inventory_collect_roots(inputs, roots, 1024 * 1024,
+																 &inventory, &diag),
+				 CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED);
+	UT_ASSERT_EQ(inventory_census_calls, 2);
+	UT_ASSERT_EQ(diag.sources, selected);
+	UT_ASSERT_EQ(diag.native_records, 0);
+	UT_ASSERT_EQ(diag.records, diag.other_records);
+	UT_ASSERT(diag.other_records > 0);
+	UT_ASSERT_EQ(cluster_recovery_native_inventory_next(inventory, &effect),
+				 CLUSTER_RECOVERY_NATIVE_INVENTORY_END);
+	/* The empty terminal is represented, not conflated with a missing
+	 * source or with an all-producer recovery-complete graph. */
+	if (inventory != NULL) {
+		unsigned empty = 0;
+		for (uint32 i = 0; i < selected; i++)
+			empty += (inventory->sources[i].cut.flags & RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY) != 0;
+		UT_ASSERT_EQ(empty, 1);
+	}
+cleanup:
+	if (roots != NULL)
+		inventory_roots_done(roots, root_fd, root_path);
+	cluster_recovery_native_inventory_destroy(inventory);
+	cold_census_done(&inputs);
+	test_reserve_mode = false;
+	cluster_node_id = saved_node;
+	test_self_incarnation = saved_incarnation;
+}
+
+#include "test_cluster_recovery_native_transcript.inc"
+#include "test_cluster_recovery_wal_tt_roots.inc"
+#include "test_cluster_recovery_multixact_inputs.inc"
+#include "test_cluster_recovery_slru_inputs.inc"
+#include "test_cluster_recovery_xact_slru_inputs.inc"
+#include "test_cluster_recovery_multixact_join_inputs.inc"
+#include "test_cluster_recovery_census_inputs.inc"
+#include "test_cluster_recovery_xact_join_inputs.inc"
+#include "test_cluster_recovery_relmap_inputs.inc"
+#include "test_cluster_recovery_relmap_physical_inputs.inc"
+#include "test_cluster_recovery_prepare_inputs.inc"
+#include "test_cluster_recovery_manifest_inputs.inc"
+#include "test_cluster_recovery_terminal_inputs.inc"
+#include "test_cluster_recovery_tt_terminal_inputs.inc"
+
+int
+main(int argc, char **argv)
+{
+	(void)argc;
+	setvbuf(stdout, NULL, _IOLBF, 0);
+	test_program_path = argv[0];
+	setup_fixture();
+	UT_PLAN(76);
+	UT_RUN(test_native_inventory_uses_two_real_cold_passes);
+	UT_RUN(test_native_inventory_never_returns_partial_on_drift_io_or_error);
+	UT_RUN(test_native_inventory_capacity_is_not_partial_success);
+	UT_RUN(test_native_inventory_open_unknown_and_online_never_observed);
+	UT_RUN(test_native_inventory_keeps_real_empty_sources_and_other_obligations);
+	UT_RUN(test_native_inventory_detects_non_native_rewrite);
+	UT_RUN(test_native_inventory_collects_real_fsm_and_all_physical_roots);
+	UT_RUN(test_native_inventory_poison_targets_on_error_and_drift);
+	UT_RUN(test_record_transcript_full_fields_and_storage_independence);
+	UT_RUN(test_record_transcript_rejects_unsafe_bounds);
+	UT_RUN(test_final_input_recheck_preserves_effect_cursor_and_all_sources);
+	UT_RUN(test_final_input_recheck_is_sticky_on_bytes_scope_io_and_error);
+	UT_RUN(test_native_inventory_collects_undo_targets_from_real_retained_wal);
+	UT_RUN(test_cold_inventory_owns_undo_records_and_rechecks_after_export);
+	UT_RUN(test_cold_inventory_does_not_hide_invalid_undo_in_other_records);
+	UT_RUN(test_wal_heads_seed_reused_slots_through_real_files);
+	UT_RUN(test_wal_heads_require_prior_same_source_identity);
+	UT_RUN(test_wal_head_seeding_preserves_effect_cursor);
+	UT_RUN(test_wal_head_final_recheck_and_destroy_revoke_graph);
+	UT_RUN(test_wal_heads_reject_late_graph_and_partial_capacity);
+	UT_RUN(test_wal_head_bounded_search_and_lifecycle_barriers);
+	UT_RUN(test_cold_multixact_records_keep_all_shapes_and_origin_sources);
+	UT_RUN(test_cold_multixact_second_and_final_reads_revoke_observations);
+	UT_RUN(test_cold_multixact_unknown_and_bad_shapes_never_become_other);
+	UT_RUN(test_cold_mx_join_visits_all_saved_creates_and_preserves_effects);
+	UT_RUN(test_cold_mx_join_final_wal_drift_and_destroy_revoke_roots);
+	UT_RUN(test_cold_mx_join_refusal_poisons_inventory_and_partial_roots);
+	UT_RUN(test_owned_census_real_inputs_all_observation_families);
+	UT_RUN(test_owned_census_final_rereads_refuse_changes);
+	UT_RUN(test_owned_census_scope_loss_and_drained_invalidation);
+	UT_RUN(test_owned_census_missing_and_short_files_refuse);
+	UT_RUN(test_owned_census_error_releases_children);
+	UT_RUN(test_owned_census_open_input_and_budget_refuse);
+	UT_RUN(test_owned_census_destroy_each_phase);
+	UT_RUN(test_owned_census_target_obligations_keep_absence_extent_and_unsupported_forks);
+	UT_RUN(test_owned_census_target_join_and_final_observation_revoke_changed_inputs);
+	UT_RUN(test_owned_census_enumerates_raw_native_slru_slots);
+	UT_RUN(test_owned_census_native_slru_drift_and_scope_loss_revoke_outputs);
+	UT_RUN(test_cold_slru_records_keep_all_shapes_and_origin_targets);
+	UT_RUN(test_cold_slru_second_and_final_reads_revoke_the_union);
+	UT_RUN(test_cold_slru_bad_records_never_become_other);
+	UT_RUN(test_cold_terminal_assignment_target_union_without_zero);
+	UT_RUN(test_cold_child_record_drift_revokes_all_targets);
+	UT_RUN(test_owned_census_missing_or_short_terminal_clog_refuses);
+	UT_RUN(test_cold_commit_ts_keeps_original_profile_refusal);
+	UT_RUN(test_cold_xact_join_keeps_every_source_and_raw_effect);
+	UT_RUN(test_cold_xact_join_final_wal_roots_destroy_revoke_outputs);
+	UT_RUN(test_owned_xact_join_still_requires_final_whole_inputs);
+	UT_RUN(test_cold_relmap_owns_images_entries_and_all_target_paths);
+	UT_RUN(test_cold_relmap_second_and_final_reads_revoke_observations);
+	UT_RUN(test_cold_relmap_malformed_or_unknown_never_becomes_other);
+	UT_RUN(test_owned_census_maps_keep_all_copy_edges);
+	UT_RUN(test_owned_census_maps_final_root_and_wal_rechecks);
+	UT_RUN(test_owned_census_bad_map_revokes_all_children);
+	UT_RUN(test_cold_prepare_full_payload_and_polarities_remain_unowned);
+	UT_RUN(test_cold_prepare_two_pass_and_final_drift_revoke_roots);
+	UT_RUN(test_cold_prepare_invalid_or_completion_records_never_become_other);
+	UT_RUN(test_census_manifest_requires_original_final_reads);
+	UT_RUN(test_inventory_digest_binds_every_source_cut_tail_and_transcript);
+	UT_RUN(test_census_manifest_revokes_after_scope_or_dependency_loss);
+	UT_RUN(test_census_manifest_final_changes_never_export_partial);
+	UT_RUN(test_inventory_digest_canonical_sha256_and_failed_output);
+	UT_RUN(test_terminal_edges_keep_every_exact_and_native_carrier);
+	UT_RUN(test_terminal_edges_never_guess_missing_or_reused_bindings);
+	UT_RUN(test_terminal_edges_preserve_effects_and_final_revocation);
+	UT_RUN(test_terminal_binding_search_is_bounded);
+	UT_RUN(test_terminal_census_compares_original_physical_slots);
+	UT_RUN(test_terminal_census_final_changes_revoke_output);
+	UT_RUN(test_terminal_bad_exact_fields_refuse_and_revoke);
+	UT_RUN(test_terminal_lookup_exact_identity_and_unbound_records);
+	UT_RUN(test_terminal_lookup_consistent_and_conflicting_endpoints);
+	UT_RUN(test_terminal_lookup_bounded_query_and_key_change);
+	UT_RUN(test_terminal_lookup_final_input_drift_revokes);
+	UT_RUN(test_physical_tt_terminal_census_keeps_every_slot);
+	UT_RUN(test_physical_tt_terminal_census_final_rechecks);
+	UT_RUN(test_terminal_lookup_invalid_keys_and_incomplete_cursor_refuse);
+	UT_DONE();
+	return ut_failed_count != 0;
+}

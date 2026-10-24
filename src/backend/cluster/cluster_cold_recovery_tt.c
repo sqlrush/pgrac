@@ -1,0 +1,1235 @@
+/*-------------------------------------------------------------------------
+ *
+ * cluster_cold_recovery_tt.c
+ *    Original cold Startup ownership of raw persistent TT base inputs.
+ *
+ * Portions Copyright (c) 2026, pgrac contributors
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *    src/backend/cluster/cluster_cold_recovery_tt.c
+ *
+ * NOTES
+ *    PGRAC-original. Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md
+ *    This captures bytes, not checkpoint coverage or transaction outcomes.
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "access/htup_details.h"
+#include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_recovery_undo_scan.h"
+#include "cluster/cluster_side_online_plan.h"
+#include "cluster/cluster_uba.h"
+#include "cluster/cluster_undo_segment.h"
+#include "cluster/cluster_undo_segment_init.h"
+#include "cluster/storage/cluster_shared_fs.h"
+#include "cluster/storage/cluster_undo_alloc.h"
+#include "storage/fd.h"
+#include "utils/memutils.h"
+
+#define COLD_TT_MAX_ORIGINS UNDO_OWNER_INSTANCE_MAX
+
+typedef struct ColdTtInputV1 {
+	struct ColdTtInputV1 *next;
+	uint8 owner;
+	uint32 segment;
+	dev_t device;
+	ino_t inode;
+	off_t size;
+	PGAlignedBlock block;
+} ColdTtInputV1;
+
+typedef struct ColdTtBlockV1 {
+	struct ColdTtBlockV1 *next;
+	const ColdTtInputV1 *file;
+	uint32 block;
+	PGAlignedBlock bytes;
+} ColdTtBlockV1;
+
+typedef struct ClusterColdTtBaseV1 {
+	bool owners[COLD_TT_MAX_ORIGINS + 1];
+	uint64 system_identifier;
+	uint64 database_incarnation;
+	ColdTtInputV1 *first;
+	ColdTtInputV1 *last;
+	ColdTtBlockV1 *blocks;
+	Size used;
+	Size budget;
+	uint32 count;
+	ClusterColdDetailV1 detail;
+	bool captured;
+} ClusterColdTtBaseV1;
+
+static const ColdTtBlockV1 *cold_tt_undo_block(const ClusterColdTypedV1 *typed, bool after_redo,
+											   uint32 segment, uint32 blockno, bool fresh);
+
+typedef enum ColdTtReadV1 { COLD_TT_ABSENT, COLD_TT_PRESENT, COLD_TT_UNREADABLE } ColdTtReadV1;
+
+static bool
+cold_tt_owners(const ClusterColdTypedV1 *typed, bool *owners)
+{
+	memset(owners, 0, sizeof(bool) * (COLD_TT_MAX_ORIGINS + 1));
+	if (typed == NULL || typed->participant_count == 0
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS)
+		return false;
+	for (uint32 i = 0; i < typed->participant_count; i++) {
+		uint16 owner = typed->participants[i].thread_id;
+
+		if (owner == 0 || owner > COLD_TT_MAX_ORIGINS)
+			return false;
+		/* Different WAL generations may name the same physical TT origin. */
+		owners[owner] = true;
+	}
+	return true;
+}
+
+static bool
+cold_tt_same_file(const struct stat *a, const struct stat *b)
+{
+	return S_ISREG(a->st_mode) && S_ISREG(b->st_mode) && a->st_dev == b->st_dev
+		   && a->st_ino == b->st_ino && a->st_size == b->st_size;
+}
+
+/* No create, mutation, scope admission or fsync. The original Startup owns
+ * source selection and isolation; a path lookup grants neither. ENOENT is
+ * the only absent result. Do not use an observer's optional-file policy. */
+static ColdTtReadV1
+cold_tt_read(uint8 owner, uint32 segment, ColdTtInputV1 *input)
+{
+	char path[MAXPGPATH];
+	struct stat before, after, named;
+	ColdTtReadV1 result = COLD_TT_UNREADABLE;
+	int flags = O_RDONLY | PG_BINARY;
+	int fd;
+
+#ifdef O_NOFOLLOW
+	flags |= O_NOFOLLOW;
+#endif
+	if (cluster_shared_fs_undo_path_resolve(owner, segment, path, sizeof(path)) != 0)
+		return COLD_TT_UNREADABLE;
+	fd = BasicOpenFile(path, flags);
+	if (fd < 0)
+		return errno == ENOENT ? COLD_TT_ABSENT : COLD_TT_UNREADABLE;
+	if (fstat(fd, &before) != 0 || !S_ISREG(before.st_mode)
+		|| before.st_size != UNDO_SEGMENT_SIZE_BYTES)
+		goto done;
+	if (pg_pread(fd, input->block.data, BLCKSZ, 0) != BLCKSZ)
+		goto done;
+	/* Keep damaged bytes only as an opaque, stable file observation. They
+	 * cannot supply a TT identity or DATA ancestry; sealed INIT/REUSE redo
+	 * must reconstruct the entire header before any such fact is exported. */
+	if (cluster_undo_segment_header_integrity(input->block.data) != CLUSTER_UNDO_HEADER_CORRUPT
+		&& !UndoSegmentHeader_identity_matches(input->block.data, segment, owner))
+		goto done;
+	if (fstat(fd, &after) != 0 || lstat(path, &named) != 0 || !cold_tt_same_file(&before, &after)
+		|| !cold_tt_same_file(&after, &named))
+		goto done;
+	input->owner = owner;
+	input->segment = segment;
+	input->device = after.st_dev;
+	input->inode = after.st_ino;
+	input->size = after.st_size;
+	result = COLD_TT_PRESENT;
+done:
+	if (close(fd) != 0)
+		result = COLD_TT_UNREADABLE;
+	return result;
+}
+
+/* The original owner still supplies isolation. Bind the DATA read to the
+ * captured file identity and complete block zero, not just a segment number. */
+static bool
+cold_tt_read_data(const ColdTtInputV1 *input, uint32 block, char *bytes)
+{
+	char path[MAXPGPATH];
+	PGAlignedBlock header;
+	struct stat before, after, named;
+	int flags = O_RDONLY | PG_BINARY;
+	int fd;
+	bool result = false;
+
+	if (cluster_undo_segment_header_integrity(input->block.data) == CLUSTER_UNDO_HEADER_CORRUPT)
+		return false;
+#ifdef O_NOFOLLOW
+	flags |= O_NOFOLLOW;
+#endif
+	if (cluster_shared_fs_undo_path_resolve(input->owner, input->segment, path, sizeof(path)) != 0)
+		return false;
+	fd = BasicOpenFile(path, flags);
+	if (fd < 0)
+		return false;
+	if (fstat(fd, &before) != 0 || !S_ISREG(before.st_mode) || before.st_dev != input->device
+		|| before.st_ino != input->inode || before.st_size != input->size)
+		goto done;
+	if (pg_pread(fd, bytes, BLCKSZ, (off_t)block * BLCKSZ) != BLCKSZ || fstat(fd, &after) != 0
+		|| lstat(path, &named) != 0 || !cold_tt_same_file(&before, &after)
+		|| !cold_tt_same_file(&after, &named))
+		goto done;
+	if (pg_pread(fd, header.data, BLCKSZ, 0) != BLCKSZ
+		|| memcmp(header.data, input->block.data, BLCKSZ) != 0 || fstat(fd, &after) != 0
+		|| lstat(path, &named) != 0 || !cold_tt_same_file(&before, &after)
+		|| !cold_tt_same_file(&after, &named))
+		goto done;
+	result = true;
+done:
+	if (close(fd) != 0)
+		result = false;
+	return result;
+}
+
+static void
+cold_tt_clear(ClusterColdTtBaseV1 *base)
+{
+	ColdTtInputV1 *input = base->first;
+	ColdTtBlockV1 *block = base->blocks;
+
+	while (block != NULL) {
+		ColdTtBlockV1 *next = block->next;
+
+		pfree(block);
+		block = next;
+	}
+	base->blocks = NULL;
+
+	while (input != NULL) {
+		ColdTtInputV1 *next = input->next;
+
+		pfree(input);
+		input = next;
+	}
+	base->first = base->last = NULL;
+	base->count = 0;
+	base->used = sizeof(*base);
+}
+
+static ClusterColdDetailV1
+cold_tt_capture(ClusterColdTypedV1 *typed, Size budget, ClusterColdTtBaseV1 **target)
+{
+	ClusterColdTtBaseV1 *base;
+	bool owners[COLD_TT_MAX_ORIGINS + 1];
+
+	if (!cold_tt_owners(typed, owners))
+		return CLUSTER_COLD_PARTICIPANT_INVALID;
+	if (*target != NULL)
+		return CLUSTER_COLD_STATE;
+	if (budget < sizeof(*base))
+		return CLUSTER_COLD_CAPACITY;
+	base = palloc_extended(sizeof(*base), MCXT_ALLOC_NO_OOM | MCXT_ALLOC_ZERO);
+	if (base == NULL)
+		return CLUSTER_COLD_OOM;
+	*target = base;
+	base->used = sizeof(*base);
+	base->budget = budget;
+	base->detail = CLUSTER_COLD_SOURCE_GAP;
+	base->system_identifier = typed->system_identifier;
+	base->database_incarnation = typed->observer.database_incarnation;
+	memcpy(base->owners, owners, sizeof(owners));
+	for (uint16 owner = 1; owner <= COLD_TT_MAX_ORIGINS; owner++) {
+		if (!owners[owner])
+			continue;
+		for (uint32 n = 0; n < CLUSTER_UNDO_SEGS_PER_INSTANCE; n++) {
+			uint32 segment = (owner - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + n + 1;
+			ColdTtInputV1 observed = { 0 };
+			ColdTtInputV1 *saved;
+			ColdTtReadV1 result = cold_tt_read((uint8)owner, segment, &observed);
+
+			if (result == COLD_TT_ABSENT)
+				continue;
+			if (result != COLD_TT_PRESENT)
+				goto refused;
+			if (sizeof(*saved) > base->budget - base->used) {
+				base->detail = CLUSTER_COLD_CAPACITY;
+				goto refused;
+			}
+			saved = palloc_extended(sizeof(*saved), MCXT_ALLOC_NO_OOM);
+			if (saved == NULL) {
+				base->detail = CLUSTER_COLD_OOM;
+				goto refused;
+			}
+			*saved = observed;
+			saved->next = NULL;
+			if (base->last == NULL)
+				base->first = saved;
+			else
+				base->last->next = saved;
+			base->last = saved;
+			base->count++;
+			base->used += sizeof(*saved);
+		}
+	}
+	base->captured = true;
+	base->detail = CLUSTER_COLD_OK;
+	return CLUSTER_COLD_OK;
+refused:
+	cold_tt_clear(base);
+	return base->detail;
+}
+
+ClusterColdDetailV1
+cluster_cold_tt_base_capture_v1(ClusterColdTypedV1 *typed, Size budget)
+{
+	if (typed == NULL)
+		return CLUSTER_COLD_PARTICIPANT_INVALID;
+	return cold_tt_capture(typed, budget, &typed->tt_base);
+}
+
+static ClusterColdDetailV1
+cold_tt_recheck(ClusterColdTypedV1 *typed, ClusterColdTtBaseV1 *base)
+{
+	ColdTtInputV1 *saved;
+	bool owners[COLD_TT_MAX_ORIGINS + 1];
+
+	if (typed == NULL || base == NULL)
+		return CLUSTER_COLD_STATE;
+	if (!base->captured || base->detail != CLUSTER_COLD_OK)
+		return base->detail;
+	/* Any interruption or refusal leaves the snapshot unusable. */
+	base->detail = CLUSTER_COLD_SOURCE_GAP;
+	if (!cold_tt_owners(typed, owners) || memcmp(owners, base->owners, sizeof(owners)) != 0)
+		return base->detail;
+	saved = base->first;
+	for (uint16 owner = 1; owner <= COLD_TT_MAX_ORIGINS; owner++) {
+		if (!owners[owner])
+			continue;
+		for (uint32 n = 0; n < CLUSTER_UNDO_SEGS_PER_INSTANCE; n++) {
+			uint32 segment = (owner - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + n + 1;
+			ColdTtInputV1 observed = { 0 };
+			ColdTtReadV1 result = cold_tt_read((uint8)owner, segment, &observed);
+			bool expected = saved != NULL && saved->owner == owner && saved->segment == segment;
+
+			if (result == COLD_TT_UNREADABLE || expected != (result == COLD_TT_PRESENT))
+				return base->detail;
+			if (!expected)
+				continue;
+			if (saved->device != observed.device || saved->inode != observed.inode
+				|| saved->size != observed.size
+				|| memcmp(saved->block.data, observed.block.data, BLCKSZ) != 0)
+				return base->detail;
+			saved = saved->next;
+		}
+	}
+	if (saved != NULL)
+		return base->detail;
+	for (const ColdTtBlockV1 *block = base->blocks; block != NULL; block = block->next) {
+		PGAlignedBlock observed;
+
+		if (!cold_tt_read_data(block->file, block->block, observed.data)
+			|| memcmp(block->bytes.data, observed.data, BLCKSZ) != 0)
+			return base->detail;
+	}
+	base->detail = CLUSTER_COLD_OK;
+	return CLUSTER_COLD_OK;
+}
+
+ClusterColdDetailV1
+cluster_cold_tt_base_recheck_v1(ClusterColdTypedV1 *typed)
+{
+	return cold_tt_recheck(typed, typed == NULL ? NULL : typed->tt_base);
+}
+
+static void
+cold_tt_destroy(ClusterColdTtBaseV1 **target)
+{
+	ClusterColdTtBaseV1 *base = *target;
+
+	if (base == NULL)
+		return;
+	*target = NULL;
+	cold_tt_clear(base);
+	pfree(base);
+}
+
+void
+cluster_cold_tt_after_redo_reset_v1(ClusterColdTypedV1 *typed)
+{
+	if (typed != NULL) {
+		if (typed->top_tx_census != NULL) {
+			pfree(typed->top_tx_census);
+			typed->top_tx_census = NULL;
+		}
+		cold_tt_destroy(&typed->tt_after_redo);
+	}
+}
+
+void
+cluster_cold_tt_base_destroy_v1(ClusterColdTypedV1 *typed)
+{
+	if (typed == NULL)
+		return;
+	cluster_cold_tt_after_redo_reset_v1(typed);
+	cold_tt_destroy(&typed->tt_base);
+}
+
+uint32
+cluster_cold_tt_base_count_v1(const ClusterColdTypedV1 *typed)
+{
+	if (typed == NULL || typed->tt_base == NULL || !typed->tt_base->captured
+		|| typed->tt_base->detail != CLUSTER_COLD_OK)
+		return 0;
+	return typed->tt_base->count;
+}
+
+const UndoSegmentHeaderData *
+cluster_cold_tt_base_header_v1(const ClusterColdTypedV1 *typed, uint32 index, uint8 *owner,
+							   uint32 *segment)
+{
+	const ColdTtInputV1 *input;
+
+	if (owner == NULL || segment == NULL || index >= cluster_cold_tt_base_count_v1(typed))
+		return NULL;
+	input = typed->tt_base->first;
+	while (index-- > 0)
+		input = input->next;
+	*owner = input->owner;
+	*segment = input->segment;
+	return (const UndoSegmentHeaderData *)input->block.data;
+}
+
+static bool
+cold_tt_namespace_matches(const ClusterColdTypedV1 *typed, const ClusterColdTtBaseV1 *base)
+{
+	bool owners[COLD_TT_MAX_ORIGINS + 1];
+
+	return typed != NULL && base != NULL && base->captured && base->detail == CLUSTER_COLD_OK
+		   && base->system_identifier != 0 && base->database_incarnation != 0
+		   && typed->system_identifier == base->system_identifier
+		   && typed->observer.database_incarnation == base->database_incarnation
+		   && cold_tt_owners(typed, owners) && memcmp(owners, base->owners, sizeof(owners)) == 0;
+}
+
+bool
+cluster_cold_tt_base_namespace_matches_v1(const ClusterColdTypedV1 *typed, uint64 system_identifier,
+										  uint64 database_incarnation)
+{
+	return typed != NULL && typed->refusal == CLUSTER_COLD_OK
+		   && cold_tt_namespace_matches(typed, typed->tt_base)
+		   && typed->system_identifier == system_identifier
+		   && typed->observer.database_incarnation == database_incarnation;
+}
+
+ClusterColdDetailV1
+cluster_cold_tt_after_redo_capture_v1(ClusterColdTypedV1 *typed)
+{
+	const ClusterColdTtBaseV1 *base;
+	ClusterColdTtBaseV1 *after;
+	ClusterColdDetailV1 detail;
+
+	/* The caller temporarily marks the attempt incomplete while checking all
+	 * original sources. Namespace and pre-redo input must remain intact. */
+	if (typed == NULL || !cold_tt_namespace_matches(typed, typed->tt_base))
+		return CLUSTER_COLD_SOURCE_GAP;
+	base = typed->tt_base;
+	if (typed->tt_after_redo != NULL)
+		return CLUSTER_COLD_STATE;
+	if (base->used > base->budget)
+		return CLUSTER_COLD_CAPACITY;
+	detail = cold_tt_capture(typed, base->budget - base->used, &typed->tt_after_redo);
+	if (detail != CLUSTER_COLD_OK)
+		return detail;
+	after = typed->tt_after_redo;
+	after->captured = false;
+	after->detail = CLUSTER_COLD_SOURCE_GAP;
+	/* Retain a separate post-redo image of each already cached UNDO block.
+	 * Bind it to the new header and file identity; preserve the preimage. */
+	for (const ColdTtBlockV1 *before = base->blocks; before != NULL; before = before->next) {
+		const ColdTtInputV1 *file;
+		ColdTtBlockV1 *saved;
+
+		for (file = after->first; file != NULL; file = file->next)
+			if (file->owner == before->file->owner && file->segment == before->file->segment)
+				break;
+		if (file == NULL)
+			goto refused;
+		if (sizeof(*saved) > after->budget - after->used) {
+			after->detail = CLUSTER_COLD_CAPACITY;
+			goto refused;
+		}
+		saved = palloc_extended(sizeof(*saved), MCXT_ALLOC_NO_OOM);
+		if (saved == NULL) {
+			after->detail = CLUSTER_COLD_OOM;
+			goto refused;
+		}
+		if (!cold_tt_read_data(file, before->block, saved->bytes.data)) {
+			pfree(saved);
+			goto refused;
+		}
+		saved->file = file;
+		saved->block = before->block;
+		saved->next = after->blocks;
+		after->blocks = saved;
+		after->used += sizeof(*saved);
+	}
+	after->captured = true;
+	after->detail = CLUSTER_COLD_OK;
+	return CLUSTER_COLD_OK;
+refused:
+	cold_tt_clear(after);
+	return after->detail;
+}
+
+ClusterColdDetailV1
+cluster_cold_tt_after_redo_recheck_v1(ClusterColdTypedV1 *typed)
+{
+	if (typed == NULL || typed->tt_after_redo == NULL)
+		return CLUSTER_COLD_STATE;
+	if (!cold_tt_namespace_matches(typed, typed->tt_base)
+		|| !cold_tt_namespace_matches(typed, typed->tt_after_redo)) {
+		typed->tt_after_redo->detail = CLUSTER_COLD_SOURCE_GAP;
+		return CLUSTER_COLD_SOURCE_GAP;
+	}
+	return cold_tt_recheck(typed, typed->tt_after_redo);
+}
+
+uint32
+cluster_cold_tt_after_redo_count_v1(const ClusterColdTypedV1 *typed)
+{
+	if (!cluster_cold_tt_after_redo_namespace_matches_v1(typed))
+		return 0;
+	return typed->tt_after_redo->count;
+}
+
+bool
+cluster_cold_tt_after_redo_namespace_matches_v1(const ClusterColdTypedV1 *typed)
+{
+	return typed != NULL && typed->refusal == CLUSTER_COLD_OK
+		   && cold_tt_namespace_matches(typed, typed->tt_base)
+		   && cold_tt_namespace_matches(typed, typed->tt_after_redo);
+}
+
+static bool
+cold_tt_block_write(const RfSideOnlineOperationV1 *operation)
+{
+	return operation->kind == RF_SIDE_ONLINE_OPERATION_UNDO
+		   && (operation->undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
+			   || operation->undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI);
+}
+
+/* Exact native fold/readback does not itself decode records. Address the
+ * first record only to invoke the original reader's complete block checks,
+ * including inherited records that a delta did not replace. Then qualify
+ * each full before-image for the existing heap consumer. Physical raw
+ * identities remain independent of any WAL actor or selected loser. */
+static bool
+cold_tt_undo_records(const ColdTtBlockV1 *after)
+{
+	const ColdTtInputV1 *file = after->file;
+	UndoBlockHeader block;
+	UndoSlotDirEntry slot;
+	UndoRecordHeader header;
+	ClusterRecoveryUndoRecord record;
+	UBA address;
+
+	if (file->owner == 0 || file->owner > UNDO_OWNER_INSTANCE_MAX || file->segment == 0
+		|| file->segment > UINT16_MAX || after->block == 0)
+		return false;
+	memcpy(&block, after->bytes.data, sizeof(block));
+	memcpy(&slot, after->bytes.data + UNDO_SLOT_DIR_OFFSET(0), sizeof(slot));
+	if (!cluster_undo_record_slot_range_valid(block.slot_count, 0, slot.record_offset,
+											  slot.record_length)
+		|| slot.record_length < sizeof(header))
+		return false;
+	memcpy(&header, after->bytes.data + slot.record_offset, sizeof(header));
+	if (header.tt_slot_id == 0 || header.tt_slot_id > TT_SLOTS_PER_SEGMENT)
+		return false;
+	address = uba_encode(file->segment, after->block, header.tt_slot_id - 1, 0);
+	if (cluster_recovery_undo_record_read(after->bytes.data, BLCKSZ, file->segment, after->block,
+										  file->owner, address, &record)
+		!= CLUSTER_RECOVERY_UNDO_ENTRY)
+		return false;
+	/* The original reader checked every range and payload in this immutable
+	 * block. Reuse those bounds without decoding the whole block per row. */
+	for (uint16 row = 0; row < block.slot_count; row++) {
+		const char *payload;
+		uint16 image_offset, image_length;
+		uint8 hoff;
+
+		memcpy(&slot, after->bytes.data + UNDO_SLOT_DIR_OFFSET(row), sizeof(slot));
+		memcpy(&header, after->bytes.data + slot.record_offset, sizeof(header));
+		payload = after->bytes.data + slot.record_offset + sizeof(header);
+		if (header.record_type == UNDO_RECORD_UPDATE) {
+			UndoUpdatePayload update;
+
+			memcpy(&update, payload, sizeof(update));
+			image_offset = update.old_tuple_offset;
+			image_length = update.old_tuple_length;
+		} else if (header.record_type == UNDO_RECORD_DELETE) {
+			UndoDeletePayload deleted;
+
+			memcpy(&deleted, payload, sizeof(deleted));
+			image_offset = deleted.full_tuple_offset;
+			image_length = deleted.full_tuple_length;
+		} else
+			continue;
+		if (image_length < SizeofHeapTupleHeader)
+			return false;
+		memcpy(&hoff, payload + image_offset + offsetof(HeapTupleHeaderData, t_hoff), sizeof(hoff));
+		if (hoff < SizeofHeapTupleHeader || hoff > image_length)
+			return false;
+	}
+	return true;
+}
+
+bool
+cluster_cold_tt_after_redo_undo_matches_v1(const ClusterColdTypedV1 *typed)
+{
+	Size originals = 0, uncached = 0, posts = 0;
+
+	if (!cluster_cold_tt_after_redo_namespace_matches_v1(typed) || typed->replay_count == 0
+		|| typed->replay_count > typed->participant_count)
+		return false;
+	for (const ColdTtBlockV1 *before = typed->tt_base->blocks; before != NULL;
+		 before = before->next) {
+		const ColdTtBlockV1 *after;
+		PGAlignedBlock expected;
+		uint32 p, index;
+		uint8 owner = before->file->owner;
+		uint32 segment = before->file->segment;
+
+		for (after = typed->tt_after_redo->blocks; after != NULL; after = after->next)
+			if (after->file->owner == owner && after->file->segment == segment
+				&& after->block == before->block)
+				break;
+		if (after == NULL)
+			return false;
+		for (p = 0; p < typed->replay_count; p++)
+			if (typed->participants[p].thread_id == owner)
+				break;
+		if (p < typed->replay_count) {
+			if (cluster_cold_tt_header_find_v1(typed, false, owner, segment, &index) == NULL
+				|| !cluster_cold_typed_undo_base_redo_block_v1(typed, p, index, before->block,
+															   &before->bytes, &expected))
+				return false;
+		} else
+			expected = before->bytes;
+		if (memcmp(after->bytes.data, expected.data, BLCKSZ) != 0)
+			return false;
+		originals++;
+	}
+	/* A replayed write is an effect even when no TT chain read cached its
+	 * predecessor. Only the original native FPI fold can supply those expected
+	 * bytes; observed DATA must never become its own missing predecessor. */
+	for (uint32 p = 0; p < typed->replay_count; p++) {
+		const RfSideOnlinePlanV1 *plan = typed->side_plans[p];
+		uint32 count = rf_side_online_plan_operation_count_v1(plan);
+
+		if (count == UINT32_MAX)
+			return false;
+		for (uint32 i = 0; i < count; i++) {
+			RfSideOnlineOperationV1 operation;
+			const ColdTtBlockV1 *before, *after;
+			RfSideUndoBlockImageV1 expected;
+			bool duplicate = false;
+
+			if (!rf_side_online_plan_operation_v1(plan, i, &operation))
+				return false;
+			if (operation.history_only || !cold_tt_block_write(&operation))
+				continue;
+			if (operation.undo.instance != typed->participants[p].thread_id)
+				return false;
+			for (before = typed->tt_base->blocks; before != NULL; before = before->next)
+				if (before->file->owner == operation.undo.instance
+					&& before->file->segment == operation.undo.segment_id
+					&& before->block == operation.undo.block_no)
+					break;
+			if (before != NULL)
+				continue; /* Already compared with its retained original above. */
+			for (uint32 j = 0; j < i; j++) {
+				RfSideOnlineOperationV1 prior;
+
+				if (!rf_side_online_plan_operation_v1(plan, j, &prior))
+					return false;
+				if (!prior.history_only && cold_tt_block_write(&prior)
+					&& prior.undo.instance == operation.undo.instance
+					&& prior.undo.segment_id == operation.undo.segment_id
+					&& prior.undo.block_no == operation.undo.block_no) {
+					duplicate = true;
+					break;
+				}
+			}
+			if (duplicate)
+				continue;
+			if (rf_side_online_plan_prepare_undo_block_v1(plan, operation.undo.instance,
+														  operation.undo.segment_id,
+														  operation.undo.block_no, &expected)
+				!= RF_PAGE_PROOF_DETAIL_OK)
+				return false;
+			after = cold_tt_undo_block(typed, true, operation.undo.segment_id,
+									   operation.undo.block_no, true);
+			if (after == NULL || memcmp(after->bytes.data, expected.page.data, BLCKSZ) != 0)
+				return false;
+			uncached++;
+		}
+	}
+	for (const ColdTtBlockV1 *after = typed->tt_after_redo->blocks; after != NULL;
+		 after = after->next) {
+		if (!cold_tt_undo_records(after))
+			return false;
+		posts++;
+	}
+	return originals + uncached == posts;
+}
+
+typedef struct ColdTtAfterRedoGraphInputV1 {
+	const ClusterColdTypedV1 *typed;
+} ColdTtAfterRedoGraphInputV1;
+
+static ClusterRecoveryGraphResult
+cold_tt_after_redo_graph_read(void *arg, const ClusterRecoveryTxnKey *key, UBA address,
+							  ClusterRecoveryUndoRecord *record, uint32 *generation)
+{
+	const ColdTtAfterRedoGraphInputV1 *input = arg;
+	const ColdTtBlockV1 *block;
+	uint32 segment, blockno;
+	uint16 offset, row;
+
+	if (record != NULL)
+		memset(record, 0, sizeof(*record));
+	if (generation != NULL)
+		*generation = 0;
+	if (input == NULL || input->typed == NULL || key == NULL || record == NULL || generation == NULL
+		|| !uba_decode_record(address, &segment, &blockno, &offset, &row))
+		return CLUSTER_RECOVERY_GRAPH_INVALID;
+	/* Only already retained, native-fold-verified post-redo blocks may supply
+	 * members. A miss cannot fetch DATA or refresh this immutable snapshot. */
+	for (block = input->typed->tt_after_redo->blocks; block != NULL; block = block->next)
+		if (block->file->owner == key->origin_node_id + 1 && block->file->segment == segment
+			&& block->block == blockno)
+			break;
+	if (block == NULL
+		|| cluster_recovery_undo_record_read(block->bytes.data, BLCKSZ, segment, blockno,
+											 block->file->owner, address, record)
+			   != CLUSTER_RECOVERY_UNDO_ENTRY)
+		return CLUSTER_RECOVERY_GRAPH_CORRUPT;
+	/* A spill segment has its own physical generation. The original graph
+	 * separately validates every record against the canonical TT key. */
+	*generation = ((const UndoSegmentHeaderData *)block->file->block.data)->wrap_count;
+	return CLUSTER_RECOVERY_GRAPH_RECORD;
+}
+
+bool
+cluster_cold_tt_after_redo_undo_chain_matches_v1(const ClusterColdTypedV1 *typed,
+												 const ClusterColdTtSlotKeyV1 *key)
+{
+	const UndoSegmentHeaderData *header;
+	const TTSlot *slot;
+	ColdTtAfterRedoGraphInputV1 input = { typed };
+	ClusterRecoveryTxnKey transaction;
+	ClusterRecoveryReferenceGraph *graph = NULL;
+	ClusterRecoveryGraphRecord record;
+	ClusterRecoveryGraphResult result;
+	Size remaining;
+
+	if (key == NULL || key->owner_instance == 0 || key->owner_instance > COLD_TT_MAX_ORIGINS
+		|| key->segment_id == 0
+		|| (key->segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 != key->owner_instance
+		|| key->slot_offset >= TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(key->xid)
+		|| key->slot_wrap == TT_WRAP_INVALID
+		|| (header = cluster_cold_tt_header_find_v1(typed, true, key->owner_instance,
+													key->segment_id, NULL))
+			   == NULL
+		|| cluster_undo_segment_header_integrity(header) == CLUSTER_UNDO_HEADER_CORRUPT
+		|| typed->system_identifier == 0 || typed->observer.database_incarnation == 0)
+		return false;
+	slot = &header->tt_slots[key->slot_offset];
+	if (header->wrap_count != key->segment_generation || slot->status != TT_SLOT_ACTIVE
+		|| slot->xid != key->xid || slot->wrap != key->slot_wrap)
+		return false;
+	/* Empty is neutral here. It cannot qualify transaction effects or an old
+	 * checkpoint base; the original C0 producer retains those separate gates. */
+	if (UBA_is_invalid(slot->first_undo_block))
+		return true;
+	/* The graph is temporary, but shares the captures' original total budget.
+	 * Account for later base reads as well as the post-capture's own limit. */
+	if (typed->tt_base->used > typed->tt_base->budget
+		|| typed->tt_after_redo->used > typed->tt_after_redo->budget)
+		return false;
+	remaining = typed->tt_base->budget - typed->tt_base->used;
+	if (typed->tt_after_redo->used > remaining)
+		return false;
+	remaining -= typed->tt_after_redo->used;
+	remaining = Min(remaining, typed->tt_after_redo->budget - typed->tt_after_redo->used);
+	transaction
+		= (ClusterRecoveryTxnKey){ .system_identifier = typed->system_identifier,
+								   .database_incarnation = typed->observer.database_incarnation,
+								   .segment_id = key->segment_id,
+								   .segment_generation = key->segment_generation,
+								   .xid = key->xid,
+								   .origin_node_id = key->owner_instance - 1,
+								   .slot_offset = key->slot_offset,
+								   .slot_wrap = key->slot_wrap };
+	result = cluster_recovery_reference_graph_begin(remaining, cold_tt_after_redo_graph_read,
+													&input, &graph);
+	if (result != CLUSTER_RECOVERY_GRAPH_MORE)
+		return false;
+	result = cluster_recovery_reference_graph_add(graph, &transaction, slot->first_undo_block);
+	while (result == CLUSTER_RECOVERY_GRAPH_MORE || result == CLUSTER_RECOVERY_GRAPH_RECORD)
+		result = cluster_recovery_reference_graph_step(graph, &record);
+	/* DRAINED includes the original graph's second reads and order/cycle
+	 * checks. It qualifies this supplied chain, never all transaction effects. */
+	cluster_recovery_reference_graph_destroy(graph);
+	return result == CLUSTER_RECOVERY_GRAPH_DRAINED;
+}
+
+const UndoSegmentHeaderData *
+cluster_cold_tt_header_find_v1(const ClusterColdTypedV1 *typed, bool after_redo, uint8 owner,
+							   uint32 segment, uint32 *index)
+{
+	const ClusterColdTtBaseV1 *base;
+	uint32 i = 0;
+
+	if (index != NULL)
+		*index = UINT32_MAX;
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK
+		|| !cold_tt_namespace_matches(typed, typed->tt_base)
+		|| (after_redo && !cluster_cold_tt_after_redo_namespace_matches_v1(typed)))
+		return NULL;
+	base = after_redo ? typed->tt_after_redo : typed->tt_base;
+	for (const ColdTtInputV1 *input = base->first; input != NULL; input = input->next, i++) {
+		if (input->owner != owner || input->segment != segment)
+			continue;
+		if (index != NULL)
+			*index = i;
+		return (const UndoSegmentHeaderData *)input->block.data;
+	}
+	return NULL;
+}
+
+const UndoSegmentHeaderData *
+cluster_cold_tt_after_redo_header_v1(const ClusterColdTypedV1 *typed, uint32 index, uint8 *owner,
+									 uint32 *segment)
+{
+	const ColdTtInputV1 *input;
+
+	if (owner != NULL)
+		*owner = 0;
+	if (segment != NULL)
+		*segment = 0;
+	if (owner == NULL || segment == NULL || index >= cluster_cold_tt_after_redo_count_v1(typed))
+		return NULL;
+	input = typed->tt_after_redo->first;
+	while (index-- > 0)
+		input = input->next;
+	*owner = input->owner;
+	*segment = input->segment;
+	return (const UndoSegmentHeaderData *)input->block.data;
+}
+
+static void
+cold_tt_slot_copy(const ColdTtInputV1 *input, uint32 slot_offset, ClusterColdTtSlotInputV1 *out)
+{
+	const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)input->block.data;
+	const TTSlot *slot = &header->tt_slots[slot_offset];
+
+	out->key.owner_instance = input->owner;
+	out->key.segment_id = input->segment;
+	out->key.segment_generation = header->wrap_count;
+	out->key.slot_offset = slot_offset;
+	out->key.xid = slot->xid;
+	out->key.slot_wrap = slot->wrap;
+	out->slot = *slot;
+}
+
+static bool
+cold_tt_slot(const ClusterColdTtBaseV1 *base, uint32 count, uint32 segment_index,
+			 uint32 slot_offset, ClusterColdTtSlotInputV1 *out)
+{
+	const ColdTtInputV1 *input;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (slot_offset >= TT_SLOTS_PER_SEGMENT || segment_index >= count)
+		return false;
+	input = base->first;
+	while (segment_index-- > 0)
+		input = input->next;
+	if (cluster_undo_segment_header_integrity(input->block.data) == CLUSTER_UNDO_HEADER_CORRUPT)
+		return false;
+	cold_tt_slot_copy(input, slot_offset, out);
+	return true;
+}
+
+bool
+cluster_cold_tt_base_slot_v1(const ClusterColdTypedV1 *typed, uint32 segment_index,
+							 uint32 slot_offset, ClusterColdTtSlotInputV1 *out)
+{
+	return cold_tt_slot(typed == NULL ? NULL : typed->tt_base, cluster_cold_tt_base_count_v1(typed),
+						segment_index, slot_offset, out);
+}
+
+bool
+cluster_cold_tt_after_redo_slot_v1(const ClusterColdTypedV1 *typed, uint32 segment_index,
+								   uint32 slot_offset, ClusterColdTtSlotInputV1 *out)
+{
+	return cold_tt_slot(typed == NULL ? NULL : typed->tt_after_redo,
+						cluster_cold_tt_after_redo_count_v1(typed), segment_index, slot_offset,
+						out);
+}
+
+/* Reserve census storage before a producer can allocate more TT input. */
+static ClusterColdTopTxCensusV1 *
+cold_tt_census_allocate(ClusterColdTypedV1 *typed, uint32 count, Size *allocated)
+{
+	ClusterColdTtBaseV1 *after = typed->tt_after_redo;
+	ClusterColdTopTxCensusV1 *census;
+	Size bytes, remaining;
+
+	if (count > (MaxAllocSize - offsetof(ClusterColdTopTxCensusV1, entries))
+					/ sizeof(ClusterColdTopTxCensusEntryV1)
+		|| typed->tt_base->used > typed->tt_base->budget || after->used > after->budget)
+		return NULL;
+	bytes = offsetof(ClusterColdTopTxCensusV1, entries)
+			+ sizeof(ClusterColdTopTxCensusEntryV1) * count;
+	remaining = typed->tt_base->budget - typed->tt_base->used;
+	if (after->used > remaining)
+		return NULL;
+	remaining = Min(remaining - after->used, after->budget - after->used);
+	if (bytes > remaining)
+		return NULL;
+	census = palloc_extended(bytes, MCXT_ALLOC_NO_OOM | MCXT_ALLOC_ZERO);
+	if (census != NULL) {
+		after->used += bytes;
+		*allocated = bytes;
+	}
+	return census;
+}
+
+/* The original inventory owner retains every ACTIVE, not just those the
+ * current physical producer can prove. This is an input census, never a
+ * TX_CLOSURE completion receipt or permission to reuse pass-2 authority. */
+bool
+cluster_cold_typed_top_tx_census_v1(ClusterColdTypedV1 *typed,
+									struct ClusterRecoveryFencePlan *fence)
+{
+	ClusterColdTtBaseV1 *after;
+	ClusterColdTopTxCensusV1 *census;
+	uint32 count = 0, next = 0;
+	Size bytes;
+
+	if (typed == NULL)
+		return false;
+	/* A refused retry cannot expose a preceding attempt's census. The
+	 * allocation is charged to the post-capture's original shared budget. */
+	if (typed->top_tx_census != NULL) {
+		bytes = offsetof(ClusterColdTopTxCensusV1, entries)
+				+ sizeof(ClusterColdTopTxCensusEntryV1) * typed->top_tx_census->count;
+		pfree(typed->top_tx_census);
+		typed->top_tx_census = NULL;
+		if (typed->tt_after_redo == NULL || typed->tt_after_redo->used < bytes)
+			return false;
+		typed->tt_after_redo->used -= bytes;
+	}
+	if (typed->refusal != CLUSTER_COLD_OK
+		|| !cluster_cold_typed_xid_sources_ready_v1(typed)
+		|| !cluster_cold_typed_effects_ready_v1(typed)
+		|| !cluster_cold_tt_after_redo_namespace_matches_v1(typed)
+		|| !cluster_cold_typed_sources_current_v1(typed, fence)
+		|| cluster_cold_tt_after_redo_recheck_v1(typed) != CLUSTER_COLD_OK
+		|| !cluster_cold_typed_tt_redo_inventory_v1(typed))
+		return false;
+	after = typed->tt_after_redo;
+	for (const ColdTtInputV1 *input = after->first; input != NULL; input = input->next) {
+		const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)input->block.data;
+
+		for (uint32 slot = 0; slot < TT_SLOTS_PER_SEGMENT; slot++)
+			if (header->tt_slots[slot].status == TT_SLOT_ACTIVE) {
+				if (count == UINT32_MAX)
+					return false;
+				count++;
+			}
+	}
+	census = cold_tt_census_allocate(typed, count, &bytes);
+	if (census == NULL)
+		return false;
+	census->plan = typed->plan;
+	census->count = count;
+	for (const ColdTtInputV1 *input = after->first; input != NULL; input = input->next) {
+		const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)input->block.data;
+
+		for (uint32 slot = 0; slot < TT_SLOTS_PER_SEGMENT; slot++) {
+			ClusterColdTopTxCensusEntryV1 *entry;
+			ClusterColdTopTxProofV1 proof = { 0 };
+			ClusterColdTopTxLoserProducerResultV1 loser;
+
+			if (header->tt_slots[slot].status != TT_SLOT_ACTIVE)
+				continue;
+			entry = &census->entries[next++];
+			cold_tt_slot_copy(input, slot, &entry->input);
+			proof.key = entry->input.key;
+			/* No aggregate effects count supplies a per-top effects flag.
+			 * History/unknown origins remain explicit unproven inputs. */
+			for (uint32 p = 0; p < typed->replay_count; p++) {
+				if (typed->participants[p].thread_id != input->owner)
+					continue;
+				if (cluster_cold_typed_top_tx_loser_producer_v1(typed, fence, p, &proof, &loser)) {
+					entry->loser_proven = true;
+					entry->loser = loser.loser;
+					entry->proof = loser.proof;
+					census->proven_count++;
+				}
+				break;
+			}
+			if (typed->refusal != CLUSTER_COLD_OK || typed->tt_after_redo != after)
+				goto refused;
+		}
+	}
+	/* Bracket the entire census, including entries whose proof is absent.
+	 * No partial list can survive a failed physical/source recheck. */
+	if (cluster_cold_tt_after_redo_recheck_v1(typed) != CLUSTER_COLD_OK
+		|| !cluster_cold_typed_sources_current_v1(typed, fence))
+		goto refused;
+	typed->top_tx_census = census;
+	return true;
+
+refused:
+	if (typed->tt_after_redo == after)
+		after->used -= bytes;
+	pfree(census);
+	return false;
+}
+
+bool
+cluster_cold_tt_base_match_v1(const ClusterColdTypedV1 *typed,
+							  const ClusterColdTtSlotKeyV1 *expected, ClusterColdTtSlotInputV1 *out)
+{
+	ClusterColdTtSlotKeyV1 key;
+	const ColdTtInputV1 *input;
+
+	if (out == NULL)
+		return false;
+	/* A caller may use its previous input copy's key as the expectation. */
+	if (expected != NULL)
+		key = *expected;
+	memset(out, 0, sizeof(*out));
+	if (expected == NULL || key.owner_instance == 0 || key.owner_instance > COLD_TT_MAX_ORIGINS
+		|| key.segment_id == 0
+		|| (key.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 != key.owner_instance
+		|| key.slot_offset >= TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(key.xid)
+		|| key.slot_wrap == TT_WRAP_INVALID || cluster_cold_tt_base_count_v1(typed) == 0)
+		return false;
+	for (input = typed->tt_base->first; input != NULL; input = input->next) {
+		const UndoSegmentHeaderData *header;
+		const TTSlot *slot;
+
+		if (input->owner != key.owner_instance || input->segment != key.segment_id)
+			continue;
+		header = (const UndoSegmentHeaderData *)input->block.data;
+		if (cluster_undo_segment_header_integrity(header) == CLUSTER_UNDO_HEADER_CORRUPT)
+			return false;
+		slot = &header->tt_slots[key.slot_offset];
+		if (header->wrap_count != key.segment_generation || slot->xid != key.xid
+			|| slot->wrap != key.slot_wrap)
+			return false;
+		cold_tt_slot_copy(input, key.slot_offset, out);
+		return true;
+	}
+	return false;
+}
+
+static const ColdTtBlockV1 *
+cold_tt_undo_block(const ClusterColdTypedV1 *typed, bool after_redo, uint32 segment, uint32 blockno,
+				   bool fresh)
+{
+	ClusterColdTtBaseV1 *base;
+	const ColdTtInputV1 *file;
+	ColdTtBlockV1 *block, *allocated = NULL;
+	bool owners[COLD_TT_MAX_ORIGINS + 1];
+
+	if (typed == NULL || typed->tt_base == NULL
+		|| (after_redo && !cluster_cold_tt_after_redo_namespace_matches_v1(typed)))
+		return NULL;
+	base = after_redo ? typed->tt_after_redo : typed->tt_base;
+	if (!base->captured || base->detail != CLUSTER_COLD_OK)
+		return NULL;
+	base->detail = CLUSTER_COLD_SOURCE_GAP;
+	if (typed->refusal != CLUSTER_COLD_OK || !cold_tt_owners(typed, owners)
+		|| memcmp(owners, base->owners, sizeof(owners)) != 0 || segment == 0 || blockno == 0
+		|| blockno >= UNDO_BLOCKS_PER_SEGMENT)
+		return NULL;
+	for (file = base->first; file != NULL; file = file->next)
+		if (file->segment == segment)
+			break;
+	if (file == NULL)
+		return NULL;
+	for (block = base->blocks; block != NULL; block = block->next)
+		if (block->file == file && block->block == blockno)
+			break;
+	if (block == NULL) {
+		Size remaining = base->used <= base->budget ? base->budget - base->used : 0;
+		Size shared = typed->tt_base->used <= typed->tt_base->budget
+						  ? typed->tt_base->budget - typed->tt_base->used
+						  : 0;
+
+		/* Both captures and later UNDO reads share the original one budget. */
+		if (typed->tt_after_redo != NULL)
+			shared = typed->tt_after_redo->used <= shared ? shared - typed->tt_after_redo->used : 0;
+		if (sizeof(*block) > remaining || sizeof(*block) > shared) {
+			base->detail = CLUSTER_COLD_CAPACITY;
+			return NULL;
+		}
+		allocated = palloc_extended(sizeof(*block), MCXT_ALLOC_NO_OOM);
+		if (allocated == NULL) {
+			base->detail = CLUSTER_COLD_OOM;
+			return NULL;
+		}
+		block = allocated;
+		block->file = file;
+		block->block = blockno;
+		if (!cold_tt_read_data(file, blockno, block->bytes.data))
+			goto refused;
+	} else if (fresh) {
+		PGAlignedBlock observed;
+
+		/* The graph verifies each record in a second read. A cache hit
+		 * must retain the original source's full-byte stability check. */
+		if (!cold_tt_read_data(file, blockno, observed.data)
+			|| memcmp(observed.data, block->bytes.data, BLCKSZ) != 0)
+			goto refused;
+	}
+	if (allocated != NULL) {
+		block->next = base->blocks;
+		base->blocks = block;
+		base->used += sizeof(*block);
+	}
+	base->detail = CLUSTER_COLD_OK;
+	return block;
+refused:
+	if (allocated != NULL)
+		pfree(allocated);
+	return NULL;
+}
+
+/* Keep raw DATA capture separate from record parsing: a valid redo delta may
+ * introduce the requested record into an already retained original block. */
+bool
+cluster_cold_tt_base_block_v1(ClusterColdTypedV1 *typed, uint32 segment_index, uint32 blockno,
+							  PGAlignedBlock *out, uint32 *generation)
+{
+	const UndoSegmentHeaderData *header;
+	const ColdTtBlockV1 *block;
+	uint8 owner;
+	uint32 segment;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (generation != NULL)
+		*generation = 0;
+	if (out == NULL || generation == NULL
+		|| (header = cluster_cold_tt_base_header_v1(typed, segment_index, &owner, &segment))
+			   == NULL
+		|| cluster_undo_segment_header_integrity(header) == CLUSTER_UNDO_HEADER_CORRUPT)
+		return false;
+	if (typed->system_identifier != typed->tt_base->system_identifier
+		|| typed->observer.database_incarnation != typed->tt_base->database_incarnation) {
+		typed->tt_base->detail = CLUSTER_COLD_SOURCE_GAP;
+		return false;
+	}
+	block = cold_tt_undo_block(typed, false, segment, blockno, true);
+	if (block == NULL)
+		return false;
+	*out = block->bytes;
+	*generation = header->wrap_count;
+	return true;
+}
+
+static bool
+cold_tt_undo_record(ClusterColdTypedV1 *typed, UBA address, ClusterRecoveryUndoRecord *out,
+					uint32 *generation, bool fresh)
+{
+	const ColdTtBlockV1 *block;
+	ClusterRecoveryUndoRecord record;
+	uint32 segment, blockno;
+	uint16 slot, row;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (generation != NULL)
+		*generation = 0;
+	if (typed == NULL || out == NULL || generation == NULL || typed->tt_base == NULL)
+		return false;
+	if (!uba_decode_record(address, &segment, &blockno, &slot, &row)) {
+		if (typed->tt_base->detail == CLUSTER_COLD_OK)
+			typed->tt_base->detail = CLUSTER_COLD_SOURCE_GAP;
+		return false;
+	}
+	block = cold_tt_undo_block(typed, false, segment, blockno, fresh);
+	if (block == NULL)
+		return false;
+	if (cluster_recovery_undo_record_read(block->bytes.data, BLCKSZ, segment, blockno,
+										  block->file->owner, address, &record)
+		!= CLUSTER_RECOVERY_UNDO_ENTRY) {
+		typed->tt_base->detail = CLUSTER_COLD_SOURCE_GAP;
+		return false;
+	}
+	*out = record;
+	*generation = ((const UndoSegmentHeaderData *)block->file->block.data)->wrap_count;
+	return true;
+}
+
+bool
+cluster_cold_tt_undo_record_v1(ClusterColdTypedV1 *typed, UBA address,
+							   ClusterRecoveryUndoRecord *out, uint32 *generation)
+{
+	return cold_tt_undo_record(typed, address, out, generation, false);
+}
+
+ClusterRecoveryGraphResult
+cluster_cold_tt_graph_read_v1(void *arg, const ClusterRecoveryTxnKey *key, UBA address,
+							  ClusterRecoveryUndoRecord *out, uint32 *generation)
+{
+	ClusterColdTypedV1 *typed = arg;
+	ClusterColdTtBaseV1 *base;
+	ClusterColdTtSlotKeyV1 expected = { 0 };
+	ClusterColdTtSlotInputV1 input;
+	ClusterRecoveryGraphResult result = CLUSTER_RECOVERY_GRAPH_INVALID;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (generation != NULL)
+		*generation = 0;
+	if (typed == NULL || typed->tt_base == NULL)
+		return result;
+	base = typed->tt_base;
+	if (!base->captured || base->detail != CLUSTER_COLD_OK)
+		goto refused;
+	if (key == NULL || out == NULL || generation == NULL)
+		goto refused;
+	result = CLUSTER_RECOVERY_GRAPH_IDENTITY;
+	if (base->system_identifier == 0 || base->database_incarnation == 0
+		|| typed->system_identifier != base->system_identifier
+		|| typed->observer.database_incarnation != base->database_incarnation
+		|| key->system_identifier != base->system_identifier
+		|| key->database_incarnation != base->database_incarnation
+		|| key->origin_node_id >= COLD_TT_MAX_ORIGINS)
+		goto refused;
+	expected.owner_instance = (uint8)(key->origin_node_id + 1);
+	expected.segment_id = key->segment_id;
+	expected.segment_generation = key->segment_generation;
+	expected.slot_offset = key->slot_offset;
+	expected.xid = key->xid;
+	expected.slot_wrap = key->slot_wrap;
+	if (!cluster_cold_tt_base_match_v1(typed, &expected, &input))
+		goto refused;
+	result = CLUSTER_RECOVERY_GRAPH_INVALID;
+	if (!cold_tt_undo_record(typed, address, out, generation, true))
+		goto refused;
+	result = cluster_recovery_tx_record_check(key, address, out, *generation);
+	if (result != CLUSTER_RECOVERY_GRAPH_MORE)
+		goto refused;
+	return CLUSTER_RECOVERY_GRAPH_RECORD;
+refused:
+	if (base->detail == CLUSTER_COLD_CAPACITY || base->detail == CLUSTER_COLD_OOM)
+		result = CLUSTER_RECOVERY_GRAPH_CAPACITY;
+	else if (base->detail == CLUSTER_COLD_OK)
+		base->detail = CLUSTER_COLD_SOURCE_GAP;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (generation != NULL)
+		*generation = 0;
+	return result;
+}

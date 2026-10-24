@@ -18,6 +18,8 @@
  *    are supplied here. A wrong pg_wal fallback returns different bytes.
  *-------------------------------------------------------------------------
  */
+#define USE_PGRAC_CLUSTER 1
+
 #include "postgres.h"
 #include "cluster/cluster_wal_writer.h"
 
@@ -30,6 +32,7 @@
 #include "cluster/cluster_wal_source.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_restart_read.h"
+#include "cluster/cluster_same_host_fence.h"
 #include "../../backend/cluster/cluster_control_root_private.h"
 #include "../../backend/cluster/cluster_control_bootstrap_private.h"
 #include "common/cryptohash.h"
@@ -50,6 +53,11 @@ typedef enum {
 
 bool cluster_enabled = true, cluster_shared_config = true;
 char *cluster_wal_threads_dir;
+int PostmasterPid = 4242;
+static bool local_capture_available;
+static unsigned local_capture_calls;
+static ClusterSameHostKeyV1 local_captured_key;
+extern bool cluster_external_fence_rejoin_protected_set_digest(uint8 out[32]);
 static char *DataDir;
 static int cluster_node_id = 1;
 int wal_segment_size = 1024 * 1024;
@@ -128,6 +136,31 @@ cluster_wal_thread_id(void)
 }
 #include "test_cluster_wal_restart_mirror.inc"
 static ClusterWalThreadShmemData mirror;
+
+bool
+cluster_same_host_fence_available(void)
+{
+	return local_capture_available;
+}
+
+bool
+cluster_external_fence_rejoin_protected_set_digest(uint8 out[32])
+{
+	memset(out, 0x51, 32);
+	return true;
+}
+
+bool
+cluster_same_host_fence_record_writer_v1(const char *root, const ClusterSameHostKeyV1 *key,
+									   uint64 pid)
+{
+	UT_ASSERT(root == cluster_wal_threads_dir);
+	UT_ASSERT_EQ(pid, PostmasterPid);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&mirror.writer_ref_state), 0);
+	local_captured_key = *key;
+	local_capture_calls++;
+	return true;
+}
 
 int
 BasicOpenFile(const char *path, int flags)
@@ -239,6 +272,9 @@ fixture(void)
 	uint8 bytes[CLUSTER_WAL_CLAIM_V2_BYTES];
 	ClusterWalThreadClaimV2 claim = { 0 };
 	pg_cryptohash_ctx *hash;
+	local_capture_available = false;
+	local_capture_calls = 0;
+	memset(&local_captured_key, 0, sizeof(local_captured_key));
 	if (original_dir < 0)
 		original_dir = open(".", O_RDONLY | O_DIRECTORY);
 	if (original_dir < 0 || fchdir(original_dir))
@@ -740,6 +776,47 @@ UT_TEST(initialized_writer_qualification_is_published_only_with_exact_install)
 	UT_ASSERT(!cluster_wal_thread_initialized_writer_matches(&installed_writer, 77));
 }
 
+UT_TEST(recovered_writer_qualification_is_published_only_with_exact_install)
+{
+	ClusterWalStartupImage expected = { 0 };
+	ClusterWalSourceRef changed;
+	uint64 owner_incarnation;
+	fixture();
+	expected.claim.identity = installed_writer.claim.identity;
+	expected.operation_uuid[0] = 0x27;
+	expected.first_segment_lsn = 2 * wal_segment_size;
+	expected.input_kind = CLUSTER_WAL_STARTUP_RECOVERED;
+	expected.formation_epoch = 77;
+	UT_ASSERT(!cluster_wal_thread_recovered_writer_matches(&installed_writer, 77));
+	owner_incarnation = expected.claim.identity.origin_owner_incarnation;
+	expected.claim.identity.origin_owner_incarnation++;
+	UT_ASSERT_EQ(cluster_wal_thread_install_startup(&expected),
+					 CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	expected.claim.identity.origin_owner_incarnation = owner_incarnation;
+	install_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	UT_ASSERT_NE(cluster_wal_thread_install_startup(&expected), 0);
+	UT_ASSERT(!cluster_wal_thread_recovered_writer_matches(&installed_writer, 77));
+	install_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	UT_ASSERT_EQ(cluster_wal_thread_install_startup(&expected), 0);
+	UT_ASSERT(cluster_wal_thread_recovered_writer_matches(&installed_writer, 77));
+	UT_ASSERT(!cluster_wal_thread_initialized_writer_matches(&installed_writer, 77));
+	UT_ASSERT(!cluster_wal_thread_recovered_writer_matches(&installed_writer, 0));
+	UT_ASSERT(!cluster_wal_thread_recovered_writer_matches(&installed_writer, 78));
+	UT_ASSERT(!cluster_wal_thread_recovered_writer_matches(NULL, 77));
+	changed = installed_writer;
+	changed.claim.claim_sha256[0]++;
+	UT_ASSERT(!cluster_wal_thread_recovered_writer_matches(&changed, 77));
+	pg_atomic_write_u32(&mirror.writer_ref_state, 1);
+	UT_ASSERT(!cluster_wal_thread_recovered_writer_matches(&installed_writer, 77));
+	pg_atomic_write_u32(&mirror.writer_ref_state, 2);
+	UT_ASSERT_EQ(cluster_wal_thread_install_startup(&expected), 0);
+	expected.input_kind = CLUSTER_WAL_STARTUP_CLEAN;
+	UT_ASSERT_NE(cluster_wal_thread_install_startup(&expected), 0);
+	fixture();
+	UT_ASSERT_EQ(cluster_wal_thread_install_startup(&expected), 0);
+	UT_ASSERT(!cluster_wal_thread_recovered_writer_matches(&installed_writer, 77));
+}
+
 UT_TEST(close_failure_cannot_leak_successful_segment)
 {
 	fixture();
@@ -788,12 +865,33 @@ UT_TEST(reading_preserves_both_generations)
 	UT_ASSERT(!restart_owned(&st, false));
 }
 
+UT_TEST(same_host_capsule_capture_precedes_installed_writer_ready)
+{
+	ClusterWalSourceRef actual;
+	ClusterWalStartupImage expected = { 0 };
+	fixture();
+	local_capture_available = true;
+	expected.claim.identity = installed_writer.claim.identity;
+	expected.operation_uuid[0] = 0x27;
+	expected.first_segment_lsn = 2 * wal_segment_size;
+	UT_ASSERT_EQ(cluster_wal_thread_install_startup(&expected), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(local_capture_calls, 1);
+	UT_ASSERT_EQ(local_captured_key.system_identifier, expected.claim.identity.system_identifier);
+	UT_ASSERT_EQ(local_captured_key.origin_node_id, expected.claim.identity.origin_node_id);
+	UT_ASSERT_EQ(local_captured_key.incarnation, expected.claim.identity.origin_owner_incarnation);
+	UT_ASSERT_EQ(local_captured_key.protected_set_digest[0], 0x51);
+	UT_ASSERT(cluster_wal_thread_current_v2_ref(&actual));
+	UT_ASSERT(memcmp(&actual, &installed_writer, sizeof(actual)) == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(18);
+	UT_RUN(same_host_capsule_capture_precedes_installed_writer_ready);
 	UT_RUN(clean_writer_qualification_is_published_only_with_exact_install);
 	UT_RUN(initialized_writer_qualification_is_published_only_with_exact_install);
+	UT_RUN(recovered_writer_qualification_is_published_only_with_exact_install);
 	UT_RUN(native_reads_retained_input_not_pg_wal);
 	UT_RUN(native_bad_input_never_falls_back);
 	UT_RUN(legacy_keeps_native_route);

@@ -80,6 +80,8 @@ typedef struct ColdRecord {
 	XLogRecPtr end_rec_ptr;
 	uint64 scn;
 	uint32 record_crc;
+	TransactionId source_xid;
+	TransactionId source_top_xid;
 	uint32 first_component;
 	uint8 participant; /* canonical index */
 	uint8 component_count;
@@ -87,6 +89,12 @@ typedef struct ColdRecord {
 	uint8 info;
 	uint8 flags; /* COLD_RECORD_* */
 } ColdRecord;
+
+/* Input order reuses planning records and separately retains omitted frames. */
+typedef struct ColdInputFrameRef {
+	uint32 index;
+	bool planning_record;
+} ColdInputFrameRef;
 
 #define COLD_RECORD_HISTORY 0x01
 #define COLD_RECORD_SCHEDULED 0x02
@@ -133,6 +141,7 @@ typedef struct ColdComponent {
 #define COLD_STATE_FIRST_APPLY 0x01
 #define COLD_STATE_EXACT 0x02
 #define COLD_STATE_DATA_BEFORE 0x04
+#define COLD_STATE_FINAL 0x08 /* sealed live PAGE frontier; readback duty only */
 #define COLD_STATE_DATA_KIND_SHIFT 4
 #define COLD_STATE_DATA_KIND_MASK 0x03
 /* Set at seal from SPACE effects; never cleared by verdict assignment. */
@@ -197,6 +206,14 @@ struct ClusterColdPlanV1 {
 	uint32 record_count;
 	uint32 record_chunk_count;
 	uint32 record_chunk_capacity;
+	ColdInputFrameRef **input_frame_chunks;
+	uint32 input_frame_count;
+	uint32 input_frame_chunk_count;
+	uint32 input_frame_chunk_capacity;
+	ClusterColdRecordFrameV1 **omitted_frame_chunks;
+	uint32 omitted_frame_count;
+	uint32 omitted_frame_chunk_count;
+	uint32 omitted_frame_chunk_capacity;
 	ColdComponent **component_chunks;
 	uint32 component_count;
 	uint32 component_chunk_count;

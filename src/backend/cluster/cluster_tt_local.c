@@ -349,7 +349,7 @@ cluster_tt_local_reserve_binding(TransactionId top_xid, uint32 *out_segment_id,
 								"segment %u (%s)",
 								seg,
 								at_hard_cap ? "undo segment pool hard cap reached"
-											: "undo segment autoextend failed"),
+											: "undo segment rollover refused; see lifecycle diagnostic"),
 						 errdetail(
 							 "node=%d retention_horizon_scn=" UINT64_FORMAT
 							 " current_scn=" UINT64_FORMAT " retain_skip=" UINT64_FORMAT
@@ -358,6 +358,7 @@ cluster_tt_local_reserve_binding(TransactionId top_xid, uint32 *out_segment_id,
 							 " segment_reuse=" UINT64_FORMAT " segment_switch=" UINT64_FORMAT
 							 " tt_rollover_fail_hard_cap=" UINT64_FORMAT
 							 " tt_rollover_fail_extend=" UINT64_FORMAT
+							 " tt_rollover_fail_activate=" UINT64_FORMAT
 							 " record_extent_hard_cap_fail=" UINT64_FORMAT
 							 " segments_max_per_instance=%d cleaner_status=%s"
 							 " cleaner_loop_iters=" INT64_FORMAT " cleaner_tick_age_ms=%ld.",
@@ -370,12 +371,16 @@ cluster_tt_local_reserve_binding(TransactionId top_xid, uint32 *out_segment_id,
 							 cluster_undo_segment_switch_count(),
 							 cluster_undo_tt_rollover_fail_hard_cap_count(),
 							 cluster_undo_tt_rollover_fail_extend_count(),
+							 cluster_undo_tt_rollover_fail_activate_count(),
 							 cluster_undo_segment_hard_cap_fail_count(),
 							 cluster_undo_segments_max_per_instance,
 							 cluster_undo_cleaner_status_to_string(cluster_undo_cleaner_status()),
 							 cluster_undo_cleaner_main_loop_iters(), cleaner_tick_age_ms),
-						 errhint("A long-running reader is retaining committed undo; end it, "
-								 "or raise cluster.undo_segments_max_per_instance.")));
+						 errhint(at_hard_cap
+								 ? "A long-running reader is retaining committed undo; end it, "
+								   "or raise cluster.undo_segments_max_per_instance."
+								 : "Inspect the preceding undo lifecycle stage/predicate for "
+								   "selection, publication, activation or binding refusal.")));
 				}
 			}
 		}
@@ -761,6 +766,13 @@ cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 	if (binding_out == NULL)
 		return false;
 	memset(binding_out, 0, sizeof(*binding_out));
+	/* Existing-other starts keep canonical ACTIVE reservation closed until the
+	 * recovered semantic OPEN cut is visible.  Startup-owned reservation keeps
+	 * its original recovery authority path. */
+	if (MyBackendType != B_STARTUP && cluster_shared_config
+		&& cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& !cluster_semantic_activation_recovered_open_current())
+		return false;
 	if (!cluster_enabled || cluster_node_id < 0 || !TransactionIdIsNormal(top_xid))
 		return false;
 

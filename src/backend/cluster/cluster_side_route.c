@@ -93,7 +93,8 @@ side_manifest_disposition(const RfOpcodeRouteV1 *route, bool active, ClusterSide
 		return;
 
 	if (route->codec_id == RF_ROUTE_CODEC_SIDE_CLUSTER_UNDO) {
-		if (route->normalized_info != XLOG_HW_RESERVE)
+		if (route->normalized_info != XLOG_HW_RESERVE
+			&& route->normalized_info != XLOG_UNDO_RECOVERY_TT_ABORT)
 			out->kind = CLUSTER_SIDE_ROUTE_TT_UNDO;
 		return;
 	}

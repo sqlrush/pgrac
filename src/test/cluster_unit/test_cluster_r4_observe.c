@@ -60,6 +60,9 @@ static bool admission_recheck;
 static bool copy_ok;
 static ClusterBufmgrGcsCopyRefusal copy_refusal;
 static bool construct_partial;
+static ClusterNormalStartState holder_start_state;
+static bool holder_recovered_open;
+static int copy_calls;
 static int enter_calls;
 static int recheck_calls;
 static int leave_calls;
@@ -104,12 +107,25 @@ cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
 	token->entered = false;
 }
 
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return holder_start_state;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return holder_recovered_open;
+}
+
 bool
 cluster_bufmgr_copy_block_for_r4_cr(BufferTag tag pg_attribute_unused(),
 									SCN expected_page_scn pg_attribute_unused(),
 									XLogRecPtr *page_lsn_out, SCN *page_scn_out, char *dst,
 									ClusterBufmgrGcsCopyRefusal *refusal_out)
 {
+	copy_calls++;
 	if (page_lsn_out != NULL)
 		*page_lsn_out = (XLogRecPtr)1;
 	if (page_scn_out != NULL)
@@ -158,6 +174,9 @@ reset_fixture(void)
 	copy_ok = true;
 	copy_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE;
 	construct_partial = false;
+	holder_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+	holder_recovered_open = true;
+	copy_calls = 0;
 	enter_calls = 0;
 	recheck_calls = 0;
 	leave_calls = 0;
@@ -210,6 +229,23 @@ UT_TEST(test_holder_full_is_observed_after_accepted_build)
 	UT_ASSERT_EQ(enter_calls, 1);
 	UT_ASSERT_EQ(recheck_calls, 1);
 	UT_ASSERT_EQ(leave_calls, 1);
+}
+
+UT_TEST(test_holder_refuses_before_recovered_open)
+{
+	BufferTag tag = { 0 };
+	char page[BLCKSZ];
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_NONE;
+
+	reset_fixture();
+	holder_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	holder_recovered_open = false;
+	UT_ASSERT_EQ(cluster_cr_build_on_holder(&tag, (SCN)1, page, &reason),
+				 CLUSTER_CR_BUILD_RETRYABLE);
+	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_RF_DEFERRED);
+	UT_ASSERT_EQ(copy_calls, 0);
+	UT_ASSERT_EQ(enter_calls, 0);
+	UT_ASSERT_EQ(observation_total(), 0);
 }
 
 UT_TEST(test_holder_retry_is_observed_with_typed_reason)
@@ -291,9 +327,10 @@ UT_TEST(test_refusal_reasons_are_stage_separated_and_logs_are_bounded)
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
 	UT_RUN(test_event_domain_is_exact_and_adapter_is_one_to_one);
 	UT_RUN(test_holder_full_is_observed_after_accepted_build);
+	UT_RUN(test_holder_refuses_before_recovered_open);
 	UT_RUN(test_holder_retry_is_observed_with_typed_reason);
 	UT_RUN(test_holder_nonretryable_failure_is_observed);
 	UT_RUN(test_holder_admission_refusal_is_not_an_event);

@@ -45,4 +45,10 @@ rf_side_online_production_preflight_v1(const RfSideOnlinePlanV1 *plan,
 extern RfPageProofDetailV1 rf_side_online_production_apply_v1(const RfSideOnlinePlanV1 *plan,
 															  RfSideOnlineProductionOwnerV1 *owner);
 
+/* Cold-only record-local consumer. This never closes the full protected set. */
+extern RfPageProofDetailV1
+rf_side_online_production_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+										  const RfPageOnlineRecordIdentityV1 *identity,
+										  RfSideOnlineProductionOwnerV1 *owner);
+
 #endif

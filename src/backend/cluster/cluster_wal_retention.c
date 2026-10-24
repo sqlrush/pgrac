@@ -77,6 +77,8 @@ struct ClusterWalRetentionPin {
 	bool poisoned;
 	ClusterRecoverySerialGuardSet *serial_set;
 	ClusterWalPinThread *threads;
+	uint16 nreaders;
+	ClusterWalPinLock *readers; /* retained inputs without recovery authority */
 };
 
 struct ClusterWalRootPublishGuard {
@@ -90,6 +92,8 @@ struct ClusterWalRootPublishGuard {
 	ClusterWalRetentionPin *pin;
 	ClusterControlRootReadToken root_read;
 	ClusterWalPinLock walr;
+	uint16 nmembers;
+	struct ClusterWalRootPublishGuard *members;
 };
 
 struct ClusterWalReadPinV1 {
@@ -578,6 +582,8 @@ pin_valid(const ClusterWalRetentionPin *pin)
 	return pin != NULL && pin == active_pin && pin->magic == CLUSTER_WAL_PIN_MAGIC
 		   && pin->owner_pid == MyProcPid && pin->owner == CurrentResourceOwner && pin->nthreads > 0
 		   && pin->nthreads <= CLUSTER_WAL_RETENTION_MAX_THREADS && pin->threads != NULL
+		   && pin->nreaders <= CLUSTER_WAL_RETENTION_MAX_THREADS - pin->nthreads
+		   && (pin->nreaders == 0 || pin->readers != NULL)
 		   && pin->state >= CLUSTER_WAL_PIN_STATE_ACQUIRED_UNBOUND
 		   && pin->state <= CLUSTER_WAL_PIN_STATE_SEALED;
 }
@@ -595,21 +601,36 @@ pin_free(ClusterWalRetentionPin *pin)
 				pfree(pin->threads[i].intervals);
 		pfree(pin->threads);
 	}
+	if (pin->readers != NULL)
+		pfree(pin->readers);
 	explicit_bzero(pin, sizeof(*pin));
 	pfree(pin);
+}
+
+/* Both arrays are disjoint. Only threads[] has recovery duties/IR. */
+static ClusterWalPinLock *
+pin_walr_for_thread(ClusterWalRetentionPin *pin, uint16 thread_id)
+{
+	for (uint16 i = 0; i < pin->nthreads; i++)
+		if (pin->threads[i].duty.origin_thread_id == thread_id)
+			return &pin->threads[i].walr;
+	for (uint16 i = 0; i < pin->nreaders; i++)
+		if (pin->readers[i].request.resid.field1 == thread_id)
+			return &pin->readers[i];
+	return NULL;
 }
 
 static ClusterWalrReleaseResult
 pin_release_locks(ClusterWalRetentionPin *pin)
 {
-	uint16 i;
 	bool unconfirmed = false;
 
-	for (i = pin->nthreads; i > 0; i--) {
-		ClusterWalPinLock *walr = &pin->threads[i - 1].walr;
+	/* Reverse the complete physical union, including partial acquisition. */
+	for (uint16 tid = CLUSTER_WAL_RETENTION_MAX_THREADS; tid > 0; tid--) {
+		ClusterWalPinLock *walr = pin_walr_for_thread(pin, tid);
 		ClusterLockAcquireResult result;
 
-		if (!walr->held && !walr->release_uncertain)
+		if (walr == NULL || (!walr->held && !walr->release_uncertain))
 			continue;
 		result = walr_request_release_actual(&walr->request);
 		if (result == CLUSTER_LOCK_ACQUIRE_OK_GRANTED) {
@@ -648,10 +669,38 @@ walr_request_current(const ClusterLockAcquireRequest *request)
 }
 
 static bool
+pin_readers_current(ClusterWalRetentionPin *pin)
+{
+	for (uint16 i = 0; i < pin->nreaders; i++) {
+		const ClusterWalPinLock *walr = &pin->readers[i];
+
+		if (!walr->held || walr->release_uncertain || !walr_request_current(&walr->request)) {
+			pin->poisoned = true;
+			return false;
+		}
+	}
+	return true;
+}
+
+static const ClusterWalRootPublishGuard *
+root_publish_member(const ClusterWalRootPublishGuard *guard, uint16 thread_id)
+{
+	if (guard == NULL)
+		return NULL;
+	if (guard->nmembers == 0)
+		return guard->thread_id == thread_id ? guard : NULL;
+	for (uint16 i = 0; i < guard->nmembers; i++)
+		if (guard->members[i].thread_id == thread_id)
+			return &guard->members[i];
+	return NULL;
+}
+
+static bool
 pin_thread_walr_current(const ClusterWalRetentionPin *pin, const ClusterWalPinThread *thread)
 {
 	const ClusterWalReuseActionGuard *guard = active_reuse_guard;
-	const ClusterWalRootPublishGuard *publisher = active_root_publish_guard;
+	const ClusterWalRootPublishGuard *publisher =
+		root_publish_member(active_root_publish_guard, thread->duty.origin_thread_id);
 
 	if (!thread->walr.held || thread->walr.release_uncertain)
 		return false;
@@ -688,6 +737,8 @@ pin_current_after_grants(ClusterWalRetentionPin *pin)
 {
 	uint16 i;
 
+	if (!pin_readers_current(pin))
+		return CLUSTER_WAL_PIN_STALE;
 	for (i = 0; i < pin->nthreads; i++) {
 		ClusterWalPinThread *thread = &pin->threads[i];
 		ClusterControlRootSnapshot snapshot;
@@ -722,16 +773,22 @@ pin_current_after_grants(ClusterWalRetentionPin *pin)
 	return CLUSTER_WAL_PIN_OK;
 }
 
-ClusterWalPinResult
-cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *requests,
-								  uint16 nthreads, ClusterWalRetentionPin **out_pin)
+static bool walr_share_request_init(uint16 thread_id, ClusterLockAcquireRequest *request);
+
+static ClusterWalPinResult
+pin_acquire_inputs(const ClusterWalRetentionPinThreadRequest *requests, uint16 nthreads,
+				   const uint16 *input_threads, uint16 ninput_threads,
+				   ClusterWalRetentionPin **out_pin)
 {
 	ClusterWalRetentionPin *pin;
 	Size total_bytes;
 	uint16 i;
+	uint16 nreaders = 0;
 
 	if (out_pin == NULL || *out_pin != NULL || requests == NULL || CurrentResourceOwner == NULL
-		|| nthreads == 0 || nthreads > CLUSTER_WAL_RETENTION_MAX_THREADS)
+		|| nthreads == 0 || nthreads > CLUSTER_WAL_RETENTION_MAX_THREADS
+		|| ninput_threads > CLUSTER_WAL_RETENTION_MAX_THREADS
+		|| (ninput_threads != 0 && input_threads == NULL))
 		return CLUSTER_WAL_PIN_INVALID;
 	if (active_pin != NULL || active_read_pin != NULL)
 		return CLUSTER_WAL_PIN_CAPACITY;
@@ -739,12 +796,27 @@ cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *req
 	if (nthreads > (MaxAllocSize - total_bytes) / sizeof(ClusterWalPinThread))
 		return CLUSTER_WAL_PIN_INVALID;
 	total_bytes += (Size)nthreads * sizeof(ClusterWalPinThread);
+	for (i = 0; i < ninput_threads; i++)
+		if (input_threads[i] == 0 || input_threads[i] > CLUSTER_WAL_RETENTION_MAX_THREADS
+			|| (i > 0 && input_threads[i - 1] >= input_threads[i]))
+			return CLUSTER_WAL_PIN_INVALID;
 	for (i = 0; i < nthreads; i++) {
+		bool found = ninput_threads == 0;
+
 		if (!pin_request_valid(&requests[i], wal_segment_size, &total_bytes)
 			|| (i > 0
 				&& requests[i - 1].duty.origin_thread_id >= requests[i].duty.origin_thread_id))
 			return CLUSTER_WAL_PIN_INVALID;
+		for (uint16 j = 0; j < ninput_threads; j++)
+			if (input_threads[j] == requests[i].duty.origin_thread_id)
+				found = true;
+		if (!found)
+			return CLUSTER_WAL_PIN_INVALID;
 	}
+	if (ninput_threads != 0)
+		nreaders = ninput_threads - nthreads;
+	if (nreaders > (MaxAllocSize - total_bytes) / sizeof(ClusterWalPinLock))
+		return CLUSTER_WAL_PIN_INVALID;
 	walr_resource_ensure_callback();
 
 	pin = palloc0(sizeof(*pin));
@@ -754,6 +826,8 @@ cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *req
 	pin->owner = CurrentResourceOwner;
 	pin->nthreads = nthreads;
 	pin->state = CLUSTER_WAL_PIN_STATE_ACQUIRED_UNBOUND;
+	if (nreaders != 0)
+		pin->readers = palloc0((Size)nreaders * sizeof(*pin->readers));
 	for (i = 0; i < nthreads; i++) {
 		ClusterWalPinThread *thread = &pin->threads[i];
 		Size bytes = (Size)requests[i].nintervals * sizeof(*thread->intervals);
@@ -769,26 +843,21 @@ cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *req
 		thread->formation = requests[i].formation;
 		thread->needs = requests[i].needs;
 		thread->admissions = requests[i].admissions;
+		walr_share_request_init(thread->duty.origin_thread_id, &thread->walr.request);
 	}
+	for (i = 0; i < ninput_threads; i++)
+		if (pin_walr_for_thread(pin, input_threads[i]) == NULL) {
+			walr_share_request_init(input_threads[i], &pin->readers[pin->nreaders].request);
+			pin->nreaders++;
+		}
+	/* Register the complete owner before any actual grant, including ERROR. */
 	active_pin = pin;
-
-	for (i = 0; i < nthreads; i++) {
-		ClusterWalPinLock *walr = &pin->threads[i].walr;
+	for (uint16 tid = 1; tid <= CLUSTER_WAL_RETENTION_MAX_THREADS; tid++) {
+		ClusterWalPinLock *walr = pin_walr_for_thread(pin, tid);
 		ClusterLockAcquireResult result;
 
-		memset(&walr->request, 0, sizeof(walr->request));
-		if (!cluster_wal_retention_resid_encode(pin->threads[i].duty.origin_thread_id,
-												&walr->request.resid))
-			return pin_fail_after_locks(pin, CLUSTER_WAL_PIN_INVALID, out_pin);
-		walr->request.lockmode = ShareLock;
-		walr->request.op = CLUSTER_LOCK_OP_REQUEST;
-		walr->request.current_mode = NoLock;
-		walr->request.lockmethod_id = DEFAULT_LOCKMETHOD;
-		walr->request.dontwait = true;
-		walr->request.sessionLock = false;
-		walr->request.caller_local_start_ts_ms = (uint64)(GetCurrentTimestamp() / 1000);
-		walr->request.timeout_ms = 1;
-		walr->request.wait_event = WAIT_EVENT_CLUSTER_GES_REPLY_WAIT;
+		if (walr == NULL)
+			continue;
 		result = walr_request_acquire_actual(&walr->request);
 		if (result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
 			return pin_fail_after_locks(pin, CLUSTER_WAL_PIN_UNAVAILABLE, out_pin);
@@ -798,6 +867,23 @@ cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *req
 		return pin_fail_after_locks(pin, CLUSTER_WAL_PIN_STALE, out_pin);
 	*out_pin = pin;
 	return CLUSTER_WAL_PIN_OK;
+}
+
+ClusterWalPinResult
+cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *requests,
+								  uint16 nthreads, ClusterWalRetentionPin **out_pin)
+{
+	return pin_acquire_inputs(requests, nthreads, NULL, 0, out_pin);
+}
+
+ClusterWalPinResult
+cluster_wal_retention_pin_acquire_inputs_v1(
+	const ClusterWalRetentionPinThreadRequest *requests, uint16 nthreads,
+	const uint16 *input_threads, uint16 ninput_threads, ClusterWalRetentionPin **out_pin)
+{
+	if (input_threads == NULL || ninput_threads == 0)
+		return CLUSTER_WAL_PIN_INVALID;
+	return pin_acquire_inputs(requests, nthreads, input_threads, ninput_threads, out_pin);
 }
 
 static bool
@@ -838,7 +924,7 @@ cluster_wal_retention_pin_bind_one(ClusterWalRetentionPin *pin,
 		return CLUSTER_WAL_PIN_RELEASE_UNCERTAIN;
 	if (pin->state != CLUSTER_WAL_PIN_STATE_ACQUIRED_UNBOUND || pin->nthreads != 1)
 		return CLUSTER_WAL_PIN_INVALID;
-	if (!pin_thread_walr_current(pin, &pin->threads[0])
+	if (!pin_readers_current(pin) || !pin_thread_walr_current(pin, &pin->threads[0])
 		|| !serial_matches_thread(held_serial, &pin->threads[0]))
 		return CLUSTER_WAL_PIN_STALE;
 	pin->threads[0].serial = held_serial;
@@ -859,6 +945,8 @@ cluster_wal_retention_pin_bind_set(ClusterWalRetentionPin *pin,
 	if (pin->state != CLUSTER_WAL_PIN_STATE_ACQUIRED_UNBOUND || pin->nthreads <= 1
 		|| held_set == NULL || held_set->count != pin->nthreads)
 		return CLUSTER_WAL_PIN_INVALID;
+	if (!pin_readers_current(pin))
+		return CLUSTER_WAL_PIN_STALE;
 	for (i = 0; i < pin->nthreads; i++)
 		if (!pin_thread_walr_current(pin, &pin->threads[i])
 			|| !serial_matches_thread(&held_set->guards[i], &pin->threads[i]))
@@ -878,6 +966,8 @@ pin_revalidate_bound(ClusterWalRetentionPin *pin)
 	if (pin->state != CLUSTER_WAL_PIN_STATE_BOUND_ONE
 		&& pin->state != CLUSTER_WAL_PIN_STATE_BOUND_SET)
 		return CLUSTER_WAL_PIN_INVALID;
+	if (!pin_readers_current(pin))
+		return CLUSTER_WAL_PIN_STALE;
 	for (i = 0; i < pin->nthreads; i++)
 		if (!pin_thread_walr_current(pin, &pin->threads[i])
 			|| !serial_matches_thread(pin->threads[i].serial, &pin->threads[i])) {
@@ -1320,6 +1410,197 @@ cluster_wal_retention_root_publish_begin_exact(const ClusterControlRootReadToken
 	return CLUSTER_WAL_PIN_OK;
 }
 
+/* PGRAC: one ResourceOwner entry holds the complete original input cut, not
+ * one independently releasable publish guard per thread. All IR releases and
+ * original S holders are checked before the first nonblocking conversion.
+ * A partial cut is cleanup-only and cannot be observed as publication-ready.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterWalPinResult
+cluster_wal_retention_root_publish_begin_set_v1(const ClusterControlRootReadToken *roots,
+												uint16 nroots, ClusterWalRootPublishGuard **out_guard)
+{
+	ClusterWalRootPublishGuard *guard;
+	ClusterWalRetentionPin *pin = active_pin;
+
+	if (roots == NULL || nroots == 0 || nroots > CLUSTER_WAL_RETENTION_MAX_THREADS
+		|| out_guard == NULL || *out_guard != NULL || CurrentResourceOwner == NULL)
+		return CLUSTER_WAL_PIN_INVALID;
+	for (uint16 i = 0; i < nroots; i++) {
+		const ClusterControlRootReadToken *root = &roots[i];
+
+		if (root->origin_thread_id == 0
+			|| root->origin_thread_id > CLUSTER_WAL_RETENTION_MAX_THREADS
+			|| (i > 0 && root->origin_thread_id <= roots[i - 1].origin_thread_id)
+			|| root->source == 0 || root->reserved20 != 0 || root->reserved32 != 0
+			|| root->root_lineage_seq == 0 || root->root_publish_seq == 0
+			|| root->file_txn_seq == 0 || root->record_crc32c == 0
+			|| (root->root_flags & ~CLUSTER_CONTROL_ROOT_FLAGS_V1) != 0
+			|| (root->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
+				&& root->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED)
+			|| root->file_txn_seq != roots[0].file_txn_seq
+			|| memcmp(root->authority_uuid, roots[0].authority_uuid, 16) != 0)
+			return CLUSTER_WAL_PIN_INVALID;
+	}
+	if (active_root_publish_guard != NULL)
+		return CLUSTER_WAL_PIN_CAPACITY;
+	if (!pin_valid(pin) || pin->poisoned || pin->state != CLUSTER_WAL_PIN_STATE_SEALED
+		|| nroots != pin->nthreads + pin->nreaders || !pin_readers_current(pin))
+		return CLUSTER_WAL_PIN_STALE;
+	for (uint16 i = 0; i < pin->nthreads; i++) {
+		const ClusterWalPinThread *thread = &pin->threads[i];
+		const ClusterRecoverySerialGuard *serial = thread->serial;
+
+		if (serial == NULL || serial->mode != CLUSTER_RECOVERY_SERIAL_COLD_FORMED
+			|| serial->held || serial->release_uncertain || thread->pending.generation != 0
+			|| !pin_thread_walr_current(pin, thread) || thread->walr.request.lockmode != ShareLock
+			|| thread->walr.request.holder.request_id != thread->walr.request.request_id
+			|| !walr_request_has_native_lock(&thread->walr.request))
+			return CLUSTER_WAL_PIN_STALE;
+	}
+	for (uint16 i = 0; i < nroots; i++) {
+		const ClusterControlRootReadToken *root = &roots[i];
+		ClusterWalPinThread *thread = pin_find_thread(pin, root->origin_thread_id);
+		bool reader_found = false;
+
+		if (thread != NULL) {
+			if (root->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
+				|| memcmp(root, &thread->root_read, sizeof(*root)) != 0)
+				return CLUSTER_WAL_PIN_STALE;
+			continue;
+		}
+		if (root->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED)
+			return CLUSTER_WAL_PIN_STALE;
+		for (uint16 j = 0; j < pin->nreaders; j++) {
+			const ClusterLockAcquireRequest *request = &pin->readers[j].request;
+
+			if (request->resid.field1 == root->origin_thread_id
+				&& request->lockmode == ShareLock && walr_request_has_native_lock(request)) {
+				reader_found = true;
+				break;
+			}
+		}
+		if (!reader_found)
+			return CLUSTER_WAL_PIN_STALE;
+	}
+
+	walr_resource_ensure_callback();
+	/* A single allocation is registered before any throwing lock operation. */
+	guard = palloc0(sizeof(*guard) * (1 + nroots));
+	guard->magic = CLUSTER_WAL_ROOT_PUBLISH_MAGIC;
+	guard->owner_pid = MyProcPid;
+	guard->owner = CurrentResourceOwner;
+	guard->borrowed_from_pin = true;
+	guard->pin = pin;
+	guard->nmembers = nroots;
+	guard->members = guard + 1;
+	for (uint16 i = 0; i < nroots; i++) {
+		ClusterWalRootPublishGuard *member = &guard->members[i];
+
+		member->owner_pid = MyProcPid;
+		member->owner = CurrentResourceOwner;
+		member->thread_id = roots[i].origin_thread_id;
+		member->borrowed_from_pin = true;
+		member->pin = pin;
+		member->root_read = roots[i];
+	}
+	active_root_publish_guard = guard;
+	*out_guard = guard;
+	for (uint16 i = 0; i < nroots; i++) {
+		ClusterWalRootPublishGuard *member = &guard->members[i];
+		ClusterWalPinThread *thread;
+		ClusterLockAcquireResult converted;
+		bool cleanup_required = false;
+
+		if (member->root_read.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED)
+			continue;
+		thread = pin_find_thread(pin, member->thread_id);
+		member->walr.request = thread->walr.request;
+		member->walr.request.lockmode = ExclusiveLock;
+		member->walr.request.op = CLUSTER_LOCK_OP_CONVERT;
+		member->walr.request.current_mode = ShareLock;
+		member->walr.request.convert_old_request_id = thread->walr.request.request_id;
+		member->walr.request.dontwait = true;
+		member->walr.request.timeout_ms = 1;
+		converted = walr_request_convert_actual(&member->walr.request, 0, &cleanup_required);
+		if (converted != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED) {
+			if (cleanup_required) {
+				member->converted_from_pin = member->walr.held = true;
+				member->walr.release_uncertain = true;
+				pin->poisoned = true;
+				return CLUSTER_WAL_PIN_RELEASE_UNCERTAIN;
+			}
+			if (converted != CLUSTER_LOCK_ACQUIRE_NOT_AVAIL)
+				pin->poisoned = true;
+			return CLUSTER_WAL_PIN_UNAVAILABLE;
+		}
+		member->converted_from_pin = member->walr.held = true;
+	}
+	return CLUSTER_WAL_PIN_OK;
+}
+
+bool
+cluster_wal_retention_root_publish_set_current_v1(const ClusterWalRootPublishGuard *guard)
+{
+	if (guard == NULL || guard != active_root_publish_guard
+		|| guard->magic != CLUSTER_WAL_ROOT_PUBLISH_MAGIC || guard->owner_pid != MyProcPid
+		|| guard->owner != CurrentResourceOwner || !guard->borrowed_from_pin
+		|| !pin_valid(guard->pin) || guard->pin->poisoned
+		|| guard->pin->state != CLUSTER_WAL_PIN_STATE_SEALED || guard->nmembers == 0
+		|| guard->nmembers != guard->pin->nthreads + guard->pin->nreaders
+		|| !pin_readers_current(guard->pin))
+		return false;
+	for (uint16 i = 0; i < guard->nmembers; i++) {
+		const ClusterWalRootPublishGuard *member = &guard->members[i];
+
+		if (member->root_read.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
+			&& !cluster_wal_retention_root_publish_sealed_current(guard, &member->root_read))
+			return false;
+	}
+	return true;
+}
+
+static ClusterWalrReleaseResult
+root_publish_member_end(ClusterWalRootPublishGuard *member)
+{
+	if (member->converted_from_pin) {
+		ClusterWalPinThread *thread = pin_find_thread(member->pin, member->thread_id);
+		ClusterLockAcquireRequest down = member->walr.request;
+		bool cleanup_required = false;
+
+		if (member->pin != active_pin || thread == NULL || !thread->walr.held
+			|| !member->walr.held || down.lockmode != ExclusiveLock)
+			return CLUSTER_WALR_RELEASE_INVALID;
+		if (member->walr.release_uncertain)
+			return CLUSTER_WALR_RELEASE_UNCONFIRMED;
+		down.lockmode = ShareLock;
+		down.op = CLUSTER_LOCK_OP_CONVERT;
+		down.current_mode = ExclusiveLock;
+		down.convert_old_request_id = 0;
+		down.dontwait = true;
+		if (walr_request_convert_actual(&down, member->walr.request.request_id, &cleanup_required)
+			!= CLUSTER_LOCK_ACQUIRE_OK_CONVERTED) {
+			member->walr.release_uncertain = true;
+			member->pin->poisoned = true;
+			return CLUSTER_WALR_RELEASE_UNCONFIRMED;
+		}
+		/* Same native accounting as the existing reuse-guard consumer:
+		 * retain the original S ref, remove temporary X and extra S refs. */
+		walr_native_lock_release_or_fatal(&member->walr.request);
+		walr_native_lock_release_or_fatal(&down);
+		thread->walr.request = down;
+		member->walr.held = false;
+		member->converted_from_pin = false;
+	} else if (!member->borrowed_from_pin && !member->borrowed_from_read_pin) {
+		if (walr_request_release_actual(&member->walr.request)
+			!= CLUSTER_LOCK_ACQUIRE_OK_GRANTED) {
+			member->walr.release_uncertain = true;
+			return CLUSTER_WALR_RELEASE_UNCONFIRMED;
+		}
+		member->walr.held = false;
+	}
+	return CLUSTER_WALR_RELEASE_CONFIRMED;
+}
+
 ClusterWalrReleaseResult
 cluster_wal_retention_root_publish_end(ClusterWalRootPublishGuard **guard)
 {
@@ -1330,6 +1611,7 @@ cluster_wal_retention_root_publish_end(ClusterWalRootPublishGuard **guard)
 	static uint64 logged_control_owner;
 	static bool logged_invalid;
 	ClusterWalrReleaseResult result = CLUSTER_WALR_RELEASE_CONFIRMED;
+	ClusterWalRootPublishGuard *member;
 	const ClusterLockAcquireRequest *request;
 	const char *action = "release_walr";
 
@@ -1340,51 +1622,19 @@ cluster_wal_retention_root_publish_end(ClusterWalRootPublishGuard **guard)
 	if (*guard != active_root_publish_guard || (*guard)->magic != CLUSTER_WAL_ROOT_PUBLISH_MAGIC
 		|| (*guard)->owner_pid != MyProcPid || (*guard)->owner != CurrentResourceOwner)
 		goto invalid;
-	if ((*guard)->converted_from_pin) {
-		ClusterWalPinThread *thread = pin_find_thread((*guard)->pin, (*guard)->thread_id);
-		ClusterLockAcquireRequest down = (*guard)->walr.request;
-		bool cleanup_required = false;
-		action = "downgrade_walr";
-		if ((*guard)->pin != active_pin || thread == NULL || !thread->walr.held
-			|| !(*guard)->walr.held || down.lockmode != ExclusiveLock) {
-			result = CLUSTER_WALR_RELEASE_INVALID;
+	/* PGRAC: reverse the original ordered conversions, retaining the one
+	 * owner on any uncertain member. Already restored members are not retried.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	for (uint16 i = (*guard)->nmembers ? (*guard)->nmembers : 1; i > 0; i--) {
+		member = (*guard)->nmembers ? &(*guard)->members[i - 1] : *guard;
+		action = member->converted_from_pin ? "downgrade_walr" : "release_walr";
+		result = root_publish_member_end(member);
+		if (result != CLUSTER_WALR_RELEASE_CONFIRMED)
 			goto diagnostic;
-		}
-		if ((*guard)->walr.release_uncertain) {
-			result = CLUSTER_WALR_RELEASE_UNCONFIRMED;
-			goto diagnostic;
-		}
-		down.lockmode = ShareLock;
-		down.op = CLUSTER_LOCK_OP_CONVERT;
-		down.current_mode = ExclusiveLock;
-		down.convert_old_request_id = 0;
-		down.dontwait = true;
-		if (walr_request_convert_actual(&down, (*guard)->walr.request.request_id, &cleanup_required)
-			!= CLUSTER_LOCK_ACQUIRE_OK_CONVERTED) {
-			(*guard)->walr.release_uncertain = true;
-			(*guard)->pin->poisoned = true;
-			result = CLUSTER_WALR_RELEASE_UNCONFIRMED;
-			goto diagnostic;
-		}
-		/* Same native accounting as the existing reuse-guard consumer:
-		 * retain the original S ref, remove temporary X and extra S refs. */
-		walr_native_lock_release_or_fatal(&(*guard)->walr.request);
-		walr_native_lock_release_or_fatal(&down);
-		thread->walr.request = down;
-		(*guard)->walr.held = false;
-	} else if (!(*guard)->borrowed_from_pin && !(*guard)->borrowed_from_read_pin) {
-		ClusterLockAcquireResult lock_result;
-
-		lock_result = walr_request_release_actual(&(*guard)->walr.request);
-		if (lock_result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED) {
-			(*guard)->walr.release_uncertain = true;
-			result = CLUSTER_WALR_RELEASE_UNCONFIRMED;
-		} else
-			(*guard)->walr.held = false;
 	}
 	if (result == CLUSTER_WALR_RELEASE_CONFIRMED) {
 		active_root_publish_guard = NULL;
-		explicit_bzero(*guard, sizeof(**guard));
+		explicit_bzero(*guard, sizeof(**guard) * (1 + (*guard)->nmembers));
 		pfree(*guard);
 		*guard = NULL;
 		logged_owner = false;
@@ -1394,7 +1644,7 @@ cluster_wal_retention_root_publish_end(ClusterWalRootPublishGuard **guard)
 
 diagnostic:
 	/* PGRAC: log the retained original owner once, including repeated cleanup. */
-	request = &(*guard)->walr.request;
+	request = &member->walr.request;
 	if (!logged_owner || logged_request != request->request_id
 		|| logged_epoch != request->holder.cluster_epoch
 		|| logged_control_owner != request->control_owner_id) {
@@ -1497,6 +1747,7 @@ bool
 cluster_wal_retention_root_publish_sealed_current(const ClusterWalRootPublishGuard *guard,
 												  const ClusterControlRootReadToken *expected_root)
 {
+	const ClusterWalRootPublishGuard *member;
 	ClusterWalPinThread *thread;
 	PgracExternalFenceDenyReason reason;
 
@@ -1506,14 +1757,16 @@ cluster_wal_retention_root_publish_sealed_current(const ClusterWalRootPublishGua
 	 * Author: SqlRush <sqlrush@gmail.com> */
 	if (guard == NULL || guard != active_root_publish_guard || expected_root == NULL
 		|| guard->magic != CLUSTER_WAL_ROOT_PUBLISH_MAGIC || guard->owner_pid != MyProcPid
-		|| guard->owner != CurrentResourceOwner || !guard->borrowed_from_pin
-		|| !guard->converted_from_pin || guard->pin != active_pin || !guard->walr.held
-		|| guard->walr.release_uncertain || guard->walr.request.lockmode != ExclusiveLock
-		|| !walr_request_current(&guard->walr.request)
-		|| guard->thread_id != expected_root->origin_thread_id || !pin_valid(active_pin)
+		|| guard->owner != CurrentResourceOwner)
+		return false;
+	member = root_publish_member(guard, expected_root->origin_thread_id);
+	if (member == NULL || !member->borrowed_from_pin || !member->converted_from_pin
+		|| member->pin != active_pin || !member->walr.held || member->walr.release_uncertain
+		|| member->walr.request.lockmode != ExclusiveLock
+		|| !walr_request_current(&member->walr.request) || !pin_valid(active_pin)
 		|| active_pin->poisoned || active_pin->state != CLUSTER_WAL_PIN_STATE_SEALED)
 		return false;
-	thread = pin_find_thread(active_pin, guard->thread_id);
+	thread = pin_find_thread(active_pin, member->thread_id);
 	if (thread == NULL || thread->serial == NULL || thread->serial->held
 		|| thread->serial->release_uncertain
 		|| memcmp(&thread->root_read, expected_root, sizeof(*expected_root)) != 0
@@ -1585,21 +1838,26 @@ walr_resource_release_callback(ResourceReleasePhase phase, bool isCommit, bool i
 		&& active_root_publish_guard->owner == CurrentResourceOwner) {
 		ClusterWalRootPublishGuard *guard = active_root_publish_guard;
 
-		if (guard->converted_from_pin) {
-			ClusterWalPinThread *thread = pin_find_thread(guard->pin, guard->thread_id);
-			/* ERROR surrenders the one converted coordinated holder rather
+		for (uint16 i = guard->nmembers ? guard->nmembers : 1; i > 0; i--) {
+			ClusterWalRootPublishGuard *member = guard->nmembers ? &guard->members[i - 1] : guard;
+			ClusterWalPinThread *thread;
+
+			if (!member->converted_from_pin)
+				continue;
+			thread = pin_find_thread(member->pin, member->thread_id);
+			/* ERROR surrenders each converted coordinated holder rather
 			 * than trying to reconstruct S after an uncertain downgrade. */
-			if (guard->pin != active_pin || thread == NULL || !thread->walr.held
-				|| !guard->walr.held
-				|| walr_request_release_actual(&guard->walr.request)
+			if (member->pin != active_pin || thread == NULL || !thread->walr.held
+				|| !member->walr.held
+				|| walr_request_release_actual(&member->walr.request)
 					   != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
 				elog(FATAL, "could not confirm WALR exclusive root-publisher cleanup");
 			walr_native_lock_release_or_fatal(&thread->walr.request);
 			thread->walr.held = false;
 			thread->walr.release_uncertain = false;
-			guard->walr.held = false;
-			guard->converted_from_pin = false;
-			guard->pin->poisoned = true;
+			member->walr.held = false;
+			member->converted_from_pin = false;
+			member->pin->poisoned = true;
 		}
 		if (cluster_wal_retention_root_publish_end(&guard) != CLUSTER_WALR_RELEASE_CONFIRMED)
 			elog(FATAL, "could not confirm WALR root-publisher cleanup");

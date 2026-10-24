@@ -28,6 +28,14 @@
 #include "cluster/cluster_tx_resolve.h"
 
 static bool
+cluster_tx_resolve_recovered_open_admitted(void)
+{
+	return MyBackendType == B_STARTUP || !cluster_shared_config
+		   || cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_EXISTING_OTHER
+		   || cluster_semantic_activation_recovered_open_current();
+}
+
+static bool
 cluster_tx_locator_is_well_formed(const ClusterTxLocator *locator, bool allow_partial_wrap,
 								  ClusterTxResolveReason *reason_out)
 {
@@ -423,6 +431,10 @@ cluster_tx_resolve_exact_trace_impl(const ClusterTxLocator *locator, ClusterTxRe
 	if (reason_out != NULL)
 		*reason_out = CLUSTER_TX_RESOLVE_TARGET_DISABLED;
 	memset(&admission, 0, sizeof(admission));
+	if (!terminal_census && !cluster_tx_resolve_recovered_open_admitted()) {
+		reason = CLUSTER_TX_RESOLVE_RF_DEFERRED;
+		goto done;
+	}
 	if (terminal_census)
 		admission_result = cluster_semantic_activation_enter_r4_terminal_census(&admission);
 	else
@@ -466,6 +478,10 @@ cluster_tx_resolve_multixact(MultiXactId mxid, ClusterMultiResolution *out,
 	if (reason_out != NULL)
 		*reason_out = CLUSTER_TX_RESOLVE_TARGET_DISABLED;
 	memset(&admission, 0, sizeof(admission));
+	if (!cluster_tx_resolve_recovered_open_admitted()) {
+		reason = CLUSTER_TX_RESOLVE_RF_DEFERRED;
+		goto done;
+	}
 
 	admission_result = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
 														 CLUSTER_SEMANTIC_TARGET_SIDE, &admission);

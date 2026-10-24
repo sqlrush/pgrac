@@ -17,6 +17,7 @@
 #include "cluster/cluster_page_anchor_cache.h"
 #include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_thread.h"
@@ -59,6 +60,21 @@ static bool catch_native_errors, native_panicked;
 XLogRecPtr ProcLastRecPtr, XactLastRecEnd;
 static XLogRecPtr last_insert_record_end;
 ProcessingMode Mode = NormalProcessing;
+BackendType MyBackendType = B_BACKEND;
+static ClusterNormalStartState page_wal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+static bool page_wal_recovered_open = true;
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return page_wal_start_state;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return page_wal_recovered_open;
+}
 
 #include "test_cluster_pcm_checksum_owner.inc"
 #include "test_cluster_page_wal_image.inc"
@@ -757,6 +773,33 @@ carrier_preflight_refuses_without_mutation(void)
 		free(before);
 	}
 }
+
+UT_TEST(online_install_requires_recovered_open)
+{
+	ClusterPageWalBindingV1 carrier;
+	ClusterPageWalInstallV1 prepared = { 0 };
+	ClusterNormalStartState saved_state = page_wal_start_state;
+	bool saved_open = page_wal_recovered_open;
+	BackendType saved_backend = MyBackendType;
+
+	reset();
+	MyBackendType = B_BACKEND;
+	page_wal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	page_wal_recovered_open = false;
+	UT_ASSERT(capture());
+	PageSetLSNPreserveOrigin(page.data, 0x200);
+	UT_ASSERT(cluster_page_wal_snapshot_v1(1, &carrier));
+	UT_ASSERT(!cluster_page_wal_prepare_install_v1(1, &carrier, page.data, &prepared));
+	page_wal_recovered_open = true;
+	UT_ASSERT(cluster_page_wal_prepare_install_v1(1, &carrier, page.data, &prepared));
+	UT_ASSERT(cluster_page_wal_publish_install_v1(1, &prepared));
+	cluster_page_wal_release_install_v1(&prepared);
+
+	page_wal_start_state = saved_state;
+	page_wal_recovered_open = saved_open;
+	MyBackendType = saved_backend;
+}
+
 static void
 unattributed_carrier_clears_old_source(void)
 {
@@ -1818,7 +1861,7 @@ UT_TEST(space_capture_unavailable_source_is_not_mutation_failure)
 int
 main(void)
 {
-	UT_PLAN(44);
+	UT_PLAN(45);
 	UT_RUN(installed_carrier_matches_explicit_absence_not_snapshot_failure);
 	UT_RUN(output_snapshot_retains_exact_failed_output_binding);
 	UT_RUN(failed_output_distinguishes_empty_latest_from_invalid_binding);
@@ -1845,6 +1888,7 @@ main(void)
 	UT_RUN(global_catalog_identity);
 	UT_RUN(carrier_install_keeps_original_generation);
 	UT_RUN(carrier_preflight_refuses_without_mutation);
+	UT_RUN(online_install_requires_recovered_open);
 	UT_RUN(unattributed_carrier_clears_old_source);
 	UT_RUN(flush_certification_is_source_exact);
 	UT_RUN(flush_refusal_never_certifies);

@@ -16,12 +16,16 @@
 #include "catalog/pg_control.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
+#include "replication/origin.h"
 #include "storage/standbydefs.h"
 #include "cluster/cluster_side_online_plan.h"
+#include "cluster/cluster_uba.h"
+#include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_native_startup.h"
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_xid_stripe_xlog.h"
 #include "cluster/storage/cluster_undo_alloc.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 
 #ifdef RF_SIDE_ONLINE_TESTING
 #include <stdlib.h>
@@ -46,8 +50,12 @@ struct RfSideOnlinePlanV1 {
 	uint8 storage_uuid[16];
 	Size memory_budget;
 	Size memory_used;
+	/* Charged in memory_used: serial preflight/apply needs one aligned copy. */
+	Size cold_completion_scratch_bytes;
 	uint32 participant_count;
 	RfContributorStreamCutV1 *physical_cuts;
+	ClusterWalSourceRef *sources;
+	uint32 source_count;
 	XLogRecPtr *redo_starts;
 	XLogRecPtr *last_record_end;
 	bool *participant_seen;
@@ -60,6 +68,114 @@ struct RfSideOnlinePlanV1 {
 	ClusterSpaceIdentityKey *space_targets;
 	uint32 space_target_count;
 };
+
+/* A rejected binding cannot leave an earlier sealed view consumable. */
+static bool
+side_source_bind_failed(RfSideOnlinePlanV1 *plan)
+{
+	if (plan != NULL && plan->magic == RF_SIDE_ONLINE_PLAN_MAGIC) {
+		plan->failed = true;
+		plan->sealed = false;
+	}
+	return false;
+}
+
+/* Streamed participants can be only a subset of the retained ROOT inputs.
+ * Source array order carries no authority and is not a participant index. */
+static uint32
+side_cut_source(const RfContributorStreamCutV1 *cut, const ClusterWalSourceRef *sources,
+				uint32 count)
+{
+	uint32 found = UINT32_MAX;
+
+	for (uint32 i = 0; i < count; i++) {
+		const ClusterControlRootIdentity *id = &sources[i].claim.identity;
+		if (id->origin_thread_id != cut->failed_thread
+			|| id->origin_owner_incarnation != cut->origin_owner_incarnation)
+			continue;
+		if (found != UINT32_MAX || sources[i].timeline != cut->timeline_id)
+			return UINT32_MAX;
+		found = i;
+	}
+	return found;
+}
+
+bool
+rf_side_online_plan_bind_sources_v1(RfSideOnlinePlanV1 *plan, const ClusterWalSourceRef *sources,
+									uint32 count)
+{
+	Size bytes;
+	ClusterWalSourceRef *bound;
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || plan->sealed || plan->failed
+		|| plan->sources != NULL || sources == NULL || count < plan->participant_count || count == 0
+		|| count > RF_PAGE_STABLE_MAX_PARTICIPANTS || plan->operation_count != 0)
+		return side_source_bind_failed(plan);
+	for (uint32 i = 0; i < count; i++) {
+		const ClusterWalThreadClaimRefV2 *claim = &sources[i].claim;
+		const ClusterControlRootIdentity *id = &claim->identity;
+
+		if (!cluster_wal_claim_v2_ref_valid(claim)
+			|| id->system_identifier != plan->system_identifier
+			|| memcmp(id->storage_uuid, plan->storage_uuid, 16) != 0 || sources[i].timeline == 0
+			|| claim->database_incarnation != sources[0].claim.database_incarnation
+			|| (plan->database_incarnation != 0
+				&& plan->database_incarnation != claim->database_incarnation))
+			return side_source_bind_failed(plan);
+		/* A repeated identity is ambiguous even with the same hash/timeline;
+		 * a second claim must never repair or override the first one. */
+		for (uint32 j = 0; j < i; j++)
+			if (sources[j].claim.identity.origin_thread_id == id->origin_thread_id
+				&& sources[j].claim.identity.origin_owner_incarnation
+					   == id->origin_owner_incarnation)
+				return side_source_bind_failed(plan);
+	}
+	for (uint32 i = 0; i < plan->participant_count; i++)
+		if (plan->participant_seen[i]
+			|| side_cut_source(&plan->physical_cuts[i], sources, count) == UINT32_MAX)
+			return side_source_bind_failed(plan);
+	bytes = (Size)count * sizeof(*bound);
+	if (bytes > plan->memory_budget || plan->memory_used > plan->memory_budget - bytes)
+		return side_source_bind_failed(plan);
+	bound = (ClusterWalSourceRef *)side_alloc0(bytes);
+	if (bound == NULL)
+		return side_source_bind_failed(plan);
+	memcpy(bound, sources, bytes);
+	plan->sources = bound;
+	plan->source_count = count;
+	plan->memory_used += bytes;
+	return true;
+}
+
+bool
+rf_side_online_plan_recovery_abort_sources_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+											  ClusterWalSourceRef *writer,
+											  ClusterWalSourceRef *target)
+{
+	const RfSideOnlineOperationV1 *op;
+	uint32 writer_index;
+
+	if (writer != NULL)
+		memset(writer, 0, sizeof(*writer));
+	if (target != NULL)
+		memset(target, 0, sizeof(*target));
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || plan->failed
+		|| plan->purpose != RF_SIDE_PLAN_RECOVERY || plan->sources == NULL
+		|| index >= plan->operation_count || writer == NULL || target == NULL || writer == target)
+		return false;
+	op = &plan->operations[index];
+	if (op->kind != RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT
+		|| op->identity.participant_index >= plan->participant_count
+		|| op->recovery_target_source >= plan->source_count)
+		return false;
+	writer_index = side_cut_source(&plan->physical_cuts[op->identity.participant_index],
+								   plan->sources, plan->source_count);
+	if (writer_index == UINT32_MAX)
+		return false;
+	*writer = plan->sources[writer_index];
+	*target = plan->sources[op->recovery_target_source];
+	return true;
+}
 
 static bool
 side_bytes_nonzero(const uint8 *bytes, Size length)
@@ -345,8 +461,11 @@ side_operation_space_input(const RfSideOnlinePlanV1 *plan, const RfSideOnlineOpe
 
 		if (op->owned_payload_length != op->xact.completion_payload_length
 			|| (plan->purpose == RF_SIDE_PLAN_PI_CONTRIBUTIONS
-				? !rf_side_xact_inspection_preflight_v1(&op->xact)
-				: !rf_side_xact_structural_preflight_v1(&op->xact)))
+					? !rf_side_xact_inspection_preflight_v1(&op->xact)
+				: op->xact.cold_completion_effects
+					? !rf_side_xact_cold_completion_payload_v1(&op->xact, candidate.data,
+															   candidate.length)
+					: !rf_side_xact_structural_preflight_v1(&op->xact)))
 			return false;
 		candidate.data = (const uint8 *)candidate.data + op->xact.space_drop_offset
 						 + (Size)item * CLUSTER_SPACE_STRUCTURE_WAL_BYTES;
@@ -367,7 +486,7 @@ side_operation_space_input(const RfSideOnlinePlanV1 *plan, const RfSideOnlineOpe
 static bool
 side_projection_decode(const RfDetachedRecordPlanV1 *record_plan,
 					   RfSideOnlineOperationV1 *candidate, uint32 *payload_offset,
-					   uint32 *payload_length)
+					   uint32 *payload_length, bool bounded_members)
 {
 	const XLogReaderState *record = record_plan->source_record;
 	const char *data = XLogRecGetData(record);
@@ -437,18 +556,18 @@ side_projection_decode(const RfDetachedRecordPlanV1 *record_plan,
 		}
 		if (info == XLOG_MULTIXACT_CREATE_ID) {
 			xl_multixact_create header;
-			Size expected;
 			int i;
 
 			if (data_length < SizeOfMultiXactCreate)
 				return false;
 			memset(&header, 0, sizeof(header));
 			memcpy(&header, data, SizeOfMultiXactCreate);
-			if (header.nmembers <= 0 || header.nmembers > 256 || !MultiXactIdIsValid(header.mid)
-				|| header.moff == 0)
+			if (header.nmembers <= 0 || (bounded_members && header.nmembers > 256)
+				|| !MultiXactIdIsValid(header.mid) || header.moff == 0)
 				return false;
-			expected = SizeOfMultiXactCreate + (Size)header.nmembers * sizeof(MultiXactMember);
-			if (expected != data_length)
+			if ((data_length - SizeOfMultiXactCreate) % sizeof(MultiXactMember) != 0
+				|| (data_length - SizeOfMultiXactCreate) / sizeof(MultiXactMember)
+					   != (Size)header.nmembers)
 				return false;
 			for (i = 0; i < header.nmembers; i++) {
 				MultiXactMember member;
@@ -484,6 +603,31 @@ side_projection_decode(const RfDetachedRecordPlanV1 *record_plan,
 		}
 	}
 	return false;
+}
+
+bool
+rf_side_online_projection_record_shape_v1(XLogReaderState *record, bool bounded_members)
+{
+	RfDetachedRecordPlanV1 record_plan = { 0 };
+	RfSideOnlineOperationV1 candidate = { 0 };
+	uint32 payload_offset;
+	uint32 payload_length;
+	uint8 rmid;
+
+	if (record == NULL || record->record == NULL || XLogRecMaxBlockId(record) >= 0
+		|| XLogRecGetData(record) == NULL
+		|| (XLogRecGetInfo(record) & XLR_INFO_MASK & ~XLR_CHECK_CONSISTENCY) != 0)
+		return false;
+	rmid = XLogRecGetRmid(record);
+	if (rmid != RM_CLOG_ID && rmid != RM_MULTIXACT_ID && rmid != RM_COMMIT_TS_ID)
+		return false;
+	record_plan.source_record = record;
+	record_plan.route.rmid = rmid;
+	record_plan.route.normalized_info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
+	record_plan.route.record_owner = RF_ROUTE_OWNER_SIDE_TYPED;
+	record_plan.route.codec_id = RF_ROUTE_CODEC_SIDE_STANDARD;
+	return side_projection_decode(&record_plan, &candidate, &payload_offset, &payload_length,
+								  bounded_members);
 }
 
 static bool
@@ -705,6 +849,22 @@ side_native_standby_valid(const uint8 *data, uint32 length, uint8 info)
 	}
 }
 
+bool
+rf_side_online_standby_record_shape_v1(XLogReaderState *record)
+{
+	uint32 length;
+	const uint8 *data;
+
+	if (record == NULL || record->record == NULL || XLogRecGetRmid(record) != RM_STANDBY_ID
+		|| XLogRecMaxBlockId(record) >= 0 || record->record->has_page_version_edge
+		|| (XLogRecGetInfo(record) & XLR_INFO_MASK) != 0)
+		return false;
+	length = XLogRecGetDataLen(record);
+	data = (const uint8 *)XLogRecGetData(record);
+	return (length == 0 || data != NULL)
+		   && side_native_standby_valid(data, length, XLogRecGetInfo(record) & ~XLR_INFO_MASK);
+}
+
 /* Stripe knowledge belongs to its native owner, not a PCM page. JOIN is
  * emitted by the joining source; RETIRE is emitted by the removal coordinator
  * and can name another slot. Neither shape alone authorizes replay. */
@@ -745,6 +905,19 @@ side_native_control_valid(XLogReaderState *reader, const RfPageOnlineRecordIdent
 	if (XLogRecMaxBlockId(reader) >= 0 || reader->record->has_page_version_edge
 		|| (length > 0 && data == NULL) || (XLogRecGetInfo(reader) & XLR_INFO_MASK) != 0)
 		return false;
+	if (XLogRecGetRmid(reader) == RM_XACT_ID) {
+		int count;
+
+		if (info == XLOG_XACT_ASSIGNMENT)
+			return rf_side_xact_assignment_preflight_v1(data, length);
+		/* Preserve the full logical-decoding array, even though physical
+		 * xact_redo performs no work for this command-level marker. */
+		if (info != XLOG_XACT_INVALIDATIONS || length < MinSizeOfXactInvals)
+			return false;
+		memcpy(&count, data + offsetof(xl_xact_invals, nmsgs), sizeof(count));
+		return count >= 0
+			   && (uint64)count * sizeof(SharedInvalidationMessage) == length - MinSizeOfXactInvals;
+	}
 	if (XLogRecGetRmid(reader) == RM_STANDBY_ID)
 		return side_native_standby_valid(data, length, info);
 	if (XLogRecGetRmid(reader) == RM_CLUSTER_XID_STRIPE_ID)
@@ -815,6 +988,62 @@ side_native_control_valid(XLogReaderState *reader, const RfPageOnlineRecordIdent
 	}
 }
 
+/* C0's WAL writer is not the target TT owner. Only the original retained
+ * full-source set may identify that target; neither its digest nor these
+ * copies grant a mutation scope, a loser verdict or terminal completion. */
+static bool
+side_recovery_abort_decode(const RfSideOnlinePlanV1 *plan,
+						   const RfDetachedRecordPlanV1 *record_plan,
+						   const RfPageOnlineRecordIdentityV1 *identity,
+						   RfSideOnlineOperationV1 *candidate)
+{
+	const XLogReaderState *reader = record_plan->source_record;
+	const ClusterWalThreadClaimRefV2 *writer;
+	ClusterRecoveryTTAbortV1 *c0 = &candidate->recovery_abort;
+	uint32 target = UINT32_MAX;
+	uint32 writer_index;
+
+	if (plan->purpose != RF_SIDE_PLAN_RECOVERY || plan->sources == NULL
+		|| record_plan->route.normalized_info != XLOG_UNDO_RECOVERY_TT_ABORT
+		|| XLogRecGetRmid(reader) != RM_CLUSTER_UNDO_ID
+		|| XLogRecGetInfo(reader) != XLOG_UNDO_RECOVERY_TT_ABORT || XLogRecHasAnyBlockRefs(reader)
+		|| TransactionIdIsValid(XLogRecGetXid(reader))
+		|| TransactionIdIsValid(reader->record->toplevel_xid)
+		|| XLogRecGetOrigin(reader) != InvalidRepOriginId
+		|| !cluster_recovery_tt_abort_decode_v1((const uint8 *)XLogRecGetData(reader),
+												XLogRecGetDataLen(reader), c0))
+		return false;
+	writer_index = side_cut_source(&plan->physical_cuts[identity->participant_index], plan->sources,
+								   plan->source_count);
+	if (writer_index == UINT32_MAX)
+		return false;
+	writer = &plan->sources[writer_index].claim;
+	if (writer->identity.origin_thread_id != c0->writer_thread
+		|| writer->identity.origin_owner_incarnation != c0->writer_incarnation)
+		return false;
+	for (uint32 i = 0; i < plan->source_count; i++) {
+		const ClusterWalThreadClaimRefV2 *claim = &plan->sources[i].claim;
+		const ClusterControlRootIdentity *id = &claim->identity;
+
+		if (id->origin_thread_id != c0->target_thread
+			|| id->origin_owner_incarnation != c0->target_incarnation)
+			continue;
+		if (target != UINT32_MAX || memcmp(claim->claim_sha256, c0->target_claim_sha256, 32) != 0
+			|| id->system_identifier != writer->identity.system_identifier
+			|| memcmp(id->storage_uuid, writer->identity.storage_uuid, 16) != 0
+			|| memcmp(id->authority_uuid, writer->identity.authority_uuid, 16) != 0
+			|| claim->database_incarnation != writer->database_incarnation)
+			return false;
+		target = i;
+	}
+	if (target == UINT32_MAX)
+		return false;
+	candidate->kind = RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT;
+	candidate->recovery_target_source = (uint16)target;
+	candidate->owned_payload_length = XLogRecGetDataLen(reader);
+	return true;
+}
+
 /* Decode one record without allocating or retaining its payload. Both the
  * immutable replay plan and the streaming census use this same validator. */
 static RfPageProofDetailV1
@@ -849,7 +1078,12 @@ side_decode_record(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *recor
 	memset(candidate, 0, sizeof(*candidate));
 	*payload = NULL;
 	if (record_plan->route.record_owner == RF_ROUTE_OWNER_SIDE_TYPED) {
-		if (((record_plan->route.rmid == RM_XLOG_ID || record_plan->route.rmid == RM_STANDBY_ID)
+		if (((record_plan->route.rmid == RM_XLOG_ID || record_plan->route.rmid == RM_STANDBY_ID
+			  || (record_plan->route.rmid == RM_XACT_ID
+				  && ((XLogRecGetInfo(record_plan->source_record) & ~XLR_INFO_MASK)
+						  == XLOG_XACT_ASSIGNMENT
+					  || (XLogRecGetInfo(record_plan->source_record) & ~XLR_INFO_MASK)
+							 == XLOG_XACT_INVALIDATIONS)))
 			 && record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_STANDARD)
 			|| (record_plan->route.rmid == RM_CLUSTER_XID_STRIPE_ID
 				&& record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_XID_STRIPE_SHMEM)) {
@@ -862,10 +1096,19 @@ side_decode_record(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *recor
 		} else if (record_plan->route.rmid == RM_XACT_ID
 				   && record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_STANDARD) {
 			if (!(plan->purpose == RF_SIDE_PLAN_PI_CONTRIBUTIONS
-				  ? rf_side_xact_inspect_pi_v1(record_plan->source_record, plan->system_identifier,
-											 identity->record.origin_thread, &candidate->xact)
-				  : rf_side_xact_decode_v1(record_plan->source_record, plan->system_identifier,
-										  identity->record.origin_thread, &candidate->xact)))
+					  ? rf_side_xact_inspect_pi_v1(record_plan->source_record,
+												   plan->system_identifier,
+												   identity->record.origin_thread, &candidate->xact)
+					  : rf_side_xact_decode_recovery_v1(
+							record_plan->source_record, plan->system_identifier,
+							identity->record.origin_thread, &candidate->xact)))
+				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			/* A selected compound consumer reconstructs only this immutable
+			 * top-level carrier. Reject unsupported frame identity before it
+			 * can be lost by capture; PI inspection remains non-executable. */
+			if (plan->purpose == RF_SIDE_PLAN_RECOVERY && candidate->xact.space_drop_count != 0
+				&& (XLogRecGetOrigin(record_plan->source_record) != InvalidRepOriginId
+					|| TransactionIdIsValid(record_plan->source_record->record->toplevel_xid)))
 				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 			candidate->kind = RF_SIDE_ONLINE_OPERATION_XACT;
 			if (candidate->xact.kind == RF_SIDE_XACT_PREPARE
@@ -890,6 +1133,13 @@ side_decode_record(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *recor
 				*payload = (const uint8 *)XLogRecGetData(record_plan->source_record);
 			}
 		} else if (record_plan->route.rmid == RM_CLUSTER_UNDO_ID
+				   && record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_CLUSTER_UNDO
+				   && (XLogRecGetInfo(record_plan->source_record) & ~XLR_INFO_MASK)
+						  == XLOG_UNDO_RECOVERY_TT_ABORT) {
+			if (!side_recovery_abort_decode(plan, record_plan, identity, candidate))
+				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			*payload = (const uint8 *)XLogRecGetData(record_plan->source_record);
+		} else if (record_plan->route.rmid == RM_CLUSTER_UNDO_ID
 				   && record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_CLUSTER_UNDO) {
 			uint32 length = XLogRecGetDataLen(record_plan->source_record);
 			if (!cluster_undo_decode(record_plan->source_record, &candidate->undo)
@@ -911,8 +1161,7 @@ side_decode_record(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *recor
 			}
 		} else if (record_plan->route.rmid == RM_SMGR_ID
 				   && record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_STANDARD) {
-			if (plan->purpose == RF_SIDE_PLAN_PI_CONTRIBUTIONS
-				&& record_plan->route.normalized_info == XLOG_SMGR_CREATE) {
+			if (record_plan->route.normalized_info == XLOG_SMGR_CREATE) {
 				xl_smgr_create create;
 				if (XLogRecHasAnyBlockRefs(record_plan->source_record)
 					|| XLogRecGetInfo(record_plan->source_record)
@@ -936,7 +1185,7 @@ side_decode_record(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *recor
 					|| record_plan->route.rmid == RM_COMMIT_TS_ID)
 				   && record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_STANDARD) {
 			uint32 offset, length;
-			if (!side_projection_decode(record_plan, candidate, &offset, &length))
+			if (!side_projection_decode(record_plan, candidate, &offset, &length, true))
 				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 			candidate->kind = RF_SIDE_ONLINE_OPERATION_PROJECTION;
 			candidate->owned_payload_length = length;
@@ -947,6 +1196,7 @@ side_decode_record(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *recor
 		candidate->route = record_plan->route;
 		candidate->purpose = plan->purpose;
 		candidate->source_xid = XLogRecGetXid(record_plan->source_record);
+		candidate->source_top_xid = record_plan->source_record->record->toplevel_xid;
 		candidate->history_only
 			= identity->record.end_rec_ptr <= plan->redo_starts[identity->participant_index];
 	} else if (record_plan->route.record_owner != RF_ROUTE_OWNER_PAGE_CODEC
@@ -963,21 +1213,47 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 	RfSideOnlineOperationV1 candidate;
 	const uint8 *payload;
 	RfPageProofDetailV1 detail;
+	bool recovery_abort = record_plan != NULL && record_plan->source_record != NULL
+						  && record_plan->source_record->record != NULL
+						  && XLogRecGetRmid(record_plan->source_record) == RM_CLUSTER_UNDO_ID
+						  && (XLogRecGetInfo(record_plan->source_record) & ~XLR_INFO_MASK)
+								 == XLOG_UNDO_RECOVERY_TT_ABORT;
 
 	detail = side_decode_record(plan, record_plan, identity, &candidate, &payload);
 	if (detail != RF_PAGE_PROOF_DETAIL_OK) {
 		if (plan != NULL && plan->magic == RF_SIDE_ONLINE_PLAN_MAGIC
-			&& plan->purpose == RF_SIDE_PLAN_PI_CONTRIBUTIONS)
-			plan->failed = true;
+			&& (plan->purpose == RF_SIDE_PLAN_PI_CONTRIBUTIONS || plan->sources != NULL
+				|| recovery_abort))
+			(void)side_source_bind_failed(plan);
 		return detail;
 	}
 	if (candidate.kind != RF_SIDE_ONLINE_OPERATION_INVALID) {
 		if (!side_ensure_operation_capacity(plan)
 			|| !side_ensure_payload_capacity(plan, candidate.owned_payload_length))
 		{
-			if (plan->purpose == RF_SIDE_PLAN_PI_CONTRIBUTIONS)
-				plan->failed = true;
+			if (plan->purpose == RF_SIDE_PLAN_PI_CONTRIBUTIONS || plan->sources != NULL)
+				(void)side_source_bind_failed(plan);
 			return RF_PAGE_PROOF_DETAIL_CAPACITY;
+		}
+		if (((candidate.kind == RF_SIDE_ONLINE_OPERATION_XACT
+			  && candidate.xact.cold_completion_effects)
+			 || (candidate.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
+				 && plan->purpose == RF_SIDE_PLAN_RECOVERY
+				 && ((candidate.identity.record.rmid == RM_STANDBY_ID
+					  && (candidate.identity.record.info & ~XLR_INFO_MASK) == XLOG_INVALIDATIONS)
+					 || (candidate.identity.record.rmid == RM_XACT_ID
+						 && (candidate.identity.record.info & ~XLR_INFO_MASK)
+								== XLOG_XACT_ASSIGNMENT))))
+			&& candidate.owned_payload_length > plan->cold_completion_scratch_bytes) {
+			Size extra = candidate.owned_payload_length - plan->cold_completion_scratch_bytes;
+
+			/* Keep the largest simultaneous native copy separate from both
+			 * owned payload storage and the original page/header scratch. */
+			if (!side_plan_reserve(plan, extra)) {
+				plan->failed = true;
+				return RF_PAGE_PROOF_DETAIL_CAPACITY;
+			}
+			plan->cold_completion_scratch_bytes = candidate.owned_payload_length;
 		}
 		candidate.owned_payload_offset = plan->owned_payload_bytes;
 		if (candidate.owned_payload_length > 0) {
@@ -995,8 +1271,10 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 bool
 rf_side_online_plan_bind_database_v1(RfSideOnlinePlanV1 *plan, uint64 database_incarnation)
 {
-	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || plan->sealed
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || plan->sealed || plan->failed
 		|| database_incarnation == 0
+		|| (plan->sources != NULL
+			&& plan->sources[0].claim.database_incarnation != database_incarnation)
 		|| (plan->database_incarnation != 0 && plan->database_incarnation != database_incarnation))
 		return false;
 	for (uint32 i = 0; i < plan->operation_count; i++)
@@ -1043,6 +1321,7 @@ rf_side_online_plan_source_matches_v1(const RfSideOnlinePlanV1 *plan, uint64 sys
 									  const RfContributorStreamCutV1 *cut)
 {
 	const RfContributorStreamCutV1 *source;
+	uint32 flags;
 
 	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed
 		|| plan->database_incarnation == 0 || system_identifier != plan->system_identifier
@@ -1057,10 +1336,92 @@ rf_side_online_plan_source_matches_v1(const RfSideOnlinePlanV1 *plan, uint64 sys
 		}
 	if (source == NULL)
 		return false;
-	return cut->flags == RF_CONTRIBUTOR_CUT_COMPLETE && cut->flags == source->flags
+	flags = RF_CONTRIBUTOR_CUT_COMPLETE
+			| (cut->scan_begin_inclusive == cut->scan_end_exclusive
+				   ? RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY
+				   : 0);
+	return cut->flags == flags && cut->flags == source->flags
 		   && cut->failed_thread == source->failed_thread && cut->timeline_id == source->timeline_id
 		   && cut->scan_begin_inclusive == source->scan_begin_inclusive
 		   && cut->scan_end_exclusive == source->scan_end_exclusive;
+}
+
+bool
+rf_side_online_plan_recovery_source_matches_v1(const RfSideOnlinePlanV1 *plan,
+											   uint64 system_identifier,
+											   const uint8 storage_uuid[16],
+											   const RfContributorStreamCutV1 *cut)
+{
+	return rf_side_online_plan_source_matches_v1(plan, system_identifier, storage_uuid, cut)
+		   && plan->purpose == RF_SIDE_PLAN_RECOVERY;
+}
+
+static bool
+side_recovery_claim_matches(const RfSideOnlinePlanV1 *plan, const ClusterWalSourceRef *source,
+							bool physical)
+{
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || plan->failed
+		|| plan->purpose != RF_SIDE_PLAN_RECOVERY || plan->sources == NULL || source == NULL
+		|| !cluster_wal_claim_v2_ref_valid(&source->claim) || source->timeline == 0
+		|| plan->database_incarnation != source->claim.database_incarnation)
+		return false;
+	for (uint32 i = 0; i < (physical ? plan->participant_count : plan->source_count); i++) {
+		const ClusterWalSourceRef *bound;
+		const ClusterControlRootIdentity *left, *right;
+
+		if (physical) {
+			const RfContributorStreamCutV1 *cut = &plan->physical_cuts[i];
+			uint32 index;
+
+			if (cut->failed_thread != source->claim.identity.origin_thread_id
+				|| cut->origin_owner_incarnation != source->claim.identity.origin_owner_incarnation
+				|| cut->timeline_id != source->timeline)
+				continue;
+			index = side_cut_source(cut, plan->sources, plan->source_count);
+			if (index == UINT32_MAX)
+				return false;
+			bound = &plan->sources[index];
+		} else {
+			bound = &plan->sources[i];
+			if (bound->claim.identity.origin_thread_id != source->claim.identity.origin_thread_id
+				|| bound->claim.identity.origin_owner_incarnation
+					   != source->claim.identity.origin_owner_incarnation
+				|| bound->timeline != source->timeline)
+				continue;
+		}
+		left = &bound->claim.identity;
+		right = &source->claim.identity;
+		/* Compare logical fields, never native-struct padding. Both reserved
+		 * fields were checked by bind_sources and ref_valid respectively. */
+		return left->system_identifier == right->system_identifier
+			   && memcmp(left->storage_uuid, right->storage_uuid, 16) == 0
+			   && memcmp(left->authority_uuid, right->authority_uuid, 16) == 0
+			   && left->origin_thread_id == right->origin_thread_id
+			   && left->origin_node_id == right->origin_node_id
+			   && left->thread_claim_created_at == right->thread_claim_created_at
+			   && left->thread_claim_crc32c == right->thread_claim_crc32c
+			   && left->origin_owner_incarnation == right->origin_owner_incarnation
+			   && left->root_lineage_seq == right->root_lineage_seq
+			   && bound->claim.database_incarnation == source->claim.database_incarnation
+			   && bound->claim.max_config_generation == source->claim.max_config_generation
+			   && memcmp(bound->claim.claim_sha256, source->claim.claim_sha256, 32) == 0
+			   && bound->timeline == source->timeline;
+	}
+	return false;
+}
+
+bool
+rf_side_online_plan_recovery_claim_matches_v1(const RfSideOnlinePlanV1 *plan,
+											  const ClusterWalSourceRef *source)
+{
+	return side_recovery_claim_matches(plan, source, true);
+}
+
+bool
+rf_side_online_plan_recovery_bound_claim_matches_v1(const RfSideOnlinePlanV1 *plan,
+													const ClusterWalSourceRef *source)
+{
+	return side_recovery_claim_matches(plan, source, false);
 }
 
 static RfPageProofDetailV1
@@ -1215,10 +1576,124 @@ rf_side_online_plan_contains_commit_v1(const RfSideOnlinePlanV1 *plan,
 	return false;
 }
 
-static ClusterUndoHeaderPrepareResultV1
-side_plan_slot_step(const RfSideOnlineOperationV1 *op, const char *base, char *out)
+static bool
+side_plan_abort_identity(const RfSideOnlinePlanV1 *plan, const RfSideOnlineOperationV1 *operation,
+						 ClusterUndoDecoded *out, bool include_history)
 {
-	if (op->owned_payload_length != 0)
+	const RfSideOnlineOperationV1 *abort = NULL;
+	uint32 native_count = 0;
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || plan->failed
+		|| plan->purpose != RF_SIDE_PLAN_RECOVERY || operation == NULL || out == NULL
+		|| operation->purpose != RF_SIDE_PLAN_RECOVERY
+		|| (operation->history_only && !include_history)
+		|| operation->kind != RF_SIDE_ONLINE_OPERATION_XACT
+		|| operation->xact.kind != RF_SIDE_XACT_ABORT
+		|| (operation->xact.cold_completion_effects
+				? !rf_side_xact_cold_completion_preflight_v1(
+					  &operation->xact, operation->owned_payload, operation->owned_payload_length)
+				: (operation->owned_payload != NULL || operation->owned_payload_length != 0
+				   || !rf_side_xact_structural_preflight_v1(&operation->xact)))
+		|| rf_side_online_plan_origin_operation_count_v1(plan, operation->xact.origin_thread)
+			   == UINT32_MAX)
+		return false;
+
+	/* A raw xid cannot choose among retained incarnations or terminal records.
+	 * Match the complete exported native operation, not a caller-supplied xid. */
+	for (uint32 i = 0; i < plan->operation_count; i++) {
+		const RfSideOnlineOperationV1 *op = &plan->operations[i];
+
+		if (op->identity.record.origin_thread != operation->xact.origin_thread)
+			continue;
+		if (op->kind == RF_SIDE_ONLINE_OPERATION_XACT && op->xact.xid == operation->xact.xid) {
+			RfSideOnlineOperationV1 expected = *op;
+
+			if (expected.owned_payload_length != 0) {
+				if (expected.owned_payload_offset > plan->owned_payload_bytes
+					|| expected.owned_payload_length
+						   > plan->owned_payload_bytes - expected.owned_payload_offset)
+					return false;
+				expected.owned_payload = plan->owned_payload + expected.owned_payload_offset;
+			}
+			if (memcmp(&expected, operation, sizeof(expected)) != 0 || ++native_count != 1)
+				return false;
+		}
+		if (op->kind != RF_SIDE_ONLINE_OPERATION_UNDO || op->undo.kind != CLUSTER_UNDO_KIND_TT_ABORT
+			|| op->undo.xid != operation->xact.xid)
+			continue;
+		if (abort != NULL || op->identity.participant_index != operation->identity.participant_index
+			|| op->identity.record.end_rec_ptr > operation->identity.record.read_rec_ptr
+			|| op->undo.format_version != CLUSTER_UNDO_TT_ABORT_EXACT_VERSION
+			|| !cluster_undo_preflight(&op->undo))
+			return false;
+		abort = op;
+	}
+	if (native_count != 1 || abort == NULL)
+		return false;
+	for (uint32 i = 0; i < plan->operation_count; i++) {
+		const RfSideOnlineOperationV1 *op = &plan->operations[i];
+		const ClusterUndoDecoded *d = &op->undo;
+		const ClusterUndoDecoded *key = &abort->undo;
+		uint16 slot;
+
+		if (op->identity.record.origin_thread != operation->xact.origin_thread
+			|| op->kind != RF_SIDE_ONLINE_OPERATION_UNDO || op == abort)
+			continue;
+		if (d->xid == key->xid
+			&& (d->kind == CLUSTER_UNDO_KIND_TT_BIND || d->kind == CLUSTER_UNDO_KIND_TT_COMMIT
+				|| d->kind == CLUSTER_UNDO_KIND_TT_SET_HEAD)) {
+			if (d->kind == CLUSTER_UNDO_KIND_TT_COMMIT || d->instance != key->instance
+				|| d->segment_id != key->segment_id || d->slot_offset != key->slot_offset
+				|| d->wrap != key->wrap
+				|| (d->kind == CLUSTER_UNDO_KIND_TT_BIND
+					&& d->expected_generation != key->expected_generation))
+				return false;
+		}
+		/* The producer emits TT_ABORT before native ABORT. A later reuse or
+		 * mutation inside that interval cannot be assigned to the old carrier. */
+		if (op->identity.participant_index != abort->identity.participant_index
+			|| op->identity.record.read_rec_ptr < abort->identity.record.end_rec_ptr
+			|| op->identity.record.read_rec_ptr >= operation->identity.record.read_rec_ptr
+			|| d->instance != key->instance || d->segment_id != key->segment_id)
+			continue;
+		if (d->kind == CLUSTER_UNDO_KIND_SEGMENT_INIT
+			|| d->kind == CLUSTER_UNDO_KIND_SEGMENT_RECYCLE
+			|| d->kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE
+			|| (side_plan_slot_operation(op, key->instance, key->segment_id, &slot)
+				&& slot == key->slot_offset))
+			return false;
+	}
+	*out = abort->undo;
+	return true;
+}
+
+bool
+rf_side_online_plan_abort_target_v1(const RfSideOnlinePlanV1 *plan,
+									const RfSideOnlineOperationV1 *operation,
+									ClusterUndoDecoded *out)
+{
+	return side_plan_abort_identity(plan, operation, out, false);
+}
+
+bool
+rf_side_online_plan_abort_identity_v1(const RfSideOnlinePlanV1 *plan,
+									  const RfSideOnlineOperationV1 *operation,
+									  ClusterUndoDecoded *out)
+{
+	return side_plan_abort_identity(plan, operation, out, true);
+}
+
+static ClusterUndoHeaderPrepareResultV1
+side_plan_slot_step(const RfSideOnlinePlanV1 *plan, const RfSideOnlineOperationV1 *op,
+					const char *base, char *out)
+{
+	if (op->owned_payload_length != 0
+		&& (op->kind != RF_SIDE_ONLINE_OPERATION_XACT
+			|| op->owned_payload_offset > plan->owned_payload_bytes
+			|| op->owned_payload_length > plan->owned_payload_bytes - op->owned_payload_offset
+			|| !rf_side_xact_cold_completion_preflight_v1(
+				&op->xact, plan->owned_payload + op->owned_payload_offset,
+				op->owned_payload_length)))
 		return CLUSTER_UNDO_HEADER_BLOCKED;
 	if (op->kind == RF_SIDE_ONLINE_OPERATION_XACT) {
 		const xl_xact_tt_commit *d = &op->xact.tt_delta;
@@ -1293,7 +1768,7 @@ side_plan_prepare_slots(const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 s
 			if (!started) {
 				if (!full_image) {
 					if (original != NULL) {
-						result = side_plan_slot_step(op, observed, scratch.data);
+						result = side_plan_slot_step(plan, op, observed, scratch.data);
 						proved = result == CLUSTER_UNDO_HEADER_APPLY
 								 || result == CLUSTER_UNDO_HEADER_ALREADY;
 					}
@@ -1321,7 +1796,7 @@ side_plan_prepare_slots(const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 s
 				}
 				started = true;
 			}
-			result = side_plan_slot_step(op, scratch.data, scratch.data);
+			result = side_plan_slot_step(plan, op, scratch.data, scratch.data);
 			/* Stale source is not evidence of a target's membership. */
 			if (result == CLUSTER_UNDO_HEADER_BLOCKED || result == CLUSTER_UNDO_HEADER_SKIP_STALE)
 				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
@@ -1359,17 +1834,16 @@ side_plan_prepare_slots(const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 s
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
-RfPageProofDetailV1
-rf_side_online_plan_prepare_undo_block_v1(const RfSideOnlinePlanV1 *plan, uint8 instance,
-										  uint32 segment_id, uint32 block_no,
-										  RfSideUndoBlockImageV1 *out)
+static RfPageProofDetailV1
+side_plan_prepare_undo_block(const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 segment_id,
+							 uint32 block_no, uint32 end, RfSideUndoBlockImageV1 *out)
 {
 	RfSideUndoBlockImageV1 prepared;
 	bool anchored = false;
 	Size scratch = sizeof(prepared) + BLCKSZ;
 
 	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || out == NULL
-		|| instance == 0 || instance > 128 || segment_id == 0
+		|| end > plan->operation_count || instance == 0 || instance > 128 || segment_id == 0
 		|| ((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1 != instance || block_no == 0
 		|| block_no >= UNDO_BLOCKS_PER_SEGMENT)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
@@ -1377,7 +1851,7 @@ rf_side_online_plan_prepare_undo_block_v1(const RfSideOnlinePlanV1 *plan, uint8 
 		return RF_PAGE_PROOF_DETAIL_CAPACITY;
 	memset(&prepared, 0, sizeof(prepared));
 	prepared.source_index = UINT32_MAX;
-	for (uint32 i = 0; i < plan->operation_count; i++) {
+	for (uint32 i = 0; i < end; i++) {
 		const RfSideOnlineOperationV1 *op = &plan->operations[i];
 		const ClusterUndoDecoded *d = &op->undo;
 
@@ -1400,16 +1874,15 @@ rf_side_online_plan_prepare_undo_block_v1(const RfSideOnlinePlanV1 *plan, uint8 
 		prepared.source_index = i;
 		prepared.operation_count++;
 	}
-	if (prepared.operation_count == 0)
+	if (!anchored || prepared.operation_count == 0)
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 	*out = prepared;
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
-RfPageProofDetailV1
-rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan, uint8 instance,
-										   uint32 segment_id, const char *base,
-										   RfSideUndoHeaderImageV1 *out)
+static RfPageProofDetailV1
+side_plan_prepare_undo_header(const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 segment_id,
+							  const char *base, uint32 end, RfSideUndoHeaderImageV1 *out)
 {
 	RfSideUndoHeaderImageV1 prepared;
 	PGAlignedBlock seed;
@@ -1419,15 +1892,17 @@ rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan, uint8
 	bool base_valid, observed = false, full_image = false, found = false;
 
 	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || out == NULL
-		|| instance == 0 || instance > 128 || segment_id == 0
+		|| end > plan->operation_count || instance == 0 || instance > 128 || segment_id == 0
 		|| ((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1 != instance)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	if (scratch > plan->memory_budget || plan->memory_used > plan->memory_budget - scratch)
 		return RF_PAGE_PROOF_DETAIL_CAPACITY;
 	memset(&prepared, 0, sizeof(prepared));
 	prepared.source_index = UINT32_MAX;
-	base_valid = base != NULL && UndoSegmentHeader_identity_matches(base, segment_id, instance);
-	for (uint32 i = 0; i < plan->operation_count; i++) {
+	base_valid = base != NULL
+				 && cluster_undo_segment_header_integrity(base) != CLUSTER_UNDO_HEADER_CORRUPT
+				 && UndoSegmentHeader_identity_matches(base, segment_id, instance);
+	for (uint32 i = 0; i < end; i++) {
 		const RfSideOnlineOperationV1 *op = &plan->operations[i];
 		uint16 slot;
 
@@ -1463,9 +1938,8 @@ rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan, uint8
 			memcpy(seed.data, base, BLCKSZ);
 	}
 	prepared.page = seed;
-	for (uint32 i = 0; i <= plan->operation_count; i++) {
-		const RfSideOnlineOperationV1 *op
-			= i == plan->operation_count ? NULL : &plan->operations[i];
+	for (uint32 i = 0; i <= end; i++) {
+		const RfSideOnlineOperationV1 *op = i == end ? NULL : &plan->operations[i];
 		const char *target;
 
 		if (op != NULL) {
@@ -1521,10 +1995,142 @@ rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan, uint8
 	}
 	if (base_valid && !observed)
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	/* A checksum is a physical write result, not a WAL field. Preserve an
+	 * unchanged predecessor (including legacy zero); replaying its history
+	 * alone must not manufacture integrity qualification. */
+	if (base_valid)
+		((PageHeader)prepared.page.data)->pd_checksum = ((const PageHeaderData *)base)->pd_checksum;
 	if (base_valid && memcmp(base, prepared.page.data, BLCKSZ) == 0)
 		prepared.source_index = UINT32_MAX;
+	else if (prepared.operation_count != 0
+			 && !cluster_undo_segment_header_seal(prepared.page.data))
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 	*out = prepared;
 	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_block_v1(const RfSideOnlinePlanV1 *plan, uint8 instance,
+										  uint32 segment_id, uint32 block_no,
+										  RfSideUndoBlockImageV1 *out)
+{
+	return side_plan_prepare_undo_block(plan, instance, segment_id, block_no,
+										plan != NULL ? plan->operation_count : 0, out);
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan, uint8 instance,
+										   uint32 segment_id, const char *base,
+										   RfSideUndoHeaderImageV1 *out)
+{
+	return side_plan_prepare_undo_header(plan, instance, segment_id, base,
+										 plan != NULL ? plan->operation_count : 0, out);
+}
+
+static RfPageProofDetailV1
+side_plan_prepare_undo_record(const RfSideOnlinePlanV1 *plan, uint32 index,
+							  const RfPageOnlineRecordIdentityV1 *identity, const char *base,
+							  bool header_only, bool allow_history, RfSideUndoHeaderImageV1 *out)
+{
+	const RfSideOnlineOperationV1 *operation;
+	uint8 instance;
+	uint32 segment;
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || plan->failed
+		|| plan->purpose != RF_SIDE_PLAN_RECOVERY || out == NULL || identity == NULL
+		|| index >= plan->operation_count)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	operation = &plan->operations[index];
+	if ((operation->history_only && !allow_history) || operation->purpose != RF_SIDE_PLAN_RECOVERY
+		|| identity->reserved_zero != 0
+		|| identity->participant_index != operation->identity.participant_index
+		|| memcmp(&identity->record, &operation->identity.record, sizeof(identity->record)) != 0
+		|| rf_side_online_plan_origin_operation_count_v1(plan, identity->record.origin_thread)
+			   == UINT32_MAX)
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	if (operation->kind == RF_SIDE_ONLINE_OPERATION_UNDO) {
+		const ClusterUndoDecoded *undo = &operation->undo;
+
+		instance = undo->instance;
+		segment = undo->segment_id;
+		if (!header_only
+			&& (undo->kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
+				|| undo->kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI))
+			return side_plan_prepare_undo_block(plan, instance, segment, undo->block_no, index + 1,
+												out);
+	} else if (operation->kind == RF_SIDE_ONLINE_OPERATION_XACT
+			   && operation->xact.kind == RF_SIDE_XACT_COMMIT && operation->xact.has_tt_delta) {
+		instance = operation->xact.tt_delta.instance;
+		segment = operation->xact.tt_delta.segment_id;
+	} else if (header_only && operation->kind == RF_SIDE_ONLINE_OPERATION_XACT
+			   && operation->xact.kind == RF_SIDE_XACT_ABORT) {
+		RfSideOnlineOperationV1 exported;
+		ClusterUndoDecoded target;
+
+		/* Bind the complete native payload and its unique earlier TT_ABORT.
+		 * Native ABORT itself is not another TT transition. */
+		if (!rf_side_online_plan_operation_v1(plan, index, &exported)
+			|| !rf_side_online_plan_abort_target_v1(plan, &exported, &target))
+			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		instance = target.instance;
+		segment = target.segment_id;
+	} else
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	/* Original immutable full-source input stays intact. Only the private
+	 * reconstruction endpoint changes; later lifecycle/terminal records
+	 * cannot establish the selected prefix's base or enter its output. */
+	return side_plan_prepare_undo_header(plan, instance, segment, base, index + 1, out);
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+										   const RfPageOnlineRecordIdentityV1 *identity,
+										   const char *base, RfSideUndoHeaderImageV1 *out)
+{
+	return side_plan_prepare_undo_record(plan, index, identity, base, false, false, out);
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_record_header_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+												  const RfPageOnlineRecordIdentityV1 *identity,
+												  const char *base, RfSideUndoHeaderImageV1 *out)
+{
+	return side_plan_prepare_undo_record(plan, index, identity, base, true, false, out);
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_record_input_header_v1(
+	const RfSideOnlinePlanV1 *plan, uint32 index, const RfPageOnlineRecordIdentityV1 *identity,
+	const char *base, RfSideUndoHeaderImageV1 *out)
+{
+	return side_plan_prepare_undo_record(plan, index, identity, base, true, true, out);
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_head_block_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+											   const RfPageOnlineRecordIdentityV1 *identity,
+											   RfSideUndoBlockImageV1 *out)
+{
+	const RfSideOnlineOperationV1 *op;
+	uint32 segment, block;
+	uint16 slot, row;
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || plan->failed
+		|| plan->purpose != RF_SIDE_PLAN_RECOVERY || index >= plan->operation_count
+		|| identity == NULL || out == NULL)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	op = &plan->operations[index];
+	if (op->history_only || op->purpose != RF_SIDE_PLAN_RECOVERY
+		|| op->kind != RF_SIDE_ONLINE_OPERATION_UNDO
+		|| op->undo.kind != CLUSTER_UNDO_KIND_TT_SET_HEAD || identity->reserved_zero != 0
+		|| identity->participant_index != op->identity.participant_index
+		|| memcmp(&identity->record, &op->identity.record, sizeof(identity->record)) != 0
+		|| rf_side_online_plan_origin_operation_count_v1(plan, identity->record.origin_thread)
+			   == UINT32_MAX
+		|| !cluster_undo_preflight(&op->undo)
+		|| !uba_decode_record(op->undo.first_undo_block, &segment, &block, &slot, &row))
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	return side_plan_prepare_undo_block(plan, op->undo.instance, segment, block, index, out);
 }
 
 typedef struct SideSpaceSourceInput {
@@ -1632,8 +2238,8 @@ done:
  * to a subsequent typed CREATE; PAGE users must additionally match every
  * version edge to that typed incarnation and respect its creation boundary. */
 static bool
-side_pi_creation(const RfSideOnlinePlanV1 *plan, uint32 index,
-				 ClusterSpaceStructureChange *change, uint32 *typed_index)
+side_native_creation(const RfSideOnlinePlanV1 *plan, uint32 index,
+					 ClusterSpaceStructureChange *change, uint32 *typed_index)
 {
 	const RfSideOnlineOperationV1 *op = &plan->operations[index];
 	xl_smgr_create create;
@@ -1672,15 +2278,153 @@ side_pi_creation(const RfSideOnlinePlanV1 *plan, uint32 index,
 	return false;
 }
 
+bool
+rf_side_online_plan_native_creation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+									   ClusterSpaceStructureChange *change)
+{
+	uint32 typed;
+
+	if (change != NULL)
+		memset(change, 0, sizeof(*change));
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || plan->failed
+		|| plan->purpose != RF_SIDE_PLAN_RECOVERY || change == NULL
+		|| index >= plan->operation_count)
+		return false;
+	if (!side_native_creation(plan, index, change, &typed)) {
+		memset(change, 0, sizeof(*change));
+		return false;
+	}
+	return true;
+}
+
+/* Native ABORT has no SPACE incarnation. Keep every pending-delete locator
+ * tied to a unique earlier CREATE pair in this original source and xid.
+ * This proves the input binding, not permission to delete any storage. */
 static bool
-side_pi_structures_covered(const RfSideOnlinePlanV1 *plan)
+side_native_abort_creation(const RfSideOnlinePlanV1 *plan, uint32 index, RelFileLocator locator,
+						   uint32 *typed_index)
+{
+	const RfSideOnlineOperationV1 *op = &plan->operations[index];
+	bool found = false;
+	uint32 matched = UINT32_MAX;
+
+	for (uint32 j = 0; j < plan->operation_count; j++) {
+		const RfSideOnlineOperationV1 *create = &plan->operations[j];
+		ClusterSpaceStructureChange change;
+		xl_smgr_create native;
+		uint32 typed;
+
+		if (create->kind != RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE)
+			continue;
+		memcpy(&native, plan->owned_payload + create->owned_payload_offset, sizeof(native));
+		if (!RelFileLocatorEquals(native.rlocator, locator))
+			continue;
+		if (found || j >= index || create->source_xid != op->source_xid
+			|| create->identity.participant_index != op->identity.participant_index
+			|| create->identity.record.end_rec_ptr > op->identity.record.read_rec_ptr
+			|| !side_native_creation(plan, j, &change, &typed) || typed >= index
+			|| plan->operations[typed].identity.record.end_rec_ptr
+				   > op->identity.record.read_rec_ptr)
+			return false;
+		/* A completed raw xid cannot lend its CREATE to a later reuse. */
+		for (uint32 k = j + 1; k < index; k++) {
+			const RfSideOnlineOperationV1 *between = &plan->operations[k];
+
+			if (between->identity.participant_index == op->identity.participant_index
+				&& between->kind == RF_SIDE_ONLINE_OPERATION_XACT
+				&& between->xact.xid == op->xact.xid)
+				return false;
+		}
+		matched = typed;
+		found = true;
+	}
+	if (found)
+		*typed_index = matched;
+	return found;
+}
+
+static bool
+side_native_abort_deletes_covered(const RfSideOnlinePlanV1 *plan, uint32 index)
+{
+	const RfSideOnlineOperationV1 *op = &plan->operations[index];
+	xl_xact_parsed_abort parsed;
+	uint8 *copy;
+	bool result = false;
+
+	if (plan->purpose != RF_SIDE_PLAN_RECOVERY || !op->xact.cold_completion_effects
+		|| op->source_xid != op->xact.xid || op->owned_payload_offset > plan->owned_payload_bytes
+		|| op->owned_payload_length > plan->owned_payload_bytes - op->owned_payload_offset
+		|| !rf_side_xact_cold_completion_payload_v1(
+			&op->xact, plan->owned_payload + op->owned_payload_offset, op->owned_payload_length))
+		return false;
+	/* The bounded validator freed its aligned copy. Reuse the plan's single
+	 * maximum-payload scratch reservation while reading native locators. */
+	copy = side_alloc0(op->owned_payload_length);
+	if (copy == NULL)
+		return false;
+	memcpy(copy, plan->owned_payload + op->owned_payload_offset, op->owned_payload_length);
+	ParseAbortRecord(XLOG_XACT_ABORT | XLOG_XACT_HAS_INFO, (xl_xact_abort *)copy, &parsed);
+	for (int r = 0; r < parsed.nrels; r++) {
+		uint32 typed;
+
+		/* Native pending-delete duplicates may share this same exact pair. */
+		if (!side_native_abort_creation(plan, index, parsed.xlocators[r], &typed))
+			goto done;
+	}
+	result = true;
+done:
+	side_free(copy);
+	return result;
+}
+
+bool
+rf_side_online_plan_abort_creation_v1(const RfSideOnlinePlanV1 *plan, uint32 index, uint32 relation,
+									  uint32 *creation_index)
+{
+	const RfSideOnlineOperationV1 *op;
+	xl_xact_parsed_abort parsed;
+	uint8 *copy;
+	bool ok;
+
+	if (creation_index != NULL)
+		*creation_index = UINT32_MAX;
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || plan->failed
+		|| plan->purpose != RF_SIDE_PLAN_RECOVERY || creation_index == NULL
+		|| index >= plan->operation_count)
+		return false;
+	op = &plan->operations[index];
+	if (op->kind != RF_SIDE_ONLINE_OPERATION_XACT || op->xact.kind != RF_SIDE_XACT_ABORT
+		|| relation >= op->xact.relation_count || !op->xact.cold_completion_effects
+		|| op->source_xid != op->xact.xid || op->owned_payload_offset > plan->owned_payload_bytes
+		|| op->owned_payload_length > plan->owned_payload_bytes - op->owned_payload_offset
+		|| !rf_side_xact_cold_completion_payload_v1(
+			&op->xact, plan->owned_payload + op->owned_payload_offset, op->owned_payload_length))
+		return false;
+	copy = side_alloc0(op->owned_payload_length);
+	if (copy == NULL)
+		return false;
+	memcpy(copy, plan->owned_payload + op->owned_payload_offset, op->owned_payload_length);
+	ParseAbortRecord(XLOG_XACT_ABORT | XLOG_XACT_HAS_INFO, (xl_xact_abort *)copy, &parsed);
+	ok = relation < parsed.nrels
+		 && side_native_abort_creation(plan, index, parsed.xlocators[relation], creation_index);
+	side_free(copy);
+	return ok;
+}
+
+static bool
+side_native_structures_covered(const RfSideOnlinePlanV1 *plan)
 {
 	for (uint32 i = 0; i < plan->operation_count; i++) {
 		ClusterSpaceStructureChange change;
 		uint32 typed;
 
 		if (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE
-			&& !side_pi_creation(plan, i, &change, &typed))
+			&& !side_native_creation(plan, i, &change, &typed))
+			return false;
+		if (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_XACT
+			&& plan->operations[i].xact.kind == RF_SIDE_XACT_ABORT
+			&& plan->operations[i].xact.relation_count != 0
+			&& !side_native_abort_deletes_covered(plan, i))
 			return false;
 	}
 	return true;
@@ -1703,7 +2447,7 @@ rf_side_online_plan_page_lifecycle_v1(const RfSideOnlinePlanV1 *plan,
 
 		if (op->kind != RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE)
 			continue;
-		if (!side_pi_creation(plan, i, &change, &typed))
+		if (!side_native_creation(plan, i, &change, &typed))
 			return false;
 		if (!RelFileLocatorEquals(target->page_identity.locator, change.identity.result.key.locator))
 			continue;
@@ -1748,7 +2492,7 @@ rf_side_online_plan_seal_v1(RfSideOnlinePlanV1 *plan)
 					|| plan->last_record_end[i] != cut->scan_end_exclusive)))
 			return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
 	}
-	if (plan->purpose == RF_SIDE_PLAN_PI_CONTRIBUTIONS && !side_pi_structures_covered(plan))
+	if (!side_native_structures_covered(plan))
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 	detail = side_space_sources_seal(plan);
 	if (detail != RF_PAGE_PROOF_DETAIL_OK)
@@ -1804,20 +2548,26 @@ rf_side_online_plan_contribution_owners_v1(const RfSideOnlinePlanV1 *plan, uint3
 		switch (op->xact.kind) {
 		case RF_SIDE_XACT_COMMIT:
 			result.owners = RF_SIDE_CONTRIBUTION_UNDO_HEADER | RF_SIDE_CONTRIBUTION_TERMINAL;
-			if (op->xact.pi_read_only) {
+			if (op->xact.pi_read_only || op->xact.cold_completion_effects) {
 				if (op->xact.invalidation_count != 0
 					|| XactCompletionRelcacheInitFileInval(op->xact.xinfo))
 					result.owners |= RF_SIDE_CONTRIBUTION_INVALIDATION;
 				if (op->xact.relation_count != 0)
 					result.owners |= RF_SIDE_CONTRIBUTION_NATIVE_STRUCTURE;
-				if ((op->xact.xinfo & (XACT_COMPLETION_FORCE_SYNC_COMMIT
-					| XACT_COMPLETION_APPLY_FEEDBACK | XACT_XINFO_HAS_AE_LOCKS)) != 0)
+				if ((op->xact.xinfo
+					 & (XACT_COMPLETION_FORCE_SYNC_COMMIT | XACT_COMPLETION_APPLY_FEEDBACK
+						| XACT_XINFO_HAS_AE_LOCKS | XACT_XINFO_HAS_DROPPED_STATS))
+					!= 0)
 					result.owners |= RF_SIDE_CONTRIBUTION_COMPLETION;
 			}
 			break;
 		case RF_SIDE_XACT_ABORT:
 			/* Its TT transition is a separate original UNDO record. */
 			result.owners = RF_SIDE_CONTRIBUTION_TERMINAL;
+			if (op->xact.cold_completion_effects)
+				result.owners |= RF_SIDE_CONTRIBUTION_COMPLETION;
+			if (op->xact.relation_count != 0)
+				result.owners |= RF_SIDE_CONTRIBUTION_NATIVE_STRUCTURE;
 			break;
 		case RF_SIDE_XACT_PREPARE:
 		case RF_SIDE_XACT_COMMIT_PREPARED:
@@ -2127,6 +2877,78 @@ rf_side_online_plan_space_terminal_v1(const RfSideOnlinePlanV1 *plan,
 }
 
 bool
+rf_side_online_plan_space_abort_v1(const RfSideOnlinePlanV1 *plan, uint32 space_operation,
+								   uint32 *abort_operation, uint32 *abort_relation)
+{
+	const RfSideOnlineOperationV1 *space;
+	RfSideSpaceTerminalV1 terminal;
+	uint32 selected = UINT32_MAX, ordinal = UINT32_MAX;
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || plan->failed
+		|| plan->purpose != RF_SIDE_PLAN_RECOVERY || space_operation >= plan->operation_count
+		|| abort_operation == NULL || abort_relation == NULL || abort_operation == abort_relation)
+		return false;
+	space = &plan->operations[space_operation];
+	if (space->kind != RF_SIDE_ONLINE_OPERATION_SPACE || space->history_only
+		|| !rf_side_online_plan_space_terminal_v1(plan, &space->space_key, 1, &terminal)
+		|| terminal.operation != space_operation)
+		return false;
+	if (space->route.normalized_info == XLOG_SMGR_SPACE_IDENTITY) {
+		ClusterSpaceStructureChange change;
+
+		if (!cluster_space_structure_wal_decode(plan->owned_payload + space->owned_payload_offset,
+												space->owned_payload_length, &change)
+			|| change.identity.action != CLUSTER_SPACE_WAL_CREATE)
+			return false;
+	} else if (space->route.normalized_info != XLOG_SMGR_SPACE_RESERVATION)
+		return false;
+	for (uint32 i = 0; i < plan->operation_count; i++) {
+		const RfSideOnlineOperationV1 *op = &plan->operations[i];
+
+		if (op->kind != RF_SIDE_ONLINE_OPERATION_XACT || op->xact.kind != RF_SIDE_XACT_ABORT)
+			continue;
+		for (uint32 r = 0; r < op->xact.relation_count; r++) {
+			uint32 creation;
+
+			/* Reuse the original complete payload, unique native CREATE pair,
+			 * source/xid and raw-xid-reuse checks; never match naked locators. */
+			if (!rf_side_online_plan_abort_creation_v1(plan, i, r, &creation))
+				return false;
+			if (!RelFileLocatorEquals(plan->operations[creation].space_key.locator,
+									  space->space_key.locator))
+				continue;
+			if (creation > space_operation || i <= space_operation || op->history_only
+				|| op->identity.participant_index != space->identity.participant_index
+				|| space->identity.record.end_rec_ptr > op->identity.record.read_rec_ptr
+				|| (selected != UINT32_MAX && selected != i))
+				return false;
+			/* Only the same original current CREATE/ADVANCE prefix may lend
+			 * this final binding. Structural transitions need their own owner. */
+			for (uint32 j = creation; j < i; j++) {
+				const RfSideOnlineOperationV1 *prefix = &plan->operations[j];
+
+				if (prefix->kind != RF_SIDE_ONLINE_OPERATION_SPACE
+					|| !RelFileLocatorEquals(prefix->space_key.locator, space->space_key.locator))
+					continue;
+				if (prefix->history_only || j > space_operation
+					|| prefix->identity.participant_index != op->identity.participant_index
+					|| prefix->identity.record.end_rec_ptr > op->identity.record.read_rec_ptr
+					|| (j != creation
+						&& prefix->route.normalized_info != XLOG_SMGR_SPACE_RESERVATION))
+					return false;
+			}
+			if (selected == UINT32_MAX) {
+				selected = i;
+				ordinal = r;
+			}
+		}
+	}
+	*abort_operation = selected;
+	*abort_relation = ordinal;
+	return true;
+}
+
+bool
 rf_side_online_plan_space_target_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 									ClusterSpaceIdentityKey *out)
 {
@@ -2272,10 +3094,14 @@ side_plan_apply_ops_valid(const RfSideOnlinePlanV1 *plan, const RfSideOnlineAppl
 	if (rf_side_online_plan_origin_operation_count_v1(plan, ops->source_thread) == UINT32_MAX)
 		return false;
 	for (i = 0; i < plan->operation_count; i++) {
-		if (plan->operations[i].history_only)
-			continue;
 		if (ops->source_thread != 0
 			&& plan->operations[i].identity.record.origin_thread != ops->source_thread)
+			continue;
+		/* Writer checkpoint coverage alone cannot discharge a target C0.
+		 * Its authority/coverage consumer is required even for history. */
+		if (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT)
+			return false;
+		if (plan->operations[i].history_only)
 			continue;
 		if ((plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_XACT
 			 && (ops->preflight_xact == NULL || ops->apply_xact == NULL))
@@ -2283,7 +3109,8 @@ side_plan_apply_ops_valid(const RfSideOnlinePlanV1 *plan, const RfSideOnlineAppl
 				&& (ops->preflight_undo == NULL || ops->apply_undo == NULL))
 			|| (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_PROJECTION
 				&& (ops->preflight_projection == NULL || ops->apply_projection == NULL))
-			|| (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_SPACE
+			|| ((plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_SPACE
+				 || plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE)
 				&& (ops->preflight_space == NULL || ops->apply_space == NULL))
 			/* No projection/TT callback may stand in for native control. */
 			|| (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
@@ -2327,7 +3154,8 @@ side_plan_preflight_active(const RfSideOnlinePlanV1 *plan, const RfSideOnlineApp
 			accepted = ops->preflight_xact(ops->arg, &operation);
 		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO)
 			accepted = ops->preflight_undo(ops->arg, &operation);
-		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_SPACE)
+		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_SPACE
+				 || operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE)
 			accepted = ops->preflight_space(ops->arg, &operation);
 		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL)
 			accepted = ops->preflight_control(ops->arg, &operation);
@@ -2372,6 +3200,8 @@ side_plan_apply_active(const RfSideOnlinePlanV1 *plan, const RfSideOnlineApplyOp
 	detail = side_plan_preflight_active(plan, ops);
 	if (detail != RF_PAGE_PROOF_DETAIL_OK)
 		return detail;
+	if (ops->prepare_apply != NULL && !ops->prepare_apply(ops->arg))
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 	for (i = 0; i < plan->operation_count; i++) {
 		RfSideOnlineOperationV1 operation = plan->operations[i];
 		bool applied;
@@ -2387,7 +3217,8 @@ side_plan_apply_active(const RfSideOnlinePlanV1 *plan, const RfSideOnlineApplyOp
 			applied = ops->apply_xact(ops->arg, &operation);
 		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO)
 			applied = ops->apply_undo(ops->arg, &operation);
-		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_SPACE)
+		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_SPACE
+				 || operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE)
 			applied = ops->apply_space(ops->arg, &operation);
 		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL)
 			applied = ops->apply_control(ops->arg, &operation);
@@ -2423,6 +3254,75 @@ rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan, const RfSideOnlineA
 	PG_END_TRY();
 	return detail;
 }
+
+RfPageProofDetailV1
+rf_side_online_plan_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+									const RfPageOnlineRecordIdentityV1 *identity,
+									const RfSideOnlineApplyOpsV1 *ops)
+{
+	RfSideOnlineOperationV1 operation;
+	RfPageProofDetailV1 detail;
+
+	if (!side_plan_apply_ops_valid(plan, ops) || plan->failed || identity == NULL
+		|| !rf_side_online_plan_operation_v1(plan, index, &operation) || ops->source_thread == 0
+		|| operation.history_only || operation.identity.record.origin_thread != ops->source_thread
+		|| identity->participant_index != operation.identity.participant_index
+		|| identity->reserved_zero != 0
+		|| memcmp(&identity->record, &operation.identity.record, sizeof(identity->record)) != 0)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	/* XACT and UNDO require their record callbacks, never the whole-source
+	 * consumers. Legacy terminal carriers and SPACE remain separate. */
+	if (operation.kind != RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
+		&& operation.kind != RF_SIDE_ONLINE_OPERATION_PROJECTION
+		&& !(operation.kind == RF_SIDE_ONLINE_OPERATION_XACT
+			 && (operation.xact.kind == RF_SIDE_XACT_COMMIT
+				 || operation.xact.kind == RF_SIDE_XACT_ABORT)
+			 && ops->apply_xact_record != NULL)
+		&& !(operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
+			 && (operation.undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
+				 || operation.undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI
+				 || operation.undo.kind == CLUSTER_UNDO_KIND_SEGMENT_INIT
+				 || operation.undo.kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE
+				 || operation.undo.kind == CLUSTER_UNDO_KIND_SEGMENT_RECYCLE
+				 || operation.undo.kind == CLUSTER_UNDO_KIND_TT_BIND
+				 || operation.undo.kind == CLUSTER_UNDO_KIND_TT_SET_HEAD
+				 || operation.undo.kind == CLUSTER_UNDO_KIND_TT_CTRC_RELEASE
+				 || (operation.undo.kind == CLUSTER_UNDO_KIND_TT_ABORT
+					 && operation.undo.format_version == CLUSTER_UNDO_TT_ABORT_EXACT_VERSION))
+			 && ops->apply_undo_record != NULL))
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	if (!ops->begin_protected_set(ops->arg))
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	PG_TRY();
+	{
+		/* Do not turn record selection into permission to skip an unsupported
+		 * later effect in this source. All original preflights still precede
+		 * the first mutation and the original source durability barrier. */
+		detail = side_plan_preflight_active(plan, ops);
+		if (detail == RF_PAGE_PROOF_DETAIL_OK && ops->prepare_apply != NULL
+			&& !ops->prepare_apply(ops->arg))
+			detail = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		if (detail == RF_PAGE_PROOF_DETAIL_OK) {
+			bool applied = operation.kind == RF_SIDE_ONLINE_OPERATION_XACT
+							   ? ops->apply_xact_record(ops->arg, index, &operation)
+						   : operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
+							   ? ops->apply_undo_record(ops->arg, index, &operation)
+						   : operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
+							   ? ops->apply_control(ops->arg, &operation)
+							   : ops->apply_projection(ops->arg, &operation);
+			if (!applied)
+				detail = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		}
+	}
+	PG_FINALLY();
+	{
+		/* Only the enclosing ordered replay can close the complete source. */
+		ops->end_protected_set(ops->arg, false);
+	}
+	PG_END_TRY();
+	return detail;
+}
+
 void
 rf_side_online_plan_destroy_v1(RfSideOnlinePlanV1 **plan_address)
 {
@@ -2433,6 +3333,8 @@ rf_side_online_plan_destroy_v1(RfSideOnlinePlanV1 **plan_address)
 	plan = *plan_address;
 	if (plan->physical_cuts != NULL)
 		side_free(plan->physical_cuts);
+	if (plan->sources != NULL)
+		side_free(plan->sources);
 	if (plan->last_record_end != NULL)
 		side_free(plan->last_record_end);
 	if (plan->redo_starts != NULL)

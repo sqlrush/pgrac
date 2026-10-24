@@ -17,6 +17,7 @@
 #include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_alloc.h"
+#include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "unit_test.h"
 
@@ -32,7 +33,31 @@ static bool note_accept;
 static bool note_pending;
 static bool expect_panic;
 static bool fail_sync;
+static size_t last_write_length;
+static bool header_locked;
+static uint32 header_locks, header_unlocks;
 static jmp_buf panic_jump;
+
+bool
+cluster_undo_block0_header_write_lock(uint32 segment, uint8 owner, uint32 *acquired)
+{
+	UT_ASSERT_EQ(segment, 513);
+	UT_ASSERT_EQ(owner, 3);
+	UT_ASSERT(!header_locked);
+	header_locked = true;
+	header_locks++;
+	*acquired = 17;
+	return true;
+}
+
+void
+cluster_undo_block0_header_write_unlock(uint32 acquired)
+{
+	UT_ASSERT_EQ(acquired, 17);
+	UT_ASSERT(header_locked);
+	header_locked = false;
+	header_unlocks++;
+}
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -88,6 +113,7 @@ fixture_write(int fd, const void *buffer, size_t length, off_t offset)
 				  && offset == offsetof(UndoSegmentHeaderData, tt_slots) + 4 * sizeof(TTSlot)));
 	UT_ASSERT_EQ(syncs, 0);
 	writes++;
+	last_write_length = length;
 	memcpy(disk.data + offset, buffer, length);
 	return length;
 }
@@ -189,6 +215,9 @@ reset_io(void)
 	notes = 0;
 	note_pending = false;
 	fail_sync = false;
+	last_write_length = 0;
+	header_locks = header_unlocks = 0;
+	header_locked = false;
 }
 
 static void
@@ -593,6 +622,7 @@ UT_TEST(test_native_init_validates_real_image_before_file_mutation)
 		}
 		expect_panic = false;
 		if (invalid == 0) {
+			UT_ASSERT(cluster_undo_segment_header_seal(image.data));
 			UT_ASSERT(memcmp(disk.data, image.data, BLCKSZ) == 0);
 			UT_ASSERT_EQ(writes, 1);
 			UT_ASSERT_EQ(syncs, 1);
@@ -666,6 +696,7 @@ UT_TEST(test_native_reuse_durability_and_stale_generation)
 	cluster_undo_segment_make_header_bytes(513, 3, image.data);
 	((UndoSegmentHeaderData *)image.data)->wrap_count = 9;
 	memcpy(wal.image, image.data, BLCKSZ);
+	UT_ASSERT(cluster_undo_segment_header_seal(image.data));
 	for (int generation = 8; generation <= 10; generation++) {
 		cluster_undo_segment_make_header_bytes(513, 3, disk.data);
 		((UndoSegmentHeaderData *)disk.data)->wrap_count = generation;
@@ -803,10 +834,109 @@ UT_TEST(test_native_exact_commit_rejects_bad_header_before_write)
 	}
 }
 
+UT_TEST(test_native_header_writers_seal_full_pages)
+{
+	for (int kind = 0; kind < 6; kind++) {
+		struct { xl_undo_segment_reuse record; char image[BLCKSZ]; } reuse = { 0 };
+		struct { xl_cluster_undo_segment_init record; char image[BLCKSZ]; } init = { 0 };
+		xl_undo_segment_recycle recycle = { 0 };
+		UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)disk.data;
+
+		cluster_undo_segment_make_header_bytes(513, 3, disk.data);
+		header->wrap_count = 8;
+		if (kind == 2 || kind == 3) {
+			header->tt_slots[4].xid = 802;
+			header->tt_slots[4].wrap = 7;
+			header->tt_slots[4].status = TT_SLOT_ACTIVE;
+		}
+		UT_ASSERT(cluster_undo_segment_header_seal(disk.data));
+		reset_io();
+		if (kind == 0) {
+			init.record.instance = 3;
+			init.record.segment_id = 513;
+			cluster_undo_segment_make_header_bytes(513, 3, init.image);
+			apply_record(XLOG_UNDO_SEGMENT_INIT, &init, sizeof(init));
+		} else if (kind == 1)
+			cluster_tt_durable_redo_bind_slot(3, 513, 8, 4, 7, 802);
+		else if (kind == 2)
+			cluster_tt_durable_redo_stamp_slot(3, 513, 4, 7, 802, 999);
+		else if (kind == 3)
+			cluster_tt_durable_redo_stamp_slot_exact(3, 513, 8, 4, 7, 802, 999);
+		else if (kind == 4) {
+			recycle.instance = 3;
+			recycle.segment_id = 513;
+			recycle.expected_generation = 8;
+			recycle.old_state = SEGMENT_COMMITTED;
+			recycle.new_state = SEGMENT_RECYCLABLE;
+			apply_record(XLOG_UNDO_SEGMENT_RECYCLE, &recycle, sizeof(recycle));
+		} else {
+			reuse.record.instance = 3;
+			reuse.record.segment_id = 513;
+			reuse.record.old_generation = 8;
+			reuse.record.new_generation = 9;
+			cluster_undo_segment_make_header_bytes(513, 3, reuse.image);
+			((UndoSegmentHeaderData *)reuse.image)->wrap_count = 9;
+			apply_record(XLOG_UNDO_SEGMENT_REUSE, &reuse, sizeof(reuse));
+		}
+		UT_ASSERT_EQ(writes, 1);
+		UT_ASSERT_EQ(last_write_length, BLCKSZ);
+		UT_ASSERT_EQ(cluster_undo_segment_header_integrity(disk.data), CLUSTER_UNDO_HEADER_VALID);
+		UT_ASSERT_EQ(header_locks, 1);
+		UT_ASSERT_EQ(header_unlocks, 1);
+		UT_ASSERT(!header_locked);
+	}
+}
+
+UT_TEST(test_native_delta_rejects_corrupt_header_before_identity)
+{
+	for (int kind = 0; kind < 4; kind++) {
+		PGAlignedBlock before;
+		xl_undo_segment_recycle recycle = { 0 };
+		UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)disk.data;
+
+		cluster_undo_segment_make_header_bytes(513, 3, disk.data);
+		header->wrap_count = 8;
+		if (kind != 0) {
+			header->tt_slots[4].xid = 802;
+			header->tt_slots[4].wrap = 7;
+			header->tt_slots[4].status = TT_SLOT_ACTIVE;
+		}
+		UT_ASSERT(cluster_undo_segment_header_seal(disk.data));
+		disk.data[BLCKSZ - 1] ^= 1;
+		before = disk;
+		reset_io();
+		expect_panic = true;
+		if (setjmp(panic_jump) == 0) {
+			if (kind == 0)
+				cluster_tt_durable_redo_bind_slot(3, 513, 8, 4, 7, 802);
+			else if (kind == 1)
+				cluster_tt_durable_redo_stamp_slot(3, 513, 4, 7, 802, 999);
+			else if (kind == 2)
+				cluster_tt_durable_redo_stamp_slot_exact(3, 513, 8, 4, 7, 802, 999);
+			else {
+				recycle.instance = 3;
+				recycle.segment_id = 513;
+				recycle.expected_generation = 8;
+				recycle.old_state = SEGMENT_COMMITTED;
+				recycle.new_state = SEGMENT_RECYCLABLE;
+				apply_record(XLOG_UNDO_SEGMENT_RECYCLE, &recycle, sizeof(recycle));
+			}
+			UT_ASSERT(false);
+		}
+		expect_panic = false;
+		UT_ASSERT_EQ(writes + syncs + applies, 0);
+		UT_ASSERT(memcmp(before.data, disk.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(header_locks, header_unlocks);
+		UT_ASSERT(!header_locked);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(14);
+	UT_RUN(test_native_header_writers_seal_full_pages);
+	UT_RUN(test_native_delta_rejects_corrupt_header_before_identity);
 	UT_RUN(test_native_exact_commit_rejects_bad_header_before_write);
 	UT_RUN(test_private_abort_head_release_and_exact_stale_results);
 	UT_RUN(test_native_bind_uses_complete_header_identity_and_durable_slot);

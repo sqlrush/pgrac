@@ -53,6 +53,7 @@
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_wal_claim.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_writer.h"
@@ -67,6 +68,13 @@ cluster_lmon_marker_complete_wakeup(void)
 
 /* This voting fixture never installs a native first-start writer. Keep
  * unrelated activation dependencies explicit and impossible to synthesize. */
+bool
+cluster_recovery_checkpoint_observe_v1(
+	ClusterRecoveryCheckpointObservationV1 *out pg_attribute_unused())
+{
+	abort();
+}
+
 bool
 cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out pg_attribute_unused())
 {
@@ -89,6 +97,13 @@ cluster_wal_writer_ready(TimeLineID timeline pg_attribute_unused())
 bool
 cluster_wal_thread_clean_writer_matches(const ClusterWalSourceRef *expected pg_attribute_unused(),
 										uint64 epoch pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_wal_thread_recovered_writer_matches(const ClusterWalSourceRef *expected pg_attribute_unused(),
+													uint64 epoch pg_attribute_unused())
 {
 	abort();
 }
@@ -224,6 +239,7 @@ extern ClusterReplacementRequestSlotState
 cluster_qvotec_test_replacement_request_preserve(ClusterVotingSlot *next,
 												 const ClusterVotingSlot *prior);
 extern long cluster_qvotec_test_poll_wait_timeout_ms(uint64 elapsed_us, int poll_interval_ms);
+extern bool cluster_qvotec_test_death_policy_valid(uint64 write_lease_us, uint64 death_floor_us);
 extern bool cluster_qvotec_test_clean_shutdown(const int *fds, int n_disks, uint64 incarnation,
 											   uint64 generation);
 extern void cluster_qvotec_test_probe_prior_slots(const int *fds, int n_disks, uint64 incarnation);
@@ -2136,7 +2152,7 @@ UT_TEST(test_in_quorum_pre_shmem_init_false)
 	UT_ASSERT(!(cluster_qvotec_in_quorum()));
 }
 
-UT_TEST(test_quorum_lease_thirty_polls_preserves_exact_expiry_and_fail_closed)
+UT_TEST(test_quorum_write_lease_six_polls_preserves_exact_expiry_and_fail_closed)
 {
 	void (*publish)(uint64) = cluster_qvotec_test_publish_poll_lease;
 	TimestampTz saved_now = mock_now;
@@ -2156,19 +2172,17 @@ UT_TEST(test_quorum_lease_thirty_polls_preserves_exact_expiry_and_fail_closed)
 	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 4), CLUSTER_QVOTEC_QUORUM_OK);
 	publish(1000000);
 	UT_ASSERT_EQ(pg_atomic_read_u64((pg_atomic_uint64 *)(shmem_storage + 24)), 1000000);
-	UT_ASSERT_EQ(pg_atomic_read_u64((pg_atomic_uint64 *)(shmem_storage + 32)), 61000000);
+	UT_ASSERT_EQ(pg_atomic_read_u64((pg_atomic_uint64 *)(shmem_storage + 32)), 13000000);
 	memcpy(published, shmem_storage, sizeof(published));
 
-	/* The old age boundaries are inside the approved laboratory window. */
+	/* The actual write permit expires at twelve seconds, independently of death. */
 	mock_now = 5000000;
 	UT_ASSERT(cluster_qvotec_in_quorum());
+	mock_now = 12999999;
+	UT_ASSERT(cluster_qvotec_in_quorum());
 	mock_now = 13000000;
-	UT_ASSERT(cluster_qvotec_in_quorum());
-	mock_now = 60999999;
-	UT_ASSERT(cluster_qvotec_in_quorum());
-	mock_now = 61000000;
 	UT_ASSERT(!cluster_qvotec_in_quorum());
-	mock_now = 61000001;
+	mock_now = 13000001;
 	UT_ASSERT(!cluster_qvotec_in_quorum());
 	UT_ASSERT_EQ(memcmp(published, shmem_storage, sizeof(published)), 0);
 
@@ -2185,7 +2199,7 @@ UT_TEST(test_quorum_lease_thirty_polls_preserves_exact_expiry_and_fail_closed)
 	/* Only the existing publisher renews; it does not turn a LOST state OK. */
 	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 4), CLUSTER_QVOTEC_QUORUM_LOST);
 	publish(14000000);
-	UT_ASSERT_EQ(pg_atomic_read_u64((pg_atomic_uint64 *)(shmem_storage + 32)), 74000000);
+	UT_ASSERT_EQ(pg_atomic_read_u64((pg_atomic_uint64 *)(shmem_storage + 32)), 26000000);
 	UT_ASSERT_EQ(cluster_qvotec_get_quorum_state(), CLUSTER_QVOTEC_QUORUM_LOST);
 	UT_ASSERT(!cluster_qvotec_in_quorum());
 	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 4), CLUSTER_QVOTEC_QUORUM_OK);
@@ -3105,7 +3119,40 @@ UT_TEST(test_prior_exit_cannot_be_replaced_by_another_probe)
  * caller's death threshold and this node's write lease (so a still-living
  * old instance could no longer commit).  Author: SqlRush <sqlrush@gmail.com>
  */
-#define DEATH_LEASE_US ((uint64)2000 * 30 * 1000)
+#define DEATH_LEASE_US ((uint64)2000 * 15 * 1000)
+
+UT_TEST(test_prior_death_policy_rejects_enlarged_write_lease)
+{
+	/* The exact production predicate used before QVOTEC opens voting disks. */
+	UT_ASSERT(cluster_qvotec_test_death_policy_valid(12000000, 30000000));
+	UT_ASSERT(cluster_qvotec_test_death_policy_valid(15000000, 30000000));
+	UT_ASSERT(!cluster_qvotec_test_death_policy_valid(15000001, 30000000));
+	UT_ASSERT(!cluster_qvotec_test_death_policy_valid(60000000, 30000000));
+	UT_ASSERT(!cluster_qvotec_test_death_policy_valid(0, 30000000));
+	UT_ASSERT(!cluster_qvotec_test_death_policy_valid(UINT64_MAX, UINT64_MAX));
+}
+
+UT_TEST(test_prior_death_thirty_second_boundary)
+{
+	PgsaDiskSet set;
+	ClusterQvotecPriorExitObservation out;
+	bool unclean;
+
+	UT_ASSERT(normal_stop_disk_set(&set));
+	cluster_shared_config = true;
+	UT_ASSERT(normal_stop_startup_probe(&set, &unclean));
+	UT_ASSERT(unclean);
+	/* The saved predecessor heartbeat is 1; CSSD's selected deadband is 20s. */
+	UT_ASSERT(!cluster_qvotec_prior_death_observe(0, 901, 902, 1 + UINT64CONST(29900000),
+											   UINT64CONST(20000000), &out));
+	UT_ASSERT_EQ(out.n_disks, 0);
+	UT_ASSERT(cluster_qvotec_prior_death_observe(0, 901, 902, 1 + UINT64CONST(30000000),
+											  UINT64CONST(20000000), &out));
+	UT_ASSERT_EQ(out.observing_incarnation, 902);
+	UT_ASSERT_EQ(out.n_disks, 3);
+	cluster_shared_config = false;
+	pgsa_disk_set_close(&set);
+}
 
 UT_TEST(test_prior_death_proves_stale_unclean_slots)
 {
@@ -3122,9 +3169,10 @@ UT_TEST(test_prior_death_proves_stale_unclean_slots)
 	UT_ASSERT_EQ(out.observing_incarnation, 902);
 	UT_ASSERT_EQ(out.n_disks, 3);
 	UT_ASSERT_EQ(out.slots[2].incarnation, 901);
-	/* not older than the write lease yet */
-	UT_ASSERT(!cluster_qvotec_prior_death_observe(0, 901, 902, 1 + DEATH_LEASE_US, 3000000, &out));
+	/* One microsecond before the death floor is insufficient; equality is allowed. */
+	UT_ASSERT(!cluster_qvotec_prior_death_observe(0, 901, 902, DEATH_LEASE_US, 3000000, &out));
 	UT_ASSERT_EQ(out.n_disks, 0);
+	UT_ASSERT(cluster_qvotec_prior_death_observe(0, 901, 902, 1 + DEATH_LEASE_US, 3000000, &out));
 	/* a death threshold above the lease rules */
 	UT_ASSERT(!cluster_qvotec_prior_death_observe(0, 901, 902, 1 + DEATH_LEASE_US + 1,
 												  DEATH_LEASE_US * 2, &out));
@@ -5299,7 +5347,7 @@ UT_TEST(test_whole_admission_has_one_wait_budget_and_keeps_real_loss)
 int
 main(void)
 {
-	UT_PLAN(105);
+	UT_PLAN(107);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
 	UT_RUN(test_qvotec_preserves_replacement_request_per_disk_fail_closed);
@@ -5318,7 +5366,7 @@ main(void)
 	UT_RUN(test_shared_storage_evidence_never_replaces_database_quorum);
 	UT_RUN(test_quorum_owner_phase_is_read_only_and_rejects_missing_or_recycled_owner);
 	UT_RUN(test_passive_quorum_observation_neither_renews_nor_logs);
-	UT_RUN(test_quorum_lease_thirty_polls_preserves_exact_expiry_and_fail_closed);
+	UT_RUN(test_quorum_write_lease_six_polls_preserves_exact_expiry_and_fail_closed);
 	UT_RUN(test_in_quorum_pre_shmem_init_false);
 	UT_RUN(test_in_quorum_initializing_state_false);
 	UT_RUN(test_in_quorum_frozen_flag_overrides_to_false);
@@ -5371,6 +5419,8 @@ main(void)
 	UT_RUN(test_prior_exit_retains_exact_preheartbeat_slots);
 	UT_RUN(test_prior_exit_refuses_empty_mixed_live_or_other_boot);
 	UT_RUN(test_prior_exit_cannot_be_replaced_by_another_probe);
+	UT_RUN(test_prior_death_policy_rejects_enlarged_write_lease);
+	UT_RUN(test_prior_death_thirty_second_boundary);
 	UT_RUN(test_prior_death_proves_stale_unclean_slots);
 	UT_RUN(test_prior_death_refuses_mixed_fresh_or_other_boot);
 	UT_RUN(test_normal_stop_third_disk_write_failure_is_not_majority_success);

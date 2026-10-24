@@ -31,6 +31,7 @@
 #include "storage/latch.h"
 #include "cluster/cluster_config_members.h"
 #include "cluster/cluster_recovery_anchor.h"
+#include "cluster/cluster_recovery_plan.h"
 #include "storage/fd.h"
 #include "storage/lwlock.h"
 #include "utils/wait_event.h"
@@ -66,10 +67,23 @@ Latch *MyLatch = &latch;
 static LOCKMODE cf_mode;
 static bool local_lock, ref_ok, lock_ok, read_ok, release_ok, fence_ok, serving_ok;
 static bool provider_ok, prebump, cancel_on_wait, change_epoch_on_wait, read_error;
-static bool initialized_ok, clean_ok, lose_initialized_on_release;
+static bool initialized_ok, clean_ok, recovered_ok, lose_initialized_on_release;
 static ClusterWalSourceRef initialized_ref;
 static uint64 initialized_epoch;
+static ClusterWalSourceRef recovered_ref;
+static uint64 recovered_epoch;
 static uint64 epoch;
+/* The opaque owner and ROOT I/O are leaf fixture boundaries; all native
+ * consumer control flow remains the production function body. */
+static bool recovery_fixture, recovery_scope_valid;
+static bool recovery_revoke_read, recovery_change_read;
+static bool recovery_revoke_release, recovery_revoke_wait, recovery_change_wait;
+static bool recovery_revoke_publish, recovery_change_publish;
+static unsigned recovery_reads, recovery_publishes, recovery_begins, recovery_ends;
+static ClusterWalWriterToken recovery_writer;
+static char recovery_scope_identity;
+#define FIXTURE_RECOVERY_SCOPE ((struct ClusterRecoveryCheckpointScopeV1 *) &recovery_scope_identity)
+
 static unsigned root_calls, waits, local_updates, reads, releases;
 static unsigned serving_pending_reads, serving_reads;
 static unsigned read_pending;
@@ -388,8 +402,10 @@ cluster_cf_unlock_confirmed(LOCKMODE m)
 	UT_ASSERT(cf_mode == m);
 	cf_mode = NoLock;
 	releases++;
+	if (recovery_revoke_release)
+		recovery_scope_valid = false;
 	if (lose_initialized_on_release)
-		initialized_ok = clean_ok = false;
+		initialized_ok = clean_ok = recovered_ok = false;
 	if (change_ref_on_release)
 		ref.claim.max_config_generation++;
 	return release_ok ? CLUSTER_CF_RELEASE_CONFIRMED : CLUSTER_CF_RELEASE_UNCONFIRMED;
@@ -399,6 +415,8 @@ cluster_cf_authority_read_check(ControlFileData *o, bool *pending)
 {
 	UT_ASSERT(cf_mode == ShareLock && !local_lock);
 	reads++;
+	if (recovery_fixture && !serving_ok)
+		return false;
 	if (pending)
 		*pending = read_pending > 0;
 	if (read_pending > 0) {
@@ -433,6 +451,13 @@ cluster_wal_thread_clean_writer_matches(const ClusterWalSourceRef *expected, uin
 {
 	return clean_ok && ref_ok && observed_epoch == initialized_epoch
 		   && memcmp(expected, &initialized_ref, sizeof(*expected)) == 0;
+}
+bool
+cluster_wal_thread_recovered_writer_matches(const ClusterWalSourceRef *expected,
+													 uint64 observed_epoch)
+{
+	return recovered_ok && ref_ok && observed_epoch == recovered_epoch
+		   && memcmp(expected, &recovered_ref, sizeof(*expected)) == 0;
 }
 bool
 cluster_write_fence_allowed(void)
@@ -509,6 +534,10 @@ WaitLatch(Latch *l, int e, long t, uint32 event)
 		ref.claim.identity.origin_owner_incarnation++;
 	if (cancel_on_wait)
 		InterruptPending = true;
+	if (recovery_revoke_wait)
+		recovery_scope_valid = false;
+	if (recovery_change_wait)
+		recovery_writer.startup_first_lsn++;
 	return WL_TIMEOUT;
 }
 ClusterControlRootResult
@@ -531,6 +560,67 @@ cluster_control_root_v3_checkpoint_publish(const ClusterControlRootIdentity *sel
 	if (shutdown_after_publish)
 		ShutdownRequestPending = true;
 	return fixture_root_result(returns[root_calls++]);
+}
+
+bool
+cluster_recovery_checkpoint_begin_v1(struct ClusterRecoveryCheckpointScopeV1 **out)
+{
+	recovery_begins++;
+	if (!recovery_scope_valid)
+		return false;
+	*out = FIXTURE_RECOVERY_SCOPE;
+	return true;
+}
+bool
+cluster_recovery_checkpoint_current_v1(const struct ClusterRecoveryCheckpointScopeV1 *scope,
+									 ClusterWalWriterToken *writer)
+{
+	memset(writer, 0, sizeof(*writer));
+	if (scope != FIXTURE_RECOVERY_SCOPE || !recovery_scope_valid
+		|| MyBackendType != B_CHECKPOINTER || CritSectionCount != 0 || ShutdownRequestPending)
+		return false;
+	*writer = recovery_writer;
+	return true;
+}
+void
+cluster_recovery_checkpoint_end_v1(struct ClusterRecoveryCheckpointScopeV1 **scope)
+{
+	if (*scope != NULL) {
+		UT_ASSERT(*scope == FIXTURE_RECOVERY_SCOPE);
+		recovery_ends++;
+	}
+	*scope = NULL;
+}
+ClusterControlRootResult
+cluster_control_root_v3_read_recovery_checkpoint_locked(
+	const struct ClusterRecoveryCheckpointScopeV1 *scope, ControlFileData *out)
+{
+	UT_ASSERT(scope == FIXTURE_RECOVERY_SCOPE && cf_mode == ShareLock && !local_lock);
+	recovery_reads++;
+	if (read_error)
+		ereport(ERROR, (errmsg("fixture recovery read error")));
+	*out = selected;
+	if (recovery_revoke_read)
+		recovery_scope_valid = false;
+	if (recovery_change_read)
+		recovery_writer.startup_first_lsn++;
+	return read_ok ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_IO_ERROR;
+}
+ClusterControlRootResult
+cluster_control_root_v3_recovery_checkpoint_publish(
+	const struct ClusterRecoveryCheckpointScopeV1 *scope, const ClusterControlRootIdentity *self,
+	const ControlFileData *c, XLogRecPtr end, ClusterControlRootSnapshot *out,
+	ClusterControlRootFileToken *token, ControlFileData *control)
+{
+	ClusterControlRootResult result;
+	UT_ASSERT(scope == FIXTURE_RECOVERY_SCOPE);
+	recovery_publishes++;
+	result = cluster_control_root_v3_checkpoint_publish(self, c, end, out, token, control);
+	if (recovery_revoke_publish)
+		recovery_scope_valid = false;
+	if (recovery_change_publish)
+		recovery_writer.startup_first_lsn++;
+	return result;
 }
 
 ClusterControlRootResult
@@ -801,9 +891,21 @@ reset_fixture(void)
 	prebump = local_lock = cancel_on_wait = change_epoch_on_wait = read_error = false;
 	cf_mode = NoLock;
 	epoch = 9;
-	initialized_ok = clean_ok = lose_initialized_on_release = false;
+	recovery_fixture = false;
+	recovery_scope_valid = true;
+	recovery_revoke_read = recovery_change_read = recovery_revoke_release = false;
+	recovery_revoke_wait = recovery_change_wait = false;
+	recovery_revoke_publish = recovery_change_publish = false;
+	recovery_reads = recovery_publishes = recovery_begins = recovery_ends = 0;
+	memset(&recovery_writer, 0, sizeof(recovery_writer));
+	recovery_writer.ref = ref;
+	recovery_writer.epoch = epoch;
+	recovery_writer.startup_first_lsn = 64;
+	initialized_ok = clean_ok = recovered_ok = lose_initialized_on_release = false;
 	initialized_ref = ref;
 	initialized_epoch = epoch;
+	recovered_ref = ref;
+	recovered_epoch = epoch;
 	CritSectionCount = InterruptHoldoffCount = QueryCancelHoldoffCount = 0;
 	InterruptPending = false;
 	ShutdownRequestPending = false;
@@ -846,7 +948,7 @@ prepare(int flags)
 {
 	if (sigsetjmp(error_boundary, 1))
 		return false;
-	ClusterCheckpointV3Prepare(flags, &candidate);
+	ClusterCheckpointV3Prepare(flags, &candidate, NULL);
 	return true;
 }
 static bool
@@ -854,8 +956,211 @@ publish(void)
 {
 	if (sigsetjmp(error_boundary, 1))
 		return false;
-	ClusterCheckpointV3Publish(&candidate, 220);
+	ClusterCheckpointV3Publish(&candidate, 220, NULL);
 	return true;
+}
+
+/* Exercise the explicit scope separately from every ordinary native purpose. */
+static bool
+recovery_prepare(int flags)
+{
+	if (sigsetjmp(error_boundary, 1))
+		return false;
+	ClusterCheckpointV3Prepare(flags, &candidate, FIXTURE_RECOVERY_SCOPE);
+	return true;
+}
+static bool
+recovery_publish(void)
+{
+	if (sigsetjmp(error_boundary, 1))
+		return false;
+	ClusterCheckpointV3Publish(&candidate, 220, FIXTURE_RECOVERY_SCOPE);
+	return true;
+}
+static void
+recovery_setup(void)
+{
+	reset_fixture();
+	recovery_fixture = true;
+	serving_ok = false;
+}
+static bool
+recovery_begin(int flags, struct ClusterRecoveryCheckpointScopeV1 **scope)
+{
+	if (sigsetjmp(error_boundary, 1))
+		return false;
+	ClusterCheckpointRecoveryBegin(flags, scope);
+	return true;
+}
+UT_TEST(recovery_checkpoint_selects_scope_only_for_closed_online_owner)
+{
+	struct ClusterRecoveryCheckpointScopeV1 *scope = NULL;
+
+	reset_fixture();
+	UT_ASSERT(recovery_begin(CHECKPOINT_FORCE, &scope));
+	UT_ASSERT(scope == NULL && recovery_begins == 0);
+	recovery_setup();
+	serving_pending_reads = 1;
+	UT_ASSERT(recovery_begin(CHECKPOINT_FORCE, &scope));
+	UT_ASSERT(scope == NULL && recovery_begins == 0);
+	recovery_setup();
+	UT_ASSERT(recovery_begin(CHECKPOINT_FORCE, &scope));
+	UT_ASSERT(scope == FIXTURE_RECOVERY_SCOPE && recovery_begins == 1);
+	cluster_recovery_checkpoint_end_v1(&scope);
+	UT_ASSERT(scope == NULL && recovery_ends == 1);
+	recovery_setup();
+	recovery_scope_valid = false;
+	UT_ASSERT(!recovery_begin(CHECKPOINT_FORCE, &scope));
+	UT_ASSERT(scope == NULL && recovery_begins == 1);
+	for (int purpose = 0; purpose < 3; purpose++) {
+		recovery_setup();
+		if (purpose == 2) {
+			MyBackendType = B_STARTUP;
+			MyAuxProcType = StartupProcess;
+		}
+		UT_ASSERT(recovery_begin(purpose == 0 ? CHECKPOINT_IS_SHUTDOWN
+										: purpose == 1 ? CHECKPOINT_END_OF_RECOVERY : CHECKPOINT_FORCE,
+								&scope));
+		UT_ASSERT(scope == NULL && recovery_begins == 0);
+	}
+}
+
+UT_TEST(recovery_checkpoint_closed_admission_uses_only_original_scope)
+{
+	recovery_setup();
+	UT_ASSERT(recovery_prepare(CHECKPOINT_FORCE));
+	UT_ASSERT_EQ(candidate.checkPoint, 150);
+	UT_ASSERT_EQ(recovery_reads, 1);
+	UT_ASSERT_EQ(reads, 0);
+	UT_ASSERT_EQ(cf_mode, NoLock);
+	UT_ASSERT_EQ(current.checkPoint, 100);
+	candidate = selected;
+	candidate.checkPoint = 200;
+	UT_ASSERT(recovery_publish());
+	UT_ASSERT_EQ(recovery_publishes, 1);
+	UT_ASSERT_EQ(root_calls, 1);
+	UT_ASSERT_EQ(current.checkPoint, 200);
+	UT_ASSERT_EQ(current.checkPointCopy.nextOid, 60001);
+	UT_ASSERT(!serving_ok);
+}
+UT_TEST(recovery_checkpoint_preserves_owner_and_native_guards)
+{
+	for (int stage = 0; stage < 2; stage++) {
+		for (int fault = 0; fault < 10; fault++) {
+			recovery_setup();
+			switch (fault) {
+				case 0: recovery_scope_valid = false; break;
+				case 1: recovery_writer.ref.claim.identity.origin_owner_incarnation++; break;
+				case 2: recovery_writer.epoch++; break;
+				case 3: provider_ok = false; initialized_ok = clean_ok = true; break;
+				case 4: fence_ok = false; break;
+				case 5: prebump = true; break;
+				case 6: ref_ok = false; break;
+				case 7: CritSectionCount = 1; break;
+				case 8: ShutdownRequestPending = true; break;
+				case 9: MyBackendType = B_BACKEND; break;
+			}
+			UT_ASSERT(!(stage == 0 ? recovery_prepare(CHECKPOINT_FORCE) : recovery_publish()));
+			UT_ASSERT_EQ(recovery_reads | recovery_publishes | root_calls, 0);
+			UT_ASSERT_EQ(current.checkPoint, 100);
+			UT_ASSERT_EQ(cf_mode, NoLock);
+		}
+	}
+}
+UT_TEST(recovery_checkpoint_exact_recovered_owner_without_transport)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		recovery_setup();
+		provider_ok = false;
+		recovered_ok = true;
+		if (fault == 1) recovered_ok = false;
+		if (fault == 2) recovered_epoch++;
+		if (fault == 3) recovered_ref.claim.identity.origin_owner_incarnation++;
+		if (fault == 4) recovery_scope_valid = false;
+		if (fault == 5) lose_initialized_on_release = true;
+		UT_ASSERT_EQ(recovery_prepare(CHECKPOINT_FORCE), fault == 0);
+		if (fault == 0) {
+			candidate = selected;
+			candidate.checkPoint = 200;
+			UT_ASSERT(recovery_publish());
+			UT_ASSERT_EQ(recovery_publishes, 1);
+			UT_ASSERT_EQ(current.checkPoint, 200);
+			UT_ASSERT(!serving_ok && !provider_ok);
+		} else {
+			UT_ASSERT_EQ(recovery_publishes | root_calls, 0);
+			UT_ASSERT_EQ(current.checkPoint, 100);
+		}
+	}
+}
+UT_TEST(recovery_checkpoint_rechecks_read_and_confirmed_release)
+{
+	for (int fault = 0; fault < 7; fault++) {
+		recovery_setup();
+		switch (fault) {
+			case 0: recovery_revoke_read = true; break;
+			case 1: recovery_change_read = true; break;
+			case 2: recovery_revoke_release = true; break;
+			case 3: change_ref_on_release = true; break;
+			case 4: release_ok = false; break;
+			case 5: read_ok = false; break;
+			case 6: read_error = true; break;
+		}
+		UT_ASSERT(!recovery_prepare(CHECKPOINT_FORCE));
+		UT_ASSERT_EQ(recovery_reads, 1);
+		UT_ASSERT_EQ(candidate.checkPoint, 0);
+		UT_ASSERT_EQ(cf_mode, NoLock);
+		UT_ASSERT_EQ(releases, 1);
+		UT_ASSERT_EQ(current.checkPoint, 100);
+	}
+}
+UT_TEST(recovery_checkpoint_retries_without_reclassifying_its_owner)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		recovery_setup();
+		returns[0] = CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+		if (fault == 1) recovery_revoke_wait = true;
+		if (fault == 2) recovery_change_wait = true;
+		if (fault == 3) cancel_on_wait = true;
+		if (fault == 4) change_epoch_on_wait = true;
+		UT_ASSERT_EQ(recovery_publish(), fault == 0);
+		UT_ASSERT_EQ(root_calls, fault == 0 ? 2 : 1);
+		UT_ASSERT_EQ(recovery_publishes, root_calls);
+		UT_ASSERT_EQ(waits, 1);
+		UT_ASSERT_EQ(current.checkPoint, fault == 0 ? 200 : 100);
+		UT_ASSERT(!serving_ok && cf_mode == NoLock && !local_lock);
+	}
+}
+UT_TEST(recovery_checkpoint_rechecks_durable_result_before_projection)
+{
+	for (int fault = 0; fault < 2; fault++) {
+		recovery_setup();
+		if (fault == 0) recovery_revoke_publish = true;
+		if (fault == 1) recovery_change_publish = true;
+		UT_ASSERT(!recovery_publish());
+		UT_ASSERT_EQ(root_calls, 1);
+		UT_ASSERT_EQ(recovery_publishes, 1);
+		UT_ASSERT_EQ(current.checkPoint, 100);
+		UT_ASSERT_EQ(local_updates, 0);
+	}
+}
+UT_TEST(recovery_checkpoint_does_not_replace_other_native_purposes)
+{
+	recovery_setup();
+	UT_ASSERT(!prepare(CHECKPOINT_FORCE));
+	UT_ASSERT(!publish());
+	UT_ASSERT_EQ(recovery_reads | recovery_publishes | root_calls, 0);
+	for (int startup = 0; startup < 2; startup++) {
+		recovery_setup();
+		if (startup) MyBackendType = B_STARTUP;
+		else ShutdownRequestPending = true;
+		UT_ASSERT(!recovery_prepare(startup ? CHECKPOINT_END_OF_RECOVERY : CHECKPOINT_IS_SHUTDOWN));
+		UT_ASSERT_EQ(recovery_reads | startup_calls, 0);
+		recovery_setup();
+		if (startup) MyBackendType = B_STARTUP;
+		else { ShutdownRequestPending = true; candidate.state = DB_SHUTDOWNED; }
+		UT_ASSERT(!recovery_publish());
+		UT_ASSERT_EQ(recovery_publishes | root_calls | startup_calls, 0);
+	}
 }
 
 UT_TEST(prepare_uses_short_owned_read)
@@ -992,6 +1297,42 @@ UT_TEST(initialized_writer_checkpoint_uses_exact_existing_fence_qualification)
 		UT_ASSERT_EQ(root_calls, 1);
 		UT_ASSERT_EQ(shutdown_calls, shutdown);
 		UT_ASSERT_EQ(current.checkPoint, 200);
+	}
+}
+UT_TEST(recovered_writer_checkpoint_uses_exact_recovered_fence_qualification)
+{
+	for (unsigned shutdown = 0; shutdown < 2; shutdown++) {
+		reset_fixture();
+		provider_ok = false;
+		recovered_ok = true;
+		ShutdownRequestPending = shutdown != 0;
+		UT_ASSERT(prepare(shutdown ? CHECKPOINT_IS_SHUTDOWN : CHECKPOINT_FORCE));
+		UT_ASSERT_EQ(reads, 1);
+		UT_ASSERT_EQ(cf_mode, NoLock);
+		candidate.checkPoint = 200;
+		candidate.state = shutdown ? DB_SHUTDOWNED : DB_IN_PRODUCTION;
+		UT_ASSERT(publish());
+		UT_ASSERT_EQ(root_calls, 1);
+		UT_ASSERT_EQ(shutdown_calls, shutdown);
+		UT_ASSERT_EQ(current.checkPoint, 200);
+	}
+	for (unsigned fault = 0; fault < 4; fault++) {
+		reset_fixture();
+		provider_ok = false;
+		recovered_ok = fault != 0;
+		if (fault == 1)
+			recovered_epoch++;
+		if (fault == 2)
+			recovered_ref.claim.identity.origin_owner_incarnation++;
+		if (fault == 3)
+			lose_initialized_on_release = true;
+		UT_ASSERT(!prepare(CHECKPOINT_FORCE));
+		UT_ASSERT_EQ(reads, fault == 3 ? 1 : 0);
+		UT_ASSERT_EQ(cf_mode, NoLock);
+		UT_ASSERT(!publish());
+		UT_ASSERT_EQ(root_calls, 0);
+		UT_ASSERT_EQ(local_updates, 0);
+		UT_ASSERT_EQ(current.checkPoint, 100);
 	}
 }
 UT_TEST(initialized_checkpoint_cannot_borrow_other_input_epoch_or_writer)
@@ -1233,7 +1574,7 @@ startup_prepare(int flags)
 {
 	if (sigsetjmp(error_boundary, 1))
 		return false;
-	ClusterCheckpointV3Prepare(flags, &candidate);
+	ClusterCheckpointV3Prepare(flags, &candidate, NULL);
 	return true;
 }
 
@@ -1242,7 +1583,7 @@ startup_publish(void)
 {
 	if (sigsetjmp(error_boundary, 1))
 		return false;
-	ClusterCheckpointV3Publish(&candidate, 220);
+	ClusterCheckpointV3Publish(&candidate, 220, NULL);
 	return true;
 }
 
@@ -1253,6 +1594,25 @@ UT_TEST(startup_prepare_uses_only_bound_initializer_without_serving)
 	UT_ASSERT_EQ(candidate.checkPoint, 100);
 	UT_ASSERT_EQ(candidate.state, DB_SHUTDOWNED);
 	UT_ASSERT_EQ(reads | local_updates | native_writes, 0);
+}
+
+UT_TEST(startup_checkpoint_accepts_recovered_cohort)
+{
+	startup_fixture();
+	clusterStartupWriter.input_kind = CLUSTER_WAL_STARTUP_RECOVERED;
+	clusterStartupWriter.generation = 7;
+	UT_ASSERT(startup_prepare(CHECKPOINT_END_OF_RECOVERY | CHECKPOINT_IMMEDIATE));
+	UT_ASSERT_EQ(candidate.checkPoint, 100);
+	candidate.checkPoint = 200;
+	UT_ASSERT(startup_publish());
+	UT_ASSERT_EQ(startup_calls, 1);
+	UT_ASSERT_EQ(install_calls, 1);
+	UT_ASSERT_EQ(reads, 1);
+	UT_ASSERT_EQ(local_updates, 1);
+	UT_ASSERT(clusterStartupWriterInstalled);
+	UT_ASSERT_EQ(current.checkPoint, 200);
+	UT_ASSERT_EQ(current.state, DB_IN_PRODUCTION);
+	UT_ASSERT_EQ(root_calls, 0);
 }
 
 UT_TEST(startup_file_sync_rechecks_original_writer_and_keeps_native_owner)
@@ -1685,6 +2045,17 @@ UT_TEST(legacy_startup_keeps_its_control_authority_path)
 	UT_ASSERT_EQ(legacy_anchors, 1);
 }
 
+static unsigned cold_prepare_calls;
+static bool cold_prepare_ok;
+
+void
+ClusterPrepareColdWalRecovery(void)
+{
+	cold_prepare_calls++;
+	if (!cold_prepare_ok)
+		ereport(FATAL, (errmsg("typed cold preparation refused")));
+}
+
 static bool
 startup_recovery_control_site(void)
 {
@@ -1694,24 +2065,44 @@ startup_recovery_control_site(void)
 	return true;
 }
 
-UT_TEST(shared_crash_control_refuses_before_untyped_publication)
+UT_TEST(shared_crash_control_prepares_without_untyped_publication)
 {
 	reset_fixture();
+	cold_prepare_calls = 0;
+	cold_prepare_ok = true;
 	MyBackendType = B_STARTUP;
 	InRecovery = true;
 	current.state = DB_IN_CRASH_RECOVERY;
 	selected = current;
-	UT_ASSERT(!startup_recovery_control_site());
-	UT_ASSERT_EQ(native_error_level, FATAL);
+	UT_ASSERT(startup_recovery_control_site());
+	UT_ASSERT_EQ(cold_prepare_calls, 1);
+	UT_ASSERT_EQ(native_error_level, 0);
 	UT_ASSERT_EQ(native_writes, 0);
 	UT_ASSERT_EQ(root_calls + startup_calls + install_calls, 0);
 	UT_ASSERT_EQ(memcmp(&selected, &current, sizeof(current)), 0);
 	UT_ASSERT_EQ(CritSectionCount, 0);
 }
 
+UT_TEST(shared_crash_control_prepare_refusal_never_publishes)
+{
+	reset_fixture();
+	cold_prepare_calls = 0;
+	cold_prepare_ok = false;
+	MyBackendType = B_STARTUP;
+	InRecovery = true;
+	current.state = DB_IN_CRASH_RECOVERY;
+	selected = current;
+	UT_ASSERT(!startup_recovery_control_site());
+	UT_ASSERT_EQ(cold_prepare_calls, 1);
+	UT_ASSERT_EQ(native_error_level, FATAL);
+	UT_ASSERT_EQ(native_writes, 0);
+	UT_ASSERT_EQ(memcmp(&selected, &current, sizeof(current)), 0);
+}
+
 UT_TEST(legacy_crash_control_keeps_native_publication)
 {
 	reset_fixture();
+	cold_prepare_calls = 0;
 	cluster_shared_config = false;
 	MyBackendType = B_STARTUP;
 	InRecovery = true;
@@ -1719,6 +2110,7 @@ UT_TEST(legacy_crash_control_keeps_native_publication)
 	UT_ASSERT(startup_recovery_control_site());
 	UT_ASSERT_EQ(native_error_level, 0);
 	UT_ASSERT_EQ(native_writes, 1);
+	UT_ASSERT_EQ(cold_prepare_calls, 0);
 }
 
 /* PGRAC: actual directory validator on real scratch files, not a mocked
@@ -1839,6 +2231,18 @@ UT_TEST(initializer_selection_precedes_first_native_side_effect)
 	UT_ASSERT_EQ(advance_calls, 2);
 	UT_ASSERT_EQ(waits, 1);
 	UT_ASSERT_EQ(current.checkPoint, 100);
+}
+
+UT_TEST(initializer_selection_accepts_recovered_cohort)
+{
+	writer_begin_fixture();
+	offered.input_kind = CLUSTER_WAL_STARTUP_RECOVERED;
+	UT_ASSERT(startup_first_native_site());
+	UT_ASSERT_EQ(startup_directory_calls, 1);
+	UT_ASSERT(!directory_before_selection);
+	UT_ASSERT(clusterStartupWriterSelected);
+	UT_ASSERT_EQ(clusterStartupWriter.input_kind, CLUSTER_WAL_STARTUP_RECOVERED);
+	UT_ASSERT_EQ(route_calls | bind_calls, 0);
 }
 
 UT_TEST(initializer_selection_waits_for_original_lock_before_native_side_effect)
@@ -1993,6 +2397,101 @@ UT_TEST(writer_begin_routes_only_after_all_target_initializing)
 	UT_ASSERT_EQ(current.checkPoint, 100);
 	UT_ASSERT_EQ(input.endOfLog, 220);
 	UT_ASSERT_EQ(native_writes | local_updates, 0);
+}
+
+UT_TEST(writer_begin_accepts_recovered_cohort)
+{
+	writer_begin_fixture();
+	offered.input_kind = CLUSTER_WAL_STARTUP_RECOVERED;
+	UT_ASSERT_EQ(writer_begin(), wal_segment_size);
+	UT_ASSERT(clusterStartupWriterSelected && clusterStartupWriterBound);
+	UT_ASSERT_EQ(clusterStartupWriter.input_kind, CLUSTER_WAL_STARTUP_RECOVERED);
+	UT_ASSERT_EQ(route_calls, 1);
+	UT_ASSERT_EQ(bind_calls, 1);
+	UT_ASSERT_EQ(native_writes | local_updates, 0);
+}
+
+static void
+recovered_writer_tail_fixture(void)
+{
+	writer_begin_fixture();
+	offered.input_kind = CLUSTER_WAL_STARTUP_RECOVERED;
+	/* The exact checkpoint is 100..220; later ordinary WAL ends at 340. */
+	offered.predecessor.snapshot.tail_last_record_lsn = 300;
+	offered.sealed_input_end = input.endOfLog = 340;
+	input.lastRec = 300;
+}
+
+UT_TEST(writer_begin_recovered_keeps_checkpoint_separate_from_tail)
+{
+	recovered_writer_tail_fixture();
+	UT_ASSERT_EQ(writer_begin(), wal_segment_size);
+	UT_ASSERT(clusterStartupWriterSelected && clusterStartupWriterBound);
+	UT_ASSERT_EQ(clusterStartupWriter.input_record_start, 100);
+	UT_ASSERT_EQ(clusterStartupWriter.input_record_end, 220);
+	UT_ASSERT_EQ(input.lastRec, 300);
+	UT_ASSERT_EQ(input.endOfLog, 340);
+	UT_ASSERT_EQ(route_calls, 1);
+	UT_ASSERT_EQ(bind_calls, 1);
+}
+
+UT_TEST(writer_begin_recovered_binds_before_native_recovery_done)
+{
+	for (unsigned state = 0; state < 2; state++) {
+		recovered_writer_tail_fixture();
+		/* The early crash branch seals; it does not select a CLEAN owner. */
+		current.state = state == 0 ? DB_IN_PRODUCTION : DB_IN_CRASH_RECOVERY;
+		self_seal_returns[0] = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		UT_ASSERT(startup_first_native_site());
+		UT_ASSERT_EQ(self_seal_calls, 1);
+		UT_ASSERT(!clusterStartupWriterSelected);
+		/* FinishWalRecovery leaves the native crash phase set until EOR. */
+		InRecovery = true;
+		current.state = DB_IN_CRASH_RECOVERY;
+		UT_ASSERT_EQ(writer_bind(), wal_segment_size);
+		UT_ASSERT(clusterStartupWriterSelected && clusterStartupWriterBound);
+		UT_ASSERT_EQ(advance_calls, 1);
+		UT_ASSERT(InRecovery);
+		UT_ASSERT_EQ(current.state, DB_IN_CRASH_RECOVERY);
+		UT_ASSERT_EQ(native_writes | local_updates, 0);
+	}
+}
+
+UT_TEST(native_crash_does_not_bind_clean_initialization)
+{
+	for (unsigned kind = 0; kind < 2; kind++) {
+		writer_begin_fixture();
+		offered.input_kind = kind == 0 ? CLUSTER_WAL_STARTUP_CLEAN
+			: CLUSTER_WAL_STARTUP_INITIALIZED;
+		current.state = DB_IN_PRODUCTION;
+		self_seal_returns[0] = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		UT_ASSERT(startup_first_native_site());
+		InRecovery = true;
+		current.state = DB_IN_CRASH_RECOVERY;
+		UT_ASSERT_EQ(writer_bind(), InvalidXLogRecPtr);
+		UT_ASSERT(!clusterStartupWriterSelected && !clusterStartupWriterBound);
+		UT_ASSERT_EQ(bind_calls | route_calls | native_writes | local_updates, 0);
+	}
+}
+
+UT_TEST(writer_begin_recovered_rejects_different_checkpoint_tail_or_phase)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		recovered_writer_tail_fixture();
+		switch (fault) {
+		case 0: current.checkPoint++; break;
+		case 1: input.lastRec++; break;
+		case 2: input.endOfLog++; break;
+		case 3: offered.input_record_end = offered.sealed_input_end + 1; break;
+		case 4: InRecovery = true; break; /* Not the corresponding crash state. */
+		case 5: current.state = DB_IN_ARCHIVE_RECOVERY; break;
+		case 6: offered.input_record_end = offered.input_record_start; break;
+		}
+		expected_control_checkpoint = current.checkPoint;
+		UT_ASSERT_EQ(writer_begin(), InvalidXLogRecPtr);
+		UT_ASSERT(!clusterStartupWriterBound);
+		UT_ASSERT_EQ(bind_calls | route_calls | native_writes | local_updates, 0);
+	}
 }
 
 UT_TEST(writer_begin_rejects_wrong_input_or_failed_route_without_binding)
@@ -2524,6 +3023,19 @@ UT_TEST(native_empty_input_requires_the_original_bound_initializer)
 int
 main(void)
 {
+	if (getenv("PGRAC_RECOVERY_CHECKPOINT_ONLY") != NULL) {
+		UT_PLAN(8);
+		UT_RUN(recovery_checkpoint_selects_scope_only_for_closed_online_owner);
+		UT_RUN(recovery_checkpoint_closed_admission_uses_only_original_scope);
+		UT_RUN(recovery_checkpoint_preserves_owner_and_native_guards);
+		UT_RUN(recovery_checkpoint_exact_recovered_owner_without_transport);
+		UT_RUN(recovery_checkpoint_rechecks_read_and_confirmed_release);
+		UT_RUN(recovery_checkpoint_retries_without_reclassifying_its_owner);
+		UT_RUN(recovery_checkpoint_rechecks_durable_result_before_projection);
+		UT_RUN(recovery_checkpoint_does_not_replace_other_native_purposes);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_CF_CONSUMERS_ONLY") != NULL) {
 		UT_PLAN(6);
 		UT_RUN(startup_configuration_and_selection_retire_before_reobserving);
@@ -2535,7 +3047,16 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(67);
+	UT_PLAN(84);
+	UT_RUN(recovery_checkpoint_selects_scope_only_for_closed_online_owner);
+	UT_RUN(recovery_checkpoint_closed_admission_uses_only_original_scope);
+	UT_RUN(recovery_checkpoint_preserves_owner_and_native_guards);
+	UT_RUN(recovery_checkpoint_exact_recovered_owner_without_transport);
+	UT_RUN(recovery_checkpoint_rechecks_read_and_confirmed_release);
+	UT_RUN(recovery_checkpoint_retries_without_reclassifying_its_owner);
+	UT_RUN(recovery_checkpoint_rechecks_durable_result_before_projection);
+	UT_RUN(recovery_checkpoint_does_not_replace_other_native_purposes);
+
 	UT_RUN(native_empty_input_requires_the_original_bound_initializer);
 	UT_RUN(shutdown_wait_log_carries_the_remaining_wait_budget);
 	UT_RUN(writer_prepare_nonok_with_binding_is_not_retried_or_cleared);
@@ -2555,9 +3076,11 @@ main(void)
 	UT_RUN(clean_input_observation_rejects_wrong_owner_phase_and_lock_context);
 	UT_RUN(clean_input_observation_rechecks_root_and_native_checkpoint);
 	UT_RUN(initializer_selection_waits_for_original_lock_before_native_side_effect);
+	UT_RUN(initializer_selection_accepts_recovered_cohort);
 	UT_RUN(clean_writer_checkpoint_uses_exact_existing_fence_qualification);
 	UT_RUN(clean_checkpoint_cannot_borrow_other_input_epoch_or_writer);
-	UT_RUN(shared_crash_control_refuses_before_untyped_publication);
+	UT_RUN(shared_crash_control_prepares_without_untyped_publication);
+	UT_RUN(shared_crash_control_prepare_refusal_never_publishes);
 	UT_RUN(legacy_crash_control_keeps_native_publication);
 	UT_RUN(startup_file_sync_rechecks_original_writer_and_keeps_native_owner);
 	UT_RUN(shared_crash_startup_uses_original_self_seal_before_native_directory);
@@ -2574,6 +3097,7 @@ main(void)
 	UT_RUN(prepare_pending_cannot_hide_release_loss_cancel_or_changed_owner);
 	UT_RUN(prepare_refuses_unsupported_or_unproven_input);
 	UT_RUN(initialized_writer_checkpoint_uses_exact_existing_fence_qualification);
+	UT_RUN(recovered_writer_checkpoint_uses_exact_recovered_fence_qualification);
 	UT_RUN(initialized_checkpoint_cannot_borrow_other_input_epoch_or_writer);
 	UT_RUN(publish_retries_only_root_competition_before_projection);
 	UT_RUN(publish_does_not_retry_safety_or_io_refusal);
@@ -2589,11 +3113,17 @@ main(void)
 	UT_RUN(online_checkpoint_during_shutdown_signal_stays_online);
 	UT_RUN(early_shutdown_never_calls_untyped_writer_for_root_v3);
 	UT_RUN(startup_prepare_uses_only_bound_initializer_without_serving);
+	UT_RUN(startup_checkpoint_accepts_recovered_cohort);
 	UT_RUN(startup_prepare_rejects_other_purposes_and_lost_owner);
 	UT_RUN(startup_publish_installs_only_actual_root_projection);
 	UT_RUN(startup_publish_reobserves_cas_without_holding_locks);
 	UT_RUN(startup_publish_refusal_never_installs_in_memory_candidate);
 	UT_RUN(writer_begin_routes_only_after_all_target_initializing);
+	UT_RUN(writer_begin_accepts_recovered_cohort);
+	UT_RUN(writer_begin_recovered_keeps_checkpoint_separate_from_tail);
+	UT_RUN(writer_begin_recovered_binds_before_native_recovery_done);
+	UT_RUN(native_crash_does_not_bind_clean_initialization);
+	UT_RUN(writer_begin_recovered_rejects_different_checkpoint_tail_or_phase);
 	UT_RUN(initializer_selection_precedes_first_native_side_effect);
 	UT_RUN(early_selection_refusal_or_cancel_precedes_native_mutation);
 	UT_RUN(late_binding_requires_same_early_selection);

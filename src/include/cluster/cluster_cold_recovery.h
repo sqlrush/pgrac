@@ -50,7 +50,11 @@
 
 #include "access/xlogrecord.h"
 #include "cluster/cluster_page_stable_base.h"
+#include "cluster/cluster_page_detached.h"
 #include "cluster/cluster_wal_source.h"
+#include "cluster/cluster_tt_slot.h"
+#include "cluster/cluster_recovery_tt_record.h"
+#include "cluster/cluster_recovery_reference_graph.h"
 
 #define CLUSTER_COLD_RECOVERY_INTERFACE_V1 1
 #define CLUSTER_COLD_MAX_PARTICIPANTS RF_PAGE_STABLE_MAX_PARTICIPANTS
@@ -143,11 +147,11 @@ typedef struct ClusterColdSpaceOpV1 {
  * already-durable history before it.  UNSUPPORTED marks input outside the
  * supported profile (prepared transactions) and is refused anywhere.
  * SIDE_UNOWNED marks a non-page effect of another generation for which no
- * typed cold owner exists yet (transaction outcomes, undo, SLRU); like
+ * typed cold owner exists yet (whole-source transaction outcomes, undo); like
  * STRUCTURAL it is refused after native redo and is never replayed as a
  * no-op.  FOREIGN_CONTROL marks another generation's native control record
  * (XLOG checkpoint, NEXTOID, parameter, FPW, timeline and segment records,
- * standby records, logical messages): on the founder its typed effect is
+ * standby locks/running transactions, logical messages): its typed effect is
  * none, as in crash recovery -- they describe that writer's own control file
  * and counters -- so it is consumed without native replay.
  */
@@ -155,7 +159,9 @@ typedef struct ClusterColdSpaceOpV1 {
 #define CLUSTER_COLD_RECORD_UNSUPPORTED UINT8_C(0x02)
 #define CLUSTER_COLD_RECORD_SIDE_UNOWNED UINT8_C(0x04)
 #define CLUSTER_COLD_RECORD_FOREIGN_CONTROL UINT8_C(0x08)
-#define CLUSTER_COLD_RECORD_KNOWN_FLAGS UINT8_C(0x0F)
+/* Original-origin record-local consumer, never founder native redo/no-op. */
+#define CLUSTER_COLD_RECORD_FOREIGN_SIDE UINT8_C(0x10)
+#define CLUSTER_COLD_RECORD_KNOWN_FLAGS UINT8_C(0x1F)
 
 /* Every decoded record of a participant is fed, in its LSN order.  Records
  * without ordinary page components only advance the participant cursor. */
@@ -165,6 +171,9 @@ typedef struct ClusterColdRecordV1 {
 	XLogRecPtr prev_rec_ptr; /* xl_prev: must equal the previous fed read_rec_ptr */
 	uint64 scn;				 /* xl_scn; deterministic tie-break only */
 	uint32 record_crc;
+	/* Original frame values, not a derived canonical ownership proof. */
+	TransactionId source_xid;
+	TransactionId source_top_xid;
 	uint8 rmid;
 	uint8 info;
 	uint8 record_flags; /* CLUSTER_COLD_RECORD_* */
@@ -174,6 +183,21 @@ typedef struct ClusterColdRecordV1 {
 	uint32 space_count; /* a record has SPACE effects or page components, not both */
 	const ClusterColdSpaceOpV1 *space_ops;
 } ClusterColdRecordV1;
+
+/* Original record frame metadata, not an ownership or effects proof. */
+typedef struct ClusterColdRecordFrameV1 {
+	XLogRecPtr read_rec_ptr;
+	XLogRecPtr end_rec_ptr;
+	uint32 record_crc;
+	uint32 participant; /* create()'s caller index */
+	TransactionId source_xid;
+	TransactionId source_top_xid;
+	uint32 page_components;
+	uint32 space_effects;
+	uint8 rmid;
+	uint8 info;
+	bool history;
+} ClusterColdRecordFrameV1;
 
 typedef enum ClusterColdDataKindV1 {
 	CLUSTER_COLD_DATA_INVALID = 0, /* unreadable or failed verification */
@@ -287,6 +311,14 @@ extern ClusterColdDetailV1 cluster_cold_plan_seal_v1(ClusterColdPlanV1 *plan,
 													 ClusterColdObserveV1 observe, void *arg,
 													 ClusterColdDiagV1 *diag);
 
+/* After replay and its original durability barrier, reread the final live
+ * PAGE versions retained by the sealed graph, including all-SKIP pages.
+ * History/object-checkpoint-only and retired pages retain their original
+ * owners' duties. This read-only check grants no replay or C0 authority. */
+extern ClusterColdDetailV1 cluster_cold_plan_readback_v1(const ClusterColdPlanV1 *plan,
+														 ClusterColdObserveV1 observe, void *arg,
+														 ClusterColdDiagV1 *diag);
+
 /* Sealed schedule: non-history records with ordinary page components, in
  * replay order.  Each participant's records keep their LSN order. */
 extern uint32 cluster_cold_plan_step_count_v1(const ClusterColdPlanV1 *plan);
@@ -296,6 +328,28 @@ extern bool cluster_cold_plan_step_v1(const ClusterColdPlanV1 *plan, uint32 inde
 extern bool cluster_cold_plan_step_space_v1(const ClusterColdPlanV1 *plan, uint32 index,
 											uint32 effect, uint32 *relation, uint32 *input);
 
+/* Sealed-only, by-value frames in feed order, including retained history.
+ * These enumerate only records stored for PAGE/SPACE planning: records with
+ * no such component and historical SPACE ADVANCEs are omitted.  The count
+ * proves neither all-record coverage nor ordinary-effects completion.
+ * source_top_xid may be absent; neither field establishes canonical ownership.
+ * No replay, loser, C0 or write authority is granted by reading these inputs.
+ * Both accessors clear their output on failure (including unsealed plans). */
+extern bool cluster_cold_plan_record_frame_count_v1(const ClusterColdPlanV1 *plan,
+													uint32 *out_count);
+extern bool cluster_cold_plan_record_frame_v1(const ClusterColdPlanV1 *plan, uint32 index,
+											  ClusterColdRecordFrameV1 *out);
+
+/* Every accepted input record, in feed order, including cursor-only records
+ * and historical SPACE ADVANCEs omitted by the planning-frame accessors.
+ * These sealed-only, by-value metadata inputs retain the original component
+ * counts; they do not retain all payloads or prove effects, base coverage,
+ * canonical ownership, replay completion, loser identity or C0 authority.
+ * Both accessors clear their output on failure. */
+extern bool cluster_cold_plan_input_frame_count_v1(const ClusterColdPlanV1 *plan,
+												   uint32 *out_count);
+extern bool cluster_cold_plan_input_frame_v1(const ClusterColdPlanV1 *plan, uint32 index,
+											 ClusterColdRecordFrameV1 *out);
 
 /* Records at or after the participant's native redo start (pass-2 input),
  * page or not, as fed; pass 2 must consume exactly this many. */
@@ -362,6 +416,11 @@ extern ClusterColdDetailV1 cluster_cold_plan_set_space_check_v1(ClusterColdPlanV
 /* Participants of a sealed plan; 0 unless seal() succeeded. */
 extern uint32 cluster_cold_plan_participant_count_v1(const ClusterColdPlanV1 *plan);
 
+/* Exact native cut of a sealed participant, in create()'s caller order. */
+extern bool cluster_cold_plan_participant_matches_v1(const ClusterColdPlanV1 *plan,
+													 uint32 participant,
+													 const ClusterColdParticipantV1 *cut);
+
 /* Pass-2 action for one scheduled page record.  A fully skipped record of
  * the founder's own thread still advances nextXid past its xid. */
 typedef enum ClusterColdPageActionV1 {
@@ -377,14 +436,16 @@ extern ClusterColdPageActionV1 cluster_cold_page_action_v1(const ClusterColdStep
  * Pass-2 handling of a decoded record without a scheduled step.  SPACE
  * effects are never replayed natively: the SPACE owner installs them, or the
  * SPACE pages on disk already cover them.  Another generation's native
- * control record is consumed without replay.  Page versions, refused flags
+ * control record is consumed without replay; record-local SIDE effects use
+ * their original-origin consumer. Page versions, refused flags
  * or a commit's drops (always a step) mean pass 1 saw other input.
  */
 typedef enum ClusterColdUnscheduledV1 {
 	CLUSTER_COLD_UNSCHEDULED_NATIVE = 0,
 	CLUSTER_COLD_UNSCHEDULED_SPACE_SKIP = 1,
 	CLUSTER_COLD_UNSCHEDULED_REFUSE = 2,
-	CLUSTER_COLD_UNSCHEDULED_FOREIGN_NOOP = 3
+	CLUSTER_COLD_UNSCHEDULED_FOREIGN_NOOP = 3,
+	CLUSTER_COLD_UNSCHEDULED_FOREIGN_SIDE = 4
 } ClusterColdUnscheduledV1;
 
 extern ClusterColdUnscheduledV1 cluster_cold_unscheduled_v1(const ClusterColdRecordV1 *record);
@@ -414,9 +475,11 @@ typedef enum ClusterColdReplayDetailV1 {
 	CLUSTER_COLD_REPLAY_TARGET_PASSED = 4, /* the scheduled record start was passed */
 	CLUSTER_COLD_REPLAY_IDENTITY = 5,	   /* the scheduled record identity differs */
 	CLUSTER_COLD_REPLAY_PAST_TAIL = 6,	   /* a record lies past the validated tail */
-	CLUSTER_COLD_REPLAY_CUT_DIFFERS = 7,   /* end or record count differs from pass 1 */
+	CLUSTER_COLD_REPLAY_CUT_DIFFERS = 7,   /* source, cut or record count differs from pass 1 */
 	CLUSTER_COLD_REPLAY_CALLBACK = 8	   /* a callback refused the record */
 } ClusterColdReplayDetailV1;
+
+struct ClusterColdReplayResultV1;
 
 typedef struct ClusterColdReplayOpsV1 {
 	/* Next record of a participant; false at end of stream or on failure. */
@@ -426,9 +489,24 @@ typedef struct ClusterColdReplayOpsV1 {
 	/* Consume the scheduled record just returned with its page action. */
 	bool (*scheduled)(void *arg, uint32 participant, const ClusterColdStepV1 *step,
 					  ClusterColdPageActionV1 action);
-	/* Install all inputs of one SPACE relation, after every participant was
-	 * drained; required when the plan has SPACE relations. */
+	/* Finalize one SPACE relation only after every scheduled callback and
+	 * every source drain succeeded in this invocation. Install remaining
+	 * inputs, or verify the physical result of an already executed DROP;
+	 * required when the plan has SPACE relations. */
 	bool (*space_final)(void *arg, uint32 relation);
+	/* Optional owner notification after this source's scheduled steps and
+	 * exact counted drain. Other sources may still have scheduled work;
+	 * this does not grant global completion. Refusal stops further replay. */
+	bool (*source_drained)(void *arg, uint32 participant,
+						   const struct ClusterColdReplayResultV1 *progress, uint64 records);
+	/* Optional complete remainder-drain permutation, validated before any
+	 * record callback. Scheduled steps and each stream order stay unchanged. */
+	bool (*source_order)(void *arg, uint32 *order, uint32 count);
+	/* Optional exact dependency of the current unscheduled record. The owner
+	 * returns NO_INDEX for none; a different source must finish its original
+	 * scheduled steps and counted drain before this record is consumed. */
+	bool (*record_dependency)(void *arg, uint32 participant,
+							  const ClusterColdReplayRecordV1 *record, uint32 *target);
 } ClusterColdReplayOpsV1;
 
 typedef struct ClusterColdReplayResultV1 {
@@ -449,8 +527,8 @@ typedef struct ClusterColdReplayResultV1 {
 	uint32 last_crc[CLUSTER_COLD_MAX_PARTICIPANTS];
 } ClusterColdReplayResultV1;
 
-/* participants/participant_count must be the plan's caller-order cuts; own
- * is the founder's caller index. */
+/* participants/participant_count must be the plan's caller-order cuts,
+ * verified before the first callback; own is the founder's caller index. */
 extern ClusterColdReplayDetailV1
 cluster_cold_replay_run_v1(const ClusterColdPlanV1 *plan,
 						   const ClusterColdParticipantV1 *participants, uint32 participant_count,
@@ -475,6 +553,93 @@ extern PGDLLIMPORT int cluster_cold_recovery_plan_memory;
 
 struct XLogReaderState;
 
+/* Per-record effect families, including every item of a native counted
+ * array. Native redo consumes the entire array, never only its first item.
+ * These are in-memory routes, not a WAL format or completion certificate. */
+typedef enum ClusterColdEffectV1 {
+	CLUSTER_COLD_EFFECT_RECORD = 1U << 0,
+	CLUSTER_COLD_EFFECT_PAGE = 1U << 1,
+	CLUSTER_COLD_EFFECT_FSM = 1U << 2,
+	CLUSTER_COLD_EFFECT_SPACE = 1U << 3,
+	CLUSTER_COLD_EFFECT_TERMINAL = 1U << 4,
+	CLUSTER_COLD_EFFECT_TT = 1U << 5,
+	CLUSTER_COLD_EFFECT_CHILDREN = 1U << 6,
+	CLUSTER_COLD_EFFECT_RELATIONS = 1U << 7,
+	CLUSTER_COLD_EFFECT_STATS = 1U << 8,
+	CLUSTER_COLD_EFFECT_INVALIDATIONS = 1U << 9,
+	CLUSTER_COLD_EFFECT_RELCACHE = 1U << 10,
+	CLUSTER_COLD_EFFECT_ORIGIN = 1U << 11,
+	CLUSTER_COLD_EFFECT_LOCKS = 1U << 12,
+	CLUSTER_COLD_EFFECT_SYNC = 1U << 13,
+	CLUSTER_COLD_EFFECT_FEEDBACK = 1U << 14,
+	CLUSTER_COLD_EFFECT_SCN = 1U << 15
+} ClusterColdEffectV1;
+
+/* Disjoint routes must cover required exactly. APPLY names an existing
+ * consumer, not permission to invoke it: the original cold readiness,
+ * source/base, full-record and mutation gates still apply. In particular
+ * foreign terminal/SLRU effects remain refused until their cold adapter is
+ * wired. A compound record with any refused effect cannot replay partially. */
+typedef struct ClusterColdEffectRoutesV1 {
+	uint32 required;
+	uint32 native_apply;
+	uint32 page_apply;
+	uint32 space_apply;
+	uint32 no_effect;
+	uint32 refused;
+} ClusterColdEffectRoutesV1;
+
+/* Original-thread native cold-replay counter inputs, applied in this order:
+ * advance past record_xid, advance past payload_xid (if present), then apply
+ * checkpoint_next_xid as an ONLINE minimum or a SHUTDOWN exact value.
+ * complete only describes this record's inputs. It proves no replay cut,
+ * per-thread endpoint, allocator authority, FullXid epoch or loser identity. */
+typedef struct ClusterColdXidInputV1 {
+	TransactionId record_xid;
+	TransactionId payload_xid;
+	uint64 checkpoint_next_xid; /* Native FullTransactionId value; zero if absent. */
+	bool checkpoint_shutdown;
+	bool complete;
+} ClusterColdXidInputV1;
+
+/* Pure counter fold over one original source's post-checkpoint input cut.
+ * A finished value is only an input-derived candidate. The original owner
+ * must still prove actual effect replay, freshness and all-thread coverage
+ * before using any endpoint; this state grants no allocator/loser authority. */
+typedef struct ClusterColdXidProgressV1 {
+	ClusterColdParticipantV1 source;
+	uint64 next_xid;
+	uint64 expected_records;
+	uint64 records;
+	XLogRecPtr last_read;
+	XLogRecPtr last_end;
+	bool begun;
+	bool failed;
+} ClusterColdXidProgressV1;
+
+/* Attempt-local counter inputs published only by the original endpoint
+ * owner after every source and the post-redo inventory pass their final
+ * readback. The sealed plan binds the physical cuts; the copied sources
+ * bind the selected claims/namespaces. This is not fresh execution authority. */
+typedef struct ClusterColdXidReceiptV1 {
+	const ClusterColdPlanV1 *plan;
+	uint64 system_identifier;
+	uint32 participant_count;
+	uint32 replay_count;
+	ClusterWalSourceRef sources[CLUSTER_COLD_MAX_PARTICIPANTS];
+	uint64 next_xid[CLUSTER_COLD_MAX_PARTICIPANTS];
+} ClusterColdXidReceiptV1;
+
+extern bool cluster_cold_xid_begin_v1(ClusterColdXidProgressV1 *progress,
+									 const ClusterColdParticipantV1 *source,
+									 uint64 checkpoint_next_xid, uint64 expected_records);
+extern bool cluster_cold_xid_record_v1(ClusterColdXidProgressV1 *progress,
+									  const ClusterColdParticipantV1 *source,
+									  const ClusterColdRecordV1 *record,
+									  const ClusterColdXidInputV1 *input);
+extern bool cluster_cold_xid_candidate_v1(const ClusterColdXidProgressV1 *progress,
+										 const ClusterColdParticipantV1 *source, uint64 *next_xid);
+
 /*
  * One native record mapped to plan input by the shared closed route
  * registry.  record.components points into components[] and
@@ -486,14 +651,21 @@ struct XLogReaderState;
 typedef struct ClusterColdDecodedV1 {
 	ClusterColdRecordV1 record;
 	ClusterColdComponentV1 components[CLUSTER_COLD_MAX_COMPONENTS];
+	ClusterColdEffectRoutesV1 effects;
+	ClusterColdXidInputV1 xid_input;
+	/* Borrowed from this decode only; capture before advancing the reader. */
+	RfDetachedRecordPlanV1 detached;
 	uint8 route_owner;	/* RfRecordRouteOwnerV1 */
 	uint8 route_detail; /* RfPageProofDetailV1 of a refused record */
 	ClusterColdSpaceOpV1 *space_ops;
 	uint32 space_capacity;
 } ClusterColdDecodedV1;
 
-/* Classify one decoded record of the exact source namespace.  Unsupported
- * opcodes and routed side components fail with OPCODE_UNSUPPORTED; SPACE
+/* Classify one decoded record of the exact source namespace. Reserved raw/top
+ * xids, top without raw, and a known child raw/top mismatch fail with
+ * COMPONENT_INVALID before any effect route or counter input is exported.
+ * Absent top metadata is allowed but never proves canonical ownership.
+ * Unsupported opcodes and routed side components fail with OPCODE_UNSUPPORTED; SPACE
  * identity and reservation changes and a commit's relation drops become
  * typed SPACE effects (SPACE_INVALID when malformed or of another
  * namespace); other lifecycle, prepared-transaction and (for another
@@ -505,6 +677,49 @@ extern ClusterColdDetailV1 cluster_cold_recovery_decode_v1(struct XLogReaderStat
 														   bool space_active, bool foreign,
 														   ClusterColdDecodedV1 *out);
 extern void cluster_cold_decoded_release_v1(ClusterColdDecodedV1 *decoded);
+
+/* Before a pass-2 consumer or skip, prove that its original dispatch covers
+ * the entire decoded record. NULL step means unscheduled. This is not
+ * source qualification, consumer readiness or a completion certificate. */
+extern bool cluster_cold_replay_effects_v1(const ClusterColdDecodedV1 *decoded,
+										   const ClusterColdStepV1 *step, bool own);
+
+/* Attempt-local coverage of the complete effect matrix. Startup checks
+ * the route before any effect, then records coverage only after the original
+ * consumer returns or a validated skip finishes. These counts do not verify
+ * execution themselves and are neither a WAL field nor completion authority:
+ * the caller still owns source, freshness, durability and fence checks. */
+typedef struct ClusterColdEffectsProofV1 {
+	uint64 records_seen[CLUSTER_COLD_MAX_PARTICIPANTS];
+	uint64 records_routed;
+	uint32 required_union;
+	uint32 routed_union;
+	/* Keep route coverage bound to the participant that supplied it.  These
+	 * attempt-local masks prevent one origin's ordinary route from qualifying
+	 * another origin; they are not persistence, authority or C0 state. */
+	uint32 required_union_by_participant[CLUSTER_COLD_MAX_PARTICIPANTS];
+	uint32 routed_union_by_participant[CLUSTER_COLD_MAX_PARTICIPANTS];
+	bool invalid;
+} ClusterColdEffectsProofV1;
+
+/* Volatile pass-2 output owned by the original typed context. The copied
+ * counts/result remain tied to its sealed plan; this is not durability,
+ * checkpoint coverage, top ownership or old-writer isolation authority. */
+typedef struct ClusterColdEffectsReceiptV1 {
+	const ClusterColdPlanV1 *plan;
+	ClusterColdEffectsProofV1 proof;
+	ClusterColdReplayResultV1 result;
+} ClusterColdEffectsReceiptV1;
+
+extern void cluster_cold_effects_proof_init_v1(ClusterColdEffectsProofV1 *proof);
+extern bool cluster_cold_effects_proof_record_v1(ClusterColdEffectsProofV1 *proof,
+										 uint32 participant,
+										 const ClusterColdDecodedV1 *decoded,
+										 const ClusterColdStepV1 *step, bool own);
+extern bool cluster_cold_effects_proof_finish_v1(const ClusterColdEffectsProofV1 *proof,
+										 const ClusterColdPlanV1 *plan,
+										 const ClusterColdReplayResultV1 *result,
+										 uint32 participant_count);
 
 /*
  * Pass-2 reader over one ROOT-selected writer generation.  Segments are
@@ -571,18 +786,33 @@ extern const char *cluster_cold_refusal_hint_v1(ClusterColdDetailV1 detail);
 /* Pass-1 scan of one RECOVERY_REQUIRED root through the sealed recovery
  * visitor, feeding the plan participant at caller index `participant`.
  * Every visited record is provisional until the visit and the observed cut
- * (complete end, record count) match the ROOT. */
+ * (complete end, record count) match the ROOT. Optional side_plan is an
+ * unsealed single-source plan for this ROOT; it captures every complete
+ * decoded record without changing any original ownership/refusal flags.
+ * If its execution profile is narrower than native/history acceptance,
+ * side_capture_detail marks the entire optional capture unusable. The
+ * caller discards it, and all captures on later whole-input failure. */
 typedef struct ClusterColdScanResultV1 {
 	uint64 records;
+	/* Read-only history checkpoint-to-tail counter input. Zero unless the
+	 * complete retained visit proves its cut; not an effect/freshness proof. */
+	ClusterColdXidProgressV1 history_xid;
 	int root_result; /* ClusterControlRootResult of the visit */
 	XLogRecPtr failed_read_rec_ptr;
 	uint8 route_detail;
+	/* Capture profile differs from native/history acceptance. Nonzero means
+	 * discard the entire optional SIDE plan; it cannot authorize replay. */
+	uint8 side_capture_detail;
+	XLogRecPtr side_capture_read_rec_ptr;
 } ClusterColdScanResultV1;
+
+struct RfSideOnlinePlanV1;
 
 extern ClusterColdDetailV1 cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 													 const ClusterControlRootSnapshot *root,
 													 const ClusterControlRootReadToken *token,
 													 bool space_active, bool foreign,
+													 struct RfSideOnlinePlanV1 *side_plan,
 													 ClusterColdScanResultV1 *result);
 
 /* Pass 2 consumed exactly the ROOT-sealed cut of replayed generation
@@ -617,7 +847,11 @@ extern void cluster_cold_touched_add_v1(ClusterColdTouchedV1 *touched,
 										const RelFileLocator *locator, ForkNumber fork);
 extern void cluster_cold_touched_add_record_v1(ClusterColdTouchedV1 *touched,
 											   struct XLogReaderState *record);
-extern void cluster_cold_durable_barrier_v1(const ClusterColdTouchedV1 *touched);
+/* Startup-only: also write the founder's native SLRU/undo caches, then use
+ * the original checkpointer sync handshake. An empty relation set does not
+ * prove those caches clean. False leaves counter/completion publication
+ * blocked; errors from the original write/sync owners propagate. */
+extern bool cluster_cold_durable_barrier_v1(const ClusterColdTouchedV1 *touched);
 
 /*
  * Typed cold replay driver state (startup process).  prepare() runs pass 1
@@ -631,6 +865,11 @@ extern void cluster_cold_durable_barrier_v1(const ClusterColdTouchedV1 *touched)
 struct ClusterRecoveryFencePlan;
 
 struct ClusterWalInputsV1;
+struct ClusterColdReplayRootV1;
+struct ClusterColdTtBaseV1;
+struct UndoSegmentHeaderData;
+struct ClusterControlRootSnapshot;
+struct ClusterWalRecoveryCheckpointV1;
 
 typedef struct ClusterColdTypedV1 {
 	MemoryContext context;
@@ -640,7 +879,37 @@ typedef struct ClusterColdTypedV1 {
 	uint32 participant_count;
 	uint32 replay_count; /* [0, replay_count): crashed; the rest history only */
 	uint32 own_participant;
+	/* Original checkpoints for all participants; only [0, replay_root_count)
+	 * have the original ROOT tokens permitting replay-source revalidation. */
+	struct ClusterColdReplayRootV1 *replay_roots;
+	uint32 replay_root_count;
+	struct ClusterColdTtBaseV1 *tt_base; /* raw original-owner input, no outcome authority */
+	struct ClusterColdTtBaseV1 *tt_after_redo; /* separate physical input, same TT budget */
+	/* Complete read-only ACTIVE input census from the still-held pass-2 cut.
+	 * It survives EOR as input only, never as execution or write authority. */
+	struct ClusterColdTopTxCensusV1 *top_tx_census;
+	bool source_drained[CLUSTER_COLD_MAX_PARTICIPANTS]; /* this pass-2 attempt only */
+	/* Provisional native counters after counted pass-2 drain. Zero means
+	 * missing; these do not prove global effects/durability or all-thread N. */
+	uint64 xid_next_at_drain[CLUSTER_COLD_MAX_PARTICIPANTS];
+	/* Full-width maximum of every original counter endpoint after replay
+	 * and the caller's durability barrier. No TT/top/loser authority. */
+	uint64 xid_next_after_redo;
+	ClusterColdXidReceiptV1 xid_receipt;
+	ClusterColdEffectsReceiptV1 effects_receipt;
+	/* Read-only pass-1 inputs for history generations. Their source redo is
+	 * the original checkpoint's, not the history mutation cut at tail. No
+	 * pass-2 endpoint: final source freshness/durability still needs proof. */
+	ClusterColdXidProgressV1 history_xid[CLUSTER_COLD_MAX_PARTICIPANTS];
+	/* Per selected source, including its retained pre-redo records. Each plan
+	 * binds the complete retained source set; that does not authorize target
+	 * mutation. History-only generations keep their redo cut at the tail. */
+	struct RfSideOnlinePlanV1 *side_plans[CLUSTER_COLD_MAX_PARTICIPANTS];
+	uint8 side_capture_detail[CLUSTER_COLD_MAX_PARTICIPANTS];
+	XLogRecPtr side_capture_read_rec_ptr[CLUSTER_COLD_MAX_PARTICIPANTS];
 	struct ClusterWalInputsV1 *inputs;				   /* census read scope, released by pass 1 */
+	ClusterControlRootFileToken census_root; /* metadata only, never an execution pin */
+	bool census_root_captured;
 	uint32 input_index[CLUSTER_COLD_MAX_PARTICIPANTS]; /* history: index in that scope */
 	uint64 system_identifier;
 	uint64 scanned_records;
@@ -649,9 +918,605 @@ typedef struct ClusterColdTypedV1 {
 	ClusterWalSourceRef sources[CLUSTER_COLD_MAX_PARTICIPANTS];
 } ClusterColdTypedV1;
 
+/* After the original durability barrier, reread each surviving replay PAGE
+ * frontier through the physical DATA observer. This grants no C0 authority. */
+extern bool cluster_cold_data_readback_v1(ClusterColdTypedV1 *typed);
+
+/* Read the retained original all-source counter maximum. Refuse a missing,
+ * partial or mismatched receipt and zero the output. This only checks the
+ * retained inputs; it does not reacquire a fence or revalidate disk sources. */
+extern bool cluster_cold_typed_xid_maximum_v1(const ClusterColdTypedV1 *typed, uint64 *next_xid);
+
+/* Original completion receipt's exact plan/source binding only. Numeric
+ * endpoints are separately required by xid_maximum for C0 derivation. */
+extern bool cluster_cold_typed_xid_sources_ready_v1(const ClusterColdTypedV1 *typed);
+
 extern ClusterColdTypedV1 *cluster_cold_typed_prepare_v1(struct ClusterRecoveryFencePlan *fence,
 														 uint16 own_thread, XLogRecPtr own_redo);
 extern void cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed);
+
+/* Capture actual pass-2 coverage before its adapter is released. A failed
+ * completion clears the previous output; consumers recheck the same plan. */
+extern bool cluster_cold_typed_effects_complete_v1(ClusterColdTypedV1 *typed,
+													const ClusterColdEffectsProofV1 *proof,
+													const ClusterColdReplayResultV1 *result);
+extern bool cluster_cold_typed_effects_ready_v1(const ClusterColdTypedV1 *typed);
+/* Return independent physical evidence for nonempty ordinary effects.  This
+ * is derived from the sealed routed receipt, never from a caller proof bit,
+ * and grants no execution or C0 authority. */
+extern bool cluster_cold_typed_effects_nonempty_v1(const ClusterColdTypedV1 *typed);
+/* Return ordinary-effect evidence only for the selected participant's own
+ * routed receipt.  Aggregate readiness and caller proof bits cannot qualify a
+ * different participant, and this remains read-only with no C0 authority. */
+extern bool cluster_cold_typed_effects_nonempty_for_participant_v1(
+	const ClusterColdTypedV1 *typed, uint32 participant);
+
+/* Startup before execution pin/IR only. Reopen the original cold input owner,
+ * compare the complete selected ROOT and history checkpoints, then release
+ * all read pins. Success is freshness input, not execution/durability proof. */
+extern bool cluster_cold_typed_recheck_inputs_v1(ClusterColdTypedV1 *typed);
+/* Recheck/release the original census, then retain every selected physical
+ * thread in the original execution owner before its unchanged foreign IR set.
+ * This does not qualify history durability, final freshness or endpoints. */
+extern bool cluster_cold_typed_acquire_serial_v1(ClusterColdTypedV1 *typed,
+												 struct ClusterRecoveryFencePlan *fence);
+
+/* Original native checkpoint input for any selected generation, including
+ * history. Copies only sealed input; failure clears both outputs. This does
+ * not establish TT era, checkpoint coverage, replay or loser authority. */
+extern bool cluster_cold_typed_checkpoint_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+											 struct ClusterControlRootSnapshot *out_root,
+											 struct ClusterWalRecoveryCheckpointV1 *out_checkpoint);
+
+/* Read-only TT base input owned by the original cold attempt. Every segment
+ * address of every participant origin (including history) is inspected.
+ * These bytes prove neither FullXid, checkpoint coverage nor loser status. */
+extern ClusterColdDetailV1 cluster_cold_tt_base_capture_v1(ClusterColdTypedV1 *typed, Size budget);
+extern ClusterColdDetailV1 cluster_cold_tt_base_recheck_v1(ClusterColdTypedV1 *typed);
+extern void cluster_cold_tt_base_destroy_v1(ClusterColdTypedV1 *typed);
+extern uint32 cluster_cold_tt_base_count_v1(const ClusterColdTypedV1 *typed);
+extern const struct UndoSegmentHeaderData *
+cluster_cold_tt_base_header_v1(const ClusterColdTypedV1 *typed, uint32 index, uint8 *owner,
+							   uint32 *segment);
+
+/* Match raw namespace input against the retained capture and current caller.
+ * This is neither source isolation nor checkpoint or transaction authority. */
+extern bool cluster_cold_tt_base_namespace_matches_v1(const ClusterColdTypedV1 *typed,
+													  uint64 system_identifier,
+													  uint64 database_incarnation);
+
+/* Physical input identity only: xid is raw, not FullXid, and there is no
+ * cluster epoch or checkpoint/terminal proof. Generation zero is valid. */
+typedef struct ClusterColdTtSlotKeyV1 {
+	uint8 owner_instance;
+	uint32 segment_id;
+	uint32 segment_generation;
+	uint32 slot_offset;
+	TransactionId xid;
+	uint16 slot_wrap;
+} ClusterColdTtSlotKeyV1;
+
+/* Read-only canonical input for the new creator of one retained heap record.
+ * This covers INSERT/UPDATE/HOT_UPDATE and MULTI_INSERT only, not old tuple
+ * xmin/xmax, DELETE/LOCK actors or individual MX members. */
+typedef struct ClusterColdPageCreatorV1 {
+	ClusterColdRecordFrameV1 frame;
+	ClusterColdTtSlotKeyV1 key;
+} ClusterColdPageCreatorV1;
+
+/* Match this record's own raw creator to the original same-source native
+ * canonical BIND and an exact ACTIVE TT prefix before the PAGE record.
+ * Requires sealed matching recovery inputs and a native lifecycle full image;
+ * missing/ambiguous input refuses and clears out. A qualified older canonical
+ * base is a separate producer, not a new BIND retention requirement.
+ * This supplies neither complete ordinary_effects nor post-redo loser/C0,
+ * isolation, durability, source revalidation or permission to apply anything. */
+extern bool cluster_cold_typed_page_creator_v1(const ClusterColdTypedV1 *typed, uint32 frame_index,
+											   ClusterColdPageCreatorV1 *out);
+
+/* Read-only canonical input for this record's own DELETE/LOCK/LOCK_UPDATED
+ * actor. Payload xmax, old tuple creators and individual MX members are not
+ * identified by this value and require their own effect input proofs. */
+typedef struct ClusterColdPageActorV1 {
+	ClusterColdRecordFrameV1 frame;
+	ClusterColdTtSlotKeyV1 key;
+} ClusterColdPageActorV1;
+
+/* Match the original WAL header raw actor to its canonical ACTIVE TT prefix,
+ * with the same source and refusal guarantees as the creator input above.
+ * This grants no complete effects, loser/C0 or mutation authority. */
+extern bool cluster_cold_typed_page_actor_v1(const ClusterColdTypedV1 *typed, uint32 frame_index,
+											 ClusterColdPageActorV1 *out);
+
+typedef struct ClusterColdTtSlotInputV1 {
+	ClusterColdTtSlotKeyV1 key;
+	TTSlot slot;
+} ClusterColdTtSlotInputV1;
+
+/* Physical identity of a slot that remains ACTIVE after sealed redo. The
+ * key already carries the raw xid; this value deliberately has no FullXid,
+ * cluster epoch, top proof, effects coverage or mutation authority. */
+typedef struct ClusterColdTtActiveIdentityV1 {
+	ClusterColdTtSlotKeyV1 key;
+} ClusterColdTtActiveIdentityV1;
+
+/* Attempt-local top proof assembled by the original source/effects owners.
+ * The six gates are deliberately independent: a physical ACTIVE slot alone
+ * never proves that it is the original top transaction.  FullXid, nextXid,
+ * and cluster epoch are absent because they are not loser gates. */
+typedef struct ClusterColdTopTxProofV1 {
+	ClusterColdTtSlotKeyV1 key;
+	bool producer_top;
+	bool qualified_base;
+	bool sealed_redo;
+	bool ordinary_effects;
+	bool old_writer_isolated;
+	bool terminal_match;
+} ClusterColdTopTxProofV1;
+
+/* Physical E1 loser identity. This is not a persistent record or authority
+ * grant; C0 derivation consumes it only after all physical fields match. */
+typedef struct ClusterColdLoserIdentityV1 {
+	ClusterColdTtSlotKeyV1 key;
+} ClusterColdLoserIdentityV1;
+
+/* Read-only physical result, independent of any C0 writer/epoch/FullXid
+ * fields. The exact ACTIVE before-image is input, never a write grant. */
+typedef struct ClusterColdTopTxLoserProducerResultV1 {
+	ClusterColdTtActiveIdentityV1 active;
+	ClusterColdLoserIdentityV1 loser;
+	TTSlot before;
+	/* Independent producer proof retained with this exact physical result.
+	 * This is attempt-local input for a later consumer, never authority. */
+	ClusterColdTopTxProofV1 proof;
+} ClusterColdTopTxLoserProducerResultV1;
+
+extern bool cluster_cold_typed_top_tx_loser_producer_v1(
+	ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence, uint32 participant,
+	const ClusterColdTopTxProofV1 *proof, ClusterColdTopTxLoserProducerResultV1 *out);
+
+/* Every physical ACTIVE is retained, including unsupported/unproven tops.
+ * A proven loser is only a pass-2-local fact. Later consumers must reacquire
+ * their own source/isolation and TX_CLOSURE writer authority. */
+typedef struct ClusterColdTopTxCensusEntryV1 {
+	ClusterColdTtSlotInputV1 input;
+	bool loser_proven;
+	ClusterColdLoserIdentityV1 loser;
+	/* The complete producer proof is retained with the matching census entry;
+	 * an absent/zero proof keeps the ACTIVE input unresolved. */
+	ClusterColdTopTxProofV1 proof;
+} ClusterColdTopTxCensusEntryV1;
+
+typedef struct ClusterColdTopTxCensusV1 {
+	const ClusterColdPlanV1 *plan;
+	uint32 count;
+	uint32 proven_count;
+	ClusterColdTopTxCensusEntryV1 entries[FLEXIBLE_ARRAY_MEMBER];
+} ClusterColdTopTxCensusV1;
+
+/* No caller proof flags: only the original producer's independent gates
+ * can qualify a retained ACTIVE. NULL census means incomplete, not empty. */
+extern bool cluster_cold_typed_top_tx_census_v1(
+	ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence);
+
+/* Attempt-local producer result.  The source owner supplies the proof and
+ * shape; this value only records the exact post-redo physical fact, the
+ * resulting loser key and the derived C0 fields.  It is never persisted. */
+typedef struct ClusterColdTopTxC0ProducerResultV1 {
+	ClusterColdTtActiveIdentityV1 active;
+	ClusterColdLoserIdentityV1 loser;
+	ClusterRecoveryTTAbortDerivationV1 c0;
+} ClusterColdTopTxC0ProducerResultV1;
+
+/* The loser gate is independent from FullXid/epoch derivation. C0 refuses
+ * incomplete all-thread endpoints or any exact physical mismatch, while a
+ * C0 derivation failure never turns an already-proven physical loser into an
+ * abort. These are attempt-local helpers and add no persistent ABI. */
+extern bool cluster_cold_top_tx_loser_v1(const ClusterColdTtActiveIdentityV1 *active,
+										 const ClusterColdTopTxProofV1 *proof,
+										 ClusterColdLoserIdentityV1 *out);
+extern bool cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
+									 const ClusterRecoveryTTAbortV1 *shape, uint64 next_xid,
+									 bool all_endpoints_complete, bool has_oldest_xid,
+									 TransactionId oldest_xid, uint64 recoverer_epoch,
+									 ClusterRecoveryTTAbortDerivationV1 *out);
+
+/* Revalidate the original selected ROOTs, sources, checkpoints and retained
+ * history inside the caller's still-held pass-2 fence/serial set. No refresh
+ * or authority acquisition: failure invalidates this attempt's cached input.
+ * This is not a post-EOR recovery-writer grant. */
+extern bool cluster_cold_typed_sources_current_v1(ClusterColdTypedV1 *typed,
+												  struct ClusterRecoveryFencePlan *fence);
+
+/* Read-only pass-2 isolation input from the original exact foreign target's
+ * COLD_FORMED authority, including its current real NeedSet/AdmissionSet,
+ * ROOT/token, serial and retained window. Own/history-only participants
+ * without that original authority refuse. No new grant or post-EOR authority. */
+extern bool cluster_cold_typed_old_writer_isolated_v1(ClusterColdTypedV1 *typed,
+													  struct ClusterRecoveryFencePlan *fence,
+													  uint32 participant);
+
+/* Shared physical producer boundary for one original TT owner, also used by
+ * the C0 wrapper. The physical entry takes no C0 shape, epoch or numeric
+ * FullXid endpoint; it still requires the complete original source receipt.
+ * Locate the post-redo header
+ * by physical owner/segment, require the complete ordinary TT/UNDO inventory
+ * and all original sources, then verify the selected sealed fold and exact
+ * slot before-image. Require this original owner's captured native checkpoint
+ * to agree with its exact source, ROOT and selected redo interval. This input
+ * check alone does not qualify TT base coverage.
+ * Recheck the original post-redo physical namespace, inode identities and
+ * retained TT/UNDO bytes before consuming cached images and before publishing
+ * output. A mismatch invalidates that snapshot and leaves output zero. These
+ * checks alone do not establish source/ROOT freshness or old-writer isolation.
+ * Require the original owner to revalidate every selected source/ROOT and its
+ * still-held execution fence before reading cached inputs and before publishing
+ * the candidate. This produces only an input descriptor, not C0 write authority.
+ * Derive producer_top/qualified_base from the original integrity-checked
+ * native checkpoint base with the exact ACTIVE generation/slot/wrap/xid.
+ * The supported ACTIVE publisher stores only canonical top xids; native
+ * COMMIT/checkpoint ordering covers pre-redo stamps. Complete sealed redo
+ * and whole physical readback cover the rest. A checksum-zero original base
+ * remains unqualified even if redo seals its post-image. Alternatively,
+ * require this source's exact canonical BIND and complete native INIT/REUSE
+ * fold with no captured predecessor, agreeing with the full post-redo page.
+ * The caller's producer_top/qualified_base bits are ignored; neither a CRC
+ * nor a checkpoint number alone supplies these native owner proofs.
+ * Derive sealed_redo from the original all-record completion receipt,
+ * bound to this exact plan and complete source set by the all-thread
+ * endpoint receipt, with the verified ordinary inventory. The caller's
+ * sealed_redo bit is ignored. Derive old_writer_isolated from the original
+ * exact foreign target authority above and recheck it before output. The
+ * caller's isolation bit is ignored; an own/history target cannot substitute
+ * a caller assertion for missing authority. Derive terminal_match from the
+ * qualified native base, sealed redo and exact physical ACTIVE readback,
+ * together with the retained terminal checks below. The caller's terminal
+ * bit is ignored. Check original actor/top consistency in every accepted
+ * input record, including cursor-only records and retained history, and any
+ * present native BIND or ordinary exact TT_ABORT actor against that operation's
+ * own durable slot xid.
+ * Original UNDO BLOCK_WRITE/MULTI FPIs also require complete native record
+ * decoding, including historical records' own physical origin/TT locators.
+ * The inventory also decodes every complete retained post-redo UNDO block,
+ * including new delta records and inherited original-base records, after
+ * its existing exact native fold/readback checks.
+ * These raw records need not name the WAL actor or this selected loser and
+ * do not supply canonical generation or terminal authority.
+ * Replay PAGE INSERT/UPDATE/HOT/MULTI
+ * additionally require their original creator input; DELETE/LOCK/LOCK_UPDATED
+ * require their actor input, each from its own BIND and ACTIVE causal prefix.
+ * History frames retain the consistency check; the replay-only PAGE producers
+ * do not qualify them. Derive the restricted empty ordinary_effects case
+ * only when the complete all-source input transcript matches every original
+ * SIDE operation and contains solely native INIT/REUSE/BIND and XLOG NOOP,
+ * with no PAGE/SPACE work. The exact unique replay BIND must have an UNUSED,
+ * xid-free, empty predecessor from an earlier full native lifecycle image;
+ * its post-redo head must remain empty. History-only/idempotent BIND and
+ * old ACTIVE head=0 do not supply this proof. Old tuple/MX ownership, a
+ * parent graph and nonempty ordinary_effects remain independent requirements.
+ * Other proof/shape gates remain independent and required. Older ACTIVE
+ * without a retained BIND requires the qualified original checkpoint base;
+ * this does not introduce a BIND lifetime retention requirement.
+ * Reject exact native COMMIT/TT_ABORT conflicts in every sealed source,
+ * including history-only retained incarnations of the same thread. Absence
+ * of those conflicts alone does not supply the terminal proof. A native
+ * ABORT with this origin/raw xid additionally requires its original unique
+ * exact TT_ABORT pairing, including retained history. This read-only identity
+ * does not authorize historical replay. An unqualified ABORT remains blocked.
+ * Replayed native UNDO deltas additionally require their normal original
+ * WAL actor's own BIND and its inclusive ACTIVE prefix. Every appended record in
+ * their persisted directory span must match that actor's raw xid and
+ * physical origin/TT segment/slot/wrap. The prefix supplies the canonical
+ * segment generation. Abort cleanup may flush the batch after exact TT_ABORT,
+ * native ABORT or later slot reuse; none erases the original binding input.
+ * An intervening COMMIT is incompatible with the native precommit drain.
+ * Inherited records and FPI history retain their own actors and do not
+ * gain canonical identity or the independent ordinary_effects proof here.
+ * Target incarnation/claim remain bound to the original source.  A new
+ * header with no original base requires the native full-image proof.
+ * The original endpoint receipt must cover the unchanged complete source
+ * set. The C0 wrapper additionally requires all numeric endpoints, their
+ * agreement with typed->xid_next_after_redo and the exact C0 shape. A missing
+ * post-redo image or physical proof gate refuses either entry.
+ * No proof bit is synthesized from source-drained state, current epoch or
+ * graph shape, and no old C0 replay consumer is called here. */
+extern bool cluster_cold_typed_top_tx_c0_producer_v1(
+	ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence, uint32 participant,
+	const ClusterColdTopTxProofV1 *proof, const ClusterRecoveryTTAbortV1 *shape,
+	bool has_oldest_xid, TransactionId oldest_xid, uint64 recoverer_epoch,
+	ClusterColdTopTxC0ProducerResultV1 *out);
+
+/* Re-enumerate physical TT after complete redo and the original durability
+ * barrier, without overwriting the pre-redo base. Share its remaining budget.
+ * Retain post-redo images of UNDO blocks already cached in the original base;
+ * recheck them against disk along with the post-redo headers.
+ * The original cold owner must revalidate all sources around capture/readback.
+ * These raw bytes grant no checkpoint, top, loser, FullXid or C0 authority. */
+extern ClusterColdDetailV1 cluster_cold_tt_after_redo_capture_v1(ClusterColdTypedV1 *typed);
+extern ClusterColdDetailV1 cluster_cold_tt_after_redo_recheck_v1(ClusterColdTypedV1 *typed);
+extern void cluster_cold_tt_after_redo_reset_v1(ClusterColdTypedV1 *typed);
+extern uint32 cluster_cold_tt_after_redo_count_v1(const ClusterColdTypedV1 *typed);
+/* Distinguish a captured empty inventory from absent or refused input. */
+extern bool cluster_cold_tt_after_redo_namespace_matches_v1(const ClusterColdTypedV1 *typed);
+/* Original inventory consumer: compare every retained UNDO block pair with
+ * the sealed current source's native fold, or unchanged history-only bytes.
+ * Validate the original record layout and bounded full heap before-images.
+ * Does not reread disk, qualify base coverage or prove transaction membership.
+ * Final source/header/block rechecks remain with the original owner. */
+extern bool cluster_cold_tt_after_redo_undo_matches_v1(const ClusterColdTypedV1 *typed);
+/* After the complete native inventory check, qualify the selected ACTIVE
+ * slot's supplied prev-chain using retained post-redo bytes and the original
+ * raw reader/reference graph, including its order/cycle and second reads.
+ * Temporary graph storage shares the captures' remaining memory budget.
+ * No DATA I/O or cache refresh. Does not prove checkpoint/producer coverage,
+ * atomic transaction effects or C0 authority. An empty head is neutral. */
+extern bool cluster_cold_tt_after_redo_undo_chain_matches_v1(const ClusterColdTypedV1 *typed,
+															 const ClusterColdTtSlotKeyV1 *key);
+/* Exact physical lookup in one valid captured inventory. Clears index on
+ * absence/refusal; no disk access, reconstruction or recovery authority. */
+extern const UndoSegmentHeaderData *cluster_cold_tt_header_find_v1(const ClusterColdTypedV1 *typed,
+																   bool after_redo, uint8 owner,
+																   uint32 segment, uint32 *index);
+/* Complete retained post-redo header input, indexed in its own inventory.
+ * Failure clears available identity outputs. No original-base coverage. */
+extern const struct UndoSegmentHeaderData *
+cluster_cold_tt_after_redo_header_v1(const ClusterColdTypedV1 *typed, uint32 index, uint8 *owner,
+									 uint32 *segment);
+extern bool cluster_cold_tt_after_redo_slot_v1(const ClusterColdTypedV1 *typed,
+											   uint32 segment_index, uint32 slot_offset,
+											   ClusterColdTtSlotInputV1 *out);
+
+/* Enumerate every physical slot without filtering status, then optionally
+ * match an expected physical key. Both copy input only and clear output on
+ * failure. A match grants no top binding, outcome or mutation authority. */
+extern bool cluster_cold_tt_base_slot_v1(const ClusterColdTypedV1 *typed, uint32 segment_index,
+										 uint32 slot_offset, ClusterColdTtSlotInputV1 *out);
+extern bool cluster_cold_tt_base_match_v1(const ClusterColdTypedV1 *typed,
+										  const ClusterColdTtSlotKeyV1 *expected,
+										  ClusterColdTtSlotInputV1 *out);
+
+struct ClusterRecoveryUndoRecord;
+/* Retain and copy a whole original physical UNDO block within the TT budget,
+ * bound to its captured namespace, file identity and complete block zero.
+ * Reread on every call and in final base_recheck. Raw bytes and generation
+ * alone prove no record validity, LSN coverage or transaction authority.
+ * Failure clears outputs; source/allocation refusal invalidates TT input. */
+extern bool cluster_cold_tt_base_block_v1(ClusterColdTypedV1 *typed, uint32 segment_index,
+										  uint32 blockno, PGAlignedBlock *out, uint32 *generation);
+/* Copy raw original UNDO from a captured physical segment, which may differ
+ * from its canonical TT segment. Retain each whole block once within the TT
+ * budget and reread it in base_recheck before pass-2. No canonical transaction,
+ * generation ancestry, checksum, FullXid/epoch, top, complete-chain or terminal
+ * proof is created; the graph owner must check those independently. Failure
+ * clears outputs; source, parse or allocation refusal invalidates TT input. */
+extern bool cluster_cold_tt_undo_record_v1(ClusterColdTypedV1 *typed, UBA address,
+										   struct ClusterRecoveryUndoRecord *out,
+										   uint32 *generation);
+
+/* Read callback for the existing reference graph over an exact captured
+ * namespace and canonical physical TT slot key. Reread cached source bytes
+ * on every call, including graph verification. The original cold owner must
+ * still provide isolation and final base_recheck; neither a matching raw key
+ * nor a drained supplied graph proves FullXid/epoch/top binding, complete
+ * producer coverage, loser eligibility or C0/OPEN authority. Source/parse
+ * refusals return GRAPH_INVALID, allocation refusals GRAPH_CAPACITY; every
+ * refusal clears available outputs and invalidates the retained TT input. */
+extern ClusterRecoveryGraphResult
+cluster_cold_tt_graph_read_v1(void *arg, const ClusterRecoveryTxnKey *key, UBA address,
+							  struct ClusterRecoveryUndoRecord *out, uint32 *generation);
+
+struct RfSideUndoHeaderImageV1;
+/* Fold one selected original source's ordinary redo into a private copy of
+ * its captured TT header. This is input reconstruction, not FullXid/epoch,
+ * top binding, checkpoint coverage, loser or completion authority. C0 and
+ * prepared transactions are unsupported here. Failure leaves out unchanged. */
+extern bool cluster_cold_typed_tt_redo_header_v1(const ClusterColdTypedV1 *typed,
+												 uint32 participant, uint32 segment_index,
+												 struct RfSideUndoHeaderImageV1 *out);
+
+/* Match this original header's complete sealed ordinary fold against the
+ * separately captured physical post-redo header, by owner/segment rather
+ * than inventory index. Copies the folded image only on exact equality;
+ * failure clears out. This is selected-header readback input, not global
+ * inventory, checkpoint/base qualification, top, loser or C0 authority.
+ * Original source isolation and final freshness/readback owners still apply. */
+extern bool cluster_cold_typed_tt_redo_readback_v1(const ClusterColdTypedV1 *typed,
+												   uint32 participant, uint32 segment_index,
+												   struct RfSideUndoHeaderImageV1 *out);
+
+/* Select a physical post-redo header, including one absent from the original
+ * inventory. Such a header requires the sealed native full-image fold with
+ * no base; observed post bytes never supply missing input. Exact full-block
+ * equality and the original-source guards still apply. Failure clears out.
+ * This is selected-header input, not global inventory or recovery authority. */
+extern bool cluster_cold_typed_tt_after_redo_readback_v1(const ClusterColdTypedV1 *typed,
+														 uint32 participant,
+														 uint32 post_segment_index,
+														 struct RfSideUndoHeaderImageV1 *out);
+
+/* Check both captured inventories and every current source's ordinary TT
+ * target. Current origins use the sealed native fold; history-only origins
+ * must retain their original full header bytes and are never replayed here.
+ * Every already-cached UNDO data block also needs the exact native after
+ * image, including unchanged bytes and history-only blocks. Every actual
+ * current WAL block-write target absent from that cache needs the complete
+ * native FPI fold and a separate retained post image; no observed-base fallback.
+ * After those checks, every retained post block needs complete native record
+ * decoding, including unchanged records' physical origin/TT locators. This
+ * does not qualify the base, per-operation prefixes or canonical history.
+ * This read-only comparison grants no checkpoint/base, history-effect, top,
+ * loser or C0 authority. Original source isolation and final rechecks remain
+ * the caller's obligations; no completion flag is stored. */
+extern bool cluster_cold_typed_tt_redo_inventory_v1(const ClusterColdTypedV1 *typed);
+
+typedef struct ClusterColdCtrcReleaseCensusV1 {
+	uint32 subject_count;
+	uint32 released_count;
+	uint32 unresolved_count;
+	uint32 unqualified_count;
+} ClusterColdCtrcReleaseCensusV1;
+
+/* Retained native input only, no live allocator/admission or new release.
+ * The original registered Startup must supply its complete pass-2 census.
+ * This cannot replace the independent D2 proof for newly discharged work. */
+extern bool cluster_cold_typed_ctrc_release_census_v1(const ClusterColdTypedV1 *typed,
+												  ClusterColdCtrcReleaseCensusV1 *out);
+
+/* Copy any physical slot after the same selected source's sealed ordinary
+ * redo, or match its resulting physical key. No status is filtered during
+ * enumeration, and generation zero is valid. A pre-redo key is insufficient
+ * after slot/segment reuse. These are raw input copies, not FullXid/epoch,
+ * canonical top, checkpoint coverage, loser or C0/OPEN authority. History,
+ * C0 and prepared inputs retain the header fold's refusal. Failure clears
+ * available output; expected may point into out. Original source isolation
+ * and final rechecks remain required. The existing raw graph callback still
+ * matches only the captured pre-redo key. */
+extern bool cluster_cold_typed_tt_redo_slot_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+											   uint32 segment_index, uint32 slot_offset,
+											   ClusterColdTtSlotInputV1 *out);
+extern bool cluster_cold_typed_tt_redo_match_v1(const ClusterColdTypedV1 *typed, uint32 participant,
+												uint32 segment_index,
+												const ClusterColdTtSlotKeyV1 *expected,
+												ClusterColdTtSlotInputV1 *out);
+/* Retain only the exact physical key of a post-redo ACTIVE slot. Terminal
+ * status, raw xid and wrap must agree with that key. This is an input fact
+ * for a later TopTxProof/loser consumer, never a loser decision itself; no
+ * FullXid high bits or bind-time epoch are read. Failure clears out. */
+extern bool cluster_cold_typed_tt_active_identity_v1(const ClusterColdTypedV1 *typed,
+															uint32 participant,
+															uint32 segment_index,
+															const ClusterColdTtSlotKeyV1 *expected,
+															ClusterColdTtActiveIdentityV1 *out);
+
+/* Copy one raw record from a sealed ordinary source's final FPI-backed UNDO
+ * block image and return its folded physical segment generation (zero is
+ * valid). segment_index selects the captured physical segment, which may
+ * differ from the canonical TT segment. No DATA fallback is attempted when
+ * that incarnation lacks an FPI or has an unanchored delta. Original source
+ * isolation and final rechecks remain required. This creates no canonical
+ * transaction, FullXid/epoch/top, checkpoint coverage, complete-chain, loser
+ * or C0/OPEN proof. History, C0 and prepared inputs retain the header fold's
+ * refusal. Failure clears available outputs; successful output owns bytes. */
+extern bool cluster_cold_typed_undo_redo_record_v1(const ClusterColdTypedV1 *typed,
+												   uint32 participant, uint32 segment_index,
+												   UBA address,
+												   struct ClusterRecoveryUndoRecord *out,
+												   uint32 *generation);
+
+/* Distinct original-base input: same captured generation, no INIT/REUSE,
+ * and a nonzero base block LSN no later than this source's native redo start.
+ * Cache and reread the entire original block, fold ordinary sealed redo in a
+ * private copy, then parse. No fallback or change to the FPI-only reader or
+ * graph. Final base/source checks, isolation and all transaction proofs remain
+ * the original owner's duty. Failure clears available outputs. */
+extern bool cluster_cold_typed_undo_base_redo_record_v1(ClusterColdTypedV1 *typed,
+														uint32 participant, uint32 segment_index,
+														UBA address,
+														struct ClusterRecoveryUndoRecord *out,
+														uint32 *generation);
+
+/* Fold a retained original UNDO block without rereading pre-redo disk bytes.
+ * Uses the record reader's exact source, generation, lifecycle and LSN guards.
+ * Successful output owns bytes; failure clears out. Base may alias out.
+ * No checkpoint/base coverage, transaction or completion authority. */
+extern bool cluster_cold_typed_undo_base_redo_block_v1(const ClusterColdTypedV1 *typed,
+													   uint32 participant, uint32 segment_index,
+													   uint32 block_no, const PGAlignedBlock *base,
+													   PGAlignedBlock *out);
+
+/* One explicitly selected original replay participant, never a history or
+ * owner-id shortcut. The caller retains this context throughout graph use. */
+typedef struct ClusterColdTtRedoGraphInputV1 {
+	const ClusterColdTypedV1 *typed;
+	uint32 participant;
+} ClusterColdTtRedoGraphInputV1;
+
+/* Create an input graph with every nonzero after-redo TT head in every
+ * captured segment of this participant's physical owner. Terminal status
+ * does not retire a dependency. No BIND inventory or zero-head inference.
+ * The caller retains input and typed through graph destruction. Failure
+ * clears out and destroys any partially seeded graph. MORE only means the
+ * TT roots were supplied; traversal, page/native roots, all-source and final
+ * base/source checks remain required. No top/loser/C0 or OPEN authority. */
+extern ClusterRecoveryGraphResult
+cluster_cold_typed_tt_redo_graph_begin_v1(ClusterColdTtRedoGraphInputV1 *input,
+										  size_t memory_budget,
+										  struct ClusterRecoveryReferenceGraph **out);
+
+/* Existing reference-graph callback over an exact after-redo TT key and the
+ * same source's final FPI-backed records. No DATA fallback or install. Every
+ * call, including graph verification, repeats the source and identity checks;
+ * refusal clears outputs and the graph retains its normal sticky failure.
+ * A drained supplied graph proves no FullXid/epoch/top, producer/checkpoint
+ * coverage, loser, C0 or OPEN authority. Original source isolation and final
+ * base/source rechecks remain required. The raw pre-redo callback is unchanged. */
+extern ClusterRecoveryGraphResult
+cluster_cold_typed_tt_redo_graph_read_v1(void *arg, const ClusterRecoveryTxnKey *key, UBA address,
+										 struct ClusterRecoveryUndoRecord *out, uint32 *generation);
+
+/* Explicit original-base alternative, never an FPI-only graph fallback.
+ * The original bounded block cache is mutable; retain this context and typed
+ * through graph destruction. Roots and exact after-redo key checks have the
+ * same contract as the FPI-only graph above. Records use the separate
+ * same-generation/no-lifecycle original-base reader and its full-byte reread.
+ * Cache/source/parse refusal returns GRAPH_INVALID and clears outputs; graph
+ * allocation still returns GRAPH_CAPACITY. Final base/source checks and
+ * isolation remain owner duties. No qualified checkpoint/source coverage,
+ * FullXid/epoch/top, loser, C0 or OPEN authority, even after DRAINED. */
+typedef struct ClusterColdTtBaseRedoGraphInputV1 {
+	ClusterColdTypedV1 *typed;
+	uint32 participant;
+} ClusterColdTtBaseRedoGraphInputV1;
+
+extern ClusterRecoveryGraphResult
+cluster_cold_typed_tt_base_redo_graph_begin_v1(ClusterColdTtBaseRedoGraphInputV1 *input,
+											   size_t memory_budget,
+											   struct ClusterRecoveryReferenceGraph **out);
+extern ClusterRecoveryGraphResult
+cluster_cold_typed_tt_base_redo_graph_read_v1(void *arg, const ClusterRecoveryTxnKey *key,
+											  UBA address, struct ClusterRecoveryUndoRecord *out,
+											  uint32 *generation);
+
+/* Sync the selected crashed sources before pass-2 mutations. No replay or
+ * completion authority is created; a refusal invalidates this typed attempt. */
+extern bool cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed,
+											   struct ClusterRecoveryFencePlan *fence);
+
+/* Call after the original sequencer and physical durability barrier, while
+ * the original execution owner remains held. No allocator is advanced. */
+extern bool cluster_cold_typed_xid_endpoints_v1(ClusterColdTypedV1 *typed,
+												struct ClusterRecoveryFencePlan *fence,
+												const ClusterColdReplayResultV1 *result,
+												const ClusterColdXidProgressV1 *progress);
+
+/* Bind the original sequencer's completed source to its captured ROOT.
+ * This is redo ordering only, not terminal, service or OPEN authority. */
+extern bool cluster_cold_typed_source_drained_v1(ClusterColdTypedV1 *typed,
+												 struct ClusterRecoveryFencePlan *fence,
+												 uint32 participant,
+												 const ClusterColdReplayResultV1 *progress,
+												 uint64 records);
+
+/* Order only the remainder drains by exact captured C0 dependencies.
+ * Failure exports no partial order or completion authority. */
+extern bool cluster_cold_typed_drain_order_v1(ClusterColdTypedV1 *typed,
+											  struct ClusterRecoveryFencePlan *fence, uint32 *order,
+											  uint32 count);
+
+/* Resolve one already-decoded, captured C0 dependency. This returns only
+ * an exact source index, never a completion or mutation permission. */
+extern bool cluster_cold_typed_record_target_v1(ClusterColdTypedV1 *typed,
+												struct ClusterRecoveryFencePlan *fence,
+												uint32 participant,
+												const ClusterColdRecordV1 *record, uint32 *target);
+
+/* Consume one original foreign control or record-local native SIDE effect
+ * under its existing cold authority. Selection never authorizes a full source
+ * or recovery completion. */
+extern bool cluster_cold_typed_side_record_v1(ClusterColdTypedV1 *typed,
+											  struct ClusterRecoveryFencePlan *fence,
+											  uint32 participant,
+											  const ClusterColdRecordV1 *record);
 
 /*
  * Before the fence plan publishes its origins recovered: each origin is a
@@ -673,6 +1538,19 @@ extern bool cluster_cold_completion_ready_v1(const ClusterColdTypedV1 *typed,
  * cold SPACE install (cluster_cold_space_owner_v1, the handshake's
  * space_owner).
  */
+/* Post-drain foreign DROP check under its original exact cold source scope;
+ * no reinstall of absent SPACE or recovery completion publication. */
+extern bool cluster_cold_typed_drop_final_v1(ClusterColdTypedV1 *typed,
+											 struct ClusterRecoveryFencePlan *fence,
+											 uint32 relation);
+
+/* Original sequencer final callback only, after every scheduled record and
+ * source drain succeeded. Bind the exact terminal cold SPACE input to its
+ * original sealed native ABORT, then ask its physical owner for the result.
+ * No match leaves aborted false; refusal preserves it. No completion grant. */
+extern bool cluster_cold_typed_space_abort_final_v1(const ClusterColdTypedV1 *typed,
+													uint32 relation, bool *aborted);
+
 extern bool cluster_cold_space_owner_v1(void);
 extern bool cluster_cold_typed_space_install_v1(const ClusterColdTypedV1 *typed, uint32 relation,
 												uint32 through, bool step);

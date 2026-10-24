@@ -316,9 +316,18 @@ compute_for(uint32 source, ClusterWalRetainedCutV1 *cut, RfPageProofDetailV1 *de
 	ClusterControlRootResult result;
 
 	self_ref = items[source].source;
-	result = cluster_wal_retained_cut_compute_v1(&self_ref, cut, detail);
+	result = cluster_wal_retained_cut_compute_v1(&self_ref, cut, detail, NULL);
 	UT_ASSERT_EQ(scopes_open, 0);
 	return result;
+}
+
+static ClusterControlRootResult
+compute_for_with_diagnostics(uint32 source, ClusterWalRetainedCutV1 *cut,
+							 RfPageProofDetailV1 *detail,
+							 ClusterWalRetainedCutDiagnosticsV1 *diagnostics)
+{
+	self_ref = items[source].source;
+	return cluster_wal_retained_cut_compute_v1(&self_ref, cut, detail, diagnostics);
 }
 
 /* ---- records in their real layouts ---- */
@@ -544,8 +553,10 @@ rec_abort(uint32 source, XLogRecPtr read, XLogRecPtr end, TransactionId xid,
 static RealRecord *
 rec_smgr(uint32 source, XLogRecPtr read, XLogRecPtr end, bool truncate, RelFileNumber relnumber)
 {
-	RealRecord *r = record_new(source, RM_SMGR_ID, truncate ? XLOG_SMGR_TRUNCATE : XLOG_SMGR_CREATE,
-							   InvalidTransactionId, read, end);
+	RealRecord *r
+		= record_new(source, RM_SMGR_ID,
+					 (truncate ? XLOG_SMGR_TRUNCATE : XLOG_SMGR_CREATE) | XLR_SPECIAL_REL_UPDATE,
+					 InvalidTransactionId, read, end);
 
 	if (truncate) {
 		xl_smgr_truncate xlrec = { 0 };

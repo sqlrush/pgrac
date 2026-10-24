@@ -658,6 +658,179 @@ done:
 	return durable;
 }
 
+/* The cold owner has already executed the exact native DROP and excludes
+ * other writers. Sync its existing result only: never truncate, unlink or
+ * adopt a replacement here. Two bounded raw descriptors live only within
+ * this call; allocate first, then use non-throwing I/O and close on every exit.
+ * This physical result is not a replay or recovery-completion certificate. */
+bool
+cluster_shared_fs_sharedfs_sync_drop_result(RelFileLocator locator)
+{
+	SharedFsDropFork forks[MAX_FORKNUM + 1];
+	char *paths[MAX_FORKNUM + 1];
+	char *parent;
+	struct stat parent_identity;
+	int directory = -1;
+	int saved_errno;
+	bool synced = false;
+
+	if (!enableFsync || !OidIsValid(locator.relNumber)) {
+		errno = EINVAL;
+		return false;
+	}
+	memset(forks, 0, sizeof(forks));
+	for (ForkNumber fork = MAIN_FORKNUM; fork <= MAX_FORKNUM; fork++) {
+		paths[fork] = cluster_shared_fs_sharedfs_relpath(locator, fork);
+		forks[fork].fd = -1;
+		forks[fork].name = strrchr(paths[fork], '/') + 1;
+	}
+	parent = pstrdup(paths[MAIN_FORKNUM]);
+	*strrchr(parent, '/') = '\0';
+	directory = open(parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | PG_BINARY);
+	if (directory < 0 || fstat(directory, &parent_identity) != 0)
+		goto done;
+	forks[MAIN_FORKNUM].fd
+		= openat(directory, forks[MAIN_FORKNUM].name, O_RDWR | O_NOFOLLOW | O_NONBLOCK | PG_BINARY);
+	if (forks[MAIN_FORKNUM].fd < 0
+		|| fstat(forks[MAIN_FORKNUM].fd, &forks[MAIN_FORKNUM].identity) != 0
+		|| !sharedfs_drop_namespace_matches(directory, parent, &parent_identity, forks, true))
+		goto done;
+	if (pg_fsync(forks[MAIN_FORKNUM].fd) != 0
+		|| !sharedfs_drop_namespace_matches(directory, parent, &parent_identity, forks, true)
+		|| pg_fsync(directory) != 0
+		|| !sharedfs_drop_namespace_matches(directory, parent, &parent_identity, forks, true))
+		goto done;
+	synced = true;
+
+done:
+	saved_errno = errno != 0 ? errno : EIO;
+	if (forks[MAIN_FORKNUM].fd >= 0 && close(forks[MAIN_FORKNUM].fd) != 0) {
+		synced = false;
+		saved_errno = errno;
+	}
+	if (directory >= 0 && close(directory) != 0) {
+		synced = false;
+		saved_errno = errno;
+	}
+	for (ForkNumber fork = MAIN_FORKNUM; fork <= MAX_FORKNUM; fork++)
+		pfree(paths[fork]);
+	pfree(parent);
+	errno = synced ? 0 : saved_errno;
+	return synced;
+}
+
+typedef struct SharedFsCreateDirectory {
+	int fd;
+	char *name;
+	struct stat identity;
+} SharedFsCreateDirectory;
+
+static bool
+sharedfs_create_namespace_matches(const SharedFsCreateDirectory *dirs, unsigned count,
+								  const char *name, const struct stat *file)
+{
+	struct stat current;
+
+	for (unsigned i = 0; i < count; i++) {
+		int rc = i == 0 ? lstat(dirs[i].name, &current)
+						: fstatat(dirs[i - 1].fd, dirs[i].name, &current, AT_SYMLINK_NOFOLLOW);
+
+		if (rc != 0 || !S_ISDIR(current.st_mode)
+			|| !sharedfs_drop_same_file(&dirs[i].identity, &current))
+			return false;
+	}
+	return fstatat(dirs[count - 1].fd, name, &current, AT_SYMLINK_NOFOLLOW) == 0
+		   && S_ISREG(current.st_mode) && current.st_nlink == 1
+		   && sharedfs_drop_same_file(file, &current) && file->st_size == current.st_size;
+}
+
+/* mkdir-p can introduce ancestors as well as the final file. The original
+ * cold owner excludes writers; sync its existing result leaf-to-root without
+ * adopting a changed namespace. Allocate before opening any raw descriptors,
+ * then use non-throwing I/O and close every descriptor on every exit. The
+ * configured shared root is pre-existing deployment state; its parent is not
+ * a directory created by relation redo. No bytes or directory entries change. */
+bool
+cluster_shared_fs_sharedfs_sync_create_result(RelFileLocator locator, ForkNumber forknum)
+{
+	SharedFsCreateDirectory *dirs;
+	struct stat file_identity;
+	char *relative, *root, *name, *next;
+	unsigned count = 1, index = 1;
+	Size root_length;
+	int file = -1, saved_errno;
+	bool synced = false;
+
+	if (!enableFsync || !OidIsValid(locator.relNumber)
+		|| (forknum != MAIN_FORKNUM && forknum != SPACE_FORKNUM) || cluster_shared_data_dir == NULL
+		|| cluster_shared_data_dir[0] != '/') {
+		errno = EINVAL;
+		return false;
+	}
+	relative = relpathperm(locator, forknum);
+	root = pstrdup(cluster_shared_data_dir);
+	root_length = strlen(root);
+	while (root_length > 1 && root[root_length - 1] == '/')
+		root[--root_length] = '\0';
+	for (name = relative; *name != '\0'; name++)
+		if (*name == '/')
+			count++;
+	dirs = palloc0(sizeof(*dirs) * count);
+	for (unsigned i = 0; i < count; i++)
+		dirs[i].fd = -1;
+	dirs[0].name = root;
+	name = relative;
+	while ((next = strchr(name, '/')) != NULL) {
+		*next = '\0';
+		dirs[index++].name = name;
+		name = next + 1;
+	}
+	/* Native locator paths cannot climb out of, or alias, the shared root. */
+	for (unsigned i = 1; i < count; i++)
+		if (dirs[i].name[0] == '\0' || strcmp(dirs[i].name, ".") == 0
+			|| strcmp(dirs[i].name, "..") == 0)
+			goto done;
+	if (name[0] == '\0')
+		goto done;
+	for (unsigned i = 0; i < count; i++) {
+		dirs[i].fd = i == 0 ? open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | PG_BINARY)
+							: openat(dirs[i - 1].fd, dirs[i].name,
+									 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | PG_BINARY);
+		if (dirs[i].fd < 0 || fstat(dirs[i].fd, &dirs[i].identity) != 0
+			|| !S_ISDIR(dirs[i].identity.st_mode))
+			goto done;
+	}
+	file = openat(dirs[count - 1].fd, name, O_RDWR | O_NOFOLLOW | O_NONBLOCK | PG_BINARY);
+	if (file < 0 || fstat(file, &file_identity) != 0 || !S_ISREG(file_identity.st_mode)
+		|| file_identity.st_nlink != 1
+		|| !sharedfs_create_namespace_matches(dirs, count, name, &file_identity)
+		|| pg_fsync(file) != 0
+		|| !sharedfs_create_namespace_matches(dirs, count, name, &file_identity))
+		goto done;
+	for (unsigned i = count; i > 0; i--)
+		if (pg_fsync(dirs[i - 1].fd) != 0
+			|| !sharedfs_create_namespace_matches(dirs, count, name, &file_identity))
+			goto done;
+	synced = true;
+
+done:
+	saved_errno = errno != 0 ? errno : EIO;
+	if (file >= 0 && close(file) != 0) {
+		synced = false;
+		saved_errno = errno;
+	}
+	for (unsigned i = count; i > 0; i--)
+		if (dirs[i - 1].fd >= 0 && close(dirs[i - 1].fd) != 0) {
+			synced = false;
+			saved_errno = errno;
+		}
+	pfree(dirs);
+	pfree(relative);
+	pfree(root);
+	errno = synced ? 0 : saved_errno;
+	return synced;
+}
+
 /* Original checkpointer work owns these raw descriptors across ERROR cleanup.
  * No pointer into a transaction/checkpointer scratch context is retained. */
 typedef struct SharedFsDropWorkFork {

@@ -82,6 +82,11 @@ extern void XLogRecoveryShmemInit(void);
 extern void InitWalRecovery(ControlFileData *ControlFile,
 							bool *wasShutdown_ptr, bool *haveBackupLabel_ptr,
 							bool *haveTblspcMap_ptr);
+#ifdef USE_PGRAC_CLUSTER
+/* Original typed cold plan, prepared before shared Startup control handling;
+ * one-shot replay input only, without control publication or a WAL writer. */
+extern void ClusterPrepareColdWalRecovery(void);
+#endif
 extern void PerformWalRecovery(void);
 
 /*
@@ -129,10 +134,75 @@ typedef struct
 	 */
 	bool		standby_signal_file_found;
 	bool		recovery_signal_file_found;
+#ifdef USE_PGRAC_CLUSTER
+	/* Borrowed, attempt-local replay inputs until Startup's final close.
+	 * No retained execution pin, current source proof, or C0 write authority. */
+	const struct ClusterColdTypedV1 *cluster_cold_inputs;
+	/* Original post-EOR resource identity, not an I/O or C0 grant. */
+	struct ClusterRecoveryStartV1 *cluster_tx_start;
+#endif
 } EndOfWalRecoveryInfo;
 
 extern EndOfWalRecoveryInfo *FinishWalRecovery(void);
 extern void ShutdownWalRecovery(void);
+#ifdef USE_PGRAC_CLUSTER
+extern void ClusterReleaseColdRecoveryInputs(EndOfWalRecoveryInfo *info);
+extern bool ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info);
+extern bool ClusterColdRecoveryTxCurrent(const struct ClusterRecoveryStartV1 *start);
+struct ClusterRecoveryCheckpointOwnerV1;
+/* Original recovered INSTALL only; ordinary CLEAN/first creation cannot
+ * provide this checkpoint input. The output clears on refusal. */
+extern bool ClusterColdRecoveryTxCheckpointOwnerV1(const struct ClusterRecoveryStartV1 *start,
+	struct ClusterRecoveryCheckpointOwnerV1 *out);
+struct ClusterColdTopTxCensusEntryV1;
+/* Original ACTIVE census subject only; not a loser proof or I/O grant. */
+extern bool ClusterColdRecoveryTxSubjectCurrent(
+	const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject, uint64 *generation, uint64 *serial);
+
+/* Original post-EOR owner only: return a physical loser candidate from the
+ * exact retained ACTIVE census entry.  This is a read-only identity check;
+ * it grants no C0, TT, WAL, checkpoint or mutation authority. */
+extern bool ClusterColdRecoveryTxLoserCurrent(
+	const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject);
+
+/* Original post-EOR owner only: require the producer's complete independent
+ * TopTxProof for this exact ACTIVE census subject.  This is a read-only
+ * qualified old-ACTIVE input; it grants no C0, TT, WAL, checkpoint or
+ * mutation authority. */
+extern bool ClusterColdRecoveryTxTopProofCurrent(
+	const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject);
+
+extern const struct ClusterColdTypedV1 *
+ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start);
+
+/* Original post-EOR owner only: require the complete sealed ordinary-effects
+ * receipt before consuming any proven physical loser.  This is a read-only
+ * input check; the restricted empty-effects proof remains a per-entry
+ * TopTxProof fact and this accessor grants no C0, TT, WAL or checkpoint
+ * authority. */
+extern bool ClusterColdRecoveryTxEffectsCurrent(
+	const struct ClusterRecoveryStartV1 *start);
+
+struct ClusterRecoveryTTAbortDerivationV1;
+/* Pure C0 candidate fields from the original proof/endpoints and installed
+ * writer. The caller holds and revalidates the original TX_CLOSURE read
+ * scope. This grants no WAL, TT, checkpoint or execution authority. */
+extern bool ClusterColdRecoveryTxC0Candidate(
+	const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject,
+	struct ClusterRecoveryTTAbortDerivationV1 *out);
+struct ClusterUndoBlock0Pin;
+/* Reserve the original proven target's EMPTY block0 slot without a content
+ * lock. The caller releases it before the retained source scope. This is
+ * local exclusion only, with no C0/WAL/TT/I/O or checkpoint authority. */
+extern bool ClusterColdRecoveryTxC0Reserve(
+	const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject,
+	struct ClusterUndoBlock0Pin *pin);
+#endif
 extern void RemovePromoteSignalFiles(void);
 
 extern bool HotStandbyActive(void);

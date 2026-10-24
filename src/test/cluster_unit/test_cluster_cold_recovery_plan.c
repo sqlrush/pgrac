@@ -29,6 +29,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 
 #include "unit_test.h"
 
@@ -79,6 +80,11 @@ UT_TEST(test_lower_lag_old_fpi_cannot_overwrite_newer_durable)
 	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 0), 3);
 	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 1), 1);
 	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 2), 0);
+	/* The surviving frontier is qualified history, never replayed here. */
+	table.calls = 0;
+	table.fail = true;
+	UT_ASSERT_EQ(cluster_cold_plan_readback_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(table.calls, 0);
 	destroy_plan(&plan);
 }
 
@@ -476,6 +482,112 @@ UT_TEST(test_pure_history_page_not_observed)
 	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(table.calls, 1);
 	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 1);
+	table.calls = 0;
+	table.count = 0;
+	observe_set(&table, 100, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 6));
+	UT_ASSERT_EQ(cluster_cold_plan_readback_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(table.calls, 1); /* only the live page, not history's rel 300 */
+	destroy_plan(&plan);
+}
+
+/* Final versions follow the graph, not token or feed order. One read per
+ * surviving page must see its terminal result, never an intermediate edge. */
+UT_TEST(test_readback_checks_terminal_versions_once_per_page)
+{
+	ClusterColdParticipantV1 parts[2]
+		= { part(1, 11, 0x1000, 0x1000, 0x2000), part(2, 12, 0x1000, 0x1000, 0x2000) };
+	ClusterColdComponentV1 last = delta(0, 100, 0, 900, 3);
+	ClusterColdComponentV1 first = delta(0, 100, 0, 1, 900);
+	ClusterColdComponentV1 other = delta(0, 200, 0, 10, 11);
+	ClusterColdPlanV1 *plan = make_plan(parts, 2);
+	ClusterColdDiagV1 diag;
+	ObserveTable table = { 0 };
+
+	UT_ASSERT_EQ(feed(plan, 0, 0x1000, 0x1800, 1, 1, &last), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed(plan, 0, 0x1800, 0x2000, 2, 1, &other), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed(plan, 1, 0x1000, 0x2000, 999, 1, &first), CLUSTER_COLD_OK);
+	observe_set(&table, 100, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 1));
+	observe_set(&table, 200, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 10));
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	table.count = 0;
+	observe_set(&table, 100, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 3));
+	observe_set(&table, 200, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 11));
+	table.calls = 0;
+	UT_ASSERT_EQ(cluster_cold_plan_readback_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(table.calls, 2);
+	table.count = 0;
+	observe_set(&table, 100, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 900));
+	observe_set(&table, 200, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 11));
+	UT_ASSERT_EQ(cluster_cold_plan_readback_v1(plan, observe, &table, &diag),
+				 CLUSTER_COLD_ANCESTOR_MISSING);
+	UT_ASSERT(diag.has_record && diag.participant == 0 && diag.read_rec_ptr == 0x1000);
+	UT_ASSERT_EQ(diag.page.locator.relNumber, 100);
+	UT_ASSERT_EQ(diag.version.mutation_token, 900);
+	UT_ASSERT_EQ(diag.detail, CLUSTER_COLD_ANCESTOR_MISSING);
+	destroy_plan(&plan);
+}
+
+UT_TEST(test_readback_rechecks_skip_and_refuses_unproven_data)
+{
+	ClusterColdParticipantV1 parts[1] = { part(1, 11, 0x1000, 0x1000, 0x2000) };
+	ClusterColdComponentV1 component = delta(0, 100, 0, 1, 2);
+	ClusterColdPlanV1 *plan = make_plan(parts, 1);
+	ClusterColdDiagV1 diag;
+	ClusterColdStepV1 step;
+	ObserveTable table = { 0 };
+
+	UT_ASSERT_EQ(feed(plan, 0, 0x1000, 0x2000, 1, 1, &component), CLUSTER_COLD_OK);
+	observe_set(&table, 100, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 2));
+	UT_ASSERT_EQ(cluster_cold_plan_readback_v1(plan, observe, &table, &diag), CLUSTER_COLD_STATE);
+	UT_ASSERT_EQ(table.calls, 0);
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_plan_step_v1(plan, 0, &step) && step.all_skip);
+	table.calls = 0;
+	UT_ASSERT_EQ(cluster_cold_plan_readback_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(table.calls, 1);
+	for (int fault = 0; fault < 8; fault++) {
+		ClusterColdDetailV1 expected;
+
+		table.count = 0;
+		observe_set(&table, 100, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 2));
+		table.fail = false;
+		if (fault == 0) {
+			table.fail = true;
+			expected = CLUSTER_COLD_OBSERVATION_FAILED;
+		} else if (fault == 1) {
+			table.data[0].reserved_zero[0] = 1;
+			expected = CLUSTER_COLD_OBSERVATION_FAILED;
+		} else if (fault == 2) {
+			table.data[0].flags = 0;
+			expected = CLUSTER_COLD_CONTENT_UNPROVEN;
+		} else if (fault == 3) {
+			table.count = 0;
+			observe_set(&table, 100, 0, CLUSTER_COLD_DATA_ABSENT, ver(0, 0));
+			expected = CLUSTER_COLD_CONTENT_UNPROVEN;
+		} else if (fault == 4) {
+			table.count = 0;
+			observe_set(&table, 100, 0, CLUSTER_COLD_DATA_INVALID, ver(0, 0));
+			table.data[0].flags = 0;
+			expected = CLUSTER_COLD_CONTENT_UNPROVEN;
+		} else if (fault == 5) {
+			table.data[0].version = ver(0, 2);
+			table.data[0].flags |= CLUSTER_COLD_DATA_FLAG_NO_IDENTITY;
+			expected = CLUSTER_COLD_IDENTITY_MISSING;
+		} else if (fault == 6) {
+			table.data[0].version = ver(INC_J, 2);
+			expected = CLUSTER_COLD_INCARNATION_MISMATCH;
+		} else {
+			table.data[0].version.mutation_token = 1;
+			expected = CLUSTER_COLD_ANCESTOR_MISSING;
+		}
+		UT_ASSERT_EQ(cluster_cold_plan_readback_v1(plan, observe, &table, &diag), expected);
+		UT_ASSERT_EQ(diag.detail, expected);
+		UT_ASSERT(diag.has_record && diag.read_rec_ptr == 0x1000);
+	}
+	UT_ASSERT_EQ(cluster_cold_plan_readback_v1(NULL, observe, &table, &diag),
+				 CLUSTER_COLD_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(cluster_cold_plan_readback_v1(plan, NULL, &table, NULL),
+				 CLUSTER_COLD_INVALID_ARGUMENT);
 	destroy_plan(&plan);
 }
 
@@ -942,10 +1054,399 @@ UT_TEST(test_compact_plan_capacity)
 	destroy_plan(&plan);
 }
 
+/* A writer checkpoint cannot cover a C0's different target mutation. */
+UT_TEST(test_c0_history_is_not_checkpoint_coverage)
+{
+	for (int boundary = 0; boundary < 2; boundary++) {
+		ClusterColdParticipantV1 parts[1] = { part(2, 12, 0x100, 0x1000, 0x2000) };
+		ClusterColdPlanV1 *plan = make_plan(parts, 1);
+		ClusterColdRecordV1 record = { 0 };
+		record.read_rec_ptr = 0x100;
+		record.end_rec_ptr = boundary ? 0x1000 : 0x200;
+		record.rmid = RM_CLUSTER_UNDO_ID;
+		record.info = XLOG_UNDO_RECOVERY_TT_ABORT;
+		record.record_flags = CLUSTER_COLD_RECORD_FOREIGN_SIDE;
+		UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 0, &record),
+					 CLUSTER_COLD_STRUCTURAL_UNSUPPORTED);
+		UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 0);
+		record.rmid = RM_HEAP_ID;
+		record.info = 0;
+		record.record_flags = 0;
+		UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 0, &record), CLUSTER_COLD_STATE);
+		destroy_plan(&plan);
+	}
+}
+
+UT_TEST(test_c0_replay_range_retains_full_record_obligation)
+{
+	ClusterColdParticipantV1 parts[1] = { part(2, 12, 0x1000, 0x1000, 0x1100) };
+	ClusterColdPlanV1 *plan = make_plan(parts, 1);
+	ClusterColdRecordV1 record = { 0 };
+	ClusterColdDiagV1 diag;
+	ObserveTable table = { 0 };
+	record.read_rec_ptr = 0x1000;
+	record.end_rec_ptr = 0x1100;
+	record.rmid = RM_CLUSTER_UNDO_ID;
+	record.info = XLOG_UNDO_RECOVERY_TT_ABORT;
+	record.record_flags = CLUSTER_COLD_RECORD_FOREIGN_SIDE;
+	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 0, &record), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 0), 1);
+	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 0);
+	UT_ASSERT_EQ(table.calls, 0);
+	destroy_plan(&plan);
+}
+
+/* Caller order differs from canonical order; history is not a replay step. */
+UT_TEST(test_record_frames_preserve_page_and_history_inputs)
+{
+	ClusterColdParticipantV1 parts[2]
+		= { part(2, 22, 0x1000, 0x1000, 0x1200), part(1, 11, 0x100, 0x180, 0x180) };
+	ClusterColdPlanV1 *plan = make_plan(parts, 2);
+	ClusterColdComponentV1 current = delta(0, 100, 0, 2, 3);
+	ClusterColdComponentV1 history = delta(0, 100, 0, 1, 2);
+	ClusterColdRecordV1 record = { 0 };
+	ClusterColdRecordFrameV1 frame;
+	ClusterColdRecordFrameV1 zero = { 0 };
+	ObserveTable table = { 0 };
+	ClusterColdDiagV1 diag;
+	uint32 count = 99;
+
+	record.read_rec_ptr = 0x1000;
+	record.end_rec_ptr = 0x1100;
+	record.prev_rec_ptr = 0xFC0;
+	record.record_crc = 111;
+	record.source_xid = 804;
+	/* An absent top stays absent; the accessor does not invent a proof. */
+	record.source_top_xid = InvalidTransactionId;
+	record.rmid = RM_HEAP_ID;
+	record.info = 0x20;
+	record.component_count = 1;
+	record.components = &current;
+	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 0, &record), CLUSTER_COLD_OK);
+	record.source_xid = 999;
+	record.source_top_xid = 999;
+	/* A cursor-only record is not included in the retained frame census. */
+	record.read_rec_ptr = 0x1100;
+	record.end_rec_ptr = 0x1200;
+	record.prev_rec_ptr = 0x1000;
+	record.component_count = 0;
+	record.components = NULL;
+	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 0, &record), CLUSTER_COLD_OK);
+	record.read_rec_ptr = 0x100;
+	record.end_rec_ptr = 0x180;
+	record.prev_rec_ptr = 0xC0;
+	record.record_crc = 222;
+	record.source_xid = 803;
+	/* Even a conflicting frame is preserved for the later ownership check. */
+	record.source_top_xid = 802;
+	record.info = 0x40;
+	record.component_count = 1;
+	record.components = &history;
+	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 1, &record), CLUSTER_COLD_OK);
+	memset(&record, 0, sizeof(record));
+	observe_set(&table, 100, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 2));
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_plan_record_frame_count_v1(plan, &count));
+	UT_ASSERT_EQ(count, 2);
+	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 0), 2);
+	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 1);
+	UT_ASSERT(cluster_cold_plan_record_frame_v1(plan, 0, &frame));
+	UT_ASSERT_EQ(frame.participant, 0);
+	UT_ASSERT_EQ(frame.read_rec_ptr, 0x1000);
+	UT_ASSERT_EQ(frame.end_rec_ptr, 0x1100);
+	UT_ASSERT_EQ(frame.record_crc, 111);
+	UT_ASSERT_EQ(frame.source_xid, 804);
+	UT_ASSERT_EQ(frame.source_top_xid, InvalidTransactionId);
+	UT_ASSERT_EQ(frame.rmid, RM_HEAP_ID);
+	UT_ASSERT_EQ(frame.info, 0x20);
+	UT_ASSERT_EQ(frame.page_components, 1);
+	UT_ASSERT_EQ(frame.space_effects, 0);
+	UT_ASSERT(!frame.history);
+	UT_ASSERT(cluster_cold_plan_record_frame_v1(plan, 1, &frame));
+	UT_ASSERT_EQ(frame.participant, 1);
+	UT_ASSERT_EQ(frame.read_rec_ptr, 0x100);
+	UT_ASSERT_EQ(frame.end_rec_ptr, 0x180);
+	UT_ASSERT_EQ(frame.record_crc, 222);
+	UT_ASSERT_EQ(frame.source_xid, 803);
+	UT_ASSERT_EQ(frame.source_top_xid, 802);
+	UT_ASSERT_EQ(frame.info, 0x40);
+	UT_ASSERT_EQ(frame.page_components, 1);
+	UT_ASSERT_EQ(frame.space_effects, 0);
+	UT_ASSERT(frame.history);
+	UT_ASSERT(!cluster_cold_plan_record_frame_v1(plan, count, &frame));
+	UT_ASSERT(memcmp(&frame, &zero, sizeof(frame)) == 0);
+	destroy_plan(&plan);
+}
+
+UT_TEST(test_record_frames_refuse_unsealed_failed_and_invalid_inputs)
+{
+	ClusterColdParticipantV1 participant = part(1, 11, 0x100, 0x100, 0x200);
+	ClusterColdPlanV1 *plan = make_plan(&participant, 1);
+	ClusterColdRecordFrameV1 frame;
+	ClusterColdRecordFrameV1 zero = { 0 };
+	ObserveTable table = { 0 };
+	ClusterColdDiagV1 diag;
+	uint32 count = 99;
+
+	memset(&frame, 0xA5, sizeof(frame));
+	UT_ASSERT(!cluster_cold_plan_record_frame_count_v1(NULL, &count));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT(!cluster_cold_plan_record_frame_v1(NULL, 0, &frame));
+	UT_ASSERT(memcmp(&frame, &zero, sizeof(frame)) == 0);
+	count = 99;
+	memset(&frame, 0xA5, sizeof(frame));
+	UT_ASSERT(!cluster_cold_plan_record_frame_count_v1(plan, &count));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT(!cluster_cold_plan_record_frame_v1(plan, 0, &frame));
+	UT_ASSERT(memcmp(&frame, &zero, sizeof(frame)) == 0);
+	UT_ASSERT_EQ(feed_plain(plan, 0, 0x100, 0x200), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	count = 99;
+	UT_ASSERT(cluster_cold_plan_record_frame_count_v1(plan, &count));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 0), 1);
+	UT_ASSERT(!cluster_cold_plan_record_frame_count_v1(plan, NULL));
+	UT_ASSERT(!cluster_cold_plan_record_frame_v1(plan, 0, NULL));
+	memset(&frame, 0xA5, sizeof(frame));
+	UT_ASSERT(!cluster_cold_plan_record_frame_v1(plan, UINT32_MAX, &frame));
+	UT_ASSERT(memcmp(&frame, &zero, sizeof(frame)) == 0);
+	destroy_plan(&plan);
+	plan = make_plan(&participant, 1);
+	UT_ASSERT_EQ(feed_plain(plan, 0, 0x100, 0x180), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_plan_seal_v1(plan, observe, &table, &diag) != CLUSTER_COLD_OK);
+	count = 99;
+	memset(&frame, 0xA5, sizeof(frame));
+	UT_ASSERT(!cluster_cold_plan_record_frame_count_v1(plan, &count));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT(!cluster_cold_plan_record_frame_v1(plan, 0, &frame));
+	UT_ASSERT(memcmp(&frame, &zero, sizeof(frame)) == 0);
+	destroy_plan(&plan);
+}
+
+/* Complete input metadata must not change the original planning census. */
+UT_TEST(test_input_frames_include_cursor_only_and_history_advance)
+{
+	ClusterColdParticipantV1 parts[2]
+		= { part(2, 22, 0x1000, 0x1000, 0x1200), part(1, 11, 0x100, 0x200, 0x200) };
+	ClusterColdPlanV1 *plan = make_plan(parts, 2);
+	ClusterColdComponentV1 current = delta(0, 100, 0, 2, 3);
+	ClusterColdComponentV1 history = delta(0, 100, 0, 1, 2);
+	ClusterColdSpaceOpV1 advance = { 0 };
+	ClusterColdRecordV1 record = { 0 };
+	ClusterColdRecordFrameV1 frame;
+	ClusterColdRecordFrameV1 expected[4] = { 0 };
+	ObserveTable table = { 0 };
+	ClusterColdDiagV1 diag;
+	uint8 payload = 1;
+	uint32 count = 99;
+
+	record.read_rec_ptr = 0x1000;
+	record.end_rec_ptr = 0x1100;
+	record.prev_rec_ptr = 0xFC0;
+	record.record_crc = 111;
+	record.source_xid = 804;
+	record.rmid = RM_HEAP_ID;
+	record.info = 0x20;
+	record.component_count = 1;
+	record.components = &current;
+	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 0, &record), CLUSTER_COLD_OK);
+	expected[0].read_rec_ptr = 0x1000;
+	expected[0].end_rec_ptr = 0x1100;
+	expected[0].record_crc = 111;
+	expected[0].source_xid = 804;
+	expected[0].page_components = 1;
+	expected[0].rmid = RM_HEAP_ID;
+	expected[0].info = 0x20;
+
+	record.read_rec_ptr = 0x1100;
+	record.end_rec_ptr = 0x1200;
+	record.prev_rec_ptr = 0x1000;
+	record.record_crc = 112;
+	record.source_xid = 999;
+	record.source_top_xid = 998;
+	record.component_count = 0;
+	record.components = NULL;
+	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 0, &record), CLUSTER_COLD_OK);
+	expected[1] = expected[0];
+	expected[1].read_rec_ptr = 0x1100;
+	expected[1].end_rec_ptr = 0x1200;
+	expected[1].record_crc = 112;
+	expected[1].source_xid = 999;
+	expected[1].source_top_xid = 998;
+	expected[1].page_components = 0;
+
+	record.read_rec_ptr = 0x100;
+	record.end_rec_ptr = 0x180;
+	record.prev_rec_ptr = 0xC0;
+	record.record_crc = 222;
+	record.source_xid = 803;
+	record.source_top_xid = 802;
+	record.info = 0x40;
+	record.component_count = 1;
+	record.components = &history;
+	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 1, &record), CLUSTER_COLD_OK);
+	expected[2] = expected[0];
+	expected[2].read_rec_ptr = 0x100;
+	expected[2].end_rec_ptr = 0x180;
+	expected[2].record_crc = 222;
+	expected[2].participant = 1;
+	expected[2].source_xid = 803;
+	expected[2].source_top_xid = 802;
+	expected[2].info = 0x40;
+	expected[2].history = true;
+
+	advance.kind = CLUSTER_COLD_SPACE_ADVANCE;
+	advance.locator = page_id(100, 0).locator;
+	memset(advance.result_incarnation, INC_I, sizeof(advance.result_incarnation));
+	advance.payload = &payload;
+	advance.payload_length = sizeof(payload);
+	record.read_rec_ptr = 0x180;
+	record.end_rec_ptr = 0x200;
+	record.prev_rec_ptr = 0x100;
+	record.record_crc = 223;
+	record.component_count = 0;
+	record.components = NULL;
+	record.space_count = 1;
+	record.space_ops = &advance;
+	record.rmid = RM_SMGR_ID;
+	record.info = 0x70;
+	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 1, &record), CLUSTER_COLD_OK);
+	expected[3] = expected[2];
+	expected[3].read_rec_ptr = 0x180;
+	expected[3].end_rec_ptr = 0x200;
+	expected[3].record_crc = 223;
+	expected[3].page_components = 0;
+	expected[3].space_effects = 1;
+	expected[3].rmid = RM_SMGR_ID;
+	expected[3].info = 0x70;
+	memset(&record, 0, sizeof(record));
+	memset(&advance, 0, sizeof(advance));
+	observe_set(&table, 100, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 2));
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_plan_record_frame_count_v1(plan, &count));
+	UT_ASSERT_EQ(count, 2);
+	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 1);
+	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 0), 2);
+	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 1), 0);
+	UT_ASSERT(cluster_cold_plan_input_frame_count_v1(plan, &count));
+	UT_ASSERT_EQ(count, 4);
+	for (uint32 i = 0; i < 4; i++) {
+		UT_ASSERT(cluster_cold_plan_input_frame_v1(plan, i, &frame));
+		UT_ASSERT(memcmp(&frame, &expected[i], sizeof(frame)) == 0);
+	}
+	destroy_plan(&plan);
+}
+
+UT_TEST(test_input_frames_empty_cursor_and_page_chunk_boundary)
+{
+	for (uint32 mode = 0; mode < 3; mode++) {
+		uint32 records = mode == 0 ? 0 : 1025;
+		bool pages = mode == 2;
+		ClusterColdParticipantV1 parts[1]
+			= { part(1, 11, 0x1000, 0x1000, 0x1000 + records * 0x10) };
+		ClusterColdPlanV1 *plan = make_plan(parts, 1);
+		ClusterColdRecordFrameV1 frame;
+		ClusterColdRecordFrameV1 zero = { 0 };
+		ObserveTable table = { 0 };
+		ClusterColdDiagV1 diag;
+		uint32 count = 99;
+
+		for (uint32 i = 0; i < records; i++) {
+			ClusterColdComponentV1 component = delta(0, 100, 0, i + 1, i + 2);
+
+			UT_ASSERT_EQ(feed(plan, 0, 0x1000 + i * 0x10, 0x1010 + i * 0x10, 1, pages ? 1 : 0,
+							  pages ? &component : NULL),
+						 CLUSTER_COLD_OK);
+		}
+		if (pages)
+			observe_set(&table, 100, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 1));
+		UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+		UT_ASSERT(cluster_cold_plan_input_frame_count_v1(plan, &count));
+		UT_ASSERT_EQ(count, records);
+		UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), pages ? records : 0);
+		UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 0), records);
+		UT_ASSERT(cluster_cold_plan_record_frame_count_v1(plan, &count));
+		UT_ASSERT_EQ(count, pages ? records : 0);
+		for (uint32 i = 0; i < records; i++) {
+			UT_ASSERT(cluster_cold_plan_input_frame_v1(plan, i, &frame));
+			UT_ASSERT_EQ(frame.read_rec_ptr, 0x1000 + i * 0x10);
+			UT_ASSERT_EQ(frame.end_rec_ptr, 0x1010 + i * 0x10);
+			UT_ASSERT_EQ(frame.record_crc, frame.read_rec_ptr ^ frame.end_rec_ptr);
+			UT_ASSERT_EQ(frame.page_components, pages ? 1 : 0);
+			UT_ASSERT_EQ(frame.space_effects, 0);
+			UT_ASSERT(!frame.history);
+		}
+		memset(&frame, 0xA5, sizeof(frame));
+		UT_ASSERT(!cluster_cold_plan_input_frame_v1(plan, records, &frame));
+		UT_ASSERT(memcmp(&frame, &zero, sizeof(frame)) == 0);
+		destroy_plan(&plan);
+	}
+}
+
+UT_TEST(test_input_frames_reject_unsealed_failed_and_invalid_inputs)
+{
+	ClusterColdParticipantV1 parts[1] = { part(1, 11, 0x1000, 0x1000, 0x1200) };
+	ClusterColdPlanV1 *plan = make_plan(parts, 1);
+	ClusterColdRecordFrameV1 frame;
+	ClusterColdRecordFrameV1 zero = { 0 };
+	uint32 count = 99;
+
+	UT_ASSERT(!cluster_cold_plan_input_frame_count_v1(NULL, &count));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT(!cluster_cold_plan_input_frame_count_v1(plan, NULL));
+	UT_ASSERT(!cluster_cold_plan_input_frame_v1(plan, 0, NULL));
+	for (uint32 phase = 0; phase < 2; phase++) {
+		count = 99;
+		memset(&frame, 0xA5, sizeof(frame));
+		UT_ASSERT(!cluster_cold_plan_input_frame_count_v1(plan, &count));
+		UT_ASSERT_EQ(count, 0);
+		UT_ASSERT(!cluster_cold_plan_input_frame_v1(plan, 0, &frame));
+		UT_ASSERT(memcmp(&frame, &zero, sizeof(frame)) == 0);
+		if (phase == 0) {
+			UT_ASSERT_EQ(feed_plain(plan, 0, 0x1000, 0x1100), CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(feed_plain(plan, 0, 0x1080, 0x1200), CLUSTER_COLD_SOURCE_GAP);
+		}
+	}
+	memset(&frame, 0xA5, sizeof(frame));
+	UT_ASSERT(!cluster_cold_plan_input_frame_v1(NULL, 0, &frame));
+	UT_ASSERT(memcmp(&frame, &zero, sizeof(frame)) == 0);
+	destroy_plan(&plan);
+}
+
+UT_TEST(test_input_frames_share_original_memory_budget)
+{
+	ClusterColdParticipantV1 parts[1] = { part(1, 11, 0x1000, 0x1000, 0x20000) };
+	ClusterColdPlanV1 *plan = NULL;
+	ClusterColdDetailV1 detail = CLUSTER_COLD_OK;
+	ClusterColdRecordFrameV1 frame;
+	ClusterColdRecordFrameV1 zero = { 0 };
+	uint32 accepted = 0;
+	uint32 count = 99;
+
+	UT_ASSERT_EQ(cluster_cold_plan_create_v1(parts, 1, 80 * 1024, &plan), CLUSTER_COLD_OK);
+	for (uint32 i = 0; i < 5000 && detail == CLUSTER_COLD_OK; i++) {
+		detail = feed_plain(plan, 0, 0x1000 + i * 0x10, 0x1010 + i * 0x10);
+		if (detail == CLUSTER_COLD_OK)
+			accepted++;
+	}
+	UT_ASSERT(accepted > 0 && accepted < 5000);
+	UT_ASSERT_EQ(detail, CLUSTER_COLD_CAPACITY);
+	UT_ASSERT_EQ(feed_plain(plan, 0, 0x18000, 0x18010), CLUSTER_COLD_STATE);
+	UT_ASSERT(!cluster_cold_plan_input_frame_count_v1(plan, &count));
+	UT_ASSERT_EQ(count, 0);
+	memset(&frame, 0xA5, sizeof(frame));
+	UT_ASSERT(!cluster_cold_plan_input_frame_v1(plan, 0, &frame));
+	UT_ASSERT(memcmp(&frame, &zero, sizeof(frame)) == 0);
+	destroy_plan(&plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(42);
+	UT_RUN(test_c0_history_is_not_checkpoint_coverage);
+	UT_RUN(test_c0_replay_range_retains_full_record_obligation);
 	UT_RUN(test_lower_lag_old_fpi_cannot_overwrite_newer_durable);
 	UT_RUN(test_data_behind_history_is_refused);
 	UT_RUN(test_a_b_c_exact_order_ignores_scn_and_lsn);
@@ -964,6 +1465,8 @@ main(void)
 	UT_RUN(test_multi_page_record_mixed_verdicts);
 	UT_RUN(test_cross_generation_deadlock_refused);
 	UT_RUN(test_pure_history_page_not_observed);
+	UT_RUN(test_readback_checks_terminal_versions_once_per_page);
+	UT_RUN(test_readback_rechecks_skip_and_refuses_unproven_data);
 	UT_RUN(test_participant_cut_validation);
 	UT_RUN(test_two_generations_of_one_thread_link_by_version);
 	UT_RUN(test_observation_failure_refused);
@@ -978,6 +1481,12 @@ main(void)
 	UT_RUN(test_unowned_side_records_refused_after_native_redo);
 	UT_RUN(test_unverified_content_needs_an_anchor);
 	UT_RUN(test_compact_plan_capacity);
+	UT_RUN(test_record_frames_preserve_page_and_history_inputs);
+	UT_RUN(test_record_frames_refuse_unsealed_failed_and_invalid_inputs);
+	UT_RUN(test_input_frames_include_cursor_only_and_history_advance);
+	UT_RUN(test_input_frames_empty_cursor_and_page_chunk_boundary);
+	UT_RUN(test_input_frames_reject_unsealed_failed_and_invalid_inputs);
+	UT_RUN(test_input_frames_share_original_memory_budget);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

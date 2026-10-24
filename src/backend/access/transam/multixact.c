@@ -152,6 +152,7 @@
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
+#include "utils/wait_event.h"
 
 
 /*
@@ -207,6 +208,14 @@ StaticAssertDecl(MULTIXACT_OFFSETS_PER_PAGE == CLUSTER_NATIVE_MX_OFFSETS_PER_PAG
 				 "native MX offset inspection geometry");
 StaticAssertDecl(MULTIXACT_MEMBERS_PER_PAGE == CLUSTER_NATIVE_MX_MEMBERS_PER_PAGE,
 				 "native MX member inspection geometry");
+/* PGRAC: keep the read-only physical census bound to this native layout. */
+StaticAssertDecl(MULTIXACT_MEMBERS_PER_MEMBERGROUP == CLUSTER_NATIVE_MX_GROUP_MEMBERS,
+				 "native MX member group geometry");
+StaticAssertDecl(MULTIXACT_MEMBERGROUP_SIZE == CLUSTER_NATIVE_MX_GROUP_BYTES,
+				 "native MX member group bytes");
+StaticAssertDecl(MXACT_MEMBER_BITS_PER_XACT == CLUSTER_NATIVE_MX_FLAG_BITS
+				 && MULTIXACT_FLAGBYTES_PER_GROUP == sizeof(uint32),
+				 "native MX member flag geometry");
 #endif
 
 /*
@@ -4211,10 +4220,12 @@ multi_recovery_cache_discard(SlruCtl ctl)
 static bool
 multi_recovery_permitted(int origin)
 {
-	/* Own-origin native startup retains its original SLRU/counter owner. */
+	/* ONLINE cannot replay its own live origin. A qualified cold scope may
+	 * recover that origin's former files without touching local allocation. */
 	return cluster_shared_config && origin >= 0 && origin < MULTIXACT_RECOVERY_ORIGINS
-		&& origin != cluster_node_id && MultiXactRecoveryLocks != NULL
-		&& cluster_undo_recovery_origin_authorized_v1(origin);
+		   && MultiXactRecoveryLocks != NULL && cluster_undo_recovery_origin_authorized_v1(origin)
+		   && (origin != cluster_node_id
+			   || cluster_undo_recovery_cold_origin_authorized_v1(origin));
 }
 
 static bool
@@ -4406,10 +4417,56 @@ multi_recovery_members(SlruCtl ctl, const ClusterSideProjectionOperationV1 *op,
 }
 
 static bool
+multi_recovery_same_file(const struct stat *before, const struct stat *after)
+{
+	return before->st_dev == after->st_dev && before->st_ino == after->st_ino
+		   && before->st_size == after->st_size;
+}
+
+/* Native recovery completion cannot inherit generic directory exceptions
+ * or ignore failure closing the descriptor that performed the sync. */
+static bool
+multi_recovery_sync_path(SlruCtl ctl, int segment)
+{
+	bool directory = segment < 0;
+	char path[MAXPGPATH];
+	struct stat before, opened, after;
+	volatile int fd = -1;
+	volatile bool ok = false;
+	int length;
+
+	length = directory ? snprintf(path, sizeof(path), "%s", ctl->Dir)
+					   : snprintf(path, sizeof(path), "%s/%04X", ctl->Dir, segment);
+	if (length < 0 || length >= sizeof(path) || lstat(path, &before) != 0
+		|| (directory ? !S_ISDIR(before.st_mode) : !S_ISREG(before.st_mode))
+		|| before.st_uid != geteuid() || (before.st_mode & (S_IWGRP | S_IWOTH)) != 0
+		|| (!directory && before.st_nlink != 1))
+		return false;
+	PG_TRY();
+	{
+		fd = OpenTransientFile(path, (directory ? O_RDONLY | O_DIRECTORY : O_RDWR) | O_NOFOLLOW
+										 | O_CLOEXEC | PG_BINARY);
+		if (fd >= 0 && fstat(fd, &opened) == 0 && multi_recovery_same_file(&before, &opened)) {
+			pgstat_report_wait_start(WAIT_EVENT_SLRU_FLUSH_SYNC);
+			ok = pg_fsync(fd) == 0;
+			pgstat_report_wait_end();
+			ok = ok && fstat(fd, &after) == 0 && multi_recovery_same_file(&before, &after)
+				 && lstat(path, &after) == 0 && multi_recovery_same_file(&before, &after);
+		}
+	}
+	PG_FINALLY();
+	{
+		pgstat_report_wait_end();
+		if (fd >= 0 && CloseTransientFile(fd) != 0)
+			ok = false;
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+static bool
 multi_recovery_sync(SlruCtl ctl, int origin)
 {
-	FileTag tag;
-	char path[MAXPGPATH];
 	int segments[MULTIXACT_RECOVERY_BUFFERS];
 	int count = 0;
 
@@ -4434,13 +4491,10 @@ multi_recovery_sync(SlruCtl ctl, int origin)
 		return false;
 	SimpleLruWriteAll(ctl, false);
 	for (int i = 0; i < count; i++) {
-		memset(&tag, 0, sizeof(tag));
-		tag.segno = segments[i];
-		if (!multi_recovery_permitted(origin) || SlruSyncFileTag(ctl, &tag, path) != 0)
+		if (!multi_recovery_permitted(origin) || !multi_recovery_sync_path(ctl, segments[i]))
 			return false;
 	}
-	fsync_fname(ctl->Dir, true);
-	return multi_recovery_permitted(origin);
+	return multi_recovery_sync_path(ctl, -1) && multi_recovery_permitted(origin);
 }
 
 /* Use the record's exact native range, retaining the final partial segment. */
@@ -4521,6 +4575,20 @@ multi_recovery_operation(int origin, const ClusterSideProjectionOperationV1 *op,
 	}
 	return (verify || (multi_recovery_sync(members, origin) && multi_recovery_sync(offsets, origin)))
 		&& multi_recovery_directory_ready(origin);
+}
+
+/* Read-only validation before a protected set starts changing native storage. */
+bool
+cluster_multixact_native_recovery_preflight(int origin, const ClusterSideProjectionOperationV1 *op,
+											const uint8 *payload, uint32 length,
+											XLogRecPtr source_lsn, XLogRecPtr source_end_lsn)
+{
+	return source_lsn != InvalidXLogRecPtr && source_end_lsn > source_lsn
+		   && multi_recovery_permitted(origin)
+		   && multi_recovery_input_valid(origin, op, payload, length)
+		   && MultiXactRecoveryOffsetCtl[origin].shared != NULL
+		   && MultiXactRecoveryMemberCtl[origin].shared != NULL
+		   && multi_recovery_directory_ready(origin);
 }
 
 static bool

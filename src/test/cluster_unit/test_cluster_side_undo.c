@@ -21,6 +21,7 @@
 
 #include "access/rmgr.h"
 #include "access/xlogrecord.h"
+#include "cluster/cluster_recovery_tt_record.h"
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_slot.h"
@@ -344,6 +345,34 @@ UT_TEST(test_decode_malformed_and_unknown_blocked)
 	/* NULL inputs. */
 	UT_ASSERT(!cluster_undo_decode(NULL, &out));
 	UT_ASSERT(!cluster_undo_decode(rec, NULL));
+}
+
+UT_TEST(test_decode_missing_carrier_blocked)
+{
+	const struct {
+		uint8 info;
+		uint32 len;
+	} carriers[] = {
+		{ XLOG_UNDO_TT_SLOT_COMMIT, sizeof(xl_undo_tt_slot_commit) },
+		{ XLOG_UNDO_TT_SLOT_SET_HEAD, sizeof(xl_undo_tt_slot_set_head) },
+		{ XLOG_UNDO_TT_SLOT_ABORT, sizeof(xl_undo_tt_slot_abort) },
+		{ XLOG_UNDO_TT_SLOT_ABORT, sizeof(xl_undo_tt_slot_abort_exact) },
+		{ XLOG_UNDO_TT_SLOT_BIND, sizeof(xl_undo_tt_slot_bind) },
+	};
+	FakeRecord fr;
+	ClusterUndoDecoded out;
+	XLogReaderState *record;
+
+	for (uint32 i = 0; i < lengthof(carriers); i++) {
+		record = make_record(&fr, RM_CLUSTER_UNDO_ID, carriers[i].info, NULL, 0);
+		/* A reported complete length cannot replace the missing bytes. */
+		fr.u.dec.main_data_len = carriers[i].len;
+		UT_ASSERT(!cluster_undo_decode(record, &out));
+		fr.u.dec.main_data_len = 0;
+		UT_ASSERT(!cluster_undo_decode(record, &out));
+	}
+	memset(&fr, 0, sizeof(fr));
+	UT_ASSERT(!cluster_undo_decode(&fr.st, &out));
 }
 
 UT_TEST(test_preflight_field_integrity_and_route)
@@ -670,14 +699,48 @@ UT_TEST(test_overlapping_undo_record_and_slot_ranges_refuse)
 	UT_ASSERT(!cluster_undo_decode(record, &out));
 }
 
+UT_TEST(test_recovery_abort_codec_does_not_authorize_ordinary_side)
+{
+	ClusterRecoveryTTAbortV1 payload = { 0 };
+	ClusterUndoDecoded decoded;
+	FakeRecord fr;
+	uint8 bytes[CLUSTER_RECOVERY_TT_ABORT_BYTES];
+	XLogReaderState *record;
+
+	payload.version = CLUSTER_RECOVERY_TT_ABORT_VERSION;
+	payload.length = CLUSTER_RECOVERY_TT_ABORT_BYTES;
+	payload.flags = CLUSTER_RECOVERY_TT_ABORT_TOP_KNOWN;
+	payload.target_thread = 2;
+	payload.writer_thread = 1;
+	payload.target_incarnation = 11;
+	payload.writer_incarnation = 12;
+	payload.recovery_serial = 13;
+	payload.target_epoch = 1;
+	payload.target_full_xid = payload.top_full_xid = 1234;
+	payload.target_claim_sha256[0] = 1;
+	payload.exact
+		= (xl_undo_tt_slot_abort_exact){ .segment_id = 257,
+										 .xid = 1234,
+										 .instance = 2,
+										 .format_version = CLUSTER_UNDO_TT_ABORT_EXACT_VERSION };
+	payload.before = (TTSlot){ .xid = 1234, .status = TT_SLOT_ACTIVE };
+	UT_ASSERT(cluster_recovery_tt_abort_encode_v1(&payload, bytes, sizeof(bytes)));
+	record
+		= make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_RECOVERY_TT_ABORT, bytes, sizeof(bytes));
+	UT_ASSERT(!cluster_undo_decode(record, &decoded));
+	UT_ASSERT(!cluster_undo_preflight(&decoded));
+	UT_ASSERT(!cluster_undo_inspect_pi(&decoded));
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(13);
 
 	UT_RUN(test_decode_tt_commit_fields);
 	UT_RUN(test_decode_tt_bind_exact_shape_and_reserved_bytes);
 	UT_RUN(test_decode_malformed_and_unknown_blocked);
+	UT_RUN(test_decode_missing_carrier_blocked);
 	UT_RUN(test_preflight_field_integrity_and_route);
 	UT_RUN(test_decode_block_write_fields);
 	UT_RUN(test_decode_set_head_and_multi_exact_shape);
@@ -686,6 +749,7 @@ main(void)
 	UT_RUN(test_typed_exact_abort_requires_same_active_predecessor);
 	UT_RUN(test_typed_ctrc_release_requires_exact_terminal_generation_and_post_read);
 	UT_RUN(test_overlapping_undo_record_and_slot_ranges_refuse);
+	UT_RUN(test_recovery_abort_codec_does_not_authorize_ordinary_side);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

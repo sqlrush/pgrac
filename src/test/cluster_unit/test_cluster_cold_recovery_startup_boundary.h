@@ -82,14 +82,134 @@ pfree(void *pointer)
 static ClusterControlRootSnapshot roots[NROOTS + 1];
 static ClusterControlRootReadToken tokens[NROOTS + 1];
 static XLogRecPtr native_redo[NROOTS + 1];
+static ClusterWalRecoveryCheckpointV1 native_checkpoint[NROOTS + 1];
 static ClusterControlRootResult source_result[NROOTS + 1];
+static ClusterControlRootResult own_lookup_result;
+static bool own_lookup_override;
+static ClusterControlRootIdentity own_lookup_identity;
+char *cluster_shared_data_dir = "fixture-shared";
+static ClusterControlRootResult commit_ts_profile_result[NROOTS];
+static unsigned commit_ts_profile_calls[NROOTS], commit_ts_profile_fail_after[NROOTS];
+
+ClusterControlRootResult cluster_control_native_commit_ts_profile_v1(const char *shared_root,
+																   uint32 node);
+
+/* Physical I/O remains a fixture here; control-root tests exercise the actual
+ * bounded directory reader. Each failure models an observation at this call. */
+ClusterControlRootResult
+cluster_control_native_commit_ts_profile_v1(const char *shared_root, uint32 node)
+{
+	if (shared_root == NULL || strcmp(shared_root, cluster_shared_data_dir) != 0 || node >= NROOTS)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	commit_ts_profile_calls[node]++;
+	return commit_ts_profile_calls[node] > commit_ts_profile_fail_after[node]
+			   ? commit_ts_profile_result[node]
+			   : CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
 static uint16 fence_count;
 static ClusterColdDetailV1 scan_result[NROOTS + 1];
 static uint64 data_token;
 static uint64 database_incarnation[NROOTS + 1];
+static uint32 scan_space_offset;
+static bool scan_space_drop;
 static bool scan_space;					/* thread 2 extends relation 300 before its page record */
 static ClusterWalSourceRef restart_ref; /* this node's bootstrap-validated restart input */
 static bool restart_ref_present;
+static int source_sync_calls;
+static uint16 source_sync_order[NROOTS];
+static uint16 source_sync_fail_thread;
+static int source_sync_fault;
+static bool fence_current;
+static sigjmp_buf source_sync_exception;
+static int tt_base_captures, tt_base_rechecks, tt_base_destroys;
+static uint32 tt_base_participants;
+static Size tt_base_budget;
+static ClusterColdDetailV1 tt_base_capture_result, tt_base_recheck_result;
+static bool tt_base_captured;
+static int tt_after_captures, tt_after_rechecks, tt_after_resets, tt_after_fault;
+static uint32 tt_after_participants;
+static bool tt_after_captured;
+static ClusterColdDetailV1 tt_after_capture_result, tt_after_recheck_result;
+static int tt_inventory_calls, tt_inventory_fault;
+static bool tt_inventory_result, tt_inventory_inputs_ready;
+
+bool
+cluster_cold_typed_tt_redo_inventory_v1(const ClusterColdTypedV1 *typed)
+{
+	tt_inventory_calls++;
+	tt_inventory_inputs_ready = typed->refusal == CLUSTER_COLD_OK && tt_base_captured
+								&& tt_after_captured && tt_after_rechecks == 0
+								&& typed->xid_next_after_redo == 0;
+	if (tt_inventory_fault == 1)
+		tokens[3].file_txn_seq++;
+	if (tt_inventory_fault == 2)
+		tt_after_recheck_result = CLUSTER_COLD_SOURCE_GAP;
+	if (tt_inventory_fault == 3)
+		siglongjmp(*PG_exception_stack, 1);
+	return tt_inventory_result && tt_inventory_inputs_ready;
+}
+
+ClusterColdDetailV1
+cluster_cold_tt_after_redo_capture_v1(ClusterColdTypedV1 *typed)
+{
+	tt_after_captures++;
+	tt_after_participants = typed->participant_count;
+	tt_after_captured = tt_after_capture_result == CLUSTER_COLD_OK;
+	if (tt_after_fault == 1)
+		tokens[3].file_txn_seq++;
+	if (tt_after_fault == 3)
+		siglongjmp(*PG_exception_stack, 1);
+	return tt_after_capture_result;
+}
+
+ClusterColdDetailV1
+cluster_cold_tt_after_redo_recheck_v1(ClusterColdTypedV1 *typed)
+{
+	(void)typed;
+	tt_after_rechecks++;
+	if (tt_after_fault == 2)
+		tokens[3].file_txn_seq++;
+	if (tt_after_fault == 4)
+		siglongjmp(*PG_exception_stack, 1);
+	return tt_after_recheck_result;
+}
+
+void
+cluster_cold_tt_after_redo_reset_v1(ClusterColdTypedV1 *typed)
+{
+	(void)typed;
+	if (tt_after_captured)
+		tt_after_resets++;
+	tt_after_captured = false;
+}
+
+ClusterColdDetailV1
+cluster_cold_tt_base_capture_v1(ClusterColdTypedV1 *typed, Size budget)
+{
+	tt_base_captures++;
+	tt_base_participants = typed->participant_count;
+	tt_base_budget = budget;
+	tt_base_captured = tt_base_capture_result == CLUSTER_COLD_OK;
+	return tt_base_capture_result;
+}
+
+ClusterColdDetailV1
+cluster_cold_tt_base_recheck_v1(ClusterColdTypedV1 *typed)
+{
+	(void)typed;
+	tt_base_rechecks++;
+	return tt_base_recheck_result;
+}
+
+void
+cluster_cold_tt_base_destroy_v1(ClusterColdTypedV1 *typed)
+{
+	cluster_cold_tt_after_redo_reset_v1(typed);
+	if (tt_base_captured)
+		tt_base_destroys++;
+	tt_base_captured = false;
+}
 
 bool
 cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
@@ -109,12 +229,14 @@ cluster_control_root_identity_equal(const ClusterControlRootIdentity *left,
 	return left != NULL && right != NULL && memcmp(left, right, sizeof(*left)) == 0;
 }
 
+#ifndef CLUSTER_COLD_NATIVE_DUTY_COMPARE
 ClusterRecoveryDutyCompare
 cluster_recovery_duty_key_compare(const ClusterRecoveryDutyKey *a, const ClusterRecoveryDutyKey *b)
 {
 	return memcmp(a, b, sizeof(*a)) == 0 ? CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
 										 : CLUSTER_RECOVERY_DUTY_COMPARE_DIFFERENT;
 }
+#endif
 
 ClusterControlRootResult
 cluster_control_root_lookup_owner_by_node_runtime(int32 node, ClusterControlRootIdentity *identity,
@@ -123,10 +245,15 @@ cluster_control_root_lookup_owner_by_node_runtime(int32 node, ClusterControlRoot
 {
 	if (node < 0 || node >= NROOTS)
 		return CLUSTER_CONTROL_ROOT_ABSENT;
+	if (node == 0 && own_lookup_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& own_lookup_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return own_lookup_result; /* Failed lookup need not initialize outputs. */
 	*snapshot = roots[node + 1];
 	*identity = snapshot->identity;
+	if (node == 0 && own_lookup_override)
+		*identity = own_lookup_identity;
 	*token = tokens[node + 1];
-	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	return node == 0 ? own_lookup_result : CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
 ClusterControlRootResult
@@ -136,14 +263,95 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *root,
 {
 	uint16 thread = root->identity.origin_thread_id;
 
-	UT_ASSERT_EQ(memcmp(token, &tokens[thread], sizeof(*token)), 0);
 	memset(source, 0, sizeof(*source));
+	if (memcmp(token, &tokens[thread], sizeof(*token)) != 0
+		|| memcmp(root, &roots[thread], sizeof(*root)) != 0)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	source->claim.identity = root->identity;
 	source->claim.database_incarnation = database_incarnation[thread];
 	memset(source->claim.claim_sha256, thread, sizeof(source->claim.claim_sha256));
 	source->timeline = root->checkpoint_tli;
 	*redo = native_redo[thread];
 	return source_result[thread];
+}
+
+ClusterControlRootResult
+cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *root,
+											const ClusterControlRootReadToken *token,
+											ClusterWalRecoveryCheckpointV1 *out)
+{
+	ClusterControlRootResult result;
+	*out = native_checkpoint[root->identity.origin_thread_id];
+	result
+		= cluster_control_root_recovery_source_v1(root, token, &out->source, &out->checkpoint.redo);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		memset(out, 0, sizeof(*out));
+	return result;
+}
+
+bool
+cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *plan)
+{
+	/* Real revalidation also requires the pass-2 serial set. Pass 1
+	 * may compare exact ROOT inputs, but cannot use execution authority. */
+	return plan != NULL && fence_current && cluster_cold_replay_window_active_v1();
+}
+
+static void source_sync_history_drift(int fault);
+
+ClusterControlRootResult
+cluster_control_root_recovery_sync_v1(const ClusterControlRootSnapshot *root,
+									  const ClusterControlRootReadToken *token,
+									  ClusterWalTailObservation *out)
+{
+	uint16 thread = root->identity.origin_thread_id;
+
+	UT_ASSERT_EQ(memcmp(root, &roots[thread], sizeof(*root)), 0);
+	UT_ASSERT_EQ(memcmp(token, &tokens[thread], sizeof(*token)), 0);
+	if (source_sync_calls < NROOTS)
+		source_sync_order[source_sync_calls] = thread;
+	source_sync_calls++;
+	memset(out, 0, sizeof(*out));
+	out->complete_end = root->validated_tail_lsn_exclusive;
+	out->last_record_start = root->tail_last_record_lsn;
+	out->last_record_crc = root->tail_last_record_crc32c;
+	out->database_incarnation = database_incarnation[thread];
+	if (thread != source_sync_fail_thread)
+		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	switch (source_sync_fault) {
+	case 1:
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	case 2:
+		out->complete_end++;
+		break;
+	case 3:
+		out->last_record_start++;
+		break;
+	case 4:
+		out->last_record_crc++;
+		break;
+	case 5:
+		out->database_incarnation++;
+		break;
+	case 6:
+		database_incarnation[1]++;
+		break;
+	case 7:
+		fence_current = false;
+		break;
+	case 8:
+		siglongjmp(source_sync_exception, 1);
+	case 9:
+		native_checkpoint[1].checkpoint.oldestXid++;
+		break;
+	case 10:
+	case 11:
+		source_sync_history_drift(source_sync_fault);
+		break;
+	default:
+		break;
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
 uint16
@@ -170,6 +378,107 @@ cluster_recovery_merge_fence_plan_origin(const ClusterRecoveryFencePlan *plan, u
 	return true;
 }
 
+static int census_releases;
+/* SIDE storage is a lifecycle boundary here; original decoder/payload
+ * ownership is tested separately. No mutation authority is manufactured. */
+struct RfSideOnlinePlanV1 {
+	RfContributorStreamCutV1 cut;
+	ClusterWalSourceRef sources[CLUSTER_COLD_MAX_PARTICIPANTS];
+	uint32 source_count;
+	XLogRecPtr redo;
+	uint32 captured;
+	bool bound;
+	bool sealed;
+	uint32 operation_count;
+	RfSideOnlineOperationV1 operations[4];
+};
+static RfSideOnlinePlanV1 side_fixture[CLUSTER_COLD_MAX_PARTICIPANTS];
+static int side_creates, side_seals, side_destroys, side_fault;
+static Size side_budget_total;
+
+RfPageProofDetailV1
+rf_side_online_plan_create_v1(const RfSideOnlinePlanRequestV1 *request, RfSideOnlinePlanV1 **out)
+{
+	*out = NULL;
+	UT_ASSERT_EQ(request->participant_count, 1);
+	UT_ASSERT_EQ(request->purpose, RF_SIDE_PLAN_RECOVERY);
+	UT_ASSERT_EQ(request->system_identifier, 9);
+	UT_ASSERT_EQ(request->storage_uuid[0], 1);
+	UT_ASSERT_NOT_NULL(request->redo_starts);
+	UT_ASSERT(request->memory_budget > 0
+			  && request->memory_budget <= RF_SIDE_ONLINE_PLAN_MAX_BYTES);
+	if (side_fault == 1 && side_creates == 1)
+		return RF_PAGE_PROOF_DETAIL_CAPACITY;
+	if (side_fault == 9 && side_creates == NROOTS)
+		return RF_PAGE_PROOF_DETAIL_CAPACITY;
+	UT_ASSERT(side_creates < CLUSTER_COLD_MAX_PARTICIPANTS);
+	*out = &side_fixture[side_creates++];
+	(*out)->cut = request->physical_cuts[0];
+	(*out)->redo = request->redo_starts[0];
+	side_budget_total += request->memory_budget;
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+bool
+rf_side_online_plan_bind_sources_v1(RfSideOnlinePlanV1 *plan, const ClusterWalSourceRef *sources,
+									uint32 count)
+{
+	UT_ASSERT_EQ(plan->captured, 0);
+	UT_ASSERT_EQ(census_releases, 0);
+	if (side_fault == 8 && plan == &side_fixture[1])
+		return false;
+	if (sources == NULL || count == 0 || count > CLUSTER_COLD_MAX_PARTICIPANTS)
+		return false;
+	memcpy(plan->sources, sources, count * sizeof(*sources));
+	plan->source_count = count;
+	return true;
+}
+
+bool
+rf_side_online_plan_bind_database_v1(RfSideOnlinePlanV1 *plan, uint64 database)
+{
+	UT_ASSERT_EQ(database, 5);
+	UT_ASSERT(side_creates >= NROOTS);
+	UT_ASSERT_EQ(census_releases, 1);
+	if (side_fault == 2 && plan == &side_fixture[1])
+		return false;
+	if (side_fault == 13 && plan == &side_fixture[NROOTS])
+		return false;
+	plan->bound = true;
+	return true;
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_seal_v1(RfSideOnlinePlanV1 *plan)
+{
+	UT_ASSERT(plan->bound
+			  && plan->captured == (plan->cut.scan_end_exclusive == plan->redo ? 1 : 2));
+	if (side_fault == 3 && plan == &side_fixture[1])
+		return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
+	if (side_fault == 7 && plan == &side_fixture[0])
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	if (plan == &side_fixture[NROOTS]) {
+		if (side_fault == 11)
+			return RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED;
+		if (side_fault == 14)
+			return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
+	}
+	plan->sealed = true;
+	side_seals++;
+	/* A later source cannot hide drift of the first original ROOT. */
+	if (side_fault == 5 && plan == &side_fixture[2])
+		tokens[1].file_txn_seq++;
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+void
+rf_side_online_plan_destroy_v1(RfSideOnlinePlanV1 **plan)
+{
+	if (plan != NULL && *plan != NULL) {
+		side_destroys++;
+		*plan = NULL;
+	}
+}
 /* Each participant contributes its native-redo checkpoint record and one
  * page record on page (100, thread). */
 static bool scan_foreign[NROOTS + 1];
@@ -178,7 +487,7 @@ ClusterColdDetailV1
 cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 						  const ClusterControlRootSnapshot *root,
 						  const ClusterControlRootReadToken *token, bool space_active, bool foreign,
-						  ClusterColdScanResultV1 *result)
+						  struct RfSideOnlinePlanV1 *side_plan, ClusterColdScanResultV1 *result)
 {
 	uint16 thread = root->identity.origin_thread_id;
 	ClusterColdComponentV1 component;
@@ -186,6 +495,7 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 	ClusterColdDetailV1 detail;
 
 	(void)token;
+
 	(void)space_active;
 	scan_foreign[thread] = foreign;
 	memset(result, 0, sizeof(*result));
@@ -202,6 +512,7 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 		return detail;
 	if (scan_space && thread == 2) {
 		static const char payload[4] = { 'A', 'D', 'V', '1' };
+		static const char drop_payload[CLUSTER_SPACE_STRUCTURE_WAL_BYTES] = { 'D' };
 		ClusterColdSpaceOpV1 advance;
 
 		memset(&advance, 0, sizeof(advance));
@@ -212,9 +523,16 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 		memset(advance.result_incarnation, 7, 16);
 		advance.payload = payload;
 		advance.payload_length = sizeof(payload);
+		if (scan_space_drop) {
+			advance.kind = CLUSTER_COLD_SPACE_DROP;
+			memset(advance.result_incarnation, 0, 16);
+			memset(advance.before_incarnation, 7, 16);
+			advance.payload = drop_payload;
+			advance.payload_length = sizeof(drop_payload);
+		}
 		memset(&record, 0, sizeof(record));
-		record.read_rec_ptr = native_redo[thread];
-		record.end_rec_ptr = native_redo[thread] + 0x100;
+		record.read_rec_ptr = native_redo[thread] + scan_space_offset;
+		record.end_rec_ptr = record.read_rec_ptr + 0x100;
 		record.prev_rec_ptr = root->checkpoint_lower_lsn;
 		record.space_count = 1;
 		record.space_ops = &advance;
@@ -239,14 +557,24 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 	component.before.mutation_token = 5;
 	memset(component.result.segment_incarnation, 7, 16);
 	component.result.mutation_token = 6;
-	record.read_rec_ptr = native_redo[thread] + (scan_space && thread == 2 ? 0x100 : 0);
+	record.read_rec_ptr
+		= native_redo[thread] + (scan_space && thread == 2 ? scan_space_offset + 0x100 : 0);
 	record.end_rec_ptr = root->validated_tail_lsn_exclusive;
-	record.prev_rec_ptr
-		= scan_space && thread == 2 ? native_redo[thread] : root->checkpoint_lower_lsn;
+	record.prev_rec_ptr = scan_space && thread == 2 ? native_redo[thread] + scan_space_offset
+													: root->checkpoint_lower_lsn;
 	record.component_count = 1;
 	record.components = &component;
 	detail = cluster_cold_plan_feed_v1(plan, participant, &record);
 	result->records = 2;
+	if (side_plan != NULL) {
+		side_plan->captured = 2;
+		if (side_fault == 6 && thread == 1) {
+			result->side_capture_detail = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			result->side_capture_read_rec_ptr = 0x100;
+		}
+		if (side_fault == 4 && thread == 3)
+			tokens[1].file_txn_seq++;
+	}
 	return detail;
 }
 
@@ -322,20 +650,208 @@ cluster_cold_space_check_v1(void *arg, const RelFileLocator *locator,
  * census_history adds history-only generations.  The census selection
  * itself is tested with the I/O module.
  */
-#define MAX_HISTORY 2
+#define MAX_HISTORY 3
 static int census_scope;
 static ClusterControlRootResult census_begin_result;
 static ClusterControlRootResult census_revalidate_result;
+static ClusterControlRootResult census_token_result;
+static ClusterControlRootFileToken census_token;
+static int census_token_reads;
 static ClusterColdCensusDetailV1 census_select_result;
 static ClusterColdCensusDetailV1 census_cover_result;
 static uint16 census_bad_thread;
 static XLogRecPtr census_redo_skew; /* added to thread 2's census native redo */
 static ClusterColdCensusEntryV1 census_history[MAX_HISTORY];
 static uint32 census_history_count;
+static bool census_history_current;
 static int census_begins;
-static int census_releases;
+static ClusterWalInputV1 census_inputs[11 + MAX_HISTORY];
+static int census_input_fault;
+static uint32 census_fault_index;
+static unsigned history_checkpoint_reads;
+static unsigned history_checkpoint_fault;
+static unsigned history_sync_calls, history_sync_fail_at, history_sync_fault;
+static uint64 history_sync_incarnations[MAX_HISTORY];
+static uint16 history_sync_threads[MAX_HISTORY];
+
+static unsigned serial_input_calls;
+static uint16 serial_input_count, serial_input_threads[128];
+static bool serial_input_ok;
+
+bool
+cluster_recovery_merge_fence_plan_acquire_serial_inputs_v1(
+	ClusterRecoveryFencePlan *plan, const uint16 *threads, uint16 count)
+{
+	UT_ASSERT_NOT_NULL(plan);
+	UT_ASSERT_EQ(census_begins, census_releases);
+	UT_ASSERT(!cluster_cold_replay_window_active_v1());
+	serial_input_calls++;
+	serial_input_count = count;
+	UT_ASSERT(count <= lengthof(serial_input_threads));
+	memcpy(serial_input_threads, threads, count * sizeof(*threads));
+	return serial_input_ok;
+}
+
 static int history_scans;
 static uint32 history_scan_index;
+
+static void
+census_refresh_inputs(void)
+{
+	memset(census_inputs, 0, sizeof(census_inputs));
+	for (uint32 i = 1; i <= NROOTS; i++) {
+		ClusterWalRecoveryCheckpointV1 selected;
+		ClusterWalInputV1 *item = &census_inputs[i];
+		cluster_control_root_recovery_checkpoint_v1(&roots[i], &tokens[i], &selected);
+		item->kind = CLUSTER_WAL_INPUT_CHECKPOINT;
+		item->current = true;
+		item->source = selected.source;
+		item->checkpoint = roots[i];
+		item->checkpoint_start = selected.checkpoint_start;
+		item->native_redo = selected.checkpoint.redo;
+		item->native_checkpoint = selected.checkpoint;
+	}
+	for (uint32 i = 0; i < census_history_count; i++) {
+		const ClusterColdCensusEntryV1 *entry = &census_history[i];
+		ClusterWalInputV1 *item = &census_inputs[entry->input_index];
+		item->kind = CLUSTER_WAL_INPUT_CHECKPOINT;
+		item->current = census_history_current;
+		item->source = entry->source;
+		item->checkpoint = roots[entry->cut.thread_id];
+		if (census_history_current)
+			item->checkpoint.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+		item->checkpoint.identity = entry->identity;
+		item->checkpoint.checkpoint_lower_lsn = entry->cut.physical_lower;
+		item->checkpoint.validated_tail_lsn_exclusive = entry->cut.tail_end;
+		item->checkpoint.tail_last_record_lsn = entry->cut.physical_lower;
+		item->checkpoint.tail_last_record_crc32c = 0;
+		item->checkpoint_start = entry->cut.physical_lower;
+		item->native_redo = entry->cut.physical_lower;
+		item->native_checkpoint = native_checkpoint[entry->cut.thread_id].checkpoint;
+		item->native_checkpoint.redo = item->native_redo;
+	}
+	{
+		ClusterWalInputV1 *item = &census_inputs[census_fault_index];
+		switch (census_input_fault) {
+		case 2:
+			item->kind = CLUSTER_WAL_INPUT_INITIALIZER_TERMINAL;
+			break;
+		case 3:
+			item->native_checkpoint.redo++;
+			break;
+		case 4:
+			item->source.claim.claim_sha256[0]++;
+			break;
+		case 5:
+			item->checkpoint.identity.origin_owner_incarnation++;
+			break;
+		case 6:
+			item->checkpoint_start = InvalidXLogRecPtr;
+			break;
+		case 7:
+			item->native_checkpoint.nextXid = FullTransactionIdFromU64(17);
+			break;
+		case 8:
+			item->native_checkpoint.ThisTimeLineID++;
+			break;
+		case 9:
+			item->checkpoint.checkpoint_lower_lsn++;
+			break;
+		}
+	}
+}
+
+static void
+source_sync_history_drift(int fault)
+{
+	if (fault == 10)
+		census_token.file_txn_seq++;
+	else
+		census_input_fault = 7;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_cold_checkpoint_v1(const ClusterControlRootSnapshot *expected,
+									const ClusterControlRootFileToken *root_token,
+									ClusterWalRecoveryCheckpointV1 *out)
+{
+	UT_ASSERT(cluster_cold_replay_window_active_v1());
+	UT_ASSERT_EQ(census_begins, census_releases);
+	history_checkpoint_reads++;
+	memset(out, 0, sizeof(*out));
+	if (memcmp(root_token, &census_token, sizeof(*root_token)) != 0)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	census_refresh_inputs();
+	for (uint32 i = 0; i < lengthof(census_inputs); i++) {
+		const ClusterWalInputV1 *item = &census_inputs[i];
+		if (item->kind != CLUSTER_WAL_INPUT_CHECKPOINT
+			|| (census_input_fault == 1 && census_fault_index == i)
+			|| memcmp(&item->checkpoint, expected, sizeof(*expected)) != 0)
+			continue;
+		if (history_checkpoint_fault == 1)
+			fence_current = false;
+		if (history_checkpoint_fault == 2)
+			siglongjmp(*PG_exception_stack, 1);
+		if (history_checkpoint_fault == 3)
+			native_checkpoint[1].checkpoint.oldestXid++;
+		out->source = item->source;
+		out->checkpoint_start = item->checkpoint_start;
+		out->checkpoint = item->native_checkpoint;
+		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	}
+	return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_cold_sync_v1(const ClusterControlRootSnapshot *expected,
+								const ClusterControlRootFileToken *root_token,
+								ClusterWalTailObservation *out)
+{
+	ClusterWalRecoveryCheckpointV1 selected, confirmed;
+	ClusterControlRootResult result;
+	unsigned call = history_sync_calls++;
+
+	UT_ASSERT(call < MAX_HISTORY);
+	if (call < MAX_HISTORY) {
+		history_sync_incarnations[call] = expected->identity.origin_owner_incarnation;
+		history_sync_threads[call] = expected->identity.origin_thread_id;
+	}
+	memset(out, 0, sizeof(*out));
+	result = cluster_wal_inputs_cold_checkpoint_v1(expected, root_token, &selected);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (call + 1 == history_sync_fail_at) {
+		if (history_sync_fault == 1)
+			return CLUSTER_CONTROL_ROOT_IO_ERROR;
+		if (history_sync_fault == 6)
+			census_token.file_txn_seq++;
+		if (history_sync_fault == 7)
+			census_input_fault = 7;
+		if (history_sync_fault == 8)
+			fence_current = false;
+		if (history_sync_fault == 9)
+			siglongjmp(*PG_exception_stack, 1);
+	}
+	result = cluster_wal_inputs_cold_checkpoint_v1(expected, root_token, &confirmed);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| memcmp(&selected, &confirmed, sizeof(selected)) != 0)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	out->complete_end = expected->validated_tail_lsn_exclusive;
+	out->last_record_start = expected->tail_last_record_lsn;
+	out->last_record_crc = expected->tail_last_record_crc32c;
+	out->database_incarnation = selected.source.claim.database_incarnation;
+	if (call + 1 == history_sync_fail_at) {
+		if (history_sync_fault == 2)
+			out->complete_end++;
+		if (history_sync_fault == 3)
+			out->last_record_start++;
+		if (history_sync_fault == 4)
+			out->last_record_crc++;
+		if (history_sync_fault == 5)
+			out->database_incarnation++;
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
 
 ClusterControlRootResult
 cluster_wal_inputs_cold_begin_v1(const uint8 storage_uuid[16], uint64 system_identifier,
@@ -344,6 +860,7 @@ cluster_wal_inputs_cold_begin_v1(const uint8 storage_uuid[16], uint64 system_ide
 	census_begins++;
 	UT_ASSERT_EQ(system_identifier, 9);
 	UT_ASSERT_EQ(storage_uuid[0], 1);
+	census_refresh_inputs();
 	*out = census_begin_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			   ? (ClusterWalInputsV1 *)&census_scope
 			   : NULL;
@@ -354,15 +871,28 @@ uint32
 cluster_wal_inputs_count_v1(ClusterWalInputsV1 *inputs)
 {
 	UT_ASSERT(inputs == (ClusterWalInputsV1 *)&census_scope);
-	return 0;
+	return lengthof(census_inputs);
 }
 
 const ClusterWalInputV1 *
 cluster_wal_inputs_at_v1(ClusterWalInputsV1 *inputs, uint32 index)
 {
-	(void)inputs;
-	(void)index;
-	return NULL;
+	UT_ASSERT(inputs == (ClusterWalInputsV1 *)&census_scope);
+	return index >= lengthof(census_inputs)
+				   || (census_input_fault == 1 && index == census_fault_index)
+			   ? NULL
+			   : &census_inputs[index];
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_root_token_v1(ClusterWalInputsV1 *inputs, ClusterControlRootFileToken *out)
+{
+	UT_ASSERT(inputs == (ClusterWalInputsV1 *)&census_scope);
+	census_token_reads++;
+	memset(out, 0, sizeof(*out));
+	if (census_token_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*out = census_token;
+	return census_token_result;
 }
 
 ClusterControlRootResult
@@ -402,7 +932,7 @@ cluster_cold_census_select_v1(const ClusterWalInputV1 *const *inputs, uint32 cou
 		e->input_index = thread;
 		e->role = CLUSTER_COLD_CENSUS_REPLAY;
 		e->identity = roots[thread].identity;
-		e->source.claim.identity = roots[thread].identity;
+		e->source = census_inputs[thread].source;
 		e->cut.thread_id = thread;
 		e->cut.timeline = roots[thread].checkpoint_tli;
 		e->cut.owner_incarnation = roots[thread].identity.origin_owner_incarnation;
@@ -434,7 +964,7 @@ cluster_cold_census_cover_v1(const ClusterColdCensusEntryV1 *entries, uint32 cou
 ClusterColdDetailV1
 cluster_cold_scan_input_v1(ClusterColdPlanV1 *plan, uint32 participant, ClusterWalInputsV1 *inputs,
 						   uint32 index, bool space_active, bool foreign,
-						   ClusterColdScanResultV1 *result)
+						   RfSideOnlinePlanV1 *side_plan, ClusterColdScanResultV1 *result)
 {
 	const ClusterColdCensusEntryV1 *entry = NULL;
 	ClusterColdRecordV1 record;
@@ -454,6 +984,25 @@ cluster_cold_scan_input_v1(ClusterColdPlanV1 *plan, uint32 participant, ClusterW
 	record.end_rec_ptr = entry->cut.tail_end;
 	record.prev_rec_ptr = 0x10;
 	result->records = 1;
+	result->history_xid.source = entry->cut;
+	result->history_xid.source.native_redo = record.read_rec_ptr;
+	result->history_xid.next_xid
+		= U64FromFullTransactionId(census_inputs[index].native_checkpoint.nextXid);
+	result->history_xid.expected_records = result->history_xid.records = 1;
+	result->history_xid.last_read = record.read_rec_ptr;
+	result->history_xid.last_end = record.end_rec_ptr;
+	result->history_xid.begun = true;
+	if (side_plan != NULL) {
+		UT_ASSERT_EQ(side_plan->cut.failed_thread, entry->cut.thread_id);
+		UT_ASSERT_EQ(side_plan->cut.origin_owner_incarnation, entry->cut.owner_incarnation);
+		side_plan->captured = 1;
+		if (side_fault == 10) {
+			result->side_capture_detail = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			result->side_capture_read_rec_ptr = record.read_rec_ptr;
+		}
+		if (side_fault == 12)
+			return CLUSTER_COLD_CAPACITY;
+	}
 	return cluster_cold_plan_feed_v1(plan, participant, &record);
 }
 
@@ -469,6 +1018,7 @@ history_generation(uint16 thread, uint64 incarnation, XLogRecPtr lower, XLogRecP
 	e->identity.origin_owner_incarnation = incarnation;
 	e->source.claim.identity = e->identity;
 	e->source.claim.database_incarnation = 5;
+	e->source.timeline = 1;
 	e->cut.thread_id = thread;
 	e->cut.timeline = 1;
 	e->cut.owner_incarnation = incarnation;
@@ -477,13 +1027,319 @@ history_generation(uint16 thread, uint64 incarnation, XLogRecPtr lower, XLogRecP
 	e->cut.tail_end = tail;
 }
 
+
+/* Exact-record dispatch boundary: real Startup selection and revalidation,
+ * with the original SIDE consumer and authority IO represented separately. */
+static uint64 control_epoch;
+static int control_calls, control_init_calls, control_fault;
+static uint32 control_selected;
+static bool control_authority_ok, control_borrow_ok, control_cover_ok;
+static bool control_native_pair_ok;
+static ClusterRecoveryDutyKey control_duty;
+static ClusterRecoverySerialGuard control_serial;
+static ClusterControlRootSnapshot control_root;
+static ClusterControlRootReadToken control_token;
+static bool c0_mode, c0_target_borrow, c0_target_current, c0_target_cover;
+static int c0_calls, c0_fault;
+static ClusterRecoveryDutyKey c0_duty;
+static ClusterRecoverySerialGuard c0_serial;
+static ClusterControlRootSnapshot c0_root;
+static ClusterControlRootReadToken c0_token;
+
+uint64
+cluster_epoch_get_current(void)
+{
+	return control_epoch;
+}
+
+bool
+cluster_recovery_merge_fence_plan_authority(ClusterRecoveryFencePlan *plan, uint16 thread,
+											ClusterThreadRecoveryAuthorityV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (c0_mode && thread == 3) {
+		if (!c0_target_borrow || !cluster_recovery_merge_fence_plan_revalidate_nowait(plan))
+			return false;
+		out->duty = &c0_duty;
+		out->root_snapshot = &c0_root;
+		out->root_token = &c0_token;
+		out->serial_guard = &c0_serial;
+		return true;
+	}
+	if (!control_borrow_ok || !cluster_recovery_merge_fence_plan_revalidate_nowait(plan)
+		|| thread != 2)
+		return false;
+	out->duty = &control_duty;
+	out->root_snapshot = &control_root;
+	out->root_token = &control_token;
+	out->serial_guard = &control_serial;
+	return true;
+}
+
+ClusterThreadRecoveryAuthorityResultV1
+cluster_thread_recovery_authority_revalidate_nowait_v1(
+	const ClusterThreadRecoveryAuthorityV1 *authority)
+{
+	if (c0_mode && authority != NULL && authority->duty == &c0_duty)
+		return c0_target_current && authority->root_snapshot == &c0_root
+					   && authority->root_token == &c0_token
+					   && authority->serial_guard == &c0_serial
+					   && c0_serial.mode == CLUSTER_RECOVERY_SERIAL_COLD_FORMED
+				   ? CLUSTER_THREAD_AUTHORITY_OK
+				   : CLUSTER_THREAD_AUTHORITY_ROOT_STALE;
+	return control_authority_ok && authority != NULL && authority->duty == &control_duty
+				   && authority->root_snapshot == &control_root
+				   && authority->root_token == &control_token
+				   && authority->serial_guard == &control_serial
+				   && control_serial.mode == CLUSTER_RECOVERY_SERIAL_COLD_FORMED
+			   ? CLUSTER_THREAD_AUTHORITY_OK
+			   : CLUSTER_THREAD_AUTHORITY_ROOT_STALE;
+}
+
+bool
+cluster_thread_recovery_authority_covers_window_v1(
+	const ClusterThreadRecoveryAuthorityV1 *authority, uint16 thread, XLogRecPtr lower,
+	XLogRecPtr upper)
+{
+	if (c0_mode && authority->duty == &c0_duty)
+		return c0_target_cover && thread == 3 && lower == 0x100 && upper == 0x2000;
+	return control_cover_ok && authority->duty == &control_duty && thread == 2 && lower == 0x100
+		   && upper == 0x2000;
+}
+
+bool
+rf_side_online_plan_source_matches_v1(const RfSideOnlinePlanV1 *plan, uint64 system,
+									  const uint8 uuid[16], const RfContributorStreamCutV1 *cut)
+{
+	const uint8 expected[16] = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+	return plan != NULL && plan->sealed && plan->bound && system == 9
+		   && memcmp(uuid, expected, 16) == 0 && memcmp(cut, &plan->cut, sizeof(*cut)) == 0;
+}
+
+bool
+rf_side_online_plan_replay_start_matches_v1(const RfSideOnlinePlanV1 *plan, uint32 thread,
+											uint64 incarnation, uint64 database, XLogRecPtr redo)
+{
+	return plan != NULL && plan->sealed && database == 5 && plan->cut.failed_thread == thread
+		   && plan->cut.origin_owner_incarnation == incarnation && plan->redo == redo;
+}
+
+uint32
+rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan)
+{
+	return plan != NULL && plan->sealed ? plan->operation_count : 0;
+}
+
+bool
+rf_side_online_plan_operation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+								 RfSideOnlineOperationV1 *out)
+{
+	if (plan == NULL || !plan->sealed || index >= plan->operation_count)
+		return false;
+	*out = plan->operations[index];
+	return true;
+}
+
+/* Captured-plan and IO boundaries only. The real C0 planner and the real
+ * held-FD execution owner have independent tests. */
+bool
+rf_side_online_plan_recovery_abort_sources_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+											  ClusterWalSourceRef *writer,
+											  ClusterWalSourceRef *target)
+{
+	if (!c0_mode || plan == NULL || !plan->sealed || !plan->bound || index >= plan->operation_count
+		|| plan->source_count < 2
+		|| plan->operations[index].kind != RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT
+		|| plan->operations[index].recovery_target_source >= plan->source_count)
+		return false;
+	for (uint32 p = 0; p < plan->source_count; p++) {
+		if (plan->sources[p].claim.identity.origin_thread_id == plan->cut.failed_thread
+			&& plan->sources[p].claim.identity.origin_owner_incarnation
+				   == plan->cut.origin_owner_incarnation) {
+			*writer = plan->sources[p];
+			*target = plan->sources[plan->operations[index].recovery_target_source];
+			return true;
+		}
+	}
+	return false;
+}
+
+bool
+cluster_undo_recovery_abort_replay_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+									  const RfPageOnlineRecordIdentityV1 *identity,
+									  const ClusterThreadRecoveryAuthorityV1 *writer,
+									  const ClusterThreadRecoveryAuthorityV1 *target)
+{
+	c0_calls++;
+	UT_ASSERT(plan == &side_fixture[1]);
+	UT_ASSERT_EQ(index, 1);
+	UT_ASSERT_EQ(memcmp(identity, &plan->operations[index].identity, sizeof(*identity)), 0);
+	UT_ASSERT(writer->duty == &control_duty);
+	UT_ASSERT(target->duty
+			  == (plan->operations[index].recovery_target_source == 1 ? &control_duty : &c0_duty));
+	UT_ASSERT_EQ(cluster_thread_recovery_authority_revalidate_nowait_v1(writer),
+				 CLUSTER_THREAD_AUTHORITY_OK);
+	UT_ASSERT_EQ(cluster_thread_recovery_authority_revalidate_nowait_v1(target),
+				 CLUSTER_THREAD_AUTHORITY_OK);
+	UT_ASSERT(cluster_cold_replay_window_active_v1());
+	if (c0_fault == 1)
+		return false;
+	if (c0_fault == 2)
+		siglongjmp(*PG_exception_stack, 1);
+	if (c0_fault == 3)
+		control_epoch++;
+	if (c0_fault == 4)
+		c0_target_current = false;
+	if (c0_fault == 5)
+		tokens[3].file_txn_seq++;
+	if (c0_fault == 6)
+		control_authority_ok = false;
+	if (c0_fault == 7)
+		fence_current = false;
+	return true;
+}
+
+bool
+cluster_undo_recovery_abort_replay_native_v1(const RfSideOnlinePlanV1 *plan,
+	uint32 index, const RfPageOnlineRecordIdentityV1 *identity,
+	const ClusterControlRootSnapshot *writer_root, const ClusterControlRootReadToken *writer_token,
+	const ClusterThreadRecoveryAuthorityV1 *target)
+{
+	c0_calls++;
+	UT_ASSERT(plan == &side_fixture[0]);
+	UT_ASSERT_EQ(index, 0);
+	UT_ASSERT_EQ(memcmp(identity, &plan->operations[index].identity, sizeof(*identity)), 0);
+	UT_ASSERT_EQ(memcmp(writer_root, &roots[1], sizeof(*writer_root)), 0);
+	UT_ASSERT_EQ(memcmp(writer_token, &tokens[1], sizeof(*writer_token)), 0);
+	UT_ASSERT(target->duty == &c0_duty);
+	UT_ASSERT_EQ(cluster_thread_recovery_authority_revalidate_nowait_v1(target),
+		CLUSTER_THREAD_AUTHORITY_OK);
+	UT_ASSERT(cluster_cold_replay_window_active_v1());
+	if (c0_fault == 1)
+		return false;
+	if (c0_fault == 2)
+		siglongjmp(*PG_exception_stack, 1);
+	if (c0_fault == 3)
+		restart_ref.claim.claim_sha256[0] ^= 1;
+	if (c0_fault == 4)
+		c0_target_current = false;
+	return true;
+}
+
+bool
+rf_side_online_plan_native_creation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+									   ClusterSpaceStructureChange *creation)
+{
+	/*
+	 * Decoder boundary only: actual native/typed payload pairing also has
+	 * the original real SIDE plan regression.
+	 */
+	if (!control_native_pair_ok || plan != &side_fixture[1] || index != 0
+		|| plan->operations[index].source_xid != plan->operations[2].source_xid
+		|| plan->operations[index].identity.record.end_rec_ptr
+			   > plan->operations[2].identity.record.read_rec_ptr)
+		return false;
+	memset(creation, 0, sizeof(*creation));
+	creation->identity.action = CLUSTER_SPACE_WAL_CREATE;
+	creation->identity.result.key = plan->operations[2].space_key;
+	return true;
+}
+
+bool
+rf_side_online_production_owner_init_v1(RfSideOnlineProductionOwnerV1 *owner, void *arg,
+										RfSideOnlineFreshAuthorityV1 check, uint32 epoch,
+										bool retained)
+{
+	control_init_calls++;
+	UT_ASSERT_EQ(epoch, 7);
+	UT_ASSERT(retained);
+	memset(owner, 0, sizeof(*owner));
+	owner->authority_arg = arg;
+	owner->revalidate_authority = check;
+	return control_fault != 6;
+}
+
+bool
+rf_side_online_production_bind_undo_v1(RfSideOnlineProductionOwnerV1 *owner,
+									   const ClusterThreadRecoveryAuthorityV1 *authority)
+{
+	UT_ASSERT(owner->authority_arg == authority);
+	owner->undo_authority = authority;
+	return control_fault != 7;
+}
+
+RfPageProofDetailV1
+rf_side_online_production_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+										  const RfPageOnlineRecordIdentityV1 *identity,
+										  RfSideOnlineProductionOwnerV1 *owner)
+{
+	control_calls++;
+	control_selected = index;
+	UT_ASSERT(plan == &side_fixture[1]);
+	UT_ASSERT_EQ(index, 1);
+	UT_ASSERT_EQ(memcmp(identity, &plan->operations[index].identity, sizeof(*identity)), 0);
+	UT_ASSERT(owner->undo_authority != NULL);
+	UT_ASSERT(owner->revalidate_authority(owner->authority_arg));
+	/* Preserve the real record-local owner's whole-source callback contract. */
+	for (uint32 i = 0; i < plan->operation_count; i++) {
+		const RfSideOnlineOperationV1 *op = &plan->operations[i];
+		if (!op->history_only
+			&& (op->kind == RF_SIDE_ONLINE_OPERATION_SPACE
+				|| op->kind == RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE)) {
+			if (owner->preflight_space == NULL || owner->apply_space == NULL)
+				return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+			if (!owner->preflight_space(owner->space_arg, op))
+				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			/* Record selection must not execute SPACE early. */
+		}
+	}
+	if (control_fault == 1)
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	if (control_fault == 2)
+		tokens[3].file_txn_seq++;
+	if (control_fault == 3)
+		control_authority_ok = false;
+	if (control_fault == 4)
+		control_epoch++;
+	if (control_fault == 5)
+		siglongjmp(source_sync_exception, 1);
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
 static void
 fixture(void)
 {
 	uint16 thread;
 
+	own_lookup_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	own_lookup_override = false;
+	memset(&own_lookup_identity, 0, sizeof(own_lookup_identity));
+	serial_input_calls = serial_input_count = 0;
+	serial_input_ok = true;
+	memset(serial_input_threads, 0, sizeof(serial_input_threads));
+	tt_base_captures = tt_base_rechecks = tt_base_destroys = 0;
+	tt_base_participants = 0;
+	tt_base_budget = 0;
+	tt_base_capture_result = tt_base_recheck_result = CLUSTER_COLD_OK;
+	tt_base_captured = false;
+	tt_after_captures = tt_after_rechecks = tt_after_resets = tt_after_fault = 0;
+	tt_after_participants = 0;
+	tt_after_captured = false;
+	tt_after_capture_result = tt_after_recheck_result = CLUSTER_COLD_OK;
+	tt_inventory_calls = tt_inventory_fault = 0;
+	tt_inventory_result = true;
+	tt_inventory_inputs_ready = false;
+	c0_mode = false;
+	memset(side_fixture, 0, sizeof(side_fixture));
+	side_creates = side_seals = side_destroys = side_fault = 0;
+	side_budget_total = 0;
+
 	memset(roots, 0, sizeof(roots));
 	memset(tokens, 0, sizeof(tokens));
+	memset(native_checkpoint, 0, sizeof(native_checkpoint));
+	memset(commit_ts_profile_result, 0, sizeof(commit_ts_profile_result));
+	memset(commit_ts_profile_calls, 0, sizeof(commit_ts_profile_calls));
+	memset(commit_ts_profile_fail_after, 0, sizeof(commit_ts_profile_fail_after));
 	for (thread = 1; thread <= NROOTS; thread++) {
 		ClusterControlRootIdentity *id = &roots[thread].identity;
 		ClusterWalThreadClaim claim;
@@ -506,7 +1362,16 @@ fixture(void)
 		roots[thread].checkpoint_tli = roots[thread].tail_tli = 1;
 		roots[thread].checkpoint_lower_lsn = 0x100;
 		roots[thread].validated_tail_lsn_exclusive = 0x2000;
+		/* The scan fixture's final page record starts at native_redo and
+		 * has the zero CRC of its fully zero-initialized record header. */
+		roots[thread].root_flags |= CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
+		roots[thread].tail_last_record_lsn = 0x800;
+		roots[thread].tail_last_record_crc32c = 0;
 		native_redo[thread] = 0x800;
+		native_checkpoint[thread].checkpoint_start = 0x900;
+		native_checkpoint[thread].checkpoint.ThisTimeLineID = 1;
+		native_checkpoint[thread].checkpoint.nextXid
+			= FullTransactionIdFromU64(UINT64CONST(0x100000100) + thread);
 		source_result[thread] = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 		scan_result[thread] = CLUSTER_COLD_OK;
 		database_incarnation[thread] = 5;
@@ -518,16 +1383,34 @@ fixture(void)
 	memset(restart_ref.claim.claim_sha256, 1, sizeof(restart_ref.claim.claim_sha256));
 	restart_ref.timeline = 1;
 	restart_ref_present = true;
+	source_sync_calls = source_sync_fail_thread = source_sync_fault = 0;
+	memset(source_sync_order, 0, sizeof(source_sync_order));
+	fence_current = true;
+	scan_space_offset = 0;
+	scan_space_drop = false;
+	cluster_cold_replay_window_leave_v1();
 	fence_count = 2;
 	data_token = 5;
 	contexts_alive = 0;
 	census_begin_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 	census_revalidate_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	census_token_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	memset(&census_token, 0, sizeof(census_token));
+	census_token.system_identifier = 9;
+	census_token.file_txn_seq = 5;
+	census_token_reads = 0;
 	census_select_result = CLUSTER_COLD_CENSUS_OK;
 	census_cover_result = CLUSTER_COLD_CENSUS_OK;
 	census_bad_thread = 0;
 	census_redo_skew = 0;
 	census_history_count = 0;
+	census_history_current = false;
+	census_input_fault = 0;
+	history_checkpoint_reads = history_checkpoint_fault = 0;
+	history_sync_calls = history_sync_fail_at = history_sync_fault = 0;
+	memset(history_sync_incarnations, 0, sizeof(history_sync_incarnations));
+	memset(history_sync_threads, 0, sizeof(history_sync_threads));
+	census_fault_index = 11;
 	census_begins = census_releases = history_scans = 0;
 	history_scan_index = 0;
 }

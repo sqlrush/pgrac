@@ -17,6 +17,7 @@
 #define TEST_CLUSTER_SUBTRANS_ORDER_FIXTURE_H
 
 bool cluster_shared_config = true;
+char *cluster_shared_data_dir;
 bool IsUnderPostmaster = true;
 bool InRecovery;
 bool enableFsync = true;
@@ -50,12 +51,12 @@ static bool reader_notify;
 static struct {
 	LWLock *ptr;
 	bool held;
-} lock_map[256];
+} lock_map[256 + 4 * SUBTRANS_RECOVERY_ORIGINS];
 static unsigned lock_count;
 static struct {
 	void *ptr;
 	Size size;
-} mappings[8];
+} mappings[8 + SUBTRANS_RECOVERY_ORIGINS];
 static unsigned mapping_count;
 
 static void fixture_panic(void) pg_attribute_noreturn();
@@ -558,6 +559,7 @@ fixture_setup(void)
 	LWLockInitialize(SubtransSLRULock, 0);
 	LWLockInitialize(CheckpointerCommLock, 0);
 	IsUnderPostmaster = false;
+	cluster_shared_data_dir = fixture_path;
 	SUBTRANSShmemInit();
 	IsUnderPostmaster = true;
 	CheckpointerShmem = ShmemInitStruct(

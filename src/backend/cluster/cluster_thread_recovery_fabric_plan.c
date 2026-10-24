@@ -229,6 +229,10 @@ cluster_thread_recovery_fabric_plan_create_v1(
 	side_request.redo_starts = request->redo_starts;
 	side_request.purpose = request->purpose;
 	detail = rf_side_online_plan_create_v1(&side_request, &plan->side_plan);
+	if (detail == RF_PAGE_PROOF_DETAIL_OK && request->sources != NULL
+		&& !rf_side_online_plan_bind_sources_v1(plan->side_plan, request->sources,
+												request->participant_count))
+		detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
 	if (detail != RF_PAGE_PROOF_DETAIL_OK) {
 		fabric_plan_free(plan);
 		return detail;

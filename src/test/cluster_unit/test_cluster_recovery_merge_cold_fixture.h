@@ -78,6 +78,22 @@ fixture(void)
 		open_calls[tid] = tail_calls[tid] = source_calls[tid] = revalidate_calls[tid] = 0;
 	}
 	formations_built = formations_destroyed = 0;
+	online_formations_built = cold_formations_built = online_needs_built = cold_needs_built = 0;
+	cold_input_waits = 0;
+	cold_wait_hook = NULL;
+	memset(&cold_cohort, 0, sizeof(cold_cohort));
+	cold_cohort.startup_formation_generation = 22;
+	cold_cohort.local_epoch = 7;
+	for (unsigned node = 0; node < NODES; node++) {
+		cold_cohort.membership.membership_state[node] = CLUSTER_MEMBER_MEMBER;
+		cold_cohort.membership.last_admitted_incarnation[node] = 12;
+	}
+	cold_cf_held = false;
+	cold_cf_reads = cold_origin_reads = cold_cf_releases = 0;
+	cold_bad_origin = -1;
+	cold_pending_initializer = false;
+	cold_metadata_error = false;
+	cold_release_result = CLUSTER_CF_RELEASE_CONFIRMED;
 	completion_reset();
 	events[0] = '\0';
 	cluster_shared_config = true;

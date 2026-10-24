@@ -52,6 +52,20 @@ cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *req
 	return CLUSTER_WAL_PIN_OK;
 }
 
+static uint16 pin_input_count;
+static uint16 pin_input_threads[128];
+
+ClusterWalPinResult
+cluster_wal_retention_pin_acquire_inputs_v1(
+	const ClusterWalRetentionPinThreadRequest *requests, uint16 count,
+	const uint16 *threads, uint16 nthreads, ClusterWalRetentionPin **out)
+{
+	pin_input_count = nthreads;
+	UT_ASSERT(nthreads <= lengthof(pin_input_threads));
+	memcpy(pin_input_threads, threads, nthreads * sizeof(*threads));
+	return cluster_wal_retention_pin_acquire(requests, count, out);
+}
+
 ClusterWalPinResult
 cluster_wal_retention_pin_bind_one(ClusterWalRetentionPin *pin, ClusterRecoverySerialGuard *serial)
 {
@@ -453,6 +467,22 @@ UT_TEST(cold_plan_pins_exact_inputs_before_any_ir)
 	UT_ASSERT_EQ(pin_release_calls, 1);
 }
 
+UT_TEST(cold_plan_retains_history_in_same_owner_before_original_ir)
+{
+	const uint16 inputs[] = { 1, 2, 3 };
+	ClusterRecoveryFencePlan *plan = cold_pin_plan(2);
+
+	pin_input_count = 0;
+	UT_ASSERT(cluster_recovery_merge_fence_plan_acquire_serial_inputs_v1(plan, inputs, 3));
+	UT_ASSERT_EQ(pin_input_count, 3);
+	for (unsigned i = 0; i < 3; i++)
+		UT_ASSERT_EQ(pin_input_threads[i], inputs[i]);
+	UT_ASSERT_EQ(pin_requested_origins, 2);
+	UT_ASSERT_EQ(pin_ir_locks_at_acquire, 0);
+	UT_ASSERT_EQ(plan->serial_guards.count, 2);
+	cold_pin_cleanup(&plan);
+}
+
 UT_TEST(cold_plan_pin_refusal_takes_no_ir)
 {
 	ClusterRecoveryFencePlan *plan = cold_pin_plan(1);
@@ -582,12 +612,13 @@ main(void)
 	retire_driver = cluster_control_request_driver_start();
 	cluster_shared_config = true;
 	MyBackendType = B_LMON; /* Nonblocking release; ACKs are explicit above. */
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(ir_copied_set_compacts_without_losing_cleanup_owner);
 	UT_RUN(ir_failed_s5_outlives_stack_without_becoming_a_holder);
 	UT_RUN(ir_old_guard_is_unusable_during_rebind_but_still_releasable);
 	UT_RUN(cold_plan_partial_set_keeps_cleanup_without_minting_full_authority);
 	UT_RUN(cold_plan_pins_exact_inputs_before_any_ir);
+	UT_RUN(cold_plan_retains_history_in_same_owner_before_original_ir);
 	UT_RUN(cold_plan_pin_refusal_takes_no_ir);
 	UT_RUN(cold_plan_failed_pin_bind_does_not_publish_full_authority);
 	UT_RUN(cold_plan_pin_release_uncertain_retains_borrowed_fence_owners);

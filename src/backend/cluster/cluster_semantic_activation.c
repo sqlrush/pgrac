@@ -34,6 +34,7 @@
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_replacement_wire.h"
 #include "cluster/cluster_semantic_activation.h"
@@ -552,7 +553,16 @@ typedef struct SemanticActivationRestartDiagnostic {
 	bool wait_logged;
 } SemanticActivationRestartDiagnostic;
 
+/* Volatile source identity in the original restart round. A recovered
+ * source never changes the native clean-start observation into CLEAN. */
+typedef enum ClusterSemanticRestartSource {
+	CLUSTER_SEMANTIC_RESTART_SOURCE_NONE = 0,
+	CLUSTER_SEMANTIC_RESTART_SOURCE_CLEAN,
+	CLUSTER_SEMANTIC_RESTART_SOURCE_RECOVERED
+} ClusterSemanticRestartSource;
+
 typedef struct SemanticActivationRestart {
+	ClusterSemanticRestartSource source;
 	bool disabled;
 	bool failed;
 	bool have_open;
@@ -12895,7 +12905,7 @@ cluster_semantic_normal_start_prepare(bool clean, int prepared_count, const char
 		return normal_start_prepare_failed(failure, "NORMAL_START_PGSA_INVALID");
 	/* Unsupported valid records keep their original recovery/cutover contract.
 	 * They cannot borrow this normal completion or the SOURCE-zero exception. */
-	if (!clean || record.phase != CLUSTER_SEMANTIC_PHASE_OPEN
+	if (record.phase != CLUSTER_SEMANTIC_PHASE_OPEN
 		|| record.source_feature_bitmap != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
 		|| record.target_feature_bitmap
 			   != (CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
@@ -12903,19 +12913,23 @@ cluster_semantic_normal_start_prepare(bool clean, int prepared_count, const char
 		|| (!cluster_shared_config && record.transition_epoch != CLUSTER_EPOCH_INITIAL)
 		|| record.record_generation < 6 || record.record_generation == UINT64_MAX
 		|| record.coordinator_node != 0 || record.admitted_members_lo != UINT64_C(15)
-		|| record.admitted_members_hi != 0 || record.rollback_feature_bitmap != 0)
+		|| record.admitted_members_hi != 0 || record.rollback_feature_bitmap != 0
+		|| (!clean && !cluster_shared_config))
 		goto publish;
-	if (prepared_count != 0 || !normal_start_checkpoint_captured || normal_start_checkpoint_invalid)
+	if (clean
+		&& (prepared_count != 0 || !normal_start_checkpoint_captured || normal_start_checkpoint_invalid))
 		return normal_start_prepare_failed(failure, "NORMAL_START_OWN_CHECKPOINT_UNPROVEN");
 	image.node_id = cluster_node_id;
 	image.system_identifier = GetSystemIdentifier();
 	image.boot_incarnation = cluster_qvotec_get_self_incarnation();
 	image.epoch = cluster_shared_config ? cluster_epoch_get_current() : record.transition_epoch;
-	image.own_checkpoint_lsn = normal_start_checkpoint.lsn;
-	image.own_redo_lsn = normal_start_checkpoint.redo;
-	image.own_next_full_xid = normal_start_checkpoint.next_full_xid;
-	image.own_checkpoint_scn = normal_start_checkpoint.scn;
-	if (cluster_shared_config) {
+	if (clean) {
+		image.own_checkpoint_lsn = normal_start_checkpoint.lsn;
+		image.own_redo_lsn = normal_start_checkpoint.redo;
+		image.own_next_full_xid = normal_start_checkpoint.next_full_xid;
+		image.own_checkpoint_scn = normal_start_checkpoint.scn;
+	}
+	if (clean && cluster_shared_config) {
 		ClusterControlRootResult result = cluster_wal_startup_clean_input_v1(&image.clean_input);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 			ereport(LOG, (errmsg("cluster normal startup CLEAN input unavailable"),
@@ -12928,7 +12942,8 @@ cluster_semantic_normal_start_prepare(bool clean, int prepared_count, const char
 		if (!normal_start_clean_input_valid(&image, &record))
 			return normal_start_prepare_failed(failure, "NORMAL_START_CLEAN_BRIDGE_UNPROVEN");
 	}
-	if (!normal_start_identity_current(&image) || !normal_start_closed_snapshot(&before))
+	if (clean
+		&& (!normal_start_identity_current(&image) || !normal_start_closed_snapshot(&before)))
 		return normal_start_prepare_failed(failure, "NORMAL_START_NOT_EXCLUSIVE");
 	if (cluster_qvotec_bootstrap_read_undo_root_descriptor(image.system_identifier, image.pgrd)
 			!= CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
@@ -12940,6 +12955,11 @@ cluster_semantic_normal_start_prepare(bool clean, int prepared_count, const char
 			   != CLUSTER_UNDO_SMGR_ROOT_MIRROR_EXACT
 		|| memcmp(mirror, image.pgrd, sizeof(mirror)) != 0)
 		return normal_start_prepare_failed(failure, "NORMAL_START_PGRD_UNPROVEN");
+	/* Preserve the original inputs for the recovered-owner service consumer.
+	 * This is still EXISTING_OTHER: no CLEAN bridge, resident completion or
+	 * restart binding is manufactured from recovery's prepare step. */
+	if (!clean)
+		goto publish;
 	if (!normal_start_identity_current(&image) || !normal_start_closed_snapshot(&after)
 		|| before.seq != after.seq)
 		return normal_start_prepare_failed(failure, "NORMAL_START_IDENTITY_CHANGED");
@@ -13356,23 +13376,57 @@ cluster_semantic_activation_note_clean_start(bool clean)
 		pg_atomic_write_u32(SemanticActivationCleanStart, 2);
 }
 
+static ClusterSemanticRestartSource
+semantic_activation_restart_source_current(void)
+{
+	const ClusterNormalStartCompletion *input = NormalStartCompletion;
+	ClusterRecoveryCheckpointObservationV1 observed;
+	uint32 native;
+
+	if (SemanticActivationCleanStart == NULL || RecoveryInProgress())
+		return CLUSTER_SEMANTIC_RESTART_SOURCE_NONE;
+	native = pg_atomic_read_u32(SemanticActivationCleanStart);
+	if (native != 1 && native != 2)
+		return CLUSTER_SEMANTIC_RESTART_SOURCE_NONE;
+	/* The original ROOT-selected INSTALL identifies RECOVERED, independently
+	 * of whether this node's own old WAL happened to end in a clean stop.
+	 * This observation says nothing about completion of its service work. */
+	if (cluster_shared_config
+		&& cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& input != NULL && input->node_id == cluster_node_id
+		&& cluster_recovery_checkpoint_observe_v1(&observed)
+		&& input->system_identifier == observed.owner.writer.ref.claim.identity.system_identifier
+		&& input->boot_incarnation == observed.owner.owner_boot
+		&& input->epoch == observed.owner.writer.epoch
+		&& cluster_wal_thread_recovered_writer_matches(&observed.owner.writer.ref, input->epoch))
+		return CLUSTER_SEMANTIC_RESTART_SOURCE_RECOVERED;
+	if (native == 1 && !cluster_qvotec_prior_unclean_death()
+		&& (cluster_shared_config
+				? (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_TARGET_READY
+				   && normal_start_identity_current(input) && normal_start_clean_installed(input))
+				: cluster_epoch_get_current() == CLUSTER_EPOCH_INITIAL))
+		return CLUSTER_SEMANTIC_RESTART_SOURCE_CLEAN;
+	return CLUSTER_SEMANTIC_RESTART_SOURCE_NONE;
+}
+
 static bool
 semantic_activation_restart_current(void)
 {
 	SemanticActivationAdmissionSnapshot gate;
 	ClusterInitialCleanFormationSnapshot clean;
+	ClusterSemanticRestartSource source = semantic_activation_restart_source_current();
 	uint64 lo, hi, epoch;
 	int32 coordinator;
 
-	return SemanticActivationCleanStart != NULL
-		   && pg_atomic_read_u32(SemanticActivationCleanStart) == 1
-		   && !cluster_r4_bit22_cutover_active() && !RecoveryInProgress()
-		   && !cluster_qvotec_prior_unclean_death()
-		   && (cluster_shared_config
-				   ? (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_TARGET_READY
-					  && normal_start_identity_current(NormalStartCompletion)
-					  && normal_start_clean_installed(NormalStartCompletion))
-				   : cluster_epoch_get_current() == CLUSTER_EPOCH_INITIAL)
+	if (source == CLUSTER_SEMANTIC_RESTART_SOURCE_NONE
+		|| (semantic_activation_restart.source != CLUSTER_SEMANTIC_RESTART_SOURCE_NONE
+			&& semantic_activation_restart.source != source))
+		return false;
+	semantic_activation_restart.source = source;
+	/* RECOVERED has a distinct source now. Its full original service-result
+	 * handoff is still required before collecting a new OPEN_APPLIED round. */
+	return source == CLUSTER_SEMANTIC_RESTART_SOURCE_CLEAN
+		   && !cluster_r4_bit22_cutover_active()
 		   && cluster_grd_recovery_state_value() == GRD_RECOVERY_IDLE
 		   && semantic_activation_snapshot(&gate) && gate.transition_closed && gate.active_bits == 0
 		   && gate.record_generation == 0 && gate.formation_epoch == cluster_epoch_get_current()
@@ -13444,7 +13498,11 @@ normal_start_record_matches(const ClusterSemanticActivationRecord *record)
 {
 	uint8 encoded[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
 	return NormalStartCompletion != NULL
-		   && cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_TARGET_READY
+		   && (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_TARGET_READY
+			   || (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+				   && record != NULL && record->phase == CLUSTER_SEMANTIC_PHASE_OPEN
+				   && semantic_activation_restart_source_current()
+						  == CLUSTER_SEMANTIC_RESTART_SOURCE_RECOVERED))
 		   && cluster_semantic_activation_record_encode(record, encoded)
 		   && memcmp(encoded, NormalStartCompletion->pgsa, sizeof(encoded)) == 0;
 }
@@ -14145,6 +14203,9 @@ cluster_semantic_activation_lmon_tick(void)
 	semantic_activation_ack_lmon_drain();
 	if (SemanticActivationShmem == NULL)
 		return;
+	/* Collect the original TX component even while formation/serving waits.
+	 * This value-only receipt cannot replace the remaining service owners. */
+	(void)cluster_recovery_tx_result_accept_v1();
 	if (semantic_serving_lmon_tick())
 		return;
 	/* A normal-stop read owns the same original LMON/QVOTEC slot until its
@@ -14193,6 +14254,11 @@ cluster_semantic_activation_lmon_tick(void)
 												snapshot.record_generation, current_epoch, true);
 }
 
+static bool
+normal_start_service_binding_current(const ClusterSemanticActivationRecord *open,
+									 const uint8 *root,
+									 const ClusterSemanticActivationAckTableV1 *table);
+
 /* Bounded, nonblocking postmaster adapter for the two existing first-OPEN
  * rounds. Only LMON/QVOTEC publish their durable records and admission gates.
  * A reply merely retires this request; readiness is sampled independently. */
@@ -14226,7 +14292,15 @@ cluster_semantic_activation_startup_poll(ClusterSemanticActivationRefusal *refus
 		}
 		if (start->epoch != epoch || memcmp(&start->writer, &writer, sizeof(writer)) != 0)
 			return false;
-	} else if (state != CLUSTER_NORMAL_START_TARGET_READY || start->bound)
+	} else if ((state != CLUSTER_NORMAL_START_TARGET_READY
+			   && state != CLUSTER_NORMAL_START_EXISTING_OTHER)
+			  || start->bound)
+		return false;
+	/* The no-PGPROC postmaster observes the original LMON's completed ROOT
+	 * handoff, just like ordinary backends. It does not repeat that owner's
+	 * durable input read or invoke its role-bound checkpoint observation. */
+	if (state == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& !cluster_semantic_activation_recovered_open_current())
 		return false;
 
 	semantic_activation_set_refusal(refusal, CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED, 0, 0);
@@ -14459,16 +14533,108 @@ pgrac_r4_bit22_cutover_begin(PG_FUNCTION_ARGS)
 /* Validate the immutable CLEAN bridge without requiring fresh ALIVE from a
  * peer that the original normal-stop owner already proved terminal. */
 static bool
+normal_start_recovered_service_binding_current(const ClusterSemanticActivationRecord *open,
+												 const uint8 *root,
+												 const ClusterSemanticActivationAckTableV1 *table)
+{
+	ClusterRecoveryCheckpointObservationV1 observed;
+	ClusterRecoveryCheckpointObservationV1 observed_after;
+	ClusterRecoveryTxResultObservationV1 tx, tx_after;
+	ClusterRecoveryCtrcResultObservationV1 ctrc, ctrc_after;
+	ClusterFormationSnapshotV1 formation;
+	const ClusterNormalStartCompletion *input = NormalStartCompletion;
+
+	/* The recovered consumer derives a local thread id below.  Keep this
+	 * direct entry point fail-closed when called outside the startup wrapper. */
+	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	/* RECOVERED activation must consume the published checkpoint owner. */
+	if (open == NULL || root == NULL || table == NULL || input == NULL
+		|| cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_EXISTING_OTHER
+		|| !cluster_recovery_checkpoint_observe_v1(&observed)
+		|| !cluster_recovery_tx_result_observe_accepted_v1(&tx)
+		|| tx.result.state != CLUSTER_RECOVERY_TX_RESULT_COMPLETE
+		|| memcmp(&tx.checkpoint, &observed, sizeof(observed)) != 0
+		|| !cluster_recovery_ctrc_result_observe_v1(&ctrc)
+		|| ctrc.result.state != CLUSTER_RECOVERY_CTRC_RESULT_COMPLETE
+		|| memcmp(&ctrc.checkpoint, &observed, sizeof(observed)) != 0
+		|| memcmp(ctrc.result.input_root_sha256, tx.result.input_root_sha256, 32) != 0
+		|| observed.slot_generation == 0 || observed.slot_generation == UINT64_MAX
+		|| observed.owner.owner_boot == 0 || observed.owner.owner_boot == UINT64_MAX
+		|| observed.owner.owner_pid <= 0
+		|| input->system_identifier == 0
+		|| input->system_identifier != GetSystemIdentifier()
+		|| observed.owner.writer.ref.claim.identity.system_identifier != input->system_identifier
+		|| open->transition_epoch == 0 || open->transition_epoch == UINT64_MAX
+		|| table->transition_epoch == 0 || table->transition_epoch == UINT64_MAX
+		|| open->transition_epoch >= table->transition_epoch
+		|| observed.owner.writer.epoch != table->transition_epoch
+		|| observed.owner.writer.epoch == 0 || observed.owner.writer.epoch == UINT64_MAX
+		|| observed.owner.owner_boot != cluster_qvotec_get_self_incarnation()
+		|| observed.owner.writer.ref.claim.identity.origin_node_id != cluster_node_id
+		|| observed.owner.writer.ref.claim.identity.origin_thread_id != cluster_node_id + 1
+		|| observed.owner.writer.ref.claim.identity.origin_owner_incarnation
+			   != observed.owner.owner_boot
+		|| !cluster_wal_thread_recovered_writer_matches(&observed.owner.writer.ref,
+																	 observed.owner.writer.epoch)
+		|| memcmp(root, input->pgrd, CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES) != 0
+		|| !cluster_reconfig_capture_formation_snapshot_v1(cluster_node_id + 1, &formation)
+		|| formation.local_epoch != observed.owner.writer.epoch
+		|| formation.startup_formation_generation == 0
+		|| formation.startup_formation_generation == UINT64_MAX
+		|| formation.self_join_admitted != 1 || formation.self_join_failed
+		|| formation.prebump_sync_active
+		|| !semantic_activation_bytes_are_zero(formation.reserved, sizeof(formation.reserved))
+		|| !semantic_activation_bytes_are_zero(formation.pending_join_bitmap,
+														   sizeof(formation.pending_join_bitmap))
+		|| !semantic_activation_bytes_are_zero(formation.excluded_bitmap,
+														   sizeof(formation.excluded_bitmap))
+		|| !semantic_activation_bytes_are_zero(formation.clean_departed_bitmap,
+														   sizeof(formation.clean_departed_bitmap))
+		|| !semantic_activation_bytes_are_zero(formation.removed_bitmap,
+														   sizeof(formation.removed_bitmap)))
+		return false;
+	for (unsigned node = 0; node < CLUSTER_MAX_NODES; node++) {
+		if ((node < 4) != (formation.membership.membership_state[node] == CLUSTER_MEMBER_MEMBER))
+			return false;
+		if (node < 4
+			&& formation.membership.last_admitted_incarnation[node]
+				   != table->expected[node].admitted_incarnation)
+			return false;
+	}
+	/* Consume the independent original TX and CTRC components across the
+	 * formation and membership reads. Other service owners remain required. */
+	if (!cluster_recovery_checkpoint_observe_v1(&observed_after)
+		|| observed_after.slot_generation != observed.slot_generation
+		|| memcmp(&observed_after.owner, &observed.owner, sizeof(observed.owner)) != 0
+		|| !cluster_recovery_tx_result_observe_accepted_v1(&tx_after)
+		|| memcmp(&tx_after, &tx, sizeof(tx)) != 0
+		|| !cluster_recovery_ctrc_result_observe_v1(&ctrc_after)
+		|| memcmp(&ctrc_after, &ctrc, sizeof(ctrc)) != 0)
+		return false;
+	return true;
+}
+
+static bool
 normal_start_service_binding_current(const ClusterSemanticActivationRecord *open, const uint8 *root,
 									 const ClusterSemanticActivationAckTableV1 *table)
 {
 	ClusterFormationSnapshotV1 formation;
 	const ClusterNormalStartCompletion *input = NormalStartCompletion;
 
+	/* A recovered start must advance the service epoch before it can expose
+	 * the recovered owner.  Do not let the equal-epoch fast path bypass the
+	 * physical owner observation required by the RECOVERED -> OPEN handoff. */
+	if (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		&& table->transition_epoch == open->transition_epoch)
+		return false;
 	if (table->transition_epoch == open->transition_epoch)
 		return semantic_activation_bytes_are_zero(table->restart_binding, 32);
 	if (!cluster_shared_config)
 		return false;
+	if (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER)
+		return normal_start_recovered_service_binding_current(open, root, table);
 	if (!normal_start_record_matches(open) || input->epoch != table->transition_epoch
 		|| open->transition_epoch == 0 || open->transition_epoch >= input->epoch
 		|| memcmp(root, input->pgrd, CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES) != 0
@@ -14501,6 +14667,31 @@ normal_start_service_binding_current(const ClusterSemanticActivationRecord *open
 			return false;
 	}
 	return true;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	const ClusterNormalStartCompletion *input = NormalStartCompletion;
+	SemanticServingCut before, after;
+	uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+
+	if (cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_EXISTING_OTHER
+		|| input == NULL || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
+		|| input->node_id != cluster_node_id || !semantic_serving_cut_read(&before)
+		|| input->system_identifier != before.system_identifier || input->epoch != before.epoch
+		|| input->boot_incarnation != before.members[cluster_node_id]
+		|| !semantic_serving_ready(&before)
+		|| !semantic_activation_pgrd_snapshot_copy(root)
+		|| memcmp(root, input->pgrd, sizeof(root)) != 0)
+		return false;
+	/* Only the original LMON publisher performs the durable serving ROOT
+	 * operation. Ordinary backends and postmaster consume its completed cut;
+	 * an INSTALL observation or historical OPEN is not a substitute. */
+	return cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
+		   && NormalStartCompletion == input && semantic_serving_cut_read(&after)
+		   && memcmp(&before, &after, sizeof(before)) == 0 && semantic_serving_ready(&after);
 }
 
 ClusterNormalStopPollResult

@@ -368,6 +368,17 @@ struct ClusterSpaceIdentity;
 extern bool cluster_shared_fs_sharedfs_drop_durable(const struct ClusterSpaceIdentity *identity,
 													uint64 mutation_token);
 
+/* Sync only an already-deleted cold result: MAIN=0 and every auxiliary absent.
+ * No mutation, replay authority, receipt or completion publication. The caller
+ * must retain the original exclusive cold scope and exact executed DROP proof. */
+extern bool cluster_shared_fs_sharedfs_sync_drop_result(RelFileLocator locator);
+
+/* Original exclusive cold CREATE owner only. Sync the existing MAIN/SPACE
+ * file and every directory from its parent through the configured root.
+ * Does not create anything, acquire authority or publish recovery completion. */
+extern bool cluster_shared_fs_sharedfs_sync_create_result(RelFileLocator locator,
+														  ForkNumber forknum);
+
 /* Retained physical progress is allocated only inside the original KO work.
  * A successful physical attempt keeps MAIN and grants no reuse authority. */
 struct ClusterKoDropWorkV2;

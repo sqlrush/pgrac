@@ -84,7 +84,23 @@ typedef struct ClusterWalRetainedCutV1 {
 	 * running or restarted instance still refers to them. */
 	uint32 unneeded_generations;
 	ClusterControlRootIdentity unneeded[CLUSTER_WAL_RETAINED_UNNEEDED_MAX];
+	/* Read-only D1 coverage observations.  These counters never authorize a
+	 * cut, replay, or service state; zero means only that this input had no
+	 * observed record of that shape. */
+	uint64 native_smgr_create_records;
+	uint64 native_xact_invalidation_records;
+	uint64 native_xact_assignment_records;
+	uint64 native_dropped_stats_records;
+	uint64 native_dropped_stats_items;
+	uint32 native_effects_incomplete;
 } ClusterWalRetainedCutV1;
+
+/* Diagnostics from a refused census are deliberately kept separate from the
+ * proof output.  A non-zero value is an observation of malformed native
+ * effects, never a partial retention proof. */
+typedef struct ClusterWalRetainedCutDiagnosticsV1 {
+	uint32 native_effects_incomplete;
+} ClusterWalRetainedCutDiagnosticsV1;
 
 /*
  * Checkpointer only, inside CreateCheckPoint after its redo point is chosen
@@ -104,9 +120,10 @@ extern void cluster_wal_retained_cut_before_sync_v1(XLogRecPtr redo);
  * the output is zeroed and detail names a PAGE/SIDE decode refusal.
  * Publishing is a separate ROOT operation that must compare root_token.
  */
-extern ClusterControlRootResult cluster_wal_retained_cut_compute_v1(const ClusterWalSourceRef *self,
-																	ClusterWalRetainedCutV1 *out,
-																	RfPageProofDetailV1 *detail);
+extern ClusterControlRootResult
+cluster_wal_retained_cut_compute_v1(const ClusterWalSourceRef *self, ClusterWalRetainedCutV1 *out,
+									RfPageProofDetailV1 *detail,
+									ClusterWalRetainedCutDiagnosticsV1 *diagnostics);
 
 /*
  * Checkpointer, after its own online checkpoint is published and before WAL

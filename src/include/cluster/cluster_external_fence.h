@@ -5,8 +5,9 @@
  *
  *	  Oracle documents failure isolation, GES/LMON recovery coordination and
  *	  IPMI integration, but not these bytes or predicates.  The exact layouts
- *	  below are the approved PGRAC adaptation.  No production provider is
- *	  selected: provider id 0 remains UNAVAILABLE and bit 24 remains inactive.
+ *	  below are the approved PGRAC adaptation.  Transport provider id 0 remains
+ *	  UNAVAILABLE and bit 24 inactive.  E1 has a separate exact same-host
+ *	  process-exclusion provider; ordinary online/rejoin admission is unchanged.
  *
  *-------------------------------------------------------------------------
  */
@@ -342,7 +343,8 @@ cluster_reconfig_rejoin_pending_snapshot(const ClusterReconfigRejoinFailureSnaps
 extern bool
 cluster_reconfig_rejoin_pending_ready(const ClusterReconfigRejoinPendingSnapshotV1 *pending);
 
-/* STOP04 §11.7 current-package policy.  This remains false until a later
+/* STOP04 §11.7 transport policy (not the E1 same-host process provider).
+ * This remains false until a later
  * explicit provider selection and deployment certification authorizes bit24.
  * Keeping the check as a production callsite leaves the approved LMON handoff
  * dormant without weakening ordinary online join. */
@@ -395,6 +397,18 @@ extern PgracExternalFenceNeedSetResult
 cluster_external_fence_need_set_build(const ClusterRecoveryDutyKey *duty,
 									  const ClusterFormationWitnessV1 *formation,
 									  PgracExternalFenceNeedSetV1 **out);
+/* E1 only: an exact cold-cohort coordination witness plus canonical prior
+ * ROOTs selects the old writer set (including the founder's predecessor).
+ * This builder performs bounded ROOT reads; it neither relabels new MEMBERs
+ * DEAD nor substitutes self-seal/prior-death for provider admission. */
+extern PgracExternalFenceNeedSetResult
+cluster_external_fence_need_set_build_cold(const ClusterRecoveryDutyKey *duty,
+										   const ClusterFormationWitnessV1 *formation,
+										   PgracExternalFenceNeedSetV1 **out);
+/* Last build attempt in this process: a static diagnostic string, not a proof.
+ * Capability/provider refusals name the first failed predicate; other refusals
+ * return NOT_EXPORTED, success returns NONE.  Capture before another build. */
+extern const char *cluster_external_fence_need_set_last_predicate(void);
 extern bool
 cluster_external_fence_need_set_revalidate_nowait(const PgracExternalFenceNeedSetV1 *needs,
 												  const ClusterFormationWitnessV1 *formation,

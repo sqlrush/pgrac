@@ -21,6 +21,7 @@
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_startup_phase.h"
 #include "utils/timestamp.h"
 #undef printf
 #include "unit_test.h"
@@ -40,6 +41,64 @@ static bool members_available, actual_available;
 static uint64 selected_generation;
 static ClusterControlRootResult selection_result;
 static ClusterR4MembershipSnapshot members;
+static ClusterStartupPhase startup_phase;
+static unsigned progress_samples;
+static unsigned progress_logs;
+static char progress_message[128], progress_detail[1024];
+
+/* Capture only expected operational logs; unexpected severities still fail. */
+bool
+errstart(int elevel, const char *domain)
+{
+	if (elevel == DEBUG1)
+		return false;
+	if (elevel != LOG)
+		abort();
+	return true;
+}
+int
+errmsg(const char *format, ...)
+{
+	va_list args;
+	va_start(args, format);
+	vsnprintf(progress_message, sizeof(progress_message), format, args);
+	va_end(args);
+	return 0;
+}
+int
+errdetail(const char *format, ...)
+{
+	va_list args;
+	va_start(args, format);
+	vsnprintf(progress_detail, sizeof(progress_detail), format, args);
+	va_end(args);
+	return 0;
+}
+void
+errfinish(const char *filename, int lineno, const char *funcname)
+{
+	if (strcmp(progress_message, "native startup configuration is pending") != 0)
+		abort();
+	progress_logs++;
+}
+
+ClusterStartupPhase
+cluster_current_phase(void)
+{
+	return startup_phase;
+}
+bool
+cluster_config_members_observe(ClusterConfigMembersObservation *out)
+{
+	progress_samples++;
+	memset(out, 0, sizeof(*out));
+	return false;
+}
+ClusterConfigMountResult
+cluster_config_members_mount_status(void)
+{
+	return CLUSTER_CONFIG_MOUNT_UNPROVEN;
+}
 
 void
 cluster_config_members_poll(const ClusterSharedConfigRef *ref,
@@ -179,6 +238,9 @@ fixture(void)
 	members_available = actual_available = publication = true;
 	stop = leaving = busy = publication_error = signal_error = false;
 	polls = releases = sends = cancels = writes = member_polls = member_cancels = 0;
+	startup_phase = CLUSTER_PHASE_RUNNING;
+	progress_samples = 0;
+	progress_logs = 0;
 	now += 1000000;
 }
 static void
@@ -364,10 +426,37 @@ UT_TEST(missing_actual_cancels)
 	cluster_shared_config_delivery_lmon_tick();
 	UT_ASSERT(polls == 0 && writes == 0 && cancels == 1);
 }
+UT_TEST(startup_pending_reports_without_changing_delivery_or_wait)
+{
+	fixture();
+	startup_phase = CLUSTER_PHASE_3_RECOVERY;
+	busy = true;
+	cluster_shared_config_delivery_lmon_tick();
+	UT_ASSERT_EQ(progress_samples, 1);
+	UT_ASSERT_EQ(progress_logs, 1);
+	UT_ASSERT(strstr(progress_detail, "stage=root_select") != NULL);
+	UT_ASSERT(strstr(progress_detail, "member_round_current=0") != NULL);
+	for (unsigned i = 0; i < 20; i++)
+		cluster_shared_config_delivery_lmon_tick();
+	UT_ASSERT_EQ(progress_samples, 1);
+	UT_ASSERT_EQ(progress_logs, 1);
+	UT_ASSERT_EQ(polls, 21);
+	UT_ASSERT(writes == 0 && sends == 0 && member_polls == 0);
+	now += 5000000;
+	cluster_shared_config_delivery_lmon_tick();
+	UT_ASSERT_EQ(progress_samples, 2);
+	UT_ASSERT_EQ(progress_logs, 2);
+	UT_ASSERT_EQ(polls, 22);
+	UT_ASSERT(writes == 0 && sends == 0 && member_polls == 0);
+	busy = false;
+	cluster_shared_config_delivery_lmon_tick();
+	UT_ASSERT(writes == 1 && sends == 1 && member_polls == 1);
+}
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(19);
+	UT_RUN(startup_pending_reports_without_changing_delivery_or_wait);
 	UT_RUN(select_and_deliver);
 	UT_RUN(notification_is_not_application);
 	UT_RUN(failed_signal_retried);

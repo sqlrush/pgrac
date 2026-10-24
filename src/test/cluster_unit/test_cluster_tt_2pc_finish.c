@@ -123,7 +123,23 @@ pfree(void *pointer)
  *	Seams of the staged finish
  * ============================================================ */
 bool cluster_enabled = true;
+bool cluster_shared_config = false;
 int cluster_node_id = 0;
+BackendType MyBackendType = B_BACKEND;
+static ClusterNormalStartState twopc_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+static bool twopc_recovered_open = true;
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return twopc_start_state;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return twopc_recovered_open;
+}
 
 static XactCallback registered_callback = NULL;
 static int registrations = 0;
@@ -338,6 +354,10 @@ reset(void)
 	fail_stage_on = 0;
 	flush_ptr = RECORD_END;
 	last_elevel = 0;
+	cluster_shared_config = false;
+	MyBackendType = B_BACKEND;
+	twopc_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+	twopc_recovered_open = true;
 }
 
 /* A prepared transaction with two bindings in this node's segments. */
@@ -407,6 +427,21 @@ abort_event(void)
 /* ============================================================
  *	Tests
  * ============================================================ */
+UT_TEST(test_recovered_open_gate_precedes_twophase_stage)
+{
+	reset();
+	cluster_shared_config = true;
+	twopc_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	twopc_recovered_open = false;
+	UT_ASSERT(raises(prefinish_commit));
+	UT_ASSERT_EQ(stages, 0);
+	UT_ASSERT_EQ(enters, 0);
+	UT_ASSERT_EQ(registrations, 0);
+	cluster_shared_config = false;
+	twopc_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+	twopc_recovered_open = true;
+}
+
 UT_TEST(test_f1_normal_finish_publishes_and_releases_once)
 {
 	reset();
@@ -535,7 +570,8 @@ int
 main(void)
 {
 	make_record();
-	UT_PLAN(7);
+	UT_PLAN(8);
+	UT_RUN(test_recovered_open_gate_precedes_twophase_stage);
 	UT_RUN(test_f1_normal_finish_publishes_and_releases_once);
 	UT_RUN(test_f2_abort_after_stage_releases_stage_and_admission);
 	UT_RUN(test_f3_abort_after_record_releases_without_publishing);

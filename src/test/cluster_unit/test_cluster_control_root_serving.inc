@@ -9,6 +9,63 @@ static unsigned serving_match_calls;
 static uint64 serving_current_epoch;
 static ClusterNormalStopPollResult serving_epoch_result;
 static void (*serving_match_hook)(void);
+static bool serving_recovery_observed;
+static ClusterRecoveryCheckpointObservationV1 serving_recovery_owner;
+static unsigned serving_recovery_reads, serving_recovery_change_at, serving_recovery_fault;
+static ClusterNormalStartState serving_normal_start_state = CLUSTER_NORMAL_START_UNCLASSIFIED;
+
+static void
+test_recovered_checkpoint_owner_fixture(const ClusterWalSourceRef *ref, uint64 epoch)
+{
+	memset(&serving_recovery_owner, 0, sizeof(serving_recovery_owner));
+	serving_recovery_owner.slot_generation = 4;
+	serving_recovery_owner.owner.writer.ref = *ref;
+	serving_recovery_owner.owner.writer.epoch = epoch;
+	serving_recovery_owner.owner.owner_boot = cluster_qvotec_get_self_incarnation();
+	serving_recovery_observed = true;
+}
+
+static void
+test_recovered_checkpoint_owner_system_identifier(uint64 system_identifier)
+{
+	serving_recovery_owner.owner.writer.ref.claim.identity.system_identifier = system_identifier;
+}
+
+static void
+test_recovered_checkpoint_owner_unpublish(void)
+{
+	serving_recovery_observed = false;
+}
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return test_normal_start_state_override ? test_normal_start_state : serving_normal_start_state;
+}
+
+/* Only this shared-owner leaf is doubled here. The original owner's shared
+ * publication, role/currentness and withdrawal are covered by cold_tx_start. */
+bool
+cluster_recovery_checkpoint_observe_v1(ClusterRecoveryCheckpointObservationV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (++serving_recovery_reads == serving_recovery_change_at) {
+		switch (serving_recovery_fault) {
+		case 0: serving_recovery_observed = false; break;
+		case 1: serving_recovery_owner.slot_generation++; break;
+		case 2: serving_recovery_owner.owner.operation_uuid[0]++; break;
+		case 3: serving_recovery_owner.owner.install_generation++; break;
+		case 4: serving_recovery_owner.owner.start_generation++; break;
+		case 5: serving_recovery_owner.owner.start_serial++; break;
+		case 6: serving_recovery_owner.owner.owner_pid++; break;
+		case 7: serving_recovery_owner.owner.writer.ref.claim.identity.origin_node_id++; break;
+		}
+	}
+	if (!serving_recovery_observed)
+		return false;
+	*out = serving_recovery_owner;
+	return true;
+}
 
 ClusterNormalStopPollResult
 cluster_semantic_normal_stop_match(const ClusterSemanticActivationRecord *open,
@@ -55,6 +112,10 @@ serving_fixture_installed(uint8 before[66048], ControlRootImage *root, bool all)
 	ControlFileData candidate;
 	ClusterControlRootFileToken token;
 	char path[MAXPGPATH];
+	serving_recovery_observed = false;
+	memset(&serving_recovery_owner, 0, sizeof(serving_recovery_owner));
+	serving_recovery_reads = serving_recovery_change_at = serving_recovery_fault = 0;
+	serving_normal_start_state = CLUSTER_NORMAL_START_UNCLASSIFIED;
 
 	first_start_fixture(before, root);
 	if (ut_current_failed)
@@ -121,6 +182,181 @@ static void
 serving_fixture(uint8 before[66048], ControlRootImage *root)
 {
 	serving_fixture_installed(before, root, true);
+}
+
+/* Physical installed ROOT/anchor fixture plus a local original-owner leaf.
+ * The fixture starts through CLEAN; this doubled recovery input does not
+ * prove CLEAN is eligible for production recovered-owner registration. */
+static void
+serving_recovery_fixture(uint8 before[66048], ControlRootImage *root, uint32 state)
+{
+	ClusterRecoveryCheckpointOwnerV1 *owner = &serving_recovery_owner.owner;
+	serving_fixture(before, root);
+	if (ut_current_failed)
+		return;
+	root->header.v2.database_state = state;
+	root->records[0].lifecycle_reason = CLUSTER_CONTROL_ROOT_PUBLISH_CHECKPOINT_ADVANCE;
+	UT_ASSERT_EQ(cluster_control_root_v3_encode(root), 0);
+	v2_write_roots(root->bytes);
+	memcpy(before, root->bytes, 66048);
+	serving_recovery_owner.slot_generation = 4;
+	owner->writer.ref.claim.identity = root->records[0].identity;
+	owner->writer.ref.claim.database_incarnation = root->header.v2.database_incarnation;
+	owner->writer.ref.claim.max_config_generation = root->header.v2.config_generation;
+	memcpy(owner->writer.ref.claim.claim_sha256, root->refs[0].claim_sha256, 32);
+	owner->writer.ref.timeline = root->records[0].checkpoint_tli;
+	owner->writer.epoch = test_epoch;
+	owner->writer.startup_first_lsn = root->records[0].checkpoint_lower_lsn;
+	test_checkpoint_prefix_ref = owner->writer.ref;
+	test_wal_validated = true;
+	memset(owner->operation_uuid, 0x72, sizeof(owner->operation_uuid));
+	owner->install_generation = 8;
+	owner->start_generation = 9;
+	owner->start_serial = 10;
+	owner->owner_boot = test_self_incarnation;
+	test_recovered_writer_epoch = test_epoch;
+	owner->owner_pid = 81;
+	serving_recovery_observed = true;
+}
+
+UT_TEST(test_serving_local_advanced_checkpoint_requires_original_recovered_owner)
+{
+	for (uint32 state = CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED;
+		 state <= CLUSTER_CONTROL_ROOT_DATABASE_RECOVERING; state++) {
+		uint8 before[66048], after[66048];
+		ControlRootImage root, published;
+		ClusterControlRootFileToken token;
+		char path[MAXPGPATH];
+		serving_recovery_fixture(before, &root, state);
+		if (ut_current_failed)
+			return;
+		/* This publisher creates the serving proof consumed by recovered OPEN. */
+		test_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+		test_normal_start_state_override = true;
+		test_recovered_open = false;
+		UT_ASSERT_EQ(cluster_control_root_v3_serving_poll(&serving_open, serving_descriptor, &token),
+					 0);
+		test_recovered_open = true;
+		test_normal_start_state_override = false;
+		path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+		read_all_or_abort(path, after, sizeof(after));
+		UT_ASSERT_EQ(cluster_control_root_v3_decode(after, sizeof(after), v2_storage, TEST_SYSID,
+													 &published), 0);
+		UT_ASSERT_EQ(published.header.v2.database_state, CLUSTER_CONTROL_ROOT_DATABASE_OPEN);
+		UT_ASSERT_EQ(published.header.v2.serving[0], 9);
+		UT_ASSERT(memcmp(published.bytes + 1024, before + 1024, 66048 - 1024) == 0);
+		UT_ASSERT(serving_recovery_reads >= 3);
+	}
+}
+
+UT_TEST(test_serving_advanced_checkpoint_cannot_borrow_missing_foreign_or_wrong_local_owner)
+{
+	for (unsigned fault = 0; fault < 13; fault++) {
+		uint8 before[66048];
+		ControlRootImage root;
+		ClusterControlRootFileToken token;
+		serving_recovery_fixture(before, &root, CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED);
+		if (ut_current_failed)
+			return;
+		switch (fault) {
+		case 0: serving_recovery_observed = false; break;
+		case 1: serving_recovery_owner.owner.writer.epoch++; break;
+		case 2: serving_recovery_owner.owner.owner_boot++; break;
+		case 3: serving_recovery_owner.owner.writer.ref.claim.identity.origin_node_id = 3; break;
+		case 4: serving_recovery_owner.owner.writer.ref.claim.identity.origin_thread_id = 4; break;
+		case 5: serving_recovery_owner.owner.writer.ref.claim.identity.origin_owner_incarnation++;
+			break;
+		case 6: serving_recovery_owner.owner.writer.ref.claim.claim_sha256[0]++; break;
+		case 7: serving_recovery_owner.owner.writer.ref.claim.database_incarnation++; break;
+		case 8: serving_recovery_owner.owner.writer.ref.claim.max_config_generation++; break;
+		case 9: serving_recovery_owner.owner.writer.ref.timeline++; break;
+		case 10: serving_recovery_owner.owner.writer.startup_first_lsn++; break;
+		case 11:
+			/* A local witness cannot qualify the other member's latest ROOT. */
+			root.records[3].lifecycle_reason = CLUSTER_CONTROL_ROOT_PUBLISH_CHECKPOINT_ADVANCE;
+			UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+			v2_write_roots(root.bytes); memcpy(before, root.bytes, 66048); break;
+		case 12:
+			root.header.v2.database_state = CLUSTER_CONTROL_ROOT_DATABASE_RECOVERING;
+			UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+			v2_write_roots(root.bytes); memcpy(before, root.bytes, 66048);
+			serving_recovery_observed = false; break;
+		}
+		UT_ASSERT(cluster_control_root_v3_serving_poll(&serving_open, serving_descriptor, &token)
+				  != 0);
+		UT_ASSERT(v2_zero(&token, sizeof(token)));
+		v2_assert_primary_unchanged(before);
+	}
+}
+
+UT_TEST(test_serving_recovered_state_requires_owner_observation)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	ClusterControlRootFileToken token;
+	serving_recovery_fixture(before, &root, CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED);
+	if (ut_current_failed)
+		return;
+	serving_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	serving_recovery_observed = false;
+	UT_ASSERT(cluster_control_root_v3_serving_poll(&serving_open, serving_descriptor, &token)
+			  != 0);
+	UT_ASSERT(v2_zero(&token, sizeof(token)));
+	v2_assert_primary_unchanged(before);
+	serving_normal_start_state = CLUSTER_NORMAL_START_UNCLASSIFIED;
+}
+
+UT_TEST(test_serving_recovered_state_requires_published_writer_match)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	ClusterControlRootFileToken token;
+	serving_recovery_fixture(before, &root, CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED);
+	if (ut_current_failed)
+		return;
+	serving_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	test_recovered_writer_epoch = 0;
+	UT_ASSERT(cluster_control_root_v3_serving_poll(&serving_open, serving_descriptor, &token)
+			  != 0);
+	UT_ASSERT(v2_zero(&token, sizeof(token)));
+	v2_assert_primary_unchanged(before);
+	test_recovered_writer_epoch = test_epoch;
+	serving_normal_start_state = CLUSTER_NORMAL_START_UNCLASSIFIED;
+}
+
+UT_TEST(test_serving_recovered_state_rejects_foreign_owner_system)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	ClusterControlRootFileToken token;
+	serving_recovery_fixture(before, &root, CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED);
+	if (ut_current_failed)
+		return;
+	serving_normal_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	test_recovered_checkpoint_owner_system_identifier(root.header.system_identifier ^ UINT64_C(1));
+	UT_ASSERT(cluster_control_root_v3_serving_poll(&serving_open, serving_descriptor, &token)
+			  != 0);
+	UT_ASSERT(v2_zero(&token, sizeof(token)));
+	v2_assert_primary_unchanged(before);
+	serving_normal_start_state = CLUSTER_NORMAL_START_UNCLASSIFIED;
+}
+
+UT_TEST(test_serving_recovery_owner_drift_across_root_io_never_publishes_open)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		uint8 before[66048];
+		ControlRootImage root;
+		ClusterControlRootFileToken token;
+		serving_recovery_fixture(before, &root, CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED);
+		if (ut_current_failed)
+			return;
+		serving_recovery_fault = fault;
+		serving_recovery_change_at = 3; /* After the first physical ROOT/anchor read. */
+		UT_ASSERT(cluster_control_root_v3_serving_poll(&serving_open, serving_descriptor, &token)
+				  != 0);
+		UT_ASSERT(v2_zero(&token, sizeof(token)));
+		v2_assert_primary_unchanged(before);
+	}
 }
 
 UT_TEST(test_serving_requires_coordinator_publish_then_startup_is_active)

@@ -43,6 +43,10 @@
 
 #include <unistd.h>
 
+#include "access/clog.h"
+#include "access/commit_ts.h"
+#include "access/multixact.h"
+#include "access/subtrans.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
@@ -53,9 +57,12 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_space_reservation.h"
+#include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_wal_restart_read.h"
 #include "cluster/cluster_wal_tail.h"
+#include "cluster/storage/cluster_undo_buf.h"
 #include "pgstat.h"
+#include "postmaster/bgwriter.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/smgr.h"
@@ -293,8 +300,35 @@ cluster_cold_observe_data_v1(void *arg, const RfPageIdentityV1 *page, ClusterCol
 	return true;
 }
 
+bool
+cluster_cold_data_readback_v1(ClusterColdTypedV1 *typed)
+{
+	ClusterColdDiagV1 diag;
+	ClusterColdDetailV1 detail;
+
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK)
+		return false;
+	/* SPACE redo can replace the identity cached during the initial seal. */
+	typed->observer.cached_valid = false;
+	detail = cluster_cold_plan_readback_v1(typed->plan, cluster_cold_observe_data_v1,
+										   &typed->observer, &diag);
+	if (detail != CLUSTER_COLD_OK) {
+		typed->refusal = detail;
+		snprintf(typed->refusal_detail, sizeof(typed->refusal_detail),
+				 "PAGE readback failed: result %u participant %u record %X/%X relation %u "
+				 "fork %u block %u",
+				 (unsigned)detail, (unsigned)diag.participant, LSN_FORMAT_ARGS(diag.read_rec_ptr),
+				 diag.page.locator.relNumber, (unsigned)diag.page.forknum, diag.page.blockno);
+		return false;
+	}
+	return true;
+}
+
 typedef struct ColdScanWork {
 	ClusterColdPlanV1 *plan;
+	RfSideOnlinePlanV1 *side_plan;
+	uint16 source_thread;
+	TimeLineID timeline;
 	uint32 participant;
 	uint64 system_identifier;
 	uint8 storage_uuid[16];
@@ -302,6 +336,10 @@ typedef struct ColdScanWork {
 	bool foreign;
 	ClusterColdDetailV1 detail;
 	ClusterColdScanResultV1 *result;
+	ClusterColdXidProgressV1 history_xid;
+	ClusterWalRecoveryCheckpointV1 checkpoint;
+	bool checkpoint_required;
+	bool checkpoint_seen;
 	ClusterColdDecodedV1 decoded;
 } ColdScanWork;
 
@@ -311,12 +349,77 @@ cold_scan_visit(XLogReaderState *reader, void *arg)
 	ColdScanWork *work = (ColdScanWork *)arg;
 
 	CHECK_FOR_INTERRUPTS();
+	/*
+	 * The selected control-file copy must describe this exact native WAL
+	 * record. Keep every field, including counters, bound to its source.
+	 */
+	if (work->checkpoint_required && reader->ReadRecPtr == work->checkpoint.checkpoint_start) {
+		uint8 info = XLogRecGetInfo(reader);
+
+		if (work->checkpoint_seen || XLogRecGetRmid(reader) != RM_XLOG_ID
+			|| (info != XLOG_CHECKPOINT_ONLINE && info != XLOG_CHECKPOINT_SHUTDOWN)
+			|| XLogRecGetXid(reader) != InvalidTransactionId || XLogRecMaxBlockId(reader) >= 0
+			|| XLogRecGetDataLen(reader) != sizeof(CheckPoint) || XLogRecGetData(reader) == NULL
+			|| memcmp(XLogRecGetData(reader), &work->checkpoint.checkpoint, sizeof(CheckPoint))
+				   != 0) {
+			work->detail = CLUSTER_COLD_SOURCE_GAP;
+			work->result->failed_read_rec_ptr = reader->ReadRecPtr;
+			return false;
+		}
+		work->checkpoint_seen = true;
+	}
 	work->detail
 		= cluster_cold_recovery_decode_v1(reader, work->system_identifier, work->storage_uuid,
 										  work->space_active, work->foreign, &work->decoded);
 	if (work->detail == CLUSTER_COLD_OK)
 		work->detail
 			= cluster_cold_plan_feed_v1(work->plan, work->participant, &work->decoded.record);
+	if (work->detail == CLUSTER_COLD_OK && work->history_xid.begun && !work->history_xid.failed) {
+		ClusterColdXidProgressV1 *xid = &work->history_xid;
+		const ClusterColdRecordV1 *record = &work->decoded.record;
+
+		/* History still grants no physical replay. Only records at the
+		 * original checkpoint's redo cut advance this read-only counter. */
+		if (record->read_rec_ptr >= xid->source.native_redo)
+			(void)cluster_cold_xid_record_v1(xid, &xid->source, record, &work->decoded.xid_input);
+		else if (record->end_rec_ptr > xid->source.native_redo) {
+			xid->failed = true;
+			xid->next_xid = 0;
+		}
+	}
+	if (work->detail == CLUSTER_COLD_OK && work->side_plan != NULL) {
+		const ClusterColdRecordV1 *record = &work->decoded.record;
+		RfPageOnlineRecordIdentityV1 identity = { 0 };
+		RfPageProofDetailV1 captured;
+
+		/* Each SIDE plan owns exactly this original source, independently
+		 * of the PAGE plan's participant order and history-only sources. */
+		identity.record.system_identifier = work->system_identifier;
+		memcpy(identity.record.storage_uuid, work->storage_uuid, 16);
+		identity.record.origin_thread = work->source_thread;
+		identity.record.timeline_id = work->timeline;
+		identity.record.read_rec_ptr = record->read_rec_ptr;
+		identity.record.end_rec_ptr = record->end_rec_ptr;
+		identity.record.record_crc = record->record_crc;
+		identity.record.rmid = record->rmid;
+		identity.record.info = record->info;
+		captured = rf_side_online_plan_feed_record_v1(work->side_plan, &work->decoded.detached,
+													  &identity);
+		if (captured == RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE
+			|| captured == RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED) {
+			/* The original plan above owns native/history acceptance. A
+			 * narrower SIDE profile cannot invalidate it, but this source
+			 * must never expose a partial SIDE plan as executable. */
+			work->result->side_capture_detail = (uint8)captured;
+			work->result->side_capture_read_rec_ptr = record->read_rec_ptr;
+			work->side_plan = NULL;
+		} else if (captured != RF_PAGE_PROOF_DETAIL_OK) {
+			work->decoded.route_detail = (uint8)captured;
+			work->detail = captured == RF_PAGE_PROOF_DETAIL_CAPACITY
+							   ? CLUSTER_COLD_CAPACITY
+							   : CLUSTER_COLD_SIDE_OWNER_MISSING;
+		}
+	}
 	if (work->detail != CLUSTER_COLD_OK) {
 		work->result->failed_read_rec_ptr = reader->ReadRecPtr;
 		work->result->route_detail = work->decoded.route_detail;
@@ -356,28 +459,93 @@ cold_scan_finish(ColdScanWork *work, ClusterControlRootResult visit,
 	result->root_result = (int)visit;
 	if (detail == CLUSTER_COLD_OK
 		&& (visit != CLUSTER_CONTROL_ROOT_OK_PRIMARY || observed->records != result->records
-			|| observed->complete_end != tail))
+			|| observed->complete_end != tail
+			|| (work->checkpoint_required && !work->checkpoint_seen)))
 		detail = CLUSTER_COLD_SOURCE_GAP;
+	if (detail == CLUSTER_COLD_OK && work->history_xid.begun && !work->history_xid.failed) {
+		ClusterColdXidProgressV1 *xid = &work->history_xid;
+		uint64 next;
+
+		/* While visiting, expected_records is only a byte-derived upper
+		 * bound. The original full retained visit above has now proved the
+		 * complete input count/cut; freeze its post-redo count, then require
+		 * the ordered fold to reach that exact tail. No effect is certified. */
+		xid->expected_records = xid->records;
+		if (cluster_cold_xid_candidate_v1(xid, &xid->source, &next))
+			result->history_xid = *xid;
+	}
 	pfree(work);
 	return detail;
+}
+
+/* Optional counter capture uses the original immutable checkpoint, not the
+ * history participant's mutation cut at tail. Missing/unsupported inputs
+ * leave no candidate without changing the original plan's acceptance. */
+static void
+cold_scan_history_xid_begin(ColdScanWork *work, const ClusterWalInputV1 *input)
+{
+	const ClusterControlRootSnapshot *root = &input->checkpoint;
+	const CheckPoint *checkpoint = &input->native_checkpoint;
+	ClusterColdParticipantV1 source = { 0 };
+
+	if (!cluster_control_root_identity_equal(&root->identity, &input->source.claim.identity)
+		|| input->source.timeline != root->checkpoint_tli
+		|| XLogRecPtrIsInvalid(input->checkpoint_start)
+		|| checkpoint->ThisTimeLineID != root->checkpoint_tli
+		|| checkpoint->redo != input->native_redo)
+		return;
+	source.thread_id = root->identity.origin_thread_id;
+	source.timeline = root->checkpoint_tli;
+	source.owner_incarnation = root->identity.origin_owner_incarnation;
+	source.physical_lower = root->checkpoint_lower_lsn;
+	source.native_redo = checkpoint->redo;
+	source.tail_end = root->validated_tail_lsn_exclusive;
+	if (source.native_redo < source.physical_lower || source.native_redo > source.tail_end)
+		return;
+	(void)cluster_cold_xid_begin_v1(&work->history_xid, &source,
+									U64FromFullTransactionId(checkpoint->nextXid),
+									source.tail_end - source.native_redo);
+}
+
+static bool
+cold_scan_checkpoint_valid(const ClusterControlRootSnapshot *root,
+						   const ClusterWalRecoveryCheckpointV1 *checkpoint)
+{
+	return !XLogRecPtrIsInvalid(checkpoint->checkpoint_start)
+		   && checkpoint->checkpoint_start >= root->checkpoint_lower_lsn
+		   && checkpoint->checkpoint_start < root->validated_tail_lsn_exclusive
+		   && !XLogRecPtrIsInvalid(checkpoint->checkpoint.redo)
+		   && checkpoint->checkpoint.redo >= root->checkpoint_lower_lsn
+		   && checkpoint->checkpoint.redo <= checkpoint->checkpoint_start
+		   && checkpoint->checkpoint.ThisTimeLineID == root->checkpoint_tli;
 }
 
 ClusterColdDetailV1
 cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 						  const ClusterControlRootSnapshot *root,
 						  const ClusterControlRootReadToken *token, bool space_active, bool foreign,
-						  ClusterColdScanResultV1 *result)
+						  struct RfSideOnlinePlanV1 *side_plan, ClusterColdScanResultV1 *result)
 {
 	ColdScanWork *work;
 	ClusterWalTailObservation observed;
 	ClusterControlRootResult visit;
+	ClusterWalRecoveryCheckpointV1 checkpoint;
 
 	if (result == NULL)
 		return CLUSTER_COLD_INVALID_ARGUMENT;
 	memset(result, 0, sizeof(*result));
 	if (plan == NULL || root == NULL || token == NULL)
 		return CLUSTER_COLD_INVALID_ARGUMENT;
+	visit = cluster_control_root_recovery_checkpoint_v1(root, token, &checkpoint);
+	result->root_result = (int)visit;
+	if (visit != CLUSTER_CONTROL_ROOT_OK_PRIMARY || !cold_scan_checkpoint_valid(root, &checkpoint))
+		return CLUSTER_COLD_SOURCE_GAP;
 	work = cold_scan_work(plan, participant, &root->identity, space_active, foreign, result);
+	work->checkpoint = checkpoint;
+	work->checkpoint_required = true;
+	work->side_plan = side_plan;
+	work->source_thread = root->identity.origin_thread_id;
+	work->timeline = root->checkpoint_tli;
 	memset(&observed, 0, sizeof(observed));
 	visit = cluster_control_root_recovery_visit(root, token, cold_scan_visit, work, &observed);
 	return cold_scan_finish(work, visit, &observed, root->validated_tail_lsn_exclusive);
@@ -386,12 +554,13 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 ClusterColdDetailV1
 cluster_cold_scan_input_v1(ClusterColdPlanV1 *plan, uint32 participant, ClusterWalInputsV1 *inputs,
 						   uint32 index, bool space_active, bool foreign,
-						   ClusterColdScanResultV1 *result)
+						   RfSideOnlinePlanV1 *side_plan, ClusterColdScanResultV1 *result)
 {
 	const ClusterWalInputV1 *input;
 	ColdScanWork *work;
 	ClusterWalTailObservation observed;
 	ClusterControlRootResult visit;
+	ClusterWalRecoveryCheckpointV1 checkpoint = { 0 };
 
 	if (result == NULL)
 		return CLUSTER_COLD_INVALID_ARGUMENT;
@@ -399,8 +568,19 @@ cluster_cold_scan_input_v1(ClusterColdPlanV1 *plan, uint32 participant, ClusterW
 	input = inputs != NULL ? cluster_wal_inputs_at_v1(inputs, index) : NULL;
 	if (plan == NULL || input == NULL || input->kind != CLUSTER_WAL_INPUT_CHECKPOINT)
 		return CLUSTER_COLD_INVALID_ARGUMENT;
+	checkpoint.checkpoint_start = input->checkpoint_start;
+	memcpy(&checkpoint.checkpoint, &input->native_checkpoint, sizeof(checkpoint.checkpoint));
+	if (!cold_scan_checkpoint_valid(&input->checkpoint, &checkpoint))
+		return CLUSTER_COLD_SOURCE_GAP;
 	work = cold_scan_work(plan, participant, &input->checkpoint.identity, space_active, foreign,
 						  result);
+	/* Bind the immutable scope copy in the original retained WAL visit. */
+	work->checkpoint = checkpoint;
+	work->checkpoint_required = true;
+	work->side_plan = side_plan;
+	work->source_thread = input->checkpoint.identity.origin_thread_id;
+	work->timeline = input->checkpoint.checkpoint_tli;
+	cold_scan_history_xid_begin(work, input);
 	memset(&observed, 0, sizeof(observed));
 	visit = cluster_wal_inputs_visit_retained_v1(inputs, index, cold_scan_visit, work, &observed);
 	return cold_scan_finish(work, visit, &observed, input->checkpoint.validated_tail_lsn_exclusive);
@@ -548,13 +728,44 @@ cluster_cold_completion_proven_v1(const ClusterColdPlanV1 *plan,
 								  const ClusterControlRootSnapshot *root,
 								  const ClusterColdReplayResultV1 *result, uint32 participant)
 {
-	return plan != NULL && root != NULL && result != NULL
-		   && participant < cluster_cold_plan_participant_count_v1(plan)
-		   && result->detail == CLUSTER_COLD_REPLAY_OK
-		   && result->steps_done == cluster_cold_plan_step_count_v1(plan)
-		   && root->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
-		   && (root->root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID) != 0
-		   && root->tail_last_record_lsn != InvalidXLogRecPtr
+	uint32 expected_space_steps = 0;
+	uint32 expected_space_relations;
+	uint64 expected_pages_skipped = 0;
+	uint64 expected_pages_applied = 0;
+	uint32 i;
+
+	if (plan == NULL || root == NULL || result == NULL
+		|| participant >= cluster_cold_plan_participant_count_v1(plan)
+		|| result->detail != CLUSTER_COLD_REPLAY_OK
+		|| result->steps_done != cluster_cold_plan_step_count_v1(plan)
+		|| root->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+		|| (root->root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID) == 0
+		|| root->tail_last_record_lsn == InvalidXLogRecPtr)
+		return false;
+	for (i = 0; i < cluster_cold_plan_step_count_v1(plan); i++) {
+		ClusterColdStepV1 step;
+
+		if (!cluster_cold_plan_step_v1(plan, i, &step))
+			return false;
+		switch (step.step_kind) {
+			case CLUSTER_COLD_STEP_PAGE:
+				if (step.all_skip)
+					expected_pages_skipped++;
+				else
+					expected_pages_applied++;
+				break;
+			case CLUSTER_COLD_STEP_SPACE:
+				expected_space_steps++;
+				break;
+			default:
+				return false;
+		}
+	}
+	expected_space_relations = cluster_cold_plan_space_relation_count_v1(plan);
+	return result->space_steps == expected_space_steps
+		   && result->space_relations_finished == expected_space_relations
+		   && result->pages_skipped == expected_pages_skipped
+		   && result->pages_applied == expected_pages_applied
 		   && result->last_read[participant] == root->tail_last_record_lsn
 		   && result->last_crc[participant] == root->tail_last_record_crc32c
 		   && result->last_end[participant] == root->validated_tail_lsn_exclusive;
@@ -682,28 +893,40 @@ cluster_cold_touched_add_record_v1(ClusterColdTouchedV1 *touched, XLogReaderStat
 	}
 }
 
-/* Write every dirty buffer of the touched relations in one pass, then fsync
- * each touched fork that exists (smgrDoPendingSyncs' pattern). */
-void
+/* Keep relation write/fsync order, then the native checkpoint write/sync
+ * order for the founder's redo caches. Foreign SIDE consumers retain their
+ * own origin-scoped durable readback. This publishes no checkpoint or ROOT. */
+bool
 cluster_cold_durable_barrier_v1(const ClusterColdTouchedV1 *touched)
 {
 	SMgrRelation *smgrs;
 	uint32 i;
 
-	if (touched == NULL || touched->count == 0)
-		return;
-	smgrs = palloc(sizeof(SMgrRelation) * touched->count);
-	for (i = 0; i < touched->count; i++)
-		smgrs[i] = smgropen(touched->rels[i].locator, InvalidBackendId);
-	FlushRelationsAllBuffers(smgrs, (int)touched->count);
-	for (i = 0; i < touched->count; i++) {
-		ForkNumber fork;
+	if (touched != NULL && touched->count != 0) {
+		smgrs = palloc(sizeof(SMgrRelation) * touched->count);
+		for (i = 0; i < touched->count; i++)
+			smgrs[i] = smgropen(touched->rels[i].locator, InvalidBackendId);
+		FlushRelationsAllBuffers(smgrs, (int)touched->count);
+		for (i = 0; i < touched->count; i++) {
+			ForkNumber fork;
 
-		for (fork = 0; fork <= MAX_FORKNUM; fork++)
-			if ((touched->rels[i].forks & (UINT32_C(1) << fork)) != 0 && smgrexists(smgrs[i], fork))
-				smgrimmedsync(smgrs[i], fork);
+			for (fork = 0; fork <= MAX_FORKNUM; fork++)
+				if ((touched->rels[i].forks & (UINT32_C(1) << fork)) != 0
+					&& smgrexists(smgrs[i], fork))
+					smgrimmedsync(smgrs[i], fork);
+		}
+		pfree(smgrs);
 	}
-	pfree(smgrs);
+	/* A transaction-only source can leave dirty native caches with no
+	 * touched relation at all. Writes can enqueue fsync requests, so none
+	 * of these calls alone proves durability. Use the existing startup
+	 * handshake after all writes; an unconfirmed sync is not completion. */
+	CheckPointCLOG();
+	CheckPointCommitTs();
+	CheckPointSUBTRANS();
+	CheckPointMultiXact();
+	cluster_undo_buf_flush_all(true);
+	return RequestStartupSync();
 }
 
 #endif /* USE_PGRAC_CLUSTER */

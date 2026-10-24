@@ -25,10 +25,12 @@
 #include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_wal_tail.h"
 #include "cluster/storage/cluster_smgr.h"
+#include "cluster/storage/cluster_shared_fs.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/buf_internals.h"
 #include "storage/smgr.h"
+#include "storage/md.h"
 #include "storage/checksum.h"
 #include "utils/resowner.h"
 #include "utils/memutils.h"
@@ -45,6 +47,7 @@ typedef struct SpaceRecoveryTarget {
 	ClusterSpaceIdentityKey key;
 	bool has_create;
 	bool has_structure;
+	bool native_create;
 	uint32 operation_count;
 	PGAlignedBlock before[2];
 	ClusterSpaceRecoveryImage final;
@@ -72,7 +75,7 @@ struct ClusterSpaceRecoveryBatchV1 {
 	ResourceOwner source_owner;
 	ResourceOwner io_owner;
 	ResourceOwner previous_owner;
-	bool cold_drop_already;
+	bool cold_result_already;
 	bool preflight_complete;
 	bool installed;
 };
@@ -82,6 +85,28 @@ typedef struct SpaceColdAuthority {
 	ClusterControlRootReadToken token;
 	XLogRecPtr native_redo;
 } SpaceColdAuthority;
+
+typedef struct SpaceColdAbortTarget {
+	RelFileLocator locator;
+	uint32 relation;
+} SpaceColdAbortTarget;
+
+/* Ephemeral native pending-delete work, borrowed only while the original
+ * all-source cold batch remains alive. No persisted deletion permission. */
+typedef struct SpaceColdAbortDelete {
+	const RfSideOnlinePlanV1 *side;
+	uint32 index;
+	uint32 count;
+	SpaceColdAbortTarget *targets;
+	RelFileLocator *locators;
+	ClusterSpaceColdAbortFinishV1 before_delete, finish;
+	void *finish_arg;
+} SpaceColdAbortDelete;
+
+static bool space_cold_abort_delete(ClusterSpaceRecoveryBatchV1 *batch,
+									const SpaceColdAbortDelete *work, Size budget);
+
+static bool space_cold_abort_main(RelFileLocator locator, bool deleted);
 
 static bool
 space_cold_phase(void)
@@ -106,8 +131,10 @@ space_sources_fresh_current_owner(const ClusterSpaceRecoveryBatchV1 *batch)
 		ClusterWalRetentionPin *pin = NULL;
 		uint16 count = 0;
 
-		if (!space_cold_phase() || batch->fabric != NULL || batch->side != NULL
-			|| batch->cold_fence != NULL || batch->cold_origins == NULL
+		if (!space_cold_phase() || batch->fabric != NULL || batch->cold_fence != NULL
+			|| batch->cold_origins == NULL
+			|| (batch->side != NULL
+				&& batch->source_count != rf_side_online_plan_participant_count_v1(batch->side))
 			|| cluster_wal_retention_pin_borrow_cold_v1(&pin, guards, lengthof(guards), &count)
 				   != CLUSTER_WAL_PIN_OK
 			|| count != batch->source_count || pin != batch->sources[0].retention_pin)
@@ -145,10 +172,10 @@ space_sources_fresh_current_owner(const ClusterSpaceRecoveryBatchV1 *batch)
 				.scan_begin_inclusive = a->root_snapshot->checkpoint_lower_lsn,
 				.scan_end_exclusive = a->root_snapshot->validated_tail_lsn_exclusive
 			};
-			if (batch->cold_inputs == NULL
-				&& (!rf_side_online_plan_source_matches_v1(batch->side, a->duty->system_identifier,
-														   a->duty->storage_uuid, &cut)
-					|| !rf_side_online_plan_source_matches_v1(
+			if (batch->side != NULL
+				&& (!rf_side_online_plan_recovery_source_matches_v1(
+						batch->side, a->duty->system_identifier, a->duty->storage_uuid, &cut)
+					|| !rf_side_online_plan_recovery_source_matches_v1(
 						batch->side, a->root_snapshot->identity.system_identifier,
 						a->root_snapshot->identity.storage_uuid, &cut)))
 				return false;
@@ -325,6 +352,46 @@ space_cold_shrink(ClusterSpaceRecoveryBatchV1 *batch, uint32 through, bool apply
 	return ok;
 }
 
+/* The paired native CREATE owns MAIN, the typed record owns SPACE. Keep
+ * their effects separate and never turn a missing nonempty MAIN into an
+ * empty relation. Existing MAIN is adopted by native redo, not truncated. */
+static bool
+space_native_create(ClusterSpaceRecoveryBatchV1 *batch, SpaceRecoveryTarget *target,
+					SMgrRelation rel, bool apply)
+{
+	ClusterSpaceReservation before;
+	const ClusterSharedFsOps *ops;
+	uint64 token;
+	BlockNumber blocks;
+	bool present;
+
+	if (!target->native_create)
+		return true;
+	ops = cluster_shared_fs_get_active_ops();
+	if (batch->cold_fence == NULL || !space_sources_fresh(batch) || ops == NULL
+		|| ops->id != CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS)
+		return false;
+	present = smgrexists(rel, MAIN_FORKNUM);
+	if (!present && !PageIsNew(target->before[1].data)
+		&& (!cluster_space_reservation_page_decode(target->before[1].data, BLCKSZ, SPACE_FORKNUM, 1,
+												   &target->key, &before, &token)
+			|| before.next_block != 0))
+		return false;
+	if (!apply)
+		return space_sources_fresh(batch);
+	blocks = present ? smgrnblocks(rel, MAIN_FORKNUM) : 0;
+	if (!space_sources_fresh(batch))
+		return false;
+	smgrcreate(rel, MAIN_FORKNUM, true);
+	if (!space_sources_fresh(batch))
+		return false;
+	smgrimmedsync(rel, MAIN_FORKNUM);
+	return space_sources_fresh(batch) && smgrexists(rel, MAIN_FORKNUM)
+		   && smgrnblocks(rel, MAIN_FORKNUM) == blocks && space_sources_fresh(batch)
+		   && cluster_shared_fs_sharedfs_sync_create_result(target->key.locator, MAIN_FORKNUM)
+		   && space_sources_fresh(batch);
+}
+
 static bool
 space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, uint32 through)
 {
@@ -427,12 +494,13 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, u
 		 * it with the previously prepared lower HWM. Rollback uses this
 		 * apply's own original bytes, not the earlier preflight snapshot. */
 		target->final = prepared;
-		if (batch->cold_drop_already) {
-			/* COMMIT may delete only its exact installed result, never a
-			 * LIVE predecessor or a reused locator. This is a read-only
-			 * proof: a cached result cannot be made durable on this path. */
+		if (batch->cold_result_already) {
+			/* COMMIT needs its exact tombstone; native ABORT needs its
+			 * exact CREATE/ADVANCE result. Neither may borrow a predecessor
+			 * or successor, or make cached-only bytes durable here. */
 			if (apply || prepared.apply_mask != 0 || prepared.covered_by_successor_mask != 0
-				|| prepared.source_index[0] != 0 || prepared.source_index[1] != 0)
+				|| prepared.source_index[0] >= batch->operation_count
+				|| prepared.source_index[1] >= batch->operation_count)
 				goto done;
 			for (int i = 0; i < 2; i++)
 				if (memcmp(target->before[i].data, prepared.pages[i].data, BLCKSZ) != 0
@@ -462,11 +530,13 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, u
 					&& !space_disk_matches(rel, i, target->before[i].data))
 					goto done;
 			if (prepared.source_index[0] == UINT32_MAX && prepared.source_index[1] == UINT32_MAX) {
-				ok = true;
+				ok = space_native_create(batch, target, rel, true);
 				goto done;
 			}
 		}
 		if (!space_sources_fresh(batch))
+			goto done;
+		if (!space_native_create(batch, target, rel, apply))
 			goto done;
 		if (!apply) {
 			ok = true;
@@ -510,6 +580,13 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, u
 		ok = space_sources_fresh(batch) && space_disk_matches(rel, 0, prepared.pages[0].data)
 			 && space_disk_matches(rel, 1, prepared.pages[1].data);
 	done:;
+		/* File sync alone does not persist a newly created directory entry.
+		 * This also applies when native redo adopted an existing/open file. */
+		if (ok && apply && target->native_create && !batch->cold_result_already)
+			ok = space_sources_fresh(batch)
+				 && cluster_shared_fs_sharedfs_sync_create_result(target->key.locator,
+																  SPACE_FORKNUM)
+				 && space_sources_fresh(batch);
 	}
 	PG_FINALLY();
 	{
@@ -595,6 +672,10 @@ space_recovery_preflight(const ClusterThreadRecoveryFabricPlanV1 *plan,
 
 		if (!rf_side_online_plan_operation_v1(side, i, &op))
 			return false;
+		if (op.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE) {
+			if (cold_fence == NULL || !rf_side_online_plan_native_creation_v1(side, i, &structure))
+				return false;
+		}
 		if (op.history_only)
 			continue;
 		if (op.kind == RF_SIDE_ONLINE_OPERATION_XACT && op.xact.space_drop_count != 0)
@@ -669,6 +750,13 @@ space_recovery_preflight(const ClusterThreadRecoveryFabricPlanV1 *plan,
 				RfSideOnlineOperationV1 op;
 				if (!rf_side_online_plan_operation_v1(side, j, &op))
 					goto done;
+				if (!op.history_only && op.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE) {
+					ClusterSpaceStructureChange paired;
+					if (!rf_side_online_plan_native_creation_v1(side, j, &paired))
+						goto done;
+					if (memcmp(&paired.identity.result.key, &target->key, sizeof(target->key)) == 0)
+						target->native_create = true;
+				}
 				if (!op.history_only && op.kind == RF_SIDE_ONLINE_OPERATION_SPACE
 					&& (op.identity.record.info & ~XLR_INFO_MASK) == XLOG_SMGR_SPACE_IDENTITY
 					&& RelFileLocatorEquals(op.space_key.locator, target->key.locator))
@@ -705,10 +793,48 @@ cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *pla
 		sources, count, out);
 }
 
+/* The original ROOT owner syncs this retained stream outside target locks.
+ * A pin or a foreign numeric LSN cannot substitute for the complete source. */
+static bool
+space_source_sync(ClusterSpaceRecoveryBatchV1 *batch, uint32 source)
+{
+	const ClusterThreadRecoveryAuthorityV1 *a;
+	ClusterWalTailObservation observed;
+
+	if (source >= batch->source_count || !space_sources_fresh(batch))
+		return false;
+	a = &batch->sources[source];
+	return cluster_control_root_recovery_sync_v1(a->root_snapshot, a->root_token, &observed)
+			   == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		   && space_sources_fresh(batch)
+		   && observed.complete_end == a->root_snapshot->validated_tail_lsn_exclusive
+		   && observed.last_record_start == a->root_snapshot->tail_last_record_lsn
+		   && observed.last_record_crc == a->root_snapshot->tail_last_record_crc32c;
+}
+
+static bool
+space_cold_relation_sync(ClusterSpaceRecoveryBatchV1 *batch)
+{
+	/* The complete chain, not just the requested prefix, can qualify a
+	 * durable successor. Sync every contributing origin once before any
+	 * creation, dirtying or physical shrink; do not flush unrelated origins. */
+	for (uint32 source = 0; source < batch->source_count; source++)
+		for (uint32 i = 0; i < batch->operation_count; i++)
+			if (batch->cold_origins[i].origin_thread
+				== batch->sources[source].duty->origin_thread_id) {
+				if (!space_source_sync(batch, source))
+					return false;
+				break;
+			}
+	return space_sources_fresh(batch);
+}
+
 static bool
 space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRecoveryInput *inputs,
 						const ClusterSpaceColdSourceV1 *origins, uint32 count, uint32 through,
-						uint8 shrink_forks, bool drop_already)
+						uint8 shrink_forks, bool drop_already, const RfSideOnlinePlanV1 *abort_side,
+						const ClusterSpaceColdSourceV1 *abort_source, Size budget,
+						bool abort_result, const SpaceColdAbortDelete *abort_delete)
 {
 	ClusterRecoverySerialGuard *guards[CLUSTER_WAL_RETENTION_MAX_THREADS];
 	ClusterWalRetentionPin *pin = NULL;
@@ -716,8 +842,31 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 	ClusterThreadRecoveryAuthorityV1 *authorities;
 	SpaceColdAuthority *owners;
 	uint16 source_count = 0;
+	uint32 physical_sources = 0;
 	Size bytes, scratch;
 	bool ok = false;
+	bool abort_already = abort_side != NULL;
+
+	if (budget > MaxAllocSize || (abort_side == NULL) != (abort_source == NULL)
+		|| (abort_delete != NULL && abort_side == NULL)
+		|| (abort_result && (abort_side == NULL || abort_delete != NULL)))
+		return false;
+	if (abort_already) {
+		ClusterSpaceStructureChange create;
+
+		if (inputs == NULL || count == 0 || through != count - 1 || drop_already
+			|| shrink_forks != 0
+			|| !cluster_space_structure_wal_decode(inputs[0].data, inputs[0].length, &create)
+			|| create.identity.action != CLUSTER_SPACE_WAL_CREATE)
+			return false;
+		for (uint32 i = 1; i < count; i++) {
+			ClusterSpaceReservationChange advance;
+
+			if (!cluster_space_reservation_wal_decode(inputs[i].data, inputs[i].length, &advance)
+				|| advance.action != CLUSTER_SPACE_RESERVATION_ADVANCE)
+				return false;
+		}
+	}
 
 	if (shrink_forks != 0) {
 		ClusterSpaceStructureChange change;
@@ -745,8 +894,8 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 		return false;
 	bytes = sizeof(*batch) + sizeof(SpaceRecoveryTarget)
 			+ (Size)source_count * (sizeof(*authorities) + sizeof(*owners));
-	if (scratch > MaxAllocSize - bytes - 4 * BLCKSZ
-		|| count > (MaxAllocSize - bytes - scratch - 4 * BLCKSZ) / sizeof(uint32))
+	if (bytes > budget || 4 * BLCKSZ > budget - bytes || scratch > budget - bytes - 4 * BLCKSZ
+		|| count > (budget - bytes - scratch - 4 * BLCKSZ) / sizeof(uint32))
 		return false;
 	bytes += (Size)count * sizeof(uint32);
 	batch = space_alloc(bytes);
@@ -758,7 +907,11 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 	batch->order = (uint32 *)(batch->targets + 1);
 	batch->sources = authorities;
 	batch->cold_inputs = inputs;
-	batch->cold_drop_already = drop_already;
+	/* The borrowed pin supplies the complete original cold owner. A SIDE
+	 * capture may contain only one physical stream; validate its bound claims
+	 * and every physical cut below without promoting other held ROOTs. */
+	batch->side = NULL;
+	batch->cold_result_already = drop_already || abort_already;
 	batch->cold_shrink_step = through;
 	batch->cold_shrink_forks = shrink_forks;
 	batch->cold_origins = origins;
@@ -794,6 +947,35 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 				|| owners[i].native_redo < owners[i].root.checkpoint_lower_lsn
 				|| owners[i].native_redo > owners[i].root.validated_tail_lsn_exclusive)
 				goto done;
+			if (abort_already) {
+				bool physical = rf_side_online_plan_recovery_claim_matches_v1(abort_side, &source);
+				bool terminal = guard->duty.origin_thread_id == abort_source->origin_thread;
+
+				if ((terminal && !physical)
+					|| (!abort_result
+						&& !rf_side_online_plan_recovery_bound_claim_matches_v1(abort_side,
+																				&source)))
+					goto done;
+				if (!abort_result && physical)
+					physical_sources++;
+				if (physical && (!abort_result || terminal)) {
+					RfContributorStreamCutV1 cut
+						= { .failed_thread = guard->duty.origin_thread_id,
+							.origin_owner_incarnation = guard->duty.origin_owner_incarnation,
+							.timeline_id = owners[i].root.checkpoint_tli,
+							.flags = RF_CONTRIBUTOR_CUT_COMPLETE,
+							.scan_begin_inclusive = owners[i].root.checkpoint_lower_lsn,
+							.scan_end_exclusive = owners[i].root.validated_tail_lsn_exclusive };
+
+					if (!rf_side_online_plan_replay_start_matches_v1(
+							abort_side, guard->duty.origin_thread_id,
+							guard->duty.origin_owner_incarnation, key->database_incarnation,
+							owners[i].native_redo)
+						|| !rf_side_online_plan_recovery_source_matches_v1(
+							abort_side, key->system_identifier, key->storage_uuid, &cut))
+						goto done;
+				}
+			}
 			authorities[i]
 				= (ClusterThreadRecoveryAuthorityV1){ .duty = &guard->duty,
 													  .root_snapshot = &owners[i].root,
@@ -805,13 +987,29 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 													  .retention_pin = pin,
 													  .serial_guard = guard };
 		}
-		if (!space_sources_fresh(batch)
+		if ((abort_already && !abort_result
+			 && physical_sources != rf_side_online_plan_participant_count_v1(abort_side))
+			|| !space_sources_fresh(batch)
 			|| !cluster_space_recovery_order(inputs, count, key, batch->order))
 			goto done;
+		if (abort_already) {
+			uint16 source;
+
+			for (source = 0; source < source_count; source++)
+				if (abort_source->origin_thread == authorities[source].duty->origin_thread_id)
+					break;
+			if (source == source_count || abort_source->end_rec_ptr <= owners[source].native_redo
+				|| abort_source->end_rec_ptr > owners[source].root.validated_tail_lsn_exclusive)
+				goto done;
+		}
 		for (uint32 i = 0; i < count; i++) {
 			uint16 source;
 
 			if (batch->order[i] != i)
+				goto done;
+			if (abort_already
+				&& (origins[i].origin_thread != abort_source->origin_thread
+					|| origins[i].end_rec_ptr >= abort_source->end_rec_ptr))
 				goto done;
 			for (source = 0; source < source_count; source++)
 				if (origins[i].origin_thread == authorities[source].duty->origin_thread_id)
@@ -830,16 +1028,28 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 					|= structure.identity.action == CLUSTER_SPACE_WAL_CREATE;
 			}
 		}
+		/* The original sequencer already executed this ABORT and drained
+		 * every source. Reuse its complete retained ancestry and owner set,
+		 * but inspect only the physical result: deleted SPACE cannot qualify
+		 * the pre-delete check and must never be installed here. */
+		if (abort_result) {
+			ok = space_sources_fresh(batch) && space_cold_abort_main(key->locator, true)
+				 && space_sources_fresh(batch);
+			goto done;
+		}
 		if (!space_target_run(batch, 0, false, UINT32_MAX) || !space_sources_fresh(batch))
 			goto done;
-		if (drop_already) {
-			ok = true;
+		if (batch->cold_result_already) {
+			ok = abort_delete == NULL
+				 || space_cold_abort_delete(batch, abort_delete, budget - batch->allocated_bytes);
 			goto done;
 		}
 		batch->preflight_complete = true;
 		/* Qualify the requested shrink before even an earlier CREATE can
 		 * publish a component. Other steps/forks have no physical action. */
 		if (shrink_forks != 0 && !space_target_run(batch, 0, false, through))
+			goto done;
+		if (!space_cold_relation_sync(batch))
 			goto done;
 		/* Install structural SPACE results in order without replaying an
 		 * intermediate shrink against DATA already covered by history. */
@@ -864,7 +1074,8 @@ cluster_space_recovery_cold_relation_install_v1(const ClusterSpaceIdentityKey *k
 												const ClusterSpaceColdSourceV1 *origins,
 												uint32 count, uint32 through, uint8 shrink_forks)
 {
-	return space_cold_relation_run(key, inputs, origins, count, through, shrink_forks, false);
+	return space_cold_relation_run(key, inputs, origins, count, through, shrink_forks, false, NULL,
+								   NULL, MaxAllocSize, false, NULL);
 }
 
 bool
@@ -872,7 +1083,266 @@ cluster_space_recovery_cold_drop_already_v1(const ClusterSpaceIdentityKey *key,
 											const ClusterSpaceRecoveryInput *input,
 											const ClusterSpaceColdSourceV1 *source)
 {
-	return space_cold_relation_run(key, input, source, 1, 0, 0, true);
+	return space_cold_relation_run(key, input, source, 1, 0, 0, true, NULL, NULL, MaxAllocSize,
+								   false, NULL);
+}
+
+static bool
+space_cold_abort_run(const RfSideOnlinePlanV1 *side, uint32 index, uint32 relation, Size budget,
+					 bool result, const SpaceColdAbortDelete *work)
+{
+	RfSideOnlineOperationV1 abort, create;
+	ClusterSpaceRecoveryInput *inputs;
+	ClusterSpaceColdSourceV1 *origins;
+	ClusterSpaceColdSourceV1 terminal;
+	uint32 creation, count = 0;
+	Size bytes;
+	bool ok = false;
+
+	if (!space_cold_phase()
+		|| !rf_side_online_plan_abort_creation_v1(side, index, relation, &creation)
+		|| !rf_side_online_plan_operation_v1(side, index, &abort)
+		|| !rf_side_online_plan_operation_v1(side, creation, &create))
+		return false;
+	/* Count and then borrow every immutable SPACE edge for this locator.
+	 * Do not omit an intervening transition or merge another source/key. */
+	for (uint32 i = creation; i < index; i++) {
+		RfSideOnlineOperationV1 op;
+
+		if (!rf_side_online_plan_operation_v1(side, i, &op))
+			return false;
+		if (op.kind != RF_SIDE_ONLINE_OPERATION_SPACE
+			|| !RelFileLocatorEquals(op.space_key.locator, create.space_key.locator))
+			continue;
+		if (op.identity.participant_index != abort.identity.participant_index
+			|| op.space_key.system_identifier != create.space_key.system_identifier
+			|| op.space_key.database_incarnation != create.space_key.database_incarnation
+			|| memcmp(op.space_key.storage_uuid, create.space_key.storage_uuid, 16) != 0
+			|| op.identity.record.end_rec_ptr > abort.identity.record.read_rec_ptr)
+			return false;
+		count++;
+	}
+	if (count == 0 || count > budget / (sizeof(*inputs) + sizeof(*origins)))
+		return false;
+	bytes = (Size)count * (sizeof(*inputs) + sizeof(*origins));
+	inputs = space_alloc(bytes);
+	if (inputs == NULL)
+		return false;
+	origins = (ClusterSpaceColdSourceV1 *)(inputs + count);
+	terminal = (ClusterSpaceColdSourceV1){ abort.identity.record.origin_thread,
+										   abort.identity.record.end_rec_ptr };
+	PG_TRY();
+	{
+		uint32 n = 0;
+
+		for (uint32 i = creation; i < index; i++) {
+			RfSideOnlineOperationV1 op;
+
+			if (!rf_side_online_plan_operation_v1(side, i, &op))
+				goto done;
+			if (op.kind != RF_SIDE_ONLINE_OPERATION_SPACE
+				|| !RelFileLocatorEquals(op.space_key.locator, create.space_key.locator))
+				continue;
+			inputs[n] = (ClusterSpaceRecoveryInput){ op.owned_payload, op.owned_payload_length };
+			origins[n++] = (ClusterSpaceColdSourceV1){ op.identity.record.origin_thread,
+													   op.identity.record.end_rec_ptr };
+		}
+		if (n != count)
+			goto done;
+		ok = space_cold_relation_run(&create.space_key, inputs, origins, count, count - 1, 0, false,
+									 side, &terminal, budget - bytes, result, work);
+	done:;
+	}
+	PG_FINALLY();
+	{
+		space_free(inputs);
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+bool
+cluster_space_recovery_cold_abort_preflight_v1(const RfSideOnlinePlanV1 *side, uint32 index,
+											   uint32 relation)
+{
+	return space_cold_abort_run(side, index, relation,
+								rf_side_online_plan_scratch_available_v1(side), false, NULL);
+}
+
+bool
+cluster_space_recovery_cold_abort_result_v1(const RfSideOnlinePlanV1 *side, uint32 index,
+											uint32 relation)
+{
+	return space_cold_abort_run(side, index, relation,
+								rf_side_online_plan_scratch_available_v1(side), true, NULL);
+}
+
+static int
+space_cold_abort_compare(const void *a, const void *b)
+{
+	const RelFileLocator *x = &((const SpaceColdAbortTarget *)a)->locator;
+	const RelFileLocator *y = &((const SpaceColdAbortTarget *)b)->locator;
+
+	if (x->spcOid != y->spcOid)
+		return x->spcOid < y->spcOid ? -1 : 1;
+	if (x->dbOid != y->dbOid)
+		return x->dbOid < y->dbOid ? -1 : 1;
+	return x->relNumber < y->relNumber ? -1 : x->relNumber > y->relNumber;
+}
+
+static bool
+space_cold_abort_main(RelFileLocator locator, bool deleted)
+{
+	const ClusterSharedFsOps *ops = cluster_shared_fs_get_active_ops();
+	SMgrRelation rel;
+
+	if (!space_cold_phase() || ops == NULL || ops->id != CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS
+		|| cluster_smgr_which_for(locator, InvalidBackendId) != 1)
+		return false;
+	rel = smgropen(locator, InvalidBackendId);
+	smgrrelease(rel);
+	/* A missing MAIN name cannot reserve this incarnation during replay.
+	 * Native shared unlink must retain it empty and remove every auxiliary. */
+	if (!smgrexists(rel, MAIN_FORKNUM))
+		return false;
+	if (deleted) {
+		if (smgrnblocks(rel, MAIN_FORKNUM) != 0)
+			return false;
+		for (ForkNumber fork = MAIN_FORKNUM + 1; fork <= MAX_FORKNUM; fork++)
+			if (smgrexists(rel, fork))
+				return false;
+	}
+	return true;
+}
+
+static bool
+space_cold_abort_group(ClusterSpaceRecoveryBatchV1 *batch, const SpaceColdAbortDelete *work,
+					   Size budget, bool deleted)
+{
+	for (uint32 i = 0; i < work->count; i++)
+		if (!space_sources_fresh(batch)
+			|| (!deleted
+				&& !space_cold_abort_run(work->side, work->index, work->targets[i].relation, budget,
+										 false, NULL))
+			|| !space_sources_fresh(batch) || !space_cold_abort_main(work->locators[i], deleted)
+			|| !space_sources_fresh(batch))
+			return false;
+	return true;
+}
+
+static bool
+space_cold_abort_delete(ClusterSpaceRecoveryBatchV1 *batch, const SpaceColdAbortDelete *work,
+						Size budget)
+{
+	/* Qualify the entire native list before even syncing its source, then
+	 * repeat after that I/O. Keep the original batch/guards/pin alive through
+	 * native deletion and final durability. No local flush of foreign LSNs. */
+	if (!space_cold_abort_group(batch, work, budget, false) || !space_cold_relation_sync(batch)
+		|| !space_cold_abort_group(batch, work, budget, false))
+		return false;
+	/* Native CLOG/lock obligations must precede unlink, inside this owner.
+	 * Requalify all targets after the callback before touching any file. */
+	if (work->before_delete != NULL
+		&& (!work->before_delete(work->finish_arg, work->side, work->index)
+			|| !space_cold_abort_group(batch, work, budget, false)))
+		return false;
+	DropRelationFiles(work->locators, work->count, true);
+	if (!space_cold_abort_group(batch, work, budget, true))
+		return false;
+	for (uint32 i = 0; i < work->count; i++)
+		if (!space_sources_fresh(batch)
+			|| !cluster_shared_fs_sharedfs_sync_drop_result(work->locators[i])
+			|| !space_sources_fresh(batch))
+			return false;
+	/* An earlier target must still satisfy the result after the last sync.
+	 * Keep this original batch alive through a synchronous continuation;
+	 * neither a callback nor its return value is a persisted deletion proof.
+	 * Missing incarnation proof on a later retry remains BLOCKED. */
+	return space_cold_abort_group(batch, work, budget, true)
+		   && (work->finish == NULL
+			   || (work->finish(work->finish_arg, work->side, work->index)
+				   && space_cold_abort_group(batch, work, budget, true)));
+}
+
+static bool
+space_cold_abort_execute(const RfSideOnlinePlanV1 *side, uint32 index, Size finish_bytes, void *arg,
+						 ClusterSpaceColdAbortFinishV1 before_delete,
+						 ClusterSpaceColdAbortFinishV1 finish)
+{
+	RfSideOnlineOperationV1 abort;
+	SpaceColdAbortDelete work = { .side = side,
+								  .index = index,
+								  .before_delete = before_delete,
+								  .finish = finish,
+								  .finish_arg = arg };
+	Size bytes, native_bytes, budget = rf_side_online_plan_scratch_available_v1(side);
+	uint32 creation, count;
+	bool ok = false;
+
+	/* The continuation runs while the original proof storage is retained.
+	 * Reserve its peak scratch now, never discover that shortage after unlink. */
+	if (finish_bytes > budget)
+		return false;
+	budget -= finish_bytes;
+	if (!space_cold_phase() || !rf_side_online_plan_abort_creation_v1(side, index, 0, &creation)
+		|| !rf_side_online_plan_operation_v1(side, index, &abort)
+		|| (count = abort.xact.relation_count) == 0
+		|| count > budget
+					   / (sizeof(*work.targets) + sizeof(*work.locators) + sizeof(SMgrRelation)
+						  + sizeof(RelFileLocatorBackend)))
+		return false;
+	bytes = (Size)count * (sizeof(*work.targets) + sizeof(*work.locators));
+	/* Reserve the native DropRelationFiles/smgrdounlinkall arrays too. */
+	native_bytes = (Size)count * (sizeof(SMgrRelation) + sizeof(RelFileLocatorBackend));
+	work.targets = space_alloc(bytes);
+	if (work.targets == NULL)
+		return false;
+	work.locators = (RelFileLocator *)(work.targets + count);
+	PG_TRY();
+	{
+		for (uint32 i = 0; i < count; i++) {
+			RfSideOnlineOperationV1 create;
+
+			if (!rf_side_online_plan_abort_creation_v1(side, index, i, &creation)
+				|| !rf_side_online_plan_operation_v1(side, creation, &create))
+				goto done;
+			work.targets[i] = (SpaceColdAbortTarget){ create.space_key.locator, i };
+		}
+		/* Repeated native locators may share proof, never native close/unlink
+		 * handles. Retain an original ordinal for each distinct target. */
+		qsort(work.targets, count, sizeof(*work.targets), space_cold_abort_compare);
+		for (uint32 i = 0; i < count; i++)
+			if (work.count == 0
+				|| !RelFileLocatorEquals(work.targets[i].locator, work.locators[work.count - 1])) {
+				work.targets[work.count] = work.targets[i];
+				work.locators[work.count++] = work.targets[i].locator;
+			}
+		ok = space_cold_abort_run(side, index, work.targets[0].relation,
+								  budget - bytes - native_bytes, false, &work);
+	done:;
+	}
+	PG_FINALLY();
+	{
+		space_free(work.targets);
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+bool
+cluster_space_recovery_cold_abort_delete_v1(const RfSideOnlinePlanV1 *side, uint32 index)
+{
+	return space_cold_abort_execute(side, index, 0, NULL, NULL, NULL);
+}
+
+bool
+cluster_space_recovery_cold_abort_finish_v1(const RfSideOnlinePlanV1 *side, uint32 index,
+											Size finish_bytes, void *arg,
+											ClusterSpaceColdAbortFinishV1 before_delete,
+											ClusterSpaceColdAbortFinishV1 finish)
+{
+	return finish != NULL
+		   && space_cold_abort_execute(side, index, finish_bytes, arg, before_delete, finish);
 }
 
 bool
@@ -885,6 +1355,8 @@ cluster_space_recovery_cold_preflight_v1(const RfSideOnlinePlanV1 *side,
 		fence != NULL ? cluster_recovery_merge_fence_plan_origin_count(fence) : 0, out);
 }
 
+static bool space_native_create_sources_sync(ClusterSpaceRecoveryBatchV1 *batch);
+
 bool
 cluster_space_recovery_apply_through_v1(ClusterSpaceRecoveryBatchV1 *batch, uint32 target,
 										uint32 through)
@@ -893,7 +1365,34 @@ cluster_space_recovery_apply_through_v1(ClusterSpaceRecoveryBatchV1 *batch, uint
 		|| target >= batch->target_count || through >= batch->targets[target].operation_count
 		|| !space_sources_fresh(batch))
 		return false;
-	return space_target_run(batch, target, true, through);
+	return space_native_create_sources_sync(batch)
+		   && space_target_run(batch, target, true, through);
+}
+
+static bool
+space_native_create_sources_sync(ClusterSpaceRecoveryBatchV1 *batch)
+{
+	for (uint32 i = 0; batch->side != NULL && i < batch->operation_count; i++) {
+		RfSideOnlineOperationV1 op;
+		bool found = false;
+		if (!rf_side_online_plan_operation_v1(batch->side, i, &op))
+			return false;
+		if (op.history_only || op.kind != RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE)
+			continue;
+		if (batch->cold_fence == NULL || !space_sources_fresh(batch))
+			return false;
+		for (uint32 j = 0; j < batch->source_count; j++) {
+			const ClusterThreadRecoveryAuthorityV1 *a = &batch->sources[j];
+			if (a->duty->origin_thread_id != op.identity.record.origin_thread)
+				continue;
+			if (!space_source_sync(batch, j))
+				return false;
+			found = true;
+		}
+		if (!found)
+			return false;
+	}
+	return true;
 }
 
 bool
@@ -901,6 +1400,8 @@ cluster_space_recovery_apply_v1(ClusterSpaceRecoveryBatchV1 *batch)
 {
 	if (batch == NULL || !batch->preflight_complete || batch->installed
 		|| !space_sources_fresh(batch))
+		return false;
+	if (!space_native_create_sources_sync(batch))
 		return false;
 	for (uint32 i = 0; i < batch->target_count; i++)
 		if (!space_target_run(batch, i, true, UINT32_MAX))
@@ -1007,7 +1508,10 @@ cluster_space_recovery_preflight_operation_v1(void *arg, const RfSideOnlineOpera
 	const ClusterSpaceRecoveryBatchV1 *batch = arg;
 
 	if (batch == NULL || !batch->preflight_complete || operation == NULL || operation->history_only
-		|| operation->kind != RF_SIDE_ONLINE_OPERATION_SPACE || !space_sources_fresh(batch))
+		|| (operation->kind != RF_SIDE_ONLINE_OPERATION_SPACE
+			&& (operation->kind != RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE
+				|| batch->cold_fence == NULL))
+		|| !space_sources_fresh(batch))
 		return false;
 	for (uint32 i = 0; i < batch->operation_count; i++) {
 		RfSideOnlineOperationV1 expected;
@@ -1015,7 +1519,13 @@ cluster_space_recovery_preflight_operation_v1(void *arg, const RfSideOnlineOpera
 		if (!rf_side_online_plan_operation_v1(batch->side, i, &expected))
 			return false;
 		if (memcmp(&operation->identity, &expected.identity, sizeof(expected.identity)) == 0)
-			return !expected.history_only && expected.kind == RF_SIDE_ONLINE_OPERATION_SPACE
+			return !expected.history_only && expected.kind == operation->kind
+				   && expected.purpose == RF_SIDE_PLAN_RECOVERY
+				   && operation->purpose == expected.purpose
+				   && (operation->kind != RF_SIDE_ONLINE_OPERATION_NATIVE_STRUCTURE
+					   || (operation->source_xid == expected.source_xid
+						   && memcmp(&operation->route, &expected.route, sizeof(expected.route))
+								  == 0))
 				   && operation->owned_payload_length == expected.owned_payload_length
 				   && operation->owned_payload != NULL && expected.owned_payload != NULL
 				   && memcmp(operation->owned_payload, expected.owned_payload,
