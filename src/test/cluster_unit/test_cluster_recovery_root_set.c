@@ -7,7 +7,10 @@ int namespace_fixture_main(void);
 #undef main
 #include "utils/resowner.h"
 #define pread namespace_test_pread
-#include "../../backend/cluster/cluster_recovery_root_set.c"
+#ifndef RECOVERY_ROOT_SET_PRODUCT_SOURCE
+#define RECOVERY_ROOT_SET_PRODUCT_SOURCE "../../backend/cluster/cluster_recovery_root_set.c"
+#endif
+#include RECOVERY_ROOT_SET_PRODUCT_SOURCE
 #undef pread
 
 #include "test_cluster_recovery_crypto_boundary.h"
@@ -887,10 +890,12 @@ UT_TEST(test_observed_relation_lookup_collision_exhaustion_is_not_missing)
 	remove_root(fd);
 }
 
+#include "test_cluster_recovery_root_reobserve.inc"
+
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(30);
 	UT_RUN(test_unreferenced_physical_files_and_missing_wal_targets_are_preserved);
 	UT_RUN(test_native_slru_root_counts_are_exposed_only_after_observation);
 	UT_RUN(test_all_file_bytes_are_read_twice_in_bounded_chunks);
@@ -915,6 +920,12 @@ main(void)
 	UT_RUN(test_observed_relation_lookup_preserves_missing_and_wal_only_candidates);
 	UT_RUN(test_observed_relation_lookup_refuses_namespace_and_unsupported_addresses);
 	UT_RUN(test_observed_relation_lookup_collision_exhaustion_is_not_missing);
+	UT_RUN(test_reobserve_uses_original_fd_and_new_complete_physical_bytes);
+	UT_RUN(test_reobserve_keeps_missing_and_beyond_eof_typed_wal_requirements);
+	UT_RUN(test_reobserve_refuses_old_path_removal_type_change_io_and_late_drift);
+	UT_RUN(test_reobserve_requires_explicit_invalidation_of_complete_observation);
+	UT_RUN(test_reobserve_output_aliases_leave_old_storage_unchanged);
+	UT_RUN(test_reobserve_capacity_closed_and_reused_fd_preserve_old_set);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

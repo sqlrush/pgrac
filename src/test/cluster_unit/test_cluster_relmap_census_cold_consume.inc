@@ -242,3 +242,66 @@ UT_TEST(test_census_cold_consumer_cannot_reuse_old_observations_or_infer_empty_c
 		census_cold_consume_cleanup(&f);
 	}
 }
+
+/* Controlled native leaf changes real pair bytes. This is not native
+ * durability/terminal qualification; the physical reader itself is real. */
+static void
+census_cold_clear_pair_bytes(void)
+{
+	census_pair(census_native_fixture->fd, census_native_identity.dbid, 0, false, false, false);
+}
+
+UT_TEST(test_census_cold_consumer_then_fresh_original_root_keeps_all_debt)
+{
+	for (unsigned shared = 0; shared < 2; shared++) {
+		CensusFixture f;
+		ClusterRecoveryRootSet *fresh = NULL;
+		ClusterRelmapRetentionDirectory saved[2];
+		Oid dbid = shared ? InvalidOid : 5;
+		uint8 before[32], after[32];
+		size_t bytes[2] = { 0 };
+		census_cold_reset();
+		if (census_native_begin(&f, dbid, 2, true)) {
+			memcpy(saved, f.origin, sizeof(saved));
+			UT_ASSERT(cluster_recovery_root_set_digest(f.roots, before));
+			census_batch_consuming = true;
+			census_native_after_arbitration = census_cold_clear_pair_bytes;
+			UT_ASSERT_EQ(cluster_relmap_retention_census_recovery_arbitrate_cold(f.census, dbid),
+						 CLUSTER_RELMAP_V2_CLEARED_POSTREAD);
+			census_refused(&f);
+			UT_ASSERT_EQ(cluster_recovery_root_set_reobserve_begin(f.roots, 1024 * 1024, &fresh),
+						 CLUSTER_RECOVERY_ROOTS_MORE);
+			if (fresh != NULL) {
+				unsigned copies = 0;
+				uint8 expected[CLUSTER_RELMAP_V2_FILE_SIZE], actual[CLUSTER_RELMAP_V2_FILE_SIZE];
+				const char *primary
+					= shared ? "global/pgrac_relmap_authority" : "base/5/pgrac_relmap_authority";
+				UT_ASSERT_EQ(finish_roots(fresh, bytes), CLUSTER_RECOVERY_ROOTS_OBSERVED);
+				UT_ASSERT(bytes[0] == bytes[1] && bytes[0] >= 4 * sizeof(expected));
+				UT_ASSERT(cluster_recovery_root_set_digest(fresh, after));
+				UT_ASSERT(memcmp(before, after, 32) != 0);
+				census_wire(expected, dbid, 0, false, false);
+				for (uint32 i = 0; i < cluster_recovery_root_set_count(fresh); i++) {
+					const ClusterRecoveryRootEntry *entry
+						= cluster_recovery_root_set_entry(fresh, i);
+					if (entry != NULL
+						&& (strcmp(entry->file.path, primary) == 0
+							|| (strncmp(entry->file.path, primary, strlen(primary)) == 0
+								&& strcmp(entry->file.path + strlen(primary), ".bak") == 0))) {
+						UT_ASSERT_EQ(
+							cluster_recovery_root_set_read(fresh, i, 0, actual, sizeof(actual)),
+							CLUSTER_RECOVERY_ROOTS_BYTES);
+						UT_ASSERT_EQ(memcmp(expected, actual, sizeof(expected)), 0);
+						copies++;
+					}
+				}
+				UT_ASSERT_EQ(copies, 2);
+			}
+			census_batch_pins_same(&f, saved);
+			census_refused(&f);
+			UT_ASSERT(census_native_scope_current && census_cold_selected.scope_serial == 73);
+		}
+		cluster_recovery_root_set_destroy(fresh);
+		census_cold_consume_cleanup(&f);
+	}
+}
