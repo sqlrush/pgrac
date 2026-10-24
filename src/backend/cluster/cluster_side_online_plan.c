@@ -1462,6 +1462,42 @@ rf_side_online_plan_recovery_claim_matches_v1(const RfSideOnlinePlanV1 *plan,
 	return side_recovery_claim_matches(plan, source, true);
 }
 
+uint32
+rf_side_online_plan_native_terminal_count_v1(const RfSideOnlinePlanV1 *plan,
+											 const ClusterWalSourceRef *source)
+{
+	uint32 count = 0;
+
+	if (!rf_side_online_plan_recovery_claim_matches_v1(plan, source))
+		return UINT32_MAX;
+	for (const SideNativeTerminalWitness *witness = plan->native_terminals; witness != NULL;
+		 witness = witness->next) {
+		const RfSideOnlineOperationV1 *operation;
+		const RfContributorStreamCutV1 *cut;
+
+		if (witness->operation_index >= plan->operation_count)
+			return UINT32_MAX;
+		operation = &plan->operations[witness->operation_index];
+		if (operation->identity.participant_index >= plan->participant_count)
+			return UINT32_MAX;
+		cut = &plan->physical_cuts[operation->identity.participant_index];
+		if (cut->failed_thread != source->claim.identity.origin_thread_id
+			|| cut->origin_owner_incarnation != source->claim.identity.origin_owner_incarnation
+			|| cut->timeline_id != source->timeline)
+			continue;
+		if (operation->kind != RF_SIDE_ONLINE_OPERATION_XACT
+			|| operation->purpose != RF_SIDE_PLAN_RECOVERY
+			|| !TransactionIdIsNormal(operation->source_xid)
+			|| TransactionIdIsValid(operation->source_top_xid)
+			|| operation->identity.record.read_rec_ptr < cut->scan_begin_inclusive
+			|| operation->identity.record.end_rec_ptr > cut->scan_end_exclusive
+			|| count == UINT32_MAX - 1)
+			return UINT32_MAX;
+		count++;
+	}
+	return count;
+}
+
 /* Exact original decoded carrier correspondence only. The caller retains
  * reader CRC/source/cut pins and native FullXid/base/era responsibility. */
 bool

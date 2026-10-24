@@ -26,6 +26,7 @@ struct ClusterRelmapTerminalScanV1 {
 	bool checkpoint_seen, terminal_seen, failed, prefix_only, native_base_retained;
 	bool pending_required, pending_seen;
 	uint64 pending_scope_serial;
+	uint32 native_terminals, expected_native_terminals;
 	ClusterRelmapV2Image pending;
 };
 
@@ -87,19 +88,22 @@ terminal_scan_xact(ClusterRelmapTerminalScanV1 *scan, XLogReaderState *reader)
 			if (child == target)
 				return false;
 		}
-		return true;
-	}
-	if (scan->terminal_seen
-		|| (scan->prefix_only
-				? (scan->checkpoint_seen || reader->ReadRecPtr < scan->selected.native_redo
-				   || reader->EndRecPtr > scan->selected.checkpoint_start)
-				: !scan->checkpoint_seen))
+	} else if (scan->terminal_seen
+			   || (scan->prefix_only
+					   ? (scan->checkpoint_seen || reader->ReadRecPtr < scan->selected.native_redo
+						  || reader->EndRecPtr > scan->selected.checkpoint_start)
+					   : !scan->checkpoint_seen))
 		return false;
 	if (scan->pending_required
-		&& !cluster_undo_recovery_cold_terminal_matches_v1(
-			&scan->selected.source, &scan->selected.checkpoint, scan->selected.native_redo,
-			scan->pending_scope_serial, reader))
+		&& (scan->native_terminals == UINT32_MAX - 1
+			|| !cluster_undo_recovery_cold_terminal_matches_v1(
+				&scan->selected.source, &scan->selected.checkpoint, scan->selected.native_redo,
+				scan->pending_scope_serial, reader)))
 		return false;
+	if (scan->pending_required)
+		scan->native_terminals++;
+	if (xid != target)
+		return true;
 	scan->terminal_seen = true;
 	scan->observation.status = commit ? TRANSACTION_STATUS_COMMITTED : TRANSACTION_STATUS_ABORTED;
 	scan->observation.terminal_start = reader->ReadRecPtr;
@@ -279,7 +283,14 @@ terminal_scan(ClusterWalInputsV1 *inputs, uint32 index, FullTransactionId reques
 	{
 		ClusterWalTailObservation observed = { 0 };
 		scan->hash = pg_cryptohash_create(PG_SHA256);
-		if (scan->hash != NULL && pg_cryptohash_init(scan->hash) == 0
+		if (scan->hash != NULL
+			&& (!scan->pending_required
+				|| ((scan->expected_native_terminals = cluster_undo_recovery_cold_terminal_count_v1(
+						 &scan->selected.source, &scan->selected.checkpoint,
+						 scan->selected.native_redo, scan->pending_scope_serial))
+						!= UINT32_MAX
+					&& scan->expected_native_terminals != 0))
+			&& pg_cryptohash_init(scan->hash) == 0
 			&& pg_cryptohash_update(scan->hash, domain, domain_bytes) == 0
 			&& pg_cryptohash_update(scan->hash, input->native_window, 160) == 0
 			&& pg_cryptohash_update(scan->hash, input->source.claim.identity.storage_uuid, 16) == 0
@@ -290,7 +301,12 @@ terminal_scan(ClusterWalInputsV1 *inputs, uint32 index, FullTransactionId reques
 				   == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			&& scan->checkpoint_seen && scan->terminal_seen
 			&& (!scan->pending_required
-				|| (scan->pending_seen && scan->native_base_retained
+				|| (scan->native_terminals == scan->expected_native_terminals
+					&& cluster_undo_recovery_cold_terminal_count_v1(
+						   &scan->selected.source, &scan->selected.checkpoint,
+						   scan->selected.native_redo, scan->pending_scope_serial)
+						   == scan->expected_native_terminals
+					&& scan->pending_seen && scan->native_base_retained
 					&& scan->pending.pending_owner.wal_end <= scan->observation.terminal_start
 					&& scan->pending.pending_owner.membership_epoch
 						   == scan->observation.window.epoch

@@ -407,6 +407,29 @@ cluster_undo_recovery_cold_terminal_matches_v1(const ClusterWalSourceRef *source
 				  == scope_serial;
 }
 
+uint32
+cluster_undo_recovery_cold_terminal_count_v1(const ClusterWalSourceRef *source,
+											 const ClusterControlRootSnapshot *checkpoint,
+											 XLogRecPtr native_redo, uint64 scope_serial)
+{
+	const ClusterUndoRecoveryScopeV1 *scope = active_scope;
+	uint32 count;
+
+	if (scope_serial == 0
+		|| cluster_undo_recovery_cold_scope_id_v1(source, checkpoint, native_redo) != scope_serial
+		|| active_scope != scope
+		|| !rf_side_online_plan_replay_start_matches_v1(
+			scope->plan, source->claim.identity.origin_thread_id,
+			source->claim.identity.origin_owner_incarnation, source->claim.database_incarnation,
+			native_redo))
+		return UINT32_MAX;
+	count = rf_side_online_plan_native_terminal_count_v1(scope->plan, source);
+	if (active_scope != scope || undo_scope_serial != scope_serial
+		|| cluster_undo_recovery_cold_scope_id_v1(source, checkpoint, native_redo) != scope_serial)
+		return UINT32_MAX;
+	return count;
+}
+
 bool
 cluster_undo_recovery_abort_clog_authorized_v1(int origin_node, TransactionId xid)
 {

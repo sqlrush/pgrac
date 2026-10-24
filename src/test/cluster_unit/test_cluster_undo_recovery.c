@@ -75,6 +75,16 @@ rf_side_online_plan_replay_start_matches_v1(const RfSideOnlinePlanV1 *p, uint32 
 		   && incarnation == duty.origin_owner_incarnation && db == 4 && redo == 120;
 }
 
+uint32
+rf_side_online_plan_native_terminal_count_v1(const RfSideOnlinePlanV1 *p,
+											 const ClusterWalSourceRef *source)
+{
+	return terminal_enabled && terminal_plan_ok && p == plan
+				   && memcmp(source, &cold_source, sizeof(*source)) == 0
+			   ? 1
+			   : UINT32_MAX;
+}
+
 bool
 rf_side_online_plan_terminal_matches_v1(const RfSideOnlinePlanV1 *p,
 										const ClusterWalSourceRef *source,
@@ -674,9 +684,13 @@ UT_TEST(test_cold_terminal_match_uses_only_original_round_and_plan)
 			UT_ASSERT_EQ(terminal_plan_calls, 1);
 		if (fault == 1 || fault >= 4)
 			UT_ASSERT_EQ(terminal_plan_calls, 0);
+		UT_ASSERT_EQ(cluster_undo_recovery_cold_terminal_count_v1(&query, &root, 120, round),
+					 fault == 0 || fault == 8 ? 1 : UINT32_MAX);
 		cluster_undo_recovery_scope_leave_v1(&scope);
 		UT_ASSERT(!cluster_undo_recovery_cold_terminal_matches_v1(&query, &root, 120, round,
 																  &terminal_reader));
+		UT_ASSERT_EQ(cluster_undo_recovery_cold_terminal_count_v1(&query, &root, 120, round),
+					 UINT32_MAX);
 		terminal_enabled = false;
 	}
 }

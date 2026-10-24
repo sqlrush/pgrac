@@ -12469,11 +12469,13 @@ UT_TEST(test_native_terminal_witness_owns_exact_original_header_and_payload)
 		original = fake;
 		original.reader.record = &original.u.decoded;
 		original.u.decoded.main_data = (char *)original.data;
+		UT_ASSERT_EQ(rf_side_online_plan_native_terminal_count_v1(plan, &source), UINT32_MAX);
 		UT_ASSERT(!rf_side_online_plan_terminal_matches_v1(plan, &source, &original.reader));
 		/* Borrowed decoder bytes are reused before sealing. */
 		memset(fake.data, 0xa5, sizeof(fake.data));
 		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
 		UT_ASSERT(rf_side_online_plan_terminal_matches_v1(plan, &source, &original.reader));
+		UT_ASSERT_EQ(rf_side_online_plan_native_terminal_count_v1(plan, &source), 1);
 		UT_ASSERT(rf_side_online_plan_operation_v1(plan, aborting ? 1 : 0, &operation));
 		UT_ASSERT_EQ(operation.owned_payload_length, 0);
 		UT_ASSERT(operation.owned_payload == NULL);
@@ -12539,6 +12541,8 @@ UT_TEST(test_native_terminal_witness_owns_exact_original_header_and_payload)
 				break;
 			}
 			UT_ASSERT(!rf_side_online_plan_terminal_matches_v1(plan, &other, &query.reader));
+			UT_ASSERT_EQ(rf_side_online_plan_native_terminal_count_v1(plan, &other),
+						 fault == 10 || fault == 11 ? UINT32_MAX : 1);
 		}
 		UT_ASSERT(rf_side_online_plan_terminal_matches_v1(plan, &source, &original.reader));
 		rf_side_online_plan_destroy_v1(&plan);

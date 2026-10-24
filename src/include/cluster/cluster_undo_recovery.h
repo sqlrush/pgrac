@@ -58,6 +58,12 @@ struct XLogReaderState;
 extern bool cluster_undo_recovery_cold_terminal_matches_v1(
 	const ClusterWalSourceRef *source, const ClusterControlRootSnapshot *checkpoint,
 	XLogRecPtr native_redo, uint64 scope_serial, const struct XLogReaderState *reader);
+/* Same original scope/source/redo/round; unavailable is UINT32_MAX, never an
+ * empty completed source. Counts only that scope's own sealed native plan. */
+extern uint32
+cluster_undo_recovery_cold_terminal_count_v1(const ClusterWalSourceRef *source,
+											 const ClusterControlRootSnapshot *checkpoint,
+											 XLogRecPtr native_redo, uint64 scope_serial);
 /* Only the already-durable exact C0 target's top-level native ABORT bit.
  * This does not authorize an origin scope or other native operations. */
 extern bool cluster_undo_recovery_abort_clog_authorized_v1(int origin_node, TransactionId xid);

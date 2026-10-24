@@ -2120,6 +2120,8 @@ static bool custody_shared;
 static uint64 custody_scope = 1;
 static unsigned custody_scope_reads, custody_scope_error_after;
 static unsigned custody_terminal_calls, custody_terminal_fault;
+static unsigned custody_inventory_fault, custody_inventory_calls, custody_inventory_expected = 1;
+static bool custody_extra_terminal;
 static void
 custody_image_init(const ClusterControlRootSnapshot *snapshot, uint64 dbinc)
 {
@@ -2162,7 +2164,7 @@ terminal_prefix_fixture(bool aborting, unsigned fault)
 	snapshot = &root.records[0];
 	lower = snapshot->checkpoint_lower_lsn;
 	at = lower + MAXALIGN(SizeOfXLogRecord + 2 + sizeof(timestamp));
-	if (fault == 29)
+	if (fault == 29 || fault == 30)
 		at += MAXALIGN(SizeOfXLogRecord + 5 + MinSizeOfRelmapUpdate + sizeof(RelMapFile));
 	if (fault == 4 || fault == 5 || fault == 6)
 		at += MAXALIGN(SizeOfXLogRecord + 2 + sizeof(timestamp));
@@ -2188,7 +2190,7 @@ terminal_prefix_fixture(bool aborting, unsigned fault)
 	source.claim.max_config_generation = root.header.v2.config_generation;
 	memcpy(source.claim.claim_sha256, root.refs[0].claim_sha256, 32);
 	source.timeline = snapshot->tail_tli;
-	if (fault == 29) {
+	if (fault == 29 || fault == 30) {
 		uint8 payload[MinSizeOfRelmapUpdate + sizeof(RelMapFile)];
 		xl_relmap_update update = { 0 };
 		WalTestRecord pending;
@@ -2235,6 +2237,9 @@ terminal_prefix_fixture(bool aborting, unsigned fault)
 									  sizeof(a->checkpoint_copy));
 	UT_ASSERT_EQ(checkpoint.exclusive_end, prefix_test_checkpoint_end);
 	tail = checkpoint;
+	if (fault == 30)
+		tail = terminal_test_record(&source, tail.exclusive_end, tail.record_start, RM_XACT_ID,
+									XLOG_XACT_COMMIT, 98, &timestamp, sizeof(timestamp));
 	if (fault == 2)
 		tail = terminal_test_record(&source, tail.exclusive_end, tail.record_start, RM_XACT_ID,
 									XLOG_XACT_COMMIT, 99, &timestamp, sizeof(timestamp));
@@ -2354,22 +2359,50 @@ cluster_undo_recovery_cold_scope_id_v1(const ClusterWalSourceRef *source,
 			   : 0;
 }
 
+uint32
+cluster_undo_recovery_cold_terminal_count_v1(const ClusterWalSourceRef *source,
+											 const ClusterControlRootSnapshot *checkpoint,
+											 XLogRecPtr redo, uint64 serial)
+{
+	custody_inventory_calls++;
+	if (custody_inventory_fault == 8)
+		ereport(ERROR, (errmsg("injected original inventory ERROR")));
+	if (serial != custody_scope || serial == 0
+		|| memcmp(source, &prefix_base_expected.source, sizeof(*source)) != 0
+		|| memcmp(checkpoint, &prefix_base_expected.checkpoint, sizeof(*checkpoint)) != 0
+		|| redo != prefix_base_expected.native_redo || custody_inventory_fault == 1)
+		return UINT32_MAX;
+	if (custody_inventory_fault == 2)
+		return 0;
+	if (custody_inventory_fault == 3
+		|| (custody_inventory_fault == 5 && custody_inventory_calls > 1))
+		return custody_inventory_expected + 1;
+	if (custody_inventory_fault == 4)
+		return custody_inventory_expected - 1;
+	return custody_inventory_expected;
+}
+
 bool
 cluster_undo_recovery_cold_terminal_matches_v1(const ClusterWalSourceRef *source,
 											   const ClusterControlRootSnapshot *checkpoint,
 											   XLogRecPtr redo, uint64 serial,
 											   const XLogReaderState *reader)
 {
+	TransactionId xid = reader != NULL ? XLogRecGetXid(reader) : 0;
 	custody_terminal_calls++;
-	if (custody_terminal_fault == 2)
+	if (custody_terminal_fault == 2 || (custody_inventory_fault == 7 && xid == 98))
 		ereport(ERROR, (errmsg("injected original terminal source ERROR")));
-	return custody_terminal_fault == 0 && serial == custody_scope && serial != 0
+	return custody_terminal_fault == 0 && !(custody_inventory_fault == 6 && xid == 98)
+		   && serial == custody_scope && serial != 0
 		   && memcmp(source, &prefix_base_expected.source, sizeof(*source)) == 0
 		   && memcmp(checkpoint, &prefix_base_expected.checkpoint, sizeof(*checkpoint)) == 0
 		   && redo == prefix_base_expected.native_redo && reader != NULL
 		   && reader->ReadRecPtr >= redo
-		   && reader->EndRecPtr <= prefix_base_expected.checkpoint_start
-		   && XLogRecGetRmid(reader) == RM_XACT_ID && XLogRecGetXid(reader) == 99;
+		   && reader->EndRecPtr
+				  <= (xid == 99 ? prefix_base_expected.checkpoint_start
+								: prefix_base_expected.checkpoint.validated_tail_lsn_exclusive)
+		   && XLogRecGetRmid(reader) == RM_XACT_ID
+		   && (xid == 99 || (custody_extra_terminal && xid == 98));
 }
 
 bool
@@ -2840,7 +2873,9 @@ custody_setup(bool shared, bool aborted)
 	custody_scope = 7;
 	custody_scope_reads = custody_scope_error_after = 0;
 	custody_terminal_calls = custody_terminal_fault = 0;
-	inputs = terminal_prefix_fixture(aborted, 29);
+	custody_inventory_calls = custody_inventory_fault = 0;
+	custody_inventory_expected = custody_extra_terminal ? 2 : 1;
+	inputs = terminal_prefix_fixture(aborted, custody_extra_terminal ? 30 : 29);
 	prefix_base_expected = *cluster_wal_inputs_at_v1(inputs, 0);
 	prefix_base_fault = prefix_base_scope_checks = prefix_base_reads = 0;
 	prefix_base_status = aborted ? TRANSACTION_STATUS_ABORTED : TRANSACTION_STATUS_COMMITTED;
@@ -2852,6 +2887,7 @@ custody_done(ClusterWalInputsV1 **inputs)
 {
 	cold_census_done(inputs);
 	cluster_node_id = custody_saved_node;
+	custody_extra_terminal = false;
 }
 UT_TEST(test_recovery_custody_binds_both_namespaces_and_pair_cuts)
 {
@@ -3121,6 +3157,41 @@ UT_TEST(test_recovery_custody_base_drift_and_io_error_are_sticky)
 		}
 }
 
+UT_TEST(test_recovery_custody_requires_complete_original_native_terminal_set)
+{
+	for (unsigned shared = 0; shared < 2; shared++)
+		for (unsigned fault = 0; fault < 9; fault++) {
+			ClusterWalInputsV1 *inputs;
+			ClusterRelmapRecoveryHandle *handle = NULL;
+			ClusterRelmapV2View view;
+			volatile bool threw = false;
+			custody_extra_terminal = true;
+			inputs = custody_setup(shared, fault % 2);
+			view = custody_view(false);
+			custody_inventory_fault = fault;
+			test_capture_error_level = fault == 7 || fault == 8;
+			PG_TRY();
+			{
+				UT_ASSERT_EQ(cluster_relmap_recovery_prepare_v1(inputs, &custody_image.identity,
+																&view, &handle),
+							 fault == 0);
+			}
+			PG_CATCH();
+			{
+				threw = true;
+			}
+			PG_END_TRY();
+			test_capture_error_level = false;
+			UT_ASSERT_EQ(threw, fault == 7 || fault == 8);
+			UT_ASSERT_EQ(handle != NULL, fault == 0);
+			UT_ASSERT_EQ(custody_terminal_calls, fault == 1 || fault == 2 || fault == 8 ? 0 : 2);
+			UT_ASSERT_EQ(prefix_base_reads, fault == 0 ? 1 : 0);
+			UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock);
+			cluster_relmap_recovery_handle_release_v1(&handle);
+			custody_done(&inputs);
+		}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -3128,7 +3199,8 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(55);
+	UT_PLAN(56);
+	UT_RUN(test_recovery_custody_requires_complete_original_native_terminal_set);
 	UT_RUN(test_recovery_custody_base_drift_and_io_error_are_sticky);
 	UT_RUN(test_recovery_custody_reads_original_native_base_before_publication);
 	UT_RUN(test_recovery_custody_requires_original_sealed_terminal_source);

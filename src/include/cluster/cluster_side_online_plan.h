@@ -188,6 +188,10 @@ extern bool rf_side_online_plan_recovery_bound_claim_matches_v1(const RfSideOnli
 extern bool rf_side_online_plan_terminal_matches_v1(const RfSideOnlinePlanV1 *plan,
 													const ClusterWalSourceRef *source,
 													const XLogReaderState *reader);
+/* Exact source-bound native terminal inventory; UINT32_MAX on unavailable
+ * original sealed RECOVERY plan/source. Structural count only, no completion. */
+extern uint32 rf_side_online_plan_native_terminal_count_v1(const RfSideOnlinePlanV1 *plan,
+														   const ClusterWalSourceRef *source);
 /* UINT32_MAX for an invalid or unsealed plan. */
 extern uint32 rf_side_online_plan_participant_count_v1(const RfSideOnlinePlanV1 *plan);
 /* The physical lower alone must not authorize replay of retained history. */
