@@ -48,6 +48,7 @@ typedef enum ClusterHeapFreezePageMatchV1 {
 #define CLUSTER_HEAP_FREEZE_NO_CARRIER_REQUEST UINT8_MAX
 #define CLUSTER_HEAP_FREEZE_NO_DATA_GROUP UINT8_MAX
 #define CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET UINT8_MAX
+#define CLUSTER_HEAP_FREEZE_NO_ABORTED_XMAX_TARGET UINT8_MAX
 
 /*
  * A request about one physical carrier, not a creator or terminal proof.
@@ -96,6 +97,8 @@ typedef struct ClusterHeapFreezeTupleInputV1
 	uint8 carrier_request_index;
 	/* Physical association only; never a row-freeze certificate. */
 	uint8 creation_target_proof_index;
+	/* Exact aborted modifier association only, never rollback completion. */
+	uint8 aborted_xmax_target_proof_index;
 	/* Optional exact origin observation; Invalid means not qualified.
 	 * This association alone grants no F/H, current ownership or freeze. */
 	FullTransactionId original_creator_full_xid;
@@ -288,6 +291,16 @@ cluster_heap_freeze_validate_carrier_cleanout_v1(
  * exact original FullXid follows only that matching row; its absence stays
  * unqualified. No F/H eligibility, final apply ownership or retention is implied. */
 extern uint16 cluster_heap_freeze_bind_creation_targets_v1(
+	ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *current_fence);
+
+/* Reset prior aborted-modifier associations and bind only a complete exact
+ * canonical ABORTED proof to its ordinary UPDATE/DELETE old physical row.
+ * The target and canonical terminal state do NOT prove rollback completion;
+ * no xmax clear, native plan, F/H, retention or apply authority is granted.
+ * Creator associations are independent and remain untouched. */
+extern uint16 cluster_heap_freeze_bind_aborted_xmax_targets_v1(
 	ClusterHeapFreezePageBatchV1 *page,
 	const ClusterHeapFreezeProofBatchV1 *proofs,
 	const ClusterHeapFreezeFinalFenceV1 *current_fence);

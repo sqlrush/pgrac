@@ -635,6 +635,7 @@ UT_TEST(prepare_preserves_raw_headers_and_owns_physical_rows)
 		UT_ASSERT_EQ(row->infomask, tuple->t_infomask);
 		UT_ASSERT_EQ(row->infomask2, tuple->t_infomask2);
 		UT_ASSERT_EQ(row->header_length, tuple->t_hoff);
+		UT_ASSERT_EQ(row->aborted_xmax_target_proof_index, CLUSTER_HEAP_FREEZE_NO_ABORTED_XMAX_TARGET);
 		UT_ASSERT_EQ(memcmp(&row->ctid, &tuple->t_ctid, sizeof(row->ctid)), 0);
 		UT_ASSERT_EQ(row->itl_slot_index, i);
 		UT_ASSERT(row->has_carrier);
@@ -3047,10 +3048,188 @@ UT_TEST(xmin_batch_plan_single_target_preserves_original_plan)
 	UT_ASSERT_EQ(horizon, 77);
 }
 
+
+static void
+init_aborted_xmax_binding_fixture(ClusterHeapFreezePageBatchV1 *page,
+	ClusterHeapFreezeProofBatchV1 *proofs, ClusterHeapFreezeFinalFenceV1 *fence)
+{
+	init_creation_binding_fixture(page, proofs, fence);
+	proofs->proofs[0].resolution.outcome = CLUSTER_TX_ABORTED;
+	proofs->proofs[0].resolution.commit_scn = 0;
+	proofs->proofs[0].resolution.local_aborted_xmax_target =
+		(ClusterTxModificationTarget){.locator = page->identity.key.locator,
+			.fork = MAIN_FORKNUM, .block = page->block, .offset = 1,
+			.tuple_length = 60, .valid = true};
+	for (uint16 i = 0; i < page->tuple_count; i++) {
+		page->tuples[i].raw_xmin = FrozenTransactionId;
+		page->tuples[i].infomask = HEAP_XMIN_FROZEN;
+		page->tuples[i].raw_xmax = 77;
+		page->tuples[i].aborted_xmax_target_proof_index = 3;
+		page->tuples[i].original_creator_full_xid = FullTransactionIdFromEpochAndXid(1, 55);
+	}
+}
+
+UT_TEST(aborted_xmax_binding_names_old_physical_row_without_changing_headers)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+	ClusterHeapFreezeTupleInputV1 expected[2];
+
+	init_aborted_xmax_binding_fixture(&page, &proofs, &fence);
+	memcpy(expected, page.tuples, sizeof(expected));
+	expected[0].aborted_xmax_target_proof_index = 0;
+	expected[1].aborted_xmax_target_proof_index = CLUSTER_HEAP_FREEZE_NO_ABORTED_XMAX_TARGET;
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_aborted_xmax_targets_v1(&page, &proofs, &fence), 1);
+	UT_ASSERT_EQ(memcmp(expected, page.tuples, sizeof(expected)), 0);
+	/* Same raw xmax and carrier cannot substitute a different physical row. */
+	proofs.proofs[0].resolution.local_aborted_xmax_target.offset = 2;
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_aborted_xmax_targets_v1(&page, &proofs, &fence), 1);
+	UT_ASSERT_EQ(page.tuples[0].aborted_xmax_target_proof_index, CLUSTER_HEAP_FREEZE_NO_ABORTED_XMAX_TARGET);
+	UT_ASSERT_EQ(page.tuples[1].aborted_xmax_target_proof_index, 0);
+}
+
+UT_TEST(aborted_xmax_binding_rejects_wrong_target_and_nonmodifier_states)
+{
+	for (int variant = 0; variant < 25; variant++) {
+		ClusterHeapFreezePageBatchV1 page;
+		ClusterHeapFreezeProofBatchV1 proofs;
+		ClusterHeapFreezeFinalFenceV1 fence;
+		ClusterTxModificationTarget *target;
+		ClusterHeapFreezeTupleInputV1 *row;
+
+		init_aborted_xmax_binding_fixture(&page, &proofs, &fence);
+		target = &proofs.proofs[0].resolution.local_aborted_xmax_target;
+		row = &page.tuples[0];
+		switch (variant) {
+		case 0: target->locator.spcOid++; break;
+		case 1: target->locator.dbOid++; break;
+		case 2: target->locator.relNumber++; break;
+		case 3: target->fork = FSM_FORKNUM; break;
+		case 4: target->block++; break;
+		case 5: target->offset = 3; break;
+		case 6: target->tuple_length = 0; break;
+		case 7: target->tuple_length--; break;
+		case 8: target->valid = false; break;
+		case 9: row->raw_xmax++; break;
+		case 10: row->infomask |= HEAP_XMAX_IS_MULTI; break;
+		case 11: row->infomask |= HEAP_XMAX_INVALID; break;
+		case 12: row->infomask |= HEAP_XMAX_COMMITTED; break;
+		case 13: row->infomask |= HEAP_XMAX_LOCK_ONLY; break;
+		case 14: row->raw_xmax = FrozenTransactionId; break;
+		case 15: row->has_carrier = false; break;
+		case 16: row->carrier_request_index = CLUSTER_ITL_INITRANS_DEFAULT; break;
+		case 17: row->itl_slot_index++; break;
+		case 18: row->tuple_offset++; break;
+		case 19: row->header_length = SizeofHeapTupleHeader - 1; break;
+		case 20: row->tuple_length = SizeofHeapTupleHeader - 1; break;
+		case 21: row->tuple_offset = BLCKSZ; break;
+		case 22: row->tuple_offset = 0; break;
+		case 23: row->header_length = row->tuple_length + 1; break;
+		case 24: row->offset = InvalidOffsetNumber; break;
+		}
+		UT_ASSERT_EQ(cluster_heap_freeze_bind_aborted_xmax_targets_v1(&page, &proofs, &fence), 0);
+		for (int i = 0; i < 2; i++) {
+			UT_ASSERT_EQ(page.tuples[i].aborted_xmax_target_proof_index, CLUSTER_HEAP_FREEZE_NO_ABORTED_XMAX_TARGET);
+			UT_ASSERT_EQ(page.tuples[i].creation_target_proof_index, 0);
+		}
+	}
+}
+
+UT_TEST(aborted_xmax_binding_keeps_distinct_carriers_and_exact_proof_order)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+	ClusterHeapFreezeCanonicalProofV1 swap;
+
+	init_aborted_xmax_binding_fixture(&page, &proofs, &fence);
+	page.carrier_request_count = proofs.proof_count = 2;
+	page.carrier_requests[1] = page.carrier_requests[0];
+	page.carrier_requests[1].locator.itl_slot_index = 1;
+	proofs.proofs[1] = proofs.proofs[0];
+	proofs.proofs[1].requested_locator.itl_slot_index = 1;
+	proofs.proofs[1].resolution.locator_echo.itl_slot_index = 1;
+	proofs.proofs[1].resolution.local_aborted_xmax_target.offset = 2;
+	page.tuples[1].carrier_request_index = page.tuples[1].itl_slot_index = 1;
+	swap = proofs.proofs[0]; proofs.proofs[0] = proofs.proofs[1]; proofs.proofs[1] = swap;
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_aborted_xmax_targets_v1(&page, &proofs, &fence), 2);
+	UT_ASSERT_EQ(page.tuples[0].aborted_xmax_target_proof_index, 1);
+	UT_ASSERT_EQ(page.tuples[1].aborted_xmax_target_proof_index, 0);
+	proofs.proofs[1].resolution.local_aborted_xmax_target.offset = 2;
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_aborted_xmax_targets_v1(&page, &proofs, &fence), 1);
+	UT_ASSERT_EQ(page.tuples[0].aborted_xmax_target_proof_index, CLUSTER_HEAP_FREEZE_NO_ABORTED_XMAX_TARGET);
+	for (unsigned byte = 0; byte < sizeof(ClusterItlSlotData); byte++) {
+		init_aborted_xmax_binding_fixture(&page, &proofs, &fence);
+		((char *)&page.tuples[0].carrier)[byte] ^= 1;
+		UT_ASSERT_EQ(cluster_heap_freeze_bind_aborted_xmax_targets_v1(&page, &proofs, &fence), 0);
+		UT_ASSERT_EQ(page.tuples[0].aborted_xmax_target_proof_index, CLUSTER_HEAP_FREEZE_NO_ABORTED_XMAX_TARGET);
+	}
+}
+
+UT_TEST(aborted_xmax_binding_requires_complete_canonical_and_final_fence)
+{
+	for (int variant = 0; variant < 18; variant++) {
+		ClusterHeapFreezePageBatchV1 page;
+		ClusterHeapFreezeProofBatchV1 proofs;
+		ClusterHeapFreezeFinalFenceV1 fence;
+
+		init_aborted_xmax_binding_fixture(&page, &proofs, &fence);
+		switch (variant) {
+		case 0: proofs.proofs[0].c1b_finalized = false; break;
+		case 1: proofs.proofs[0].authority_current = false; break;
+		case 2: proofs.proofs[0].admission_current = false; break;
+		case 3: proofs.proofs[0].resolution.local_canonical_valid = false; break;
+		case 4: proofs.proofs[0].resolution.outcome = CLUSTER_TX_COMMITTED;
+			proofs.proofs[0].resolution.commit_scn = 5; break;
+		case 5: proofs.proofs[0].resolution.outcome = CLUSTER_TX_PREPARED; break;
+		case 6: proofs.proofs[0].resolution.locator_echo.xid++; break;
+		case 7: proofs.proofs[0].resolution.locator_echo.tt_wrap++; break;
+		case 8: proofs.proofs[0].requested_locator.uba.raw[0]++; break;
+		case 9: proofs.proofs[0].current_fence.page_version++; break;
+		case 10: fence.page_lsn++; break;
+		case 11: page.page_lsn++; break;
+		case 12: page.page_version++; break;
+		case 13: page.carrier_request_count = 2; break;
+		case 14: proofs.proof_count = 0; break;
+		case 15: proofs.proof_count = CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH + 1; break;
+		case 16: page.tuple_count = MaxHeapTuplesPerPage + 1; break;
+		case 17: proofs.proofs[0].resolution.commit_scn = 5; break;
+		}
+		UT_ASSERT_EQ(cluster_heap_freeze_bind_aborted_xmax_targets_v1(&page, &proofs, &fence), 0);
+		UT_ASSERT_EQ(page.tuples[0].aborted_xmax_target_proof_index, CLUSTER_HEAP_FREEZE_NO_ABORTED_XMAX_TARGET);
+		UT_ASSERT_EQ(page.tuples[1].aborted_xmax_target_proof_index, CLUSTER_HEAP_FREEZE_NO_ABORTED_XMAX_TARGET);
+	}
+}
+
+UT_TEST(aborted_xmax_binding_missing_inputs_retire_only_their_association)
+{
+	ClusterHeapFreezePageBatchV1 page;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterHeapFreezeFinalFenceV1 fence;
+
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_aborted_xmax_targets_v1(NULL, NULL, NULL), 0);
+	for (int variant = 0; variant < 3; variant++) {
+		init_aborted_xmax_binding_fixture(&page, &proofs, &fence);
+		UT_ASSERT_EQ(cluster_heap_freeze_bind_aborted_xmax_targets_v1(&page,
+			variant == 0 ? NULL : &proofs, variant == 1 ? NULL : &fence), variant == 2 ? 1 : 0);
+		UT_ASSERT_EQ(page.tuples[1].aborted_xmax_target_proof_index, CLUSTER_HEAP_FREEZE_NO_ABORTED_XMAX_TARGET);
+		UT_ASSERT_EQ(page.tuples[0].creation_target_proof_index, 0);
+		UT_ASSERT(FullTransactionIdEquals(page.tuples[0].original_creator_full_xid,
+			FullTransactionIdFromEpochAndXid(1, 55)));
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(98);
+	UT_PLAN(103);
+	UT_RUN(aborted_xmax_binding_names_old_physical_row_without_changing_headers);
+	UT_RUN(aborted_xmax_binding_rejects_wrong_target_and_nonmodifier_states);
+	UT_RUN(aborted_xmax_binding_keeps_distinct_carriers_and_exact_proof_order);
+	UT_RUN(aborted_xmax_binding_requires_complete_canonical_and_final_fence);
+	UT_RUN(aborted_xmax_binding_missing_inputs_retire_only_their_association);
+
 	UT_RUN(xmin_batch_plan_keeps_target_order_and_native_fields);
 	UT_RUN(xmin_batch_plan_later_refusal_preserves_all_outputs);
 	UT_RUN(xmin_batch_plan_runtime_counts_and_capacity_are_bounded);

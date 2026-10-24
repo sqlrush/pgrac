@@ -1951,6 +1951,8 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 		{
 			vacrel->shared_freeze_batch.tuples[index].creation_target_proof_index =
 				CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET;
+			vacrel->shared_freeze_batch.tuples[index].aborted_xmax_target_proof_index =
+				CLUSTER_HEAP_FREEZE_NO_ABORTED_XMAX_TARGET;
 			vacrel->shared_freeze_batch.tuples[index].original_creator_full_xid =
 				InvalidFullTransactionId;
 		}
@@ -2142,6 +2144,8 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN && !cleaned)
 		{
 			(void) cluster_heap_freeze_bind_creation_targets_v1(
+				&vacrel->shared_freeze_batch, &proofs, &current_fence);
+			(void) cluster_heap_freeze_bind_aborted_xmax_targets_v1(
 				&vacrel->shared_freeze_batch, &proofs, &current_fence);
 			/* Screen the same attempt's original creator identities and observed
 			 * bounds without producing native plans. Positive F/H and producer

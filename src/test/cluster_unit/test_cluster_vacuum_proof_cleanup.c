@@ -73,6 +73,7 @@ volatile uint32 CritSectionCount;
 static RelationData relation;
 static LVRelState vacrel;
 static unsigned enters, leaves, debt, resolves, routes, target_bindings;
+static unsigned aborted_target_bindings;
 static unsigned writer_resumes, writer_releases;
 static bool writer_scope_active;
 static bool writer_resume_allowed, writer_resume_error;
@@ -719,6 +720,18 @@ cluster_heap_freeze_bind_creation_targets_v1(ClusterHeapFreezePageBatchV1 *page,
 	return 0;
 }
 
+uint16
+cluster_heap_freeze_bind_aborted_xmax_targets_v1(ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs, const ClusterHeapFreezeFinalFenceV1 *fence)
+{
+	if (guard_held || pin_held || content_locked || debt != 1 || target_bindings == 0
+		|| page != &vacrel.shared_freeze_batch || proofs == NULL || fence == NULL)
+		abort();
+	aborted_target_bindings++;
+	page->tuples[0].aborted_xmax_target_proof_index = 0;
+	return 1;
+}
+
 bool
 cluster_heap_freeze_select_xmin_candidates_v1(const ClusterHeapFreezePageBatchV1 *page,
 	const ClusterHeapFreezeProofBatchV1 *proofs, const ClusterHeapFreezeFinalFenceV1 *fence,
@@ -886,6 +899,8 @@ reset_fixture(void)
 	vacrel.shared_freeze_batch.carrier_request_count = 1;
 	vacrel.shared_freeze_batch.tuple_count = 1;
 	vacrel.shared_freeze_batch.tuples[0].creation_target_proof_index = 0;
+	vacrel.shared_freeze_batch.tuples[0].aborted_xmax_target_proof_index = 3;
+	aborted_target_bindings = 0;
 	target_bindings = 0;
 	memset(&cohort_value, 0, sizeof(cohort_value));
 	cohort_value.future_full_xid_max = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 1000));
@@ -2009,6 +2024,36 @@ UT_TEST(rejected_or_cleaned_collection_cannot_reuse_creation_indexes)
 	}
 }
 
+UT_TEST(aborted_modifier_binding_runs_after_local_release_under_original_admission)
+{
+	reset_fixture();
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs(&vacrel, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(aborted_target_bindings, 1);
+	UT_ASSERT_EQ(vacrel.shared_freeze_batch.tuples[0].aborted_xmax_target_proof_index, 0);
+	UT_ASSERT_EQ(debt, 0);
+	UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+}
+
+UT_TEST(rejected_or_cleaned_collection_retires_aborted_modifier_association)
+{
+	for (int variant = 0; variant < 6; variant++) {
+		reset_fixture();
+		switch (variant) {
+		case 0: vacrel.shared_freeze_batch.carrier_request_count = 0; break;
+		case 1: reject_admission = true; break;
+		case 2: unknown_outcome = true; break;
+		case 3: page_match = CLUSTER_HEAP_FREEZE_PAGE_CHANGED; break;
+		case 4: setup_cleanout_page(); break;
+		case 5: changed_master = true; break;
+		}
+		(void)lazy_collect_shared_freeze_proofs(&vacrel, 1);
+		UT_ASSERT_EQ(aborted_target_bindings, 0);
+		UT_ASSERT_EQ(vacrel.shared_freeze_batch.tuples[0].aborted_xmax_target_proof_index,
+			CLUSTER_HEAP_FREEZE_NO_ABORTED_XMAX_TARGET);
+		UT_ASSERT_EQ(debt, 0);
+	}
+}
+
 static void
 set_shared_policy(TransactionId xid)
 {
@@ -2910,7 +2955,9 @@ UT_TEST(test_writer_resume_error_before_lock_still_unpins_before_admission)
 int
 main(void)
 {
-	UT_PLAN(108);
+	UT_PLAN(110);
+	UT_RUN(aborted_modifier_binding_runs_after_local_release_under_original_admission);
+	UT_RUN(rejected_or_cleaned_collection_retires_aborted_modifier_association);
 	UT_RUN(test_writer_resume_error_before_lock_still_unpins_before_admission);
 	UT_RUN(test_refused_original_writer_never_falls_back_to_read_only_x);
 	UT_RUN(test_original_writer_error_cancel_cleans_local_scope_before_admission);
