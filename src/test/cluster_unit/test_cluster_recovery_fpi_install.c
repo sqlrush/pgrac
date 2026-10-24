@@ -2,10 +2,12 @@
 int recovery_fpi_insert_fixture_main(void);
 #define recovery_fpi_hash_create recovery_fpi_insert_hash_create
 #define ClusterStartupInstalledRecoveryWriterV1 recovery_fpi_insert_installed_writer
+#define cluster_scn_advance recovery_fpi_insert_scn_advance
 #define RECOVERY_FPI_INSERT_MAIN recovery_fpi_insert_fixture_main
 #include "test_cluster_recovery_fpi_insert.c"
 #undef recovery_fpi_hash_create
 #undef ClusterStartupInstalledRecoveryWriterV1
+#undef cluster_scn_advance
 
 #include "cluster/cluster_page_install.h"
 #include "access/xlogrecovery.h"
@@ -41,6 +43,8 @@ static ClusterRecoveryCheckpointOwnerV1 input_owner;
 static BlockNumber input_space_blocks;
 static bool input_missing_space;
 static RfPageRecoveryCtrcItlSelectionV1 input_itls[CLUSTER_ITL_INITRANS_DEFAULT + 1];
+static unsigned input_token_fault;
+static bool preparing_input_frame;
 #define input_start ((struct ClusterRecoveryStartV1 *)&input_start_object)
 #define input_work ((ClusterColdCtrcWorkV1 *)input_work_storage.data)
 
@@ -469,12 +473,13 @@ UT_TEST(fpi_inserted_observer_is_exact_and_never_advances_window)
 
 #include "test_cluster_recovery_ctrc_read.inc"
 #include "test_cluster_recovery_ctrc_itl.inc"
+#include "test_cluster_recovery_ctrc_fpi.inc"
 
 int
 main(void)
 {
 	atexit(install_file_close);
-	UT_PLAN(23);
+	UT_PLAN(30);
 	UT_RUN(fpi_install_syncs_exact_native_lsn_and_checksum_without_retiring_window);
 	UT_RUN(fpi_install_exact_result_retries_sync_and_postread_without_rewriting);
 	UT_RUN(fpi_install_refuses_wrong_window_flush_frame_actor_or_serial_before_io);
@@ -498,6 +503,13 @@ main(void)
 	UT_RUN(ctrc_itl_input_refuses_wrong_actor_before_borrowing_work);
 	UT_RUN(ctrc_itl_input_rechecks_original_scope_and_selected_bytes);
 	UT_RUN(ctrc_itl_input_errors_preserve_output_and_owners);
+	UT_RUN(ctrc_itl_fpi_prepares_exact_canonical_frame_from_original_input);
+	UT_RUN(ctrc_itl_fpi_unchanged_does_not_mint_a_version);
+	UT_RUN(ctrc_itl_fpi_ignores_native_space_padding);
+	UT_RUN(ctrc_itl_fpi_refusals_keep_output_and_original_debt);
+	UT_RUN(ctrc_itl_fpi_rechecks_original_inputs_after_token_preparation);
+	UT_RUN(ctrc_itl_fpi_refuses_output_aliases_and_bounds_before_io);
+	UT_RUN(ctrc_itl_fpi_errors_keep_output_and_original_debt);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

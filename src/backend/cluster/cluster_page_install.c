@@ -956,21 +956,33 @@ page_recovery_ctrc_itl_inputs_current(const PageRecoveryCtrcReadV1 *context,
 }
 
 static bool
-page_recovery_ctrc_itl_output_overlaps(const RfPageRecoveryCtrcItlImageV1 *out,
+page_recovery_ctrc_itl_output_overlaps(const void *out, Size out_size,
 	const void *input, Size size)
 {
 	uintptr_t a = (uintptr_t)out, b = (uintptr_t)input;
 
-	return size != 0 && (a <= b ? b - a < sizeof(*out) : a - b < size);
+	return size != 0 && (a <= b ? b - a < out_size : a - b < size);
 }
 
-bool
-rf_page_recovery_ctrc_itl_image_smgr_v1(const struct ClusterRecoveryStartV1 *start,
+static bool
+page_recovery_ctrc_fpi_identity_current(const ClusterSpaceIdentity *space,
+	const uint8 identity[CLUSTER_SPACE_IDENTITY_BYTES], const RfPageVersionV1 *before,
+	const RfPageVersionV1 *fixed_before)
+{
+	uint8 encoded[CLUSTER_SPACE_IDENTITY_BYTES];
+
+	return cluster_space_identity_encode(space, encoded, sizeof(encoded))
+		&& memcmp(encoded, identity, sizeof(encoded)) == 0
+		&& memcmp(before, fixed_before, sizeof(*before)) == 0;
+}
+
+static bool
+page_recovery_ctrc_itl_image(const struct ClusterRecoveryStartV1 *start,
 	const ClusterColdCtrcWorkV1 *work, const RfPageAuthorityGuardV1 *guard,
 	ClusterRecoverySerialGuard *serial, ClusterWalRetentionPin *pin,
 	const ClusterSpaceIdentity *space, BlockNumber blockno,
 	const RfPageVersionV1 *expected_before, const RfPageRecoveryCtrcItlSelectionV1 *selections,
-	Size count, RfPageRecoveryCtrcItlImageV1 *out)
+	Size count, RfPageRecoveryCtrcItlImageV1 *out, RfPageRecoveryCtrcItlFpiV1 *fpi_out)
 {
 	PageRecoveryCtrcReadV1 context;
 	PageRecoveryCtrcItlInputsV1 fixed;
@@ -979,10 +991,15 @@ rf_page_recovery_ctrc_itl_image_smgr_v1(const struct ClusterRecoveryStartV1 *sta
 	ClusterCtrcItlCleanoutApplyResult result;
 	const ClusterColdTypedV1 *typed;
 	PGAlignedBlock before;
+	ClusterSpaceIdentity frame_space;
+	RfPageVersionV1 frame_before;
+	uint8 frame_identity[CLUSTER_SPACE_IDENTITY_BYTES];
+	void *output = out != NULL ? (void *)out : (void *)fpi_out;
+	Size out_size = out != NULL ? sizeof(*out) : sizeof(*fpi_out);
 	Size work_bytes;
 
 	if (start == NULL || work == NULL || guard == NULL || serial == NULL || pin == NULL
-		|| space == NULL || expected_before == NULL || selections == NULL || out == NULL
+		|| space == NULL || expected_before == NULL || selections == NULL || output == NULL
 		|| count == 0 || count > CLUSTER_ITL_INITRANS_DEFAULT
 		|| !page_recovery_ctrc_actor_current()
 		|| !ClusterColdRecoveryCtrcWorkCurrent(start, work))
@@ -994,16 +1011,22 @@ rf_page_recovery_ctrc_itl_image_smgr_v1(const struct ClusterRecoveryStartV1 *sta
 		return false;
 	work_bytes = offsetof(ClusterColdCtrcWorkV1, entries)
 		+ (Size)work->counts.subject_count * sizeof(work->entries[0]);
-	if (page_recovery_ctrc_itl_output_overlaps(out, work, work_bytes)
-		|| page_recovery_ctrc_itl_output_overlaps(out, typed, sizeof(*typed))
-		|| page_recovery_ctrc_itl_output_overlaps(out, selections, count * sizeof(*selections))
-		|| page_recovery_ctrc_itl_output_overlaps(out, space, sizeof(*space))
-		|| page_recovery_ctrc_itl_output_overlaps(out, expected_before, sizeof(*expected_before))
-		|| page_recovery_ctrc_itl_output_overlaps(out, serial, sizeof(*serial))
-		|| page_recovery_ctrc_itl_output_overlaps(out, start, 1)
-		|| page_recovery_ctrc_itl_output_overlaps(out, guard, 1)
-		|| page_recovery_ctrc_itl_output_overlaps(out, pin, 1))
+	if (page_recovery_ctrc_itl_output_overlaps(output, out_size, work, work_bytes)
+		|| page_recovery_ctrc_itl_output_overlaps(output, out_size, typed, sizeof(*typed))
+		|| page_recovery_ctrc_itl_output_overlaps(output, out_size, selections, count * sizeof(*selections))
+		|| page_recovery_ctrc_itl_output_overlaps(output, out_size, space, sizeof(*space))
+		|| page_recovery_ctrc_itl_output_overlaps(output, out_size, expected_before, sizeof(*expected_before))
+		|| page_recovery_ctrc_itl_output_overlaps(output, out_size, serial, sizeof(*serial))
+		|| page_recovery_ctrc_itl_output_overlaps(output, out_size, start, 1)
+		|| page_recovery_ctrc_itl_output_overlaps(output, out_size, guard, 1)
+		|| page_recovery_ctrc_itl_output_overlaps(output, out_size, pin, 1))
 		return false;
+	if (fpi_out != NULL) {
+		frame_space = *space;
+		frame_before = *expected_before;
+		if (!cluster_space_identity_encode(&frame_space, frame_identity, sizeof(frame_identity)))
+			return false;
+	}
 	fixed.plan = work->plan;
 	fixed.census = work->top_tx_census;
 	fixed.generation = work->generation;
@@ -1037,7 +1060,51 @@ rf_page_recovery_ctrc_itl_image_smgr_v1(const struct ClusterRecoveryStartV1 *sta
 		|| !page_recovery_ctrc_itl_inputs_current(&context, selections, &fixed))
 		return false;
 	candidate.rewritten = result == CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN;
+	if (fpi_out != NULL) {
+		RfPageRecoveryCtrcItlFpiV1 fpi;
+
+		memset(&fpi, 0, sizeof(fpi));
+		if (!page_recovery_ctrc_fpi_identity_current(space, frame_identity,
+			expected_before, &frame_before))
+			return false;
+		fpi.rewritten = candidate.rewritten;
+		if (fpi.rewritten && !GenericXLogRecoveryImagePrepare(GENERIC_XLOG_CTRC_ITL,
+			&frame_space, MAIN_FORKNUM, blockno, before.data, candidate.image.data, &fpi.frame))
+			return false;
+		/* The original token producer can yield or throw. Its private result
+		 * is publishable only while every borrowed input still matches. */
+		if (!page_recovery_ctrc_itl_inputs_current(&context, selections, &fixed)
+			|| !page_recovery_ctrc_fpi_identity_current(space, frame_identity,
+				expected_before, &frame_before))
+			return false;
+		memcpy(fpi_out, &fpi, sizeof(fpi));
+		return true;
+	}
 	memcpy(out, &candidate, sizeof(candidate));
 	return true;
+}
+
+bool
+rf_page_recovery_ctrc_itl_image_smgr_v1(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, const RfPageAuthorityGuardV1 *guard,
+	ClusterRecoverySerialGuard *serial, ClusterWalRetentionPin *pin,
+	const ClusterSpaceIdentity *space, BlockNumber blockno,
+	const RfPageVersionV1 *expected_before, const RfPageRecoveryCtrcItlSelectionV1 *selections,
+	Size count, RfPageRecoveryCtrcItlImageV1 *out)
+{
+	return page_recovery_ctrc_itl_image(start, work, guard, serial, pin, space,
+		blockno, expected_before, selections, count, out, NULL);
+}
+
+bool
+rf_page_recovery_ctrc_itl_fpi_smgr_v1(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, const RfPageAuthorityGuardV1 *guard,
+	ClusterRecoverySerialGuard *serial, ClusterWalRetentionPin *pin,
+	const ClusterSpaceIdentity *space, BlockNumber blockno,
+	const RfPageVersionV1 *expected_before, const RfPageRecoveryCtrcItlSelectionV1 *selections,
+	Size count, RfPageRecoveryCtrcItlFpiV1 *out)
+{
+	return page_recovery_ctrc_itl_image(start, work, guard, serial, pin, space,
+		blockno, expected_before, selections, count, NULL, out);
 }
 #endif /* USE_PGRAC_CLUSTER && !USE_CLUSTER_UNIT */
