@@ -13,15 +13,16 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "access/xlogreader.h"
+#include "cluster/cluster_xlog.h"
 #include "cluster/cluster_recovery_namespace.h"
 #include "cluster/cluster_recovery_reference_graph.h"
 #include "cluster/cluster_recovery_tt_record.h"
 
 #define CLUSTER_RECOVERY_CTRC_VERSION UINT16_C(2)
-#define CLUSTER_RECOVERY_CTRC_BYTES 320
+#define CLUSTER_RECOVERY_CTRC_BYTES CLUSTER_XLOG_D0_PAYLOAD_BYTES
 #define CLUSTER_RECOVERY_CTRC_RELEASE_PROVEN UINT32_C(1)
 /* Frozen D0 opcode; live redo dispatch remains disabled. */
-#define CLUSTER_RECOVERY_CTRC_WAL_INFO UINT8_C(0xD0)
+#define CLUSTER_RECOVERY_CTRC_WAL_INFO CLUSTER_XLOG_D0_WAL_INFO
 
 /* Logical fields, never an on-disk struct. Reserved bytes and the payload/
  * identity hashes are derived by the codec, not supplied by the caller. */
