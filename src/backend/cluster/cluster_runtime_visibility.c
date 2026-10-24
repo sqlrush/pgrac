@@ -2002,6 +2002,80 @@ cluster_runtime_visibility_origin_data_copy(uint32 segment_id, uint8 owner, uint
  * and failure here must not turn a valid transaction verdict into UNKNOWN.
  */
 static void
+cluster_runtime_visibility_origin_aborted_xmax_target(const char *record_bytes,
+													size_t record_length, ClusterTxResolution *candidate)
+{
+	UndoRecordHeader record;
+	UndoItlHistoryTrailer history;
+	ClusterTxModificationTarget target = {0};
+	const char *payload;
+	uint16 body_length, old_length, old_offset;
+	uint8 old_hoff;
+
+	memset(&candidate->local_aborted_xmax_target, 0,
+		sizeof(candidate->local_aborted_xmax_target));
+	if (candidate->outcome != CLUSTER_TX_ABORTED || !candidate->local_canonical_valid
+		|| record_bytes == NULL || record_length < sizeof(record) || record_length > BLCKSZ)
+		return;
+	memcpy(&record, record_bytes, sizeof(record));
+	if (record.xid != candidate->locator_echo.xid
+		|| !RelFileNumberIsValid(record.target_locator.relNumber)
+		|| record.target_fork != MAIN_FORKNUM || record.target_block == InvalidBlockNumber
+		|| !OffsetNumberIsValid(record.target_offset)
+		|| record.target_offset > MaxHeapTuplesPerPage)
+		return;
+	payload = record_bytes + sizeof(record);
+	if (!cluster_undo_record_decode_payload(&record, payload, record_length - sizeof(record),
+											&body_length, &history))
+		return;
+
+	switch (record.record_type) {
+	case UNDO_RECORD_UPDATE: {
+		UndoUpdatePayload update;
+
+		if (body_length < sizeof(update))
+			return;
+		memcpy(&update, payload, sizeof(update));
+		if (update.new_block == InvalidBlockNumber || !OffsetNumberIsValid(update.new_offset)
+			|| update.new_offset > MaxHeapTuplesPerPage)
+			return;
+		old_length = update.old_tuple_length;
+		old_offset = update.old_tuple_offset;
+		break;
+	}
+	case UNDO_RECORD_DELETE: {
+		UndoDeletePayload deleted;
+
+		if (body_length < sizeof(deleted))
+			return;
+		memcpy(&deleted, payload, sizeof(deleted));
+		old_length = deleted.full_tuple_length;
+		old_offset = deleted.full_tuple_offset;
+		break;
+	}
+	default:
+		return;
+	}
+	if (old_length < SizeofHeapTupleHeader || old_length > BLCKSZ - SizeOfPageHeaderData
+		|| old_offset > body_length || old_length > body_length - old_offset)
+		return;
+	memcpy(&old_hoff, payload + old_offset + offsetof(HeapTupleHeaderData, t_hoff),
+		sizeof(old_hoff));
+	if (old_hoff < SizeofHeapTupleHeader || old_hoff > old_length)
+		return;
+
+	/* UPDATE's header names the old row, never the replacement. This is
+	 * physical input only: ABORTED does not establish rollback completion. */
+	target.locator = record.target_locator;
+	target.fork = MAIN_FORKNUM;
+	target.block = record.target_block;
+	target.offset = record.target_offset;
+	target.tuple_length = old_length;
+	target.valid = true;
+	candidate->local_aborted_xmax_target = target;
+}
+
+static void
 cluster_runtime_visibility_origin_creation_target(const char *record_bytes, size_t record_length,
 												  ClusterTxResolution *candidate)
 {
@@ -2225,6 +2299,8 @@ cluster_runtime_visibility_origin_plan_freeze_data_internal(
 	}
 	plan_data->canonical_root = *root;
 	cluster_runtime_visibility_origin_creation_target(plan_data->record_buf.data,
+													 plan_data->record_length, &plan_data->candidate);
+	cluster_runtime_visibility_origin_aborted_xmax_target(plan_data->record_buf.data,
 													 plan_data->record_length, &plan_data->candidate);
 	cluster_runtime_visibility_terminal_publish(&plan_data->candidate, &plan_data->canonical_root,
 												 plan_data->candidate_recycled_abort);
@@ -2546,6 +2622,8 @@ cluster_runtime_visibility_origin_plan_recheck_data_internal(
 			&plan_data->canonical_locator, &plan_data->canonical_diagnostic))
 		goto failed;
 	cluster_runtime_visibility_origin_creation_target(record_buf.data, record_length,
+													 &plan_data->candidate);
+	cluster_runtime_visibility_origin_aborted_xmax_target(record_buf.data, record_length,
 													 &plan_data->candidate);
 	cluster_runtime_visibility_terminal_publish(&plan_data->candidate, &plan_data->canonical_root,
 												 plan_data->candidate_recycled_abort);
@@ -3033,6 +3111,7 @@ cluster_runtime_visibility_resolve_exact_origin_admitted(
 		out->local_canonical_valid = false;
 		out->local_original_full_xid = InvalidFullTransactionId;
 		memset(&out->local_creation_target, 0, sizeof(out->local_creation_target));
+		memset(&out->local_aborted_xmax_target, 0, sizeof(out->local_aborted_xmax_target));
 		goto recheck;
 	}
 	logical.owner_instance = (uint8)((uint32)origin + 1);

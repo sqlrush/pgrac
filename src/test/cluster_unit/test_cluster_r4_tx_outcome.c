@@ -1227,6 +1227,7 @@ cluster_gcs_block_r4_tx_resolve_fetch_and_wait(int32 origin_node, const ClusterT
 	out->outcome = test_remote_origin_outcome;
 	/* A peer must never supply an in-process creation projection. */
 	out->local_creation_target.valid = true;
+	out->local_aborted_xmax_target.valid = true;
 	out->local_original_full_xid = FullTransactionIdFromEpochAndXid(9, TEST_ORIGIN_XID);
 	*reason_out = test_remote_origin_outcome == CLUSTER_TX_UNKNOWN
 					  ? CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE
@@ -3809,6 +3810,7 @@ test_remote_origin_does_not_depend_on_foreign_residency(ClusterTxResolveMode mod
 		UT_ASSERT_EQ(test_remote_origin_generation, UINT32_MAX);
 		UT_ASSERT(!FullTransactionIdIsValid(resolution.local_original_full_xid));
 		UT_ASSERT(!resolution.local_creation_target.valid);
+		UT_ASSERT(!resolution.local_aborted_xmax_target.valid);
 		UT_ASSERT_EQ(test_regular_root_resolve_calls, 0);
 		UT_ASSERT_EQ(test_terminal_census_root_resolve_calls, 0);
 		UT_ASSERT_EQ(test_candidate_acquire_calls, 0);
@@ -6890,6 +6892,8 @@ resolve_creation_record(bool same_segment, int drift, ClusterTxResolution *resol
 	ClusterUndoBlock0CurrentGuard data_guard = {0}, tt_guard = {0};
 	ClusterUndoBlock0ResolvedRoot data_root = {0}, tt_root = {0};
 	PGAlignedBlock page;
+	const ClusterTxOutcome expected = test_native_status == TRANSACTION_STATUS_ABORTED
+		? CLUSTER_TX_ABORTED : CLUSTER_TX_COMMITTED;
 
 	admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
 	admission.record_generation = 5;
@@ -6920,7 +6924,147 @@ resolve_creation_record(bool same_segment, int drift, ClusterTxResolution *resol
 	UT_ASSERT_EQ(cluster_runtime_visibility_origin_plan_copy_data_held(
 		&plan, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, &data_guard,
 		&data_root, resolution, page.data, &reason),
-		drift == 0 ? CLUSTER_TX_COMMITTED : CLUSTER_TX_UNKNOWN);
+		drift == 0 ? expected : CLUSTER_TX_UNKNOWN);
+}
+
+static void
+init_aborted_modification_record(uint16 type, bool same_segment)
+{
+	const uint16 old_length = SizeofHeapTupleHeader + 8;
+	uint16 old_offset;
+	uint8 old_hoff = SizeofHeapTupleHeader;
+
+	init_creation_record(type, same_segment);
+	test_native_status = TRANSACTION_STATUS_ABORTED;
+	test_tt_slot.status = test_durable_locator_status = TT_SLOT_ABORTED;
+	test_tt_slot.commit_scn = InvalidScn;
+	memset(test_origin_payload, 0, sizeof(test_origin_payload));
+	if (type == UNDO_RECORD_UPDATE) {
+		UndoUpdatePayload update = {0};
+		update.new_block = 24; update.new_offset = 4;
+		update.old_tuple_length = old_length;
+		update.old_tuple_offset = old_offset = sizeof(update);
+		memcpy(test_origin_payload, &update, sizeof(update));
+	} else {
+		UndoDeletePayload deleted = {0};
+		deleted.full_tuple_length = old_length;
+		deleted.full_tuple_offset = old_offset = sizeof(deleted);
+		memcpy(test_origin_payload, &deleted, sizeof(deleted));
+	}
+	UT_ASSERT(old_offset + old_length <= sizeof(test_origin_payload));
+	memcpy(test_origin_payload + old_offset + offsetof(HeapTupleHeaderData, t_hoff),
+		&old_hoff, sizeof(old_hoff));
+	test_origin_payload_bytes = old_offset + old_length;
+	test_origin_record.payload_length = test_origin_payload_bytes;
+}
+
+UT_TEST(test_aborted_delete_target_comes_from_final_exact_record)
+{
+	for (int same = 0; same < 2; same++) {
+		ClusterTxResolution resolution;
+		init_aborted_modification_record(UNDO_RECORD_DELETE, same);
+		if (same) test_origin_record.target_locator.dbOid = InvalidOid;
+		resolve_creation_record(same, 0, &resolution);
+		UT_ASSERT_EQ(resolution.outcome, CLUSTER_TX_ABORTED);
+		UT_ASSERT(resolution.local_aborted_xmax_target.valid);
+		UT_ASSERT(RelFileLocatorEquals(resolution.local_aborted_xmax_target.locator,
+			test_origin_record.target_locator));
+		UT_ASSERT_EQ(resolution.local_aborted_xmax_target.fork, MAIN_FORKNUM);
+		UT_ASSERT_EQ(resolution.local_aborted_xmax_target.block, 23);
+		UT_ASSERT_EQ(resolution.local_aborted_xmax_target.offset, 3);
+		UT_ASSERT_EQ(resolution.local_aborted_xmax_target.tuple_length, SizeofHeapTupleHeader + 8);
+		UT_ASSERT(!resolution.local_creation_target.valid);
+	}
+}
+
+UT_TEST(test_aborted_update_target_names_old_tuple_not_replacement)
+{
+	for (int same = 0; same < 2; same++) {
+		ClusterTxResolution resolution;
+		init_aborted_modification_record(UNDO_RECORD_UPDATE, same);
+		resolve_creation_record(same, 0, &resolution);
+		UT_ASSERT(resolution.local_aborted_xmax_target.valid);
+		UT_ASSERT_EQ(resolution.local_aborted_xmax_target.block, 23);
+		UT_ASSERT_EQ(resolution.local_aborted_xmax_target.offset, 3);
+		UT_ASSERT_EQ(resolution.local_aborted_xmax_target.tuple_length, SizeofHeapTupleHeader + 8);
+		UT_ASSERT(!resolution.local_creation_target.valid);
+	}
+}
+
+UT_TEST(test_modification_projection_never_upgrades_committed_or_insert_record)
+{
+	for (unsigned variant = 0; variant < 3; variant++) {
+		ClusterTxResolution resolution;
+		if (variant == 2) {
+			init_creation_record(UNDO_RECORD_INSERT, false);
+			test_native_status = TRANSACTION_STATUS_ABORTED;
+			test_tt_slot.status = TT_SLOT_ABORTED; test_tt_slot.commit_scn = InvalidScn;
+		} else {
+			init_aborted_modification_record(variant ? UNDO_RECORD_UPDATE : UNDO_RECORD_DELETE, false);
+			test_native_status = TRANSACTION_STATUS_COMMITTED;
+			test_tt_slot.status = test_durable_locator_status = TT_SLOT_COMMITTED;
+			test_tt_slot.commit_scn = test_commit_scn;
+		}
+		resolve_creation_record(false, 0, &resolution);
+		UT_ASSERT(!resolution.local_aborted_xmax_target.valid);
+		UT_ASSERT_EQ(resolution.local_creation_target.valid, variant == 1);
+	}
+}
+
+UT_TEST(test_aborted_modification_projection_rejects_malformed_record_image)
+{
+	for (unsigned update = 0; update < 2; update++) {
+		for (unsigned variant = 0; variant < 10; variant++) {
+			ClusterTxResolution resolution;
+			uint16 old_offset;
+			init_aborted_modification_record(update ? UNDO_RECORD_UPDATE : UNDO_RECORD_DELETE, false);
+			old_offset = update ? sizeof(UndoUpdatePayload) : sizeof(UndoDeletePayload);
+			switch (variant) {
+			case 0: test_origin_record.target_locator.relNumber = InvalidRelFileNumber; break;
+			case 1: test_origin_record.target_fork = FSM_FORKNUM; break;
+			case 2: test_origin_record.target_block = InvalidBlockNumber; break;
+			case 3: test_origin_record.target_offset = MaxHeapTuplesPerPage + 1; break;
+			case 4: test_origin_record.payload_length++; break;
+			case 5:
+				if (update) ((UndoUpdatePayload *)test_origin_payload)->old_tuple_length = 1;
+				else ((UndoDeletePayload *)test_origin_payload)->full_tuple_length = 1;
+				break;
+			case 6:
+				if (update) ((UndoUpdatePayload *)test_origin_payload)->old_tuple_offset = BLCKSZ;
+				else ((UndoDeletePayload *)test_origin_payload)->full_tuple_offset = BLCKSZ;
+				break;
+			case 7: test_origin_payload[old_offset + offsetof(HeapTupleHeaderData, t_hoff)] = 0; break;
+			case 8: test_origin_payload[old_offset + offsetof(HeapTupleHeaderData, t_hoff)] = UINT8_MAX; break;
+			case 9: test_origin_record.flags = 0; break;
+			}
+			resolve_creation_record(false, 0, &resolution);
+			UT_ASSERT_EQ(resolution.outcome, CLUSTER_TX_ABORTED);
+			UT_ASSERT(!resolution.local_aborted_xmax_target.valid);
+			UT_ASSERT(!resolution.local_creation_target.valid);
+		}
+	}
+}
+
+UT_TEST(test_aborted_modification_target_not_exported_after_final_data_drift)
+{
+	for (int drift = 1; drift <= 4; drift++) {
+		ClusterTxResolution resolution;
+		init_aborted_modification_record(UNDO_RECORD_UPDATE, false);
+		resolve_creation_record(false, drift, &resolution);
+		UT_ASSERT(!resolution.local_aborted_xmax_target.valid);
+	}
+}
+
+UT_TEST(test_later_creation_result_clears_aborted_modification_projection)
+{
+	ClusterTxResolution resolution;
+	init_aborted_modification_record(UNDO_RECORD_DELETE, false);
+	resolve_creation_record(false, 0, &resolution);
+	UT_ASSERT(resolution.local_aborted_xmax_target.valid);
+	init_creation_record(UNDO_RECORD_INSERT, false);
+	resolve_creation_record(false, 0, &resolution);
+	UT_ASSERT(!resolution.local_aborted_xmax_target.valid);
+	UT_ASSERT(resolution.local_creation_target.valid);
 }
 
 UT_TEST(test_insert_creation_target_comes_from_final_exact_record)
@@ -7145,7 +7289,7 @@ UT_TEST(test_original_full_xid_does_not_escape_final_fence_drift)
 int
 main(void)
 {
-	UT_PLAN(196);
+	UT_PLAN(202);
 	UT_RUN(test_original_full_xid_reaches_same_and_cross_segment_census_result);
 	UT_RUN(test_original_full_xid_missing_or_key_alias_keeps_verdict_without_identity);
 	UT_RUN(test_original_full_xid_not_queried_for_other_roles_or_abort);
@@ -7338,6 +7482,12 @@ main(void)
 	UT_RUN(test_exact_origin_memo_rechecks_each_data_carrier);
 	UT_RUN(test_exact_origin_memo_publishes_after_final_data_recheck);
 	UT_RUN(test_exact_origin_memo_hit_preserves_final_data_and_generation_fences);
+	UT_RUN(test_aborted_delete_target_comes_from_final_exact_record);
+	UT_RUN(test_aborted_update_target_names_old_tuple_not_replacement);
+	UT_RUN(test_modification_projection_never_upgrades_committed_or_insert_record);
+	UT_RUN(test_aborted_modification_projection_rejects_malformed_record_image);
+	UT_RUN(test_aborted_modification_target_not_exported_after_final_data_drift);
+	UT_RUN(test_later_creation_result_clears_aborted_modification_projection);
 	UT_RUN(test_insert_creation_target_comes_from_final_exact_record);
 	UT_RUN(test_update_creation_target_names_replacement_not_old_tuple);
 	UT_RUN(test_noncreation_or_malformed_payload_keeps_verdict_without_target);

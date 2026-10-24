@@ -146,6 +146,19 @@ typedef struct ClusterTxCreationTarget {
 	bool valid;
 } ClusterTxCreationTarget;
 
+/* Optional old-tuple address decoded from an exact local UPDATE/DELETE.
+ * This is physical record metadata only, not rollback completion, original
+ * FullXid provenance, freeze eligibility or permission to retire a reference.
+ * Like the creation projection, it is never serialized or accepted from peers. */
+typedef struct ClusterTxModificationTarget {
+	RelFileLocator locator;
+	ForkNumber fork;
+	BlockNumber block;
+	OffsetNumber offset;
+	uint16 tuple_length;
+	bool valid;
+} ClusterTxModificationTarget;
+
 typedef struct ClusterTxResolution {
 	ClusterTxLocator locator_echo;
 	TransactionId top_xid;
@@ -163,6 +176,8 @@ typedef struct ClusterTxResolution {
 	 * Invalid means unavailable; never reconstructed from raw XID or wire. */
 	FullTransactionId local_original_full_xid;
 	ClusterTxCreationTarget local_creation_target;
+	/* ABORTED outcome alone does not prove that physical rollback completed. */
+	ClusterTxModificationTarget local_aborted_xmax_target;
 } ClusterTxResolution;
 
 /* A page-derived request carries TT_WRAP_INVALID until the origin reads the
