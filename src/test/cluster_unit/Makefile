@@ -8947,8 +8947,14 @@ test_cluster_xid_stripe_evidence.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     END { if (maintenance != 4 || history != 5 || lookup != 1 || types != 2 || zero != 1 || reads != 2 || leases != 1 || pointer != 1 || actions != 2 || ready != 1 || future != 1 || fence != 1 || window != 1 || wrap != 1 || boots != 1 || bootptr != 1 || writers != 2 || herd != 1 || floor != 1 || wait != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_xid_stripe_active.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
+	awk '/^ProcArrayGetActiveFullXidSample\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_xid_stripe_evidence: test_cluster_xid_stripe_evidence.c unit_test.h \
-		test_cluster_xid_stripe_evidence.inc $(CLUSTER_XID_STRIPE_O) \
+		test_cluster_xid_stripe_evidence.inc test_cluster_xid_stripe_active.inc \
+		test_cluster_pgproc_active_types.inc $(CLUSTER_XID_STRIPE_O) \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
 		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
 		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h
