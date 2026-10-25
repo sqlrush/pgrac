@@ -9,10 +9,72 @@
 #include "cluster/cluster_block_io_trace.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_pcm_own.h"
+#include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_startup_phase.h"
+#include "cluster/cluster_gcs.h"
+#include "cluster/cluster_grd.h"
+#include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_membership.h"
+#include "cluster/cluster_qvotec.h"
 #include "miscadmin.h"
 #include "utils/timestamp.h"
 
 #ifdef USE_PGRAC_CLUSTER
+/* Conditions are observations at this cut, not a new service admission.
+ * result records the original branch; the claim identity has a locked native
+ * lifecycle. A missing snapshot stays unknown, never an invented blocker. */
+void
+cluster_block_io_trace_master(const ClusterPcmReadGrantKey *key, const char *event, int result)
+{
+	ClusterPcmReadGrant blocker = {0};
+	bool known, pending = false, serving, member, join_active, rebuilt, recovering;
+	int route;
+	int saved_errno = errno;
+	if (!cluster_trace_block_io || key == NULL)
+		return;
+	known = cluster_pcm_lock_read_grant_blocker_snapshot(key->tag, key->requester_node, &blocker);
+	serving = cluster_authority_readiness_managed()
+		? cluster_serving_ready_check(&pending, NULL) : cluster_qvotec_in_quorum();
+	member = cluster_membership_is_member(cluster_node_id);
+	join_active = cluster_grd_join_remaster_active_for_shard(key->tag);
+	rebuilt = cluster_grd_block_view_rebuilt(key->tag);
+	recovering = cluster_gcs_block_phase_for_tag(key->tag) == GCS_BLOCK_RECOVERING;
+	route = cluster_gcs_lookup_master(key->tag);
+	write_stderr("BLOCK_IO event=FIRST_FILL_MASTER action=%s time=" INT64_FORMAT
+		" node=%d pid=%d tag=%u/%u/%u/%d/%u request=" UINT64_FORMAT
+		" epoch=" UINT64_FORMAT " requester=%d backend=%d decision=%d"
+		" blocker_known=%d blocker_request=" UINT64_FORMAT " blocker_epoch=" UINT64_FORMAT
+		" blocker_node=%d blocker_backend=%d blocker_binding=" UINT64_FORMAT
+		" blocker_revoking=%d blocker_ack_consumed=%d conditions_sampled=1"
+		" serving=%d serving_pending=%d member=%d join_active=%d rebuilt=%d recovering=%d route=%d\n",
+		event, GetCurrentTimestamp(), cluster_node_id, MyProcPid, key->tag.spcOid, key->tag.dbOid,
+		key->tag.relNumber, key->tag.forkNum, key->tag.blockNum, key->request_id, key->epoch,
+		key->requester_node, key->backend_id, result, known, blocker.key.request_id,
+		blocker.key.epoch, known ? blocker.key.requester_node : -1,
+		known ? blocker.key.backend_id : -1, blocker.binding_generation,
+		blocker.revoking, blocker.ack_consumed, serving, pending, member, join_active,
+		rebuilt, recovering, route);
+	errno = saved_errno;
+}
+
+void
+cluster_block_io_trace_receipt(const ClusterPcmReadSource *source, const char *event,
+	int backend, int buffer, int owner_pid, uint64 incarnation, unsigned count)
+{
+	int saved_errno = errno;
+	if (cluster_trace_block_io && source != NULL)
+		write_stderr("BLOCK_IO event=QUIET_RECEIPT action=%s time=" INT64_FORMAT
+			" node=%d pid=%d backend=%d owner_pid=%d incarnation=" UINT64_FORMAT
+			" tag=%u/%u/%u/%d/%u request=" UINT64_FORMAT " epoch=" UINT64_FORMAT
+			" master=%d buffer=%d generation=" UINT64_FORMAT " token=" UINT64_FORMAT
+			" backend_receipts=%u\n", event, GetCurrentTimestamp(), cluster_node_id,
+			MyProcPid, backend, owner_pid, incarnation, source->tag.spcOid, source->tag.dbOid,
+			source->tag.relNumber, source->tag.forkNum, source->tag.blockNum,
+			source->request_id, source->request_epoch, source->master_node, buffer,
+			source->base_generation, source->reservation_token, count);
+	errno = saved_errno;
+}
+
 void
 cluster_block_io_trace_pending_s(const ClusterPcmReadGrantKey *key, const char *event,
 	int phase, int holder, uint64 binding, int result)

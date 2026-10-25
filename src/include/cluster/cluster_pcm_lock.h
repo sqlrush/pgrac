@@ -1416,6 +1416,10 @@ extern bool cluster_pcm_lock_read_grant_holder_done(const ClusterPcmReadGrantKey
 	int32 authenticated_holder);
 extern void cluster_pcm_lock_check_shutdown_wait(void);
 extern bool cluster_pcm_lock_read_grant_revoke_ack(const ClusterPcmReadGrantKey *key);
+extern bool cluster_pcm_lock_read_grant_retire_notice_admitted(const ClusterPcmReadGrantKey *key);
+extern bool cluster_pcm_lock_read_grant_absent(const ClusterPcmReadGrantKey *key);
+extern bool cluster_pcm_lock_read_grant_blocker_snapshot(BufferTag tag, int requester,
+	ClusterPcmReadGrant *out);
 extern bool cluster_pcm_lock_read_grant_work(uint32 *cursor, int worker, int workers,
 	TimestampTz now, uint64 current_epoch, ClusterPcmReadGrant *out);
 

@@ -69,7 +69,7 @@ wait_latch(Latch *latch pg_attribute_unused(), int events,
 	long ms, uint32 event pg_attribute_unused())
 {
 	UT_ASSERT(ms == 10 || ms == 1000);
-	UT_ASSERT_EQ((events & WL_LATCH_SET) != 0, ms == 1000);
+	UT_ASSERT((events & WL_LATCH_SET) != 0);
 	latch_waits++;
 	return WL_TIMEOUT;
 }
@@ -105,6 +105,8 @@ static void gcs_block_forward_reply_immediate_deny(const GcsBlockForwardPayload 
 #define ResetLatch(latch) ((void)0)
 #define MyLatch ((Latch *)1)
 #define ereport(level, ...) pg_re_throw()
+static bool gcs_first_fill_retry_progress(const ClusterPcmReadSource *source pg_attribute_unused(),
+	bool finish pg_attribute_unused()) { return latch_waits > 0; }
 #include "test_cluster_first_fill_holder.inc"
 #undef ereport
 #undef MyLatch
