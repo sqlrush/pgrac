@@ -75,6 +75,7 @@ typedef struct ClusterColdReplayRootV1 {
 	ClusterControlRootReadToken token;
 	XLogRecPtr checkpoint_start;
 	CheckPoint native_checkpoint;
+	uint8 native_window[160];
 	bool checkpoint_captured;
 } ColdRoot;
 
@@ -183,6 +184,7 @@ cold_participant(ClusterColdTypedV1 *typed, ColdRoot *root, uint32 index)
 	typed->sources[index] = selected.source;
 	root->checkpoint_start = selected.checkpoint_start;
 	memcpy(&root->native_checkpoint, &selected.checkpoint, sizeof(root->native_checkpoint));
+	memcpy(root->native_window, selected.native_window, sizeof(root->native_window));
 	root->checkpoint_captured = true;
 	memset(participant, 0, sizeof(*participant));
 	participant->thread_id = root->root.identity.origin_thread_id;
@@ -386,7 +388,9 @@ cold_census_take(ClusterColdTypedV1 *typed, ColdRoot *roots, const ClusterWalInp
 				|| roots[k].checkpoint_start != input->checkpoint_start
 				|| memcmp(&roots[k].native_checkpoint, &input->native_checkpoint,
 						  sizeof(input->native_checkpoint))
-					   != 0) {
+					   != 0
+				|| memcmp(roots[k].native_window, input->native_window,
+						  sizeof(input->native_window)) != 0) {
 				cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
 							"thread %u census cut differs from its ROOT source (native redo %X/%X)",
 							(unsigned)entry->cut.thread_id,
@@ -407,6 +411,8 @@ cold_census_take(ClusterColdTypedV1 *typed, ColdRoot *roots, const ClusterWalInp
 		roots[typed->participant_count].checkpoint_start = input->checkpoint_start;
 		memcpy(&roots[typed->participant_count].native_checkpoint, &input->native_checkpoint,
 			   sizeof(input->native_checkpoint));
+		memcpy(roots[typed->participant_count].native_window, input->native_window,
+			   sizeof(input->native_window));
 		roots[typed->participant_count].checkpoint_captured = true;
 		typed->participant_count++;
 	}
@@ -480,6 +486,10 @@ cold_scan_history(ClusterColdTypedV1 *typed)
 										 false, true, typed->side_plans[i], &scan);
 
 		typed->scanned_records += scan.records;
+		if (detail == CLUSTER_COLD_OK
+			&& memcmp(scan.native_window, typed->replay_roots[i].native_window,
+					  sizeof(scan.native_window)) != 0)
+			detail = CLUSTER_COLD_SOURCE_GAP;
 		if (detail != CLUSTER_COLD_OK) {
 			cold_refuse(typed, detail,
 						"pass-1 scan refused: %s; history thread %u record %X/%X (root result %d)",
@@ -543,7 +553,9 @@ cold_census_matches(ClusterColdTypedV1 *typed)
 			|| input->checkpoint_start != selected->checkpoint_start
 			|| input->native_redo != selected->native_checkpoint.redo
 			|| memcmp(&input->native_checkpoint, &selected->native_checkpoint,
-					  sizeof(input->native_checkpoint)) != 0)
+					  sizeof(input->native_checkpoint)) != 0
+			|| memcmp(input->native_window, selected->native_window,
+					  sizeof(input->native_window)) != 0)
 			return false;
 	}
 	return cluster_wal_inputs_revalidate_v1(typed->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
@@ -784,6 +796,9 @@ cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots,
 			= cluster_cold_scan_root_v1(typed->plan, i, &roots[i].root, &roots[i].token, false,
 										i != typed->own_participant, typed->side_plans[i], &scan);
 		typed->scanned_records += scan.records;
+		if (detail == CLUSTER_COLD_OK
+			&& memcmp(scan.native_window, roots[i].native_window, sizeof(scan.native_window)) != 0)
+			detail = CLUSTER_COLD_SOURCE_GAP;
 		if (detail != CLUSTER_COLD_OK) {
 			cold_refuse(typed, detail,
 						"pass-1 scan refused: %s; thread %u record %X/%X (root result %d, "
@@ -938,6 +953,8 @@ cluster_cold_typed_checkpoint_v1(const ClusterColdTypedV1 *typed, uint32 partici
 	out_checkpoint->checkpoint_start = selected->checkpoint_start;
 	memcpy(&out_checkpoint->checkpoint, &selected->native_checkpoint,
 		   sizeof(out_checkpoint->checkpoint));
+	memcpy(out_checkpoint->native_window, selected->native_window,
+		   sizeof(out_checkpoint->native_window));
 	return true;
 }
 
@@ -985,7 +1002,9 @@ cold_sources_match(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
 			|| selected->checkpoint_start != observed.checkpoint_start
 			|| memcmp(&selected->native_checkpoint, &observed.checkpoint,
 					  sizeof(observed.checkpoint))
-				   != 0)
+				   != 0
+			|| memcmp(selected->native_window, observed.native_window,
+					  sizeof(observed.native_window)) != 0)
 			return false;
 	}
 	return cold_native_profiles_match(typed);
@@ -1061,6 +1080,8 @@ cold_history_sources_match(ClusterColdTypedV1 *typed)
 			|| observed.checkpoint_start != selected->checkpoint_start
 			|| memcmp(&observed.checkpoint, &selected->native_checkpoint,
 						  sizeof(observed.checkpoint)) != 0
+			|| memcmp(observed.native_window, selected->native_window,
+					  sizeof(observed.native_window)) != 0
 			|| !cold_history_side_effects_match(typed, i))
 			return false;
 	}

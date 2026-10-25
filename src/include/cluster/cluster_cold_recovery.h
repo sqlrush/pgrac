@@ -943,9 +943,10 @@ extern bool cluster_cold_typed_recheck_inputs_v1(ClusterColdTypedV1 *typed);
 extern bool cluster_cold_typed_acquire_serial_v1(ClusterColdTypedV1 *typed,
 												 struct ClusterRecoveryFencePlan *fence);
 
-/* Original native checkpoint input for any selected generation, including
- * history. Copies only sealed input; failure clears both outputs. This does
- * not establish TT era, checkpoint coverage, replay or loser authority. */
+/* Original native checkpoint and its exact window for any selected generation,
+ * including history. Legacy zero windows remain zero. Copies only sealed input;
+ * failure clears both outputs. This does not establish TT era, checkpoint
+ * coverage, native lifetime, replay or loser authority. */
 extern bool cluster_cold_typed_checkpoint_v1(const ClusterColdTypedV1 *typed, uint32 participant,
 											 struct ClusterControlRootSnapshot *out_root,
 											 struct ClusterWalRecoveryCheckpointV1 *out_checkpoint);
