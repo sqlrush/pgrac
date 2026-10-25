@@ -93,7 +93,7 @@ cold_original_scope_setup(void)
 	if (cold_original_plan == NULL)
 		return;
 	input.plan = cold_original_plan;
-	UT_ASSERT(rf_side_online_plan_bind_sources_v1(cold_original_plan, &input.source, 1));
+	UT_ASSERT(cold_original_cohort_bind(cold_original_plan, &input.source));
 	/* Use the held execution ROOT reader; pass-1 pins may not be reacquired. */
 	UT_ASSERT_EQ(cluster_control_root_recovery_visit(&execution_root, &execution_token,
 													 relmap_retained_side_feed, &feed, &observed),

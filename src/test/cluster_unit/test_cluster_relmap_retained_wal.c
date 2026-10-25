@@ -45,6 +45,8 @@ static void cold_original_scope_setup(void);
 static void cold_original_scope_done(void);
 static void cold_original_protection_setup(void);
 static void cold_original_authority_postwrite(void);
+static bool cold_original_cohort_bind(RfSideOnlinePlanV1 *plan,
+									const ClusterWalSourceRef *selected);
 static size_t cold_original_terminal_payload(bool aborted, uint16 thread, uint8 *out);
 static TestRelmapNativeClogStats cold_native_clog_last;
 bool
@@ -3410,6 +3412,7 @@ UT_TEST(test_terminal_read_native_error_keeps_output_zero_and_custody_dead)
 #include "test_cluster_relmap_cold_native.inc"
 #include "test_cluster_relmap_original_scope.inc"
 #include "test_cluster_relmap_original_authority.inc"
+#include "test_cluster_relmap_original_cohort.inc"
 
 int
 main(int argc, char **argv)
@@ -3418,7 +3421,10 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(128);
+	UT_PLAN(131);
+	UT_RUN(test_cold_cohort_other_origins_preserve_selected_consumer);
+	UT_RUN(test_cold_cohort_same_origin_generations_refuse_before_native);
+	UT_RUN(test_cold_cohort_foreign_pending_requires_original_directory);
 	UT_RUN(test_cold_original_authority_rejects_broken_provenance_before_storage);
 	UT_RUN(test_cold_original_authority_postwrite_loss_keeps_original_debt);
 	UT_RUN(test_cold_original_authority_late_provider_refusal_or_error_keeps_pending);

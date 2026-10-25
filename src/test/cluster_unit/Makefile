@@ -3462,6 +3462,7 @@ test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
 		test_cluster_relmap_native_clog.h test_cluster_relmap_native_clog.o \
 		test_cluster_relmap_original_scope.h test_cluster_relmap_original_scope.inc \
 		test_cluster_relmap_original_authority.inc \
+		test_cluster_relmap_original_cohort.inc \
 		test_cluster_relmap_original_scope.o test_cluster_relmap_original_authority.o \
 		test_cluster_relmap_retained_arb.o test_cluster_relmap_retained_authority.o \
 		test_cluster_relmap_observation_namespace.o \
