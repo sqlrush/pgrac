@@ -985,6 +985,31 @@ cluster_recovery_cold_observation_physical_complete(struct ClusterRecoveryStartV
 	return true;
 }
 
+/* The complete raw view must also be usable by the original C0 terminal
+ * consumer before Startup waits for independent CTRC service. Never replace
+ * the retained pre-C0 work or raw bytes with these private derived values.
+ * This validates terminal inputs, not history coverage or apply authority. */
+static bool
+cluster_recovery_cold_observation_terminals_current(struct ClusterRecoveryStartV1 *start)
+{
+	uint32 count = start->ctrc_observation_work_copy->counts.subject_count;
+
+	for (uint32 i = 0; i < count; i++) {
+		ClusterColdTtSlotInputV1 terminal;
+
+		/* Check complete original inputs around each canonical/C0 lookup,
+		 * including the last subject and late owner or accepted-TX loss. */
+		if (!cluster_recovery_cold_observation_current(start)
+			|| !cluster_recovery_ctrc_terminal_subject_v1(start, start->ctrc_observation_work,
+				i, &start->ctrc_physical->entries[i], &terminal)
+			|| !cluster_recovery_cold_observation_current(start)) {
+			cluster_recovery_cold_observation_refuse(start, "physical_terminal", (int)i);
+			return false;
+		}
+	}
+	return cluster_recovery_cold_observation_current(start);
+}
+
 bool
 ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size memory_budget)
 {
@@ -1128,7 +1153,8 @@ ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size 
 			if (cluster_recovery_cold_observation_current(start)
 				&& cluster_recovery_census_manifest(state->ctrc_observation_census, &confirmed)
 				&& memcmp(&confirmed, &state->ctrc_observation_manifest, sizeof(confirmed)) == 0
-				&& cluster_recovery_cold_observation_current(start)) {
+				&& cluster_recovery_cold_observation_current(start)
+				&& cluster_recovery_cold_observation_terminals_current(state)) {
 				state->ctrc_observation_complete = true;
 				observed = true;
 			} else

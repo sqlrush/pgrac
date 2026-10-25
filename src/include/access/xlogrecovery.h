@@ -196,6 +196,8 @@ extern bool ClusterColdRecoveryCtrcWorkCurrent(const struct ClusterRecoveryStart
  * under its original CTRC scope, retaining both under this same Start.
  * memory_budget includes the immutable work copy, current physical TT view
  * and census-owned allocations (not borrowed inputs/reader/cryptohash storage).
+ * After manifest checks, qualify every retained physical subject with the
+ * original canonical C0/preexisting terminal consumer without changing it.
  * Repeated calls only revalidate the saved observation; refusal is sticky.
  * DRAINED/manifest never supplies a semantic seal, freeze, PAGE authority,
  * service completion or release. Original Start cleanup retires cursor before
@@ -207,6 +209,8 @@ extern const char *ClusterColdRecoveryCtrcObservationRefusal(
 	const struct ClusterRecoveryStartV1 *start);
 
 /* Borrow the same complete raw physical TT view after original observation.
+ * Each subject must also pass the original canonical C0/preexisting terminal
+ * consumer after the manifest checks, including every repeat validation.
  * Exact original Start/work and repeat observation revalidation are required;
  * no new scope/census or source refresh. Run before PAGE/content protection:
  * original interrupt/manifest checks may execute. NULL refuses, including a
