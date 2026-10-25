@@ -65,6 +65,7 @@ typedef struct ClusterRecoveryCtrcIoScopeV1 {
 	char namespace_path[MAXPGPATH];
 	struct stat namespace_identity;
 	bool serial_prepared;
+	bool serial_replay;
 	uint32 serial_subject;
 	ClusterRecoverySerialRequest serial_request;
 } ClusterRecoveryCtrcIoScopeV1;
@@ -1785,6 +1786,19 @@ cluster_wal_inputs_tx_abort_current_v1(ClusterWalInputsV1 *inputs,
 		&& memcmp(record, &candidate.record, sizeof(*record)) == 0;
 }
 
+/* Keep the two original purposes distinct even when both indexes are zero.
+ * Native IR callbacks may only validate the purpose prepared on this scope. */
+static bool
+inputs_ctrc_serial_current(ClusterWalInputsV1 *inputs, uint32 index,
+	const ClusterRecoverySerialRequest *request, bool replay)
+{
+	return replay
+		? ClusterColdRecoveryCtrcReplayRequestCurrent(inputs->ctrc.start,
+			inputs->ctrc.work, index, inputs, request)
+		: ClusterColdRecoveryCtrcSerialRequestCurrent(inputs->ctrc.start,
+			inputs->ctrc.work, index, inputs, request);
+}
+
 /* Reconstruct only original request inputs, never a held guard. The old RR
  * token is retained verbatim; current COMPLETE/history comes solely from this
  * scope's actual full ROOT selection, original source cut and WALR owner. */
@@ -1805,9 +1819,8 @@ inputs_tx_subject_request(ClusterWalInputsV1 *inputs, ClusterRecoverySerialReque
 		return false;
 	if (inputs->purpose == WAL_INPUTS_CTRC_CENSUS) {
 		if (!inputs->ctrc.serial_prepared
-			|| !ClusterColdRecoveryCtrcSerialRequestCurrent(inputs->ctrc.start,
-				inputs->ctrc.work, inputs->ctrc.serial_subject, inputs,
-				&inputs->ctrc.serial_request))
+			|| !inputs_ctrc_serial_current(inputs, inputs->ctrc.serial_subject,
+				&inputs->ctrc.serial_request, inputs->ctrc.serial_replay))
 			return false;
 		request = inputs->ctrc.serial_request;
 		request.tx_closure_scope = NULL;
@@ -1956,11 +1969,12 @@ cluster_wal_inputs_tx_abort_acquire_v1(ClusterWalInputsV1 *inputs,
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
-bool
-cluster_wal_inputs_ctrc_authorized_v1(ClusterWalInputsV1 *inputs, uint32 subject_index)
+static bool
+inputs_ctrc_authorized(ClusterWalInputsV1 *inputs, uint32 subject_index, bool replay)
 {
 	if (!inputs_owned(inputs) || inputs->purpose != WAL_INPUTS_CTRC_CENSUS
 		|| !inputs->ctrc.serial_prepared || inputs->ctrc.serial_subject != subject_index
+		|| inputs->ctrc.serial_replay != replay
 		|| !inputs->tx.ir_ready || inputs->tx.ir_revoked)
 		return false;
 	if (!inputs_current(inputs)
@@ -1973,9 +1987,9 @@ cluster_wal_inputs_ctrc_authorized_v1(ClusterWalInputsV1 *inputs, uint32 subject
 	return true;
 }
 
-ClusterControlRootResult
-cluster_wal_inputs_ctrc_acquire_v1(ClusterWalInputsV1 *inputs, uint32 subject_index,
-	const ClusterRecoverySerialRequest *provisional)
+static ClusterControlRootResult
+inputs_ctrc_acquire(ClusterWalInputsV1 *inputs, uint32 subject_index,
+	const ClusterRecoverySerialRequest *provisional, bool replay)
 {
 	ClusterRecoverySerialRequest request;
 	ClusterControlRootResult result;
@@ -1989,14 +2003,14 @@ cluster_wal_inputs_ctrc_acquire_v1(ClusterWalInputsV1 *inputs, uint32 subject_in
 	if (request.mode != CLUSTER_RECOVERY_SERIAL_TX_CLOSURE || request.tx_closure_scope != NULL)
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	request.tx_closure_scope = inputs;
-	if (!ClusterColdRecoveryCtrcSerialRequestCurrent(inputs->ctrc.start, inputs->ctrc.work,
-			subject_index, inputs, &request))
+	if (!inputs_ctrc_serial_current(inputs, subject_index, &request, replay))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (inputs->ctrc.serial_prepared) {
-		if (inputs->ctrc.serial_subject != subject_index
+		if (inputs->ctrc.serial_replay != replay || inputs->ctrc.serial_subject != subject_index
 			|| !cluster_wal_inputs_tx_serial_current_v1(inputs, &request))
 			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	} else {
+		inputs->ctrc.serial_replay = replay;
 		inputs->ctrc.serial_subject = subject_index;
 		inputs->ctrc.serial_request = request;
 		inputs->ctrc.serial_prepared = true;
@@ -2054,15 +2068,16 @@ cluster_wal_inputs_ctrc_acquire_v1(ClusterWalInputsV1 *inputs, uint32 subject_in
 	return result;
 }
 
-ClusterControlRootResult
-cluster_wal_inputs_ctrc_release_v1(ClusterWalInputsV1 *inputs, uint32 subject_index)
+static ClusterControlRootResult
+inputs_ctrc_release(ClusterWalInputsV1 *inputs, uint32 subject_index, bool replay)
 {
 	bool revoked;
 
 	if (CritSectionCount != 0 || cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	if (!inputs_owned(inputs) || inputs->purpose != WAL_INPUTS_CTRC_CENSUS
-		|| !inputs->ctrc.serial_prepared || inputs->ctrc.serial_subject != subject_index)
+		|| !inputs->ctrc.serial_prepared || inputs->ctrc.serial_subject != subject_index
+		|| inputs->ctrc.serial_replay != replay)
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	/* Cleanup must not depend on still-current proofs. Retain every byte of
 	 * the request/guard and its WALR scope if original release is uncertain. */
@@ -2072,8 +2087,47 @@ cluster_wal_inputs_ctrc_release_v1(ClusterWalInputsV1 *inputs, uint32 subject_in
 	inputs->tx.ir_ready = false;
 	inputs->tx.ir_revoked = revoked;
 	inputs->ctrc.serial_prepared = false;
+	inputs->ctrc.serial_replay = false;
 	memset(&inputs->ctrc.serial_request, 0, sizeof(inputs->ctrc.serial_request));
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+bool
+cluster_wal_inputs_ctrc_authorized_v1(ClusterWalInputsV1 *inputs, uint32 subject_index)
+{
+	return inputs_ctrc_authorized(inputs, subject_index, false);
+}
+
+bool
+cluster_wal_inputs_ctrc_replay_authorized_v1(ClusterWalInputsV1 *inputs, uint32 source_index)
+{
+	return inputs_ctrc_authorized(inputs, source_index, true);
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_ctrc_acquire_v1(ClusterWalInputsV1 *inputs, uint32 subject_index,
+	const ClusterRecoverySerialRequest *provisional)
+{
+	return inputs_ctrc_acquire(inputs, subject_index, provisional, false);
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_ctrc_replay_acquire_v1(ClusterWalInputsV1 *inputs, uint32 source_index,
+	const ClusterRecoverySerialRequest *provisional)
+{
+	return inputs_ctrc_acquire(inputs, source_index, provisional, true);
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_ctrc_release_v1(ClusterWalInputsV1 *inputs, uint32 subject_index)
+{
+	return inputs_ctrc_release(inputs, subject_index, false);
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_ctrc_replay_release_v1(ClusterWalInputsV1 *inputs, uint32 source_index)
+{
+	return inputs_ctrc_release(inputs, source_index, true);
 }
 
 static bool
@@ -2285,6 +2339,86 @@ cluster_wal_inputs_ctrc_subject_covers_window_v1(
 	memcpy(&original, authority, sizeof(original));
 	return lower != InvalidXLogRecPtr && upper > lower
 		&& cluster_wal_inputs_ctrc_subject_current_v1(&original)
+		&& thread == original.source.selected.source.claim.identity.origin_thread_id
+		&& lower >= original.source.selected.checkpoint.checkpoint_lower_lsn
+		&& upper <= original.source.selected.checkpoint.validated_tail_lsn_exclusive
+		&& memcmp(authority, &original, sizeof(original)) == 0;
+}
+
+/* Replay-origin views use their own discriminator and original index.
+ * They cannot be consumed as a TT subject or an all-source held set. */
+static bool
+inputs_ctrc_replay_authority(ClusterWalInputsV1 *inputs, uint32 source_index,
+	ClusterRecoveryCtrcReplayAuthorityV1 *out)
+{
+	ClusterRecoveryCtrcReplayAuthorityV1 authority = {0};
+	ClusterRecoverySerialRequest request;
+	const ClusterWalInputV1 *selected;
+
+	if (inputs == NULL || inputs != active_ctrc_retention.scope)
+		return false;
+	memcpy(&authority.source.retention, &active_ctrc_retention,
+		sizeof(authority.source.retention));
+	if (!inputs_ctrc_retention_locator_current(&authority.source.retention)
+		|| !cluster_wal_inputs_ctrc_replay_authorized_v1(inputs, source_index)
+		|| !inputs_tx_subject_request(inputs, &request, &selected))
+		return false;
+	authority.ir_request_id = inputs->tx.ir.lock_request.request_id;
+	if (authority.ir_request_id == 0)
+		return false;
+	authority.work_generation = inputs->ctrc.work_generation;
+	authority.source_index = source_index;
+	memcpy(&authority.source.root, &inputs->token, sizeof(authority.source.root));
+	memcpy(&authority.source.selected, selected, sizeof(authority.source.selected));
+	memcpy(&authority.source.replay_token, &request.expected_root_token,
+		sizeof(authority.source.replay_token));
+	if (!inputs_ctrc_retention_locator_current(&authority.source.retention)
+		|| !cluster_wal_inputs_ctrc_replay_authorized_v1(inputs, source_index)
+		|| authority.ir_request_id != inputs->tx.ir.lock_request.request_id
+		|| authority.work_generation != inputs->ctrc.work_generation)
+		return false;
+	memcpy(out, &authority, sizeof(authority));
+	return true;
+}
+
+ClusterRecoveryCtrcReplayAuthorityV1
+cluster_wal_inputs_ctrc_replay_source_v1(ClusterWalInputsV1 *inputs, uint32 source_index)
+{
+	ClusterRecoveryCtrcReplayAuthorityV1 authority = {0};
+	ClusterRecoveryCtrcReplayAuthorityV1 empty = {0};
+
+	if (!inputs_ctrc_replay_authority(inputs, source_index, &authority))
+		return empty;
+	return authority;
+}
+
+bool
+cluster_wal_inputs_ctrc_replay_source_current_v1(const ClusterRecoveryCtrcReplayAuthorityV1 *authority)
+{
+	ClusterRecoveryCtrcReplayAuthorityV1 original, current;
+
+	if (authority == NULL)
+		return false;
+	memcpy(&original, authority, sizeof(original));
+	return inputs_ctrc_retention_locator_current(&original.source.retention)
+		&& inputs_ctrc_replay_authority(original.source.retention.scope,
+			original.source_index, &current)
+		&& memcmp(&original, &current, sizeof(original)) == 0
+		&& memcmp(authority, &original, sizeof(original)) == 0;
+}
+
+bool
+cluster_wal_inputs_ctrc_replay_source_covers_window_v1(
+	const ClusterRecoveryCtrcReplayAuthorityV1 *authority, uint16 thread,
+	XLogRecPtr lower, XLogRecPtr upper)
+{
+	ClusterRecoveryCtrcReplayAuthorityV1 original;
+
+	if (authority == NULL)
+		return false;
+	memcpy(&original, authority, sizeof(original));
+	return lower != InvalidXLogRecPtr && upper > lower
+		&& cluster_wal_inputs_ctrc_replay_source_current_v1(&original)
 		&& thread == original.source.selected.source.claim.identity.origin_thread_id
 		&& lower >= original.source.selected.checkpoint.checkpoint_lower_lsn
 		&& upper <= original.source.selected.checkpoint.validated_tail_lsn_exclusive

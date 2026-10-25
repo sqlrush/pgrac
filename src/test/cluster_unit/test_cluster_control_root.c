@@ -26007,6 +26007,7 @@ UT_TEST(test_tx_inputs_parent_subject_and_wait_revalidation)
 #include "test_cluster_control_ctrc_local_wal.inc"
 #include "test_cluster_control_ctrc_namespace.inc"
 #include "test_cluster_control_ctrc_ir.inc"
+#include "test_cluster_control_ctrc_replay_ir.inc"
 #include "test_cluster_control_ctrc_stable.inc"
 
 /*
@@ -26234,6 +26235,19 @@ main(int argc, char **argv)
 		UT_RUN(test_ctrc_stable_new_native_grant_cannot_revive_old_proof);
 		UT_RUN(test_ctrc_stable_cf_wait_and_changed_root_keep_original_owners);
 		UT_RUN(test_ctrc_stable_late_scope_loss_and_error_never_publish_proof);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_CTRC_REPLAY_IR") != NULL) {
+		UT_PLAN(8);
+		UT_RUN(test_ctrc_replay_ir_grants_original_source_without_a_tt_subject);
+		UT_RUN(test_ctrc_replay_ir_never_substitutes_for_subject_purpose);
+		UT_RUN(test_ctrc_replay_ir_wait_keeps_original_purpose_and_holder);
+		UT_RUN(test_ctrc_replay_ir_rejects_wrong_original_and_provisional_inputs);
+		UT_RUN(test_ctrc_replay_ir_late_loss_retains_exact_native_cleanup_debt);
+		UT_RUN(test_ctrc_replay_source_freezes_native_values_and_exact_window);
+		UT_RUN(test_ctrc_replay_ir_uncertain_release_keeps_purpose_request_and_walr);
+		UT_RUN(test_ctrc_replay_ir_error_and_reacquire_never_renew_old_source);
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
@@ -26482,7 +26496,16 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(551);
+	UT_PLAN(559);
+	UT_RUN(test_ctrc_replay_ir_grants_original_source_without_a_tt_subject);
+	UT_RUN(test_ctrc_replay_ir_never_substitutes_for_subject_purpose);
+	UT_RUN(test_ctrc_replay_ir_wait_keeps_original_purpose_and_holder);
+	UT_RUN(test_ctrc_replay_ir_rejects_wrong_original_and_provisional_inputs);
+	UT_RUN(test_ctrc_replay_ir_late_loss_retains_exact_native_cleanup_debt);
+	UT_RUN(test_ctrc_replay_source_freezes_native_values_and_exact_window);
+	UT_RUN(test_ctrc_replay_ir_uncertain_release_keeps_purpose_request_and_walr);
+	UT_RUN(test_ctrc_replay_ir_error_and_reacquire_never_renew_old_source);
+
 	UT_RUN(test_ctrc_stable_uses_original_native_scope_and_unchanged_selector);
 	UT_RUN(test_ctrc_stable_refuses_forged_owner_and_uncovered_source_cut);
 	UT_RUN(test_ctrc_stable_checks_every_contributor_instead_of_first_owner);
