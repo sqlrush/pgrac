@@ -2089,6 +2089,19 @@ test_cluster_heap_freeze_policy_current.inc: $(top_srcdir)/src/backend/cluster/c
 	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Original shared census layout and begin; readiness/traversal stay external.
+test_cluster_heap_ctrc_types.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c $(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h Makefile
+	@awk '/^typedef struct (CtrcCleanerWorkerObservationShared|ClusterCtrcSharedHeader) / { emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 2 || done != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_ctrc_begin.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk '/^cluster_ctrc_active_scan_begin\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_ctrc_registration.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
 	awk '/^ctrc_note_unqualified_registration\(/ { print "static void"; emit=1; found++ } \
 	     /^cluster_ctrc_active_scan_registration_current\(/ { print "bool"; emit=1; found++ } \
@@ -2097,6 +2110,7 @@ test_cluster_heap_ctrc_registration.inc: $(top_srcdir)/src/backend/cluster/clust
 
 test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_ctrc_registration.inc \
+		test_cluster_heap_ctrc_types.inc test_cluster_heap_ctrc_begin.inc \
 		test_cluster_heap_freeze_cohort_current.inc \
 		test_cluster_heap_freeze_cohort_backend.inc \
 		test_cluster_heap_freeze_worker_current.inc \
@@ -5023,6 +5037,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_freeze_worker_pass.inc test_cluster_heap_freeze_worker_pass.inc.tmp
 	rm -f test_cluster_heap_freeze_pgproc_types.inc test_cluster_heap_freeze_pgproc_types.inc.tmp
 	rm -f test_cluster_heap_freeze_pgproc_sample.inc test_cluster_heap_freeze_pgproc_sample.inc.tmp
+	rm -f test_cluster_heap_ctrc_types.inc test_cluster_heap_ctrc_types.inc.tmp test_cluster_heap_ctrc_begin.inc test_cluster_heap_ctrc_begin.inc.tmp
 	rm -f test_cluster_heap_freeze_stripe_future.inc test_cluster_heap_freeze_stripe_future.inc.tmp
 	rm -f test_cluster_heap_freeze_lease_current.inc test_cluster_heap_freeze_lease_current.inc.tmp
 	rm -f test_cluster_space_cache_insert.inc test_cluster_space_cache_delete.inc test_cluster_space_cache_allocation.inc test_cluster_space_cache_update.inc

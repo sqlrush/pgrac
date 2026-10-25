@@ -153,12 +153,10 @@ static bool post_space_census_error;
 static ClusterHeapFreezeCohortObservation *post_space_bounds;
 static ClusterHeapFreezePolicySampleV1 *post_space_policy;
 
-/* Compile the original ingress producer and current-cut predicate together
- * with the native apply bodies. Only the shared-header storage projection,
- * runtime attachment and concurrent callback schedule remain fixture leaves. */
-static struct {
-	pg_atomic_uint64 unqualified_registration_generation;
-} registration_shared, *CtrcShared = &registration_shared;
+/* Original shared-header layout, ingress producer and current-cut predicate.
+ * Header publication, runtime attachment and scheduling are fixture leaves. */
+#include "test_cluster_heap_ctrc_types.inc"
+static ClusterCtrcSharedHeader registration_shared, *CtrcShared = &registration_shared;
 static bool registration_attached;
 
 static bool
@@ -850,6 +848,7 @@ worker_original_publish_fixture(const ClusterHeapFreezeCohortObservation *cohort
  * are controlled; they supply no producer-retention or freeze authority. */
 static bool pass_capture_allowed, pass_native_allowed, pass_begin_allowed, pass_pending;
 static unsigned pass_capture_reads, pass_native_reads, pass_begin_reads, pass_step_reads;
+static unsigned pass_census_ready_reads;
 static unsigned pass_lease_checks, pass_admission_checks, pass_incomplete_slices;
 static int pass_step_fault;
 static FullTransactionId pass_reference, pass_future, pass_active_min;
@@ -1035,16 +1034,25 @@ worker_pass_native_sample(FullTransactionId *reference, FullTransactionId *futur
 }
 
 static bool
+worker_census_shmem_ready(void)
+{
+	worker_pass_assert_unlocked(); pass_census_ready_reads++;
+	/* Exact capacity/header attachment is not exercised by this fixture. */
+	return registration_attached && CtrcShared != NULL;
+}
+#define cluster_ctrc_shmem_ready worker_census_shmem_ready
+#define cluster_ctrc_active_scan_begin original_census_scan_begin
+#include "test_cluster_heap_ctrc_begin.inc"
+#undef cluster_ctrc_active_scan_begin
+#undef cluster_ctrc_shmem_ready
+
+static bool
 worker_pass_census_begin(ClusterCtrcActiveScan *scan, FullTransactionId reference)
 {
 	worker_pass_assert_unlocked(); pass_begin_reads++;
 	UT_ASSERT_EQ(pass_native_reads, pass_begin_reads);
 	if (!pass_begin_allowed) return false;
-	scan->status = CTRC_ACTIVE_SCAN_INCOMPLETE;
-	scan->reference_full = reference;
-	scan->unqualified_registration_generation = pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation);
-	scan->total_entries = 1;
-	return true;
+	return original_census_scan_begin(scan, reference);
 }
 
 static void
@@ -1722,6 +1730,7 @@ reset(uint8 opcode, bool shared)
 	pass_capture_allowed = pass_native_allowed = pass_begin_allowed = true;
 	pass_pending = false; pass_step_fault = 0; pass_incomplete_slices = 0;
 	pass_capture_reads = pass_native_reads = pass_begin_reads = pass_step_reads = 0;
+	pass_census_ready_reads = 0;
 	pass_lease_checks = pass_admission_checks = 0;
 	pass_reference = pass_future = pass_active_min = InvalidFullTransactionId;
 	memset(&pass_captured_admission, 0, sizeof(pass_captured_admission));
@@ -1741,6 +1750,8 @@ reset(uint8 opcode, bool shared)
 	advance_legal_next_after_target = NULL;
 	CtrcShared = &registration_shared;
 	registration_attached = true;
+	memset(CtrcShared, 0, sizeof(*CtrcShared));
+	CtrcShared->origin_key_entries = CtrcShared->participant_key_entries = 1;
 	pg_atomic_init_u64(&CtrcShared->unqualified_registration_generation, 41);
 	registration_checks = 0;
 	advance_registration_after_target = advance_registration_in_clock = false;
@@ -5920,10 +5931,143 @@ UT_TEST(test_xmin_original_stripe_future_rechecks_after_snapshot_unlock)
 	}
 }
 
+UT_TEST(test_xmin_original_census_begin_refuses_invalid_reference)
+{
+	for (uint32 raw = InvalidTransactionId; raw < FirstNormalTransactionId; raw++) {
+		QualifiedXminFixture f; ClusterCtrcActiveScan scan, expected;
+		qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI); fixture_release_original_writer();
+		/* Direct begin API only; no native sample is fabricated or published. */
+		pass_native_reads = 1;
+		memset(&scan, 0xa5, sizeof(scan)); memset(&expected, 0, sizeof(expected));
+		expected.status = CTRC_ACTIVE_SCAN_INVALID;
+		UT_ASSERT(!worker_pass_census_begin(&scan, raw == 0 ? InvalidFullTransactionId : FullTransactionIdFromEpochAndXid(1, raw)));
+		UT_ASSERT(memcmp(&scan, &expected, sizeof(scan)) == 0);
+		UT_ASSERT(!original_census_scan_begin(NULL, f.policy.legal_next));
+		UT_ASSERT_EQ(pass_census_ready_reads, 0);
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+		UT_ASSERT(!sampler_lock_held && !lease_lock_held && !worker_lock_held && !local_x && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
+UT_TEST(test_xmin_original_census_begin_continues_native_wal)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		qualified_xmin_require_peer(&f, 65);
+		/* Only traversal remains controlled: these are header inputs, not rows. */
+		CtrcShared->origin_key_entries = 2; CtrcShared->participant_key_entries = 3;
+		native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id - 1;
+		fixture_release_original_writer(); resume_allowed = true;
+		worker_original_sample_pass_fixture(&f.cohort);
+		UT_ASSERT_EQ(pass_begin_reads, 1); UT_ASSERT_EQ(pass_census_ready_reads, 1);
+		UT_ASSERT_EQ(publisher_scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+		UT_ASSERT_EQ(publisher_scan.total_entries, 5); UT_ASSERT_EQ(publisher_scan.next_index, 5);
+		UT_ASSERT_EQ(publisher_scan.unqualified_registration_generation, 41);
+		UT_ASSERT(FullTransactionIdEquals(publisher_scan.reference_full, sampler_variables.nextXid));
+		UT_ASSERT_EQ(U64FromFullTransactionId(publisher_scan.min_full), f.cohort.active_full_xid_min);
+		f.cohort.local_registration_cut = publisher_scan;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT(!sampler_lock_held && !lease_lock_held && !worker_lock_held && !local_x && !resumed_writer);
+		UT_ASSERT(f.admission.entered); UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
+UT_TEST(test_xmin_original_census_begin_refuses_unavailable_header)
+{
+	for (int fault = 0; fault < 8; fault++) {
+		QualifiedXminFixture f; ClusterUndoCleanerActiveSample zero;
+		qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id - 1;
+		switch (fault) {
+		case 0: CtrcShared = NULL; break;
+		case 1: registration_attached = false; break;
+		case 2: pg_atomic_write_u64(&CtrcShared->unqualified_registration_generation, 0); break;
+		case 3: pg_atomic_write_u64(&CtrcShared->unqualified_registration_generation, UINT64_MAX); break;
+		case 4: CtrcShared->origin_key_entries = UINT64_MAX; break;
+		case 5: CtrcShared->origin_key_entries = UINT64_MAX - 1; CtrcShared->participant_key_entries = 2; break;
+		case 6: CtrcShared->participant_key_entries = UINT64_MAX; break;
+		case 7: CtrcShared->origin_key_entries = CtrcShared->participant_key_entries = UINT64_MAX; break;
+		}
+		fixture_release_original_writer(); resume_allowed = true;
+		worker_original_sample_pass_fixture(&f.cohort);
+		memset(&zero, 0, sizeof(zero));
+		UT_ASSERT_EQ(pass_begin_reads, 1); UT_ASSERT_EQ(pass_census_ready_reads, 1);
+		UT_ASSERT_EQ(publisher_scan.status, CTRC_ACTIVE_SCAN_INVALID); UT_ASSERT(!pass_pending);
+		UT_ASSERT(memcmp(&zero, &native_worker_shared.active_sample, sizeof(zero)) == 0);
+		UT_ASSERT(!qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes + conditional_unlocks, 0);
+		UT_ASSERT_EQ(sampler_lock_acquires, sampler_lock_releases);
+		UT_ASSERT_EQ(lease_lock_acquires, lease_lock_releases);
+		UT_ASSERT(!sampler_lock_held && !lease_lock_held && !worker_lock_held && !local_x && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_original_census_begin_count_boundary_is_api_only)
+{
+	for (int shape = 0; shape < 2; shape++) {
+		QualifiedXminFixture f; ClusterCtrcActiveScan scan;
+		qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI); fixture_release_original_writer();
+		/* Exercise sum arithmetic only; no array of this size is allocated/scanned. */
+		CtrcShared->origin_key_entries = shape ? UINT64_MAX : UINT64_MAX - 1;
+		CtrcShared->participant_key_entries = shape ? 0 : 1;
+		memset(&scan, 0xa5, sizeof(scan));
+		UT_ASSERT(original_census_scan_begin(&scan, f.policy.legal_next));
+		UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_INCOMPLETE);
+		UT_ASSERT_EQ(scan.total_entries, UINT64_MAX); UT_ASSERT_EQ(scan.next_index, 0);
+		UT_ASSERT_EQ(scan.unqualified_registration_generation, 41);
+		UT_ASSERT(FullTransactionIdEquals(scan.reference_full, f.policy.legal_next));
+		UT_ASSERT(FullTransactionIdEquals(scan.min_full, f.policy.legal_next));
+		UT_ASSERT(!FullTransactionIdIsValid(scan.future_full) && !scan.lock_busy);
+		UT_ASSERT_EQ(pass_census_ready_reads, 1);
+		UT_ASSERT_EQ(pass_capture_reads + pass_native_reads + pass_begin_reads + pass_step_reads, 0);
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+		UT_ASSERT(!sampler_lock_held && !lease_lock_held && !worker_lock_held && !local_x && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
+UT_TEST(test_xmin_original_census_begin_retains_registration_across_continuation)
+{
+	QualifiedXminFixture f; ClusterCtrcActiveScan first;
+	qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+	qualified_xmin_require_peer(&f, 65);
+	native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id - 1;
+	fixture_release_original_writer(); resume_allowed = true; pass_incomplete_slices = 1;
+	worker_original_sample_pass_fixture(&f.cohort);
+	first = publisher_scan;
+	UT_ASSERT_EQ(first.status, CTRC_ACTIVE_SCAN_INCOMPLETE); UT_ASSERT(pass_pending);
+	UT_ASSERT_EQ(first.total_entries, 2); UT_ASSERT_EQ(first.unqualified_registration_generation, 41);
+	ctrc_note_unqualified_registration();
+	UT_ASSERT(!cluster_ctrc_active_scan_registration_current(&first));
+	original_worker_sample_active_pass();
+	UT_ASSERT_EQ(pass_capture_reads, 1); UT_ASSERT_EQ(pass_native_reads, 1);
+	UT_ASSERT_EQ(pass_begin_reads, 1); UT_ASSERT_EQ(pass_census_ready_reads, 1);
+	UT_ASSERT_EQ(pass_step_reads, 2);
+	UT_ASSERT_EQ(publisher_scan.unqualified_registration_generation, first.unqualified_registration_generation);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), 42);
+	f.cohort.local_registration_cut = publisher_scan;
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes + conditional_unlocks, 0);
+	UT_ASSERT(!sampler_lock_held && !lease_lock_held && !worker_lock_held && !local_x && f.admission.entered);
+	UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(153);
+	UT_PLAN(158);
+	UT_RUN(test_xmin_original_census_begin_refuses_invalid_reference);
+	UT_RUN(test_xmin_original_census_begin_continues_native_wal);
+	UT_RUN(test_xmin_original_census_begin_refuses_unavailable_header);
+	UT_RUN(test_xmin_original_census_begin_count_boundary_is_api_only);
+	UT_RUN(test_xmin_original_census_begin_retains_registration_across_continuation);
 	UT_RUN(test_xmin_original_stripe_future_refuses_exhausted_lease);
 	UT_RUN(test_xmin_original_stripe_future_continues_native_wal);
 	UT_RUN(test_xmin_original_stripe_future_refuses_unavailable_inputs);
