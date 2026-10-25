@@ -9548,10 +9548,11 @@ test_cluster_ctrc_horizon_cohort.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     /^undo_horizon_v2_required\(/ { print "static bool"; emit=1; found++ } \
 	     /^undo_horizon_v2_observe_peer\(/ { print "static ClusterHeapFreezeCohortStatus"; emit=1; found++ } \
 	     /^undo_horizon_v2_cohort_current\(/ { print "static ClusterHeapFreezeCohortStatus"; emit=1; found++ } \
+	     /^cluster_heap_freeze_cohort_current\(/ { print "ClusterHeapFreezeCohortStatus"; emit=1; found++ } \
 	     /^undo_horizon_v2_cohort_observe\(/ && ++cohort_seen == 2 { print "static ClusterHeapFreezeCohortStatus"; emit=1; found++ } \
 	     /^undo_horizon_publish_freeze_watermark\(/ && ++publish_seen == 2 { print "static bool"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (found != 14 || cohort_seen != 2 || publish_seen != 2 || types || emit) exit 1 }' $< > $@.tmp
+	     END { if (found != 15 || cohort_seen != 2 || publish_seen != 2 || types || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Receive the sender's actual V2 bytes with the original handler and rejection counter.
