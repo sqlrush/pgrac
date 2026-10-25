@@ -8889,8 +8889,22 @@ test_cluster_xid_allocation.inc: $(top_srcdir)/src/backend/access/transam/varsup
 	     emit { print } /^}/ { emit=0 } END { if (found != 7) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_xid_allocation_stripe.inc: $(top_srcdir)/src/backend/cluster/cluster_xid_stripe_boot.c Makefile
+	awk '/^typedef struct ClusterXidStripe(Lease|BootShmem) / { emit=1; types++ } \
+	     /^static ClusterXidStripe(Lease|BootShmem) \*/ { print; pointers++ } \
+	     /^cluster_xid_stripe_(sample_future|sample_fence_current|lease_ready|window_exceeded)\(/ { print "static bool"; emit=1; found++ } \
+	     /^cluster_xid_wrap_barrier_passed\(/ { print "static bool"; emit=1; found++ } \
+	     /^cluster_xid_stripe_(my_slot_floor|herding_floor)\(/ { print "static FullTransactionId"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (types != 2 || pointers != 2 || found != 7) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_xid_allocation: test_cluster_xid_allocation.c unit_test.h \
-		test_cluster_xid_allocation.inc test_cluster_pgproc_active_types.inc $(CLUSTER_XID_STRIPE_O) \
+		test_cluster_xid_allocation.inc test_cluster_xid_allocation_stripe.inc \
+		test_cluster_pgproc_active_types.inc $(CLUSTER_XID_STRIPE_O) \
+		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
+		$(top_srcdir)/src/include/cluster/cluster_qvotec.h \
+		$(top_srcdir)/src/include/storage/condition_variable.h \
 		$(top_srcdir)/src/include/access/twophase.h \
 		$(top_srcdir)/src/include/storage/proc.h \
 		$(top_srcdir)/src/include/storage/procarray.h
