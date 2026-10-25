@@ -67,7 +67,9 @@ heap_freeze_report_v2_kind_valid(uint32 kind)
 static bool
 heap_freeze_report_v2_full_xid_valid(uint64 value)
 {
-	return FullTransactionIdIsValid(FullTransactionIdFromU64(value));
+	/* A nonzero epoch does not make a special raw XID normal. */
+	return value != UINT64_MAX
+		&& TransactionIdIsNormal(XidFromFullTransactionId(FullTransactionIdFromU64(value)));
 }
 
 static bool
