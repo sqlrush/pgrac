@@ -41,6 +41,9 @@
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_heap_horizon.h"
+#include "cluster/cluster_undo_cleaner.h"
+#include "cluster/cluster_undo_horizon.h"
+#include "cluster/cluster_conf.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_wal_thread.h"
@@ -133,6 +136,13 @@ static bool allocation_fence_error;
 bool cluster_xid_striping;
 static bool saved_policy_current;
 static ClusterHeapFreezeCohortStatus saved_cohort_status;
+/* Attachment/publication and the bounded peer/H backend remain fixture leaves. */
+static unsigned char cohort_attachment;
+static const void *UndoHorizonShmem = &cohort_attachment;
+static const ClusterHeapFreezeCohortObservation *cohort_source_input;
+static bool cohort_sample_available, cohort_sample_error, cohort_revoke_ingress;
+static int cohort_sample_fault;
+static unsigned cohort_sample_reads, cohort_backend_checks;
 static int source_current_error_stage, source_current_revoke_census;
 static const ClusterHeapFreezePolicySampleV1 *expected_current_policy;
 static const ClusterHeapFreezeCohortObservation *expected_current_cohort;
@@ -419,6 +429,57 @@ cluster_heap_freeze_policy_sample_current_v1(const ClusterHeapFreezePolicySample
 	return actual_saved_policy_current(sample);
 }
 
+/* Return a structured worker publication to the original current entry. Its
+ * acquisition/lease authority is controlled; independent mismatches are injected
+ * below, so this never certifies the all-producer or native lifetime chain. */
+bool
+cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out)
+{
+	UT_ASSERT(!local_x && !local_share && backend_pin_count == 1);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+	UT_ASSERT_EQ(cohort_current_checks, 1);
+	cohort_sample_reads++;
+	if (cohort_sample_error) elog(ERROR, "injected worker publication read ERROR");
+	if (!cohort_sample_available) return false;
+	UT_ASSERT(cohort_source_input != NULL);
+	memset(out, 0, sizeof(*out));
+	out->sample_id = cohort_source_input->source_local_sample_id;
+	out->worker_pid = 42;
+	out->scan = cohort_source_input->local_registration_cut;
+	out->admission_fence = cohort_source_input->admission_fence;
+	switch (cohort_sample_fault) {
+	case 1: out->sample_id++; break;
+	case 2: out->scan.min_full = FullTransactionIdFromU64(U64FromFullTransactionId(out->scan.min_full) + 1); break;
+	case 3: out->admission_fence.record_generation++; break;
+	case 4: out->scan.status = CTRC_ACTIVE_SCAN_INCOMPLETE; break;
+	}
+	return true;
+}
+
+/* Peer generations and H freshness are intentionally still the bounded leaf;
+ * the original outer entry validates saved metadata, worker identity and cut. */
+static ClusterHeapFreezeCohortStatus
+undo_horizon_v2_cohort_current(const ClusterSemanticActiveSampleFence *fence,
+	const ClusterHeapFreezeCohortPeerObservation *peers, TimestampTz started,
+	uint32 interval_ms, const ClusterUndoCleanerActiveSample *active)
+{
+	UT_ASSERT(!local_x && !local_share && backend_pin_count == 1);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT(fence == &cohort_source_input->admission_fence);
+	UT_ASSERT(peers == cohort_source_input->source_peers);
+	UT_ASSERT_EQ(started, cohort_source_input->source_started_at_us);
+	UT_ASSERT_EQ(interval_ms, cohort_source_input->source_interval_ms);
+	UT_ASSERT_EQ(active->sample_id, cohort_source_input->source_local_sample_id);
+	cohort_backend_checks++;
+	if (cohort_revoke_ingress) ctrc_note_unqualified_registration();
+	return saved_cohort_status;
+}
+
+#define cluster_heap_freeze_cohort_current actual_saved_cohort_current
+#include "test_cluster_heap_freeze_cohort_current.inc"
+#undef cluster_heap_freeze_cohort_current
+
 ClusterHeapFreezeCohortStatus
 cluster_heap_freeze_cohort_current(const ClusterHeapFreezeCohortObservation *cohort)
 {
@@ -432,7 +493,8 @@ cluster_heap_freeze_cohort_current(const ClusterHeapFreezeCohortObservation *coh
 	cohort_current_checks++;
 	if (source_current_error_stage == 2) elog(ERROR, "injected saved-cohort current error");
 	if (source_current_revoke_census == 2) admission_current = false;
-	return saved_cohort_status;
+	cohort_source_input = cohort;
+	return actual_saved_cohort_current(cohort);
 }
 
 /* Existing full TARGET policy is stronger than census-read permission. */
@@ -893,6 +955,9 @@ reset(uint8 opcode, bool shared)
 	allocation_fence_checks = 0; allocation_fence_error = false;
 	cluster_xid_striping = true;
 	saved_policy_current = true; saved_cohort_status = CLUSTER_HEAP_FREEZE_COHORT_READY;
+	UndoHorizonShmem = &cohort_attachment; cohort_source_input = NULL;
+	cohort_sample_available = true; cohort_sample_error = cohort_revoke_ingress = false;
+	cohort_sample_fault = 0; cohort_sample_reads = cohort_backend_checks = 0;
 	source_current_error_stage = source_current_revoke_census = 0;
 	expected_current_policy = NULL; expected_current_cohort = NULL;
 	preflight_target_error = preflight_revoke_census = allow_preflight_target = false;
@@ -1282,6 +1347,9 @@ qualified_xmin_setup(QualifiedXminFixture *f, uint16 xmax_mask)
 	f->cohort.future_full_xid_max = U64FromFullTransactionId(f->policy.legal_next);
 	f->cohort.local_registration_cut.min_full = f->policy.freeze_limit;
 	f->cohort.local_registration_cut.future_full = f->policy.legal_next;
+	f->cohort.source_local_sample_id = 17;
+	f->cohort.source_started_at_us = 1000000;
+	f->cohort.source_interval_ms = CLUSTER_UNDO_HORIZON_INTERVAL_MIN_MS;
 	f->cohort.horizon_scn = 10;
 	f->cohort.source_local_horizon_scn = 10;
 	f->cohort.source_local_history.sample_clock_scn = 10;
@@ -2868,7 +2936,8 @@ UT_TEST(test_xmin_registration_cut_rechecked_after_actual_space_prepare)
 			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 2)
 				: qualified_xmin_apply(&f, 0)));
 			UT_ASSERT_EQ(space_observation_checks, 1);
-			UT_ASSERT_EQ(registration_checks, 2);
+			/* The original cohort entry adds its final cut read before resume. */
+			UT_ASSERT_EQ(registration_checks, released ? 3 : 2);
 			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
 			UT_ASSERT_EQ(CritSectionCount, 0);
 			UT_ASSERT_EQ(backend_pin_count, 1);
@@ -3605,10 +3674,125 @@ UT_TEST(test_xmin_original_allocation_fence_error_preserves_caller_resources)
 	}
 }
 
+UT_TEST(test_xmin_original_cohort_entry_refuses_unknown_saved_metadata)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int fault = 0; fault < 6; fault++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			fixture_release_original_writer(); resume_allowed = true;
+			switch (fault) {
+			case 0: f.cohort.source_local_sample_id = 0; break;
+			case 1: f.cohort.source_started_at_us = 0; break;
+			case 2: f.cohort.source_started_at_us = UINT64_MAX; break;
+			case 3: f.cohort.source_interval_ms = CLUSTER_UNDO_HORIZON_INTERVAL_MIN_MS - 1; break;
+			case 4: f.cohort.source_interval_ms = CLUSTER_UNDO_HORIZON_INTERVAL_MAX_MS + 1; break;
+			case 5: UndoHorizonShmem = NULL; break;
+			}
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(policy_current_checks, 1); UT_ASSERT_EQ(cohort_current_checks, 1);
+			UT_ASSERT_EQ(cohort_sample_reads + cohort_backend_checks + census_preflight_checks, 0);
+			UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_cohort_entry_rejects_missing_or_replaced_worker)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int fault = 0; fault < 5; fault++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			fixture_release_original_writer(); resume_allowed = true;
+			cohort_sample_available = fault != 0; cohort_sample_fault = fault;
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(cohort_sample_reads, 1);
+			UT_ASSERT_EQ(cohort_backend_checks + census_preflight_checks, 0);
+			UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_cohort_final_cut_follows_backend_observation)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		fixture_release_original_writer(); resume_allowed = cohort_revoke_ingress = true;
+		UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+		UT_ASSERT_EQ(cohort_sample_reads, 1); UT_ASSERT_EQ(cohort_backend_checks, 1);
+		UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_original_cohort_current_reaches_same_native_wal)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		ClusterHeapFreezeCohortObservation before;
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		before = f.cohort;
+		fixture_release_original_writer(); resume_allowed = true;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(cohort_sample_reads, 1); UT_ASSERT_EQ(cohort_backend_checks, 1);
+		UT_ASSERT_EQ(census_preflight_checks, 1);
+		UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(memcmp(&f.cohort, &before, sizeof(before)) == 0);
+	}
+}
+
+UT_TEST(test_xmin_original_worker_read_error_preserves_caller_resources)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		fixture_release_original_writer(); resume_allowed = cohort_sample_error = expecting_error = true;
+		if (setjmp(error_jump) == 0) {
+			if (batch) (void)qualified_xmin_batch_apply(&f, targets, 3);
+			else (void)qualified_xmin_apply(&f, 0);
+			UT_ASSERT(false);
+		} else {
+			UT_ASSERT_EQ(cohort_sample_reads, 1);
+			UT_ASSERT_EQ(cohort_backend_checks + census_preflight_checks, 0);
+			UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+		expecting_error = false;
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(99);
+	UT_PLAN(104);
+	UT_RUN(test_xmin_original_cohort_entry_refuses_unknown_saved_metadata);
+	UT_RUN(test_xmin_original_cohort_entry_rejects_missing_or_replaced_worker);
+	UT_RUN(test_xmin_original_cohort_final_cut_follows_backend_observation);
+	UT_RUN(test_xmin_original_cohort_current_reaches_same_native_wal);
+	UT_RUN(test_xmin_original_worker_read_error_preserves_caller_resources);
 	UT_RUN(test_xmin_original_policy_current_uses_retained_allocation_fence);
 	UT_RUN(test_xmin_original_policy_current_rejects_disabled_striping_before_fence);
 	UT_RUN(test_xmin_original_allocation_fence_error_preserves_caller_resources);
