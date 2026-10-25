@@ -594,6 +594,7 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		test_cluster_relmap_producer_stage.inc \
 		test_cluster_relmap_producer_prepare.inc \
 		test_cluster_relmap_producer_terminal.inc \
+		test_cluster_relmap_postcommit.inc \
 		$(top_srcdir)/src/backend/utils/cache/relmapper.c \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
@@ -9518,8 +9519,30 @@ test_cluster_ctrc_horizon_sender.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     emit { print } /^}/ { emit=0 } END { if (found != 4 || types || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Continue the same actual producer inputs through the original cohort and candidate.
+test_cluster_ctrc_horizon_cohort.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c Makefile
+	awk '/^typedef struct UndoHorizonV2MaintenanceObservation / { types=1; found++ } \
+	     types { print } /^} UndoHorizonV2MaintenanceObservation;/ { types=0 } \
+	     /^typedef ClusterHeapFreezeCohortPeerObservation UndoHorizonV2PeerObservation;/ { print; found++ } \
+	     /^#define UNDO_HORIZON_SEQLOCK_RETRIES / { print; found++ } \
+	     /^undo_horizon_maintenance_coverage\(/ { print "static uint64"; emit=1; found++ } \
+	     /^undo_horizon_v2_publish\(/ { print "static void"; emit=1; found++ } \
+	     /^undo_horizon_sample_local_report\(/ { print "static bool"; emit=1; found++ } \
+	     /^undo_horizon_v2_slot_sample\(/ { print "static ClusterHeapFreezeCohortStatus"; emit=1; found++ } \
+	     /^undo_horizon_watermark_sources_current\(/ { print "static bool"; emit=1; found++ } \
+	     /^cluster_heap_freeze_watermark_sample\(/ { print "bool"; emit=1; found++ } \
+	     /^undo_horizon_v2_required\(/ { print "static bool"; emit=1; found++ } \
+	     /^undo_horizon_v2_observe_peer\(/ { print "static ClusterHeapFreezeCohortStatus"; emit=1; found++ } \
+	     /^undo_horizon_v2_cohort_current\(/ { print "static ClusterHeapFreezeCohortStatus"; emit=1; found++ } \
+	     /^undo_horizon_v2_cohort_observe\(/ && ++cohort_seen == 2 { print "static ClusterHeapFreezeCohortStatus"; emit=1; found++ } \
+	     /^undo_horizon_publish_freeze_watermark\(/ && ++publish_seen == 2 { print "static bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (found != 14 || cohort_seen != 2 || publish_seen != 2 || types || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_ctrc_horizon: test_cluster_ctrc_horizon.c test_cluster_ctrc_cleaner.c \
 		test_cluster_ctrc_horizon_sender.inc test_cluster_ctrc_run_pass.inc unit_test.h \
+		test_cluster_ctrc_horizon_cohort.inc \
 		test_cluster_retention_sample.inc $(CLUSTER_UNDO_RETENTION_O) \
 		$(CLUSTER_SCN_O) $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
@@ -9541,6 +9564,7 @@ clean distclean maintainer-clean: clean-ctrc-horizon
 .PHONY: clean-ctrc-horizon
 clean-ctrc-horizon:
 	rm -f test_cluster_ctrc_horizon_sender.inc test_cluster_ctrc_horizon_sender.inc.tmp
+	rm -f test_cluster_ctrc_horizon_cohort.inc test_cluster_ctrc_horizon_cohort.inc.tmp
 
 test_cluster_ctrc_successor_fence: test_cluster_ctrc_successor_fence.c test_cluster_ctrc_cleaner.c \
 		test_cluster_ctrc_run_pass.inc unit_test.h $(CLUSTER_SCN_O) \
