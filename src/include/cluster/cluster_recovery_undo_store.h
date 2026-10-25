@@ -36,6 +36,10 @@ cluster_recovery_undo_store_graph_begin(ClusterRecoveryUndoStore *store, uint64 
  * before the first graph step; this accessor is not full producer coverage. */
 extern ClusterRecoveryReferenceGraph *
 cluster_recovery_undo_store_graph(ClusterRecoveryUndoStore *store);
+/* Borrow the same observed namespace after TT enumeration. Its lifetime is
+ * the store's original caller-owned lifetime, not a new retained source. */
+extern ClusterRecoveryRootSet *
+cluster_recovery_undo_store_root_set(ClusterRecoveryUndoStore *store);
 
 /* MORE loads one header; RECORD returns one of its 48 raw TT slots. DRAINED
  * completes only this physical TT inventory, never the recovery graph. */
@@ -59,6 +63,21 @@ extern ClusterRecoveryGraphResult
 cluster_recovery_undo_store_read(void *arg, const ClusterRecoveryTxnKey *transaction, UBA address,
 								 ClusterRecoveryUndoRecord *record,
 								 uint32 *record_segment_generation);
+
+/* Resolve a PAGE/history candidate against the complete canonical TT base.
+ * The original record supplies TT segment/slot/wrap; xid is the PAGE's raw
+ * xid. All must match the actual ACTIVE/COMMITTED/ABORTED slot before its
+ * generation is used. Neither the physical UBA segment nor local ITL wrap
+ * supplies a canonical generation. One whole undo-block read, no mutation.
+ * Missing/reused/unknown canonical base returns PENDING with zero outputs;
+ * retained WAL roots may still resolve it in the original later graph walk.
+ * Other failures revoke the store/graph. RECORD is an exact base binding,
+ * not top/terminal/history coverage or retirement authority. Original final
+ * headers/namespace/input and full graph rereads remain mandatory. */
+extern ClusterRecoveryGraphResult cluster_recovery_undo_store_read_base(
+	ClusterRecoveryUndoStore *store, UBA address, TransactionId xid,
+	ClusterRecoveryTxnKey *transaction, ClusterRecoveryUndoRecord *record,
+	uint32 *record_segment_generation);
 
 /* Re-read every entire saved TT header, one per call, after graph traversal.
  * DRAINED means byte-stable headers, not transaction or retirement proof. */

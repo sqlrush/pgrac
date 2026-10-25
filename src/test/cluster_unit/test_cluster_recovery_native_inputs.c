@@ -831,6 +831,7 @@ cleanup:
 #include "test_cluster_recovery_manifest_inputs.inc"
 #include "test_cluster_recovery_terminal_inputs.inc"
 #include "test_cluster_recovery_tt_terminal_inputs.inc"
+#include "test_cluster_recovery_page_roots_inputs.inc"
 
 int
 main(int argc, char **argv)
@@ -839,7 +840,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(76);
+	UT_PLAN(79);
 	UT_RUN(test_native_inventory_uses_two_real_cold_passes);
 	UT_RUN(test_native_inventory_never_returns_partial_on_drift_io_or_error);
 	UT_RUN(test_native_inventory_capacity_is_not_partial_success);
@@ -867,6 +868,9 @@ main(int argc, char **argv)
 	UT_RUN(test_cold_mx_join_visits_all_saved_creates_and_preserves_effects);
 	UT_RUN(test_cold_mx_join_final_wal_drift_and_destroy_revoke_roots);
 	UT_RUN(test_cold_mx_join_refusal_poisons_inventory_and_partial_roots);
+	UT_RUN(test_owned_census_page_roots_without_tt_or_wal_heads);
+	UT_RUN(test_page_root_deferred_base_preserves_independent_wal_forest);
+	UT_RUN(test_page_root_deferred_base_never_replaces_later_coverage);
 	UT_RUN(test_owned_census_real_inputs_all_observation_families);
 	UT_RUN(test_owned_census_final_rereads_refuse_changes);
 	UT_RUN(test_owned_census_scope_loss_and_drained_invalidation);

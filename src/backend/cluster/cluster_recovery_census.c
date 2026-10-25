@@ -16,6 +16,7 @@ struct ClusterRecoveryCensus {
 	ClusterRecoveryNativeInventory *inventory;
 	ClusterRecoveryUndoStore *undo;
 	ClusterRecoveryReferenceGraph *graph; /* owned by undo */
+	ClusterRecoveryPageRoots *page_roots;
 	ClusterRecoveryRelationCensus *relations;
 	ClusterRecoveryMultixactScan *mx;
 	ClusterRecoverySlruScan *slru;
@@ -34,6 +35,8 @@ census_release(ClusterRecoveryCensus *census)
 {
 	/* Dependents precede their owners. Inventory destruction revokes its
 	 * borrowed graph/roots, so both must still be alive here. */
+	cluster_recovery_page_roots_destroy(census->page_roots);
+	census->page_roots = NULL;
 	cluster_recovery_relation_census_destroy(census->relations);
 	census->relations = NULL;
 	cluster_recovery_multixact_scan_destroy(census->mx);
@@ -346,7 +349,22 @@ census_step(ClusterRecoveryCensus *census, ClusterRecoveryCensusEntry *out)
 		d->graph_result = cluster_recovery_native_inventory_seed_graph_step(
 			census->inventory, census->graph, &d->inventory);
 		if (d->graph_result == CLUSTER_RECOVERY_GRAPH_DRAINED)
+			d->phase = CLUSTER_RECOVERY_CENSUS_PAGE_ROOTS;
+		if (d->graph_result == CLUSTER_RECOVERY_GRAPH_MORE
+			|| d->graph_result == CLUSTER_RECOVERY_GRAPH_DRAINED)
+			return CLUSTER_RECOVERY_CENSUS_MORE;
+		break;
+	case CLUSTER_RECOVERY_CENSUS_PAGE_ROOTS:
+		if (census->page_roots == NULL)
+			d->graph_result = cluster_recovery_page_roots_begin(census->undo, census->child_budget,
+																  &census->page_roots);
+		else
+			d->graph_result = cluster_recovery_page_roots_step(census->page_roots, &d->page_roots);
+		if (d->graph_result == CLUSTER_RECOVERY_GRAPH_DRAINED) {
+			cluster_recovery_page_roots_destroy(census->page_roots);
+			census->page_roots = NULL;
 			d->phase = CLUSTER_RECOVERY_CENSUS_TX;
+		}
 		if (d->graph_result == CLUSTER_RECOVERY_GRAPH_MORE
 			|| d->graph_result == CLUSTER_RECOVERY_GRAPH_DRAINED)
 			return CLUSTER_RECOVERY_CENSUS_MORE;

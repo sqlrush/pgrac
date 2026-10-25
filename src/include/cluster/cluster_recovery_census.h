@@ -11,6 +11,7 @@
 
 #include "cluster/cluster_recovery_native_inventory.h"
 #include "cluster/cluster_recovery_undo_store.h"
+#include "cluster/cluster_recovery_page_roots.h"
 #include "cluster/cluster_recovery_relation_census.h"
 #include "cluster/cluster_recovery_multixact_scan.h"
 #include "cluster/cluster_recovery_slru_scan.h"
@@ -33,6 +34,7 @@ typedef enum ClusterRecoveryCensusPhase {
 	CLUSTER_RECOVERY_CENSUS_ROOTS,
 	CLUSTER_RECOVERY_CENSUS_TT,
 	CLUSTER_RECOVERY_CENSUS_WAL_HEADS,
+	CLUSTER_RECOVERY_CENSUS_PAGE_ROOTS,
 	CLUSTER_RECOVERY_CENSUS_TX,
 	CLUSTER_RECOVERY_CENSUS_TX_TARGETS,
 	CLUSTER_RECOVERY_CENSUS_RELATIONS,
@@ -130,6 +132,7 @@ typedef struct ClusterRecoveryCensusDiag {
 	ClusterRecoveryNativeInventoryResult inventory_result;
 	ClusterRecoveryTerminalResult terminal_result;
 	ClusterRecoveryNativeInventoryDiag inventory;
+	ClusterRecoveryPageRootsDiag page_roots;
 	uint64 tt_slots, tx_records, relation_entries, mx_entries, mx_comparisons, effects;
 	uint64 slru_entries;
 	uint64 xact_comparisons;
@@ -163,7 +166,10 @@ extern ClusterRecoveryCensusResult cluster_recovery_census_begin(ClusterWalInput
 																 int root_fd, size_t memory_budget,
 																 ClusterRecoveryCensus **out);
 
-/* Run the existing ROOT/WAL union, all TT slots and seeded TX records,
+/* Run the existing ROOT/WAL union, all TT slots, physical PAGE/history root
+ * discovery and seeded TX records. Discovery adds exact canonical-base roots
+ * before the TX walk; deferred bindings/structures remain obligations for
+ * the unchanged subsequent observed-graph PAGE/history consumers. Then run
  * all TX record target/SPACE candidates, relation/page/history, raw physical
  * CLOG/SUBTRANS/commit_ts/MX, retained MX/terminal/assignment comparisons,
  * physical native relmap copies and every mapped fork edge, and native

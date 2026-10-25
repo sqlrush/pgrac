@@ -8,6 +8,7 @@ static unsigned owned_target_mode;
 static unsigned owned_clog_fault;
 static bool owned_native_slru;
 static bool owned_terminals;
+static bool owned_page_roots_fixture;
 static void owned_slru_files(int fd, bool create);
 
 /* Both retained terminal records name xid4195136, CLOG page128/segment4.
@@ -75,7 +76,7 @@ owned_census_fixture(ClusterWalInputsV1 **inputs, int *fd, char path[MAXPGPATH],
 	ClusterRecoveryRootSet *roots;
 	ClusterRecoveryCensus *census = NULL;
 	int file;
-	inventory_extra = owned_terminals ? 16 : 9;
+	inventory_extra = owned_page_roots_fixture ? 6 : owned_terminals ? 16 : 9;
 	inventory_binding_case = 0;
 	*inputs = inventory_fixture(false, open_source);
 	roots = inventory_roots(*inputs, path, fd, false);

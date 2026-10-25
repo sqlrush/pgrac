@@ -23,6 +23,7 @@ int namespace_fixture_main(void);
 #include "../../backend/cluster/cluster_recovery_page_history.c"
 #include "../../backend/cluster/cluster_recovery_page_census.c"
 #include "../../backend/cluster/cluster_recovery_relation_census.c"
+#include "../../backend/cluster/cluster_recovery_page_roots.c"
 
 static const uint8 store_uuid[16] = { 9, 3, 7 };
 
@@ -638,11 +639,17 @@ UT_TEST(test_read_and_final_recheck_failures_poison_already_borrowed_graph)
 
 #include "test_cluster_recovery_page_census.inc"
 #include "test_cluster_recovery_relation_census.inc"
+#include "test_cluster_recovery_page_roots.inc"
 
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(30);
+	UT_RUN(test_page_root_binding_keeps_canonical_and_physical_generations_distinct);
+	UT_RUN(test_page_root_reused_or_unknown_binding_remains_unresolved);
+	UT_RUN(test_page_roots_find_inverse_only_transaction_before_graph_walk);
+	UT_RUN(test_page_roots_read_failures_revoke_the_original_owners);
+	UT_RUN(test_page_roots_budget_and_lifetime_refuse_late_seeding);
 	UT_RUN(test_real_untouched_segment_files_feed_all_slots_and_the_full_transaction_chain);
 	UT_RUN(test_missing_segment_or_short_or_failed_read_is_not_an_empty_chain);
 	UT_RUN(test_foreign_database_or_tt_identity_never_selects_a_local_record);
