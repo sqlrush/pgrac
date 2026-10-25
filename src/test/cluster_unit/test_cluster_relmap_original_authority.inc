@@ -61,6 +61,9 @@ test_relmap_authority_admissions(const PgracExternalFenceAdmissionSetV1 *admissi
 ClusterWalPinResult
 test_relmap_authority_pin(ClusterWalRetentionPin *pin)
 {
+	if (cold_native_real_pin) {
+		return test_relmap_native_pin_revalidate(pin, PG_exception_stack);
+	}
 	return pin == (ClusterWalRetentionPin *)&cold_authority_tokens[3]
 				   && !cold_authority_fault_now(5)
 			   ? CLUSTER_WAL_PIN_OK
@@ -82,11 +85,15 @@ cold_original_protection_setup(void)
 	cold_original_serial.formation = cold_original_authority.formation;
 	cold_original_serial.fence_need_set = cold_original_authority.fence_need_set;
 	cold_original_serial.fence_admission_set = cold_original_authority.fence_admission_set;
+	if (cold_native_real_pin)
+		cold_original_pin_setup();
 }
 
 static void
 cold_original_authority_postwrite(void)
 {
+	if (cold_native_real_pin && cold_pin_postwrite_loss)
+		test_relmap_native_pin_fault(3);
 	if (cold_native_post_fault == 3)
 		cold_original_serial.fence_admission_set = NULL;
 	if (cold_native_post_fault == 4)
