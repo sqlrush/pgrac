@@ -9588,7 +9588,20 @@ test_cluster_cold_source_completion.inc: $(top_srcdir)/src/backend/cluster/clust
 	awk '/^cluster_cold_completion_proven_v1\(/ { print "bool"; emit=1; count++ } emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_cold_checkpoint_publisher.o: test_cluster_cold_checkpoint_publisher.c \
+		test_cluster_cold_checkpoint_publisher.h test_cluster_cold_checkpoint_publisher_namespace.h \
+		test_cluster_relmap_recovery.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_recovery.c \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_checkpoint_native.c \
+		$(top_srcdir)/src/include/access/transam.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_checkpoint.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
+
 test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_test.h $(CLUSTER_COLD_STARTUP_O) \
+		test_cluster_cold_checkpoint_publisher.o test_cluster_cold_checkpoint_publisher.h \
+		test_cluster_cold_startup_checkpoint_publisher.inc \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_checkpoint.h \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o \
@@ -9605,6 +9618,7 @@ test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_te
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_census.h \
 		cluster_unit_port_stubs.o $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_STARTUP_O) \
+		test_cluster_cold_checkpoint_publisher.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o \
 		$(top_builddir)/src/common/libpgcommon.a \
 		test_cluster_cold_recovery_xid_core.o test_cluster_cold_recovery_replay_core.o \

@@ -3478,11 +3478,12 @@ UT_TEST(test_checkpoint_export_clears_unsealed_and_failed_output)
 
 #include "test_cluster_cold_startup_native_window.inc"
 #include "test_cluster_cold_startup_issued_window.inc"
+#include "test_cluster_cold_startup_checkpoint_publisher.inc"
 
 int
 main(void)
 {
-	UT_PLAN(131);
+	UT_PLAN(134);
 	UT_RUN(test_prepare_invalidates_old_retention_before_first_root);
 	UT_RUN(test_prepare_retention_refusal_stops_before_any_recovery_input);
 	UT_RUN(test_prepare_input_refusal_and_retry_repeat_retention_invalidation);
@@ -3542,6 +3543,9 @@ main(void)
 	UT_RUN(test_checkpoint_window_original_reselect_drift_is_sticky);
 	UT_RUN(test_endpoints_include_original_postflush_issuance_for_every_source);
 	UT_RUN(test_postflush_endpoints_keep_completion_and_failure_boundaries);
+	UT_RUN(test_original_checkpointer_issued_window_reaches_every_startup_endpoint);
+	UT_RUN(test_unknown_original_checkpointer_does_not_invent_a_later_endpoint);
+	UT_RUN(test_original_publisher_window_cannot_move_to_another_source_or_checkpoint);
 	UT_RUN(test_tt_base_capture_includes_history_before_wal_scan);
 	UT_RUN(test_tt_base_capture_failure_stops_before_side_and_scan);
 	UT_RUN(test_tt_base_drift_refuses_pass_two_stickily);
