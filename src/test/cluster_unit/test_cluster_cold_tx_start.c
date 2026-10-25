@@ -11,6 +11,7 @@
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_wal_inputs.h"
+#include "cluster/cluster_recovery_census.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_recovery_undo_scan.h"
@@ -55,6 +56,18 @@ static bool native_recovery, binding_ok, writer_ok, allocation_ok;
 static bool effects_ready;
 static bool xid_ready, invalidate_writer_on_xid_ready;
 static unsigned scope_begins, scope_checks, scope_releases;
+static char observation_scope_object, observation_cursor_object;
+static unsigned observation_scope_begins, observation_census_begins, observation_steps,
+	observation_manifests, observation_census_destroys, observation_scope_releases;
+static unsigned observation_fault, observation_fault_at;
+static bool observation_scope_live, observation_cursor_live;
+static char observation_events[64];
+static unsigned observation_event_count;
+static ClusterRecoveryCensusManifest observation_manifest;
+static void observation_fixture_reset(void);
+static void observation_scope_release(void);
+static bool observation_work_allocation(Size size, int flags);
+int cluster_cold_recovery_plan_memory = 65536;
 static unsigned fail_scope_check;
 static bool scope_begin_ok;
 static unsigned target_reserves, target_releases;
@@ -179,7 +192,8 @@ void *MemoryContextAllocExtended(MemoryContext context, Size size, int flags)
 {
 	(void)context;
 	if ((flags & (MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM))
-		!= (MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM)) abort();
+		!= (MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM)
+		&& !observation_work_allocation(size, flags)) abort();
 	if (!allocation_ok) return NULL;
 	allocations++;
 	return calloc(1, size);
@@ -321,6 +335,11 @@ cluster_wal_inputs_revalidate_v1(ClusterWalInputsV1 *inputs)
 void
 cluster_wal_inputs_release_v1(ClusterWalInputsV1 **inputs)
 {
+	if (*inputs == (ClusterWalInputsV1 *)&observation_scope_object) {
+		observation_scope_release();
+		*inputs = NULL;
+		return;
+	}
 	if (*inputs != (ClusterWalInputsV1 *)&scope_storage) abort();
 	if (reserved_target != NULL || stamp_live) abort();
 	scope_releases++;
@@ -527,6 +546,7 @@ static void reset(void)
 	observed_writer.ref.timeline = clusterStartupWriter.timeline;
 	observed_writer.epoch = clusterStartupWriter.formation_epoch;
 	observed_writer.startup_first_lsn = clusterStartupWriter.first_segment_lsn;
+	observation_fixture_reset();
 }
 static void retain(void)
 {
@@ -1905,10 +1925,18 @@ UT_TEST(test_original_error_revokes_ctrc_registration_with_the_owner_slot)
 
 #include "test_cluster_cold_tx_ctrc_subject.inc"
 #include "test_cluster_cold_ctrc_handoff.inc"
+#include "test_cluster_cold_ctrc_census.inc"
 
 int main(void)
 {
-	UT_PLAN(65);
+	UT_PLAN(72);
+	UT_RUN(test_actual_startup_observes_full_ctrc_input_before_independent_handoff);
+	UT_RUN(test_ctrc_observation_retains_original_cursor_and_never_completes_service);
+	UT_RUN(test_ctrc_observation_refusal_is_sticky_and_preserves_first_stage_and_results);
+	UT_RUN(test_ctrc_observation_rejects_original_work_root_owner_and_tx_drift_mid_census);
+	UT_RUN(test_ctrc_observation_propagates_native_error_after_child_before_scope_cleanup);
+	UT_RUN(test_ctrc_observation_requires_accepted_tx_and_reserves_budget_before_scope);
+	UT_RUN(test_ctrc_observation_process_cleanup_retires_children_once_without_handoff);
 	UT_RUN(test_startup_retains_inputs_until_independent_ctrc_acceptance);
 	UT_RUN(test_ctrc_handoff_pending_timeouts_keep_original_input_and_responsibility);
 	UT_RUN(test_ctrc_handoff_refuses_wrong_original_components_without_releasing_input);
