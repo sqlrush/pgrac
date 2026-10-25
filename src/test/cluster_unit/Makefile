@@ -596,6 +596,8 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		test_cluster_relmap_producer_terminal.inc \
 		test_cluster_relmap_postcommit.inc \
 		test_cluster_relmap_abort.inc \
+		test_cluster_relmap_unarmed.inc \
+		test_cluster_relmap_precommit.inc \
 		$(top_srcdir)/src/backend/utils/cache/relmapper.c \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
@@ -9544,9 +9546,16 @@ test_cluster_ctrc_horizon_cohort.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     END { if (found != 14 || cohort_seen != 2 || publish_seen != 2 || types || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Receive the sender's actual V2 bytes with the original handler and rejection counter.
+test_cluster_ctrc_horizon_receive.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c Makefile
+	awk '/^undo_horizon_reject\(/ { print "static void"; emit=1; found++ } \
+	     /^undo_horizon_v2_receive\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_ctrc_horizon: test_cluster_ctrc_horizon.c test_cluster_ctrc_cleaner.c \
 		test_cluster_ctrc_horizon_sender.inc test_cluster_ctrc_run_pass.inc unit_test.h \
-		test_cluster_ctrc_horizon_cohort.inc \
+		test_cluster_ctrc_horizon_cohort.inc test_cluster_ctrc_horizon_receive.inc \
 		test_cluster_retention_sample.inc $(CLUSTER_UNDO_RETENTION_O) \
 		$(CLUSTER_SCN_O) $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
@@ -9557,6 +9566,7 @@ test_cluster_ctrc_horizon: test_cluster_ctrc_horizon.c test_cluster_ctrc_cleaner
 		$(top_srcdir)/src/include/cluster/cluster_ic.h \
 		$(top_srcdir)/src/include/cluster/cluster_ic_envelope.h \
 		$(top_srcdir)/src/include/cluster/cluster_ic_router.h \
+		$(top_srcdir)/src/include/cluster/cluster_ic_tier1.h \
 		$(top_srcdir)/src/include/cluster/cluster_sf_dep.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_SCN_O) $(CLUSTER_UNDO_RETENTION_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c \
@@ -9569,6 +9579,7 @@ clean distclean maintainer-clean: clean-ctrc-horizon
 clean-ctrc-horizon:
 	rm -f test_cluster_ctrc_horizon_sender.inc test_cluster_ctrc_horizon_sender.inc.tmp
 	rm -f test_cluster_ctrc_horizon_cohort.inc test_cluster_ctrc_horizon_cohort.inc.tmp
+	rm -f test_cluster_ctrc_horizon_receive.inc test_cluster_ctrc_horizon_receive.inc.tmp
 
 test_cluster_ctrc_successor_fence: test_cluster_ctrc_successor_fence.c test_cluster_ctrc_cleaner.c \
 		test_cluster_ctrc_run_pass.inc unit_test.h $(CLUSTER_SCN_O) \
