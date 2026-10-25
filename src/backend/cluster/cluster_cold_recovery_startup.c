@@ -1150,9 +1150,14 @@ cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed_address)
 	if (typed_address == NULL || *typed_address == NULL)
 		return;
 	typed = *typed_address;
-	*typed_address = NULL;
 	if (typed->inputs != NULL)
 		cluster_wal_inputs_release_v1(&typed->inputs);
+	if (typed->tx_fence != NULL) {
+		cluster_recovery_merge_fence_plan_destroy(&typed->tx_fence);
+		if (typed->tx_fence != NULL)
+			elog(FATAL, "could not release original cold transaction fence owner");
+	}
+	*typed_address = NULL;
 	cold_side_destroy(typed);
 	cluster_cold_tt_base_destroy_v1(typed);
 	if (typed->plan != NULL)

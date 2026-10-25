@@ -3898,10 +3898,34 @@ UT_TEST(test_own_root_seal_diagnostic_separates_lifecycle_and_flags)
 #include "test_cluster_cold_startup_issued_window.inc"
 #include "test_cluster_cold_startup_checkpoint_publisher.inc"
 
+UT_TEST(test_original_typed_owner_retires_fence_after_dependent_read_scope)
+{
+	ClusterColdTypedV1 *typed;
+	static char original_fence;
+	unsigned before;
+
+	fixture();
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	before = tx_fences_destroyed;
+	typed->tx_fence = (ClusterRecoveryFencePlan *)&original_fence;
+	typed->inputs = (ClusterWalInputsV1 *)&census_scope;
+	tx_fence_expected_census_releases = census_releases + 1;
+	tx_fence_census_release_observer = &census_releases;
+	cluster_cold_typed_destroy_v1(&typed);
+	UT_ASSERT(typed == NULL);
+	UT_ASSERT_EQ(tx_fences_destroyed, before + 1);
+	UT_ASSERT_EQ(census_releases, tx_fence_expected_census_releases);
+	UT_ASSERT_EQ(contexts_alive, 0);
+	cluster_cold_typed_destroy_v1(&typed);
+	UT_ASSERT_EQ(tx_fences_destroyed, before + 1);
+	tx_fence_census_release_observer = NULL;
+}
+
 int
 main(void)
 {
-	UT_PLAN(147);
+	UT_PLAN(148);
 	UT_RUN(test_execution_refusal_preserves_the_first_census_failure);
 	UT_RUN(test_own_root_lookup_diagnostic_does_not_read_failed_outputs);
 	UT_RUN(test_own_root_key_format_diagnostic_names_the_field);
@@ -4050,6 +4074,7 @@ main(void)
 	UT_RUN(test_source_barrier_whole_source_preflight_before_sync);
 	UT_RUN(test_source_barrier_requires_cold_window_and_original_scope);
 	UT_RUN(test_source_barrier_error_does_not_leave_success);
+	UT_RUN(test_original_typed_owner_retires_fence_after_dependent_read_scope);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

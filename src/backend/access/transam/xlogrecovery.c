@@ -695,6 +695,7 @@ static ClusterColdTypedV1 *cluster_recovery_cold_inputs;
 struct ClusterRecoveryStartV1 {
 	const ClusterColdTypedV1 *inputs;
 	const ClusterColdTopTxCensusV1 *census;
+	ClusterRecoveryFencePlan *tx_fence;
 	ResourceOwner owner;
 	int pid;
 	uint64 owner_boot;
@@ -786,13 +787,14 @@ cluster_recovery_cold_inputs_cleanup(int code, Datum arg)
 	cluster_cold_typed_destroy_v1(&cluster_recovery_cold_inputs);
 }
 
-/* Keep only original read-only inputs across EOR, never a live read scope.
- * The fence plan's execution guards and retention pin are released normally.
- * Any later consumer must obtain fresh source and writer authorization. */
+/* Keep original inputs and their original formation/isolation proof owners
+ * across EOR, never a live read scope or the old execution guards/pin.
+ * Later mutation still needs fresh source, serial and writer authorization. */
 static void
 cluster_recovery_cold_inputs_retain(ClusterColdTypedV1 **typed)
 {
 	if (typed == NULL || *typed == NULL || (*typed)->inputs != NULL
+		|| !cluster_recovery_merge_fence_plan_tx_current_v1((*typed)->tx_fence, NULL)
 		|| cluster_recovery_cold_inputs != NULL)
 		ereport(FATAL, (errmsg("could not retain original cold recovery inputs")));
 	before_shmem_exit(cluster_recovery_cold_inputs_cleanup, (Datum)0);
@@ -821,6 +823,7 @@ ClusterColdRecoveryTxCurrent(const struct ClusterRecoveryStartV1 *start)
 		|| start->owner_boot != cluster_qvotec_get_self_incarnation()
 		|| start->inputs != cluster_recovery_cold_inputs || start->inputs == NULL
 		|| start->inputs->inputs != NULL || start->inputs->plan == NULL
+		|| start->tx_fence == NULL || start->tx_fence != start->inputs->tx_fence
 		|| start->census != start->inputs->top_tx_census || start->census == NULL
 		|| start->census->plan != start->inputs->plan
 		|| !ClusterStartupInstalledRecoveryWriterV1(&writer, operation_uuid, &install_generation))
@@ -1267,7 +1270,8 @@ ClusterColdRecoveryTxTopProofCurrent(const struct ClusterRecoveryStartV1 *start,
 		|| !subject->proof.sealed_redo
 		|| !subject->proof.ordinary_effects
 		|| !subject->proof.old_writer_isolated
-		|| !subject->proof.terminal_match)
+		|| !subject->proof.terminal_match
+		|| !cluster_recovery_merge_fence_plan_tx_current_v1(start->tx_fence, NULL))
 		return false;
 	return true;
 }
@@ -1308,7 +1312,8 @@ ClusterColdRecoveryTxC0Candidate(const struct ClusterRecoveryStartV1 *start,
 	if (target == UINT32_MAX
 		|| typed->sources[target].claim.identity.origin_thread_id != key->owner_instance
 		|| typed->sources[target].claim.identity.origin_owner_incarnation
-			!= typed->participants[target].owner_incarnation)
+			!= typed->participants[target].owner_incarnation
+		|| !cluster_recovery_merge_fence_plan_tx_current_v1(start->tx_fence, &typed->sources[target]))
 		return false;
 
 	memset(&shape, 0, sizeof(shape));
@@ -1339,7 +1344,8 @@ ClusterColdRecoveryTxC0Candidate(const struct ClusterRecoveryStartV1 *start,
 		|| cluster_recovery_tt_abort_match_v1(&candidate.record, key->segment_generation,
 			&subject->input.slot) != CLUSTER_RECOVERY_TT_ABORT_APPLY
 		|| !ClusterColdRecoveryTxTopProofCurrent(start, subject)
-		|| !ClusterColdRecoveryTxEffectsCurrent(start))
+		|| !ClusterColdRecoveryTxEffectsCurrent(start)
+		|| !cluster_recovery_merge_fence_plan_tx_current_v1(start->tx_fence, &typed->sources[target]))
 		return false;
 	*out = candidate;
 	return true;
@@ -1396,6 +1402,7 @@ ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 		|| cluster_recovery_cold_inputs->participant_count == 0
 		|| cluster_recovery_cold_inputs->top_tx_census == NULL
 		|| cluster_recovery_cold_inputs->top_tx_census->plan != cluster_recovery_cold_inputs->plan
+		|| !cluster_recovery_merge_fence_plan_tx_current_v1(cluster_recovery_cold_inputs->tx_fence, NULL)
 		|| CurrentResourceOwner == NULL || MyProcPid <= 0
 		|| cluster_recovery_cold_generation == PG_UINT64_MAX
 		|| !ClusterStartupInstalledRecoveryWriterV1(&writer, operation_uuid, &install_generation))
@@ -1413,6 +1420,7 @@ ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 		return false;
 	start->inputs = cluster_recovery_cold_inputs;
 	start->census = cluster_recovery_cold_inputs->top_tx_census;
+	start->tx_fence = cluster_recovery_cold_inputs->tx_fence;
 	start->owner = CurrentResourceOwner;
 	start->pid = MyProcPid;
 	start->owner_boot = owner_boot;
@@ -4689,6 +4697,10 @@ cluster_typed_replay_publish(ClusterColdTypedReplay *rep, const ClusterColdRepla
 	if (!cluster_cold_typed_top_tx_census_v1(rep->typed, plan))
 		cluster_typed_replay_unpublished(
 			thread, "Post-redo ACTIVE input census is incomplete", (int)rep->typed->refusal);
+	if (!cluster_recovery_merge_fence_plan_bind_tx_inputs_v1(
+			plan, rep->typed->sources, rep->typed->replay_count))
+		cluster_typed_replay_unpublished(
+			thread, "Original transaction isolation inputs could not be retained", 0);
 	switch (cluster_recovery_merge_fence_plan_complete_v1(plan, &thread, &detail))
 	{
 		case CLUSTER_RECOVERY_FENCE_COMPLETE_OK:
@@ -4749,7 +4761,12 @@ cluster_typed_replay_finish(ClusterColdTypedReplay *rep, const ClusterColdReplay
 			ereport(FATAL,
 					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
 					 errmsg("cold recovery serialization release was not confirmed")));
-		cluster_recovery_merge_fence_plan_destroy(rep->fence_plan);
+		if (rep->typed->tx_fence != NULL
+			|| !cluster_recovery_merge_fence_plan_tx_current_v1(*rep->fence_plan, NULL))
+			cluster_typed_replay_unpublished(
+				0, "Original completed transaction fence owner could not be transferred", 0);
+		rep->typed->tx_fence = *rep->fence_plan;
+		*rep->fence_plan = NULL;
 	}
 }
 

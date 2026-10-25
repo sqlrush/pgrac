@@ -101,17 +101,23 @@ typedef struct ClusterRecoveryFenceOrigin {
 	ClusterFormationWitnessV1 *formation;
 	PgracExternalFenceNeedSetV1 *needs;
 	PgracExternalFenceAdmissionSetV1 *admissions;
+	ClusterWalSourceRef tx_source; /* original retained source, never a new duty */
 } ClusterRecoveryFenceOrigin;
 
 struct ClusterRecoveryFencePlan {
 	uint32 magic;
 	int32 owner_pid;
+	ResourceOwner owner;
+	uint64 owner_boot;
 	uint16 own_thread;
 	uint16 origin_count;
 	bool sealed;
 	bool serial_held;
 	bool committed;
-	uint8 reserved[5];
+	bool tx_inputs_bound;
+	bool completed;
+	bool tx_stale;
+	uint8 reserved[2];
 	int acquire_timeout_ms_snapshot;
 	char refusal_detail[512]; /* first original refusal; no authority */
 	uint64 replay_thread_bitmap[2];
@@ -1753,6 +1759,8 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 	plan = palloc0(sizeof(*plan));
 	plan->magic = CLUSTER_RECOVERY_FENCE_PLAN_MAGIC;
 	plan->owner_pid = MyProcPid;
+	plan->owner = CurrentResourceOwner;
+	plan->owner_boot = cluster_qvotec_get_self_incarnation();
 	plan->own_thread = own_thread;
 	plan->acquire_timeout_ms_snapshot = cluster_external_fence_acquire_timeout_ms;
 	/* PGRAC: refuse the unshared multi-generation merge before any fence
@@ -2338,6 +2346,94 @@ cluster_recovery_merge_fence_plan_authority(ClusterRecoveryFencePlan *plan, uint
 	return true;
 }
 
+/* Freeze only original input references while the original execution owners
+ * still protect them. The complete set is checked before publishing any copy;
+ * this cannot bind a new source after IR/WALR have been surrendered. */
+bool
+cluster_recovery_merge_fence_plan_bind_tx_inputs_v1(ClusterRecoveryFencePlan *plan,
+	const ClusterWalSourceRef *sources, uint32 count)
+{
+	uint32 selected[CLUSTER_WAL_STATE_SLOT_COUNT];
+
+	if (!recovery_fence_plan_valid(plan) || !cluster_shared_config || !plan->committed
+		|| plan->tx_inputs_bound || plan->completed || sources == NULL || count == 0
+		|| count > CLUSTER_WAL_STATE_SLOT_COUNT || plan->owner == NULL
+		|| plan->owner != CurrentResourceOwner || plan->owner_boot == 0
+		|| plan->owner_boot != cluster_qvotec_get_self_incarnation()
+		|| !cluster_recovery_merge_fence_plan_revalidate_nowait(plan))
+		return false;
+	/* The input is a separate original typed allocation, never this opaque
+	 * owner's storage. Refuse overlap before any source dereference/copy. */
+	if ((uintptr_t)sources <= (uintptr_t)plan
+		? (uintptr_t)plan - (uintptr_t)sources < sizeof(*sources) * count
+		: (uintptr_t)sources - (uintptr_t)plan < sizeof(*plan))
+		return false;
+	for (uint16 i = 0; i < plan->origin_count; i++) {
+		const ClusterRecoveryFenceOrigin *origin = &plan->origins[i];
+
+		selected[i] = UINT32_MAX;
+		for (uint32 p = 0; p < count; p++) {
+			if (sources[p].claim.identity.origin_thread_id != origin->origin_thread)
+				continue;
+			if (selected[i] != UINT32_MAX
+				|| !cluster_wal_claim_v2_ref_valid(&sources[p].claim)
+				|| memcmp(&sources[p].claim.identity, &origin->duty, sizeof(origin->duty)) != 0
+				|| sources[p].timeline != origin->root_snapshot.checkpoint_tli)
+				return false;
+			selected[i] = p;
+		}
+		if (selected[i] == UINT32_MAX)
+			return false;
+	}
+	/* All fallible checks precede this publication, including the last
+	 * complete original execution/proof revalidation. */
+	if (!cluster_recovery_merge_fence_plan_revalidate_nowait(plan))
+		return false;
+	for (uint16 i = 0; i < plan->origin_count; i++)
+		memcpy(&plan->origins[i].tx_source, &sources[selected[i]], sizeof(*sources));
+	plan->tx_inputs_bound = true;
+	return true;
+}
+
+/* Original isolation evidence survives COMPLETE and INSTALL as owned input.
+ * It is not the released RR serial/pin and grants no replay/PAGE permission.
+ * A source, membership, provider or process-owner change must not be adopted
+ * by this same post-EOR attempt. Ordinary RR revalidation remains unchanged. */
+bool
+cluster_recovery_merge_fence_plan_tx_current_v1(ClusterRecoveryFencePlan *plan,
+	const ClusterWalSourceRef *source)
+{
+	PgracExternalFenceDenyReason reason;
+	bool matched = source == NULL;
+
+	if (!recovery_fence_plan_valid(plan) || !cluster_shared_config || !plan->sealed
+		|| !plan->committed || !plan->completed || !plan->tx_inputs_bound || plan->tx_stale
+		|| plan->serial_held || plan->serial_guards.count != 0 || plan->retention_pin != NULL
+		|| plan->origin_count == 0)
+		return false;
+	if (plan->owner == NULL || plan->owner != CurrentResourceOwner || plan->owner_boot == 0
+		|| plan->owner_boot != cluster_qvotec_get_self_incarnation()) {
+		plan->tx_stale = true;
+		return false;
+	}
+	for (uint16 i = 0; i < plan->origin_count; i++) {
+		const ClusterRecoveryFenceOrigin *origin = &plan->origins[i];
+
+		if (cluster_formation_witness_revalidate_nowait(origin->formation)
+				!= CLUSTER_FORMATION_WITNESS_READY
+			|| !cluster_external_fence_need_set_revalidate_nowait(
+				origin->needs, origin->formation, &reason)
+			|| !cluster_external_fence_revalidate_set_nowait(
+				origin->admissions, origin->needs, origin->formation, &reason)) {
+			plan->tx_stale = true;
+			return false;
+		}
+		if (source != NULL && memcmp(source, &origin->tx_source, sizeof(*source)) == 0)
+			matched = true;
+	}
+	return matched;
+}
+
 /*
  * PGRAC (S9P2-05): publish every fenced origin recovered, in the order the
  * online recovery worker uses for one origin.  Each origin's authority and
@@ -2406,6 +2502,7 @@ cluster_recovery_merge_fence_plan_complete_v1(ClusterRecoveryFencePlan *plan, ui
 		*failed_detail = (int)pin_released;
 		return CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_RELEASE;
 	}
+	plan->completed = true;
 	return CLUSTER_RECOVERY_FENCE_COMPLETE_OK;
 }
 

@@ -534,6 +534,16 @@ struct ClusterThreadRecoveryAuthorityV1;
 extern bool
 cluster_recovery_merge_fence_plan_authority(ClusterRecoveryFencePlan *plan, uint16 origin_thread,
 											struct ClusterThreadRecoveryAuthorityV1 *out);
+/* Bind original immutable input refs before pass-2 IR/WALR release. After
+ * complete confirmed release, retain this same plan's original proof owners
+ * for the original post-EOR Start. This is isolation input, not IR, a PAGE
+ * grant, a new writer or ordinary RR replay authority. A non-NULL source must
+ * match one exact bound ref. Any observed owner/proof loss is sticky. */
+struct ClusterWalSourceRef;
+extern bool cluster_recovery_merge_fence_plan_bind_tx_inputs_v1(ClusterRecoveryFencePlan *plan,
+	const struct ClusterWalSourceRef *sources, uint32 count);
+extern bool cluster_recovery_merge_fence_plan_tx_current_v1(ClusterRecoveryFencePlan *plan,
+	const struct ClusterWalSourceRef *source);
 extern bool cluster_recovery_merge_fence_plan_release_serial(ClusterRecoveryFencePlan *plan);
 extern void cluster_recovery_merge_fence_plan_destroy(ClusterRecoveryFencePlan **plan);
 

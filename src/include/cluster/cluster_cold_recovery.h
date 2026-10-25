@@ -902,6 +902,10 @@ typedef struct ClusterColdTypedV1 {
 	/* Complete read-only ACTIVE input census from the still-held pass-2 cut.
 	 * It survives EOR as input only, never as execution or write authority. */
 	struct ClusterColdTopTxCensusV1 *top_tx_census;
+	/* Original completed fence's formation/isolation owners only. Its IR and
+	 * WALR must already be confirmed released before this ownership transfer.
+	 * Destroy with these original inputs, after dependent Start/read scopes. */
+	struct ClusterRecoveryFencePlan *tx_fence;
 	/* Retained native TT subjects, including terminal and history inputs.
 	 * This is one input component, not complete page-reference coverage. */
 	struct ClusterColdCtrcWorkV1 *ctrc_work;
