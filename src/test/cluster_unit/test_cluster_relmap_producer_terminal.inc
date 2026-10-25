@@ -101,7 +101,7 @@ terminal_clear(const ClusterRelmapV2Image *image, bool publish)
 	uint8 actual[CLUSTER_RELMAP_V2_FILE_SIZE], expected[CLUSTER_RELMAP_V2_FILE_SIZE];
 
 	UT_ASSERT(authority_held && !local_held && !v2_retention_held && CritSectionCount == 0);
-	UT_ASSERT(v2_terminal_context && terminal_calls < 2);
+	UT_ASSERT((v2_terminal_context || (!publish && v2_abort_callback_context)) && terminal_calls < 2);
 	UT_ASSERT_EQ(publish, terminal_publish);
 	UT_ASSERT_EQ(cluster_relmap_v2_encode(image, actual, sizeof(actual)), CLUSTER_RELMAP_V2_VALID);
 	UT_ASSERT_EQ(cluster_relmap_v2_encode(&terminal_images[slot], expected, sizeof(expected)),

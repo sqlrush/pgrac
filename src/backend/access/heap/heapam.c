@@ -20969,6 +20969,15 @@ heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 			elog(ERROR, "PGRAC shared heap freeze requires exact SPACE identity");
 		}
 	}
+	/* SPACE preparation observes state after the earlier TARGET fence.
+	 * Keep the same entered token current through this last observation,
+	 * then check the retained source inputs after these identity callbacks.
+	 * A refusal or ERROR still belongs to the caller's original resources. */
+	if (conditional
+		&& (freeze_admission == NULL || !freeze_admission->entered
+			|| !cluster_semantic_activation_recheck(freeze_admission)
+			|| !cluster_semantic_activation_recheck_r4_terminal_census(freeze_admission)))
+		return false;
 	/* SPACE preparation also observes live state. Retain the original local
 	 * ingress cut and the same F/H/native-window inputs until immediately
 	 * before the critical section. This performs only the existing bounded

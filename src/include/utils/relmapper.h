@@ -107,6 +107,16 @@ extern bool cluster_relmap_producer_finish_v2(bool is_commit);
  * terminal, releases no retention pin and installs no live v2 caller. */
 extern void cluster_relmap_producer_postcommit_v2(void);
 
+/* Dormant original abort caller, before top FullXid teardown, retaining the
+ * original mapped-rel AEL/global relmap X and holding no local LWLocks. The
+ * abort decision can precede TRANS_ABORT and remains the caller's duty.
+ * Discard all saved prepare receipts once, unlock global X last, then retire
+ * local custody. UNKNOWN/ERROR/source loss PANIC, keeping custody/pins/debt;
+ * never retry or switch polarity. Empty is a no-op, including failed prepare
+ * without a saved receipt; its original obligations remain with the caller.
+ * No invalidation, terminal proof, retention release or live v2 caller. */
+extern void cluster_relmap_producer_abort_v2(void);
+
 /* PGRAC (spec-6.14 D5): post-commit publish / abort discard of a staged
  * shared relmap authority image. */
 extern void AtEOXact_ClusterRelmapPublish(void);

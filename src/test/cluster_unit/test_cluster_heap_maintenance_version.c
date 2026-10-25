@@ -137,6 +137,12 @@ static ClusterHeapFreezeCohortObservation *replace_bounds_in_space;
 static ClusterHeapFreezePolicySampleV1 *replace_policy_in_space;
 static int replace_bound_kind;
 static unsigned space_observation_checks;
+/* Keep pre-SPACE fixture counters distinct from final same-token checks. */
+static unsigned post_space_target_checks, post_space_census_checks, post_space_error_seen;
+static int revoke_admission_in_space, change_source_after_space_target;
+static bool post_space_census_error;
+static ClusterHeapFreezeCohortObservation *post_space_bounds;
+static ClusterHeapFreezePolicySampleV1 *post_space_policy;
 
 /* Compile the original ingress producer and current-cut predicate together
  * with the native apply bodies. Only the shared-header storage projection,
@@ -350,6 +356,18 @@ cluster_semantic_activation_recheck_r4_terminal_census(
 		UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
 		return admission_current;
 	}
+	if (space_observation_checks != 0) {
+		post_space_census_checks++;
+		UT_ASSERT(token != NULL && token->entered && local_x && backend_pin_count == 1);
+		UT_ASSERT_EQ(post_space_target_checks, 1);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT_EQ(inserts + dirties + edges + flushes, 0);
+		if (post_space_census_error) {
+			post_space_error_seen = 2;
+			elog(ERROR, "injected final census ERROR after SPACE");
+		}
+		return admission_current;
+	}
 	admission_checks++;
 	UT_ASSERT(token != NULL && token->entered);
 	return admission_current;
@@ -368,6 +386,28 @@ cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 		if (preflight_target_error) elog(ERROR, "injected unlocked TARGET preflight error");
 		if (preflight_revoke_census) admission_current = false;
 		return full_target_current || allow_preflight_target;
+	}
+	if (space_observation_checks != 0) {
+		post_space_target_checks++;
+		UT_ASSERT(token != NULL && token->entered && local_x && backend_pin_count == 1);
+		UT_ASSERT_EQ(full_target_checks, 1);
+		UT_ASSERT_EQ(admission_checks, 1);
+		UT_ASSERT_EQ(wal_clock_reads, 1);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT_EQ(inserts + dirties + edges + flushes, 0);
+		if (target_recheck_error) {
+			post_space_error_seen = 1;
+			elog(ERROR, "injected final TARGET ERROR after SPACE");
+		}
+		if (change_source_after_space_target == 1) ctrc_note_unqualified_registration();
+		if (post_space_bounds != NULL) {
+			post_space_bounds->horizon_scn--;
+			post_space_bounds->source_local_horizon_scn--;
+		}
+		if (post_space_policy != NULL)
+			post_space_policy->legal_next = FullTransactionIdFromU64(
+				U64FromFullTransactionId(post_space_policy->legal_next) + 1);
+		return full_target_current;
 	}
 	full_target_checks++;
 	if (advance_registration_after_target) ctrc_note_unqualified_registration();
@@ -501,6 +541,10 @@ BufferIsPermanent(Buffer buffer)
 {
 	UT_ASSERT_EQ(buffer, 1);
 	space_observation_checks++;
+	if (revoke_admission_in_space == 1) full_target_current = false;
+	if (revoke_admission_in_space == 2) admission_current = false;
+	if (revoke_admission_in_space == 3) target_recheck_error = true;
+	if (revoke_admission_in_space == 4) post_space_census_error = true;
 	if (space_permanence_error)
 		elog(ERROR, "injected SPACE buffer observation ERROR");
 	if (advance_registration_in_space) ctrc_note_unqualified_registration();
@@ -791,6 +835,10 @@ reset(uint8 opcode, bool shared)
 	registration_checks = 0;
 	advance_registration_after_target = advance_registration_in_clock = false;
 	advance_registration_in_space = false; space_observation_checks = 0;
+	post_space_target_checks = post_space_census_checks = post_space_error_seen = 0;
+	revoke_admission_in_space = change_source_after_space_target = 0;
+	post_space_census_error = false;
+	post_space_bounds = NULL; post_space_policy = NULL;
 	replace_bounds_in_space = NULL; replace_policy_in_space = NULL; replace_bound_kind = 0;
 	local_x = writer_current = route_current = authority_current = admission_current = true;
 	local_share = resume_allowed = resume_error = resumed_writer = false;
@@ -3208,10 +3256,99 @@ UT_TEST(test_xmin_native_horizon_rechecks_legal_window_after_final_target)
 	}
 }
 
+
+/* Real native/SPACE bodies, with only the buffer observation/status and
+ * scheduling leaves controlled. No native or positive qualification claim. */
+static void
+assert_post_space_refusal_resources(QualifiedXminFixture *f, bool released)
+{
+	UT_ASSERT_EQ(space_observation_checks, 1);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(f->admission.entered && local_x == !released && !resumed_writer);
+	UT_ASSERT_EQ(conditional_resumes, released);
+	UT_ASSERT_EQ(conditional_unlocks, released);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_xmin_final_admission_refusal_after_actual_space_is_before_wal)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int released = 0; released < 2; released++) {
+			for (int kind = 1; kind <= 2; kind++) {
+				QualifiedXminFixture f;
+				ClusterHeapFreezeXminTargetV1 targets[3];
+
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
+				if (released) { fixture_release_original_writer(); resume_allowed = true; }
+				revoke_admission_in_space = kind;
+				UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 2)
+					: qualified_xmin_apply(&f, 0)));
+				UT_ASSERT_EQ(post_space_target_checks, 1);
+				UT_ASSERT_EQ(post_space_census_checks, kind == 2);
+				assert_post_space_refusal_resources(&f, released);
+			}
+		}
+	}
+}
+
+UT_TEST(test_xmin_final_admission_error_after_actual_space_unwinds_only_new_writer)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int released = 0; released < 2; released++) {
+			for (int kind = 3; kind <= 4; kind++) {
+				QualifiedXminFixture f;
+				ClusterHeapFreezeXminTargetV1 targets[3];
+
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
+				if (released) { fixture_release_original_writer(); resume_allowed = true; }
+				revoke_admission_in_space = kind;
+				expecting_error = true;
+				if (setjmp(error_jump) == 0) {
+					(void)(batch ? qualified_xmin_batch_apply(&f, targets, 2)
+						: qualified_xmin_apply(&f, 0));
+					UT_ASSERT(false);
+				}
+				UT_ASSERT_EQ(post_space_error_seen, kind - 2);
+				UT_ASSERT_EQ(post_space_target_checks, 1);
+				UT_ASSERT_EQ(post_space_census_checks, kind == 4);
+				assert_post_space_refusal_resources(&f, released);
+			}
+		}
+	}
+}
+
+UT_TEST(test_xmin_final_admission_callbacks_precede_last_source_match)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int released = 0; released < 2; released++) {
+			for (int kind = 1; kind <= 3; kind++) {
+				QualifiedXminFixture f;
+				ClusterHeapFreezeXminTargetV1 targets[3];
+
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_INVALID);
+				if (released) { fixture_release_original_writer(); resume_allowed = true; }
+				change_source_after_space_target = kind;
+				if (kind == 2) post_space_bounds = &f.cohort;
+				if (kind == 3) post_space_policy = &f.policy;
+				UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 2)
+					: qualified_xmin_apply(&f, 0)));
+				UT_ASSERT_EQ(post_space_target_checks, 1);
+				UT_ASSERT_EQ(post_space_census_checks, 1);
+				assert_post_space_refusal_resources(&f, released);
+			}
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(88);
+	UT_PLAN(91);
 	UT_RUN(test_xmin_native_horizon_refuses_creator_outside_legal_window);
 	UT_RUN(test_xmin_native_horizon_keeps_strictly_inside_legal_window);
 	UT_RUN(test_xmin_native_horizon_rechecks_legal_window_after_final_target);
@@ -3300,6 +3437,9 @@ main(void)
 	UT_RUN(test_xmin_single_and_batch_reject_unknown_or_behind_wal_clock);
 	UT_RUN(test_xmin_single_and_batch_wal_clock_accept_time_equal_or_ahead);
 	UT_RUN(test_xmin_batch_flush_error_keeps_borrowed_resources);
+	UT_RUN(test_xmin_final_admission_refusal_after_actual_space_is_before_wal);
+	UT_RUN(test_xmin_final_admission_error_after_actual_space_unwinds_only_new_writer);
+	UT_RUN(test_xmin_final_admission_callbacks_precede_last_source_match);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
