@@ -1631,7 +1631,8 @@ cluster_wal_inputs_tx_abort_current_v1(ClusterWalInputsV1 *inputs,
  * token is retained verbatim; current COMPLETE/history comes solely from this
  * scope's actual full ROOT selection, original source cut and WALR owner. */
 static bool
-inputs_tx_serial_request(ClusterWalInputsV1 *inputs, ClusterRecoverySerialRequest *out)
+inputs_tx_subject_request(ClusterWalInputsV1 *inputs, ClusterRecoverySerialRequest *out,
+	const ClusterWalInputV1 **out_selected)
 {
 	ClusterRecoverySerialRequest request;
 	const ClusterColdTypedV1 *typed;
@@ -1682,7 +1683,15 @@ inputs_tx_serial_request(ClusterWalInputsV1 *inputs, ClusterRecoverySerialReques
 		return false;
 	request.tx_closure_scope = inputs;
 	*out = request;
+	if (out_selected != NULL)
+		*out_selected = selected;
 	return true;
+}
+
+static bool
+inputs_tx_serial_request(ClusterWalInputsV1 *inputs, ClusterRecoverySerialRequest *out)
+{
+	return inputs_tx_subject_request(inputs, out, NULL);
 }
 
 bool
@@ -1831,6 +1840,74 @@ cluster_wal_inputs_tx_retention_v1(ClusterWalInputsV1 *inputs,
 		|| memcmp(record, &original, sizeof(original)) != 0)
 		return empty;
 	return view;
+}
+
+/* All outputs below are private stack values. Native incarnation and locator
+ * checks precede any borrowed scope/IR access; the original request producer
+ * alone chooses this subject from the full selected current/history union. */
+static bool
+inputs_tx_subject_authority(const ClusterRecoveryTxRetentionV1 *view,
+	ClusterRecoverySubjectAuthorityV1 *out)
+{
+	ClusterRecoverySerialRequest request;
+	const ClusterWalInputV1 *selected;
+
+	if (!cluster_wal_inputs_tx_retention_current_v1(view)
+		|| !inputs_tx_subject_request(view->scope, &request, &selected))
+		return false;
+	memset(out, 0, sizeof(*out));
+	memcpy(&out->retention, view, sizeof(*view));
+	memcpy(&out->root, &view->scope->token, sizeof(out->root));
+	memcpy(&out->selected, selected, sizeof(*selected));
+	memcpy(&out->replay_token, &request.expected_root_token, sizeof(out->replay_token));
+	/* These are exact retained inputs, not a new claim or a current RR token.
+	 * Do not replace either root identity with the installed writer's epoch. */
+	return cluster_wal_inputs_tx_retention_current_v1(view);
+}
+
+ClusterRecoverySubjectAuthorityV1
+cluster_wal_inputs_tx_subject_v1(const ClusterRecoveryTxRetentionV1 *view)
+{
+	ClusterRecoverySubjectAuthorityV1 authority, empty = {0};
+	ClusterRecoveryTxRetentionV1 original;
+
+	if (view == NULL)
+		return empty;
+	memcpy(&original, view, sizeof(original));
+	if (!inputs_tx_subject_authority(&original, &authority)
+		|| memcmp(view, &original, sizeof(original)) != 0)
+		return empty;
+	return authority;
+}
+
+bool
+cluster_wal_inputs_tx_subject_current_v1(const ClusterRecoverySubjectAuthorityV1 *authority)
+{
+	ClusterRecoverySubjectAuthorityV1 original, expected;
+
+	if (authority == NULL)
+		return false;
+	memcpy(&original, authority, sizeof(original));
+	return inputs_tx_subject_authority(&original.retention, &expected)
+		&& memcmp(&original, &expected, sizeof(original)) == 0
+		&& memcmp(authority, &original, sizeof(original)) == 0;
+}
+
+bool
+cluster_wal_inputs_tx_subject_covers_window_v1(
+	const ClusterRecoverySubjectAuthorityV1 *authority, uint16 thread,
+	XLogRecPtr lower, XLogRecPtr upper)
+{
+	ClusterRecoverySubjectAuthorityV1 original;
+
+	if (authority == NULL || thread == 0 || lower == InvalidXLogRecPtr || upper <= lower)
+		return false;
+	memcpy(&original, authority, sizeof(original));
+	return cluster_wal_inputs_tx_subject_current_v1(&original)
+		&& thread == original.selected.source.claim.identity.origin_thread_id
+		&& lower >= original.selected.checkpoint.checkpoint_lower_lsn
+		&& upper <= original.selected.checkpoint.validated_tail_lsn_exclusive
+		&& memcmp(authority, &original, sizeof(original)) == 0;
 }
 
 bool

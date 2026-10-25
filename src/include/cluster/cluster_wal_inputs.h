@@ -149,6 +149,31 @@ extern ClusterRecoveryTxRetentionV1 cluster_wal_inputs_tx_retention_v1(
 /* No I/O; locate the exact active scope and original native incarnation before
  * inspecting scope/IR pointers. This never grants PAGE or ordinary RR rights. */
 extern bool cluster_wal_inputs_tx_retention_current_v1(const ClusterRecoveryTxRetentionV1 *view);
+/* Original TX subject only: this value freezes the exact COMPLETE current or
+ * selected history input and its whole ROOT beside the borrowed native owners.
+ * The replay token remains the immutable old RR token, never current write
+ * authority. Retain the original scope/Start; caller storage must be disjoint.
+ * This is not an RR retention pin, PAGE batch, replay/ROOT publication or DATA
+ * permission. Other contributing origins still need their own authorities. */
+typedef struct ClusterRecoverySubjectAuthorityV1 {
+	ClusterRecoveryTxRetentionV1 retention;
+	ClusterControlRootFileToken root;
+	ClusterWalInputV1 selected;
+	ClusterControlRootReadToken replay_token;
+} ClusterRecoverySubjectAuthorityV1;
+/* No I/O/allocation/acquire; all-zero on refusal. Only the original native TX
+ * scope can supply the selected subject. No caller-provided COMPLETE record. */
+extern ClusterRecoverySubjectAuthorityV1 cluster_wal_inputs_tx_subject_v1(
+	const ClusterRecoveryTxRetentionV1 *view);
+/* No I/O: compare the complete frozen value against that same original scope
+ * and actual native holders, locating its incarnation before dereferencing any
+ * borrowed owner. Across I/O, revalidate the original whole ROOT scope outside
+ * native locks as well. This never reselects a different generation/cut. */
+extern bool cluster_wal_inputs_tx_subject_current_v1(
+	const ClusterRecoverySubjectAuthorityV1 *authority);
+extern bool cluster_wal_inputs_tx_subject_covers_window_v1(
+	const ClusterRecoverySubjectAuthorityV1 *authority, uint16 thread,
+	XLogRecPtr lower, XLogRecPtr upper);
 struct ClusterRecoverySerialRequest;
 /* IR purpose callbacks: validate includes original whole ROOT I/O outside CF;
  * current is no-wait and never calls the IR holder revalidation recursively. */

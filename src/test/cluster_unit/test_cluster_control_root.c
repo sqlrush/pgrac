@@ -25386,6 +25386,149 @@ tx_ir_fixture(bool complete)
 	cluster_wal_inputs_release_v1(&inputs);
 	tx_inputs_activate();
 }
+/* Catch borrowing a copied COMPLETE record, another retained origin or an
+ * expired native owner in place of this exact original TX subject. */
+UT_TEST(test_tx_subject_authority_requires_original_native_grant_and_selected_root)
+{
+	ClusterWalInputsV1 *inputs = NULL;
+	ClusterRecoveryTxRetentionV1 view = {0};
+	ClusterRecoverySubjectAuthorityV1 authority;
+	const ClusterWalInputV1 *selected;
+	int cf_calls, grants;
+
+	tx_ir_fixture(true);
+	UT_ASSERT_EQ(tx_inputs_begin(&inputs), 0);
+	authority = cluster_wal_inputs_tx_subject_v1(&view);
+	UT_ASSERT(v2_zero(&authority, sizeof(authority)));
+	UT_ASSERT_EQ(cluster_wal_inputs_tx_abort_acquire_v1(inputs, &tx_inputs_candidate.record), 0);
+	view = cluster_wal_inputs_tx_retention_v1(inputs, &tx_inputs_candidate.record);
+	cf_calls = test_cf_lock_calls; grants = test_tx_ir_grants;
+	authority = cluster_wal_inputs_tx_subject_v1(&view);
+	UT_ASSERT(authority.retention.scope == inputs);
+	if (authority.retention.scope == NULL) {
+		cluster_wal_inputs_release_v1(&inputs);
+		test_inputs_startup_cf = false;
+		return;
+	}
+	selected = cluster_wal_inputs_at_v1(inputs, 0);
+	UT_ASSERT(selected != NULL);
+	UT_ASSERT(memcmp(&authority.selected, selected, sizeof(*selected)) == 0);
+	UT_ASSERT(authority.selected.current);
+	UT_ASSERT_EQ(authority.selected.checkpoint.lifecycle,
+		CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE);
+	UT_ASSERT(memcmp(&authority.replay_token, &view.serial->root_read_token,
+		sizeof(authority.replay_token)) == 0);
+	UT_ASSERT(cluster_wal_inputs_tx_subject_current_v1(&authority));
+	UT_ASSERT_EQ(test_cf_lock_calls, cf_calls); UT_ASSERT_EQ(test_tx_ir_grants, grants);
+	cluster_wal_inputs_release_v1(&inputs);
+	UT_ASSERT(!cluster_wal_inputs_tx_subject_current_v1(&authority));
+	UT_ASSERT(!test_tx_ir_held && !inputs_pin_held);
+	test_inputs_startup_cf = false;
+}
+
+UT_TEST(test_tx_subject_authority_rejects_every_frozen_field_and_foreign_source)
+{
+	ClusterWalInputsV1 *inputs = NULL;
+	ClusterRecoveryTxRetentionV1 view;
+	ClusterRecoverySubjectAuthorityV1 authority;
+	const ClusterWalInputV1 *other;
+
+	tx_ir_fixture(true);
+	UT_ASSERT_EQ(tx_inputs_begin(&inputs), 0);
+	UT_ASSERT_EQ(cluster_wal_inputs_tx_abort_acquire_v1(inputs, &tx_inputs_candidate.record), 0);
+	view = cluster_wal_inputs_tx_retention_v1(inputs, &tx_inputs_candidate.record);
+	authority = cluster_wal_inputs_tx_subject_v1(&view);
+	UT_ASSERT(authority.retention.scope == inputs);
+	if (authority.retention.scope == NULL) {
+		cluster_wal_inputs_release_v1(&inputs); test_inputs_startup_cf = false; return;
+	}
+	/* Includes all reserved bytes, full native checkpoint, claim hashes and
+	 * the original physical cut, not only origin or lifecycle fields. */
+	for (Size i = 0; i < sizeof(authority); i++) {
+		ClusterRecoverySubjectAuthorityV1 changed = authority;
+		((unsigned char *)&changed)[i] ^= 1;
+		UT_ASSERT(!cluster_wal_inputs_tx_subject_current_v1(&changed));
+	}
+	other = cluster_wal_inputs_at_v1(inputs, 1);
+	UT_ASSERT(other != NULL);
+	if (other != NULL) {
+		ClusterRecoverySubjectAuthorityV1 changed = authority;
+		changed.selected = *other;
+		UT_ASSERT(!cluster_wal_inputs_tx_subject_current_v1(&changed));
+	}
+	UT_ASSERT(cluster_wal_inputs_tx_subject_current_v1(&authority));
+	UT_ASSERT(!cluster_wal_inputs_tx_subject_current_v1(NULL));
+	cluster_wal_inputs_release_v1(&inputs);
+	test_inputs_startup_cf = false;
+}
+
+UT_TEST(test_tx_subject_authority_covers_only_its_complete_original_physical_cut)
+{
+	ClusterWalInputsV1 *inputs = NULL;
+	ClusterRecoveryTxRetentionV1 view;
+	ClusterRecoverySubjectAuthorityV1 authority;
+	uint16 thread;
+	XLogRecPtr lower, upper;
+
+	tx_ir_fixture(true);
+	UT_ASSERT_EQ(tx_inputs_begin(&inputs), 0);
+	UT_ASSERT_EQ(cluster_wal_inputs_tx_abort_acquire_v1(inputs, &tx_inputs_candidate.record), 0);
+	view = cluster_wal_inputs_tx_retention_v1(inputs, &tx_inputs_candidate.record);
+	authority = cluster_wal_inputs_tx_subject_v1(&view);
+	UT_ASSERT(authority.retention.scope == inputs);
+	if (authority.retention.scope == NULL) {
+		cluster_wal_inputs_release_v1(&inputs); test_inputs_startup_cf = false; return;
+	}
+	thread = authority.selected.source.claim.identity.origin_thread_id;
+	lower = authority.selected.checkpoint.checkpoint_lower_lsn;
+	upper = authority.selected.checkpoint.validated_tail_lsn_exclusive;
+	UT_ASSERT(cluster_wal_inputs_tx_subject_covers_window_v1(&authority, thread, lower, upper));
+	UT_ASSERT(!cluster_wal_inputs_tx_subject_covers_window_v1(&authority, 128, lower, upper));
+	UT_ASSERT(!cluster_wal_inputs_tx_subject_covers_window_v1(&authority, thread, lower - 1, upper));
+	UT_ASSERT(!cluster_wal_inputs_tx_subject_covers_window_v1(&authority, thread, lower, upper + 1));
+	UT_ASSERT(!cluster_wal_inputs_tx_subject_covers_window_v1(&authority, thread, lower, lower));
+	UT_ASSERT(!cluster_wal_inputs_tx_subject_covers_window_v1(&authority, thread, 0, upper));
+	inputs_pin_current = false;
+	UT_ASSERT(!cluster_wal_inputs_tx_subject_covers_window_v1(&authority, thread, lower, upper));
+	cluster_wal_inputs_release_v1(&inputs);
+	test_inputs_startup_cf = false;
+}
+
+UT_TEST(test_tx_subject_authority_never_renews_on_native_owner_or_root_change)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		ClusterWalInputsV1 *inputs = NULL;
+		ClusterRecoveryTxRetentionV1 view;
+		ClusterRecoverySubjectAuthorityV1 authority, refused;
+
+		tx_ir_fixture(true);
+		UT_ASSERT_EQ(tx_inputs_begin(&inputs), 0);
+		UT_ASSERT_EQ(cluster_wal_inputs_tx_abort_acquire_v1(inputs, &tx_inputs_candidate.record), 0);
+		view = cluster_wal_inputs_tx_retention_v1(inputs, &tx_inputs_candidate.record);
+		authority = cluster_wal_inputs_tx_subject_v1(&view);
+		UT_ASSERT(authority.retention.scope == inputs);
+		if (authority.retention.scope == NULL) {
+			cluster_wal_inputs_release_v1(&inputs); test_inputs_startup_cf = false; return;
+		}
+		switch (fault) {
+		case 0: test_input_current = false; break;
+		case 1: tx_inputs_generation++; break;
+		case 2: tx_inputs_typed.sources[0].claim.claim_sha256[0] ^= 1; break;
+		case 3:
+			v2_checkpoint_root_race();
+			UT_ASSERT_EQ(cluster_wal_inputs_revalidate_v1(inputs), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+			break;
+		case 4: UT_ASSERT_EQ(cluster_wal_inputs_suspend_v1(inputs), 0); break;
+		}
+		UT_ASSERT(!cluster_wal_inputs_tx_subject_current_v1(&authority));
+		refused = cluster_wal_inputs_tx_subject_v1(&view);
+		UT_ASSERT(v2_zero(&refused, sizeof(refused)));
+		cluster_wal_inputs_release_v1(&inputs);
+		UT_ASSERT(!test_tx_ir_held && !inputs_pin_held);
+		test_inputs_startup_cf = false;
+	}
+}
+
 UT_TEST(test_tx_retention_exports_only_original_granted_scope_owners)
 {
 	ClusterWalInputsV1 *inputs = NULL;
@@ -25737,6 +25880,78 @@ UT_TEST(test_tx_ir_exact_history_source_is_selected_without_current_rr_fallback)
 	test_inputs_startup_cf = false;
 }
 
+UT_TEST(test_tx_subject_authority_binds_exact_selected_history)
+{
+	uint8 bytes[66048], uuid[16] = {0x86};
+	ClusterPhase1FullStopPlan plan;
+	ClusterWalHistoryImage history;
+	ClusterWalHistoryStage stage;
+	ControlRootImage root;
+	ClusterWalInputsV1 *inputs = NULL;
+	const ClusterWalInputV1 *item = NULL;
+	ClusterWalInputV1 expected = {0};
+	ClusterRecoveryTxRetentionV1 view;
+	ClusterRecoverySubjectAuthorityV1 authority;
+	v2_close_history_fixture_sequenced(bytes, &plan, &history, &stage, 2, true);
+	root_fixture_version3(bytes);
+	UT_ASSERT_EQ(cluster_control_root_v3_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &root), 0);
+	tx_ir_complete(&history.records[0].snapshot);
+	test_actual_cf = ExclusiveLock;
+	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 890002, uuid, &stage), 0);
+	UT_ASSERT_EQ(cluster_wal_history_install(&stage), 0);
+	root.refs[0].history_generation = stage.generation;
+	memcpy(root.refs[0].history_sha256, stage.sha256, 32);
+	UT_ASSERT_EQ(cluster_wal_history_discard(&stage), 0);
+	test_actual_cf = test_cf_mode = NoLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+	v2_write_roots(root.bytes);
+	cluster_shared_config = true; MyBackendType = B_BG_WORKER;
+	inputs_pin_held = inputs_pin_refuse = inputs_pin_race = inputs_pin_throw = false;
+	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs), 0);
+	for (uint32 i = 0; i < cluster_wal_inputs_count_v1(inputs); i++) {
+		const ClusterWalInputV1 *at = cluster_wal_inputs_at_v1(inputs, i);
+		if (!at->current && at->kind == CLUSTER_WAL_INPUT_CHECKPOINT
+			&& at->checkpoint.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE) {
+			UT_ASSERT(item == NULL); item = at;
+		}
+	}
+	UT_ASSERT(item != NULL);
+	if (item != NULL) {
+		ClusterColdParticipantV1 *cut;
+		expected = *item;
+		memset(&tx_inputs_typed, 0, sizeof(tx_inputs_typed));
+		tx_inputs_typed.system_identifier = TEST_SYSID;
+		tx_inputs_typed.census_root_captured = true;
+		UT_ASSERT_EQ(cluster_wal_inputs_root_token_v1(inputs, &tx_inputs_typed.census_root), 0);
+		tx_inputs_typed.participant_count = tx_inputs_typed.replay_count = 1;
+		tx_inputs_typed.sources[0] = item->source;
+		cut = &tx_inputs_typed.participants[0];
+		cut->thread_id = item->source.claim.identity.origin_thread_id;
+		cut->owner_incarnation = item->source.claim.identity.origin_owner_incarnation;
+		cut->timeline = item->source.timeline;
+		cut->physical_lower = item->checkpoint.checkpoint_lower_lsn;
+		cut->native_redo = item->native_redo;
+		cut->tail_end = item->checkpoint.validated_tail_lsn_exclusive;
+	}
+	cluster_wal_inputs_release_v1(&inputs);
+	tx_inputs_activate();
+	UT_ASSERT_EQ(tx_inputs_begin(&inputs), 0);
+	UT_ASSERT_EQ(cluster_wal_inputs_tx_abort_acquire_v1(inputs, &tx_inputs_candidate.record), 0);
+	UT_ASSERT(cluster_wal_inputs_tx_abort_authorized_v1(inputs, &tx_inputs_candidate.record));
+	view = cluster_wal_inputs_tx_retention_v1(inputs, &tx_inputs_candidate.record);
+	authority = cluster_wal_inputs_tx_subject_v1(&view);
+	UT_ASSERT(authority.retention.scope == inputs);
+	UT_ASSERT(!authority.selected.current);
+	UT_ASSERT(memcmp(&authority.selected, &expected, sizeof(expected)) == 0);
+	UT_ASSERT(cluster_wal_inputs_tx_subject_current_v1(&authority));
+	UT_ASSERT(cluster_wal_inputs_tx_subject_covers_window_v1(&authority,
+		expected.source.claim.identity.origin_thread_id, expected.checkpoint.checkpoint_lower_lsn,
+		expected.checkpoint.validated_tail_lsn_exclusive));
+	cluster_wal_inputs_release_v1(&inputs);
+	UT_ASSERT(!test_tx_ir_held && !inputs_pin_held);
+	test_inputs_startup_cf = false;
+}
+
 static void ctrc_inputs_activate_work(void);
 static void
 inputs_reselects_original_history_after_actual_install(bool ctrc)
@@ -26045,7 +26260,12 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_TX_INPUTS") != NULL) {
-		UT_PLAN(18);
+		UT_PLAN(23);
+		UT_RUN(test_tx_subject_authority_requires_original_native_grant_and_selected_root);
+		UT_RUN(test_tx_subject_authority_rejects_every_frozen_field_and_foreign_source);
+		UT_RUN(test_tx_subject_authority_covers_only_its_complete_original_physical_cut);
+		UT_RUN(test_tx_subject_authority_never_renews_on_native_owner_or_root_change);
+		UT_RUN(test_tx_subject_authority_binds_exact_selected_history);
 		UT_RUN(test_tx_retention_exports_only_original_granted_scope_owners);
 		UT_RUN(test_tx_retention_recreated_pin_or_scope_never_renews_a_view);
 		UT_RUN(test_tx_retention_checks_original_sources_and_native_owners);
