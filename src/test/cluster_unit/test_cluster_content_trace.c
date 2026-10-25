@@ -276,11 +276,54 @@ count_owner(const ClusterContentTraceOwner *owner, void *context)
 	(*count)++;
 }
 
-UT_TEST(rejection_keeps_never_published_native_slot_unknown)
+UT_TEST(process_start_initializes_empty_before_pid_without_local_process)
+{
+	ClusterContentTraceOwner empty = {0};
+	ClusterContentTraceWalkStats stats; unsigned owners = 0;
+	reset(); cluster_trace_tx_identity = false; MyProc = NULL;
+	UT_ASSERT_EQ(procs[1].pid, 0);
+	cluster_content_trace_process_start(1);
+	empty.revision = 1;
+	UT_ASSERT_EQ(memcmp(&content_trace->slots[1].owner, &empty, sizeof(empty)), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&content_trace->slots[1].revision), 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&content_trace->slots[1].busy), 0);
+	cluster_trace_tx_identity = true;
+	cluster_content_trace_walk(count_owner, &owners, &stats);
+	UT_ASSERT_EQ(owners, 0); UT_ASSERT_EQ(stats.changed, 0);
+	/* The first real hold/wait must replace the baseline and remain visible. */
+	actor(1); hold(0, LW_SHARED);
+	cluster_content_trace_native_wait_set(&buf(1)->content_lock, LW_EXCLUSIVE);
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.nowners, 1); UT_ASSERT_EQ(cut.owners[0].pid, 101);
+	UT_ASSERT_EQ(cut.owners[0].nlocks, 1); UT_ASSERT(cut.owners[0].native_waiting);
+}
+
+UT_TEST(process_start_retires_recycled_payload_at_native_allocation)
+{
+	ClusterContentTraceOwner empty = {0};
+	ClusterContentTraceWalkStats stats; unsigned owners = 0;
+	uint64 revision;
+	reset(); actor(1); hold(0, LW_EXCLUSIVE);
+	cluster_content_trace_native_wait_set(&buf(1)->content_lock, LW_SHARED);
+	revision = pg_atomic_read_u64(&content_trace->slots[1].revision);
+	UT_ASSERT(content_trace->slots[1].owner.native_waiting);
+	/* Native cleanup releases the old holds before the slot is reallocated.
+	 * Old PGPROC PID/backendId may still be present at this pre-PID hook. */
+	nheld = 0; cluster_content_trace_process_start(1);
+	empty.revision = revision + 1;
+	UT_ASSERT_EQ(memcmp(&content_trace->slots[1].owner, &empty, sizeof(empty)), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&content_trace->slots[1].revision), revision + 1);
+	cluster_content_trace_walk(count_owner, &owners, &stats);
+	UT_ASSERT_EQ(owners, 0); UT_ASSERT_EQ(stats.changed, 0);
+}
+
+UT_TEST(rejection_keeps_busy_allocation_without_baseline_unknown)
 {
 	ClusterContentTraceWalkStats stats; unsigned owners = 0;
 	reset(); nrejected = 0;
+	pg_atomic_write_u32(&content_trace->slots[1].busy, 1);
 	cluster_content_trace_process_start(1);
+	pg_atomic_write_u32(&content_trace->slots[1].busy, 0);
 	cluster_content_trace_walk_rejections(count_owner, &owners,
 		remember_rejection, &nrejected, &stats);
 	UT_ASSERT_EQ(stats.changed, 1); UT_ASSERT_EQ(stats.owners, 0);
@@ -300,7 +343,9 @@ UT_TEST(rejection_retains_stale_payload_and_native_free_identity)
 	ClusterContentTraceWalkStats stats; unsigned owners = 0;
 	reset(); nrejected = 0; actor(1); hold(0, LW_EXCLUSIVE);
 	cluster_content_trace_lock_changed(&buf(0)->content_lock);
+	pg_atomic_write_u32(&content_trace->slots[1].busy, 1);
 	cluster_content_trace_process_start(1); procs[1].pid = 0;
+	pg_atomic_write_u32(&content_trace->slots[1].busy, 0);
 	cluster_content_trace_walk_rejections(count_owner, &owners,
 		remember_rejection, &nrejected, &stats);
 	UT_ASSERT_EQ(stats.changed, 1); UT_ASSERT_EQ(owners, 0);
@@ -345,7 +390,9 @@ UT_TEST(rejection_details_preserve_legacy_counters_and_source_bytes)
 		actor(i); cluster_content_trace_native_wait_set(&buf(0)->content_lock, LW_SHARED);
 	}
 	pg_atomic_write_u32(&content_trace->slots[0].busy, 1);
+	pg_atomic_write_u32(&content_trace->slots[1].busy, 1);
 	cluster_content_trace_process_start(1); procs[2].pid = 0;
+	pg_atomic_write_u32(&content_trace->slots[1].busy, 0);
 	size = content_trace_size(); before = malloc(size); memcpy(before, content_trace, size);
 	cluster_content_trace_walk(count_owner, &old_owners, &legacy);
 	cluster_content_trace_walk_rejections(count_owner, &new_owners,
@@ -617,15 +664,21 @@ UT_TEST(hw_ko_grant_cap_and_missed_release_are_unknown)
 
 UT_TEST(process_start_invalidates_even_identical_reused_native_identity)
 {
+	ClusterContentTraceOwner before;
+	uint64 revision;
 	reset(); hold(0, LW_EXCLUSIVE);
 	cluster_content_trace_lock_changed(&buf(0)->content_lock);
 	cluster_content_trace_capture(NULL, &cut);
 	UT_ASSERT_EQ(cut.nowners, 1);
+	before = content_trace->slots[0].owner;
+	revision = pg_atomic_read_u64(&content_trace->slots[0].revision);
 	/* Native pid and backendId may both repeat in a recycled PGPROC. */
 	cluster_trace_tx_identity = false;
 	pg_atomic_write_u32(&content_trace->slots[0].busy, 1);
 	cluster_content_trace_process_start(0);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&content_trace->slots[0].busy), 1);
+	UT_ASSERT_EQ(memcmp(&before, &content_trace->slots[0].owner, sizeof(before)), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&content_trace->slots[0].revision), revision + 1);
 	pg_atomic_write_u32(&content_trace->slots[0].busy, 0);
 	cluster_trace_tx_identity = true;
 	cluster_content_trace_capture(NULL, &cut);
@@ -810,8 +863,10 @@ UT_TEST(pcm_nested_finish_inherits_only_same_native_request_admission)
 int main(void)
 {
 	cluster_content_trace_shmem_register(); assert(registered && registered->lwlock_count == 0);
-	UT_PLAN(41);
-	UT_RUN(rejection_keeps_never_published_native_slot_unknown);
+	UT_PLAN(43);
+	UT_RUN(process_start_initializes_empty_before_pid_without_local_process);
+	UT_RUN(process_start_retires_recycled_payload_at_native_allocation);
+	UT_RUN(rejection_keeps_busy_allocation_without_baseline_unknown);
 	UT_RUN(rejection_retains_stale_payload_and_native_free_identity);
 	UT_RUN(rejection_busy_never_copies_payload_and_dead_identity_stays_unknown);
 	UT_RUN(rejection_details_preserve_legacy_counters_and_source_bytes);

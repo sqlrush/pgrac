@@ -77,10 +77,25 @@ cluster_content_trace_shmem_register(void)
 void
 cluster_content_trace_process_start(uint32 procno)
 {
+	ContentTraceSlot *slot;
+	uint32 expected = 0;
+	uint64 revision;
+
 	/* Invalidate a prior incarnation even if its PID/backendId are reused.
 	 * Never take busy away from a reader or a previous, interrupted publisher. */
-	if (content_trace != NULL && procno < content_trace->nslots)
-		(void)pg_atomic_fetch_add_u64(&content_trace->slots[procno].revision, 1);
+	if (content_trace == NULL || procno >= content_trace->nslots)
+		return;
+	slot = &content_trace->slots[procno];
+	revision = pg_atomic_fetch_add_u64(&slot->revision, 1) + 1;
+	if (!pg_atomic_compare_exchange_u32(&slot->busy, &expected, 1))
+		return;
+	/* Only the native allocator calls this, before publishing its new PID.
+	 * The previous allocation has released its content holds; the new one
+	 * has none yet. Publish that empty baseline, not a stale incarnation.
+	 * A missed busy acquisition above must instead retain UNKNOWN. */
+	memset(&slot->owner, 0, sizeof(slot->owner));
+	slot->owner.revision = revision;
+	(void)pg_atomic_exchange_u32(&slot->busy, 0);
 }
 
 static bool
