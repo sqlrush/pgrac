@@ -27,4 +27,15 @@ extern ClusterThreadRecoveryAuthorityResultV1
 test_relmap_scope_authority(const ClusterThreadRecoveryAuthorityV1 *authority);
 extern bool test_relmap_scope_storage(ClusterProtectedSetIdentityV1 *out);
 extern void test_relmap_scope_cache_reset(void);
+/* Controlled lower facilities, never external-fence/retention certification. */
+extern ClusterRecoverySerialRevalidateResult
+test_relmap_authority_serial(ClusterRecoverySerialGuard *guard);
+extern ClusterFormationWitnessResult
+test_relmap_authority_formation(const ClusterFormationWitnessV1 *formation);
+extern bool test_relmap_authority_needs(const PgracExternalFenceNeedSetV1 *needs,
+	const ClusterFormationWitnessV1 *formation, PgracExternalFenceDenyReason *reason);
+extern bool test_relmap_authority_admissions(const PgracExternalFenceAdmissionSetV1 *admissions,
+	const PgracExternalFenceNeedSetV1 *needs, const ClusterFormationWitnessV1 *formation,
+	PgracExternalFenceDenyReason *reason);
+extern ClusterWalPinResult test_relmap_authority_pin(ClusterWalRetentionPin *pin);
 #endif

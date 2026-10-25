@@ -43,6 +43,8 @@ static bool relmap_root_merger, relmap_root_namespace_x;
 static bool cold_native_real_clog, cold_native_real_scope;
 static void cold_original_scope_setup(void);
 static void cold_original_scope_done(void);
+static void cold_original_protection_setup(void);
+static void cold_original_authority_postwrite(void);
 static size_t cold_original_terminal_payload(bool aborted, uint16 thread, uint8 *out);
 static TestRelmapNativeClogStats cold_native_clog_last;
 bool
@@ -3407,6 +3409,7 @@ UT_TEST(test_terminal_read_native_error_keeps_output_zero_and_custody_dead)
 #include "test_cluster_relmap_census_open.inc"
 #include "test_cluster_relmap_cold_native.inc"
 #include "test_cluster_relmap_original_scope.inc"
+#include "test_cluster_relmap_original_authority.inc"
 
 int
 main(int argc, char **argv)
@@ -3415,7 +3418,10 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(125);
+	UT_PLAN(128);
+	UT_RUN(test_cold_original_authority_rejects_broken_provenance_before_storage);
+	UT_RUN(test_cold_original_authority_postwrite_loss_keeps_original_debt);
+	UT_RUN(test_cold_original_authority_late_provider_refusal_or_error_keeps_pending);
 	UT_RUN(test_cold_original_scope_native_commit_abort);
 	UT_RUN(test_cold_original_scope_reentry_rejects_old_cursor);
 	UT_RUN(test_cold_original_scope_refuses_non_cold_or_stale_owner);

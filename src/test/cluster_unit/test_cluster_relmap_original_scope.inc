@@ -43,18 +43,6 @@ cold_original_terminal_payload(bool aborted, uint16 thread, uint8 *out)
 	return length;
 }
 
-ClusterThreadRecoveryAuthorityResultV1
-test_relmap_scope_authority(const ClusterThreadRecoveryAuthorityV1 *a)
-{
-	cold_original_checks++;
-	return a == &cold_original_authority && a->serial_guard == &cold_original_serial
-				   && a->serial_guard->held && !a->serial_guard->release_uncertain
-				   && a->duty == &cold_original_duty && a->root_snapshot == &execution_root
-				   && a->root_token == &execution_token && cold_original_fault == 0
-			   ? CLUSTER_THREAD_AUTHORITY_OK
-			   : CLUSTER_THREAD_AUTHORITY_PIN_STALE;
-}
-
 bool
 test_relmap_scope_storage(ClusterProtectedSetIdentityV1 *out)
 {
@@ -126,6 +114,7 @@ cold_original_scope_setup(void)
 	cold_original_authority.root_token = &execution_token;
 	cold_original_authority.serial_guard = &cold_original_serial;
 	cold_original_fault = cold_original_checks = cold_original_resets = 0;
+	cold_original_protection_setup();
 	UT_ASSERT(cluster_undo_recovery_scope_enter_v1(&cold_original_scope, &cold_original_authority,
 												   cold_original_plan));
 	serial = cold_original_id();

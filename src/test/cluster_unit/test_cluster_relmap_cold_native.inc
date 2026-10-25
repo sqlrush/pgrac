@@ -18,6 +18,8 @@ cold_native_sync(void)
 		custody_scope++;
 	if (cold_native_syncs == 4 && cold_native_post_fault == 2)
 		custody_scope_error_after = custody_scope_reads + 1;
+	if (cold_native_real_scope && cold_native_syncs == 4 && cold_native_post_fault >= 3)
+		cold_original_authority_postwrite();
 }
 
 /* The actual arbiter must broadcast only after both new images are durable
