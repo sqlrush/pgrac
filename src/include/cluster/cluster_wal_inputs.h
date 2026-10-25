@@ -88,7 +88,9 @@ struct ClusterColdCtrcWorkV1;
 /* Original post-EOR Startup and its current retained CTRC work only. Reacquire
  * the complete ROOT-selected input set and WALR read pins, reselect every
  * original source (including INSTALL history), and bind the original census
- * ROOT, owner and work generation. No ACTIVE subject is required. Suspend/
+ * ROOT, owner and work generation. Complete original source/participant bytes
+ * and counts are fixed before scope I/O; every local current rejects drift.
+ * No ACTIVE subject is required. Suspend/
  * resume and reads reject re-prepared work even at the same allocation address.
  * Cold census may fix and natively flush only this exact original Startup
  * owner's installed local OPEN writer after selection. Its end never moves;

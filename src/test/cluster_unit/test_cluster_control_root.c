@@ -26008,6 +26008,7 @@ UT_TEST(test_tx_inputs_parent_subject_and_wait_revalidation)
 #include "test_cluster_control_ctrc_namespace.inc"
 #include "test_cluster_control_ctrc_ir.inc"
 #include "test_cluster_control_ctrc_replay_ir.inc"
+#include "test_cluster_control_ctrc_source_plan.inc"
 #include "test_cluster_control_ctrc_stable.inc"
 
 /*
@@ -26235,6 +26236,16 @@ main(int argc, char **argv)
 		UT_RUN(test_ctrc_stable_new_native_grant_cannot_revive_old_proof);
 		UT_RUN(test_ctrc_stable_cf_wait_and_changed_root_keep_original_owners);
 		UT_RUN(test_ctrc_stable_late_scope_loss_and_error_never_publish_proof);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_CTRC_SOURCE_PLAN") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_ctrc_source_plan_preserves_unchanged_local_scope);
+		UT_RUN(test_ctrc_source_plan_rejects_every_source_and_participant_byte);
+		UT_RUN(test_ctrc_source_plan_refuses_all_later_count_changes);
+		UT_RUN(test_ctrc_source_plan_other_origin_drift_keeps_native_cleanup_debt);
+		UT_RUN(test_ctrc_source_plan_refuses_invalid_initial_bounds_before_owners);
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
@@ -26496,7 +26507,13 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(559);
+	UT_PLAN(564);
+	UT_RUN(test_ctrc_source_plan_preserves_unchanged_local_scope);
+	UT_RUN(test_ctrc_source_plan_rejects_every_source_and_participant_byte);
+	UT_RUN(test_ctrc_source_plan_refuses_all_later_count_changes);
+	UT_RUN(test_ctrc_source_plan_other_origin_drift_keeps_native_cleanup_debt);
+	UT_RUN(test_ctrc_source_plan_refuses_invalid_initial_bounds_before_owners);
+
 	UT_RUN(test_ctrc_replay_ir_grants_original_source_without_a_tt_subject);
 	UT_RUN(test_ctrc_replay_ir_never_substitutes_for_subject_purpose);
 	UT_RUN(test_ctrc_replay_ir_wait_keeps_original_purpose_and_holder);

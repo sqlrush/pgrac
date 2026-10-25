@@ -53,9 +53,19 @@ typedef struct ClusterRecoveryTxIoScopeV1 {
 	bool ir_revoked;
 } ClusterRecoveryTxIoScopeV1;
 
+/* Original full source plan, captured before this scope performs I/O.
+ * Only cold census allocates it, in the same creation context as its scope.
+ * Mutable scan progress and TX results keep their original separate owners. */
+typedef struct ClusterRecoveryCtrcSourcePlanV1 {
+	uint32 participant_count, replay_count;
+	ClusterColdParticipantV1 participants[CLUSTER_COLD_MAX_PARTICIPANTS];
+	ClusterWalSourceRef sources[CLUSTER_COLD_MAX_PARTICIPANTS];
+} ClusterRecoveryCtrcSourcePlanV1;
+
 typedef struct ClusterRecoveryCtrcIoScopeV1 {
 	const struct ClusterRecoveryStartV1 *start;
 	const ClusterColdTypedV1 *inputs;
+	ClusterRecoveryCtrcSourcePlanV1 *source_plan;
 	const ClusterColdCtrcWorkV1 *work;
 	uint64 work_generation;
 	ClusterRecoveryCheckpointOwnerV1 owner;
@@ -144,7 +154,14 @@ inputs_scope_role(const ClusterWalInputsV1 *inputs)
 			return false;
 		typed = ClusterColdRecoveryTxInputs(inputs->ctrc.start);
 		return typed != NULL && typed == inputs->ctrc.inputs && typed->census_root_captured
-			&& memcmp(&typed->census_root, &inputs->ctrc.root, sizeof(inputs->ctrc.root)) == 0;
+			&& memcmp(&typed->census_root, &inputs->ctrc.root, sizeof(inputs->ctrc.root)) == 0
+			&& inputs->ctrc.source_plan != NULL
+			&& typed->participant_count == inputs->ctrc.source_plan->participant_count
+			&& typed->replay_count == inputs->ctrc.source_plan->replay_count
+			&& memcmp(typed->participants, inputs->ctrc.source_plan->participants,
+				(Size)typed->participant_count * sizeof(typed->participants[0])) == 0
+			&& memcmp(typed->sources, inputs->ctrc.source_plan->sources,
+				(Size)typed->participant_count * sizeof(typed->sources[0])) == 0;
 	}
 	if (inputs->purpose != WAL_INPUTS_TX_CLOSURE)
 		return inputs_io_role(inputs->purpose == WAL_INPUTS_COLD_REPLAY);
@@ -438,6 +455,8 @@ cluster_wal_inputs_release_v1(ClusterWalInputsV1 **inputs)
 		memset(&active_tx_retention, 0, sizeof(active_tx_retention));
 	if (active_ctrc_retention.scope == *inputs)
 		memset(&active_ctrc_retention, 0, sizeof(active_ctrc_retention));
+	if ((*inputs)->ctrc.source_plan != NULL)
+		pfree((*inputs)->ctrc.source_plan);
 	explicit_bzero(*inputs, sizeof(**inputs));
 	pfree(*inputs);
 	*inputs = NULL;
@@ -1488,6 +1507,9 @@ inputs_begin(const uint8 storage_uuid[16], uint64 system_identifier, WalInputsPu
 			|| !ClusterColdRecoveryCtrcWorkCurrent(start, ctrc_work)
 			|| (typed = ClusterColdRecoveryTxInputs(start)) == NULL
 			|| !typed->census_root_captured
+			|| typed->participant_count == 0
+			|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+			|| typed->replay_count > typed->participant_count
 			|| !ClusterColdRecoveryTxCheckpointOwnerV1(start, &ctrc_owner))
 			return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	}
@@ -1512,6 +1534,13 @@ inputs_begin(const uint8 storage_uuid[16], uint64 system_identifier, WalInputsPu
 		inputs->ctrc.work_generation = ctrc_work->generation;
 		inputs->ctrc.owner = ctrc_owner;
 		inputs->ctrc.root = typed->census_root;
+		inputs->ctrc.source_plan = palloc0(sizeof(*inputs->ctrc.source_plan));
+		inputs->ctrc.source_plan->participant_count = typed->participant_count;
+		inputs->ctrc.source_plan->replay_count = typed->replay_count;
+		memcpy(inputs->ctrc.source_plan->participants, typed->participants,
+			(Size)typed->participant_count * sizeof(typed->participants[0]));
+		memcpy(inputs->ctrc.source_plan->sources, typed->sources,
+			(Size)typed->participant_count * sizeof(typed->sources[0]));
 		/* Bind the physical directory name/object before the original ROOT
 		 * selection. Lazy opening must not adopt a later configuration or a
 		 * replacement directory containing a copy of the same ROOT bytes.
