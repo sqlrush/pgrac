@@ -89,7 +89,9 @@ struct ClusterColdCtrcWorkV1;
 /* Original post-EOR Startup and its current retained CTRC work only. Reacquire
  * the complete ROOT-selected input set and WALR read pins, reselect every
  * original source (including INSTALL history), and bind the original census
- * ROOT, owner and work generation. No ACTIVE subject is required. Suspend/
+ * ROOT, owner and work generation. Complete original source/participant bytes
+ * and counts are fixed before scope I/O; every local current rejects drift.
+ * No ACTIVE subject is required. Suspend/
  * resume and reads reject re-prepared work even at the same allocation address.
  * Cold census may fix and natively flush only this exact original Startup
  * owner's installed local OPEN writer after selection. Its end never moves;
@@ -221,6 +223,40 @@ extern bool cluster_wal_inputs_ctrc_subject_current_v1(
 	const ClusterRecoveryCtrcSubjectAuthorityV1 *authority);
 extern bool cluster_wal_inputs_ctrc_subject_covers_window_v1(
 	const ClusterRecoveryCtrcSubjectAuthorityV1 *authority, uint16 thread,
+	XLogRecPtr lower, XLogRecPtr upper);
+/* One original replay origin on the same single native CTRC holder. The
+ * provisional request must come from ClusterColdRecoveryCtrcReplayRequest.
+ * A TT entry is not required. Subject and replay purposes cannot replace
+ * each other before exact confirmed release, even for the same index.
+ * Other origins still require their own simultaneous native custody before
+ * PAGE; this single-holder API is not an all-source set or service driver. */
+extern ClusterControlRootResult cluster_wal_inputs_ctrc_replay_acquire_v1(
+	ClusterWalInputsV1 *inputs, uint32 source_index,
+	const struct ClusterRecoverySerialRequest *provisional);
+extern bool cluster_wal_inputs_ctrc_replay_authorized_v1(
+	ClusterWalInputsV1 *inputs, uint32 source_index);
+extern ClusterControlRootResult cluster_wal_inputs_ctrc_replay_release_v1(
+	ClusterWalInputsV1 *inputs, uint32 source_index);
+/* Distinct native purpose: actual TX IR and original read-WALR incarnation,
+ * complete original COMPLETE/history input and immutable old replay token.
+ * By-value, disjoint caller storage, zero on refusal. Retain original scope
+ * and Start. This view grants neither ordinary RR nor PAGE/DATA/completion. */
+typedef struct ClusterRecoveryCtrcReplayAuthorityV1 {
+	ClusterRecoverySubjectAuthorityV1 source;
+	uint64 ir_request_id;
+	uint64 work_generation;
+	uint32 source_index;
+	uint32 reserved_zero;
+} ClusterRecoveryCtrcReplayAuthorityV1;
+extern ClusterRecoveryCtrcReplayAuthorityV1 cluster_wal_inputs_ctrc_replay_source_v1(
+	ClusterWalInputsV1 *inputs, uint32 source_index);
+/* No I/O/allocation/acquire/cleanup. Locate original scope/pin incarnation
+ * before inspecting borrowed pointers, then verify exact current native IR.
+ * Across I/O, also revalidate the whole original ROOT outside native locks. */
+extern bool cluster_wal_inputs_ctrc_replay_source_current_v1(
+	const ClusterRecoveryCtrcReplayAuthorityV1 *authority);
+extern bool cluster_wal_inputs_ctrc_replay_source_covers_window_v1(
+	const ClusterRecoveryCtrcReplayAuthorityV1 *authority, uint16 thread,
 	XLogRecPtr lower, XLogRecPtr upper);
 struct ClusterRecoverySerialRequest;
 /* IR purpose callbacks: validate includes original whole ROOT I/O outside CF;
