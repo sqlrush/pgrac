@@ -8385,6 +8385,7 @@ test_cluster_ctrc_horizon_sender.inc: $(top_srcdir)/src/backend/cluster/cluster_
 
 test_cluster_ctrc_horizon: test_cluster_ctrc_horizon.c test_cluster_ctrc_cleaner.c \
 		test_cluster_ctrc_horizon_sender.inc test_cluster_ctrc_run_pass.inc unit_test.h \
+		test_cluster_retention_sample.inc $(CLUSTER_UNDO_RETENTION_O) \
 		$(CLUSTER_SCN_O) $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
 		$(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c \
@@ -8395,7 +8396,7 @@ test_cluster_ctrc_horizon: test_cluster_ctrc_horizon.c test_cluster_ctrc_cleaner
 		$(top_srcdir)/src/include/cluster/cluster_ic_envelope.h \
 		$(top_srcdir)/src/include/cluster/cluster_ic_router.h \
 		$(top_srcdir)/src/include/cluster/cluster_sf_dep.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_SCN_O) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_SCN_O) $(CLUSTER_UNDO_RETENTION_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c \
 		$(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \

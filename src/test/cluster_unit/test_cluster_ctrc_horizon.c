@@ -375,14 +375,138 @@ UT_TEST(test_applied_receipt_report_retains_source_until_exact_final_certificate
 	exercise_original_retirement_reports(true);
 }
 
+/* Compose the original H source, using the same PGPROC whose original
+ * native protection is transferred above. Clock and lock scheduling remain
+ * fixture leaves; the ProcArray scan, fold and output clearing are product. */
+static SCN sender_sample_clock;
+static unsigned sender_history_reads;
+static ClusterUndoRetentionSample sender_pre_exit_history;
+
+static SCN
+sender_history_clock(void)
+{
+	UT_ASSERT(native_lock_held && native_held_lock == native_procarray_lock);
+	UT_ASSERT_EQ(native_lock_mode, LW_EXCLUSIVE);
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT(!native_cleaner_lock_held && !sender_maintenance_held);
+	sender_history_reads++;
+	return sender_sample_clock;
+}
+
+#define MainLWLockArray native_locks
+#define allProcs (native_procs.allProcs)
+#define cluster_scn_current sender_history_clock
+#include "test_cluster_retention_sample.inc"
+#undef cluster_scn_current
+#undef allProcs
+#undef MainLWLockArray
+
+static void
+sample_original_history_before_exit(void)
+{
+	/* The original native fixture supplies the transaction fields. Supply
+	 * this live backend's PID before sampling its snapshot attribution. A
+	 * zero-PID dummy correctly remains UNKNOWN in the original sampler. */
+	UT_ASSERT(MyProcPid > 0);
+	test_my_proc.pid = MyProcPid;
+	UT_ASSERT(TransactionIdIsValid(test_my_proc.xmin));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&test_my_proc.cluster_read_scn_atomic), 17);
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&sender_pre_exit_history));
+	UT_ASSERT_EQ(sender_pre_exit_history.horizon_scn, 17);
+	UT_ASSERT_EQ(sender_pre_exit_history.clock_scn, sender_sample_clock);
+	UT_ASSERT_EQ(sender_pre_exit_history.contributor_kind,
+		CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+	UT_ASSERT_EQ(sender_pre_exit_history.contributor_token, 1);
+}
+
+static void
+assert_actual_history_report(const ClusterUndoCleanerActiveSample *active,
+							const ClusterUndoRetentionSample *history, unsigned expected_calls)
+{
+	unsigned reads = sender_history_reads;
+
+	undo_horizon_send_v2(1, active, history);
+	UT_ASSERT_EQ(sender_history_reads, reads);
+	UT_ASSERT_EQ(sender_calls, expected_calls);
+	UT_ASSERT_EQ(sender_state.report_sequence, expected_calls);
+	UT_ASSERT_EQ(sender_report.f_sample_id, active->sample_id);
+	UT_ASSERT_EQ(sender_report.active_full_xid_min, U64FromFullTransactionId(active->scan.min_full));
+	UT_ASSERT_EQ(sender_report.horizon_scn, history->horizon_scn);
+	UT_ASSERT_EQ(sender_report.h_sample_clock_scn, history->clock_scn);
+	UT_ASSERT_EQ(sender_report.h_contributor_kind, history->contributor_kind);
+	UT_ASSERT_EQ(sender_report.h_contributor_token, history->contributor_token);
+	UT_ASSERT_EQ(native_lock_acquires, native_lock_releases);
+	UT_ASSERT_EQ(native_cleaner_lock_acquires, native_cleaner_lock_releases);
+	UT_ASSERT_EQ(sender_maintenance_acquires, sender_maintenance_releases);
+	UT_ASSERT(!native_lock_held && !native_cleaner_lock_held && !sender_maintenance_held);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_original_snapshot_then_native_exit_clock_h_reach_retained_f_report)
+{
+	ClusterUndoCleanerActiveSample active;
+	ClusterUndoRetentionSample history;
+
+	sender_sample_clock = 700;
+	sender_history_reads = 0;
+	original_worker_pre_exit_observer = sample_original_history_before_exit;
+	active = original_sender_source();
+	original_worker_pre_exit_observer = NULL;
+	UT_ASSERT_EQ(sender_history_reads, 1);
+	UT_ASSERT_EQ(test_my_proc.xmin, InvalidTransactionId);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&test_my_proc.cluster_read_scn_atomic), 0);
+	assert_actual_history_report(&active, &sender_pre_exit_history, 1);
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&history));
+	UT_ASSERT_EQ(sender_history_reads, 2);
+	UT_ASSERT_EQ(history.horizon_scn, sender_sample_clock);
+	UT_ASSERT_EQ(history.clock_scn, sender_sample_clock);
+	UT_ASSERT_EQ(history.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+	UT_ASSERT_EQ(history.contributor_token, 0);
+	assert_actual_history_report(&active, &history, 2);
+}
+
+UT_TEST(test_actual_replication_h_refusal_cannot_become_v2_report_or_sequence_debit)
+{
+	ClusterUndoCleanerActiveSample active = original_sender_source();
+	ClusterUndoRetentionSample history, zero = {0};
+
+	sender_sample_clock = 700;
+	sender_history_reads = 0;
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&history));
+	assert_actual_history_report(&active, &history, 1);
+	for (unsigned kind = 0; kind < 2; kind++) {
+		TransactionId *pin = kind == 0 ? &procArray->replication_slot_xmin
+			: &procArray->replication_slot_catalog_xmin;
+		unsigned calls = sender_calls;
+
+		*pin = XidFromFullTransactionId(active.scan.min_full);
+		memset(&history, 0xa5, sizeof(history));
+		UT_ASSERT(!cluster_undo_retention_horizon_sample(&history));
+		UT_ASSERT(memcmp(&history, &zero, sizeof(history)) == 0);
+		/* The original production caller withholds a failed H sample. Even
+		 * direct entry cannot encode its cleared output into a V2 report. */
+		undo_horizon_send_v2(1, &active, &history);
+		UT_ASSERT_EQ(sender_calls, calls);
+		UT_ASSERT_EQ(sender_state.report_sequence, calls);
+		UT_ASSERT(native_cleaner_sample_current(&active));
+		*pin = InvalidTransactionId;
+		UT_ASSERT(cluster_undo_retention_horizon_sample(&history));
+		UT_ASSERT_EQ(history.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+		assert_actual_history_report(&active, &history, calls + 1);
+	}
+	UT_ASSERT_EQ(sender_history_reads, 5);
+}
+
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(7);
 	UT_RUN(test_original_protection_exit_and_complete_worker_reach_v2_wire);
 	UT_RUN(test_actual_foreign_receipt_revokes_old_report_and_blocks_new_unqualified_report);
 	UT_RUN(test_actual_foreign_close_revokes_old_report_and_blocks_new_unqualified_report);
 	UT_RUN(test_cancelled_receipt_report_retains_source_until_exact_final_certificate_reply);
 	UT_RUN(test_applied_receipt_report_retains_source_until_exact_final_certificate_reply);
+	UT_RUN(test_original_snapshot_then_native_exit_clock_h_reach_retained_f_report);
+	UT_RUN(test_actual_replication_h_refusal_cannot_become_v2_report_or_sequence_debit);
 	return ut_failed_count == 0 ? 0 : 1;
 }
