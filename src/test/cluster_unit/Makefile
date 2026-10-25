@@ -599,6 +599,7 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		test_cluster_relmap_unarmed.inc \
 		test_cluster_relmap_precommit.inc \
 		test_cluster_relmap_authority_entry.inc \
+		test_cluster_relmap_terminal_callbacks.inc \
 		test_cluster_relmap_native_lock.inc test_cluster_relmap_native_lock.h \
 		test_cluster_relmap_native_lock.o \
 		test_cluster_relmap_physical_pair.inc test_cluster_relmap_physical_pair.h \
@@ -2440,6 +2441,17 @@ test_cluster_heap_freeze_policy_sample.inc: $(top_srcdir)/src/backend/cluster/cl
 	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Original typed storage plus retained peer/H backend and local-source wrapper.
+test_cluster_heap_freeze_cohort_backend.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c Makefile
+	@awk '/^typedef struct ClusterUndoHorizonSlotShmem / { types=1; found++ } \
+	     types { print } /^} ClusterUndoHorizonShmem;/ { types=0; print "static ClusterUndoHorizonShmem *UndoHorizonShmem;" } \
+	     /^typedef ClusterHeapFreezeCohortPeerObservation UndoHorizonV2PeerObservation;/ { print; found++ } \
+	     /^undo_horizon_local_source_current\(/ { print "static bool"; emit=1; found++ } \
+	     /^undo_horizon_v2_cohort_current\(/ { print "static ClusterHeapFreezeCohortStatus"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 4 || done != 2 || types || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 # Original outer cohort-current entry and its fixed required-member predicate.
 test_cluster_heap_freeze_cohort_current.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c Makefile
 	@awk '/^undo_horizon_v2_required\(/ { print "static bool"; emit=1; found++ } \
@@ -2464,6 +2476,7 @@ test_cluster_heap_ctrc_registration.inc: $(top_srcdir)/src/backend/cluster/clust
 test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_ctrc_registration.inc \
 		test_cluster_heap_freeze_cohort_current.inc \
+		test_cluster_heap_freeze_cohort_backend.inc \
 		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_horizon.h \
 		$(top_srcdir)/src/include/cluster/cluster_conf.h \
@@ -5824,6 +5837,7 @@ clean distclean maintainer-clean:
 		test_cluster_heap_freeze_policy_current.inc test_cluster_heap_freeze_policy_current.inc.tmp
 	rm -f test_cluster_heap_freeze_policy_sample.inc test_cluster_heap_freeze_policy_sample.inc.tmp
 	rm -f test_cluster_heap_freeze_cohort_current.inc test_cluster_heap_freeze_cohort_current.inc.tmp
+	rm -f test_cluster_heap_freeze_cohort_backend.inc test_cluster_heap_freeze_cohort_backend.inc.tmp
 	rm -f test_cluster_space_cache_insert.inc test_cluster_space_cache_delete.inc test_cluster_space_cache_allocation.inc test_cluster_space_cache_update.inc
 	rm -f test_cluster_space_hint_owners.inc test_cluster_space_census_types.inc test_cluster_space_census_mutation.inc test_cluster_space_cleanout_product.o
 	rm -f test_cluster_space_fsm_hint.inc

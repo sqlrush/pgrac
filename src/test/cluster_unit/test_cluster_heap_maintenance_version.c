@@ -136,13 +136,18 @@ static bool allocation_fence_error;
 bool cluster_xid_striping;
 static bool saved_policy_current;
 static ClusterHeapFreezeCohortStatus saved_cohort_status;
-/* Attachment/publication and the bounded peer/H backend remain fixture leaves. */
-static unsigned char cohort_attachment;
-static const void *UndoHorizonShmem = &cohort_attachment;
+/* Worker/admission/capability providers and end-clock remain fixture leaves. */
 static const ClusterHeapFreezeCohortObservation *cohort_source_input;
 static bool cohort_sample_available, cohort_sample_error, cohort_revoke_ingress;
 static int cohort_sample_fault;
 static unsigned cohort_sample_reads, cohort_backend_checks;
+static bool cohort_worker_live, cohort_admission_live, cohort_clock_error;
+static bool cohort_peer_revoke_worker, cohort_clock_revoke_worker, cohort_clock_revoke_admission;
+static unsigned cohort_worker_current_checks, cohort_semantic_current_checks;
+static unsigned cohort_peer_current_checks, cohort_end_clock_reads;
+static uint32 cohort_live_generation[CLUSTER_MAX_NODES];
+static int cohort_interval_ms;
+static TimestampTz cohort_end_clock;
 static int source_current_error_stage, source_current_revoke_census;
 static const ClusterHeapFreezePolicySampleV1 *expected_current_policy;
 static const ClusterHeapFreezeCohortObservation *expected_current_cohort;
@@ -457,8 +462,69 @@ cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out)
 	return true;
 }
 
-/* Peer generations and H freshness are intentionally still the bounded leaf;
- * the original outer entry validates saved metadata, worker identity and cut. */
+/* Keep provider identity/current decisions explicit while executing the
+ * original peer/H loops, local wrapper and end-clock ordering. */
+static bool
+cohort_worker_publication_current(const ClusterUndoCleanerActiveSample *active)
+{
+	UT_ASSERT(!local_x && !local_share && backend_pin_count == 1);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(active->sample_id, cohort_source_input->source_local_sample_id);
+	UT_ASSERT(memcmp(&active->scan, &cohort_source_input->local_registration_cut, sizeof(active->scan)) == 0);
+	cohort_worker_current_checks++;
+	return cohort_worker_live;
+}
+
+static bool
+cohort_admission_source_current(const ClusterSemanticActiveSampleFence *fence)
+{
+	UT_ASSERT(fence == &cohort_source_input->admission_fence);
+	UT_ASSERT(!local_x && !local_share && backend_pin_count == 1);
+	cohort_semantic_current_checks++;
+	return cohort_admission_live;
+}
+
+static bool
+cohort_peer_generation_current(int32 peer, uint32 capability, uint32 generation)
+{
+	UT_ASSERT(peer >= 0 && peer < CLUSTER_MAX_NODES);
+	UT_ASSERT_EQ(capability, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2);
+	UT_ASSERT(!local_x && !local_share && backend_pin_count == 1);
+	cohort_peer_current_checks++;
+	if (cohort_peer_revoke_worker) cohort_worker_live = false;
+	return generation == cohort_live_generation[peer];
+}
+
+static TimestampTz
+cohort_current_end_clock(void)
+{
+	UT_ASSERT(!local_x && !local_share && backend_pin_count == 1);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	cohort_end_clock_reads++;
+	if (cohort_clock_error) elog(ERROR, "injected original cohort end-clock ERROR");
+	if (cohort_clock_revoke_worker) cohort_worker_live = false;
+	if (cohort_clock_revoke_admission) cohort_admission_live = false;
+	return cohort_end_clock;
+}
+
+static bool undo_horizon_v2_required(const ClusterSemanticActiveSampleFence *, int32);
+#define cluster_undo_cleaner_active_sample_current cohort_worker_publication_current
+#define cluster_semantic_activation_active_sample_current cohort_admission_source_current
+#define cluster_sf_peer_capability_generation_matches cohort_peer_generation_current
+#define GetCurrentTimestamp cohort_current_end_clock
+#define cluster_lmon_main_loop_interval cohort_interval_ms
+#define undo_horizon_v2_cohort_current actual_retained_cohort_current
+#include "test_cluster_heap_freeze_cohort_backend.inc"
+#undef undo_horizon_v2_cohort_current
+#undef cluster_lmon_main_loop_interval
+#undef GetCurrentTimestamp
+#undef cluster_sf_peer_capability_generation_matches
+#undef cluster_semantic_activation_active_sample_current
+#undef cluster_undo_cleaner_active_sample_current
+static ClusterUndoHorizonShmem cohort_shared;
+
+/* Preserve old refusal-status injection. Every READY continuation now passes
+ * through the original backend; this adapter never manufactures READY. */
 static ClusterHeapFreezeCohortStatus
 undo_horizon_v2_cohort_current(const ClusterSemanticActiveSampleFence *fence,
 	const ClusterHeapFreezeCohortPeerObservation *peers, TimestampTz started,
@@ -473,7 +539,8 @@ undo_horizon_v2_cohort_current(const ClusterSemanticActiveSampleFence *fence,
 	UT_ASSERT_EQ(active->sample_id, cohort_source_input->source_local_sample_id);
 	cohort_backend_checks++;
 	if (cohort_revoke_ingress) ctrc_note_unqualified_registration();
-	return saved_cohort_status;
+	if (saved_cohort_status != CLUSTER_HEAP_FREEZE_COHORT_READY) return saved_cohort_status;
+	return actual_retained_cohort_current(fence, peers, started, interval_ms, active);
 }
 
 #define cluster_heap_freeze_cohort_current actual_saved_cohort_current
@@ -955,7 +1022,19 @@ reset(uint8 opcode, bool shared)
 	allocation_fence_checks = 0; allocation_fence_error = false;
 	cluster_xid_striping = true;
 	saved_policy_current = true; saved_cohort_status = CLUSTER_HEAP_FREEZE_COHORT_READY;
-	UndoHorizonShmem = &cohort_attachment; cohort_source_input = NULL;
+	memset(&cohort_shared, 0, sizeof(cohort_shared));
+	UndoHorizonShmem = &cohort_shared; cohort_source_input = NULL;
+	for (int peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+		pg_atomic_init_u32(&cohort_shared.freeze_slots[peer].seq, 2);
+		cohort_live_generation[peer] = 7;
+	}
+	cohort_worker_live = cohort_admission_live = true;
+	cohort_clock_error = cohort_peer_revoke_worker = false;
+	cohort_clock_revoke_worker = cohort_clock_revoke_admission = false;
+	cohort_worker_current_checks = cohort_semantic_current_checks = 0;
+	cohort_peer_current_checks = cohort_end_clock_reads = 0;
+	cohort_interval_ms = CLUSTER_UNDO_HORIZON_INTERVAL_MIN_MS;
+	cohort_end_clock = 1000000;
 	cohort_sample_available = true; cohort_sample_error = cohort_revoke_ingress = false;
 	cohort_sample_fault = 0; cohort_sample_reads = cohort_backend_checks = 0;
 	source_current_error_stage = source_current_revoke_census = 0;
@@ -3784,10 +3863,160 @@ UT_TEST(test_xmin_original_worker_read_error_preserves_caller_resources)
 	}
 }
 
+/* Add a fixed required peer using the same saved numeric bounds. This is
+ * fixture-qualified input, not authentication or a producer-retention grant. */
+static void
+qualified_xmin_require_peer(QualifiedXminFixture *f, int peer)
+{
+	if (peer < 64) f->cohort.admitted_members_lo |= UINT64CONST(1) << peer;
+	else f->cohort.admitted_members_hi |= UINT64CONST(1) << (peer - 64);
+	f->cohort.admission_fence.admitted_members_lo = f->cohort.admitted_members_lo;
+	f->cohort.admission_fence.admitted_members_hi = f->cohort.admitted_members_hi;
+	f->cohort.source_peer_active_full_xid_min[peer] = f->cohort.active_full_xid_min;
+	f->cohort.source_peer_future_full_xid[peer] = f->cohort.future_full_xid_max;
+	f->cohort.source_peer_horizon_scn[peer] = f->cohort.horizon_scn;
+	f->cohort.source_peer_history[peer] = f->cohort.source_local_history;
+	f->cohort.source_peers[peer] = (ClusterHeapFreezeCohortPeerObservation){
+		.recv_at_us = 1000000, .interval_ms = CLUSTER_UNDO_HORIZON_INTERVAL_MIN_MS,
+		.generation = 7, .seq = 2 };
+}
+
+UT_TEST(test_xmin_original_peer_backend_continues_native_wal)
+{
+	const int peers[] = { 1, 65 };
+	for (int batch = 0; batch < 2; batch++) {
+		for (unsigned i = 0; i < lengthof(peers); i++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			ClusterHeapFreezeCohortObservation before;
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			qualified_xmin_require_peer(&f, peers[i]); before = f.cohort;
+			fixture_release_original_writer(); resume_allowed = true;
+			UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+			UT_ASSERT_EQ(cohort_peer_current_checks, 1); UT_ASSERT_EQ(cohort_end_clock_reads, 1);
+			UT_ASSERT_EQ(cohort_worker_current_checks, 2); UT_ASSERT_EQ(cohort_semantic_current_checks, 2);
+			UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
+			UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+			UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(memcmp(&f.cohort, &before, sizeof(before)) == 0);
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_peer_sequence_generation_and_h_refuse_before_resume)
+{
+	const int peers[] = { 1, 65 };
+	for (int batch = 0; batch < 2; batch++) {
+		for (unsigned i = 0; i < lengthof(peers); i++) {
+			for (int fault = 0; fault < 4; fault++) {
+				QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+				int peer = peers[i];
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+				qualified_xmin_require_peer(&f, peer);
+				fixture_release_original_writer(); resume_allowed = true;
+				switch (fault) {
+				case 0: pg_atomic_write_u32(&cohort_shared.freeze_slots[peer].seq, 4); break;
+				case 1: cohort_live_generation[peer]++; break;
+				case 2: f.cohort.source_peers[peer].recv_at_us = 699999; break;
+				case 3: f.cohort.source_peers[peer].recv_at_us = 1000001; break;
+				}
+				UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+				UT_ASSERT_EQ(cohort_backend_checks, 1);
+				UT_ASSERT_EQ(cohort_peer_current_checks, fault != 0);
+				UT_ASSERT_EQ(cohort_end_clock_reads, fault >= 2);
+				UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+				UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+				UT_ASSERT_EQ(backend_pin_count, 1);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_cohort_rechecks_local_source_around_end_clock)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int fault = 0; fault < 5; fault++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			qualified_xmin_require_peer(&f, 1);
+			fixture_release_original_writer(); resume_allowed = true;
+			switch (fault) {
+			case 0: cohort_worker_live = false; break;
+			case 1: cohort_admission_live = false; break;
+			case 2: cohort_peer_revoke_worker = true; break;
+			case 3: cohort_clock_revoke_worker = true; break;
+			case 4: cohort_clock_revoke_admission = true; break;
+			}
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(cohort_worker_current_checks, fault >= 3 ? 2 : 1);
+			UT_ASSERT_EQ(cohort_end_clock_reads, fault >= 3);
+			UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_cohort_clock_rejects_stale_or_rollback)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int fault = 0; fault < 2; fault++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			fixture_release_original_writer(); resume_allowed = true;
+			cohort_end_clock = fault == 0 ? 999999 : 1300001;
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(cohort_peer_current_checks, 0); UT_ASSERT_EQ(cohort_end_clock_reads, 1);
+			UT_ASSERT_EQ(cohort_worker_current_checks, 1);
+			UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_cohort_clock_error_preserves_caller_resources)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		fixture_release_original_writer(); resume_allowed = cohort_clock_error = expecting_error = true;
+		if (setjmp(error_jump) == 0) {
+			if (batch) (void)qualified_xmin_batch_apply(&f, targets, 3);
+			else (void)qualified_xmin_apply(&f, 0);
+			UT_ASSERT(false);
+		} else {
+			UT_ASSERT_EQ(cohort_backend_checks, 1); UT_ASSERT_EQ(cohort_end_clock_reads, 1);
+			UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+		expecting_error = false;
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(104);
+	UT_PLAN(109);
+	UT_RUN(test_xmin_original_peer_backend_continues_native_wal);
+	UT_RUN(test_xmin_original_peer_sequence_generation_and_h_refuse_before_resume);
+	UT_RUN(test_xmin_original_cohort_rechecks_local_source_around_end_clock);
+	UT_RUN(test_xmin_original_cohort_clock_rejects_stale_or_rollback);
+	UT_RUN(test_xmin_original_cohort_clock_error_preserves_caller_resources);
 	UT_RUN(test_xmin_original_cohort_entry_refuses_unknown_saved_metadata);
 	UT_RUN(test_xmin_original_cohort_entry_rejects_missing_or_replaced_worker);
 	UT_RUN(test_xmin_original_cohort_final_cut_follows_backend_observation);
