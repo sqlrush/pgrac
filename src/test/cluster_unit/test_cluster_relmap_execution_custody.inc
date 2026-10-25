@@ -444,6 +444,10 @@ cluster_shared_fs_recovery_root_open_v1(const uint8 expected_uuid[16])
 {
 	UT_ASSERT_EQ(memcmp(expected_uuid, execution_root.identity.storage_uuid, 16), 0);
 	execution_root_opens++;
+	if (cold_native_real_storage) {
+		execution_root_fd = test_relmap_native_storage_open(expected_uuid, PG_exception_stack);
+		return execution_root_fd;
+	}
 	if (execution_root_fault == 1)
 		return -1;
 	if (execution_root_fault == 2)

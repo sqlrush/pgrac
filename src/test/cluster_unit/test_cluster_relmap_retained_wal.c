@@ -32,6 +32,7 @@ int control_fixture_main(int argc, char **argv);
 #include "cluster/cluster_sinval.h"
 #include "cluster/cluster_conf.h"
 #include "test_cluster_relmap_native_clog.h"
+#include "test_cluster_relmap_native_storage.h"
 #include "test_cluster_relmap_original_scope.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
@@ -41,6 +42,7 @@ int control_fixture_main(int argc, char **argv);
 bool cluster_shared_catalog;
 static bool relmap_root_merger, relmap_root_namespace_x;
 static bool cold_native_real_clog, cold_native_real_scope;
+static bool cold_native_real_storage;
 static void cold_original_scope_setup(void);
 static void cold_original_scope_done(void);
 static void cold_original_protection_setup(void);
@@ -3414,6 +3416,7 @@ UT_TEST(test_terminal_read_native_error_keeps_output_zero_and_custody_dead)
 #include "test_cluster_relmap_original_authority.inc"
 #include "test_cluster_relmap_original_cohort.inc"
 #include "test_cluster_relmap_native_file.inc"
+#include "test_cluster_relmap_original_storage.inc"
 
 int
 main(int argc, char **argv)
@@ -3422,7 +3425,10 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(134);
+	UT_PLAN(137);
+	UT_RUN(test_cold_original_storage_full_native_chain_and_fd_custody);
+	UT_RUN(test_cold_original_storage_rejects_unqualified_sentinel_before_native);
+	UT_RUN(test_cold_original_storage_midread_change_and_error_preserve_pending);
 	UT_RUN(test_cold_native_replaced_file_refuses_before_pair_write);
 	UT_RUN(test_cold_native_replaced_file_after_pair_sync_keeps_debt);
 	UT_RUN(test_cold_native_replaced_file_permanently_invalidates_old_handle);
