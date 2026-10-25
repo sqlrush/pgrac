@@ -12,6 +12,7 @@ typedef struct TestRelmapNativeTTStats
 {
 	unsigned bindings, bind_records, ctrc_opens;
 	bool balanced, assertion_failed;
+	bool commit_admission, commit_reservation;
 } TestRelmapNativeTTStats;
 
 typedef struct TestRelmapNativeTTTerminal
@@ -30,4 +31,6 @@ extern bool test_relmap_native_tt_lookup(TransactionId xid, ClusterCanonicalTxnB
 extern TestRelmapNativeTTStats test_relmap_native_tt_stats(void);
 extern bool test_relmap_native_tt_terminal(const ClusterCanonicalTxnBinding *binding,
 	bool commit, bool fail_write, TestRelmapNativeTTTerminal *out);
+extern bool test_relmap_native_tt_stage_commit(const ClusterCanonicalTxnBinding *binding,
+	TestRelmapNativeTTTerminal *out);
 #endif
