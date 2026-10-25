@@ -8314,6 +8314,21 @@ test_cluster_ctrc_native_group_exit.inc: $(top_srcdir)/src/backend/storage/ipc/p
 	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Actual native PREPARE handoff and retirement, with no copied predicates.
+test_cluster_ctrc_native_prepare.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c \
+		$(top_srcdir)/src/backend/access/transam/twophase.c Makefile
+	awk '/^ProcArray(Add|Remove|ClearTransaction)\(/ { print "void"; emit=1; found++ } \
+	     /^MarkAsPreparingGuts\(/ { print "static void"; emit=1; found++ } \
+	     /^GXactLoadSubxactData\(/ { print "static void"; emit=1; found++ } \
+	     /^MarkAsPrepared\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 6 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
+clean distclean maintainer-clean: clean-ctrc-native-prepare
+.PHONY: clean-ctrc-native-prepare
+clean-ctrc-native-prepare:
+	rm -f test_cluster_ctrc_native_prepare.inc test_cluster_ctrc_native_prepare.inc.tmp
+
 test_cluster_ctrc_worker_sample.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
 	awk '/^cluster_undo_cleaner_active_sample\(/ { print "bool"; emit=1; found++ } \
 	     /^cluster_undo_cleaner_active_sample_current\(/ { print "bool"; emit=1; found++ } \
@@ -8325,6 +8340,7 @@ test_cluster_ctrc_cleaner test_cluster_ctrc_capacity test_cluster_ctrc_dispatch 
 test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: test_cluster_ctrc_read_scope.inc \
 		test_cluster_ctrc_worker_sample.inc \
 		test_cluster_ctrc_native_exit.inc test_cluster_ctrc_native_group_exit.inc \
+		test_cluster_ctrc_native_prepare.inc \
 		test_cluster_pgproc_active_types.inc \
 		$(top_srcdir)/src/include/storage/procarray.h $(top_srcdir)/src/include/access/transam.h \
 		$(top_srcdir)/src/include/access/twophase.h $(top_srcdir)/src/include/access/xlog.h \
