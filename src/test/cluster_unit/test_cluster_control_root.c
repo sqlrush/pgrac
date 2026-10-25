@@ -26224,7 +26224,7 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_CTRC_IR") != NULL) {
-		UT_PLAN(9);
+		UT_PLAN(17);
 		UT_RUN(test_ctrc_ir_requires_native_grant_and_keeps_original_walr);
 		UT_RUN(test_ctrc_ir_subject_cannot_change_before_confirmed_release);
 		UT_RUN(test_ctrc_ir_busy_retry_and_cf_contention_retain_one_subject);
@@ -26234,6 +26234,14 @@ main(int argc, char **argv)
 		UT_RUN(test_ctrc_ir_current_is_local_and_suspend_never_renews_held_rights);
 		UT_RUN(test_ctrc_ir_ordinary_tx_scope_cannot_claim_ctrc_subject_rights);
 		UT_RUN(test_ctrc_ir_error_keeps_original_holder_and_prepared_subject_revoked);
+		UT_RUN(test_ctrc_subject_borrows_only_original_granted_native_owners);
+		UT_RUN(test_ctrc_subject_rejects_changed_complete_value_without_borrowed_dereference);
+		UT_RUN(test_ctrc_subject_live_proof_loss_keeps_original_native_cleanup_debt);
+		UT_RUN(test_ctrc_subject_release_and_reacquire_never_revives_old_values);
+		UT_RUN(test_ctrc_subject_recreated_scope_or_pin_cannot_renew_old_value);
+		UT_RUN(test_ctrc_subject_window_is_exact_and_current_does_not_read_root);
+		UT_RUN(test_ctrc_subject_uncertain_release_withholds_view_and_retains_owners);
+		UT_RUN(test_ctrc_subject_binds_exact_selected_history);
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
@@ -26460,7 +26468,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(535);
+	UT_PLAN(543);
 	UT_RUN(test_ctrc_ir_requires_native_grant_and_keeps_original_walr);
 	UT_RUN(test_ctrc_ir_subject_cannot_change_before_confirmed_release);
 	UT_RUN(test_ctrc_ir_busy_retry_and_cf_contention_retain_one_subject);
@@ -26470,6 +26478,14 @@ main(int argc, char **argv)
 	UT_RUN(test_ctrc_ir_current_is_local_and_suspend_never_renews_held_rights);
 	UT_RUN(test_ctrc_ir_ordinary_tx_scope_cannot_claim_ctrc_subject_rights);
 	UT_RUN(test_ctrc_ir_error_keeps_original_holder_and_prepared_subject_revoked);
+	UT_RUN(test_ctrc_subject_borrows_only_original_granted_native_owners);
+	UT_RUN(test_ctrc_subject_rejects_changed_complete_value_without_borrowed_dereference);
+	UT_RUN(test_ctrc_subject_live_proof_loss_keeps_original_native_cleanup_debt);
+	UT_RUN(test_ctrc_subject_release_and_reacquire_never_revives_old_values);
+	UT_RUN(test_ctrc_subject_recreated_scope_or_pin_cannot_renew_old_value);
+	UT_RUN(test_ctrc_subject_window_is_exact_and_current_does_not_read_root);
+	UT_RUN(test_ctrc_subject_uncertain_release_withholds_view_and_retains_owners);
+	UT_RUN(test_ctrc_subject_binds_exact_selected_history);
 	UT_RUN(test_recovered_history_clean_follower_waits_after_sole_complete_install);
 	UT_RUN(test_recovered_history_driver_consumes_exact_selected_history);
 	UT_RUN(test_recovered_history_wait_preserves_original_current_owner_guards);

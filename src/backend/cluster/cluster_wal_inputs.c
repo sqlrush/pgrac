@@ -96,6 +96,8 @@ struct ClusterWalInputsV1 {
 /* A locator, not another owner or a grant. Keep the native incarnation outside
  * borrowed allocations so stale/forged views are rejected before dereference. */
 static ClusterRecoveryTxRetentionV1 active_tx_retention;
+/* A separate purpose locator; borrowing this never makes census a C0 scope. */
+static ClusterRecoveryTxRetentionV1 active_ctrc_retention;
 
 typedef struct WalInputsWork {
 	ControlRootImage root;
@@ -433,6 +435,8 @@ cluster_wal_inputs_release_v1(ClusterWalInputsV1 **inputs)
 		elog(FATAL, "could not release WAL input retention owner");
 	if (active_tx_retention.scope == *inputs)
 		memset(&active_tx_retention, 0, sizeof(active_tx_retention));
+	if (active_ctrc_retention.scope == *inputs)
+		memset(&active_ctrc_retention, 0, sizeof(active_ctrc_retention));
 	explicit_bzero(*inputs, sizeof(**inputs));
 	pfree(*inputs);
 	*inputs = NULL;
@@ -1630,6 +1634,8 @@ cluster_wal_inputs_begin_ctrc_census_v1(const struct ClusterRecoveryStartV1 *sta
 	const struct ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 **out)
 {
 	const ClusterColdTypedV1 *typed;
+	ClusterControlRootResult result;
+	ClusterWalReadPinOwnerV1 owner;
 
 	if (out == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
@@ -1637,8 +1643,22 @@ cluster_wal_inputs_begin_ctrc_census_v1(const struct ClusterRecoveryStartV1 *sta
 	if (!ClusterColdRecoveryCtrcWorkCurrent(start, work)
 		|| (typed = ClusterColdRecoveryTxInputs(start)) == NULL || typed->participant_count == 0)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	return inputs_begin(typed->sources[0].claim.identity.storage_uuid, typed->system_identifier,
+	result = inputs_begin(typed->sources[0].claim.identity.storage_uuid, typed->system_identifier,
 		WAL_INPUTS_CTRC_CENSUS, start, NULL, work, out);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!cluster_wal_read_pin_owner_v1((*out)->pin, &owner)) {
+		cluster_wal_inputs_release_v1(out);
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	}
+	/* The native read pin permits one original live scope. Keep its locator
+	 * outside borrowed allocations; this supplies neither a prepared IR nor
+	 * any right to use the separate C0-only source API. */
+	memset(&active_ctrc_retention, 0, sizeof(active_ctrc_retention));
+	active_ctrc_retention.scope = *out;
+	active_ctrc_retention.serial = &(*out)->tx.ir;
+	active_ctrc_retention.input_owner = owner;
+	return result;
 }
 
 static bool
@@ -2177,6 +2197,97 @@ cluster_wal_inputs_tx_subject_covers_window_v1(
 		&& thread == original.selected.source.claim.identity.origin_thread_id
 		&& lower >= original.selected.checkpoint.checkpoint_lower_lsn
 		&& upper <= original.selected.checkpoint.validated_tail_lsn_exclusive
+		&& memcmp(authority, &original, sizeof(original)) == 0;
+}
+
+static bool
+inputs_ctrc_retention_locator_current(const ClusterRecoveryTxRetentionV1 *view)
+{
+	return view->scope != NULL && view->scope == active_ctrc_retention.scope
+		&& view->serial == active_ctrc_retention.serial
+		&& view->input_owner.pin == active_ctrc_retention.input_owner.pin
+		&& view->input_owner.generation == active_ctrc_retention.input_owner.generation
+		&& cluster_wal_read_pin_owner_current_v1(&view->input_owner);
+}
+
+/* Locate the native owner before touching a borrowed scope or serial. This
+ * purpose keeps the same original COMPLETE/history selector and no-I/O Start
+ * callback as actual IR authorization. Never recreate an RR retention pin. */
+static bool
+inputs_ctrc_subject_authority(ClusterWalInputsV1 *inputs, uint32 subject_index,
+	ClusterRecoveryCtrcSubjectAuthorityV1 *out)
+{
+	ClusterRecoveryCtrcSubjectAuthorityV1 authority = {0};
+	ClusterRecoverySerialRequest request;
+	const ClusterWalInputV1 *selected;
+
+	if (inputs == NULL || inputs != active_ctrc_retention.scope)
+		return false;
+	memcpy(&authority.source.retention, &active_ctrc_retention,
+		sizeof(authority.source.retention));
+	if (!inputs_ctrc_retention_locator_current(&authority.source.retention)
+		|| !cluster_wal_inputs_ctrc_authorized_v1(inputs, subject_index)
+		|| !inputs_tx_subject_request(inputs, &request, &selected))
+		return false;
+	authority.ir_request_id = inputs->tx.ir.lock_request.request_id;
+	if (authority.ir_request_id == 0)
+		return false;
+	authority.work_generation = inputs->ctrc.work_generation;
+	authority.subject_index = subject_index;
+	memcpy(&authority.source.root, &inputs->token, sizeof(authority.source.root));
+	memcpy(&authority.source.selected, selected, sizeof(authority.source.selected));
+	memcpy(&authority.source.replay_token, &request.expected_root_token,
+		sizeof(authority.source.replay_token));
+	if (!inputs_ctrc_retention_locator_current(&authority.source.retention)
+		|| !cluster_wal_inputs_ctrc_authorized_v1(inputs, subject_index)
+		|| authority.ir_request_id != inputs->tx.ir.lock_request.request_id
+		|| authority.work_generation != inputs->ctrc.work_generation)
+		return false;
+	memcpy(out, &authority, sizeof(authority));
+	return true;
+}
+
+ClusterRecoveryCtrcSubjectAuthorityV1
+cluster_wal_inputs_ctrc_subject_v1(ClusterWalInputsV1 *inputs, uint32 subject_index)
+{
+	ClusterRecoveryCtrcSubjectAuthorityV1 authority = {0};
+	ClusterRecoveryCtrcSubjectAuthorityV1 empty = {0};
+
+	if (!inputs_ctrc_subject_authority(inputs, subject_index, &authority))
+		return empty;
+	return authority;
+}
+
+bool
+cluster_wal_inputs_ctrc_subject_current_v1(const ClusterRecoveryCtrcSubjectAuthorityV1 *authority)
+{
+	ClusterRecoveryCtrcSubjectAuthorityV1 original, current;
+
+	if (authority == NULL)
+		return false;
+	memcpy(&original, authority, sizeof(original));
+	return inputs_ctrc_retention_locator_current(&original.source.retention)
+		&& inputs_ctrc_subject_authority(original.source.retention.scope,
+			original.subject_index, &current)
+		&& memcmp(&original, &current, sizeof(original)) == 0
+		&& memcmp(authority, &original, sizeof(original)) == 0;
+}
+
+bool
+cluster_wal_inputs_ctrc_subject_covers_window_v1(
+	const ClusterRecoveryCtrcSubjectAuthorityV1 *authority, uint16 thread,
+	XLogRecPtr lower, XLogRecPtr upper)
+{
+	ClusterRecoveryCtrcSubjectAuthorityV1 original;
+
+	if (authority == NULL)
+		return false;
+	memcpy(&original, authority, sizeof(original));
+	return lower != InvalidXLogRecPtr && upper > lower
+		&& cluster_wal_inputs_ctrc_subject_current_v1(&original)
+		&& thread == original.source.selected.source.claim.identity.origin_thread_id
+		&& lower >= original.source.selected.checkpoint.checkpoint_lower_lsn
+		&& upper <= original.source.selected.checkpoint.validated_tail_lsn_exclusive
 		&& memcmp(authority, &original, sizeof(original)) == 0;
 }
 

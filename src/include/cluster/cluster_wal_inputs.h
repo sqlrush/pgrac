@@ -194,6 +194,33 @@ extern bool cluster_wal_inputs_tx_subject_current_v1(
 extern bool cluster_wal_inputs_tx_subject_covers_window_v1(
 	const ClusterRecoverySubjectAuthorityV1 *authority, uint16 thread,
 	XLogRecPtr lower, XLogRecPtr upper);
+/* Original CTRC census subject only. Borrow its actual held TX_CLOSURE IR
+ * and native read-WALR owner, with the complete selected COMPLETE current or
+ * history input. Bind the original work/index and this exact native acquire;
+ * confirmed release/reacquire must never renew an older borrowed value.
+ * The embedded source is a value projection, not C0 scope permission or an
+ * ordinary RR retention pin. Every other contributing origin and PAGE guard
+ * still requires its own authority. Retain the original scope and Start. */
+typedef struct ClusterRecoveryCtrcSubjectAuthorityV1 {
+	ClusterRecoverySubjectAuthorityV1 source;
+	uint64 ir_request_id;
+	uint64 work_generation;
+	uint32 subject_index;
+	uint32 reserved_zero;
+} ClusterRecoveryCtrcSubjectAuthorityV1;
+/* No I/O/allocation/acquire/output pointer. All-zero on refusal; assign into
+ * disjoint caller storage. Only the original scope selects its own source. */
+extern ClusterRecoveryCtrcSubjectAuthorityV1 cluster_wal_inputs_ctrc_subject_v1(
+	ClusterWalInputsV1 *inputs, uint32 subject_index);
+/* No I/O: locate the original native scope/pin incarnation before inspecting
+ * borrowed pointers, then recheck the complete value and actual held IR.
+ * Across I/O, also revalidate the original whole ROOT scope outside native
+ * locks. This local check neither reads ROOT nor freezes another writer. */
+extern bool cluster_wal_inputs_ctrc_subject_current_v1(
+	const ClusterRecoveryCtrcSubjectAuthorityV1 *authority);
+extern bool cluster_wal_inputs_ctrc_subject_covers_window_v1(
+	const ClusterRecoveryCtrcSubjectAuthorityV1 *authority, uint16 thread,
+	XLogRecPtr lower, XLogRecPtr upper);
 struct ClusterRecoverySerialRequest;
 /* IR purpose callbacks: validate includes original whole ROOT I/O outside CF;
  * current is no-wait and never calls the IR holder revalidation recursively. */
