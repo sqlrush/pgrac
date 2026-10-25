@@ -30,6 +30,8 @@ static unsigned sender_unknown_on_peer;
 static ClusterCtrcOriginEntry sender_foreign_request;
 static ClusterHeapFreezeReportV2 sender_report;
 static void (*sender_peer_current_observer)(void);
+static bool sender_high_peer_enabled;
+static int32 sender_peer_observer_target;
 
 /* Observe only the sender's original maintenance spinlock here. The shared
  * engine above keeps its original strict census-lock observer unchanged. */
@@ -73,7 +75,7 @@ cluster_sf_peer_capability_word_sample(int32 peer, uint32 required,
 {
 	UT_ASSERT_EQ(held_count, 0);
 	UT_ASSERT(!native_lock_held && !native_cleaner_lock_held && !sender_maintenance_held);
-	UT_ASSERT_EQ(peer, 1);
+	UT_ASSERT(peer == 1 || (sender_high_peer_enabled && peer == 65));
 	UT_ASSERT_EQ(required, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2);
 	sender_capability_reads++;
 	*word = required;
@@ -86,9 +88,10 @@ cluster_sf_peer_capability_generation_matches(int32 peer, uint32 required, uint3
 {
 	UT_ASSERT_EQ(held_count, 0);
 	UT_ASSERT(!native_lock_held && !native_cleaner_lock_held && !sender_maintenance_held);
-	UT_ASSERT_EQ(peer, 1);
+	UT_ASSERT(peer == 1 || (sender_high_peer_enabled && peer == 65));
 	UT_ASSERT_EQ(required, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2);
-	if (sender_peer_current_observer != NULL) {
+	if (sender_peer_current_observer != NULL
+		&& (sender_peer_observer_target == 0 || sender_peer_observer_target == peer)) {
 		void (*observe)(void) = sender_peer_current_observer;
 
 		sender_peer_current_observer = NULL;
@@ -149,6 +152,9 @@ original_sender_source(void)
 	ClusterUndoCleanerActiveSample active;
 	const ClusterCtrcOriginEntry *origin;
 	uint64 local_index, foreign_index;
+
+	sender_high_peer_enabled = false;
+	sender_peer_observer_target = 0;
 
 	/* Original native exit follows exact local origin/receipt installation;
 	 * two actual worker passes have retained that older FullXid. */
@@ -786,10 +792,178 @@ UT_TEST(test_actual_peer_callback_respawn_requires_fresh_cohort_publication)
 	UT_ASSERT_EQ(out.publication_sequence, old.publication_sequence + 1);
 }
 
+
+/* Peer 65 is a controlled remote input, not an authenticated producer. Rebuild
+ * the actual local scan under this fixed admission before making any report. */
+static ClusterUndoCleanerActiveSample
+original_high_peer_source(void)
+{
+	ClusterUndoCleanerActiveSample previous = original_sender_source(), active;
+
+	sender_high_peer_enabled = true;
+	native_pass_source.admitted_members_hi |= UINT64CONST(1) << (65 - 64);
+	native_pass_source.admitted_incarnation[65] = 1165;
+	finish_original_worker_pass();
+	UT_ASSERT(native_cleaner_sample(&active));
+	UT_ASSERT(native_cleaner_sample_current(&active));
+	UT_ASSERT(active.sample_id > previous.sample_id);
+	UT_ASSERT_EQ(active.admission_fence.admitted_members_lo, 3);
+	UT_ASSERT_EQ(active.admission_fence.admitted_members_hi, 2);
+	UT_ASSERT(FullTransactionIdEquals(active.scan.min_full, previous.scan.min_full));
+	return active;
+}
+
+static void
+install_controlled_high_peer_report(const ClusterUndoCleanerActiveSample *active)
+{
+	ClusterHeapFreezeReportV2 report = sender_state.freeze_slots[1].view.report;
+
+	report.origin = 65;
+	report.incarnation = active->admission_fence.admitted_incarnation[65];
+	report.future_full_xid = U64FromFullTransactionId(active->scan.future_full) + 65;
+	report.active_full_xid_min = U64FromFullTransactionId(active->scan.min_full);
+	report.horizon_scn = 250;
+	report.h_contributor_token = 165;
+	undo_horizon_v2_publish(&sender_state.freeze_slots[65], &report,
+		&active->admission_fence, test_capability_generation, cohort_now_us, false);
+}
+
+static ClusterHeapFreezeWatermark
+observe_high_cohort_and_publish(const ClusterUndoCleanerActiveSample *active,
+							   const ClusterUndoRetentionSample *history, SCN expected_h)
+{
+	ClusterHeapFreezeCohortObservation cohort;
+	UndoHorizonV2MaintenanceObservation observed;
+	ClusterHeapFreezeWatermark watermark;
+	unsigned reads = sender_history_reads, futures = native_future_reads;
+
+	UT_ASSERT_EQ(undo_horizon_v2_cohort_observe(&cohort, history, &observed),
+		CLUSTER_HEAP_FREEZE_COHORT_READY);
+	UT_ASSERT_EQ(cohort.admitted_members_lo, 3);
+	UT_ASSERT_EQ(cohort.admitted_members_hi, 2);
+	UT_ASSERT_EQ(cohort.source_local_sample_id, active->sample_id);
+	UT_ASSERT(memcmp(&cohort.local_registration_cut, &active->scan, sizeof(active->scan)) == 0);
+	UT_ASSERT_EQ(cohort.active_full_xid_min, U64FromFullTransactionId(active->scan.min_full));
+	UT_ASSERT_EQ(cohort.future_full_xid_max,
+		sender_state.freeze_slots[65].view.report.future_full_xid);
+	UT_ASSERT_EQ(cohort.source_local_horizon_scn, history->horizon_scn);
+	UT_ASSERT_EQ(cohort.source_local_history.sample_clock_scn, history->clock_scn);
+	UT_ASSERT_EQ(cohort.source_local_history.contributor_kind, history->contributor_kind);
+	UT_ASSERT_EQ(cohort.source_local_history.contributor_token, history->contributor_token);
+	UT_ASSERT_EQ(cohort.source_peers[65].seq,
+		pg_atomic_read_u32(&sender_state.freeze_slots[65].seq));
+	UT_ASSERT_NE(cohort.source_peers[65].seq, 0);
+	UT_ASSERT_EQ(cohort.source_peers[65].seq % 2, 0);
+	UT_ASSERT_EQ(cohort.source_peers[65].generation, test_capability_generation);
+	UT_ASSERT_EQ(cohort.source_peer_history[65].sample_clock_scn, 700);
+	UT_ASSERT_EQ(cohort.source_peer_history[65].contributor_kind,
+		CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+	UT_ASSERT_EQ(cohort.source_peer_history[65].contributor_token, 165);
+	UT_ASSERT_EQ(cohort.source_peer_horizon_scn[65], 250);
+	UT_ASSERT_EQ(cohort.horizon_scn, expected_h);
+	UT_ASSERT(undo_horizon_publish_freeze_watermark(&cohort, &observed, cohort_now_us));
+	memcpy(&cohort_last_observation, &cohort, sizeof(cohort));
+	memcpy(&cohort_last_maintenance, &observed, sizeof(observed));
+	UT_ASSERT(cluster_heap_freeze_watermark_sample(&watermark));
+	UT_ASSERT_EQ(watermark.admitted_members_lo, 3);
+	UT_ASSERT_EQ(watermark.admitted_members_hi, 2);
+	UT_ASSERT_EQ(watermark.f_sample_id, active->sample_id);
+	UT_ASSERT_EQ(watermark.active_full_xid_min, U64FromFullTransactionId(active->scan.min_full));
+	UT_ASSERT_EQ(watermark.horizon_scn, expected_h);
+	UT_ASSERT_EQ(sender_history_reads, reads);
+	UT_ASSERT_EQ(native_future_reads, futures);
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT_EQ(native_lock_acquires, native_lock_releases);
+	UT_ASSERT_EQ(native_cleaner_lock_acquires, native_cleaner_lock_releases);
+	UT_ASSERT_EQ(sender_maintenance_acquires, sender_maintenance_releases);
+	return watermark;
+}
+
+UT_TEST(test_required_high_peer_missing_cannot_be_dropped_from_actual_cohort)
+{
+	ClusterUndoCleanerActiveSample active = original_high_peer_source();
+	ClusterUndoRetentionSample history;
+	ClusterHeapFreezeCohortObservation cohort, unchanged;
+	ClusterHeapFreezeWatermark out, zero = {0};
+
+	sender_sample_clock = 700;
+	sender_history_reads = 0;
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&history));
+	assert_actual_history_report(&active, &history, 1);
+	install_controlled_peer_report(&active);
+	memset(&cohort, 0xa5, sizeof(cohort));
+	memcpy(&unchanged, &cohort, sizeof(unchanged));
+	UT_ASSERT_EQ(undo_horizon_v2_cohort_observe(&cohort, &history, NULL),
+		CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE);
+	UT_ASSERT(memcmp(&cohort, &unchanged, sizeof(cohort)) == 0);
+	UT_ASSERT(native_cleaner_sample_current(&active));
+	UT_ASSERT_EQ(sender_state.freeze_watermark.publication_sequence, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&sender_state.freeze_watermark_seq), 0);
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT(!cluster_heap_freeze_watermark_sample(&out));
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	install_controlled_high_peer_report(&active);
+	out = observe_high_cohort_and_publish(&active, &history, 250);
+	UT_ASSERT_EQ(out.publication_sequence, 1);
+	sender_high_peer_enabled = false;
+}
+
+static void
+republish_earlier_peer_report(void)
+{
+	ClusterHeapFreezeReportV2 report = sender_state.freeze_slots[1].view.report;
+
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT(!native_lock_held && !native_cleaner_lock_held && !sender_maintenance_held);
+	report.horizon_scn = 200;
+	report.report_sequence++;
+	undo_horizon_v2_publish(&sender_state.freeze_slots[1], &report,
+		&cohort_last_observation.admission_fence, test_capability_generation,
+		cohort_now_us, false);
+}
+
+UT_TEST(test_late_high_peer_callback_revokes_earlier_peer_copy_before_candidate)
+{
+	ClusterUndoCleanerActiveSample active = original_high_peer_source();
+	ClusterUndoRetentionSample history;
+	ClusterHeapFreezeCohortObservation cohort, unchanged;
+	ClusterHeapFreezeWatermark old, out, zero = {0};
+	uint32 seq;
+
+	sender_sample_clock = 700;
+	sender_history_reads = 0;
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&history));
+	assert_actual_history_report(&active, &history, 1);
+	install_controlled_peer_report(&active);
+	install_controlled_high_peer_report(&active);
+	old = observe_high_cohort_and_publish(&active, &history, 250);
+	seq = pg_atomic_read_u32(&sender_state.freeze_watermark_seq);
+	sender_peer_observer_target = 65;
+	sender_peer_current_observer = republish_earlier_peer_report;
+	memset(&cohort, 0xa5, sizeof(cohort));
+	memcpy(&unchanged, &cohort, sizeof(unchanged));
+	UT_ASSERT_EQ(undo_horizon_v2_cohort_observe(&cohort, &history, NULL),
+		CLUSTER_HEAP_FREEZE_COHORT_BUSY_PUBLISH);
+	UT_ASSERT(sender_peer_current_observer == NULL);
+	UT_ASSERT(memcmp(&cohort, &unchanged, sizeof(cohort)) == 0);
+	UT_ASSERT(native_cleaner_sample_current(&active));
+	UT_ASSERT(!undo_horizon_publish_freeze_watermark(&cohort_last_observation,
+		&cohort_last_maintenance, cohort_now_us));
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT(!cluster_heap_freeze_watermark_sample(&out));
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	UT_ASSERT(memcmp(&old, &sender_state.freeze_watermark, sizeof(old)) == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&sender_state.freeze_watermark_seq), seq);
+	out = observe_high_cohort_and_publish(&active, &history, 200);
+	UT_ASSERT_EQ(out.publication_sequence, old.publication_sequence + 1);
+	sender_peer_observer_target = 0;
+	sender_high_peer_enabled = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(14);
 	UT_RUN(test_original_protection_exit_and_complete_worker_reach_v2_wire);
 	UT_RUN(test_actual_foreign_receipt_revokes_old_report_and_blocks_new_unqualified_report);
 	UT_RUN(test_actual_foreign_close_revokes_old_report_and_blocks_new_unqualified_report);
@@ -802,5 +976,7 @@ main(void)
 	UT_RUN(test_original_producers_reach_cohort_and_candidate_without_resampling);
 	UT_RUN(test_actual_late_receipt_revokes_cohort_and_clears_candidate_read);
 	UT_RUN(test_actual_peer_callback_respawn_requires_fresh_cohort_publication);
+	UT_RUN(test_required_high_peer_missing_cannot_be_dropped_from_actual_cohort);
+	UT_RUN(test_late_high_peer_callback_revokes_earlier_peer_copy_before_candidate);
 	return ut_failed_count == 0 ? 0 : 1;
 }
