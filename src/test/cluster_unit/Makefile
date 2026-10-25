@@ -4528,10 +4528,13 @@ test_cluster_write_fence_cache: test_cluster_write_fence_cache.c unit_test.h \
 CLUSTER_RECOVERY_ANCHOR_O = $(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
 	$(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o
 test_cluster_recovery_anchor: test_cluster_recovery_anchor.c unit_test.h \
+		test_cluster_recovery_anchor_publisher.inc \
+		test_cluster_cold_checkpoint_publisher.o test_cluster_cold_checkpoint_publisher.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_checkpoint.h \
 		$(CLUSTER_RECOVERY_ANCHOR_O) \
         $(top_srcdir)/src/backend/cluster/cluster_relmap_checkpoint.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		test_cluster_cold_checkpoint_publisher.o \
 		$(CLUSTER_RECOVERY_ANCHOR_O) \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
@@ -10687,10 +10690,23 @@ test_cluster_cold_source_completion.inc: $(top_srcdir)/src/backend/cluster/clust
 	awk '/^cluster_cold_completion_proven_v1\(/ { print "bool"; emit=1; count++ } emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_cold_checkpoint_publisher.o: test_cluster_cold_checkpoint_publisher.c \
+		test_cluster_cold_checkpoint_publisher.h test_cluster_cold_checkpoint_publisher_namespace.h \
+		test_cluster_relmap_recovery.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_recovery.c \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_checkpoint_native.c \
+		$(top_srcdir)/src/include/access/transam.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_checkpoint.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
+
 test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_test.h $(CLUSTER_COLD_STARTUP_O) \
 		test_cluster_recovery_duty_compare.inc \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		$(top_builddir)/src/common/libpgcommon.a \
+		test_cluster_cold_checkpoint_publisher.o test_cluster_cold_checkpoint_publisher.h \
+		test_cluster_cold_startup_checkpoint_publisher.inc \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_checkpoint.h \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o \
@@ -10707,6 +10723,7 @@ test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_te
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_census.h \
 		cluster_unit_port_stubs.o $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_STARTUP_O) \
+		test_cluster_cold_checkpoint_publisher.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o \
 		$(top_builddir)/src/common/libpgcommon.a \
 		test_cluster_cold_recovery_xid_core.o test_cluster_cold_recovery_replay_core.o \
@@ -10802,6 +10819,10 @@ test_cluster_cold_recovery_io_core.o: $(top_srcdir)/src/backend/cluster/cluster_
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_census.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 
+test_cluster_cold_recovery_io: CLUSTER_COLD_IO_PUBLISHER_O = test_cluster_cold_checkpoint_publisher.o
+test_cluster_cold_recovery_io: test_cluster_cold_checkpoint_publisher.o \
+		test_cluster_cold_checkpoint_publisher.h test_cluster_cold_io_checkpoint_publisher.inc
+
 test_cluster_cold_recovery_io test_cluster_cold_recovery_complete: %: %.c unit_test.h \
 		test_cluster_cold_recovery_io_boundary.h test_cluster_cold_recovery_io_core.o \
 		test_cluster_cold_recovery_xid_core.o \
@@ -10811,6 +10832,7 @@ test_cluster_cold_recovery_io test_cluster_cold_recovery_complete: %: %.c unit_t
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_census.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< test_cluster_cold_recovery_io_core.o \
+		$(CLUSTER_COLD_IO_PUBLISHER_O) \
 		test_cluster_cold_recovery_xid_core.o \
 		$(CLUSTER_COLD_PLAN_O) $(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o \
 		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@

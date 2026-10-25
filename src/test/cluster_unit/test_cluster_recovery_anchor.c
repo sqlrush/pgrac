@@ -2175,12 +2175,17 @@ UT_TEST(test_v3_postflush_issued_uses_original_immutable_readback)
 	UT_ASSERT_EQ(read.last_issued, initial.last_issued);
 	test_cf_x_held = false;
 }
+#include "test_cluster_recovery_anchor_publisher.inc"
+
 int
 main(void)
 {
 	setup_shared_root();
 
-	UT_PLAN(40);
+	UT_PLAN(43);
+	UT_RUN(test_original_checkpointer_window_survives_immutable_anchor_readback);
+	UT_RUN(test_original_checkpointer_anchor_prepare_fsync_failure_exposes_no_stage);
+	UT_RUN(test_original_checkpointer_anchor_refuses_rebinding_without_replacing_original);
 	UT_RUN(test_v3_postflush_issued_uses_original_immutable_readback);
 	UT_RUN(test_v3_window_roundtrip_and_legacy_clear);
 	UT_RUN(test_v3_window_inner_corruption_cannot_hide_behind_outer_hash);

@@ -1455,10 +1455,15 @@ UT_TEST(test_original_retained_visit_binds_later_postflush_issuance)
 		}
 }
 
+#include "test_cluster_cold_io_checkpoint_publisher.inc"
+
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(33);
+	UT_RUN(test_original_checkpointer_window_survives_both_complete_io_routes);
+	UT_RUN(test_original_checkpointer_io_refuses_mismatch_and_incomplete_visits);
+	UT_RUN(test_original_checkpointer_unknown_io_keeps_only_original_legacy_fold);
 	UT_RUN(test_original_retained_visit_binds_later_postflush_issuance);
 	UT_RUN(test_native_window_exports_only_after_complete_original_retained_visit);
 	UT_RUN(test_root_checkpoint_copy_matches_every_native_byte);

@@ -3896,11 +3896,12 @@ UT_TEST(test_own_root_seal_diagnostic_separates_lifecycle_and_flags)
 }
 #include "test_cluster_cold_startup_native_window.inc"
 #include "test_cluster_cold_startup_issued_window.inc"
+#include "test_cluster_cold_startup_checkpoint_publisher.inc"
 
 int
 main(void)
 {
-	UT_PLAN(144);
+	UT_PLAN(147);
 	UT_RUN(test_execution_refusal_preserves_the_first_census_failure);
 	UT_RUN(test_own_root_lookup_diagnostic_does_not_read_failed_outputs);
 	UT_RUN(test_own_root_key_format_diagnostic_names_the_field);
@@ -3973,6 +3974,9 @@ main(void)
 	UT_RUN(test_checkpoint_window_original_reselect_drift_is_sticky);
 	UT_RUN(test_endpoints_include_original_postflush_issuance_for_every_source);
 	UT_RUN(test_postflush_endpoints_keep_completion_and_failure_boundaries);
+	UT_RUN(test_original_checkpointer_issued_window_reaches_every_startup_endpoint);
+	UT_RUN(test_unknown_original_checkpointer_does_not_invent_a_later_endpoint);
+	UT_RUN(test_original_publisher_window_cannot_move_to_another_source_or_checkpoint);
 	UT_RUN(test_tt_base_capture_includes_history_before_wal_scan);
 	UT_RUN(test_tt_base_capture_failure_stops_before_side_and_scan);
 	UT_RUN(test_tt_base_drift_refuses_pass_two_stickily);
