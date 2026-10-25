@@ -79,6 +79,8 @@ Latch *MyLatch = &tx_wait_latch;
 static unsigned tx_waits, tx_interrupts;
 static unsigned tx_wait_destroy_base;
 static bool tx_wait_drift;
+static void (*ctrc_wait_step)(void);
+static void (*ctrc_interrupt_step)(void);
 static const struct ClusterRecoveryStartV1 *destroy_probe;
 static ClusterRecoveryPlanShmem window_region;
 static bool found_window_region;
@@ -446,6 +448,8 @@ static void reset(void)
 	memset(&ctrc_census, 0, sizeof(ctrc_census));
 	tx_waits = tx_interrupts = 0;
 	tx_wait_drift = false;
+	ctrc_wait_step = NULL;
+	ctrc_interrupt_step = NULL;
 	if (reserved_target != NULL || stamp_live) abort();
 	/* Fault injection changes actor identity; real process exit runs as the
 	 * original Startup PID, never as the deliberately forged test actor. */
@@ -1531,6 +1535,7 @@ void
 HandleStartupProcInterrupts(void)
 {
 	tx_interrupts++;
+	if (ctrc_interrupt_step != NULL) ctrc_interrupt_step();
 }
 
 void
@@ -1549,11 +1554,16 @@ WaitLatch(Latch *latch, int events, long timeout, uint32 wait_event_info)
 	UT_ASSERT(info.cluster_tx_start != NULL && input_destroys == tx_wait_destroy_base);
 	UT_ASSERT(ClusterColdRecoveryTxCurrent(info.cluster_tx_start));
 	tx_waits++;
+	if (ctrc_wait_step != NULL) {
+		ctrc_wait_step();
+		return WL_TIMEOUT;
+	}
 	if (tx_wait_drift)
 		owner_boot++;
 	else if (tx_waits == 3) {
 		serving_actor();
 		UT_ASSERT(cluster_recovery_tx_result_accept_v1());
+		UT_ASSERT(cluster_recovery_ctrc_result_accept_v1());
 		startup_actor();
 	}
 	return WL_TIMEOUT; /* Poll timeouts never become transaction errors. */
@@ -1894,10 +1904,16 @@ UT_TEST(test_original_error_revokes_ctrc_registration_with_the_owner_slot)
 }
 
 #include "test_cluster_cold_tx_ctrc_subject.inc"
+#include "test_cluster_cold_ctrc_handoff.inc"
 
 int main(void)
 {
-	UT_PLAN(60);
+	UT_PLAN(65);
+	UT_RUN(test_startup_retains_inputs_until_independent_ctrc_acceptance);
+	UT_RUN(test_ctrc_handoff_pending_timeouts_keep_original_input_and_responsibility);
+	UT_RUN(test_ctrc_handoff_refuses_wrong_original_components_without_releasing_input);
+	UT_RUN(test_ctrc_handoff_revalidates_after_startup_interrupts);
+	UT_RUN(test_ctrc_handoff_propagates_error_without_private_input_release);
 	UT_RUN(test_ctrc_terminal_subject_uses_actual_c0_and_exact_accepted_result);
 	UT_RUN(test_ctrc_terminal_subject_rejects_changed_physical_and_original_identity);
 	UT_RUN(test_ctrc_terminal_subject_requires_complete_current_original_components);
