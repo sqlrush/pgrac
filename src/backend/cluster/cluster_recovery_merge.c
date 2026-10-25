@@ -454,12 +454,16 @@ typedef struct MergeClaimCustody {
 	int directory_fd;
 	struct stat file;
 	struct stat directory;
+	int peer_fd;
+	bool peer_observed;
+	struct stat peer_file;
+	ClusterMergeClaimFile peer_image;
 	ClusterMergeClaimFile image;
 	char path[MAXPGPATH];
 	char directory_path[MAXPGPATH];
 } MergeClaimCustody;
 
-static MergeClaimCustody merge_claim_custody = { .fd = -1, .directory_fd = -1 };
+static MergeClaimCustody merge_claim_custody = { .fd = -1, .directory_fd = -1, .peer_fd = -1 };
 static uint64 merge_claim_serial;
 static bool merge_claim_callback_registered;
 
@@ -640,6 +644,140 @@ merge_claim_regime_configured(void)
 		   && cluster_node_id >= 0 && cluster_wal_thread_id() != XLP_THREAD_ID_LEGACY;
 }
 
+/* Original wait observation, never the remote executor's ownership. The
+ * directory is borrowed from this waiting actor's existing staging custody.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+merge_claim_waiter_current(void)
+{
+	MergeClaimCustody *c = &merge_claim_custody;
+	struct stat directory, named_directory, file;
+	char path[MAXPGPATH];
+
+	return !c->revoked && merge_claim_regime_configured()
+		&& c->owner != NULL && c->owner == CurrentResourceOwner && c->pid == getpid()
+		&& c->boot != 0 && c->boot == cluster_qvotec_get_self_incarnation()
+		&& c->serial != 0 && c->serial == merge_claim_serial
+		&& c->image.node == cluster_node_id && c->image.sysid == GetSystemIdentifier()
+		&& merge_claim_path(path, sizeof(path)) == 0 && strcmp(path, c->path) == 0
+		&& c->fd >= 0 && fstat(c->fd, &file) == 0 && merge_claim_same_file(&file, &c->file)
+		&& c->directory_fd >= 0 && fstat(c->directory_fd, &directory) == 0
+		&& lstat(c->directory_path, &named_directory) == 0
+		&& S_ISDIR(directory.st_mode) && S_ISDIR(named_directory.st_mode)
+		&& directory.st_dev == c->directory.st_dev && directory.st_ino == c->directory.st_ino
+		&& directory.st_uid == c->directory.st_uid
+		&& named_directory.st_dev == directory.st_dev && named_directory.st_ino == directory.st_ino
+		&& named_directory.st_uid == directory.st_uid;
+}
+
+static void
+merge_claim_peer_refuse(const char *stage)
+{
+	merge_claim_custody.revoked = true;
+	ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					errmsg("shared-regime recovery claim changed while waiting"),
+					errdetail("Original read-only claim observation refused at %s.", stage),
+					errhint("Retain the claim and its recovery inputs; E1 does not adopt a replacement.")));
+}
+
+/* False is only an absent name: retry the original CF-serialized link.
+ * Keep the old read descriptor until actual local publication or exit; a
+ * same-byte replacement is never a new observation of the original file. */
+static bool
+merge_claim_peer_observe(ClusterMergeClaimFile *out)
+{
+	MergeClaimCustody *c = &merge_claim_custody;
+	struct stat named, held;
+	char bytes[sizeof(ClusterMergeClaimFile) + 1];
+	ClusterMergeClaimVerdict verdict;
+	ssize_t n;
+
+	memset(out, 0, sizeof(*out));
+	if (!merge_claim_waiter_current())
+		merge_claim_peer_refuse("waiter");
+	if (fstatat(c->directory_fd, "pgrac_merge.claim", &named, AT_SYMLINK_NOFOLLOW) != 0) {
+		if (errno == ENOENT)
+			return false;
+		merge_claim_peer_refuse("name");
+	}
+	if (!S_ISREG(named.st_mode))
+		merge_claim_peer_refuse("file_type");
+	if (c->peer_fd < 0) {
+		c->peer_fd = OpenTransientFile(c->path,
+			O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | PG_BINARY);
+		if (c->peer_fd < 0) {
+			if (errno == ENOENT)
+				return false;
+			merge_claim_peer_refuse("open");
+		}
+		if (fstat(c->peer_fd, &held) != 0 || !merge_claim_same_file(&held, &named))
+			merge_claim_peer_refuse("opened_file");
+		c->peer_file = held;
+	}
+	if (fstat(c->peer_fd, &held) != 0 || !merge_claim_same_file(&held, &c->peer_file)
+		|| !merge_claim_same_file(&held, &named))
+		merge_claim_peer_refuse("original_file");
+	n = pg_pread(c->peer_fd, bytes, sizeof(bytes), 0);
+	if (n < 0)
+		merge_claim_peer_refuse("read");
+	verdict = cluster_merge_claim_classify(bytes, (size_t)n, c->image.sysid);
+	if (verdict != CLUSTER_MERGE_CLAIM_VALID) {
+		c->revoked = true;
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+				 errmsg("shared-regime recovery claim \"%s\" is not valid (verdict %d)",
+						c->path, (int)verdict),
+				 errhint("Retain the claim and its recovery inputs; automatic takeover is unavailable.")));
+	}
+	if (c->peer_observed && memcmp(bytes, &c->peer_image, sizeof(c->peer_image)) != 0)
+		merge_claim_peer_refuse("original_bytes");
+	if (!merge_claim_waiter_current() || fstat(c->peer_fd, &held) != 0
+		|| !merge_claim_same_file(&held, &c->peer_file))
+		merge_claim_peer_refuse("after_read");
+	if (!c->peer_observed) {
+		memcpy(&c->peer_image, bytes, sizeof(c->peer_image));
+		c->peer_observed = true;
+	}
+	if (fstatat(c->directory_fd, "pgrac_merge.claim", &named, AT_SYMLINK_NOFOLLOW) != 0) {
+		if (errno == ENOENT)
+			return false;
+		merge_claim_peer_refuse("readback_name");
+	}
+	if (!merge_claim_same_file(&held, &named) || !merge_claim_waiter_current())
+		merge_claim_peer_refuse("readback_identity");
+	*out = c->peer_image;
+	return true;
+}
+
+/* Retire only the old read handle after a real original local publication.
+ * It never unlinks or adopts the peer object. Uncertain close keeps debt. */
+static void
+merge_claim_peer_close(void)
+{
+	MergeClaimCustody *c = &merge_claim_custody;
+	struct stat held;
+	char bytes[sizeof(ClusterMergeClaimFile) + 1];
+
+	if (c->peer_fd < 0)
+		return;
+	if (!c->peer_observed || !merge_claim_waiter_current()
+		|| fstat(c->peer_fd, &held) != 0 || !merge_claim_same_file(&held, &c->peer_file)
+		|| pg_pread(c->peer_fd, bytes, sizeof(bytes), 0) != sizeof(c->peer_image)
+		|| memcmp(bytes, &c->peer_image, sizeof(c->peer_image)) != 0
+		|| fstat(c->peer_fd, &held) != 0 || !merge_claim_same_file(&held, &c->peer_file)
+		|| !merge_claim_waiter_current())
+		merge_claim_peer_refuse("retire_read_handle");
+	if (CloseTransientFile(c->peer_fd) != 0) {
+		c->revoked = true;
+		ereport(FATAL, (errcode_for_file_access(),
+						errmsg("could not close original recovery claim observation: %m")));
+	}
+	c->peer_fd = -1;
+	c->peer_observed = false;
+	if (!merge_claim_custody_current())
+		merge_claim_peer_refuse("published_owner");
+}
+
 /*
  * cluster_recovery_merge_claim_acquire_blocking -- see header.
  */
@@ -708,6 +846,7 @@ cluster_recovery_merge_claim_acquire_blocking(void)
 						errmsg("could not write recovery claim tmp file \"%s\": %m", tmp)));
 	memset(custody, 0, sizeof(*custody));
 	custody->fd = fd;
+	custody->peer_fd = -1;
 	custody->directory_fd = OpenTransientFile(gdir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
 	custody->owner = CurrentResourceOwner;
 	custody->pid = getpid();
@@ -735,7 +874,10 @@ cluster_recovery_merge_claim_acquire_blocking(void)
 			|| custody->pid != getpid() || custody->boot != cluster_qvotec_get_self_incarnation())
 			ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
 						errmsg("recovery claim original owner changed while waiting")));
+		if (custody->peer_fd >= 0 && !merge_claim_waiter_current())
+			merge_claim_peer_refuse("waiting_context");
 		if (merge_claim_try_publish(tmp, claim, gdir)) {
+			merge_claim_peer_close();
 			if (wait_holder >= 0)
 				ereport(LOG,
 						(errmsg("shared-regime recovery claim acquired by node %d after waiting "
@@ -751,38 +893,12 @@ cluster_recovery_merge_claim_acquire_blocking(void)
 			ereport(FATAL, (errcode_for_file_access(),
 							errmsg("could not link recovery claim \"%s\": %m", claim)));
 
-		/* Claim exists: read it back and judge the holder. */
+		/* Observe the same original object without remote-owner authority. */
 		{
-			char buf[sizeof(ClusterMergeClaimFile) + 1];
-			ssize_t n;
 			ClusterMergeClaimFile cur;
-			ClusterMergeClaimVerdict v;
 
-			fd = OpenTransientFile(claim, O_RDONLY | PG_BINARY);
-			if (fd < 0) {
-				if (errno == ENOENT)
-					continue; /* released between link() and open(); retry */
-				ereport(FATAL, (errcode_for_file_access(),
-								errmsg("could not open recovery claim \"%s\": %m", claim)));
-			}
-			n = read(fd, buf, sizeof(buf));
-			if (n < 0)
-				ereport(FATAL, (errcode_for_file_access(),
-								errmsg("could not read recovery claim \"%s\": %m", claim)));
-			if (CloseTransientFile(fd) != 0)
-				ereport(FATAL, (errcode_for_file_access(),
-								errmsg("could not close recovery claim \"%s\": %m", claim)));
-
-			v = cluster_merge_claim_classify(buf, (size_t)n, sysid);
-			if (v != CLUSTER_MERGE_CLAIM_VALID)
-				ereport(FATAL,
-						(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
-						 errmsg("shared-regime recovery claim \"%s\" is not valid (verdict %d)",
-								claim, (int)v),
-						 errhint("The claim file on the shared root is corrupt or belongs to "
-								 "another cluster.  Verify no node is recovering, remove the "
-								 "file, and restart.")));
-			memcpy(&cur, buf, sizeof(cur));
+			if (!merge_claim_peer_observe(&cur))
+				continue;
 
 			if (cur.node == cluster_node_id)
 				ereport(FATAL,

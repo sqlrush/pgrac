@@ -357,9 +357,125 @@ UT_TEST(native_claim_owner_checks_original_actor_and_custody_revocation)
   UT_ASSERT(!cluster_recovery_merge_claim_owner_current_nowait_v1(owner));
  }
 }
+/* Peer observation must never turn a path replacement into the original
+ * file or a remote executor proof. These inject real namespace/byte changes. */
+static void peer_replace_identical(void)
+{
+ char saved[MAXPGPATH];
+ UT_ASSERT(!test_cf_held);
+ snprintf(saved,sizeof(saved),"%s/peer-original",scratch);
+ TEST_REQUIRE(rename(claim_path,saved)==0);put_claim(claim_path,1);poll_hook=NULL;
+}
+static void peer_change_immutable_bytes(void)
+{
+ ClusterMergeClaimFile f;int fd;
+ UT_ASSERT(!test_cf_held);memset(&f,0,sizeof(f));cluster_merge_claim_build(&f,1,GetSystemIdentifier());
+ f.pad=7;INIT_CRC32C(f.crc);COMP_CRC32C(f.crc,&f,offsetof(ClusterMergeClaimFile,crc));FIN_CRC32C(f.crc);
+ TEST_REQUIRE(cluster_merge_claim_classify(&f,sizeof(f),GetSystemIdentifier())==CLUSTER_MERGE_CLAIM_VALID);
+ fd=open(claim_path,O_WRONLY);TEST_REQUIRE(fd>=0);
+ TEST_REQUIRE(pwrite(fd,&f,sizeof(f),0)==sizeof(f));TEST_REQUIRE(fsync(fd)==0);close(fd);poll_hook=NULL;
+}
+static void peer_rebind_directory(void)
+{
+ char global[MAXPGPATH],saved[MAXPGPATH];
+ UT_ASSERT(!test_cf_held);snprintf(global,sizeof(global),"%s/global",scratch);
+ snprintf(saved,sizeof(saved),"%s/peer-original-directory",scratch);
+ TEST_REQUIRE(rename(global,saved)==0);TEST_REQUIRE(mkdir(global,0700)==0);
+ put_claim(claim_path,1);poll_hook=NULL;
+}
+static void peer_rebind_configured_root(void)
+{ UT_ASSERT(!test_cf_held);cluster_shared_data_dir="changed-original-namespace";poll_hook=NULL; }
+static void peer_release_then_close_error(void)
+{ peer_release();close_error=true; }
+UT_TEST(peer_wait_refuses_an_identical_replacement_object)
+{
+ char saved[MAXPGPATH];
+ reset();put_claim(claim_path,1);poll_hook=peer_replace_identical;
+ UT_ASSERT(acquire_refused());UT_ASSERT_EQ(last_state,ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+ UT_ASSERT(!merge_claim_held);UT_ASSERT_EQ(polls,1);UT_ASSERT(exists(claim_path));
+ snprintf(saved,sizeof(saved),"%s/peer-original",scratch);UT_ASSERT(exists(saved));UT_ASSERT(!test_cf_held);
+}
+UT_TEST(peer_wait_refuses_changed_original_bytes_even_with_valid_crc)
+{
+ reset();put_claim(claim_path,1);poll_hook=peer_change_immutable_bytes;
+ UT_ASSERT(acquire_refused());UT_ASSERT_EQ(last_state,ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+ UT_ASSERT(!merge_claim_held);UT_ASSERT_EQ(polls,1);UT_ASSERT(exists(claim_path));UT_ASSERT(!test_cf_held);
+}
+UT_TEST(peer_wait_does_not_follow_an_initial_symlink)
+{
+ char target[MAXPGPATH];
+ reset();snprintf(target,sizeof(target),"%s/real-peer",scratch);put_claim(target,1);
+ TEST_REQUIRE(symlink(target,claim_path)==0);
+ UT_ASSERT(acquire_refused());UT_ASSERT_EQ(last_state,ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+ UT_ASSERT(!merge_claim_held);UT_ASSERT_EQ(polls,0);UT_ASSERT(exists(claim_path));UT_ASSERT(exists(target));
+}
+UT_TEST(peer_wait_keeps_its_original_directory)
+{
+ char saved[MAXPGPATH];
+ reset();put_claim(claim_path,1);poll_hook=peer_rebind_directory;
+ UT_ASSERT(acquire_refused());UT_ASSERT_EQ(last_state,ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+ UT_ASSERT(!merge_claim_held);UT_ASSERT(exists(claim_path));
+ snprintf(saved,sizeof(saved),"%s/peer-original-directory/pgrac_merge.claim",scratch);
+ UT_ASSERT(exists(saved));UT_ASSERT(!test_cf_held);
+}
+UT_TEST(peer_wait_rechecks_the_name_after_descriptor_io)
+{
+ reset();put_claim(claim_path,1);read_hook=peer_replace_identical;
+ UT_ASSERT(acquire_refused());UT_ASSERT_EQ(last_state,ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+ UT_ASSERT(read_hook==NULL);UT_ASSERT(!merge_claim_held);UT_ASSERT(exists(claim_path));UT_ASSERT(!test_cf_held);
+}
+UT_TEST(peer_wait_retains_one_readonly_cloexec_handle_without_owner_rights)
+{
+ struct stat named,held;unsigned readers=0;
+ reset();put_claim(claim_path,1);UT_ASSERT(acquire_refused());
+ UT_ASSERT_EQ(last_state,0);UT_ASSERT(!merge_claim_held);UT_ASSERT_EQ(cluster_recovery_merge_claim_owner_v1(),0);
+ TEST_REQUIRE(lstat(claim_path,&named)==0);
+ for (int i=0;i<tracked_count;i++) {
+  int fd=tracked_fds[i];
+  if (fd<0 || fstat(fd,&held)!=0 || held.st_dev!=named.st_dev || held.st_ino!=named.st_ino) continue;
+  readers++;UT_ASSERT_EQ(fcntl(fd,F_GETFL)&O_ACCMODE,O_RDONLY);
+  UT_ASSERT((fcntl(fd,F_GETFD)&FD_CLOEXEC)!=0);
+ }
+ UT_ASSERT_EQ(readers,1);UT_ASSERT(exists(claim_path));UT_ASSERT(!test_cf_held);
+}
+UT_TEST(peer_observer_close_failure_retains_new_original_claim_debt)
+{
+ reset();put_claim(claim_path,1);poll_hook=peer_release_then_close_error;
+ UT_ASSERT(acquire_refused());UT_ASSERT_EQ(last_state,ERRCODE_IO_ERROR);
+ UT_ASSERT(merge_claim_held);UT_ASSERT_EQ(cluster_recovery_merge_claim_owner_v1(),0);
+ UT_ASSERT(exists(claim_path));UT_ASSERT(!test_cf_held);
+}
+UT_TEST(peer_wait_cannot_rebind_the_configured_namespace)
+{
+ reset();put_claim(claim_path,1);poll_hook=peer_rebind_configured_root;
+ UT_ASSERT(acquire_refused());UT_ASSERT_EQ(last_state,ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+ UT_ASSERT(!merge_claim_held);UT_ASSERT(exists(claim_path));UT_ASSERT(!test_cf_held);
+ cluster_shared_data_dir=scratch;
+}
+UT_TEST(peer_retirement_during_read_preserves_original_atomic_acquire)
+{
+ unsigned open_count=0;
+ reset();put_claim(claim_path,1);read_hook=peer_release;
+ UT_ASSERT(!acquire_refused());
+ UT_ASSERT(read_hook==NULL);UT_ASSERT_EQ(polls,0);UT_ASSERT(merge_claim_held);
+ UT_ASSERT(cluster_recovery_merge_claim_owner_v1()!=0);UT_ASSERT(!test_cf_held);
+ for (int i=0;i<tracked_count;i++) if (tracked_fds[i]>=0) open_count++;
+ UT_ASSERT_EQ(open_count,2);
+ cluster_recovery_merge_claim_release_if_held();UT_ASSERT(!exists(claim_path));
+}
 int main(void)
 {
- setbuf(stdout,NULL); UT_PLAN(26);
+ setbuf(stdout,NULL); UT_PLAN(35);
+ UT_RUN(peer_wait_refuses_an_identical_replacement_object);
+ UT_RUN(peer_wait_refuses_changed_original_bytes_even_with_valid_crc);
+ UT_RUN(peer_wait_does_not_follow_an_initial_symlink);
+ UT_RUN(peer_wait_keeps_its_original_directory);
+ UT_RUN(peer_wait_rechecks_the_name_after_descriptor_io);
+ UT_RUN(peer_wait_retains_one_readonly_cloexec_handle_without_owner_rights);
+ UT_RUN(peer_observer_close_failure_retains_new_original_claim_debt);
+ UT_RUN(peer_wait_cannot_rebind_the_configured_namespace);
+ UT_RUN(peer_retirement_during_read_preserves_original_atomic_acquire);
+
  UT_RUN(native_claim_owner_requires_creator_and_full_original_file);
  UT_RUN(native_claim_owner_incarnation_cannot_rebind_after_release);
  UT_RUN(native_claim_owner_checks_original_actor_and_custody_revocation);

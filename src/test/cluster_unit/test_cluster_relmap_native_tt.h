@@ -4,7 +4,9 @@
 #ifndef TEST_CLUSTER_RELMAP_NATIVE_TT_H
 #define TEST_CLUSTER_RELMAP_NATIVE_TT_H
 #include "postgres.h"
+#include "access/xact.h"
 #include "cluster/cluster_tt_local.h"
+#include "cluster/cluster_tt_slot.h"
 
 typedef struct TestRelmapNativeTTStats
 {
@@ -12,8 +14,20 @@ typedef struct TestRelmapNativeTTStats
 	bool balanced, assertion_failed;
 } TestRelmapNativeTTStats;
 
+typedef struct TestRelmapNativeTTTerminal
+{
+	TTSlot resident, written;
+	ClusterTTSlotCurrentOwner allocator;
+	xl_xact_tt_commit fold;
+	unsigned writes, abort_records;
+	int error_level;
+	bool allocator_present, flushed, write_before_flush;
+} TestRelmapNativeTTTerminal;
+
 extern void test_relmap_native_tt_reset(void);
 extern bool test_relmap_native_tt_publish(TransactionId xid);
 extern bool test_relmap_native_tt_lookup(TransactionId xid, ClusterCanonicalTxnBinding *out);
 extern TestRelmapNativeTTStats test_relmap_native_tt_stats(void);
+extern bool test_relmap_native_tt_terminal(const ClusterCanonicalTxnBinding *binding,
+	bool commit, bool fail_write, TestRelmapNativeTTTerminal *out);
 #endif
