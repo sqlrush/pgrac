@@ -25289,6 +25289,7 @@ UT_TEST(test_tx_inputs_parent_subject_and_wait_revalidation)
 }
 
 #include "test_cluster_control_ctrc_inputs.inc"
+#include "test_cluster_control_ctrc_namespace.inc"
 
 /*
  * Keep the long control-root suite deterministic when an individual test
@@ -25432,7 +25433,13 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_CTRC_INPUTS") != NULL) {
-		UT_PLAN(7);
+		UT_PLAN(13);
+		UT_RUN(test_ctrc_namespace_same_root_bytes_cannot_replace_original_directory);
+		UT_RUN(test_ctrc_namespace_initial_root_error_closes_fd_and_retains_scope_debt);
+		UT_RUN(test_ctrc_namespace_retains_readonly_fd_through_scope_lifetime);
+		UT_RUN(test_ctrc_namespace_rejects_other_purpose_and_changed_owner);
+		UT_RUN(test_ctrc_namespace_refuses_symlink_unsafe_mode_and_name_switch);
+		UT_RUN(test_ctrc_namespace_refuses_replaced_directory_without_reopening);
 		UT_RUN(test_ctrc_inputs_terminal_work_without_active_reads_all_retained_sources);
 		UT_RUN(test_ctrc_inputs_requires_exact_original_work_and_post_eor_start);
 		UT_RUN(test_ctrc_inputs_each_original_owner_and_work_version_is_rechecked);
@@ -25624,7 +25631,13 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(492);
+	UT_PLAN(498);
+	UT_RUN(test_ctrc_namespace_same_root_bytes_cannot_replace_original_directory);
+	UT_RUN(test_ctrc_namespace_initial_root_error_closes_fd_and_retains_scope_debt);
+	UT_RUN(test_ctrc_namespace_retains_readonly_fd_through_scope_lifetime);
+	UT_RUN(test_ctrc_namespace_rejects_other_purpose_and_changed_owner);
+	UT_RUN(test_ctrc_namespace_refuses_symlink_unsafe_mode_and_name_switch);
+	UT_RUN(test_ctrc_namespace_refuses_replaced_directory_without_reopening);
 	UT_RUN(test_ctrc_inputs_terminal_work_without_active_reads_all_retained_sources);
 	UT_RUN(test_ctrc_inputs_requires_exact_original_work_and_post_eor_start);
 	UT_RUN(test_ctrc_inputs_each_original_owner_and_work_version_is_rechecked);

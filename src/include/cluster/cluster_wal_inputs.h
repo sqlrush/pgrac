@@ -94,6 +94,19 @@ struct ClusterColdCtrcWorkV1;
 extern ClusterControlRootResult cluster_wal_inputs_begin_ctrc_census_v1(
 	const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 **out);
+/* Borrow the original CTRC scope's read-only shared namespace descriptor.
+ * Scope creation records the configured directory name/object before original
+ * ROOT selection. The first call opens that same directory without following
+ * its final symlink, verifies its owned directory identity and rechecks the
+ * original ROOT. Later calls compare the same descriptor and directory name;
+ * they never reopen or rebase. The original Start/work/owner/pin must remain
+ * current. Suspended scopes refuse. Destroy dependents before releasing the
+ * scope, which alone closes the descriptor. Failure sets *root_fd to -1.
+ * This supplies neither isolation/freeze nor DATA/write/completion authority;
+ * complete physical enumeration and all later semantic proofs remain required.
+ */
+extern ClusterControlRootResult cluster_wal_inputs_ctrc_namespace_v1(
+	ClusterWalInputsV1 *inputs, int *root_fd);
 /* Exact current C0 candidate only, inside the original TX_CLOSURE read scope.
  * Resolve through the shared undo namespace without borrowing a redo duty.
  * This provisional path grants no write authority: retain target exclusion
