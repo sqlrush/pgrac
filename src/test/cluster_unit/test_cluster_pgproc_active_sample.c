@@ -648,10 +648,78 @@ UT_TEST(test_actual_unqualified_prepare_publication_refuses_f_before_and_after_e
 	prepare_original_procarray_publication(false);
 }
 
+/* The terminal caller is outside this fixture; removal itself is original. */
+static void
+remove_prepared_from_original_array(PGPROC *proc, TransactionId latest_xid)
+{
+	ProcArrayRemove(proc, latest_xid);
+}
+
+static void
+exercise_actual_prepared_retirement(bool qualified)
+{
+	const FullTransactionId surviving = FullTransactionIdFromEpochAndXid(7, 95);
+	PGPROC before;
+
+	prepare_original_procarray_publication(qualified);
+	/* This later backend is an independent native producer. Its identity is
+	 * a controlled input; both publications and all compaction are actual. */
+	entries[3].pgprocno = 3;
+	entries[3].xid = XidFromFullTransactionId(surviving);
+	entries[3].subxidStatus.count = 2;
+	entries[3].subxidStatus.overflowed = true;
+	entries[3].statusFlags = PROC_IS_AUTOVACUUM;
+	pg_atomic_write_u64(&entries[3].cluster_top_full_xid_atomic,
+		U64FromFullTransactionId(surviving));
+	ProcArrayAdd(&entries[3]);
+	UT_ASSERT_EQ(array.numProcs, 3);
+	UT_ASSERT_EQ(array.pgprocnos[0], 0);
+	UT_ASSERT_EQ(array.pgprocnos[1], 3);
+	UT_ASSERT_EQ(array.pgprocnos[2], 7);
+	sample_prepared_publication(qualified, FullTransactionIdFromEpochAndXid(7, 90));
+	memcpy(&before, &entries[0], sizeof(before));
+	/* The caller's terminal WAL/CLOG work is outside this fixture. Execute
+	 * its original native retirement with latestXid including a child. */
+	remove_prepared_from_original_array(&entries[0], 94);
+	UT_ASSERT_EQ(array.numProcs, 2);
+	UT_ASSERT_EQ(array.pgprocnos[0], 3);
+	UT_ASSERT_EQ(array.pgprocnos[1], 7);
+	UT_ASSERT_EQ(array.pgprocnos[2], -1);
+	UT_ASSERT_EQ(entries[3].pgxactoff, 0);
+	UT_ASSERT_EQ(MyProc->pgxactoff, 1);
+	UT_ASSERT_EQ(visible_xids[0], 95);
+	UT_ASSERT_EQ(visible_xids[1], InvalidTransactionId);
+	UT_ASSERT_EQ(subxid_states[0].count, 2);
+	UT_ASSERT(subxid_states[0].overflowed);
+	UT_ASSERT_EQ(status_flags[0], PROC_IS_AUTOVACUUM);
+	UT_ASSERT(memcmp(&before, &entries[0], sizeof(before)) == 0);
+	UT_ASSERT_EQ(completed_xid, 94);
+	UT_ASSERT_EQ(variables.xactCompletionCount, 2);
+	UT_ASSERT_EQ(lifecycle_depth, 0);
+	UT_ASSERT(!held);
+	UT_ASSERT_EQ(lock_errors, 0);
+	/* The detached PGPROC deliberately retains its bytes. Sampling must use
+	 * original compact membership and the surviving producer, never a raw
+	 * scan of all slots or an inferred epoch for the retired prepared xid. */
+	sample_prepared_publication(true, surviving);
+}
+
+UT_TEST(test_actual_prepared_retirement_compacts_the_surviving_original_identity)
+{
+	exercise_actual_prepared_retirement(true);
+}
+
+UT_TEST(test_actual_unknown_prepared_identity_refuses_until_original_retirement)
+{
+	exercise_actual_prepared_retirement(false);
+}
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(19);
+	UT_RUN(test_actual_prepared_retirement_compacts_the_surviving_original_identity);
+	UT_RUN(test_actual_unknown_prepared_identity_refuses_until_original_retirement);
 	UT_RUN(test_actual_prepare_publication_retains_f_after_original_source_exit);
 	UT_RUN(test_actual_unqualified_prepare_publication_refuses_f_before_and_after_exit);
 	UT_RUN(test_empty_array_retains_one_captured_n);
