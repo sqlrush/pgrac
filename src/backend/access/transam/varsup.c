@@ -70,6 +70,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_oid_lease.h"
 #include "cluster/cluster_relmap_recovery.h"
+#include "cluster/cluster_relmap_retention_runtime.h"
 #endif
 
 
@@ -79,6 +80,15 @@
 /* pointer to "variable cache" in shared memory (set up by shmem.c) */
 VariableCache ShmemVariableCache = NULL;
 
+
+/* PGRAC: private request for the dormant original allocator entry. */
+typedef struct RelmapXidAllocationV2 {
+	uint64 system_identifier;
+	uint64 database_incarnation;
+	uint16 origin;
+	FullTransactionId full_xid;
+	bool isSubXact;
+} RelmapXidAllocationV2;
 
 /* PGRAC: one original nofail publication after all fallible extension.
  * Caller retains XidGenLock EXCLUSIVE through these stores and barriers.
@@ -180,6 +190,34 @@ publish_new_transaction_id(FullTransactionId full_xid, bool isSubXact)
 
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* These callbacks do not acquire any additional native lock or perform I/O.
+ * The original caller keeps XidGenLock; runtime owns its lexical retention
+ * acquisition through the original nofail stores, including actual issuance.
+ * Author: SqlRush <sqlrush@gmail.com>
+ * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md */
+static void
+relmap_xid_publication(void *argument)
+{
+	const RelmapXidAllocationV2 *allocation = argument;
+
+	publish_new_transaction_id(allocation->full_xid, allocation->isSubXact);
+}
+
+static void
+relmap_xid_candidate_check(const RelmapXidAllocationV2 *allocation,
+	FullTransactionId full_xid)
+{
+	if (allocation != NULL
+		&& cluster_relmap_retention_runtime_allocation_check_v2(
+			allocation->system_identifier, allocation->database_incarnation,
+			allocation->origin, U64FromFullTransactionId(full_xid)) != CLUSTER_RELMAP_RETENTION_OK)
+		ereport(ERROR,
+			(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+			 errmsg("refusing to assign a new transaction ID: relmap retention is not qualified")));
+}
+#endif
+
 /*
  * Allocate the next FullTransactionId for a new transaction or
  * subtransaction.
@@ -192,11 +230,15 @@ publish_new_transaction_id(FullTransactionId full_xid, bool isSubXact)
  * does something.  So it is safe to do a database lookup if we want to
  * issue a warning about XID wrap.
  */
-FullTransactionId
-GetNewTransactionId(bool isSubXact)
+static FullTransactionId
+get_new_transaction_id(bool isSubXact, RelmapXidAllocationV2 *allocation)
 {
 	FullTransactionId full_xid;
 	TransactionId xid;
+
+#ifndef USE_PGRAC_CLUSTER
+	(void)allocation;
+#endif
 
 	/*
 	 * Workers synchronize transaction state at the beginning of each parallel
@@ -313,6 +355,7 @@ retry_cluster_xid_reservation:
 				 errmsg("refusing to assign a new transaction ID: xid epoch rollover barrier is not complete"),
 				 errdetail("The first epoch-1 transaction ID may not be issued until every cluster member has durably disabled native-era prehistory routing."),
 				 errhint("The barrier completes automatically within about a second; retry the transaction. If this persists, check cluster connectivity and that every member runs a barrier-capable binary.")));
+	relmap_xid_candidate_check(allocation, full_xid);
 #endif
 
 	/*----------
@@ -433,6 +476,7 @@ retry_cluster_xid_reservation:
 					 errmsg("refusing to assign a new transaction ID: xid epoch rollover barrier is not complete"),
 					 errdetail("The first epoch-1 transaction ID may not be issued until every cluster member has durably disabled native-era prehistory routing."),
 					 errhint("The barrier completes automatically within about a second; retry the transaction. If this persists, check cluster connectivity and that every member runs a barrier-capable binary.")));
+		relmap_xid_candidate_check(allocation, full_xid);
 #endif
 	}
 
@@ -491,12 +535,58 @@ retry_cluster_xid_reservation:
 	ExtendCommitTs(xid);
 	ExtendSUBTRANS(xid);
 
-	publish_new_transaction_id(full_xid, isSubXact);
+#ifdef USE_PGRAC_CLUSTER
+	if (allocation != NULL)
+	{
+		ClusterRelmapRetentionResult result;
+
+		allocation->full_xid = full_xid;
+		allocation->isSubXact = isSubXact;
+		result = cluster_relmap_retention_runtime_allocation_publish_v2(
+			allocation->system_identifier, allocation->database_incarnation,
+			allocation->origin, U64FromFullTransactionId(full_xid),
+			relmap_xid_publication, allocation);
+		if (result != CLUSTER_RELMAP_RETENTION_OK)
+			ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+				 errmsg("refusing to assign a new transaction ID: relmap retention changed before publication")));
+	}
+	else
+#endif
+		publish_new_transaction_id(full_xid, isSubXact);
 
 	LWLockRelease(XidGenLock);
 
 	return full_xid;
 }
+
+/* Preserve the ordinary entry: v2 has no live allocator consumer. */
+FullTransactionId
+GetNewTransactionId(bool isSubXact)
+{
+	return get_new_transaction_id(isSubXact, NULL);
+}
+
+#ifdef USE_PGRAC_CLUSTER
+/* Dormant original allocator, with qualification supplied by its original
+ * owner. Numeric identity is only routing, not a new authority certificate. */
+FullTransactionId
+cluster_relmap_retention_allocate_xid_v2(bool isSubXact, uint64 system_identifier,
+	uint64 database_incarnation, uint16 origin)
+{
+	RelmapXidAllocationV2 allocation = { 0 };
+
+	if (!cluster_enabled || !cluster_shared_config || !IsNormalProcessingMode()
+		|| system_identifier == 0 || database_incarnation == 0 || origin >= CLUSTER_MAX_NODES)
+		ereport(ERROR,
+			(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+			 errmsg("refusing to assign a new transaction ID: relmap allocator context is not qualified")));
+	allocation.system_identifier = system_identifier;
+	allocation.database_incarnation = database_incarnation;
+	allocation.origin = origin;
+	return get_new_transaction_id(isSubXact, &allocation);
+}
+#endif
 
 /*
  * Read nextXid but don't allocate it.

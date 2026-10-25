@@ -194,4 +194,18 @@ extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_allocation_
 	uint64 system_identifier, uint64 database_incarnation, uint16 origin, uint64 candidate,
 	ClusterRelmapRetentionAllocationPublishV2 publish, void *argument);
 
+/* Dormant entry into the ORIGINAL native allocator. The original caller must
+ * already authenticate this origin/system/DB and qualify its complete native
+ * floor/issued/history/lifetime inputs; these numbers supply no certificate.
+ * Enter from the original allocation context with neither XidGenLock nor the
+ * retention lock held; this function acquires and releases the native lock.
+ * Reuses all original native wrap/StopLimit/stripe/herding/lease checks and
+ * SLRU extension. First and recomputed candidates are checked before extension;
+ * the final candidate and original nofail stores share XidGenLock->retention.
+ * Refusal raises existing53RB5 with no fallback or automatic retry. Ordinary
+ * GetNewTransactionId remains unchanged in behavior. No live caller, COMPLETE
+ * publisher, boot admission or v2 activation is installed by this entry. */
+extern FullTransactionId cluster_relmap_retention_allocate_xid_v2(bool isSubXact,
+	uint64 system_identifier, uint64 database_incarnation, uint16 origin);
+
 #endif

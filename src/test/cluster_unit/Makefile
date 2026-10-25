@@ -199,7 +199,7 @@ TESTS = test_cluster_relmap_lock test_cluster_vm_read_visibility test_cluster_he
         test_cluster_membership \
         test_cluster_node_remove test_cluster_node_remove_stop test_cluster_recovery_stop test_cluster_backup_stop test_cluster_mrp_stop \
         test_cluster_hang_acceptance \
-        test_cluster_xid_stripe test_cluster_heap_horizon test_cluster_xid_stripe_evidence test_cluster_xid_stripe_boot test_cluster_xid_allocation \
+        test_cluster_xid_stripe test_cluster_heap_horizon test_cluster_xid_stripe_evidence test_cluster_xid_stripe_boot test_cluster_xid_allocation test_cluster_xid_retention \
         test_cluster_undo_resid \
         test_cluster_undo_authority \
         test_cluster_undo_gcs \
@@ -406,7 +406,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_heap_cr_reuse test_cluster_snapshot_ad
 		test_cluster_resource_x_handoff test_cluster_retained_remote \
 		test_cluster_r4_d10_hint_source test_cluster_r4_d10_tt_source \
 		test_cluster_r4_d10_multi_source test_cluster_sf_dep test_cluster_wal_state_rmw \
-		test_cluster_ges_reply_wait test_cluster_xid_stripe_evidence test_cluster_xid_stripe_boot test_cluster_xid_allocation \
+		test_cluster_ges_reply_wait test_cluster_xid_stripe_evidence test_cluster_xid_stripe_boot test_cluster_xid_allocation test_cluster_xid_retention \
 		test_cluster_replacement_episode \
 		test_cluster_replacement_request \
 		test_cluster_undo_root_descriptor \
@@ -9249,10 +9249,12 @@ test_cluster_cr_coordinator: test_cluster_cr_coordinator.c unit_test.h \
 CLUSTER_XID_STRIPE_O = $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o
 test_cluster_xid_allocation.inc: $(top_srcdir)/src/backend/access/transam/varsup.c \
 		$(top_srcdir)/src/backend/access/transam/transam.c Makefile
-	awk '/^publish_new_transaction_id\(/ { print "static void"; emit=1; found++ } \
-	     /^GetNewTransactionId\(/ { print "FullTransactionId"; emit=1; found++ } \
+	awk '/^typedef struct RelmapXidAllocationV2 / { emit=1; types++ } \
+	     /^(publish_new_transaction_id|relmap_xid_publication|relmap_xid_candidate_check)\(/ { print "static void"; emit=1; found++ } \
+	     /^get_new_transaction_id\(/ { print "static FullTransactionId"; emit=1; found++ } \
+	     /^(GetNewTransactionId|cluster_relmap_retention_allocate_xid_v2)\(/ { print "FullTransactionId"; emit=1; found++ } \
 	     /^TransactionId(Precedes|FollowsOrEquals)\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 4) exit 1 }' $(filter %.c,$^) > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (types != 1 || found != 8) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_xid_allocation: test_cluster_xid_allocation.c unit_test.h \
@@ -9260,7 +9262,26 @@ test_cluster_xid_allocation: test_cluster_xid_allocation.c unit_test.h \
 		test_cluster_xid_allocation.inc $(CLUSTER_XID_STRIPE_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_recovery.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
 		$(top_srcdir)/src/include/access/transam.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Compose the original native allocator with its actual runtime guard and core.
+test_cluster_xid_retention_runtime.inc: $(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c Makefile
+	awk '/^typedef struct RelmapRetentionRuntimeShmem / { emit=1; types++ } \
+	     /^static RelmapRetentionRuntimeShmem \*relmap_runtime_shmem;/ { print; pointers++ } \
+	     /^relmap_runtime_(origin_matches|allocation_guard)\(/ { print "static ClusterRelmapRetentionResult"; emit=1; functions++ } \
+	     /^cluster_relmap_retention_runtime_allocation_(check|publish)_v2\(/ { print "ClusterRelmapRetentionResult"; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (types != 1 || pointers != 1 || functions != 4) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_xid_retention: test_cluster_xid_retention.c test_cluster_xid_allocation.c \
+		test_cluster_xid_publication.inc test_cluster_xid_allocation.inc \
+		test_cluster_xid_retention_runtime.inc unit_test.h $(CLUSTER_XID_STRIPE_O) \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention.c \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_recovery.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Exercise the original recovery -> seed -> claim -> WAL gate. Dependency
