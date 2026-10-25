@@ -59,6 +59,12 @@ char *DataDir = "/fixture/local";
 static uint32 wait_event_sink;
 uint32 *my_wait_event_info = &wait_event_sink;
 
+/* These metadata-only fixtures do not acquire a disk merge claim. */
+ResourceOwner CurrentResourceOwner;
+uint64 cluster_qvotec_get_self_incarnation(void) { return 0; }
+uint64 cluster_cf_owner_cookie(LOCKMODE mode pg_attribute_unused()) { return 0; }
+
+
 /* ---- fixture state ---- */
 static ClusterRecoveryPlan census;
 static ClusterRecoveryWorkerPool pool;

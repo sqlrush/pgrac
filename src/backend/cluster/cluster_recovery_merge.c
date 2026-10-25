@@ -50,6 +50,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_tier1.h" /* spec-6.14 D9 amend: claim-holder liveness poll */
 #include "cluster/cluster_ir.h"
+#include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_merge.h"
@@ -69,6 +70,7 @@
 #include "storage/fd.h"
 #include "storage/latch.h"
 #include "utils/errcodes.h"
+#include "utils/resowner.h"
 #include "utils/wait_event.h"
 
 /*
@@ -434,6 +436,178 @@ cluster_merged_any_remote_materialized(void)
 
 static bool merge_claim_held = false;
 
+/* Volatile custody of the one object this process actually linked. No disk
+ * claim, node id or restarted process can reconstruct this ownership. */
+typedef struct MergeClaimCustody {
+	ResourceOwner owner;
+	pid_t pid;
+	uint64 boot;
+	uint64 serial;
+	bool revoked;
+	int fd;
+	int directory_fd;
+	struct stat file;
+	struct stat directory;
+	ClusterMergeClaimFile image;
+	char path[MAXPGPATH];
+	char directory_path[MAXPGPATH];
+} MergeClaimCustody;
+
+static MergeClaimCustody merge_claim_custody = { .fd = -1, .directory_fd = -1 };
+static uint64 merge_claim_serial;
+static bool merge_claim_callback_registered;
+
+static void
+merge_claim_resource_release(ResourceReleasePhase phase, bool isCommit, bool isTopLevel, void *arg)
+{
+	(void)isCommit;
+	(void)isTopLevel;
+	(void)arg;
+	/* Retain the disk claim and descriptor debt. Cleanup is never takeover. */
+	if (phase == RESOURCE_RELEASE_BEFORE_LOCKS && merge_claim_custody.owner != NULL
+		&& merge_claim_custody.owner == CurrentResourceOwner)
+		merge_claim_custody.revoked = true;
+}
+
+static bool
+merge_claim_same_file(const struct stat *a, const struct stat *b)
+{
+	return S_ISREG(a->st_mode) && S_ISREG(b->st_mode) && a->st_dev == b->st_dev
+		&& a->st_ino == b->st_ino && a->st_uid == b->st_uid
+		&& a->st_size == sizeof(ClusterMergeClaimFile) && b->st_size == a->st_size;
+}
+
+static bool
+merge_claim_custody_current(void)
+{
+	MergeClaimCustody *c = &merge_claim_custody;
+	struct stat held, named, directory, named_directory;
+	char image[sizeof(ClusterMergeClaimFile) + 1];
+	char path[MAXPGPATH];
+	int n;
+
+	if (!merge_claim_held || c->revoked)
+		return false;
+	if (cluster_shared_data_dir == NULL || c->image.node != cluster_node_id
+		|| c->image.sysid != GetSystemIdentifier()) {
+		c->revoked = true;
+		return false;
+	}
+	n = snprintf(path, sizeof(path), "%s/global/pgrac_merge.claim", cluster_shared_data_dir);
+	if (c->owner == NULL || c->owner != CurrentResourceOwner || c->pid != getpid()
+		|| c->boot == 0 || c->boot != cluster_qvotec_get_self_incarnation()
+		|| c->serial == 0 || c->serial != merge_claim_serial || c->fd < 0 || c->directory_fd < 0
+		|| n < 0 || (size_t)n >= sizeof(path) || strcmp(path, c->path) != 0
+		|| fstat(c->directory_fd, &directory) != 0
+		|| lstat(c->directory_path, &named_directory) != 0
+		|| !S_ISDIR(directory.st_mode) || !S_ISDIR(named_directory.st_mode)
+		|| directory.st_dev != c->directory.st_dev || directory.st_ino != c->directory.st_ino
+		|| named_directory.st_dev != c->directory.st_dev
+		|| named_directory.st_ino != c->directory.st_ino
+		|| fstat(c->fd, &held) != 0 || !merge_claim_same_file(&held, &c->file)
+		|| fstatat(c->directory_fd, "pgrac_merge.claim", &named, AT_SYMLINK_NOFOLLOW) != 0
+		|| !merge_claim_same_file(&held, &named)
+		|| pg_pread(c->fd, image, sizeof(image), 0) != sizeof(c->image)
+		|| memcmp(image, &c->image, sizeof(c->image)) != 0
+		/* Descriptor I/O can yield. Recheck the original name and owner
+		 * before consuming its bytes; CF serializes protocol mutations. */
+		|| fstatat(c->directory_fd, "pgrac_merge.claim", &named, AT_SYMLINK_NOFOLLOW) != 0
+		|| !merge_claim_same_file(&held, &named)
+		|| lstat(c->directory_path, &named_directory) != 0
+		|| !S_ISDIR(named_directory.st_mode)
+		|| named_directory.st_dev != c->directory.st_dev
+		|| named_directory.st_ino != c->directory.st_ino
+		|| c->revoked || c->owner != CurrentResourceOwner || c->pid != getpid()
+		|| c->boot != cluster_qvotec_get_self_incarnation()) {
+		c->revoked = true;
+		return false;
+	}
+	return true;
+}
+
+/* Use the original CF serialization domain only for claim metadata. Never
+ * hold it while waiting on another claimant, scanning WAL or acquiring IR.
+ * Startup uses the existing blocking CF owner, not LMON/LMS poll APIs. */
+static uint64
+merge_claim_cf_enter(void)
+{
+	uint64 cookie;
+
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
+		|| !cluster_cf_lock(ExclusiveLock))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					errmsg("recovery claim CF serialization is unavailable")));
+	cookie = cluster_cf_owner_cookie(ExclusiveLock);
+	if (cookie == 0 || !cluster_cf_held_is_clusterwide(ExclusiveLock)) {
+		(void)cluster_cf_unlock_confirmed(ExclusiveLock);
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					errmsg("recovery claim requires clusterwide CF ownership")));
+	}
+	return cookie;
+}
+
+static void
+merge_claim_cf_exit(uint64 cookie)
+{
+	if (cookie == 0 || cluster_cf_owner_cookie(ExclusiveLock) != cookie
+		|| cluster_cf_unlock_confirmed(ExclusiveLock) != CLUSTER_CF_RELEASE_CONFIRMED) {
+		merge_claim_custody.revoked = true;
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					errmsg("recovery claim CF release was not confirmed")));
+	}
+}
+
+static bool
+merge_claim_try_publish(const char *tmp, const char *claim, const char *gdir)
+{
+	uint64 cookie;
+	struct stat existing;
+	volatile bool published = false;
+	volatile int saved_errno = 0;
+
+	/* Observation only: a visible claim means peer wait, not a CF-X retry
+	 * on every tick. The actual link still runs under CF and cannot adopt. */
+	if (fstatat(merge_claim_custody.directory_fd, "pgrac_merge.claim", &existing,
+				AT_SYMLINK_NOFOLLOW) == 0) {
+		errno = EEXIST;
+		return false;
+	}
+	if (errno != ENOENT)
+		return false;
+	cookie = merge_claim_cf_enter();
+	PG_TRY();
+	{
+		MergeClaimCustody *c = &merge_claim_custody;
+
+		if (c->revoked || c->owner != CurrentResourceOwner || c->pid != getpid()
+			|| c->boot != cluster_qvotec_get_self_incarnation())
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						errmsg("recovery claim original owner changed before publication")));
+		if (link(tmp, claim) == 0) {
+			merge_claim_held = true; /* Debt precedes any throwing operation. */
+			if (!merge_claim_custody_current())
+				ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+							errmsg("new recovery claim lost its original file identity")));
+			fsync_fname(gdir, true);
+			(void)unlink(tmp);
+			if (!merge_claim_custody_current()
+				|| cluster_cf_owner_cookie(ExclusiveLock) != cookie
+				|| !cluster_cf_held_is_clusterwide(ExclusiveLock))
+				ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+							errmsg("recovery claim publication authority changed during synchronization")));
+			published = true;
+		} else
+			saved_errno = errno;
+	}
+	PG_FINALLY();
+	{
+		merge_claim_cf_exit(cookie);
+	}
+	PG_END_TRY();
+	errno = saved_errno;
+	return published;
+}
+
 static int
 merge_claim_path(char *buf, size_t buf_size)
 {
@@ -466,7 +640,8 @@ merge_claim_regime_configured(void)
 void
 cluster_recovery_merge_claim_acquire_blocking(void)
 {
-	ClusterMergeClaimFile f;
+	ClusterMergeClaimFile f = { 0 };
+	MergeClaimCustody *custody = &merge_claim_custody;
 	char claim[MAXPGPATH];
 	char tmp[MAXPGPATH];
 	char gdir[MAXPGPATH];
@@ -477,13 +652,25 @@ cluster_recovery_merge_claim_acquire_blocking(void)
 	long deadband_ms;
 	int32 wait_holder = -1;
 
-	if (!merge_claim_regime_configured() || merge_claim_held)
+	if (merge_claim_held) {
+		if (!merge_claim_custody_current())
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						errmsg("shared-regime recovery claim original owner is no longer current")));
 		return;
+	}
+	if (!merge_claim_regime_configured())
+		return;
+	if (CurrentResourceOwner == NULL || cluster_qvotec_get_self_incarnation() == 0
+		|| merge_claim_serial == UINT64_MAX)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					errmsg("shared-regime recovery claim has no current owner identity")));
+
 
 	if (merge_claim_path(claim, sizeof(claim)) < 0)
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
 						errmsg("shared-regime recovery claim path too long")));
-	ret = snprintf(tmp, sizeof(tmp), "%s.n%d.tmp", claim, cluster_node_id);
+	ret = snprintf(tmp, sizeof(tmp), "%s.n%d.p%d.b%llu.tmp", claim, cluster_node_id,
+		(int)getpid(), (unsigned long long)cluster_qvotec_get_self_incarnation());
 	if (ret < 0 || (size_t)ret >= sizeof(tmp))
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
 						errmsg("shared-regime recovery claim tmp path too long")));
@@ -506,16 +693,31 @@ cluster_recovery_merge_claim_acquire_blocking(void)
 	cluster_merge_claim_build(&f, cluster_node_id, sysid);
 
 	/* Durable per-node tmp image; link() below publishes it atomically. */
-	fd = OpenTransientFile(tmp, O_CREAT | O_TRUNC | O_WRONLY | PG_BINARY);
+	fd = OpenTransientFile(tmp, O_CREAT | O_EXCL | O_RDWR | O_NOFOLLOW | O_CLOEXEC | PG_BINARY);
 	if (fd < 0)
 		ereport(FATAL, (errcode_for_file_access(),
 						errmsg("could not create recovery claim tmp file \"%s\": %m", tmp)));
 	if (write(fd, &f, sizeof(f)) != sizeof(f) || pg_fsync(fd) != 0)
 		ereport(FATAL, (errcode_for_file_access(),
 						errmsg("could not write recovery claim tmp file \"%s\": %m", tmp)));
-	if (CloseTransientFile(fd) != 0)
-		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("could not close recovery claim tmp file \"%s\": %m", tmp)));
+	memset(custody, 0, sizeof(*custody));
+	custody->fd = fd;
+	custody->directory_fd = OpenTransientFile(gdir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	custody->owner = CurrentResourceOwner;
+	custody->pid = getpid();
+	custody->boot = cluster_qvotec_get_self_incarnation();
+	custody->serial = ++merge_claim_serial;
+	custody->image = f;
+	strlcpy(custody->path, claim, sizeof(custody->path));
+	strlcpy(custody->directory_path, gdir, sizeof(custody->directory_path));
+	if (custody->directory_fd < 0 || fstat(fd, &custody->file) != 0
+		|| fstat(custody->directory_fd, &custody->directory) != 0
+		|| !merge_claim_same_file(&custody->file, &custody->file))
+		ereport(FATAL, (errcode_for_file_access(), errmsg("could not retain recovery claim identity: %m")));
+	if (!merge_claim_callback_registered) {
+		RegisterResourceReleaseCallback(merge_claim_resource_release, NULL);
+		merge_claim_callback_registered = true;
+	}
 
 	deadband_ms = (long)cluster_cssd_heartbeat_interval_ms
 				  * (long)Max(cluster_cssd_dead_deadband_factor, 1);
@@ -523,10 +725,11 @@ cluster_recovery_merge_claim_acquire_blocking(void)
 		deadband_ms = 5000;
 
 	for (;;) {
-		if (link(tmp, claim) == 0) {
-			fsync_fname(gdir, true);
-			(void)unlink(tmp);
-			merge_claim_held = true;
+		if (custody->revoked || custody->owner != CurrentResourceOwner
+			|| custody->pid != getpid() || custody->boot != cluster_qvotec_get_self_incarnation())
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						errmsg("recovery claim original owner changed while waiting")));
+		if (merge_claim_try_publish(tmp, claim, gdir)) {
 			if (wait_holder >= 0)
 				ereport(LOG,
 						(errmsg("shared-regime recovery claim acquired by node %d after waiting "
@@ -575,21 +778,13 @@ cluster_recovery_merge_claim_acquire_blocking(void)
 								 "file, and restart.")));
 			memcpy(&cur, buf, sizeof(cur));
 
-			if (cur.node == cluster_node_id) {
-				/*
-				 * Our own claim from a previous incarnation that crashed
-				 * mid-recovery.  A node id maps to one pgdata, so no other
-				 * process can be running under it -- adopt the claim and
-				 * re-recover (the merge is SCN-idempotent over partially
-				 * flushed pages).
-				 */
-				(void)unlink(tmp);
-				merge_claim_held = true;
-				ereport(LOG, (errmsg("shared-regime recovery claim re-adopted by node %d (previous "
-									 "incarnation crashed while recovering; re-running recovery)",
-									 cluster_node_id)));
-				return;
-			}
+			if (cur.node == cluster_node_id)
+				ereport(FATAL,
+						(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						 errmsg("shared-regime recovery claim belongs to a previous owner on node %d",
+								cluster_node_id),
+						 errdetail("E1 recovery cannot adopt a persistent claim using a node identifier."),
+						 errhint("Retain the claim and its recovery inputs; automatic takeover is unavailable.")));
 
 			/* Held by a peer: wait for its release, watching its liveness. */
 			if (cur.node != wait_holder) {
@@ -616,11 +811,7 @@ cluster_recovery_merge_claim_acquire_blocking(void)
 					 errdetail("The claim holder has been unreachable on the interconnect for "
 							   "%ld ms while its claim persists on the shared root.",
 							   dead_ms),
-					 errhint("The claim is never taken over without fencing (the dead holder's "
-							 "in-flight writes cannot be proven ceased).  Restart node %d so it "
-							 "re-adopts and completes its recovery, or verify it is down, remove "
-							 "\"%s\" from the shared root, and restart this node.",
-							 wait_holder, claim)));
+					 errhint("Retain the claim and its recovery inputs; E1 does not adopt a dead owner's claim.")));
 
 		HandleStartupProcInterrupts();
 		pg_usleep(MERGE_CLAIM_POLL_INTERVAL_MS * 1000L);
@@ -635,7 +826,7 @@ cluster_recovery_merge_claim_acquire_blocking(void)
 bool
 cluster_recovery_merge_claim_is_held(void)
 {
-	return merge_claim_held;
+	return merge_claim_custody_current();
 }
 
 /*
@@ -644,25 +835,38 @@ cluster_recovery_merge_claim_is_held(void)
 void
 cluster_recovery_merge_claim_release_if_held(void)
 {
-	char claim[MAXPGPATH];
-	char gdir[MAXPGPATH];
-	int ret;
+	MergeClaimCustody *custody = &merge_claim_custody;
+	uint64 cookie;
 
 	if (!merge_claim_held)
 		return;
+	cookie = merge_claim_cf_enter();
+	PG_TRY();
+	{
+		if (!merge_claim_custody_current()
+			|| cluster_cf_owner_cookie(ExclusiveLock) != cookie
+			|| !cluster_cf_held_is_clusterwide(ExclusiveLock))
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						errmsg("cannot release recovery claim without its original owner and file identity")));
+		/* All claim publication/retirement uses this same CF domain. The
+		 * original held directory also prevents namespace redirection. */
+		if (unlinkat(custody->directory_fd, "pgrac_merge.claim", 0) != 0)
+			ereport(FATAL, (errcode_for_file_access(), errmsg("could not release recovery claim: %m")));
+		if (pg_fsync(custody->directory_fd) != 0)
+			ereport(ERROR, (errcode_for_file_access(), errmsg("could not synchronize released recovery claim: %m")));
+		if (CloseTransientFile(custody->fd) != 0)
+			ereport(FATAL, (errcode_for_file_access(), errmsg("could not close released recovery claim: %m")));
+		custody->fd = -1;
+		if (CloseTransientFile(custody->directory_fd) != 0)
+			ereport(FATAL, (errcode_for_file_access(), errmsg("could not close released claim directory: %m")));
+		custody->directory_fd = -1;
+	}
+	PG_FINALLY();
+	{
+		merge_claim_cf_exit(cookie);
+	}
+	PG_END_TRY();
 	merge_claim_held = false;
-
-	if (merge_claim_path(claim, sizeof(claim)) < 0)
-		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
-						errmsg("shared-regime recovery claim path too long")));
-	if (unlink(claim) != 0 && errno != ENOENT)
-		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("could not release recovery claim \"%s\": %m", claim),
-						errhint("A claim this node cannot remove would wedge every peer's "
-								"crash recovery; shared storage must support unlink here.")));
-	ret = snprintf(gdir, sizeof(gdir), "%s/global", cluster_shared_data_dir);
-	if (ret > 0 && (size_t)ret < sizeof(gdir))
-		fsync_fname(gdir, true);
 	ereport(LOG, (errmsg("shared-regime recovery claim released by node %d "
 						 "(recovered content durable after the end-of-recovery checkpoint)",
 						 cluster_node_id)));
