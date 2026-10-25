@@ -618,10 +618,12 @@ undo_horizon_send_v2(int32 peer, const ClusterUndoCleanerActiveSample *active,
 	report.h_contributor_kind = h->contributor_kind;
 	report.h_contributor_token = h->contributor_token;
 	report.sender_interval_ms = (uint32)cluster_lmon_main_loop_interval;
+	/* Peer identity observation may overlap retirement of the copied local
+	 * source. Finish with its full original check before sequence debit. */
 	if (!cluster_heap_freeze_report_v2_encode(&report, bytes)
-		|| !cluster_undo_cleaner_active_sample_current(active)
 		|| !cluster_sf_peer_capability_generation_matches(
-			peer, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2, generation))
+			peer, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2, generation)
+		|| !cluster_undo_cleaner_active_sample_current(active))
 		return;
 	UndoHorizonShmem->report_sequence = report.report_sequence;
 	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_UNDO_HORIZON, peer, bytes, sizeof(bytes));

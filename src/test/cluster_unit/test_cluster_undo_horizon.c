@@ -177,6 +177,7 @@ static ClusterUndoCleanerActiveSample test_sender_sample;
 static bool test_sender_sample_valid, test_sender_sample_current = true;
 static uint64 test_registration_generation = 1;
 static bool test_sender_change_on_recheck;
+static unsigned test_sender_source_change_on_capability;
 static unsigned test_sender_captures, test_sender_current_checks;
 static unsigned test_clock_reads, test_clock_change_at, test_clock_change_kind;
 static unsigned test_v2_sends;
@@ -303,6 +304,21 @@ cluster_sf_peer_capability_generation_matches(int32 peer, uint32 required, uint3
 	if (test_v2_cap_change_on_recheck) {
 		test_v2_cap_generation++;
 		test_v2_cap_change_on_recheck = false;
+	}
+	/* A successful final peer observation may overlap local-source retirement.
+	 * Keep its return/capability identity valid to isolate source currentness. */
+	if (test_sender_source_change_on_capability != 0) {
+		unsigned change = test_sender_source_change_on_capability;
+
+		test_sender_source_change_on_capability = 0;
+		if (change == 1)
+			test_sender_sample_current = false;
+		else if (change == 2)
+			test_sender_sample.sample_id++;
+		else if (change == 3)
+			test_v2_fence.admission_publication_seq += 2;
+		else if (change == 4)
+			test_registration_generation++;
 	}
 	return peer == test_v2_peer && required == PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2
 		   && test_horizon_capable && generation == test_v2_cap_generation;
@@ -1127,6 +1143,7 @@ reset_v2_sender(void)
 	test_sender_sample.worker_pid = 100;
 	test_sender_sample_valid = test_sender_sample_current = test_v1_capable = true;
 	test_sender_change_on_recheck = false;
+	test_sender_source_change_on_capability = 0;
 	test_sender_captures = test_sender_current_checks = 0;
 	test_horizon_cut = test_horizon_seal = test_retention_mrp = false;
 	test_retention_sample_valid = true;
@@ -3426,10 +3443,48 @@ UT_TEST(test_cohort_full_local_check_survives_end_clock_source_retirement)
 	}
 }
 
+/* Actual original V2 sender: its last peer capability read must precede
+ * the retained local worker/lease/admission/census check and sequence debit. */
+UT_TEST(test_v2_sender_rejects_source_retired_during_final_capability_read)
+{
+	for (unsigned fault = 1; fault <= 4; fault++) {
+		ClusterUndoCleanerActiveSample active, saved;
+		ClusterUndoRetentionSample history, saved_history;
+		unsigned captures, cuts;
+
+		reset_v2_sender();
+		active = saved = test_sender_sample;
+		history = saved_history = test_retention_sample;
+		captures = test_sender_captures;
+		cuts = test_retention_sample_calls;
+		test_sender_source_change_on_capability = fault;
+		undo_horizon_send_v2(test_v2_peer, &active, &history);
+		UT_ASSERT_EQ(test_sender_source_change_on_capability, 0);
+		UT_ASSERT_EQ(test_v2_sends, 0);
+		UT_ASSERT_EQ(test_horizon_store.report_sequence, 0);
+		UT_ASSERT_EQ(test_sender_captures, captures);
+		UT_ASSERT_EQ(test_retention_sample_calls, cuts);
+		UT_ASSERT_EQ(memcmp(&active, &saved, sizeof(active)), 0);
+		UT_ASSERT_EQ(memcmp(&history, &saved_history, sizeof(history)), 0);
+
+		/* Only a new source-consistent fixture publication may be sent.
+		 * This repairs controlled leaves, not a production retention grant. */
+		test_sender_sample_current = true;
+		test_sender_sample.admission_fence = test_v2_fence;
+		test_sender_sample.scan.unqualified_registration_generation = test_registration_generation;
+		active = test_sender_sample;
+		undo_horizon_send_v2(test_v2_peer, &active, &history);
+		UT_ASSERT_EQ(test_v2_sends, 1);
+		UT_ASSERT_EQ(test_horizon_store.report_sequence, 1);
+		UT_ASSERT_EQ(test_v2_sent.report_sequence, 1);
+		UT_ASSERT_EQ(test_v2_sent.f_sample_id, active.sample_id);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(119);
+	UT_PLAN(120);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -3552,6 +3607,7 @@ main(void)
 	UT_RUN(test_saved_cohort_end_clock_follows_post_peer_local_current_check);
 	UT_RUN(test_cohort_observe_end_clock_follows_final_local_current_check);
 	UT_RUN(test_cohort_full_local_check_survives_end_clock_source_retirement);
+	UT_RUN(test_v2_sender_rejects_source_retired_during_final_capability_read);
 	UT_DONE();
 	free(procArray);
 	return ut_failed_count == 0 ? 0 : 1;
