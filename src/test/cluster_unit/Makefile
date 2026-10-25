@@ -578,6 +578,7 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		test_cluster_relmap_tt_retention.inc \
 		test_cluster_relmap_tt_terminal.inc \
 		test_cluster_relmap_active_hook.inc \
+		test_cluster_relmap_active_hook_terminal.inc \
 		test_cluster_relmap_native_tt.o test_cluster_relmap_native_tt_durable.o \
 		test_cluster_relmap_native_lock.inc test_cluster_relmap_native_lock.h \
 		test_cluster_relmap_native_lock.o \
