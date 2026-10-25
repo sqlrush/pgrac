@@ -2573,6 +2573,39 @@ test_cluster_heap_ctrc_ready.inc: $(top_srcdir)/src/backend/cluster/cluster_term
 	     END { if (found != 8 || done != 8 || ready_found != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Exact private local state used by the real initializer.
+test_cluster_heap_ctrc_init_state.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk '/^#define CTRC_CLEANER_(DISPATCH_BATCH|ORIGINS) / { print; constants++ } \
+	     /^typedef (enum CtrcCleanerScanKind|struct (CtrcCleanerOriginHint|CtrcCleanerBatch)) / { emit=1; types++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     /^static .* Ctrc(Batch;|OriginHint\[|DispatchCursor;|WorkerId =|LocalProgress;|LocalPasses;)/ { print; globals++ } \
+	     END { if (constants != 2 || types != 3 || done != 3 || globals != 6 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_ctrc_lwlock_init.inc: $(top_srcdir)/src/backend/storage/lmgr/lwlock.c Makefile
+	@awk '/^#define LW_FLAG_RELEASE_OK / { print; constants++ } \
+	     /^LWLockInitialize\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (constants != 1 || found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_ctrc_init.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk '/^cluster_ctrc_shmem_init\(/ { matches++; if (matches == 1) { print "static void"; emit=1; found++ } } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (matches != 2 || found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Actual shared-origin producer/readers; count both stat definitions but emit
+# only the production body. The production preprocessor branch stays intact.
+test_cluster_heap_ctrc_origin.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk '/^(cluster_ctrc_origin_original_full_xid_exact|ctrc_origin_index|cluster_ctrc_origin_original_full_xid_shared|cluster_ctrc_origin_open_reserved)\(/ { print "static bool"; emit=1; found++ } \
+	     /^(cluster_ctrc_origin_reserve_entry|cluster_ctrc_origin_reserve_active)\(/ { print "static ClusterCtrcOriginReserveResult"; emit=1; found++ } \
+	     /^cluster_ctrc_origin_open_active\(/ { print "static ClusterCtrcOriginOpenResult"; emit=1; found++ } \
+	     /^cluster_ctrc_stat_bump\(/ { stats++; if (stats == 1) { print "static void"; emit=1; found++ } } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (stats != 2 || found != 8 || done != 8 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_ctrc_begin.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
 	@awk '/^cluster_ctrc_active_scan_begin\(/ { print "static bool"; emit=1; found++ } \
 	     emit { print } emit && /^}/ { emit=0; done++ } \
@@ -2601,8 +2634,11 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_ctrc_registration.inc \
 		test_cluster_heap_ctrc_attachment.inc \
 		test_cluster_heap_ctrc_ready.inc \
+		test_cluster_heap_ctrc_init_state.inc test_cluster_heap_ctrc_lwlock_init.inc \
+		test_cluster_heap_ctrc_init.inc $(top_srcdir)/src/include/storage/proclist.h \
+		$(top_srcdir)/src/include/storage/proclist_types.h $(top_srcdir)/src/include/storage/lwlock.h \
 		test_cluster_heap_ctrc_types.inc test_cluster_heap_ctrc_begin.inc \
-		test_cluster_heap_ctrc_step.inc \
+		test_cluster_heap_ctrc_step.inc test_cluster_heap_ctrc_origin.inc \
 		test_cluster_heap_freeze_cohort_current.inc \
 		test_cluster_heap_freeze_cohort_backend.inc \
 		test_cluster_heap_freeze_worker_current.inc \
@@ -5988,8 +6024,11 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_freeze_pgproc_sample.inc test_cluster_heap_freeze_pgproc_sample.inc.tmp
 	rm -f test_cluster_heap_ctrc_types.inc test_cluster_heap_ctrc_types.inc.tmp test_cluster_heap_ctrc_begin.inc test_cluster_heap_ctrc_begin.inc.tmp
 	rm -f test_cluster_heap_ctrc_step.inc test_cluster_heap_ctrc_step.inc.tmp
+	rm -f test_cluster_heap_ctrc_origin.inc test_cluster_heap_ctrc_origin.inc.tmp
 	rm -f test_cluster_heap_ctrc_attachment.inc test_cluster_heap_ctrc_attachment.inc.tmp
 	rm -f test_cluster_heap_ctrc_ready.inc test_cluster_heap_ctrc_ready.inc.tmp
+	rm -f test_cluster_heap_ctrc_init_state.inc test_cluster_heap_ctrc_init_state.inc.tmp
+	rm -f test_cluster_heap_ctrc_lwlock_init.inc test_cluster_heap_ctrc_lwlock_init.inc.tmp test_cluster_heap_ctrc_init.inc test_cluster_heap_ctrc_init.inc.tmp
 	rm -f test_cluster_heap_freeze_stripe_future.inc test_cluster_heap_freeze_stripe_future.inc.tmp
 	rm -f test_cluster_heap_freeze_lease_current.inc test_cluster_heap_freeze_lease_current.inc.tmp
 	rm -f test_cluster_space_cache_insert.inc test_cluster_space_cache_delete.inc test_cluster_space_cache_allocation.inc test_cluster_space_cache_update.inc
