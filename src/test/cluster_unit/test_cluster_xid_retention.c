@@ -24,6 +24,7 @@ int xid_allocation_original_main(void);
 #include "test_cluster_xid_retention_runtime.inc"
 
 static bool retention_held, retention_active, retention_recompute;
+static bool retention_owner_begin;
 static unsigned retention_acquires, retention_final_observations, retention_fault;
 static unsigned retention_error_code, retention_origin;
 static uint64 retention_sysid, retention_dbinc;
@@ -36,7 +37,7 @@ retention_native_lock_acquire(LWLock *lock, LWLockMode mode)
 		held = true;
 	} else {
 		if (relmap_runtime_shmem == NULL || lock != &relmap_runtime_shmem->lock
-			|| !held || retention_held || mode != LW_EXCLUSIVE) lock_errors++;
+			|| (!held && !retention_owner_begin) || retention_held || mode != LW_EXCLUSIVE) lock_errors++;
 		retention_held = true;
 		retention_acquires++;
 	}
@@ -58,7 +59,7 @@ retention_native_lock_release(LWLock *lock)
 		}
 	} else {
 		if (relmap_runtime_shmem == NULL || lock != &relmap_runtime_shmem->lock
-			|| !retention_held || !held) lock_errors++;
+			|| !retention_held || (!held && !retention_owner_begin)) lock_errors++;
 		retention_held = false;
 	}
 	RESUME_INTERRUPTS();
@@ -214,6 +215,11 @@ retention_call(bool child, unsigned expected_error)
 	return result;
 }
 
+#ifndef CLUSTER_XID_RETENTION_CALLER_BODY
+#define CLUSTER_XID_RETENTION_CALLER_BODY "test_cluster_xid_retention_caller.inc"
+#endif
+#include CLUSTER_XID_RETENTION_CALLER_BODY
+
 UT_TEST(retention_final_callback_publishes_real_top_and_subxid)
 {
 	for (unsigned i = 0; i < 4; i++) {
@@ -335,7 +341,7 @@ UT_TEST(retention_preserves_original_stop_and_lease_gates)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(16);
 	UT_RUN(native_subxid_publication_preserves_the_final_cache_slot);
 	UT_RUN(native_publication_keeps_the_full_era_across_raw_rollover);
 	UT_RUN(no_storage_or_procarray_mutation_before_reservation);
@@ -349,6 +355,9 @@ main(void)
 	UT_RUN(retention_slru_error_never_observes_or_publishes_issuance);
 	UT_RUN(retention_recomputed_candidate_is_checked_again);
 	UT_RUN(retention_preserves_original_stop_and_lease_gates);
+	UT_RUN(original_owner_capture_and_begin_use_the_native_assignment);
+	UT_RUN(original_namespace_pin_survives_other_prepare_cancellation);
+	UT_RUN(original_owner_refusal_keeps_existing_native_pins);
 	free(relmap_runtime_shmem);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;

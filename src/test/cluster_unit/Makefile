@@ -5231,6 +5231,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_xid_retention_owner.inc test_cluster_xid_retention_owner.inc.tmp
 	rm -f test_cluster_data_sync_policy.inc test_cluster_sync_providers.inc \
 		test_cluster_sync_dispatch.inc test_cluster_sync_smgr.inc
 	rm -f test_cluster_tt_rollback_entry.inc
@@ -9270,17 +9271,32 @@ test_cluster_xid_allocation: test_cluster_xid_allocation.c unit_test.h \
 test_cluster_xid_retention_runtime.inc: $(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c Makefile
 	awk '/^typedef struct RelmapRetentionRuntimeShmem / { emit=1; types++ } \
 	     /^static RelmapRetentionRuntimeShmem \*relmap_runtime_shmem;/ { print; pointers++ } \
+	     /^static struct \{/ { emit=1; owners++ } \
 	     /^relmap_runtime_(origin_matches|allocation_guard)\(/ { print "static ClusterRelmapRetentionResult"; emit=1; functions++ } \
 	     /^cluster_relmap_retention_runtime_allocation_(check|publish)_v2\(/ { print "ClusterRelmapRetentionResult"; emit=1; functions++ } \
+	     /^cluster_relmap_retention_runtime_begin_v2\(/ { print "ClusterRelmapRetentionResult"; emit=1; functions++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (types != 1 || pointers != 1 || functions != 4) exit 1 }' $< > $@.tmp
+	     END { if (types != 1 || pointers != 1 || owners != 1 || functions != 5) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_xid_retention_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c Makefile
+	awk '/^relmap_owner_(context|matches_v2)\(/ { print "static bool"; emit=1; functions++ } \
+	     /^cluster_relmap_owner_(capture|matches)_v2\(/ { print "bool"; emit=1; functions++ } \
+	     /^cluster_relmap_owner_retention_begin_v2\(/ { print "ClusterRelmapRetentionResult"; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } END { if (functions != 5) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_xid_retention: test_cluster_xid_retention.c test_cluster_xid_allocation.c \
 		test_cluster_xid_publication.inc test_cluster_xid_allocation.inc \
+		test_cluster_xid_retention_caller.inc test_cluster_xid_retention_owner.inc \
 		test_cluster_xid_retention_runtime.inc unit_test.h $(CLUSTER_XID_STRIPE_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention.c \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_recovery.c \
+		$(top_srcdir)/src/include/cluster/cluster_membership.h \
+		$(top_srcdir)/src/include/cluster/cluster_qvotec.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_lock.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
