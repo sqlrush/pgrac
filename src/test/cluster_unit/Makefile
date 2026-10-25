@@ -2004,6 +2004,14 @@ test_cluster_heap_freeze_policy_sample.inc: $(top_srcdir)/src/backend/cluster/cl
 	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Original outer cohort-current entry and its fixed required-member predicate.
+test_cluster_heap_freeze_cohort_current.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c Makefile
+	@awk '/^undo_horizon_v2_required\(/ { print "static bool"; emit=1; found++ } \
+	     /^cluster_heap_freeze_cohort_current\(/ { print "static ClusterHeapFreezeCohortStatus"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 2 || done != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 # Original source-current predicate, private to the native writer fixture.
 test_cluster_heap_freeze_policy_current.inc: $(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c Makefile
 	@awk '/^cluster_heap_freeze_policy_sample_current_v1\(/ { print "static bool"; emit=1; found++ } \
@@ -2019,6 +2027,10 @@ test_cluster_heap_ctrc_registration.inc: $(top_srcdir)/src/backend/cluster/clust
 
 test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_ctrc_registration.inc \
+		test_cluster_heap_freeze_cohort_current.inc \
+		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_horizon.h \
+		$(top_srcdir)/src/include/cluster/cluster_conf.h \
 		test_cluster_heap_freeze_policy_current.inc \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
 		test_cluster_vacuum_observed_bounds.inc test_cluster_freeze_writer_context.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) test_cluster_heap_maintenance_policy.inc unit_test.h \
@@ -4921,6 +4933,7 @@ clean distclean maintainer-clean:
 		test_cluster_heap_freeze_xmin_apply.inc \
 		test_cluster_heap_freeze_policy_current.inc test_cluster_heap_freeze_policy_current.inc.tmp
 	rm -f test_cluster_heap_freeze_policy_sample.inc test_cluster_heap_freeze_policy_sample.inc.tmp
+	rm -f test_cluster_heap_freeze_cohort_current.inc test_cluster_heap_freeze_cohort_current.inc.tmp
 	rm -f test_cluster_space_cache_insert.inc test_cluster_space_cache_delete.inc test_cluster_space_cache_allocation.inc test_cluster_space_cache_update.inc
 	rm -f test_cluster_space_hint_owners.inc test_cluster_space_census_types.inc test_cluster_space_census_mutation.inc test_cluster_space_cleanout_product.o
 	rm -f test_cluster_space_fsm_hint.inc
