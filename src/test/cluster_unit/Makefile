@@ -9715,6 +9715,10 @@ test_cluster_cold_recovery_io_core.o: $(top_srcdir)/src/backend/cluster/cluster_
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_census.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 
+test_cluster_cold_recovery_io: CLUSTER_COLD_IO_PUBLISHER_O = test_cluster_cold_checkpoint_publisher.o
+test_cluster_cold_recovery_io: test_cluster_cold_checkpoint_publisher.o \
+		test_cluster_cold_checkpoint_publisher.h test_cluster_cold_io_checkpoint_publisher.inc
+
 test_cluster_cold_recovery_io test_cluster_cold_recovery_complete: %: %.c unit_test.h \
 		test_cluster_cold_recovery_io_boundary.h test_cluster_cold_recovery_io_core.o \
 		test_cluster_cold_recovery_xid_core.o \
@@ -9724,6 +9728,7 @@ test_cluster_cold_recovery_io test_cluster_cold_recovery_complete: %: %.c unit_t
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_census.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< test_cluster_cold_recovery_io_core.o \
+		$(CLUSTER_COLD_IO_PUBLISHER_O) \
 		test_cluster_cold_recovery_xid_core.o \
 		$(CLUSTER_COLD_PLAN_O) $(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o \
 		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
