@@ -8,11 +8,75 @@ import wait_graph_capture as graph
 
 
 class GraphTests(unittest.TestCase):
+    def test_deadline_receiver_drains_and_marks_missing_sequence_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            receiver=graph.DeadlineReceiver(1,0,Path(directory)/'deadline.log')
+            sender=graph.socket.socket(graph.socket.AF_INET,graph.socket.SOCK_DGRAM)
+            address=receiver.socket.getsockname()
+            sender.sendto(b'node=1 observer=42 sequence=1 PGRAC_WAIT_DEADLINE_BEGIN node=1\n',address)
+            sender.sendto(b'node=1 observer=42 sequence=2 PGRAC_WAIT_DEADLINE_END node=1 dropped=0\n',address)
+            result=receiver.close()
+            self.assertTrue(result['complete']);self.assertEqual(result['observers'][0]['records'],2)
+            receiver=graph.DeadlineReceiver(1,0,Path(directory)/'missing.log')
+            address=receiver.socket.getsockname()
+            sender.sendto(b'node=1 observer=42 sequence=1 PGRAC_WAIT_DEADLINE_BEGIN node=1\n',address)
+            sender.sendto(b'node=1 observer=42 sequence=3 PGRAC_WAIT_DEADLINE_END node=1 dropped=0\n',address)
+            self.assertFalse(receiver.close()['complete'])
+            sender.close()
+
+    def test_pcm_holder_maps_real_claim_to_its_wait_without_inventing_service(self):
+        actor=dict(node=2,pid=29,procno=7,backend_id=2,backend_start=8,
+                   proc_generation=31,stable=True,enqueue=dict(lifetime=9,resid=[1,2,3,0,242,1]))
+        tag=[1,2,3,4,1]
+        resource=dict(kind='pcm',node=2,tag=tag,status=0,stable=True,
+                      local_owner=dict(valid=True,state=2,highest_generation=93,
+                          handle=dict(tag=tag,requester=2,procno=7,generation=93),
+                          claim=dict(pid=29,proc_generation=31,owner_generation=93)))
+        holders=graph.pcm_claimed_holders(tag,[resource],{(2,7):actor})
+        self.assertEqual(holders[0]['process'],graph.identity(actor))
+        self.assertEqual(holders[0]['own_waits']['enqueue'],actor['enqueue'])
+        self.assertFalse(holders[0]['wait_dependency_proven'])
+        for change in ('pid','proc_generation','owner_generation'):
+            bad=copy.deepcopy(resource);bad['local_owner']['claim'][change]+=1
+            self.assertEqual(graph.pcm_claimed_holders(tag,[bad],{(2,7):actor}),[])
+        resource['stable']=False
+        self.assertEqual(graph.pcm_claimed_holders(tag,[resource],{(2,7):actor}),[])
+
+    def test_native_lifetimes_keep_halfchain_despite_diagnostic_updates(self):
+        row = dict(node=1,pid=5182,procno=90,backend_id=3,backend_start=4,
+                   proc_generation=32, revision=125085,
+                   locks=[dict(buffer=9,tag=[1,2,3,0,354],mode=0,lifetime=71)],
+                   grants=[dict(resid=[1,2,3,0,242,1],holder=[1,90,1,95210],mode=7,lifetime=72)],
+                   pcm_wait=dict(tag=[1,2,3,4,1],binding=1224,request_seq=5812,
+                                 lifetime=73,snapshot=30234))
+        final=copy.deepcopy(row);final['revision']+=40;final['pcm_wait']['snapshot']+=20
+        stable=graph.stabilize_owner(row,final)
+        self.assertTrue(stable['stable'])
+        self.assertEqual(stable['locks'],row['locks']);self.assertEqual(stable['grants'],row['grants'])
+        self.assertEqual(stable['pcm_wait'],row['pcm_wait'])
+        self.assertEqual(stable.get('unproven_resources'),[])
+        self.assertNotIn('stable',row)  # Raw cuts remain immutable.
+
+    def test_native_lifetimes_reject_aba_zero_missing_and_changed_target(self):
+        row=dict(node=1,pid=5182,procno=90,backend_id=3,backend_start=4,proc_generation=32,
+                 locks=[dict(buffer=9,tag=[1,2,3,0,354],mode=0,lifetime=71)],
+                 retry_wait=dict(buffer=10,tag=None,lifetime=72))
+        for token in (0,None,73):
+            final=copy.deepcopy(row);final['locks'][0]['lifetime']=token
+            stable=graph.stabilize_owner(row,final)
+            self.assertTrue(stable['stable']);self.assertEqual(stable['locks'],[])
+            self.assertTrue(stable['unproven_resources'])
+        final=copy.deepcopy(row);final['retry_wait']['buffer']+=1
+        stable=graph.stabilize_owner(row,final)
+        self.assertIsNone(stable['retry_wait']);self.assertEqual(len(stable['locks']),1)
+        final['proc_generation']+=1
+        self.assertFalse(graph.stabilize_owner(row,final)['stable'])
+
     def pcm_bridge_fixture(self):
-        wait = dict(tag=[1,2,3,4,5], requester=0, request_seq=9, formation=7,
+        wait = dict(lifetime=41, tag=[1,2,3,4,5], requester=0, request_seq=9, formation=7,
                     master_session=8, base=1, expected_master=2, r4=12,
                     requester_connection=15, ingress_connection=16, transport_known=True)
-        service = dict(wait, authority=3, ordered_lane=4, source=1, state=2, mode=0,
+        service = dict(wait, lifetime=42, authority=3, ordered_lane=4, source=1, state=2, mode=0,
                        source_candidate=1, retain_pi_if_dirty=1, common_flags=1,
                        common_outcome=0, wire_sender_connection=42)
         queue = dict(wait, queue_kind=1, source=1, phase=2, head=5, enqueue_order=6,
@@ -580,7 +644,7 @@ class GraphTests(unittest.TestCase):
                     return graph.json.dumps(dict(kind='pcm', node=self.node, status=2))
                 return graph.json.dumps(dict(node=self.node, epoch_begin=7, epoch_end=7, stats={},
                     owners=[dict(node=self.node, pid=10+self.node, procno=1, backend_id=-1,
-                                 backend_start=0, proc_generation=17, pcm_service=dict(tag=tag))]))
+                                 backend_start=0, proc_generation=17, pcm_service=dict(tag=tag,lifetime=43))]))
             def close(self): pass
         with tempfile.TemporaryDirectory() as directory, patch.object(graph, 'PsqlReader', Reader):
             session = graph.CaptureSession([dict(node=n, connstr=str(n)) for n in range(4)], Path(directory)/'capture')
@@ -788,7 +852,7 @@ class GraphTests(unittest.TestCase):
                     return graph.json.dumps(dict(kind='enqueue', node=self.node, resid=resid, status=1))
                 return graph.json.dumps(dict(node=self.node, epoch_begin=7, epoch_end=7, stats={},
                     owners=[dict(node=self.node, pid=10+self.node, procno=1, backend_id=2, backend_start=3, proc_generation=17,
-                                 grants=[dict(resid=resid, holder=[self.node,1,7,101], mode=7)])]))
+                                 grants=[dict(resid=resid, holder=[self.node,1,7,101], mode=7,lifetime=44)])]))
             def close(self): pass
         with tempfile.TemporaryDirectory() as directory, patch.object(graph, 'PsqlReader', Reader):
             session = graph.CaptureSession([dict(node=n, connstr=str(n)) for n in range(4)],

@@ -44,6 +44,9 @@
 
 UT_DEFINE_GLOBALS();
 bool cluster_trace_cleanup;
+static unsigned deadline_observations;
+void cluster_content_trace_deadline_dump(uint32 reason)
+{ UT_ASSERT_EQ(reason, CLUSTER_NORMAL_STOP_FAILURE_DEADLINE); deadline_observations++; }
 volatile uint32 CritSectionCount;
 
 
@@ -758,6 +761,7 @@ UT_TEST(test_postmaster_only_monotonic_intent_without_lwlock)
 
 UT_TEST(test_normal_stop_first_failure_is_sticky_even_after_protocol_close)
 {
+	unsigned before_deadline = deadline_observations;
 	reset_region();
 	cluster_clean_leave_shmem_init();
 	UT_ASSERT(cluster_normal_stop_postmaster_request());
@@ -766,6 +770,7 @@ UT_TEST(test_normal_stop_first_failure_is_sticky_even_after_protocol_close)
 	cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_CLEANER);
 	cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_NONE);
 	cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_DEADLINE);
+	UT_ASSERT_EQ(deadline_observations, before_deadline + 1);
 	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_CLEANER);
 	UT_ASSERT(!cluster_normal_stop_protocol_closed());
 	UT_ASSERT(!cluster_normal_stop_postmaster_request());

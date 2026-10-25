@@ -211,7 +211,8 @@ json_tag(StringInfo out, const BufferTag *tag)
 static void
 json_lock(StringInfo out, const ClusterContentTraceLock *lock)
 {
-	appendStringInfo(out, "{\"buffer\":%d,\"mode\":%d,\"tag\":", lock->buffer, lock->mode);
+	appendStringInfo(out, "{\"lifetime\":" UINT64_FORMAT ",\"buffer\":%d,\"mode\":%d,\"tag\":",
+		lock->lifetime, lock->buffer, lock->mode);
 	if (lock->tag_known) json_tag(out, &lock->tag);
 	else appendStringInfoString(out, "null");
 	appendStringInfoChar(out, '}');
@@ -236,9 +237,9 @@ json_pcm_admission(StringInfo out, const ClusterWaitPcmAdmission *row)
 }
 
 static void
-json_wait(StringInfo out, const ClusterWaitTrace *row)
+json_wait(StringInfo out, const ClusterWaitTrace *row, uint64 lifetime)
 {
-	appendStringInfoString(out, "{\"tag\":");
+	appendStringInfo(out, "{\"lifetime\":" UINT64_FORMAT ",\"tag\":", lifetime);
 	if (row->tag_known) json_tag(out, &row->tag);
 	else appendStringInfoString(out, "null");
 #define WG_U(f) appendStringInfo(out, ",\"" #f "\":" UINT64_FORMAT, (uint64)row->f)
@@ -304,7 +305,7 @@ json_pcm_owner(StringInfo out, const ClusterWaitGraphPcmOwner *owner)
 		h->ref.assertion.requester_node, h->ref.formation, h->ref.acquisition_generation,
 		h->master_session_incarnation, h->r4_record_generation, h->buffer_ownership_generation,
 		h->reservation_token, h->owner_generation, h->absolute_deadline_us, h->owner_procno);
-	json_wait(out, &owner->successor);
+	json_wait(out, &owner->successor, 0);
 	appendStringInfoChar(out, '}');
 }
 
@@ -331,7 +332,7 @@ json_pcm_block(StringInfo out, const ClusterWaitGraphPcmBlock *block)
 	for (uint32 i = 0; i < sizeof(block->payload); i++)
 		appendStringInfo(out, "%02x", block->payload[i]);
 	appendStringInfoString(out, "\",\"request\":");
-	if (block->decoded) json_wait(out, &block->request);
+	if (block->decoded) json_wait(out, &block->request, 0);
 	else appendStringInfoString(out, "null");
 	appendStringInfoChar(out, '}');
 }
@@ -394,9 +395,9 @@ json_owner(const ClusterContentTraceOwner *row, void *context)
 		const ClusterContentTraceGrant *grant = &row->grants[i];
 		if (i != 0) appendStringInfoChar(out, ',');
 		appendStringInfo(out, "{\"resid\":[%u,%u,%u,%u,%u,%u],\"holder\":[%u,%u,"
-			UINT64_FORMAT "," UINT64_FORMAT "],\"mode\":%d}", grant->field1, grant->field2,
+			UINT64_FORMAT "," UINT64_FORMAT "],\"mode\":%d,\"lifetime\":" UINT64_FORMAT "}", grant->field1, grant->field2,
 			grant->field3, grant->field4, grant->type, grant->lockmethodid, grant->holder_node,
-			grant->holder_procno, grant->holder_epoch, grant->holder_request, grant->mode);
+			grant->holder_procno, grant->holder_epoch, grant->holder_request, grant->mode, grant->lifetime);
 	}
 	appendStringInfoString(out, "],\"native_wait\":");
 	if (row->native_waiting) json_lock(out, &row->native_wait);
@@ -407,19 +408,25 @@ json_owner(const ClusterContentTraceOwner *row, void *context)
 		appendStringInfo(out, "{\"resid\":[%u,%u,%u,%u,%u,%u],\"mode\":%d,"
 			"\"current_mode\":%d,\"convert\":%s,\"holder\":[%u,%u," UINT64_FORMAT
 			"," UINT64_FORMAT "],\"request\":" UINT64_FORMAT ",\"epoch\":" UINT64_FORMAT
-			",\"wait_seq\":" UINT64_FORMAT "}", wait->field1, wait->field2, wait->field3,
+			",\"wait_seq\":" UINT64_FORMAT ",\"lifetime\":" UINT64_FORMAT "}", wait->field1, wait->field2, wait->field3,
 			wait->field4, wait->type, wait->lockmethodid, wait->mode, wait->current_mode,
 			wait->convert ? "true" : "false", wait->holder_node, wait->holder_procno,
-			wait->holder_epoch, wait->holder_request, wait->request, wait->epoch, wait->wait_seq);
+			wait->holder_epoch, wait->holder_request, wait->request, wait->epoch, wait->wait_seq, wait->lifetime);
 	} else appendStringInfoString(out, "null");
 	appendStringInfoString(out, ",\"pcm_wait\":");
-	if (row->wait_mask & (1U << CLCONTENT_PCM)) json_wait(out, &row->waits[CLCONTENT_PCM]);
+	if (row->wait_mask & (1U << CLCONTENT_PCM)) json_wait(out, &row->waits[CLCONTENT_PCM], row->wait_lifetimes[CLCONTENT_PCM]);
 	else appendStringInfoString(out, "null");
 	appendStringInfoString(out, ",\"pcm_service\":");
-	if (row->pcm_serving) json_wait(out, &row->pcm_service);
+	if (row->pcm_serving) json_wait(out, &row->pcm_service, row->service_lifetime);
 	else appendStringInfoString(out, "null");
 	appendStringInfoString(out, ",\"tx_wait\":");
-	if (row->wait_mask & (1U << CLCONTENT_TX)) json_wait(out, &row->waits[CLCONTENT_TX]);
+	if (row->wait_mask & (1U << CLCONTENT_TX)) json_wait(out, &row->waits[CLCONTENT_TX], row->wait_lifetimes[CLCONTENT_TX]);
+	else appendStringInfoString(out, "null");
+	appendStringInfoString(out, ",\"ko_wait\":");
+	if (row->wait_mask & (1U << CLCONTENT_KO)) json_wait(out, &row->waits[CLCONTENT_KO], row->wait_lifetimes[CLCONTENT_KO]);
+	else appendStringInfoString(out, "null");
+	appendStringInfoString(out, ",\"retry_wait\":");
+	if (row->wait_mask & (1U << CLCONTENT_RETRY)) json_wait(out, &row->waits[CLCONTENT_RETRY], row->wait_lifetimes[CLCONTENT_RETRY]);
 	else appendStringInfoString(out, "null");
 	appendStringInfoChar(out, '}');
 }
@@ -604,12 +611,12 @@ test_pgrac_wait_graph_block(PG_FUNCTION_ARGS)
 	json_context(&out, "begin", &begin);
 	json_context(&out, "end", &end);
 	appendStringInfoString(&out, ",\"view\":");
-	json_wait(&out, &snapshot->view);
+	json_wait(&out, &snapshot->view, 0);
 	appendStringInfoString(&out, ",\"local_owner\":"); json_pcm_owner(&out, &snapshot->local_owner);
 	appendStringInfoString(&out, ",\"queue\":[");
 	for (uint32 i = 0; i < snapshot->nqueued; i++) {
 		if (i != 0) appendStringInfoChar(&out, ',');
-		json_wait(&out, &snapshot->queue[i]);
+		json_wait(&out, &snapshot->queue[i], 0);
 	}
 	appendStringInfo(&out, "],\"omitted_blocks\":%u,\"blocks\":[", snapshot->omitted_blocks);
 	for (uint32 i = 0; i < snapshot->nblocks; i++) {

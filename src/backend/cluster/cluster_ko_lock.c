@@ -43,6 +43,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_content_trace.h"
 
 #include "access/xlog.h" /* RecoveryInProgress */
 #include "access/xact.h"
@@ -2064,11 +2065,21 @@ cluster_ko_peer_admission_begin_v3(RelFileLocator locator, ClusterKoPeerAdmissio
 void
 cluster_ko_peer_admission_wait(long timeout_ms)
 {
-	if (ko_state == NULL)
+	if (ko_state == NULL) {
+		cluster_content_trace_wait_clear(CLCONTENT_KO);
 		return;
+	}
 	ConditionVariablePrepareToSleep(&ko_state->peer_admission_wait_cv);
+	PG_TRY();
+	{
 	(void) ConditionVariableTimedSleep(&ko_state->peer_admission_wait_cv,
 									 timeout_ms, WAIT_EVENT_PCM_BLOCK_CONVERT_WAIT);
+	}
+	PG_FINALLY();
+	{
+		cluster_content_trace_wait_clear(CLCONTENT_KO);
+	}
+	PG_END_TRY();
 	ConditionVariableCancelSleep();
 }
 

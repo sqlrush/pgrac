@@ -182,8 +182,17 @@ cluster_bufmgr_ko_native_read_sample(RelFileLocator locator, ForkNumber fork, Bl
  * The bounded latch poll is a fallback; only the next admission sample can
  * authorize publication. Waiting alone never becomes a transaction error. */
 static void
-cluster_bufmgr_ko_read_wait(void)
+cluster_bufmgr_ko_read_wait(RelFileLocator locator, ForkNumber fork,
+	BlockNumber block, uint64 revision)
 {
+	ClusterWaitTrace wait = {0};
+	if (cluster_trace_tx_identity) {
+		InitBufferTag(&wait.tag, &locator, fork, block);
+		wait.tag_known = true; /* InvalidBlockNumber denotes this object/fork. */
+		wait.site = CLWAIT_SITE_KO_ADMISSION;
+		wait.binding = revision; /* Native caller sample; zero stays unknown. */
+		cluster_content_trace_wait_set(CLCONTENT_KO, &wait);
+	}
 	CHECK_FOR_INTERRUPTS();
 	cluster_ko_peer_admission_wait(100L);
 	CHECK_FOR_INTERRUPTS();
@@ -2972,6 +2981,8 @@ static void cluster_bufmgr_pcm_direct_init_snapshot_locked(BufferDesc *buf, uint
 														   bool page_is_new,
 														   ClusterPcmDirectInitSnapshot *out);
 
+static inline int32 GetPrivateRefCount(Buffer buffer);
+
 static bool
 cluster_bufmgr_resource_x_wait_retry(LWLock *content_lock, int32 buffer_id,
 								 uint32 wait_index, bool *barrier_refused)
@@ -3001,8 +3012,51 @@ cluster_bufmgr_resource_x_wait_retry(LWLock *content_lock, int32 buffer_id,
 	}
 	delay_ms = 2L << Min(wait_index, UINT32_C(4));
 	CHECK_FOR_INTERRUPTS();
+	if (cluster_trace_tx_identity) {
+		ClusterWaitTrace wait = {0};
+		wait.site = CLWAIT_SITE_RESOURCE_X_RETRY;
+		wait.buffer = buffer_id + 1;
+		wait.formation = gate.formation;
+		wait.binding = gate.freeze_generation;
+		wait.phase = gate.phase;
+		wait.private_pins = buffer_id >= 0 && buffer_id < NBuffers ?
+			GetPrivateRefCount(buffer_id + 1) : 0;
+		/* Some retry callers failed to pin. An observed slot generation is
+		 * then explicitly not bound to the caller's requested block. */
+		if (buffer_id >= 0 && buffer_id < NBuffers && ClusterPcmOwnArray != NULL) {
+			BufferDesc *buf = GetBufferDescriptor(buffer_id);
+			uint32 state = pg_atomic_read_u32(&buf->state);
+			/* One original header-lock CAS, never a spin/retry. The tuple
+			 * belongs to this sampled slot; only a caller pin binds its tag. */
+			if (!(state & BM_LOCKED) && pg_atomic_compare_exchange_u32(
+				&buf->state, &state, state | BM_LOCKED)) {
+				wait.entry_known = true;
+				wait.buffer_state = state;
+				wait.own_state = buf->pcm_state;
+				wait.own_generation = cluster_pcm_own_gen_get(buffer_id);
+				wait.reservation = cluster_pcm_own_reservation_token_get(buffer_id);
+				wait.own_flags = cluster_pcm_own_flags_get(buffer_id);
+				wait.writer_activation = cluster_pcm_own_writer_activation_token_get(buffer_id);
+				wait.rx_activation = cluster_pcm_own_resource_x_activation_generation_get(buffer_id);
+				if ((state & BM_TAG_VALID) && wait.private_pins > 0) {
+					wait.tag = buf->tag;
+					wait.tag_known = true;
+				}
+				UnlockBufHdr(buf, state | BM_LOCKED);
+			}
+		}
+		cluster_content_trace_wait_set(CLCONTENT_RETRY, &wait);
+	}
+	PG_TRY();
+	{
 	(void) WaitLatch(MyLatch, WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, delay_ms,
 					 WAIT_EVENT_PCM_BLOCK_CONVERT_WAIT);
+	}
+	PG_FINALLY();
+	{
+		cluster_content_trace_wait_clear(CLCONTENT_RETRY);
+	}
+	PG_END_TRY();
 	CHECK_FOR_INTERRUPTS();
 	return true;
 }
@@ -6173,7 +6227,7 @@ retry_lookup:
 		LWLockRelease(newPartitionLock);
 #ifdef USE_PGRAC_CLUSTER
 		if (pin_result == PIN_BUFFER_LOOKUP_OBJECT_RETRY) {
-			cluster_bufmgr_ko_read_wait();
+			cluster_bufmgr_ko_read_wait(smgr->smgr_rlocator.locator, forkNum, blockNum, ko_sample.revision);
 			goto retry_lookup;
 		}
 		if (pin_result == PIN_BUFFER_LOOKUP_RETRY)
@@ -6219,7 +6273,7 @@ retry_lookup:
 	LWLockRelease(newPartitionLock);
 #ifdef USE_PGRAC_CLUSTER
 	if (check_ko && ko_sample.revision == 0) {
-		cluster_bufmgr_ko_read_wait();
+		cluster_bufmgr_ko_read_wait(smgr->smgr_rlocator.locator, forkNum, blockNum, ko_sample.revision);
 		goto retry_lookup;
 	}
 #endif
@@ -6279,7 +6333,7 @@ retry_lookup:
 		LWLockRelease(newPartitionLock);
 #ifdef USE_PGRAC_CLUSTER
 		if (pin_result == PIN_BUFFER_LOOKUP_OBJECT_RETRY) {
-			cluster_bufmgr_ko_read_wait();
+			cluster_bufmgr_ko_read_wait(smgr->smgr_rlocator.locator, forkNum, blockNum, ko_sample.revision);
 			goto retry_lookup;
 		}
 		if (pin_result == PIN_BUFFER_LOOKUP_RETRY)
@@ -6338,7 +6392,7 @@ retry_lookup:
 		LWLockRelease(newPartitionLock);
 		UnpinBuffer(victim_buf_hdr);
 		StrategyFreeBuffer(victim_buf_hdr);
-		cluster_bufmgr_ko_read_wait();
+		cluster_bufmgr_ko_read_wait(smgr->smgr_rlocator.locator, forkNum, blockNum, ko_sample.revision);
 		goto retry_lookup;
 	}
 #endif
@@ -8550,7 +8604,7 @@ ExtendBufferedRelShared(BufferManagerRelation bmr, ForkNumber fork, BufferAccess
 			if (!retry)
 				ereport(ERROR, (errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
 								errmsg("cannot qualify the shared extension object owner")));
-			cluster_bufmgr_ko_read_wait();
+			cluster_bufmgr_ko_read_wait(locator, fork, InvalidBlockNumber, 0);
 		}
 	}
 	PG_TRY();

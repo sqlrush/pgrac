@@ -16,6 +16,11 @@
 #include "storage/shmem.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include "postmaster/postmaster.h"
 typedef struct ContentTraceSlot {
 	pg_atomic_uint32 busy;
 	pg_atomic_uint64 revision;
@@ -35,6 +40,37 @@ static bool pair_recording;
 static int pair_slot = -1;
 static Buffer pair_buffers[2];
 static uint64 service_serial, service_current;
+static uint64 lifetime_serial;
+static uint32 held_lifetime_count;
+static int deadline_fd = -1;
+static struct sockaddr_in deadline_address;
+static uint32 deadline_sequence, deadline_dropped;
+static struct { LWLock *lock; uint64 lifetime; } held_lifetimes[CLUSTER_CONTENT_TRACE_LOCKS];
+
+static uint64
+content_trace_lifetime(void)
+{
+	return lifetime_serial == PG_UINT64_MAX ? 0 : ++lifetime_serial;
+}
+
+/* Only called from the original successful native acquisition hook. A held
+ * list enumeration by an unrelated publisher must never invent a lifetime. */
+static void
+content_trace_acquired(LWLock *lock, LWLockMode mode, void *target)
+{
+	uint32 empty = CLUSTER_CONTENT_TRACE_LOCKS;
+	(void)mode;
+	if (lock != target) return;
+	for (uint32 i = 0; i < CLUSTER_CONTENT_TRACE_LOCKS; i++) {
+		if (held_lifetimes[i].lock == lock) return;
+		if (held_lifetimes[i].lock == NULL) empty = i;
+	}
+	if (empty < CLUSTER_CONTENT_TRACE_LOCKS) {
+		held_lifetimes[empty].lock = lock;
+		held_lifetimes[empty].lifetime = content_trace_lifetime();
+		held_lifetime_count++;
+	}
+}
 
 static Size
 content_trace_size(void)
@@ -120,6 +156,9 @@ content_trace_collect_lock(LWLock *lock, LWLockMode mode, void *context)
 		return;
 	}
 	item = &owner->locks[owner->nlocks++];
+	for (uint32 i = 0; i < CLUSTER_CONTENT_TRACE_LOCKS; i++)
+		if (held_lifetimes[i].lock == lock)
+			item->lifetime = held_lifetimes[i].lifetime;
 	item->buffer = BufferDescriptorGetBuffer(buf);
 	item->mode = mode;
 	item->tag_known = (pg_atomic_read_u32(&buf->state) & BM_TAG_VALID) != 0;
@@ -136,11 +175,20 @@ content_trace_publish(bool entering_wait)
 	ContentTraceSlot *slot;
 	uint32 expected = 0;
 	uint64 revision;
+	bool was_live = local_owner.pid != 0;
 
+	if (!cluster_trace_tx_identity) {
+		memset(held_lifetimes, 0, sizeof(held_lifetimes));
+		held_lifetime_count = 0;
+		/* A missed shared publication must not preserve private diagnostic
+		 * resources for a later re-enable to resurrect. */
+		memset(&local_owner, 0, sizeof(local_owner));
+		service_current = 0;
+	}
 	if (content_trace == NULL || MyProc == NULL ||
 		MyProc->pgprocno >= content_trace->nslots)
 		return;
-	if (!cluster_trace_tx_identity && local_owner.pid == 0)
+	if (!cluster_trace_tx_identity && !was_live)
 		return;
 	slot = &content_trace->slots[MyProc->pgprocno];
 	revision = pg_atomic_fetch_add_u64(&slot->revision, 1) + 1;
@@ -172,8 +220,11 @@ cluster_content_trace_lock_changed(LWLock *lock)
 	if (!cluster_trace_tx_identity && local_owner.pid == 0)
 		return;
 	/* Do not read the released buffer's tag: another backend can rebind it. */
-	if (BufferDescriptorFromContentLock(lock) != NULL)
+	if (BufferDescriptorFromContentLock(lock) != NULL) {
+		if (cluster_trace_tx_identity)
+			ForEachLWLockHeldByMe(content_trace_acquired, lock);
 		content_trace_publish(false);
+	}
 }
 
 /* Invalidate before native ownership changes. A delayed post-release
@@ -181,6 +232,15 @@ cluster_content_trace_lock_changed(LWLock *lock)
 void
 cluster_content_trace_lock_invalidating(LWLock *lock)
 {
+	if (BufferDescriptorFromContentLock(lock) == NULL) return;
+	/* Retire even when disabled or a shared publication is missed. */
+	for (uint32 i = 0; held_lifetime_count != 0 && i < CLUSTER_CONTENT_TRACE_LOCKS; i++)
+		if (held_lifetimes[i].lock == lock)
+		{
+			memset(&held_lifetimes[i], 0, sizeof(held_lifetimes[i]));
+			held_lifetime_count--;
+			break;
+		}
 	if ((!cluster_trace_tx_identity && local_owner.pid == 0) ||
 		content_trace == NULL || MyProc == NULL ||
 		MyProc->pgprocno >= content_trace->nslots ||
@@ -199,6 +259,7 @@ cluster_content_trace_native_wait_set(LWLock *lock, LWLockMode mode)
 		(buf = BufferDescriptorFromContentLock(lock)) == NULL)
 		return;
 	memset(wait, 0, sizeof(*wait));
+	wait->lifetime = content_trace_lifetime();
 	wait->buffer = BufferDescriptorGetBuffer(buf);
 	wait->mode = mode;
 	/* The original native caller owns its pin; no remote tag inference. */
@@ -229,6 +290,7 @@ cluster_content_trace_enqueue_wait_set(const ClusterResId *resid,
 	if (!cluster_trace_tx_identity || resid == NULL || holder == NULL)
 		return;
 	memset(wait, 0, sizeof(*wait));
+	wait->lifetime = content_trace_lifetime();
 	wait->field1 = resid->field1;
 	wait->field2 = resid->field2;
 	wait->field3 = resid->field3;
@@ -284,6 +346,7 @@ cluster_content_trace_enqueue_granted(const ClusterResId *resid,
 		if (i == local_owner.ngrants) local_owner.ngrants++;
 		row = &local_owner.grants[i];
 		memset(row, 0, sizeof(*row));
+		row->lifetime = content_trace_lifetime();
 		row->field1 = resid->field1; row->field2 = resid->field2; row->field3 = resid->field3;
 		row->field4 = resid->field4; row->type = resid->type; row->lockmethodid = resid->lockmethodid;
 		row->holder_node = holder->node_id; row->holder_procno = holder->procno;
@@ -330,6 +393,19 @@ cluster_content_trace_wait_set(ClusterContentTraceWait kind,
 {
 	if (!cluster_trace_tx_identity || kind < 0 || kind >= CLCONTENT_NWAITS || wait == NULL)
 		return;
+	/* A polling sample may change counters/entry details within one actual
+	 * wait. A changed caller resource/request/binding starts a new episode. */
+	{
+		const ClusterWaitTrace *old = &local_owner.waits[kind];
+		if (!(local_owner.wait_mask & (1U << kind)) ||
+			old->tag_known != wait->tag_known ||
+			(old->tag_known && !content_trace_tag_equal(&old->tag, &wait->tag)) ||
+			old->buffer != wait->buffer || old->binding != wait->binding ||
+			old->request_seq != wait->request_seq || old->formation != wait->formation ||
+			old->master_session != wait->master_session || old->r4 != wait->r4 ||
+			old->mode != wait->mode || old->site != wait->site)
+			local_owner.wait_lifetimes[kind] = content_trace_lifetime();
+	}
 	local_owner.waits[kind] = *wait;
 	local_owner.wait_mask |= 1U << kind;
 	content_trace_publish(true);
@@ -342,6 +418,8 @@ cluster_content_trace_wait_clear(ClusterContentTraceWait kind)
 		(local_owner.wait_mask & (1U << kind)) == 0)
 		return;
 	local_owner.wait_mask &= ~(1U << kind);
+	local_owner.wait_lifetimes[kind] = 0;
+	memset(&local_owner.waits[kind], 0, sizeof(local_owner.waits[kind]));
 	content_trace_publish(false);
 }
 
@@ -375,6 +453,7 @@ cluster_content_trace_service_begin(ClusterContentTraceServiceScope *scope,
 	if (service_serial == PG_UINT64_MAX) {
 		service_current = 0;
 		local_owner.pcm_serving = false;
+		local_owner.service_lifetime = 0;
 		memset(&local_owner.pcm_service, 0, sizeof(local_owner.pcm_service));
 		content_trace_publish(false);
 		return;
@@ -383,12 +462,14 @@ cluster_content_trace_service_begin(ClusterContentTraceServiceScope *scope,
 	scope->previous_serial = service_current;
 	scope->previous_active = local_owner.pcm_serving;
 	scope->previous = local_owner.pcm_service;
+	scope->previous_lifetime = local_owner.service_lifetime;
 	service_current = scope->serial;
 	local_owner.pcm_service = *service;
 	if (!service->service_admission.supplied && scope->previous_active
 		&& content_trace_same_pcm_service(service, &scope->previous))
 		local_owner.pcm_service.service_admission = scope->previous.service_admission;
 	local_owner.pcm_serving = true;
+	local_owner.service_lifetime = content_trace_lifetime();
 	content_trace_publish(false);
 }
 
@@ -401,6 +482,7 @@ cluster_content_trace_service_end(ClusterContentTraceServiceScope *scope)
 		service_current = scope->previous_serial;
 		local_owner.pcm_serving = scope->previous_active;
 		local_owner.pcm_service = scope->previous;
+		local_owner.service_lifetime = scope->previous_lifetime;
 		content_trace_publish(false);
 	}
 	scope->serial = 0;
@@ -417,6 +499,9 @@ cluster_content_trace_error_cleanup(void)
 	pair_recording = false;
 	pair_slot = -1;
 	local_owner.wait_mask = 0;
+	memset(local_owner.wait_lifetimes, 0, sizeof(local_owner.wait_lifetimes));
+	memset(local_owner.waits, 0, sizeof(local_owner.waits));
+	local_owner.service_lifetime = 0;
 	local_owner.native_waiting = local_owner.enqueue_waiting = false;
 	service_current = 0;
 	local_owner.pcm_serving = false;
@@ -605,6 +690,129 @@ content_trace_native_proc(uint32 slot, ClusterContentTraceNativeProc *out)
 	out->backend_id = *(volatile const BackendId *)&proc->backendId;
 	out->generation = *(volatile const uint64 *)&proc->cluster_grd_generation;
 	out->wait_event_info = *(volatile const uint32 *)&proc->wait_event_info;
+}
+
+static void content_trace_deadline_send(const char *fmt,...) pg_attribute_printf(1,2);
+
+/* Dedicated local UDP socket, O_NONBLOCK plus MSG_DONTWAIT. Never stdio,
+ * logging, a file write or a retry while the original stop lock is held.
+ * Receiver must check sequence/END/dropped; missing datagrams are UNKNOWN. */
+static void
+content_trace_deadline_send(const char *fmt,...)
+{
+	char row[2048];
+	va_list ap;
+	int prefix, n;
+	prefix = snprintf(row, sizeof(row), "node=%d observer=%d sequence=%u ",
+		cluster_node_id, MyProcPid, ++deadline_sequence);
+	va_start(ap, fmt);
+	n = vsnprintf(row + prefix, sizeof(row) - prefix, fmt, ap);
+	va_end(ap);
+	if (n < 0 || n >= (int)sizeof(row) - prefix ||
+		sendto(deadline_fd, row, prefix + n, MSG_DONTWAIT,
+			(struct sockaddr *)&deadline_address, sizeof(deadline_address)) != prefix + n)
+		deadline_dropped++;
+}
+
+static void
+content_trace_deadline_owner(const ClusterContentTraceOwner *owner, void *arg)
+{
+	(void)arg;
+	content_trace_deadline_send("PGRAC_WAIT_DEADLINE_OWNER node=%d pid=%d proc=%u generation=" UINT64_FORMAT
+		" revision=" UINT64_FORMAT " native_wait=%d native_lifetime=" UINT64_FORMAT
+		" native_buffer=%d enqueue_wait=%d enqueue_lifetime=" UINT64_FORMAT
+		" service=%d service_lifetime=" UINT64_FORMAT "\n", cluster_node_id,
+		owner->pid, owner->procno, owner->proc_generation, owner->revision,
+		owner->native_waiting, owner->native_wait.lifetime, owner->native_wait.buffer,
+		owner->enqueue_waiting, owner->enqueue.lifetime, owner->pcm_serving,
+		owner->service_lifetime);
+	for (uint32 i = 0; i < owner->nlocks + (owner->native_waiting ? 1U : 0U); i++) {
+		const ClusterContentTraceLock *lock = i < owner->nlocks ? &owner->locks[i] : &owner->native_wait;
+		content_trace_deadline_send("PGRAC_WAIT_DEADLINE_CONTENT node=%d pid=%d waiting=%d lifetime=" UINT64_FORMAT
+			" buffer=%d mode=%d tag_known=%d tag=%u/%u/%u/%d/%u\n", cluster_node_id,
+			owner->pid, i == owner->nlocks, lock->lifetime, lock->buffer, lock->mode,
+			lock->tag_known, lock->tag.spcOid, lock->tag.dbOid, lock->tag.relNumber,
+			lock->tag.forkNum, lock->tag.blockNum);
+	}
+	if (owner->enqueue_waiting) {
+		const ClusterContentTraceEnqueue *w = &owner->enqueue;
+		content_trace_deadline_send("PGRAC_WAIT_DEADLINE_ENQUEUE node=%d pid=%d lifetime=" UINT64_FORMAT
+			" resid=%u/%u/%u/%u/%u/%u mode=%d holder=%u/%u/" UINT64_FORMAT "/" UINT64_FORMAT
+			" request=" UINT64_FORMAT " epoch=" UINT64_FORMAT " wait_seq=" UINT64_FORMAT "\n",
+			cluster_node_id, owner->pid, w->lifetime, w->field1, w->field2, w->field3,
+			w->field4, w->type, w->lockmethodid, w->mode, w->holder_node, w->holder_procno,
+			w->holder_epoch, w->holder_request, w->request, w->epoch, w->wait_seq);
+	}
+	if (owner->pcm_serving) {
+		const ClusterWaitTrace *w = &owner->pcm_service;
+		content_trace_deadline_send("PGRAC_WAIT_DEADLINE_SERVICE node=%d pid=%d lifetime=" UINT64_FORMAT
+			" site=%d tag_known=%d tag=%u/%u/%u/%d/%u requester=%d request=" UINT64_FORMAT
+			" formation=" UINT64_FORMAT " session=" UINT64_FORMAT " r4=" UINT64_FORMAT "\n",
+			cluster_node_id, owner->pid, owner->service_lifetime, w->site, w->tag_known,
+			w->tag.spcOid, w->tag.dbOid, w->tag.relNumber, w->tag.forkNum, w->tag.blockNum,
+			w->requester, w->request_seq, w->formation, w->master_session, w->r4);
+	}
+	for (uint32 i = 0; i < owner->ngrants; i++) {
+		const ClusterContentTraceGrant *w = &owner->grants[i];
+		content_trace_deadline_send("PGRAC_WAIT_DEADLINE_GRANT node=%d pid=%d lifetime=" UINT64_FORMAT
+			" resid=%u/%u/%u/%u/%u/%u mode=%d holder=%u/%u/" UINT64_FORMAT "/" UINT64_FORMAT "\n",
+			cluster_node_id, owner->pid, w->lifetime, w->field1, w->field2, w->field3, w->field4,
+			w->type, w->lockmethodid, w->mode, w->holder_node, w->holder_procno, w->holder_epoch, w->holder_request);
+	}
+	for (uint32 i = 0; i < CLCONTENT_NWAITS; i++) {
+		const ClusterWaitTrace *w = &owner->waits[i];
+		if (!(owner->wait_mask & (1U << i))) continue;
+		content_trace_deadline_send("PGRAC_WAIT_DEADLINE_TARGET node=%d pid=%d proc=%u kind=%u lifetime=" UINT64_FORMAT
+			" site=%u buffer=%d tag_known=%d tag=%u/%u/%u/%d/%u binding=" UINT64_FORMAT
+			" request=" UINT64_FORMAT " formation=" UINT64_FORMAT " session=" UINT64_FORMAT "\n",
+			cluster_node_id, owner->pid, owner->procno, i, owner->wait_lifetimes[i],
+			w->site, w->buffer, w->tag_known, w->tag.spcOid, w->tag.dbOid,
+			w->tag.relNumber, w->tag.forkNum, w->tag.blockNum, w->binding,
+			w->request_seq, w->formation, w->master_session);
+	}
+}
+
+void
+cluster_content_trace_deadline_dump(uint32 reason)
+{
+	static bool emitted;
+	ClusterContentTraceWalkStats stats;
+	int saved_errno = errno;
+	if (!cluster_trace_tx_identity || emitted || ProcGlobal == NULL) return;
+	emitted = true;
+	deadline_fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (deadline_fd < 0) { errno = saved_errno; return; }
+	if (fcntl(deadline_fd, F_SETFL, O_NONBLOCK) < 0) {
+		close(deadline_fd); deadline_fd = -1; errno = saved_errno; return;
+	}
+	memset(&deadline_address, 0, sizeof(deadline_address));
+	deadline_address.sin_family = AF_INET;
+	deadline_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	/* Local diagnostic UDP uses the node's existing TCP port number. */
+	deadline_address.sin_port = htons((uint16)PostPortNumber);
+	content_trace_deadline_send("PGRAC_WAIT_DEADLINE_BEGIN node=%d observer=%d reason=%u slots=%u termination_receipt=UNKNOWN\n",
+		cluster_node_id, MyProcPid, reason, ProcGlobal->allProcCount);
+	for (uint32 i = 0; i < ProcGlobal->allProcCount; i++) {
+		ClusterContentTraceNativeProc a, b;
+		content_trace_native_proc(i, &a);
+		pg_read_barrier();
+		content_trace_native_proc(i, &b);
+		if (a.pid == 0 && b.pid == 0) continue;
+		content_trace_deadline_send("PGRAC_WAIT_DEADLINE_PROC node=%d slot=%u pid=%d backend=%d generation=" UINT64_FORMAT
+			" wait=%u after_pid=%d after_backend=%d after_generation=" UINT64_FORMAT
+			" after_wait=%u stable=%d\n", cluster_node_id, i, a.pid, a.backend_id,
+			a.generation, a.wait_event_info, b.pid, b.backend_id, b.generation, b.wait_event_info,
+			a.procno == i && b.procno == i && a.pid == b.pid && a.backend_id == b.backend_id &&
+			a.generation != 0 && a.generation == b.generation && a.wait_event_info == b.wait_event_info);
+	}
+	/* Nonwaiting busy-CAS copies. Unavailable/racing publishers are counted,
+	 * not treated as evidence that a native live process has no resource. */
+	cluster_content_trace_walk(content_trace_deadline_owner, NULL, &stats);
+	content_trace_deadline_send("PGRAC_WAIT_DEADLINE_END node=%d available=%d scanned=%u owners=%u busy=%u changed=%u dead=%u omitted=%u dropped=%u\n",
+		cluster_node_id, stats.available, stats.scanned, stats.owners, stats.busy,
+		stats.changed, stats.dead, stats.omitted_locks, deadline_dropped);
+	close(deadline_fd); deadline_fd = -1;
+	errno = saved_errno;
 }
 
 static void

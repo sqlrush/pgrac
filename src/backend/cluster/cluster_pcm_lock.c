@@ -10808,6 +10808,10 @@ pcm_trace_wait(struct GrdEntry *entry, ClusterWaitTraceSite site, PcmLockMode mo
 	LWLockRelease(&entry->entry_lock.lock);
 	row.rows = nqueued;
 emit:
+	/* Publish the owned native entry sample too, not just its pre-read keys.
+	 * A failed conditional read still publishes entry_known=false. */
+	if (!master_view)
+		cluster_content_trace_wait_set(CLCONTENT_PCM, &row);
 	pcm_trace_match_keys(&row);
 	cluster_wait_trace_emit(kind, &row);
 	for (uint32 i = 0; i < nqueued; i++) {

@@ -53,10 +53,12 @@ typedef struct ClusterContentTracePairRequest {
 } ClusterContentTracePairRequest;
 
 typedef enum ClusterContentTraceWait {
-	CLCONTENT_PCM, CLCONTENT_TX, CLCONTENT_PAIR, CLCONTENT_NWAITS
+	CLCONTENT_PCM, CLCONTENT_TX, CLCONTENT_PAIR, CLCONTENT_KO,
+	CLCONTENT_RETRY, CLCONTENT_NWAITS
 } ClusterContentTraceWait;
 
 typedef struct ClusterContentTraceLock {
+	uint64 lifetime;
 	BufferTag tag;
 	int32 buffer;
 	int32 mode;
@@ -68,6 +70,7 @@ struct ClusterGrdHolderId;
 
 /* Exact caller-side keys; not proof of a master-side queue or grant. */
 typedef struct ClusterContentTraceEnqueue {
+	uint64 lifetime;
 	uint32 field1, field2, field3;
 	uint16 field4;
 	uint8 type, lockmethodid;
@@ -80,6 +83,7 @@ typedef struct ClusterContentTraceEnqueue {
 
 /* Positive native S5 observation, never permission to use/release a grant. */
 typedef struct ClusterContentTraceGrant {
+	uint64 lifetime;
 	uint32 field1, field2, field3;
 	uint16 field4;
 	uint8 type, lockmethodid;
@@ -91,6 +95,7 @@ typedef struct ClusterContentTraceGrant {
 /* Caller-stack diagnostic lifetime only. ERROR cleanup invalidates serials;
  * unwinding an older scope must not resurrect a cleared outer service. */
 typedef struct ClusterContentTraceServiceScope {
+	uint64 previous_lifetime;
 	uint64 serial, previous_serial;
 	bool previous_active;
 	ClusterWaitTrace previous;
@@ -125,6 +130,7 @@ typedef struct ClusterContentTraceOwner {
 	ClusterContentTraceEnqueue enqueue;
 	ClusterContentTraceLock locks[CLUSTER_CONTENT_TRACE_LOCKS];
 	ClusterWaitTrace waits[CLCONTENT_NWAITS];
+	uint64 wait_lifetimes[CLCONTENT_NWAITS], service_lifetime;
 	ClusterWaitTrace pcm_service;
 } ClusterContentTraceOwner;
 
@@ -200,6 +206,8 @@ extern void cluster_content_trace_service_begin(ClusterContentTraceServiceScope 
 	const ClusterWaitTrace *service);
 extern void cluster_content_trace_service_end(ClusterContentTraceServiceScope *scope);
 extern void cluster_content_trace_error_cleanup(void);
+/* Failure-path, default-off, allocation/lock-free native process census. */
+extern void cluster_content_trace_deadline_dump(uint32 reason);
 extern void cluster_content_trace_pair(Buffer target, bool missed);
 extern void cluster_content_trace_pair_begin(Buffer first, Buffer second);
 extern void cluster_content_trace_pair_cycle(void);

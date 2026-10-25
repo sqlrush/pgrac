@@ -6,6 +6,10 @@ import selectors
 import shutil
 import subprocess
 import time
+import copy
+import socket
+import threading
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 
@@ -19,6 +23,63 @@ CONFLICTS = {1: {8}, 2: {7, 8}, 3: {5, 6, 7, 8},
 def identity(row):
     return 'n%d:p%d:s%d:b%d:t%d:g%d' % tuple(row[x] for x in
                                         ('node', 'pid', 'procno', 'backend_id', 'backend_start', 'proc_generation'))
+
+
+def stabilize_owner(first, last):
+    """Per-native-episode proof; unrelated publications do not end a hold."""
+    result = copy.deepcopy(first)
+    result['stable'] = last is not None and identity(first) == identity(last)
+    result['unproven_resources'] = []
+    if not result['stable']:
+        return result
+
+    def same(a, b):
+        token = a.get('lifetime')
+        return (type(token) is int and 0 < token < 2**64 and token == b.get('lifetime') and
+                {k:v for k,v in a.items() if k != 'snapshot'} ==
+                {k:v for k,v in b.items() if k != 'snapshot'})
+
+    for field in ('locks','grants'):
+        before, after = first.get(field, []), last.get(field, [])
+        result[field] = [a for a in before if sum(same(a,b) for b in after) == 1 and
+                         sum(same(a,b) for b in before) == 1]
+        if (len(result[field]) != len(before) or len(result[field]) != len(after)):
+            result['unproven_resources'].append(dict(field=field,before=before,after=after))
+    for field in ('native_wait','enqueue','pcm_wait','tx_wait','pcm_service','ko_wait','retry_wait'):
+        a,b = first.get(field),last.get(field)
+        if a is None and b is None:
+            continue
+        if a is None or b is None or not same(a,b):
+            result[field] = None
+            result['unproven_resources'].append(dict(field=field,before=a,after=b))
+    return result
+
+
+def pcm_claimed_holders(tag, resources, owners):
+    """Actual native claimant -> own waits. Ownership is not a service edge."""
+    result = []
+    for resource in resources:
+        if (resource.get('kind') != 'pcm' or resource.get('tag') != tag or
+                resource.get('status') != 0 or resource.get('stable') is not True):
+            continue
+        native = resource.get('local_owner') or {}
+        handle, claim = native.get('handle') or {}, native.get('claim') or {}
+        actor = owners.get((resource.get('node'),handle.get('procno')))
+        if (native.get('valid') is not True or native.get('state') not in (1,2) or
+                handle.get('tag') != tag or handle.get('requester') != resource.get('node') or
+                actor is None or actor.get('stable') is not True or
+                claim.get('pid') != actor.get('pid') or
+                claim.get('proc_generation') != actor.get('proc_generation') or
+                type(claim.get('owner_generation')) is not int or
+                not 0 < claim['owner_generation'] < 2**64-1 or
+                claim['owner_generation'] != handle.get('generation') or
+                claim['owner_generation'] != native.get('highest_generation')):
+            continue
+        result.append(dict(process=identity(actor), quality='native_claimed_holder_observation',
+                           native=native, own_waits={k:actor[k] for k in
+                           ('native_wait','enqueue','pcm_wait','tx_wait','ko_wait','retry_wait') if actor.get(k)},
+                           service=actor.get('pcm_service'), wait_dependency_proven=False))
+    return result
 
 
 def _cycles(edges):
@@ -377,6 +438,8 @@ def build_graph(snapshots, resources):
                                     reason='owner_native_identity_unproven'))
                 continue
             owners[(node, row['procno'])] = row
+            for unproven in row.get('unproven_resources', []):
+                unknown.append(dict(process=identity(row), reason='resource_lifetime_unproven', **unproven))
             if row.get('omitted_grants', 0):
                 unknown.append(dict(process=identity(row), reason='omitted_grants',
                                     count=row['omitted_grants']))
@@ -392,7 +455,7 @@ def build_graph(snapshots, resources):
                 unknown.append(dict(node=node, procno=proc['procno'], reason='process_census_changed'))
                 owners.pop((node, proc['procno']), None)
             elif owner is not None and proc.get('wait_name') in RESOURCE_WAITS and not any(
-                    owner.get(key) for key in ('native_wait', 'enqueue', 'pcm_wait', 'tx_wait')):
+                    owner.get(key) for key in ('native_wait', 'enqueue', 'pcm_wait', 'tx_wait', 'ko_wait', 'retry_wait')):
                 unknown.append(dict(process=identity(owner), reason='wait_target_unpublished',
                                     wait_name=proc.get('wait_name')))
 
@@ -479,6 +542,10 @@ def build_graph(snapshots, resources):
                 unknown.append(dict(process=identity(row), reason='enqueue_no_proven_conflicting_holder', wait=wait))
         if row.get('pcm_wait'):
             wait = row['pcm_wait']
+            # This inventory remains useful when no active service scope can
+            # be certified. It never substitutes for the service bridge.
+            holders = pcm_claimed_holders(wait.get('tag'), resources, owners)
+            row['pcm_holder_observations'] = holders
             resolved_sources, awaited_sources = 0, 0
             keys = ('tag', 'requester', 'request_seq', 'formation',
                     'master_session', 'base', 'expected_master')
@@ -511,12 +578,20 @@ def build_graph(snapshots, resources):
                         service_wire_sender_connection=service.get('wire_sender_connection')),
                         'exact_observed_pcm_dependency' if dependency is not None else 'candidate_pcm_service')
             if not resolved_sources:
-                unknown.append(dict(process=identity(row), reason='pcm_service_process_edge_unresolved', wait=wait))
+                unknown.append(dict(process=identity(row), reason='pcm_service_process_edge_unresolved',
+                                    wait=wait, native_claimed_holders=holders,
+                                    native_resource_cuts=[{k:r.get(k) for k in
+                                        ('node','status','stable','view','queue','local_owner')}
+                                        for r in resources if r.get('kind') == 'pcm' and
+                                        r.get('tag') == wait.get('tag')]))
             elif awaited_sources & ~resolved_sources:
                 unknown.append(dict(process=identity(row), reason='pcm_incompatible_sources_unmapped',
                                     source_mask=awaited_sources & ~resolved_sources, wait=wait))
         if row.get('tx_wait'):
             unknown.append(dict(process=identity(row), reason='tx_source_edge_unresolved', wait=row['tx_wait']))
+        for field in ('ko_wait','retry_wait'):
+            if row.get(field):
+                unknown.append(dict(process=identity(row), reason=field+'_service_edge_unresolved', wait=row[field]))
     for resource in resources:
         absent = 1 if resource.get('kind') == 'enqueue' else 2
         if (resource.get('status') not in (0, absent) or resource.get('stable', True) is not True or
@@ -540,6 +615,72 @@ def capture_failed_watchdog(collect):
     except BaseException as exc:
         result['capture_error'] = repr(exc)
     return result
+
+
+class DeadlineReceiver:
+    """Local UDP observation only. Keep alive through original native stop.
+
+    Use the node's TCP port number as a separate UDP port. No SQL connection
+    survives/changes frontend retirement. Missing END/sequence means UNKNOWN.
+    """
+    def __init__(self, node, port, output):
+        self.node, self.rows, self.errors = node, [], []
+        self.path = Path(output)
+        self.stream = self.path.open('xb')
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4*1024*1024)
+            self.socket.bind(('127.0.0.1', port))
+            self.socket.settimeout(.1)
+        except BaseException:
+            self.socket.close(); self.stream.close()
+            raise
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._receive, daemon=True)
+        self.thread.start()
+
+    def _receive(self):
+        while True:
+            try:
+                payload, sender = self.socket.recvfrom(4096)
+            except socket.timeout:
+                if self.stop.is_set():
+                    break
+                continue
+            except OSError as exc:
+                self.errors.append(repr(exc)); break
+            self.stream.write(payload); self.stream.flush()
+            text = payload.decode('utf-8', errors='replace')
+            match = re.fullmatch(r'node=(\d+) observer=(\d+) sequence=(\d+) (.*)\n', text)
+            if match and int(match[1]) == self.node and sender[0] == '127.0.0.1':
+                self.rows.append(dict(observer=int(match[2]),sequence=int(match[3]),text=match[4]))
+            else:
+                self.errors.append('malformed_or_wrong_node_datagram')
+
+    def close(self):
+        # Caller closes only after original stop; allow already queued local
+        # datagrams to drain before asking the receiver thread to exit.
+        self.socket.settimeout(.05)
+        self.stop.set(); self.thread.join(1)
+        if self.thread.is_alive():
+            raise RuntimeError('deadline receiver did not stop')
+        self.socket.close(); self.stream.close()
+        groups = {}
+        for row in self.rows:
+            groups.setdefault(row['observer'], []).append(row)
+        result = dict(node=self.node,errors=self.errors,observers=[],complete=False,
+                      completeness_scope='datagram_stream_only')
+        for observer, rows in groups.items():
+            ordered = sorted(rows,key=lambda r:r['sequence'])
+            sequences = [r['sequence'] for r in ordered]
+            complete = (sequences == list(range(1,len(rows)+1)) and
+                        'PGRAC_WAIT_DEADLINE_BEGIN ' in ordered[0]['text'] and
+                        'PGRAC_WAIT_DEADLINE_END ' in ordered[-1]['text'] and
+                        ordered[-1]['text'].endswith(' dropped=0'))
+            result['observers'].append(dict(observer=observer,records=len(rows),complete=complete))
+        result['complete'] = bool(groups) and not self.errors and all(o['complete'] for o in result['observers'])
+        self.path.with_suffix('.json').write_text(json.dumps(result,indent=2)+'\n')
+        return result
 
 
 class PsqlReader:
@@ -672,7 +813,8 @@ class CaptureSession:
                 for frame in result['rounds'][0]:
                     for owner in frame.get('value', {}).get('owners', []):
                         for lock in owner.get('locks', []) + [owner.get('native_wait') or {},
-                                owner.get('pcm_wait') or {}, owner.get('pcm_service') or {}]:
+                                owner.get('pcm_wait') or {}, owner.get('pcm_service') or {},
+                                owner.get('retry_wait') or {}]:
                             if lock.get('tag') is not None:
                                 keys.add(('pcm', tuple(lock['tag'])))
                         for grant in owner.get('grants', []):
@@ -706,9 +848,16 @@ class CaptureSession:
                     last['epoch_begin'] == last['epoch_end']):
                 result['errors'].append('node%d epoch changed across cuts' % node)
                 continue
+            stable_owners = []
             for owner in first['owners']:
                 matching = [x for x in last['owners'] if x['procno'] == owner['procno']]
-                owner['stable'] = len(matching) == 1 and matching[0] == owner
+                stable_owners.append(stabilize_owner(owner, matching[0] if len(matching) == 1 else None))
+            for owner in last['owners']:
+                if not any(x['procno'] == owner['procno'] for x in first['owners']):
+                    stable_owners.append(dict(owner, stable=False))
+            # Raw cuts remain intact in capture.json, including all changed
+            # targets. The graph uses only individually proved projections.
+            first = dict(first, owners=stable_owners)
             first['context_stable'] = all(first.get(k) == last.get(k) for k in CONTEXT_CUTS)
             first['peer_stable'] = all(first.get(k) == last.get(k) for k in ('peer_begin','peer_end'))
             first['streams_stable'] = all(first.get(k) == last.get(k) for k in ('streams_begin','streams_end'))
