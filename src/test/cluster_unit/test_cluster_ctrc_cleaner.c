@@ -345,6 +345,28 @@ static bool native_cleaner_sample_current(const ClusterUndoCleanerActiveSample *
 static bool undo_cleaner_active_scan_pending;
 static TimestampTz native_status_timestamp;
 static unsigned native_status_broadcasts;
+/* Controlled source/current leaves for the actual worker0 scan coordinator. */
+static bool native_pass_mode;
+static bool native_pass_capture_allowed = true;
+static bool native_pass_lease_valid = true;
+static bool native_pass_admission_valid = true;
+static unsigned native_pass_captures;
+static ClusterSemanticActiveSampleFence native_pass_source;
+
+static bool
+native_cleaner_admission_capture(ClusterSemanticActiveSampleFence *out)
+{
+	if (!native_pass_mode || held_count != 0 || native_lock_held || native_cleaner_lock_held)
+		abort();
+	native_pass_captures++;
+	MemSet(out, 0, sizeof(*out));
+	if (!native_pass_capture_allowed)
+		return false;
+	*out = native_pass_source;
+	return true;
+}
+
+
 
 static TimestampTz
 native_status_time(void)
@@ -385,6 +407,7 @@ native_cleaner_lease_current(const ClusterXidStripeSampleFence *expected)
 	if (held_count != 0 || native_lock_held || native_cleaner_lock_held)
 		abort();
 	return expected != NULL && native_publish_source
+		&& (!native_pass_mode || native_pass_lease_valid)
 		&& memcmp(expected, &undo_cleaner_active_lease_fence, sizeof(*expected)) == 0;
 }
 
@@ -394,6 +417,7 @@ native_cleaner_admission_current(const ClusterSemanticActiveSampleFence *expecte
 	if (held_count != 0 || native_lock_held || native_cleaner_lock_held)
 		abort();
 	return expected != NULL && native_publish_source
+		&& (!native_pass_mode || native_pass_admission_valid)
 		&& memcmp(expected, &undo_cleaner_active_admission_fence, sizeof(*expected)) == 0;
 }
 
@@ -404,11 +428,15 @@ native_cleaner_admission_current(const ClusterSemanticActiveSampleFence *expecte
 #define cluster_semantic_activation_active_sample_current native_cleaner_admission_current
 #define cluster_undo_cleaner_active_sample native_cleaner_sample
 #define cluster_undo_cleaner_active_sample_current native_cleaner_sample_current
+#define cluster_semantic_activation_active_sample_capture native_cleaner_admission_capture
+#define ProcArrayGetActiveFullXidSample native_procarray_sample
 #define GetCurrentTimestamp native_status_time
 #define ConditionVariableBroadcast native_status_broadcast
 #include "test_cluster_ctrc_worker_sample.inc"
 #undef ConditionVariableBroadcast
 #undef GetCurrentTimestamp
+#undef ProcArrayGetActiveFullXidSample
+#undef cluster_semantic_activation_active_sample_capture
 #undef cluster_undo_cleaner_active_sample_current
 #undef cluster_undo_cleaner_active_sample
 #undef cluster_semantic_activation_active_sample_current
@@ -6808,6 +6836,166 @@ UT_TEST(test_same_pid_worker_respawn_applied_restarts_scan_with_shared_retention
 	native_source_exit = native_publish_source = native_worker_respawn = false;
 }
 
+/* Execute the original worker0 sampler/continuation/publisher sequence with
+ * actual native PGPROC and census owners. Scheduling and source-current
+ * refusal injection remain explicit leaves, not a backend worker run. */
+static void
+exercise_worker_active_pass(unsigned fault)
+{
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcOriginReservation reservation;
+	ClusterCtrcParticipantIdentity identity = { 0 };
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcReceiptHandle receipt;
+	ClusterUndoCleanerActiveSample first, second, zero = { 0 };
+	FullTransactionId original, reference = FullTransactionIdFromEpochAndXid(9, 10000);
+	uint32 grant;
+	unsigned captures, reads, slices = 0;
+
+	reset_fixture();
+	native_source_exit = native_publish_source = native_pass_mode = true;
+	native_pass_capture_allowed = native_pass_lease_valid = native_pass_admission_valid = true;
+	native_pass_captures = 0;
+	key = fresh_origin_key();
+	key.formation_epoch = key.cluster_epoch;
+	original = FullTransactionIdFromEpochAndXid(7, key.xid);
+	test_my_proc.xid = key.xid;
+	test_top_full = original;
+	initialize_native_source(original, reference);
+	pg_atomic_write_u64(&test_my_proc.cluster_top_full_xid_atomic,
+						U64FromFullTransactionId(original));
+	native_pass_source = active_source_for_key(&key);
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &reservation),
+				 CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	origin = &ctrc_origin_entries()[reservation.origin_index];
+	UT_ASSERT(cluster_ctrc_origin_open_reserved(&reservation, &grant));
+	identity.node_id = key.origin_node_id;
+	identity.boot_incarnation = key.origin_boot_incarnation;
+	identity.capability_record_generation = test_capability_generation;
+	identity.formation_epoch = key.formation_epoch;
+	identity.admission_record_generation = key.admission_record_generation;
+	UT_ASSERT_EQ(cluster_ctrc_origin_touch_exact(&key, &identity, CTRC_PROOF_ACTIVE, &grant),
+				 CLUSTER_CTRC_TOUCH_RECORDED);
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 701, &receipt), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(FullTransactionIdEquals(receipt.original_full_xid, original));
+	/* Real native protection retires only after the original shared owners
+	 * retain this exact FullXid. The coordinator must find it in the census. */
+	native_procarray_end_transaction(MyProc, key.xid + 2);
+	UT_ASSERT_EQ(native_xids[0], InvalidTransactionId);
+	MemSet(&native_cleaner_state, 0, sizeof(native_cleaner_state));
+	MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
+	MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
+	MemSet(&undo_cleaner_active_admission_fence, 0, sizeof(undo_cleaner_active_admission_fence));
+	undo_cleaner_active_scan_pending = native_cleaner_lock_held = false;
+	native_cleaner_lock_acquires = native_cleaner_lock_releases = 0;
+	undo_cleaner_worker = 0;
+	native_cleaner_state.workers[0].status = UNDO_CLEANER_READY;
+	native_cleaner_state.workers[0].pid = MyProcPid;
+	LWLockInitialize(&native_cleaner_state.lwlock, 0);
+
+	if (fault == 3) {
+		native_pass_capture_allowed = false;
+		undo_cleaner_sample_active_pass();
+		UT_ASSERT_EQ(undo_cleaner_active_scan.status, CTRC_ACTIVE_SCAN_INVALID);
+		UT_ASSERT(!undo_cleaner_active_scan_pending);
+		UT_ASSERT_EQ(native_future_reads, 0);
+		UT_ASSERT(!native_cleaner_sample(&first));
+		UT_ASSERT_EQ(memcmp(&first, &zero, sizeof(first)), 0);
+		native_pass_capture_allowed = true;
+	}
+	conditional_refuse_call = conditional_calls + 1;
+	undo_cleaner_sample_active_pass();
+	conditional_refuse_call = 0;
+	UT_ASSERT_EQ(undo_cleaner_active_scan.status, CTRC_ACTIVE_SCAN_INCOMPLETE);
+	UT_ASSERT(undo_cleaner_active_scan_pending && undo_cleaner_active_scan.lock_busy);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.next_index, 0);
+	UT_ASSERT(FullTransactionIdEquals(undo_cleaner_active_scan.min_full, native_future));
+	UT_ASSERT_EQ(native_future_reads, 1);
+	UT_ASSERT_EQ(native_pass_captures, fault == 3 ? 2 : 1);
+	UT_ASSERT(!native_cleaner_sample(&first));
+	UT_ASSERT_EQ(memcmp(&first, &zero, sizeof(first)), 0);
+
+	if (fault == 1 || fault == 2) {
+		native_pass_lease_valid = fault != 1;
+		native_pass_admission_valid = fault != 2;
+		undo_cleaner_sample_active_pass();
+		UT_ASSERT_EQ(undo_cleaner_active_scan.status, CTRC_ACTIVE_SCAN_INVALID);
+		UT_ASSERT(!undo_cleaner_active_scan_pending);
+		UT_ASSERT_EQ(undo_cleaner_active_scan.next_index, 0);
+		UT_ASSERT_EQ(native_future_reads, 1);
+		UT_ASSERT(!native_cleaner_sample(&first));
+		UT_ASSERT_EQ(memcmp(&first, &zero, sizeof(first)), 0);
+		native_pass_lease_valid = native_pass_admission_valid = true;
+		undo_cleaner_sample_active_pass();
+		UT_ASSERT_EQ(native_future_reads, 2);
+		UT_ASSERT_EQ(native_pass_captures, 2);
+	}
+	captures = native_pass_captures;
+	reads = native_future_reads;
+	while (undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_INCOMPLETE) {
+		undo_cleaner_sample_active_pass();
+		UT_ASSERT(++slices <= 1000);
+		UT_ASSERT_EQ(native_pass_captures, captures);
+		UT_ASSERT_EQ(native_future_reads, reads);
+	}
+	UT_ASSERT(slices > 1);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT(!undo_cleaner_active_scan_pending);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.next_index, undo_cleaner_active_scan.total_entries);
+	UT_ASSERT(native_cleaner_sample(&first));
+	UT_ASSERT(native_cleaner_sample_current(&first));
+	UT_ASSERT(FullTransactionIdEquals(first.scan.min_full, original));
+	UT_ASSERT_EQ(first.scan.unqualified_entries, 0);
+	UT_ASSERT_EQ(first.sample_id, 1);
+
+	/* A completed round starts with a fresh native observation; an incomplete
+	 * successor retains the old complete publication until full coverage. */
+	native_future = FullTransactionIdFromU64(U64FromFullTransactionId(native_future) + 16);
+	undo_cleaner_sample_active_pass();
+	UT_ASSERT_EQ(native_pass_captures, captures + 1);
+	UT_ASSERT_EQ(native_future_reads, reads + 1);
+	UT_ASSERT(undo_cleaner_active_scan_pending);
+	UT_ASSERT(native_cleaner_sample(&second));
+	UT_ASSERT_EQ(memcmp(&first, &second, sizeof(first)), 0);
+	while (undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_INCOMPLETE) {
+		undo_cleaner_sample_active_pass();
+		UT_ASSERT(++slices <= 2000);
+	}
+	UT_ASSERT(native_cleaner_sample(&second));
+	UT_ASSERT_EQ(second.sample_id, first.sample_id + 1);
+	UT_ASSERT(FullTransactionIdEquals(second.scan.min_full, original));
+	UT_ASSERT(FullTransactionIdEquals(second.scan.future_full, native_future));
+	UT_ASSERT(!native_cleaner_sample_current(&first));
+	UT_ASSERT(native_cleaner_sample_current(&second));
+	UT_ASSERT_EQ(native_pass_captures, captures + 1);
+	UT_ASSERT_EQ(native_future_reads, reads + 1);
+	UT_ASSERT_EQ(native_cleaner_lock_acquires, native_cleaner_lock_releases);
+	UT_ASSERT_EQ(native_lock_acquires, native_lock_releases);
+	UT_ASSERT(!native_cleaner_lock_held && !native_lock_held);
+	UT_ASSERT_EQ(held_count, 0);
+	native_source_exit = native_publish_source = native_pass_mode = false;
+}
+
+UT_TEST(test_actual_worker_active_pass_keeps_old_shared_fullxid_across_slices)
+{
+	exercise_worker_active_pass(0);
+}
+
+UT_TEST(test_actual_worker_active_pass_restarts_after_original_lease_refusal)
+{
+	exercise_worker_active_pass(1);
+}
+
+UT_TEST(test_actual_worker_active_pass_restarts_after_original_source_refusal)
+{
+	exercise_worker_active_pass(2);
+}
+
+UT_TEST(test_actual_worker_active_pass_does_not_sample_native_without_source)
+{
+	exercise_worker_active_pass(3);
+}
+
 int
 main(void)
 {
@@ -6815,7 +7003,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(163);
+	UT_PLAN(167);
 	UT_RUN(test_receipt_observed_identity_refusal_precedes_chain_blocking);
 	UT_RUN(test_receipt_original_identity_refusal_precedes_chain_blocking);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
@@ -6984,6 +7172,10 @@ main(void)
 	UT_RUN(test_reused_native_slot_applied_retains_old_fullxid_after_same_raw_publication);
 	UT_RUN(test_same_pid_worker_respawn_cancel_restarts_scan_with_shared_retention);
 	UT_RUN(test_same_pid_worker_respawn_applied_restarts_scan_with_shared_retention);
+	UT_RUN(test_actual_worker_active_pass_keeps_old_shared_fullxid_across_slices);
+	UT_RUN(test_actual_worker_active_pass_restarts_after_original_lease_refusal);
+	UT_RUN(test_actual_worker_active_pass_restarts_after_original_source_refusal);
+	UT_RUN(test_actual_worker_active_pass_does_not_sample_native_without_source);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
