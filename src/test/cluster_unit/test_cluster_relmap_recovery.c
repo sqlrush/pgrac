@@ -11,6 +11,14 @@
 #include "miscadmin.h"
 #include "unit_test.h"
 UT_DEFINE_GLOBALS();
+
+/* Native assertions remain fatal in cassert-enabled standalone runs. */
+void
+ExceptionalCondition(const char *condition, const char *file, int line)
+{
+	fprintf(stderr, "unexpected Assert: %s at %s:%d\n", condition, file, line);
+	abort();
+}
 static VariableCacheData variables;
 VariableCache ShmemVariableCache = &variables;
 static LWLockPadded locks[NUM_INDIVIDUAL_LWLOCKS];
