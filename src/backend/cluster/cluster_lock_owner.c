@@ -16,6 +16,7 @@
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_wal_retention.h"
 #include "miscadmin.h"
+#include "portability/instr_time.h"
 #include "postmaster/startup.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -964,6 +965,42 @@ lock_owner_release_poll(ClusterLockOwner *owner)
 	return lock_owner_forget(owner);
 }
 
+/* Process-local failed release only. Never dereference an owner after a
+ * successful release, which may already have freed its private storage. */
+static void
+lock_owner_trace_walr_release(const ClusterLockOwner *owner, bool enabled,
+	const instr_time *started, const char *reason, int timeout_ms, int effective_ms)
+{
+	const ClusterLockAcquireRequest *request;
+	instr_time elapsed;
+
+	if (!enabled || !cluster_trace_control_config || CritSectionCount != 0 || owner == NULL)
+		return;
+	request = &owner->request;
+	INSTR_TIME_SET_CURRENT(elapsed);
+	INSTR_TIME_SUBTRACT(elapsed, *started);
+	ereport(LOG,
+			(errmsg("PGRAC_FAMILY=WALR_RELEASE task=owner_wait reason=%s"
+					" node=%d pid=%d role=%d proc_exit=%d proc_present=%d latch_present=%d"
+					" resource_type=%u thread=%u mode=%d"
+					" request=" UINT64_FORMAT " epoch=" UINT64_FORMAT
+					" holder_node=%d holder_procno=%u holder_request=" UINT64_FORMAT
+					" control_owner=" UINT64_FORMAT " state=%d shared=%d"
+					" conversion=%d reconstructable=%d secondary_retiring=%d"
+					" owner_generation=" UINT64_FORMAT " attempt_generation=" UINT64_FORMAT
+					" secondary_generation=" UINT64_FORMAT
+					" timeout_ms=%d effective_ms=%d elapsed_us=" UINT64_FORMAT " confirmed=0",
+					reason, cluster_node_id, MyProcPid, (int)MyBackendType, proc_exit_inprogress,
+					MyProc != NULL, MyLatch != NULL, (unsigned)request->resid.type,
+					request->resid.field1, request->lockmode, request->request_id,
+					request->holder.cluster_epoch, request->holder.node_id, request->holder.procno,
+					request->holder.request_id, request->control_owner_id, (int)owner->state,
+					owner->shared, (int)owner->conversion, owner->reconstructable,
+					owner->secondary_retiring, owner->generation, owner->attempt.generation,
+					owner->secondary.generation, timeout_ms, effective_ms,
+					(uint64)INSTR_TIME_GET_MICROSEC(elapsed))));
+}
+
 /* Preserve the caller's existing release budget, not a retirement deadline.
  * Expiry leaves the exact shared obligation owned and unusable. CONTROL
  * services never sleep on work they themselves must dispatch. */
@@ -972,13 +1009,20 @@ lock_owner_release_wait(ClusterLockOwner *owner, int timeout_ms, uint32 event)
 {
 	TimestampTz deadline;
 	int effective = timeout_ms > 0 ? timeout_ms : cluster_ges_request_timeout_ms;
+	bool trace = cluster_trace_control_config && CritSectionCount == 0 && owner != NULL
+		&& owner->request.resid.type == CLUSTER_WAL_RETENTION_RESID_TYPE;
+	instr_time started;
 
+	if (trace)
+		INSTR_TIME_SET_CURRENT(started);
 	if (lock_owner_release_poll(owner))
 		return true;
 	if (owner == NULL || !owner->shared || owner->state != CLUSTER_LOCK_OWNER_RETIRING
 		|| MyBackendType == B_LMON || MyBackendType == B_LMS || MyLatch == NULL
-		|| proc_exit_inprogress)
+		|| proc_exit_inprogress) {
+		lock_owner_trace_walr_release(owner, trace, &started, "wait_gate", timeout_ms, effective);
 		return false;
+	}
 	if (effective == 0)
 		effective = 600000; /* Same fallback as the existing S6 adapter. */
 	deadline = effective < 0 ? 0 : TimestampTzPlusMilliseconds(GetCurrentTimestamp(), effective);
@@ -990,8 +1034,10 @@ lock_owner_release_wait(ClusterLockOwner *owner, int timeout_ms, uint32 event)
 		if (lock_owner_release_poll(owner))
 			return true;
 		now = GetCurrentTimestamp();
-		if (deadline != 0 && now >= deadline)
+		if (deadline != 0 && now >= deadline) {
+			lock_owner_trace_walr_release(owner, trace, &started, "deadline", timeout_ms, effective);
 			return false;
+		}
 		if (deadline != 0)
 			wait_ms = Min(wait_ms, Max(1L, (long)((deadline - now) / 1000)));
 		CHECK_FOR_INTERRUPTS();

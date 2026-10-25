@@ -28,6 +28,7 @@
 #include "cluster_control_root_private.h"
 #include "portability/instr_time.h"
 #include "storage/lock.h"
+#include "storage/ipc.h"
 #include "utils/memutils.h"
 #include "cluster/cluster_lock_owner.h"
 #include "utils/resowner.h"
@@ -1203,6 +1204,7 @@ ClusterWalrReleaseResult
 cluster_wal_read_pin_release_v1(ClusterWalReadPinV1 **pin)
 {
 	bool uncertain = false;
+	bool reported = false;
 
 	if (pin == NULL)
 		return CLUSTER_WALR_RELEASE_INVALID;
@@ -1214,10 +1216,35 @@ cluster_wal_read_pin_release_v1(ClusterWalReadPinV1 **pin)
 	(*pin)->poisoned = true;
 	for (uint16 i = (*pin)->nthreads; i > 0; i--) {
 		ClusterWalPinLock *lock = &(*pin)->locks[i - 1];
+		ClusterLockAcquireResult result;
 
 		if (!lock->held && !lock->release_uncertain)
 			continue;
-		if (walr_request_release_actual(&lock->request) != CLUSTER_LOCK_ACQUIRE_OK_GRANTED) {
+		result = walr_request_release_actual(&lock->request);
+		if (result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED) {
+			/* First failed original call only; do not probe or retry for logging. */
+			if (!reported && cluster_trace_control_config && CritSectionCount == 0) {
+				const ClusterLockAcquireRequest *request = &lock->request;
+
+				ereport(LOG,
+						(errmsg("PGRAC_FAMILY=WALR_RELEASE task=read_member"
+								" node=%d pid=%d role=%d proc_exit=%d member=%u members=%u"
+								" resource_type=%u field2=%u field3=%u field4=%u method=%u"
+								" thread=%u mode=%d request=" UINT64_FORMAT " epoch=" UINT64_FORMAT
+								" holder_node=%d holder_procno=%u holder_request=" UINT64_FORMAT
+								" control_owner=" UINT64_FORMAT
+								" lock_result=%d held_before=%d uncertain_before=%d",
+								cluster_node_id, MyProcPid, (int)MyBackendType, proc_exit_inprogress,
+								(unsigned)(i - 1), (unsigned)(*pin)->nthreads,
+								(unsigned)request->resid.type, request->resid.field2,
+								request->resid.field3, (unsigned)request->resid.field4,
+								(unsigned)request->resid.lockmethodid, request->resid.field1,
+								request->lockmode, request->request_id, request->holder.cluster_epoch,
+								request->holder.node_id, request->holder.procno,
+								request->holder.request_id, request->control_owner_id, (int)result,
+								lock->held, lock->release_uncertain)));
+				reported = true;
+			}
 			lock->release_uncertain = true;
 			uncertain = true;
 		} else {
@@ -1872,9 +1899,17 @@ walr_resource_release_callback(ResourceReleasePhase phase, bool isCommit, bool i
 	}
 	if (active_read_pin != NULL && active_read_pin->owner == CurrentResourceOwner) {
 		ClusterWalReadPinV1 *pin = active_read_pin;
+		ClusterWalrReleaseResult result = cluster_wal_read_pin_release_v1(&pin);
 
-		if (cluster_wal_read_pin_release_v1(&pin) != CLUSTER_WALR_RELEASE_CONFIRMED)
+		if (result != CLUSTER_WALR_RELEASE_CONFIRMED) {
+			if (cluster_trace_control_config && CritSectionCount == 0)
+				ereport(LOG,
+						(errmsg("PGRAC_FAMILY=WALR_RELEASE task=read_scope_cleanup"
+								" node=%d pid=%d role=%d proc_exit=%d release_result=%d",
+								cluster_node_id, MyProcPid, (int)MyBackendType,
+								proc_exit_inprogress, (int)result)));
 			elog(FATAL, "could not confirm WALR read-scope cleanup");
+		}
 	}
 }
 

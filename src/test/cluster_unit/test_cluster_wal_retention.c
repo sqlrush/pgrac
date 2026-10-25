@@ -28,6 +28,7 @@
 #include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_wal_source.h"
 #include "common/cryptohash.h"
+#include "miscadmin.h"
 #include "storage/lock.h"
 #include "utils/resowner.h"
 
@@ -44,6 +45,10 @@ int MyProcPid = 42;
 int wal_segment_size = TEST_WAL_SEG_SIZE;
 char *cluster_wal_threads_dir;
 bool cluster_shared_config;
+bool cluster_trace_control_config;
+volatile uint32 CritSectionCount;
+BackendType MyBackendType = B_INVALID;
+bool proc_exit_inprogress;
 static bool fake_control_owner_current = true;
 static LOCKMODE fake_control_owner_mode = NoLock;
 static uint16 fake_control_owner_stale_thread;
@@ -141,6 +146,10 @@ static bool capture_release_log;
 static unsigned release_log_count;
 static char release_log_detail[1024];
 static ClusterLockAcquireRequest released_request;
+static char read_release_observations[4][2048];
+static unsigned read_release_observation_count;
+static bool expect_read_cleanup_fatal, finishing_read_cleanup_fatal;
+static char read_cleanup_fatal[128];
 
 void
 RegisterResourceReleaseCallback(ResourceReleaseCallback callback, void *arg)
@@ -152,6 +161,10 @@ RegisterResourceReleaseCallback(ResourceReleaseCallback callback, void *arg)
 bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
+	if (expect_read_cleanup_fatal && elevel == FATAL) {
+		finishing_read_cleanup_fatal = true;
+		return true;
+	}
 	if (!capture_release_log || elevel != LOG)
 		return false;
 	release_log_count++;
@@ -167,17 +180,37 @@ errstart_cold(int elevel, const char *domain)
 void
 errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
-{}
+{
+	if (finishing_read_cleanup_fatal) {
+		finishing_read_cleanup_fatal = false;
+		pg_re_throw();
+	}
+}
 
 int
 errmsg_internal(const char *fmt pg_attribute_unused(), ...)
 {
+	if (expect_read_cleanup_fatal) {
+		va_list args;
+		va_start(args, fmt);
+		vsnprintf(read_cleanup_fatal, sizeof(read_cleanup_fatal), fmt, args);
+		va_end(args);
+	}
 	return 0;
 }
 
 int
 errmsg(const char *fmt pg_attribute_unused(), ...)
 {
+	if (strstr(fmt, "PGRAC_FAMILY=WALR_RELEASE") != NULL) {
+		va_list args;
+		unsigned index = read_release_observation_count++;
+		va_start(args, fmt);
+		if (index < lengthof(read_release_observations))
+			vsnprintf(read_release_observations[index], sizeof(read_release_observations[index]),
+					  fmt, args);
+		va_end(args);
+	}
 	return 0;
 }
 
@@ -515,6 +548,14 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 static void
 reset_pin_fakes(void)
 {
+	cluster_trace_control_config = false;
+	CritSectionCount = 0;
+	proc_exit_inprogress = false;
+	MyBackendType = B_INVALID;
+	read_release_observation_count = 0;
+	memset(read_release_observations, 0, sizeof(read_release_observations));
+	expect_read_cleanup_fatal = finishing_read_cleanup_fatal = false;
+	memset(read_cleanup_fatal, 0, sizeof(read_cleanup_fatal));
 	capture_release_log = false;
 	release_log_count = 0;
 	memset(release_log_detail, 0, sizeof(release_log_detail));
@@ -3702,6 +3743,105 @@ UT_TEST(test_read_pin_uncertain_release_is_cleanup_only)
 	reset_pin_fakes();
 }
 
+UT_TEST(test_read_release_trace_keeps_first_failed_member_and_all_debt)
+{
+	uint16 threads[] = { 1, 3 };
+	ClusterWalReadPinV1 *pin = NULL;
+
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 2, &pin), CLUSTER_WAL_PIN_OK);
+	capture_release_log = cluster_trace_control_config = true;
+	fake_release_result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_UNCONFIRMED);
+	UT_ASSERT_NOT_NULL(pin);
+	UT_ASSERT_FALSE(cluster_wal_read_pin_covers_v1(pin, 1));
+	UT_ASSERT_EQ(fake_release_call_count, 2);
+	UT_ASSERT_EQ(fake_native_release_call_count, 0);
+	UT_ASSERT_EQ(read_release_observation_count, 1);
+	UT_ASSERT(strstr(read_release_observations[0], "task=read_member"));
+	UT_ASSERT(strstr(read_release_observations[0], "member=1 members=2"));
+	UT_ASSERT(strstr(read_release_observations[0], "thread=3 mode=5"));
+	UT_ASSERT(strstr(read_release_observations[0], "request=2 epoch=1"));
+	UT_ASSERT(strstr(read_release_observations[0], "holder_node=0 holder_procno=1"));
+	UT_ASSERT(strstr(read_release_observations[0], "lock_result=16 held_before=1 uncertain_before=0"));
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_UNCONFIRMED);
+	UT_ASSERT_EQ(read_release_observation_count, 2);
+	UT_ASSERT(strstr(read_release_observations[1], "held_before=1 uncertain_before=1"));
+	UT_ASSERT_EQ(fake_acquire_call_count, 2);
+	UT_ASSERT_EQ(fake_release_call_count, 4);
+	fake_release_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_NULL(pin);
+	UT_ASSERT_EQ(read_release_observation_count, 2);
+	UT_ASSERT_EQ(fake_native_release_call_count, 2);
+	reset_pin_fakes();
+}
+
+UT_TEST(test_read_release_trace_off_and_critical_preserve_original_cleanup)
+{
+	uint16 threads[] = { 1, 3 };
+	ClusterWalReadPinV1 *pin = NULL;
+
+	reset_pin_fakes();
+	cluster_shared_config = capture_release_log = true;
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 2, &pin), CLUSTER_WAL_PIN_OK);
+	fake_release_result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_UNCONFIRMED);
+	UT_ASSERT_EQ(read_release_observation_count, 0);
+	cluster_trace_control_config = true;
+	CritSectionCount = 1;
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_UNCONFIRMED);
+	UT_ASSERT_EQ(read_release_observation_count, 0);
+	UT_ASSERT_EQ(fake_release_call_count, 4);
+	UT_ASSERT_EQ(fake_native_release_call_count, 0);
+	CritSectionCount = 0;
+	fake_release_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(read_release_observation_count, 0);
+	UT_ASSERT_EQ(fake_native_release_call_count, 2);
+	reset_pin_fakes();
+}
+
+UT_TEST(test_read_release_callback_records_aggregate_and_keeps_original_fatal)
+{
+	uint16 thread = 3;
+	ClusterWalReadPinV1 *pin = NULL;
+	volatile bool caught = false;
+
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(&thread, 1, &pin), CLUSTER_WAL_PIN_OK);
+	capture_release_log = cluster_trace_control_config = true;
+	expect_read_cleanup_fatal = proc_exit_inprogress = true;
+	MyBackendType = B_BG_WRITER;
+	fake_release_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+	PG_TRY();
+	{
+		fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true,
+									   fake_resource_release_arg);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	expect_read_cleanup_fatal = false;
+	UT_ASSERT(caught);
+	UT_ASSERT(strcmp(read_cleanup_fatal, "could not confirm WALR read-scope cleanup") == 0);
+	UT_ASSERT_EQ(read_release_observation_count, 2);
+	UT_ASSERT(strstr(read_release_observations[0], "lock_result=13"));
+	UT_ASSERT(strstr(read_release_observations[1], "task=read_scope_cleanup"));
+	UT_ASSERT(strstr(read_release_observations[1], "role=6 proc_exit=1"));
+	UT_ASSERT(strstr(read_release_observations[1], "release_result=2"));
+	UT_ASSERT_EQ(fake_release_call_count, 1);
+	UT_ASSERT_EQ(fake_native_release_call_count, 0);
+	fake_release_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(fake_native_release_call_count, 1);
+	reset_pin_fakes();
+}
+
 UT_TEST(test_read_pin_checks_every_actual_owner_and_never_revives)
 {
 	uint16 threads[] = { 1, 3 };
@@ -4124,7 +4264,10 @@ main(int argc, char **argv)
 		return write_fixture_wal_segment(argc, argv);
 	if (argc != 1)
 		return 2;
-	UT_PLAN(87);
+	UT_PLAN(90);
+	UT_RUN(test_read_release_trace_keeps_first_failed_member_and_all_debt);
+	UT_RUN(test_read_release_trace_off_and_critical_preserve_original_cleanup);
+	UT_RUN(test_read_release_callback_records_aggregate_and_keeps_original_fatal);
 	UT_RUN(test_root_publish_singleton_still_refuses_a_second_guard);
 	UT_RUN(test_root_publish_cohort_holds_every_converted_owner_until_end);
 	UT_RUN(test_root_publish_cohort_keeps_closed_inputs_as_readers);
