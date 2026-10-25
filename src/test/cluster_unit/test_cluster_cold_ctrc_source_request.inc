@@ -226,3 +226,96 @@ UT_TEST(test_ctrc_source_request_rejects_stale_owner_and_critical_section)
 	request = ClusterColdRecoveryCtrcSerialRequest(NULL, NULL, UINT32_MAX);
 	UT_ASSERT(ctrc_source_request_empty(&request));
 }
+
+UT_TEST(test_ctrc_serial_current_borrows_only_the_original_complete_scope)
+{
+	ClusterWalInputsV1 *scope;
+	ClusterRecoverySerialRequest request;
+	observation_ready();
+	UT_ASSERT(ClusterColdRecoveryCtrcScope(info.cluster_tx_start, &native_ctrc_work) == NULL);
+	UT_ASSERT(ClusterColdRecoveryCtrcObserve(info.cluster_tx_start, 2 * 1024 * 1024));
+	scope = ClusterColdRecoveryCtrcScope(info.cluster_tx_start, &native_ctrc_work);
+	UT_ASSERT(scope == cluster_recovery_cold_start->ctrc_observation_inputs);
+	request = ClusterColdRecoveryCtrcSerialRequest(info.cluster_tx_start, &native_ctrc_work, 0);
+	request.tx_closure_scope = scope;
+	UT_ASSERT(ClusterColdRecoveryCtrcSerialRequestCurrent(info.cluster_tx_start,
+		&native_ctrc_work, 0, scope, &request));
+	UT_ASSERT(!ClusterColdRecoveryCtrcSerialRequestCurrent(info.cluster_tx_start,
+		&native_ctrc_work, 0, (ClusterWalInputsV1 *)&info, &request));
+	UT_ASSERT(!ClusterColdRecoveryCtrcSerialRequestCurrent(info.cluster_tx_start,
+		&native_ctrc_work, 1, scope, &request));
+	UT_ASSERT(!ClusterColdRecoveryCtrcSerialRequestCurrent(NULL, NULL, 0, NULL, &request));
+}
+
+UT_TEST(test_ctrc_serial_current_rechecks_without_manifest_io_or_scope_cleanup)
+{
+	ClusterRecoverySerialRequest request;
+	ClusterWalInputsV1 *scope;
+	unsigned manifests, steps, released, allocated;
+	observation_two_ready();
+	UT_ASSERT(ClusterColdRecoveryCtrcObserve(info.cluster_tx_start, 2 * 1024 * 1024));
+	request = ClusterColdRecoveryCtrcSerialRequest(info.cluster_tx_start, &native_ctrc_work, 1);
+	scope = ClusterColdRecoveryCtrcScope(info.cluster_tx_start, &native_ctrc_work);
+	request.tx_closure_scope = scope;
+	manifests = observation_manifests; steps = observation_steps;
+	released = observation_scope_releases; allocated = allocations;
+	UT_ASSERT(ClusterColdRecoveryCtrcSerialRequestCurrent(info.cluster_tx_start,
+		&native_ctrc_work, 1, scope, &request));
+	UT_ASSERT_EQ(observation_manifests, manifests); UT_ASSERT_EQ(observation_steps, steps);
+	UT_ASSERT_EQ(observation_scope_releases, released); UT_ASSERT_EQ(allocations, allocated);
+	native_ctrc_work.entries[1].slot.first_undo_block.raw[0]++;
+	UT_ASSERT(!ClusterColdRecoveryCtrcSerialRequestCurrent(info.cluster_tx_start,
+		&native_ctrc_work, 1, scope, &request));
+	UT_ASSERT(observation_cursor_live && observation_scope_live);
+	UT_ASSERT_EQ(observation_scope_releases, released);
+}
+
+UT_TEST(test_ctrc_serial_current_refuses_every_changed_request_binding)
+{
+	ClusterRecoverySerialRequest request, changed;
+	ClusterWalInputsV1 *scope;
+	observation_ready();
+	UT_ASSERT(ClusterColdRecoveryCtrcObserve(info.cluster_tx_start, 2 * 1024 * 1024));
+	request = ClusterColdRecoveryCtrcSerialRequest(info.cluster_tx_start, &native_ctrc_work, 0);
+	scope = ClusterColdRecoveryCtrcScope(info.cluster_tx_start, &native_ctrc_work);
+	request.tx_closure_scope = scope;
+	for (unsigned fault = 0; fault < 10; fault++) {
+		changed = request;
+		switch (fault) {
+		case 0: changed.mode = CLUSTER_RECOVERY_SERIAL_ONLINE; break;
+		case 1: changed.duty.origin_owner_incarnation++; break;
+		case 2: changed.expected_root_token.origin_thread_id++; break;
+		case 3: changed.pending.generation++; break;
+		case 4: changed.formation = NULL; break;
+		case 5: changed.fence_need_set = NULL; break;
+		case 6: changed.fence_admission_set = NULL; break;
+		case 7: changed.tx_closure_scope = NULL; break;
+		case 8: changed.acquire_timeout_ms++; break;
+		case 9: changed.release_timeout_ms++; break;
+		}
+		UT_ASSERT(!ClusterColdRecoveryCtrcSerialRequestCurrent(info.cluster_tx_start,
+			&native_ctrc_work, 0, scope, &changed));
+	}
+	UT_ASSERT(ClusterColdRecoveryCtrcSerialRequestCurrent(info.cluster_tx_start,
+		&native_ctrc_work, 0, scope, &request));
+}
+
+UT_TEST(test_ctrc_serial_current_late_drift_never_closes_borrowed_native_scope)
+{
+	for (ctrc_request_late_fault = 0; ctrc_request_late_fault < 11; ctrc_request_late_fault++) {
+		ClusterRecoverySerialRequest request;
+		ClusterWalInputsV1 *scope;
+		unsigned released;
+		observation_two_ready();
+		UT_ASSERT(ClusterColdRecoveryCtrcObserve(info.cluster_tx_start, 2 * 1024 * 1024));
+		request = ClusterColdRecoveryCtrcSerialRequest(info.cluster_tx_start, &native_ctrc_work, 0);
+		scope = ClusterColdRecoveryCtrcScope(info.cluster_tx_start, &native_ctrc_work);
+		request.tx_closure_scope = scope; released = observation_scope_releases;
+		ctrc_request_step = ctrc_source_request_late_change;
+		UT_ASSERT(!ClusterColdRecoveryCtrcSerialRequestCurrent(info.cluster_tx_start,
+			&native_ctrc_work, 0, scope, &request));
+		UT_ASSERT(observation_cursor_live && observation_scope_live);
+		UT_ASSERT_EQ(observation_scope_releases, released);
+		if (ctrc_request_late_fault == 6) owner_boot--;
+	}
+}

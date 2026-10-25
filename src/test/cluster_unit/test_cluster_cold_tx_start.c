@@ -2233,7 +2233,11 @@ UT_TEST(test_c0_error_closes_target_before_ir_and_walr)
 
 int main(void)
 {
-	UT_PLAN(106);
+	UT_PLAN(110);
+	UT_RUN(test_ctrc_serial_current_borrows_only_the_original_complete_scope);
+	UT_RUN(test_ctrc_serial_current_rechecks_without_manifest_io_or_scope_cleanup);
+	UT_RUN(test_ctrc_serial_current_refuses_every_changed_request_binding);
+	UT_RUN(test_ctrc_serial_current_late_drift_never_closes_borrowed_native_scope);
 	UT_RUN(test_ctrc_source_request_keeps_original_source_and_provisional_bindings);
 	UT_RUN(test_ctrc_source_request_accepts_existing_terminals_without_a_c0_subject);
 	UT_RUN(test_ctrc_source_request_requires_original_complete_observation_and_source);

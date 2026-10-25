@@ -1225,9 +1225,29 @@ cluster_recovery_cold_ctrc_source(const ClusterColdTypedV1 *typed, uint16 owner)
 	return target;
 }
 
-ClusterRecoverySerialRequest
-ClusterColdRecoveryCtrcSerialRequest(const struct ClusterRecoveryStartV1 *start,
+/* An IR callback cannot invoke the full getter: manifest revalidation may
+ * perform I/O and refusal cleanup would retire the scope it is borrowing.
+ * Original private physical bytes and canonical terminal are checked locally. */
+static const ClusterColdCtrcPhysicalV1 *
+cluster_recovery_cold_ctrc_local_physical(const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdCtrcWorkV1 *work, uint32 subject_index)
+{
+	ClusterColdTtSlotInputV1 terminal;
+
+	if (!ClusterColdRecoveryCtrcWorkCurrent(start, work)
+		|| !start->ctrc_observation_complete || work != start->ctrc_observation_work
+		|| !cluster_recovery_cold_observation_current(start)
+		|| subject_index >= start->ctrc_physical->count
+		|| !cluster_recovery_ctrc_terminal_subject_v1(start, work, subject_index,
+			&start->ctrc_physical->entries[subject_index], &terminal)
+		|| !cluster_recovery_cold_observation_current(start))
+		return NULL;
+	return start->ctrc_physical;
+}
+
+static ClusterRecoverySerialRequest
+cluster_recovery_cold_ctrc_serial_request(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 subject_index, bool manifest)
 {
 	ClusterRecoverySerialRequest request, empty;
 	const ClusterColdTypedV1 *typed;
@@ -1242,7 +1262,8 @@ ClusterColdRecoveryCtrcSerialRequest(const struct ClusterRecoveryStartV1 *start,
 	memset(&request, 0, sizeof(request));
 	memset(&empty, 0, sizeof(empty));
 	if (CritSectionCount != 0 || !ClusterColdRecoveryCtrcWorkCurrent(start, work)
-		|| (physical = ClusterColdRecoveryCtrcPhysical(start, work)) == NULL
+		|| (physical = manifest ? ClusterColdRecoveryCtrcPhysical(start, work)
+			: cluster_recovery_cold_ctrc_local_physical(start, work, subject_index)) == NULL
 		|| subject_index >= physical->count)
 		return empty;
 	typed = start->inputs;
@@ -1263,10 +1284,12 @@ ClusterColdRecoveryCtrcSerialRequest(const struct ClusterRecoveryStartV1 *start,
 	if (!cluster_recovery_merge_fence_plan_tx_request_v1(fence,
 			&typed->sources[target], &request))
 		return empty;
-	confirmed = ClusterColdRecoveryCtrcPhysical(start, work);
-	/* The original getter validates the complete work, accepted TX value,
-	 * manifest and every canonical terminal again. It cannot start a new view.
-	 * Keep our selected raw bytes and full old-source identity across callbacks. */
+	confirmed = manifest ? ClusterColdRecoveryCtrcPhysical(start, work)
+		: cluster_recovery_cold_ctrc_local_physical(start, work, subject_index);
+	/* The full getter validates the manifest and every canonical terminal;
+	 * the local callback validates the same work/TX and selected terminal
+	 * without I/O or cleanup. Neither starts a new view. Keep selected raw
+	 * bytes and the full old-source identity across both paths' callbacks. */
 	if (confirmed != physical || !ClusterColdRecoveryCtrcWorkCurrent(start, work)
 		|| start->inputs != typed || start->tx_fence != fence
 		|| typed->replay_count != replay_count || typed->participant_count != participant_count
@@ -1278,6 +1301,49 @@ ClusterColdRecoveryCtrcSerialRequest(const struct ClusterRecoveryStartV1 *start,
 		|| !cluster_recovery_cold_observation_current(start))
 		return empty;
 	return request;
+}
+
+ClusterRecoverySerialRequest
+ClusterColdRecoveryCtrcSerialRequest(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 subject_index)
+{
+	return cluster_recovery_cold_ctrc_serial_request(start, work, subject_index, true);
+}
+
+struct ClusterWalInputsV1 *
+ClusterColdRecoveryCtrcScope(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work)
+{
+	if (CritSectionCount != 0 || !ClusterColdRecoveryCtrcWorkCurrent(start, work)
+		|| !start->ctrc_observation_complete || work != start->ctrc_observation_work
+		|| !cluster_recovery_cold_observation_current(start))
+		return NULL;
+	return start->ctrc_observation_inputs;
+}
+
+bool
+ClusterColdRecoveryCtrcSerialRequestCurrent(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 subject_index,
+	struct ClusterWalInputsV1 *scope, const ClusterRecoverySerialRequest *request)
+{
+	ClusterRecoverySerialRequest original, expected;
+
+	if (request == NULL || scope == NULL || ClusterColdRecoveryCtrcScope(start, work) != scope)
+		return false;
+	memcpy(&original, request, sizeof(original));
+	expected = cluster_recovery_cold_ctrc_serial_request(start, work, subject_index, false);
+	return expected.mode == CLUSTER_RECOVERY_SERIAL_TX_CLOSURE
+		&& original.mode == expected.mode && original.tx_closure_scope == scope
+		&& memcmp(&original.duty, &expected.duty, sizeof(expected.duty)) == 0
+		&& memcmp(&original.expected_root_token, &expected.expected_root_token,
+			sizeof(expected.expected_root_token)) == 0
+		&& memcmp(&original.pending, &expected.pending, sizeof(expected.pending)) == 0
+		&& original.formation == expected.formation
+		&& original.fence_need_set == expected.fence_need_set
+		&& original.fence_admission_set == expected.fence_admission_set
+		&& original.acquire_timeout_ms == expected.acquire_timeout_ms
+		&& original.release_timeout_ms == expected.release_timeout_ms
+		&& memcmp(request, &original, sizeof(original)) == 0;
 }
 
 bool
