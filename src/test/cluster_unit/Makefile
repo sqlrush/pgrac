@@ -2048,6 +2048,8 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_freeze_cohort_current.inc \
 		test_cluster_heap_freeze_cohort_backend.inc \
 		test_cluster_heap_freeze_worker_current.inc \
+		test_cluster_active_sample_types.inc test_cluster_active_sample_fence.inc \
+		$(top_srcdir)/src/include/cluster/cluster_reconfig.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_horizon.h \
 		$(top_srcdir)/src/include/cluster/cluster_conf.h \
