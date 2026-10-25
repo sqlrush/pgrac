@@ -42,6 +42,7 @@
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_heap_horizon.h"
+#include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_undo_cleaner.h"
 #include "cluster/cluster_undo_horizon.h"
 #include "cluster/cluster_conf.h"
@@ -379,11 +380,122 @@ cluster_semantic_activation_recheck_r4_terminal_census(
 	UT_ASSERT(token != NULL && token->entered);
 	return admission_current;
 }
-/* Compile the original policy-current predicate; only its original stripe
- * fence observation and the independent cohort getter remain controlled. */
+/* Compile the original policy-current predicate; its lease observation
+ * below also executes the original retained stripe comparison. */
 #define cluster_heap_freeze_policy_sample_current_v1 actual_saved_policy_current
 #include "test_cluster_heap_freeze_policy_current.inc"
 #undef cluster_heap_freeze_policy_sample_current_v1
+
+/* Execute the original retained stripe comparison. Only external slot /
+ * QVOTEC observations and local lock scheduling remain controlled. */
+static ClusterXidStripeSampleFence retained_lease_fence;
+static bool lease_cluster_on, lease_catalog_on, lease_quorum, lease_lock_held;
+static uint64 lease_incarnation;
+static int lease_slot, lease_after_policy_fault, lease_revoke_after_unlock, lease_revoke_kind;
+static unsigned lease_lock_acquires, lease_lock_releases, lease_incarnation_reads, lease_quorum_reads;
+static unsigned lease_error_read;
+static void retained_lease_lock(LWLock *, LWLockMode);
+static void retained_lease_unlock(LWLock *);
+static int retained_lease_slot(void);
+static uint64 retained_lease_incarnation(void);
+static bool retained_lease_quorum(void);
+#define cluster_enabled lease_cluster_on
+#define cluster_shared_catalog lease_catalog_on
+#define cluster_xid_allocation_slot retained_lease_slot
+#define cluster_qvotec_get_self_incarnation retained_lease_incarnation
+#define cluster_qvotec_in_quorum retained_lease_quorum
+#define LWLockAcquire retained_lease_lock
+#define LWLockRelease retained_lease_unlock
+#define cluster_xid_stripe_sample_fence_current original_retained_lease_current
+#include "test_cluster_heap_freeze_lease_current.inc"
+#undef cluster_xid_stripe_sample_fence_current
+#undef LWLockRelease
+#undef LWLockAcquire
+#undef cluster_qvotec_in_quorum
+#undef cluster_qvotec_get_self_incarnation
+#undef cluster_xid_allocation_slot
+#undef cluster_shared_catalog
+#undef cluster_enabled
+static ClusterXidStripeBootShmem native_lease_shared;
+
+static int retained_lease_slot(void) { return lease_slot; }
+static bool retained_lease_quorum(void) { lease_quorum_reads++; return lease_quorum; }
+static uint64
+retained_lease_incarnation(void)
+{
+	lease_incarnation_reads++;
+	if (lease_error_read == lease_incarnation_reads)
+		elog(ERROR, "injected original lease incarnation observer ERROR");
+	return lease_incarnation;
+}
+
+static void
+retained_lease_fault(int fault)
+{
+	switch (fault) {
+	case 0: StripeBootShmem = NULL; break;
+	case 1: StripeLease = NULL; break;
+	case 2: native_lease_shared.disk_state = CLUSTER_XID_STRIPE_DISK_UNKNOWN; break;
+	case 3: native_lease_shared.floor_full++; break;
+	case 4: native_lease_shared.epoch++; break;
+	case 5: native_lease_shared.generation++; break;
+	case 6: native_lease_shared.slot_state = CLUSTER_XID_STRIPE_SLOT_UNKNOWN; break;
+	case 7: native_lease_shared.my_slot_claimed = false; break;
+	case 8: native_lease_shared.my_slot_floor_full++; break;
+	case 9: native_lease_shared.my_owner_incarnation++; break;
+	case 10: pg_atomic_write_u64(&native_lease_shared.lease.limit_full, retained_lease_fence.lease_limit_full - 1); break;
+	case 11: pg_atomic_fetch_add_u64(&native_lease_shared.lease.floor_full, 1); break;
+	case 12: pg_atomic_fetch_add_u64(&native_lease_shared.lease.published_incarnation, 1); break;
+	case 13: pg_atomic_write_u32(&native_lease_shared.lease.failed, 1); break;
+	}
+}
+
+static void
+retained_lease_lock(LWLock *lock, LWLockMode mode)
+{
+	UT_ASSERT(lock == &native_lease_shared.lock && mode == LW_SHARED && !lease_lock_held);
+	lease_lock_held = true; lease_lock_acquires++;
+}
+
+static void
+retained_lease_unlock(LWLock *lock)
+{
+	UT_ASSERT(lock == &native_lease_shared.lock && lease_lock_held);
+	lease_lock_held = false; lease_lock_releases++;
+	if (lease_lock_releases == 1 && lease_after_policy_fault >= 0)
+		retained_lease_fault(lease_after_policy_fault);
+	if (lease_lock_releases == lease_revoke_after_unlock) {
+		if (lease_revoke_kind == 1) lease_incarnation++;
+		else if (lease_revoke_kind == 2) lease_quorum = false;
+	}
+}
+
+static void
+retained_lease_publish_fixture(ClusterHeapFreezePolicySampleV1 *policy)
+{
+	/* Fixture image only: no lease grant, IO or production publisher. */
+	memset(&native_lease_shared, 0, sizeof(native_lease_shared));
+	StripeBootShmem = &native_lease_shared; StripeLease = &native_lease_shared.lease;
+	retained_lease_fence = (ClusterXidStripeSampleFence){
+		.activation_floor_full = UINT64CONST(0x100000003), .activation_epoch = 21,
+		.activation_generation = 13, .slot_floor_full = UINT64CONST(0x100000003),
+		.slot_owner_incarnation = 9, .incarnation = 9,
+		.lease_floor_full = UINT64CONST(0x100000003),
+		.lease_limit_full = U64FromFullTransactionId(policy->legal_next), .slot = 0 };
+	native_lease_shared.disk_state = CLUSTER_XID_STRIPE_DISK_PUBLISHED;
+	native_lease_shared.floor_full = retained_lease_fence.activation_floor_full;
+	native_lease_shared.epoch = retained_lease_fence.activation_epoch;
+	native_lease_shared.generation = retained_lease_fence.activation_generation;
+	native_lease_shared.slot_state = CLUSTER_XID_STRIPE_SLOT_MINE;
+	native_lease_shared.my_slot_claimed = true;
+	native_lease_shared.my_slot_floor_full = retained_lease_fence.slot_floor_full;
+	native_lease_shared.my_owner_incarnation = retained_lease_fence.slot_owner_incarnation;
+	pg_atomic_init_u64(&StripeLease->floor_full, retained_lease_fence.lease_floor_full);
+	pg_atomic_init_u64(&StripeLease->limit_full, retained_lease_fence.lease_limit_full);
+	pg_atomic_init_u64(&StripeLease->published_incarnation, retained_lease_fence.incarnation);
+	pg_atomic_init_u32(&StripeLease->failed, 0);
+	policy->allocation_fence = retained_lease_fence;
+}
 
 bool
 cluster_xid_stripe_sample_fence_current(const ClusterXidStripeSampleFence *fence)
@@ -397,7 +509,7 @@ cluster_xid_stripe_sample_fence_current(const ClusterXidStripeSampleFence *fence
 		UT_ASSERT(fence == &expected_current_policy->allocation_fence);
 	allocation_fence_checks++;
 	if (allocation_fence_error) elog(ERROR, "injected original stripe fence error");
-	return saved_policy_current;
+	return saved_policy_current && original_retained_lease_current(fence);
 }
 
 /* Instrument the original unlocked call without replacing its predicate. */
@@ -434,6 +546,7 @@ cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out)
 	memset(out, 0, sizeof(*out));
 	out->sample_id = cohort_source_input->source_local_sample_id;
 	out->worker_pid = 42;
+	out->lease_fence = retained_lease_fence;
 	out->scan = cohort_source_input->local_registration_cut;
 	out->admission_fence = cohort_source_input->admission_fence;
 	switch (cohort_sample_fault) {
@@ -475,7 +588,7 @@ worker_current_lease(const ClusterXidStripeSampleFence *fence)
 	UT_ASSERT(fence != NULL && !worker_lock_held);
 	worker_lease_checks++;
 	if (worker_lease_error) elog(ERROR, "injected original worker lease ERROR");
-	return worker_lease_ok;
+	return worker_lease_ok && original_retained_lease_current(fence);
 }
 
 /* Original admission seqlock, policy, capture and complete-fence comparison.
@@ -634,6 +747,7 @@ worker_current_publish_fixture(const ClusterHeapFreezeCohortObservation *cohort)
 	memset(sample, 0, sizeof(*sample));
 	sample->sample_id = cohort->source_local_sample_id;
 	sample->worker_pid = 42;
+	sample->lease_fence = retained_lease_fence;
 	sample->scan = cohort->local_registration_cut;
 	sample->admission_fence = cohort->admission_fence;
 	native_worker_shared.workers[0].pid = 42;
@@ -1196,6 +1310,12 @@ reset(uint8 opcode, bool shared)
 	target_preflight_checks = census_preflight_checks = 0;
 	policy_current_checks = cohort_current_checks = 0;
 	allocation_fence_checks = 0; allocation_fence_error = false;
+	lease_cluster_on = lease_catalog_on = lease_quorum = true; lease_lock_held = false;
+	lease_incarnation = 9; lease_slot = 0; lease_after_policy_fault = -1;
+	lease_revoke_after_unlock = lease_revoke_kind = 0;
+	lease_lock_acquires = lease_lock_releases = lease_incarnation_reads = lease_quorum_reads = 0;
+	lease_error_read = 0;
+
 	cluster_xid_striping = true;
 	saved_policy_current = true; saved_cohort_status = CLUSTER_HEAP_FREEZE_COHORT_READY;
 	memset(&cohort_shared, 0, sizeof(cohort_shared));
@@ -1607,6 +1727,7 @@ qualified_xmin_setup(QualifiedXminFixture *f, uint16 xmax_mask)
 	f->admission.formation_epoch = 21;
 	f->policy.legal_next = FullTransactionIdFromEpochAndXid(1, 200);
 	f->policy.freeze_limit = FullTransactionIdFromEpochAndXid(1, 100);
+	retained_lease_publish_fixture(&f->policy);
 	f->cohort.active_full_xid_min = U64FromFullTransactionId(f->policy.freeze_limit);
 	f->cohort.future_full_xid_max = U64FromFullTransactionId(f->policy.legal_next);
 	f->cohort.local_registration_cut.min_full = f->policy.freeze_limit;
@@ -4464,10 +4585,153 @@ UT_TEST(test_xmin_original_admission_excludes_heartbeat_generation_from_identity
 	}
 }
 
+UT_TEST(test_xmin_original_retained_lease_continues_native_wal)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		qualified_xmin_require_peer(&f, 65);
+		fixture_release_original_writer(); resume_allowed = true;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(lease_lock_acquires, 3); UT_ASSERT_EQ(lease_lock_releases, 3);
+		UT_ASSERT_EQ(lease_incarnation_reads, 6); UT_ASSERT_EQ(lease_quorum_reads, 6);
+		UT_ASSERT_EQ(allocation_fence_checks, 1); UT_ASSERT_EQ(worker_lease_checks, 2);
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT(!lease_lock_held && !worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
+UT_TEST(test_xmin_original_retained_lease_refuses_state_drift_at_policy_and_worker)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int worker = 0; worker < 2; worker++) {
+			for (int fault = 0; fault < 14; fault++) {
+				QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+				fixture_release_original_writer(); resume_allowed = true;
+				if (worker) lease_after_policy_fault = fault; else retained_lease_fault(fault);
+				UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+				UT_ASSERT_EQ(worker_lease_checks, worker);
+				UT_ASSERT_EQ(worker_lock_acquires + worker_lock_releases, 0);
+				UT_ASSERT_EQ(lease_lock_acquires, lease_lock_releases);
+				UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+				UT_ASSERT(!lease_lock_held && !worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+				UT_ASSERT_EQ(backend_pin_count, 1);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_retained_lease_prerequisites_refuse_before_lock)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int fault = 0; fault < 6; fault++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			fixture_release_original_writer(); resume_allowed = true;
+			switch (fault) {
+			case 0: lease_cluster_on = false; break;
+			case 1: lease_catalog_on = false; break;
+			case 2: lease_slot = -1; break;
+			case 3: lease_slot = CLUSTER_XID_STRIDE; break;
+			case 4: lease_incarnation++; break;
+			case 5: lease_quorum = false; break;
+			}
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(lease_lock_acquires + lease_lock_releases, 0);
+			UT_ASSERT_EQ(worker_lock_acquires + worker_lock_releases, 0);
+			UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(!lease_lock_held && !worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_retained_lease_rechecks_incarnation_quorum_after_unlock)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int stage = 1; stage <= 2; stage++) {
+			for (int kind = 1; kind <= 2; kind++) {
+				QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+				fixture_release_original_writer(); resume_allowed = true;
+				lease_revoke_after_unlock = stage; lease_revoke_kind = kind;
+				UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+				UT_ASSERT_EQ(lease_lock_acquires, stage); UT_ASSERT_EQ(lease_lock_releases, stage);
+				UT_ASSERT_EQ(worker_lock_acquires + worker_lock_releases, 0);
+				UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+				UT_ASSERT(!lease_lock_held && !worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+				UT_ASSERT_EQ(backend_pin_count, 1);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_retained_lease_observer_error_preserves_caller_resources)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int worker = 0; worker < 2; worker++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			fixture_release_original_writer(); resume_allowed = expecting_error = true;
+			lease_error_read = worker ? 3 : 1;
+			if (setjmp(error_jump) == 0) {
+				if (batch) (void)qualified_xmin_batch_apply(&f, targets, 3);
+				else (void)qualified_xmin_apply(&f, 0);
+				UT_ASSERT(false);
+			} else {
+				UT_ASSERT_EQ(lease_lock_acquires, worker); UT_ASSERT_EQ(lease_lock_releases, worker);
+				UT_ASSERT_EQ(worker_lock_acquires + worker_lock_releases, 0);
+				UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+				UT_ASSERT(!lease_lock_held && !worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+				UT_ASSERT_EQ(backend_pin_count, 1);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+			expecting_error = false;
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_retained_lease_allows_same_identity_renewal)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		pg_atomic_fetch_add_u64(&StripeLease->limit_full, 100);
+		fixture_release_original_writer(); resume_allowed = true;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(lease_lock_acquires, 3); UT_ASSERT_EQ(lease_lock_releases, 3);
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT(!lease_lock_held && !worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(120);
+	UT_PLAN(126);
+	UT_RUN(test_xmin_original_retained_lease_continues_native_wal);
+	UT_RUN(test_xmin_original_retained_lease_refuses_state_drift_at_policy_and_worker);
+	UT_RUN(test_xmin_original_retained_lease_prerequisites_refuse_before_lock);
+	UT_RUN(test_xmin_original_retained_lease_rechecks_incarnation_quorum_after_unlock);
+	UT_RUN(test_xmin_original_retained_lease_observer_error_preserves_caller_resources);
+	UT_RUN(test_xmin_original_retained_lease_allows_same_identity_renewal);
+
 	UT_RUN(test_xmin_original_admission_capture_current_continues_native_wal);
 	UT_RUN(test_xmin_original_admission_refuses_changed_publication_or_identity);
 	UT_RUN(test_xmin_original_admission_lifecycle_prerequisites_refuse_before_writer);
