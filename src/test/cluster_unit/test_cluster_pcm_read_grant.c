@@ -1135,10 +1135,82 @@ UT_TEST(test_cached_replay_without_local_owner_never_mints_another_delivery)
 	}
 }
 
+UT_TEST(test_native_service_generation_survives_replay_and_exact_retirement)
+{
+	BufferTag tag = make_tag(155);
+	ClusterPcmReadGrant grant, replay, work;
+	uint32 cursor = 0;
+	reset_fake_pcm_runtime(4);
+	grant = begin_read(tag, 1, 13, 155);
+	UT_ASSERT_EQ(grant.service_generation, 1);
+	UT_ASSERT_EQ(cluster_pcm_lock_read_grant_begin(tag, 1, 13, 155, 1,
+		INT64_MAX - 10000, false, &replay), PCM_GCS_TRANSITION_APPLIED);
+	UT_ASSERT_EQ(replay.service_generation, grant.service_generation);
+	UT_ASSERT_EQ(replay.binding_generation, grant.binding_generation);
+	UT_ASSERT(cluster_pcm_lock_read_grant_blocker_snapshot(tag, 1, &work));
+	UT_ASSERT_EQ(work.service_generation, grant.service_generation);
+	UT_ASSERT(cluster_pcm_lock_read_grant_done(&grant.key, 1, false));
+	UT_ASSERT(cluster_pcm_lock_read_grant_work(&cursor, 1, 2, 10001, 1, &work));
+	UT_ASSERT(work.revoking);
+	UT_ASSERT_EQ(work.service_generation, grant.service_generation);
+	UT_ASSERT(cluster_pcm_lock_read_grant_revoke_ack(&grant.key));
+	cursor = 0;
+	UT_ASSERT(cluster_pcm_lock_read_grant_work(&cursor, 1, 2, 20001, 1, &work));
+	UT_ASSERT(work.ack_consumed);
+	UT_ASSERT_EQ(work.service_generation, grant.service_generation);
+	UT_ASSERT(cluster_pcm_lock_read_grant_retire_notice_admitted(&grant.key));
+	replay = begin_read(tag, 1, 13, 156);
+	UT_ASSERT_EQ(replay.service_generation, 1);
+	UT_ASSERT(!cluster_pcm_lock_read_grant_revoke_ack(&grant.key));
+	UT_ASSERT(cluster_pcm_lock_read_grant_done(&replay.key, 1, true));
+}
+
+UT_TEST(test_saved_frame_cannot_cross_native_service_generation)
+{
+	for (int disk = 0; disk < 2; disk++) {
+		BufferTag tag = make_tag(156);
+		GcsBlockDedupKey key;
+		GcsFirstFillMasterPark *park;
+		ClusterPcmReadGrant native;
+		uint32 generation;
+		reset_fake_pcm_runtime(4); key = read_wire_setup(tag);
+		if (!disk)
+			UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_N_TO_S, 2));
+		read_admit = false;
+		read_disk_result = CLUSTER_IC_SEND_NOT_ADMITTED;
+		gcs_block_first_fill_request(&read_request, &key, 1, true);
+		UT_ASSERT_EQ(read_forwards + read_replies, 1);
+		park = &gcs_first_fill_master_parks[0];
+		UT_ASSERT(park->in_use && park->registered && !park->handed_off);
+		generation = park->grant.service_generation;
+		UT_ASSERT_EQ(generation, 1);
+		read_admit = true; read_disk_result = CLUSTER_IC_SEND_DONE;
+		for (int mismatch = 0; mismatch < 3; mismatch++) {
+			park->grant.service_generation = mismatch == 0 ? 0
+				: mismatch == 1 ? UINT32_MAX : generation + 1;
+			read_master_time += 10000; gcs_first_fill_master_tick(1);
+			UT_ASSERT_EQ(read_forwards + read_replies, 1);
+			UT_ASSERT(park->in_use && !park->handed_off);
+			UT_ASSERT_EQ(cluster_pcm_lock_read_grant_begin(tag, 1, 13,
+				read_request.request_id, 1, 10000, false, &native), PCM_GCS_TRANSITION_APPLIED);
+			UT_ASSERT_EQ(native.service_generation, generation);
+			UT_ASSERT(!native.revoking && !native.ack_consumed);
+		}
+		park->grant.service_generation = generation;
+		read_master_time += 10000; gcs_first_fill_master_tick(1);
+		UT_ASSERT_EQ(read_forwards + read_replies, 2);
+		UT_ASSERT(park->in_use && park->handed_off);
+		read_confirm_original_service();
+		UT_ASSERT(!park->in_use);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(36);
+	UT_RUN(test_native_service_generation_survives_replay_and_exact_retirement);
+	UT_RUN(test_saved_frame_cannot_cross_native_service_generation);
 	UT_RUN(test_handed_off_master_waits_without_replaying_image_or_disk_grant);
 	UT_RUN(test_master_service_retirement_cannot_consume_same_node_successor);
 	UT_RUN(test_master_service_slots_return_after_each_native_confirmation);

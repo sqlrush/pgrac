@@ -707,7 +707,8 @@ typedef struct ClusterPcmPendingS {
 	int32 holder_node;
 	uint8 phase; /* 0 empty, 1 install, 2 revoke, 3 consumed ACK notice owed */
 	uint8 holder_was_x;
-	uint8 reserved[6];
+	uint8 reserved[2];
+	uint32 service_generation;
 } ClusterPcmPendingS;
 StaticAssertDecl(sizeof(ClusterPcmPendingS) == 48, "bounded pending-S identity");
 
@@ -7478,6 +7479,7 @@ pcm_read_grant_state_valid(const ClusterPcmResourceXMasterState *state)
 		}
 		if ((claim->phase != 1 && claim->phase != 2 && claim->phase != 3) || claim->request_id == 0
 			|| claim->request_id == UINT64_MAX || claim->epoch == 0 || claim->epoch == UINT64_MAX
+			|| claim->service_generation == 0 || claim->service_generation == UINT32_MAX
 			|| claim->backend_id <= 0 || claim->backend_id > MaxBackends
 			|| claim->deadline <= 0 || claim->retry_at < 0
 			|| (claim->phase == 1 && claim->retry_at != 0)
@@ -11277,6 +11279,7 @@ pcm_read_grant_snapshot(struct GrdEntry *entry, int node, const ClusterPcmPendin
 	out->key.requester_node = node;
 	out->key.backend_id = claim->backend_id;
 	out->binding_generation = entry->binding_generation;
+	out->service_generation = claim->service_generation;
 	out->holder_node = claim->holder_node;
 	out->holder_was_x = claim->holder_was_x != 0;
 	out->revoking = claim->phase == 2;
@@ -11410,6 +11413,9 @@ cluster_pcm_lock_read_grant_begin(BufferTag tag, int32 requester, int32 backend,
 	claim->backend_id = backend;
 	claim->holder_node = holder;
 	claim->holder_was_x = mode == PCM_STATE_X;
+	/* Replays and cleanup preserve this original source-service identity.
+	 * A later service must be explicitly rebound before any new delivery. */
+	claim->service_generation = 1;
 	claim->deadline = deadline;
 	claim->phase = 1;
 	state->pending_s_bitmap |= bit;

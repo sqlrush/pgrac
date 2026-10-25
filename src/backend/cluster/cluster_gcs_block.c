@@ -18159,6 +18159,7 @@ gcs_first_fill_master_offer(GcsFirstFillMasterPark *park)
 		return;
 	}
 	if (current.binding_generation != park->grant.binding_generation
+		|| current.service_generation != park->grant.service_generation
 		|| current.holder_node != park->grant.holder_node
 		|| current.holder_was_x != park->grant.holder_was_x) {
 		park->retry_at = GetCurrentTimestamp() + 10000;
