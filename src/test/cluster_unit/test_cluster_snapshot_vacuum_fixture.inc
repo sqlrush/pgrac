@@ -167,6 +167,15 @@ GetSnapshotData(Snapshot snapshot)
 	snapshot->snapshot_type = SNAPSHOT_MVCC;
 	snapshot->xmin = 10;
 	snapshot->xmax = 200;
+	/* Native GetSnapshotData owns reusable XID storage before import copies.
+	 * These arrays replace allocation/storage only, not source visibility. */
+	if (import_install_active)
+	{
+		static TransactionId import_xip[16], import_subxip[16];
+
+		snapshot->xip = import_xip;
+		snapshot->subxip = import_subxip;
+	}
 	ClusterSnapshotRefreshFields(snapshot);
 	MyProc->xmin = snapshot->xmin;
 	/* Schedule an actual H scan in the original unpublished-reader gap.

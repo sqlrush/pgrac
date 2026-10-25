@@ -292,3 +292,159 @@ UT_TEST(refused_xmin_install_preserves_the_receivers_original_scn)
 		}
 	}
 }
+
+/* Exercise the real parallel carry, not a hand-built restored snapshot. */
+static Snapshot
+snapshot_parallel_restore(Snapshot source)
+{
+	Size size = EstimateSnapshotSpace(source);
+	char *bytes = palloc(size);
+	Snapshot restored;
+
+	SerializeSnapshot(source, bytes);
+	poison_allocations = true;
+	restored = RestoreSnapshot(bytes);
+	poison_allocations = false;
+	pfree(bytes);
+	return restored;
+}
+
+UT_TEST(parallel_serialized_snapshot_retains_original_handoff)
+{
+	for (unsigned shape = 0; shape < 4; shape++)
+	{
+		SnapshotData source = snapshot_import_begin();
+		TransactionId xip[2] = { 25, 30 }, subxip[2] = { 26, 31 };
+		Snapshot restored;
+		ClusterUndoRetentionSample sample;
+		unsigned expected_subxcnt;
+
+		source.xip = xip;
+		source.xcnt = lengthof(xip);
+		source.subxip = subxip;
+		source.subxcnt = lengthof(subxip);
+		source.suboverflowed = (shape & 1) != 0;
+		source.takenDuringRecovery = (shape & 2) != 0;
+		source.curcid = 17;
+		source.whenTaken = 12345;
+		source.lsn = 67890;
+		source.cluster_cr_identity = 99;
+		expected_subxcnt = source.suboverflowed && !source.takenDuringRecovery ? 0 : 2;
+		UT_ASSERT_EQ(EstimateSnapshotSpace(&source), sizeof(SerializedSnapshotData)
+			+ (2 + expected_subxcnt) * sizeof(TransactionId));
+		restored = snapshot_parallel_restore(&source);
+		UT_ASSERT_EQ(restored->xmin, 20);
+		UT_ASSERT_EQ(restored->xmax, 200);
+		UT_ASSERT_EQ(restored->xcnt, 2);
+		UT_ASSERT_EQ(restored->subxcnt, expected_subxcnt);
+		UT_ASSERT(restored->suboverflowed == source.suboverflowed);
+		UT_ASSERT(restored->takenDuringRecovery == source.takenDuringRecovery);
+		UT_ASSERT_EQ(restored->curcid, 17);
+		UT_ASSERT_EQ(restored->whenTaken, 12345);
+		UT_ASSERT_EQ(restored->lsn, 67890);
+		UT_ASSERT_EQ(restored->cluster_source, SNAPSHOT_SOURCE_CLUSTER);
+		UT_ASSERT_EQ(restored->read_scn, 40);
+		UT_ASSERT_EQ(restored->read_epoch, 8);
+		UT_ASSERT_EQ(restored->cluster_cr_identity, 0);
+		UT_ASSERT_EQ(restored->cluster_snapshot_session_local, 0);
+		UT_ASSERT(restored->copied && restored->regd_count == 0 && restored->active_count == 0);
+		xip[0] = subxip[0] = 150;
+		source.read_scn = 100; /* source storage may change after the carry */
+		UT_ASSERT_EQ(restored->xip[0], 25);
+		UT_ASSERT_EQ(restored->xip[1], 30);
+		if (expected_subxcnt != 0)
+		{
+			UT_ASSERT_EQ(restored->subxip[0], 26);
+			UT_ASSERT_EQ(restored->subxip[1], 31);
+		}
+		import_restored = true;
+		import_probe_after_install = true;
+		RestoreTransactionSnapshot(restored, &snapshot_procs[1]);
+		UT_ASSERT_EQ(import_install_mode, LW_EXCLUSIVE);
+		UT_ASSERT(import_gap_xmin_installed && import_gap_refused);
+		UT_ASSERT_EQ(procArray->numProcs, 1);
+		UT_ASSERT(FirstSnapshotSet && CurrentSnapshot == FirstXactSnapshot);
+		UT_ASSERT(CurrentSnapshot != restored);
+		UT_ASSERT_EQ(CurrentSnapshot->read_scn, 40);
+		UT_ASSERT_EQ(CurrentSnapshot->read_epoch, 8);
+		UT_ASSERT_EQ(CurrentSnapshot->xmin, 20);
+		UT_ASSERT_EQ(CurrentSnapshot->xcnt, 2);
+		UT_ASSERT_EQ(CurrentSnapshot->xip[0], 25);
+		UT_ASSERT_EQ(CurrentSnapshot->subxcnt, expected_subxcnt);
+		if (expected_subxcnt != 0)
+			UT_ASSERT_EQ(CurrentSnapshot->subxip[0], 26);
+		pfree(restored); /* registered transaction snapshot owns its own copy */
+		UT_ASSERT(catalog_history_sample(&sample));
+		UT_ASSERT_EQ(sample.horizon_scn, 40);
+		UT_ASSERT_EQ(sample.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+		UT_ASSERT_EQ(sample.contributor_token, 1);
+		snapshot_import_end();
+	}
+}
+
+UT_TEST(parallel_serialized_unknown_history_cannot_borrow_clock)
+{
+	const SCN unknown[] = { InvalidScn, (SCN) UINT64_MAX };
+
+	for (unsigned i = 0; i < lengthof(unknown); i++)
+	{
+		SnapshotData source = snapshot_import_begin();
+		Snapshot restored;
+		ClusterUndoRetentionSample sample, zero = { 0 };
+
+		source.read_scn = unknown[i];
+		restored = snapshot_parallel_restore(&source);
+		UT_ASSERT_EQ(restored->read_scn, unknown[i]);
+		import_restored = true;
+		import_probe_after_install = true;
+		RestoreTransactionSnapshot(restored, &snapshot_procs[1]);
+		UT_ASSERT(import_gap_xmin_installed && import_gap_refused);
+		UT_ASSERT_EQ(CurrentSnapshot->read_scn, unknown[i]);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), unknown[i]);
+		pfree(restored);
+		memset(&sample, 0xa5, sizeof(sample));
+		UT_ASSERT(!catalog_history_sample(&sample));
+		UT_ASSERT(memcmp(&sample, &zero, sizeof(sample)) == 0);
+		snapshot_import_end();
+	}
+}
+
+UT_TEST(parallel_serialized_copy_cannot_replace_original_source_admission)
+{
+	for (unsigned fault = 0; fault < 3; fault++)
+	{
+		SnapshotData source = snapshot_import_begin();
+		Snapshot restored = snapshot_parallel_restore(&source);
+		ClusterUndoRetentionSample sample, zero = { 0 };
+		volatile bool caught = false;
+
+		import_restored = true;
+		if (fault == 0)
+			snapshot_procs[1].databaseId++;
+		else if (fault == 1)
+			snapshot_procs[1].xmin = InvalidTransactionId;
+		else
+			snapshot_procs[1].xmin = 21;
+		error_code = 0;
+		PG_TRY();
+		{
+			RestoreTransactionSnapshot(restored, &snapshot_procs[1]);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(error_code, ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE);
+		UT_ASSERT(!retention_lock && !FirstSnapshotSet && FirstXactSnapshot == NULL);
+		UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
+		pfree(restored);
+		/* Remove the refused source before evaluating the receiver alone. */
+		procArray->numProcs = 1;
+		memset(&sample, 0xa5, sizeof(sample));
+		UT_ASSERT(!catalog_history_sample(&sample));
+		UT_ASSERT(memcmp(&sample, &zero, sizeof(sample)) == 0);
+		snapshot_import_end();
+	}
+}
