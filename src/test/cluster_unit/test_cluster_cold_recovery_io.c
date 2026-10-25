@@ -338,6 +338,7 @@ scan_reset(void)
 	observed_records_delta = 0;
 	observed_end = 0x1300;
 	memset(decode_refusal_at, 0, sizeof(decode_refusal_at));
+	memset(decode_record_flags, 0, sizeof(decode_record_flags));
 	memset(decode_xid_input, 0, sizeof(decode_xid_input));
 	decode_releases = 0;
 	memset(&selected_checkpoint, 0, sizeof(selected_checkpoint));
@@ -1317,10 +1318,97 @@ UT_TEST(test_native_window_exports_only_after_complete_original_retained_visit)
 		}
 }
 
+UT_TEST(test_scan_failure_reports_current_native_header_for_root_and_history)
+{
+	for (unsigned history = 0; history < 2; history++) {
+		ClusterColdScanResultV1 result;
+		ClusterColdPlanV1 *plan = NULL;
+		if (history) {
+			(void)history_counter_input(0x1000);
+			plan = history_counter_plan();
+		} else
+			scan_reset();
+		visit_headers[1].xl_rmid = RM_DBASE_ID;
+		visit_headers[1].xl_info = 0x51;
+		visit_headers[1].xl_tot_len = 1234;
+		visit_lengths[1] = 876;
+		decode_refusal_at[1] = CLUSTER_COLD_OPCODE_UNSUPPORTED;
+		UT_ASSERT_EQ(history
+			? cluster_cold_scan_input_v1(plan, 0, SCOPE, 0, false, true, NULL, &result)
+			: scan(&result, true), CLUSTER_COLD_OPCODE_UNSUPPORTED);
+		UT_ASSERT_EQ(result.records, 1);
+		UT_ASSERT_EQ(result.failed_read_rec_ptr, visit_read[1]);
+		UT_ASSERT_EQ(result.route_detail, 9);
+		UT_ASSERT(result.failed_record_present);
+		UT_ASSERT_EQ(result.failed_record_rmid, RM_DBASE_ID);
+		UT_ASSERT_EQ(result.failed_record_info, 0x51);
+		UT_ASSERT_EQ(result.failed_record_length, 1234);
+		UT_ASSERT_EQ(result.failed_record_data_length, 876);
+		cluster_cold_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_scan_lifecycle_plan_refusal_keeps_exact_raw_info)
+{
+	ClusterColdScanResultV1 result;
+	scan_reset();
+	visit_headers[1].xl_rmid = RM_SMGR_ID;
+	visit_headers[1].xl_info = 0x21;
+	visit_headers[1].xl_tot_len = 234;
+	visit_lengths[1] = 56;
+	decode_record_flags[1] = CLUSTER_COLD_RECORD_STRUCTURAL;
+	UT_ASSERT_EQ(scan(&result, false), CLUSTER_COLD_STRUCTURAL_UNSUPPORTED);
+	UT_ASSERT_EQ(result.records, 1);
+	UT_ASSERT_EQ(result.failed_read_rec_ptr, visit_read[1]);
+	UT_ASSERT(result.failed_record_present);
+	UT_ASSERT_EQ(result.failed_record_rmid, RM_SMGR_ID);
+	UT_ASSERT_EQ(result.failed_record_info, 0x21);
+	UT_ASSERT_EQ(result.failed_record_length, 234);
+	UT_ASSERT_EQ(result.failed_record_data_length, 56);
+}
+
+UT_TEST(test_scan_checkpoint_refusal_observes_header_without_decoding)
+{
+	ClusterColdScanResultV1 result;
+	scan_reset();
+	visit_headers[0].xl_rmid = RM_HEAP_ID;
+	visit_headers[0].xl_info = 0x71;
+	visit_headers[0].xl_tot_len = 345;
+	visit_lengths[0] = 67;
+	UT_ASSERT_EQ(scan(&result, false), CLUSTER_COLD_SOURCE_GAP);
+	UT_ASSERT_EQ(result.records, 0);
+	UT_ASSERT_EQ(result.failed_read_rec_ptr, visit_read[0]);
+	UT_ASSERT(result.failed_record_present);
+	UT_ASSERT_EQ(result.failed_record_rmid, RM_HEAP_ID);
+	UT_ASSERT_EQ(result.failed_record_info, 0x71);
+	UT_ASSERT_EQ(result.failed_record_length, 345);
+	UT_ASSERT_EQ(result.failed_record_data_length, 67);
+}
+
+UT_TEST(test_scan_unavailable_header_and_new_attempt_clear_observation)
+{
+	ClusterColdScanResultV1 result;
+	for (unsigned fault = 0; fault < 3; fault++) {
+		scan_reset();
+		decode_refusal_at[1] = CLUSTER_COLD_CAPACITY;
+		UT_ASSERT_EQ(scan(&result, true), CLUSTER_COLD_CAPACITY);
+		UT_ASSERT(result.failed_record_present);
+		scan_reset();
+		if (fault == 0) checkpoint_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		if (fault == 1) visit_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		UT_ASSERT_EQ(scan(&result, true), fault < 2 ? CLUSTER_COLD_SOURCE_GAP : CLUSTER_COLD_OK);
+		UT_ASSERT(!result.failed_record_present);
+		UT_ASSERT_EQ(result.failed_record_rmid, 0);
+		UT_ASSERT_EQ(result.failed_record_info, 0);
+		UT_ASSERT_EQ(result.failed_record_length, 0);
+		UT_ASSERT_EQ(result.failed_record_data_length, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(29);
 	UT_RUN(test_native_window_exports_only_after_complete_original_retained_visit);
 	UT_RUN(test_root_checkpoint_copy_matches_every_native_byte);
 	UT_RUN(test_root_checkpoint_requires_exact_native_record_and_address);
@@ -1346,6 +1434,10 @@ main(void)
 	UT_RUN(test_census_refusals);
 	UT_RUN(test_census_covers_exactly_the_crashed_generations);
 	UT_RUN(test_scan_input_proves_the_cut);
+	UT_RUN(test_scan_failure_reports_current_native_header_for_root_and_history);
+	UT_RUN(test_scan_lifecycle_plan_refusal_keeps_exact_raw_info);
+	UT_RUN(test_scan_checkpoint_refusal_observes_header_without_decoding);
+	UT_RUN(test_scan_unavailable_header_and_new_attempt_clear_observation);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

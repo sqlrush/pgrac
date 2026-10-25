@@ -145,6 +145,38 @@ typedef struct ClusterContentTraceWalkStats {
 typedef void (*ClusterContentTraceVisitor)(const ClusterContentTraceOwner *owner,
 	void *context);
 
+typedef enum ClusterContentTraceRejectReason {
+	CLCONTENT_REJECT_BUSY = 1,
+	CLCONTENT_REJECT_COPY_REVISION,
+	CLCONTENT_REJECT_IDENTITY,
+	CLCONTENT_REJECT_CENSUS_REVISION
+} ClusterContentTraceRejectReason;
+
+typedef struct ClusterContentTraceNativeProc {
+	bool available;
+	uint32 procno;
+	int32 pid, backend_id;
+	uint64 generation;
+	uint32 wait_event_info;
+} ClusterContentTraceNativeProc;
+
+/* Owned diagnostic data after a rejection, never an owner/absence proof.
+ * Native cuts follow the deciding check; they do not replay that census. */
+typedef struct ClusterContentTraceRejection {
+	uint32 slot;
+	ClusterContentTraceRejectReason reason;
+	bool payload_copied;
+	int32 payload_pid, payload_backend_id;
+	uint32 payload_procno, payload_nlocks, payload_ngrants, payload_wait_mask;
+	int64 payload_start;
+	uint64 payload_generation, payload_revision, slot_revision, final_revision;
+	bool payload_native_waiting, payload_enqueue_waiting, payload_pcm_serving;
+	ClusterContentTraceNativeProc native_before, native_after;
+} ClusterContentTraceRejection;
+
+typedef void (*ClusterContentTraceRejectVisitor)(const ClusterContentTraceRejection *row,
+	void *context);
+
 extern void cluster_content_trace_shmem_register(void);
 /* Native PGPROC allocation, before publishing the new PID; also when disabled. */
 extern void cluster_content_trace_process_start(uint32 procno);
@@ -182,6 +214,11 @@ extern void cluster_content_trace_pair_request(Buffer target,
 extern void cluster_content_trace_capture(const BufferTag *tag, ClusterContentTraceCut *cut);
 extern void cluster_content_trace_walk(ClusterContentTraceVisitor visitor,
 	void *context, ClusterContentTraceWalkStats *stats);
+/* Optional rejected-slot detail preserves the original counters/UNKNOWN rules.
+ * No payload access on BUSY; callbacks otherwise follow source busy release. */
+extern void cluster_content_trace_walk_rejections(ClusterContentTraceVisitor visitor,
+	void *context, ClusterContentTraceRejectVisitor rejected, void *rejected_context,
+	ClusterContentTraceWalkStats *stats);
 /* Caller must have discharged its original service pin/owner obligations. */
 extern void cluster_content_trace_emit(const ClusterWaitTrace *guard,
 	const ClusterContentTraceCut *cut);

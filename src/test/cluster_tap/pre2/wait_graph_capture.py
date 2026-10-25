@@ -98,6 +98,9 @@ def pcm_logical_bridge(wait, service, resources):
     if len(queues) != 1:
         return None
     resource, queue = queues[0]
+    if any(type(queue.get(k)) is not int or not 0 <= queue[k] < 2**32
+           for k in ('incompatible','blocked')):
+        return None
     blocks = []
     for block in resource.get('blocks', []):
         slot = block.get('slot', {})
@@ -114,6 +117,7 @@ def pcm_logical_bridge(wait, service, resources):
     block = blocks[0]
     return dict(quality='retained_logical_only', master=resource['node'],
                 enqueue_order=queue['enqueue_order'], head=queue['head'],
+                awaited_sources=queue['incompatible'] & ~queue.get('blocked', 0),
                 active_slot=block['slot']['state'] != 0,
                 requester_connection=wait['requester_connection'], master_ingress=wait['ingress_connection'],
                 retained_sender=block['request']['wire_sender_connection'],
@@ -221,7 +225,7 @@ def pcm_source_custody_bridge(wait, service, resources, snapshots, service_owner
     if pcm_current_bridge(wait, service, resources, snapshots) is None:
         return None
     source, master = service['source'], wait['expected_master']
-    if (source == master or service_owner.get('node') != source or
+    if (service_owner.get('node') != source or
             service_owner.get('pcm_service') != service or service_owner.get('stable') is False or
             type(service_owner.get('procno')) is not int or service_owner['procno'] < 0):
         return None
@@ -240,11 +244,13 @@ def pcm_source_custody_bridge(wait, service, resources, snapshots, service_owner
             [r.get('node') for r in rows] != list(range(128))):
         return None
     peer = rows[master]
-    generation = peer.get('generation')
-    if (peer.get('valid') is not True or type(peer.get('bits')) is not int or
-            not 0 <= peer['bits'] < 2**32 or not peer['bits'] & 0x20000 or
-            type(generation) is not int or not 0 < generation < 2**32 or
-            generation != service['service_admission']['peer_capability_generation']):
+    # Native same-instance dispatch has no HELLO peer record and uses the
+    # separate local capability-current convention1, never a remote wire ID.
+    generation = 1 if source == master else peer.get('generation')
+    if (generation != service['service_admission']['peer_capability_generation'] or
+            (source != master and (peer.get('valid') is not True or type(peer.get('bits')) is not int or
+             not 0 <= peer['bits'] < 2**32 or not peer['bits'] & 0x20000 or
+             type(generation) is not int or not 0 < generation < 2**32))):
         return None
     owner = copies[0].get('local_owner') or {}
     handle, successor = owner.get('handle') or {}, owner.get('successor') or {}
@@ -264,7 +270,7 @@ def pcm_source_custody_bridge(wait, service, resources, snapshots, service_owner
     return dict(quality='native_source_custody_cut', source=source, master=master,
                 peer_capability_generation=generation, owner_procno=handle['procno'],
                 owner_generation=handle['generation'], holder_acquisition=handle['acquisition'],
-                receiver_local_peer_record_at_cuts=True, peer_open_current_proven=False,
+                receiver_local_peer_record_at_cuts=source != master, peer_open_current_proven=False,
                 owner_claim_incarnation_proven=False, physical_frame_receipt_proven=False)
 
 
@@ -289,9 +295,57 @@ def pcm_claim_incarnation_bridge(wait, service, resources, snapshots, service_ow
                 peer_open_current_proven=False, physical_frame_receipt_proven=False)
 
 
+def pcm_dependency_bridge(wait, service, resources, snapshots, service_owner, waiter):
+    """Exact native causal dependency at finite cuts, never delivery authority.
+
+    A current master is still awaiting this BLOCK successor; the same live
+    claimant is executing its already admitted service. Packet reconstruction
+    is unnecessary for that wait relation and remains explicitly unproved.
+    """
+    claim = pcm_claim_incarnation_bridge(wait, service, resources, snapshots, service_owner)
+    if (claim is None or waiter.get('stable') is not True or
+            waiter.get('node') != wait.get('requester') or waiter.get('pcm_wait') != wait or
+            type(waiter.get('proc_generation')) is not int or waiter['proc_generation'] <= 0):
+        return None
+    source = service['source']
+    local = next(s for s in snapshots if s['node'] == source)
+    resource = next(r for r in resources if r.get('kind') == 'pcm' and
+                    r.get('node') == source and r.get('tag') == wait['tag'])
+    streams = local.get('streams_begin') or {}
+    if (local.get('streams_stable') is not True or
+            any(cut.get(side) != streams for cut in (local,resource)
+                for side in ('streams_begin','streams_end')) or
+            streams.get('known') is not True or streams.get('epoch') != wait['formation'] or
+            type(streams.get('channels')) is not int or not 1 <= streams['channels'] <= 8):
+        return None
+    rows = streams.get('rows')
+    if (not isinstance(rows,list) or len(rows) != 128 or
+            any(not isinstance(row,dict) for row in rows) or
+            [row.get('node') for row in rows] != list(range(128))):
+        return None
+    peer = rows[wait['expected_master']]
+    loopback = source == wait['expected_master']
+    data, control = peer.get('data'), peer.get('control')
+    if loopback:
+        if (type(streams.get('local_bits')) is not int or
+                not 0 <= streams['local_bits'] < 2**32 or not streams['local_bits'] & 0x20000):
+            return None
+        data, control = [], None  # No remote stream identity exists for loopback.
+    elif (peer.get('known') is not True or type(control) is not int or
+            not 0 < control < 2**32 or
+            control != service['service_admission']['peer_capability_generation'] or
+            not isinstance(data,list) or len(data) != streams['channels'] or
+            any(type(g) is not int or not 0 < g < 2**64-1 for g in data)):
+        return None
+    return dict(quality='exact_observed_pcm_dependency',
+                native_pending_reply_dependency=True, claim=claim,
+                current_peer=dict(node=wait['expected_master'], loopback=loopback, control=control, data=list(data)),
+                atomic_graph=False, authority_proof=False, physical_frame_receipt_proven=False)
+
+
 def build_graph(snapshots, resources):
     """Join copied native identities only; unknown edges remain in the result."""
-    owners, unknown, edges, epochs = {}, [], [], {}
+    owners, unknown, edges, epochs, responsibilities = {}, [], [], {}, []
     for snapshot in snapshots:
         node = snapshot['node']
         stats = snapshot.get('stats', {})
@@ -306,9 +360,11 @@ def build_graph(snapshots, resources):
             unknown.append(dict(node=node, reason='publisher_unavailable'))
         ko = snapshot.get('ko')
         if ko is not None:
+            responsibilities.append(dict(ko, node=node))
             if ko.get('status') != 0 or ko.get('omitted', 0):
                 unknown.append(dict(node=node, reason='ko_snapshot_unavailable_or_capped', ko=ko))
-            if ko.get('rows'):
+            if any(row.get('failed') is not False or row.get('invalid') is not False
+                   for row in ko.get('rows', [])):
                 unknown.append(dict(node=node, reason='ko_process_resource_edges_unresolved', ko=ko))
         for row in snapshot.get('owners', []):
             if row.get('node') != node or row.get('stable', True) is not True:
@@ -423,6 +479,7 @@ def build_graph(snapshots, resources):
                 unknown.append(dict(process=identity(row), reason='enqueue_no_proven_conflicting_holder', wait=wait))
         if row.get('pcm_wait'):
             wait = row['pcm_wait']
+            resolved_sources, awaited_sources = 0, 0
             keys = ('tag', 'requester', 'request_seq', 'formation',
                     'master_session', 'base', 'expected_master')
             for service_owner in owners.values():
@@ -435,21 +492,29 @@ def build_graph(snapshots, resources):
                         all(isinstance(wait.get(key), int) and wait[key] > 0
                             for key in ('request_seq', 'formation', 'master_session')) and
                         all(wait.get(key) == service.get(key) for key in keys)):
-                    # This is an active native call, not a grant or canonical
-                    # route/transport receipt. Master sender != requester wire.
+                    # Current native pending successor + original claimant can
+                    # prove the causal edge without inventing a frame receipt.
+                    dependency = pcm_dependency_bridge(wait, service, resources, snapshots, service_owner, row)
+                    logical = pcm_logical_bridge(wait, service, resources)
+                    if dependency is not None:
+                        resolved_sources |= 1 << service['source']
+                        awaited_sources |= logical['awaited_sources']
                     add(row, service_owner, dict(kind='pcm', tag=wait['tag'],
                         request_seq=wait['request_seq'], requester=wait['requester'],
                         formation=wait['formation'], master_session=wait['master_session'],
                         base=wait['base'], master=wait['expected_master'],
-                        logical_bridge=pcm_logical_bridge(wait, service, resources),
+                        logical_bridge=logical, dependency=dependency,
                         native_admission=pcm_admission_bridge(wait, service, resources),
                         current_context=pcm_current_bridge(wait, service, resources, snapshots),
                         source_custody=pcm_source_custody_bridge(wait, service, resources, snapshots, service_owner),
                         claim_incarnation=pcm_claim_incarnation_bridge(wait, service, resources, snapshots, service_owner),
                         service_wire_sender_connection=service.get('wire_sender_connection')),
-                        'candidate_pcm_service')
-            unknown.append(dict(process=identity(row), reason='pcm_service_process_edge_unresolved',
-                                wait=row['pcm_wait']))
+                        'exact_observed_pcm_dependency' if dependency is not None else 'candidate_pcm_service')
+            if not resolved_sources:
+                unknown.append(dict(process=identity(row), reason='pcm_service_process_edge_unresolved', wait=wait))
+            elif awaited_sources & ~resolved_sources:
+                unknown.append(dict(process=identity(row), reason='pcm_incompatible_sources_unmapped',
+                                    source_mask=awaited_sources & ~resolved_sources, wait=wait))
         if row.get('tx_wait'):
             unknown.append(dict(process=identity(row), reason='tx_source_edge_unresolved', wait=row['tx_wait']))
     for resource in resources:
@@ -461,7 +526,8 @@ def build_graph(snapshots, resources):
             if (block.get('decoded') is not True or block.get('slot', {}).get('state') not in (0, 1, 2) or
                     (block['slot']['state'] != 0 and block.get('slot_matches') is not True)):
                 unknown.append(dict(reason='pcm_retained_block_invalid', node=resource.get('node'), block=block))
-    return dict(version=2, atomic_graph=False, complete=not unknown,
+    return dict(version=3, atomic_graph=False, complete=not unknown,
+                completeness_scope='captured_active_waits', responsibilities=responsibilities,
                 vertices=[dict(id=identity(x), **x) for x in owners.values()],
                 edges=edges, cycles=_cycles(edges), unknown=unknown)
 
@@ -645,6 +711,7 @@ class CaptureSession:
                 owner['stable'] = len(matching) == 1 and matching[0] == owner
             first['context_stable'] = all(first.get(k) == last.get(k) for k in CONTEXT_CUTS)
             first['peer_stable'] = all(first.get(k) == last.get(k) for k in ('peer_begin','peer_end'))
+            first['streams_stable'] = all(first.get(k) == last.get(k) for k in ('streams_begin','streams_end'))
             snapshots.append(first)
         resources = []
         for entry in result['resources']:
@@ -658,12 +725,8 @@ class CaptureSession:
                     value['stable'] = final.get(frame['node']) == value
                     resources.append(value)
         graph = build_graph(snapshots, resources)
-        # Canonical source/service transport joins remain unqualified. Even a
-        # quiet cut cannot qualify full S2 in this slice.
-        graph['observed_edges_resolved'] = graph['complete']
-        graph['complete'] = False
-        graph['unknown'].append(dict(reason='s2_source_join_qualification_pending',
-                                    sources=['pcm_service', 'other_ges_holder_lifecycles', 'tx']))
+        # Completeness describes this cut's active waits, not an installed or
+        # protocol qualification. Unsupported *active* waits remain UNKNOWN.
         if result['errors'] or len(snapshots) != 4:
             graph['complete'] = False
             graph['unknown'].append(dict(reason='capture_incomplete', errors=result['errors']))

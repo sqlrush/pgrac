@@ -297,6 +297,152 @@ class GraphTests(unittest.TestCase):
             pid=20, proc_generation=18, owner_generation=4)
         return wait, service, resources, snapshots, owner
 
+    def dependency_fixture(self):
+        wait, service, resources, snapshots, owner = self.claim_incarnation_fixture()
+        waiter = snapshots[0]['owners'][0]
+        waiter['stable'] = True
+        streams = dict(known=True, epoch=7, channels=2, rows=[
+            dict(node=n, known=n==2, control=61 if n==2 else 0,
+                 data=[71,72] if n==2 else []) for n in range(128)])
+        snapshots[1].update(streams_begin=streams, streams_end=copy.deepcopy(streams),
+                            streams_stable=True)
+        source = next(r for r in resources if r['node']==1)
+        source.update(streams_begin=copy.deepcopy(streams), streams_end=copy.deepcopy(streams))
+        # A current source executor is waiting for a SPACE content holder,
+        # which is waiting for HW held by the original PCM requester.
+        space = [1,2,3,0,1]
+        owner['native_wait'] = dict(tag=space, mode=0)
+        resid = [1,2,3,0,242,1]
+        grant = dict(resid=resid, holder=[0,1,7,100], mode=7)
+        waiter['grants'] = [grant]
+        snapshots[1]['owners'].append(dict(node=1,pid=21,procno=3,backend_id=3,
+            backend_start=4,proc_generation=19,stable=True,
+            locks=[dict(tag=space,mode=0)], enqueue=dict(resid=resid, holder=[1,3,7,0],
+                mode=7, request=50, epoch=7, wait_seq=60)))
+        resources.append(dict(kind='enqueue',node=2,status=0,stable=True,resid=resid,
+            route_known=True,master=2,master_generation=1,shard_phase=0,epoch=7,
+            members=[dict(kind=1,id=[1,3,7,50],mode=7,wait_seq=60),
+                     dict(kind=0,id=[0,1,7,100],mode=7)]))
+        return wait, service, resources, snapshots, owner, waiter
+
+    def test_native_pcm_dependency_closes_cross_node_content_hw_cycle(self):
+        wait, service, resources, snapshots, owner, waiter = self.dependency_fixture()
+        proof = graph.pcm_dependency_bridge(wait,service,resources,snapshots,owner,waiter)
+        self.assertTrue(proof['native_pending_reply_dependency'])
+        self.assertFalse(proof['physical_frame_receipt_proven'])
+        self.assertFalse(proof['authority_proof'])
+        self.assertEqual(proof['current_peer']['control'], 61)
+        self.assertEqual(proof['current_peer']['data'], [71,72])
+        result = graph.build_graph(snapshots,resources)
+        self.assertTrue(result['complete'],result['unknown'])
+        self.assertFalse(result['atomic_graph'])
+        self.assertEqual(len(result['cycles']),1)
+        self.assertEqual({e['quality'] for e in result['edges']},
+                         {'exact_observed_pcm_dependency','exact_local_content','exact_ges_holder'})
+        self.assertEqual(result['cycles'][0][0],result['cycles'][0][-1])
+
+    def test_native_pcm_dependency_rejects_missing_closed_or_changed_peer_streams(self):
+        mutations = [lambda s:s.update(known=False), lambda s:s.update(epoch=8),
+                     lambda s:s.update(channels=0), lambda s:s.update(channels=9),
+                     lambda s:s['rows'][2].update(known=False),
+                     lambda s:s['rows'][2].update(control=42),
+                     lambda s:s['rows'][2].update(control=True),
+                     lambda s:s['rows'][2].update(data=[71]),
+                     lambda s:s['rows'][2].update(data=[71,0]),
+                     lambda s:s['rows'][2].update(data=[71,2**64-1]),
+                     lambda s:s['rows'][2].update(data=[71,True]),
+                     lambda s:s['rows'].pop()]
+        for i,mutate in enumerate(mutations):
+            wait,service,resources,snapshots,owner,waiter=self.dependency_fixture()
+            # Consistently invalid cuts must fail even when all samples agree.
+            source=next(r for r in resources if r.get('kind')=='pcm' and r['node']==1)
+            for cut in (snapshots[1],source):
+                for side in ('streams_begin','streams_end'): mutate(cut[side])
+            result=graph.build_graph(snapshots,resources)
+            self.assertFalse(result['complete'],i);self.assertEqual(result['cycles'],[],i)
+            self.assertFalse(any(e['quality']=='exact_observed_pcm_dependency' for e in result['edges']),i)
+        for location,key in (('local','streams_stable'),('owner','stable'),('waiter','stable')):
+            wait,service,resources,snapshots,owner,waiter=self.dependency_fixture()
+            {'local':snapshots[1],'owner':owner,'waiter':waiter}[location][key]=False
+            self.assertIsNone(graph.pcm_dependency_bridge(wait,service,resources,snapshots,owner,waiter))
+        wait,service,resources,snapshots,owner,waiter=self.dependency_fixture()
+        snapshots[1]['streams_end']['rows'][2]['data'][1]+=1
+        self.assertIsNone(graph.pcm_dependency_bridge(wait,service,resources,snapshots,owner,waiter))
+        snapshots[1].pop('streams_begin')
+        self.assertIsNone(graph.pcm_dependency_bridge(wait,service,resources,snapshots,owner,waiter))
+
+    def test_native_pcm_dependency_preserves_missing_claim_request_and_extra_source(self):
+        for field,value in (('pid',21),('proc_generation',19),('owner_generation',5)):
+            wait,service,resources,snapshots,owner,waiter=self.dependency_fixture()
+            source=next(r for r in resources if r.get('kind')=='pcm' and r['node']==1)
+            source['local_owner']['claim'][field]=value
+            result=graph.build_graph(snapshots,resources)
+            self.assertFalse(result['complete']);self.assertEqual(result['cycles'],[])
+        wait,service,resources,snapshots,owner,waiter=self.dependency_fixture()
+        master=next(r for r in resources if r.get('kind')=='pcm' and r['node']==2)
+        master['queue'][0]['request_seq']+=1
+        self.assertEqual(graph.build_graph(snapshots,resources)['cycles'],[])
+        wait,service,resources,snapshots,owner,waiter=self.dependency_fixture()
+        master=next(r for r in resources if r.get('kind')=='pcm' and r['node']==2)
+        master['queue'][0]['incompatible'] |= 1<<3
+        result=graph.build_graph(snapshots,resources)
+        self.assertFalse(result['complete'])
+        self.assertEqual(len(result['cycles']),1)  # Proven subcycle remains visible.
+        self.assertTrue(any(x['reason']=='pcm_incompatible_sources_unmapped' for x in result['unknown']))
+
+    def test_local_master_source_uses_native_loopback_without_peer_hello_or_data(self):
+        wait,service,resources,snapshots,owner,waiter=self.dependency_fixture()
+        old_master=next(r for r in resources if r.get('kind')=='pcm' and r['node']==2)
+        source=next(r for r in resources if r.get('kind')=='pcm' and r['node']==1)
+        source.update(queue=old_master.pop('queue'),blocks=old_master.pop('blocks'),view=old_master.pop('view'),
+                      omitted_blocks=0)
+        old_master['status']=2
+        for item in (wait,service,source['queue'][0],source['blocks'][0]['request'],source['local_owner']['successor']):
+            item['expected_master']=1
+        source['blocks'][0]['slot']['owner_node']=1
+        service['service_admission'].update(master_node=1,peer_capability_generation=1)
+        for resource in resources:
+            if resource['kind']=='pcm':
+                resource['route_begin']['master']=resource['route_end']['master']=1
+        for cut in (snapshots[1],source):
+            for side in ('streams_begin','streams_end'): cut[side]['local_bits']=0x20000
+        proof=graph.pcm_dependency_bridge(wait,service,resources,snapshots,owner,waiter)
+        self.assertTrue(proof['current_peer']['loopback'])
+        self.assertIsNone(proof['current_peer']['control'])
+        self.assertEqual(proof['current_peer']['data'],[])
+        result=graph.build_graph(snapshots,resources)
+        self.assertTrue(result['complete'],result['unknown']);self.assertEqual(len(result['cycles']),1)
+        for cut in (snapshots[1],source):
+            for side in ('streams_begin','streams_end'): cut[side]['local_bits']=0
+        self.assertIsNone(graph.pcm_dependency_bridge(wait,service,resources,snapshots,owner,waiter))
+
+    def test_nonfailed_ko_rows_remain_responsibilities_without_invented_wait_edges(self):
+        ko=dict(status=0,omitted=0,rows=[dict(kind=0,pid=10,serial=3,failed=False,invalid=False)])
+        result=graph.build_graph([dict(node=0,owners=[],ko=ko)],[])
+        self.assertTrue(result['complete'])
+        self.assertEqual(result['responsibilities'],[dict(node=0,**ko)])
+        self.assertEqual(result['edges'],[])
+        ko['rows'][0]['invalid']=True
+        self.assertFalse(graph.build_graph([dict(node=0,owners=[],ko=ko)],[])['complete'])
+
+    def test_quiet_four_node_capture_is_complete_without_blanket_qualification_override(self):
+        class Reader:
+            def __init__(self,node,directory): self.node=node['node']
+            def query(self,sql,deadline):
+                if sql.endswith('_prepare()'): return 't'
+                return graph.json.dumps(dict(node=self.node,epoch_begin=7,epoch_end=7,
+                    owners=[],procs=[],stats=dict(available=True),ko=dict(status=0,omitted=0,rows=[])))
+            def close(self): pass
+        with tempfile.TemporaryDirectory() as directory,patch.object(graph,'PsqlReader',Reader):
+            session=graph.CaptureSession([dict(node=n,connstr=str(n)) for n in range(4)],Path(directory)/'capture')
+            try:
+                result=session.capture()
+                self.assertTrue(result['complete'])
+                saved=graph.json.loads((session.output/'wait-for-graph.json').read_text())
+                self.assertTrue(saved['complete']);self.assertEqual(saved['unknown'],[])
+                self.assertFalse(saved['atomic_graph'])
+            finally: session.close()
+
     def test_claim_incarnation_binds_original_claim_and_keeps_candidate_boundary(self):
         wait, service, resources, snapshots, owner = self.claim_incarnation_fixture()
         proof = graph.pcm_claim_incarnation_bridge(wait, service, resources, snapshots, owner)
@@ -439,7 +585,7 @@ class GraphTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.object(graph, 'PsqlReader', Reader):
             session = graph.CaptureSession([dict(node=n, connstr=str(n)) for n in range(4)], Path(directory)/'capture')
             try:
-                self.assertFalse(session.capture()['complete'])
+                self.assertTrue(session.capture()['complete'])
                 raw = graph.json.loads((session.output/'capture.json').read_text())
                 self.assertEqual(raw['resource_keys'], [['pcm', tag]])
                 self.assertEqual(len(raw['resources']), 2)
@@ -648,7 +794,7 @@ class GraphTests(unittest.TestCase):
             session = graph.CaptureSession([dict(node=n, connstr=str(n)) for n in range(4)],
                                            Path(directory)/'capture')
             try:
-                self.assertFalse(session.capture()['complete'])
+                self.assertTrue(session.capture()['complete'])
                 raw = graph.json.loads((session.output/'capture.json').read_text())
                 self.assertEqual(raw['resource_keys'], [['enqueue', resid]])
                 self.assertEqual(len(raw['resources']), 2)

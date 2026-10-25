@@ -93,6 +93,7 @@ struct ClusterRecoverySerialGuard;
 struct ClusterWalRetentionPin;
 struct ClusterRecoveryStartV1;
 struct ClusterColdCtrcWorkV1;
+struct ClusterColdTtSlotInputV1;
 struct RfPageAuthorityGuardV1;
 struct ClusterSpaceIdentity;
 /* Native E1 recovered Startup only. Consume the original pending FPI and
@@ -102,6 +103,15 @@ struct ClusterSpaceIdentity;
  * Failure marks the exact window failed where still owned; ERROR rethrows. */
 extern bool rf_page_recovery_fpi_install_smgr_v1(struct ClusterRecoveryFpiInsertV1 *inserted,
 	struct ClusterRecoverySerialGuard *serial, struct ClusterWalRetentionPin *pin);
+/* Same original Finish contract, then the installer above. Caller supplies a
+ * qualified private frame and fresh, distinct output; never reuse live output.
+ * Finish prepares hash/capacity before nowait PAGE promotion. Only its success
+ * reaches target I/O. False/ERROR retains its original guard/window/WAL debt;
+ * success means only target_synced, with no discharge, DURABLE or clear. */
+extern bool rf_page_recovery_fpi_apply_smgr_v1(const GenericXLogRecoveryImageV1 *image,
+	const struct ClusterRecoveryStampOwnerV1 *owner, struct RfPageAuthorityPreflightV1 *preflight,
+	struct ClusterRecoverySerialGuard *serial, struct ClusterWalRetentionPin *pin,
+	struct ClusterRecoveryFpiInsertV1 *out);
 /* Provisional native MAIN predecessor input only, under the original
  * RECOVERED/native-DONE Start/work and promoted PAGE/serial/pin. Verify exact
  * LIVE SPACE identity/reservation, page version/checksum and unchanged SPACE
@@ -157,6 +167,21 @@ extern bool rf_page_recovery_ctrc_itl_fpi_smgr_v1(const struct ClusterRecoverySt
 	const struct ClusterSpaceIdentity *space, BlockNumber blockno,
 	const RfPageVersionV1 *expected_before, const RfPageRecoveryCtrcItlSelectionV1 *selections,
 	Size count, RfPageRecoveryCtrcItlFpiV1 *out);
+
+/* Calculate all native page ITLs against the complete original work array.
+ * Reserve scratch for at least work->counts.subject_count entries before PAGE
+ * promotion; it must be distinct from output and every borrowed object. This
+ * call performs no scratch allocation and may change it on refusal/ERROR.
+ * The full original input is copied before I/O and rechecked before publishing
+ * a private frame. All source/history/coverage and later F4/WAL/install/release
+ * obligations of the selected-frame API remain. No change returns a zero frame
+ * without a new token. Output and borrowed owners are retained on every failure. */
+extern bool rf_page_recovery_ctrc_itl_page_fpi_smgr_v1(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, const struct RfPageAuthorityGuardV1 *guard,
+	struct ClusterRecoverySerialGuard *serial, struct ClusterWalRetentionPin *pin,
+	const struct ClusterSpaceIdentity *space, BlockNumber blockno,
+	const RfPageVersionV1 *expected_before, struct ClusterColdTtSlotInputV1 *scratch,
+	Size capacity, RfPageRecoveryCtrcItlFpiV1 *out);
 #endif
 
 #endif /* CLUSTER_PAGE_INSTALL_H */
