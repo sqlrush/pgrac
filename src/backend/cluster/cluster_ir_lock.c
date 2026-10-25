@@ -521,11 +521,11 @@ cluster_recovery_serial_acquire_set(const ClusterRecoverySerialRequest *requests
 		if (result != CLUSTER_RECOVERY_SERIAL_GRANTED) {
 			ClusterRecoverySerialReleaseResult rollback_result;
 
+			*failed_index = i;
 			if (set->count == 0) {
 				memset(set, 0, sizeof(*set));
 				return result;
 			}
-			*failed_index = i;
 			rollback_result = cluster_recovery_serial_release_set(set);
 			if (rollback_result != CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED)
 				return CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE;

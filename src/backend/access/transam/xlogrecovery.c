@@ -3708,7 +3708,7 @@ cluster_recovery_typed_begin(ClusterRecoveryFencePlan **fence_plan)
 	ClusterColdHandshakeV1 handshake = cluster_cold_handshake;
 	bool		serial_acquired;
 	bool		plan_committed = false;
-	char		readiness[512];
+	char readiness[1152];
 
 	typed = cluster_cold_typed_prepare_v1(*fence_plan, cluster_wal_thread_id(), RedoStartLSN);
 	if (typed->refusal != CLUSTER_COLD_OK)
@@ -3728,10 +3728,11 @@ cluster_recovery_typed_begin(ClusterRecoveryFencePlan **fence_plan)
 	{
 		if (serial_acquired)
 			cluster_write_fence_note_external_mutation_gate_blocked();
-		snprintf(readiness, sizeof(readiness),
-				 "serial_acquired=%d commit_attempted=%d plan_committed=%d typed_refusal=%d; %s",
-				 serial_acquired, serial_acquired, plan_committed, (int)typed->refusal,
-				 typed->refusal_detail);
+		snprintf(
+			readiness, sizeof(readiness),
+			"serial_acquired=%d commit_attempted=%d plan_committed=%d typed_refusal=%d; %s; %s",
+			serial_acquired, serial_acquired, plan_committed, (int)typed->refusal,
+			typed->refusal_detail, cluster_recovery_merge_fence_plan_refusal_v1(*fence_plan));
 		cluster_recovery_typed_fail(fence_plan, &typed,
 									"cold recovery fence plan changed before replay", readiness);
 	}

@@ -111,6 +111,7 @@ struct ClusterRecoveryFencePlan {
 	bool committed;
 	uint8 reserved[5];
 	int acquire_timeout_ms_snapshot;
+	char refusal_detail[512]; /* first original refusal; no authority */
 	uint64 replay_thread_bitmap[2];
 	uint64 foreign_origin_bitmap[2];
 	XLogRecPtr start_lsn[CLUSTER_WAL_STATE_SLOT_COUNT + 1];
@@ -1730,16 +1731,46 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 	return CLUSTER_MERGE_ENGAGE;
 }
 
-/* Only the first original refusal is observed; never recheck an owner for logging. */
+/* Retain the original false result before cleanup. Formatting uses only the
+ * compared copies, and never probes a source/holder or changes authority. */
 static bool
-recovery_fence_refused(const char *stage, uint16 thread, int index, int result)
+recovery_fence_refused_detail(ClusterRecoveryFencePlan *plan, const char *stage, uint16 thread,
+							  int index, int result, const char *detail)
 {
+	char message[512];
+
+	snprintf(message, sizeof(message), "stage=%s origin_thread=%u origin_index=%d result=%d%s%s",
+			 stage, thread, index, result, detail != NULL ? " " : "", detail != NULL ? detail : "");
+	if (recovery_fence_plan_valid(plan) && plan->refusal_detail[0] == '\0')
+		strlcpy(plan->refusal_detail, message, sizeof(plan->refusal_detail));
 	if (cluster_trace_control_config && CritSectionCount == 0)
-		ereport(LOG,
-				(errmsg("PGRAC_FAMILY=COLD_FENCE host_node=%d caller_pid=%d stage=%s "
-						"origin_thread=%u origin_index=%d result=%d",
-						cluster_node_id, MyProcPid, stage, thread, index, result)));
+		ereport(LOG, (errmsg("PGRAC_FAMILY=COLD_FENCE host_node=%d caller_pid=%d %s",
+							 cluster_node_id, MyProcPid, message)));
 	return false;
+}
+
+static bool
+recovery_fence_refused(ClusterRecoveryFencePlan *plan, const char *stage, uint16 thread, int index,
+					   int result)
+{
+	return recovery_fence_refused_detail(plan, stage, thread, index, result, NULL);
+}
+
+static bool
+recovery_fence_changed(ClusterRecoveryFencePlan *plan, const char *stage, uint16 thread, int index,
+					   const char *field, uint64 expected, uint64 observed)
+{
+	char detail[192];
+
+	snprintf(detail, sizeof(detail), "field=%s expected=" UINT64_FORMAT " observed=" UINT64_FORMAT,
+			 field, expected, observed);
+	return recovery_fence_refused_detail(plan, stage, thread, index, 0, detail);
+}
+
+const char *
+cluster_recovery_merge_fence_plan_refusal_v1(const ClusterRecoveryFencePlan *plan)
+{
+	return recovery_fence_plan_valid(plan) ? plan->refusal_detail : "";
 }
 
 static bool
@@ -1754,7 +1785,7 @@ recovery_fence_plan_acquire_serial_inputs(ClusterRecoveryFencePlan *plan,
 
 	if (!recovery_fence_plan_valid(plan) || !plan->sealed || plan->serial_held || plan->committed
 		|| plan->origin_count == 0 || plan->serial_guards.count != 0 || plan->retention_pin != NULL)
-		return recovery_fence_refused("serial_state", 0, -1, 0);
+		return recovery_fence_refused(plan, "serial_state", 0, -1, 0);
 	/* PGRAC: retain the complete original input before acquiring IR. The pin
 	 * borrows the plan's fence owners until BOTH releases are confirmed.
 	 * Author: SqlRush <sqlrush@gmail.com> */
@@ -1790,9 +1821,9 @@ recovery_fence_plan_acquire_serial_inputs(ClusterRecoveryFencePlan *plan,
 		pfree(intervals);
 		pfree(pin_requests);
 		if (pin_result != CLUSTER_WAL_PIN_OK)
-			return recovery_fence_refused(valid ? "pin_acquire" : "pin_request",
-										 valid ? 0 : plan->origins[i].origin_thread,
-										 valid ? -1 : (int)i, valid ? (int)pin_result : 0);
+			return recovery_fence_refused(plan, valid ? "pin_acquire" : "pin_request",
+										  valid ? 0 : plan->origins[i].origin_thread,
+										  valid ? -1 : (int)i, valid ? (int)pin_result : 0);
 	}
 	requests = palloc0(sizeof(*requests) * plan->origin_count);
 	for (i = 0; i < plan->origin_count; i++) {
@@ -1812,18 +1843,17 @@ recovery_fence_plan_acquire_serial_inputs(ClusterRecoveryFencePlan *plan,
 												 &plan->serial_guards, &failed_index);
 	pfree(requests);
 	if (result != CLUSTER_RECOVERY_SERIAL_GRANTED)
-		return recovery_fence_refused("serial_acquire",
-									 failed_index < plan->origin_count
-										 ? plan->origins[failed_index].origin_thread : 0,
-									 failed_index < plan->origin_count ? (int)failed_index : -1,
-									 (int)result);
+		return recovery_fence_refused(
+			plan, "serial_acquire",
+			failed_index < plan->origin_count ? plan->origins[failed_index].origin_thread : 0,
+			failed_index < plan->origin_count ? (int)failed_index : -1, (int)result);
 	if (cluster_shared_config
 		&& (bind_result = (plan->origin_count == 1
 				? cluster_wal_retention_pin_bind_one(plan->retention_pin,
 													 &plan->serial_guards.guards[0])
 				: cluster_wal_retention_pin_bind_set(plan->retention_pin, &plan->serial_guards)))
 			   != CLUSTER_WAL_PIN_OK)
-		return recovery_fence_refused("pin_bind", 0, -1, (int)bind_result);
+		return recovery_fence_refused(plan, "pin_bind", 0, -1, (int)bind_result);
 	plan->serial_held = true;
 	return true;
 }
@@ -1840,7 +1870,7 @@ cluster_recovery_merge_fence_plan_acquire_serial_inputs_v1(
 {
 	if (!cluster_shared_config || input_threads == NULL || ninput_threads == 0
 		|| ninput_threads > CLUSTER_WAL_STATE_SLOT_COUNT)
-		return recovery_fence_refused("serial_input_arguments", 0, -1, 0);
+		return recovery_fence_refused(plan, "serial_input_arguments", 0, -1, 0);
 	return recovery_fence_plan_acquire_serial_inputs(plan, input_threads, ninput_threads);
 }
 
@@ -1856,12 +1886,12 @@ cluster_recovery_merge_commit_plan_nowait(ClusterRecoveryFencePlan *plan)
 	uint16 tid;
 
 	if (!recovery_fence_plan_valid(plan) || !plan->sealed || !plan->serial_held || plan->committed)
-		return recovery_fence_refused("commit_state", 0, -1, 0);
+		return recovery_fence_refused(plan, "commit_state", 0, -1, 0);
 	MemSet(current_start, 0, sizeof(current_start));
 	engage = cluster_recovery_merge_project_readonly(
 		plan->own_thread, plan->start_lsn[plan->own_thread], current_replay, current_start);
 	if (engage != CLUSTER_MERGE_ENGAGE)
-		return recovery_fence_refused("commit_project", 0, -1, (int)engage);
+		return recovery_fence_refused(plan, "commit_project", 0, -1, (int)engage);
 	current_foreign[0] = current_replay[0];
 	current_foreign[1] = current_replay[1];
 	current_foreign[(plan->own_thread - 1) / 64] &= ~(UINT64_C(1) << ((plan->own_thread - 1) % 64));
@@ -1877,42 +1907,128 @@ cluster_recovery_merge_commit_plan_nowait(ClusterRecoveryFencePlan *plan)
 			continue;
 		origin_index = recovery_fence_plan_find_origin(plan, tid);
 		if (origin_index < 0)
-			return recovery_fence_refused("commit_origin", tid, origin_index, 0);
+			return recovery_fence_refused(plan, "commit_origin", tid, origin_index, 0);
 		root_result = cluster_control_root_read_canonical(tid, &plan->origins[origin_index].duty,
 														  CLUSTER_CONTROL_ROOT_READ_STRONG,
 														  &snapshot, &token);
 		if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			&& root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
-			return recovery_fence_refused("commit_root_read", tid, origin_index, (int)root_result);
+			return recovery_fence_refused(plan, "commit_root_read", tid, origin_index,
+										  (int)root_result);
 		if (snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED)
-			return recovery_fence_refused("commit_root_lifecycle", tid, origin_index,
-										 (int)snapshot.lifecycle);
+			return recovery_fence_refused(plan, "commit_root_lifecycle", tid, origin_index,
+										  (int)snapshot.lifecycle);
 		duty_result = cluster_recovery_duty_key_compare_for_claim(
 			&snapshot.identity, &plan->origins[origin_index].duty, cluster_shared_config);
-		if (duty_result != CLUSTER_RECOVERY_DUTY_COMPARE_EXACT)
-			return recovery_fence_refused("commit_root_duty", tid, origin_index, (int)duty_result);
-		if (memcmp(&token, &plan->origins[origin_index].root_token, sizeof(token)) != 0)
-			return recovery_fence_refused("commit_root_token", tid, origin_index, 0);
-		if (cluster_shared_config
-			&& (snapshot.checkpoint_tli != plan->origins[origin_index].root_snapshot.checkpoint_tli
-				|| snapshot.tail_tli != plan->origins[origin_index].root_snapshot.tail_tli
-				|| snapshot.checkpoint_lower_lsn
-					   != plan->origins[origin_index].root_snapshot.checkpoint_lower_lsn
-				|| snapshot.validated_tail_lsn_exclusive
-					   != plan->origins[origin_index].root_snapshot.validated_tail_lsn_exclusive))
-			return recovery_fence_refused("commit_root_extent", tid, origin_index, 0);
+		if (duty_result != CLUSTER_RECOVERY_DUTY_COMPARE_EXACT) {
+			if (duty_result == CLUSTER_RECOVERY_DUTY_COMPARE_DIFFERENT) {
+				const ClusterRecoveryDutyKey *expected = &plan->origins[origin_index].duty;
+				const unsigned char *a = (const unsigned char *)expected;
+				const unsigned char *b = (const unsigned char *)&snapshot.identity;
+				const char *field = "padding";
+				char detail[192];
+				size_t byte = 0;
+
+				/* DIFFERENT already proves both original keys valid. Reserved
+				 * bytes are zero; inspect the copies, never reread their owner. */
+				while (byte < sizeof(*expected) && a[byte] == b[byte])
+					byte++;
+#define DUTY_FIELD(member)                                                                         \
+	if (byte >= offsetof(ClusterRecoveryDutyKey, member)                                           \
+		&& byte < offsetof(ClusterRecoveryDutyKey, member) + sizeof(expected->member))             \
+	field = #member
+				DUTY_FIELD(system_identifier);
+				DUTY_FIELD(storage_uuid);
+				DUTY_FIELD(authority_uuid);
+				DUTY_FIELD(origin_thread_id);
+				DUTY_FIELD(origin_node_id);
+				DUTY_FIELD(thread_claim_created_at);
+				DUTY_FIELD(thread_claim_crc32c);
+				DUTY_FIELD(origin_owner_incarnation);
+				DUTY_FIELD(root_lineage_seq);
+#undef DUTY_FIELD
+				snprintf(detail, sizeof(detail), "field=%s byte=%zu expected=%u observed=%u", field,
+						 byte, a[byte], b[byte]);
+				return recovery_fence_refused_detail(plan, "commit_root_duty", tid, origin_index,
+													 (int)duty_result, detail);
+			}
+			return recovery_fence_refused(plan, "commit_root_duty", tid, origin_index,
+										  (int)duty_result);
+		}
+		if (memcmp(&token, &plan->origins[origin_index].root_token, sizeof(token)) != 0) {
+			const ClusterControlRootReadToken *expected = &plan->origins[origin_index].root_token;
+			for (unsigned byte = 0; byte < sizeof(token.authority_uuid); byte++)
+				if (token.authority_uuid[byte] != expected->authority_uuid[byte]) {
+					char field[48];
+					snprintf(field, sizeof(field), "root_token.authority_uuid[%u]", byte);
+					return recovery_fence_changed(plan, "commit_root_token", tid, origin_index,
+												  field, expected->authority_uuid[byte],
+												  token.authority_uuid[byte]);
+				}
+#define TOKEN_CHANGED(field)                                                                       \
+	do {                                                                                           \
+		if (token.field != expected->field)                                                        \
+			return recovery_fence_changed(plan, "commit_root_token", tid, origin_index,            \
+										  "root_token." #field, expected->field, token.field);     \
+	} while (0)
+			TOKEN_CHANGED(origin_thread_id);
+			TOKEN_CHANGED(source);
+			TOKEN_CHANGED(lifecycle);
+			TOKEN_CHANGED(reserved20);
+			TOKEN_CHANGED(root_lineage_seq);
+			TOKEN_CHANGED(reserved32);
+			TOKEN_CHANGED(file_txn_seq);
+			TOKEN_CHANGED(root_publish_seq);
+			TOKEN_CHANGED(record_crc32c);
+			TOKEN_CHANGED(root_flags);
+#undef TOKEN_CHANGED
+			return recovery_fence_refused(plan, "commit_root_token", tid, origin_index, 0);
+		}
+		if (cluster_shared_config) {
+			const ClusterControlRootSnapshot *expected = &plan->origins[origin_index].root_snapshot;
+#define EXTENT_CHANGED(field)                                                                      \
+	do {                                                                                           \
+		if (snapshot.field != expected->field)                                                     \
+			return recovery_fence_changed(plan, "commit_root_extent", tid, origin_index, #field,   \
+										  expected->field, snapshot.field);                        \
+	} while (0)
+			EXTENT_CHANGED(checkpoint_tli);
+			EXTENT_CHANGED(tail_tli);
+			EXTENT_CHANGED(checkpoint_lower_lsn);
+			EXTENT_CHANGED(validated_tail_lsn_exclusive);
+#undef EXTENT_CHANGED
+		}
 		current_origins[current_count++] = tid;
 	}
 	if (!cluster_recovery_fence_plan_shape_valid(plan->own_thread, current_replay, current_foreign,
-												 current_origins, current_count)
-		|| memcmp(current_replay, plan->replay_thread_bitmap, sizeof(current_replay)) != 0
-		|| memcmp(current_foreign, plan->foreign_origin_bitmap, sizeof(current_foreign)) != 0
-		|| current_count != plan->origin_count)
-		return recovery_fence_refused("commit_shape", 0, -1, 0);
+												 current_origins, current_count))
+		return recovery_fence_refused(plan, "commit_shape", 0, -1, 0);
+	for (unsigned word = 0; word < lengthof(current_replay); word++) {
+		char field[48];
+
+		if (current_replay[word] != plan->replay_thread_bitmap[word]) {
+			snprintf(field, sizeof(field), "replay_thread_bitmap[%u]", word);
+			return recovery_fence_changed(plan, "commit_shape", 0, -1, field,
+										  plan->replay_thread_bitmap[word], current_replay[word]);
+		}
+	}
+	for (unsigned word = 0; word < lengthof(current_foreign); word++) {
+		char field[48];
+
+		if (current_foreign[word] != plan->foreign_origin_bitmap[word]) {
+			snprintf(field, sizeof(field), "foreign_origin_bitmap[%u]", word);
+			return recovery_fence_changed(plan, "commit_shape", 0, -1, field,
+										  plan->foreign_origin_bitmap[word], current_foreign[word]);
+		}
+	}
+	if (current_count != plan->origin_count)
+		return recovery_fence_changed(plan, "commit_shape", 0, -1, "origin_count",
+									  plan->origin_count, current_count);
 	for (tid = 1; tid <= CLUSTER_WAL_STATE_SLOT_COUNT; tid++) {
 		if ((current_replay[(tid - 1) / 64] & (UINT64_C(1) << ((tid - 1) % 64))) != 0
 			&& current_start[tid] != plan->start_lsn[tid])
-			return recovery_fence_refused("commit_start_lsn", tid, -1, 0);
+			return recovery_fence_changed(plan, "commit_start_lsn", tid, -1, "start_lsn",
+										  plan->start_lsn[tid], current_start[tid]);
 	}
 	if (!cluster_recovery_merge_fence_plan_revalidate_nowait(plan))
 		return false;
@@ -1950,13 +2066,13 @@ cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *pl
 
 	if (!recovery_fence_plan_valid(plan) || !plan->sealed || !plan->serial_held
 		|| plan->origin_count == 0 || plan->serial_guards.count != plan->origin_count)
-		return recovery_fence_refused("revalidate_state", 0, -1, 0);
+		return recovery_fence_refused(plan, "revalidate_state", 0, -1, 0);
 	if (cluster_shared_config) {
 		if (plan->retention_pin == NULL)
-			return recovery_fence_refused("revalidate_pin_missing", 0, -1, 0);
+			return recovery_fence_refused(plan, "revalidate_pin_missing", 0, -1, 0);
 		pin_result = cluster_wal_retention_pin_revalidate(plan->retention_pin);
 		if (pin_result != CLUSTER_WAL_PIN_OK)
-			return recovery_fence_refused("revalidate_pin", 0, -1, (int)pin_result);
+			return recovery_fence_refused(plan, "revalidate_pin", 0, -1, (int)pin_result);
 	}
 	for (i = 0; i < plan->origin_count; i++) {
 		ClusterRecoveryFenceOrigin *origin = &plan->origins[i];
@@ -1965,19 +2081,20 @@ cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *pl
 
 		serial_result = cluster_recovery_serial_revalidate(&plan->serial_guards.guards[i]);
 		if (serial_result != CLUSTER_RECOVERY_SERIAL_CURRENT)
-			return recovery_fence_refused("revalidate_serial", origin->origin_thread, i,
-										 (int)serial_result);
+			return recovery_fence_refused(plan, "revalidate_serial", origin->origin_thread, i,
+										  (int)serial_result);
 		formation_result = cluster_formation_witness_revalidate_nowait(origin->formation);
 		if (formation_result != CLUSTER_FORMATION_WITNESS_READY)
-			return recovery_fence_refused("revalidate_formation", origin->origin_thread, i,
-										 (int)formation_result);
+			return recovery_fence_refused(plan, "revalidate_formation", origin->origin_thread, i,
+										  (int)formation_result);
 		if (!cluster_external_fence_need_set_revalidate_nowait(origin->needs, origin->formation,
 																&reason))
-			return recovery_fence_refused("revalidate_needs", origin->origin_thread, i, (int)reason);
+			return recovery_fence_refused(plan, "revalidate_needs", origin->origin_thread, i,
+										  (int)reason);
 		if (!cluster_external_fence_revalidate_set_nowait(origin->admissions, origin->needs,
 														   origin->formation, &reason))
-			return recovery_fence_refused("revalidate_admissions", origin->origin_thread, i,
-										 (int)reason);
+			return recovery_fence_refused(plan, "revalidate_admissions", origin->origin_thread, i,
+										  (int)reason);
 	}
 	return true;
 }

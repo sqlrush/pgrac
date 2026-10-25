@@ -539,10 +539,68 @@ UT_TEST(test_commit_trace_identifies_original_snapshot_refusal_without_committin
 		}
 }
 
+/* The final FATAL can copy the original failed comparison even when tracing
+ * is OFF or allocation/logging is forbidden in a critical section. */
+UT_TEST(test_commit_refusal_retains_exact_field_and_first_result)
+{
+	const char *fields[] = { "file_txn_seq",
+							 "root_publish_seq",
+							 "checkpoint_tli",
+							 "validated_tail_lsn_exclusive",
+							 "start_lsn",
+							 "root_lineage_seq",
+							 "replay_thread_bitmap[1]",
+							 "foreign_origin_bitmap[1]" };
+	for (unsigned fault = 0; fault < lengthof(fields); fault++) {
+		ClusterRecoveryFencePlan *plan;
+		char first[512];
+		fixture();
+		expect_engaged(&plan);
+		if (plan == NULL)
+			return;
+		cluster_trace_control_config = false;
+		CritSectionCount = 1;
+		cold_fence_logs = 0;
+		UT_ASSERT_EQ(strlen(cluster_recovery_merge_fence_plan_refusal_v1(plan)), 0);
+		if (fault == 0)
+			tokens[2].file_txn_seq++;
+		if (fault == 1)
+			tokens[2].root_publish_seq++;
+		if (fault == 2)
+			roots[2].checkpoint_tli++;
+		if (fault == 3)
+			roots[2].validated_tail_lsn_exclusive++;
+		if (fault == 4)
+			plan->start_lsn[2]++;
+		if (fault == 5)
+			tokens[2].root_lineage_seq++;
+		if (fault == 6)
+			plan->replay_thread_bitmap[1] ^= 1;
+		if (fault == 7)
+			plan->foreign_origin_bitmap[1] ^= 1;
+		UT_ASSERT(!commit_as_held(plan));
+		UT_ASSERT(!plan->committed);
+		snprintf(first, sizeof(first), "%s", cluster_recovery_merge_fence_plan_refusal_v1(plan));
+		UT_ASSERT(strstr(first, fields[fault]) != NULL);
+		UT_ASSERT(strstr(first, fault < 6 ? "origin_thread=2" : "origin_thread=0") != NULL);
+		UT_ASSERT(strstr(first, "expected=") != NULL);
+		UT_ASSERT(strstr(first, "observed=") != NULL);
+		UT_ASSERT_EQ(cold_fence_logs, 0);
+		/* A cleanup/second refusal must not replace the original cause. */
+		plan->sealed = false;
+		UT_ASSERT(!cluster_recovery_merge_commit_plan_nowait(plan));
+		UT_ASSERT_EQ(strcmp(first, cluster_recovery_merge_fence_plan_refusal_v1(plan)), 0);
+		CritSectionCount = 0;
+		cluster_recovery_merge_fence_plan_destroy(&plan);
+	}
+	UT_ASSERT_EQ(strlen(cluster_recovery_merge_fence_plan_refusal_v1(NULL)), 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(15);
+	UT_RUN(test_commit_refusal_retains_exact_field_and_first_result);
 	UT_RUN(test_commit_trace_identifies_original_snapshot_refusal_without_committing);
 	UT_RUN(test_pre2_need_set_refusal_reports_original_provider_predicate);
 	UT_RUN(test_pre2_preflight_uses_cold_cohort_and_prior_writer_needs);
