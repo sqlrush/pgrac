@@ -3935,6 +3935,8 @@ $(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o: \
 		$(top_srcdir)/src/include/access/clog.h
 
 test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
+		test_cluster_relmap_checkpoint_publisher.inc \
+		test_cluster_cold_checkpoint_publisher.o test_cluster_cold_checkpoint_publisher.h \
 		test_cluster_relmap_origin_build.inc \
 		test_cluster_relmap_execution_custody.inc \
 		test_cluster_relmap_execution_targets.inc \
@@ -4067,6 +4069,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relma
 		$(top_srcdir)/src/include/cluster/cluster_wal_tail.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_owner.o) \
+		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_cold_checkpoint_publisher.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_arb.o test_cluster_relmap_retained_authority.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_native_clog.o test_cluster_relmap_native_storage.o test_cluster_relmap_native_pin.o test_cluster_relmap_original_scope.o test_cluster_relmap_original_authority.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),$(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o) \
@@ -9314,10 +9317,11 @@ test_cluster_pgproc_active_sample.inc: $(top_srcdir)/src/backend/access/transam/
 	     /^ProcArrayEndTransactionInternal\(/ { print "static inline void"; emit=1; count++ } \
 	     /^ProcArrayClearTransaction\(/ { print "void"; emit=1; count++ } \
 	     /^ProcArrayAdd\(/ { print "void"; emit=1; count++ } \
+	     /^ProcArrayRemove\(/ { print "void"; emit=1; count++ } \
 	     /^MarkAsPreparingGuts\(/ { print "static void"; emit=1; count++ } \
 	     /^MarkAsPrepared\(/ { print "static void"; emit=1; count++ } \
 	     emit { print } /^}$$/ { emit=0 } \
-	     END { if (count != 7 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	     END { if (count != 8 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pgproc_active_sample: test_cluster_pgproc_active_sample.c unit_test.h \
@@ -9412,6 +9416,21 @@ test_cluster_ctrc_native_group_exit.inc: $(top_srcdir)/src/backend/storage/ipc/p
 	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Actual native PREPARE handoff and retirement, with no copied predicates.
+test_cluster_ctrc_native_prepare.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c \
+		$(top_srcdir)/src/backend/access/transam/twophase.c Makefile
+	awk '/^ProcArray(Add|Remove|ClearTransaction)\(/ { print "void"; emit=1; found++ } \
+	     /^MarkAsPreparingGuts\(/ { print "static void"; emit=1; found++ } \
+	     /^GXactLoadSubxactData\(/ { print "static void"; emit=1; found++ } \
+	     /^MarkAsPrepared\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 6 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
+clean distclean maintainer-clean: clean-ctrc-native-prepare
+.PHONY: clean-ctrc-native-prepare
+clean-ctrc-native-prepare:
+	rm -f test_cluster_ctrc_native_prepare.inc test_cluster_ctrc_native_prepare.inc.tmp
+
 test_cluster_ctrc_worker_sample.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
 	awk '/^cluster_undo_cleaner_active_sample\(/ { print "bool"; emit=1; found++ } \
 	     /^cluster_undo_cleaner_active_sample_current\(/ { print "bool"; emit=1; found++ } \
@@ -9423,6 +9442,7 @@ test_cluster_ctrc_cleaner test_cluster_ctrc_capacity test_cluster_ctrc_dispatch 
 test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: test_cluster_ctrc_read_scope.inc \
 		test_cluster_ctrc_worker_sample.inc \
 		test_cluster_ctrc_native_exit.inc test_cluster_ctrc_native_group_exit.inc \
+		test_cluster_ctrc_native_prepare.inc \
 		test_cluster_pgproc_active_types.inc \
 		$(top_srcdir)/src/include/storage/procarray.h $(top_srcdir)/src/include/access/transam.h \
 		$(top_srcdir)/src/include/access/twophase.h $(top_srcdir)/src/include/access/xlog.h \

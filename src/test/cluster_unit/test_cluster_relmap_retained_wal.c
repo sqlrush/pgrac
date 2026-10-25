@@ -3460,6 +3460,7 @@ UT_TEST(test_terminal_read_native_error_keeps_output_zero_and_custody_dead)
 #include "test_cluster_relmap_native_hold.inc"
 #include "test_cluster_relmap_original_storage.inc"
 #include "test_cluster_relmap_original_pin.inc"
+#include "test_cluster_relmap_checkpoint_publisher.inc"
 
 int
 main(int argc, char **argv)
@@ -3468,7 +3469,10 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(143);
+	UT_PLAN(146);
+	UT_RUN(test_actual_checkpointer_reselected_window_builds_both_original_inputs);
+	UT_RUN(test_actual_checkpointer_unknown_window_keeps_original_factory_unavailable);
+	UT_RUN(test_actual_checkpointer_factory_refuses_end_source_and_late_owner_drift);
 	UT_RUN(test_cold_native_handle_holds_original_fd_until_release);
 	UT_RUN(test_cold_native_failed_held_read_keeps_fd_and_original_debt_until_cleanup);
 	UT_RUN(test_cold_original_pin_full_native_chain_keeps_original_pin);
