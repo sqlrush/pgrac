@@ -615,6 +615,56 @@ undo_cleaner_advance_liveness_tick(void)
 }
 
 
+/* Advance worker0's original native/census observation by one bounded slice.
+ * Retain the same captured source and lease until full coverage or rejection;
+ * these observations alone do not authorize freezing or retention release. */
+static void
+undo_cleaner_sample_active_pass(void)
+{
+	/* Capture N/future then all top/prepared PGPROCs before the census. No
+	 * input grants freeze authority. Keep these inputs throughout an
+	 * incomplete round, including continuations at a busy census entry. */
+	if (undo_cleaner_active_scan.status != CTRC_ACTIVE_SCAN_INCOMPLETE) {
+		FullTransactionId reference;
+		FullTransactionId future;
+		FullTransactionId active_min;
+
+		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
+		MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
+		MemSet(&undo_cleaner_active_admission_fence, 0,
+			   sizeof(undo_cleaner_active_admission_fence));
+		undo_cleaner_active_scan.status = CTRC_ACTIVE_SCAN_INVALID;
+		if (cluster_semantic_activation_active_sample_capture(&undo_cleaner_active_admission_fence)
+			&& ProcArrayGetActiveFullXidSample(&reference, &future, &active_min,
+											   &undo_cleaner_active_lease_fence)
+			&& cluster_ctrc_active_scan_begin(&undo_cleaner_active_scan, reference)) {
+			undo_cleaner_active_scan.future_full = future;
+			undo_cleaner_active_scan.min_full = active_min;
+		}
+	}
+	/* Qualify against the same semantic source saved before N, including each
+	 * origin's admitted incarnation. The stripe first-owner is not this boot. */
+	cluster_ctrc_active_scan_step_source(&undo_cleaner_active_scan,
+										 &undo_cleaner_active_admission_fence);
+	/* Recheck the original admission/cohort and lease after the slice has
+	 * released every census lock. No replacement may complete an old sample. */
+	if ((undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_INCOMPLETE
+		 || undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_COMPLETE)
+		&& (!cluster_xid_stripe_sample_fence_current(&undo_cleaner_active_lease_fence)
+			|| !cluster_semantic_activation_active_sample_current(
+				&undo_cleaner_active_admission_fence))) {
+		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
+		MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
+		MemSet(&undo_cleaner_active_admission_fence, 0,
+			   sizeof(undo_cleaner_active_admission_fence));
+		undo_cleaner_active_scan.status = CTRC_ACTIVE_SCAN_INVALID;
+	}
+	undo_cleaner_active_scan_pending
+		= undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_INCOMPLETE;
+	undo_cleaner_publish_active_sample();
+}
+
+
 /*
  * undo_cleaner_run_pass -- one proactive cleaning pass.
  *
@@ -699,47 +749,7 @@ undo_cleaner_run_pass(bool *out_work_remaining, bool maintenance_due)
 		undo_cleaner_publish_active_sample();
 		return false;
 	}
-	/* Capture N/future then all top/prepared PGPROCs before the census. No
-	 * input grants freeze authority. Keep these inputs throughout an
-	 * incomplete round, including continuations at a busy census entry. */
-	if (undo_cleaner_active_scan.status != CTRC_ACTIVE_SCAN_INCOMPLETE) {
-		FullTransactionId reference;
-		FullTransactionId future;
-		FullTransactionId active_min;
-
-		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
-		MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
-		MemSet(&undo_cleaner_active_admission_fence, 0,
-			   sizeof(undo_cleaner_active_admission_fence));
-		undo_cleaner_active_scan.status = CTRC_ACTIVE_SCAN_INVALID;
-		if (cluster_semantic_activation_active_sample_capture(&undo_cleaner_active_admission_fence)
-			&& ProcArrayGetActiveFullXidSample(&reference, &future, &active_min,
-											   &undo_cleaner_active_lease_fence)
-			&& cluster_ctrc_active_scan_begin(&undo_cleaner_active_scan, reference)) {
-			undo_cleaner_active_scan.future_full = future;
-			undo_cleaner_active_scan.min_full = active_min;
-		}
-	}
-	/* Qualify against the same semantic source saved before N, including each
-	 * origin's admitted incarnation. The stripe first-owner is not this boot. */
-	cluster_ctrc_active_scan_step_source(&undo_cleaner_active_scan,
-										 &undo_cleaner_active_admission_fence);
-	/* Recheck the original admission/cohort and lease after the slice has
-	 * released every census lock. No replacement may complete an old sample. */
-	if ((undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_INCOMPLETE
-		 || undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_COMPLETE)
-		&& (!cluster_xid_stripe_sample_fence_current(&undo_cleaner_active_lease_fence)
-			|| !cluster_semantic_activation_active_sample_current(
-				&undo_cleaner_active_admission_fence))) {
-		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
-		MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
-		MemSet(&undo_cleaner_active_admission_fence, 0,
-			   sizeof(undo_cleaner_active_admission_fence));
-		undo_cleaner_active_scan.status = CTRC_ACTIVE_SCAN_INVALID;
-	}
-	undo_cleaner_active_scan_pending
-		= undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_INCOMPLETE;
-	undo_cleaner_publish_active_sample();
+	undo_cleaner_sample_active_pass();
 	/* Census continuation must not accelerate optional segment maintenance. */
 	if (!maintenance_due)
 		return false;
