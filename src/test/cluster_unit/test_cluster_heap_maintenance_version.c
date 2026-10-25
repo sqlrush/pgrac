@@ -7652,10 +7652,340 @@ UT_TEST(test_census_participant_original_publisher_then_complete_walk_continues_
 	}
 }
 
+/* Receipt disposition is bookkeeping, not physical mutation or release proof. */
+static unsigned receipt_terminal_wakeups;
+static const ClusterCtrcReceiptHandle *receipt_terminal_watched;
+static void
+receipt_terminal_cleaner_wakeup(void)
+{
+	worker_pass_assert_unlocked(); UT_ASSERT_EQ(participant_lock_depth, 0);
+	UT_ASSERT(receipt_terminal_watched != NULL && receipt_terminal_watched->valid);
+	UT_ASSERT_EQ(receipt_terminal_watched->receipt->state, CTRC_RECEIPT_CANCELLED);
+	receipt_terminal_wakeups++;
+}
+
+#define cluster_ctrc_shmem_ready original_census_shmem_ready
+#define cluster_ctrc_stat_bump original_census_stat_bump
+#define cluster_undo_cleaner_wakeup receipt_terminal_cleaner_wakeup
+#define cluster_ctrc_origin_has_exact_touch original_participant_origin_has_exact_touch
+#define cluster_ctrc_origin_record_touched original_participant_origin_record_touched
+#define cluster_ctrc_participant_index_compute original_participant_participant_index_compute
+#define cluster_ctrc_participant_open original_participant_participant_open
+#define cluster_ctrc_receipt_prepare_shared_observed original_participant_receipt_prepare_shared_observed
+#define ctrc_allocate_journal_sequence original_participant_allocate_journal_sequence
+#define ctrc_origin_protects_local_receipt_locked original_participant_origin_protects_local_receipt_locked
+#define ctrc_participant_identity_valid original_participant_participant_identity_valid
+#define ctrc_participant_index original_participant_participant_index
+#define ctrc_participant_locks_acquire original_participant_participant_locks_acquire
+#define ctrc_participant_locks_release original_participant_participant_locks_release
+#define ctrc_participant_receipt_heads original_participant_participant_receipt_heads
+#define ctrc_publication_prepare_valid original_participant_publication_prepare_valid
+#define ctrc_publication_request_equal original_participant_publication_request_equal
+#define ctrc_receipt_chain_exact_locked original_participant_receipt_chain_exact_locked
+#define ctrc_receipt_entries original_participant_receipt_entries
+#define ctrc_receipt_handle_fill original_participant_receipt_handle_fill
+#define ctrc_receipt_hash_bytes original_participant_receipt_hash_bytes
+#define ctrc_receipt_links original_participant_receipt_links
+#define ctrc_receipt_prepare_existing_locked original_participant_receipt_prepare_existing_locked
+#define ctrc_receipt_prepare_locators_valid_locked original_participant_receipt_prepare_locators_valid_locked
+#define ctrc_receipt_prepare_refused original_participant_receipt_prepare_refused
+#define ctrc_receipt_prepare_shared_internal original_participant_receipt_prepare_shared_internal
+#define ctrc_receipt_prepare_table_observed original_participant_receipt_prepare_table_observed
+#define ctrc_receipt_prepare_with_sequence original_participant_receipt_prepare_with_sequence
+#define ctrc_receipt_probe_hash original_participant_receipt_probe_hash
+#define ctrc_receipt_probe_states original_participant_receipt_probe_states
+#define ctrc_receipt_publication_matches original_participant_receipt_publication_matches
+#define ctrc_relation_namespace_valid original_participant_relation_namespace_valid
+#define ctrc_target_pending_itl_valid original_participant_target_pending_itl_valid
+#define ctrc_target_pending_offnum_valid original_participant_target_pending_offnum_valid
+#define ctrc_target_predecessor_version_valid original_participant_target_predecessor_version_valid
+#define cluster_ctrc_page_version_order original_terminal_page_version_order
+#define cluster_ctrc_pending_itl_target_recheck original_terminal_pending_itl_target_recheck
+#define cluster_ctrc_receipt_apply_prepared original_terminal_receipt_apply_prepared
+#define cluster_ctrc_receipt_apply_shared original_terminal_receipt_apply_shared
+#define cluster_ctrc_receipt_cancel_prepared original_terminal_receipt_cancel_prepared
+#define cluster_ctrc_receipt_cancel_shared original_terminal_receipt_cancel_shared
+#define ctrc_bytes_nonzero original_terminal_bytes_nonzero
+#define ctrc_receipt_handle_exact original_terminal_receipt_handle_exact
+#define ctrc_target_exact_itl_valid original_terminal_target_exact_itl_valid
+#define ctrc_target_exact_tid_valid original_terminal_target_exact_tid_valid
+#define ctrc_target_itl_finalizes_exact original_terminal_target_itl_finalizes_exact
+#define ctrc_target_itl_finalizes_prepared original_terminal_target_itl_finalizes_prepared
+#define ctrc_target_offnum_finalizes_exact original_terminal_target_offnum_finalizes_exact
+#include "test_cluster_heap_ctrc_terminal.inc"
+#undef ctrc_target_predecessor_version_valid
+#undef ctrc_target_pending_offnum_valid
+#undef ctrc_target_pending_itl_valid
+#undef ctrc_relation_namespace_valid
+#undef ctrc_receipt_publication_matches
+#undef ctrc_receipt_probe_states
+#undef ctrc_receipt_probe_hash
+#undef ctrc_receipt_prepare_with_sequence
+#undef ctrc_receipt_prepare_table_observed
+#undef ctrc_receipt_prepare_shared_internal
+#undef ctrc_receipt_prepare_refused
+#undef ctrc_receipt_prepare_locators_valid_locked
+#undef ctrc_receipt_prepare_existing_locked
+#undef ctrc_receipt_links
+#undef ctrc_receipt_hash_bytes
+#undef ctrc_receipt_handle_fill
+#undef ctrc_receipt_entries
+#undef ctrc_receipt_chain_exact_locked
+#undef ctrc_publication_request_equal
+#undef ctrc_publication_prepare_valid
+#undef ctrc_participant_receipt_heads
+#undef ctrc_participant_locks_release
+#undef ctrc_participant_locks_acquire
+#undef ctrc_participant_index
+#undef ctrc_participant_identity_valid
+#undef ctrc_origin_protects_local_receipt_locked
+#undef ctrc_allocate_journal_sequence
+#undef cluster_ctrc_receipt_prepare_shared_observed
+#undef cluster_ctrc_participant_open
+#undef cluster_ctrc_participant_index_compute
+#undef cluster_ctrc_origin_record_touched
+#undef cluster_ctrc_origin_has_exact_touch
+#undef ctrc_target_offnum_finalizes_exact
+#undef ctrc_target_itl_finalizes_prepared
+#undef ctrc_target_itl_finalizes_exact
+#undef ctrc_target_exact_tid_valid
+#undef ctrc_target_exact_itl_valid
+#undef ctrc_receipt_handle_exact
+#undef ctrc_bytes_nonzero
+#undef cluster_ctrc_receipt_cancel_shared
+#undef cluster_ctrc_receipt_cancel_prepared
+#undef cluster_ctrc_receipt_apply_shared
+#undef cluster_ctrc_receipt_apply_prepared
+#undef cluster_ctrc_pending_itl_target_recheck
+#undef cluster_ctrc_page_version_order
+#undef cluster_undo_cleaner_wakeup
+#undef cluster_ctrc_stat_bump
+#undef cluster_ctrc_shmem_ready
+
+static bool
+census_receipt_cancel_retained(const ClusterCtrcReceiptHandle *handle)
+{
+	bool result;
+	receipt_terminal_watched = handle;
+	result = original_terminal_receipt_cancel_shared(handle);
+	receipt_terminal_watched = NULL;
+	return result;
+}
+
+static ClusterCtrcTargetV1
+receipt_terminal_final_target(const ClusterCtrcReceiptHandle *handle)
+{
+	ClusterCtrcTargetV1 target = handle->receipt->target;
+	target.kind = CTRC_TARGET_EXACT_ITL_SLOT;
+	target.itl_slot_index = target.itl_slot_wrap = 1;
+	target.itl_xid = handle->key.xid; target.itl_class = 1;
+	target.uba[0] = 1; target.planned_predecessor_sha256[0] = 1; target.planned_successor_sha256[0] = 2;
+	return target;
+}
+
+static bool
+receipt_terminal_fixture(QualifiedXminFixture *f, CensusRuntimeAllocation *runtime,
+						 ClusterHeapFreezeXminTargetV1 *targets, bool batch, ClusterCtrcReceiptHandle *handle)
+{
+	ClusterCtrcTxnKeyV1 key; ClusterCtrcOriginReservation reservation; uint32 grant;
+	FullTransactionId full = FullTransactionIdFromEpochAndXid(1, 100);
+	if (batch) qualified_xmin_batch_setup(f, targets);
+	else qualified_xmin_setup(f, HEAP_XMAX_IS_MULTI);
+	qualified_xmin_require_peer(f, 65); fixture_release_original_writer();
+	census_runtime_initialize_requested = true; receipt_terminal_wakeups = 0;
+	if (!census_full_layout_setup(runtime, 2)) return false;
+	key = census_key_for_full(&f->cohort.admission_fence, full);
+	UT_ASSERT_EQ(census_origin_reserve_from_backend(&key, full, &reservation), CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	UT_ASSERT(original_census_origin_open_reserved(&reservation, &grant));
+	UT_ASSERT_EQ(census_participant_prepare_from_origin(&key, grant, handle), CLUSTER_CTRC_PREPARE_READY);
+	return true;
+}
+
+UT_TEST(test_census_original_receipt_cancel_keeps_participant_full_identity)
+{
+	QualifiedXminFixture f; CensusRuntimeAllocation runtime;
+	ClusterCtrcTxnKeyV1 key; ClusterCtrcOriginReservation reservation; ClusterCtrcReceiptHandle handle;
+	FullTransactionId full = FullTransactionIdFromEpochAndXid(1, 100); uint32 grant;
+	qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI); fixture_release_original_writer();
+	census_runtime_initialize_requested = true;
+	if (!census_full_layout_setup(&runtime, 2)) { UT_ASSERT(false); return; }
+	key = census_key_for_full(&f.cohort.admission_fence, full);
+	UT_ASSERT_EQ(census_origin_reserve_from_backend(&key, full, &reservation), CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	UT_ASSERT(original_census_origin_open_reserved(&reservation, &grant));
+	UT_ASSERT_EQ(census_participant_prepare_from_origin(&key, grant, &handle), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(census_receipt_cancel_retained(&handle));
+	UT_ASSERT_EQ(handle.receipt->state, CTRC_RECEIPT_CANCELLED);
+	UT_ASSERT_EQ(handle.participant->prepared_count, 0); UT_ASSERT_EQ(handle.participant->cancelled_count, 1);
+	UT_ASSERT(FullTransactionIdEquals(handle.participant->original_full_xid, full));
+	census_full_layout_release(&runtime);
+}
+
+
+UT_TEST(test_census_original_receipt_apply_is_idempotent_and_retains_full_identity)
+{
+	QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+	ClusterCtrcTargetV1 final, changed; ClusterCtrcApplyToken token;
+	ClusterCtrcParticipantEntry before; ClusterCtrcReceipt receipt_before;
+	if (!receipt_terminal_fixture(&f, &runtime, NULL, false, &handle)) { UT_ASSERT(false); return; }
+	final = receipt_terminal_final_target(&handle);
+	UT_ASSERT_EQ(original_terminal_receipt_apply_shared(&handle, &final, &token), CLUSTER_CTRC_APPLY_APPLIED);
+	UT_ASSERT(token.valid); UT_ASSERT_EQ(token.journal_slot_generation, handle.journal_slot_generation);
+	UT_ASSERT_EQ(handle.receipt->state, CTRC_RECEIPT_APPLIED);
+	UT_ASSERT_EQ(handle.participant->receipt_count, 1); UT_ASSERT_EQ(handle.participant->prepared_count, 0);
+	UT_ASSERT_EQ(handle.participant->applied_count, 1); UT_ASSERT_EQ(handle.participant->cancelled_count, 0);
+	UT_ASSERT(FullTransactionIdEquals(handle.participant->original_full_xid, handle.original_full_xid));
+	before = *handle.participant; receipt_before = *handle.receipt;
+	UT_ASSERT_EQ(original_terminal_receipt_apply_shared(&handle, &final, &token), CLUSTER_CTRC_APPLY_APPLIED);
+	UT_ASSERT(token.valid); UT_ASSERT(!census_receipt_cancel_retained(&handle));
+	changed = final; changed.itl_slot_wrap++;
+	memset(&token, 0xa5, sizeof(token));
+	UT_ASSERT_EQ(original_terminal_receipt_apply_shared(&handle, &changed, &token), CLUSTER_CTRC_APPLY_FAIL_CLOSED);
+	UT_ASSERT(ctrc_bytes_zero(&token, sizeof(token)));
+	UT_ASSERT(memcmp(&before, handle.participant, sizeof(before)) == 0);
+	UT_ASSERT(memcmp(&receipt_before, handle.receipt, sizeof(receipt_before)) == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->stats[CTRC_STAT_RECEIPT_APPLIED]), 1);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), 1);
+	UT_ASSERT_EQ(receipt_terminal_wakeups, 0); UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	census_full_layout_release(&runtime);
+}
+
+UT_TEST(test_census_mixed_receipt_dispositions_keep_original_chain_and_protection)
+{
+	QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle first, second;
+	ClusterCtrcTargetV1 final; ClusterCtrcApplyToken token;
+	if (!receipt_terminal_fixture(&f, &runtime, NULL, false, &first)) { UT_ASSERT(false); return; }
+	participant_publication.operation_id++;
+	UT_ASSERT_EQ(participant_publisher_prepare(&first.key, first.participant->grant_generation, &second), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(first.participant == second.participant && first.receipt != second.receipt);
+	UT_ASSERT_EQ(first.participant->prepared_count, 2);
+	final = receipt_terminal_final_target(&first);
+	UT_ASSERT_EQ(original_terminal_receipt_apply_shared(&first, &final, &token), CLUSTER_CTRC_APPLY_APPLIED);
+	UT_ASSERT(census_receipt_cancel_retained(&second)); UT_ASSERT(!census_receipt_cancel_retained(&second));
+	UT_ASSERT_EQ(second.receipt->disposition, CTRC_RELEASE_CANCELLED_PREMUTATION);
+	UT_ASSERT_EQ(first.participant->receipt_count, 2); UT_ASSERT_EQ(first.participant->prepared_count, 0);
+	UT_ASSERT_EQ(first.participant->applied_count, 1); UT_ASSERT_EQ(first.participant->cancelled_count, 1);
+	UT_ASSERT_EQ(first.participant->state, CTRC_PARTICIPANT_OPEN);
+	UT_ASSERT(FullTransactionIdEquals(first.participant->original_full_xid, first.original_full_xid));
+	original_participant_participant_locks_acquire(ctrc_participant_lock_mask(first.participant_index));
+	participant_publisher_lock_acquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
+	UT_ASSERT(original_participant_receipt_chain_exact_locked(first.participant_index, false));
+	UT_ASSERT_EQ(original_participant_participant_receipt_heads()[first.participant_index], second.receipt_index + 1);
+	UT_ASSERT_EQ(original_participant_receipt_links()[second.receipt_index].next_plus_one, first.receipt_index + 1);
+	participant_publisher_lock_release(&CtrcShared->receipt_lock);
+	original_participant_participant_locks_release(ctrc_participant_lock_mask(first.participant_index));
+	UT_ASSERT_EQ(receipt_terminal_wakeups, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->stats[CTRC_STAT_RECEIPT_APPLIED]), 1);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->stats[CTRC_STAT_RECEIPT_CANCELLED]), 1);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), 1);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0); census_full_layout_release(&runtime);
+}
+
+UT_TEST(test_census_receipt_terminal_stale_handles_refuse_before_disposition_change)
+{
+	for (int fault = 0; fault < 12; fault++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle, bad;
+		ClusterCtrcTargetV1 final; ClusterCtrcApplyToken token;
+		ClusterCtrcParticipantEntry before; ClusterCtrcReceipt receipt_before;
+		if (!receipt_terminal_fixture(&f, &runtime, NULL, false, &handle)) { UT_ASSERT(false); return; }
+		bad = handle; final = receipt_terminal_final_target(&handle);
+		switch (fault) {
+			case 0: bad.valid = false; break;
+			case 1: bad.reserved8[0] = 1; break;
+			case 2: bad.participant_index = runtime.capacity.participant_key_entries; break;
+			case 3: bad.receipt_index = runtime.capacity.receipt_entries; break;
+			case 4: bad.participant = &ctrc_participant_entries()[1]; break;
+			case 5: bad.receipt = &original_participant_receipt_entries()[(handle.receipt_index + 1) % runtime.capacity.receipt_entries]; break;
+			case 6: bad.journal_slot_generation++; break;
+			case 7: bad.key.slot_wrap++; break;
+			case 8: bad.original_full_xid = FullTransactionIdFromEpochAndXid(2, 100); break;
+			case 9: bad.original_full_xid = FullTransactionIdFromU64(2); break;
+			case 10: handle.participant->original_full_xid = InvalidFullTransactionId; break;
+			case 11: CtrcShared->magic ^= 1; break;
+		}
+		before = *handle.participant; receipt_before = *handle.receipt;
+		UT_ASSERT(!census_receipt_cancel_retained(&bad));
+		memset(&token, 0xa5, sizeof(token));
+		UT_ASSERT_EQ(original_terminal_receipt_apply_shared(&bad, &final, &token), CLUSTER_CTRC_APPLY_FAIL_CLOSED);
+		UT_ASSERT(ctrc_bytes_zero(&token, sizeof(token)));
+		UT_ASSERT(memcmp(&before, handle.participant, sizeof(before)) == 0);
+		UT_ASSERT(memcmp(&receipt_before, handle.receipt, sizeof(receipt_before)) == 0);
+		UT_ASSERT_EQ(receipt_terminal_wakeups, 0); UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+		UT_ASSERT(!local_x && f.admission.entered); UT_ASSERT_EQ(backend_pin_count, 1);
+		census_full_layout_release(&runtime);
+	}
+}
+
+UT_TEST(test_census_receipt_apply_invalid_final_targets_keep_pending_protection)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+		ClusterCtrcTargetV1 final; ClusterCtrcApplyToken token;
+		ClusterCtrcParticipantEntry before; ClusterCtrcReceipt receipt_before;
+		if (!receipt_terminal_fixture(&f, &runtime, NULL, false, &handle)) { UT_ASSERT(false); return; }
+		final = receipt_terminal_final_target(&handle);
+		if (fault == 1) final.itl_xid++;
+		if (fault == 2) memset(final.uba, 0, sizeof(final.uba));
+		if (fault == 3) memset(final.planned_predecessor_sha256, 0, sizeof(final.planned_predecessor_sha256));
+		if (fault == 4) final.block_number++;
+		if (fault == 5) final.rel_number++;
+		before = *handle.participant; receipt_before = *handle.receipt; memset(&token, 0xa5, sizeof(token));
+		UT_ASSERT_EQ(original_terminal_receipt_apply_shared(&handle, fault == 0 ? NULL : &final, &token),
+			fault >= 4 ? CLUSTER_CTRC_APPLY_RETRY_REQUIRED : CLUSTER_CTRC_APPLY_FAIL_CLOSED);
+		UT_ASSERT(ctrc_bytes_zero(&token, sizeof(token)));
+		UT_ASSERT(memcmp(&before, handle.participant, sizeof(before)) == 0);
+		UT_ASSERT(memcmp(&receipt_before, handle.receipt, sizeof(receipt_before)) == 0);
+		UT_ASSERT_EQ(handle.participant->prepared_count, 1);
+		UT_ASSERT_EQ(receipt_terminal_wakeups, 0); UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+		census_full_layout_release(&runtime);
+	}
+}
+
+UT_TEST(test_census_terminal_receipts_remain_in_complete_walk_before_native_wal)
+{
+	for (int applied = 0; applied < 2; applied++) for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterHeapFreezeXminTargetV1 targets[3];
+		ClusterCtrcReceiptHandle handle; ClusterCtrcTargetV1 final; ClusterCtrcApplyToken token;
+		uint64 passes = 1, expected_passes, total;
+		if (!receipt_terminal_fixture(&f, &runtime, targets, batch, &handle)) { UT_ASSERT(false); return; }
+		if (applied) {
+			final = receipt_terminal_final_target(&handle);
+			UT_ASSERT_EQ(original_terminal_receipt_apply_shared(&handle, &final, &token), CLUSTER_CTRC_APPLY_APPLIED);
+		} else UT_ASSERT(census_receipt_cancel_retained(&handle));
+		UT_ASSERT_EQ(handle.receipt->state, applied ? CTRC_RECEIPT_APPLIED : CTRC_RECEIPT_CANCELLED);
+		UT_ASSERT_EQ(handle.participant->receipt_count, 1); UT_ASSERT_EQ(handle.participant->prepared_count, 0);
+		UT_ASSERT_EQ(handle.participant->state, CTRC_PARTICIPANT_OPEN);
+		UT_ASSERT(FullTransactionIdEquals(handle.participant->original_full_xid, FullTransactionIdFromEpochAndXid(1, 100)));
+		sampler_xids[0] = 152;
+		pg_atomic_write_u64(&sampler_slots[0].cluster_top_full_xid_atomic, U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 152)));
+		total = runtime.capacity.origin_key_entries + runtime.capacity.participant_key_entries;
+		expected_passes = (total + CLUSTER_CTRC_ACTIVE_SCAN_SLICE - 1) / CLUSTER_CTRC_ACTIVE_SCAN_SLICE;
+		native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id - 1; resume_allowed = true;
+		worker_original_sample_pass_fixture(&f.cohort);
+		while (pass_pending && passes <= expected_passes) { original_worker_sample_active_pass(); passes++; }
+		UT_ASSERT_EQ(passes, expected_passes); UT_ASSERT(!pass_pending);
+		UT_ASSERT_EQ(publisher_scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+		UT_ASSERT_EQ(publisher_scan.next_index, total); UT_ASSERT_EQ(publisher_scan.unqualified_entries, 0);
+		UT_ASSERT(FullTransactionIdEquals(publisher_scan.min_full, handle.original_full_xid));
+		UT_ASSERT_EQ(publisher_scan.unqualified_registration_generation, 1);
+		UT_ASSERT_EQ(census_step_lock_acquires, total); UT_ASSERT_EQ(census_step_lock_releases, total);
+		f.cohort.local_registration_cut = publisher_scan;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered); UT_ASSERT_EQ(backend_pin_count, 1);
+		census_full_layout_release(&runtime);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(190);
+	UT_PLAN(196);
+	UT_RUN(test_census_original_receipt_cancel_keeps_participant_full_identity);
+	UT_RUN(test_census_original_receipt_apply_is_idempotent_and_retains_full_identity);
+	UT_RUN(test_census_mixed_receipt_dispositions_keep_original_chain_and_protection);
+	UT_RUN(test_census_receipt_terminal_stale_handles_refuse_before_disposition_change);
+	UT_RUN(test_census_receipt_apply_invalid_final_targets_keep_pending_protection);
+	UT_RUN(test_census_terminal_receipts_remain_in_complete_walk_before_native_wal);
 	UT_RUN(test_census_participant_publisher_retains_original_origin_full_identity);
 	UT_RUN(test_census_participant_original_publish_and_duplicate_keep_chain_and_full_identity);
 	UT_RUN(test_census_participant_unknown_or_foreign_origin_stays_unqualified_on_later_replay);
