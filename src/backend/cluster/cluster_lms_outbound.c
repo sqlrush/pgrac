@@ -109,6 +109,7 @@ StaticAssertDecl(sizeof(ClusterLmsZeroBlockReplyWire) == GCS_BLOCK_REPLY_PAYLOAD
 				 "staged zero-block reply must preserve the GCS reply wire size");
 
 typedef struct ClusterLmsOutboundState {
+	ConditionVariable space_cv; /* native consumer release, no network retry */
 	uint32 head; /* next slot to fill */
 	uint32 tail; /* next slot to drain */
 	uint32 count;
@@ -155,6 +156,8 @@ cluster_lms_outbound_shmem_init(void)
 	if (!found) {
 		memset(cluster_lms_outbound_shared, 0, sizeof(*cluster_lms_outbound_shared));
 		pg_atomic_init_u64(&cluster_lms_outbound_shared->resource_x_transport_mutation_sequence, 1);
+		for (i = 0; i < CLUSTER_LMS_MAX_WORKERS; i++)
+			ConditionVariableInit(&cluster_lms_outbound_shared->rings[i].space_cv);
 	}
 
 	if (!IsBootstrapProcessingMode())
@@ -1429,9 +1432,46 @@ finish_batch:
 		}
 		ring->draining = 0;
 		LWLockRelease(lock);
+		ConditionVariableBroadcast(&ring->space_cv);
 	}
 
 	return sent;
+}
+
+/* Only a foreground producer may sleep: the DATA worker is the consumer.
+ * Prepare before checking space, so drain between check and sleep is visible.
+ * Response periods only recheck shutdown/epoch; they never mint a request. */
+bool
+cluster_lms_outbound_wait_capacity(int worker, uint64 epoch)
+{
+	ClusterLmsOutboundState *ring;
+	volatile bool ready = false;
+	if (worker < 0 || worker >= CLUSTER_LMS_MAX_WORKERS || OB_LOCK(worker) == NULL
+		|| cluster_lms_outbound_rings == NULL || MyBackendType != B_BACKEND)
+		return false;
+	ring = OB_RING(worker);
+	ConditionVariablePrepareToSleep(&ring->space_cv);
+	PG_TRY();
+	{
+		for (;;) {
+			cluster_pcm_lock_check_shutdown_wait();
+			if (cluster_epoch_get_current() != epoch)
+				break;
+			LWLockAcquire(OB_LOCK(worker), LW_SHARED);
+			ready = ring->count + ring->draining < PGRAC_LMS_OUTBOUND_CAPACITY;
+			LWLockRelease(OB_LOCK(worker));
+			if (ready)
+				break;
+			(void)ConditionVariableTimedSleep(&ring->space_cv, 1000,
+				WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+		}
+	}
+	PG_FINALLY();
+	{
+		ConditionVariableCancelSleep();
+	}
+	PG_END_TRY();
+	return ready;
 }
 
 uint32

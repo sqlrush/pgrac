@@ -5676,6 +5676,9 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_external_fence_duty.inc
 	rm -f test_cluster_resolver_cache_caller.inc test_cluster_resolver_cache_caller.inc.tmp
 	rm -f test_cluster_relation_size.inc
+	rm -f test_cluster_first_fill_bufmgr.inc test_cluster_first_fill_bufmgr.inc.tmp \
+		test_cluster_first_fill_holder.inc test_cluster_first_fill_holder.inc.tmp \
+		test_cluster_pcm_first_fill_master.inc test_cluster_pcm_first_fill_master.inc.tmp
 	rm -f test_cluster_pcm_read_source_owner.inc test_cluster_pcm_read_source_owner.inc.tmp
 	rm -f test_cluster_ko_writeback_io.inc test_cluster_ko_writeback_io.inc.tmp \
 		test_cluster_ko_writeback_smgr.inc test_cluster_ko_writeback_smgr.inc.tmp
@@ -12295,8 +12298,32 @@ test_cluster_tt_terminal_trace: test_cluster_tt_terminal_trace.c test_cluster_tt
 
 # Execute the production first-fill master decision with native PCM owners.
 test_cluster_pcm_first_fill_master.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
-	awk '/^gcs_block_first_fill_request\(/ { print "static void"; emit=1; n++ } \
-	     emit { print } emit && /^}/ { emit=0; done++ } \
+	awk '/^#define GCS_FIRST_FILL_PARK_MAX/ { emit=1; n++ } \
+	     /^void$$/ && emit { emit=0; done++ } emit { print } \
 	     END { if (n != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_pcm_read_grant: test_cluster_pcm_first_fill_master.inc
+
+TESTS += test_cluster_first_fill_wait
+all: test_cluster_first_fill_wait
+test_cluster_first_fill_bufmgr.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_bufmgr_first_fill_wait_begin\(/ { print "bool"; emit=1; n++ } \
+	     /^cluster_bufmgr_first_fill_wait_ready\(/ { print "int"; emit=1; n++ } \
+	     /^cluster_bufmgr_first_fill_service_wakeup\(/ { print "void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_first_fill_holder.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^typedef struct GcsFirstFillHolderPark/ { emit=1; n++ } \
+	     /^void$$/ && emit { emit=0; end++ } emit { print } \
+	     END { if (n != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^cluster_gcs_block_first_fill_tick\(/ { print "void"; emit=1; n++ } \
+	     /^cluster_gcs_block_read_source_retry_wait\(/ { print "void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2 || emit) exit 1 }' $< >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_first_fill_wait: test_cluster_first_fill_wait.c test_cluster_pcm_own test_cluster_pcm_own.c \
+		test_cluster_first_fill_bufmgr.inc test_cluster_first_fill_holder.inc unit_test.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
+		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@

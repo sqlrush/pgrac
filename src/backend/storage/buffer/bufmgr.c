@@ -62,6 +62,7 @@
 #include "cluster/cluster_mode.h"	/* PGRAC (spec-6.14 D8): storage-mode gate */
 #include "cluster/cluster_pcm_direct_init.h"
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_grd.h"		/* existing block-path fail-closed counter */
 #include "cluster/cluster_guc.h"		/* spec-4.7a D2 — cluster_gcs_block_local_cache */
@@ -5880,6 +5881,7 @@ typedef struct ClusterBufmgrReadSource
 static void
 cluster_bufmgr_pcm_read_source_begin(BufferDesc *buf, ClusterBufmgrReadSource *read)
 {
+	unsigned retries = 0;
 	for (;;)
 	{
 		ClusterPcmOwnResult result;
@@ -5910,9 +5912,7 @@ cluster_bufmgr_pcm_read_source_begin(BufferDesc *buf, ClusterBufmgrReadSource *r
 		cluster_gcs_block_read_source_complete(buf, &read->source, false);
 		read->pending = false;
 		cluster_pcm_lock_check_shutdown_wait();
-		pgstat_report_wait_start(WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
-		pg_usleep(1000L);
-		pgstat_report_wait_end();
+		cluster_gcs_block_read_source_retry_wait(&read->source, retries++);
 	}
 	if (!read->source.durable
 		|| !cluster_pcm_read_source_bound(&read->source, &read->base.tag,
@@ -15438,6 +15438,7 @@ LockBufferInternal_trace_impl(Buffer buffer, int mode, bool *pcm_barrier_refused
 		}
 		LWLockRelease(BufferDescriptorGetContentLock(buf));
 		cluster_bufmgr_pcm_x_writer_release(pcm_x_writer);
+		cluster_bufmgr_first_fill_service_wakeup(buf);
 		if (pcm_read_image_release_attempted
 			&& pcm_read_image_release_result != CLUSTER_PCM_OWN_OK)
 			cluster_pcm_own_report_bump_failure(
@@ -16783,6 +16784,18 @@ StartBufferIO(BufferDesc *buf, bool forInput)
 #endif
 
 	buf_state |= BM_IO_IN_PROGRESS;
+#ifdef USE_PGRAC_CLUSTER
+	if (!forInput && ClusterPcmOwnArray != NULL)
+	{
+		ClusterPcmOwnResult result = cluster_pcm_own_write_io_begin(buf->buf_id);
+		if (result != CLUSTER_PCM_OWN_OK)
+		{
+			UnlockBufHdr(buf, buf_state & ~BM_IO_IN_PROGRESS);
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+				errmsg("native output IO episode could not start: result=%d", result)));
+		}
+	}
+#endif
 	UnlockBufHdr(buf, buf_state);
 
 #ifdef USE_PGRAC_CLUSTER
@@ -16816,10 +16829,24 @@ static void
 TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_flag_bits)
 {
 	uint32		buf_state;
+#ifdef USE_PGRAC_CLUSTER
+	uint32 workers = 0;
+#endif
 
 	buf_state = LockBufHdr(buf);
 
 	Assert(buf_state & BM_IO_IN_PROGRESS);
+#ifdef USE_PGRAC_CLUSTER
+	if ((buf_state & BM_VALID) != 0 && ClusterPcmOwnArray != NULL)
+	{
+		ClusterPcmOwnResult result = cluster_pcm_own_write_io_complete(buf->buf_id, &workers);
+		if (result != CLUSTER_PCM_OWN_OK)
+		{
+			UnlockBufHdr(buf, buf_state);
+			ereport(PANIC, (errmsg("native output IO episode lost its owner: result=%d", result)));
+		}
+	}
+#endif
 
 	buf_state &= ~(BM_IO_IN_PROGRESS | BM_IO_ERROR);
 	if (clear_dirty && !(buf_state & BM_JUST_DIRTIED))
@@ -16832,6 +16859,11 @@ TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_flag_bits)
 								BufferDescriptorGetBuffer(buf));
 
 	ConditionVariableBroadcast(BufferDescriptorGetIOCV(buf));
+#ifdef USE_PGRAC_CLUSTER
+	for (int worker = 0; worker < CLUSTER_LMS_MAX_WORKERS; worker++)
+		if ((workers & (UINT32_C(1) << worker)) != 0)
+			cluster_lms_wakeup(worker);
+#endif
 }
 
 /*
@@ -19557,6 +19589,89 @@ cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(
 {
 	return cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image_internal(
 		tag, master_node, out_page_lsn, dst, out_refusal, NULL);
+}
+
+/* No pin or lock survives this observation. The parked owner must revalidate
+ * tag + ownership + native IO episode before it touches the buffer again. */
+bool
+cluster_bufmgr_first_fill_wait_begin(BufferTag tag, int worker, ClusterPcmFirstFillWait *wait)
+{
+	uint32 hashcode = BufTableHashCode(&tag);
+	LWLock *mapping = BufMappingPartitionLock(hashcode);
+	BufferDesc *buf;
+	uint32 state;
+	int id;
+	bool valid;
+	if (wait == NULL || ClusterPcmOwnArray == NULL || worker < 0
+		|| worker >= CLUSTER_LMS_MAX_WORKERS)
+		return false;
+	LWLockAcquire(mapping, LW_SHARED);
+	id = BufTableLookup(&tag, hashcode);
+	if (id < 0) {
+		LWLockRelease(mapping);
+		return false;
+	}
+	buf = GetBufferDescriptor(id);
+	state = LockBufHdr(buf);
+	valid = BufferTagsEqual(&tag, &buf->tag)
+		&& (state & (BM_TAG_VALID | BM_VALID | BM_IO_ERROR)) == (BM_TAG_VALID | BM_VALID)
+		&& (buf->pcm_state == PCM_STATE_X || buf->pcm_state == PCM_STATE_S)
+		&& cluster_pcm_own_gen_get(id) != UINT64_MAX;
+	if (valid) {
+		uint64 io = pg_atomic_read_u64(&ClusterPcmOwnArray[id].write_io_generation);
+		valid = (io & 1) == ((state & BM_IO_IN_PROGRESS) != 0) && io != UINT64_MAX;
+		if (valid) {
+			wait->tag = tag;
+			wait->buffer_id = id;
+			wait->own_generation = cluster_pcm_own_gen_get(id);
+			wait->write_io_generation = io;
+			ClusterPcmOwnArray[id].service_waiters |= UINT32_C(1) << worker;
+		}
+	}
+	UnlockBufHdr(buf, state);
+	LWLockRelease(mapping);
+	return valid;
+}
+
+/* -1: no longer the witnessed resident; 0: the exact/newer write still owns
+ * native IO; 1: completion observed, try the existing nonblocking producer.
+ * A completed write can still hold content SHARE for its short native suffix. */
+int
+cluster_bufmgr_first_fill_wait_ready(const ClusterPcmFirstFillWait *wait)
+{
+	BufferDesc *buf;
+	uint32 state;
+	uint64 io;
+	int result = -1;
+	if (wait == NULL || ClusterPcmOwnArray == NULL
+		|| wait->buffer_id < 0 || wait->buffer_id >= NBuffers)
+		return -1;
+	buf = GetBufferDescriptor(wait->buffer_id);
+	state = LockBufHdr(buf);
+	io = pg_atomic_read_u64(&ClusterPcmOwnArray[wait->buffer_id].write_io_generation);
+	if (BufferTagsEqual(&buf->tag, &wait->tag)
+		&& cluster_pcm_own_gen_get(wait->buffer_id) == wait->own_generation
+		&& (state & (BM_TAG_VALID | BM_VALID | BM_IO_ERROR)) == (BM_TAG_VALID | BM_VALID)
+		&& io >= wait->write_io_generation && io != UINT64_MAX
+		&& (io & 1) == ((state & BM_IO_IN_PROGRESS) != 0))
+		result = (state & BM_IO_IN_PROGRESS) != 0 ? 0 : 1;
+	UnlockBufHdr(buf, state);
+	return result;
+}
+
+void
+cluster_bufmgr_first_fill_service_wakeup(BufferDesc *buf)
+{
+	uint32 state, workers;
+	if (ClusterPcmOwnArray == NULL || buf == NULL)
+		return;
+	state = LockBufHdr(buf);
+	workers = ClusterPcmOwnArray[buf->buf_id].service_waiters;
+	ClusterPcmOwnArray[buf->buf_id].service_waiters = 0;
+	UnlockBufHdr(buf, state);
+	for (int worker = 0; worker < CLUSTER_LMS_MAX_WORKERS; worker++)
+		if ((workers & (UINT32_C(1) << worker)) != 0)
+			cluster_lms_wakeup(worker);
 }
 
 /* Only the master-authenticated first-fill FORWARD calls this owner. Unlike

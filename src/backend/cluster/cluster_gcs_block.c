@@ -282,6 +282,7 @@ static uint64
 typedef struct ClusterGcsBlockOutstandingSlot {
 	bool in_use;
 	uint8 reply_domain;
+	bool first_fill_revoked; /* exact master INVALIDATE, not reply-period expiry */
 	uint64 request_id;
 	uint8 transition_id;
 	BufferTag tag;
@@ -911,6 +912,7 @@ cluster_gcs_block_shmem_init(void)
 				slot->expected_master_node = -1;
 				gcs_block_slot_clear_current_mx_expectation(slot);
 				slot->stale = false;
+				slot->first_fill_revoked = false;
 				slot->direct_generation = 0;
 				slot->direct_state = GCS_BLOCK_DIRECT_UNARMED;
 				slot->direct_expected_peer = -1;
@@ -1024,6 +1026,7 @@ gcs_block_reserve_slot(BufferTag tag, uint8 transition_id, int32 master_node,
 			slot->expected_master_node = master_node;
 			gcs_block_slot_clear_current_mx_expectation(slot);
 			slot->stale = false;
+			slot->first_fill_revoked = false;
 			slot->direct_state = GCS_BLOCK_DIRECT_UNARMED;
 			slot->direct_expected_peer = -1;
 			slot->direct_arm_id = 0;
@@ -1103,6 +1106,7 @@ gcs_block_try_reserve_r4_slot(BufferTag tag, uint64 request_epoch, int32 expecte
 	slot->expected_master_node = expected_master_node;
 	gcs_block_slot_clear_current_mx_expectation(slot);
 	slot->stale = false;
+	slot->first_fill_revoked = false;
 	slot->direct_state = GCS_BLOCK_DIRECT_UNARMED;
 	slot->direct_expected_peer = -1;
 	slot->direct_arm_id = 0;
@@ -1175,6 +1179,7 @@ gcs_block_try_reserve_current_mx_slot(const ClusterCurrentMxKey *key, uint64 req
 	slot->expected_current_mx_key_valid = true;
 	slot->expected_current_mx_key = *key;
 	slot->stale = false;
+	slot->first_fill_revoked = false;
 	slot->direct_state = GCS_BLOCK_DIRECT_UNARMED;
 	slot->direct_expected_peer = -1;
 	slot->direct_arm_id = 0;
@@ -1228,6 +1233,7 @@ gcs_block_release_slot(ClusterGcsBlockOutstandingSlot *slot)
 	slot->expected_master_node = -1;
 	gcs_block_slot_clear_current_mx_expectation(slot);
 	slot->stale = false;
+	slot->first_fill_revoked = false;
 	slot->direct_state = GCS_BLOCK_DIRECT_UNARMED;
 	slot->direct_expected_peer = -1;
 	slot->direct_arm_id = 0;
@@ -3300,6 +3306,50 @@ cluster_gcs_block_read_source_complete(BufferDesc *buf, ClusterPcmReadSource *so
 	source->pending_s = false;
 }
 
+/* No frame was admitted on FULL. Wait for the local ring's consumer event
+ * with the same request identity, rather than returning a fresh RETRY. */
+static bool
+gcs_first_fill_enqueue(const GcsBlockRequestPayload *request, int master)
+{
+	int worker = cluster_lms_shard_for_tag(&request->tag, cluster_lms_workers);
+	for (;;) {
+		ClusterLmsEnqueueResult result = cluster_lms_outbound_try_enqueue(worker,
+			PGRAC_IC_MSG_GCS_BLOCK_REQUEST, (uint32)master, request, sizeof(*request));
+		if (result == CLUSTER_LMS_ENQUEUE_ADMITTED)
+			return true;
+		if (result != CLUSTER_LMS_ENQUEUE_FULL
+			|| !cluster_lms_outbound_wait_capacity(worker, request->epoch))
+			return false;
+	}
+}
+
+/* Called after delivery and the native reservation have both retired. The
+ * event is the master's exact revoke directive, not a timeout or DENIED.
+ * A second such event cannot mint a third request; remain locally parked
+ * until cancellation, membership or the existing hang detector intervenes. */
+void
+cluster_gcs_block_read_source_retry_wait(const ClusterPcmReadSource *source, unsigned retries)
+{
+	if (source == NULL || !source->retry_event || !source->quiescent)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+			errmsg("first-fill retry has no exact progress event")));
+	if (retries > 0)
+		cluster_block_io_trace_source(source, "RETRY_CAP_WAIT");
+	for (;;) {
+		cluster_pcm_lock_check_shutdown_wait();
+		if (cluster_epoch_get_current() != source->request_epoch)
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+				errmsg("first-fill retry wait crossed membership")));
+		(void)WaitLatch(MyLatch, WL_TIMEOUT | WL_EXIT_ON_PM_DEATH
+			| (retries == 0 ? 0 : WL_LATCH_SET),
+			retries == 0 ? 10L : 1000L, WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+		ResetLatch(MyLatch);
+		cluster_pcm_lock_check_shutdown_wait();
+		if (retries == 0)
+			return;
+	}
+}
+
 static bool
 gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition transition_id,
 							   int master_node, bool clean_eligible,
@@ -3358,8 +3408,24 @@ gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition transition_id
 	if (cluster_authority_readiness_managed()) {
 		const char *failed_predicate;
 		bool pending;
+		bool ready = cluster_serving_ready_check(&pending, &failed_predicate);
 
-		if (!cluster_serving_ready_check(&pending, &failed_predicate)) {
+		if (source != NULL && !ready && pending) {
+			/* Nothing has been sent or reserved in the GCS table. Wait for
+			 * this readiness predicate before creating the first identity. */
+			uint64 epoch = cluster_epoch_get_current();
+			while (!ready && pending) {
+				cluster_pcm_lock_check_shutdown_wait();
+				if (cluster_epoch_get_current() != epoch)
+					ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+						errmsg("first-fill readiness wait crossed membership")));
+				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					1000L, WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+				ResetLatch(MyLatch);
+				ready = cluster_serving_ready_check(&pending, &failed_predicate);
+			}
+		}
+		if (!ready) {
 			/* Before any slot/send: the original bufmgr owner aborts its
 			 * exact reservation and waits off content locks, then rechecks
 			 * the complete identity. No later sample relabels this refusal. */
@@ -3438,6 +3504,8 @@ gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition transition_id
 	max_retries = cluster_gcs_block_retransmit_max_retries >= 0
 					  ? cluster_gcs_block_retransmit_max_retries
 					  : 4;
+	if (source != NULL)
+		max_retries = 0; /* IO/master event drives this first-fill identity. */
 
 	PG_TRY();
 	{
@@ -3513,6 +3581,7 @@ gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition transition_id
 				slot->request_epoch = payload.epoch;
 				slot->expected_master_node = current_master;
 				slot->stale = false;
+				slot->first_fill_revoked = false;
 				slot->direct_state = GCS_BLOCK_DIRECT_UNARMED;
 				slot->direct_expected_peer = -1;
 				slot->direct_target_kind = GCS_BLOCK_DIRECT_TARGET_NONE;
@@ -3530,8 +3599,8 @@ gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition transition_id
 				source->master_node = current_master;
 				source->pending_s = true;
 				if (!gcs_read_source_arm(buf, source)) {
-					read_capacity_refused = retry_denied = true;
-					break;
+					ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						errmsg("first-fill cleanup ledger is full")));
 				}
 			}
 			if (!suppress_direct_land)
@@ -3543,8 +3612,9 @@ gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition transition_id
 			else
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->retransmit_send_count, 1);
 
-			request_enqueued = cluster_grd_outbound_enqueue_backend_msg(
-				PGRAC_IC_MSG_GCS_BLOCK_REQUEST, (uint32)current_master, &payload, sizeof(payload));
+			request_enqueued = source != NULL ? gcs_first_fill_enqueue(&payload, current_master)
+				: cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_REQUEST,
+					(uint32)current_master, &payload, sizeof(payload));
 			if (request_enqueued)
 				request_admitted = true;
 			else if (!request_admitted || !xp_is_read || clean_eligible) {
@@ -3569,7 +3639,7 @@ gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition transition_id
 				}
 				gcs_block_direct_finish_target(direct_target_buf, direct_prepared, false,
 											   InvalidXLogRecPtr);
-				if (xp_is_read && !clean_eligible && !request_admitted) {
+				if (source == NULL && xp_is_read && !clean_eligible && !request_admitted) {
 					/* No frame was published: there is no remote completion to
 					 * acknowledge. The existing bufmgr owner must exact-abort
 					 * its GRANT_PENDING reservation before yielding/rearming. */
@@ -3603,11 +3673,24 @@ gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition transition_id
 				ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
 				bool have_reply;
 				bool slot_stale;
+				bool revoked;
 
 				LWLockAcquire(&blk->lock.lock, LW_SHARED);
 				have_reply = slot->in_use && slot->reply_received;
 				slot_stale = slot->in_use && slot->stale;
+				revoked = slot->in_use && slot->first_fill_revoked;
 				LWLockRelease(&blk->lock.lock);
+				if (source != NULL) {
+					cluster_pcm_lock_check_shutdown_wait();
+					if (revoked) {
+						source->retry_event = true;
+						retry_denied = true;
+						break;
+					}
+					if (slot_stale || cluster_epoch_get_current() != payload.epoch)
+						ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+							errmsg("first-fill source membership changed while waiting")));
+				}
 				if (have_reply) {
 					got_reply = true;
 					break;
@@ -3621,8 +3704,14 @@ gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition transition_id
 
 				now = GetCurrentTimestamp();
 				if (now >= deadline) {
-					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_timeout_count, 1);
-					break;
+					if (source != NULL) {
+						/* A response period is not a failed acquisition. Keep the
+						 * slot and its one admitted request through native IO. */
+						deadline = now + (TimestampTz)Max(cluster_gcs_reply_timeout_ms, 1000) * 1000;
+					} else {
+						pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_timeout_count, 1);
+						break;
+					}
 				}
 				timeout_ms = (long)((deadline - now) / 1000);
 				if (timeout_ms <= 0)
@@ -3631,6 +3720,8 @@ gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition transition_id
 												  WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
 			}
 			ConditionVariableCancelSleep();
+			if (source != NULL && retry_denied)
+				break;
 
 			if (!got_reply) {
 				bool direct_abort_done = true;
@@ -3686,6 +3777,7 @@ gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition transition_id
 					LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
 					was_stale = slot->stale;
 					slot->stale = false;
+					slot->first_fill_revoked = false;
 					LWLockRelease(&blk->lock.lock);
 					if (was_stale)
 						current_master = cluster_gcs_lookup_master(tag);
@@ -3927,6 +4019,33 @@ gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition transition_id
 			}
 
 			/* DENIED paths — decide terminal vs retryable. */
+			if (source != NULL) {
+				if (final_status == GCS_BLOCK_REPLY_DENIED_PENDING_X
+					|| final_status == GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER) {
+					/* Holder failure has a master-owned revoke terminator. Wait
+					 * for that exact event, never resend a denied frame. */
+					ConditionVariablePrepareToSleep(&slot->reply_cv);
+					for (;;) {
+						ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
+						bool revoked;
+						cluster_pcm_lock_check_shutdown_wait();
+						if (cluster_epoch_get_current() != payload.epoch)
+							ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+								errmsg("first-fill refusal crossed membership")));
+						LWLockAcquire(&blk->lock.lock, LW_SHARED);
+						revoked = slot->first_fill_revoked;
+						LWLockRelease(&blk->lock.lock);
+						if (revoked)
+							break;
+						(void)ConditionVariableTimedSleep(&slot->reply_cv, 1000,
+							WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+					}
+					ConditionVariableCancelSleep();
+					source->retry_event = retry_denied = true;
+				} else
+					terminal_denied = true; /* capacity/malformed/epoch fail closed */
+				break;
+			}
 			if (final_status != GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER)
 				awaiting_holder_refusal_master_cleanup = false;
 			if (final_status == GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER)
@@ -4148,6 +4267,7 @@ gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition transition_id
 	}
 	PG_CATCH();
 	{
+		ConditionVariableCancelSleep();
 		gcs_block_release_slot(slot);
 		PG_RE_THROW();
 	}
@@ -4351,13 +4471,9 @@ gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition transition_id
 		}
 	}
 
-	/* First-fill backpressure stays local after its exact private slot has
-	 * closed. A wait budget is not evidence of corruption. */
-	if (source != NULL && !terminal_denied) {
-		source->kind = CLUSTER_PCM_SOURCE_RETRY;
-		*out_retry_denied = true;
-		return false;
-	}
+	if (source != NULL)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+			errmsg("first-fill source returned without a decision or progress event")));
 
 	/* Budget exhausted (timeout or transient DENIED) — HC98 53R90. */
 	pg_atomic_fetch_add_u64(&ClusterGcsBlock->retransmit_exhausted_count, 1);
@@ -5007,6 +5123,7 @@ gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthoritySnapshot
 				trace.checksum_actual = 0;
 				trace.deadline = 0;
 			}
+			slot->first_fill_revoked = false;
 			LWLockRelease(&blk->lock.lock);
 
 			memset(&fwd, 0, sizeof(fwd));
@@ -6190,6 +6307,7 @@ cluster_gcs_block_cr_fetch_and_wait_raw_trace_impl(BufferTag tag, SCN read_scn, 
 		slot->request_epoch = cluster_epoch_get_current();
 		slot->expected_master_node = cluster_node_id;
 		slot->stale = false;
+		slot->first_fill_revoked = false;
 		LWLockRelease(&blk->lock.lock);
 
 		memset(&fwd, 0, sizeof(fwd));
@@ -6399,6 +6517,7 @@ cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id, u
 		slot->request_epoch = cluster_epoch_get_current();
 		slot->expected_master_node = cluster_node_id;
 		slot->stale = false;
+		slot->first_fill_revoked = false;
 		LWLockRelease(&blk->lock.lock);
 
 		memset(&fwd, 0, sizeof(fwd));
@@ -6641,6 +6760,7 @@ gcs_block_undo_verdict_wire_exchange_trace_impl(
 		slot->request_epoch = stamped_epoch;
 		slot->expected_master_node = cluster_node_id;
 		slot->stale = false;
+		slot->first_fill_revoked = false;
 		LWLockRelease(&blk->lock.lock);
 
 		memset(&fwd, 0, sizeof(fwd));
@@ -7079,6 +7199,7 @@ cluster_gcs_block_undo_multi_verdict_fetch_and_wait(int32 origin_node, MultiXact
 		slot->request_epoch = cluster_epoch_get_current();
 		slot->expected_master_node = cluster_node_id;
 		slot->stale = false;
+		slot->first_fill_revoked = false;
 		LWLockRelease(&blk->lock.lock);
 
 		memset(&fwd, 0, sizeof(fwd));
@@ -7280,6 +7401,7 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, const PcmAuthority
 		slot->request_epoch = cluster_epoch_get_current();
 		slot->expected_master_node = cluster_node_id;
 		slot->stale = false;
+		slot->first_fill_revoked = false;
 		LWLockRelease(&blk->lock.lock);
 
 		memset(&fwd, 0, sizeof(fwd));
@@ -17780,6 +17902,78 @@ cluster_gcs_resource_x_target_itl_recycle_cancel_exact(const ResourceXLocalOwner
  */
 /* Master pre-registration is the authority point, before FORWARD. The marker
  * is routing only; a duplicate must still find this exact live pending grant. */
+#define GCS_FIRST_FILL_PARK_MAX 64
+typedef struct GcsFirstFillMasterPark {
+	bool in_use;
+	GcsBlockRequestPayload request;
+	GcsBlockDedupKey key;
+	TimestampTz retry_at;
+} GcsFirstFillMasterPark;
+static GcsFirstFillMasterPark gcs_first_fill_master_parks[GCS_FIRST_FILL_PARK_MAX];
+
+/* Terminal routing decisions finish execution, but retain the exact cached
+ * denial for the original replay window. DONE/sweep owns physical removal. */
+static void
+gcs_first_fill_master_deny(const GcsBlockRequestPayload *req, const GcsBlockDedupKey *key,
+	int worker, GcsBlockReplyStatus status, bool never_granted)
+{
+	GcsBlockReplyHeader header = {0};
+	header.request_id = req->request_id;
+	header.epoch = req->epoch;
+	header.sender_node = cluster_node_id;
+	header.requester_backend_id = req->requester_backend_id;
+	header.transition_id = req->transition_id;
+	header.status = status;
+	GcsBlockReplyHeaderSetForwardingMasterNode(&header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	if (never_granted) {
+		if (!cluster_gcs_block_dedup_install_ungranted_first_fill_exact(worker, key, &req->tag, &header))
+			return; /* No proof of terminal ownership: keep the original entry fail-closed. */
+	} else
+		cluster_gcs_block_dedup_install_reply(worker, key, status, &header, NULL);
+	gcs_block_send_reply(req->sender_node, req, status, InvalidXLogRecPtr, NULL);
+}
+
+static bool
+gcs_first_fill_master_park(const GcsBlockRequestPayload *req, const GcsBlockDedupKey *key)
+{
+	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
+		GcsFirstFillMasterPark *park = &gcs_first_fill_master_parks[i];
+		if (park->in_use && memcmp(&park->key, key, sizeof(*key)) == 0)
+			return true;
+	}
+	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
+		GcsFirstFillMasterPark *park = &gcs_first_fill_master_parks[i];
+		if (!park->in_use) {
+			park->request = *req;
+			park->key = *key;
+			park->retry_at = GetCurrentTimestamp() + 10000;
+			park->in_use = true;
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
+gcs_first_fill_master_cancel(const ClusterPcmReadGrantKey *key, int worker)
+{
+	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
+		GcsFirstFillMasterPark *park = &gcs_first_fill_master_parks[i];
+		if (park->in_use && park->request.request_id == key->request_id
+			&& park->request.epoch == key->epoch && park->request.sender_node == key->requester_node
+			&& park->request.requester_backend_id == key->backend_id
+			&& BufferTagsEqual(&park->request.tag, &key->tag)) {
+			park->in_use = false;
+			gcs_first_fill_master_deny(&park->request, &park->key, worker,
+				GCS_BLOCK_REPLY_DENIED_PENDING_X, true);
+			(void)cluster_gcs_block_dedup_mark_done(worker, &park->key,
+				&park->request.tag, park->request.transition_id);
+			return true;
+		}
+	}
+	return false;
+}
+
 static void
 gcs_block_first_fill_request(const GcsBlockRequestPayload *req, const GcsBlockDedupKey *key,
 	int worker, bool create)
@@ -17794,10 +17988,16 @@ gcs_block_first_fill_request(const GcsBlockRequestPayload *req, const GcsBlockDe
 	result = cluster_pcm_lock_read_grant_begin(req->tag, req->sender_node,
 		req->requester_backend_id, req->request_id, req->epoch, deadline, create, &grant);
 	if (result != PCM_GCS_TRANSITION_APPLIED) {
-		gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_PENDING_X,
-			InvalidXLogRecPtr, NULL);
+		if (create && result == PCM_GCS_TRANSITION_PENDING_X
+			&& gcs_first_fill_master_park(req, key))
+			return; /* master observes its native queue; R never polls it */
+		gcs_first_fill_master_deny(req, key, worker,
+			create && result == PCM_GCS_TRANSITION_PENDING_X ? GCS_BLOCK_REPLY_DENIED_DEDUP_FULL
+			: GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT, create);
 		return;
 	}
+	cluster_block_io_trace_pending_s(&grant.key, "REGISTERED", 1,
+		grant.holder_node, grant.binding_generation, result);
 	if (grant.holder_node < 0) {
 		/* Two-way disk grant. No image producer or synchronous registration. */
 		char reply[sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE];
@@ -17839,13 +18039,13 @@ gcs_block_first_fill_request(const GcsBlockRequestPayload *req, const GcsBlockDe
 			(uint32)cluster_node_id, &fwd, sizeof(fwd))
 		: gcs_block_forward_send_admitted(grant.holder_node, &fwd))) {
 		(void)cluster_pcm_lock_read_grant_done(&grant.key, req->sender_node, false);
-		gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_PENDING_X,
-			InvalidXLogRecPtr, NULL);
+		gcs_first_fill_master_deny(req, key, worker, GCS_BLOCK_REPLY_DENIED_PENDING_X, false);
 		return;
 	}
 	pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
 	memset(&marker, 0, sizeof(marker));
 	marker.request_id = req->request_id;
+	marker.epoch = req->epoch;
 	marker.requester_backend_id = req->requester_backend_id;
 	marker.transition_id = req->transition_id;
 	marker.sender_node = grant.holder_node;
@@ -17854,6 +18054,41 @@ gcs_block_first_fill_request(const GcsBlockRequestPayload *req, const GcsBlockDe
 	GcsBlockReplyHeaderSetForwardingMasterNode(&marker, cluster_node_id);
 	cluster_gcs_block_dedup_install_reply(worker, key, GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER,
 		&marker, NULL);
+}
+
+static void
+gcs_first_fill_master_tick(int worker)
+{
+	TimestampTz now = GetCurrentTimestamp();
+	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
+		GcsFirstFillMasterPark saved = gcs_first_fill_master_parks[i];
+		if (!saved.in_use || now < saved.retry_at)
+			continue;
+		if (saved.request.epoch != cluster_epoch_get_current()
+			|| cluster_normal_stop_requested()) {
+			gcs_first_fill_master_parks[i].in_use = false;
+			gcs_first_fill_master_deny(&saved.request, &saved.key, worker,
+				GCS_BLOCK_REPLY_DENIED_EPOCH_STALE, true);
+		} else {
+			bool pending = false;
+			bool serving = cluster_authority_readiness_managed()
+				? cluster_serving_ready_check(&pending, NULL) : cluster_qvotec_in_quorum();
+
+			/* This is a new native service attempt, outside the original
+			 * admitted envelope. Revalidate every original authority gate;
+			 * a closed/pending gate retains the same local request. */
+			if (!serving || !cluster_membership_is_member(cluster_node_id)
+				|| (cluster_grd_join_remaster_active_for_shard(saved.request.tag)
+					&& !cluster_grd_block_view_rebuilt(saved.request.tag))
+				|| cluster_gcs_block_phase_for_tag(saved.request.tag) == GCS_BLOCK_RECOVERING
+				|| cluster_gcs_lookup_master(saved.request.tag) != cluster_node_id) {
+				gcs_first_fill_master_parks[i].retry_at = now + 10000;
+				continue;
+			}
+			gcs_first_fill_master_parks[i].in_use = false;
+			gcs_block_first_fill_request(&saved.request, &saved.key, worker, true);
+		}
+	}
 }
 
 void
@@ -18071,12 +18306,21 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	}
 	/* Ordinary first-fill never enters the legacy one-shot/read-register
 	 * decision tree. Replays cannot recreate a retired pending identity. */
-	if (GcsBlockRequestPayloadIsReadMiss(req)
-		&& (dr == GCS_BLOCK_DEDUP_MISS_REGISTERED || dr == GCS_BLOCK_DEDUP_FORWARDED_DUPLICATE
+	if (GcsBlockRequestPayloadIsReadMiss(req)) {
+		if (dr == GCS_BLOCK_DEDUP_MISS_REGISTERED || dr == GCS_BLOCK_DEDUP_FORWARDED_DUPLICATE
 			|| (dr == GCS_BLOCK_DEDUP_CACHED_REPLY
-				&& GcsBlockReplyHeaderHasPendingS(&cached_entry.reply_header)))) {
-		gcs_block_first_fill_request(req, &key, dedup_worker_id,
-			dr == GCS_BLOCK_DEDUP_MISS_REGISTERED);
+				&& GcsBlockReplyHeaderHasPendingS(&cached_entry.reply_header)))
+			gcs_block_first_fill_request(req, &key, dedup_worker_id,
+				dr == GCS_BLOCK_DEDUP_MISS_REGISTERED);
+		else if (dr == GCS_BLOCK_DEDUP_CACHED_REPLY) {
+			(void)gcs_block_resend_cached_reply(req->sender_node, &cached_entry);
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_reply_count, 1);
+		} else if (dr == GCS_BLOCK_DEDUP_VALIDATION_FAIL || dr == GCS_BLOCK_DEDUP_FULL)
+			gcs_block_send_reply(req->sender_node, req,
+				dr == GCS_BLOCK_DEDUP_FULL ? GCS_BLOCK_REPLY_DENIED_DEDUP_FULL
+				: GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT, InvalidXLogRecPtr, NULL);
+		/* In-flight duplicates belong to the parked/native pending-S owner;
+		 * legacy pending-X arbitration must never overwrite that work. */
 		return;
 	}
 	if (req->transition_id == PCM_TRANS_N_TO_S) {
@@ -21195,6 +21439,84 @@ cluster_gcs_block_test_current_mx_forward128(const ClusterICEnvelope *env, const
 }
 #endif
 
+/* The routed LMS worker owns this bounded continuation without retaining a
+ * pin/content lock. The master retains pending-S authority through revoke. */
+typedef struct GcsFirstFillHolderPark {
+	bool in_use;
+	GcsBlockForwardPayload forward;
+	ClusterPcmFirstFillWait wait;
+	TimestampTz retry_at;
+} GcsFirstFillHolderPark;
+static GcsFirstFillHolderPark gcs_first_fill_holder_parks[GCS_FIRST_FILL_PARK_MAX];
+static GcsFirstFillHolderPark *gcs_first_fill_resuming;
+static bool gcs_first_fill_resume_retained;
+
+static bool
+gcs_first_fill_same_forward(const GcsBlockForwardPayload *a, const GcsBlockForwardPayload *b)
+{
+	return a->request_id == b->request_id && a->epoch == b->epoch
+		&& a->original_requester_node == b->original_requester_node
+		&& a->requester_backend_id == b->requester_backend_id
+		&& a->master_node == b->master_node && BufferTagsEqual(&a->tag, &b->tag);
+}
+
+static void
+gcs_first_fill_holder_cancel(const GcsBlockForwardPayload *fwd)
+{
+	ClusterPcmReadGrantKey key = {0};
+	key.tag = fwd->tag;
+	key.request_id = fwd->request_id;
+	key.epoch = fwd->epoch;
+	key.requester_node = fwd->original_requester_node;
+	key.backend_id = fwd->requester_backend_id;
+	(void)gcs_block_pending_s_notify_action(&key, fwd->master_node,
+		GCS_BLOCK_DONE_PENDING_S_NACK);
+	gcs_block_forward_reply_immediate_deny(fwd);
+}
+
+/* Before production, park only on witnessed native IO. After a conditional
+ * content refusal, retain that same request locally. A duplicate cannot
+ * replace either the IO witness or the accepted requester identity. */
+static bool
+gcs_first_fill_holder_park(const GcsBlockForwardPayload *fwd, bool content_busy)
+{
+	ClusterPcmFirstFillWait wait;
+	int free_slot = -1;
+	int worker = cluster_ic_tier1_my_data_channel();
+	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
+		GcsFirstFillHolderPark *park = &gcs_first_fill_holder_parks[i];
+		if (!park->in_use) {
+			if (free_slot < 0)
+				free_slot = i;
+			continue;
+		}
+		if (gcs_first_fill_same_forward(&park->forward, fwd)) {
+			if (park == gcs_first_fill_resuming) {
+				if (content_busy)
+					gcs_first_fill_resume_retained = true;
+				return content_busy;
+			}
+			return true;
+		}
+	}
+	if (!cluster_bufmgr_first_fill_wait_begin(fwd->tag, worker, &wait))
+		return false;
+	if (!content_busy && (wait.write_io_generation & 1) == 0)
+		return false;
+	if (free_slot < 0) {
+		gcs_first_fill_holder_cancel(fwd);
+		return true;
+	}
+	gcs_first_fill_holder_parks[free_slot].forward = *fwd;
+	gcs_first_fill_holder_parks[free_slot].wait = wait;
+	gcs_first_fill_holder_parks[free_slot].retry_at = GetCurrentTimestamp();
+	gcs_first_fill_holder_parks[free_slot].in_use = true;
+	cluster_block_io_trace_note(fwd->tag, "FIRST_FILL_HOLDER_PARK",
+		fwd->request_id, wait.write_io_generation, (uint32)wait.buffer_id);
+	cluster_lms_wakeup(worker);
+	return true;
+}
+
 void
 cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const void *payload)
 {
@@ -21426,6 +21748,10 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		return;
 	}
 
+	if (GcsBlockForwardPayloadIsFirstFillS(fwd)
+		&& gcs_first_fill_holder_park(fwd, false))
+		return;
+
 	/* Decide the holder-eviction fault before any irreversible downgrade.
 	 * A forced DENIED must never first publish X->S and then discard the only
 	 * image prepared for the requester. */
@@ -21478,6 +21804,12 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 			gcs_block_read_image_hop_trace(&trace, "holder.post_notify_refused", "downgrade.post_notify");
 		return;
 	}
+	if (GcsBlockForwardPayloadIsFirstFillS(fwd) && !remote_downgraded
+		&& !holder_evicted_injected
+		&& (copy_refusal == CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_FIRST
+			|| copy_refusal == CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_SECOND)
+		&& gcs_first_fill_holder_park(fwd, true))
+		return;
 	/* First-fill can consume only a durable S. A replay may find H already
 	 * downgraded; anything still X/busy refuses rather than shipping one-shot. */
 	if (GcsBlockForwardPayloadIsFirstFillS(fwd) && !remote_downgraded
@@ -21508,6 +21840,12 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		trace.ship_ok = holder_ship_ok;
 		trace.copy_refusal = copy_refusal;
 	}
+	if (GcsBlockForwardPayloadIsFirstFillS(fwd) && !holder_ship_ok
+		&& !holder_evicted_injected
+		&& (copy_refusal == CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_FIRST
+			|| copy_refusal == CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_SECOND)
+		&& gcs_first_fill_holder_park(fwd, true))
+		return;
 
 	/* Build reply (header + 8KB block or zero pad) and direct-ship to
 	 * the original requester.  HC109 stores fwd->master_node in the
@@ -21910,6 +22248,54 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 }
 
 
+/* Native IO completion wakes this worker. Each tick makes at most one
+ * nonblocking production attempt per ready entry; no requester polling and
+ * no data/control loop held waiting on a backend's content lock. */
+void
+cluster_gcs_block_first_fill_tick(void)
+{
+	int worker = cluster_ic_tier1_my_data_channel();
+	TimestampTz now = GetCurrentTimestamp();
+	if (worker < 0 || ClusterGcsBlock == NULL)
+		return;
+	gcs_first_fill_master_tick(worker);
+	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
+		GcsFirstFillHolderPark *park = &gcs_first_fill_holder_parks[i];
+		ClusterICEnvelope env = {0};
+		int ready;
+		volatile bool completed = false;
+		if (!park->in_use)
+			continue;
+		ready = cluster_bufmgr_first_fill_wait_ready(&park->wait);
+		if (ready < 0 || park->forward.epoch != cluster_epoch_get_current()
+			|| cluster_normal_stop_requested()) {
+			park->in_use = false; /* no producer/delivery can be in flight here */
+			gcs_first_fill_holder_cancel(&park->forward);
+			continue;
+		}
+		if (ready == 0 || now < park->retry_at)
+			continue;
+		park->retry_at = now + 10000;
+		env.source_node_id = (uint32)park->forward.master_node;
+		env.dest_node_id = (uint32)cluster_node_id;
+		env.payload_length = sizeof(park->forward);
+		gcs_first_fill_resuming = park;
+		gcs_first_fill_resume_retained = false;
+		PG_TRY();
+		{
+			cluster_gcs_handle_block_forward_envelope(&env, &park->forward);
+			completed = true;
+		}
+		PG_FINALLY();
+		{
+			gcs_first_fill_resuming = NULL;
+			if (completed && !gcs_first_fill_resume_retained)
+				park->in_use = false;
+		}
+		PG_END_TRY();
+	}
+}
+
 /* ============================================================
  * Dispatch table registration.
  *
@@ -22161,6 +22547,7 @@ cluster_gcs_handle_block_done_envelope(const ClusterICEnvelope *env, const void 
 		ClusterPcmReadGrantKey grant_key;
 		uint64 session;
 		bool installed = done->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_CONFIRM;
+		bool applied;
 		if (!GcsBlockDonePayloadPendingSKey(done, &grant_key)
 			|| cluster_gcs_lookup_master(done->tag) != cluster_node_id
 			|| !gcs_block_pcm_x_authenticated_session(done->sender_node,
@@ -22168,11 +22555,21 @@ cluster_gcs_handle_block_done_envelope(const ClusterICEnvelope *env, const void 
 			|| (installed && done->epoch != cluster_epoch_get_current()))
 			return;
 		if (done->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_HOLDER) {
-			if (done->epoch == cluster_epoch_get_current())
-				(void)cluster_pcm_lock_read_grant_holder_done(&grant_key, done->sender_node);
+			bool applied = done->epoch == cluster_epoch_get_current()
+				&& cluster_pcm_lock_read_grant_holder_done(&grant_key, done->sender_node);
+			cluster_block_io_trace_pending_s(&grant_key, "HOLDER_DONE", -1,
+				done->sender_node, 0, applied);
 			return;
 		}
-		if (cluster_pcm_lock_read_grant_done(&grant_key, done->sender_node, installed)) {
+		if (!installed && done->sender_node == grant_key.requester_node
+			&& gcs_first_fill_master_cancel(&grant_key, dedup_worker_id))
+			return;
+		applied = cluster_pcm_lock_read_grant_done(&grant_key, done->sender_node, installed);
+		cluster_block_io_trace_pending_s(&grant_key, installed ? "CONFIRM" : "NACK",
+			applied ? (installed ? 0 : 2) : -1, done->sender_node, 0, applied);
+		/* Requester NACK is its exact delivery-close/retirement proof.
+		 * Holder NACK alone cannot shorten the request's replay lifetime. */
+		if ((applied && installed) || (!installed && done->sender_node == grant_key.requester_node)) {
 			memset(&key, 0, sizeof(key));
 			key.origin_node_id = (uint32)grant_key.requester_node;
 			key.requester_backend_id = grant_key.backend_id;
@@ -23240,6 +23637,8 @@ cluster_gcs_block_pending_s_tick(void)
 		return;
 	if (cluster_gcs_lookup_master(work.key.tag) != cluster_node_id)
 		return; /* Membership recovery retains the debt; not this node's grant. */
+	cluster_block_io_trace_pending_s(&work.key, "REVOKE", 2,
+		work.holder_node, work.binding_generation, 0);
 	memset(&inv, 0, sizeof(inv));
 	inv.request_id = work.key.request_id;
 	inv.epoch = epoch; /* Current transport admission; original epoch is echoed separately. */
@@ -23265,12 +23664,14 @@ gcs_block_pending_s_delivery_closed(const GcsBlockInvalidatePayload *inv)
 	if (backend <= 0 || backend > MaxBackends || epoch == 0 || gcs_block_backend_blocks == NULL)
 		return false;
 	blk = &gcs_block_backend_blocks[backend - 1];
-	LWLockAcquire(&blk->lock.lock, LW_SHARED);
+	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
 	for (int i = 0; i < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; i++) {
 		ClusterGcsBlockOutstandingSlot *slot = &blk->slots[i];
 		if (slot->in_use && slot->request_id == inv->request_id
 			&& slot->request_epoch == epoch && slot->expected_master_node == inv->master_node
 			&& BufferTagsEqual(&slot->tag, &inv->tag)) {
+			slot->first_fill_revoked = true;
+			ConditionVariableSignal(&slot->reply_cv);
 			closed = false;
 			break;
 		}
@@ -23637,6 +24038,15 @@ cluster_gcs_block_normal_stop_local_poll(int *slot_out, const char **reason_out)
 		if (invalid)
 			return result;
 	}
+	for (index = 0; index < GCS_FIRST_FILL_PARK_MAX; index++) {
+		if (gcs_first_fill_master_parks[index].in_use
+			|| gcs_first_fill_holder_parks[index].in_use) {
+			*slot_out = index;
+			*reason_out = gcs_first_fill_holder_parks[index].in_use
+				? "GCS_FIRST_FILL_HOLDER_WAIT" : "GCS_FIRST_FILL_MASTER_WAIT";
+			return CLUSTER_NORMAL_STOP_PENDING;
+		}
+	}
 	return result;
 }
 
@@ -23948,15 +24358,28 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 	if (ack->reserved_0[1] == GCS_BLOCK_INVALIDATE_KIND_PENDING_S) {
 		ClusterPcmReadGrantKey key;
 		uint64 session;
-		if (GcsBlockInvalidateAckPayloadPendingSKey(ack, &key)
-			&& (ack->ack_status == 0 || ack->ack_status == 2)
+		bool decoded = GcsBlockInvalidateAckPayloadPendingSKey(ack, &key);
+		bool applied = false;
+		if (decoded && (ack->ack_status == 0 || ack->ack_status == 2)
 			&& cluster_gcs_lookup_master(ack->tag) == cluster_node_id
 			&& gcs_block_pcm_x_authenticated_session(ack->sender_node,
 				cluster_epoch_get_current(), &session)) {
 			if (ack->reserved_0[0] == GCS_BLOCK_INVALIDATE_ACK_KEPT_PI)
 				cluster_pcm_lock_pi_holder_note(ack->tag, ack->sender_node);
-			(void)cluster_pcm_lock_read_grant_revoke_ack(&key);
+			applied = cluster_pcm_lock_read_grant_revoke_ack(&key);
+			if (applied) {
+				GcsBlockDedupKey retired = {0};
+				retired.origin_node_id = (uint32)key.requester_node;
+				retired.requester_backend_id = key.backend_id;
+				retired.request_id = key.request_id;
+				retired.cluster_epoch = key.epoch;
+				(void)cluster_gcs_block_dedup_mark_done(cluster_ic_tier1_my_data_channel(),
+					&retired, &key.tag, PCM_TRANS_N_TO_S);
+			}
 		}
+		if (decoded)
+			cluster_block_io_trace_pending_s(&key, applied ? "REVOKE_ACK" : "REVOKE_ACK_REFUSED",
+				applied ? 0 : -1, ack->sender_node, 0, ack->ack_status);
 		return;
 	}
 	/*

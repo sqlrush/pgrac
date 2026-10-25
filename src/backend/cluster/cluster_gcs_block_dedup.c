@@ -45,6 +45,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_block_io_trace.h"
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -393,6 +394,10 @@ cluster_gcs_dedup_normal_stop_poll(const char **domain, uint64 *key, const char 
 			if (malformed || seen > (uint64)cluster_gcs_block_dedup_ctl->max_entries_effective) {
 				one = CLUSTER_NORMAL_STOP_INVALID;
 				cause = "GCS_DEDUP_ENTRY_SHAPE";
+				cluster_block_io_trace_note(entry->tag,
+					malformed ? "DEDUP_ENTRY_MALFORMED" : "DEDUP_CAPACITY_EXCEEDED",
+					entry->key.request_id, seen,
+					(uint32)cluster_gcs_block_dedup_ctl->max_entries_effective);
 			} else if (pending) {
 				one = CLUSTER_NORMAL_STOP_PENDING;
 				cause = "GCS_DEDUP_IN_FLIGHT";
@@ -699,6 +704,16 @@ cluster_gcs_block_dedup_lookup_or_register(int worker_id, const GcsBlockDedupKey
 		LWLockRelease(&shard->lock.lock);
 		return GCS_BLOCK_DEDUP_FULL;
 	}
+	/* ShmemInitHash max_size sizes its directory; it is not a live-entry
+	 * bound. Serialize the advertised limit with insertion, and never reclaim
+	 * a still-replayable or executing request just to admit a newer one. */
+	if (hash_get_num_entries(htab) >= cluster_gcs_block_dedup_ctl->max_entries_effective)
+		(void)dedup_reclaim_reclaimable_locked(shard, htab, GetCurrentTimestamp(), 1);
+	if (hash_get_num_entries(htab) >= cluster_gcs_block_dedup_ctl->max_entries_effective) {
+		pg_atomic_fetch_add_u64(&shard->full_count, 1);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_DEDUP_FULL;
+	}
 	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_ENTER_NULL, &found);
 	if (entry == NULL) {
 		/* PGRAC: spec-7.2a D1 — before failing closed, try to reclaim one
@@ -817,6 +832,13 @@ cluster_gcs_block_dedup_r4_route_arm_or_match(
 	}
 	/* Exact existing routes above retain their original handoff/replay. */
 	if (!cluster_normal_stop_service_new_work(false)) {
+		result = GCS_BLOCK_R4_ROUTE_ARM_FULL;
+		goto out;
+	}
+	if (hash_get_num_entries(htab) >= cluster_gcs_block_dedup_ctl->max_entries_effective)
+		(void)dedup_reclaim_reclaimable_locked(shard, htab, GetCurrentTimestamp(), 1);
+	if (hash_get_num_entries(htab) >= cluster_gcs_block_dedup_ctl->max_entries_effective) {
+		pg_atomic_fetch_add_u64(&shard->full_count, 1);
 		result = GCS_BLOCK_R4_ROUTE_ARM_FULL;
 		goto out;
 	}
@@ -1072,6 +1094,7 @@ cluster_gcs_block_dedup_pending_x_deny_next(int worker_id, const BufferTag *tag,
 	while ((entry = (GcsBlockDedupEntry *)hash_seq_search(&scan)) != NULL) {
 		if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC
 			|| entry->transition_id != (uint8)PCM_TRANS_N_TO_S
+			|| (entry->request_flags & GCS_BLOCK_DEDUP_REQUEST_F_READ_MISS) != 0
 			|| memcmp(&entry->tag, tag, sizeof(*tag)) != 0 || entry->done_at_ts != 0)
 			continue;
 
@@ -1129,6 +1152,7 @@ cluster_gcs_block_dedup_pending_x_deny_exact(int worker_id, const GcsBlockDedupK
 	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
 	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_FIND, &found);
 	if (!found || entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC
+		|| (entry->request_flags & GCS_BLOCK_DEDUP_REQUEST_F_READ_MISS) != 0
 		|| memcmp(&entry->tag, tag, sizeof(*tag)) != 0 || entry->transition_id != transition_id) {
 		if (found && entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC)
 			dedup_note_validation_failure(shard);
@@ -1183,6 +1207,49 @@ cluster_gcs_block_dedup_set_request_flags_exact(int worker_id, const GcsBlockDed
 		dedup_note_validation_failure(shard);
 	LWLockRelease(&shard->lock.lock);
 	return updated;
+}
+
+bool
+cluster_gcs_block_dedup_install_ungranted_first_fill_exact(int worker_id,
+	const GcsBlockDedupKey *key, const BufferTag *tag, const GcsBlockReplyHeader *header)
+{
+	ClusterGcsBlockDedupShard *shard;
+	HTAB *htab = NULL;
+	GcsBlockDedupEntry *entry;
+	GcsBlockDedupEntry proof = {0};
+	bool found, installed = false;
+
+	if (key == NULL || tag == NULL || header == NULL)
+		return false;
+	proof.key = *key;
+	proof.tag = *tag;
+	proof.entry_kind = GCS_BLOCK_DEDUP_ENTRY_GENERIC;
+	proof.transition_id = PCM_TRANS_N_TO_S;
+	proof.request_flags = GCS_BLOCK_DEDUP_REQUEST_F_READ_MISS;
+	proof.first_fill_no_grant = true;
+	proof.status = header->status;
+	proof.reply_header = *header;
+	proof.completed_at_ts = 1;
+	if (header->sender_node != cluster_node_id || !GcsBlockDedupEntryIsUngrantedFirstFillDenial(&proof))
+		return false;
+	shard = cluster_gcs_block_dedup_resolve_shard(worker_id, &htab);
+	if (shard == NULL)
+		return false;
+	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
+	entry = hash_search(htab, key, HASH_FIND, &found);
+	if (found && entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_GENERIC
+		&& entry->completed_at_ts == 0 && entry->done_at_ts == 0
+		&& entry->transition_id == PCM_TRANS_N_TO_S
+		&& (entry->request_flags & GCS_BLOCK_DEDUP_REQUEST_F_READ_MISS) != 0
+		&& BufferTagsEqual(&entry->tag, tag)) {
+		entry->reply_header = *header;
+		entry->status = header->status;
+		entry->completed_at_ts = GetCurrentTimestamp();
+		entry->first_fill_no_grant = true;
+		installed = true;
+	}
+	LWLockRelease(&shard->lock.lock);
+	return installed;
 }
 
 /*
@@ -1330,7 +1397,7 @@ cluster_gcs_block_dedup_install_reply_ex(int worker_id, const GcsBlockDedupKey *
 	 * reader.  Any asynchronous old producer has permanently lost the right
 	 * to restore GRANTED/FORWARD/page bytes; preserve the cached denial for
 	 * retransmit until exact DONE. */
-	if (dedup_pending_x_denial_is_exact(entry)) {
+	if (dedup_pending_x_denial_is_exact(entry) || entry->first_fill_no_grant) {
 		LWLockRelease(&shard->lock.lock);
 		return;
 	}
@@ -1571,6 +1638,9 @@ cluster_gcs_block_dedup_sweep_expired(TimestampTz now)
 				removed++;
 				continue;
 			}
+			if ((entry->request_flags & GCS_BLOCK_DEDUP_REQUEST_F_READ_MISS) != 0
+				&& entry->done_at_ts == 0 && !GcsBlockDedupEntryIsUngrantedFirstFillDenial(entry))
+				continue;
 
 			/*
 			 * GCS-race round-2 RC-F: per-entry pinned deadlines.  A

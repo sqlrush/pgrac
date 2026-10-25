@@ -1239,6 +1239,7 @@ LmsMain(void)
 			 * attempt each;  never waits on a pin). */
 				cluster_gcs_block_invalidate_park_tick();
 				cluster_gcs_block_pending_s_tick();
+				cluster_gcs_block_first_fill_tick();
 			}
 			work_completed = true;
 		}
@@ -1418,6 +1419,7 @@ LmsWorkerMain(int worker_id)
 			 * directives parked by this worker's dispatch handler. */
 				cluster_gcs_block_invalidate_park_tick();
 				cluster_gcs_block_pending_s_tick();
+					cluster_gcs_block_first_fill_tick();
 			}
 			work_completed = true;
 		}

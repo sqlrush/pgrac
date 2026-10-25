@@ -56,6 +56,7 @@
 #include <stddef.h>
 
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_block_io_trace.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_gcs_block_dedup.h"
 #include "cluster/cluster_lms_shard.h"
@@ -83,6 +84,15 @@
 
 
 UT_DEFINE_GLOBALS();
+
+static const char *dedup_reject_event;
+void
+cluster_block_io_trace_note(BufferTag tag pg_attribute_unused(), const char *event,
+	uint64 version pg_attribute_unused(), uint64 sequence pg_attribute_unused(),
+	uint32 holders pg_attribute_unused())
+{
+	dedup_reject_event = event;
+}
 
 static uint32 stop_seal;
 static int stop_gate_calls;
@@ -212,6 +222,12 @@ ShmemInitHash(const char *name pg_attribute_unused(), long init_size pg_attribut
 	h = &fake_htab[fake_htab_init_seq++];
 	h->count = 0;
 	return (HTAB *)h;
+}
+
+long
+hash_get_num_entries(HTAB *hashp)
+{
+	return ((FakeDedupShardHtab *)hashp)->count;
 }
 
 void *
@@ -574,6 +590,30 @@ UT_TEST(u6_n1_only_shard0)
 /* ============================================================
  * U7 — per-shard cap: fill shard 0 to cap → FULL + full_count++.
  * ============================================================ */
+/* The allocator may grow beyond its estimated initial size. The product
+ * must enforce its advertised cap, independently of allocator exhaustion. */
+UT_TEST(u7_configured_cap_precedes_allocator_capacity)
+{
+	BufferTag tag = make_tag(59);
+	GcsBlockDedupEntry cached;
+	GcsBlockDedupKey a = make_key(0, 1, 91, 7);
+	GcsBlockDedupKey b = make_key(0, 1, 92, 7);
+	GcsBlockDedupKey c = make_key(0, 1, 93, 7);
+	const char *reason;
+	reset_fake_dedup(2, 2);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(0, &a, tag, 1, 0, false, &cached),
+		GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(0, &b, tag, 1, 0, false, &cached),
+		GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(0, &c, tag, 1, 0, false, &cached),
+		GCS_BLOCK_DEDUP_FULL);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(0, &a, tag, 1, 0, false, &cached),
+		GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE);
+	UT_ASSERT_EQ(cluster_gcs_dedup_normal_stop_poll(NULL, NULL, &reason), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_STR_EQ(reason, "GCS_DEDUP_IN_FLIGHT");
+	UT_ASSERT_EQ(fake_htab[0].count, 2);
+}
+
 UT_TEST(u7_per_shard_cap_full)
 {
 	BufferTag tag = make_tag(60);
@@ -1293,10 +1333,137 @@ UT_TEST(stop_poll_invalid_last_shard_and_observer_preconditions)
 	MyBackendType = B_LMON;
 }
 
+UT_TEST(first_fill_requires_completion_proof_before_age_or_capacity_reclaim)
+{
+	GcsBlockDedupKey key = make_key(0, 3, 9501, 7);
+	GcsBlockDedupKey next = make_key(0, 3, 9502, 7);
+	BufferTag tag = make_tag(94);
+	GcsBlockDedupEntry cached;
+	TimestampTz now = GetCurrentTimestamp();
+
+	reset_fake_dedup(1, 1);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(0, &key, tag,
+		PCM_TRANS_N_TO_S, 26500, true, &cached), GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	UT_ASSERT(cluster_gcs_block_dedup_set_request_flags_exact(0, &key, &tag,
+		PCM_TRANS_N_TO_S, GCS_BLOCK_DEDUP_REQUEST_F_READ_MISS));
+	install_granted(0, &key);
+	cluster_gcs_block_dedup_sweep_expired(now + INT64CONST(600000000));
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_get_in_flight_count(), 1);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(0, &next, tag,
+		PCM_TRANS_N_TO_S, 26500, true, &cached), GCS_BLOCK_DEDUP_FULL);
+	UT_ASSERT(!cluster_gcs_block_dedup_mark_done(0, &key, &tag, PCM_TRANS_N_TO_X));
+	UT_ASSERT(cluster_gcs_block_dedup_mark_done(0, &key, &tag, PCM_TRANS_N_TO_S));
+	cluster_gcs_block_dedup_sweep_expired(now + INT64CONST(11000000));
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_get_in_flight_count(), 0);
+}
+
+UT_TEST(stop_rejection_distinguishes_malformed_entry_from_capacity_overrun)
+{
+	GcsBlockDedupKey key = make_key(0, 1, 9600, 7);
+	BufferTag tag = make_tag(94);
+	GcsBlockDedupEntry cached;
+	const char *domain, *reason;
+	uint64 request;
+
+	reset_fake_dedup(1, 2);
+	for (int i = 0; i < 2; i++) {
+		key.request_id++;
+		UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(0, &key, tag,
+			PCM_TRANS_N_TO_S, 26500, true, &cached), GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	}
+	((GcsBlockDedupEntry *)fake_htab[0].entries[0])->entry_kind = 99;
+	dedup_reject_event = NULL;
+	UT_ASSERT_EQ(cluster_gcs_dedup_normal_stop_poll(&domain, &request, &reason),
+		CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(dedup_reject_event, "DEDUP_ENTRY_MALFORMED");
+	((GcsBlockDedupEntry *)fake_htab[0].entries[0])->entry_kind = GCS_BLOCK_DEDUP_ENTRY_GENERIC;
+	/* Inject a historical over-capacity table independently of allocator size. */
+	memcpy(fake_htab[0].entries[2], fake_htab[0].entries[1], sizeof(cached));
+	((GcsBlockDedupEntry *)fake_htab[0].entries[2])->key.request_id++;
+	fake_htab[0].count = 3;
+	dedup_reject_event = NULL;
+	UT_ASSERT_EQ(cluster_gcs_dedup_normal_stop_poll(&domain, &request, &reason),
+		CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "GCS_DEDUP_ENTRY_SHAPE");
+	UT_ASSERT_STR_EQ(dedup_reject_event, "DEDUP_CAPACITY_EXCEEDED");
+}
+
+UT_TEST(first_fill_inflight_is_owned_by_pending_s_not_legacy_pending_x_scan)
+{
+	GcsBlockDedupKey key = make_key(0, 3, 9701, 7);
+	BufferTag tag = make_tag(94);
+	GcsBlockDedupEntry cached, denied;
+	reset_fake_dedup(1, 2);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(0, &key, tag,
+		PCM_TRANS_N_TO_S, 26500, true, &cached), GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	UT_ASSERT(cluster_gcs_block_dedup_set_request_flags_exact(0, &key, &tag,
+		PCM_TRANS_N_TO_S, GCS_BLOCK_DEDUP_REQUEST_F_READ_MISS));
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_pending_x_deny_next(0, &tag, &denied),
+		GCS_BLOCK_PENDING_X_DENY_NOT_FOUND);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_pending_x_deny_exact(0, &key, &tag,
+		PCM_TRANS_N_TO_S, &denied), GCS_BLOCK_PENDING_X_DENY_INVALID);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(0, &key, tag,
+		PCM_TRANS_N_TO_S, 26500, true, &cached), GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE);
+}
+
+UT_TEST(ungranted_first_fill_denial_retires_only_after_full_pinned_replay_window)
+{
+	GcsBlockDedupKey key = make_key(0, 3, 9801, 7);
+	GcsBlockDedupKey next = make_key(0, 3, 9802, 7);
+	BufferTag tag = make_tag(94), wrong = make_tag(95);
+	GcsBlockDedupEntry cached;
+	GcsBlockReplyHeader header = {0}, late_grant = {0};
+	TimestampTz now = GetCurrentTimestamp();
+	reset_fake_dedup(1, 1);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(0, &key, tag,
+		PCM_TRANS_N_TO_S, 26500, true, &cached), GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	UT_ASSERT(cluster_gcs_block_dedup_set_request_flags_exact(0, &key, &tag,
+		PCM_TRANS_N_TO_S, GCS_BLOCK_DEDUP_REQUEST_F_READ_MISS));
+	header.request_id = key.request_id;
+	header.epoch = key.cluster_epoch;
+	header.sender_node = cluster_node_id;
+	header.requester_backend_id = key.requester_backend_id;
+	header.transition_id = PCM_TRANS_N_TO_S;
+	header.status = GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT;
+	GcsBlockReplyHeaderSetForwardingMasterNode(&header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	UT_ASSERT(!cluster_gcs_block_dedup_install_ungranted_first_fill_exact(0, &key, &wrong, &header));
+	late_grant = header;
+	late_grant.status = GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK;
+	late_grant.reserved_0[5] = GCS_BLOCK_PENDING_S_REPLY_MARK;
+	UT_ASSERT(!cluster_gcs_block_dedup_install_ungranted_first_fill_exact(0, &key, &tag, &late_grant));
+	UT_ASSERT(cluster_gcs_block_dedup_install_ungranted_first_fill_exact(0, &key, &tag, &header));
+	/* Terminal no-grant is immutable, and is not fabricated requester DONE. */
+	cluster_gcs_block_dedup_install_reply(0, &key, GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK,
+		&late_grant, NULL);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(0, &key, tag,
+		PCM_TRANS_N_TO_S, 26500, true, &cached), GCS_BLOCK_DEDUP_CACHED_REPLY);
+	UT_ASSERT(GcsBlockDedupEntryIsUngrantedFirstFillDenial(&cached));
+	UT_ASSERT_EQ(cached.done_at_ts, 0);
+	UT_ASSERT_EQ(cached.status, GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT);
+	UT_ASSERT(!GcsBlockDedupEntryIsReclaimSafe(&cached,
+		cached.completed_at_ts + cached.pinned_lifetime_us, 1));
+	UT_ASSERT(GcsBlockDedupEntryIsReclaimSafe(&cached,
+		cached.completed_at_ts + cached.pinned_lifetime_us + 1, 1));
+	cluster_gcs_block_dedup_sweep_expired(now + 11000000);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_get_in_flight_count(), 1);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(0, &next, tag,
+		PCM_TRANS_N_TO_S, 26500, true, &cached), GCS_BLOCK_DEDUP_FULL);
+	cluster_gcs_block_dedup_sweep_expired(now + 60000000);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_get_in_flight_count(), 0);
+	/* A published grant can never be relabeled a never-granted denial. */
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(0, &next, tag,
+		PCM_TRANS_N_TO_S, 26500, true, &cached), GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	UT_ASSERT(cluster_gcs_block_dedup_set_request_flags_exact(0, &next, &tag,
+		PCM_TRANS_N_TO_S, GCS_BLOCK_DEDUP_REQUEST_F_READ_MISS));
+	install_granted(0, &next);
+	header.request_id = next.request_id;
+	UT_ASSERT(!cluster_gcs_block_dedup_install_ungranted_first_fill_exact(0, &next, &tag, &header));
+}
+
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(27);
 	UT_RUN(stop_poll_original_tables_not_cached_counts);
 	UT_RUN(stop_poll_invalid_last_shard_and_observer_preconditions);
 	UT_RUN(stop_seal_rejects_new_modifier_then_new_read);
@@ -1308,6 +1475,7 @@ main(void)
 	UT_RUN(u5_out_of_range_worker_fail_closed);
 	UT_RUN(u6_n1_only_shard0);
 	UT_RUN(u7_per_shard_cap_full);
+	UT_RUN(u7_configured_cap_precedes_allocator_capacity);
 	UT_RUN(u8_ttl_sweep_all_shards);
 	UT_RUN(u9_backend_exit_cleanup_all_shards);
 	UT_RUN(u10_remove_reopens_in_flight_entry);
@@ -1319,6 +1487,10 @@ main(void)
 	UT_RUN(u16_capability_routing_truth_table);
 	UT_RUN(u33_pending_x_arm_terminates_inflight_legacy_s_exactly);
 	UT_RUN(u34_pending_x_new_reader_exact_deny_precedes_cached_shortcut);
+	UT_RUN(first_fill_requires_completion_proof_before_age_or_capacity_reclaim);
+	UT_RUN(stop_rejection_distinguishes_malformed_entry_from_capacity_overrun);
+	UT_RUN(first_fill_inflight_is_owned_by_pending_s_not_legacy_pending_x_scan);
+	UT_RUN(ungranted_first_fill_denial_retires_only_after_full_pinned_replay_window);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -95,7 +95,8 @@ StaticAssertDecl(sizeof(GcsBlockDedupKey) == 24, "spec-2.34 D2 GcsBlockDedupKey 
  *	  [  104,   105) has_sf_dep          bool                    spec-6.2
  *	  [  105,   106) sf_flags            uint8                   spec-6.2
  *	  [  106,   107) sf_dep_count        uint8                   spec-6.2
- *	  [  107,   112) _pad1[5]            explicit pad to 8-align
+ *	  [  107,   108) first_fill_no_grant  sealed before any authorization
+ *	  [  108,   112) _pad1[4]            explicit pad to 8-align
  *	  [  112,   240) payload_meta        sf_dep_vec or PCM-X identity
  *	  [  240,  8432) block_data          char[GCS_BLOCK_DATA_SIZE]
  *	  [ 8432,  8440) completed_at_ts     TimestampTz (TTL sweep — replied)
@@ -215,7 +216,8 @@ typedef struct GcsBlockDedupEntry {
 	bool has_sf_dep;					   /*  1B — generic SF metadata; PCM-X */
 	uint8 sf_flags;						   /*  1B — metadata cell overlays the */
 	uint8 sf_dep_count;					   /*  1B — exact reservation token */
-	uint8 _pad1[5];						   /*  5B — dep_vec @ 112 */
+	bool first_fill_no_grant;			   /* terminal denial before any grant */
+	uint8 _pad1[4];						   /* dep_vec remains @ 112 */
 	GcsBlockDedupPayloadMeta payload_meta; /* 128B — deps or exact PCM-X identity */
 	char block_data[GCS_BLOCK_DATA_SIZE];  /* 8192B — full page payload */
 	TimestampTz completed_at_ts;		   /*  8B — generic wall / R4 monotonic replied */
@@ -389,6 +391,27 @@ GcsBlockReplyStatusIsReclaimIdempotent(GcsBlockReplyStatus status)
  *	  completed, age <= pinned lifetime		-> safe ONLY if the status is
  *											   site-proven idempotent
  */
+/* A master may seal this only before it has published any authorization.
+ * It is execution termination, never requester DONE or delivery quiescence. */
+static inline bool
+GcsBlockDedupEntryIsUngrantedFirstFillDenial(const GcsBlockDedupEntry *entry)
+{
+	const GcsBlockReplyHeader *header = &entry->reply_header;
+
+	return entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_GENERIC && entry->first_fill_no_grant
+		&& (entry->request_flags & GCS_BLOCK_DEDUP_REQUEST_F_READ_MISS) != 0
+		&& entry->transition_id == PCM_TRANS_N_TO_S && entry->completed_at_ts != 0
+		&& (entry->status == GCS_BLOCK_REPLY_DENIED_PENDING_X
+			|| entry->status == GCS_BLOCK_REPLY_DENIED_EPOCH_STALE
+			|| entry->status == GCS_BLOCK_REPLY_DENIED_DEDUP_FULL
+			|| entry->status == GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT)
+		&& header->status == entry->status && header->transition_id == entry->transition_id
+		&& header->request_id == entry->key.request_id && header->epoch == entry->key.cluster_epoch
+		&& header->requester_backend_id == entry->key.requester_backend_id
+		&& !GcsBlockReplyHeaderHasPendingS(header)
+		&& GcsBlockReplyHeaderGetForwardingMasterNode(header) == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER;
+}
+
 static inline bool
 GcsBlockDedupEntryIsReclaimSafe(const GcsBlockDedupEntry *entry, TimestampTz now,
 								int64 fallback_out_of_window_us)
@@ -399,6 +422,11 @@ GcsBlockDedupEntryIsReclaimSafe(const GcsBlockDedupEntry *entry, TimestampTz now
 	if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC)
 		return false;
 	if (entry->completed_at_ts == 0)
+		return false;
+	/* First-fill waits for a concrete service event beyond response periods.
+	 * Its master completion/revoke proof, not age, terminates that identity. */
+	if ((entry->request_flags & GCS_BLOCK_DEDUP_REQUEST_F_READ_MISS) != 0
+		&& entry->done_at_ts == 0 && !GcsBlockDedupEntryIsUngrantedFirstFillDenial(entry))
 		return false;
 
 	/*
@@ -507,6 +535,12 @@ extern bool cluster_gcs_block_dedup_set_request_flags_exact(int worker_id,
 															const BufferTag *tag,
 															uint8 transition_id,
 															uint8 request_flags);
+
+/* Caller proves no pending-S or FORWARD was ever created for this identity.
+ * Only a still-in-flight exact first-fill entry may become this terminal
+ * denial; sweep/reclaim then retains the full pinned replay lifetime. */
+extern bool cluster_gcs_block_dedup_install_ungranted_first_fill_exact(int worker_id,
+	const GcsBlockDedupKey *key, const BufferTag *tag, const GcsBlockReplyHeader *header);
 
 /*
  * cluster_gcs_block_dedup_mark_done — consume a requester completion proof

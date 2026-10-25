@@ -4271,6 +4271,7 @@ extern bool cluster_gcs_block_read_source_quiescent(BufferDesc *buf);
 extern void cluster_gcs_block_read_source_complete(BufferDesc *buf,
 	ClusterPcmReadSource *source, bool installed);
 extern void cluster_gcs_block_pending_s_tick(void);
+extern void cluster_gcs_block_first_fill_tick(void);
 
 extern bool cluster_gcs_block_read_source_quiesce(BufferDesc *buf, const ClusterPcmReadSource *source);
 extern bool cluster_gcs_local_master_read_source_and_wait(BufferDesc *buf, const PcmAuthoritySnapshot *expected, bool force_one_shot, bool *retry, ClusterPcmReadSource *source);

@@ -16,6 +16,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_lms.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ko.h"
 #include "cluster/cluster_scn.h"
@@ -65,6 +66,13 @@ bool
 cluster_semantic_activation_recovered_open_current(void)
 {
 	return false;
+}
+
+static uint32 native_service_wake_workers;
+void
+cluster_lms_wakeup(int worker)
+{
+	native_service_wake_workers |= UINT32_C(1) << worker;
 }
 
 static union {
@@ -7511,7 +7519,7 @@ UT_TEST(test_shmem_initializes_complete_entry)
 
 	reset_fixture();
 	UT_ASSERT_EQ(cluster_pcm_own_shmem_size(), (Size)NBuffers * sizeof(ClusterPcmOwnEntry));
-	UT_ASSERT_EQ(sizeof(ClusterPcmOwnEntry), 48);
+	UT_ASSERT_EQ(sizeof(ClusterPcmOwnEntry), 56);
 	UT_ASSERT_EQ(offsetof(ClusterPcmOwnEntry, resource_x_activation_generation), 24);
 	for (i = 0; i < NBuffers; i++) {
 		UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterPcmOwnArray[i].generation), 0);

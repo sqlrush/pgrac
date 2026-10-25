@@ -450,6 +450,7 @@ extern bool cluster_lms_data_plane_test_peer_snapshot(int32 peer_id, int *fd_out
  * [0, CLUSTER_LMS_MAX_WORKERS).
  */
 extern void cluster_lms_wakeup(int worker_id);
+extern bool cluster_lms_outbound_wait_capacity(int worker_id, uint64 epoch);
 extern void cluster_lms_outbound_shmem_register(void);
 extern void cluster_lms_outbound_request_lwlocks(void);
 /* Local staging only: FULL owns no frame and is distinct from a bad route or
