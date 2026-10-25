@@ -5307,6 +5307,12 @@ exercise_same_pid_worker_respawn(const ClusterUndoCleanerActiveSample *old,
 	native_published_samples++;
 }
 
+/* Optional observer used only by the original lifecycle-to-wire composition.
+ * All existing component cases leave it NULL. It runs after the completed
+ * publication and its locks/current assertions, never in a shared lock. */
+static void (*original_worker_publication_observer)(const ClusterUndoCleanerActiveSample *);
+static bool original_retention_report_peer;
+
 static void
 assert_original_worker_publication(const ClusterCtrcActiveScan *scan,
 								  const ClusterSemanticActiveSampleFence *source)
@@ -5343,6 +5349,8 @@ assert_original_worker_publication(const ClusterCtrcActiveScan *scan,
 	UT_ASSERT(!native_cleaner_lock_held);
 	UT_ASSERT_EQ(native_cleaner_lock_acquires, native_cleaner_lock_releases);
 	native_published_samples++;
+	if (original_worker_publication_observer != NULL)
+		original_worker_publication_observer(&sample);
 	if (native_worker_respawn && native_worker_respawns == 0)
 		exercise_same_pid_worker_respawn(&sample, source);
 }
@@ -5373,6 +5381,12 @@ exercise_original_producer_retention_lifecycle(bool applied)
 	key = fresh_origin_key();
 	key.formation_epoch = key.cluster_epoch;
 	source = active_source_for_key(&key);
+	/* The lifecycle-to-wire composition fixes its required peer before any
+	 * native/shared sampling or publication, not on an already complete cut. */
+	if (original_retention_report_peer) {
+		source.admitted_members_lo |= UINT64CONST(1) << 1;
+		source.admitted_incarnation[1] = 1102;
+	}
 	original = FullTransactionIdFromEpochAndXid(7, key.xid);
 	test_my_proc.xid = key.xid;
 	test_top_full = original;
