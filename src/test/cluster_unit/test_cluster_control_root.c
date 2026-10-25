@@ -38,6 +38,7 @@
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_recovery_plan.h"
+#include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_stats.h"
@@ -116,6 +117,24 @@ sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 static bool test_checkpoint_mode;
 static bool test_recovered_open = true;
+/* The native claim filesystem/creator contract has its own linked fixture.
+ * Only that authority boundary is controlled here; ROOT and WAL stay real. */
+static int test_merge_claim_node = -1;
+static uint64 test_merge_claim_serial;
+static bool test_merge_claim_custody;
+
+uint64
+cluster_recovery_merge_claim_owner_v1(void)
+{
+	return test_merge_claim_custody && cluster_node_id == test_merge_claim_node
+		? test_merge_claim_serial : 0;
+}
+
+bool
+cluster_recovery_merge_claim_owner_current_nowait_v1(uint64 owner)
+{
+	return owner != 0 && owner == cluster_recovery_merge_claim_owner_v1();
+}
 static ClusterNormalStartState test_normal_start_state = CLUSTER_NORMAL_START_TARGET_READY;
 static bool test_normal_start_state_override;
 static bool test_inputs_startup_cf;
@@ -1987,6 +2006,9 @@ wipe_root_files(void)
 {
 	char path[MAXPGPATH];
 	test_reserve_mode = false;
+	test_merge_claim_node = -1;
+	test_merge_claim_serial = 0;
+	test_merge_claim_custody = false;
 
 	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
 	unlink(path);
@@ -9091,6 +9113,9 @@ v3_recovered_reserve_fixture(uint8 before[66048], ControlRootImage *root,
 	test_recovered_writer_epoch = test_epoch;
 	test_walr_recovered_strict = true;
 	test_recovered_checkpoint_owner_fixture(&test_checkpoint_prefix_ref, test_epoch);
+	test_merge_claim_node = 0;
+	test_merge_claim_serial = ++boot;
+	test_merge_claim_custody = true;
 }
 
 static void
@@ -9914,6 +9939,8 @@ UT_TEST(test_v3_native_driver_rejects_foreign_current_system)
 	test_system_identifier = TEST_SYSID;
 	test_reserve_mode = false;
 }
+
+#include "test_cluster_control_recovered_owner.inc"
 
 UT_TEST(test_v3_native_driver_rejects_foreign_input_and_owner_without_mutation)
 {
@@ -26078,6 +26105,19 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
+	if (getenv("PGRAC_PRE2_TEST_RECOVERED_OWNER") != NULL) {
+		UT_PLAN(8);
+		UT_RUN(test_recovered_reserve_uses_nonlowest_original_claim_owner);
+		UT_RUN(test_recovered_reserve_requires_native_claim_custody);
+		UT_RUN(test_recovered_reserve_rejects_replaced_claim_before_cas);
+		UT_RUN(test_recovered_reserve_withholds_token_after_claim_loss);
+		UT_RUN(test_recovered_native_driver_reserves_on_original_owner);
+		UT_RUN(test_recovered_native_driver_begins_on_original_owner);
+		UT_RUN(test_recovered_begin_lowest_node_cannot_replace_claim_owner);
+		UT_RUN(test_recovered_begin_revalidates_original_claim_at_publication);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_RECOVERY_READ") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_recovery_online_reads_selected_anchor_without_sql);
@@ -26326,7 +26366,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(505);
+	UT_PLAN(513);
 	UT_RUN(test_ctrc_namespace_same_root_bytes_cannot_replace_original_directory);
 	UT_RUN(test_ctrc_namespace_initial_root_error_closes_fd_and_retains_scope_debt);
 	UT_RUN(test_ctrc_namespace_retains_readonly_fd_through_scope_lifetime);
@@ -26488,6 +26528,14 @@ main(int argc, char **argv)
 	UT_RUN(test_bootstrap_side_children_parents_and_arguments_are_strict);
 	UT_RUN(test_bootstrap_side_reobserves_every_namespace_and_closes_all_fds);
 	UT_RUN(test_v3_reserve_clean_publishes_all_sparse_targets_without_serving);
+	UT_RUN(test_recovered_reserve_uses_nonlowest_original_claim_owner);
+	UT_RUN(test_recovered_reserve_requires_native_claim_custody);
+	UT_RUN(test_recovered_reserve_rejects_replaced_claim_before_cas);
+	UT_RUN(test_recovered_reserve_withholds_token_after_claim_loss);
+	UT_RUN(test_recovered_native_driver_reserves_on_original_owner);
+	UT_RUN(test_recovered_native_driver_begins_on_original_owner);
+	UT_RUN(test_recovered_begin_lowest_node_cannot_replace_claim_owner);
+	UT_RUN(test_recovered_begin_revalidates_original_claim_at_publication);
 	UT_RUN(test_v3_target_creates_only_exact_empty_successor);
 	UT_RUN(test_recovered_prepare_precedes_checkpoint_owner_publication);
 	UT_RUN(test_v3_native_driver_prepares_sparse_targets_then_returns_initializing);

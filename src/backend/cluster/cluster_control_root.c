@@ -31,6 +31,7 @@
 #include "cluster/cluster_ir.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_wal_retention.h"
@@ -5895,6 +5896,7 @@ typedef struct ReserveCleanWork {
 	/* Recovered reservations hold every old generation through the one CAS.
 	 * Their actual checkpoint need not be the physical retained lower bound. */
 	bool recovered;
+	uint64 recovered_claim_owner;
 	ControlFileData recovered_control[CLUSTER_MAX_NODES];
 	XLogRecPtr recovered_checkpoint_end[CLUSTER_MAX_NODES];
 	ClusterWalSourceRef recovered_source[CLUSTER_MAX_NODES];
@@ -5903,6 +5905,28 @@ typedef struct ReserveCleanWork {
 	ClusterWalRootPublishGuard *recovered_walr;
 	ClusterWalPrefixIdentity *recovered_prefix[CLUSTER_MAX_NODES];
 } ReserveCleanWork;
+
+/* A mixed CLOSED/COMPLETE cohort still belongs to its original recoverer.
+ * The lowest clean-start member cannot stand in for that live creator.
+ * Capture the incarnation once per transition; reacquisition cannot rebind
+ * an in-flight scan, staging operation or publication to a different claim.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+startup_recovery_claim_current(uint64 owner)
+{
+	return cluster_recovery_merge_claim_owner_current_nowait_v1(owner)
+		&& cluster_recovery_merge_claim_owner_v1() == owner;
+}
+
+static bool
+startup_has_recovered_input(const ControlRootImage *root)
+{
+	for (unsigned node = 0; node < CLUSTER_MAX_NODES; ++node)
+		if ((root->header.v2.configured[node / 64] & (UINT64_C(1) << (node % 64))) != 0
+			&& root->records[node].lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE)
+			return true;
+	return false;
+}
 
 static bool
 startup_owner_for_input(uint64 system_identifier, uint64 epoch, uint64 incarnation,
@@ -6359,8 +6383,10 @@ reserve_recovered_reobserve(ReserveCleanWork *work, const ClusterControlRootIden
 	ClusterControlRootIdentity owner;
 	ControlFileData common;
 	ClusterControlRootResult result;
-	bool complete = false, coordinator = false;
+	bool complete = false;
 
+	if (!startup_recovery_claim_current(work->recovered_claim_owner))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (!cluster_reconfig_capture_formation_snapshot_v1(self->origin_thread_id, &formation))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = read_control_version(self->storage_uuid, self->system_identifier, &work->scan.base,
@@ -6377,6 +6403,9 @@ reserve_recovered_reobserve(ReserveCleanWork *work, const ClusterControlRootIden
 		|| !bytes_are_zero(work->scan.base.header.v2.serving,
 						   sizeof(work->scan.base.header.v2.serving)))
 		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	if ((work->scan.base.header.v2.configured[self->origin_node_id / 64]
+		 & (UINT64_C(1) << (self->origin_node_id % 64))) == 0)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	for (unsigned node = 0; node < CLUSTER_MAX_NODES; ++node) {
 		const ClusterControlRootSnapshot *record = &work->scan.base.records[node];
 		if (work->scan.base.startup[node].generation != 0
@@ -6384,11 +6413,6 @@ reserve_recovered_reobserve(ReserveCleanWork *work, const ClusterControlRootIden
 			return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
 		if ((work->scan.base.header.v2.configured[node / 64] & (UINT64_C(1) << (node % 64))) == 0)
 			continue;
-		if (!coordinator) {
-			if (node != (unsigned)self->origin_node_id)
-				return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
-			coordinator = true;
-		}
 		if (record->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED)
 			continue;
 		if (record->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
@@ -6404,7 +6428,7 @@ reserve_recovered_reobserve(ReserveCleanWork *work, const ClusterControlRootIden
 			return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
 		complete = true;
 	}
-	if (!coordinator || !complete)
+	if (!complete)
 		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
 	owner = work->scan.base.records[self->origin_node_id].identity;
 	owner.origin_owner_incarnation
@@ -6441,7 +6465,8 @@ reserve_recovered_namespace_current(ReserveCleanWork *work, unsigned node)
 {
 	/* CLOSED remains a read-only dependency of this same full cut. It must
 	 * never outlive a stale COMPLETE member or a poisoned original owner. */
-	if (!cluster_wal_retention_root_publish_set_current_v1(work->recovered_walr)
+	if (!startup_recovery_claim_current(work->recovered_claim_owner)
+		|| !cluster_wal_retention_root_publish_set_current_v1(work->recovered_walr)
 		|| (work->base.records[node].lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
 			&& !cluster_wal_retention_root_publish_sealed_current(work->recovered_walr,
 															  &work->recovered_token[node])))
@@ -6640,7 +6665,8 @@ reserve_recovered_publish(ReserveCleanWork *work, const ClusterControlRootIdenti
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 	}
-	if (!cluster_wal_retention_root_publish_set_current_v1(work->recovered_walr)
+	if (!startup_recovery_claim_current(work->recovered_claim_owner)
+		|| !cluster_wal_retention_root_publish_set_current_v1(work->recovered_walr)
 		|| !startup_owner_for_input(self->system_identifier, work->formation.local_epoch,
 								 self->origin_owner_incarnation, work->cut.required,
 								 CLUSTER_WAL_STARTUP_RECOVERED)
@@ -6658,6 +6684,7 @@ cluster_control_root_v3_reserve_recovered(const ClusterControlRootIdentity *self
 {
 	ReserveCleanWork *work;
 	ClusterControlRootResult result;
+	uint64 owner;
 	bool alias = history_ranges_overlap(self, sizeof(*self), out, sizeof(*out))
 				 || history_ranges_overlap(expected, sizeof(*expected), out, sizeof(*out));
 
@@ -6672,11 +6699,15 @@ cluster_control_root_v3_reserve_recovered(const ClusterControlRootIdentity *self
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	if (MyBackendType != B_STARTUP || CurrentResourceOwner == NULL)
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	owner = cluster_recovery_merge_claim_owner_v1();
+	if (owner == 0)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = storage_contract_check(self->storage_uuid, true);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	work = palloc0(sizeof(*work));
 	work->recovered = true;
+	work->recovered_claim_owner = owner;
 	work->scan.format_version = CONTROL_ROOT_HEADER_VERSION_V3;
 	for (unsigned i = 0; i < lengthof(work->scan.wal_dirs); ++i)
 		work->scan.wal_dirs[i] = -1;
@@ -6695,6 +6726,9 @@ cluster_control_root_v3_reserve_recovered(const ClusterControlRootIdentity *self
 	}
 	PG_END_TRY();
 	result = reserve_clean_cleanup(work, result);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& !startup_recovery_claim_current(work->recovered_claim_owner))
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	pfree(work);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		memset(out, 0, sizeof(*out));
@@ -7007,7 +7041,7 @@ startup_advance_step(StartupAdvanceWork *work, const ClusterWalSourceRef *restar
 	if (work->recovered_pending) {
 		ClusterControlRootIdentity self = restart->claim.identity;
 
-		if (coordinator != (unsigned)cluster_node_id)
+		if (cluster_recovery_merge_claim_owner_v1() == 0)
 			return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
 		self.origin_owner_incarnation = cluster_qvotec_get_self_incarnation();
 		result = cluster_control_root_v3_reserve_recovered(&self, &work->token, &published);
@@ -7033,7 +7067,9 @@ startup_advance_step(StartupAdvanceWork *work, const ClusterWalSourceRef *restar
 																work->op.operation_uuid, &prepared);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
-		if (coordinator != (unsigned)cluster_node_id)
+		if (startup_has_recovered_input(&work->root)
+			? cluster_recovery_merge_claim_owner_v1() == 0
+			: coordinator != (unsigned)cluster_node_id)
 			return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
 		result = cluster_control_root_v3_startup_begin_clean(
 			&work->op.claim.identity, work->op.operation_uuid, &work->token, &published);
@@ -7320,6 +7356,7 @@ cluster_control_root_v3_startup_route_writer(const ClusterControlRootIdentity *s
 typedef struct StartupBeginWork {
 	StartupTargetWork target;
 	ControlRootImage next;
+	uint64 recovered_claim_owner;
 	ClusterWalStartupImage operations[CLUSTER_MAX_NODES];
 	ClusterWalStartupStage stages[CLUSTER_MAX_NODES];
 } StartupBeginWork;
@@ -7353,6 +7390,7 @@ startup_begin_locked(StartupBeginWork *work, const ClusterControlRootIdentity *s
 	ClusterFormationSnapshotV1 formation;
 	ClusterControlRootResult result;
 	unsigned own = self->origin_node_id;
+	bool recovered;
 
 	result = read_control_version(self->storage_uuid, self->system_identifier, &target->base,
 								  &common, &token, CONTROL_ROOT_HEADER_VERSION_V3);
@@ -7374,6 +7412,12 @@ startup_begin_locked(StartupBeginWork *work, const ClusterControlRootIdentity *s
 		return result;
 	if (target->base.header.file_txn_seq == UINT64_MAX)
 		return CLUSTER_CONTROL_ROOT_SEQUENCE_EXHAUSTED;
+	recovered = startup_has_recovered_input(&target->base);
+	if (recovered) {
+		work->recovered_claim_owner = cluster_recovery_merge_claim_owner_v1();
+		if (work->recovered_claim_owner == 0)
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	}
 	work->next = target->base;
 	work->next.header.file_txn_seq++;
 	work->next.header.published_at_usec = GetCurrentTimestamp();
@@ -7381,8 +7425,8 @@ startup_begin_locked(StartupBeginWork *work, const ClusterControlRootIdentity *s
 		ClusterWalStartupImage *op = &work->operations[node];
 		if ((target->base.header.v2.configured[node / 64] & (UINT64_C(1) << (node % 64))) == 0)
 			continue;
-		/* The already-existing lowest-MEMBER coordinator rule. */
-		if (node < own)
+		/* Ordinary clean/initialized startup keeps its existing coordinator. */
+		if (!recovered && node < own)
 			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		result = cluster_wal_startup_read_locked(&target->base, node, op);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -7395,6 +7439,8 @@ startup_begin_locked(StartupBeginWork *work, const ClusterControlRootIdentity *s
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 	}
+	if (recovered && !startup_recovery_claim_current(work->recovered_claim_owner))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	for (unsigned node = 0; node < CLUSTER_MAX_NODES; ++node) {
 		ClusterWalStartupImage *op = &work->operations[node];
 		ClusterWalStartupStage *stage = &work->stages[node];
@@ -7430,7 +7476,8 @@ startup_begin_locked(StartupBeginWork *work, const ClusterControlRootIdentity *s
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (memcmp(&formation, &target->formation, sizeof(formation)) != 0
-		|| !startup_operation_owner(&target->base, &target->op))
+		|| !startup_operation_owner(&target->base, &target->op)
+		|| (recovered && !startup_recovery_claim_current(work->recovered_claim_owner)))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	for (unsigned node = 0; node < CLUSTER_MAX_NODES; ++node) {
 		if (work->operations[node].phase == 0)
@@ -7452,7 +7499,8 @@ startup_begin_locked(StartupBeginWork *work, const ClusterControlRootIdentity *s
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (memcmp(&formation, &target->formation, sizeof(formation)) != 0
-		|| !startup_operation_owner(&target->base, &target->op))
+		|| !startup_operation_owner(&target->base, &target->op)
+		|| (recovered && !startup_recovery_claim_current(work->recovered_claim_owner)))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	*out = token;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
@@ -7504,6 +7552,9 @@ cluster_control_root_v3_startup_begin_clean(const ClusterControlRootIdentity *se
 	}
 	PG_END_TRY();
 	result = startup_begin_cleanup(work, result);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && work->recovered_claim_owner != 0
+		&& !startup_recovery_claim_current(work->recovered_claim_owner))
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	pfree(work);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		memset(out, 0, sizeof(*out));
