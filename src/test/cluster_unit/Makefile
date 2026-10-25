@@ -9201,7 +9201,20 @@ test_cluster_undo_horizon_sender.inc: $(top_srcdir)/src/backend/cluster/cluster_
 		emit && /^\/\* ---------------- cleaner-side/ { done=1; exit } emit { print } \
 		END { if (!done || starts != 1) exit 1 }' $< > $@
 
+test_cluster_undo_horizon_cleaner.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
+	awk '/^cluster_undo_cleaner_active_sample\(/ { print "bool"; emit=1; found++ } \
+	     /^cluster_undo_cleaner_active_sample_current\(/ { print "bool"; emit=1; found++ } \
+	     /^undo_cleaner_publish_active_sample\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+clean distclean maintainer-clean: clean-undo-horizon-cleaner
+.PHONY: clean-undo-horizon-cleaner
+clean-undo-horizon-cleaner:
+	rm -f test_cluster_undo_horizon_cleaner.inc test_cluster_undo_horizon_cleaner.inc.tmp
+
 test_cluster_undo_horizon: test_cluster_undo_horizon.c unit_test.h \
+		test_cluster_undo_horizon_cleaner.inc \
 		$(srcdir)/test_cluster_undo_horizon_retention_fixture.inc \
 		test_cluster_pgproc_active_types.inc test_cluster_retention_sample.inc \
 		$(CLUSTER_UNDO_RETENTION_O) \
