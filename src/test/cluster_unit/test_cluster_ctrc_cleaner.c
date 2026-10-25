@@ -180,6 +180,8 @@ static FullTransactionId native_group_wake_minimum, native_group_wake_expected;
 static ClusterSemanticActiveSampleFence native_group_wake_source;
 static bool native_publish_source;
 static unsigned native_published_samples;
+static bool native_worker_respawn;
+static unsigned native_worker_respawns;
 static unsigned native_group_refusals;
 static unsigned native_group_wait_observations;
 static FullTransactionId native_group_wait_minimum;
@@ -340,6 +342,26 @@ static ClusterXidStripeSampleFence undo_cleaner_active_lease_fence;
 static ClusterSemanticActiveSampleFence undo_cleaner_active_admission_fence;
 static bool native_cleaner_sample(ClusterUndoCleanerActiveSample *);
 static bool native_cleaner_sample_current(const ClusterUndoCleanerActiveSample *);
+static bool undo_cleaner_active_scan_pending;
+static TimestampTz native_status_timestamp;
+static unsigned native_status_broadcasts;
+
+static TimestampTz
+native_status_time(void)
+{
+	if (held_count != 0 || native_lock_held || native_cleaner_lock_held)
+		abort();
+	return ++native_status_timestamp;
+}
+
+static void
+native_status_broadcast(ConditionVariable *cv)
+{
+	if (held_count != 0 || native_lock_held || native_cleaner_lock_held
+		|| cv != &native_cleaner_state.capacity_cv)
+		abort();
+	native_status_broadcasts++;
+}
 
 static bool
 native_cleaner_storage(void)
@@ -382,7 +404,11 @@ native_cleaner_admission_current(const ClusterSemanticActiveSampleFence *expecte
 #define cluster_semantic_activation_active_sample_current native_cleaner_admission_current
 #define cluster_undo_cleaner_active_sample native_cleaner_sample
 #define cluster_undo_cleaner_active_sample_current native_cleaner_sample_current
+#define GetCurrentTimestamp native_status_time
+#define ConditionVariableBroadcast native_status_broadcast
 #include "test_cluster_ctrc_worker_sample.inc"
+#undef ConditionVariableBroadcast
+#undef GetCurrentTimestamp
 #undef cluster_undo_cleaner_active_sample_current
 #undef cluster_undo_cleaner_active_sample
 #undef cluster_semantic_activation_active_sample_current
@@ -5258,6 +5284,79 @@ native_group_wakeup(PGSemaphore sema)
 	native_group_wakeups++;
 }
 
+/* Reenter the original worker0 lifecycle with the same numeric PID. Time,
+ * broadcast and admission capture are leaves; native/census scans are real. */
+static void
+exercise_same_pid_worker_respawn(const ClusterUndoCleanerActiveSample *old,
+	const ClusterSemanticActiveSampleFence *source)
+{
+	ClusterUndoCleanerActiveSample sample, zero = { 0 };
+	ClusterCtrcActiveScan abandoned;
+	FullTransactionId reference, future, minimum;
+	ClusterXidStripeSampleFence lease;
+	unsigned broadcasts = native_status_broadcasts;
+	unsigned reads = native_future_reads;
+
+	UT_ASSERT(native_worker_respawn && native_worker_respawns == 0);
+	UT_ASSERT_EQ(old->worker_pid, MyProcPid);
+	UT_ASSERT_EQ(native_cleaner_state.active_sample_sequence, old->sample_id);
+	/* Keep an actual next-round partial scan beside the last complete image,
+	 * exactly the state that must not survive a worker0 incarnation. */
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&abandoned, old->scan.reference_full));
+	abandoned.future_full = old->scan.future_full;
+	cluster_ctrc_active_scan_step_source(&abandoned, source);
+	UT_ASSERT_EQ(abandoned.status, CTRC_ACTIVE_SCAN_INCOMPLETE);
+	UT_ASSERT(abandoned.next_index != 0);
+	undo_cleaner_active_scan = abandoned;
+	undo_cleaner_active_scan_pending = true;
+	undo_cleaner_publish_active_sample();
+	UT_ASSERT_EQ(memcmp(&native_cleaner_state.active_sample, old, sizeof(*old)), 0);
+	undo_cleaner_publish_status(UNDO_CLEANER_SPAWNING);
+	UT_ASSERT_EQ(native_cleaner_state.workers[0].status, UNDO_CLEANER_SPAWNING);
+	UT_ASSERT_EQ(native_cleaner_state.workers[0].pid, old->worker_pid);
+	UT_ASSERT_EQ(memcmp(&native_cleaner_state.active_sample, &zero, sizeof(zero)), 0);
+	UT_ASSERT_EQ(native_cleaner_state.active_sample_sequence, old->sample_id);
+	UT_ASSERT(!undo_cleaner_active_scan_pending);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.next_index, 0);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.total_entries, 0);
+	UT_ASSERT(!FullTransactionIdIsValid(undo_cleaner_active_scan.reference_full));
+	UT_ASSERT(!native_cleaner_sample_current(old));
+	MemSet(&sample, 0xa5, sizeof(sample));
+	UT_ASSERT(!native_cleaner_sample(&sample));
+	UT_ASSERT_EQ(memcmp(&sample, &zero, sizeof(zero)), 0);
+	undo_cleaner_publish_status(UNDO_CLEANER_READY);
+	/* Restore the same admitted source to show rejection is not merely a
+	 * missing leaf fence. Numeric PID reuse cannot restore the old image. */
+	undo_cleaner_active_admission_fence = *source;
+	undo_cleaner_active_lease_fence = old->lease_fence;
+	UT_ASSERT(!native_cleaner_sample_current(old));
+	UT_ASSERT(!native_cleaner_sample(&sample));
+	UT_ASSERT_EQ(memcmp(&sample, &zero, sizeof(zero)), 0);
+	UT_ASSERT_EQ(native_status_broadcasts, broadcasts + 2);
+	UT_ASSERT(native_procarray_sample(&reference, &future, &minimum, &lease));
+	UT_ASSERT_EQ(native_future_reads, reads + 1);
+	UT_ASSERT(FullTransactionIdEquals(minimum, native_future));
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&undo_cleaner_active_scan, reference));
+	UT_ASSERT_EQ(undo_cleaner_active_scan.next_index, 0);
+	undo_cleaner_active_scan.future_full = future;
+	undo_cleaner_active_scan.min_full = minimum;
+	undo_cleaner_active_lease_fence = lease;
+	finish_source_active_scan(&undo_cleaner_active_scan, source);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.next_index, undo_cleaner_active_scan.total_entries);
+	UT_ASSERT(FullTransactionIdEquals(undo_cleaner_active_scan.min_full, old->scan.min_full));
+	undo_cleaner_publish_active_sample();
+	UT_ASSERT(native_cleaner_sample(&sample));
+	UT_ASSERT(native_cleaner_sample_current(&sample));
+	UT_ASSERT_EQ(sample.worker_pid, old->worker_pid);
+	UT_ASSERT_EQ(sample.sample_id, old->sample_id + 1);
+	UT_ASSERT(!native_cleaner_sample_current(old));
+	UT_ASSERT(!native_cleaner_lock_held && !native_lock_held && held_count == 0);
+	UT_ASSERT_EQ(native_cleaner_lock_acquires, native_cleaner_lock_releases);
+	native_worker_respawns++;
+	native_published_samples++;
+}
+
 static void
 assert_original_worker_publication(const ClusterCtrcActiveScan *scan,
 								  const ClusterSemanticActiveSampleFence *source)
@@ -5294,6 +5393,8 @@ assert_original_worker_publication(const ClusterCtrcActiveScan *scan,
 	UT_ASSERT(!native_cleaner_lock_held);
 	UT_ASSERT_EQ(native_cleaner_lock_acquires, native_cleaner_lock_releases);
 	native_published_samples++;
+	if (native_worker_respawn && native_worker_respawns == 0)
+		exercise_same_pid_worker_respawn(&sample, source);
 }
 
 static void
@@ -6687,6 +6788,26 @@ UT_TEST(test_reused_native_slot_applied_retains_old_fullxid_after_same_raw_publi
 	native_source_exit = native_publish_source = native_reused_source_exit = false;
 }
 
+UT_TEST(test_same_pid_worker_respawn_cancel_restarts_scan_with_shared_retention)
+{
+	native_source_exit = native_publish_source = native_worker_respawn = true;
+	native_worker_respawns = native_published_samples = 0;
+	exercise_original_producer_retention_lifecycle(false);
+	UT_ASSERT_EQ(native_worker_respawns, 1);
+	UT_ASSERT_EQ(native_published_samples, 4);
+	native_source_exit = native_publish_source = native_worker_respawn = false;
+}
+
+UT_TEST(test_same_pid_worker_respawn_applied_restarts_scan_with_shared_retention)
+{
+	native_source_exit = native_publish_source = native_worker_respawn = true;
+	native_worker_respawns = native_published_samples = 0;
+	exercise_original_producer_retention_lifecycle(true);
+	UT_ASSERT_EQ(native_worker_respawns, 1);
+	UT_ASSERT_EQ(native_published_samples, 4);
+	native_source_exit = native_publish_source = native_worker_respawn = false;
+}
+
 int
 main(void)
 {
@@ -6694,7 +6815,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(161);
+	UT_PLAN(163);
 	UT_RUN(test_receipt_observed_identity_refusal_precedes_chain_blocking);
 	UT_RUN(test_receipt_original_identity_refusal_precedes_chain_blocking);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
@@ -6861,6 +6982,8 @@ main(void)
 	UT_RUN(test_prepared_applied_keeps_original_shared_retention_after_native_removal);
 	UT_RUN(test_reused_native_slot_cancel_retains_old_fullxid_after_same_raw_publication);
 	UT_RUN(test_reused_native_slot_applied_retains_old_fullxid_after_same_raw_publication);
+	UT_RUN(test_same_pid_worker_respawn_cancel_restarts_scan_with_shared_retention);
+	UT_RUN(test_same_pid_worker_respawn_applied_restarts_scan_with_shared_retention);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

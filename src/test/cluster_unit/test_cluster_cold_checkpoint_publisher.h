@@ -14,4 +14,15 @@ extern TestColdCheckpointPublisherResult
 test_cold_checkpoint_publish(const ClusterWalSourceRef *source, const CheckPoint *checkpoint,
 							 XLogRecPtr start, XLogRecPtr end, uint64 post_issued, unsigned fault,
 							 uint8 out[160]);
+
+/* Controlled original-writer observations, fixed before fixture WAL creation.
+ * These values provide no production writer/admission qualification. */
+typedef struct TestColdCheckpointWriterV1 {
+	uint64 epoch, boot_incarnation;
+} TestColdCheckpointWriterV1;
+
+extern TestColdCheckpointPublisherResult test_cold_checkpoint_publish_identity(
+	const ClusterWalSourceRef *source, const CheckPoint *checkpoint, XLogRecPtr start,
+	XLogRecPtr end, uint64 post_issued, unsigned fault,
+	const TestColdCheckpointWriterV1 *writer, uint8 out[160]);
 #endif

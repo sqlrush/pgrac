@@ -3937,6 +3937,7 @@ $(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o: \
 test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
 		test_cluster_relmap_checkpoint_publisher.inc \
 		test_cluster_relmap_checkpoint_scope.inc \
+		test_cluster_relmap_checkpoint_pending.inc \
 		test_cluster_cold_checkpoint_publisher.o test_cluster_cold_checkpoint_publisher.h \
 		test_cluster_relmap_origin_build.inc \
 		test_cluster_relmap_execution_custody.inc \
@@ -9436,7 +9437,8 @@ test_cluster_ctrc_worker_sample.inc: $(top_srcdir)/src/backend/cluster/cluster_u
 	awk '/^cluster_undo_cleaner_active_sample\(/ { print "bool"; emit=1; found++ } \
 	     /^cluster_undo_cleaner_active_sample_current\(/ { print "bool"; emit=1; found++ } \
 	     /^undo_cleaner_publish_active_sample\(/ { print "static void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
+	     /^undo_cleaner_publish_status\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 4) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_ctrc_cleaner test_cluster_ctrc_capacity test_cluster_ctrc_dispatch \
