@@ -88,6 +88,7 @@ static unsigned int drift_at, drift_kind;
 /* New stage-only tests share the original providers below. */
 static LWLock *v2_retention_lock;
 static bool v2_retention_held, v2_xidgen_held;
+static void (*v2_preserve_observer)(RelFileLocator locator, bool at_commit);
 
 /* Original runtime providers are explicit fixtures; token checks are real. */
 uint64 GetSystemIdentifier(void) { return UINT64CONST(0x1122334455667788); }
@@ -498,6 +499,11 @@ cluster_relmap_authority_x_unlock(void)
 void
 RelationPreserveStorage(RelFileLocator locator, bool istemp)
 {
+	if (v2_preserve_observer)
+	{
+		v2_preserve_observer(locator, istemp);
+		return;
+	}
 	UT_ASSERT(local_held && !istemp);
 	UT_ASSERT_EQ(locator.relNumber, updates.mappings[0].mapfilenumber);
 	preserves++;
@@ -1036,11 +1042,16 @@ UT_TEST(unarmed_commit_preserves_other_writers_pending_and_global_lock)
 }
 
 #include "test_cluster_relmap_producer_stage.inc"
+#include "test_cluster_relmap_producer_prepare.inc"
 
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(34);
+	UT_RUN(v2_prepare_preserves_installs_and_forces_sync);
+	UT_RUN(v2_prepare_refusals_keep_local_map_and_debt);
+	UT_RUN(v2_staged_runtime_check_requires_original_exact_pin);
+	UT_RUN(v2_prepare_errors_keep_original_failure_duties);
 	UT_RUN(v2_original_stage_captures_merges_and_retains);
 	UT_RUN(v2_original_stage_pre_wal_refusals_preserve_outputs);
 	UT_RUN(v2_original_stage_late_refusals_keep_original_protection);

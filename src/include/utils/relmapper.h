@@ -72,6 +72,17 @@ extern bool cluster_relmap_producer_stage_v2(bool shared,
 	const struct RelMapFile *updates, struct ClusterRelmapOwnerSampleV2 *owner_out,
 	struct ClusterRelmapV2Image *staged_out);
 
+/* Dormant original producer preparation. Obtains a successful original stage
+ * in this call, rechecks BOTH exact staged copies and the original staged pin,
+ * preserves all mapped files across abort, then installs the local map and
+ * requests original synchronous commit. Same caller/outputs/failure contract
+ * as stage_v2; partial preservation retains files and all pins/debt. No live
+ * caller, terminal arm/proof, COMPLETE publication or commit/release authority.
+ * Original terminal/physical-lifetime duties remain with the caller. */
+extern bool cluster_relmap_producer_prepare_v2(bool shared,
+	const struct RelMapFile *updates, struct ClusterRelmapOwnerSampleV2 *owner_out,
+	struct ClusterRelmapV2Image *staged_out);
+
 /* PGRAC (spec-6.14 D5): post-commit publish / abort discard of a staged
  * shared relmap authority image. */
 extern void AtEOXact_ClusterRelmapPublish(void);

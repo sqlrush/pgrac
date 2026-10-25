@@ -585,6 +585,34 @@ cluster_relmap_authority_v2_read(const ClusterRelmapV2Namespace *expected,
 }
 
 bool
+cluster_relmap_authority_v2_check_staged(const ClusterRelmapV2Image *staged)
+{
+	RelmapV2Directory dirs;
+	RelmapV2Copy copies[2];
+	ClusterRelmapV2View view;
+	unsigned char bytes[CLUSTER_RELMAP_V2_FILE_SIZE];
+	bool ok = false;
+
+	if (!enableFsync || !cluster_relmap_authority_x_held() || staged == NULL
+		|| staged->pending_generation == 0
+		|| cluster_relmap_v2_encode(staged, bytes, sizeof(bytes)) != CLUSTER_RELMAP_V2_VALID)
+		return false;
+	if (!relmap_v2_open_dirs(&staged->identity, &dirs))
+		goto done;
+	/* A complete union can retain only one pending copy at a legal cut. The
+	 * original producer needs both current copies to remain its exact stage. */
+	ok = relmap_v2_load(&dirs, &staged->identity, copies, &view) == CLUSTER_RELMAP_V2_PAIR_VALID
+		&& copies[0].length == sizeof(bytes) && copies[1].length == sizeof(bytes)
+		&& memcmp(copies[0].bytes, bytes, sizeof(bytes)) == 0
+		&& memcmp(copies[1].bytes, bytes, sizeof(bytes)) == 0
+		&& cluster_relmap_authority_x_held();
+done:
+	if (!relmap_v2_close_dirs(&dirs))
+		ok = false;
+	return ok;
+}
+
+bool
 cluster_relmap_authority_v2_read_committed(const ClusterRelmapV2Namespace *expected,
 										RelMapFile *map_out, uint64 *generation_out)
 {
