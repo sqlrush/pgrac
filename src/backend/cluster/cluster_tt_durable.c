@@ -1080,6 +1080,7 @@ typedef struct TTCommitStage {
 	TTSlot predecessor;
 	TTSlot successor;
 	ClusterUndoBlock0Pin pin;
+	ClusterCanonicalTxnBinding trace_binding;
 } TTCommitStage;
 
 static TTCommitStage tt_commit_stage = { .fd = -1, .pin = { .slot = -1 } };
@@ -1327,6 +1328,8 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation, uin
 			stage->intent = root.intent;
 			stage->predecessor = disk_header->tt_slots[slot_offset];
 			stage->successor = successor;
+			if (unlikely(cluster_trace_tx_identity))
+				(void)cluster_tt_local_get_published_binding(xid, &stage->trace_binding);
 			stage->armed = true;
 		}
 		*successor_out = successor;
@@ -1421,6 +1424,10 @@ cluster_tt_slot_durable_commit_apply(XLogRecPtr commit_end)
 						errmsg("could not write canonical TT commit stamp of undo segment %u: %m",
 							   stage->segment_id)));
 	memcpy(&resident->tt_slots[stage->slot_offset], &stage->successor, sizeof(TTSlot));
+	if (unlikely(cluster_trace_tx_identity))
+		cluster_native_itl_trace_terminal(CLNITL_TT_COMMITTED, stage->owner,
+			stage->segment_id, stage->generation.value, stage->slot_offset,
+			&stage->successor, commit_end, &stage->trace_binding);
 	cluster_undo_block0_unpin(&stage->pin);
 	tt_commit_stage_clear(stage);
 	cluster_tt_durable_count_commit();
@@ -1472,6 +1479,13 @@ cluster_tt_slot_durable_abort_exact(uint32 segment_id, uint32 segment_generation
 		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	}
 	PG_END_TRY();
+	if (unlikely(cluster_trace_tx_identity)) {
+		ClusterCanonicalTxnBinding trace_binding;
+		(void)cluster_tt_local_get_published_binding(xid, &trace_binding);
+		cluster_native_itl_trace_terminal(CLNITL_TT_ABORTED, owner,
+			segment_id, segment_generation, slot_offset, successor_out, abort_lsn,
+			&trace_binding);
+	}
 	return abort_lsn;
 }
 

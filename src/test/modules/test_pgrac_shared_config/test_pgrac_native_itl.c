@@ -58,7 +58,18 @@ static void append_event(StringInfo out, const ClusterNativeItlTraceEvent *r)
 		k->admission_record_generation, k->root_descriptor_incarnation, k->root_id, k->root_generation);
 	append_hex(out, k, sizeof(*k));
 	appendStringInfo(out,
-		"\",\"bind_lsn\":\"" UINT64_FORMAT "\",\"tt_slot\":{\"xid\":%u,\"wrap\":%u,"
+		"\",\"terminal_lsn\":\"" UINT64_FORMAT "\",\"active_sequence\":" UINT64_FORMAT
+		",\"native_binding_known\":%s,\"native_binding\":{\"segment_id\":%u,"
+		"\"segment_generation\":%u,\"xid\":%u,\"slot_offset\":%u,\"slot_wrap\":%u,"
+		"\"origin_instance\":%u,\"publish_state\":%u,\"reserved16\":%u,"
+		"\"active_lsn\":\"" UINT64_FORMAT "\"}",
+		(uint64)r->terminal_lsn, r->active_sequence, r->native_binding_known ? "true" : "false",
+		r->native_binding.segment_id, r->native_binding.segment_generation,
+		r->native_binding.xid, r->native_binding.slot_offset, r->native_binding.slot_wrap,
+		r->native_binding.origin_instance, r->native_binding.publish_state,
+		r->native_binding.reserved16, (uint64)r->native_binding.active_lsn);
+	appendStringInfo(out,
+		",\"bind_lsn\":\"" UINT64_FORMAT "\",\"tt_slot\":{\"xid\":%u,\"wrap\":%u,"
 		"\"status\":%u,\"flags\":%u,\"commit_scn\":\"" UINT64_FORMAT "\",\"first_undo\":\"",
 		(uint64)r->bind_lsn, r->tt_slot.xid, r->tt_slot.wrap, r->tt_slot.status,
 		r->tt_slot.flags, (uint64)r->tt_slot.commit_scn);

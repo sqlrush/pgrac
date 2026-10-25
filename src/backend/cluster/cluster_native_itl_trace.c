@@ -179,3 +179,78 @@ cluster_native_itl_trace_selected(Buffer buffer, TransactionId xid, uint8 select
 			&GetBufferDescriptor(buffer - 1)->tag, BufferGetPage(buffer), &row);
 	(void)cluster_native_itl_trace_append(&row, NULL);
 }
+
+void
+cluster_native_itl_trace_terminal(ClusterNativeItlTraceKind kind,
+	uint8 owner, uint32 segment, uint32 generation, uint16 offset,
+	const TTSlot *successor, XLogRecPtr terminal_lsn,
+	const ClusterCanonicalTxnBinding *binding)
+{
+	ClusterNativeItlTraceEvent row = {0};
+	ClusterNativeItlTraceEvent candidate, active = {0};
+	uint64 limit;
+	unsigned matches = 0;
+
+	if (!cluster_trace_tx_identity || successor == NULL)
+		return;
+	row.kind = kind;
+	row.key.owner_instance = owner;
+	row.key.segment_id = segment;
+	row.key.segment_generation = generation;
+	row.key.slot_offset = offset;
+	row.key.slot_wrap = successor->wrap;
+	row.key.xid = successor->xid;
+	row.tt_slot = *successor;
+	row.terminal_lsn = terminal_lsn;
+	if (binding != NULL)
+		row.native_binding = *binding;
+	row.native_binding_known = binding != NULL &&
+		binding->publish_state == CLUSTER_CANONICAL_TXN_PUBLISHED &&
+		binding->reserved16 == 0 && !XLogRecPtrIsInvalid(binding->active_lsn) &&
+		binding->origin_instance == owner && binding->segment_id == segment &&
+		binding->segment_generation == generation && binding->slot_offset == offset &&
+		binding->slot_wrap == successor->wrap && binding->xid == successor->xid &&
+		TransactionIdIsNormal(successor->xid) && successor->wrap != TT_WRAP_INVALID;
+	if (row.native_binding_known)
+		row.bind_lsn = binding->active_lsn;
+
+	/* The native ACTIVE WAL location is the link, never a reconstructed
+	 * current epoch/root or an xid-only lookup. Only immutable observations
+	 * are scanned; no TT IO, allocation, lock or error is introduced here. */
+	if (row.native_binding_known && !XLogRecPtrIsInvalid(terminal_lsn) &&
+		((kind == CLNITL_TT_COMMITTED && successor->status == TT_SLOT_COMMITTED &&
+		  SCN_VALID(successor->commit_scn)) ||
+		 (kind == CLNITL_TT_ABORTED && successor->status == TT_SLOT_ABORTED &&
+		  !SCN_VALID(successor->commit_scn))) &&
+		native_itl_trace != NULL && MyProc != NULL &&
+		pg_atomic_read_u64(&native_itl_trace->next) < CLUSTER_NATIVE_ITL_TRACE_CAPACITY) {
+		limit = Min(pg_atomic_read_u64(&native_itl_trace->next),
+					(uint64)CLUSTER_NATIVE_ITL_TRACE_CAPACITY);
+		for (uint64 i = 0; i < limit; i++) {
+			if (!cluster_native_itl_trace_read(i, &candidate) ||
+				candidate.kind != CLNITL_TT_ACTIVE_PUBLISHED || !candidate.key_known ||
+				candidate.bind_lsn != binding->active_lsn ||
+				candidate.key.format_version != CLUSTER_CTRC_FORMAT_VERSION ||
+				candidate.key.owner_instance != owner || candidate.key.segment_id != segment ||
+				candidate.key.segment_generation != generation ||
+				candidate.key.slot_offset != offset || candidate.key.slot_wrap != successor->wrap ||
+				candidate.key.xid != successor->xid || candidate.key.origin_node_id != cluster_node_id ||
+				candidate.tt_slot.status != TT_SLOT_ACTIVE ||
+				candidate.tt_slot.xid != successor->xid || candidate.tt_slot.wrap != successor->wrap ||
+				candidate.node != cluster_node_id || candidate.pid != MyProcPid ||
+				candidate.procno != MyProc->pgprocno || candidate.backend_id != MyProc->backendId ||
+				candidate.backend_start != MyStartTimestamp ||
+				candidate.process_incarnation != MyProc->cluster_grd_generation)
+				continue;
+			active = candidate;
+			if (++matches > 1)
+				break;
+		}
+		if (matches == 1) {
+			row.key = active.key;
+			row.key_known = true;
+			row.active_sequence = active.sequence;
+		}
+	}
+	(void)cluster_native_itl_trace_append(&row, NULL);
+}

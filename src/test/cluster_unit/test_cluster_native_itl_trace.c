@@ -177,9 +177,149 @@ static void overflow_remains_incomplete_if_counter_wraps(void)
 	cluster_native_itl_trace_prefix(&p); UT_ASSERT(p.overflow); UT_ASSERT(!p.complete);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&native_itl_trace->next), UINT64_MAX);
 }
+
+static ClusterCanonicalTxnBinding terminal_binding(void)
+{
+	ClusterCanonicalTxnBinding binding = {0};
+	binding.segment_id = 12; binding.segment_generation = 8;
+	binding.xid = 42; binding.slot_offset = 5; binding.slot_wrap = 7;
+	binding.origin_instance = 3; binding.publish_state = CLUSTER_CANONICAL_TXN_PUBLISHED;
+	binding.active_lsn = 123;
+	return binding;
+}
+
+static void seed_terminal_active(void)
+{
+	ClusterNativeItlTraceEvent row = sample();
+	row.key.format_version = CLUSTER_CTRC_FORMAT_VERSION;
+	row.key.owner_instance = 3; row.key.origin_node_id = 2;
+	row.key.segment_id = 12; row.key.slot_offset = 5;
+	row.key.system_identifier = 11; row.key.root_id = 13;
+	row.key.formation_epoch = 14; row.key.admission_record_generation = 15;
+	row.key.root_descriptor_incarnation = 16;
+	row.tt_slot.status = TT_SLOT_ACTIVE;
+	UT_ASSERT(cluster_native_itl_trace_append(&row, NULL));
+}
+
+static TTSlot terminal_slot(bool commit)
+{
+	TTSlot slot = {0};
+	slot.xid = 42; slot.wrap = 7;
+	slot.status = commit ? TT_SLOT_COMMITTED : TT_SLOT_ABORTED;
+	slot.commit_scn = commit ? scn_encode(2, 99) : InvalidScn;
+	return slot;
+}
+
+static void terminal_commit_links_native_active_lsn_and_owned_full_key(void)
+{
+	ClusterCanonicalTxnBinding binding = terminal_binding();
+	ClusterNativeItlTraceEvent row = {0}; TTSlot slot = terminal_slot(true);
+	reset(); seed_terminal_active();
+	cluster_native_itl_trace_terminal(CLNITL_TT_COMMITTED, 3, 12, 8, 5, &slot, 1000, &binding);
+	memset(&binding, 0, sizeof(binding)); memset(&slot, 0, sizeof(slot));
+	UT_ASSERT(cluster_native_itl_trace_read(1, &row));
+	UT_ASSERT(row.key_known); UT_ASSERT(row.native_binding_known);
+	UT_ASSERT_EQ(row.kind, CLNITL_TT_COMMITTED); UT_ASSERT_EQ(row.active_sequence, 1);
+	UT_ASSERT_EQ(row.key.root_generation, 10); UT_ASSERT_EQ(row.key.root_descriptor_incarnation, 16);
+	UT_ASSERT_EQ(row.key.origin_boot_incarnation, 9); UT_ASSERT_EQ(row.native_binding.active_lsn, 123);
+	UT_ASSERT_EQ(row.bind_lsn, 123); UT_ASSERT_EQ(row.terminal_lsn, 1000);
+	UT_ASSERT_EQ(row.tt_slot.status, TT_SLOT_COMMITTED);
+	UT_ASSERT_EQ(row.tt_slot.commit_scn, scn_encode(2, 99));
+}
+
+static void terminal_abort_keeps_actual_lsn_and_invalid_scn(void)
+{
+	ClusterCanonicalTxnBinding binding = terminal_binding();
+	ClusterNativeItlTraceEvent row = {0}; TTSlot slot = terminal_slot(false);
+	reset(); seed_terminal_active();
+	cluster_native_itl_trace_terminal(CLNITL_TT_ABORTED, 3, 12, 8, 5, &slot, 1001, &binding);
+	UT_ASSERT(cluster_native_itl_trace_read(1, &row)); UT_ASSERT(row.key_known);
+	UT_ASSERT_EQ(row.kind, CLNITL_TT_ABORTED); UT_ASSERT_EQ(row.terminal_lsn, 1001);
+	UT_ASSERT_EQ(row.tt_slot.status, TT_SLOT_ABORTED); UT_ASSERT(!SCN_VALID(row.tt_slot.commit_scn));
+}
+
+static void terminal_missing_active_preserves_native_binding_but_unknown_key(void)
+{
+	ClusterCanonicalTxnBinding binding = terminal_binding();
+	ClusterNativeItlTraceEvent row = {0}; TTSlot slot = terminal_slot(true);
+	reset();
+	cluster_native_itl_trace_terminal(CLNITL_TT_COMMITTED, 3, 12, 8, 5, &slot, 1000, &binding);
+	UT_ASSERT(cluster_native_itl_trace_read(0, &row)); UT_ASSERT(!row.key_known);
+	UT_ASSERT(row.native_binding_known); UT_ASSERT_EQ(row.active_sequence, 0);
+	UT_ASSERT_EQ(row.key.segment_id, 12); UT_ASSERT_EQ(row.key.slot_wrap, 7);
+	UT_ASSERT_EQ(row.terminal_lsn, 1000);
+}
+
+static void terminal_missing_binding_never_reconstructs_from_xid(void)
+{
+	ClusterNativeItlTraceEvent row = {0}; TTSlot slot = terminal_slot(true);
+	reset(); seed_terminal_active();
+	cluster_native_itl_trace_terminal(CLNITL_TT_COMMITTED, 3, 12, 8, 5, &slot, 1000, NULL);
+	UT_ASSERT(cluster_native_itl_trace_read(1, &row));
+	UT_ASSERT(!row.key_known); UT_ASSERT(!row.native_binding_known);
+	UT_ASSERT_EQ(row.active_sequence, 0); UT_ASSERT_EQ(row.key.xid, 42);
+	UT_ASSERT_EQ(row.tt_slot.status, TT_SLOT_COMMITTED);
+}
+
+static void terminal_mismatched_native_incarnations_never_join_by_xid(void)
+{
+	for (unsigned i = 0; i < 4; i++) {
+		ClusterCanonicalTxnBinding binding = terminal_binding();
+		ClusterNativeItlTraceEvent row = {0}; TTSlot slot = terminal_slot(true);
+		reset(); seed_terminal_active();
+		if (i == 0) binding.segment_generation++;
+		if (i == 1) binding.slot_wrap++;
+		if (i == 2) binding.active_lsn++;
+		if (i == 3) binding.reserved16 = 1;
+		cluster_native_itl_trace_terminal(CLNITL_TT_COMMITTED, 3, 12, 8, 5, &slot, 1000, &binding);
+		UT_ASSERT(cluster_native_itl_trace_read(1, &row)); UT_ASSERT(!row.key_known);
+		UT_ASSERT_EQ(row.active_sequence, 0);
+	}
+}
+
+static void terminal_actor_reuse_cannot_consume_old_active(void)
+{
+	ClusterCanonicalTxnBinding binding = terminal_binding();
+	ClusterNativeItlTraceEvent row = {0}; TTSlot slot = terminal_slot(true);
+	reset(); seed_terminal_active(); proc.cluster_grd_generation++;
+	cluster_native_itl_trace_terminal(CLNITL_TT_COMMITTED, 3, 12, 8, 5, &slot, 1000, &binding);
+	UT_ASSERT(cluster_native_itl_trace_read(1, &row)); UT_ASSERT(!row.key_known);
+	UT_ASSERT_EQ(row.process_incarnation, 7); UT_ASSERT_EQ(row.active_sequence, 0);
+}
+
+static void terminal_conflicting_active_keys_are_unknown(void)
+{
+	ClusterCanonicalTxnBinding binding = terminal_binding();
+	ClusterNativeItlTraceEvent row = {0}, other = {0}; TTSlot slot = terminal_slot(true);
+	reset(); seed_terminal_active(); UT_ASSERT(cluster_native_itl_trace_read(0, &other));
+	other.key.root_generation++; UT_ASSERT(cluster_native_itl_trace_append(&other, NULL));
+	cluster_native_itl_trace_terminal(CLNITL_TT_COMMITTED, 3, 12, 8, 5, &slot, 1000, &binding);
+	UT_ASSERT(cluster_native_itl_trace_read(2, &row)); UT_ASSERT(!row.key_known);
+	UT_ASSERT_EQ(row.active_sequence, 0);
+}
+
+static void terminal_disabled_is_inert_without_actor(void)
+{
+	TTSlot slot = terminal_slot(true);
+	reset(); cluster_trace_tx_identity = false; MyProc = NULL;
+	cluster_native_itl_trace_terminal(CLNITL_TT_COMMITTED, 3, 12, 8, 5, &slot, 1000, NULL);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&native_itl_trace->next), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&native_itl_trace->dropped), 0);
+}
+
+static void terminal_invalid_lsn_is_not_an_active_key_proof(void)
+{
+	ClusterCanonicalTxnBinding binding = terminal_binding();
+	ClusterNativeItlTraceEvent row = {0}; TTSlot slot = terminal_slot(true);
+	reset(); seed_terminal_active();
+	cluster_native_itl_trace_terminal(CLNITL_TT_COMMITTED, 3, 12, 8, 5, &slot, 0, &binding);
+	UT_ASSERT(cluster_native_itl_trace_read(1, &row)); UT_ASSERT(!row.key_known);
+	UT_ASSERT_EQ(row.active_sequence, 0); UT_ASSERT_EQ(row.terminal_lsn, 0);
+}
+
 int main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(22);
 	UT_RUN(disabled_is_inert); UT_RUN(immutable_owned_copy); UT_RUN(prefix_is_complete);
 	UT_RUN(unpublished_hole_is_incomplete); UT_RUN(full_never_overwrites);
 	UT_RUN(unavailable_is_incomplete); UT_RUN(missing_actor_is_not_invented);
@@ -188,5 +328,14 @@ int main(void)
 	UT_RUN(original_selection_result_is_observed);
 	UT_RUN(invalid_page_clears_previous_payload);
 	UT_RUN(overflow_remains_incomplete_if_counter_wraps);
+	UT_RUN(terminal_commit_links_native_active_lsn_and_owned_full_key);
+	UT_RUN(terminal_abort_keeps_actual_lsn_and_invalid_scn);
+	UT_RUN(terminal_missing_active_preserves_native_binding_but_unknown_key);
+	UT_RUN(terminal_missing_binding_never_reconstructs_from_xid);
+	UT_RUN(terminal_mismatched_native_incarnations_never_join_by_xid);
+	UT_RUN(terminal_actor_reuse_cannot_consume_old_active);
+	UT_RUN(terminal_conflicting_active_keys_are_unknown);
+	UT_RUN(terminal_disabled_is_inert_without_actor);
+	UT_RUN(terminal_invalid_lsn_is_not_an_active_key_proof);
 	UT_DONE(); return ut_failed_count ? 1 : 0;
 }
