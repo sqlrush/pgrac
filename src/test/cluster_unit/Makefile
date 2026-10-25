@@ -3459,6 +3459,8 @@ test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
 		test_cluster_relmap_checkpoint_publisher.inc \
 		test_cluster_relmap_checkpoint_scope.inc \
 		test_cluster_relmap_checkpoint_pending.inc \
+		test_cluster_relmap_producer_pending.inc \
+		test_cluster_relmap_native_owner.o test_cluster_relmap_native_owner.h \
 		test_cluster_cold_checkpoint_publisher.o test_cluster_cold_checkpoint_publisher.h \
 		test_cluster_relmap_origin_build.inc \
 		test_cluster_relmap_execution_custody.inc \
@@ -3500,6 +3502,17 @@ test_cluster_relmap_original_scope.o: $(top_srcdir)/src/backend/cluster/cluster_
 		-include test_cluster_relmap_original_scope_namespace.h -c $< -o $@
 
 # Compose the cold executor with the actual native arbiter and pair storage.
+test_cluster_relmap_native_owner.o: test_cluster_relmap_native_owner.c \
+		test_cluster_relmap_native_owner.h test_cluster_relmap_native_owner_namespace.h \
+		test_cluster_wal_writer.c test_cluster_relmap_owner.inc \
+		test_cluster_relmap_retention_runtime.inc unit_test.h \
+		test_cluster_wal_publish_tail.inc test_cluster_wal_publish_callers.inc \
+		test_cluster_wal_publish_entry.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_writer.c \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
 test_cluster_relmap_native_pin.o: test_cluster_relmap_native_pin.c \
 		test_cluster_relmap_native_pin.h test_cluster_relmap_native_pin_namespace.h \
 		test_cluster_wal_retention.c unit_test.h \
@@ -3594,6 +3607,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relma
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_owner.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_cold_checkpoint_publisher.o) \
+		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_native_owner.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_arb.o test_cluster_relmap_retained_authority.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_native_clog.o test_cluster_relmap_native_storage.o test_cluster_relmap_native_pin.o test_cluster_relmap_original_scope.o test_cluster_relmap_original_authority.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),$(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o) \
