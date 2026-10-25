@@ -4804,6 +4804,8 @@ check_r11_source_removal_census:
 # ----------
 clean distclean maintainer-clean:
 	rm -f test_cluster_first_fill_send.inc test_cluster_first_fill_send.inc.tmp
+	rm -f test_cluster_first_fill_retire.inc test_cluster_first_fill_retire.inc.tmp
+	rm -f test_cluster_first_fill_retire_types.inc test_cluster_first_fill_retire_types.inc.tmp
 	rm -f test_cluster_first_fill_bufmgr.inc test_cluster_first_fill_bufmgr.inc.tmp \
 		test_cluster_first_fill_holder.inc test_cluster_first_fill_holder.inc.tmp \
 		test_cluster_pcm_first_fill_master.inc test_cluster_pcm_first_fill_master.inc.tmp
@@ -9621,7 +9623,9 @@ test_cluster_pcm_read_source_owner.inc: $(top_srcdir)/src/backend/storage/buffer
 	mv $@.tmp $@
 
 test_cluster_pcm_read_source: test_cluster_pcm_read_source.c test_cluster_pcm_own \
-		test_cluster_pcm_read_source_owner.inc
+		test_cluster_pcm_read_source_owner.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_block_io_trace.c \
+		$(top_srcdir)/src/include/cluster/cluster_block_io_trace.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
 		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
@@ -9761,9 +9765,13 @@ test_cluster_tt_terminal_trace: test_cluster_tt_terminal_trace.c test_cluster_tt
 
 # Execute the production first-fill master decision with native PCM owners.
 test_cluster_pcm_first_fill_master.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_first_fill_retired_notice\(/ { print "static bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< > $@.tmp
 	awk '/^#define GCS_FIRST_FILL_PARK_MAX/ { emit=1; n++ } \
 	     /^void$$/ && emit { emit=0; done++ } emit { print } \
-	     END { if (n != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (n != 1 || done != 1 || emit) exit 1 }' $< >> $@.tmp
+	awk '/^cluster_gcs_block_pending_s_tick\(/ { print "void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
 test_cluster_pcm_read_grant: test_cluster_pcm_first_fill_master.inc
 
@@ -9805,6 +9813,45 @@ test_cluster_first_fill_send.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_
 
 test_cluster_first_fill_send: test_cluster_first_fill_send.c test_cluster_pcm_own test_cluster_pcm_own.c \
 		test_cluster_first_fill_bufmgr.inc test_cluster_first_fill_send.inc unit_test.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
+		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Native first-fill retirement and the real invalidate/transport handoff owner.
+TESTS += test_cluster_first_fill_retire
+all: test_cluster_first_fill_retire
+
+test_cluster_first_fill_retire_types.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^typedef enum ClusterGcsBlockReplyDomain/ { emit=1; n++ } \
+	     /^typedef struct GcsFirstFillReceipt/ { emit=1; n++ } \
+	     emit { print } /^} ClusterGcsBlockReplyDomain;/ { emit=0; done++ } \
+	     /^} ClusterGcsBlockBackendBlock;/ { emit=0; done++ } \
+	     END { if (n != 2 || done != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_first_fill_retire.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^#define GCS_READ_SOURCE_LEDGER_MAX/ { emit=1; n++ } emit { print } \
+	     /^static bool gcs_read_source_exit_registered;/ { emit=0; done++ } \
+	     END { if (n != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^gcs_block_slot_clear_current_mx_expectation\(/ { print "static void"; emit=1; n++ } \
+	     /^gcs_block_my_block\(/ { print "static ClusterGcsBlockBackendBlock *"; emit=1; n++ } \
+	     /^gcs_block_reserve_slot\(/ { print "static ClusterGcsBlockOutstandingSlot *"; emit=1; n++ } \
+	     /^gcs_block_(clear_slot_locked|release_slot)\(/ { print "static void"; emit=1; n++ } \
+	     /^gcs_block_compute_invalidate_ack_checksum\(/ { print "static uint32"; emit=1; n++ } \
+	     /^gcs_first_fill_(arm_slot|receipt_matches|receipt_consumed|retry_progress)\(/ { print "static bool"; emit=1; n++ } \
+	     /^gcs_first_fill_receipt_count_locked\(/ { print "static unsigned"; emit=1; n++ } \
+	     /^gcs_first_fill_(receipt_offer|receipt_tick|source_exit)\(/ { print "static void"; emit=1; n++ } \
+	     /^gcs_first_fill_receipt_revoke\(/ { print "static int"; emit=1; n++ } \
+	     /^gcs_read_source_key\(/ { print "static ClusterPcmReadGrantKey"; emit=1; n++ } \
+	     /^gcs_read_source_arm\(/ { print "static bool"; emit=1; n++ } \
+	     /^cluster_gcs_block_read_source_(complete|retry_wait)\(/ { print "void"; emit=1; n++ } \
+	     /^cluster_gcs_block_read_source_(quiescent|quiesce)\(/ { print "bool"; emit=1; n++ } \
+	     /^gcs_block_(pending_s_delivery_closed|invalidate_execute)\(/ { print "static bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 23 || emit) exit 1 }' $< >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_first_fill_retire: test_cluster_first_fill_retire.c test_cluster_pcm_own test_cluster_pcm_own.c \
+		test_cluster_first_fill_retire_types.inc test_cluster_first_fill_retire.inc unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
 		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@

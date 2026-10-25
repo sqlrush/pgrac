@@ -1,0 +1,455 @@
+/* Exact failed-first-fill retirement uses the native reservation owner, the
+ * whole invalidate handler and real retained transport-continuation bodies.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+int first_fill_retire_own_fixture_main(void);
+#define main first_fill_retire_own_fixture_main
+#include "test_cluster_pcm_own.c"
+#undef main
+#include "cluster/cluster_gcs_reqid.h"
+#include "cluster/cluster_multixact_current_wire.h"
+#include "cluster/cluster_block_io_trace.h"
+#include "storage/condition_variable.h"
+#include "storage/latch.h"
+#include "storage/proc.h"
+#include "utils/wait_event.h"
+
+#define MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND CLUSTER_GCS_BLOCK_MAX_OUTSTANDING_PER_BACKEND
+#include "test_cluster_first_fill_retire_types.inc"
+static void gcs_block_clear_slot_locked(ClusterGcsBlockOutstandingSlot *slot);
+static ClusterGcsBlockBackendBlock retire_blocks[1];
+static ClusterGcsBlockBackendBlock *gcs_block_backend_blocks = retire_blocks;
+static struct { pg_atomic_uint64 invalidate_busy_sent_count; } retire_shared;
+static int retire_backend = 1, retire_pid = 71, retire_route = 2;
+static TimestampTz retire_start = 700, retire_now = 10;
+static uint64 retire_epoch = 1, retire_peer_session = 17;
+static unsigned retire_sends, retire_admitted, retire_tag_reads, retire_wakes, retire_sleeps;
+static unsigned retire_receipts, retire_trace_published, retire_trace_consumed;
+static ClusterICSendResult retire_result;
+static GcsBlockInvalidateAckPayload retire_ack;
+static bool retire_session = true, retire_cancel;
+static void (*retire_on_wait)(void);
+static ClusterPcmReadSource retire_wait_source;
+#define ClusterGcsBlock (&retire_shared)
+#define MaxBackends 1
+#define MyBackendId retire_backend
+#define MyProcPid retire_pid
+#define MyStartTimestamp retire_start
+#define cluster_node_id 3
+#define cluster_lms_workers 1
+#define cluster_epoch_get_current() retire_epoch
+#define cluster_lms_shard_for_tag(tag, workers) 0
+#define cluster_gcs_lookup_master(tag) retire_route
+#define GetCurrentTimestamp() retire_now
+#define LWLockAcquire(lock, mode) ((void)0)
+#define LWLockRelease(lock) ((void)0)
+#define LockBufHdr transition_lock_header
+#define ConditionVariablePrepareToSleep(cv) ((void)0)
+#define ConditionVariableCancelSleep() ((void)0)
+#define ConditionVariableSignal(cv) (++retire_wakes)
+#define ConditionVariableBroadcast(cv) (++retire_wakes)
+#define ResetLatch(latch) ((void)0)
+#define cluster_gcs_block_note_send_outcome(family, result) ((void)(result))
+#define cluster_block_io_trace_source(source, phase) ((void)0)
+#define cluster_pcm_note_invalidate_parked_grant_pending() ((void)0)
+#define cluster_sf_peer_supports_gcs_inval_busy(master) true
+#define gcs_block_observe_grant_pending_invalidate(inv, woke) ((void)0)
+#define gcs_block_wake_local_pending_s_request(inv) false
+#define cluster_bufmgr_pending_s_aborted(tag) false
+#define cluster_bufmgr_block_is_pi(tag) false
+#define cluster_pcm_lock_apply_gcs_transition(tag, trans, node) false
+#define cluster_bufmgr_invalidate_block_for_gcs(tag, mode, lsn, scn) CLUSTER_BUFMGR_GCS_DROP_PINNED
+#define elog(...) ((void)0)
+#define ereport(...) pg_re_throw()
+static void
+retire_check(void)
+{
+	if (retire_cancel) pg_re_throw();
+}
+#define cluster_pcm_lock_check_shutdown_wait retire_check
+static int
+retire_wait(void)
+{
+	retire_sleeps++;
+	retire_now += 10000;
+	if (retire_on_wait != NULL) retire_on_wait();
+	return WL_TIMEOUT;
+}
+#define WaitLatch(...) retire_wait()
+#define ConditionVariableTimedSleep(...) retire_wait()
+static bool
+gcs_block_pcm_x_authenticated_session(int master, uint64 epoch, uint64 *session)
+{
+	*session = retire_peer_session;
+	return retire_session && master == 2 && epoch == retire_epoch;
+}
+static ClusterICSendResult
+retire_send(uint8 type, int dest, const void *payload, uint32 len)
+{
+	UT_ASSERT_EQ(type, PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK);
+	UT_ASSERT_EQ(dest, 2);
+	UT_ASSERT_EQ(len, sizeof(retire_ack));
+	retire_ack = *(const GcsBlockInvalidateAckPayload *)payload;
+	retire_sends++;
+	if (retire_result == CLUSTER_IC_SEND_DONE || retire_result == CLUSTER_IC_SEND_WOULD_BLOCK)
+		retire_admitted++;
+	return retire_result;
+}
+#define gcs_block_send_envelope_or_loopback retire_send
+#define cluster_ic_send_envelope retire_send
+#define cluster_grd_outbound_enqueue_backend_msg(type, dest, data, len) \
+	(retire_send(type, dest, data, len) == CLUSTER_IC_SEND_DONE)
+static PcmLockMode
+retire_tag_state(BufferTag tag pg_attribute_unused())
+{
+	retire_tag_reads++;
+	return PCM_LOCK_MODE_N;
+}
+#define cluster_bufmgr_block_pcm_state retire_tag_state
+#define cluster_bufmgr_block_grant_pending(tag) true
+static bool
+gcs_block_pending_s_notify_action(const ClusterPcmReadGrantKey *key pg_attribute_unused(),
+	int master, uint8 action)
+{
+	UT_ASSERT_EQ(master, 2);
+	UT_ASSERT_EQ(action, GCS_BLOCK_DONE_PENDING_S_NACK);
+	return true;
+}
+static void
+gcs_block_pending_s_notify(const ClusterPcmReadGrantKey *key, int master, bool installed)
+{
+	UT_ASSERT(!installed);
+	(void)gcs_block_pending_s_notify_action(key, master, GCS_BLOCK_DONE_PENDING_S_NACK);
+}
+static void
+retire_trace(const ClusterPcmReadSource *source pg_attribute_unused(), const char *event,
+	int backend, int buf, int pid, uint64 incarnation, unsigned count)
+{
+	UT_ASSERT_EQ(backend, 1);
+	UT_ASSERT_EQ(buf, 0);
+	UT_ASSERT_EQ(pid, 71);
+	UT_ASSERT_EQ(incarnation, 700);
+	retire_receipts = count;
+	if (strcmp(event, "QUIET_PUBLISHED") == 0) retire_trace_published++;
+	else if (strcmp(event, "MASTER_ACK_CONSUMED") == 0) retire_trace_consumed++;
+	else UT_ASSERT(false);
+}
+#define cluster_block_io_trace_receipt retire_trace
+static PGPROC retire_proc;
+static PGPROC *retire_backend_proc(int backend pg_attribute_unused())
+{
+	retire_proc.pid = retire_pid;
+	return &retire_proc;
+}
+#define BackendIdGetProc retire_backend_proc
+#include "test_cluster_first_fill_retire.inc"
+
+static void
+retire_reset(BufferDesc *buf, ClusterPcmOwnEntry *entry, bool fresh)
+{
+	n_predecessor_fixture(buf, entry, BUF_TYPE_CURRENT);
+	if (fresh) {
+		pg_atomic_write_u64(&entry->generation, 0);
+		pg_atomic_write_u64(&entry->reservation_token, 0);
+	}
+	pg_atomic_write_u32(&buf->state, BM_TAG_VALID | BM_IO_IN_PROGRESS | BUF_REFCOUNT_ONE);
+	memset(retire_blocks, 0, sizeof(retire_blocks));
+	memset(gcs_read_source_attempts, 0, sizeof(gcs_read_source_attempts));
+	gcs_read_source_exit_registered = true;
+	retire_blocks[0].next_request_id = 1;
+	retire_backend = 1; retire_pid = 71; retire_start = 700; retire_route = 2;
+	retire_now = 10; retire_epoch = 1; retire_peer_session = 17;
+	memset(&retire_ack, 0, sizeof(retire_ack));
+	retire_sends = retire_admitted = retire_tag_reads = retire_wakes = retire_sleeps = 0;
+	retire_receipts = retire_trace_published = retire_trace_consumed = 0;
+	retire_result = CLUSTER_IC_SEND_NOT_ADMITTED;
+	retire_session = true; retire_cancel = false; retire_on_wait = NULL;
+	transition_buf = buf;
+}
+static ClusterPcmReadSource
+retire_arm(BufferDesc *buf, bool admitted)
+{
+	ClusterPcmReadSource source = {0};
+	ClusterGcsBlockOutstandingSlot *slot;
+	source.tag = buf->tag;
+	source.base_generation = cluster_pcm_own_gen_get(0);
+	UT_ASSERT_EQ(cluster_pcm_own_reservation_begin_exact(0, source.base_generation,
+		PCM_OWN_FLAG_GRANT_PENDING, &source.reservation_token), CLUSTER_PCM_OWN_OK);
+	slot = gcs_block_reserve_slot(buf->tag, PCM_TRANS_N_TO_S, 2, &source.request_id, true);
+	source.request_epoch = slot->request_epoch = 1;
+	source.master_node = 2;
+	source.pending_s = true;
+	source.kind = CLUSTER_PCM_SOURCE_RETRY;
+	source.retry_event = true;
+	UT_ASSERT(gcs_read_source_arm(buf, &source));
+	slot->first_fill.request_admitted = admitted;
+	return source;
+}
+static void
+retire_abort(BufferDesc *buf, ClusterPcmReadSource *source)
+{
+	UT_ASSERT(cluster_gcs_block_read_source_quiesce(buf, source));
+	source->quiescent = true;
+	UT_ASSERT_EQ(cluster_pcm_own_reservation_abort_exact(0, source->base_generation,
+		source->reservation_token, PCM_OWN_FLAG_GRANT_PENDING), CLUSTER_PCM_OWN_OK);
+	cluster_gcs_block_read_source_complete(buf, source, false);
+}
+static GcsBlockInvalidatePayload
+retire_invalidate(const ClusterPcmReadSource *source)
+{
+	GcsBlockInvalidatePayload inv = {0};
+	ClusterPcmReadGrantKey key = gcs_read_source_key(source);
+	inv.request_id = source->request_id;
+	inv.epoch = 1; inv.master_node = 2; inv.tag = source->tag;
+	inv.invalidating_for_x_node = 3;
+	GcsBlockInvalidatePayloadSetPendingS(&inv, &key);
+	return inv;
+}
+static GcsBlockDonePayload
+retire_notice(const ClusterPcmReadSource *source)
+{
+	GcsBlockDonePayload done = {0};
+	done.request_id = source->request_id; done.epoch = source->request_epoch;
+	done.sender_node = 2; done.requester_backend_id = 1; done.tag = source->tag;
+	done.transition_id = PCM_TRANS_N_TO_S;
+	done.reserved_0[0] = GCS_BLOCK_DONE_PENDING_S_RETIRED; done.reserved_0[1] = 3;
+	return done;
+}
+UT_TEST(test_old_quiet_a_never_reads_or_revokes_successor_b)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry;
+	ClusterPcmReadSource a, b;
+	GcsBlockInvalidatePayload inv;
+	retire_reset(&buf, &entry, true);
+	a = retire_arm(&buf, true); retire_abort(&buf, &a);
+	UT_ASSERT_EQ(a.base_generation, 0);
+	b = retire_arm(&buf, true);
+	inv = retire_invalidate(&a);
+	UT_ASSERT(gcs_block_invalidate_execute(&inv));
+	UT_ASSERT_EQ(retire_tag_reads, 0);
+	UT_ASSERT_EQ(retire_ack.ack_status, 2);
+	UT_ASSERT_EQ(retire_ack.request_id, a.request_id);
+	UT_ASSERT(!retire_blocks[0].slots[1].first_fill_revoked);
+	UT_ASSERT_EQ(cluster_pcm_own_reservation_token_get(0), b.reservation_token);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_GRANT_PENDING);
+	UT_ASSERT(retire_blocks[0].slots[0].first_fill.quiet);
+}
+UT_TEST(test_ack_refusal_keeps_frame_and_receipt_until_real_takeover)
+{
+	for (int which = 0; which < 2; which++) {
+		BufferDesc buf; ClusterPcmOwnEntry entry;
+		ClusterPcmReadSource a; GcsBlockInvalidatePayload inv;
+		GcsBlockInvalidateAckPayload first;
+		retire_reset(&buf, &entry, false);
+		a = retire_arm(&buf, true); retire_abort(&buf, &a); inv = retire_invalidate(&a);
+		UT_ASSERT(gcs_block_invalidate_execute(&inv)); first = retire_ack;
+		UT_ASSERT_EQ(retire_admitted, 0);
+		UT_ASSERT(!gcs_first_fill_retry_progress(&a, false));
+		retire_result = CLUSTER_IC_SEND_HARD_ERROR;
+		retire_now += 10000; gcs_first_fill_receipt_tick(0);
+		UT_ASSERT_EQ(memcmp(&first, &retire_ack, sizeof(first)), 0);
+		UT_ASSERT_EQ(retire_admitted, 0);
+		retire_result = which ? CLUSTER_IC_SEND_WOULD_BLOCK : CLUSTER_IC_SEND_DONE;
+		retire_now += 10000; gcs_first_fill_receipt_tick(0);
+		UT_ASSERT_EQ(retire_admitted, 1);
+		UT_ASSERT(gcs_first_fill_retry_progress(&a, false));
+		UT_ASSERT_EQ(retire_receipts, 1);
+		UT_ASSERT(gcs_block_invalidate_execute(&inv));
+		retire_now += 10000; gcs_first_fill_receipt_tick(0);
+		UT_ASSERT_EQ(retire_sends, 3);
+	}
+}
+UT_TEST(test_master_consumption_retires_count_and_only_the_exact_old_receipt)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry;
+	ClusterPcmReadSource a, b; GcsBlockInvalidatePayload inv; GcsBlockDonePayload done;
+	retire_reset(&buf, &entry, true);
+	a = retire_arm(&buf, true); retire_abort(&buf, &a);
+	retire_result = CLUSTER_IC_SEND_DONE; inv = retire_invalidate(&a);
+	UT_ASSERT(gcs_block_invalidate_execute(&inv));
+	UT_ASSERT(gcs_first_fill_retry_progress(&a, true));
+	b = retire_arm(&buf, true); done = retire_notice(&a);
+	done.request_id = b.request_id; UT_ASSERT(!gcs_first_fill_receipt_consumed(&done));
+	done = retire_notice(&a); done.epoch++; UT_ASSERT(!gcs_first_fill_receipt_consumed(&done));
+	done = retire_notice(&a); retire_session = false; UT_ASSERT(!gcs_first_fill_receipt_consumed(&done));
+	retire_session = true; retire_peer_session++;
+	UT_ASSERT(!gcs_first_fill_receipt_consumed(&done));
+	retire_peer_session--;
+	UT_ASSERT_EQ(retire_receipts, 1);
+	UT_ASSERT(gcs_first_fill_receipt_consumed(&done));
+	UT_ASSERT_EQ(retire_receipts, 0);
+	UT_ASSERT_EQ(retire_trace_published, 1); UT_ASSERT_EQ(retire_trace_consumed, 1);
+	UT_ASSERT(!retire_blocks[0].slots[0].in_use);
+	UT_ASSERT(retire_blocks[0].slots[1].in_use);
+	UT_ASSERT_EQ(cluster_pcm_own_reservation_token_get(0), b.reservation_token);
+	UT_ASSERT(!gcs_first_fill_receipt_consumed(&done));
+}
+UT_TEST(test_native_retirement_must_be_proven_before_quiet_publication)
+{
+	for (int bad = 0; bad < 6; bad++) {
+		BufferDesc buf; ClusterPcmOwnEntry entry;
+		ClusterPcmReadSource a; GcsBlockInvalidatePayload inv;
+		retire_reset(&buf, &entry, false); a = retire_arm(&buf, true);
+		UT_ASSERT(cluster_gcs_block_read_source_quiesce(&buf, &a)); a.quiescent = true;
+		if (bad != 0) UT_ASSERT_EQ(cluster_pcm_own_reservation_abort_exact(0, a.base_generation,
+			a.reservation_token, PCM_OWN_FLAG_GRANT_PENDING), CLUSTER_PCM_OWN_OK);
+		if (bad == 1) pg_atomic_fetch_or_u32(&buf.state, BM_DIRTY);
+		if (bad == 2) a.reservation_token++;
+		if (bad == 3) retire_start++;
+		if (bad == 4) pg_atomic_fetch_and_u32(&buf.state, ~BM_IO_IN_PROGRESS);
+		if (bad == 5) { buf.pcm_state = PCM_STATE_S; pg_atomic_fetch_or_u32(&buf.state, BM_VALID); }
+		cluster_gcs_block_read_source_complete(&buf, &a, false);
+		UT_ASSERT(!retire_blocks[0].slots[0].first_fill.quiet);
+		UT_ASSERT(a.pending_s); inv = retire_invalidate(&a);
+		UT_ASSERT(gcs_block_invalidate_execute(&inv));
+		UT_ASSERT_EQ(retire_ack.ack_status, GCS_BLOCK_INVALIDATE_ACK_STATUS_RETRYABLE_BUSY);
+		UT_ASSERT_EQ(retire_trace_published, 0);
+	}
+}
+static void
+retire_after_two_timers(void)
+{
+	if (retire_sleeps == 2) {
+		GcsBlockInvalidatePayload inv = retire_invalidate(&retire_wait_source);
+		retire_result = CLUSTER_IC_SEND_DONE;
+		UT_ASSERT(gcs_block_invalidate_execute(&inv));
+	}
+}
+UT_TEST(test_retry_requires_actual_ack_handoff_not_a_timer)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmReadSource a;
+	retire_reset(&buf, &entry, true); a = retire_arm(&buf, true); retire_abort(&buf, &a);
+	retire_wait_source = a; retire_on_wait = retire_after_two_timers;
+	cluster_gcs_block_read_source_retry_wait(&a, 0);
+	UT_ASSERT_EQ(retire_sleeps, 2); UT_ASSERT_EQ(retire_admitted, 1);
+	UT_ASSERT(retire_blocks[0].slots[0].first_fill.quiet);
+}
+static void
+retire_cancel_after_three(void)
+{
+	if (retire_sleeps == 3) retire_cancel = true;
+}
+UT_TEST(test_second_retry_stays_local_until_caller_cancels)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmReadSource a;
+	volatile bool caught = false;
+	retire_reset(&buf, &entry, false); a = retire_arm(&buf, true); retire_abort(&buf, &a);
+	retire_result = CLUSTER_IC_SEND_DONE;
+	{ GcsBlockInvalidatePayload inv = retire_invalidate(&a); UT_ASSERT(gcs_block_invalidate_execute(&inv)); }
+	retire_on_wait = retire_cancel_after_three;
+	PG_TRY(); { cluster_gcs_block_read_source_retry_wait(&a, 1); }
+	PG_CATCH(); { caught = true; } PG_END_TRY();
+	UT_ASSERT(caught); UT_ASSERT_EQ(retire_sleeps, 3);
+	UT_ASSERT(retire_blocks[0].slots[0].first_fill.quiet);
+	UT_ASSERT(!retire_blocks[0].slots[0].first_fill.progress_waiter);
+}
+static void
+retire_free_after_two(void)
+{
+	if (retire_sleeps == 2) {
+		GcsBlockDonePayload done = retire_notice(&retire_wait_source);
+		UT_ASSERT(gcs_first_fill_receipt_consumed(&done));
+	}
+}
+UT_TEST(test_full_original_container_waits_without_eviction_or_transaction_error)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmReadSource a;
+	uint64 id; ClusterGcsBlockOutstandingSlot *next;
+	retire_reset(&buf, &entry, true);
+	for (int i = 0; i < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; i++) {
+		GcsBlockInvalidatePayload inv;
+		a = retire_arm(&buf, true); retire_abort(&buf, &a);
+		inv = retire_invalidate(&a); retire_result = CLUSTER_IC_SEND_DONE;
+		UT_ASSERT(gcs_block_invalidate_execute(&inv));
+		UT_ASSERT(gcs_first_fill_retry_progress(&a, true));
+	}
+	UT_ASSERT_EQ(retire_receipts, MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND);
+	retire_wait_source = a; retire_on_wait = retire_free_after_two;
+	next = gcs_block_reserve_slot(buf.tag, PCM_TRANS_N_TO_S, 2, &id, true);
+	UT_ASSERT_EQ(retire_sleeps, 2);
+	UT_ASSERT_EQ(retire_receipts, MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND - 1);
+	UT_ASSERT(next == &retire_blocks[0].slots[MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND - 1]);
+	UT_ASSERT(id != a.request_id);
+	UT_ASSERT(retire_blocks[0].slots[0].first_fill.quiet);
+}
+UT_TEST(test_never_admitted_cancel_needs_no_remote_receipt)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmReadSource a;
+	retire_reset(&buf, &entry, false); a = retire_arm(&buf, false); retire_abort(&buf, &a);
+	UT_ASSERT(!a.pending_s); UT_ASSERT(!retire_blocks[0].slots[0].in_use);
+	UT_ASSERT_EQ(retire_trace_published, 0); UT_ASSERT_EQ(retire_sends, 0);
+}
+UT_TEST(test_exit_preserves_quiet_debt_and_reused_backend_cannot_take_it)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmReadSource a;
+	GcsBlockInvalidatePayload inv; GcsBlockDonePayload done;
+	retire_reset(&buf, &entry, true); a = retire_arm(&buf, true); retire_abort(&buf, &a);
+	retire_start++;
+	gcs_first_fill_source_exit();
+	UT_ASSERT(retire_blocks[0].slots[0].first_fill.progress_waiter);
+	retire_start--;
+	gcs_first_fill_source_exit();
+	UT_ASSERT(!retire_blocks[0].slots[0].first_fill.progress_waiter);
+	UT_ASSERT(retire_blocks[0].slots[0].first_fill.quiet);
+	retire_result = CLUSTER_IC_SEND_DONE; inv = retire_invalidate(&a);
+	UT_ASSERT(gcs_block_invalidate_execute(&inv)); done = retire_notice(&a);
+	UT_ASSERT(gcs_first_fill_receipt_consumed(&done));
+	UT_ASSERT_EQ(retire_receipts, 0); UT_ASSERT(!retire_blocks[0].slots[0].in_use);
+}
+UT_TEST(test_master_consumed_before_wait_keeps_only_exact_local_progress)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmReadSource a;
+	GcsBlockInvalidatePayload inv; GcsBlockDonePayload done;
+	retire_reset(&buf, &entry, true); a = retire_arm(&buf, true); retire_abort(&buf, &a);
+	retire_result = CLUSTER_IC_SEND_WOULD_BLOCK; inv = retire_invalidate(&a);
+	UT_ASSERT(gcs_block_invalidate_execute(&inv)); done = retire_notice(&a);
+	UT_ASSERT(gcs_first_fill_receipt_consumed(&done));
+	UT_ASSERT_EQ(retire_receipts, 0); UT_ASSERT(retire_blocks[0].slots[0].in_use);
+	cluster_gcs_block_read_source_retry_wait(&a, 0);
+	UT_ASSERT_EQ(retire_sleeps, 0); UT_ASSERT(!retire_blocks[0].slots[0].in_use);
+}
+UT_TEST(test_unknown_invalidate_still_observes_native_io_protection)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmReadSource a;
+	GcsBlockInvalidatePayload inv;
+	retire_reset(&buf, &entry, false); a = retire_arm(&buf, true);
+	inv = retire_invalidate(&a); inv.request_id++;
+	UT_ASSERT(gcs_block_invalidate_execute(&inv));
+	UT_ASSERT_EQ(retire_ack.ack_status, GCS_BLOCK_INVALIDATE_ACK_STATUS_RETRYABLE_BUSY);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_GRANT_PENDING);
+	UT_ASSERT(!retire_blocks[0].slots[0].first_fill.quiet);
+	UT_ASSERT(!retire_blocks[0].slots[0].first_fill_revoked);
+}
+
+UT_TEST(test_admitted_original_master_notice_survives_route_change)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmReadSource a;
+	GcsBlockInvalidatePayload inv; GcsBlockDonePayload done;
+	retire_reset(&buf, &entry, true); a = retire_arm(&buf, true); retire_abort(&buf, &a);
+	retire_result = CLUSTER_IC_SEND_DONE; inv = retire_invalidate(&a);
+	UT_ASSERT(gcs_block_invalidate_execute(&inv));
+	UT_ASSERT(gcs_first_fill_retry_progress(&a, true));
+	retire_route = 1; done = retire_notice(&a);
+	UT_ASSERT(gcs_first_fill_receipt_consumed(&done));
+	UT_ASSERT_EQ(retire_receipts, 0);
+	UT_ASSERT(!retire_blocks[0].slots[0].in_use);
+}
+
+int
+main(void)
+{
+	UT_PLAN(12);
+	UT_RUN(test_old_quiet_a_never_reads_or_revokes_successor_b);
+	UT_RUN(test_ack_refusal_keeps_frame_and_receipt_until_real_takeover);
+	UT_RUN(test_master_consumption_retires_count_and_only_the_exact_old_receipt);
+	UT_RUN(test_native_retirement_must_be_proven_before_quiet_publication);
+	UT_RUN(test_retry_requires_actual_ack_handoff_not_a_timer);
+	UT_RUN(test_second_retry_stays_local_until_caller_cancels);
+	UT_RUN(test_full_original_container_waits_without_eviction_or_transaction_error);
+	UT_RUN(test_never_admitted_cancel_needs_no_remote_receipt);
+	UT_RUN(test_exit_preserves_quiet_debt_and_reused_backend_cannot_take_it);
+	UT_RUN(test_master_consumed_before_wait_keeps_only_exact_local_progress);
+	UT_RUN(test_unknown_invalidate_still_observes_native_io_protection);
+	UT_RUN(test_admitted_original_master_notice_survives_route_change);
+	UT_DONE(); return ut_failed_count == 0 ? 0 : 1;
+}

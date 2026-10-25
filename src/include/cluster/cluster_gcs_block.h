@@ -1749,6 +1749,7 @@ StaticAssertDecl(offsetof(GcsBlockForwardPayload, expected_pi_watermark_scn_byte
 #define GCS_BLOCK_DONE_PENDING_S_CONFIRM ((uint8)0xa1)
 #define GCS_BLOCK_DONE_PENDING_S_NACK ((uint8)0xa2)
 #define GCS_BLOCK_DONE_PENDING_S_HOLDER ((uint8)0xa3)
+#define GCS_BLOCK_DONE_PENDING_S_RETIRED ((uint8)0xa4)
 #define GCS_BLOCK_INVALIDATE_KIND_PENDING_S ((uint8)2)
 
 static inline bool
@@ -1776,7 +1777,8 @@ GcsBlockDonePayloadPendingSKey(const GcsBlockDonePayload *p, ClusterPcmReadGrant
 	if (p == NULL || key == NULL || p->transition_id != PCM_TRANS_N_TO_S
 		|| (p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_CONFIRM
 			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_NACK
-			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_HOLDER)
+			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_HOLDER
+			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_RETIRED)
 		|| p->reserved_0[1] >= 32 || p->request_id == 0 || p->epoch == 0
 		|| p->requester_backend_id <= 0)
 		return false;
@@ -1791,6 +1793,7 @@ GcsBlockDonePayloadPendingSKey(const GcsBlockDonePayload *p, ClusterPcmReadGrant
 	key->backend_id = p->requester_backend_id;
 	return p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_NACK
 		|| p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_HOLDER
+		|| p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETIRED
 		|| p->sender_node == key->requester_node;
 }
 static inline void

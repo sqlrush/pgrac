@@ -587,6 +587,32 @@ fixture_trace_stderr(const char *fmt, ...)
 	va_end(args);
 	trace_lines++;
 }
+#include "cluster/cluster_startup_phase.h"
+#include "cluster/cluster_gcs.h"
+#include "cluster/cluster_grd.h"
+#include "cluster/cluster_membership.h"
+#include "cluster/cluster_qvotec.h"
+static unsigned trace_native_reads;
+static bool trace_blocker_known;
+static bool
+trace_blocker(BufferTag tag, int requester, ClusterPcmReadGrant *out)
+{
+	trace_native_reads++;
+	if (!trace_blocker_known) return false;
+	out->key.tag = tag; out->key.requester_node = requester;
+	out->key.request_id = 71; out->key.epoch = 1; out->key.backend_id = 7;
+	out->binding_generation = 42; out->revoking = true;
+	return true;
+}
+#define cluster_pcm_lock_read_grant_blocker_snapshot trace_blocker
+#define cluster_authority_readiness_managed() false
+#define cluster_serving_ready_check(pending, failed) false
+#define cluster_qvotec_in_quorum() true
+#define cluster_membership_is_member(node) true
+#define cluster_grd_join_remaster_active_for_shard(tag) false
+#define cluster_grd_block_view_rebuilt(tag) true
+#define cluster_gcs_block_phase_for_tag(tag) GCS_BLOCK_NORMAL
+#define cluster_gcs_lookup_master(tag) 2
 #define DataDir trace_data_dir
 #define MyProcPid getpid()
 #define GetCurrentTimestamp() INT64CONST(42)
@@ -598,6 +624,15 @@ fixture_trace_stderr(const char *fmt, ...)
 #undef GetCurrentTimestamp
 #undef MyProcPid
 #undef DataDir
+#undef cluster_gcs_lookup_master
+#undef cluster_gcs_block_phase_for_tag
+#undef cluster_grd_block_view_rebuilt
+#undef cluster_grd_join_remaster_active_for_shard
+#undef cluster_membership_is_member
+#undef cluster_qvotec_in_quorum
+#undef cluster_serving_ready_check
+#undef cluster_authority_readiness_managed
+#undef cluster_pcm_lock_read_grant_blocker_snapshot
 
 UT_TEST(test_trace_is_default_off_and_captures_exact_failed_bytes_without_overwrite)
 {
@@ -657,10 +692,48 @@ UT_TEST(test_trace_is_default_off_and_captures_exact_failed_bytes_without_overwr
 	cluster_trace_block_io = false;
 }
 
+UT_TEST(test_master_trace_default_off_then_binds_real_key_and_marks_unknown)
+{
+	ClusterPcmReadGrantKey key = {0};
+	key.request_id = 72; key.epoch = 1; key.requester_node = 3; key.backend_id = 7;
+	trace_lines = trace_native_reads = 0; cluster_trace_block_io = false;
+	cluster_block_io_trace_master(&key, "PARK", 1);
+	UT_ASSERT_EQ(trace_lines, 0); UT_ASSERT_EQ(trace_native_reads, 0);
+	cluster_trace_block_io = true; trace_blocker_known = true; errno = EDOM;
+	cluster_block_io_trace_master(&key, "PARK", 1);
+	UT_ASSERT_EQ(trace_lines, 1); UT_ASSERT_EQ(trace_native_reads, 1); UT_ASSERT_EQ(errno, EDOM);
+	UT_ASSERT(strstr(trace_line, "request=72 epoch=1 requester=3 backend=7") != NULL);
+	UT_ASSERT(strstr(trace_line, "blocker_known=1 blocker_request=71") != NULL);
+	UT_ASSERT(strstr(trace_line, "conditions_sampled=1") != NULL);
+	trace_blocker_known = false;
+	cluster_block_io_trace_master(&key, "RECHECK_WAIT", -1);
+	UT_ASSERT(strstr(trace_line, "blocker_known=0 blocker_request=0") != NULL);
+	UT_ASSERT(strstr(trace_line, "blocker_node=-1 blocker_backend=-1") != NULL);
+	cluster_trace_block_io = false;
+}
+UT_TEST(test_quiet_receipt_count_trace_is_default_off_and_reports_consumption_drop)
+{
+	ClusterPcmReadSource source = {0};
+	source.request_id = 71; source.request_epoch = 1; source.reservation_token = 1;
+	trace_lines = 0; cluster_trace_block_io = false;
+	cluster_block_io_trace_receipt(&source, "QUIET_PUBLISHED", 7, 0, 13, 17, 1);
+	UT_ASSERT_EQ(trace_lines, 0);
+	cluster_trace_block_io = true;
+	cluster_block_io_trace_receipt(&source, "QUIET_PUBLISHED", 7, 0, 13, 17, 1);
+	UT_ASSERT(strstr(trace_line, "backend_receipts=1") != NULL);
+	cluster_block_io_trace_receipt(&source, "MASTER_ACK_CONSUMED", 7, 0, 13, 17, 0);
+	UT_ASSERT(strstr(trace_line, "action=MASTER_ACK_CONSUMED") != NULL);
+	UT_ASSERT(strstr(trace_line, "backend_receipts=0") != NULL);
+	UT_ASSERT(strstr(trace_line, "owner_pid=13 incarnation=17") != NULL);
+	cluster_trace_block_io = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(14);
+	UT_RUN(test_master_trace_default_off_then_binds_real_key_and_marks_unknown);
+	UT_RUN(test_quiet_receipt_count_trace_is_default_off_and_reports_consumption_drop);
 	UT_RUN(test_typed_source_allows_disk_only_for_exact_disk_grant);
 	UT_RUN(test_source_cannot_authorize_successor_or_active_delivery);
 	UT_RUN(test_cancel_first_fill_retires_exact_reservation_before_io_cleanup);

@@ -63,6 +63,7 @@ typedef struct ClusterPcmReadGrant {
 	int32 holder_node; /* -1: disk grant, otherwise existing current/S source. */
 	bool holder_was_x;
 	bool revoking;
+	bool ack_consumed; /* Exact revoke consumed; asynchronous notice still owned. */
 } ClusterPcmReadGrant;
 
 static inline bool

@@ -705,7 +705,7 @@ typedef struct ClusterPcmPendingS {
 	TimestampTz retry_at;
 	int32 backend_id;
 	int32 holder_node;
-	uint8 phase; /* 0 empty, 1 installation pending, 2 revoke required */
+	uint8 phase; /* 0 empty, 1 install, 2 revoke, 3 consumed ACK notice owed */
 	uint8 holder_was_x;
 	uint8 reserved[6];
 } ClusterPcmPendingS;
@@ -3378,7 +3378,8 @@ cluster_resource_x_reconfig_sweep(const ResourceXReconfigToken *token, uint32 pr
 					memset(&master_state->pending_s[n], 0, sizeof(master_state->pending_s[n]));
 					master_state->pending_s_bitmap &= ~bit;
 				} else {
-					master_state->pending_s[n].phase = 2;
+					if (master_state->pending_s[n].phase != 3)
+						master_state->pending_s[n].phase = 2;
 					master_state->pending_s[n].retry_at = 0;
 				}
 			}
@@ -7475,7 +7476,7 @@ pcm_read_grant_state_valid(const ClusterPcmResourceXMasterState *state)
 				return false;
 			continue;
 		}
-		if ((claim->phase != 1 && claim->phase != 2) || claim->request_id == 0
+		if ((claim->phase != 1 && claim->phase != 2 && claim->phase != 3) || claim->request_id == 0
 			|| claim->request_id == UINT64_MAX || claim->epoch == 0 || claim->epoch == UINT64_MAX
 			|| claim->backend_id <= 0 || claim->backend_id > MaxBackends
 			|| claim->deadline <= 0 || claim->retry_at < 0
@@ -11279,6 +11280,61 @@ pcm_read_grant_snapshot(struct GrdEntry *entry, int node, const ClusterPcmPendin
 	out->holder_node = claim->holder_node;
 	out->holder_was_x = claim->holder_was_x != 0;
 	out->revoking = claim->phase == 2;
+	out->ack_consumed = claim->phase == 3;
+}
+
+/* An authenticated cancellation may precede grant registration or follow a
+ * capacity refusal. Only proven absence of this full key admits a no-grant
+ * cleanup owner; an invalid registry is never evidence of absence. */
+bool
+cluster_pcm_lock_read_grant_absent(const ClusterPcmReadGrantKey *key)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	bool absent;
+	if (key == NULL || key->requester_node < 0 || key->requester_node >= 32
+		|| key->backend_id <= 0 || key->backend_id > MaxBackends
+		|| key->request_id == 0 || key->request_id == UINT64_MAX
+		|| key->epoch == 0 || key->epoch == UINT64_MAX)
+		return false;
+	if (!pcm_entry_ref_acquire(&key->tag, false, &ref, &acquired))
+		return acquired == PCM_ENTRY_ACQUIRE_NOT_FOUND;
+	pcm_entry_lock_exclusive(ref.entry);
+	absent = pcm_read_grant_state_valid(pcm_resource_x_master_state_for_entry(ref.entry))
+		&& pcm_read_grant_lookup_locked(ref.entry, key) == NULL;
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return absent;
+}
+
+/* Diagnostic only: copy one live claim under the same entry lock as its
+ * publication/retirement. Prefer the same-node predecessor blocking B. */
+bool
+cluster_pcm_lock_read_grant_blocker_snapshot(BufferTag tag, int requester, ClusterPcmReadGrant *out)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	struct GrdEntry *entry;
+	ClusterPcmResourceXMasterState *state;
+	int selected = -1;
+	if (out == NULL || !pcm_entry_ref_acquire(&tag, false, &ref, &acquired))
+		return false;
+	entry = ref.entry;
+	pcm_entry_lock_exclusive(entry);
+	state = pcm_resource_x_master_state_for_entry(entry);
+	if (pcm_read_grant_state_valid(state)) {
+		if (requester >= 0 && requester < 32
+			&& (state->pending_s_bitmap & (UINT32_C(1) << requester)) != 0)
+			selected = requester;
+		else
+			for (int n = 0; n < 32; n++)
+				if ((state->pending_s_bitmap & (UINT32_C(1) << n)) != 0) { selected = n; break; }
+		if (selected >= 0)
+			pcm_read_grant_snapshot(entry, selected, &state->pending_s[selected], out);
+	}
+	LWLockRelease(&entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return selected >= 0;
 }
 
 PcmGcsTransitionApplyResult
@@ -11372,7 +11428,7 @@ cluster_pcm_lock_read_grant_holder_done(const ClusterPcmReadGrantKey *key, int32
 	entry = ref.entry;
 	pcm_entry_lock_exclusive(entry);
 	claim = pcm_read_grant_lookup_locked(entry, key);
-	if (claim != NULL && claim->holder_was_x && claim->holder_node == holder) {
+	if (claim != NULL && claim->phase != 3 && claim->holder_was_x && claim->holder_node == holder) {
 		PcmState mode = (PcmState)pg_atomic_read_u32(&entry->master_state);
 		if (mode == PCM_STATE_X && entry->x_holder_node == holder) {
 			cluster_pcm_transition_apply(entry, PCM_TRANS_X_TO_S_DOWNGRADE, holder);
@@ -11402,7 +11458,7 @@ cluster_pcm_lock_read_grant_done(const ClusterPcmReadGrantKey *key, int32 sender
 	pcm_entry_lock_exclusive(entry);
 	claim = pcm_read_grant_lookup_locked(entry, key);
 	state = pcm_resource_x_master_state_for_entry(entry);
-	if (claim == NULL || (sender != key->requester_node && (installed || sender != claim->holder_node)))
+	if (claim == NULL || claim->phase == 3 || (sender != key->requester_node && (installed || sender != claim->holder_node)))
 		goto done;
 	if (!installed) {
 		/* A NACK may race a successful delivery; only revoke ACK can forget it. */
@@ -11438,8 +11494,43 @@ done:
 	return applied;
 }
 
+/* Consume authority only once. The original bounded claim then owns the
+ * completion notice until the existing transport accepts it. No new request
+ * or same-node successor may overwrite that responsibility. */
 bool
 cluster_pcm_lock_read_grant_revoke_ack(const ClusterPcmReadGrantKey *key)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	struct GrdEntry *entry;
+	ClusterPcmPendingS *claim;
+	bool applied = false;
+	if (key == NULL || !pcm_entry_ref_acquire(&key->tag, false, &ref, &acquired))
+		return false;
+	entry = ref.entry;
+	pcm_entry_lock_exclusive(entry);
+	claim = pcm_read_grant_lookup_locked(entry, key);
+	if (claim != NULL && claim->phase == 3)
+		applied = true; /* duplicate ACK cannot create another notice owner */
+	else if (claim != NULL && claim->phase == 2
+		&& !((PcmState)pg_atomic_read_u32(&entry->master_state) == PCM_STATE_X
+			&& entry->x_holder_node == key->requester_node)) {
+		if ((pg_atomic_read_u32(&entry->s_holders_bitmap)
+			 & (UINT32_C(1) << key->requester_node)) != 0)
+			cluster_pcm_transition_apply(entry, PCM_TRANS_S_TO_N_INVALIDATE, key->requester_node);
+		claim->phase = 3;
+		claim->retry_at = 0;
+		applied = true;
+	}
+	LWLockRelease(&entry->entry_lock.lock);
+	if (applied)
+		ConditionVariableBroadcast(&entry->wait_cv);
+	pcm_entry_ref_release(&ref);
+	return applied;
+}
+
+bool
+cluster_pcm_lock_read_grant_retire_notice_admitted(const ClusterPcmReadGrantKey *key)
 {
 	PcmEntryRef ref;
 	PcmEntryAcquireResult acquired;
@@ -11453,12 +11544,7 @@ cluster_pcm_lock_read_grant_revoke_ack(const ClusterPcmReadGrantKey *key)
 	pcm_entry_lock_exclusive(entry);
 	claim = pcm_read_grant_lookup_locked(entry, key);
 	state = pcm_resource_x_master_state_for_entry(entry);
-	if (claim != NULL && claim->phase == 2
-		&& !((PcmState)pg_atomic_read_u32(&entry->master_state) == PCM_STATE_X
-			&& entry->x_holder_node == key->requester_node)) {
-		if ((pg_atomic_read_u32(&entry->s_holders_bitmap)
-			 & (UINT32_C(1) << key->requester_node)) != 0)
-			cluster_pcm_transition_apply(entry, PCM_TRANS_S_TO_N_INVALIDATE, key->requester_node);
+	if (claim != NULL && claim->phase == 3) {
 		memset(claim, 0, sizeof(*claim));
 		state->pending_s_bitmap &= ~(UINT32_C(1) << key->requester_node);
 		(void)pcm_resource_x_start_head_locked(entry, state, NULL);
@@ -11502,10 +11588,10 @@ cluster_pcm_lock_read_grant_work(uint32 *cursor, int worker, int workers,
 				ClusterPcmPendingS *claim = &state->pending_s[n];
 				if ((state->pending_s_bitmap & (UINT32_C(1) << n)) == 0)
 					continue;
-				if (claim->epoch != current_epoch || now >= claim->deadline
-					|| cluster_normal_stop_requested())
+				if (claim->phase != 3 && (claim->epoch != current_epoch || now >= claim->deadline
+					|| cluster_normal_stop_requested()))
 					claim->phase = 2;
-				if (claim->phase != 2 || now < claim->retry_at)
+				if ((claim->phase != 2 && claim->phase != 3) || now < claim->retry_at)
 					continue;
 				claim->retry_at = now + 10000; /* bounded asynchronous revoke retry */
 				pcm_read_grant_snapshot(entry, n, claim, out);
