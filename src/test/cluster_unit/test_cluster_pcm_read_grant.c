@@ -116,7 +116,7 @@ UT_TEST(test_native_resource_x_queue_waits_for_pending_s_before_arming_blockers)
 	UT_ASSERT_EQ(queued.incompatible_holders_bitmap, 3);
 }
 
-UT_TEST(test_timeout_requires_revoke_and_late_done_cannot_resurrect)
+UT_TEST(test_live_grant_ignores_age_but_exact_cancellation_cannot_resurrect)
 {
 	BufferTag tag = make_tag(112);
 	ClusterPcmReadGrant grant, work;
@@ -125,6 +125,13 @@ UT_TEST(test_timeout_requires_revoke_and_late_done_cannot_resurrect)
 	grant = begin_read(tag, 1, 8, 22);
 	UT_ASSERT_EQ(grant.holder_node, -1);
 	UT_ASSERT(!cluster_pcm_lock_read_grant_revoke_ack(&grant.key));
+	/* A response/lifetime period is not a failed acquisition. */
+	UT_ASSERT(!cluster_pcm_lock_read_grant_work(&cursor, 1, 2, (INT64_MAX - 10000), 1, &work));
+	UT_ASSERT_EQ(cluster_pcm_lock_read_grant_begin(tag, 1, 8, 22, 1, 20000, false, &work),
+		PCM_GCS_TRANSITION_APPLIED);
+	UT_ASSERT_EQ(work.key.request_id, grant.key.request_id);
+	UT_ASSERT(!work.revoking);
+	UT_ASSERT(cluster_pcm_lock_read_grant_done(&grant.key, 1, false));
 	UT_ASSERT(cluster_pcm_lock_read_grant_work(&cursor, 1, 2, 10001, 1, &work));
 	UT_ASSERT(work.revoking);
 	UT_ASSERT(!cluster_pcm_lock_read_grant_done(&grant.key, 1, true));
@@ -740,10 +747,56 @@ UT_TEST(test_native_absence_is_not_inferred_for_invalid_identity)
 	}
 }
 
+UT_TEST(test_unconfirmed_or_cancelling_grantee_is_never_an_image_source)
+{
+	for (int cancel = 0; cancel < 2; cancel++) {
+		BufferTag tag = make_tag(142);
+		ClusterPcmReadGrant a, b;
+		reset_fake_pcm_runtime(4);
+		a = begin_read(tag, 1, 7, 31);
+		UT_ASSERT_EQ(a.holder_node, -1);
+		if (cancel)
+			UT_ASSERT(cluster_pcm_lock_read_grant_done(&a.key, 1, false));
+		UT_ASSERT_EQ(cluster_pcm_lock_read_grant_begin(tag, 2, 8, 32, 1, 10000, true, &b),
+			PCM_GCS_TRANSITION_PENDING_X);
+		if (cancel) {
+			UT_ASSERT(cluster_pcm_lock_read_grant_revoke_ack(&a.key));
+			UT_ASSERT(cluster_pcm_lock_read_grant_retire_notice_admitted(&a.key));
+		} else {
+			UT_ASSERT(!cluster_pcm_lock_read_grant_revoke_ack(&a.key));
+			UT_ASSERT(cluster_pcm_lock_read_grant_done(&a.key, 1, true));
+		}
+		b = begin_read(tag, 2, 8, 32);
+		UT_ASSERT_EQ(b.holder_node, cancel ? -1 : 1);
+		UT_ASSERT(cluster_pcm_lock_read_grant_done(&b.key, 2, true));
+	}
+}
+
+UT_TEST(test_source_selection_skips_pending_copy_and_uses_proven_shared_holder)
+{
+	BufferTag tag = make_tag(143);
+	ClusterPcmReadGrant a, b;
+	reset_fake_pcm_runtime(4);
+	a = begin_read(tag, 0, 7, 33);
+	UT_ASSERT_EQ(a.holder_node, -1);
+	/* The fixture publishes a distinct native, already-resident S holder. */
+	UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_N_TO_S, 3));
+	b = begin_read(tag, 2, 8, 34);
+	UT_ASSERT_EQ(b.holder_node, 3);
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_S_TO_X_UPGRADE, 3),
+		PCM_GCS_TRANSITION_PENDING_X);
+	UT_ASSERT(cluster_pcm_lock_read_grant_done(&a.key, 0, false));
+	UT_ASSERT(cluster_pcm_lock_read_grant_revoke_ack(&a.key));
+	UT_ASSERT(cluster_pcm_lock_read_grant_retire_notice_admitted(&a.key));
+	UT_ASSERT(cluster_pcm_lock_read_grant_done(&b.key, 2, true));
+}
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(23);
+	UT_RUN(test_unconfirmed_or_cancelling_grantee_is_never_an_image_source);
+	UT_RUN(test_source_selection_skips_pending_copy_and_uses_proven_shared_holder);
 	UT_RUN(test_absent_old_key_cleanup_does_not_consume_successor_native_grant);
 	UT_RUN(test_native_absence_is_not_inferred_for_invalid_identity);
 	UT_RUN(test_requester_nack_can_admit_cleanup_after_initial_master_capacity_refusal);
@@ -757,7 +810,7 @@ main(void)
 	UT_RUN(test_first_disk_grant_does_not_discharge_pi_or_conversion_responsibility);
 	UT_RUN(test_pending_s_precedes_x_and_confirms_exactly);
 	UT_RUN(test_native_resource_x_queue_waits_for_pending_s_before_arming_blockers);
-	UT_RUN(test_timeout_requires_revoke_and_late_done_cannot_resurrect);
+	UT_RUN(test_live_grant_ignores_age_but_exact_cancellation_cannot_resurrect);
 	UT_RUN(test_x_downgrade_confirmation_orders_independent_notify);
 	UT_RUN(test_nack_membership_and_entry_lifetime_keep_pending_responsibility);
 	UT_RUN(test_native_master_registers_before_forward_and_replays_behind_x);

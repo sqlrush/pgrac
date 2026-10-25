@@ -11446,7 +11446,15 @@ cluster_pcm_lock_read_grant_begin(BufferTag tag, int32 requester, int32 backend,
 		&& entry->x_holder_node != requester)
 		holder = entry->x_holder_node;
 	else if (mode == PCM_STATE_S && (holders & ~bit) != 0) {
-		uint32 sources = holders & ~bit;
+		/* A disk grant publishes S liability before the recipient has any
+		 * bytes. Likewise a cancelling recipient is not a proven image
+		 * producer. Keep the incoming request queued until a real holder is
+		 * available; never forward to an unconfirmed pending-S recipient. */
+		uint32 sources = holders & ~bit & ~state->pending_s_bitmap;
+		if (sources == 0) {
+			result = PCM_GCS_TRANSITION_PENDING_X;
+			goto done;
+		}
 		holder = pcm_lowest_set_bit_node(sources);
 		if ((sources & (UINT32_C(1) << cluster_node_id)) != 0)
 			holder = cluster_node_id;
@@ -11644,7 +11652,9 @@ cluster_pcm_lock_read_grant_work(uint32 *cursor, int worker, int workers,
 				ClusterPcmPendingS *claim = &state->pending_s[n];
 				if ((state->pending_s_bitmap & (UINT32_C(1) << n)) == 0)
 					continue;
-				if (claim->phase != 3 && (claim->epoch != current_epoch || now >= claim->deadline
+				/* Time measures service, not authority. Only an explicit
+				 * cancellation, shutdown or formation change starts revocation. */
+				if (claim->phase != 3 && (claim->epoch != current_epoch
 					|| cluster_normal_stop_requested()))
 					claim->phase = 2;
 				if ((claim->phase != 2 && claim->phase != 3) || now < claim->retry_at)
