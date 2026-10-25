@@ -4218,6 +4218,8 @@ extern int cluster_pcm_local_pi_redeclare_scan_chunk(int start, int max_scan, ui
  * must exact-abort its GRANT_PENDING reservation before waiting/re-entering.
  * Terminal denials ereport(ERROR) and do not return.
  */
+/* Install permanent exit owners during buffer startup, before any read. */
+extern void cluster_gcs_block_read_source_init_backend(void);
 extern bool cluster_gcs_block_read_source_quiescent(BufferDesc *buf);
 extern void cluster_gcs_block_read_source_complete(BufferDesc *buf,
 	ClusterPcmReadSource *source, bool installed);

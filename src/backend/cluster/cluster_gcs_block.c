@@ -3210,14 +3210,28 @@ gcs_read_source_backend_exit(int code pg_attribute_unused(), Datum arg pg_attrib
 	}
 }
 
-static bool
-gcs_read_source_arm(BufferDesc *buf, ClusterPcmReadSource *source)
+void
+cluster_gcs_block_read_source_init_backend(void)
 {
-	int empty = -1;
+	/* Preserve exit order: quiesce source delivery before retiring dedup. */
+	cluster_gcs_block_dedup_register_backend_exit_hook();
 	if (!gcs_read_source_exit_registered) {
 		before_shmem_exit(gcs_read_source_backend_exit, (Datum)0);
 		gcs_read_source_exit_registered = true;
 	}
+}
+
+static bool
+gcs_read_source_arm(BufferDesc *buf, ClusterPcmReadSource *source)
+{
+	int empty = -1;
+
+	/* A permanent callback cannot be added inside ReadBuffer's temporary
+	 * PG_ENSURE_ERROR_CLEANUP bracket: its cancellation is strictly LIFO. */
+	if (!gcs_read_source_exit_registered)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			errmsg("first-read cleanup has not been initialized"),
+			errhint("Initialize buffer access before requesting a shared buffer.")));
 	for (int i = 0; i < GCS_READ_SOURCE_LEDGER_MAX; i++) {
 		GcsReadSourceAttempt *attempt = &gcs_read_source_attempts[i];
 		if (!attempt->used) {

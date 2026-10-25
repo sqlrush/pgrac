@@ -10255,6 +10255,9 @@ InitBufferPoolAccess(void)
 	 */
 	Assert(MyProc != NULL);
 	on_shmem_exit(AtProcExit_Buffers, 0);
+#ifdef USE_PGRAC_CLUSTER
+	cluster_gcs_block_read_source_init_backend();
+#endif
 }
 
 /*

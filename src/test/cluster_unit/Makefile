@@ -5432,7 +5432,7 @@ test_cluster_pcm_lock_clock_product.o: \
 		$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c \
 		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \
 		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		-Dclock_gettime=cluster_test_pcm_clock_gettime -c $< -o $@
 
 test_cluster_pcm_wait_consumer.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
@@ -9566,6 +9566,42 @@ TESTS += test_cluster_space_committed_drop
 
 TESTS += test_cluster_pcm_read_source test_cluster_pcm_read_grant
 all: test_cluster_pcm_read_source test_cluster_pcm_read_grant
+
+TESTS += test_cluster_pcm_read_exit
+all: test_cluster_pcm_read_exit
+
+# Execute the native startup wiring, persistent owners and PG LIFO operations.
+test_cluster_pcm_read_exit.inc: $(top_srcdir)/src/backend/storage/ipc/ipc.c \
+		$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c \
+		$(top_srcdir)/src/backend/cluster/cluster_gcs_block_dedup.c \
+		$(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^before_shmem_exit\(/ || /^cancel_before_shmem_exit\(/ \
+	     { print "void"; emit=1; n++ } emit { print } emit && /^}/ { emit=0 } \
+	     END { if (n != 2 || emit) exit 1 }' $< > $@.tmp
+	awk '/^dedup_backend_exit_callback\(/ { print "static void"; emit=1; n++ } \
+	     /^cluster_gcs_block_dedup_register_backend_exit_hook\(/ \
+	     { print "void"; emit=1; n++ } emit { print } emit && /^}/ { emit=0 } \
+	     END { if (n != 2 || emit) exit 1 }' \
+	     $(top_srcdir)/src/backend/cluster/cluster_gcs_block_dedup.c >> $@.tmp
+	awk '/^#define GCS_READ_SOURCE_LEDGER_MAX/ { emit=1; n++ } emit { print } \
+	     /^static bool gcs_read_source_exit_registered;/ { emit=0; done++ } \
+	     END { if (n != 1 || done != 1 || emit) exit 1 }' \
+	     $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c >> $@.tmp
+	awk '/^gcs_read_source_key\(/ { print "static ClusterPcmReadGrantKey"; emit=1; n++ } \
+	     /^gcs_read_source_backend_exit\(/ { print "static void"; emit=1; n++ } \
+	     /^cluster_gcs_block_read_source_init_backend\(/ { print "void"; emit=1; init++ } \
+	     /^gcs_read_source_arm\(/ { print "static bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (n != 3 || init > 1 || emit) exit 1 }' \
+	     $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c >> $@.tmp
+	awk '/^InitBufferPoolAccess\(/ { print "void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (n != 1 || emit) exit 1 }' \
+	     $(top_srcdir)/src/backend/storage/buffer/bufmgr.c >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pcm_read_exit: test_cluster_pcm_read_exit.c test_cluster_pcm_read_exit.inc unit_test.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_pcm_read_source_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^cluster_pcm_own_finish_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; finish_owner++ } \

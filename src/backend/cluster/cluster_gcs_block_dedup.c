@@ -459,8 +459,9 @@ cluster_gcs_block_dedup_register_backend_exit_hook(void)
 		return;
 	if (!IsUnderPostmaster)
 		return; /* only meaningful in backends */
-	if (MyBackendId <= 0)
-		return; /* auxiliary processes do not own backend ids */
+	/* Buffer access installs the hook before InitPostgres assigns an id.
+	 * Resolve the id at exit; an auxiliary process has no entries to retire.
+	 * Lazy registration during a read would displace its temporary cleanup. */
 	before_shmem_exit(dedup_backend_exit_callback, (Datum)0);
 	dedup_backend_exit_hook_registered = true;
 }
