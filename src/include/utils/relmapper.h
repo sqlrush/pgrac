@@ -109,6 +109,8 @@ extern bool cluster_relmap_producer_finish_v2(bool is_commit);
  * command-activated shared/per-db update queues through the original arm.
  * Pending CCI work, parallel workers or existing custody refuse with ERROR.
  * Both requested prepares must succeed before either active queue is reset.
+ * Recheck every saved original owner after the final prepare; refusal or
+ * ERROR keeps the whole queued batch and receipts, without rebind or retry.
  * False from an arm becomes original ERROR; ERROR leaves all queued inputs,
  * saved receipts, unfinished protection and pins/debt for original failure
  * handling. A pre-effect ERROR keeps an acquired hold for the existing

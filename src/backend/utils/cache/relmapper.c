@@ -1546,7 +1546,19 @@ cluster_relmap_producer_precommit_v2(bool is_parallel_worker)
 			(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
 			 errmsg("cluster relation map preparation could not complete before commit")));
 
-	/* All requested receipts are saved; only nofail queue retirement follows. */
+	/* A later flavour's preparation can outlive an earlier owner check.
+	 * Keep the whole input batch until every saved owner is current again. */
+	for (int slot = 0; slot < 2; slot++)
+	{
+		const ClusterRelmapProducerArmV2 *arm = &cluster_relmap_v2_arms[slot];
+
+		if (arm->armed && (!cluster_relmap_owner_matches_v2(&arm->sample)
+			|| (!arm->staged.identity.shared && MyDatabaseId != arm->staged.identity.dbid)))
+			ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+				 errmsg("cluster relation map preparation lost its original update batch owner")));
+	}
+	/* Only nofail queue retirement follows the final original-owner checks. */
 	active_shared_updates.num_mappings = 0;
 	active_local_updates.num_mappings = 0;
 }
