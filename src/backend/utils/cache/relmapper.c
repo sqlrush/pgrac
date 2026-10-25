@@ -1471,7 +1471,7 @@ cluster_relmap_producer_arm_v2(bool shared, const RelMapFile *updates)
 }
 
 static bool
-relmap_producer_finish_v2(bool is_commit, bool postcommit)
+relmap_producer_finish_v2(bool is_commit, bool keep_custody)
 {
 	if (cluster_relmap_v2_finish_entered
 		|| (!cluster_relmap_v2_arms[0].armed && !cluster_relmap_v2_arms[1].armed))
@@ -1481,7 +1481,7 @@ relmap_producer_finish_v2(bool is_commit, bool postcommit)
 	cluster_relmap_v2_finish_entered = true;
 	if (cluster_relmap_publish_arms[0].armed || cluster_relmap_publish_arms[1].armed
 		|| LWLockHeldByMe(RelationMappingLock) || LWLockHeldByMe(XidGenLock)
-		|| (postcommit && IsTransactionState()))
+		|| (is_commit && keep_custody && IsTransactionState()))
 		return false;
 	for (int slot = 0; slot < 2; slot++)
 	{
@@ -1512,7 +1512,7 @@ relmap_producer_finish_v2(bool is_commit, bool postcommit)
 			return false;
 	}
 	/* Retire local custody only. Original pins and all caller duties remain. */
-	if (!postcommit)
+	if (!keep_custody)
 	{
 		memset(cluster_relmap_v2_arms, 0, sizeof(cluster_relmap_v2_arms));
 		cluster_relmap_v2_finish_entered = false;
@@ -1616,6 +1616,49 @@ cluster_relmap_producer_postcommit_v2(void)
 		MemoryContextSwitchTo(ErrorContext);
 		EmitErrorReport();
 		relmap_producer_postcommit_failed_v2("ERROR");
+	}
+	PG_END_TRY();
+}
+
+static void relmap_producer_abort_failed_v2(const char *stage) pg_attribute_noreturn();
+
+static void
+relmap_producer_abort_failed_v2(const char *stage)
+{
+	error_context_stack = NULL;
+	MemoryContextSwitchTo(ErrorContext);
+	ereport(PANIC,
+		(errcode(ERRCODE_INTERNAL_ERROR),
+		 errmsg("cluster relation map discard could not complete during abort"),
+		 errdetail_internal("stage=%s", stage),
+		 errhidecontext(true), errhidestmt(true)));
+	pg_unreachable();
+}
+
+void
+cluster_relmap_producer_abort_v2(void)
+{
+	if (!cluster_relmap_v2_arms[0].armed && !cluster_relmap_v2_arms[1].armed)
+		return;
+
+	PG_TRY();
+	{
+		/* The original abort decision can precede TRANS_ABORT. It is the
+		 * caller's decision, never inferred from transaction-state tests. */
+		if (!relmap_producer_finish_v2(false, true))
+			relmap_producer_abort_failed_v2("DISCARD");
+		/* Keep original receipts through the last fallible operation. */
+		cluster_relmap_authority_x_unlock();
+		memset(cluster_relmap_v2_arms, 0, sizeof(cluster_relmap_v2_arms));
+		cluster_relmap_v2_finish_entered = false;
+	}
+	PG_CATCH();
+	{
+		/* Never continue native abort cleanup after an uncertain discard. */
+		error_context_stack = NULL;
+		MemoryContextSwitchTo(ErrorContext);
+		EmitErrorReport();
+		relmap_producer_abort_failed_v2("ERROR");
 	}
 	PG_END_TRY();
 }

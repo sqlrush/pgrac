@@ -90,6 +90,7 @@ static LWLock *v2_retention_lock;
 static bool v2_retention_held, v2_xidgen_held;
 static void (*v2_preserve_observer)(RelFileLocator locator, bool at_commit);
 static bool v2_terminal_context;
+static bool v2_abort_callback_context;
 static ClusterRelmapV2PairResult (*v2_pair_observer)(const ClusterRelmapV2Namespace *, ClusterRelmapV2View *);
 static bool (*v2_write_observer)(const ClusterRelmapV2Namespace *, uint64,
 	const ClusterRelmapV2Owner *, const RelMapFile *, ClusterRelmapRetentionDirectory *, LWLock *);
@@ -1072,11 +1073,16 @@ UT_TEST(unarmed_commit_preserves_other_writers_pending_and_global_lock)
 #include "test_cluster_relmap_producer_prepare.inc"
 #include "test_cluster_relmap_producer_terminal.inc"
 #include "test_cluster_relmap_postcommit.inc"
+#include "test_cluster_relmap_abort.inc"
 
 int
 main(void)
 {
-	UT_PLAN(42);
+	UT_PLAN(46);
+	UT_RUN(v2_abort_discards_all_receipts_before_unlock);
+	UT_RUN(v2_abort_refusals_keep_original_custody);
+	UT_RUN(v2_abort_partial_cleanup_is_one_shot);
+	UT_RUN(v2_abort_unlock_error_and_empty_debt_isolation);
 	UT_RUN(v2_postcommit_publishes_then_invalidates_before_unlock);
 	UT_RUN(v2_postcommit_ack_retries_keep_storage_one_shot);
 	UT_RUN(v2_postcommit_errors_and_source_loss_fail_stop);
