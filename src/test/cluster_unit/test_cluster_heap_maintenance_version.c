@@ -7241,7 +7241,7 @@ participant_publisher_lock_acquire(LWLock *lock, LWLockMode mode)
 		UT_ASSERT(mode == LW_SHARED || mode == LW_EXCLUSIVE);
 		if (mode == LW_SHARED) participant_origin_guards++;
 	} else if (lock == &CtrcShared->receipt_lock) {
-		UT_ASSERT(mode == LW_EXCLUSIVE && participant_lock_depth >= 1);
+		UT_ASSERT((mode == LW_SHARED || mode == LW_EXCLUSIVE) && participant_lock_depth >= 1);
 		UT_ASSERT(participant_lock_stack[participant_lock_depth - 1] != &CtrcShared->origin_lock);
 	} else {
 		unsigned shard;
@@ -7976,10 +7976,373 @@ UT_TEST(test_census_terminal_receipts_remain_in_complete_walk_before_native_wal)
 	}
 }
 
+/* Certificate authentication, frozen-ACK hashing/durability and cleaner scheduling
+ * are controlled inputs here. The unchanged consumer, codec, shared-pool census,
+ * lock upgrade and destructive reclaim execute their production bodies. */
+#include "port/pg_crc32c.h"
+static int certificate_worker_id = -1;
+static uint64 certificate_local_progress, certificate_table_visits;
+static unsigned certificate_wakeups, certificate_denials, certificate_upgrades;
+static const ClusterCtrcReceiptHandle *certificate_upgrade_handle;
+static unsigned certificate_upgrade_fault;
+static ClusterCtrcSealReplyResult certificate_last_result;
+static uint16 certificate_last_reason;
+
+static void
+certificate_cleaner_wakeup(void)
+{
+	UT_ASSERT_EQ(participant_lock_depth, 0); worker_pass_assert_unlocked(); certificate_wakeups++;
+}
+
+static void
+certificate_cleaner_reason(ClusterCtrcCleanerReason reason)
+{
+	UT_ASSERT_EQ(participant_lock_depth, 0); worker_pass_assert_unlocked();
+	UT_ASSERT_EQ(reason, CTRC_CLEANER_REASON_BLOCKED); certificate_denials++;
+}
+
+static ClusterCtrcAckResult
+certificate_unreached_empty_ack(ClusterCtrcParticipantEntry *participant,
+	const ClusterCtrcDurability *durability, ClusterCtrcLocalReleaseAckV1 *ack)
+{
+	(void)participant; (void)durability; (void)ack;
+	UT_ASSERT(false); /* This slice submits CERTIFICATE, never empty CLOSE. */
+	return CLUSTER_CTRC_ACK_DENIED;
+}
+
+static void
+certificate_pool_upgrade(void)
+{
+	UT_ASSERT(participant_lock_depth != 0);
+	UT_ASSERT(participant_lock_stack[participant_lock_depth - 1] != &CtrcShared->receipt_lock);
+	certificate_upgrades++;
+	/* Controlled damage at the original unlock/relock seam, not a legal
+	 * concurrent mutation while the selected participant shard is held. */
+	if (certificate_upgrade_fault != 0) {
+		const ClusterCtrcReceiptHandle *handle = certificate_upgrade_handle;
+		UT_ASSERT(handle != NULL);
+		if (certificate_upgrade_fault == 1) handle->receipt->state = CTRC_RECEIPT_CANCELLED;
+		else original_participant_participant_receipt_heads()[handle->participant_index] = 0;
+	}
+}
+#define CLUSTER_CTRC_TEST_POOL_UPGRADE() certificate_pool_upgrade()
+#define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) ((void)(kind), certificate_table_visits++)
+#define ctrc_put_u16_le original_certificate_put_u16_le
+#define ctrc_put_u32_le original_certificate_put_u32_le
+#define ctrc_put_u64_le original_certificate_put_u64_le
+#define ctrc_get_u32_le original_certificate_get_u32_le
+#define ctrc_crc32c_exact original_certificate_crc32c_exact
+#define ctrc_txn_key_encode original_certificate_txn_key_encode
+#define ctrc_seal_suboperation_valid original_certificate_seal_suboperation_valid
+#define ctrc_local_ack_shape_valid original_certificate_local_ack_shape_valid
+#define cluster_ctrc_local_release_ack_encode original_certificate_local_release_ack_encode
+#define ctrc_semantic_progress original_certificate_semantic_progress
+#define ctrc_participant_ack_entries original_certificate_participant_ack_entries
+#define ctrc_reclaim_work_find original_certificate_reclaim_work_find
+#define ctrc_receipts_reclaim_validate original_certificate_receipts_reclaim_validate
+#define ctrc_receipt_collapse_deleted_probe original_certificate_receipt_collapse_deleted_probe
+#define ctrc_receipts_reclaim_shared_locked original_certificate_receipts_reclaim_shared_locked
+#define ctrc_ack_bytes_exact original_certificate_ack_bytes_exact
+#define ctrc_frozen_ack_summary_exact original_certificate_frozen_ack_summary_exact
+#define cluster_ctrc_participant_request_apply original_certificate_participant_request_apply
+#define ctrc_participant_certificate_batch_apply_shared original_certificate_participant_certificate_batch_apply_shared
+#define cluster_ctrc_participant_certificate_batch_shared original_certificate_participant_certificate_batch_shared
+#define cluster_ctrc_participant_close_or_tombstone original_certificate_participant_close_or_tombstone
+#define cluster_ctrc_participant_close original_certificate_participant_close
+#define ctrc_receipt_entries original_participant_receipt_entries
+#define ctrc_receipt_probe_states original_participant_receipt_probe_states
+#define ctrc_receipt_links original_participant_receipt_links
+#define ctrc_participant_receipt_heads original_participant_participant_receipt_heads
+#define ctrc_receipt_chain_exact_locked original_participant_receipt_chain_exact_locked
+#define ctrc_participant_index original_participant_participant_index
+#define ctrc_participant_locks_acquire original_participant_participant_locks_acquire
+#define ctrc_participant_locks_release original_participant_participant_locks_release
+#define ctrc_participant_identity_valid original_participant_participant_identity_valid
+#define cluster_ctrc_participant_open original_participant_participant_open
+#define cluster_ctrc_empty_sha256 certificate_empty_sha256
+#define cluster_ctrc_shmem_ready original_census_shmem_ready
+#define cluster_ctrc_stat_bump original_census_stat_bump
+#define cluster_undo_cleaner_wakeup certificate_cleaner_wakeup
+#define cluster_ctrc_cleaner_reason_set certificate_cleaner_reason
+#define cluster_ctrc_participant_build_ack certificate_unreached_empty_ack
+#define CtrcWorkerId certificate_worker_id
+#define CtrcLocalProgress certificate_local_progress
+#define LWLockAcquire participant_publisher_lock_acquire
+#define LWLockRelease participant_publisher_lock_release
+#include "test_cluster_heap_ctrc_certificate.inc"
+#undef LWLockRelease
+#undef LWLockAcquire
+#undef CtrcLocalProgress
+#undef CtrcWorkerId
+#undef cluster_ctrc_participant_build_ack
+#undef cluster_ctrc_cleaner_reason_set
+#undef cluster_undo_cleaner_wakeup
+#undef cluster_ctrc_stat_bump
+#undef cluster_ctrc_shmem_ready
+#undef cluster_ctrc_empty_sha256
+#undef cluster_ctrc_participant_open
+#undef ctrc_participant_identity_valid
+#undef ctrc_participant_locks_release
+#undef ctrc_participant_locks_acquire
+#undef ctrc_participant_index
+#undef ctrc_receipt_chain_exact_locked
+#undef ctrc_participant_receipt_heads
+#undef ctrc_receipt_links
+#undef ctrc_receipt_probe_states
+#undef ctrc_receipt_entries
+#undef cluster_ctrc_participant_close
+#undef cluster_ctrc_participant_close_or_tombstone
+#undef cluster_ctrc_participant_certificate_batch_shared
+#undef ctrc_participant_certificate_batch_apply_shared
+#undef cluster_ctrc_participant_request_apply
+#undef ctrc_frozen_ack_summary_exact
+#undef ctrc_ack_bytes_exact
+#undef ctrc_receipts_reclaim_shared_locked
+#undef ctrc_receipt_collapse_deleted_probe
+#undef ctrc_receipts_reclaim_validate
+#undef ctrc_reclaim_work_find
+#undef ctrc_participant_ack_entries
+#undef ctrc_semantic_progress
+#undef cluster_ctrc_local_release_ack_encode
+#undef ctrc_local_ack_shape_valid
+#undef ctrc_seal_suboperation_valid
+#undef ctrc_txn_key_encode
+#undef ctrc_crc32c_exact
+#undef ctrc_get_u32_le
+#undef ctrc_put_u64_le
+#undef ctrc_put_u32_le
+#undef ctrc_put_u16_le
+#undef CLUSTER_CTRC_TEST_TABLE_VISIT
+#undef CLUSTER_CTRC_TEST_POOL_UPGRADE
+
+static ClusterCtrcCloseDispatch
+certificate_dispatch(const ClusterCtrcReceiptHandle *handle)
+{
+	ClusterCtrcCloseDispatch dispatch;
+	memset(&dispatch, 0, sizeof(dispatch)); dispatch.key = handle->key;
+	dispatch.participant = handle->participant->identity;
+	dispatch.grant_generation = handle->participant->grant_generation; dispatch.seal_generation = 17;
+	dispatch.suboperation = CTRC_SEAL_CERTIFICATE_COMMITTED;
+	return dispatch;
+}
+
+static bool
+census_receipt_certificate_submit(const ClusterCtrcReceiptHandle *handle)
+{
+	ClusterCtrcCloseDispatch dispatch = certificate_dispatch(handle);
+	UT_ASSERT(original_certificate_participant_certificate_batch_apply_shared(
+		&dispatch, 1, &certificate_last_result, &certificate_last_reason));
+	return certificate_last_result == CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED;
+}
+
+static void
+certificate_observers_reset(void)
+{
+	certificate_table_visits = certificate_wakeups = certificate_denials = certificate_upgrades = 0;
+	certificate_upgrade_handle = NULL; certificate_upgrade_fault = 0;
+	certificate_last_result = CTRC_SEAL_REPLY_DENIED; certificate_last_reason = UINT16_MAX;
+}
+
+/* A deliberately controlled frozen-ACK input. It is shape/CRC checked by the
+ * original codec; this fixture does not produce or authenticate its row digest,
+ * durable ACK or the certificate. Only original CANCELLED receipts are used. */
+static bool
+certificate_frozen_input(const ClusterCtrcReceiptHandle *handle)
+{
+	ClusterCtrcParticipantEntry *row = handle->participant;
+	ClusterCtrcLocalReleaseAckV1 *ack = &original_certificate_participant_ack_entries()[handle->participant_index];
+	uint8 encoded[CLUSTER_CTRC_LOCAL_ACK_BYTES];
+	if (!census_receipt_cancel_retained(handle)) return false;
+	if (original_certificate_participant_close(row, &row->identity, row->grant_generation, 17)
+		!= CLUSTER_CTRC_CLOSE_ACK_READY) return false;
+	UT_ASSERT_EQ(row->cancelled_count, 1); UT_ASSERT_EQ(row->receipt_count, 1);
+	memset(ack, 0, sizeof(*ack)); ack->transaction_key = row->key;
+	ack->grant_generation = row->grant_generation; ack->result = CTRC_ACK_RELEASED;
+	ack->flags = CTRC_ACK_FLAG_ALL_DURABLE; ack->seal_generation = row->seal_generation;
+	ack->participant_node_id = row->identity.node_id; ack->dependency_entry_count = CLUSTER_SF_DEP_MAX_ORIGINS;
+	ack->capability_record_generation = row->identity.capability_record_generation;
+	ack->participant_boot_incarnation = row->identity.boot_incarnation;
+	ack->formation_epoch = row->identity.formation_epoch; ack->admission_record_generation = row->identity.admission_record_generation;
+	ack->first_key_sequence = ack->last_key_sequence = ack->total_receipt_count = ack->cancelled_count = ack->ack_frozen_count = 1;
+	ack->minimum_journal_sequence = ack->maximum_journal_sequence = handle->receipt->publication.journal_sequence;
+	ack->row_digest_sha256[0] = 0x42; /* Controlled digest, not an actual cleaner hash. */
+	if (!original_certificate_local_release_ack_encode(ack, encoded)) return false;
+	ack->crc32c = original_certificate_get_u32_le(encoded + 412);
+	row->state = CTRC_PARTICIPANT_ACK_FROZEN; row->ack_frozen_count = 1;
+	handle->receipt->state = CTRC_RECEIPT_ACK_FROZEN;
+	certificate_observers_reset(); return true;
+}
+
+UT_TEST(test_census_premature_certificate_cannot_reclaim_retained_receipt)
+{
+	QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+	ClusterCtrcParticipantEntry before; ClusterCtrcReceipt receipt_before;
+	if (!receipt_terminal_fixture(&f, &runtime, NULL, false, &handle)) { UT_ASSERT(false); return; }
+	UT_ASSERT(census_receipt_cancel_retained(&handle)); certificate_observers_reset();
+	before = *handle.participant; receipt_before = *handle.receipt;
+	UT_ASSERT(!census_receipt_certificate_submit(&handle));
+	UT_ASSERT(memcmp(&before, handle.participant, sizeof(before)) == 0);
+	UT_ASSERT(memcmp(&receipt_before, handle.receipt, sizeof(receipt_before)) == 0);
+	UT_ASSERT(FullTransactionIdEquals(handle.participant->original_full_xid, handle.original_full_xid));
+	census_full_layout_release(&runtime);
+}
+
+UT_TEST(test_census_certificate_reclaims_only_frozen_cancelled_receiver)
+{
+	QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+	ClusterCtrcOriginEntry origin_before; uint64 origin_index;
+	if (!receipt_terminal_fixture(&f, &runtime, NULL, false, &handle)) { UT_ASSERT(false); return; }
+	UT_ASSERT(original_census_origin_index(&handle.key, &origin_index));
+	origin_before = ctrc_origin_entries()[origin_index];
+	UT_ASSERT(certificate_frozen_input(&handle));
+	UT_ASSERT(census_receipt_certificate_submit(&handle));
+	UT_ASSERT_EQ(certificate_last_reason, 0); UT_ASSERT_EQ(certificate_upgrades, 1);
+	UT_ASSERT_EQ(certificate_table_visits, runtime.capacity.receipt_entries);
+	UT_ASSERT(ctrc_bytes_zero(handle.participant, sizeof(*handle.participant)));
+	UT_ASSERT(ctrc_bytes_zero(handle.receipt, sizeof(*handle.receipt)));
+	UT_ASSERT(ctrc_bytes_zero(&original_participant_receipt_links()[handle.receipt_index], sizeof(CtrcReceiptLink)));
+	UT_ASSERT_EQ(original_participant_participant_receipt_heads()[handle.participant_index], 0);
+	UT_ASSERT(ctrc_bytes_zero(&original_certificate_participant_ack_entries()[handle.participant_index], sizeof(ClusterCtrcLocalReleaseAckV1)));
+	UT_ASSERT_EQ(original_participant_receipt_probe_states()[handle.receipt_index], CTRC_RECEIPT_PROBE_EMPTY);
+	UT_ASSERT(memcmp(&origin_before, &ctrc_origin_entries()[origin_index], sizeof(origin_before)) == 0);
+	UT_ASSERT_EQ(certificate_wakeups, 1); UT_ASSERT_EQ(certificate_denials, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->stats[CTRC_STAT_SEMANTIC_PROGRESS]), 1);
+	UT_ASSERT_EQ(participant_lock_depth, 0); UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	UT_ASSERT(!census_receipt_cancel_retained(&handle)); /* Reclaimed handle remains stale. */
+	census_full_layout_release(&runtime);
+}
+
+UT_TEST(test_census_certificate_refuses_stale_summary_or_incomplete_chain)
+{
+	for (int fault = 0; fault < 14; fault++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+		ClusterCtrcParticipantEntry before; ClusterCtrcReceipt receipt_before;
+		ClusterCtrcLocalReleaseAckV1 *ack, ack_before; ClusterCtrcCloseDispatch dispatch;
+		ClusterCtrcSealReplyResult result; uint16 reason; uint64 other;
+		if (!receipt_terminal_fixture(&f, &runtime, NULL, false, &handle)) { UT_ASSERT(false); return; }
+		UT_ASSERT(certificate_frozen_input(&handle)); dispatch = certificate_dispatch(&handle);
+		ack = &original_certificate_participant_ack_entries()[handle.participant_index];
+		other = (handle.receipt_index + 1) % runtime.capacity.receipt_entries;
+		switch (fault) {
+			case 0: dispatch.participant.boot_incarnation++; break;
+			case 1: dispatch.grant_generation++; break;
+			case 2: dispatch.seal_generation++; break;
+			case 3: ack->crc32c ^= 1; break;
+			case 4: ack->grant_generation++; break;
+			case 5: handle.participant->state = CTRC_PARTICIPANT_ACK_READY; break;
+			case 6: handle.participant->receipt_count++; break;
+			case 7: handle.participant->ack_frozen_count++; break;
+			case 8: handle.receipt->state = CTRC_RECEIPT_CANCELLED; break;
+			case 9: original_participant_participant_receipt_heads()[handle.participant_index] = 0; break;
+			case 10: original_participant_receipt_links()[handle.receipt_index].journal_generation++; break;
+			case 11: original_participant_receipt_probe_states()[handle.receipt_index] = CTRC_RECEIPT_PROBE_EMPTY; break;
+			case 12: original_participant_receipt_entries()[other].state = CTRC_RECEIPT_PREPARED; break;
+			case 13: original_participant_receipt_links()[other].journal_generation = 1; break;
+		}
+		before = *handle.participant; receipt_before = *handle.receipt; ack_before = *ack;
+		UT_ASSERT(original_certificate_participant_certificate_batch_apply_shared(&dispatch, 1, &result, &reason));
+		UT_ASSERT_EQ(result, CTRC_SEAL_REPLY_BLOCKED_RETAIN);
+		UT_ASSERT_EQ(reason, fault < 6 ? CTRC_SEAL_REASON_IDENTITY : CTRC_SEAL_REASON_ACK_UNAVAILABLE);
+		if (fault >= 6) before.state = CTRC_PARTICIPANT_BLOCKED;
+		UT_ASSERT(memcmp(&before, handle.participant, sizeof(before)) == 0);
+		UT_ASSERT(memcmp(&receipt_before, handle.receipt, sizeof(receipt_before)) == 0);
+		UT_ASSERT(memcmp(&ack_before, ack, sizeof(ack_before)) == 0);
+		UT_ASSERT(FullTransactionIdEquals(handle.participant->original_full_xid, handle.original_full_xid));
+		UT_ASSERT_EQ(certificate_upgrades, 0); UT_ASSERT_EQ(certificate_wakeups, 0);
+		UT_ASSERT_EQ(certificate_denials, 1); UT_ASSERT_EQ(participant_lock_depth, 0);
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0); census_full_layout_release(&runtime);
+	}
+}
+
+UT_TEST(test_census_certificate_preflight_keeps_all_slots_on_bad_batch)
+{
+	QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+	ClusterCtrcCloseDispatch dispatch[2]; ClusterCtrcSealReplyResult results[2];
+	ClusterCtrcParticipantEntry before; ClusterCtrcReceipt receipt_before; unsigned locks;
+	if (!receipt_terminal_fixture(&f, &runtime, NULL, false, &handle)) { UT_ASSERT(false); return; }
+	UT_ASSERT(certificate_frozen_input(&handle)); dispatch[0] = dispatch[1] = certificate_dispatch(&handle);
+	before = *handle.participant; receipt_before = *handle.receipt; locks = participant_lock_acquires;
+	UT_ASSERT(!original_certificate_participant_certificate_batch_shared(dispatch, 2, results));
+	UT_ASSERT(!original_certificate_participant_certificate_batch_shared(dispatch, 0, results));
+	UT_ASSERT(!original_certificate_participant_certificate_batch_shared(dispatch, CLUSTER_CTRC_RECLAIM_BATCH_MAX + 1, results));
+	UT_ASSERT(!original_certificate_participant_certificate_batch_shared(NULL, 1, results));
+	UT_ASSERT(!original_certificate_participant_certificate_batch_shared(dispatch, 1, NULL));
+	dispatch[0].suboperation = CTRC_SEAL_CLOSE_AND_CLEAN;
+	UT_ASSERT(!original_certificate_participant_certificate_batch_shared(dispatch, 1, results));
+	dispatch[0] = certificate_dispatch(&handle); dispatch[0].participant.node_id++;
+	UT_ASSERT(!original_certificate_participant_certificate_batch_shared(dispatch, 1, results));
+	UT_ASSERT_EQ(participant_lock_acquires, locks);
+	UT_ASSERT(memcmp(&before, handle.participant, sizeof(before)) == 0);
+	UT_ASSERT(memcmp(&receipt_before, handle.receipt, sizeof(receipt_before)) == 0);
+	UT_ASSERT_EQ(certificate_table_visits, 0); UT_ASSERT_EQ(certificate_wakeups + certificate_denials, 0);
+	census_full_layout_release(&runtime);
+}
+
+UT_TEST(test_census_certificate_upgrade_rechecks_before_first_delete)
+{
+	for (unsigned fault = 1; fault <= 2; fault++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+		ClusterCtrcLocalReleaseAckV1 before;
+		if (!receipt_terminal_fixture(&f, &runtime, NULL, false, &handle)) { UT_ASSERT(false); return; }
+		UT_ASSERT(certificate_frozen_input(&handle));
+		before = original_certificate_participant_ack_entries()[handle.participant_index];
+		certificate_upgrade_handle = &handle; certificate_upgrade_fault = fault;
+		UT_ASSERT(!census_receipt_certificate_submit(&handle));
+		UT_ASSERT_EQ(certificate_last_result, CTRC_SEAL_REPLY_BLOCKED_RETAIN);
+		UT_ASSERT_EQ(certificate_last_reason, CTRC_SEAL_REASON_ACK_UNAVAILABLE);
+		UT_ASSERT_EQ(certificate_upgrades, 1); UT_ASSERT_EQ(certificate_table_visits, runtime.capacity.receipt_entries);
+		UT_ASSERT_EQ(handle.participant->state, CTRC_PARTICIPANT_BLOCKED);
+		UT_ASSERT_EQ(handle.receipt->state, fault == 1 ? CTRC_RECEIPT_CANCELLED : CTRC_RECEIPT_ACK_FROZEN);
+		UT_ASSERT_EQ(original_participant_receipt_probe_states()[handle.receipt_index], CTRC_RECEIPT_PROBE_OCCUPIED);
+		UT_ASSERT(memcmp(&before, &original_certificate_participant_ack_entries()[handle.participant_index], sizeof(before)) == 0);
+		UT_ASSERT(FullTransactionIdEquals(handle.participant->original_full_xid, handle.original_full_xid));
+		UT_ASSERT_EQ(certificate_wakeups, 0); UT_ASSERT_EQ(certificate_denials, 1);
+		UT_ASSERT_EQ(participant_lock_depth, 0); certificate_upgrade_handle = NULL; certificate_upgrade_fault = 0;
+		census_full_layout_release(&runtime);
+	}
+}
+
+UT_TEST(test_census_certificate_receiver_retirement_keeps_origin_through_native_wal)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+		ClusterHeapFreezeXminTargetV1 targets[3]; ClusterCtrcOriginEntry origin_before;
+		uint64 origin_index, total, expected_passes, passes = 1;
+		if (!receipt_terminal_fixture(&f, &runtime, targets, batch != 0, &handle)) { UT_ASSERT(false); return; }
+		UT_ASSERT(original_census_origin_index(&handle.key, &origin_index)); origin_before = ctrc_origin_entries()[origin_index];
+		UT_ASSERT(certificate_frozen_input(&handle)); UT_ASSERT(census_receipt_certificate_submit(&handle));
+		UT_ASSERT(memcmp(&origin_before, &ctrc_origin_entries()[origin_index], sizeof(origin_before)) == 0);
+		sampler_xids[0] = 152;
+		pg_atomic_write_u64(&sampler_slots[0].cluster_top_full_xid_atomic, U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 152)));
+		total = runtime.capacity.origin_key_entries + runtime.capacity.participant_key_entries;
+		expected_passes = (total + CLUSTER_CTRC_ACTIVE_SCAN_SLICE - 1) / CLUSTER_CTRC_ACTIVE_SCAN_SLICE;
+		native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id - 1; resume_allowed = true;
+		worker_original_sample_pass_fixture(&f.cohort);
+		while (pass_pending && passes <= expected_passes) { original_worker_sample_active_pass(); passes++; }
+		UT_ASSERT_EQ(passes, expected_passes); UT_ASSERT(!pass_pending);
+		UT_ASSERT_EQ(publisher_scan.status, CTRC_ACTIVE_SCAN_COMPLETE); UT_ASSERT_EQ(publisher_scan.next_index, total);
+		UT_ASSERT_EQ(publisher_scan.unqualified_entries, 0);
+		UT_ASSERT(FullTransactionIdEquals(publisher_scan.min_full, handle.original_full_xid));
+		UT_ASSERT(ctrc_bytes_zero(handle.participant, sizeof(*handle.participant)));
+		UT_ASSERT_EQ(census_step_lock_acquires, total); UT_ASSERT_EQ(census_step_lock_releases, total);
+		f.cohort.local_registration_cut = publisher_scan;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered); UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT_EQ(participant_lock_depth, 0); census_full_layout_release(&runtime);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(196);
+	UT_PLAN(202);
+	UT_RUN(test_census_premature_certificate_cannot_reclaim_retained_receipt);
+	UT_RUN(test_census_certificate_reclaims_only_frozen_cancelled_receiver);
+	UT_RUN(test_census_certificate_refuses_stale_summary_or_incomplete_chain);
+	UT_RUN(test_census_certificate_preflight_keeps_all_slots_on_bad_batch);
+	UT_RUN(test_census_certificate_upgrade_rechecks_before_first_delete);
+	UT_RUN(test_census_certificate_receiver_retirement_keeps_origin_through_native_wal);
 	UT_RUN(test_census_original_receipt_cancel_keeps_participant_full_identity);
 	UT_RUN(test_census_original_receipt_apply_is_idempotent_and_retains_full_identity);
 	UT_RUN(test_census_mixed_receipt_dispositions_keep_original_chain_and_protection);

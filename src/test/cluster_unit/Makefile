@@ -2166,6 +2166,17 @@ test_cluster_heap_ctrc_terminal.inc: $(top_srcdir)/src/backend/cluster/cluster_t
 	     END { if (found != 13 || done != 13 || emit) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Original certificate consumer/reclaim closure; skip the original forward declaration.
+test_cluster_heap_ctrc_certificate.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk 'BEGIN { pattern = "^(ctrc_put_u16_le|ctrc_put_u32_le|ctrc_put_u64_le|ctrc_get_u32_le|ctrc_crc32c_exact|ctrc_txn_key_encode|ctrc_seal_suboperation_valid|ctrc_local_ack_shape_valid|cluster_ctrc_local_release_ack_encode|ctrc_semantic_progress|ctrc_participant_ack_entries|ctrc_reclaim_work_find|ctrc_receipts_reclaim_validate|ctrc_receipt_collapse_deleted_probe|ctrc_receipts_reclaim_shared_locked|ctrc_ack_bytes_exact|ctrc_frozen_ack_summary_exact|cluster_ctrc_participant_request_apply|ctrc_participant_certificate_batch_apply_shared|cluster_ctrc_participant_certificate_batch_shared|cluster_ctrc_participant_close_or_tombstone|cluster_ctrc_participant_close)\\(" } \
+	     /^const uint8 cluster_ctrc_empty_sha256\[32\] = \{/ { constant=1; constants++; print "static " $$0; next } \
+	     constant { print; if (/^};/) constant=0; next } \
+	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); ret=prev; sub(/^static[ \t]+/, "", ret); candidate=1; head=1; text=""; decl="" } \
+	     candidate { text=text $$0 "\n"; if (/^\{/) { head=0; if (seen[name]++) exit 1; order[++found]=name; returns[name]="static " ret } else if (head) { decl=decl $$0 "\n"; if (/;[ \t]*$$/) candidate=0 } } \
+	     candidate && /^}/ { candidate=0; body[name]=text; declaration[name]=decl; done++ } { prev=$$0 } \
+	     END { if (found != 22 || done != 22 || candidate || constant || constants != 1) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_ctrc_begin.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
 	@awk '/^cluster_ctrc_active_scan_begin\(/ { print "static bool"; emit=1; found++ } \
 	     emit { print } emit && /^}/ { emit=0; done++ } \
@@ -2200,6 +2211,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_ctrc_types.inc test_cluster_heap_ctrc_begin.inc \
 		test_cluster_heap_ctrc_step.inc test_cluster_heap_ctrc_origin.inc \
 		test_cluster_heap_ctrc_participant.inc test_cluster_heap_ctrc_terminal.inc \
+		test_cluster_heap_ctrc_certificate.inc $(top_srcdir)/src/include/port/pg_crc32c.h \
 		test_cluster_heap_freeze_cohort_current.inc \
 		test_cluster_heap_freeze_cohort_backend.inc \
 		test_cluster_heap_freeze_worker_current.inc \
@@ -5131,6 +5143,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_ctrc_origin.inc test_cluster_heap_ctrc_origin.inc.tmp
 	rm -f test_cluster_heap_ctrc_participant.inc test_cluster_heap_ctrc_participant.inc.tmp
 	rm -f test_cluster_heap_ctrc_terminal.inc test_cluster_heap_ctrc_terminal.inc.tmp
+	rm -f test_cluster_heap_ctrc_certificate.inc test_cluster_heap_ctrc_certificate.inc.tmp
 	rm -f test_cluster_heap_ctrc_attachment.inc test_cluster_heap_ctrc_attachment.inc.tmp
 	rm -f test_cluster_heap_ctrc_ready.inc test_cluster_heap_ctrc_ready.inc.tmp
 	rm -f test_cluster_heap_ctrc_init_state.inc test_cluster_heap_ctrc_init_state.inc.tmp
