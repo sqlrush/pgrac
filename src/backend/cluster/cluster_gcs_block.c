@@ -17957,8 +17957,12 @@ typedef struct GcsFirstFillMasterPark {
 	bool in_use;
 	bool cancelling;
 	bool ack_consumed;
+	bool registered;
 	GcsBlockRequestPayload request;
 	GcsBlockDedupKey key;
+	ClusterPcmReadGrant grant;
+	GcsBlockForwardPayload forward;
+	GcsBlockReplyHeader disk_reply;
 	TimestampTz retry_at;
 } GcsFirstFillMasterPark;
 static GcsFirstFillMasterPark gcs_first_fill_master_parks[GCS_FIRST_FILL_PARK_MAX];
@@ -17990,7 +17994,8 @@ gcs_first_fill_master_cancel_ack(const ClusterPcmReadGrantKey *key)
 {
 	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
 		GcsFirstFillMasterPark *park = &gcs_first_fill_master_parks[i];
-		if (park->cancelling && gcs_first_fill_master_key_matches(park, key)) {
+		if (park->cancelling && !park->registered
+			&& gcs_first_fill_master_key_matches(park, key)) {
 			park->ack_consumed = true;
 			park->retry_at = 0;
 			return true;
@@ -18022,13 +18027,13 @@ gcs_first_fill_master_deny(const GcsBlockRequestPayload *req, const GcsBlockDedu
 	gcs_block_send_reply(req->sender_node, req, status, InvalidXLogRecPtr, NULL);
 }
 
-static bool
+static GcsFirstFillMasterPark *
 gcs_first_fill_master_park(const GcsBlockRequestPayload *req, const GcsBlockDedupKey *key)
 {
 	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
 		GcsFirstFillMasterPark *park = &gcs_first_fill_master_parks[i];
 		if (park->in_use && memcmp(&park->key, key, sizeof(*key)) == 0)
-			return true;
+			return park;
 	}
 	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
 		GcsFirstFillMasterPark *park = &gcs_first_fill_master_parks[i];
@@ -18039,10 +18044,10 @@ gcs_first_fill_master_park(const GcsBlockRequestPayload *req, const GcsBlockDedu
 			park->retry_at = GetCurrentTimestamp() + 10000;
 			park->in_use = true;
 			gcs_first_fill_master_trace(req, "PARK", 0);
-			return true;
+			return park;
 		}
 	}
-	return false;
+	return NULL;
 }
 
 static bool
@@ -18051,6 +18056,17 @@ gcs_first_fill_master_cancel(const ClusterPcmReadGrantKey *key, int worker)
 	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
 		GcsFirstFillMasterPark *park = &gcs_first_fill_master_parks[i];
 		if (gcs_first_fill_master_key_matches(park, key)) {
+			if (park->registered) {
+				/* Stop local delivery first. The native claim, including a
+				 * phase-3 consumed ACK, owns revoke/notice completion. A
+				 * registered request is never a never-granted proof. */
+				park->cancelling = true;
+				park->retry_at = 0;
+				if (cluster_pcm_lock_read_grant_done(key, key->requester_node, false)
+					|| cluster_pcm_lock_read_grant_absent(key))
+					memset(park, 0, sizeof(*park));
+				return true;
+			}
 			if (!park->cancelling) {
 				park->cancelling = true;
 				park->retry_at = 0;
@@ -18117,6 +18133,63 @@ gcs_first_fill_master_cancel(const ClusterPcmReadGrantKey *key, int worker)
 	return false;
 }
 
+/* This slot owns only an unadmitted frame. Native pending-S remains the
+ * authority; its exact binding and source must still cover each send offer.
+ * A refused offer is paced locally, never returned as a requester retry. */
+static void
+gcs_first_fill_master_offer(GcsFirstFillMasterPark *park)
+{
+	ClusterPcmReadGrant current;
+	bool admitted;
+	PcmGcsTransitionApplyResult result;
+
+	result = cluster_pcm_lock_read_grant_begin(park->request.tag, park->request.sender_node,
+		park->request.requester_backend_id, park->request.request_id, park->request.epoch,
+		GetCurrentTimestamp() + 10000, false, &current);
+	if (result != PCM_GCS_TRANSITION_APPLIED) {
+		/* An earlier admitted replay can finish while this local copy is
+		 * refused. Only proven exact absence permits forgetting that copy. */
+		if (cluster_pcm_lock_read_grant_absent(&park->grant.key))
+			memset(park, 0, sizeof(*park));
+		else
+			park->retry_at = GetCurrentTimestamp() + 10000;
+		return;
+	}
+	if (current.binding_generation != park->grant.binding_generation
+		|| current.holder_node != park->grant.holder_node
+		|| current.holder_was_x != park->grant.holder_was_x) {
+		park->retry_at = GetCurrentTimestamp() + 10000;
+		gcs_first_fill_master_trace(&park->request, "OUTBOUND_BINDING_WAIT", -1);
+		return; /* A successor binding cannot authorize the saved bytes. */
+	}
+	if (park->grant.holder_node < 0) {
+		char reply[sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE];
+		ClusterICSendResult send_result;
+
+		/* Disk grants carry a saved header and canonical zero page padding.
+		 * Neither watermark nor decision is recomputed after a refusal. */
+		memset(reply, 0, sizeof(reply));
+		memcpy(reply, &park->disk_reply, sizeof(park->disk_reply));
+		send_result = gcs_block_send_envelope_or_loopback(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+			park->request.sender_node, reply, sizeof(reply));
+		cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY, send_result);
+		admitted = send_result == CLUSTER_IC_SEND_DONE || send_result == CLUSTER_IC_SEND_WOULD_BLOCK;
+	} else {
+		/* Same-instance M/H retains the existing DATA ring ownership rule. */
+		admitted = park->grant.holder_node == cluster_node_id
+			? cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+				(uint32)cluster_node_id, &park->forward, sizeof(park->forward))
+			: gcs_block_forward_send_admitted(park->grant.holder_node, &park->forward);
+		if (admitted)
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
+	}
+	gcs_first_fill_master_trace(&park->request, admitted ? "OUTBOUND_ADMITTED" : "OUTBOUND_WAIT", 0);
+	if (admitted)
+		memset(park, 0, sizeof(*park)); /* Transport/holder plus native claim now own completion. */
+	else
+		park->retry_at = GetCurrentTimestamp() + 10000;
+}
+
 static void
 gcs_block_first_fill_request(const GcsBlockRequestPayload *req, const GcsBlockDedupKey *key,
 	int worker, bool create)
@@ -18125,28 +18198,38 @@ gcs_block_first_fill_request(const GcsBlockRequestPayload *req, const GcsBlockDe
 	PcmGcsTransitionApplyResult result;
 	GcsBlockForwardPayload fwd;
 	GcsBlockReplyHeader marker;
+	GcsFirstFillMasterPark *park;
 	TimestampTz deadline = GetCurrentTimestamp()
 		+ (TimestampTz)Max(GcsBlockRequestPayloadGetLifetimeHintMs(req), 1000) * 1000;
 
 	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
-		GcsFirstFillMasterPark *park = &gcs_first_fill_master_parks[i];
-		if (park->in_use && park->cancelling && memcmp(&park->key, key, sizeof(*key)) == 0)
-			return; /* late REQUEST cannot resurrect a cancellation owner */
+		park = &gcs_first_fill_master_parks[i];
+		if (park->in_use && (park->cancelling || park->registered)
+			&& memcmp(&park->key, key, sizeof(*key)) == 0)
+			return; /* Original local owner handles delivery or cancellation. */
+	}
+	/* Reserve outbound responsibility before publishing native S liability.
+	 * Full ingress waiting is separate; never grant without a retained owner. */
+	park = gcs_first_fill_master_park(req, key);
+	if (park == NULL) {
+		gcs_first_fill_master_deny(req, key, worker, GCS_BLOCK_REPLY_DENIED_DEDUP_FULL, create);
+		return;
 	}
 	result = cluster_pcm_lock_read_grant_begin(req->tag, req->sender_node,
 		req->requester_backend_id, req->request_id, req->epoch, deadline, create, &grant);
 	gcs_first_fill_master_trace(req, "DECISION", result);
 	if (result != PCM_GCS_TRANSITION_APPLIED) {
-		if (create && result == PCM_GCS_TRANSITION_PENDING_X
-			&& gcs_first_fill_master_park(req, key))
+		if (create && result == PCM_GCS_TRANSITION_PENDING_X)
 			return; /* master observes its native queue; R never polls it */
+		memset(park, 0, sizeof(*park));
 		gcs_first_fill_master_deny(req, key, worker,
-			create && result == PCM_GCS_TRANSITION_PENDING_X ? GCS_BLOCK_REPLY_DENIED_DEDUP_FULL
-			: GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT, create);
+			GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT, create);
 		return;
 	}
 	cluster_block_io_trace_pending_s(&grant.key, "REGISTERED", 1,
 		grant.holder_node, grant.binding_generation, result);
+	park->registered = true;
+	park->grant = grant;
 	if (grant.holder_node < 0) {
 		/* Two-way disk grant. No image producer or synchronous registration. */
 		char reply[sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE];
@@ -18164,9 +18247,8 @@ gcs_block_first_fill_request(const GcsBlockRequestPayload *req, const GcsBlockDe
 		hdr->checksum = gcs_block_compute_checksum(reply + sizeof(*hdr));
 		cluster_gcs_block_dedup_install_reply(worker, key,
 			GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK, hdr, reply + sizeof(*hdr));
-		cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY,
-			gcs_block_send_envelope_or_loopback(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
-				req->sender_node, reply, sizeof(reply)));
+		park->disk_reply = *hdr;
+		gcs_first_fill_master_offer(park);
 		return;
 	}
 	memset(&fwd, 0, sizeof(fwd));
@@ -18182,16 +18264,7 @@ gcs_block_first_fill_request(const GcsBlockRequestPayload *req, const GcsBlockDe
 	GcsBlockForwardPayloadSetDowngradeRequest(&fwd, grant.holder_was_x);
 	GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&fwd,
 		cluster_pcm_lock_pi_watermark_scn_query(req->tag));
-	/* Same-instance M/H uses the existing DATA ring, not an IC self-send. */
-	if (!(grant.holder_node == cluster_node_id
-		? cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
-			(uint32)cluster_node_id, &fwd, sizeof(fwd))
-		: gcs_block_forward_send_admitted(grant.holder_node, &fwd))) {
-		(void)cluster_pcm_lock_read_grant_done(&grant.key, req->sender_node, false);
-		gcs_first_fill_master_deny(req, key, worker, GCS_BLOCK_REPLY_DENIED_PENDING_X, false);
-		return;
-	}
-	pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
+	park->forward = fwd;
 	memset(&marker, 0, sizeof(marker));
 	marker.request_id = req->request_id;
 	marker.epoch = req->epoch;
@@ -18203,6 +18276,7 @@ gcs_block_first_fill_request(const GcsBlockRequestPayload *req, const GcsBlockDe
 	GcsBlockReplyHeaderSetForwardingMasterNode(&marker, cluster_node_id);
 	cluster_gcs_block_dedup_install_reply(worker, key, GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER,
 		&marker, NULL);
+	gcs_first_fill_master_offer(park);
 }
 
 static void
@@ -18216,7 +18290,11 @@ gcs_first_fill_master_tick(int worker)
 		if (cluster_membership_get_state(saved.request.sender_node) == CLUSTER_MEMBER_DEAD
 			|| cluster_membership_get_state(saved.request.sender_node) == CLUSTER_MEMBER_REMOVED) {
 			/* Committed membership death/terminal removal, not a send refusal
-			 * or elapsed time. This park never published a pending grant. */
+			 * or elapsed time. Native membership cleanup owns published grants. */
+			if (saved.registered && !cluster_pcm_lock_read_grant_absent(&saved.grant.key)) {
+				gcs_first_fill_master_parks[i].retry_at = now + 10000;
+				continue;
+			}
 			gcs_first_fill_master_trace(&saved.request, "DEAD_REQUESTER_RETIRE", 0);
 			(void)cluster_gcs_block_dedup_mark_done(worker, &saved.key,
 				&saved.request.tag, saved.request.transition_id);
@@ -18225,6 +18303,10 @@ gcs_first_fill_master_tick(int worker)
 		}
 		if (saved.cancelling) {
 			ClusterPcmReadGrantKey key = {0};
+			if (saved.registered) {
+				(void)gcs_first_fill_master_cancel(&saved.grant.key, worker);
+				continue;
+			}
 			key.tag = saved.request.tag;
 			key.request_id = saved.request.request_id;
 			key.epoch = saved.request.epoch;
@@ -18274,8 +18356,10 @@ gcs_first_fill_master_tick(int worker)
 				continue;
 			}
 			gcs_first_fill_master_trace(&saved.request, "RECHECK_OPEN", 0);
-			gcs_first_fill_master_parks[i].in_use = false;
-			gcs_block_first_fill_request(&saved.request, &saved.key, worker, true);
+			if (saved.registered)
+				gcs_first_fill_master_offer(&gcs_first_fill_master_parks[i]);
+			else
+				gcs_block_first_fill_request(&saved.request, &saved.key, worker, true);
 		}
 	}
 }
