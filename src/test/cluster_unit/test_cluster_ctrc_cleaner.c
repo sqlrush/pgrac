@@ -162,13 +162,18 @@ static char batch_reply_logs[CLUSTER_CTRC_RECLAIM_BATCH_MAX][8192];
 BackendType MyBackendType = B_BACKEND;
 AuxProcType MyAuxProcType = NotAnAuxProcess;
 int MyProcPid = 2901;
-static PGPROC test_my_proc;
+static PGPROC native_proc_slots[2];
+#define test_my_proc native_proc_slots[0]
 PGPROC *MyProc = &test_my_proc;
 static FullTransactionId test_top_full;
 static unsigned top_full_reads;
 /* Only the new composition groups run the actual native source exit. */
 static bool native_source_exit;
 static bool native_grouped_source_exit;
+static bool native_multi_member_exit;
+static unsigned native_group_wakeups;
+static FullTransactionId native_group_wake_minimum, native_group_wake_expected;
+static ClusterSemanticActiveSampleFence native_group_wake_source;
 static bool native_publish_source;
 static unsigned native_published_samples;
 static unsigned native_group_refusals;
@@ -178,10 +183,10 @@ static VariableCacheData native_variables;
 static VariableCache native_variable_cache = &native_variables;
 static PROC_HDR native_procs;
 static PROC_HDR *native_proc_global = &native_procs;
-static TransactionId native_xids[1];
-static XidCacheStatus native_subxids[1];
-static uint8 native_status_flags[1];
-static char native_array_storage[offsetof(ProcArrayStruct, pgprocnos) + sizeof(int)]
+static TransactionId native_xids[2];
+static XidCacheStatus native_subxids[2];
+static uint8 native_status_flags[2];
+static char native_array_storage[offsetof(ProcArrayStruct, pgprocnos) + 2 * sizeof(int)]
 	pg_attribute_aligned(MAXIMUM_ALIGNOF);
 static ProcArrayStruct *procArray = (ProcArrayStruct *) native_array_storage;
 static LWLockPadded native_locks[NUM_INDIVIDUAL_LWLOCKS];
@@ -209,6 +214,7 @@ MaintainLatestCompletedXid(TransactionId latest_xid)
 	native_completed_xid = latest_xid;
 }
 static void ProcArrayGroupClearXid(PGPROC *, TransactionId);
+static void native_group_wakeup(PGSemaphore);
 
 static void
 native_unexpected_semaphore(PGSemaphore sema pg_attribute_unused())
@@ -270,7 +276,7 @@ native_sample_future(FullTransactionId reference, FullTransactionId *future,
 #include "test_cluster_ctrc_native_exit.inc"
 #define allProcs (native_procs.allProcs)
 #define PGSemaphoreLock native_unexpected_semaphore
-#define PGSemaphoreUnlock native_unexpected_semaphore
+#define PGSemaphoreUnlock native_group_wakeup
 #define pgstat_report_wait_start native_unexpected_wait_start
 #define pgstat_report_wait_end native_unexpected_wait_end
 #include "test_cluster_ctrc_native_group_exit.inc"
@@ -4917,10 +4923,24 @@ observe_native_source_lock(LWLock *lock, LWLockMode mode, bool acquire)
 			FullTransactionId future;
 			ClusterXidStripeSampleFence fence;
 
-			/* The actual leader is queued but has not acquired its lock.
-			 * A scheduled real sampler must still see the original PGPROC. */
+			/* Queue placement is a controlled scheduling leaf; the original
+			 * leader below must clear and wake both actual PGPROC records. */
+			if (native_multi_member_exit) {
+				PGPROC *member = &native_proc_slots[1];
+				uint32 first = 0;
+
+				if (member->procArrayGroupMember || !TransactionIdIsValid(member->xid))
+					abort();
+				member->procArrayGroupMember = true;
+				member->procArrayGroupMemberXid = member->xid + 2;
+				pg_atomic_write_u32(&member->procArrayGroupNext, 0);
+				if (!pg_atomic_compare_exchange_u32(&native_procs.procArrayGroupFirst, &first, 1))
+					abort();
+			}
+			/* Before content ownership, the real sampler must still see
+			 * the original oldest native identity in this complete queue. */
 			if (native_lock_held || !MyProc->procArrayGroupMember
-				|| pg_atomic_read_u32(&native_procs.procArrayGroupFirst) != 0
+				|| pg_atomic_read_u32(&native_procs.procArrayGroupFirst) != (native_multi_member_exit ? 1 : 0)
 				|| !native_procarray_sample(&reference, &future,
 					&native_group_wait_minimum, &fence))
 				abort();
@@ -4947,6 +4967,8 @@ initialize_native_source(FullTransactionId original, FullTransactionId reference
 {
 	MemSet(&native_variables, 0, sizeof(native_variables));
 	MemSet(&native_procs, 0, sizeof(native_procs));
+	MemSet(&native_proc_slots[1], 0, sizeof(native_proc_slots[1]));
+	MemSet(native_xids, 0, sizeof(native_xids));
 	MemSet(native_array_storage, 0, sizeof(native_array_storage));
 	MemSet(native_subxids, 0, sizeof(native_subxids));
 	MemSet(native_status_flags, 0, sizeof(native_status_flags));
@@ -4971,6 +4993,7 @@ initialize_native_source(FullTransactionId original, FullTransactionId reference
 	native_held_lock = NULL;
 	native_lock_acquires = native_lock_releases = native_future_reads = 0;
 	native_group_refusals = 0;
+	native_group_wakeups = 0;
 	native_group_wait_observations = 0;
 	native_group_wait_minimum = InvalidFullTransactionId;
 	test_my_proc.pgprocno = 0;
@@ -4978,6 +5001,25 @@ initialize_native_source(FullTransactionId original, FullTransactionId reference
 	pg_atomic_init_u32(&native_procs.procArrayGroupFirst, INVALID_PGPROCNO);
 	pg_atomic_init_u32(&test_my_proc.procArrayGroupNext, INVALID_PGPROCNO);
 	native_completed_xid = InvalidTransactionId;
+	native_group_wake_minimum = InvalidFullTransactionId;
+	if (native_multi_member_exit) {
+		PGPROC *member = &native_proc_slots[1];
+		FullTransactionId other = FullTransactionIdFromU64(U64FromFullTransactionId(original) + 64);
+
+		*member = test_my_proc;
+		member->pgprocno = member->pgxactoff = 1;
+		member->pid = MyProcPid + 1;
+		member->xid = member->xmin = native_xids[1] = XidFromFullTransactionId(other);
+		member->lxid = 24;
+		member->sem = (PGSemaphore)member;
+		member->subxids.xids[0] = member->xid + 1;
+		member->subxids.xids[1] = member->xid + 2;
+		native_subxids[1] = member->subxidStatus;
+		native_status_flags[1] = member->statusFlags;
+		pg_atomic_write_u64(&member->cluster_top_full_xid_atomic, U64FromFullTransactionId(other));
+		procArray->numProcs = procArray->maxProcs = 2;
+		procArray->pgprocnos[1] = 1;
+	}
 	external_lock_hook = observe_native_source_lock;
 }
 
@@ -5001,6 +5043,39 @@ assert_native_source_minimum(FullTransactionId expected)
 	UT_ASSERT(!native_lock_held);
 	UT_ASSERT_EQ(held_count, 0);
 	return minimum;
+}
+
+/* The semaphore is a leaf. Its caller is the real post-unlock leader tail. */
+static void
+native_group_wakeup(PGSemaphore sema)
+{
+	PGPROC *member = &native_proc_slots[1];
+	FullTransactionId reference, future, minimum;
+	ClusterXidStripeSampleFence fence;
+	ClusterCtrcActiveScan scan;
+
+	if (!native_multi_member_exit || !native_grouped_source_exit
+		|| native_lock_held || native_cleaner_lock_held || held_count != 0
+		|| sema != member->sem || native_group_wakeups != 0
+		|| member->procArrayGroupMember
+		|| pg_atomic_read_u32(&member->procArrayGroupNext) != INVALID_PGPROCNO
+		|| TransactionIdIsValid(member->xid) || TransactionIdIsValid(MyProc->xid)
+		|| TransactionIdIsValid(native_xids[0]) || TransactionIdIsValid(native_xids[1])
+		|| pg_atomic_read_u64(&member->cluster_top_full_xid_atomic) != 0
+		|| pg_atomic_read_u64(&MyProc->cluster_top_full_xid_atomic) != 0)
+		abort();
+	if (!native_procarray_sample(&reference, &future, &minimum, &fence)
+		|| !FullTransactionIdEquals(minimum, native_future)
+		|| !cluster_ctrc_active_scan_begin(&scan, reference))
+		abort();
+	scan.future_full = future;
+	scan.min_full = minimum;
+	finish_source_active_scan(&scan, &native_group_wake_source);
+	if (scan.status != CTRC_ACTIVE_SCAN_COMPLETE || scan.unqualified_entries != 0
+		|| !FullTransactionIdEquals(scan.min_full, native_group_wake_expected))
+		abort();
+	native_group_wake_minimum = scan.min_full;
+	native_group_wakeups++;
 }
 
 static void
@@ -5129,6 +5204,8 @@ exercise_original_producer_retention_lifecycle(bool applied)
 		TransactionId latest = key.xid + 2;
 		unsigned acquires = native_lock_acquires;
 
+		native_group_wake_source = source;
+		native_group_wake_expected = original;
 		/* Both original ordinary native end branches run only after the
 		 * actual shared owners already retain this same FullXid. */
 		native_procarray_end_transaction(MyProc, latest);
@@ -5141,7 +5218,7 @@ exercise_original_producer_retention_lifecycle(bool applied)
 			UT_ASSERT_EQ(pg_atomic_read_u32(&native_procs.procArrayGroupFirst), INVALID_PGPROCNO);
 		}
 		UT_ASSERT_EQ(native_completed_xid, latest);
-		UT_ASSERT_EQ(native_variables.xactCompletionCount, 1);
+		UT_ASSERT_EQ(native_variables.xactCompletionCount, native_multi_member_exit ? 2 : 1);
 		UT_ASSERT_EQ(native_xids[0], InvalidTransactionId);
 		UT_ASSERT_EQ(test_my_proc.xid, InvalidTransactionId);
 		UT_ASSERT_EQ(test_my_proc.xmin, InvalidTransactionId);
@@ -5152,7 +5229,25 @@ exercise_original_producer_retention_lifecycle(bool applied)
 		UT_ASSERT(!test_my_proc.subxidStatus.overflowed);
 		UT_ASSERT_EQ(native_subxids[0].count, 0);
 		UT_ASSERT(!native_subxids[0].overflowed);
-		UT_ASSERT_EQ(native_lock_acquires, acquires + (native_grouped_source_exit ? 3 : 1));
+		if (native_multi_member_exit) {
+			PGPROC *member = &native_proc_slots[1];
+
+			UT_ASSERT_EQ(native_group_wakeups, 1);
+			UT_ASSERT(FullTransactionIdEquals(native_group_wake_minimum, original));
+			UT_ASSERT_EQ(member->xid, InvalidTransactionId);
+			UT_ASSERT_EQ(member->xmin, InvalidTransactionId);
+			UT_ASSERT_EQ(member->lxid, InvalidLocalTransactionId);
+			UT_ASSERT_EQ(native_xids[1], InvalidTransactionId);
+			UT_ASSERT_EQ(pg_atomic_read_u64(&member->cluster_read_scn_atomic), 0);
+			UT_ASSERT_EQ(member->subxidStatus.count, 0);
+			UT_ASSERT(!member->subxidStatus.overflowed);
+			UT_ASSERT_EQ(native_subxids[1].count, 0);
+			UT_ASSERT(!native_subxids[1].overflowed);
+			UT_ASSERT(!member->procArrayGroupMember);
+			UT_ASSERT_EQ(pg_atomic_read_u32(&member->procArrayGroupNext), INVALID_PGPROCNO);
+		}
+		UT_ASSERT_EQ(native_lock_acquires,
+			acquires + (native_grouped_source_exit ? (native_multi_member_exit ? 5 : 3) : 1));
 		UT_ASSERT_EQ(native_lock_acquires, native_lock_releases);
 		UT_ASSERT(!native_lock_held);
 		UT_ASSERT_EQ(memcmp(origin, &before_origin, sizeof(before_origin)), 0);
@@ -5338,7 +5433,7 @@ exercise_original_producer_retention_lifecycle(bool applied)
 	UT_ASSERT_EQ(held_count, 0);
 	if (native_source_exit) {
 		assert_native_source_minimum(native_future);
-		UT_ASSERT_EQ(native_variables.xactCompletionCount, 1);
+		UT_ASSERT_EQ(native_variables.xactCompletionCount, native_multi_member_exit ? 2 : 1);
 		external_lock_hook = NULL;
 	}
 }
@@ -6338,6 +6433,30 @@ UT_TEST(test_original_worker_publication_keeps_applied_group_source_retention)
 	native_source_exit = native_grouped_source_exit = native_publish_source = false;
 }
 
+UT_TEST(test_multi_member_group_cancel_keeps_original_retention_through_wakeup)
+{
+	native_source_exit = native_grouped_source_exit = native_publish_source = true;
+	native_multi_member_exit = true;
+	native_published_samples = 0;
+	exercise_original_producer_retention_lifecycle(false);
+	UT_ASSERT_EQ(native_group_wakeups, 1);
+	UT_ASSERT_EQ(native_published_samples, 3);
+	native_multi_member_exit = false;
+	native_source_exit = native_grouped_source_exit = native_publish_source = false;
+}
+
+UT_TEST(test_multi_member_group_applied_keeps_original_retention_through_wakeup)
+{
+	native_source_exit = native_grouped_source_exit = native_publish_source = true;
+	native_multi_member_exit = true;
+	native_published_samples = 0;
+	exercise_original_producer_retention_lifecycle(true);
+	UT_ASSERT_EQ(native_group_wakeups, 1);
+	UT_ASSERT_EQ(native_published_samples, 3);
+	native_multi_member_exit = false;
+	native_source_exit = native_grouped_source_exit = native_publish_source = false;
+}
+
 int
 main(void)
 {
@@ -6345,7 +6464,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(155);
+	UT_PLAN(157);
 	UT_RUN(test_receipt_observed_identity_refusal_precedes_chain_blocking);
 	UT_RUN(test_receipt_original_identity_refusal_precedes_chain_blocking);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
@@ -6506,6 +6625,8 @@ main(void)
 	UT_RUN(test_native_group_exit_keeps_applied_receipt_and_certificate_retention);
 	UT_RUN(test_original_worker_publication_keeps_cancelled_native_source_retention);
 	UT_RUN(test_original_worker_publication_keeps_applied_group_source_retention);
+	UT_RUN(test_multi_member_group_cancel_keeps_original_retention_through_wakeup);
+	UT_RUN(test_multi_member_group_applied_keeps_original_retention_through_wakeup);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
