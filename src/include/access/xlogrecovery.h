@@ -264,6 +264,22 @@ extern bool ClusterColdRecoveryCtrcSerialRequestCurrent(
 	const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdCtrcWorkV1 *work, uint32 subject_index,
 	struct ClusterWalInputsV1 *scope, const struct ClusterRecoverySerialRequest *request);
+/* Every original replay origin, including one with no TT subject. This
+ * source-index purpose returns only the original completed-fence provisional
+ * request after revalidating the complete retained observation/manifest.
+ * Store the by-value result in disjoint caller storage. No native IR/WALR,
+ * PAGE, DATA, FPI or service right is supplied; other sources retain their
+ * own custody requirements. Nonreplay/history-only indexes refuse. */
+extern struct ClusterRecoverySerialRequest ClusterColdRecoveryCtrcReplayRequest(
+	const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 source_index);
+/* Local complete work/TX/terminal/source recheck under the exact original
+ * borrowed scope. No I/O/allocation/cleanup or recursive IR validation.
+ * Full ROOT/native-holder validation remains the owning consumer's duty. */
+extern bool ClusterColdRecoveryCtrcReplayRequestCurrent(
+	const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 source_index,
+	struct ClusterWalInputsV1 *scope, const struct ClusterRecoverySerialRequest *request);
 struct ClusterUndoBlock0Pin;
 /* Reserve the original proven target's EMPTY block0 slot without a content
  * lock. The caller releases it before the retained source scope. This is

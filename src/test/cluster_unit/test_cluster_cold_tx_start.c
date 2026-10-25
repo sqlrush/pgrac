@@ -2137,6 +2137,7 @@ UT_TEST(test_original_error_revokes_ctrc_registration_with_the_owner_slot)
 #include "test_cluster_cold_ctrc_census.inc"
 #include "test_cluster_cold_ctrc_terminals.inc"
 #include "test_cluster_cold_ctrc_source_request.inc"
+#include "test_cluster_cold_ctrc_replay_source.inc"
 
 UT_TEST(test_start_serial_request_keeps_original_subject_separate_from_new_writer)
 {
@@ -2233,7 +2234,15 @@ UT_TEST(test_c0_error_closes_target_before_ir_and_walr)
 
 int main(void)
 {
-	UT_PLAN(110);
+	UT_PLAN(118);
+	UT_RUN(test_ctrc_replay_request_rejects_stale_start_and_critical_section);
+	UT_RUN(test_ctrc_replay_request_covers_original_source_without_a_tt_subject);
+	UT_RUN(test_ctrc_replay_request_allows_empty_work_only_after_complete_observation);
+	UT_RUN(test_ctrc_replay_request_refuses_nonreplay_ambiguous_and_changed_originals);
+	UT_RUN(test_ctrc_replay_current_checks_all_terminals_without_io_or_cleanup);
+	UT_RUN(test_ctrc_replay_current_rejects_other_source_and_changed_request_bindings);
+	UT_RUN(test_ctrc_replay_request_withholds_result_after_original_late_drift);
+	UT_RUN(test_ctrc_replay_request_error_never_publishes_or_retires_original_owner);
 	UT_RUN(test_ctrc_serial_current_borrows_only_the_original_complete_scope);
 	UT_RUN(test_ctrc_serial_current_rechecks_without_manifest_io_or_scope_cleanup);
 	UT_RUN(test_ctrc_serial_current_refuses_every_changed_request_binding);
