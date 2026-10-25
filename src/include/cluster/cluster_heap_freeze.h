@@ -428,7 +428,10 @@ extern bool cluster_heap_freeze_prepare_xmin_batch_v1(
  * unchanged. Otherwise the same entered token must pass full TARGET and
  * terminal-census policy before the saved original writer/KO fence is
  * conditionally resumed under local content-X; that temporary ledger/lock is released on
- * success, refusal and ERROR, preserving the caller pin/token. No fresh grant,
+ * success, refusal and ERROR, preserving the caller pin/token. Before restoring
+ * it, the original policy/cohort current getters run without a content lock;
+ * the same entered census recheck follows their identity callbacks. An already
+ * owned content lock never invokes these unlocked getters. No fresh grant,
  * current fetch or proof request is permitted. A preexisting share lock cannot
  * be upgraded. The original ERROR/cancel continues after local cleanup.
  * It rechecks the
