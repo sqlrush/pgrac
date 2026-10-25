@@ -89,6 +89,7 @@ OBJS = \
 	cluster_page_replay_batch.o \
 	cluster_page_recovery.o \
 	cluster_page_stable_base.o \
+	cluster_page_stable_base_ctrc.o \
 	cluster_page_source.o \
 	cluster_page_set.o \
 	cluster_page_apply.o \

@@ -26007,6 +26007,7 @@ UT_TEST(test_tx_inputs_parent_subject_and_wait_revalidation)
 #include "test_cluster_control_ctrc_local_wal.inc"
 #include "test_cluster_control_ctrc_namespace.inc"
 #include "test_cluster_control_ctrc_ir.inc"
+#include "test_cluster_control_ctrc_stable.inc"
 
 /*
  * Keep the long control-root suite deterministic when an individual test
@@ -26220,6 +26221,19 @@ main(int argc, char **argv)
 	if (getenv("PGRAC_PRE2_TEST_STAMP_WORKER_ENTRY") != NULL) {
 		UT_PLAN(1);
 		UT_RUN(test_runtime_v3_failure_worker_entry_establishes_resource_owner);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_CTRC_STABLE") != NULL) {
+		UT_PLAN(8);
+		UT_RUN(test_ctrc_stable_uses_original_native_scope_and_unchanged_selector);
+		UT_RUN(test_ctrc_stable_refuses_forged_owner_and_uncovered_source_cut);
+		UT_RUN(test_ctrc_stable_checks_every_contributor_instead_of_first_owner);
+		UT_RUN(test_ctrc_stable_preserves_graph_rejection_and_budget_before_root_io);
+		UT_RUN(test_ctrc_stable_freezes_full_graph_and_source_bytes);
+		UT_RUN(test_ctrc_stable_new_native_grant_cannot_revive_old_proof);
+		UT_RUN(test_ctrc_stable_cf_wait_and_changed_root_keep_original_owners);
+		UT_RUN(test_ctrc_stable_late_scope_loss_and_error_never_publish_proof);
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
@@ -26468,7 +26482,15 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(543);
+	UT_PLAN(551);
+	UT_RUN(test_ctrc_stable_uses_original_native_scope_and_unchanged_selector);
+	UT_RUN(test_ctrc_stable_refuses_forged_owner_and_uncovered_source_cut);
+	UT_RUN(test_ctrc_stable_checks_every_contributor_instead_of_first_owner);
+	UT_RUN(test_ctrc_stable_preserves_graph_rejection_and_budget_before_root_io);
+	UT_RUN(test_ctrc_stable_freezes_full_graph_and_source_bytes);
+	UT_RUN(test_ctrc_stable_new_native_grant_cannot_revive_old_proof);
+	UT_RUN(test_ctrc_stable_cf_wait_and_changed_root_keep_original_owners);
+	UT_RUN(test_ctrc_stable_late_scope_loss_and_error_never_publish_proof);
 	UT_RUN(test_ctrc_ir_requires_native_grant_and_keeps_original_walr);
 	UT_RUN(test_ctrc_ir_subject_cannot_change_before_confirmed_release);
 	UT_RUN(test_ctrc_ir_busy_retry_and_cf_contention_retain_one_subject);
