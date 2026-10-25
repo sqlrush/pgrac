@@ -1087,7 +1087,7 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(85);
+	UT_PLAN(88);
 	UT_RUN(export_original_registration_publishes_h_before_file_visibility);
 	UT_RUN(export_original_registration_preserves_other_older_snapshot);
 	UT_RUN(export_errors_retain_original_h_until_transaction_cleanup);
@@ -1096,6 +1096,9 @@ main(void)
 	UT_RUN(restored_xmin_does_not_borrow_the_receivers_previous_scn);
 	UT_RUN(refused_xmin_install_preserves_the_receivers_original_scn);
 	UT_RUN(restored_snapshot_original_xmin_handoff_survives_source_exit);
+	UT_RUN(imported_finite_history_requires_original_source_scn_coverage);
+	UT_RUN(restored_finite_history_requires_original_source_scn_coverage);
+	UT_RUN(original_native_xmin_contract_and_older_source_protection_remain);
 	UT_RUN(parallel_serialized_snapshot_retains_original_handoff);
 	UT_RUN(parallel_serialized_unknown_history_cannot_borrow_clock);
 	UT_RUN(parallel_serialized_copy_cannot_replace_original_source_admission);

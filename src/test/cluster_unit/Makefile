@@ -9057,9 +9057,11 @@ test_cluster_snapshot_admission_vacuum.inc: $(top_srcdir)/src/backend/commands/v
 		printf "%s", body }' $< > $@
 
 test_cluster_snapshot_import_xmin.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
-	@awk '/^ProcArrayInstall(Imported|Restored)Xmin\(/ { print "bool"; emit=1; starts++ } \
+	@awk '/^procarray_snapshot_scn_covered\(/ { print "static bool"; emit=1; starts++ } \
+		/^ProcArrayInstall(Imported|Restored)XminInternal\(/ { print "static bool"; emit=1; starts++ } \
+		/^ProcArrayInstall(Imported|Restored)Xmin(WithReadScn)?\(/ { print "bool"; emit=1; starts++ } \
 		emit { print } emit && /^}$$/ { emit=0 } \
-		END { if (emit || starts != 2) exit 1 }' $< > $@
+		END { if (emit || starts != 7) exit 1 }' $< > $@
 
 test_cluster_snapshot_import_compare.inc: $(top_srcdir)/src/backend/access/transam/transam.c Makefile
 	@awk '/^TransactionIdPrecedesOrEquals\(/ { print "bool"; emit=1; starts++ } \

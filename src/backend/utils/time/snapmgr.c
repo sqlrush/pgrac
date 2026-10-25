@@ -643,6 +643,13 @@ static void
 SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid,
 					   int sourcepid, PGPROC *sourceproc)
 {
+#ifdef USE_PGRAC_CLUSTER
+	SCN source_read_scn = cluster_enabled && cluster_shared_config
+		&& sourcesnap->cluster_source == SNAPSHOT_SOURCE_CLUSTER
+		&& SCN_VALID(sourcesnap->read_scn) && sourcesnap->read_scn != (SCN) UINT64_MAX
+		? sourcesnap->read_scn : InvalidScn;
+#endif
+
 	/* Caller should have checked this already */
 	Assert(!FirstSnapshotSet);
 
@@ -711,18 +718,39 @@ SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid,
 	 */
 	if (sourceproc != NULL)
 	{
-		if (!ProcArrayInstallRestoredXmin(CurrentSnapshot->xmin, sourceproc))
+		bool installed;
+
+#ifdef USE_PGRAC_CLUSTER
+		if (SCN_VALID(source_read_scn))
+			installed = ProcArrayInstallRestoredXminWithReadScn(
+				CurrentSnapshot->xmin, sourceproc, source_read_scn);
+		else
+#endif
+			installed = ProcArrayInstallRestoredXmin(CurrentSnapshot->xmin, sourceproc);
+		if (!installed)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("could not import the requested snapshot"),
 					 errdetail("The source transaction is not running anymore.")));
 	}
-	else if (!ProcArrayInstallImportedXmin(CurrentSnapshot->xmin, sourcevxid))
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("could not import the requested snapshot"),
-				 errdetail("The source process with PID %d is not running anymore.",
-						   sourcepid)));
+	else
+	{
+		bool installed;
+
+#ifdef USE_PGRAC_CLUSTER
+		if (SCN_VALID(source_read_scn))
+			installed = ProcArrayInstallImportedXminWithReadScn(
+				CurrentSnapshot->xmin, sourcevxid, source_read_scn);
+		else
+#endif
+			installed = ProcArrayInstallImportedXmin(CurrentSnapshot->xmin, sourcevxid);
+		if (!installed)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("could not import the requested snapshot"),
+					 errdetail("The source process with PID %d is not running anymore.",
+							   sourcepid)));
+	}
 
 	/*
 	 * In transaction-snapshot mode, the first snapshot must live until end of

@@ -2851,6 +2851,23 @@ GetSnapshotData(Snapshot snapshot)
 	return snapshot;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Called under the original xmin install lock, before receiver mutation.
+ * Zero is reserved for the unchanged native xmin-only contract. */
+static bool
+procarray_snapshot_scn_covered(PGPROC *source, uint64 read_scn)
+{
+	SCN retained;
+
+	if (read_scn == InvalidScn)
+		return true;
+	retained = (SCN) pg_atomic_read_u64(&source->cluster_read_scn_atomic);
+	return read_scn != UINT64_MAX && SCN_VALID(retained)
+		&& retained != (SCN) UINT64_MAX
+		&& scn_time_cmp(retained, (SCN) read_scn) <= 0;
+}
+#endif
+
 /*
  * ProcArrayInstallImportedXmin -- install imported xmin into MyProc->xmin
  *
@@ -2861,14 +2878,17 @@ GetSnapshotData(Snapshot snapshot)
  *
  * Returns true if successful, false if source xact is no longer running.
  */
-bool
-ProcArrayInstallImportedXmin(TransactionId xmin,
-							 VirtualTransactionId *sourcevxid)
+static bool
+ProcArrayInstallImportedXminInternal(TransactionId xmin,
+									 VirtualTransactionId *sourcevxid, uint64 read_scn)
 {
 	bool		result = false;
 	ProcArrayStruct *arrayP = procArray;
 	int			index;
 
+#ifndef USE_PGRAC_CLUSTER
+	(void) read_scn;
+#endif
 	Assert(TransactionIdIsNormal(xmin));
 	if (!sourcevxid)
 		return false;
@@ -2909,6 +2929,10 @@ ProcArrayInstallImportedXmin(TransactionId xmin,
 		if (!TransactionIdIsNormal(xid) ||
 			!TransactionIdPrecedesOrEquals(xid, xmin))
 			continue;
+#ifdef USE_PGRAC_CLUSTER
+		if (!procarray_snapshot_scn_covered(proc, read_scn))
+			continue;
+#endif
 
 		/*
 		 * We're good.  Install the new xmin.  As in GetSnapshotData, set
@@ -2933,6 +2957,24 @@ ProcArrayInstallImportedXmin(TransactionId xmin,
 	return result;
 }
 
+/* Preserve the original native caller's xmin-only contract. */
+bool
+ProcArrayInstallImportedXmin(TransactionId xmin, VirtualTransactionId *sourcevxid)
+{
+	return ProcArrayInstallImportedXminInternal(xmin, sourcevxid, 0);
+}
+
+#ifdef USE_PGRAC_CLUSTER
+bool
+ProcArrayInstallImportedXminWithReadScn(TransactionId xmin,
+									  VirtualTransactionId *sourcevxid, SCN read_scn)
+{
+	if (!SCN_VALID(read_scn) || read_scn == (SCN) UINT64_MAX)
+		return false;
+	return ProcArrayInstallImportedXminInternal(xmin, sourcevxid, read_scn);
+}
+#endif
+
 /*
  * ProcArrayInstallRestoredXmin -- install restored xmin into MyProc->xmin
  *
@@ -2946,12 +2988,15 @@ ProcArrayInstallImportedXmin(TransactionId xmin,
  *
  * Returns true if successful, false if source xact is no longer running.
  */
-bool
-ProcArrayInstallRestoredXmin(TransactionId xmin, PGPROC *proc)
+static bool
+ProcArrayInstallRestoredXminInternal(TransactionId xmin, PGPROC *proc, uint64 read_scn)
 {
 	bool		result = false;
 	TransactionId xid;
 
+#ifndef USE_PGRAC_CLUSTER
+	(void) read_scn;
+#endif
 	Assert(TransactionIdIsNormal(xmin));
 	Assert(proc != NULL);
 
@@ -2969,7 +3014,11 @@ ProcArrayInstallRestoredXmin(TransactionId xmin, PGPROC *proc)
 	xid = UINT32_ACCESS_ONCE(proc->xmin);
 	if (proc->databaseId == MyDatabaseId &&
 		TransactionIdIsNormal(xid) &&
-		TransactionIdPrecedesOrEquals(xid, xmin))
+		TransactionIdPrecedesOrEquals(xid, xmin)
+#ifdef USE_PGRAC_CLUSTER
+		&& procarray_snapshot_scn_covered(proc, read_scn)
+#endif
+		)
 	{
 		/*
 		 * Install xmin and propagate the statusFlags that affect how the
@@ -2993,6 +3042,22 @@ ProcArrayInstallRestoredXmin(TransactionId xmin, PGPROC *proc)
 
 	return result;
 }
+
+bool
+ProcArrayInstallRestoredXmin(TransactionId xmin, PGPROC *proc)
+{
+	return ProcArrayInstallRestoredXminInternal(xmin, proc, 0);
+}
+
+#ifdef USE_PGRAC_CLUSTER
+bool
+ProcArrayInstallRestoredXminWithReadScn(TransactionId xmin, PGPROC *proc, SCN read_scn)
+{
+	if (!SCN_VALID(read_scn) || read_scn == (SCN) UINT64_MAX)
+		return false;
+	return ProcArrayInstallRestoredXminInternal(xmin, proc, read_scn);
+}
+#endif
 
 /*
  * GetRunningTransactionData -- returns information about running transactions.
