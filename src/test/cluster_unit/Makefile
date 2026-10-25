@@ -9090,6 +9090,8 @@ test_cluster_xid_stripe_active.inc: $(top_srcdir)/src/backend/storage/ipc/procar
 
 test_cluster_xid_stripe_evidence: test_cluster_xid_stripe_evidence.c unit_test.h \
 		test_cluster_xid_stripe_evidence.inc test_cluster_xid_stripe_active.inc \
+		test_cluster_heap_freeze_policy_current.inc \
+		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
 		test_cluster_pgproc_active_types.inc $(CLUSTER_XID_STRIPE_O) \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
 		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
