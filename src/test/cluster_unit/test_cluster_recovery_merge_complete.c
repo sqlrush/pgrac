@@ -463,10 +463,66 @@ UT_TEST(test_tx_original_proof_or_resource_loss_is_sticky)
 	}
 }
 
+UT_TEST(test_tx_request_borrows_only_exact_completed_old_subject_proofs)
+{
+	ClusterRecoveryFencePlan *plan = replayed_plan();
+	ClusterWalSourceRef sources[NODES];
+	ClusterRecoverySerialRequest request, saved;
+	uint16 thread;
+	int detail;
+	if (plan == NULL) return;
+	tx_sources(plan, sources);
+	memset(&request, 0xa5, sizeof(request)); saved = request;
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_tx_request_v1(plan, &sources[0], &request));
+	UT_ASSERT(memcmp(&request, &saved, sizeof(request)) == 0);
+	UT_ASSERT(cluster_recovery_merge_fence_plan_bind_tx_inputs_v1(plan, sources, plan->origin_count));
+	UT_ASSERT_EQ(complete(plan, &thread, &detail), CLUSTER_RECOVERY_FENCE_COMPLETE_OK);
+	UT_ASSERT(cluster_recovery_merge_fence_plan_tx_request_v1(plan, &sources[0], &request));
+	UT_ASSERT_EQ(request.mode, CLUSTER_RECOVERY_SERIAL_TX_CLOSURE);
+	UT_ASSERT(request.tx_closure_scope == NULL);
+	UT_ASSERT(memcmp(&request.duty, &plan->origins[0].duty, sizeof(request.duty)) == 0);
+	UT_ASSERT(memcmp(&request.expected_root_token, &plan->origins[0].root_token,
+		sizeof(request.expected_root_token)) == 0);
+	UT_ASSERT(request.formation == plan->origins[0].formation);
+	UT_ASSERT(request.fence_need_set == plan->origins[0].needs);
+	UT_ASSERT(request.fence_admission_set == plan->origins[0].admissions);
+	UT_ASSERT_EQ(request.acquire_timeout_ms, plan->acquire_timeout_ms_snapshot);
+	UT_ASSERT_EQ(request.release_timeout_ms, plan->acquire_timeout_ms_snapshot);
+	UT_ASSERT(!plan->serial_held && plan->retention_pin == NULL);
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_tx_request_v1(plan, &sources[0],
+		(ClusterRecoverySerialRequest *)plan));
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_tx_request_v1(plan, &sources[0],
+		(ClusterRecoverySerialRequest *)&sources[0]));
+	sources[0].claim.claim_sha256[0]++;
+	saved = request;
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_tx_request_v1(plan, &sources[0], &request));
+	UT_ASSERT(memcmp(&request, &saved, sizeof(request)) == 0);
+	drop_plan(&plan);
+}
+UT_TEST(test_tx_request_cannot_borrow_revoked_original_proof_owner)
+{
+	ClusterRecoveryFencePlan *plan = replayed_plan();
+	ClusterWalSourceRef sources[NODES];
+	ClusterRecoverySerialRequest request, saved;
+	uint16 thread;
+	int detail;
+	if (plan == NULL) return;
+	tx_sources(plan, sources);
+	UT_ASSERT(cluster_recovery_merge_fence_plan_bind_tx_inputs_v1(plan, sources, plan->origin_count));
+	UT_ASSERT_EQ(complete(plan, &thread, &detail), CLUSTER_RECOVERY_FENCE_COMPLETE_OK);
+	memset(&request, 0xa5, sizeof(request)); saved = request;
+	fence_current[4] = false;
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_tx_request_v1(plan, &sources[0], &request));
+	fence_current[4] = true;
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_tx_request_v1(plan, &sources[0], &request));
+	UT_ASSERT(memcmp(&request, &saved, sizeof(request)) == 0);
+	drop_plan(&plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(12);
 	UT_RUN(test_complete_publishes_every_origin);
 	UT_RUN(test_complete_after_preflight_seal);
 	UT_RUN(test_complete_refuses_before_any_publication);
@@ -477,6 +533,8 @@ main(void)
 	UT_RUN(test_tx_proof_owner_survives_only_complete_confirmed_handoff);
 	UT_RUN(test_tx_input_binding_is_atomic_exact_and_cannot_adopt_a_new_source);
 	UT_RUN(test_tx_original_proof_or_resource_loss_is_sticky);
+	UT_RUN(test_tx_request_borrows_only_exact_completed_old_subject_proofs);
+	UT_RUN(test_tx_request_cannot_borrow_revoked_original_proof_owner);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

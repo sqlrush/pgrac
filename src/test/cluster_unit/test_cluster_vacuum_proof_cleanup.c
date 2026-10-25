@@ -929,6 +929,11 @@ reset_fixture(void)
 	cohort_value.future_full_xid_max = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 1000));
 	cohort_value.requested_full_xid_max = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 1100));
 	cohort_value.active_full_xid_min = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 60));
+	cohort_value.local_registration_cut.status = CTRC_ACTIVE_SCAN_COMPLETE;
+	cohort_value.local_registration_cut.min_full = FullTransactionIdFromU64(cohort_value.active_full_xid_min);
+	cohort_value.local_registration_cut.future_full = FullTransactionIdFromU64(cohort_value.future_full_xid_max);
+	cohort_value.source_peer_active_full_xid_min[1] = cohort_value.active_full_xid_min;
+	cohort_value.source_peer_future_full_xid[1] = cohort_value.future_full_xid_max;
 	cohort_value.horizon_scn = 500;
 	cohort_value.source_local_horizon_scn = 600;
 	cohort_value.source_peer_horizon_scn[1] = 500;
@@ -3227,6 +3232,8 @@ UT_TEST(native_window_subset_uses_original_legal_next_not_freeze_limit)
 	 * the second creator falls outside it. */
 	cohort_value.active_full_xid_min = U64FromFullTransactionId(
 		FullTransactionIdFromEpochAndXid(1, 79));
+	cohort_value.local_registration_cut.min_full = FullTransactionIdFromU64(cohort_value.active_full_xid_min);
+	cohort_value.source_peer_active_full_xid_min[1] = cohort_value.active_full_xid_min;
 	use_candidate_value = true;
 	candidate_value.target_count = 2;
 	vacrel.shared_freeze_batch.tuple_count = 2;

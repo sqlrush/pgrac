@@ -53,7 +53,7 @@ CLUSTER_UNIT_CRYPTOHASH_O = $(top_builddir)/src/common/cryptohash.o \
 endif
 
 # Test source files (each becomes a standalone executable)
-TESTS = test_cluster_vm_read_visibility test_cluster_heap_maintenance test_cluster_vacuum_shared_mx test_cluster_heap_cr_reuse test_cluster_buffer_cr test_cluster_buffer_mapping test_cluster_pi_contribution_stream test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_shared_fs_cold_drop test_cluster_formation_restart test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime test_cluster_relation_size test_cluster_vacuum_proof_cleanup test_cluster_heap_hot_full_trace test_cluster_gcs_read_image_hops test_cluster_gcs_read_image_trace \
+TESTS = test_cluster_relmap_lock test_cluster_vm_read_visibility test_cluster_heap_maintenance test_cluster_vacuum_shared_mx test_cluster_heap_cr_reuse test_cluster_buffer_cr test_cluster_buffer_mapping test_cluster_pi_contribution_stream test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_shared_fs_cold_drop test_cluster_formation_restart test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime test_cluster_relation_size test_cluster_vacuum_proof_cleanup test_cluster_heap_hot_full_trace test_cluster_gcs_read_image_hops test_cluster_gcs_read_image_trace \
         test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_catalog_manifest test_cluster_catalog_init test_cluster_catalog_startup test_cluster_initdb_tree test_cluster_initdb_cohort \
         test_pgrac_control_binding test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker test_pgrac_fenced_cib \
         test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter \
@@ -1012,6 +1012,10 @@ test_cluster_recovery_serial: test_cluster_recovery_serial.c unit_test.h $(CLUST
 		$(CLUSTER_VERSION_O) $(CLUSTER_IR_O) $(CLUSTER_IR_LOCK_O) \
 		$(CLUSTER_DL_O) $(CLUSTER_HW_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_cold_tx_start test_cluster_recovery_merge_complete \
+test_cluster_recovery_merge_seal test_cluster_wal_inputs_product.o: \
+		$(top_srcdir)/src/include/cluster/cluster_ir.h
 
 CLUSTER_EXTERNAL_FENCE_O = test_cluster_external_fence_product.o test_cluster_same_host_fence_product.o
 PGRAC_EXTERNAL_FENCE_PROTOCOL_O = \
@@ -5001,6 +5005,10 @@ $(filter-out test_cluster_cold_tx_start test_cluster_postmaster_lwlock test_clus
 
 # Native CR metadata checks are inline in the shared descriptor definition.
 test_cluster_buffer_desc: $(top_srcdir)/src/include/storage/buf_internals.h
+
+# The standalone test includes the complete singleton implementation.
+test_cluster_relmap_lock: $(top_srcdir)/src/backend/cluster/cluster_relmap_lock.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_lock.h
 
 # The wire behavior is inline; an updated decoder must rebuild this binary.
 test_cluster_r4_wire_codec: test_cluster_r4_wire_codec.c \

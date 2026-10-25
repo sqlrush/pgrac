@@ -85,7 +85,11 @@ typedef enum ClusterRecoverySerialMode {
 	/* PGRAC: existing IR for exact pending initialization closure only.
 	 * No checkpoint substitution or ordinary page/side replay permission.
 	 * Author: SqlRush <sqlrush@gmail.com> */
-	CLUSTER_RECOVERY_SERIAL_INITIALIZER = 4
+	CLUSTER_RECOVERY_SERIAL_INITIALIZER = 4,
+	/* Original post-DONE old subject only. The retained RR token is an
+	 * immutable input binding; the scope proves current COMPLETE/history.
+	 * Same resource and native owner, never ordinary replay authority. */
+	CLUSTER_RECOVERY_SERIAL_TX_CLOSURE = 5
 } ClusterRecoverySerialMode;
 
 typedef enum ClusterRecoverySerialAcquireResult {
@@ -115,6 +119,8 @@ typedef enum ClusterRecoverySerialReleaseResult {
 	CLUSTER_RECOVERY_SERIAL_RELEASE_INVALID = 3
 } ClusterRecoverySerialReleaseResult;
 
+struct ClusterWalInputsV1;
+
 typedef struct ClusterRecoverySerialRequest {
 	ClusterRecoverySerialMode mode;
 	ClusterRecoveryDutyKey duty;
@@ -123,6 +129,7 @@ typedef struct ClusterRecoverySerialRequest {
 	const ClusterFormationWitnessV1 *formation;
 	const PgracExternalFenceNeedSetV1 *fence_need_set;
 	const PgracExternalFenceAdmissionSetV1 *fence_admission_set;
+	struct ClusterWalInputsV1 *tx_closure_scope; /* only TX_CLOSURE */
 	int32 acquire_timeout_ms;
 	int32 release_timeout_ms;
 } ClusterRecoverySerialRequest;
@@ -138,6 +145,7 @@ typedef struct ClusterRecoverySerialGuard {
 	const ClusterFormationWitnessV1 *formation;
 	const PgracExternalFenceNeedSetV1 *fence_need_set;
 	const PgracExternalFenceAdmissionSetV1 *fence_admission_set;
+	struct ClusterWalInputsV1 *tx_closure_scope; /* only TX_CLOSURE */
 	ClusterLockAcquireRequest lock_request;
 	int32 release_timeout_ms;
 } ClusterRecoverySerialGuard;
@@ -160,6 +168,8 @@ extern ClusterRecoverySerialRevalidateResult
 cluster_recovery_serial_input_revalidate(ClusterRecoverySerialGuard *guard);
 extern ClusterRecoverySerialRevalidateResult
 cluster_recovery_serial_initializer_revalidate(ClusterRecoverySerialGuard *guard);
+extern ClusterRecoverySerialRevalidateResult
+cluster_recovery_serial_tx_revalidate(ClusterRecoverySerialGuard *guard);
 extern ClusterRecoverySerialReleaseResult
 cluster_recovery_serial_release(ClusterRecoverySerialGuard *guard);
 extern ClusterRecoverySerialAcquireResult

@@ -174,6 +174,10 @@ typedef struct ClusterHeapFreezeCohortObservation {
 	uint64 source_local_horizon_scn;
 	/* Kept outside the peer identity type, which is also stored in shmem. */
 	uint64 source_peer_horizon_scn[CLUSTER_MAX_NODES];
+	/* Exact FullXids from those same peer reports; process-local only.
+	 * Local F inputs remain in the original local_registration_cut. */
+	uint64 source_peer_future_full_xid[CLUSTER_MAX_NODES];
+	uint64 source_peer_active_full_xid_min[CLUSTER_MAX_NODES];
 	/* Same original cuts as the H scalars above; never resampled on handoff. */
 	ClusterHeapFreezeHistorySourceObservationV1 source_local_history;
 	ClusterHeapFreezeHistorySourceObservationV1 source_peer_history[CLUSTER_MAX_NODES];
@@ -190,6 +194,10 @@ typedef struct ClusterHeapFreezeCohortObservation {
  * or invalidate that selected bound. The retained H must equal the original
  * SCN-time minimum of its local sample and exactly the required peer sources,
  * preserving the original fold order for equal-time values.
+ * The retained F and future maximum must also reproduce the complete original
+ * local census FullXids and exactly the required peer report FullXids. Unknown,
+ * special, exhausted or inverted source values refuse without epoch inference.
+ * These source matches are not remote authentication or retention authority.
  * Original source clock/kind/token metadata survives this handoff. Each H
  * must fit its source clock and original report kind range; UNKNOWN and
  * diagnostic tokens do not establish contributor protection or authority.

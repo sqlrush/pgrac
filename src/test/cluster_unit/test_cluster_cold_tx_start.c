@@ -8,6 +8,7 @@
 #include "access/xlogrecovery.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_recovery_merge.h"
+#include "cluster/cluster_ir.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_wal_writer.h"
@@ -58,7 +59,10 @@ static bool effects_ready;
 static bool tx_fence_current, tx_fence_subject_current;
 static unsigned tx_fence_checks;
 static bool invalidate_fence_in_pre, invalidate_fence_on_flush;
-static char tx_fence_object;
+static union {
+	ClusterRecoverySerialRequest alignment;
+	uint8 bytes[2 * sizeof(ClusterRecoverySerialRequest)];
+} tx_fence_object;
 /* Original completed fence owner is a controlled leaf here; its real
  * completion/proof lifecycle is exercised by recovery_merge_complete. */
 bool
@@ -70,9 +74,53 @@ cluster_recovery_merge_fence_plan_tx_current_v1(struct ClusterRecoveryFencePlan 
 	return tx_fence_current && (source == NULL || tx_fence_subject_current);
 }
 
+bool
+cluster_recovery_merge_fence_plan_tx_request_v1(struct ClusterRecoveryFencePlan *plan,
+	const ClusterWalSourceRef *source, ClusterRecoverySerialRequest *out)
+{
+	/* This owner leaf knows the entire opaque allocation, as the real merge
+	 * owner does. The Start wrapper must pass its actual output here. */
+	if ((uintptr_t)out <= (uintptr_t)plan
+		? (uintptr_t)plan - (uintptr_t)out < sizeof(*out)
+		: (uintptr_t)out - (uintptr_t)plan < sizeof(tx_fence_object))
+		return false;
+	if (!cluster_recovery_merge_fence_plan_tx_current_v1(plan, source)) return false;
+	memset(out, 0, sizeof(*out));
+	out->mode = CLUSTER_RECOVERY_SERIAL_TX_CLOSURE;
+	out->duty = source->claim.identity;
+	out->formation = (const ClusterFormationWitnessV1 *)&tx_fence_object;
+	out->fence_need_set = (const PgracExternalFenceNeedSetV1 *)&tx_fence_object;
+	out->fence_admission_set = (const PgracExternalFenceAdmissionSetV1 *)&tx_fence_object;
+	out->acquire_timeout_ms = out->release_timeout_ms = 1000;
+	return true;
+}
+
 static bool xid_ready, invalidate_writer_on_xid_ready;
 static void (*terminal_xid_step)(void);
 static unsigned scope_begins, scope_checks, scope_releases;
+static unsigned tx_ir_acquires, tx_ir_releases, tx_ir_waits_remaining, tx_ir_local_waits;
+static unsigned tx_ir_cancel_wait;
+static bool tx_ir_allowed, tx_ir_held, lose_tx_ir_pre, lose_tx_ir_flush;
+ClusterControlRootResult
+cluster_wal_inputs_tx_abort_acquire_v1(ClusterWalInputsV1 *inputs,
+	const ClusterRecoveryTTAbortV1 *record)
+{
+	(void)inputs; (void)record;
+	tx_ir_acquires++;
+	if (tx_ir_waits_remaining > 0) {
+		tx_ir_waits_remaining--;
+		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	}
+	tx_ir_held = tx_ir_allowed;
+	return tx_ir_allowed ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+bool
+cluster_wal_inputs_tx_abort_authorized_v1(ClusterWalInputsV1 *inputs,
+	const ClusterRecoveryTTAbortV1 *record)
+{
+	(void)inputs; (void)record;
+	return tx_ir_held;
+}
 static char observation_scope_object, observation_cursor_object;
 static unsigned observation_scope_begins, observation_census_begins, observation_steps,
 	observation_manifests, observation_census_destroys, observation_scope_releases;
@@ -173,6 +221,7 @@ cluster_wal_writer_begin(TimeLineID timeline, ClusterWalWriterToken *out)
 	if (window_region.thread_replay[2].stamp.phase == CLUSTER_RECOVERY_STAMP_PRE_INSERT) {
 		if (!pre_cut.captured) capture_pending(&pre_cut);
 		if (invalidate_fence_in_pre) tx_fence_current = false;
+		if (lose_tx_ir_pre) tx_ir_held = false;
 		if (invalidate_writer_in_pre) {
 			invalidate_writer_in_pre = false;
 			observed_writer.epoch++;
@@ -221,6 +270,13 @@ void *MemoryContextAllocExtended(MemoryContext context, Size size, int flags)
 	return calloc(1, size);
 }
 void pfree(void *ptr) { if (ptr != NULL) frees++; free(ptr); }
+void *palloc0(Size size)
+{
+	return MemoryContextAllocExtended(TopMemoryContext, size, MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+}
+volatile sig_atomic_t InterruptPending;
+void ProcessInterrupts(void) { InterruptPending = false; }
+
 ClusterUndoBlock0Result
 cluster_undo_block0_recovery_reserve(const ClusterUndoBlock0LogicalKey *logical,
 	const ClusterUndoBlock0AuthorityProof *proof, ClusterUndoBlock0Pin *pin)
@@ -365,6 +421,8 @@ cluster_wal_inputs_release_v1(ClusterWalInputsV1 **inputs)
 	}
 	if (*inputs != (ClusterWalInputsV1 *)&scope_storage) abort();
 	if (reserved_target != NULL || stamp_live) abort();
+	if (tx_ir_held) tx_ir_releases++;
+	tx_ir_held = false;
 	scope_releases++;
 	*inputs = NULL;
 }
@@ -468,6 +526,7 @@ void XLogFlush(XLogRecPtr end)
 	wal_flushes++;
 	if (invalidate_writer_on_flush) observed_writer.epoch++;
 	if (invalidate_fence_on_flush) tx_fence_current = false;
+	if (lose_tx_ir_flush) tx_ir_held = false;
 	if (flush_error) pg_re_throw();
 }
 bool cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 stamp)
@@ -535,6 +594,8 @@ static void reset(void)
 	terminal_xid_step = NULL;
 	scope_begins = scope_checks = scope_releases = fail_scope_check = 0;
 	scope_begin_ok = true;
+	tx_ir_acquires = tx_ir_releases = tx_ir_waits_remaining = tx_ir_local_waits = tx_ir_cancel_wait = 0;
+	tx_ir_allowed = true; tx_ir_held = lose_tx_ir_pre = lose_tx_ir_flush = false;
 	target_reserves = target_releases = 0;
 	target_reserve_ok = true;
 	invalidate_writer_on_reserve = false;
@@ -1667,6 +1728,13 @@ WaitLatch(Latch *latch, int events, long timeout, uint32 wait_event_info)
 	UT_ASSERT(latch == MyLatch);
 	UT_ASSERT_EQ(events, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH);
 	UT_ASSERT_EQ(timeout, 100);
+	if (wait_event_info == WAIT_EVENT_CLUSTER_THREAD_RECOVERY) {
+		tx_ir_local_waits++;
+		UT_ASSERT(reserved_target == NULL && !stamp_live && !tx_ir_held);
+		UT_ASSERT_EQ(scope_checks, 1);
+		if (tx_ir_cancel_wait == tx_ir_local_waits) ShutdownRequestPending = true;
+		return WL_TIMEOUT;
+	}
 	UT_ASSERT_EQ(wait_event_info, PG_WAIT_EXTENSION);
 	UT_ASSERT(info.cluster_tx_start != NULL && input_destroys == tx_wait_destroy_base);
 	UT_ASSERT(ClusterColdRecoveryTxCurrent(info.cluster_tx_start));
@@ -2025,9 +2093,100 @@ UT_TEST(test_original_error_revokes_ctrc_registration_with_the_owner_slot)
 #include "test_cluster_cold_ctrc_census.inc"
 #include "test_cluster_cold_ctrc_terminals.inc"
 
+UT_TEST(test_start_serial_request_keeps_original_subject_separate_from_new_writer)
+{
+	ClusterRecoverySerialRequest request, saved;
+	uint8 fence_before[sizeof(tx_fence_object)];
+	c0_subject();
+	UT_ASSERT(ClusterColdRecoveryTxSerialRequest(info.cluster_tx_start, &census.entries[0], &request));
+	UT_ASSERT_EQ(request.mode, CLUSTER_RECOVERY_SERIAL_TX_CLOSURE);
+	UT_ASSERT(request.tx_closure_scope == NULL);
+	UT_ASSERT(memcmp(&request.duty, &typed.sources[0].claim.identity, sizeof(request.duty)) == 0);
+	UT_ASSERT_NE(request.duty.origin_owner_incarnation, observed_writer.ref.claim.identity.origin_owner_incarnation);
+	saved = request; tx_fence_subject_current = false;
+	UT_ASSERT(!ClusterColdRecoveryTxSerialRequest(info.cluster_tx_start, &census.entries[0], &request));
+	UT_ASSERT(memcmp(&saved, &request, sizeof(request)) == 0);
+	tx_fence_subject_current = true;
+	UT_ASSERT(!ClusterColdRecoveryTxSerialRequest(info.cluster_tx_start, &census.entries[0],
+		(ClusterRecoverySerialRequest *)info.cluster_tx_start));
+	UT_ASSERT(!ClusterColdRecoveryTxSerialRequest(info.cluster_tx_start, &census.entries[0],
+		(ClusterRecoverySerialRequest *)&typed.sources[0]));
+	UT_ASSERT(!ClusterColdRecoveryTxSerialRequest(info.cluster_tx_start, &census.entries[0],
+		(ClusterRecoverySerialRequest *)&census.entries[0]));
+	memcpy(fence_before, &tx_fence_object, sizeof(fence_before));
+	for (size_t offset = 0; offset <= sizeof(tx_fence_object) - sizeof(request);
+		 offset += MAXIMUM_ALIGNOF) {
+		UT_ASSERT(!ClusterColdRecoveryTxSerialRequest(info.cluster_tx_start, &census.entries[0],
+			(ClusterRecoverySerialRequest *)((char *)&tx_fence_object + offset)));
+		UT_ASSERT(memcmp(fence_before, &tx_fence_object, sizeof(fence_before)) == 0);
+	}
+}
+
+UT_TEST(test_tx_ir_waits_keep_original_input_and_cancel_before_target_or_wal)
+{
+	c0_subject(); tx_ir_waits_remaining = 193;
+	UT_ASSERT(cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+	UT_ASSERT_EQ(tx_ir_acquires, 194);
+	UT_ASSERT_EQ(tx_ir_local_waits, 193);
+	UT_ASSERT_EQ(wal_inserts, 1);
+	UT_ASSERT_EQ(tx_ir_releases, 1);
+	c0_subject(); tx_ir_waits_remaining = 193; tx_ir_cancel_wait = 129;
+	UT_ASSERT(!cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+	UT_ASSERT_EQ(tx_ir_acquires, 129);
+	UT_ASSERT_EQ(tx_ir_local_waits, 129);
+	UT_ASSERT_EQ(target_reserves + stamp_prepares + wal_inserts, 0);
+	UT_ASSERT_EQ(scope_releases, 1);
+}
+
+UT_TEST(test_actual_c0_requires_new_ir_before_target_or_wal)
+{
+	c0_subject();
+	UT_ASSERT(cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+	UT_ASSERT_EQ(tx_ir_acquires, 1);
+	UT_ASSERT_EQ(tx_ir_releases, 1);
+	UT_ASSERT(!tx_ir_held);
+	c0_subject(); tx_ir_allowed = false;
+	UT_ASSERT(!cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+	UT_ASSERT_EQ(target_reserves + stamp_prepares + wal_inserts + stamp_writes, 0);
+	UT_ASSERT_EQ(scope_releases, 1);
+}
+UT_TEST(test_c0_rechecks_new_ir_at_pre_insert_and_post_flush)
+{
+	c0_subject(); lose_tx_ir_pre = true;
+	UT_ASSERT(!cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+	UT_ASSERT_EQ(wal_inserts + stamp_writes, 0);
+	UT_ASSERT_EQ(stamp_closes, 1);
+	UT_ASSERT_EQ(scope_releases, 1);
+	c0_subject(); lose_tx_ir_flush = true;
+	UT_ASSERT(!cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+	UT_ASSERT_EQ(wal_inserts, 1);
+	UT_ASSERT_EQ(stamp_writes, 0);
+	UT_ASSERT(window_region.thread_replay[2].stamp.failed);
+	UT_ASSERT_EQ(stamp_closes, 1);
+	UT_ASSERT_EQ(scope_releases, 1);
+}
+UT_TEST(test_c0_error_closes_target_before_ir_and_walr)
+{
+	volatile bool caught = false;
+	c0_subject(); flush_error = true;
+	PG_TRY();
+	{ (void)cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start); }
+	PG_CATCH(); { caught = true; }
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(stamp_closes, 1);
+	UT_ASSERT_EQ(target_releases, 1);
+	UT_ASSERT_EQ(tx_ir_releases, 1);
+	UT_ASSERT_EQ(scope_releases, 1);
+	UT_ASSERT(!tx_ir_held && !stamp_live && reserved_target == NULL);
+	UT_ASSERT(window_region.thread_replay[2].stamp.failed);
+	/* Discard only external fixture leaves on the failing parent. */
+	stamp_live = false; reserved_target = NULL; tx_ir_held = false;
+}
+
 int main(void)
 {
-	UT_PLAN(88);
+	UT_PLAN(93);
 	UT_RUN(test_ctrc_observation_requires_every_original_c0_terminal);
 	UT_RUN(test_startup_refuses_unusable_ctrc_terminal_before_independent_wait);
 	UT_RUN(test_ctrc_observation_qualifies_the_last_subject_without_rewriting_inputs);
@@ -2095,6 +2254,11 @@ int main(void)
 	UT_RUN(test_before_insert_writer_drift_does_not_create_wal_or_target_mutation);
 	UT_RUN(test_post_insert_write_or_writer_failure_retains_failed_window);
 	UT_RUN(test_post_insert_error_marks_debt_before_rethrow);
+	UT_RUN(test_start_serial_request_keeps_original_subject_separate_from_new_writer);
+	UT_RUN(test_tx_ir_waits_keep_original_input_and_cancel_before_target_or_wal);
+	UT_RUN(test_actual_c0_requires_new_ir_before_target_or_wal);
+	UT_RUN(test_c0_rechecks_new_ir_at_pre_insert_and_post_flush);
+	UT_RUN(test_c0_error_closes_target_before_ir_and_walr);
 	reset();
 	if (allocations != frees) { fprintf(stderr, "unreleased start resources\n"); return 1; }
 	UT_RUN(test_new_c0_projects_after_durability_before_original_guards_release);

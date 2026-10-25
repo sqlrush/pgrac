@@ -1211,6 +1211,8 @@ qualified_xmin_setup(QualifiedXminFixture *f, uint16 xmax_mask)
 	f->policy.freeze_limit = FullTransactionIdFromEpochAndXid(1, 100);
 	f->cohort.active_full_xid_min = U64FromFullTransactionId(f->policy.freeze_limit);
 	f->cohort.future_full_xid_max = U64FromFullTransactionId(f->policy.legal_next);
+	f->cohort.local_registration_cut.min_full = f->policy.freeze_limit;
+	f->cohort.local_registration_cut.future_full = f->policy.legal_next;
 	f->cohort.horizon_scn = 10;
 	f->cohort.source_local_horizon_scn = 10;
 	f->cohort.source_local_history.sample_clock_scn = 10;
@@ -2853,6 +2855,7 @@ UT_TEST(test_xmin_native_window_retained_through_actual_space_prepare)
 				: U64FromFullTransactionId(f.page.tuples[0].original_creator_full_xid);
 			f.policy.legal_next = FullTransactionIdFromU64(creator + UINT64CONST(0x7fffffff));
 			f.cohort.future_full_xid_max = U64FromFullTransactionId(f.policy.legal_next);
+			f.cohort.local_registration_cut.future_full = f.policy.legal_next;
 			replace_policy_in_space = &f.policy;
 			if (released) { fixture_release_original_writer(); resume_allowed = true; }
 			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 2)
@@ -3183,6 +3186,7 @@ UT_TEST(test_xmin_native_horizon_refuses_creator_outside_legal_window)
 				: U64FromFullTransactionId(f.page.tuples[0].original_creator_full_xid);
 				f.policy.legal_next = FullTransactionIdFromU64(creator + UINT64CONST(0x80000000) + past_half);
 				f.cohort.future_full_xid_max = U64FromFullTransactionId(f.policy.legal_next);
+				f.cohort.local_registration_cut.future_full = f.policy.legal_next;
 				if (released) { fixture_release_original_writer(); resume_allowed = true; }
 				UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 2)
 					: qualified_xmin_apply(&f, 0)));
@@ -3213,6 +3217,7 @@ UT_TEST(test_xmin_native_horizon_keeps_strictly_inside_legal_window)
 				: U64FromFullTransactionId(f.page.tuples[0].original_creator_full_xid);
 				f.policy.legal_next = FullTransactionIdFromU64(creator + UINT64CONST(0x7fffffff) - inside);
 				f.cohort.future_full_xid_max = U64FromFullTransactionId(f.policy.legal_next);
+				f.cohort.local_registration_cut.future_full = f.policy.legal_next;
 				if (released) { fixture_release_original_writer(); resume_allowed = true; }
 				UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 2)
 					: qualified_xmin_apply(&f, 0));
@@ -3242,6 +3247,7 @@ UT_TEST(test_xmin_native_horizon_rechecks_legal_window_after_final_target)
 				: U64FromFullTransactionId(f.page.tuples[0].original_creator_full_xid);
 			f.policy.legal_next = FullTransactionIdFromU64(creator + UINT64CONST(0x7fffffff));
 			f.cohort.future_full_xid_max = U64FromFullTransactionId(f.policy.legal_next);
+			f.cohort.local_registration_cut.future_full = f.policy.legal_next;
 			advance_legal_next_after_target = &f.policy;
 			if (released) { fixture_release_original_writer(); resume_allowed = true; }
 			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 2)

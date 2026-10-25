@@ -48,13 +48,17 @@ extern void cluster_relmap_resid_encode(ClusterResId *dst);
 /*
  * cluster_relmap_authority_x_lock -- acquire the singleton relmap-authority
  * X lock (GES; ClusterRelmapWrite wait event).  Returns false on timeout /
- * lock-service unavailability (caller fail-closes).  Must not be called
+ * lock-service unavailability or an unconfirmed prior release (caller
+ * fail-closes).  Must not be called
  * while already holding it (Assert).
  */
 extern bool cluster_relmap_authority_x_lock(void);
 
 /*
- * cluster_relmap_authority_x_unlock -- release if held (idempotent).
+ * cluster_relmap_authority_x_unlock -- release if held; a confirmed release
+ * makes later calls no-ops.  An unconfirmed coordinated release PANICs without
+ * retiring the original hold.  ERROR retains the original hold and prevents
+ * another release attempt; the abort callback then PANICs before retrying I/O.
  */
 extern void cluster_relmap_authority_x_unlock(void);
 

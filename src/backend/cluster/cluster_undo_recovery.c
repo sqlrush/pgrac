@@ -60,7 +60,7 @@ recovery_tx_abort_current(const RecoveryTxAbortScope *scope)
 {
 	return cluster_peer_mode_enabled() && cluster_undo_gcs_coherence
 		&& cluster_undo_smgr_recovery_abort_durable_v1(scope->stamp, &scope->record)
-		&& cluster_wal_inputs_tx_abort_current_v1(scope->inputs, &scope->record);
+		&& cluster_wal_inputs_tx_abort_authorized_v1(scope->inputs, &scope->record);
 }
 
 static bool

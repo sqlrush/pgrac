@@ -1178,10 +1178,58 @@ UT_TEST(test_actual_receive_rechecks_private_stream_hello_and_admission_before_p
 	receiver_view(false);
 }
 
+UT_TEST(test_original_cohort_preserves_fullxid_sources_before_native_window_refusal)
+{
+	ClusterUndoCleanerActiveSample active = original_sender_source();
+	ClusterUndoRetentionSample history;
+	ClusterHeapFreezeCohortObservation cohort;
+	ClusterHeapFreezePolicySampleV1 policy = { 0 };
+	ClusterSemanticAdmissionToken admission = { 0 };
+	ClusterHeapFreezeObservedBoundsV1 bounds, before;
+	const ClusterHeapFreezeReportV2 *peer;
+	unsigned reads, future_reads;
+
+	sender_sample_clock = 700;
+	sender_history_reads = 0;
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&history));
+	assert_actual_history_report(&active, &history, 1);
+	install_controlled_peer_report(&active);
+	UT_ASSERT_EQ(undo_horizon_v2_cohort_observe(&cohort, NULL, NULL), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	peer = &sender_state.freeze_slots[1].view.report;
+	UT_ASSERT_EQ(cohort.source_peer_active_full_xid_min[1], peer->active_full_xid_min);
+	UT_ASSERT_EQ(cohort.source_peer_future_full_xid[1], peer->future_full_xid);
+	UT_ASSERT_EQ(cohort.source_peer_active_full_xid_min[65], 0);
+	UT_ASSERT_EQ(cohort.source_peer_future_full_xid[65], 0);
+	UT_ASSERT(FullTransactionIdEquals(cohort.local_registration_cut.min_full, active.scan.min_full));
+	policy.legal_next = policy.freeze_limit = active.scan.future_full;
+	admission.entered = true;
+	admission.record_generation = cohort.record_generation;
+	admission.formation_epoch = cohort.formation_epoch;
+	reads = sender_history_reads; future_reads = native_future_reads;
+	/* This original fixture deliberately retains epoch7 below epoch9 N.
+	 * Preserve that complete identity; the existing native past-halfspace
+	 * gate must still refuse. Do not relabel an epoch to manufacture a plan. */
+	UT_ASSERT(U64FromFullTransactionId(policy.legal_next)
+		- U64FromFullTransactionId(active.scan.min_full) >= UINT64CONST(0x80000000));
+	memset(&bounds, 0xa5, sizeof(bounds)); before = bounds;
+	UT_ASSERT(!cluster_heap_freeze_observed_bounds_v1(&policy, &cohort, &admission, 0, &bounds));
+	UT_ASSERT(memcmp(&bounds, &before, sizeof(bounds)) == 0);
+	UT_ASSERT_EQ(sender_history_reads, reads);
+	UT_ASSERT_EQ(native_future_reads, future_reads);
+	/* Missing source data also stays closed here. Specific source-check
+	 * sensitivity is isolated by the pure-bounds fixture's legal window. */
+	cohort.source_peer_active_full_xid_min[1] = 0;
+	memset(&bounds, 0xa5, sizeof(bounds)); before = bounds;
+	UT_ASSERT(!cluster_heap_freeze_observed_bounds_v1(&policy, &cohort, &admission, 0, &bounds));
+	UT_ASSERT(memcmp(&bounds, &before, sizeof(bounds)) == 0);
+	UT_ASSERT_EQ(sender_history_reads, reads);
+	UT_ASSERT_EQ(native_future_reads, future_reads);
+}
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(18);
 	UT_RUN(test_original_protection_exit_and_complete_worker_reach_v2_wire);
 	UT_RUN(test_actual_foreign_receipt_revokes_old_report_and_blocks_new_unqualified_report);
 	UT_RUN(test_actual_foreign_close_revokes_old_report_and_blocks_new_unqualified_report);
@@ -1199,5 +1247,6 @@ main(void)
 	UT_RUN(test_actual_sender_bytes_reach_original_receive_without_origin_relabel);
 	UT_RUN(test_actual_receive_unproven_ingress_preserves_last_accepted_slot);
 	UT_RUN(test_actual_receive_rechecks_private_stream_hello_and_admission_before_publish);
+	UT_RUN(test_original_cohort_preserves_fullxid_sources_before_native_window_refusal);
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -237,6 +237,12 @@ extern bool ClusterColdRecoveryTxC0Candidate(
 	const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdTopTxCensusEntryV1 *subject,
 	struct ClusterRecoveryTTAbortDerivationV1 *out);
+struct ClusterRecoverySerialRequest;
+/* Original C0 subject/source and completed isolation owner only. Provisional
+ * request bindings, with no grant or replacement of the old duty identity. */
+extern bool ClusterColdRecoveryTxSerialRequest(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject,
+	struct ClusterRecoverySerialRequest *out);
 struct ClusterUndoBlock0Pin;
 /* Reserve the original proven target's EMPTY block0 slot without a content
  * lock. The caller releases it before the retained source scope. This is

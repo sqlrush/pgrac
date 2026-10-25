@@ -25,6 +25,7 @@
 #include "cluster/cluster_guc.h" /* cluster_ges_request_timeout_ms */
 #include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_ir.h"
+#include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_shmem.h"
@@ -210,7 +211,8 @@ recovery_serial_request_valid(const ClusterRecoverySerialRequest *request)
 			   || request->mode == CLUSTER_RECOVERY_SERIAL_COLD_FORMED
 			   || (cluster_shared_config
 				   && (request->mode == CLUSTER_RECOVERY_SERIAL_INPUT_SEAL
-					   || request->mode == CLUSTER_RECOVERY_SERIAL_INITIALIZER)))
+					   || request->mode == CLUSTER_RECOVERY_SERIAL_INITIALIZER
+					   || request->mode == CLUSTER_RECOVERY_SERIAL_TX_CLOSURE)))
 		   && cluster_recovery_duty_key_valid_for_claim(&request->duty, cluster_shared_config)
 		   && (request->mode == CLUSTER_RECOVERY_SERIAL_INITIALIZER
 				   ? recovery_serial_pending_valid(&request->pending, &request->expected_root_token,
@@ -218,6 +220,8 @@ recovery_serial_request_valid(const ClusterRecoverySerialRequest *request)
 				   : memcmp(&request->pending, &zero, sizeof(zero)) == 0
 						 && recovery_serial_root_token_matches_duty(&request->expected_root_token,
 																	&request->duty, request->mode))
+		   && ((request->mode == CLUSTER_RECOVERY_SERIAL_TX_CLOSURE)
+			   == (request->tx_closure_scope != NULL))
 		   && request->formation != NULL && request->fence_need_set != NULL
 		   && request->fence_admission_set != NULL && request->acquire_timeout_ms >= 1
 		   && request->acquire_timeout_ms <= 600000 && request->release_timeout_ms >= 1
@@ -235,7 +239,10 @@ recovery_serial_release_guard_valid(const ClusterRecoverySerialGuard *guard)
 			&& guard->mode != CLUSTER_RECOVERY_SERIAL_COLD_FORMED
 			&& !(cluster_shared_config
 				 && (guard->mode == CLUSTER_RECOVERY_SERIAL_INPUT_SEAL
-					 || guard->mode == CLUSTER_RECOVERY_SERIAL_INITIALIZER)))
+					 || guard->mode == CLUSTER_RECOVERY_SERIAL_INITIALIZER
+					 || guard->mode == CLUSTER_RECOVERY_SERIAL_TX_CLOSURE)))
+		|| ((guard->mode == CLUSTER_RECOVERY_SERIAL_TX_CLOSURE)
+			!= (guard->tx_closure_scope != NULL))
 		|| guard->formation == NULL || guard->fence_need_set == NULL
 		|| guard->fence_admission_set == NULL || guard->release_timeout_ms < 1
 		|| guard->release_timeout_ms > 600000
@@ -271,7 +278,12 @@ recovery_serial_preflight(const ClusterRecoverySerialRequest *request)
 	ClusterControlRootReadToken token;
 	ClusterControlRootResult root_result;
 	PgracExternalFenceDenyReason reason;
-	if (request->mode == CLUSTER_RECOVERY_SERIAL_INITIALIZER) {
+	if (request->mode == CLUSTER_RECOVERY_SERIAL_TX_CLOSURE) {
+		root_result = cluster_wal_inputs_tx_serial_validate_v1(request->tx_closure_scope, request);
+		if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return root_result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+				? CLUSTER_RECOVERY_SERIAL_BUSY : CLUSTER_RECOVERY_SERIAL_STALE;
+	} else if (request->mode == CLUSTER_RECOVERY_SERIAL_INITIALIZER) {
 		ClusterControlRecoverySubject subject;
 		root_result = cluster_control_root_read_recovery_subject(request->duty.origin_thread_id,
 																 &request->duty, &subject);
@@ -375,6 +387,7 @@ cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
 	guard->duty = request->duty;
 	guard->root_read_token = request->expected_root_token;
 	guard->pending = request->pending;
+	guard->tx_closure_scope = request->tx_closure_scope;
 	guard->formation = request->formation;
 	guard->fence_need_set = request->fence_need_set;
 	guard->fence_admission_set = request->fence_admission_set;
@@ -392,6 +405,10 @@ cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
 	else if (!cluster_external_fence_revalidate_set_nowait(
 				 guard->fence_admission_set, guard->fence_need_set, guard->formation, &reason))
 		stale_result = CLUSTER_RECOVERY_SERIAL_FENCE_STALE;
+	if (stale_result == CLUSTER_RECOVERY_SERIAL_CURRENT
+		&& request->mode == CLUSTER_RECOVERY_SERIAL_TX_CLOSURE
+		&& !cluster_wal_inputs_tx_serial_current_v1(request->tx_closure_scope, request))
+		stale_result = CLUSTER_RECOVERY_SERIAL_CAPABILITY_STALE;
 	if (stale_result != CLUSTER_RECOVERY_SERIAL_CURRENT) {
 		ClusterRecoverySerialReleaseResult release_result
 			= recovery_serial_release_with_timeout(guard, guard->release_timeout_ms);
@@ -468,6 +485,31 @@ cluster_recovery_serial_initializer_revalidate(ClusterRecoverySerialGuard *guard
 	return recovery_serial_revalidate_purpose(guard, CLUSTER_RECOVERY_SERIAL_INITIALIZER);
 }
 
+ClusterRecoverySerialRevalidateResult
+cluster_recovery_serial_tx_revalidate(ClusterRecoverySerialGuard *guard)
+{
+	ClusterRecoverySerialRevalidateResult result
+		= recovery_serial_revalidate_purpose(guard, CLUSTER_RECOVERY_SERIAL_TX_CLOSURE);
+	ClusterRecoverySerialRequest request = {0};
+
+	if (result != CLUSTER_RECOVERY_SERIAL_CURRENT)
+		return result;
+	request.mode = guard->mode;
+	request.duty = guard->duty;
+	request.expected_root_token = guard->root_read_token;
+	request.pending = guard->pending;
+	request.formation = guard->formation;
+	request.fence_need_set = guard->fence_need_set;
+	request.fence_admission_set = guard->fence_admission_set;
+	request.tx_closure_scope = guard->tx_closure_scope;
+	request.acquire_timeout_ms = request.release_timeout_ms = guard->release_timeout_ms;
+	if (!cluster_wal_inputs_tx_serial_current_v1(guard->tx_closure_scope, &request)) {
+		IR_BUMP(revalidate_reject_count);
+		return CLUSTER_RECOVERY_SERIAL_CAPABILITY_STALE;
+	}
+	return CLUSTER_RECOVERY_SERIAL_CURRENT;
+}
+
 ClusterRecoverySerialAcquireResult
 cluster_recovery_serial_acquire_set(const ClusterRecoverySerialRequest *requests, uint16 count,
 									int overall_acquire_timeout_ms,
@@ -489,6 +531,7 @@ cluster_recovery_serial_acquire_set(const ClusterRecoverySerialRequest *requests
 		if (!recovery_serial_request_valid(&requests[i])
 			|| requests[i].mode == CLUSTER_RECOVERY_SERIAL_INPUT_SEAL
 			|| requests[i].mode == CLUSTER_RECOVERY_SERIAL_INITIALIZER
+			|| requests[i].mode == CLUSTER_RECOVERY_SERIAL_TX_CLOSURE
 			|| (i > 0 && requests[i - 1].duty.origin_thread_id >= requests[i].duty.origin_thread_id)
 			|| (i > 0 && requests[i - 1].release_timeout_ms != requests[i].release_timeout_ms))
 			return CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE;
