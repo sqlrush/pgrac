@@ -3462,6 +3462,7 @@ UT_TEST(test_terminal_read_native_error_keeps_output_zero_and_custody_dead)
 #include "test_cluster_relmap_original_pin.inc"
 #include "test_cluster_relmap_checkpoint_publisher.inc"
 #include "test_cluster_relmap_checkpoint_scope.inc"
+#include "test_cluster_relmap_checkpoint_pending.inc"
 
 int
 main(int argc, char **argv)
@@ -3470,7 +3471,10 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(149);
+	UT_PLAN(152);
+	UT_RUN(test_actual_checkpointer_pending_uses_original_scope_and_held_native_read);
+	UT_RUN(test_actual_checkpointer_pending_refuses_independent_writer_mismatch);
+	UT_RUN(test_actual_checkpointer_pending_native_refusal_keeps_original_protection);
 	UT_RUN(test_actual_checkpointer_original_scope_builds_same_window_and_source);
 	UT_RUN(test_actual_checkpointer_original_scope_refusal_keeps_outputs_private);
 	UT_RUN(test_actual_checkpointer_scope_reentry_requires_fresh_building_outputs);
