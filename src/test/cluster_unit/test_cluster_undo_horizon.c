@@ -177,6 +177,9 @@ static ClusterUndoCleanerActiveSample test_sender_sample;
 static bool test_sender_sample_valid, test_sender_sample_current = true;
 static uint64 test_registration_generation = 1;
 static bool test_sender_change_on_recheck;
+static unsigned test_sender_source_change_on_capability;
+static unsigned test_sender_captures, test_sender_current_checks;
+static unsigned test_clock_reads, test_clock_change_at, test_clock_change_kind;
 static unsigned test_v2_sends;
 static ClusterHeapFreezeReportV2 test_v2_sent;
 static bool test_cohort_all_caps;
@@ -209,6 +212,7 @@ cluster_xid_stripe_request_maintenance(const ClusterSemanticActiveSampleFence *i
 bool
 cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out)
 {
+	test_sender_captures++;
 	if (test_change_admission_on_capture != 0 && --test_change_admission_on_capture == 0)
 		test_v2_fence.admission_publication_seq += 2;
 	MemSet(out, 0, sizeof(*out));
@@ -231,6 +235,7 @@ cluster_ctrc_active_scan_registration_current(const ClusterCtrcActiveScan *scan)
 bool
 cluster_undo_cleaner_active_sample_current(const ClusterUndoCleanerActiveSample *expected)
 {
+	test_sender_current_checks++;
 	if (test_sender_change_on_recheck)
 		test_sender_sample.sample_id++;
 	test_horizon_now += test_source_current_clock_shift;
@@ -282,6 +287,12 @@ cluster_sf_peer_capability_generation_matches(int32 peer, uint32 required, uint3
 				test_v2_fence.admission_publication_seq += 2;
 			else if (test_cohort_change == 5)
 				test_registration_generation++;
+			else if (test_cohort_change == 6)
+				test_sender_sample_current = false;
+			else if (test_cohort_change == 7)
+				test_sender_sample.sample_id++;
+			else if (test_cohort_change == 8)
+				test_source_current_clock_shift = 3000001;
 			else if (test_cohort_change == 4) {
 				test_horizon_store.freeze_watermark.publication_sequence++;
 				pg_atomic_fetch_add_u32(&test_horizon_store.freeze_watermark_seq, 2);
@@ -293,6 +304,21 @@ cluster_sf_peer_capability_generation_matches(int32 peer, uint32 required, uint3
 	if (test_v2_cap_change_on_recheck) {
 		test_v2_cap_generation++;
 		test_v2_cap_change_on_recheck = false;
+	}
+	/* A successful final peer observation may overlap local-source retirement.
+	 * Keep its return/capability identity valid to isolate source currentness. */
+	if (test_sender_source_change_on_capability != 0) {
+		unsigned change = test_sender_source_change_on_capability;
+
+		test_sender_source_change_on_capability = 0;
+		if (change == 1)
+			test_sender_sample_current = false;
+		else if (change == 2)
+			test_sender_sample.sample_id++;
+		else if (change == 3)
+			test_v2_fence.admission_publication_seq += 2;
+		else if (change == 4)
+			test_registration_generation++;
 	}
 	return peer == test_v2_peer && required == PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2
 		   && test_horizon_capable && generation == test_v2_cap_generation;
@@ -363,6 +389,15 @@ errfinish(const char *file, int line, const char *func)
 TimestampTz
 GetCurrentTimestamp(void)
 {
+	if (++test_clock_reads == test_clock_change_at) {
+		test_clock_change_at = 0;
+		if (test_clock_change_kind == 1)
+			test_sender_sample_current = false;
+		else if (test_clock_change_kind == 2)
+			test_sender_sample.sample_id++;
+		else if (test_clock_change_kind == 3)
+			test_v2_fence.admission_publication_seq += 2;
+	}
 	return test_horizon_now;
 }
 uint64
@@ -476,6 +511,7 @@ reset_v2_receiver(void)
 	test_registration_generation = 1;
 	test_cohort_clock_shift = 0;
 	test_source_current_clock_shift = 0;
+	test_clock_reads = test_clock_change_at = test_clock_change_kind = 0;
 	test_v2_source = (ClusterICControlIngress){ .serial = 19,
 												.epoch = 7,
 												.owner_pid = MyProcPid,
@@ -1107,6 +1143,8 @@ reset_v2_sender(void)
 	test_sender_sample.worker_pid = 100;
 	test_sender_sample_valid = test_sender_sample_current = test_v1_capable = true;
 	test_sender_change_on_recheck = false;
+	test_sender_source_change_on_capability = 0;
+	test_sender_captures = test_sender_current_checks = 0;
 	test_horizon_cut = test_horizon_seal = test_retention_mrp = false;
 	test_retention_sample_valid = true;
 	test_retention_sample
@@ -3303,10 +3341,150 @@ UT_TEST(test_native_history_retirement_preserves_exact_equal_time_origin)
 	native_history_enabled = false;
 }
 
+/* The peer identity read can run after the original local current check.
+ * Retire the saved local publication without changing its census generation;
+ * a pure registration check alone cannot validate that same worker/lease. */
+UT_TEST(test_saved_cohort_rechecks_complete_local_source_after_peer_callbacks)
+{
+	const int faults[] = { 6, 7, 3 };
+
+	for (unsigned i = 0; i < lengthof(faults); i++) {
+		ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
+		ClusterHeapFreezeCohortObservation cohort, saved;
+		unsigned captures, checks, history;
+
+		cohort_receive(65, report);
+		UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&cohort), CLUSTER_HEAP_FREEZE_COHORT_READY);
+		saved = cohort;
+		captures = test_sender_captures;
+		checks = test_sender_current_checks;
+		history = test_retention_sample_calls;
+		test_cohort_trigger_peer = 65;
+		test_cohort_changed_peer = 1;
+		test_cohort_change = faults[i];
+		UT_ASSERT_EQ(cluster_heap_freeze_cohort_current(&cohort),
+					 CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED);
+		UT_ASSERT_EQ(test_registration_generation, cohort.local_registration_cut.unqualified_registration_generation);
+		UT_ASSERT_EQ(test_sender_captures, captures + 1);
+		UT_ASSERT_EQ(test_sender_current_checks, checks + 1);
+		UT_ASSERT_EQ(test_retention_sample_calls, history);
+		UT_ASSERT_EQ(memcmp(&cohort, &saved, sizeof(cohort)), 0);
+	}
+}
+
+UT_TEST(test_saved_cohort_end_clock_follows_post_peer_local_current_check)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
+	ClusterHeapFreezeCohortObservation cohort, saved;
+	unsigned captures, checks, history;
+
+	cohort_receive(65, report);
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&cohort), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	saved = cohort;
+	captures = test_sender_captures;
+	checks = test_sender_current_checks;
+	history = test_retention_sample_calls;
+	test_cohort_trigger_peer = 65;
+	test_cohort_changed_peer = 1;
+	test_cohort_change = 8;
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_current(&cohort), CLUSTER_HEAP_FREEZE_COHORT_H_STALE);
+	UT_ASSERT_EQ(test_source_current_clock_shift, 0);
+	UT_ASSERT_EQ(test_sender_captures, captures + 1);
+	UT_ASSERT_EQ(test_sender_current_checks, checks + 1);
+	UT_ASSERT_EQ(test_retention_sample_calls, history);
+	UT_ASSERT_EQ(memcmp(&cohort, &saved, sizeof(cohort)), 0);
+}
+
+UT_TEST(test_cohort_observe_end_clock_follows_final_local_current_check)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
+	ClusterHeapFreezeCohortObservation out, before;
+
+	cohort_receive(65, report);
+	memset(&out, 0xa5, sizeof(out));
+	before = out;
+	test_cohort_trigger_peer = 65;
+	test_cohort_changed_peer = 1;
+	test_cohort_change = 8;
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_H_STALE);
+	UT_ASSERT_EQ(test_source_current_clock_shift, 0);
+	UT_ASSERT_EQ(memcmp(&out, &before, sizeof(out)), 0);
+}
+
+/* Preserve the original observe-side full check after the end-clock read.
+ * Registration can remain unchanged while worker/lease/admission retires. */
+UT_TEST(test_cohort_full_local_check_survives_end_clock_source_retirement)
+{
+	for (unsigned saved_mode = 0; saved_mode < 2; saved_mode++) {
+		for (unsigned fault = 1; fault <= 3; fault++) {
+			ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
+			ClusterHeapFreezeCohortObservation out, saved;
+			unsigned history, captures;
+
+			cohort_receive(65, report);
+			if (saved_mode)
+				UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_READY);
+			else
+				memset(&out, 0xa5, sizeof(out));
+			saved = out;
+			history = test_retention_sample_calls;
+			captures = test_sender_captures;
+			test_clock_change_kind = fault;
+			/* Observe reads start+end; saved-current reads only end. */
+			test_clock_change_at = test_clock_reads + (saved_mode ? 1 : 2);
+			UT_ASSERT_EQ(saved_mode ? cluster_heap_freeze_cohort_current(&out)
+				: cluster_heap_freeze_cohort_observe(&out), CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED);
+			UT_ASSERT_EQ(test_clock_change_at, 0);
+			UT_ASSERT_EQ(test_registration_generation, 1);
+			UT_ASSERT_EQ(test_sender_captures, captures + 1);
+			UT_ASSERT_EQ(test_retention_sample_calls, history + (saved_mode ? 0 : 1));
+			UT_ASSERT_EQ(memcmp(&out, &saved, sizeof(out)), 0);
+		}
+	}
+}
+
+/* Actual original V2 sender: its last peer capability read must precede
+ * the retained local worker/lease/admission/census check and sequence debit. */
+UT_TEST(test_v2_sender_rejects_source_retired_during_final_capability_read)
+{
+	for (unsigned fault = 1; fault <= 4; fault++) {
+		ClusterUndoCleanerActiveSample active, saved;
+		ClusterUndoRetentionSample history, saved_history;
+		unsigned captures, cuts;
+
+		reset_v2_sender();
+		active = saved = test_sender_sample;
+		history = saved_history = test_retention_sample;
+		captures = test_sender_captures;
+		cuts = test_retention_sample_calls;
+		test_sender_source_change_on_capability = fault;
+		undo_horizon_send_v2(test_v2_peer, &active, &history);
+		UT_ASSERT_EQ(test_sender_source_change_on_capability, 0);
+		UT_ASSERT_EQ(test_v2_sends, 0);
+		UT_ASSERT_EQ(test_horizon_store.report_sequence, 0);
+		UT_ASSERT_EQ(test_sender_captures, captures);
+		UT_ASSERT_EQ(test_retention_sample_calls, cuts);
+		UT_ASSERT_EQ(memcmp(&active, &saved, sizeof(active)), 0);
+		UT_ASSERT_EQ(memcmp(&history, &saved_history, sizeof(history)), 0);
+
+		/* Only a new source-consistent fixture publication may be sent.
+		 * This repairs controlled leaves, not a production retention grant. */
+		test_sender_sample_current = true;
+		test_sender_sample.admission_fence = test_v2_fence;
+		test_sender_sample.scan.unqualified_registration_generation = test_registration_generation;
+		active = test_sender_sample;
+		undo_horizon_send_v2(test_v2_peer, &active, &history);
+		UT_ASSERT_EQ(test_v2_sends, 1);
+		UT_ASSERT_EQ(test_horizon_store.report_sequence, 1);
+		UT_ASSERT_EQ(test_v2_sent.report_sequence, 1);
+		UT_ASSERT_EQ(test_v2_sent.f_sample_id, active.sample_id);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(115);
+	UT_PLAN(120);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -3425,6 +3603,11 @@ main(void)
 	UT_RUN(test_v2_cohort_rejects_exhausted_local_full_xid_sample);
 	UT_RUN(test_v2_watermark_publisher_rejects_invalid_original_full_xids);
 	UT_RUN(test_v2_watermark_reader_rejects_invalid_original_full_xids);
+	UT_RUN(test_saved_cohort_rechecks_complete_local_source_after_peer_callbacks);
+	UT_RUN(test_saved_cohort_end_clock_follows_post_peer_local_current_check);
+	UT_RUN(test_cohort_observe_end_clock_follows_final_local_current_check);
+	UT_RUN(test_cohort_full_local_check_survives_end_clock_source_retirement);
+	UT_RUN(test_v2_sender_rejects_source_retired_during_final_capability_read);
 	UT_DONE();
 	free(procArray);
 	return ut_failed_count == 0 ? 0 : 1;

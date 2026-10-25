@@ -618,10 +618,12 @@ undo_horizon_send_v2(int32 peer, const ClusterUndoCleanerActiveSample *active,
 	report.h_contributor_kind = h->contributor_kind;
 	report.h_contributor_token = h->contributor_token;
 	report.sender_interval_ms = (uint32)cluster_lmon_main_loop_interval;
+	/* Peer identity observation may overlap retirement of the copied local
+	 * source. Finish with its full original check before sequence debit. */
 	if (!cluster_heap_freeze_report_v2_encode(&report, bytes)
-		|| !cluster_undo_cleaner_active_sample_current(active)
 		|| !cluster_sf_peer_capability_generation_matches(
-			peer, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2, generation))
+			peer, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2, generation)
+		|| !cluster_undo_cleaner_active_sample_current(active))
 		return;
 	UndoHorizonShmem->report_sequence = report.report_sequence;
 	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_UNDO_HORIZON, peer, bytes, sizeof(bytes));
@@ -1006,7 +1008,8 @@ undo_horizon_v2_observe_peer(int32 peer, const ClusterSemanticActiveSampleFence 
 static ClusterHeapFreezeCohortStatus
 undo_horizon_v2_cohort_current(const ClusterSemanticActiveSampleFence *fence,
 							   const UndoHorizonV2PeerObservation *peers, TimestampTz started,
-							   uint32 source_interval_ms)
+							   uint32 source_interval_ms,
+							   const ClusterUndoCleanerActiveSample *active)
 {
 	TimestampTz now;
 	uint32 local_ms
@@ -1026,8 +1029,15 @@ undo_horizon_v2_cohort_current(const ClusterSemanticActiveSampleFence *fence,
 				peer, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2, p->generation))
 			return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
 	}
-	/* Read the end clock after identity callbacks, including for a single
-	 * local member. This expires the retained H cut, never F by its age. */
+	/* Peer observers may replace or revoke the local worker/lease/admission
+	 * after its publication was copied. Recheck that entire original sample
+	 * before the end clock; a registration generation alone is insufficient.
+	 * No new native/census/history sample is acquired here. */
+	if (!cluster_undo_cleaner_active_sample_current(active)
+		|| !cluster_semantic_activation_active_sample_current(fence))
+		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
+	/* Read the end clock after peer and local identity callbacks, including
+	 * for a single local member. Expire H, never F merely by its age. */
 	now = GetCurrentTimestamp();
 	if (now <= 0 || now < started
 		|| (uint64)(now - started)
@@ -1046,6 +1056,12 @@ undo_horizon_v2_cohort_current(const ClusterSemanticActiveSampleFence *fence,
 			|| (uint64)now - p->recv_at_us > window)
 			return CLUSTER_HEAP_FREEZE_COHORT_H_STALE;
 	}
+	/* Preserve the original observe-side full check after the end clock as
+	 * well: time collection can overlap worker/lease/admission retirement
+	 * without changing the ingress generation. This acquires no new sample. */
+	if (!cluster_undo_cleaner_active_sample_current(active)
+		|| !cluster_semantic_activation_active_sample_current(fence))
+		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
 	return CLUSTER_HEAP_FREEZE_COHORT_READY;
 }
 
@@ -1134,11 +1150,12 @@ undo_horizon_v2_cohort_observe(ClusterHeapFreezeCohortObservation *out,
 		observed.covered = Min(observed.covered, candidate.source_peers[peer].covered);
 	}
 	status = undo_horizon_v2_cohort_current(&fence, candidate.source_peers, started,
-											  candidate.source_interval_ms);
+											  candidate.source_interval_ms, &active);
 	if (status != CLUSTER_HEAP_FREEZE_COHORT_READY)
 		return status;
-	if (!cluster_undo_cleaner_active_sample_current(&active)
-		|| !cluster_semantic_activation_active_sample_current(&fence))
+	/* Identity callbacks and the end clock have finished. Retain the original
+	 * ingress cut through publication without another sampling callback. */
+	if (!cluster_ctrc_active_scan_registration_current(&active.scan))
 		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
 	memcpy(out, &candidate, sizeof(candidate));
 	if (maintenance != NULL)
@@ -1270,15 +1287,14 @@ cluster_heap_freeze_cohort_current(const ClusterHeapFreezeCohortObservation *exp
 	if (active.sample_id != expected->source_local_sample_id
 		|| active.scan.status != CTRC_ACTIVE_SCAN_COMPLETE
 		|| memcmp(&active.scan, &expected->local_registration_cut, sizeof(active.scan)) != 0
-		|| memcmp(&active.admission_fence, fence, sizeof(*fence)) != 0
-		|| !cluster_undo_cleaner_active_sample_current(&active))
+		|| memcmp(&active.admission_fence, fence, sizeof(*fence)) != 0)
 		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
 	status = undo_horizon_v2_cohort_current(fence, expected->source_peers,
-		(TimestampTz)expected->source_started_at_us, expected->source_interval_ms);
+		(TimestampTz)expected->source_started_at_us, expected->source_interval_ms, &active);
 	if (status != CLUSTER_HEAP_FREEZE_COHORT_READY)
 		return status;
-	/* The original local getter ran before peer observers. Recheck only
-	 * its retained ingress cut now; never resample N/PGPROC/H or a peer. */
+	/* Full local identity and H's end clock were checked after peer observers.
+	 * Keep the final pure ingress check; never resample N/PGPROC/H or a peer. */
 	if (!cluster_ctrc_active_scan_registration_current(&active.scan))
 		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
 	return CLUSTER_HEAP_FREEZE_COHORT_READY;
