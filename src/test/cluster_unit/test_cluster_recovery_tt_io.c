@@ -47,6 +47,7 @@ static PGAlignedBlock initial;
 static bool header_locked;
 static char tx_scope_storage;
 static bool tx_scope_current;
+static bool tx_loss_on_lock, tx_loss_on_stat, tx_loss_on_read;
 static int tx_resolves;
 static jmp_buf report_jump;
 static bool report_armed, sync_retry;
@@ -70,6 +71,14 @@ test_report(int elevel)
 }
 
 bool
+cluster_wal_inputs_tx_abort_authorized_v1(ClusterWalInputsV1 *inputs,
+	const ClusterRecoveryTTAbortV1 *candidate)
+{
+	return tx_scope_current && inputs == (ClusterWalInputsV1 *)&tx_scope_storage
+		&& memcmp(candidate, &record, sizeof(record)) == 0;
+}
+
+bool
 cluster_wal_inputs_tx_abort_path_v1(ClusterWalInputsV1 *inputs,
 	const ClusterRecoveryTTAbortV1 *candidate, char *out, size_t size)
 {
@@ -89,6 +98,8 @@ cluster_undo_block0_header_write_lock(uint32 segment, uint8 owner, uint32 *acqui
 	UT_ASSERT(!header_locked);
 	header_locked = true;
 	*acquired = 1;
+	if (tx_loss_on_lock)
+		tx_scope_current = false;
 	return true;
 }
 void
@@ -181,6 +192,8 @@ io_pread(int fd, void *buffer, size_t size, off_t offset)
 	ssize_t result;
 	reads++;
 	result = pread(fd, buffer, read_short && size > 0 ? size - 1 : size, offset);
+	if (header_locked && tx_loss_on_read)
+		tx_scope_current = false;
 	if (corrupt_postread && writes != 0 && result == (ssize_t)size && size > 0)
 		((char *)buffer)[size - 1] ^= 1;
 	return result;
@@ -198,6 +211,8 @@ io_pwrite(int fd, const void *buffer, size_t size, off_t offset)
 static int
 io_fstat(int fd, struct stat *st)
 {
+	if (header_locked && tx_loss_on_stat)
+		tx_scope_current = false;
 	if (stat_error) {
 		errno = EIO;
 		return -1;
@@ -244,6 +259,7 @@ reset_file(bool already)
 	opens = resolves = reads = writes = syncs = closes = 0;
 	tx_resolves = 0;
 	tx_scope_current = true;
+	tx_loss_on_lock = tx_loss_on_stat = tx_loss_on_read = false;
 	scope_current = capacity = true;
 	open_error = read_short = write_short = sync_error = close_error = stat_error = false;
 	corrupt_postread = false;
@@ -726,6 +742,34 @@ UT_TEST(test_d0_sync_failure_keeps_native_error_unlock_and_sticky_debt)
 	}
 }
 
+UT_TEST(test_tx_held_descriptor_refuses_lost_ir_before_target_write)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ClusterUndoSmgrRecoveryStampV1 stamp;
+		PGAlignedBlock actual;
+		int fd;
+
+		reset_file(false);
+		UT_ASSERT(cluster_undo_smgr_recovery_abort_prepare_tx_v1(
+			(ClusterWalInputsV1 *)&tx_scope_storage, &record, &stamp));
+		if (fault == 0) tx_scope_current = false;
+		if (fault == 1) tx_loss_on_lock = true;
+		if (fault == 2) tx_loss_on_stat = true;
+		if (fault == 3) tx_loss_on_read = true;
+		UT_ASSERT(!cluster_undo_smgr_recovery_abort_write_v1(stamp));
+		UT_ASSERT_EQ(writes + syncs, 0);
+		UT_ASSERT(!cluster_undo_smgr_recovery_abort_durable_v1(stamp, &record));
+		UT_ASSERT(cluster_undo_smgr_recovery_abort_close_v1(stamp));
+		UT_ASSERT_EQ(external_fds, 0);
+		UT_ASSERT(!header_locked);
+		fd = open(test_file, O_RDONLY);
+		UT_ASSERT(fd >= 0);
+		UT_ASSERT_EQ(pread(fd, actual.data, BLCKSZ, 0), BLCKSZ);
+		UT_ASSERT(memcmp(actual.data, initial.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(close(fd), 0);
+	}
+}
+
 int
 main(void)
 {
@@ -735,7 +779,7 @@ main(void)
 		return 2;
 	snprintf(test_dir, sizeof(test_dir), "%s", dir);
 	snprintf(test_file, sizeof(test_file), "%s/seg_257.dat", dir);
-	UT_PLAN(13);
+	UT_PLAN(14);
 	UT_RUN(test_exact_durable_slot_preserves_whole_header_and_head);
 	UT_RUN(test_cold_prepare_uses_exact_tx_scope_without_redo_path_or_writes);
 	UT_RUN(test_cold_prepare_refuses_bad_scope_crc_before_image_and_releases_owner);
@@ -749,6 +793,7 @@ main(void)
 	UT_RUN(test_durable_fact_requires_exact_completed_live_stamp);
 	UT_RUN(test_c0_tx_record_and_d0_share_stage_without_cross_kind_authority);
 	UT_RUN(test_d0_sync_failure_keeps_native_error_unlock_and_sticky_debt);
+	UT_RUN(test_tx_held_descriptor_refuses_lost_ir_before_target_write);
 	CurrentResourceOwner = (ResourceOwner)&owner_storage[0];
 	if (release_callback != NULL)
 		release_callback(RESOURCE_RELEASE_AFTER_LOCKS, false, true, release_arg);

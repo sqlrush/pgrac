@@ -10,10 +10,28 @@
 #define PGRAC_CONTROL_CF_EMBEDDED
 #include "test_cluster_cf_enqueue.c"
 #include "cluster/cluster_ir.h"
+#include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_thread_recovery_authority.h"
+
+/* This fixture has no original post-DONE input owner; ordinary IR cannot
+ * borrow the dedicated purpose. Real current/history scope is tested separately. */
+bool
+cluster_wal_inputs_tx_serial_current_v1(ClusterWalInputsV1 *inputs,
+	const ClusterRecoverySerialRequest *request)
+{
+	(void)inputs; (void)request;
+	return false;
+}
+ClusterControlRootResult
+cluster_wal_inputs_tx_serial_validate_v1(ClusterWalInputsV1 *inputs,
+	const ClusterRecoverySerialRequest *request)
+{
+	(void)inputs; (void)request;
+	return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
 
 static ClusterControlRootReadToken ir_token;
 static ClusterControlRootReadToken ir_tokens[CLUSTER_WAL_STATE_SLOT_COUNT + 1];

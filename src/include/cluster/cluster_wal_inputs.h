@@ -118,6 +118,24 @@ extern bool cluster_wal_inputs_tx_abort_path_v1(ClusterWalInputsV1 *inputs,
 extern bool cluster_wal_inputs_tx_abort_current_v1(ClusterWalInputsV1 *inputs,
 	const struct ClusterRecoveryTTAbortV1 *record);
 
+/* One native IR attempt for this exact original C0 candidate. Select only
+ * the original COMPLETE checkpoint/history, with the original isolation owner
+ * and whole ROOT/WALR scope. RECONFIG_WAIT means local contention, never a
+ * terminal elapsed deadline. An uncertain release retains this entire scope.
+ * This grants neither PAGE nor ordinary RR replay authority. */
+extern ClusterControlRootResult cluster_wal_inputs_tx_abort_acquire_v1(
+	ClusterWalInputsV1 *inputs, const struct ClusterRecoveryTTAbortV1 *record);
+/* No I/O: current exact candidate plus this scope's actual held TX IR. */
+extern bool cluster_wal_inputs_tx_abort_authorized_v1(ClusterWalInputsV1 *inputs,
+	const struct ClusterRecoveryTTAbortV1 *record);
+struct ClusterRecoverySerialRequest;
+/* IR purpose callbacks: validate includes original whole ROOT I/O outside CF;
+ * current is no-wait and never calls the IR holder revalidation recursively. */
+extern ClusterControlRootResult cluster_wal_inputs_tx_serial_validate_v1(
+	ClusterWalInputsV1 *inputs, const struct ClusterRecoverySerialRequest *request);
+extern bool cluster_wal_inputs_tx_serial_current_v1(ClusterWalInputsV1 *inputs,
+	const struct ClusterRecoverySerialRequest *request);
+
 /* Startup in recovery, under the caller's existing execution WALR retention
  * owner. Select one exact CLOSED/RECOVERY_REQUIRED/RECOVERY_COMPLETE checkpoint
  * from the original whole ROOT, validate its native anchor and physical claim,

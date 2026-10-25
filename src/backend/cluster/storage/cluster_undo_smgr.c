@@ -597,6 +597,7 @@ typedef struct RecoveryHeaderStamp {
 	bool failed;
 	bool durable;
 	ClusterRecoveryTTAbortV1 record;
+	ClusterWalInputsV1 *tx_inputs; /* only original post-EOR C0 */
 	struct stat file;
 	uint32 slot_offset;
 #ifdef USE_PGRAC_CLUSTER
@@ -767,9 +768,18 @@ cluster_undo_smgr_recovery_abort_prepare_tx_v1(ClusterWalInputsV1 *inputs,
 	out->token = 0;
 	if (CurrentResourceOwner == NULL || recovery_header_stamp.fd >= 0
 		|| recovery_header_stamp_serial == UINT64_MAX || !cluster_recovery_tt_abort_valid_v1(record)
+		|| !cluster_wal_inputs_tx_abort_authorized_v1(inputs, record)
 		|| !cluster_wal_inputs_tx_abort_path_v1(inputs, record, path, sizeof(path)))
 		return false;
-	return recovery_abort_prepare_path(record, path, out);
+	if (!recovery_abort_prepare_path(record, path, out))
+		return false;
+	recovery_header_stamp.tx_inputs = inputs;
+	if (!cluster_wal_inputs_tx_abort_authorized_v1(inputs, record)) {
+		(void)recovery_header_stamp_release();
+		out->token = 0;
+		return false;
+	}
+	return true;
 }
 
 static bool
@@ -786,6 +796,9 @@ recovery_header_stamp_write(ClusterUndoSmgrRecoveryStampV1 stamp, RecoveryHeader
 		|| stage->owner != CurrentResourceOwner || stage->kind != kind || stage->failed)
 		return false;
 	stage->durable = false;
+	if (stage->tx_inputs != NULL
+		&& !cluster_wal_inputs_tx_abort_authorized_v1(stage->tx_inputs, &stage->record))
+		goto refused;
 	if (!cluster_undo_block0_header_write_lock(header->segment_id, header->owner_instance,
 												 &acquired_slot))
 		goto refused;
@@ -795,6 +808,11 @@ recovery_header_stamp_write(ClusterUndoSmgrRecoveryStampV1 stamp, RecoveryHeader
 	size = pg_pread(stage->fd, observed.data, BLCKSZ, 0);
 	cluster_undo_record_note_smgr_pread();
 	if (size != BLCKSZ || memcmp(observed.data, stage->before.data, BLCKSZ) != 0)
+		goto refused;
+	/* The local header lock and file reads may have waited. Recheck the
+	 * original no-I/O guard at the mutation boundary after those waits. */
+	if (stage->tx_inputs != NULL
+		&& !cluster_wal_inputs_tx_abort_authorized_v1(stage->tx_inputs, &stage->record))
 		goto refused;
 	if (memcmp(stage->before.data, stage->after.data, BLCKSZ) != 0) {
 		size = pg_pwrite(stage->fd, stage->after.data, BLCKSZ, 0);
@@ -823,6 +841,9 @@ recovery_header_stamp_write(ClusterUndoSmgrRecoveryStampV1 stamp, RecoveryHeader
 	cluster_undo_record_note_smgr_pread();
 	if (size != BLCKSZ || memcmp(observed.data, stage->after.data, BLCKSZ) != 0
 		|| fstat(stage->fd, &file) != 0 || !recovery_header_stamp_file_matches(&file))
+		goto refused;
+	if (stage->tx_inputs != NULL
+		&& !cluster_wal_inputs_tx_abort_authorized_v1(stage->tx_inputs, &stage->record))
 		goto refused;
 	memcpy(stage->before.data, stage->after.data, BLCKSZ);
 	stage->durable = true;

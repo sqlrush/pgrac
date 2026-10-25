@@ -544,6 +544,11 @@ extern bool cluster_recovery_merge_fence_plan_bind_tx_inputs_v1(ClusterRecoveryF
 	const struct ClusterWalSourceRef *sources, uint32 count);
 extern bool cluster_recovery_merge_fence_plan_tx_current_v1(ClusterRecoveryFencePlan *plan,
 	const struct ClusterWalSourceRef *source);
+struct ClusterRecoverySerialRequest;
+/* Borrow the original completed proof owner's exact old-subject request.
+ * It still needs the purpose-bound current-history scope and a new IR grant. */
+extern bool cluster_recovery_merge_fence_plan_tx_request_v1(ClusterRecoveryFencePlan *plan,
+	const struct ClusterWalSourceRef *source, struct ClusterRecoverySerialRequest *out);
 extern bool cluster_recovery_merge_fence_plan_release_serial(ClusterRecoveryFencePlan *plan);
 extern void cluster_recovery_merge_fence_plan_destroy(ClusterRecoveryFencePlan **plan);
 

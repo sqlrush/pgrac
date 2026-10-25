@@ -62,7 +62,7 @@ cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
 }
 
 bool
-cluster_wal_inputs_tx_abort_current_v1(ClusterWalInputsV1 *inputs,
+cluster_wal_inputs_tx_abort_authorized_v1(ClusterWalInputsV1 *inputs,
 	const ClusterRecoveryTTAbortV1 *record)
 {
 	return tx_mode && tx_current && inputs == (ClusterWalInputsV1 *)&tx_inputs_storage

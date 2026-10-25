@@ -2434,6 +2434,42 @@ cluster_recovery_merge_fence_plan_tx_current_v1(ClusterRecoveryFencePlan *plan,
 	return matched;
 }
 
+bool
+cluster_recovery_merge_fence_plan_tx_request_v1(ClusterRecoveryFencePlan *plan,
+	const ClusterWalSourceRef *source, ClusterRecoverySerialRequest *out)
+{
+	ClusterRecoverySerialRequest request = {0};
+
+	/* No write to an opaque owner or the caller's original source on refusal. */
+	if (out == NULL || source == NULL || plan == NULL
+		|| ((uintptr_t)out <= (uintptr_t)plan
+			? (uintptr_t)plan - (uintptr_t)out < sizeof(*out)
+			: (uintptr_t)out - (uintptr_t)plan < sizeof(*plan))
+		|| ((uintptr_t)out <= (uintptr_t)source
+			? (uintptr_t)source - (uintptr_t)out < sizeof(*out)
+			: (uintptr_t)out - (uintptr_t)source < sizeof(*source))
+		|| !cluster_recovery_merge_fence_plan_tx_current_v1(plan, source))
+		return false;
+	for (uint16 i = 0; i < plan->origin_count; i++) {
+		const ClusterRecoveryFenceOrigin *origin = &plan->origins[i];
+		if (memcmp(source, &origin->tx_source, sizeof(*source)) != 0)
+			continue;
+		request.mode = CLUSTER_RECOVERY_SERIAL_TX_CLOSURE;
+		request.duty = origin->duty;
+		request.expected_root_token = origin->root_token;
+		request.formation = origin->formation;
+		request.fence_need_set = origin->needs;
+		request.fence_admission_set = origin->admissions;
+		request.acquire_timeout_ms = plan->acquire_timeout_ms_snapshot;
+		request.release_timeout_ms = plan->acquire_timeout_ms_snapshot;
+		if (!cluster_recovery_merge_fence_plan_tx_current_v1(plan, source))
+			return false;
+		*out = request;
+		return true;
+	}
+	return false;
+}
+
 /*
  * PGRAC (S9P2-05): publish every fenced origin recovered, in the order the
  * online recovery worker uses for one origin.  Each origin's authority and

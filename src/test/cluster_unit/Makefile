@@ -774,6 +774,10 @@ test_cluster_recovery_serial: test_cluster_recovery_serial.c unit_test.h $(CLUST
 		$(CLUSTER_DL_O) $(CLUSTER_HW_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+test_cluster_cold_tx_start test_cluster_recovery_merge_complete \
+test_cluster_recovery_merge_seal test_cluster_wal_inputs_product.o: \
+		$(top_srcdir)/src/include/cluster/cluster_ir.h
+
 CLUSTER_EXTERNAL_FENCE_O = test_cluster_external_fence_product.o test_cluster_same_host_fence_product.o
 PGRAC_EXTERNAL_FENCE_PROTOCOL_O = \
 	$(top_builddir)/src/common/pgrac_external_fence_protocol_srv.o

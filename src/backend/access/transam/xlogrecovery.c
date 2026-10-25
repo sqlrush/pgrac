@@ -212,6 +212,7 @@
 #include "utils/resowner.h"
 #include "cluster/cluster_wal_tail.h"
 #include "cluster/cluster_recovery_merge.h"
+#include "cluster/cluster_ir.h"
 #include "cluster/cluster_recovery_worker.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "cluster/storage/cluster_undo_xlog.h"
@@ -1349,6 +1350,38 @@ ClusterColdRecoveryTxC0Candidate(const struct ClusterRecoveryStartV1 *start,
 		return false;
 	*out = candidate;
 	return true;
+}
+
+bool
+ClusterColdRecoveryTxSerialRequest(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdTopTxCensusEntryV1 *subject, ClusterRecoverySerialRequest *out)
+{
+	ClusterRecoveryTTAbortDerivationV1 candidate;
+	const ClusterColdTypedV1 *typed;
+
+	if (out == NULL || !ClusterColdRecoveryStartOutputDistinct(start, out, sizeof(*out))
+		|| !ClusterColdRecoveryTxC0Candidate(start, subject, &candidate))
+		return false;
+	typed = start->inputs;
+	if (((uintptr_t)out <= (uintptr_t)typed
+		 ? (uintptr_t)typed - (uintptr_t)out < sizeof(*out)
+		 : (uintptr_t)out - (uintptr_t)typed < sizeof(*typed))
+		|| ((uintptr_t)out <= (uintptr_t)subject
+			? (uintptr_t)subject - (uintptr_t)out < sizeof(*out)
+			: (uintptr_t)out - (uintptr_t)subject < sizeof(*subject)))
+		return false;
+	for (uint32 p = 0; p < typed->replay_count; p++) {
+		if (typed->participants[p].thread_id != candidate.record.target_thread)
+			continue;
+		if (!ClusterColdRecoveryTxTopProofCurrent(start, subject)
+			|| !ClusterColdRecoveryTxEffectsCurrent(start))
+			return false;
+		/* The original owner must see the final output address so it can
+		 * reject aliases throughout its opaque proof storage before publishing. */
+		return cluster_recovery_merge_fence_plan_tx_request_v1(start->tx_fence,
+			&typed->sources[p], out);
+	}
+	return false;
 }
 
 bool

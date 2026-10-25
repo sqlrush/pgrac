@@ -6737,7 +6737,7 @@ ClusterStartupInstalledRecoveryWriterV1(ClusterWalWriterToken *writer,
 static bool
 cluster_cold_recovery_stamp_c0_v1(const struct ClusterRecoveryStartV1 *start,
 	const ClusterColdTopTxCensusEntryV1 *entry, const ClusterRecoveryTTAbortV1 *record,
-	ClusterUndoSmgrRecoveryStampV1 stamp)
+	ClusterUndoSmgrRecoveryStampV1 stamp, ClusterWalInputsV1 *inputs)
 {
 	const ClusterColdTypedV1 *typed = ClusterColdRecoveryTxInputs(start);
 	ClusterRecoveryStampOwnerV1 owner = {0};
@@ -6747,7 +6747,8 @@ cluster_cold_recovery_stamp_c0_v1(const struct ClusterRecoveryStartV1 *start,
 	uint32 participant = UINT32_MAX;
 	volatile bool completed = false;
 
-	if (typed == NULL || record == NULL || typed->replay_count == 0
+	if (!cluster_wal_inputs_tx_abort_authorized_v1(inputs, record)
+		|| typed == NULL || record == NULL || typed->replay_count == 0
 		|| typed->replay_count > typed->participant_count
 		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS)
 		return false;
@@ -6776,7 +6777,8 @@ cluster_cold_recovery_stamp_c0_v1(const struct ClusterRecoveryStartV1 *start,
 		/* Only this branch proves that insertion and target mutation did not
 		 * begin. Once INSERTING is set, every refusal retains the responsibility. */
 		if (!ClusterColdRecoveryTxTopProofCurrent(start, entry)
-			|| !ClusterColdRecoveryTxEffectsCurrent(start))
+			|| !ClusterColdRecoveryTxEffectsCurrent(start)
+			|| !cluster_wal_inputs_tx_abort_authorized_v1(inputs, record))
 		{
 			if (!cluster_recovery_stamp_cancel_v1(&window))
 				(void)cluster_recovery_stamp_fail_v1(&window);
@@ -6795,11 +6797,14 @@ cluster_cold_recovery_stamp_c0_v1(const struct ClusterRecoveryStartV1 *start,
 				ereport(PANIC, (errmsg("could not record cold recovery C0 insertion")));
 			END_CRIT_SECTION();
 			XLogFlush(end);
-			if (ClusterColdRecoveryTxTopProofCurrent(start, entry)
+			if (cluster_wal_inputs_tx_abort_authorized_v1(inputs, record)
+				&& ClusterColdRecoveryTxTopProofCurrent(start, entry)
 				&& ClusterColdRecoveryTxEffectsCurrent(start)
+				&& cluster_wal_inputs_tx_abort_authorized_v1(inputs, record)
 				&& cluster_undo_smgr_recovery_abort_write_v1(stamp)
 				&& ClusterColdRecoveryTxTopProofCurrent(start, entry)
 				&& ClusterColdRecoveryTxEffectsCurrent(start)
+				&& cluster_wal_inputs_tx_abort_authorized_v1(inputs, record)
 				&& cluster_recovery_stamp_durable_v1(&window)
 				&& cluster_recovery_stamp_clear_v1(&window))
 				completed = true;
@@ -6856,12 +6861,14 @@ cluster_cold_recovery_consume_loser_inputs_v1(
 	for (uint32 i = 0; i < typed->top_tx_census->count; i++)
 	{
 		const ClusterColdTopTxCensusEntryV1 *entry = &typed->top_tx_census->entries[i];
-		ClusterWalInputsV1 *inputs = NULL;
-		ClusterControlRootResult result;
+		struct {
+			ClusterWalInputsV1 *inputs;
+			ClusterUndoBlock0Pin target;
+			ClusterUndoSmgrRecoveryStampV1 stamp;
+		} *operation;
+		volatile ClusterControlRootResult result;
 		ClusterRecoveryTTAbortDerivationV1 candidate;
 		ClusterRecoveryTTAbortDerivationV1 confirmed;
-		ClusterUndoBlock0Pin target = { .slot = -1 };
-		ClusterUndoSmgrRecoveryStampV1 stamp = {0};
 
 		/* A retained ACTIVE without an independent loser proof stays
 		 * unresolved; it must not be promoted by this consumer. */
@@ -6876,51 +6883,76 @@ cluster_cold_recovery_consume_loser_inputs_v1(
 		if (!ClusterColdRecoveryTxTopProofCurrent(start, entry))
 			return false;
 
-		result = cluster_wal_inputs_begin_tx_closure_v1(start, entry, &inputs);
-		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || inputs == NULL)
+		operation = palloc0(sizeof(*operation));
+		operation->target.slot = -1;
+		PG_TRY();
 		{
-			if (inputs != NULL)
-				cluster_wal_inputs_release_v1(&inputs);
-			return false;
+			result = cluster_wal_inputs_begin_tx_closure_v1(start, entry, &operation->inputs);
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && operation->inputs == NULL)
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+				result = cluster_wal_inputs_revalidate_v1(operation->inputs);
+			/* Derive fields from this original proof and actual installed writer,
+			 * inside its original source scope. The candidate is not a write grant. */
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				&& !ClusterColdRecoveryTxC0Candidate(start, entry, &candidate))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			/* Competing recovery owners wait locally without a terminal elapsed
+			 * deadline. Never hold CF or a target reservation across this wait. */
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+				do {
+					CHECK_FOR_INTERRUPTS();
+					if (ShutdownRequestPending) {
+						result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+						break;
+					}
+					result = cluster_wal_inputs_tx_abort_acquire_v1(operation->inputs, &candidate.record);
+					if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT) {
+						(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+							100L, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
+						ResetLatch(MyLatch);
+					}
+				} while (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+			}
+			/* Local target exclusion only. Retain no content lock across the later
+			 * C0 preparation/insertion seam, and grant no mutation authority here. */
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				&& !ClusterColdRecoveryTxC0Reserve(start, entry, &operation->target))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+				result = cluster_wal_inputs_revalidate_v1(operation->inputs);
+			/* All fallible descriptor preparation precedes the later PRE_INSERT
+			 * seam. Keep the original source and target exclusion throughout I/O. */
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				&& !cluster_undo_smgr_recovery_abort_prepare_tx_v1(operation->inputs, &candidate.record, &operation->stamp))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+				XLogEnsureRecordSpace(0, 1);
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+				result = cluster_wal_inputs_revalidate_v1(operation->inputs);
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				&& (!ClusterColdRecoveryTxC0Candidate(start, entry, &confirmed)
+					|| memcmp(&candidate.record, &confirmed.record, sizeof(candidate.record)) != 0))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				&& !cluster_cold_recovery_stamp_c0_v1(start, entry, &confirmed.record, operation->stamp, operation->inputs))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				&& !cluster_undo_recovery_abort_project_tx_v1(operation->inputs, &confirmed.record, operation->stamp))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		}
-		result = cluster_wal_inputs_revalidate_v1(inputs);
-		/* Derive fields from this original proof and actual installed writer,
-		 * inside its original source scope. The candidate is not a write grant. */
-		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			&& !ClusterColdRecoveryTxC0Candidate(start, entry, &candidate))
-			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-		/* Local target exclusion only. Retain no content lock across the later
-		 * C0 preparation/insertion seam, and grant no mutation authority here. */
-		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			&& !ClusterColdRecoveryTxC0Reserve(start, entry, &target))
-			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			result = cluster_wal_inputs_revalidate_v1(inputs);
-		/* All fallible descriptor preparation precedes the later PRE_INSERT
-		 * seam. Keep the original source and target exclusion throughout I/O. */
-		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			&& !cluster_undo_smgr_recovery_abort_prepare_tx_v1(inputs, &candidate.record, &stamp))
-			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			XLogEnsureRecordSpace(0, 1);
-		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			result = cluster_wal_inputs_revalidate_v1(inputs);
-		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			&& (!ClusterColdRecoveryTxC0Candidate(start, entry, &confirmed)
-				|| memcmp(&candidate.record, &confirmed.record, sizeof(candidate.record)) != 0))
-			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			&& !cluster_cold_recovery_stamp_c0_v1(start, entry, &confirmed.record, stamp))
-			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			&& !cluster_undo_recovery_abort_project_tx_v1(inputs, &confirmed.record, stamp))
-			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-		/* Close before releasing exclusion, including every post-I/O refusal.
-		 * The stamp owner independently retains every incomplete inserted C0. */
-		if (stamp.token != 0 && !cluster_undo_smgr_recovery_abort_close_v1(stamp))
-			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-		cluster_undo_block0_release_reservation(&target);
-		cluster_wal_inputs_release_v1(&inputs);
+		PG_FINALLY();
+		{
+			/* Close before releasing exclusion, including every post-I/O refusal.
+			 * The stamp owner independently retains every incomplete inserted C0. */
+			if (operation->stamp.token != 0 && !cluster_undo_smgr_recovery_abort_close_v1(operation->stamp))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			cluster_undo_block0_release_reservation(&operation->target);
+			if (operation->inputs != NULL)
+				cluster_wal_inputs_release_v1(&operation->inputs);
+			pfree(operation);
+		}
+		PG_END_TRY();
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return false;
 		/* Record only the original owner's successful complete operation,

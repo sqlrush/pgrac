@@ -34,6 +34,7 @@
 #include "cluster/cluster_sequence.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_inputs.h"
 #include "miscadmin.h"
 #include "storage/relfilelocator.h"
 #include "storage/shmem.h"
@@ -81,6 +82,27 @@ static union {
 } fake_ir_shmem;
 static ClusterLockAcquireResult stub_acquire_result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 static uint32 stub_acquire_calls;
+static char tx_scope_object;
+static bool tx_scope_current = true;
+static bool tx_scope_fresh = true;
+static bool lose_tx_scope_on_grant;
+static unsigned tx_scope_reads;
+bool
+cluster_wal_inputs_tx_serial_current_v1(struct ClusterWalInputsV1 *scope,
+	const ClusterRecoverySerialRequest *request)
+{
+	return tx_scope_current && scope == (struct ClusterWalInputsV1 *)&tx_scope_object
+		&& request->tx_closure_scope == scope;
+}
+ClusterControlRootResult
+cluster_wal_inputs_tx_serial_validate_v1(struct ClusterWalInputsV1 *scope,
+	const ClusterRecoverySerialRequest *request)
+{
+	tx_scope_reads++;
+	return tx_scope_fresh && cluster_wal_inputs_tx_serial_current_v1(scope, request)
+		? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+
 static bool stub_formation_ready;
 static bool stub_need_set_ready;
 static bool stub_admission_set_ready;
@@ -120,6 +142,7 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *request)
 	ClusterLockAcquireRequest *mutable_request = (ClusterLockAcquireRequest *)request;
 
 	stub_acquire_calls++;
+	if (lose_tx_scope_on_grant) tx_scope_current = false;
 	mutable_request->request_id = UINT64_C(9001);
 	mutable_request->holder.node_id = 0;
 	mutable_request->holder.procno = 9;
@@ -862,7 +885,8 @@ UT_TEST(test_recovery_serial_acquire_set_zero_before_first_grant)
 	stub_acquire_calls = 0;
 	UT_ASSERT_EQ(cluster_recovery_serial_acquire_set(requests, 2, 5000, &set, &failed_index),
 				 CLUSTER_RECOVERY_SERIAL_FENCE_DENIED);
-	UT_ASSERT_EQ(failed_index, CLUSTER_RECOVERY_SERIAL_SET_FAILED_NONE);
+	/* Original per-request failure identifies the first request, before any grant. */
+	UT_ASSERT_EQ(failed_index, 0);
 	UT_ASSERT_EQ(stub_acquire_calls, 0);
 	UT_ASSERT(memcmp(&set, &(ClusterRecoverySerialGuardSet){ 0 }, sizeof(set)) == 0);
 
@@ -1026,10 +1050,105 @@ UT_TEST(test_recovery_serial_pending_rejects_mixed_stale_and_unisolated_subjects
 	}
 }
 
+static ClusterRecoverySerialRequest
+tx_serial_request(void)
+{
+	ClusterRecoverySerialRequest request = valid_serial_request();
+	cluster_shared_config = true;
+	request.mode = CLUSTER_RECOVERY_SERIAL_TX_CLOSURE;
+	request.duty.thread_claim_crc32c = 0;
+	request.tx_closure_scope = (struct ClusterWalInputsV1 *)&tx_scope_object;
+	stub_acquire_calls = stub_release_calls = tx_scope_reads = 0;
+	stub_release_result_index = stub_release_result_count = 0;
+	stub_acquire_result = stub_release_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	stub_formation_ready = stub_need_set_ready = stub_admission_set_ready = true;
+	tx_scope_current = tx_scope_fresh = true;
+	lose_tx_scope_on_grant = false;
+	return request;
+}
+UT_TEST(test_tx_serial_requires_original_purpose_and_actual_ges_holder)
+{
+	ClusterRecoverySerialRequest request = tx_serial_request();
+	ClusterRecoverySerialGuard guard;
+	UT_ASSERT_EQ(cluster_recovery_serial_acquire(&request, &guard), CLUSTER_RECOVERY_SERIAL_GRANTED);
+	UT_ASSERT(guard.held && guard.tx_closure_scope == request.tx_closure_scope);
+	UT_ASSERT_EQ(guard.duty.root_lineage_seq, request.duty.root_lineage_seq);
+	UT_ASSERT_EQ(tx_scope_reads, 1);
+	UT_ASSERT_EQ(cluster_recovery_serial_revalidate(&guard), CLUSTER_RECOVERY_SERIAL_CAPABILITY_STALE);
+	UT_ASSERT_EQ(cluster_recovery_serial_tx_revalidate(&guard), CLUSTER_RECOVERY_SERIAL_CURRENT);
+	UT_ASSERT_EQ(cluster_recovery_serial_release(&guard), CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED);
+	for (unsigned fault = 0; fault < 3; fault++) {
+		request = tx_serial_request();
+		if (fault == 0) stub_acquire_result = CLUSTER_LOCK_ACQUIRE_OK_NATIVE;
+		if (fault == 1) stub_acquire_result = CLUSTER_LOCK_ACQUIRE_NOT_AVAIL;
+		if (fault == 2) tx_scope_fresh = false;
+		UT_ASSERT(cluster_recovery_serial_acquire(&request, &guard) != CLUSTER_RECOVERY_SERIAL_GRANTED);
+		UT_ASSERT(!guard.held);
+		UT_ASSERT_EQ(stub_acquire_calls, fault == 2 ? 0 : 1);
+	}
+	cluster_shared_config = false;
+}
+UT_TEST(test_tx_serial_never_falls_back_to_rr_or_set_permission)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		ClusterRecoverySerialRequest request = tx_serial_request();
+		ClusterRecoverySerialGuard guard;
+		switch (fault) {
+		case 0: request.tx_closure_scope = NULL; break;
+		case 1: request.mode = CLUSTER_RECOVERY_SERIAL_ONLINE; break;
+		case 2: request.mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED; break;
+		case 3: tx_scope_current = false; break;
+		case 4: request.expected_root_token.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE; break;
+		}
+		UT_ASSERT(cluster_recovery_serial_acquire(&request, &guard) != CLUSTER_RECOVERY_SERIAL_GRANTED);
+		UT_ASSERT_EQ(stub_acquire_calls, 0);
+	}
+	{
+		ClusterRecoverySerialRequest request = tx_serial_request();
+		ClusterRecoverySerialGuardSet set;
+		uint16 failed;
+		UT_ASSERT_EQ(cluster_recovery_serial_acquire_set(&request, 1, 100, &set, &failed),
+			CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE);
+		UT_ASSERT_EQ(stub_acquire_calls, 0);
+	}
+	cluster_shared_config = false;
+}
+UT_TEST(test_tx_serial_loss_during_acquire_rolls_back_or_retains_release_debt)
+{
+	for (unsigned uncertain = 0; uncertain < 2; uncertain++) {
+		ClusterRecoverySerialRequest request = tx_serial_request();
+		ClusterRecoverySerialGuard guard;
+		lose_tx_scope_on_grant = true;
+		if (uncertain) stub_release_result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+		UT_ASSERT(cluster_recovery_serial_acquire(&request, &guard) != CLUSTER_RECOVERY_SERIAL_GRANTED);
+		UT_ASSERT_EQ(stub_release_calls, 1);
+		UT_ASSERT_EQ(guard.held, uncertain != 0);
+		if (uncertain) {
+			UT_ASSERT(guard.release_uncertain);
+			UT_ASSERT_EQ(cluster_recovery_serial_tx_revalidate(&guard), CLUSTER_RECOVERY_SERIAL_RELEASE_UNCERTAIN);
+			stub_release_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+			UT_ASSERT_EQ(cluster_recovery_serial_release(&guard), CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED);
+		}
+	}
+	cluster_shared_config = false;
+}
+UT_TEST(test_tx_serial_held_loss_refuses_mutation_but_allows_exact_cleanup)
+{
+	ClusterRecoverySerialRequest request = tx_serial_request();
+	ClusterRecoverySerialGuard guard;
+	UT_ASSERT_EQ(cluster_recovery_serial_acquire(&request, &guard), CLUSTER_RECOVERY_SERIAL_GRANTED);
+	tx_scope_current = false;
+	UT_ASSERT_EQ(cluster_recovery_serial_tx_revalidate(&guard), CLUSTER_RECOVERY_SERIAL_CAPABILITY_STALE);
+	/* Revocation does not dereference/refresh the scope at the release boundary. */
+	UT_ASSERT_EQ(cluster_recovery_serial_release(&guard), CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED);
+	UT_ASSERT(!guard.held);
+	cluster_shared_config = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(27);
 	UT_RUN(test_recovery_serial_resid_encode);
 	UT_RUN(test_ir_resid_namespace_distinct);
 	UT_RUN(test_recovery_serial_resid_thread_and_lineage_distinct);
@@ -1053,6 +1172,10 @@ main(void)
 	UT_RUN(test_recovery_serial_input_guard_loses_authority_and_keeps_uncertain_release);
 	UT_RUN(test_recovery_serial_pending_initializer_does_not_require_fake_checkpoint);
 	UT_RUN(test_recovery_serial_pending_rejects_mixed_stale_and_unisolated_subjects);
+	UT_RUN(test_tx_serial_requires_original_purpose_and_actual_ges_holder);
+	UT_RUN(test_tx_serial_never_falls_back_to_rr_or_set_permission);
+	UT_RUN(test_tx_serial_loss_during_acquire_rolls_back_or_retains_release_debt);
+	UT_RUN(test_tx_serial_held_loss_refuses_mutation_but_allows_exact_cleanup);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;
