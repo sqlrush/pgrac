@@ -25959,6 +25959,7 @@ UT_TEST(test_tx_inputs_parent_subject_and_wait_revalidation)
 }
 
 #include "test_cluster_control_ctrc_inputs.inc"
+#include "test_cluster_control_ctrc_local_wal.inc"
 #include "test_cluster_control_ctrc_namespace.inc"
 
 /*
@@ -26103,7 +26104,7 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_CTRC_INPUTS") != NULL) {
-		UT_PLAN(13);
+		UT_PLAN(20);
 		UT_RUN(test_ctrc_namespace_same_root_bytes_cannot_replace_original_directory);
 		UT_RUN(test_ctrc_namespace_initial_root_error_closes_fd_and_retains_scope_debt);
 		UT_RUN(test_ctrc_namespace_retains_readonly_fd_through_scope_lifetime);
@@ -26117,6 +26118,13 @@ main(int argc, char **argv)
 		UT_RUN(test_ctrc_inputs_wait_resume_keeps_original_work_and_whole_root);
 		UT_RUN(test_ctrc_inputs_open_wait_has_no_partial_census_or_mutation_permission);
 		UT_RUN(test_ctrc_inputs_reselects_original_history_after_actual_install);
+		UT_RUN(test_ctrc_local_cut_reads_installed_writer_and_all_original_history);
+		UT_RUN(test_ctrc_local_cut_flushes_one_original_minimum_despite_later_insert);
+		UT_RUN(test_ctrc_local_cut_foreign_open_waits_before_any_callback_or_flush);
+		UT_RUN(test_ctrc_local_cut_cannot_borrow_another_native_writer_or_start);
+		UT_RUN(test_ctrc_local_cut_flush_drift_error_and_short_flush_preserve_debt);
+		UT_RUN(test_ctrc_local_cut_record_and_final_owner_checks_refuse_drift);
+		UT_RUN(test_ctrc_local_cut_damage_never_shortens_the_confirmed_native_end);
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
@@ -26318,7 +26326,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(498);
+	UT_PLAN(505);
 	UT_RUN(test_ctrc_namespace_same_root_bytes_cannot_replace_original_directory);
 	UT_RUN(test_ctrc_namespace_initial_root_error_closes_fd_and_retains_scope_debt);
 	UT_RUN(test_ctrc_namespace_retains_readonly_fd_through_scope_lifetime);
@@ -26332,6 +26340,13 @@ main(int argc, char **argv)
 	UT_RUN(test_ctrc_inputs_wait_resume_keeps_original_work_and_whole_root);
 	UT_RUN(test_ctrc_inputs_open_wait_has_no_partial_census_or_mutation_permission);
 	UT_RUN(test_ctrc_inputs_reselects_original_history_after_actual_install);
+	UT_RUN(test_ctrc_local_cut_reads_installed_writer_and_all_original_history);
+	UT_RUN(test_ctrc_local_cut_flushes_one_original_minimum_despite_later_insert);
+	UT_RUN(test_ctrc_local_cut_foreign_open_waits_before_any_callback_or_flush);
+	UT_RUN(test_ctrc_local_cut_cannot_borrow_another_native_writer_or_start);
+	UT_RUN(test_ctrc_local_cut_flush_drift_error_and_short_flush_preserve_debt);
+	UT_RUN(test_ctrc_local_cut_record_and_final_owner_checks_refuse_drift);
+	UT_RUN(test_ctrc_local_cut_damage_never_shortens_the_confirmed_native_end);
 	UT_RUN(test_cold_sync_retained_files_under_original_owner_without_cf);
 	UT_RUN(test_cold_sync_each_io_failure_root_race_and_error_discard_output);
 	UT_RUN(test_cold_sync_requires_exact_root_fsync_role_and_disjoint_output);

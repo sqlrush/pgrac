@@ -3426,7 +3426,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs: %: %.c test_clust
 		$(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_undo_store.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_undo_scan.o \
-		test_cluster_control_cold_census.inc test_cluster_control_ctrc_inputs.inc test_cluster_recovery_native_transcript.inc test_cluster_recovery_wal_tt_roots.inc test_cluster_recovery_multixact_inputs.inc test_cluster_recovery_slru_inputs.inc test_cluster_recovery_xact_slru_inputs.inc test_cluster_recovery_multixact_join_inputs.inc test_cluster_recovery_census_inputs.inc test_cluster_heap_small_scn.inc \
+		test_cluster_control_cold_census.inc test_cluster_control_ctrc_inputs.inc test_cluster_control_ctrc_local_wal.inc test_cluster_recovery_native_transcript.inc test_cluster_recovery_wal_tt_roots.inc test_cluster_recovery_multixact_inputs.inc test_cluster_recovery_slru_inputs.inc test_cluster_recovery_xact_slru_inputs.inc test_cluster_recovery_multixact_join_inputs.inc test_cluster_recovery_census_inputs.inc test_cluster_heap_small_scn.inc \
 		test_cluster_control_root_initialized.inc test_cluster_control_root_first_start.inc test_cluster_control_catalog.inc \
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		test_cluster_control_native_xid.inc \
