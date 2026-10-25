@@ -166,6 +166,10 @@ static uint32 receipt_child_attempt;
 static int receipt_leave_calls;
 static int receipt_unref_calls;
 static int receipt_install_calls;
+static int receipt_wal_calls;
+static int receipt_wal_install_calls;
+static bool receipt_wal_throw;
+static PGAlignedBlock receipt_wal_image;
 /* PGRAC: trap only the explicitly exercised abort boundary. */
 static bool receipt_trap_error;
 static sigjmp_buf receipt_error_jump;
@@ -179,6 +183,7 @@ static bool receipt_throw_apply;
 
 char *DataDir = NULL;
 bool cluster_enabled = false;
+bool cluster_shared_config = false;
 bool IsUnderPostmaster = false;
 bool cluster_undo_gcs_coherence = false;
 bool cluster_trace_normal_stop = false;
@@ -422,6 +427,52 @@ cluster_undo_buf_install_ref_locked(int slot, uint32 segment_id, uint8 owner, ui
 	UT_ASSERT_EQ(receipt_apply_calls, cluster_undo_record_reservation.receipt.ctrc_applied_mask == 3 ? 2 : 1);
 	UT_ASSERT_EQ(((const UndoBlockHeader *)image)->slot_count, 1);
 	receipt_install_calls++;
+}
+
+XLogRecPtr
+cluster_undo_emit_block_write_multi(uint8 instance, uint32 segment_id, uint32 block_no,
+								 const char *image, XLogRecPtr old_lsn, uint16 rec_off,
+								 uint16 rec_len, uint16 slot_off, uint16 slot_len)
+{
+	UT_ASSERT(cluster_shared_config);
+	UT_ASSERT(receipt_buffer_locked);
+	UT_ASSERT(MyProc != NULL && (MyProc->delayChkptFlags & DELAY_CHKPT_START) != 0);
+	UT_ASSERT_EQ(receipt_install_calls, 0);
+	UT_ASSERT_EQ(instance, 1);
+	UT_ASSERT_EQ(segment_id, 1);
+	UT_ASSERT_EQ(block_no, 1);
+	UT_ASSERT_EQ(old_lsn, InvalidXLogRecPtr);
+	UT_ASSERT_EQ(rec_off, sizeof(UndoBlockHeader));
+	UT_ASSERT_EQ(rec_len, ((const UndoBlockHeader *)image)->free_offset - rec_off);
+	UT_ASSERT_EQ(slot_off, UNDO_SLOT_DIR_OFFSET(0));
+	UT_ASSERT_EQ(slot_len, sizeof(UndoSlotDirEntry));
+	receipt_wal_calls++;
+	memcpy(receipt_wal_image.data, image, BLCKSZ);
+	if (receipt_wal_throw) {
+		UT_ASSERT(PG_exception_stack != NULL);
+		siglongjmp(*PG_exception_stack, 1);
+	}
+	return (XLogRecPtr)500;
+}
+
+void
+cluster_undo_buf_install_wal_ref_locked(int slot, uint32 segment_id, uint8 owner,
+									  uint32 block_no, const char image[BLCKSZ], XLogRecPtr wal_lsn)
+{
+	UT_ASSERT_EQ(receipt_wal_calls, 1);
+	UT_ASSERT_EQ(wal_lsn, 500);
+	UT_ASSERT_EQ(((const UndoBlockHeader *)image)->block_lsn, wal_lsn);
+	UT_ASSERT(MyProc != NULL && (MyProc->delayChkptFlags & DELAY_CHKPT_START) != 0);
+	cluster_undo_buf_install_ref_locked(slot, segment_id, owner, block_no, image);
+	receipt_wal_install_calls++;
+}
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
 }
 
 TransactionId
@@ -937,6 +988,7 @@ undo_test_fixture_begin(void)
 
 	DataDir = undo_test_root;
 	cluster_node_id = 0;
+	cluster_shared_config = false;
 	cluster_enabled = false;
 	cluster_undo_gcs_coherence = false;
 	cluster_undo_segments_max_per_instance = CLUSTER_UNDO_SEGS_PER_INSTANCE;
@@ -2785,6 +2837,7 @@ receipt_fixture_ready(uint8 record_type, ClusterUndoRecordPrepareReceipt *receip
 	cluster_undo_local_head_count = 0;
 	memset(&cluster_undo_retry_cancel_snapshot, 0, sizeof(cluster_undo_retry_cancel_snapshot));
 	cluster_node_id = 0;
+	cluster_shared_config = false;
 	MyBackendId = 1;
 	receipt_trap_error = false;
 	receipt_error_level = receipt_error_code = 0;
@@ -2821,6 +2874,8 @@ receipt_fixture_ready(uint8 record_type, ClusterUndoRecordPrepareReceipt *receip
 	receipt_cancel_fail_at = 0;
 	receipt_child_attempt = 0;
 	receipt_leave_calls = receipt_unref_calls = receipt_install_calls = 0;
+	receipt_wal_calls = receipt_wal_install_calls = 0;
+	receipt_wal_throw = false;
 	cluster_undo_current_extent.segment_id = 1;
 	cluster_undo_current_extent.first_block = 1;
 	cluster_undo_current_extent.nblocks = 1;
@@ -3103,6 +3158,115 @@ UT_TEST(test_ready_receipt_survives_prepare_deadline_through_real_consume)
 		cluster_undo_record_cancel_prepared(&receipt);
 		UT_ASSERT_EQ(receipt_cancel_calls, 0); /* Shared APPLIED ownership survives. */
 	}
+}
+
+static void
+receipt_native_insert_fixture(ClusterUndoRecordPrepareReceipt *receipt,
+							  ClusterUndoRecordTarget *target)
+{
+	UndoItlHistoryEntry history = { 0 };
+	ClusterCtrcTargetV1 final_target = { 0 };
+	ClusterCtrcApplyToken token;
+
+	receipt_fixture_ready(UNDO_RECORD_INSERT, receipt);
+	cluster_shared_config = true;
+	receipt->ctrc_pending_mask = 1;
+	receipt->ctrc_pending_targets[0].block_number = 37;
+	memset(target, 0, sizeof(*target));
+	target->locator.spcOid = 1663;
+	target->locator.dbOid = 5;
+	target->locator.relNumber = 20000;
+	target->forknum = MAIN_FORKNUM;
+	target->blockno = 37;
+	target->offnum = 1;
+	history.block = final_target.block_number = 37;
+	history.after_kind = ITL_FLAG_ACTIVE;
+	history.after_write_scn = 999;
+	UT_ASSERT(cluster_undo_record_receipt_sync(receipt));
+	UT_ASSERT(cluster_undo_record_ctrc_prepare_pending(receipt, 0));
+	UT_ASSERT(cluster_undo_record_stage_history(receipt, 0, &history));
+	UT_ASSERT_EQ(cluster_undo_record_consume_preflight(receipt, sizeof(UndoInsertPayload)),
+				 CLUSTER_UNDO_RECORD_CONSUME_PREFLIGHT_READY);
+	UT_ASSERT_EQ(cluster_undo_record_ctrc_apply_prepared(receipt, 0, &final_target, &token),
+				 CLUSTER_CTRC_APPLY_APPLIED);
+}
+
+/* Catches a returned native UBA whose undo exists only in the old clean,
+ * process-local pending window.  The real consumer must publish WAL first. */
+UT_TEST(test_native_prepared_undo_is_wal_backed_before_uba_publication)
+{
+	PGPROC proc = { 0 };
+	PGPROC *saved_proc = MyProc;
+	const int saved_flags[] = { DELAY_CHKPT_COMPLETE, DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE };
+
+	MyProc = &proc;
+	for (size_t i = 0; i < lengthof(saved_flags); i++) {
+		ClusterUndoRecordPrepareReceipt receipt;
+		ClusterUndoRecordPrepareReceipt zero = { 0 };
+		ClusterUndoRecordTarget target;
+		UndoInsertPayload payload = { 0 };
+		UBA uba;
+
+		receipt_native_insert_fixture(&receipt, &target);
+		proc.delayChkptFlags = saved_flags[i];
+		UT_ASSERT_EQ(cluster_undo_record_consume_prepared(&receipt, &target, &payload,
+														 sizeof(payload), &uba),
+					 CLUSTER_UNDO_RECORD_CONSUME_APPLIED);
+		UT_ASSERT(!UBA_is_invalid(uba));
+		UT_ASSERT_EQ(receipt_wal_calls, 1);
+		UT_ASSERT_EQ(receipt_wal_install_calls, 1);
+		UT_ASSERT_EQ(receipt_install_calls, 1);
+		UT_ASSERT_EQ(receipt_unref_calls, 1);
+		UT_ASSERT_EQ(receipt_leave_calls, 1);
+		UT_ASSERT_EQ(proc.delayChkptFlags, saved_flags[i]);
+		UT_ASSERT(!cluster_undo_pending.active);
+		UT_ASSERT(!cluster_undo_record_reservation.active);
+		UT_ASSERT(!receipt_buffer_locked);
+		UT_ASSERT_EQ(memcmp(&receipt, &zero, sizeof(receipt)), 0);
+	}
+	cluster_shared_config = false;
+	MyProc = saved_proc;
+}
+
+/* Catches WAL insertion failure being converted to success or discharging
+ * the original APPLY/ref owner; the checkpoint exclusion must still end. */
+UT_TEST(test_native_prepared_undo_wal_error_retains_original_debt)
+{
+	PGPROC proc = { 0 };
+	PGPROC *saved_proc = MyProc;
+	ClusterUndoRecordPrepareReceipt receipt;
+	ClusterUndoRecordTarget target;
+	UndoInsertPayload payload = { 0 };
+	UBA uba = InvalidUba;
+	volatile bool caught = false;
+
+	receipt_native_insert_fixture(&receipt, &target);
+	MyProc = &proc;
+	proc.delayChkptFlags = DELAY_CHKPT_COMPLETE;
+	receipt_wal_throw = true;
+	PG_TRY();
+	{
+		(void)cluster_undo_record_consume_prepared(&receipt, &target, &payload, sizeof(payload),
+												  &uba);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT(UBA_is_invalid(uba));
+	UT_ASSERT_EQ(receipt_wal_calls, 1);
+	UT_ASSERT_EQ(receipt_install_calls, 0);
+	UT_ASSERT_EQ(receipt_unref_calls + receipt_leave_calls + receipt_cancel_calls, 0);
+	UT_ASSERT(cluster_undo_record_reservation.active);
+	UT_ASSERT(cluster_undo_record_reservation.consume_locked);
+	UT_ASSERT(cluster_undo_record_reservation.owns_ref);
+	UT_ASSERT_EQ(cluster_undo_record_reservation.receipt.ctrc_applied_mask, 1);
+	UT_ASSERT(!cluster_undo_pending.active);
+	UT_ASSERT_EQ(proc.delayChkptFlags, DELAY_CHKPT_COMPLETE);
+	cluster_shared_config = false;
+	MyProc = saved_proc;
 }
 
 UT_TEST(test_ready_preflight_crosses_old_deadline_while_taking_lock)
@@ -4739,7 +4903,7 @@ UT_TEST(test_receipt_consumer_later_apply_error_cannot_reuse_earlier_result)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(111);
+	UT_PLAN(113);
 	UT_RUN(test_lifecycle_activation_refusal_reports_original_current_stage);
 	UT_RUN(test_receipt_lifecycle_reports_original_shared_path_without_replay);
 	UT_RUN(test_receipt_lifecycle_begin_unknown_and_cancel_do_not_borrow_shared_path);
@@ -4822,6 +4986,8 @@ main(int argc, char **argv)
 	UT_RUN(test_record_drain_owner_stamps_only_after_gate);
 	UT_RUN(test_live_lifecycle_writers_use_only_exact_block0_current);
 	UT_RUN(test_ready_receipt_survives_prepare_deadline_through_real_consume);
+	UT_RUN(test_native_prepared_undo_is_wal_backed_before_uba_publication);
+	UT_RUN(test_native_prepared_undo_wal_error_retains_original_debt);
 	UT_RUN(test_ready_preflight_crosses_old_deadline_while_taking_lock);
 	UT_RUN(test_ready_contention_retries_without_cancel_or_new_deadline);
 	UT_RUN(test_ready_identity_mismatch_is_not_hidden_by_lifetime_fix);

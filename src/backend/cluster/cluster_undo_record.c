@@ -2776,15 +2776,48 @@ undo_receipt_prepare_owner_trace(const char *event,
 
 static void
 cluster_undo_record_install_prepared_resident_locked(const ClusterUndoRecordPrepareReceipt *receipt,
-													 const char image[BLCKSZ])
+													 char image[BLCKSZ])
 {
 	ClusterUndoRecordReservation *reservation = &cluster_undo_record_reservation;
 
 	if (receipt == NULL || image == NULL || !reservation->consume_locked
 		|| reservation->ref_slot < 0)
 		elog(PANIC, "cluster undo prepared consume reached install without its exact lock");
-	cluster_undo_buf_install_ref_locked(reservation->ref_slot, receipt->actual_segment_id,
-										receipt->owner_instance, receipt->extent.cur_block, image);
+	if (cluster_shared_config) {
+		UndoBlockHeader *header = (UndoBlockHeader *)image;
+		uint16 rec_off = receipt->extent.cur_free_offset;
+		int saved_delay_flags;
+
+		/* A returned UBA may outlive both this backend and its transaction.
+		 * Protect its original undo image before exposure, then make it visible
+		 * to the existing checkpoint/eviction owner in the same short window.
+		 * No pending image or storage I/O may escape this heap-lock consumer. */
+		if (MyProc == NULL || cluster_undo_pending.active || !reservation->owns_ref)
+			elog(PANIC, "cluster undo native prepared publication lost its original owner");
+		saved_delay_flags = MyProc->delayChkptFlags;
+		MyProc->delayChkptFlags = saved_delay_flags | DELAY_CHKPT_START;
+		PG_TRY();
+		{
+			XLogRecPtr lsn = cluster_undo_emit_block_write_multi(
+				receipt->owner_instance, receipt->actual_segment_id, receipt->extent.cur_block,
+				image, ((UndoBlockHeader *)reservation->block.data)->block_lsn, rec_off,
+				(uint16)(header->free_offset - rec_off),
+				(uint16)UNDO_SLOT_DIR_OFFSET(receipt->extent.cur_slot_count),
+				sizeof(UndoSlotDirEntry));
+
+			header->block_lsn = lsn;
+			cluster_undo_buf_install_wal_ref_locked(
+				reservation->ref_slot, receipt->actual_segment_id, receipt->owner_instance,
+				receipt->extent.cur_block, image, lsn);
+		}
+		PG_FINALLY();
+		{
+			MyProc->delayChkptFlags = saved_delay_flags;
+		}
+		PG_END_TRY();
+	} else
+		cluster_undo_buf_install_ref_locked(reservation->ref_slot, receipt->actual_segment_id,
+											receipt->owner_instance, receipt->extent.cur_block, image);
 	cluster_undo_buf_unlock_ref(reservation->ref_slot);
 	reservation->consume_locked = false;
 }
@@ -2936,7 +2969,7 @@ cluster_undo_record_prepare_trace_impl(uint8 record_type, uint16 payload_capacit
 		return CLUSTER_UNDO_RECORD_PREPARE_RETRY_REQUIRED;
 
 	if (cluster_undo_pending.active
-		&& (cluster_undo_pending.segment_id != ext->segment_id
+		&& (cluster_shared_config || cluster_undo_pending.segment_id != ext->segment_id
 			|| cluster_undo_pending.owner_instance != owner_instance
 			|| cluster_undo_pending.block_no != ext->cur_block)
 		&& !cluster_undo_pending_flush_internal(false))
@@ -3884,28 +3917,35 @@ cluster_undo_record_consume_prepared(ClusterUndoRecordPrepareReceipt *receipt,
 
 	cluster_undo_record_install_prepared_resident_locked(receipt, successor.data);
 
-	if (!cluster_undo_pending.active) {
-		cluster_undo_pending.active = true;
-		cluster_undo_pending.owner_instance = receipt->owner_instance;
-		cluster_undo_pending.segment_id = receipt->actual_segment_id;
-		cluster_undo_pending.block_no = receipt->extent.cur_block;
-		cluster_undo_pending.old_block_lsn
-			= ((UndoBlockHeader *)reservation->block.data)->block_lsn;
-		cluster_undo_pending.rec_lo = (uint16)free_offset;
-		cluster_undo_pending.rec_hi = (uint16)free_offset;
-		cluster_undo_pending.slot_min_off = PG_UINT16_MAX;
-		cluster_undo_pending.slot_max_off = 0;
-		cluster_undo_pending.nrecords = 0;
-		cluster_undo_pending.ref_slot = reservation->ref_slot;
+	if (cluster_shared_config) {
+		/* The original checkpoint-visible slot owns durability after install;
+		 * this reservation no longer needs a process-local pending reference. */
+		cluster_undo_buf_unref_slot(reservation->ref_slot);
 		reservation->owns_ref = false;
+	} else {
+		if (!cluster_undo_pending.active) {
+			cluster_undo_pending.active = true;
+			cluster_undo_pending.owner_instance = receipt->owner_instance;
+			cluster_undo_pending.segment_id = receipt->actual_segment_id;
+			cluster_undo_pending.block_no = receipt->extent.cur_block;
+			cluster_undo_pending.old_block_lsn
+				= ((UndoBlockHeader *)reservation->block.data)->block_lsn;
+			cluster_undo_pending.rec_lo = (uint16)free_offset;
+			cluster_undo_pending.rec_hi = (uint16)free_offset;
+			cluster_undo_pending.slot_min_off = PG_UINT16_MAX;
+			cluster_undo_pending.slot_max_off = 0;
+			cluster_undo_pending.nrecords = 0;
+			cluster_undo_pending.ref_slot = reservation->ref_slot;
+			reservation->owns_ref = false;
+		}
+		memcpy(cluster_undo_pending.buf, successor.data, BLCKSZ);
+		cluster_undo_pending.rec_hi = (uint16)(free_offset + record_length);
+		if ((uint16)UNDO_SLOT_DIR_OFFSET(new_slot_idx) < cluster_undo_pending.slot_min_off)
+			cluster_undo_pending.slot_min_off = (uint16)UNDO_SLOT_DIR_OFFSET(new_slot_idx);
+		if ((uint16)UNDO_SLOT_DIR_OFFSET(new_slot_idx) > cluster_undo_pending.slot_max_off)
+			cluster_undo_pending.slot_max_off = (uint16)UNDO_SLOT_DIR_OFFSET(new_slot_idx);
+		cluster_undo_pending.nrecords++;
 	}
-	memcpy(cluster_undo_pending.buf, successor.data, BLCKSZ);
-	cluster_undo_pending.rec_hi = (uint16)(free_offset + record_length);
-	if ((uint16)UNDO_SLOT_DIR_OFFSET(new_slot_idx) < cluster_undo_pending.slot_min_off)
-		cluster_undo_pending.slot_min_off = (uint16)UNDO_SLOT_DIR_OFFSET(new_slot_idx);
-	if ((uint16)UNDO_SLOT_DIR_OFFSET(new_slot_idx) > cluster_undo_pending.slot_max_off)
-		cluster_undo_pending.slot_max_off = (uint16)UNDO_SLOT_DIR_OFFSET(new_slot_idx);
-	cluster_undo_pending.nrecords++;
 
 	cluster_semantic_activation_leave(&cluster_undo_record_reservation.receipt.modifier_admission);
 	cluster_undo_record_reservation.active = false;

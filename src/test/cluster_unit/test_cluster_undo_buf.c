@@ -44,6 +44,7 @@
 #include "cluster/cluster_conf.h" /* ClusterConf type for the single-node latch stub */
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_undo_format.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_buf.h"
@@ -76,6 +77,7 @@ UT_DEFINE_GLOBALS();
  * node 0 keeps every smgr call on the RUNTIME_SHARED (own) branch.
  */
 int cluster_node_id = 0;
+bool cluster_shared_config = false;
 /* Linked block-zero observer is not called by this DATA-pool fixture. */
 bool IsUnderPostmaster = false;
 BackendType MyBackendType = B_INVALID;
@@ -262,6 +264,12 @@ LWLockHeldByMe(LWLock *lock)
 {
 	return undo_test_conditionally_held_lock == lock;
 }
+bool
+LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
+{
+	/* This fixture retains only the exclusive prepared-consume lock. */
+	return mode == LW_EXCLUSIVE && LWLockHeldByMe(lock);
+}
 
 void
 cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unused())
@@ -304,21 +312,28 @@ pg_re_throw(void)
 	abort();
 }
 
-/* ----- elog/ereport stubs (the U1-U6 paths never raise; symbols only) ----- */
+static bool undo_test_trap_error;
+static sigjmp_buf undo_test_error_jump;
+static int undo_test_error_level;
+
+/* ----- elog/ereport stubs (only explicit invalid-publication cases raise) ----- */
 bool
-errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+errstart(int elevel, const char *domain pg_attribute_unused())
 {
+	undo_test_error_level = elevel;
 	return true;
 }
 bool
-errstart_cold(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+errstart_cold(int elevel, const char *domain pg_attribute_unused())
 {
-	return true;
+	return errstart(elevel, domain);
 }
 void
 errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
 {
+	if (undo_test_trap_error)
+		siglongjmp(undo_test_error_jump, 1);
 	abort(); /* no U1-U6 test reaches an error */
 }
 int
@@ -357,6 +372,8 @@ static int smgr_fsync_write_calls = 0; /* spec-4.8ab D2: write-back flush (do_fs
 static bool smgr_last_write_fsync = true;
 static uint32 smgr_last_write_block = 0;
 static char smgr_last_write_byte0 = 0;
+static char smgr_last_write_image[BLCKSZ];
+static XLogRecPtr undo_test_flushed_lsn;
 
 bool
 cluster_undo_smgr_read_block(ClusterUndoPathIntent intent pg_attribute_unused(),
@@ -381,6 +398,7 @@ cluster_undo_smgr_write_block(ClusterUndoPathIntent intent pg_attribute_unused()
 	smgr_last_write_fsync = do_fsync;
 	smgr_last_write_block = block_no;
 	smgr_last_write_byte0 = buf[0];
+	memcpy(smgr_last_write_image, buf, BLCKSZ);
 	return true;
 }
 
@@ -407,8 +425,10 @@ errcode_for_file_access(void)
 /* XLogFlush stub: the write-back flush path (flush_dirty_slot) references it,
  * but U1-U6 run with write-back gated off so it is never executed. */
 void
-XLogFlush(XLogRecPtr record pg_attribute_unused())
-{}
+XLogFlush(XLogRecPtr record)
+{
+	undo_test_flushed_lsn = record;
+}
 
 /* GetFlushRecPtr stub: flush_dirty_slot's WAL-before-data guard (spec-4.8ab D1)
  * compares the block's protecting LSN against this durable bound.  The D2
@@ -440,6 +460,9 @@ fresh_pool(void)
 	}
 	smgr_read_calls = smgr_write_calls = smgr_fsync_write_calls = 0;
 	smgr_last_write_fsync = true;
+	undo_test_flushed_lsn = InvalidXLogRecPtr;
+	undo_test_trap_error = false;
+	cluster_shared_config = false;
 	undo_test_conditionally_held_lock = NULL;
 	undo_test_conditional_acquire_allowed = true;
 	cluster_undo_buf_shmem_init();
@@ -598,6 +621,101 @@ UT_TEST(test_undo_buf_prepared_consume_lock_window)
 	cluster_undo_buf_unref_slot(ref_slot);
 }
 
+
+/* The native prepared receipt uses the original checkpoint/eviction owner,
+ * even when the legacy peered/GUC write-back switch is off.  Missing dirty
+ * publication would make the checkpoint silently leave the new UBA on disk. */
+UT_TEST(test_native_prepared_undo_is_checkpoint_visible_with_legacy_gate_off)
+{
+	ClusterConf conf = { 0 };
+	ClusterUndoBufPin pin;
+	PGAlignedBlock successor = { 0 };
+	char copied[BLCKSZ];
+	UndoBlockHeader *header = (UndoBlockHeader *)successor.data;
+	int ref_slot;
+
+	fresh_pool();
+	conf.node_count = 4;
+	ClusterConfShmem = &conf;
+	cluster_undo_buffer_writeback = false;
+	cluster_shared_config = true;
+	UT_ASSERT(!cluster_undo_buf_writeback_allowed());
+	UT_ASSERT_NOT_NULL(cluster_undo_buf_pin(9, 1, 7, CLUSTER_UNDO_BUF_SHARED, &pin));
+	ref_slot = pin.slot;
+	cluster_undo_buf_addref(&pin);
+	cluster_undo_buf_unpin(&pin);
+	UT_ASSERT(cluster_undo_buf_lock_ref_conditional(ref_slot, 9, 1, 7));
+	header->magic = PGRAC_UNDO_BLOCK_MAGIC;
+	header->block_version = UNDO_BLOCK_VERSION_1;
+	header->block_lsn = 500;
+	successor.data[128] = 0x6d;
+	cluster_undo_buf_install_wal_ref_locked(ref_slot, 9, 1, 7, successor.data, 500);
+	UT_ASSERT_EQ(smgr_write_calls, 0); /* No file I/O under the heap lock. */
+	cluster_undo_buf_unlock_ref(ref_slot);
+	cluster_undo_buf_unref_slot(ref_slot);
+	cluster_undo_buf_flush_all(true);
+	UT_ASSERT_EQ(smgr_write_calls, 1);
+	UT_ASSERT_EQ(smgr_fsync_write_calls, 1);
+	UT_ASSERT_EQ(undo_test_flushed_lsn, 500);
+	UT_ASSERT_EQ(memcmp(smgr_last_write_image, successor.data, BLCKSZ), 0);
+	UT_ASSERT(cluster_undo_buf_copy_resident(9, 1, 7, copied));
+	UT_ASSERT_EQ(memcmp(copied, successor.data, BLCKSZ), 0);
+	cluster_undo_buf_flush_all(true);
+	UT_ASSERT_EQ(smgr_write_calls, 1); /* Completed dirty debt is retired. */
+	UT_ASSERT(!cluster_undo_buf_writeback_allowed());
+	cluster_shared_config = false;
+	ClusterConfShmem = NULL;
+}
+
+/* Each wrong authority/LSN must PANIC before replacing a prior valid image. */
+UT_TEST(test_native_prepared_undo_rejects_unowned_or_invalid_wal_before_copy)
+{
+	ClusterUndoBufPin pin;
+	PGAlignedBlock predecessor = { 0 };
+	PGAlignedBlock successor;
+	char copied[BLCKSZ];
+	UndoBlockHeader *header = (UndoBlockHeader *)predecessor.data;
+	int ref_slot;
+
+	fresh_pool();
+	cluster_shared_config = true;
+	UT_ASSERT_NOT_NULL(cluster_undo_buf_pin(9, 1, 7, CLUSTER_UNDO_BUF_SHARED, &pin));
+	ref_slot = pin.slot;
+	cluster_undo_buf_addref(&pin);
+	cluster_undo_buf_unpin(&pin);
+	UT_ASSERT(cluster_undo_buf_lock_ref_conditional(ref_slot, 9, 1, 7));
+	header->magic = PGRAC_UNDO_BLOCK_MAGIC;
+	header->block_version = UNDO_BLOCK_VERSION_1;
+	header->block_lsn = 500;
+	cluster_undo_buf_install_wal_ref_locked(ref_slot, 9, 1, 7, predecessor.data, 500);
+	for (int variant = 0; variant < 7; variant++) {
+		uint8 owner = variant == 0 ? 2 : 1;
+		XLogRecPtr lsn = variant == 1 ? InvalidXLogRecPtr : variant == 2 ? 499 : 501;
+
+		memcpy(successor.data, predecessor.data, BLCKSZ);
+		((UndoBlockHeader *)successor.data)->block_lsn = variant == 3 ? 502 : lsn;
+		if (variant == 4)
+			((UndoBlockHeader *)successor.data)->magic = 0;
+		cluster_shared_config = variant != 5;
+		cluster_node_id = variant == 6 ? -1 : 0;
+		successor.data[128] = 0x6d;
+		undo_test_trap_error = true;
+		if (sigsetjmp(undo_test_error_jump, 1) == 0) {
+			cluster_undo_buf_install_wal_ref_locked(ref_slot, 9, owner, 7, successor.data, lsn);
+			UT_ASSERT(false);
+		} else
+			UT_ASSERT_EQ(undo_test_error_level, PANIC);
+		undo_test_trap_error = false;
+		cluster_undo_buf_unlock_ref(ref_slot);
+		UT_ASSERT(cluster_undo_buf_copy_resident(9, 1, 7, copied));
+		UT_ASSERT_EQ(memcmp(copied, predecessor.data, BLCKSZ), 0);
+		UT_ASSERT(cluster_undo_buf_lock_ref_conditional(ref_slot, 9, 1, 7));
+	}
+	cluster_undo_buf_unlock_ref(ref_slot);
+	cluster_undo_buf_unref_slot(ref_slot);
+	cluster_node_id = 0;
+	cluster_shared_config = false;
+}
 
 /* ===== Spec 8.4A D1 — block0 gets B=D separate sparse frames ===== */
 UT_TEST(test_undo_buf_region_keeps_data_and_block0_frame_capacity_separate)
@@ -932,6 +1050,8 @@ main(void)
 	UT_RUN(test_undo_buf_miss_then_hit);
 	UT_RUN(test_undo_buf_copy_resident_never_fills_on_miss);
 	UT_RUN(test_undo_buf_prepared_consume_lock_window);
+	UT_RUN(test_native_prepared_undo_is_checkpoint_visible_with_legacy_gate_off);
+	UT_RUN(test_native_prepared_undo_rejects_unowned_or_invalid_wal_before_copy);
 	UT_RUN(test_undo_buf_region_keeps_data_and_block0_frame_capacity_separate);
 	UT_RUN(test_undo_buf_disable_detaches_block0_frame_bank);
 	UT_RUN(test_undo_buf_write_through);
