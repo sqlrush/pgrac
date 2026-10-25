@@ -83,6 +83,20 @@ extern bool cluster_relmap_producer_prepare_v2(bool shared,
 	const struct RelMapFile *updates, struct ClusterRelmapOwnerSampleV2 *owner_out,
 	struct ClusterRelmapV2Image *staged_out);
 
+/* Dormant original producer custody. Arm obtains successful original prepare
+ * receipts in this invocation and retains them privately per map flavour;
+ * no external image can replace them. Same failure duties as prepare_v2.
+ * Finish is for the original authenticated terminal caller BEFORE top FullXid
+ * teardown, with global relmap X retained and no mapping/XidGen/retention lock.
+ * Its first attempt latches both slots before fallible checks. False/ERROR
+ * keeps custody and pins/debt; never retry or switch terminal polarity.
+ * True means only this batch's dual-copy cleanup and original-owner recheck,
+ * then local custody retirement. Caller retains original postcommit fail-stop
+ * or abort failure handling, local-map/invalidation/lock/physical-file duties.
+ * No live hook, terminal classifier/proof, COMPLETE or release authority. */
+extern bool cluster_relmap_producer_arm_v2(bool shared, const struct RelMapFile *updates);
+extern bool cluster_relmap_producer_finish_v2(bool is_commit);
+
 /* PGRAC (spec-6.14 D5): post-commit publish / abort discard of a staged
  * shared relmap authority image. */
 extern void AtEOXact_ClusterRelmapPublish(void);

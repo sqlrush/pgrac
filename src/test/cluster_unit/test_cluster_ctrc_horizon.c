@@ -28,6 +28,7 @@ static unsigned sender_calls, sender_capability_reads;
 static unsigned sender_unknown_on_peer;
 static ClusterCtrcOriginEntry sender_foreign_request;
 static ClusterHeapFreezeReportV2 sender_report;
+static void (*sender_peer_current_observer)(void);
 
 /* Observe only the sender's original maintenance spinlock here. The shared
  * engine above keeps its original strict census-lock observer unchanged. */
@@ -86,6 +87,12 @@ cluster_sf_peer_capability_generation_matches(int32 peer, uint32 required, uint3
 	UT_ASSERT(!native_lock_held && !native_cleaner_lock_held && !sender_maintenance_held);
 	UT_ASSERT_EQ(peer, 1);
 	UT_ASSERT_EQ(required, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2);
+	if (sender_peer_current_observer != NULL) {
+		void (*observe)(void) = sender_peer_current_observer;
+
+		sender_peer_current_observer = NULL;
+		observe();
+	}
 	if (sender_unknown_on_peer != 0) {
 		unsigned kind = sender_unknown_on_peer;
 
@@ -497,10 +504,94 @@ UT_TEST(test_actual_replication_h_refusal_cannot_become_v2_report_or_sequence_de
 	UT_ASSERT_EQ(sender_history_reads, 5);
 }
 
+UT_TEST(test_actual_worker_restart_withholds_report_until_new_complete_scan)
+{
+	ClusterUndoCleanerActiveSample active = original_sender_source(), restarted;
+	ClusterUndoRetentionSample history;
+	ClusterHeapFreezeReportV2 accepted;
+
+	sender_sample_clock = 700;
+	sender_history_reads = 0;
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&history));
+	assert_actual_history_report(&active, &history, 1);
+	memcpy(&accepted, &sender_report, sizeof(accepted));
+	native_future = FullTransactionIdFromU64(U64FromFullTransactionId(native_future) + 16);
+	undo_cleaner_publish_status(UNDO_CLEANER_SPAWNING);
+	for (unsigned phase = 0; phase < 2; phase++) {
+		if (phase == 1)
+			undo_cleaner_publish_status(UNDO_CLEANER_READY);
+		UT_ASSERT_EQ(native_cleaner_state.workers[0].pid, active.worker_pid);
+		/* The original registration cut remains current; a matching PID and
+		 * that cut cannot replace the retired worker publication. */
+		UT_ASSERT(cluster_ctrc_active_scan_registration_current(&active.scan));
+		UT_ASSERT(!native_cleaner_sample_current(&active));
+		undo_horizon_send_v2(1, &active, &history);
+		UT_ASSERT_EQ(sender_calls, 1);
+		UT_ASSERT_EQ(sender_state.report_sequence, 1);
+		UT_ASSERT(memcmp(&sender_report, &accepted, sizeof(accepted)) == 0);
+	}
+	finish_original_worker_pass();
+	UT_ASSERT(native_cleaner_sample(&restarted));
+	UT_ASSERT(native_cleaner_sample_current(&restarted));
+	UT_ASSERT_EQ(restarted.worker_pid, active.worker_pid);
+	UT_ASSERT_EQ(restarted.sample_id, active.sample_id + 1);
+	UT_ASSERT(FullTransactionIdEquals(restarted.scan.future_full, native_future));
+	UT_ASSERT(FullTransactionIdEquals(restarted.scan.min_full, active.scan.min_full));
+	UT_ASSERT(!native_cleaner_sample_current(&active));
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&history));
+	assert_actual_history_report(&restarted, &history, 2);
+}
+
+static ClusterUndoCleanerActiveSample sender_respawn_source;
+
+static void
+restart_original_worker_at_peer_check(void)
+{
+	UT_ASSERT(!native_cleaner_lock_held && !native_lock_held && held_count == 0);
+	UT_ASSERT(!sender_maintenance_held);
+	exercise_same_pid_worker_respawn(&sender_respawn_source,
+		&sender_respawn_source.admission_fence);
+}
+
+UT_TEST(test_actual_same_pid_respawn_during_peer_check_rejects_old_sample)
+{
+	ClusterUndoCleanerActiveSample active = original_sender_source(), restarted;
+	ClusterUndoRetentionSample history;
+	ClusterHeapFreezeReportV2 accepted;
+
+	sender_sample_clock = 700;
+	sender_history_reads = 0;
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&history));
+	assert_actual_history_report(&active, &history, 1);
+	memcpy(&accepted, &sender_report, sizeof(accepted));
+	sender_respawn_source = active;
+	native_future = FullTransactionIdFromU64(U64FromFullTransactionId(native_future) + 16);
+	native_worker_respawn = true;
+	native_worker_respawns = 0;
+	sender_peer_current_observer = restart_original_worker_at_peer_check;
+	undo_horizon_send_v2(1, &active, &history);
+	native_worker_respawn = false;
+	UT_ASSERT(sender_peer_current_observer == NULL);
+	UT_ASSERT_EQ(native_worker_respawns, 1);
+	UT_ASSERT_EQ(sender_calls, 1);
+	UT_ASSERT_EQ(sender_state.report_sequence, 1);
+	UT_ASSERT(memcmp(&sender_report, &accepted, sizeof(accepted)) == 0);
+	UT_ASSERT(cluster_ctrc_active_scan_registration_current(&active.scan));
+	UT_ASSERT(!native_cleaner_sample_current(&active));
+	UT_ASSERT(native_cleaner_sample(&restarted));
+	UT_ASSERT(native_cleaner_sample_current(&restarted));
+	UT_ASSERT_EQ(restarted.worker_pid, active.worker_pid);
+	UT_ASSERT_EQ(restarted.sample_id, active.sample_id + 1);
+	UT_ASSERT(FullTransactionIdEquals(restarted.scan.future_full, native_future));
+	UT_ASSERT(FullTransactionIdEquals(restarted.scan.min_full, active.scan.min_full));
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&history));
+	assert_actual_history_report(&restarted, &history, 2);
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(9);
 	UT_RUN(test_original_protection_exit_and_complete_worker_reach_v2_wire);
 	UT_RUN(test_actual_foreign_receipt_revokes_old_report_and_blocks_new_unqualified_report);
 	UT_RUN(test_actual_foreign_close_revokes_old_report_and_blocks_new_unqualified_report);
@@ -508,5 +599,7 @@ main(void)
 	UT_RUN(test_applied_receipt_report_retains_source_until_exact_final_certificate_reply);
 	UT_RUN(test_original_snapshot_then_native_exit_clock_h_reach_retained_f_report);
 	UT_RUN(test_actual_replication_h_refusal_cannot_become_v2_report_or_sequence_debit);
+	UT_RUN(test_actual_worker_restart_withholds_report_until_new_complete_scan);
+	UT_RUN(test_actual_same_pid_respawn_during_peer_check_rejects_old_sample);
 	return ut_failed_count == 0 ? 0 : 1;
 }

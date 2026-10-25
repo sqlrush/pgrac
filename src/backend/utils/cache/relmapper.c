@@ -1302,6 +1302,16 @@ typedef struct ClusterRelmapPublishArm
 
 static ClusterRelmapPublishArm cluster_relmap_publish_arms[2];
 
+typedef struct ClusterRelmapProducerArmV2
+{
+	bool armed;
+	ClusterRelmapOwnerSampleV2 sample;
+	ClusterRelmapV2Image staged;
+} ClusterRelmapProducerArmV2;
+
+static ClusterRelmapProducerArmV2 cluster_relmap_v2_arms[2];
+static bool cluster_relmap_v2_finish_entered;
+
 /* Bounded post-commit retries before fail-stop (r4-P1). */
 #define CLUSTER_RELMAP_PUBLISH_RETRIES 10
 
@@ -1430,6 +1440,79 @@ cluster_relmap_producer_prepare_v2(bool shared, const RelMapFile *updates,
 refused:
 	LWLockRelease(RelationMappingLock);
 	return false;
+}
+
+bool
+cluster_relmap_producer_arm_v2(bool shared, const RelMapFile *updates)
+{
+	ClusterRelmapProducerArmV2 *arm = &cluster_relmap_v2_arms[shared ? 0 : 1];
+	ClusterRelmapOwnerSampleV2 sample;
+	ClusterRelmapV2Image staged;
+
+	if (arm->armed || cluster_relmap_v2_finish_entered
+		|| cluster_relmap_publish_arms[0].armed || cluster_relmap_publish_arms[1].armed)
+		return false;
+	for (int slot = 0; slot < 2; slot++)
+	{
+		const ClusterRelmapProducerArmV2 *previous = &cluster_relmap_v2_arms[slot];
+
+		if (previous->armed && (!cluster_relmap_owner_matches_v2(&previous->sample)
+			|| (!previous->staged.identity.shared && MyDatabaseId != previous->staged.identity.dbid)))
+			return false;
+	}
+	if (!cluster_relmap_producer_prepare_v2(shared, updates, &sample, &staged))
+		return false;
+	/* Only nofail stores follow the original successful prepare. */
+	arm->sample = sample;
+	arm->staged = staged;
+	arm->armed = true;
+	return true;
+}
+
+bool
+cluster_relmap_producer_finish_v2(bool is_commit)
+{
+	if (cluster_relmap_v2_finish_entered
+		|| (!cluster_relmap_v2_arms[0].armed && !cluster_relmap_v2_arms[1].armed))
+		return false;
+	/* Latch before any fallible check or I/O. Even a partial cleanup must not
+	 * be retried here, including by switching to the other terminal polarity. */
+	cluster_relmap_v2_finish_entered = true;
+	if (cluster_relmap_publish_arms[0].armed || cluster_relmap_publish_arms[1].armed
+		|| LWLockHeldByMe(RelationMappingLock) || LWLockHeldByMe(XidGenLock))
+		return false;
+	for (int slot = 0; slot < 2; slot++)
+	{
+		const ClusterRelmapProducerArmV2 *arm = &cluster_relmap_v2_arms[slot];
+
+		if (arm->armed && (!cluster_relmap_owner_terminal_matches_v2(&arm->sample)
+			|| (!arm->staged.identity.shared && MyDatabaseId != arm->staged.identity.dbid)))
+			return false;
+	}
+	for (int slot = 0; slot < 2; slot++)
+	{
+		const ClusterRelmapProducerArmV2 *arm = &cluster_relmap_v2_arms[slot];
+		ClusterRelmapV2ClearResult result;
+
+		if (!arm->armed)
+			continue;
+		result = is_commit ? cluster_relmap_retention_runtime_publish_v2(&arm->sample, &arm->staged)
+			: cluster_relmap_retention_runtime_discard_pending_v2(&arm->sample, &arm->staged);
+		if (result != CLUSTER_RELMAP_V2_CLEARED_POSTREAD)
+			return false;
+	}
+	for (int slot = 0; slot < 2; slot++)
+	{
+		const ClusterRelmapProducerArmV2 *arm = &cluster_relmap_v2_arms[slot];
+
+		if (arm->armed && (!cluster_relmap_owner_terminal_matches_v2(&arm->sample)
+			|| (!arm->staged.identity.shared && MyDatabaseId != arm->staged.identity.dbid)))
+			return false;
+	}
+	/* Retire local custody only. Original pins and all caller duties remain. */
+	memset(cluster_relmap_v2_arms, 0, sizeof(cluster_relmap_v2_arms));
+	cluster_relmap_v2_finish_entered = false;
+	return true;
 }
 
 static void
