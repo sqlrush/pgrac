@@ -2136,6 +2136,17 @@ test_cluster_heap_ctrc_init.inc: $(top_srcdir)/src/backend/cluster/cluster_termi
 	     END { if (matches != 2 || found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Actual shared-origin producer/readers; count both stat definitions but emit
+# only the production body. The production preprocessor branch stays intact.
+test_cluster_heap_ctrc_origin.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk '/^(cluster_ctrc_origin_original_full_xid_exact|ctrc_origin_index|cluster_ctrc_origin_original_full_xid_shared|cluster_ctrc_origin_open_reserved)\(/ { print "static bool"; emit=1; found++ } \
+	     /^(cluster_ctrc_origin_reserve_entry|cluster_ctrc_origin_reserve_active)\(/ { print "static ClusterCtrcOriginReserveResult"; emit=1; found++ } \
+	     /^cluster_ctrc_origin_open_active\(/ { print "static ClusterCtrcOriginOpenResult"; emit=1; found++ } \
+	     /^cluster_ctrc_stat_bump\(/ { stats++; if (stats == 1) { print "static void"; emit=1; found++ } } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (stats != 2 || found != 8 || done != 8 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_ctrc_begin.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
 	@awk '/^cluster_ctrc_active_scan_begin\(/ { print "static bool"; emit=1; found++ } \
 	     emit { print } emit && /^}/ { emit=0; done++ } \
@@ -2168,7 +2179,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_ctrc_init.inc $(top_srcdir)/src/include/storage/proclist.h \
 		$(top_srcdir)/src/include/storage/proclist_types.h $(top_srcdir)/src/include/storage/lwlock.h \
 		test_cluster_heap_ctrc_types.inc test_cluster_heap_ctrc_begin.inc \
-		test_cluster_heap_ctrc_step.inc \
+		test_cluster_heap_ctrc_step.inc test_cluster_heap_ctrc_origin.inc \
 		test_cluster_heap_freeze_cohort_current.inc \
 		test_cluster_heap_freeze_cohort_backend.inc \
 		test_cluster_heap_freeze_worker_current.inc \
@@ -5097,6 +5108,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_freeze_pgproc_sample.inc test_cluster_heap_freeze_pgproc_sample.inc.tmp
 	rm -f test_cluster_heap_ctrc_types.inc test_cluster_heap_ctrc_types.inc.tmp test_cluster_heap_ctrc_begin.inc test_cluster_heap_ctrc_begin.inc.tmp
 	rm -f test_cluster_heap_ctrc_step.inc test_cluster_heap_ctrc_step.inc.tmp
+	rm -f test_cluster_heap_ctrc_origin.inc test_cluster_heap_ctrc_origin.inc.tmp
 	rm -f test_cluster_heap_ctrc_attachment.inc test_cluster_heap_ctrc_attachment.inc.tmp
 	rm -f test_cluster_heap_ctrc_ready.inc test_cluster_heap_ctrc_ready.inc.tmp
 	rm -f test_cluster_heap_ctrc_init_state.inc test_cluster_heap_ctrc_init_state.inc.tmp
