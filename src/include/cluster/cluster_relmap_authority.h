@@ -241,6 +241,13 @@ extern ClusterRelmapV2PairResult
 cluster_relmap_authority_v2_read(const ClusterRelmapV2Namespace *expected,
 								ClusterRelmapV2View *output);
 
+/* Read-only current physical conjunct for an original successful stage.
+ * Requires namespace X and enabled fsync. BOTH copies must equal the complete
+ * original staged bytes with safe paths/inodes/directories and successful
+ * closes. A legal union view with one clean copy is insufficient. No writes,
+ * resync, recovery of a failed stage, durability/terminal proof or release. */
+extern bool cluster_relmap_authority_v2_check_staged(const ClusterRelmapV2Image *staged);
+
 /*
  * Dormant clean v1 conversion under the namespace X lock. The original owner
  * must authenticate expected's namespace/incarnation and keep publishers

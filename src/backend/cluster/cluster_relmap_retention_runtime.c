@@ -160,6 +160,35 @@ relmap_runtime_directory_matches(const ClusterRelmapRetentionDirectory *director
 	return CLUSTER_RELMAP_RETENTION_OK;
 }
 
+/* Read-only conjunct; no image/storage or terminal authority is minted. */
+bool
+cluster_relmap_retention_runtime_check_staged_v2(const ClusterRelmapOwnerSampleV2 *sample,
+	const ClusterRelmapV2Image *staged)
+{
+	ClusterRelmapRetentionKey key = { 0 };
+	ClusterRelmapRetentionDirectory *directory;
+	ClusterRelmapRetentionResult result;
+
+	if (staged == NULL || staged->pending_owner.wal_end == InvalidXLogRecPtr
+		|| LWLockHeldByMe(XidGenLock)
+		|| relmap_runtime_producer_key(sample, &staged->identity,
+			staged->pending_generation, false, &key) != CLUSTER_RELMAP_RETENTION_OK)
+		return false;
+	if (staged->pending_owner.node != sample->owner.node
+		|| staged->pending_owner.top_full_xid != sample->owner.top_full_xid
+		|| staged->pending_owner.membership_epoch != sample->owner.membership_epoch
+		|| staged->pending_owner.admitted_incarnation != sample->owner.admitted_incarnation
+		|| staged->pending_owner.boot_incarnation != sample->owner.boot_incarnation)
+		return false;
+	directory = &relmap_runtime_shmem->directories[key.origin];
+	LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
+	result = relmap_runtime_directory_matches(directory, &key);
+	if (result == CLUSTER_RELMAP_RETENTION_OK)
+		result = cluster_relmap_retention_stage_check(directory, &key, staged->pending_owner.wal_end);
+	LWLockRelease(&relmap_runtime_shmem->lock);
+	return result == CLUSTER_RELMAP_RETENTION_OK && cluster_relmap_owner_matches_v2(sample);
+}
+
 XLogRecPtr
 cluster_relmap_retention_runtime_insert_pending_v2(const ClusterRelmapOwnerSampleV2 *sample,
 	const ClusterRelmapV2Namespace *identity, uint64 generation, const RelMapFile *pending)

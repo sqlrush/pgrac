@@ -1382,6 +1382,56 @@ refused:
 	return false;
 }
 
+bool
+cluster_relmap_producer_prepare_v2(bool shared, const RelMapFile *updates,
+	ClusterRelmapOwnerSampleV2 *owner_out, ClusterRelmapV2Image *staged_out)
+{
+	ClusterRelmapOwnerSampleV2 sample;
+	ClusterRelmapV2Image staged;
+	Oid tsid = shared ? GLOBALTABLESPACE_OID : MyDatabaseTableSpace;
+
+	if (owner_out == NULL || staged_out == NULL
+		|| cluster_relmap_publish_arms[0].armed || cluster_relmap_publish_arms[1].armed
+		|| !cluster_relmap_producer_stage_v2(shared, updates, &sample, &staged))
+		return false;
+	/* Only this call's successful original stage can reach installation.
+	 * A caller-supplied image or a failed stage cannot be rehabilitated. */
+	LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
+	if ((!shared && MyDatabaseTableSpace != tsid)
+		|| !cluster_relmap_retention_runtime_check_staged_v2(&sample, &staged)
+		|| !cluster_relmap_authority_v2_check_staged(&staged)
+		|| !cluster_relmap_retention_runtime_check_staged_v2(&sample, &staged))
+		goto refused;
+
+	/* Same original preservation as the live producer: keep mapped files
+	 * across a later abort, including when a subsequent check refuses. */
+	for (int32 i = 0; i < staged.pending.num_mappings; i++)
+	{
+		RelFileLocator locator;
+
+		locator.spcOid = tsid;
+		locator.dbOid = staged.identity.dbid;
+		locator.relNumber = staged.pending.mappings[i].mapfilenumber;
+		RelationPreserveStorage(locator, false);
+	}
+	if ((!shared && MyDatabaseTableSpace != tsid)
+		|| !cluster_relmap_authority_v2_check_staged(&staged)
+		|| !cluster_relmap_retention_runtime_check_staged_v2(&sample, &staged))
+		goto refused;
+
+	/* No fallible work after adoption. Terminal publication remains separate. */
+	memcpy(shared ? &shared_map : &local_map, &staged.pending, sizeof(RelMapFile));
+	LWLockRelease(RelationMappingLock);
+	ForceSyncCommit();
+	*owner_out = sample;
+	*staged_out = staged;
+	return true;
+
+refused:
+	LWLockRelease(RelationMappingLock);
+	return false;
+}
+
 static void
 cluster_perform_relmap_update(bool shared, const RelMapFile *updates)
 {

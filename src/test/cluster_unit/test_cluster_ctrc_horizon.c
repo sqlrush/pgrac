@@ -281,12 +281,108 @@ UT_TEST(test_actual_foreign_close_revokes_old_report_and_blocks_new_unqualified_
 	exercise_unknown_producer_handoff(2);
 }
 
+/* The original lifecycle helper publishes at three existing completed cuts:
+ * after native exit, after receiver certificate retirement but before its
+ * exact final reply, and after the original owner finally reclaims its row. */
+static unsigned sender_retirement_reports;
+static uint64 sender_retirement_last_sample_id;
+static FullTransactionId sender_retained_original;
+
+static void
+observe_original_retirement_publication(const ClusterUndoCleanerActiveSample *published)
+{
+	ClusterUndoCleanerActiveSample active;
+	const ClusterCtrcOriginEntry *origin = &ctrc_origin_entries()[0];
+	bool previous_pass_mode = native_pass_mode;
+
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT(!native_cleaner_lock_held && !native_lock_held);
+	UT_ASSERT_EQ(native_xids[0], InvalidTransactionId);
+	UT_ASSERT(sender_retirement_reports < 3);
+	if (sender_retirement_reports == 0) {
+		sender_retained_original = published->scan.min_full;
+		UT_ASSERT_EQ(origin->state, CTRC_ORIGIN_OPEN);
+	} else if (sender_retirement_reports == 1) {
+		UT_ASSERT_EQ(origin->state, CTRC_ORIGIN_RELEASE_PROVEN);
+		UT_ASSERT(ctrc_bytes_zero(&ctrc_participant_entries()[0],
+								 sizeof(ClusterCtrcParticipantEntry)));
+	} else
+		UT_ASSERT(ctrc_bytes_zero(origin, sizeof(*origin)));
+
+	/* The same required cohort was fixed before the original lifecycle's
+	 * first sample. Start a fresh worker pass under that exact source. */
+	native_pass_source = published->admission_fence;
+	UT_ASSERT((native_pass_source.admitted_members_lo & (UINT64CONST(1) << 1)) != 0);
+	UT_ASSERT_EQ(native_pass_source.admitted_incarnation[1], 1102);
+	native_pass_mode = true;
+	native_pass_capture_allowed = native_pass_lease_valid = native_pass_admission_valid = true;
+	finish_original_worker_pass();
+	UT_ASSERT(native_cleaner_sample(&active));
+	UT_ASSERT(native_cleaner_sample_current(&active));
+	UT_ASSERT(active.sample_id > sender_retirement_last_sample_id);
+	sender_retirement_last_sample_id = active.sample_id;
+	UT_ASSERT_EQ(active.scan.unqualified_entries, 0);
+	UT_ASSERT(FullTransactionIdEquals(active.scan.min_full,
+		sender_retirement_reports < 2 ? sender_retained_original : native_future));
+	send_original_sample(&active);
+	UT_ASSERT_EQ(sender_calls, sender_retirement_reports + 1);
+	UT_ASSERT_EQ(sender_state.report_sequence, sender_calls);
+	UT_ASSERT_EQ(sender_report.f_sample_id, active.sample_id);
+	UT_ASSERT_EQ(sender_report.active_full_xid_min, U64FromFullTransactionId(active.scan.min_full));
+	UT_ASSERT_EQ(sender_report.future_full_xid, U64FromFullTransactionId(native_future));
+	sender_retirement_reports++;
+	native_pass_mode = previous_pass_mode;
+}
+
+static void
+exercise_original_retirement_reports(bool applied)
+{
+	memset(&sender_state, 0, sizeof(sender_state));
+	SpinLockInit(&sender_state.maintenance_lock);
+	sender_maintenance_lock = &sender_state.maintenance_lock;
+	sender_maintenance_held = false;
+	sender_maintenance_acquires = sender_maintenance_releases = 0;
+	UndoHorizonShmem = &sender_state;
+	sender_calls = sender_capability_reads = sender_unknown_on_peer = 0;
+	sender_retirement_reports = 0;
+	sender_retirement_last_sample_id = 0;
+	sender_retained_original = InvalidFullTransactionId;
+	native_source_exit = native_publish_source = true;
+	native_published_samples = 0;
+	original_retention_report_peer = true;
+	original_worker_publication_observer = observe_original_retirement_publication;
+	exercise_original_producer_retention_lifecycle(applied);
+	original_worker_publication_observer = NULL;
+	original_retention_report_peer = false;
+	UT_ASSERT_EQ(native_published_samples, 3);
+	UT_ASSERT_EQ(sender_retirement_reports, 3);
+	UT_ASSERT_EQ(sender_calls, 3);
+	UT_ASSERT_EQ(sender_state.report_sequence, 3);
+	UT_ASSERT(FullTransactionIdPrecedes(sender_retained_original, native_future));
+	UT_ASSERT_EQ(sender_report.active_full_xid_min, U64FromFullTransactionId(native_future));
+	UT_ASSERT_EQ(sender_maintenance_acquires, sender_maintenance_releases);
+	UT_ASSERT_EQ(held_count, 0);
+	native_source_exit = native_publish_source = false;
+}
+
+UT_TEST(test_cancelled_receipt_report_retains_source_until_exact_final_certificate_reply)
+{
+	exercise_original_retirement_reports(false);
+}
+
+UT_TEST(test_applied_receipt_report_retains_source_until_exact_final_certificate_reply)
+{
+	exercise_original_retirement_reports(true);
+}
+
 int
 main(void)
 {
-	UT_PLAN(3);
+	UT_PLAN(5);
 	UT_RUN(test_original_protection_exit_and_complete_worker_reach_v2_wire);
 	UT_RUN(test_actual_foreign_receipt_revokes_old_report_and_blocks_new_unqualified_report);
 	UT_RUN(test_actual_foreign_close_revokes_old_report_and_blocks_new_unqualified_report);
+	UT_RUN(test_cancelled_receipt_report_retains_source_until_exact_final_certificate_reply);
+	UT_RUN(test_applied_receipt_report_retains_source_until_exact_final_certificate_reply);
 	return ut_failed_count == 0 ? 0 : 1;
 }

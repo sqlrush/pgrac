@@ -2247,10 +2247,15 @@ UT_TEST(test_changed_wal_cannot_rebind_staged_pin)
 #include "test_cluster_relmap_recovery_arbitration.inc"
 #include "test_cluster_relmap_owner_conversion.inc"
 
+#include "test_cluster_relmap_staged_observation.inc"
+
 int
 main(void)
 {
-	UT_PLAN(89);
+	UT_PLAN(92);
+	UT_RUN(test_staged_observation_reads_both_exact_copies_without_mutation);
+	UT_RUN(test_staged_observation_rejects_legal_union_cuts_and_changed_bytes);
+	UT_RUN(test_staged_observation_refuses_original_lock_path_and_close_failures);
 	UT_RUN(test_recovery_arbitration_clears_both_namespaces_from_native_outcome);
 	UT_RUN(test_recovery_arbitration_preserves_pending_original_base_at_publish_cut);
 	UT_RUN(test_recovery_arbitration_requires_original_merger_and_namespace_x);

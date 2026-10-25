@@ -32,6 +32,16 @@ extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_begin_v2(
 	const ClusterRelmapOwnerSampleV2 *sample, const ClusterRelmapV2Namespace *identity,
 	uint64 generation);
 
+/* Read-only original in-progress producer conjunct. Recheck original owner,
+ * namespace, COMPLETE directory and exact staged pin/end under the sole lock,
+ * then original owner again outside it. No assignment, I/O, state mutation,
+ * retry, image/durability/terminal proof or release. MappingLock may be held;
+ * caller must hold no XidGen/retention lock. Snapshot only, not a reservation
+ * or permission to adopt a map without the original successful stage and
+ * independent exact physical-copy checks. */
+extern bool cluster_relmap_retention_runtime_check_staged_v2(
+	const ClusterRelmapOwnerSampleV2 *sample, const ClusterRelmapV2Image *staged);
+
 /* Dormant original producer: with its already captured top FullXid, original
  * global relmap X and RelationMappingLock(X), insert the native RELMAP record,
  * flush its actual returned end, then stage BOTH v2 copies through the original
