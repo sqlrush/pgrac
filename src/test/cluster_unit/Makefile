@@ -2027,6 +2027,13 @@ test_cluster_heap_freeze_worker_getter.inc: $(top_srcdir)/src/backend/cluster/cl
 	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Original worker0 publication into the same shared image consumed by the getter.
+test_cluster_heap_freeze_worker_publisher.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
+	@awk '/^undo_cleaner_publish_active_sample\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 # Original typed storage plus retained peer/H backend and local-source wrapper.
 test_cluster_heap_freeze_cohort_backend.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c Makefile
 	@awk '/^typedef struct ClusterUndoHorizonSlotShmem / { types=1; found++ } \
@@ -2065,6 +2072,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_freeze_cohort_backend.inc \
 		test_cluster_heap_freeze_worker_current.inc \
 		test_cluster_heap_freeze_worker_getter.inc \
+		test_cluster_heap_freeze_worker_publisher.inc \
 		test_cluster_heap_freeze_lease_current.inc \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe.h \
 		test_cluster_active_sample_types.inc test_cluster_active_sample_fence.inc \
@@ -4978,6 +4986,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_freeze_cohort_backend.inc test_cluster_heap_freeze_cohort_backend.inc.tmp
 	rm -f test_cluster_heap_freeze_worker_current.inc test_cluster_heap_freeze_worker_current.inc.tmp
 	rm -f test_cluster_heap_freeze_worker_getter.inc test_cluster_heap_freeze_worker_getter.inc.tmp
+	rm -f test_cluster_heap_freeze_worker_publisher.inc test_cluster_heap_freeze_worker_publisher.inc.tmp
 	rm -f test_cluster_heap_freeze_lease_current.inc test_cluster_heap_freeze_lease_current.inc.tmp
 	rm -f test_cluster_space_cache_insert.inc test_cluster_space_cache_delete.inc test_cluster_space_cache_allocation.inc test_cluster_space_cache_update.inc
 	rm -f test_cluster_space_hint_owners.inc test_cluster_space_census_types.inc test_cluster_space_census_mutation.inc test_cluster_space_cleanout_product.o
