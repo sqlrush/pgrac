@@ -9608,9 +9608,21 @@ v3_recovered_begin_success(bool all_recovered)
 	for (unsigned i = 0; i < 2; ++i) {
 		unsigned node = ops[i].claim.identity.origin_node_id;
 		v3_recovered_begin_select(&ops[i]);
-		UT_ASSERT_EQ(cluster_control_root_v3_startup_read_writer(&ops[i].claim.identity,
-																 ops[i].operation_uuid, &observed), 0);
-		UT_ASSERT_EQ(observed.phase, CLUSTER_WAL_STARTUP_INITIALIZING);
+		if (i == 0) {
+			UT_ASSERT_EQ(cluster_control_root_v3_startup_read_writer(&ops[i].claim.identity,
+											 ops[i].operation_uuid, &observed), 0);
+			UT_ASSERT_EQ(observed.phase, CLUSTER_WAL_STARTUP_INITIALIZING);
+		} else {
+			UT_ASSERT_NE(cluster_control_root_v3_startup_read_writer(&ops[i].claim.identity,
+											 ops[i].operation_uuid, &observed), 0);
+			UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+			test_actual_cf = test_cf_mode = ShareLock;
+			UT_ASSERT_EQ(cluster_wal_startup_read_locked(&selected, node, &observed), 0);
+			test_actual_cf = test_cf_mode = NoLock;
+			UT_ASSERT_EQ(observed.phase, CLUSTER_WAL_STARTUP_RESERVED);
+			UT_ASSERT(memcmp(&selected.startup[node], &root.startup[node],
+							 sizeof(root.startup[node])) == 0);
+		}
 		UT_ASSERT_EQ(observed.input_kind, ops[i].input_kind);
 		UT_ASSERT_EQ(observed.input_record_start, ops[i].input_record_start);
 		UT_ASSERT_EQ(observed.input_record_end, ops[i].input_record_end);
@@ -9637,7 +9649,7 @@ UT_TEST(test_recovered_begin_all_complete_inputs_are_not_clean_exit)
 	v3_recovered_begin_success(true);
 }
 
-UT_TEST(test_recovered_begin_requires_every_actual_empty_target)
+UT_TEST(test_recovered_begin_requires_actual_founder_target_durability)
 {
 	uint8 before[66048];
 	ControlRootImage root;
@@ -9650,12 +9662,15 @@ UT_TEST(test_recovered_begin_requires_every_actual_empty_target)
 																 ops[0].operation_uuid, &observed), 0);
 	if (ut_current_failed)
 		goto done;
+	test_history_sync_count = 0;
+	test_history_fail_sync = 1;
 	UT_ASSERT(cluster_control_root_v3_startup_begin_clean(&ops[0].claim.identity,
 														  ops[0].operation_uuid, &token, &published) != 0);
 	UT_ASSERT(v2_zero(&published, sizeof(published)));
 	v2_assert_primary_unchanged(before);
 	UT_ASSERT_EQ(test_actual_cf, NoLock);
  done:
+	test_history_fail_sync = 0;
 	test_reserve_mode = false;
 }
 
@@ -9799,8 +9814,7 @@ UT_TEST(test_v3_native_driver_advances_recovered_cohort_without_losing_kinds)
 	v3_recovered_begin_fixture(before, &root, &token, ops, false);
 	if (ut_current_failed)
 		return;
-	/* A follower may prepare its target, but only the coordinator may publish
-	 * the mixed RECOVERED/CLEAN cohort as INITIALIZING. */
+	/* The follower remains read-only until the founder's native INSTALL. */
 	restart = v3_recovered_driver_restart(&root, 3);
 	UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed),
 					 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
@@ -9814,9 +9828,9 @@ UT_TEST(test_v3_native_driver_advances_recovered_cohort_without_losing_kinds)
 	UT_ASSERT_EQ(observed.phase, CLUSTER_WAL_STARTUP_INITIALIZING);
 	UT_ASSERT_EQ(observed.input_kind, CLUSTER_WAL_STARTUP_RECOVERED);
 	restart = v3_recovered_driver_restart(&root, 3);
-	UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed), 0);
-	UT_ASSERT_EQ(observed.phase, CLUSTER_WAL_STARTUP_INITIALIZING);
-	UT_ASSERT_EQ(observed.input_kind, CLUSTER_WAL_STARTUP_CLEAN);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed),
+				 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	UT_ASSERT(v2_zero(&observed, sizeof(observed)));
 	UT_ASSERT_EQ(test_actual_cf, NoLock);
 	test_reserve_mode = false;
 }
@@ -9872,11 +9886,15 @@ UT_TEST(test_v3_native_driver_reserves_cache_complete_cohort)
 		}
 		for (unsigned node = 0; node <= 3; node += 3) {
 			restart = v3_recovered_driver_restart(&root, node);
-			UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed), 0);
-			UT_ASSERT_EQ(observed.phase, CLUSTER_WAL_STARTUP_INITIALIZING);
-			UT_ASSERT_EQ(observed.input_kind, node == 0 || all_recovered
-												 ? CLUSTER_WAL_STARTUP_RECOVERED
-												 : CLUSTER_WAL_STARTUP_CLEAN);
+			if (node == 0) {
+				UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed), 0);
+				UT_ASSERT_EQ(observed.phase, CLUSTER_WAL_STARTUP_INITIALIZING);
+				UT_ASSERT_EQ(observed.input_kind, CLUSTER_WAL_STARTUP_RECOVERED);
+			} else {
+				UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed),
+							 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+				UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+			}
 		}
 		UT_ASSERT_EQ(test_startup_exit_requests, exits);
 		UT_ASSERT_EQ(test_actual_cf, NoLock);
@@ -26025,6 +26043,8 @@ control_root_test_reset_state(void)
 	cluster_wal_threads_dir = test_wal_root;
 }
 
+#include "test_cluster_control_recovered_founder.inc"
+
 #undef UT_RUN
 #define UT_RUN(name)                                                                            \
 	do {                                                                                          \
@@ -26073,11 +26093,59 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_WRITER") != NULL) {
+		UT_PLAN(30);
+		UT_RUN(test_v3_target_creates_only_exact_empty_successor);
+		UT_RUN(test_v3_startup_checkpoint_publishes_only_actual_new_durability);
+		UT_RUN(test_v3_startup_checkpoint_retry_requires_selected_root_durability);
+		UT_RUN(test_v3_startup_publication_and_install_use_native_counters);
+		UT_RUN(test_v3_startup_install_rejects_changed_native_counters);
+		UT_RUN(test_v3_startup_install_retains_predecessor_without_serving);
+		UT_RUN(test_v3_startup_install_refuses_wrong_owner_and_intent);
+		UT_RUN(test_v3_new_generation_archives_the_retained_range);
+		UT_RUN(test_v3_startup_install_requires_actual_old_and_new_files);
+		UT_RUN(test_v3_startup_install_uncertain_rename_is_not_success);
+		UT_RUN(test_v3_startup_install_all_sync_and_late_cuts_retain_obligations);
+		UT_RUN(test_v3_startup_install_keeps_full_history_and_refuses_overflow);
+		UT_RUN(test_v3_checkpoint_transfers_terminal_obligations_atomically);
+		UT_RUN(test_v3_startup_install_sparse_pair_has_no_four_member_assumption);
+		UT_RUN(test_v3_startup_checkpoint_refuses_runtime_and_control_drift);
+		UT_RUN(test_v3_startup_checkpoint_requires_real_successor_bytes);
+		UT_RUN(test_v3_startup_checkpoint_persistence_and_late_races_keep_obligations);
+		UT_RUN(test_v3_begin_requires_all_declared_empty_targets_before_native_mutation);
+		UT_RUN(test_v3_startup_route_switches_only_exact_empty_generation);
+		UT_RUN(test_v3_startup_route_consumes_complete_retained_predecessor);
+		UT_RUN(test_v3_startup_route_requires_exact_owner_and_restart_input);
+		UT_RUN(test_v3_startup_route_refuses_unsafe_or_nonempty_namespaces);
+		UT_RUN(test_v3_startup_route_uncertain_rename_requires_directory_sync);
+		UT_RUN(test_v3_startup_route_rechecks_names_and_owner_after_exchange);
+		UT_RUN(test_bootstrap_pending_route_keeps_immutable_restart_input);
+		UT_RUN(test_v3_target_rejects_wrong_owner_before_creation);
+		UT_RUN(test_v3_target_never_adopts_foreign_or_nonempty_namespace);
+		UT_RUN(test_v3_target_sync_failures_never_grant_initialization);
+		UT_RUN(test_v3_target_reobserves_formation_and_write_fence_after_files);
+		UT_RUN(test_v3_begin_failures_preserve_selected_obligations_without_permission);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_RECOVERED_FOUNDER") != NULL) {
+		UT_PLAN(8);
+		UT_RUN(test_recovered_founder_begin_preserves_unprepared_peer);
+		UT_RUN(test_recovered_founder_driver_needs_only_own_target);
+		UT_RUN(test_recovered_founder_native_eor_install_keeps_full_old_input);
+		UT_RUN(test_recovered_founder_writer_requires_original_claim);
+		UT_RUN(test_recovered_founder_checkpoint_withholds_after_claim_drift);
+		UT_RUN(test_recovered_founder_install_withholds_after_claim_drift);
+		UT_RUN(test_recovered_founder_checkpoint_rechecks_every_peer);
+		UT_RUN(test_recovered_founder_begin_requires_own_durable_target);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_RECOVERED_BEGIN") != NULL) {
 		UT_PLAN(12);
 		UT_RUN(test_recovered_begin_mixed_inputs_keep_their_original_kinds);
 		UT_RUN(test_recovered_begin_all_complete_inputs_are_not_clean_exit);
-		UT_RUN(test_recovered_begin_requires_every_actual_empty_target);
+		UT_RUN(test_recovered_begin_requires_actual_founder_target_durability);
 		UT_RUN(test_recovered_prepare_precedes_checkpoint_owner_publication);
 		UT_RUN(test_recovered_begin_rejects_an_independently_rebound_peer);
 		UT_RUN(test_recovered_begin_retains_original_owner_and_fence_guards);
@@ -26366,7 +26434,16 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(513);
+	UT_PLAN(521);
+	UT_RUN(test_recovered_founder_begin_preserves_unprepared_peer);
+	UT_RUN(test_recovered_founder_driver_needs_only_own_target);
+	UT_RUN(test_recovered_founder_native_eor_install_keeps_full_old_input);
+	UT_RUN(test_recovered_founder_writer_requires_original_claim);
+	UT_RUN(test_recovered_founder_checkpoint_withholds_after_claim_drift);
+	UT_RUN(test_recovered_founder_install_withholds_after_claim_drift);
+	UT_RUN(test_recovered_founder_checkpoint_rechecks_every_peer);
+	UT_RUN(test_recovered_founder_begin_requires_own_durable_target);
+
 	UT_RUN(test_ctrc_namespace_same_root_bytes_cannot_replace_original_directory);
 	UT_RUN(test_ctrc_namespace_initial_root_error_closes_fd_and_retains_scope_debt);
 	UT_RUN(test_ctrc_namespace_retains_readonly_fd_through_scope_lifetime);
