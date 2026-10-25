@@ -14,7 +14,7 @@ extern void test_relmap_native_clog_setup(const char *root, int origin, Transact
 extern bool test_relmap_native_clog_read(int origin, TransactionId xid,
 										 ClusterClogNativeBaseV1 *out, sigjmp_buf *outer_stack);
 /* Faults: 1 missing,2 short,3 file sync,4 directory sync,5 directory ERROR,
- * 6 different last page byte. Trigger at call0 before the physical census,
+ * 6 different last page byte,7 identical bytes in a distinct inode. Trigger at call0 before the physical census,
  * or immediately before the selected original native read. */
 extern void test_relmap_native_clog_authorize(bool (*check)(int));
 extern void test_relmap_native_clog_fault(unsigned fault, unsigned on_call);

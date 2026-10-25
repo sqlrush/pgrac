@@ -1337,6 +1337,8 @@ native_base_reads_complete_selected_origin_page_without_mutation(void)
 	for (unsigned aborted = 0; aborted < 2; ++aborted) {
 		ClusterClogNativeBaseV1 out;
 		PGAlignedBlock expected = { 0 };
+		struct stat observed;
+		char path[MAXPGPATH];
 		XidStatus status = aborted ? TRANSACTION_STATUS_ABORTED : TRANSACTION_STATUS_COMMITTED;
 		unsigned before_writes = writes, before_syncs = syncs, before_dirs = dirsyncs;
 		expected.data[BLCKSZ - 1] = 0x5a;
@@ -1349,6 +1351,10 @@ native_base_reads_complete_selected_origin_page_without_mutation(void)
 		UT_ASSERT_EQ(out.xid, 100);
 		UT_ASSERT_EQ(out.page_number, 0);
 		UT_ASSERT_EQ(out.status, status);
+		fixture_path(0, path);
+		UT_ASSERT_EQ(lstat(path, &observed), 0);
+		UT_ASSERT(out.file.device == observed.st_dev && out.file.inode == observed.st_ino
+				  && out.file.size == observed.st_size);
 		UT_ASSERT(memcmp(out.image, expected.data, BLCKSZ) == 0);
 		UT_ASSERT_EQ(writes, before_writes);
 		UT_ASSERT(syncs > before_syncs && dirsyncs > before_dirs);

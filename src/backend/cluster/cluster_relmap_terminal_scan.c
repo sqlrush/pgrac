@@ -515,6 +515,7 @@ struct ClusterRelmapRecoveryHandle {
 	uint8 pending_wire[CLUSTER_RELMAP_V2_FILE_SIZE];
 	uint8 committed_wire[CLUSTER_RELMAP_V2_FILE_SIZE];
 	uint8 native_base_fingerprint[32];
+	ClusterClogNativeFileV1 native_base_file;
 };
 
 static bool
@@ -1122,7 +1123,8 @@ recovery_handle_current(ClusterRelmapRecoveryHandle *handle)
  * status or upgrading it to FullXid/base-lifetime qualification. Every read
  * still uses the original native owner and its own held-FD sync/readback. */
 static bool
-recovery_handle_base_fingerprint(ClusterRelmapRecoveryHandle *handle, uint8 out[32])
+recovery_handle_base_fingerprint(ClusterRelmapRecoveryHandle *handle, uint8 out[32],
+								 ClusterClogNativeFileV1 *file)
 {
 	ClusterRelmapTerminalBaseObservationV1 base;
 
@@ -1131,6 +1133,7 @@ recovery_handle_base_fingerprint(ClusterRelmapRecoveryHandle *handle, uint8 out[
 		|| !recovery_handle_current(handle))
 		return false;
 	memcpy(out, base.fingerprint, 32);
+	*file = base.native_base.file;
 	return true;
 }
 
@@ -1183,7 +1186,8 @@ cluster_relmap_recovery_prepare_v1(ClusterWalInputsV1 *inputs,
 		accepted = terminal_scan(inputs, index,
 								 FullTransactionIdFromU64(image.pending_owner.top_full_xid), true,
 								 &image, serial, &handle->scan)
-				   && recovery_handle_base_fingerprint(handle, handle->native_base_fingerprint);
+				   && recovery_handle_base_fingerprint(handle, handle->native_base_fingerprint,
+													 &handle->native_base_file);
 	}
 	PG_CATCH();
 	{
@@ -1226,7 +1230,8 @@ cluster_relmap_recovery_prepare_cold_v1(const ClusterRelmapV2Namespace *identity
 	{
 		if (terminal_scan_cold(&image, &handle->scan)) {
 			handle->scope_serial = handle->scan->pending_scope_serial;
-			accepted = recovery_handle_base_fingerprint(handle, handle->native_base_fingerprint);
+			accepted = recovery_handle_base_fingerprint(handle, handle->native_base_fingerprint,
+													 &handle->native_base_file);
 		}
 	}
 	PG_CATCH();
@@ -1279,6 +1284,7 @@ cluster_relmap_recovery_handle_matches_v1(ClusterRelmapRecoveryHandle *handle,
 {
 	ClusterRelmapV2Image image;
 	uint8 native_base_fingerprint[32];
+	ClusterClogNativeFileV1 native_base_file;
 	uint8 pending_wire[CLUSTER_RELMAP_V2_FILE_SIZE], committed_wire[CLUSTER_RELMAP_V2_FILE_SIZE];
 	if (handle == NULL || handle->pid != getpid() || handle->failed
 		|| recovery_overlap(handle, sizeof(*handle), identity, sizeof(*identity))
@@ -1290,8 +1296,11 @@ cluster_relmap_recovery_handle_matches_v1(ClusterRelmapRecoveryHandle *handle,
 		|| !recovery_pending_encode(identity, pending, &image, pending_wire, committed_wire)
 		|| memcmp(pending_wire, handle->pending_wire, sizeof(pending_wire)) != 0
 		|| memcmp(committed_wire, handle->committed_wire, sizeof(committed_wire)) != 0
-		|| !recovery_handle_base_fingerprint(handle, native_base_fingerprint)
-		|| memcmp(native_base_fingerprint, handle->native_base_fingerprint, 32) != 0)
+		|| !recovery_handle_base_fingerprint(handle, native_base_fingerprint, &native_base_file)
+		|| memcmp(native_base_fingerprint, handle->native_base_fingerprint, 32) != 0
+		|| native_base_file.device != handle->native_base_file.device
+		|| native_base_file.inode != handle->native_base_file.inode
+		|| native_base_file.size != handle->native_base_file.size)
 		return false;
 	handle->failed = false;
 	return true;

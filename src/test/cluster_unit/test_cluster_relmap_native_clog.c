@@ -45,6 +45,32 @@ relmap_native_apply_fault(void)
 		UT_ASSERT_EQ(pwrite(fd, &byte, 1, BLCKSZ - 1), 1);
 		UT_ASSERT_EQ(close(fd), 0);
 	}
+	if (relmap_native_fault == 7) {
+		char replacement[MAXPGPATH];
+		PGAlignedBlock image;
+		struct stat before, after;
+		int old, fresh;
+		UT_ASSERT(snprintf(replacement, sizeof(replacement), "%s.replace", relmap_native_path)
+				  < sizeof(replacement));
+		old = open(relmap_native_path, O_RDONLY);
+		UT_ASSERT(old >= 0 && fstat(old, &before) == 0);
+		UT_ASSERT_EQ(before.st_size, BLCKSZ);
+		UT_ASSERT_EQ(pread(old, image.data, BLCKSZ, 0), BLCKSZ);
+		fresh = open(replacement, O_RDWR | O_CREAT | O_EXCL, 0600);
+		UT_ASSERT(fresh >= 0);
+		UT_ASSERT_EQ(write(fresh, image.data, BLCKSZ), BLCKSZ);
+		UT_ASSERT_EQ(fstat(fresh, &after), 0);
+		UT_ASSERT(before.st_dev != after.st_dev || before.st_ino != after.st_ino);
+		UT_ASSERT_EQ(rename(replacement, relmap_native_path), 0);
+		UT_ASSERT_EQ(pread(fresh, image.data, BLCKSZ, 0), BLCKSZ);
+		{
+			PGAlignedBlock original;
+			UT_ASSERT_EQ(pread(old, original.data, BLCKSZ, 0), BLCKSZ);
+			UT_ASSERT_EQ(memcmp(original.data, image.data, BLCKSZ), 0);
+		}
+		UT_ASSERT_EQ(close(fresh), 0);
+		UT_ASSERT_EQ(close(old), 0);
+	}
 }
 
 void

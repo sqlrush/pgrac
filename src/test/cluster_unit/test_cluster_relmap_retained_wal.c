@@ -3413,6 +3413,7 @@ UT_TEST(test_terminal_read_native_error_keeps_output_zero_and_custody_dead)
 #include "test_cluster_relmap_original_scope.inc"
 #include "test_cluster_relmap_original_authority.inc"
 #include "test_cluster_relmap_original_cohort.inc"
+#include "test_cluster_relmap_native_file.inc"
 
 int
 main(int argc, char **argv)
@@ -3421,7 +3422,10 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(131);
+	UT_PLAN(134);
+	UT_RUN(test_cold_native_replaced_file_refuses_before_pair_write);
+	UT_RUN(test_cold_native_replaced_file_after_pair_sync_keeps_debt);
+	UT_RUN(test_cold_native_replaced_file_permanently_invalidates_old_handle);
 	UT_RUN(test_cold_cohort_other_origins_preserve_selected_consumer);
 	UT_RUN(test_cold_cohort_same_origin_generations_refuse_before_native);
 	UT_RUN(test_cold_cohort_foreign_pending_requires_original_directory);

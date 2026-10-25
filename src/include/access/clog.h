@@ -65,11 +65,19 @@ extern bool cluster_clog_native_terminal_sync_v1(TransactionId xid,
  * ERROR releases only this call's
  * FD/lock. False may follow sync and does not imply rollback/safe retry.
  * This raw page does not certify FullXid era, retained floor or a source seal. */
+/* Process-local observation only; never serialized or a retained lifetime. */
+typedef struct ClusterClogNativeFileV1 {
+	dev_t device;
+	ino_t inode;
+	off_t size;
+} ClusterClogNativeFileV1;
+
 typedef struct ClusterClogNativeBaseV1 {
 	int origin;
 	TransactionId xid;
 	uint32 page_number;
 	XidStatus status;
+	ClusterClogNativeFileV1 file;
 	uint8 image[BLCKSZ];
 } ClusterClogNativeBaseV1;
 extern bool cluster_clog_native_recovery_base_read_v1(int origin, TransactionId xid,
