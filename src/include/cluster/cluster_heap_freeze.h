@@ -445,8 +445,10 @@ extern bool cluster_heap_freeze_prepare_xmin_batch_v1(
  * The same cohort must retain its original completed local census cut with
  * zero unqualified entries. Its original registration generation is rechecked
  * before writer use and after TARGET/clock and SPACE observations, immediately
- * before the native critical section. This local point check does not serialize
- * later ingress or
+ * before the native critical section. The same pure F/H match and unchanged
+ * legal-next identity are also required after SPACE preparation, preserving
+ * the already-checked native window through that observation. These local
+ * point checks do not serialize later ingress or
  * supply remote/provenance/producer-retention qualification.
  * Their separate current/provenance/retention qualification remains required;
  * the match performs no sampling or callback under page locks.
