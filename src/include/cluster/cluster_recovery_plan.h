@@ -356,6 +356,21 @@ extern bool cluster_recovery_tx_result_accept_v1(void);
  * A TX component is not completion of the remaining service owners. */
 extern bool cluster_recovery_tx_result_observe_accepted_v1(ClusterRecoveryTxResultObservationV1 *out);
 extern bool cluster_recovery_tx_result_accepted_v1(const struct ClusterRecoveryStartV1 *start);
+struct ClusterColdCtrcWorkV1;
+struct ClusterColdTtSlotInputV1;
+struct ClusterRecoveryUndoEntry;
+/* Read-only terminal view of one original pre-C0 CTRC subject. Require the
+ * original Start/work, exact accepted complete TX result and unchanged
+ * canonical physical TT observation. Old ACTIVE additionally needs its unique
+ * original TopTxProof/C0 candidate and exact durable successor. Original work
+ * and output on refusal are unchanged; output must not overlap borrowed state.
+ * The caller obtains and retains observed under the original namespace,
+ * isolation and full census. Neither this value nor raw terminal equality
+ * proves history/graph coverage, release, PAGE/WAL permission or service OPEN.
+ * No I/O, allocation, wait, result publication or responsibility retirement. */
+extern bool cluster_recovery_ctrc_terminal_subject_v1(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 index,
+	const struct ClusterRecoveryUndoEntry *observed, struct ClusterColdTtSlotInputV1 *out);
 /* Original Startup handoff: wait locally for the registered TX component;
  * missing, unresolved or stale results refuse rather than releasing proof. */
 extern bool cluster_recovery_tx_result_wait_v1(const struct ClusterRecoveryStartV1 *start);

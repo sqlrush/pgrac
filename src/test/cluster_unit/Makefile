@@ -10078,6 +10078,8 @@ test_cluster_cold_tx_finish_boundary.inc: $(top_srcdir)/src/backend/access/trans
 # The recovered service matcher consumes the original registered components.
 test_cluster_r4_activation_fsm test_cluster_r4_activation_record: $(top_srcdir)/src/include/cluster/cluster_recovery_plan.h
 
+test_cluster_cold_tx_start: test_cluster_cold_tx_ctrc_subject.inc
+
 test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_owner.inc \
 		test_cluster_cold_tx_finish_boundary.inc \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \

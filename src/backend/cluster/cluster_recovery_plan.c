@@ -55,6 +55,7 @@
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_ctrc_record.h"
+#include "cluster/cluster_recovery_undo_scan.h"
 #include "cluster/cluster_recovery_worker.h" /* pool lives in this wrapper (spec-4.4 D5) */
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_semantic_activation.h" /* bit22 cutover latch (contract §B) */
@@ -68,6 +69,7 @@
 #include "postmaster/interrupt.h"
 #include "postmaster/startup.h"
 #include "storage/latch.h"
+#include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
@@ -1134,6 +1136,137 @@ bool
 cluster_recovery_tx_result_accepted_v1(const struct ClusterRecoveryStartV1 *start)
 {
 	return recovery_tx_result_handoff_status(start) == RECOVERY_TX_HANDOFF_ACCEPTED;
+}
+
+static bool
+recovery_ctrc_subject_overlap(const void *out, Size bytes, const void *input, Size length)
+{
+	uintptr_t a = (uintptr_t)out, b = (uintptr_t)input;
+
+	return bytes != 0 && length != 0 && (a <= b ? b - a < bytes : a - b < length);
+}
+
+static bool
+recovery_ctrc_subject_key_same(const ClusterColdTtSlotKeyV1 *a, const ClusterColdTtSlotKeyV1 *b)
+{
+	return a->owner_instance == b->owner_instance && a->segment_id == b->segment_id
+		&& a->segment_generation == b->segment_generation && a->slot_offset == b->slot_offset
+		&& a->xid == b->xid && a->slot_wrap == b->slot_wrap;
+}
+
+bool
+cluster_recovery_ctrc_terminal_subject_v1(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, uint32 index, const ClusterRecoveryUndoEntry *observed,
+	ClusterColdTtSlotInputV1 *out)
+{
+	const ClusterColdTypedV1 *typed;
+	const ClusterColdTopTxCensusEntryV1 *top = NULL;
+	ClusterRecoveryCheckpointSlotV1 *slot;
+	ClusterRecoveryCheckpointOwnerV1 owner, confirmed;
+	ClusterRecoveryTxResultValueV1 result;
+	ClusterColdCtrcReleaseCensusV1 counts;
+	ClusterColdTtSlotInputV1 original, value;
+	ClusterRecoveryUndoEntry physical;
+	uint64 slot_generation, work_generation;
+	Size work_bytes, census_bytes;
+	bool same;
+
+	if (out == NULL || observed == NULL || CritSectionCount != 0
+		|| start == NULL || start != checkpoint_registered_start
+		|| cluster_recovery_plan_shmem == NULL
+		|| !ClusterColdRecoveryCtrcWorkCurrent(start, work)
+		|| !ClusterColdRecoveryTxCheckpointOwnerV1(start, &owner)
+		|| memcmp(&owner, &checkpoint_registered_owner, sizeof(owner)) != 0)
+		return false;
+	typed = ClusterColdRecoveryTxInputs(start);
+	if (typed == NULL || typed->top_tx_census == NULL || !typed->census_root_captured
+		|| typed->census_root.system_identifier != owner.writer.ref.claim.identity.system_identifier
+		|| index >= work->counts.subject_count || work->counts.unqualified_count != 0
+		|| work->counts.subject_count
+			> (MaxAllocSize - offsetof(ClusterColdCtrcWorkV1, entries)) / sizeof(work->entries[0])
+		|| typed->top_tx_census->count > (MaxAllocSize - offsetof(ClusterColdTopTxCensusV1, entries))
+			/ sizeof(typed->top_tx_census->entries[0]))
+		return false;
+	work_bytes = offsetof(ClusterColdCtrcWorkV1, entries)
+		+ (Size)work->counts.subject_count * sizeof(work->entries[0]);
+	census_bytes = offsetof(ClusterColdTopTxCensusV1, entries)
+		+ (Size)typed->top_tx_census->count * sizeof(typed->top_tx_census->entries[0]);
+	if (recovery_ctrc_subject_overlap(out, sizeof(*out), work, work_bytes)
+		|| recovery_ctrc_subject_overlap(out, sizeof(*out), typed, sizeof(*typed))
+		|| recovery_ctrc_subject_overlap(out, sizeof(*out), typed->top_tx_census, census_bytes)
+		|| recovery_ctrc_subject_overlap(out, sizeof(*out), observed, sizeof(*observed))
+		|| recovery_ctrc_subject_overlap(out, sizeof(*out), cluster_recovery_plan_shmem,
+			sizeof(*cluster_recovery_plan_shmem))
+		|| !ClusterColdRecoveryStartOutputDistinct(start, out, sizeof(*out)))
+		return false;
+	counts = work->counts;
+	work_generation = work->generation;
+	original = value = work->entries[index];
+	physical = *observed;
+	if (original.key.owner_instance != physical.owner_instance
+		|| original.key.segment_id != physical.segment_id
+		|| original.key.segment_generation != physical.segment_generation
+		|| original.key.slot_offset != physical.slot_offset || physical.slot_offset >= TT_SLOTS_PER_SEGMENT
+		|| original.key.xid != original.slot.xid || original.key.slot_wrap != original.slot.wrap
+		|| original.key.xid != physical.slot.xid || original.key.slot_wrap != physical.slot.wrap
+		|| !TransactionIdIsNormal(original.key.xid) || (original.slot.flags & ~TT_SLOT_FLAGS_KNOWN) != 0)
+		return false;
+
+	/* Only the original completed C0 loop may supply this receipt. Observe its
+	 * entire local generation/value; never infer completion from physical ABORT. */
+	slot = &cluster_recovery_plan_shmem->checkpoint_owner;
+	SpinLockAcquire(&slot->lock);
+	result = slot->tx_result;
+	slot_generation = slot->generation;
+	same = slot->valid && memcmp(&slot->owner, &owner, sizeof(owner)) == 0
+		&& result.state == CLUSTER_RECOVERY_TX_RESULT_COMPLETE && result.result_generation != 0
+		&& slot->tx_accepted_generation == result.result_generation
+		&& result.subject_count == typed->top_tx_census->count
+		&& result.processed_count == result.subject_count && result.completed_count == result.subject_count
+		&& result.unresolved_count == 0
+		&& memcmp(result.input_root_sha256, typed->census_root.image_sha256, 32) == 0;
+	SpinLockRelease(&slot->lock);
+	if (!same)
+		return false;
+	if (original.slot.status == TT_SLOT_ACTIVE) {
+		ClusterRecoveryTTAbortDerivationV1 c0;
+
+		for (uint32 i = 0; i < typed->top_tx_census->count; i++) {
+			const ClusterColdTopTxCensusEntryV1 *entry = &typed->top_tx_census->entries[i];
+			if (!recovery_ctrc_subject_key_same(&entry->input.key, &original.key))
+				continue;
+			if (top != NULL || memcmp(&entry->input.slot, &original.slot, sizeof(original.slot)) != 0)
+				return false;
+			top = entry;
+		}
+		if (top == NULL || !ClusterColdRecoveryTxC0Candidate(start, top, &c0)
+			|| cluster_recovery_tt_abort_match_v1(&c0.record, physical.segment_generation,
+				&physical.slot) != CLUSTER_RECOVERY_TT_ABORT_IDEMPOTENT)
+			return false;
+		value.slot = physical.slot;
+	} else if (((original.slot.status != TT_SLOT_COMMITTED || !SCN_VALID(original.slot.commit_scn))
+			&& (original.slot.status != TT_SLOT_ABORTED || SCN_VALID(original.slot.commit_scn)))
+		|| memcmp(&original.slot, &physical.slot, sizeof(original.slot)) != 0)
+		return false;
+	if (!ClusterColdRecoveryCtrcWorkCurrent(start, work) || work->generation != work_generation
+		|| memcmp(&counts, &work->counts, sizeof(counts)) != 0
+		|| memcmp(&original, &work->entries[index], sizeof(original)) != 0
+		|| memcmp(&physical, observed, sizeof(physical)) != 0
+		|| !ClusterColdRecoveryTxCheckpointOwnerV1(start, &confirmed)
+		|| memcmp(&owner, &confirmed, sizeof(owner)) != 0
+		|| (top != NULL && (!ClusterColdRecoveryTxTopProofCurrent(start, top)
+			|| !ClusterColdRecoveryTxEffectsCurrent(start))))
+		return false;
+	SpinLockAcquire(&slot->lock);
+	same = slot->valid && slot->generation == slot_generation
+		&& memcmp(&slot->owner, &owner, sizeof(owner)) == 0
+		&& memcmp(&slot->tx_result, &result, sizeof(result)) == 0
+		&& slot->tx_accepted_generation == result.result_generation;
+	SpinLockRelease(&slot->lock);
+	if (!same)
+		return false;
+	*out = value;
+	return true;
 }
 
 bool
