@@ -364,6 +364,7 @@ OBJS = \
 	cluster_xnode_profile.o \
 	cluster_update_trace.o \
 	cluster_tx_identity_trace.o \
+	cluster_block_io_trace.o \
 	cluster_content_trace.o \
 	cluster_native_itl_trace.o \
 	storage/cluster_shared_fs.o \

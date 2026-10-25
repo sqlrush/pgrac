@@ -82,6 +82,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_pi_rebuild.h"
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_block_io_trace.h"
 #include "cluster/cluster_itl.h" /* spec-5.2 D11 — active-ITL writer-transfer guard */
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_rdma.h"
@@ -3128,10 +3129,166 @@ cluster_gcs_block_redo_lsn_covered(int dead_origin, XLogRecPtr required_lsn)
 	return covered;
 }
 
+#define GCS_READ_SOURCE_LEDGER_MAX 32
+typedef struct GcsReadSourceAttempt {
+	bool used;
+	int buf_id;
+	ClusterPcmReadSource source;
+} GcsReadSourceAttempt;
+static GcsReadSourceAttempt gcs_read_source_attempts[GCS_READ_SOURCE_LEDGER_MAX];
+static bool gcs_read_source_exit_registered;
+
+/* Existing DONE family, asynchronously queued. Master deadline retains debt
+ * if notification cannot be admitted or is lost; there is no ACK wait here. */
+static bool
+gcs_block_pending_s_notify_action(const ClusterPcmReadGrantKey *key, int master, uint8 action)
+{
+	GcsBlockDonePayload done;
+	if (master < 0 || master >= 32 || ClusterGcsBlock == NULL)
+		return false;
+	CLUSTER_INJECTION_POINT("cluster-gcs-block-done-drop");
+	if (cluster_ic_suppress_gcs_done_cap
+		|| (master != cluster_node_id && !cluster_sf_peer_supports_gcs_done(master))
+		|| cluster_injection_should_skip("cluster-gcs-block-done-drop"))
+		return false;
+	memset(&done, 0, sizeof(done));
+	done.request_id = key->request_id;
+	done.epoch = key->epoch;
+	done.tag = key->tag;
+	done.sender_node = cluster_node_id;
+	done.requester_backend_id = key->backend_id;
+	done.transition_id = PCM_TRANS_N_TO_S;
+	done.reserved_0[0] = action;
+	done.reserved_0[1] = (uint8)key->requester_node;
+	if (cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_DONE,
+		(uint32)master, &done, sizeof(done))) {
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->done_sent_count, 1);
+		return true;
+	}
+	else
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->done_enqueue_drop_count, 1);
+	return false;
+}
+
+static void
+gcs_block_pending_s_notify(const ClusterPcmReadGrantKey *key, int master, bool installed)
+{
+	(void)gcs_block_pending_s_notify_action(key, master,
+		installed ? GCS_BLOCK_DONE_PENDING_S_CONFIRM : GCS_BLOCK_DONE_PENDING_S_NACK);
+}
+
 bool
-cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition transition_id,
-										int master_node, bool clean_eligible,
-										bool *out_retry_denied)
+cluster_gcs_block_read_grant_holder_notify(const ClusterPcmReadGrantKey *key, int32 master)
+{
+	return gcs_block_pending_s_notify_action(key, master, GCS_BLOCK_DONE_PENDING_S_HOLDER);
+}
+
+static ClusterPcmReadGrantKey
+gcs_read_source_key(const ClusterPcmReadSource *source)
+{
+	ClusterPcmReadGrantKey key;
+	memset(&key, 0, sizeof(key));
+	key.tag = source->tag;
+	key.request_id = source->request_id;
+	key.epoch = source->request_epoch;
+	key.requester_node = cluster_node_id;
+	key.backend_id = (int32)MyBackendId;
+	return key;
+}
+
+static void
+gcs_read_source_backend_exit(int code pg_attribute_unused(), Datum arg pg_attribute_unused())
+{
+	for (int i = 0; i < GCS_READ_SOURCE_LEDGER_MAX; i++) {
+		GcsReadSourceAttempt *attempt = &gcs_read_source_attempts[i];
+		if (attempt->used && cluster_gcs_block_read_source_quiesce(
+			GetBufferDescriptor(attempt->buf_id), &attempt->source)) {
+			ClusterPcmReadGrantKey key = gcs_read_source_key(&attempt->source);
+			gcs_block_pending_s_notify(&key, attempt->source.master_node, false);
+			memset(attempt, 0, sizeof(*attempt));
+		}
+	}
+}
+
+static bool
+gcs_read_source_arm(BufferDesc *buf, ClusterPcmReadSource *source)
+{
+	int empty = -1;
+	if (!gcs_read_source_exit_registered) {
+		before_shmem_exit(gcs_read_source_backend_exit, (Datum)0);
+		gcs_read_source_exit_registered = true;
+	}
+	for (int i = 0; i < GCS_READ_SOURCE_LEDGER_MAX; i++) {
+		GcsReadSourceAttempt *attempt = &gcs_read_source_attempts[i];
+		if (!attempt->used) {
+			if (empty < 0)
+				empty = i;
+			continue;
+		}
+		if (attempt->buf_id == buf->buf_id
+			&& attempt->source.request_id == source->request_id
+			&& attempt->source.request_epoch == source->request_epoch
+			&& attempt->source.master_node == source->master_node
+			&& attempt->source.base_generation == source->base_generation
+			&& attempt->source.reservation_token == source->reservation_token
+			&& BufferTagsEqual(&attempt->source.tag, &source->tag))
+			return true;
+	}
+	if (empty < 0)
+		return false; /* caller exact-aborts and waits locally */
+	gcs_read_source_attempts[empty].used = true;
+	gcs_read_source_attempts[empty].buf_id = buf->buf_id;
+	gcs_read_source_attempts[empty].source = *source;
+	return true;
+}
+
+void
+cluster_gcs_block_read_source_complete(BufferDesc *buf, ClusterPcmReadSource *source, bool installed)
+{
+	bool exact;
+	uint32 state;
+	if (source == NULL || !source->pending_s || !source->quiescent || buf == NULL)
+		return;
+	state = LockBufHdr(buf);
+	exact = BufferTagsEqual(&buf->tag, &source->tag)
+		&& cluster_pcm_own_reservation_token_get(buf->buf_id) == source->reservation_token
+		&& cluster_pcm_own_writer_activation_token_get(buf->buf_id) == 0
+		&& cluster_pcm_own_resource_x_activation_generation_get(buf->buf_id) == 0
+		&& cluster_pcm_own_delivery_attempt_get(buf->buf_id) == 0;
+	if (installed)
+		exact = exact && source->durable && buf->pcm_state == PCM_STATE_S
+			&& cluster_pcm_own_gen_get(buf->buf_id) == source->base_generation + 1
+			&& cluster_pcm_own_flags_get(buf->buf_id) == 0
+			&& (state & (BM_TAG_VALID | BM_VALID | BM_IO_IN_PROGRESS | BM_IO_ERROR))
+				== (BM_TAG_VALID | BM_VALID);
+	else
+		exact = exact && buf->pcm_state == PCM_STATE_N
+			&& cluster_pcm_own_gen_get(buf->buf_id) == source->base_generation
+			&& cluster_pcm_own_flags_get(buf->buf_id) == 0;
+	UnlockBufHdr(buf, state);
+	if (!exact)
+		return; /* Retain the exit/deadline owner, never invent an abandonment. */
+	for (int i = 0; i < GCS_READ_SOURCE_LEDGER_MAX; i++) {
+		GcsReadSourceAttempt *attempt = &gcs_read_source_attempts[i];
+		if (attempt->used && attempt->buf_id == buf->buf_id
+			&& BufferTagsEqual(&attempt->source.tag, &source->tag)
+			&& attempt->source.base_generation == source->base_generation
+			&& attempt->source.reservation_token == source->reservation_token) {
+			ClusterPcmReadGrantKey key = gcs_read_source_key(&attempt->source);
+			bool current = attempt->source.request_id == source->request_id
+				&& attempt->source.request_epoch == source->request_epoch
+				&& attempt->source.master_node == source->master_node;
+			gcs_block_pending_s_notify(&key, attempt->source.master_node, installed && current);
+			memset(attempt, 0, sizeof(*attempt));
+		}
+	}
+	source->pending_s = false;
+}
+
+static bool
+gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition transition_id,
+							   int master_node, bool clean_eligible,
+							   bool *out_retry_denied, ClusterPcmReadSource *source)
 {
 	ClusterGcsBlockOutstandingSlot *slot;
 	uint64 request_id = 0;
@@ -3145,7 +3302,7 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	bool read_capacity_refused = false;
 	bool request_admitted = false;
 	bool retransmit_warning_emitted = false;
-	bool suppress_direct_land = false;
+	bool suppress_direct_land = source != NULL;
 	bool awaiting_holder_refusal_master_cleanup = false;
 	uint8 final_status = GCS_BLOCK_REPLY_DENIED_INCOMPATIBLE;
 	int32 final_forwarding_master = GCS_BLOCK_REPLY_NO_FORWARDING_MASTER;
@@ -3260,6 +3417,8 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 
 	cluster_gcs_block_dedup_register_backend_exit_hook();
 	slot = gcs_block_reserve_slot(tag, (uint8)transition_id, current_master, &request_id);
+	if (source != NULL)
+		source->request_id = request_id;
 
 	max_retries = cluster_gcs_block_retransmit_max_retries >= 0
 					  ? cluster_gcs_block_retransmit_max_retries
@@ -3312,6 +3471,7 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 			/* spec-5.2a D1/D2: mark a deliberately-clean (sequence-refill) X
 			 * request so the master takes the clean-page X-transfer path. */
 			GcsBlockRequestPayloadSetCleanEligible(&payload, clean_eligible);
+			GcsBlockRequestPayloadSetReadMiss(&payload, source != NULL);
 			/* GCS-race round-2 RC-F: carry THIS requester's legal-request
 			 * lifetime so the master pins the dedup entry TTL to the wire
 			 * truth at registration (never to its own later GUC reads). */
@@ -3349,6 +3509,16 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				LWLockRelease(&blk->lock.lock);
 			}
 
+			if (source != NULL) {
+				source->request_id = request_id;
+				source->request_epoch = payload.epoch;
+				source->master_node = current_master;
+				source->pending_s = true;
+				if (!gcs_read_source_arm(buf, source)) {
+					read_capacity_refused = retry_denied = true;
+					break;
+				}
+			}
 			if (!suppress_direct_land)
 				(void)gcs_block_direct_prepare_attempt(slot, buf, tag, transition_id,
 													   current_master);
@@ -3539,6 +3709,17 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 			final_forwarding_master
 				= GcsBlockReplyHeaderGetForwardingMasterNode(&slot->reply_header);
 
+			if (source != NULL
+				&& (final_status == GCS_BLOCK_REPLY_GRANTED
+					|| final_status == GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
+					|| final_status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE
+					|| final_status == GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK
+					|| final_status == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER)
+				&& !GcsBlockReplyHeaderHasPendingS(&slot->reply_header)) {
+				final_status = GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT;
+				terminal_denied = true;
+				break;
+			}
 			if (final_status == GCS_BLOCK_REPLY_GRANTED
 				|| final_status == GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
 				|| final_status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
@@ -3564,6 +3745,7 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 					cluster_xp_end(&xp_recv);
 
 					if (expected != got) {
+						cluster_block_io_trace_failed(tag, slot->reply_block_data, "WIRE", expected, got);
 						pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
 						final_status = GCS_BLOCK_REPLY_DENIED_CHECKSUM_FAIL;
 						terminal_denied = true;
@@ -3615,7 +3797,10 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 					if (final_status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER)
 						pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_granted_from_holder_count,
 												1);
-					if (final_status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE) {
+					if (source != NULL && GcsBlockReplyHeaderHasPendingS(&slot->reply_header)) {
+						/* Master registered this exact request before forwarding.
+						 * Native S publication sends asynchronous DONE, below bufmgr. */
+					} else if (final_status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE) {
 						/*
 						 * PGRAC: spec-6.12a ㉕ — the remote holder downgraded
 						 * X->S and shipped a durable S grant; its master notify
@@ -3699,6 +3884,7 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				cluster_xp_end(&xp_recv);
 
 				if (expected != got) {
+					cluster_block_io_trace_failed(tag, slot->reply_block_data, "WIRE", expected, got);
 					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
 					final_status = GCS_BLOCK_REPLY_DENIED_CHECKSUM_FAIL;
 					terminal_denied = true;
@@ -3996,7 +4182,15 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	 * or discard-and-re-read the shared-storage page; a terminal 53R93 here
 	 * loses the xp/hist sample like every other terminal ereport above.
 	 */
-	if (granted_storage_fallback)
+	if (source != NULL) {
+		source->kind = granted_storage_fallback ? CLUSTER_PCM_SOURCE_DISK_GRANT
+			: (granted || read_image) ? CLUSTER_PCM_SOURCE_IMAGE_INSTALLED
+			: retry_denied ? CLUSTER_PCM_SOURCE_RETRY : CLUSTER_PCM_SOURCE_FAIL;
+		source->watermark = granted_storage_fallback ? (uint64)final_page_lsn : 0;
+		source->request_id = request_id;
+		source->request_epoch = done_request_epoch;
+		source->master_node = done_master_node;
+	} else if (granted_storage_fallback)
 		cluster_gcs_block_fallback_verify_refresh(buf, tag, (SCN)final_page_lsn);
 
 	/* PGRAC: spec-5.59 D2/D3/D4 — close the requester-wait (and index
@@ -4012,8 +4206,8 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	if (granted || granted_storage_fallback || read_image)
 		gcs_block_ship_hist_record(ship_started_at);
 
-	if (granted || granted_storage_fallback || read_image
-		|| (retry_denied && !read_capacity_refused)) {
+	if (source == NULL && (granted || granted_storage_fallback || read_image
+		|| (retry_denied && !read_capacity_refused))) {
 		/*
 		 * PGRAC: GCS-race round-2 RC-F — completion proof.  The terminal
 		 * reply was verified and consumed, so no retransmit of this
@@ -4142,6 +4336,14 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 		}
 	}
 
+	/* First-fill backpressure stays local after its exact private slot has
+	 * closed. A wait budget is not evidence of corruption. */
+	if (source != NULL && !terminal_denied) {
+		source->kind = CLUSTER_PCM_SOURCE_RETRY;
+		*out_retry_denied = true;
+		return false;
+	}
+
 	/* Budget exhausted (timeout or transient DENIED) — HC98 53R90. */
 	pg_atomic_fetch_add_u64(&ClusterGcsBlock->retransmit_exhausted_count, 1);
 	ereport(ERROR,
@@ -4236,6 +4438,82 @@ gcs_block_stage_forward_wait_impl(int32 destination, const GcsBlockForwardPayloa
 	}
 }
 
+bool
+cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition transition_id,
+									  int master_node, bool clean_eligible,
+									  bool *out_retry_denied)
+{
+	return gcs_send_block_request_and_wait(buf, transition_id, master_node,
+		clean_eligible, out_retry_denied, NULL);
+}
+
+bool
+cluster_gcs_send_block_request_source_and_wait(BufferDesc *buf, int master_node,
+											 bool *retry_denied, ClusterPcmReadSource *source)
+{
+	return gcs_send_block_request_and_wait(buf, PCM_TRANS_N_TO_S, master_node,
+		false, retry_denied, source);
+}
+
+bool
+cluster_gcs_block_read_source_quiescent(BufferDesc *buf)
+{
+	ClusterGcsBlockBackendBlock *blk;
+	bool quiet = true;
+	int i;
+
+	if (ClusterGcsBlock == NULL || MyBackendId == InvalidBackendId || buf == NULL)
+		return false;
+	blk = gcs_block_my_block();
+	LWLockAcquire(&blk->lock.lock, LW_SHARED);
+	for (i = 0; i < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; i++) {
+		ClusterGcsBlockOutstandingSlot *slot = &blk->slots[i];
+		if ((slot->in_use && BufferTagsEqual(&slot->tag, &buf->tag))
+			|| (slot->direct_target_prepared && slot->direct_target_buf == buf)) {
+			quiet = false;
+			break;
+		}
+	}
+	LWLockRelease(&blk->lock.lock);
+	return quiet;
+}
+
+bool
+cluster_gcs_block_read_source_quiesce(BufferDesc *buf, const ClusterPcmReadSource *source)
+{
+	ClusterGcsBlockBackendBlock *blk;
+	ClusterGcsBlockOutstandingSlot *owned = NULL;
+	bool safe = true;
+	int i;
+	if (ClusterGcsBlock == NULL || MyBackendId == InvalidBackendId
+		|| buf == NULL || source == NULL || !BufferTagsEqual(&buf->tag, &source->tag))
+		return false;
+	blk = gcs_block_my_block();
+	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+	for (i = 0; i < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; i++) {
+		ClusterGcsBlockOutstandingSlot *slot = &blk->slots[i];
+		if (slot->direct_target_prepared && slot->direct_target_buf == buf) {
+			safe = false;
+			break;
+		}
+		if (!slot->in_use || !BufferTagsEqual(&slot->tag, &source->tag))
+			continue;
+		if (owned != NULL || source->request_id == 0 || slot->request_id != source->request_id
+			|| slot->transition_id != PCM_TRANS_N_TO_S
+			|| slot->direct_state != GCS_BLOCK_DIRECT_UNARMED) {
+			safe = false;
+			break;
+		}
+		owned = slot;
+	}
+	LWLockRelease(&blk->lock.lock);
+	/* Only this backend rearms its slot. TCP delivery writes private reply
+	 * bytes under this lock; it never installs prefill bytes in the buffer. */
+	if (safe && owned != NULL)
+		gcs_block_release_slot(owned);
+	return safe && cluster_gcs_block_read_source_quiescent(buf);
+}
+
 static void
 gcs_block_unsent_slot_cleanup(int code pg_attribute_unused(), Datum arg)
 {
@@ -4259,9 +4537,9 @@ gcs_block_stage_forward_wait(ClusterGcsBlockOutstandingSlot *slot, int32 destina
 	return admitted;
 }
 
-bool
-cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthoritySnapshot *expected,
-											 bool force_one_shot, bool *out_retry_denied)
+static bool
+gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthoritySnapshot *expected,
+											 bool force_one_shot, bool *out_retry_denied, ClusterPcmReadSource *source)
 {
 	ClusterGcsBlockOutstandingSlot *slot;
 	uint64 request_id = 0;
@@ -4275,6 +4553,7 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 	bool installed = false;
 	bool durable_s = false; /* spec-6.12a ㉕ — holder downgraded, we registered */
 	bool image_only;
+	bool shared_source;
 	int32 holder_node;
 
 	Assert(out_retry_denied != NULL);
@@ -4285,10 +4564,18 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 								  cluster_node_id)));
 	*out_retry_denied = false;
+	shared_source = expected->state == PCM_STATE_S && expected->x_holder_node < 0;
 	holder_node = expected->x_holder_node;
-	if (expected->state != PCM_STATE_X || holder_node < 0 || holder_node >= 32
-		|| holder_node == cluster_node_id || expected->s_holders_bitmap != 0
-		|| expected->master_holder.node_id != (uint32)holder_node)
+	if (shared_source) {
+		for (holder_node = 0; holder_node < 32; holder_node++)
+			if (holder_node != cluster_node_id
+				&& (expected->s_holders_bitmap & ((uint32)1 << holder_node)) != 0)
+				break;
+	}
+	if (holder_node < 0 || holder_node >= 32 || holder_node == cluster_node_id
+		|| (!shared_source && (expected->state != PCM_STATE_X
+			|| expected->s_holders_bitmap != 0
+			|| expected->master_holder.node_id != (uint32)holder_node)))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("cluster_gcs_block: invalid remote-X authority for exact read image"),
@@ -4310,6 +4597,8 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 	/* expected_master == self:  the holder's reply carries forwarding_master =
 	 * self, which the HC108 authorized chain validates against this slot. */
 	slot = gcs_block_reserve_slot(tag, (uint8)PCM_TRANS_N_TO_S, cluster_node_id, &request_id);
+	if (source != NULL)
+		source->request_id = request_id;
 	max_retries = cluster_gcs_block_retransmit_max_retries >= 0
 					  ? cluster_gcs_block_retransmit_max_retries
 					  : 4;
@@ -4351,6 +4640,10 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 
 			LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
 			slot->request_id = request_id;
+			if (source != NULL) {
+				source->request_id = request_id;
+				source->request_epoch = cluster_epoch_get_current();
+			}
 			slot->reply_received = false;
 			memset(&slot->reply_header, 0, sizeof(slot->reply_header));
 			memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
@@ -4372,12 +4665,12 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 			fwd.transition_id = (uint8)PCM_TRANS_N_TO_S;
 			GcsBlockForwardPayloadSetExpectedPiWatermarkScn(
 				&fwd, cluster_pcm_lock_pi_watermark_scn_query(tag));
-			GcsBlockForwardPayloadSetReadImage(&fwd, true);
+			GcsBlockForwardPayloadSetReadImage(&fwd, !shared_source);
 			/* PGRAC: spec-6.12a ㉕ — ask the remote X holder to TRY the quiescent
 		 * X->S downgrade so this read (and every later one) becomes a durable
 		 * cached S.  We ARE the master here, so on the holder's durable reply
 		 * the registration is a local transition apply — no ACK wire. */
-			if (cluster_read_scache && !image_only)
+			if (!shared_source && cluster_read_scache && !image_only)
 				GcsBlockForwardPayloadSetDowngradeRequest(&fwd, true);
 
 			if (retry_attempt > 0)
@@ -4429,7 +4722,8 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 			last_status = got_reply ? (int)slot->reply_header.status : -1;
 
 			if (got_reply
-				&& (slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
+				&& ((shared_source && slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER)
+					|| slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
 					|| (!image_only
 						&& slot->reply_header.status
 							   == (uint8)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE))) {
@@ -4454,8 +4748,8 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 				 * pcm_state stays N (Rule 8.A: never a durable copy the
 				 * master entry does not track).
 				 */
-					if (slot->reply_header.status
-						== (uint8)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE) {
+					if (slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
+						|| slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE) {
 						if (!image_only
 							&& cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_N_TO_S,
 																	 cluster_node_id))
@@ -4464,6 +4758,7 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 							cluster_lever_a_note_remote_ack_degraded();
 					}
 				} else {
+					cluster_block_io_trace_failed(tag, slot->reply_block_data, "WIRE", expected, got);
 					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
 				}
 			}
@@ -4521,6 +4816,13 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 	if (installed)
 		return false; /* one-shot read image — non-durable, leave pcm_state N */
 
+	if (source != NULL && (last_status == -1
+		|| last_status == GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
+		|| last_status == GCS_BLOCK_REPLY_DENIED_PENDING_X)) {
+		*out_retry_denied = true;
+		return false;
+	}
+
 	/* No read image obtained (timeout / holder evict / denial) — fail closed,
 	 * never a silent stale read (Rule 8.A). */
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -4535,6 +4837,26 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 					errhint("The X holder did not ship a current image in time; retry, or "
 							"inspect dump_gcs.cf_xheld_read_ship_count.")));
 	return true; /* unreachable */
+}
+
+
+bool
+cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthoritySnapshot *expected,
+		bool force_one_shot, bool *retry)
+{
+	return gcs_local_master_read_image_and_wait(buf, expected, force_one_shot, retry, NULL);
+}
+
+bool
+cluster_gcs_local_master_read_source_and_wait(BufferDesc *buf, const PcmAuthoritySnapshot *expected,
+	bool force_one_shot, bool *retry, ClusterPcmReadSource *source)
+{
+	if (force_one_shot || !cluster_pcm_lock_authority_matches(buf->tag, expected)) {
+		*retry = true;
+		return false;
+	}
+	return gcs_send_block_request_and_wait(buf, PCM_TRANS_N_TO_S, cluster_node_id,
+		false, retry, source);
 }
 
 
@@ -9056,8 +9378,10 @@ gcs_block_produce_reply(const GcsBlockRequestPayload *req, char *block_buf, bool
 		 * image newer than storage) and must never be overwritten.
 		 */
 		fallback_watermark_scn = cluster_pcm_lock_pi_watermark_scn_query(req->tag);
-		apply_result = cluster_pcm_lock_apply_gcs_transition_result(
-			req->tag, (PcmLockTransition)req->transition_id, req->sender_node);
+		apply_result = GcsBlockRequestPayloadIsReadMiss(req)
+			? cluster_pcm_lock_apply_disk_read_grant(req->tag, req->sender_node)
+			: cluster_pcm_lock_apply_gcs_transition_result(
+				req->tag, (PcmLockTransition)req->transition_id, req->sender_node);
 		if (apply_result != PCM_GCS_TRANSITION_APPLIED) {
 			*out_status
 				= GcsBlockApplyRefusalStatus(apply_result, (PcmLockTransition)req->transition_id);
@@ -9084,6 +9408,12 @@ gcs_block_produce_reply(const GcsBlockRequestPayload *req, char *block_buf, bool
 	if (!found
 		&& cluster_pcm_master_requester_is_holder(req->tag, req->sender_node,
 												  (PcmLockTransition)req->transition_id)) {
+		if (GcsBlockRequestPayloadIsReadMiss(req)
+			&& cluster_pcm_lock_apply_disk_read_grant(req->tag, req->sender_node)
+				!= PCM_GCS_TRANSITION_APPLIED) {
+			*out_status = GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
+			return true;
+		}
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_storage_fallback_count, 1);
 		*out_status = GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK;
 		return true;
@@ -17003,6 +17333,84 @@ cluster_gcs_resource_x_target_itl_recycle_cancel_exact(const ResourceXLocalOwner
  *	       VALIDATION_FAIL      HC91 — reply VALIDATOR_REJECT
  *	       FULL                 HC92 — reply DENIED_DEDUP_FULL (transient)
  */
+/* Master pre-registration is the authority point, before FORWARD. The marker
+ * is routing only; a duplicate must still find this exact live pending grant. */
+static void
+gcs_block_first_fill_request(const GcsBlockRequestPayload *req, const GcsBlockDedupKey *key,
+	int worker, bool create)
+{
+	ClusterPcmReadGrant grant;
+	PcmGcsTransitionApplyResult result;
+	GcsBlockForwardPayload fwd;
+	GcsBlockReplyHeader marker;
+	TimestampTz deadline = GetCurrentTimestamp()
+		+ (TimestampTz)Max(GcsBlockRequestPayloadGetLifetimeHintMs(req), 1000) * 1000;
+
+	result = cluster_pcm_lock_read_grant_begin(req->tag, req->sender_node,
+		req->requester_backend_id, req->request_id, req->epoch, deadline, create, &grant);
+	if (result != PCM_GCS_TRANSITION_APPLIED) {
+		gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_PENDING_X,
+			InvalidXLogRecPtr, NULL);
+		return;
+	}
+	if (grant.holder_node < 0) {
+		/* Two-way disk grant. No image producer or synchronous registration. */
+		char reply[sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE];
+		GcsBlockReplyHeader *hdr = (GcsBlockReplyHeader *)reply;
+		memset(reply, 0, sizeof(reply));
+		hdr->request_id = req->request_id;
+		hdr->epoch = req->epoch;
+		hdr->sender_node = cluster_node_id;
+		hdr->requester_backend_id = req->requester_backend_id;
+		hdr->transition_id = req->transition_id;
+		hdr->status = GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK;
+		hdr->page_lsn = (uint64)cluster_pcm_lock_pi_watermark_scn_query(req->tag);
+		hdr->reserved_0[5] = GCS_BLOCK_PENDING_S_REPLY_MARK;
+		GcsBlockReplyHeaderSetForwardingMasterNode(hdr, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+		hdr->checksum = gcs_block_compute_checksum(reply + sizeof(*hdr));
+		cluster_gcs_block_dedup_install_reply(worker, key,
+			GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK, hdr, reply + sizeof(*hdr));
+		cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY,
+			gcs_block_send_envelope_or_loopback(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+				req->sender_node, reply, sizeof(reply)));
+		return;
+	}
+	memset(&fwd, 0, sizeof(fwd));
+	fwd.request_id = req->request_id;
+	fwd.epoch = req->epoch;
+	fwd.tag = req->tag;
+	fwd.original_requester_node = req->sender_node;
+	fwd.requester_backend_id = req->requester_backend_id;
+	fwd.master_node = cluster_node_id;
+	fwd.transition_id = PCM_TRANS_N_TO_S;
+	fwd.reserved_0[6] = GCS_BLOCK_FORWARD_KIND_FIRST_FILL_S;
+	GcsBlockForwardPayloadSetReadImage(&fwd, grant.holder_was_x);
+	GcsBlockForwardPayloadSetDowngradeRequest(&fwd, grant.holder_was_x);
+	GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&fwd,
+		cluster_pcm_lock_pi_watermark_scn_query(req->tag));
+	/* Same-instance M/H uses the existing DATA ring, not an IC self-send. */
+	if (!(grant.holder_node == cluster_node_id
+		? cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+			(uint32)cluster_node_id, &fwd, sizeof(fwd))
+		: gcs_block_forward_send_admitted(grant.holder_node, &fwd))) {
+		(void)cluster_pcm_lock_read_grant_done(&grant.key, req->sender_node, false);
+		gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_PENDING_X,
+			InvalidXLogRecPtr, NULL);
+		return;
+	}
+	pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
+	memset(&marker, 0, sizeof(marker));
+	marker.request_id = req->request_id;
+	marker.requester_backend_id = req->requester_backend_id;
+	marker.transition_id = req->transition_id;
+	marker.sender_node = grant.holder_node;
+	marker.status = GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER;
+	marker.reserved_0[5] = GCS_BLOCK_PENDING_S_REPLY_MARK;
+	GcsBlockReplyHeaderSetForwardingMasterNode(&marker, cluster_node_id);
+	cluster_gcs_block_dedup_install_reply(worker, key, GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER,
+		&marker, NULL);
+}
+
 void
 cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const void *payload)
 {
@@ -17135,6 +17543,16 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 		}
 	}
 
+	if (req->reserved_0[6] > 1
+		|| (GcsBlockRequestPayloadIsReadMiss(req)
+			&& (req->transition_id != PCM_TRANS_N_TO_S
+				|| GcsBlockRequestPayloadIsCleanEligible(req)
+				|| GcsBlockRequestPayloadIsDirectLandArmed(req)))) {
+		gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT,
+			InvalidXLogRecPtr, NULL);
+		return;
+	}
+
 	/* HC75 range guard — out of range never enters dedup HTAB. */
 	if (req->transition_id < PCM_TRANS_N_TO_S || req->transition_id > PCM_TRANS_S_TO_X_CLEANOUT) {
 		gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT,
@@ -17194,6 +17612,8 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	if (dr != GCS_BLOCK_DEDUP_VALIDATION_FAIL && dr != GCS_BLOCK_DEDUP_FULL) {
 		if (GcsBlockRequestPayloadIsDirectLandArmed(req))
 			request_flags |= GCS_BLOCK_DEDUP_REQUEST_F_DIRECT_LAND;
+		if (GcsBlockRequestPayloadIsReadMiss(req))
+			request_flags |= GCS_BLOCK_DEDUP_REQUEST_F_READ_MISS;
 		if (!cluster_gcs_block_dedup_set_request_flags_exact(dedup_worker_id, &key, &req->tag,
 															 req->transition_id, request_flags)) {
 			/* The tuple was removed/replaced or its immutable request properties
@@ -17203,6 +17623,16 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 								 InvalidXLogRecPtr, NULL);
 			return;
 		}
+	}
+	/* Ordinary first-fill never enters the legacy one-shot/read-register
+	 * decision tree. Replays cannot recreate a retired pending identity. */
+	if (GcsBlockRequestPayloadIsReadMiss(req)
+		&& (dr == GCS_BLOCK_DEDUP_MISS_REGISTERED || dr == GCS_BLOCK_DEDUP_FORWARDED_DUPLICATE
+			|| (dr == GCS_BLOCK_DEDUP_CACHED_REPLY
+				&& GcsBlockReplyHeaderHasPendingS(&cached_entry.reply_header)))) {
+		gcs_block_first_fill_request(req, &key, dedup_worker_id,
+			dr == GCS_BLOCK_DEDUP_MISS_REGISTERED);
+		return;
 	}
 	if (req->transition_id == PCM_TRANS_N_TO_S) {
 		queue_pending_x_after = gcs_block_queue_pending_x_authoritative(req->tag);
@@ -18458,7 +18888,8 @@ scache_downgraded_fall_through:
 			 *	stay fail-closed.  A failed/unverifiable storage read keeps
 			 *	the fail-closed DENIED too (Rule 8.A).
 			 */
-			if (verdict == GCS_LOST_WRITE_FAIL_STALE) {
+			if (verdict == GCS_LOST_WRITE_FAIL_STALE
+				&& !GcsBlockRequestPayloadIsReadMiss(req)) {
 				SCN storage_scn = InvalidScn;
 				bool storage_read_ok = false;
 				MemoryContext probe_cxt = CurrentMemoryContext;
@@ -20290,6 +20721,21 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 
 	cluster_sf_dep_vec_reset(&sf_dep_vec);
 	fwd = (const GcsBlockForwardPayload *)payload;
+	if (GcsBlockForwardPayloadIsFirstFillS(fwd)) {
+		uint64 session;
+		if (fwd->master_node != (int32)env->source_node_id
+			|| fwd->epoch != cluster_epoch_get_current()
+			|| cluster_gcs_lookup_master(fwd->tag) != fwd->master_node
+			|| !gcs_block_pcm_x_authenticated_session(fwd->master_node, fwd->epoch, &session)
+			|| fwd->transition_id != PCM_TRANS_N_TO_S
+			|| fwd->original_requester_node < 0 || fwd->original_requester_node >= 32
+			|| fwd->requester_backend_id <= 0 || fwd->requester_backend_id > MaxBackends
+			|| fwd->request_id == 0 || fwd->reserved_0[0] > 1
+			|| fwd->reserved_0[1] != 0 || fwd->reserved_0[2] != 0
+			|| fwd->reserved_0[3] != fwd->reserved_0[0]
+			|| fwd->reserved_0[4] != 0 || fwd->reserved_0[5] != 0)
+			return;
+	}
 	if (GcsBlockForwardPayloadIsCurrentMxRuntime(fwd)
 		|| fwd->reserved_0[6] == GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS)
 		return;
@@ -20460,19 +20906,39 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	 * injection) falls back to today's one-shot read-image ship — the flag
 	 * is a request, never a command.
 	 */
-	if (cluster_read_scache && GcsBlockForwardPayloadIsReadImage(fwd)
+	if ((cluster_read_scache || GcsBlockForwardPayloadIsFirstFillS(fwd))
+		&& GcsBlockForwardPayloadIsReadImage(fwd)
 		&& GcsBlockForwardPayloadIsDowngradeRequest(fwd)
 		&& fwd->transition_id == PCM_TRANS_N_TO_S) {
 		CLUSTER_INJECTION_POINT("cluster-gcs-block-remote-downgrade");
 		if (!holder_evicted_injected
 			&& !cluster_injection_should_skip("cluster-gcs-block-remote-downgrade"))
-			remote_downgrade_outcome = cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(
-				fwd->tag, fwd->master_node, &page_lsn, block_buf, &copy_refusal);
+			{
+			if (GcsBlockForwardPayloadIsFirstFillS(fwd)) {
+				ClusterPcmReadGrantKey grant_key = { 0 };
+				grant_key.tag = fwd->tag;
+				grant_key.request_id = fwd->request_id;
+				grant_key.epoch = fwd->epoch;
+				grant_key.requester_node = fwd->original_requester_node;
+				grant_key.backend_id = fwd->requester_backend_id;
+				remote_downgrade_outcome = cluster_bufmgr_first_fill_s_prepare_image(
+					&grant_key, fwd->master_node, &page_lsn, block_buf, &copy_refusal);
+			} else
+				remote_downgrade_outcome = cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(
+					fwd->tag, fwd->master_node, &page_lsn, block_buf, &copy_refusal);
+		}
 		remote_downgraded = remote_downgrade_outcome == CLUSTER_BUFMGR_GCS_DOWNGRADE_COMMITTED;
 		cluster_lever_a_note_remote_downgrade(remote_downgraded);
 	}
 	if (remote_downgrade_outcome == CLUSTER_BUFMGR_GCS_DOWNGRADE_FAILCLOSED_POST_NOTIFY)
 		return;
+	/* First-fill can consume only a durable S. A replay may find H already
+	 * downgraded; anything still X/busy refuses rather than shipping one-shot. */
+	if (GcsBlockForwardPayloadIsFirstFillS(fwd) && !remote_downgraded
+		&& (cluster_bufmgr_block_pcm_state(fwd->tag) != PCM_LOCK_MODE_S
+			|| cluster_bufmgr_block_grant_pending(fwd->tag)))
+		holder_evicted_injected = true;
+
 
 	/* spec-2.35 D15 — SKIP simulates the evict race. */
 	if (holder_evicted_injected) {
@@ -20589,7 +21055,13 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 			 * transfer."  Rule 8.A: a GCS ownership transfer must satisfy the
 			 * holder's local commit dependency, not just the bufmgr API contract.
 			 */
-			if (remote_downgraded) {
+			if (GcsBlockForwardPayloadIsFirstFillS(fwd)) {
+				hdr->status = remote_downgraded
+					? GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE
+					: GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER;
+				hdr->reserved_0[5] = GCS_BLOCK_PENDING_S_REPLY_MARK;
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_from_holder_ship_count, 1);
+			} else if (remote_downgraded) {
 				/*
 				 * PGRAC: spec-6.12a ㉕ — we accepted the downgrade: our copy is
 				 * S, the page is flushed storage-current, and the master
@@ -20837,6 +21309,15 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 											cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
 																	 fwd->original_requester_node,
 																	 buf, total));
+	}
+	if (GcsBlockForwardPayloadIsFirstFillS(fwd) && !GcsBlockReplyHeaderHasPendingS(hdr)) {
+		ClusterPcmReadGrantKey key = { 0 };
+		key.tag = fwd->tag;
+		key.request_id = fwd->request_id;
+		key.epoch = fwd->epoch;
+		key.requester_node = fwd->original_requester_node;
+		key.backend_id = fwd->requester_backend_id;
+		gcs_block_pending_s_notify(&key, fwd->master_node, false);
 	}
 	/* PGRAC: spec-5.59 D3 — close the holder-forward read-image ship scope
 	 * (no-op unless the read-image branch above started it). */
@@ -21089,6 +21570,34 @@ cluster_gcs_handle_block_done_envelope(const ClusterICEnvelope *env, const void 
 	 */
 	if (done->sender_node != (int32)env->source_node_id) {
 		cluster_gcs_block_dedup_note_done_mismatch(dedup_worker_id);
+		return;
+	}
+	if (done->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_CONFIRM
+		|| done->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_NACK
+		|| done->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_HOLDER) {
+		ClusterPcmReadGrantKey grant_key;
+		uint64 session;
+		bool installed = done->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_CONFIRM;
+		if (!GcsBlockDonePayloadPendingSKey(done, &grant_key)
+			|| cluster_gcs_lookup_master(done->tag) != cluster_node_id
+			|| !gcs_block_pcm_x_authenticated_session(done->sender_node,
+				cluster_epoch_get_current(), &session)
+			|| (installed && done->epoch != cluster_epoch_get_current()))
+			return;
+		if (done->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_HOLDER) {
+			if (done->epoch == cluster_epoch_get_current())
+				(void)cluster_pcm_lock_read_grant_holder_done(&grant_key, done->sender_node);
+			return;
+		}
+		if (cluster_pcm_lock_read_grant_done(&grant_key, done->sender_node, installed)) {
+			memset(&key, 0, sizeof(key));
+			key.origin_node_id = (uint32)grant_key.requester_node;
+			key.requester_backend_id = grant_key.backend_id;
+			key.request_id = grant_key.request_id;
+			key.cluster_epoch = grant_key.epoch;
+			(void)cluster_gcs_block_dedup_mark_done(dedup_worker_id, &key,
+				&done->tag, done->transition_id);
+		}
 		return;
 	}
 	{
@@ -21466,6 +21975,7 @@ void
 cluster_gcs_block_pi_write_note(BufferTag tag, SCN page_scn)
 {
 	bool overflowed = false;
+	uint64 sequence = 0;
 
 	if (ClusterGcsBlock == NULL || !cluster_past_image)
 		return;
@@ -21479,10 +21989,12 @@ cluster_gcs_block_pi_write_note(BufferTag tag, SCN page_scn)
 
 		ClusterGcsBlock->pi_note_ring[slot].tag = tag;
 		ClusterGcsBlock->pi_note_ring[slot].page_scn = page_scn;
-		ClusterGcsBlock->pi_note_append_seq++;
+		sequence = ClusterGcsBlock->pi_note_append_seq++;
 	}
 	SpinLockRelease(&ClusterGcsBlock->pi_note_lock);
 
+	cluster_block_io_trace_note(tag, overflowed ? "WRITE_NOTE_DROPPED" : "WRITE_NOTE",
+		(uint64)page_scn, sequence, 0);
 	cluster_lever_h_note_write_note(overflowed);
 }
 
@@ -21520,6 +22032,10 @@ cluster_gcs_block_pi_note_confirm(uint64 presync_seq)
 	if (presync_seq > ClusterGcsBlock->pi_note_confirmed_seq)
 		ClusterGcsBlock->pi_note_confirmed_seq = presync_seq;
 	SpinLockRelease(&ClusterGcsBlock->pi_note_lock);
+	{
+		BufferTag no_tag = {0};
+		cluster_block_io_trace_note(no_tag, "SYNC_CONFIRMED_PREFIX", 0, presync_seq, 0);
+	}
 }
 
 /*
@@ -21597,6 +22113,7 @@ gcs_block_pi_discard_master_apply(BufferTag tag, SCN written_scn)
 
 	if (!cluster_pcm_lock_pi_discard_collect(tag, written_scn, &holders))
 		return;
+	cluster_block_io_trace_note(tag, "PI_DIRECTORY_RETIRED", written_scn, 0, holders);
 	/* The durable-confirm retire HC130 anticipated (counter shared with the
 	 * tag-lifecycle retire family). */
 	if (ClusterGcsBlock != NULL)
@@ -21918,16 +22435,21 @@ gcs_block_wake_local_pending_s_request(const GcsBlockInvalidatePayload *inv)
 			ClusterGcsBlockOutstandingSlot *slot = &blk->slots[slot_idx];
 			GcsBlockReplyHeader *hdr;
 
+			if (inv->reserved_0[0] == GCS_BLOCK_INVALIDATE_KIND_PENDING_S
+				&& (backend_idx + 1 != GcsBlockInvalidatePayloadPendingSBackend(inv)
+					|| slot->request_id != inv->request_id))
+				continue;
 			if (!GcsBlockLocalPendingSDenialMatches(
 					slot->in_use, slot->reply_received, slot->stale, slot->transition_id,
 					&slot->tag, slot->request_epoch, slot->expected_master_node, slot->direct_state,
-					slot->direct_target_prepared, &inv->tag, inv->epoch, inv->master_node))
+					slot->direct_target_prepared, &inv->tag, inv->reserved_0[0] == GCS_BLOCK_INVALIDATE_KIND_PENDING_S
+					? GcsBlockInvalidatePayloadPendingSEpoch(inv) : inv->epoch, inv->master_node))
 				continue;
 
 			hdr = &slot->reply_header;
 			memset(hdr, 0, sizeof(*hdr));
 			hdr->request_id = slot->request_id;
-			hdr->epoch = inv->epoch;
+			hdr->epoch = slot->request_epoch;
 			hdr->sender_node = inv->master_node;
 			hdr->requester_backend_id = backend_idx + 1;
 			hdr->transition_id = slot->transition_id;
@@ -22121,6 +22643,61 @@ gcs_block_observe_grant_pending_invalidate(const GcsBlockInvalidatePayload *inv,
  *	sent);  false when the local copy was PINNED — nothing was changed,
  *	no ACK was sent, and the caller parks the directive for retry.
  */
+void
+cluster_gcs_block_pending_s_tick(void)
+{
+	static uint32 cursor;
+	ClusterPcmReadGrant work;
+	GcsBlockInvalidatePayload inv;
+	int worker = cluster_ic_tier1_my_data_channel();
+	uint64 epoch = cluster_epoch_get_current();
+	if (worker < 0 || ClusterGcsBlock == NULL
+		|| !cluster_pcm_lock_read_grant_work(&cursor, worker, cluster_lms_workers,
+			GetCurrentTimestamp(), epoch, &work))
+		return;
+	if (cluster_gcs_lookup_master(work.key.tag) != cluster_node_id)
+		return; /* Membership recovery retains the debt; not this node's grant. */
+	memset(&inv, 0, sizeof(inv));
+	inv.request_id = work.key.request_id;
+	inv.epoch = epoch; /* Current transport admission; original epoch is echoed separately. */
+	inv.tag = work.key.tag;
+	inv.master_node = cluster_node_id;
+	inv.invalidating_for_x_node = (uint8)work.key.requester_node;
+	GcsBlockInvalidatePayloadSetPendingS(&inv, &work.key);
+	inv.checksum = gcs_block_compute_invalidate_checksum(&inv);
+	cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_INVALIDATE,
+		gcs_block_send_envelope_or_loopback(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE,
+			work.key.requester_node, &inv, sizeof(inv)));
+}
+
+/* A no-resident ACK must also exclude a delayed private delivery. A live slot
+ * remains owned by its backend; wake that exact attempt and wait for closure. */
+static bool
+gcs_block_pending_s_delivery_closed(const GcsBlockInvalidatePayload *inv)
+{
+	int backend = GcsBlockInvalidatePayloadPendingSBackend(inv);
+	uint64 epoch = GcsBlockInvalidatePayloadPendingSEpoch(inv);
+	ClusterGcsBlockBackendBlock *blk;
+	bool closed = true;
+	if (backend <= 0 || backend > MaxBackends || epoch == 0 || gcs_block_backend_blocks == NULL)
+		return false;
+	blk = &gcs_block_backend_blocks[backend - 1];
+	LWLockAcquire(&blk->lock.lock, LW_SHARED);
+	for (int i = 0; i < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; i++) {
+		ClusterGcsBlockOutstandingSlot *slot = &blk->slots[i];
+		if (slot->in_use && slot->request_id == inv->request_id
+			&& slot->request_epoch == epoch && slot->expected_master_node == inv->master_node
+			&& BufferTagsEqual(&slot->tag, &inv->tag)) {
+			closed = false;
+			break;
+		}
+	}
+	LWLockRelease(&blk->lock.lock);
+	if (!closed)
+		(void)gcs_block_wake_local_pending_s_request(inv);
+	return closed;
+}
+
 static bool
 gcs_block_invalidate_execute(const GcsBlockInvalidatePayload *inv)
 {
@@ -22148,8 +22725,24 @@ gcs_block_invalidate_execute(const GcsBlockInvalidatePayload *inv)
 	 * (Rule 8.A stale-S; masked pre-㉕ by the AD-015 phantom-harness
 	 * divergence deferral, exposed by the ㉕ remote-downgrade S caches).
 	 */
+	if (inv->reserved_0[0] == GCS_BLOCK_INVALIDATE_KIND_PENDING_S
+		&& !gcs_block_pending_s_delivery_closed(inv)) {
+		ack_status = GCS_BLOCK_INVALIDATE_ACK_STATUS_RETRYABLE_BUSY;
+		goto send_ack;
+	}
 	pre_state = cluster_bufmgr_block_pcm_state(inv->tag);
+	/* The first-fill S commit still precedes BM_VALID; its IO owner must
+	 * finish or abort before any kind of invalidate can certify a drop. */
+	if (pre_state != PCM_LOCK_MODE_N && cluster_bufmgr_block_grant_pending(inv->tag)) {
+		ack_status = GCS_BLOCK_INVALIDATE_ACK_STATUS_RETRYABLE_BUSY;
+		goto send_ack;
+	}
 	if (pre_state == PCM_LOCK_MODE_N) {
+		if (inv->reserved_0[0] == GCS_BLOCK_INVALIDATE_KIND_PENDING_S
+			&& cluster_bufmgr_pending_s_aborted(inv->tag)) {
+			ack_status = 2;
+			goto send_ack;
+		}
 		/*
 		 * PGRAC ownership-generation wave (W3) — do NOT treat N as
 		 * already-invalidated while a grant for this tag is in flight to
@@ -22263,6 +22856,8 @@ send_ack:
 	/* PGRAC: spec-6.12h D-h2 — kept-PI report ride (checksum-covered). */
 	ack.reserved_0[0] = kept_pi ? (uint8)GCS_BLOCK_INVALIDATE_ACK_KEPT_PI : (uint8)0;
 	GcsBlockInvalidateAckPayloadSetPageScn(&ack, page_scn); /* spec-2.41 D3 — SCN carrier @52 */
+	if (inv->reserved_0[0] == GCS_BLOCK_INVALIDATE_KIND_PENDING_S)
+		GcsBlockInvalidateAckPayloadEchoPendingS(&ack, inv);
 	ack.checksum = gcs_block_compute_invalidate_ack_checksum(&ack);
 
 	/*
@@ -22643,6 +23238,15 @@ cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const
 		}
 	}
 
+	if (inv->reserved_0[0] == GCS_BLOCK_INVALIDATE_KIND_PENDING_S) {
+		if (GcsBlockInvalidatePayloadPendingSEpoch(inv) == 0
+			|| GcsBlockInvalidatePayloadPendingSBackend(inv) <= 0
+			|| GcsBlockInvalidatePayloadPendingSBackend(inv) > MaxBackends)
+			return;
+		for (int i = 1; i < (int)sizeof(inv->reserved_0); i++)
+			if (inv->reserved_0[i] != 0)
+				return;
+	}
 	/*
 	 * PGRAC: spec-6.12h D-h2 — PI_DISCARD directive ride.  Strictly drops a
 	 * BUF_TYPE_PI buffer (a live current copy is never touched — the strict
@@ -22756,6 +23360,22 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 		}
 	}
 
+	/* Exact pending-S revoke proofs never reach the legacy slotless clear.
+	 * In particular, BUSY or a stale ACK cannot erase a successor S grant. */
+	if (ack->reserved_0[1] == GCS_BLOCK_INVALIDATE_KIND_PENDING_S) {
+		ClusterPcmReadGrantKey key;
+		uint64 session;
+		if (GcsBlockInvalidateAckPayloadPendingSKey(ack, &key)
+			&& (ack->ack_status == 0 || ack->ack_status == 2)
+			&& cluster_gcs_lookup_master(ack->tag) == cluster_node_id
+			&& gcs_block_pcm_x_authenticated_session(ack->sender_node,
+				cluster_epoch_get_current(), &session)) {
+			if (ack->reserved_0[0] == GCS_BLOCK_INVALIDATE_ACK_KEPT_PI)
+				cluster_pcm_lock_pi_holder_note(ack->tag, ack->sender_node);
+			(void)cluster_pcm_lock_read_grant_revoke_ack(&key);
+		}
+		return;
+	}
 	/*
 	 * PGRAC: spec-6.12h D-h2 — unsolicited rides on the ACK wire, diverted
 	 * BEFORE the e2 slotless branch and the HC100 slot logic (both reject

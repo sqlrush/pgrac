@@ -696,6 +696,21 @@ typedef struct ClusterPcmResourceXDeferredSettlement {
 	uint32 present;
 } ClusterPcmResourceXDeferredSettlement;
 
+/* A possible requester copy is authority debt, even before BM_VALID. The
+ * resource master owns it under entry_lock until DONE or exact revoke ACK. */
+typedef struct ClusterPcmPendingS {
+	uint64 request_id;
+	uint64 epoch;
+	TimestampTz deadline;
+	TimestampTz retry_at;
+	int32 backend_id;
+	int32 holder_node;
+	uint8 phase; /* 0 empty, 1 installation pending, 2 revoke required */
+	uint8 holder_was_x;
+	uint8 reserved[6];
+} ClusterPcmPendingS;
+StaticAssertDecl(sizeof(ClusterPcmPendingS) == 48, "bounded pending-S identity");
+
 typedef struct ClusterPcmResourceXMasterState {
 	uint64 binding_generation;
 	uint64 authority_generation;
@@ -727,6 +742,9 @@ typedef struct ClusterPcmResourceXMasterState {
 	 * clean; publication moves it into the local PI responsibility. */
 	ClusterPageWalRefV1 holder_pi_first;
 	ResourceXIntentSlot holder_image_intent;
+	uint32 pending_s_bitmap;
+	uint32 pending_s_reserved;
+	ClusterPcmPendingS pending_s[RESOURCE_X_PROTOCOL_NODE_LIMIT];
 } ClusterPcmResourceXMasterState;
 
 StaticAssertDecl(sizeof(ClusterPcmResourceXMasterRequest) == 352,
@@ -751,7 +769,7 @@ StaticAssertDecl(sizeof(ClusterPcmResourceXRequesterJoin) == 9120,
 				 "Resource-X requester join layout must remain 9120 bytes");
 StaticAssertDecl(sizeof(ClusterPcmResourceXDeferredSettlement) == 160,
 				 "Resource-X deferred settlement must remain bounded");
-StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 49960,
+StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 51504,
 				 "D4 Resource-X master state must bind object generation");
 
 typedef struct ClusterPcmShared {
@@ -948,6 +966,10 @@ static ClusterPcmResourceXMasterState *
 pcm_resource_x_master_state_for_entry(const struct GrdEntry *entry);
 static ClusterPcmResourceXMasterRequest *
 pcm_resource_x_master_head(ClusterPcmResourceXMasterState *state, int32 *requester_node_out);
+static bool pcm_read_grant_state_valid(const ClusterPcmResourceXMasterState *state);
+static ClusterPcmResourceXMasterRequest *
+pcm_resource_x_start_head_locked(struct GrdEntry *entry, ClusterPcmResourceXMasterState *state,
+	int32 *requester_node_out);
 static void pcm_trace_wait(struct GrdEntry *entry, ClusterWaitTraceSite site,
 	PcmLockMode mode, int32 expected_master, int32 requester, uint64 request_seq,
 	bool request_known, bool master_view, const ClusterWaitTrace *wait_request);
@@ -2093,7 +2115,8 @@ pcm_entry_retire_eligible_locked(struct GrdEntry *entry, uint64 expected_generat
 		*why = PCM_RETIRE_REFUSAL_IDENTITY_MISMATCH;
 		return false;
 	}
-	if (state->holder_status.valid != 0 || state->holder_image.valid != 0
+	if (!pcm_read_grant_state_valid(state) || state->pending_s_bitmap != 0
+		|| state->holder_status.valid != 0 || state->holder_image.valid != 0
 		|| state->holder_pi_first.source_flags != 0 /* D S09 R-A22 */
 		|| state->holder_status_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
 		|| state->holder_image_intent.state != RESOURCE_X_INTENT_SLOT_EMPTY) {
@@ -2501,6 +2524,8 @@ pcm_resource_x_reconfig_proof_slot_locked(struct GrdEntry *entry,
 	Assert(old_residual_out != NULL);
 	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED));
 	*old_residual_out = false;
+	if (!pcm_read_grant_state_valid(state) || state->pending_s_bitmap != 0)
+		return false;
 	digest = pcm_resource_x_proof_digest_tag(*digest_io, &entry->tag);
 
 	if (!pcm_resource_x_active_empty_locked(entry)) {
@@ -3339,10 +3364,28 @@ cluster_resource_x_reconfig_sweep(const ResourceXReconfigToken *token, uint32 pr
 		}
 		dead_requester_bitmap = token->dead_requester_bitmap;
 		master_state = pcm_resource_x_master_state_for_entry(entry);
-		if (master_state == NULL) {
+		if (!pcm_read_grant_state_valid(master_state)) {
 			LWLockRelease(&entry->entry_lock.lock);
 			pcm_resource_x_reconfig_block();
 			return pcm_resource_x_reconfig_return_release(&entry_ref, RESOURCE_X_RECONFIG_CORRUPT);
+		}
+		if (master_state->pending_s_bitmap != 0) {
+			for (int n = 0; n < RESOURCE_X_PROTOCOL_NODE_LIMIT; n++) {
+				uint32 bit = UINT32_C(1) << n;
+				if ((master_state->pending_s_bitmap & bit) == 0)
+					continue;
+				if ((dead_requester_bitmap & bit) != 0) {
+					memset(&master_state->pending_s[n], 0, sizeof(master_state->pending_s[n]));
+					master_state->pending_s_bitmap &= ~bit;
+				} else {
+					master_state->pending_s[n].phase = 2;
+					master_state->pending_s[n].retry_at = 0;
+				}
+			}
+			if (master_state->pending_s_bitmap != 0) {
+				LWLockRelease(&entry->entry_lock.lock);
+				return pcm_resource_x_reconfig_return_release(&entry_ref, RESOURCE_X_RECONFIG_RETRY);
+			}
 		}
 		if (!pcm_resource_x_source_settlement_debt_decode_locked(entry, master_state,
 																 &source_settlement)
@@ -5225,6 +5268,13 @@ pcm_frontend_wait_check_shutdown(void)
 				 errmsg("canceling statement during administrator shutdown while waiting for cluster buffer ownership")));
 }
 
+void
+cluster_pcm_lock_check_shutdown_wait(void)
+{
+	pcm_frontend_wait_check_shutdown();
+	CHECK_FOR_INTERRUPTS();
+}
+
 /* One backend can have at most one ConditionVariable sleep registration.
  * Preserve that registration across the executor probe/wait API boundary,
  * but retain only the exact pinned handle and logical Resource-X identity. */
@@ -6126,18 +6176,11 @@ cluster_pcm_lock_cleanup_on_node_dead(int32 dead_node)
 		bool changed = false;
 		bool broadcast_needed = false;
 		bool master_holder_was_dead;
+		bool pending_retired = false;
 		PcmState before_state;
 		PcmState after_state;
 		uint32 s_bitmap;
 		uint32 pi_bitmap;
-
-		/* Cheap unlocked filter; rechecked under entry_lock below. */
-		if (entry->x_holder_node != dead_node
-			&& (pg_atomic_read_u32(&entry->s_holders_bitmap) & dead_bit) == 0
-			&& (pg_atomic_read_u32(&entry->pi_holders_bitmap) & dead_bit) == 0
-			&& (!pcm_master_holder_is_valid(entry)
-				|| (int32)entry->master_holder.node_id != dead_node))
-			continue;
 
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
 		/* A dead canonical reservation writer may have durable grants that
@@ -6150,6 +6193,20 @@ cluster_pcm_lock_cleanup_on_node_dead(int32 dead_node)
 			&& entry->x_holder_node == dead_node) {
 			LWLockRelease(&entry->entry_lock.lock);
 			continue;
+		}
+		{
+			ClusterPcmResourceXMasterState *state = pcm_resource_x_master_state_for_entry(entry);
+			if (!pcm_read_grant_state_valid(state)) {
+				LWLockRelease(&entry->entry_lock.lock);
+				continue;
+			}
+			if ((state->pending_s_bitmap & dead_bit) != 0) {
+				/* Same membership-removal owner as ordinary S reclamation.
+				 * A live holder's possible requester copy remains protected. */
+				memset(&state->pending_s[dead_node], 0, sizeof(state->pending_s[dead_node]));
+				state->pending_s_bitmap &= ~dead_bit;
+				changed = broadcast_needed = pending_retired = true;
+			}
 		}
 		before_state = (PcmState)pg_atomic_read_u32(&entry->master_state);
 		master_holder_was_dead
@@ -6197,6 +6254,11 @@ cluster_pcm_lock_cleanup_on_node_dead(int32 dead_node)
 		if (changed && after_state != before_state)
 			broadcast_needed = true;
 
+		if (pending_retired) {
+			(void)pcm_resource_x_start_head_locked(entry,
+				pcm_resource_x_master_state_for_entry(entry), NULL);
+			(void)pcm_resource_x_intent_mark_dirty();
+		}
 		LWLockRelease(&entry->entry_lock.lock);
 
 		if (broadcast_needed)
@@ -7398,11 +7460,53 @@ cluster_pcm_transition_apply(struct GrdEntry *entry, PcmLockTransition trans, in
  * This is the final admission point for every local/remote S publication:
  * existing S residency may re-enter without changing authority, but a new bit
  * cannot cross any live writer barrier (including the same-node case). */
+/* Unknown residue cannot become an empty protocol, disk permission, or a
+ * reclaimable registry slot. Empty rows are canonical zero bytes. */
+static bool
+pcm_read_grant_state_valid(const ClusterPcmResourceXMasterState *state)
+{
+	static const ClusterPcmPendingS empty;
+	if (state == NULL || state->pending_s_reserved != 0)
+		return false;
+	for (int n = 0; n < RESOURCE_X_PROTOCOL_NODE_LIMIT; n++) {
+		const ClusterPcmPendingS *claim = &state->pending_s[n];
+		if ((state->pending_s_bitmap & (UINT32_C(1) << n)) == 0) {
+			if (memcmp(claim, &empty, sizeof(empty)) != 0)
+				return false;
+			continue;
+		}
+		if ((claim->phase != 1 && claim->phase != 2) || claim->request_id == 0
+			|| claim->request_id == UINT64_MAX || claim->epoch == 0 || claim->epoch == UINT64_MAX
+			|| claim->backend_id <= 0 || claim->backend_id > MaxBackends
+			|| claim->deadline <= 0 || claim->retry_at < 0
+			|| (claim->phase == 1 && claim->retry_at != 0)
+			|| claim->holder_node < -1 || claim->holder_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+			|| claim->holder_node == n || claim->holder_was_x > 1
+			|| (claim->holder_node == -1 && claim->holder_was_x != 0))
+			return false;
+		for (int i = 0; i < (int)sizeof(claim->reserved); i++)
+			if (claim->reserved[i] != 0)
+				return false;
+	}
+	return true;
+}
+
+static bool
+pcm_read_grant_pending_locked(struct GrdEntry *entry)
+{
+	ClusterPcmResourceXMasterState *state = pcm_resource_x_master_state_for_entry(entry);
+	return !pcm_read_grant_state_valid(state) || state->pending_s_bitmap != 0;
+}
+
 static bool
 pcm_s_admission_allowed_locked(struct GrdEntry *entry, uint32 holder_bit)
 {
+	ClusterPcmResourceXMasterState *state = pcm_resource_x_master_state_for_entry(entry);
 	Assert(entry != NULL);
 	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	/* Only the exact completion API may turn a pending recipient into S. */
+	if (!pcm_read_grant_state_valid(state) || (state->pending_s_bitmap & holder_bit) != 0)
+		return false;
 	return (pg_atomic_read_u32(&entry->s_holders_bitmap) & holder_bit) != 0
 		   || entry->pending_x_requester_node == -1;
 }
@@ -7416,9 +7520,9 @@ pcm_s_admission_allowed_locked(struct GrdEntry *entry, uint32 holder_bit)
  * reply wait.  The bool wrapper preserves existing callers' applied/not-
  * applied contract.
  */
-PcmGcsTransitionApplyResult
-cluster_pcm_lock_apply_gcs_transition_result(BufferTag tag, PcmLockTransition trans,
-											 int holder_node_id)
+static PcmGcsTransitionApplyResult
+pcm_lock_apply_gcs_transition_result(BufferTag tag, PcmLockTransition trans,
+								   int holder_node_id, bool disk_source)
 {
 	PcmEntryRef entry_ref;
 	PcmEntryAcquireResult acquire_result;
@@ -7464,7 +7568,22 @@ cluster_pcm_lock_apply_gcs_transition_result(BufferTag tag, PcmLockTransition tr
 		result = PCM_GCS_TRANSITION_PENDING_X;
 		goto unlock;
 	}
+	if ((trans == PCM_TRANS_N_TO_X || trans == PCM_TRANS_S_TO_X_UPGRADE)
+		&& pcm_read_grant_pending_locked(entry)) {
+		result = PCM_GCS_TRANSITION_PENDING_X;
+		goto unlock;
+	}
 	cur = (PcmState)pg_atomic_read_u32(&entry->master_state);
+	/* This grant covers a first physical read, not an idempotent re-ack of
+	 * bytes the requester already has. Keep the proof and S publication in
+	 * the same original entry-lock interval. Any PI responsibility refuses. */
+	if (disk_source
+		&& (trans != PCM_TRANS_N_TO_S
+			|| pg_atomic_read_u32(&entry->pi_holders_bitmap) != 0
+			|| (cur != PCM_STATE_N
+				&& (cur != PCM_STATE_S
+					|| pg_atomic_read_u32(&entry->s_holders_bitmap) != holder_bit))))
+		goto unlock;
 
 	/*
 	 * GCS shared-read grant: a remote N->S acquire is compatible with an
@@ -7532,6 +7651,19 @@ unlock:
 		ConditionVariableBroadcast(&entry->wait_cv);
 	pcm_entry_ref_release(&entry_ref);
 	return result;
+}
+
+PcmGcsTransitionApplyResult
+cluster_pcm_lock_apply_gcs_transition_result(BufferTag tag, PcmLockTransition trans,
+										   int holder_node_id)
+{
+	return pcm_lock_apply_gcs_transition_result(tag, trans, holder_node_id, false);
+}
+
+PcmGcsTransitionApplyResult
+cluster_pcm_lock_apply_disk_read_grant(BufferTag tag, int32 holder_node_id)
+{
+	return pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_N_TO_S, holder_node_id, true);
 }
 
 bool
@@ -7736,7 +7868,7 @@ cluster_pcm_get_trans_s_to_x_cleanout_count(void)
 
 static bool
 pcm_lock_acquire_local_pinned(BufferTag tag, PcmLockMode mode, PcmAuthoritySnapshot *remote_x_out,
-							  PcmEntryWaitContext *wait_context)
+							  PcmEntryWaitContext *wait_context, ClusterPcmReadSource *source)
 {
 	struct GrdEntry *entry;
 	int holder_node;
@@ -7772,6 +7904,16 @@ pcm_lock_acquire_local_pinned(BufferTag tag, PcmLockMode mode, PcmAuthoritySnaps
 		cur = (PcmState)pg_atomic_read_u32(&entry->master_state);
 
 		if (mode == PCM_LOCK_MODE_S) {
+			if (source != NULL
+				&& (pg_atomic_read_u32(&entry->pi_holders_bitmap) != 0
+					|| (cur != PCM_STATE_N
+						&& (cur != PCM_STATE_S
+							|| pg_atomic_read_u32(&entry->s_holders_bitmap) != holder_bit)))) {
+				/* Return to the BufferDesc-aware source selector. No grant. */
+				pcm_authority_snapshot_locked(entry, remote_x_out);
+				LWLockRelease(&entry->entry_lock.lock);
+				return false;
+			}
 			pending_x_blocks_new_s = !pcm_s_admission_allowed_locked(entry, holder_bit);
 			if (!pending_x_blocks_new_s && cur == PCM_STATE_N) {
 				cluster_pcm_transition_apply(entry, PCM_TRANS_N_TO_S, holder_node);
@@ -7794,8 +7936,10 @@ pcm_lock_acquire_local_pinned(BufferTag tag, PcmLockMode mode, PcmAuthoritySnaps
 		} else /* mode == PCM_LOCK_MODE_X */
 		{
 			uint32 holders;
+			bool pending_s = pcm_read_grant_pending_locked(entry);
 
-			if (cur == PCM_STATE_N) {
+			pending_x_blocks_new_s = pending_s;
+			if (!pending_s && cur == PCM_STATE_N) {
 				cluster_pcm_transition_apply(entry, PCM_TRANS_N_TO_X, holder_node);
 				LWLockRelease(&entry->entry_lock.lock);
 				return true;
@@ -7816,7 +7960,7 @@ pcm_lock_acquire_local_pinned(BufferTag tag, PcmLockMode mode, PcmAuthoritySnaps
 			}
 
 			holders = pg_atomic_read_u32(&entry->s_holders_bitmap);
-			if (cur == PCM_STATE_S && (holders & holder_bit) != 0 && (holders & ~holder_bit) == 0) {
+			if (!pending_s && cur == PCM_STATE_S && (holders & holder_bit) != 0 && (holders & ~holder_bit) == 0) {
 				/*
 				 * spec-2.35 HC111/HC112: an S bit records cache residency,
 				 * not a currently held shared content_lock.  A later local X
@@ -7979,7 +8123,8 @@ pcm_lock_acquire_local_pinned(BufferTag tag, PcmLockMode mode, PcmAuthoritySnaps
 }
 
 static bool
-pcm_lock_acquire_local(BufferTag tag, PcmLockMode mode, PcmAuthoritySnapshot *remote_x_out)
+pcm_lock_acquire_local(BufferTag tag, PcmLockMode mode, PcmAuthoritySnapshot *remote_x_out,
+					   ClusterPcmReadSource *source)
 {
 	PcmEntryWaitContext wait_context;
 	PcmEntryAcquireResult acquire_result;
@@ -8031,7 +8176,7 @@ pcm_lock_acquire_local(BufferTag tag, PcmLockMode mode, PcmAuthoritySnapshot *re
 
 	PG_TRY();
 	{
-		acquired = pcm_lock_acquire_local_pinned(tag, mode, remote_x_out, &wait_context);
+		acquired = pcm_lock_acquire_local_pinned(tag, mode, remote_x_out, &wait_context, source);
 	}
 	PG_FINALLY();
 	{
@@ -8050,7 +8195,7 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 
 	/* A tag-only caller has no BufferDesc and therefore retains the
 	 * historical fail-closed behavior for a remote-X conflict. */
-	(void)pcm_lock_acquire_local(tag, mode, NULL);
+	(void)pcm_lock_acquire_local(tag, mode, NULL, NULL);
 }
 
 
@@ -8098,8 +8243,9 @@ cluster_pcm_clean_page_xfer_consume(void)
  *	install received block bytes into this buffer's content on GRANTED
  *	(HC84 PageSetLSN + memcpy under content_lock EXCLUSIVE).
  */
-bool
-cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *out_retry_denied)
+static bool
+pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *out_retry_denied,
+						ClusterPcmReadSource *source)
 {
 	BufferTag tag;
 	int master_node;
@@ -8213,6 +8359,10 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *out_ret
 	}
 
 	master_node = cluster_gcs_lookup_master(tag);
+	if (source != NULL)
+		return cluster_gcs_send_block_request_source_and_wait(buf, master_node,
+			out_retry_denied, source);
+
 
 	if (master_node != cluster_node_id) {
 		PcmLockTransition trans = (mode == PCM_LOCK_MODE_S) ? PCM_TRANS_N_TO_S : PCM_TRANS_N_TO_X;
@@ -8227,6 +8377,9 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *out_ret
 		 * spec-5.2a D2/D3: carry clean-page eligibility (X only) so the remote
 		 * master takes the dedicated clean-page X-transfer path rather than the
 		 * conservative HG7 fail-closed DENY. */
+		if (source != NULL)
+			return cluster_gcs_send_block_request_source_and_wait(buf, master_node,
+				out_retry_denied, source);
 		return cluster_gcs_send_block_request_and_wait(
 			buf, trans, master_node, clean_eligible && mode == PCM_LOCK_MODE_X, out_retry_denied);
 	}
@@ -8272,9 +8425,18 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *out_ret
 			return false;
 		}
 
-		if (remote_x_exact)
-			return cluster_gcs_local_master_read_image_and_wait(buf, &authority, s_barrier_active,
-																out_retry_denied);
+		if (remote_x_exact || (source != NULL && have_authority
+			&& authority.state == PCM_STATE_S
+			&& (authority.s_holders_bitmap & ~pcm_holder_bit(cluster_node_id)) != 0)) {
+			bool granted = source != NULL
+				? cluster_gcs_local_master_read_source_and_wait(buf, &authority,
+					s_barrier_active, out_retry_denied, source)
+				: cluster_gcs_local_master_read_image_and_wait(buf, &authority,
+					s_barrier_active, out_retry_denied);
+			if (source != NULL && !*out_retry_denied)
+				source->kind = CLUSTER_PCM_SOURCE_IMAGE_INSTALLED;
+			return granted;
+		}
 	} else /* mode == PCM_LOCK_MODE_X */
 	{
 		/*
@@ -8322,7 +8484,7 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *out_ret
 				 * replaces the sampled S authority with remote X before this entry
 				 * lock, preserve that exact authority and use the normal X-transfer
 				 * path instead of the tag-only legacy terminal. */
-				if (!pcm_lock_acquire_local(tag, PCM_LOCK_MODE_S, &raced_remote_x))
+				if (!pcm_lock_acquire_local(tag, PCM_LOCK_MODE_S, &raced_remote_x, NULL))
 					return cluster_gcs_local_master_x_transfer_and_wait(
 						buf, &raced_remote_x, clean_eligible, out_retry_denied);
 				/* Amendment v1.2 (R5): the upgrade waits on remote ACKs with
@@ -8376,7 +8538,13 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *out_ret
 	{
 		PcmAuthoritySnapshot raced_remote_x;
 
-		if (!pcm_lock_acquire_local(tag, mode, &raced_remote_x)) {
+		if (!pcm_lock_acquire_local(tag, mode, &raced_remote_x, source)) {
+			if (source != NULL) {
+				/* An exact source appeared between selection and grant. Retire
+				 * this reservation off-lock before selecting it afresh. */
+				*out_retry_denied = true;
+				return false;
+			}
 			if (mode == PCM_LOCK_MODE_S)
 				return cluster_gcs_local_master_read_image_and_wait(
 					buf, &raced_remote_x, cluster_gcs_block_resource_x_local_s_barrier_active(tag),
@@ -8397,11 +8565,75 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *out_ret
 	 * acquire: a mode=X acquire may have just collected invalidate ACKs,
 	 * which advance the watermark with the dropped copies' page SCNs.
 	 */
-	cluster_gcs_block_fallback_verify_refresh(buf, tag,
-											  cluster_pcm_lock_pi_watermark_scn_query(tag));
+	if (source != NULL) {
+		source->kind = CLUSTER_PCM_SOURCE_DISK_GRANT;
+		source->watermark = cluster_pcm_lock_pi_watermark_scn_query(tag);
+	} else
+		cluster_gcs_block_fallback_verify_refresh(buf, tag,
+			cluster_pcm_lock_pi_watermark_scn_query(tag));
 	return true;
 }
 
+bool
+cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *retry_denied)
+{
+	return pcm_lock_acquire_buffer(buf, mode, retry_denied, NULL);
+}
+
+ClusterPcmReadSourceKind
+cluster_pcm_lock_acquire_buffer_source(BufferDesc *buf, ClusterPcmReadSource *source)
+{
+	bool retry_denied = false;
+
+	ClusterPcmOwnSnapshot live;
+	uint32 state;
+	bool exact;
+
+	if (buf == NULL || source == NULL || ClusterPcmOwnArray == NULL)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			errmsg("first-read source requires an exact buffer reservation")));
+	state = LockBufHdr(buf);
+	live.tag = buf->tag;
+	live.generation = cluster_pcm_own_gen_get(buf->buf_id);
+	live.reservation_token = cluster_pcm_own_reservation_token_get(buf->buf_id);
+	live.pcm_state = buf->pcm_state;
+	live.flags = cluster_pcm_own_flags_get(buf->buf_id);
+	live.writer_activation_token = cluster_pcm_own_writer_activation_token_get(buf->buf_id);
+	live.resource_x_activation_generation = cluster_pcm_own_resource_x_activation_generation_get(buf->buf_id);
+	exact = BufferTagsEqual(&source->tag, &live.tag)
+		&& live.generation == source->base_generation
+		&& live.reservation_token == source->reservation_token
+		&& live.reservation_token != 0 && live.reservation_token != UINT64_MAX
+		&& live.generation != UINT64_MAX && live.pcm_state == PCM_STATE_N
+		&& live.flags == PCM_OWN_FLAG_GRANT_PENDING
+		&& live.writer_activation_token == 0 && live.resource_x_activation_generation == 0
+		&& cluster_pcm_own_delivery_attempt_get(buf->buf_id) == 0
+		&& (state & (BM_TAG_VALID | BM_VALID | BM_IO_IN_PROGRESS | BM_DIRTY))
+			== (BM_TAG_VALID | BM_IO_IN_PROGRESS);
+	UnlockBufHdr(buf, state);
+	if (!exact)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+			errmsg("first-read source lost its original buffer reservation")));
+	source->kind = CLUSTER_PCM_SOURCE_FAIL;
+	source->durable = false;
+	source->quiescent = false;
+	source->master_node = cluster_gcs_lookup_master(source->tag);
+	PG_TRY();
+	{
+		source->durable = pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_S,
+			&retry_denied, source);
+		if (retry_denied)
+			source->kind = CLUSTER_PCM_SOURCE_RETRY;
+	}
+	PG_FINALLY();
+	{
+		/* The prefill sender never arms a direct target. All private reply
+		 * slots have been released under their existing native slot lock. */
+		source->quiescent = cluster_gcs_block_read_source_quiesce(buf, source);
+	}
+	PG_END_TRY();
+	return source->kind;
+}
 
 void
 cluster_pcm_lock_release(BufferTag tag)
@@ -9327,6 +9559,9 @@ pcm_normal_stop_scan(bool require_pi_retired, bool retire_pi, BufferTag *tag_out
 			 * a declaration here merely to manufacture an empty directory. */
 			current = CLUSTER_NORMAL_STOP_PENDING;
 			current_reason = "PCM_REFERENCE";
+		} else if (current == CLUSTER_NORMAL_STOP_READY && pcm_read_grant_pending_locked(entry)) {
+			current = CLUSTER_NORMAL_STOP_PENDING;
+			current_reason = "PCM_PENDING_S_FIRST_FILL";
 		} else if (current == CLUSTER_NORMAL_STOP_READY
 				   && (entry->pending_x_requester_node != -1 || entry->convert_queue != NULL)) {
 			current = CLUSTER_NORMAL_STOP_PENDING;
@@ -9517,6 +9752,10 @@ pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out, b
 	}
 
 	if (state != NULL) {
+		if (!pcm_read_grant_state_valid(state))
+			PCM_PROTOCOL_INVALID(145, -1);
+		if (state->pending_s_bitmap != 0)
+			active = retained = true;
 		drained_pair_history
 			= pcm_resource_x_holder_pair_drained_history_locked(entry, state, NULL, NULL);
 		if ((!drained_pair_history
@@ -10978,7 +11217,8 @@ pcm_resource_x_start_head_locked(struct GrdEntry *entry, ClusterPcmResourceXMast
 		return NULL;
 	/* Pausing advancement does not prove an empty queue: RELEASE_X must
 	 * preserve the current carrier for this exact successor. */
-	if (cluster_grd_pi_rebuild_blocked_v1(entry->tag))
+	if (!pcm_read_grant_state_valid(state) || state->pending_s_bitmap != 0
+		|| cluster_grd_pi_rebuild_blocked_v1(entry->tag))
 		goto done;
 	if (request->phase == RESOURCE_X_MASTER_QUEUED) {
 		request->head_transition_generation = pg_atomic_read_u64(&entry->transition_count_local);
@@ -11008,6 +11248,269 @@ done:
 	if (requester_node_out != NULL)
 		*requester_node_out = requester_node;
 	return request;
+}
+
+/* Caller holds the exact registry/entry binding. No transport under this lock. */
+static ClusterPcmPendingS *
+pcm_read_grant_lookup_locked(struct GrdEntry *entry, const ClusterPcmReadGrantKey *key)
+{
+	ClusterPcmResourceXMasterState *state = pcm_resource_x_master_state_for_entry(entry);
+	ClusterPcmPendingS *claim;
+	if (!pcm_read_grant_state_valid(state) || key == NULL || key->requester_node < 0 || key->requester_node >= 32
+		|| !BufferTagsEqual(&key->tag, &entry->tag)
+		|| (state->pending_s_bitmap & (UINT32_C(1) << key->requester_node)) == 0)
+		return NULL;
+	claim = &state->pending_s[key->requester_node];
+	return claim->phase != 0 && claim->request_id == key->request_id
+		&& claim->epoch == key->epoch && claim->backend_id == key->backend_id ? claim : NULL;
+}
+
+static void
+pcm_read_grant_snapshot(struct GrdEntry *entry, int node, const ClusterPcmPendingS *claim,
+	ClusterPcmReadGrant *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->key.tag = entry->tag;
+	out->key.request_id = claim->request_id;
+	out->key.epoch = claim->epoch;
+	out->key.requester_node = node;
+	out->key.backend_id = claim->backend_id;
+	out->binding_generation = entry->binding_generation;
+	out->holder_node = claim->holder_node;
+	out->holder_was_x = claim->holder_was_x != 0;
+	out->revoking = claim->phase == 2;
+}
+
+PcmGcsTransitionApplyResult
+cluster_pcm_lock_read_grant_begin(BufferTag tag, int32 requester, int32 backend,
+	uint64 request_id, uint64 epoch, TimestampTz deadline, bool create, ClusterPcmReadGrant *out)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	ClusterPcmResourceXMasterState *state;
+	ClusterPcmPendingS *claim;
+	struct GrdEntry *entry;
+	PcmGcsTransitionApplyResult result = PCM_GCS_TRANSITION_PENDING_X;
+	PcmState mode;
+	uint32 bit, holders;
+	int holder = -1;
+	if (out == NULL || requester < 0 || requester >= 32 || (backend <= 0 || backend > MaxBackends)
+		|| request_id == 0 || request_id == UINT64_MAX || epoch == 0 || epoch == UINT64_MAX
+		|| deadline <= 0 || !pcm_entry_ref_acquire(&tag, true, &ref, &acquired))
+		return PCM_GCS_TRANSITION_INCOMPATIBLE;
+	entry = ref.entry;
+	bit = UINT32_C(1) << requester;
+	pcm_entry_lock_exclusive(entry);
+	state = pcm_resource_x_master_state_for_entry(entry);
+	if (!pcm_read_grant_state_valid(state))
+		goto done;
+	claim = &state->pending_s[requester];
+	if ((state->pending_s_bitmap & bit) != 0) {
+		/* A replay cannot renew a deadline or pass a later writer. */
+		if (claim->phase == 1 && claim->request_id == request_id && claim->epoch == epoch
+			&& claim->backend_id == backend) {
+			pcm_read_grant_snapshot(entry, requester, claim, out);
+			result = PCM_GCS_TRANSITION_APPLIED;
+		}
+		goto done;
+	}
+	if (!create || (cluster_shared_config
+		&& pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase) != RESOURCE_X_GATE_OPEN)
+		|| entry->pending_x_requester_node != -1 || pcm_resource_x_s_barrier_active_locked(entry))
+		goto done;
+	mode = (PcmState)pg_atomic_read_u32(&entry->master_state);
+	holders = pg_atomic_read_u32(&entry->s_holders_bitmap);
+	if ((mode == PCM_STATE_N || (mode == PCM_STATE_S && holders == bit))
+		&& pg_atomic_read_u32(&entry->pi_holders_bitmap) == 0) {
+		/* Disk source proof and S liability are one entry-lock publication. */
+		if (mode == PCM_STATE_N)
+			cluster_pcm_transition_apply(entry, PCM_TRANS_N_TO_S, requester);
+	} else if (mode == PCM_STATE_X && entry->x_holder_node >= 0
+		&& entry->x_holder_node != requester)
+		holder = entry->x_holder_node;
+	else if (mode == PCM_STATE_S && (holders & ~bit) != 0) {
+		uint32 sources = holders & ~bit;
+		holder = pcm_lowest_set_bit_node(sources);
+		if ((sources & (UINT32_C(1) << cluster_node_id)) != 0)
+			holder = cluster_node_id;
+	} else
+		goto done; /* PI without a proven current source is never disk permission. */
+	memset(claim, 0, sizeof(*claim));
+	claim->request_id = request_id;
+	claim->epoch = epoch;
+	claim->backend_id = backend;
+	claim->holder_node = holder;
+	claim->holder_was_x = mode == PCM_STATE_X;
+	claim->deadline = deadline;
+	claim->phase = 1;
+	state->pending_s_bitmap |= bit;
+	pcm_read_grant_snapshot(entry, requester, claim, out);
+	result = PCM_GCS_TRANSITION_APPLIED;
+done:
+	LWLockRelease(&entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return result;
+}
+
+/* A holder notification may arrive after the recipient's DONE. It never
+ * addresses a later X at the same node: the original pending key must exist. */
+bool
+cluster_pcm_lock_read_grant_holder_done(const ClusterPcmReadGrantKey *key, int32 holder)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	struct GrdEntry *entry;
+	ClusterPcmPendingS *claim;
+	bool applied = false;
+	if (key == NULL || !pcm_entry_ref_acquire(&key->tag, false, &ref, &acquired))
+		return false;
+	entry = ref.entry;
+	pcm_entry_lock_exclusive(entry);
+	claim = pcm_read_grant_lookup_locked(entry, key);
+	if (claim != NULL && claim->holder_was_x && claim->holder_node == holder) {
+		PcmState mode = (PcmState)pg_atomic_read_u32(&entry->master_state);
+		if (mode == PCM_STATE_X && entry->x_holder_node == holder) {
+			cluster_pcm_transition_apply(entry, PCM_TRANS_X_TO_S_DOWNGRADE, holder);
+			applied = true;
+		} else if (mode == PCM_STATE_S
+			&& (pg_atomic_read_u32(&entry->s_holders_bitmap) & (UINT32_C(1) << holder)) != 0)
+			applied = true;
+	}
+	LWLockRelease(&entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return applied;
+}
+
+bool
+cluster_pcm_lock_read_grant_done(const ClusterPcmReadGrantKey *key, int32 sender, bool installed)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	struct GrdEntry *entry;
+	ClusterPcmResourceXMasterState *state;
+	ClusterPcmPendingS *claim;
+	PcmState mode;
+	bool applied = false;
+	if (key == NULL || !pcm_entry_ref_acquire(&key->tag, false, &ref, &acquired))
+		return false;
+	entry = ref.entry;
+	pcm_entry_lock_exclusive(entry);
+	claim = pcm_read_grant_lookup_locked(entry, key);
+	state = pcm_resource_x_master_state_for_entry(entry);
+	if (claim == NULL || (sender != key->requester_node && (installed || sender != claim->holder_node)))
+		goto done;
+	if (!installed) {
+		/* A NACK may race a successful delivery; only revoke ACK can forget it. */
+		claim->phase = 2;
+		claim->retry_at = 0;
+		applied = true;
+		goto done;
+	}
+	if (claim->phase != 1)
+		goto done;
+	mode = (PcmState)pg_atomic_read_u32(&entry->master_state);
+	if (mode == PCM_STATE_X) {
+		/* The authenticated requester consumed H's durable-S reply. This is
+		 * the asynchronous arrival update; H's earlier notify may overtake it. */
+		if (!claim->holder_was_x || entry->x_holder_node != claim->holder_node)
+			goto done;
+		cluster_pcm_transition_apply(entry, PCM_TRANS_X_TO_S_DOWNGRADE, claim->holder_node);
+	} else if (mode != PCM_STATE_N && mode != PCM_STATE_S)
+		goto done;
+	cluster_pcm_transition_apply(entry, PCM_TRANS_N_TO_S, key->requester_node);
+	if (key->requester_node == cluster_node_id && entry->s_holder_refcount_local == 0)
+		entry->s_holder_refcount_local = 1;
+	memset(claim, 0, sizeof(*claim));
+	state->pending_s_bitmap &= ~(UINT32_C(1) << key->requester_node);
+	(void)pcm_resource_x_start_head_locked(entry, state, NULL);
+	(void)pcm_resource_x_intent_mark_dirty();
+	applied = true;
+done:
+	LWLockRelease(&entry->entry_lock.lock);
+	if (applied)
+		ConditionVariableBroadcast(&entry->wait_cv);
+	pcm_entry_ref_release(&ref);
+	return applied;
+}
+
+bool
+cluster_pcm_lock_read_grant_revoke_ack(const ClusterPcmReadGrantKey *key)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	struct GrdEntry *entry;
+	ClusterPcmResourceXMasterState *state;
+	ClusterPcmPendingS *claim;
+	bool applied = false;
+	if (key == NULL || !pcm_entry_ref_acquire(&key->tag, false, &ref, &acquired))
+		return false;
+	entry = ref.entry;
+	pcm_entry_lock_exclusive(entry);
+	claim = pcm_read_grant_lookup_locked(entry, key);
+	state = pcm_resource_x_master_state_for_entry(entry);
+	if (claim != NULL && claim->phase == 2
+		&& !((PcmState)pg_atomic_read_u32(&entry->master_state) == PCM_STATE_X
+			&& entry->x_holder_node == key->requester_node)) {
+		if ((pg_atomic_read_u32(&entry->s_holders_bitmap)
+			 & (UINT32_C(1) << key->requester_node)) != 0)
+			cluster_pcm_transition_apply(entry, PCM_TRANS_S_TO_N_INVALIDATE, key->requester_node);
+		memset(claim, 0, sizeof(*claim));
+		state->pending_s_bitmap &= ~(UINT32_C(1) << key->requester_node);
+		(void)pcm_resource_x_start_head_locked(entry, state, NULL);
+		(void)pcm_resource_x_intent_mark_dirty();
+		applied = true;
+	}
+	LWLockRelease(&entry->entry_lock.lock);
+	if (applied)
+		ConditionVariableBroadcast(&entry->wait_cv);
+	pcm_entry_ref_release(&ref);
+	return applied;
+}
+
+/* One bounded LMS pass. Snapshot work under locks, perform wire IO afterwards.
+ * Old formation is revocation debt, not permission to erase a live recipient. */
+bool
+cluster_pcm_lock_read_grant_work(uint32 *cursor, int worker, int workers,
+	TimestampTz now, uint64 current_epoch, ClusterPcmReadGrant *out)
+{
+	bool found = false;
+	if (cursor == NULL || out == NULL || pcm_grd_effective <= 0
+		|| cluster_pcm_resource_x_slots == NULL || cluster_pcm_htab == NULL
+		|| worker < 0 || workers <= worker || now < 0)
+		return false;
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	for (unsigned probe = 0; probe < 64 && !found; probe++) {
+		uint32 index = *cursor % (uint32)pcm_grd_effective;
+		ClusterPcmResourceXSlot *slot = &cluster_pcm_resource_x_slots[index];
+		struct GrdEntry *entry;
+		ClusterPcmResourceXMasterState *state;
+		*cursor = (index + 1) % (uint32)pcm_grd_effective;
+		if (slot->state != PCM_REGISTRY_LIVE
+			|| cluster_lms_shard_for_tag(&slot->tag, workers) != worker)
+			continue;
+		entry = hash_search(cluster_pcm_htab, &slot->tag, HASH_FIND, NULL);
+		if (entry == NULL || !LWLockConditionalAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE))
+			continue;
+		state = pcm_resource_x_master_state_for_entry(entry);
+		if (pcm_read_grant_state_valid(state))
+			for (int n = 0; n < 32; n++) {
+				ClusterPcmPendingS *claim = &state->pending_s[n];
+				if ((state->pending_s_bitmap & (UINT32_C(1) << n)) == 0)
+					continue;
+				if (claim->epoch != current_epoch || now >= claim->deadline
+					|| cluster_normal_stop_requested())
+					claim->phase = 2;
+				if (claim->phase != 2 || now < claim->retry_at)
+					continue;
+				claim->retry_at = now + 10000; /* bounded asynchronous revoke retry */
+				pcm_read_grant_snapshot(entry, n, claim, out);
+				found = true;
+				break;
+			}
+		LWLockRelease(&entry->entry_lock.lock);
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+	return found;
 }
 
 static void
@@ -19391,6 +19894,7 @@ pcm_resource_x_bootstrap_dispatch_state_locked(struct GrdEntry *entry,
 	Assert(requester_node >= 0 && requester_node < RESOURCE_X_PROTOCOL_NODE_LIMIT);
 	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED)
 		   || LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	occupied = !pcm_read_grant_state_valid(state) || state->pending_s_bitmap != 0;
 	requester_bit = UINT32_C(1) << (uint32)requester_node;
 	if (!pcm_resource_x_source_settlement_debt_decode_locked(entry, state, &source_settlement))
 		return PCM_RESOURCE_X_BOOTSTRAP_DISPATCH_CORRUPT;
@@ -20233,7 +20737,7 @@ pcm_resource_x_assert_locked(struct GrdEntry *entry, const ResourceXDecodedFrame
 
 	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
 	state = pcm_resource_x_master_state_for_entry(entry);
-	if (state == NULL || cluster_grd_pi_rebuild_blocked_v1(entry->tag)
+	if (!pcm_read_grant_state_valid(state) || cluster_grd_pi_rebuild_blocked_v1(entry->tag)
 		|| state->authority_generation == 0 || state->next_enqueue_order == 0) {
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		goto unlock;
@@ -20341,6 +20845,8 @@ pcm_resource_x_assert_locked(struct GrdEntry *entry, const ResourceXDecodedFrame
 		if (head_node != requester_node)
 			request->phase = RESOURCE_X_MASTER_QUEUED;
 		else {
+			if (pcm_read_grant_pending_locked(entry))
+				goto assertion_head_done;
 			request->head_transition_generation
 				= pg_atomic_read_u64(&entry->transition_count_local);
 			if (request->head_transition_generation == UINT64_MAX) {

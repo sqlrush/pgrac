@@ -102,6 +102,8 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_prepared_s_so
 #undef printf
 
 #include "unit_test.h"
+
+int MaxBackends = 1024;
 #include "cluster/cluster_pi_rebuild.h"
 #include "test_cluster_pcm_source_owner_layout.inc"
 #include "test_cluster_pcm_stop_fields.inc"
@@ -429,6 +431,12 @@ cluster_page_data_pi_ack_read_v1(const ClusterPiPhysicalAckV1 *ack,
 			*out_node = i;
 			return true;
 		}
+	return false;
+}
+
+bool
+cluster_normal_stop_requested(void)
+{
 	return false;
 }
 
@@ -1311,6 +1319,23 @@ cluster_gcs_send_block_request_and_wait(struct BufferDesc *buf pg_attribute_unus
 										int master_node pg_attribute_unused(),
 										bool clean_eligible pg_attribute_unused(),
 										bool *out_retry_denied pg_attribute_unused())
+{
+	abort();
+}
+
+/* Ordinary lock fixtures do not execute the first-fill transport owner. */
+bool
+cluster_gcs_send_block_request_source_and_wait(BufferDesc *buf pg_attribute_unused(),
+	int master pg_attribute_unused(), bool *retry pg_attribute_unused(),
+	ClusterPcmReadSource *source pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_gcs_local_master_read_source_and_wait(BufferDesc *buf pg_attribute_unused(),
+	const PcmAuthoritySnapshot *expected pg_attribute_unused(), bool one pg_attribute_unused(),
+	bool *retry pg_attribute_unused(), ClusterPcmReadSource *source pg_attribute_unused())
 {
 	abort();
 }

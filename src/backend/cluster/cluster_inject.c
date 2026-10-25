@@ -642,6 +642,7 @@ static ClusterInjectPoint cluster_injection_registry[] = {
 	 * SLEEP:0 supplies a success-path observation without changing behavior.
 	 */
 	{ .name = "cluster-pcm-x-retain-flush-error" },
+	{ .name = "cluster-pcm-write-before-data" },
 	/*
 	 * cluster-pcm-grant-finalize-window (W3):
 	 *   Fires in LockBuffer AFTER a real X acquire installed the grant and

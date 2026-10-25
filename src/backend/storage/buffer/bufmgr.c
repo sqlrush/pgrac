@@ -80,6 +80,8 @@
 #include "cluster/cluster_sf_dep.h"		/* spec-6.2 Smart Fusion DBWR brake */
 #include "cluster/cluster_xnode_profile.h"	/* spec-5.59 D3/D4 — read probe + relkind hint */
 #include "cluster/cluster_itl.h"	/* spec-6.12a — quiescent check for X->S downgrade */
+#include "cluster/cluster_block_io_trace.h"
+#include "storage/checksum.h"
 #include "cluster/cluster_inject.h" /* GCS-race round-4c P1 — yield-notify-drop point */
 #include "cluster/cluster_pcm_own.h" /* ownership-generation wave — per-buffer gen + flags */
 #include "cluster/cluster_pcm_x_bufmgr.h" /* spec-2.36a C1 opaque reservation API */
@@ -3252,54 +3254,76 @@ cluster_bufmgr_pcm_retry_denied_rearm(BufferDesc *buf, PcmLockMode pcm_mode,
 	return CLUSTER_BUFMGR_PCM_RETRY_REARMED;
 }
 
-/* An error before local S publication must not strand an ordinary N
- * reservation.  This catch runs BEFORE AbortBufferIO/ResourceOwner cleanup:
- * a cleared IO bit after generic cleanup would not prove DMA quiescence.
- * Never release a remote grant speculatively, or touch a successor/retained
- * authority.  The lower GCS error owner has already retired the TCP reply
- * slot, so a late generic reply cannot install after this exact abort. */
+/* First-fill cancellation has not called AbortBufferIO yet. A source receipt
+ * proves that the synchronous caller returned and no reply slot/direct target
+ * can still install. Keep the IO bit until this exact reservation is retired. */
+static ClusterPcmOwnResult
+cluster_bufmgr_pcm_abort_shared_owned(BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+									 uint64 token, const ClusterPcmReadSource *source)
+{
+	ClusterPcmOwnResult result = CLUSTER_PCM_OWN_STALE;
+	uint32 state = LockBufHdr(buf);
+	bool first_fill = source != NULL
+		&& cluster_pcm_read_source_bound(source, &base->tag, base->generation, token)
+		&& (state & (BM_TAG_VALID | BM_VALID | BM_IO_IN_PROGRESS | BM_DIRTY))
+			== (BM_TAG_VALID | BM_IO_IN_PROGRESS);
+
+	if (ClusterPcmOwnArray != NULL && base->pcm_state == (uint8)PCM_STATE_N
+		&& base->flags == 0 && base->reservation_token != UINT64_MAX
+		&& token == base->reservation_token + 1
+		&& BufferTagsEqual(&buf->tag, &base->tag)
+		&& (source != NULL ? first_fill
+			: (state & (BM_TAG_VALID | BM_IO_IN_PROGRESS)) == BM_TAG_VALID)
+		&& buf->pcm_state == (uint8)PCM_STATE_N
+		&& (buf->buffer_type != (uint8)BUF_TYPE_PI || first_fill)
+		&& cluster_pcm_own_gen_get(buf->buf_id) == base->generation
+		&& cluster_pcm_own_reservation_token_get(buf->buf_id) == token
+		&& cluster_pcm_own_writer_activation_token_get(buf->buf_id) == 0
+		&& cluster_pcm_own_resource_x_activation_generation_get(buf->buf_id) == 0
+		&& cluster_pcm_own_delivery_attempt_get(buf->buf_id) == 0)
+	{
+		if (cluster_pcm_own_flags_get(buf->buf_id) == PCM_OWN_FLAG_GRANT_PENDING)
+			result = cluster_pcm_own_reservation_abort_exact(buf->buf_id,
+				base->generation, token, PCM_OWN_FLAG_GRANT_PENDING);
+		else if (first_fill && cluster_pcm_own_flags_get(buf->buf_id) == 0)
+			result = CLUSTER_PCM_OWN_OK; /* This same exact catch already retired it. */
+	}
+	UnlockBufHdr(buf, state);
+	return result;
+}
+
 static bool
 cluster_bufmgr_pcm_acquire_shared_owned(BufferDesc *buf,
 									   const ClusterPcmOwnSnapshot *base,
-									   uint64 reservation_token,
-									   bool *retry_denied)
+									   uint64 reservation_token, bool *retry_denied,
+									   ClusterPcmReadSource *source)
 {
 	volatile bool acquired = false;
 
 	PG_TRY();
 	{
 		cluster_bufmgr_trace_cleanup(buf, "shared_acquire_enter", reservation_token);
-		acquired = cluster_pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_S, retry_denied);
+		if (source != NULL) {
+			ClusterPcmReadSourceKind kind = cluster_pcm_lock_acquire_buffer_source(buf, source);
+			*retry_denied = kind == CLUSTER_PCM_SOURCE_RETRY;
+			acquired = source->durable;
+		} else
+			acquired = cluster_pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_S, retry_denied);
 	}
 	PG_CATCH();
 	{
-		ClusterPcmOwnResult result = CLUSTER_PCM_OWN_STALE;
-		uint32 state;
-
-		state = LockBufHdr(buf);
-		if (ClusterPcmOwnArray != NULL && base->pcm_state == (uint8) PCM_STATE_N
-			&& base->flags == 0 && base->reservation_token != UINT64_MAX
-			&& reservation_token == base->reservation_token + 1
-			&& BufferTagsEqual(&buf->tag, &base->tag)
-			&& (state & (BM_TAG_VALID | BM_IO_IN_PROGRESS)) == BM_TAG_VALID
-			&& buf->pcm_state == (uint8) PCM_STATE_N
-			&& buf->buffer_type != (uint8) BUF_TYPE_PI
-			&& cluster_pcm_own_gen_get(buf->buf_id) == base->generation
-			&& cluster_pcm_own_reservation_token_get(buf->buf_id) == reservation_token
-			&& cluster_pcm_own_flags_get(buf->buf_id) == PCM_OWN_FLAG_GRANT_PENDING
-			&& cluster_pcm_own_writer_activation_token_get(buf->buf_id) == 0
-			&& cluster_pcm_own_resource_x_activation_generation_get(buf->buf_id) == 0
-			&& cluster_pcm_own_delivery_attempt_get(buf->buf_id) == 0)
-			result = cluster_pcm_own_reservation_abort_exact(
-				buf->buf_id, base->generation, reservation_token, PCM_OWN_FLAG_GRANT_PENDING);
-		UnlockBufHdr(buf, state);
-		cluster_bufmgr_trace_cleanup(buf, "shared_acquire_catch", (uint64) result);
+		/* The first-fill IO owner also owns master rollback and AbortBufferIO.
+		 * Do not retire its evidence in this inner catch. */
+		ClusterPcmOwnResult result = source != NULL && source->durable
+			? CLUSTER_PCM_OWN_STALE
+			: cluster_bufmgr_pcm_abort_shared_owned(buf, base, reservation_token, source);
+		cluster_bufmgr_trace_cleanup(buf, "shared_acquire_catch", (uint64)result);
 		if (result != CLUSTER_PCM_OWN_OK)
 			elog(LOG,
 				 "cluster shared acquisition error cleanup not proven: buffer=%d "
 				 "generation=%llu token=%llu result=%d; exact reservation left unchanged",
-				 buf->buf_id, (unsigned long long) base->generation,
-				 (unsigned long long) reservation_token, (int) result);
+				 buf->buf_id, (unsigned long long)base->generation,
+				 (unsigned long long)reservation_token, (int)result);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -5841,6 +5865,179 @@ ExtendBufferedRelTo(BufferManagerRelation bmr,
 	return buffer;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Automatic first-fill receipt; no shared state or new protocol lifecycle. */
+typedef struct ClusterBufmgrReadSource
+{
+	BufferDesc *buf;
+	ClusterPcmOwnSnapshot base;
+	ClusterPcmReadSource source;
+	uint64 token;
+	bool pending;
+	bool content_locked;
+} ClusterBufmgrReadSource;
+
+static void
+cluster_bufmgr_pcm_read_source_begin(BufferDesc *buf, ClusterBufmgrReadSource *read)
+{
+	for (;;)
+	{
+		ClusterPcmOwnResult result;
+		bool covered = false;
+		bool retry = false;
+
+		result = cluster_bufmgr_pcm_begin_grant_reservation_wait(buf, PCM_LOCK_MODE_S,
+			&read->base, &read->token, &covered, NULL);
+		if (result != CLUSTER_PCM_OWN_OK || covered)
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+				errmsg("first buffer fill could not reserve its exact source")));
+		read->pending = true;
+		memset(&read->source, 0, sizeof(read->source));
+		read->source.tag = read->base.tag;
+		read->source.base_generation = read->base.generation;
+		read->source.reservation_token = read->token;
+		cluster_block_io_trace_source(&read->source, "REQUEST");
+		(void)cluster_bufmgr_pcm_acquire_shared_owned(buf, &read->base, read->token,
+			&retry, &read->source);
+		cluster_block_io_trace_source(&read->source, "DECISION");
+		if (!retry)
+			break;
+		result = cluster_bufmgr_pcm_abort_shared_owned(buf, &read->base,
+			read->token, &read->source);
+		if (result != CLUSTER_PCM_OWN_OK)
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+				errmsg("first buffer fill retry could not retire its exact source")));
+		cluster_gcs_block_read_source_complete(buf, &read->source, false);
+		read->pending = false;
+		cluster_pcm_lock_check_shutdown_wait();
+		pgstat_report_wait_start(WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+		pg_usleep(1000L);
+		pgstat_report_wait_end();
+	}
+	if (!read->source.durable
+		|| !cluster_pcm_read_source_bound(&read->source, &read->base.tag,
+			read->base.generation, read->token)
+		|| (read->source.kind != CLUSTER_PCM_SOURCE_DISK_GRANT
+			&& read->source.kind != CLUSTER_PCM_SOURCE_IMAGE_INSTALLED))
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+			errmsg("first buffer fill has no proven GCS source")));
+}
+
+static bool
+cluster_bufmgr_pcm_read_source_owned(BufferDesc *buf, ClusterBufmgrReadSource *read)
+{
+	uint32 state = LockBufHdr(buf);
+	bool allowed = cluster_pcm_read_source_bound(&read->source, &buf->tag,
+		cluster_pcm_own_gen_get(buf->buf_id), cluster_pcm_own_reservation_token_get(buf->buf_id))
+		&& (state & (BM_TAG_VALID | BM_VALID | BM_IO_IN_PROGRESS | BM_DIRTY))
+			== (BM_TAG_VALID | BM_IO_IN_PROGRESS)
+		&& buf->pcm_state == PCM_STATE_N
+		&& cluster_pcm_own_flags_get(buf->buf_id) == PCM_OWN_FLAG_GRANT_PENDING
+		&& cluster_pcm_own_writer_activation_token_get(buf->buf_id) == 0
+		&& cluster_pcm_own_resource_x_activation_generation_get(buf->buf_id) == 0
+		&& cluster_pcm_own_delivery_attempt_get(buf->buf_id) == 0;
+	UnlockBufHdr(buf, state);
+	return allowed;
+}
+
+static bool
+cluster_bufmgr_pcm_read_source_disk_allowed(BufferDesc *buf, ClusterBufmgrReadSource *read)
+{
+	return read->source.kind == CLUSTER_PCM_SOURCE_DISK_GRANT && read->source.durable
+		&& cluster_bufmgr_pcm_read_source_owned(buf, read);
+}
+
+static void
+cluster_bufmgr_pcm_read_source_finish(BufferDesc *buf, ClusterBufmgrReadSource *read)
+{
+	ClusterPcmOwnResult result;
+	uint64 generation;
+	uint32 state;
+
+	LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
+	read->content_locked = true;
+	state = LockBufHdr(buf);
+	if (!BufferTagsEqual(&buf->tag, &read->base.tag)
+		|| cluster_pcm_own_gen_get(buf->buf_id) != read->base.generation
+		|| cluster_pcm_own_reservation_token_get(buf->buf_id) != read->token
+		|| cluster_pcm_own_flags_get(buf->buf_id) != PCM_OWN_FLAG_GRANT_PENDING
+		|| buf->pcm_state != PCM_STATE_N
+		|| cluster_pcm_own_writer_activation_token_get(buf->buf_id) != 0
+		|| cluster_pcm_own_resource_x_activation_generation_get(buf->buf_id) != 0
+		|| cluster_pcm_own_delivery_attempt_get(buf->buf_id) != 0
+		|| (state & (BM_TAG_VALID | BM_VALID | BM_IO_IN_PROGRESS | BM_DIRTY))
+			!= (BM_TAG_VALID | BM_IO_IN_PROGRESS))
+	{
+		UnlockBufHdr(buf, state);
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+			errmsg("first buffer fill lost its original descriptor reservation")));
+	}
+	/* IO still withholds visibility. A proven source has replaced the old
+	 * invalid bytes, so a prior PI may become CURRENT, never before proof. */
+	buf->buffer_type = BUF_TYPE_CURRENT;
+	UnlockBufHdr(buf, state);
+	if (read->source.durable)
+		result = cluster_pcm_own_finish_grant_reservation(buf, &read->base, read->token,
+			PCM_STATE_S, false, &generation, NULL);
+	else
+		result = cluster_bufmgr_pcm_abort_shared_owned(buf, &read->base,
+			read->token, &read->source);
+	if (result != CLUSTER_PCM_OWN_OK)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+			errmsg("first buffer fill could not finish its exact source: result=%d", result)));
+	read->pending = false;
+	LWLockRelease(BufferDescriptorGetContentLock(buf));
+	read->content_locked = false;
+}
+
+static void
+cluster_bufmgr_pcm_read_source_cleanup(BufferDesc *buf, ClusterBufmgrReadSource *read)
+{
+	if (read->content_locked)
+	{
+		LWLockRelease(BufferDescriptorGetContentLock(buf));
+		read->content_locked = false;
+	}
+	/* A RETRY may already have retired its reservation before cancellation
+	 * at the local wait. It still owns native IO, so finish that suffix too. */
+	if (!read->pending && read->source.kind != CLUSTER_PCM_SOURCE_RETRY)
+		return;
+	/* FileRead/smgrread are synchronous; at this catch their frames have
+	 * returned. No asynchronous disk target exists. Independently close the
+	 * network target before reservation retirement, never after IO abort. */
+	read->source.quiescent = cluster_gcs_block_read_source_quiesce(buf, &read->source);
+	if (read->source.durable && !read->source.pending_s)
+	{
+		if (!cluster_bufmgr_pcm_read_source_owned(buf, read))
+		{
+			elog(LOG, "first buffer fill master rollback identity not proven: buffer=%d; reservation preserved",
+				buf->buf_id);
+			return;
+		}
+		cluster_pcm_lock_release_buffer_for_eviction(buf, PCM_LOCK_MODE_S);
+		read->source.durable = false;
+	}
+	if (cluster_bufmgr_pcm_abort_shared_owned(buf, &read->base,
+		read->token, &read->source) == CLUSTER_PCM_OWN_OK)
+	{
+		cluster_gcs_block_read_source_complete(buf, &read->source, false);
+		read->pending = false;
+		AbortBufferIO(BufferDescriptorGetBuffer(buf));
+	}
+	else
+		elog(LOG, "first buffer fill quiescence/retirement not proven: buffer=%d; reservation preserved",
+			buf->buf_id);
+}
+
+/* Also runs at native FATAL/backend-exit before generic resource cleanup. */
+static void
+cluster_bufmgr_pcm_read_source_error(int code pg_attribute_unused(), Datum arg)
+{
+	ClusterBufmgrReadSource *read = (ClusterBufmgrReadSource *)DatumGetPointer(arg);
+	cluster_bufmgr_pcm_read_source_cleanup(read->buf, read);
+}
+#endif
+
 /*
  * ReadBuffer_common -- common logic for all ReadBuffer variants
  *
@@ -5859,6 +6056,7 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	bool		isLocalBuf = SmgrIsTemp(smgr);
 #ifdef USE_PGRAC_CLUSTER
 	ClusterPcmDirectInitProof direct_init_proof;
+	ClusterPcmReadSource completed_source = {0};
 #endif
 
 	*hit = false;
@@ -6007,92 +6205,139 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	}
 	else
 	{
-		instr_time	io_start = pgstat_prepare_io_time();
-		bool		verified;
-
-		smgrread(smgr, forkNum, blockNum, bufBlock);
-
-		pgstat_count_io_op_time(io_object, io_context,
-								IOOP_READ, io_start, 1);
-
-		/* check for garbage data */
-		verified = PageIsVerifiedForFork((Page) bufBlock, forkNum, blockNum,
-										  PIV_LOG_WARNING | PIV_REPORT_STAT);
-
 #ifdef USE_PGRAC_CLUSTER
+		volatile ClusterBufmgrReadSource read;
+		bool tracked = !isLocalBuf && cluster_pcm_is_active()
+			&& cluster_bufmgr_should_pcm_track(bufHdr);
 
-		/*
-		 * PGRAC (spec-4.10 D1/D4): try to rebuild a corrupt block from WAL
-		 * before applying the zero/error policy.  PERMANENT shared-buffer
-		 * relations only (relpersistence == RELPERSISTENCE_PERMANENT &&
-		 * !isLocalBuf): temp / unlogged relations have no authoritative WAL
-		 * chain -- a reused relfilenode could even match stale WAL of a
-		 * dropped relation -- so they are never WAL-reconstructed.
-		 * Single-node / own-thread only (cross-node forward Stage 5).  Q3
-		 * (recovery-precedence): with online recovery on, also rebuild when
-		 * ignore_checksum_failure masked a real checksum mismatch
-		 * (PageIsVerifiedExtended returned true); if it cannot rebuild,
-		 * ignore_checksum_failure's "return the page as-is" remains the
-		 * fallback (verified stays true).
-		 */
-		if (!verified)
+		memset((void *)&read, 0, sizeof(read));
+		read.buf = bufHdr;
+		PG_ENSURE_ERROR_CLEANUP(cluster_bufmgr_pcm_read_source_error,
+			PointerGetDatum((ClusterBufmgrReadSource *)&read));
 		{
-			if (relpersistence == RELPERSISTENCE_PERMANENT && !isLocalBuf
-				&& cluster_block_recovery_on_read(smgr, forkNum, blockNum, (char *) bufBlock))
-				verified = true;
-		}
-		else if (relpersistence == RELPERSISTENCE_PERMANENT && !isLocalBuf
-				 && ignore_checksum_failure && cluster_online_block_recovery
-				 && cluster_block_recovery_checksum_mismatch((char *) bufBlock, blockNum))
-		{
-			(void) cluster_block_recovery_on_read(smgr, forkNum, blockNum, (char *) bufBlock);
-		}
+			if (tracked)
+				cluster_bufmgr_pcm_read_source_begin(bufHdr, (ClusterBufmgrReadSource *)&read);
+			if (!tracked || read.source.kind == CLUSTER_PCM_SOURCE_DISK_GRANT)
 #endif
-
-		if (!verified)
-		{
-			if (mode == RBM_ZERO_ON_ERROR || zero_damaged_pages)
 			{
-				ereport(WARNING,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("invalid page in block %u of relation %s; zeroing out page",
-								blockNum,
-								relpath(smgr->smgr_rlocator, forkNum))));
-				MemSet((char *) bufBlock, 0, BLCKSZ);
-			}
+				instr_time io_start = pgstat_prepare_io_time();
+				bool verified;
 #ifdef USE_PGRAC_CLUSTER
-			else if (cluster_online_block_recovery)
-			{
+				if (tracked && !cluster_bufmgr_pcm_read_source_disk_allowed(bufHdr,
+					(ClusterBufmgrReadSource *)&read))
+					ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("refusing physical read without its exact GCS disk grant")));
+				if (tracked)
+					cluster_block_io_trace_source((const ClusterPcmReadSource *)&read.source, "DISK_BEGIN");
+#endif
+				smgrread(smgr, forkNum, blockNum, bufBlock);
+
+				pgstat_count_io_op_time(io_object, io_context,
+										IOOP_READ, io_start, 1);
+
+				/* check for garbage data */
+				verified = PageIsVerifiedForFork((Page) bufBlock, forkNum, blockNum,
+												  PIV_LOG_WARNING | PIV_REPORT_STAT);
+
+#ifdef USE_PGRAC_CLUSTER
+
+				if (cluster_trace_block_io && (!verified
+					|| cluster_block_recovery_checksum_mismatch((char *)bufBlock, blockNum)))
+				{
+					BufferTag failed_tag;
+					InitBufferTag(&failed_tag, &smgr->smgr_rlocator.locator, forkNum, blockNum);
+					cluster_block_io_trace_failed(failed_tag, (char *)bufBlock, "DISK",
+						((PageHeader)bufBlock)->pd_checksum,
+						DataChecksumsEnabled() && !PageIsNew((Page)bufBlock)
+							? pg_checksum_page((char *)bufBlock, blockNum) : 0);
+				}
+
 				/*
-				 * Online recovery on but the block could not be rebuilt.
-				 * PANIC escalation (operator opt-in) is restricted to the
-				 * main data fork: VM/FSM and other auxiliary forks are
-				 * reconstructible from scratch, so an unrebuildable one
-				 * should fail the query (ERROR), not crash the instance.
+				 * PGRAC (spec-4.10 D1/D4): try to rebuild a corrupt block from WAL
+				 * before applying the zero/error policy.  PERMANENT shared-buffer
+				 * relations only (relpersistence == RELPERSISTENCE_PERMANENT &&
+				 * !isLocalBuf): temp / unlogged relations have no authoritative WAL
+				 * chain -- a reused relfilenode could even match stale WAL of a
+				 * dropped relation -- so they are never WAL-reconstructed.
+				 * Single-node / own-thread only (cross-node forward Stage 5).  Q3
+				 * (recovery-precedence): with online recovery on, also rebuild when
+				 * ignore_checksum_failure masked a real checksum mismatch
+				 * (PageIsVerifiedExtended returned true); if it cannot rebuild,
+				 * ignore_checksum_failure's "return the page as-is" remains the
+				 * fallback (verified stays true).
 				 */
-				int			elevel = (cluster_block_recovery_on_unrecoverable == CLUSTER_BLKREC_ACTION_PANIC
-									  && forkNum == MAIN_FORKNUM)
-					? PANIC : ERROR;
-
-				ereport(elevel,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("invalid page in block %u of relation %s",
-								blockNum,
-								relpath(smgr->smgr_rlocator, forkNum)),
-						 errhint("online block recovery could not rebuild this block from WAL "
-								 "(no full-page-image base in retained WAL, an unsupported "
-								 "change, or a cross-node block); restore from backup.")));
-			}
+				if (!verified)
+				{
+					if (relpersistence == RELPERSISTENCE_PERMANENT && !isLocalBuf
+						&& cluster_block_recovery_on_read(smgr, forkNum, blockNum, (char *) bufBlock))
+						verified = true;
+				}
+				else if (relpersistence == RELPERSISTENCE_PERMANENT && !isLocalBuf
+						 && ignore_checksum_failure && cluster_online_block_recovery
+						 && cluster_block_recovery_checksum_mismatch((char *) bufBlock, blockNum))
+				{
+					(void) cluster_block_recovery_on_read(smgr, forkNum, blockNum, (char *) bufBlock);
+				}
 #endif
-			else
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("invalid page in block %u of relation %s",
-								blockNum,
-								relpath(smgr->smgr_rlocator, forkNum))));
-		}
-	}
 
+				if (!verified)
+				{
+					if (mode == RBM_ZERO_ON_ERROR || zero_damaged_pages)
+					{
+						ereport(WARNING,
+								(errcode(ERRCODE_DATA_CORRUPTED),
+								 errmsg("invalid page in block %u of relation %s; zeroing out page",
+										blockNum,
+										relpath(smgr->smgr_rlocator, forkNum))));
+						MemSet((char *) bufBlock, 0, BLCKSZ);
+					}
+#ifdef USE_PGRAC_CLUSTER
+					else if (cluster_online_block_recovery)
+					{
+						/*
+						 * Online recovery on but the block could not be rebuilt.
+						 * PANIC escalation (operator opt-in) is restricted to the
+						 * main data fork: VM/FSM and other auxiliary forks are
+						 * reconstructible from scratch, so an unrebuildable one
+						 * should fail the query (ERROR), not crash the instance.
+						 */
+						int			elevel = (cluster_block_recovery_on_unrecoverable == CLUSTER_BLKREC_ACTION_PANIC
+											  && forkNum == MAIN_FORKNUM)
+							? PANIC : ERROR;
+
+						ereport(elevel,
+								(errcode(ERRCODE_DATA_CORRUPTED),
+								 errmsg("invalid page in block %u of relation %s",
+										blockNum,
+										relpath(smgr->smgr_rlocator, forkNum)),
+								 errhint("online block recovery could not rebuild this block from WAL "
+										 "(no full-page-image base in retained WAL, an unsupported "
+										 "change, or a cross-node block); restore from backup.")));
+					}
+#endif
+					else
+						ereport(ERROR,
+								(errcode(ERRCODE_DATA_CORRUPTED),
+								 errmsg("invalid page in block %u of relation %s",
+										blockNum,
+										relpath(smgr->smgr_rlocator, forkNum))));
+				}
+#ifdef USE_PGRAC_CLUSTER
+				if (tracked)
+					cluster_gcs_block_fallback_verify_refresh(bufHdr, read.source.tag,
+						(SCN)read.source.watermark);
+#endif
+			}
+#ifdef USE_PGRAC_CLUSTER
+			if (tracked) {
+				cluster_bufmgr_pcm_read_source_finish(bufHdr, (ClusterBufmgrReadSource *)&read);
+				completed_source = read.source;
+			}
+		}
+		PG_END_ENSURE_ERROR_CLEANUP(cluster_bufmgr_pcm_read_source_error,
+			PointerGetDatum((ClusterBufmgrReadSource *)&read));
+#endif
+	}
 	/*
 	 * In RBM_ZERO_AND_LOCK / RBM_ZERO_AND_CLEANUP_LOCK mode, grab the buffer
 	 * content lock before marking the page as valid, to make sure that no
@@ -6130,6 +6375,9 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	{
 		/* Set BM_VALID, terminate IO, and wake up any waiters */
 		TerminateBufferIO(bufHdr, false, BM_VALID);
+#ifdef USE_PGRAC_CLUSTER
+		cluster_gcs_block_read_source_complete(bufHdr, &completed_source, true);
+#endif
 	}
 
 	VacuumPageMiss++;
@@ -10583,6 +10831,13 @@ FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 #endif
 	if (write_attempted != NULL)
 		*write_attempted = true;
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_injection_is_armed("cluster-pcm-write-before-data"))
+	{
+		cluster_block_io_trace_note(buf->tag, "WRITE_PAUSE", written_token, 0, 0);
+		CLUSTER_INJECTION_POINT("cluster-pcm-write-before-data");
+	}
+#endif
 	smgrwrite(reln,
 			  BufTagGetForkNum(&buf->tag),
 			  buf->tag.blockNum,
@@ -10590,6 +10845,7 @@ FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 			  false);
 
 #ifdef USE_PGRAC_CLUSTER
+	cluster_block_io_trace_write(buf, bufToWrite);
 
 	/*
 	 * PGRAC spec-6.12h D-h2 (Q25-A "写盘成功" face): a cluster-tracked block's
@@ -15327,7 +15583,7 @@ LockBufferInternal_trace_impl(Buffer buffer, int mode, bool *pcm_barrier_refused
 							pcm_pending_set = true;
 							pcm_acquired = cluster_bufmgr_pcm_acquire_shared_owned(
 								buf, &pcm_pending_base, pcm_pending_token,
-								&retry_denied);
+								&retry_denied, NULL);
 							if (!retry_denied)
 								break;
 							pcm_pending_set = false;
@@ -18044,10 +18300,10 @@ cluster_bufmgr_downgrade_record_pi(BufferDesc *buf, volatile bool *content_locke
 	return true;
 }
 
-ClusterBufmgrGcsDowngradeOutcome
-cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(
+static ClusterBufmgrGcsDowngradeOutcome
+cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image_internal(
 	BufferTag tag, XLogRecPtr *out_page_lsn, char *dst,
-	ClusterBufmgrGcsCopyRefusal *out_refusal)
+	ClusterBufmgrGcsCopyRefusal *out_refusal, const ClusterPcmReadGrantKey *first_fill)
 {
 	uint32		hashcode;
 	LWLock	   *partition_lock;
@@ -18117,7 +18373,8 @@ cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(
 	cover_result
 		= cluster_pcm_lock_resource_x_bootstrap_round_x_to_s_preflight_exact(
 			&current);
-	if (cover_result != RESOURCE_X_APPLY_NOT_FOUND) {
+	if (cover_result != RESOURCE_X_APPLY_NOT_FOUND
+		&& !(first_fill != NULL && cover_result == RESOURCE_X_APPLY_APPLIED)) {
 		if (cover_result != RESOURCE_X_APPLY_APPLIED
 			&& cover_result != RESOURCE_X_APPLY_BAD_STATE
 			&& cover_result != RESOURCE_X_APPLY_DUPLICATE)
@@ -18251,8 +18508,9 @@ cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(
 		return CLUSTER_BUFMGR_GCS_DOWNGRADE_REFUSED_PRE_NOTIFY;
 	}
 
-	if (!cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_X_TO_S_DOWNGRADE,
-											   cluster_node_id))
+	if (!(first_fill != NULL
+		? cluster_pcm_lock_read_grant_holder_done(first_fill, cluster_node_id)
+		: cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_X_TO_S_DOWNGRADE, cluster_node_id)))
 	{
 		/* Master refused (state moved under us) — leave local X untouched. */
 		own_result = cluster_bufmgr_pcm_own_abort_x_revoke(buf, &revoking);
@@ -18290,6 +18548,15 @@ cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(
 	}
 	cluster_bufmgr_unpin_for_gcs(buf);
 	return CLUSTER_BUFMGR_GCS_DOWNGRADE_COMMITTED;
+}
+
+ClusterBufmgrGcsDowngradeOutcome
+cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(
+	BufferTag tag, XLogRecPtr *out_page_lsn, char *dst,
+	ClusterBufmgrGcsCopyRefusal *out_refusal)
+{
+	return cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image_internal(
+		tag, out_page_lsn, dst, out_refusal, NULL);
 }
 
 bool
@@ -18795,10 +19062,10 @@ cluster_bufmgr_pcm_own_finish_x_to_s_downgrade(
 	return result;
 }
 
-ClusterBufmgrGcsDowngradeOutcome
-cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(
+static ClusterBufmgrGcsDowngradeOutcome
+cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image_internal(
 	BufferTag tag, int32 master_node, XLogRecPtr *out_page_lsn, char *dst,
-	ClusterBufmgrGcsCopyRefusal *out_refusal)
+	ClusterBufmgrGcsCopyRefusal *out_refusal, const ClusterPcmReadGrantKey *first_fill)
 {
 	uint32		hashcode;
 	LWLock	   *partition_lock;
@@ -18870,7 +19137,8 @@ cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(
 	cover_result
 		= cluster_pcm_lock_resource_x_bootstrap_round_x_to_s_preflight_exact(
 			&current);
-	if (cover_result != RESOURCE_X_APPLY_NOT_FOUND) {
+	if (cover_result != RESOURCE_X_APPLY_NOT_FOUND
+		&& !(first_fill != NULL && cover_result == RESOURCE_X_APPLY_APPLIED)) {
 		if (cover_result != RESOURCE_X_APPLY_APPLIED
 			&& cover_result != RESOURCE_X_APPLY_BAD_STATE
 			&& cover_result != RESOURCE_X_APPLY_DUPLICATE)
@@ -19018,7 +19286,9 @@ cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(
 	}
 	else
 		notify_handed_off
-			= cluster_gcs_send_transition_nowait(tag, PCM_TRANS_X_TO_S_DOWNGRADE, master_node);
+			= first_fill != NULL
+				? cluster_gcs_block_read_grant_holder_notify(first_fill, master_node)
+				: cluster_gcs_send_transition_nowait(tag, PCM_TRANS_X_TO_S_DOWNGRADE, master_node);
 	if (!notify_handed_off)
 	{
 		own_result = cluster_bufmgr_pcm_own_abort_x_revoke(buf, &revoking);
@@ -19057,6 +19327,38 @@ cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(
 	}
 	cluster_bufmgr_unpin_for_gcs(buf);
 	return CLUSTER_BUFMGR_GCS_DOWNGRADE_COMMITTED;
+}
+
+ClusterBufmgrGcsDowngradeOutcome
+cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(
+	BufferTag tag, int32 master_node, XLogRecPtr *out_page_lsn, char *dst,
+	ClusterBufmgrGcsCopyRefusal *out_refusal)
+{
+	return cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image_internal(
+		tag, master_node, out_page_lsn, dst, out_refusal, NULL);
+}
+
+/* Only the master-authenticated first-fill FORWARD calls this owner. Unlike
+ * optional read-cache callers it consumes an exact terminal-X cover via the
+ * existing post-commit note and sends an episode-bound asynchronous notice. */
+ClusterBufmgrGcsDowngradeOutcome
+cluster_bufmgr_first_fill_s_prepare_image(const ClusterPcmReadGrantKey *key,
+	int32 master_node, XLogRecPtr *out_page_lsn, char *dst,
+	ClusterBufmgrGcsCopyRefusal *out_refusal)
+{
+	if (key == NULL || key->request_id == 0 || key->request_id == UINT64_MAX
+		|| key->epoch == 0 || key->epoch == UINT64_MAX || key->backend_id <= 0
+		|| key->requester_node < 0 || key->requester_node >= 32
+		|| master_node < 0 || master_node >= 32) {
+		if (out_refusal != NULL)
+			*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_INVALID_ARGUMENT;
+		return CLUSTER_BUFMGR_GCS_DOWNGRADE_REFUSED_PRE_NOTIFY;
+	}
+	if (master_node == cluster_node_id)
+		return cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image_internal(
+			key->tag, out_page_lsn, dst, out_refusal, key);
+	return cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image_internal(
+		key->tag, master_node, out_page_lsn, dst, out_refusal, key);
 }
 
 bool
@@ -19734,10 +20036,16 @@ cluster_bufmgr_refresh_block_from_storage_for_gcs(BufferDesc *buf, SCN *out_page
 		smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
 		if (!PageIsVerifiedForFork((Page) scratch.data, BufTagGetForkNum(&tag), tag.blockNum,
 									PIV_LOG_WARNING | PIV_REPORT_STAT))
+		{
+			cluster_block_io_trace_failed(tag, scratch.data, "DISK_REFRESH",
+				((PageHeader)scratch.data)->pd_checksum,
+				DataChecksumsEnabled() && !PageIsNew((Page)scratch.data)
+					? pg_checksum_page(scratch.data, tag.blockNum) : 0);
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("invalid page in block %u of relation %u during GCS storage-fallback refresh",
 							tag.blockNum, tag.relNumber)));
+		}
 
 		content_lock = BufferDescriptorGetContentLock(buf);
 		LWLockAcquire(content_lock, LW_EXCLUSIVE);
@@ -19884,6 +20192,37 @@ cluster_bufmgr_block_pcm_state(BufferTag tag)
  * strand a stale grant after finalize.  Same by-tag lookup as
  * cluster_bufmgr_block_pcm_state; returns false when the block is not resident.
  */
+/* After an exact pending-S slot has closed, N with no native reservation
+ * proves that attempt cannot install. RETRY may retain PG's IO bit for its
+ * next source decision; that IO bit alone is not a live grant reservation. */
+bool
+cluster_bufmgr_pending_s_aborted(BufferTag tag)
+{
+	uint32 hashcode = BufTableHashCode(&tag);
+	LWLock *partition_lock = BufMappingPartitionLock(hashcode);
+	int buf_id;
+	bool aborted = false;
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hashcode);
+	if (buf_id >= 0) {
+		BufferDesc *buf = GetBufferDescriptor(buf_id);
+		uint32 state = LockBufHdr(buf);
+		uint64 generation = cluster_pcm_own_gen_get(buf_id);
+		uint64 token = cluster_pcm_own_reservation_token_get(buf_id);
+		aborted = BufferTagsEqual(&buf->tag, &tag)
+			&& (state & (BM_TAG_VALID | BM_VALID | BM_DIRTY | BM_IO_ERROR)) == BM_TAG_VALID
+			&& buf->pcm_state == PCM_STATE_N && buf->buffer_type == BUF_TYPE_CURRENT
+			&& generation != 0 && generation != UINT64_MAX && token != 0 && token != UINT64_MAX
+			&& cluster_pcm_own_flags_get(buf_id) == 0
+			&& cluster_pcm_own_writer_activation_token_get(buf_id) == 0
+			&& cluster_pcm_own_resource_x_activation_generation_get(buf_id) == 0
+			&& cluster_pcm_own_delivery_attempt_get(buf_id) == 0;
+		UnlockBufHdr(buf, state);
+	}
+	LWLockRelease(partition_lock);
+	return aborted;
+}
+
 bool
 cluster_bufmgr_block_grant_pending(BufferTag tag)
 {
@@ -19907,8 +20246,17 @@ cluster_bufmgr_block_grant_pending(BufferTag tag)
 	buf = GetBufferDescriptor(buf_id);
 
 	buf_state = LockBufHdr(buf);
-	if (BufferTagsEqual(&buf->tag, &tag) && (buf_state & BM_VALID) != 0)
-		pending = (cluster_pcm_own_flags_get(buf->buf_id) & PCM_OWN_FLAG_GRANT_PENDING) != 0;
+	if (BufferTagsEqual(&buf->tag, &tag) && (buf_state & BM_TAG_VALID) != 0)
+	{
+		/* Native IO withholds visibility through both source reservation
+		 * and the committed-S -> TerminateBufferIO(BM_VALID) suffix. Do not
+		 * ACK either interval as already invalidated. The IO owner, not an
+		 * INVALIDATE worker, publishes or aborts the original fill. If exact
+		 * cleanup cannot prove quiescence, its retained reservation also
+		 * remains pending after generic IO cleanup clears the IO bit. */
+		pending = (cluster_pcm_own_flags_get(buf->buf_id) & PCM_OWN_FLAG_GRANT_PENDING) != 0 ||
+			(buf_state & (BM_VALID | BM_IO_IN_PROGRESS)) == BM_IO_IN_PROGRESS;
+	}
 	UnlockBufHdr(buf, buf_state);
 	LWLockRelease(partition_lock);
 
@@ -22337,6 +22685,7 @@ cluster_bufmgr_discard_pi_block(BufferTag tag)
 	int			buf_id;
 	BufferDesc *buf;
 	uint32		buf_state;
+	uint64 generation = 0, token = 0, version = 0;
 
 	/* Tag-only notifications cannot discharge opaque shared versions. The
 	 * all-member shutdown checkpoint is the existing qualified caller. */
@@ -22372,7 +22721,15 @@ cluster_bufmgr_discard_pi_block(BufferTag tag)
 	 * InvalidateBuffer below breaks the shape), but a directive-discarded
 	 * slot should not linger as a plausible-looking stamp. */
 	cluster_pi_shadow_clear(buf->buf_id);
+	if (cluster_trace_block_io)
+	{
+		generation = cluster_pcm_own_gen_get(buf->buf_id);
+		token = cluster_pcm_own_reservation_token_get(buf->buf_id);
+		/* PI bytes are immutable here: exact tag, zero pins, header held. */
+		version = ((PageHeader)BufHdrGetBlock(buf))->pd_block_scn;
+	}
 	InvalidateBuffer(buf);		/* releases the header spinlock */
+	cluster_block_io_trace_pi_retired(tag, buf_id, generation, token, version);
 
 	return true;
 }

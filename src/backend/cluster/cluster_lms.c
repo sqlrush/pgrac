@@ -1238,6 +1238,7 @@ LmsMain(void)
 			 * directives parked by the dispatch handler (bounded, one
 			 * attempt each;  never waits on a pin). */
 				cluster_gcs_block_invalidate_park_tick();
+				cluster_gcs_block_pending_s_tick();
 			}
 			work_completed = true;
 		}
@@ -1416,6 +1417,7 @@ LmsWorkerMain(int worker_id)
 				/* GCS serve-stall round-5 A2 — retry PINNED invalidate
 			 * directives parked by this worker's dispatch handler. */
 				cluster_gcs_block_invalidate_park_tick();
+				cluster_gcs_block_pending_s_tick();
 			}
 			work_completed = true;
 		}

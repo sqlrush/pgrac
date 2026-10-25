@@ -4803,6 +4803,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_pcm_read_source_owner.inc test_cluster_pcm_read_source_owner.inc.tmp
 	rm -f test_cluster_ko_writeback_io.inc test_cluster_ko_writeback_io.inc.tmp \
 		test_cluster_ko_writeback_smgr.inc test_cluster_ko_writeback_smgr.inc.tmp
 	rm -f test_cluster_ko_sync_io.inc test_cluster_ko_sync_io.inc.tmp \
@@ -5524,7 +5525,7 @@ test_cluster_pcm_settlement_ingress.inc: $(top_srcdir)/src/backend/cluster/clust
 	     END { if (count != 4 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
 		test_cluster_pcm_master_durable.inc \
 		test_cluster_pcm_bootstrap_tick.inc \
 		test_cluster_pcm_settlement_ingress.inc \
@@ -5682,11 +5683,12 @@ test_cluster_pcm_flush_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmg
 # Real local/remote S-cache prepare and ownership transitions.
 test_cluster_pcm_downgrade.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^cluster_bufmgr_downgrade_record_pi\(/ { print "static bool"; emit=1; record_pi++ } \
-	     /^cluster_bufmgr_downgrade_x_to_s_(remote_)?for_gcs_prepare_image\(/ { print "ClusterBufmgrGcsDowngradeOutcome"; emit=1; prepare++ } \
+	     /^cluster_bufmgr_downgrade_x_to_s_(remote_)?for_gcs_prepare_image_internal\(/ { print "static ClusterBufmgrGcsDowngradeOutcome"; emit=1; core++ } \
+	     /^cluster_bufmgr_(downgrade_x_to_s_(remote_)?for_gcs_prepare_image|first_fill_s_prepare_image)\(/ { print "ClusterBufmgrGcsDowngradeOutcome"; emit=1; prepare++ } \
 	     /^cluster_bufmgr_pcm_own_(begin_x_revoke|abort_x_revoke)\(/ { print "ClusterPcmOwnResult"; emit=1; revoke++ } \
 	     /^cluster_bufmgr_pcm_own_finish_x_to_s_downgrade\(/ { print "static ClusterPcmOwnResult"; emit=1; finish++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (record_pi != 1 || prepare != 2 || revoke != 2 || finish != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (record_pi != 1 || core != 2 || prepare != 3 || revoke != 2 || finish != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pcm_eviction_gate.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
@@ -9561,6 +9563,28 @@ TESTS += test_cluster_pi_drop_storage
 all: test_cluster_pi_drop_storage
 
 TESTS += test_cluster_space_committed_drop
+
+TESTS += test_cluster_pcm_read_source test_cluster_pcm_read_grant
+all: test_cluster_pcm_read_source test_cluster_pcm_read_grant
+
+test_cluster_pcm_read_source_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_pcm_own_finish_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; finish_owner++ } \
+	     /^cluster_bufmgr_pcm_abort_shared_owned\(/ { print "static ClusterPcmOwnResult"; emit=1; abort_owner++ } \
+	     /^cluster_bufmgr_pcm_acquire_shared_owned\(/ { print "static bool"; emit=1; found++ } \
+	     /^cluster_bufmgr_block_grant_pending\(/ { print "bool"; emit=1; pending_owner++ } \
+	     /^cluster_bufmgr_pending_s_aborted\(/ { print "bool"; emit=1; aborted_owner++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (found != 1 || abort_owner != 1 || finish_owner != 1 || pending_owner != 1 || aborted_owner != 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^typedef struct ClusterBufmgrReadSource$$/ { emit=1; found++ } \
+	     /^#endif/ && emit { emit=0 } emit { print } \
+	     END { if (found != 1 || emit) exit 1 }' $< >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pcm_read_source: test_cluster_pcm_read_source.c test_cluster_pcm_own \
+		test_cluster_pcm_read_source_owner.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
+		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 all: test_cluster_space_committed_drop
 
 test_cluster_space_committed_drop: test_cluster_space_close_policy.inc test_cluster_space_drop_state.inc
@@ -9694,3 +9718,11 @@ test_cluster_tt_terminal_trace: test_cluster_tt_terminal_trace.c test_cluster_tt
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Execute the production first-fill master decision with native PCM owners.
+test_cluster_pcm_first_fill_master.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_first_fill_request\(/ { print "static void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (n != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_pcm_read_grant: test_cluster_pcm_first_fill_master.inc

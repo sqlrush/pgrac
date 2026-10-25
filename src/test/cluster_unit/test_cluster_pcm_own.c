@@ -774,7 +774,15 @@ transition_write_context(void *arg)
 		if ((elevel) >= ERROR)                                                                     \
 			pg_re_throw();                                                                         \
 	} while (0)
+#define cluster_injection_is_armed(name) false
+#define CLUSTER_INJECTION_POINT(name) ((void)0)
+#define cluster_block_io_trace_note(...) ((void)0)
+#define cluster_block_io_trace_write(...) ((void)0)
 #include "test_cluster_pcm_flush_owner.inc"
+#undef cluster_block_io_trace_write
+#undef cluster_block_io_trace_note
+#undef CLUSTER_INJECTION_POINT
+#undef cluster_injection_is_armed
 #undef cluster_space_recovery_flush_permitted_v1
 #undef pfree
 #undef relpathperm
@@ -880,6 +888,10 @@ downgrade_master_notify(BufferTag tag, PcmLockTransition trans, int node, bool r
 	downgrade_master_notify(tag, trans, node, false)
 #define cluster_gcs_send_transition_nowait(tag, trans, node)                                       \
 	downgrade_master_notify(tag, trans, node, true)
+#define cluster_pcm_lock_read_grant_holder_done(key, node)                                        \
+	downgrade_master_notify((key)->tag, PCM_TRANS_X_TO_S_DOWNGRADE, node, false)
+#define cluster_gcs_block_read_grant_holder_notify(key, node)                                      \
+	downgrade_master_notify((key)->tag, PCM_TRANS_X_TO_S_DOWNGRADE, node, true)
 #define cluster_bufmgr_pcm_x_content_write_permitted(buf)                                          \
 	(cluster_pcm_own_flags_get((buf)->buf_id) == 0)
 #define cluster_itl_page_has_active_slot(page) false
@@ -899,6 +911,8 @@ downgrade_master_notify(BufferTag tag, PcmLockTransition trans, int node, bool r
 #undef cluster_itl_page_has_active_slot
 #undef cluster_bufmgr_pcm_x_content_write_permitted
 #undef cluster_gcs_send_transition_nowait
+#undef cluster_gcs_block_read_grant_holder_notify
+#undef cluster_pcm_lock_read_grant_holder_done
 #undef cluster_pcm_lock_apply_gcs_transition
 
 #undef FlushBufferWithRecovery
@@ -1273,7 +1287,8 @@ source_tick_snapshot(const BufferTag *tag, ResourceXGateSnapshot *gate, int32 *m
 
 static ResourceXApplyResult
 source_tick_run(const ResourceXAcquisitionRef *ref, const ClusterSemanticAdmissionToken *admission,
-				int32 master, uint64 session)
+				int32 master, uint64 session,
+				const ClusterWaitPcmAdmission *observation pg_attribute_unused())
 {
 	UT_ASSERT(BufferTagsEqual(&ref->assertion.resource, &source_tick_held->revoking.tag));
 	UT_ASSERT_EQ(master, 0);
@@ -1299,8 +1314,11 @@ source_tick_run(const ResourceXAcquisitionRef *ref, const ClusterSemanticAdmissi
 	((token)->entered && (node) == 0 && (generation) == 61 ? source_tick_peer_result               \
 														   : RESOURCE_X_APPLY_STALE)
 #define gcs_block_resource_x_source_finish_run_exact source_tick_run
+#define gcs_block_pcm_service_admission(out, admission, gate, stage, node, session, ingress) \
+	memset((out), 0, sizeof(*(out)))
 #define gcs_block_resource_x_stage_ready_tag(tag) ((void)(tag), source_tick_notifications++)
 #include "test_cluster_pcm_source_finish_tick.inc"
+#undef gcs_block_pcm_service_admission
 #undef gcs_block_resource_x_stage_ready_tag
 #undef gcs_block_resource_x_source_finish_run_exact
 #undef gcs_block_resource_x_target_peer_matches_exact

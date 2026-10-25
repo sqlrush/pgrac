@@ -58,6 +58,7 @@
 #include "cluster/cluster_resource_x_node_wire.h"
 #include "cluster/cluster_scn.h"   /* spec-2.41 D2 — SCN dual watermark */
 #include "storage/buf_internals.h" /* BufferTag */
+#include "cluster/cluster_pcm_read_source.h"
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -1400,6 +1401,23 @@ extern void cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode);
  */
 extern bool cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode,
 											bool *out_retry_denied);
+extern ClusterPcmReadSourceKind
+cluster_pcm_lock_acquire_buffer_source(BufferDesc *buf, ClusterPcmReadSource *source);
+extern PcmGcsTransitionApplyResult
+cluster_pcm_lock_apply_disk_read_grant(BufferTag tag, int32 holder_node_id);
+
+/* First-fill source authority is registered by the master before shipping. */
+extern PcmGcsTransitionApplyResult cluster_pcm_lock_read_grant_begin(BufferTag tag,
+	int32 requester, int32 backend, uint64 request_id, uint64 epoch,
+	TimestampTz deadline, bool create, ClusterPcmReadGrant *out);
+extern bool cluster_pcm_lock_read_grant_done(const ClusterPcmReadGrantKey *key,
+	int32 authenticated_sender, bool installed);
+extern bool cluster_pcm_lock_read_grant_holder_done(const ClusterPcmReadGrantKey *key,
+	int32 authenticated_holder);
+extern void cluster_pcm_lock_check_shutdown_wait(void);
+extern bool cluster_pcm_lock_read_grant_revoke_ack(const ClusterPcmReadGrantKey *key);
+extern bool cluster_pcm_lock_read_grant_work(uint32 *cursor, int worker, int workers,
+	TimestampTz now, uint64 current_epoch, ClusterPcmReadGrant *out);
 
 /*
  * PGRAC: spec-5.2a D2 — clean-page X-transfer arm (backend-local, one-shot).
