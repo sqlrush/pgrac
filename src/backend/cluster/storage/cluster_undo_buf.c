@@ -14,6 +14,9 @@
  *	      (XLOG_UNDO_BLOCK_WRITE) and made durable by the checkpoint write-back
  *	      flush (cluster_undo_buf_flush_all) + eviction flush;  with write-back
  *	      off, durability stays at cluster_undo_xact_precommit_flush;
+ *	    - native shared prepared receipts publish their own WAL-backed dirty
+ *	      image through install_wal_ref_locked; the same checkpoint/eviction
+ *	      owner flushes it, independently of the legacy mode switch;
  *	    - block 0 (segment header + durable TT slots) is NOT poolable.
  *
  *	  Concurrency (NOTES):  a miss does disk I/O OUTSIDE the pool map_lock —
@@ -49,8 +52,10 @@
 
 #include "access/xlog.h"			/* XLogFlush — WAL-before-data on write-back (D2b) */
 #include "cluster/cluster_conf.h"	/* cluster_conf_has_peers — single-node gate (D2b) */
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h" /* spec-4.8ab D1 boundary-guard injection points */
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_undo_format.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_buf.h"
@@ -80,7 +85,7 @@ typedef struct UndoBufSlot {
 	uint32 block_no;
 	bool valid;				   /* slot holds a real block */
 	bool io_in_progress;	   /* a backend is filling it from disk */
-	bool dirty;				   /* write-back only;  D1 write-through => false */
+	bool dirty;				   /* WAL-backed debt; D1 write-through => false */
 	pg_atomic_uint32 pincount; /* > 0 => not evictable */
 	uint32 clock_used;		   /* clock-sweep recency hint (0/1) */
 	XLogRecPtr last_wal_lsn;   /* D2: LSN protecting a dirty block */
@@ -914,6 +919,38 @@ cluster_undo_buf_install_ref_locked(int slot, uint32 segment_id, uint8 owner, ui
 
 
 void
+cluster_undo_buf_install_wal_ref_locked(int slot, uint32 segment_id, uint8 owner,
+									  uint32 block_no, const char image[BLCKSZ], XLogRecPtr wal_lsn)
+{
+	UndoBufSlot *s;
+	const UndoBlockHeader *header;
+
+	/* Only the native origin's prepared receipt may create this debt.  Remote
+	 * DATA consumers already fetch the origin resident image under their
+	 * original DATA SCUR; the legacy mode latch remains unchanged. */
+	if (!cluster_shared_config || cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| owner != (uint8)(cluster_node_id + 1) || block_no == 0 || image == NULL
+		|| XLogRecPtrIsInvalid(wal_lsn) || UndoBufPool == NULL || UndoBufSlots == NULL
+		|| slot < 0 || slot >= UndoBufPool->nslots)
+		ereport(PANIC, (errmsg("cluster undo native prepared publication lost WAL authority")));
+	s = &UndoBufSlots[slot];
+	if (!LWLockHeldByMe(&s->content_lock) || !s->valid || s->io_in_progress
+		|| s->segment_id != segment_id || s->owner != owner || s->block_no != block_no
+		|| pg_atomic_read_u32(&s->pincount) == 0)
+		ereport(PANIC, (errmsg("cluster undo native prepared publication lost exact resident")));
+	header = (const UndoBlockHeader *)image;
+	if (header->magic != PGRAC_UNDO_BLOCK_MAGIC || header->block_version != UNDO_BLOCK_VERSION_1
+		|| header->block_lsn != wal_lsn
+		|| (!XLogRecPtrIsInvalid(s->last_wal_lsn) && wal_lsn < s->last_wal_lsn))
+		ereport(PANIC, (errmsg("cluster undo native prepared publication has invalid WAL image")));
+
+	cluster_undo_buf_install_ref_locked(slot, segment_id, owner, block_no, image);
+	s->last_wal_lsn = wal_lsn;
+	s->dirty = true;
+}
+
+
+void
 cluster_undo_buf_unlock_ref(int slot)
 {
 	UndoBufSlot *s;
@@ -976,8 +1013,9 @@ cluster_undo_buf_flush_all(bool is_checkpoint)
 	 * DELAY_CHKPT_START guarantee real (spec-3.18 §2.6 v0.8).
 	 *
 	 * Always scan for dirty slots regardless of the current write-back gate:
-	 * with write-back off no slot is ever left dirty (mark_dirty write-throughs
-	 * with dirty=false), so the scan is a cheap no-op;  but if the GUC was
+	 * native prepared publication creates explicit WAL-backed dirty debt even
+	 * with the legacy gate off.  Legacy mark_dirty still write-throughs with
+	 * dirty=false; if the GUC was
 	 * toggled on->off via SIGHUP while dirty slots existed, those slots still
 	 * need flushing for durability -- the gate decides whether NEW writes
 	 * buffer, not whether already-dirty blocks get persisted.

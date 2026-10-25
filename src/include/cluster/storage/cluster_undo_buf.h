@@ -123,6 +123,13 @@ extern bool cluster_undo_buf_lock_ref_conditional(int slot, uint32 segment_id, u
 												  uint32 block_no);
 extern void cluster_undo_buf_install_ref_locked(int slot, uint32 segment_id, uint8 owner,
 												uint32 block_no, const char image[BLCKSZ]);
+/* Native shared-profile prepared publication: exact own-instance ref/lock,
+ * valid WAL-stamped image, and caller-held DELAY_CHKPT_START.  No I/O or new
+ * pin; the original checkpoint/eviction owner retires the resulting dirty
+ * debt.  This does not enable the generic legacy write-back mode. */
+extern void cluster_undo_buf_install_wal_ref_locked(int slot, uint32 segment_id, uint8 owner,
+													uint32 block_no, const char image[BLCKSZ],
+													XLogRecPtr wal_lsn);
 extern void cluster_undo_buf_unlock_ref(int slot);
 
 /* checkpoint / shutdown flush hook.  is_checkpoint=true on checkpoint. */
