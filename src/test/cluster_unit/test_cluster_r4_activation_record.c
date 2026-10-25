@@ -35,6 +35,12 @@ cluster_recovery_tx_result_accept_v1(void)
 	return false;
 }
 
+bool
+cluster_recovery_ctrc_result_accept_v1(void)
+{
+	return false;
+}
+
 uint64
 cluster_membership_cut_generation(void)
 {

@@ -14521,9 +14521,10 @@ cluster_semantic_activation_lmon_tick(void)
 	semantic_activation_ack_lmon_drain();
 	if (SemanticActivationShmem == NULL)
 		return;
-	/* Collect the original TX component even while formation/serving waits.
+	/* Collect the original components even while formation/serving waits.
 	 * This value-only receipt cannot replace the remaining service owners. */
 	(void)cluster_recovery_tx_result_accept_v1();
+	(void)cluster_recovery_ctrc_result_accept_v1();
 	if (semantic_serving_lmon_tick())
 		return;
 	/* A normal-stop read owns the same original LMON/QVOTEC slot until its
@@ -14874,7 +14875,7 @@ normal_start_recovered_service_binding_current(const ClusterSemanticActivationRe
 		|| !cluster_recovery_tx_result_observe_accepted_v1(&tx)
 		|| tx.result.state != CLUSTER_RECOVERY_TX_RESULT_COMPLETE
 		|| memcmp(&tx.checkpoint, &observed, sizeof(observed)) != 0
-		|| !cluster_recovery_ctrc_result_observe_v1(&ctrc)
+		|| !cluster_recovery_ctrc_result_observe_accepted_v1(&ctrc)
 		|| ctrc.result.state != CLUSTER_RECOVERY_CTRC_RESULT_COMPLETE
 		|| memcmp(&ctrc.checkpoint, &observed, sizeof(observed)) != 0
 		|| memcmp(ctrc.result.input_root_sha256, tx.result.input_root_sha256, 32) != 0
@@ -14928,7 +14929,7 @@ normal_start_recovered_service_binding_current(const ClusterSemanticActivationRe
 		|| memcmp(&observed_after.owner, &observed.owner, sizeof(observed.owner)) != 0
 		|| !cluster_recovery_tx_result_observe_accepted_v1(&tx_after)
 		|| memcmp(&tx_after, &tx, sizeof(tx)) != 0
-		|| !cluster_recovery_ctrc_result_observe_v1(&ctrc_after)
+		|| !cluster_recovery_ctrc_result_observe_accepted_v1(&ctrc_after)
 		|| memcmp(&ctrc_after, &ctrc, sizeof(ctrc)) != 0)
 		return false;
 	return true;

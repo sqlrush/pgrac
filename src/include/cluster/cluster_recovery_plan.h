@@ -328,6 +328,12 @@ struct ClusterRecoveryCheckpointScopeV1;
  * of the TX result. Pending/unknown is observable, never service permission. */
 extern bool cluster_recovery_ctrc_result_collect_v1(const struct ClusterRecoveryStartV1 *start);
 extern bool cluster_recovery_ctrc_result_observe_v1(ClusterRecoveryCtrcResultObservationV1 *out);
+/* Original LMON registers the complete independent component in that same
+ * owner slot. A new collection/revocation invalidates its receipt. Neither
+ * registration nor this accepted snapshot creates a release or service proof.
+ * The snapshot is zero on refusal and carries the exact owner/result values. */
+extern bool cluster_recovery_ctrc_result_accept_v1(void);
+extern bool cluster_recovery_ctrc_result_observe_accepted_v1(ClusterRecoveryCtrcResultObservationV1 *out);
 extern bool cluster_recovery_checkpoint_register_v1(const struct ClusterRecoveryStartV1 *start);
 /* Successful Startup private-input release transfers only this original
  * checkpoint observation. It is neither service completion nor OPEN proof. */
