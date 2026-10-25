@@ -213,3 +213,82 @@ UT_TEST(restored_snapshot_rejects_unprotected_original_source)
 	for (unsigned fault = 0; fault < 3; fault++)
 		snapshot_import_refused(true, fault);
 }
+
+/* A receiver may still advertise a finite SCN from a previous local point.
+ * Installing an older native xmin must not lend that SCN to the imported
+ * snapshot while its original snapmgr registration has not yet published. */
+static void
+snapshot_import_replaces_prior_scn(bool restored)
+{
+	SnapshotData source = snapshot_import_begin();
+	VirtualTransactionId vxid = { 2, 3 };
+	ClusterUndoRetentionSample sample, zero = { 0 };
+	Snapshot owned;
+	bool gap_refused;
+
+	import_restored = restored;
+	proc.xmin = TransactionXmin = 80;
+	pg_atomic_write_u64(&proc.cluster_read_scn_atomic, 100);
+	import_observe_install = true;
+	UT_ASSERT(restored ? ProcArrayInstallRestoredXmin(source.xmin, &snapshot_procs[1])
+		: ProcArrayInstallImportedXmin(source.xmin, &vxid));
+	UT_ASSERT_EQ(proc.xmin, 20);
+	UT_ASSERT_EQ(TransactionXmin, 20);
+	UT_ASSERT_EQ(import_install_mode, restored ? LW_EXCLUSIVE : LW_SHARED);
+	UT_ASSERT(!retention_lock);
+	/* End the old source after the actual installer has returned. The
+	 * receiver owns xmin, but does not yet own a registered SCN snapshot. */
+	procArray->numProcs = 1;
+	snapshot_procs[1].xmin = InvalidTransactionId;
+	pg_atomic_write_u64(&snapshot_procs[1].cluster_read_scn_atomic, InvalidScn);
+	memset(&sample, 0xa5, sizeof(sample));
+	gap_refused = !catalog_history_sample(&sample)
+		&& memcmp(&sample, &zero, sizeof(sample)) == 0
+		&& pg_atomic_read_u64(&proc.cluster_read_scn_atomic) == InvalidScn
+		&& import_scn_at_unlock == InvalidScn;
+	/* Only original snapmgr registration can complete this history handoff.
+	 * No installer copies an SCN from a raw XID or another backend. */
+	owned = RegisterSnapshot(&source);
+	UT_ASSERT(catalog_history_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 40);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), 40);
+	UnregisterSnapshot(owned);
+	snapshot_import_end();
+	UT_ASSERT(gap_refused); /* after original cleanup, including parent RED */
+}
+
+UT_TEST(imported_xmin_does_not_borrow_the_receivers_previous_scn)
+{
+	snapshot_import_replaces_prior_scn(false);
+}
+
+UT_TEST(restored_xmin_does_not_borrow_the_receivers_previous_scn)
+{
+	snapshot_import_replaces_prior_scn(true);
+}
+
+UT_TEST(refused_xmin_install_preserves_the_receivers_original_scn)
+{
+	for (int restored = 0; restored < 2; restored++) {
+		for (int fault = 0; fault < 3; fault++) {
+			SnapshotData source = snapshot_import_begin();
+			VirtualTransactionId vxid = { 2, 3 };
+
+			import_restored = restored;
+			proc.xmin = TransactionXmin = 80;
+			pg_atomic_write_u64(&proc.cluster_read_scn_atomic, 100);
+			import_observe_install = true;
+			if (fault == 0) snapshot_procs[1].databaseId++;
+			if (fault == 1) snapshot_procs[1].xmin = InvalidTransactionId;
+			if (fault == 2) snapshot_procs[1].xmin = 21;
+			UT_ASSERT(!(restored ? ProcArrayInstallRestoredXmin(source.xmin, &snapshot_procs[1])
+				: ProcArrayInstallImportedXmin(source.xmin, &vxid)));
+			UT_ASSERT_EQ(proc.xmin, 80);
+			UT_ASSERT_EQ(TransactionXmin, 80);
+			UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), 100);
+			UT_ASSERT_EQ(import_scn_at_unlock, 100);
+			UT_ASSERT(!retention_lock);
+			snapshot_import_end();
+		}
+	}
+}

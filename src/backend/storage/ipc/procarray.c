@@ -2240,6 +2240,8 @@ ClusterSnapshotRefreshFields(Snapshot snapshot)
  * be recycled (spec-3.12 C1/C3/C5). The fallback clock is sampled before the
  * scan. An xmin-bearing backend without a published read_scn makes the sample
  * unproven (InvalidScn), covering snapshot creation before snapmgr publication.
+ * Successful native xmin import/restoration clears the receiver's previous
+ * SCN under this same lock; only snapmgr can publish the replacement snapshot.
  *
  * spec-3.15 V-3: prepared transactions' dummy PGPROCs never publish a
  * cluster_read_scn_atomic (only snapmgr does, for live snapshots; proc.c
@@ -2915,6 +2917,12 @@ ProcArrayInstallImportedXmin(TransactionId xmin,
 		 * we don't check that.)
 		 */
 		MyProc->xmin = TransactionXmin = xmin;
+#ifdef USE_PGRAC_CLUSTER
+		/* The new xmin does not qualify a previous snapshot's read SCN.
+		 * Keep this handoff unknown under the same ProcArray lock until
+		 * snapmgr registers and publishes the imported/restored snapshot. */
+		pg_atomic_write_u64(&MyProc->cluster_read_scn_atomic, InvalidScn);
+#endif
 
 		result = true;
 		break;
@@ -2968,6 +2976,12 @@ ProcArrayInstallRestoredXmin(TransactionId xmin, PGPROC *proc)
 		 * value is interpreted by vacuum.
 		 */
 		MyProc->xmin = TransactionXmin = xmin;
+#ifdef USE_PGRAC_CLUSTER
+		/* The new xmin does not qualify a previous snapshot's read SCN.
+		 * Keep this handoff unknown under the same ProcArray lock until
+		 * snapmgr registers and publishes the imported/restored snapshot. */
+		pg_atomic_write_u64(&MyProc->cluster_read_scn_atomic, InvalidScn);
+#endif
 		MyProc->statusFlags = (MyProc->statusFlags & ~PROC_XMIN_FLAGS) |
 			(proc->statusFlags & PROC_XMIN_FLAGS);
 		ProcGlobal->statusFlags[MyProc->pgxactoff] = MyProc->statusFlags;

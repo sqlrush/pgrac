@@ -91,7 +91,7 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 			UT_ASSERT(import_install_active && !import_restored);
 		else
 			UT_ASSERT_EQ(mode, LW_EXCLUSIVE);
-		if (import_probe_after_install)
+		if (import_probe_after_install || import_observe_install)
 			import_install_mode = mode;
 		UT_ASSERT(!retention_lock && !vacuum_xid_lock && !vacuum_inplace_lock);
 		retention_lock = true;
@@ -109,6 +109,10 @@ LWLockRelease(LWLock *lock)
 {
 	if (lock == ProcArrayLock) {
 		UT_ASSERT(retention_lock);
+		if (import_observe_install) {
+			import_scn_at_unlock = pg_atomic_read_u64(&proc.cluster_read_scn_atomic);
+			import_observe_install = false;
+		}
 		retention_lock = false;
 		retention_releases++;
 		snapshot_import_after_procarray_unlock();
