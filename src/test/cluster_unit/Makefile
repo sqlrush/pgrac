@@ -5686,6 +5686,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_external_fence_duty.inc
 	rm -f test_cluster_resolver_cache_caller.inc test_cluster_resolver_cache_caller.inc.tmp
 	rm -f test_cluster_relation_size.inc
+	rm -f test_cluster_first_fill_send.inc test_cluster_first_fill_send.inc.tmp
 	rm -f test_cluster_first_fill_bufmgr.inc test_cluster_first_fill_bufmgr.inc.tmp \
 		test_cluster_first_fill_holder.inc test_cluster_first_fill_holder.inc.tmp \
 		test_cluster_pcm_first_fill_master.inc test_cluster_pcm_first_fill_master.inc.tmp
@@ -12344,6 +12345,27 @@ test_cluster_first_fill_holder.inc: $(top_srcdir)/src/backend/cluster/cluster_gc
 
 test_cluster_first_fill_wait: test_cluster_first_fill_wait.c test_cluster_pcm_own test_cluster_pcm_own.c \
 		test_cluster_first_fill_bufmgr.inc test_cluster_first_fill_holder.inc unit_test.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
+		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_first_fill_send
+all: test_cluster_first_fill_send
+# Compile the whole production handler, not a replacement serve callback.
+test_cluster_first_fill_send.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^typedef struct GcsReadImageHopTrace/ { emit=1; n++ } \
+	     emit { print } /^} GcsReadImageHopTrace;$$/ { emit=0; done++ } \
+	     END { if (n != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^typedef struct GcsFirstFillHolderPark/ { emit=1; n++ } \
+	     /^void$$/ && emit { emit=0; done++ } emit { print } \
+	     END { if (n != 1 || done != 1 || emit) exit 1 }' $< >> $@.tmp
+	awk '/^cluster_gcs_handle_block_forward_envelope\(/ { print "void"; emit=1; n++ } \
+	     /^cluster_gcs_block_first_fill_tick\(/ { print "void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2 || emit) exit 1 }' $< >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_first_fill_send: test_cluster_first_fill_send.c test_cluster_pcm_own test_cluster_pcm_own.c \
+		test_cluster_first_fill_bufmgr.inc test_cluster_first_fill_send.inc unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
 		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@

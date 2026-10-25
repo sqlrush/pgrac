@@ -88,6 +88,11 @@ static void gcs_block_forward_reply_immediate_deny(const GcsBlockForwardPayload 
 }
 #define GCS_FIRST_FILL_PARK_MAX 64
 #define ClusterGcsBlock ((void *)1)
+/* These IO-only cases must never enter the real reply-send stage. */
+#define cluster_gcs_lookup_master(tag) 2
+#define gcs_block_pcm_x_authenticated_session(master, epoch, session) true
+#define cluster_ic_send_envelope(...) (pg_re_throw(), CLUSTER_IC_SEND_HARD_ERROR)
+#define cluster_gcs_block_note_send_outcome(...) ((void)0)
 #define cluster_ic_tier1_my_data_channel wait_channel
 #define GetCurrentTimestamp() wait_now
 #define cluster_epoch_get_current() wait_epoch
@@ -113,6 +118,10 @@ static void gcs_block_forward_reply_immediate_deny(const GcsBlockForwardPayload 
 #undef cluster_epoch_get_current
 #undef GetCurrentTimestamp
 #undef cluster_ic_tier1_my_data_channel
+#undef cluster_gcs_block_note_send_outcome
+#undef cluster_ic_send_envelope
+#undef gcs_block_pcm_x_authenticated_session
+#undef cluster_gcs_lookup_master
 #undef ClusterGcsBlock
 #undef cluster_lms_wakeup
 
