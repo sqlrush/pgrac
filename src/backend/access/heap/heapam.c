@@ -109,6 +109,7 @@
 #include "cluster/cluster_writer_chain.h" /* spec-7.1a D0 terminal-writer chaining */
 #include "cluster/cluster_xid_stripe.h" /* spec-7.1a D5 foreign-class chain floor */
 #include "cluster/cluster_xnode_profile.h" /* diagnostic wait phase trace */
+#include "cluster/cluster_native_itl_trace.h"
 #include "cluster/cluster_itl_touch.h"	/* xact-local touch list */
 #include "cluster/cluster_scn.h"		/* cluster_scn_advance / SCN */
 #include "cluster/cluster_space_storage.h" /* PGRAC: native page-version WAL */
@@ -733,9 +734,13 @@ static bool
 cluster_heap_itl_alloc_once(Buffer buffer, TransactionId xid,
 							bool lock_only, uint8 *slot_index_out)
 {
-	return lock_only
+	bool selected = lock_only
 		? cluster_itl_alloc_or_reuse_lock_slot(buffer, xid, slot_index_out)
 			: cluster_itl_alloc_or_reuse_slot(buffer, xid, slot_index_out);
+	if (unlikely(cluster_trace_tx_identity))
+		cluster_native_itl_trace_selected(buffer, xid,
+			selected ? *slot_index_out : UINT8_MAX, selected);
+	return selected;
 }
 
 
