@@ -64,6 +64,9 @@ static bool observation_scope_live, observation_cursor_live;
 static char observation_events[64];
 static unsigned observation_event_count;
 static ClusterRecoveryCensusManifest observation_manifest;
+static ClusterRecoveryUndoEntry observation_physical[4];
+static unsigned observation_physical_count, observation_fail_allocation;
+static bool observation_release_error, observation_early_read;
 static void observation_fixture_reset(void);
 static void observation_scope_release(void);
 static bool observation_work_allocation(Size size, int flags);
@@ -194,7 +197,8 @@ void *MemoryContextAllocExtended(MemoryContext context, Size size, int flags)
 	if ((flags & (MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM))
 		!= (MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM)
 		&& !observation_work_allocation(size, flags)) abort();
-	if (!allocation_ok) return NULL;
+	if (!allocation_ok || (observation_fail_allocation != 0
+		&& allocations + 1 == observation_fail_allocation)) return NULL;
 	allocations++;
 	return calloc(1, size);
 }
@@ -1929,7 +1933,14 @@ UT_TEST(test_original_error_revokes_ctrc_registration_with_the_owner_slot)
 
 int main(void)
 {
-	UT_PLAN(72);
+	UT_PLAN(79);
+	UT_RUN(test_ctrc_physical_input_keeps_work_order_and_raw_c0_successor);
+	UT_RUN(test_ctrc_physical_input_refuses_reuse_duplicates_and_ambiguous_originals);
+	UT_RUN(test_ctrc_physical_input_is_private_until_full_census_and_original_rechecks);
+	UT_RUN(test_ctrc_physical_input_requires_exact_owner_work_and_valid_empty_observation);
+	UT_RUN(test_ctrc_physical_input_reserves_storage_before_scope_and_preserves_results);
+	UT_RUN(test_ctrc_physical_input_retains_storage_on_original_scope_release_error);
+	UT_RUN(test_ctrc_observation_refuses_missing_required_current_physical_slot);
 	UT_RUN(test_actual_startup_observes_full_ctrc_input_before_independent_handoff);
 	UT_RUN(test_ctrc_observation_retains_original_cursor_and_never_completes_service);
 	UT_RUN(test_ctrc_observation_refusal_is_sticky_and_preserves_first_stage_and_results);

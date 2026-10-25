@@ -154,6 +154,16 @@ typedef struct ClusterRecoveryCensusManifest {
 	uint8 inputs_sha256[32], roots_sha256[32], observation_sha256[32];
 } ClusterRecoveryCensusManifest;
 
+/* Raw current TT observations in the original retained work order. A zero
+ * count is a valid complete empty view, distinct from missing observation.
+ * Borrow only while the original Start/cursor/scope and all caller isolation
+ * and freeze premises live. Identity matching is not terminal/history,
+ * canonical transaction, semantic coverage, apply or release authority. */
+typedef struct ClusterColdCtrcPhysicalV1 {
+	uint32 count;
+	ClusterRecoveryUndoEntry entries[FLEXIBLE_ARRAY_MEMBER];
+} ClusterColdCtrcPhysicalV1;
+
 /* Borrow the original live cold inputs and their ROOT-selected isolated
  * namespace fd. The caller holds isolation, retention and these owners for
  * the entire cursor lifetime; this API establishes none of those premises.

@@ -713,6 +713,7 @@ struct ClusterRecoveryStartV1 {
 	ClusterWalInputsV1 *ctrc_observation_inputs;
 	ClusterRecoveryCensus *ctrc_observation_census;
 	ClusterRecoveryCensusManifest ctrc_observation_manifest;
+	ClusterColdCtrcPhysicalV1 *ctrc_physical;
 	char ctrc_observation_refusal[384];
 };
 static struct ClusterRecoveryStartV1 *cluster_recovery_cold_start;
@@ -729,6 +730,10 @@ cluster_recovery_cold_observation_close(struct ClusterRecoveryStartV1 *start)
 	start->ctrc_observation_census = NULL;
 	if (start->ctrc_observation_inputs != NULL)
 		cluster_wal_inputs_release_v1(&start->ctrc_observation_inputs);
+	if (start->ctrc_physical != NULL) {
+		pfree(start->ctrc_physical);
+		start->ctrc_physical = NULL;
+	}
 	if (start->ctrc_observation_work_copy != NULL) {
 		pfree(start->ctrc_observation_work_copy);
 		start->ctrc_observation_work_copy = NULL;
@@ -904,6 +909,8 @@ static bool
 cluster_recovery_cold_observation_work_current(const struct ClusterRecoveryStartV1 *start)
 {
 	return start->ctrc_observation_work_copy != NULL
+		&& start->ctrc_physical != NULL
+		&& start->ctrc_physical->count == start->ctrc_observation_work_copy->counts.subject_count
 		&& ClusterColdRecoveryCtrcWorkCurrent(start, start->ctrc_observation_work)
 		&& start->inputs->census_root_captured
 		&& memcmp(&start->inputs->census_root, &start->ctrc_observation_root,
@@ -927,6 +934,55 @@ cluster_recovery_cold_observation_current(const struct ClusterRecoveryStartV1 *s
 		&& cluster_recovery_ctrc_terminal_result_v1(start, start->ctrc_observation_work, &tx)
 		&& memcmp(&tx, &start->ctrc_observation_tx, sizeof(tx)) == 0
 		&& cluster_recovery_cold_observation_work_current(start);
+}
+
+/* One original TT_SLOT, including unrelated physical slots. Only the view
+ * is indexed by work; the full original census is never shortened. */
+static bool
+cluster_recovery_cold_observation_physical(struct ClusterRecoveryStartV1 *start,
+	const ClusterRecoveryUndoEntry *entry)
+{
+	const ClusterColdCtrcWorkV1 *work = start->ctrc_observation_work_copy;
+	uint32 found = UINT32_MAX;
+	uint8 *seen = (uint8 *)(start->ctrc_physical->entries + work->counts.subject_count);
+
+	for (uint32 i = 0; i < work->counts.subject_count; i++) {
+		const ClusterColdTtSlotInputV1 *subject = &work->entries[i];
+		const ClusterColdTtSlotKeyV1 *key = &subject->key;
+		if (key->owner_instance != entry->owner_instance || key->segment_id != entry->segment_id
+			|| key->slot_offset != entry->slot_offset)
+			continue;
+		if (found != UINT32_MAX || key->segment_generation != entry->segment_generation
+			|| key->xid != entry->slot.xid || key->slot_wrap != entry->slot.wrap
+			|| key->xid != subject->slot.xid || key->slot_wrap != subject->slot.wrap) {
+			cluster_recovery_cold_observation_refuse(start, "physical_identity", (int)i);
+			return false;
+		}
+		found = i;
+	}
+	if (found == UINT32_MAX)
+		return true;
+	if (seen[found]) {
+		cluster_recovery_cold_observation_refuse(start, "physical_duplicate", (int)found);
+		return false;
+	}
+	memcpy(&start->ctrc_physical->entries[found], entry, sizeof(*entry));
+	seen[found] = 1;
+	return true;
+}
+
+static bool
+cluster_recovery_cold_observation_physical_complete(struct ClusterRecoveryStartV1 *start)
+{
+	uint32 count = start->ctrc_observation_work_copy->counts.subject_count;
+	const uint8 *seen = (const uint8 *)(start->ctrc_physical->entries + count);
+
+	for (uint32 i = 0; i < count; i++)
+		if (!seen[i]) {
+			cluster_recovery_cold_observation_refuse(start, "physical_missing", (int)i);
+			return false;
+		}
+	return true;
 }
 
 bool
@@ -961,7 +1017,7 @@ ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size 
 				cluster_recovery_cold_observation_refuse(state, "revalidate", 0);
 		} else {
 			const ClusterColdCtrcWorkV1 *work = start->inputs->ctrc_work;
-			Size bytes = 0;
+			Size bytes = 0, physical_bytes = 0;
 			ClusterControlRootResult scope_result;
 			ClusterRecoveryCensusResult result;
 			ClusterRecoveryCensusEntry entry;
@@ -977,7 +1033,17 @@ ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size 
 				}
 				bytes = offsetof(ClusterColdCtrcWorkV1, entries)
 					+ (Size)work->counts.subject_count * sizeof(work->entries[0]);
-				if (memory_budget > MaxAllocSize || memory_budget <= bytes) {
+				/* One complete view plus one presence byte per original subject.
+				 * Reserve all storage before opening the original input scope. */
+				if (work->counts.subject_count > (MaxAllocSize - offsetof(ClusterColdCtrcPhysicalV1, entries))
+						/ (sizeof(ClusterRecoveryUndoEntry) + 1)) {
+					cluster_recovery_cold_observation_refuse(state, "physical_budget", 0);
+					break;
+				}
+				physical_bytes = offsetof(ClusterColdCtrcPhysicalV1, entries)
+					+ (Size)work->counts.subject_count * (sizeof(ClusterRecoveryUndoEntry) + 1);
+				if (memory_budget > MaxAllocSize || memory_budget <= bytes
+					|| physical_bytes >= memory_budget - bytes) {
 					cluster_recovery_cold_observation_refuse(state, "memory_budget", 0);
 					break;
 				}
@@ -991,6 +1057,13 @@ ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size 
 					break;
 				}
 				memcpy(state->ctrc_observation_work_copy, work, bytes);
+				state->ctrc_physical = MemoryContextAllocExtended(TopMemoryContext,
+					physical_bytes, MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+				if (state->ctrc_physical == NULL) {
+					cluster_recovery_cold_observation_refuse(state, "physical_allocation", 0);
+					break;
+				}
+				state->ctrc_physical->count = work->counts.subject_count;
 				if (!cluster_recovery_ctrc_terminal_result_v1(start, work, &tx)) {
 					cluster_recovery_cold_observation_refuse(state, "accepted_tx", 0);
 					break;
@@ -1007,7 +1080,7 @@ ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size 
 					break;
 				}
 				result = cluster_recovery_census_begin_ctrc(state->ctrc_observation_inputs,
-					memory_budget - bytes, &state->ctrc_observation_census);
+					memory_budget - bytes - physical_bytes, &state->ctrc_observation_census);
 				if (result != CLUSTER_RECOVERY_CENSUS_MORE) {
 					cluster_recovery_cold_observation_refuse(state, "census_begin", (int)result);
 					break;
@@ -1021,12 +1094,24 @@ ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size 
 					result = cluster_recovery_census_next(state->ctrc_observation_census, &entry);
 					/* Every original kind and phase is visited; no TT/target or
 					 * terminal filtering can shorten this complete observation. */
-					if (result == CLUSTER_RECOVERY_CENSUS_MORE || result == CLUSTER_RECOVERY_CENSUS_ENTRY)
+					if (result == CLUSTER_RECOVERY_CENSUS_ENTRY) {
+						if (!cluster_recovery_cold_observation_current(start)) {
+							cluster_recovery_cold_observation_refuse(state, "original_input_changed", 0);
+							break;
+						}
+						if (entry.kind == CLUSTER_RECOVERY_CENSUS_TT_SLOT
+							&& !cluster_recovery_cold_observation_physical(state, &entry.value.tt))
+							break;
+						continue;
+					}
+					if (result == CLUSTER_RECOVERY_CENSUS_MORE)
 						continue;
 					if (result != CLUSTER_RECOVERY_CENSUS_DRAINED) {
 						cluster_recovery_cold_observation_refuse(state, "census_next", (int)result);
 						break;
 					}
+					if (!cluster_recovery_cold_observation_physical_complete(state))
+						break;
 					if (!cluster_recovery_cold_observation_current(start)
 						|| !cluster_recovery_census_manifest(state->ctrc_observation_census,
 							&state->ctrc_observation_manifest)) {
@@ -1068,6 +1153,18 @@ ClusterColdRecoveryCtrcObservationRefusal(const struct ClusterRecoveryStartV1 *s
 	return start != NULL && start == cluster_recovery_cold_start
 		&& start->ctrc_observation_refusal[0] != '\0'
 		? start->ctrc_observation_refusal : "stage=original_owner";
+}
+
+const ClusterColdCtrcPhysicalV1 *
+ClusterColdRecoveryCtrcPhysical(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work)
+{
+	if (start == NULL || start != cluster_recovery_cold_start || CritSectionCount != 0
+		|| !start->ctrc_observation_complete || work != start->ctrc_observation_work)
+		return NULL;
+	/* Repeat observation only revalidates the same retained inputs/manifest;
+	 * budget0 cannot start a replacement scope or rebuild a refused view. */
+	return ClusterColdRecoveryCtrcObserve(start, 0) ? start->ctrc_physical : NULL;
 }
 
 bool
