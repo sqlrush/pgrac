@@ -8272,7 +8272,13 @@ test_cluster_active_sample_fence: test_cluster_active_sample_fence.c unit_test.h
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
 
+test_cluster_worker_pgproc_sample.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
+	@awk '/^ProcArrayGetActiveFullXidSample\(/ { print "bool"; emit=1; starts++ } \
+		emit { print } emit && /^}$$/ { emit=0 } \
+		END { if (emit || starts != 1) exit 1 }' $< > $@
+
 test_cluster_undo_cleaner_capacity: test_cluster_undo_cleaner_capacity.c test_cluster_undo_cleaner_holds.inc \
+		test_cluster_pgproc_active_types.inc test_cluster_worker_pgproc_sample.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c \
 		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \

@@ -32,6 +32,8 @@ static uint32 semantic_activation_local_inflight[2][64];
 #undef fprintf
 #include "unit_test.h"
 UT_DEFINE_GLOBALS();
+#include "access/twophase.h"
+#include "test_cluster_pgproc_active_types.inc"
 
 BackendType MyBackendType;
 PGPROC *MyProc;
@@ -79,6 +81,19 @@ static unsigned test_source_steps;
 static ClusterSemanticActiveSampleFence test_sample_source, test_first_source, test_last_source;
 static bool test_change_admission_after_n;
 static bool test_census_busy, test_census_invalid;
+static VariableCacheData native_variables;
+VariableCache ShmemVariableCache = &native_variables;
+static PROC_HDR native_procs;
+PROC_HDR *ProcGlobal = &native_procs;
+static char native_array_storage[offsetof(ProcArrayStruct, pgprocnos) + 4 * sizeof(int)]
+	pg_attribute_aligned(MAXIMUM_ALIGNOF);
+static ProcArrayStruct *procArray = (ProcArrayStruct *) native_array_storage;
+static PGPROC native_entries[4];
+static TransactionId native_xids[4];
+static LWLockPadded native_locks[NUM_INDIVIDUAL_LWLOCKS];
+LWLockPadded *MainLWLockArray = native_locks;
+static unsigned native_lock_phase;
+static bool native_custom;
 bool cluster_undo_record_segment_commit_on_rollover;
 int cluster_undo_cleaner_batch_segments = 8;
 
@@ -98,39 +113,28 @@ cluster_ctrc_cleaner_run_pass(void)
 	return test_ctrc_progress;
 }
 
-/* Original shared-array coverage is tested in test_cluster_ctrc_cleaner.
- * These boundary inputs test the actual outer pass's owner and cadence. */
-FullTransactionId
-ReadNextFullTransactionId(void)
+/* Recovery and stripe promises remain boundary facts; the native array scan
+ * below now runs from the exact original body in every outer-pass case. */
+bool
+RecoveryInProgress(void)
 {
-	if (test_lock_depth != 0)
-		abort();
-	test_reference_reads++;
-	return test_reference;
+	return false;
 }
 
-/* The actual native sampler is executed in test_cluster_pgproc_active_sample. */
 bool
-ProcArrayGetActiveFullXidSample(FullTransactionId *reference, FullTransactionId *future,
-								FullTransactionId *minimum, ClusterXidStripeSampleFence *fence)
+cluster_xid_stripe_sample_future(FullTransactionId reference, FullTransactionId *future,
+							   ClusterXidStripeSampleFence *fence)
 {
-	if (test_lock_depth != 0 || test_ctrc_passes <= test_pgproc_samples)
+	if (test_lock_depth != 1 || native_lock_phase != 1
+		|| !FullTransactionIdEquals(reference, test_reference))
 		abort();
-	test_pgproc_samples++;
 	MemSet(fence, 0, sizeof(*fence));
 	fence->incarnation = test_lease_identity;
-	*reference = ReadNextFullTransactionId();
-	if (test_change_admission_after_n)
-		test_sample_admission_identity++;
-	*future = FullTransactionIdIsValid(test_future) ? test_future : *reference;
-	*minimum = FullTransactionIdIsValid(test_pgproc_min) ? test_pgproc_min : *future;
-	if (test_pgproc_invalid) {
-		*reference = *future = *minimum = InvalidFullTransactionId;
-		MemSet(fence, 0, sizeof(*fence));
-		return false;
-	}
+	*future = FullTransactionIdIsValid(test_future) ? test_future : reference;
 	return true;
 }
+
+#include "test_cluster_worker_pgproc_sample.inc"
 
 /* The original stripe predicate is executed in test_cluster_xid_stripe_evidence.
  * Here the boundary enforces the same start token and no overlapping locks. */
@@ -358,10 +362,36 @@ LWLockInitialize(LWLock *lock, int tranche)
 }
 
 bool
-LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
 	if (test_lock_depth++ != 0)
 		abort();
+	if (lock == XidGenLock)
+	{
+		if (mode != LW_SHARED || test_ctrc_passes <= test_pgproc_samples)
+			abort();
+		native_lock_phase = 1;
+		test_pgproc_samples++;
+		test_reference_reads++;
+		native_variables.nextXid = test_reference;
+		if (!native_custom)
+		{
+			procArray->numProcs = 0;
+			if (FullTransactionIdIsValid(test_pgproc_min) || test_pgproc_invalid)
+			{
+				procArray->numProcs = 1;
+				native_xids[0] = test_pgproc_invalid ? 80 : XidFromFullTransactionId(test_pgproc_min);
+				pg_atomic_write_u64(&native_entries[0].cluster_top_full_xid_atomic,
+					test_pgproc_invalid ? 0 : U64FromFullTransactionId(test_pgproc_min));
+			}
+		}
+	}
+	else if (lock == ProcArrayLock)
+	{
+		if (mode != LW_SHARED || native_lock_phase != 2)
+			abort();
+		native_lock_phase = 3;
+	}
 	/* A contended bookkeeping LWLock also clears its wait event. */
 	if (test_lock_wait) {
 		pgstat_report_wait_start(PG_WAIT_LWLOCK);
@@ -371,10 +401,24 @@ LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_u
 }
 
 void
-LWLockRelease(LWLock *lock pg_attribute_unused())
+LWLockRelease(LWLock *lock)
 {
 	if (test_lock_depth-- != 1)
 		abort();
+	if (lock == XidGenLock)
+	{
+		if (native_lock_phase != 1)
+			abort();
+		native_lock_phase = 2;
+		if (test_change_admission_after_n)
+			test_sample_admission_identity++;
+	}
+	else if (lock == ProcArrayLock)
+	{
+		if (native_lock_phase != 3)
+			abort();
+		native_lock_phase = 4;
+	}
 }
 
 void
@@ -600,6 +644,21 @@ reset_wait_fixture(void)
 	test_census_begins = test_census_steps = test_reference_reads = test_pgproc_samples = 0;
 	test_pgproc_min = test_future = InvalidFullTransactionId;
 	test_pgproc_invalid = false;
+	MemSet(&native_variables, 0, sizeof(native_variables));
+	MemSet(&native_procs, 0, sizeof(native_procs));
+	MemSet(native_array_storage, 0, sizeof(native_array_storage));
+	MemSet(native_entries, 0, sizeof(native_entries));
+	MemSet(native_xids, 0, sizeof(native_xids));
+	procArray->maxProcs = lengthof(native_xids);
+	for (int i = 0; i < lengthof(native_xids); i++)
+	{
+		procArray->pgprocnos[i] = i;
+		pg_atomic_init_u64(&native_entries[i].cluster_top_full_xid_atomic, 0);
+	}
+	native_procs.xids = native_xids;
+	native_procs.allProcs = native_entries;
+	native_lock_phase = 0;
+	native_custom = false;
 	test_lease_current = test_sample_admission_current = true;
 	test_lease_identity = 31;
 	test_sample_admission_identity = 2;
@@ -1063,6 +1122,110 @@ UT_TEST(test_pgproc_and_future_are_captured_once_for_the_whole_census_round)
 				 U64FromFullTransactionId(test_pgproc_min));
 }
 
+UT_TEST(test_worker_retains_actual_native_prepared_minimum_after_source_exit)
+{
+	ClusterUndoCleanerActiveSample sample;
+	bool remaining;
+
+	reset_wait_fixture();
+	undo_cleaner_worker = 0;
+	native_custom = true;
+	procArray->numProcs = 3;
+	native_entries[0].pid = 1234;
+	native_entries[1].pid = 0; /* Prepared transaction dummy. */
+	native_entries[2].pid = 1235;
+	native_xids[0] = native_xids[1] = 80;
+	native_xids[2] = 90;
+	pg_atomic_write_u64(&native_entries[0].cluster_top_full_xid_atomic,
+					   U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(7, 80)));
+	pg_atomic_write_u64(&native_entries[1].cluster_top_full_xid_atomic,
+					   U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(7, 80)));
+	pg_atomic_write_u64(&native_entries[2].cluster_top_full_xid_atomic,
+					   U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(7, 90)));
+	test_future = FullTransactionIdFromEpochAndXid(7, 500);
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT_EQ(undo_cleaner_active_scan.status, CTRC_ACTIVE_SCAN_INCOMPLETE);
+	UT_ASSERT_EQ(XidFromFullTransactionId(undo_cleaner_active_scan.min_full), 80);
+	UT_ASSERT(!cluster_undo_cleaner_active_sample(&sample));
+	UT_ASSERT_EQ(native_lock_phase, 4);
+
+	/* Controlled source exit: the original prepared dummy remains published. */
+	native_xids[0] = InvalidTransactionId;
+	pg_atomic_write_u64(&native_entries[0].cluster_top_full_xid_atomic, 0);
+	test_reference = FullTransactionIdFromEpochAndXid(7, 200);
+	test_future = FullTransactionIdFromEpochAndXid(7, 700);
+	(void)undo_cleaner_run_pass(&remaining, false);
+	UT_ASSERT(cluster_undo_cleaner_active_sample(&sample));
+	UT_ASSERT(cluster_undo_cleaner_active_sample_current(&sample));
+	UT_ASSERT_EQ(sample.sample_id, 1);
+	UT_ASSERT_EQ(sample.scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(U64FromFullTransactionId(sample.scan.reference_full),
+				 U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(7, 100)));
+	UT_ASSERT_EQ(U64FromFullTransactionId(sample.scan.min_full),
+				 U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(7, 80)));
+	UT_ASSERT_EQ(XidFromFullTransactionId(sample.scan.future_full), 500);
+	UT_ASSERT_EQ(test_pgproc_samples, 1);
+	UT_ASSERT_EQ(test_census_begins, 1);
+	UT_ASSERT_EQ(test_census_steps, 2);
+	UT_ASSERT_EQ(test_ctrc_passes, 2);
+	UT_ASSERT_EQ(test_modifier_entries, 0);
+	UT_ASSERT_EQ(test_gc_passes, 0);
+}
+
+UT_TEST(test_worker_actual_unknown_prepared_identity_refuses_candidate)
+{
+	unsigned variant;
+
+	for (variant = 0; variant < 2; variant++)
+	{
+		ClusterUndoCleanerActiveSample sample;
+		bool remaining;
+
+		reset_wait_fixture();
+		undo_cleaner_worker = 0;
+		native_custom = true;
+		procArray->numProcs = 2;
+		native_entries[0].pid = 1234;
+		native_entries[1].pid = 0;
+		native_xids[0] = 80;
+		native_xids[1] = 81;
+		pg_atomic_write_u64(&native_entries[0].cluster_top_full_xid_atomic,
+						   U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(7, 80)));
+		pg_atomic_write_u64(&native_entries[1].cluster_top_full_xid_atomic,
+			variant == 0 ? 0 :
+			U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(7, 82)));
+		(void)undo_cleaner_run_pass(&remaining, false);
+		UT_ASSERT_EQ(undo_cleaner_active_scan.status, CTRC_ACTIVE_SCAN_INVALID);
+		UT_ASSERT_EQ(test_pgproc_samples, 1);
+		UT_ASSERT_EQ(test_census_begins, 0);
+		UT_ASSERT_EQ(test_census_steps, 0);
+		MemSet(&sample, 0xa5, sizeof(sample));
+		UT_ASSERT(!cluster_undo_cleaner_active_sample(&sample));
+		UT_ASSERT_EQ(sample.sample_id, 0);
+		UT_ASSERT_EQ(native_lock_phase, 4);
+
+		/* Remove the unknown input; only a fresh round may publish a sample. */
+		native_xids[1] = InvalidTransactionId;
+		pg_atomic_write_u64(&native_entries[1].cluster_top_full_xid_atomic, 0);
+		(void)undo_cleaner_run_pass(&remaining, false);
+		UT_ASSERT_EQ(undo_cleaner_active_scan.status, CTRC_ACTIVE_SCAN_INCOMPLETE);
+		UT_ASSERT(!cluster_undo_cleaner_active_sample(&sample));
+		(void)undo_cleaner_run_pass(&remaining, false);
+		UT_ASSERT(cluster_undo_cleaner_active_sample(&sample));
+		UT_ASSERT(cluster_undo_cleaner_active_sample_current(&sample));
+		UT_ASSERT_EQ(sample.sample_id, 1);
+		UT_ASSERT_EQ(U64FromFullTransactionId(sample.scan.min_full),
+			U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(7, 80)));
+		UT_ASSERT_EQ(test_pgproc_samples, 2);
+		UT_ASSERT_EQ(test_census_begins, 1);
+		UT_ASSERT_EQ(test_census_steps, 2);
+		UT_ASSERT_EQ(test_ctrc_passes, 3);
+		UT_ASSERT_EQ(test_modifier_entries, 0);
+		UT_ASSERT_EQ(test_gc_passes, 0);
+		UT_ASSERT_EQ(native_lock_phase, 4);
+	}
+}
+
 UT_TEST(test_changed_lease_cannot_complete_old_census_sample)
 {
 	bool remaining;
@@ -1383,7 +1546,7 @@ UT_TEST(test_worker_census_source_republication_discards_before_replacement)
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(28);
 	UT_RUN(test_capacity_wait_retries_signals_and_cadence_without_authorizing_free);
 	UT_RUN(test_capacity_sleep_reports_frontend_undo_event);
 	UT_RUN(test_capacity_sleep_restores_outer_event_on_normal_return);
@@ -1399,6 +1562,8 @@ main(void)
 	UT_RUN(test_census_has_one_worker_and_no_shutdown_or_disabled_continuation);
 	UT_RUN(test_census_invalid_sample_and_respawn_start_from_fresh_reference);
 	UT_RUN(test_pgproc_and_future_are_captured_once_for_the_whole_census_round);
+	UT_RUN(test_worker_retains_actual_native_prepared_minimum_after_source_exit);
+	UT_RUN(test_worker_actual_unknown_prepared_identity_refuses_candidate);
 	UT_RUN(test_changed_lease_cannot_complete_old_census_sample);
 	UT_RUN(test_closed_admission_cannot_start_native_census_sample);
 	UT_RUN(test_changed_admission_cannot_complete_old_census_sample);
