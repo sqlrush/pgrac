@@ -715,15 +715,28 @@ UT_TEST(test_v2_payload_cannot_assert_identity_or_special_xids)
 			bad.incarnation++;
 		if (i == 4)
 			bad.origin++;
-		if (i == 5)
-			bad.future_full_xid = UINT64CONST(0x200000001);
-		if (i == 6)
-			bad.active_full_xid_min = UINT64CONST(0x100000002);
-		if (i == 7)
-			bad.requested_full_xid = UINT64CONST(0x100000001);
 		if (i == 8)
 			bad.horizon_scn = bad.h_sample_clock_scn + 1;
-		receive_v2_report(&bad);
+		if (i >= 5 && i <= 7) {
+			static const unsigned offsets[] = {
+				CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_FUTURE_FULL_XID,
+				CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_ACTIVE_FULL_XID_MIN,
+				CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_REQUESTED_FULL_XID
+			};
+			static const uint64 values[] = {
+				UINT64CONST(0x200000001), UINT64CONST(0x100000002),
+				UINT64CONST(0x100000001)
+			};
+			uint8 bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES];
+			unsigned byte;
+
+			/* The encoder now rejects these; inject malformed wire bytes. */
+			UT_ASSERT(cluster_heap_freeze_report_v2_encode(&bad, bytes));
+			for (byte = 0; byte < 8; byte++)
+				bytes[offsets[i - 5] + byte] = (uint8)(values[i - 5] >> (8 * byte));
+			receive_horizon_bytes(bytes, sizeof(bytes));
+		} else
+			receive_v2_report(&bad);
 		UT_ASSERT(cluster_heap_freeze_report_v2_sample(1, &view));
 		UT_ASSERT_EQ(view.report.report_sequence, initial.report_sequence);
 	}

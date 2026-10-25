@@ -892,6 +892,85 @@ UT_TEST(freeze_report_v2_rejects_invalid_full_xid_window)
 	UT_ASSERT(cluster_heap_freeze_report_v2_encode(&input, bytes));
 }
 
+/* Exercise both codec boundaries without relying on a malformed header. */
+static void
+assert_freeze_report_v2_rejects_full_xid(unsigned field, uint64 value)
+{
+	static const unsigned offsets[] = {
+		CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_FUTURE_FULL_XID,
+		CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_ACTIVE_FULL_XID_MIN,
+		CLUSTER_HEAP_FREEZE_REPORT_V2_OFF_REQUESTED_FULL_XID
+	};
+	ClusterHeapFreezeReportV2 input = make_freeze_report_v2();
+	ClusterHeapFreezeReportV2 invalid;
+	ClusterHeapFreezeReportV2 output;
+	uint8 bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES];
+	uint8 before[CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES];
+	unsigned i;
+
+	input.future_full_xid = UINT64CONST(0x00000003000003e8);
+	input.active_full_xid_min = UINT64CONST(0x0000000100000003);
+	input.requested_full_xid = 0;
+	UT_ASSERT(field < lengthof(offsets));
+	UT_ASSERT(cluster_heap_freeze_report_v2_encode(&input, bytes));
+	memcpy(before, bytes, sizeof(before));
+	invalid = input;
+	if (field == 0)
+		invalid.future_full_xid = value;
+	else if (field == 1)
+		invalid.active_full_xid_min = value;
+	else
+		invalid.requested_full_xid = value;
+	UT_ASSERT(!cluster_heap_freeze_report_v2_encode(&invalid, bytes));
+	UT_ASSERT(memcmp(before, bytes, sizeof(bytes)) == 0);
+	for (i = 0; i < 8; i++)
+		bytes[offsets[field] + i] = (uint8)(value >> (8 * i));
+	output = input;
+	UT_ASSERT(!cluster_heap_freeze_report_v2_decode(bytes, sizeof(bytes), &output));
+	assert_freeze_report_v2_equal(&input, &output);
+}
+
+UT_TEST(freeze_report_v2_rejects_special_and_exhausted_required_full_xids)
+{
+	static const uint64 invalid[] = {
+		UINT64CONST(0x0000000200000001),
+		UINT64CONST(0x0000000200000002),
+		UINT64_MAX
+	};
+	unsigned field;
+	unsigned i;
+
+	for (field = 0; field < 2; field++)
+		for (i = 0; i < lengthof(invalid); i++)
+			assert_freeze_report_v2_rejects_full_xid(field, invalid[i]);
+}
+
+UT_TEST(freeze_report_v2_rejects_special_and_exhausted_requested_full_xid)
+{
+	assert_freeze_report_v2_rejects_full_xid(2, UINT64CONST(0x0000000200000001));
+	assert_freeze_report_v2_rejects_full_xid(2, UINT64CONST(0x0000000200000002));
+	assert_freeze_report_v2_rejects_full_xid(2, UINT64_MAX);
+}
+
+UT_TEST(freeze_report_v2_preserves_finite_normal_full_xid_boundaries)
+{
+	ClusterHeapFreezeReportV2 input = make_freeze_report_v2();
+	ClusterHeapFreezeReportV2 output;
+	uint8 bytes[CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES];
+
+	input.future_full_xid = UINT64_MAX - 1;
+	input.active_full_xid_min = FirstNormalTransactionId;
+	input.requested_full_xid = UINT64_MAX - 1;
+	UT_ASSERT(cluster_heap_freeze_report_v2_encode(&input, bytes));
+	UT_ASSERT(cluster_heap_freeze_report_v2_decode(bytes, sizeof(bytes), &output));
+	assert_freeze_report_v2_equal(&input, &output);
+	input.active_full_xid_min = UINT64CONST(0x0000000200000003);
+	input.requested_full_xid = 0;
+	UT_ASSERT(cluster_heap_freeze_report_v2_encode(&input, bytes));
+	UT_ASSERT(cluster_heap_freeze_report_v2_decode(bytes, sizeof(bytes), &output));
+	assert_freeze_report_v2_equal(&input, &output);
+}
+
 UT_TEST(freeze_report_v2_decode_rejects_invalid_payload)
 {
 	ClusterHeapFreezeReportV2 input = make_freeze_report_v2();
@@ -1195,7 +1274,7 @@ UT_TEST(observed_bounds_keep_fullxid_epoch_and_high_member_bit)
 int
 main(void)
 {
-	UT_PLAN(58);
+	UT_PLAN(61);
 	UT_RUN(observed_bounds_cap_policy_at_same_cohort_and_preserve_h_domain);
 	UT_RUN(observed_bounds_reproduces_original_fixed_cohort_h_minimum);
 	UT_RUN(observed_bounds_rejects_changed_or_missing_original_h_atomically);
@@ -1254,6 +1333,9 @@ main(void)
 	UT_RUN(freeze_report_v2_rejects_missing_identity_and_sample);
 	UT_RUN(freeze_report_v2_rejects_invalid_full_xid_window);
 	UT_RUN(freeze_report_v2_decode_rejects_invalid_payload);
+	UT_RUN(freeze_report_v2_rejects_special_and_exhausted_required_full_xids);
+	UT_RUN(freeze_report_v2_rejects_special_and_exhausted_requested_full_xid);
+	UT_RUN(freeze_report_v2_preserves_finite_normal_full_xid_boundaries);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
