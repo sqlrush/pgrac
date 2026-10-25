@@ -20,6 +20,7 @@
 #include "../../backend/cluster/cluster_wal_claim.c"
 #include "cluster/cluster_lock_acquire.h"
 #include "test_cluster_relmap_native_lock.h"
+#include "test_cluster_relmap_physical_pair.h"
 
 #undef printf
 #undef fprintf
@@ -101,6 +102,7 @@ static void (*v2_send_observer)(const SharedInvalidationMessage *, int);
 static ClusterSinvalAckResult (*v2_ack_observer)(const SharedInvalidationMessage *, int);
 static void (*v2_unlock_observer)(void);
 static bool v2_native_lock_active;
+static ClusterRelmapV2ClearResult (*v2_terminal_observer)(const ClusterRelmapV2Image *, bool);
 static bool v2_postcommit_error_stack;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
@@ -1093,11 +1095,15 @@ UT_TEST(unarmed_commit_preserves_other_writers_pending_and_global_lock)
 #include "test_cluster_relmap_unarmed.inc"
 #include "test_cluster_relmap_precommit.inc"
 #include "test_cluster_relmap_native_lock.inc"
+#include "test_cluster_relmap_physical_pair.inc"
 
 int
 main(void)
 {
-	UT_PLAN(57);
+	UT_PLAN(60);
+	UT_RUN(v2_physical_pairs_finish_before_notification_and_unlock);
+	UT_RUN(v2_physical_stage_sync_refusal_keeps_original_batch);
+	UT_RUN(v2_physical_second_finish_refusal_keeps_all_custody);
 	UT_RUN(v2_native_lock_batch_finishes_before_original_release);
 	UT_RUN(v2_native_lock_release_refusal_retains_original_custody);
 	UT_RUN(v2_native_lock_refusals_do_not_enter_release);
