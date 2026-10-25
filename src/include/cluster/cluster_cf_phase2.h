@@ -44,6 +44,7 @@
 #ifndef CLUSTER_CF_PHASE2_H
 #define CLUSTER_CF_PHASE2_H
 
+#include "datatype/timestamp.h"
 #include "port/pg_crc32c.h"
 
 /* Subdirectory under the shared global/ dir holding the probe/ack files. */
@@ -112,6 +113,14 @@ extern bool cluster_cf_phase2_rendezvous(const char *shared_dir, int self_id, in
  * unverified so the role gate fails closed.
  */
 extern void cluster_cf_phase2_verify_or_fail(const char *pgdata);
+
+/* Original postmaster phase-3 owner, after CSSD/quorum readiness and before
+ * formation/recovery authority: finish a missing early proof with fresh
+ * original rounds bounded by both the CF timeout and its existing deadline.
+ * True requires an exact current ACK and successful original contract update;
+ * an expired/absent/wrong ACK or persistence failure cannot complete it.
+ * Authority-off/disabled/single-node needs no cross-node proof. */
+extern bool cluster_cf_phase2_verify_pending(const char *pgdata, TimestampTz deadline);
 
 /*
  * cluster_cf_phase2_peer_verified -- did this bootstrap's Phase-2 rendezvous

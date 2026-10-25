@@ -2410,6 +2410,20 @@ phase_3_handler(PhaseRunFailContext *fail_ctx)
 		return PHASE_RUN_FATAL;
 	}
 
+	/* A successful peer can leave its own rendezvous before our early probe
+	 * appears. Its CSSD responder then finishes that exchange too late for
+	 * the expired round. The original PM must finish a fresh qualification
+	 * within this same phase budget, before waiting for formation that itself
+	 * requires the local contract. No persisted flag replaces fresh proof. */
+	if (cluster_phase4_wal_state_configured() && !cluster_cf_phase2_peer_verified()
+		&& !cluster_cf_phase2_verify_pending(DataDir, phase3_recovery_deadline)) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE;
+		fail_ctx->errmsg = "cluster phase 3: fresh cross-node storage contract did not complete";
+		fail_ctx->errhint = "Verify the configured peer's exact storage probe response and local "
+							"contract persistence; recovery authority remains closed.";
+		return PHASE_RUN_FATAL;
+	}
+
 establish_recovery_authority:
 	if (cluster_phase4_wal_state_configured())
 		elog(LOG, "cluster phase 3: recovery quorum established; checking live formation witness");

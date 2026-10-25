@@ -543,6 +543,10 @@ static int phase_test_live_formation_calls = 0;
 static int phase_test_recovery_control_formation_calls = 0;
 static bool phase_test_live_refreshes_classification = false;
 static bool phase_test_cf_peer_verified = false;
+static bool phase_test_cf_pending_ok = true;
+static unsigned phase_test_cf_pending_calls;
+static TimestampTz phase_test_cf_pending_deadline;
+static char phase_test_cf_pending_events[256];
 static bool phase_test_epoch0_late_founder_evidence = false;
 static bool phase_test_late_founder_after_grd_barrier = false;
 static bool phase_test_publish_recovery_after_grd_barrier = false;
@@ -1093,6 +1097,16 @@ void
 cluster_cf_phase2_verify_or_fail(const char *datadir pg_attribute_unused())
 {}
 
+bool cluster_cf_phase2_verify_pending(const char *datadir, TimestampTz deadline);
+bool
+cluster_cf_phase2_verify_pending(const char *datadir pg_attribute_unused(), TimestampTz deadline)
+{
+	phase_test_cf_pending_calls++;
+	phase_test_cf_pending_deadline = deadline;
+	strlcpy(phase_test_cf_pending_events, phase4_events, sizeof(phase_test_cf_pending_events));
+	return phase_test_cf_pending_ok;
+}
+
 bool
 cluster_cf_phase2_peer_verified(void)
 {
@@ -1212,6 +1226,10 @@ reset_phase_service_fixture(bool formed_registry)
 	phase_test_recovery_control_formation_calls = 0;
 	phase_test_live_refreshes_classification = false;
 	phase_test_cf_peer_verified = false;
+	phase_test_cf_pending_ok = true;
+	phase_test_cf_pending_calls = 0;
+	phase_test_cf_pending_deadline = 0;
+	phase_test_cf_pending_events[0] = '\0';
 	phase_test_epoch0_late_founder_evidence = false;
 	phase_test_late_founder_after_grd_barrier = false;
 	phase_test_publish_recovery_after_grd_barrier = false;
@@ -1716,6 +1734,45 @@ UT_TEST(test_rf_a1_phase3_establishes_formation_and_phase4_does_not_respawn)
 	UT_ASSERT_EQ(phase_test_live_formation_calls, 1);
 	UT_ASSERT_EQ((int)cluster_authority_readiness_get(), (int)CLUSTER_AUTHORITY_SERVING_READY);
 	UT_ASSERT(cluster_serving_ready_is_current());
+}
+
+UT_TEST(test_phase3_missing_storage_proof_finishes_after_quorum_before_formation)
+{
+	reset_phase_service_fixture(true);
+	cluster_run_startup_sequence();
+	UT_ASSERT_EQ(phase_test_cf_pending_calls, 1);
+	UT_ASSERT_STR_EQ(phase_test_cf_pending_events, "CcQqV");
+	UT_ASSERT(phase_test_cf_pending_deadline > 0);
+	UT_ASSERT_EQ(phase_test_recovery_control_formation_calls, 1);
+	UT_ASSERT_EQ(phase_test_lms_start_calls, 1);
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(), (int)CLUSTER_AUTHORITY_RECOVERY_READY);
+	/* The original successful early proof must keep its existing fast path. */
+	reset_phase_service_fixture(true);
+	phase_test_cf_peer_verified = true;
+	cluster_run_startup_sequence();
+	UT_ASSERT_EQ(phase_test_cf_pending_calls, 0);
+	UT_ASSERT_EQ(phase_test_recovery_control_formation_calls, 1);
+}
+
+UT_TEST(test_phase3_missing_storage_proof_cannot_reach_recovery_authority)
+{
+	bool caught_fatal = false;
+
+	reset_phase_service_fixture(true);
+	phase_test_cf_pending_ok = false;
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		cluster_run_startup_sequence();
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+	UT_ASSERT(caught_fatal);
+	UT_ASSERT_EQ(phase4_last_sqlstate, ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE);
+	UT_ASSERT_EQ(phase_test_cf_pending_calls, 1);
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqV");
+	UT_ASSERT_EQ(phase_test_recovery_control_formation_calls, 0);
+	UT_ASSERT_EQ(phase_test_lms_start_calls, 0);
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(), (int)CLUSTER_AUTHORITY_OFF);
 }
 
 UT_TEST(test_phase3_join_readonly_defers_authority_until_post_startup_admission)
@@ -3164,7 +3221,7 @@ UT_TEST(test_nonshared_phase4_keeps_original_activation_entry)
 int
 main(void)
 {
-	UT_PLAN(65);
+	UT_PLAN(67);
 	UT_RUN(test_join_readonly_wait_does_not_publish_or_repeat_startup);
 	UT_RUN(test_phase_callbacks_and_public_terminal_entries_publish_once);
 	UT_RUN(test_phase_exit_error_does_not_leave_partial_publication);
@@ -3197,6 +3254,8 @@ main(void)
 	UT_RUN(test_phase_shmem_register_init_linkable);
 	UT_RUN(test_rf_a1_no_pgproc_phase_reads_never_block);
 	UT_RUN(test_rf_a1_phase3_establishes_formation_and_phase4_does_not_respawn);
+	UT_RUN(test_phase3_missing_storage_proof_finishes_after_quorum_before_formation);
+	UT_RUN(test_phase3_missing_storage_proof_cannot_reach_recovery_authority);
 	UT_RUN(test_phase3_join_readonly_defers_authority_until_post_startup_admission);
 	UT_RUN(test_phase3_joining_without_exact_peer_active_stays_recovery_control);
 	UT_RUN(test_phase3_epoch0_late_founder_defers_only_with_exact_current_evidence);

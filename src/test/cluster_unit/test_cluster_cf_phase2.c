@@ -80,6 +80,29 @@ static ClusterCfContractState contract_state;
 static char trace_message[2048];
 static TimestampTz clock_now = 1;
 static int64 clock_step;
+static bool virtual_sleep, sequential_random;
+static TimestampTz responder_at;
+static int virtual_responder_node = -1;
+
+/* Only the new pending-owner cases control time. The responder still uses
+ * the production probe/ACK I/O and tuple checks against the real temp dir. */
+void
+pg_usleep(long microsec)
+{
+	int saved_node;
+
+	if (!virtual_sleep) {
+		usleep(microsec);
+		return;
+	}
+	clock_now += microsec;
+	if (virtual_responder_node < 0 || clock_now < responder_at)
+		return;
+	saved_node = cluster_node_id;
+	cluster_node_id = virtual_responder_node;
+	cluster_cf_phase2_respond_tick();
+	cluster_node_id = saved_node;
+}
 
 /* ---- Assert + ereport + fd.c stubs (same pattern as the storage test) ---- */
 void
@@ -248,6 +271,11 @@ pg_strong_random(void *buf, size_t len)
 	if (!random_ok)
 		return false;
 	memset(buf, random_zero ? 0 : 0x5a, len);
+	if (sequential_random && len == sizeof(uint64)) {
+		uint64 nonce = UINT64CONST(0x5a5a5a5a5a5a5a5a) + random_calls;
+
+		memcpy(buf, &nonce, sizeof(nonce));
+	}
 	return true;
 }
 
@@ -655,6 +683,8 @@ prepare_verify_case(bool trace)
 	clock_now = 1;
 	clock_step = 0;
 	trace_message[0] = '\0';
+	virtual_sleep = sequential_random = false;
+	virtual_responder_node = -1;
 }
 
 static void
@@ -818,10 +848,111 @@ UT_TEST(test_verify_trace_no_extra_IO_or_polls_and_errno_preserved)
 	UT_ASSERT_EQ(errno, original_errno);
 }
 
+static void
+prepare_pending_case(void)
+{
+	prepare_verify_case(true);
+	virtual_sleep = sequential_random = true;
+	cluster_cf_enqueue_timeout_ms = 1000;
+}
+
+UT_TEST(test_pending_owner_finishes_fresh_round_after_early_ack_deadline)
+{
+	ClusterCfPhase2RecordV2 expired, current;
+	TimestampTz deadline;
+
+	prepare_pending_case();
+	virtual_responder_node = 0;
+	responder_at = clock_now + 2200000;
+	deadline = clock_now + 5000000;
+	cluster_cf_phase2_verify_or_fail(shared_root);
+	UT_ASSERT_EQ(contract_calls, 0);
+	UT_ASSERT(strstr(trace_message, "reason=ack_deadline") != NULL);
+	UT_ASSERT(cluster_cf_phase2_read_probe(shared_root, 2, &expired));
+	/* The expired round's eventual ACK cannot complete a new fresh round. */
+	UT_ASSERT(cluster_cf_phase2_write_ack(shared_root, 2, 0, expired.probe_nonce));
+	UT_ASSERT(cluster_cf_phase2_verify_pending(shared_root, deadline));
+	UT_ASSERT_EQ(contract_calls, 1);
+	UT_ASSERT_EQ(contract_state, CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED);
+	UT_ASSERT(random_calls >= 3);
+	UT_ASSERT(cluster_cf_phase2_read_probe(shared_root, 2, &current));
+	UT_ASSERT(current.probe_nonce != expired.probe_nonce);
+	UT_ASSERT(cluster_cf_phase2_read_exact_ack(shared_root, 2, 0, current.probe_nonce));
+	UT_ASSERT(clock_now < deadline);
+}
+
+UT_TEST(test_pending_owner_wrong_peer_and_old_ack_cannot_complete)
+{
+	TimestampTz deadline;
+
+	prepare_pending_case();
+	seed_verify_ack(); /* old nonce, though its selected peer is correct */
+	virtual_responder_node = 1; /* current nonce, but not selected peer0 */
+	responder_at = clock_now;
+	deadline = clock_now + 2500000;
+	UT_ASSERT(!cluster_cf_phase2_verify_pending(shared_root, deadline));
+	UT_ASSERT_EQ(contract_calls, 0);
+	UT_ASSERT(clock_now >= deadline);
+	UT_ASSERT(strstr(trace_message, "reason=ack_deadline") != NULL);
+}
+
+UT_TEST(test_pending_owner_clips_round_to_existing_phase_deadline)
+{
+	TimestampTz deadline;
+
+	prepare_pending_case();
+	cluster_cf_enqueue_timeout_ms = 30000;
+	deadline = clock_now + 350000;
+	UT_ASSERT(!cluster_cf_phase2_verify_pending(shared_root, deadline));
+	UT_ASSERT_EQ(random_calls, 1);
+	UT_ASSERT_EQ(contract_calls, 0);
+	UT_ASSERT(strstr(trace_message, "timeout_ms=350") != NULL);
+	UT_ASSERT(clock_now >= deadline);
+	/* Original100ms polling may cross the cut, but cannot start another round. */
+	UT_ASSERT(clock_now - deadline < 100000);
+	UT_ASSERT(!cluster_cf_phase2_verify_pending(shared_root, deadline));
+	UT_ASSERT_EQ(random_calls, 1);
+}
+
+UT_TEST(test_pending_owner_requires_actual_contract_persistence)
+{
+	prepare_pending_case();
+	virtual_responder_node = 0;
+	responder_at = clock_now;
+	contract_ok = false;
+	UT_ASSERT(!cluster_cf_phase2_verify_pending(shared_root, clock_now + 450000));
+	UT_ASSERT(contract_calls > 0);
+	UT_ASSERT(strstr(trace_message, "contract_updated=0") != NULL);
+}
+
+UT_TEST(test_pending_owner_noop_gates_and_unavailable_nonce_stay_bounded)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		prepare_pending_case();
+		if (fault == 0)
+			cluster_controlfile_shared_authority = false;
+		else if (fault == 1)
+			cluster_enabled = false;
+		else if (fault == 2)
+			configure_nodes(1);
+		else if (fault == 3)
+			random_ok = false;
+		else
+			cluster_cf_enqueue_timeout_ms = 0;
+		UT_ASSERT_EQ(cluster_cf_phase2_verify_pending(shared_root, clock_now + 250000), fault < 3);
+		UT_ASSERT_EQ(contract_calls, 0);
+		UT_ASSERT_EQ(open_calls, 0);
+		if (fault < 3 || fault == 4)
+			UT_ASSERT_EQ(random_calls, 0);
+		else
+			UT_ASSERT(random_calls > 0 && random_calls <= 3);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(23);
 	UT_RUN(test_probe_ack_roundtrip);
 	UT_RUN(test_four_responders_publish_distinct_exact_acks);
 	UT_RUN(test_nonselected_responder_cannot_complete_rendezvous);
@@ -840,6 +971,11 @@ main(void)
 	UT_RUN(test_verify_trace_original_success_and_contract_update);
 	UT_RUN(test_verify_trace_contract_update_failure_does_not_change_behavior);
 	UT_RUN(test_verify_trace_no_extra_IO_or_polls_and_errno_preserved);
+	UT_RUN(test_pending_owner_finishes_fresh_round_after_early_ack_deadline);
+	UT_RUN(test_pending_owner_wrong_peer_and_old_ack_cannot_complete);
+	UT_RUN(test_pending_owner_clips_round_to_existing_phase_deadline);
+	UT_RUN(test_pending_owner_requires_actual_contract_persistence);
+	UT_RUN(test_pending_owner_noop_gates_and_unavailable_nonce_stay_bounded);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;
