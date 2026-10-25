@@ -45,6 +45,7 @@ UT_DEFINE_GLOBALS();
 bool cluster_enabled;
 bool cluster_xid_striping;
 bool cluster_shared_catalog;
+bool cluster_shared_config;
 int cluster_node_id;
 int cluster_xid_herding_slack = 4194304;
 static uint64 local_next = 2052;
@@ -351,6 +352,12 @@ cluster_voting_disk_write_raw_slot_at(int fd, off_t offset, const void *bytes)
 }
 
 #include "test_cluster_xid_stripe_evidence.inc"
+
+/* The original policy predicate now consumes the original stripe-current
+ * implementation already compiled above; no bool fence stub intervenes. */
+#define cluster_heap_freeze_policy_sample_current_v1 actual_saved_policy_current
+#include "test_cluster_heap_freeze_policy_current.inc"
+#undef cluster_heap_freeze_policy_sample_current_v1
 #include "test_cluster_xid_stripe_active.inc"
 
 static ClusterXidStripeSlotRecord rows[3];
@@ -428,7 +435,7 @@ reset_lease(void)
 	outside_qvotec = false;
 	xid_lock_held = true;
 	change_inc_on_release = false;
-	in_quorum = cluster_enabled = cluster_shared_catalog = cluster_xid_striping = true;
+	in_quorum = cluster_enabled = cluster_shared_catalog = cluster_shared_config = cluster_xid_striping = true;
 	cluster_node_id = 4;
 	allowed_writes = 3;
 	writes = premature_grants = wakeups = 0;
@@ -1908,6 +1915,85 @@ UT_TEST(active_sample_does_not_turn_old_cut_into_current_authority)
 	}
 }
 
+/* This constructs a candidate from the original sampler, not a new F or
+ * retention certificate. Only these source-current composition groups use it. */
+static void
+original_policy_from_real_stripe(ClusterHeapFreezePolicySampleV1 *sample)
+{
+	FullTransactionId future;
+
+	prepare_future_lease();
+	outside_qvotec = true;
+	UT_ASSERT(cluster_xid_stripe_sample_future(FullTransactionIdFromU64(local_next),
+		&future, &sample_fence));
+	memset(sample, 0, sizeof(*sample));
+	sample->legal_next = sample->freeze_limit = future;
+	sample->allocation_fence = sample_fence;
+	/* The original source-current contract does not require XidGenLock. */
+	xid_lock_held = false;
+}
+
+UT_TEST(original_policy_current_keeps_real_lease_across_original_renewal)
+{
+	ClusterHeapFreezePolicySampleV1 sample, before;
+	unsigned writes_before;
+
+	original_policy_from_real_stripe(&sample); before = sample;
+	writes_before = writes;
+	UT_ASSERT(actual_saved_policy_current(&sample));
+	UT_ASSERT_EQ(writes, writes_before);
+	outside_qvotec = false; writes = 0;
+	stripe_lease_tick(disks, 3, sample.allocation_fence.lease_limit_full);
+	UT_ASSERT(pg_atomic_read_u64(&lease.limit_full) > sample.allocation_fence.lease_limit_full);
+	writes_before = writes;
+	UT_ASSERT(actual_saved_policy_current(&sample));
+	UT_ASSERT_EQ(writes, writes_before);
+	UT_ASSERT(memcmp(&sample, &before, sizeof(sample)) == 0);
+	UT_ASSERT(!xid_lock_held && !exclusive_lock);
+}
+
+UT_TEST(original_policy_current_refuses_revoked_real_source_without_mutation)
+{
+	for (int fault = 0; fault < 11; fault++) {
+		ClusterHeapFreezePolicySampleV1 sample, before;
+		unsigned writes_before;
+
+		original_policy_from_real_stripe(&sample); before = sample;
+		switch (fault) {
+		case 0: incarnation++; break;
+		case 1: in_quorum = false; break;
+		case 2: pg_atomic_write_u32(&lease.failed, 1); break;
+		case 3: pg_atomic_write_u64(&lease.limit_full, 0); break;
+		case 4: pg_atomic_write_u64(&lease.floor_full, sample.allocation_fence.lease_floor_full + 16); break;
+		case 5: pg_atomic_write_u64(&lease.published_incarnation, incarnation + 1); break;
+		case 6: boot.generation++; break;
+		case 7: boot.my_slot_claimed = false; break;
+		case 8: boot.my_owner_incarnation++; break;
+		case 9: boot.floor_full++; break;
+		case 10: pg_atomic_write_u64(&lease.limit_full, sample.allocation_fence.lease_limit_full - 1); break;
+		}
+		writes_before = writes;
+		UT_ASSERT(!actual_saved_policy_current(&sample));
+		UT_ASSERT_EQ(writes, writes_before);
+		UT_ASSERT(memcmp(&sample, &before, sizeof(sample)) == 0);
+		UT_ASSERT(!xid_lock_held && !exclusive_lock);
+	}
+}
+
+UT_TEST(original_policy_current_cannot_replace_captured_fence_with_valid_numbers)
+{
+	ClusterHeapFreezePolicySampleV1 sample, before;
+	unsigned writes_before;
+
+	original_policy_from_real_stripe(&sample);
+	memset(&sample.allocation_fence, 0, sizeof(sample.allocation_fence));
+	before = sample; writes_before = writes;
+	UT_ASSERT(!actual_saved_policy_current(&sample));
+	UT_ASSERT_EQ(writes, writes_before);
+	UT_ASSERT(memcmp(&sample, &before, sizeof(sample)) == 0);
+	UT_ASSERT(!xid_lock_held && !exclusive_lock);
+}
+
 int
 main(void)
 {
@@ -1917,7 +2003,10 @@ main(void)
 		if (disks[i] < 0 || unlink(path) != 0)
 			abort();
 	}
-	UT_PLAN(48);
+	UT_PLAN(51);
+	UT_RUN(original_policy_current_keeps_real_lease_across_original_renewal);
+	UT_RUN(original_policy_current_refuses_revoked_real_source_without_mutation);
+	UT_RUN(original_policy_current_cannot_replace_captured_fence_with_valid_numbers);
 	UT_RUN(coherent_tracking_and_retirement_choose_latest);
 	UT_RUN(equal_generation_disagreement_refuses_in_either_order);
 	UT_RUN(newer_record_cannot_replace_claim_identity);

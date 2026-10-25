@@ -109,6 +109,7 @@ struct ClusterWalRootPublishGuard {
 
 struct ClusterWalReadPinV1 {
 	uint32 magic;
+	uint64 generation;
 	int32 owner_pid;
 	ResourceOwner owner;
 	uint16 nthreads;
@@ -118,6 +119,8 @@ struct ClusterWalReadPinV1 {
 
 static ClusterWalRetentionPin *active_pin;
 static ClusterWalReadPinV1 *active_read_pin;
+/* Process-local incarnation only; never wrap or reuse one for a new grant set. */
+static uint64 read_pin_generation;
 static ClusterWalRootPublishGuard *active_root_publish_guard;
 static ClusterWalReuseActionGuard *active_reuse_guard;
 static ClusterWalRetentionE1Context *active_e1_context;
@@ -1185,7 +1188,7 @@ static bool
 read_pin_valid(const ClusterWalReadPinV1 *pin)
 {
 	return pin != NULL && pin == active_read_pin && pin->magic == CLUSTER_WAL_READ_PIN_MAGIC
-		   && pin->owner_pid == MyProcPid && CurrentResourceOwner != NULL
+		   && pin->generation != 0 && pin->owner_pid == MyProcPid && CurrentResourceOwner != NULL
 		   && pin->owner == CurrentResourceOwner && pin->nthreads > 0
 		   && pin->nthreads <= CLUSTER_WAL_RETENTION_MAX_THREADS;
 }
@@ -1208,6 +1211,38 @@ cluster_wal_read_pin_covers_v1(ClusterWalReadPinV1 *pin, uint16 thread)
 			found = true;
 	}
 	return found;
+}
+
+/* Preserve the entire native owner, including retained read-only sources.
+ * No allocation, lock acquisition, ROOT access or recovery permission here. */
+bool
+cluster_wal_read_pin_owner_v1(ClusterWalReadPinV1 *pin, ClusterWalReadPinOwnerV1 *out)
+{
+	ClusterWalReadPinOwnerV1 owner;
+	Size bytes;
+	uintptr_t a = (uintptr_t)out, b = (uintptr_t)pin;
+
+	if (!read_pin_valid(pin) || out == NULL)
+		return false;
+	bytes = offsetof(ClusterWalReadPinV1, locks) + (Size)pin->nthreads * sizeof(ClusterWalPinLock);
+	if (!(a <= b ? b - a >= sizeof(*out) : a - b >= bytes)
+		|| !cluster_wal_read_pin_covers_v1(pin, pin->locks[0].request.resid.field1))
+		return false;
+	memset(&owner, 0, sizeof(owner));
+	owner.pin = pin;
+	owner.generation = pin->generation;
+	*out = owner;
+	return true;
+}
+
+bool
+cluster_wal_read_pin_owner_current_v1(const ClusterWalReadPinOwnerV1 *owner)
+{
+	/* Locate the active allocation and its incarnation before reading any
+	 * child of a released pin, even if an allocator reused its address. */
+	return owner != NULL && read_pin_valid(owner->pin)
+		&& owner->generation == owner->pin->generation
+		&& cluster_wal_read_pin_covers_v1(owner->pin, owner->pin->locks[0].request.resid.field1);
 }
 
 ClusterWalrReleaseResult
@@ -1289,10 +1324,13 @@ cluster_wal_read_pin_acquire_v1(const uint16 *threads, uint16 nthreads, ClusterW
 		if (threads[i] == 0 || threads[i] > CLUSTER_WAL_RETENTION_MAX_THREADS
 			|| (i > 0 && threads[i - 1] >= threads[i]))
 			return CLUSTER_WAL_PIN_INVALID;
+	if (read_pin_generation == UINT64_MAX)
+		return CLUSTER_WAL_PIN_UNAVAILABLE;
 	walr_resource_ensure_callback();
 	pin = palloc0(offsetof(ClusterWalReadPinV1, locks)
 				  + (Size)nthreads * sizeof(ClusterWalPinLock));
 	pin->magic = CLUSTER_WAL_READ_PIN_MAGIC;
+	pin->generation = ++read_pin_generation;
 	pin->owner_pid = MyProcPid;
 	pin->owner = CurrentResourceOwner;
 	pin->nthreads = nthreads;

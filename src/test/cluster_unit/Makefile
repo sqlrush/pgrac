@@ -598,6 +598,10 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		test_cluster_relmap_abort.inc \
 		test_cluster_relmap_unarmed.inc \
 		test_cluster_relmap_precommit.inc \
+		test_cluster_relmap_native_lock.inc test_cluster_relmap_native_lock.h \
+		test_cluster_relmap_native_lock.o \
+		test_cluster_relmap_physical_pair.inc test_cluster_relmap_physical_pair.h \
+		test_cluster_relmap_physical_pair.o \
 		$(top_srcdir)/src/backend/utils/cache/relmapper.c \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
@@ -611,9 +615,27 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		test_cluster_relmap_v2_codec_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		test_cluster_relmap_native_lock.o \
+		test_cluster_relmap_physical_pair.o \
 		test_cluster_relmap_v2_codec_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+test_cluster_relmap_native_lock.o: test_cluster_relmap_native_lock.c \
+		test_cluster_relmap_native_lock.h \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_lock.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_lock.h \
+		$(top_srcdir)/src/include/cluster/cluster_lock_acquire.h \
+		$(top_srcdir)/src/include/cluster/cluster_guc.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_relmap_physical_pair.o: test_cluster_relmap_physical_pair.c \
+		test_cluster_relmap_physical_pair.h \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_authority.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
 		test_cluster_relmap_census_recovery.inc \
@@ -2410,6 +2432,13 @@ test_cluster_heap_maintenance_identity.inc: $(top_srcdir)/src/backend/access/hea
 	mv $@.tmp $@
 
 # Execute original census ingress invalidation with the native freeze/WAL continuation.
+# Original source-current predicate, private to the native writer fixture.
+test_cluster_heap_freeze_policy_current.inc: $(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c Makefile
+	@awk '/^cluster_heap_freeze_policy_sample_current_v1\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_ctrc_registration.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
 	awk '/^ctrc_note_unqualified_registration\(/ { print "static void"; emit=1; found++ } \
 	     /^cluster_ctrc_active_scan_registration_current\(/ { print "bool"; emit=1; found++ } \
@@ -2418,6 +2447,8 @@ test_cluster_heap_ctrc_registration.inc: $(top_srcdir)/src/backend/cluster/clust
 
 test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_ctrc_registration.inc \
+		test_cluster_heap_freeze_policy_current.inc \
+		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
 		test_cluster_vacuum_observed_bounds.inc test_cluster_freeze_writer_context.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) test_cluster_heap_maintenance_policy.inc unit_test.h \
 		test_cluster_heap_borrowed_pin.inc $(top_srcdir)/src/include/storage/bufmgr.h \
 		test_cluster_vacuum_freeze_locators.inc \
@@ -3910,6 +3941,7 @@ WAL_INPUT_CONTRIBUTION_TEST_OBJS = $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
 # Observe only the claim-call boundary; the input owner and claim reader both
 # execute their production implementations.
 test_cluster_wal_inputs_product.o: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c \
+		$(top_srcdir)/src/include/cluster/cluster_wal_retention.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
 		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
@@ -5768,7 +5800,8 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_prune_version.inc test_cluster_heap_prune_helpers.inc \
 		test_cluster_heap_freeze_body.inc test_cluster_heap_freeze_helpers.inc \
 		test_cluster_heap_freeze_apply.inc test_cluster_heap_freeze_redo.inc test_cluster_heap_vacuum_version.inc \
-		test_cluster_heap_freeze_xmin_apply.inc
+		test_cluster_heap_freeze_xmin_apply.inc \
+		test_cluster_heap_freeze_policy_current.inc test_cluster_heap_freeze_policy_current.inc.tmp
 	rm -f test_cluster_space_cache_insert.inc test_cluster_space_cache_delete.inc test_cluster_space_cache_allocation.inc test_cluster_space_cache_update.inc
 	rm -f test_cluster_space_hint_owners.inc test_cluster_space_census_types.inc test_cluster_space_census_mutation.inc test_cluster_space_cleanout_product.o
 	rm -f test_cluster_space_fsm_hint.inc
@@ -10300,6 +10333,8 @@ test_cluster_xid_stripe_active.inc: $(top_srcdir)/src/backend/storage/ipc/procar
 
 test_cluster_xid_stripe_evidence: test_cluster_xid_stripe_evidence.c unit_test.h \
 		test_cluster_xid_stripe_evidence.inc test_cluster_xid_stripe_active.inc \
+		test_cluster_heap_freeze_policy_current.inc \
+		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
 		test_cluster_pgproc_active_types.inc $(CLUSTER_XID_STRIPE_O) \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
 		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \

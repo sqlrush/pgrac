@@ -100,6 +100,8 @@ terminal_clear(const ClusterRelmapV2Image *image, bool publish)
 	unsigned slot = image->identity.shared ? 0 : 1;
 	uint8 actual[CLUSTER_RELMAP_V2_FILE_SIZE], expected[CLUSTER_RELMAP_V2_FILE_SIZE];
 
+	if (v2_terminal_observer)
+		return v2_terminal_observer(image, publish);
 	UT_ASSERT(authority_held && !local_held && !v2_retention_held && CritSectionCount == 0);
 	UT_ASSERT((v2_terminal_context || (!publish && v2_abort_callback_context)) && terminal_calls < 2);
 	UT_ASSERT_EQ(publish, terminal_publish);
@@ -139,6 +141,7 @@ cluster_relmap_authority_v2_discard_pending(const ClusterRelmapV2Image *image)
 static void
 terminal_test_reset(void)
 {
+	v2_terminal_observer = NULL;
 	memset(cluster_relmap_v2_arms, 0, sizeof(cluster_relmap_v2_arms));
 	cluster_relmap_v2_finish_entered = false;
 	cluster_relmap_v2_prepare_unfinished = false;

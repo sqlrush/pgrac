@@ -240,6 +240,19 @@ extern bool cluster_wal_retention_pin_output_distinct_v1(const ClusterWalRetenti
 	const void *out, Size bytes);
 typedef struct ClusterWalRootPublishGuard ClusterWalRootPublishGuard;
 typedef struct ClusterWalReadPinV1 ClusterWalReadPinV1;
+/* Borrow the exact native read-pin incarnation. This is retention only: it
+ * neither transfers ownership nor supplies recovery/DATA/publication rights. */
+typedef struct ClusterWalReadPinOwnerV1 {
+	ClusterWalReadPinV1 *pin;
+	uint64 generation;
+} ClusterWalReadPinOwnerV1;
+extern bool cluster_wal_read_pin_owner_v1(ClusterWalReadPinV1 *pin,
+	ClusterWalReadPinOwnerV1 *out);
+/* All original grants must still be usable, including read-only inputs.
+ * Checks the active native incarnation before dereferencing borrowed owners.
+ * The snapshot producer preserves output on refusal, including whole native
+ * allocation aliases; it supplies neither IR nor publication authority. */
+extern bool cluster_wal_read_pin_owner_current_v1(const ClusterWalReadPinOwnerV1 *owner);
 
 typedef struct ClusterWalRetentionPinThreadRequest {
 	const ClusterWalRetentionInterval *intervals;
