@@ -94,6 +94,14 @@ static ClusterRelmapV2PairResult (*v2_pair_observer)(const ClusterRelmapV2Namesp
 static bool (*v2_write_observer)(const ClusterRelmapV2Namespace *, uint64,
 	const ClusterRelmapV2Owner *, const RelMapFile *, ClusterRelmapRetentionDirectory *, LWLock *);
 static bool (*v2_prepared_pair_observer)(const ClusterRelmapV2Image *);
+static void (*v2_send_observer)(const SharedInvalidationMessage *, int);
+static ClusterSinvalAckResult (*v2_ack_observer)(const SharedInvalidationMessage *, int);
+static void (*v2_unlock_observer)(void);
+static bool v2_postcommit_error_stack;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+MemoryContext ErrorContext;
+MemoryContext CurrentMemoryContext;
 
 /* Original runtime providers are explicit fixtures; token checks are real. */
 uint64 GetSystemIdentifier(void) { return UINT64CONST(0x1122334455667788); }
@@ -227,6 +235,8 @@ void
 errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused(),
 		  const char *func pg_attribute_unused())
 {
+	if (v2_postcommit_error_stack && error_level == ERROR && PG_exception_stack)
+		siglongjmp(*PG_exception_stack, 1);
 	siglongjmp(error_target, 1);
 }
 
@@ -462,6 +472,11 @@ SendSharedInvalidMessages(const SharedInvalidationMessage *msgs, int n)
 {
 	unsigned int slot = msgs[0].rm.dbId == InvalidOid ? 0 : 1;
 
+	if (v2_send_observer)
+	{
+		v2_send_observer(msgs, n);
+		return;
+	}
 	UT_ASSERT(authority_held && !local_held && CritSectionCount == 0);
 	UT_ASSERT_EQ(n, 1);
 	UT_ASSERT_EQ(msgs[0].rm.id, SHAREDINVALRELMAP_ID);
@@ -479,6 +494,8 @@ cluster_sinval_enqueue_and_wait_ack(const SharedInvalidationMessage *msgs, int n
 {
 	unsigned int slot = msgs[0].rm.dbId == InvalidOid ? 0 : 1;
 
+	if (v2_ack_observer)
+		return v2_ack_observer(msgs, n);
 	UT_ASSERT(authority_held && !local_held && CritSectionCount == 0);
 	UT_ASSERT_EQ(n, 1);
 	UT_ASSERT_EQ(msgs[0].rm.id, SHAREDINVALRELMAP_ID);
@@ -495,6 +512,11 @@ cluster_sinval_enqueue_and_wait_ack(const SharedInvalidationMessage *msgs, int n
 void
 cluster_relmap_authority_x_unlock(void)
 {
+	if (v2_unlock_observer)
+	{
+		v2_unlock_observer();
+		return;
+	}
 	UT_ASSERT(authority_held && !local_held && CritSectionCount == 0);
 	unlock_calls++;
 	record_publish_event(UNLOCK);
@@ -1049,11 +1071,16 @@ UT_TEST(unarmed_commit_preserves_other_writers_pending_and_global_lock)
 #include "test_cluster_relmap_producer_stage.inc"
 #include "test_cluster_relmap_producer_prepare.inc"
 #include "test_cluster_relmap_producer_terminal.inc"
+#include "test_cluster_relmap_postcommit.inc"
 
 int
 main(void)
 {
-	UT_PLAN(38);
+	UT_PLAN(42);
+	UT_RUN(v2_postcommit_publishes_then_invalidates_before_unlock);
+	UT_RUN(v2_postcommit_ack_retries_keep_storage_one_shot);
+	UT_RUN(v2_postcommit_errors_and_source_loss_fail_stop);
+	UT_RUN(v2_postcommit_preflight_storage_failures_and_empty_isolation);
 	UT_RUN(v2_terminal_custody_uses_original_prepare_for_both_flavours);
 	UT_RUN(v2_terminal_arm_refuses_without_replacing_original_custody);
 	UT_RUN(v2_terminal_attempt_context_refusals_are_sticky);

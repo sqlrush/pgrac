@@ -141,6 +141,7 @@
 #include "cluster/cluster_sinval.h"		  /* cross-node inval ack barrier (2.39) */
 #include "cluster/storage/cluster_smgr.h" /* cluster_smgr_invalidate_relmap */
 #include "storage/sinval.h"				  /* SendSharedInvalidMessages */
+#include "utils/memutils.h"
 #endif
 
 
@@ -1469,8 +1470,8 @@ cluster_relmap_producer_arm_v2(bool shared, const RelMapFile *updates)
 	return true;
 }
 
-bool
-cluster_relmap_producer_finish_v2(bool is_commit)
+static bool
+relmap_producer_finish_v2(bool is_commit, bool postcommit)
 {
 	if (cluster_relmap_v2_finish_entered
 		|| (!cluster_relmap_v2_arms[0].armed && !cluster_relmap_v2_arms[1].armed))
@@ -1479,7 +1480,8 @@ cluster_relmap_producer_finish_v2(bool is_commit)
 	 * be retried here, including by switching to the other terminal polarity. */
 	cluster_relmap_v2_finish_entered = true;
 	if (cluster_relmap_publish_arms[0].armed || cluster_relmap_publish_arms[1].armed
-		|| LWLockHeldByMe(RelationMappingLock) || LWLockHeldByMe(XidGenLock))
+		|| LWLockHeldByMe(RelationMappingLock) || LWLockHeldByMe(XidGenLock)
+		|| (postcommit && IsTransactionState()))
 		return false;
 	for (int slot = 0; slot < 2; slot++)
 	{
@@ -1510,9 +1512,112 @@ cluster_relmap_producer_finish_v2(bool is_commit)
 			return false;
 	}
 	/* Retire local custody only. Original pins and all caller duties remain. */
-	memset(cluster_relmap_v2_arms, 0, sizeof(cluster_relmap_v2_arms));
-	cluster_relmap_v2_finish_entered = false;
+	if (!postcommit)
+	{
+		memset(cluster_relmap_v2_arms, 0, sizeof(cluster_relmap_v2_arms));
+		cluster_relmap_v2_finish_entered = false;
+	}
 	return true;
+}
+
+bool
+cluster_relmap_producer_finish_v2(bool is_commit)
+{
+	return relmap_producer_finish_v2(is_commit, false);
+}
+
+static void relmap_producer_postcommit_failed_v2(const char *stage) pg_attribute_noreturn();
+
+static void
+relmap_producer_postcommit_failed_v2(const char *stage)
+{
+	error_context_stack = NULL;
+	MemoryContextSwitchTo(ErrorContext);
+	ereport(PANIC,
+		(errcode(ERRCODE_INTERNAL_ERROR),
+		 errmsg("cluster relation map publication could not complete after commit"),
+		 errdetail_internal("stage=%s", stage),
+		 errhidecontext(true), errhidestmt(true)));
+	pg_unreachable();
+}
+
+static bool
+relmap_producer_postcommit_current_v2(void)
+{
+	if (!cluster_relmap_v2_finish_entered
+		|| (!cluster_relmap_v2_arms[0].armed && !cluster_relmap_v2_arms[1].armed))
+		return false;
+	for (int slot = 0; slot < 2; slot++)
+	{
+		const ClusterRelmapProducerArmV2 *arm = &cluster_relmap_v2_arms[slot];
+
+		if (arm->armed && (!cluster_relmap_owner_terminal_matches_v2(&arm->sample)
+			|| (!arm->staged.identity.shared && MyDatabaseId != arm->staged.identity.dbid)))
+			return false;
+	}
+	return true;
+}
+
+void
+cluster_relmap_producer_postcommit_v2(void)
+{
+	if (!cluster_relmap_v2_arms[0].armed && !cluster_relmap_v2_arms[1].armed)
+		return;
+
+	PG_TRY();
+	{
+		if (!relmap_producer_finish_v2(true, true))
+			relmap_producer_postcommit_failed_v2("CLEANUP");
+		for (int slot = 0; slot < 2; slot++)
+		{
+			const ClusterRelmapProducerArmV2 *arm = &cluster_relmap_v2_arms[slot];
+			SharedInvalidationMessage msg;
+
+			if (!arm->armed)
+				continue;
+			/* Both original pairs are clean before any backend-visible inval. */
+			msg.rm.id = SHAREDINVALRELMAP_ID;
+			msg.rm.dbId = arm->staged.identity.dbid;
+			SendSharedInvalidMessages(&msg, 1);
+			if (!relmap_producer_postcommit_current_v2())
+				relmap_producer_postcommit_failed_v2("INVALIDATION_SOURCE");
+			if (cluster_peer_mode_enabled())
+			{
+				ClusterSinvalAckResult result = CLUSTER_SINVAL_ACK_TIMEOUT;
+
+				/* Only the original notification policy retries, never storage. */
+				for (int attempt = 0; attempt < CLUSTER_RELMAP_PUBLISH_RETRIES; attempt++)
+				{
+					result = cluster_sinval_enqueue_and_wait_ack(&msg, 1);
+					if (!relmap_producer_postcommit_current_v2())
+						relmap_producer_postcommit_failed_v2("ACK_SOURCE");
+					if (result == CLUSTER_SINVAL_ACK_DONE)
+						break;
+					ereport(WARNING,
+						(errmsg("cluster relmap invalidation not acknowledged "
+							"(attempt %d of %d), retrying",
+							attempt + 1, CLUSTER_RELMAP_PUBLISH_RETRIES)));
+				}
+				if (result != CLUSTER_SINVAL_ACK_DONE)
+					relmap_producer_postcommit_failed_v2("ACK");
+			}
+		}
+		if (!relmap_producer_postcommit_current_v2())
+			relmap_producer_postcommit_failed_v2("RELEASE_SOURCE");
+		/* Keep custody until the last fallible original operation succeeds. */
+		cluster_relmap_authority_x_unlock();
+		memset(cluster_relmap_v2_arms, 0, sizeof(cluster_relmap_v2_arms));
+		cluster_relmap_v2_finish_entered = false;
+	}
+	PG_CATCH();
+	{
+		/* A committed transaction must not reach ordinary abort cleanup. */
+		error_context_stack = NULL;
+		MemoryContextSwitchTo(ErrorContext);
+		EmitErrorReport();
+		relmap_producer_postcommit_failed_v2("ERROR");
+	}
+	PG_END_TRY();
 }
 
 static void

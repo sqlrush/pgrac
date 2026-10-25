@@ -97,6 +97,16 @@ extern bool cluster_relmap_producer_prepare_v2(bool shared,
 extern bool cluster_relmap_producer_arm_v2(bool shared, const struct RelMapFile *updates);
 extern bool cluster_relmap_producer_finish_v2(bool is_commit);
 
+/* Dormant original postcommit caller only, after durable commit and before
+ * top FullXid teardown, retaining original mapped-rel AEL and global relmap X.
+ * Consume saved prepare receipts once, publish both pairs before invalidation,
+ * apply the original local/peer ACK policy and recheck the original owner.
+ * Unlock global X last, then retire local custody only. UNKNOWN/ERROR, source
+ * loss or exhausted notification retries PANIC; custody/pins/debt remain and
+ * uncertain storage is never retried. Empty is a no-op. This authenticates no
+ * terminal, releases no retention pin and installs no live v2 caller. */
+extern void cluster_relmap_producer_postcommit_v2(void);
+
 /* PGRAC (spec-6.14 D5): post-commit publish / abort discard of a staged
  * shared relmap authority image. */
 extern void AtEOXact_ClusterRelmapPublish(void);
