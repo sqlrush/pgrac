@@ -8313,13 +8313,22 @@ test_cluster_ctrc_native_group_exit.inc: $(top_srcdir)/src/backend/storage/ipc/p
 	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_ctrc_worker_sample.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
+	awk '/^cluster_undo_cleaner_active_sample\(/ { print "bool"; emit=1; found++ } \
+	     /^cluster_undo_cleaner_active_sample_current\(/ { print "bool"; emit=1; found++ } \
+	     /^undo_cleaner_publish_active_sample\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_ctrc_cleaner test_cluster_ctrc_capacity test_cluster_ctrc_dispatch \
 test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: test_cluster_ctrc_read_scope.inc \
+		test_cluster_ctrc_worker_sample.inc \
 		test_cluster_ctrc_native_exit.inc test_cluster_ctrc_native_group_exit.inc \
 		test_cluster_pgproc_active_types.inc \
 		$(top_srcdir)/src/include/storage/procarray.h $(top_srcdir)/src/include/access/transam.h \
 		$(top_srcdir)/src/include/access/twophase.h $(top_srcdir)/src/include/access/xlog.h \
-		$(top_srcdir)/src/include/storage/pg_sema.h $(top_srcdir)/src/include/utils/wait_event.h
+		$(top_srcdir)/src/include/storage/pg_sema.h $(top_srcdir)/src/include/utils/wait_event.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h
 
 test_cluster_ctrc_capacity: test_cluster_ctrc_capacity.c test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
