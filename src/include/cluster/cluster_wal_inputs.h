@@ -91,8 +91,11 @@ struct ClusterColdCtrcWorkV1;
  * original source (including INSTALL history), and bind the original census
  * ROOT, owner and work generation. No ACTIVE subject is required. Suspend/
  * resume and reads reject re-prepared work even at the same allocation address.
- * Retained-only: an OPEN source still waits before any cold-census callback.
- * This grants no C0/path, live cut/flush, DATA, discharge or completion right. */
+ * Cold census may fix and natively flush only this exact original Startup
+ * owner's installed local OPEN writer after selection. Its end never moves;
+ * native writer/fence/timeline, physical prefix and whole-scope checks remain.
+ * Any other OPEN source waits before callbacks or local flush. General live
+ * APIs remain refused. No C0/path, DATA, discharge or completion right. */
 extern ClusterControlRootResult cluster_wal_inputs_begin_ctrc_census_v1(
 	const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 **out);
@@ -305,9 +308,10 @@ extern ClusterControlRootResult cluster_wal_inputs_census_v1(ClusterWalInputsV1 
 typedef RfPageProofDetailV1 (*ClusterWalCensusSourceVisitorV1)(
 	const ClusterWalSourceRef *source, const RfContributorStreamCutV1 *cut,
 	const ClusterWalTailObservation *completed, void *arg);
-/* Requires the original startup cold scope. OPEN sources return WAIT before
- * any callbacks; this does not request live writer sampling or borrow online
- * PI/replay authority. The original physical, claim, ROOT, pin and final
+/* Requires an original Startup cold scope. OPEN sources return WAIT before
+ * callbacks, except the original CTRC scope's exact installed local writer
+ * and private fixed native cut described above. No peer live-cut request or
+ * online PI/replay authority. The original physical, claim, ROOT, pin and final
  * all-source checks remain mandatory. An empty callback list alone proves
  * nothing about namespace coverage or recovery completion. */
 extern ClusterControlRootResult

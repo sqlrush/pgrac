@@ -893,6 +893,73 @@ UT_TEST(test_owned_ctrc_census_rejects_other_purpose_and_namespace_switch)
 	test_inputs_startup_cf = false;
 }
 
+static void
+ctrc_inventory_append_after_first_pass(void)
+{
+	test_flush = test_insert = ctrc_local_append(ctrc_local_checkpoint_end, test_insert);
+}
+
+UT_TEST(test_ctrc_inventory_keeps_original_local_cut_and_native_terminal_bytes)
+{
+	ClusterWalInputsV1 *inputs = NULL;
+	ClusterRecoveryNativeInventory *inventory = NULL;
+	ClusterRecoveryNativeInventoryDiag diag;
+	ClusterRecoveryNativeEffect effect;
+	ClusterWalSourceRef selected = { 0 };
+	TimestampTz time = 12345;
+	WalTestRecord terminal;
+	XLogRecPtr fixed;
+
+	ctrc_local_fixture(false);
+	terminal = inventory_write_record(&ctrc_local_source, ctrc_local_checkpoint_end,
+		ctrc_local_checkpoint, RM_XACT_ID, XLOG_XACT_ABORT, &time, sizeof(time));
+	fixed = test_insert = terminal.exclusive_end;
+	UT_ASSERT_EQ(ctrc_inputs_begin(&inputs), 0);
+	for (uint32 i = 0; i < cluster_wal_inputs_count_v1(inputs); i++) {
+		const ClusterWalInputV1 *item = cluster_wal_inputs_at_v1(inputs, i);
+		if (item->current && cluster_control_root_identity_equal(&item->source.claim.identity,
+			&ctrc_local_source.claim.identity))
+			selected = item->source;
+	}
+	UT_ASSERT(selected.claim.database_incarnation != 0);
+	inventory_census_calls = 0;
+	inventory_between_passes = ctrc_inventory_append_after_first_pass;
+	UT_ASSERT_EQ(cluster_recovery_native_inventory_build(inputs, 1024 * 1024, &inventory, &diag),
+		CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED);
+	inventory_between_passes = NULL;
+	UT_ASSERT_EQ(inventory_census_calls, 2);
+	UT_ASSERT_EQ(diag.sources, 4);
+	UT_ASSERT_EQ(diag.native_records, 1);
+	UT_ASSERT(diag.records >= 5);
+	UT_ASSERT_EQ(ctrc_local_flushes, 1);
+	UT_ASSERT_EQ(ctrc_local_requested, fixed);
+	UT_ASSERT(test_insert > fixed);
+	if (inventory != NULL) {
+		UT_ASSERT_EQ(cluster_recovery_native_inventory_next(inventory, &effect),
+			CLUSTER_RECOVERY_NATIVE_INVENTORY_EFFECT);
+		UT_ASSERT_EQ(effect.kind, CLUSTER_RECOVERY_NATIVE_TERMINAL);
+		UT_ASSERT_EQ(effect.record->read_lsn, terminal.record_start);
+		UT_ASSERT_EQ(effect.record->end_lsn, fixed);
+		UT_ASSERT_EQ(effect.record->cut.scan_end_exclusive, fixed);
+		UT_ASSERT_EQ(effect.record->header.xl_info & ~XLR_INFO_MASK, XLOG_XACT_ABORT);
+		UT_ASSERT_EQ(effect.record->xact_time, time);
+		UT_ASSERT_EQ(memcmp(&effect.record->source, &selected, sizeof(selected)), 0);
+		UT_ASSERT_EQ(cluster_recovery_native_inventory_next(inventory, &effect),
+			CLUSTER_RECOVERY_NATIVE_INVENTORY_END);
+		UT_ASSERT_EQ(cluster_recovery_native_inventory_recheck(inputs, inventory, &diag),
+			CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED);
+		/* A CRC-valid rewrite within the fixed prefix revokes the inventory;
+		 * bytes appended after the cut above cannot hide that change. */
+		time++;
+		inventory_write_record(&ctrc_local_source, terminal.record_start, ctrc_local_checkpoint,
+			RM_XACT_ID, XLOG_XACT_ABORT, &time, sizeof(time));
+		UT_ASSERT_EQ(cluster_recovery_native_inventory_recheck(inputs, inventory, &diag),
+			CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED);
+	}
+	cluster_recovery_native_inventory_destroy(inventory);
+	ctrc_local_done(&inputs);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -900,7 +967,8 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(81);
+	UT_PLAN(82);
+	UT_RUN(test_ctrc_inventory_keeps_original_local_cut_and_native_terminal_bytes);
 	UT_RUN(test_owned_ctrc_census_borrows_namespace_and_revokes_changed_work);
 	UT_RUN(test_owned_ctrc_census_rejects_other_purpose_and_namespace_switch);
 	UT_RUN(test_native_inventory_uses_two_real_cold_passes);

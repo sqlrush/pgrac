@@ -913,6 +913,130 @@ cluster_wal_inputs_visit_live_local_v1(ClusterWalInputsV1 *inputs, uint32 index,
 	return result;
 }
 
+/* Only the original installed recovery writer may supply a local OPEN cut
+ * to its own CTRC census. This does not admit Startup to the online APIs or
+ * qualify any other OPEN input, even one on this same node. */
+static bool
+inputs_ctrc_local_open(const ClusterWalInputsV1 *inputs, uint32 index)
+{
+	const ClusterWalInputV1 *item = &inputs->items[index];
+	const ClusterWalWriterToken *writer = &inputs->ctrc.owner.writer;
+
+	return inputs->purpose == WAL_INPUTS_CTRC_CENSUS && item->current
+		&& item->kind == CLUSTER_WAL_INPUT_CHECKPOINT
+		&& item->checkpoint.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+		&& item->source.claim.identity.origin_node_id == cluster_node_id
+		&& cluster_wal_claim_v2_ref_valid(&writer->ref.claim)
+		&& inputs_source_selected(&writer->ref, &item->source)
+		&& writer->epoch != 0 && IsValidWalSegSize(wal_segment_size)
+		&& writer->startup_first_lsn != InvalidXLogRecPtr
+		&& writer->startup_first_lsn % wal_segment_size == 0
+		&& item->checkpoint_start >= writer->startup_first_lsn;
+}
+
+static ClusterControlRootResult
+inputs_ctrc_local_cut(ClusterWalInputsV1 *inputs, uint32 index, ClusterWalWriterFlushV1 *out)
+{
+	const ClusterWalInputV1 *item = &inputs->items[index];
+	const ClusterWalWriterToken *writer = &inputs->ctrc.owner.writer;
+	ClusterControlRootResult result;
+	ClusterWalWriterFlushV1 native = { 0 };
+	XLogRecPtr reserved;
+	TimeLineID timeline;
+
+	memset(out, 0, sizeof(*out));
+	if (!inputs_current(inputs) || !inputs_ctrc_local_open(inputs, index)
+		|| CritSectionCount != 0 || ShutdownRequestPending
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = cluster_wal_inputs_revalidate_v1(inputs);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	result = cluster_wal_writer_check(writer);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	reserved = GetXLogInsertEndRecPtr();
+	result = cluster_wal_writer_check(writer);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (reserved == InvalidXLogRecPtr || reserved == UINT64_MAX
+		|| reserved <= item->checkpoint_start
+		|| reserved < item->checkpoint.validated_tail_lsn_exclusive)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	if (inputs->local_minimum == InvalidXLogRecPtr) {
+		/* Sample once, after this scope's complete ROOT/input selection.
+		 * Native flush completes all reservations through this exact end. */
+		inputs->local_writer = *writer;
+		inputs->local_minimum = reserved;
+		inputs->local_index = index;
+	} else if (inputs->local_index != index
+		|| memcmp(&inputs->local_writer, writer, sizeof(*writer)) != 0)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (reserved < inputs->local_minimum)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	if (inputs->local_cut.complete_end != InvalidXLogRecPtr
+		&& (inputs->local_cut.complete_end != inputs->local_minimum
+			|| inputs->local_cut.flushed_end < inputs->local_minimum
+			|| memcmp(&inputs->local_cut.writer, writer, sizeof(*writer)) != 0))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+
+	native.writer = *writer;
+	native.complete_end = inputs->local_minimum;
+	native.flushed_end = GetFlushRecPtr(&timeline);
+	if (timeline != writer->ref.timeline)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	if (native.flushed_end < native.complete_end) {
+		/* Original Startup I/O only, without CF/content/critical locks.
+		 * Requalify before the native device call; never adopt a new writer. */
+		result = cluster_wal_inputs_revalidate_v1(inputs);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cluster_wal_writer_check(writer);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		XLogFlush(native.complete_end);
+		native.flushed_end = GetFlushRecPtr(&timeline);
+	}
+	result = cluster_wal_writer_check(writer);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result = cluster_wal_inputs_revalidate_v1(inputs);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (timeline != writer->ref.timeline)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	if (native.flushed_end < native.complete_end)
+		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	if (inputs->local_cut.complete_end == InvalidXLogRecPtr)
+		inputs->local_cut = native;
+	*out = inputs->local_cut;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static ClusterControlRootResult
+inputs_ctrc_local_visit(ClusterWalInputsV1 *inputs, uint32 index,
+	ClusterWalRecordVisitor visitor, void *arg, ClusterWalTailObservation *out)
+{
+	const ClusterWalInputV1 *item = &inputs->items[index];
+	ClusterWalWriterFlushV1 native;
+	ClusterWalTailObservation observed = { 0 };
+	WalInputsVisit visit = { inputs, visitor, arg };
+	ClusterControlRootResult result;
+
+	memset(out, 0, sizeof(*out));
+	result = inputs_ctrc_local_cut(inputs, index, &native);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result = cluster_wal_flushed_prefix_visit(cluster_wal_threads_dir, &item->source,
+			wal_segment_size, item->checkpoint.checkpoint_lower_lsn, inputs->local_minimum,
+			native.complete_end, native.flushed_end, item->checkpoint_start,
+			item->checkpoint.checkpoint_record_crc32c, inputs_visit_record, &visit, &observed);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result = cluster_wal_writer_check(&native.writer);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result = cluster_wal_inputs_revalidate_v1(inputs);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*out = observed;
+	return result;
+}
+
 static ClusterControlRootResult
 inputs_remote_sample(ClusterWalInputsV1 *inputs, uint32 index, ClusterWalWriterFlushV1 *out)
 {
@@ -1056,17 +1180,19 @@ inputs_contribution_cuts(ClusterWalInputsV1 *inputs, WalContributionWork *work)
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	work->count = inputs->count;
-	/* A cold reader cannot request a live writer's cut. Check the entire
-	 * selected set first: no callback may observe a prefix while a later
-	 * source is still OPEN. This preserves the original retained-reader
-	 * WAIT polarity without borrowing its online sampling path. */
+	/* Check the entire set before callbacks or local flush. Only the exact
+	 * original CTRC owner's installed writer has a private local cut; all
+	 * other OPEN sources retain the original WAIT polarity. */
 	if ((inputs->purpose != WAL_INPUTS_ONLINE)) {
 		for (uint32 i = 0; i < work->count; i++) {
 			const ClusterWalInputV1 *item = &inputs->items[i];
 			if (item->kind == CLUSTER_WAL_INPUT_CHECKPOINT) {
 				uint32 lifecycle = item->checkpoint.lifecycle;
-				if (lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN)
-					return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+				if (lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN) {
+					if (!inputs_ctrc_local_open(inputs, i))
+						return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+					continue;
+				}
 				if (lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
 					&& lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
 					&& lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE)
@@ -1089,7 +1215,13 @@ inputs_contribution_cuts(ClusterWalInputsV1 *inputs, WalContributionWork *work)
 			cut.scan_begin_inclusive = item->checkpoint.checkpoint_lower_lsn;
 			cut.scan_end_exclusive = item->checkpoint.validated_tail_lsn_exclusive;
 			if (item->checkpoint.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN) {
-				result = cluster_wal_inputs_prepare_live_v1(inputs, i, &cut.scan_end_exclusive);
+				if (inputs->purpose == WAL_INPUTS_CTRC_CENSUS) {
+					ClusterWalWriterFlushV1 native;
+					result = inputs_ctrc_local_cut(inputs, i, &native);
+					if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+						cut.scan_end_exclusive = native.complete_end;
+				} else
+					result = cluster_wal_inputs_prepare_live_v1(inputs, i, &cut.scan_end_exclusive);
 				if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 					return result;
 			}
@@ -1196,10 +1328,14 @@ inputs_contribution_build(ClusterWalInputsV1 *inputs, bool space_active, WalCont
 				return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 		}
 		if (item->kind == CLUSTER_WAL_INPUT_CHECKPOINT
-			&& item->checkpoint.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN)
-			result = cluster_wal_inputs_visit_live_v1(inputs, index, inputs_contribution_record,
-													  work, &observed);
-		else
+			&& item->checkpoint.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN) {
+			if (inputs->purpose == WAL_INPUTS_CTRC_CENSUS)
+				result = inputs_ctrc_local_visit(inputs, index, inputs_contribution_record,
+					work, &observed);
+			else
+				result = cluster_wal_inputs_visit_live_v1(inputs, index, inputs_contribution_record,
+					work, &observed);
+		} else
 			result = cluster_wal_inputs_visit_retained_v1(inputs, index, inputs_contribution_record,
 														  work, &observed);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
