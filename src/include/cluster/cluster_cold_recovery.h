@@ -1523,7 +1523,9 @@ extern bool cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed,
 											   struct ClusterRecoveryFencePlan *fence);
 
 /* Call after the original sequencer and physical durability barrier, while
- * the original execution owner remains held. No allocator is advanced. */
+ * the original execution owner remains held. Its validated v2 checkpoint
+ * window adds the next normal actual-issued xid as an input minimum; zero
+ * and v1 windows retain the original WAL fold. No allocator is advanced. */
 extern bool cluster_cold_typed_xid_endpoints_v1(ClusterColdTypedV1 *typed,
 												struct ClusterRecoveryFencePlan *fence,
 												const ClusterColdReplayResultV1 *result,

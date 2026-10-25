@@ -3895,11 +3895,12 @@ UT_TEST(test_own_root_seal_diagnostic_separates_lifecycle_and_flags)
 	}
 }
 #include "test_cluster_cold_startup_native_window.inc"
+#include "test_cluster_cold_startup_issued_window.inc"
 
 int
 main(void)
 {
-	UT_PLAN(142);
+	UT_PLAN(144);
 	UT_RUN(test_execution_refusal_preserves_the_first_census_failure);
 	UT_RUN(test_own_root_lookup_diagnostic_does_not_read_failed_outputs);
 	UT_RUN(test_own_root_key_format_diagnostic_names_the_field);
@@ -3970,6 +3971,8 @@ main(void)
 	UT_RUN(test_checkpoint_window_scan_drift_never_seals_input);
 	UT_RUN(test_checkpoint_window_history_census_recheck_is_exact);
 	UT_RUN(test_checkpoint_window_original_reselect_drift_is_sticky);
+	UT_RUN(test_endpoints_include_original_postflush_issuance_for_every_source);
+	UT_RUN(test_postflush_endpoints_keep_completion_and_failure_boundaries);
 	UT_RUN(test_tt_base_capture_includes_history_before_wal_scan);
 	UT_RUN(test_tt_base_capture_failure_stops_before_side_and_scan);
 	UT_RUN(test_tt_base_drift_refuses_pass_two_stickily);

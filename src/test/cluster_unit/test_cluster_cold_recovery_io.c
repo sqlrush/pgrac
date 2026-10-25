@@ -1405,10 +1405,61 @@ UT_TEST(test_scan_unavailable_header_and_new_attempt_clear_observation)
 	}
 }
 
+UT_TEST(test_original_retained_visit_binds_later_postflush_issuance)
+{
+	for (unsigned route = 0; route < 2; route++)
+		for (unsigned fault = 0; fault < 2; fault++) {
+			ClusterColdScanResultV1 result;
+			ClusterColdPlanV1 *plan;
+			ClusterWalInputV1 *input;
+			ClusterRelmapCheckpointWindow window;
+			ClusterControlRootReadToken token = { 0 };
+			ClusterColdDetailV1 detail;
+			uint8 zero[160] = { 0 };
+			uint64 issued;
+
+			scope_reset();
+			input = generation(2, 12, false, REQUIRED, 0x1000, 0x1000, 0x1300);
+			scan_reset();
+			scoped_checkpoint_wal(input);
+			native_window_fixture(input, 0x1100);
+			UT_ASSERT(cluster_relmap_checkpoint_window_decode_v1(
+				input->native_window, &input->native_checkpoint, input->checkpoint_start, 0x1100,
+				&input->source.claim.identity, 3, &window));
+			UT_ASSERT(cluster_relmap_checkpoint_window_encode_v2(
+				&window, &input->native_checkpoint, input->checkpoint_start, 0x1100,
+				U64FromFullTransactionId(input->native_checkpoint.nextXid) + 37,
+				input->native_window));
+			if (fault)
+				observed_records_delta = 1;
+			plan = scan_plan();
+			if (route) {
+				selected_checkpoint.source = input->source;
+				selected_checkpoint.checkpoint_start = input->checkpoint_start;
+				selected_checkpoint.checkpoint = input->native_checkpoint;
+				memcpy(selected_checkpoint.native_window, input->native_window, 160);
+				detail = cluster_cold_scan_root_v1(plan, 0, &input->checkpoint, &token, false, true,
+												   NULL, &result);
+			} else
+				detail = cluster_cold_scan_input_v1(plan, 0, SCOPE, 0, false, true, NULL, &result);
+			UT_ASSERT_EQ(detail, fault ? CLUSTER_COLD_SOURCE_GAP : CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(memcmp(result.native_window, fault ? zero : input->native_window, 160), 0);
+			if (!fault) {
+				UT_ASSERT(cluster_relmap_checkpoint_window_decode_v2(
+					result.native_window, &input->native_checkpoint, input->checkpoint_start,
+					0x1100, &input->source.claim.identity, 3, &window, &issued));
+				UT_ASSERT_EQ(issued,
+							 U64FromFullTransactionId(input->native_checkpoint.nextXid) + 37);
+			}
+			cluster_cold_plan_destroy_v1(&plan);
+		}
+}
+
 int
 main(void)
 {
-	UT_PLAN(29);
+	UT_PLAN(30);
+	UT_RUN(test_original_retained_visit_binds_later_postflush_issuance);
 	UT_RUN(test_native_window_exports_only_after_complete_original_retained_visit);
 	UT_RUN(test_root_checkpoint_copy_matches_every_native_byte);
 	UT_RUN(test_root_checkpoint_requires_exact_native_record_and_address);

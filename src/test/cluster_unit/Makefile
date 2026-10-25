@@ -10662,6 +10662,7 @@ test_cluster_cold_tt_base: test_cluster_cold_tt_base.c unit_test.h test_cluster_
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
 
 test_cluster_cold_recovery_startup_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_checkpoint.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
 		$(top_srcdir)/src/backend/cluster/cluster_control_bootstrap_private.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_census.h \
@@ -10689,6 +10690,7 @@ test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_te
 		$(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o \
 		$(top_builddir)/src/common/libpgcommon.a \
 		test_cluster_cold_startup_native_window.inc \
+		test_cluster_cold_startup_issued_window.inc \
 		test_cluster_cold_source_completion.inc \
 		test_cluster_cold_endpoints.h test_cluster_cold_recovery_xid_core.o \
 		test_cluster_cold_recovery_replay_core.o \
