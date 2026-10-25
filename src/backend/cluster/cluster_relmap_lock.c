@@ -48,6 +48,7 @@
 typedef struct RelmapXHold {
 	bool held;
 	bool coordinated;
+	bool release_entered;
 	ClusterLockAcquireRequest req;
 } RelmapXHold;
 
@@ -74,6 +75,8 @@ cluster_relmap_authority_x_lock(void)
 	ClusterLockAcquireRequest req;
 	ClusterLockAcquireResult r;
 
+	if (relmap_x_hold.release_entered)
+		return false;
 	Assert(!relmap_x_hold.held);
 
 	memset(&req, 0, sizeof(req));
@@ -120,10 +123,21 @@ cluster_relmap_authority_x_unlock(void)
 {
 	if (!relmap_x_hold.held)
 		return;
+	if (relmap_x_hold.release_entered)
+		ereport(PANIC,
+				(errmsg("cluster relmap authority lock release cannot be retried")));
 	if (relmap_x_hold.coordinated)
-		(void)cluster_lock_acquire_s6_release(&relmap_x_hold.req);
+	{
+		/* Keep the exact hold through an unconfirmed result or ERROR unwind. */
+		relmap_x_hold.release_entered = true;
+		if (cluster_lock_acquire_s6_release(&relmap_x_hold.req)
+			!= CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
+			ereport(PANIC,
+					(errmsg("cluster relmap authority lock release was not confirmed")));
+	}
 	relmap_x_hold.held = false;
 	relmap_x_hold.coordinated = false;
+	relmap_x_hold.release_entered = false;
 }
 
 bool
