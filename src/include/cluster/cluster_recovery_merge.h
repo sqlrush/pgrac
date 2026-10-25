@@ -327,6 +327,11 @@ cluster_recmerge_streaming_select(const ClusterRecmergeStreamingInput *inputs, i
  *	bootstrap fail-close in cluster_cf_storage.c) -- boot fails closed
  *	and the operator resolves it.
  *
+ *	E1 never re-adopts a persistent same-node claim. Only the live original
+ *	process/ResourceOwner/boot retains its linked file and directory identity;
+ *	re-entry, consumers and release must revalidate that exact custody.
+ *	Resource release revokes use without removing the disk claim.
+ *
  *	The pure build/classify core lives here (unit-testable, frontend-
  *	safe); the claim I/O + wait loop are backend-only below.
  * ============================================================
