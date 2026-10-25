@@ -243,6 +243,14 @@ struct ClusterRecoverySerialRequest;
 extern bool ClusterColdRecoveryTxSerialRequest(const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdTopTxCensusEntryV1 *subject,
 	struct ClusterRecoverySerialRequest *out);
+/* One already observed original CTRC subject, including existing terminals.
+ * By-value provisional old-source bindings only; empty on refusal. Call before
+ * PAGE/content locks: the retained observation/manifest is revalidated. This
+ * does not acquire IR/WALR/PAGE or replace the later complete-source scope.
+ * Store the returned value in caller-owned storage distinct from all inputs. */
+extern struct ClusterRecoverySerialRequest ClusterColdRecoveryCtrcSerialRequest(
+	const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 subject_index);
 struct ClusterUndoBlock0Pin;
 /* Reserve the original proven target's EMPTY block0 slot without a content
  * lock. The caller releases it before the retained source scope. This is

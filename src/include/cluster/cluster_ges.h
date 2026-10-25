@@ -583,6 +583,7 @@ typedef struct ClusterGesReleaseAttempt {
 	bool registering;
 } ClusterGesReleaseAttempt;
 
+struct ClusterResId;
 extern ClusterGesRedeclareResult cluster_ges_release_poll(ClusterGesReleaseAttempt *attempt,
 														  const struct ClusterResId *resid,
 														  const struct ClusterGrdHolderId *holder,
@@ -597,7 +598,6 @@ typedef enum ClusterGesAcquireResult {
 	CLUSTER_GES_ACQUIRE_INVALID
 } ClusterGesAcquireResult;
 
-struct ClusterResId;
 extern ClusterGesAcquireResult cluster_ges_cf_request_poll(ClusterGesAcquireAttempt *attempt,
 														   const struct ClusterResId *resid,
 														   uint32 mode,

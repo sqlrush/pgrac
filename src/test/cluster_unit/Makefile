@@ -2546,7 +2546,15 @@ test_cluster_heap_freeze_policy_current.inc: $(top_srcdir)/src/backend/cluster/c
 	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-# Original shared census layout and begin; readiness/traversal stay external.
+# Original bounded shared attachment; full capacity/layout readiness stays external.
+test_cluster_heap_ctrc_attachment.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk '/^#define CLUSTER_CTRC_SHMEM_(MAGIC|VERSION) / { print; constants++ } \
+	     /^ctrc_runtime_attached\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (constants != 2 || found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Original shared census layout and begin; full capacity readiness stays external.
 test_cluster_heap_ctrc_types.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c $(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h Makefile
 	@awk '/^typedef struct (CtrcCleanerWorkerObservationShared|ClusterCtrcSharedHeader) / { emit=1; found++ } \
 	     emit { print } emit && /^}/ { emit=0; done++ } \
@@ -2559,6 +2567,18 @@ test_cluster_heap_ctrc_begin.inc: $(top_srcdir)/src/backend/cluster/cluster_term
 	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Original census entry traversal, physical lock selection and widening.
+test_cluster_heap_ctrc_step.inc: $(top_srcdir)/src/backend/cluster/cluster_xid_stripe.c $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk '/^cluster_xid_widen\(/ { print "static FullTransactionId"; emit=1; found++ } \
+	     /^(ctrc_bytes_zero|ctrc_txn_key_valid)\(/ { print "static bool"; emit=1; found++ } \
+	     /^ctrc_origin_entries\(/ { print "static ClusterCtrcOriginEntry *"; emit=1; found++ } \
+	     /^ctrc_participant_entries\(/ { print "static ClusterCtrcParticipantEntry *"; emit=1; found++ } \
+	     /^ctrc_participant_lock_mask\(/ { print "static uint32"; emit=1; found++ } \
+	     /^(ctrc_active_scan_step|cluster_ctrc_active_scan_step_source)\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 8 || done != 8 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_ctrc_registration.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
 	awk '/^ctrc_note_unqualified_registration\(/ { print "static void"; emit=1; found++ } \
 	     /^cluster_ctrc_active_scan_registration_current\(/ { print "bool"; emit=1; found++ } \
@@ -2567,7 +2587,9 @@ test_cluster_heap_ctrc_registration.inc: $(top_srcdir)/src/backend/cluster/clust
 
 test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_ctrc_registration.inc \
+		test_cluster_heap_ctrc_attachment.inc \
 		test_cluster_heap_ctrc_types.inc test_cluster_heap_ctrc_begin.inc \
+		test_cluster_heap_ctrc_step.inc \
 		test_cluster_heap_freeze_cohort_current.inc \
 		test_cluster_heap_freeze_cohort_backend.inc \
 		test_cluster_heap_freeze_worker_current.inc \
@@ -5951,6 +5973,8 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_freeze_pgproc_types.inc test_cluster_heap_freeze_pgproc_types.inc.tmp
 	rm -f test_cluster_heap_freeze_pgproc_sample.inc test_cluster_heap_freeze_pgproc_sample.inc.tmp
 	rm -f test_cluster_heap_ctrc_types.inc test_cluster_heap_ctrc_types.inc.tmp test_cluster_heap_ctrc_begin.inc test_cluster_heap_ctrc_begin.inc.tmp
+	rm -f test_cluster_heap_ctrc_step.inc test_cluster_heap_ctrc_step.inc.tmp
+	rm -f test_cluster_heap_ctrc_attachment.inc test_cluster_heap_ctrc_attachment.inc.tmp
 	rm -f test_cluster_heap_freeze_stripe_future.inc test_cluster_heap_freeze_stripe_future.inc.tmp
 	rm -f test_cluster_heap_freeze_lease_current.inc test_cluster_heap_freeze_lease_current.inc.tmp
 	rm -f test_cluster_space_cache_insert.inc test_cluster_space_cache_delete.inc test_cluster_space_cache_allocation.inc test_cluster_space_cache_update.inc
@@ -11929,6 +11953,7 @@ test_cluster_cold_tx_start: test_cluster_cold_tx_ctrc_subject.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_handoff.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_census.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_terminals.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_source_request.inc
 test_cluster_cold_tx_start: $(top_srcdir)/src/include/cluster/cluster_recovery_census.h
 
 test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_owner.inc \
