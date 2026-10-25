@@ -1284,23 +1284,32 @@ cluster_snapshot_cr_identity_v1(Snapshot expected, uint64 *identity)
  * differently (two snapshots may share xmin but differ in read_scn), so a
  * stale min-xmin pick could publish a read_scn newer than the true min and let
  * retention recycle undo a live reader still needs (规则 8.A false-recycle).
- * We therefore walk every live snapshot for the true min read_scn.  Atomic
- * write because the helper runs outside ProcArrayLock.
+ * We therefore walk every live snapshot for the true min read_scn.  A live
+ * unknown or unbounded source must retain its original marker, not borrow
+ * a finite sibling's protection.  The native H sampler rejects that marker
+ * with the original installed xmin.  Atomic write because this helper runs
+ * outside ProcArrayLock.
  */
-static void
+static bool
 cluster_min_read_scn_heap_walk(pairingheap_node *node, SCN *minp)
 {
 	while (node != NULL)
 	{
 		Snapshot	s = pairingheap_container(SnapshotData, ph_node, node);
 
-		if (SCN_VALID(s->read_scn)
-			&& (!SCN_VALID(*minp) || scn_time_cmp(s->read_scn, *minp) < 0))
+		if (!SCN_VALID(s->read_scn) || s->read_scn == (SCN) UINT64_MAX)
+		{
 			*minp = s->read_scn;
-		if (node->first_child != NULL)
-			cluster_min_read_scn_heap_walk(node->first_child, minp);
+			return false;
+		}
+		if (!SCN_VALID(*minp) || scn_time_cmp(s->read_scn, *minp) < 0)
+			*minp = s->read_scn;
+		if (node->first_child != NULL &&
+			!cluster_min_read_scn_heap_walk(node->first_child, minp))
+			return false;
 		node = node->next_sibling;
 	}
+	return true;
 }
 
 static void
@@ -1317,13 +1326,18 @@ cluster_recompute_proc_read_scn(void)
 	{
 		Snapshot	s = ae->as_snap;
 
-		if (SCN_VALID(s->read_scn)
-			&& (!SCN_VALID(min) || scn_time_cmp(s->read_scn, min) < 0))
+		if (!SCN_VALID(s->read_scn) || s->read_scn == (SCN) UINT64_MAX)
+		{
+			min = s->read_scn;
+			goto publish;
+		}
+		if (!SCN_VALID(min) || scn_time_cmp(s->read_scn, min) < 0)
 			min = s->read_scn;
 	}
 	if (!pairingheap_is_empty(&RegisteredSnapshots))
-		cluster_min_read_scn_heap_walk(RegisteredSnapshots.ph_root, &min);
+		(void) cluster_min_read_scn_heap_walk(RegisteredSnapshots.ph_root, &min);
 
+publish:
 	pg_atomic_write_u64(&MyProc->cluster_read_scn_atomic, (uint64) min);
 }
 #endif
