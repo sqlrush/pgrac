@@ -85,10 +85,18 @@ cluster_pcm_lock_acquire_buffer_source(BufferDesc *buf pg_attribute_unused(),
 	if (fixture_retries > 0) {
 		fixture_retries--;
 		source->kind = CLUSTER_PCM_SOURCE_RETRY;
+		source->retry_event = true;
 	}
 	source->durable = source->kind == CLUSTER_PCM_SOURCE_DISK_GRANT
 		|| source->kind == CLUSTER_PCM_SOURCE_IMAGE_INSTALLED;
 	return source->kind;
+}
+
+void
+cluster_gcs_block_read_source_retry_wait(const ClusterPcmReadSource *source, unsigned retries)
+{
+	UT_ASSERT(source->retry_event && source->quiescent);
+	UT_ASSERT_EQ(retries, 0);
 }
 
 void

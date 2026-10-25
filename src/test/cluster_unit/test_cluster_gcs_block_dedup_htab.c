@@ -60,6 +60,7 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_gcs_block_dedup.h"
+#include "cluster/cluster_block_io_trace.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h"
@@ -367,6 +368,18 @@ hash_seq_search(HASH_SEQ_STATUS *status)
 
 void
 hash_seq_term(HASH_SEQ_STATUS *status pg_attribute_unused())
+{}
+
+long
+hash_get_num_entries(HTAB *hashp pg_attribute_unused())
+{
+	return fake_live_count();
+}
+
+void
+cluster_block_io_trace_note(BufferTag tag pg_attribute_unused(),
+	const char *event pg_attribute_unused(), uint64 version pg_attribute_unused(),
+	uint64 sequence pg_attribute_unused(), uint32 holders pg_attribute_unused())
 {}
 
 /* ============================================================

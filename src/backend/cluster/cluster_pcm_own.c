@@ -58,8 +58,9 @@ cluster_pcm_own_shmem_init(void)
 			pg_atomic_init_u64(&ClusterPcmOwnArray[i].writer_activation_token, 0);
 			pg_atomic_init_u64(&ClusterPcmOwnArray[i].resource_x_activation_generation, 0);
 			pg_atomic_init_u32(&ClusterPcmOwnArray[i].flags, 0);
-			ClusterPcmOwnArray[i]._pad = 0;
+			ClusterPcmOwnArray[i].service_waiters = 0;
 			pg_atomic_init_u64(&ClusterPcmOwnArray[i].delivery_attempt, 0);
+			pg_atomic_init_u64(&ClusterPcmOwnArray[i].write_io_generation, 0);
 		}
 	}
 }
@@ -81,6 +82,43 @@ cluster_pcm_own_reservation_flag_valid(uint32 reservation_flag)
 {
 	return reservation_flag == PCM_OWN_FLAG_GRANT_PENDING
 		   || reservation_flag == PCM_OWN_FLAG_REVOKING;
+}
+
+/* Called only with the native buffer header locked. IO is serialized by
+ * BM_IO_IN_PROGRESS, and its witness survives retagging to exclude ABA. */
+ClusterPcmOwnResult
+cluster_pcm_own_write_io_begin(int buf_id)
+{
+	ClusterPcmOwnEntry *entry;
+	uint64 generation;
+	if (!cluster_pcm_own_entry_for_buf(buf_id, &entry))
+		return CLUSTER_PCM_OWN_NOT_READY;
+	generation = pg_atomic_read_u64(&entry->write_io_generation);
+	if ((generation & 1) != 0)
+		return CLUSTER_PCM_OWN_BUSY;
+	if (generation >= UINT64_MAX - 1)
+		return CLUSTER_PCM_OWN_EXHAUSTED;
+	pg_atomic_write_u64(&entry->write_io_generation, generation + 1);
+	return CLUSTER_PCM_OWN_OK;
+}
+
+ClusterPcmOwnResult
+cluster_pcm_own_write_io_complete(int buf_id, uint32 *workers)
+{
+	ClusterPcmOwnEntry *entry;
+	uint64 generation;
+	if (workers == NULL)
+		return CLUSTER_PCM_OWN_INVALID;
+	*workers = 0;
+	if (!cluster_pcm_own_entry_for_buf(buf_id, &entry))
+		return CLUSTER_PCM_OWN_NOT_READY;
+	generation = pg_atomic_read_u64(&entry->write_io_generation);
+	if ((generation & 1) == 0 || generation == UINT64_MAX)
+		return CLUSTER_PCM_OWN_STALE;
+	pg_atomic_write_u64(&entry->write_io_generation, generation + 1);
+	*workers = entry->service_waiters;
+	entry->service_waiters = 0;
+	return CLUSTER_PCM_OWN_OK;
 }
 
 static ClusterPcmOwnResult

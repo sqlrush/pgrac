@@ -14,6 +14,22 @@
 
 #ifdef USE_PGRAC_CLUSTER
 void
+cluster_block_io_trace_pending_s(const ClusterPcmReadGrantKey *key, const char *event,
+	int phase, int holder, uint64 binding, int result)
+{
+	int saved_errno = errno;
+	if (cluster_trace_block_io && key != NULL)
+		write_stderr("BLOCK_IO event=PENDING_S action=%s time=" INT64_FORMAT
+			" node=%d pid=%d tag=%u/%u/%u/%d/%u request=" UINT64_FORMAT
+			" epoch=" UINT64_FORMAT " requester=%d backend=%d phase=%d holder=%d"
+			" binding=" UINT64_FORMAT " result=%d\n", event, GetCurrentTimestamp(),
+			cluster_node_id, MyProcPid, key->tag.spcOid, key->tag.dbOid, key->tag.relNumber,
+			key->tag.forkNum, key->tag.blockNum, key->request_id, key->epoch,
+			key->requester_node, key->backend_id, phase, holder, binding, result);
+	errno = saved_errno;
+}
+
+void
 cluster_block_io_trace_source(const ClusterPcmReadSource *source, const char *phase)
 {
 	int saved_errno = errno;

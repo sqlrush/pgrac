@@ -11290,7 +11290,7 @@ cluster_pcm_lock_read_grant_begin(BufferTag tag, int32 requester, int32 backend,
 	ClusterPcmResourceXMasterState *state;
 	ClusterPcmPendingS *claim;
 	struct GrdEntry *entry;
-	PcmGcsTransitionApplyResult result = PCM_GCS_TRANSITION_PENDING_X;
+	PcmGcsTransitionApplyResult result = PCM_GCS_TRANSITION_INCOMPATIBLE;
 	PcmState mode;
 	uint32 bit, holders;
 	int holder = -1;
@@ -11306,6 +11306,7 @@ cluster_pcm_lock_read_grant_begin(BufferTag tag, int32 requester, int32 backend,
 		goto done;
 	claim = &state->pending_s[requester];
 	if ((state->pending_s_bitmap & bit) != 0) {
+		result = PCM_GCS_TRANSITION_PENDING_X;
 		/* A replay cannot renew a deadline or pass a later writer. */
 		if (claim->phase == 1 && claim->request_id == request_id && claim->epoch == epoch
 			&& claim->backend_id == backend) {
@@ -11314,10 +11315,14 @@ cluster_pcm_lock_read_grant_begin(BufferTag tag, int32 requester, int32 backend,
 		}
 		goto done;
 	}
-	if (!create || (cluster_shared_config
-		&& pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase) != RESOURCE_X_GATE_OPEN)
-		|| entry->pending_x_requester_node != -1 || pcm_resource_x_s_barrier_active_locked(entry))
+	if (!create)
 		goto done;
+	if ((cluster_shared_config
+		&& pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase) != RESOURCE_X_GATE_OPEN)
+		|| entry->pending_x_requester_node != -1 || pcm_resource_x_s_barrier_active_locked(entry)) {
+		result = PCM_GCS_TRANSITION_PENDING_X;
+		goto done;
+	}
 	mode = (PcmState)pg_atomic_read_u32(&entry->master_state);
 	holders = pg_atomic_read_u32(&entry->s_holders_bitmap);
 	if ((mode == PCM_STATE_N || (mode == PCM_STATE_S && holders == bit))

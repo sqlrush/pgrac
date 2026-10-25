@@ -29,7 +29,24 @@ typedef struct ClusterPcmReadSource {
 	bool durable;
 	bool quiescent;
 	bool pending_s; /* Master pre-registration; DONE follows native publication. */
+	bool retry_event; /* Exact master revocation observed, never a timer. */
 } ClusterPcmReadSource;
+
+/* Non-authoritative holder continuation bound to native output IO. No pin or
+ * content lock is held while parked. Reuse is rejected before serving. */
+typedef struct ClusterPcmFirstFillWait {
+	BufferTag tag;
+	uint64 own_generation;
+	uint64 write_io_generation;
+	int32 buffer_id;
+} ClusterPcmFirstFillWait;
+
+extern bool cluster_bufmgr_first_fill_wait_begin(BufferTag tag, int worker,
+	ClusterPcmFirstFillWait *wait);
+extern int cluster_bufmgr_first_fill_wait_ready(const ClusterPcmFirstFillWait *wait);
+extern void cluster_bufmgr_first_fill_service_wakeup(BufferDesc *buf);
+extern void cluster_gcs_block_read_source_retry_wait(const ClusterPcmReadSource *source,
+	unsigned retries);
 
 /* Wire identity, not a grant. The master also checks its pinned registry binding. */
 typedef struct ClusterPcmReadGrantKey {

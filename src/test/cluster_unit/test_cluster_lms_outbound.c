@@ -64,12 +64,62 @@
 #include "port/pg_crc32c.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
+#include "storage/condition_variable.h"
 
 #undef printf
 
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+sigjmp_buf *PG_exception_stack = NULL;
+ErrorContextCallback *error_context_stack = NULL;
+static ConditionVariable *ut_space_wait;
+static unsigned ut_space_sleeps, ut_space_broadcasts;
+static int ut_space_action;
+static bool ut_space_cancel;
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
+
+void
+cluster_pcm_lock_check_shutdown_wait(void)
+{
+	if (ut_space_cancel)
+		pg_re_throw();
+}
+
+void
+ConditionVariableInit(ConditionVariable *cv)
+{
+	memset(cv, 0, sizeof(*cv));
+}
+
+void
+ConditionVariablePrepareToSleep(ConditionVariable *cv)
+{
+	UT_ASSERT(ut_space_wait == NULL);
+	ut_space_wait = cv;
+}
+
+bool
+ConditionVariableCancelSleep(void)
+{
+	bool waiting = ut_space_wait != NULL;
+	ut_space_wait = NULL;
+	return waiting;
+}
+
+void
+ConditionVariableBroadcast(ConditionVariable *cv pg_attribute_unused())
+{
+	ut_space_broadcasts++;
+}
 
 bool
 errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
@@ -131,6 +181,27 @@ uint64
 cluster_epoch_get_current(void)
 {
 	return ut_request_epoch;
+}
+
+bool
+ConditionVariableTimedSleep(ConditionVariable *cv, long ms,
+	uint32 event pg_attribute_unused())
+{
+	UT_ASSERT(cv == ut_space_wait);
+	UT_ASSERT_EQ(ms, 1000);
+	ut_space_sleeps++;
+	if (ut_space_action == 1) {
+		BackendType saved = MyBackendType;
+		MyBackendType = B_LMS;
+		UT_ASSERT(cluster_lms_outbound_drain_send(1) > 0);
+		MyBackendType = saved;
+	} else if (ut_space_action == 2)
+		ut_request_epoch++;
+	else if (ut_space_action == 3)
+		ut_space_cancel = true;
+	else
+		UT_ASSERT(false);
+	return false;
 }
 
 uint64
@@ -901,6 +972,10 @@ ut_count_marker(uint8 marker)
 static void
 ut_reset_log(void)
 {
+	UT_ASSERT(ut_space_wait == NULL);
+	ut_space_sleeps = ut_space_broadcasts = 0;
+	ut_space_action = 0;
+	ut_space_cancel = false;
 	ut_refill_worker = -1;
 	ut_refill_admitted = 0;
 	ut_request_epoch = 7;
@@ -2688,10 +2763,57 @@ UT_TEST(test_plain_frame_old_head_does_not_block_new_cut_frame)
 	UT_ASSERT_EQ(ut_sent_log[0].marker, 0xa9);
 }
 
+UT_TEST(test_foreground_capacity_wait_resumes_after_native_drain)
+{
+	ut_captured_region->init_fn();
+	ut_reset_log();
+	for (int i = 0; i < 256; i++)
+		UT_ASSERT(ut_enqueue_marker(1, UT_PEER_X, 0xe2));
+	UT_ASSERT(!ut_enqueue_first_read(1, UT_PEER_X, 0xbc));
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+	ut_space_action = 1;
+	MyBackendType = B_BACKEND;
+	UT_ASSERT(cluster_lms_outbound_wait_capacity(1, ut_request_epoch));
+	MyBackendType = B_LMS;
+	UT_ASSERT_EQ(ut_space_sleeps, 1);
+	UT_ASSERT(ut_space_broadcasts > 0);
+	UT_ASSERT(ut_space_wait == NULL);
+	UT_ASSERT(ut_enqueue_first_read(1, UT_PEER_X, 0xbc));
+	while (cluster_lms_outbound_depth(1) > 0)
+		(void)cluster_lms_outbound_drain_send(1);
+	UT_ASSERT_EQ(ut_count_marker(0xbc), 1);
+	UT_ASSERT_EQ(ut_sent_n, 257);
+}
+
+UT_TEST(test_capacity_wait_membership_and_cancel_remove_subscription)
+{
+	for (int action = 2; action <= 3; action++) {
+		volatile bool caught = false;
+		ut_captured_region->init_fn();
+		ut_reset_log();
+		for (int i = 0; i < 256; i++)
+			UT_ASSERT(ut_enqueue_marker(1, UT_PEER_X, 0xe2));
+		ut_space_action = action;
+		MyBackendType = B_BACKEND;
+		PG_TRY();
+		{
+			UT_ASSERT(!cluster_lms_outbound_wait_capacity(1, ut_request_epoch));
+		}
+		PG_CATCH(); { caught = true; }
+		PG_END_TRY();
+		MyBackendType = B_LMS;
+		UT_ASSERT_EQ(caught, action == 3);
+		UT_ASSERT_EQ(ut_space_sleeps, 1);
+		UT_ASSERT(ut_space_wait == NULL);
+		UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 256);
+		UT_ASSERT_EQ(ut_sent_n, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(59);
+	UT_PLAN(61);
 
 	UT_RUN(test_normal_stop_missing_outbound_is_not_empty);
 	UT_RUN(test_ring_shmem_init);
@@ -2752,6 +2874,8 @@ main(void)
 	UT_RUN(test_plain_frame_unknown_cut_has_no_delayed_send_qualification);
 	UT_RUN(test_plain_frame_enqueue_rechecks_cut_around_stream_sample);
 	UT_RUN(test_plain_frame_old_head_does_not_block_new_cut_frame);
+	UT_RUN(test_foreground_capacity_wait_resumes_after_native_drain);
+	UT_RUN(test_capacity_wait_membership_and_cancel_remove_subscription);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

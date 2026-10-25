@@ -66,6 +66,10 @@ my ($rh)=$reader_hash =~ /([0-9a-f]{32})/;
 require_true(defined($wh) && defined($rh),'both original native page digests must be captured');
 is($rh,$wh,'peer installs the complete current page, byte for byte');
 my $blog=substr(slurp_file($b->logfile),$bo);
+my @requests=($blog =~ /^.*BLOCK_IO event=READ_SOURCE phase=REQUEST .*pid=$rpid .*tag=\d+\/\d+\/$rel\/0\/0 .*$/mg);
+is(scalar(@requests),1,'native write-busy reader retains its original request without retry flooding');
+like(substr(slurp_file($a->logfile),$ao),qr/BLOCK_IO event=FIRST_FILL_HOLDER_PARK .*tag=\d+\/\d+\/$rel\/0\/0 /,
+ 'holder retained the request against the actual native write episode');
 like($blog,qr/BLOCK_IO event=READ_SOURCE phase=DECISION .*pid=$rpid .*tag=\d+\/\d+\/$rel\/0\/0 source=2 /,
  'same original miss chose an installed GCS image');
 unlike($blog,qr/BLOCK_IO event=READ_SOURCE phase=DISK_BEGIN .*pid=$rpid .*tag=\d+\/\d+\/$rel\/0\/0 /,

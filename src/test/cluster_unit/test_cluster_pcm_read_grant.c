@@ -199,6 +199,11 @@ static GcsBlockForwardPayload read_forward;
 static GcsBlockReplyHeader read_reply;
 static unsigned read_forwards, read_replies, read_local_forwards;
 static bool read_admit;
+static TimestampTz read_master_time;
+static unsigned read_retirements;
+static unsigned read_ungranted;
+static bool read_managed, read_serving, read_quorum, read_member;
+static bool read_join_rebuilt, read_recovering, read_home;
 static GcsBlockRequestPayload read_request;
 static void
 gcs_block_send_reply(int32 dest, const GcsBlockRequestPayload *req, GcsBlockReplyStatus status,
@@ -249,12 +254,47 @@ read_mock_install(int worker pg_attribute_unused(), const GcsBlockDedupKey *key,
 	UT_ASSERT_EQ(key->request_id, hdr->request_id);
 	UT_ASSERT_EQ(status, hdr->status);
 }
+static bool
+read_mock_ungranted(int worker, const GcsBlockDedupKey *key, const BufferTag *tag,
+	const GcsBlockReplyHeader *header)
+{
+	UT_ASSERT(BufferTagsEqual(tag, &read_request.tag));
+	read_mock_install(worker, key, (GcsBlockReplyStatus)header->status, header, NULL);
+	read_ungranted++;
+	return true;
+}
 #define ClusterGcsBlock (&read_wire_counters)
 #define cluster_grd_outbound_enqueue_backend_msg read_mock_enqueue
 #define cluster_gcs_block_dedup_install_reply read_mock_install
+#define cluster_gcs_block_dedup_install_ungranted_first_fill_exact read_mock_ungranted
+#define cluster_authority_readiness_managed() read_managed
+#define cluster_serving_ready_check(pending, failed) ((void)(pending), (void)(failed), read_serving)
+#define cluster_qvotec_in_quorum() read_quorum
+#define cluster_membership_is_member(node) read_member
+#define cluster_grd_join_remaster_active_for_shard(tag) true
+#define cluster_grd_block_view_rebuilt(tag) read_join_rebuilt
+#define cluster_gcs_block_phase_for_tag(tag) (read_recovering ? GCS_BLOCK_RECOVERING : GCS_BLOCK_NORMAL)
+#define cluster_gcs_lookup_master(tag) (read_home ? cluster_node_id : cluster_node_id + 1)
 #define cluster_gcs_block_note_send_outcome(family, result) ((void)(result))
 #define gcs_block_compute_checksum(data) 0
+#define cluster_block_io_trace_pending_s(key, phase, state, holder, binding, result) ((void)0)
+#define cluster_gcs_block_dedup_mark_done(worker, key, tag, transition) (++read_retirements, true)
+#define GetCurrentTimestamp() read_master_time
+#define cluster_epoch_get_current() read_request.epoch
 #include "test_cluster_pcm_first_fill_master.inc"
+#undef cluster_epoch_get_current
+#undef GetCurrentTimestamp
+#undef cluster_gcs_lookup_master
+#undef cluster_gcs_block_phase_for_tag
+#undef cluster_grd_block_view_rebuilt
+#undef cluster_grd_join_remaster_active_for_shard
+#undef cluster_membership_is_member
+#undef cluster_qvotec_in_quorum
+#undef cluster_serving_ready_check
+#undef cluster_authority_readiness_managed
+#undef cluster_gcs_block_dedup_install_ungranted_first_fill_exact
+#undef cluster_gcs_block_dedup_mark_done
+#undef cluster_block_io_trace_pending_s
 #undef gcs_block_compute_checksum
 #undef cluster_gcs_block_note_send_outcome
 #undef cluster_gcs_block_dedup_install_reply
@@ -266,6 +306,13 @@ read_wire_setup(BufferTag tag)
 {
 	GcsBlockDedupKey key = {0};
 	read_forwards = read_replies = read_local_forwards = 0;
+	read_retirements = 0;
+	read_ungranted = 0;
+	read_managed = read_serving = read_quorum = read_member = true;
+	read_join_rebuilt = read_home = true;
+	read_recovering = false;
+	read_master_time = 1;
+	memset(gcs_first_fill_master_parks, 0, sizeof(gcs_first_fill_master_parks));
 	read_admit = true;
 	memset(&read_request, 0, sizeof(read_request));
 	read_request.tag = tag;
@@ -303,7 +350,100 @@ UT_TEST(test_native_master_registers_before_forward_and_replays_behind_x)
 	UT_ASSERT(cluster_pcm_lock_read_grant_done(&grant.key, 1, true));
 	gcs_block_first_fill_request(&read_request, &key, 1, false);
 	UT_ASSERT_EQ(read_forwards, 2);
-	UT_ASSERT_EQ(read_reply.status, GCS_BLOCK_REPLY_DENIED_PENDING_X);
+	UT_ASSERT_EQ(read_reply.status, GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT);
+}
+
+UT_TEST(test_native_master_waits_behind_existing_conversion_without_reader_resend)
+{
+	BufferTag tag = make_tag(125);
+	GcsBlockDedupKey key;
+	reset_fake_pcm_runtime(4);
+	key = read_wire_setup(tag);
+	UT_ASSERT(cluster_pcm_lock_set_pending_x(tag, 2, 41));
+	gcs_block_first_fill_request(&read_request, &key, 1, true);
+	UT_ASSERT_EQ(read_forwards + read_replies, 0);
+	UT_ASSERT(gcs_first_fill_master_parks[0].in_use);
+	read_master_time += 10000;
+	gcs_first_fill_master_tick(1);
+	UT_ASSERT_EQ(read_forwards + read_replies, 0);
+	cluster_pcm_lock_clear_pending_x_if(tag, 2);
+	read_master_time += 10000;
+	gcs_first_fill_master_tick(1);
+	UT_ASSERT_EQ(read_replies, 1);
+	UT_ASSERT_EQ(read_reply.status, GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK);
+	UT_ASSERT(!gcs_first_fill_master_parks[0].in_use);
+}
+
+UT_TEST(test_native_master_cancel_retires_unpublished_request_without_grant)
+{
+	BufferTag tag = make_tag(126);
+	GcsBlockDedupKey key;
+	ClusterPcmReadGrantKey cancel = {0};
+	reset_fake_pcm_runtime(4);
+	key = read_wire_setup(tag);
+	UT_ASSERT(cluster_pcm_lock_set_pending_x(tag, 2, 41));
+	gcs_block_first_fill_request(&read_request, &key, 1, true);
+	cancel.tag = tag;
+	cancel.request_id = read_request.request_id;
+	cancel.epoch = read_request.epoch;
+	cancel.requester_node = read_request.sender_node;
+	cancel.backend_id = read_request.requester_backend_id + 1;
+	UT_ASSERT(!gcs_first_fill_master_cancel(&cancel, 1));
+	cancel.backend_id--;
+	UT_ASSERT(gcs_first_fill_master_cancel(&cancel, 1));
+	UT_ASSERT_EQ(read_retirements, 1);
+	UT_ASSERT_EQ(read_forwards, 0);
+	UT_ASSERT(!gcs_first_fill_master_parks[0].in_use);
+	UT_ASSERT_EQ(cluster_pcm_lock_query_s_holders_bitmap(tag), 0);
+}
+
+UT_TEST(test_delayed_master_rechecks_each_native_admission_gate)
+{
+	for (int gate = 0; gate < 6; gate++) {
+		BufferTag tag = make_tag(127 + gate);
+		GcsBlockDedupKey key;
+		reset_fake_pcm_runtime(4);
+		key = read_wire_setup(tag);
+		UT_ASSERT(cluster_pcm_lock_set_pending_x(tag, 2, 41));
+		gcs_block_first_fill_request(&read_request, &key, 1, true);
+		cluster_pcm_lock_clear_pending_x_if(tag, 2);
+		switch (gate) {
+		case 0: read_serving = false; break;
+		case 1: read_member = false; break;
+		case 2: read_join_rebuilt = false; break;
+		case 3: read_recovering = true; break;
+		case 4: read_home = false; break;
+		case 5: read_managed = false; read_quorum = false; break;
+		}
+		for (int tick = 0; tick < 3; tick++) {
+			read_master_time += 10000;
+			gcs_first_fill_master_tick(1);
+			UT_ASSERT_EQ(read_forwards + read_replies, 0);
+			UT_ASSERT(gcs_first_fill_master_parks[0].in_use);
+			UT_ASSERT_EQ(cluster_pcm_lock_query_s_holders_bitmap(tag), 0);
+		}
+		read_serving = read_member = read_join_rebuilt = read_home = read_quorum = true;
+		read_recovering = false;
+		read_master_time += 10000;
+		gcs_first_fill_master_tick(1);
+		UT_ASSERT_EQ(read_replies, 1);
+		UT_ASSERT_EQ(read_reply.status, GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK);
+		UT_ASSERT(!gcs_first_fill_master_parks[0].in_use);
+	}
+}
+
+UT_TEST(test_master_seals_only_proven_never_granted_terminal_denial)
+{
+	BufferTag tag = make_tag(134);
+	GcsBlockDedupKey key;
+	reset_fake_pcm_runtime(4);
+	key = read_wire_setup(tag);
+	UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_N_TO_X, 2));
+	UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_X_TO_N_DOWNGRADE, 2));
+	gcs_block_first_fill_request(&read_request, &key, 1, true);
+	UT_ASSERT_EQ(read_forwards, 0);
+	UT_ASSERT_EQ(read_reply.status, GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT);
+	UT_ASSERT_EQ(read_ungranted, 1);
 }
 UT_TEST(test_native_master_disk_grant_has_typed_marker_and_no_forward)
 {
@@ -391,7 +531,11 @@ UT_TEST(test_pending_done_and_revoke_echo_are_exact_and_reject_unknown_fields)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(16);
+	UT_RUN(test_delayed_master_rechecks_each_native_admission_gate);
+	UT_RUN(test_master_seals_only_proven_never_granted_terminal_denial);
+	UT_RUN(test_native_master_waits_behind_existing_conversion_without_reader_resend);
+	UT_RUN(test_native_master_cancel_retires_unpublished_request_without_grant);
 	UT_RUN(test_first_disk_grant_is_atomic_and_rejects_foreign_current_copies);
 	UT_RUN(test_first_disk_grant_does_not_discharge_pi_or_conversion_responsibility);
 	UT_RUN(test_pending_s_precedes_x_and_confirms_exactly);

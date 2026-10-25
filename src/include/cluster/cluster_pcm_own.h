@@ -66,11 +66,12 @@ typedef struct ClusterPcmOwnEntry {
 	pg_atomic_uint64 writer_activation_token; /* committed X not yet activated under content X */
 	pg_atomic_uint64 resource_x_activation_generation; /* target T2 bound, T3 not yet open */
 	pg_atomic_uint32 flags;							   /* PCM_OWN_FLAG_* */
-	uint32 _pad;									   /* keep naturally aligned */
+	uint32 service_waiters; /* LMS worker bits, protected by the buffer header. */
 	pg_atomic_uint64 delivery_attempt;				   /* non-authoritative target residency hold */
+	pg_atomic_uint64 write_io_generation; /* odd: native output IO; even: completed. */
 } ClusterPcmOwnEntry;
 
-StaticAssertDecl(sizeof(ClusterPcmOwnEntry) == 48, "ClusterPcmOwnEntry must remain 48 bytes");
+StaticAssertDecl(sizeof(ClusterPcmOwnEntry) == 56, "ClusterPcmOwnEntry must remain 56 bytes");
 StaticAssertDecl(offsetof(ClusterPcmOwnEntry, writer_activation_token) == 16,
 				 "writer activation fence offset must remain stable");
 StaticAssertDecl(offsetof(ClusterPcmOwnEntry, resource_x_activation_generation) == 24,
@@ -107,6 +108,10 @@ extern PGDLLIMPORT ClusterPcmOwnEntry *ClusterPcmOwnArray;
 extern Size cluster_pcm_own_shmem_size(void);
 extern void cluster_pcm_own_shmem_init(void);
 extern void cluster_pcm_own_shmem_register(void);
+
+/* Native output IO witness only; never a PCM grant. Caller holds BufHdr. */
+extern ClusterPcmOwnResult cluster_pcm_own_write_io_begin(int buf_id);
+extern ClusterPcmOwnResult cluster_pcm_own_write_io_complete(int buf_id, uint32 *workers);
 
 /*
  * Raw exact helpers.  PRECONDITION: the caller holds the matching
