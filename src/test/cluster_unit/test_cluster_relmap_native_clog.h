@@ -16,6 +16,7 @@ extern bool test_relmap_native_clog_read(int origin, TransactionId xid,
 /* Faults: 1 missing,2 short,3 file sync,4 directory sync,5 directory ERROR,
  * 6 different last page byte. Trigger at call0 before the physical census,
  * or immediately before the selected original native read. */
+extern void test_relmap_native_clog_authorize(bool (*check)(int));
 extern void test_relmap_native_clog_fault(unsigned fault, unsigned on_call);
 extern TestRelmapNativeClogStats test_relmap_native_clog_stats(void);
 extern TestRelmapNativeClogStats test_relmap_native_clog_done(void);

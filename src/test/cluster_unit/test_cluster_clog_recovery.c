@@ -57,6 +57,7 @@ static LWLockPadded native_locks[NUM_INDIVIDUAL_LWLOCKS];
 LWLockPadded *MainLWLockArray = native_locks;
 static bool authority = true, revoke_on_lock, expect_error, fail_open, fail_sync, fail_dirsync;
 static int fixture_origin = 1;
+static bool (*fixture_cold_origin)(int);
 static bool c0_authority;
 static bool revoke_after_read, revoke_after_sync;
 static unsigned base_sync_mutation;
@@ -162,7 +163,8 @@ AbsorbSyncRequests(void)
 bool
 cluster_undo_recovery_cold_origin_authorized_v1(int origin)
 {
-	return authority && origin == fixture_origin;
+	return authority && origin == fixture_origin
+		&& (fixture_cold_origin == NULL || fixture_cold_origin(origin));
 }
 bool
 cluster_undo_recovery_abort_clog_authorized_v1(int origin, TransactionId xid)

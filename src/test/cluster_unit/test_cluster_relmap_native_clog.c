@@ -48,6 +48,12 @@ relmap_native_apply_fault(void)
 }
 
 void
+test_relmap_native_clog_authorize(bool (*check)(int))
+{
+	fixture_cold_origin = check;
+}
+
+void
 test_relmap_native_clog_fault(unsigned fault, unsigned on_call)
 {
 	relmap_native_fault = fault;
@@ -129,6 +135,7 @@ test_relmap_native_clog_done(void)
 	memset(ClogRecoveryCtl, 0, sizeof(ClogRecoveryCtl));
 	fail_sync = fail_dirsync = expect_error = base_fixture = false;
 	directory_sync_error = 0;
+	fixture_cold_origin = NULL;
 	PG_exception_stack = NULL;
 	return result;
 }

@@ -291,6 +291,8 @@ cluster_undo_recovery_cold_checkpoint_visit_v1(int origin,
 	ClusterWalTailObservation observed = { 0 };
 	execution_visits++;
 	UT_ASSERT(!inputs_pin_held && inputs_pin_refuse);
+	if (cold_native_real_scope)
+		return test_relmap_scope_checkpoint_visit(origin, visitor, arg);
 	if (execution_fault == 1 || custody_scope == 0
 		|| origin != execution_root.identity.origin_node_id || visitor == NULL)
 		return false;

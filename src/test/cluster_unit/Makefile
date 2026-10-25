@@ -3460,6 +3460,8 @@ test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
 		test_cluster_relmap_execution_observe.inc test_cluster_relmap_census_open.inc \
 		test_cluster_relmap_cold_native.inc \
 		test_cluster_relmap_native_clog.h test_cluster_relmap_native_clog.o \
+		test_cluster_relmap_original_scope.h test_cluster_relmap_original_scope.inc \
+		test_cluster_relmap_original_scope.o \
 		test_cluster_relmap_retained_arb.o test_cluster_relmap_retained_authority.o \
 		test_cluster_relmap_observation_namespace.o \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
@@ -3468,6 +3470,13 @@ test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
 		test_cluster_relmap_retained_census.o test_cluster_relmap_pending_product.o \
 		test_cluster_relmap_pending_side_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o
+
+# Compose the original scope without sharing its controlled authority leaves.
+test_cluster_relmap_original_scope.o: $(top_srcdir)/src/backend/cluster/cluster_undo_recovery.c \
+		test_cluster_relmap_original_scope_namespace.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		-include test_cluster_relmap_original_scope_namespace.h -c $< -o $@
 
 # Compose the cold executor with the actual native arbiter and pair storage.
 test_cluster_relmap_native_clog.o: test_cluster_relmap_native_clog.c \
@@ -3549,7 +3558,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relma
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_owner.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_arb.o test_cluster_relmap_retained_authority.o) \
-		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_native_clog.o) \
+		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_native_clog.o test_cluster_relmap_original_scope.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),$(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_census.o test_cluster_relmap_pending_product.o test_cluster_relmap_pending_side_product.o $(top_builddir)/src/backend/cluster/cluster_relmap_retention.o) \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_root_set.o \

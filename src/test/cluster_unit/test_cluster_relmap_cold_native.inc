@@ -83,6 +83,8 @@ cold_native_setup(bool shared, bool aborted, bool clean)
 	UT_ASSERT_EQ(close(fd), 0);
 	if (cold_native_real_clog)
 		test_relmap_native_clog_setup(test_root, 0, 99, prefix_base_status, prefix_base_last_byte);
+	if (cold_native_real_scope)
+		cold_original_scope_setup();
 	test_startup_sync_hook = cold_native_sync;
 }
 
@@ -110,6 +112,8 @@ cold_native_done(ClusterRelmapRetentionCensus *census)
 	UT_ASSERT_EQ(unlinkat(fd, "base/42", AT_REMOVEDIR), 0);
 	UT_ASSERT_EQ(close(fd), 0);
 	cluster_shared_data_dir = cold_native_saved_dir;
+	if (cold_native_real_scope)
+		cold_original_scope_done();
 	ClusterConfShmem = NULL;
 	execution_root_done();
 }
