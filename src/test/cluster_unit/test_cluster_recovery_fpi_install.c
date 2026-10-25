@@ -192,6 +192,7 @@ smgrread(SMgrRelation relation, ForkNumber forknum, BlockNumber block, void *buf
 			case 12: input_itls[0].subject_index++; break;
 			case 13: input_work->entries[0].key.segment_generation++; break;
 			case 14: input_itls[0].expected_itl_wrap++; break;
+			case 15: input_work->entries[input_work->counts.subject_count - 1].slot.commit_scn++; break;
 			}
 		}
 		return;
@@ -474,12 +475,13 @@ UT_TEST(fpi_inserted_observer_is_exact_and_never_advances_window)
 #include "test_cluster_recovery_ctrc_read.inc"
 #include "test_cluster_recovery_ctrc_itl.inc"
 #include "test_cluster_recovery_ctrc_fpi.inc"
+#include "test_cluster_recovery_ctrc_page_fpi.inc"
 
 int
 main(void)
 {
 	atexit(install_file_close);
-	UT_PLAN(30);
+	UT_PLAN(38);
 	UT_RUN(fpi_install_syncs_exact_native_lsn_and_checksum_without_retiring_window);
 	UT_RUN(fpi_install_exact_result_retries_sync_and_postread_without_rewriting);
 	UT_RUN(fpi_install_refuses_wrong_window_flush_frame_actor_or_serial_before_io);
@@ -510,6 +512,14 @@ main(void)
 	UT_RUN(ctrc_itl_fpi_rechecks_original_inputs_after_token_preparation);
 	UT_RUN(ctrc_itl_fpi_refuses_output_aliases_and_bounds_before_io);
 	UT_RUN(ctrc_itl_fpi_errors_keep_output_and_original_debt);
+	UT_RUN(ctrc_page_fpi_covers_all_native_itls_without_selections);
+	UT_RUN(ctrc_page_fpi_empty_and_terminal_results_do_not_mint_tokens);
+	UT_RUN(ctrc_page_fpi_missing_ambiguous_or_unqualified_late_input_refuses);
+	UT_RUN(ctrc_page_fpi_rechecks_all_subject_bytes_after_each_read);
+	UT_RUN(ctrc_page_fpi_rechecks_full_input_after_token_preparation);
+	UT_RUN(ctrc_page_fpi_rejects_capacity_and_overlap_before_io);
+	UT_RUN(ctrc_page_fpi_keeps_original_scope_guards);
+	UT_RUN(ctrc_page_fpi_errors_preserve_output_and_debt);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

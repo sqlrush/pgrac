@@ -1107,4 +1107,105 @@ rf_page_recovery_ctrc_itl_fpi_smgr_v1(const struct ClusterRecoveryStartV1 *start
 	return page_recovery_ctrc_itl_image(start, work, guard, serial, pin, space,
 		blockno, expected_before, selections, count, NULL, out);
 }
+
+typedef struct PageRecoveryCtrcPageInputsV1 {
+	const ClusterColdPlanV1 *plan;
+	const struct ClusterColdTopTxCensusV1 *census;
+	uint64 generation;
+	ClusterColdCtrcReleaseCensusV1 counts;
+} PageRecoveryCtrcPageInputsV1;
+
+static bool
+page_recovery_ctrc_page_inputs_current(const PageRecoveryCtrcReadV1 *context,
+	const PageRecoveryCtrcPageInputsV1 *fixed, const ClusterColdTtSlotInputV1 *subjects)
+{
+	return page_recovery_ctrc_current(context)
+		&& context->work_generation == fixed->generation
+		&& context->work->plan == fixed->plan && context->work->top_tx_census == fixed->census
+		&& memcmp(&context->work->counts, &fixed->counts, sizeof(fixed->counts)) == 0
+		&& (fixed->counts.subject_count == 0
+			|| memcmp(context->work->entries, subjects,
+				(Size)fixed->counts.subject_count * sizeof(*subjects)) == 0);
+}
+
+bool
+rf_page_recovery_ctrc_itl_page_fpi_smgr_v1(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, const RfPageAuthorityGuardV1 *guard,
+	ClusterRecoverySerialGuard *serial, ClusterWalRetentionPin *pin,
+	const ClusterSpaceIdentity *space, BlockNumber blockno,
+	const RfPageVersionV1 *expected_before, ClusterColdTtSlotInputV1 *scratch,
+	Size capacity, RfPageRecoveryCtrcItlFpiV1 *out)
+{
+	PageRecoveryCtrcReadV1 context;
+	PageRecoveryCtrcPageInputsV1 fixed;
+	RfPageRecoveryCtrcItlFpiV1 candidate = {0};
+	PGAlignedBlock before, image;
+	ClusterSpaceIdentity frame_space;
+	RfPageVersionV1 frame_before;
+	uint8 frame_identity[CLUSTER_SPACE_IDENTITY_BYTES];
+	ClusterCtrcItlCleanoutApplyResult result;
+	const ClusterColdTypedV1 *typed;
+	Size work_bytes, subject_bytes, scratch_bytes;
+
+	if (start == NULL || work == NULL || guard == NULL || serial == NULL || pin == NULL
+		|| space == NULL || expected_before == NULL || out == NULL
+		|| capacity > MaxAllocSize / sizeof(*scratch) || (capacity != 0 && scratch == NULL)
+		|| !page_recovery_ctrc_actor_current()
+		|| !ClusterColdRecoveryCtrcWorkCurrent(start, work))
+		return false;
+	typed = ClusterColdRecoveryTxInputs(start);
+	if (typed == NULL || !ClusterColdRecoveryCtrcWorkCurrent(start, work)
+		|| work->generation == 0 || work->counts.subject_count > capacity
+		|| work->counts.subject_count
+			> (MaxAllocSize - offsetof(ClusterColdCtrcWorkV1, entries)) / sizeof(work->entries[0]))
+		return false;
+	subject_bytes = (Size)work->counts.subject_count * sizeof(*scratch);
+	work_bytes = offsetof(ClusterColdCtrcWorkV1, entries) + subject_bytes;
+	scratch_bytes = capacity * sizeof(*scratch);
+	if (page_recovery_ctrc_itl_output_overlaps(out, sizeof(*out), scratch, scratch_bytes))
+		return false;
+	{
+		const void *borrowed[] = {work, typed, space, expected_before, serial, start, guard, pin};
+		const Size bytes[] = {work_bytes, sizeof(*typed), sizeof(*space), sizeof(*expected_before),
+			sizeof(*serial), 1, 1, 1};
+
+		for (Size i = 0; i < lengthof(borrowed); i++)
+			if (page_recovery_ctrc_itl_output_overlaps(out, sizeof(*out), borrowed[i], bytes[i])
+				|| (scratch_bytes != 0 && page_recovery_ctrc_itl_output_overlaps(scratch,
+					scratch_bytes, borrowed[i], bytes[i])))
+				return false;
+	}
+	frame_space = *space;
+	frame_before = *expected_before;
+	if (!cluster_space_identity_encode(&frame_space, frame_identity, sizeof(frame_identity)))
+		return false;
+	fixed.plan = work->plan;
+	fixed.census = work->top_tx_census;
+	fixed.generation = work->generation;
+	memcpy(&fixed.counts, &work->counts, sizeof(fixed.counts));
+	if (subject_bytes != 0)
+		memcpy(scratch, work->entries, subject_bytes);
+	if (!page_recovery_ctrc_read_image(start, work, guard, serial, pin, space,
+		blockno, expected_before, &before, &context)
+		|| context.typed != typed
+		|| !page_recovery_ctrc_page_inputs_current(&context, &fixed, scratch))
+		return false;
+	result = cluster_ctrc_recovery_itl_page_image_v1(scratch, fixed.counts.subject_count,
+		before.data, image.data);
+	if (result == CLUSTER_CTRC_ITL_CLEANOUT_RETAIN
+		|| !page_recovery_ctrc_page_inputs_current(&context, &fixed, scratch)
+		|| !page_recovery_ctrc_fpi_identity_current(space, frame_identity,
+			expected_before, &frame_before))
+		return false;
+	candidate.rewritten = result == CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN;
+	if (candidate.rewritten && !GenericXLogRecoveryImagePrepare(GENERIC_XLOG_CTRC_ITL,
+		&frame_space, MAIN_FORKNUM, blockno, before.data, image.data, &candidate.frame))
+		return false;
+	if (!page_recovery_ctrc_page_inputs_current(&context, &fixed, scratch)
+		|| !page_recovery_ctrc_fpi_identity_current(space, frame_identity,
+			expected_before, &frame_before))
+		return false;
+	memcpy(out, &candidate, sizeof(candidate));
+	return true;
+}
 #endif /* USE_PGRAC_CLUSTER && !USE_CLUSTER_UNIT */

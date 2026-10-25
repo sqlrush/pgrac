@@ -32,6 +32,9 @@ cluster_scn_advance(void)
 			i < sizeof(input_identity); i++)
 			((unsigned char *)&input_identity)[i] ^= 0xff;
 		break;
+	case 15: input_work->entries[input_work->counts.subject_count - 1].slot.commit_scn++; break;
+	case 16: input_work->plan = (const ClusterColdPlanV1 *)&input_start_object; break;
+	case 17: input_work->top_tx_census = (const struct ClusterColdTopTxCensusV1 *)&input_start_object; break;
 	}
 	return token;
 }
