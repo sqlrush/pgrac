@@ -5390,6 +5390,7 @@ exercise_same_pid_worker_respawn(const ClusterUndoCleanerActiveSample *old,
  * publication and its locks/current assertions, never in a shared lock. */
 static void (*original_worker_publication_observer)(const ClusterUndoCleanerActiveSample *);
 static bool original_retention_report_peer;
+static void (*original_worker_pre_exit_observer)(void);
 
 static void
 assert_original_worker_publication(const ClusterCtrcActiveScan *scan,
@@ -6892,6 +6893,8 @@ exercise_worker_active_pass(unsigned fault)
 				 CLUSTER_CTRC_TOUCH_RECORDED);
 	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 701, &receipt), CLUSTER_CTRC_PREPARE_READY);
 	UT_ASSERT(FullTransactionIdEquals(receipt.original_full_xid, original));
+	if (original_worker_pre_exit_observer != NULL)
+		original_worker_pre_exit_observer();
 	/* Real native protection retires only after the original shared owners
 	 * retain this exact FullXid. The coordinator must find it in the census. */
 	native_procarray_end_transaction(MyProc, key.xid + 2);
