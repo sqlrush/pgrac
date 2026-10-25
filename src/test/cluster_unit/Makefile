@@ -11755,6 +11755,15 @@ test_cluster_cold_tx_writer.inc: $(top_srcdir)/src/backend/access/transam/xlog.c
 	     emit { print } /^}/ { emit=0 } END { if (count != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Execute the actual EOR claim block, including its clean/recovered split.
+test_cluster_cold_tx_claim_eor_boundary.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^StartupXLOG\(/ { owner=1 } \
+	     owner && /PGRAC spec-6.14 D5:/ { emit=1; count++; print "/*" } \
+	     emit && /PGRAC \(GCS-race round-2 RC-E\)/ { emit=0; last++; exit } \
+	     emit { if (previous != "") print previous; previous=$$0 } \
+	     END { if (count != 1 || last != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_cold_tx_start_boundary.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^StartupXLOG\(/ { owner=1 } \
 	     owner && /XLogCtl->SharedRecoveryState = RECOVERY_STATE_DONE;/ { done++ } \
@@ -11778,8 +11787,9 @@ test_cluster_cold_tx_xid_maximum.inc: $(top_srcdir)/src/backend/cluster/cluster_
 test_cluster_cold_tx_finish_boundary.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^StartupXLOG\(/ { owner=1 } \
 	     owner && /Complete original TX component handoff before releasing private input/ { emit=1; count++ } \
+	     emit && released && /^#endif/ { emit=0; last=1; exit } \
 	     emit { print } \
-	     emit && /ClusterReleaseColdRecoveryInputs\(endOfRecoveryInfo\)/ { emit=0; last=1; exit } \
+	     emit && /ClusterReleaseColdRecoveryInputs\(endOfRecoveryInfo\)/ { released=1 } \
 	     END { if (count != 1 || !last || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
@@ -11793,6 +11803,7 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_terminals.inc
 test_cluster_cold_tx_start: $(top_srcdir)/src/include/cluster/cluster_recovery_census.h
 
 test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_owner.inc \
+		test_cluster_cold_tx_claim_eor_boundary.inc test_cluster_cold_claim_service.inc \
 		test_cluster_cold_tx_finish_boundary.inc \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
         test_cluster_cold_tx_consumer.inc test_cluster_cold_tx_xid_maximum.inc \

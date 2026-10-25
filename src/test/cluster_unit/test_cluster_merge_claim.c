@@ -306,9 +306,63 @@ UT_TEST(cf_refusal_does_not_publish_claim)
 {
  reset();cf_available=false;UT_ASSERT(acquire_refused());UT_ASSERT(!exists(claim_path));
 }
+UT_TEST(native_claim_owner_requires_creator_and_full_original_file)
+{
+ uint64 owner; char old[MAXPGPATH];
+ reset();UT_ASSERT_EQ(cluster_recovery_merge_claim_owner_v1(),0);
+ cluster_recovery_merge_claim_acquire_blocking();
+ owner=cluster_recovery_merge_claim_owner_v1();UT_ASSERT(owner!=0);
+ UT_ASSERT(cluster_recovery_merge_claim_owner_current_nowait_v1(owner));
+ /* Local custody is deliberately not an FD/name/bytes witness. The original
+  * full check must still detect an identical replacement and revoke custody. */
+ snprintf(old,sizeof(old),"%s/old-owner",scratch);
+ TEST_REQUIRE(rename(claim_path,old)==0);put_claim(claim_path,0);
+ UT_ASSERT(cluster_recovery_merge_claim_owner_current_nowait_v1(owner));
+ UT_ASSERT_EQ(cluster_recovery_merge_claim_owner_v1(),0);
+ UT_ASSERT(!cluster_recovery_merge_claim_owner_current_nowait_v1(owner));
+ UT_ASSERT(exists(claim_path));UT_ASSERT(exists(old));
+}
+UT_TEST(native_claim_owner_incarnation_cannot_rebind_after_release)
+{
+ uint64 old,fresh;
+ reset();cluster_recovery_merge_claim_acquire_blocking();
+ old=cluster_recovery_merge_claim_owner_v1();UT_ASSERT(old!=0);
+ cluster_recovery_merge_claim_release_if_held();
+ UT_ASSERT(!cluster_recovery_merge_claim_owner_current_nowait_v1(old));
+ cluster_recovery_merge_claim_acquire_blocking();
+ fresh=cluster_recovery_merge_claim_owner_v1();
+ UT_ASSERT(fresh!=0 && fresh!=old);
+ UT_ASSERT(!cluster_recovery_merge_claim_owner_current_nowait_v1(old));
+ UT_ASSERT(!cluster_recovery_merge_claim_owner_current_nowait_v1(0));
+ UT_ASSERT(cluster_recovery_merge_claim_owner_current_nowait_v1(fresh));
+ cluster_recovery_merge_claim_release_if_held();
+}
+UT_TEST(native_claim_owner_checks_original_actor_and_custody_revocation)
+{
+ for (unsigned fault=0;fault<5;fault++) {
+  uint64 owner;
+  reset();cluster_recovery_merge_claim_acquire_blocking();
+  owner=cluster_recovery_merge_claim_owner_v1();UT_ASSERT(owner!=0);
+  switch(fault) {
+  case 0: owner_pid++;break;
+  case 1: CurrentResourceOwner=(ResourceOwner)(uintptr_t)2;break;
+  case 2: self_boot++;break;
+  case 3: release_cb(RESOURCE_RELEASE_BEFORE_LOCKS,false,true,release_arg);break;
+  case 4: cluster_shared_data_dir="other-private-namespace";break;
+  }
+  UT_ASSERT(!cluster_recovery_merge_claim_owner_current_nowait_v1(owner));
+  UT_ASSERT(exists(claim_path));
+  owner_pid=12345;CurrentResourceOwner=(ResourceOwner)(uintptr_t)1;
+  self_boot=17;cluster_shared_data_dir=scratch;
+  UT_ASSERT(!cluster_recovery_merge_claim_owner_current_nowait_v1(owner));
+ }
+}
 int main(void)
 {
- setbuf(stdout,NULL); UT_PLAN(23);
+ setbuf(stdout,NULL); UT_PLAN(26);
+ UT_RUN(native_claim_owner_requires_creator_and_full_original_file);
+ UT_RUN(native_claim_owner_incarnation_cannot_rebind_after_release);
+ UT_RUN(native_claim_owner_checks_original_actor_and_custody_revocation);
  UT_RUN(original_owner_links_and_releases);UT_RUN(same_node_persistent_claim_is_not_adopted);
  UT_RUN(replacement_file_is_not_unlinked);UT_RUN(changed_original_bytes_are_not_released);
  UT_RUN(missing_original_file_is_not_confirmed_release);UT_RUN(replaced_symlink_is_not_unlinked);
