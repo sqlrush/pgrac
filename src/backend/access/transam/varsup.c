@@ -339,6 +339,19 @@ retry_cluster_xid_reservation:
 	}
 
 #ifdef USE_PGRAC_CLUSTER
+	/* The original future-XID source and final striped candidate must retain
+	 * their complete finite identity. A 64-bit carry must not restart issuance
+	 * below nextXid; refuse before reservation waits, SLRU or ProcArray changes. */
+	if (cluster_enabled && cluster_shared_catalog
+		&& (!TransactionIdIsNormal(XidFromFullTransactionId(ShmemVariableCache->nextXid))
+			|| U64FromFullTransactionId(ShmemVariableCache->nextXid) == UINT64_MAX
+			|| !TransactionIdIsNormal(XidFromFullTransactionId(full_xid))
+			|| U64FromFullTransactionId(full_xid) == UINT64_MAX
+			|| FullTransactionIdPrecedes(full_xid, ShmemVariableCache->nextXid)))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("refusing to assign a new transaction ID: cluster full transaction identity is exhausted or invalid")));
+
 	/* PGRAC: consume a majority-durable stripe reservation before SLRU or
 	 * ProcArray mutation. QVOTEC may need XidGenLock to observe nextXid;
 	 * wait outside the lock, then rederive all candidates and limits.

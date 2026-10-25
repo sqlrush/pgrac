@@ -18,6 +18,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include <setjmp.h>
 #include "access/clog.h"
 #include "access/commit_ts.h"
 #include "access/subtrans.h"
@@ -71,6 +72,10 @@ int cluster_injection_armed_count;
 BackendId MyBackendId;
 static GlobalTransaction MyLockedGxact;
 static TransactionId completed_xid;
+static sigjmp_buf allocation_error_env;
+static bool allocation_error_expected;
+static int allocation_error_code;
+static unsigned allocation_errors;
 
 static void
 MaintainLatestCompletedXid(TransactionId xid)
@@ -178,6 +183,10 @@ void
 cluster_xid_stripe_wait_lease(FullTransactionId candidate)
 {
 	waits++;
+	/* A refusal test must never reach this boundary. Stop a parent's mock
+	 * wait with a distinct marker, not a synthetic product ERROR/success. */
+	if (allocation_error_expected)
+		siglongjmp(allocation_error_env, 2);
 	if (held)
 		lock_errors++;
 	reservation = true;
@@ -228,17 +237,32 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 bool
 errstart(int level, const char *domain)
 {
-	abort();
+	if (!allocation_error_expected || level != ERROR)
+		abort();
+	return true;
 }
 bool
 errstart_cold(int level, const char *domain)
 {
-	abort();
+	return errstart(level, domain);
 }
+int
+errcode(int sqlerrcode)
+{
+	allocation_error_code = sqlerrcode;
+	return 0;
+}
+int errmsg(const char *fmt, ...) { return 0; }
+int errdetail(const char *fmt, ...) { return 0; }
+int errhint(const char *fmt, ...) { return 0; }
+int errmsg_plural(const char *singular, const char *plural, unsigned long n, ...) { return 0; }
 void
 errfinish(const char *file, int line, const char *function)
 {
-	abort();
+	if (!allocation_error_expected)
+		abort();
+	allocation_errors++;
+	siglongjmp(allocation_error_env, 1);
 }
 
 #include "test_cluster_xid_allocation.inc"
@@ -263,6 +287,7 @@ reset_allocator(void)
 	procs.statusFlags = status_flags;
 	held = reservation = jump = advance_while_unlocked = false;
 	cluster_enabled = cluster_shared_catalog = cluster_xid_striping = true;
+	cluster_node_id = 4;
 	waits = extensions = early_extensions = lock_errors = 0;
 	floor_full = limit_full = 0;
 	sampling = lifecycle = false;
@@ -271,6 +296,8 @@ reset_allocator(void)
 	MyBackendId = 19;
 	MyLockedGxact = NULL;
 	completed_xid = InvalidTransactionId;
+	allocation_error_expected = false;
+	allocation_error_code = allocation_errors = 0;
 }
 
 UT_TEST(no_storage_or_procarray_mutation_before_reservation)
@@ -474,10 +501,100 @@ UT_TEST(real_prepare_retains_the_allocated_identity_until_its_own_retirement)
 	assert_sample_minimum(variables.nextXid);
 }
 
+/* The real ERROR is raised before any mutation. Only the outer resource-owner
+ * lock release is simulated here; no live backend ERROR recovery is claimed. */
+static void
+expect_unqualified_allocation_refusal(uint64 reference, int slot, bool child)
+{
+	VariableCacheData before_cache;
+	PGPROC before_procs[lengthof(entries)];
+	TransactionId before_xids[lengthof(visible_xids)];
+	XidCacheStatus before_subxids[lengthof(subxids)];
+	volatile bool caught = false;
+	int jump_reason;
+
+	reset_allocator();
+	cluster_xid_striping = slot >= 0;
+	if (slot >= 0)
+		cluster_node_id = slot;
+	variables.nextXid = FullTransactionIdFromU64(reference);
+	if (child) {
+		entries[0].xid = visible_xids[0] = 90;
+		pg_atomic_write_u64(&entries[0].cluster_top_full_xid_atomic,
+			U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(7, 90)));
+	}
+	memcpy(&before_cache, &variables, sizeof(variables));
+	memcpy(before_procs, entries, sizeof(entries));
+	memcpy(before_xids, visible_xids, sizeof(visible_xids));
+	memcpy(before_subxids, subxids, sizeof(subxids));
+	allocation_error_expected = true;
+	jump_reason = sigsetjmp(allocation_error_env, 0);
+	if (jump_reason == 0)
+		(void)GetNewTransactionId(child);
+	else
+		caught = jump_reason == 1;
+	allocation_error_expected = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(allocation_errors, 1);
+	UT_ASSERT_EQ(allocation_error_code, ERRCODE_PROGRAM_LIMIT_EXCEEDED);
+	UT_ASSERT(held && held_lock == XidGenLock && held_mode == LW_EXCLUSIVE);
+	UT_ASSERT(memcmp(&before_cache, &variables, sizeof(variables)) == 0);
+	UT_ASSERT(memcmp(before_procs, entries, sizeof(entries)) == 0);
+	UT_ASSERT(memcmp(before_xids, visible_xids, sizeof(visible_xids)) == 0);
+	UT_ASSERT(memcmp(before_subxids, subxids, sizeof(subxids)) == 0);
+	UT_ASSERT_EQ(waits, 0);
+	UT_ASSERT_EQ(extensions, 0);
+	UT_ASSERT_EQ(early_extensions, 0);
+	UT_ASSERT_EQ(lock_errors, 0);
+	LWLockRelease(XidGenLock);
+	UT_ASSERT(!held);
+}
+
+UT_TEST(shared_allocator_rejects_unknown_or_special_original_identity)
+{
+	const uint64 invalid[] = { 0, 1, 2, UINT64_MAX,
+		UINT64CONST(0x500000000), UINT64CONST(0x500000001), UINT64CONST(0x500000002) };
+	const int slots[] = { -1, 4 };
+
+	for (unsigned i = 0; i < lengthof(invalid); i++)
+		for (unsigned s = 0; s < lengthof(slots); s++)
+			for (unsigned child = 0; child < 2; child++)
+				expect_unqualified_allocation_refusal(invalid[i], slots[s], child != 0);
+}
+
+UT_TEST(shared_stripe_projection_cannot_issue_below_original_fullxid)
+{
+	for (unsigned child = 0; child < 2; child++)
+	{
+		expect_unqualified_allocation_refusal(UINT64_MAX - 1, 4, child != 0);
+		expect_unqualified_allocation_refusal(UINT64_MAX - 2, 15, child != 0);
+	}
+}
+
+UT_TEST(shared_finite_identity_keeps_original_native_publication)
+{
+	FullTransactionId issued;
+	uint64 reference = UINT64_MAX - 1;
+
+	reset_allocator();
+	cluster_xid_striping = false;
+	variables.nextXid = FullTransactionIdFromU64(reference);
+	issued = GetNewTransactionId(false);
+	UT_ASSERT_EQ(U64FromFullTransactionId(issued), reference);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&entries[0].cluster_top_full_xid_atomic), reference);
+	UT_ASSERT_EQ(entries[0].xid, XidFromFullTransactionId(issued));
+	UT_ASSERT_EQ(visible_xids[0], XidFromFullTransactionId(issued));
+	UT_ASSERT_EQ(U64FromFullTransactionId(variables.nextXid), UINT64_MAX);
+	UT_ASSERT_EQ(waits, 0);
+	UT_ASSERT_EQ(extensions, 3);
+	UT_ASSERT_EQ(lock_errors, 0);
+	UT_ASSERT(!held);
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(11);
 	UT_RUN(no_storage_or_procarray_mutation_before_reservation);
 	UT_RUN(wait_rederives_native_counter_and_new_boot_floor);
 	UT_RUN(native_allocation_preserves_ordinary_counter);
@@ -486,6 +603,9 @@ main(void)
 	UT_RUN(real_sample_keeps_original_top_when_child_cache_overflows);
 	UT_RUN(real_sample_refuses_raw_publication_that_does_not_match_allocation);
 	UT_RUN(real_prepare_retains_the_allocated_identity_until_its_own_retirement);
+	UT_RUN(shared_allocator_rejects_unknown_or_special_original_identity);
+	UT_RUN(shared_stripe_projection_cannot_issue_below_original_fullxid);
+	UT_RUN(shared_finite_identity_keeps_original_native_publication);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
