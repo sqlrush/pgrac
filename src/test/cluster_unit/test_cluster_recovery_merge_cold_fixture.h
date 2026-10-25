@@ -32,6 +32,8 @@
 static void
 fixture(void)
 {
+	CurrentResourceOwner = (ResourceOwner)&census;
+	fence_owner_boot = 123;
 	memset(&census, 0, sizeof(census));
 	census.generated = true;
 	census.own_thread = 1;

@@ -328,10 +328,145 @@ UT_TEST(test_legacy_profile_rejects_generation_claim_crc)
 				 CLUSTER_RECOVERY_DUTY_COMPARE_INVALID);
 }
 
+/* The same original input refs survive completion, never its old IR/pin. */
+static void
+tx_sources(ClusterRecoveryFencePlan *plan, ClusterWalSourceRef *sources)
+{
+	memset(sources, 0, sizeof(*sources) * plan->origin_count);
+	for (uint16 i = 0; i < plan->origin_count; i++) {
+		sources[i].claim.identity = plan->origins[i].duty;
+		sources[i].claim.database_incarnation = 17;
+		sources[i].claim.max_config_generation = 19;
+		sources[i].claim.claim_sha256[31] = plan->origins[i].origin_thread;
+		sources[i].timeline = plan->origins[i].root_snapshot.checkpoint_tli;
+	}
+}
+
+UT_TEST(test_tx_proof_owner_survives_only_complete_confirmed_handoff)
+{
+	ClusterRecoveryFencePlan *plan = replayed_plan();
+	ClusterWalSourceRef sources[NODES];
+	uint16 thread;
+	int detail;
+
+	if (plan == NULL) return;
+	tx_sources(plan, sources);
+	UT_ASSERT(cluster_recovery_merge_fence_plan_bind_tx_inputs_v1(plan, sources, plan->origin_count));
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_tx_current_v1(plan, &sources[0]));
+	UT_ASSERT_EQ(complete(plan, &thread, &detail), CLUSTER_RECOVERY_FENCE_COMPLETE_OK);
+	UT_ASSERT_EQ(formations_destroyed, 0);
+	UT_ASSERT(cluster_recovery_merge_fence_plan_tx_current_v1(plan, NULL));
+	for (uint16 i = 0; i < plan->origin_count; i++)
+		UT_ASSERT(cluster_recovery_merge_fence_plan_tx_current_v1(plan, &sources[i]));
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_revalidate_nowait(plan));
+	UT_ASSERT(!plan->serial_held && plan->serial_guards.count == 0 && plan->retention_pin == NULL);
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_bind_tx_inputs_v1(plan, sources, plan->origin_count));
+	UT_ASSERT(cluster_recovery_merge_fence_plan_tx_current_v1(plan, &sources[0]));
+	cluster_recovery_merge_fence_plan_destroy(&plan);
+	UT_ASSERT(plan == NULL);
+	UT_ASSERT_EQ(formations_destroyed, 3);
+
+	/* COMPLETE must never make unbound or partly completed proof owners usable. */
+	for (unsigned fault = 0; fault < 4; fault++) {
+		plan = replayed_plan();
+		tx_sources(plan, sources);
+		if (fault != 0)
+			UT_ASSERT(cluster_recovery_merge_fence_plan_bind_tx_inputs_v1(plan, sources, plan->origin_count));
+		if (fault == 1) ir_release_result = CLUSTER_RECOVERY_SERIAL_RELEASE_UNCONFIRMED;
+		if (fault == 2) finalize_result[3] = CLUSTER_THREAD_ROOT_FINALIZE_OK + 2;
+		if (fault == 3) pin_release_result = CLUSTER_WALR_RELEASE_UNCONFIRMED;
+		(void)complete(plan, &thread, &detail);
+		UT_ASSERT(!cluster_recovery_merge_fence_plan_tx_current_v1(plan, &sources[0]));
+		UT_ASSERT_EQ(formations_destroyed, 0);
+		drop_plan(&plan);
+	}
+}
+
+UT_TEST(test_tx_input_binding_is_atomic_exact_and_cannot_adopt_a_new_source)
+{
+	for (unsigned fault = 0; fault < 9; fault++) {
+		ClusterRecoveryFencePlan *plan = replayed_plan();
+		ClusterWalSourceRef sources[NODES];
+		uint32 count;
+
+		if (plan == NULL) return;
+		tx_sources(plan, sources);
+		count = plan->origin_count;
+		switch (fault) {
+		case 0: count--; break; /* missing final original origin */
+		case 1: sources[count] = sources[0]; count++; break;
+		case 2: sources[count - 1].claim.identity.origin_owner_incarnation++; break;
+		case 3: sources[count - 1].timeline++; break;
+		case 4: sources[count - 1].claim.database_incarnation = 0; break;
+		case 5: memset(sources[count - 1].claim.claim_sha256, 0, 32); break;
+		case 6: CurrentResourceOwner = (ResourceOwner)&sources; break;
+		case 7: fence_owner_boot++; break;
+		case 8: break; /* opaque owner alias */
+		}
+		UT_ASSERT(!cluster_recovery_merge_fence_plan_bind_tx_inputs_v1(plan,
+			fault == 8 ? (const ClusterWalSourceRef *)plan : sources, count));
+		UT_ASSERT(!plan->tx_inputs_bound);
+		for (uint16 i = 0; i < plan->origin_count; i++) {
+			ClusterWalSourceRef zero = {0};
+			UT_ASSERT(memcmp(&plan->origins[i].tx_source, &zero, sizeof(zero)) == 0);
+		}
+		drop_plan(&plan);
+	}
+	for (unsigned fault = 0; fault < 6; fault++) {
+		ClusterRecoveryFencePlan *plan = replayed_plan();
+		ClusterWalSourceRef sources[NODES], changed;
+		uint16 thread;
+		int detail;
+
+		if (plan == NULL) return;
+		tx_sources(plan, sources);
+		UT_ASSERT(cluster_recovery_merge_fence_plan_bind_tx_inputs_v1(plan, sources, plan->origin_count));
+		UT_ASSERT_EQ(complete(plan, &thread, &detail), CLUSTER_RECOVERY_FENCE_COMPLETE_OK);
+		changed = sources[0];
+		switch (fault) {
+		case 0: changed.claim.identity.origin_owner_incarnation++; break;
+		case 1: changed.claim.identity.root_lineage_seq++; break;
+		case 2: changed.claim.database_incarnation++; break;
+		case 3: changed.claim.max_config_generation++; break;
+		case 4: changed.claim.claim_sha256[0]++; break;
+		case 5: changed.timeline++; break;
+		}
+		UT_ASSERT(!cluster_recovery_merge_fence_plan_tx_current_v1(plan, &changed));
+		UT_ASSERT(cluster_recovery_merge_fence_plan_tx_current_v1(plan, &sources[0]));
+		drop_plan(&plan);
+	}
+}
+
+UT_TEST(test_tx_original_proof_or_resource_loss_is_sticky)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterRecoveryFencePlan *plan = replayed_plan();
+		ClusterWalSourceRef sources[NODES];
+		uint16 thread;
+		int detail;
+		ResourceOwner owner = CurrentResourceOwner;
+		uint64 boot = fence_owner_boot;
+
+		if (plan == NULL) return;
+		tx_sources(plan, sources);
+		UT_ASSERT(cluster_recovery_merge_fence_plan_bind_tx_inputs_v1(plan, sources, plan->origin_count));
+		UT_ASSERT_EQ(complete(plan, &thread, &detail), CLUSTER_RECOVERY_FENCE_COMPLETE_OK);
+		if (fault == 0) CurrentResourceOwner = (ResourceOwner)&sources;
+		if (fault == 1) fence_owner_boot++;
+		if (fault == 2) fence_current[4] = false; /* last origin, not only target */
+		UT_ASSERT(!cluster_recovery_merge_fence_plan_tx_current_v1(plan, &sources[0]));
+		CurrentResourceOwner = owner;
+		fence_owner_boot = boot;
+		fence_current[4] = true;
+		UT_ASSERT(!cluster_recovery_merge_fence_plan_tx_current_v1(plan, &sources[0]));
+		drop_plan(&plan);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(10);
 	UT_RUN(test_complete_publishes_every_origin);
 	UT_RUN(test_complete_after_preflight_seal);
 	UT_RUN(test_complete_refuses_before_any_publication);
@@ -339,6 +474,9 @@ main(void)
 	UT_RUN(test_complete_finalize_failures);
 	UT_RUN(test_complete_generation_claim_profile);
 	UT_RUN(test_legacy_profile_rejects_generation_claim_crc);
+	UT_RUN(test_tx_proof_owner_survives_only_complete_confirmed_handoff);
+	UT_RUN(test_tx_input_binding_is_atomic_exact_and_cannot_adopt_a_new_source);
+	UT_RUN(test_tx_original_proof_or_resource_loss_is_sticky);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

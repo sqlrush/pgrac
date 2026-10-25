@@ -9546,7 +9546,16 @@ test_cluster_recovery_duty_compare.inc: $(top_srcdir)/src/backend/cluster/cluste
 	     emit { print } /^}/ { emit=0 } END { if (n != 6 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Compile the native claim-reference validator used at the retained-input bind.
+test_cluster_recovery_claim_ref.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c Makefile
+	awk '/^claim_zero\(/ { print "static bool"; emit=1; n++ } \
+	     /^claim_identity_valid\(/ { print "static bool"; emit=1; n++ } \
+	     /^cluster_wal_claim_v2_ref_valid\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_recovery_merge_seal test_cluster_recovery_merge_complete: %: %.c unit_test.h \
+		test_cluster_recovery_claim_ref.inc \
 		$(top_srcdir)/src/include/cluster/cluster_external_fence.h \
 		$(top_srcdir)/src/include/cluster/cluster_cf_enqueue.h \
 		$(top_srcdir)/src/include/cluster/cluster_reconfig.h \

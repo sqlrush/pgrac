@@ -354,6 +354,19 @@ cluster_control_root_recovery_sync_v1(const ClusterControlRootSnapshot *root,
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
+/* The original input destructor alone retires this completed proof owner. */
+static unsigned tx_fences_destroyed;
+static int tx_fence_expected_census_releases;
+static int *tx_fence_census_release_observer;
+void
+cluster_recovery_merge_fence_plan_destroy(ClusterRecoveryFencePlan **plan)
+{
+	if (tx_fence_census_release_observer != NULL)
+		UT_ASSERT_EQ(*tx_fence_census_release_observer, tx_fence_expected_census_releases);
+	if (*plan != NULL) tx_fences_destroyed++;
+	*plan = NULL;
+}
+
 uint16
 cluster_recovery_merge_fence_plan_origin_count(const ClusterRecoveryFencePlan *plan)
 {
