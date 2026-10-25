@@ -230,16 +230,26 @@ errdetail(const char *fmt, ...)
 	return 0;
 }
 
+/* Force the same allocation address for the native borrowed-owner ABA case. */
+static void *read_owner_reuse_storage;
+static Size read_owner_allocation_bytes;
 void *
 palloc0(Size size)
 {
+	read_owner_allocation_bytes = size;
+	if (read_owner_reuse_storage != NULL) {
+		if (size > 4096) abort();
+		memset(read_owner_reuse_storage, 0, size);
+		return read_owner_reuse_storage;
+	}
 	return calloc(1, size);
 }
 
 void
 pfree(void *pointer)
 {
-	free(pointer);
+	if (pointer != read_owner_reuse_storage)
+		free(pointer);
 }
 
 TimestampTz
@@ -4283,6 +4293,103 @@ UT_TEST(test_pin_storage_distinct_checks_interior_without_changing_owner)
 	reset_pin_fakes();
 }
 
+UT_TEST(test_read_owner_borrows_all_original_native_grants_without_acquiring)
+{
+	uint16 threads[] = {1, 3};
+	ClusterWalReadPinV1 *pin = NULL;
+	ClusterWalReadPinOwnerV1 owner, before;
+	int acquired, released;
+	reset_pin_fakes(); cluster_shared_config = true;
+	memset(&owner, 0xa5, sizeof(owner)); before = owner;
+	UT_ASSERT(!cluster_wal_read_pin_owner_v1(NULL, &owner));
+	UT_ASSERT_EQ(memcmp(&owner, &before, sizeof(owner)), 0);
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 2, &pin), CLUSTER_WAL_PIN_OK);
+	acquired = fake_acquire_call_count; released = fake_release_call_count;
+	UT_ASSERT(cluster_wal_read_pin_owner_v1(pin, &owner));
+	UT_ASSERT(owner.pin == pin && owner.generation != 0);
+	UT_ASSERT(cluster_wal_read_pin_owner_current_v1(&owner));
+	UT_ASSERT(cluster_wal_read_pin_owner_current_v1(&owner));
+	UT_ASSERT(!cluster_wal_read_pin_covers_v1(owner.pin, 2));
+	UT_ASSERT(!cluster_wal_read_pin_covers_v1(owner.pin, 0));
+	UT_ASSERT(!cluster_wal_read_pin_owner_current_v1(NULL));
+	UT_ASSERT_EQ(fake_acquire_call_count, acquired);
+	UT_ASSERT_EQ(fake_release_call_count, released);
+	UT_ASSERT(!cluster_wal_retention_active_pin_present());
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT(!cluster_wal_read_pin_owner_current_v1(&owner));
+	reset_pin_fakes();
+}
+UT_TEST(test_read_owner_never_rebinds_after_same_address_reacquisition)
+{
+	uint16 thread = 1;
+	ClusterWalReadPinV1 *pin = NULL;
+	ClusterWalReadPinOwnerV1 old, fresh;
+	reset_pin_fakes(); cluster_shared_config = true;
+	read_owner_reuse_storage = calloc(1, 4096);
+	UT_ASSERT_NOT_NULL(read_owner_reuse_storage);
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(&thread, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT(cluster_wal_read_pin_owner_v1(pin, &old));
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT(!cluster_wal_read_pin_owner_current_v1(&old));
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(&thread, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT(cluster_wal_read_pin_owner_v1(pin, &fresh));
+	UT_ASSERT(fresh.pin == old.pin); /* actual native allocation is deliberately reused */
+	UT_ASSERT(fresh.generation != old.generation);
+	UT_ASSERT(!cluster_wal_read_pin_owner_current_v1(&old));
+	UT_ASSERT(cluster_wal_read_pin_owner_current_v1(&fresh));
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	free(read_owner_reuse_storage); read_owner_reuse_storage = NULL;
+	reset_pin_fakes();
+}
+UT_TEST(test_read_owner_checks_every_member_and_preserves_original_cleanup)
+{
+	uint16 threads[] = {1, 3};
+	ClusterWalReadPinV1 *pin = NULL;
+	ClusterWalReadPinOwnerV1 owner, output, before;
+	ResourceOwner saved = CurrentResourceOwner;
+	reset_pin_fakes(); cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 2, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT(cluster_wal_read_pin_owner_v1(pin, &owner));
+	CurrentResourceOwner = (ResourceOwner)(uintptr_t)2;
+	UT_ASSERT(!cluster_wal_read_pin_owner_current_v1(&owner));
+	CurrentResourceOwner = saved;
+	MyProcPid++;
+	UT_ASSERT(!cluster_wal_read_pin_owner_current_v1(&owner));
+	MyProcPid--;
+	fake_control_owner_stale_thread = 3;
+	UT_ASSERT(!cluster_wal_read_pin_owner_current_v1(&owner));
+	fake_control_owner_stale_thread = 0;
+	UT_ASSERT(!cluster_wal_read_pin_owner_current_v1(&owner));
+	memset(&output, 0xa5, sizeof(output)); before = output;
+	UT_ASSERT(!cluster_wal_read_pin_owner_v1(pin, &output));
+	UT_ASSERT_EQ(memcmp(&output, &before, sizeof(output)), 0);
+	fake_release_result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_UNCONFIRMED);
+	UT_ASSERT(pin != NULL && !cluster_wal_read_pin_owner_current_v1(&owner));
+	fake_release_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	reset_pin_fakes();
+}
+UT_TEST(test_read_owner_refuses_entire_native_owner_storage_alias)
+{
+	uint16 threads[] = {1, 3};
+	ClusterWalReadPinV1 *pin = NULL;
+	ClusterWalReadPinOwnerV1 owner;
+	reset_pin_fakes(); cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 2, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT(!cluster_wal_read_pin_owner_v1(pin, (ClusterWalReadPinOwnerV1 *)pin));
+	UT_ASSERT(!cluster_wal_read_pin_owner_v1(pin, (ClusterWalReadPinOwnerV1 *)((char *)pin + 1)));
+	UT_ASSERT(!cluster_wal_read_pin_owner_v1(pin,
+		(ClusterWalReadPinOwnerV1 *)((char *)pin + read_owner_allocation_bytes - 1)));
+	UT_ASSERT(cluster_wal_read_pin_owner_v1(pin, &owner));
+	UT_ASSERT(cluster_wal_read_pin_owner_current_v1(&owner));
+	fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
+		fake_resource_release_arg);
+	UT_ASSERT(!cluster_wal_read_pin_owner_current_v1(&owner));
+	UT_ASSERT_EQ(fake_release_call_count, 2);
+	reset_pin_fakes();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -4291,7 +4398,11 @@ main(int argc, char **argv)
 		return write_fixture_wal_segment(argc, argv);
 	if (argc != 1)
 		return 2;
-	UT_PLAN(91);
+	UT_PLAN(95);
+	UT_RUN(test_read_owner_borrows_all_original_native_grants_without_acquiring);
+	UT_RUN(test_read_owner_never_rebinds_after_same_address_reacquisition);
+	UT_RUN(test_read_owner_checks_every_member_and_preserves_original_cleanup);
+	UT_RUN(test_read_owner_refuses_entire_native_owner_storage_alias);
 	UT_RUN(test_read_release_trace_keeps_first_failed_member_and_all_debt);
 	UT_RUN(test_read_release_trace_off_and_critical_preserve_original_cleanup);
 	UT_RUN(test_read_release_callback_records_aggregate_and_keeps_original_fatal);

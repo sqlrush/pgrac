@@ -90,6 +90,10 @@ struct ClusterWalInputsV1 {
 	ClusterWalCutV1 *remote[CLUSTER_WAL_INPUTS_MAX];
 };
 
+/* A locator, not another owner or a grant. Keep the native incarnation outside
+ * borrowed allocations so stale/forged views are rejected before dereference. */
+static ClusterRecoveryTxRetentionV1 active_tx_retention;
+
 typedef struct WalInputsWork {
 	ControlRootImage root;
 	ControlFileData common;
@@ -424,6 +428,8 @@ cluster_wal_inputs_release_v1(ClusterWalInputsV1 **inputs)
 	if ((*inputs)->pin != NULL
 		&& cluster_wal_read_pin_release_v1(&(*inputs)->pin) != CLUSTER_WALR_RELEASE_CONFIRMED)
 		elog(FATAL, "could not release WAL input retention owner");
+	if (active_tx_retention.scope == *inputs)
+		memset(&active_tx_retention, 0, sizeof(active_tx_retention));
 	explicit_bzero(*inputs, sizeof(**inputs));
 	pfree(*inputs);
 	*inputs = NULL;
@@ -1455,14 +1461,29 @@ cluster_wal_inputs_begin_tx_closure_v1(const struct ClusterRecoveryStartV1 *star
 	const struct ClusterColdTopTxCensusEntryV1 *subject, ClusterWalInputsV1 **out)
 {
 	const ClusterColdTypedV1 *typed;
+	ClusterControlRootResult result;
+	ClusterWalReadPinOwnerV1 owner;
 	if (out == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	*out = NULL;
 	typed = ClusterColdRecoveryTxInputs(start);
 	if (typed == NULL || typed->participant_count == 0)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	return inputs_begin(typed->sources[0].claim.identity.storage_uuid, typed->system_identifier,
+	result = inputs_begin(typed->sources[0].claim.identity.storage_uuid, typed->system_identifier,
 		WAL_INPUTS_TX_CLOSURE, start, subject, NULL, out);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!cluster_wal_read_pin_owner_v1((*out)->pin, &owner)) {
+		cluster_wal_inputs_release_v1(out);
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	}
+	/* Native read-pin exclusivity makes this the original single live scope.
+	 * Publishing this locator supplies no IR: ir_ready is still false. */
+	memset(&active_tx_retention, 0, sizeof(active_tx_retention));
+	active_tx_retention.scope = *out;
+	active_tx_retention.serial = &(*out)->tx.ir;
+	active_tx_retention.input_owner = owner;
+	return result;
 }
 
 ClusterControlRootResult
@@ -1753,6 +1774,62 @@ cluster_wal_inputs_tx_abort_acquire_v1(ClusterWalInputsV1 *inputs,
 	}
 	inputs->tx.ir_ready = true;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static bool
+inputs_tx_retention_locator(const ClusterRecoveryTxRetentionV1 *view)
+{
+	return view->scope != NULL && view->scope == active_tx_retention.scope
+		&& view->serial == active_tx_retention.serial
+		&& view->input_owner.pin == active_tx_retention.input_owner.pin
+		&& view->input_owner.generation == active_tx_retention.input_owner.generation
+		&& cluster_wal_read_pin_owner_current_v1(&view->input_owner);
+}
+
+bool
+cluster_wal_inputs_tx_retention_current_v1(const ClusterRecoveryTxRetentionV1 *view)
+{
+	ClusterRecoveryTxRetentionV1 original;
+	ClusterRecoveryTTAbortDerivationV1 candidate;
+	ClusterWalInputsV1 *inputs;
+
+	if (view == NULL)
+		return false;
+	original = *view;
+	/* Do not dereference caller-supplied scope/serial pointers until both
+	 * the original locator and native allocation incarnation have matched. */
+	if (!inputs_tx_retention_locator(&original))
+		return false;
+	inputs = original.scope;
+	if (!inputs_owned(inputs) || inputs->purpose != WAL_INPUTS_TX_CLOSURE
+		|| inputs->pin != original.input_owner.pin || original.serial != &inputs->tx.ir
+		|| !ClusterColdRecoveryTxC0Candidate(inputs->tx.start, inputs->tx.subject, &candidate)
+		|| !cluster_wal_inputs_tx_abort_authorized_v1(inputs, &candidate.record))
+		return false;
+	return inputs_tx_retention_locator(&original);
+}
+
+ClusterRecoveryTxRetentionV1
+cluster_wal_inputs_tx_retention_v1(ClusterWalInputsV1 *inputs,
+	const ClusterRecoveryTTAbortV1 *record)
+{
+	ClusterRecoveryTxRetentionV1 view, empty = {0};
+	ClusterRecoveryTTAbortV1 original;
+
+	/* No caller output pointer can alias an opaque owner. Freeze the exact
+	 * supplied candidate before callbacks; all later checks use that value. */
+	if (inputs == NULL || inputs != active_tx_retention.scope || record == NULL)
+		return empty;
+	view = active_tx_retention;
+	if (!inputs_tx_retention_locator(&view))
+		return empty;
+	original = *record;
+	if (!cluster_wal_inputs_tx_abort_current_v1(inputs, &original)
+		|| !cluster_wal_inputs_tx_abort_authorized_v1(inputs, &original)
+		|| !cluster_wal_inputs_tx_retention_current_v1(&view)
+		|| memcmp(record, &original, sizeof(original)) != 0)
+		return empty;
+	return view;
 }
 
 bool

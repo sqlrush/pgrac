@@ -4,6 +4,7 @@
 #define CLUSTER_WAL_INPUTS_H
 
 #include "cluster/cluster_wal_tail.h"
+#include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_thread_recovery_fabric.h"
 
 #define CLUSTER_WAL_INPUTS_MAX 128
@@ -128,6 +129,25 @@ extern ClusterControlRootResult cluster_wal_inputs_tx_abort_acquire_v1(
 /* No I/O: current exact candidate plus this scope's actual held TX IR. */
 extern bool cluster_wal_inputs_tx_abort_authorized_v1(ClusterWalInputsV1 *inputs,
 	const struct ClusterRecoveryTTAbortV1 *record);
+struct ClusterRecoverySerialGuard;
+/* Borrow only this original scope's actual TX IR and complete native WALR
+ * owner, without acquiring or transferring either. Retain the original scope
+ * and Start until every consumer has retired. This purpose is distinct from
+ * an ordinary RR retention pin; PAGE/stable-base, DATA, FPI, ROOT publishing
+ * and discharge still require their own consumers and proofs. */
+typedef struct ClusterRecoveryTxRetentionV1 {
+	ClusterWalInputsV1 *scope;
+	struct ClusterRecoverySerialGuard *serial;
+	ClusterWalReadPinOwnerV1 input_owner;
+} ClusterRecoveryTxRetentionV1;
+/* No I/O, allocation or caller output pointer: return the complete view by
+ * value, or an all-zero value on refusal. A caller assignment must use its
+ * own disjoint storage. No borrowed owner is overwritten by this producer. */
+extern ClusterRecoveryTxRetentionV1 cluster_wal_inputs_tx_retention_v1(
+	ClusterWalInputsV1 *inputs, const struct ClusterRecoveryTTAbortV1 *record);
+/* No I/O; locate the exact active scope and original native incarnation before
+ * inspecting scope/IR pointers. This never grants PAGE or ordinary RR rights. */
+extern bool cluster_wal_inputs_tx_retention_current_v1(const ClusterRecoveryTxRetentionV1 *view);
 struct ClusterRecoverySerialRequest;
 /* IR purpose callbacks: validate includes original whole ROOT I/O outside CF;
  * current is no-wait and never calls the IR holder revalidation recursively. */

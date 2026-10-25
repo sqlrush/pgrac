@@ -3376,6 +3376,7 @@ WAL_INPUT_CONTRIBUTION_TEST_OBJS = $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
 # Observe only the claim-call boundary; the input owner and claim reader both
 # execute their production implementations.
 test_cluster_wal_inputs_product.o: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c \
+		$(top_srcdir)/src/include/cluster/cluster_wal_retention.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
 		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
