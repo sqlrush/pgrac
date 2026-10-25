@@ -74,9 +74,18 @@ static bool native_xid_locked, native_lease_current = true;
 static unsigned native_samples, native_fences, native_truncations;
 static int native_truncated_page;
 
+#include "test_cluster_undo_horizon_retention_fixture.inc"
+
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
+	if (native_history_enabled && lock == ProcArrayLock) {
+		UT_ASSERT(!native_history_locked && !native_xid_locked);
+		UT_ASSERT_EQ(mode, LW_EXCLUSIVE);
+		native_history_locked = true;
+		native_history_cuts++;
+		return true;
+	}
 	UT_ASSERT(lock == XidGenLock && !native_xid_locked);
 	UT_ASSERT_EQ(mode, LW_SHARED);
 	native_xid_locked = true;
@@ -86,6 +95,12 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 void
 LWLockRelease(LWLock *lock)
 {
+	if (native_history_enabled && lock == ProcArrayLock) {
+		UT_ASSERT(native_history_locked && !native_xid_locked);
+		native_history_locked = false;
+		native_history_unlocks++;
+		return;
+	}
 	UT_ASSERT(lock == XidGenLock && native_xid_locked);
 	native_xid_locked = false;
 }
@@ -365,6 +380,8 @@ bool
 cluster_undo_retention_horizon_sample(ClusterUndoRetentionSample *out)
 {
 	test_retention_sample_calls++;
+	if (native_history_enabled)
+		return native_history_sample(out);
 	*out = test_retention_sample;
 	test_horizon_now += test_cohort_clock_shift;
 	test_cohort_clock_shift = 0;
@@ -1064,6 +1081,7 @@ UT_TEST(test_local_report_refusal_clears_metadata_and_stalls_sender)
 static void
 reset_v2_sender(void)
 {
+	native_history_enabled = false;
 	(void)reset_v2_receiver();
 	MemSet(&test_sender_sample, 0, sizeof(test_sender_sample));
 	test_sender_sample.scan.status = CTRC_ACTIVE_SCAN_COMPLETE;
@@ -3039,10 +3057,151 @@ UT_TEST(test_watermark_reader_clears_output_on_late_registration)
 	UT_ASSERT_EQ(test_sender_sample.sample_id, sample_id);
 }
 
+UT_TEST(test_native_history_cut_reaches_report_cohort_and_watermark)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
+	ClusterHeapFreezeCohortObservation cohort;
+	ClusterHeapFreezeWatermark watermark;
+	SCN minimum = scn_encode(2, 250);
+
+	cohort_receive(65, report);
+	native_history_reset();
+	native_history_procs[0].xmin = 90;
+	pg_atomic_write_u64(&native_history_procs[0].cluster_read_scn_atomic, 500);
+	native_history_procs[2].xmin = 120;
+	pg_atomic_write_u64(&native_history_procs[2].cluster_read_scn_atomic, minimum);
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT(test_v2_sends > 0);
+	UT_ASSERT_EQ(test_v2_sent.horizon_scn, minimum);
+	UT_ASSERT_EQ(test_v2_sent.h_sample_clock_scn, native_history_clock);
+	UT_ASSERT_EQ(test_v2_sent.h_contributor_kind,
+		CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+	UT_ASSERT_EQ(test_v2_sent.h_contributor_token, 3);
+	UT_ASSERT(cluster_heap_freeze_watermark_sample(&watermark));
+	UT_ASSERT_EQ(watermark.horizon_scn, minimum);
+	UT_ASSERT_EQ(native_history_cuts, 1);
+	UT_ASSERT_EQ(native_history_clocks, 1);
+	UT_ASSERT_EQ(native_history_unlocks, 1);
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&cohort), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	UT_ASSERT_EQ(cohort.source_local_horizon_scn, minimum);
+	UT_ASSERT_EQ(cohort.source_local_history.sample_clock_scn, native_history_clock);
+	UT_ASSERT_EQ(cohort.source_local_history.contributor_kind,
+		CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+	UT_ASSERT_EQ(cohort.source_local_history.contributor_token, 3);
+	UT_ASSERT_EQ(cohort.horizon_scn, minimum);
+	UT_ASSERT_EQ(native_history_cuts, 2);
+	UT_ASSERT_EQ(native_history_clocks, native_history_cuts);
+	UT_ASSERT_EQ(native_history_unlocks, native_history_cuts);
+	UT_ASSERT(!native_history_locked);
+	native_history_enabled = false;
+}
+
+UT_TEST(test_native_unproven_history_refuses_original_lmon_and_cohort)
+{
+	for (unsigned variant = 0; variant < 6; variant++) {
+		(void)reset_v2_cohort(false);
+		native_history_reset();
+		native_history_procs[0].xmin = 90;
+		pg_atomic_write_u64(&native_history_procs[0].cluster_read_scn_atomic, 400);
+		switch (variant) {
+		case 0: pg_atomic_write_u64(&native_history_procs[0].cluster_read_scn_atomic, InvalidScn); break;
+		case 1: procArray->replication_slot_xmin = 90; break;
+		case 2: procArray->replication_slot_catalog_xmin = 90; break;
+		case 3:
+			native_history_procs[1].pid = 0;
+			native_history_procs[1].xmin = 120;
+			break;
+		case 4: pg_atomic_write_u64(&native_history_procs[0].cluster_read_scn_atomic, UINT64_MAX); break;
+		case 5: procArray->numProcs = procArray->maxProcs + 1; break;
+		}
+		cluster_undo_horizon_lmon_tick();
+		UT_ASSERT_EQ(test_v2_sends, 0);
+		UT_ASSERT_EQ(test_horizon_store.report_sequence, 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&test_horizon_store.freeze_watermark_seq), 0);
+		assert_cohort_refusal(CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE);
+		UT_ASSERT_EQ(native_history_cuts, 2);
+		UT_ASSERT_EQ(native_history_clocks, native_history_cuts);
+		UT_ASSERT_EQ(native_history_unlocks, native_history_cuts);
+		UT_ASSERT(!native_history_locked);
+		native_history_enabled = false;
+	}
+}
+
+UT_TEST(test_native_history_loss_preserves_candidate_without_a_fresh_fold)
+{
+	ClusterHeapFreezeWatermark old;
+	uint64 report_sequence;
+	uint32 watermark_seq;
+	unsigned sends;
+
+	(void)reset_v2_cohort(false);
+	native_history_reset();
+	native_history_procs[0].xmin = 90;
+	pg_atomic_write_u64(&native_history_procs[0].cluster_read_scn_atomic, 250);
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT(cluster_heap_freeze_watermark_sample(&old));
+	report_sequence = test_horizon_store.report_sequence;
+	watermark_seq = pg_atomic_read_u32(&test_horizon_store.freeze_watermark_seq);
+	sends = test_v2_sends;
+	procArray->replication_slot_catalog_xmin = 90;
+	test_horizon_now += 1000001;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_v2_sends, sends);
+	UT_ASSERT_EQ(test_horizon_store.report_sequence, report_sequence);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&test_horizon_store.freeze_watermark_seq), watermark_seq);
+	UT_ASSERT(memcmp(&old, &test_horizon_store.freeze_watermark, sizeof(old)) == 0);
+	assert_cohort_refusal(CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE);
+	procArray->replication_slot_catalog_xmin = InvalidTransactionId;
+	test_horizon_now += 1000001;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT(test_v2_sends > sends);
+	UT_ASSERT_EQ(test_horizon_store.report_sequence, report_sequence + 1);
+	UT_ASSERT_EQ(test_v2_sent.f_sample_id, old.f_sample_id);
+	UT_ASSERT_EQ(test_v2_sent.horizon_scn, 250);
+	UT_ASSERT_EQ(native_history_cuts, 4);
+	UT_ASSERT_EQ(native_history_clocks, native_history_cuts);
+	UT_ASSERT_EQ(native_history_unlocks, native_history_cuts);
+	native_history_enabled = false;
+}
+
+UT_TEST(test_native_history_retirement_preserves_exact_equal_time_origin)
+{
+	SCN first = scn_encode(3, 250), second = scn_encode(1, 250);
+	uint64 report_sequence, sample_id;
+
+	(void)reset_v2_cohort(false);
+	native_history_reset();
+	for (unsigned i = 0; i < 2; i++) {
+		native_history_procs[i].xmin = 90 + i;
+		pg_atomic_write_u64(&native_history_procs[i].cluster_read_scn_atomic,
+			i == 0 ? first : second);
+	}
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_v2_sent.horizon_scn, first);
+	UT_ASSERT_EQ(test_v2_sent.h_contributor_token, 1);
+	report_sequence = test_v2_sent.report_sequence;
+	sample_id = test_v2_sent.f_sample_id;
+	/* Retire only the original source; the equal-time reader remains. */
+	native_history_procs[0].xmin = InvalidTransactionId;
+	pg_atomic_write_u64(&native_history_procs[0].cluster_read_scn_atomic, InvalidScn);
+	test_horizon_now += 1000001;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_v2_sent.horizon_scn, second);
+	UT_ASSERT_EQ(test_v2_sent.h_contributor_token, 2);
+	UT_ASSERT_EQ(test_v2_sent.h_sample_clock_scn, native_history_clock);
+	UT_ASSERT_EQ(test_v2_sent.report_sequence, report_sequence + 1);
+	UT_ASSERT_EQ(test_v2_sent.f_sample_id, sample_id);
+	UT_ASSERT_EQ(test_horizon_store.freeze_watermark.horizon_scn, second);
+	UT_ASSERT_EQ(native_history_cuts, 2);
+	UT_ASSERT_EQ(native_history_clocks, native_history_cuts);
+	UT_ASSERT_EQ(native_history_unlocks, native_history_cuts);
+	native_history_enabled = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(108);
+	UT_PLAN(112);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -3153,7 +3312,12 @@ main(void)
 	UT_RUN(test_v2_lmon_records_real_cohort_refusals);
 	UT_RUN(test_v2_lmon_observation_respects_original_shutdown_and_enable_gates);
 	UT_RUN(test_v2_lmon_observes_clock_rollback_as_stale);
+	UT_RUN(test_native_history_cut_reaches_report_cohort_and_watermark);
+	UT_RUN(test_native_unproven_history_refuses_original_lmon_and_cohort);
+	UT_RUN(test_native_history_loss_preserves_candidate_without_a_fresh_fold);
+	UT_RUN(test_native_history_retirement_preserves_exact_equal_time_origin);
 
 	UT_DONE();
+	free(procArray);
 	return ut_failed_count == 0 ? 0 : 1;
 }

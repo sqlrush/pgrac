@@ -9137,6 +9137,9 @@ test_cluster_undo_horizon_sender.inc: $(top_srcdir)/src/backend/cluster/cluster_
 		END { if (!done || starts != 1) exit 1 }' $< > $@
 
 test_cluster_undo_horizon: test_cluster_undo_horizon.c unit_test.h \
+		$(srcdir)/test_cluster_undo_horizon_retention_fixture.inc \
+		test_cluster_pgproc_active_types.inc test_cluster_retention_sample.inc \
+		$(CLUSTER_UNDO_RETENTION_O) \
 		test_cluster_subtrans_watermark.inc $(CLUSTER_XID_STRIPE_O) \
 		$(top_srcdir)/src/include/access/slru.h $(top_srcdir)/src/include/access/subtrans.h \
 		$(top_srcdir)/src/include/cluster/cluster_mode.h $(top_srcdir)/src/include/storage/lwlock.h \
@@ -9153,6 +9156,7 @@ test_cluster_undo_horizon: test_cluster_undo_horizon.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_HORIZON_O) $(CLUSTER_XID_STRIPE_O) \
+		$(CLUSTER_UNDO_RETENTION_O) \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -o $@
