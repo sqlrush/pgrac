@@ -103,10 +103,22 @@ extern ClusterRelmapV2ClearResult cluster_relmap_retention_runtime_discard_pendi
  * all existing same-FullXid pins, including staged pins and all namespaces.
  * No global relmap X lock is required. An empty COMPLETE origin stays empty;
  * UNKNOWN/BUILDING is never a qualified empty set. Inputs cannot be supplied
- * by another backend. Refusal preserves ACTIVE/BIND and pins; the eventual
- * live hook must follow its ERROR path without cancelling publication.
+ * by another backend. Refusal preserves ACTIVE/BIND and pins; the
+ * ACTIVE hook below follows its ERROR path without cancelling publication.
  * OK grants no stage, terminal, TT reuse or pin release permission. */
 extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_bind_current_v2(void);
+
+/* Original ACTIVE publisher, after successful publication/admission leave and
+ * on reuse, before returning success. Only this backend's actual successful
+ * v2 begin creates a routing duty; no begin or a different actual FullXid is
+ * a no-op, not an assertion that an UNKNOWN directory is empty. The last
+ * proven zero-effect cancellation clears this routing duty; ERROR, staged
+ * cleanup and shmem reattachment do not. Same-top calls enroll the real TT
+ * receipt through bind_current, preserving its source/COMPLETE/lock gates.
+ * False/ERROR must propagate OUTSIDE the ACTIVE publication catch so its
+ * already published binding remains available to original abort. No stage,
+ * terminal, COMPLETE or release permission, and no live v2 producer activation. */
+extern bool cluster_relmap_retention_runtime_after_active_v2(TransactionId top_xid);
 
 /* Dormant read-only relmap conjunct for an original TT release/reuse consumer
  * (ordinary A0/GC or recovery D0). The original caller authenticates the

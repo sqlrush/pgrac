@@ -35,6 +35,16 @@ typedef struct RelmapRetentionRuntimeShmem {
 
 static RelmapRetentionRuntimeShmem *relmap_runtime_shmem;
 
+/* PGRAC: only an original successful begin creates this backend's routing
+ * duty. It is not shmem completeness or a release receipt. Keep it across
+ * ERROR/reattachment; a different actual FullXid never inherits the duty.
+ * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md */
+static struct {
+	uint64 top_full_xid;
+	int origin;
+	int pid;
+} relmap_runtime_active_owner;
+
 static Size
 relmap_runtime_shmem_size(void)
 {
@@ -108,14 +118,22 @@ ClusterRelmapRetentionResult
 cluster_relmap_retention_runtime_begin_v2(const ClusterRelmapOwnerSampleV2 *sample,
 	const ClusterRelmapV2Namespace *identity, uint64 generation)
 {
+	ClusterRelmapRetentionResult result;
+
 	if (sample == NULL || identity == NULL || sample->owner.node >= CLUSTER_MAX_NODES)
 		return CLUSTER_RELMAP_RETENTION_INVALID;
 	if (relmap_runtime_shmem == NULL)
 		return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
 	/* The original adapter rechecks provenance/namespace and samples the real
 	 * published TT receipt outside the lock. Only its pure core runs inside. */
-	return cluster_relmap_owner_retention_begin_v2(sample, identity, generation,
+	result = cluster_relmap_owner_retention_begin_v2(sample, identity, generation,
 		&relmap_runtime_shmem->directories[sample->owner.node], &relmap_runtime_shmem->lock);
+	if (result == CLUSTER_RELMAP_RETENTION_OK) {
+		relmap_runtime_active_owner.top_full_xid = sample->owner.top_full_xid;
+		relmap_runtime_active_owner.origin = sample->owner.node;
+		relmap_runtime_active_owner.pid = sample->producer_pid;
+	}
+	return result;
 }
 
 static ClusterRelmapRetentionResult
@@ -288,6 +306,23 @@ cluster_relmap_retention_runtime_cancel_prepare_v2(const ClusterRelmapOwnerSampl
 	result = relmap_runtime_directory_matches(directory, &key);
 	if (result == CLUSTER_RELMAP_RETENTION_OK)
 		result = cluster_relmap_retention_cancel_prepare(directory, &key);
+	if (result == CLUSTER_RELMAP_RETENTION_OK
+		&& relmap_runtime_active_owner.top_full_xid == key.top_full_xid
+		&& relmap_runtime_active_owner.origin == key.origin
+		&& relmap_runtime_active_owner.pid == MyProcPid) {
+		bool remaining = false;
+
+		/* Only the original COMPLETE directory, after a proven zero-effect
+		 * cancellation, can show that this backend has no remaining duty. */
+		for (unsigned i = 0; i < CLUSTER_RELMAP_RETENTION_CAPACITY; i++)
+			if (directory->pins[i].occupied
+				&& directory->pins[i].key.top_full_xid == key.top_full_xid) {
+				remaining = true;
+				break;
+			}
+		if (!remaining)
+			memset(&relmap_runtime_active_owner, 0, sizeof(relmap_runtime_active_owner));
+	}
 	LWLockRelease(&relmap_runtime_shmem->lock);
 	return result;
 }
@@ -407,6 +442,27 @@ cluster_relmap_retention_runtime_bind_current_v2(void)
 		result = cluster_relmap_retention_bind(directory, U64FromFullTransactionId(top), &binding);
 	LWLockRelease(&relmap_runtime_shmem->lock);
 	return result;
+}
+
+bool
+cluster_relmap_retention_runtime_after_active_v2(TransactionId top_xid)
+{
+	FullTransactionId top;
+
+	/* No dormant producer begin in this backend means no new v2 duty. Do
+	 * not consult an UNKNOWN directory or assign an xid for ordinary v1. */
+	if (relmap_runtime_active_owner.top_full_xid == 0)
+		return true;
+	top = GetTopFullTransactionIdIfAny();
+	if (!FullTransactionIdIsValid(top) || !TransactionIdIsNormal(XidFromFullTransactionId(top)))
+		return false;
+	if (U64FromFullTransactionId(top) != relmap_runtime_active_owner.top_full_xid)
+		return true;
+	if (XidFromFullTransactionId(top) != top_xid
+		|| relmap_runtime_active_owner.origin != cluster_node_id
+		|| relmap_runtime_active_owner.pid != MyProcPid)
+		return false;
+	return cluster_relmap_retention_runtime_bind_current_v2() == CLUSTER_RELMAP_RETENTION_OK;
 }
 
 ClusterRelmapRetentionResult

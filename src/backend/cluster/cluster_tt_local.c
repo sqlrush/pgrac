@@ -65,6 +65,8 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "cluster/cluster_relmap_retention_runtime.h"
+
 typedef struct ClusterTTLocalShmem {
 	pg_atomic_uint32 slot_seq; /* monotonic provisional tt_slot_id */
 } ClusterTTLocalShmem;
@@ -806,6 +808,18 @@ cluster_tt_local_forget_unpublished_reservation(TransactionId top_xid)
 	memset(&cluster_tt_local_bindings[cluster_tt_local_binding_count], 0, sizeof(*binding));
 }
 
+/* PGRAC: late pin enrollment must not relabel a published ACTIVE as FAILED.
+ * Keep it outside the publication catch, with original abort duty intact.
+ * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md */
+static void
+cluster_tt_local_bind_relmap_pending(TransactionId top_xid)
+{
+	if (!cluster_relmap_retention_runtime_after_active_v2(top_xid))
+		ereport(ERROR,
+			(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+			 errmsg("cannot attach canonical ACTIVE to existing relation map retention")));
+}
+
 bool
 cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 										  ClusterCanonicalTxnBinding *binding_out)
@@ -846,8 +860,10 @@ cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 		idx = cluster_tt_local_find_binding(top_xid);
 		if (idx >= 0) {
 			binding = &cluster_tt_local_bindings[idx];
-			if (cluster_tt_local_copy_published(binding, binding_out))
+			if (cluster_tt_local_copy_published(binding, binding_out)) {
+				cluster_tt_local_bind_relmap_pending(top_xid);
 				return true;
+			}
 			if (binding->publish_state != CLUSTER_CANONICAL_TXN_RESERVED)
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
@@ -945,8 +961,10 @@ cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 		cluster_semantic_activation_leave(&modifier_token);
 		if (!reserved)
 			return false;
-		if (!retry_unpublished)
+		if (!retry_unpublished) {
+			cluster_tt_local_bind_relmap_pending(top_xid);
 			return true;
+		}
 		cluster_tt_local_forget_unpublished_reservation(top_xid);
 		retry_count++;
 		if (retry_count == 1 || (retry_count & (retry_count - 1)) == 0)

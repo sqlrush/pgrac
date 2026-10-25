@@ -3,12 +3,29 @@
  * Author: SqlRush <sqlrush@gmail.com> */
 #include "test_cluster_relmap_native_tt_namespace.h"
 #define TT_ACTIVE_OWNER_FIXTURE_MAIN d3_tt_existing_main
+#define TT_ACTIVE_OWNER_EXTERNAL_RELMAP_HOOK
 #include "test_cluster_tt_active_owner.c"
 #include "test_cluster_relmap_native_tt.h"
+
+static bool (*active_observer)(TransactionId);
+bool cluster_relmap_retention_runtime_after_active_v2(TransactionId xid);
+
+bool
+cluster_relmap_retention_runtime_after_active_v2(TransactionId xid)
+{
+	return active_observer == NULL || active_observer(xid);
+}
+
+void
+test_relmap_native_tt_observe_active(bool (*observer)(TransactionId))
+{
+	active_observer = observer;
+}
 
 void
 test_relmap_native_tt_reset(void)
 {
+	active_observer = NULL;
 	ut_current_failed = 0;
 	cluster_node_id = 0;
 	reset_active_owner();

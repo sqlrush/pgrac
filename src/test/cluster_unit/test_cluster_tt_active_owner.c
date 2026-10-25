@@ -12,6 +12,15 @@ int durable_fixture_main(int argc, char **argv);
 #include "../../backend/cluster/cluster_tt_slot.c"
 #include "../../backend/cluster/cluster_tt_local.c"
 
+/* Ordinary TT tests have no relmap producer; the composition supplies it. */
+#ifndef TT_ACTIVE_OWNER_EXTERNAL_RELMAP_HOOK
+bool
+cluster_relmap_retention_runtime_after_active_v2(TransactionId xid pg_attribute_unused())
+{
+	return true;
+}
+#endif
+
 static ClusterTTSlotShmem allocator_storage;
 static int lock_depth;
 static int modifier_enters;

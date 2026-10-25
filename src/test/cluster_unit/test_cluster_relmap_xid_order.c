@@ -1108,11 +1108,19 @@ UT_TEST(unarmed_commit_preserves_other_writers_pending_and_global_lock)
 #include "test_cluster_relmap_original_tt.inc"
 #include "test_cluster_relmap_tt_retention.inc"
 #include "test_cluster_relmap_tt_terminal.inc"
+#include "test_cluster_relmap_active_hook.inc"
 
 int
 main(void)
 {
-	UT_PLAN(81);
+	UT_PLAN(88);
+	UT_RUN(v2_active_hook_rejects_a_changed_original_owner);
+	UT_RUN(v2_active_hook_has_no_duty_without_original_begin);
+	UT_RUN(v2_active_hook_does_not_reconstruct_a_new_full_xid_era);
+	UT_RUN(v2_active_hook_forgets_only_all_cancelled_zero_effect_prepares);
+	UT_RUN(v2_active_hook_binds_all_prior_staged_pins);
+	UT_RUN(v2_active_hook_refusal_preserves_published_active_and_pins);
+	UT_RUN(v2_active_hook_rechecks_already_published_receipt);
 	UT_RUN(v2_unwritten_tt_commit_stage_survives_relmap_abort);
 	UT_RUN(v2_unwritten_tt_commit_stage_abort_error_keeps_pins);
 	UT_RUN(v2_original_tt_commit_precedes_relmap_postcommit);
