@@ -82,6 +82,16 @@ struct ClusterWalRetentionPin {
 	ClusterWalPinLock *readers; /* retained inputs without recovery authority */
 };
 
+bool
+cluster_wal_retention_pin_output_distinct_v1(const ClusterWalRetentionPin *pin,
+	const void *out, Size bytes)
+{
+	uintptr_t a = (uintptr_t)out, b = (uintptr_t)pin;
+
+	return pin != NULL && out != NULL && bytes != 0
+		&& (a <= b ? b - a >= bytes : a - b >= sizeof(*pin));
+}
+
 struct ClusterWalRootPublishGuard {
 	uint32 magic;
 	int32 owner_pid;

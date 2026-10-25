@@ -63,6 +63,11 @@ typedef struct RfPageAuthorityBatchRequestV1 {
 
 typedef struct RfPageAuthorityPreflightV1 RfPageAuthorityPreflightV1;
 typedef struct RfPageAuthorityGuardV1 RfPageAuthorityGuardV1;
+/* Exclude this complete opaque object before writing caller output/scratch.
+ * Storage separation only, not guard validity or authority. The caller also
+ * keeps every separately allocated/borrowed backing object disjoint. */
+extern bool rf_page_authority_guard_output_distinct_v1(const RfPageAuthorityGuardV1 *guard,
+	const void *out, Size bytes);
 
 /* Value references to already held objects, never a replacement for them.
  * No observer may dereference the cookie or acquire authority from this value. */

@@ -233,6 +233,11 @@ typedef enum ClusterWalrReleaseResult {
 } ClusterWalrReleaseResult;
 
 typedef struct ClusterWalRetentionPin ClusterWalRetentionPin;
+/* Complete opaque pin object extent only, without dereferencing it or
+ * validating authority. Separately allocated/borrowed storage remains the
+ * caller's disjointness obligation. No I/O, lock, mutation or retirement. */
+extern bool cluster_wal_retention_pin_output_distinct_v1(const ClusterWalRetentionPin *pin,
+	const void *out, Size bytes);
 typedef struct ClusterWalRootPublishGuard ClusterWalRootPublishGuard;
 typedef struct ClusterWalReadPinV1 ClusterWalReadPinV1;
 

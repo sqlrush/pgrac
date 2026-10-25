@@ -34,7 +34,9 @@ static bool found_region;
 static ClusterRecoveryStampOwnerV1 owner;
 static uint8 payload[CLUSTER_RECOVERY_TT_ABORT_BYTES];
 static unsigned stamp_hash_calls;
-static char fpi_guard_object, fpi_pin_object;
+static PGAlignedBlock fpi_guard_backing, fpi_pin_backing;
+#define fpi_guard_object fpi_guard_backing.data[0]
+#define fpi_pin_object fpi_pin_backing.data[0]
 static ClusterRecoverySerialGuard fpi_serial;
 static RfPageIdentityV1 fpi_target;
 static bool fpi_protection_current;
