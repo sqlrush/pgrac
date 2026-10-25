@@ -89,6 +89,11 @@ static unsigned int drift_at, drift_kind;
 static LWLock *v2_retention_lock;
 static bool v2_retention_held, v2_xidgen_held;
 static void (*v2_preserve_observer)(RelFileLocator locator, bool at_commit);
+static bool v2_terminal_context;
+static ClusterRelmapV2PairResult (*v2_pair_observer)(const ClusterRelmapV2Namespace *, ClusterRelmapV2View *);
+static bool (*v2_write_observer)(const ClusterRelmapV2Namespace *, uint64,
+	const ClusterRelmapV2Owner *, const RelMapFile *, ClusterRelmapRetentionDirectory *, LWLock *);
+static bool (*v2_prepared_pair_observer)(const ClusterRelmapV2Image *);
 
 /* Original runtime providers are explicit fixtures; token checks are real. */
 uint64 GetSystemIdentifier(void) { return UINT64CONST(0x1122334455667788); }
@@ -136,7 +141,7 @@ cluster_write_fence_observe(ClusterWriteFenceObservation *out)
 	out->now_us = 100;
 	out->expiry_us = 10000;
 }
-bool IsTransactionState(void) { return true; }
+bool IsTransactionState(void) { return !v2_terminal_context; }
 bool RecoveryInProgress(void) { return false; }
 TimeLineID GetWALInsertionTimeLine(void) { return insert_timeline; }
 bool
@@ -1043,11 +1048,16 @@ UT_TEST(unarmed_commit_preserves_other_writers_pending_and_global_lock)
 
 #include "test_cluster_relmap_producer_stage.inc"
 #include "test_cluster_relmap_producer_prepare.inc"
+#include "test_cluster_relmap_producer_terminal.inc"
 
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(38);
+	UT_RUN(v2_terminal_custody_uses_original_prepare_for_both_flavours);
+	UT_RUN(v2_terminal_arm_refuses_without_replacing_original_custody);
+	UT_RUN(v2_terminal_attempt_context_refusals_are_sticky);
+	UT_RUN(v2_terminal_partial_unknown_and_errors_keep_all_custody);
 	UT_RUN(v2_prepare_preserves_installs_and_forces_sync);
 	UT_RUN(v2_prepare_refusals_keep_local_map_and_debt);
 	UT_RUN(v2_staged_runtime_check_requires_original_exact_pin);

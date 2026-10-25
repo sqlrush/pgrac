@@ -23,6 +23,9 @@ cluster_relmap_authority_v2_check_staged(const ClusterRelmapV2Image *staged)
 	ClusterRelmapRetentionDirectory *directory = &relmap_runtime_shmem->directories[cluster_node_id];
 	uint8 wire[CLUSTER_RELMAP_V2_FILE_SIZE];
 
+	if (v2_prepared_pair_observer)
+		return v2_prepared_pair_observer(staged);
+
 	UT_ASSERT(authority_held && local_held && !v2_retention_held && CritSectionCount == 0);
 	UT_ASSERT_EQ(v2_stage_calls, 1);
 	UT_ASSERT_EQ(v2_stage_writes, 2);

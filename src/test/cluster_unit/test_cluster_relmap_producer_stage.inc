@@ -104,6 +104,8 @@ ClusterRelmapV2PairResult
 cluster_relmap_authority_v2_read(const ClusterRelmapV2Namespace *identity,
 	ClusterRelmapV2View *out)
 {
+	if (v2_pair_observer)
+		return v2_pair_observer(identity, out);
 	UT_ASSERT(authority_held && !v2_retention_held && CritSectionCount == 0);
 	UT_ASSERT_EQ(identity->system_identifier, GetSystemIdentifier());
 	UT_ASSERT_EQ(identity->database_incarnation, writer_ref.claim.database_incarnation);
@@ -148,6 +150,9 @@ cluster_relmap_authority_v2_write_pending(const ClusterRelmapV2Namespace *identi
 {
 	ClusterRelmapRetentionKey key = { 0 };
 	ClusterRelmapRetentionResult result;
+
+	if (v2_write_observer)
+		return v2_write_observer(identity, generation, owner, pending, directory, lock);
 
 	UT_ASSERT(authority_held && local_held && !v2_retention_held && CritSectionCount == 0);
 	UT_ASSERT(lock == v2_retention_lock);
