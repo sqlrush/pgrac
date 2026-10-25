@@ -513,6 +513,10 @@ extern bool cluster_recovery_merge_fence_plan_acquire_serial(ClusterRecoveryFenc
 extern bool cluster_recovery_merge_fence_plan_acquire_serial_inputs_v1(
 	ClusterRecoveryFencePlan *plan, const uint16 *input_threads, uint16 ninput_threads);
 extern bool cluster_recovery_merge_commit_plan_nowait(ClusterRecoveryFencePlan *plan);
+/* Borrowed diagnostic only, valid until plan destruction. Empty before the
+ * first refusal; copied before cleanup by the original Startup FATAL. */
+extern const char *
+cluster_recovery_merge_fence_plan_refusal_v1(const ClusterRecoveryFencePlan *plan);
 extern bool cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *plan);
 extern uint16 cluster_recovery_merge_fence_plan_origin_count(const ClusterRecoveryFencePlan *plan);
 struct ClusterControlRootSnapshot;

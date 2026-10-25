@@ -661,6 +661,21 @@ UT_TEST(cold_plan_trace_reports_actual_pin_revalidation_without_new_ir)
 	cold_pin_cleanup(&plan);
 }
 
+UT_TEST(ir_first_acquire_failure_identifies_its_original_set_index)
+{
+	ClusterRecoverySerialRequest request = ir_request(2);
+	ClusterRecoverySerialGuardSet set = { 0 };
+	uint16 failed_index = CLUSTER_RECOVERY_SERIAL_SET_FAILED_NONE;
+
+	ir_unavailable_thread = 2;
+	UT_ASSERT_EQ(cluster_recovery_serial_acquire_set(&request, 1, 100, &set, &failed_index),
+				 CLUSTER_RECOVERY_SERIAL_ROOT_UNAVAILABLE);
+	UT_ASSERT_EQ(failed_index, 0);
+	UT_ASSERT_EQ(set.count, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 0);
+	ir_unavailable_thread = 0;
+}
+
 int
 main(void)
 {
@@ -673,7 +688,8 @@ main(void)
 	retire_driver = cluster_control_request_driver_start();
 	cluster_shared_config = true;
 	MyBackendType = B_LMON; /* Nonblocking release; ACKs are explicit above. */
-	UT_PLAN(15);
+	UT_PLAN(16);
+	UT_RUN(ir_first_acquire_failure_identifies_its_original_set_index);
 	UT_RUN(ir_copied_set_compacts_without_losing_cleanup_owner);
 	UT_RUN(ir_failed_s5_outlives_stack_without_becoming_a_holder);
 	UT_RUN(ir_old_guard_is_unusable_during_rebind_but_still_releasable);

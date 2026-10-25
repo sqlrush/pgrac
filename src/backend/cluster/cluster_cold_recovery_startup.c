@@ -686,10 +686,35 @@ cold_census_matches(ClusterColdTypedV1 *typed)
 		return false;
 	}
 	if (memcmp(&token, &typed->census_root, sizeof(token)) != 0) {
+		const unsigned char *expected = (const unsigned char *)&typed->census_root;
+		const unsigned char *observed = (const unsigned char *)&token;
+		const char *field = "padding";
+		size_t byte = 0;
+
+		/* Diagnose the same original comparison; do not reread or rebase the
+		 * selected ROOT. The byte index also identifies array elements. */
+		while (byte < sizeof(token) && expected[byte] == observed[byte])
+			byte++;
+#define CENSUS_TOKEN_FIELD(member)                                                                 \
+	if (byte >= offsetof(ClusterControlRootFileToken, member)                                      \
+		&& byte < offsetof(ClusterControlRootFileToken, member) + sizeof(token.member))            \
+	field = #member
+		CENSUS_TOKEN_FIELD(authority_uuid);
+		CENSUS_TOKEN_FIELD(file_txn_seq);
+		CENSUS_TOKEN_FIELD(body_crc32c);
+		CENSUS_TOKEN_FIELD(header_crc32c);
+		CENSUS_TOKEN_FIELD(activation_state);
+		CENSUS_TOKEN_FIELD(format_version);
+		CENSUS_TOKEN_FIELD(record_count);
+		CENSUS_TOKEN_FIELD(system_identifier);
+		CENSUS_TOKEN_FIELD(image_sha256);
+#undef CENSUS_TOKEN_FIELD
 		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
-					"pre-execution census refused: stage=census_root_changed expected_txn="
-					UINT64_FORMAT " observed_txn=" UINT64_FORMAT,
-					typed->census_root.file_txn_seq, token.file_txn_seq);
+					"pre-execution census refused: stage=census_root_changed field=%s byte=%zu "
+					"expected_byte=%u observed_byte=%u expected_txn=" UINT64_FORMAT
+					" observed_txn=" UINT64_FORMAT,
+					field, byte, expected[byte], observed[byte], typed->census_root.file_txn_seq,
+					token.file_txn_seq);
 		return false;
 	}
 	for (uint32 i = typed->replay_count; i < typed->participant_count; i++) {

@@ -411,8 +411,15 @@ UT_TEST(test_census_recheck_preserves_original_history_inputs_only)
 
 UT_TEST(test_census_recheck_rejects_every_changed_root_token_byte)
 {
+	const char *fields[] = { "authority_uuid", "file_txn_seq",		"body_crc32c",
+							 "header_crc32c",  "activation_state",	"format_version",
+							 "record_count",   "system_identifier", "image_sha256" };
+	const size_t ends[] = { 16, 24, 28, 32, 36, 38, 40, 48, 80 };
+
 	for (size_t byte = 0; byte < sizeof(census_token); byte++) {
 		ClusterColdTypedV1 *typed;
+		char expected[64];
+		size_t field = 0;
 
 		fixture();
 		history_generation(2, 9, 0x40, 0x80);
@@ -420,6 +427,12 @@ UT_TEST(test_census_recheck_rejects_every_changed_root_token_byte)
 		((unsigned char *)&census_token)[byte] ^= 1;
 		UT_ASSERT(!cluster_cold_typed_recheck_inputs_v1(typed));
 		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
+		while (byte >= ends[field])
+			field++;
+		snprintf(expected, sizeof(expected), "field=%s byte=%zu ", fields[field], byte);
+		UT_ASSERT(strstr(typed->refusal_detail, expected) != NULL);
+		UT_ASSERT(strstr(typed->refusal_detail, "expected_byte=") != NULL);
+		UT_ASSERT(strstr(typed->refusal_detail, "observed_byte=") != NULL);
 		UT_ASSERT(!typed->census_root_captured);
 		UT_ASSERT_EQ(typed->history_xid[3].next_xid, 0);
 		UT_ASSERT_EQ(census_releases, 2);
