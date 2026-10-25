@@ -1293,6 +1293,125 @@ cluster_recovery_tx_result_wait_v1(const struct ClusterRecoveryStartV1 *start)
 	}
 }
 
+typedef struct RecoveryCtrcHandoffV1 {
+	const struct ClusterRecoveryStartV1 *start;
+	const ClusterColdTypedV1 *typed;
+	const ClusterColdCtrcWorkV1 *work;
+	const ClusterColdPlanV1 *plan;
+	const ClusterColdTopTxCensusV1 *census;
+	uint64 work_generation, slot_generation, first_result_generation;
+	ClusterColdCtrcReleaseCensusV1 counts;
+	ClusterControlRootFileToken root;
+	ClusterRecoveryCheckpointOwnerV1 owner;
+	ClusterRecoveryTxResultValueV1 tx;
+} RecoveryCtrcHandoffV1;
+
+static RecoveryTxHandoffStatus
+recovery_ctrc_result_handoff_status(const RecoveryCtrcHandoffV1 *fixed)
+{
+	ClusterRecoveryCheckpointSlotV1 *slot;
+	ClusterRecoveryCheckpointOwnerV1 owner;
+	const ClusterRecoveryCtrcResultValueV1 *result;
+	RecoveryTxHandoffStatus status = RECOVERY_TX_HANDOFF_BLOCKED;
+	uint8 zero[32] = {0};
+
+	if (MyBackendType != B_STARTUP || !IsUnderPostmaster || CritSectionCount != 0
+		|| ShutdownRequestPending || fixed->start != checkpoint_registered_start
+		|| cluster_recovery_plan_shmem == NULL
+		|| !ClusterColdRecoveryCtrcWorkCurrent(fixed->start, fixed->work)
+		|| ClusterColdRecoveryTxInputs(fixed->start) != fixed->typed
+		|| fixed->work->generation != fixed->work_generation
+		|| memcmp(&fixed->work->counts, &fixed->counts, sizeof(fixed->counts)) != 0
+		|| fixed->typed->plan != fixed->plan || fixed->typed->top_tx_census != fixed->census
+		|| fixed->census->plan != fixed->plan || !fixed->typed->census_root_captured
+		|| memcmp(&fixed->typed->census_root, &fixed->root, sizeof(fixed->root)) != 0
+		|| fixed->root.system_identifier != fixed->owner.writer.ref.claim.identity.system_identifier
+		|| memcmp(fixed->root.image_sha256, zero, sizeof(zero)) == 0
+		|| !ClusterColdRecoveryTxCheckpointOwnerV1(fixed->start, &owner)
+		|| memcmp(&owner, &fixed->owner, sizeof(owner)) != 0
+		|| memcmp(&checkpoint_registered_owner, &owner, sizeof(owner)) != 0
+		|| cluster_epoch_get_current() != owner.writer.epoch
+		|| fixed->tx.state != CLUSTER_RECOVERY_TX_RESULT_COMPLETE
+		|| fixed->tx.result_generation == 0 || fixed->tx.subject_count != fixed->census->count
+		|| fixed->tx.processed_count != fixed->tx.subject_count
+		|| fixed->tx.completed_count != fixed->tx.subject_count || fixed->tx.unresolved_count != 0
+		|| memcmp(fixed->tx.input_root_sha256, fixed->root.image_sha256, 32) != 0
+		|| fixed->first_result_generation == 0)
+		return status;
+	slot = &cluster_recovery_plan_shmem->checkpoint_owner;
+	SpinLockAcquire(&slot->lock);
+	result = &slot->ctrc_result;
+	if (slot->valid && slot->generation == fixed->slot_generation
+		&& memcmp(&slot->owner, &fixed->owner, sizeof(slot->owner)) == 0
+		&& memcmp(&slot->tx_result, &fixed->tx, sizeof(fixed->tx)) == 0
+		&& slot->tx_accepted_generation == fixed->tx.result_generation
+		&& result->result_generation >= fixed->first_result_generation
+		&& result->subject_count == fixed->counts.subject_count
+		&& result->released_count <= result->subject_count
+		&& result->unresolved_count == result->subject_count - result->released_count
+		&& memcmp(result->input_root_sha256, fixed->root.image_sha256, 32) == 0) {
+		if (result->state == CLUSTER_RECOVERY_CTRC_RESULT_PENDING
+			&& slot->ctrc_accepted_generation == 0)
+			status = RECOVERY_TX_HANDOFF_WAIT;
+		else if (result->state == CLUSTER_RECOVERY_CTRC_RESULT_COMPLETE
+			&& result->released_count == result->subject_count && result->unqualified_count == 0) {
+			if (slot->ctrc_accepted_generation == result->result_generation)
+				status = RECOVERY_TX_HANDOFF_ACCEPTED;
+			else if (slot->ctrc_accepted_generation == 0)
+				status = RECOVERY_TX_HANDOFF_WAIT;
+		}
+	}
+	SpinLockRelease(&slot->lock);
+	return status;
+}
+
+bool
+cluster_recovery_ctrc_result_wait_v1(const struct ClusterRecoveryStartV1 *start)
+{
+	RecoveryCtrcHandoffV1 fixed = {0};
+	ClusterRecoveryCheckpointSlotV1 *slot;
+
+	if (start == NULL)
+		return true;
+	if (start != checkpoint_registered_start || cluster_recovery_plan_shmem == NULL
+		|| !ClusterColdRecoveryTxCheckpointOwnerV1(start, &fixed.owner))
+		return false;
+	fixed.start = start;
+	fixed.typed = ClusterColdRecoveryTxInputs(start);
+	if (fixed.typed == NULL || fixed.typed->top_tx_census == NULL
+		|| !ClusterColdRecoveryCtrcWorkCurrent(start, fixed.typed->ctrc_work))
+		return false;
+	fixed.work = fixed.typed->ctrc_work;
+	fixed.work_generation = fixed.work->generation;
+	fixed.counts = fixed.work->counts;
+	fixed.plan = fixed.typed->plan;
+	fixed.census = fixed.typed->top_tx_census;
+	fixed.root = fixed.typed->census_root;
+	slot = &cluster_recovery_plan_shmem->checkpoint_owner;
+	SpinLockAcquire(&slot->lock);
+	fixed.slot_generation = slot->generation;
+	fixed.first_result_generation = slot->ctrc_result.result_generation;
+	fixed.tx = slot->tx_result;
+	SpinLockRelease(&slot->lock);
+	if (recovery_ctrc_result_handoff_status(&fixed) == RECOVERY_TX_HANDOFF_BLOCKED)
+		return false;
+	for (;;) {
+		RecoveryTxHandoffStatus status;
+
+		ResetLatch(MyLatch);
+		HandleStartupProcInterrupts();
+		/* Interrupts may revoke this owner. Accept only a current result
+		 * after that boundary, never a pre-interrupt COMPLETE snapshot. */
+		status = recovery_ctrc_result_handoff_status(&fixed);
+		if (status == RECOVERY_TX_HANDOFF_BLOCKED)
+			return false;
+		if (status == RECOVERY_TX_HANDOFF_ACCEPTED)
+			return true;
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+			100L, PG_WAIT_EXTENSION);
+	}
+}
+
 bool
 cluster_recovery_checkpoint_begin_v1(struct ClusterRecoveryCheckpointScopeV1 **out)
 {

@@ -374,6 +374,12 @@ extern bool cluster_recovery_ctrc_terminal_subject_v1(const struct ClusterRecove
 /* Original Startup handoff: wait locally for the registered TX component;
  * missing, unresolved or stale results refuse rather than releasing proof. */
 extern bool cluster_recovery_tx_result_wait_v1(const struct ClusterRecoveryStartV1 *start);
+/* Keep original private inputs until the independent CTRC component has been
+ * completed and accepted by original LMON. Freeze this attempt's input/owner
+ * identity; PENDING and unaccepted COMPLETE wait locally without a deadline.
+ * Drift refuses, interrupts propagate, and no result or duty is retired here.
+ * This is lifetime handoff only, not a service producer or completion proof. */
+extern bool cluster_recovery_ctrc_result_wait_v1(const struct ClusterRecoveryStartV1 *start);
 /* Checkpointer-only, process-local opaque stable read; no I/O or write grant.
  * The original publisher must still prove ROOT/common/service and all normal
  * writer, membership, fence, durability and release conditions. */

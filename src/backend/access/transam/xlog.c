@@ -8246,6 +8246,10 @@ StartupXLOG(void)
 	/* Complete original TX component handoff before releasing private input. */
 	if (!cluster_recovery_tx_result_wait_v1(endOfRecoveryInfo->cluster_tx_start))
 		ereport(FATAL, (errmsg("could not complete original Startup transaction result handoff")));
+	/* The same original executor/input must survive independent CTRC service.
+	 * TX acceptance alone cannot transfer or destroy its private work. */
+	if (!cluster_recovery_ctrc_result_wait_v1(endOfRecoveryInfo->cluster_tx_start))
+		ereport(FATAL, (errmsg("could not complete original Startup CTRC result handoff")));
 	ClusterReleaseColdRecoveryInputs(endOfRecoveryInfo);
 #endif
 }
