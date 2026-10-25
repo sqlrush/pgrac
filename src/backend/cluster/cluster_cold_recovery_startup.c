@@ -54,6 +54,7 @@
 #include "cluster/cluster_page_cold_redo.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_recovery_merge.h"
+#include "cluster/cluster_relmap_checkpoint.h"
 #include "cluster/cluster_relmap_retention_runtime.h"
 #include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_wal_tail.h"
@@ -1217,6 +1218,48 @@ cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFen
 	return true;
 }
 
+/* The complete original scan already matched these exact bytes against the
+ * actual checkpoint record and its end. Recheck that retained input here;
+ * parsing its end is not an independent WAL or source qualification. */
+static bool
+cold_xid_window_minimum(const ClusterColdTypedV1 *typed, uint32 p, uint64 *next)
+{
+	const ColdRoot *selected = &typed->replay_roots[p];
+	const ClusterWalSourceRef *source = &typed->sources[p];
+	const uint8 *bytes = selected->native_window;
+	const uint8 zero[160] = { 0 };
+	ClusterRelmapCheckpointWindow window;
+	XLogRecPtr end = 0;
+	uint64 issued;
+	FullTransactionId after;
+
+	if (memcmp(bytes, zero, sizeof(zero)) == 0)
+		return true;
+	for (unsigned i = 0; i < 8; i++)
+		end |= (uint64)bytes[88 + i] << (8 * i);
+	if (selected->checkpoint_start < selected->root.checkpoint_lower_lsn
+		|| selected->checkpoint_start >= end || end > selected->root.validated_tail_lsn_exclusive)
+		return false;
+	if (memcmp(bytes, "RMWIN002", 8) != 0)
+		return cluster_relmap_checkpoint_window_decode_v1(
+			bytes, &selected->native_checkpoint, selected->checkpoint_start, end,
+			&source->claim.identity, source->claim.database_incarnation, &window);
+	if (!cluster_relmap_checkpoint_window_decode_v2(
+			bytes, &selected->native_checkpoint, selected->checkpoint_start, end,
+			&source->claim.identity, source->claim.database_incarnation, &window, &issued)
+		|| issued == UINT64_MAX)
+		return false;
+	/* This actual post-flush issuance can be later than checkpoint nextXid.
+	 * Keep the original counted WAL fold, adding only a monotonic minimum. */
+	after = FullTransactionIdFromU64(issued);
+	FullTransactionIdAdvance(&after);
+	if (!TransactionIdIsNormal(XidFromFullTransactionId(after))
+		|| U64FromFullTransactionId(after) <= issued)
+		return false;
+	*next = Max(*next, U64FromFullTransactionId(after));
+	return true;
+}
+
 static bool
 cold_xid_endpoint(const ClusterColdTypedV1 *typed, const ClusterColdReplayResultV1 *result,
 				  const ClusterColdXidProgressV1 *progress, uint32 p, uint64 *next)
@@ -1303,7 +1346,8 @@ cluster_cold_typed_xid_endpoints_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFe
 				&& cold_replay_sources_current(typed, fence);
 		for (uint32 p = 0; ready && p < typed->participant_count; p++) {
 			uint64 next;
-			ready = cold_xid_endpoint(typed, result, progress, p, &next);
+			ready = cold_xid_endpoint(typed, result, progress, p, &next)
+					&& cold_xid_window_minimum(typed, p, &next);
 			if (ready) {
 				typed->xid_receipt.next_xid[p] = next;
 				if (next > maximum)
