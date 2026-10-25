@@ -343,6 +343,20 @@ typedef struct ColdScanWork {
 	ClusterColdDecodedV1 decoded;
 } ColdScanWork;
 
+/* Observe the original rejecting reader, never a prior decoded record.
+ * Failure diagnostics only: no payload, allocation or extra source read. */
+static void
+cold_scan_failed_record(ClusterColdScanResultV1 *result, XLogReaderState *reader)
+{
+	if (reader->record == NULL)
+		return;
+	result->failed_record_present = true;
+	result->failed_record_rmid = XLogRecGetRmid(reader);
+	result->failed_record_info = XLogRecGetInfo(reader);
+	result->failed_record_length = XLogRecGetTotalLen(reader);
+	result->failed_record_data_length = XLogRecGetDataLen(reader);
+}
+
 static bool
 cold_scan_visit(XLogReaderState *reader, void *arg)
 {
@@ -364,6 +378,7 @@ cold_scan_visit(XLogReaderState *reader, void *arg)
 				   != 0) {
 			work->detail = CLUSTER_COLD_SOURCE_GAP;
 			work->result->failed_read_rec_ptr = reader->ReadRecPtr;
+			cold_scan_failed_record(work->result, reader);
 			return false;
 		}
 		work->checkpoint_seen = true;
@@ -423,6 +438,7 @@ cold_scan_visit(XLogReaderState *reader, void *arg)
 	if (work->detail != CLUSTER_COLD_OK) {
 		work->result->failed_read_rec_ptr = reader->ReadRecPtr;
 		work->result->route_detail = work->decoded.route_detail;
+		cold_scan_failed_record(work->result, reader);
 		return false;
 	}
 	work->result->records++;

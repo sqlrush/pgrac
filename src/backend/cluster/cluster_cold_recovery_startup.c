@@ -634,9 +634,13 @@ cold_scan_history(ClusterColdTypedV1 *typed)
 		typed->scanned_records += scan.records;
 		if (detail != CLUSTER_COLD_OK) {
 			cold_refuse(typed, detail,
-						"pass-1 scan refused: %s; history thread %u record %X/%X (root result %d)",
+						"pass-1 scan refused: %s; history thread %u record %X/%X (root result %d, "
+						"record seen %u, rmid %u, info 0x%02X, length %u, data length %u)",
 						cold_detail_name(detail), (unsigned)typed->participants[i].thread_id,
-						LSN_FORMAT_ARGS(scan.failed_read_rec_ptr), scan.root_result);
+						LSN_FORMAT_ARGS(scan.failed_read_rec_ptr), scan.root_result,
+						(unsigned)scan.failed_record_present, (unsigned)scan.failed_record_rmid,
+						(unsigned)scan.failed_record_info, (unsigned)scan.failed_record_length,
+						(unsigned)scan.failed_record_data_length);
 			memset(typed->history_xid, 0, sizeof(typed->history_xid));
 			return false;
 		}
@@ -939,10 +943,13 @@ cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots,
 		if (detail != CLUSTER_COLD_OK) {
 			cold_refuse(typed, detail,
 						"pass-1 scan refused: %s; thread %u record %X/%X (root result %d, "
-						"route detail %u)",
+						"route detail %u, record seen %u, rmid %u, info 0x%02X, length %u, "
+						"data length %u)",
 						cold_detail_name(detail), (unsigned)typed->participants[i].thread_id,
 						LSN_FORMAT_ARGS(scan.failed_read_rec_ptr), scan.root_result,
-						(unsigned)scan.route_detail);
+						(unsigned)scan.route_detail, (unsigned)scan.failed_record_present,
+						(unsigned)scan.failed_record_rmid, (unsigned)scan.failed_record_info,
+						(unsigned)scan.failed_record_length, (unsigned)scan.failed_record_data_length);
 			return false;
 		}
 		if (scan.side_capture_detail != 0) {

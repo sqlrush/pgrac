@@ -309,6 +309,7 @@ static ClusterControlRootResult visit_result;
 static uint64 observed_records_delta;
 static XLogRecPtr observed_end;
 static ClusterColdDetailV1 decode_refusal_at[MAX_VISIT];
+static uint8 decode_record_flags[MAX_VISIT];
 static ClusterColdXidInputV1 decode_xid_input[MAX_VISIT];
 static bool decode_saw_foreign;
 static bool decode_saw_space_active;
@@ -411,6 +412,7 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 	out->record.rmid = RM_HEAP_ID;
 	out->record.info = 0x10;
 	out->record.record_crc = 0x9876;
+	out->record.record_flags = decode_record_flags[i];
 	out->xid_input = decode_xid_input[i];
 	out->detached.source_record = reader;
 	out->detached.preflight_complete = true;

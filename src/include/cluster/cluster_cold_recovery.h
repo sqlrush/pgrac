@@ -800,6 +800,13 @@ typedef struct ClusterColdScanResultV1 {
 	int root_result; /* ClusterControlRootResult of the visit */
 	XLogRecPtr failed_read_rec_ptr;
 	uint8 route_detail;
+	/* Exact rejecting native reader header only; no decoded payload or
+	 * admission proof. Zero unless a record callback itself refused. */
+	bool failed_record_present;
+	uint8 failed_record_rmid;
+	uint8 failed_record_info;
+	uint32 failed_record_length;
+	uint32 failed_record_data_length;
 	/* Capture profile differs from native/history acceptance. Nonzero means
 	 * discard the entire optional SIDE plan; it cannot authorize replay. */
 	uint8 side_capture_detail;
