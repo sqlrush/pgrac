@@ -132,6 +132,7 @@ OBJS = \
 	cluster_recovery_reference_graph.o \
 	cluster_recovery_page_history.o \
 	cluster_recovery_page_census.o \
+	cluster_recovery_page_roots.o \
 	cluster_recovery_census.o \
 	cluster_recovery_relation_census.o \
 	cluster_cold_recovery_space.o \

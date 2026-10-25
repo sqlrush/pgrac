@@ -124,6 +124,12 @@ cluster_recovery_undo_store_graph(ClusterRecoveryUndoStore *store)
 	return store->graph;
 }
 
+ClusterRecoveryRootSet *
+cluster_recovery_undo_store_root_set(ClusterRecoveryUndoStore *store)
+{
+	return cluster_recovery_undo_store_graph(store) == NULL ? NULL : store->roots;
+}
+
 ClusterRecoveryGraphResult
 cluster_recovery_undo_store_next(ClusterRecoveryUndoStore *store, ClusterRecoveryUndoEntry *out)
 {
@@ -359,6 +365,90 @@ cluster_recovery_undo_store_read(void *arg, const ClusterRecoveryTxnKey *key, UB
 	}
 	*generation = physical->wrap_count;
 	return CLUSTER_RECOVERY_GRAPH_RECORD;
+}
+
+ClusterRecoveryGraphResult
+cluster_recovery_undo_store_read_base(ClusterRecoveryUndoStore *store, UBA address,
+									TransactionId xid, ClusterRecoveryTxnKey *transaction,
+									ClusterRecoveryUndoRecord *record, uint32 *generation)
+{
+	const UndoSegmentHeaderData *physical, *canonical;
+	const TTSlot *binding;
+	ClusterRecoveryTxnKey key = { 0 };
+	ClusterRecoveryRootsResult read;
+	ClusterRecoveryGraphResult result;
+	uint8 digest[32];
+	uint32 segment, block;
+	uint16 slot, row;
+
+	if (transaction != NULL)
+		memset(transaction, 0, sizeof(*transaction));
+	if (record != NULL)
+		memset(record, 0, sizeof(*record));
+	if (generation != NULL)
+		*generation = 0;
+	if (store == NULL || transaction == NULL || record == NULL || generation == NULL)
+		return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_INVALID);
+	if (store->status > CLUSTER_RECOVERY_GRAPH_DRAINED)
+		return store->status;
+	if (store->status != CLUSTER_RECOVERY_GRAPH_DRAINED || store->graph == NULL)
+		return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_INVALID);
+	if (!cluster_recovery_root_set_digest(store->roots, digest))
+		return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_CHANGED);
+	if (!TransactionIdIsNormal(xid)
+		|| !uba_decode_record(address, &segment, &block, &slot, &row)
+		|| segment > UNDO_STORE_SEGMENTS)
+		return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_IDENTITY);
+	physical = cluster_recovery_undo_store_header(store, segment);
+	if (physical == NULL)
+		return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_IO);
+	read = cluster_recovery_root_set_read(store->roots,
+										  store->files[store->by_segment[segment] - 1].root_index,
+										  (uint64)block * BLCKSZ, store->page, BLCKSZ);
+	if (read != CLUSTER_RECOVERY_ROOTS_BYTES)
+		return undo_store_roots_result(store, read);
+	if (cluster_recovery_undo_record_read(store->page, BLCKSZ, segment, block,
+										 physical->owner_instance, address, record)
+		!= CLUSTER_RECOVERY_UNDO_ENTRY) {
+		result = CLUSTER_RECOVERY_GRAPH_CORRUPT;
+		goto refuse;
+	}
+	if (record->header.xid != xid) {
+		result = CLUSTER_RECOVERY_GRAPH_IDENTITY;
+		goto refuse;
+	}
+	canonical = cluster_recovery_undo_store_header(store, record->header.tt_slot_segment_id);
+	/* A complete matching base is an independent binding. A current segment
+	 * number alone, or the local PAGE wrap, is never sufficient. Reused and
+	 * legacy identities remain for the later independently seeded WAL forest. */
+	if (canonical == NULL || canonical->wrap_count == UINT32_MAX
+		|| record->header.tt_wrap_plus1 == 0)
+		goto pending;
+	binding = &canonical->tt_slots[slot];
+	if (binding->status < TT_SLOT_ACTIVE || binding->status > TT_SLOT_ABORTED
+		|| binding->xid != xid || binding->wrap == TT_WRAP_INVALID
+		|| binding->wrap != record->header.tt_wrap_plus1 - 1)
+		goto pending;
+	key.system_identifier = store->system_identifier;
+	key.database_incarnation = store->database_incarnation;
+	key.segment_id = canonical->segment_id;
+	key.segment_generation = canonical->wrap_count;
+	key.origin_node_id = canonical->owner_instance - 1;
+	key.slot_offset = slot;
+	key.slot_wrap = binding->wrap;
+	key.xid = xid;
+	result = cluster_recovery_tx_record_check(&key, address, record, physical->wrap_count);
+	if (result != CLUSTER_RECOVERY_GRAPH_MORE)
+		goto refuse;
+	*transaction = key;
+	*generation = physical->wrap_count;
+	return CLUSTER_RECOVERY_GRAPH_RECORD;
+pending:
+	memset(record, 0, sizeof(*record));
+	return CLUSTER_RECOVERY_GRAPH_PENDING;
+refuse:
+	memset(record, 0, sizeof(*record));
+	return undo_store_fail(store, result);
 }
 
 ClusterRecoveryGraphResult

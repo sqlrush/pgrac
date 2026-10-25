@@ -3903,6 +3903,7 @@ test_cluster_catalog_origin_io.o: $(top_srcdir)/src/backend/cluster/cluster_init
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 RECOVERY_CENSUS_TEST_OBJS = \
+		$(top_builddir)/src/backend/cluster/cluster_recovery_page_roots.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_relation_census.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_relation_scan.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_page_census.o \
@@ -3914,7 +3915,10 @@ RECOVERY_CENSUS_TEST_OBJS = \
 		$(top_builddir)/src/backend/cluster/cluster_cr_apply.o
 
 test_cluster_recovery_native_inputs: $(top_srcdir)/src/include/access/twophase_rmgr.h
-test_cluster_recovery_native_inputs: test_cluster_recovery_manifest_inputs.inc test_cluster_recovery_terminal_inputs.inc test_cluster_recovery_tt_terminal_inputs.inc
+test_cluster_recovery_native_inputs: $(top_srcdir)/src/backend/cluster/cluster_recovery_census.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_page_roots.h
+test_cluster_recovery_native_inputs: test_cluster_recovery_manifest_inputs.inc test_cluster_recovery_terminal_inputs.inc test_cluster_recovery_tt_terminal_inputs.inc test_cluster_recovery_page_roots_inputs.inc
 test_cluster_recovery_native_inputs: $(RECOVERY_CENSUS_TEST_OBJS) test_cluster_recovery_prepare_fixture.h test_cluster_recovery_prepare_inputs.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_xact_join_inputs.inc test_cluster_recovery_relmap_physical_inputs.inc test_cluster_recovery_relmap_inputs.inc test_cluster_recovery_relmap_fixture.h
 
@@ -11002,6 +11006,9 @@ test_cluster_recovery_namespace: test_cluster_recovery_namespace.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_recovery_undo_store: test_cluster_recovery_undo_store.c test_cluster_recovery_namespace.c \
+		test_cluster_recovery_page_roots.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_page_roots.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_page_roots.h \
 		test_cluster_recovery_crypto_boundary.h test_cluster_recovery_page_census.inc unit_test.h \
 		test_cluster_recovery_relation_census.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_relation_census.c \
