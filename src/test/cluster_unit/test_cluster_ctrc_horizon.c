@@ -307,6 +307,7 @@ UT_TEST(test_actual_foreign_close_revokes_old_report_and_blocks_new_unqualified_
 static unsigned sender_retirement_reports;
 static uint64 sender_retirement_last_sample_id;
 static FullTransactionId sender_retained_original;
+static void (*sender_retirement_observer)(const ClusterUndoCleanerActiveSample *);
 
 static void
 observe_original_retirement_publication(const ClusterUndoCleanerActiveSample *published)
@@ -370,7 +371,8 @@ exercise_original_retirement_reports(bool applied)
 	native_source_exit = native_publish_source = true;
 	native_published_samples = 0;
 	original_retention_report_peer = true;
-	original_worker_publication_observer = observe_original_retirement_publication;
+	original_worker_publication_observer = sender_retirement_observer != NULL
+		? sender_retirement_observer : observe_original_retirement_publication;
 	exercise_original_producer_retention_lifecycle(applied);
 	original_worker_publication_observer = NULL;
 	original_retention_report_peer = false;
@@ -1226,10 +1228,103 @@ UT_TEST(test_original_cohort_preserves_fullxid_sources_before_native_window_refu
 	UT_ASSERT_EQ(native_future_reads, future_reads);
 }
 
+/* Keep the original three real owner cuts and their original report path.
+ * Only the peer report, clock and semantic/lock boundaries remain controlled. */
+static ClusterHeapFreezeCohortObservation retirement_previous_cohort;
+static bool retirement_previous_valid;
+static unsigned retirement_cohort_checks, retirement_native_eligible;
+
+static void
+observe_original_retirement_cohort(const ClusterUndoCleanerActiveSample *published)
+{
+	ClusterHeapFreezeCohortObservation cohort;
+	ClusterUndoCleanerActiveSample active;
+	ClusterHeapFreezePolicySampleV1 policy = { 0 };
+	ClusterSemanticAdmissionToken admission = { 0 };
+	ClusterHeapFreezeObservedBoundsV1 bounds, before;
+	bool previous_mode = native_pass_mode;
+	unsigned native_reads, history_reads;
+
+	observe_original_retirement_publication(published);
+	native_pass_mode = true;
+	UT_ASSERT(native_cleaner_sample(&active));
+	UT_ASSERT(native_cleaner_sample_current(&active));
+	/* The same fixed required peer was present before the original owner's
+	 * first cut. This peer report is a controlled leaf, not remote retention. */
+	install_controlled_peer_report(&active);
+	if (retirement_previous_valid) {
+		UT_ASSERT(retirement_previous_cohort.source_local_sample_id < active.sample_id);
+		UT_ASSERT_EQ(cluster_heap_freeze_cohort_current(&retirement_previous_cohort),
+			CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED);
+	}
+	sender_sample_clock = 700;
+	UT_ASSERT_EQ(undo_horizon_v2_cohort_observe(&cohort, NULL, NULL),
+		CLUSTER_HEAP_FREEZE_COHORT_READY);
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_current(&cohort), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	UT_ASSERT_EQ(cohort.source_local_sample_id, active.sample_id);
+	UT_ASSERT_EQ(cohort.active_full_xid_min, U64FromFullTransactionId(active.scan.min_full));
+	UT_ASSERT_EQ(cohort.source_peer_active_full_xid_min[1],
+		U64FromFullTransactionId(active.scan.future_full));
+	UT_ASSERT_EQ(cohort.admitted_members_lo, 3);
+	UT_ASSERT_EQ(cohort.local_unqualified_entries, 0);
+	policy.legal_next = policy.freeze_limit = active.scan.future_full;
+	admission.entered = true;
+	admission.record_generation = cohort.record_generation;
+	admission.formation_epoch = cohort.formation_epoch;
+	memset(&bounds, 0xa5, sizeof(bounds)); before = bounds;
+	native_reads = native_future_reads; history_reads = sender_history_reads;
+	if (sender_retirement_reports < 3) {
+		/* Receiver-side certificate retirement alone did not return the
+		 * original owner's final reply. Its epoch7 key still protects F. */
+		UT_ASSERT_EQ(cohort.active_full_xid_min, U64FromFullTransactionId(sender_retained_original));
+		UT_ASSERT(!cluster_heap_freeze_observed_bounds_v1(&policy, &cohort, &admission, 0, &bounds));
+		UT_ASSERT(memcmp(&bounds, &before, sizeof(bounds)) == 0);
+	} else {
+		UT_ASSERT_EQ(sender_retirement_reports, 3);
+		UT_ASSERT(cluster_heap_freeze_observed_bounds_v1(&policy, &cohort, &admission, 0, &bounds));
+		UT_ASSERT(FullTransactionIdEquals(bounds.freeze_limit, active.scan.future_full));
+		UT_ASSERT_EQ(bounds.horizon_scn, 300);
+		retirement_native_eligible++;
+	}
+	UT_ASSERT_EQ(native_future_reads, native_reads);
+	UT_ASSERT_EQ(sender_history_reads, history_reads);
+	retirement_previous_cohort = cohort;
+	retirement_previous_valid = true;
+	retirement_cohort_checks++;
+	native_pass_mode = previous_mode;
+}
+
+static void
+exercise_original_final_reply_cohort(bool applied)
+{
+	retirement_previous_valid = false;
+	retirement_cohort_checks = retirement_native_eligible = 0;
+	sender_retirement_observer = observe_original_retirement_cohort;
+	exercise_original_retirement_reports(applied);
+	sender_retirement_observer = NULL;
+	UT_ASSERT(original_worker_publication_observer == NULL);
+	UT_ASSERT_EQ(retirement_cohort_checks, 3);
+	UT_ASSERT_EQ(retirement_native_eligible, 1);
+	UT_ASSERT_EQ(sender_retirement_reports, 3);
+	UT_ASSERT_EQ(sender_calls, 3);
+	UT_ASSERT_EQ(sender_maintenance_acquires, sender_maintenance_releases);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_original_cancel_final_reply_precedes_new_cohort_native_eligibility)
+{
+	exercise_original_final_reply_cohort(false);
+}
+
+UT_TEST(test_original_applied_final_reply_precedes_new_cohort_native_eligibility)
+{
+	exercise_original_final_reply_cohort(true);
+}
+
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(20);
 	UT_RUN(test_original_protection_exit_and_complete_worker_reach_v2_wire);
 	UT_RUN(test_actual_foreign_receipt_revokes_old_report_and_blocks_new_unqualified_report);
 	UT_RUN(test_actual_foreign_close_revokes_old_report_and_blocks_new_unqualified_report);
@@ -1248,5 +1343,7 @@ main(void)
 	UT_RUN(test_actual_receive_unproven_ingress_preserves_last_accepted_slot);
 	UT_RUN(test_actual_receive_rechecks_private_stream_hello_and_admission_before_publish);
 	UT_RUN(test_original_cohort_preserves_fullxid_sources_before_native_window_refusal);
+	UT_RUN(test_original_cancel_final_reply_precedes_new_cohort_native_eligibility);
+	UT_RUN(test_original_applied_final_reply_precedes_new_cohort_native_eligibility);
 	return ut_failed_count == 0 ? 0 : 1;
 }
