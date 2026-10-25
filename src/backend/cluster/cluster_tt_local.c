@@ -47,7 +47,10 @@
 
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
+/* PGRAC: Runtime-only declarations do not belong to the disabled stubs. */
+#ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_reconfig.h"
+#endif
 #include "cluster/cluster_scn.h" /* S3 forensics — floor-lag vs current SCN in errdetail */
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_shmem.h"
@@ -55,8 +58,12 @@
 #include "cluster/cluster_tt_local.h"
 #include "cluster/cluster_tt_2pc.h"			 /* ClusterTT2PCBinding export (spec-3.15) */
 #include "cluster/cluster_tt_slot.h"		 /* spec-3.4b D4 real binding */
+#ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_undo_cleaner.h"	 /* S3 forensics — cleaner stall state in errdetail */
+#endif
+#ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_undo_record_api.h" /* spec-3.12 D2b cluster_undo_tt_rollover_locked */
+#endif
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_tt_status_hint.h"		/* spec-3.2 D4 wire emit append */
 #include "cluster/cluster_uba.h"				/* P0-33 exact data-ref alias */
