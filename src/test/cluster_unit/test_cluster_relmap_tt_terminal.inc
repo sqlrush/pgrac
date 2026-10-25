@@ -182,3 +182,117 @@ UT_TEST(v2_original_tt_abort_failure_keeps_debt_after_clean_pairs)
 		original_tt_done();
 	}
 }
+
+static void
+unwritten_tt_stage_retained(const ClusterRelmapRetentionDirectory *directory,
+	const ClusterRelmapRetentionDirectory *before, const ClusterCanonicalTxnBinding *receipt)
+{
+	ClusterCanonicalTxnBinding absent;
+	TestRelmapNativeTTStats stats = test_relmap_native_tt_stats();
+	TestRelmapPhysicalStats io_before = test_relmap_physical_stats(), io_after;
+
+	UT_ASSERT_EQ(stats.bindings, 1);
+	UT_ASSERT_EQ(stats.bind_records, 1);
+	UT_ASSERT_EQ(stats.ctrc_opens, 1);
+	UT_ASSERT(!stats.balanced && !stats.assertion_failed);
+	UT_ASSERT(stats.commit_admission && stats.commit_reservation);
+	/* A staged local binding is intentionally not a fresh ACTIVE receipt. */
+	UT_ASSERT(!test_relmap_native_tt_lookup(receipt->xid, &absent));
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_tt_release_check_v2(
+		directory->system_identifier, directory->database_incarnation, receipt),
+		CLUSTER_RELMAP_RETENTION_RETAINED);
+	UT_ASSERT(memcmp(before, directory, sizeof(*before)) == 0);
+	io_after = test_relmap_physical_stats();
+	UT_ASSERT(memcmp(&io_before, &io_after, sizeof(io_before)) == 0);
+}
+
+static bool
+unwritten_tt_prepare(const ClusterCanonicalTxnBinding *receipt)
+{
+	TestRelmapNativeTTTerminal staged;
+	bool ok = test_relmap_native_tt_stage_commit(receipt, &staged);
+
+	UT_ASSERT(ok);
+	if (!ok)
+		return false;
+	UT_ASSERT_EQ(staged.writes + staged.abort_records, 0);
+	UT_ASSERT(!staged.flushed && !staged.write_before_flush);
+	UT_ASSERT_EQ(staged.error_level, 0);
+	UT_ASSERT_EQ(staged.resident.status, TT_SLOT_ACTIVE);
+	UT_ASSERT_EQ(staged.resident.xid, receipt->xid);
+	UT_ASSERT_EQ(staged.resident.wrap, receipt->slot_wrap);
+	UT_ASSERT_EQ(staged.resident.commit_scn, InvalidScn);
+	UT_ASSERT(staged.allocator_present && staged.allocator.status == CTS_ACTIVE);
+	UT_ASSERT_EQ(staged.fold.segment_id, receipt->segment_id);
+	UT_ASSERT_EQ(staged.fold.segment_generation, receipt->segment_generation);
+	UT_ASSERT_EQ(staged.fold.slot_offset, receipt->slot_offset);
+	UT_ASSERT_EQ(staged.fold.wrap, receipt->slot_wrap);
+	UT_ASSERT_EQ(staged.fold.xid, receipt->xid);
+	UT_ASSERT_EQ(staged.fold.instance, receipt->origin_instance);
+	UT_ASSERT_EQ(staged.fold.commit_scn, scn_encode(1, 42));
+	return true;
+}
+
+UT_TEST(v2_unwritten_tt_commit_stage_survives_relmap_abort)
+{
+	for (unsigned which = 0; which < 6; which++)
+	{
+		ClusterCanonicalTxnBinding receipt;
+		TestRelmapNativeTTTerminal result;
+		ClusterRelmapRetentionDirectory *directory = terminal_tt_fixture(which, false, &receipt);
+		ClusterRelmapRetentionDirectory before;
+		TestRelmapNativeTTStats stats;
+
+		if (directory == NULL) { original_tt_done(); continue; }
+		before = *directory;
+		if (!unwritten_tt_prepare(&receipt)) { original_tt_done(); continue; }
+		unwritten_tt_stage_retained(directory, &before, &receipt);
+		/* No native commit record: relmap abort precedes the TT unstage. */
+		physical_finishing = true;
+		original_terminal_callback(false);
+		physical_clean_pairs();
+		UT_ASSERT(!cluster_relmap_authority_x_held());
+		unwritten_tt_stage_retained(directory, &before, &receipt);
+		UT_ASSERT(test_relmap_native_tt_terminal(&receipt, false, false, &result));
+		terminal_tt_success(&receipt, &result, false);
+		stats = test_relmap_native_tt_stats();
+		UT_ASSERT(!stats.commit_admission && !stats.commit_reservation);
+		terminal_tt_retained(directory, &before, &receipt);
+		original_tt_done();
+	}
+}
+
+UT_TEST(v2_unwritten_tt_commit_stage_abort_error_keeps_pins)
+{
+	for (unsigned which = 0; which < 6; which++)
+	{
+		ClusterCanonicalTxnBinding receipt, after;
+		TestRelmapNativeTTTerminal result;
+		ClusterRelmapRetentionDirectory *directory = terminal_tt_fixture(which, false, &receipt);
+		ClusterRelmapRetentionDirectory before;
+		TestRelmapNativeTTStats stats;
+
+		if (directory == NULL) { original_tt_done(); continue; }
+		before = *directory;
+		if (!unwritten_tt_prepare(&receipt)) { original_tt_done(); continue; }
+		unwritten_tt_stage_retained(directory, &before, &receipt);
+		physical_finishing = true;
+		original_terminal_callback(false);
+		physical_clean_pairs();
+		unwritten_tt_stage_retained(directory, &before, &receipt);
+		UT_ASSERT(!test_relmap_native_tt_terminal(&receipt, false, true, &result));
+		UT_ASSERT_EQ(result.error_level, ERROR);
+		UT_ASSERT_EQ(result.writes, 1);
+		UT_ASSERT_EQ(result.abort_records, 1);
+		UT_ASSERT(result.flushed && !result.write_before_flush);
+		UT_ASSERT_EQ(result.resident.status, TT_SLOT_ACTIVE);
+		UT_ASSERT(result.allocator_present && result.allocator.status == CTS_ACTIVE);
+		stats = test_relmap_native_tt_stats();
+		UT_ASSERT(!stats.commit_admission && !stats.commit_reservation);
+		UT_ASSERT_EQ(stats.bindings, 1);
+		UT_ASSERT(test_relmap_native_tt_lookup(100, &after));
+		UT_ASSERT(memcmp(&receipt, &after, sizeof(receipt)) == 0);
+		terminal_tt_retained(directory, &before, &receipt);
+		original_tt_done();
+	}
+}

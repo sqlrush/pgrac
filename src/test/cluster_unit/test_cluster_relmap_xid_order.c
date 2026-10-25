@@ -1112,7 +1112,9 @@ UT_TEST(unarmed_commit_preserves_other_writers_pending_and_global_lock)
 int
 main(void)
 {
-	UT_PLAN(79);
+	UT_PLAN(81);
+	UT_RUN(v2_unwritten_tt_commit_stage_survives_relmap_abort);
+	UT_RUN(v2_unwritten_tt_commit_stage_abort_error_keeps_pins);
 	UT_RUN(v2_original_tt_commit_precedes_relmap_postcommit);
 	UT_RUN(v2_original_tt_abort_follows_relmap_abort_cleanup);
 	UT_RUN(v2_original_tt_abort_failure_keeps_debt_after_clean_pairs);
