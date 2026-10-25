@@ -1157,6 +1157,92 @@ recovery_ctrc_subject_key_same(const ClusterColdTtSlotKeyV1 *a, const ClusterCol
 }
 
 bool
+cluster_recovery_plan_output_distinct_v1(const struct ClusterRecoveryStartV1 *start,
+	const void *out, Size bytes)
+{
+	return out != NULL && bytes != 0 && cluster_recovery_plan_shmem != NULL
+		&& !recovery_ctrc_subject_overlap(out, bytes, cluster_recovery_plan_shmem,
+			sizeof(*cluster_recovery_plan_shmem))
+		&& ClusterColdRecoveryStartOutputDistinct(start, out, bytes);
+}
+
+bool
+cluster_recovery_ctrc_terminal_result_v1(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, ClusterRecoveryTxResultObservationV1 *out)
+{
+	ClusterRecoveryTxResultObservationV1 value = {0};
+	ClusterRecoveryCheckpointOwnerV1 confirmed;
+	ClusterRecoveryCheckpointSlotV1 *slot;
+	const ClusterColdTypedV1 *typed;
+	ClusterColdCtrcReleaseCensusV1 counts;
+	uint64 generation;
+	Size work_bytes, census_bytes;
+	bool same;
+
+	if (out == NULL || CritSectionCount != 0 || start == NULL
+		|| start != checkpoint_registered_start || cluster_recovery_plan_shmem == NULL
+		|| !ClusterColdRecoveryCtrcWorkCurrent(start, work)
+		|| !ClusterColdRecoveryTxCheckpointOwnerV1(start, &value.checkpoint.owner)
+		|| memcmp(&value.checkpoint.owner, &checkpoint_registered_owner,
+			sizeof(checkpoint_registered_owner)) != 0)
+		return false;
+	typed = ClusterColdRecoveryTxInputs(start);
+	if (typed == NULL || typed->top_tx_census == NULL || !typed->census_root_captured
+		|| typed->top_tx_census != work->top_tx_census || typed->plan != work->plan
+		|| typed->top_tx_census->plan != typed->plan
+		|| typed->census_root.system_identifier
+			!= value.checkpoint.owner.writer.ref.claim.identity.system_identifier
+		|| work->counts.unqualified_count != 0 || work->generation == 0
+		|| work->counts.subject_count
+			> (MaxAllocSize - offsetof(ClusterColdCtrcWorkV1, entries)) / sizeof(work->entries[0])
+		|| typed->top_tx_census->count > (MaxAllocSize - offsetof(ClusterColdTopTxCensusV1, entries))
+			/ sizeof(typed->top_tx_census->entries[0]))
+		return false;
+	work_bytes = offsetof(ClusterColdCtrcWorkV1, entries)
+		+ (Size)work->counts.subject_count * sizeof(work->entries[0]);
+	census_bytes = offsetof(ClusterColdTopTxCensusV1, entries)
+		+ (Size)typed->top_tx_census->count * sizeof(typed->top_tx_census->entries[0]);
+	if (!cluster_recovery_plan_output_distinct_v1(start, out, sizeof(*out))
+		|| recovery_ctrc_subject_overlap(out, sizeof(*out), work, work_bytes)
+		|| recovery_ctrc_subject_overlap(out, sizeof(*out), typed, sizeof(*typed))
+		|| recovery_ctrc_subject_overlap(out, sizeof(*out), typed->top_tx_census, census_bytes))
+		return false;
+	counts = work->counts;
+	generation = work->generation;
+	slot = &cluster_recovery_plan_shmem->checkpoint_owner;
+	SpinLockAcquire(&slot->lock);
+	value.checkpoint.slot_generation = slot->generation;
+	value.result = slot->tx_result;
+	same = slot->valid && slot->generation != 0 && slot->generation != UINT64_MAX
+		&& memcmp(&slot->owner, &value.checkpoint.owner, sizeof(slot->owner)) == 0
+		&& value.result.state == CLUSTER_RECOVERY_TX_RESULT_COMPLETE
+		&& value.result.result_generation != 0
+		&& slot->tx_accepted_generation == value.result.result_generation
+		&& value.result.subject_count == typed->top_tx_census->count
+		&& value.result.processed_count == value.result.subject_count
+		&& value.result.completed_count == value.result.subject_count
+		&& value.result.unresolved_count == 0
+		&& memcmp(value.result.input_root_sha256, typed->census_root.image_sha256, 32) == 0;
+	SpinLockRelease(&slot->lock);
+	if (!same || !ClusterColdRecoveryCtrcWorkCurrent(start, work)
+		|| ClusterColdRecoveryTxInputs(start) != typed || work->generation != generation
+		|| memcmp(&work->counts, &counts, sizeof(counts)) != 0
+		|| !ClusterColdRecoveryTxCheckpointOwnerV1(start, &confirmed)
+		|| memcmp(&confirmed, &value.checkpoint.owner, sizeof(confirmed)) != 0)
+		return false;
+	SpinLockAcquire(&slot->lock);
+	same = slot->valid && slot->generation == value.checkpoint.slot_generation
+		&& memcmp(&slot->owner, &value.checkpoint.owner, sizeof(slot->owner)) == 0
+		&& memcmp(&slot->tx_result, &value.result, sizeof(value.result)) == 0
+		&& slot->tx_accepted_generation == value.result.result_generation;
+	SpinLockRelease(&slot->lock);
+	if (!same)
+		return false;
+	memcpy(out, &value, sizeof(value));
+	return true;
+}
+
+bool
 cluster_recovery_ctrc_terminal_subject_v1(const struct ClusterRecoveryStartV1 *start,
 	const ClusterColdCtrcWorkV1 *work, uint32 index, const ClusterRecoveryUndoEntry *observed,
 	ClusterColdTtSlotInputV1 *out)

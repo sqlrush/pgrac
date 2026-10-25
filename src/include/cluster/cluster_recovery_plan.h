@@ -359,6 +359,16 @@ extern bool cluster_recovery_tx_result_accepted_v1(const struct ClusterRecoveryS
 struct ClusterColdCtrcWorkV1;
 struct ClusterColdTtSlotInputV1;
 struct ClusterRecoveryUndoEntry;
+/* Storage separation only: exclude the entire original Start and private
+ * shared plan region before writing caller scratch. No current/write grant. */
+extern bool cluster_recovery_plan_output_distinct_v1(const struct ClusterRecoveryStartV1 *start,
+	const void *out, Size bytes);
+/* Original retained Startup/work only: copy the exact accepted COMPLETE TX
+ * component and checkpoint generation/owner. Caller revalidates this whole
+ * value across I/O. No terminal/history/PAGE/release or service authority.
+ * Distinct output is unchanged on refusal; no allocation, I/O or retirement. */
+extern bool cluster_recovery_ctrc_terminal_result_v1(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, ClusterRecoveryTxResultObservationV1 *out);
 /* Read-only terminal view of one original pre-C0 CTRC subject. Require the
  * original Start/work, exact accepted complete TX result and unchanged
  * canonical physical TT observation. Old ACTIVE additionally needs its unique

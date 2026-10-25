@@ -4256,6 +4256,33 @@ UT_TEST(test_root_publish_cohort_uncertain_partial_downgrade_is_cleanup_only)
 	UT_ASSERT_EQ(fake_native_release_call_count, 5);
 }
 
+UT_TEST(test_pin_storage_distinct_checks_interior_without_changing_owner)
+{
+	ClusterWalRetentionInterval interval = {.thread_id = 1, .tli = 1,
+		.start_lsn = TEST_WAL_SEG_SIZE, .end_lsn = TEST_WAL_SEG_SIZE * 2};
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+	ClusterWalRetentionPin *pin = NULL;
+	char separate = 0;
+
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	for (Size offset = 0; offset <= 4 * sizeof(void *); offset++)
+		UT_ASSERT(!cluster_wal_retention_pin_output_distinct_v1(pin,
+			(void *)((uintptr_t)pin + offset), 1));
+	UT_ASSERT(!cluster_wal_retention_pin_output_distinct_v1(pin, (void *)((uintptr_t)pin - 4), 5));
+	UT_ASSERT(cluster_wal_retention_pin_output_distinct_v1(pin, (void *)((uintptr_t)pin - 4), 4));
+	UT_ASSERT(cluster_wal_retention_pin_output_distinct_v1(pin, &separate, sizeof(separate)));
+	UT_ASSERT(!cluster_wal_retention_pin_output_distinct_v1(NULL, &separate, 1));
+	UT_ASSERT(!cluster_wal_retention_pin_output_distinct_v1(pin, NULL, 1));
+	UT_ASSERT(!cluster_wal_retention_pin_output_distinct_v1(pin, &separate, 0));
+	UT_ASSERT(cluster_wal_retention_active_pin_present());
+	UT_ASSERT_EQ(fake_release_call_count, 0);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT(pin == NULL); UT_ASSERT_EQ(fake_release_call_count, 1);
+	reset_pin_fakes();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -4264,7 +4291,7 @@ main(int argc, char **argv)
 		return write_fixture_wal_segment(argc, argv);
 	if (argc != 1)
 		return 2;
-	UT_PLAN(90);
+	UT_PLAN(91);
 	UT_RUN(test_read_release_trace_keeps_first_failed_member_and_all_debt);
 	UT_RUN(test_read_release_trace_off_and_critical_preserve_original_cleanup);
 	UT_RUN(test_read_release_callback_records_aggregate_and_keeps_original_fatal);
@@ -4355,6 +4382,7 @@ main(int argc, char **argv)
 	UT_RUN(test_fold_empty_open_interval_is_not_bounded);
 	UT_RUN(test_pending_pin_protects_input_without_fake_checkpoint_interval);
 	UT_RUN(test_pending_pin_refuses_stale_or_mixed_inputs_before_retaining_owner);
+	UT_RUN(test_pin_storage_distinct_checks_interior_without_changing_owner);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

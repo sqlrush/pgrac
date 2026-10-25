@@ -27,6 +27,7 @@
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_recovery_plan.h"
+#include "cluster/cluster_recovery_undo_scan.h"
 #include "cluster/cluster_recovery_stamp.h"
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_terminal_ref_census.h"
@@ -1215,6 +1216,132 @@ rf_page_recovery_ctrc_itl_page_fpi_smgr_v1(const struct ClusterRecoveryStartV1 *
 	if (!page_recovery_ctrc_page_inputs_current(&context, &fixed, scratch)
 		|| !page_recovery_ctrc_fpi_identity_current(space, frame_identity,
 			expected_before, &frame_before))
+		return false;
+	memcpy(out, &candidate, sizeof(candidate));
+	return true;
+}
+
+static bool
+page_recovery_ctrc_terminal_inputs_current(const PageRecoveryCtrcReadV1 *context,
+	const PageRecoveryCtrcPageInputsV1 *fixed, const ClusterRecoveryUndoEntry *physical,
+	const ClusterColdTtSlotInputV1 *original, const ClusterColdTtSlotInputV1 *terminal,
+	const ClusterRecoveryTxResultObservationV1 *result)
+{
+	ClusterRecoveryTxResultObservationV1 observed;
+	ClusterColdTtSlotInputV1 subject;
+
+	if (!page_recovery_ctrc_page_inputs_current(context, fixed, original)
+		|| !cluster_recovery_ctrc_terminal_result_v1(context->start, context->work, &observed)
+		|| memcmp(&observed, result, sizeof(observed)) != 0)
+		return false;
+	for (uint32 i = 0; i < fixed->counts.subject_count; i++)
+		if (!cluster_recovery_ctrc_terminal_subject_v1(context->start, context->work,
+			i, &physical[i], &subject) || memcmp(&subject, &terminal[i], sizeof(subject)) != 0)
+			return false;
+	return page_recovery_ctrc_page_inputs_current(context, fixed, original)
+		&& cluster_recovery_ctrc_terminal_result_v1(context->start, context->work, &observed)
+		&& memcmp(&observed, result, sizeof(observed)) == 0;
+}
+
+bool
+rf_page_recovery_ctrc_itl_c0_page_fpi_smgr_v1(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, const RfPageAuthorityGuardV1 *guard,
+	ClusterRecoverySerialGuard *serial, ClusterWalRetentionPin *pin,
+	const ClusterSpaceIdentity *space, BlockNumber blockno,
+	const RfPageVersionV1 *expected_before, const ClusterRecoveryUndoEntry *physical,
+	Size physical_count, ClusterColdTtSlotInputV1 *scratch, Size capacity,
+	RfPageRecoveryCtrcItlFpiV1 *out)
+{
+	PageRecoveryCtrcReadV1 context;
+	PageRecoveryCtrcPageInputsV1 fixed;
+	ClusterRecoveryTxResultObservationV1 result;
+	RfPageRecoveryCtrcItlFpiV1 candidate = {0};
+	PGAlignedBlock before, image;
+	ClusterSpaceIdentity frame_space;
+	RfPageVersionV1 frame_before;
+	uint8 frame_identity[CLUSTER_SPACE_IDENTITY_BYTES];
+	ClusterCtrcItlCleanoutApplyResult projected;
+	const ClusterColdTypedV1 *typed;
+	ClusterColdTtSlotInputV1 *terminal;
+	Size subject_bytes, work_bytes, physical_bytes, scratch_bytes, census_bytes;
+
+	if (start == NULL || work == NULL || guard == NULL || serial == NULL || pin == NULL
+		|| space == NULL || expected_before == NULL || out == NULL
+		|| capacity > MaxAllocSize / sizeof(*scratch) || (capacity != 0 && scratch == NULL)
+		|| physical_count > MaxAllocSize / sizeof(*physical)
+		|| (physical_count != 0 && physical == NULL) || !page_recovery_ctrc_actor_current()
+		|| !ClusterColdRecoveryCtrcWorkCurrent(start, work))
+		return false;
+	typed = ClusterColdRecoveryTxInputs(start);
+	if (typed == NULL || typed->top_tx_census == NULL
+		|| !ClusterColdRecoveryCtrcWorkCurrent(start, work) || work->generation == 0
+		|| physical_count != work->counts.subject_count || physical_count > capacity / 2
+		|| physical_count > (MaxAllocSize - offsetof(ClusterColdCtrcWorkV1, entries)) / sizeof(*scratch)
+		|| typed->top_tx_census->count > (MaxAllocSize - offsetof(ClusterColdTopTxCensusV1, entries))
+			/ sizeof(typed->top_tx_census->entries[0]))
+		return false;
+	subject_bytes = physical_count * sizeof(*scratch);
+	physical_bytes = physical_count * sizeof(*physical);
+	work_bytes = offsetof(ClusterColdCtrcWorkV1, entries) + subject_bytes;
+	scratch_bytes = capacity * sizeof(*scratch);
+	census_bytes = offsetof(ClusterColdTopTxCensusV1, entries)
+		+ (Size)typed->top_tx_census->count * sizeof(typed->top_tx_census->entries[0]);
+	if (!cluster_recovery_plan_output_distinct_v1(start, out, sizeof(*out))
+		|| !rf_page_authority_guard_output_distinct_v1(guard, out, sizeof(*out))
+		|| !cluster_wal_retention_pin_output_distinct_v1(pin, out, sizeof(*out))
+		|| (scratch_bytes != 0 && !cluster_recovery_plan_output_distinct_v1(start, scratch, scratch_bytes))
+		|| (scratch_bytes != 0 && !rf_page_authority_guard_output_distinct_v1(guard, scratch, scratch_bytes))
+		|| (scratch_bytes != 0 && !cluster_wal_retention_pin_output_distinct_v1(pin, scratch, scratch_bytes))
+		|| page_recovery_ctrc_itl_output_overlaps(out, sizeof(*out), scratch, scratch_bytes))
+		return false;
+	{
+		const void *borrowed[] = {work, typed, typed->top_tx_census, physical,
+			space, expected_before, serial};
+		const Size bytes[] = {work_bytes, sizeof(*typed), census_bytes, physical_bytes,
+			sizeof(*space), sizeof(*expected_before), sizeof(*serial)};
+		for (Size i = 0; i < lengthof(borrowed); i++)
+			if (page_recovery_ctrc_itl_output_overlaps(out, sizeof(*out), borrowed[i], bytes[i])
+				|| (scratch_bytes != 0 && page_recovery_ctrc_itl_output_overlaps(scratch,
+					scratch_bytes, borrowed[i], bytes[i])))
+				return false;
+	}
+	fixed.plan = work->plan;
+	fixed.census = work->top_tx_census;
+	fixed.generation = work->generation;
+	memcpy(&fixed.counts, &work->counts, sizeof(fixed.counts));
+	frame_space = *space;
+	frame_before = *expected_before;
+	terminal = physical_count == 0 ? NULL : scratch + physical_count;
+	if (subject_bytes != 0)
+		memcpy(scratch, work->entries, subject_bytes);
+	/* Freeze the full input before original owner/result observations can
+	 * yield. A changed count cannot adopt an old terminal scratch tail. */
+	if (!cluster_space_identity_encode(&frame_space, frame_identity, sizeof(frame_identity))
+		|| !cluster_recovery_ctrc_terminal_result_v1(start, work, &result)
+		|| !ClusterColdRecoveryCtrcWorkCurrent(start, work)
+		|| ClusterColdRecoveryTxInputs(start) != typed || work->generation != fixed.generation
+		|| work->plan != fixed.plan || work->top_tx_census != fixed.census
+		|| memcmp(&work->counts, &fixed.counts, sizeof(fixed.counts)) != 0
+		|| (subject_bytes != 0 && memcmp(scratch, work->entries, subject_bytes) != 0))
+		return false;
+	for (uint32 i = 0; i < fixed.counts.subject_count; i++)
+		if (!cluster_recovery_ctrc_terminal_subject_v1(start, work, i, &physical[i], &terminal[i]))
+			return false;
+	if (!page_recovery_ctrc_read_image(start, work, guard, serial, pin, space,
+		blockno, expected_before, &before, &context) || context.typed != typed
+		|| !page_recovery_ctrc_terminal_inputs_current(&context, &fixed, physical, scratch, terminal, &result))
+		return false;
+	projected = cluster_ctrc_recovery_itl_page_image_v1(terminal, physical_count, before.data, image.data);
+	if (projected == CLUSTER_CTRC_ITL_CLEANOUT_RETAIN
+		|| !page_recovery_ctrc_terminal_inputs_current(&context, &fixed, physical, scratch, terminal, &result)
+		|| !page_recovery_ctrc_fpi_identity_current(space, frame_identity, expected_before, &frame_before))
+		return false;
+	candidate.rewritten = projected == CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN;
+	if (candidate.rewritten && !GenericXLogRecoveryImagePrepare(GENERIC_XLOG_CTRC_ITL,
+		&frame_space, MAIN_FORKNUM, blockno, before.data, image.data, &candidate.frame))
+		return false;
+	if (!page_recovery_ctrc_terminal_inputs_current(&context, &fixed, physical, scratch, terminal, &result)
+		|| !page_recovery_ctrc_fpi_identity_current(space, frame_identity, expected_before, &frame_before))
 		return false;
 	memcpy(out, &candidate, sizeof(candidate));
 	return true;

@@ -58,6 +58,16 @@ struct RfPageAuthorityPreflightV1 {
 	RfPageAuthorityGuardV1 guard_storage;
 };
 
+bool
+rf_page_authority_guard_output_distinct_v1(const RfPageAuthorityGuardV1 *guard,
+	const void *out, Size bytes)
+{
+	uintptr_t a = (uintptr_t)out, b = (uintptr_t)guard;
+
+	return guard != NULL && out != NULL && bytes != 0
+		&& (a <= b ? b - a >= bytes : a - b >= sizeof(*guard));
+}
+
 static void
 authority_preflight_free(RfPageAuthorityPreflightV1 *preflight)
 {

@@ -36,6 +36,8 @@ cluster_scn_advance(void)
 	case 16: input_work->plan = (const ClusterColdPlanV1 *)&input_start_object; break;
 	case 17: input_work->top_tx_census = (const struct ClusterColdTopTxCensusV1 *)&input_start_object; break;
 	}
+	if (terminal_frame_fault != NULL)
+		terminal_frame_fault(true);
 	return token;
 }
 

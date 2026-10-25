@@ -45,6 +45,8 @@ static bool input_missing_space;
 static RfPageRecoveryCtrcItlSelectionV1 input_itls[CLUSTER_ITL_INITRANS_DEFAULT + 1];
 static unsigned input_token_fault;
 static bool preparing_input_frame;
+static void (*terminal_frame_fault)(bool token);
+static void (*terminal_owner_fault)(void);
 #define input_start ((struct ClusterRecoveryStartV1 *)&input_start_object)
 #define input_work ((ClusterColdCtrcWorkV1 *)input_work_storage.data)
 
@@ -71,6 +73,8 @@ ClusterColdRecoveryTxCheckpointOwnerV1(const struct ClusterRecoveryStartV1 *star
 	memset(out, 0, sizeof(*out));
 	if (!input_current || start != input_start)
 		return false;
+	if (terminal_owner_fault != NULL)
+		terminal_owner_fault();
 	*out = input_owner;
 	return true;
 }
@@ -198,6 +202,8 @@ smgrread(SMgrRelation relation, ForkNumber forknum, BlockNumber block, void *buf
 			case 15: input_work->entries[input_work->counts.subject_count - 1].slot.commit_scn++; break;
 			}
 		}
+		if (terminal_frame_fault != NULL)
+			terminal_frame_fault(false);
 		return;
 	}
 	UT_ASSERT(relation == &install_relation && forknum == MAIN_FORKNUM && block == 7);
@@ -480,12 +486,13 @@ UT_TEST(fpi_inserted_observer_is_exact_and_never_advances_window)
 #include "test_cluster_recovery_ctrc_fpi.inc"
 #include "test_cluster_recovery_ctrc_page_fpi.inc"
 #include "test_cluster_recovery_fpi_apply.inc"
+#include "test_cluster_recovery_ctrc_c0_page.inc"
 
 int
 main(void)
 {
 	atexit(install_file_close);
-	UT_PLAN(44);
+	UT_PLAN(51);
 	UT_RUN(fpi_install_syncs_exact_native_lsn_and_checksum_without_retiring_window);
 	UT_RUN(fpi_install_exact_result_retries_sync_and_postread_without_rewriting);
 	UT_RUN(fpi_install_refuses_wrong_window_flush_frame_actor_or_serial_before_io);
@@ -530,6 +537,13 @@ main(void)
 	UT_RUN(fpi_apply_uncertain_wal_never_reaches_install);
 	UT_RUN(fpi_apply_target_refusals_keep_flushed_pending_debt);
 	UT_RUN(fpi_apply_target_errors_rethrow_with_original_debt);
+	UT_RUN(ctrc_c0_page_projects_original_active_work_without_mutating_it);
+	UT_RUN(ctrc_c0_page_handles_mixed_and_noop_inputs);
+	UT_RUN(ctrc_c0_page_requires_original_complete_accepted_value_before_io);
+	UT_RUN(ctrc_c0_page_rechecks_receipt_physical_proofs_and_full_work);
+	UT_RUN(ctrc_c0_page_refuses_scratch_and_borrowed_aliases_before_io);
+	UT_RUN(ctrc_c0_page_errors_rethrow_without_publishing_or_retiring);
+	UT_RUN(ctrc_c0_page_freezes_counts_before_original_owner_observation);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

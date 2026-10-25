@@ -594,10 +594,38 @@ UT_TEST(test_install_adapter_runs_promote_publish_release)
 	rf_page_authority_preflight_destroy_v1(&preflight);
 }
 
+UT_TEST(test_guard_storage_distinct_checks_interior_without_changing_owner)
+{
+	RfPageAuthorityBatchRequestV1 request;
+	RfPageAuthorityTargetV1 targets[2];
+	ClusterRecoverySerialGuard serial;
+	RfPageAuthorityPreflightV1 *preflight = NULL;
+	RfPageAuthorityGuardV1 *guard = NULL;
+	char separate = 0;
+
+	init_case(&request, targets, &serial);
+	rf_page_guard_shmem_init_v1();
+	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(&request, 1000, &preflight), RF_PAGE_AUTHORITY_OK);
+	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(preflight, &serial, &guard), RF_PAGE_AUTHORITY_OK);
+	for (Size offset = 0; offset <= 4 * sizeof(void *); offset++)
+		UT_ASSERT(!rf_page_authority_guard_output_distinct_v1(guard,
+			(void *)((uintptr_t)guard + offset), 1));
+	UT_ASSERT(!rf_page_authority_guard_output_distinct_v1(guard, (void *)((uintptr_t)guard - 4), 5));
+	UT_ASSERT(rf_page_authority_guard_output_distinct_v1(guard, (void *)((uintptr_t)guard - 4), 4));
+	UT_ASSERT(rf_page_authority_guard_output_distinct_v1(guard, &separate, sizeof(separate)));
+	UT_ASSERT(!rf_page_authority_guard_output_distinct_v1(NULL, &separate, 1));
+	UT_ASSERT(!rf_page_authority_guard_output_distinct_v1(guard, NULL, 1));
+	UT_ASSERT(!rf_page_authority_guard_output_distinct_v1(guard, &separate, 0));
+	UT_ASSERT_EQ(rf_page_authority_batch_revalidate_nowait_v1(guard, &serial), RF_PAGE_AUTHORITY_OK);
+	rf_page_authority_guard_release_v1(&guard);
+	UT_ASSERT(guard == NULL);
+	rf_page_authority_preflight_destroy_v1(&preflight);
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(15);
 	UT_RUN(test_exact_owner_set_promotes_and_revalidates);
 	UT_RUN(test_batch_target_set_is_not_limited_by_record_components);
 	UT_RUN(test_missing_live_stop04_object_is_invalid);
@@ -612,6 +640,7 @@ main(void)
 	UT_RUN(test_identity_and_incarnation_are_exact);
 	UT_RUN(test_recovery_reference_requires_exact_held_target_and_pin);
 	UT_RUN(test_install_adapter_runs_promote_publish_release);
+	UT_RUN(test_guard_storage_distinct_checks_interior_without_changing_owner);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

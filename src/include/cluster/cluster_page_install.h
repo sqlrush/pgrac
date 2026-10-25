@@ -182,6 +182,25 @@ extern bool rf_page_recovery_ctrc_itl_page_fpi_smgr_v1(const struct ClusterRecov
 	const struct ClusterSpaceIdentity *space, BlockNumber blockno,
 	const RfPageVersionV1 *expected_before, struct ClusterColdTtSlotInputV1 *scratch,
 	Size capacity, RfPageRecoveryCtrcItlFpiV1 *out);
+/* Post-C0 variant using the same retained pre-C0 work. The caller holds a
+ * complete immutable physical TT observation array in original work order,
+ * under the original isolation/namespace/full-census premises. Require exact
+ * original accepted TX value plus each canonical C0/terminal successor.
+ * Reserve scratch for twice subject_count entries before PAGE promotion:
+ * original inputs then terminal views. Recheck all inputs and that same TX
+ * value across the original reader/token producer; no scratch allocation.
+ * All backing storage must be distinct; scratch may change on refusal/ERROR,
+ * output and original owners/debts stay unchanged. This only prepares a
+ * private frame; graph/history/source proof, F4/WAL/install/discharge and
+ * full-service completion remain separate requirements. */
+struct ClusterRecoveryUndoEntry;
+extern bool rf_page_recovery_ctrc_itl_c0_page_fpi_smgr_v1(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, const struct RfPageAuthorityGuardV1 *guard,
+	struct ClusterRecoverySerialGuard *serial, struct ClusterWalRetentionPin *pin,
+	const struct ClusterSpaceIdentity *space, BlockNumber blockno,
+	const RfPageVersionV1 *expected_before, const struct ClusterRecoveryUndoEntry *physical,
+	Size physical_count, struct ClusterColdTtSlotInputV1 *scratch, Size capacity,
+	RfPageRecoveryCtrcItlFpiV1 *out);
 #endif
 
 #endif /* CLUSTER_PAGE_INSTALL_H */
