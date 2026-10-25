@@ -2445,6 +2445,98 @@ UT_TEST(test_v2_cohort_rejects_local_sample_and_admission_changes)
 	}
 }
 
+UT_TEST(test_v2_cohort_rejects_exhausted_local_full_xid_sample)
+{
+	(void)reset_v2_cohort(false);
+	test_sender_sample.scan.future_full = FullTransactionIdFromU64(UINT64_MAX);
+	assert_cohort_refusal(CLUSTER_HEAP_FREEZE_COHORT_INVALID);
+
+	(void)reset_v2_cohort(false);
+	test_sender_sample.scan.future_full = FullTransactionIdFromU64(UINT64_MAX);
+	test_sender_sample.scan.min_full = FullTransactionIdFromU64(UINT64_MAX);
+	assert_cohort_refusal(CLUSTER_HEAP_FREEZE_COHORT_INVALID);
+
+	/* The last finite normal value still traverses the original whole path. */
+	(void)reset_v2_cohort(false);
+	test_sender_sample.scan.future_full = FullTransactionIdFromU64(UINT64_MAX - 1);
+	test_sender_sample.scan.min_full = FullTransactionIdFromU64(UINT64_MAX - 1);
+	{
+		ClusterHeapFreezeWatermark out;
+		cluster_undo_horizon_lmon_tick();
+		UT_ASSERT(cluster_heap_freeze_watermark_sample(&out));
+		UT_ASSERT_EQ(out.future_full_xid_max, UINT64_MAX - 1);
+	}
+}
+
+UT_TEST(test_v2_watermark_publisher_rejects_invalid_original_full_xids)
+{
+	static const uint64 invalid[] = {
+		UINT64CONST(0x200000001), UINT64CONST(0x200000002), UINT64_MAX
+	};
+	for (unsigned field = 0; field < 4; field++) {
+		for (unsigned i = 0; i < lengthof(invalid); i++) {
+			ClusterHeapFreezeCohortObservation cohort;
+			UndoHorizonV2MaintenanceObservation observed = { 0 };
+			ClusterHeapFreezeWatermark first;
+			uint32 seq;
+
+			(void)reset_v2_cohort(false);
+			UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&cohort),
+						 CLUSTER_HEAP_FREEZE_COHORT_READY);
+			observed.fence = test_v2_fence;
+			observed.active_sample_id = test_sender_sample.sample_id;
+			UT_ASSERT(undo_horizon_publish_freeze_watermark(&cohort, &observed, test_horizon_now));
+			first = test_horizon_store.freeze_watermark;
+			seq = pg_atomic_read_u32(&test_horizon_store.freeze_watermark_seq);
+			if (field < 2) {
+				cohort.future_full_xid_max = invalid[i];
+				if (field == 1)
+					cohort.active_full_xid_min = invalid[i];
+			} else {
+				test_sender_sample.scan.future_full = FullTransactionIdFromU64(invalid[i]);
+				if (field == 3)
+					test_sender_sample.scan.min_full = FullTransactionIdFromU64(invalid[i]);
+			}
+			UT_ASSERT(!undo_horizon_publish_freeze_watermark(&cohort, &observed, test_horizon_now + 1));
+			UT_ASSERT(memcmp(&first, &test_horizon_store.freeze_watermark, sizeof(first)) == 0);
+			UT_ASSERT_EQ(pg_atomic_read_u32(&test_horizon_store.freeze_watermark_seq), seq);
+		}
+	}
+}
+
+UT_TEST(test_v2_watermark_reader_rejects_invalid_original_full_xids)
+{
+	static const uint64 invalid[] = {
+		UINT64CONST(0x200000001), UINT64CONST(0x200000002), UINT64_MAX
+	};
+	for (unsigned field = 0; field < 4; field++) {
+		for (unsigned i = 0; i < lengthof(invalid); i++) {
+			ClusterHeapFreezeWatermark stored, out, zero = { 0 };
+			uint32 seq;
+
+			(void)reset_v2_cohort(false);
+			cluster_undo_horizon_lmon_tick();
+			UT_ASSERT(cluster_heap_freeze_watermark_sample(&stored));
+			if (field < 2) {
+				test_horizon_store.freeze_watermark.future_full_xid_max = invalid[i];
+				if (field == 1)
+					test_horizon_store.freeze_watermark.active_full_xid_min = invalid[i];
+			} else {
+				test_sender_sample.scan.future_full = FullTransactionIdFromU64(invalid[i]);
+				if (field == 3)
+					test_sender_sample.scan.min_full = FullTransactionIdFromU64(invalid[i]);
+			}
+			stored = test_horizon_store.freeze_watermark;
+			seq = pg_atomic_read_u32(&test_horizon_store.freeze_watermark_seq);
+			memset(&out, 0xa5, sizeof(out));
+			UT_ASSERT(!cluster_heap_freeze_watermark_sample(&out));
+			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+			UT_ASSERT(memcmp(&stored, &test_horizon_store.freeze_watermark, sizeof(stored)) == 0);
+			UT_ASSERT_EQ(pg_atomic_read_u32(&test_horizon_store.freeze_watermark_seq), seq);
+		}
+	}
+}
+
 UT_TEST(test_v2_cohort_defends_against_malformed_slots)
 {
 	for (int fault = 0; fault < 13; fault++) {
@@ -3214,7 +3306,7 @@ UT_TEST(test_native_history_retirement_preserves_exact_equal_time_origin)
 int
 main(void)
 {
-	UT_PLAN(112);
+	UT_PLAN(115);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -3330,6 +3422,9 @@ main(void)
 	UT_RUN(test_native_history_loss_preserves_candidate_without_a_fresh_fold);
 	UT_RUN(test_native_history_retirement_preserves_exact_equal_time_origin);
 
+	UT_RUN(test_v2_cohort_rejects_exhausted_local_full_xid_sample);
+	UT_RUN(test_v2_watermark_publisher_rejects_invalid_original_full_xids);
+	UT_RUN(test_v2_watermark_reader_rejects_invalid_original_full_xids);
 	UT_DONE();
 	free(procArray);
 	return ut_failed_count == 0 ? 0 : 1;

@@ -912,6 +912,8 @@ cluster_heap_freeze_watermark_sample(ClusterHeapFreezeWatermark *out)
 			|| watermark.admitted_members_hi != fence.admitted_members_hi
 			|| watermark.future_full_xid_max == 0
 			|| watermark.active_full_xid_min == 0
+			|| watermark.future_full_xid_max == UINT64_MAX
+			|| watermark.active_full_xid_min == UINT64_MAX
 			|| !FullTransactionIdIsValid(future) || !FullTransactionIdIsValid(active_min)
 			|| FullTransactionIdFollows(active_min, future)
 			|| !TransactionIdIsNormal(
@@ -924,6 +926,10 @@ cluster_heap_freeze_watermark_sample(ClusterHeapFreezeWatermark *out)
 			|| !cluster_undo_cleaner_active_sample(&active)
 			|| active.sample_id != active_sample_id
 			|| active.scan.unqualified_entries != 0
+			|| !TransactionIdIsNormal(XidFromFullTransactionId(active.scan.future_full))
+			|| !TransactionIdIsNormal(XidFromFullTransactionId(active.scan.min_full))
+			|| U64FromFullTransactionId(active.scan.future_full) == UINT64_MAX
+			|| U64FromFullTransactionId(active.scan.min_full) == UINT64_MAX
 			|| memcmp(&active.admission_fence, &fence, sizeof(fence)) != 0
 			|| !cluster_undo_cleaner_active_sample_current(&active)
 			|| !undo_horizon_watermark_sources_current(&fence, sources)
@@ -1080,6 +1086,9 @@ undo_horizon_v2_cohort_observe(ClusterHeapFreezeCohortObservation *out,
 		|| !FullTransactionIdIsValid(active.scan.min_full)
 		|| !TransactionIdIsNormal(XidFromFullTransactionId(active.scan.future_full))
 		|| !TransactionIdIsNormal(XidFromFullTransactionId(active.scan.min_full))
+		/* Local samples do not pass through the finite V2 codec. */
+		|| U64FromFullTransactionId(active.scan.future_full) == UINT64_MAX
+		|| U64FromFullTransactionId(active.scan.min_full) == UINT64_MAX
 		|| FullTransactionIdFollows(active.scan.min_full, active.scan.future_full)
 		|| !SCN_VALID(history.horizon_scn) || !SCN_VALID(history.clock_scn)
 		|| history.horizon_scn == CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED
@@ -1164,6 +1173,12 @@ undo_horizon_publish_freeze_watermark(const ClusterHeapFreezeCohortObservation *
 		|| active.sample_id != observed->active_sample_id || active.worker_pid <= 0
 		|| !FullTransactionIdIsValid(active.scan.future_full)
 		|| !FullTransactionIdIsValid(active.scan.min_full)
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(active.scan.future_full))
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(active.scan.min_full))
+		|| U64FromFullTransactionId(active.scan.future_full) == UINT64_MAX
+		|| U64FromFullTransactionId(active.scan.min_full) == UINT64_MAX
+		|| cohort->future_full_xid_max == UINT64_MAX
+		|| cohort->active_full_xid_min == UINT64_MAX
 		|| !FullTransactionIdIsValid(future) || !FullTransactionIdIsValid(active_min)
 		|| !TransactionIdIsNormal(XidFromFullTransactionId(future))
 		|| !TransactionIdIsNormal(XidFromFullTransactionId(active_min))
