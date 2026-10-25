@@ -1199,6 +1199,87 @@ ClusterColdRecoveryCtrcPhysical(const struct ClusterRecoveryStartV1 *start,
 	return ClusterColdRecoveryCtrcObserve(start, 0) ? start->ctrc_physical : NULL;
 }
 
+/* History endpoints cannot substitute for the current failed source of a TT
+ * owner. Locate a unique original replay participant before reading its source. */
+static uint32
+cluster_recovery_cold_ctrc_source(const ClusterColdTypedV1 *typed, uint16 owner)
+{
+	uint32 target = UINT32_MAX;
+
+	if (owner == 0 || typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->replay_count == 0 || typed->replay_count > typed->participant_count)
+		return UINT32_MAX;
+	for (uint32 p = 0; p < typed->replay_count; p++) {
+		if (typed->participants[p].thread_id != owner)
+			continue;
+		if (target != UINT32_MAX)
+			return UINT32_MAX;
+		target = p;
+	}
+	if (target == UINT32_MAX || typed->participants[target].owner_incarnation == 0
+		|| typed->sources[target].claim.identity.origin_thread_id != owner
+		|| typed->sources[target].claim.identity.origin_owner_incarnation
+			!= typed->participants[target].owner_incarnation
+		|| typed->sources[target].timeline != typed->participants[target].timeline)
+		return UINT32_MAX;
+	return target;
+}
+
+ClusterRecoverySerialRequest
+ClusterColdRecoveryCtrcSerialRequest(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 subject_index)
+{
+	ClusterRecoverySerialRequest request, empty;
+	const ClusterColdTypedV1 *typed;
+	const ClusterColdCtrcPhysicalV1 *physical, *confirmed;
+	struct ClusterRecoveryFencePlan *fence;
+	ClusterWalSourceRef source;
+	ClusterColdParticipantV1 participant;
+	ClusterRecoveryUndoEntry observed;
+	uint32 target, replay_count, participant_count;
+	uint16 owner;
+
+	memset(&request, 0, sizeof(request));
+	memset(&empty, 0, sizeof(empty));
+	if (CritSectionCount != 0 || !ClusterColdRecoveryCtrcWorkCurrent(start, work)
+		|| (physical = ClusterColdRecoveryCtrcPhysical(start, work)) == NULL
+		|| subject_index >= physical->count)
+		return empty;
+	typed = start->inputs;
+	fence = start->tx_fence;
+	owner = work->entries[subject_index].key.owner_instance;
+	target = cluster_recovery_cold_ctrc_source(typed, owner);
+	if (target == UINT32_MAX)
+		return empty;
+	replay_count = typed->replay_count;
+	participant_count = typed->participant_count;
+	memcpy(&source, &typed->sources[target], sizeof(source));
+	memcpy(&participant, &typed->participants[target], sizeof(participant));
+	memcpy(&observed, &physical->entries[subject_index], sizeof(observed));
+
+	/* The original completed fence owner alone supplies the old duty, RR token
+	 * and live formation/fence bindings. Never manufacture them from the new
+	 * installed writer, or treat this unheld template as PAGE/write authority. */
+	if (!cluster_recovery_merge_fence_plan_tx_request_v1(fence,
+			&typed->sources[target], &request))
+		return empty;
+	confirmed = ClusterColdRecoveryCtrcPhysical(start, work);
+	/* The original getter validates the complete work, accepted TX value,
+	 * manifest and every canonical terminal again. It cannot start a new view.
+	 * Keep our selected raw bytes and full old-source identity across callbacks. */
+	if (confirmed != physical || !ClusterColdRecoveryCtrcWorkCurrent(start, work)
+		|| start->inputs != typed || start->tx_fence != fence
+		|| typed->replay_count != replay_count || typed->participant_count != participant_count
+		|| cluster_recovery_cold_ctrc_source(typed, owner) != target
+		|| memcmp(&source, &typed->sources[target], sizeof(source)) != 0
+		|| memcmp(&participant, &typed->participants[target], sizeof(participant)) != 0
+		|| memcmp(&observed, &confirmed->entries[subject_index], sizeof(observed)) != 0
+		|| !cluster_recovery_merge_fence_plan_tx_current_v1(fence, &source)
+		|| !cluster_recovery_cold_observation_current(start))
+		return empty;
+	return request;
+}
+
 bool
 ClusterColdRecoveryTxEffectsCurrent(const struct ClusterRecoveryStartV1 *start)
 {

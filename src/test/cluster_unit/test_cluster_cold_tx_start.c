@@ -58,6 +58,7 @@ static bool native_recovery, binding_ok, writer_ok, allocation_ok;
 static bool effects_ready;
 static bool tx_fence_current, tx_fence_subject_current;
 static unsigned tx_fence_checks;
+static void (*ctrc_request_step)(void);
 static bool invalidate_fence_in_pre, invalidate_fence_on_flush;
 static union {
 	ClusterRecoverySerialRequest alignment;
@@ -92,6 +93,7 @@ cluster_recovery_merge_fence_plan_tx_request_v1(struct ClusterRecoveryFencePlan 
 	out->fence_need_set = (const PgracExternalFenceNeedSetV1 *)&tx_fence_object;
 	out->fence_admission_set = (const PgracExternalFenceAdmissionSetV1 *)&tx_fence_object;
 	out->acquire_timeout_ms = out->release_timeout_ms = 1000;
+	if (ctrc_request_step != NULL) ctrc_request_step();
 	return true;
 }
 
@@ -630,6 +632,7 @@ static void reset(void)
 	effects_ready = false;
 	tx_fence_current = tx_fence_subject_current = true;
 	tx_fence_checks = 0;
+	ctrc_request_step = NULL;
 	invalidate_fence_in_pre = invalidate_fence_on_flush = false;
 	xid_ready = invalidate_writer_on_xid_ready = false;
 	terminal_xid_step = NULL;
@@ -2133,6 +2136,7 @@ UT_TEST(test_original_error_revokes_ctrc_registration_with_the_owner_slot)
 #include "test_cluster_cold_ctrc_handoff.inc"
 #include "test_cluster_cold_ctrc_census.inc"
 #include "test_cluster_cold_ctrc_terminals.inc"
+#include "test_cluster_cold_ctrc_source_request.inc"
 
 UT_TEST(test_start_serial_request_keeps_original_subject_separate_from_new_writer)
 {
@@ -2229,7 +2233,14 @@ UT_TEST(test_c0_error_closes_target_before_ir_and_walr)
 
 int main(void)
 {
-	UT_PLAN(99);
+	UT_PLAN(106);
+	UT_RUN(test_ctrc_source_request_keeps_original_source_and_provisional_bindings);
+	UT_RUN(test_ctrc_source_request_accepts_existing_terminals_without_a_c0_subject);
+	UT_RUN(test_ctrc_source_request_requires_original_complete_observation_and_source);
+	UT_RUN(test_ctrc_source_request_refuses_history_only_and_uncovered_sources);
+	UT_RUN(test_ctrc_source_request_withholds_private_result_after_late_drift);
+	UT_RUN(test_ctrc_source_request_propagates_error_without_publishing_or_retiring);
+	UT_RUN(test_ctrc_source_request_rejects_stale_owner_and_critical_section);
 	UT_RUN(test_original_recovered_claim_spans_eor_pending_service_and_handoff);
 	UT_RUN(test_claim_eor_preserves_original_clean_no_attempt_behavior);
 	UT_RUN(test_start_requires_the_original_live_claim_incarnation);
