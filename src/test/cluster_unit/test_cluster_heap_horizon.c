@@ -990,6 +990,19 @@ UT_TEST(freeze_report_v2_decode_rejects_invalid_payload)
 	assert_freeze_report_v2_equal(&input, &output);
 }
 
+/* Controlled original source images for otherwise unchanged policy tests. */
+static void
+observed_bounds_set_full_xid_sources(ClusterHeapFreezeCohortObservation *cohort)
+{
+	cohort->local_registration_cut.status = CTRC_ACTIVE_SCAN_COMPLETE;
+	cohort->local_registration_cut.min_full = FullTransactionIdFromU64(cohort->active_full_xid_min);
+	cohort->local_registration_cut.future_full = FullTransactionIdFromU64(cohort->future_full_xid_max);
+	for (int peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+		cohort->source_peer_active_full_xid_min[peer] = cohort->active_full_xid_min;
+		cohort->source_peer_future_full_xid[peer] = cohort->future_full_xid_max;
+	}
+}
+
 static void
 observed_bounds_fixture(ClusterHeapFreezePolicySampleV1 *policy,
 	ClusterHeapFreezeCohortObservation *cohort, ClusterSemanticAdmissionToken *admission)
@@ -1001,6 +1014,7 @@ observed_bounds_fixture(ClusterHeapFreezePolicySampleV1 *policy,
 	policy->freeze_limit = FullTransactionIdFromEpochAndXid(2, 80);
 	cohort->active_full_xid_min = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(2, 60));
 	cohort->future_full_xid_max = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(2, 2000));
+	observed_bounds_set_full_xid_sources(cohort);
 	cohort->horizon_scn = 500;
 	cohort->source_local_horizon_scn = 700;
 	cohort->source_peer_horizon_scn[0] = 700;
@@ -1033,6 +1047,7 @@ UT_TEST(observed_bounds_cap_policy_at_same_cohort_and_preserve_h_domain)
 	UT_ASSERT_EQ(U64FromFullTransactionId(out.freeze_limit), cohort.active_full_xid_min);
 	UT_ASSERT_EQ(out.horizon_scn, cohort.horizon_scn);
 	cohort.active_full_xid_min = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(2, 90));
+	observed_bounds_set_full_xid_sources(&cohort);
 	UT_ASSERT(cluster_heap_freeze_observed_bounds_v1(&policy, &cohort, &admission, 0, &out));
 	UT_ASSERT(FullTransactionIdEquals(out.freeze_limit, policy.freeze_limit));
 	UT_ASSERT_EQ(out.horizon_scn, cohort.horizon_scn);
@@ -1210,6 +1225,7 @@ UT_TEST(observed_bounds_selected_cutoff_refuses_native_halfspace_alias)
 		case 2: cohort.active_full_xid_min = legal - UINT64CONST(0x100000000); break;
 		case 3: cohort.active_full_xid_min = FirstNormalTransactionId; break;
 		}
+		observed_bounds_set_full_xid_sources(&cohort);
 		memset(&out, 0x5a, sizeof(out)); saved = out;
 		UT_ASSERT(!cluster_heap_freeze_observed_bounds_v1(&policy, &cohort,
 			&admission, 0, &out));
@@ -1231,6 +1247,7 @@ UT_TEST(observed_bounds_selected_cutoff_keeps_exact_native_window_edge)
 		cohort.active_full_xid_min = variant == 0
 			? legal - UINT64CONST(0x7fffffff)
 			: U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, UINT32_MAX));
+		observed_bounds_set_full_xid_sources(&cohort);
 		UT_ASSERT(cluster_heap_freeze_observed_bounds_v1(&policy, &cohort,
 			&admission, 0, &out));
 		UT_ASSERT_EQ(U64FromFullTransactionId(out.freeze_limit), cohort.active_full_xid_min);
@@ -1248,6 +1265,7 @@ UT_TEST(observed_bounds_checks_selected_minimum_not_ignored_future_bound)
 	observed_bounds_fixture(&policy, &cohort, &admission);
 	cohort.active_full_xid_min = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(3, 80));
 	cohort.future_full_xid_max = cohort.active_full_xid_min + 1000;
+	observed_bounds_set_full_xid_sources(&cohort);
 	UT_ASSERT(cluster_heap_freeze_observed_bounds_v1(&policy, &cohort,
 		&admission, 0, &out));
 	UT_ASSERT(FullTransactionIdEquals(out.freeze_limit, policy.freeze_limit));
@@ -1264,6 +1282,7 @@ UT_TEST(observed_bounds_keep_fullxid_epoch_and_high_member_bit)
 
 	observed_bounds_fixture(&policy, &cohort, &admission);
 	cohort.active_full_xid_min = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, UINT32_MAX - 100));
+	observed_bounds_set_full_xid_sources(&cohort);
 	cohort.admitted_members_hi = cohort.admission_fence.admitted_members_hi = UINT64CONST(1) << 63;
 	cohort.admission_fence.local_node_id = 127;
 	UT_ASSERT(cluster_heap_freeze_observed_bounds_v1(&policy, &cohort, &admission, 127, &out));
@@ -1271,10 +1290,96 @@ UT_TEST(observed_bounds_keep_fullxid_epoch_and_high_member_bit)
 	UT_ASSERT(!FullTransactionIdEquals(out.freeze_limit, policy.freeze_limit));
 }
 
+UT_TEST(observed_bounds_reproduces_exact_fullxid_min_and_future_max_from_fixed_sources)
+{
+	ClusterHeapFreezePolicySampleV1 policy;
+	ClusterHeapFreezeCohortObservation cohort;
+	ClusterSemanticAdmissionToken admission;
+	ClusterHeapFreezeObservedBoundsV1 out;
+	observed_bounds_fixture(&policy, &cohort, &admission);
+	cohort.local_registration_cut.min_full = FullTransactionIdFromEpochAndXid(2, 90);
+	cohort.local_registration_cut.future_full = FullTransactionIdFromEpochAndXid(2, 1500);
+	UT_ASSERT(cluster_heap_freeze_observed_bounds_v1(&policy, &cohort, &admission, 0, &out));
+	UT_ASSERT_EQ(U64FromFullTransactionId(out.freeze_limit), cohort.source_peer_active_full_xid_min[1]);
+	/* A required high member keeps its complete older epoch, while its
+	 * future contributes only to the max, never to the freeze minimum. */
+	cohort.admitted_members_hi = cohort.admission_fence.admitted_members_hi = UINT64CONST(1) << 63;
+	cohort.source_peer_active_full_xid_min[127] =
+		U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, UINT32_MAX - 100));
+	cohort.source_peer_future_full_xid[127] =
+		U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(3, FirstNormalTransactionId));
+	cohort.active_full_xid_min = cohort.source_peer_active_full_xid_min[127];
+	cohort.future_full_xid_max = cohort.source_peer_future_full_xid[127];
+	cohort.source_peer_horizon_scn[127] = cohort.source_local_horizon_scn;
+	cohort.source_peer_history[127] = cohort.source_local_history;
+	/* Nonmembers never contribute, even with malformed diagnostic storage. */
+	cohort.source_peer_active_full_xid_min[65] = UINT64_MAX;
+	cohort.source_peer_future_full_xid[65] = 1;
+	UT_ASSERT(cluster_heap_freeze_observed_bounds_v1(&policy, &cohort, &admission, 0, &out));
+	UT_ASSERT_EQ(U64FromFullTransactionId(out.freeze_limit), cohort.source_peer_active_full_xid_min[127]);
+	UT_ASSERT_EQ(out.horizon_scn, 500);
+	UT_ASSERT_EQ(activation_reads, 0);
+}
+
+UT_TEST(observed_bounds_missing_or_changed_fullxid_source_is_atomic)
+{
+	for (int source = 0; source < 2; source++) {
+		for (int fault = 0; fault < 8; fault++) {
+			ClusterHeapFreezePolicySampleV1 policy;
+			ClusterHeapFreezeCohortObservation cohort;
+			ClusterSemanticAdmissionToken admission;
+			ClusterHeapFreezeObservedBoundsV1 out, before;
+			uint64 min, future;
+			observed_bounds_fixture(&policy, &cohort, &admission);
+			min = cohort.active_full_xid_min; future = cohort.future_full_xid_max;
+			switch (fault) {
+			case 0: min = 0; break;
+			case 1: future = 0; break;
+			case 2: min = (UINT64CONST(2) << 32) | FrozenTransactionId; break;
+			case 3: future = (UINT64CONST(2) << 32) | BootstrapTransactionId; break;
+			case 4: min = UINT64_MAX; break;
+			case 5: future = UINT64_MAX; break;
+			case 6: min--; break; /* aggregate no longer equals the saved source */
+			case 7: future++; break;
+			}
+			if (source == 0) {
+				cohort.local_registration_cut.min_full = FullTransactionIdFromU64(min);
+				cohort.local_registration_cut.future_full = FullTransactionIdFromU64(future);
+			} else {
+				cohort.source_peer_active_full_xid_min[1] = min;
+				cohort.source_peer_future_full_xid[1] = future;
+			}
+			memset(&out, 0xa5, sizeof(out)); before = out;
+			UT_ASSERT(!cluster_heap_freeze_observed_bounds_v1(&policy, &cohort, &admission, 0, &out));
+			UT_ASSERT(memcmp(&out, &before, sizeof(out)) == 0);
+			UT_ASSERT_EQ(activation_reads, 0);
+		}
+	}
+}
+
+UT_TEST(observed_bounds_aggregate_fullxid_cannot_replace_saved_source_even_if_policy_ignores_f)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		ClusterHeapFreezePolicySampleV1 policy;
+		ClusterHeapFreezeCohortObservation cohort;
+		ClusterSemanticAdmissionToken admission;
+		ClusterHeapFreezeObservedBoundsV1 out, before;
+		observed_bounds_fixture(&policy, &cohort, &admission);
+		if (fault < 2) {
+			if (fault == 1) policy.freeze_limit = FullTransactionIdFromEpochAndXid(2, 40);
+			cohort.active_full_xid_min++;
+		} else cohort.future_full_xid_max++;
+		memset(&out, 0xa5, sizeof(out)); before = out;
+		UT_ASSERT(!cluster_heap_freeze_observed_bounds_v1(&policy, &cohort, &admission, 0, &out));
+		UT_ASSERT(memcmp(&out, &before, sizeof(out)) == 0);
+		UT_ASSERT_EQ(activation_reads, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(61);
+	UT_PLAN(64);
 	UT_RUN(observed_bounds_cap_policy_at_same_cohort_and_preserve_h_domain);
 	UT_RUN(observed_bounds_reproduces_original_fixed_cohort_h_minimum);
 	UT_RUN(observed_bounds_rejects_changed_or_missing_original_h_atomically);
@@ -1286,6 +1391,9 @@ main(void)
 	UT_RUN(observed_bounds_selected_cutoff_keeps_exact_native_window_edge);
 	UT_RUN(observed_bounds_checks_selected_minimum_not_ignored_future_bound);
 	UT_RUN(observed_bounds_keep_fullxid_epoch_and_high_member_bit);
+	UT_RUN(observed_bounds_reproduces_exact_fullxid_min_and_future_max_from_fixed_sources);
+	UT_RUN(observed_bounds_missing_or_changed_fullxid_source_is_atomic);
+	UT_RUN(observed_bounds_aggregate_fullxid_cannot_replace_saved_source_even_if_policy_ignores_f);
 	UT_RUN(policy_sample_retains_original_legal_next_and_allocation_fence);
 	UT_RUN(policy_sample_refusal_preserves_complete_output);
 	UT_RUN(policy_sample_rechecks_original_fence_without_resampling_next);

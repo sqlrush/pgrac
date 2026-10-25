@@ -375,6 +375,7 @@ cluster_heap_freeze_observed_bounds_v1(
 {
 	ClusterHeapFreezeObservedBoundsV1 bounds = { 0 };
 	SCN source_horizon;
+	uint64 source_min, source_future;
 
 	if (policy == NULL || cohort == NULL || admission == NULL || out == NULL
 		|| !admission->entered || admission->record_generation == 0
@@ -410,6 +411,20 @@ cluster_heap_freeze_observed_bounds_v1(
 	 * publications, in the original fold order and SCN time domain. Values
 	 * from outside that fixed cohort cannot change this bound. This is a
 	 * pure source match, not contributor-lifetime or retention authority. */
+	/* Reproduce F from the same original completed local cut and required
+	 * peer report inputs. A caller's aggregate cannot replace a missing or
+	 * inconsistent source, even when the policy would ignore its higher F.
+	 * Numeric equality still grants no producer-lifetime/retention authority. */
+	source_min = U64FromFullTransactionId(cohort->local_registration_cut.min_full);
+	source_future = U64FromFullTransactionId(cohort->local_registration_cut.future_full);
+	if (cohort->local_registration_cut.status != CTRC_ACTIVE_SCAN_COMPLETE
+		|| cohort->local_registration_cut.unqualified_entries != 0
+		|| !TransactionIdIsNormal((TransactionId)source_min)
+		|| !TransactionIdIsNormal((TransactionId)source_future)
+		|| source_min == UINT64_MAX || source_future == UINT64_MAX
+		|| source_min > source_future)
+		return false;
+
 	source_horizon = (SCN)cohort->source_local_horizon_scn;
 	if (!SCN_VALID(source_horizon) || source_horizon == UINT64_MAX
 		|| !SCN_VALID((SCN)cohort->source_local_history.sample_clock_scn)
@@ -421,9 +436,19 @@ cluster_heap_freeze_observed_bounds_v1(
 	{
 		uint64 members = peer < 64 ? cohort->admitted_members_lo : cohort->admitted_members_hi;
 		SCN peer_horizon;
+		uint64 peer_min, peer_future;
 
 		if (peer == local_node_id || (members & (UINT64CONST(1) << (peer % 64))) == 0)
 			continue;
+		peer_min = cohort->source_peer_active_full_xid_min[peer];
+		peer_future = cohort->source_peer_future_full_xid[peer];
+		if (!TransactionIdIsNormal((TransactionId)peer_min)
+			|| !TransactionIdIsNormal((TransactionId)peer_future)
+			|| peer_min == UINT64_MAX || peer_future == UINT64_MAX
+			|| peer_min > peer_future)
+			return false;
+		source_min = Min(source_min, peer_min);
+		source_future = Max(source_future, peer_future);
 		peer_horizon = (SCN)cohort->source_peer_horizon_scn[peer];
 		if (!SCN_VALID(peer_horizon) || peer_horizon == UINT64_MAX
 			|| !SCN_VALID((SCN)cohort->source_peer_history[peer].sample_clock_scn)
@@ -435,7 +460,9 @@ cluster_heap_freeze_observed_bounds_v1(
 		if (scn_time_cmp(peer_horizon, source_horizon) < 0)
 			source_horizon = peer_horizon;
 	}
-	if ((uint64)source_horizon != cohort->horizon_scn)
+	if (source_min != cohort->active_full_xid_min
+		|| source_future != cohort->future_full_xid_max
+		|| (uint64)source_horizon != cohort->horizon_scn)
 		return false;
 
 	/* F only caps the original policy; H remains in its independent SCN

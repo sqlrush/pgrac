@@ -1003,6 +1003,10 @@ undo_horizon_v2_observe_peer(int32 peer, const ClusterSemanticActiveSampleFence 
 		return CLUSTER_HEAP_FREEZE_COHORT_INVALID;
 	identity->recv_at_us = view.recv_at_us;
 	identity->interval_ms = report->sender_interval_ms;
+	/* Retain the same already-decoded F inputs before folding; no second
+	 * slot read, local epoch inference or new source qualification. */
+	candidate->source_peer_future_full_xid[peer] = report->future_full_xid;
+	candidate->source_peer_active_full_xid_min[peer] = report->active_full_xid_min;
 	candidate->source_peer_horizon_scn[peer] = report->horizon_scn;
 	candidate->source_peer_history[peer].sample_clock_scn = report->h_sample_clock_scn;
 	candidate->source_peer_history[peer].contributor_kind = report->h_contributor_kind;
