@@ -571,6 +571,7 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		test_cluster_relmap_abort.inc \
 		test_cluster_relmap_unarmed.inc \
 		test_cluster_relmap_precommit.inc \
+		test_cluster_relmap_authority_entry.inc \
 		test_cluster_relmap_native_lock.inc test_cluster_relmap_native_lock.h \
 		test_cluster_relmap_native_lock.o \
 		test_cluster_relmap_physical_pair.inc test_cluster_relmap_physical_pair.h \

@@ -173,7 +173,7 @@ UT_TEST(v2_precommit_preflight_refusals_keep_original_queues)
 				UT_ASSERT(!cluster_relmap_producer_arm_v2(true, &updates));
 				terminal_prepare_fail = false;
 				break;
-			case 12: authority_held = false; break;
+			case 12: authority_held = false; lock_available = false; break;
 			case 13: local_held = true; break;
 			case 14: v2_xidgen_held = true; break;
 			case 15: ShutdownRequestPending = true; break;

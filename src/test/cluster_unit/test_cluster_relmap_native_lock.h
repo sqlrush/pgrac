@@ -25,5 +25,6 @@ extern void test_relmap_native_lock_stats(TestRelmapNativeLockStats *out);
 extern bool test_relmap_native_lock_acquire(void);
 extern bool test_relmap_native_lock_held(void);
 extern void test_relmap_native_lock_release(void);
+extern void test_relmap_native_abort_release(void);
 
 #endif
