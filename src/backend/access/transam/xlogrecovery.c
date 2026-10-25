@@ -820,6 +820,18 @@ ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start)
 }
 
 bool
+ClusterColdRecoveryStartOutputDistinct(const struct ClusterRecoveryStartV1 *start,
+	const void *out, Size bytes)
+{
+	uintptr_t a = (uintptr_t)out, b = (uintptr_t)start;
+
+	/* Keep the opaque extent at its owner. No dereference, writer validation
+	 * or authority is implied by this storage-only check. */
+	return start != NULL && start == cluster_recovery_cold_start && out != NULL && bytes != 0
+		&& (a <= b ? b - a >= bytes : a - b >= sizeof(*start));
+}
+
+bool
 ClusterColdRecoveryCtrcWorkCurrent(const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdCtrcWorkV1 *work)
 {

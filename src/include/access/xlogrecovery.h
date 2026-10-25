@@ -178,6 +178,11 @@ extern bool ClusterColdRecoveryTxTopProofCurrent(
 extern const struct ClusterColdTypedV1 *
 ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start);
 
+/* Check the entire original opaque Start extent without exposing its layout.
+ * Storage separation only; this grants no input/current/write authority. */
+extern bool ClusterColdRecoveryStartOutputDistinct(const struct ClusterRecoveryStartV1 *start,
+	const void *out, Size bytes);
+
 struct ClusterColdCtrcWorkV1;
 /* Original RECOVERED/native-DONE Startup only. Prepare retained TT-native
  * work before C0; this grants no page, receipt, I/O or release authority.

@@ -13,6 +13,7 @@
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/cluster_recovery_undo_scan.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "../../../src/backend/cluster/cluster_control_root_private.h"
@@ -1892,9 +1893,16 @@ UT_TEST(test_original_error_revokes_ctrc_registration_with_the_owner_slot)
 	startup_actor(); ClusterReleaseColdRecoveryInputs(&info);
 }
 
+#include "test_cluster_cold_tx_ctrc_subject.inc"
+
 int main(void)
 {
-	UT_PLAN(55);
+	UT_PLAN(60);
+	UT_RUN(test_ctrc_terminal_subject_uses_actual_c0_and_exact_accepted_result);
+	UT_RUN(test_ctrc_terminal_subject_rejects_changed_physical_and_original_identity);
+	UT_RUN(test_ctrc_terminal_subject_requires_complete_current_original_components);
+	UT_RUN(test_ctrc_terminal_subject_preserves_preexisting_terminal_bytes);
+	UT_RUN(test_ctrc_terminal_subject_refuses_aliases_and_late_owner_change);
 	UT_RUN(test_original_lmon_registers_only_the_exact_complete_ctrc_value);
 	UT_RUN(test_ctrc_registration_does_not_infer_completion_from_tx_or_an_empty_slot);
 	UT_RUN(test_new_original_ctrc_generation_invalidates_its_previous_registration);
