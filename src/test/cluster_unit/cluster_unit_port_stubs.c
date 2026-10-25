@@ -17,6 +17,7 @@
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_update_trace.h"
 #include "cluster/cluster_tx_identity_trace.h"
+#include "cluster/cluster_native_itl_trace.h"
 #include "cluster/cluster_wait_trace.h"
 #include "cluster/cluster_xnode_profile.h"
 #include "cluster/cluster_storage_quorum.h"
@@ -25,6 +26,24 @@
  * Dedicated trace tests override these defaults with the real collector. */
 bool cluster_update_trace_enabled __attribute__((weak)) = false;
 bool cluster_trace_tx_identity __attribute__((weak)) = false;
+void __attribute__((weak))
+cluster_native_itl_trace_tt(ClusterNativeItlTraceKind kind pg_attribute_unused(),
+						  const ClusterCtrcTxnKeyV1 *key pg_attribute_unused(),
+						  const TTSlot *slot pg_attribute_unused(),
+						  XLogRecPtr lsn pg_attribute_unused())
+{
+	if (cluster_trace_tx_identity)
+		abort();
+}
+void __attribute__((weak))
+cluster_native_itl_trace_selected(Buffer buffer pg_attribute_unused(),
+								 TransactionId xid pg_attribute_unused(),
+								 uint8 selected pg_attribute_unused(),
+								 bool succeeded pg_attribute_unused())
+{
+	if (cluster_trace_tx_identity)
+		abort();
+}
 void __attribute__((weak))
 cluster_tx_identity_trace_emit(ClusterTxIdentityTraceKind kind pg_attribute_unused(),
 								const ClusterTxIdentityTrace *row pg_attribute_unused())

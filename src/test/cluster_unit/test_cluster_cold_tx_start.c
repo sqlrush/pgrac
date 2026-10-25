@@ -1780,9 +1780,126 @@ UT_TEST(test_ctrc_work_requires_original_pointer_and_live_startup_owner)
 	}
 }
 
+UT_TEST(test_original_lmon_registers_only_the_exact_complete_ctrc_value)
+{
+	for (unsigned empty = 0; empty < 2; empty++) {
+		ClusterRecoveryCtrcResultObservationV1 before, after, unavailable, zero = {0};
+		reset(); retain(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
+		if (!empty) ctrc_census.subject_count = ctrc_census.released_count = 48;
+		UT_ASSERT(cluster_recovery_ctrc_result_collect_v1(info.cluster_tx_start));
+		UT_ASSERT(!cluster_recovery_ctrc_result_accept_v1());
+		serving_actor();
+		UT_ASSERT(cluster_recovery_ctrc_result_observe_v1(&before));
+		memset(&unavailable, 0xa5, sizeof(unavailable));
+		UT_ASSERT(!cluster_recovery_ctrc_result_observe_accepted_v1(&unavailable));
+		UT_ASSERT(memcmp(&unavailable, &zero, sizeof(zero)) == 0);
+		UT_ASSERT(cluster_recovery_ctrc_result_accept_v1());
+		UT_ASSERT(cluster_recovery_ctrc_result_accept_v1());
+		UT_ASSERT(cluster_recovery_ctrc_result_observe_accepted_v1(&after));
+		UT_ASSERT(memcmp(&before, &after, sizeof(before)) == 0);
+		startup_actor();
+		ClusterReleaseColdRecoveryInputs(&info);
+		serving_actor();
+		UT_ASSERT(cluster_recovery_ctrc_result_observe_accepted_v1(&after));
+		UT_ASSERT(memcmp(&before, &after, sizeof(before)) == 0);
+		startup_actor();
+	}
+}
+
+UT_TEST(test_ctrc_registration_does_not_infer_completion_from_tx_or_an_empty_slot)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ClusterRecoveryCtrcResultObservationV1 unavailable, zero = {0};
+		c0_subject();
+		serving_actor(); UT_ASSERT(!cluster_recovery_ctrc_result_accept_v1());
+		startup_actor();
+		ctrc_census.subject_count = 1;
+		if (fault == 0) ctrc_census.unresolved_count = 1;
+		if (fault == 1) ctrc_census.unqualified_count = 1;
+		if (fault == 2) ctrc_census_ok = false;
+		UT_ASSERT(cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+		UT_ASSERT_EQ(window_region.checkpoint_owner.tx_result.state, CLUSTER_RECOVERY_TX_RESULT_COMPLETE);
+		serving_actor();
+		UT_ASSERT(!cluster_recovery_ctrc_result_accept_v1());
+		memset(&unavailable, 0xa5, sizeof(unavailable));
+		UT_ASSERT(!cluster_recovery_ctrc_result_observe_accepted_v1(&unavailable));
+		UT_ASSERT(memcmp(&unavailable, &zero, sizeof(zero)) == 0);
+		startup_actor();
+	}
+}
+
+UT_TEST(test_new_original_ctrc_generation_invalidates_its_previous_registration)
+{
+	ClusterRecoveryCtrcResultObservationV1 before, after, zero = {0};
+	reset(); retain(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
+	UT_ASSERT(cluster_recovery_ctrc_result_collect_v1(info.cluster_tx_start));
+	serving_actor(); UT_ASSERT(cluster_recovery_ctrc_result_accept_v1());
+	UT_ASSERT(cluster_recovery_ctrc_result_observe_accepted_v1(&before));
+	startup_actor();
+	UT_ASSERT(cluster_recovery_ctrc_result_collect_v1(info.cluster_tx_start));
+	serving_actor();
+	UT_ASSERT(!cluster_recovery_ctrc_result_observe_accepted_v1(&after));
+	UT_ASSERT(memcmp(&after, &zero, sizeof(zero)) == 0);
+	UT_ASSERT(cluster_recovery_ctrc_result_accept_v1());
+	UT_ASSERT(cluster_recovery_ctrc_result_observe_accepted_v1(&after));
+	UT_ASSERT_EQ(after.result.result_generation, before.result.result_generation + 1);
+	UT_ASSERT(memcmp(&before.checkpoint, &after.checkpoint, sizeof(before.checkpoint)) == 0);
+	startup_actor();
+	ctrc_census.subject_count = ctrc_census.unresolved_count = 1;
+	UT_ASSERT(cluster_recovery_ctrc_result_collect_v1(info.cluster_tx_start));
+	serving_actor();
+	UT_ASSERT(!cluster_recovery_ctrc_result_accept_v1());
+	UT_ASSERT(!cluster_recovery_ctrc_result_observe_accepted_v1(&after));
+	UT_ASSERT(memcmp(&after, &zero, sizeof(zero)) == 0);
+	startup_actor();
+}
+
+UT_TEST(test_ctrc_registration_rechecks_original_actor_boot_epoch_and_slot)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		ClusterRecoveryCtrcResultObservationV1 after, zero = {0};
+		reset(); retain(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
+		UT_ASSERT(cluster_recovery_ctrc_result_collect_v1(info.cluster_tx_start));
+		serving_actor(); UT_ASSERT(cluster_recovery_ctrc_result_accept_v1());
+		if (fault == 0) startup_actor();
+		if (fault == 1) owner_boot++;
+		if (fault == 2) checkpoint_epoch++;
+		if (fault == 3) window_region.checkpoint_owner.valid = false;
+		if (fault == 4) window_region.checkpoint_owner.ctrc_accepted_generation++;
+		if (fault == 5) observed_writer.ref.claim.max_config_generation++;
+		if (fault == 6) ShutdownRequestPending = true;
+		memset(&after, 0xa5, sizeof(after));
+		UT_ASSERT(!cluster_recovery_ctrc_result_observe_accepted_v1(&after));
+		UT_ASSERT(memcmp(&after, &zero, sizeof(zero)) == 0);
+		if (fault != 4) UT_ASSERT(!cluster_recovery_ctrc_result_accept_v1());
+		startup_actor();
+	}
+}
+
+UT_TEST(test_original_error_revokes_ctrc_registration_with_the_owner_slot)
+{
+	ClusterRecoveryCtrcResultObservationV1 after, zero = {0};
+	reset(); retain(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
+	UT_ASSERT(cluster_recovery_ctrc_result_collect_v1(info.cluster_tx_start));
+	serving_actor(); UT_ASSERT(cluster_recovery_ctrc_result_accept_v1());
+	startup_actor();
+	release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_accepted_generation, 0);
+	serving_actor();
+	UT_ASSERT(!cluster_recovery_ctrc_result_accept_v1());
+	UT_ASSERT(!cluster_recovery_ctrc_result_observe_accepted_v1(&after));
+	UT_ASSERT(memcmp(&after, &zero, sizeof(zero)) == 0);
+	startup_actor(); ClusterReleaseColdRecoveryInputs(&info);
+}
+
 int main(void)
 {
-	UT_PLAN(50);
+	UT_PLAN(55);
+	UT_RUN(test_original_lmon_registers_only_the_exact_complete_ctrc_value);
+	UT_RUN(test_ctrc_registration_does_not_infer_completion_from_tx_or_an_empty_slot);
+	UT_RUN(test_new_original_ctrc_generation_invalidates_its_previous_registration);
+	UT_RUN(test_ctrc_registration_rechecks_original_actor_boot_epoch_and_slot);
+	UT_RUN(test_original_error_revokes_ctrc_registration_with_the_owner_slot);
 	UT_RUN(test_ctrc_work_is_prepared_before_actual_c0_and_keeps_pending_input);
 	UT_RUN(test_ctrc_work_requires_original_pointer_and_live_startup_owner);
 	UT_RUN(test_ctrc_component_is_independent_of_complete_tx_and_fresh_shmem);

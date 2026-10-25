@@ -113,3 +113,11 @@ LANGUAGE C STRICT;
 REVOKE ALL ON FUNCTION test_pgrac_config_selection_cleanup() FROM PUBLIC;
 -- PGRAC: exact detached process observation; no runtime mutation capability.
 -- Author: SqlRush <sqlrush@gmail.com>
+CREATE FUNCTION test_pgrac_native_itl_trace()
+RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_native_itl_trace'
+LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+REVOKE ALL ON FUNCTION test_pgrac_native_itl_trace() FROM PUBLIC;
+CREATE FUNCTION test_pgrac_native_itl_page(regclass, integer)
+RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_native_itl_page'
+LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+REVOKE ALL ON FUNCTION test_pgrac_native_itl_page(regclass, integer) FROM PUBLIC;

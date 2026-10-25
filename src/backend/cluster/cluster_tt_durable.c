@@ -32,6 +32,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_native_itl_trace.h"
 #include "cluster/cluster_undo_recovery.h"
 
 #include "access/transam.h"
@@ -604,6 +605,9 @@ cluster_tt_slot_durable_publish_active(const ClusterTTSlotCurrentOwner *expected
 									  ctrc_key.slot_offset, ctrc_key.slot_wrap, ctrc_key.xid,
 									  cluster_ges_request_timeout_ms)));
 		ctrc_pre_bind_cancel_armed = ctrc_reserve_result == CLUSTER_CTRC_ORIGIN_RESERVED_PENDING;
+		if (unlikely(cluster_trace_tx_identity))
+			cluster_native_itl_trace_tt(CLNITL_TT_ADMITTED, &ctrc_key,
+				&disk_header->tt_slots[expected_owner->slot_offset], InvalidXLogRecPtr);
 
 		switch (cluster_tt_active_transition_decide(
 			&disk_header->tt_slots[expected_owner->slot_offset], disk_header->wrap_count,
@@ -684,6 +688,9 @@ cluster_tt_slot_durable_publish_active(const ClusterTTSlotCurrentOwner *expected
 
 		*segment_generation_out = generation.value;
 		*successor_out = successor;
+		if (unlikely(cluster_trace_tx_identity))
+			cluster_native_itl_trace_tt(CLNITL_TT_ACTIVE_PUBLISHED, &ctrc_key,
+				&successor, (XLogRecPtr)bind_lsn);
 	active_publication_done:;
 	}
 	PG_FINALLY();

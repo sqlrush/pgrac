@@ -122,6 +122,8 @@ static bool g_capture_log;
 static char g_log_detail[1024];
 static char g_cf_trace_log[2048];
 static unsigned g_cf_trace_logs;
+static char g_walr_release_log[2048];
+static unsigned g_walr_release_logs;
 static ClusterGesTimeoutDetail g_timeout_detail;
 
 const ClusterGesTimeoutDetail *
@@ -144,6 +146,13 @@ errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_un
 int
 errmsg(const char *fmt, ...)
 {
+	if (strstr(fmt, "PGRAC_FAMILY=WALR_RELEASE") != NULL) {
+		va_list args;
+		va_start(args, fmt);
+		vsnprintf(g_walr_release_log, sizeof(g_walr_release_log), fmt, args);
+		va_end(args);
+		++g_walr_release_logs;
+	}
 	if (strstr(fmt, "PGRAC_FAMILY=CF_RETURN") != NULL
 		|| strstr(fmt, "PGRAC_FAMILY=CF_BLOCKER") != NULL) {
 		va_list args;

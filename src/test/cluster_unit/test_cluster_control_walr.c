@@ -86,6 +86,82 @@ walr_fixture_request(void)
 	return request;
 }
 
+UT_TEST(walr_release_trace_gate_preserves_native_ref_and_original_owner)
+{
+	ClusterLockAcquireRequest request = walr_fixture_request(), original;
+	unsigned waits = owner_wait_calls;
+
+	UT_ASSERT_EQ(walr_request_acquire_actual(&request), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	original = request;
+	g_capture_log = true;
+	g_walr_release_logs = 0;
+	MyBackendType = B_BG_WRITER;
+	proc_exit_inprogress = true;
+	cluster_trace_control_config = false;
+	UT_ASSERT_EQ(walr_request_release_actual(&request), CLUSTER_LOCK_ACQUIRE_PENDING);
+	UT_ASSERT_EQ(g_walr_release_logs, 0);
+	cluster_trace_control_config = true;
+	CritSectionCount = 1;
+	UT_ASSERT_EQ(walr_request_release_actual(&request), CLUSTER_LOCK_ACQUIRE_PENDING);
+	UT_ASSERT_EQ(g_walr_release_logs, 0);
+	CritSectionCount = 0;
+	UT_ASSERT_EQ(walr_request_release_actual(&request), CLUSTER_LOCK_ACQUIRE_PENDING);
+	UT_ASSERT_EQ(g_walr_release_logs, 1);
+	UT_ASSERT(strstr(g_walr_release_log, "task=owner_wait reason=wait_gate"));
+	UT_ASSERT(strstr(g_walr_release_log, "resource_type=250 thread=2 mode=5"));
+	UT_ASSERT(strstr(g_walr_release_log, "role=6 proc_exit=1"));
+	UT_ASSERT(strstr(g_walr_release_log, "state=4 shared=1"));
+	UT_ASSERT(strstr(g_walr_release_log, "confirmed=0"));
+	UT_ASSERT(memcmp(&request, &original, sizeof(request)) == 0);
+	UT_ASSERT_EQ(owner_wait_calls, waits);
+	UT_ASSERT_EQ(native_refs[ShareLock], 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 1);
+	proc_exit_inprogress = false;
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT_EQ(walr_request_release_actual(&request), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(native_refs[ShareLock], 0);
+	UT_ASSERT_EQ(g_walr_release_logs, 1);
+	g_capture_log = cluster_trace_control_config = false;
+	MyBackendType = B_INVALID;
+}
+
+UT_TEST(walr_release_trace_deadline_records_same_call_without_retry)
+{
+	ClusterLockAcquireRequest request = walr_fixture_request(), original;
+	int saved_timeout = cluster_ges_request_timeout_ms;
+	unsigned waits = owner_wait_calls, acquires;
+	char expected[128];
+
+	UT_ASSERT_EQ(walr_request_acquire_actual(&request), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	original = request;
+	acquires = g_seven_count;
+	cluster_ges_request_timeout_ms = 1;
+	MyBackendType = B_BACKEND;
+	g_capture_log = cluster_trace_control_config = true;
+	g_walr_release_logs = 0;
+	UT_ASSERT_EQ(walr_request_release_actual(&request), CLUSTER_LOCK_ACQUIRE_PENDING);
+	UT_ASSERT_EQ(g_walr_release_logs, 1);
+	UT_ASSERT(strstr(g_walr_release_log, "task=owner_wait reason=deadline"));
+	UT_ASSERT(strstr(g_walr_release_log, "timeout_ms=0 effective_ms=1"));
+	snprintf(expected, sizeof(expected), "request=" UINT64_FORMAT " epoch=" UINT64_FORMAT,
+			 request.request_id, request.holder.cluster_epoch);
+	UT_ASSERT(strstr(g_walr_release_log, expected));
+	snprintf(expected, sizeof(expected), "control_owner=" UINT64_FORMAT,
+			 request.control_owner_id);
+	UT_ASSERT(strstr(g_walr_release_log, expected));
+	UT_ASSERT(memcmp(&request, &original, sizeof(request)) == 0);
+	UT_ASSERT_EQ(g_seven_count, acquires);
+	UT_ASSERT_EQ(owner_wait_calls, waits);
+	UT_ASSERT_EQ(native_refs[ShareLock], 1);
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT_EQ(walr_request_release_actual(&request), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(g_walr_release_logs, 1);
+	UT_ASSERT_EQ(native_refs[ShareLock], 0);
+	g_capture_log = cluster_trace_control_config = false;
+	cluster_ges_request_timeout_ms = saved_timeout;
+	MyBackendType = B_INVALID;
+}
+
 UT_TEST(native_s_is_kept_until_exact_retirement)
 {
 	ClusterLockAcquireRequest request = walr_fixture_request();
@@ -622,7 +698,9 @@ main(void)
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
 	cluster_shared_config = true;
-	UT_PLAN(13);
+	UT_PLAN(15);
+	UT_RUN(walr_release_trace_gate_preserves_native_ref_and_original_owner);
+	UT_RUN(walr_release_trace_deadline_records_same_call_without_retry);
 	UT_RUN(native_s_is_kept_until_exact_retirement);
 	UT_RUN(failed_native_publication_keeps_only_owned_cleanup);
 	UT_RUN(upgrade_uses_new_attempt_and_downgrade_keeps_confirmed_identity);

@@ -182,8 +182,10 @@ static bool test_recovered_tx_available;
 static bool test_recovered_tx_change_after_read;
 static ClusterRecoveryCtrcResultObservationV1 test_recovered_ctrc_result;
 static bool test_recovered_ctrc_available, test_recovered_ctrc_change_after_read;
+static bool test_recovered_ctrc_accepted;
 static unsigned test_recovered_checkpoint_observe_calls;
 static unsigned test_recovery_tx_accept_calls;
+static unsigned test_recovery_ctrc_accept_calls;
 static bool test_recovered_checkpoint_fail_after_first;
 static int test_first_live_checks;
 static ClusterControlRootResult test_first_live_result;
@@ -244,6 +246,22 @@ cluster_recovery_ctrc_result_observe_v1(ClusterRecoveryCtrcResultObservationV1 *
 	if (test_recovered_ctrc_change_after_read)
 		test_recovered_ctrc_result.result.result_generation++;
 	return true;
+}
+
+bool cluster_recovery_ctrc_result_accept_v1(void);
+bool cluster_recovery_ctrc_result_observe_accepted_v1(ClusterRecoveryCtrcResultObservationV1 *out);
+
+bool
+cluster_recovery_ctrc_result_accept_v1(void)
+{
+	test_recovery_ctrc_accept_calls++;
+	return false;
+}
+
+bool
+cluster_recovery_ctrc_result_observe_accepted_v1(ClusterRecoveryCtrcResultObservationV1 *out)
+{
+	return test_recovered_ctrc_accepted && cluster_recovery_ctrc_result_observe_v1(out);
 }
 
 ClusterControlRootResult
@@ -1352,6 +1370,7 @@ test_gate_reset(void)
 	test_recovered_checkpoint_observed = false;
 	test_recovered_checkpoint_observe_calls = 0;
 	test_recovery_tx_accept_calls = 0;
+	test_recovery_ctrc_accept_calls = 0;
 	test_recovered_checkpoint_fail_after_first = false;
 	memset(&test_recovered_checkpoint, 0, sizeof(test_recovered_checkpoint));
 	test_serving_found = false;
@@ -9500,6 +9519,7 @@ ut_normal_start_recovered_owner_setup(ClusterSemanticActivationRecord *open,
 		test_recovered_tx_result.result.input_root_sha256, 32);
 	test_recovered_ctrc_available = true;
 	test_recovered_ctrc_change_after_read = false;
+	test_recovered_ctrc_accepted = true;
 	for (int node = 0; node < 4; node++)
 		table->expected[node].admitted_incarnation
 			= cluster_membership_get_last_admitted_incarnation(node);
@@ -9543,6 +9563,32 @@ UT_TEST(test_recovered_service_consumes_independent_ctrc_completion)
 	}
 	ut_normal_start_recovered_owner_setup(&open, &table);
 	UT_ASSERT(normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+}
+
+UT_TEST(test_recovered_service_refuses_complete_but_unregistered_ctrc)
+{
+	ClusterSemanticActivationRecord open;
+	ClusterSemanticActivationAckTableV1 table;
+
+	ut_normal_start_recovered_owner_setup(&open, &table);
+	test_recovered_ctrc_accepted = false;
+	UT_ASSERT(!normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+	test_recovered_ctrc_accepted = true;
+	UT_ASSERT(normal_start_service_binding_current(&open, test_normal_pgrd_bytes, &table));
+}
+
+UT_TEST(test_lmon_registers_ctrc_component_while_recovered_open_is_pending)
+{
+	ut_a142_setup(0);
+	cluster_semantic_activation_note_clean_start(false);
+	test_restart_unclean = true;
+	MyAuxProcType = LmonProcess;
+	IsUnderPostmaster = true;
+	test_recovery_ctrc_accept_calls = 0;
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT_EQ(test_recovery_ctrc_accept_calls, 1);
+	UT_ASSERT(!semantic_activation_restart.requested && !semantic_activation_restart.opened);
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_u32(TEST_GATE_CLOSED_OFFSET)), 1);
 }
 
 UT_TEST(test_normal_start_recovered_owner_observation_accepts_exact_binding)
@@ -12118,7 +12164,7 @@ UT_TEST(test_stop_trace_recovered_equal_epoch_refuses_before_owner)
 int
 main(void)
 {
-	UT_PLAN(415);
+	UT_PLAN(417);
 	UT_RUN(test_stop_trace_preserves_recovered_record_acceptance);
 	UT_RUN(test_stop_trace_preserves_recovered_service_owner_guards);
 	UT_RUN(test_stop_trace_recovered_equal_epoch_refuses_before_owner);
@@ -12476,6 +12522,8 @@ main(void)
 	UT_RUN(test_recovered_prepare_supplies_service_binding_input);
 	UT_RUN(test_recovered_service_consumes_accepted_tx_component);
 	UT_RUN(test_recovered_service_consumes_independent_ctrc_completion);
+	UT_RUN(test_recovered_service_refuses_complete_but_unregistered_ctrc);
+	UT_RUN(test_lmon_registers_ctrc_component_while_recovered_open_is_pending);
 	UT_RUN(test_recovered_prepare_requires_original_pgrd);
 	UT_RUN(test_normal_start_recovered_owner_observation_fails_closed_without_observation);
 	UT_RUN(test_normal_start_recovered_owner_observation_rejects_foreign_system);
