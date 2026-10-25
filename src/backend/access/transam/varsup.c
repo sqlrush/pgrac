@@ -80,6 +80,113 @@
 VariableCache ShmemVariableCache = NULL;
 
 
+/* PGRAC: one original nofail publication after all fallible extension.
+ * Caller retains XidGenLock EXCLUSIVE through these stores and barriers.
+ * Keep the actual-issued receipt after ProcArray publication.
+ * Author: SqlRush <sqlrush@gmail.com>
+ * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md */
+static void
+publish_new_transaction_id(FullTransactionId full_xid, bool isSubXact)
+{
+	TransactionId xid = XidFromFullTransactionId(full_xid);
+
+	/*
+	 * Now advance the nextXid counter.  This must not happen until after we
+	 * have successfully completed ExtendCLOG() --- if that routine fails, we
+	 * want the next incoming transaction to try it again.  We cannot assign
+	 * more XIDs until there is CLOG space for them.
+	 */
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC: spec-6.15 D1 -- republish the striped candidate (which may
+	 * lie ahead of the stored nextXid) so the advance below lands at
+	 * candidate + 1.  With striping off full_xid still equals nextXid
+	 * and this store is a no-op.
+	 */
+	ShmemVariableCache->nextXid = full_xid;
+#endif
+	FullTransactionIdAdvance(&ShmemVariableCache->nextXid);
+
+	/*
+	 * We must store the new XID into the shared ProcArray before releasing
+	 * XidGenLock.  This ensures that every active XID older than
+	 * latestCompletedXid is present in the ProcArray, which is essential for
+	 * correct OldestXmin tracking; see src/backend/access/transam/README.
+	 *
+	 * Note that readers of ProcGlobal->xids/PGPROC->xid should be careful to
+	 * fetch the value for each proc only once, rather than assume they can
+	 * read a value multiple times and get the same answer each time.  Note we
+	 * are assuming that TransactionId and int fetch/store are atomic.
+	 *
+	 * The same comments apply to the subxact xid count and overflow fields.
+	 *
+	 * Use of a write barrier prevents dangerous code rearrangement in this
+	 * function; other backends could otherwise e.g. be examining my subxids
+	 * info concurrently, and we don't want them to see an invalid
+	 * intermediate state, such as an incremented nxids before the array entry
+	 * is filled.
+	 *
+	 * Other processes that read nxids should do so before reading xids
+	 * elements with a pg_read_barrier() in between, so that they can be sure
+	 * not to read an uninitialized array element; see
+	 * src/backend/storage/lmgr/README.barrier.
+	 *
+	 * If there's no room to fit a subtransaction XID into PGPROC, set the
+	 * cache-overflowed flag instead.  This forces readers to look in
+	 * pg_subtrans to map subtransaction XIDs up to top-level XIDs. There is a
+	 * race-condition window, in that the new XID will not appear as running
+	 * until its parent link has been placed into pg_subtrans. However, that
+	 * will happen before anyone could possibly have a reason to inquire about
+	 * the status of the XID, so it seems OK.  (Snapshots taken during this
+	 * window *will* include the parent XID, so they will deliver the correct
+	 * answer later on when someone does have a reason to inquire.)
+	 */
+	if (!isSubXact)
+	{
+		Assert(ProcGlobal->subxidStates[MyProc->pgxactoff].count == 0);
+		Assert(!ProcGlobal->subxidStates[MyProc->pgxactoff].overflowed);
+		Assert(MyProc->subxidStatus.count == 0);
+		Assert(!MyProc->subxidStatus.overflowed);
+
+#ifdef USE_PGRAC_CLUSTER
+		/* Keep the actual assignment, before either raw-XID publication.
+		 * ProcArray readers need not also hold XidGenLock. */
+		pg_atomic_write_u64(&MyProc->cluster_top_full_xid_atomic,
+							U64FromFullTransactionId(full_xid));
+		pg_write_barrier();
+#endif
+		/* LWLockRelease acts as barrier */
+		MyProc->xid = xid;
+		ProcGlobal->xids[MyProc->pgxactoff] = xid;
+	}
+	else
+	{
+		XidCacheStatus *substat = &ProcGlobal->subxidStates[MyProc->pgxactoff];
+		int			nxids = MyProc->subxidStatus.count;
+
+		Assert(substat->count == MyProc->subxidStatus.count);
+		Assert(substat->overflowed == MyProc->subxidStatus.overflowed);
+
+		if (nxids < PGPROC_MAX_CACHED_SUBXIDS)
+		{
+			MyProc->subxids.xids[nxids] = xid;
+			pg_write_barrier();
+			MyProc->subxidStatus.count = substat->count = nxids + 1;
+		}
+		else
+			MyProc->subxidStatus.overflowed = substat->overflowed = true;
+	}
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Actual native publication only. A reserved stripe candidate, legal
+	 * future ceiling or replay endpoint must never populate this receipt. */
+	if (cluster_enabled && cluster_shared_config)
+		cluster_relmap_recovery_issued_publish(full_xid);
+#endif
+
+}
+
 /*
  * Allocate the next FullTransactionId for a new transaction or
  * subtransaction.
@@ -407,100 +514,7 @@ retry_cluster_xid_reservation:
 	ExtendCommitTs(xid);
 	ExtendSUBTRANS(xid);
 
-	/*
-	 * Now advance the nextXid counter.  This must not happen until after we
-	 * have successfully completed ExtendCLOG() --- if that routine fails, we
-	 * want the next incoming transaction to try it again.  We cannot assign
-	 * more XIDs until there is CLOG space for them.
-	 */
-#ifdef USE_PGRAC_CLUSTER
-
-	/*
-	 * PGRAC: spec-6.15 D1 -- republish the striped candidate (which may
-	 * lie ahead of the stored nextXid) so the advance below lands at
-	 * candidate + 1.  With striping off full_xid still equals nextXid
-	 * and this store is a no-op.
-	 */
-	ShmemVariableCache->nextXid = full_xid;
-#endif
-	FullTransactionIdAdvance(&ShmemVariableCache->nextXid);
-
-	/*
-	 * We must store the new XID into the shared ProcArray before releasing
-	 * XidGenLock.  This ensures that every active XID older than
-	 * latestCompletedXid is present in the ProcArray, which is essential for
-	 * correct OldestXmin tracking; see src/backend/access/transam/README.
-	 *
-	 * Note that readers of ProcGlobal->xids/PGPROC->xid should be careful to
-	 * fetch the value for each proc only once, rather than assume they can
-	 * read a value multiple times and get the same answer each time.  Note we
-	 * are assuming that TransactionId and int fetch/store are atomic.
-	 *
-	 * The same comments apply to the subxact xid count and overflow fields.
-	 *
-	 * Use of a write barrier prevents dangerous code rearrangement in this
-	 * function; other backends could otherwise e.g. be examining my subxids
-	 * info concurrently, and we don't want them to see an invalid
-	 * intermediate state, such as an incremented nxids before the array entry
-	 * is filled.
-	 *
-	 * Other processes that read nxids should do so before reading xids
-	 * elements with a pg_read_barrier() in between, so that they can be sure
-	 * not to read an uninitialized array element; see
-	 * src/backend/storage/lmgr/README.barrier.
-	 *
-	 * If there's no room to fit a subtransaction XID into PGPROC, set the
-	 * cache-overflowed flag instead.  This forces readers to look in
-	 * pg_subtrans to map subtransaction XIDs up to top-level XIDs. There is a
-	 * race-condition window, in that the new XID will not appear as running
-	 * until its parent link has been placed into pg_subtrans. However, that
-	 * will happen before anyone could possibly have a reason to inquire about
-	 * the status of the XID, so it seems OK.  (Snapshots taken during this
-	 * window *will* include the parent XID, so they will deliver the correct
-	 * answer later on when someone does have a reason to inquire.)
-	 */
-	if (!isSubXact)
-	{
-		Assert(ProcGlobal->subxidStates[MyProc->pgxactoff].count == 0);
-		Assert(!ProcGlobal->subxidStates[MyProc->pgxactoff].overflowed);
-		Assert(MyProc->subxidStatus.count == 0);
-		Assert(!MyProc->subxidStatus.overflowed);
-
-#ifdef USE_PGRAC_CLUSTER
-		/* Keep the actual assignment, before either raw-XID publication.
-		 * ProcArray readers need not also hold XidGenLock. */
-		pg_atomic_write_u64(&MyProc->cluster_top_full_xid_atomic,
-							U64FromFullTransactionId(full_xid));
-		pg_write_barrier();
-#endif
-		/* LWLockRelease acts as barrier */
-		MyProc->xid = xid;
-		ProcGlobal->xids[MyProc->pgxactoff] = xid;
-	}
-	else
-	{
-		XidCacheStatus *substat = &ProcGlobal->subxidStates[MyProc->pgxactoff];
-		int			nxids = MyProc->subxidStatus.count;
-
-		Assert(substat->count == MyProc->subxidStatus.count);
-		Assert(substat->overflowed == MyProc->subxidStatus.overflowed);
-
-		if (nxids < PGPROC_MAX_CACHED_SUBXIDS)
-		{
-			MyProc->subxids.xids[nxids] = xid;
-			pg_write_barrier();
-			MyProc->subxidStatus.count = substat->count = nxids + 1;
-		}
-		else
-			MyProc->subxidStatus.overflowed = substat->overflowed = true;
-	}
-
-#ifdef USE_PGRAC_CLUSTER
-	/* Actual native publication only. A reserved stripe candidate, legal
-	 * future ceiling or replay endpoint must never populate this receipt. */
-	if (cluster_enabled && cluster_shared_config)
-		cluster_relmap_recovery_issued_publish(full_xid);
-#endif
+	publish_new_transaction_id(full_xid, isSubXact);
 
 	LWLockRelease(XidGenLock);
 

@@ -956,10 +956,16 @@ UT_TEST(actual_stripe_future_keeps_prepared_fullxid_until_original_retirement)
 	assert_real_stripe_sample(FullTransactionIdFromU64(2084), 2084);
 }
 
+#define proc entries[0]
+#include "test_cluster_xid_publication.inc"
+#undef proc
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(17);
+	UT_RUN(native_subxid_publication_preserves_the_final_cache_slot);
+	UT_RUN(native_publication_keeps_the_full_era_across_raw_rollover);
 	UT_RUN(no_storage_or_procarray_mutation_before_reservation);
 	UT_RUN(wait_rederives_native_counter_and_new_boot_floor);
 	UT_RUN(native_allocation_preserves_ordinary_counter);
