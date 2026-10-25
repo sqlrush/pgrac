@@ -564,14 +564,22 @@ test_cluster_relmap_arb: test_cluster_relmap_arb.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
+		test_cluster_relmap_producer_stage.inc \
 		$(top_srcdir)/src/backend/utils/cache/relmapper.c \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_writer.c \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_writer.h \
-		$(top_srcdir)/src/include/cluster/cluster_wal_claim.h $(CLUSTER_UNIT_PORT_LIBS)
+		$(top_srcdir)/src/include/cluster/cluster_wal_claim.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
+		test_cluster_relmap_v2_codec_product.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		test_cluster_relmap_v2_codec_product.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \

@@ -55,6 +55,23 @@ extern void AtEOXact_RelationMap(bool isCommit, bool isParallelWorker);
 extern void AtPrepare_RelationMap(void);
 
 #ifdef USE_PGRAC_CLUSTER
+struct RelMapFile;
+struct ClusterRelmapOwnerSampleV2;
+struct ClusterRelmapV2Image;
+
+/* Dormant stage-only producer under the caller's original global relmap X.
+ * Captures the original owner before local locking, prepares retention, then
+ * merges into the same clean v2 base and inserts/flushes/stages native WAL.
+ * Outputs change only on success and retain the original owner for terminal
+ * work. False/ERROR may follow preparation, durable WAL or pair writes: keep
+ * all original obligations and follow the original failure path; never retry
+ * or infer rollback. Caller must hold no mapping, XidGen or retention lock. It keeps
+ * global X and all physical-file, commit, cleanup and terminal duties. This
+ * does not adopt a local map, arm publication or authorize commit/release. */
+extern bool cluster_relmap_producer_stage_v2(bool shared,
+	const struct RelMapFile *updates, struct ClusterRelmapOwnerSampleV2 *owner_out,
+	struct ClusterRelmapV2Image *staged_out);
+
 /* PGRAC (spec-6.14 D5): post-commit publish / abort discard of a staged
  * shared relmap authority image. */
 extern void AtEOXact_ClusterRelmapPublish(void);
