@@ -27,9 +27,14 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include "access/xact.h"
+#include "access/transam.h"
+#include "access/twophase.h"
+#include "access/xlog.h"
+#include "storage/procarray.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "storage/spin.h"
+#include "test_cluster_pgproc_active_types.inc"
 
 static unsigned spin_acquisitions;
 static unsigned sleepable_acquisitions;
@@ -91,6 +96,97 @@ static PGPROC test_my_proc;
 PGPROC *MyProc = &test_my_proc;
 static FullTransactionId test_top_full;
 static unsigned top_full_reads;
+/* Only the new composition groups run the actual native source exit. */
+static bool native_source_exit;
+static VariableCacheData native_variables;
+static VariableCache native_variable_cache = &native_variables;
+static PROC_HDR native_procs;
+static PROC_HDR *native_proc_global = &native_procs;
+static TransactionId native_xids[1];
+static XidCacheStatus native_subxids[1];
+static uint8 native_status_flags[1];
+static char native_array_storage[offsetof(ProcArrayStruct, pgprocnos) + sizeof(int)]
+	pg_attribute_aligned(MAXIMUM_ALIGNOF);
+static ProcArrayStruct *procArray = (ProcArrayStruct *) native_array_storage;
+static LWLockPadded native_locks[NUM_INDIVIDUAL_LWLOCKS];
+/* Resolve original native lock macros against this private fixture array. */
+#define MainLWLockArray native_locks
+static LWLock *const native_xidgen_lock = XidGenLock;
+static LWLock *const native_procarray_lock = ProcArrayLock;
+#undef MainLWLockArray
+static bool native_lock_held;
+static LWLock *native_held_lock;
+static LWLockMode native_lock_mode;
+static unsigned native_lock_acquires, native_lock_releases, native_future_reads;
+static FullTransactionId native_future;
+static TransactionId native_completed_xid;
+static void ProcArrayEndTransactionInternal(PGPROC *, TransactionId);
+static void native_procarray_end_transaction(PGPROC *, TransactionId);
+static bool native_procarray_sample(FullTransactionId *, FullTransactionId *,
+								   FullTransactionId *, ClusterXidStripeSampleFence *);
+
+static void
+MaintainLatestCompletedXid(TransactionId latest_xid)
+{
+	if (!native_lock_held || native_lock_mode != LW_EXCLUSIVE)
+		abort();
+	native_completed_xid = latest_xid;
+}
+static void
+ProcArrayGroupClearXid(PGPROC *proc, TransactionId latest_xid)
+{
+	/* The actual public entry must take its original immediate-lock branch. */
+	abort();
+}
+
+static bool
+native_recovery_in_progress(void)
+{
+	return false;
+}
+static bool
+native_lock_held_in_mode(LWLock *lock, LWLockMode mode)
+{
+	return native_lock_held && lock == native_held_lock && native_lock_mode == mode;
+}
+static bool
+native_lock_is_held(LWLock *lock)
+{
+	return native_lock_held && lock == native_held_lock;
+}
+static bool
+native_sample_future(FullTransactionId reference, FullTransactionId *future,
+								 ClusterXidStripeSampleFence *fence)
+{
+	if (!native_source_exit || held_count != 0 || !native_lock_held
+		|| native_held_lock != native_xidgen_lock || native_lock_mode != LW_SHARED)
+		abort();
+	native_future_reads++;
+	*future = native_future;
+	MemSet(fence, 0, sizeof(*fence));
+	return true;
+}
+/* Alias only the extracted native bodies, leaving all importing fixtures'
+ * original global native owners and helper implementations intact. */
+#define ShmemVariableCache native_variable_cache
+#define ProcGlobal native_proc_global
+#define MainLWLockArray native_locks
+#define RecoveryInProgress native_recovery_in_progress
+#define LWLockHeldByMeInMode native_lock_held_in_mode
+#define LWLockHeldByMe native_lock_is_held
+#define cluster_xid_stripe_sample_future native_sample_future
+#define ProcArrayGetActiveFullXidSample native_procarray_sample
+#define ProcArrayEndTransaction native_procarray_end_transaction
+#include "test_cluster_ctrc_native_exit.inc"
+#undef ProcArrayEndTransaction
+#undef ProcArrayGetActiveFullXidSample
+#undef cluster_xid_stripe_sample_future
+#undef LWLockHeldByMe
+#undef LWLockHeldByMeInMode
+#undef RecoveryInProgress
+#undef MainLWLockArray
+#undef ProcGlobal
+#undef ShmemVariableCache
 static bool allow_new_service_participant = true;
 static unsigned new_service_participant_calls;
 static unsigned wake_count;
@@ -4599,6 +4695,89 @@ finish_source_active_scan(ClusterCtrcActiveScan *scan,
 /* Compose the original registration and release owners, rather than seeding
  * an OPEN row or clearing it to simulate source retirement.  PGPROC removal
  * and block-0 certificate durability remain controlled fixture boundaries. */
+/* Native PGPROC locks are observed separately and may never nest with any
+ * shared census lock. Scheduling and compact membership remain test leaves. */
+static bool
+observe_native_source_lock(LWLock *lock, LWLockMode mode, bool acquire)
+{
+	if (lock != native_xidgen_lock && lock != native_procarray_lock) {
+		if (native_lock_held)
+			abort();
+		return false;
+	}
+	if (!native_source_exit || held_count != 0)
+		abort();
+	if (acquire) {
+		if (native_lock_held || (lock == native_xidgen_lock && mode != LW_SHARED))
+			abort();
+		native_lock_held = true;
+		native_held_lock = lock;
+		native_lock_mode = mode;
+		native_lock_acquires++;
+	} else {
+		if (!native_lock_held || lock != native_held_lock)
+			abort();
+		native_lock_held = false;
+		native_held_lock = NULL;
+		native_lock_releases++;
+	}
+	return true;
+}
+
+static void
+initialize_native_source(FullTransactionId original, FullTransactionId reference)
+{
+	MemSet(&native_variables, 0, sizeof(native_variables));
+	MemSet(&native_procs, 0, sizeof(native_procs));
+	MemSet(native_array_storage, 0, sizeof(native_array_storage));
+	MemSet(native_subxids, 0, sizeof(native_subxids));
+	MemSet(native_status_flags, 0, sizeof(native_status_flags));
+	native_variables.nextXid = reference;
+	native_future = FullTransactionIdFromU64(U64FromFullTransactionId(reference) + 16);
+	native_xids[0] = XidFromFullTransactionId(original);
+	native_procs.xids = native_xids;
+	native_procs.allProcs = &test_my_proc;
+	native_procs.subxidStates = native_subxids;
+	native_procs.statusFlags = native_status_flags;
+	procArray->numProcs = procArray->maxProcs = 1;
+	procArray->pgprocnos[0] = 0;
+	test_my_proc.pgxactoff = 0;
+	test_my_proc.lxid = 23;
+	test_my_proc.xmin = XidFromFullTransactionId(original);
+	pg_atomic_write_u64(&test_my_proc.cluster_read_scn_atomic, 17);
+	test_my_proc.subxidStatus.count = native_subxids[0].count = 2;
+	test_my_proc.subxidStatus.overflowed = native_subxids[0].overflowed = true;
+	test_my_proc.subxids.xids[0] = native_xids[0] + 1;
+	test_my_proc.subxids.xids[1] = native_xids[0] + 2;
+	native_lock_held = false;
+	native_held_lock = NULL;
+	native_lock_acquires = native_lock_releases = native_future_reads = 0;
+	native_completed_xid = InvalidTransactionId;
+	external_lock_hook = observe_native_source_lock;
+}
+
+static FullTransactionId
+assert_native_source_minimum(FullTransactionId expected)
+{
+	FullTransactionId reference, future, minimum;
+	ClusterXidStripeSampleFence fence;
+	VariableCacheData before = native_variables;
+	unsigned acquires = native_lock_acquires;
+	unsigned reads = native_future_reads;
+
+	UT_ASSERT(native_procarray_sample(&reference, &future, &minimum, &fence));
+	UT_ASSERT(FullTransactionIdEquals(reference, native_variables.nextXid));
+	UT_ASSERT(FullTransactionIdEquals(future, native_future));
+	UT_ASSERT(FullTransactionIdEquals(minimum, expected));
+	UT_ASSERT_EQ(memcmp(&native_variables, &before, sizeof(before)), 0);
+	UT_ASSERT_EQ(native_future_reads, reads + 1);
+	UT_ASSERT_EQ(native_lock_acquires, acquires + 2);
+	UT_ASSERT_EQ(native_lock_acquires, native_lock_releases);
+	UT_ASSERT(!native_lock_held);
+	UT_ASSERT_EQ(held_count, 0);
+	return minimum;
+}
+
 static void
 exercise_original_producer_retention_lifecycle(bool applied)
 {
@@ -4617,6 +4796,7 @@ exercise_original_producer_retention_lifecycle(bool applied)
 	ClusterCtrcActiveScan retained, fresh, registration_cut, retirement_cut;
 	ClusterSemanticActiveSampleFence source;
 	FullTransactionId original, reference = FullTransactionIdFromEpochAndXid(9, 10000);
+	FullTransactionId native_minimum = InvalidFullTransactionId;
 	uint32 grant;
 	uint16 reason;
 
@@ -4629,9 +4809,18 @@ exercise_original_producer_retention_lifecycle(bool applied)
 	test_top_full = original;
 	pg_atomic_write_u64(&test_my_proc.cluster_top_full_xid_atomic,
 						U64FromFullTransactionId(original));
+	if (native_source_exit) {
+		initialize_native_source(original, reference);
+		native_minimum = assert_native_source_minimum(original);
+	}
 	/* Pause the real cursor before any entry, then publish through the
 	 * original reservation/receipt owners before retiring PGPROC. */
 	UT_ASSERT(cluster_ctrc_active_scan_begin(&registration_cut, reference));
+	if (native_source_exit) {
+		/* Keep the native pre-census cut, as the original worker does. */
+		registration_cut.future_full = native_future;
+		registration_cut.min_full = native_minimum;
+	}
 	conditional_refuse_call = conditional_calls + 1;
 	cluster_ctrc_active_scan_step_source(&registration_cut, &source);
 	UT_ASSERT_EQ(registration_cut.status, CTRC_ACTIVE_SCAN_INCOMPLETE);
@@ -4659,9 +4848,40 @@ exercise_original_producer_retention_lifecycle(bool applied)
 	UT_ASSERT(FullTransactionIdEquals(handle.participant->original_full_xid, original));
 	/* Only after both actual shared owners retain the source may this
 	 * controlled backend retire its original transaction protection. */
-	test_my_proc.xid = InvalidTransactionId;
-	test_top_full = InvalidFullTransactionId;
-	pg_atomic_write_u64(&test_my_proc.cluster_top_full_xid_atomic, 0);
+	if (native_source_exit) {
+		ClusterCtrcOriginEntry before_origin = *origin;
+		ClusterCtrcParticipantEntry before_participant = *handle.participant;
+		TransactionId latest = key.xid + 2;
+		unsigned acquires = native_lock_acquires;
+
+		/* The public ordinary native end takes its real immediate ProcArray
+		 * branch; the original shared owners already hold this identity. */
+		native_procarray_end_transaction(MyProc, latest);
+		UT_ASSERT_EQ(native_completed_xid, latest);
+		UT_ASSERT_EQ(native_variables.xactCompletionCount, 1);
+		UT_ASSERT_EQ(native_xids[0], InvalidTransactionId);
+		UT_ASSERT_EQ(test_my_proc.xid, InvalidTransactionId);
+		UT_ASSERT_EQ(test_my_proc.xmin, InvalidTransactionId);
+		UT_ASSERT_EQ(test_my_proc.lxid, InvalidLocalTransactionId);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&test_my_proc.cluster_top_full_xid_atomic), 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&test_my_proc.cluster_read_scn_atomic), 0);
+		UT_ASSERT_EQ(test_my_proc.subxidStatus.count, 0);
+		UT_ASSERT(!test_my_proc.subxidStatus.overflowed);
+		UT_ASSERT_EQ(native_subxids[0].count, 0);
+		UT_ASSERT(!native_subxids[0].overflowed);
+		UT_ASSERT_EQ(native_lock_acquires, acquires + 1);
+		UT_ASSERT_EQ(native_lock_acquires, native_lock_releases);
+		UT_ASSERT(!native_lock_held);
+		UT_ASSERT_EQ(memcmp(origin, &before_origin, sizeof(before_origin)), 0);
+		UT_ASSERT_EQ(memcmp(handle.participant, &before_participant,
+						  sizeof(before_participant)), 0);
+		test_top_full = InvalidFullTransactionId;
+		assert_native_source_minimum(native_future);
+	} else {
+		test_my_proc.xid = InvalidTransactionId;
+		test_top_full = InvalidFullTransactionId;
+		pg_atomic_write_u64(&test_my_proc.cluster_top_full_xid_atomic, 0);
+	}
 	finish_source_active_scan(&registration_cut, &source);
 	UT_ASSERT_EQ(registration_cut.status, CTRC_ACTIVE_SCAN_COMPLETE);
 	UT_ASSERT_EQ(registration_cut.unqualified_entries, 0);
@@ -4806,6 +5026,11 @@ exercise_original_producer_retention_lifecycle(bool applied)
 	UT_ASSERT(FullTransactionIdEquals(fresh.min_full, reference));
 	UT_ASSERT_EQ(top_full_reads, 1);
 	UT_ASSERT_EQ(held_count, 0);
+	if (native_source_exit) {
+		assert_native_source_minimum(native_future);
+		UT_ASSERT_EQ(native_variables.xactCompletionCount, 1);
+		external_lock_hook = NULL;
+	}
 }
 
 UT_TEST(test_original_cancelled_producer_retains_fullxid_until_final_certificate_reply)
@@ -5216,6 +5441,21 @@ UT_TEST(test_last_slice_registration_cannot_publish_complete_old_cut)
 	UT_ASSERT_EQ(held_count, 0);
 }
 
+
+UT_TEST(test_native_source_exit_keeps_cancelled_receipt_and_certificate_retention)
+{
+	native_source_exit = true;
+	exercise_original_producer_retention_lifecycle(false);
+	native_source_exit = false;
+}
+
+UT_TEST(test_native_source_exit_keeps_applied_receipt_and_certificate_retention)
+{
+	native_source_exit = true;
+	exercise_original_producer_retention_lifecycle(true);
+	native_source_exit = false;
+}
+
 int
 main(void)
 {
@@ -5223,7 +5463,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(125);
+	UT_PLAN(127);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
 	UT_RUN(test_prepare_path_input_precedes_journal_exhaustion);
 	UT_RUN(test_prepare_path_chain_precedes_locator_and_keeps_blocked_state);
@@ -5352,6 +5592,8 @@ main(void)
 	UT_RUN(test_unknown_registration_sequence_saturates_without_changing_prepare);
 	UT_RUN(test_unknown_registration_zero_and_absent_source_never_current);
 	UT_RUN(test_last_slice_registration_cannot_publish_complete_old_cut);
+	UT_RUN(test_native_source_exit_keeps_cancelled_receipt_and_certificate_retention);
+	UT_RUN(test_native_source_exit_keeps_applied_receipt_and_certificate_retention);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

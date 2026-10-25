@@ -8301,8 +8301,18 @@ test_cluster_ctrc_read_scope.inc: $(top_srcdir)/src/backend/cluster/cluster_term
 	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_ctrc_native_exit.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
+	awk '/^ProcArrayGetActiveFullXidSample\(/ { print "bool"; emit=1; found++ } \
+	     /^ProcArrayEndTransaction\(/ { print "void"; emit=1; found++ } \
+	     /^ProcArrayEndTransactionInternal\(/ { print "static inline void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_ctrc_cleaner test_cluster_ctrc_capacity test_cluster_ctrc_dispatch \
-test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: test_cluster_ctrc_read_scope.inc
+test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: test_cluster_ctrc_read_scope.inc \
+		test_cluster_ctrc_native_exit.inc test_cluster_pgproc_active_types.inc \
+		$(top_srcdir)/src/include/storage/procarray.h $(top_srcdir)/src/include/access/transam.h \
+		$(top_srcdir)/src/include/access/twophase.h $(top_srcdir)/src/include/access/xlog.h
 
 test_cluster_ctrc_capacity: test_cluster_ctrc_capacity.c test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
