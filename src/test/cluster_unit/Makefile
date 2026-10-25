@@ -3456,6 +3456,8 @@ $(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o: \
 		$(top_srcdir)/src/include/access/clog.h
 
 test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
+		test_cluster_relmap_checkpoint_publisher.inc \
+		test_cluster_cold_checkpoint_publisher.o test_cluster_cold_checkpoint_publisher.h \
 		test_cluster_relmap_origin_build.inc \
 		test_cluster_relmap_execution_custody.inc \
 		test_cluster_relmap_execution_targets.inc \
@@ -3589,6 +3591,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relma
 		$(top_srcdir)/src/include/cluster/cluster_wal_tail.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_owner.o) \
+		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_cold_checkpoint_publisher.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_arb.o test_cluster_relmap_retained_authority.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_native_clog.o test_cluster_relmap_native_storage.o test_cluster_relmap_native_pin.o test_cluster_relmap_original_scope.o test_cluster_relmap_original_authority.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),$(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o) \
