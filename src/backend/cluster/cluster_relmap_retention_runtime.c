@@ -5,6 +5,8 @@
 
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "access/xloginsert.h"
+#include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_relmap_authority.h"
 #include "cluster/cluster_relmap_retention_runtime.h"
@@ -13,6 +15,7 @@
 #include "postmaster/interrupt.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
+#include "utils/relmapper.h"
 
 #define RELMAP_RETENTION_RUNTIME_NAME "pgrac relmap retention"
 #define RELMAP_RETENTION_RUNTIME_MAGIC 0x52525432U
@@ -155,6 +158,62 @@ relmap_runtime_directory_matches(const ClusterRelmapRetentionDirectory *director
 		|| directory->database_incarnation != key->identity.database_incarnation)
 		return CLUSTER_RELMAP_RETENTION_INVALID;
 	return CLUSTER_RELMAP_RETENTION_OK;
+}
+
+XLogRecPtr
+cluster_relmap_retention_runtime_insert_pending_v2(const ClusterRelmapOwnerSampleV2 *sample,
+	const ClusterRelmapV2Namespace *identity, uint64 generation, const RelMapFile *pending)
+{
+	ClusterRelmapRetentionKey key = { 0 };
+	ClusterRelmapRetentionResult result;
+	ClusterRelmapV2Image checked = { 0 };
+	uint8 wire[CLUSTER_RELMAP_V2_FILE_SIZE];
+	xl_relmap_update update = { 0 };
+	XLogRecPtr end;
+
+	if (pending == NULL || generation < 2
+		|| relmap_runtime_producer_key(sample, identity, generation, false, &key)
+			!= CLUSTER_RELMAP_RETENTION_OK
+		|| !LWLockHeldByMeInMode(RelationMappingLock, LW_EXCLUSIVE)
+		|| LWLockHeldByMe(XidGenLock)
+		|| U64FromFullTransactionId(GetCurrentFullTransactionIdIfAny()) != key.top_full_xid)
+		return InvalidXLogRecPtr;
+	update.dbid = key.identity.dbid;
+	update.tsid = key.identity.shared ? GLOBALTABLESPACE_OID : MyDatabaseTableSpace;
+	update.nbytes = sizeof(RelMapFile);
+	if (!key.identity.shared && (!OidIsValid(update.tsid) || update.tsid == GLOBALTABLESPACE_OID))
+		return InvalidXLogRecPtr;
+	/* Validate and retain this call's exact native bytes before WAL construction.
+	 * This temporary clean codec image grants no committed/base authority. */
+	checked.identity = key.identity;
+	checked.committed_generation = generation - 1;
+	checked.committed = *pending;
+	if (cluster_relmap_v2_encode(&checked, wire, sizeof(wire)) != CLUSTER_RELMAP_V2_VALID)
+		return InvalidXLogRecPtr;
+
+	LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
+	result = cluster_relmap_retention_prepare_check(
+		&relmap_runtime_shmem->directories[key.origin], &key);
+	LWLockRelease(&relmap_runtime_shmem->lock);
+	if (result != CLUSTER_RELMAP_RETENTION_OK || !cluster_relmap_owner_matches_v2(sample))
+		return InvalidXLogRecPtr;
+
+	/* Original native RELMAP format/order. Never query or assign the top xid
+	 * inside CRIT; XLogInsert uses the already checked original current xid.
+	 * Native critical errors propagate/fail-stop with all obligations retained. */
+	START_CRIT_SECTION();
+	XLogBeginInsert();
+	XLogRegisterData((char *) &update, MinSizeOfRelmapUpdate);
+	XLogRegisterData((char *) &checked.committed, sizeof(RelMapFile));
+	end = XLogInsert(RM_RELMAP_ID, XLOG_RELMAP_UPDATE);
+	if (end != InvalidXLogRecPtr)
+		XLogFlush(end);
+	END_CRIT_SECTION();
+	if (end == InvalidXLogRecPtr
+		|| !cluster_relmap_retention_runtime_write_pending_v2(sample, identity, generation,
+			end, &checked.committed))
+		return InvalidXLogRecPtr;
+	return end;
 }
 
 bool

@@ -125,6 +125,11 @@ extern ClusterRelmapRetentionResult cluster_relmap_retention_bind(
 extern ClusterRelmapRetentionResult cluster_relmap_retention_tt_release_check(
 	const ClusterRelmapRetentionDirectory *directory,
 	const ClusterCanonicalTxnBinding *binding);
+/* Read-only exact unstaged preparation check under the same caller-held lock.
+ * Rechecks the original floor/issued window; never creates a pin, assigns a
+ * WAL end or grants stage/terminal/release authority after unlocking. */
+extern ClusterRelmapRetentionResult cluster_relmap_retention_prepare_check(
+	const ClusterRelmapRetentionDirectory *directory, const ClusterRelmapRetentionKey *key);
 extern ClusterRelmapRetentionResult cluster_relmap_retention_stage_start(
 	ClusterRelmapRetentionDirectory *directory, const ClusterRelmapRetentionKey *key,
 	uint64 wal_end);

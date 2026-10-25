@@ -3505,12 +3505,15 @@ test_cluster_relmap_original_scope.o: $(top_srcdir)/src/backend/cluster/cluster_
 test_cluster_relmap_native_owner.o: test_cluster_relmap_native_owner.c \
 		test_cluster_relmap_native_owner.h test_cluster_relmap_native_owner_namespace.h \
 		test_cluster_wal_writer.c test_cluster_relmap_owner.inc \
-		test_cluster_relmap_retention_runtime.inc unit_test.h \
+		test_cluster_relmap_retention_runtime.inc test_cluster_relmap_pending_insert.inc unit_test.h \
 		test_cluster_wal_publish_tail.inc test_cluster_wal_publish_callers.inc \
 		test_cluster_wal_publish_entry.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_writer.c \
-		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
+		$(top_srcdir)/src/include/access/xloginsert.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_relmap_native_pin.o: test_cluster_relmap_native_pin.c \
@@ -8941,6 +8944,7 @@ test_cluster_wal_writer: test_cluster_wal_writer.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_writer.h \
 		test_cluster_relmap_owner.inc \
 		test_cluster_relmap_retention_runtime.inc \
+		test_cluster_relmap_pending_insert.inc \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
@@ -8950,6 +8954,7 @@ test_cluster_wal_writer: test_cluster_wal_writer.c unit_test.h \
 		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
 		$(top_srcdir)/src/include/common/relmap.h \
 		$(top_srcdir)/src/include/utils/relmapper.h \
+		$(top_srcdir)/src/include/access/xloginsert.h \
 		$(top_srcdir)/src/include/access/xlogreader.h \
 		$(top_srcdir)/src/include/catalog/pg_tablespace_d.h \
 		$(top_builddir)/src/common/libpgcommon.a \
