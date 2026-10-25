@@ -571,6 +571,8 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		test_cluster_relmap_abort.inc \
 		test_cluster_relmap_unarmed.inc \
 		test_cluster_relmap_precommit.inc \
+		test_cluster_relmap_native_lock.inc test_cluster_relmap_native_lock.h \
+		test_cluster_relmap_native_lock.o \
 		$(top_srcdir)/src/backend/utils/cache/relmapper.c \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
@@ -584,9 +586,18 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		test_cluster_relmap_v2_codec_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		test_cluster_relmap_native_lock.o \
 		test_cluster_relmap_v2_codec_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+test_cluster_relmap_native_lock.o: test_cluster_relmap_native_lock.c \
+		test_cluster_relmap_native_lock.h \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_lock.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_lock.h \
+		$(top_srcdir)/src/include/cluster/cluster_lock_acquire.h \
+		$(top_srcdir)/src/include/cluster/cluster_guc.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
 		test_cluster_relmap_census_recovery.inc \

@@ -18,6 +18,8 @@
 #include "../../backend/cluster/cluster_relmap_owner.c"
 #include "../../backend/cluster/cluster_wal_writer.c"
 #include "../../backend/cluster/cluster_wal_claim.c"
+#include "cluster/cluster_lock_acquire.h"
+#include "test_cluster_relmap_native_lock.h"
 
 #undef printf
 #undef fprintf
@@ -98,6 +100,7 @@ static bool (*v2_prepared_pair_observer)(const ClusterRelmapV2Image *);
 static void (*v2_send_observer)(const SharedInvalidationMessage *, int);
 static ClusterSinvalAckResult (*v2_ack_observer)(const SharedInvalidationMessage *, int);
 static void (*v2_unlock_observer)(void);
+static bool v2_native_lock_active;
 static bool v2_postcommit_error_stack;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
@@ -275,12 +278,19 @@ GetTopTransactionId(void)
 bool
 cluster_relmap_authority_x_held(void)
 {
+	if (v2_native_lock_active)
+		return test_relmap_native_lock_held();
 	return authority_held;
 }
 
 bool
 cluster_relmap_authority_x_lock(void)
 {
+	if (v2_native_lock_active)
+	{
+		authority_held = test_relmap_native_lock_acquire();
+		return authority_held;
+	}
 	authority_held = lock_available;
 	return authority_held;
 }
@@ -513,6 +523,12 @@ cluster_sinval_enqueue_and_wait_ack(const SharedInvalidationMessage *msgs, int n
 void
 cluster_relmap_authority_x_unlock(void)
 {
+	if (v2_native_lock_active)
+	{
+		test_relmap_native_lock_release();
+		authority_held = test_relmap_native_lock_held();
+		return;
+	}
 	if (v2_unlock_observer)
 	{
 		v2_unlock_observer();
@@ -1076,11 +1092,15 @@ UT_TEST(unarmed_commit_preserves_other_writers_pending_and_global_lock)
 #include "test_cluster_relmap_abort.inc"
 #include "test_cluster_relmap_unarmed.inc"
 #include "test_cluster_relmap_precommit.inc"
+#include "test_cluster_relmap_native_lock.inc"
 
 int
 main(void)
 {
-	UT_PLAN(54);
+	UT_PLAN(57);
+	UT_RUN(v2_native_lock_batch_finishes_before_original_release);
+	UT_RUN(v2_native_lock_release_refusal_retains_original_custody);
+	UT_RUN(v2_native_lock_refusals_do_not_enter_release);
 	UT_RUN(v2_precommit_consumes_original_cci_batch_before_terminal);
 	UT_RUN(v2_precommit_preflight_refusals_keep_original_queues);
 	UT_RUN(v2_precommit_partial_batch_error_retains_all_input_and_debt);
