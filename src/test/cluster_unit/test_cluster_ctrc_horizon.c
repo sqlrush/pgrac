@@ -21,6 +21,7 @@ int ctrc_component_main(void);
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_sf_dep.h"
 
 int cluster_lmon_main_loop_interval = 1000;
@@ -29,6 +30,8 @@ static unsigned sender_calls, sender_capability_reads;
 static unsigned sender_unknown_on_peer;
 static ClusterCtrcOriginEntry sender_foreign_request;
 static ClusterHeapFreezeReportV2 sender_report;
+static uint8 sender_wire[CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES];
+static bool receiver_mode;
 static void (*sender_peer_current_observer)(void);
 static bool sender_high_peer_enabled;
 static int32 sender_peer_observer_target;
@@ -75,7 +78,8 @@ cluster_sf_peer_capability_word_sample(int32 peer, uint32 required,
 {
 	UT_ASSERT_EQ(held_count, 0);
 	UT_ASSERT(!native_lock_held && !native_cleaner_lock_held && !sender_maintenance_held);
-	UT_ASSERT(peer == 1 || (sender_high_peer_enabled && peer == 65));
+	UT_ASSERT(peer == 1 || (sender_high_peer_enabled && peer == 65)
+			  || (receiver_mode && peer == 0));
 	UT_ASSERT_EQ(required, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2);
 	sender_capability_reads++;
 	*word = required;
@@ -88,7 +92,8 @@ cluster_sf_peer_capability_generation_matches(int32 peer, uint32 required, uint3
 {
 	UT_ASSERT_EQ(held_count, 0);
 	UT_ASSERT(!native_lock_held && !native_cleaner_lock_held && !sender_maintenance_held);
-	UT_ASSERT(peer == 1 || (sender_high_peer_enabled && peer == 65));
+	UT_ASSERT(peer == 1 || (sender_high_peer_enabled && peer == 65)
+			  || (receiver_mode && peer == 0));
 	UT_ASSERT_EQ(required, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2);
 	if (sender_peer_current_observer != NULL
 		&& (sender_peer_observer_target == 0 || sender_peer_observer_target == peer)) {
@@ -129,6 +134,7 @@ cluster_ic_send_envelope(uint8 type, int32 destination, const void *payload, uin
 	UT_ASSERT_EQ(destination, 1);
 	UT_ASSERT_EQ(length, CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES);
 	UT_ASSERT(cluster_heap_freeze_report_v2_decode(payload, length, &sender_report));
+	memcpy(sender_wire, payload, length);
 	sender_calls++;
 	return CLUSTER_IC_SEND_DONE;
 }
@@ -960,10 +966,222 @@ UT_TEST(test_late_high_peer_callback_revokes_earlier_peer_copy_before_candidate)
 	sender_high_peer_enabled = false;
 }
 
+/* This second process view consumes the actual bytes emitted above. Its
+ * ingress, private stream and semantic owner are explicit fixture leaves;
+ * the handler, decoder, monotone checks and slot publication are original. */
+static ClusterUndoHorizonShmem receiver_state;
+static ClusterSemanticActiveSampleFence receiver_fence;
+static ClusterICControlIngress receiver_ingress;
+static bool receiver_ingress_available, receiver_source_current;
+static unsigned receiver_stream_reads, receiver_stream_refuse_at, receiver_late_fault;
+
+bool
+cluster_ic_dispatch_control_ingress(const ClusterICEnvelope *env, ClusterICControlIngress *out)
+{
+	UT_ASSERT(receiver_mode && cluster_node_id == 1);
+	UT_ASSERT_EQ(env->source_node_id, 0);
+	UT_ASSERT_EQ(env->dest_node_id, 1);
+	UT_ASSERT_EQ(held_count, 0);
+	if (!receiver_ingress_available)
+		return false;
+	*out = receiver_ingress;
+	return true;
+}
+
+bool
+cluster_ic_tier1_stream_current(const ClusterICTier1Stream *stream)
+{
+	UT_ASSERT(receiver_mode && cluster_node_id == 1);
+	UT_ASSERT_EQ(stream->serial, receiver_ingress.serial);
+	UT_ASSERT_EQ(stream->epoch, receiver_ingress.epoch);
+	UT_ASSERT_EQ(stream->owner_pid, MyProcPid);
+	UT_ASSERT_EQ(stream->peer, 0);
+	UT_ASSERT_EQ(stream->plane, CLUSTER_IC_PLANE_CONTROL);
+	UT_ASSERT_EQ(stream->channel, -1);
+	UT_ASSERT(!native_lock_held && !native_cleaner_lock_held && held_count == 0);
+	receiver_stream_reads++;
+	return receiver_stream_reads != receiver_stream_refuse_at;
+}
+
+static bool
+receiver_source_capture(ClusterSemanticActiveSampleFence *out)
+{
+	UT_ASSERT(receiver_mode && cluster_node_id == 1);
+	*out = receiver_fence;
+	return true;
+}
+
+static bool
+receiver_source_matches(const ClusterSemanticActiveSampleFence *fence)
+{
+	UT_ASSERT(receiver_mode && cluster_node_id == 1);
+	return receiver_source_current && memcmp(fence, &receiver_fence, sizeof(*fence)) == 0;
+}
+
+#define GetCurrentTimestamp cohort_timestamp
+#define cluster_semantic_activation_active_sample_capture receiver_source_capture
+#define cluster_semantic_activation_active_sample_current receiver_source_matches
+#include "test_cluster_ctrc_horizon_receive.inc"
+#undef cluster_semantic_activation_active_sample_current
+#undef cluster_semantic_activation_active_sample_capture
+#undef GetCurrentTimestamp
+
+static void
+receiver_view(bool receiving)
+{
+	receiver_mode = receiving;
+	cluster_node_id = receiving ? 1 : 0;
+	UndoHorizonShmem = receiving ? &receiver_state : &sender_state;
+}
+
+static ClusterUndoCleanerActiveSample
+start_original_receive(ClusterICEnvelope *env, ClusterUndoRetentionSample *history)
+{
+	ClusterUndoCleanerActiveSample active;
+
+	receiver_view(false);
+	active = original_sender_source();
+	sender_sample_clock = 700;
+	sender_history_reads = 0;
+	UT_ASSERT(cluster_undo_retention_horizon_sample(history));
+	assert_actual_history_report(&active, history, 1);
+	memset(&receiver_state, 0, sizeof(receiver_state));
+	pg_atomic_init_u64(&receiver_state.wire_reject_count, 0);
+	for (unsigned i = 0; i < CLUSTER_MAX_NODES; i++)
+		pg_atomic_init_u32(&receiver_state.freeze_slots[i].seq, 0);
+	/* The receiver observes the same controlled formation from node1.
+	 * Do not relabel the sender's origin, incarnation or encoded payload. */
+	receiver_fence = active.admission_fence;
+	receiver_fence.local_node_id = 1;
+	receiver_fence.local_boot_incarnation = receiver_fence.admitted_incarnation[1];
+	receiver_ingress = (ClusterICControlIngress){ .serial = 77,
+		.epoch = sender_report.formation_epoch, .owner_pid = MyProcPid,
+		.source_node = 0, .carrier = CLUSTER_IC_CONTROL_TCP };
+	receiver_ingress_available = receiver_source_current = true;
+	receiver_stream_reads = receiver_stream_refuse_at = receiver_late_fault = 0;
+	cohort_now_us = 10000000;
+	*env = (ClusterICEnvelope){ .msg_type = PGRAC_IC_MSG_UNDO_HORIZON,
+		.source_node_id = 0, .dest_node_id = 1, .epoch = sender_report.formation_epoch,
+		.payload_length = sizeof(sender_wire) };
+	receiver_view(true);
+	return active;
+}
+
+static void
+next_original_receive_report(const ClusterUndoCleanerActiveSample *active,
+							 const ClusterUndoRetentionSample *history)
+{
+	receiver_view(false);
+	assert_actual_history_report(active, history, 2);
+	receiver_view(true);
+}
+
+UT_TEST(test_actual_sender_bytes_reach_original_receive_without_origin_relabel)
+{
+	ClusterICEnvelope env;
+	ClusterUndoRetentionSample history;
+	ClusterUndoCleanerActiveSample active = start_original_receive(&env, &history);
+	unsigned reads = sender_history_reads, future_reads = native_future_reads;
+	ClusterHeapFreezeReportV2SlotShmem *slot = &receiver_state.freeze_slots[0];
+
+	undo_horizon_v2_receive(&env, sender_wire);
+	UT_ASSERT(slot->valid && !slot->view.horizon_regression_flagged);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->seq), 2);
+	UT_ASSERT_EQ(slot->last_report_sequence, sender_report.report_sequence);
+	UT_ASSERT(memcmp(&slot->view.report, &sender_report, sizeof(sender_report)) == 0);
+	UT_ASSERT(memcmp(&slot->fence, &receiver_fence, sizeof(receiver_fence)) == 0);
+	UT_ASSERT_EQ(slot->capability_generation, test_capability_generation);
+	UT_ASSERT_EQ(slot->view.recv_at_us, cohort_now_us);
+	UT_ASSERT_EQ(slot->view.report.origin, 0);
+	UT_ASSERT_EQ(slot->view.report.active_full_xid_min, U64FromFullTransactionId(active.scan.min_full));
+	UT_ASSERT_EQ(slot->view.report.horizon_scn, history.horizon_scn);
+	UT_ASSERT_EQ(receiver_stream_reads, 2);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&receiver_state.wire_reject_count), 0);
+	UT_ASSERT_EQ(sender_history_reads, reads);
+	UT_ASSERT_EQ(native_future_reads, future_reads);
+	UT_ASSERT(!receiver_state.freeze_slots[1].valid);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&receiver_state.freeze_watermark_seq), 0);
+	receiver_view(false);
+}
+
+UT_TEST(test_actual_receive_unproven_ingress_preserves_last_accepted_slot)
+{
+	ClusterICEnvelope env;
+	ClusterUndoRetentionSample history;
+	ClusterUndoCleanerActiveSample active = start_original_receive(&env, &history);
+	ClusterICControlIngress good = receiver_ingress;
+	ClusterHeapFreezeReportV2SlotShmem old;
+
+	undo_horizon_v2_receive(&env, sender_wire);
+	old = receiver_state.freeze_slots[0];
+	UT_ASSERT(old.valid);
+	next_original_receive_report(&active, &history);
+	for (unsigned fault = 1; fault <= 4; fault++) {
+		receiver_ingress = good;
+		receiver_ingress_available = fault != 1;
+		if (fault == 2) receiver_ingress.owner_pid++;
+		if (fault == 3) receiver_ingress.carrier = CLUSTER_IC_CONTROL_UNKNOWN;
+		if (fault == 4) receiver_ingress.epoch++;
+		receiver_stream_reads = 0;
+		undo_horizon_v2_receive(&env, sender_wire);
+		UT_ASSERT(memcmp(&old, &receiver_state.freeze_slots[0], sizeof(old)) == 0);
+		UT_ASSERT_EQ(receiver_stream_reads, 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&receiver_state.wire_reject_count), fault);
+	}
+	receiver_view(false);
+}
+
+static void
+change_receiver_identity_after_capture(void)
+{
+	if (receiver_late_fault == 2)
+		test_capability_generation++;
+	else {
+		UT_ASSERT_EQ(receiver_late_fault, 3);
+		receiver_source_current = false;
+	}
+}
+
+UT_TEST(test_actual_receive_rechecks_private_stream_hello_and_admission_before_publish)
+{
+	ClusterICEnvelope env;
+	ClusterUndoRetentionSample history;
+	ClusterUndoCleanerActiveSample active = start_original_receive(&env, &history);
+	uint32 generation = test_capability_generation;
+	ClusterHeapFreezeReportV2SlotShmem old;
+
+	undo_horizon_v2_receive(&env, sender_wire);
+	old = receiver_state.freeze_slots[0];
+	UT_ASSERT(old.valid);
+	next_original_receive_report(&active, &history);
+	for (unsigned fault = 1; fault <= 3; fault++) {
+		receiver_stream_reads = 0;
+		receiver_stream_refuse_at = fault == 1 ? 2 : 0;
+		receiver_source_current = true;
+		receiver_late_fault = fault;
+		sender_peer_current_observer = fault == 1 ? NULL : change_receiver_identity_after_capture;
+		undo_horizon_v2_receive(&env, sender_wire);
+		UT_ASSERT(memcmp(&old, &receiver_state.freeze_slots[0], sizeof(old)) == 0);
+		UT_ASSERT_EQ(receiver_stream_reads, 2);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&receiver_state.wire_reject_count), fault);
+		UT_ASSERT(sender_peer_current_observer == NULL);
+		test_capability_generation = generation;
+	}
+	receiver_stream_refuse_at = 0;
+	receiver_source_current = true;
+	undo_horizon_v2_receive(&env, sender_wire);
+	UT_ASSERT_EQ(receiver_state.freeze_slots[0].last_report_sequence, 2);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&receiver_state.freeze_slots[0].seq), 4);
+	UT_ASSERT(memcmp(&receiver_state.freeze_slots[0].view.report, &sender_report,
+				 sizeof(sender_report)) == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&receiver_state.wire_reject_count), 3);
+	receiver_view(false);
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(17);
 	UT_RUN(test_original_protection_exit_and_complete_worker_reach_v2_wire);
 	UT_RUN(test_actual_foreign_receipt_revokes_old_report_and_blocks_new_unqualified_report);
 	UT_RUN(test_actual_foreign_close_revokes_old_report_and_blocks_new_unqualified_report);
@@ -978,5 +1196,8 @@ main(void)
 	UT_RUN(test_actual_peer_callback_respawn_requires_fresh_cohort_publication);
 	UT_RUN(test_required_high_peer_missing_cannot_be_dropped_from_actual_cohort);
 	UT_RUN(test_late_high_peer_callback_revokes_earlier_peer_copy_before_candidate);
+	UT_RUN(test_actual_sender_bytes_reach_original_receive_without_origin_relabel);
+	UT_RUN(test_actual_receive_unproven_ingress_preserves_last_accepted_slot);
+	UT_RUN(test_actual_receive_rechecks_private_stream_hello_and_admission_before_publish);
 	return ut_failed_count == 0 ? 0 : 1;
 }
