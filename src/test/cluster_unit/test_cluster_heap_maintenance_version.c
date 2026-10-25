@@ -110,6 +110,9 @@ static bool full_target_current, target_recheck_error, revoke_target_census;
 static unsigned full_target_checks;
 static unsigned target_preflight_checks, census_preflight_checks;
 static unsigned policy_current_checks, cohort_current_checks;
+static unsigned allocation_fence_checks;
+static bool allocation_fence_error;
+bool cluster_xid_striping;
 static bool saved_policy_current;
 static ClusterHeapFreezeCohortStatus saved_cohort_status;
 static int source_current_error_stage, source_current_revoke_census;
@@ -360,8 +363,28 @@ cluster_semantic_activation_recheck_r4_terminal_census(
 	UT_ASSERT(token != NULL && token->entered);
 	return admission_current;
 }
-/* Controlled current-getter leaves: the wrapper must call them only before
- * restoring its writer, with the original saved observations and pin. */
+/* Compile the original policy-current predicate; only its original stripe
+ * fence observation and the independent cohort getter remain controlled. */
+#define cluster_heap_freeze_policy_sample_current_v1 actual_saved_policy_current
+#include "test_cluster_heap_freeze_policy_current.inc"
+#undef cluster_heap_freeze_policy_sample_current_v1
+
+bool
+cluster_xid_stripe_sample_fence_current(const ClusterXidStripeSampleFence *fence)
+{
+	UT_ASSERT(!local_x && !local_share && backend_pin_count == 1);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+	UT_ASSERT_EQ(policy_current_checks, 1);
+	UT_ASSERT_EQ(cohort_current_checks + census_preflight_checks, 0);
+	if (expected_current_policy != NULL)
+		UT_ASSERT(fence == &expected_current_policy->allocation_fence);
+	allocation_fence_checks++;
+	if (allocation_fence_error) elog(ERROR, "injected original stripe fence error");
+	return saved_policy_current;
+}
+
+/* Instrument the original unlocked call without replacing its predicate. */
 bool
 cluster_heap_freeze_policy_sample_current_v1(const ClusterHeapFreezePolicySampleV1 *sample)
 {
@@ -375,7 +398,7 @@ cluster_heap_freeze_policy_sample_current_v1(const ClusterHeapFreezePolicySample
 	policy_current_checks++;
 	if (source_current_error_stage == 1) elog(ERROR, "injected saved-policy current error");
 	if (source_current_revoke_census == 1) admission_current = false;
-	return saved_policy_current;
+	return actual_saved_policy_current(sample);
 }
 
 ClusterHeapFreezeCohortStatus
@@ -849,6 +872,8 @@ reset(uint8 opcode, bool shared)
 	full_target_checks = 0;
 	target_preflight_checks = census_preflight_checks = 0;
 	policy_current_checks = cohort_current_checks = 0;
+	allocation_fence_checks = 0; allocation_fence_error = false;
+	cluster_xid_striping = true;
 	saved_policy_current = true; saved_cohort_status = CLUSTER_HEAP_FREEZE_COHORT_READY;
 	source_current_error_stage = source_current_revoke_census = 0;
 	expected_current_policy = NULL; expected_current_cohort = NULL;
@@ -3487,10 +3512,88 @@ UT_TEST(test_xmin_borrowed_content_lock_never_calls_unlocked_source_getters)
 	}
 }
 
+UT_TEST(test_xmin_original_policy_current_uses_retained_allocation_fence)
+{
+	QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int batch = 0; batch < 2; batch++) {
+		for (int current = 0; current < 2; current++) {
+			ClusterHeapFreezePolicySampleV1 before;
+
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			fixture_release_original_writer(); resume_allowed = true;
+			expected_current_policy = &f.policy; expected_current_cohort = &f.cohort;
+			before = f.policy; saved_policy_current = current != 0;
+			UT_ASSERT_EQ(batch ? qualified_xmin_batch_apply(&f, targets, 3)
+				: qualified_xmin_apply(&f, 0), current != 0);
+			UT_ASSERT_EQ(policy_current_checks, 1); UT_ASSERT_EQ(allocation_fence_checks, 1);
+			UT_ASSERT_EQ(cohort_current_checks, current);
+			UT_ASSERT_EQ(census_preflight_checks, current);
+			UT_ASSERT_EQ(conditional_resumes, current); UT_ASSERT_EQ(conditional_unlocks, current);
+			UT_ASSERT_EQ(inserts, current); UT_ASSERT_EQ(flushes, current);
+			UT_ASSERT(memcmp(&f.policy, &before, sizeof(before)) == 0);
+			UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			if (!current) UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_policy_current_rejects_disabled_striping_before_fence)
+{
+	QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int batch = 0; batch < 2; batch++) {
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		fixture_release_original_writer(); resume_allowed = true;
+		cluster_xid_striping = false;
+		UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3)
+			: qualified_xmin_apply(&f, 0)));
+		UT_ASSERT_EQ(policy_current_checks, 1);
+		UT_ASSERT_EQ(allocation_fence_checks + cohort_current_checks + census_preflight_checks, 0);
+		UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+		UT_ASSERT_EQ(inserts + dirties + edges + flushes, 0);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_original_allocation_fence_error_preserves_caller_resources)
+{
+	QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+
+	for (int batch = 0; batch < 2; batch++) {
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		fixture_release_original_writer(); resume_allowed = true;
+		allocation_fence_error = expecting_error = true;
+		if (setjmp(error_jump) == 0) {
+			if (batch) (void)qualified_xmin_batch_apply(&f, targets, 3);
+			else (void)qualified_xmin_apply(&f, 0);
+			UT_ASSERT(false);
+		} else {
+			UT_ASSERT_EQ(policy_current_checks, 1); UT_ASSERT_EQ(allocation_fence_checks, 1);
+			UT_ASSERT_EQ(cohort_current_checks + census_preflight_checks, 0);
+			UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+			UT_ASSERT_EQ(inserts + dirties + edges + flushes, 0);
+			UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+		expecting_error = false;
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(96);
+	UT_PLAN(99);
+	UT_RUN(test_xmin_original_policy_current_uses_retained_allocation_fence);
+	UT_RUN(test_xmin_original_policy_current_rejects_disabled_striping_before_fence);
+	UT_RUN(test_xmin_original_allocation_fence_error_preserves_caller_resources);
 	UT_RUN(test_xmin_unlocked_source_refusal_precedes_original_writer_resume);
 	UT_RUN(test_xmin_unlocked_current_checks_keep_saved_inputs_and_native_wal);
 	UT_RUN(test_xmin_unlocked_source_error_keeps_caller_pin_and_admission);

@@ -1997,6 +1997,13 @@ test_cluster_heap_maintenance_identity.inc: $(top_srcdir)/src/backend/access/hea
 	mv $@.tmp $@
 
 # Execute original census ingress invalidation with the native freeze/WAL continuation.
+# Original source-current predicate, private to the native writer fixture.
+test_cluster_heap_freeze_policy_current.inc: $(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c Makefile
+	@awk '/^cluster_heap_freeze_policy_sample_current_v1\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_ctrc_registration.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
 	awk '/^ctrc_note_unqualified_registration\(/ { print "static void"; emit=1; found++ } \
 	     /^cluster_ctrc_active_scan_registration_current\(/ { print "bool"; emit=1; found++ } \
@@ -2005,6 +2012,8 @@ test_cluster_heap_ctrc_registration.inc: $(top_srcdir)/src/backend/cluster/clust
 
 test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_ctrc_registration.inc \
+		test_cluster_heap_freeze_policy_current.inc \
+		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
 		test_cluster_vacuum_observed_bounds.inc test_cluster_freeze_writer_context.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) test_cluster_heap_maintenance_policy.inc unit_test.h \
 		test_cluster_heap_borrowed_pin.inc $(top_srcdir)/src/include/storage/bufmgr.h \
 		test_cluster_vacuum_freeze_locators.inc \
@@ -4902,7 +4911,8 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_prune_version.inc test_cluster_heap_prune_helpers.inc \
 		test_cluster_heap_freeze_body.inc test_cluster_heap_freeze_helpers.inc \
 		test_cluster_heap_freeze_apply.inc test_cluster_heap_freeze_redo.inc test_cluster_heap_vacuum_version.inc \
-		test_cluster_heap_freeze_xmin_apply.inc
+		test_cluster_heap_freeze_xmin_apply.inc \
+		test_cluster_heap_freeze_policy_current.inc test_cluster_heap_freeze_policy_current.inc.tmp
 	rm -f test_cluster_space_cache_insert.inc test_cluster_space_cache_delete.inc test_cluster_space_cache_allocation.inc test_cluster_space_cache_update.inc
 	rm -f test_cluster_space_hint_owners.inc test_cluster_space_census_types.inc test_cluster_space_census_mutation.inc test_cluster_space_cleanout_product.o
 	rm -f test_cluster_space_fsm_hint.inc
