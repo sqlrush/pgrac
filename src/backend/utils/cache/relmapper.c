@@ -140,6 +140,7 @@
 #include "cluster/cluster_relmap_retention_runtime.h"
 #include "cluster/cluster_sinval.h"		  /* cross-node inval ack barrier (2.39) */
 #include "cluster/storage/cluster_smgr.h" /* cluster_smgr_invalidate_relmap */
+#include "postmaster/interrupt.h"
 #include "storage/sinval.h"				  /* SendSharedInvalidMessages */
 #include "utils/memutils.h"
 #endif
@@ -1507,9 +1508,14 @@ cluster_relmap_producer_precommit_v2(bool is_parallel_worker)
 	if (active_shared_updates.num_mappings == 0 && active_local_updates.num_mappings == 0
 		&& pending_shared_updates.num_mappings == 0 && pending_local_updates.num_mappings == 0)
 		return;
-	/* Consume only this original command-activated batch. Refuse the whole
-	 * input before staging its first flavour if its local shape is invalid. */
-	if (is_parallel_worker || pending_shared_updates.num_mappings != 0
+	/* Check the original backend context and the whole activated batch before
+	 * the singleton acquisition can wait or its first flavour can stage. */
+	if (!cluster_enabled || !cluster_shared_config
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| MyBackendType != B_BACKEND || MyProcPid <= 0 || CritSectionCount != 0
+		|| ShutdownRequestPending || !IsTransactionState() || RecoveryInProgress()
+		|| LWLockHeldByMe(RelationMappingLock) || LWLockHeldByMe(XidGenLock)
+		|| is_parallel_worker || pending_shared_updates.num_mappings != 0
 		|| pending_local_updates.num_mappings != 0
 		|| active_shared_updates.num_mappings < 0 || active_shared_updates.num_mappings > MAX_MAPPINGS
 		|| active_local_updates.num_mappings < 0 || active_local_updates.num_mappings > MAX_MAPPINGS
@@ -1522,7 +1528,14 @@ cluster_relmap_producer_precommit_v2(bool is_parallel_worker)
 			(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
 			 errmsg("cluster relation map preparation cannot consume the current update batch")));
 
-	/* The caller retains original global X and failure/terminal duties.
+	/* Both flavours share the original singleton, as in the original writer.
+	 * Capture/assignment, retention begin and local MappingLock follow it. */
+	if (!cluster_relmap_authority_x_held() && !cluster_relmap_authority_x_lock())
+		ereport(ERROR,
+			(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+			 errmsg("could not acquire the cluster relation map authority lock")));
+
+	/* The caller retains original abort-lock and failure/terminal duties.
 	 * A refusal may follow durable effects, including the other flavour;
 	 * propagate ERROR without clearing either queued input or old custody. */
 	if ((active_shared_updates.num_mappings != 0

@@ -358,6 +358,35 @@ cluster_voting_disk_write_raw_slot_at(int fd, off_t offset, const void *bytes)
 #define cluster_heap_freeze_policy_sample_current_v1 actual_saved_policy_current
 #include "test_cluster_heap_freeze_policy_current.inc"
 #undef cluster_heap_freeze_policy_sample_current_v1
+
+/* Only the bounded published-watermark observation remains a leaf here.
+ * Its caller must already have released the original XidGenLock. */
+static bool policy_watermark_available;
+static uint64 policy_watermark_min;
+static int policy_watermark_revoke;
+static unsigned policy_watermark_reads;
+
+bool
+cluster_heap_freeze_watermark_sample(ClusterHeapFreezeWatermark *out)
+{
+	UT_ASSERT(active_sampling && !xid_lock_held && !exclusive_lock);
+	UT_ASSERT_EQ(active_depth, 0);
+	policy_watermark_reads++;
+	switch (policy_watermark_revoke) {
+	case 1: incarnation++; break;
+	case 2: in_quorum = false; break;
+	case 3: pg_atomic_write_u32(&StripeLease->failed, 1); break;
+	case 4: StripeBootShmem->generation++; break;
+	}
+	if (!policy_watermark_available) return false;
+	memset(out, 0, sizeof(*out));
+	out->active_full_xid_min = policy_watermark_min;
+	return true;
+}
+
+#define cluster_heap_freeze_policy_sample_v1 actual_saved_policy_sample
+#include "test_cluster_heap_freeze_policy_sample.inc"
+#undef cluster_heap_freeze_policy_sample_v1
 #include "test_cluster_xid_stripe_active.inc"
 
 static ClusterXidStripeSlotRecord rows[3];
@@ -1994,6 +2023,120 @@ UT_TEST(original_policy_current_cannot_replace_captured_fence_with_valid_numbers
 	UT_ASSERT(!xid_lock_held && !exclusive_lock);
 }
 
+/* Run the original full policy sampler against the original durable lease
+ * fixture. This does not qualify the independent published watermark. */
+static void
+original_policy_sampling_fixture(void)
+{
+	prepare_future_lease();
+	outside_qvotec = true;
+	variables.nextXid = FullTransactionIdFromU64(local_next);
+	xid_lock_held = false;
+	active_sampling = true;
+	active_depth = active_lock_errors = 0;
+	policy_watermark_available = false;
+	policy_watermark_min = 0;
+	policy_watermark_revoke = 0;
+	policy_watermark_reads = 0;
+}
+
+UT_TEST(original_policy_sampler_uses_real_legal_future_and_native_age)
+{
+	ClusterHeapFreezePolicySampleV1 sample;
+	unsigned writes_before;
+
+	original_policy_sampling_fixture();
+	/* Floor 4096 is normalized to origin slot 4 (4100), above raw nextXid. */
+	pg_atomic_write_u64(&boot.herding_floor_full, 4096);
+	writes_before = writes;
+	UT_ASSERT(actual_saved_policy_sample(4050, 1000, 100, 1000, &sample));
+	UT_ASSERT_EQ(U64FromFullTransactionId(sample.legal_next), 4100);
+	UT_ASSERT_EQ(U64FromFullTransactionId(sample.freeze_limit), 4000);
+	UT_ASSERT(sample.aggressive);
+	UT_ASSERT(actual_saved_policy_current(&sample));
+	UT_ASSERT_EQ(local_next, 2052);
+	UT_ASSERT_EQ(U64FromFullTransactionId(variables.nextXid), 2052);
+	UT_ASSERT_EQ(policy_watermark_reads, 1);
+	UT_ASSERT_EQ(writes, writes_before);
+	UT_ASSERT(!xid_lock_held && !exclusive_lock);
+	UT_ASSERT_EQ(active_depth + active_lock_errors, 0);
+}
+
+UT_TEST(original_policy_sampler_treats_watermark_as_conservative_ceiling)
+{
+	const uint64 minima[] = { 1800, 4000, 2, 0 };
+
+	for (unsigned i = 0; i < lengthof(minima); i++) {
+		ClusterHeapFreezePolicySampleV1 sample, before;
+		unsigned writes_before;
+
+		original_policy_sampling_fixture();
+		policy_watermark_available = true;
+		policy_watermark_min = minima[i];
+		memset(&sample, 0xA5, sizeof(sample)); before = sample;
+		writes_before = writes;
+		if (i < 2) {
+			UT_ASSERT(actual_saved_policy_sample(2000, 1000, 100, 2000, &sample));
+			UT_ASSERT_EQ(U64FromFullTransactionId(sample.legal_next), 2052);
+			UT_ASSERT_EQ(U64FromFullTransactionId(sample.freeze_limit), i == 0 ? 1800 : 1952);
+			UT_ASSERT(!sample.aggressive);
+			UT_ASSERT(actual_saved_policy_current(&sample));
+		} else {
+			UT_ASSERT(!actual_saved_policy_sample(2000, 1000, 100, 2000, &sample));
+			UT_ASSERT(memcmp(&sample, &before, sizeof(sample)) == 0);
+		}
+		UT_ASSERT_EQ(policy_watermark_reads, 1);
+		UT_ASSERT_EQ(writes, writes_before);
+		UT_ASSERT(!xid_lock_held && !exclusive_lock);
+		UT_ASSERT_EQ(active_depth + active_lock_errors, 0);
+	}
+}
+
+UT_TEST(original_policy_sampler_rejects_actual_source_revoked_by_reader)
+{
+	for (int fault = 1; fault <= 4; fault++) {
+		ClusterHeapFreezePolicySampleV1 sample, before;
+		unsigned writes_before;
+
+		original_policy_sampling_fixture();
+		policy_watermark_available = true;
+		policy_watermark_min = 1800;
+		policy_watermark_revoke = fault;
+		memset(&sample, 0xA5, sizeof(sample)); before = sample;
+		writes_before = writes;
+		UT_ASSERT(!actual_saved_policy_sample(2000, 1000, 100, 2000, &sample));
+		UT_ASSERT(memcmp(&sample, &before, sizeof(sample)) == 0);
+		UT_ASSERT_EQ(policy_watermark_reads, 1);
+		UT_ASSERT_EQ(writes, writes_before);
+		UT_ASSERT(!xid_lock_held && !exclusive_lock);
+		UT_ASSERT_EQ(active_depth + active_lock_errors, 0);
+	}
+}
+
+UT_TEST(original_policy_sampler_refuses_before_reader_without_current_lease)
+{
+	for (int fault = 0; fault < 4; fault++) {
+		ClusterHeapFreezePolicySampleV1 sample, before;
+		unsigned writes_before;
+
+		original_policy_sampling_fixture();
+		switch (fault) {
+		case 0: pg_atomic_write_u32(&lease.failed, 1); break;
+		case 1: pg_atomic_write_u64(&lease.limit_full, 0); break;
+		case 2: pg_atomic_write_u64(&lease.published_incarnation, incarnation + 1); break;
+		case 3: boot.my_slot_claimed = false; break;
+		}
+		memset(&sample, 0xA5, sizeof(sample)); before = sample;
+		writes_before = writes;
+		UT_ASSERT(!actual_saved_policy_sample(2000, 1000, 100, 2000, &sample));
+		UT_ASSERT(memcmp(&sample, &before, sizeof(sample)) == 0);
+		UT_ASSERT_EQ(policy_watermark_reads, 0);
+		UT_ASSERT_EQ(writes, writes_before);
+		UT_ASSERT(!xid_lock_held && !exclusive_lock);
+		UT_ASSERT_EQ(active_depth + active_lock_errors, 0);
+	}
+}
+
 int
 main(void)
 {
@@ -2003,7 +2146,11 @@ main(void)
 		if (disks[i] < 0 || unlink(path) != 0)
 			abort();
 	}
-	UT_PLAN(51);
+	UT_PLAN(55);
+	UT_RUN(original_policy_sampler_uses_real_legal_future_and_native_age);
+	UT_RUN(original_policy_sampler_treats_watermark_as_conservative_ceiling);
+	UT_RUN(original_policy_sampler_rejects_actual_source_revoked_by_reader);
+	UT_RUN(original_policy_sampler_refuses_before_reader_without_current_lease);
 	UT_RUN(original_policy_current_keeps_real_lease_across_original_renewal);
 	UT_RUN(original_policy_current_refuses_revoked_real_source_without_mutation);
 	UT_RUN(original_policy_current_cannot_replace_captured_fence_with_valid_numbers);

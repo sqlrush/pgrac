@@ -101,14 +101,20 @@ extern bool cluster_relmap_producer_arm_v2(bool shared, const struct RelMapFile 
 extern bool cluster_relmap_producer_finish_v2(bool is_commit);
 
 /* Dormant original precommit batch, before the native commit decision, under
- * the caller's original mapped-rel AEL/global relmap X. Consume only original
+ * the caller's original mapped-rel AEL and no mapping/XidGen/retention lock.
+ * Reuse global relmap X or acquire the original singleton once after backend
+ * context and whole-batch preflight, before capture, pin or local lock/WAL.
+ * The caller retains it through original terminal and failure handling.
+ * Consume only original
  * command-activated shared/per-db update queues through the original arm.
  * Pending CCI work, parallel workers or existing custody refuse with ERROR.
  * Both requested prepares must succeed before either active queue is reset.
  * False from an arm becomes original ERROR; ERROR leaves all queued inputs,
  * saved receipts, unfinished protection and pins/debt for original failure
- * handling. Empty queues are a no-op. No global lock acquisition, terminal
- * authentication, commit permission, retention release or live v2 hook. */
+ * handling. A pre-effect ERROR keeps an acquired hold for the existing
+ * original abort lock cleanup; the empty v2 abort callback does not release
+ * it. Empty queues acquire nothing. No terminal authentication, commit
+ * permission, retention release or live v2 hook. */
 extern void cluster_relmap_producer_precommit_v2(bool is_parallel_worker);
 
 /* Dormant original postcommit caller only, after durable commit and before

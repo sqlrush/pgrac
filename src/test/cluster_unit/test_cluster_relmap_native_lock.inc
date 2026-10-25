@@ -192,7 +192,6 @@ UT_TEST(v2_native_lock_refusals_do_not_enter_release)
 		directory = native_lock_fixture(which >= 2, 3, false, &config);
 		before = *directory;
 		precommit_save_queues(queues);
-		UT_ASSERT(!cluster_relmap_authority_x_lock());
 		UT_ASSERT(precommit_error(false));
 		precommit_same_queues(queues);
 		UT_ASSERT_EQ(assignments + inserts + flushes + v2_stage_writes, 0);

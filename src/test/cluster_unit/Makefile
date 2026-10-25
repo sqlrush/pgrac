@@ -598,6 +598,7 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		test_cluster_relmap_abort.inc \
 		test_cluster_relmap_unarmed.inc \
 		test_cluster_relmap_precommit.inc \
+		test_cluster_relmap_authority_entry.inc \
 		test_cluster_relmap_native_lock.inc test_cluster_relmap_native_lock.h \
 		test_cluster_relmap_native_lock.o \
 		test_cluster_relmap_physical_pair.inc test_cluster_relmap_physical_pair.h \
@@ -2432,6 +2433,13 @@ test_cluster_heap_maintenance_identity.inc: $(top_srcdir)/src/backend/access/hea
 	mv $@.tmp $@
 
 # Execute original census ingress invalidation with the native freeze/WAL continuation.
+# Original full policy sampler, composed with the actual stripe lease fixture.
+test_cluster_heap_freeze_policy_sample.inc: $(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c Makefile
+	@awk '/^cluster_heap_freeze_policy_sample_v1\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 # Original source-current predicate, private to the native writer fixture.
 test_cluster_heap_freeze_policy_current.inc: $(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c Makefile
 	@awk '/^cluster_heap_freeze_policy_sample_current_v1\(/ { print "static bool"; emit=1; found++ } \
@@ -5802,6 +5810,7 @@ clean distclean maintainer-clean:
 		test_cluster_heap_freeze_apply.inc test_cluster_heap_freeze_redo.inc test_cluster_heap_vacuum_version.inc \
 		test_cluster_heap_freeze_xmin_apply.inc \
 		test_cluster_heap_freeze_policy_current.inc test_cluster_heap_freeze_policy_current.inc.tmp
+	rm -f test_cluster_heap_freeze_policy_sample.inc test_cluster_heap_freeze_policy_sample.inc.tmp
 	rm -f test_cluster_space_cache_insert.inc test_cluster_space_cache_delete.inc test_cluster_space_cache_allocation.inc test_cluster_space_cache_update.inc
 	rm -f test_cluster_space_hint_owners.inc test_cluster_space_census_types.inc test_cluster_space_census_mutation.inc test_cluster_space_cleanout_product.o
 	rm -f test_cluster_space_fsm_hint.inc
@@ -10334,6 +10343,7 @@ test_cluster_xid_stripe_active.inc: $(top_srcdir)/src/backend/storage/ipc/procar
 test_cluster_xid_stripe_evidence: test_cluster_xid_stripe_evidence.c unit_test.h \
 		test_cluster_xid_stripe_evidence.inc test_cluster_xid_stripe_active.inc \
 		test_cluster_heap_freeze_policy_current.inc \
+		test_cluster_heap_freeze_policy_sample.inc \
 		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
 		test_cluster_pgproc_active_types.inc $(CLUSTER_XID_STRIPE_O) \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \

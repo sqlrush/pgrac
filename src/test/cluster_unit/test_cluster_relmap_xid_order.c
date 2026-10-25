@@ -1096,11 +1096,16 @@ UT_TEST(unarmed_commit_preserves_other_writers_pending_and_global_lock)
 #include "test_cluster_relmap_precommit.inc"
 #include "test_cluster_relmap_native_lock.inc"
 #include "test_cluster_relmap_physical_pair.inc"
+#include "test_cluster_relmap_authority_entry.inc"
 
 int
 main(void)
 {
-	UT_PLAN(60);
+	UT_PLAN(64);
+	UT_RUN(v2_precommit_acquires_or_reuses_original_authority);
+	UT_RUN(v2_precommit_entry_refuses_before_original_acquisition);
+	UT_RUN(v2_precommit_pre_effect_error_keeps_original_abort_release);
+	UT_RUN(v2_precommit_entered_error_keeps_acquired_authority);
 	UT_RUN(v2_physical_pairs_finish_before_notification_and_unlock);
 	UT_RUN(v2_physical_stage_sync_refusal_keeps_original_batch);
 	UT_RUN(v2_physical_second_finish_refusal_keeps_all_custody);
