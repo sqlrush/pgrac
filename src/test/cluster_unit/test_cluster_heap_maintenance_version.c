@@ -55,6 +55,7 @@
 #include "storage/bufmgr.h"
 #include "storage/buf_internals.h"
 #include "storage/standby.h"
+#include "storage/proc.h"
 #include "utils/rel.h"
 #include "unit_test.h"
 #include "cluster/cluster_mode.h"
@@ -535,6 +536,7 @@ cluster_heap_freeze_policy_sample_current_v1(const ClusterHeapFreezePolicySample
 static bool original_worker_publication_get(ClusterUndoCleanerActiveSample *);
 static void worker_original_publish_fixture(const ClusterHeapFreezeCohortObservation *);
 static void worker_original_sample_pass_fixture(const ClusterHeapFreezeCohortObservation *);
+static void worker_native_sample_fixture(const ClusterHeapFreezeCohortObservation *);
 
 bool
 cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out)
@@ -846,11 +848,12 @@ static unsigned pass_lease_checks, pass_admission_checks, pass_incomplete_slices
 static int pass_step_fault;
 static FullTransactionId pass_reference, pass_future, pass_active_min;
 static ClusterSemanticActiveSampleFence pass_captured_admission;
+static bool sampler_lock_held;
 
 static void
 worker_pass_assert_unlocked(void)
 {
-	UT_ASSERT(!worker_lock_held && !lease_lock_held && !local_x && !local_share);
+	UT_ASSERT(!sampler_lock_held && !worker_lock_held && !lease_lock_held && !local_x && !local_share);
 	UT_ASSERT_EQ(CritSectionCount, 0);
 }
 
@@ -864,6 +867,116 @@ worker_pass_capture(ClusterSemanticActiveSampleFence *out)
 	return true;
 }
 
+/* Original compact native membership layout and sampler. Registry contents,
+ * lock scheduling and stripe-future are fixture inputs, not live provenance. */
+#include "test_cluster_heap_freeze_pgproc_types.inc"
+static VariableCacheData sampler_variables;
+static VariableCache sampler_cache = &sampler_variables;
+static PROC_HDR sampler_procs;
+static PROC_HDR *sampler_proc_global = &sampler_procs;
+static PGPROC sampler_slots[3];
+static TransactionId sampler_xids[3];
+static char sampler_array_storage[offsetof(ProcArrayStruct, pgprocnos) + 3 * sizeof(int)]
+	pg_attribute_aligned(MAXIMUM_ALIGNOF);
+static ProcArrayStruct *sampler_proc_array = (ProcArrayStruct *) sampler_array_storage;
+static LWLockPadded sampler_locks[NUM_INDIVIDUAL_LWLOCKS];
+#define MainLWLockArray sampler_locks
+static LWLock *const sampler_xid_lock = XidGenLock;
+static LWLock *const sampler_proc_lock = ProcArrayLock;
+#undef MainLWLockArray
+static LWLock *sampler_held_lock;
+static unsigned sampler_xid_locks, sampler_proc_locks;
+static unsigned sampler_lock_acquires, sampler_lock_releases, sampler_future_reads;
+static bool sampler_recovering, sampler_future_allowed, sampler_advance_on_xid_unlock;
+
+static bool
+sampler_recovery_in_progress(void)
+{
+	return sampler_recovering;
+}
+
+static void
+sampler_lock_acquire(LWLock *lock, LWLockMode mode)
+{
+	worker_pass_assert_unlocked();
+	UT_ASSERT(mode == LW_SHARED && (lock == sampler_xid_lock || lock == sampler_proc_lock));
+	if (lock == sampler_xid_lock) sampler_xid_locks++;
+	else {
+		UT_ASSERT_EQ(sampler_xid_locks, sampler_proc_locks + 1);
+		sampler_proc_locks++;
+	}
+	sampler_lock_held = true; sampler_held_lock = lock; sampler_lock_acquires++;
+}
+
+static void
+sampler_lock_release(LWLock *lock)
+{
+	UT_ASSERT(sampler_lock_held && lock == sampler_held_lock);
+	sampler_lock_held = false; sampler_held_lock = NULL; sampler_lock_releases++;
+	if (lock == sampler_xid_lock && sampler_advance_on_xid_unlock)
+		sampler_variables.nextXid = FullTransactionIdFromEpochAndXid(2, 300);
+}
+
+static bool
+sampler_stripe_future(FullTransactionId reference, FullTransactionId *future,
+					  ClusterXidStripeSampleFence *fence)
+{
+	UT_ASSERT(sampler_lock_held && sampler_held_lock == sampler_xid_lock);
+	UT_ASSERT(!worker_lock_held && !lease_lock_held && !local_x && !local_share);
+	UT_ASSERT(FullTransactionIdIsValid(reference)); sampler_future_reads++;
+	*future = InvalidFullTransactionId; memset(fence, 0, sizeof(*fence));
+	if (!sampler_future_allowed) return false;
+	*future = pass_future; *fence = retained_lease_fence;
+	return true;
+}
+
+#define ShmemVariableCache sampler_cache
+#define ProcGlobal sampler_proc_global
+#define procArray sampler_proc_array
+#define MainLWLockArray sampler_locks
+#define RecoveryInProgress sampler_recovery_in_progress
+#define LWLockAcquire sampler_lock_acquire
+#define LWLockRelease sampler_lock_release
+#define cluster_xid_stripe_sample_future sampler_stripe_future
+#define ProcArrayGetActiveFullXidSample original_native_fullxid_sample
+#include "test_cluster_heap_freeze_pgproc_sample.inc"
+#undef ProcArrayGetActiveFullXidSample
+#undef cluster_xid_stripe_sample_future
+#undef LWLockRelease
+#undef LWLockAcquire
+#undef RecoveryInProgress
+#undef MainLWLockArray
+#undef procArray
+#undef ProcGlobal
+#undef ShmemVariableCache
+#undef UINT32_ACCESS_ONCE
+
+static void
+worker_native_sample_fixture(const ClusterHeapFreezeCohortObservation *cohort)
+{
+	/* Construct typed registry inputs; this does not run allocation/2PC. */
+	memset(&sampler_variables, 0, sizeof(sampler_variables));
+	memset(&sampler_procs, 0, sizeof(sampler_procs));
+	memset(sampler_slots, 0, sizeof(sampler_slots));
+	memset(sampler_xids, 0, sizeof(sampler_xids));
+	memset(sampler_array_storage, 0, sizeof(sampler_array_storage));
+	sampler_cache = &sampler_variables; sampler_proc_global = &sampler_procs;
+	sampler_proc_array = (ProcArrayStruct *) sampler_array_storage;
+	sampler_variables.nextXid = FullTransactionIdFromU64(cohort->future_full_xid_max);
+	sampler_procs.allProcs = sampler_slots; sampler_procs.xids = sampler_xids;
+	sampler_proc_array->maxProcs = 3; sampler_proc_array->numProcs = 1;
+	sampler_proc_array->pgprocnos[0] = 0;
+	for (int i = 0; i < 3; i++) pg_atomic_init_u64(&sampler_slots[i].cluster_top_full_xid_atomic, 0);
+	sampler_xids[0] = XidFromFullTransactionId(FullTransactionIdFromU64(cohort->active_full_xid_min));
+	pg_atomic_write_u64(&sampler_slots[0].cluster_top_full_xid_atomic, cohort->active_full_xid_min);
+	pass_reference = pass_future = sampler_variables.nextXid;
+	pass_active_min = FullTransactionIdFromU64(cohort->active_full_xid_min);
+	sampler_lock_held = sampler_recovering = sampler_advance_on_xid_unlock = false;
+	sampler_held_lock = NULL; sampler_future_allowed = true;
+	sampler_xid_locks = sampler_proc_locks = 0;
+	sampler_lock_acquires = sampler_lock_releases = sampler_future_reads = 0;
+}
+
 static bool
 worker_pass_native_sample(FullTransactionId *reference, FullTransactionId *future,
 						 FullTransactionId *minimum, ClusterXidStripeSampleFence *fence)
@@ -873,9 +986,7 @@ worker_pass_native_sample(FullTransactionId *reference, FullTransactionId *futur
 	*reference = *future = *minimum = InvalidFullTransactionId;
 	memset(fence, 0, sizeof(*fence));
 	if (!pass_native_allowed) return false;
-	*reference = pass_reference; *future = pass_future; *minimum = pass_active_min;
-	*fence = retained_lease_fence;
-	return true;
+	return original_native_fullxid_sample(reference, future, minimum, fence);
 }
 
 static bool
@@ -1985,6 +2096,7 @@ qualified_xmin_setup(QualifiedXminFixture *f, uint16 xmax_mask)
 	f->cohort.local_registration_cut.unqualified_registration_generation = pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation);
 	admission_current_publish_fixture(&f->cohort);
 	worker_current_publish_fixture(&f->cohort);
+	worker_native_sample_fixture(&f->cohort);
 	f->input.freeze_policy = &f->policy; f->input.freeze_cohort = &f->cohort;
 	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f->page, &f->proofs, &f->fence), 1);
 }
@@ -5463,10 +5575,154 @@ UT_TEST(test_xmin_original_worker_pass_new_round_revokes_old_cohort)
 	}
 }
 
+UT_TEST(test_xmin_original_native_sampler_continues_worker_wal)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		qualified_xmin_require_peer(&f, 65);
+		native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id - 1;
+		memset(&native_worker_shared.active_sample, 0, sizeof(native_worker_shared.active_sample));
+		fixture_release_original_writer(); resume_allowed = true;
+		worker_original_sample_pass_fixture(&f.cohort);
+		UT_ASSERT_EQ(sampler_xid_locks, 1); UT_ASSERT_EQ(sampler_proc_locks, 1);
+		UT_ASSERT_EQ(sampler_lock_acquires, 2); UT_ASSERT_EQ(sampler_lock_releases, 2);
+		UT_ASSERT_EQ(sampler_future_reads, 1); UT_ASSERT(!sampler_lock_held);
+		UT_ASSERT(FullTransactionIdEquals(publisher_scan.reference_full, sampler_variables.nextXid));
+		UT_ASSERT(FullTransactionIdEquals(publisher_scan.min_full, f.cohort.local_registration_cut.min_full));
+		f.cohort.local_registration_cut = publisher_scan;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT(!worker_lock_held && !lease_lock_held && !local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
+UT_TEST(test_xmin_original_native_sampler_refuses_unknown_identity_and_window)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int fault = 0; fault < 11; fault++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			ClusterUndoCleanerActiveSample zero;
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id - 1;
+			switch (fault) {
+			case 0: sampler_xids[0] = FrozenTransactionId; break;
+			case 1: pg_atomic_write_u64(&sampler_slots[0].cluster_top_full_xid_atomic, 0); break;
+			case 2: pg_atomic_fetch_add_u64(&sampler_slots[0].cluster_top_full_xid_atomic, 1); break;
+			case 3: pg_atomic_write_u64(&sampler_slots[0].cluster_top_full_xid_atomic, UINT64_MAX); break;
+			case 4: sampler_proc_array->numProcs = -1; break;
+			case 5: sampler_proc_array->numProcs = 4; break;
+			case 6: sampler_variables.nextXid = InvalidFullTransactionId; break;
+			case 7: sampler_future_allowed = false; break;
+			case 8: sampler_recovering = true; break;
+			case 9: sampler_proc_global->xids = NULL; break;
+			case 10: sampler_cache = NULL; break;
+			}
+			fixture_release_original_writer(); resume_allowed = true;
+			worker_original_sample_pass_fixture(&f.cohort);
+			memset(&zero, 0, sizeof(zero));
+			UT_ASSERT_EQ(publisher_scan.status, CTRC_ACTIVE_SCAN_INVALID); UT_ASSERT(!pass_pending);
+			UT_ASSERT(memcmp(&zero, &native_worker_shared.active_sample, sizeof(zero)) == 0);
+			UT_ASSERT_EQ(pass_native_reads, 1); UT_ASSERT_EQ(pass_begin_reads, 0);
+			UT_ASSERT_EQ(sampler_lock_acquires, sampler_lock_releases); UT_ASSERT(!sampler_lock_held);
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(!worker_lock_held && !lease_lock_held && !local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_native_sampler_uses_compact_membership)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id - 1;
+		sampler_proc_array->numProcs = 2;
+		sampler_proc_array->pgprocnos[0] = 2; sampler_proc_array->pgprocnos[1] = 0;
+		sampler_xids[0] = 150; sampler_xids[1] = 100;
+		pg_atomic_write_u64(&sampler_slots[2].cluster_top_full_xid_atomic, U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 150)));
+		/* PID0 is a controlled dummy shape, not a full PREPARE lifecycle. */
+		UT_ASSERT_EQ(sampler_slots[0].pid, 0);
+		fixture_release_original_writer(); resume_allowed = true;
+		worker_original_sample_pass_fixture(&f.cohort);
+		UT_ASSERT(FullTransactionIdEquals(publisher_scan.min_full, FullTransactionIdFromEpochAndXid(1, 100)));
+		UT_ASSERT_EQ(sampler_xid_locks, 1); UT_ASSERT_EQ(sampler_proc_locks, 1);
+		UT_ASSERT_EQ(sampler_lock_acquires, sampler_lock_releases);
+		f.cohort.local_registration_cut = publisher_scan;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT(!sampler_lock_held && !worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
+UT_TEST(test_xmin_original_native_sampler_retains_xidgen_snapshot)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		FullTransactionId before;
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id - 1;
+		before = sampler_variables.nextXid; sampler_advance_on_xid_unlock = true;
+		fixture_release_original_writer(); resume_allowed = true;
+		worker_original_sample_pass_fixture(&f.cohort);
+		UT_ASSERT(FullTransactionIdEquals(publisher_scan.reference_full, before));
+		UT_ASSERT(!FullTransactionIdEquals(publisher_scan.reference_full, sampler_variables.nextXid));
+		UT_ASSERT(FullTransactionIdEquals(publisher_scan.future_full, f.policy.legal_next));
+		UT_ASSERT_EQ(sampler_xid_locks, 1); UT_ASSERT_EQ(sampler_proc_locks, 1);
+		UT_ASSERT_EQ(sampler_future_reads, 1); UT_ASSERT(!sampler_lock_held);
+		f.cohort.local_registration_cut = publisher_scan;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT(!worker_lock_held && !lease_lock_held && !local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
+UT_TEST(test_xmin_original_native_sampler_fullxid_fold_and_atomic_refusal)
+{
+	QualifiedXminFixture f;
+	FullTransactionId reference, future, minimum;
+	ClusterXidStripeSampleFence fence, zero;
+	unsigned locks;
+	qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI); fixture_release_original_writer();
+	sampler_variables.nextXid = pass_future = FullTransactionIdFromEpochAndXid(2, 200);
+	sampler_proc_array->numProcs = 2;
+	sampler_proc_array->pgprocnos[0] = 0; sampler_proc_array->pgprocnos[1] = 2;
+	sampler_xids[0] = 100; sampler_xids[1] = 3;
+	pg_atomic_write_u64(&sampler_slots[2].cluster_top_full_xid_atomic, U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(2, 3)));
+	UT_ASSERT(original_native_fullxid_sample(&reference, &future, &minimum, &fence));
+	UT_ASSERT(FullTransactionIdEquals(minimum, FullTransactionIdFromEpochAndXid(1, 100)));
+	UT_ASSERT(FullTransactionIdEquals(reference, sampler_variables.nextXid));
+	UT_ASSERT(FullTransactionIdEquals(future, pass_future));
+	locks = sampler_lock_acquires;
+	memset(&fence, 0xa5, sizeof(fence)); memset(&zero, 0, sizeof(zero));
+	UT_ASSERT(!original_native_fullxid_sample(&reference, &reference, &minimum, &fence));
+	UT_ASSERT(!FullTransactionIdIsValid(reference) && !FullTransactionIdIsValid(minimum));
+	UT_ASSERT(memcmp(&fence, &zero, sizeof(fence)) == 0);
+	UT_ASSERT_EQ(sampler_lock_acquires, locks); UT_ASSERT_EQ(sampler_lock_acquires, sampler_lock_releases);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	UT_ASSERT(!sampler_lock_held && !worker_lock_held && !local_x && f.admission.entered);
+	UT_ASSERT_EQ(backend_pin_count, 1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(143);
+	UT_PLAN(148);
+	UT_RUN(test_xmin_original_native_sampler_continues_worker_wal);
+	UT_RUN(test_xmin_original_native_sampler_refuses_unknown_identity_and_window);
+	UT_RUN(test_xmin_original_native_sampler_uses_compact_membership);
+	UT_RUN(test_xmin_original_native_sampler_retains_xidgen_snapshot);
+	UT_RUN(test_xmin_original_native_sampler_fullxid_fold_and_atomic_refusal);
 	UT_RUN(test_xmin_original_worker_pass_continues_native_wal);
 	UT_RUN(test_xmin_original_worker_pass_capture_refusals_do_not_publish);
 	UT_RUN(test_xmin_original_worker_pass_continuation_does_not_resample);
