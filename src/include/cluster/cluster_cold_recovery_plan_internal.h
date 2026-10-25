@@ -195,6 +195,9 @@ struct ClusterColdPlanV1 {
 	uint8 phase;
 	bool namespace_known;
 	uint64 max_scn; /* highest xl_scn of every accepted record */
+	/* All retained JOINs must describe the same activation before replay. */
+	uint64 stripe_floor_full;
+	uint64 stripe_epoch;
 	uint64 system_identifier;
 	uint8 storage_uuid[16];
 	uint32 participant_count;

@@ -33,6 +33,7 @@
 #include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_tt_2pc.h"
 #include "cluster/cluster_xid_stripe.h"
+#include "cluster/cluster_xid_stripe_boot.h"
 #include "cluster/cluster_xid_stripe_xlog.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "storage/standbydefs.h"
@@ -175,6 +176,9 @@ static int control_scope_fault;
 static bool control_observe_throw, control_expire_after_observe;
 static bool cold_control_test;
 static unsigned cold_control_drift;
+static bool cold_join_test;
+static unsigned cold_join_preflights, cold_join_applies;
+static int cold_join_fault = -1;
 int cluster_node_id = 0;
 static TimestampTz canonical_projection_time;
 static uint16 canonical_projection_wrap;
@@ -903,6 +907,31 @@ cluster_scn_recovery_replay_observe(SCN scn)
 			((ClusterRecoverySerialGuard *)canonical_scope->authority->serial_guard)->mode
 				= CLUSTER_RECOVERY_SERIAL_ONLINE;
 	}
+}
+
+/* The actual native publisher/readback is tested against original shmem in
+ * test_cluster_xid_stripe_boot; this boundary verifies the production owner. */
+bool
+cluster_xid_stripe_replay_join_v1(uint64 floor, uint64 epoch, int slot, bool apply)
+{
+	UT_ASSERT(cold_join_test && canonical_scope != NULL && canonical_writer_depth == 1);
+	UT_ASSERT_EQ(floor, 4195104);
+	UT_ASSERT_EQ(epoch, 1);
+	UT_ASSERT_EQ(slot, 2);
+	if (!apply) {
+		cold_join_preflights++;
+		return cold_join_fault != 0 && cold_join_fault != 2;
+	}
+	cold_join_applies++;
+	if (cold_join_fault == 1)
+		return false;
+	if (cold_join_fault == 3)
+		control_fresh = false;
+	if (cold_join_fault == 4)
+		cold_join_fault = 2; /* Native state lost before its postread. */
+	if (cold_join_fault == 5)
+		pg_re_throw();
+	return true;
 }
 
 ClusterRemoteXactMutationV2
@@ -6904,13 +6933,13 @@ UT_TEST(test_stripe_records_retain_exact_control_obligation_without_pcm_target)
 
 UT_TEST(test_stripe_malformed_or_wrong_source_cannot_seal)
 {
-	for (unsigned fault = 0; fault < 11; fault++) {
+	for (unsigned fault = 0; fault < 14; fault++) {
 		RfSideOnlinePlanV1 *plan = space_online_plan(200);
 		xl_cluster_xid_stripe_join join = { 0 };
 		xl_cluster_xid_stripe_retire retire = { 9 };
 		uint8 payload[sizeof(join) + 1] = { 0 }, uuid[16];
-		uint8 info = fault >= 8 ? XLOG_CLUSTER_XID_STRIPE_RETIRE : XLOG_CLUSTER_XID_STRIPE_JOIN;
-		uint32 length = fault >= 8 ? sizeof(retire) : sizeof(join);
+		uint8 info = (fault >= 8 && fault <= 10) ? XLOG_CLUSTER_XID_STRIPE_RETIRE : XLOG_CLUSTER_XID_STRIPE_JOIN;
+		uint32 length = (fault >= 8 && fault <= 10) ? sizeof(retire) : sizeof(join);
 		FakeXactRecord fake;
 		RfPageOnlineRecordIdentityV1 identity;
 		RfDetachedRecordPlanV1 record;
@@ -6919,7 +6948,7 @@ UT_TEST(test_stripe_malformed_or_wrong_source_cannot_seal)
 		join.stride_mode_epoch = fault == 3 ? 0 : 7;
 		join.slot = fault == 4 ? -1 : fault == 5 ? CLUSTER_XID_STRIDE : fault == 6 ? 3 : 2;
 		retire.slot = fault == 8 ? -1 : fault == 9 ? CLUSTER_XID_STRIDE : 9;
-		memcpy(payload, fault >= 8 ? (const void *)&retire : (const void *)&join, length);
+		memcpy(payload, (fault >= 8 && fault <= 10) ? (const void *)&retire : (const void *)&join, length);
 		if (fault == 0 || fault == 10)
 			length--;
 		if (fault == 1)
@@ -6928,6 +6957,9 @@ UT_TEST(test_stripe_malformed_or_wrong_source_cannot_seal)
 			payload[offsetof(xl_cluster_xid_stripe_join, slot) + sizeof(int32)] = 1;
 		memset(uuid, 0x44, sizeof(uuid));
 		make_projection_record(&fake, RM_CLUSTER_XID_STRIPE_ID, info, payload, length);
+		if (fault == 11) fake.u.decoded.header.xl_xid = 818;
+		if (fault == 12) fake.u.decoded.toplevel_xid = 818;
+		if (fault == 13) fake.u.decoded.record_origin = 1;
 		identity = make_identity(&fake, uuid);
 		fake.u.decoded.max_block_id = -1;
 		record = make_projection_record_plan(&fake);
@@ -7611,6 +7643,120 @@ cold_control_owner(RfSideOnlineProductionOwnerV1 *owner,
 	UT_ASSERT(rf_side_online_production_owner_init_v1(owner, authority, control_authority_fresh, 19,
 													  true));
 	UT_ASSERT(rf_side_online_production_bind_undo_v1(owner, authority));
+}
+
+static RfSideOnlinePlanV1 *
+cold_join_plan(bool retire)
+{
+	RfSideOnlinePlanV1 *plan = space_online_plan(200);
+	xl_cluster_xid_stripe_join join = { 0 };
+	xl_cluster_xid_stripe_retire removal = { 2 };
+	FakeXactRecord fake;
+	uint8 uuid[16];
+	RfPageOnlineRecordIdentityV1 identity;
+	RfDetachedRecordPlanV1 record;
+
+	join.activated_floor_full = 4195104;
+	join.stride_mode_epoch = 1;
+	join.slot = 2;
+	memset(uuid, 0x44, sizeof(uuid));
+	make_projection_record(&fake, RM_CLUSTER_XID_STRIPE_ID,
+						   retire ? XLOG_CLUSTER_XID_STRIPE_RETIRE : XLOG_CLUSTER_XID_STRIPE_JOIN,
+						   retire ? (const void *)&removal : (const void *)&join,
+						   retire ? sizeof(removal) : sizeof(join));
+	identity = make_identity(&fake, uuid);
+	fake.u.decoded.max_block_id = -1;
+	record = make_projection_record_plan(&fake);
+	UT_ASSERT_EQ(rf_opcode_route_lookup_v1(RM_CLUSTER_XID_STRIPE_ID, identity.record.info,
+										 false, true, &record.route), RF_OPCODE_ROUTE_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &record, &identity),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	memset(fake.data, 0xa5, sizeof(join)); /* Only the immutable capture may execute. */
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	return plan;
+}
+
+UT_TEST(test_cold_join_uses_captured_native_owner_without_full_source_completion)
+{
+	RfSideOnlinePlanV1 *plan = cold_join_plan(false);
+	ClusterRecoveryDutyKey duty = canonical_duty;
+	ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
+	ClusterThreadRecoveryAuthorityV1 authority = { .duty = &duty, .serial_guard = &guard };
+	RfSideOnlineProductionOwnerV1 owner;
+	RfSideOnlineOperationV1 operation;
+
+	cold_control_reset();
+	cold_join_test = true;
+	cold_join_fault = -1;
+	cold_join_preflights = cold_join_applies = 0;
+	cold_control_owner(&owner, &authority, &duty);
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &operation));
+	UT_ASSERT_EQ(rf_side_online_production_preflight_v1(plan, &owner), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(cold_join_applies + control_observe_calls, 0);
+	for (unsigned repeat = 0; repeat < 2; repeat++) {
+		UT_ASSERT_EQ(rf_side_online_production_apply_record_v1(plan, 0, &operation.identity, &owner),
+					 RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(cold_join_applies, repeat + 1);
+		UT_ASSERT_EQ(control_observe_calls, repeat + 1);
+		UT_ASSERT(!owner.protected_set_complete && !owner.protected_set_active);
+		UT_ASSERT(owner.protected_plan == NULL && canonical_scope == NULL
+				  && canonical_writer_depth == 0);
+	}
+	UT_ASSERT(cold_join_preflights >= 5);
+	UT_ASSERT_EQ(canonical_writes + canonical_syncs + cold_cache_calls + cold_clog_applies
+				 + prepare_apply.terminal_projection_stores, 0);
+	cold_join_test = false;
+	cold_control_reset();
+	control_scope_test = cold_control_test = false;
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_cold_join_keeps_original_authority_retire_and_failure_boundaries)
+{
+	for (int fault = 0; fault < 15; fault++) {
+		RfSideOnlinePlanV1 *plan = cold_join_plan(fault == 14);
+		ClusterRecoveryDutyKey duty = canonical_duty;
+		ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
+		ClusterThreadRecoveryAuthorityV1 authority = { .duty = &duty, .serial_guard = &guard };
+		static RfSideOnlineProductionOwnerV1 owner;
+		RfSideOnlineOperationV1 operation;
+		volatile bool caught = false;
+		volatile RfPageProofDetailV1 result = RF_PAGE_PROOF_DETAIL_INTERNAL;
+
+		cold_control_reset();
+		cold_join_test = true;
+		cold_join_fault = fault < 6 ? fault : -1;
+		cold_join_preflights = cold_join_applies = 0;
+		cold_control_owner(&owner, &authority, &duty);
+		UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &operation));
+		if (fault == 6) standbyState = STANDBY_INITIALIZED;
+		if (fault == 7) guard.mode = CLUSTER_RECOVERY_SERIAL_ONLINE;
+		if (fault == 8) cold_clog_denied = true;
+		if (fault == 9) control_scope_fault = 7;
+		if (fault == 10) operation.identity.record.record_crc++;
+		if (fault == 11) control_fresh = false;
+		if (fault == 12) cold_control_drift = 1;
+		if (fault == 13) cluster_node_id = 2;
+		PG_TRY();
+		{
+			result = rf_side_online_production_apply_record_v1(plan, 0, &operation.identity, &owner);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 5);
+		UT_ASSERT(result != RF_PAGE_PROOF_DETAIL_OK && !owner.protected_set_complete);
+		UT_ASSERT_EQ(cold_join_applies, (fault == 1 || (fault >= 3 && fault <= 5) || fault == 12) ? 1 : 0);
+		UT_ASSERT_EQ(control_observe_calls, fault == 12 ? 1 : 0);
+		UT_ASSERT(owner.protected_plan == NULL && !owner.protected_set_active
+				  && canonical_scope == NULL && canonical_writer_depth == 0);
+		cold_join_test = false;
+		cold_control_reset();
+		control_scope_test = cold_control_test = false;
+		rf_side_online_plan_destroy_v1(&plan);
+	}
 }
 
 UT_TEST(test_cold_foreign_control_consumes_no_founder_or_transaction_effects)
@@ -12662,7 +12808,7 @@ UT_TEST(test_native_terminal_witness_rejects_unbound_plan)
 int
 main(void)
 {
-	UT_PLAN(189);
+	UT_PLAN(191);
 	UT_RUN(test_recovery_single_source_uses_complete_original_bound_origin);
 	UT_RUN(test_native_terminal_witness_uses_original_bound_plan_budget);
 	UT_RUN(test_native_terminal_witness_rejects_duplicate_physical_raw_terminal);
@@ -12775,6 +12921,8 @@ main(void)
 	UT_RUN(test_stripe_records_retain_exact_control_obligation_without_pcm_target);
 	UT_RUN(test_stripe_malformed_or_wrong_source_cannot_seal);
 	UT_RUN(test_native_controls_use_original_online_owner_before_any_side_effect);
+	UT_RUN(test_cold_join_uses_captured_native_owner_without_full_source_completion);
+	UT_RUN(test_cold_join_keeps_original_authority_retire_and_failure_boundaries);
 	UT_RUN(test_cold_foreign_control_consumes_no_founder_or_transaction_effects);
 	UT_RUN(test_cold_foreign_controls_keep_original_role_source_and_effect_gates);
 	UT_RUN(test_cold_control_rechecks_context_after_observation_and_unwinds_error);

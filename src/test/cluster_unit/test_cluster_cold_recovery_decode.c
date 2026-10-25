@@ -41,6 +41,8 @@
 #include "cluster/cluster_page_detached.h"
 #include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_space_reservation.h"
+#include "cluster/cluster_xid_stripe.h"
+#include "cluster/cluster_xid_stripe_xlog.h"
 #include "replication/message.h"
 #include "storage/standbydefs.h"
 
@@ -484,7 +486,6 @@ UT_TEST(test_storage_lifecycle_classification)
 				  { RM_RELMAP_ID, 0x00, CLUSTER_COLD_RECORD_STRUCTURAL },
 				  { RM_REPLORIGIN_ID, 0x00, CLUSTER_COLD_RECORD_STRUCTURAL },
 				  { RM_HEAP2_ID, XLOG_HEAP2_REWRITE, CLUSTER_COLD_RECORD_STRUCTURAL },
-				  { RM_CLUSTER_XID_STRIPE_ID, 0x00, CLUSTER_COLD_RECORD_STRUCTURAL },
 				  { RM_CLUSTER_XID_STRIPE_ID, 0x10, CLUSTER_COLD_RECORD_STRUCTURAL },
 				  { RM_XLOG_ID, XLOG_NEXTOID, 0 },
 				  { RM_STANDBY_ID, XLOG_RUNNING_XACTS, 0 } };
@@ -1111,10 +1112,70 @@ UT_TEST(test_detached_capture_borrows_only_a_complete_decode)
 	cluster_cold_decoded_release_v1(&out);
 }
 
+static void
+stripe_join_record(FakeRecord *r, unsigned slot)
+{
+	xl_cluster_xid_stripe_join join = { 0 };
+	fake_record(r, RM_CLUSTER_XID_STRIPE_ID, XLOG_CLUSTER_XID_STRIPE_JOIN, 0);
+	join.activated_floor_full = 4195104;
+	join.stride_mode_epoch = 1;
+	join.slot = slot;
+	memcpy(r->data, &join, sizeof(join));
+	r->storage.decoded.main_data_len = sizeof(join);
+	r->reader.cluster_expected_thread_id = slot + 1;
+	preflight_plan.route.codec_id = RF_ROUTE_CODEC_SIDE_XID_STRIPE_SHMEM;
+}
+
+UT_TEST(test_stripe_join_uses_real_native_or_foreign_consumer)
+{
+	for (unsigned slot = 0; slot < CLUSTER_XID_STRIDE; slot++) {
+		FakeRecord r;
+		ClusterColdDecodedV1 out = { 0 };
+		stripe_join_record(&r, slot);
+		for (unsigned foreign = 0; foreign < 2; foreign++) {
+			UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&r.reader, 99, UUID, false,
+				foreign != 0, &out), CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(out.record.record_flags, foreign ? CLUSTER_COLD_RECORD_FOREIGN_SIDE : 0);
+			UT_ASSERT_EQ(out.record.stripe_floor_full, 4195104);
+			UT_ASSERT_EQ(out.record.stripe_epoch, 1);
+			UT_ASSERT_EQ(out.effects.required, CLUSTER_COLD_EFFECT_RECORD);
+			UT_ASSERT_EQ(out.effects.native_apply, out.effects.required);
+			UT_ASSERT_EQ(out.effects.no_effect | out.effects.refused, 0);
+		}
+	}
+}
+
+UT_TEST(test_stripe_join_rejects_incomplete_or_unbound_original_frame)
+{
+	for (unsigned fault = 0; fault < 16; fault++) {
+		FakeRecord r;
+		stripe_join_record(&r, 0);
+		if (fault == 0) r.storage.decoded.main_data_len--;
+		if (fault == 1) r.storage.decoded.main_data_len++;
+		if (fault == 2) r.storage.decoded.main_data = NULL;
+		if (fault == 3) memset(r.data, 0, sizeof(uint64));
+		if (fault == 4) memset(r.data + sizeof(uint64), 0, sizeof(uint64));
+		if (fault == 5) r.data[offsetof(xl_cluster_xid_stripe_join, slot)] = CLUSTER_XID_STRIDE;
+		if (fault == 6) memset(r.data + offsetof(xl_cluster_xid_stripe_join, slot), 255, sizeof(int32));
+		if (fault == 7) r.reader.cluster_expected_thread_id++;
+		if (fault == 8) r.reader.cluster_expected_thread_id = 0;
+		if (fault == 9) r.data[sizeof(xl_cluster_xid_stripe_join) - 1] = 1;
+		if (fault == 10) r.storage.decoded.header.xl_info = XLR_SPECIAL_REL_UPDATE;
+		if (fault == 11) r.storage.decoded.header.xl_xid = 3;
+		if (fault == 12) r.storage.decoded.toplevel_xid = 3;
+		if (fault == 13) r.storage.decoded.record_origin = 1;
+		if (fault == 14) r.storage.decoded.has_page_version_edge = true;
+		if (fault == 15) r.storage.decoded.max_block_id = 0;
+		UT_ASSERT(standby_refused(&r));
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(21);
+	UT_RUN(test_stripe_join_uses_real_native_or_foreign_consumer);
+	UT_RUN(test_stripe_join_rejects_incomplete_or_unbound_original_frame);
 	UT_RUN(test_complete_standby_payloads_keep_original_effect_routes);
 	UT_RUN(test_standby_lock_bad_payload_never_gets_effect_route);
 	UT_RUN(test_running_xacts_bad_payload_never_gets_effect_route);

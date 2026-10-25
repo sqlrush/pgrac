@@ -880,20 +880,37 @@ rf_side_online_standby_record_shape_v1(XLogReaderState *record)
 /* Stripe knowledge belongs to its native owner, not a PCM page. JOIN is
  * emitted by the joining source; RETIRE is emitted by the removal coordinator
  * and can name another slot. Neither shape alone authorizes replay. */
+bool
+rf_side_online_stripe_join_shape_v1(const uint8 *data, uint32 length, uint16 origin_thread,
+									 uint64 *floor, uint64 *epoch)
+{
+	xl_cluster_xid_stripe_join join;
+	Size fields_end = offsetof(xl_cluster_xid_stripe_join, slot) + sizeof(join.slot);
+
+	if (floor == NULL || epoch == NULL)
+		return false;
+	*floor = *epoch = 0;
+	if (data == NULL || length != sizeof(join)
+		|| side_bytes_nonzero(data + fields_end, sizeof(join) - fields_end))
+		return false;
+	memcpy(&join, data, sizeof(join));
+	if (join.activated_floor_full == 0 || join.stride_mode_epoch == 0 || join.slot < 0
+		|| join.slot >= CLUSTER_XID_STRIDE || origin_thread != (uint16)(join.slot + 1))
+		return false;
+	*floor = join.activated_floor_full;
+	*epoch = join.stride_mode_epoch;
+	return true;
+}
+
 static bool
 side_native_stripe_valid(const uint8 *data, uint32 length, uint8 info,
 						 const RfPageOnlineRecordIdentityV1 *identity)
 {
 	if (info == XLOG_CLUSTER_XID_STRIPE_JOIN) {
-		xl_cluster_xid_stripe_join join;
-		Size fields_end = offsetof(xl_cluster_xid_stripe_join, slot) + sizeof(join.slot);
-		if (length != sizeof(join)
-			|| side_bytes_nonzero(data + fields_end, sizeof(join) - fields_end))
-			return false;
-		memcpy(&join, data, sizeof(join));
-		return join.activated_floor_full != 0 && join.stride_mode_epoch != 0 && join.slot >= 0
-			   && join.slot < CLUSTER_XID_STRIDE
-			   && identity->record.origin_thread == (uint16)(join.slot + 1);
+		uint64 floor, epoch;
+
+		return rf_side_online_stripe_join_shape_v1(data, length, identity->record.origin_thread,
+												  &floor, &epoch);
 	}
 	if (info == XLOG_CLUSTER_XID_STRIPE_RETIRE) {
 		xl_cluster_xid_stripe_retire retire;
@@ -932,8 +949,14 @@ side_native_control_valid(XLogReaderState *reader, const RfPageOnlineRecordIdent
 	}
 	if (XLogRecGetRmid(reader) == RM_STANDBY_ID)
 		return side_native_standby_valid(data, length, info);
-	if (XLogRecGetRmid(reader) == RM_CLUSTER_XID_STRIPE_ID)
+	if (XLogRecGetRmid(reader) == RM_CLUSTER_XID_STRIPE_ID) {
+		if (info == XLOG_CLUSTER_XID_STRIPE_JOIN
+			&& (TransactionIdIsValid(XLogRecGetXid(reader))
+				|| TransactionIdIsValid(reader->record->toplevel_xid)
+				|| XLogRecGetOrigin(reader) != InvalidRepOriginId))
+			return false;
 		return side_native_stripe_valid(data, length, info, identity);
+	}
 	if (XLogRecGetRmid(reader) != RM_XLOG_ID)
 		return false;
 	switch (info) {

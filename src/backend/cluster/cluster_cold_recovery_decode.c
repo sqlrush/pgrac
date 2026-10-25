@@ -48,6 +48,7 @@
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_xid_stripe_xlog.h"
 #include "cluster/cluster_page_detached.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_side_undo.h"
@@ -603,9 +604,27 @@ cold_record_flags(XLogReaderState *reader, uint64 system_identifier, const uint8
 	case RM_TBLSPC_ID:
 	case RM_RELMAP_ID:
 	case RM_REPLORIGIN_ID:
+		*flags = CLUSTER_COLD_RECORD_STRUCTURAL;
+		return CLUSTER_COLD_OK;
 	case RM_CLUSTER_XID_STRIPE_ID:
-		/* Stripe JOIN/RETIRE are cluster-wide facts whose order across
-		 * generations a per-participant drain cannot keep. */
+		if (info == XLOG_CLUSTER_XID_STRIPE_JOIN) {
+			/* JOINs commute only within one activation. The readonly plan
+			 * folds this exact tuple over every source, including history,
+			 * before the original native or foreign SIDE publisher runs. */
+			if (XLogRecGetInfo(reader) != XLOG_CLUSTER_XID_STRIPE_JOIN
+				|| XLogRecHasAnyBlockRefs(reader) || reader->record->has_page_version_edge
+				|| TransactionIdIsValid(XLogRecGetXid(reader))
+				|| TransactionIdIsValid(reader->record->toplevel_xid)
+				|| XLogRecGetOrigin(reader) != InvalidRepOriginId
+				|| !rf_side_online_stripe_join_shape_v1(
+					(const uint8 *)XLogRecGetData(reader), XLogRecGetDataLen(reader),
+					reader->cluster_expected_thread_id, &out->record.stripe_floor_full,
+					&out->record.stripe_epoch))
+				return CLUSTER_COLD_COMPONENT_INVALID;
+			return CLUSTER_COLD_OK;
+		}
+		/* RETIRE may name another source's slot. Its cross-source order
+		 * still needs a lifecycle owner, never a per-source no-op. */
 		*flags = CLUSTER_COLD_RECORD_STRUCTURAL;
 		return CLUSTER_COLD_OK;
 	default:
@@ -666,6 +685,9 @@ cold_foreign_side(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan,
 				 && (XLogRecGetInfo(reader) & XLR_INFO_MASK) == XLR_SPECIAL_REL_UPDATE))
 		|| plan->route.record_owner != RF_ROUTE_OWNER_SIDE_TYPED)
 		return false;
+	if (XLogRecGetRmid(reader) == RM_CLUSTER_XID_STRIPE_ID)
+		return info == XLOG_CLUSTER_XID_STRIPE_JOIN
+			   && plan->route.codec_id == RF_ROUTE_CODEC_SIDE_XID_STRIPE_SHMEM;
 	if (XLogRecGetRmid(reader) == RM_CLUSTER_UNDO_ID) {
 		ClusterUndoDecoded undo;
 

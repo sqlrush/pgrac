@@ -10,6 +10,7 @@
 #include "access/clog.h"
 #include "cluster/cluster_multixact.h"
 #include "cluster/cluster_scn.h"
+#include "cluster/cluster_xid_stripe_boot.h"
 #include "cluster/cluster_side_online_owner.h"
 #include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_undo_smgr.h"
@@ -225,6 +226,15 @@ cluster_clog_native_recovery_verify_v1(int origin pg_attribute_unused(),
 	return false;
 }
 
+bool
+cluster_xid_stripe_replay_join_v1(uint64 floor pg_attribute_unused(),
+								 uint64 epoch pg_attribute_unused(),
+								 int slot pg_attribute_unused(), bool apply pg_attribute_unused())
+{
+	UT_ASSERT(false); /* This fixture contains TT records only. */
+	return false;
+}
+
 void
 cluster_scn_recovery_replay_observe(SCN scn pg_attribute_unused())
 {
@@ -335,6 +345,36 @@ rf_side_xact_apply_cold_abort_completion_v1(
 	void *arg pg_attribute_unused(), RfSideXactVerifyAbortCoverageV1 verify pg_attribute_unused())
 {
 	UT_ASSERT(false); /* Full payload/owner integration is in test_cluster_side_xact. */
+	return RF_SIDE_XACT_APPLY_BLOCKED;
+}
+
+bool
+rf_side_online_stripe_join_shape_v1(const uint8 *data pg_attribute_unused(),
+									 uint32 length pg_attribute_unused(),
+									 uint16 origin pg_attribute_unused(),
+									 uint64 *floor pg_attribute_unused(),
+									 uint64 *epoch pg_attribute_unused())
+{
+	UT_ASSERT(false); /* Native control integration is in test_cluster_side_xact. */
+	return false;
+}
+
+bool
+rf_side_xact_cold_abort_clog_v1(const RfSideXactOperationV1 *op pg_attribute_unused(),
+								 const uint8 *payload pg_attribute_unused(),
+								 uint32 length pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+RfSideXactApplyResultV1
+rf_side_xact_apply_cold_abort_delete_completion_v1(
+	const RfSideOnlinePlanV1 *plan pg_attribute_unused(), uint32 index pg_attribute_unused(),
+	Size owner_bytes pg_attribute_unused(), void *arg pg_attribute_unused(),
+	RfSideXactVerifyAbortCoverageV1 verify pg_attribute_unused())
+{
+	UT_ASSERT(false);
 	return RF_SIDE_XACT_APPLY_BLOCKED;
 }
 

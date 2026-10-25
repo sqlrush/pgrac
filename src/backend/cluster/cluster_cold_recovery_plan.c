@@ -43,6 +43,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "cluster/cluster_cold_recovery_plan_internal.h"
+#include "cluster/cluster_xid_stripe_xlog.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 
 static int
@@ -529,6 +530,27 @@ cluster_cold_plan_feed_v1(ClusterColdPlanV1 *plan, uint32 participant,
 			&& (record->record_flags & CLUSTER_COLD_RECORD_SIDE_UNOWNED) != 0
 			&& record->end_rec_ptr > owner->cut.native_redo)
 			detail = CLUSTER_COLD_SIDE_OWNER_MISSING;
+		/* Every JOIN, including retained history, must agree before any
+		 * source can replay. No numeric epoch selection or SCN ordering can
+		 * make incompatible activations commute. Other families carry none. */
+		if (detail == CLUSTER_COLD_OK) {
+			if (record->rmid == RM_CLUSTER_XID_STRIPE_ID
+				&& record->info == XLOG_CLUSTER_XID_STRIPE_JOIN) {
+				if (record->stripe_floor_full == 0 || record->stripe_epoch == 0
+					|| record->component_count != 0 || record->space_count != 0
+					|| (record->record_flags != 0
+						&& record->record_flags != CLUSTER_COLD_RECORD_FOREIGN_SIDE)
+					|| (plan->stripe_floor_full != 0
+						&& (record->stripe_floor_full != plan->stripe_floor_full
+							|| record->stripe_epoch != plan->stripe_epoch)))
+					detail = CLUSTER_COLD_COMPONENT_INVALID;
+				else {
+					plan->stripe_floor_full = record->stripe_floor_full;
+					plan->stripe_epoch = record->stripe_epoch;
+				}
+			} else if (record->stripe_floor_full != 0 || record->stripe_epoch != 0)
+				detail = CLUSTER_COLD_COMPONENT_INVALID;
+		}
 		if (detail == CLUSTER_COLD_OK)
 			detail = components_validate(plan, record);
 		if (detail == CLUSTER_COLD_OK && !space_ops_valid(record))

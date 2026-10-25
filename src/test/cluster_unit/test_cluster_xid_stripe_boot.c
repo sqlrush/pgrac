@@ -259,10 +259,54 @@ UT_TEST(test_disk_state_no_pgproc_busy_is_unknown)
 	UT_ASSERT_EQ(cluster_xid_stripe_disk_state(), CLUSTER_XID_STRIPE_DISK_PUBLISHED);
 }
 
+UT_TEST(test_cold_join_preflight_and_native_readback)
+{
+	reset_boot();
+	for (int slot = 0; slot < CLUSTER_XID_STRIDE; slot++) {
+		uint32 before = pg_atomic_read_u32(&boot.replay_active_bitmap);
+		UT_ASSERT(cluster_xid_stripe_replay_join_v1(4195104, 1, slot, false));
+		UT_ASSERT_EQ(pg_atomic_read_u32(&boot.replay_active_bitmap), before);
+		UT_ASSERT(cluster_xid_stripe_replay_join_v1(4195104, 1, slot, true));
+		UT_ASSERT_EQ(pg_atomic_read_u64(&boot.replay_floor_full), 4195104);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&boot.replay_epoch), 1);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&boot.replay_active_bitmap), before | (1u << slot));
+		UT_ASSERT(cluster_xid_stripe_replay_join_v1(4195104, 1, slot, true));
+	}
+	UT_ASSERT_EQ(pg_atomic_read_u32(&boot.replay_active_bitmap),
+		(uint32)((UINT64_C(1) << CLUSTER_XID_STRIDE) - 1));
+	UT_ASSERT_EQ(wal_records + wal_begins, 0);
+}
+
+UT_TEST(test_cold_join_refuses_missing_state_and_conflicting_tuple_without_mutation)
+{
+	for (unsigned fault = 0; fault < 10; fault++) {
+		ClusterXidStripeBootShmem before;
+		uint64 floor = 4195104, epoch = 1;
+		int slot = 0;
+		reset_boot();
+		UT_ASSERT(cluster_xid_stripe_replay_join_v1(floor, epoch, slot, true));
+		if (fault == 7 || fault == 9) pg_atomic_write_u64(&boot.replay_floor_full, 0);
+		if (fault == 8 || fault == 9) pg_atomic_write_u64(&boot.replay_epoch, 0);
+		before = boot;
+		if (fault == 0) StripeBootShmem = NULL;
+		if (fault == 1) floor = 0;
+		if (fault == 2) epoch = 0;
+		if (fault == 3) slot = -1;
+		if (fault == 4) slot = CLUSTER_XID_STRIDE;
+		if (fault == 5) floor++;
+		if (fault == 6) epoch++;
+		UT_ASSERT(!cluster_xid_stripe_replay_join_v1(floor, epoch, slot, false));
+		UT_ASSERT(!cluster_xid_stripe_replay_join_v1(floor, epoch, slot, true));
+		UT_ASSERT(memcmp(&boot, &before, sizeof(boot)) == 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(8);
+	UT_RUN(test_cold_join_preflight_and_native_readback);
+	UT_RUN(test_cold_join_refuses_missing_state_and_conflicting_tuple_without_mutation);
 	UT_RUN(test_disk_state_no_pgproc_busy_is_unknown);
 	UT_RUN(test_recovery_holds_every_activation_state_without_side_effects);
 	UT_RUN(test_seed_samples_recovery_end_not_the_pre_recovery_counter);
