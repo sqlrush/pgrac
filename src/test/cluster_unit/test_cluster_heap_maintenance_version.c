@@ -7217,10 +7217,451 @@ UT_TEST(test_census_shared_origin_producer_then_complete_walk_continues_native_w
 	}
 }
 
+/* The complete original publisher is used below. Only physical lock scheduling
+ * and the external object-admission predicates remain explicit controlled leaves. */
+static LWLock *participant_lock_stack[CLUSTER_CTRC_CLEANER_WORKERS + 2];
+static LWLockMode participant_lock_modes[CLUSTER_CTRC_CLEANER_WORKERS + 2];
+static unsigned participant_lock_depth, participant_lock_acquires, participant_lock_releases;
+static unsigned participant_origin_guards, participant_guard_publications;
+static unsigned participant_admission_samples, participant_admission_current_reads;
+static bool participant_admission_sample_ok = true, participant_admission_current_ok = true;
+static ClusterCtrcReceiptHandle *participant_watched_handle;
+static ClusterCtrcParticipantIdentity participant_identity;
+static ClusterCtrcPublicationIdV1 participant_publication;
+static ClusterCtrcTargetV1 participant_target;
+static ClusterCtrcPreparePath participant_prepare_path;
+
+static bool
+participant_publisher_lock_acquire(LWLock *lock, LWLockMode mode)
+{
+	worker_pass_assert_unlocked(); UT_ASSERT(!census_origin_lock_held);
+	UT_ASSERT(participant_lock_depth < lengthof(participant_lock_stack));
+	if (lock == &CtrcShared->origin_lock) {
+		UT_ASSERT_EQ(participant_lock_depth, 0);
+		UT_ASSERT(mode == LW_SHARED || mode == LW_EXCLUSIVE);
+		if (mode == LW_SHARED) participant_origin_guards++;
+	} else if (lock == &CtrcShared->receipt_lock) {
+		UT_ASSERT(mode == LW_EXCLUSIVE && participant_lock_depth >= 1);
+		UT_ASSERT(participant_lock_stack[participant_lock_depth - 1] != &CtrcShared->origin_lock);
+	} else {
+		unsigned shard;
+		for (shard = 0; shard < CLUSTER_CTRC_CLEANER_WORKERS; shard++)
+			if (lock == &CtrcShared->participant_locks[shard].lock) break;
+		UT_ASSERT(shard < CLUSTER_CTRC_CLEANER_WORKERS && mode == LW_EXCLUSIVE);
+		if (participant_lock_depth != 0 && participant_lock_stack[participant_lock_depth - 1] != &CtrcShared->origin_lock) {
+			unsigned previous;
+			for (previous = 0; previous < CLUSTER_CTRC_CLEANER_WORKERS; previous++)
+				if (participant_lock_stack[participant_lock_depth - 1] == &CtrcShared->participant_locks[previous].lock) break;
+			UT_ASSERT(previous < shard);
+		}
+	}
+	participant_lock_stack[participant_lock_depth] = lock;
+	participant_lock_modes[participant_lock_depth++] = mode; participant_lock_acquires++;
+	return true;
+}
+
+static void
+participant_publisher_lock_release(LWLock *lock)
+{
+	UT_ASSERT(participant_lock_depth != 0 && participant_lock_stack[participant_lock_depth - 1] == lock);
+	if (lock == &CtrcShared->origin_lock && participant_lock_modes[participant_lock_depth - 1] == LW_SHARED
+		&& participant_watched_handle != NULL && participant_watched_handle->valid) {
+		const ClusterCtrcReceiptHandle *handle = participant_watched_handle;
+		UT_ASSERT_EQ(participant_lock_depth, 1);
+		UT_ASSERT(handle->participant->state == CTRC_PARTICIPANT_OPEN);
+		UT_ASSERT_EQ(handle->receipt->state, CTRC_RECEIPT_PREPARED);
+		UT_ASSERT(FullTransactionIdEquals(handle->original_full_xid, handle->participant->original_full_xid));
+		participant_guard_publications++;
+	}
+	participant_lock_depth--; participant_lock_releases++;
+}
+
+static bool
+participant_object_admission_begin(RelFileLocator locator, ClusterKoPeerAdmissionV3 *admission)
+{
+	worker_pass_assert_unlocked(); UT_ASSERT_EQ(participant_lock_depth, 0);
+	UT_ASSERT(locator.spcOid != InvalidOid && admission != NULL);
+	memset(admission, 0, sizeof(*admission)); participant_admission_samples++;
+	return participant_admission_sample_ok;
+}
+
+static bool
+participant_object_admission_current(const ClusterKoPeerAdmissionV3 *admission, RelFileLocator locator)
+{
+	UT_ASSERT(participant_lock_depth >= 2 && participant_lock_stack[participant_lock_depth - 1] == &CtrcShared->receipt_lock);
+	UT_ASSERT(admission != NULL && locator.spcOid != InvalidOid); participant_admission_current_reads++;
+	return participant_admission_current_ok;
+}
+
+static bool
+participant_object_read_current(const ClusterKoPeerAdmissionV3 *admission, RelFileLocator locator,
+							   ForkNumber fork, BlockNumber block)
+{
+	(void)fork; (void)block;
+	return participant_object_admission_current(admission, locator);
+}
+
+#define cluster_ctrc_shmem_ready original_census_shmem_ready
+#define cluster_ctrc_stat_bump original_census_stat_bump
+#define ctrc_origin_index original_census_origin_index
+#define LWLockAcquire participant_publisher_lock_acquire
+#define LWLockRelease participant_publisher_lock_release
+#define cluster_ko_peer_admission_begin_v3 participant_object_admission_begin
+#define cluster_ko_peer_admission_current_v3 participant_object_admission_current
+#define cluster_ko_peer_read_current_v3 participant_object_read_current
+#define cluster_ctrc_origin_has_exact_touch original_participant_origin_has_exact_touch
+#define cluster_ctrc_origin_record_touched original_participant_origin_record_touched
+#define cluster_ctrc_participant_index_compute original_participant_participant_index_compute
+#define cluster_ctrc_participant_open original_participant_participant_open
+#define cluster_ctrc_receipt_prepare_shared_observed original_participant_receipt_prepare_shared_observed
+#define ctrc_allocate_journal_sequence original_participant_allocate_journal_sequence
+#define ctrc_origin_protects_local_receipt_locked original_participant_origin_protects_local_receipt_locked
+#define ctrc_participant_identity_valid original_participant_participant_identity_valid
+#define ctrc_participant_index original_participant_participant_index
+#define ctrc_participant_locks_acquire original_participant_participant_locks_acquire
+#define ctrc_participant_locks_release original_participant_participant_locks_release
+#define ctrc_participant_receipt_heads original_participant_participant_receipt_heads
+#define ctrc_publication_prepare_valid original_participant_publication_prepare_valid
+#define ctrc_publication_request_equal original_participant_publication_request_equal
+#define ctrc_receipt_chain_exact_locked original_participant_receipt_chain_exact_locked
+#define ctrc_receipt_entries original_participant_receipt_entries
+#define ctrc_receipt_handle_fill original_participant_receipt_handle_fill
+#define ctrc_receipt_hash_bytes original_participant_receipt_hash_bytes
+#define ctrc_receipt_links original_participant_receipt_links
+#define ctrc_receipt_prepare_existing_locked original_participant_receipt_prepare_existing_locked
+#define ctrc_receipt_prepare_locators_valid_locked original_participant_receipt_prepare_locators_valid_locked
+#define ctrc_receipt_prepare_refused original_participant_receipt_prepare_refused
+#define ctrc_receipt_prepare_shared_internal original_participant_receipt_prepare_shared_internal
+#define ctrc_receipt_prepare_table_observed original_participant_receipt_prepare_table_observed
+#define ctrc_receipt_prepare_with_sequence original_participant_receipt_prepare_with_sequence
+#define ctrc_receipt_probe_hash original_participant_receipt_probe_hash
+#define ctrc_receipt_probe_states original_participant_receipt_probe_states
+#define ctrc_receipt_publication_matches original_participant_receipt_publication_matches
+#define ctrc_relation_namespace_valid original_participant_relation_namespace_valid
+#define ctrc_target_pending_itl_valid original_participant_target_pending_itl_valid
+#define ctrc_target_pending_offnum_valid original_participant_target_pending_offnum_valid
+#define ctrc_target_predecessor_version_valid original_participant_target_predecessor_version_valid
+#include "test_cluster_heap_ctrc_participant.inc"
+#undef ctrc_target_predecessor_version_valid
+#undef ctrc_target_pending_offnum_valid
+#undef ctrc_target_pending_itl_valid
+#undef ctrc_relation_namespace_valid
+#undef ctrc_receipt_publication_matches
+#undef ctrc_receipt_probe_states
+#undef ctrc_receipt_probe_hash
+#undef ctrc_receipt_prepare_with_sequence
+#undef ctrc_receipt_prepare_table_observed
+#undef ctrc_receipt_prepare_shared_internal
+#undef ctrc_receipt_prepare_refused
+#undef ctrc_receipt_prepare_locators_valid_locked
+#undef ctrc_receipt_prepare_existing_locked
+#undef ctrc_receipt_links
+#undef ctrc_receipt_hash_bytes
+#undef ctrc_receipt_handle_fill
+#undef ctrc_receipt_entries
+#undef ctrc_receipt_chain_exact_locked
+#undef ctrc_publication_request_equal
+#undef ctrc_publication_prepare_valid
+#undef ctrc_participant_receipt_heads
+#undef ctrc_participant_locks_release
+#undef ctrc_participant_locks_acquire
+#undef ctrc_participant_index
+#undef ctrc_participant_identity_valid
+#undef ctrc_origin_protects_local_receipt_locked
+#undef ctrc_allocate_journal_sequence
+#undef cluster_ctrc_receipt_prepare_shared_observed
+#undef cluster_ctrc_participant_open
+#undef cluster_ctrc_participant_index_compute
+#undef cluster_ctrc_origin_record_touched
+#undef cluster_ctrc_origin_has_exact_touch
+#undef cluster_ko_peer_read_current_v3
+#undef cluster_ko_peer_admission_current_v3
+#undef cluster_ko_peer_admission_begin_v3
+#undef LWLockRelease
+#undef LWLockAcquire
+#undef ctrc_origin_index
+#undef cluster_ctrc_stat_bump
+#undef cluster_ctrc_shmem_ready
+
+static void
+participant_publisher_inputs(const ClusterCtrcTxnKeyV1 *key, uint32 grant)
+{
+	UT_ASSERT_EQ(participant_lock_depth, 0);
+	participant_lock_acquires = participant_lock_releases = participant_origin_guards = participant_guard_publications = 0;
+	participant_admission_samples = participant_admission_current_reads = 0;
+	participant_admission_sample_ok = participant_admission_current_ok = true;
+	participant_watched_handle = NULL;
+	memset(&participant_identity, 0, sizeof(participant_identity));
+	participant_identity.node_id = (uint16)cluster_node_id;
+	participant_identity.boot_incarnation = key->origin_boot_incarnation;
+	participant_identity.formation_epoch = key->formation_epoch;
+	participant_identity.admission_record_generation = key->admission_record_generation;
+	participant_identity.capability_record_generation = 1;
+	memset(&participant_publication, 0, sizeof(participant_publication));
+	participant_publication.requester_node_id = participant_identity.node_id;
+	participant_publication.requester_boot_incarnation = participant_identity.boot_incarnation;
+	participant_publication.capability_record_generation = participant_identity.capability_record_generation;
+	participant_publication.requester_backend_id = 11;
+	participant_publication.wire_request_id = 101; participant_publication.operation_id = 201;
+	participant_publication.attempt_generation = 1; participant_publication.member_ordinal = UINT16_MAX;
+	participant_publication.reference_kind = CTRC_REF_HEAP_ITL_UBA;
+	participant_publication.target_kind = CTRC_TARGET_PAGE_PENDING_ITL_SLOT;
+	participant_publication.grant_generation = grant;
+	memset(&participant_target, 0, sizeof(participant_target));
+	participant_target.kind = CTRC_TARGET_PAGE_PENDING_ITL_SLOT;
+	participant_target.spc_oid = 1663; participant_target.db_oid = 5; participant_target.rel_number = 9001;
+	participant_target.block_number = 44;
+	participant_target.predecessor_page_lsn_origin_node_id = CLUSTER_CTRC_PAGE_LSN_ORIGIN_INVALID;
+	participant_target.publication_own_generation = 17; participant_target.publication_acquisition_epoch = 19;
+	participant_target.relation_persistence = RELPERSISTENCE_PERMANENT;
+	participant_target.needs_wal = true; participant_target.page_operation_kind = 1;
+}
+
+static ClusterCtrcPrepareResult
+participant_publisher_prepare(const ClusterCtrcTxnKeyV1 *key, uint32 grant, ClusterCtrcReceiptHandle *handle)
+{
+	ClusterCtrcPrepareResult result;
+	participant_watched_handle = handle;
+	result = original_participant_receipt_prepare_shared_observed(key, &participant_identity, grant,
+		&participant_publication, &participant_target, handle, &participant_prepare_path);
+	participant_watched_handle = NULL;
+	UT_ASSERT_EQ(participant_lock_depth, 0); UT_ASSERT_EQ(participant_lock_acquires, participant_lock_releases);
+	return result;
+}
+
+static void
+participant_publisher_touch(const ClusterCtrcTxnKeyV1 *key, uint32 grant)
+{
+	uint64 index; uint32 touched_grant;
+	UT_ASSERT(original_census_origin_index(key, &index));
+	census_origin_lock_acquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	UT_ASSERT_EQ(original_participant_origin_record_touched(&ctrc_origin_entries()[index], &participant_identity,
+		CTRC_PROOF_ACTIVE, &touched_grant), CLUSTER_CTRC_TOUCH_RECORDED);
+	UT_ASSERT_EQ(touched_grant, grant);
+	census_origin_lock_release(&CtrcShared->origin_lock);
+}
+
+static ClusterCtrcPrepareResult
+census_participant_prepare_from_origin(const ClusterCtrcTxnKeyV1 *key, uint32 grant, ClusterCtrcReceiptHandle *handle)
+{
+	participant_publisher_inputs(key, grant); participant_publisher_touch(key, grant);
+	return participant_publisher_prepare(key, grant, handle);
+}
+
+UT_TEST(test_census_participant_publisher_retains_original_origin_full_identity)
+{
+	QualifiedXminFixture f; CensusRuntimeAllocation runtime;
+	ClusterCtrcTxnKeyV1 key; ClusterCtrcOriginReservation reservation; ClusterCtrcReceiptHandle handle;
+	FullTransactionId full = FullTransactionIdFromEpochAndXid(1, 100); uint32 grant;
+	qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI); fixture_release_original_writer();
+	census_runtime_initialize_requested = true;
+	if (!census_full_layout_setup(&runtime, 2)) { UT_ASSERT(false); return; }
+	key = census_key_for_full(&f.cohort.admission_fence, full);
+	UT_ASSERT_EQ(census_origin_reserve_from_backend(&key, full, &reservation), CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	UT_ASSERT(original_census_origin_open_reserved(&reservation, &grant));
+	UT_ASSERT_EQ(census_participant_prepare_from_origin(&key, grant, &handle), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT_EQ(ctrc_participant_entries()[0].state, CTRC_PARTICIPANT_OPEN);
+	UT_ASSERT(FullTransactionIdEquals(ctrc_participant_entries()[0].original_full_xid, full));
+	census_full_layout_release(&runtime);
+}
+
+
+UT_TEST(test_census_participant_original_publish_and_duplicate_keep_chain_and_full_identity)
+{
+	QualifiedXminFixture f; CensusRuntimeAllocation runtime;
+	ClusterCtrcTxnKeyV1 key; ClusterCtrcOriginReservation reservation;
+	ClusterCtrcReceiptHandle handle, replay; ClusterCtrcParticipantEntry before; ClusterCtrcReceipt receipt_before;
+	FullTransactionId full = FullTransactionIdFromEpochAndXid(1, 100); uint32 grant;
+	qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI); fixture_release_original_writer();
+	census_runtime_initialize_requested = true;
+	if (!census_full_layout_setup(&runtime, 2)) { UT_ASSERT(false); return; }
+	key = census_key_for_full(&f.cohort.admission_fence, full); key.segment_id = 2; key.slot_offset = 3;
+	UT_ASSERT_EQ(census_origin_reserve_from_backend(&key, full, &reservation), CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	UT_ASSERT(original_census_origin_open_reserved(&reservation, &grant));
+	UT_ASSERT_EQ(census_participant_prepare_from_origin(&key, grant, &handle), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(handle.valid && FullTransactionIdEquals(handle.original_full_xid, full));
+	UT_ASSERT(handle.participant == &ctrc_participant_entries()[handle.participant_index]);
+	UT_ASSERT(handle.participant_index != 0); UT_ASSERT(ctrc_bytes_zero(&ctrc_participant_entries()[0], sizeof(before)));
+	UT_ASSERT_EQ(handle.participant->receipt_count, 1); UT_ASSERT_EQ(handle.participant->prepared_count, 1);
+	UT_ASSERT_EQ(original_participant_participant_receipt_heads()[handle.participant_index], handle.receipt_index + 1);
+	original_participant_participant_locks_acquire(ctrc_participant_lock_mask(handle.participant_index));
+	participant_publisher_lock_acquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
+	UT_ASSERT(original_participant_receipt_chain_exact_locked(handle.participant_index, false));
+	participant_publisher_lock_release(&CtrcShared->receipt_lock);
+	original_participant_participant_locks_release(ctrc_participant_lock_mask(handle.participant_index));
+	UT_ASSERT_EQ(participant_guard_publications, 1); UT_ASSERT_EQ(participant_admission_samples, 1);
+	UT_ASSERT_EQ(participant_admission_current_reads, 1);
+	before = *handle.participant; receipt_before = *handle.receipt;
+	UT_ASSERT_EQ(participant_publisher_prepare(&key, grant, &replay), CLUSTER_CTRC_PREPARE_DUPLICATE);
+	UT_ASSERT(replay.valid && FullTransactionIdEquals(replay.original_full_xid, full));
+	UT_ASSERT_EQ(replay.receipt_index, handle.receipt_index); UT_ASSERT_EQ(replay.journal_slot_generation, handle.journal_slot_generation);
+	UT_ASSERT(memcmp(&before, handle.participant, sizeof(before)) == 0);
+	UT_ASSERT(memcmp(&receipt_before, handle.receipt, sizeof(receipt_before)) == 0);
+	UT_ASSERT_EQ(CtrcShared->global_journal_generation, 3); /* Duplicate may consume an unused scalar. */
+	UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->stats[CTRC_STAT_RECEIPT_PREPARED]), 1);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), 1);
+	UT_ASSERT_EQ(participant_origin_guards, 2); UT_ASSERT_EQ(participant_guard_publications, 2);
+	UT_ASSERT_EQ(participant_lock_depth, 0); UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	census_full_layout_release(&runtime);
+}
+
+UT_TEST(test_census_participant_unknown_or_foreign_origin_stays_unqualified_on_later_replay)
+{
+	for (int foreign = 0; foreign < 2; foreign++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime;
+		ClusterCtrcTxnKeyV1 key; ClusterCtrcOriginReservation reservation; ClusterCtrcReceiptHandle handle, replay;
+		FullTransactionId full = FullTransactionIdFromEpochAndXid(1, 100); uint32 grant;
+		qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI); fixture_release_original_writer();
+		census_runtime_initialize_requested = true;
+		if (!census_full_layout_setup(&runtime, 2)) { UT_ASSERT(false); return; }
+		key = census_key_for_full(&f.cohort.admission_fence, full);
+		UT_ASSERT_EQ(census_origin_reserve_from_backend(&key, full, &reservation), CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+		UT_ASSERT(original_census_origin_open_reserved(&reservation, &grant));
+		participant_publisher_inputs(&key, grant); participant_publisher_touch(&key, grant);
+		if (foreign) {
+			/* Foreign grant authentication is a controlled input, not a remote protocol run. */
+			key.origin_node_id = 1; key.owner_instance = 2; key.segment_id = CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+		} else ctrc_origin_entries()[0].original_full_xid = InvalidFullTransactionId;
+		UT_ASSERT_EQ(participant_publisher_prepare(&key, grant, &handle), CLUSTER_CTRC_PREPARE_READY);
+		UT_ASSERT(handle.valid && FullTransactionIdEquals(handle.original_full_xid, InvalidFullTransactionId));
+		UT_ASSERT(FullTransactionIdEquals(handle.participant->original_full_xid, InvalidFullTransactionId));
+		UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), 2);
+		UT_ASSERT_EQ(participant_origin_guards, foreign ? 0 : 1);
+		if (!foreign) ctrc_origin_entries()[0].original_full_xid = full; /* Controlled metadata restoration. */
+		UT_ASSERT_EQ(participant_publisher_prepare(&key, grant, &replay), CLUSTER_CTRC_PREPARE_DUPLICATE);
+		UT_ASSERT(FullTransactionIdEquals(replay.original_full_xid, InvalidFullTransactionId));
+		UT_ASSERT(FullTransactionIdEquals(replay.participant->original_full_xid, InvalidFullTransactionId));
+		UT_ASSERT_EQ(replay.participant->receipt_count, 1);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), 2);
+		UT_ASSERT_EQ(participant_lock_depth, 0); UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+		census_full_layout_release(&runtime);
+	}
+}
+
+UT_TEST(test_census_participant_shared_preflight_refuses_before_new_receiver)
+{
+	for (int fault = 0; fault < 11; fault++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime;
+		ClusterCtrcTxnKeyV1 key; ClusterCtrcOriginReservation reservation; ClusterCtrcReceiptHandle handle;
+		FullTransactionId full = FullTransactionIdFromEpochAndXid(1, 100); uint32 grant;
+		ClusterCtrcPreparePath expected = CLUSTER_CTRC_PREPARE_PATH_UNKNOWN;
+		qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI); fixture_release_original_writer();
+		census_runtime_initialize_requested = true;
+		if (!census_full_layout_setup(&runtime, 2)) { UT_ASSERT(false); return; }
+		key = census_key_for_full(&f.cohort.admission_fence, full);
+		UT_ASSERT_EQ(census_origin_reserve_from_backend(&key, full, &reservation), CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+		UT_ASSERT(original_census_origin_open_reserved(&reservation, &grant));
+		participant_publisher_inputs(&key, grant); participant_publisher_touch(&key, grant);
+		switch (fault) {
+			case 0: participant_target.spc_oid = InvalidOid; expected = CLUSTER_CTRC_PREPARE_PATH_NAMESPACE; break;
+			case 1: participant_identity.node_id = 1; expected = CLUSTER_CTRC_PREPARE_PATH_INPUT; break;
+			case 2: key.segment_id = 0; expected = CLUSTER_CTRC_PREPARE_PATH_INPUT; break;
+			case 3: CtrcShared->magic ^= 1; expected = CLUSTER_CTRC_PREPARE_PATH_INPUT; break;
+			case 4: expected = CLUSTER_CTRC_PREPARE_PATH_INPUT; break;
+			case 5: CtrcShared->global_journal_generation = UINT64_MAX; expected = CLUSTER_CTRC_PREPARE_PATH_JOURNAL; break;
+			case 6: ctrc_origin_entries()[0].state = CTRC_ORIGIN_RELEASE_PROVEN; break;
+			case 7: grant++; break;
+			case 8: ctrc_origin_entries()[0].touched_bitmap = 0; break;
+			case 9: participant_admission_sample_ok = false; expected = CLUSTER_CTRC_PREPARE_PATH_OBJECT_EXISTING; break;
+			case 10: participant_admission_current_ok = false; expected = CLUSTER_CTRC_PREPARE_PATH_OBJECT_EXISTING; break;
+		}
+		memset(&handle, 0xa5, sizeof(handle));
+		UT_ASSERT_EQ(participant_publisher_prepare(&key, grant, fault == 4 ? NULL : &handle), CLUSTER_CTRC_PREPARE_REFUSED);
+		if (fault != 4) UT_ASSERT(ctrc_bytes_zero(&handle, sizeof(handle)));
+		UT_ASSERT_EQ(participant_prepare_path, expected);
+		UT_ASSERT(ctrc_bytes_zero(ctrc_participant_entries(), runtime.capacity.participant_key_entries * sizeof(ClusterCtrcParticipantEntry)));
+		UT_ASSERT(ctrc_bytes_zero(original_participant_receipt_entries(), runtime.capacity.receipt_entries * sizeof(ClusterCtrcReceipt)));
+		UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), 1);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->stats[CTRC_STAT_RECEIPT_PREPARED]), 0);
+		UT_ASSERT_EQ(participant_lock_depth, 0); UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+		UT_ASSERT(!local_x && f.admission.entered); UT_ASSERT_EQ(backend_pin_count, 1);
+		census_full_layout_release(&runtime);
+	}
+}
+
+UT_TEST(test_census_participant_known_full_conflict_precedes_chain_refusal_without_mutation)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime;
+		ClusterCtrcTxnKeyV1 key; ClusterCtrcOriginReservation reservation; ClusterCtrcReceiptHandle handle, refused;
+		ClusterCtrcParticipantEntry before; ClusterCtrcReceipt receipt_before; CtrcReceiptLink link_before;
+		FullTransactionId full = FullTransactionIdFromEpochAndXid(1, 100); uint32 grant; uint64 head;
+		qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI); fixture_release_original_writer();
+		census_runtime_initialize_requested = true;
+		if (!census_full_layout_setup(&runtime, 2)) { UT_ASSERT(false); return; }
+		key = census_key_for_full(&f.cohort.admission_fence, full);
+		UT_ASSERT_EQ(census_origin_reserve_from_backend(&key, full, &reservation), CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+		UT_ASSERT(original_census_origin_open_reserved(&reservation, &grant));
+		UT_ASSERT_EQ(census_participant_prepare_from_origin(&key, grant, &handle), CLUSTER_CTRC_PREPARE_READY);
+		ctrc_origin_entries()[0].original_full_xid = FullTransactionIdFromEpochAndXid(2, 100);
+		if (fault == 1) handle.participant->receipt_count++;
+		if (fault == 2) original_participant_participant_receipt_heads()[handle.participant_index] = runtime.capacity.receipt_entries + 1;
+		before = *handle.participant; receipt_before = *handle.receipt;
+		link_before = original_participant_receipt_links()[handle.receipt_index];
+		head = original_participant_participant_receipt_heads()[handle.participant_index];
+		UT_ASSERT_EQ(participant_publisher_prepare(&key, grant, &refused), CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT_EQ(participant_prepare_path, CLUSTER_CTRC_PREPARE_PATH_ORIGINAL_FULL_XID);
+		UT_ASSERT(ctrc_bytes_zero(&refused, sizeof(refused)));
+		UT_ASSERT(memcmp(&before, handle.participant, sizeof(before)) == 0);
+		UT_ASSERT(memcmp(&receipt_before, handle.receipt, sizeof(receipt_before)) == 0);
+		UT_ASSERT(memcmp(&link_before, &original_participant_receipt_links()[handle.receipt_index], sizeof(link_before)) == 0);
+		UT_ASSERT_EQ(original_participant_participant_receipt_heads()[handle.participant_index], head);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), 1);
+		UT_ASSERT_EQ(participant_lock_depth, 0); UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+		census_full_layout_release(&runtime);
+	}
+}
+
+UT_TEST(test_census_participant_original_publisher_then_complete_walk_continues_native_wal)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3]; CensusRuntimeAllocation runtime;
+		ClusterCtrcTxnKeyV1 key; ClusterCtrcOriginReservation reservation; ClusterCtrcReceiptHandle handle;
+		FullTransactionId full = FullTransactionIdFromEpochAndXid(1, 100); uint32 grant;
+		uint64 passes = 1, expected_passes, total;
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		qualified_xmin_require_peer(&f, 65); fixture_release_original_writer();
+		census_runtime_initialize_requested = true;
+		if (!census_full_layout_setup(&runtime, 2)) { UT_ASSERT(false); return; }
+		key = census_key_for_full(&f.cohort.admission_fence, full);
+		UT_ASSERT_EQ(census_origin_reserve_from_backend(&key, full, &reservation), CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+		UT_ASSERT(original_census_origin_open_reserved(&reservation, &grant));
+		UT_ASSERT_EQ(census_participant_prepare_from_origin(&key, grant, &handle), CLUSTER_CTRC_PREPARE_READY);
+		UT_ASSERT(handle.valid && FullTransactionIdEquals(handle.original_full_xid, full));
+		UT_ASSERT_EQ(participant_guard_publications, 1); UT_ASSERT_EQ(participant_lock_depth, 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), 1);
+		sampler_xids[0] = 152;
+		pg_atomic_write_u64(&sampler_slots[0].cluster_top_full_xid_atomic, U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 152)));
+		total = runtime.capacity.origin_key_entries + runtime.capacity.participant_key_entries;
+		expected_passes = (total + CLUSTER_CTRC_ACTIVE_SCAN_SLICE - 1) / CLUSTER_CTRC_ACTIVE_SCAN_SLICE;
+		native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id - 1; resume_allowed = true;
+		worker_original_sample_pass_fixture(&f.cohort);
+		while (pass_pending && passes <= expected_passes) { original_worker_sample_active_pass(); passes++; }
+		UT_ASSERT_EQ(passes, expected_passes); UT_ASSERT(!pass_pending);
+		UT_ASSERT_EQ(publisher_scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+		UT_ASSERT_EQ(publisher_scan.unqualified_registration_generation, 1);
+		UT_ASSERT_EQ(publisher_scan.next_index, total); UT_ASSERT_EQ(publisher_scan.unqualified_entries, 0);
+		UT_ASSERT(FullTransactionIdEquals(publisher_scan.min_full, full));
+		UT_ASSERT_EQ(census_step_lock_acquires, total); UT_ASSERT_EQ(census_step_lock_releases, total);
+		f.cohort.local_registration_cut = publisher_scan;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered); UT_ASSERT_EQ(backend_pin_count, 1);
+		census_full_layout_release(&runtime);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(184);
+	UT_PLAN(190);
+	UT_RUN(test_census_participant_publisher_retains_original_origin_full_identity);
+	UT_RUN(test_census_participant_original_publish_and_duplicate_keep_chain_and_full_identity);
+	UT_RUN(test_census_participant_unknown_or_foreign_origin_stays_unqualified_on_later_replay);
+	UT_RUN(test_census_participant_shared_preflight_refuses_before_new_receiver);
+	UT_RUN(test_census_participant_known_full_conflict_precedes_chain_refusal_without_mutation);
+	UT_RUN(test_census_participant_original_publisher_then_complete_walk_continues_native_wal);
 
 	UT_RUN(test_census_shared_origin_reservation_retains_original_full_identity);
 	UT_RUN(test_census_shared_origin_exact_open_and_replay_use_physical_slot);
