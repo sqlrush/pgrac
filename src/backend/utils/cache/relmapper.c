@@ -1919,6 +1919,12 @@ AtEOXact_ClusterRelmapPublish(void)
 {
 	int			slot;
 
+	/*
+	 * The original native caller has committed; consume v2 custody first.
+	 * Empty v2 custody is a no-op and leaves the original v1 path intact.
+	 */
+	cluster_relmap_producer_postcommit_v2();
+
 	if (!cluster_relmap_publish_arms[0].armed &&
 		!cluster_relmap_publish_arms[1].armed)
 		return;
@@ -2001,6 +2007,21 @@ void
 AtAbort_ClusterRelmapPending(void)
 {
 	int			slot;
+
+	/*
+	 * Native abort can also follow an ERROR in TRANS_COMMIT. Its later
+	 * RecordTransactionAbort guard cannot protect relmap IO here. Reject
+	 * transition states with v2 custody; this does not prove an abort terminal.
+	 */
+	if ((cluster_relmap_v2_arms[0].armed || cluster_relmap_v2_arms[1].armed
+		 || cluster_relmap_v2_prepare_unfinished) && !IsTransactionState())
+		relmap_producer_abort_failed_v2("NATIVE_ABORT_CONTEXT");
+
+	/*
+	 * Refusal must stop the original caller before its unconditional unlock.
+	 * Empty v2 custody leaves pre-effect lock cleanup to that caller.
+	 */
+	cluster_relmap_producer_abort_v2();
 
 	for (slot = 0; slot < 2; slot++)
 	{

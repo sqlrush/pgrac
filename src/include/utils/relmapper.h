@@ -117,8 +117,9 @@ extern bool cluster_relmap_producer_finish_v2(bool is_commit);
  * permission, retention release or live v2 hook. */
 extern void cluster_relmap_producer_precommit_v2(bool is_parallel_worker);
 
-/* Dormant original postcommit caller only, after durable commit and before
- * top FullXid teardown, retaining original mapped-rel AEL and global relmap X.
+/* Original v2 postcommit consumer, selected by the native relmap callback
+ * after durable commit and before top FullXid teardown, retaining original
+ * mapped-rel AEL and global relmap X.
  * Consume saved prepare receipts once, publish both pairs before invalidation,
  * apply the original local/peer ACK policy and recheck the original owner.
  * Unlock global X last, then retire local custody only. UNKNOWN/ERROR, source
@@ -126,11 +127,12 @@ extern void cluster_relmap_producer_precommit_v2(bool is_parallel_worker);
  * uncertain storage is never retried. Incomplete arm preparation also PANICs;
  * only empty custody with no unfinished preparation is a no-op. This
  * authenticates no terminal, releases no retention pin and installs no live
- * v2 caller. */
+ * v2 precommit caller. */
 extern void cluster_relmap_producer_postcommit_v2(void);
 
-/* Dormant original abort caller, before top FullXid teardown, retaining the
- * original mapped-rel AEL/global relmap X and holding no local LWLocks. The
+/* Original v2 abort consumer, selected by the native relmap callback before
+ * top FullXid teardown, retaining the original mapped-rel AEL/global relmap X
+ * and holding no local LWLocks. The
  * abort decision can precede TRANS_ABORT and remains the caller's duty.
  * Discard all saved prepare receipts once, unlock global X last, then retire
  * local custody. UNKNOWN/ERROR/source loss PANIC, keeping custody/pins/debt;
@@ -138,11 +140,16 @@ extern void cluster_relmap_producer_postcommit_v2(void);
  * even without a saved receipt; no earlier receipt is discarded or unlocked.
  * Empty custody without unfinished preparation is a no-op. Standalone
  * stage/prepare callers retain their original failure obligations.
- * No invalidation, terminal proof, retention release or live v2 caller. */
+ * No invalidation, terminal proof, retention release or v2 precommit activation. */
 extern void cluster_relmap_producer_abort_v2(void);
 
-/* PGRAC (spec-6.14 D5): post-commit publish / abort discard of a staged
- * shared relmap authority image. */
+/* PGRAC (spec-6.14 D5): original native relmap terminal callbacks. Consume
+ * saved v2 custody first; an empty v2 consumer leaves the original v1 path.
+ * Native abort rejects non-INPROGRESS context with v2 custody before IO;
+ * this rejection guard does not authenticate an abort terminal.
+ * The abort caller's original singleton cleanup still follows, including
+ * after a pre-effect failure without saved v2 custody. No v2 precommit hook
+ * or terminal classification is installed by these callbacks. */
 extern void AtEOXact_ClusterRelmapPublish(void);
 extern void AtAbort_ClusterRelmapPending(void);
 #endif
