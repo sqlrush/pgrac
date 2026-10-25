@@ -17958,6 +17958,7 @@ typedef struct GcsFirstFillMasterPark {
 	bool cancelling;
 	bool ack_consumed;
 	bool registered;
+	bool handed_off;
 	GcsBlockRequestPayload request;
 	GcsBlockDedupKey key;
 	ClusterPcmReadGrant grant;
@@ -18133,9 +18134,9 @@ gcs_first_fill_master_cancel(const ClusterPcmReadGrantKey *key, int worker)
 	return false;
 }
 
-/* This slot owns only an unadmitted frame. Native pending-S remains the
- * authority; its exact binding and source must still cover each send offer.
- * A refused offer is paced locally, never returned as a requester retry. */
+/* Master keeps the service item after the transport takes its bytes. Native
+ * pending-S remains authority through confirmation or exact cleanup. Only an
+ * unadmitted frame may be offered; a refusal is never a requester retry. */
 static void
 gcs_first_fill_master_offer(GcsFirstFillMasterPark *park)
 {
@@ -18143,6 +18144,8 @@ gcs_first_fill_master_offer(GcsFirstFillMasterPark *park)
 	bool admitted;
 	PcmGcsTransitionApplyResult result;
 
+	if (park->handed_off)
+		return;
 	result = cluster_pcm_lock_read_grant_begin(park->request.tag, park->request.sender_node,
 		park->request.requester_backend_id, park->request.request_id, park->request.epoch,
 		GetCurrentTimestamp() + 10000, false, &current);
@@ -18185,9 +18188,8 @@ gcs_first_fill_master_offer(GcsFirstFillMasterPark *park)
 	}
 	gcs_first_fill_master_trace(&park->request, admitted ? "OUTBOUND_ADMITTED" : "OUTBOUND_WAIT", 0);
 	if (admitted)
-		memset(park, 0, sizeof(*park)); /* Transport/holder plus native claim now own completion. */
-	else
-		park->retry_at = GetCurrentTimestamp() + 10000;
+		park->handed_off = true; /* Bytes moved; the original service still awaits native completion. */
+	park->retry_at = GetCurrentTimestamp() + 10000;
 }
 
 static void
@@ -18207,6 +18209,13 @@ gcs_block_first_fill_request(const GcsBlockRequestPayload *req, const GcsBlockDe
 		if (park->in_use && (park->cancelling || park->registered)
 			&& memcmp(&park->key, key, sizeof(*key)) == 0)
 			return; /* Original local owner handles delivery or cancellation. */
+	}
+	if (!create) {
+		/* A cached marker is not proof that downstream work is absent.
+		 * Only the original admitted MISS may create a service item. Native
+		 * pending-S keeps any unknown reconfiguration/cleanup responsibility. */
+		gcs_first_fill_master_trace(req, "REPLAY_NO_LOCAL_OWNER", 0);
+		return;
 	}
 	/* Reserve outbound responsibility before publishing native S liability.
 	 * Full ingress waiting is separate; never grant without a retained owner. */
@@ -18331,6 +18340,15 @@ gcs_first_fill_master_tick(int worker)
 			}
 			continue;
 		}
+		if (saved.registered && saved.handed_off
+			&& cluster_pcm_lock_read_grant_absent(&saved.grant.key)) {
+			/* Exact native completion can precede this tick or a same-node
+			 * successor. Retirement grants no new service, so closed serving
+			 * gates must not hold an already-completed local item forever. */
+			gcs_first_fill_master_trace(&saved.request, "SERVICE_RETIRED", 0);
+			memset(&gcs_first_fill_master_parks[i], 0, sizeof(saved));
+			continue;
+		}
 		if (saved.request.epoch != cluster_epoch_get_current()
 			|| cluster_normal_stop_requested()) {
 			ClusterPcmReadGrantKey key = {0};
@@ -18338,6 +18356,10 @@ gcs_first_fill_master_tick(int worker)
 			key.epoch = saved.request.epoch; key.requester_node = saved.request.sender_node;
 			key.backend_id = saved.request.requester_backend_id;
 			(void)gcs_first_fill_master_cancel(&key, worker);
+		} else if (saved.handed_off) {
+			/* Transport/holder owns the accepted frame. Observe native
+			 * confirmation without issuing another delivery or selecting a source. */
+			gcs_first_fill_master_parks[i].retry_at = now + 10000;
 		} else {
 			bool pending = false;
 			bool serving = cluster_authority_readiness_managed()
