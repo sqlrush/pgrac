@@ -4050,10 +4050,13 @@ test_cluster_write_fence_cache: test_cluster_write_fence_cache.c unit_test.h \
 # locally; CRC32C comes from libpgport, so no PG backend is needed.
 CLUSTER_RECOVERY_ANCHOR_O = $(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o
 test_cluster_recovery_anchor: test_cluster_recovery_anchor.c unit_test.h \
+		test_cluster_recovery_anchor_publisher.inc \
+		test_cluster_cold_checkpoint_publisher.o test_cluster_cold_checkpoint_publisher.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_checkpoint.h \
 		$(CLUSTER_RECOVERY_ANCHOR_O) \
         $(top_srcdir)/src/backend/cluster/cluster_relmap_checkpoint.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		test_cluster_cold_checkpoint_publisher.o \
 		$(CLUSTER_RECOVERY_ANCHOR_O) $(top_srcdir)/src/backend/cluster/cluster_relmap_checkpoint.c \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
