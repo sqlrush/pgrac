@@ -104,6 +104,8 @@ static void (*v2_unlock_observer)(void);
 static bool v2_native_lock_active;
 static ClusterRelmapV2ClearResult (*v2_terminal_observer)(const ClusterRelmapV2Image *, bool);
 static bool v2_postcommit_error_stack;
+static void (*v2_final_sync_observer)(void);
+static void (*v2_final_writer_observer)(void);
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 MemoryContext ErrorContext;
@@ -131,6 +133,8 @@ bool
 cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 {
 	writer_reads++;
+	if (v2_final_writer_observer != NULL)
+		v2_final_writer_observer();
 	*out = writer_ref;
 	return writer_available;
 }
@@ -560,6 +564,8 @@ ForceSyncCommit(void)
 {
 	UT_ASSERT(!local_held && CritSectionCount == 0);
 	sync_commits++;
+	if (v2_final_sync_observer != NULL)
+		v2_final_sync_observer();
 }
 
 void
@@ -1098,11 +1104,14 @@ UT_TEST(unarmed_commit_preserves_other_writers_pending_and_global_lock)
 #include "test_cluster_relmap_physical_pair.inc"
 #include "test_cluster_relmap_authority_entry.inc"
 #include "test_cluster_relmap_terminal_callbacks.inc"
+#include "test_cluster_relmap_precommit_final.inc"
 
 int
 main(void)
 {
-	UT_PLAN(68);
+	UT_PLAN(70);
+	UT_RUN(v2_precommit_final_owner_drift_keeps_complete_batch);
+	UT_RUN(v2_precommit_final_owner_error_keeps_complete_batch);
 	UT_RUN(v2_original_callbacks_finish_physical_pairs_before_release);
 	UT_RUN(v2_original_abort_callback_keeps_pre_effect_lock_cleanup);
 	UT_RUN(v2_original_callback_failure_blocks_legacy_abort_release);

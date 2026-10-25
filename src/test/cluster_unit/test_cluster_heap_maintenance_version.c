@@ -40,7 +40,9 @@
 #include "cluster/cluster_ko.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_heap_horizon.h"
+#include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_undo_cleaner.h"
 #include "cluster/cluster_undo_horizon.h"
 #include "cluster/cluster_conf.h"
@@ -396,11 +398,122 @@ cluster_semantic_activation_recheck_r4_terminal_census(
 	UT_ASSERT(token != NULL && token->entered);
 	return admission_current;
 }
-/* Compile the original policy-current predicate; only its original stripe
- * fence observation and the independent cohort getter remain controlled. */
+/* Compile the original policy-current predicate; its lease observation
+ * below also executes the original retained stripe comparison. */
 #define cluster_heap_freeze_policy_sample_current_v1 actual_saved_policy_current
 #include "test_cluster_heap_freeze_policy_current.inc"
 #undef cluster_heap_freeze_policy_sample_current_v1
+
+/* Execute the original retained stripe comparison. Only external slot /
+ * QVOTEC observations and local lock scheduling remain controlled. */
+static ClusterXidStripeSampleFence retained_lease_fence;
+static bool lease_cluster_on, lease_catalog_on, lease_quorum, lease_lock_held;
+static uint64 lease_incarnation;
+static int lease_slot, lease_after_policy_fault, lease_revoke_after_unlock, lease_revoke_kind;
+static unsigned lease_lock_acquires, lease_lock_releases, lease_incarnation_reads, lease_quorum_reads;
+static unsigned lease_error_read;
+static void retained_lease_lock(LWLock *, LWLockMode);
+static void retained_lease_unlock(LWLock *);
+static int retained_lease_slot(void);
+static uint64 retained_lease_incarnation(void);
+static bool retained_lease_quorum(void);
+#define cluster_enabled lease_cluster_on
+#define cluster_shared_catalog lease_catalog_on
+#define cluster_xid_allocation_slot retained_lease_slot
+#define cluster_qvotec_get_self_incarnation retained_lease_incarnation
+#define cluster_qvotec_in_quorum retained_lease_quorum
+#define LWLockAcquire retained_lease_lock
+#define LWLockRelease retained_lease_unlock
+#define cluster_xid_stripe_sample_fence_current original_retained_lease_current
+#include "test_cluster_heap_freeze_lease_current.inc"
+#undef cluster_xid_stripe_sample_fence_current
+#undef LWLockRelease
+#undef LWLockAcquire
+#undef cluster_qvotec_in_quorum
+#undef cluster_qvotec_get_self_incarnation
+#undef cluster_xid_allocation_slot
+#undef cluster_shared_catalog
+#undef cluster_enabled
+static ClusterXidStripeBootShmem native_lease_shared;
+
+static int retained_lease_slot(void) { return lease_slot; }
+static bool retained_lease_quorum(void) { lease_quorum_reads++; return lease_quorum; }
+static uint64
+retained_lease_incarnation(void)
+{
+	lease_incarnation_reads++;
+	if (lease_error_read == lease_incarnation_reads)
+		elog(ERROR, "injected original lease incarnation observer ERROR");
+	return lease_incarnation;
+}
+
+static void
+retained_lease_fault(int fault)
+{
+	switch (fault) {
+	case 0: StripeBootShmem = NULL; break;
+	case 1: StripeLease = NULL; break;
+	case 2: native_lease_shared.disk_state = CLUSTER_XID_STRIPE_DISK_UNKNOWN; break;
+	case 3: native_lease_shared.floor_full++; break;
+	case 4: native_lease_shared.epoch++; break;
+	case 5: native_lease_shared.generation++; break;
+	case 6: native_lease_shared.slot_state = CLUSTER_XID_STRIPE_SLOT_UNKNOWN; break;
+	case 7: native_lease_shared.my_slot_claimed = false; break;
+	case 8: native_lease_shared.my_slot_floor_full++; break;
+	case 9: native_lease_shared.my_owner_incarnation++; break;
+	case 10: pg_atomic_write_u64(&native_lease_shared.lease.limit_full, retained_lease_fence.lease_limit_full - 1); break;
+	case 11: pg_atomic_fetch_add_u64(&native_lease_shared.lease.floor_full, 1); break;
+	case 12: pg_atomic_fetch_add_u64(&native_lease_shared.lease.published_incarnation, 1); break;
+	case 13: pg_atomic_write_u32(&native_lease_shared.lease.failed, 1); break;
+	}
+}
+
+static void
+retained_lease_lock(LWLock *lock, LWLockMode mode)
+{
+	UT_ASSERT(lock == &native_lease_shared.lock && mode == LW_SHARED && !lease_lock_held);
+	lease_lock_held = true; lease_lock_acquires++;
+}
+
+static void
+retained_lease_unlock(LWLock *lock)
+{
+	UT_ASSERT(lock == &native_lease_shared.lock && lease_lock_held);
+	lease_lock_held = false; lease_lock_releases++;
+	if (lease_lock_releases == 1 && lease_after_policy_fault >= 0)
+		retained_lease_fault(lease_after_policy_fault);
+	if (lease_lock_releases == lease_revoke_after_unlock) {
+		if (lease_revoke_kind == 1) lease_incarnation++;
+		else if (lease_revoke_kind == 2) lease_quorum = false;
+	}
+}
+
+static void
+retained_lease_publish_fixture(ClusterHeapFreezePolicySampleV1 *policy)
+{
+	/* Fixture image only: no lease grant, IO or production publisher. */
+	memset(&native_lease_shared, 0, sizeof(native_lease_shared));
+	StripeBootShmem = &native_lease_shared; StripeLease = &native_lease_shared.lease;
+	retained_lease_fence = (ClusterXidStripeSampleFence){
+		.activation_floor_full = UINT64CONST(0x100000003), .activation_epoch = 21,
+		.activation_generation = 13, .slot_floor_full = UINT64CONST(0x100000003),
+		.slot_owner_incarnation = 9, .incarnation = 9,
+		.lease_floor_full = UINT64CONST(0x100000003),
+		.lease_limit_full = U64FromFullTransactionId(policy->legal_next), .slot = 0 };
+	native_lease_shared.disk_state = CLUSTER_XID_STRIPE_DISK_PUBLISHED;
+	native_lease_shared.floor_full = retained_lease_fence.activation_floor_full;
+	native_lease_shared.epoch = retained_lease_fence.activation_epoch;
+	native_lease_shared.generation = retained_lease_fence.activation_generation;
+	native_lease_shared.slot_state = CLUSTER_XID_STRIPE_SLOT_MINE;
+	native_lease_shared.my_slot_claimed = true;
+	native_lease_shared.my_slot_floor_full = retained_lease_fence.slot_floor_full;
+	native_lease_shared.my_owner_incarnation = retained_lease_fence.slot_owner_incarnation;
+	pg_atomic_init_u64(&StripeLease->floor_full, retained_lease_fence.lease_floor_full);
+	pg_atomic_init_u64(&StripeLease->limit_full, retained_lease_fence.lease_limit_full);
+	pg_atomic_init_u64(&StripeLease->published_incarnation, retained_lease_fence.incarnation);
+	pg_atomic_init_u32(&StripeLease->failed, 0);
+	policy->allocation_fence = retained_lease_fence;
+}
 
 bool
 cluster_xid_stripe_sample_fence_current(const ClusterXidStripeSampleFence *fence)
@@ -414,7 +527,7 @@ cluster_xid_stripe_sample_fence_current(const ClusterXidStripeSampleFence *fence
 		UT_ASSERT(fence == &expected_current_policy->allocation_fence);
 	allocation_fence_checks++;
 	if (allocation_fence_error) elog(ERROR, "injected original stripe fence error");
-	return saved_policy_current;
+	return saved_policy_current && original_retained_lease_current(fence);
 }
 
 /* Instrument the original unlocked call without replacing its predicate. */
@@ -451,6 +564,7 @@ cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out)
 	memset(out, 0, sizeof(*out));
 	out->sample_id = cohort_source_input->source_local_sample_id;
 	out->worker_pid = 42;
+	out->lease_fence = retained_lease_fence;
 	out->scan = cohort_source_input->local_registration_cut;
 	out->admission_fence = cohort_source_input->admission_fence;
 	switch (cohort_sample_fault) {
@@ -464,6 +578,200 @@ cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out)
 
 /* Keep provider identity/current decisions explicit while executing the
  * original peer/H loops, local wrapper and end-clock ordering. */
+/* Original worker publication-current; scheduling, lease and admission
+ * providers remain controlled, and cannot manufacture a cleaner publication. */
+static UndoCleanerSharedState native_worker_shared;
+static UndoCleanerSharedState *undo_cleaner_state;
+static bool worker_current_enabled, worker_storage_ok, worker_stop_cut;
+static bool worker_lease_ok, worker_admission_ok, worker_lease_error, worker_admission_error;
+static bool worker_lock_held, worker_register_on_unlock;
+static unsigned worker_lock_acquires, worker_lock_releases;
+static unsigned worker_lease_checks, worker_admission_checks;
+
+static bool
+worker_current_storage(void)
+{
+	return worker_storage_ok;
+}
+
+static bool
+worker_current_stop(void)
+{
+	return worker_stop_cut;
+}
+
+static bool
+worker_current_lease(const ClusterXidStripeSampleFence *fence)
+{
+	UT_ASSERT(fence != NULL && !worker_lock_held);
+	worker_lease_checks++;
+	if (worker_lease_error) elog(ERROR, "injected original worker lease ERROR");
+	return worker_lease_ok && original_retained_lease_current(fence);
+}
+
+/* Original admission seqlock, policy, capture and complete-fence comparison.
+ * Membership/QVOTEC and lifecycle observations remain controlled providers. */
+#include "test_cluster_active_sample_types.inc"
+static ClusterSemanticActivationShmem native_admission_shared;
+static ClusterSemanticActivationShmem *SemanticActivationShmem;
+static ClusterR4MembershipSnapshot admission_members;
+static uint64 admission_system_id, admission_epoch, admission_incarnation, admission_cut;
+static int admission_self, admission_membership_fault;
+static bool admission_recovering, admission_stopping, admission_serving;
+static bool admission_join_allowed, admission_quorum, admission_membership_available;
+static unsigned admission_membership_reads;
+
+static bool admission_source_recovery(void) { return admission_recovering; }
+static bool admission_source_stop(void) { return admission_stopping; }
+static bool admission_source_serving(void) { return admission_serving; }
+static int admission_source_join(void) { return admission_join_allowed ? CLUSTER_JOIN_GATE_ALLOW : -1; }
+static bool admission_source_quorum(void) { return admission_quorum; }
+static uint64 admission_source_system_id(void) { return admission_system_id; }
+static uint64 admission_source_epoch(void) { return admission_epoch; }
+static uint64 admission_source_incarnation(void) { return admission_incarnation; }
+static uint64 admission_source_cut(void) { return admission_cut; }
+static bool admission_source_cut_current(uint64 expected) { return expected == admission_cut; }
+
+static bool
+admission_source_membership(ClusterR4MembershipSnapshot *out)
+{
+	UT_ASSERT(out != NULL && !worker_lock_held);
+	admission_membership_reads++;
+	if (!admission_membership_available) return false;
+	*out = admission_members;
+	switch (admission_membership_fault) {
+	case 1: pg_atomic_fetch_add_u64(&native_admission_shared.admission_seq, 2); break;
+	case 2: admission_cut++; break;
+	case 3: admission_epoch++; break;
+	case 4: admission_incarnation++; break;
+	case 5: admission_serving = false; break;
+	case 6: admission_quorum = false; break;
+	case 7: admission_stopping = true; break;
+	case 8: admission_self++; break;
+	case 9: elog(ERROR, "injected original admission membership ERROR"); break;
+	}
+	return true;
+}
+
+static bool original_admission_source_capture(ClusterSemanticActiveSampleFence *);
+static bool original_admission_source_current(const ClusterSemanticActiveSampleFence *);
+#define cluster_node_id admission_self
+#define RecoveryInProgress admission_source_recovery
+#define cluster_normal_stop_maintenance_cut admission_source_stop
+#define normal_start_serving_allowed admission_source_serving
+#define cluster_reconfig_self_join_gate_verdict admission_source_join
+#define cluster_membership_cut_generation admission_source_cut
+#define GetSystemIdentifier admission_source_system_id
+#define cluster_reconfig_lmon_snapshot_r4_membership admission_source_membership
+#define cluster_qvotec_in_quorum admission_source_quorum
+#define cluster_qvotec_get_self_incarnation admission_source_incarnation
+#define cluster_epoch_get_current admission_source_epoch
+#define cluster_membership_cut_generation_current admission_source_cut_current
+#define cluster_semantic_activation_active_sample_capture original_admission_source_capture
+#define cluster_semantic_activation_active_sample_current original_admission_source_current
+#include "test_cluster_active_sample_fence.inc"
+#undef cluster_semantic_activation_active_sample_current
+#undef cluster_semantic_activation_active_sample_capture
+#undef cluster_membership_cut_generation_current
+#undef cluster_epoch_get_current
+#undef cluster_qvotec_get_self_incarnation
+#undef cluster_qvotec_in_quorum
+#undef cluster_reconfig_lmon_snapshot_r4_membership
+#undef GetSystemIdentifier
+#undef cluster_membership_cut_generation
+#undef cluster_reconfig_self_join_gate_verdict
+#undef normal_start_serving_allowed
+#undef cluster_normal_stop_maintenance_cut
+#undef RecoveryInProgress
+#undef cluster_node_id
+
+static void
+admission_current_publish_fixture(ClusterHeapFreezeCohortObservation *cohort)
+{
+	/* Controlled fixture publication, not a production R4 activation. */
+	memset(&native_admission_shared, 0, sizeof(native_admission_shared));
+	SemanticActivationShmem = &native_admission_shared;
+	pg_atomic_init_u64(&native_admission_shared.admission_seq, 2);
+	pg_atomic_init_u64(&native_admission_shared.active_bits, CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1);
+	pg_atomic_init_u64(&native_admission_shared.record_generation, cohort->record_generation);
+	pg_atomic_init_u64(&native_admission_shared.formation_epoch, cohort->formation_epoch);
+	pg_atomic_init_u32(&native_admission_shared.transition_closed, 0);
+	memset(&admission_members, 0, sizeof(admission_members));
+	admission_self = 0; admission_system_id = 12345;
+	admission_epoch = admission_members.formation_epoch = cohort->formation_epoch;
+	admission_incarnation = admission_members.local_self_boot_incarnation = 9;
+	admission_cut = 4;
+	admission_members.admitted_members_lo = cohort->admitted_members_lo;
+	admission_members.admitted_members_hi = cohort->admitted_members_hi;
+	for (int peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+		if ((peer < 64 ? cohort->admitted_members_lo : cohort->admitted_members_hi)
+			& (UINT64CONST(1) << (peer % 64))) {
+			admission_members.admitted_incarnation[peer] = admission_incarnation + peer;
+			admission_members.observed_generation[peer] = 12;
+		}
+	}
+	UT_ASSERT(original_admission_source_capture(&cohort->admission_fence));
+	admission_membership_reads = 0;
+}
+
+static bool
+worker_current_admission(const ClusterSemanticActiveSampleFence *fence)
+{
+	UT_ASSERT(fence != NULL && !worker_lock_held);
+	worker_admission_checks++;
+	if (worker_admission_error) elog(ERROR, "injected original worker admission ERROR");
+	return worker_admission_ok && original_admission_source_current(fence);
+}
+
+static void
+worker_current_lock(LWLock *lock, LWLockMode mode)
+{
+	UT_ASSERT(lock == &native_worker_shared.lwlock && mode == LW_SHARED);
+	UT_ASSERT(!worker_lock_held);
+	worker_lock_held = true; worker_lock_acquires++;
+}
+
+static void
+worker_current_unlock(LWLock *lock)
+{
+	UT_ASSERT(lock == &native_worker_shared.lwlock && worker_lock_held);
+	worker_lock_held = false; worker_lock_releases++;
+	if (worker_register_on_unlock) ctrc_note_unqualified_registration();
+}
+
+#define cluster_undo_cleaner_enabled worker_current_enabled
+#define cluster_storage_mode_enabled worker_current_storage
+#define cluster_normal_stop_maintenance_cut worker_current_stop
+#define cluster_xid_stripe_sample_fence_current worker_current_lease
+#define cluster_semantic_activation_active_sample_current worker_current_admission
+#define LWLockAcquire worker_current_lock
+#define LWLockRelease worker_current_unlock
+#define cluster_undo_cleaner_active_sample_current original_worker_publication_current
+#include "test_cluster_heap_freeze_worker_current.inc"
+#undef cluster_undo_cleaner_active_sample_current
+#undef LWLockRelease
+#undef LWLockAcquire
+#undef cluster_semantic_activation_active_sample_current
+#undef cluster_xid_stripe_sample_fence_current
+#undef cluster_normal_stop_maintenance_cut
+#undef cluster_storage_mode_enabled
+#undef cluster_undo_cleaner_enabled
+
+static void
+worker_current_publish_fixture(const ClusterHeapFreezeCohortObservation *cohort)
+{
+	/* Fixture construction, not the production publisher or an authority grant. */
+	ClusterUndoCleanerActiveSample *sample = &native_worker_shared.active_sample;
+	memset(sample, 0, sizeof(*sample));
+	sample->sample_id = cohort->source_local_sample_id;
+	sample->worker_pid = 42;
+	sample->lease_fence = retained_lease_fence;
+	sample->scan = cohort->local_registration_cut;
+	sample->admission_fence = cohort->admission_fence;
+	native_worker_shared.workers[0].pid = 42;
+	native_worker_shared.workers[0].status = UNDO_CLEANER_READY;
+}
+
 static bool
 cohort_worker_publication_current(const ClusterUndoCleanerActiveSample *active)
 {
@@ -472,7 +780,7 @@ cohort_worker_publication_current(const ClusterUndoCleanerActiveSample *active)
 	UT_ASSERT_EQ(active->sample_id, cohort_source_input->source_local_sample_id);
 	UT_ASSERT(memcmp(&active->scan, &cohort_source_input->local_registration_cut, sizeof(active->scan)) == 0);
 	cohort_worker_current_checks++;
-	return cohort_worker_live;
+	return cohort_worker_live && original_worker_publication_current(active);
 }
 
 static bool
@@ -481,7 +789,7 @@ cohort_admission_source_current(const ClusterSemanticActiveSampleFence *fence)
 	UT_ASSERT(fence == &cohort_source_input->admission_fence);
 	UT_ASSERT(!local_x && !local_share && backend_pin_count == 1);
 	cohort_semantic_current_checks++;
-	return cohort_admission_live;
+	return cohort_admission_live && original_admission_source_current(fence);
 }
 
 static bool
@@ -1020,6 +1328,12 @@ reset(uint8 opcode, bool shared)
 	target_preflight_checks = census_preflight_checks = 0;
 	policy_current_checks = cohort_current_checks = 0;
 	allocation_fence_checks = 0; allocation_fence_error = false;
+	lease_cluster_on = lease_catalog_on = lease_quorum = true; lease_lock_held = false;
+	lease_incarnation = 9; lease_slot = 0; lease_after_policy_fault = -1;
+	lease_revoke_after_unlock = lease_revoke_kind = 0;
+	lease_lock_acquires = lease_lock_releases = lease_incarnation_reads = lease_quorum_reads = 0;
+	lease_error_read = 0;
+
 	cluster_xid_striping = true;
 	saved_policy_current = true; saved_cohort_status = CLUSTER_HEAP_FREEZE_COHORT_READY;
 	memset(&cohort_shared, 0, sizeof(cohort_shared));
@@ -1028,6 +1342,15 @@ reset(uint8 opcode, bool shared)
 		pg_atomic_init_u32(&cohort_shared.freeze_slots[peer].seq, 2);
 		cohort_live_generation[peer] = 7;
 	}
+	memset(&native_worker_shared, 0, sizeof(native_worker_shared));
+	undo_cleaner_state = &native_worker_shared;
+	admission_recovering = admission_stopping = false;
+	admission_serving = admission_join_allowed = admission_quorum = admission_membership_available = true;
+	admission_membership_fault = 0; admission_membership_reads = 0;
+	worker_current_enabled = worker_storage_ok = worker_lease_ok = worker_admission_ok = true;
+	worker_stop_cut = worker_lease_error = worker_admission_error = false;
+	worker_lock_held = worker_register_on_unlock = false;
+	worker_lock_acquires = worker_lock_releases = worker_lease_checks = worker_admission_checks = 0;
 	cohort_worker_live = cohort_admission_live = true;
 	cohort_clock_error = cohort_peer_revoke_worker = false;
 	cohort_clock_revoke_worker = cohort_clock_revoke_admission = false;
@@ -1422,6 +1745,7 @@ qualified_xmin_setup(QualifiedXminFixture *f, uint16 xmax_mask)
 	f->admission.formation_epoch = 21;
 	f->policy.legal_next = FullTransactionIdFromEpochAndXid(1, 200);
 	f->policy.freeze_limit = FullTransactionIdFromEpochAndXid(1, 100);
+	retained_lease_publish_fixture(&f->policy);
 	f->cohort.active_full_xid_min = U64FromFullTransactionId(f->policy.freeze_limit);
 	f->cohort.future_full_xid_max = U64FromFullTransactionId(f->policy.legal_next);
 	f->cohort.local_registration_cut.min_full = f->policy.freeze_limit;
@@ -1441,6 +1765,8 @@ qualified_xmin_setup(QualifiedXminFixture *f, uint16 xmax_mask)
 	f->cohort.admission_fence.local_node_id = 0;
 	f->cohort.local_registration_cut.status = CTRC_ACTIVE_SCAN_COMPLETE;
 	f->cohort.local_registration_cut.unqualified_registration_generation = pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation);
+	admission_current_publish_fixture(&f->cohort);
+	worker_current_publish_fixture(&f->cohort);
 	f->input.freeze_policy = &f->policy; f->input.freeze_cohort = &f->cohort;
 	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f->page, &f->proofs, &f->fence), 1);
 }
@@ -3016,7 +3342,7 @@ UT_TEST(test_xmin_registration_cut_rechecked_after_actual_space_prepare)
 				: qualified_xmin_apply(&f, 0)));
 			UT_ASSERT_EQ(space_observation_checks, 1);
 			/* The original cohort entry adds its final cut read before resume. */
-			UT_ASSERT_EQ(registration_checks, released ? 3 : 2);
+			UT_ASSERT_EQ(registration_checks, released ? 5 : 2);
 			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
 			UT_ASSERT_EQ(CritSectionCount, 0);
 			UT_ASSERT_EQ(backend_pin_count, 1);
@@ -3073,6 +3399,7 @@ UT_TEST(test_xmin_native_window_retained_through_actual_space_prepare)
 			f.policy.legal_next = FullTransactionIdFromU64(creator + UINT64CONST(0x7fffffff));
 			f.cohort.future_full_xid_max = U64FromFullTransactionId(f.policy.legal_next);
 			f.cohort.local_registration_cut.future_full = f.policy.legal_next;
+			worker_current_publish_fixture(&f.cohort);
 			replace_policy_in_space = &f.policy;
 			if (released) { fixture_release_original_writer(); resume_allowed = true; }
 			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 2)
@@ -3435,6 +3762,7 @@ UT_TEST(test_xmin_native_horizon_keeps_strictly_inside_legal_window)
 				f.policy.legal_next = FullTransactionIdFromU64(creator + UINT64CONST(0x7fffffff) - inside);
 				f.cohort.future_full_xid_max = U64FromFullTransactionId(f.policy.legal_next);
 				f.cohort.local_registration_cut.future_full = f.policy.legal_next;
+				worker_current_publish_fixture(&f.cohort);
 				if (released) { fixture_release_original_writer(); resume_allowed = true; }
 				UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 2)
 					: qualified_xmin_apply(&f, 0));
@@ -3465,6 +3793,7 @@ UT_TEST(test_xmin_native_horizon_rechecks_legal_window_after_final_target)
 			f.policy.legal_next = FullTransactionIdFromU64(creator + UINT64CONST(0x7fffffff));
 			f.cohort.future_full_xid_max = U64FromFullTransactionId(f.policy.legal_next);
 			f.cohort.local_registration_cut.future_full = f.policy.legal_next;
+			worker_current_publish_fixture(&f.cohort);
 			advance_legal_next_after_target = &f.policy;
 			if (released) { fixture_release_original_writer(); resume_allowed = true; }
 			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 2)
@@ -3879,6 +4208,8 @@ qualified_xmin_require_peer(QualifiedXminFixture *f, int peer)
 	f->cohort.source_peers[peer] = (ClusterHeapFreezeCohortPeerObservation){
 		.recv_at_us = 1000000, .interval_ms = CLUSTER_UNDO_HORIZON_INTERVAL_MIN_MS,
 		.generation = 7, .seq = 2 };
+	admission_current_publish_fixture(&f->cohort);
+	worker_current_publish_fixture(&f->cohort);
 }
 
 UT_TEST(test_xmin_original_peer_backend_continues_native_wal)
@@ -4008,10 +4339,430 @@ UT_TEST(test_xmin_original_cohort_clock_error_preserves_caller_resources)
 	}
 }
 
+UT_TEST(test_xmin_original_worker_publication_continues_native_wal)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		qualified_xmin_require_peer(&f, 65);
+		fixture_release_original_writer(); resume_allowed = true;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(worker_lock_acquires, 2); UT_ASSERT_EQ(worker_lock_releases, 2);
+		UT_ASSERT_EQ(worker_lease_checks, 2); UT_ASSERT_EQ(worker_admission_checks, 2);
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
+		UT_ASSERT(!worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
+UT_TEST(test_xmin_original_worker_publication_refuses_stale_shared_image)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int fault = 0; fault < 11; fault++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			fixture_release_original_writer(); resume_allowed = true;
+			switch (fault) {
+			case 0: undo_cleaner_state = NULL; break;
+			case 1: worker_current_enabled = false; break;
+			case 2: worker_storage_ok = false; break;
+			case 3: worker_stop_cut = true; break;
+			case 4: native_worker_shared.shutdown_requested = true; break;
+			case 5: native_worker_shared.workers[0].status = UNDO_CLEANER_SPAWNING; break;
+			case 6: native_worker_shared.workers[0].pid++; break;
+			case 7: native_worker_shared.active_sample.sample_id++; break;
+			case 8: native_worker_shared.active_sample.scan.future_full = FullTransactionIdFromU64(1); break;
+			case 9: native_worker_shared.active_sample.admission_fence.record_generation++; break;
+			case 10: native_worker_shared.active_sample.worker_pid++; break;
+			}
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(worker_lock_acquires, fault >= 4); UT_ASSERT_EQ(worker_lock_releases, worker_lock_acquires);
+			UT_ASSERT_EQ(cohort_worker_current_checks, 1); UT_ASSERT_EQ(cohort_end_clock_reads, 0);
+			UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(!worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_worker_fence_refusals_precede_publication_lock)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int admission = 0; admission < 2; admission++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			fixture_release_original_writer(); resume_allowed = true;
+			if (admission) worker_admission_ok = false; else worker_lease_ok = false;
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(worker_lease_checks, 1); UT_ASSERT_EQ(worker_admission_checks, admission);
+			UT_ASSERT_EQ(worker_lock_acquires + worker_lock_releases, 0);
+			UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(!worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_worker_fence_error_preserves_caller_resources)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int admission = 0; admission < 2; admission++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			fixture_release_original_writer(); resume_allowed = expecting_error = true;
+			if (admission) worker_admission_error = true; else worker_lease_error = true;
+			if (setjmp(error_jump) == 0) {
+				if (batch) (void)qualified_xmin_batch_apply(&f, targets, 3);
+				else (void)qualified_xmin_apply(&f, 0);
+				UT_ASSERT(false);
+			} else {
+				UT_ASSERT_EQ(worker_lease_checks, 1); UT_ASSERT_EQ(worker_admission_checks, admission);
+				UT_ASSERT_EQ(worker_lock_acquires + worker_lock_releases, 0);
+				UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+				UT_ASSERT(!worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+				UT_ASSERT_EQ(backend_pin_count, 1);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+			expecting_error = false;
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_worker_unlock_rechecks_actual_registration_cut)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		fixture_release_original_writer(); resume_allowed = worker_register_on_unlock = true;
+		UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+		UT_ASSERT_EQ(worker_lock_acquires, 1); UT_ASSERT_EQ(worker_lock_releases, 1);
+		UT_ASSERT_EQ(worker_lease_checks, 1); UT_ASSERT_EQ(worker_admission_checks, 1);
+		UT_ASSERT_EQ(cohort_end_clock_reads, 0);
+		UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+		UT_ASSERT(!worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_original_admission_capture_current_continues_native_wal)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		qualified_xmin_require_peer(&f, 65);
+		fixture_release_original_writer(); resume_allowed = true;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(admission_membership_reads, 4);
+		UT_ASSERT_EQ(worker_admission_checks, 2); UT_ASSERT_EQ(cohort_semantic_current_checks, 2);
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
+		UT_ASSERT(!worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
+UT_TEST(test_xmin_original_admission_refuses_changed_publication_or_identity)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int fault = 0; fault < 12; fault++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			fixture_release_original_writer(); resume_allowed = true;
+			switch (fault) {
+			case 0: SemanticActivationShmem = NULL; break;
+			case 1: pg_atomic_write_u64(&native_admission_shared.admission_seq, 3); break;
+			case 2: pg_atomic_write_u64(&native_admission_shared.admission_seq, 4); break;
+			case 3: pg_atomic_fetch_add_u64(&native_admission_shared.record_generation, 1); break;
+			case 4: pg_atomic_write_u32(&native_admission_shared.transition_closed, 1); break;
+			case 5: pg_atomic_write_u64(&native_admission_shared.active_bits, UINT64CONST(1) << 63); break;
+			case 6: pg_atomic_fetch_add_u64(&native_admission_shared.formation_epoch, 1); break;
+			case 7: admission_system_id++; break;
+			case 8: admission_cut++; break;
+			case 9: admission_members.admitted_members_hi = UINT64CONST(1) << 1; break;
+			case 10: admission_incarnation++; break;
+			case 11: admission_members.admitted_incarnation[0]++; break;
+			}
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(worker_lock_acquires + worker_lock_releases, 0);
+			UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(!worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_admission_lifecycle_prerequisites_refuse_before_writer)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int fault = 0; fault < 10; fault++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			fixture_release_original_writer(); resume_allowed = true;
+			switch (fault) {
+			case 0: admission_recovering = true; break;
+			case 1: admission_stopping = true; break;
+			case 2: admission_serving = false; break;
+			case 3: admission_join_allowed = false; break;
+			case 4: admission_system_id = 0; break;
+			case 5: admission_epoch = 0; break;
+			case 6: admission_self = -1; break;
+			case 7: admission_self = CLUSTER_MAX_NODES; break;
+			case 8: admission_membership_available = false; break;
+			case 9: admission_quorum = false; break;
+			}
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(worker_lock_acquires + worker_lock_releases, 0);
+			UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(!worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_admission_rechecks_after_membership_callback)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int fault = 1; fault <= 8; fault++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			fixture_release_original_writer(); resume_allowed = true;
+			admission_membership_fault = fault;
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(admission_membership_reads, 1);
+			UT_ASSERT_EQ(worker_lock_acquires + worker_lock_releases, 0);
+			UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(!worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_admission_membership_error_preserves_caller_resources)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		fixture_release_original_writer(); resume_allowed = expecting_error = true;
+		admission_membership_fault = 9;
+		if (setjmp(error_jump) == 0) {
+			if (batch) (void)qualified_xmin_batch_apply(&f, targets, 3);
+			else (void)qualified_xmin_apply(&f, 0);
+			UT_ASSERT(false);
+		} else {
+			UT_ASSERT_EQ(admission_membership_reads, 1);
+			UT_ASSERT_EQ(worker_lock_acquires + worker_lock_releases, 0);
+			UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(!worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+		expecting_error = false;
+	}
+}
+
+UT_TEST(test_xmin_original_admission_excludes_heartbeat_generation_from_identity)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		qualified_xmin_require_peer(&f, 65);
+		admission_members.observed_generation[0]++;
+		admission_members.observed_generation[65]++;
+		fixture_release_original_writer(); resume_allowed = true;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(admission_membership_reads, 4);
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT(!worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
+UT_TEST(test_xmin_original_retained_lease_continues_native_wal)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		qualified_xmin_require_peer(&f, 65);
+		fixture_release_original_writer(); resume_allowed = true;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(lease_lock_acquires, 3); UT_ASSERT_EQ(lease_lock_releases, 3);
+		UT_ASSERT_EQ(lease_incarnation_reads, 6); UT_ASSERT_EQ(lease_quorum_reads, 6);
+		UT_ASSERT_EQ(allocation_fence_checks, 1); UT_ASSERT_EQ(worker_lease_checks, 2);
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT(!lease_lock_held && !worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
+UT_TEST(test_xmin_original_retained_lease_refuses_state_drift_at_policy_and_worker)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int worker = 0; worker < 2; worker++) {
+			for (int fault = 0; fault < 14; fault++) {
+				QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+				fixture_release_original_writer(); resume_allowed = true;
+				if (worker) lease_after_policy_fault = fault; else retained_lease_fault(fault);
+				UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+				UT_ASSERT_EQ(worker_lease_checks, worker);
+				UT_ASSERT_EQ(worker_lock_acquires + worker_lock_releases, 0);
+				UT_ASSERT_EQ(lease_lock_acquires, lease_lock_releases);
+				UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+				UT_ASSERT(!lease_lock_held && !worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+				UT_ASSERT_EQ(backend_pin_count, 1);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_retained_lease_prerequisites_refuse_before_lock)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int fault = 0; fault < 6; fault++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			fixture_release_original_writer(); resume_allowed = true;
+			switch (fault) {
+			case 0: lease_cluster_on = false; break;
+			case 1: lease_catalog_on = false; break;
+			case 2: lease_slot = -1; break;
+			case 3: lease_slot = CLUSTER_XID_STRIDE; break;
+			case 4: lease_incarnation++; break;
+			case 5: lease_quorum = false; break;
+			}
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(lease_lock_acquires + lease_lock_releases, 0);
+			UT_ASSERT_EQ(worker_lock_acquires + worker_lock_releases, 0);
+			UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(!lease_lock_held && !worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_retained_lease_rechecks_incarnation_quorum_after_unlock)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int stage = 1; stage <= 2; stage++) {
+			for (int kind = 1; kind <= 2; kind++) {
+				QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+				fixture_release_original_writer(); resume_allowed = true;
+				lease_revoke_after_unlock = stage; lease_revoke_kind = kind;
+				UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+				UT_ASSERT_EQ(lease_lock_acquires, stage); UT_ASSERT_EQ(lease_lock_releases, stage);
+				UT_ASSERT_EQ(worker_lock_acquires + worker_lock_releases, 0);
+				UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+				UT_ASSERT(!lease_lock_held && !worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+				UT_ASSERT_EQ(backend_pin_count, 1);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_retained_lease_observer_error_preserves_caller_resources)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int worker = 0; worker < 2; worker++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			fixture_release_original_writer(); resume_allowed = expecting_error = true;
+			lease_error_read = worker ? 3 : 1;
+			if (setjmp(error_jump) == 0) {
+				if (batch) (void)qualified_xmin_batch_apply(&f, targets, 3);
+				else (void)qualified_xmin_apply(&f, 0);
+				UT_ASSERT(false);
+			} else {
+				UT_ASSERT_EQ(lease_lock_acquires, worker); UT_ASSERT_EQ(lease_lock_releases, worker);
+				UT_ASSERT_EQ(worker_lock_acquires + worker_lock_releases, 0);
+				UT_ASSERT_EQ(census_preflight_checks + conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+				UT_ASSERT(!lease_lock_held && !worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+				UT_ASSERT_EQ(backend_pin_count, 1);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+			expecting_error = false;
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_retained_lease_allows_same_identity_renewal)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		pg_atomic_fetch_add_u64(&StripeLease->limit_full, 100);
+		fixture_release_original_writer(); resume_allowed = true;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(lease_lock_acquires, 3); UT_ASSERT_EQ(lease_lock_releases, 3);
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT(!lease_lock_held && !worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(109);
+	UT_PLAN(126);
+	UT_RUN(test_xmin_original_retained_lease_continues_native_wal);
+	UT_RUN(test_xmin_original_retained_lease_refuses_state_drift_at_policy_and_worker);
+	UT_RUN(test_xmin_original_retained_lease_prerequisites_refuse_before_lock);
+	UT_RUN(test_xmin_original_retained_lease_rechecks_incarnation_quorum_after_unlock);
+	UT_RUN(test_xmin_original_retained_lease_observer_error_preserves_caller_resources);
+	UT_RUN(test_xmin_original_retained_lease_allows_same_identity_renewal);
+
+	UT_RUN(test_xmin_original_admission_capture_current_continues_native_wal);
+	UT_RUN(test_xmin_original_admission_refuses_changed_publication_or_identity);
+	UT_RUN(test_xmin_original_admission_lifecycle_prerequisites_refuse_before_writer);
+	UT_RUN(test_xmin_original_admission_rechecks_after_membership_callback);
+	UT_RUN(test_xmin_original_admission_membership_error_preserves_caller_resources);
+	UT_RUN(test_xmin_original_admission_excludes_heartbeat_generation_from_identity);
+
+	UT_RUN(test_xmin_original_worker_publication_continues_native_wal);
+	UT_RUN(test_xmin_original_worker_publication_refuses_stale_shared_image);
+	UT_RUN(test_xmin_original_worker_fence_refusals_precede_publication_lock);
+	UT_RUN(test_xmin_original_worker_fence_error_preserves_caller_resources);
+	UT_RUN(test_xmin_original_worker_unlock_rechecks_actual_registration_cut);
+
 	UT_RUN(test_xmin_original_peer_backend_continues_native_wal);
 	UT_RUN(test_xmin_original_peer_sequence_generation_and_h_refuse_before_resume);
 	UT_RUN(test_xmin_original_cohort_rechecks_local_source_around_end_clock);
