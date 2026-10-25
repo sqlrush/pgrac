@@ -8718,10 +8718,286 @@ UT_TEST(test_census_original_ack_then_certificate_keeps_origin_before_native_wal
 	}
 }
 
+/* Origin volatile lifetime edge only. The canonical block0 release-proof
+ * publisher is an explicit controlled precondition of commit_shared below. */
+static uint64 origin_reply_table_visits;
+#define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) ((void)(kind), origin_reply_table_visits++)
+#define ctrc_origin_ack_entries original_origin_reply_origin_ack_entries
+#define ctrc_origin_ack_index original_origin_reply_origin_ack_index
+#define ctrc_origin_frozen_touch_set_valid original_origin_reply_origin_frozen_touch_set_valid
+#define cluster_ctrc_origin_begin_seal_entry original_origin_reply_origin_begin_seal_entry
+#define cluster_ctrc_origin_arm_close_entry original_origin_reply_origin_arm_close_entry
+#define cluster_ctrc_origin_note_close_reply_entry original_origin_reply_origin_note_close_reply_entry
+#define cluster_ctrc_origin_begin_cleaning_entry original_origin_reply_origin_begin_cleaning_entry
+#define cluster_ctrc_origin_ack_land_entry original_origin_reply_origin_ack_land_entry
+#define ctrc_origin_ack_land_locked original_origin_reply_origin_ack_land_locked
+#define cluster_ctrc_origin_ack_land_shared original_origin_reply_origin_ack_land_shared
+#define cluster_ctrc_origin_certificate_validate original_origin_reply_origin_certificate_validate
+#define cluster_ctrc_origin_certificate_snapshot_entry original_origin_reply_origin_certificate_snapshot_entry
+#define cluster_ctrc_origin_certificate_commit_entry original_origin_reply_origin_certificate_commit_entry
+#define ctrc_origin_certificate_snapshot_index_locked original_origin_reply_origin_certificate_snapshot_index_locked
+#define ctrc_origin_certificate_commit_shared original_origin_reply_origin_certificate_commit_shared
+#define cluster_ctrc_origin_arm_certificate_entry original_origin_reply_origin_arm_certificate_entry
+#define cluster_ctrc_origin_note_certificate_reply_entry original_origin_reply_origin_note_certificate_reply_entry
+#define ctrc_origin_release_reclaim_locked original_origin_reply_origin_release_reclaim_locked
+#define ctrc_origin_note_certificate_match_locked original_origin_reply_origin_note_certificate_match_locked
+#define cluster_ctrc_origin_note_certificate_reply_shared original_origin_reply_origin_note_certificate_reply_shared
+#define ctrc_origin_index original_census_origin_index
+#define ctrc_participant_identity_valid original_participant_participant_identity_valid
+#define ctrc_ack_bytes_exact original_certificate_ack_bytes_exact
+#define cluster_ctrc_shmem_ready original_census_shmem_ready
+#define ctrc_semantic_progress original_certificate_semantic_progress
+#define LWLockAcquire participant_publisher_lock_acquire
+#define LWLockRelease participant_publisher_lock_release
+#include "test_cluster_heap_ctrc_origin_reply.inc"
+#undef LWLockRelease
+#undef LWLockAcquire
+#undef ctrc_semantic_progress
+#undef cluster_ctrc_shmem_ready
+#undef ctrc_ack_bytes_exact
+#undef ctrc_participant_identity_valid
+#undef ctrc_origin_index
+#undef cluster_ctrc_origin_note_certificate_reply_shared
+#undef ctrc_origin_note_certificate_match_locked
+#undef ctrc_origin_release_reclaim_locked
+#undef cluster_ctrc_origin_note_certificate_reply_entry
+#undef cluster_ctrc_origin_arm_certificate_entry
+#undef ctrc_origin_certificate_commit_shared
+#undef ctrc_origin_certificate_snapshot_index_locked
+#undef cluster_ctrc_origin_certificate_commit_entry
+#undef cluster_ctrc_origin_certificate_snapshot_entry
+#undef cluster_ctrc_origin_certificate_validate
+#undef cluster_ctrc_origin_ack_land_shared
+#undef ctrc_origin_ack_land_locked
+#undef cluster_ctrc_origin_ack_land_entry
+#undef cluster_ctrc_origin_begin_cleaning_entry
+#undef cluster_ctrc_origin_note_close_reply_entry
+#undef cluster_ctrc_origin_arm_close_entry
+#undef cluster_ctrc_origin_begin_seal_entry
+#undef ctrc_origin_frozen_touch_set_valid
+#undef ctrc_origin_ack_index
+#undef ctrc_origin_ack_entries
+#undef CLUSTER_CTRC_TEST_TABLE_VISIT
+
+static bool
+census_origin_certificate_reply(uint64 request_id, uint16 participant)
+{
+	return original_origin_reply_origin_note_certificate_reply_shared(request_id, participant,
+		CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED);
+}
+
+/* The real publisher/canonical durable block0 proof is not supplied by this
+ * fixture. Only its already-canonical precondition is controlled here; every
+ * volatile FSM, ACK inbox, snapshot identity and reclamation check is real. */
+static bool
+origin_reply_ready_fixture(QualifiedXminFixture *f, CensusRuntimeAllocation *runtime,
+	ClusterHeapFreezeXminTargetV1 *targets, bool batch, ClusterCtrcReceiptHandle *handle,
+	uint64 *origin_index, ClusterCtrcOriginCertificateSnapshot *snapshot)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcLocalReleaseAckV1 *ack;
+	bool snapped;
+	if (!ack_ready_fixture(f, runtime, targets, batch, handle)) return false;
+	if (!census_original_nonempty_ack_freeze(handle) || !original_census_origin_index(&handle->key, origin_index)) return false;
+	origin = &ctrc_origin_entries()[*origin_index];
+	ack = &original_certificate_participant_ack_entries()[handle->participant_index];
+	participant_publisher_lock_acquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	UT_ASSERT(original_origin_reply_origin_begin_seal_entry(origin, 17));
+	UT_ASSERT(original_origin_reply_origin_arm_close_entry(origin, ack->participant_node_id, 11));
+	UT_ASSERT(original_origin_reply_origin_note_close_reply_entry(origin, ack->participant_node_id, 11, CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK));
+	UT_ASSERT(original_origin_reply_origin_begin_cleaning_entry(origin));
+	participant_publisher_lock_release(&CtrcShared->origin_lock);
+	if (!original_origin_reply_origin_ack_land_shared(11, ack)) return false;
+	UT_ASSERT_EQ(origin->state, CTRC_ORIGIN_CERTIFYING);
+	participant_publisher_lock_acquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	snapped = original_origin_reply_origin_certificate_snapshot_index_locked(*origin_index, snapshot);
+	participant_publisher_lock_release(&CtrcShared->origin_lock);
+	if (!snapped) return false;
+	/* Controlled durable-publication boundary; this call does not write or
+	 * prove canonical block0. Its original caller requires that beforehand. */
+	if (!original_origin_reply_origin_certificate_commit_shared(snapshot)) return false;
+	UT_ASSERT_EQ(origin->state, CTRC_ORIGIN_RELEASE_PROVEN);
+	participant_publisher_lock_acquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	UT_ASSERT(original_origin_reply_origin_arm_certificate_entry(origin, ack->participant_node_id, 123));
+	participant_publisher_lock_release(&CtrcShared->origin_lock);
+	UT_ASSERT(FullTransactionIdEquals(origin->original_full_xid, handle->original_full_xid));
+	certificate_observers_reset(); origin_reply_table_visits = 0; return true;
+}
+
+static bool
+origin_reply_reclaim_receiver(const ClusterCtrcReceiptHandle *handle)
+{
+	return census_receipt_certificate_submit(handle);
+}
+
+UT_TEST(test_census_origin_rejects_unarmed_certificate_reply_without_retiring)
+{
+	QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+	ClusterCtrcOriginEntry before; uint64 index;
+	if (!receipt_terminal_fixture(&f, &runtime, NULL, false, &handle)) { UT_ASSERT(false); return; }
+	UT_ASSERT(original_census_origin_index(&handle.key, &index)); before = ctrc_origin_entries()[index];
+	UT_ASSERT(!census_origin_certificate_reply(123, handle.participant->identity.node_id));
+	UT_ASSERT(memcmp(&before, &ctrc_origin_entries()[index], sizeof(before)) == 0);
+	UT_ASSERT(FullTransactionIdEquals(ctrc_origin_entries()[index].original_full_xid, handle.original_full_xid));
+	census_full_layout_release(&runtime);
+}
+
+UT_TEST(test_census_original_certificate_reply_retires_origin_and_inbox_once)
+{
+	QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+	ClusterCtrcOriginCertificateSnapshot snapshot; ClusterCtrcOriginEntry empty_origin = {0};
+	ClusterCtrcLocalReleaseAckV1 empty_ack = {0}; uint64 index; uint16 node;
+	if (!origin_reply_ready_fixture(&f, &runtime, NULL, false, &handle, &index, &snapshot)) { UT_ASSERT(false); return; }
+	node = handle.participant->identity.node_id;
+	UT_ASSERT(origin_reply_reclaim_receiver(&handle));
+	UT_ASSERT(FullTransactionIdEquals(ctrc_origin_entries()[index].original_full_xid, handle.original_full_xid));
+	UT_ASSERT(census_origin_certificate_reply(123, node));
+	UT_ASSERT(memcmp(&ctrc_origin_entries()[index], &empty_origin, sizeof(empty_origin)) == 0);
+	for (uint64 i = 0; i < CtrcShared->origin_ack_inbox_entries; i++)
+		UT_ASSERT(memcmp(&original_origin_reply_origin_ack_entries()[i], &empty_ack, sizeof(empty_ack)) == 0);
+	UT_ASSERT_EQ(origin_reply_table_visits, runtime.capacity.origin_key_entries);
+	UT_ASSERT_EQ(participant_lock_depth, 0);
+	UT_ASSERT(!census_origin_certificate_reply(123, node));
+	UT_ASSERT(memcmp(&ctrc_origin_entries()[index], &empty_origin, sizeof(empty_origin)) == 0);
+	census_full_layout_release(&runtime);
+}
+
+UT_TEST(test_census_original_origin_reply_rejects_stale_request_or_result)
+{
+	for (int fault = 0; fault < 7; fault++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+		ClusterCtrcOriginCertificateSnapshot snapshot; ClusterCtrcOriginEntry before;
+		ClusterCtrcLocalReleaseAckV1 inbox_before[2]; uint64 index, ack_index, request = 123;
+		uint16 node; ClusterCtrcSealReplyResult result = CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED;
+		if (!origin_reply_ready_fixture(&f, &runtime, NULL, false, &handle, &index, &snapshot)) { UT_ASSERT(false); return; }
+		node = handle.participant->identity.node_id;
+		UT_ASSERT(original_origin_reply_origin_ack_index(&handle.key, 0, &ack_index));
+		UT_ASSERT(origin_reply_reclaim_receiver(&handle));
+		before = ctrc_origin_entries()[index];
+		memcpy(inbox_before, &original_origin_reply_origin_ack_entries()[ack_index], sizeof(inbox_before));
+		switch (fault) {
+			case 0: request = 0; break;
+			case 1: request++; break;
+			case 2: node ^= 1; break;
+			case 3: node = UINT16_MAX; break;
+			case 4: result = CTRC_SEAL_REPLY_DENIED; break;
+			case 5: result = CTRC_SEAL_REPLY_PENDING_DRAIN; break;
+			case 6: result = CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK; break;
+		}
+		UT_ASSERT(!original_origin_reply_origin_note_certificate_reply_shared(request, node, result));
+		UT_ASSERT(memcmp(&before, &ctrc_origin_entries()[index], sizeof(before)) == 0);
+		UT_ASSERT(memcmp(inbox_before, &original_origin_reply_origin_ack_entries()[ack_index], sizeof(inbox_before)) == 0);
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0); UT_ASSERT_EQ(participant_lock_depth, 0);
+		census_full_layout_release(&runtime);
+	}
+}
+
+UT_TEST(test_census_original_origin_reclaim_rechecks_exact_ack_inbox)
+{
+	for (int fault = 0; fault < 8; fault++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+		ClusterCtrcOriginCertificateSnapshot snapshot; ClusterCtrcLocalReleaseAckV1 before[2];
+		ClusterCtrcOriginEntry *origin; ClusterCtrcLocalReleaseAckV1 *inbox;
+		uint64 index, base; uint16 node;
+		if (!origin_reply_ready_fixture(&f, &runtime, NULL, false, &handle, &index, &snapshot)) { UT_ASSERT(false); return; }
+		node = handle.participant->identity.node_id;
+		UT_ASSERT(original_origin_reply_origin_ack_index(&handle.key, 0, &base));
+		UT_ASSERT(origin_reply_reclaim_receiver(&handle));
+		origin = &ctrc_origin_entries()[index]; inbox = &original_origin_reply_origin_ack_entries()[base];
+		switch (fault) {
+			case 0: inbox[node].crc32c ^= 1; break;
+			case 1: inbox[node].reserved[0] = 1; break;
+			case 2: inbox[node].grant_generation++; break;
+			case 3: origin->grant_generation++; break;
+			case 4: origin->touched_count++; break;
+			case 5: origin->touched[node].boot_incarnation++; break;
+			case 6: origin->ack_bitmap = 0; break;
+			case 7: inbox[node ^ 1].result = CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK; break;
+		}
+		memcpy(before, inbox, sizeof(before));
+		UT_ASSERT(!census_origin_certificate_reply(123, node));
+		UT_ASSERT_EQ(origin->state, CTRC_ORIGIN_BLOCKED);
+		UT_ASSERT(FullTransactionIdEquals(origin->original_full_xid, handle.original_full_xid));
+		UT_ASSERT(memcmp(before, inbox, sizeof(before)) == 0);
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0); UT_ASSERT_EQ(participant_lock_depth, 0);
+		census_full_layout_release(&runtime);
+	}
+}
+
+UT_TEST(test_census_original_origin_duplicate_reply_id_retains_both_origins)
+{
+	QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+	ClusterCtrcOriginCertificateSnapshot snapshot; ClusterCtrcOriginReservation reservation;
+	ClusterCtrcTxnKeyV1 key; ClusterCtrcParticipantIdentity participant;
+	FullTransactionId second_full = FullTransactionIdFromEpochAndXid(1, 101);
+	uint64 index, second_index; uint32 grant, touched_grant; uint16 node;
+	if (!origin_reply_ready_fixture(&f, &runtime, NULL, false, &handle, &index, &snapshot)) { UT_ASSERT(false); return; }
+	participant = handle.participant->identity; node = participant.node_id;
+	UT_ASSERT(origin_reply_reclaim_receiver(&handle));
+	key = handle.key; key.slot_offset++; key.xid++;
+	UT_ASSERT_EQ(census_origin_reserve_from_backend(&key, second_full, &reservation), CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	UT_ASSERT(original_census_origin_open_reserved(&reservation, &grant));
+	UT_ASSERT(original_census_origin_index(&key, &second_index)); UT_ASSERT(index != second_index);
+	participant_publisher_lock_acquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	UT_ASSERT_EQ(original_participant_origin_record_touched(&ctrc_origin_entries()[second_index], &participant,
+		CTRC_PROOF_ACTIVE, &touched_grant), CLUSTER_CTRC_TOUCH_RECORDED);
+	UT_ASSERT_EQ(touched_grant, grant);
+	UT_ASSERT(original_origin_reply_origin_begin_seal_entry(&ctrc_origin_entries()[second_index], 17));
+	UT_ASSERT(original_origin_reply_origin_arm_close_entry(&ctrc_origin_entries()[second_index], node, 123));
+	participant_publisher_lock_release(&CtrcShared->origin_lock);
+	UT_ASSERT(!census_origin_certificate_reply(123, node));
+	UT_ASSERT_EQ(ctrc_origin_entries()[index].state, CTRC_ORIGIN_BLOCKED);
+	UT_ASSERT_EQ(ctrc_origin_entries()[second_index].state, CTRC_ORIGIN_BLOCKED);
+	UT_ASSERT(FullTransactionIdEquals(ctrc_origin_entries()[index].original_full_xid, handle.original_full_xid));
+	UT_ASSERT(FullTransactionIdEquals(ctrc_origin_entries()[second_index].original_full_xid, second_full));
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0); UT_ASSERT_EQ(participant_lock_depth, 0);
+	census_full_layout_release(&runtime);
+}
+
+UT_TEST(test_census_original_origin_retirement_advances_walk_and_rejects_old_candidate)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+		ClusterHeapFreezeXminTargetV1 targets[3]; ClusterCtrcOriginCertificateSnapshot snapshot;
+		uint64 index, total, expected_passes, passes = 1; uint16 node;
+		if (!origin_reply_ready_fixture(&f, &runtime, targets, batch != 0, &handle, &index, &snapshot)) { UT_ASSERT(false); return; }
+		node = handle.participant->identity.node_id;
+		UT_ASSERT(origin_reply_reclaim_receiver(&handle)); UT_ASSERT(census_origin_certificate_reply(123, node));
+		UT_ASSERT(ctrc_bytes_zero(&ctrc_origin_entries()[index], sizeof(ClusterCtrcOriginEntry)));
+		sampler_xids[0] = 152;
+		pg_atomic_write_u64(&sampler_slots[0].cluster_top_full_xid_atomic, U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 152)));
+		total = runtime.capacity.origin_key_entries + runtime.capacity.participant_key_entries;
+		expected_passes = (total + CLUSTER_CTRC_ACTIVE_SCAN_SLICE - 1) / CLUSTER_CTRC_ACTIVE_SCAN_SLICE;
+		/* A later publication gets a new ID; never reuse the old candidate's
+		 * sample ID or replace its saved cut with this later observation. */
+		native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id; resume_allowed = true;
+		worker_original_sample_pass_fixture(&f.cohort);
+		while (pass_pending && passes <= expected_passes) { original_worker_sample_active_pass(); passes++; }
+		UT_ASSERT_EQ(passes, expected_passes); UT_ASSERT(!pass_pending);
+		UT_ASSERT_EQ(publisher_scan.status, CTRC_ACTIVE_SCAN_COMPLETE); UT_ASSERT_EQ(publisher_scan.next_index, total);
+		UT_ASSERT_EQ(publisher_scan.unqualified_entries, 0);
+		UT_ASSERT(FullTransactionIdEquals(publisher_scan.min_full, FullTransactionIdFromEpochAndXid(1, 152)));
+		UT_ASSERT_EQ(native_worker_shared.active_sample.sample_id, f.cohort.source_local_sample_id + 1);
+		UT_ASSERT(memcmp(&f.cohort.local_registration_cut, &publisher_scan, sizeof(publisher_scan)) != 0);
+		/* The new observation neither rebinds the saved old candidate nor
+		 * grants a new freeze bound. Original current checks must reject it. */
+		UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes, 0);
+		UT_ASSERT_EQ(participant_lock_depth, 0); UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1); census_full_layout_release(&runtime);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(208);
+	UT_PLAN(214);
+	UT_RUN(test_census_origin_rejects_unarmed_certificate_reply_without_retiring);
+	UT_RUN(test_census_original_certificate_reply_retires_origin_and_inbox_once);
+	UT_RUN(test_census_original_origin_reply_rejects_stale_request_or_result);
+	UT_RUN(test_census_original_origin_reclaim_rechecks_exact_ack_inbox);
+	UT_RUN(test_census_original_origin_duplicate_reply_id_retains_both_origins);
+	UT_RUN(test_census_original_origin_retirement_advances_walk_and_rejects_old_candidate);
 	UT_RUN(test_census_original_nonempty_ack_snapshot_can_freeze_cancelled_receipt);
 	UT_RUN(test_census_original_ack_hashes_full_sorted_receipt_chain_before_reclaim);
 	UT_RUN(test_census_original_ack_refuses_durability_or_two_capture_drift);
