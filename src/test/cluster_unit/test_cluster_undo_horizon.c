@@ -26,6 +26,10 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/slru.h"
+#include "access/subtrans.h"
+#include "storage/lwlock.h"
+#include "cluster/cluster_mode.h"
 
 #include "cluster/cluster_undo_horizon.h"
 #include "cluster/cluster_heap_horizon.h"
@@ -55,6 +59,70 @@ UT_DEFINE_GLOBALS();
 #include "../../backend/cluster/cluster_undo_horizon_ic.c"
 
 static ClusterUndoHorizonShmem test_horizon_store;
+/* Native checkpoint consumer composed with the actual LMON publication.
+ * Allocation, owner/current and SLRU I/O remain controlled leaves. */
+bool cluster_shared_catalog = true;
+bool cluster_xid_striping = true;
+static VariableCacheData native_cache;
+VariableCache ShmemVariableCache = &native_cache;
+static LWLockPadded native_locks[NUM_INDIVIDUAL_LWLOCKS];
+LWLockPadded *MainLWLockArray = native_locks;
+static SlruCtlData native_subtrans;
+#define SubTransCtl (&native_subtrans)
+#define TransactionIdToPage(xid) ((xid) / (TransactionId)(BLCKSZ / sizeof(TransactionId)))
+static bool native_xid_locked, native_lease_current = true;
+static unsigned native_samples, native_fences, native_truncations;
+static int native_truncated_page;
+
+bool
+LWLockAcquire(LWLock *lock, LWLockMode mode)
+{
+	UT_ASSERT(lock == XidGenLock && !native_xid_locked);
+	UT_ASSERT_EQ(mode, LW_SHARED);
+	native_xid_locked = true;
+	return true;
+}
+
+void
+LWLockRelease(LWLock *lock)
+{
+	UT_ASSERT(lock == XidGenLock && native_xid_locked);
+	native_xid_locked = false;
+}
+
+bool
+cluster_xid_stripe_sample_future(FullTransactionId reference,
+	FullTransactionId *future, ClusterXidStripeSampleFence *fence)
+{
+	UT_ASSERT(native_xid_locked);
+	UT_ASSERT(FullTransactionIdEquals(reference, native_cache.nextXid));
+	native_samples++;
+	memset(fence, 0, sizeof(*fence));
+	fence->incarnation = 81;
+	*future = native_cache.nextXid;
+	return true;
+}
+
+bool
+cluster_xid_stripe_sample_fence_current(const ClusterXidStripeSampleFence *fence)
+{
+	UT_ASSERT(!native_xid_locked);
+	UT_ASSERT_EQ(fence->incarnation, 81);
+	UT_ASSERT_EQ(native_truncations, 0);
+	native_fences++;
+	return native_lease_current;
+}
+
+void
+SimpleLruTruncate(SlruCtl ctl, int cutoffPage)
+{
+	UT_ASSERT(ctl == SubTransCtl && !native_xid_locked);
+	native_truncations++;
+	native_truncated_page = cutoffPage;
+}
+
+#include "test_cluster_subtrans_watermark.inc"
+
 bool cluster_enabled = true;
 int cluster_node_id = 0;
 int MyProcPid = 11;
@@ -2461,6 +2529,102 @@ UT_TEST(test_v2_lmon_observes_once_per_interval_without_an_extra_retention_cut)
 			  != NULL);
 }
 
+static void
+native_subtrans_cohort(void)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_cohort(false);
+
+	UT_ASSERT(!native_xid_locked);
+	cluster_shared_catalog = cluster_xid_striping = true;
+	native_cache.nextXid = FullTransactionIdFromEpochAndXid(1, 20000);
+	native_lease_current = true;
+	native_samples = native_fences = native_truncations = 0;
+	native_truncated_page = -1;
+	test_sender_sample.scan.future_full = native_cache.nextXid;
+	test_sender_sample.scan.min_full = FullTransactionIdFromEpochAndXid(1, 10000);
+	report.report_sequence++;
+	report.f_sample_id++;
+	report.future_full_xid = U64FromFullTransactionId(native_cache.nextXid);
+	report.active_full_xid_min = U64FromFullTransactionId(
+		FullTransactionIdFromEpochAndXid(1, 7000));
+	cohort_receive(1, report);
+}
+
+UT_TEST(test_real_lmon_candidate_caps_native_subtrans_without_raising_its_cut)
+{
+	const TransactionId oldest[] = { 10000, 6144 };
+	const int expected[] = { 3, 2 };
+
+	for (unsigned i = 0; i < lengthof(oldest); i++)
+	{
+		ClusterHeapFreezeWatermark watermark;
+
+		native_subtrans_cohort();
+		cluster_undo_horizon_lmon_tick();
+		UT_ASSERT(cluster_heap_freeze_watermark_sample(&watermark));
+		UT_ASSERT_EQ(watermark.active_full_xid_min,
+			U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 7000)));
+		TruncateSUBTRANS(oldest[i]);
+		UT_ASSERT_EQ(native_samples, 1);
+		UT_ASSERT_EQ(native_fences, 1);
+		UT_ASSERT_EQ(native_truncations, 1);
+		UT_ASSERT_EQ(native_truncated_page, expected[i]);
+		UT_ASSERT(!native_xid_locked);
+	}
+}
+
+UT_TEST(test_unqualified_publication_keeps_native_subtrans_until_fresh_fold)
+{
+	native_subtrans_cohort();
+	test_sender_sample.scan.unqualified_entries = 1;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_horizon_store.freeze_watermark.publication_sequence, 0);
+	TruncateSUBTRANS(10000);
+	UT_ASSERT_EQ(native_truncations, 0);
+	UT_ASSERT_EQ(native_fences, 0);
+	UT_ASSERT(!native_xid_locked);
+
+	test_sender_sample.scan.unqualified_entries = 0;
+	test_horizon_now += 1000001;
+	cluster_undo_horizon_lmon_tick();
+	TruncateSUBTRANS(10000);
+	UT_ASSERT_EQ(native_truncations, 1);
+	UT_ASSERT_EQ(native_truncated_page, 3);
+	UT_ASSERT_EQ(native_fences, 1);
+	UT_ASSERT(!native_xid_locked);
+}
+
+UT_TEST(test_retired_actual_candidate_sources_keep_native_subtrans)
+{
+	for (unsigned fault = 0; fault < 6; fault++)
+	{
+		ClusterHeapFreezeWatermark watermark;
+
+		native_subtrans_cohort();
+		cluster_undo_horizon_lmon_tick();
+		UT_ASSERT(cluster_heap_freeze_watermark_sample(&watermark));
+		if (fault == 0)
+			test_sender_sample.sample_id++;
+		else if (fault == 1)
+			test_registration_generation++;
+		else if (fault == 2)
+			test_v2_identity = false;
+		else if (fault == 3)
+			test_cohort_generations[1]++;
+		else if (fault == 4)
+			pg_atomic_write_u32(&test_horizon_store.freeze_slots[1].seq,
+				pg_atomic_read_u32(&test_horizon_store.freeze_slots[1].seq) + 1);
+		else
+			pg_atomic_write_u32(&test_horizon_store.freeze_watermark_seq,
+				pg_atomic_read_u32(&test_horizon_store.freeze_watermark_seq) + 1);
+		TruncateSUBTRANS(10000);
+		UT_ASSERT_EQ(native_samples, 1);
+		UT_ASSERT_EQ(native_fences, 0);
+		UT_ASSERT_EQ(native_truncations, 0);
+		UT_ASSERT(!native_xid_locked);
+	}
+}
+
 UT_TEST(test_v2_lmon_publishes_identity_bound_global_watermark)
 {
 	ClusterHeapFreezeWatermark watermark;
@@ -2878,7 +3042,7 @@ UT_TEST(test_watermark_reader_clears_output_on_late_registration)
 int
 main(void)
 {
-	UT_PLAN(105);
+	UT_PLAN(108);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -2967,6 +3131,9 @@ main(void)
 	UT_RUN(test_v2_cohort_single_member_still_requires_local_evidence);
 	UT_RUN(test_v2_summary_refusal_does_not_reuse_observed_values);
 	UT_RUN(test_v2_lmon_observes_once_per_interval_without_an_extra_retention_cut);
+	UT_RUN(test_real_lmon_candidate_caps_native_subtrans_without_raising_its_cut);
+	UT_RUN(test_unqualified_publication_keeps_native_subtrans_until_fresh_fold);
+	UT_RUN(test_retired_actual_candidate_sources_keep_native_subtrans);
 	UT_RUN(test_v2_lmon_publishes_identity_bound_global_watermark);
 	UT_RUN(test_v2_unknown_local_identity_blocks_new_watermark_not_observation);
 	UT_RUN(test_v2_publisher_checks_both_identity_coverage_inputs_atomically);
