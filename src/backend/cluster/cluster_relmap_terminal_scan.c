@@ -392,9 +392,9 @@ terminal_scan_current(ClusterRelmapTerminalScanV1 *scan)
 	return current != NULL && memcmp(current, &scan->selected, sizeof(*current)) == 0;
 }
 
-bool
-cluster_relmap_recovery_terminal_prefix_base_read_v1(ClusterRelmapTerminalScanV1 *scan,
-													 ClusterRelmapTerminalBaseObservationV1 *out)
+static bool
+terminal_prefix_base_read(ClusterRelmapTerminalScanV1 *scan,
+	ClusterRelmapTerminalBaseObservationV1 *out, ClusterClogNativeBaseHandleV1 **held)
 {
 	static const uint8 domain[] = "PGRAC-RELMAP-PREFIX-NATIVE-BASE-V1";
 	ClusterRelmapTerminalBaseObservationV1 result = { 0 };
@@ -428,7 +428,10 @@ cluster_relmap_recovery_terminal_prefix_base_read_v1(ClusterRelmapTerminalScanV1
 		if (terminal_scan_current(scan)
 			&& cluster_undo_recovery_cold_source_matches_v1(
 				&scan->selected.source, &scan->selected.checkpoint, scan->selected.native_redo)
-			&& cluster_clog_native_recovery_base_read_v1(origin, xid, &result.native_base)
+			&& (held != NULL
+					? cluster_clog_native_recovery_base_read_held_v1(
+						  origin, xid, &result.native_base, held)
+					: cluster_clog_native_recovery_base_read_v1(origin, xid, &result.native_base))
 			&& result.native_base.origin == origin
 			&& result.native_base.xid == xid
 			/* Native CLOG stores four two-bit transactions per byte. */
@@ -469,6 +472,13 @@ cluster_relmap_recovery_terminal_prefix_base_read_v1(ClusterRelmapTerminalScanV1
 	scan->failed = false;
 	*out = result;
 	return true;
+}
+
+bool
+cluster_relmap_recovery_terminal_prefix_base_read_v1(ClusterRelmapTerminalScanV1 *scan,
+													 ClusterRelmapTerminalBaseObservationV1 *out)
+{
+	return terminal_prefix_base_read(scan, out, NULL);
 }
 
 bool
@@ -516,6 +526,7 @@ struct ClusterRelmapRecoveryHandle {
 	uint8 committed_wire[CLUSTER_RELMAP_V2_FILE_SIZE];
 	uint8 native_base_fingerprint[32];
 	ClusterClogNativeFileV1 native_base_file;
+	ClusterClogNativeBaseHandleV1 *native_base;
 };
 
 static bool
@@ -1121,7 +1132,7 @@ recovery_handle_current(ClusterRelmapRecoveryHandle *handle)
 
 /* Bind the original native durable page observation, without exporting its
  * status or upgrading it to FullXid/base-lifetime qualification. Every read
- * still uses the original native owner and its own held-FD sync/readback. */
+ * reuses the original native owner's continuously held descriptor. */
 static bool
 recovery_handle_base_fingerprint(ClusterRelmapRecoveryHandle *handle, uint8 out[32],
 								 ClusterClogNativeFileV1 *file)
@@ -1129,7 +1140,7 @@ recovery_handle_base_fingerprint(ClusterRelmapRecoveryHandle *handle, uint8 out[
 	ClusterRelmapTerminalBaseObservationV1 base;
 
 	if (!recovery_handle_current(handle)
-		|| !cluster_relmap_recovery_terminal_prefix_base_read_v1(handle->scan, &base)
+		|| !terminal_prefix_base_read(handle->scan, &base, &handle->native_base)
 		|| !recovery_handle_current(handle))
 		return false;
 	memcpy(out, base.fingerprint, 32);
@@ -1191,12 +1202,14 @@ cluster_relmap_recovery_prepare_v1(ClusterWalInputsV1 *inputs,
 	}
 	PG_CATCH();
 	{
+		cluster_clog_native_recovery_base_release_v1(&handle->native_base);
 		terminal_scan_free(handle->scan);
 		pfree(handle);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 	if (!accepted) {
+		cluster_clog_native_recovery_base_release_v1(&handle->native_base);
 		terminal_scan_free(handle->scan);
 		pfree(handle);
 		return false;
@@ -1236,12 +1249,14 @@ cluster_relmap_recovery_prepare_cold_v1(const ClusterRelmapV2Namespace *identity
 	}
 	PG_CATCH();
 	{
+		cluster_clog_native_recovery_base_release_v1(&handle->native_base);
 		terminal_scan_free(handle->scan);
 		pfree(handle);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 	if (!accepted) {
+		cluster_clog_native_recovery_base_release_v1(&handle->native_base);
 		terminal_scan_free(handle->scan);
 		pfree(handle);
 		return false;
@@ -1400,6 +1415,7 @@ cluster_relmap_recovery_handle_release_v1(ClusterRelmapRecoveryHandle **handle)
 	old = *handle;
 	*handle = NULL;
 	if (old != NULL) {
+		cluster_clog_native_recovery_base_release_v1(&old->native_base);
 		terminal_scan_free(old->scan);
 		pfree(old);
 	}

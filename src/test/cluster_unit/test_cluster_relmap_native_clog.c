@@ -128,14 +128,22 @@ test_relmap_native_clog_setup(const char *root, int origin, TransactionId xid, X
 
 bool
 test_relmap_native_clog_read(int origin, TransactionId xid, ClusterClogNativeBaseV1 *out,
-							 sigjmp_buf *outer_stack)
+							 sigjmp_buf *outer_stack, ClusterClogNativeBaseHandleV1 **held)
 {
 	relmap_native_calls++;
 	PG_exception_stack = outer_stack;
 	if (relmap_native_calls == relmap_native_on_call)
 		relmap_native_apply_fault();
 	/* This is the namespaced original production body from clog.c. */
+	if (held != NULL)
+		return cluster_clog_native_recovery_base_read_held_v1(origin, xid, out, held);
 	return cluster_clog_native_recovery_base_read_v1(origin, xid, out);
+}
+
+void
+test_relmap_native_clog_release(ClusterClogNativeBaseHandleV1 **held)
+{
+	cluster_clog_native_recovery_base_release_v1(held);
 }
 
 TestRelmapNativeClogStats

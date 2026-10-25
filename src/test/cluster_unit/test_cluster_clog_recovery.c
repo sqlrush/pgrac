@@ -1478,6 +1478,101 @@ native_base_error_rethrows_and_releases_only_own_lock_and_fd(void)
 	UT_ASSERT_EQ(InterruptHoldoffCount, 0);
 }
 
+static void
+native_held_base_reuses_original_descriptor_without_spanning_locks(void)
+{
+	ClusterClogNativeBaseHandleV1 *held = NULL;
+	ClusterClogNativeBaseV1 out, raw;
+	int descriptor;
+	fixture_zero(0);
+	fixture_bit(100, TRANSACTION_STATUS_COMMITTED);
+	authority = true;
+	UT_ASSERT(cluster_clog_native_recovery_base_read_held_v1(1, 100, &out, &held));
+	UT_ASSERT(held != NULL);
+	descriptor = held->fd;
+	UT_ASSERT_EQ(transient_fds, 1);
+	UT_ASSERT((fcntl(descriptor, F_GETFD) & FD_CLOEXEC) != 0);
+	UT_ASSERT(!LWLockHeldByMe(&ClogRecoveryLocks[3].lock));
+	UT_ASSERT(cluster_clog_native_recovery_base_read_v1(1, 100, &raw));
+	UT_ASSERT_EQ(memcmp(&out, &raw, sizeof(out)), 0);
+	UT_ASSERT_EQ(transient_fds, 1);
+	/* A reopen would fail, while the original held descriptor remains valid. */
+	fail_open = true;
+	UT_ASSERT(cluster_clog_native_recovery_base_read_held_v1(1, 100, &raw, &held));
+	fail_open = false;
+	UT_ASSERT_EQ(held->fd, descriptor);
+	UT_ASSERT_EQ(memcmp(&out, &raw, sizeof(out)), 0);
+	UT_ASSERT_EQ(transient_fds, 1);
+	UT_ASSERT(!LWLockHeldByMe(&ClogRecoveryLocks[3].lock));
+	cluster_clog_native_recovery_base_release_v1(&held);
+	UT_ASSERT(held == NULL);
+	UT_ASSERT(fcntl(descriptor, F_GETFD) < 0 && errno == EBADF);
+	cluster_clog_native_recovery_base_release_v1(&held);
+	cluster_clog_native_recovery_base_release_v1(NULL);
+	fixture_idle();
+}
+
+static void
+native_held_base_constructor_error_and_later_refusals_keep_custody_sticky(void)
+{
+	ClusterClogNativeBaseHandleV1 *held = NULL;
+	ClusterClogNativeBaseV1 out, zero = { 0 };
+	volatile bool caught = false;
+	fixture_zero(0);
+	fixture_bit(100, TRANSACTION_STATUS_COMMITTED);
+	authority = true;
+	fail_dirsync = expect_error = true;
+	PG_TRY();
+	{
+		(void)cluster_clog_native_recovery_base_read_held_v1(1, 100, &out, &held);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	fail_dirsync = expect_error = false;
+	UT_ASSERT(caught && held == NULL);
+	UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+	fixture_idle();
+	for (unsigned fault = 0; fault < 5; fault++) {
+		int descriptor;
+		unsigned before_writes = writes;
+		caught = false;
+		UT_ASSERT(cluster_clog_native_recovery_base_read_held_v1(1, 100, &out, &held));
+		descriptor = held->fd;
+		if (fault == 2)
+			fail_sync = true;
+		if (fault == 3)
+			fail_dirsync = expect_error = true;
+		if (fault == 4)
+			UT_ASSERT_EQ(ftruncate(descriptor, BLCKSZ - 1), 0);
+		memset(&out, 0xa5, sizeof(out));
+		PG_TRY();
+		{
+			UT_ASSERT(!cluster_clog_native_recovery_base_read_held_v1(
+				fault == 0 ? 0 : 1, fault == 1 ? 101 : 100, &out, &held));
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 3);
+		fail_sync = fail_dirsync = expect_error = false;
+		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		UT_ASSERT(held != NULL && held->failed && held->fd == descriptor);
+		UT_ASSERT_EQ(transient_fds, 1);
+		UT_ASSERT(!LWLockHeldByMe(&ClogRecoveryLocks[3].lock));
+		UT_ASSERT(!cluster_clog_native_recovery_base_read_held_v1(1, 100, &out, &held));
+		UT_ASSERT_EQ(writes, before_writes);
+		cluster_clog_native_recovery_base_release_v1(&held);
+		UT_ASSERT(held == NULL);
+		UT_ASSERT(fcntl(descriptor, F_GETFD) < 0 && errno == EBADF);
+		fixture_idle();
+	}
+}
+
 int
 main(void)
 {
@@ -1494,7 +1589,7 @@ main(void)
 			return 2;
 	}
 	clog_recovery_shmem_init();
-	UT_PLAN(29);
+	UT_PLAN(31);
 	UT_RUN(separate_original_origin_controls);
 	UT_RUN(commit_and_abort_persist_full_tree_without_local_pollution);
 	UT_RUN(conflicting_late_child_refuses_before_any_tree_write);
@@ -1521,6 +1616,8 @@ main(void)
 	UT_RUN(native_base_refuses_missing_nonterminal_or_unqualified_inputs);
 	UT_RUN(native_base_sync_identity_and_close_failure_publish_nothing);
 	UT_RUN(native_base_error_rethrows_and_releases_only_own_lock_and_fd);
+	UT_RUN(native_held_base_reuses_original_descriptor_without_spanning_locks);
+	UT_RUN(native_held_base_constructor_error_and_later_refusals_keep_custody_sticky);
 	base_fixture = false;
 	native_fixture = true;
 	original_cwd = open(".", O_RDONLY | O_DIRECTORY);

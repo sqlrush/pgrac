@@ -3466,6 +3466,7 @@ test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
 		test_cluster_relmap_original_authority.inc \
 		test_cluster_relmap_original_cohort.inc \
 		test_cluster_relmap_native_file.inc \
+		test_cluster_relmap_native_hold.inc \
 		test_cluster_relmap_original_storage.inc \
 		test_cluster_relmap_original_pin.inc test_cluster_relmap_native_pin.h \
 		test_cluster_relmap_native_pin.o \

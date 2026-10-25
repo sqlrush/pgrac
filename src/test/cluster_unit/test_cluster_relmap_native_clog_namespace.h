@@ -61,6 +61,9 @@
 #define clogsyncfiletag d3_clog_clogsyncfiletag
 #define cluster_clog_native_recovery_apply_v1 d3_clog_cluster_clog_native_recovery_apply_v1
 #define cluster_clog_native_recovery_base_read_v1 d3_clog_cluster_clog_native_recovery_base_read_v1
+#define cluster_clog_native_recovery_base_read_held_v1                                             \
+	d3_clog_cluster_clog_native_recovery_base_read_held_v1
+#define cluster_clog_native_recovery_base_release_v1 d3_clog_cluster_clog_native_recovery_base_release_v1
 #define cluster_clog_native_recovery_record_apply_v1                                               \
 	d3_clog_cluster_clog_native_recovery_record_apply_v1
 #define cluster_clog_native_recovery_record_verify_v1                                              \

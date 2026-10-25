@@ -83,6 +83,19 @@ typedef struct ClusterClogNativeBaseV1 {
 extern bool cluster_clog_native_recovery_base_read_v1(int origin, TransactionId xid,
 													  ClusterClogNativeBaseV1 *out);
 
+/* Original descriptor custody, not a truncation pin or a certified era.
+ * Start with *held NULL; subsequent reads reuse that same tracked descriptor
+ * for the exact origin/xid. Refusal/ERROR permanently poisons existing custody
+ * and never reopens it. Raw observation above retains its per-call lifetime.
+ * Exclusive out/held storage must be separate from the opaque object. The
+ * original cold scope and fd.c lifetime must outlive custody; release it on
+ * every exit before either ends, including after refusal/ERROR. No native lock
+ * is held between calls. Release consumes only local FD/memory, never debt. */
+typedef struct ClusterClogNativeBaseHandleV1 ClusterClogNativeBaseHandleV1;
+extern bool cluster_clog_native_recovery_base_read_held_v1(int origin, TransactionId xid,
+	ClusterClogNativeBaseV1 *out, ClusterClogNativeBaseHandleV1 **held);
+extern void cluster_clog_native_recovery_base_release_v1(ClusterClogNativeBaseHandleV1 **held);
+
 /* Original-origin storage only. The recovery owner must first prove the
  * complete terminal record, original source/base/era and mutation authority.
  * These calls neither resolve an unknown transaction nor publish visibility.
