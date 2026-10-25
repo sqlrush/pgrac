@@ -59,6 +59,22 @@ UT_DEFINE_GLOBALS();
 #include "../../backend/cluster/cluster_undo_horizon_ic.c"
 
 static ClusterUndoHorizonShmem test_horizon_store;
+/* Original cleaner publication and current checks are composed below with
+ * the complete horizon TU. Scheduling/configuration/lease/census remain
+ * controlled leaves; these observations grant no producer lifetime. */
+static UndoCleanerSharedState test_cleaner_state;
+static UndoCleanerSharedState *undo_cleaner_state = &test_cleaner_state;
+static int undo_cleaner_worker;
+static ClusterCtrcActiveScan undo_cleaner_active_scan;
+static ClusterXidStripeSampleFence undo_cleaner_active_lease_fence;
+static ClusterSemanticActiveSampleFence undo_cleaner_active_admission_fence;
+static bool test_actual_cleaner, test_cleaner_locked;
+static bool test_cleaner_enabled, test_cleaner_storage, test_cleaner_stopped;
+static bool test_cleaner_lease_valid;
+static unsigned test_cleaner_locks, test_cleaner_unlocks;
+static unsigned test_cleaner_retire_on_peer;
+static bool actual_cleaner_sample(ClusterUndoCleanerActiveSample *);
+static bool actual_cleaner_sample_current(const ClusterUndoCleanerActiveSample *);
 /* Native checkpoint consumer composed with the actual LMON publication.
  * Allocation, owner/current and SLRU I/O remain controlled leaves. */
 bool cluster_shared_catalog = true;
@@ -79,6 +95,13 @@ static int native_truncated_page;
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
+	if (test_actual_cleaner && lock == &test_cleaner_state.lwlock) {
+		UT_ASSERT(!test_cleaner_locked && !native_xid_locked && !native_history_locked);
+		UT_ASSERT(mode == LW_SHARED || mode == LW_EXCLUSIVE);
+		test_cleaner_locked = true;
+		test_cleaner_locks++;
+		return true;
+	}
 	if (native_history_enabled && lock == ProcArrayLock) {
 		UT_ASSERT(!native_history_locked && !native_xid_locked);
 		UT_ASSERT_EQ(mode, LW_EXCLUSIVE);
@@ -95,6 +118,12 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 void
 LWLockRelease(LWLock *lock)
 {
+	if (test_actual_cleaner && lock == &test_cleaner_state.lwlock) {
+		UT_ASSERT(test_cleaner_locked && !native_xid_locked && !native_history_locked);
+		test_cleaner_locked = false;
+		test_cleaner_unlocks++;
+		return;
+	}
 	if (native_history_enabled && lock == ProcArrayLock) {
 		UT_ASSERT(native_history_locked && !native_xid_locked);
 		native_history_locked = false;
@@ -215,6 +244,8 @@ cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out)
 	test_sender_captures++;
 	if (test_change_admission_on_capture != 0 && --test_change_admission_on_capture == 0)
 		test_v2_fence.admission_publication_seq += 2;
+	if (test_actual_cleaner)
+		return actual_cleaner_sample(out);
 	MemSet(out, 0, sizeof(*out));
 	if (!test_sender_sample_valid)
 		return false;
@@ -236,6 +267,8 @@ bool
 cluster_undo_cleaner_active_sample_current(const ClusterUndoCleanerActiveSample *expected)
 {
 	test_sender_current_checks++;
+	if (test_actual_cleaner)
+		return actual_cleaner_sample_current(expected);
 	if (test_sender_change_on_recheck)
 		test_sender_sample.sample_id++;
 	test_horizon_now += test_source_current_clock_shift;
@@ -262,6 +295,81 @@ cluster_semantic_activation_active_sample_current(const ClusterSemanticActiveSam
 	return test_v2_identity && memcmp(expected, &test_v2_fence, sizeof(*expected)) == 0;
 }
 
+static bool
+actual_cleaner_storage(void)
+{
+	UT_ASSERT(!test_cleaner_locked && !native_xid_locked && !native_history_locked);
+	return test_cleaner_storage;
+}
+
+static bool
+actual_cleaner_stop(void)
+{
+	UT_ASSERT(!test_cleaner_locked && !native_xid_locked && !native_history_locked);
+	return test_cleaner_stopped;
+}
+
+static bool
+actual_cleaner_lease_current(const ClusterXidStripeSampleFence *expected)
+{
+	UT_ASSERT(!test_cleaner_locked && !native_xid_locked && !native_history_locked);
+	return test_cleaner_lease_valid
+		&& memcmp(expected, &undo_cleaner_active_lease_fence, sizeof(*expected)) == 0;
+}
+
+static bool
+actual_cleaner_admission_current(const ClusterSemanticActiveSampleFence *expected)
+{
+	UT_ASSERT(!test_cleaner_locked && !native_xid_locked && !native_history_locked);
+	return cluster_semantic_activation_active_sample_current(expected);
+}
+
+#define cluster_undo_cleaner_enabled test_cleaner_enabled
+#define cluster_storage_mode_enabled actual_cleaner_storage
+#define cluster_normal_stop_maintenance_cut actual_cleaner_stop
+#define cluster_xid_stripe_sample_fence_current actual_cleaner_lease_current
+#define cluster_semantic_activation_active_sample_current actual_cleaner_admission_current
+#define cluster_undo_cleaner_active_sample actual_cleaner_sample
+#define cluster_undo_cleaner_active_sample_current actual_cleaner_sample_current
+#include "test_cluster_undo_horizon_cleaner.inc"
+#undef cluster_undo_cleaner_active_sample_current
+#undef cluster_undo_cleaner_active_sample
+#undef cluster_semantic_activation_active_sample_current
+#undef cluster_xid_stripe_sample_fence_current
+#undef cluster_normal_stop_maintenance_cut
+#undef cluster_storage_mode_enabled
+#undef cluster_undo_cleaner_enabled
+
+/* One controlled retirement during a successful peer read, with unchanged
+ * wire/peer identity. The real cleaner current predicate must reject it. */
+static void
+retire_actual_cleaner_at_peer(int32 peer)
+{
+	unsigned change = test_cleaner_retire_on_peer;
+
+	if (!test_actual_cleaner || peer != 65 || change == 0)
+		return;
+	UT_ASSERT(!test_cleaner_locked && !native_xid_locked && !native_history_locked);
+	test_cleaner_retire_on_peer = 0;
+	switch (change) {
+		case 1: test_cleaner_state.workers[0].status = UNDO_CLEANER_SPAWNING; break;
+		case 2: test_cleaner_state.workers[0].pid++; break;
+		case 3: test_cleaner_state.shutdown_requested = true; break;
+		case 4:
+			undo_cleaner_active_scan.min_full =
+				FullTransactionIdFromEpochAndXid(1, 257);
+			undo_cleaner_publish_active_sample();
+			break;
+		case 5: test_cleaner_lease_valid = false; break;
+		case 6: test_registration_generation++; break;
+		case 7: test_v2_fence.admission_publication_seq += 2; break;
+		case 8: test_cleaner_enabled = false; break;
+		case 9: test_cleaner_storage = false; break;
+		case 10: test_cleaner_stopped = true; break;
+		default: UT_ASSERT(false); break;
+	}
+}
+
 bool
 cluster_sf_peer_capability_word_sample(int32 peer, uint32 required, uint32 *word,
 									   uint32 *generation)
@@ -274,6 +382,7 @@ cluster_sf_peer_capability_word_sample(int32 peer, uint32 required, uint32 *word
 bool
 cluster_sf_peer_capability_generation_matches(int32 peer, uint32 required, uint32 generation)
 {
+	retire_actual_cleaner_at_peer(peer);
 	if (test_cohort_all_caps) {
 		if (peer == test_cohort_trigger_peer) {
 			int32 changed = test_cohort_changed_peer;
@@ -1130,6 +1239,8 @@ UT_TEST(test_local_report_refusal_clears_metadata_and_stalls_sender)
 static void
 reset_v2_sender(void)
 {
+	test_actual_cleaner = false;
+	test_cleaner_retire_on_peer = 0;
 	native_history_enabled = false;
 	(void)reset_v2_receiver();
 	MemSet(&test_sender_sample, 0, sizeof(test_sender_sample));
@@ -3481,10 +3592,200 @@ UT_TEST(test_v2_sender_rejects_source_retired_during_final_capability_read)
 	}
 }
 
+/* This fixture supplies a completed census/lease image. The real census and
+ * native producer handoffs have their own composed fixture; no controlled
+ * image here is a positive F/H or retained-producer certificate. */
+static void
+start_actual_cleaner_cohort(void)
+{
+	ClusterHeapFreezeReportV2 report;
+	ClusterUndoCleanerActiveSample sample;
+
+	native_subtrans_cohort();
+	report = test_horizon_store.freeze_slots[1].view.report;
+	test_v2_fence.admitted_members_hi = UINT64CONST(1) << 1;
+	test_v2_fence.admitted_incarnation[65] = 105;
+	test_sender_sample.admission_fence = test_v2_fence;
+	/* Both reports must be admitted under this same complete cohort. */
+	report.report_sequence++;
+	cohort_receive(1, report);
+	cohort_receive(65, report);
+	memset(&test_cleaner_state, 0, sizeof(test_cleaner_state));
+	undo_cleaner_worker = 0;
+	undo_cleaner_active_scan = test_sender_sample.scan;
+	undo_cleaner_active_lease_fence = test_sender_sample.lease_fence;
+	undo_cleaner_active_admission_fence = test_v2_fence;
+	test_cleaner_state.workers[0].status = UNDO_CLEANER_READY;
+	test_cleaner_state.workers[0].pid = MyProcPid;
+	test_cleaner_enabled = test_cleaner_storage = test_cleaner_lease_valid = true;
+	test_cleaner_stopped = test_cleaner_locked = false;
+	test_cleaner_locks = test_cleaner_unlocks = 0;
+	test_actual_cleaner = true;
+	undo_cleaner_publish_active_sample();
+	UT_ASSERT(cluster_undo_cleaner_active_sample(&sample));
+	UT_ASSERT_EQ(sample.sample_id, 1);
+	UT_ASSERT_EQ(sample.worker_pid, MyProcPid);
+	UT_ASSERT(memcmp(&sample.scan, &undo_cleaner_active_scan, sizeof(sample.scan)) == 0);
+}
+
+UT_TEST(test_original_cleaner_complete_publication_reaches_v2_and_fixed_cohort)
+{
+	ClusterUndoCleanerActiveSample first, out;
+	ClusterHeapFreezeWatermark watermark, unchanged;
+	ClusterHeapFreezeCohortObservation cohort;
+
+	start_actual_cleaner_cohort();
+	UT_ASSERT(cluster_undo_cleaner_active_sample(&first));
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT(test_v2_sends > 0);
+	UT_ASSERT_EQ(test_v2_sent.f_sample_id, first.sample_id);
+	UT_ASSERT_EQ(test_v2_sent.active_full_xid_min, U64FromFullTransactionId(first.scan.min_full));
+	UT_ASSERT(cluster_heap_freeze_watermark_sample(&watermark));
+	UT_ASSERT_EQ(watermark.f_sample_id, first.sample_id);
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&cohort), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	UT_ASSERT_EQ(cohort.source_local_sample_id, first.sample_id);
+
+	undo_cleaner_active_scan.status = CTRC_ACTIVE_SCAN_INCOMPLETE;
+	undo_cleaner_active_scan.min_full = FullTransactionIdFromEpochAndXid(1, 11000);
+	undo_cleaner_publish_active_sample();
+	UT_ASSERT(cluster_undo_cleaner_active_sample(&out));
+	UT_ASSERT(memcmp(&first, &out, sizeof(first)) == 0);
+	UT_ASSERT(cluster_heap_freeze_watermark_sample(&unchanged));
+	UT_ASSERT(memcmp(&watermark, &unchanged, sizeof(watermark)) == 0);
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_current(&cohort), CLUSTER_HEAP_FREEZE_COHORT_READY);
+
+	undo_cleaner_active_scan.status = CTRC_ACTIVE_SCAN_COMPLETE;
+	undo_cleaner_publish_active_sample();
+	UT_ASSERT(cluster_undo_cleaner_active_sample(&out));
+	UT_ASSERT_EQ(out.sample_id, first.sample_id + 1);
+	UT_ASSERT(!cluster_undo_cleaner_active_sample_current(&first));
+	UT_ASSERT(cluster_heap_freeze_cohort_current(&cohort) != CLUSTER_HEAP_FREEZE_COHORT_READY);
+	UT_ASSERT(!cluster_heap_freeze_watermark_sample(&unchanged));
+	UT_ASSERT(memcmp(&watermark, &test_horizon_store.freeze_watermark, sizeof(watermark)) == 0);
+	test_horizon_now += 1000001;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT(cluster_heap_freeze_watermark_sample(&watermark));
+	UT_ASSERT_EQ(watermark.f_sample_id, out.sample_id);
+	UT_ASSERT_EQ(test_v2_sent.f_sample_id, out.sample_id);
+	UT_ASSERT_EQ(test_cleaner_locks, test_cleaner_unlocks);
+	UT_ASSERT(!test_cleaner_locked);
+	test_actual_cleaner = false;
+}
+
+UT_TEST(test_original_cleaner_retirement_revokes_each_v2_candidate_boundary)
+{
+	for (unsigned boundary = 0; boundary < 5; boundary++)
+		for (unsigned fault = 1; fault <= 10; fault++) {
+			ClusterUndoCleanerActiveSample active;
+			ClusterHeapFreezeCohortObservation cohort, out, before;
+			UndoHorizonV2MaintenanceObservation observed;
+			ClusterHeapFreezeWatermark watermark, rejected, zero = { 0 };
+			ClusterUndoRetentionSample history;
+			uint64 report_sequence;
+			uint32 publication_seq;
+			unsigned sends;
+
+			start_actual_cleaner_cohort();
+			UT_ASSERT(cluster_undo_cleaner_active_sample(&active));
+			history = test_retention_sample;
+			UT_ASSERT_EQ(undo_horizon_v2_cohort_observe(&cohort, NULL, &observed),
+						 CLUSTER_HEAP_FREEZE_COHORT_READY);
+			UT_ASSERT(undo_horizon_publish_freeze_watermark(&cohort, &observed, test_horizon_now));
+			UT_ASSERT(cluster_heap_freeze_watermark_sample(&watermark));
+			report_sequence = test_horizon_store.report_sequence;
+			publication_seq = pg_atomic_read_u32(&test_horizon_store.freeze_watermark_seq);
+			sends = test_v2_sends;
+			test_cleaner_retire_on_peer = fault;
+			switch (boundary) {
+				case 0:
+					undo_horizon_send_v2(65, &active, &history);
+					break;
+				case 1:
+					memset(&out, 0xa5, sizeof(out));
+					before = out;
+					UT_ASSERT(cluster_heap_freeze_cohort_observe(&out) != CLUSTER_HEAP_FREEZE_COHORT_READY);
+					UT_ASSERT(memcmp(&out, &before, sizeof(out)) == 0);
+					break;
+				case 2:
+					UT_ASSERT(cluster_heap_freeze_cohort_current(&cohort) != CLUSTER_HEAP_FREEZE_COHORT_READY);
+					break;
+				case 3:
+					UT_ASSERT(!undo_horizon_publish_freeze_watermark(&cohort, &observed, test_horizon_now));
+					break;
+				case 4:
+					memset(&rejected, 0xa5, sizeof(rejected));
+					UT_ASSERT(!cluster_heap_freeze_watermark_sample(&rejected));
+					UT_ASSERT(memcmp(&rejected, &zero, sizeof(rejected)) == 0);
+					break;
+			}
+			UT_ASSERT_EQ(test_cleaner_retire_on_peer, 0);
+			UT_ASSERT(!cluster_undo_cleaner_active_sample_current(&active));
+			UT_ASSERT_EQ(test_v2_sends, sends);
+			UT_ASSERT_EQ(test_horizon_store.report_sequence, report_sequence);
+			UT_ASSERT_EQ(pg_atomic_read_u32(&test_horizon_store.freeze_watermark_seq), publication_seq);
+			UT_ASSERT(memcmp(&watermark, &test_horizon_store.freeze_watermark, sizeof(watermark)) == 0);
+			UT_ASSERT_EQ(test_cleaner_locks, test_cleaner_unlocks);
+			UT_ASSERT(!test_cleaner_locked && !native_xid_locked && !native_history_locked);
+			test_actual_cleaner = false;
+		}
+}
+
+UT_TEST(test_original_cleaner_retirement_keeps_native_cut_until_new_complete_fold)
+{
+	for (unsigned fault = 1; fault <= 10; fault++) {
+		ClusterHeapFreezeWatermark watermark;
+		ClusterHeapFreezeReportV2 report;
+		uint64 sample_id, next_id;
+
+		start_actual_cleaner_cohort();
+		cluster_undo_horizon_lmon_tick();
+		UT_ASSERT(cluster_heap_freeze_watermark_sample(&watermark));
+		sample_id = watermark.f_sample_id;
+		test_cleaner_retire_on_peer = fault;
+		TruncateSUBTRANS(10000);
+		UT_ASSERT_EQ(test_cleaner_retire_on_peer, 0);
+		UT_ASSERT_EQ(native_truncations, 0);
+		UT_ASSERT_EQ(native_fences, 0);
+		UT_ASSERT_EQ(test_horizon_store.freeze_watermark.f_sample_id, sample_id);
+
+		/* Controlled original-source recovery, followed by the real sole
+		 * publisher, does not reuse the retired sample or reset its sequence. */
+		test_cleaner_state.workers[0].status = UNDO_CLEANER_READY;
+		test_cleaner_state.workers[0].pid = MyProcPid;
+		test_cleaner_state.shutdown_requested = false;
+		test_cleaner_enabled = test_cleaner_storage = test_cleaner_lease_valid = true;
+		test_cleaner_stopped = false;
+		undo_cleaner_active_scan.unqualified_registration_generation = test_registration_generation;
+		undo_cleaner_active_admission_fence = test_v2_fence;
+		next_id = test_cleaner_state.active_sample_sequence + 1;
+		undo_cleaner_publish_active_sample();
+		UT_ASSERT_EQ(test_cleaner_state.active_sample.sample_id, next_id);
+		UT_ASSERT(next_id > sample_id);
+		/* Admission retirement also invalidates the two original reports;
+		 * fresh receiver admissions must precede the new complete fold. */
+		report = test_horizon_store.freeze_slots[1].view.report;
+		report.report_sequence++;
+		cohort_receive(1, report);
+		cohort_receive(65, report);
+		test_horizon_now += 1000001;
+		cluster_undo_horizon_lmon_tick();
+		TruncateSUBTRANS(10000);
+		UT_ASSERT_EQ(native_truncations, 1);
+		UT_ASSERT_EQ(native_fences, 1);
+		UT_ASSERT_EQ(native_truncated_page, fault == 4 ? 0 : 3);
+		UT_ASSERT_EQ(test_horizon_store.freeze_watermark.active_full_xid_min,
+			U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, fault == 4 ? 257 : 7000)));
+		UT_ASSERT_EQ(test_horizon_store.freeze_watermark.f_sample_id, next_id);
+		UT_ASSERT_EQ(test_cleaner_locks, test_cleaner_unlocks);
+		UT_ASSERT(!test_cleaner_locked && !native_xid_locked && !native_history_locked);
+		test_actual_cleaner = false;
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(120);
+	UT_PLAN(123);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -3608,6 +3909,9 @@ main(void)
 	UT_RUN(test_cohort_observe_end_clock_follows_final_local_current_check);
 	UT_RUN(test_cohort_full_local_check_survives_end_clock_source_retirement);
 	UT_RUN(test_v2_sender_rejects_source_retired_during_final_capability_read);
+	UT_RUN(test_original_cleaner_complete_publication_reaches_v2_and_fixed_cohort);
+	UT_RUN(test_original_cleaner_retirement_revokes_each_v2_candidate_boundary);
+	UT_RUN(test_original_cleaner_retirement_keeps_native_cut_until_new_complete_fold);
 	UT_DONE();
 	free(procArray);
 	return ut_failed_count == 0 ? 0 : 1;

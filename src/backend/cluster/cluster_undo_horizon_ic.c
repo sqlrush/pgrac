@@ -577,6 +577,18 @@ undo_horizon_sample_local_report(ClusterUndoRetentionSample *out)
  * Each attempted V2 send consumes a shared sequence even if transport fails.
  * An incomplete identity cover cannot export F; refuse it before capability
  * sampling or consuming a sequence. Read-only cohort observations retain it. */
+/* One original local-source contract for every observer handoff. This is a
+ * currentness check on the copied publication, not a resample or retention
+ * grant. Call after peer observers; H users also bracket their end clock. */
+static bool
+undo_horizon_local_source_current(const ClusterSemanticActiveSampleFence *fence,
+								  const ClusterUndoCleanerActiveSample *active)
+{
+	return fence != NULL && active != NULL
+		&& memcmp(&active->admission_fence, fence, sizeof(*fence)) == 0
+		&& cluster_undo_cleaner_active_sample_current(active);
+}
+
 static void
 undo_horizon_send_v2(int32 peer, const ClusterUndoCleanerActiveSample *active,
 					 const ClusterUndoRetentionSample *h)
@@ -623,7 +635,7 @@ undo_horizon_send_v2(int32 peer, const ClusterUndoCleanerActiveSample *active,
 	if (!cluster_heap_freeze_report_v2_encode(&report, bytes)
 		|| !cluster_sf_peer_capability_generation_matches(
 			peer, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2, generation)
-		|| !cluster_undo_cleaner_active_sample_current(active))
+		|| !undo_horizon_local_source_current(fence, active))
 		return;
 	UndoHorizonShmem->report_sequence = report.report_sequence;
 	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_UNDO_HORIZON, peer, bytes, sizeof(bytes));
@@ -827,7 +839,8 @@ cluster_heap_freeze_report_v2_sample(int32 peer, ClusterHeapFreezeReportV2View *
 static bool
 undo_horizon_watermark_sources_current(
 	const ClusterSemanticActiveSampleFence *fence,
-	const ClusterHeapFreezeCohortPeerObservation *sources)
+	const ClusterHeapFreezeCohortPeerObservation *sources,
+	const ClusterUndoCleanerActiveSample *active)
 {
 	int32 peer;
 
@@ -849,6 +862,10 @@ undo_horizon_watermark_sources_current(
 			return false;
 	}
 	if (!cluster_semantic_activation_active_sample_current(fence))
+		return false;
+	/* Finish ALL peer/semantic observers before the complete local source.
+	 * Then keep the original pure peer-generation/sequence and ingress cut. */
+	if (!undo_horizon_local_source_current(fence, active))
 		return false;
 	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
 		uint32 word, generation;
@@ -933,8 +950,7 @@ cluster_heap_freeze_watermark_sample(ClusterHeapFreezeWatermark *out)
 			|| U64FromFullTransactionId(active.scan.future_full) == UINT64_MAX
 			|| U64FromFullTransactionId(active.scan.min_full) == UINT64_MAX
 			|| memcmp(&active.admission_fence, &fence, sizeof(fence)) != 0
-			|| !cluster_undo_cleaner_active_sample_current(&active)
-			|| !undo_horizon_watermark_sources_current(&fence, sources)
+			|| !undo_horizon_watermark_sources_current(&fence, sources, &active)
 			/* Peer observers may overlap new unknown local registration.
 			 * This last read has no callbacks, locks, or replacement sample. */
 			|| !cluster_ctrc_active_scan_registration_current(&active.scan))
@@ -1033,7 +1049,7 @@ undo_horizon_v2_cohort_current(const ClusterSemanticActiveSampleFence *fence,
 	 * after its publication was copied. Recheck that entire original sample
 	 * before the end clock; a registration generation alone is insufficient.
 	 * No new native/census/history sample is acquired here. */
-	if (!cluster_undo_cleaner_active_sample_current(active)
+	if (!undo_horizon_local_source_current(fence, active)
 		|| !cluster_semantic_activation_active_sample_current(fence))
 		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
 	/* Read the end clock after peer and local identity callbacks, including
@@ -1059,7 +1075,7 @@ undo_horizon_v2_cohort_current(const ClusterSemanticActiveSampleFence *fence,
 	/* Preserve the original observe-side full check after the end clock as
 	 * well: time collection can overlap worker/lease/admission retirement
 	 * without changing the ingress generation. This acquires no new sample. */
-	if (!cluster_undo_cleaner_active_sample_current(active)
+	if (!undo_horizon_local_source_current(fence, active)
 		|| !cluster_semantic_activation_active_sample_current(fence))
 		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
 	return CLUSTER_HEAP_FREEZE_COHORT_READY;
@@ -1207,8 +1223,7 @@ undo_horizon_publish_freeze_watermark(const ClusterHeapFreezeCohortObservation *
 		|| cohort->admitted_members_lo != observed->fence.admitted_members_lo
 		|| cohort->admitted_members_hi != observed->fence.admitted_members_hi
 		|| memcmp(&active.admission_fence, &observed->fence, sizeof(active.admission_fence)) != 0
-		|| !cluster_undo_cleaner_active_sample_current(&active)
-		|| !undo_horizon_watermark_sources_current(&observed->fence, cohort->source_peers)
+		|| !undo_horizon_watermark_sources_current(&observed->fence, cohort->source_peers, &active)
 		/* Keep the old candidate if peer validation overlapped local ingress. */
 		|| !cluster_ctrc_active_scan_registration_current(&active.scan))
 		return false;
