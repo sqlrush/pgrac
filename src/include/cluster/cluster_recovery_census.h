@@ -156,8 +156,10 @@ typedef struct ClusterRecoveryCensusManifest {
 
 /* Raw current TT observations in the original retained work order. A zero
  * count is a valid complete empty view, distinct from missing observation.
- * Borrow only while the original Start/cursor/scope and all caller isolation
- * and freeze premises live. Identity matching is not terminal/history,
+ * The original Startup consumer separately checks every C0/preexisting
+ * terminal before publishing this unchanged raw view. Borrow only while the
+ * original Start/cursor/scope and all caller isolation and freeze premises
+ * live. Identity matching is not terminal/history,
  * canonical transaction, semantic coverage, apply or release authority. */
 typedef struct ClusterColdCtrcPhysicalV1 {
 	uint32 count;

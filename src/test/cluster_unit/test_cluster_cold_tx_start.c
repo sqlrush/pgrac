@@ -55,6 +55,7 @@ static ClusterWalWriterToken observed_writer;
 static bool native_recovery, binding_ok, writer_ok, allocation_ok;
 static bool effects_ready;
 static bool xid_ready, invalidate_writer_on_xid_ready;
+static void (*terminal_xid_step)(void);
 static unsigned scope_begins, scope_checks, scope_releases;
 static char observation_scope_object, observation_cursor_object;
 static unsigned observation_scope_begins, observation_census_begins, observation_steps,
@@ -313,6 +314,7 @@ cluster_cold_typed_xid_sources_ready_v1(const ClusterColdTypedV1 *candidate)
 {
 	if (invalidate_writer_on_xid_ready)
 		observed_writer.epoch++;
+	if (terminal_xid_step != NULL) terminal_xid_step();
 	return xid_ready && candidate == &typed;
 }
 
@@ -508,6 +510,7 @@ static void reset(void)
 	native_recovery = false;
 	effects_ready = false;
 	xid_ready = invalidate_writer_on_xid_ready = false;
+	terminal_xid_step = NULL;
 	scope_begins = scope_checks = scope_releases = fail_scope_check = 0;
 	scope_begin_ok = true;
 	target_reserves = target_releases = 0;
@@ -1930,10 +1933,17 @@ UT_TEST(test_original_error_revokes_ctrc_registration_with_the_owner_slot)
 #include "test_cluster_cold_tx_ctrc_subject.inc"
 #include "test_cluster_cold_ctrc_handoff.inc"
 #include "test_cluster_cold_ctrc_census.inc"
+#include "test_cluster_cold_ctrc_terminals.inc"
 
 int main(void)
 {
-	UT_PLAN(79);
+	UT_PLAN(85);
+	UT_RUN(test_ctrc_observation_requires_every_original_c0_terminal);
+	UT_RUN(test_startup_refuses_unusable_ctrc_terminal_before_independent_wait);
+	UT_RUN(test_ctrc_observation_qualifies_the_last_subject_without_rewriting_inputs);
+	UT_RUN(test_ctrc_borrowed_physical_view_rechecks_original_terminal_proofs);
+	UT_RUN(test_ctrc_terminal_recheck_preserves_exact_existing_terminals);
+	UT_RUN(test_ctrc_terminal_recheck_cleans_original_children_on_error_and_late_drift);
 	UT_RUN(test_ctrc_physical_input_keeps_work_order_and_raw_c0_successor);
 	UT_RUN(test_ctrc_physical_input_refuses_reuse_duplicates_and_ambiguous_originals);
 	UT_RUN(test_ctrc_physical_input_is_private_until_full_census_and_original_rechecks);
