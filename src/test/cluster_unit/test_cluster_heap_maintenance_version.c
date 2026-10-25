@@ -551,6 +551,7 @@ cluster_heap_freeze_policy_sample_current_v1(const ClusterHeapFreezePolicySample
  * acquisition/lease authority is controlled; independent mismatches are injected
  * below, so this never certifies the all-producer or native lifetime chain. */
 static bool original_worker_publication_get(ClusterUndoCleanerActiveSample *);
+static void worker_original_publish_fixture(const ClusterHeapFreezeCohortObservation *);
 
 bool
 cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out)
@@ -792,6 +793,67 @@ worker_getter_unlock(LWLock *lock)
 #undef cluster_undo_cleaner_active_sample_current
 #undef LWLockRelease
 #undef LWLockAcquire
+
+/* Original publisher inputs remain controlled; publication itself uses its
+ * original exclusive shared lock, independently traced from both readers. */
+static int publisher_worker, publisher_pid, publisher_unlock_fault;
+static unsigned publisher_lock_acquires, publisher_lock_releases;
+static ClusterCtrcActiveScan publisher_scan;
+static ClusterXidStripeSampleFence publisher_lease;
+static ClusterSemanticActiveSampleFence publisher_admission;
+
+static void
+worker_publisher_lock(LWLock *lock, LWLockMode mode)
+{
+	UT_ASSERT(lock == &native_worker_shared.lwlock && mode == LW_EXCLUSIVE);
+	UT_ASSERT(!worker_lock_held);
+	worker_lock_held = true; publisher_lock_acquires++;
+}
+
+static void
+worker_publisher_unlock(LWLock *lock)
+{
+	UT_ASSERT(lock == &native_worker_shared.lwlock && worker_lock_held);
+	worker_lock_held = false; publisher_lock_releases++;
+	switch (publisher_unlock_fault) {
+	case 1: ctrc_note_unqualified_registration(); break;
+	case 2: pg_atomic_write_u32(&StripeLease->failed, 1); break;
+	case 3: pg_atomic_fetch_add_u64(&native_admission_shared.admission_seq, 2); break;
+	case 4: native_worker_shared.shutdown_requested = true; break;
+	case 5: native_worker_shared.workers[0].status = UNDO_CLEANER_SPAWNING; break;
+	case 6: native_worker_shared.workers[0].pid++; break;
+	}
+}
+
+#define undo_cleaner_worker publisher_worker
+#define undo_cleaner_active_scan publisher_scan
+#define undo_cleaner_active_lease_fence publisher_lease
+#define undo_cleaner_active_admission_fence publisher_admission
+#define MyProcPid publisher_pid
+#define LWLockAcquire worker_publisher_lock
+#define LWLockRelease worker_publisher_unlock
+#define undo_cleaner_publish_active_sample original_worker_publication_publish
+#include "test_cluster_heap_freeze_worker_publisher.inc"
+#undef undo_cleaner_publish_active_sample
+#undef LWLockRelease
+#undef LWLockAcquire
+#undef MyProcPid
+#undef undo_cleaner_active_admission_fence
+#undef undo_cleaner_active_lease_fence
+#undef undo_cleaner_active_scan
+#undef undo_cleaner_worker
+
+static void
+worker_original_publish_fixture(const ClusterHeapFreezeCohortObservation *cohort)
+{
+	/* Controlled completed input and process identity; no census run-pass or
+	 * qualification is supplied by this helper. Keep the real sequence. */
+	publisher_worker = 0; publisher_pid = 42;
+	publisher_scan = cohort->local_registration_cut;
+	publisher_lease = retained_lease_fence;
+	publisher_admission = cohort->admission_fence;
+	original_worker_publication_publish();
+}
 
 static void
 worker_current_publish_fixture(const ClusterHeapFreezeCohortObservation *cohort)
@@ -1388,6 +1450,11 @@ reset(uint8 opcode, bool shared)
 	worker_lock_held = worker_register_on_unlock = false;
 	worker_lock_acquires = worker_lock_releases = worker_lease_checks = worker_admission_checks = 0;
 	getter_copy_acquires = getter_copy_releases = 0; getter_copy_fault = 0;
+	publisher_worker = 0; publisher_pid = 42; publisher_unlock_fault = 0;
+	publisher_lock_acquires = publisher_lock_releases = 0;
+	memset(&publisher_scan, 0, sizeof(publisher_scan));
+	memset(&publisher_lease, 0, sizeof(publisher_lease));
+	memset(&publisher_admission, 0, sizeof(publisher_admission));
 	cohort_worker_live = cohort_admission_live = true;
 	cohort_clock_error = cohort_peer_revoke_worker = false;
 	cohort_clock_revoke_worker = cohort_clock_revoke_admission = false;
@@ -4909,10 +4976,188 @@ UT_TEST(test_xmin_original_worker_getter_new_sample_does_not_refresh_old_cohort)
 	}
 }
 
+UT_TEST(test_xmin_original_worker_publisher_getter_continues_native_wal)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		qualified_xmin_require_peer(&f, 65);
+		native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id - 1;
+		memset(&native_worker_shared.active_sample, 0, sizeof(native_worker_shared.active_sample));
+		worker_original_publish_fixture(&f.cohort);
+		UT_ASSERT_EQ(native_worker_shared.active_sample.sample_id, f.cohort.source_local_sample_id);
+		UT_ASSERT_EQ(native_worker_shared.active_sample_sequence, f.cohort.source_local_sample_id);
+		UT_ASSERT_EQ(publisher_lock_acquires, 1); UT_ASSERT_EQ(publisher_lock_releases, 1);
+		UT_ASSERT(memcmp(&native_worker_shared.active_sample.scan, &publisher_scan, sizeof(publisher_scan)) == 0);
+		UT_ASSERT(memcmp(&native_worker_shared.active_sample.lease_fence, &publisher_lease, sizeof(publisher_lease)) == 0);
+		UT_ASSERT(memcmp(&native_worker_shared.active_sample.admission_fence, &publisher_admission, sizeof(publisher_admission)) == 0);
+		fixture_release_original_writer(); resume_allowed = true;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(getter_copy_acquires, 1); UT_ASSERT_EQ(getter_copy_releases, 1);
+		UT_ASSERT_EQ(worker_lock_acquires, 3); UT_ASSERT_EQ(worker_lock_releases, 3);
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT(!worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
+UT_TEST(test_xmin_original_worker_publisher_incomplete_preserves_last_image)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		ClusterUndoCleanerActiveSample before;
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id - 1;
+		worker_original_publish_fixture(&f.cohort);
+		before = native_worker_shared.active_sample;
+		publisher_scan.status = CTRC_ACTIVE_SCAN_INCOMPLETE;
+		publisher_scan.min_full = InvalidFullTransactionId;
+		publisher_scan.future_full = InvalidFullTransactionId;
+		publisher_lease.activation_generation++;
+		publisher_admission.record_generation++;
+		original_worker_publication_publish();
+		UT_ASSERT(memcmp(&before, &native_worker_shared.active_sample, sizeof(before)) == 0);
+		UT_ASSERT_EQ(native_worker_shared.active_sample_sequence, before.sample_id);
+		UT_ASSERT_EQ(publisher_lock_acquires, 1); UT_ASSERT_EQ(publisher_lock_releases, 1);
+		fixture_release_original_writer(); resume_allowed = true;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT(!worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
+UT_TEST(test_xmin_original_worker_publisher_invalid_clears_before_native_wal)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int fault = 0; fault < 5; fault++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			ClusterUndoCleanerActiveSample zero;
+			uint64 sequence;
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id - 1;
+			worker_original_publish_fixture(&f.cohort);
+			switch (fault) {
+			case 0: publisher_scan.status = CTRC_ACTIVE_SCAN_INVALID; break;
+			case 1: native_worker_shared.shutdown_requested = true; break;
+			case 2: native_worker_shared.workers[0].status = UNDO_CLEANER_SPAWNING; break;
+			case 3: native_worker_shared.workers[0].pid++; break;
+			case 4: native_worker_shared.active_sample_sequence = UINT64_MAX; break;
+			}
+			sequence = native_worker_shared.active_sample_sequence;
+			original_worker_publication_publish();
+			memset(&zero, 0, sizeof(zero));
+			UT_ASSERT(memcmp(&zero, &native_worker_shared.active_sample, sizeof(zero)) == 0);
+			UT_ASSERT_EQ(native_worker_shared.active_sample_sequence, sequence);
+			UT_ASSERT_EQ(publisher_lock_acquires, 2); UT_ASSERT_EQ(publisher_lock_releases, 2);
+			fixture_release_original_writer(); resume_allowed = true;
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(!worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_worker_publisher_nonowner_preserves_image)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int missing = 0; missing < 2; missing++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			ClusterUndoCleanerActiveSample before;
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id - 1;
+			worker_original_publish_fixture(&f.cohort);
+			before = native_worker_shared.active_sample;
+			publisher_scan.status = CTRC_ACTIVE_SCAN_INVALID;
+			if (missing) undo_cleaner_state = NULL;
+			else publisher_worker = 1;
+			original_worker_publication_publish();
+			UT_ASSERT(memcmp(&before, &native_worker_shared.active_sample, sizeof(before)) == 0);
+			UT_ASSERT_EQ(native_worker_shared.active_sample_sequence, before.sample_id);
+			UT_ASSERT_EQ(publisher_lock_acquires, 1); UT_ASSERT_EQ(publisher_lock_releases, 1);
+			undo_cleaner_state = &native_worker_shared;
+			fixture_release_original_writer(); resume_allowed = true;
+			UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+			UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+			UT_ASSERT(!worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+		}
+	}
+}
+
+UT_TEST(test_xmin_original_worker_publisher_sequence_exhaustion_does_not_wrap)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		ClusterUndoCleanerActiveSample out, zero;
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		f.cohort.source_local_sample_id = UINT64_MAX;
+		native_worker_shared.active_sample_sequence = UINT64_MAX - 1;
+		worker_original_publish_fixture(&f.cohort);
+		UT_ASSERT(original_worker_publication_get(&out));
+		UT_ASSERT_EQ(out.sample_id, UINT64_MAX);
+		UT_ASSERT_EQ(native_worker_shared.active_sample_sequence, UINT64_MAX);
+		original_worker_publication_publish();
+		memset(&out, 0xa5, sizeof(out)); memset(&zero, 0, sizeof(zero));
+		UT_ASSERT(!original_worker_publication_get(&out));
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		UT_ASSERT(memcmp(&native_worker_shared.active_sample, &zero, sizeof(zero)) == 0);
+		UT_ASSERT_EQ(native_worker_shared.active_sample_sequence, UINT64_MAX);
+		UT_ASSERT_EQ(publisher_lock_acquires, 2); UT_ASSERT_EQ(publisher_lock_releases, 2);
+		fixture_release_original_writer(); resume_allowed = true;
+		UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+		UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + inserts + edges + dirties + flushes, 0);
+		UT_ASSERT(!worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_original_worker_publisher_unlock_revocation_blocks_native_wal)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (int fault = 1; fault <= 6; fault++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			ClusterUndoCleanerActiveSample out, zero;
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id - 1;
+			publisher_unlock_fault = fault;
+			worker_original_publish_fixture(&f.cohort);
+			UT_ASSERT_EQ(native_worker_shared.active_sample.sample_id, f.cohort.source_local_sample_id);
+			UT_ASSERT_EQ(publisher_lock_acquires, 1); UT_ASSERT_EQ(publisher_lock_releases, 1);
+			memset(&out, 0xa5, sizeof(out)); memset(&zero, 0, sizeof(zero));
+			UT_ASSERT(!original_worker_publication_get(&out));
+			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+			fixture_release_original_writer(); resume_allowed = true;
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + inserts + edges + dirties + flushes, 0);
+			UT_ASSERT_EQ(getter_copy_acquires, getter_copy_releases);
+			UT_ASSERT_EQ(worker_lock_acquires, worker_lock_releases);
+			UT_ASSERT(!worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(131);
+	UT_PLAN(137);
+	UT_RUN(test_xmin_original_worker_publisher_getter_continues_native_wal);
+	UT_RUN(test_xmin_original_worker_publisher_incomplete_preserves_last_image);
+	UT_RUN(test_xmin_original_worker_publisher_invalid_clears_before_native_wal);
+	UT_RUN(test_xmin_original_worker_publisher_nonowner_preserves_image);
+	UT_RUN(test_xmin_original_worker_publisher_sequence_exhaustion_does_not_wrap);
+	UT_RUN(test_xmin_original_worker_publisher_unlock_revocation_blocks_native_wal);
 	UT_RUN(test_xmin_original_worker_getter_continues_native_wal);
 	UT_RUN(test_xmin_original_worker_getter_returns_shared_image_and_clears_refusal);
 	UT_RUN(test_xmin_original_worker_getter_rechecks_drift_after_copy_unlock);

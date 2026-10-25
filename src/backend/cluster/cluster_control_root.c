@@ -6756,6 +6756,7 @@ typedef struct StartupTargetWork {
 	ControlRootImage base, observed;
 	ClusterWalStartupImage op;
 	ClusterFormationSnapshotV1 formation;
+	uint64 recovered_claim_owner;
 	bool cf_held;
 } StartupTargetWork;
 
@@ -7080,6 +7081,11 @@ startup_advance_step(StartupAdvanceWork *work, const ClusterWalSourceRef *restar
 														 : result;
 	}
 	if (work->op.phase == CLUSTER_WAL_STARTUP_RESERVED) {
+		/* A recovered follower observes this cut without creating its writer
+		 * while the original founder is still completing native INSTALL. */
+		if (startup_has_recovered_input(&work->root)
+			&& cluster_recovery_merge_claim_owner_v1() == 0)
+			return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
 		result = cluster_control_root_v3_startup_prepare_target(&work->op.claim.identity,
 																work->op.operation_uuid, &prepared);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -7171,13 +7177,31 @@ startup_same_input_cohort(const ClusterWalStartupImage *selected,
 			   == 0;
 }
 
+/* The original founder alone may advance ahead of RESERVED peers. Keep
+ * one native claim incarnation across every I/O/CAS/confirmed cleanup cut.
+ * A locally CLOSED input remains dependent on a COMPLETE peer in this cut. */
+static bool
+startup_capture_recovery_owner(const ControlRootImage *root, const ClusterWalStartupImage *selected,
+							   uint64 *owner)
+{
+	*owner = 0;
+	if (selected->input_kind != CLUSTER_WAL_STARTUP_RECOVERED && !startup_has_recovered_input(root))
+		return true;
+	*owner = cluster_recovery_merge_claim_owner_v1();
+	return startup_recovery_claim_current(*owner);
+}
+
 /* Every declared target must still have exactly its selected incarnation.
  * A missing member is never an excuse to shrink a startup operation. */
 static ClusterControlRootResult
 startup_operation_formation(const ControlRootImage *root, uint32 phase, bool allow_progress,
 							const ClusterWalStartupImage *selected,
-							ClusterFormationSnapshotV1 *formation)
+							ClusterFormationSnapshotV1 *formation, uint64 recovered_claim_owner)
 {
+	if (recovered_claim_owner != 0
+		&& (selected->claim.identity.origin_node_id != cluster_node_id
+			|| !startup_recovery_claim_current(recovered_claim_owner)))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (root->header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
 		|| root->header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED
 		|| root->header.v2.serving[0] != 0 || root->header.v2.serving[1] != 0
@@ -7215,7 +7239,11 @@ startup_operation_formation(const ControlRootImage *root, uint32 phase, bool all
 		result = cluster_wal_startup_read_locked(root, node, &op);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
-		if ((op.phase != phase && !(allow_progress && op.phase == CLUSTER_WAL_STARTUP_DURABLE))
+		/* Peers have no native writer until the founder's real INSTALL. Their
+		 * full selected operation is still read/decoded and cohort-checked. */
+		if ((op.phase != phase && !(allow_progress && op.phase == CLUSTER_WAL_STARTUP_DURABLE)
+			 && !(recovered_claim_owner != 0 && node != (unsigned)cluster_node_id
+				  && op.phase == CLUSTER_WAL_STARTUP_RESERVED))
 			|| !startup_same_input_cohort(selected, &op)
 			|| op.config_generation != root->header.v2.config_generation
 			|| op.formation_epoch != formation->local_epoch
@@ -7223,7 +7251,8 @@ startup_operation_formation(const ControlRootImage *root, uint32 phase, bool all
 				   != formation->membership.last_admitted_incarnation[node])
 			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	}
-	if (!startup_complete_formation(root, formation, false, selected->input_kind))
+	if (!startup_complete_formation(root, formation, false, selected->input_kind)
+		|| (recovered_claim_owner != 0 && !startup_recovery_claim_current(recovered_claim_owner)))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
@@ -7252,6 +7281,10 @@ startup_prepare_target_locked(StartupTargetWork *work, const ClusterControlRootI
 		|| memcmp(operation_uuid, work->op.operation_uuid, 16) != 0
 		|| !startup_operation_owner(&work->base, &work->op))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if ((writer || work->op.phase != CLUSTER_WAL_STARTUP_RESERVED)
+		&& !startup_capture_recovery_owner(&work->base, &work->op,
+										  &work->recovered_claim_owner))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (work->op.phase != phase) {
 		/* The coordinator may BEGIN after this peer observed RESERVED and
 		 * dropped CF-S. Only the exact same operation and complete formation
@@ -7260,12 +7293,13 @@ startup_prepare_target_locked(StartupTargetWork *work, const ClusterControlRootI
 		if (action != STARTUP_TARGET_PREPARE || work->op.phase != CLUSTER_WAL_STARTUP_INITIALIZING)
 			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		result = startup_operation_formation(&work->base, CLUSTER_WAL_STARTUP_INITIALIZING, true,
-											 &work->op, &work->formation);
+											 &work->op, &work->formation,
+											 work->recovered_claim_owner);
 		return result == CLUSTER_CONTROL_ROOT_OK_PRIMARY ? CLUSTER_CONTROL_ROOT_CAS_CONFLICT
 														 : result;
 	}
 	result = startup_operation_formation(&work->base, phase, writer, &work->op,
-										 &work->formation);
+										 &work->formation, work->recovered_claim_owner);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	result = cluster_wal_startup_empty_locked(&work->base, node, !writer, !writer);
@@ -7287,7 +7321,7 @@ startup_prepare_target_locked(StartupTargetWork *work, const ClusterControlRootI
 	if (memcmp(work->observed.bytes, work->base.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
 		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
 	result = startup_operation_formation(&work->observed, phase, writer, &work->op,
-										 &formation);
+										 &formation, work->recovered_claim_owner);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (memcmp(&formation, &work->formation, sizeof(formation)) != 0
@@ -7340,6 +7374,9 @@ startup_target_read(const ClusterControlRootIdentity *self, const uint8 operatio
 	PG_END_TRY();
 	if (work->cf_held)
 		result = release_cf(ExclusiveLock, result);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && work->recovered_claim_owner != 0
+		&& !startup_recovery_claim_current(work->recovered_claim_owner))
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		*out = work->op;
 	pfree(work);
@@ -7423,18 +7460,17 @@ startup_begin_locked(StartupBeginWork *work, const ClusterControlRootIdentity *s
 		|| memcmp(operation_uuid, target->op.operation_uuid, 16) != 0
 		|| !startup_operation_owner(&target->base, &target->op))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	recovered = startup_has_recovered_input(&target->base);
+	if (!startup_capture_recovery_owner(&target->base, &target->op,
+									   &work->recovered_claim_owner))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = startup_operation_formation(&target->base, CLUSTER_WAL_STARTUP_RESERVED, false,
-										 &target->op, &target->formation);
+										 &target->op, &target->formation,
+										 work->recovered_claim_owner);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (target->base.header.file_txn_seq == UINT64_MAX)
 		return CLUSTER_CONTROL_ROOT_SEQUENCE_EXHAUSTED;
-	recovered = startup_has_recovered_input(&target->base);
-	if (recovered) {
-		work->recovered_claim_owner = cluster_recovery_merge_claim_owner_v1();
-		if (work->recovered_claim_owner == 0)
-			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	}
 	work->next = target->base;
 	work->next.header.file_txn_seq++;
 	work->next.header.published_at_usec = GetCurrentTimestamp();
@@ -7450,8 +7486,12 @@ startup_begin_locked(StartupBeginWork *work, const ClusterControlRootIdentity *s
 			return result;
 		if (!startup_same_input_cohort(&target->op, op))
 			return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
-		/* A remote target may have failed after creating readable metadata
-		 * but before its fsync. Reestablish durability ourselves before CAS. */
+		/* The recovered founder cannot wait for a peer writer that is still
+		 * blocked on this original claim. Its old input and RESERVED operation
+		 * stay selected; only the founder's actual target advances here. */
+		if (recovered && node != own)
+			continue;
+		/* Ordinary clean startup retains its original all-target fsync. */
 		result = cluster_wal_startup_empty_locked(&target->base, node, false, true);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
@@ -7462,7 +7502,7 @@ startup_begin_locked(StartupBeginWork *work, const ClusterControlRootIdentity *s
 		ClusterWalStartupImage *op = &work->operations[node];
 		ClusterWalStartupStage *stage = &work->stages[node];
 		ClusterWalStartupImage observed;
-		if (op->phase == 0)
+		if (op->phase == 0 || (recovered && node != own))
 			continue;
 		op->phase = CLUSTER_WAL_STARTUP_INITIALIZING;
 		op->generation = work->next.header.file_txn_seq;
@@ -7489,7 +7529,7 @@ startup_begin_locked(StartupBeginWork *work, const ClusterControlRootIdentity *s
 	if (!file_token_equal(expected, &token))
 		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
 	result = startup_operation_formation(&target->observed, CLUSTER_WAL_STARTUP_RESERVED, false,
-										 &target->op, &formation);
+										 &target->op, &formation, work->recovered_claim_owner);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (memcmp(&formation, &target->formation, sizeof(formation)) != 0
@@ -7497,7 +7537,7 @@ startup_begin_locked(StartupBeginWork *work, const ClusterControlRootIdentity *s
 		|| (recovered && !startup_recovery_claim_current(work->recovered_claim_owner)))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	for (unsigned node = 0; node < CLUSTER_MAX_NODES; ++node) {
-		if (work->operations[node].phase == 0)
+		if (work->operations[node].phase == 0 || (recovered && node != own))
 			continue;
 		result = cluster_wal_startup_empty_locked(&target->base, node, false, false);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -7512,7 +7552,7 @@ startup_begin_locked(StartupBeginWork *work, const ClusterControlRootIdentity *s
 	if (memcmp(target->observed.bytes, work->next.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
 		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
 	result = startup_operation_formation(&target->observed, CLUSTER_WAL_STARTUP_INITIALIZING, false,
-										 &target->op, &formation);
+										 &target->op, &formation, work->recovered_claim_owner);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (memcmp(&formation, &target->formation, sizeof(formation)) != 0
@@ -7588,6 +7628,7 @@ typedef struct StartupCheckpointWork {
 	ClusterWalStartupImage op, durable;
 	ClusterWalStartupStage operation_stage;
 	ClusterFormationSnapshotV1 formation;
+	uint64 recovered_claim_owner;
 } StartupCheckpointWork;
 
 static bool
@@ -7595,7 +7636,9 @@ startup_checkpoint_owner(const StartupCheckpointWork *work, const ClusterControl
 						 XLogRecPtr end)
 {
 	/* The dedicated EOR accessor observes native fsync before recovery DONE. */
-	return GetXLogInsertEndRecPtr() == end && ClusterXLogStartupFlushCovers(end, work->op.timeline)
+	return (work->recovered_claim_owner == 0
+			|| startup_recovery_claim_current(work->recovered_claim_owner))
+		   && GetXLogInsertEndRecPtr() == end && ClusterXLogStartupFlushCovers(end, work->op.timeline)
 		   && startup_operation_owner(&work->scan.base, &work->op)
 		   && cluster_wal_writer_startup_matches(self, work->op.operation_uuid,
 												 work->op.first_segment_lsn);
@@ -7620,7 +7663,7 @@ startup_checkpoint_reobserve(StartupCheckpointWork *work, const ClusterControlRo
 		!= 0)
 		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
 	result = startup_operation_formation(&work->observed, CLUSTER_WAL_STARTUP_INITIALIZING, true,
-										 &work->op, &formation);
+										 &work->op, &formation, work->recovered_claim_owner);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (memcmp(&formation, &work->formation, sizeof(formation)) != 0
@@ -7659,6 +7702,9 @@ startup_checkpoint_publish(StartupCheckpointWork *work, const ClusterControlRoot
 	result = cluster_wal_startup_read_locked(&scan->base, node, &work->op);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
+	if (!startup_capture_recovery_owner(&scan->base, &work->op,
+									   &work->recovered_claim_owner))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if ((work->op.phase != CLUSTER_WAL_STARTUP_INITIALIZING
 		 && work->op.phase != CLUSTER_WAL_STARTUP_DURABLE)
 		|| memcmp(operation_uuid, work->op.operation_uuid, 16) != 0
@@ -7666,7 +7712,7 @@ startup_checkpoint_publish(StartupCheckpointWork *work, const ClusterControlRoot
 		|| work->op.segment_size != wal_segment_size || !startup_checkpoint_owner(work, self, end))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = startup_operation_formation(&scan->base, CLUSTER_WAL_STARTUP_INITIALIZING, true,
-										 &work->op, &work->formation);
+										 &work->op, &work->formation, work->recovered_claim_owner);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	/* Re-read the actual predecessor claim/anchor, not a copy supplied by the
@@ -7908,6 +7954,9 @@ cluster_control_root_v3_startup_checkpoint(const ClusterControlRootIdentity *sel
 	}
 	PG_END_TRY();
 	result = startup_checkpoint_cleanup(work, result);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && work->recovered_claim_owner != 0
+		&& !startup_recovery_claim_current(work->recovered_claim_owner))
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		*out = work->durable;
 	pfree(work);
@@ -7926,11 +7975,83 @@ typedef struct StartupInstallWork {
 	bool already_installed;
 } StartupInstallWork;
 
+/* Archive the real cache-complete predecessor without turning it into a
+ * clean close. The founder keeps the original claim and native WALR guard;
+ * the immutable record still needs its exact claim, anchor and WAL tail. */
+static ClusterControlRootResult
+startup_install_record_locked(const StartupInstallWork *work, const ClusterWalHistoryRecord *record)
+{
+	const CheckpointV2Work *scan = &work->checkpoint.scan;
+	const ClusterControlRootSnapshot *snapshot = &record->snapshot;
+	ClusterRecoveryAnchorRefV2 anchor = { 0 };
+	ClusterWalThreadClaimRefV2 claim_ref = { 0 };
+	ClusterWalThreadClaimV2 claim;
+	ClusterWalSourceRef source = { 0 };
+	ClusterWalTailObservation tail;
+	ControlFileData raw;
+	ClusterControlRootResult result;
+	const uint32 flags = CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID
+						 | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_LAST_RECORD_VALID;
+
+	if (snapshot->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED)
+		return closed_v2_record_locked(&scan->base, snapshot, &record->refs, &scan->old_view);
+	if (snapshot->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
+		|| !startup_recovery_claim_current(work->checkpoint.recovered_claim_owner)
+		|| (snapshot->root_flags & flags) != flags
+		|| snapshot->recovered_through_lsn_exclusive != snapshot->validated_tail_lsn_exclusive
+		|| snapshot->recovered_tli != snapshot->tail_tli
+		|| snapshot->recovered_last_record_lsn != snapshot->tail_last_record_lsn
+		|| snapshot->recovered_last_record_crc32c != snapshot->tail_last_record_crc32c)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	claim_ref.identity = snapshot->identity;
+	claim_ref.database_incarnation = scan->base.header.v2.database_incarnation;
+	claim_ref.max_config_generation = scan->base.header.v2.config_generation;
+	memcpy(claim_ref.claim_sha256, record->refs.claim_sha256, 32);
+	result = cluster_wal_claim_v2_read(cluster_wal_threads_dir, &claim_ref, &claim);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	anchor.identity = snapshot->identity;
+	anchor.database_incarnation = claim_ref.database_incarnation;
+	anchor.max_config_generation = claim_ref.max_config_generation;
+	anchor.anchor_generation = record->refs.anchor_generation;
+	memcpy(anchor.anchor_sha256, record->refs.anchor_sha256, 32);
+	memcpy(anchor.claim_sha256, record->refs.claim_sha256, 32);
+	result = cluster_recovery_anchor_v2_read_locked(&anchor, &scan->old_view, &raw);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	result = cluster_recovery_anchor_v2_thread_state(&anchor, snapshot, &raw);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	/* A recovered tail may contain many records after its native checkpoint.
+	 * Retain that exact range; shutdown-only checkpoint/tail equality would
+	 * invent a clean-close proof and discard the actual recovery input. */
+	if (raw.checkPoint < snapshot->checkpoint_lower_lsn
+		|| raw.checkPoint >= snapshot->validated_tail_lsn_exclusive
+		|| raw.checkPointCopy.redo < snapshot->checkpoint_lower_lsn
+		|| raw.checkPointCopy.redo > raw.checkPoint
+		|| raw.checkPointCopy.ThisTimeLineID != snapshot->checkpoint_tli)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	source.claim = claim_ref;
+	source.timeline = snapshot->checkpoint_tli;
+	result = cluster_wal_tail_observe_checkpoint(
+		cluster_wal_threads_dir, &source, wal_segment_size, snapshot->checkpoint_lower_lsn,
+		snapshot->validated_tail_lsn_exclusive, raw.checkPoint, snapshot->checkpoint_record_crc32c,
+		&tail);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& (tail.complete_end != snapshot->validated_tail_lsn_exclusive
+			|| tail.last_record_start != snapshot->tail_last_record_lsn
+			|| tail.last_record_crc != snapshot->tail_last_record_crc32c))
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& !startup_recovery_claim_current(work->checkpoint.recovered_claim_owner))
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	return result;
+}
+
 static ClusterControlRootResult
 startup_install_history(StartupInstallWork *work, unsigned node)
 {
 	StartupCheckpointWork *check = &work->checkpoint;
-	CheckpointV2Work *scan = &check->scan;
 	ClusterWalHistoryRecord predecessor = check->op.predecessor;
 	ClusterControlRootResult result;
 	uint32 position = 0;
@@ -7977,8 +8098,7 @@ startup_install_history(StartupInstallWork *work, unsigned node)
 	++work->history.count;
 	for (uint32 i = 0; i < work->history.count; ++i) {
 		const ClusterWalHistoryRecord *record = &work->history.records[i];
-		result = closed_v2_record_locked(&scan->base, &record->snapshot, &record->refs,
-										 &scan->old_view);
+		result = startup_install_record_locked(work, record);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 	}
@@ -8100,12 +8220,15 @@ startup_install_publish(StartupInstallWork *work, const ClusterWalStartupImage *
 	}
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
+	if (!startup_capture_recovery_owner(&scan->base, &check->op,
+									   &check->recovered_claim_owner))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (check->op.config_generation != scan->base.header.v2.config_generation
 		|| check->op.segment_size != wal_segment_size
 		|| !startup_checkpoint_owner(check, self, end))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = startup_operation_formation(&scan->base, CLUSTER_WAL_STARTUP_INITIALIZING, true,
-										 &check->op, &check->formation);
+										 &check->op, &check->formation, check->recovered_claim_owner);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	result = startup_install_history(work, node);
@@ -8270,6 +8393,10 @@ cluster_control_root_v3_startup_install_writer(const ClusterWalStartupImage *exp
 	}
 	PG_END_TRY();
 	result = startup_install_cleanup(work, result);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& work->checkpoint.recovered_claim_owner != 0
+		&& !startup_recovery_claim_current(work->checkpoint.recovered_claim_owner))
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		*out = work->checkpoint.scan.source_ref;
 	pfree(work);

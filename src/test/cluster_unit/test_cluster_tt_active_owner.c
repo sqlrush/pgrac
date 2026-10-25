@@ -861,6 +861,10 @@ UT_TEST(test_missing_origin_identity_never_changes_active_success)
 	UT_ASSERT(!cluster_tt_slot_origin_identity_read(&g_ctrc_original_reservation.key, &full));
 	UT_ASSERT_EQ(lock_depth, 0);
 }
+#ifdef TT_ACTIVE_OWNER_FIXTURE_MAIN
+int TT_ACTIVE_OWNER_FIXTURE_MAIN(void);
+#define main TT_ACTIVE_OWNER_FIXTURE_MAIN
+#endif
 
 int
 main(void)
@@ -893,3 +897,6 @@ main(void)
 	UT_DONE();
 	return ut_failed_count != 0;
 }
+#ifdef TT_ACTIVE_OWNER_FIXTURE_MAIN
+#undef main
+#endif
