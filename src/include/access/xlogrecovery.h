@@ -194,8 +194,8 @@ extern bool ClusterColdRecoveryCtrcWorkCurrent(const struct ClusterRecoveryStart
 
 /* Original Startup after accepted TX: drive the complete read-only census
  * under its original CTRC scope, retaining both under this same Start.
- * memory_budget includes a full immutable work copy and the census's owned
- * allocation budget (not borrowed inputs/native reader/cryptohash storage).
+ * memory_budget includes the immutable work copy, current physical TT view
+ * and census-owned allocations (not borrowed inputs/reader/cryptohash storage).
  * Repeated calls only revalidate the saved observation; refusal is sticky.
  * DRAINED/manifest never supplies a semantic seal, freeze, PAGE authority,
  * service completion or release. Original Start cleanup retires cursor before
@@ -205,6 +205,17 @@ extern bool ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *
 /* First bounded observation refusal, valid only while original Start lives. */
 extern const char *ClusterColdRecoveryCtrcObservationRefusal(
 	const struct ClusterRecoveryStartV1 *start);
+
+/* Borrow the same complete raw physical TT view after original observation.
+ * Exact original Start/work and repeat observation revalidation are required;
+ * no new scope/census or source refresh. Run before PAGE/content protection:
+ * original interrupt/manifest checks may execute. NULL refuses, including a
+ * provisional/failed observation. Borrowed bytes are immutable until original
+ * owner cleanup; later protected consumers still recheck their own premises.
+ * The view grants no semantic seal, freeze, terminal or mutation authority. */
+struct ClusterColdCtrcPhysicalV1;
+extern const struct ClusterColdCtrcPhysicalV1 *ClusterColdRecoveryCtrcPhysical(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work);
 
 /* Original post-EOR owner only: require the complete sealed ordinary-effects
  * receipt before consuming any proven physical loser.  This is a read-only
