@@ -63,7 +63,7 @@ TESTS = test_cluster_vm_read_visibility test_cluster_heap_maintenance test_clust
         test_cluster_native_itl_trace test_cluster_tt_terminal_trace test_cluster_update_trace test_cluster_wait_resources test_cluster_content_trace test_cluster_content_trace_exec test_cluster_pcm_service_trace test_cluster_tx_identity_trace test_cluster_cr_dependency test_cluster_startup_exit test_cluster_config_members test_cluster_config_mount \
         test_cluster_heap_prepare_diagnostic test_cluster_generic_version test_cluster_generic_redo test_cluster_recovery_fpi_insert test_cluster_recovery_fpi_install \
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
-        test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_ctrc_successor_fence test_cluster_ctrc_dispatch test_cluster_heap_receipt \
+        test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_ctrc_horizon test_cluster_ctrc_successor_fence test_cluster_ctrc_dispatch test_cluster_heap_receipt \
         test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_pgproc_active_sample test_cluster_retention_sample test_cluster_active_sample_fence test_cluster_ctrc_itl_reuse test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_ges_holder test_cluster_ko_relation_scan test_cluster_ko_current_admission test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_ko_wait_trace test_cluster_ko_extend_range test_cluster_ko_extend_recovery test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop \
         test_cluster_bufmgr_stop test_cluster_allocation_stop test_cluster_hw_cold test_cluster_hw_initdb test_cluster_shared_parameters test_cluster_shared_config_alter test_cluster_checkpoint_pi_tick test_cluster_native_wal_stop test_cluster_checkpointer_stop test_cluster_postmaster_stop test_cluster_xnode_profile test_cluster_adg \
         test_cluster_xnode_lever test_cluster_ges_handoff \
@@ -437,7 +437,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_heap_cr_reuse test_cluster_snapshot_ad
 		test_cluster_r4_scratch_resolver,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_native_wal_stop test_cluster_hw_initdb test_cluster_hw_cold test_cluster_cr_inline_stop test_cluster_mrp_stop test_cluster_backup_stop test_cluster_recovery_stop test_cluster_node_remove_stop test_cluster_postmaster_stop test_cluster_checkpointer_stop test_cluster_allocation_stop test_cluster_raw_device_capacity test_cluster_replacement_wire \
 		test_cluster_external_fence test_pgrac_external_fence_protocol \
-		test_cluster_wal_retention test_cluster_terminal_ref_census test_cluster_ctrc_cleaner test_cluster_ctrc_successor_fence test_cluster_ctrc_dispatch test_cluster_heap_receipt \
+		test_cluster_wal_retention test_cluster_terminal_ref_census test_cluster_ctrc_cleaner test_cluster_ctrc_horizon test_cluster_ctrc_successor_fence test_cluster_ctrc_dispatch test_cluster_heap_receipt \
 		test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_pgproc_active_sample test_cluster_retention_sample test_cluster_active_sample_fence test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_ges_holder test_cluster_ko_relation_scan test_cluster_ko_current_admission test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_ko_wait_trace test_cluster_ko_extend_range test_cluster_ko_extend_recovery test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop,$(SIMPLE_TESTS))
 
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
@@ -591,14 +591,22 @@ test_cluster_relmap_arb: test_cluster_relmap_arb.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
+		test_cluster_relmap_producer_stage.inc \
 		$(top_srcdir)/src/backend/utils/cache/relmapper.c \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_writer.c \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_writer.h \
-		$(top_srcdir)/src/include/cluster/cluster_wal_claim.h $(CLUSTER_UNIT_PORT_LIBS)
+		$(top_srcdir)/src/include/cluster/cluster_wal_claim.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
+		test_cluster_relmap_v2_codec_product.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		test_cluster_relmap_v2_codec_product.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
@@ -9462,7 +9470,7 @@ test_cluster_ctrc_worker_sample.inc: $(top_srcdir)/src/backend/cluster/cluster_u
 	     emit { print } /^}/ { emit=0 } END { if (found != 5) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_ctrc_cleaner test_cluster_ctrc_capacity test_cluster_ctrc_dispatch \
+test_cluster_ctrc_cleaner test_cluster_ctrc_horizon test_cluster_ctrc_capacity test_cluster_ctrc_dispatch \
 test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: test_cluster_ctrc_read_scope.inc \
 		test_cluster_ctrc_worker_sample.inc \
 		test_cluster_ctrc_native_exit.inc test_cluster_ctrc_native_group_exit.inc \
@@ -9484,7 +9492,7 @@ test_cluster_undo_cleaner: $(top_srcdir)/src/include/cluster/cluster_undo_cleane
 	$(top_srcdir)/src/include/miscadmin.h
 
 # These fixtures use the real shared engine and PGPROC allocation identity.
-test_cluster_ctrc_cleaner test_cluster_ctrc_capacity test_cluster_ctrc_dispatch \
+test_cluster_ctrc_cleaner test_cluster_ctrc_horizon test_cluster_ctrc_capacity test_cluster_ctrc_dispatch \
 		test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: \
 		$(top_srcdir)/src/include/storage/proc.h
 
@@ -9496,6 +9504,39 @@ test_cluster_ctrc_cleaner: test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pas
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+
+# Compose the original native/shared protection owners with their V2 sender.
+test_cluster_ctrc_horizon_sender.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c Makefile
+	awk '/^typedef struct ClusterUndoHorizonSlotShmem / { types=1; found++ } \
+	     types { print } /^} ClusterUndoHorizonShmem;/ { types=0; print "static ClusterUndoHorizonShmem *UndoHorizonShmem;" } \
+	     /^undo_horizon_maintenance_sample\(/ { print "static UndoHorizonMaintenanceIntent"; emit=1; found++ } \
+	     /^undo_horizon_local_source_current\(/ { print "static bool"; emit=1; found++ } \
+	     /^undo_horizon_send_v2\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 4 || types || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_ctrc_horizon: test_cluster_ctrc_horizon.c test_cluster_ctrc_cleaner.c \
+		test_cluster_ctrc_horizon_sender.inc test_cluster_ctrc_run_pass.inc unit_test.h \
+		$(CLUSTER_SCN_O) $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
+		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
+		$(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c \
+		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_horizon.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_retention.h \
+		$(top_srcdir)/src/include/cluster/cluster_ic.h \
+		$(top_srcdir)/src/include/cluster/cluster_ic_envelope.h \
+		$(top_srcdir)/src/include/cluster/cluster_ic_router.h \
+		$(top_srcdir)/src/include/cluster/cluster_sf_dep.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_SCN_O) \
+		$(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c \
+		$(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+
+clean distclean maintainer-clean: clean-ctrc-horizon
+.PHONY: clean-ctrc-horizon
+clean-ctrc-horizon:
+	rm -f test_cluster_ctrc_horizon_sender.inc test_cluster_ctrc_horizon_sender.inc.tmp
 
 test_cluster_ctrc_successor_fence: test_cluster_ctrc_successor_fence.c test_cluster_ctrc_cleaner.c \
 		test_cluster_ctrc_run_pass.inc unit_test.h $(CLUSTER_SCN_O) \

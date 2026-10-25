@@ -85,6 +85,10 @@ static TimeLineID insert_timeline;
 static unsigned int writer_reads, observed_epoch_reads;
 static unsigned int drift_at, drift_kind;
 
+/* New stage-only tests share the original providers below. */
+static LWLock *v2_retention_lock;
+static bool v2_retention_held, v2_xidgen_held;
+
 /* Original runtime providers are explicit fixtures; token checks are real. */
 uint64 GetSystemIdentifier(void) { return UINT64CONST(0x1122334455667788); }
 uint64 cluster_epoch_get_current(void) { return writer_epoch; }
@@ -134,7 +138,15 @@ cluster_write_fence_observe(ClusterWriteFenceObservation *out)
 bool IsTransactionState(void) { return true; }
 bool RecoveryInProgress(void) { return false; }
 TimeLineID GetWALInsertionTimeLine(void) { return insert_timeline; }
-bool LWLockHeldByMe(LWLock *lock) { return lock == RelationMappingLock && local_held; }
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	if (lock == v2_retention_lock)
+		return v2_retention_held;
+	if (lock == XidGenLock)
+		return v2_xidgen_held;
+	return lock == RelationMappingLock && local_held;
+}
 FullTransactionId GetTopFullTransactionIdIfAny(void) { return assigned_xid; }
 
 static void
@@ -272,6 +284,12 @@ cluster_relmap_authority_read_header(bool shared pg_attribute_unused(),
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
+	if (lock == v2_retention_lock)
+	{
+		UT_ASSERT(mode == LW_EXCLUSIVE && !v2_retention_held);
+		v2_retention_held = true;
+		return true;
+	}
 	UT_ASSERT(lock == RelationMappingLock && mode == LW_EXCLUSIVE);
 	UT_ASSERT(authority_held && !local_held && CritSectionCount == 0);
 	local_held = true;
@@ -284,6 +302,12 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 void
 LWLockRelease(LWLock *lock)
 {
+	if (lock == v2_retention_lock)
+	{
+		UT_ASSERT(v2_retention_held);
+		v2_retention_held = false;
+		return;
+	}
 	UT_ASSERT(lock == RelationMappingLock && local_held);
 	local_held = false;
 }
@@ -1011,10 +1035,16 @@ UT_TEST(unarmed_commit_preserves_other_writers_pending_and_global_lock)
 	UT_ASSERT(authority_held && !local_held && CritSectionCount == 0);
 }
 
+#include "test_cluster_relmap_producer_stage.inc"
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(30);
+	UT_RUN(v2_original_stage_captures_merges_and_retains);
+	UT_RUN(v2_original_stage_pre_wal_refusals_preserve_outputs);
+	UT_RUN(v2_original_stage_late_refusals_keep_original_protection);
+	UT_RUN(v2_original_stage_errors_leave_original_failure_duties);
 	UT_RUN(shared_assigns_before_lock_and_wal);
 	UT_RUN(database_assigns_before_lock_and_wal);
 	UT_RUN(shared_reuses_existing_full_xid);

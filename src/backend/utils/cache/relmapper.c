@@ -137,6 +137,7 @@
 #include "cluster/cluster_relmap_authority.h" /* shared relmap authority (D5) */
 #include "cluster/cluster_relmap_lock.h"  /* singleton relmap X lock (D5) */
 #include "cluster/cluster_relmap_owner.h" /* immutable producer identity */
+#include "cluster/cluster_relmap_retention_runtime.h"
 #include "cluster/cluster_sinval.h"		  /* cross-node inval ack barrier (2.39) */
 #include "cluster/storage/cluster_smgr.h" /* cluster_smgr_invalidate_relmap */
 #include "storage/sinval.h"				  /* SendSharedInvalidMessages */
@@ -1303,6 +1304,83 @@ static ClusterRelmapPublishArm cluster_relmap_publish_arms[2];
 
 /* Bounded post-commit retries before fail-stop (r4-P1). */
 #define CLUSTER_RELMAP_PUBLISH_RETRIES 10
+
+bool
+cluster_relmap_producer_stage_v2(bool shared, const RelMapFile *updates,
+	ClusterRelmapOwnerSampleV2 *owner_out, ClusterRelmapV2Image *staged_out)
+{
+	ClusterRelmapOwnerSampleV2 sample;
+	ClusterRelmapV2Namespace identity = { 0 };
+	ClusterRelmapV2View base, checked;
+	ClusterRelmapV2Image staged = { 0 };
+	XLogRecPtr end;
+
+	/* The original caller owns global X and every eventual terminal duty.
+	 * Capture can assign the top xid, so it precedes local locking and WAL. */
+	if (updates == NULL || owner_out == NULL || staged_out == NULL
+		|| updates->num_mappings < 0 || updates->num_mappings > MAX_MAPPINGS
+		|| LWLockHeldByMe(RelationMappingLock) || LWLockHeldByMe(XidGenLock)
+		|| (!shared && (!OidIsValid(MyDatabaseTableSpace)
+			|| MyDatabaseTableSpace == GLOBALTABLESPACE_OID))
+		|| !cluster_relmap_owner_capture_v2(&sample))
+		return false;
+	identity.system_identifier = sample.writer.ref.claim.identity.system_identifier;
+	identity.database_incarnation = sample.writer.ref.claim.database_incarnation;
+	identity.shared = shared;
+	identity.dbid = shared ? InvalidOid : MyDatabaseId;
+
+	/* A committed-only/fallback read cannot prove the pending set empty. */
+	if (cluster_relmap_authority_v2_read(&identity, &base) != CLUSTER_RELMAP_V2_PAIR_VALID
+		|| !base.pending_complete || base.has_pending || base.committed_generation == 0
+		|| base.committed_generation == UINT64_MAX
+		|| !cluster_relmap_owner_matches_v2(&sample)
+		|| cluster_relmap_retention_runtime_begin_v2(&sample, &identity,
+			base.committed_generation + 1) != CLUSTER_RELMAP_RETENTION_OK)
+		return false;
+
+	LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
+	/* Keep the exact originally prepared generation and complete native base.
+	 * A changed pair is a refusal, never permission to adopt a newer base. */
+	if (cluster_relmap_authority_v2_read(&identity, &checked) != CLUSTER_RELMAP_V2_PAIR_VALID
+		|| !checked.pending_complete || checked.has_pending
+		|| checked.committed_generation != base.committed_generation
+		|| memcmp(&checked.committed, &base.committed, sizeof(RelMapFile)) != 0
+		|| !cluster_relmap_owner_matches_v2(&sample))
+		goto refused;
+	staged.identity = identity;
+	staged.committed_generation = base.committed_generation;
+	staged.pending_generation = base.committed_generation + 1;
+	staged.committed = base.committed;
+	staged.pending = base.committed;
+	merge_map_updates(&staged.pending, updates, allowSystemTableMods);
+	staged.pending.magic = RELMAPPER_FILEMAGIC;
+	if (staged.pending.num_mappings < 0 || staged.pending.num_mappings > MAX_MAPPINGS)
+		elog(ERROR, "attempt to write bogus relation mapping");
+	INIT_CRC32C(staged.pending.crc);
+	COMP_CRC32C(staged.pending.crc, (char *) &staged.pending, offsetof(RelMapFile, crc));
+	FIN_CRC32C(staged.pending.crc);
+
+	/* Existing native insertion flushes its actual returned end before the
+	 * original dual-copy writer can mark/stage. No caller-supplied WAL end. */
+	end = cluster_relmap_retention_runtime_insert_pending_v2(&sample, &identity,
+		staged.pending_generation, &staged.pending);
+	if (end == InvalidXLogRecPtr)
+		goto refused;
+	staged.pending_owner = sample.owner;
+	staged.pending_owner.wal_end = end;
+	LWLockRelease(RelationMappingLock);
+	if (!cluster_relmap_owner_matches_v2(&sample))
+		return false;
+	*owner_out = sample;
+	*staged_out = staged;
+	return true;
+
+refused:
+	/* Even an unstaged preparation remains the original caller's obligation.
+	 * False can follow durable writes; do not cancel, retry or clear pins. */
+	LWLockRelease(RelationMappingLock);
+	return false;
+}
 
 static void
 cluster_perform_relmap_update(bool shared, const RelMapFile *updates)
