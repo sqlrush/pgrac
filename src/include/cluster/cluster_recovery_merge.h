@@ -583,14 +583,20 @@ cluster_recovery_merge_fence_plan_complete_v1(ClusterRecoveryFencePlan *plan, ui
  * above).  acquire_blocking runs in PerformWalRecovery BEFORE the engage
  * decision (crash recovery only -- never archive/standby/restore, whose
  * recovery is unbounded or off-regime); it no-ops unless the shared-WAL
- * regime is fully configured.  release runs in StartupXLOG AFTER the
- * end-of-recovery checkpoint (only then is the recovered content durable
- * in shared storage; releasing at merge end would let a late booter
- * re-merge from stale storage concurrently with this node's live
- * writes). */
+ * regime is fully configured. CLEAN/no-retained-input release follows its
+ * synchronous end-of-recovery checkpoint. Retained cold recovery keeps the
+ * same original claim through transaction/CTRC acceptance and private input
+ * handoff; EOR alone does not end that executor's shared mutations. */
 extern void cluster_recovery_merge_claim_acquire_blocking(void);
 extern void cluster_recovery_merge_claim_release_if_held(void);
 extern bool cluster_recovery_merge_claim_is_held(void);
+/* Full original FD/name/bytes validation outside target/content locks.
+ * Zero refuses; this process-local incarnation never adopts a disk claim. */
+extern uint64 cluster_recovery_merge_claim_owner_v1(void);
+/* Local custody only, no I/O or acquisition. Match the original creator,
+ * ResourceOwner/boot and incarnation before using retained service inputs.
+ * This does not replace full file revalidation across I/O or at retirement. */
+extern bool cluster_recovery_merge_claim_owner_current_nowait_v1(uint64 owner);
 
 extern ClusterRecoveryMergeState *cluster_recovery_merge_begin(const uint64 merge_bitmap[2],
 															   const XLogRecPtr *start_lsn,

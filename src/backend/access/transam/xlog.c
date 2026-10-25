@@ -8023,21 +8023,18 @@ StartupXLOG(void)
 	 * PGRAC spec-6.14 D5: with recovery durable, the sole merger resolves
 	 * any staged relmap-authority pending image (publish if the owner
 	 * committed, discard if it aborted, keep + fail-closed if unprovable)
-	 * BEFORE the claim is released -- no concurrent merger, no live relmap
-	 * writer can race the arbitration.  No-op without the claim.
+	 * BEFORE the claim is released. A retained recovery still has transaction
+	 * and CTRC work after native DONE; keep its original claim and defer both
+	 * operations to that service handoff. CLEAN/no-attempt keeps this boundary.
 	 */
-	cluster_relmap_arbitrate_pendings();
+	if (endOfRecoveryInfo->cluster_cold_inputs == NULL)
+	{
+		cluster_relmap_arbitrate_pendings();
 
-	/*
-	 * PGRAC spec-6.14 D9 amend (INV-D9-R): release the shared-regime
-	 * crash-recovery claim only NOW -- the end-of-recovery checkpoint above
-	 * ran synchronously (CHECKPOINT_WAIT), so every page this recovery
-	 * produced is durable in shared storage.  Releasing at merge end
-	 * instead would let a late-booting peer engage its own merge against
-	 * stale storage while this node's buffered content is still in flight.
-	 * No-op unless this startup acquired the claim.
-	 */
-	cluster_recovery_merge_claim_release_if_held();
+		/* No retained service can still mutate shared storage in this case.
+		 * The existing synchronous EOR durability condition remains required. */
+		cluster_recovery_merge_claim_release_if_held();
+	}
 
 	/*
 	 * PGRAC (GCS-race round-2 RC-E): with redo complete and the CLOG SLRU
@@ -8286,7 +8283,19 @@ StartupXLOG(void)
 	 * TX acceptance alone cannot transfer or destroy its private work. */
 	if (!cluster_recovery_ctrc_result_wait_v1(endOfRecoveryInfo->cluster_tx_start))
 		ereport(FATAL, (errmsg("could not complete original Startup CTRC result handoff")));
+	if (endOfRecoveryInfo->cluster_cold_inputs != NULL)
+	{
+		/* Full original file validation may yield; recheck the exact Start
+		 * after it, before arbitration or retiring any private input. */
+		if (!cluster_recovery_merge_claim_is_held()
+			|| !ClusterColdRecoveryTxCurrent(endOfRecoveryInfo->cluster_tx_start))
+			ereport(FATAL, (errmsg("original recovery claim changed before service handoff")));
+		cluster_relmap_arbitrate_pendings();
+	}
 	ClusterReleaseColdRecoveryInputs(endOfRecoveryInfo);
+	/* Private-scope cleanup/handoff can fail. Retire the original claim only
+	 * after it succeeds; uncertain unlink/sync/CF release remains fatal debt. */
+	cluster_recovery_merge_claim_release_if_held();
 #endif
 }
 

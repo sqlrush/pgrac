@@ -702,6 +702,7 @@ struct ClusterRecoveryStartV1 {
 	uint64 owner_boot;
 	uint64 generation;
 	uint64 serial;
+	uint64 claim_owner;
 	uint64 install_generation;
 	ClusterWalWriterToken writer;
 	uint8 operation_uuid[16];
@@ -822,6 +823,7 @@ ClusterColdRecoveryTxCurrent(const struct ClusterRecoveryStartV1 *start)
 		|| start->generation == 0 || start->serial == 0 || start->pid != MyProcPid
 		|| start->owner != CurrentResourceOwner || start->owner_boot == 0
 		|| start->owner_boot != cluster_qvotec_get_self_incarnation()
+		|| !cluster_recovery_merge_claim_owner_current_nowait_v1(start->claim_owner)
 		|| start->inputs != cluster_recovery_cold_inputs || start->inputs == NULL
 		|| start->inputs->inputs != NULL || start->inputs->plan == NULL
 		|| start->tx_fence == NULL || start->tx_fence != start->inputs->tx_fence
@@ -1420,7 +1422,7 @@ ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 	struct ClusterRecoveryStartV1 *start;
 	ClusterWalWriterToken writer;
 	uint8 operation_uuid[16];
-	uint64 owner_boot, install_generation;
+	uint64 owner_boot, install_generation, claim_owner;
 
 	if (info == NULL)
 		return false;
@@ -1439,6 +1441,11 @@ ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 		|| CurrentResourceOwner == NULL || MyProcPid <= 0
 		|| cluster_recovery_cold_generation == PG_UINT64_MAX
 		|| !ClusterStartupInstalledRecoveryWriterV1(&writer, operation_uuid, &install_generation))
+		return false;
+	/* Original retained recovery is still serialized by its exact creator.
+	 * This full file check runs before target protection, not in Current. */
+	claim_owner = cluster_recovery_merge_claim_owner_v1();
+	if (claim_owner == 0)
 		return false;
 	owner_boot = cluster_qvotec_get_self_incarnation();
 	if (owner_boot == 0 || owner_boot != writer.ref.claim.identity.origin_owner_incarnation)
@@ -1459,6 +1466,7 @@ ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 	start->owner_boot = owner_boot;
 	start->generation = ++cluster_recovery_cold_generation;
 	start->serial = 1;
+	start->claim_owner = claim_owner;
 	start->install_generation = install_generation;
 	start->writer = writer;
 	memcpy(start->operation_uuid, operation_uuid, 16);

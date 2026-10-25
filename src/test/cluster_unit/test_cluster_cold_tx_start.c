@@ -320,6 +320,43 @@ static void test_fatal(void)
 #undef ereport
 #define ereport(level, rest) test_fatal()
 
+/* Actual filesystem custody runs in merge_claim. These are its native owner
+ * and retirement boundaries, controlled alongside the original writer leaves. */
+static bool claim_held, claim_read_ok, claim_arbitrate_error, claim_release_error;
+static uint64 claim_serial;
+static unsigned claim_arbitrations, claim_releases, claim_destroys_at_release;
+uint64 cluster_recovery_merge_claim_owner_v1(void);
+bool cluster_recovery_merge_claim_owner_current_nowait_v1(uint64 owner);
+uint64 cluster_recovery_merge_claim_owner_v1(void)
+{
+	return claim_held && claim_read_ok ? claim_serial : 0;
+}
+bool cluster_recovery_merge_claim_owner_current_nowait_v1(uint64 owner)
+{
+	return claim_held && owner != 0 && owner == claim_serial;
+}
+bool cluster_recovery_merge_claim_is_held(void) { return claim_held && claim_read_ok; }
+void cluster_relmap_arbitrate_pendings(void);
+void cluster_relmap_arbitrate_pendings(void)
+{
+	if (!claim_held) return;
+	claim_arbitrations++;
+	if (claim_arbitrate_error) test_fatal();
+}
+void cluster_recovery_merge_claim_release_if_held(void)
+{
+	if (!claim_held) return;
+	if (!claim_read_ok || claim_release_error) test_fatal();
+	claim_destroys_at_release = input_destroys;
+	claim_releases++;
+	claim_held = false;
+}
+static void actual_startup_eor_claim(EndOfWalRecoveryInfo *endOfRecoveryInfo)
+{
+	(void)endOfRecoveryInfo;
+#include "test_cluster_cold_tx_claim_eor_boundary.inc"
+}
+
 #include "test_cluster_cold_tx_writer.inc"
 #include "test_cluster_cold_tx_owner.inc"
 #include "test_cluster_cold_tx_xid_maximum.inc"
@@ -558,6 +595,10 @@ static void reset(void)
 	MyBackendType = B_STARTUP;
 	MyProcPid = 81;
 	if (exit_callback != NULL) exit_callback(0, (Datum)0);
+	claim_held = claim_read_ok = true;
+	claim_serial = 19;
+	claim_arbitrate_error = claim_release_error = false;
+	claim_arbitrations = claim_releases = claim_destroys_at_release = 0;
 	found_window_region = false;
 	cluster_recovery_plan_shmem_init();
 	memset(&pre_cut, 0, sizeof(pre_cut));
@@ -2184,9 +2225,17 @@ UT_TEST(test_c0_error_closes_target_before_ir_and_walr)
 	stamp_live = false; reserved_target = NULL; tx_ir_held = false;
 }
 
+#include "test_cluster_cold_claim_service.inc"
+
 int main(void)
 {
-	UT_PLAN(93);
+	UT_PLAN(99);
+	UT_RUN(test_original_recovered_claim_spans_eor_pending_service_and_handoff);
+	UT_RUN(test_claim_eor_preserves_original_clean_no_attempt_behavior);
+	UT_RUN(test_start_requires_the_original_live_claim_incarnation);
+	UT_RUN(test_failed_pending_ctrc_keeps_original_claim_and_inputs);
+	UT_RUN(test_final_claim_validation_or_arbitration_failure_retains_inputs);
+	UT_RUN(test_claim_release_failure_never_returns_startup_success);
 	UT_RUN(test_ctrc_observation_requires_every_original_c0_terminal);
 	UT_RUN(test_startup_refuses_unusable_ctrc_terminal_before_independent_wait);
 	UT_RUN(test_ctrc_observation_qualifies_the_last_subject_without_rewriting_inputs);

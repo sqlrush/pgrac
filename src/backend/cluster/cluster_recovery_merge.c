@@ -835,6 +835,36 @@ cluster_recovery_merge_claim_is_held(void)
 	return merge_claim_custody_current();
 }
 
+uint64
+cluster_recovery_merge_claim_owner_v1(void)
+{
+	return merge_claim_custody_current() ? merge_claim_custody.serial : 0;
+}
+
+bool
+cluster_recovery_merge_claim_owner_current_nowait_v1(uint64 owner)
+{
+	MergeClaimCustody *c = &merge_claim_custody;
+	char path[MAXPGPATH];
+	int n;
+
+	/* A foreign old stamp must not revoke another valid original creator. */
+	if (owner == 0 || !merge_claim_held || c->revoked
+		|| owner != c->serial || owner != merge_claim_serial)
+		return false;
+	n = cluster_shared_data_dir == NULL ? -1
+		: snprintf(path, sizeof(path), "%s/global/pgrac_merge.claim", cluster_shared_data_dir);
+	if (c->owner == NULL || c->owner != CurrentResourceOwner || c->pid != getpid()
+		|| c->boot == 0 || c->boot != cluster_qvotec_get_self_incarnation()
+		|| c->fd < 0 || c->directory_fd < 0 || c->image.node != cluster_node_id
+		|| c->image.sysid != GetSystemIdentifier()
+		|| n < 0 || (size_t)n >= sizeof(path) || strcmp(path, c->path) != 0) {
+		c->revoked = true;
+		return false;
+	}
+	return true;
+}
+
 /*
  * cluster_recovery_merge_claim_release_if_held -- see header.
  */
