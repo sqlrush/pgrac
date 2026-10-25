@@ -8988,10 +8988,473 @@ UT_TEST(test_census_original_origin_retirement_advances_walk_and_rejects_old_can
 	}
 }
 
+/* Original publisher control flow and record/identity helpers execute below.
+ * Current-lock, physical I/O, admission and WAL insertion are explicit leaves;
+ * in-memory readback here does not certify disk durability or live authority. */
+#include "cluster/cluster_undo_segment.h"
+#include "cluster/cluster_undo_smgr.h"
+#include "cluster/storage/cluster_undo_block0.h"
+#include "cluster/storage/cluster_undo_block0_current.h"
+#include "cluster/storage/cluster_undo_xlog.h"
+
+typedef enum DurableCertificateFault {
+	DURABLE_OK, DURABLE_ENTER_DENIED, DURABLE_ROOT_DENIED, DURABLE_ACQUIRE_FAILED,
+	DURABLE_GENERATION_FAILED, DURABLE_GENERATION_UNKNOWN, DURABLE_GENERATION_CHANGED,
+	DURABLE_PIN_FAILED, DURABLE_INITIAL_READ_FAILED, DURABLE_INITIAL_MISMATCH,
+	DURABLE_BAD_HEADER, DURABLE_BAD_SLOT, DURABLE_ROOT_CHANGED, DURABLE_SHARED_CHANGED,
+	DURABLE_WAL_INVALID, DURABLE_FINAL_READ_FAILED, DURABLE_FINAL_MISMATCH,
+	DURABLE_FINAL_FLAG_MISSING, DURABLE_PIN_GENERATION_CHANGED,
+	DURABLE_FINAL_ADMISSION_DENIED, DURABLE_FINAL_CURRENT_DENIED,
+	DURABLE_RELEASE_FAILED, DURABLE_COMMIT_CHANGED,
+	DURABLE_ERROR_ACQUIRE, DURABLE_ERROR_FLUSH, DURABLE_ERROR_READBACK, DURABLE_ERROR_RELEASE
+} DurableCertificateFault;
+static DurableCertificateFault durable_fault;
+static const ClusterCtrcOriginCertificateSnapshot *durable_snapshot;
+static PGAlignedBlock durable_disk, durable_resident;
+static xl_undo_tt_slot_ctrc_release_v1 durable_record;
+static bool durable_admitted, durable_current, durable_pinned;
+static unsigned durable_enters, durable_leaves, durable_roots, durable_reads;
+static unsigned durable_wals, durable_flushes, durable_rechecks, durable_admission_checks;
+static unsigned durable_commits, durable_cancels, durable_wakeups;
+static char durable_events[80]; static unsigned durable_event_count;
+static int durable_node, durable_timeout = 50;
+static volatile sig_atomic_t durable_interrupt_pending;
+static void durable_event(char c) {
+	UT_ASSERT(durable_event_count + 1 < sizeof(durable_events));
+	durable_events[durable_event_count++] = c; durable_events[durable_event_count] = 0;
+}
+static void durable_process_interrupts(void) { UT_ASSERT(false); }
+static uint64 durable_system_id(void) { return durable_snapshot->origin.key.system_identifier; }
+static uint64 durable_epoch(void) { return durable_snapshot->origin.key.cluster_epoch; }
+static uint64 durable_incarnation(void) { return durable_snapshot->origin.key.origin_boot_incarnation; }
+static void durable_reason(ClusterCtrcCleanerReason reason) { (void)reason; }
+static void durable_barrier(ClusterCtrcTestBarrierPhase phase) { UT_ASSERT_EQ(phase, CTRC_TEST_BARRIER_CERTIFICATE_READY); }
+static void durable_wakeup(void) {
+	UT_ASSERT(!durable_admitted && !durable_current && !durable_pinned); durable_wakeups++;
+}
+static ClusterSemanticAdmissionResult
+durable_enter(ClusterSemanticAdmissionToken *admission)
+{
+	durable_enters++;
+	if (durable_fault == DURABLE_ENTER_DENIED) return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+	UT_ASSERT(!durable_admitted && !durable_current && !durable_pinned);
+	admission->entered = true; admission->record_generation = durable_snapshot->origin.key.admission_record_generation;
+	admission->formation_epoch = durable_snapshot->origin.key.formation_epoch;
+	durable_admitted = true; durable_event('E'); return CLUSTER_SEMANTIC_ADMISSION_OK;
+}
+static void durable_leave(ClusterSemanticAdmissionToken *admission) {
+	UT_ASSERT(admission->entered && durable_admitted && !durable_current && !durable_pinned);
+	durable_leaves++; durable_admitted = false; admission->entered = false; durable_event('L');
+	if (durable_fault == DURABLE_COMMIT_CHANGED) ctrc_origin_entries()[durable_snapshot->origin_index].grant_generation++;
+}
+static bool
+durable_resolve(const ClusterSemanticAdmissionToken *admission, ClusterUndoPathIntent intent,
+	uint32 owner, uint32 segment, ClusterUndoBlock0ResolvedRoot *root)
+{
+	UT_ASSERT(admission->entered && durable_admitted); UT_ASSERT_EQ(intent, CLUSTER_UNDO_PATH_RUNTIME_SHARED);
+	UT_ASSERT_EQ(owner, durable_snapshot->origin.key.owner_instance); UT_ASSERT_EQ(segment, durable_snapshot->origin.key.segment_id);
+	durable_roots++;
+	if (durable_fault == DURABLE_ROOT_DENIED) return false;
+	root->intent = intent; root->root_id = durable_snapshot->origin.key.root_id;
+	root->root_generation = durable_snapshot->origin.key.root_generation;
+	if (durable_roots == 2 && durable_fault == DURABLE_ROOT_CHANGED) root->root_generation++;
+	if (durable_roots == 2 && durable_fault == DURABLE_SHARED_CHANGED) ctrc_origin_entries()[durable_snapshot->origin_index].grant_generation++;
+	return true;
+}
+static ClusterUndoBlock0CurrentStep
+durable_acquire(const ClusterUndoBlock0LogicalKey *key, int timeout,
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure)
+{
+	(void)guard; (void)failure;
+	UT_ASSERT(admission->entered && durable_admitted && !durable_current); UT_ASSERT_EQ(timeout, durable_timeout);
+	UT_ASSERT_EQ(key->segment_id, durable_snapshot->origin.key.segment_id); UT_ASSERT_EQ(key->owner_instance, durable_snapshot->origin.key.owner_instance);
+	if (durable_fault == DURABLE_ACQUIRE_FAILED) return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+	durable_current = true; durable_event('A');
+	return durable_fault == DURABLE_ERROR_ACQUIRE ? CLUSTER_UNDO_BLOCK0_CURRENT_PENDING : CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
+}
+static ClusterUndoBlock0CurrentStep
+durable_acquire_poll(ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure)
+{
+	(void)guard; (void)failure; UT_ASSERT(durable_current && durable_fault == DURABLE_ERROR_ACQUIRE);
+	elog(ERROR, "injected original certificate acquire poll ERROR"); return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+}
+static bool durable_wait(ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0ReplyWaitSite site) {
+	(void)guard; (void)site; UT_ASSERT(false); return true;
+}
+static void durable_pause(long microseconds) { (void)microseconds; UT_ASSERT(false); }
+static ClusterUndoBlock0Result
+durable_generation(ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root, ClusterUndoBlock0Generation *generation)
+{
+	(void)guard; (void)root; UT_ASSERT(durable_current && durable_admitted && !durable_pinned);
+	if (durable_fault == DURABLE_GENERATION_FAILED) return CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH;
+	generation->known = durable_fault != DURABLE_GENERATION_UNKNOWN;
+	generation->value = durable_snapshot->origin.key.segment_generation + (durable_fault == DURABLE_GENERATION_CHANGED);
+	return CLUSTER_UNDO_BLOCK0_OK;
+}
+static ClusterUndoBlock0Result
+durable_pin(ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
+	const ClusterUndoBlock0Generation *generation, ClusterUndoBlock0Pin *pin, char **page)
+{
+	(void)guard; (void)root; UT_ASSERT(durable_current && durable_admitted && !durable_pinned);
+	if (durable_fault == DURABLE_PIN_FAILED) return CLUSTER_UNDO_BLOCK0_NOT_FOUND;
+	pin->slot = 0; pin->mode = CLUSTER_UNDO_BLOCK0_EXCLUSIVE; pin->observed_generation = *generation;
+	*page = durable_resident.data; durable_pinned = true; durable_event('P'); return CLUSTER_UNDO_BLOCK0_OK;
+}
+static bool
+durable_read(ClusterUndoPathIntent intent, uint32 segment, uint8 owner, uint32 block, char *out)
+{
+	UT_ASSERT_EQ(intent, CLUSTER_UNDO_PATH_RUNTIME_SHARED); UT_ASSERT_EQ(block, 0);
+	UT_ASSERT_EQ(segment, durable_snapshot->origin.key.segment_id); UT_ASSERT_EQ(owner, durable_snapshot->origin.key.owner_instance);
+	UT_ASSERT(durable_pinned && durable_current && durable_admitted); durable_reads++;
+	if ((durable_reads == 1 && durable_fault == DURABLE_INITIAL_READ_FAILED)
+		|| (durable_reads == 2 && durable_fault == DURABLE_FINAL_READ_FAILED)) return false;
+	if (durable_reads == 2 && durable_fault == DURABLE_ERROR_READBACK) elog(ERROR, "injected certificate readback ERROR");
+	if (durable_reads == 1 && (durable_fault == DURABLE_BAD_HEADER || durable_fault == DURABLE_BAD_SLOT)) {
+		UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)durable_disk.data;
+		if (durable_fault == DURABLE_BAD_HEADER) header->segment_id++;
+		else header->tt_slots[durable_snapshot->origin.key.slot_offset].xid++;
+		memcpy(durable_resident.data, durable_disk.data, BLCKSZ);
+	}
+	if (durable_reads == 2 && durable_fault == DURABLE_FINAL_FLAG_MISSING) {
+		((UndoSegmentHeaderData *)durable_disk.data)->tt_slots[durable_snapshot->origin.key.slot_offset].flags = 0;
+		memcpy(durable_resident.data, durable_disk.data, BLCKSZ);
+	}
+	memcpy(out, durable_disk.data, BLCKSZ);
+	if ((durable_reads == 1 && durable_fault == DURABLE_INITIAL_MISMATCH)
+		|| (durable_reads == 2 && durable_fault == DURABLE_FINAL_MISMATCH)) out[BLCKSZ - 1] ^= 1;
+	return true;
+}
+static bool durable_admission_current(const ClusterSemanticAdmissionToken *admission) {
+	UT_ASSERT(admission->entered && durable_admitted); durable_admission_checks++;
+	return !(durable_admission_checks == 2 && durable_fault == DURABLE_FINAL_ADMISSION_DENIED);
+}
+static ClusterUndoBlock0Result durable_current_recheck(ClusterUndoBlock0CurrentGuard *guard) {
+	(void)guard; UT_ASSERT(durable_current && durable_pinned); durable_rechecks++;
+	return durable_rechecks == 2 && durable_fault == DURABLE_FINAL_CURRENT_DENIED ? CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED : CLUSTER_UNDO_BLOCK0_OK;
+}
+static XLogRecPtr durable_insert(const xl_undo_tt_slot_ctrc_release_v1 *record) {
+	UT_ASSERT(durable_admitted && durable_current && durable_pinned); durable_wals++;
+	UT_ASSERT_EQ(ctrc_origin_entries()[durable_snapshot->origin_index].state, CTRC_ORIGIN_CERTIFYING);
+	durable_record = *record; durable_event('W');
+	return durable_fault == DURABLE_WAL_INVALID ? InvalidXLogRecPtr : UINT64_C(0x123450);
+}
+static void durable_flush(ClusterUndoBlock0Pin *pin, const char *successor, XLogRecPtr lsn, bool metadata_only) {
+	UT_ASSERT(durable_admitted && durable_current && durable_pinned); UT_ASSERT(!metadata_only); UT_ASSERT_EQ(lsn, UINT64_C(0x123450));
+	durable_flushes++; durable_event('F');
+	if (durable_fault == DURABLE_ERROR_FLUSH) elog(ERROR, "injected certificate flush ERROR");
+	memcpy(durable_disk.data, successor, BLCKSZ); memcpy(durable_resident.data, successor, BLCKSZ);
+	if (durable_fault == DURABLE_PIN_GENERATION_CHANGED) pin->observed_generation.value++;
+}
+static void durable_unpin(ClusterUndoBlock0Pin *pin) {
+	UT_ASSERT(pin->slot == 0 && durable_pinned && durable_current && durable_admitted);
+	durable_pinned = false; durable_event('U'); pin->slot = -1;
+}
+static ClusterUndoBlock0CurrentStep
+durable_release(ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure) {
+	(void)guard; (void)failure; UT_ASSERT(!durable_pinned && durable_current && durable_admitted);
+	if (durable_fault == DURABLE_ERROR_RELEASE) return CLUSTER_UNDO_BLOCK0_CURRENT_PENDING;
+	durable_current = false; durable_event('R');
+	return durable_fault == DURABLE_RELEASE_FAILED ? CLUSTER_UNDO_BLOCK0_CURRENT_FAILED : CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED;
+}
+static ClusterUndoBlock0CurrentStep
+durable_release_poll(ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure) {
+	(void)guard; (void)failure; UT_ASSERT(durable_current && !durable_pinned && durable_fault == DURABLE_ERROR_RELEASE);
+	elog(ERROR, "injected certificate release poll ERROR"); return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+}
+static void durable_cancel(ClusterUndoBlock0CurrentGuard *guard) {
+	(void)guard; UT_ASSERT(durable_current && !durable_pinned && durable_admitted);
+	durable_cancels++; durable_current = false; durable_event('X');
+}
+static bool durable_commit(const ClusterCtrcOriginCertificateSnapshot *snapshot) {
+	UT_ASSERT(!durable_current && !durable_pinned && !durable_admitted && durable_events[durable_event_count - 1] == 'L');
+	durable_commits++; durable_event('C'); return original_origin_reply_origin_certificate_commit_shared(snapshot);
+}
+#define cluster_ctrc_origin_certificate_digest original_durable_certificate_digest
+#define ctrc_origin_certificate_snapshot_matches_shared original_durable_snapshot_matches
+#define ctrc_cleaner_publish_certificate original_durable_publish
+#define cluster_undo_block0_root_valid original_durable_root_valid
+#define cluster_undo_block0_root_matches original_durable_root_matches
+#define cluster_undo_block0_generation_matches original_durable_generation_matches
+#define cluster_ctrc_origin_certificate_validate original_origin_reply_origin_certificate_validate
+#define cluster_ctrc_local_release_ack_encode original_certificate_local_release_ack_encode
+#define ctrc_put_u16_le original_certificate_put_u16_le
+#define ctrc_put_u32_le original_certificate_put_u32_le
+#define cluster_ctrc_shmem_ready original_census_shmem_ready
+#define ctrc_origin_certificate_snapshot_index_locked original_origin_reply_origin_certificate_snapshot_index_locked
+#define ctrc_origin_certificate_commit_shared durable_commit
+#define cluster_ctrc_stat_bump original_census_stat_bump
+#define LWLockAcquire participant_publisher_lock_acquire
+#define LWLockRelease participant_publisher_lock_release
+#define cluster_node_id durable_node
+#define cluster_ges_request_timeout_ms durable_timeout
+#define GetSystemIdentifier durable_system_id
+#define cluster_epoch_get_current durable_epoch
+#define cluster_qvotec_get_self_incarnation durable_incarnation
+#define cluster_ctrc_cleaner_reason_set durable_reason
+#define cluster_ctrc_test_barrier_wait durable_barrier
+#define cluster_undo_cleaner_wakeup durable_wakeup
+#define cluster_semantic_activation_enter_r4_terminal_census durable_enter
+#define cluster_semantic_activation_leave durable_leave
+#define cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census durable_resolve
+#define cluster_semantic_activation_recheck_r4_terminal_census durable_admission_current
+#define cluster_undo_block0_current_acquire_begin_ctrc_release durable_acquire
+#define cluster_undo_block0_current_acquire_poll durable_acquire_poll
+#define cluster_undo_block0_current_wait_reply durable_wait
+#define cluster_undo_block0_current_sample_generation_exclusive durable_generation
+#define cluster_undo_block0_current_pin_exclusive durable_pin
+#define cluster_undo_block0_current_recheck_exclusive durable_current_recheck
+#define cluster_undo_block0_current_release_begin durable_release
+#define cluster_undo_block0_current_release_poll durable_release_poll
+#define cluster_undo_block0_current_cancel durable_cancel
+#define cluster_undo_block0_unpin durable_unpin
+#define cluster_undo_smgr_read_block durable_read
+#define cluster_undo_xlog_insert_tt_ctrc_release durable_insert
+#define cluster_undo_block0_flush_sync durable_flush
+#define pg_usleep durable_pause
+#define InterruptPending durable_interrupt_pending
+#define ProcessInterrupts durable_process_interrupts
+#include "test_cluster_heap_ctrc_durable_certificate.inc"
+#undef ProcessInterrupts
+#undef InterruptPending
+#undef pg_usleep
+#undef cluster_undo_block0_flush_sync
+#undef cluster_undo_xlog_insert_tt_ctrc_release
+#undef cluster_undo_smgr_read_block
+#undef cluster_undo_block0_unpin
+#undef cluster_undo_block0_current_cancel
+#undef cluster_undo_block0_current_release_poll
+#undef cluster_undo_block0_current_release_begin
+#undef cluster_undo_block0_current_recheck_exclusive
+#undef cluster_undo_block0_current_pin_exclusive
+#undef cluster_undo_block0_current_sample_generation_exclusive
+#undef cluster_undo_block0_current_wait_reply
+#undef cluster_undo_block0_current_acquire_poll
+#undef cluster_undo_block0_current_acquire_begin_ctrc_release
+#undef cluster_semantic_activation_recheck_r4_terminal_census
+#undef cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census
+#undef cluster_semantic_activation_leave
+#undef cluster_semantic_activation_enter_r4_terminal_census
+#undef cluster_undo_cleaner_wakeup
+#undef cluster_ctrc_test_barrier_wait
+#undef cluster_ctrc_cleaner_reason_set
+#undef cluster_qvotec_get_self_incarnation
+#undef cluster_epoch_get_current
+#undef GetSystemIdentifier
+#undef cluster_ges_request_timeout_ms
+#undef cluster_node_id
+#undef LWLockRelease
+#undef LWLockAcquire
+#undef cluster_ctrc_stat_bump
+#undef ctrc_origin_certificate_commit_shared
+#undef ctrc_origin_certificate_snapshot_index_locked
+#undef cluster_ctrc_shmem_ready
+#undef ctrc_put_u32_le
+#undef ctrc_put_u16_le
+#undef cluster_ctrc_local_release_ack_encode
+#undef cluster_ctrc_origin_certificate_validate
+#undef cluster_undo_block0_generation_matches
+#undef cluster_undo_block0_root_matches
+#undef cluster_undo_block0_root_valid
+#undef ctrc_cleaner_publish_certificate
+#undef ctrc_origin_certificate_snapshot_matches_shared
+#undef cluster_ctrc_origin_certificate_digest
+
+static void durable_observers_reset(const ClusterCtrcOriginCertificateSnapshot *snapshot) {
+	UndoSegmentHeaderData *header;
+	durable_snapshot = snapshot; durable_fault = DURABLE_OK; durable_node = snapshot->origin.key.origin_node_id;
+	durable_admitted = durable_current = durable_pinned = false;
+	durable_enters = durable_leaves = durable_roots = durable_reads = durable_wals = durable_flushes = 0;
+	durable_rechecks = durable_admission_checks = durable_commits = durable_cancels = durable_wakeups = 0;
+	durable_event_count = 0; memset(durable_events, 0, sizeof(durable_events));
+	memset(&durable_disk, 0, sizeof(durable_disk)); memset(&durable_record, 0, sizeof(durable_record));
+	header = (UndoSegmentHeaderData *)durable_disk.data;
+	header->segment_id = snapshot->origin.key.segment_id; header->owner_instance = snapshot->origin.key.owner_instance;
+	header->wrap_count = snapshot->origin.key.segment_generation; header->tt_slots_count = TT_SLOTS_PER_SEGMENT;
+	header->tt_slots[snapshot->origin.key.slot_offset].xid = snapshot->origin.key.xid;
+	header->tt_slots[snapshot->origin.key.slot_offset].wrap = snapshot->origin.key.slot_wrap;
+	header->tt_slots[snapshot->origin.key.slot_offset].status = TT_SLOT_COMMITTED;
+	header->tt_slots[snapshot->origin.key.slot_offset].commit_scn = 9;
+	memcpy(durable_resident.data, durable_disk.data, BLCKSZ);
+}
+static bool durable_snapshot_fixture(QualifiedXminFixture *f, CensusRuntimeAllocation *runtime,
+	ClusterHeapFreezeXminTargetV1 *targets, bool batch, ClusterCtrcReceiptHandle *handle,
+	uint64 *index, ClusterCtrcOriginCertificateSnapshot *snapshot)
+{
+	ClusterCtrcOriginEntry *origin; ClusterCtrcLocalReleaseAckV1 *ack; bool exact;
+	if (!ack_ready_fixture(f, runtime, targets, batch, handle) || !census_original_nonempty_ack_freeze(handle)
+		|| !original_census_origin_index(&handle->key, index)) return false;
+	origin = &ctrc_origin_entries()[*index]; ack = &original_certificate_participant_ack_entries()[handle->participant_index];
+	participant_publisher_lock_acquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	UT_ASSERT(original_origin_reply_origin_begin_seal_entry(origin, 17));
+	UT_ASSERT(original_origin_reply_origin_arm_close_entry(origin, ack->participant_node_id, 11));
+	UT_ASSERT(original_origin_reply_origin_note_close_reply_entry(origin, ack->participant_node_id, 11, CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK));
+	UT_ASSERT(original_origin_reply_origin_begin_cleaning_entry(origin));
+	participant_publisher_lock_release(&CtrcShared->origin_lock);
+	if (!original_origin_reply_origin_ack_land_shared(11, ack)) return false;
+	participant_publisher_lock_acquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	exact = original_origin_reply_origin_certificate_snapshot_index_locked(*index, snapshot);
+	participant_publisher_lock_release(&CtrcShared->origin_lock);
+	if (!exact) return false;
+	UT_ASSERT_EQ(origin->state, CTRC_ORIGIN_CERTIFYING); durable_observers_reset(snapshot); return true;
+}
+static bool census_origin_durable_certificate_publish(const ClusterCtrcOriginCertificateSnapshot *snapshot) {
+	return original_durable_publish(snapshot);
+}
+
+UT_TEST(test_census_durable_certificate_rejects_empty_snapshot_without_commit)
+{
+	ClusterCtrcOriginCertificateSnapshot empty = {0};
+	UT_ASSERT(!census_origin_durable_certificate_publish(NULL));
+	UT_ASSERT(!census_origin_durable_certificate_publish(&empty));
+}
+
+UT_TEST(test_census_original_durable_publisher_commits_after_readback_and_cleanup)
+{
+	for (int shape = 0; shape < 4; shape++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+		ClusterCtrcOriginCertificateSnapshot snapshot; PGAlignedBlock expected; uint64 index;
+		UndoSegmentHeaderData *header; bool replay = (shape & 1) != 0;
+		if (!durable_snapshot_fixture(&f, &runtime, NULL, false, &handle, &index, &snapshot)) { UT_ASSERT(false); return; }
+		header = (UndoSegmentHeaderData *)durable_disk.data;
+		if (shape & 2) { header->tt_slots[handle.key.slot_offset].status = TT_SLOT_ABORTED; header->tt_slots[handle.key.slot_offset].commit_scn = InvalidScn; }
+		if (replay) header->tt_slots[handle.key.slot_offset].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+		memcpy(durable_resident.data, durable_disk.data, BLCKSZ); expected = durable_disk;
+		((UndoSegmentHeaderData *)expected.data)->tt_slots[handle.key.slot_offset].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+		UT_ASSERT(census_origin_durable_certificate_publish(&snapshot));
+		UT_ASSERT_EQ(ctrc_origin_entries()[index].state, CTRC_ORIGIN_RELEASE_PROVEN);
+		UT_ASSERT(FullTransactionIdEquals(ctrc_origin_entries()[index].original_full_xid, handle.original_full_xid));
+		UT_ASSERT_EQ(handle.participant->state, CTRC_PARTICIPANT_ACK_FROZEN);
+		UT_ASSERT(memcmp(durable_disk.data, expected.data, BLCKSZ) == 0);
+		UT_ASSERT(memcmp(durable_resident.data, expected.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(durable_wals, !replay); UT_ASSERT_EQ(durable_flushes, !replay);
+		UT_ASSERT_EQ(durable_reads, 2); UT_ASSERT_EQ(durable_commits, 1); UT_ASSERT_EQ(durable_wakeups, 1);
+		UT_ASSERT_EQ(durable_enters, 1); UT_ASSERT_EQ(durable_leaves, 1);
+		UT_ASSERT(strcmp(durable_events, replay ? "EAPURLC" : "EAPWFURLC") == 0);
+		UT_ASSERT(!durable_admitted && !durable_current && !durable_pinned);
+		if (!replay) {
+			UT_ASSERT(cluster_undo_tt_ctrc_release_valid(&durable_record));
+			UT_ASSERT_EQ(durable_record.xid, handle.key.xid); UT_ASSERT_EQ(durable_record.seal_generation, 17);
+			UT_ASSERT(!ctrc_bytes_zero(durable_record.ack_set_digest, sizeof(durable_record.ack_set_digest)));
+		}
+		UT_ASSERT_EQ(participant_lock_depth, 0); census_full_layout_release(&runtime);
+	}
+}
+
+UT_TEST(test_census_original_durable_publisher_preflight_keeps_origin_before_wait)
+{
+	for (int fault = 0; fault < 10; fault++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+		ClusterCtrcOriginCertificateSnapshot snapshot, bad; ClusterCtrcOriginEntry before; uint64 index;
+		if (!durable_snapshot_fixture(&f, &runtime, NULL, false, &handle, &index, &snapshot)) { UT_ASSERT(false); return; }
+		bad = snapshot; before = ctrc_origin_entries()[index];
+		switch (fault) {
+			case 0: bad.origin.state = CTRC_ORIGIN_OPEN; break;
+			case 1: bad.origin.grant_generation++; break;
+			case 2: bad.origin.seal_generation = UINT64_MAX; break;
+			case 3: bad.origin.key.system_identifier++; break;
+			case 4: bad.origin.key.origin_boot_incarnation++; break;
+			case 5: bad.origin.key.segment_id++; break;
+			case 6: bad.ack_count = 0; break;
+			case 7: bad.acks[0].crc32c ^= 1; break;
+			case 8: bad.origin_index = CtrcShared->origin_key_entries; break;
+			case 9: durable_node = 1; break;
+		}
+		UT_ASSERT(!census_origin_durable_certificate_publish(&bad));
+		UT_ASSERT(memcmp(&before, &ctrc_origin_entries()[index], sizeof(before)) == 0);
+		UT_ASSERT_EQ(durable_enters + durable_roots + durable_wals + durable_flushes + durable_commits, 0);
+		UT_ASSERT(!durable_pinned && !durable_current && !durable_admitted);
+		UT_ASSERT_EQ(participant_lock_depth, 0); census_full_layout_release(&runtime);
+	}
+}
+
+UT_TEST(test_census_original_durable_publisher_refusals_never_commit_origin)
+{
+	for (DurableCertificateFault fault = DURABLE_ENTER_DENIED; fault <= DURABLE_COMMIT_CHANGED; fault++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+		ClusterCtrcOriginCertificateSnapshot snapshot; uint64 index;
+		if (!durable_snapshot_fixture(&f, &runtime, NULL, false, &handle, &index, &snapshot)) { UT_ASSERT(false); return; }
+		durable_fault = fault;
+		UT_ASSERT(!census_origin_durable_certificate_publish(&snapshot));
+		UT_ASSERT_EQ(ctrc_origin_entries()[index].state, CTRC_ORIGIN_CERTIFYING);
+		UT_ASSERT(FullTransactionIdEquals(ctrc_origin_entries()[index].original_full_xid, handle.original_full_xid));
+		UT_ASSERT_EQ(handle.participant->state, CTRC_PARTICIPANT_ACK_FROZEN);
+		UT_ASSERT_EQ(durable_wals, fault >= DURABLE_WAL_INVALID);
+		UT_ASSERT_EQ(durable_flushes, fault > DURABLE_WAL_INVALID);
+		UT_ASSERT_EQ(durable_commits, fault == DURABLE_COMMIT_CHANGED);
+		UT_ASSERT_EQ(durable_leaves, fault != DURABLE_ENTER_DENIED);
+		UT_ASSERT_EQ(durable_wakeups, 0); UT_ASSERT_EQ(durable_cancels, 0);
+		UT_ASSERT(!durable_pinned && !durable_current && !durable_admitted);
+		UT_ASSERT_EQ(participant_lock_depth, 0); UT_ASSERT_EQ(inserts + dirties + flushes, 0);
+		census_full_layout_release(&runtime);
+	}
+}
+
+UT_TEST(test_census_original_durable_publisher_error_unpins_before_guard_and_admission)
+{
+	for (DurableCertificateFault fault = DURABLE_ERROR_ACQUIRE; fault <= DURABLE_ERROR_RELEASE; fault++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+		ClusterCtrcOriginCertificateSnapshot snapshot; ClusterCtrcOriginEntry before; uint64 index;
+		if (!durable_snapshot_fixture(&f, &runtime, NULL, false, &handle, &index, &snapshot)) { UT_ASSERT(false); return; }
+		before = ctrc_origin_entries()[index]; durable_fault = fault; expecting_error = true;
+		if (setjmp(error_jump) == 0) { (void)census_origin_durable_certificate_publish(&snapshot); UT_ASSERT(false); }
+		else {
+			UT_ASSERT(PG_exception_stack == NULL); UT_ASSERT_EQ(durable_leaves, 1); UT_ASSERT_EQ(durable_cancels, 1);
+			UT_ASSERT(!durable_pinned && !durable_current && !durable_admitted);
+			UT_ASSERT(strcmp(durable_events, fault == DURABLE_ERROR_ACQUIRE ? "EAXL" : "EAPWFUXL") == 0);
+			UT_ASSERT_EQ(durable_commits + durable_wakeups, 0);
+			UT_ASSERT(memcmp(&before, &ctrc_origin_entries()[index], sizeof(before)) == 0);
+			UT_ASSERT_EQ(participant_lock_depth, 0); UT_ASSERT(!local_x && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+		}
+		expecting_error = false; census_full_layout_release(&runtime);
+	}
+}
+
+UT_TEST(test_census_original_durable_publish_then_retirement_keeps_old_native_candidate_closed)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+		ClusterHeapFreezeXminTargetV1 targets[3]; ClusterCtrcOriginCertificateSnapshot snapshot;
+		uint64 index, total, expected_passes, passes = 1; uint16 node;
+		if (!durable_snapshot_fixture(&f, &runtime, targets, batch != 0, &handle, &index, &snapshot)) { UT_ASSERT(false); return; }
+		node = handle.participant->identity.node_id;
+		UT_ASSERT(census_origin_durable_certificate_publish(&snapshot));
+		UT_ASSERT_EQ(durable_commits, 1); UT_ASSERT_EQ(durable_wals, 1); UT_ASSERT_EQ(durable_flushes, 1);
+		UT_ASSERT(FullTransactionIdEquals(ctrc_origin_entries()[index].original_full_xid, handle.original_full_xid));
+		participant_publisher_lock_acquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+		UT_ASSERT(original_origin_reply_origin_arm_certificate_entry(&ctrc_origin_entries()[index], node, 123));
+		participant_publisher_lock_release(&CtrcShared->origin_lock);
+		certificate_observers_reset(); UT_ASSERT(origin_reply_reclaim_receiver(&handle));
+		UT_ASSERT(census_origin_certificate_reply(123, node));
+		UT_ASSERT(ctrc_bytes_zero(&ctrc_origin_entries()[index], sizeof(ClusterCtrcOriginEntry)));
+		sampler_xids[0] = 152;
+		pg_atomic_write_u64(&sampler_slots[0].cluster_top_full_xid_atomic, U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 152)));
+		total = runtime.capacity.origin_key_entries + runtime.capacity.participant_key_entries;
+		expected_passes = (total + CLUSTER_CTRC_ACTIVE_SCAN_SLICE - 1) / CLUSTER_CTRC_ACTIVE_SCAN_SLICE;
+		native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id; resume_allowed = true;
+		worker_original_sample_pass_fixture(&f.cohort);
+		while (pass_pending && passes <= expected_passes) { original_worker_sample_active_pass(); passes++; }
+		UT_ASSERT_EQ(passes, expected_passes); UT_ASSERT_EQ(publisher_scan.next_index, total);
+		UT_ASSERT_EQ(publisher_scan.status, CTRC_ACTIVE_SCAN_COMPLETE); UT_ASSERT_EQ(publisher_scan.unqualified_entries, 0);
+		UT_ASSERT(FullTransactionIdEquals(publisher_scan.min_full, FullTransactionIdFromEpochAndXid(1, 152)));
+		UT_ASSERT_EQ(native_worker_shared.active_sample.sample_id, f.cohort.source_local_sample_id + 1);
+		UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+		UT_ASSERT_EQ(inserts + dirties + flushes + conditional_resumes, 0);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered); UT_ASSERT_EQ(backend_pin_count, 1);
+		census_full_layout_release(&runtime);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(214);
+	UT_PLAN(220);
+	UT_RUN(test_census_durable_certificate_rejects_empty_snapshot_without_commit);
+	UT_RUN(test_census_original_durable_publisher_commits_after_readback_and_cleanup);
+	UT_RUN(test_census_original_durable_publisher_preflight_keeps_origin_before_wait);
+	UT_RUN(test_census_original_durable_publisher_refusals_never_commit_origin);
+	UT_RUN(test_census_original_durable_publisher_error_unpins_before_guard_and_admission);
+	UT_RUN(test_census_original_durable_publish_then_retirement_keeps_old_native_candidate_closed);
 	UT_RUN(test_census_origin_rejects_unarmed_certificate_reply_without_retiring);
 	UT_RUN(test_census_original_certificate_reply_retires_origin_and_inbox_once);
 	UT_RUN(test_census_original_origin_reply_rejects_stale_request_or_result);
