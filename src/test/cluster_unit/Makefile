@@ -575,6 +575,7 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		test_cluster_relmap_terminal_callbacks.inc \
 		test_cluster_relmap_precommit_final.inc \
 		test_cluster_relmap_original_tt.inc test_cluster_relmap_native_tt.h \
+		test_cluster_relmap_tt_retention.inc \
 		test_cluster_relmap_native_tt.o test_cluster_relmap_native_tt_durable.o \
 		test_cluster_relmap_native_lock.inc test_cluster_relmap_native_lock.h \
 		test_cluster_relmap_native_lock.o \
