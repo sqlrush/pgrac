@@ -31,6 +31,7 @@ int control_fixture_main(int argc, char **argv);
 #include "cluster/cluster_relmap_authority.h"
 #include "cluster/cluster_sinval.h"
 #include "cluster/cluster_conf.h"
+#include "test_cluster_relmap_native_clog.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
 #include "utils/relmapper.h"
@@ -38,6 +39,8 @@ int control_fixture_main(int argc, char **argv);
 /* This retained-WAL fixture grants no physical execution census ownership. */
 bool cluster_shared_catalog;
 static bool relmap_root_merger, relmap_root_namespace_x;
+static bool cold_native_real_clog;
+static TestRelmapNativeClogStats cold_native_clog_last;
 bool
 cluster_recovery_merge_claim_is_held(void)
 {
@@ -2448,6 +2451,8 @@ cluster_clog_native_recovery_base_read_v1(int origin, TransactionId xid,
 										  ClusterClogNativeBaseV1 *out)
 {
 	prefix_base_reads++;
+	if (cold_native_real_clog)
+		return test_relmap_native_clog_read(origin, xid, out, PG_exception_stack);
 	memset(out, 0, sizeof(*out));
 	if (origin == cluster_node_id || prefix_base_fault == 2)
 		return false;
@@ -3387,7 +3392,10 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(119);
+	UT_PLAN(122);
+	UT_RUN(test_cold_native_actual_clog_commit_abort_and_full_page);
+	UT_RUN(test_cold_native_actual_clog_missing_short_and_io_failures);
+	UT_RUN(test_cold_native_actual_clog_late_base_change_or_error);
 	UT_RUN(test_cold_native_commit_abort_actual_pair_and_fresh_committed);
 	UT_RUN(test_cold_native_clean_does_not_read_clog_or_write_pairs);
 	UT_RUN(test_cold_native_unknown_and_native_error_keep_pending);

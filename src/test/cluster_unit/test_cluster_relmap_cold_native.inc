@@ -81,6 +81,8 @@ cold_native_setup(bool shared, bool aborted, bool clean)
 		relmap_census_file(fd, cold_native_paths[i], &image);
 	}
 	UT_ASSERT_EQ(close(fd), 0);
+	if (cold_native_real_clog)
+		test_relmap_native_clog_setup(test_root, 0, 99, prefix_base_status, prefix_base_last_byte);
 	test_startup_sync_hook = cold_native_sync;
 }
 
@@ -91,6 +93,11 @@ cold_native_done(ClusterRelmapRetentionCensus *census)
 	test_startup_sync_hook = NULL;
 	test_history_fail_sync = test_history_sync_count = 0;
 	cluster_relmap_retention_census_destroy(census);
+	if (cold_native_real_clog) {
+		cold_native_clog_last = test_relmap_native_clog_done();
+		UT_ASSERT_EQ(cold_native_clog_last.open_fds, 0);
+		UT_ASSERT_EQ(cold_native_clog_last.assertion_failed, 0);
+	}
 	if (execution_root_fd >= 0)
 		UT_ASSERT(fcntl(execution_root_fd, F_GETFD) < 0 && errno == EBADF);
 	UT_ASSERT(!inputs_pin_held && inputs_pin_refuse && inputs_pin_current);
@@ -241,4 +248,88 @@ UT_TEST(test_cold_native_postwrite_scope_loss_or_error_keeps_original_debt)
 		UT_ASSERT(!view.has_pending && view.committed_generation == 8);
 		cold_native_done(census);
 	}
+}
+
+/* The same executor/terminal/arbiter/pair/consumer path now obtains its native
+ * fingerprint from actual original-origin CLOG file sync/full-page readback. */
+UT_TEST(test_cold_native_actual_clog_commit_abort_and_full_page)
+{
+	cold_native_real_clog = true;
+	test_cold_native_commit_abort_actual_pair_and_fresh_committed();
+	UT_ASSERT(cold_native_clog_last.calls >= 3);
+	UT_ASSERT(cold_native_clog_last.file_syncs >= cold_native_clog_last.calls);
+	UT_ASSERT(cold_native_clog_last.directory_syncs >= cold_native_clog_last.calls);
+	cold_native_real_clog = false;
+}
+
+UT_TEST(test_cold_native_actual_clog_missing_short_and_io_failures)
+{
+	cold_native_real_clog = true;
+	for (unsigned fault = 1; fault <= 5; fault++) {
+		ClusterRelmapRetentionCensus *census = NULL;
+		ClusterRelmapV2View view;
+		volatile bool accepted = false, threw = false;
+		cold_native_setup(false, false, false);
+		test_relmap_native_clog_fault(fault, 0);
+		test_capture_error_level = true;
+		PG_TRY();
+		{
+			accepted = cold_native_execute(&census);
+		}
+		PG_CATCH();
+		{
+			threw = true;
+		}
+		PG_END_TRY();
+		test_capture_error_level = false;
+		UT_ASSERT(!accepted && census == NULL && custody_scope == 7);
+		UT_ASSERT_EQ(threw, fault == 5);
+		UT_ASSERT_EQ(prefix_base_reads, 1);
+		UT_ASSERT_EQ(cold_native_syncs + cold_native_invals + cold_native_acks, 0);
+		UT_ASSERT_EQ(cluster_relmap_authority_v2_read(&custody_image.identity, &view),
+					 CLUSTER_RELMAP_V2_PAIR_VALID);
+		UT_ASSERT(view.has_pending && view.pending_complete);
+		cold_native_done(census);
+		UT_ASSERT_EQ(cold_native_clog_last.calls, 1);
+		if (ut_current_failed)
+			break;
+	}
+	cold_native_real_clog = false;
+}
+
+UT_TEST(test_cold_native_actual_clog_late_base_change_or_error)
+{
+	const unsigned faults[] = { 3, 5, 6 };
+	cold_native_real_clog = true;
+	for (unsigned i = 0; i < lengthof(faults); i++) {
+		ClusterRelmapRetentionCensus *census = NULL;
+		ClusterRelmapV2View view;
+		volatile bool accepted = false, threw = false;
+		cold_native_setup(true, i == 2, false);
+		test_relmap_native_clog_fault(faults[i], 2);
+		test_capture_error_level = true;
+		PG_TRY();
+		{
+			accepted = cold_native_execute(&census);
+		}
+		PG_CATCH();
+		{
+			threw = true;
+		}
+		PG_END_TRY();
+		test_capture_error_level = false;
+		UT_ASSERT(!accepted && census == NULL && custody_scope == 7);
+		UT_ASSERT_EQ(threw, faults[i] == 5);
+		UT_ASSERT_EQ(prefix_base_reads, 2);
+		UT_ASSERT_EQ(cold_native_syncs + cold_native_invals + cold_native_acks, 0);
+		UT_ASSERT_EQ(cluster_relmap_authority_v2_read(&custody_image.identity, &view),
+					 CLUSTER_RELMAP_V2_PAIR_VALID);
+		UT_ASSERT(view.has_pending && view.pending_complete);
+		cold_native_done(census);
+		UT_ASSERT_EQ(cold_native_clog_last.calls, 2);
+		UT_ASSERT(cold_native_clog_last.file_syncs >= 1);
+		if (ut_current_failed)
+			break;
+	}
+	cold_native_real_clog = false;
 }
