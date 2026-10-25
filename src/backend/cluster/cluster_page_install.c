@@ -715,6 +715,17 @@ rf_page_recovery_fpi_install_smgr_v1(ClusterRecoveryFpiInsertV1 *inserted,
 	return completed;
 }
 
+bool
+rf_page_recovery_fpi_apply_smgr_v1(const GenericXLogRecoveryImageV1 *image,
+	const ClusterRecoveryStampOwnerV1 *owner, RfPageAuthorityPreflightV1 *preflight,
+	ClusterRecoverySerialGuard *serial, ClusterWalRetentionPin *pin,
+	ClusterRecoveryFpiInsertV1 *out)
+{
+	if (!GenericXLogRecoveryImageFinish(image, owner, preflight, serial, pin, out))
+		return false;
+	return rf_page_recovery_fpi_install_smgr_v1(out, serial, pin);
+}
+
 /* A local snapshot binds observations to the same original owners. Neither
  * this value nor the returned page is a completion or mutation capability. */
 typedef struct PageRecoveryCtrcReadV1 {

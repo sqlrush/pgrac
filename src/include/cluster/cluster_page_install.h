@@ -103,6 +103,15 @@ struct ClusterSpaceIdentity;
  * Failure marks the exact window failed where still owned; ERROR rethrows. */
 extern bool rf_page_recovery_fpi_install_smgr_v1(struct ClusterRecoveryFpiInsertV1 *inserted,
 	struct ClusterRecoverySerialGuard *serial, struct ClusterWalRetentionPin *pin);
+/* Same original Finish contract, then the installer above. Caller supplies a
+ * qualified private frame and fresh, distinct output; never reuse live output.
+ * Finish prepares hash/capacity before nowait PAGE promotion. Only its success
+ * reaches target I/O. False/ERROR retains its original guard/window/WAL debt;
+ * success means only target_synced, with no discharge, DURABLE or clear. */
+extern bool rf_page_recovery_fpi_apply_smgr_v1(const GenericXLogRecoveryImageV1 *image,
+	const struct ClusterRecoveryStampOwnerV1 *owner, struct RfPageAuthorityPreflightV1 *preflight,
+	struct ClusterRecoverySerialGuard *serial, struct ClusterWalRetentionPin *pin,
+	struct ClusterRecoveryFpiInsertV1 *out);
 /* Provisional native MAIN predecessor input only, under the original
  * RECOVERED/native-DONE Start/work and promoted PAGE/serial/pin. Verify exact
  * LIVE SPACE identity/reservation, page version/checksum and unchanged SPACE

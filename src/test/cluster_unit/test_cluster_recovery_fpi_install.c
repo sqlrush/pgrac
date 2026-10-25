@@ -25,7 +25,7 @@ static SMgrRelationData install_relation;
 static ClusterRecoveryFpiInsertV1 inserted;
 static int install_fd = -1;
 static char install_path[64];
-static bool installing, checksums, postread_corrupt;
+static bool installing, applying, checksums, postread_corrupt;
 static unsigned reads, writes, syncs, opens, install_hashes;
 static unsigned throw_read_at;
 static bool throw_write, throw_sync, drift_after_read, drift_after_sync, drift_after_postread;
@@ -108,6 +108,9 @@ XLogRecPtr
 GetFlushRecPtr(TimeLineID *timeline)
 {
 	UT_ASSERT_EQ(CritSectionCount, 0);
+	/* The composed operation enters target validation only after Finish. */
+	if (applying)
+		installing = true;
 	if (timeline != NULL)
 		*timeline = native_flush_timeline;
 	return native_flush_end;
@@ -476,12 +479,13 @@ UT_TEST(fpi_inserted_observer_is_exact_and_never_advances_window)
 #include "test_cluster_recovery_ctrc_itl.inc"
 #include "test_cluster_recovery_ctrc_fpi.inc"
 #include "test_cluster_recovery_ctrc_page_fpi.inc"
+#include "test_cluster_recovery_fpi_apply.inc"
 
 int
 main(void)
 {
 	atexit(install_file_close);
-	UT_PLAN(38);
+	UT_PLAN(44);
 	UT_RUN(fpi_install_syncs_exact_native_lsn_and_checksum_without_retiring_window);
 	UT_RUN(fpi_install_exact_result_retries_sync_and_postread_without_rewriting);
 	UT_RUN(fpi_install_refuses_wrong_window_flush_frame_actor_or_serial_before_io);
@@ -520,6 +524,12 @@ main(void)
 	UT_RUN(ctrc_page_fpi_rejects_capacity_and_overlap_before_io);
 	UT_RUN(ctrc_page_fpi_keeps_original_scope_guards);
 	UT_RUN(ctrc_page_fpi_errors_preserve_output_and_debt);
+	UT_RUN(fpi_apply_flushes_before_exact_target_install);
+	UT_RUN(fpi_apply_exact_result_still_syncs_and_postreads);
+	UT_RUN(fpi_apply_early_refusals_never_touch_target);
+	UT_RUN(fpi_apply_uncertain_wal_never_reaches_install);
+	UT_RUN(fpi_apply_target_refusals_keep_flushed_pending_debt);
+	UT_RUN(fpi_apply_target_errors_rethrow_with_original_debt);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
