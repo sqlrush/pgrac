@@ -1056,14 +1056,23 @@ cluster_clog_native_terminal_sync_v1(TransactionId xid, ClusterClogNativeTermina
 	return true;
 }
 
-/* D3 durable native base input. No status is taken from the recoverer's
- * XactCtl/cache, and no missing page can be justified by this read. The
- * original cold authority and origin truncate owner remain mandatory. */
-bool
-cluster_clog_native_recovery_base_read_v1(int origin, TransactionId xid,
-										  ClusterClogNativeBaseV1 *out)
+struct ClusterClogNativeBaseHandleV1 {
+	pid_t pid;
+	int origin;
+	TransactionId xid;
+	int fd;
+	struct stat file;
+	bool failed;
+};
+
+/* The raw and held variants share the original native lock/I/O checks. */
+static bool
+clog_recovery_base_read(int origin, TransactionId xid, ClusterClogNativeBaseV1 *out,
+					   ClusterClogNativeBaseHandleV1 **custody)
 {
 	ClusterClogNativeBaseV1 result = { 0 };
+	ClusterClogNativeBaseHandleV1 *held = custody != NULL ? *custody : NULL;
+	bool existing = held != NULL;
 	PGAlignedBlock readback;
 	SlruCtl ctl;
 	LWLock *lock;
@@ -1076,6 +1085,14 @@ cluster_clog_native_recovery_base_read_v1(int origin, TransactionId xid,
 	if (out == NULL)
 		return false;
 	memset(out, 0, sizeof(*out));
+	if (existing) {
+		if (held->pid != getpid() || held->failed)
+			return false;
+		/* Every later failure, including ERROR in an owner check, is sticky. */
+		held->failed = true;
+		if (held->origin != origin || held->xid != xid || held->fd < 0)
+			return false;
+	}
 	if (!enableFsync || CritSectionCount != 0 || !TransactionIdIsNormal(xid)
 		|| LWLockHeldByMe(XidGenLock) || LWLockHeldByMe(XactTruncationLock)
 		|| LWLockHeldByMe(XactSLRULock) || !clog_recovery_permitted(origin))
@@ -1088,6 +1105,16 @@ cluster_clog_native_recovery_base_read_v1(int origin, TransactionId xid,
 	length = snprintf(path, sizeof(path), "%s/%04X", ctl->Dir, page / SLRU_PAGES_PER_SEGMENT);
 	if (length < 0 || length >= sizeof(path))
 		return false;
+	if (custody != NULL && !existing) {
+		held = calloc(1, sizeof(*held));
+		if (held == NULL)
+			return false;
+		held->pid = getpid();
+		held->origin = origin;
+		held->xid = xid;
+		held->fd = -1;
+		held->failed = true;
+	}
 
 	PG_TRY();
 	{
@@ -1095,8 +1122,10 @@ cluster_clog_native_recovery_base_read_v1(int origin, TransactionId xid,
 		locked = true;
 		if (clog_recovery_directory_ready(origin)
 			&& clog_recovery_page_identity(ctl, page, &before)) {
-			fd = OpenTransientFile(path, O_RDWR | O_NOFOLLOW | O_CLOEXEC | PG_BINARY);
+			fd = existing ? held->fd
+						  : OpenTransientFile(path, O_RDWR | O_NOFOLLOW | O_CLOEXEC | PG_BINARY);
 			ok = fd >= 0 && fstat(fd, &opened) == 0 && clog_recovery_same_file(&before, &opened)
+				 && (!existing || clog_recovery_same_file(&held->file, &opened))
 				 && clog_recovery_sync(ctl, -1, NULL);
 			if (ok) {
 				pgstat_report_wait_start(WAIT_EVENT_SLRU_FLUSH_SYNC);
@@ -1119,19 +1148,23 @@ cluster_clog_native_recovery_base_read_v1(int origin, TransactionId xid,
 				}
 			}
 		}
-		if (fd >= 0) {
+		if (ok && custody != NULL)
+			ok = clog_recovery_directory_ready(origin);
+		if (fd >= 0 && !existing && (custody == NULL || !ok)) {
 			int closing = fd;
 			fd = -1;
 			if (CloseTransientFile(closing) != 0)
 				ok = false;
 		}
-		if (ok)
+		if (ok && custody == NULL)
 			ok = clog_recovery_directory_ready(origin);
+		LWLockRelease(lock);
+		locked = false;
 	}
 	PG_CATCH();
 	{
 		pgstat_report_wait_end();
-		if (fd >= 0) {
+		if (fd >= 0 && !existing) {
 			int closing = fd;
 			fd = -1;
 			(void)CloseTransientFile(closing);
@@ -1140,20 +1173,67 @@ cluster_clog_native_recovery_base_read_v1(int origin, TransactionId xid,
 			HOLD_INTERRUPTS();
 			LWLockRelease(lock);
 		}
+		if (!existing)
+			free(held);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	if (locked)
-		LWLockRelease(lock);
-	if (!ok)
+	if (!ok) {
+		if (!existing)
+			free(held);
 		return false;
+	}
 	result.origin = origin;
 	result.xid = xid;
 	result.page_number = page;
 	result.file = (ClusterClogNativeFileV1){ before.st_dev, before.st_ino, before.st_size };
 	memcpy(result.image, readback.data, BLCKSZ);
+	if (custody != NULL) {
+		if (!existing) {
+			held->fd = fd;
+			held->file = before;
+		}
+		held->failed = false;
+		*custody = held;
+	}
 	*out = result;
 	return true;
+}
+
+/* D3 durable native base input. No status is taken from the recoverer's
+ * XactCtl/cache, and no missing page can be justified by this read. */
+bool
+cluster_clog_native_recovery_base_read_v1(int origin, TransactionId xid,
+										  ClusterClogNativeBaseV1 *out)
+{
+	return clog_recovery_base_read(origin, xid, out, NULL);
+}
+
+bool
+cluster_clog_native_recovery_base_read_held_v1(int origin, TransactionId xid,
+	ClusterClogNativeBaseV1 *out, ClusterClogNativeBaseHandleV1 **held)
+{
+	if (held == NULL)
+		return false;
+	return clog_recovery_base_read(origin, xid, out, held);
+}
+
+void
+cluster_clog_native_recovery_base_release_v1(ClusterClogNativeBaseHandleV1 **held)
+{
+	ClusterClogNativeBaseHandleV1 *old;
+	if (held == NULL)
+		return;
+	old = *held;
+	*held = NULL;
+	if (old != NULL) {
+		if (old->pid == getpid() && old->fd >= 0) {
+			int fd = old->fd;
+			old->fd = -1;
+			(void)CloseTransientFile(fd);
+		}
+		free(old);
+	}
 }
 
 typedef enum ClogRecoveryAccess {

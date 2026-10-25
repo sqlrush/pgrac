@@ -8,6 +8,195 @@ import wait_graph_capture as graph
 
 
 class GraphTests(unittest.TestCase):
+    def test_deadline_receiver_sidecar_save_error_preserves_native_stream_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'deadline.log'
+            path.with_suffix('.os.json').mkdir()
+            receiver = graph.DeadlineReceiver(1, 0, path)
+            error = None
+            with graph.socket.socket(graph.socket.AF_INET, graph.socket.SOCK_DGRAM) as sender:
+                address = receiver.socket.getsockname()
+                sender.sendto(b'node=1 observer=42 sequence=1 PGRAC_WAIT_DEADLINE_BEGIN node=1\n', address)
+                sender.sendto(b'node=1 observer=42 sequence=2 PGRAC_WAIT_DEADLINE_END node=1 dropped=0\n', address)
+                try:
+                    result = receiver.close()
+                except OSError as exc:
+                    error = repr(exc)
+            self.assertIsNone(error, 'OS sidecar save errors must not suppress native UDP proof')
+            self.assertTrue(result['complete'])
+            self.assertEqual(result['errors'], [])
+            saved = graph.json.loads(path.with_suffix('.json').read_text())
+            self.assertEqual(saved, result)
+            self.assertIn('os_observation_error', saved)
+
+    def test_deadline_receiver_persists_os_census_separately_from_stream_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'deadline.log'
+            receiver = graph.DeadlineReceiver(1, 0, path)
+            sender = graph.socket.socket(graph.socket.AF_INET, graph.socket.SOCK_DGRAM)
+            try:
+                address = receiver.socket.getsockname()
+                sender.sendto(b'node=1 observer=42 sequence=1 PGRAC_WAIT_DEADLINE_BEGIN node=1\n', address)
+                sender.sendto(b'node=1 observer=42 sequence=2 PGRAC_WAIT_DEADLINE_PROC node=1 slot=7 pid=14 backend=2 generation=9007199254740993 wait=285212680 after_pid=14 after_backend=2 after_generation=9007199254740993 after_wait=285212680 stable=1\n', address)
+                sender.sendto(b'node=1 observer=42 sequence=3 PGRAC_WAIT_DEADLINE_END node=1 dropped=0\n', address)
+                result = receiver.close()
+            finally:
+                sender.close()
+            self.assertTrue(result['complete'])
+            self.assertEqual(result['completeness_scope'], 'datagram_stream_only')
+            sidecar = path.with_suffix('.os.json')
+            self.assertTrue(sidecar.is_file(), 'PGPROC identity alone is not a live-process census')
+            value = graph.json.loads(sidecar.read_text())
+            self.assertEqual(value['processes'][0]['native']['generation'], 9007199254740993)
+            self.assertEqual(value['processes'][0]['native']['wait'], 285212680)
+            self.assertFalse(value['processes'][0]['native_incarnation_bound'])
+            self.assertEqual(value['processes'][0]['termination_receipt'], 'UNKNOWN')
+            self.assertEqual(value['processes'][0]['sequence'], 2)
+
+    def deadline_native_proc(self):
+        return dict(node=1, slot=7, pid=14, backend=2, generation=9007199254740993,
+                    wait=285212680, after_pid=14, after_backend=2,
+                    after_generation=9007199254740993, after_wait=285212680, stable=1)
+
+    def deadline_proc_fixture(self, directory, *, state='S', start=9007199254740995):
+        root = Path(directory)
+        proc = root / '14'
+        proc.mkdir()
+        (root / 'self/ns').mkdir(parents=True)
+        (root / 'self/ns/net').write_text('namespace identity fixture')
+        (proc / 'ns').mkdir()
+        (proc / 'ns/net').symlink_to(root / 'self/ns/net')
+        self.deadline_proc_stat(proc, state=state, start=start)
+        (proc / 'status').write_text('Name:\tpostgres\nPid:\t14\n'
+                                     'SigPnd:\t0000000000000000\nShdPnd:\t0000000000000002\n'
+                                     'SigBlk:\t0000000000000004\nSigIgn:\t0000000000000000\n'
+                                     'SigCgt:\t0000000000000010\n')
+        (proc / 'wchan').write_text('futex_wait_queue\n')
+        return root
+
+    def deadline_proc_stat(self, proc, *, state='S', start=9007199254740995):
+        tail = [state] + ['0'] * 49
+        tail[1] = '3'
+        tail[19] = str(start)
+        (proc / 'stat').write_text('14 (post)gres worker) ' + ' '.join(tail) + '\n')
+
+    def test_deadline_os_census_preserves_controlled_proc_identity_and_wait_cuts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.deadline_proc_fixture(directory)
+            native = self.deadline_native_proc()
+            result = graph.deadline_os_process(native, root)
+            self.assertEqual(result['status'], 'live_os_process_observed')
+            self.assertEqual(result['before']['comm'], 'post)gres worker')
+            self.assertEqual(result['before']['start_ticks'], 9007199254740995)
+            self.assertEqual(result['before']['wchan'], 'futex_wait_queue')
+            self.assertEqual(result['after']['signals']['ShdPnd'], '0000000000000002')
+            self.assertEqual(result['before']['net_inode'], (root/'self/ns/net').stat().st_ino)
+            self.assertEqual(result['native'], native)
+            self.assertFalse(result['native_incarnation_bound'])
+            self.assertEqual(result['termination_receipt'], 'UNKNOWN')
+            self.assertLessEqual(result['sample_started_monotonic_ns'], result['sample_finished_monotonic_ns'])
+
+    def test_deadline_os_census_absent_pgproc_pid_does_not_mean_live(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.deadline_proc_fixture(directory)
+            native = self.deadline_native_proc()
+            native['pid'] = native['after_pid'] = 15
+            result = graph.deadline_os_process(native, root)
+            self.assertEqual(result['status'], 'not_present_during_sampling')
+            self.assertFalse(result['native_incarnation_bound'])
+
+    def test_deadline_os_census_rejects_pid_reuse_between_cuts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.deadline_proc_fixture(directory)
+            original = graph._linux_process_cut
+            calls = []
+            def cut(*args):
+                value = original(*args)
+                calls.append(value)
+                if len(calls) == 1:
+                    self.deadline_proc_stat(root/'14', start=9007199254740996)
+                return value
+            with patch.object(graph, '_linux_process_cut', cut):
+                result = graph.deadline_os_process(self.deadline_native_proc(), root)
+            self.assertEqual(result['status'], 'changed_os_identity')
+            self.assertNotEqual(result['before']['start_ticks'], result['after']['start_ticks'])
+
+    def test_deadline_os_census_rejects_other_namespace_and_zombies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.deadline_proc_fixture(directory)
+            net = root/'14/ns/net'
+            net.unlink()
+            net.write_text('different namespace')
+            result = graph.deadline_os_process(self.deadline_native_proc(), root)
+            self.assertEqual(result['status'], 'different_network_namespace')
+            net.unlink()
+            net.symlink_to(root/'self/ns/net')
+            for state in ('Z', 'X'):
+                self.deadline_proc_stat(root/'14', state=state)
+                result = graph.deadline_os_process(self.deadline_native_proc(), root)
+                self.assertEqual(result['status'], 'exited_os_process_observed')
+
+    def test_deadline_os_census_permission_malformed_and_short_reads_are_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.deadline_proc_fixture(directory)
+            for text in ('14 (worker) S 0\n', '15 (worker) S ' + '0 '*50,
+                         '14 (worker) S ' + '0 '*3000,
+                         '14 (worker) ? ' + '0 '*18 + '9 ' + '0 '*30):
+                (root/'14/stat').write_text(text)
+                result = graph.deadline_os_process(self.deadline_native_proc(), root)
+                self.assertEqual(result['status'], 'unavailable')
+            self.deadline_proc_stat(root/'14')
+            with patch.object(graph, '_read_proc_text', side_effect=PermissionError('denied')):
+                result = graph.deadline_os_process(self.deadline_native_proc(), root)
+            self.assertEqual(result['status'], 'unavailable')
+            self.assertTrue(result['before']['errors'])
+
+    def test_deadline_os_census_does_not_bind_unstable_or_invalid_native_pid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.deadline_proc_fixture(directory)
+            for field, value in [('stable', 0), ('after_generation', 3), ('after_pid', 15),
+                                 ('pid', 0), ('pid', -1), ('pid', 2**40),
+                                 ('generation', 0), ('backend', -2), ('pid', True)]:
+                native = self.deadline_native_proc()
+                native[field] = value
+                if field == 'backend':
+                    native['after_backend'] = value
+                result = graph.deadline_os_process(native, root)
+                self.assertEqual(result['status'], 'unstable_native_record')
+                self.assertFalse(result['native_incarnation_bound'])
+
+    def test_deadline_os_census_namespace_change_during_sampling_is_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.deadline_proc_fixture(directory)
+            original = graph._linux_process_cut
+            calls = []
+            def cut(*args):
+                value = original(*args)
+                calls.append(value)
+                if len(calls) == 2:
+                    replacement = root/'new-net'
+                    replacement.write_text('new receiver namespace')
+                    replacement.replace(root/'self/ns/net')
+                return value
+            with patch.object(graph, '_linux_process_cut', cut):
+                result = graph.deadline_os_process(self.deadline_native_proc(), root)
+            self.assertEqual(result['status'], 'collector_namespace_changed')
+
+    def test_deadline_receiver_keeps_malformed_proc_unknown_without_os_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'malformed.log'
+            receiver = graph.DeadlineReceiver(1, 0, path)
+            with graph.socket.socket(graph.socket.AF_INET, graph.socket.SOCK_DGRAM) as sender:
+                address = receiver.socket.getsockname()
+                sender.sendto(b'node=1 observer=42 sequence=1 PGRAC_WAIT_DEADLINE_BEGIN node=1\n', address)
+                sender.sendto(b'node=1 observer=42 sequence=2 PGRAC_WAIT_DEADLINE_PROC node=2 slot=7\n', address)
+                sender.sendto(b'node=1 observer=42 sequence=3 PGRAC_WAIT_DEADLINE_END node=1 dropped=0\n', address)
+                result = receiver.close()
+            self.assertTrue(result['complete'])
+            value = graph.json.loads(path.with_suffix('.os.json').read_text())['processes'][0]
+            self.assertEqual(value['status'], 'malformed_native_record')
+            self.assertFalse(value['native_incarnation_bound'])
+
     def test_deadline_receiver_drains_and_marks_missing_sequence_unknown(self):
         with tempfile.TemporaryDirectory() as directory:
             receiver=graph.DeadlineReceiver(1,0,Path(directory)/'deadline.log')

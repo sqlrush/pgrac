@@ -3939,6 +3939,7 @@ test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
 		test_cluster_relmap_original_authority.inc \
 		test_cluster_relmap_original_cohort.inc \
 		test_cluster_relmap_native_file.inc \
+		test_cluster_relmap_native_hold.inc \
 		test_cluster_relmap_original_storage.inc \
 		test_cluster_relmap_original_pin.inc test_cluster_relmap_native_pin.h \
 		test_cluster_relmap_native_pin.o \
@@ -9390,8 +9391,25 @@ test_cluster_ctrc_read_scope.inc: $(top_srcdir)/src/backend/cluster/cluster_term
 	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_ctrc_native_exit.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
+	awk '/^ProcArrayGetActiveFullXidSample\(/ { print "bool"; emit=1; found++ } \
+	     /^ProcArrayEndTransaction\(/ { print "void"; emit=1; found++ } \
+	     /^ProcArrayEndTransactionInternal\(/ { print "static inline void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_ctrc_native_group_exit.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
+	awk '/^ProcArrayGroupClearXid\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_ctrc_cleaner test_cluster_ctrc_capacity test_cluster_ctrc_dispatch \
-test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: test_cluster_ctrc_read_scope.inc
+test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: test_cluster_ctrc_read_scope.inc \
+		test_cluster_ctrc_native_exit.inc test_cluster_ctrc_native_group_exit.inc \
+		test_cluster_pgproc_active_types.inc \
+		$(top_srcdir)/src/include/storage/procarray.h $(top_srcdir)/src/include/access/transam.h \
+		$(top_srcdir)/src/include/access/twophase.h $(top_srcdir)/src/include/access/xlog.h \
+		$(top_srcdir)/src/include/storage/pg_sema.h $(top_srcdir)/src/include/utils/wait_event.h
 
 test_cluster_ctrc_capacity: test_cluster_ctrc_capacity.c test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \

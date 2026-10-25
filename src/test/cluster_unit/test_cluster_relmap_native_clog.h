@@ -12,7 +12,8 @@ typedef struct TestRelmapNativeClogStats {
 extern void test_relmap_native_clog_setup(const char *root, int origin, TransactionId xid,
 										  XidStatus status, uint8 last_byte);
 extern bool test_relmap_native_clog_read(int origin, TransactionId xid,
-										 ClusterClogNativeBaseV1 *out, sigjmp_buf *outer_stack);
+	ClusterClogNativeBaseV1 *out, sigjmp_buf *outer_stack, ClusterClogNativeBaseHandleV1 **held);
+extern void test_relmap_native_clog_release(ClusterClogNativeBaseHandleV1 **held);
 /* Faults: 1 missing,2 short,3 file sync,4 directory sync,5 directory ERROR,
  * 6 different last page byte,7 identical bytes in a distinct inode. Trigger at call0 before the physical census,
  * or immediately before the selected original native read. */

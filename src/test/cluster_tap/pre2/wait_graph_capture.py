@@ -617,6 +617,102 @@ def capture_failed_watchdog(collect):
     return result
 
 
+def _read_proc_text(path, limit=8192):
+    with path.open(encoding='ascii', errors='replace') as stream:
+        value = stream.read(limit + 1)
+    if len(value) > limit:
+        raise ValueError('proc field exceeds observation limit')
+    return value
+
+
+def _linux_process_cut(root, pid):
+    """A bounded OS observation, independent of native PGPROC allocation."""
+    path = root / str(pid)
+    result = dict(pid=pid, present=None, errors=[])
+    try:
+        raw = _read_proc_text(path / 'stat')
+        left, right = raw.find(' ('), raw.rfind(')')
+        if left < 1 or right <= left or int(raw[:left]) != pid:
+            raise ValueError('proc stat PID/comm shape differs')
+        fields = raw[right+1:].split()
+        if (len(fields) < 20 or fields[0] not in tuple('RSDZTtXxKWPI') or
+                int(fields[19]) <= 0 or int(fields[1]) < 0):
+            raise ValueError('proc stat state/start identity missing')
+        result.update(present=True, comm=raw[left+2:right], state=fields[0],
+                      ppid=int(fields[1]), start_ticks=int(fields[19]))
+    except FileNotFoundError:
+        result.update(present=False)
+        return result
+    except (OSError, ValueError) as exc:
+        result['errors'].append(dict(field='stat', error=repr(exc)))
+        return result
+    for name in ('uid', 'net_inode', 'wchan', 'signals'):
+        try:
+            if name == 'uid':
+                result[name] = path.stat().st_uid
+            elif name == 'net_inode':
+                result[name] = (path / 'ns/net').stat().st_ino
+            elif name == 'wchan':
+                result[name] = _read_proc_text(path / 'wchan').strip()
+            else:
+                status = _read_proc_text(path / 'status', 16384)
+                masks = dict(re.findall(r'^(SigPnd|ShdPnd|SigBlk|SigIgn|SigCgt):\s*([^\s]+)$',
+                                        status, re.M))
+                if len(masks) != 5 or not all(re.fullmatch(r'[0-9a-fA-F]{1,32}', v)
+                                              for v in masks.values()):
+                    raise ValueError('proc signal masks unavailable')
+                result[name] = masks
+        except (OSError, ValueError) as exc:
+            result['errors'].append(dict(field=name, error=repr(exc)))
+    return result
+
+
+def deadline_os_process(native, proc_root=Path('/proc')):
+    """Sample after receiving a deadline record, never assert signal receipt.
+
+    Even stable OS PID/start ticks cannot bind a previously emitted native
+    allocation generation: its original OS birth identity was not published.
+    """
+    result = dict(native=dict(native), status='unstable_native_record',
+                  native_incarnation_bound=False, termination_receipt='UNKNOWN',
+                  scope='post_receive_os_observation', proc_root=str(proc_root),
+                  sample_started_monotonic_ns=time.monotonic_ns())
+    required = ('pid','backend','generation','wait','after_pid','after_backend',
+                'after_generation','after_wait','stable')
+    valid = (all(type(native.get(k)) is int for k in required) and
+             0 < native['pid'] < 2**31 and 0 < native['generation'] < 2**64-1 and
+             native['stable'] == 1 and native['backend'] >= -1 and native['backend'] != 0 and
+             all(native[a] == native[b] for a,b in
+                 (('pid','after_pid'),('backend','after_backend'),
+                  ('generation','after_generation'),('wait','after_wait'))))
+    if valid:
+        try:
+            namespace = (proc_root / 'self/ns/net').stat().st_ino
+            result['collector_net_inode'] = namespace
+            before = _linux_process_cut(proc_root, native['pid'])
+            after = _linux_process_cut(proc_root, native['pid'])
+            result.update(before=before, after=after, status='unavailable')
+            result['collector_after_net_inode'] = (proc_root / 'self/ns/net').stat().st_ino
+            if result['collector_after_net_inode'] != namespace:
+                result['status'] = 'collector_namespace_changed'
+            elif before.get('present') is False and after.get('present') is False:
+                result['status'] = 'not_present_during_sampling'
+            elif not before['errors'] and not after['errors']:
+                identity_fields = ('pid','start_ticks','uid','net_inode')
+                if any(before.get(k) != after.get(k) for k in identity_fields):
+                    result['status'] = 'changed_os_identity'
+                elif before.get('net_inode') != namespace:
+                    result['status'] = 'different_network_namespace'
+                elif before.get('state') in ('Z','X','x') or after.get('state') in ('Z','X','x'):
+                    result['status'] = 'exited_os_process_observed'
+                elif before.get('present') and after.get('present'):
+                    result['status'] = 'live_os_process_observed'
+        except (OSError, ValueError) as exc:
+            result.update(status='unavailable', error=repr(exc))
+    result['sample_finished_monotonic_ns'] = time.monotonic_ns()
+    return result
+
+
 class DeadlineReceiver:
     """Local UDP observation only. Keep alive through original native stop.
 
@@ -625,6 +721,7 @@ class DeadlineReceiver:
     """
     def __init__(self, node, port, output):
         self.node, self.rows, self.errors = node, [], []
+        self.os_processes = []
         self.path = Path(output)
         self.stream = self.path.open('xb')
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -649,11 +746,27 @@ class DeadlineReceiver:
                 continue
             except OSError as exc:
                 self.errors.append(repr(exc)); break
+            received = time.monotonic_ns()
             self.stream.write(payload); self.stream.flush()
             text = payload.decode('utf-8', errors='replace')
             match = re.fullmatch(r'node=(\d+) observer=(\d+) sequence=(\d+) (.*)\n', text)
             if match and int(match[1]) == self.node and sender[0] == '127.0.0.1':
                 self.rows.append(dict(observer=int(match[2]),sequence=int(match[3]),text=match[4]))
+                if match[4].startswith('PGRAC_WAIT_DEADLINE_PROC '):
+                    proc = re.fullmatch(
+                        r'PGRAC_WAIT_DEADLINE_PROC node=(\d+) slot=(\d+) pid=(-?\d+) backend=(-?\d+) '
+                        r'generation=(\d+) wait=(\d+) after_pid=(-?\d+) after_backend=(-?\d+) '
+                        r'after_generation=(\d+) after_wait=(\d+) stable=([01])', match[4])
+                    fields = ('node','slot','pid','backend','generation','wait','after_pid',
+                              'after_backend','after_generation','after_wait','stable')
+                    if proc and int(proc[1]) == self.node:
+                        value = deadline_os_process(dict(zip(fields, map(int, proc.groups()))))
+                    else:
+                        value = dict(status='malformed_native_record', native_incarnation_bound=False,
+                                     termination_receipt='UNKNOWN', raw=match[4])
+                    value.update(observer=int(match[2]), sequence=int(match[3]),
+                                 received_monotonic_ns=received)
+                    self.os_processes.append(value)
             else:
                 self.errors.append('malformed_or_wrong_node_datagram')
 
@@ -665,6 +778,16 @@ class DeadlineReceiver:
         if self.thread.is_alive():
             raise RuntimeError('deadline receiver did not stop')
         self.socket.close(); self.stream.close()
+        # The native sequence proof stays independent from OS sampling, which
+        # happens later and cannot establish allocation or signal receipt.
+        os_error = None
+        try:
+            self.path.with_suffix('.os.json').write_text(json.dumps(dict(
+                node=self.node, scope='post_receive_os_observation', atomic_graph=False,
+                native_incarnation_bound=False, termination_receipt='UNKNOWN',
+                processes=self.os_processes), indent=2)+'\n')
+        except OSError as exc:
+            os_error = repr(exc)
         groups = {}
         for row in self.rows:
             groups.setdefault(row['observer'], []).append(row)
@@ -679,6 +802,8 @@ class DeadlineReceiver:
                         ordered[-1]['text'].endswith(' dropped=0'))
             result['observers'].append(dict(observer=observer,records=len(rows),complete=complete))
         result['complete'] = bool(groups) and not self.errors and all(o['complete'] for o in result['observers'])
+        if os_error is not None:
+            result['os_observation_error'] = os_error
         self.path.with_suffix('.json').write_text(json.dumps(result,indent=2)+'\n')
         return result
 

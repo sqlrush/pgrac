@@ -2489,7 +2489,7 @@ cluster_clog_native_recovery_base_read_v1(int origin, TransactionId xid,
 {
 	prefix_base_reads++;
 	if (cold_native_real_clog) {
-		bool result = test_relmap_native_clog_read(origin, xid, out, PG_exception_stack);
+		bool result = test_relmap_native_clog_read(origin, xid, out, PG_exception_stack, NULL);
 		if (cold_native_real_pin && cold_pin_unknown_loss && !result)
 			test_relmap_native_pin_fault(3);
 		return result;
@@ -2515,6 +2515,34 @@ cluster_clog_native_recovery_base_read_v1(int origin, TransactionId xid,
 	if (prefix_base_fault == 8)
 		ereport(ERROR, (errmsg("injected native base ERROR")));
 	return true;
+}
+
+bool
+cluster_clog_native_recovery_base_read_held_v1(int origin, TransactionId xid,
+	ClusterClogNativeBaseV1 *out, ClusterClogNativeBaseHandleV1 **held)
+{
+	static char controlled_custody;
+	if (cold_native_real_clog) {
+		bool result;
+		prefix_base_reads++;
+		result = test_relmap_native_clog_read(origin, xid, out, PG_exception_stack, held);
+		if (cold_native_real_pin && cold_pin_unknown_loss && !result)
+			test_relmap_native_pin_fault(3);
+		return result;
+	}
+	if (!cluster_clog_native_recovery_base_read_v1(origin, xid, out))
+		return false;
+	*held = (ClusterClogNativeBaseHandleV1 *)&controlled_custody;
+	return true;
+}
+
+void
+cluster_clog_native_recovery_base_release_v1(ClusterClogNativeBaseHandleV1 **held)
+{
+	if (cold_native_real_clog)
+		test_relmap_native_clog_release(held);
+	else
+		*held = NULL;
 }
 
 static ClusterRelmapTerminalScanV1 *
@@ -3429,6 +3457,7 @@ UT_TEST(test_terminal_read_native_error_keeps_output_zero_and_custody_dead)
 #include "test_cluster_relmap_original_authority.inc"
 #include "test_cluster_relmap_original_cohort.inc"
 #include "test_cluster_relmap_native_file.inc"
+#include "test_cluster_relmap_native_hold.inc"
 #include "test_cluster_relmap_original_storage.inc"
 #include "test_cluster_relmap_original_pin.inc"
 
@@ -3439,7 +3468,9 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(141);
+	UT_PLAN(143);
+	UT_RUN(test_cold_native_handle_holds_original_fd_until_release);
+	UT_RUN(test_cold_native_failed_held_read_keeps_fd_and_original_debt_until_cleanup);
 	UT_RUN(test_cold_original_pin_full_native_chain_keeps_original_pin);
 	UT_RUN(test_cold_original_pin_owner_context_refuses_before_native);
 	UT_RUN(test_cold_original_pin_late_owner_loss_keeps_durable_pair);
