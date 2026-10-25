@@ -1106,11 +1106,15 @@ UT_TEST(unarmed_commit_preserves_other_writers_pending_and_global_lock)
 #include "test_cluster_relmap_terminal_callbacks.inc"
 #include "test_cluster_relmap_precommit_final.inc"
 #include "test_cluster_relmap_original_tt.inc"
+#include "test_cluster_relmap_tt_retention.inc"
 
 int
 main(void)
 {
-	UT_PLAN(73);
+	UT_PLAN(76);
+	UT_RUN(v2_tt_retention_outlives_original_terminal_cleanup);
+	UT_RUN(v2_tt_retention_keeps_partial_terminal_failure);
+	UT_RUN(v2_tt_retention_routes_original_receipt_and_exact_physical_key);
 	UT_RUN(v2_original_tt_publication_precedes_pin_registration);
 	UT_RUN(v2_original_tt_publication_attaches_to_all_existing_staged_pins);
 	UT_RUN(v2_original_tt_publication_survives_late_pin_registration_refusal);

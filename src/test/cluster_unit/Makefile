@@ -602,6 +602,7 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		test_cluster_relmap_terminal_callbacks.inc \
 		test_cluster_relmap_precommit_final.inc \
 		test_cluster_relmap_original_tt.inc test_cluster_relmap_native_tt.h \
+		test_cluster_relmap_tt_retention.inc \
 		test_cluster_relmap_native_tt.o test_cluster_relmap_native_tt_durable.o \
 		test_cluster_relmap_native_lock.inc test_cluster_relmap_native_lock.h \
 		test_cluster_relmap_native_lock.o \
@@ -2489,6 +2490,27 @@ test_cluster_heap_freeze_worker_publisher.inc: $(top_srcdir)/src/backend/cluster
 	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Original worker scan coordinator, with controlled native/census traversal leaves.
+test_cluster_heap_freeze_worker_pass.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
+	@awk '/^undo_cleaner_sample_active_pass\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Original compact ProcArray layout and read-only FullXid sampler.
+test_cluster_heap_freeze_pgproc_types.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
+	@awk '/^#define UINT32_ACCESS_ONCE/ { print; found++ } \
+	     /^typedef struct ProcArrayStruct$$/ { emit=1; found++ } \
+	     emit { print } /^} ProcArrayStruct;$$/ { emit=0; done++ } \
+	     END { if (found != 2 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_freeze_pgproc_sample.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
+	@awk '/^ProcArrayGetActiveFullXidSample\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 # Original typed storage plus retained peer/H backend and local-source wrapper.
 test_cluster_heap_freeze_cohort_backend.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c Makefile
 	@awk '/^typedef struct ClusterUndoHorizonSlotShmem / { types=1; found++ } \
@@ -2528,6 +2550,9 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_freeze_worker_current.inc \
 		test_cluster_heap_freeze_worker_getter.inc \
 		test_cluster_heap_freeze_worker_publisher.inc \
+		test_cluster_heap_freeze_worker_pass.inc \
+		test_cluster_heap_freeze_pgproc_types.inc test_cluster_heap_freeze_pgproc_sample.inc \
+		$(top_srcdir)/src/include/storage/proc.h $(top_srcdir)/src/include/access/transam.h \
 		test_cluster_heap_freeze_lease_current.inc \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe.h \
 		test_cluster_active_sample_types.inc test_cluster_active_sample_fence.inc \
@@ -4191,7 +4216,7 @@ test_cluster_relmap_retained_owner.o: $(top_srcdir)/src/backend/cluster/cluster_
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relmap_retained_wal: %: %.c test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc test_cluster_control_root_serving.inc test_cluster_control_recovered_owner.inc test_cluster_control_recovered_founder.inc \
+test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relmap_retained_wal: %: %.c test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc test_cluster_control_root_serving.inc test_cluster_control_recovered_owner.inc test_cluster_control_recovered_founder.inc test_cluster_control_recovered_history.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_census.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_native_inventory.c \
@@ -5898,6 +5923,9 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_freeze_worker_current.inc test_cluster_heap_freeze_worker_current.inc.tmp
 	rm -f test_cluster_heap_freeze_worker_getter.inc test_cluster_heap_freeze_worker_getter.inc.tmp
 	rm -f test_cluster_heap_freeze_worker_publisher.inc test_cluster_heap_freeze_worker_publisher.inc.tmp
+	rm -f test_cluster_heap_freeze_worker_pass.inc test_cluster_heap_freeze_worker_pass.inc.tmp
+	rm -f test_cluster_heap_freeze_pgproc_types.inc test_cluster_heap_freeze_pgproc_types.inc.tmp
+	rm -f test_cluster_heap_freeze_pgproc_sample.inc test_cluster_heap_freeze_pgproc_sample.inc.tmp
 	rm -f test_cluster_heap_freeze_lease_current.inc test_cluster_heap_freeze_lease_current.inc.tmp
 	rm -f test_cluster_space_cache_insert.inc test_cluster_space_cache_delete.inc test_cluster_space_cache_allocation.inc test_cluster_space_cache_update.inc
 	rm -f test_cluster_space_hint_owners.inc test_cluster_space_census_types.inc test_cluster_space_census_mutation.inc test_cluster_space_cleanout_product.o

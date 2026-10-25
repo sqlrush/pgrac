@@ -26183,6 +26183,7 @@ control_root_test_reset_state(void)
 }
 
 #include "test_cluster_control_recovered_founder.inc"
+#include "test_cluster_control_recovered_history.inc"
 
 #undef UT_RUN
 #define UT_RUN(name)                                                                            \
@@ -26264,6 +26265,16 @@ main(int argc, char **argv)
 		UT_RUN(test_v3_target_sync_failures_never_grant_initialization);
 		UT_RUN(test_v3_target_reobserves_formation_and_write_fence_after_files);
 		UT_RUN(test_v3_begin_failures_preserve_selected_obligations_without_permission);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_RECOVERED_HISTORY") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_recovered_history_clean_follower_waits_after_sole_complete_install);
+		UT_RUN(test_recovered_history_driver_consumes_exact_selected_history);
+		UT_RUN(test_recovered_history_wait_preserves_original_current_owner_guards);
+		UT_RUN(test_recovered_history_follower_waits_before_native_install_too);
+		UT_RUN(test_recovered_history_does_not_promote_an_older_episode);
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
@@ -26604,7 +26615,13 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(523);
+	UT_PLAN(528);
+	UT_RUN(test_recovered_history_clean_follower_waits_after_sole_complete_install);
+	UT_RUN(test_recovered_history_driver_consumes_exact_selected_history);
+	UT_RUN(test_recovered_history_wait_preserves_original_current_owner_guards);
+	UT_RUN(test_recovered_history_follower_waits_before_native_install_too);
+	UT_RUN(test_recovered_history_does_not_promote_an_older_episode);
+
 	UT_RUN(test_recovered_founder_begin_preserves_unprepared_peer);
 	UT_RUN(test_recovered_founder_driver_needs_only_own_target);
 	UT_RUN(test_recovered_founder_native_eor_install_keeps_full_old_input);
