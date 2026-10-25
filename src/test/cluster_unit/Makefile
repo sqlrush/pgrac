@@ -3936,6 +3936,7 @@ $(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o: \
 
 test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
 		test_cluster_relmap_checkpoint_publisher.inc \
+		test_cluster_relmap_checkpoint_scope.inc \
 		test_cluster_cold_checkpoint_publisher.o test_cluster_cold_checkpoint_publisher.h \
 		test_cluster_relmap_origin_build.inc \
 		test_cluster_relmap_execution_custody.inc \
