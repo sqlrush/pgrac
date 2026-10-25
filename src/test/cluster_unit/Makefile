@@ -574,6 +574,8 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		test_cluster_relmap_authority_entry.inc \
 		test_cluster_relmap_terminal_callbacks.inc \
 		test_cluster_relmap_precommit_final.inc \
+		test_cluster_relmap_original_tt.inc test_cluster_relmap_native_tt.h \
+		test_cluster_relmap_native_tt.o test_cluster_relmap_native_tt_durable.o \
 		test_cluster_relmap_native_lock.inc test_cluster_relmap_native_lock.h \
 		test_cluster_relmap_native_lock.o \
 		test_cluster_relmap_physical_pair.inc test_cluster_relmap_physical_pair.h \
@@ -589,13 +591,28 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
 		test_cluster_relmap_v2_codec_product.o \
-		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o $(CLUSTER_UNIT_PORT_LIBS)
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		test_cluster_relmap_native_lock.o \
 		test_cluster_relmap_physical_pair.o \
+		test_cluster_relmap_native_tt.o test_cluster_relmap_native_tt_durable.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
 		test_cluster_relmap_v2_codec_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+test_cluster_relmap_native_tt.o: test_cluster_relmap_native_tt.c \
+		test_cluster_relmap_native_tt.h test_cluster_relmap_native_tt_namespace.h \
+		test_cluster_tt_active_owner.c test_cluster_tt_durable.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_relmap_native_tt_durable.o: test_cluster_relmap_native_tt_durable.c \
+		test_cluster_relmap_native_tt_namespace.h \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_durable.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_relmap_native_lock.o: test_cluster_relmap_native_lock.c \
 		test_cluster_relmap_native_lock.h \

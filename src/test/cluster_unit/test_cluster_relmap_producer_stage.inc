@@ -19,6 +19,7 @@ static const ClusterShmemRegion *v2_region;
 static void *v2_allocation;
 static unsigned v2_pair_mode, v2_pair_reads, v2_stage_mode, v2_stage_calls;
 static unsigned v2_stage_writes, v2_tt_reads;
+static bool (*v2_published_binding_observer)(TransactionId, ClusterCanonicalTxnBinding *);
 static ClusterRelmapV2Owner v2_staged_owner;
 static ClusterRelmapV2Namespace v2_staged_identity;
 static RelMapFile v2_staged_map;
@@ -55,6 +56,8 @@ cluster_tt_local_get_published_binding(TransactionId xid, ClusterCanonicalTxnBin
 	UT_ASSERT(!local_held && !v2_retention_held);
 	UT_ASSERT_EQ(xid, XidFromFullTransactionId(assigned_xid));
 	v2_tt_reads++;
+	if (v2_published_binding_observer != NULL)
+		return v2_published_binding_observer(xid, out);
 	memset(out, 0, sizeof(*out));
 	return false;
 }

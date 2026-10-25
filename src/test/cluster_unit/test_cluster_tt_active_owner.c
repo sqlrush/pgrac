@@ -578,6 +578,11 @@ UT_TEST(test_real_local_postbind_error_stays_failed_without_reallocation)
 	UT_ASSERT_EQ(modifier_leaves, 1);
 }
 
+#ifdef TT_ACTIVE_OWNER_FIXTURE_MAIN
+int TT_ACTIVE_OWNER_FIXTURE_MAIN(void);
+#define main TT_ACTIVE_OWNER_FIXTURE_MAIN
+#endif
+
 int
 main(void)
 {
@@ -600,3 +605,6 @@ main(void)
 	UT_DONE();
 	return ut_failed_count != 0;
 }
+#ifdef TT_ACTIVE_OWNER_FIXTURE_MAIN
+#undef main
+#endif
