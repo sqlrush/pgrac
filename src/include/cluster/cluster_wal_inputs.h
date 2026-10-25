@@ -99,6 +99,24 @@ struct ClusterColdCtrcWorkV1;
 extern ClusterControlRootResult cluster_wal_inputs_begin_ctrc_census_v1(
 	const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 **out);
+struct ClusterRecoverySerialRequest;
+/* One subject on the original completed observation scope; no second WALR
+ * scope. Produce the full provisional Start request before borrowing inputs.
+ * Native TX_CLOSURE IR and a post-grant whole ROOT check are mandatory. Local
+ * BUSY/RETRY/CF contention retains this same prepared subject/holder for WAIT.
+ * A prepared subject cannot be replaced until exact release is confirmed.
+ * These APIs grant neither PAGE nor ordinary RR, DATA or completion rights. */
+extern ClusterControlRootResult cluster_wal_inputs_ctrc_acquire_v1(
+	ClusterWalInputsV1 *inputs, uint32 subject_index,
+	const struct ClusterRecoverySerialRequest *provisional);
+/* No I/O; original subject proofs and this scope's actual native IR only. */
+extern bool cluster_wal_inputs_ctrc_authorized_v1(ClusterWalInputsV1 *inputs,
+	uint32 subject_index);
+/* Retire only this prepared subject's IR, retaining the original observation
+ * and WALR for the next subject. Proof loss does not prevent exact cleanup.
+ * Unconfirmed release retains IR/request/WALR debt and terminates the call. */
+extern ClusterControlRootResult cluster_wal_inputs_ctrc_release_v1(
+	ClusterWalInputsV1 *inputs, uint32 subject_index);
 /* Borrow the original CTRC scope's read-only shared namespace descriptor.
  * Scope creation records the configured directory name/object before original
  * ROOT selection. The first call opens that same directory without following

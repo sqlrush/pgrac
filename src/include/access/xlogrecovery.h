@@ -251,6 +251,19 @@ extern bool ClusterColdRecoveryTxSerialRequest(const struct ClusterRecoveryStart
 extern struct ClusterRecoverySerialRequest ClusterColdRecoveryCtrcSerialRequest(
 	const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdCtrcWorkV1 *work, uint32 subject_index);
+struct ClusterWalInputsV1;
+/* Borrow only the original completed observation's scope, without I/O or
+ * acquisition. Retain Start and its observation through every dependent use. */
+extern struct ClusterWalInputsV1 *ClusterColdRecoveryCtrcScope(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work);
+/* Native IR purpose callback: local original owner/work/accepted TX/terminal
+ * and completed-source checks only. Never invokes manifest/ROOT I/O, frees a
+ * borrowed scope, or revalidates the IR recursively. Request must be bound to
+ * that exact original scope; full ROOT validation remains a separate step. */
+extern bool ClusterColdRecoveryCtrcSerialRequestCurrent(
+	const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 subject_index,
+	struct ClusterWalInputsV1 *scope, const struct ClusterRecoverySerialRequest *request);
 struct ClusterUndoBlock0Pin;
 /* Reserve the original proven target's EMPTY block0 slot without a content
  * lock. The caller releases it before the retained source scope. This is

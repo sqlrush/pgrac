@@ -26145,6 +26145,7 @@ UT_TEST(test_tx_inputs_parent_subject_and_wait_revalidation)
 #include "test_cluster_control_ctrc_inputs.inc"
 #include "test_cluster_control_ctrc_local_wal.inc"
 #include "test_cluster_control_ctrc_namespace.inc"
+#include "test_cluster_control_ctrc_ir.inc"
 
 /*
  * Keep the long control-root suite deterministic when an individual test
@@ -26358,6 +26359,20 @@ main(int argc, char **argv)
 	if (getenv("PGRAC_PRE2_TEST_STAMP_WORKER_ENTRY") != NULL) {
 		UT_PLAN(1);
 		UT_RUN(test_runtime_v3_failure_worker_entry_establishes_resource_owner);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_CTRC_IR") != NULL) {
+		UT_PLAN(9);
+		UT_RUN(test_ctrc_ir_requires_native_grant_and_keeps_original_walr);
+		UT_RUN(test_ctrc_ir_subject_cannot_change_before_confirmed_release);
+		UT_RUN(test_ctrc_ir_busy_retry_and_cf_contention_retain_one_subject);
+		UT_RUN(test_ctrc_ir_requires_original_complete_subject_request_and_scope);
+		UT_RUN(test_ctrc_ir_late_drift_keeps_native_holder_until_exact_cleanup);
+		UT_RUN(test_ctrc_ir_uncertain_release_retains_request_ir_and_walr_debt);
+		UT_RUN(test_ctrc_ir_current_is_local_and_suspend_never_renews_held_rights);
+		UT_RUN(test_ctrc_ir_ordinary_tx_scope_cannot_claim_ctrc_subject_rights);
+		UT_RUN(test_ctrc_ir_error_keeps_original_holder_and_prepared_subject_revoked);
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
@@ -26615,7 +26630,16 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(528);
+	UT_PLAN(537);
+	UT_RUN(test_ctrc_ir_requires_native_grant_and_keeps_original_walr);
+	UT_RUN(test_ctrc_ir_subject_cannot_change_before_confirmed_release);
+	UT_RUN(test_ctrc_ir_busy_retry_and_cf_contention_retain_one_subject);
+	UT_RUN(test_ctrc_ir_requires_original_complete_subject_request_and_scope);
+	UT_RUN(test_ctrc_ir_late_drift_keeps_native_holder_until_exact_cleanup);
+	UT_RUN(test_ctrc_ir_uncertain_release_retains_request_ir_and_walr_debt);
+	UT_RUN(test_ctrc_ir_current_is_local_and_suspend_never_renews_held_rights);
+	UT_RUN(test_ctrc_ir_ordinary_tx_scope_cannot_claim_ctrc_subject_rights);
+	UT_RUN(test_ctrc_ir_error_keeps_original_holder_and_prepared_subject_revoked);
 	UT_RUN(test_recovered_history_clean_follower_waits_after_sole_complete_install);
 	UT_RUN(test_recovered_history_driver_consumes_exact_selected_history);
 	UT_RUN(test_recovered_history_wait_preserves_original_current_owner_guards);
