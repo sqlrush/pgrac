@@ -883,10 +883,42 @@ UT_TEST(test_resource_x_length_collisions_preserve_legacy_domains)
 				 -1);
 }
 
+UT_TEST(test_first_fill_service_wire_routes_only_canonical_extension)
+{
+	GcsBlockFirstFillForwardPayload service = {0};
+	BufferTag tag = make_tag(1, 2, 3, MAIN_FORKNUM, 157);
+	int expected = cluster_lms_shard_for_tag(&tag, 4);
+	service.forward.tag = tag;
+	service.forward.request_id = 71;
+	service.forward.epoch = 1;
+	service.forward.original_requester_node = 1;
+	service.forward.requester_backend_id = 3;
+	service.forward.master_node = 2;
+	service.forward.transition_id = PCM_TRANS_N_TO_S;
+	service.forward.reserved_0[6] = GCS_BLOCK_FORWARD_KIND_FIRST_FILL_S;
+	service.binding_generation = 7;
+	service.service_generation = 1;
+	UT_ASSERT_EQ(sizeof(service), 80);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+		&service, sizeof(service), 4), expected);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+		&service, sizeof(GcsBlockForwardPayload), 4), -1);
+	service.reserved = 1;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+		&service, sizeof(service), 4), -1);
+	service.reserved = 0; service.service_generation = 0;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+		&service, sizeof(service), 4), -1);
+	service.service_generation = 1; service.binding_generation = UINT64_MAX;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+		&service, sizeof(service), 4), -1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(17);
+	UT_RUN(test_first_fill_service_wire_routes_only_canonical_extension);
 	UT_RUN(test_route_matches_shard_for_tag);
 	UT_RUN(test_route_ack_request_interleave_affinity);
 	UT_RUN(test_route_registry_partition);

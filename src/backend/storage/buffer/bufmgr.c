@@ -18338,7 +18338,7 @@ cluster_bufmgr_downgrade_record_pi(BufferDesc *buf, volatile bool *content_locke
 static ClusterBufmgrGcsDowngradeOutcome
 cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image_internal(
 	BufferTag tag, XLogRecPtr *out_page_lsn, char *dst,
-	ClusterBufmgrGcsCopyRefusal *out_refusal, const ClusterPcmReadGrantKey *first_fill)
+	ClusterBufmgrGcsCopyRefusal *out_refusal, const ClusterPcmReadGrant *first_fill)
 {
 	uint32		hashcode;
 	LWLock	   *partition_lock;
@@ -19100,7 +19100,7 @@ cluster_bufmgr_pcm_own_finish_x_to_s_downgrade(
 static ClusterBufmgrGcsDowngradeOutcome
 cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image_internal(
 	BufferTag tag, int32 master_node, XLogRecPtr *out_page_lsn, char *dst,
-	ClusterBufmgrGcsCopyRefusal *out_refusal, const ClusterPcmReadGrantKey *first_fill)
+	ClusterBufmgrGcsCopyRefusal *out_refusal, const ClusterPcmReadGrant *first_fill)
 {
 	uint32		hashcode;
 	LWLock	   *partition_lock;
@@ -19460,11 +19460,15 @@ cluster_bufmgr_first_fill_service_wakeup(BufferDesc *buf)
  * optional read-cache callers it consumes an exact terminal-X cover via the
  * existing post-commit note and sends an episode-bound asynchronous notice. */
 ClusterBufmgrGcsDowngradeOutcome
-cluster_bufmgr_first_fill_s_prepare_image(const ClusterPcmReadGrantKey *key,
+cluster_bufmgr_first_fill_s_prepare_image(const ClusterPcmReadGrant *service,
 	int32 master_node, XLogRecPtr *out_page_lsn, char *dst,
 	ClusterBufmgrGcsCopyRefusal *out_refusal)
 {
-	if (key == NULL || key->request_id == 0 || key->request_id == UINT64_MAX
+	const ClusterPcmReadGrantKey *key = service != NULL ? &service->key : NULL;
+	if (service == NULL || service->binding_generation == 0
+		|| service->binding_generation == UINT64_MAX || service->service_generation == 0
+		|| service->service_generation == UINT32_MAX || service->holder_node != cluster_node_id
+		|| !service->holder_was_x || key == NULL || key->request_id == 0 || key->request_id == UINT64_MAX
 		|| key->epoch == 0 || key->epoch == UINT64_MAX || key->backend_id <= 0
 		|| key->requester_node < 0 || key->requester_node >= 32
 		|| master_node < 0 || master_node >= 32) {
@@ -19474,9 +19478,9 @@ cluster_bufmgr_first_fill_s_prepare_image(const ClusterPcmReadGrantKey *key,
 	}
 	if (master_node == cluster_node_id)
 		return cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image_internal(
-			key->tag, out_page_lsn, dst, out_refusal, key);
+			key->tag, out_page_lsn, dst, out_refusal, service);
 	return cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image_internal(
-		key->tag, master_node, out_page_lsn, dst, out_refusal, key);
+		key->tag, master_node, out_page_lsn, dst, out_refusal, service);
 }
 
 bool

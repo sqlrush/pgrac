@@ -172,6 +172,12 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		tag = &resource_x_tag;
 		break;
 	case PGRAC_IC_MSG_GCS_BLOCK_FORWARD:
+		if (payload_len == sizeof(GcsBlockFirstFillForwardPayload)) {
+			if (!GcsBlockFirstFillForwardPayloadValid(payload, payload_len))
+				return -1;
+			tag = &((const GcsBlockFirstFillForwardPayload *)payload)->forward.tag;
+			break;
+		}
 		if (payload_len == CLUSTER_CTRC_SEAL_REQUEST_BYTES) {
 			if (!cluster_ctrc_payload_route_tag(payload, payload_len, &route_tag))
 				return -1;
@@ -197,6 +203,9 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		if (payload_len != sizeof(GcsBlockForwardPayload)
 			&& payload_len != sizeof(ClusterR4CrForwardPayload))
 			return -1;
+		if (payload_len == sizeof(GcsBlockForwardPayload)
+			&& GcsBlockForwardPayloadIsFirstFillS(payload))
+			return -1; /* First-fill always carries the bound service extension. */
 		/* Spec 8.4 D4 kind-4 and the M4-scoped existing kind-2 extension
 		 * share the cooperative worker-0 driver and must stay on DATA0.
 		 * Kind-4 additionally requires its internal endpoint; kind-2 keeps
