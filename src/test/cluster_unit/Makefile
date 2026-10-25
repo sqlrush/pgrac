@@ -5232,6 +5232,8 @@ check_r11_source_removal_census:
 # ----------
 clean distclean maintainer-clean:
 	rm -f test_cluster_xid_retention_owner.inc test_cluster_xid_retention_owner.inc.tmp
+	rm -f test_cluster_xid_retention_xact_types.inc test_cluster_xid_retention_xact_types.inc.tmp
+	rm -f test_cluster_xid_retention_xact_functions.inc test_cluster_xid_retention_xact_functions.inc.tmp
 	rm -f test_cluster_data_sync_policy.inc test_cluster_sync_providers.inc \
 		test_cluster_sync_dispatch.inc test_cluster_sync_smgr.inc
 	rm -f test_cluster_tt_rollback_entry.inc
@@ -9286,9 +9288,27 @@ test_cluster_xid_retention_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     emit { print } /^}/ { emit=0 } END { if (functions != 5) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_xid_retention_xact_types.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
+	awk '/^typedef enum (TransState|TBlockState)$$/ { emit=1; types++ } \
+	     /^typedef struct TransactionStateData$$/ { emit=1; types++ } \
+	     /^typedef TransactionStateData \*TransactionState;/ { print; pointers++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (types != 3 || pointers != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_xid_retention_xact_functions.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
+	awk '/^AssignTransactionId\(/ { print "static void"; emit=1; functions++ } \
+	     /^IsTransactionState\(/ { print "static bool"; emit=1; functions++ } \
+	     /^GetTopTransactionId\(/ { print "static TransactionId"; emit=1; functions++ } \
+	     /^GetTopFullTransactionId(IfAny)?\(/ { print "static FullTransactionId"; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } END { if (functions != 5) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_xid_retention: test_cluster_xid_retention.c test_cluster_xid_allocation.c \
 		test_cluster_xid_publication.inc test_cluster_xid_allocation.inc \
 		test_cluster_xid_retention_caller.inc test_cluster_xid_retention_owner.inc \
+		test_cluster_xid_retention_xact.inc test_cluster_xid_retention_xact_types.inc \
+		test_cluster_xid_retention_xact_functions.inc \
 		test_cluster_xid_retention_runtime.inc unit_test.h $(CLUSTER_XID_STRIPE_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention.c \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_recovery.c \
@@ -9297,6 +9317,9 @@ test_cluster_xid_retention: test_cluster_xid_retention.c test_cluster_xid_alloca
 		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_lock.h \
+		$(top_srcdir)/src/include/cluster/cluster_reconfig.h \
+		$(top_srcdir)/src/include/access/xloginsert.h \
+		$(top_srcdir)/src/include/utils/resowner.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 

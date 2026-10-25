@@ -219,6 +219,7 @@ retention_call(bool child, unsigned expected_error)
 #define CLUSTER_XID_RETENTION_CALLER_BODY "test_cluster_xid_retention_caller.inc"
 #endif
 #include CLUSTER_XID_RETENTION_CALLER_BODY
+#include "test_cluster_xid_retention_xact.inc"
 
 UT_TEST(retention_final_callback_publishes_real_top_and_subxid)
 {
@@ -341,7 +342,7 @@ UT_TEST(retention_preserves_original_stop_and_lease_gates)
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(19);
 	UT_RUN(native_subxid_publication_preserves_the_final_cache_slot);
 	UT_RUN(native_publication_keeps_the_full_era_across_raw_rollover);
 	UT_RUN(no_storage_or_procarray_mutation_before_reservation);
@@ -358,6 +359,9 @@ main(void)
 	UT_RUN(original_owner_capture_and_begin_use_the_native_assignment);
 	UT_RUN(original_namespace_pin_survives_other_prepare_cancellation);
 	UT_RUN(original_owner_refusal_keeps_existing_native_pins);
+	UT_RUN(original_xact_stack_keeps_top_pin_and_parent_order);
+	UT_RUN(original_xact_admission_guards_precede_native_assignment);
+	UT_RUN(original_xact_failure_keeps_unassigned_top_and_existing_pin);
 	free(relmap_runtime_shmem);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;

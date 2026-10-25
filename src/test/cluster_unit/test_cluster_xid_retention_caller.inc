@@ -17,6 +17,9 @@ static uint64 caller_boot, caller_admitted;
 static FullTransactionId caller_top;
 static ClusterWalWriterToken caller_writer;
 static unsigned caller_assignments, caller_owner_lock_errors;
+static FullTransactionId (*caller_top_reader)(void);
+static FullTransactionId (*caller_top_if_any_reader)(void);
+static bool (*caller_state_reader)(void);
 
 static void
 caller_observation(void)
@@ -28,6 +31,7 @@ bool
 IsTransactionState(void)
 {
 	caller_observation();
+	if (caller_state_reader != NULL) return caller_state_reader();
 	return caller_transaction;
 }
 
@@ -81,6 +85,10 @@ FullTransactionId
 GetTopFullTransactionId(void)
 {
 	caller_observation();
+	if (caller_top_reader != NULL) {
+		caller_top = caller_top_reader();
+		return caller_top;
+	}
 	if (!FullTransactionIdIsValid(caller_top)) {
 		caller_top = cluster_relmap_retention_allocate_xid_v2(false,
 			retention_sysid, retention_dbinc, retention_origin);
@@ -93,6 +101,7 @@ FullTransactionId
 GetTopFullTransactionIdIfAny(void)
 {
 	caller_observation();
+	if (caller_top_if_any_reader != NULL) return caller_top_if_any_reader();
 	return caller_top;
 }
 
@@ -116,6 +125,8 @@ caller_fixture(uint64 first, unsigned origin)
 	memset(&relmap_runtime_active_owner, 0, sizeof(relmap_runtime_active_owner));
 	caller_transaction = caller_global_x = caller_writer_ready = true;
 	caller_binding_drift = false;
+	caller_top_reader = caller_top_if_any_reader = NULL;
+	caller_state_reader = NULL;
 	caller_assignments = caller_owner_lock_errors = 0;
 	caller_top = InvalidFullTransactionId;
 	MyBackendType = B_BACKEND;
