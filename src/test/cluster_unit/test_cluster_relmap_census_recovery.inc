@@ -30,6 +30,7 @@ static bool census_merger_held = true, census_namespace_x = true;
 static unsigned census_arbitrations, census_arbitration_mode;
 static bool census_batch_consuming;
 static void (*census_native_after_arbitration)(void);
+static void (*census_native_after_prepare)(void);
 static unsigned census_arbitration_after, census_arbitration_drift, census_arbitration_drift_after;
 bool cluster_shared_catalog = true;
 
@@ -189,6 +190,8 @@ cluster_relmap_recovery_prepare_v1(struct ClusterWalInputsV1 *inputs,
 			UT_ASSERT_EQ(close(fd), 0);
 		}
 	}
+	if (census_native_after_prepare != NULL)
+		census_native_after_prepare();
 	return true;
 }
 
@@ -220,6 +223,7 @@ census_native_reset(CensusFixture *f)
 	census_arbitrations = census_arbitration_mode = 0;
 	census_batch_consuming = census_native_scope_error = false;
 	census_native_after_arbitration = NULL;
+	census_native_after_prepare = NULL;
 	census_arbitration_after = census_arbitration_drift_after = 1;
 	census_arbitration_drift = 0;
 	census_merger_held = census_namespace_x = cluster_shared_catalog = true;

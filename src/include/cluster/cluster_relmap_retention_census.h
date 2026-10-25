@@ -339,7 +339,8 @@ extern bool cluster_relmap_retention_census_restart_cold(ClusterRelmapRetentionC
  * not native prepare's separately owned allocations or synchronous I/O.
  *
  * Re-read every exact pair, prepare every selected original native handle,
- * recheck the whole ROOT and all selected pins/sources, then publish once.
+ * recheck the whole ROOT, sources and ALL original origin/slot pin bytes,
+ * including unselected obligations, after each prepare and before publishing.
  * Clean namespaces need no handle. Any late refusal/ERROR frees all local
  * handles, invalidates old observations and retains every pin. Before
  * DRAINED or without original ownership, leave the scan unconsumed.
@@ -376,7 +377,7 @@ cluster_relmap_retention_census_recovery_batch_release(ClusterRelmapCensusRecove
 /* Consume the original prepared set once under the same borrowed lifetimes.
  * Always clear *batch and free all local custody, including refusal/ERROR.
  * Missing initial shared-catalog/merger/X ownership leaves observations alone.
- * Otherwise recheck the whole original ROOT, sources and exact pins before
+ * Otherwise recheck the whole original ROOT, sources and ALL original pins before
  * targets. Revoke physical census/ROOT/directory observations BEFORE the first
  * native arbiter call; native cold authority and all original pins survive.
  * Check original ownership/source/origin metadata and every saved pin across

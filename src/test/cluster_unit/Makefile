@@ -577,6 +577,7 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
 		test_cluster_relmap_census_recovery.inc \
 		test_cluster_relmap_census_batch.inc \
+		test_cluster_relmap_census_all_pins.inc \
 		test_cluster_relmap_census_cold.inc \
 		test_cluster_relmap_census_cold_consume.inc \
 		test_cluster_relmap_census_cold_reobserve.inc \
@@ -638,6 +639,7 @@ test_cluster_relmap_retention_census_product.o: $(top_srcdir)/src/backend/cluste
 test_cluster_relmap_census_side: test_cluster_relmap_retention_census.c \
 		test_cluster_relmap_census_recovery.inc \
 		test_cluster_relmap_census_batch.inc \
+		test_cluster_relmap_census_all_pins.inc \
 		test_cluster_relmap_census_cold.inc \
 		test_cluster_relmap_census_cold_consume.inc \
 		test_cluster_relmap_census_cold_reobserve.inc \

@@ -1006,6 +1006,7 @@ ProcessInterrupts(void)
 }
 #include "test_cluster_relmap_census_recovery.inc"
 #include "test_cluster_relmap_census_batch.inc"
+#include "test_cluster_relmap_census_all_pins.inc"
 #include "test_cluster_relmap_census_cold.inc"
 #include "test_cluster_relmap_census_cold_consume.inc"
 #include "test_cluster_relmap_census_cold_reobserve.inc"
@@ -1018,7 +1019,11 @@ ProcessInterrupts(void)
 int
 main(void)
 {
-	UT_PLAN(114);
+	UT_PLAN(118);
+	UT_RUN(test_retained_batch_prepare_keeps_unselected_and_unused_original_pins);
+	UT_RUN(test_retained_batch_all_original_pins_bind_interval_and_empty_batch);
+	UT_RUN(test_retained_batch_native_clear_rechecks_every_original_pin);
+	UT_RUN(test_retained_batch_native_unknown_still_rechecks_original_sources);
 	UT_RUN(test_cold_committed_reads_clean_and_post_clear_exact_namespaces);
 	UT_RUN(test_cold_committed_initial_gates_preserve_unfinished_and_original_custody);
 	UT_RUN(test_cold_committed_pending_and_missing_namespace_never_mean_empty);

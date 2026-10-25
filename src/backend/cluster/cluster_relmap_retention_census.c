@@ -81,7 +81,7 @@ struct ClusterRelmapCensusRecoveryBatch {
 	ClusterWalInputsV1 *inputs;
 	bool cold;
 	ClusterRelmapRecoverySourceObservationV1 cold_source;
-	uint8 cold_pins[32];
+	uint8 pins[32];
 	size_t bytes;
 	size_t count;
 	CensusRecoveryItem items[FLEXIBLE_ARRAY_MEMBER];
@@ -1024,7 +1024,7 @@ census_recovery_prepare_all(ClusterRelmapRetentionCensus *census, ClusterWalInpu
 			batch->inputs = inputs;
 			batch->cold = cold;
 			batch->bytes = bytes;
-			if (cold && !census_recovery_pins_digest(census, batch->cold_pins))
+			if (!census_recovery_pins_digest(census, batch->pins))
 				break;
 			for (uint32 i = 0; i < census->count; i++) {
 				const ClusterRecoveryRootEntry *entry
@@ -1080,7 +1080,7 @@ census_recovery_prepare_all(ClusterRelmapRetentionCensus *census, ClusterWalInpu
 						break;
 					}
 					if (!census_cold_consumer_current(census, census->nodes[0], &batch->cold_source,
-													  batch->cold_pins,
+														  batch->pins,
 													  CLUSTER_RELMAP_RETENTION_BUILDING)) {
 						complete = false;
 						break;
@@ -1092,12 +1092,15 @@ census_recovery_prepare_all(ClusterRelmapRetentionCensus *census, ClusterWalInpu
 					break;
 				}
 				item->pin = *pin;
+				if (!cold
+					&& !census_recovery_batch_current(batch, CLUSTER_RELMAP_RETENTION_BUILDING)) {
+					complete = false;
+					break;
+				}
 			}
 			if (!complete || !census_recovery_current(census)
-				|| (cold ? (batch->count == 0
-							|| !census_recovery_batch_current(batch,
-															  CLUSTER_RELMAP_RETENTION_BUILDING))
-						 : !census_recovery_sources(census, inputs)))
+				|| (cold && batch->count == 0)
+				|| !census_recovery_batch_current(batch, CLUSTER_RELMAP_RETENTION_BUILDING))
 				break;
 			/* Later native I/O cannot conceal new physical namespaces or
 			 * unrelated changes behind the saved OBSERVED digest. */
@@ -1109,8 +1112,7 @@ census_recovery_prepare_all(ClusterRelmapRetentionCensus *census, ClusterWalInpu
 				root_result = cluster_recovery_root_set_step(census->roots, &event);
 			}
 			if (root_result != CLUSTER_RECOVERY_ROOTS_OBSERVED || !census_recovery_current(census)
-				|| (cold ? !census_recovery_batch_current(batch, CLUSTER_RELMAP_RETENTION_BUILDING)
-						 : !census_recovery_sources(census, inputs))
+				|| !census_recovery_batch_current(batch, CLUSTER_RELMAP_RETENTION_BUILDING)
 				|| !cluster_shared_catalog || !cluster_recovery_merge_claim_is_held()
 				|| !cluster_relmap_authority_x_held())
 				break;
@@ -1165,17 +1167,20 @@ census_recovery_batch_current(const ClusterRelmapCensusRecoveryBatch *batch,
 							  ClusterRelmapRetentionState state)
 {
 	const ClusterRelmapRetentionCensus *census = batch->census;
+	uint8 pins[32];
 
 	if (batch->cold)
 		return census->origin_count == 1 && batch->count != 0
 			   && census_cold_consumer_current(census, census->nodes[0], &batch->cold_source,
-											   batch->cold_pins, state);
+											   batch->pins, state);
 	if (!cluster_shared_catalog || !cluster_recovery_merge_claim_is_held()
 		|| !cluster_relmap_authority_x_held() || !census_recovery_sources(census, batch->inputs))
 		return false;
 	for (size_t i = 0; i < census->origin_count; i++)
 		if (!census_origin_same_in_state(census, census->nodes[i], state))
 			return false;
+	if (!census_recovery_pins_digest(census, pins) || memcmp(pins, batch->pins, sizeof(pins)) != 0)
+		return false;
 	for (size_t i = 0; i < batch->count; i++) {
 		const CensusRecoveryItem *item = &batch->items[i];
 		const ClusterRelmapRetentionPin *pin
@@ -1249,19 +1254,17 @@ census_recovery_arbitrate_all(ClusterRelmapCensusRecoveryBatch **custody, bool c
 					break;
 				native_result = cluster_relmap_arbitrate_pending_v2(&item->handle, &item->identity,
 																	&item->pending);
-				/* Cold UNKNOWN may follow target writes too. Complete its
+				/* UNKNOWN may follow target writes too. Complete the
 				 * original source/pin checks on EVERY normal return. */
-				if (cold && !census_recovery_batch_current(batch, CLUSTER_RELMAP_RETENTION_UNKNOWN))
+				if (!census_recovery_batch_current(batch, CLUSTER_RELMAP_RETENTION_UNKNOWN))
 					break;
-				if (native_result != CLUSTER_RELMAP_V2_CLEARED_POSTREAD
-					|| (!cold
-						&& !census_recovery_batch_current(batch, CLUSTER_RELMAP_RETENTION_UNKNOWN)))
+				if (native_result != CLUSTER_RELMAP_V2_CLEARED_POSTREAD)
 					break;
 			}
 			if (consumed == batch->count) {
 				if (cold) {
 					census->cold_observe_source = batch->cold_source;
-					memcpy(census->cold_observe_pins, batch->cold_pins, sizeof(batch->cold_pins));
+					memcpy(census->cold_observe_pins, batch->pins, sizeof(batch->pins));
 					census->cold_observe_origin = census->nodes[0];
 				}
 				result = CLUSTER_RELMAP_V2_CLEARED_POSTREAD;
