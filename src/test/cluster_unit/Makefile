@@ -10133,6 +10133,7 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_handoff.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_census.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_terminals.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_source_request.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_replay_source.inc
 test_cluster_cold_tx_start: $(top_srcdir)/src/include/cluster/cluster_recovery_census.h
 
 test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_owner.inc \

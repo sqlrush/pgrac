@@ -1346,6 +1346,117 @@ ClusterColdRecoveryCtrcSerialRequestCurrent(const struct ClusterRecoveryStartV1 
 		&& memcmp(request, &original, sizeof(original)) == 0;
 }
 
+/* An origin can contribute redo with no TT subject. Its native purpose
+ * callback still validates every original physical terminal locally, including
+ * a legitimately empty work, without manifest I/O or borrowed-scope cleanup. */
+static const ClusterColdCtrcPhysicalV1 *
+cluster_recovery_cold_ctrc_all_local_physical(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work)
+{
+	const ClusterColdCtrcPhysicalV1 *physical;
+	uint32 count;
+
+	if (!ClusterColdRecoveryCtrcWorkCurrent(start, work)
+		|| !start->ctrc_observation_complete || work != start->ctrc_observation_work
+		|| !cluster_recovery_cold_observation_current(start))
+		return NULL;
+	physical = start->ctrc_physical;
+	count = physical->count;
+	for (uint32 i = 0; i < count; i++)
+		if (cluster_recovery_cold_ctrc_local_physical(start, work, i) != physical)
+			return NULL;
+	return cluster_recovery_cold_observation_current(start)
+		&& start->ctrc_physical == physical && physical->count == count ? physical : NULL;
+}
+
+static bool
+cluster_recovery_cold_ctrc_replay_index(const ClusterColdTypedV1 *typed, uint32 index)
+{
+	return typed->participant_count <= CLUSTER_COLD_MAX_PARTICIPANTS
+		&& typed->replay_count > 0 && typed->replay_count <= typed->participant_count
+		&& index < typed->replay_count && typed->sources[index].timeline != 0
+		&& cluster_recovery_cold_ctrc_source(typed, typed->participants[index].thread_id) == index;
+}
+
+static ClusterRecoverySerialRequest
+cluster_recovery_cold_ctrc_replay_request(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 source_index, bool manifest)
+{
+	ClusterRecoverySerialRequest request, empty;
+	const ClusterColdTypedV1 *typed;
+	const ClusterColdCtrcPhysicalV1 *physical, *confirmed;
+	struct ClusterRecoveryFencePlan *fence;
+	ClusterWalSourceRef source;
+	ClusterColdParticipantV1 participant;
+	uint32 replay_count, participant_count;
+
+	memset(&request, 0, sizeof(request));
+	memset(&empty, 0, sizeof(empty));
+	if (CritSectionCount != 0 || !ClusterColdRecoveryCtrcWorkCurrent(start, work))
+		return empty;
+	typed = start->inputs;
+	if (!cluster_recovery_cold_ctrc_replay_index(typed, source_index)
+		|| (physical = manifest ? ClusterColdRecoveryCtrcPhysical(start, work)
+			: cluster_recovery_cold_ctrc_all_local_physical(start, work)) == NULL
+		|| !ClusterColdRecoveryCtrcWorkCurrent(start, work) || start->inputs != typed
+		|| !cluster_recovery_cold_ctrc_replay_index(typed, source_index))
+		return empty;
+	fence = start->tx_fence;
+	replay_count = typed->replay_count;
+	participant_count = typed->participant_count;
+	memcpy(&source, &typed->sources[source_index], sizeof(source));
+	memcpy(&participant, &typed->participants[source_index], sizeof(participant));
+	/* The original completed fence supplies the old identity, RR token and
+	 * formation/isolation owners. No TT occupancy or new writer substitutes. */
+	if (!cluster_recovery_merge_fence_plan_tx_request_v1(fence,
+			&typed->sources[source_index], &request))
+		return empty;
+	confirmed = manifest ? ClusterColdRecoveryCtrcPhysical(start, work)
+		: cluster_recovery_cold_ctrc_all_local_physical(start, work);
+	if (confirmed != physical || !ClusterColdRecoveryCtrcWorkCurrent(start, work)
+		|| start->inputs != typed || start->tx_fence != fence
+		|| typed->replay_count != replay_count || typed->participant_count != participant_count
+		|| !cluster_recovery_cold_ctrc_replay_index(typed, source_index)
+		|| memcmp(&source, &typed->sources[source_index], sizeof(source)) != 0
+		|| memcmp(&participant, &typed->participants[source_index], sizeof(participant)) != 0
+		|| !cluster_recovery_merge_fence_plan_tx_current_v1(fence, &source)
+		|| !cluster_recovery_cold_observation_current(start))
+		return empty;
+	return request;
+}
+
+ClusterRecoverySerialRequest
+ClusterColdRecoveryCtrcReplayRequest(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 source_index)
+{
+	return cluster_recovery_cold_ctrc_replay_request(start, work, source_index, true);
+}
+
+bool
+ClusterColdRecoveryCtrcReplayRequestCurrent(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 source_index,
+	struct ClusterWalInputsV1 *scope, const ClusterRecoverySerialRequest *request)
+{
+	ClusterRecoverySerialRequest original, expected;
+
+	if (request == NULL || scope == NULL || ClusterColdRecoveryCtrcScope(start, work) != scope)
+		return false;
+	memcpy(&original, request, sizeof(original));
+	expected = cluster_recovery_cold_ctrc_replay_request(start, work, source_index, false);
+	return expected.mode == CLUSTER_RECOVERY_SERIAL_TX_CLOSURE
+		&& original.mode == expected.mode && original.tx_closure_scope == scope
+		&& memcmp(&original.duty, &expected.duty, sizeof(expected.duty)) == 0
+		&& memcmp(&original.expected_root_token, &expected.expected_root_token,
+			sizeof(expected.expected_root_token)) == 0
+		&& memcmp(&original.pending, &expected.pending, sizeof(expected.pending)) == 0
+		&& original.formation == expected.formation
+		&& original.fence_need_set == expected.fence_need_set
+		&& original.fence_admission_set == expected.fence_admission_set
+		&& original.acquire_timeout_ms == expected.acquire_timeout_ms
+		&& original.release_timeout_ms == expected.release_timeout_ms
+		&& memcmp(request, &original, sizeof(original)) == 0;
+}
+
 bool
 ClusterColdRecoveryTxEffectsCurrent(const struct ClusterRecoveryStartV1 *start)
 {
