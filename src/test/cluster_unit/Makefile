@@ -8943,8 +8943,10 @@ test_cluster_xid_stripe_boot.inc: $(top_srcdir)/src/backend/cluster/cluster_xid_
 	     /^cluster_xid_stripe_join_progress\(/ { print "ClusterXidStripeJoinProgress"; emit=1; functions++ } \
 	     /^cluster_xid_stripe_join_gate\(/ { print "ClusterXidStripeJoinVerdict"; emit=1; functions++ } \
 	     /^cluster_xid_stripe_(get_activation|emit_join_wal)\(/ { print "bool"; emit=1; functions++ } \
+	     /^cluster_xid_stripe_replay_note_join\(/ { print "void"; emit=1; functions++ } \
+	     /^cluster_xid_stripe_replay_join_v1\(/ { print "bool"; emit=1; functions++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (types != 3 || pointers != 1 || functions != 7) exit 1 }' $(filter %.c,$^) > $@.tmp
+	     END { if (types != 3 || pointers != 1 || functions != 9) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_xid_stripe_boot: test_cluster_xid_stripe_boot.c unit_test.h test_cluster_xid_stripe_boot.inc

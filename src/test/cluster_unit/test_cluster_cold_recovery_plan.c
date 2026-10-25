@@ -29,6 +29,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_xid_stripe_xlog.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 
 #include "unit_test.h"
@@ -1441,10 +1442,66 @@ UT_TEST(test_input_frames_share_original_memory_budget)
 	destroy_plan(&plan);
 }
 
+static ClusterColdDetailV1
+feed_stripe_join(ClusterColdPlanV1 *plan, uint32 p, XLogRecPtr read,
+	uint64 floor, uint64 epoch)
+{
+	ClusterColdRecordV1 r = { 0 };
+	r.read_rec_ptr = read;
+	r.end_rec_ptr = read + 0x40;
+	r.prev_rec_ptr = chain_prev(plan, p, read);
+	r.rmid = RM_CLUSTER_XID_STRIPE_ID;
+	r.info = XLOG_CLUSTER_XID_STRIPE_JOIN;
+	r.stripe_floor_full = floor;
+	r.stripe_epoch = epoch;
+	return cluster_cold_plan_feed_v1(plan, p, &r);
+}
+
+UT_TEST(test_stripe_join_tuple_is_cohort_wide_and_history_bound)
+{
+	for (unsigned reverse = 0; reverse < 2; reverse++) {
+		ClusterColdParticipantV1 cuts[2] = { part(1, 11, 0x100, 0x140, 0x180),
+			part(2, 12, 0x100, 0x100, 0x180) };
+		ClusterColdPlanV1 *plan = make_plan(cuts, 2);
+		ObserveTable table = { 0 };
+		ClusterColdDiagV1 diag;
+		for (unsigned k = 0; k < 2; k++) {
+			unsigned p = reverse ? 1 - k : k;
+			UT_ASSERT_EQ(feed_stripe_join(plan, p, 0x100, 4195104, 1), CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(feed_stripe_join(plan, p, 0x140, 4195104, 1), CLUSTER_COLD_OK);
+		}
+		UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 0);
+		UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 0), 1);
+		UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 1), 2);
+		destroy_plan(&plan);
+	}
+}
+
+UT_TEST(test_stripe_join_tuple_disagreement_refuses_before_any_observation)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ClusterColdParticipantV1 cuts[2] = { part(1, 11, 0x100, 0x140, 0x140),
+			part(2, 12, 0x100, 0x100, 0x140) };
+		ClusterColdPlanV1 *plan = make_plan(cuts, 2);
+		ObserveTable table = { 0 };
+		ClusterColdDiagV1 diag;
+		UT_ASSERT_EQ(feed_stripe_join(plan, 0, 0x100, 4195104, 1), CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(feed_stripe_join(plan, 1, 0x100,
+			fault == 0 ? 0 : fault == 1 ? 4195105 : 4195104,
+			fault == 2 ? 0 : fault == 3 ? 2 : 1), CLUSTER_COLD_COMPONENT_INVALID);
+		UT_ASSERT_NE(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(table.calls, 0);
+		destroy_plan(&plan);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(42);
+	UT_PLAN(44);
+	UT_RUN(test_stripe_join_tuple_is_cohort_wide_and_history_bound);
+	UT_RUN(test_stripe_join_tuple_disagreement_refuses_before_any_observation);
 	UT_RUN(test_c0_history_is_not_checkpoint_coverage);
 	UT_RUN(test_c0_replay_range_retains_full_record_obligation);
 	UT_RUN(test_lower_lag_old_fpi_cannot_overwrite_newer_durable);

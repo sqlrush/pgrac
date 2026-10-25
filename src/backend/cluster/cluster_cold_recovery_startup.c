@@ -57,6 +57,7 @@
 #include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_wal_tail.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_xid_stripe_xlog.h"
 #include "storage/bufpage.h"
 #include "storage/checksum.h"
 #include "utils/memutils.h"
@@ -1673,6 +1674,8 @@ cold_record_side_kind(const ClusterColdRecordV1 *record)
 		return RF_SIDE_ONLINE_OPERATION_INVALID;
 	if (record->rmid == RM_CLUSTER_UNDO_ID && info == XLOG_UNDO_RECOVERY_TT_ABORT)
 		return RF_SIDE_ONLINE_OPERATION_RECOVERY_TT_ABORT;
+	if (record->rmid == RM_CLUSTER_XID_STRIPE_ID && info == XLOG_CLUSTER_XID_STRIPE_JOIN)
+		return RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL;
 	if (record->rmid == RM_CLUSTER_UNDO_ID
 		&& (info == XLOG_UNDO_BLOCK_WRITE || info == XLOG_UNDO_BLOCK_WRITE_MULTI
 			|| info == XLOG_UNDO_SEGMENT_INIT || info == XLOG_UNDO_SEGMENT_REUSE

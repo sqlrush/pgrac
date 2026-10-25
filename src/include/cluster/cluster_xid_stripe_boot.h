@@ -243,6 +243,10 @@ extern uint64 cluster_xid_wrap_barrier_ack_bitmap(void);
 extern uint64 cluster_xid_stripe_cluster_max_hwm(void);
 
 extern void cluster_xid_stripe_replay_note_join(uint64 floor_full, uint64 epoch, int slot);
+/* Cold Startup's serialized publisher: false preflights without mutation;
+ * true uses the original native publisher and verifies its exact readback. */
+extern bool cluster_xid_stripe_replay_join_v1(uint64 floor_full, uint64 epoch, int slot,
+										   bool apply);
 extern void cluster_xid_stripe_replay_note_retire(int slot);
 extern bool cluster_xid_stripe_replay_filter_active(void);
 extern bool cluster_xid_stripe_replay_should_fill(TransactionId xid);

@@ -174,6 +174,10 @@ typedef struct ClusterColdRecordV1 {
 	/* Original frame values, not a derived canonical ownership proof. */
 	TransactionId source_xid;
 	TransactionId source_top_xid;
+	/* Exact JOIN activation, folded across the readonly source set. Zero
+	 * for every other family; not a wire field or execution authority. */
+	uint64 stripe_floor_full;
+	uint64 stripe_epoch;
 	uint8 rmid;
 	uint8 info;
 	uint8 record_flags; /* CLUSTER_COLD_RECORD_* */

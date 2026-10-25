@@ -36,6 +36,7 @@
 #include "storage/standbydefs.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_xid_stripe_xlog.h"
 #include "cluster/cluster_cold_recovery_census.h"
 #include "cluster/cluster_cold_recovery_plan_internal.h"
 #include "cluster/cluster_side_online_plan.h"
@@ -2017,8 +2018,8 @@ side_record_fixture(ClusterColdRecordV1 *record, uint8 rmid, uint8 info,
 
 UT_TEST(test_native_side_dispatch_selects_exact_existing_consumer)
 {
-	const uint8 rmids[] = { RM_CLOG_ID,		 RM_CLOG_ID,	  RM_MULTIXACT_ID, RM_MULTIXACT_ID,
-							RM_MULTIXACT_ID, RM_MULTIXACT_ID, RM_XACT_ID,	   RM_STANDBY_ID };
+	const uint8 rmids[] = { RM_CLOG_ID, RM_CLOG_ID, RM_MULTIXACT_ID, RM_MULTIXACT_ID,
+		RM_MULTIXACT_ID, RM_MULTIXACT_ID, RM_XACT_ID, RM_STANDBY_ID, RM_CLUSTER_XID_STRIPE_ID };
 	const uint8 infos[] = { CLOG_ZEROPAGE,
 							CLOG_TRUNCATE,
 							XLOG_MULTIXACT_ZERO_OFF_PAGE,
@@ -2026,7 +2027,7 @@ UT_TEST(test_native_side_dispatch_selects_exact_existing_consumer)
 							XLOG_MULTIXACT_CREATE_ID,
 							XLOG_MULTIXACT_TRUNCATE_ID,
 							XLOG_XACT_ASSIGNMENT,
-							XLOG_INVALIDATIONS };
+							XLOG_INVALIDATIONS, XLOG_CLUSTER_XID_STRIPE_JOIN };
 	for (uint32 i = 0; i < lengthof(rmids); i++) {
 		ClusterColdRecordV1 record;
 		ClusterColdTypedV1 *typed = control_fixture_mode(&record, true);
@@ -2045,7 +2046,7 @@ UT_TEST(test_native_side_dispatch_selects_exact_existing_consumer)
 
 UT_TEST(test_native_side_dispatch_rejects_wrong_kind_and_family)
 {
-	for (uint32 fault = 0; fault < 9; fault++) {
+	for (uint32 fault = 0; fault < 11; fault++) {
 		ClusterColdRecordV1 record;
 		ClusterColdTypedV1 *typed;
 
@@ -2086,6 +2087,15 @@ UT_TEST(test_native_side_dispatch_rejects_wrong_kind_and_family)
 		case 8:
 			side_record_fixture(&record, RM_STANDBY_ID, XLOG_INVALIDATIONS,
 								RF_SIDE_ONLINE_OPERATION_XACT);
+			break;
+		case 9:
+			side_record_fixture(&record, RM_CLUSTER_XID_STRIPE_ID, XLOG_CLUSTER_XID_STRIPE_RETIRE,
+								RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL);
+			break;
+		case 10:
+			side_record_fixture(&record, RM_CLUSTER_XID_STRIPE_ID,
+				XLOG_CLUSTER_XID_STRIPE_JOIN | XLR_SPECIAL_REL_UPDATE,
+				RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL);
 			break;
 		}
 		UT_ASSERT(!consume_control(typed, &record));

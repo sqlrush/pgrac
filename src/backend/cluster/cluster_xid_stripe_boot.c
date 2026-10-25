@@ -2026,6 +2026,34 @@ cluster_xid_stripe_replay_note_retire(int slot)
 }
 
 bool
+cluster_xid_stripe_replay_join_v1(uint64 floor_full, uint64 epoch, int slot, bool apply)
+{
+	uint64 current_floor, current_epoch;
+	uint32 bitmap;
+
+	/* This face is called only by the serialized cold Startup owner, after
+	 * its whole-source activation fold and original authority preflight.
+	 * Do not let native first-wins or missing shmem become a false success. */
+	if (StripeBootShmem == NULL || floor_full == 0 || epoch == 0
+		|| slot < 0 || slot >= CLUSTER_XID_STRIDE)
+		return false;
+	current_floor = pg_atomic_read_u64(&StripeBootShmem->replay_floor_full);
+	current_epoch = pg_atomic_read_u64(&StripeBootShmem->replay_epoch);
+	bitmap = pg_atomic_read_u32(&StripeBootShmem->replay_active_bitmap);
+	if (current_floor == 0 && current_epoch == 0) {
+		if (bitmap != 0)
+			return false;
+	} else if (current_floor != floor_full || current_epoch != epoch)
+		return false;
+	if (!apply)
+		return true;
+	cluster_xid_stripe_replay_note_join(floor_full, epoch, slot);
+	return pg_atomic_read_u64(&StripeBootShmem->replay_floor_full) == floor_full
+		   && pg_atomic_read_u64(&StripeBootShmem->replay_epoch) == epoch
+		   && (pg_atomic_read_u32(&StripeBootShmem->replay_active_bitmap) & (UINT32_C(1) << slot)) != 0;
+}
+
+bool
 cluster_xid_stripe_replay_filter_active(void)
 {
 	return StripeBootShmem != NULL && pg_atomic_read_u64(&StripeBootShmem->replay_floor_full) != 0;

@@ -24,6 +24,8 @@
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_uba.h"
+#include "cluster/cluster_xid_stripe_boot.h"
+#include "cluster/cluster_xid_stripe_xlog.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "storage/standbydefs.h"
 #include "utils/inval.h"
@@ -1116,6 +1118,27 @@ side_owner_cold_control_no_effect(const RfSideOnlineProductionOwnerV1 *owner,
 }
 
 static bool
+side_owner_cold_stripe_join(const RfSideOnlineProductionOwnerV1 *owner,
+						   const RfSideOnlineOperationV1 *operation, bool apply)
+{
+	uint64 floor, epoch;
+	const RfPageReplayRecordIdentityV1 *record = &operation->identity.record;
+
+	return side_owner_cold_formed(owner) && cluster_node_id >= 0
+		   && cluster_node_id <= SCN_MAX_VALID_NODE_ID
+		   && record->origin_thread != cluster_node_id + 1
+		   && standbyState == STANDBY_DISABLED
+		   && record->rmid == RM_CLUSTER_XID_STRIPE_ID
+		   && record->info == XLOG_CLUSTER_XID_STRIPE_JOIN
+		   && !TransactionIdIsValid(operation->source_xid)
+		   && !TransactionIdIsValid(operation->source_top_xid)
+		   && rf_side_online_stripe_join_shape_v1(operation->owned_payload,
+													 operation->owned_payload_length,
+													 record->origin_thread, &floor, &epoch)
+		   && cluster_xid_stripe_replay_join_v1(floor, epoch, record->origin_thread - 1, apply);
+}
+
+static bool
 side_owner_preflight_control(void *arg, const RfSideOnlineOperationV1 *operation)
 {
 	RfSideOnlineProductionOwnerV1 *owner = arg;
@@ -1149,6 +1172,8 @@ side_owner_preflight_control(void *arg, const RfSideOnlineOperationV1 *operation
 	if (side_owner_cold_formed(owner)) {
 		if (!cluster_undo_recovery_cold_origin_authorized_v1(record->origin_thread - 1))
 			return false;
+		if (record->rmid == RM_CLUSTER_XID_STRIPE_ID)
+			return side_owner_cold_stripe_join(owner, operation, false);
 		if (record->rmid == RM_XACT_ID && info == XLOG_XACT_ASSIGNMENT)
 			return side_owner_assignment(operation, false);
 		if (record->rmid == RM_STANDBY_ID && info == XLOG_INVALIDATIONS)
@@ -1167,11 +1192,18 @@ side_owner_apply_control(void *arg, const RfSideOnlineOperationV1 *operation)
 {
 	RfSideOnlineProductionOwnerV1 *owner = arg;
 	bool cold_no_effect;
+	bool cold_join;
 
 	if (!side_owner_preflight_control(arg, operation))
 		return false;
 	cold_no_effect = side_owner_cold_control_no_effect(owner, operation);
-	if (side_owner_cold_formed(owner) && operation->identity.record.rmid == RM_XACT_ID
+	cold_join = side_owner_cold_formed(owner)
+				&& operation->identity.record.rmid == RM_CLUSTER_XID_STRIPE_ID;
+	if (cold_join) {
+		if (!side_owner_cold_stripe_join(owner, operation, true)
+			|| !side_owner_preflight_control(arg, operation))
+			return false;
+	} else if (side_owner_cold_formed(owner) && operation->identity.record.rmid == RM_XACT_ID
 		&& (operation->identity.record.info & ~XLR_INFO_MASK) == XLOG_XACT_ASSIGNMENT) {
 		if (!side_owner_assignment(operation, true)
 			|| !side_owner_preflight_control(arg, operation))
@@ -1207,8 +1239,8 @@ side_owner_apply_control(void *arg, const RfSideOnlineOperationV1 *operation)
 	cluster_scn_recovery_replay_observe(operation->control_scn);
 	/* A source/role change cannot convert the cold no-effect classification
 	 * into an online success after observing the original SCN. */
-	if (cold_no_effect
-		&& (!side_owner_cold_control_no_effect(owner, operation)
+	if ((cold_no_effect || cold_join)
+		&& ((cold_no_effect && !side_owner_cold_control_no_effect(owner, operation))
 			|| !side_owner_preflight_control(arg, operation)))
 		return false;
 	return true;

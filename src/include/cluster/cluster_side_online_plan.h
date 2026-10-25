@@ -401,6 +401,10 @@ extern bool rf_side_online_projection_record_shape_v1(XLogReaderState *record, b
  * Shape only: grants no source, no-effect or execution authority. */
 extern bool rf_side_online_standby_record_shape_v1(XLogReaderState *record);
 
+/* Exact native JOIN payload and emitting source only. No replay authority. */
+extern bool rf_side_online_stripe_join_shape_v1(const uint8 *data, uint32 length,
+											 uint16 origin_thread, uint64 *floor, uint64 *epoch);
+
 /* Complete sorted unique namespace/locator set for typed SPACE, including
  * each original COMMIT-DROP participant. Sealing checks every source chain;
  * enumeration grants no target, lifecycle or durability authority.
