@@ -3939,6 +3939,8 @@ test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
 		test_cluster_relmap_original_cohort.inc \
 		test_cluster_relmap_native_file.inc \
 		test_cluster_relmap_original_storage.inc \
+		test_cluster_relmap_original_pin.inc test_cluster_relmap_native_pin.h \
+		test_cluster_relmap_native_pin.o \
 		test_cluster_relmap_native_storage.h test_cluster_relmap_native_storage.o \
 		test_cluster_relmap_original_scope.o test_cluster_relmap_original_authority.o \
 		test_cluster_relmap_retained_arb.o test_cluster_relmap_retained_authority.o \
@@ -3965,6 +3967,13 @@ test_cluster_relmap_original_scope.o: $(top_srcdir)/src/backend/cluster/cluster_
 		-include test_cluster_relmap_original_scope_namespace.h -c $< -o $@
 
 # Compose the cold executor with the actual native arbiter and pair storage.
+test_cluster_relmap_native_pin.o: test_cluster_relmap_native_pin.c \
+		test_cluster_relmap_native_pin.h test_cluster_relmap_native_pin_namespace.h \
+		test_cluster_wal_retention.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_retention.c \
+		$(top_srcdir)/src/include/cluster/cluster_wal_retention.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
 test_cluster_relmap_native_storage.o: test_cluster_relmap_native_storage.c \
 		test_cluster_relmap_native_storage.h test_cluster_relmap_native_storage_namespace.h \
 		test_cluster_shared_fs_sharedfs.c test_cluster_data_sync_policy.inc \
@@ -4051,7 +4060,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relma
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_owner.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_arb.o test_cluster_relmap_retained_authority.o) \
-		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_native_clog.o test_cluster_relmap_native_storage.o test_cluster_relmap_original_scope.o test_cluster_relmap_original_authority.o) \
+		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_native_clog.o test_cluster_relmap_native_storage.o test_cluster_relmap_native_pin.o test_cluster_relmap_original_scope.o test_cluster_relmap_original_authority.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),$(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_census.o test_cluster_relmap_pending_product.o test_cluster_relmap_pending_side_product.o $(top_builddir)/src/backend/cluster/cluster_relmap_retention.o) \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_root_set.o \
@@ -10081,8 +10090,14 @@ test_cluster_xid_stripe_evidence.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     END { if (maintenance != 4 || history != 5 || lookup != 1 || types != 2 || zero != 1 || reads != 2 || leases != 1 || pointer != 1 || actions != 2 || ready != 1 || future != 1 || fence != 1 || window != 1 || wrap != 1 || boots != 1 || bootptr != 1 || writers != 2 || herd != 1 || floor != 1 || wait != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_xid_stripe_active.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
+	awk '/^ProcArrayGetActiveFullXidSample\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_xid_stripe_evidence: test_cluster_xid_stripe_evidence.c unit_test.h \
-		test_cluster_xid_stripe_evidence.inc $(CLUSTER_XID_STRIPE_O) \
+		test_cluster_xid_stripe_evidence.inc test_cluster_xid_stripe_active.inc \
+		test_cluster_pgproc_active_types.inc $(CLUSTER_XID_STRIPE_O) \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
 		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
 		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h

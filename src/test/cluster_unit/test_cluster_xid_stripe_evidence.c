@@ -31,6 +31,10 @@
 #include "cluster/cluster_inject.h"
 #include "storage/condition_variable.h"
 #include "storage/lwlock.h"
+#include "storage/proc.h"
+#include "storage/procarray.h"
+#include "access/twophase.h"
+#include "test_cluster_pgproc_active_types.inc"
 #include "storage/pmsignal.h"
 #include "miscadmin.h"
 #include "utils/wait_event.h"
@@ -44,6 +48,27 @@ bool cluster_shared_catalog;
 int cluster_node_id;
 int cluster_xid_herding_slack = 4194304;
 static uint64 local_next = 2052;
+/* Only the new composition cases use these native PGPROC/cache inputs. */
+static VariableCacheData variables;
+VariableCache ShmemVariableCache = &variables;
+static PROC_HDR procs;
+PROC_HDR *ProcGlobal = &procs;
+static char active_array_storage[offsetof(ProcArrayStruct, pgprocnos) + 8 * sizeof(int)]
+	pg_attribute_aligned(MAXIMUM_ALIGNOF);
+#define active_array (*(ProcArrayStruct *) active_array_storage)
+static ProcArrayStruct *procArray = &active_array;
+static TransactionId active_xids[8];
+static PGPROC active_procs[8];
+static bool active_sampling, active_recovery;
+static LWLock *active_locks[3];
+static unsigned active_depth, active_lock_errors, active_array_reads;
+static void (*after_future_hook)(void);
+
+bool
+RecoveryInProgress(void)
+{
+	return active_recovery;
+}
 static bool stall_herding;
 bool IsUnderPostmaster;
 volatile sig_atomic_t InterruptPending;
@@ -123,6 +148,21 @@ ReadNextFullTransactionId(void)
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
+	if (active_sampling) {
+		if (mode != LW_SHARED || active_depth >= lengthof(active_locks))
+			abort();
+		if (lock == ProcArrayLock) {
+			active_array_reads++;
+			if (active_depth != 0 || xid_lock_held)
+				active_lock_errors++;
+		}
+		if (lock == XidGenLock) {
+			if (active_depth != 0)
+				active_lock_errors++;
+			xid_lock_held = true;
+		}
+		active_locks[active_depth++] = lock;
+	}
 	exclusive_lock = mode == LW_EXCLUSIVE;
 	return true;
 }
@@ -134,6 +174,18 @@ LWLockHeldByMe(LWLock *lock)
 void
 LWLockRelease(LWLock *lock)
 {
+	if (active_sampling) {
+		if (active_depth == 0 || active_locks[--active_depth] != lock)
+			abort();
+		if (lock == XidGenLock) {
+			xid_lock_held = false;
+			if (after_future_hook != NULL) {
+				void (*hook)(void) = after_future_hook;
+				after_future_hook = NULL;
+				hook();
+			}
+		}
+	}
 	if (exclusive_lock && exclusive_release_hook != NULL) {
 		void (*hook)(void) = exclusive_release_hook;
 		exclusive_release_hook = NULL;
@@ -299,6 +351,7 @@ cluster_voting_disk_write_raw_slot_at(int fd, off_t offset, const void *bytes)
 }
 
 #include "test_cluster_xid_stripe_evidence.inc"
+#include "test_cluster_xid_stripe_active.inc"
 
 static ClusterXidStripeSlotRecord rows[3];
 static ClusterXidStripeLease lease;
@@ -363,6 +416,8 @@ cluster_xid_stripe_scan_disks(const int *fds, int n_disks)
 static void
 reset_lease(void)
 {
+	active_sampling = active_recovery = false;
+	after_future_hook = NULL;
 	memset(&lease, 0, sizeof(lease));
 	pg_atomic_init_u64(&lease.floor_full, 0);
 	pg_atomic_init_u64(&lease.limit_full, 0);
@@ -1663,6 +1718,196 @@ UT_TEST(maintenance_durable_io_still_requires_current_proof_before_arm)
 	UT_ASSERT_EQ(U64FromFullTransactionId(cluster_xid_stripe_herding_floor()), 8196);
 }
 
+/* Compose the original durable lease/future producer and native F sampler.
+ * PGPROC membership, atomics and lock scheduling remain controlled leaves. */
+static void
+prepare_active_sample(void)
+{
+	prepare_future_lease();
+	MemSet(&variables, 0, sizeof(variables));
+	MemSet(&procs, 0, sizeof(procs));
+	MemSet(active_array_storage, 0, sizeof(active_array_storage));
+	MemSet(active_xids, 0, sizeof(active_xids));
+	MemSet(active_procs, 0, sizeof(active_procs));
+	variables.nextXid = FullTransactionIdFromU64(local_next);
+	procs.xids = active_xids;
+	procs.allProcs = active_procs;
+	active_array.maxProcs = lengthof(active_xids);
+	for (unsigned i = 0; i < lengthof(active_procs); i++)
+		pg_atomic_init_u64(&active_procs[i].cluster_top_full_xid_atomic, 0);
+	active_depth = active_lock_errors = active_array_reads = 0;
+	xid_lock_held = false;
+	active_sampling = true;
+}
+
+UT_TEST(active_sample_composes_real_floors_and_original_pgproc_identity)
+{
+	FullTransactionId reference, future, minimum;
+	ClusterXidStripeSampleFence fence;
+	VariableCacheData before;
+	unsigned writes_before;
+
+	prepare_active_sample();
+	boot.floor_full = 2055;
+	pg_atomic_write_u64(&boot.herding_floor_full, 2069);
+	active_array.numProcs = 3;
+	active_array.pgprocnos[0] = 6;
+	active_array.pgprocnos[1] = 1;
+	active_array.pgprocnos[2] = 4;
+	/* Same raw value, different original epoch: never collapse the identities. */
+	active_xids[0] = 2050;
+	pg_atomic_write_u64(&active_procs[6].cluster_top_full_xid_atomic,
+		U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 2050)));
+	active_xids[1] = 2051;
+	pg_atomic_write_u64(&active_procs[1].cluster_top_full_xid_atomic, 2051);
+	/* An idle compact entry's stale full value is not an active producer. */
+	pg_atomic_write_u64(&active_procs[4].cluster_top_full_xid_atomic, 3);
+	before = variables;
+	writes_before = writes;
+	UT_ASSERT(ProcArrayGetActiveFullXidSample(&reference, &future, &minimum, &fence));
+	UT_ASSERT_EQ(U64FromFullTransactionId(reference), 2052);
+	UT_ASSERT_EQ(U64FromFullTransactionId(future), 2084);
+	UT_ASSERT_EQ(U64FromFullTransactionId(minimum), 2051);
+	UT_ASSERT_EQ(fence.activation_floor_full, 2055);
+	UT_ASSERT_EQ(fence.slot_floor_full, boot.my_slot_floor_full);
+	UT_ASSERT_EQ(fence.slot_owner_incarnation, boot.my_owner_incarnation);
+	UT_ASSERT_EQ(fence.incarnation, incarnation);
+	UT_ASSERT_EQ(fence.slot, 4);
+	UT_ASSERT_EQ(fence.lease_floor_full, pg_atomic_read_u64(&lease.floor_full));
+	UT_ASSERT_EQ(fence.lease_limit_full, pg_atomic_read_u64(&lease.limit_full));
+	UT_ASSERT(cluster_xid_stripe_sample_fence_current(&fence));
+	UT_ASSERT_EQ(memcmp(&variables, &before, sizeof(before)), 0);
+	UT_ASSERT_EQ(writes, writes_before);
+	UT_ASSERT_EQ(active_array_reads, 1);
+	UT_ASSERT_EQ(active_lock_errors, 0);
+	UT_ASSERT_EQ(active_depth, 0);
+	UT_ASSERT(!xid_lock_held);
+}
+
+UT_TEST(active_sample_clears_outputs_when_real_source_or_identity_is_unknown)
+{
+	for (unsigned scenario = 0; scenario < 10; scenario++) {
+		FullTransactionId reference = FullTransactionIdFromU64(99);
+		FullTransactionId future = reference, minimum = reference;
+		ClusterXidStripeSampleFence fence, empty = {0};
+		VariableCacheData before;
+		unsigned writes_before;
+
+		prepare_active_sample();
+		MemSet(&fence, 0x5a, sizeof(fence));
+		switch (scenario) {
+		case 0: pg_atomic_write_u32(&lease.failed, 1); break;
+		case 1: pg_atomic_write_u64(&lease.published_incarnation, incarnation + 1); break;
+		case 2: in_quorum = false; break;
+		case 3: boot.my_slot_claimed = false; break;
+		case 4: boot.my_owner_incarnation = 0; break;
+		case 5: cluster_xid_striping = false; break;
+		case 6:
+			pg_atomic_write_u64(&lease.limit_full, pg_atomic_read_u64(&lease.floor_full));
+			break;
+		case 7: variables.nextXid = FullTransactionIdFromEpochAndXid(1, 1); break;
+		case 8: variables.nextXid = FullTransactionIdFromU64(UINT64_MAX); break;
+		case 9:
+			active_array.numProcs = 1;
+			active_array.pgprocnos[0] = 6;
+			active_xids[0] = 2051; /* visible raw identity lacks original FullXid */
+			break;
+		}
+		before = variables;
+		writes_before = writes;
+		UT_ASSERT(!ProcArrayGetActiveFullXidSample(&reference, &future, &minimum, &fence));
+		UT_ASSERT(!FullTransactionIdIsValid(reference));
+		UT_ASSERT(!FullTransactionIdIsValid(future));
+		UT_ASSERT(!FullTransactionIdIsValid(minimum));
+		UT_ASSERT_EQ(memcmp(&fence, &empty, sizeof(empty)), 0);
+		UT_ASSERT_EQ(memcmp(&variables, &before, sizeof(before)), 0);
+		UT_ASSERT_EQ(writes, writes_before);
+		UT_ASSERT_EQ(active_array_reads, scenario == 9 ? 1 : 0);
+		UT_ASSERT_EQ(active_lock_errors, 0);
+		UT_ASSERT_EQ(active_depth, 0);
+		UT_ASSERT(!xid_lock_held);
+	}
+}
+
+static void
+publish_active_after_future(void)
+{
+	variables.nextXid = FullTransactionIdFromU64(2053);
+	active_array.numProcs = 1;
+	active_array.pgprocnos[0] = 6;
+	pg_atomic_write_u64(&active_procs[6].cluster_top_full_xid_atomic, 2052);
+	active_xids[0] = 2052;
+}
+
+UT_TEST(active_sample_keeps_original_cut_through_publication_and_durable_renewal)
+{
+	FullTransactionId reference, future, minimum;
+	ClusterXidStripeSampleFence fence, saved;
+
+	prepare_active_sample();
+	after_future_hook = publish_active_after_future;
+	UT_ASSERT(ProcArrayGetActiveFullXidSample(&reference, &future, &minimum, &fence));
+	UT_ASSERT(after_future_hook == NULL);
+	UT_ASSERT_EQ(U64FromFullTransactionId(variables.nextXid), 2053);
+	UT_ASSERT_EQ(U64FromFullTransactionId(reference), 2052);
+	UT_ASSERT_EQ(U64FromFullTransactionId(future), 2052);
+	UT_ASSERT_EQ(U64FromFullTransactionId(minimum), 2052);
+	saved = fence;
+	UT_ASSERT(cluster_xid_stripe_sample_fence_current(&saved));
+	/* The real publisher extends the promise without replacing the old cut.
+	 * Its storage leaf gives each publication the original three-write budget. */
+	active_sampling = false;
+	writes = 0;
+	stripe_lease_tick(disks, 3, saved.lease_limit_full);
+	active_sampling = true;
+	UT_ASSERT(pg_atomic_read_u64(&lease.limit_full) > saved.lease_limit_full);
+	UT_ASSERT(cluster_xid_stripe_sample_fence_current(&saved));
+	UT_ASSERT_EQ(memcmp(&fence, &saved, sizeof(saved)), 0);
+	UT_ASSERT_EQ(U64FromFullTransactionId(minimum), 2052);
+	UT_ASSERT_EQ(active_array_reads, 1);
+	UT_ASSERT_EQ(active_lock_errors, 0);
+	UT_ASSERT_EQ(active_depth, 0);
+	UT_ASSERT(!xid_lock_held);
+}
+
+static unsigned active_revoke_kind;
+static void
+revoke_source_after_future(void)
+{
+	switch (active_revoke_kind) {
+	case 0: pg_atomic_write_u32(&lease.failed, 1); break;
+	case 1: incarnation++; break;
+	case 2: boot.generation++; break;
+	case 3: boot.my_slot_claimed = false; break;
+	}
+}
+
+UT_TEST(active_sample_does_not_turn_old_cut_into_current_authority)
+{
+	for (active_revoke_kind = 0; active_revoke_kind < 4; active_revoke_kind++) {
+		FullTransactionId reference, future, minimum;
+		ClusterXidStripeSampleFence fence;
+		unsigned writes_before;
+
+		prepare_active_sample();
+		after_future_hook = revoke_source_after_future;
+		writes_before = writes;
+		/* A local sample can finish after its lease/source was revoked. */
+		UT_ASSERT(ProcArrayGetActiveFullXidSample(&reference, &future, &minimum, &fence));
+		UT_ASSERT(after_future_hook == NULL);
+		UT_ASSERT_EQ(U64FromFullTransactionId(reference), 2052);
+		UT_ASSERT_EQ(U64FromFullTransactionId(future), 2052);
+		UT_ASSERT_EQ(U64FromFullTransactionId(minimum), 2052);
+		/* The existing consumer recheck must still reject that exact fence. */
+		UT_ASSERT(!cluster_xid_stripe_sample_fence_current(&fence));
+		UT_ASSERT_EQ(writes, writes_before);
+		UT_ASSERT_EQ(active_array_reads, 1);
+		UT_ASSERT_EQ(active_lock_errors, 0);
+		UT_ASSERT_EQ(active_depth, 0);
+		UT_ASSERT(!xid_lock_held);
+	}
+}
+
 int
 main(void)
 {
@@ -1672,7 +1917,7 @@ main(void)
 		if (disks[i] < 0 || unlink(path) != 0)
 			abort();
 	}
-	UT_PLAN(44);
+	UT_PLAN(48);
 	UT_RUN(coherent_tracking_and_retirement_choose_latest);
 	UT_RUN(equal_generation_disagreement_refuses_in_either_order);
 	UT_RUN(newer_record_cannot_replace_claim_identity);
@@ -1717,6 +1962,10 @@ main(void)
 	UT_RUN(maintenance_extends_only_original_lease_and_respects_stall);
 	UT_RUN(maintenance_staging_and_durable_reply_recheck_identity_after_unlock);
 	UT_RUN(maintenance_durable_io_still_requires_current_proof_before_arm);
+	UT_RUN(active_sample_composes_real_floors_and_original_pgproc_identity);
+	UT_RUN(active_sample_clears_outputs_when_real_source_or_identity_is_unknown);
+	UT_RUN(active_sample_keeps_original_cut_through_publication_and_durable_renewal);
+	UT_RUN(active_sample_does_not_turn_old_cut_into_current_authority);
 	for (int i = 0; i < 3; i++)
 		close(disks[i]);
 	UT_DONE();

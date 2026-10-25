@@ -33,6 +33,7 @@ int control_fixture_main(int argc, char **argv);
 #include "cluster/cluster_conf.h"
 #include "test_cluster_relmap_native_clog.h"
 #include "test_cluster_relmap_native_storage.h"
+#include "test_cluster_relmap_native_pin.h"
 #include "test_cluster_relmap_original_scope.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
@@ -43,6 +44,8 @@ bool cluster_shared_catalog;
 static bool relmap_root_merger, relmap_root_namespace_x;
 static bool cold_native_real_clog, cold_native_real_scope;
 static bool cold_native_real_storage;
+static bool cold_native_real_pin, cold_pin_postwrite_loss, cold_pin_unknown_loss;
+static void cold_original_pin_setup(void);
 static void cold_original_scope_setup(void);
 static void cold_original_scope_done(void);
 static void cold_original_protection_setup(void);
@@ -2366,6 +2369,12 @@ terminal_prefix_fixture(bool aborting, unsigned fault)
 	snapshot->tail_last_record_lsn = tail.record_start;
 	snapshot->tail_last_record_crc32c = tail.record_crc;
 	snapshot->validated_tail_lsn_exclusive = tail.exclusive_end;
+	if (cold_native_real_pin) {
+		/* Only the new pin fixture has a known empty baseline at redo. */
+		snapshot->root_flags |= CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+		snapshot->recovered_tli = snapshot->tail_tli;
+		snapshot->recovered_through_lsn_exclusive = snapshot->checkpoint_lower_lsn;
+	}
 	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
 	v2_write_roots(root.bytes);
 	if (fault == 9) {
@@ -2479,8 +2488,12 @@ cluster_clog_native_recovery_base_read_v1(int origin, TransactionId xid,
 										  ClusterClogNativeBaseV1 *out)
 {
 	prefix_base_reads++;
-	if (cold_native_real_clog)
-		return test_relmap_native_clog_read(origin, xid, out, PG_exception_stack);
+	if (cold_native_real_clog) {
+		bool result = test_relmap_native_clog_read(origin, xid, out, PG_exception_stack);
+		if (cold_native_real_pin && cold_pin_unknown_loss && !result)
+			test_relmap_native_pin_fault(3);
+		return result;
+	}
 	memset(out, 0, sizeof(*out));
 	if (origin == cluster_node_id || prefix_base_fault == 2)
 		return false;
@@ -3417,6 +3430,7 @@ UT_TEST(test_terminal_read_native_error_keeps_output_zero_and_custody_dead)
 #include "test_cluster_relmap_original_cohort.inc"
 #include "test_cluster_relmap_native_file.inc"
 #include "test_cluster_relmap_original_storage.inc"
+#include "test_cluster_relmap_original_pin.inc"
 
 int
 main(int argc, char **argv)
@@ -3425,7 +3439,11 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(137);
+	UT_PLAN(141);
+	UT_RUN(test_cold_original_pin_full_native_chain_keeps_original_pin);
+	UT_RUN(test_cold_original_pin_owner_context_refuses_before_native);
+	UT_RUN(test_cold_original_pin_late_owner_loss_keeps_durable_pair);
+	UT_RUN(test_cold_original_pin_unknown_and_poison_never_release_or_retry);
 	UT_RUN(test_cold_original_storage_full_native_chain_and_fd_custody);
 	UT_RUN(test_cold_original_storage_rejects_unqualified_sentinel_before_native);
 	UT_RUN(test_cold_original_storage_midread_change_and_error_preserve_pending);
