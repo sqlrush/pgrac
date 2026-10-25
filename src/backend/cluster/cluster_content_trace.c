@@ -575,8 +575,60 @@ cluster_content_trace_pair(Buffer target, bool missed)
 	cluster_content_trace_wait_set(CLCONTENT_PAIR, &wait);
 }
 
+static void
+content_trace_native_proc(uint32 slot, ClusterContentTraceNativeProc *out)
+{
+	const PGPROC *proc;
+
+	memset(out, 0, sizeof(*out));
+	if (ProcGlobal == NULL || slot >= ProcGlobal->allProcCount)
+		return;
+	proc = &ProcGlobal->allProcs[slot];
+	out->available = true;
+	out->procno = proc->pgprocno;
+	out->pid = *(volatile const int *)&proc->pid;
+	out->backend_id = *(volatile const BackendId *)&proc->backendId;
+	out->generation = *(volatile const uint64 *)&proc->cluster_grd_generation;
+	out->wait_event_info = *(volatile const uint32 *)&proc->wait_event_info;
+}
+
+static void
+content_trace_reject(uint32 slot, ClusterContentTraceRejectReason reason,
+	const ClusterContentTraceOwner *owner, uint64 revision,
+	ClusterContentTraceRejectVisitor visitor, void *context)
+{
+	ClusterContentTraceRejection row = {.slot = slot, .reason = reason};
+
+	if (visitor == NULL)
+		return;
+	row.slot_revision = revision;
+	if (owner != NULL) {
+		row.payload_copied = true;
+		row.payload_pid = owner->pid;
+		row.payload_procno = owner->procno;
+		row.payload_backend_id = owner->backend_id;
+		row.payload_start = owner->backend_start;
+		row.payload_generation = owner->proc_generation;
+		row.payload_revision = owner->revision;
+		row.payload_nlocks = owner->nlocks;
+		row.payload_ngrants = owner->ngrants;
+		row.payload_wait_mask = owner->wait_mask;
+		row.payload_native_waiting = owner->native_waiting;
+		row.payload_enqueue_waiting = owner->enqueue_waiting;
+		row.payload_pcm_serving = owner->pcm_serving;
+	}
+	/* Read-only cuts after rejecting the source. A concurrent allocation or
+	 * publication may change these, so export both and retain UNKNOWN. */
+	content_trace_native_proc(slot, &row.native_before);
+	pg_read_barrier();
+	content_trace_native_proc(slot, &row.native_after);
+	row.final_revision = pg_atomic_read_u64(&content_trace->slots[slot].revision);
+	visitor(&row, context);
+}
+
 void
-cluster_content_trace_walk(ClusterContentTraceVisitor visitor, void *context,
+cluster_content_trace_walk_rejections(ClusterContentTraceVisitor visitor, void *context,
+	ClusterContentTraceRejectVisitor rejected, void *rejected_context,
 	ClusterContentTraceWalkStats *stats)
 {
 	memset(stats, 0, sizeof(*stats));
@@ -598,6 +650,9 @@ cluster_content_trace_walk(ClusterContentTraceVisitor visitor, void *context,
 		stats->scanned++;
 		if (!pg_atomic_compare_exchange_u32(&slot->busy, &expected, 1)) {
 			stats->busy++;
+			if (rejected != NULL)
+				content_trace_reject(i, CLCONTENT_REJECT_BUSY, NULL,
+					pg_atomic_read_u64(&slot->revision), rejected, rejected_context);
 			continue;
 		}
 		owner = slot->owner;
@@ -606,6 +661,8 @@ cluster_content_trace_walk(ClusterContentTraceVisitor visitor, void *context,
 		(void)pg_atomic_exchange_u32(&slot->busy, 0);
 		if (owner.revision != revision) {
 			stats->changed++;
+			content_trace_reject(i, CLCONTENT_REJECT_COPY_REVISION, &owner,
+				revision, rejected, rejected_context);
 			continue;
 		}
 		if (owner.pid == 0)
@@ -620,6 +677,8 @@ cluster_content_trace_walk(ClusterContentTraceVisitor visitor, void *context,
 			ProcGlobal->allProcs[i].pid != owner.pid ||
 			ProcGlobal->allProcs[i].backendId != owner.backend_id) {
 			stats->dead++;
+			content_trace_reject(i, CLCONTENT_REJECT_IDENTITY, &owner,
+				revision, rejected, rejected_context);
 			continue;
 		}
 		/* Process allocation invalidates before publishing its native identity.
@@ -627,6 +686,8 @@ cluster_content_trace_walk(ClusterContentTraceVisitor visitor, void *context,
 		pg_read_barrier();
 		if (revision != pg_atomic_read_u64(&slot->revision)) {
 			stats->changed++;
+			content_trace_reject(i, CLCONTENT_REJECT_CENSUS_REVISION, &owner,
+				revision, rejected, rejected_context);
 			continue;
 		}
 		stats->omitted_locks += owner.omitted_locks;
@@ -637,6 +698,13 @@ cluster_content_trace_walk(ClusterContentTraceVisitor visitor, void *context,
 		stats->owners++;
 		visitor(&owner, context);
 	}
+}
+
+void
+cluster_content_trace_walk(ClusterContentTraceVisitor visitor, void *context,
+	ClusterContentTraceWalkStats *stats)
+{
+	cluster_content_trace_walk_rejections(visitor, context, NULL, NULL, stats);
 }
 
 typedef struct ContentTraceCapture {

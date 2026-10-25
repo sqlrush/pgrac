@@ -342,6 +342,40 @@ typedef struct WaitGraphOwnerWriter {
 } WaitGraphOwnerWriter;
 
 static void
+json_native_proc(StringInfo out, const ClusterContentTraceNativeProc *proc)
+{
+	appendStringInfo(out, "{\"available\":%s,\"procno\":%u,\"pid\":%d,"
+		"\"backend_id\":%d,\"generation\":" UINT64_FORMAT ",\"wait_event_info\":%u}",
+		proc->available ? "true" : "false", proc->procno, proc->pid,
+		proc->backend_id, proc->generation, proc->wait_event_info);
+}
+
+static void
+json_rejection(const ClusterContentTraceRejection *row, void *context)
+{
+	WaitGraphOwnerWriter *writer = context;
+	StringInfo out = writer->out;
+	if (writer->count++ != 0) appendStringInfoChar(out, ',');
+	appendStringInfo(out, "{\"slot\":%u,\"reason\":%d,\"payload_copied\":%s,"
+		"\"payload\":{\"pid\":%d,\"procno\":%u,\"backend_id\":%d,"
+		"\"backend_start\":" INT64_FORMAT ",\"generation\":" UINT64_FORMAT
+		",\"revision\":" UINT64_FORMAT ",\"nlocks\":%u,\"ngrants\":%u,"
+		"\"wait_mask\":%u,\"native_waiting\":%s,\"enqueue_waiting\":%s,\"pcm_serving\":%s},"
+		"\"slot_revision\":" UINT64_FORMAT ",\"final_revision\":" UINT64_FORMAT
+		",\"native_before\":", row->slot, row->reason, row->payload_copied ? "true" : "false",
+		row->payload_pid, row->payload_procno, row->payload_backend_id,
+		row->payload_start, row->payload_generation, row->payload_revision,
+		row->payload_nlocks, row->payload_ngrants, row->payload_wait_mask,
+		row->payload_native_waiting ? "true" : "false",
+		row->payload_enqueue_waiting ? "true" : "false", row->payload_pcm_serving ? "true" : "false",
+		row->slot_revision, row->final_revision);
+	json_native_proc(out, &row->native_before);
+	appendStringInfoString(out, ",\"native_after\":");
+	json_native_proc(out, &row->native_after);
+	appendStringInfoChar(out, '}');
+}
+
+static void
 json_owner(const ClusterContentTraceOwner *row, void *context)
 {
 	WaitGraphOwnerWriter *writer = context;
@@ -430,7 +464,9 @@ test_pgrac_wait_graph(PG_FUNCTION_ARGS)
 {
 #ifdef USE_PGRAC_CLUSTER
 	StringInfoData out;
+	StringInfoData rejections;
 	WaitGraphOwnerWriter writer = {.out = &out};
+	WaitGraphOwnerWriter rejected_writer = {.out = &rejections};
 	ClusterContentTraceWalkStats stats;
 	ClusterWaitGraphKoSnapshot *ko;
 	WaitGraphContext begin, end;
@@ -441,14 +477,17 @@ test_pgrac_wait_graph(PG_FUNCTION_ARGS)
 	epoch = cluster_epoch_get_current();
 	wait_graph_context_snapshot(&begin);
 	initStringInfo(&out);
+	initStringInfo(&rejections);
 	appendStringInfo(&out, "{\"version\":2,\"node\":%d,\"epoch_begin\":" UINT64_FORMAT
 		",\"atomic_graph\":false,\"observed_at\":" INT64_FORMAT ",\"owners\":[",
 		cluster_node_id, epoch, GetCurrentTimestamp());
-	cluster_content_trace_walk(json_owner, &writer, &stats);
-	appendStringInfo(&out, "],\"stats\":{\"available\":%s,\"scanned\":%u,\"busy\":%u,"
+	cluster_content_trace_walk_rejections(json_owner, &writer,
+		json_rejection, &rejected_writer, &stats);
+	appendStringInfo(&out, "],\"rejected_slots\":[%s],\"stats\":{\"available\":%s,\"scanned\":%u,\"busy\":%u,"
 		"\"changed\":%u,\"dead\":%u,\"owners\":%u,\"omitted_locks\":%u},\"procs\":[",
-		stats.available ? "true" : "false", stats.scanned, stats.busy, stats.changed,
+		rejections.data, stats.available ? "true" : "false", stats.scanned, stats.busy, stats.changed,
 		stats.dead, stats.owners, stats.omitted_locks);
+	pfree(rejections.data);
 	if (ProcGlobal != NULL) {
 		for (uint32 i = 0; i < ProcGlobal->allProcCount; i++) {
 			const PGPROC *proc = &ProcGlobal->allProcs[i];
