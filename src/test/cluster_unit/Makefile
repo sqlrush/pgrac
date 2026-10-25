@@ -3849,6 +3849,8 @@ $(CLUSTER_CONTROL_ROOT_O): $(top_srcdir)/src/include/cluster/cluster_recovery_pl
 # stream.  The reader is compiled -DFRONTEND (pg_waldump style) so the
 # unit binary does not drag in backend palloc/elog/ShmemVariableCache
 # machinery; err*/BasicOpenFile are stubbed in the test file.
+test_cluster_control_root test_cluster_recovery_native_inputs: test_cluster_control_ctrc_namespace.inc
+
 test_cluster_control_root_worker.inc: $(top_srcdir)/src/backend/cluster/cluster_thread_recovery_worker.c \
 		$(top_srcdir)/src/backend/cluster/cluster_thread_recovery_authority.c \
 		$(top_srcdir)/src/backend/cluster/cluster_thread_recovery_orchestrator.c \

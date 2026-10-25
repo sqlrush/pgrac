@@ -28,6 +28,8 @@ struct ClusterRecoveryCensus {
 	uint8 storage_uuid[16];
 	uint64 system_identifier, database_incarnation;
 	size_t child_budget;
+	bool ctrc_namespace;
+	int ctrc_namespace_fd; /* borrowed from inputs, never closed here */
 };
 
 static void
@@ -123,6 +125,26 @@ cluster_recovery_census_begin(ClusterWalInputsV1 *inputs, int root_fd, size_t me
 	}
 	*out = census;
 	return CLUSTER_RECOVERY_CENSUS_MORE;
+}
+
+ClusterRecoveryCensusResult
+cluster_recovery_census_begin_ctrc(ClusterWalInputsV1 *inputs, size_t memory_budget,
+	ClusterRecoveryCensus **out)
+{
+	ClusterRecoveryCensusResult result;
+	int fd = -1;
+
+	if (out == NULL)
+		return CLUSTER_RECOVERY_CENSUS_INVALID;
+	*out = NULL;
+	if (cluster_wal_inputs_ctrc_namespace_v1(inputs, &fd) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return CLUSTER_RECOVERY_CENSUS_REFUSED;
+	result = cluster_recovery_census_begin(inputs, fd, memory_budget, out);
+	if (result == CLUSTER_RECOVERY_CENSUS_MORE) {
+		(*out)->ctrc_namespace = true;
+		(*out)->ctrc_namespace_fd = fd;
+	}
+	return result;
 }
 
 static ClusterRecoveryCensusResult
@@ -619,7 +641,15 @@ cluster_recovery_census_next(ClusterRecoveryCensus *census, ClusterRecoveryCensu
 		return census_fail(census, CLUSTER_RECOVERY_CENSUS_INVALID);
 	PG_TRY();
 	{
-		result = census_step(census, out);
+		int fd = -1;
+
+		if (census->ctrc_namespace
+			&& ((census->diag.input_result = cluster_wal_inputs_ctrc_namespace_v1(
+				census->inputs, &fd)) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				|| fd != census->ctrc_namespace_fd))
+			result = census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+		else
+			result = census_step(census, out);
 	}
 	PG_CATCH();
 	{

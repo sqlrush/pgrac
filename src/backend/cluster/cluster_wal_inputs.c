@@ -4,6 +4,8 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "access/xlog.h"
@@ -54,6 +56,10 @@ typedef struct ClusterRecoveryCtrcIoScopeV1 {
 	uint64 work_generation;
 	ClusterRecoveryCheckpointOwnerV1 owner;
 	ClusterControlRootFileToken root;
+	int namespace_fd;
+	bool namespace_verified;
+	char namespace_path[MAXPGPATH];
+	struct stat namespace_identity;
 } ClusterRecoveryCtrcIoScopeV1;
 
 struct ClusterWalInputsV1 {
@@ -376,6 +382,17 @@ inputs_unlock(WalInputsWork *work)
 	}
 }
 
+static void
+inputs_namespace_close(ClusterWalInputsV1 *inputs)
+{
+	int fd = inputs->ctrc.namespace_fd;
+
+	inputs->ctrc.namespace_fd = -1;
+	inputs->ctrc.namespace_verified = false;
+	if (fd >= 0 && close(fd) != 0)
+		elog(FATAL, "could not close CTRC input namespace owner");
+}
+
 void
 cluster_wal_inputs_release_v1(ClusterWalInputsV1 **inputs)
 {
@@ -383,6 +400,7 @@ cluster_wal_inputs_release_v1(ClusterWalInputsV1 **inputs)
 		return;
 	if (!inputs_owned(*inputs))
 		elog(ERROR, "WAL input scope belongs to another resource owner");
+	inputs_namespace_close(*inputs);
 	for (uint32 i = 0; i < CLUSTER_WAL_INPUTS_MAX; i++)
 		cluster_wal_cut_release_v1(&(*inputs)->remote[i]);
 	if ((*inputs)->pin != NULL
@@ -1316,6 +1334,7 @@ inputs_begin(const uint8 storage_uuid[16], uint64 system_identifier, WalInputsPu
 	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	inputs = palloc0(sizeof(*inputs));
+	inputs->ctrc.namespace_fd = -1;
 	inputs->pid = getpid();
 	inputs->owner = CurrentResourceOwner;
 	inputs->purpose = purpose;
@@ -1326,6 +1345,16 @@ inputs_begin(const uint8 storage_uuid[16], uint64 system_identifier, WalInputsPu
 		inputs->ctrc.work_generation = ctrc_work->generation;
 		inputs->ctrc.owner = ctrc_owner;
 		inputs->ctrc.root = typed->census_root;
+		/* Bind the physical directory name/object before the original ROOT
+		 * selection. Lazy opening must not adopt a later configuration or a
+		 * replacement directory containing a copy of the same ROOT bytes.
+		 * An unavailable namespace does not change existing WAL-only scope
+		 * semantics; its separate physical accessor remains unavailable. */
+		if (cluster_shared_data_dir == NULL
+			|| strlcpy(inputs->ctrc.namespace_path, cluster_shared_data_dir,
+				   sizeof(inputs->ctrc.namespace_path)) >= sizeof(inputs->ctrc.namespace_path)
+			|| lstat(inputs->ctrc.namespace_path, &inputs->ctrc.namespace_identity) != 0)
+			inputs->ctrc.namespace_path[0] = '\0';
 	}
 	if (purpose == WAL_INPUTS_TX_CLOSURE) {
 		inputs->tx.start = start;
@@ -1433,6 +1462,108 @@ cluster_wal_inputs_begin_ctrc_census_v1(const struct ClusterRecoveryStartV1 *sta
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	return inputs_begin(typed->sources[0].claim.identity.storage_uuid, typed->system_identifier,
 		WAL_INPUTS_CTRC_CENSUS, start, NULL, work, out);
+}
+
+static bool
+inputs_namespace_directory(const struct stat *st)
+{
+	return S_ISDIR(st->st_mode) && st->st_uid == geteuid()
+		&& (st->st_mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
+/* Directory contents/timestamps belong to the complete namespace census.
+ * This owner checks the selected name, object and access policy only. */
+static bool
+inputs_namespace_same(const struct stat *a, const struct stat *b)
+{
+	return inputs_namespace_directory(a) && inputs_namespace_directory(b)
+		&& a->st_dev == b->st_dev && a->st_ino == b->st_ino
+		&& a->st_mode == b->st_mode && a->st_uid == b->st_uid && a->st_gid == b->st_gid;
+}
+
+static bool
+inputs_namespace_current(const ClusterWalInputsV1 *inputs)
+{
+	struct stat name, held;
+	const ClusterRecoveryCtrcIoScopeV1 *scope = &inputs->ctrc;
+
+	return scope->namespace_fd >= 0 && cluster_shared_data_dir != NULL
+		&& strcmp(cluster_shared_data_dir, scope->namespace_path) == 0
+		&& fstat(scope->namespace_fd, &held) == 0
+		&& lstat(scope->namespace_path, &name) == 0
+		&& inputs_namespace_same(&scope->namespace_identity, &held)
+		&& inputs_namespace_same(&held, &name);
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_ctrc_namespace_v1(ClusterWalInputsV1 *inputs, int *root_fd)
+{
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	ClusterRecoveryCtrcIoScopeV1 *scope;
+
+	if (root_fd == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	*root_fd = -1;
+	if (CritSectionCount != 0 || cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (!inputs_current(inputs) || inputs->purpose != WAL_INPUTS_CTRC_CENSUS)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	scope = &inputs->ctrc;
+	if (scope->namespace_fd < 0) {
+#if defined(O_NOFOLLOW) && defined(O_DIRECTORY) && defined(O_CLOEXEC)
+		struct stat named, held;
+		int fd;
+
+		if (cluster_shared_data_dir == NULL || scope->namespace_path[0] != '/'
+			|| strcmp(cluster_shared_data_dir, scope->namespace_path) != 0
+			|| lstat(scope->namespace_path, &named) != 0
+			|| !inputs_namespace_same(&scope->namespace_identity, &named)) {
+			inputs->stale = true;
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		}
+		fd = open(scope->namespace_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+		if (fd < 0) {
+			inputs->stale = true;
+			return CLUSTER_CONTROL_ROOT_IO_ERROR;
+		}
+		/* Publish cleanup ownership before any backend call can ERROR. */
+		scope->namespace_fd = fd;
+		if (fstat(fd, &held) != 0 || !inputs_namespace_same(&named, &held)) {
+			inputs->stale = true;
+			inputs_namespace_close(inputs);
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		}
+#else
+		inputs->stale = true;
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+#endif
+	}
+	PG_TRY();
+	{
+		if (!inputs_namespace_current(inputs)) {
+			inputs->stale = true;
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		} else if (!scope->namespace_verified) {
+			result = cluster_wal_inputs_revalidate_v1(inputs);
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				&& (!inputs_current(inputs) || !inputs_namespace_current(inputs))) {
+				inputs->stale = true;
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			}
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+				scope->namespace_verified = true;
+		}
+	}
+	PG_CATCH();
+	{
+		inputs->stale = true;
+		inputs_namespace_close(inputs);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*root_fd = scope->namespace_fd;
+	return result;
 }
 
 /* Reject aliasing before clearing a failed read's output. */

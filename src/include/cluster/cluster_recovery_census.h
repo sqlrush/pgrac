@@ -166,6 +166,14 @@ extern ClusterRecoveryCensusResult cluster_recovery_census_begin(ClusterWalInput
 																 int root_fd, size_t memory_budget,
 																 ClusterRecoveryCensus **out);
 
+/* Original CTRC scope entry: obtain its selected namespace instead of accepting
+ * a caller FD. Borrow scope and descriptor until destroy. Every next/manifest
+ * checks the original scope/work/namespace binding; failure revokes the cursor.
+ * The original caller must still hold isolation/retention/freeze. This is an
+ * observation component, not a service driver, semantic seal or write grant. */
+extern ClusterRecoveryCensusResult cluster_recovery_census_begin_ctrc(
+	ClusterWalInputsV1 *inputs, size_t memory_budget, ClusterRecoveryCensus **out);
+
 /* Run the existing ROOT/WAL union, all TT slots, physical PAGE/history root
  * discovery and seeded TX records. Discovery adds exact canonical-base roots
  * before the TX walk; deferred bindings/structures remain obligations for

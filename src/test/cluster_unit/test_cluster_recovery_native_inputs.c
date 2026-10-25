@@ -833,6 +833,66 @@ cleanup:
 #include "test_cluster_recovery_tt_terminal_inputs.inc"
 #include "test_cluster_recovery_page_roots_inputs.inc"
 
+UT_TEST(test_owned_ctrc_census_borrows_namespace_and_revokes_changed_work)
+{
+	ClusterWalInputsV1 *inputs = NULL;
+	ClusterRecoveryCensus *census = NULL;
+	ClusterRecoveryCensusEntry entry, zero = {0};
+	ClusterRecoveryCensusManifest manifest, empty = {0};
+	int fd = -1;
+
+	ctrc_inputs_fixture();
+	UT_ASSERT_EQ(ctrc_inputs_begin(&inputs), 0);
+	UT_ASSERT_EQ(cluster_recovery_census_begin_ctrc(inputs, 8 * 1024 * 1024, &census),
+		CLUSTER_RECOVERY_CENSUS_MORE);
+	UT_ASSERT_EQ(cluster_wal_inputs_ctrc_namespace_v1(inputs, &fd), 0);
+	UT_ASSERT_EQ(cluster_recovery_census_next(census, &entry), CLUSTER_RECOVERY_CENSUS_MORE);
+	tx_inputs_typed.ctrc_work_generation++;
+	memset(&entry, 0xa5, sizeof(entry));
+	UT_ASSERT_EQ(cluster_recovery_census_next(census, &entry), CLUSTER_RECOVERY_CENSUS_REFUSED);
+	UT_ASSERT(memcmp(&entry, &zero, sizeof(entry)) == 0);
+	memset(&manifest, 0xa5, sizeof(manifest));
+	UT_ASSERT(!cluster_recovery_census_manifest(census, &manifest));
+	UT_ASSERT(memcmp(&manifest, &empty, sizeof(manifest)) == 0);
+	cluster_recovery_census_destroy(census);
+	UT_ASSERT(fcntl(fd, F_GETFD) >= 0);
+	cluster_wal_inputs_release_v1(&inputs);
+	UT_ASSERT_EQ(fcntl(fd, F_GETFD), -1);
+	test_inputs_startup_cf = false;
+}
+
+UT_TEST(test_owned_ctrc_census_rejects_other_purpose_and_namespace_switch)
+{
+	for (unsigned fault = 0; fault < 2; fault++) {
+		ClusterWalInputsV1 *inputs = NULL;
+		ClusterRecoveryCensus *census = NULL;
+		ClusterRecoveryCensusEntry entry, zero = {0};
+		char *selected;
+
+		ctrc_inputs_fixture();
+		if (fault == 0) {
+			inputs_native_recovery = true;
+			UT_ASSERT_EQ(cluster_wal_inputs_cold_begin_v1(v2_storage, TEST_SYSID, &inputs), 0);
+			UT_ASSERT_EQ(cluster_recovery_census_begin_ctrc(inputs, 8 * 1024 * 1024, &census),
+				CLUSTER_RECOVERY_CENSUS_REFUSED);
+			UT_ASSERT_NULL(census);
+		} else {
+			UT_ASSERT_EQ(ctrc_inputs_begin(&inputs), 0);
+			UT_ASSERT_EQ(cluster_recovery_census_begin_ctrc(inputs, 8 * 1024 * 1024, &census),
+				CLUSTER_RECOVERY_CENSUS_MORE);
+			selected = cluster_shared_data_dir;
+			cluster_shared_data_dir = "";
+			memset(&entry, 0xa5, sizeof(entry));
+			UT_ASSERT_EQ(cluster_recovery_census_next(census, &entry), CLUSTER_RECOVERY_CENSUS_REFUSED);
+			cluster_shared_data_dir = selected;
+			UT_ASSERT(memcmp(&entry, &zero, sizeof(entry)) == 0);
+		}
+		cluster_recovery_census_destroy(census);
+		cluster_wal_inputs_release_v1(&inputs);
+	}
+	test_inputs_startup_cf = false;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -840,7 +900,9 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(79);
+	UT_PLAN(81);
+	UT_RUN(test_owned_ctrc_census_borrows_namespace_and_revokes_changed_work);
+	UT_RUN(test_owned_ctrc_census_rejects_other_purpose_and_namespace_switch);
 	UT_RUN(test_native_inventory_uses_two_real_cold_passes);
 	UT_RUN(test_native_inventory_never_returns_partial_on_drift_io_or_error);
 	UT_RUN(test_native_inventory_capacity_is_not_partial_success);
