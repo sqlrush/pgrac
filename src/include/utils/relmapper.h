@@ -100,6 +100,17 @@ extern bool cluster_relmap_producer_prepare_v2(bool shared,
 extern bool cluster_relmap_producer_arm_v2(bool shared, const struct RelMapFile *updates);
 extern bool cluster_relmap_producer_finish_v2(bool is_commit);
 
+/* Dormant original precommit batch, before the native commit decision, under
+ * the caller's original mapped-rel AEL/global relmap X. Consume only original
+ * command-activated shared/per-db update queues through the original arm.
+ * Pending CCI work, parallel workers or existing custody refuse with ERROR.
+ * Both requested prepares must succeed before either active queue is reset.
+ * False from an arm becomes original ERROR; ERROR leaves all queued inputs,
+ * saved receipts, unfinished protection and pins/debt for original failure
+ * handling. Empty queues are a no-op. No global lock acquisition, terminal
+ * authentication, commit permission, retention release or live v2 hook. */
+extern void cluster_relmap_producer_precommit_v2(bool is_parallel_worker);
+
 /* Dormant original postcommit caller only, after durable commit and before
  * top FullXid teardown, retaining original mapped-rel AEL and global relmap X.
  * Consume saved prepare receipts once, publish both pairs before invalidation,

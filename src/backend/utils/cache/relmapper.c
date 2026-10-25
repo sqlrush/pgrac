@@ -1501,6 +1501,43 @@ cluster_relmap_producer_arm_v2(bool shared, const RelMapFile *updates)
 	return true;
 }
 
+void
+cluster_relmap_producer_precommit_v2(bool is_parallel_worker)
+{
+	if (active_shared_updates.num_mappings == 0 && active_local_updates.num_mappings == 0
+		&& pending_shared_updates.num_mappings == 0 && pending_local_updates.num_mappings == 0)
+		return;
+	/* Consume only this original command-activated batch. Refuse the whole
+	 * input before staging its first flavour if its local shape is invalid. */
+	if (is_parallel_worker || pending_shared_updates.num_mappings != 0
+		|| pending_local_updates.num_mappings != 0
+		|| active_shared_updates.num_mappings < 0 || active_shared_updates.num_mappings > MAX_MAPPINGS
+		|| active_local_updates.num_mappings < 0 || active_local_updates.num_mappings > MAX_MAPPINGS
+		|| (active_local_updates.num_mappings != 0 && (!OidIsValid(MyDatabaseTableSpace)
+			|| MyDatabaseTableSpace == GLOBALTABLESPACE_OID))
+		|| cluster_relmap_publish_arms[0].armed || cluster_relmap_publish_arms[1].armed
+		|| cluster_relmap_v2_arms[0].armed || cluster_relmap_v2_arms[1].armed
+		|| cluster_relmap_v2_finish_entered || cluster_relmap_v2_prepare_unfinished)
+		ereport(ERROR,
+			(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+			 errmsg("cluster relation map preparation cannot consume the current update batch")));
+
+	/* The caller retains original global X and failure/terminal duties.
+	 * A refusal may follow durable effects, including the other flavour;
+	 * propagate ERROR without clearing either queued input or old custody. */
+	if ((active_shared_updates.num_mappings != 0
+			&& !cluster_relmap_producer_arm_v2(true, &active_shared_updates))
+		|| (active_local_updates.num_mappings != 0
+			&& !cluster_relmap_producer_arm_v2(false, &active_local_updates)))
+		ereport(ERROR,
+			(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+			 errmsg("cluster relation map preparation could not complete before commit")));
+
+	/* All requested receipts are saved; only nofail queue retirement follows. */
+	active_shared_updates.num_mappings = 0;
+	active_local_updates.num_mappings = 0;
+}
+
 static bool
 relmap_producer_finish_v2(bool is_commit, bool keep_custody)
 {
