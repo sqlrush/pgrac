@@ -237,6 +237,31 @@ extern bool rf_page_stable_base_proof_matches_sources_v1(
 	const RfPageVersionV1 *expected_result,
 	const struct ClusterThreadRecoveryAuthorityV1 *authorities, uint32 count,
 	const RfPagePinnedSourceV1 *source, const RfContributorVectorV1 *contributors);
+/* Native CTRC purpose, before PAGE promotion: each contributor must supply
+ * its actual original held subject IR/native WALR view. This never casts that
+ * view into an ordinary RR pin or grants PAGE/DATA authority. All graph/source
+ * bytes and owners are privately frozen before original whole-scope ROOT I/O;
+ * retain the original inputs until the proof is destroyed. The budget bounds
+ * private snapshots plus graph workspace, including selector temporary space.
+ * The returned value owns only private memory; no caller output may alias an
+ * owner. A failure, WAIT or ERROR never releases the borrowed original owners.
+ * Multi-origin use requires all actual source grants at once. */
+struct ClusterRecoveryCtrcSubjectAuthorityV1;
+typedef struct RfPageStableCtrcBuildV1 {
+	RfPageStableBaseProofV1 *proof;
+	RfPageProofDetailV1 detail;
+} RfPageStableCtrcBuildV1;
+extern RfPageStableCtrcBuildV1 rf_page_stable_base_proof_build_ctrc_v1(
+	const RfPageStableGraphRequestV1 *graph,
+	const struct ClusterRecoveryCtrcSubjectAuthorityV1 *authorities, uint32 count,
+	Size memory_budget);
+/* No I/O/allocation/acquire. Exact original values and actual native holders
+ * must still match. This check cannot select a new ROOT or renew an old grant. */
+extern bool rf_page_stable_base_proof_matches_ctrc_v1(
+	const RfPageStableBaseProofV1 *proof, const RfPageIdentityV1 *page_identity,
+	const RfPageVersionV1 *expected_result,
+	const struct ClusterRecoveryCtrcSubjectAuthorityV1 *authorities, uint32 count,
+	const RfPagePinnedSourceV1 *source, const RfContributorVectorV1 *contributors);
 extern bool rf_page_stable_base_proof_matches_v1(
 	const RfPageStableBaseProofV1 *proof, const RfPageIdentityV1 *page_identity,
 	const RfPageVersionV1 *expected_result, const ClusterRecoveryDutyKey *duties,

@@ -25,25 +25,7 @@
 #define stable_free(pointer_) pfree((pointer_))
 #endif
 
-#define RF_PAGE_STABLE_PROOF_MAGIC UINT32_C(0x52505350)
-
-struct RfPageStableBaseProofV1 {
-	uint32 magic;
-	uint32 participant_count;
-	RfPageIdentityV1 page_identity;
-	RfPageVersionV1 expected_result;
-	RfPageStableSelectionV1 selection;
-	const ClusterRecoveryDutyKey *duties;
-	const ClusterControlRootReadToken *root_tokens;
-	const ClusterFormationWitnessV1 *formation;
-	const PgracExternalFenceNeedSetV1 *fence_need_set;
-	const PgracExternalFenceAdmissionSetV1 *fence_admission_set;
-	ClusterWalRetentionPin *retention_pin;
-	const RfPagePinnedSourceV1 *source;
-	const RfContributorVectorV1 *contributors;
-	const ClusterThreadRecoveryAuthorityV1 *source_authorities;
-	ClusterThreadRecoveryAuthorityV1 *source_owners;
-};
+#include "cluster_page_stable_base_private.h"
 
 static bool
 bytes_nonzero(const uint8 *bytes, size_t size)
@@ -715,6 +697,7 @@ rf_page_stable_base_proof_matches_sources_v1(const RfPageStableBaseProofV1 *proo
 											 const RfContributorVectorV1 *contributors)
 {
 	if (proof == NULL || proof->magic != RF_PAGE_STABLE_PROOF_MAGIC || proof->source_owners == NULL
+		|| proof->ctrc_owners != NULL
 		|| proof->source_authorities != authorities || proof->participant_count != count
 		|| count == 0 || count > RF_PAGE_STABLE_MAX_PARTICIPANTS
 		|| !rf_page_identity_equal_v1(&proof->page_identity, page_identity)
@@ -822,7 +805,8 @@ rf_page_stable_base_proof_matches_v1(
 	const RfContributorVectorV1 *contributors, uint32 participant_count)
 {
 	return proof != NULL && proof->magic == RF_PAGE_STABLE_PROOF_MAGIC && participant_count != 0
-		   && proof->source_authorities == NULL && proof->participant_count == participant_count
+		   && proof->source_authorities == NULL && proof->ctrc_owners == NULL
+		   && proof->participant_count == participant_count
 		   && rf_page_identity_equal_v1(&proof->page_identity, page_identity)
 		   && rf_page_version_equal_v1(&proof->expected_result, expected_result)
 		   && rf_page_version_equal_v1(&proof->selection.terminal_version, expected_result)
@@ -846,6 +830,12 @@ rf_page_stable_base_proof_destroy_v1(RfPageStableBaseProofV1 **proof_pointer)
 	proof->magic = 0;
 	if (proof->source_owners != NULL)
 		stable_free(proof->source_owners);
+	if (proof->ctrc_owners != NULL)
+		stable_free(proof->ctrc_owners);
+	if (proof->ctrc_storage != NULL)
+		stable_free(proof->ctrc_storage);
+	if (proof->ctrc_scratch != NULL)
+		stable_free(proof->ctrc_scratch);
 	stable_free(proof);
 	*proof_pointer = NULL;
 }

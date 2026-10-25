@@ -1895,7 +1895,8 @@ test_cluster_page_online_plan: test_cluster_page_online_plan.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) \
 		-lssl -lcrypto -o $@
 
-test_cluster_page_dependency_base.o: $(top_srcdir)/src/backend/cluster/cluster_page_stable_base.c
+test_cluster_page_dependency_base.o: $(top_srcdir)/src/backend/cluster/cluster_page_stable_base.c \
+		$(top_srcdir)/src/backend/cluster/cluster_page_stable_base_private.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_page_dependency: test_cluster_page_dependency.c unit_test.h \
@@ -3056,7 +3057,8 @@ test_cluster_block_redeclare_scan.inc: $(top_srcdir)/src/backend/storage/buffer/
 	awk '/^cluster_bufmgr_redeclare_scan_chunk\(/ { print "int"; emit=1; n++ } \
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1) exit 1 }' $< > $@
 
-test_cluster_page_data_stable.o: $(top_srcdir)/src/backend/cluster/cluster_page_stable_base.c
+test_cluster_page_data_stable.o: $(top_srcdir)/src/backend/cluster/cluster_page_stable_base.c \
+		$(top_srcdir)/src/backend/cluster/cluster_page_stable_base_private.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_page_wal_product.o: $(top_srcdir)/src/backend/cluster/cluster_page_wal.c \
@@ -3562,6 +3564,7 @@ test_cluster_page_anchor_cache: test_cluster_page_anchor_cache.c unit_test.h \
 		-lssl -lcrypto $(filter -llz4 -lzstd,$(LIBS)) -o $@
 $(CLUSTER_PAGE_STABLE_BASE_O): \
 		$(top_srcdir)/src/backend/cluster/cluster_page_stable_base.c \
+		$(top_srcdir)/src/backend/cluster/cluster_page_stable_base_private.h \
 		$(top_srcdir)/src/include/cluster/cluster_page_stable_base.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 
@@ -4110,6 +4113,13 @@ $(CLUSTER_CONTROL_ROOT_O): $(top_srcdir)/src/include/cluster/cluster_recovery_pl
 # machinery; err*/BasicOpenFile are stubbed in the test file.
 test_cluster_control_root test_cluster_recovery_native_inputs: test_cluster_control_ctrc_namespace.inc
 test_cluster_control_root test_cluster_recovery_native_inputs: test_cluster_control_ctrc_ir.inc
+test_cluster_control_root test_cluster_recovery_native_inputs: test_cluster_control_ctrc_stable.inc
+
+test_cluster_page_stable_ctrc.o: $(top_srcdir)/src/backend/cluster/cluster_page_stable_base_ctrc.c \
+		$(top_srcdir)/src/backend/cluster/cluster_page_stable_base_private.h \
+		$(top_srcdir)/src/include/cluster/cluster_page_stable_base.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_control_root_worker.inc: $(top_srcdir)/src/backend/cluster/cluster_thread_recovery_worker.c \
 		$(top_srcdir)/src/backend/cluster/cluster_thread_recovery_authority.c \
@@ -4332,6 +4342,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relma
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		test_cluster_control_native_xid.inc \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
+		test_cluster_page_stable_ctrc.o \
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
 		test_cluster_wal_inputs_product.o \
 		$(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
@@ -4364,6 +4375,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relma
 		$(if $(filter test_cluster_recovery_native_inputs,$@),$(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_store.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_scan.o $(RECOVERY_CENSUS_TEST_OBJS)) \
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
+		test_cluster_page_stable_ctrc.o \
 		test_cluster_wal_inputs_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
