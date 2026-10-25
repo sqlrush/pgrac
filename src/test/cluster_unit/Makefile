@@ -2049,6 +2049,14 @@ test_cluster_heap_freeze_pgproc_types.inc: $(top_srcdir)/src/backend/storage/ipc
 	     END { if (found != 2 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Original stripe future and its pure rounding/window/wrap predicates.
+test_cluster_heap_freeze_stripe_future.inc: $(top_srcdir)/src/backend/cluster/cluster_xid_stripe.c $(top_srcdir)/src/backend/cluster/cluster_xid_stripe_boot.c Makefile
+	@awk '/^cluster_xid_next_striped_full\(/ { print "static FullTransactionId"; emit=1; found++ } \
+	     /^(cluster_xid_stripe_(sample_future|window_exceeded)|cluster_xid_wrap_barrier_passed)\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 4 || done != 4 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_freeze_pgproc_sample.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
 	@awk '/^ProcArrayGetActiveFullXidSample\(/ { print "static bool"; emit=1; found++ } \
 	     emit { print } emit && /^}/ { emit=0; done++ } \
@@ -2096,6 +2104,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_freeze_worker_publisher.inc \
 		test_cluster_heap_freeze_worker_pass.inc \
 		test_cluster_heap_freeze_pgproc_types.inc test_cluster_heap_freeze_pgproc_sample.inc \
+		test_cluster_heap_freeze_stripe_future.inc \
 		$(top_srcdir)/src/include/storage/proc.h $(top_srcdir)/src/include/access/transam.h \
 		test_cluster_heap_freeze_lease_current.inc \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe.h \
@@ -5014,6 +5023,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_freeze_worker_pass.inc test_cluster_heap_freeze_worker_pass.inc.tmp
 	rm -f test_cluster_heap_freeze_pgproc_types.inc test_cluster_heap_freeze_pgproc_types.inc.tmp
 	rm -f test_cluster_heap_freeze_pgproc_sample.inc test_cluster_heap_freeze_pgproc_sample.inc.tmp
+	rm -f test_cluster_heap_freeze_stripe_future.inc test_cluster_heap_freeze_stripe_future.inc.tmp
 	rm -f test_cluster_heap_freeze_lease_current.inc test_cluster_heap_freeze_lease_current.inc.tmp
 	rm -f test_cluster_space_cache_insert.inc test_cluster_space_cache_delete.inc test_cluster_space_cache_allocation.inc test_cluster_space_cache_update.inc
 	rm -f test_cluster_space_hint_owners.inc test_cluster_space_census_types.inc test_cluster_space_census_mutation.inc test_cluster_space_cleanout_product.o

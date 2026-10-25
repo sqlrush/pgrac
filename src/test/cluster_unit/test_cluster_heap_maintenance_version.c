@@ -482,7 +482,10 @@ retained_lease_publish_fixture(ClusterHeapFreezePolicySampleV1 *policy)
 		.activation_generation = 13, .slot_floor_full = UINT64CONST(0x100000003),
 		.slot_owner_incarnation = 9, .incarnation = 9,
 		.lease_floor_full = UINT64CONST(0x100000003),
-		.lease_limit_full = U64FromFullTransactionId(policy->legal_next), .slot = 0 };
+		.lease_limit_full = U64FromFullTransactionId(policy->legal_next) + CLUSTER_XID_STRIDE,
+		.slot = XidFromFullTransactionId(policy->legal_next) % CLUSTER_XID_STRIDE };
+	/* A real future must be in the leased slot and strictly below its limit. */
+	lease_slot = retained_lease_fence.slot;
 	native_lease_shared.disk_state = CLUSTER_XID_STRIPE_DISK_PUBLISHED;
 	native_lease_shared.floor_full = retained_lease_fence.activation_floor_full;
 	native_lease_shared.epoch = retained_lease_fence.activation_epoch;
@@ -495,6 +498,9 @@ retained_lease_publish_fixture(ClusterHeapFreezePolicySampleV1 *policy)
 	pg_atomic_init_u64(&StripeLease->limit_full, retained_lease_fence.lease_limit_full);
 	pg_atomic_init_u64(&StripeLease->published_incarnation, retained_lease_fence.incarnation);
 	pg_atomic_init_u32(&StripeLease->failed, 0);
+	pg_atomic_init_u64(&StripeBootShmem->herding_floor_full, 0);
+	pg_atomic_init_u64(&StripeBootShmem->cluster_min_active_hwm, 0);
+	pg_atomic_init_u32(&StripeBootShmem->wrap_barrier_done, 1);
 	policy->allocation_fence = retained_lease_fence;
 }
 
@@ -917,6 +923,45 @@ sampler_lock_release(LWLock *lock)
 		sampler_variables.nextXid = FullTransactionIdFromEpochAndXid(2, 300);
 }
 
+static int sampler_herding_slack;
+static bool original_stripe_window_exceeded(FullTransactionId);
+static bool original_stripe_wrap_barrier_passed(void);
+static bool sampler_lock_held_by_me(LWLock *lock)
+{
+	return sampler_lock_held && sampler_held_lock == lock;
+}
+#define MainLWLockArray sampler_locks
+#define LWLockHeldByMe sampler_lock_held_by_me
+#define LWLockAcquire retained_lease_lock
+#define LWLockRelease retained_lease_unlock
+#define cluster_enabled lease_cluster_on
+#define cluster_shared_catalog lease_catalog_on
+#define cluster_xid_allocation_slot retained_lease_slot
+#define cluster_qvotec_get_self_incarnation retained_lease_incarnation
+#define cluster_qvotec_in_quorum retained_lease_quorum
+#define cluster_xid_herding_slack sampler_herding_slack
+#define cluster_xid_next_striped_full original_stripe_next_full
+#define cluster_xid_stripe_window_exceeded original_stripe_window_exceeded
+#define cluster_xid_wrap_barrier_passed original_stripe_wrap_barrier_passed
+#define cluster_xid_stripe_sample_fence_current original_retained_lease_current
+#define cluster_xid_stripe_sample_future original_stripe_future
+#include "test_cluster_heap_freeze_stripe_future.inc"
+#undef cluster_xid_stripe_sample_future
+#undef cluster_xid_stripe_sample_fence_current
+#undef cluster_xid_wrap_barrier_passed
+#undef cluster_xid_stripe_window_exceeded
+#undef cluster_xid_next_striped_full
+#undef cluster_xid_herding_slack
+#undef cluster_qvotec_in_quorum
+#undef cluster_qvotec_get_self_incarnation
+#undef cluster_xid_allocation_slot
+#undef cluster_shared_catalog
+#undef cluster_enabled
+#undef LWLockRelease
+#undef LWLockAcquire
+#undef LWLockHeldByMe
+#undef MainLWLockArray
+
 static bool
 sampler_stripe_future(FullTransactionId reference, FullTransactionId *future,
 					  ClusterXidStripeSampleFence *fence)
@@ -926,8 +971,7 @@ sampler_stripe_future(FullTransactionId reference, FullTransactionId *future,
 	UT_ASSERT(FullTransactionIdIsValid(reference)); sampler_future_reads++;
 	*future = InvalidFullTransactionId; memset(fence, 0, sizeof(*fence));
 	if (!sampler_future_allowed) return false;
-	*future = pass_future; *fence = retained_lease_fence;
-	return true;
+	return original_stripe_future(reference, future, fence);
 }
 
 #define ShmemVariableCache sampler_cache
@@ -973,6 +1017,7 @@ worker_native_sample_fixture(const ClusterHeapFreezeCohortObservation *cohort)
 	pass_active_min = FullTransactionIdFromU64(cohort->active_full_xid_min);
 	sampler_lock_held = sampler_recovering = sampler_advance_on_xid_unlock = false;
 	sampler_held_lock = NULL; sampler_future_allowed = true;
+	sampler_herding_slack = 64;
 	sampler_xid_locks = sampler_proc_locks = 0;
 	sampler_lock_acquires = sampler_lock_releases = sampler_future_reads = 0;
 }
@@ -5695,6 +5740,8 @@ UT_TEST(test_xmin_original_native_sampler_fullxid_fold_and_atomic_refusal)
 	unsigned locks;
 	qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI); fixture_release_original_writer();
 	sampler_variables.nextXid = pass_future = FullTransactionIdFromEpochAndXid(2, 200);
+	/* This API-only epoch-fold case also needs an actual covering lease. */
+	pg_atomic_write_u64(&StripeLease->limit_full, U64FromFullTransactionId(pass_future) + CLUSTER_XID_STRIDE);
 	sampler_proc_array->numProcs = 2;
 	sampler_proc_array->pgprocnos[0] = 0; sampler_proc_array->pgprocnos[1] = 2;
 	sampler_xids[0] = 100; sampler_xids[1] = 3;
@@ -5714,10 +5761,174 @@ UT_TEST(test_xmin_original_native_sampler_fullxid_fold_and_atomic_refusal)
 	UT_ASSERT_EQ(backend_pin_count, 1);
 }
 
+UT_TEST(test_xmin_original_stripe_future_refuses_exhausted_lease)
+{
+	QualifiedXminFixture f;
+	FullTransactionId future = FullTransactionIdFromU64(1);
+	ClusterXidStripeSampleFence fence;
+
+	qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI); fixture_release_original_writer();
+	memset(&fence, 0xa5, sizeof(fence));
+	sampler_lock_acquire(sampler_xid_lock, LW_SHARED);
+	/* The reference equals the lease limit: no future may be issued. */
+	UT_ASSERT(!sampler_stripe_future(FullTransactionIdFromU64(retained_lease_fence.lease_limit_full), &future, &fence));
+	sampler_lock_release(sampler_xid_lock);
+	UT_ASSERT(!FullTransactionIdIsValid(future));
+	UT_ASSERT_EQ(fence.incarnation, 0);
+	UT_ASSERT_EQ(sampler_lock_acquires, sampler_lock_releases);
+}
+
+UT_TEST(test_xmin_original_stripe_future_continues_native_wal)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		qualified_xmin_require_peer(&f, 65);
+		native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id - 1;
+		fixture_release_original_writer(); resume_allowed = true;
+		worker_original_sample_pass_fixture(&f.cohort);
+		UT_ASSERT_EQ(publisher_scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+		UT_ASSERT_EQ(U64FromFullTransactionId(publisher_scan.future_full) % CLUSTER_XID_STRIDE, (uint64) lease_slot);
+		UT_ASSERT(U64FromFullTransactionId(publisher_scan.future_full) < pg_atomic_read_u64(&StripeLease->limit_full));
+		UT_ASSERT_EQ(sampler_xid_locks, 1); UT_ASSERT_EQ(sampler_proc_locks, 1);
+		UT_ASSERT_EQ(sampler_future_reads, 1);
+		f.cohort.local_registration_cut = publisher_scan;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT_EQ(lease_lock_acquires, lease_lock_releases);
+		UT_ASSERT(lease_lock_acquires >= 3);
+		UT_ASSERT(!sampler_lock_held && !lease_lock_held && !worker_lock_held && !local_x && !resumed_writer);
+		UT_ASSERT(f.admission.entered); UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
+UT_TEST(test_xmin_original_stripe_future_refuses_unavailable_inputs)
+{
+	for (int fault = 0; fault < 27; fault++) {
+		QualifiedXminFixture f; ClusterUndoCleanerActiveSample zero;
+		qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id - 1;
+		switch (fault) {
+		case 0: lease_cluster_on = false; break;
+		case 1: lease_catalog_on = false; break;
+		case 2: cluster_xid_striping = false; break;
+		case 3: StripeBootShmem = NULL; break;
+		case 4: StripeLease = NULL; break;
+		case 5: lease_quorum = false; break;
+		case 6: lease_slot = -1; break;
+		case 7: lease_slot = CLUSTER_XID_STRIDE; break;
+		case 8: lease_incarnation = 0; break;
+		case 9: native_lease_shared.disk_state = CLUSTER_XID_STRIPE_DISK_UNKNOWN; break;
+		case 10: native_lease_shared.floor_full = 0; break;
+		case 11: native_lease_shared.epoch = 0; break;
+		case 12: native_lease_shared.generation = 0; break;
+		case 13: native_lease_shared.slot_state = CLUSTER_XID_STRIPE_SLOT_UNKNOWN; break;
+		case 14: native_lease_shared.my_slot_claimed = false; break;
+		case 15: native_lease_shared.my_slot_floor_full = 0; break;
+		case 16: native_lease_shared.my_owner_incarnation = 0; break;
+		case 17: pg_atomic_write_u64(&StripeLease->floor_full, 0); break;
+		case 18: pg_atomic_write_u64(&StripeLease->limit_full, retained_lease_fence.lease_floor_full); break;
+		case 19: pg_atomic_fetch_add_u64(&StripeLease->published_incarnation, 1); break;
+		case 20: pg_atomic_write_u32(&StripeLease->failed, 1); break;
+		case 21: pg_atomic_write_u32(&native_lease_shared.wrap_barrier_done, 0); break;
+		case 22:
+			pg_atomic_write_u64(&native_lease_shared.cluster_min_active_hwm, retained_lease_fence.lease_floor_full);
+			sampler_herding_slack = 1; break;
+		case 23: pg_atomic_write_u64(&native_lease_shared.herding_floor_full, retained_lease_fence.lease_limit_full); break;
+		case 24: sampler_variables.nextXid = FullTransactionIdFromEpochAndXid(1, FrozenTransactionId); break;
+		case 25: sampler_variables.nextXid = InvalidFullTransactionId; break;
+		case 26: pg_atomic_write_u64(&StripeLease->limit_full, U64FromFullTransactionId(sampler_variables.nextXid)); break;
+		}
+		fixture_release_original_writer(); resume_allowed = true;
+		worker_original_sample_pass_fixture(&f.cohort);
+		memset(&zero, 0, sizeof(zero));
+		UT_ASSERT_EQ(publisher_scan.status, CTRC_ACTIVE_SCAN_INVALID);
+		UT_ASSERT_EQ(sampler_proc_locks, 0); UT_ASSERT_EQ(pass_begin_reads, 0);
+		UT_ASSERT(memcmp(&zero, &native_worker_shared.active_sample, sizeof(zero)) == 0);
+		UT_ASSERT(!qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes + conditional_unlocks, 0);
+		UT_ASSERT_EQ(sampler_lock_acquires, sampler_lock_releases);
+		UT_ASSERT_EQ(lease_lock_acquires, lease_lock_releases);
+		UT_ASSERT(!sampler_lock_held && !lease_lock_held && !worker_lock_held && !local_x && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_xmin_original_stripe_future_rounding_and_wrap_are_readonly)
+{
+	static const struct { uint64 reference, herd, limit, expected; int slot; } cases[] = {
+		{ UINT64CONST(0x1000000c3), 0, UINT64CONST(0x100000100), UINT64CONST(0x1000000c8), 8 },
+		{ UINT64CONST(0x1000000c3), UINT64CONST(0x1000000c9), UINT64CONST(0x100000100), UINT64CONST(0x1000000d8), 8 },
+		{ UINT64CONST(0x1ffffffff), 0, UINT64CONST(0x200000020), UINT64CONST(0x200000010), 0 },
+		{ UINT64_MAX, 0, UINT64_MAX, 0, 8 }
+	};
+	for (unsigned i = 0; i < lengthof(cases); i++) {
+		QualifiedXminFixture f; FullTransactionId future;
+		ClusterXidStripeSampleFence fence;
+		qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI); fixture_release_original_writer();
+		lease_slot = cases[i].slot;
+		pg_atomic_write_u64(&StripeLease->limit_full, cases[i].limit);
+		pg_atomic_write_u64(&native_lease_shared.herding_floor_full, cases[i].herd);
+		memset(&fence, 0xa5, sizeof(fence));
+		sampler_lock_acquire(sampler_xid_lock, LW_SHARED);
+		UT_ASSERT_EQ(sampler_stripe_future(FullTransactionIdFromU64(cases[i].reference), &future, &fence), cases[i].expected != 0);
+		sampler_lock_release(sampler_xid_lock);
+		UT_ASSERT_EQ(U64FromFullTransactionId(future), cases[i].expected);
+		if (cases[i].expected != 0) {
+			UT_ASSERT_EQ(fence.lease_limit_full, cases[i].limit); UT_ASSERT_EQ(fence.slot, cases[i].slot);
+		} else UT_ASSERT_EQ(fence.incarnation, 0);
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes + pass_native_reads, 0);
+		UT_ASSERT_EQ(lease_lock_acquires, lease_lock_releases);
+		UT_ASSERT(!sampler_lock_held && !lease_lock_held && !local_x && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+	{
+		QualifiedXminFixture f; FullTransactionId future;
+		ClusterXidStripeSampleFence fence;
+		qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI); fixture_release_original_writer();
+		memset(&fence, 0xa5, sizeof(fence));
+		UT_ASSERT(!original_stripe_future(f.policy.legal_next, &future, &fence));
+		UT_ASSERT(!FullTransactionIdIsValid(future)); UT_ASSERT_EQ(fence.incarnation, 0);
+		UT_ASSERT(!original_stripe_future(f.policy.legal_next, &future, NULL));
+		UT_ASSERT(!original_stripe_future(f.policy.legal_next, NULL, &fence));
+		UT_ASSERT_EQ(lease_lock_acquires + sampler_lock_acquires, 0);
+	}
+}
+
+UT_TEST(test_xmin_original_stripe_future_rechecks_after_snapshot_unlock)
+{
+	for (int fault = 0; fault < 4; fault++) {
+		QualifiedXminFixture f;
+		qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id - 1;
+		if (fault < 2) lease_after_policy_fault = fault == 0 ? 5 : 13;
+		else { lease_revoke_after_unlock = 2; lease_revoke_kind = fault == 2 ? 1 : 2; }
+		fixture_release_original_writer(); resume_allowed = true;
+		worker_original_sample_pass_fixture(&f.cohort);
+		UT_ASSERT_EQ(publisher_scan.status, CTRC_ACTIVE_SCAN_INVALID);
+		UT_ASSERT_EQ(sampler_future_reads, 1); UT_ASSERT_EQ(sampler_proc_locks, 0);
+		UT_ASSERT_EQ(pass_begin_reads, 0);
+		UT_ASSERT(!qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes + conditional_unlocks, 0);
+		UT_ASSERT_EQ(sampler_lock_acquires, sampler_lock_releases);
+		UT_ASSERT_EQ(lease_lock_acquires, lease_lock_releases);
+		UT_ASSERT(!sampler_lock_held && !lease_lock_held && !worker_lock_held && !local_x && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(148);
+	UT_PLAN(153);
+	UT_RUN(test_xmin_original_stripe_future_refuses_exhausted_lease);
+	UT_RUN(test_xmin_original_stripe_future_continues_native_wal);
+	UT_RUN(test_xmin_original_stripe_future_refuses_unavailable_inputs);
+	UT_RUN(test_xmin_original_stripe_future_rounding_and_wrap_are_readonly);
+	UT_RUN(test_xmin_original_stripe_future_rechecks_after_snapshot_unlock);
 	UT_RUN(test_xmin_original_native_sampler_continues_worker_wal);
 	UT_RUN(test_xmin_original_native_sampler_refuses_unknown_identity_and_window);
 	UT_RUN(test_xmin_original_native_sampler_uses_compact_membership);
