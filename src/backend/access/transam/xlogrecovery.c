@@ -204,6 +204,7 @@
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_recovery_census.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_wal_writer.h"
 #include "cluster/storage/cluster_undo_block0.h"
@@ -703,10 +704,36 @@ struct ClusterRecoveryStartV1 {
 	ClusterWalWriterToken writer;
 	uint8 operation_uuid[16];
 	bool revoked;
+	bool ctrc_observation_started, ctrc_observation_complete;
+	const ClusterColdCtrcWorkV1 *ctrc_observation_work;
+	ClusterColdCtrcWorkV1 *ctrc_observation_work_copy;
+	Size ctrc_observation_work_bytes;
+	ClusterRecoveryTxResultObservationV1 ctrc_observation_tx;
+	ClusterControlRootFileToken ctrc_observation_root;
+	ClusterWalInputsV1 *ctrc_observation_inputs;
+	ClusterRecoveryCensus *ctrc_observation_census;
+	ClusterRecoveryCensusManifest ctrc_observation_manifest;
+	char ctrc_observation_refusal[384];
 };
 static struct ClusterRecoveryStartV1 *cluster_recovery_cold_start;
 static uint64 cluster_recovery_cold_generation;
 static bool cluster_recovery_cold_callback_registered;
+
+/* Retire dependents before the original scope/FD/WALR owner. The original
+ * scope's unconfirmed-release refusal must not free the retained inputs. */
+static void
+cluster_recovery_cold_observation_close(struct ClusterRecoveryStartV1 *start)
+{
+	start->ctrc_observation_complete = false;
+	cluster_recovery_census_destroy(start->ctrc_observation_census);
+	start->ctrc_observation_census = NULL;
+	if (start->ctrc_observation_inputs != NULL)
+		cluster_wal_inputs_release_v1(&start->ctrc_observation_inputs);
+	if (start->ctrc_observation_work_copy != NULL) {
+		pfree(start->ctrc_observation_work_copy);
+		start->ctrc_observation_work_copy = NULL;
+	}
+}
 
 static bool
 cluster_recovery_cold_writer_same(const ClusterWalWriterToken *a,
@@ -735,6 +762,7 @@ cluster_recovery_cold_resource_release(ResourceReleasePhase phase, bool isCommit
 	{
 		cluster_recovery_checkpoint_revoke_v1(cluster_recovery_cold_start);
 		cluster_recovery_cold_start->revoked = true;
+		cluster_recovery_cold_observation_close(cluster_recovery_cold_start);
 	}
 }
 
@@ -746,6 +774,7 @@ cluster_recovery_cold_inputs_cleanup(int code, Datum arg)
 	if (cluster_recovery_cold_start != NULL) {
 		cluster_recovery_checkpoint_revoke_v1(cluster_recovery_cold_start);
 		cluster_recovery_cold_start->revoked = true;
+		cluster_recovery_cold_observation_close(cluster_recovery_cold_start);
 		pfree(cluster_recovery_cold_start);
 		cluster_recovery_cold_start = NULL;
 	}
@@ -850,6 +879,195 @@ ClusterColdRecoveryCtrcWorkPrepare(const struct ClusterRecoveryStartV1 *start)
 		|| !ClusterColdRecoveryCtrcWorkCurrent(start, cluster_recovery_cold_inputs->ctrc_work))
 		return NULL;
 	return cluster_recovery_cold_inputs->ctrc_work;
+}
+
+static void
+cluster_recovery_cold_observation_refuse(struct ClusterRecoveryStartV1 *start,
+	const char *stage, int result)
+{
+	ClusterRecoveryCensusDiag diag = {0};
+
+	if (start->ctrc_observation_refusal[0] != '\0')
+		return;
+	if (start->ctrc_observation_census != NULL)
+		(void)cluster_recovery_census_diag(start->ctrc_observation_census, &diag);
+	snprintf(start->ctrc_observation_refusal, sizeof(start->ctrc_observation_refusal),
+		"stage=%s result=%d phase=%d input=%d roots=%d graph=%d relation=%d "
+		"mx=%d slru=%d relmap=%d join=%d xact=%d inventory=%d terminal=%d",
+		stage, result, (int)diag.phase, (int)diag.input_result, (int)diag.roots_result,
+		(int)diag.graph_result, (int)diag.relation_result, (int)diag.mx_result,
+		(int)diag.slru_result, (int)diag.relmap_result, (int)diag.join_result,
+		(int)diag.xact_result, (int)diag.inventory_result, (int)diag.terminal_result);
+}
+
+static bool
+cluster_recovery_cold_observation_work_current(const struct ClusterRecoveryStartV1 *start)
+{
+	return start->ctrc_observation_work_copy != NULL
+		&& ClusterColdRecoveryCtrcWorkCurrent(start, start->ctrc_observation_work)
+		&& start->inputs->census_root_captured
+		&& memcmp(&start->inputs->census_root, &start->ctrc_observation_root,
+			sizeof(start->ctrc_observation_root)) == 0
+		/* Locate the original full-sized allocation before comparing entries.
+		 * A reused address with a smaller new work cannot supply this extent. */
+		&& start->ctrc_observation_work->generation == start->ctrc_observation_work_copy->generation
+		&& memcmp(&start->ctrc_observation_work->counts,
+			&start->ctrc_observation_work_copy->counts,
+			sizeof(start->ctrc_observation_work->counts)) == 0
+		&& memcmp(start->ctrc_observation_work, start->ctrc_observation_work_copy,
+			start->ctrc_observation_work_bytes) == 0;
+}
+
+static bool
+cluster_recovery_cold_observation_current(const struct ClusterRecoveryStartV1 *start)
+{
+	ClusterRecoveryTxResultObservationV1 tx;
+
+	return cluster_recovery_cold_observation_work_current(start)
+		&& cluster_recovery_ctrc_terminal_result_v1(start, start->ctrc_observation_work, &tx)
+		&& memcmp(&tx, &start->ctrc_observation_tx, sizeof(tx)) == 0
+		&& cluster_recovery_cold_observation_work_current(start);
+}
+
+bool
+ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size memory_budget)
+{
+	struct ClusterRecoveryStartV1 *state;
+	volatile bool candidate = false, observed = false;
+	ClusterRecoveryCensusManifest confirmed;
+
+	if (start == NULL)
+		return true;
+	if (start != cluster_recovery_cold_start)
+		return false;
+	state = cluster_recovery_cold_start;
+	if (state->ctrc_observation_started && !state->ctrc_observation_complete)
+		return false;
+	/* This original Startup boundary holds no PAGE/content or slot lock. */
+	if (CritSectionCount != 0 || !ClusterColdRecoveryTxCurrent(start)) {
+		state->ctrc_observation_started = true;
+		state->ctrc_observation_complete = false;
+		cluster_recovery_cold_observation_refuse(state, "owner", 0);
+		return false;
+	}
+	PG_TRY();
+	{
+		if (state->ctrc_observation_started) {
+			if (cluster_recovery_cold_observation_current(start)
+				&& cluster_recovery_census_manifest(state->ctrc_observation_census, &confirmed)
+				&& memcmp(&confirmed, &state->ctrc_observation_manifest, sizeof(confirmed)) == 0)
+				candidate = true;
+			else
+				cluster_recovery_cold_observation_refuse(state, "revalidate", 0);
+		} else {
+			const ClusterColdCtrcWorkV1 *work = start->inputs->ctrc_work;
+			Size bytes = 0;
+			ClusterControlRootResult scope_result;
+			ClusterRecoveryCensusResult result;
+			ClusterRecoveryCensusEntry entry;
+			ClusterRecoveryTxResultObservationV1 tx;
+
+			state->ctrc_observation_started = true;
+			do {
+				if (!ClusterColdRecoveryCtrcWorkCurrent(start, work)
+					|| work->counts.subject_count > (MaxAllocSize - offsetof(ClusterColdCtrcWorkV1, entries))
+						/ sizeof(work->entries[0])) {
+					cluster_recovery_cold_observation_refuse(state, "work", 0);
+					break;
+				}
+				bytes = offsetof(ClusterColdCtrcWorkV1, entries)
+					+ (Size)work->counts.subject_count * sizeof(work->entries[0]);
+				if (memory_budget > MaxAllocSize || memory_budget <= bytes) {
+					cluster_recovery_cold_observation_refuse(state, "memory_budget", 0);
+					break;
+				}
+				state->ctrc_observation_work = work;
+				state->ctrc_observation_work_bytes = bytes;
+				state->ctrc_observation_root = start->inputs->census_root;
+				state->ctrc_observation_work_copy = MemoryContextAllocExtended(TopMemoryContext,
+					bytes, MCXT_ALLOC_NO_OOM);
+				if (state->ctrc_observation_work_copy == NULL) {
+					cluster_recovery_cold_observation_refuse(state, "work_allocation", 0);
+					break;
+				}
+				memcpy(state->ctrc_observation_work_copy, work, bytes);
+				if (!cluster_recovery_ctrc_terminal_result_v1(start, work, &tx)) {
+					cluster_recovery_cold_observation_refuse(state, "accepted_tx", 0);
+					break;
+				}
+				state->ctrc_observation_tx = tx;
+				if (!cluster_recovery_cold_observation_current(start)) {
+					cluster_recovery_cold_observation_refuse(state, "accepted_tx", 0);
+					break;
+				}
+				scope_result = cluster_wal_inputs_begin_ctrc_census_v1(start, work,
+					&state->ctrc_observation_inputs);
+				if (scope_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+					cluster_recovery_cold_observation_refuse(state, "scope_begin", (int)scope_result);
+					break;
+				}
+				result = cluster_recovery_census_begin_ctrc(state->ctrc_observation_inputs,
+					memory_budget - bytes, &state->ctrc_observation_census);
+				if (result != CLUSTER_RECOVERY_CENSUS_MORE) {
+					cluster_recovery_cold_observation_refuse(state, "census_begin", (int)result);
+					break;
+				}
+				for (;;) {
+					HandleStartupProcInterrupts();
+					if (!cluster_recovery_cold_observation_current(start)) {
+						cluster_recovery_cold_observation_refuse(state, "original_input_changed", 0);
+						break;
+					}
+					result = cluster_recovery_census_next(state->ctrc_observation_census, &entry);
+					/* Every original kind and phase is visited; no TT/target or
+					 * terminal filtering can shorten this complete observation. */
+					if (result == CLUSTER_RECOVERY_CENSUS_MORE || result == CLUSTER_RECOVERY_CENSUS_ENTRY)
+						continue;
+					if (result != CLUSTER_RECOVERY_CENSUS_DRAINED) {
+						cluster_recovery_cold_observation_refuse(state, "census_next", (int)result);
+						break;
+					}
+					if (!cluster_recovery_cold_observation_current(start)
+						|| !cluster_recovery_census_manifest(state->ctrc_observation_census,
+							&state->ctrc_observation_manifest)) {
+						cluster_recovery_cold_observation_refuse(state, "manifest", 0);
+						break;
+					}
+					candidate = true;
+					break;
+				}
+			} while (false);
+		}
+		if (candidate) {
+			HandleStartupProcInterrupts();
+			if (cluster_recovery_cold_observation_current(start)
+				&& cluster_recovery_census_manifest(state->ctrc_observation_census, &confirmed)
+				&& memcmp(&confirmed, &state->ctrc_observation_manifest, sizeof(confirmed)) == 0
+				&& cluster_recovery_cold_observation_current(start)) {
+				state->ctrc_observation_complete = true;
+				observed = true;
+			} else
+				cluster_recovery_cold_observation_refuse(state, "manifest_changed", 0);
+		}
+	}
+	PG_CATCH();
+	{
+		cluster_recovery_cold_observation_refuse(state, "error", 0);
+		cluster_recovery_cold_observation_close(state);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!observed)
+		cluster_recovery_cold_observation_close(state);
+	return observed;
+}
+
+const char *
+ClusterColdRecoveryCtrcObservationRefusal(const struct ClusterRecoveryStartV1 *start)
+{
+	return start != NULL && start == cluster_recovery_cold_start
+		&& start->ctrc_observation_refusal[0] != '\0'
+		? start->ctrc_observation_refusal : "stage=original_owner";
 }
 
 bool
@@ -1097,6 +1315,8 @@ ClusterReleaseColdRecoveryInputs(EndOfWalRecoveryInfo *info)
 	if (info == NULL || info->cluster_cold_inputs != cluster_recovery_cold_inputs
 		|| info->cluster_tx_start != cluster_recovery_cold_start)
 		ereport(FATAL, (errmsg("cold recovery input handoff belongs to another attempt")));
+	if (cluster_recovery_cold_start != NULL)
+		cluster_recovery_cold_observation_close(cluster_recovery_cold_start);
 	/* Preserve the original registered checkpoint owner after successful
 	 * Startup completion, before destroying its private source inputs.
 	 * An already-revoked attempt is cleanup only and transfers nothing. */

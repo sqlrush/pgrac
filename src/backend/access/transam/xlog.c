@@ -8245,6 +8245,11 @@ StartupXLOG(void)
 	/* Complete original TX component handoff before releasing private input. */
 	if (!cluster_recovery_tx_result_wait_v1(endOfRecoveryInfo->cluster_tx_start))
 		ereport(FATAL, (errmsg("could not complete original Startup transaction result handoff")));
+	/* Retain the original complete observation, not a semantic service seal. */
+	if (!ClusterColdRecoveryCtrcObserve(endOfRecoveryInfo->cluster_tx_start,
+			(Size)cluster_cold_recovery_plan_memory * 1024 / 4))
+		ereport(FATAL, (errmsg("could not observe original Startup CTRC inputs"),
+			errdetail("%s", ClusterColdRecoveryCtrcObservationRefusal(endOfRecoveryInfo->cluster_tx_start))));
 	/* The same original executor/input must survive independent CTRC service.
 	 * TX acceptance alone cannot transfer or destroy its private work. */
 	if (!cluster_recovery_ctrc_result_wait_v1(endOfRecoveryInfo->cluster_tx_start))

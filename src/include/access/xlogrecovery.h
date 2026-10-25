@@ -192,6 +192,20 @@ ClusterColdRecoveryCtrcWorkPrepare(const struct ClusterRecoveryStartV1 *start);
 extern bool ClusterColdRecoveryCtrcWorkCurrent(const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdCtrcWorkV1 *work);
 
+/* Original Startup after accepted TX: drive the complete read-only census
+ * under its original CTRC scope, retaining both under this same Start.
+ * memory_budget includes a full immutable work copy and the census's owned
+ * allocation budget (not borrowed inputs/native reader/cryptohash storage).
+ * Repeated calls only revalidate the saved observation; refusal is sticky.
+ * DRAINED/manifest never supplies a semantic seal, freeze, PAGE authority,
+ * service completion or release. Original Start cleanup retires cursor before
+ * scope. Native ERROR propagates, with original WALR release debt unchanged. */
+extern bool ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start,
+	Size memory_budget);
+/* First bounded observation refusal, valid only while original Start lives. */
+extern const char *ClusterColdRecoveryCtrcObservationRefusal(
+	const struct ClusterRecoveryStartV1 *start);
+
 /* Original post-EOR owner only: require the complete sealed ordinary-effects
  * receipt before consuming any proven physical loser.  This is a read-only
  * input check; the restricted empty-effects proof remains a per-entry
