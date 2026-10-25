@@ -7,6 +7,7 @@
 #include "cluster/cluster_relmap_authority.h"
 #include "cluster/cluster_shmem.h"
 #include "storage/shmem.h"
+#include "access/xloginsert.h"
 
 static const ClusterShmemRegion *relmap_runtime_registered;
 static void *relmap_runtime_allocation;
@@ -19,7 +20,44 @@ static ClusterRelmapV2Owner relmap_runtime_stage_owner;
 static ClusterRelmapV2Namespace relmap_runtime_stage_identity;
 static RelMapFile relmap_runtime_stage_map;
 
+/* Only the new dormant producer's native leaves are controlled here. Keep
+ * existing writer/flush providers and every original runtime test unchanged. */
+static void relmap_pending_begin(void);
+static void relmap_pending_register(char *data, uint32 bytes);
+static XLogRecPtr relmap_pending_insert(RmgrId rmid, uint8 info);
+static void relmap_pending_flush(XLogRecPtr end);
+static bool relmap_pending_lock_mode(LWLock *lock, LWLockMode mode);
+static FullTransactionId relmap_pending_current_xid(void);
+static Oid relmap_pending_tablespace;
+#pragma push_macro("XLogBeginInsert")
+#pragma push_macro("XLogRegisterData")
+#pragma push_macro("XLogInsert")
+#pragma push_macro("XLogFlush")
+#pragma push_macro("LWLockHeldByMeInMode")
+#pragma push_macro("GetCurrentFullTransactionIdIfAny")
+#pragma push_macro("MyDatabaseTableSpace")
+#undef XLogBeginInsert
+#undef XLogRegisterData
+#undef XLogInsert
+#undef XLogFlush
+#undef LWLockHeldByMeInMode
+#undef GetCurrentFullTransactionIdIfAny
+#undef MyDatabaseTableSpace
+#define XLogBeginInsert relmap_pending_begin
+#define XLogRegisterData relmap_pending_register
+#define XLogInsert relmap_pending_insert
+#define XLogFlush relmap_pending_flush
+#define LWLockHeldByMeInMode relmap_pending_lock_mode
+#define GetCurrentFullTransactionIdIfAny relmap_pending_current_xid
+#define MyDatabaseTableSpace relmap_pending_tablespace
 #include "../../backend/cluster/cluster_relmap_retention_runtime.c"
+#pragma pop_macro("MyDatabaseTableSpace")
+#pragma pop_macro("GetCurrentFullTransactionIdIfAny")
+#pragma pop_macro("LWLockHeldByMeInMode")
+#pragma pop_macro("XLogFlush")
+#pragma pop_macro("XLogInsert")
+#pragma pop_macro("XLogRegisterData")
+#pragma pop_macro("XLogBeginInsert")
 
 /* Controlled storage boundary only. The real authority/filesystem failure-cut
  * suite is separate; these counters are not durable I/O evidence. */

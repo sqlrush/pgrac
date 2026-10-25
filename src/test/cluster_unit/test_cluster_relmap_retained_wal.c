@@ -34,6 +34,7 @@ int control_fixture_main(int argc, char **argv);
 #include "test_cluster_relmap_native_clog.h"
 #include "test_cluster_relmap_native_storage.h"
 #include "test_cluster_relmap_native_pin.h"
+#include "test_cluster_relmap_native_owner.h"
 #include "test_cluster_relmap_original_scope.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
@@ -2180,6 +2181,8 @@ custody_image_init(const ClusterControlRootSnapshot *snapshot, uint64 dbinc)
 	relmap_test_crc(&custody_image.pending);
 }
 static uint64 custody_era_offset, custody_next_override;
+/* New producer composition only; all original fixtures keep the NULL path. */
+static bool (*custody_original_owner_capture)(const ClusterWalSourceRef *, ClusterRelmapV2Owner *);
 static ClusterWalInputsV1 *
 terminal_prefix_fixture(bool aborting, unsigned fault)
 {
@@ -2248,6 +2251,9 @@ terminal_prefix_fixture(bool aborting, unsigned fault)
 		WalTestRecord pending;
 		custody_image_init(snapshot, root.header.v2.database_incarnation);
 		custody_image.pending_owner.top_full_xid += custody_era_offset;
+		if (custody_original_owner_capture != NULL
+			&& !custody_original_owner_capture(&source, &custody_image.pending_owner))
+			return NULL;
 		update.dbid = custody_image.identity.dbid;
 		update.tsid = custody_shared ? GLOBALTABLESPACE_OID : DEFAULTTABLESPACE_OID;
 		update.nbytes = sizeof(RelMapFile);
@@ -3463,6 +3469,7 @@ UT_TEST(test_terminal_read_native_error_keeps_output_zero_and_custody_dead)
 #include "test_cluster_relmap_checkpoint_publisher.inc"
 #include "test_cluster_relmap_checkpoint_scope.inc"
 #include "test_cluster_relmap_checkpoint_pending.inc"
+#include "test_cluster_relmap_producer_pending.inc"
 
 int
 main(int argc, char **argv)
@@ -3471,7 +3478,10 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(152);
+	UT_PLAN(155);
+	UT_RUN(test_original_owner_sample_reaches_pending_and_native_read);
+	UT_RUN(test_original_owner_capture_refusal_preserves_pending_and_scope);
+	UT_RUN(test_original_owner_recheck_never_adopts_or_reassigns);
 	UT_RUN(test_actual_checkpointer_pending_uses_original_scope_and_held_native_read);
 	UT_RUN(test_actual_checkpointer_pending_refuses_independent_writer_mismatch);
 	UT_RUN(test_actual_checkpointer_pending_native_refusal_keeps_original_protection);

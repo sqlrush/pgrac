@@ -1520,11 +1520,16 @@ UT_TEST(test_requested_flush_rejects_foreign_or_unsafe_context_without_io)
 
 #include "test_cluster_relmap_owner.inc"
 #include "test_cluster_relmap_retention_runtime.inc"
+#include "test_cluster_relmap_pending_insert.inc"
 
 int
 main(void)
 {
-	UT_PLAN(118);
+	UT_PLAN(122);
+	UT_RUN(test_relmap_pending_insert_uses_actual_record_end_and_native_payload);
+	UT_RUN(test_relmap_pending_insert_refuses_before_wal_without_original_preparation);
+	UT_RUN(test_relmap_pending_insert_late_refusal_retains_original_obligations);
+	UT_RUN(test_relmap_pending_insert_critical_error_propagates_without_local_release);
 	UT_RUN(test_clean_writer_requires_selected_exit_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_requires_selected_input_and_installed_same_epoch);
 	UT_RUN(test_recovered_writer_requires_selected_input_and_installed_same_epoch);

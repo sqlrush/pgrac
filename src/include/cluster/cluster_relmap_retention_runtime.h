@@ -32,6 +32,21 @@ extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_begin_v2(
 	const ClusterRelmapOwnerSampleV2 *sample, const ClusterRelmapV2Namespace *identity,
 	uint64 generation);
 
+/* Dormant original producer: with its already captured top FullXid, original
+ * global relmap X and RelationMappingLock(X), insert the native RELMAP record,
+ * flush its actual returned end, then stage BOTH v2 copies through the original
+ * runtime adapter. Requires an exact unstaged preparation, no caller-held
+ * XidGen/retention lock, and current FullXid equal to the original top sample;
+ * never assigns an xid inside this window. Native WAL and storage I/O run
+ * outside retention. Returns only this insertion's end after successful stage
+ * and original-owner revalidation. InvalidXLogRecPtr can follow durable WAL or
+ * partial/complete pair writes: follow the original failure path, preserve all
+ * duties and do not retry or infer rollback. ERROR/fail-stop propagates. No
+ * live caller, COMPLETE publication, terminal proof or release permission. */
+extern XLogRecPtr cluster_relmap_retention_runtime_insert_pending_v2(
+	const ClusterRelmapOwnerSampleV2 *sample, const ClusterRelmapV2Namespace *identity,
+	uint64 generation, const RelMapFile *pending);
+
 /* Dormant original-producer stage after its original relmap WAL insert/flush.
  * The caller supplies that exact durable record end, which this adapter does
  * not independently authenticate. The original relmap X must remain held;
