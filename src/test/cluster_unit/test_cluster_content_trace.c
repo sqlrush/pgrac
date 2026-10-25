@@ -57,6 +57,9 @@ void errfinish(const char *file, int line, const char *func)
 	}
 }
 
+static unsigned deadline_procs, deadline_targets, deadline_ends;
+int PostPortNumber;
+
 #include "../../backend/cluster/cluster_content_trace.c"
 #include "test_cluster_content_trace_lw_wait.inc"
 
@@ -66,6 +69,8 @@ static void actor(unsigned i)
 	memset(&local_owner, 0, sizeof(local_owner));
 	pair_depth = 0; pair_recording = false; pair_slot = -1;
 	service_serial = service_current = 0;
+	lifetime_serial = 0; memset(held_lifetimes, 0, sizeof(held_lifetimes));
+	held_lifetime_count = 0;
 	MyProc = &procs[i]; MyProc->pgprocno = i; MyProc->pid = MyProcPid = 100 + i; MyProc->backendId = 1 + i;
 	MyStartTimestamp = 1000 + i;
 	MyProc->cluster_grd_generation = 10000 + i;
@@ -860,10 +865,140 @@ UT_TEST(pcm_nested_finish_inherits_only_same_native_request_admission)
 	UT_ASSERT(!local_owner.pcm_serving);
 }
 
+UT_TEST(resource_lifetimes_survive_unrelated_samples_but_not_release)
+{
+	ClusterWaitTrace wait = {0};
+	uint64 held_life, wait_life;
+	reset(); hold(0, LW_EXCLUSIVE);
+	cluster_content_trace_lock_changed(&buf(0)->content_lock);
+	held_life = local_owner.locks[0].lifetime;
+	UT_ASSERT(held_life != 0);
+	wait.tag = buf(1)->tag; wait.tag_known = true; wait.binding = 91;
+	cluster_content_trace_wait_set(CLCONTENT_PCM, &wait);
+	wait_life = local_owner.wait_lifetimes[CLCONTENT_PCM];
+	UT_ASSERT(wait_life != 0);
+	wait.snapshot++; wait.progress++;
+	cluster_content_trace_wait_set(CLCONTENT_PCM, &wait);
+	UT_ASSERT_EQ(local_owner.locks[0].lifetime, held_life);
+	UT_ASSERT_EQ(local_owner.wait_lifetimes[CLCONTENT_PCM], wait_life);
+	cluster_content_trace_lock_invalidating(&buf(0)->content_lock);
+	nheld = 0; cluster_content_trace_lock_changed(&buf(0)->content_lock);
+	hold(0, LW_EXCLUSIVE); cluster_content_trace_lock_changed(&buf(0)->content_lock);
+	UT_ASSERT(local_owner.locks[0].lifetime != held_life);
+	wait.binding++; cluster_content_trace_wait_set(CLCONTENT_PCM, &wait);
+	UT_ASSERT(local_owner.wait_lifetimes[CLCONTENT_PCM] != wait_life);
+	wait_life = local_owner.wait_lifetimes[CLCONTENT_PCM];
+	cluster_content_trace_wait_clear(CLCONTENT_PCM);
+	cluster_content_trace_wait_set(CLCONTENT_PCM, &wait);
+	UT_ASSERT(local_owner.wait_lifetimes[CLCONTENT_PCM] != wait_life);
+}
+
+UT_TEST(grant_and_native_wait_lifetimes_retire_at_native_boundary)
+{
+	ClusterResId hw = {1, 2, 3, 0, 0xf2, 1};
+	ClusterGrdHolderId holder = {0, 0, 17, 19};
+	uint64 grant, wait;
+	reset(); cluster_content_trace_enqueue_granted(&hw, &holder, ExclusiveLock);
+	grant = local_owner.grants[0].lifetime; UT_ASSERT(grant != 0);
+	cluster_content_trace_native_wait_set(&buf(1)->content_lock, LW_SHARED);
+	wait = local_owner.native_wait.lifetime; UT_ASSERT(wait != 0);
+	cluster_content_trace_native_wait_clear();
+	cluster_content_trace_native_wait_set(&buf(1)->content_lock, LW_SHARED);
+	UT_ASSERT(local_owner.native_wait.lifetime != wait);
+	UT_ASSERT_EQ(local_owner.grants[0].lifetime, grant);
+	cluster_content_trace_enqueue_releasing(&hw, &holder);
+	cluster_content_trace_enqueue_granted(&hw, &holder, ExclusiveLock);
+	UT_ASSERT(local_owner.grants[0].lifetime != grant);
+}
+
+UT_TEST(retry_and_service_lifetimes_cleanup_without_resurrection)
+{
+	ClusterWaitTrace wait = {0};
+	ClusterContentTraceServiceScope scope;
+	uint64 life;
+	reset(); wait.buffer = 3;
+	cluster_content_trace_wait_set(CLCONTENT_RETRY, &wait);
+	life = local_owner.wait_lifetimes[CLCONTENT_RETRY]; UT_ASSERT(life != 0);
+	cluster_content_trace_service_begin(&scope, &wait);
+	UT_ASSERT(local_owner.service_lifetime != 0);
+	cluster_content_trace_error_cleanup();
+	UT_ASSERT_EQ(local_owner.wait_lifetimes[CLCONTENT_RETRY], 0);
+	UT_ASSERT_EQ(local_owner.service_lifetime, 0);
+	cluster_content_trace_service_end(&scope);
+	UT_ASSERT_EQ(local_owner.service_lifetime, 0);
+	cluster_content_trace_wait_set(CLCONTENT_RETRY, &wait);
+	UT_ASSERT(local_owner.wait_lifetimes[CLCONTENT_RETRY] != life);
+}
+
+UT_TEST(lifetime_exhaustion_and_missed_disable_cannot_resurrect_resources)
+{
+	ClusterResId hw = {1, 2, 3, 0, 0xf2, 1};
+	ClusterGrdHolderId holder = {0, 0, 17, 19};
+	ClusterWaitTrace wait = {0};
+	ClusterContentTraceServiceScope outer, inner;
+	reset();
+	cluster_content_trace_enqueue_granted(&hw, &holder, ExclusiveLock);
+	cluster_content_trace_service_begin(&outer, &wait);
+	cluster_content_trace_service_begin(&inner, &wait);
+	pg_atomic_write_u32(&content_trace->slots[0].busy, 1);
+	cluster_trace_tx_identity = false;
+	cluster_content_trace_enqueue_releasing(&hw, &holder);
+	pg_atomic_write_u32(&content_trace->slots[0].busy, 0);
+	cluster_trace_tx_identity = true;
+	cluster_content_trace_service_end(&inner);
+	UT_ASSERT_EQ(local_owner.ngrants, 0); UT_ASSERT(!local_owner.pcm_serving);
+	cluster_content_trace_service_end(&outer);
+	lifetime_serial = PG_UINT64_MAX;
+	cluster_content_trace_wait_set(CLCONTENT_PCM, &wait);
+	UT_ASSERT_EQ(local_owner.wait_lifetimes[CLCONTENT_PCM], 0);
+	hold(0, LW_EXCLUSIVE); cluster_content_trace_lock_changed(&buf(0)->content_lock);
+	UT_ASSERT_EQ(local_owner.locks[0].lifetime, 0);
+}
+
+UT_TEST(deadline_census_is_default_off_bounded_and_once)
+{
+	ClusterWaitTrace wait = {0};
+	struct sockaddr_in address = {.sin_family=AF_INET, .sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
+	socklen_t len = sizeof(address);
+	char packet[2048];
+	int receiver = socket(AF_INET, SOCK_DGRAM, 0), n;
+	UT_ASSERT(receiver >= 0);
+	UT_ASSERT_EQ(bind(receiver, (struct sockaddr *)&address, sizeof(address)), 0);
+	UT_ASSERT_EQ(getsockname(receiver, (struct sockaddr *)&address, &len), 0);
+	PostPortNumber = ntohs(address.sin_port);
+	reset(); cluster_content_trace_wait_set(CLCONTENT_RETRY, &wait);
+	actor(1); /* A live, unpublished process is still in the native census. */
+	cluster_trace_tx_identity = false;
+	cluster_content_trace_deadline_dump(3);
+	UT_ASSERT_EQ(deadline_procs, 0);
+	cluster_trace_tx_identity = true;
+	cluster_content_trace_deadline_dump(3);
+	while ((n = recv(receiver, packet, sizeof(packet)-1, MSG_DONTWAIT)) > 0) {
+		packet[n] = '\0';
+		if (strstr(packet, "DEADLINE_PROC ")) deadline_procs++;
+		if (strstr(packet, "DEADLINE_TARGET ")) deadline_targets++;
+		if (strstr(packet, "DEADLINE_END ")) {
+			deadline_ends++;
+			UT_ASSERT(strstr(packet, "dropped=0") != NULL);
+		}
+	}
+	UT_ASSERT_EQ(deadline_procs, 2); UT_ASSERT_EQ(deadline_targets, 1);
+	UT_ASSERT_EQ(deadline_ends, 1);
+	cluster_content_trace_deadline_dump(3);
+	UT_ASSERT_EQ(deadline_procs, 2); UT_ASSERT_EQ(deadline_ends, 1);
+	UT_ASSERT_EQ(recv(receiver, packet, sizeof(packet), MSG_DONTWAIT), -1);
+	close(receiver);
+}
+
 int main(void)
 {
 	cluster_content_trace_shmem_register(); assert(registered && registered->lwlock_count == 0);
-	UT_PLAN(43);
+	UT_PLAN(48);
+	UT_RUN(lifetime_exhaustion_and_missed_disable_cannot_resurrect_resources);
+	UT_RUN(deadline_census_is_default_off_bounded_and_once);
+	UT_RUN(resource_lifetimes_survive_unrelated_samples_but_not_release);
+	UT_RUN(grant_and_native_wait_lifetimes_retire_at_native_boundary);
+	UT_RUN(retry_and_service_lifetimes_cleanup_without_resurrection);
 	UT_RUN(process_start_initializes_empty_before_pid_without_local_process);
 	UT_RUN(process_start_retires_recycled_payload_at_native_allocation);
 	UT_RUN(rejection_keeps_busy_allocation_without_baseline_unknown);

@@ -45,6 +45,16 @@ cluster_native_itl_trace_selected(Buffer buffer pg_attribute_unused(),
 		abort();
 }
 void __attribute__((weak))
+cluster_native_itl_trace_terminal(ClusterNativeItlTraceKind kind pg_attribute_unused(),
+	uint8 owner pg_attribute_unused(), uint32 segment pg_attribute_unused(),
+	uint32 generation pg_attribute_unused(), uint16 offset pg_attribute_unused(),
+	const TTSlot *successor pg_attribute_unused(), XLogRecPtr lsn pg_attribute_unused(),
+	const ClusterCanonicalTxnBinding *binding pg_attribute_unused())
+{
+	if (cluster_trace_tx_identity)
+		abort();
+}
+void __attribute__((weak))
 cluster_tx_identity_trace_emit(ClusterTxIdentityTraceKind kind pg_attribute_unused(),
 								const ClusterTxIdentityTrace *row pg_attribute_unused())
 {

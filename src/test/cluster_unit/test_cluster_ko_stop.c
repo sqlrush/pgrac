@@ -2,6 +2,7 @@
 /* Actual KO SPSC admission/drain, with explicit storage and ACK-queue boundary
  * fixtures. A queue-empty observation alone does not certify flush completion. */
 #include "postgres.h"
+#include "cluster/cluster_content_trace.h"
 #include "access/xact.h"
 #include "access/multixact.h"
 #include "catalog/storage.h"
@@ -29,6 +30,10 @@ static unsigned ko_cv_cancel_calls;
 static unsigned ko_cv_broadcast_calls;
 static long ko_cv_last_timeout;
 static uint32 ko_cv_last_wait_event;
+static unsigned ko_trace_clears;
+static bool ko_trace_sleep_error;
+void cluster_content_trace_wait_clear(ClusterContentTraceWait kind)
+{ if (kind == CLCONTENT_KO) ko_trace_clears++; }
 
 void
 ConditionVariableInit(ConditionVariable *cv)
@@ -49,6 +54,7 @@ ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(), long ti
 	ko_cv_sleep_calls++;
 	ko_cv_last_timeout = timeout;
 	ko_cv_last_wait_event = wait_event_info;
+	if (ko_trace_sleep_error) siglongjmp(*PG_exception_stack, 1);
 	return true;
 }
 
@@ -1846,6 +1852,10 @@ reset_test(void)
 
 UT_TEST(test_admission_wait_uses_event_wake_with_bounded_fallback)
 {
+	unsigned cleared = ko_trace_clears;
+	sigjmp_buf stack;
+	sigjmp_buf *saved_stack = PG_exception_stack;
+	bool caught = false;
 	reset_test();
 	ko_cv_prepare_calls = ko_cv_sleep_calls = ko_cv_cancel_calls = 0;
 	ko_cv_broadcast_calls = 0;
@@ -1858,6 +1868,12 @@ UT_TEST(test_admission_wait_uses_event_wake_with_bounded_fallback)
 	UT_ASSERT_EQ(ko_cv_cancel_calls, 1);
 	UT_ASSERT_EQ(ko_cv_last_timeout, 100L);
 	UT_ASSERT_EQ(ko_cv_last_wait_event, WAIT_EVENT_PCM_BLOCK_CONVERT_WAIT);
+	UT_ASSERT_EQ(ko_trace_clears, cleared + 1);
+	ko_trace_sleep_error = true; PG_exception_stack = &stack;
+	if (sigsetjmp(stack, 0) == 0) cluster_ko_peer_admission_wait(100L);
+	else caught = true;
+	PG_exception_stack = saved_stack; ko_trace_sleep_error = false;
+	UT_ASSERT(caught); UT_ASSERT_EQ(ko_trace_clears, cleared + 2);
 
 	ko_peer_admission_wake();
 	UT_ASSERT_EQ(ko_cv_broadcast_calls, 1);

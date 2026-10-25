@@ -16,6 +16,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_content_trace.h"
 #include "access/nbtree.h"
 #include "catalog/pg_class.h"
 #include "cluster/cluster_guc.h"
@@ -36,6 +37,9 @@ sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 bool cluster_enabled = true, cluster_shared_config = true;
 bool cluster_tx_enqueue_wait_enabled = true;
+bool cluster_trace_tx_identity;
+void cluster_content_trace_wait_set(ClusterContentTraceWait kind, const ClusterWaitTrace *wait)
+{ (void)kind; (void)wait; }
 int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 int cluster_ges_request_timeout_ms = 1000;
 int NBuffers = 2, NLocBuffer;

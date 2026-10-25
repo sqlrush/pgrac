@@ -37,6 +37,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 
 #include "cluster/cluster_lmd.h"
@@ -869,6 +870,8 @@ cluster_normal_stop_fail(ClusterNormalStopFailure reason)
 		|| reason > CLUSTER_NORMAL_STOP_FAILURE_LATE_UNSEALED_WORK)
 		reason = CLUSTER_NORMAL_STOP_FAILURE_STATE;
 	(void)pg_atomic_compare_exchange_u32(&cl_normal_stop->failure_reason, &expected, reason);
+	if (reason == CLUSTER_NORMAL_STOP_FAILURE_DEADLINE)
+		cluster_content_trace_deadline_dump(reason);
 }
 
 ClusterNormalStopFailure

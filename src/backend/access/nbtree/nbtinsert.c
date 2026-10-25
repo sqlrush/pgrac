@@ -26,6 +26,7 @@
  */
 
 #include "postgres.h"
+#include "cluster/cluster_content_trace.h"
 
 #include "access/nbtree.h"
 #include "access/nbtxlog.h"
@@ -153,6 +154,13 @@ _bt_insert_alloc_begin(Relation rel, BTInsertAlloc *allocation)
 					(errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
 					 errmsg("cannot qualify the index extension object owner")));
 		CHECK_FOR_INTERRUPTS();
+		if (cluster_trace_tx_identity) {
+			ClusterWaitTrace wait = {0};
+			InitBufferTag(&wait.tag, &rel->rd_locator, MAIN_FORKNUM, InvalidBlockNumber);
+			wait.tag_known = true;
+			wait.site = CLWAIT_SITE_KO_ADMISSION;
+			cluster_content_trace_wait_set(CLCONTENT_KO, &wait);
+		}
 		cluster_ko_peer_admission_wait(100L);
 		CHECK_FOR_INTERRUPTS();
 	}

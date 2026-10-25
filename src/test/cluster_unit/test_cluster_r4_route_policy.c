@@ -6,6 +6,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_content_trace.h"
 
 #include <setjmp.h>
 #include <sys/mman.h>
@@ -174,6 +175,8 @@ ClusterConf *ClusterConfShmem = NULL;
 bool cluster_smart_fusion = false;
 BackendId MyBackendId = 1;
 BackendType MyBackendType = B_BACKEND;
+PGPROC *MyProc = NULL;
+bool cluster_trace_normal_stop = false;
 int cluster_gcs_reply_timeout_ms = 5000;
 int cluster_gcs_block_retransmit_max_retries = 4;
 int cluster_gcs_block_retransmit_initial_backoff_ms = 10;
@@ -182,6 +185,21 @@ int cluster_injection_armed_count = 0;
 char *BufferBlocks = NULL;
 Block *LocalBufferBlockPointers = NULL;
 int NBuffers = 0;
+bool cluster_trace_tx_identity;
+static ClusterWaitTrace retry_trace;
+static unsigned retry_trace_set, retry_trace_clear;
+static int retry_private_pins;
+static bool retry_trace_throw;
+static bool retry_trace_header_busy;
+void cluster_content_trace_wait_set(ClusterContentTraceWait kind, const ClusterWaitTrace *wait)
+{
+	UT_ASSERT_EQ(kind, CLCONTENT_RETRY);
+	retry_trace = *wait; retry_trace_set++;
+}
+void cluster_content_trace_wait_clear(ClusterContentTraceWait kind)
+{ UT_ASSERT_EQ(kind, CLCONTENT_RETRY); retry_trace_clear++; }
+static inline int32 GetPrivateRefCount(Buffer buffer)
+{ (void)buffer; return retry_private_pins; }
 int NLocBuffer = 0;
 ClusterXnodeProfileShared *ClusterXnodeProfileCtl = NULL;
 bool cluster_xnode_profile_enabled = false;
@@ -760,6 +778,7 @@ ResetLatch(Latch *latch)
 int
 WaitLatch(Latch *latch, int wake_events, long timeout, uint32 wait_event)
 {
+	if (retry_trace_throw) siglongjmp(*PG_exception_stack, 1);
 	UT_ASSERT(latch == MyLatch);
 	UT_ASSERT((wake_events & (WL_TIMEOUT | WL_EXIT_ON_PM_DEATH))
 			  == (WL_TIMEOUT | WL_EXIT_ON_PM_DEATH));
@@ -768,7 +787,8 @@ WaitLatch(Latch *latch, int wake_events, long timeout, uint32 wait_event)
 		UT_ASSERT_EQ(wait_event, WAIT_EVENT_PCM_BLOCK_CONVERT_WAIT);
 		UT_ASSERT(!capacity_content_held);
 		UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
-		UT_ASSERT_EQ(pg_atomic_read_u32(&capacity_buffer.state) & BM_LOCKED, 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&capacity_buffer.state) & BM_LOCKED,
+			retry_trace_header_busy ? BM_LOCKED : 0);
 	} else {
 		long factor = timeout / cluster_gcs_block_retransmit_initial_backoff_ms;
 
@@ -826,6 +846,10 @@ ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(),
 		route_test_epoch++;
 	return false;
 }
+
+void
+ConditionVariableSleep(ConditionVariable *cv, uint32 event)
+{ (void)cv; (void)event; UT_ASSERT(false); }
 
 bool
 ConditionVariableCancelSleep(void)
@@ -7550,10 +7574,59 @@ UT_TEST(test_internal_origin_refusals_do_not_enter_backend_reply_table)
 	}
 }
 
+UT_TEST(test_native_retry_trace_samples_owner_generation_and_clears)
+{
+	ClusterPcmOwnEntry own;
+
+	ClusterPcmOwnEntry *saved_own = ClusterPcmOwnArray;
+
+	int saved_buffers = NBuffers;
+	bool refused = false;
+	unsigned before_set = retry_trace_set, before_clear = retry_trace_clear;
+	sigjmp_buf stack;
+	sigjmp_buf *saved_stack = PG_exception_stack;
+	bool caught = false;
+
+	memset(&own, 0, sizeof(own));
+	ClusterPcmOwnArray = &own; NBuffers = 1;
+	capacity_buffer.tag = (BufferTag){.spcOid=1,.dbOid=2,.relNumber=3,.forkNum=SPACE_FORKNUM,.blockNum=1};
+	pg_atomic_init_u32(&capacity_buffer.state, BM_TAG_VALID);
+	pg_atomic_init_u64(&own.generation, 37);
+	pg_atomic_init_u64(&own.reservation_token, 38);
+	cluster_trace_tx_identity = true; retry_private_pins = 1;
+	capacity_wait_active = true; capacity_content_held = false; capacity_gate_open = true;
+	retry_latch_cancel = false; retry_latch_epoch_drift = false; sync_forward_terminate = false;
+	cluster_bufmgr_resource_x_wait_retry(&capacity_buffer.content_lock, 0, 0, &refused);
+	UT_ASSERT_EQ(retry_trace_set, before_set+1); UT_ASSERT_EQ(retry_trace_clear, before_clear+1);
+	UT_ASSERT(retry_trace.tag_known); UT_ASSERT(retry_trace.entry_known);
+	UT_ASSERT_EQ(retry_trace.own_generation, 37); UT_ASSERT_EQ(retry_trace.reservation, 38);
+	UT_ASSERT_EQ(retry_trace.tag.blockNum, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&capacity_buffer.state), BM_TAG_VALID);
+	retry_private_pins = 0;
+	cluster_bufmgr_resource_x_wait_retry(&capacity_buffer.content_lock, 0, 0, &refused);
+	UT_ASSERT(!retry_trace.tag_known); UT_ASSERT(retry_trace.entry_known);
+	pg_atomic_write_u32(&capacity_buffer.state, BM_TAG_VALID | BM_LOCKED);
+	retry_trace_header_busy = true;
+	cluster_bufmgr_resource_x_wait_retry(&capacity_buffer.content_lock, 0, 0, &refused);
+	UT_ASSERT(!retry_trace.entry_known); UT_ASSERT(!retry_trace.tag_known);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&capacity_buffer.state), BM_TAG_VALID | BM_LOCKED);
+	retry_trace_header_busy = false;
+	pg_atomic_write_u32(&capacity_buffer.state, BM_TAG_VALID);
+	retry_trace_throw = true; PG_exception_stack = &stack;
+	if (sigsetjmp(stack, 0) == 0)
+		cluster_bufmgr_resource_x_wait_retry(&capacity_buffer.content_lock, 0, 0, &refused);
+	else caught = true;
+	PG_exception_stack = saved_stack; retry_trace_throw = false;
+	UT_ASSERT(caught); UT_ASSERT_EQ(retry_trace_clear, before_clear+4);
+	cluster_trace_tx_identity = false; capacity_wait_active = false;
+	ClusterPcmOwnArray = saved_own; NBuffers = saved_buffers;
+}
+
 int
 main(void)
 {
-	UT_PLAN(156);
+	UT_PLAN(157);
+	UT_RUN(test_native_retry_trace_samples_owner_generation_and_clears);
 	UT_RUN(test_current_mx_updater_precommit_final_release_failure_is_unknown);
 	UT_RUN(test_current_mx_origin_retry_keeps_unknown_release_and_deadline_fences);
 	UT_RUN(test_current_mx_precommit_origin_releases_before_retry);
