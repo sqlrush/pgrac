@@ -28,6 +28,12 @@ int control_fixture_main(int argc, char **argv);
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_relmap_lock.h"
+#include "cluster/cluster_relmap_authority.h"
+#include "cluster/cluster_sinval.h"
+#include "cluster/cluster_conf.h"
+#include "test_cluster_relmap_native_clog.h"
+#include "test_cluster_relmap_native_storage.h"
+#include "test_cluster_relmap_original_scope.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
 #include "utils/relmapper.h"
@@ -35,6 +41,16 @@ int control_fixture_main(int argc, char **argv);
 /* This retained-WAL fixture grants no physical execution census ownership. */
 bool cluster_shared_catalog;
 static bool relmap_root_merger, relmap_root_namespace_x;
+static bool cold_native_real_clog, cold_native_real_scope;
+static bool cold_native_real_storage;
+static void cold_original_scope_setup(void);
+static void cold_original_scope_done(void);
+static void cold_original_protection_setup(void);
+static void cold_original_authority_postwrite(void);
+static bool cold_original_cohort_bind(RfSideOnlinePlanV1 *plan,
+									const ClusterWalSourceRef *selected);
+static size_t cold_original_terminal_payload(bool aborted, uint16 thread, uint8 *out);
+static TestRelmapNativeClogStats cold_native_clog_last;
 bool
 cluster_recovery_merge_claim_is_held(void)
 {
@@ -2174,10 +2190,21 @@ terminal_prefix_fixture(bool aborting, unsigned fault)
 	ControlFileData native = { 0 };
 	ClusterWalInputsV1 *inputs = NULL;
 	TimestampTz timestamp = 123;
+	uint8 native_terminal[sizeof(xl_xact_commit) + sizeof(xl_xact_xinfo)
+		+ sizeof(xl_xact_scn) + sizeof(xl_xact_tt_commit)];
+	const void *terminal_data = &timestamp;
+	size_t terminal_bytes = sizeof(timestamp);
+	uint8 terminal_info = aborting ? XLOG_XACT_ABORT : XLOG_XACT_COMMIT;
 	WalTestRecord terminal, checkpoint, tail;
 	XLogRecPtr lower, at;
 	char path[MAXPGPATH];
 	inputs_closed_wal_fixture(bytes, anchors);
+	if (cold_native_real_scope) {
+		terminal_bytes = cold_original_terminal_payload(aborting, a->identity.origin_thread_id,
+			native_terminal);
+		terminal_data = native_terminal;
+		terminal_info |= XLOG_XACT_HAS_INFO;
+	}
 	a->checkpoint_copy.nextXid = FullTransactionIdFromU64(custody_next_override != 0
 		? custody_next_override
 		: U64FromFullTransactionId(a->checkpoint_copy.nextXid) + custody_era_offset);
@@ -2185,7 +2212,7 @@ terminal_prefix_fixture(bool aborting, unsigned fault)
 		cluster_control_root_v3_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &root), 0);
 	snapshot = &root.records[0];
 	lower = snapshot->checkpoint_lower_lsn;
-	at = lower + MAXALIGN(SizeOfXLogRecord + 2 + sizeof(timestamp));
+	at = lower + MAXALIGN(SizeOfXLogRecord + 2 + terminal_bytes);
 	if (fault >= 29 && fault <= 32)
 		at += MAXALIGN(SizeOfXLogRecord + 5 + MinSizeOfRelmapUpdate + sizeof(RelMapFile));
 	if (fault == 4 || fault == 5 || fault == 6)
@@ -2227,8 +2254,7 @@ terminal_prefix_fixture(bool aborting, unsigned fault)
 									   payload, sizeof(payload));
 		custody_image.pending_owner.wal_end = pending.exclusive_end;
 		terminal = terminal_test_record(&source, pending.exclusive_end, pending.record_start,
-										RM_XACT_ID, aborting ? XLOG_XACT_ABORT : XLOG_XACT_COMMIT,
-										99, &timestamp, sizeof(timestamp));
+										RM_XACT_ID, terminal_info, 99, terminal_data, terminal_bytes);
 	} else if (fault == 14 || fault == 28) {
 		int page = 0;
 		xl_clog_truncate trunc = { .pageno = 0, .oldestXact = 80, .oldestXactDb = 123 };
@@ -2371,6 +2397,8 @@ cluster_undo_recovery_cold_source_matches_v1(const ClusterWalSourceRef *source,
 											 const ClusterControlRootSnapshot *checkpoint,
 											 XLogRecPtr native_redo)
 {
+	if (cold_native_real_scope)
+		return test_relmap_scope_source_matches(source, checkpoint, native_redo);
 	prefix_base_scope_checks++;
 	return prefix_base_fault != 1 && !(prefix_base_fault == 9 && prefix_base_scope_checks > 1)
 		   && memcmp(source, &prefix_base_expected.source, sizeof(*source)) == 0
@@ -2383,6 +2411,8 @@ cluster_undo_recovery_cold_scope_id_v1(const ClusterWalSourceRef *source,
 									   const ClusterControlRootSnapshot *checkpoint,
 									   XLogRecPtr native_redo)
 {
+	if (cold_native_real_scope)
+		return test_relmap_scope_id(source, checkpoint, native_redo);
 	if (++custody_scope_reads == custody_scope_error_after)
 		ereport(ERROR, (errmsg("injected original scope identity ERROR")));
 	if (custody_scope_reads == origin_build_scope_change_after)
@@ -2399,6 +2429,8 @@ cluster_undo_recovery_cold_terminal_count_v1(const ClusterWalSourceRef *source,
 											 const ClusterControlRootSnapshot *checkpoint,
 											 XLogRecPtr redo, uint64 serial)
 {
+	if (cold_native_real_scope)
+		return test_relmap_scope_terminal_count(source, checkpoint, redo, serial);
 	custody_inventory_calls++;
 	if (custody_inventory_fault == 8)
 		ereport(ERROR, (errmsg("injected original inventory ERROR")));
@@ -2424,6 +2456,8 @@ cluster_undo_recovery_cold_terminal_matches_v1(const ClusterWalSourceRef *source
 											   const XLogReaderState *reader)
 {
 	TransactionId xid = reader != NULL ? XLogRecGetXid(reader) : 0;
+	if (cold_native_real_scope)
+		return test_relmap_scope_terminal_matches(source, checkpoint, redo, serial, reader);
 	custody_terminal_calls++;
 	if (custody_terminal_fault == 2 || (custody_inventory_fault == 7 && xid == 98))
 		ereport(ERROR, (errmsg("injected original terminal source ERROR")));
@@ -2445,6 +2479,8 @@ cluster_clog_native_recovery_base_read_v1(int origin, TransactionId xid,
 										  ClusterClogNativeBaseV1 *out)
 {
 	prefix_base_reads++;
+	if (cold_native_real_clog)
+		return test_relmap_native_clog_read(origin, xid, out, PG_exception_stack);
 	memset(out, 0, sizeof(*out));
 	if (origin == cluster_node_id || prefix_base_fault == 2)
 		return false;
@@ -3375,6 +3411,12 @@ UT_TEST(test_terminal_read_native_error_keeps_output_zero_and_custody_dead)
 #include "test_cluster_relmap_execution_targets.inc"
 #include "test_cluster_relmap_execution_observe.inc"
 #include "test_cluster_relmap_census_open.inc"
+#include "test_cluster_relmap_cold_native.inc"
+#include "test_cluster_relmap_original_scope.inc"
+#include "test_cluster_relmap_original_authority.inc"
+#include "test_cluster_relmap_original_cohort.inc"
+#include "test_cluster_relmap_native_file.inc"
+#include "test_cluster_relmap_original_storage.inc"
 
 int
 main(int argc, char **argv)
@@ -3383,7 +3425,32 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(112);
+	UT_PLAN(137);
+	UT_RUN(test_cold_original_storage_full_native_chain_and_fd_custody);
+	UT_RUN(test_cold_original_storage_rejects_unqualified_sentinel_before_native);
+	UT_RUN(test_cold_original_storage_midread_change_and_error_preserve_pending);
+	UT_RUN(test_cold_native_replaced_file_refuses_before_pair_write);
+	UT_RUN(test_cold_native_replaced_file_after_pair_sync_keeps_debt);
+	UT_RUN(test_cold_native_replaced_file_permanently_invalidates_old_handle);
+	UT_RUN(test_cold_cohort_other_origins_preserve_selected_consumer);
+	UT_RUN(test_cold_cohort_same_origin_generations_refuse_before_native);
+	UT_RUN(test_cold_cohort_foreign_pending_requires_original_directory);
+	UT_RUN(test_cold_original_authority_rejects_broken_provenance_before_storage);
+	UT_RUN(test_cold_original_authority_postwrite_loss_keeps_original_debt);
+	UT_RUN(test_cold_original_authority_late_provider_refusal_or_error_keeps_pending);
+	UT_RUN(test_cold_original_scope_native_commit_abort);
+	UT_RUN(test_cold_original_scope_reentry_rejects_old_cursor);
+	UT_RUN(test_cold_original_scope_refuses_non_cold_or_stale_owner);
+	UT_RUN(test_cold_native_actual_clog_commit_abort_and_full_page);
+	UT_RUN(test_cold_native_actual_clog_missing_short_and_io_failures);
+	UT_RUN(test_cold_native_actual_clog_late_base_change_or_error);
+	UT_RUN(test_cold_native_commit_abort_actual_pair_and_fresh_committed);
+	UT_RUN(test_cold_native_clean_does_not_read_clog_or_write_pairs);
+	UT_RUN(test_cold_native_unknown_and_native_error_keep_pending);
+	UT_RUN(test_cold_native_each_sync_cut_returns_no_observation_or_retry);
+	UT_RUN(test_cold_native_postwrite_scope_loss_or_error_keeps_original_debt);
+	UT_RUN(test_cold_committed_original_wal_factory_and_all_physical_namespaces);
+	UT_RUN(test_cold_committed_original_wal_source_and_other_namespace_drift_refuse);
 	UT_RUN(test_census_open_original_wal_physical_pairs_and_owned_fd);
 	UT_RUN(test_census_open_initial_gates_output_and_budgets);
 	UT_RUN(test_census_open_checkpoint_refusal_and_error_cleanup);

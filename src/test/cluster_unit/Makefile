@@ -603,12 +603,15 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
 		test_cluster_relmap_census_recovery.inc \
 		test_cluster_relmap_census_batch.inc \
+		test_cluster_relmap_census_all_pins.inc \
 		test_cluster_relmap_census_cold.inc \
 		test_cluster_relmap_census_cold_consume.inc \
 		test_cluster_relmap_census_cold_reobserve.inc \
 		test_cluster_relmap_census_cold_restart.inc \
 		test_cluster_relmap_census_execution_batch.inc \
 		test_cluster_relmap_census_cold_initial.inc \
+		test_cluster_relmap_census_execute.inc \
+		test_cluster_relmap_census_committed_cold.inc \
 		test_cluster_recovery_root_reobserve.inc \
 		test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c \
 		test_cluster_recovery_crypto_boundary.h unit_test.h \
@@ -662,6 +665,7 @@ test_cluster_relmap_retention_census_product.o: $(top_srcdir)/src/backend/cluste
 test_cluster_relmap_census_side: test_cluster_relmap_retention_census.c \
 		test_cluster_relmap_census_recovery.inc \
 		test_cluster_relmap_census_batch.inc \
+		test_cluster_relmap_census_all_pins.inc \
 		test_cluster_relmap_census_cold.inc \
 		test_cluster_relmap_census_cold_consume.inc \
 		test_cluster_relmap_census_cold_reobserve.inc \
@@ -3928,6 +3932,16 @@ test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
 		test_cluster_relmap_execution_custody.inc \
 		test_cluster_relmap_execution_targets.inc \
 		test_cluster_relmap_execution_observe.inc test_cluster_relmap_census_open.inc \
+		test_cluster_relmap_cold_native.inc \
+		test_cluster_relmap_native_clog.h test_cluster_relmap_native_clog.o \
+		test_cluster_relmap_original_scope.h test_cluster_relmap_original_scope.inc \
+		test_cluster_relmap_original_authority.inc \
+		test_cluster_relmap_original_cohort.inc \
+		test_cluster_relmap_native_file.inc \
+		test_cluster_relmap_original_storage.inc \
+		test_cluster_relmap_native_storage.h test_cluster_relmap_native_storage.o \
+		test_cluster_relmap_original_scope.o test_cluster_relmap_original_authority.o \
+		test_cluster_relmap_retained_arb.o test_cluster_relmap_retained_authority.o \
 		test_cluster_relmap_observation_namespace.o \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o \
@@ -3935,6 +3949,51 @@ test_cluster_relmap_retained_wal: test_cluster_relmap_retained_owner.o \
 		test_cluster_relmap_retained_census.o test_cluster_relmap_pending_product.o \
 		test_cluster_relmap_pending_side_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o
+
+# Original authority tuple checks with isolated lower fixture facilities.
+test_cluster_relmap_original_authority.o: $(top_srcdir)/src/backend/cluster/cluster_thread_recovery_authority.c \
+		test_cluster_relmap_original_authority_namespace.h \
+		$(top_srcdir)/src/include/cluster/cluster_thread_recovery_authority.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		-include test_cluster_relmap_original_authority_namespace.h -c $< -o $@
+
+# Compose the original scope without sharing its controlled authority leaves.
+test_cluster_relmap_original_scope.o: $(top_srcdir)/src/backend/cluster/cluster_undo_recovery.c \
+		test_cluster_relmap_original_scope_namespace.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		-include test_cluster_relmap_original_scope_namespace.h -c $< -o $@
+
+# Compose the cold executor with the actual native arbiter and pair storage.
+test_cluster_relmap_native_storage.o: test_cluster_relmap_native_storage.c \
+		test_cluster_relmap_native_storage.h test_cluster_relmap_native_storage_namespace.h \
+		test_cluster_shared_fs_sharedfs.c test_cluster_data_sync_policy.inc \
+		test_cluster_drop_work_unavailable.h unit_test.h \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_shared_fs_sharedfs.c \
+		$(top_srcdir)/src/include/cluster/storage/cluster_shared_fs.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_relmap_native_clog.o: test_cluster_relmap_native_clog.c \
+		test_cluster_relmap_native_clog.h test_cluster_relmap_native_clog_namespace.h \
+		test_cluster_clog_recovery.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/clog.c \
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/include/access/clog.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_relmap_retained_arb.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_arb.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_arb.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_relmap_retained_authority.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_authority.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
 # Read faults affect only the real namespace reader in this retained-WAL unit.
 test_cluster_relmap_observation_namespace.o: $(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h Makefile
@@ -3991,6 +4050,8 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relma
 		$(top_srcdir)/src/include/cluster/cluster_wal_tail.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_owner.o) \
+		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_arb.o test_cluster_relmap_retained_authority.o) \
+		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_native_clog.o test_cluster_relmap_native_storage.o test_cluster_relmap_original_scope.o test_cluster_relmap_original_authority.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),$(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_census.o test_cluster_relmap_pending_product.o test_cluster_relmap_pending_side_product.o $(top_builddir)/src/backend/cluster/cluster_relmap_retention.o) \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_root_set.o \
@@ -4578,9 +4639,9 @@ test_cluster_control_walr.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_ret
 test_cluster_control_ir_plan.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
 	awk '/^#define CLUSTER_RECOVERY_FENCE_PLAN_MAGIC/ { print; constants++ } \
 	     /^typedef struct ClusterRecoveryFenceOrigin \{/ || /^struct ClusterRecoveryFencePlan \{/ { emit=1; types++ } \
-	     /^(recovery_fence_plan_acquire_serial_inputs|recovery_fence_plan_valid|recovery_fence_plan_release_members|recovery_fence_plan_find_origin|cluster_recovery_merge_fence_plan_acquire_serial|cluster_recovery_merge_fence_plan_acquire_serial_inputs_v1|cluster_recovery_merge_fence_plan_revalidate_nowait|cluster_recovery_merge_fence_plan_authority|cluster_recovery_merge_fence_plan_release_serial|cluster_recovery_merge_fence_plan_destroy)\(/ { print prev; emit=1; count++ } \
+	     /^(recovery_fence_refused|recovery_fence_plan_acquire_serial_inputs|recovery_fence_plan_valid|recovery_fence_plan_release_members|recovery_fence_plan_find_origin|cluster_recovery_merge_fence_plan_acquire_serial|cluster_recovery_merge_fence_plan_acquire_serial_inputs_v1|cluster_recovery_merge_fence_plan_revalidate_nowait|cluster_recovery_merge_fence_plan_authority|cluster_recovery_merge_fence_plan_release_serial|cluster_recovery_merge_fence_plan_destroy)\(/ { print prev; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
-	     END { if (constants != 1 || types != 2 || count != 10) exit 1 }' $< > $@.tmp
+	     END { if (constants != 1 || types != 2 || count != 11) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_control_ir: test_cluster_control_ir.c test_cluster_cf_enqueue.c unit_test.h \
@@ -9232,9 +9293,11 @@ test_cluster_pgproc_active_sample.inc: $(top_srcdir)/src/backend/access/transam/
 	     /^ProcArrayGetActiveFullXidSample\(/ { print "bool"; emit=1; count++ } \
 	     /^ProcArrayEndTransactionInternal\(/ { print "static inline void"; emit=1; count++ } \
 	     /^ProcArrayClearTransaction\(/ { print "void"; emit=1; count++ } \
+	     /^ProcArrayAdd\(/ { print "void"; emit=1; count++ } \
 	     /^MarkAsPreparingGuts\(/ { print "static void"; emit=1; count++ } \
+	     /^MarkAsPrepared\(/ { print "static void"; emit=1; count++ } \
 	     emit { print } /^}$$/ { emit=0 } \
-	     END { if (count != 5 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	     END { if (count != 7 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pgproc_active_sample: test_cluster_pgproc_active_sample.c unit_test.h \
@@ -9288,7 +9351,13 @@ test_cluster_active_sample_fence: test_cluster_active_sample_fence.c unit_test.h
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
 
+test_cluster_worker_pgproc_sample.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
+	@awk '/^ProcArrayGetActiveFullXidSample\(/ { print "bool"; emit=1; starts++ } \
+		emit { print } emit && /^}$$/ { emit=0 } \
+		END { if (emit || starts != 1) exit 1 }' $< > $@
+
 test_cluster_undo_cleaner_capacity: test_cluster_undo_cleaner_capacity.c test_cluster_undo_cleaner_holds.inc \
+		test_cluster_pgproc_active_types.inc test_cluster_worker_pgproc_sample.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c \
 		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
@@ -10121,7 +10190,22 @@ test_cluster_snapshot_admission_vacuum.inc: $(top_srcdir)/src/backend/commands/v
 		if (has_internal) print "static void vac_update_datfrozenxid_internal(void);"; \
 		printf "%s", body }' $< > $@
 
+test_cluster_snapshot_import_xmin.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
+	@awk '/^procarray_snapshot_scn_covered\(/ { print "static bool"; emit=1; starts++ } \
+		/^ProcArrayInstall(Imported|Restored)XminInternal\(/ { print "static bool"; emit=1; starts++ } \
+		/^ProcArrayInstall(Imported|Restored)Xmin(WithReadScn)?\(/ { print "bool"; emit=1; starts++ } \
+		emit { print } emit && /^}$$/ { emit=0 } \
+		END { if (emit || starts != 7) exit 1 }' $< > $@
+
+test_cluster_snapshot_import_compare.inc: $(top_srcdir)/src/backend/access/transam/transam.c Makefile
+	@awk '/^TransactionIdPrecedesOrEquals\(/ { print "bool"; emit=1; starts++ } \
+		emit { print } emit && /^}$$/ { emit=0 } \
+		END { if (emit || starts != 1) exit 1 }' $< > $@
+
 test_cluster_snapshot_admission: test_cluster_snapshot_admission.c unit_test.h \
+		test_cluster_snapshot_import_xmin.inc test_cluster_snapshot_import_compare.inc \
+		$(srcdir)/test_cluster_snapshot_import_fixture.inc \
+		$(srcdir)/test_cluster_snapshot_export_fixture.inc \
 		test_cluster_pgproc_active_types.inc test_cluster_retention_sample.inc \
 		$(top_srcdir)/src/include/cluster/cluster_undo_retention.h $(CLUSTER_UNDO_RETENTION_O) \
 		$(srcdir)/test_cluster_snapshot_vacuum_fixture.inc test_cluster_snapshot_admission_vacuum.inc \
@@ -10129,9 +10213,13 @@ test_cluster_snapshot_admission: test_cluster_snapshot_admission.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe.h \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h $(CLUSTER_XID_STRIPE_O) \
 		$(top_srcdir)/src/backend/utils/time/snapmgr.c $(top_srcdir)/src/include/utils/snapmgr.h \
-		$(top_builddir)/src/backend/lib/pairingheap.o
+		$(top_builddir)/src/backend/lib/pairingheap.o \
+		$(top_builddir)/src/backend/nodes/list.o $(top_builddir)/src/common/stringinfo_srv.o \
+		$(top_builddir)/src/common/psprintf_srv.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(top_builddir)/src/backend/lib/pairingheap.o $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNDO_RETENTION_O) \
+		$(top_builddir)/src/backend/nodes/list.o $(top_builddir)/src/common/stringinfo_srv.o \
+		$(top_builddir)/src/common/psprintf_srv.o \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # PGRAC: execute the real native maintenance entry, with catalogue/I/O leaves.
@@ -10183,6 +10271,12 @@ test_cluster_undo_horizon_sender.inc: $(top_srcdir)/src/backend/cluster/cluster_
 		END { if (!done || starts != 1) exit 1 }' $< > $@
 
 test_cluster_undo_horizon: test_cluster_undo_horizon.c unit_test.h \
+		$(srcdir)/test_cluster_undo_horizon_retention_fixture.inc \
+		test_cluster_pgproc_active_types.inc test_cluster_retention_sample.inc \
+		$(CLUSTER_UNDO_RETENTION_O) \
+		test_cluster_subtrans_watermark.inc $(CLUSTER_XID_STRIPE_O) \
+		$(top_srcdir)/src/include/access/slru.h $(top_srcdir)/src/include/access/subtrans.h \
+		$(top_srcdir)/src/include/cluster/cluster_mode.h $(top_srcdir)/src/include/storage/lwlock.h \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c \
@@ -10195,7 +10289,8 @@ test_cluster_undo_horizon: test_cluster_undo_horizon.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_HORIZON_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c \
-		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_HORIZON_O) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_HORIZON_O) $(CLUSTER_XID_STRIPE_O) \
+		$(CLUSTER_UNDO_RETENTION_O) \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -o $@

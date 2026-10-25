@@ -1,0 +1,13 @@
+/* Isolate only the six cold accessors mocked by the retained-WAL fixture.
+ * The original scope implementation and sealed plan remain unchanged.
+ * Author: SqlRush <sqlrush@gmail.com> */
+#define cluster_undo_recovery_cold_source_matches_v1 test_relmap_scope_source_matches
+#define cluster_undo_recovery_cold_scope_id_v1 test_relmap_scope_id
+#define cluster_undo_recovery_cold_single_source_v1 test_relmap_scope_single_source
+#define cluster_undo_recovery_cold_checkpoint_visit_v1 test_relmap_scope_checkpoint_visit
+#define cluster_undo_recovery_cold_terminal_matches_v1 test_relmap_scope_terminal_matches
+#define cluster_undo_recovery_cold_terminal_count_v1 test_relmap_scope_terminal_count
+/* These leaves do not certify the original external fence or retention. */
+#define cluster_thread_recovery_authority_revalidate_nowait_v1 test_relmap_scope_authority
+#define cluster_shared_fs_get_protected_set_identity test_relmap_scope_storage
+#define cluster_undo_smgr_fd_cache_reset test_relmap_scope_cache_reset

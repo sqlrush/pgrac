@@ -1150,6 +1150,7 @@ cluster_clog_native_recovery_base_read_v1(int origin, TransactionId xid,
 	result.origin = origin;
 	result.xid = xid;
 	result.page_number = page;
+	result.file = (ClusterClogNativeFileV1){ before.st_dev, before.st_ino, before.st_size };
 	memcpy(result.image, readback.data, BLCKSZ);
 	*out = result;
 	return true;

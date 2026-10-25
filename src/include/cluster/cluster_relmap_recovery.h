@@ -59,8 +59,10 @@ typedef struct ClusterRelmapRecoverySourceObservationV1 {
 extern bool cluster_relmap_recovery_handle_source_v1(ClusterRelmapRecoveryHandle *handle,
 													 ClusterRelmapRecoverySourceObservationV1 *out);
 /* Exact full namespace/view, original-round current checks and an unchanged
- * internally reread native base fingerprint. Page drift (even another slot)
- * conservatively refuses this snapshot; false is not rollback/retry permission.
+ * internally reread native base fingerprint and native device/inode/size.
+ * File replacement or page drift (even another slot) refuses this snapshot;
+ * these local observations do not prove retained lifetime or exclude inode
+ * reuse. False is not rollback/retry permission.
  * Refusal
  * or ERROR after entry is sticky; overlapping inputs are unchanged and do
  * not invalidate custody. No terminal/COMPLETE/release permission. */

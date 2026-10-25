@@ -49,6 +49,17 @@ extern Snapshot GetSnapshotData(Snapshot snapshot);
 extern bool ProcArrayInstallImportedXmin(TransactionId xmin,
 										 VirtualTransactionId *sourcevxid);
 extern bool ProcArrayInstallRestoredXmin(TransactionId xmin, PGPROC *proc);
+#ifdef USE_PGRAC_CLUSTER
+/* Finite history handoff: source xmin AND its published read-SCN protection
+ * must cover the requested point under the original install lock. Refusal
+ * preserves receiver xmin/status/SCN; success clears its old SCN until original
+ * snapmgr registration publishes the actual imported point. These wrappers
+ * do not qualify global F/H or grant freeze/retention-release authority. */
+extern bool ProcArrayInstallImportedXminWithReadScn(TransactionId xmin,
+													VirtualTransactionId *sourcevxid, SCN read_scn);
+extern bool ProcArrayInstallRestoredXminWithReadScn(TransactionId xmin,
+													PGPROC *proc, SCN read_scn);
+#endif
 
 extern RunningTransactions GetRunningTransactionData(void);
 

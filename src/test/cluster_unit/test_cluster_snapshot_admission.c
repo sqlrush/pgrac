@@ -31,9 +31,19 @@ MemoryContext TopTransactionContext = (MemoryContext)1;
 MemoryContext CurrentMemoryContext = (MemoryContext)1;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
-static PGPROC proc;
+static PGPROC snapshot_procs[2];
+#define proc snapshot_procs[0]
 static PGPROC *allProcs = &proc;
 static ProcArrayStruct *procArray;
+PROC_HDR *ProcGlobal;
+static PROC_HDR snapshot_proc_header;
+static uint8 snapshot_status_flags[2];
+static bool import_install_active, import_restored, import_probe_after_install;
+static bool import_gap_refused, import_gap_xmin_installed;
+static bool import_observe_install;
+static SCN import_scn_at_unlock;
+static LWLockMode import_install_mode;
+static void snapshot_import_after_procarray_unlock(void);
 static bool retention_lock, retention_probe_before_publish, retention_gap_refused;
 static unsigned retention_acquires, retention_releases, retention_clocks;
 static unsigned remembered;
@@ -763,7 +773,10 @@ UT_TEST(cr_identity_restore_and_snapshot_refresh_start_new_lifetimes)
 
 /* PGRAC: catalogue I/O leaves around the real maintenance entry and snapshots. */
 #include "test_cluster_snapshot_vacuum_fixture.inc"
+#undef proc
 #include "test_cluster_retention_sample.inc"
+#include "test_cluster_snapshot_import_xmin.inc"
+#define proc snapshot_procs[0]
 
 /* Use the actual catalog getter, pairing heap, publisher and invalidation;
  * GetSnapshotData supplies controlled source fields through the existing
@@ -856,6 +869,9 @@ catalog_history_sample(ClusterUndoRetentionSample *sample)
 	UT_ASSERT(!retention_lock);
 	return valid;
 }
+
+#include "test_cluster_snapshot_import_fixture.inc"
+#include "test_cluster_snapshot_export_fixture.inc"
 
 UT_TEST(catalog_original_publication_completes_the_real_h_sample)
 {
@@ -958,6 +974,84 @@ UT_TEST(original_catalog_pin_cannot_supply_a_missing_finite_clock)
 	snapshot_clock = 100;
 }
 
+UT_TEST(mixed_registered_sources_cannot_hide_unqualified_h)
+{
+	const SCN unknown[] = { InvalidScn, (SCN) UINT64_MAX };
+
+	for (unsigned variant = 0; variant < lengthof(unknown); variant++)
+	{
+		for (unsigned reverse = 0; reverse < 2; reverse++)
+		{
+			ClusterUndoRetentionSample sample, rejected, zero = { 0 };
+			Snapshot finite, unqualified;
+			SCN published;
+			bool refused;
+
+			/* The original native xmin remains installed throughout this cut. */
+			proc.xmin = 10;
+			finite = reverse ? NULL : registered(40);
+			unqualified = registered(unknown[variant]);
+			if (reverse)
+				finite = registered(40);
+			published = pg_atomic_read_u64(&proc.cluster_read_scn_atomic);
+			memset(&rejected, 0xa5, sizeof(rejected));
+			refused = !catalog_history_sample(&rejected);
+			/* Clean up before assertions so exact-parent RED stays isolated. */
+			UnregisterSnapshot(unqualified);
+			UT_ASSERT(catalog_history_sample(&sample));
+			UT_ASSERT_EQ(sample.horizon_scn, 40);
+			UnregisterSnapshot(finite);
+			UT_ASSERT(catalog_history_sample(&sample));
+			UT_ASSERT_EQ(sample.horizon_scn, 100);
+			UT_ASSERT_EQ(published, unknown[variant]);
+			UT_ASSERT(refused);
+			UT_ASSERT_EQ(memcmp(&rejected, &zero, sizeof(rejected)), 0);
+		}
+	}
+}
+
+UT_TEST(mixed_active_sources_cannot_hide_unqualified_h)
+{
+	const SCN unknown[] = { InvalidScn, (SCN) UINT64_MAX };
+
+	for (unsigned variant = 0; variant < lengthof(unknown); variant++)
+	{
+		for (unsigned reverse = 0; reverse < 2; reverse++)
+		{
+			SnapshotData finite = { 0 }, unqualified;
+			ClusterUndoRetentionSample sample, zero = { 0 }, rejected;
+			SCN published;
+			bool refused, remaining_known;
+
+			finite.snapshot_type = SNAPSHOT_MVCC;
+			finite.xmin = 10;
+			finite.xmax = 20;
+			finite.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+			finite.read_epoch = 7;
+			finite.read_scn = 40;
+			unqualified = finite;
+			unqualified.read_scn = unknown[variant];
+			proc.xmin = 10;
+			PushActiveSnapshot(reverse ? &unqualified : &finite);
+			PushActiveSnapshot(reverse ? &finite : &unqualified);
+			published = pg_atomic_read_u64(&proc.cluster_read_scn_atomic);
+			memset(&rejected, 0xa5, sizeof(rejected));
+			refused = !catalog_history_sample(&rejected);
+			PopActiveSnapshot();
+			remaining_known = catalog_history_sample(&sample);
+			PopActiveSnapshot();
+			UT_ASSERT_EQ(published, unknown[variant]);
+			UT_ASSERT(refused);
+			UT_ASSERT_EQ(memcmp(&rejected, &zero, sizeof(rejected)), 0);
+			UT_ASSERT_EQ(remaining_known, !reverse);
+			if (!reverse)
+				UT_ASSERT_EQ(sample.horizon_scn, 40);
+			UT_ASSERT(catalog_history_sample(&sample));
+			UT_ASSERT_EQ(sample.horizon_scn, 100);
+		}
+	}
+}
+
 UT_TEST(original_registered_nonfinite_reader_keeps_h_unqualified_until_retirement)
 {
 	ClusterUndoRetentionSample sample, zero = { 0 };
@@ -978,20 +1072,42 @@ main(void)
 {
 	MyProc = &proc;
 	proc.pid = 1234;
-	procArray = calloc(1, sizeof(ProcArrayStruct) + sizeof(int));
+	procArray = calloc(1, sizeof(ProcArrayStruct) + 2 * sizeof(int));
 	if (procArray == NULL)
 		abort();
-	procArray->maxProcs = procArray->numProcs = 1;
+	procArray->maxProcs = 2;
+	procArray->numProcs = 1;
 	procArray->pgprocnos[0] = 0;
+	procArray->pgprocnos[1] = 1;
+	ProcGlobal = &snapshot_proc_header;
+	ProcGlobal->statusFlags = snapshot_status_flags;
 	pg_atomic_init_u64(&proc.cluster_read_scn_atomic, 0);
 	UndoHorizonShmem = &horizon;
 	pg_atomic_init_u64(&horizon.self_admitted_epoch, 8);
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(70);
+	UT_PLAN(88);
+	UT_RUN(export_original_registration_publishes_h_before_file_visibility);
+	UT_RUN(export_original_registration_preserves_other_older_snapshot);
+	UT_RUN(export_errors_retain_original_h_until_transaction_cleanup);
+	UT_RUN(imported_snapshot_original_xmin_handoff_survives_source_exit);
+	UT_RUN(imported_xmin_does_not_borrow_the_receivers_previous_scn);
+	UT_RUN(restored_xmin_does_not_borrow_the_receivers_previous_scn);
+	UT_RUN(refused_xmin_install_preserves_the_receivers_original_scn);
+	UT_RUN(restored_snapshot_original_xmin_handoff_survives_source_exit);
+	UT_RUN(imported_finite_history_requires_original_source_scn_coverage);
+	UT_RUN(restored_finite_history_requires_original_source_scn_coverage);
+	UT_RUN(original_native_xmin_contract_and_older_source_protection_remain);
+	UT_RUN(parallel_serialized_snapshot_retains_original_handoff);
+	UT_RUN(parallel_serialized_unknown_history_cannot_borrow_clock);
+	UT_RUN(parallel_serialized_copy_cannot_replace_original_source_admission);
+	UT_RUN(imported_snapshot_rejects_missing_or_unprotected_original_source);
+	UT_RUN(restored_snapshot_rejects_unprotected_original_source);
 	UT_RUN(original_catalog_pin_cannot_supply_a_missing_finite_clock);
 	UT_RUN(original_registered_nonfinite_reader_keeps_h_unqualified_until_retirement);
+	UT_RUN(mixed_registered_sources_cannot_hide_unqualified_h);
+	UT_RUN(mixed_active_sources_cannot_hide_unqualified_h);
 	UT_RUN(catalog_original_publication_completes_the_real_h_sample);
 	UT_RUN(catalog_h_sample_preserves_other_original_snapshot_protection);
 	UT_RUN(catalog_actual_retirement_releases_only_its_original_h_pin);

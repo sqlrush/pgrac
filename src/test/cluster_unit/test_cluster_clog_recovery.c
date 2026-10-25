@@ -58,6 +58,7 @@ static LWLockPadded own_main_locks[NUM_INDIVIDUAL_LWLOCKS];
 static bool native_fixture, native_corrupt, native_short;
 static unsigned native_wal_flushes, native_sync_requests;
 static bool authority = true, revoke_on_lock, expect_error, fail_open, fail_sync, fail_dirsync;
+static bool (*fixture_cold_origin)(int);
 static bool c0_authority;
 static bool revoke_after_read, revoke_after_sync;
 static unsigned base_sync_mutation;
@@ -163,7 +164,8 @@ AbsorbSyncRequests(void)
 bool
 cluster_undo_recovery_cold_origin_authorized_v1(int origin)
 {
-	return authority && origin == 1;
+	return authority && origin == fixture_origin
+		&& (fixture_cold_origin == NULL || fixture_cold_origin(origin));
 }
 bool
 cluster_undo_recovery_abort_clog_authorized_v1(int origin, TransactionId xid)
@@ -1501,6 +1503,8 @@ native_base_reads_complete_selected_origin_page_without_mutation(void)
 	for (unsigned aborted = 0; aborted < 2; ++aborted) {
 		ClusterClogNativeBaseV1 out;
 		PGAlignedBlock expected = { 0 };
+		struct stat observed;
+		char path[MAXPGPATH];
 		XidStatus status = aborted ? TRANSACTION_STATUS_ABORTED : TRANSACTION_STATUS_COMMITTED;
 		unsigned before_writes = writes, before_syncs = syncs, before_dirs = dirsyncs;
 		expected.data[BLCKSZ - 1] = 0x5a;
@@ -1513,6 +1517,10 @@ native_base_reads_complete_selected_origin_page_without_mutation(void)
 		UT_ASSERT_EQ(out.xid, 100);
 		UT_ASSERT_EQ(out.page_number, 0);
 		UT_ASSERT_EQ(out.status, status);
+		fixture_path(0, path);
+		UT_ASSERT_EQ(lstat(path, &observed), 0);
+		UT_ASSERT(out.file.device == observed.st_dev && out.file.inode == observed.st_ino
+				  && out.file.size == observed.st_size);
 		UT_ASSERT(memcmp(out.image, expected.data, BLCKSZ) == 0);
 		UT_ASSERT_EQ(writes, before_writes);
 		UT_ASSERT(syncs > before_syncs && dirsyncs > before_dirs);

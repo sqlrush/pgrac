@@ -600,6 +600,67 @@ UT_TEST(cold_plan_stale_pin_or_mismatched_snapshot_never_exports_authority)
 	cold_pin_cleanup(&plan);
 }
 
+UT_TEST(cold_plan_trace_names_the_original_acquire_failure_without_releasing_it)
+{
+	const char *stages[] = { "stage=pin_request", "stage=pin_acquire", "stage=pin_bind",
+							"stage=serial_acquire" };
+
+	for (unsigned enabled = 0; enabled < 2; enabled++)
+		for (unsigned fault = 0; fault < lengthof(stages); fault++) {
+			ClusterRecoveryFencePlan *plan = cold_pin_plan(2);
+
+			cluster_trace_control_config = enabled;
+			g_capture_log = true;
+			g_cold_fence_log[0] = '\0';
+			g_cold_fence_logs = 0;
+			if (fault == 0)
+				plan->origins[1].root_snapshot.tail_tli++;
+			if (fault == 1)
+				pin_available = false;
+			if (fault == 2)
+				pin_bind_ok = false;
+			if (fault == 3)
+				ir_unavailable_thread = 1;
+			UT_ASSERT(!cluster_recovery_merge_fence_plan_acquire_serial(plan));
+			UT_ASSERT(!plan->serial_held);
+			UT_ASSERT(!plan->committed);
+			UT_ASSERT_EQ(g_cold_fence_logs, enabled);
+			if (enabled)
+				UT_ASSERT(strstr(g_cold_fence_log, stages[fault]) != NULL);
+			UT_ASSERT_EQ(pin_acquire_calls, fault == 0 ? 0 : 1);
+			UT_ASSERT_EQ(pin_bind_calls, fault == 2 ? 1 : 0);
+			UT_ASSERT_EQ(pin_release_calls, 0);
+			if (fault >= 2)
+				UT_ASSERT(plan->retention_pin != NULL);
+			ir_unavailable_thread = 0;
+			cluster_trace_control_config = g_capture_log = false;
+			cold_pin_cleanup(&plan);
+		}
+}
+
+UT_TEST(cold_plan_trace_reports_actual_pin_revalidation_without_new_ir)
+{
+	ClusterRecoveryFencePlan *plan = cold_pin_plan(2);
+
+	cluster_trace_control_config = g_capture_log = true;
+	g_cold_fence_logs = 0;
+	UT_ASSERT(cluster_recovery_merge_fence_plan_acquire_serial(plan));
+	UT_ASSERT(cluster_recovery_merge_fence_plan_revalidate_nowait(plan));
+	UT_ASSERT_EQ(g_cold_fence_logs, 0);
+	pin_current = false;
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_revalidate_nowait(plan));
+	UT_ASSERT_EQ(g_cold_fence_logs, 1);
+	UT_ASSERT(strstr(g_cold_fence_log, "stage=revalidate_pin") != NULL);
+	UT_ASSERT_EQ(pin_acquire_calls, 1);
+	UT_ASSERT_EQ(pin_bind_calls, 1);
+	UT_ASSERT_EQ(pin_release_calls, 0);
+	UT_ASSERT_EQ(plan->serial_guards.count, 2);
+	UT_ASSERT(plan->serial_held);
+	UT_ASSERT(!plan->committed);
+	cluster_trace_control_config = g_capture_log = false;
+	cold_pin_cleanup(&plan);
+}
+
 int
 main(void)
 {
@@ -612,7 +673,7 @@ main(void)
 	retire_driver = cluster_control_request_driver_start();
 	cluster_shared_config = true;
 	MyBackendType = B_LMON; /* Nonblocking release; ACKs are explicit above. */
-	UT_PLAN(13);
+	UT_PLAN(15);
 	UT_RUN(ir_copied_set_compacts_without_losing_cleanup_owner);
 	UT_RUN(ir_failed_s5_outlives_stack_without_becoming_a_holder);
 	UT_RUN(ir_old_guard_is_unusable_during_rebind_but_still_releasable);
@@ -626,6 +687,8 @@ main(void)
 	UT_RUN(cold_plan_uncertain_pin_acquire_keeps_cleanup_owner);
 	UT_RUN(cold_plan_authority_borrows_exact_owners_only_after_commit);
 	UT_RUN(cold_plan_stale_pin_or_mismatched_snapshot_never_exports_authority);
+	UT_RUN(cold_plan_trace_names_the_original_acquire_failure_without_releasing_it);
+	UT_RUN(cold_plan_trace_reports_actual_pin_revalidation_without_new_ir);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

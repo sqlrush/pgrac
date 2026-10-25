@@ -75,6 +75,76 @@ census_open_drain(ClusterRelmapRetentionCensus *census, unsigned *images)
 	return result;
 }
 
+/* Real original checkpoint/WAL, target union, held fd and physical pairs;
+ * the finished consumer obtains no caller-created source or map. */
+UT_TEST(test_cold_committed_original_wal_factory_and_all_physical_namespaces)
+{
+	ClusterRelmapRetentionCensus *census = NULL;
+	unsigned images;
+	const Oid dbids[] = { InvalidOid, 70001, 42, InvalidOid };
+	census_open_setup();
+	UT_ASSERT(census_open(&census));
+	UT_ASSERT_EQ(census_open_drain(census, &images), CLUSTER_RELMAP_CENSUS_DRAINED);
+	for (unsigned i = 0; i < lengthof(dbids); i++) {
+		ClusterRelmapCensusCommitted out;
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT(cluster_relmap_retention_census_committed_cold(census, dbids[i], &out));
+		UT_ASSERT(out.present && out.identity.dbid == dbids[i]
+				  && out.identity.shared == (dbids[i] == InvalidOid));
+		UT_ASSERT_EQ(out.identity.system_identifier, TEST_SYSID);
+		UT_ASSERT_EQ(out.identity.database_incarnation,
+					 prefix_base_expected.source.claim.database_incarnation);
+		UT_ASSERT_EQ(out.generation, 1);
+		UT_ASSERT_EQ(out.map.num_mappings, 1);
+		UT_ASSERT_EQ(out.map.mappings[0].mapoid, 1247);
+		UT_ASSERT_EQ(out.map.mappings[0].mapfilenumber, 81234);
+		UT_ASSERT(fcntl(execution_root_fd, F_GETFD) >= 0);
+	}
+	census_open_done(census);
+}
+
+UT_TEST(test_cold_committed_original_wal_source_and_other_namespace_drift_refuse)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterRelmapRetentionCensus *census = NULL;
+		ClusterRelmapCensusCommitted out, zero = { 0 };
+		unsigned images;
+		volatile bool accepted = false, threw = false;
+		census_open_setup();
+		UT_ASSERT(census_open(&census));
+		UT_ASSERT_EQ(census_open_drain(census, &images), CLUSTER_RELMAP_CENSUS_DRAINED);
+		if (fault == 0)
+			custody_scope++;
+		if (fault == 1) {
+			int fd = open(test_root, O_RDONLY | O_DIRECTORY);
+			UT_ASSERT(fd >= 0);
+			UT_ASSERT_EQ(unlinkat(fd, census_open_paths[5], 0), 0);
+			UT_ASSERT_EQ(close(fd), 0);
+		}
+		if (fault == 2)
+			custody_scope_error_after = custody_scope_reads + 1;
+		memset(&out, 0xa5, sizeof(out));
+		test_capture_error_level = true;
+		PG_TRY();
+		{
+			accepted = cluster_relmap_retention_census_committed_cold(census, InvalidOid, &out);
+		}
+		PG_CATCH();
+		{
+			threw = true;
+		}
+		PG_END_TRY();
+		test_capture_error_level = false;
+		custody_scope_error_after = 0; /* Also disarm when the parent has no reader. */
+		UT_ASSERT(!accepted && memcmp(&out, &zero, sizeof(out)) == 0);
+		UT_ASSERT_EQ(threw, fault == 2);
+		UT_ASSERT_EQ(cluster_relmap_retention_census_next(census),
+					 CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+		UT_ASSERT(fcntl(execution_root_fd, F_GETFD) >= 0);
+		census_open_done(census);
+	}
+}
+
 /* Missing production composition or lost fd custody breaks real map/close. */
 UT_TEST(test_census_open_original_wal_physical_pairs_and_owned_fd)
 {

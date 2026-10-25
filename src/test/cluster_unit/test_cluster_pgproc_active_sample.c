@@ -38,6 +38,7 @@ static char array_storage[offsetof(ProcArrayStruct, pgprocnos) + 8 * sizeof(int)
 static ProcArrayStruct *procArray = &array;
 static TransactionId visible_xids[8];
 static PGPROC entries[8];
+static PGPROC *allProcs = entries;
 static LWLockPadded locks[NUM_INDIVIDUAL_LWLOCKS];
 LWLockPadded *MainLWLockArray = locks;
 static unsigned lock_phase, lock_errors;
@@ -48,6 +49,8 @@ static ClusterXidStripeSampleFence sample_fence;
 static uint64 lease_incarnation;
 static bool change_lease_after_n;
 static bool lifecycle_mode;
+static LWLock *lifecycle_locks[2];
+static unsigned lifecycle_depth;
 static XidCacheStatus subxid_states[8];
 static uint8 status_flags[8];
 PGPROC *MyProc;
@@ -66,8 +69,11 @@ MaintainLatestCompletedXid(TransactionId latestXid)
 bool
 LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
 {
-	return lifecycle_mode && held && mode == LW_EXCLUSIVE &&
-		(lock == ProcArrayLock || lock == TwoPhaseStateLock);
+	if (lifecycle_mode && mode == LW_EXCLUSIVE)
+		for (unsigned i = 0; i < lifecycle_depth; i++)
+			if (lifecycle_locks[i] == lock)
+				return true;
+	return false;
 }
 
 bool
@@ -96,8 +102,12 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
 	if (lifecycle_mode)
 	{
-		if (held || mode != LW_EXCLUSIVE || (lock != ProcArrayLock && lock != TwoPhaseStateLock))
+		if (mode != LW_EXCLUSIVE || lifecycle_depth >= lengthof(lifecycle_locks)
+			|| (lifecycle_depth == 0 ? lock != ProcArrayLock && lock != TwoPhaseStateLock
+				: lifecycle_locks[0] != ProcArrayLock || lock != XidGenLock))
 			lock_errors++;
+		if (lifecycle_depth < lengthof(lifecycle_locks))
+			lifecycle_locks[lifecycle_depth++] = lock;
 		held = true;
 		return true;
 	}
@@ -114,9 +124,11 @@ LWLockRelease(LWLock *lock)
 {
 	if (lifecycle_mode)
 	{
-		if (!held || (lock != ProcArrayLock && lock != TwoPhaseStateLock))
+		if (!held || lifecycle_depth == 0 || lifecycle_locks[lifecycle_depth - 1] != lock)
 			lock_errors++;
-		held = false;
+		if (lifecycle_depth > 0)
+			lifecycle_depth--;
+		held = lifecycle_depth != 0;
 		return;
 	}
 	if (!held || (lock_phase == 1 ? lock != XidGenLock : lock_phase != 3 || lock != ProcArrayLock))
@@ -173,6 +185,7 @@ reset_fixture(void)
 	MyAuxProcType = NotAnAuxProcess;
 	MyLockedGxact = NULL;
 	IsPostmasterEnvironment = lifecycle_mode = false;
+	lifecycle_depth = 0;
 	completed_xid = InvalidTransactionId;
 	array.maxProcs = lengthof(visible_xids);
 	for (int i = 0; i < lengthof(visible_xids); i++)
@@ -535,10 +548,112 @@ UT_TEST(test_original_end_transaction_retires_fullxid_with_raw_xid)
 	UT_ASSERT(!held);
 }
 
+/* Run the actual sampler only after the native publication/clear locks have
+ * been released. This changes the scheduling leaf, not its sampled values. */
+static void
+sample_prepared_publication(bool expected_valid, FullTransactionId expected_min)
+{
+	FullTransactionId n, future, minimum;
+	ClusterXidStripeSampleFence zero_fence = { 0 };
+	bool valid;
+
+	UT_ASSERT(lifecycle_mode && lifecycle_depth == 0 && !held);
+	lifecycle_mode = false;
+	lock_phase = 0;
+	valid = ProcArrayGetActiveFullXidSample(&n, &future, &minimum, &sample_fence);
+	UT_ASSERT_EQ(valid, expected_valid);
+	if (expected_valid)
+	{
+		UT_ASSERT(FullTransactionIdEquals(n, variables.nextXid));
+		UT_ASSERT(FullTransactionIdEquals(minimum, expected_min));
+		UT_ASSERT_EQ(sample_fence.incarnation, lease_incarnation);
+	}
+	else
+	{
+		UT_ASSERT(!FullTransactionIdIsValid(n));
+		UT_ASSERT(!FullTransactionIdIsValid(future));
+		UT_ASSERT(!FullTransactionIdIsValid(minimum));
+		UT_ASSERT(memcmp(&sample_fence, &zero_fence, sizeof(sample_fence)) == 0);
+	}
+	UT_ASSERT_EQ(lock_phase, 4);
+	UT_ASSERT_EQ(lock_errors, 0);
+	UT_ASSERT(!held);
+	lifecycle_mode = true;
+}
+
+static void
+prepare_original_procarray_publication(bool qualified)
+{
+	GlobalTransactionData gxact = { 0 };
+	FullTransactionId full = FullTransactionIdFromEpochAndXid(7, 90);
+	TransactionId prepared_xid = qualified ? 90 : 91;
+
+	reset_fixture();
+	lifecycle_mode = true;
+	/* The initial allocator identity is a controlled input. Publication,
+	 * compaction, PREPARE transfer, source clear and sampling are actual. */
+	MyProc->pgprocno = 7;
+	MyProc->lxid = 8;
+	MyProc->xid = 90;
+	MyProc->subxidStatus.count = 2;
+	pg_atomic_write_u64(&MyProc->cluster_top_full_xid_atomic, U64FromFullTransactionId(full));
+	ProcArrayAdd(MyProc);
+	UT_ASSERT_EQ(array.numProcs, 1);
+	UT_ASSERT_EQ(array.pgprocnos[0], 7);
+	sample_prepared_publication(true, full);
+
+	gxact.pgprocno = 0;
+	LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);
+	MarkAsPreparingGuts(&gxact, prepared_xid, "original-publication", 123, 456, 789);
+	LWLockRelease(TwoPhaseStateLock);
+	/* A prepared carrier not yet published cannot replace the old source. */
+	UT_ASSERT_EQ(array.numProcs, 1);
+	sample_prepared_publication(true, full);
+
+	MarkAsPrepared(&gxact, false);
+	UT_ASSERT(gxact.valid && MyLockedGxact == &gxact);
+	UT_ASSERT_EQ(array.numProcs, 2);
+	UT_ASSERT_EQ(array.pgprocnos[0], 0);
+	UT_ASSERT_EQ(array.pgprocnos[1], 7);
+	UT_ASSERT_EQ(entries[0].pgxactoff, 0);
+	UT_ASSERT_EQ(MyProc->pgxactoff, 1);
+	UT_ASSERT_EQ(visible_xids[0], prepared_xid);
+	UT_ASSERT_EQ(visible_xids[1], 90);
+	UT_ASSERT_EQ(subxid_states[0].count, 0);
+	UT_ASSERT_EQ(subxid_states[1].count, 2);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&entries[0].cluster_top_full_xid_atomic),
+		qualified ? U64FromFullTransactionId(full) : 0);
+	/* Even with a valid source still present, an unqualified published
+	 * prepared identity must refuse the entire sample, rather than skip it. */
+	sample_prepared_publication(qualified, full);
+
+	ProcArrayClearTransaction(MyProc);
+	UT_ASSERT_EQ(visible_xids[1], InvalidTransactionId);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&MyProc->cluster_top_full_xid_atomic), 0);
+	UT_ASSERT_EQ(subxid_states[1].count, 0);
+	UT_ASSERT_EQ(variables.xactCompletionCount, 1);
+	UT_ASSERT_EQ(visible_xids[0], prepared_xid);
+	/* Source exit cannot raise a qualified prepared minimum or repair an
+	 * unknown one. EndPrepare WAL/callbacks remain outside this fixture. */
+	sample_prepared_publication(qualified, full);
+}
+
+UT_TEST(test_actual_prepare_publication_retains_f_after_original_source_exit)
+{
+	prepare_original_procarray_publication(true);
+}
+
+UT_TEST(test_actual_unqualified_prepare_publication_refuses_f_before_and_after_exit)
+{
+	prepare_original_procarray_publication(false);
+}
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(17);
+	UT_RUN(test_actual_prepare_publication_retains_f_after_original_source_exit);
+	UT_RUN(test_actual_unqualified_prepare_publication_refuses_f_before_and_after_exit);
 	UT_RUN(test_empty_array_retains_one_captured_n);
 	UT_RUN(test_prepared_vacuum_and_other_database_top_xids_are_included);
 	UT_RUN(test_previous_epoch_and_post_n_allocation_use_same_anchor);

@@ -20932,13 +20932,17 @@ heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 						   HeapTupleFreeze *tuples, int ntuples
 #ifdef USE_PGRAC_CLUSTER
 						   , const ClusterSpaceIdentity *identity, bool conditional,
-						   const ClusterCtrcActiveScan *registration_cut
+						   const ClusterHeapFreezePageInputV1 *freeze_input,
+						   const ClusterSemanticAdmissionToken *freeze_admission,
+						   const ClusterHeapFreezeObservedBoundsV1 *expected_bounds,
+						   FullTransactionId expected_legal_next
 #endif
 						   )
 {
 	Page		page = BufferGetPage(buffer);
 #ifdef USE_PGRAC_CLUSTER
 	RfPageProducerBatchV1 version_batch;
+	ClusterHeapFreezeObservedBoundsV1 final_bounds;
 	bool		versioned = cluster_shared_config
 		&& rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
 		&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1;
@@ -20965,14 +20969,24 @@ heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 			elog(ERROR, "PGRAC shared heap freeze requires exact SPACE identity");
 		}
 	}
-	/* SPACE preparation also observes live state. Retain the same original
-	 * local ingress cut until immediately before the critical section; this
-	 * bounded atomic check adds no protection or producer qualification. */
+	/* SPACE preparation also observes live state. Retain the original local
+	 * ingress cut and the same F/H/native-window inputs until immediately
+	 * before the critical section. This performs only the existing bounded
+	 * cut check and pure match, without sampling or acquiring protection. */
 	if (conditional
-		&& (registration_cut == NULL
-			|| registration_cut->status != CTRC_ACTIVE_SCAN_COMPLETE
-			|| registration_cut->unqualified_entries != 0
-			|| !cluster_ctrc_active_scan_registration_current(registration_cut)))
+		&& (freeze_input == NULL || freeze_input->freeze_policy == NULL
+			|| freeze_input->freeze_cohort == NULL || expected_bounds == NULL
+			|| freeze_input->freeze_cohort->local_registration_cut.status
+				!= CTRC_ACTIVE_SCAN_COMPLETE
+			|| freeze_input->freeze_cohort->local_registration_cut.unqualified_entries != 0
+			|| !cluster_ctrc_active_scan_registration_current(
+				&freeze_input->freeze_cohort->local_registration_cut)
+			|| !cluster_heap_freeze_observed_bounds_v1(freeze_input->freeze_policy,
+				freeze_input->freeze_cohort, freeze_admission, cluster_node_id, &final_bounds)
+			|| !FullTransactionIdEquals(final_bounds.freeze_limit, expected_bounds->freeze_limit)
+			|| final_bounds.horizon_scn != expected_bounds->horizon_scn
+			|| !FullTransactionIdEquals(freeze_input->freeze_policy->legal_next,
+				expected_legal_next)))
 		return false;
 #endif
 	START_CRIT_SECTION();
@@ -21064,6 +21078,7 @@ cluster_heap_freeze_apply_xmin_batch_locked_v1(
 	SCN page_version;
 	SCN wal_clock;
 	ClusterHeapFreezeObservedBoundsV1 bounds;
+	FullTransactionId legal_next;
 
 	/* Borrow a real writer's resources; a local conditional lock is not X. */
 	if (rel == NULL || rel->rd_rel == NULL || input == NULL || page == NULL
@@ -21168,6 +21183,7 @@ cluster_heap_freeze_apply_xmin_batch_locked_v1(
 	/* Native FREEZE_PAGE keeps a raw conflict horizon. Recheck the original
 	 * creator against the same legal-next window after the final callbacks;
 	 * equality of F/H alone cannot qualify this narrowing. */
+	legal_next = input->freeze_policy->legal_next;
 	for (uint16 i = 0; i < target_count; i++)
 		if (!FullTransactionIdPrecedes(targets[i].original_creator_full_xid,
 			input->freeze_policy->legal_next)
@@ -21186,7 +21202,7 @@ cluster_heap_freeze_apply_xmin_batch_locked_v1(
 	/* Native redo and the existing SPACE version edge remain the only format. */
 	if (!heap_freeze_apply_prepared(rel, buffer,
 		conflict_horizon, plans, target_count,
-		&fence->identity, true, &input->freeze_cohort->local_registration_cut))
+		&fence->identity, true, input, admission, &bounds, legal_next))
 		return false;
 	XLogFlush(PageGetLSN(live_page));
 	return true;
@@ -21406,7 +21422,7 @@ heap_freeze_execute_prepared(Relation rel, Buffer buffer,
 	heap_freeze_apply_prepared(rel, buffer, snapshotConflictHorizon, tuples,
 							   ntuples
 #ifdef USE_PGRAC_CLUSTER
-							   , identity, false, NULL
+							   , identity, false, NULL, NULL, NULL, InvalidFullTransactionId
 #endif
 							   );
 }

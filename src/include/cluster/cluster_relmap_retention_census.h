@@ -90,6 +90,48 @@ extern bool cluster_relmap_retention_census_open_cold(uint16 origin, size_t root
 													  size_t memory_budget, size_t payload_budget,
 													  ClusterRelmapRetentionCensus **out);
 
+/* One dormant original-owner operation: open and drain the complete initial
+ * census, prepare/consume all pending once, then restart and drain once after
+ * all CLEAR. Require no remaining pending before publishing a DRAINED cursor;
+ * an initially clean census makes no native attempt. UNKNOWN/ERROR never
+ * retries or replaces the original scope. All original complete-single-origin,
+ * isolation/native/SIDE/base/era/history/lifetime qualifications above remain
+ * caller preconditions; no live caller or COMPLETE/release authority follows.
+ *
+ * Fresh NULL exclusive output is unchanged on false/ERROR. Clean up every
+ * intermediate local handle/cursor/ROOT/fd on every exit. Success owns its
+ * internal predecessor chain: one destroy releases local descendant storage
+ * before predecessor ROOT and its tracked fd, never original scope/pins/debt.
+ * Keep original owner/protections alive until destroy. Ordinary restart still
+ * borrows its predecessor. Returned cursor/sets remain provisional BUILDING.
+ *
+ * Each ROOT receives half root_budget. memory_budget bounds both fixed
+ * cursor/directory allocations or original fixed storage plus batch, whichever
+ * is larger. Native handle allocations remain separate; payload_budget applies
+ * to each original WAL target decode. All work is synchronous. */
+extern bool cluster_relmap_retention_census_execute_cold(uint16 origin, size_t root_budget,
+														 size_t memory_budget,
+														 size_t payload_budget,
+														 ClusterRelmapRetentionCensus **out);
+
+/* Read one committed namespace after the original produced single-origin
+ * census is DRAINED and has no pending pins. Use its original held ROOT/fd,
+ * full pair hashes and decoder, then recheck the entire physical ROOT and
+ * original source/serial/context/all pins before publishing a copied map.
+ * No native call, configured-path read, COMPLETE or release is performed.
+ * All original qualification/lifetime preconditions above still apply.
+ *
+ * NULL/known current or predecessor input overlap refuses unchanged. Other
+ * outputs clear on refusal/ERROR. Missing initial context or an unfinished/
+ * unbound cursor refuses without consuming it; entered failure invalidates
+ * only local observations, preserving pins/debt. Missing namespace is failure,
+ * never an empty map. Earlier copies must be discarded after any later
+ * refusal. Repeated reads remain provisional under the same original owner;
+ * destroy dependents before ending that owner's protections/fd lifetime. */
+extern bool cluster_relmap_retention_census_committed_cold(ClusterRelmapRetentionCensus *census,
+														   Oid dbid,
+														   ClusterRelmapCensusCommitted *out);
+
 /* At most128 metadata candidates, one <=BLCKSZ original file read, or one
  * existing whole-ROOT recheck step. Require global/base and both exact v2
  * copies for global and every canonical physical base/db directory, including
@@ -297,7 +339,8 @@ extern bool cluster_relmap_retention_census_restart_cold(ClusterRelmapRetentionC
  * not native prepare's separately owned allocations or synchronous I/O.
  *
  * Re-read every exact pair, prepare every selected original native handle,
- * recheck the whole ROOT and all selected pins/sources, then publish once.
+ * recheck the whole ROOT, sources and ALL original origin/slot pin bytes,
+ * including unselected obligations, after each prepare and before publishing.
  * Clean namespaces need no handle. Any late refusal/ERROR frees all local
  * handles, invalidates old observations and retains every pin. Before
  * DRAINED or without original ownership, leave the scan unconsumed.
@@ -334,7 +377,7 @@ cluster_relmap_retention_census_recovery_batch_release(ClusterRelmapCensusRecove
 /* Consume the original prepared set once under the same borrowed lifetimes.
  * Always clear *batch and free all local custody, including refusal/ERROR.
  * Missing initial shared-catalog/merger/X ownership leaves observations alone.
- * Otherwise recheck the whole original ROOT, sources and exact pins before
+ * Otherwise recheck the whole original ROOT, sources and ALL original pins before
  * targets. Revoke physical census/ROOT/directory observations BEFORE the first
  * native arbiter call; native cold authority and all original pins survive.
  * Check original ownership/source/origin metadata and every saved pin across

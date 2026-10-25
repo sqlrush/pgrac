@@ -9,22 +9,30 @@
 #include "miscadmin.h"
 #include "storage/fd.h"
 
-/* This fixture borrows every fd/ROOT. Native lifetime/context leaves must
- * stay unreachable; the retained-WAL fixture exercises their owned variant. */
+/* Borrowed tests must never cross these native boundaries. Only the explicit
+ * execution fixture may own a new fd under its controlled Startup context. */
 BackendType MyBackendType = B_BG_WORKER;
 volatile uint32 CritSectionCount = 0;
+static bool census_execute_active, census_execute_recovery;
+static int census_execute_fd = -1;
+static unsigned census_execute_closes;
 
 bool
 RecoveryInProgress(void)
 {
-	abort();
+	if (!census_execute_active)
+		abort();
+	return census_execute_recovery;
 }
 
 int
 CloseTransientFile(int fd)
 {
-	(void)fd;
-	abort();
+	if (!census_execute_active || fd != census_execute_fd)
+		abort();
+	census_execute_closes++;
+	census_execute_fd = -1;
+	return close(fd);
 }
 
 #define CENSUS_BUDGET (128 * 1024)
@@ -998,17 +1006,38 @@ ProcessInterrupts(void)
 }
 #include "test_cluster_relmap_census_recovery.inc"
 #include "test_cluster_relmap_census_batch.inc"
+#include "test_cluster_relmap_census_all_pins.inc"
 #include "test_cluster_relmap_census_cold.inc"
 #include "test_cluster_relmap_census_cold_consume.inc"
 #include "test_cluster_relmap_census_cold_reobserve.inc"
 #include "test_cluster_relmap_census_cold_restart.inc"
 #include "test_cluster_relmap_census_execution_batch.inc"
 #include "test_cluster_relmap_census_cold_initial.inc"
+#include "test_cluster_relmap_census_execute.inc"
+#include "test_cluster_relmap_census_committed_cold.inc"
 
 int
 main(void)
 {
-	UT_PLAN(100);
+	UT_PLAN(118);
+	UT_RUN(test_retained_batch_prepare_keeps_unselected_and_unused_original_pins);
+	UT_RUN(test_retained_batch_all_original_pins_bind_interval_and_empty_batch);
+	UT_RUN(test_retained_batch_native_clear_rechecks_every_original_pin);
+	UT_RUN(test_retained_batch_native_unknown_still_rechecks_original_sources);
+	UT_RUN(test_cold_committed_reads_clean_and_post_clear_exact_namespaces);
+	UT_RUN(test_cold_committed_initial_gates_preserve_unfinished_and_original_custody);
+	UT_RUN(test_cold_committed_pending_and_missing_namespace_never_mean_empty);
+	UT_RUN(test_cold_committed_whole_root_and_pair_changes_are_sticky);
+	UT_RUN(test_cold_committed_io_rechecks_source_context_and_all_ancestor_pins);
+	UT_RUN(test_cold_committed_output_aliases_preserve_current_and_owned_parent_storage);
+	UT_RUN(test_census_execute_clean_input_needs_no_native_attempt);
+	UT_RUN(test_census_execute_all_pending_owns_entire_local_chain);
+	UT_RUN(test_census_execute_entry_gates_and_budgets_preserve_output);
+	UT_RUN(test_census_execute_checkpoint_and_physical_failure_clean_local_custody);
+	UT_RUN(test_census_execute_native_prepare_failure_releases_all_local_handles);
+	UT_RUN(test_census_execute_unknown_or_error_stops_without_retry);
+	UT_RUN(test_census_execute_post_clear_failure_and_remaining_pending_refuse);
+	UT_RUN(test_census_execute_returned_chain_keeps_original_context_and_source);
 	UT_RUN(test_census_restart_native_return_checks_original_ancestor_pins);
 	UT_RUN(test_census_restart_original_source_is_required_after_publication);
 	UT_RUN(test_census_restart_original_pin_and_metadata_checks_continue_until_native);

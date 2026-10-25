@@ -87,7 +87,12 @@ bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
 	if (lock == ProcArrayLock) {
-		UT_ASSERT_EQ(mode, LW_EXCLUSIVE);
+		if (mode == LW_SHARED)
+			UT_ASSERT(import_install_active && !import_restored);
+		else
+			UT_ASSERT_EQ(mode, LW_EXCLUSIVE);
+		if (import_probe_after_install || import_observe_install)
+			import_install_mode = mode;
 		UT_ASSERT(!retention_lock && !vacuum_xid_lock && !vacuum_inplace_lock);
 		retention_lock = true;
 		retention_acquires++;
@@ -104,8 +109,13 @@ LWLockRelease(LWLock *lock)
 {
 	if (lock == ProcArrayLock) {
 		UT_ASSERT(retention_lock);
+		if (import_observe_install) {
+			import_scn_at_unlock = pg_atomic_read_u64(&proc.cluster_read_scn_atomic);
+			import_observe_install = false;
+		}
 		retention_lock = false;
 		retention_releases++;
+		snapshot_import_after_procarray_unlock();
 		return;
 	}
 	UT_ASSERT(lock == XidGenLock && vacuum_xid_lock);
@@ -157,6 +167,15 @@ GetSnapshotData(Snapshot snapshot)
 	snapshot->snapshot_type = SNAPSHOT_MVCC;
 	snapshot->xmin = 10;
 	snapshot->xmax = 200;
+	/* Native GetSnapshotData owns reusable XID storage before import copies.
+	 * These arrays replace allocation/storage only, not source visibility. */
+	if (import_install_active)
+	{
+		static TransactionId import_xip[16], import_subxip[16];
+
+		snapshot->xip = import_xip;
+		snapshot->subxip = import_subxip;
+	}
 	ClusterSnapshotRefreshFields(snapshot);
 	MyProc->xmin = snapshot->xmin;
 	/* Schedule an actual H scan in the original unpublished-reader gap.

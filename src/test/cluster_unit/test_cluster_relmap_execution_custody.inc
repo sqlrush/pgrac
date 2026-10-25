@@ -10,6 +10,8 @@ cluster_undo_recovery_cold_single_source_v1(const ClusterWalSourceRef *source,
 {
 	ClusterWalSourceRef observed;
 	XLogRecPtr redo;
+	if (cold_native_real_scope)
+		return test_relmap_scope_single_source(source, checkpoint, native_redo, serial);
 	UT_ASSERT(!inputs_pin_held && inputs_pin_refuse);
 	if (execution_pending_guard_fault == 4
 		|| (execution_pending_guard_fault == 3 && prefix_base_reads > 0))
@@ -442,6 +444,10 @@ cluster_shared_fs_recovery_root_open_v1(const uint8 expected_uuid[16])
 {
 	UT_ASSERT_EQ(memcmp(expected_uuid, execution_root.identity.storage_uuid, 16), 0);
 	execution_root_opens++;
+	if (cold_native_real_storage) {
+		execution_root_fd = test_relmap_native_storage_open(expected_uuid, PG_exception_stack);
+		return execution_root_fd;
+	}
 	if (execution_root_fault == 1)
 		return -1;
 	if (execution_root_fault == 2)
