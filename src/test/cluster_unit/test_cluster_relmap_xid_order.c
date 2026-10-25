@@ -1074,11 +1074,16 @@ UT_TEST(unarmed_commit_preserves_other_writers_pending_and_global_lock)
 #include "test_cluster_relmap_producer_terminal.inc"
 #include "test_cluster_relmap_postcommit.inc"
 #include "test_cluster_relmap_abort.inc"
+#include "test_cluster_relmap_unarmed.inc"
 
 int
 main(void)
 {
-	UT_PLAN(46);
+	UT_PLAN(50);
+	UT_RUN(v2_unarmed_prepare_false_blocks_terminal_cleanup);
+	UT_RUN(v2_unarmed_prepare_error_keeps_protection);
+	UT_RUN(v2_unarmed_prepare_cannot_retry_or_change_polarity);
+	UT_RUN(v2_pre_effect_refusals_preserve_normal_abort);
 	UT_RUN(v2_abort_discards_all_receipts_before_unlock);
 	UT_RUN(v2_abort_refusals_keep_original_custody);
 	UT_RUN(v2_abort_partial_cleanup_is_one_shot);

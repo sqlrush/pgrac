@@ -265,7 +265,10 @@ UT_TEST(v2_abort_unlock_error_and_empty_debt_isolation)
 			authority_pending[0] = 19;
 		}
 		memcpy(before, directory->pins, sizeof(before));
-		cluster_relmap_producer_abort_v2();
+		if (partial_prepare)
+			UT_ASSERT(abort_panic());
+		else
+			cluster_relmap_producer_abort_v2();
 		UT_ASSERT_EQ(terminal_calls + publish_events + unlock_calls, 0);
 		UT_ASSERT(authority_held && !cluster_relmap_v2_finish_entered);
 		UT_ASSERT(!cluster_relmap_v2_arms[0].armed && !cluster_relmap_v2_arms[1].armed);

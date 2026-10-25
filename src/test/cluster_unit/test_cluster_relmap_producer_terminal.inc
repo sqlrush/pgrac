@@ -141,6 +141,7 @@ terminal_test_reset(void)
 {
 	memset(cluster_relmap_v2_arms, 0, sizeof(cluster_relmap_v2_arms));
 	cluster_relmap_v2_finish_entered = false;
+	cluster_relmap_v2_prepare_unfinished = false;
 	v2_terminal_context = false;
 	v2_pair_observer = NULL;
 	v2_write_observer = NULL;

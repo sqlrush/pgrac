@@ -1312,18 +1312,21 @@ typedef struct ClusterRelmapProducerArmV2
 
 static ClusterRelmapProducerArmV2 cluster_relmap_v2_arms[2];
 static bool cluster_relmap_v2_finish_entered;
+static bool cluster_relmap_v2_prepare_unfinished;
 
 /* Bounded post-commit retries before fail-stop (r4-P1). */
 #define CLUSTER_RELMAP_PUBLISH_RETRIES 10
 
-bool
-cluster_relmap_producer_stage_v2(bool shared, const RelMapFile *updates,
-	ClusterRelmapOwnerSampleV2 *owner_out, ClusterRelmapV2Image *staged_out)
+static bool
+relmap_producer_stage_v2(bool shared, const RelMapFile *updates,
+	ClusterRelmapOwnerSampleV2 *owner_out, ClusterRelmapV2Image *staged_out,
+	bool *unfinished)
 {
 	ClusterRelmapOwnerSampleV2 sample;
 	ClusterRelmapV2Namespace identity = { 0 };
 	ClusterRelmapV2View base, checked;
 	ClusterRelmapV2Image staged = { 0 };
+	ClusterRelmapRetentionResult begin_result;
 	XLogRecPtr end;
 
 	/* The original caller owns global X and every eventual terminal duty.
@@ -1344,10 +1347,21 @@ cluster_relmap_producer_stage_v2(bool shared, const RelMapFile *updates,
 	if (cluster_relmap_authority_v2_read(&identity, &base) != CLUSTER_RELMAP_V2_PAIR_VALID
 		|| !base.pending_complete || base.has_pending || base.committed_generation == 0
 		|| base.committed_generation == UINT64_MAX
-		|| !cluster_relmap_owner_matches_v2(&sample)
-		|| cluster_relmap_retention_runtime_begin_v2(&sample, &identity,
-			base.committed_generation + 1) != CLUSTER_RELMAP_RETENTION_OK)
+		|| !cluster_relmap_owner_matches_v2(&sample))
 		return false;
+	/* Begin may reserve a pin, and ERROR can unwind after that mutation.
+	 * A normally returned non-OK result is nonmutating in the original
+	 * retention begin; only that result can undo this preliminary guard. */
+	if (unfinished != NULL)
+		*unfinished = true;
+	begin_result = cluster_relmap_retention_runtime_begin_v2(&sample, &identity,
+		base.committed_generation + 1);
+	if (begin_result != CLUSTER_RELMAP_RETENTION_OK)
+	{
+		if (unfinished != NULL)
+			*unfinished = false;
+		return false;
+	}
 
 	LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
 	/* Keep the exact originally prepared generation and complete native base.
@@ -1394,8 +1408,16 @@ refused:
 }
 
 bool
-cluster_relmap_producer_prepare_v2(bool shared, const RelMapFile *updates,
+cluster_relmap_producer_stage_v2(bool shared, const RelMapFile *updates,
 	ClusterRelmapOwnerSampleV2 *owner_out, ClusterRelmapV2Image *staged_out)
+{
+	return relmap_producer_stage_v2(shared, updates, owner_out, staged_out, NULL);
+}
+
+static bool
+relmap_producer_prepare_v2(bool shared, const RelMapFile *updates,
+	ClusterRelmapOwnerSampleV2 *owner_out, ClusterRelmapV2Image *staged_out,
+	bool *unfinished)
 {
 	ClusterRelmapOwnerSampleV2 sample;
 	ClusterRelmapV2Image staged;
@@ -1403,7 +1425,7 @@ cluster_relmap_producer_prepare_v2(bool shared, const RelMapFile *updates,
 
 	if (owner_out == NULL || staged_out == NULL
 		|| cluster_relmap_publish_arms[0].armed || cluster_relmap_publish_arms[1].armed
-		|| !cluster_relmap_producer_stage_v2(shared, updates, &sample, &staged))
+		|| !relmap_producer_stage_v2(shared, updates, &sample, &staged, unfinished))
 		return false;
 	/* Only this call's successful original stage can reach installation.
 	 * A caller-supplied image or a failed stage cannot be rehabilitated. */
@@ -1444,13 +1466,20 @@ refused:
 }
 
 bool
+cluster_relmap_producer_prepare_v2(bool shared, const RelMapFile *updates,
+	ClusterRelmapOwnerSampleV2 *owner_out, ClusterRelmapV2Image *staged_out)
+{
+	return relmap_producer_prepare_v2(shared, updates, owner_out, staged_out, NULL);
+}
+
+bool
 cluster_relmap_producer_arm_v2(bool shared, const RelMapFile *updates)
 {
 	ClusterRelmapProducerArmV2 *arm = &cluster_relmap_v2_arms[shared ? 0 : 1];
 	ClusterRelmapOwnerSampleV2 sample;
 	ClusterRelmapV2Image staged;
 
-	if (arm->armed || cluster_relmap_v2_finish_entered
+	if (arm->armed || cluster_relmap_v2_finish_entered || cluster_relmap_v2_prepare_unfinished
 		|| cluster_relmap_publish_arms[0].armed || cluster_relmap_publish_arms[1].armed)
 		return false;
 	for (int slot = 0; slot < 2; slot++)
@@ -1461,19 +1490,21 @@ cluster_relmap_producer_arm_v2(bool shared, const RelMapFile *updates)
 			|| (!previous->staged.identity.shared && MyDatabaseId != previous->staged.identity.dbid)))
 			return false;
 	}
-	if (!cluster_relmap_producer_prepare_v2(shared, updates, &sample, &staged))
+	if (!relmap_producer_prepare_v2(shared, updates, &sample, &staged,
+		&cluster_relmap_v2_prepare_unfinished))
 		return false;
 	/* Only nofail stores follow the original successful prepare. */
 	arm->sample = sample;
 	arm->staged = staged;
 	arm->armed = true;
+	cluster_relmap_v2_prepare_unfinished = false;
 	return true;
 }
 
 static bool
 relmap_producer_finish_v2(bool is_commit, bool keep_custody)
 {
-	if (cluster_relmap_v2_finish_entered
+	if (cluster_relmap_v2_finish_entered || cluster_relmap_v2_prepare_unfinished
 		|| (!cluster_relmap_v2_arms[0].armed && !cluster_relmap_v2_arms[1].armed))
 		return false;
 	/* Latch before any fallible check or I/O. Even a partial cleanup must not
@@ -1561,7 +1592,8 @@ relmap_producer_postcommit_current_v2(void)
 void
 cluster_relmap_producer_postcommit_v2(void)
 {
-	if (!cluster_relmap_v2_arms[0].armed && !cluster_relmap_v2_arms[1].armed)
+	if (!cluster_relmap_v2_arms[0].armed && !cluster_relmap_v2_arms[1].armed
+		&& !cluster_relmap_v2_prepare_unfinished)
 		return;
 
 	PG_TRY();
@@ -1638,7 +1670,8 @@ relmap_producer_abort_failed_v2(const char *stage)
 void
 cluster_relmap_producer_abort_v2(void)
 {
-	if (!cluster_relmap_v2_arms[0].armed && !cluster_relmap_v2_arms[1].armed)
+	if (!cluster_relmap_v2_arms[0].armed && !cluster_relmap_v2_arms[1].armed
+		&& !cluster_relmap_v2_prepare_unfinished)
 		return;
 
 	PG_TRY();

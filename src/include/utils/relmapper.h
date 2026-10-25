@@ -86,6 +86,9 @@ extern bool cluster_relmap_producer_prepare_v2(bool shared,
 /* Dormant original producer custody. Arm obtains successful original prepare
  * receipts in this invocation and retains them privately per map flavour;
  * no external image can replace them. Same failure duties as prepare_v2.
+ * An incomplete arm with possible retention or persistent effects blocks
+ * further arm/finish calls, including cleanup of earlier successful receipts.
+ * It keeps global X and original pins/debt for the original failure path.
  * Finish is for the original authenticated terminal caller BEFORE top FullXid
  * teardown, with global relmap X retained and no mapping/XidGen/retention lock.
  * Its first attempt latches both slots before fallible checks. False/ERROR
@@ -103,8 +106,10 @@ extern bool cluster_relmap_producer_finish_v2(bool is_commit);
  * apply the original local/peer ACK policy and recheck the original owner.
  * Unlock global X last, then retire local custody only. UNKNOWN/ERROR, source
  * loss or exhausted notification retries PANIC; custody/pins/debt remain and
- * uncertain storage is never retried. Empty is a no-op. This authenticates no
- * terminal, releases no retention pin and installs no live v2 caller. */
+ * uncertain storage is never retried. Incomplete arm preparation also PANICs;
+ * only empty custody with no unfinished preparation is a no-op. This
+ * authenticates no terminal, releases no retention pin and installs no live
+ * v2 caller. */
 extern void cluster_relmap_producer_postcommit_v2(void);
 
 /* Dormant original abort caller, before top FullXid teardown, retaining the
@@ -112,8 +117,10 @@ extern void cluster_relmap_producer_postcommit_v2(void);
  * abort decision can precede TRANS_ABORT and remains the caller's duty.
  * Discard all saved prepare receipts once, unlock global X last, then retire
  * local custody. UNKNOWN/ERROR/source loss PANIC, keeping custody/pins/debt;
- * never retry or switch polarity. Empty is a no-op, including failed prepare
- * without a saved receipt; its original obligations remain with the caller.
+ * never retry or switch polarity. Incomplete arm preparation also PANICs,
+ * even without a saved receipt; no earlier receipt is discarded or unlocked.
+ * Empty custody without unfinished preparation is a no-op. Standalone
+ * stage/prepare callers retain their original failure obligations.
  * No invalidation, terminal proof, retention release or live v2 caller. */
 extern void cluster_relmap_producer_abort_v2(void);
 
