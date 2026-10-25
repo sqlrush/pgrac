@@ -25,6 +25,16 @@
 SELECT name, setting, unit, context, source, pending_restart FROM pg_settings WHERE name = 'cluster.xnode_profile';
 ```
 
+## `cluster.trace_block_io`
+
+布尔参数，默认 `off`；超级用户可在会话或配置文件中设置。需要跨节点与后台写者的完整记录时，在所有参与节点的启动配置中启用。输出为服务端日志中的 `BLOCK_IO` 行。
+
+`READ_SOURCE` 记录原始 tag、generation、token、request、epoch 和 master。`phase=REQUEST` 尚未作出来源判定；`DECISION` 的 source 为 0=FAIL、1=DISK_GRANT、2=IMAGE_INSTALLED、3=RETRY；`DISK_BEGIN` 表示该次授权即将用于物理读。
+
+`WRITE_COMPLETE` 仅表示写调用已返回，`durable=0`。`WRITE_NOTE` 将该版本关联到节点内的 sequence；`SYNC_CONFIRMED_PREFIX` 表示此前 `[0, sequence)` 的写记录已通过同步屏障。`PI_DIRECTORY_RETIRED` 是目录侧退休，`PI_RETIRED` 是实际本地 PI 丢弃，保留原 buffer、generation、token 和 version；两者应分别核对。
+
+校验失败时，尝试把原始整页保存到该节点数据目录的 `pg_stat_tmp/pcm-failed-*.bin`，权限为 `0600`。文件包含原始页内容。`VERIFY_FAILED` 记录 expected、calculated、保存路径、实际 bytes 和 capture_errno；只有 `bytes=8192` 且 `capture_errno=0` 才是完整捕获。捕获失败不改变原校验结果。此参数不改变读写授权、校验或错误处理。
+
 ## `cluster.trace_tx_identity`
 
 | 属性 | 值 |

@@ -103,6 +103,8 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_prepared_s_so
 #undef printf
 
 #include "unit_test.h"
+
+int MaxBackends = 1024;
 #include "cluster/cluster_pi_rebuild.h"
 #include "test_cluster_pcm_source_owner_layout.inc"
 #include "test_cluster_pcm_stop_fields.inc"
@@ -457,6 +459,12 @@ cluster_page_data_pi_ack_read_v1(const ClusterPiPhysicalAckV1 *ack,
 }
 
 bool
+cluster_normal_stop_requested(void)
+{
+	return false;
+}
+
+bool
 cluster_normal_stop_service_new_work(bool modifies_data)
 {
 	Assert(modifies_data);
@@ -522,9 +530,9 @@ cluster_test_pcm_memcmp(const void *left, const void *right, size_t bytes)
 {
 	if (fake_pcm_count_comparisons) {
 		fake_pcm_max_compare_bytes = Max(fake_pcm_max_compare_bytes, bytes);
-		if (bytes == 49960)
+		if (bytes == 51504)
 			fake_pcm_full_state_compares++;
-		if ((bytes == 304 || bytes == 49960) && fake_pcm_first_master_compare == NULL)
+		if ((bytes == 304 || bytes == 51504) && fake_pcm_first_master_compare == NULL)
 			fake_pcm_first_master_compare = left;
 	}
 	return memcmp(left, right, bytes);
@@ -1367,6 +1375,23 @@ cluster_gcs_send_block_request_and_wait(struct BufferDesc *buf pg_attribute_unus
 										int master_node pg_attribute_unused(),
 										bool clean_eligible pg_attribute_unused(),
 										bool *out_retry_denied pg_attribute_unused())
+{
+	abort();
+}
+
+/* Ordinary lock fixtures do not execute the first-fill transport owner. */
+bool
+cluster_gcs_send_block_request_source_and_wait(BufferDesc *buf pg_attribute_unused(),
+	int master pg_attribute_unused(), bool *retry pg_attribute_unused(),
+	ClusterPcmReadSource *source pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_gcs_local_master_read_source_and_wait(BufferDesc *buf pg_attribute_unused(),
+	const PcmAuthoritySnapshot *expected pg_attribute_unused(), bool one pg_attribute_unused(),
+	bool *retry pg_attribute_unused(), ClusterPcmReadSource *source pg_attribute_unused())
 {
 	abort();
 }
@@ -21816,7 +21841,7 @@ UT_TEST(test_inactive_master_body_is_outside_scan_integrity_proof)
 			pcm_scan_retire_fixture(tag);
 		/* Deliberately damage only fixture-owned inactive storage. These
 		 * scans prove registry lifecycle, not inactive-body integrity. */
-		memset(state, 0xa5, 49960);
+		memset(state, 0xa5, 51504);
 		pcm_comparison_count_begin();
 		UT_ASSERT_EQ(cluster_pcm_lock_ko_relation_scan_v3(locator, 17, 4, &cursor),
 					 CLUSTER_PCM_PI_RELATION_EMPTY);
@@ -21825,7 +21850,7 @@ UT_TEST(test_inactive_master_body_is_outside_scan_integrity_proof)
 		UT_ASSERT_EQ(cursor, 4);
 		UT_ASSERT(fake_pcm_max_compare_bytes <= 48);
 		UT_ASSERT(fake_pcm_first_master_compare == NULL);
-		memset(state, 0, 49960);
+		memset(state, 0, 51504);
 	}
 	cluster_shared_config = false;
 #endif
@@ -21834,7 +21859,7 @@ UT_TEST(test_inactive_master_body_is_outside_scan_integrity_proof)
 UT_TEST(test_retirement_establishes_and_checks_zero_inactive_body)
 {
 #ifdef USE_ASSERT_CHECKING
-	static const unsigned char zero[49960];
+	static const unsigned char zero[51504];
 #endif
 	pi_relation_scan_setup();
 	pcm_comparison_count_begin();

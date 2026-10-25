@@ -1421,6 +1421,18 @@ StaticAssertDecl(sizeof(GcsBlockRequestPayload) == 64,
  *	leaves it 0 → existing conservative path unchanged (inv ①).  ABI stays
  *	64B (reserved-byte overlay). */
 static inline void
+GcsBlockRequestPayloadSetReadMiss(GcsBlockRequestPayload *p, bool enabled)
+{
+	p->reserved_0[6] = enabled ? 1 : 0;
+}
+
+static inline bool
+GcsBlockRequestPayloadIsReadMiss(const GcsBlockRequestPayload *p)
+{
+	return p->reserved_0[6] == 1;
+}
+
+static inline void
 GcsBlockRequestPayloadSetCleanEligible(GcsBlockRequestPayload *p, bool eligible)
 {
 	p->reserved_0[0] = eligible ? (uint8)1 : (uint8)0;
@@ -1777,6 +1789,115 @@ StaticAssertDecl(sizeof(GcsBlockForwardPayload) == 64,
 StaticAssertDecl(offsetof(GcsBlockForwardPayload, expected_pi_watermark_scn_bytes) == 49,
 				 "spec-2.41 D1 — expected_pi_watermark_scn_bytes[8] must land at "
 				 "offset 49 immediately after transition_id byte at offset 48");
+
+/* First-fill reuses the existing families; markers never grant by themselves. */
+#define GCS_BLOCK_FORWARD_KIND_FIRST_FILL_S ((uint8)12)
+#define GCS_BLOCK_PENDING_S_REPLY_MARK ((uint8)0x53)
+#define GCS_BLOCK_DONE_PENDING_S_CONFIRM ((uint8)0xa1)
+#define GCS_BLOCK_DONE_PENDING_S_NACK ((uint8)0xa2)
+#define GCS_BLOCK_DONE_PENDING_S_HOLDER ((uint8)0xa3)
+#define GCS_BLOCK_INVALIDATE_KIND_PENDING_S ((uint8)2)
+
+static inline bool
+GcsBlockForwardPayloadIsFirstFillS(const GcsBlockForwardPayload *p)
+{
+	return p != NULL && p->reserved_0[6] == GCS_BLOCK_FORWARD_KIND_FIRST_FILL_S;
+}
+static inline bool
+GcsBlockReplyHeaderHasPendingS(const GcsBlockReplyHeader *p)
+{
+	if (p == NULL || p->reserved_0[5] != GCS_BLOCK_PENDING_S_REPLY_MARK
+		|| p->transition_id != PCM_TRANS_N_TO_S)
+		return false;
+	for (int i = 0; i < 5; i++)
+		if (p->reserved_0[i] != 0)
+			return false;
+	return p->status == GCS_BLOCK_REPLY_GRANTED
+		|| p->status == GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK
+		|| p->status == GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
+		|| p->status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE;
+}
+static inline bool
+GcsBlockDonePayloadPendingSKey(const GcsBlockDonePayload *p, ClusterPcmReadGrantKey *key)
+{
+	if (p == NULL || key == NULL || p->transition_id != PCM_TRANS_N_TO_S
+		|| (p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_CONFIRM
+			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_NACK
+			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_HOLDER)
+		|| p->reserved_0[1] >= 32 || p->request_id == 0 || p->epoch == 0
+		|| p->requester_backend_id <= 0)
+		return false;
+	for (int i = 2; i < (int)sizeof(p->reserved_0); i++)
+		if (p->reserved_0[i] != 0)
+			return false;
+	memset(key, 0, sizeof(*key));
+	key->tag = p->tag;
+	key->request_id = p->request_id;
+	key->epoch = p->epoch;
+	key->requester_node = p->reserved_0[1];
+	key->backend_id = p->requester_backend_id;
+	return p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_NACK
+		|| p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_HOLDER
+		|| p->sender_node == key->requester_node;
+}
+static inline void
+GcsBlockInvalidatePayloadSetPendingS(GcsBlockInvalidatePayload *p,
+	const ClusterPcmReadGrantKey *key)
+{
+	p->reserved_0[0] = GCS_BLOCK_INVALIDATE_KIND_PENDING_S;
+	for (int i = 0; i < 8; i++)
+		p->reserved_1[i] = (uint8)(key->epoch >> (8 * i));
+	for (int i = 0; i < 4; i++)
+		p->reserved_1[8 + i] = (uint8)((uint32)key->backend_id >> (8 * i));
+}
+static inline uint64
+GcsBlockInvalidatePayloadPendingSEpoch(const GcsBlockInvalidatePayload *p)
+{
+	uint64 epoch = 0;
+	for (int i = 0; i < 8; i++)
+		epoch |= (uint64)p->reserved_1[i] << (8 * i);
+	return epoch;
+}
+static inline int32
+GcsBlockInvalidatePayloadPendingSBackend(const GcsBlockInvalidatePayload *p)
+{
+	uint32 backend = 0;
+	for (int i = 0; i < 4; i++)
+		backend |= (uint32)p->reserved_1[8 + i] << (8 * i);
+	return (int32)backend;
+}
+static inline void
+GcsBlockInvalidateAckPayloadEchoPendingS(GcsBlockInvalidateAckPayload *ack,
+	const GcsBlockInvalidatePayload *inv)
+{
+	ack->reserved_0[1] = GCS_BLOCK_INVALIDATE_KIND_PENDING_S;
+	ack->epoch = GcsBlockInvalidatePayloadPendingSEpoch(inv);
+	memcpy(ack->reserved_1, inv->reserved_1 + 8, 4);
+}
+static inline bool
+GcsBlockInvalidateAckPayloadPendingSKey(const GcsBlockInvalidateAckPayload *p,
+	ClusterPcmReadGrantKey *key)
+{
+	uint32 backend = 0;
+	if (p == NULL || key == NULL || p->reserved_0[1] != GCS_BLOCK_INVALIDATE_KIND_PENDING_S
+		|| p->request_id == 0 || p->epoch == 0 || p->sender_node < 0 || p->sender_node >= 32
+		|| p->reserved_0[0] > 1)
+		return false;
+	for (int i = 2; i < (int)sizeof(p->reserved_0); i++)
+		if (p->reserved_0[i] != 0)
+			return false;
+	for (int i = 0; i < 4; i++)
+		backend |= (uint32)p->reserved_1[i] << (8 * i);
+	if (backend == 0 || backend > INT_MAX)
+		return false;
+	memset(key, 0, sizeof(*key));
+	key->tag = p->tag;
+	key->request_id = p->request_id;
+	key->epoch = p->epoch;
+	key->requester_node = p->sender_node;
+	key->backend_id = (int32)backend;
+	return true;
+}
 
 /* PGRAC: spec-2.41 D1/D3 — little-endian SCN helpers (the @49 carrier now holds
  * the detector's expected pi_watermark_scn, NOT a page_lsn). */
@@ -4029,6 +4150,12 @@ typedef enum ClusterBufmgrGcsDowngradeOutcome {
 extern bool cluster_bufmgr_downgrade_x_to_s_for_gcs(BufferTag tag);
 extern ClusterBufmgrGcsDowngradeOutcome cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(
 	BufferTag tag, XLogRecPtr *out_page_lsn, char *dst, ClusterBufmgrGcsCopyRefusal *out_refusal);
+extern ClusterBufmgrGcsDowngradeOutcome cluster_bufmgr_first_fill_s_prepare_image(
+	const ClusterPcmReadGrantKey *key, int32 master_node, XLogRecPtr *out_page_lsn,
+	char *dst, ClusterBufmgrGcsCopyRefusal *out_refusal);
+extern bool cluster_gcs_block_read_grant_holder_notify(const ClusterPcmReadGrantKey *key,
+	int32 master_node);
+extern bool cluster_bufmgr_pending_s_aborted(BufferTag tag);
 extern bool cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(BufferTag tag, int32 master_node);
 extern ClusterBufmgrGcsDowngradeOutcome
 cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(
@@ -4138,6 +4265,19 @@ extern int cluster_pcm_local_pi_redeclare_scan_chunk(int start, int max_scan, ui
  * must exact-abort its GRANT_PENDING reservation before waiting/re-entering.
  * Terminal denials ereport(ERROR) and do not return.
  */
+/* Install permanent exit owners during buffer startup, before any read. */
+extern void cluster_gcs_block_read_source_init_backend(void);
+extern bool cluster_gcs_block_read_source_quiescent(BufferDesc *buf);
+extern void cluster_gcs_block_read_source_complete(BufferDesc *buf,
+	ClusterPcmReadSource *source, bool installed);
+extern void cluster_gcs_block_pending_s_tick(void);
+
+extern bool cluster_gcs_block_read_source_quiesce(BufferDesc *buf, const ClusterPcmReadSource *source);
+extern bool cluster_gcs_local_master_read_source_and_wait(BufferDesc *buf, const PcmAuthoritySnapshot *expected, bool force_one_shot, bool *retry, ClusterPcmReadSource *source);
+extern bool cluster_gcs_send_block_request_source_and_wait(BufferDesc *buf,
+														  int master_node,
+														  bool *out_retry_denied,
+														  ClusterPcmReadSource *source);
 extern bool cluster_gcs_send_block_request_and_wait(BufferDesc *buf,
 													PcmLockTransition transition_id,
 													int master_node, bool clean_eligible,

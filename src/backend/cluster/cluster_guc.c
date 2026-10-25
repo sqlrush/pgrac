@@ -116,6 +116,7 @@ bool cluster_xnode_profile_enabled = false;
 /* Diagnostic per-storage-UPDATE phase trace; default OFF. */
 bool cluster_update_trace_enabled = false;
 bool cluster_trace_tx_identity = false;
+bool cluster_trace_block_io = false;
 bool cluster_trace_cleanup = false;
 bool cluster_trace_normal_stop = false;
 char *cluster_trace_visibility_relids = NULL;
@@ -1736,6 +1737,10 @@ cluster_init_guc(void)
 		"cluster.trace_tx_identity", gettext_noop("Log exact transaction identity observations."),
 		gettext_noop("Bounded per-process diagnostic capture; unknown identity fields stay unknown."),
 		&cluster_trace_tx_identity, false, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.trace_block_io", gettext_noop("Record block read sources, failed pages and write receipts."),
+		NULL, &cluster_trace_block_io, false, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
 		"cluster.trace_cleanup", gettext_noop("Log transaction cleanup and buffer invalidation phases."),

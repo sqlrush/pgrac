@@ -1213,7 +1213,7 @@ UT_TEST(test_local_master_read_image_retries_holder_busy_with_fresh_identity)
 {
 	char *source = read_gcs_block_source();
 	const char *read_image
-		= source != NULL ? strstr(source, "\ncluster_gcs_local_master_read_image_and_wait(") : NULL;
+		= source != NULL ? strstr(source, "\ngcs_local_master_read_image_and_wait(") : NULL;
 	const char *read_image_end = read_image != NULL ? strstr(read_image, "\n}\n") : NULL;
 	const char *budget;
 	const char *loop;
@@ -1273,7 +1273,7 @@ UT_TEST(test_local_master_read_image_stops_retrying_displaced_holder_exactly)
 {
 	char *source = read_gcs_block_source();
 	const char *read_image
-		= source != NULL ? strstr(source, "\ncluster_gcs_local_master_read_image_and_wait(") : NULL;
+		= source != NULL ? strstr(source, "\ngcs_local_master_read_image_and_wait(") : NULL;
 	const char *read_image_end = read_image != NULL ? strstr(read_image, "\n}\n") : NULL;
 	const char *expected_arg;
 	const char *retry_arg;
@@ -1354,7 +1354,7 @@ UT_TEST(test_local_master_read_image_pending_x_denial_rearms_at_outer_boundary)
 {
 	char *source = read_gcs_block_source();
 	const char *read_image
-		= source != NULL ? strstr(source, "\ncluster_gcs_local_master_read_image_and_wait(") : NULL;
+		= source != NULL ? strstr(source, "\ngcs_local_master_read_image_and_wait(") : NULL;
 	const char *read_image_end = read_image != NULL ? strstr(read_image, "\n}\n") : NULL;
 	const char *pending_x;
 	const char *retry_flag;
@@ -1614,7 +1614,7 @@ UT_TEST(test_local_master_read_image_refusal_evidence_is_attempt_exact)
 	char *source = read_gcs_block_source();
 	char *t400 = read_source_path(T400_SOURCE_PATH);
 	const char *read_image
-		= source != NULL ? strstr(source, "\ncluster_gcs_local_master_read_image_and_wait(") : NULL;
+		= source != NULL ? strstr(source, "\ngcs_local_master_read_image_and_wait(") : NULL;
 	const char *read_image_end = read_image != NULL ? strstr(read_image, "\n}\n") : NULL;
 	const char *attempts = read_image != NULL ? strstr(read_image, "attempts=%d") : NULL;
 	const char *last_status = attempts != NULL ? strstr(attempts, "last_status=%d") : NULL;
@@ -1767,7 +1767,7 @@ UT_TEST(test_remote_downgrade_prepares_exact_image_before_notify_and_reply)
 	const char *helper
 		= bufmgr_source != NULL
 			  ? strstr(bufmgr_source,
-					   "\ncluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(")
+					   "\ncluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image_internal(")
 			  : NULL;
 	const char *helper_end = helper != NULL ? strstr(helper, "\n}\n") : NULL;
 	const char *reserve
@@ -1792,7 +1792,7 @@ UT_TEST(test_remote_downgrade_prepares_exact_image_before_notify_and_reply)
 		= helper != NULL ? strstr(helper, "cluster_bufmgr_pcm_own_abort_x_revoke(") : NULL;
 	const char *local_helper
 		= bufmgr_source != NULL
-			  ? strstr(bufmgr_source, "\ncluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(")
+			  ? strstr(bufmgr_source, "\ncluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image_internal(")
 			  : NULL;
 	const char *local_helper_end = local_helper != NULL ? strstr(local_helper, "\n}\n") : NULL;
 	const char *local_reserve = local_helper != NULL
