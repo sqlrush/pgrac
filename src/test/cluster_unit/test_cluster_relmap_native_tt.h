@@ -26,6 +26,7 @@ typedef struct TestRelmapNativeTTTerminal
 } TestRelmapNativeTTTerminal;
 
 extern void test_relmap_native_tt_reset(void);
+extern void test_relmap_native_tt_observe_active(bool (*observer)(TransactionId));
 extern bool test_relmap_native_tt_publish(TransactionId xid);
 extern bool test_relmap_native_tt_lookup(TransactionId xid, ClusterCanonicalTxnBinding *out);
 extern TestRelmapNativeTTStats test_relmap_native_tt_stats(void);

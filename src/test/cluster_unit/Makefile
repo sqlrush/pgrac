@@ -577,6 +577,7 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		test_cluster_relmap_original_tt.inc test_cluster_relmap_native_tt.h \
 		test_cluster_relmap_tt_retention.inc \
 		test_cluster_relmap_tt_terminal.inc \
+		test_cluster_relmap_active_hook.inc \
 		test_cluster_relmap_native_tt.o test_cluster_relmap_native_tt_durable.o \
 		test_cluster_relmap_native_lock.inc test_cluster_relmap_native_lock.h \
 		test_cluster_relmap_native_lock.o \
@@ -608,6 +609,7 @@ test_cluster_relmap_native_tt.o: test_cluster_relmap_native_tt.c \
 		test_cluster_relmap_native_tt.h test_cluster_relmap_native_tt_namespace.h \
 		test_cluster_tt_active_owner.c test_cluster_tt_durable.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
 		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
@@ -7611,7 +7613,8 @@ test_cluster_tt_rollback_entry: test_cluster_tt_rollback_entry.c test_cluster_tt
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_tt_abort_owner: test_cluster_tt_abort_owner.c test_cluster_tt_durable.c unit_test.h \
-		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c $(CLUSTER_TT_DURABLE_O)
+		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h $(CLUSTER_TT_DURABLE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
@@ -7619,6 +7622,7 @@ test_cluster_tt_abort_owner: test_cluster_tt_abort_owner.c test_cluster_tt_durab
 
 test_cluster_tt_active_owner: test_cluster_tt_active_owner.c test_cluster_tt_durable.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
 		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c $(CLUSTER_TT_DURABLE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
