@@ -3728,8 +3728,12 @@ cluster_recovery_typed_begin(ClusterRecoveryFencePlan **fence_plan)
 	{
 		if (serial_acquired)
 			cluster_write_fence_note_external_mutation_gate_blocked();
+		snprintf(readiness, sizeof(readiness),
+				 "serial_acquired=%d commit_attempted=%d plan_committed=%d typed_refusal=%d; %s",
+				 serial_acquired, serial_acquired, plan_committed, (int)typed->refusal,
+				 typed->refusal_detail);
 		cluster_recovery_typed_fail(fence_plan, &typed,
-									"cold recovery fence plan changed before replay", NULL);
+									"cold recovery fence plan changed before replay", readiness);
 	}
 	ereport(LOG,
 			(errmsg("cluster typed cold recovery: plan sealed for %u writer generations",

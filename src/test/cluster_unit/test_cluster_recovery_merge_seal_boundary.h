@@ -43,6 +43,8 @@
 /* ---- configuration the module reads ---- */
 bool cluster_merged_recovery = true;
 bool cluster_shared_config = true;
+bool cluster_trace_control_config = false;
+volatile uint32 CritSectionCount;
 bool fullPageWrites = true;
 char *cluster_wal_threads_dir = "/fixture/wal";
 char *cluster_shared_data_dir = "/fixture/data";
@@ -105,6 +107,8 @@ ErrorContextCallback *error_context_stack;
 static char last_message[512];
 static char last_detail[1024];
 static char last_plan_log_detail[1024];
+static char cold_fence_log[1024];
+static unsigned cold_fence_logs;
 
 static void event(const char *fmt, ...) pg_attribute_printf(1, 2);
 
@@ -171,6 +175,12 @@ errmsg(const char *fmt, ...)
 {
 	va_list args;
 
+	if (last_elevel == LOG && strstr(fmt, "PGRAC_FAMILY=COLD_FENCE") != NULL) {
+		va_start(args, fmt);
+		vsnprintf(cold_fence_log, sizeof(cold_fence_log), fmt, args);
+		va_end(args);
+		cold_fence_logs++;
+	}
 	if (last_elevel < ERROR)
 		return 0;
 	va_start(args, fmt);

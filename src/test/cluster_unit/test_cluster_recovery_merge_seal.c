@@ -502,10 +502,48 @@ UT_TEST(test_pre2_need_set_refusal_reports_original_provider_predicate)
 	cold_need_predicate = "NONE";
 }
 
+UT_TEST(test_commit_trace_identifies_original_snapshot_refusal_without_committing)
+{
+	const char *stages[] = { "stage=commit_root_token", "stage=commit_start_lsn",
+							"stage=revalidate_formation" };
+
+	for (unsigned enabled = 0; enabled < 3; enabled++)
+		for (unsigned fault = 0; fault < lengthof(stages); fault++) {
+			ClusterRecoveryFencePlan *plan;
+
+			fixture();
+			expect_engaged(&plan);
+			if (plan == NULL)
+				return;
+			if (fault == 0)
+				tokens[2].root_publish_seq++;
+			if (fault == 1)
+				plan->start_lsn[2]++;
+			if (fault == 2)
+				fence_current[2] = false;
+			cluster_trace_control_config = enabled;
+			CritSectionCount = enabled == 2;
+			cold_fence_logs = 0;
+			cold_fence_log[0] = '\0';
+			UT_ASSERT(!commit_as_held(plan));
+			UT_ASSERT(!plan->committed);
+			UT_ASSERT_EQ(cold_fence_logs, enabled == 1);
+			if (enabled == 1) {
+				UT_ASSERT(strstr(cold_fence_log, stages[fault]) != NULL);
+				UT_ASSERT(strstr(cold_fence_log, "origin_thread=2") != NULL);
+			}
+			UT_ASSERT_EQ(open_calls[2] + tail_calls[2], 0);
+			cluster_trace_control_config = false;
+			CritSectionCount = 0;
+			cluster_recovery_merge_fence_plan_destroy(&plan);
+		}
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
+	UT_RUN(test_commit_trace_identifies_original_snapshot_refusal_without_committing);
 	UT_RUN(test_pre2_need_set_refusal_reports_original_provider_predicate);
 	UT_RUN(test_pre2_preflight_uses_cold_cohort_and_prior_writer_needs);
 	UT_RUN(test_no_plan_refusal_identifies_snapshot_and_output_cut);

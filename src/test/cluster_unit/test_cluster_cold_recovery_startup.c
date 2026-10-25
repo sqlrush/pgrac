@@ -199,6 +199,50 @@ UT_TEST(test_execution_pin_includes_history_only_thread_once_after_census_releas
 	cluster_cold_typed_destroy_v1(&typed);
 }
 
+UT_TEST(test_execution_refusal_preserves_the_first_census_failure)
+{
+	const char *fields[] = { "missing", "kind", "native_checkpoint", "source", "root",
+							"checkpoint_start", "native_checkpoint", "native_checkpoint", "root" };
+
+	for (unsigned fault = 1; fault <= 13; fault++) {
+		ClusterColdTypedV1 *typed;
+		const char *stage;
+
+		fixture();
+		history_generation(2, 9, 0x40, 0x80);
+		typed = prepare(0x800);
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+		census_fault_index = 11;
+		if (fault <= 9)
+			census_input_fault = fault;
+		if (fault == 10)
+			census_token_result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		if (fault == 11)
+			census_token.file_txn_seq++;
+		if (fault == 12)
+			census_revalidate_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		if (fault == 13)
+			census_begin_result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		stage = fault <= 9 ? "stage=census_history" : fault == 10 ? "stage=census_root_read"
+				: fault == 11 ? "stage=census_root_changed"
+				: fault == 12 ? "stage=census_revalidate" : "stage=census_begin";
+		UT_ASSERT(!cluster_cold_typed_acquire_serial_v1(typed, (ClusterRecoveryFencePlan *)1));
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
+		UT_ASSERT(strstr(typed->refusal_detail, stage) != NULL);
+		if (fault <= 9) {
+			UT_ASSERT(strstr(typed->refusal_detail, fields[fault - 1]) != NULL);
+			UT_ASSERT(strstr(typed->refusal_detail, "input_index=11") != NULL);
+		}
+		UT_ASSERT_EQ(serial_input_calls, 0);
+		UT_ASSERT_EQ(census_begins, 2);
+		UT_ASSERT_EQ(census_releases, fault == 13 ? 1 : 2);
+		UT_ASSERT_NULL(typed->inputs);
+		UT_ASSERT(!typed->census_root_captured);
+		UT_ASSERT(!typed->history_xid[3].begun);
+		cluster_cold_typed_destroy_v1(&typed);
+	}
+}
+
 UT_TEST(test_execution_pin_refuses_changed_census_before_retention)
 {
 	ClusterColdTypedV1 *typed;
@@ -3789,7 +3833,8 @@ UT_TEST(test_own_root_seal_diagnostic_separates_lifecycle_and_flags)
 int
 main(void)
 {
-	UT_PLAN(133);
+	UT_PLAN(134);
+	UT_RUN(test_execution_refusal_preserves_the_first_census_failure);
 	UT_RUN(test_own_root_lookup_diagnostic_does_not_read_failed_outputs);
 	UT_RUN(test_own_root_key_format_diagnostic_names_the_field);
 	UT_RUN(test_own_root_legacy_crc_diagnostic_uses_native_claim_crc);

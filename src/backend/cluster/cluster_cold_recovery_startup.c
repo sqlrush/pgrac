@@ -676,34 +676,64 @@ cold_census_matches(ClusterColdTypedV1 *typed)
 {
 	ClusterControlRootFileToken token;
 	uint32 count = cluster_wal_inputs_count_v1(typed->inputs);
+	ClusterControlRootResult result;
 
-	if (cluster_wal_inputs_root_token_v1(typed->inputs, &token)
-			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY
-		|| memcmp(&token, &typed->census_root, sizeof(token)) != 0)
+	result = cluster_wal_inputs_root_token_v1(typed->inputs, &token);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
+					"pre-execution census refused: stage=census_root_read result=%d", (int)result);
 		return false;
+	}
+	if (memcmp(&token, &typed->census_root, sizeof(token)) != 0) {
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
+					"pre-execution census refused: stage=census_root_changed expected_txn="
+					UINT64_FORMAT " observed_txn=" UINT64_FORMAT,
+					typed->census_root.file_txn_seq, token.file_txn_seq);
+		return false;
+	}
 	for (uint32 i = typed->replay_count; i < typed->participant_count; i++) {
 		const ColdRoot *selected = &typed->replay_roots[i];
 		const ClusterWalInputV1 *input
 			= typed->input_index[i] < count
 				  ? cluster_wal_inputs_at_v1(typed->inputs, typed->input_index[i])
 				  : NULL;
+		const char *field = NULL;
 
 		/* The whole ROOT token also fixes input ordering and claim/anchor
 		 * references. Compare the actual checkpoint bytes read by that owner,
 		 * including the full-width seed used for the preserved history fold.
 		 * Preserve the original census role: current CLOSED/RECOVERY_COMPLETE
 		 * inputs can also be history. */
-		if (input == NULL || input->kind != CLUSTER_WAL_INPUT_CHECKPOINT
-			|| !selected->checkpoint_captured
-			|| memcmp(&input->checkpoint, &selected->root, sizeof(input->checkpoint)) != 0
-			|| memcmp(&input->source, &typed->sources[i], sizeof(input->source)) != 0
-			|| input->checkpoint_start != selected->checkpoint_start
-			|| input->native_redo != selected->native_checkpoint.redo
-			|| memcmp(&input->native_checkpoint, &selected->native_checkpoint,
-					  sizeof(input->native_checkpoint)) != 0)
+		if (input == NULL)
+			field = "missing";
+		else if (input->kind != CLUSTER_WAL_INPUT_CHECKPOINT)
+			field = "kind";
+		else if (!selected->checkpoint_captured)
+			field = "checkpoint_captured";
+		else if (memcmp(&input->checkpoint, &selected->root, sizeof(input->checkpoint)) != 0)
+			field = "root";
+		else if (memcmp(&input->source, &typed->sources[i], sizeof(input->source)) != 0)
+			field = "source";
+		else if (input->checkpoint_start != selected->checkpoint_start)
+			field = "checkpoint_start";
+		else if (input->native_redo != selected->native_checkpoint.redo)
+			field = "native_redo";
+		else if (memcmp(&input->native_checkpoint, &selected->native_checkpoint,
+						sizeof(input->native_checkpoint)) != 0)
+			field = "native_checkpoint";
+		if (field != NULL) {
+			cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
+						"pre-execution census refused: stage=census_history participant=%u "
+						"thread=%u input_index=%u field=%s",
+						i, typed->participants[i].thread_id, typed->input_index[i], field);
 			return false;
+		}
 	}
-	return cluster_wal_inputs_revalidate_v1(typed->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	result = cluster_wal_inputs_revalidate_v1(typed->inputs);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
+					"pre-execution census refused: stage=census_revalidate result=%d", (int)result);
+	return result == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
 bool
@@ -731,10 +761,15 @@ cluster_cold_typed_recheck_inputs_v1(ClusterColdTypedV1 *typed)
 	PG_TRY();
 	{
 		const ClusterControlRootIdentity *own = &typed->replay_roots[0].root.identity;
+		ClusterControlRootResult result;
 
-		if (cluster_wal_inputs_cold_begin_v1(own->storage_uuid, typed->system_identifier,
-											  &typed->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result = cluster_wal_inputs_cold_begin_v1(own->storage_uuid, typed->system_identifier,
+												 &typed->inputs);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			matched = cold_census_matches(typed);
+		else
+			cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
+						"pre-execution census refused: stage=census_begin result=%d", (int)result);
 		if (typed->inputs != NULL)
 			cluster_wal_inputs_release_v1(&typed->inputs);
 	}
@@ -767,15 +802,25 @@ cluster_cold_typed_acquire_serial_v1(ClusterColdTypedV1 *typed, ClusterRecoveryF
 
 	if (typed == NULL)
 		return false;
-	if (fence == NULL || !cluster_cold_typed_recheck_inputs_v1(typed))
+	if (fence == NULL) {
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "execution input retention refused: stage=fence");
+		goto refused;
+	}
+	if (!cluster_cold_typed_recheck_inputs_v1(typed))
 		goto refused;
 	for (uint32 i = 0; i < typed->participant_count; i++) {
 		uint16 thread = typed->participants[i].thread_id;
 
 		if (thread == 0 || thread > CLUSTER_WAL_RETENTION_MAX_THREADS
 			|| thread != typed->replay_roots[i].root.identity.origin_thread_id
-			|| thread != typed->sources[i].claim.identity.origin_thread_id)
+			|| thread != typed->sources[i].claim.identity.origin_thread_id) {
+			cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
+						"execution input retention refused: stage=input_thread participant=%u "
+						"thread=%u root_thread=%u source_thread=%u",
+						i, thread, typed->replay_roots[i].root.identity.origin_thread_id,
+						typed->sources[i].claim.identity.origin_thread_id);
 			goto refused;
+		}
 		selected[thread] = true;
 	}
 	for (uint16 thread = 1; thread <= CLUSTER_WAL_RETENTION_MAX_THREADS; thread++) {
@@ -794,14 +839,16 @@ cluster_cold_typed_acquire_serial_v1(ClusterColdTypedV1 *typed, ClusterRecoveryF
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	if (!acquired)
+	if (!acquired) {
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
+					"execution input retention refused: stage=serial_inputs input_threads=%u", count);
 		goto refused;
+	}
 	typed->refusal = CLUSTER_COLD_OK;
 	typed->refusal_detail[0] = '\0';
 	return true;
 
 refused:
-	cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "execution input retention could not be established");
 	memset(&typed->history_xid, 0, sizeof(typed->history_xid));
 	typed->census_root_captured = false;
 	return false;

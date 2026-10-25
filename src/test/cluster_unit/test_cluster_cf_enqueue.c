@@ -124,6 +124,8 @@ static char g_cf_trace_log[2048];
 static unsigned g_cf_trace_logs;
 static char g_walr_release_log[2048];
 static unsigned g_walr_release_logs;
+static char g_cold_fence_log[2048];
+static unsigned g_cold_fence_logs;
 static ClusterGesTimeoutDetail g_timeout_detail;
 
 const ClusterGesTimeoutDetail *
@@ -146,6 +148,13 @@ errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_un
 int
 errmsg(const char *fmt, ...)
 {
+	if (strstr(fmt, "PGRAC_FAMILY=COLD_FENCE") != NULL) {
+		va_list args;
+		va_start(args, fmt);
+		vsnprintf(g_cold_fence_log, sizeof(g_cold_fence_log), fmt, args);
+		va_end(args);
+		++g_cold_fence_logs;
+	}
 	if (strstr(fmt, "PGRAC_FAMILY=WALR_RELEASE") != NULL) {
 		va_list args;
 		va_start(args, fmt);
