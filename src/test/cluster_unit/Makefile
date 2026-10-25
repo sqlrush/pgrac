@@ -9403,13 +9403,22 @@ test_cluster_ctrc_native_group_exit.inc: $(top_srcdir)/src/backend/storage/ipc/p
 	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_ctrc_worker_sample.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
+	awk '/^cluster_undo_cleaner_active_sample\(/ { print "bool"; emit=1; found++ } \
+	     /^cluster_undo_cleaner_active_sample_current\(/ { print "bool"; emit=1; found++ } \
+	     /^undo_cleaner_publish_active_sample\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_ctrc_cleaner test_cluster_ctrc_capacity test_cluster_ctrc_dispatch \
 test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: test_cluster_ctrc_read_scope.inc \
+		test_cluster_ctrc_worker_sample.inc \
 		test_cluster_ctrc_native_exit.inc test_cluster_ctrc_native_group_exit.inc \
 		test_cluster_pgproc_active_types.inc \
 		$(top_srcdir)/src/include/storage/procarray.h $(top_srcdir)/src/include/access/transam.h \
 		$(top_srcdir)/src/include/access/twophase.h $(top_srcdir)/src/include/access/xlog.h \
-		$(top_srcdir)/src/include/storage/pg_sema.h $(top_srcdir)/src/include/utils/wait_event.h
+		$(top_srcdir)/src/include/storage/pg_sema.h $(top_srcdir)/src/include/utils/wait_event.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h
 
 test_cluster_ctrc_capacity: test_cluster_ctrc_capacity.c test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
@@ -10676,6 +10685,10 @@ test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_te
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_checkpoint.h \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o \
+		$(top_builddir)/src/common/libpgcommon.a \
+		test_cluster_cold_startup_native_window.inc \
 		test_cluster_cold_source_completion.inc \
 		test_cluster_cold_endpoints.h test_cluster_cold_recovery_xid_core.o \
 		test_cluster_cold_recovery_replay_core.o \
@@ -10686,6 +10699,8 @@ test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_te
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_census.h \
 		cluster_unit_port_stubs.o $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_STARTUP_O) \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o \
+		$(top_builddir)/src/common/libpgcommon.a \
 		test_cluster_cold_recovery_xid_core.o test_cluster_cold_recovery_replay_core.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		$(top_builddir)/src/common/libpgcommon.a \

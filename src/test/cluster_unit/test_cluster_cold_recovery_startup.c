@@ -50,6 +50,7 @@
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_relmap_retention_runtime.h"
+#include "cluster/cluster_relmap_checkpoint.h"
 #include "cluster/cluster_wal_tail.h"
 #include "utils/memutils.h"
 
@@ -3893,11 +3894,12 @@ UT_TEST(test_own_root_seal_diagnostic_separates_lifecycle_and_flags)
 		cluster_cold_typed_destroy_v1(&typed);
 	}
 }
+#include "test_cluster_cold_startup_native_window.inc"
 
 int
 main(void)
 {
-	UT_PLAN(137);
+	UT_PLAN(142);
 	UT_RUN(test_execution_refusal_preserves_the_first_census_failure);
 	UT_RUN(test_own_root_lookup_diagnostic_does_not_read_failed_outputs);
 	UT_RUN(test_own_root_key_format_diagnostic_names_the_field);
@@ -3963,6 +3965,11 @@ main(void)
 	UT_RUN(test_checkpoint_inputs_survive_census_for_every_generation);
 	UT_RUN(test_checkpoint_input_mismatch_stops_before_capture_and_scan);
 	UT_RUN(test_checkpoint_export_clears_unsealed_and_failed_output);
+	UT_RUN(test_checkpoint_windows_survive_every_original_generation);
+	UT_RUN(test_checkpoint_window_census_drift_stops_before_capture);
+	UT_RUN(test_checkpoint_window_scan_drift_never_seals_input);
+	UT_RUN(test_checkpoint_window_history_census_recheck_is_exact);
+	UT_RUN(test_checkpoint_window_original_reselect_drift_is_sticky);
 	UT_RUN(test_tt_base_capture_includes_history_before_wal_scan);
 	UT_RUN(test_tt_base_capture_failure_stops_before_side_and_scan);
 	UT_RUN(test_tt_base_drift_refuses_pass_two_stickily);

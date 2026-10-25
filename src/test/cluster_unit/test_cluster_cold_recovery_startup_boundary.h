@@ -95,6 +95,9 @@ static ClusterControlRootSnapshot roots[NROOTS + 1];
 static ClusterControlRootReadToken tokens[NROOTS + 1];
 static XLogRecPtr native_redo[NROOTS + 1];
 static ClusterWalRecoveryCheckpointV1 native_checkpoint[NROOTS + 1];
+static uint16 native_window_scan_thread;
+static uint32 native_window_scan_history;
+static bool native_window_scan_zero;
 static ClusterControlRootResult source_result[NROOTS + 1];
 static ClusterControlRootResult own_lookup_result;
 static bool own_lookup_override;
@@ -588,6 +591,13 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 		if (side_fault == 4 && thread == 3)
 			tokens[1].file_txn_seq++;
 	}
+	memcpy(result->native_window, native_checkpoint[thread].native_window, 160);
+	if (native_window_scan_thread == thread) {
+		if (native_window_scan_zero)
+			memset(result->native_window, 0, 160);
+		else
+			result->native_window[159] ^= 1;
+	}
 	return detail;
 }
 
@@ -683,6 +693,7 @@ static int census_input_fault;
 static uint32 census_fault_index;
 static unsigned history_checkpoint_reads;
 static unsigned history_checkpoint_fault;
+static uint8 history_native_window[MAX_HISTORY][160];
 static unsigned history_sync_calls, history_sync_fail_at, history_sync_fault;
 static uint64 history_sync_incarnations[MAX_HISTORY];
 static uint16 history_sync_threads[MAX_HISTORY];
@@ -723,6 +734,7 @@ census_refresh_inputs(void)
 		item->checkpoint_start = selected.checkpoint_start;
 		item->native_redo = selected.checkpoint.redo;
 		item->native_checkpoint = selected.checkpoint;
+		memcpy(item->native_window, selected.native_window, 160);
 	}
 	for (uint32 i = 0; i < census_history_count; i++) {
 		const ClusterColdCensusEntryV1 *entry = &census_history[i];
@@ -742,6 +754,7 @@ census_refresh_inputs(void)
 		item->native_redo = entry->cut.physical_lower;
 		item->native_checkpoint = native_checkpoint[entry->cut.thread_id].checkpoint;
 		item->native_checkpoint.redo = item->native_redo;
+		memcpy(item->native_window, history_native_window[i], 160);
 	}
 	{
 		ClusterWalInputV1 *item = &census_inputs[census_fault_index];
@@ -769,6 +782,12 @@ census_refresh_inputs(void)
 			break;
 		case 9:
 			item->checkpoint.checkpoint_lower_lsn++;
+			break;
+		case 10:
+			item->native_window[159] ^= 1;
+			break;
+		case 11:
+			memset(item->native_window, 0, 160);
 			break;
 		}
 	}
@@ -810,6 +829,7 @@ cluster_wal_inputs_cold_checkpoint_v1(const ClusterControlRootSnapshot *expected
 		out->source = item->source;
 		out->checkpoint_start = item->checkpoint_start;
 		out->checkpoint = item->native_checkpoint;
+		memcpy(out->native_window, item->native_window, 160);
 		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 	}
 	return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
@@ -1005,6 +1025,13 @@ cluster_cold_scan_input_v1(ClusterColdPlanV1 *plan, uint32 participant, ClusterW
 	result->history_xid.last_read = record.read_rec_ptr;
 	result->history_xid.last_end = record.end_rec_ptr;
 	result->history_xid.begun = true;
+	memcpy(result->native_window, census_inputs[index].native_window, 160);
+	if (native_window_scan_history == index) {
+		if (native_window_scan_zero)
+			memset(result->native_window, 0, 160);
+		else
+			result->native_window[159] ^= 1;
+	}
 	if (side_plan != NULL) {
 		UT_ASSERT_EQ(side_plan->cut.failed_thread, entry->cut.thread_id);
 		UT_ASSERT_EQ(side_plan->cut.origin_owner_incarnation, entry->cut.owner_incarnation);
@@ -1352,6 +1379,10 @@ fixture(void)
 	memset(roots, 0, sizeof(roots));
 	memset(tokens, 0, sizeof(tokens));
 	memset(native_checkpoint, 0, sizeof(native_checkpoint));
+	memset(history_native_window, 0, sizeof(history_native_window));
+	native_window_scan_thread = 0;
+	native_window_scan_history = 0;
+	native_window_scan_zero = false;
 	memset(commit_ts_profile_result, 0, sizeof(commit_ts_profile_result));
 	memset(commit_ts_profile_calls, 0, sizeof(commit_ts_profile_calls));
 	memset(commit_ts_profile_fail_after, 0, sizeof(commit_ts_profile_fail_after));
