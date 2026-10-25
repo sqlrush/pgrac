@@ -8333,7 +8333,8 @@ test_cluster_ctrc_worker_sample.inc: $(top_srcdir)/src/backend/cluster/cluster_u
 	awk '/^cluster_undo_cleaner_active_sample\(/ { print "bool"; emit=1; found++ } \
 	     /^cluster_undo_cleaner_active_sample_current\(/ { print "bool"; emit=1; found++ } \
 	     /^undo_cleaner_publish_active_sample\(/ { print "static void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
+	     /^undo_cleaner_publish_status\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 4) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_ctrc_cleaner test_cluster_ctrc_capacity test_cluster_ctrc_dispatch \
