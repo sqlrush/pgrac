@@ -122,12 +122,26 @@ static int empty_race, empty_vm_race, empty_repin_misses;
 static unsigned empty_aux_calls, empty_resumes, empty_heap_waits, empty_cleanup_waits;
 static unsigned empty_repins, empty_local_unlocks, empty_fsm;
 static bool empty_error_after_resume, empty_error_at_capture, empty_cancel_repin;
+/* Deferred repair owns no heap pin/lock; the lower X service may drop its
+ * only VM pin before returning a clean reobservation result. */
+static bool repair_retry_fixture, repair_pinned, repair_locked, repair_aux_driving;
+static bool repair_retain_pin, repair_clear_on_repin, repair_cancel, repair_caught;
+static unsigned repair_refusals, repair_attempts, repair_pin_calls, repair_unpins;
+static unsigned repair_error_at;
+static Buffer repair_vm_handle;
+static ResourceXAuxiliaryAcquireContext *repair_context;
+static PGAlignedBlock repair_current;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 volatile sig_atomic_t InterruptPending;
 void
 ProcessInterrupts(void)
 {
+	if (repair_retry_fixture) {
+		UT_ASSERT(repair_cancel && !repair_pinned && !repair_locked);
+		InterruptPending = false;
+		elog(ERROR, "controlled cancellation at unpinned VM repair retry");
+	}
 	UT_ASSERT(empty_fixture && !held[0] && !held[1] && !pinned[1]);
 	UT_ASSERT(empty_cancel_repin);
 	InterruptPending = false;
@@ -265,6 +279,28 @@ visibilitymap_pin_ok(BlockNumber block, Buffer buffer)
 void
 LockBuffer(Buffer buffer, int mode)
 {
+	if (repair_retry_fixture) {
+		UT_ASSERT_EQ(buffer, 2);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT(!held[0] && !pinned[0]);
+		if (mode == BUFFER_LOCK_UNLOCK) {
+			UT_ASSERT(repair_locked && repair_pinned);
+			repair_locked = false;
+		} else {
+			UT_ASSERT_EQ(mode, BUFFER_LOCK_EXCLUSIVE);
+			UT_ASSERT(repair_pinned && !repair_locked);
+			/* The ordinary API cannot return the replaced handle to its
+			 * owner. Model its existing pre-mutation error boundary. */
+			if (!repair_aux_driving && repair_refusals != 0) {
+				ReleaseBuffer(buffer);
+				fixture_locators[1].relNumber++;
+				elog(ERROR, "ordinary VM lock cannot return a replaced pin");
+			}
+			repair_locked = true;
+		}
+		lock_calls++;
+		return;
+	}
 	if (empty_fixture) {
 		UT_ASSERT(buffer == 1 || buffer == 2);
 		if (cluster_shared_config)
@@ -376,6 +412,13 @@ vm_readbuf(Relation rel, BlockNumber block, bool extend)
 void
 ReleaseBuffer(Buffer buffer)
 {
+	if (repair_retry_fixture) {
+		UT_ASSERT_EQ(buffer, 2);
+		UT_ASSERT(repair_pinned && !repair_locked);
+		repair_pinned = false;
+		repair_unpins++;
+		return;
+	}
 	UT_ASSERT(empty_fixture && (buffer == 1 || buffer == 2));
 	UT_ASSERT(pinned[buffer - 1] && !held[buffer - 1]);
 	pinned[buffer - 1] = false;
@@ -399,6 +442,50 @@ LockBufferForCleanup(Buffer buffer)
 bool
 ClusterLockBufferExclusiveAuxiliaryAware(Buffer *buffer, ResourceXAuxiliaryAcquireContext *context)
 {
+	if (repair_retry_fixture) {
+		UT_ASSERT(context != NULL && repair_pinned && !repair_locked);
+		UT_ASSERT_EQ(*buffer, 2);
+		UT_ASSERT(!held[0] && !pinned[0]);
+		repair_attempts++;
+		if (repair_attempts == 1) {
+			UT_ASSERT(!context->active);
+			repair_context = context;
+			context->active = true;
+			context->absolute_deadline_us = 81;
+			context->diagnostic_request_sequence = 91;
+		} else {
+			UT_ASSERT(context == repair_context && context->active);
+			UT_ASSERT_EQ(context->absolute_deadline_us, 81);
+			UT_ASSERT_EQ(context->diagnostic_request_sequence, 91);
+			UT_ASSERT_EQ(context->reobserve_count,
+						 repair_retain_pin ? 0 : repair_attempts - 1);
+		}
+		if (repair_attempts == repair_error_at)
+			elog(ERROR, "controlled VM repair acquisition failure");
+		if (repair_refusals != 0) {
+			repair_refusals--;
+			context->reobserve = !repair_retain_pin;
+			if (!repair_retain_pin)
+				context->reobserve_count++;
+			if (!repair_retain_pin) {
+				ReleaseBuffer(*buffer);
+				*buffer = InvalidBuffer;
+				fixture_locators[1].relNumber++;
+			}
+			if (repair_cancel)
+				InterruptPending = true;
+			return false;
+		}
+		repair_aux_driving = true;
+		LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
+		repair_aux_driving = false;
+		memset(context, 0, sizeof(*context));
+		return true;
+	}
+	if (repairing_vm_only) {
+		LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
+		return true;
+	}
 	UT_ASSERT(empty_fixture && context != NULL && !held[0]);
 	UT_ASSERT_EQ(*buffer, 2);
 	empty_aux_calls++;
@@ -499,6 +586,16 @@ visibilitymap_pin(Relation rel, BlockNumber block, Buffer *buffer)
 	UT_ASSERT(rel == &relation);
 	UT_ASSERT_EQ(block, 0);
 	UT_ASSERT(!BufferIsValid(*buffer) || *buffer == 2);
+	if (repair_retry_fixture) {
+		UT_ASSERT(!repair_locked && !held[0] && !pinned[0]);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		repair_pin_calls++;
+		repair_pinned = true;
+		fixture_locators[1] = relation.rd_locator;
+		if (repair_clear_on_repin && repair_pin_calls > 1)
+			*PageGetContents(pages[1].data) &= ~VISIBILITYMAP_VALID_BITS;
+		repair_current = pages[1];
+	}
 	if (empty_fixture) {
 		UT_ASSERT(!held[0] && !held[1]);
 		pinned[1] = true;
@@ -521,6 +618,7 @@ run_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLogRecPtr recptr, Bu
 	static void reset(bool shared, bool visible, uint8 vm_bits)
 {
 	empty_fixture = false;
+	repair_retry_fixture = false;
 	memset(&relation, 0, sizeof(relation));
 	memset(&relform, 0, sizeof(relform));
 	memset(&identity, 0, sizeof(identity));
@@ -1451,10 +1549,137 @@ UT_TEST(test_pinned_vm_status_refuses_unknown_zero_and_accepts_only_pristine_new
 	}
 }
 
+static void
+setup_repair_reobservation(bool retain_pin, unsigned refusals, bool cached)
+{
+	reset(true, false, VISIBILITYMAP_VALID_BITS | (VISIBILITYMAP_VALID_BITS << 2));
+	repair_retry_fixture = repairing = repairing_vm_only = true;
+	repair_pinned = cached;
+	repair_locked = repair_aux_driving = false;
+	repair_retain_pin = retain_pin;
+	repair_clear_on_repin = repair_cancel = repair_caught = false;
+	repair_refusals = refusals;
+	repair_attempts = repair_pin_calls = repair_unpins = repair_error_at = 0;
+	repair_vm_handle = cached ? 2 : InvalidBuffer;
+	repair_context = NULL;
+	InterruptPending = false;
+	memset(held, 0, sizeof(held));
+	memset(pinned, 0, sizeof(pinned));
+}
+
+static void
+run_repair_with_error_boundary(void)
+{
+	expecting_error = true;
+	if (setjmp(error_jump) == 0)
+		lazy_clear_vm_after_heap(&relation, &identity, 0, &repair_vm_handle);
+	else
+		repair_caught = true;
+	expecting_error = false;
+}
+
+UT_TEST(test_vm_only_repair_reobserves_replaced_and_retained_pins)
+{
+	for (unsigned retain = 0; retain < 2; retain++) {
+		for (unsigned cached = 0; cached < 2; cached++) {
+			for (unsigned refusals = 1; refusals <= 4; refusals += 3) {
+				setup_repair_reobservation(retain != 0, refusals, cached != 0);
+				run_repair_with_error_boundary();
+				UT_ASSERT(!repair_caught);
+				UT_ASSERT_EQ(repair_attempts, refusals + 1);
+				UT_ASSERT_EQ(repair_pin_calls, refusals + 1);
+				UT_ASSERT_EQ(repair_unpins, refusals);
+				UT_ASSERT(repair_pinned && !repair_locked);
+				UT_ASSERT_EQ(repair_vm_handle, 2);
+				UT_ASSERT_EQ(assertion_failures, 0);
+				UT_ASSERT_EQ(CritSectionCount, 0);
+				UT_ASSERT_EQ(inserts, 1);
+				UT_ASSERT_EQ(edge_count, 1);
+				UT_ASSERT_EQ(next_token, 101);
+				UT_ASSERT_EQ(edges[0].before.mutation_token, 30);
+				UT_ASSERT_EQ(registered[0], 1);
+				UT_ASSERT_EQ(registered[1], 0);
+				UT_ASSERT_EQ(dirty[0], 0);
+				UT_ASSERT_EQ(dirty[1], 1);
+				UT_ASSERT_EQ(*PageGetContents(pages[1].data), VISIBILITYMAP_VALID_BITS << 2);
+				UT_ASSERT_EQ(PageGetLSN(pages[1].data), UINT64_C(0x9000));
+				UT_ASSERT_EQ(memcmp(pages[0].data, before[0].data, BLCKSZ), 0);
+				if (repair_pinned)
+					ReleaseBuffer(repair_vm_handle);
+			}
+		}
+	}
+}
+
+UT_TEST(test_vm_only_repair_rechecks_clear_after_refetch_without_wal)
+{
+	for (unsigned retain = 0; retain < 2; retain++) {
+		setup_repair_reobservation(retain != 0, 1, false);
+		repair_clear_on_repin = true;
+		run_repair_with_error_boundary();
+		UT_ASSERT(!repair_caught);
+		UT_ASSERT_EQ(repair_attempts, 2);
+		UT_ASSERT_EQ(repair_pin_calls, 2);
+		UT_ASSERT_EQ(repair_unpins, 1);
+		UT_ASSERT(repair_pinned && !repair_locked);
+		UT_ASSERT_EQ(assertion_failures, 0);
+		UT_ASSERT_EQ(next_token, 100);
+		UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
+		UT_ASSERT_EQ(memcmp(pages[0].data, before[0].data, BLCKSZ), 0);
+		UT_ASSERT_EQ(memcmp(pages[1].data, repair_current.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(*PageGetContents(pages[1].data), VISIBILITYMAP_VALID_BITS << 2);
+		if (repair_pinned)
+			ReleaseBuffer(repair_vm_handle);
+	}
+}
+
+UT_TEST(test_vm_only_repair_cancel_stops_before_next_pin_or_mutation)
+{
+	for (unsigned retain = 0; retain < 2; retain++) {
+		setup_repair_reobservation(retain != 0, 4, false);
+		repair_cancel = true;
+		run_repair_with_error_boundary();
+		UT_ASSERT(repair_caught && !InterruptPending);
+		UT_ASSERT_EQ(repair_attempts, 1);
+		UT_ASSERT_EQ(repair_pin_calls, 1);
+		UT_ASSERT_EQ(repair_unpins, 1);
+		UT_ASSERT_EQ(repair_vm_handle, InvalidBuffer);
+		UT_ASSERT(!repair_pinned && !repair_locked);
+		UT_ASSERT_EQ(assertion_failures, 0);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT_EQ(next_token, 100);
+		UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
+		UT_ASSERT_EQ(memcmp(pages, before, sizeof(pages)), 0);
+	}
+}
+
+UT_TEST(test_vm_only_repair_error_preserves_only_the_callers_current_pin)
+{
+	for (unsigned retain = 0; retain < 2; retain++) {
+		setup_repair_reobservation(retain != 0, 1, false);
+		repair_error_at = 2;
+		run_repair_with_error_boundary();
+		UT_ASSERT(repair_caught);
+		UT_ASSERT_EQ(repair_attempts, 2);
+		UT_ASSERT_EQ(repair_pin_calls, 2);
+		UT_ASSERT_EQ(repair_unpins, 1);
+		UT_ASSERT_EQ(repair_vm_handle, 2);
+		UT_ASSERT(repair_pinned && !repair_locked);
+		UT_ASSERT_EQ(assertion_failures, 0);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT_EQ(next_token, 100);
+		UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
+		UT_ASSERT_EQ(memcmp(pages, before, sizeof(pages)), 0);
+		if (repair_pinned)
+			ReleaseBuffer(repair_vm_handle);
+		UT_ASSERT(!repair_pinned);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(37);
 	UT_RUN(test_visible_exact_two_page_batch);
 	UT_RUN(test_no_change_allocates_no_version);
 	UT_RUN(test_nonshared_preserves_native_hint_lsn_rules);
@@ -1488,6 +1713,10 @@ main(void)
 	UT_RUN(test_pinned_vm_status_decodes_exact_bytes_without_mutation_or_acquisition);
 	UT_RUN(test_pinned_vm_status_rejects_wrong_targets_and_invalid_arguments);
 	UT_RUN(test_pinned_vm_status_refuses_unknown_zero_and_accepts_only_pristine_new_page);
+	UT_RUN(test_vm_only_repair_reobserves_replaced_and_retained_pins);
+	UT_RUN(test_vm_only_repair_rechecks_clear_after_refetch_without_wal);
+	UT_RUN(test_vm_only_repair_cancel_stops_before_next_pin_or_mutation);
+	UT_RUN(test_vm_only_repair_error_preserves_only_the_callers_current_pin);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

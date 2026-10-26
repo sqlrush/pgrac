@@ -21,6 +21,7 @@
 #include "postgres.h"
 
 #include <setjmp.h>
+#include <stdarg.h>
 #include <unistd.h>
 
 #include "access/generic_xlog.h"
@@ -39,6 +40,8 @@
 #include "cluster/cluster_itl_touch.h"
 #include "cluster/cluster_itl.h"
 #include "utils/memutils.h"
+#include "utils/resowner.h"
+#include "utils/memdebug.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_pcm_lock.h"
@@ -12454,6 +12457,11 @@ page_owner_generic_start(bool logged, GenericXLogInternalOwner owner)
 	return (GenericXLogState *)&page_owner_wal_cookie;
 }
 
+static bool page_owner_use_native_resident;
+static unsigned page_owner_native_resident_calls;
+static Buffer page_owner_acquire_from_original(const ClusterItlTouchRecord *, ClusterItlStampSkipReason *);
+static void page_owner_unlock_from_original(Buffer);
+
 static Buffer
 page_owner_stamp_acquire(const ClusterItlTouchRecord *record, ClusterItlStampSkipReason *reason)
 {
@@ -12463,6 +12471,8 @@ page_owner_stamp_acquire(const ClusterItlTouchRecord *record, ClusterItlStampSki
 	else
 		UT_ASSERT(record == page_owner_touch_list);
 	UT_ASSERT(reason != NULL); *reason = (ClusterItlStampSkipReason)0;
+	if (page_owner_use_native_resident)
+		return page_owner_acquire_from_original(record, reason);
 	if (page_owner_stamp_case == 0)
 		return InvalidBuffer;
 	page_owner_page_locked = true;
@@ -12474,7 +12484,11 @@ page_owner_stamp_unlock(Buffer buffer)
 {
 	UT_ASSERT_EQ(buffer, 1); UT_ASSERT(page_owner_page_locked);
 	UT_ASSERT_EQ(page_owner_touch_list->ctrc_handle.receipt->state, CTRC_RECEIPT_APPLIED);
-	page_owner_page_locked = false; page_owner_unlocks++;
+	if (page_owner_use_native_resident)
+		page_owner_unlock_from_original(buffer);
+	else
+		page_owner_page_locked = false;
+	page_owner_unlocks++;
 }
 
 static bool
@@ -12666,6 +12680,321 @@ page_owner_capture_from_original(Buffer buffer, const BufferTag *tag,
 	pg_atomic_write_u32(&buf->state, saved_state);
 	page_owner_native_authority_calls++;
 	return result;
+}
+
+/* Mapping, private pin/resource owner and LWLock scheduling are controlled.
+ * Original resident bodies own all live checks and refusal/success cleanup. */
+#include "test_cluster_heap_resident_stamp_types.inc"
+static LWLock page_owner_resident_mapping_lock;
+static bool page_owner_resident_active, page_owner_resident_partition_held;
+static unsigned page_owner_resident_pins, page_owner_resident_unpins;
+static unsigned page_owner_resident_releases, page_owner_resident_successes;
+static unsigned page_owner_resident_missing, page_owner_resident_wrap, page_owner_resident_generation;
+static struct {
+	BufferTag tag;
+	uint32 state;
+	uint8 pcm, type;
+	ClusterPcmOwnEntry own, *array;
+	int32 pins;
+	bool local_x;
+} page_owner_resident_saved;
+
+static uint32
+page_owner_resident_hash(BufferTag *tag)
+{
+	UT_ASSERT(page_owner_resident_active && !page_owner_resident_partition_held);
+	UT_ASSERT(BufferTagsEqual(tag, &GetBufferDescriptor(0)->tag));
+	return 73;
+}
+static LWLock *
+page_owner_resident_partition(uint32 hash)
+{
+	UT_ASSERT_EQ(hash, 73);
+	return &page_owner_resident_mapping_lock;
+}
+static void
+page_owner_resident_reserve(void)
+{
+	UT_ASSERT(page_owner_resident_active && !page_owner_resident_partition_held && !page_owner_page_locked);
+}
+static void
+page_owner_resident_enlarge(ResourceOwner owner)
+{
+	UT_ASSERT(owner == (ResourceOwner)&page_owner_wal_cookie);
+	page_owner_resident_reserve();
+}
+static bool
+page_owner_resident_lock(LWLock *lock, LWLockMode mode)
+{
+	UT_ASSERT(page_owner_resident_active);
+	if (lock == &page_owner_resident_mapping_lock)
+	{
+		UT_ASSERT_EQ(mode, LW_SHARED);
+		UT_ASSERT(!page_owner_resident_partition_held && !page_owner_page_locked);
+		page_owner_resident_partition_held = true;
+	}
+	else
+	{
+		UT_ASSERT(lock == BufferDescriptorGetContentLock(GetBufferDescriptor(0)));
+		UT_ASSERT_EQ(mode, LW_EXCLUSIVE);
+		UT_ASSERT(!page_owner_resident_partition_held && !page_owner_page_locked && !local_x);
+		UT_ASSERT_EQ(backend_pin_count, page_owner_resident_saved.pins + 1);
+		page_owner_page_locked = local_x = true;
+	}
+	return true;
+}
+static void
+page_owner_resident_release_lock(LWLock *lock)
+{
+	UT_ASSERT(page_owner_resident_active);
+	if (lock == &page_owner_resident_mapping_lock)
+	{
+		UT_ASSERT(page_owner_resident_partition_held && !page_owner_page_locked);
+		page_owner_resident_partition_held = false;
+	}
+	else
+	{
+		UT_ASSERT(lock == BufferDescriptorGetContentLock(GetBufferDescriptor(0)));
+		UT_ASSERT(!page_owner_resident_partition_held && page_owner_page_locked && local_x);
+		UT_ASSERT_EQ(backend_pin_count, page_owner_resident_saved.pins + 1);
+		page_owner_page_locked = local_x = false;
+		page_owner_resident_releases++;
+	}
+}
+static int
+page_owner_resident_lookup(BufferTag *tag, uint32 hash)
+{
+	UT_ASSERT(page_owner_resident_partition_held && !page_owner_page_locked);
+	UT_ASSERT_EQ(hash, 73); UT_ASSERT(BufferTagsEqual(tag, &GetBufferDescriptor(0)->tag));
+	return page_owner_stamp_case == 0 ? -1 : 0;
+}
+static bool page_owner_use_original_lookup_pin;
+static unsigned page_owner_original_lookup_pin_calls;
+static unsigned page_owner_lookup_private_reads, page_owner_lookup_pin_leaf_calls;
+
+/* Actual lookup routing and the original PCM tracking predicate below;
+ * private-refcount storage, runtime/config and primitive pin stay controlled.
+ * Auxiliary publication is outside these MAIN-fork cases and fails loudly. */
+static PrivateRefCountEntry *
+page_owner_lookup_private_ref(Buffer buffer, bool move)
+{
+	UT_ASSERT(page_owner_use_original_lookup_pin && page_owner_resident_partition_held);
+	UT_ASSERT_EQ(buffer, 1); UT_ASSERT(move);
+	page_owner_lookup_private_reads++;
+	return NULL;
+}
+static bool
+page_owner_lookup_pcm_active(void)
+{
+	UT_ASSERT(page_owner_use_original_lookup_pin && page_owner_resident_active && page_owner_resident_partition_held);
+	return true;
+}
+static bool
+page_owner_lookup_pin_leaf(BufferDesc *buf, BufferAccessStrategy strategy)
+{
+	UT_ASSERT(buf == GetBufferDescriptor(0) && strategy == NULL);
+	UT_ASSERT_EQ(buf->tag.forkNum, MAIN_FORKNUM);
+	UT_ASSERT(page_owner_resident_partition_held && !page_owner_page_locked);
+	UT_ASSERT_EQ(backend_pin_count, page_owner_resident_saved.pins);
+	backend_pin_count++; page_owner_resident_pins++;
+	page_owner_lookup_pin_leaf_calls++;
+	return true;
+}
+static void
+page_owner_lookup_aux_reserve(void)
+{
+	UT_ASSERT(false);
+}
+static PrivateRefCountEntry *
+page_owner_lookup_aux_ref(Buffer buffer)
+{
+	(void)buffer;
+	UT_ASSERT(false);
+	return NULL;
+}
+static void
+page_owner_lookup_aux_remember(ResourceOwner owner, Buffer buffer)
+{
+	(void)owner; (void)buffer;
+	UT_ASSERT(false);
+}
+
+#define GetPrivateRefCountEntry page_owner_lookup_private_ref
+#define cluster_pcm_is_active page_owner_lookup_pcm_active
+#define cluster_shared_catalog true
+#define cluster_bufmgr_should_pcm_track original_touch_pin_tracked
+#define ReservePrivateRefCountEntry page_owner_lookup_aux_reserve
+#define LockBufHdr original_touch_header_lock
+#define NewPrivateRefCountEntry page_owner_lookup_aux_ref
+#define ResourceOwnerRememberBuffer page_owner_lookup_aux_remember
+#define CurrentResourceOwner ((ResourceOwner)&page_owner_wal_cookie)
+#define PinBuffer page_owner_lookup_pin_leaf
+#define PinBufferForLookup original_touch_lookup_pin
+#include "test_cluster_heap_lookup_pin.inc"
+#undef PinBufferForLookup
+#undef PinBuffer
+#undef CurrentResourceOwner
+#undef ResourceOwnerRememberBuffer
+#undef NewPrivateRefCountEntry
+#undef LockBufHdr
+#undef ReservePrivateRefCountEntry
+#undef cluster_bufmgr_should_pcm_track
+#undef cluster_shared_catalog
+#undef cluster_pcm_is_active
+#undef GetPrivateRefCountEntry
+
+static PinBufferLookupResult
+page_owner_resident_pin(BufferDesc *buf, BufferAccessStrategy strategy)
+{
+	UT_ASSERT(buf == GetBufferDescriptor(0) && strategy == NULL);
+	UT_ASSERT(page_owner_resident_partition_held && !page_owner_page_locked);
+	UT_ASSERT_EQ(backend_pin_count, page_owner_resident_saved.pins);
+	if (page_owner_use_original_lookup_pin)
+	{
+		PinBufferLookupResult result = original_touch_lookup_pin(buf, strategy);
+		page_owner_original_lookup_pin_calls++;
+		return result;
+	}
+	backend_pin_count++; page_owner_resident_pins++;
+	return PIN_BUFFER_LOOKUP_VALID;
+}
+static void
+page_owner_resident_unpin(Buffer buffer)
+{
+	UT_ASSERT_EQ(buffer, 1);
+	UT_ASSERT(!page_owner_resident_partition_held && !page_owner_page_locked && !local_x);
+	UT_ASSERT_EQ(backend_pin_count, page_owner_resident_saved.pins + 1);
+	backend_pin_count--; page_owner_resident_unpins++;
+}
+
+static int page_owner_resident_error_detail(const char *format, ...) pg_attribute_printf(1, 2);
+static int
+page_owner_resident_error_detail(const char *format, ...)
+{
+	va_list args;
+	char detail[128];
+
+	va_start(args, format);
+	(void)vsnprintf(detail, sizeof(detail), format, args);
+	va_end(args);
+	fprintf(stderr, "# resident stamp detail: %s\n", detail);
+	return 0;
+}
+
+#define errdetail page_owner_resident_error_detail
+#define cluster_bufmgr_lock_resident_for_exact_itl_stamp original_touch_resident_acquire
+#define cluster_bufmgr_unlock_resident_stamp original_touch_resident_unlock
+#define cluster_pcm_own_snapshot_locked original_touch_snapshot_locked
+#define cluster_bufmgr_pcm_x_retained_image_locked original_touch_retained_image
+#define LockBufHdr original_touch_header_lock
+#define cluster_conf_node_count page_owner_authority_node_count
+#define cluster_epoch_get_current page_owner_authority_epoch
+#define cluster_storage_mode_enabled page_owner_authority_storage
+#define BufTableHashCode page_owner_resident_hash
+#define BufMappingPartitionLock page_owner_resident_partition
+#define ReservePrivateRefCountEntry page_owner_resident_reserve
+#define ResourceOwnerEnlargeBuffers page_owner_resident_enlarge
+#define CurrentResourceOwner ((ResourceOwner)&page_owner_wal_cookie)
+#define LWLockAcquire page_owner_resident_lock
+#define LWLockRelease page_owner_resident_release_lock
+#define BufTableLookup page_owner_resident_lookup
+#define PinBufferForLookup page_owner_resident_pin
+#define ReleaseBuffer page_owner_resident_unpin
+#include "test_cluster_heap_resident_stamp.inc"
+#undef BufHdrGetBlock
+#undef ReleaseBuffer
+#undef PinBufferForLookup
+#undef BufTableLookup
+#undef LWLockRelease
+#undef LWLockAcquire
+#undef CurrentResourceOwner
+#undef ResourceOwnerEnlargeBuffers
+#undef ReservePrivateRefCountEntry
+#undef BufMappingPartitionLock
+#undef BufTableHashCode
+#undef cluster_storage_mode_enabled
+#undef cluster_epoch_get_current
+#undef cluster_conf_node_count
+#undef LockBufHdr
+#undef cluster_bufmgr_pcm_x_retained_image_locked
+#undef cluster_pcm_own_snapshot_locked
+#undef cluster_bufmgr_unlock_resident_stamp
+#undef cluster_bufmgr_lock_resident_for_exact_itl_stamp
+#undef errdetail
+
+static void
+page_owner_resident_restore(void)
+{
+	BufferDesc *buf = GetBufferDescriptor(0);
+	UT_ASSERT(page_owner_resident_active && !page_owner_resident_partition_held && !page_owner_page_locked);
+	UT_ASSERT_EQ(backend_pin_count, page_owner_resident_saved.pins);
+	UT_ASSERT_EQ(local_x, page_owner_resident_saved.local_x);
+	buf->tag = page_owner_resident_saved.tag;
+	buf->pcm_state = page_owner_resident_saved.pcm; buf->buffer_type = page_owner_resident_saved.type;
+	pg_atomic_write_u32(&buf->state, page_owner_resident_saved.state);
+	ClusterPcmOwnArray = page_owner_resident_saved.array;
+	page_owner_resident_active = false;
+}
+static Buffer
+page_owner_acquire_from_original(const ClusterItlTouchRecord *record, ClusterItlStampSkipReason *reason)
+{
+	BufferDesc *buf = GetBufferDescriptor(0);
+	ClusterPcmOwnEntry *own = &page_owner_resident_saved.own;
+	const ClusterItlTerminalProof *latest = &page_owner_touch_list[page_owner_touch_count - 1].proof;
+	Buffer result;
+	UT_ASSERT(page_owner_use_native_resident && !page_owner_resident_active && !local_x);
+	page_owner_resident_saved.tag = buf->tag;
+	page_owner_resident_saved.state = pg_atomic_read_u32(&buf->state);
+	page_owner_resident_saved.pcm = buf->pcm_state; page_owner_resident_saved.type = buf->buffer_type;
+	page_owner_resident_saved.array = ClusterPcmOwnArray;
+	page_owner_resident_saved.pins = backend_pin_count; page_owner_resident_saved.local_x = local_x;
+	UT_ASSERT_EQ(page_owner_resident_saved.state & BM_LOCKED, 0);
+	pg_atomic_init_u64(&own->generation, latest->own_generation);
+	pg_atomic_init_u64(&own->reservation_token, 0);
+	pg_atomic_init_u64(&own->writer_activation_token, 0);
+	pg_atomic_init_u64(&own->resource_x_activation_generation, 0);
+	pg_atomic_init_u64(&own->delivery_attempt, 0); pg_atomic_init_u32(&own->flags, 0);
+	ClusterPcmOwnArray = own;
+	InitBufferTag(&buf->tag, &record->key.rloc, record->key.forknum, record->key.block);
+	buf->pcm_state = PCM_STATE_X; buf->buffer_type = BUF_TYPE_CURRENT;
+	pg_atomic_write_u32(&buf->state, BM_VALID);
+	page_owner_resident_active = true;
+	result = original_touch_resident_acquire(record, reason);
+	page_owner_native_resident_calls++;
+	if (BufferIsValid(result))
+	{
+		UT_ASSERT_EQ(result, 1); UT_ASSERT_EQ(*reason, CLUSTER_ITL_STAMP_SKIP_NONE);
+		UT_ASSERT(page_owner_page_locked && local_x && !page_owner_resident_partition_held);
+		page_owner_resident_successes++;
+	}
+	else
+	{
+		if (page_owner_stamp_case == 0)
+		{
+			UT_ASSERT_EQ(*reason, CLUSTER_ITL_STAMP_SKIP_NOT_RESIDENT);
+			page_owner_resident_missing++;
+		}
+		else if (record == page_owner_touch_list + page_owner_touch_count - 1)
+		{
+			UT_ASSERT_EQ(page_owner_stamp_case, 1);
+			UT_ASSERT_EQ(*reason, CLUSTER_ITL_STAMP_SKIP_WRAP_CHANGED);
+			page_owner_resident_wrap++;
+		}
+		else
+		{
+			UT_ASSERT_EQ(*reason, CLUSTER_ITL_STAMP_SKIP_OWNERSHIP_GENERATION_CHANGED);
+			page_owner_resident_generation++;
+		}
+		page_owner_resident_restore();
+	}
+	return result;
+}
+static void
+page_owner_unlock_from_original(Buffer buffer)
+{
+	UT_ASSERT(page_owner_resident_active && page_owner_page_locked && local_x);
+	original_touch_resident_unlock(buffer);
+	page_owner_resident_restore();
 }
 
 static bool
@@ -12933,7 +13262,10 @@ page_owner_finish_full_batch(ClusterItlTouchRecord *record)
 			UT_ASSERT_EQ(batch.nruns, 0);
 		UT_ASSERT(!page_owner_page_locked);
 		UT_ASSERT_EQ(page_owner_starts, 1);
-		UT_ASSERT_EQ(page_owner_unlocks, page_owner_stamp_case != 0);
+		if (page_owner_use_native_resident)
+			UT_ASSERT_EQ(page_owner_unlocks, page_owner_stamp_case >= 2);
+		else
+			UT_ASSERT_EQ(page_owner_unlocks, page_owner_stamp_case != 0);
 		if (page_owner_stamp_case < 2)
 		{
 			UT_ASSERT_EQ(page_owner_skips, page_owner_use_range ? 2 : 1);
@@ -13369,6 +13701,69 @@ full_source_then_recent_case(bool batch, bool late_receiver)
 	full_source_then_recent_lifecycle_case(batch, late_receiver, false, 0, 0);
 }
 
+UT_TEST(test_original_lookup_pin_feeds_resident_stamp_and_recent_freeze)
+{
+	page_owner_use_original_lookup_pin = true;
+	page_owner_original_lookup_pin_calls = 0;
+	page_owner_lookup_private_reads = page_owner_lookup_pin_leaf_calls = 0;
+	page_owner_use_native_resident = page_owner_use_native_authority = true;
+	page_owner_native_resident_calls = 0;
+	page_owner_resident_pins = page_owner_resident_unpins = 0;
+	page_owner_resident_releases = page_owner_resident_successes = 0;
+	page_owner_resident_missing = page_owner_resident_wrap = page_owner_resident_generation = 0;
+	page_owner_native_authority_calls = page_owner_native_authority_refusals = 0;
+	page_owner_use_registration = page_owner_use_xact_owner = page_owner_use_range = page_owner_use_full_batch = native_exit_use_page_owner_discharge = true;
+	page_owner_registered_records = 0;
+	for (unsigned retirement = 1; retirement <= 2; retirement++)
+		for (unsigned batch = 0; batch < 2; batch++)
+			full_source_then_recent_lifecycle_case(batch != 0, false, true, 2, retirement);
+	UT_ASSERT_EQ(page_owner_registered_records, 32);
+	UT_ASSERT_EQ(page_owner_native_authority_calls, 80);
+	UT_ASSERT_EQ(page_owner_native_authority_refusals, 16);
+	UT_ASSERT_EQ(page_owner_native_resident_calls, 24);
+	UT_ASSERT_EQ(page_owner_resident_successes, 8);
+	UT_ASSERT_EQ(page_owner_resident_pins, 16); UT_ASSERT_EQ(page_owner_resident_unpins, 16);
+	UT_ASSERT_EQ(page_owner_resident_releases, 16);
+	UT_ASSERT_EQ(page_owner_resident_missing, 8);
+	UT_ASSERT_EQ(page_owner_resident_wrap, 4); UT_ASSERT_EQ(page_owner_resident_generation, 4);
+	UT_ASSERT_EQ(page_owner_original_lookup_pin_calls, 16);
+	UT_ASSERT_EQ(page_owner_lookup_private_reads, 16);
+	UT_ASSERT_EQ(page_owner_lookup_pin_leaf_calls, 16);
+	UT_ASSERT(!page_owner_resident_active && !page_owner_resident_partition_held && !page_owner_page_locked);
+	UT_ASSERT(ClusterPcmOwnArray == NULL);
+	page_owner_use_registration = page_owner_use_xact_owner = page_owner_use_range = page_owner_use_full_batch = native_exit_use_page_owner_discharge = false;
+	page_owner_use_native_resident = page_owner_use_native_authority = false;
+	page_owner_use_original_lookup_pin = false;
+}
+
+UT_TEST(test_original_resident_stamp_owner_feeds_shared_retention_and_recent_freeze)
+{
+	page_owner_use_native_resident = page_owner_use_native_authority = true;
+	page_owner_native_resident_calls = 0;
+	page_owner_resident_pins = page_owner_resident_unpins = 0;
+	page_owner_resident_releases = page_owner_resident_successes = 0;
+	page_owner_resident_missing = page_owner_resident_wrap = page_owner_resident_generation = 0;
+	page_owner_native_authority_calls = page_owner_native_authority_refusals = 0;
+	page_owner_use_registration = page_owner_use_xact_owner = page_owner_use_range = page_owner_use_full_batch = native_exit_use_page_owner_discharge = true;
+	page_owner_registered_records = 0;
+	for (unsigned retirement = 1; retirement <= 2; retirement++)
+		for (unsigned batch = 0; batch < 2; batch++)
+			full_source_then_recent_lifecycle_case(batch != 0, false, true, 2, retirement);
+	UT_ASSERT_EQ(page_owner_registered_records, 32);
+	UT_ASSERT_EQ(page_owner_native_authority_calls, 80);
+	UT_ASSERT_EQ(page_owner_native_authority_refusals, 16);
+	UT_ASSERT_EQ(page_owner_native_resident_calls, 24);
+	UT_ASSERT_EQ(page_owner_resident_successes, 8);
+	UT_ASSERT_EQ(page_owner_resident_pins, 16); UT_ASSERT_EQ(page_owner_resident_unpins, 16);
+	UT_ASSERT_EQ(page_owner_resident_releases, 16);
+	UT_ASSERT_EQ(page_owner_resident_missing, 8);
+	UT_ASSERT_EQ(page_owner_resident_wrap, 4); UT_ASSERT_EQ(page_owner_resident_generation, 4);
+	UT_ASSERT(!page_owner_resident_active && !page_owner_resident_partition_held && !page_owner_page_locked);
+	UT_ASSERT(ClusterPcmOwnArray == NULL);
+	page_owner_use_registration = page_owner_use_xact_owner = page_owner_use_range = page_owner_use_full_batch = native_exit_use_page_owner_discharge = false;
+	page_owner_use_native_resident = page_owner_use_native_authority = false;
+}
+
 UT_TEST(test_original_bufmgr_authority_feeds_touch_registration_and_recent_freeze)
 {
 	page_owner_use_native_authority = true;
@@ -13745,7 +14140,7 @@ UT_TEST(test_recent_xmin_share_lock_refusal_keeps_borrowed_pin_without_upgrade)
 int
 main(void)
 {
-	UT_PLAN(309);
+	UT_PLAN(311);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -13754,6 +14149,8 @@ main(void)
 	UT_RUN(test_recent_refused_receiver_keeps_original_cut_and_native_continuation);
 	UT_RUN(test_full_original_source_reaches_pin_free_collector_and_recent_wal);
 	UT_RUN(test_full_original_source_late_receiver_revokes_recent_wal);
+	UT_RUN(test_original_lookup_pin_feeds_resident_stamp_and_recent_freeze);
+	UT_RUN(test_original_resident_stamp_owner_feeds_shared_retention_and_recent_freeze);
 	UT_RUN(test_original_bufmgr_authority_feeds_touch_registration_and_recent_freeze);
 	UT_RUN(test_original_exact_touch_registration_feeds_finish_and_recent_freeze);
 	UT_RUN(test_original_top_xact_finish_retires_local_touches_before_recent_freeze);

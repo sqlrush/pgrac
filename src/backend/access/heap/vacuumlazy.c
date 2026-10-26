@@ -976,9 +976,20 @@ lazy_clear_vm_after_heap(Relation rel, const ClusterSpaceIdentity *identity, Blo
 	const uint8 block_id = 0;
 	RfPageProducerBatchV1 versions;
 	XLogRecPtr recptr;
+	ResourceXAuxiliaryAcquireContext context = {0};
 
-	visibilitymap_pin(rel, heapblk, vmbuf);
-	LockBuffer(*vmbuf, BUFFER_LOCK_EXCLUSIVE);
+	for (;;) {
+		visibilitymap_pin(rel, heapblk, vmbuf);
+		if (ClusterLockBufferExclusiveAuxiliaryAware(vmbuf, &context))
+			break;
+		/* The lower handoff may already have consumed the old pin. Keep
+		 * its request history while obtaining a fresh relation-aware pin. */
+		if (BufferIsValid(*vmbuf)) {
+			ReleaseBuffer(*vmbuf);
+			*vmbuf = InvalidBuffer;
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
 	/* The observed positive may already have been cleared by its writer. */
 	if (visibilitymap_get_status(rel, heapblk, vmbuf) == 0) {
 		LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
