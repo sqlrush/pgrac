@@ -9779,6 +9779,33 @@ test_cluster_pcm_first_fill_master.inc: $(top_srcdir)/src/backend/cluster/cluste
 	mv $@.tmp $@
 test_cluster_pcm_read_grant: test_cluster_pcm_first_fill_master.inc
 
+TESTS += test_cluster_first_fill_ingress_tcp
+all: test_cluster_first_fill_ingress_tcp
+
+# Real TCP receive framing plus the production unadmitted master owner.
+# Native grant/dedup admission is exercised separately by pcm_read_grant.
+test_cluster_first_fill_ingress.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^\/\* GCS first-fill ingress owner begin/ { emit=1; n++ } \
+	     emit { print } /^\/\* GCS first-fill ingress owner end/ { emit=0; done++ } \
+	     END { if (n != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^gcs_block_first_fill_ingress\(/ { print "static void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_first_fill_ingress_tcp: test_cluster_first_fill_ingress_tcp.c \
+        test_cluster_first_fill_ingress.inc test_cluster_ic_tier1_partial.c unit_test.h \
+        $(top_srcdir)/src/backend/cluster/cluster_ic_tier1.c $(CLUSTER_VERSION_O) \
+        $(top_srcdir)/src/include/cluster/cluster_gcs_block_dedup.h \
+        $(top_srcdir)/src/include/cluster/cluster_gcs_reqid.h \
+        $(top_srcdir)/src/include/cluster/cluster_pcm_lock.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-first-fill-ingress
+.PHONY: clean-first-fill-ingress
+clean-first-fill-ingress:
+	rm -f test_cluster_first_fill_ingress.inc test_cluster_first_fill_ingress.inc.tmp
+
 TESTS += test_cluster_first_fill_wait
 all: test_cluster_first_fill_wait
 test_cluster_first_fill_bufmgr.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile

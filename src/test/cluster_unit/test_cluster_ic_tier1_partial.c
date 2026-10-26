@@ -413,9 +413,15 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload
 	return CLUSTER_IC_SEND_DONE;
 }
 
+/* Optional composition boundary for protocol owners exercised over this
+ * real receive parser. Ordinary tier1 tests leave it unset. */
+static ClusterICDispatchResult (*ut_dispatch_hook)(const ClusterICEnvelope *, const void *, int32);
+
 ClusterICDispatchResult
 cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, int32 peer_id)
 {
+	if (ut_dispatch_hook != NULL)
+		return ut_dispatch_hook(env, payload, peer_id);
 	(void)env;
 	(void)payload;
 	(void)peer_id;

@@ -40,6 +40,8 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "utils/memutils.h"
+
 #include "access/multixact.h" /* MultiXactIdIsValid (spec-7.1 D3-b fetch) */
 #include "access/xact.h"
 #include "access/xlog.h"
@@ -18217,8 +18219,11 @@ gcs_first_fill_master_park(const GcsBlockRequestPayload *req, const GcsBlockDedu
 	return NULL;
 }
 
+static bool gcs_first_fill_master_cancel(const ClusterPcmReadGrantKey *key, int worker);
+
 static bool
-gcs_first_fill_master_cancel(const ClusterPcmReadGrantKey *key, int worker)
+gcs_first_fill_master_cancel_owned(const ClusterPcmReadGrantKey *key, int worker,
+	uint32 original_lifetime_ms)
 {
 	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
 		GcsFirstFillMasterPark *park = &gcs_first_fill_master_parks[i];
@@ -18269,7 +18274,8 @@ gcs_first_fill_master_cancel(const ClusterPcmReadGrantKey *key, int worker)
 		wire.request_id = key->request_id;
 		wire.cluster_epoch = key->epoch;
 		result = cluster_gcs_block_dedup_lookup_or_register(worker, &wire, key->tag,
-			PCM_TRANS_N_TO_S, 0, cluster_sf_peer_supports_gcs_done(key->requester_node), &cached);
+			PCM_TRANS_N_TO_S, original_lifetime_ms,
+			cluster_sf_peer_supports_gcs_done(key->requester_node), &cached);
 		if (result != GCS_BLOCK_DEDUP_MISS_REGISTERED && result != GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE
 			&& result != GCS_BLOCK_DEDUP_FORWARDED_DUPLICATE && result != GCS_BLOCK_DEDUP_CACHED_REPLY)
 			return false;
@@ -18293,6 +18299,7 @@ gcs_first_fill_master_cancel(const ClusterPcmReadGrantKey *key, int worker)
 		park->request.requester_backend_id = key->backend_id;
 		park->request.transition_id = PCM_TRANS_N_TO_S;
 		GcsBlockRequestPayloadSetReadMiss(&park->request, true);
+		GcsBlockRequestPayloadSetLifetimeHintMs(&park->request, original_lifetime_ms);
 		park->cancelling = park->in_use = true;
 		gcs_first_fill_master_trace(&park->request, "CLEANUP_ADMITTED", result);
 		return true;
@@ -18486,8 +18493,8 @@ gcs_block_first_fill_request(const GcsBlockRequestPayload *req, const GcsBlockDe
 /* The routed LMS alone mutates its local parks. Dedup lookup and flag
  * pinning cannot dispatch another frame or tick, so this read-only capacity
  * check stays valid until the original MISS publishes its local owner. */
-static void
-gcs_block_first_fill_ingress(const ClusterICEnvelope *env, const GcsBlockRequestPayload *req,
+static bool
+gcs_block_first_fill_try_ingress(const GcsBlockRequestPayload *req,
 	const GcsBlockDedupKey *key, int worker)
 {
 	GcsBlockDedupEntry cached = {0};
@@ -18504,23 +18511,21 @@ gcs_block_first_fill_ingress(const ClusterICEnvelope *env, const GcsBlockRequest
 	if (!capacity) {
 		/* Do not create an in-flight dedup duplicate with no local owner. */
 		gcs_first_fill_master_trace(req, "INGRESS_MASTER_FULL", 0);
-		cluster_ic_dispatch_defer(env);
-		return;
+		return false;
 	}
 	result = cluster_gcs_block_dedup_lookup_or_register(worker, key, req->tag,
 		req->transition_id, GcsBlockRequestPayloadGetLifetimeHintMs(req),
 		cluster_sf_peer_supports_gcs_done(req->sender_node), &cached);
 	if (result == GCS_BLOCK_DEDUP_FULL) {
 		gcs_first_fill_master_trace(req, "INGRESS_DEDUP_FULL", 0);
-		cluster_ic_dispatch_defer(env);
-		return;
+		return false;
 	}
 	if (result == GCS_BLOCK_DEDUP_VALIDATION_FAIL
 		|| !cluster_gcs_block_dedup_set_request_flags_exact(worker, key, &req->tag,
 			req->transition_id, GCS_BLOCK_DEDUP_REQUEST_F_READ_MISS)) {
 		gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT,
 			InvalidXLogRecPtr, NULL);
-		return;
+		return true;
 	}
 	if (result == GCS_BLOCK_DEDUP_MISS_REGISTERED
 		|| result == GCS_BLOCK_DEDUP_FORWARDED_DUPLICATE
@@ -18535,6 +18540,244 @@ gcs_block_first_fill_ingress(const ClusterICEnvelope *env, const GcsBlockRequest
 	}
 	/* In-flight duplicates belong to the original parked/native owner.
 	 * A replay without that owner cannot recreate an already-retired service. */
+	return true;
+}
+
+/* GCS first-fill ingress owner begin. */
+/* Unadmitted requests must not pin a TCP receive head in front of the DONE
+ * that releases master/dedup capacity. The routed LMS owns these exact bytes.
+ * Credit is the existing eight outstanding slots per requester backend, also
+ * retained by quiet receipts across backend reuse, not an extra wire budget. */
+typedef struct GcsFirstFillIngressWait {
+	struct GcsFirstFillIngressWait *next;
+	GcsBlockRequestPayload request;
+	GcsBlockDedupKey key;
+	uint64 requester_session;
+	int worker;
+	bool cancelling;
+} GcsFirstFillIngressWait;
+
+static GcsFirstFillIngressWait *gcs_first_fill_ingress_head;
+static GcsFirstFillIngressWait *gcs_first_fill_ingress_tail;
+static uint32 gcs_first_fill_ingress_count;
+static uint8 *gcs_first_fill_ingress_credit[32];
+
+static bool
+gcs_first_fill_ingress_identity(const GcsBlockRequestPayload *req,
+	const GcsBlockDedupKey *key, int worker)
+{
+	return req->sender_node >= 0 && req->sender_node < 32
+		&& req->requester_backend_id > 0 && req->requester_backend_id <= MaxBackends
+		&& worker >= 0 && worker < cluster_lms_workers
+		&& req->epoch != 0 && req->request_id != 0
+		&& GcsBlockRequestPayloadIsReadMiss(req) && req->transition_id == PCM_TRANS_N_TO_S
+		&& !GcsBlockRequestPayloadIsCleanEligible(req) && !GcsBlockRequestPayloadIsDirectLandArmed(req)
+		&& (req->request_id & GCS_REQID_LOCAL_DOMAIN_FLAG) == 0
+		&& ((req->request_id >> GCS_REQID_NODE_SHIFT) & GCS_REQID_NODE_MASK) == (uint64)req->sender_node
+		&& ((req->request_id >> GCS_REQID_BACKEND_SHIFT) & GCS_REQID_BACKEND_MASK)
+			== (uint64)(req->requester_backend_id - 1)
+		&& (req->request_id & GCS_REQID_REQUESTER_SEQ_MASK) != 0
+		&& key->origin_node_id == (uint32)req->sender_node
+		&& key->requester_backend_id == req->requester_backend_id
+		&& key->request_id == req->request_id && key->cluster_epoch == req->epoch;
+}
+
+static GcsFirstFillIngressWait *
+gcs_first_fill_ingress_find(const GcsBlockDedupKey *key)
+{
+	for (GcsFirstFillIngressWait *item = gcs_first_fill_ingress_head; item != NULL; item = item->next)
+		if (memcmp(&item->key, key, sizeof(*key)) == 0)
+			return item;
+	return NULL;
+}
+
+static bool
+gcs_first_fill_ingress_retain(const GcsBlockRequestPayload *req,
+	const GcsBlockDedupKey *key, int worker)
+{
+	GcsFirstFillIngressWait *item;
+	uint8 *credit;
+	uint64 session;
+	if (!gcs_first_fill_ingress_identity(req, key, worker)
+		|| !gcs_block_pcm_x_authenticated_session(req->sender_node, req->epoch, &session) || session == 0)
+		return false;
+	item = gcs_first_fill_ingress_find(key);
+	if (item != NULL)
+		return item->worker == worker && item->requester_session == session
+			&& memcmp(&item->request, req, sizeof(*req)) == 0;
+	credit = gcs_first_fill_ingress_credit[req->sender_node];
+	if (credit == NULL) {
+		credit = MemoryContextAllocZero(TopMemoryContext, (Size)MaxBackends);
+		gcs_first_fill_ingress_credit[req->sender_node] = credit;
+	}
+	if (credit[req->requester_backend_id - 1] >= CLUSTER_GCS_BLOCK_MAX_OUTSTANDING_PER_BACKEND)
+		return false; /* No eviction or invented grant on conflicting/over-credit input. */
+	item = MemoryContextAllocZero(TopMemoryContext, sizeof(*item));
+	item->request = *req;
+	item->key = *key;
+	item->requester_session = session;
+	item->worker = worker;
+	if (gcs_first_fill_ingress_tail != NULL)
+		gcs_first_fill_ingress_tail->next = item;
+	else
+		gcs_first_fill_ingress_head = item;
+	gcs_first_fill_ingress_tail = item;
+	credit[req->requester_backend_id - 1]++;
+	gcs_first_fill_ingress_count++;
+	gcs_first_fill_master_trace(req, "INGRESS_QUEUED", gcs_first_fill_ingress_count);
+	return true;
+}
+
+static void
+gcs_first_fill_ingress_forget(GcsFirstFillIngressWait *item)
+{
+	GcsFirstFillIngressWait **link = &gcs_first_fill_ingress_head;
+	GcsFirstFillIngressWait *previous = NULL;
+	while (*link != NULL && *link != item) {
+		previous = *link;
+		link = &(*link)->next;
+	}
+	Assert(*link == item && gcs_first_fill_ingress_count > 0);
+	Assert(gcs_first_fill_ingress_identity(&item->request, &item->key, item->worker));
+	Assert(gcs_first_fill_ingress_credit[item->request.sender_node][item->request.requester_backend_id - 1] > 0);
+	*link = item->next;
+	if (gcs_first_fill_ingress_tail == item)
+		gcs_first_fill_ingress_tail = previous;
+	gcs_first_fill_ingress_credit[item->request.sender_node][item->request.requester_backend_id - 1]--;
+	gcs_first_fill_ingress_count--;
+	gcs_first_fill_master_trace(&item->request, "INGRESS_RETIRED", gcs_first_fill_ingress_count);
+	pfree(item);
+}
+
+static bool
+gcs_first_fill_master_cancel(const ClusterPcmReadGrantKey *key, int worker)
+{
+	GcsBlockDedupKey wire = {0};
+	GcsFirstFillIngressWait *item;
+	bool accepted;
+	uint32 original_lifetime_ms = 0;
+	wire.origin_node_id = key->requester_node;
+	wire.requester_backend_id = key->backend_id;
+	wire.request_id = key->request_id;
+	wire.cluster_epoch = key->epoch;
+	item = gcs_first_fill_ingress_find(&wire);
+	if (item != NULL && BufferTagsEqual(&item->request.tag, &key->tag)) {
+		item->cancelling = true; /* Seal before cleanup can release its original credit. */
+		original_lifetime_ms = GcsBlockRequestPayloadGetLifetimeHintMs(&item->request);
+		gcs_first_fill_master_trace(&item->request, "INGRESS_CANCEL", gcs_first_fill_ingress_count);
+	} else
+		item = NULL;
+	/* A fresh DONE-capable dedup registration must keep the original wire
+	 * lifetime. Cleanup identity alone cannot invent valid TTL metadata. */
+	accepted = gcs_first_fill_master_cancel_owned(key, worker, original_lifetime_ms);
+	if (accepted && item != NULL)
+		gcs_first_fill_ingress_forget(item); /* Same LMS turn, before any quiet ACK. */
+	return accepted;
+}
+
+static void
+gcs_first_fill_ingress_tick(int worker)
+{
+	uint32 budget = Min(gcs_first_fill_ingress_count, (uint32)GCS_FIRST_FILL_PARK_MAX);
+	while (budget-- > 0) {
+		GcsFirstFillIngressWait *item = gcs_first_fill_ingress_head;
+		const GcsBlockRequestPayload *req = &item->request;
+		uint64 session;
+		bool pending = false;
+		bool serving;
+		/* Rotate even a blocked head. No later key can starve behind it. */
+		if (item->next != NULL) {
+			gcs_first_fill_ingress_head = item->next;
+			gcs_first_fill_ingress_tail->next = item;
+			gcs_first_fill_ingress_tail = item;
+			item->next = NULL;
+		}
+		if (item->worker != worker)
+			continue;
+		if (req->epoch != cluster_epoch_get_current()
+			|| cluster_gcs_lookup_master(req->tag) != cluster_node_id
+			|| cluster_membership_get_state(req->sender_node) == CLUSTER_MEMBER_DEAD
+			|| cluster_membership_get_state(req->sender_node) == CLUSTER_MEMBER_REMOVED) {
+			/* No dedup/native grant was created. Committed reconfiguration
+			 * owns the failed original episode, never its elapsed age. */
+			gcs_first_fill_master_trace(req, "INGRESS_RECONFIGURED", 0);
+			gcs_first_fill_ingress_forget(item);
+			continue;
+		}
+		if (!gcs_block_pcm_x_authenticated_session(req->sender_node, req->epoch, &session))
+			continue;
+		if (session != item->requester_session) {
+			gcs_first_fill_master_trace(req, "INGRESS_INSTANCE_CHANGED", 0);
+			gcs_first_fill_ingress_forget(item);
+			continue;
+		}
+		if (cluster_normal_stop_requested())
+			item->cancelling = true;
+		if (item->cancelling) {
+			ClusterPcmReadGrantKey key = {0};
+			key.tag = req->tag; key.request_id = req->request_id; key.epoch = req->epoch;
+			key.requester_node = req->sender_node; key.backend_id = req->requester_backend_id;
+			(void)gcs_first_fill_master_cancel(&key, worker);
+			continue;
+		}
+		serving = cluster_authority_readiness_managed()
+			? cluster_serving_ready_check(&pending, NULL) : cluster_qvotec_in_quorum();
+		if (!serving || !cluster_membership_is_member(cluster_node_id)
+			|| (cluster_grd_join_remaster_active_for_shard(req->tag)
+				&& !cluster_grd_block_view_rebuilt(req->tag))
+			|| cluster_gcs_block_phase_for_tag(req->tag) == GCS_BLOCK_RECOVERING)
+			continue; /* Original DATA admission is not reusable authority. */
+		if (gcs_block_first_fill_try_ingress(req, &item->key, worker))
+			gcs_first_fill_ingress_forget(item);
+	}
+}
+
+static ClusterNormalStopPollResult
+gcs_first_fill_ingress_poll(const char **reason)
+{
+	uint64 credits = 0;
+	uint32 count = 0;
+	const GcsFirstFillIngressWait *last = NULL;
+	*reason = "GCS_FIRST_FILL_INGRESS_INVALID";
+	if ((uint64)gcs_first_fill_ingress_count
+		> (uint64)32 * MaxBackends * CLUSTER_GCS_BLOCK_MAX_OUTSTANDING_PER_BACKEND)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	for (const GcsFirstFillIngressWait *item = gcs_first_fill_ingress_head;
+		 item != NULL; item = item->next) {
+		if (++count > gcs_first_fill_ingress_count
+			|| !gcs_first_fill_ingress_identity(&item->request, &item->key, item->worker)
+			|| item->requester_session == 0)
+			return CLUSTER_NORMAL_STOP_INVALID;
+		last = item;
+	}
+	for (int node = 0; node < 32; node++) {
+		if (gcs_first_fill_ingress_credit[node] == NULL)
+			continue;
+		for (int backend = 0; backend < MaxBackends; backend++) {
+			uint8 n = gcs_first_fill_ingress_credit[node][backend];
+			if (n > CLUSTER_GCS_BLOCK_MAX_OUTSTANDING_PER_BACKEND)
+				return CLUSTER_NORMAL_STOP_INVALID;
+			credits += n;
+		}
+	}
+	if (count != gcs_first_fill_ingress_count || credits != count || last != gcs_first_fill_ingress_tail)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	*reason = count > 0 ? "GCS_FIRST_FILL_INGRESS_WAIT" : "NONE";
+	return count > 0 ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_READY;
+}
+/* GCS first-fill ingress owner end. */
+
+static void
+gcs_block_first_fill_ingress(const ClusterICEnvelope *env, const GcsBlockRequestPayload *req,
+	const GcsBlockDedupKey *key, int worker)
+{
+	/* A queued original may already be sealed by NACK. Never bypass it to
+	 * create another service, even if capacity became available meanwhile. */
+	if (gcs_first_fill_ingress_find(key) == NULL
+		&& gcs_block_first_fill_try_ingress(req, key, worker))
+		return;
+	if (!gcs_first_fill_ingress_retain(req, key, worker))
+		cluster_ic_dispatch_defer(env); /* Unknown/conflicting input keeps its carrier. */
 }
 
 static void
@@ -18699,6 +18942,7 @@ gcs_first_fill_master_tick(int worker)
 				gcs_block_first_fill_request(&saved.request, &saved.key, worker, true);
 		}
 	}
+	gcs_first_fill_ingress_tick(worker);
 }
 
 void
@@ -24854,6 +25098,15 @@ cluster_gcs_block_normal_stop_local_poll(int *slot_out, const char **reason_out)
 		}
 		if (invalid)
 			return result;
+	}
+	{
+		const char *ingress_reason;
+		ClusterNormalStopPollResult ingress = gcs_first_fill_ingress_poll(&ingress_reason);
+		if (ingress != CLUSTER_NORMAL_STOP_READY) {
+			*slot_out = -1;
+			*reason_out = ingress_reason;
+			return ingress;
+		}
 	}
 	for (index = 0; index < GCS_FIRST_FILL_PARK_MAX; index++) {
 		if (gcs_first_fill_master_parks[index].in_use
