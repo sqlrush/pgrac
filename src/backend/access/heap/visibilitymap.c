@@ -918,6 +918,37 @@ visibilitymap_get_status(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
 	return result;
 }
 
+/* Decode an exact already-pinned image, without fetching, repinning or taking
+ * current authority. A consumer that relies on a zero bit must retain its
+ * existing coherent content-lock bracket. This is not snapshot permission. */
+bool
+visibilitymap_get_status_pinned(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 *status)
+{
+	Page page;
+	uint8 observed;
+#ifdef USE_PGRAC_CLUSTER
+	static const PGAlignedBlock zero;
+#endif
+
+	if (status != NULL)
+		*status = 0;
+	if (status == NULL || heapBlk == InvalidBlockNumber
+		|| !vm_buffer_matches(rel, vmbuf, VISIBILITYMAP_FORKNUM, HEAPBLK_TO_MAPBLOCK(heapBlk)))
+		return false;
+	page = BufferGetPage(vmbuf);
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_heap_maintenance_restricted(rel)
+		&& (PageIsNew(page) ? memcmp(page, zero.data, BLCKSZ) != 0 : !vm_redo_page_valid(page)))
+		return false;
+#endif
+	observed = ((uint8 *)PageGetContents(page))[HEAPBLK_TO_MAPBYTE(heapBlk)];
+	observed = (observed >> HEAPBLK_TO_OFFSET(heapBlk)) & VISIBILITYMAP_VALID_BITS;
+	if (observed == VISIBILITYMAP_ALL_FROZEN)
+		return false;
+	*status = observed;
+	return true;
+}
+
 /*
  * visibilitymap_get_status_coherent -- observe bits under current read authority.
  *
@@ -934,10 +965,7 @@ visibilitymap_get_status_coherent(Relation rel, BlockNumber heapBlk, Buffer *vmb
 	RelFileLocator locator;
 	ForkNumber forknum;
 	BlockNumber block;
-	Page page;
-	uint8 observed = 0;
 	bool valid;
-	static const PGAlignedBlock zero;
 
 	if (status != NULL)
 		*status = 0;
@@ -968,24 +996,8 @@ visibilitymap_get_status_coherent(Relation rel, BlockNumber heapBlk, Buffer *vmb
 	/* A pin is not a grant. This also revalidates an existing cached grant. */
 	if (!ClusterLockBufferShareBarrierAware(*vmbuf))
 		return false;
-	BufferGetTag(*vmbuf, &locator, &forknum, &block);
-	page = BufferGetPage(*vmbuf);
-	valid = RelFileLocatorEquals(locator, rel->rd_locator) && forknum == VISIBILITYMAP_FORKNUM
-			&& block == mapBlock;
-#ifdef USE_PGRAC_CLUSTER
-	valid = valid
-			&& (PageIsNew(page) ? memcmp(page, zero.data, BLCKSZ) == 0 : vm_redo_page_valid(page));
-#else
-	(void)zero;
-#endif
-	if (valid) {
-		observed = ((uint8 *)PageGetContents(page))[HEAPBLK_TO_MAPBYTE(heapBlk)];
-		observed = (observed >> HEAPBLK_TO_OFFSET(heapBlk)) & VISIBILITYMAP_VALID_BITS;
-		valid = observed != VISIBILITYMAP_ALL_FROZEN;
-	}
+	valid = visibilitymap_get_status_pinned(rel, heapBlk, *vmbuf, status);
 	LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
-	if (valid)
-		*status = observed;
 	return valid;
 }
 

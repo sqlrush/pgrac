@@ -84,6 +84,11 @@ extern bool visibilitymap_set_retry_aware(Relation rel, BlockNumber heapBlk, Buf
 #endif
 										  );
 extern uint8 visibilitymap_get_status(Relation rel, BlockNumber heapBlk, Buffer *vmbuf);
+/* Exact pinned-image observation only: no I/O, repin or grant acquisition.
+ * Caller retains its coherent current/content bracket before relying on bits.
+ * False clears status. This does not authorize visibility or freeze skips. */
+extern bool visibilitymap_get_status_pinned(Relation rel, BlockNumber heapBlk, Buffer vmbuf,
+										   uint8 *status);
 /* No content locks on entry; relation lifecycle lock retained. False clears
  * status. Success observes bits only, without granting visibility/freeze skips.
  * The returned pin remains caller-owned, with no retained content lock. */

@@ -1369,10 +1369,92 @@ UT_TEST(test_original_new_page_and_nonshared_empty_paths_preserved)
 	}
 }
 
+UT_TEST(test_pinned_vm_status_decodes_exact_bytes_without_mutation_or_acquisition)
+{
+	const BlockNumber blocks[]
+		= { 0, 1, 2, 3, 4, HEAPBLOCKS_PER_PAGE - 1, HEAPBLOCKS_PER_PAGE, HEAPBLOCKS_PER_PAGE + 3 };
+
+	for (unsigned i = 0; i < lengthof(blocks); i++) {
+		for (uint8 bits = 0; bits <= VISIBILITYMAP_VALID_BITS; bits++) {
+			uint8 status = 77;
+			uint8 *byte;
+			bool valid;
+
+			reset(true, false, 0);
+			fixture_blocks[1] = HEAPBLK_TO_MAPBLOCK(blocks[i]);
+			byte = (uint8 *)PageGetContents(pages[1].data) + HEAPBLK_TO_MAPBYTE(blocks[i]);
+			*byte = (0x55 & ~(VISIBILITYMAP_VALID_BITS << HEAPBLK_TO_OFFSET(blocks[i])))
+					| (bits << HEAPBLK_TO_OFFSET(blocks[i]));
+			memcpy(before, pages, sizeof(pages));
+			valid = visibilitymap_get_status_pinned(&relation, blocks[i], 2, &status);
+			UT_ASSERT_EQ(valid, bits != VISIBILITYMAP_ALL_FROZEN);
+			UT_ASSERT_EQ(status, valid ? bits : 0);
+			UT_ASSERT_EQ(lock_calls + inserts + edge_count + dirty[0] + dirty[1], 0);
+			UT_ASSERT_EQ(next_token, 100);
+			UT_ASSERT(memcmp(before, pages, sizeof(pages)) == 0);
+		}
+	}
+}
+
+UT_TEST(test_pinned_vm_status_rejects_wrong_targets_and_invalid_arguments)
+{
+	for (int variant = 0; variant < 9; variant++) {
+		uint8 status = 77;
+		Relation rel = &relation;
+		BlockNumber heap_block = 0;
+		Buffer vm = 2;
+
+		reset(true, false, VISIBILITYMAP_VALID_BITS);
+		if (variant < 5)
+			change_tag(2, variant);
+		else if (variant == 5)
+			rel = NULL;
+		else if (variant == 6)
+			heap_block = InvalidBlockNumber;
+		else if (variant == 7)
+			vm = InvalidBuffer;
+		UT_ASSERT(
+			!visibilitymap_get_status_pinned(rel, heap_block, vm, variant == 8 ? NULL : &status));
+		UT_ASSERT_EQ(status, variant == 8 ? 77 : 0);
+		UT_ASSERT_EQ(assertion_failures, 0);
+		UT_ASSERT_EQ(lock_calls + inserts + edge_count + dirty[0] + dirty[1], 0);
+		UT_ASSERT_EQ(next_token, 100);
+		UT_ASSERT(memcmp(before, pages, sizeof(pages)) == 0);
+	}
+}
+
+UT_TEST(test_pinned_vm_status_refuses_unknown_zero_and_accepts_only_pristine_new_page)
+{
+	for (int variant = 0; variant < 5; variant++) {
+		uint8 status = 77;
+		PageHeader header;
+
+		reset(true, false, 0);
+		header = (PageHeader)pages[1].data;
+		if (variant == 0)
+			header->pd_block_scn = 0;
+		else if (variant == 1)
+			header->pd_lower--;
+		else {
+			memset(pages[1].data, 0, BLCKSZ);
+			if (variant == 3)
+				pages[1].data[BLCKSZ - 1] = 1;
+			else if (variant == 4)
+				header->pd_block_scn = 1;
+		}
+		memcpy(before, pages, sizeof(pages));
+		UT_ASSERT_EQ(visibilitymap_get_status_pinned(&relation, 0, 2, &status), variant == 2);
+		UT_ASSERT_EQ(status, 0);
+		UT_ASSERT_EQ(lock_calls + inserts + edge_count + dirty[0] + dirty[1], 0);
+		UT_ASSERT_EQ(next_token, 100);
+		UT_ASSERT(memcmp(before, pages, sizeof(pages)) == 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(33);
 	UT_RUN(test_visible_exact_two_page_batch);
 	UT_RUN(test_no_change_allocates_no_version);
 	UT_RUN(test_nonshared_preserves_native_hint_lsn_rules);
@@ -1403,6 +1485,9 @@ main(void)
 	UT_RUN(test_empty_publication_error_unwinds_only_its_vm_scope);
 	UT_RUN(test_empty_cancel_at_repin_miss_keeps_no_vm_pin_or_writer);
 	UT_RUN(test_original_new_page_and_nonshared_empty_paths_preserved);
+	UT_RUN(test_pinned_vm_status_decodes_exact_bytes_without_mutation_or_acquisition);
+	UT_RUN(test_pinned_vm_status_rejects_wrong_targets_and_invalid_arguments);
+	UT_RUN(test_pinned_vm_status_refuses_unknown_zero_and_accepts_only_pristine_new_page);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

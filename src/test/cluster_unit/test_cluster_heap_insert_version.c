@@ -27,6 +27,7 @@
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "miscadmin.h"
@@ -39,6 +40,24 @@
 #include "test_cluster_heap_maintenance_policy.inc"
 
 UT_DEFINE_GLOBALS();
+
+/* Version/storage leaves run online; this is not recovered admission. */
+BackendType MyBackendType = B_BACKEND;
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return CLUSTER_NORMAL_START_TARGET_READY;
+}
+bool
+cluster_semantic_activation_phase1_pristine(void)
+{
+	return false;
+}
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return false;
+}
 
 bool cluster_enabled = true, cluster_shared_config = true, cluster_shared_catalog;
 int wal_level = WAL_LEVEL_REPLICA, NBuffers = 4, NLocBuffer, cluster_node_id = 0;
@@ -73,7 +92,9 @@ static bool confirming, spec_aborting;
 static bool multi_inserting;
 static unsigned vm_locks;
 static unsigned vm_shares;
-static bool vm_share_refused, vm_refresh_frozen;
+static bool vm_share_refused, vm_refresh_frozen, vm_exact_target;
+static unsigned vm_raw_reads;
+static int vm_refresh_invalid;
 
 void
 LockBuffer(Buffer buffer, int mode)
@@ -95,6 +116,12 @@ ClusterLockBufferShareBarrierAware(Buffer buffer)
 		return false;
 	if (vm_refresh_frozen)
 		pages[1].data[SizeOfPageHeaderData] = VISIBILITYMAP_VALID_BITS;
+	if (vm_refresh_invalid == 1)
+		((PageHeader)pages[1].data)->pd_block_scn = 0;
+	else if (vm_refresh_invalid == 2)
+		((PageHeader)pages[1].data)->pd_lower--;
+	else if (vm_refresh_invalid == 3)
+		tags[1].relNumber++;
 	return true;
 }
 
@@ -245,16 +272,27 @@ visibilitymap_clear_locked(Relation rel, BlockNumber heapblock, Buffer vmbuffer,
 bool
 visibilitymap_pin_ok(BlockNumber heapblock, Buffer buffer)
 {
+	if (vm_exact_target)
+		return (buffer == 2 || buffer == 4)
+			&& blocks[buffer - 1] == heapblock / ((BLCKSZ - MAXALIGN(SizeOfPageHeaderData)) * 4);
 	return (heapblock == blocks[0] || heapblock == blocks[2]) && (buffer == 2 || buffer == 4);
 }
 
 uint8
 visibilitymap_get_status(Relation rel, BlockNumber heapblock, Buffer *buffer)
 {
+	vm_raw_reads++;
 	if (rel != &relation_data || !visibilitymap_pin_ok(heapblock, *buffer))
 		abort();
 	return pages[*buffer - 1].data[SizeOfPageHeaderData];
 }
+
+#define MAPSIZE (BLCKSZ - MAXALIGN(SizeOfPageHeaderData))
+#define HEAPBLOCKS_PER_PAGE (MAPSIZE * 4)
+#define HEAPBLK_TO_MAPBLOCK(x) ((x) / HEAPBLOCKS_PER_PAGE)
+#define HEAPBLK_TO_MAPBYTE(x) (((x) % HEAPBLOCKS_PER_PAGE) / 4)
+#define HEAPBLK_TO_OFFSET(x) (((x) % 4) * 2)
+#include "test_cluster_vm_pinned_status.inc"
 
 void
 cluster_pcm_vm_metric_note(const BufferTag *tag, PcmVmMetric metric)
@@ -864,6 +902,8 @@ run_update(bool versioned, bool crosspage, int vm_mode, bool hot)
 	ItemIdData cluster_current_mx_new_line_pointer = { 0 };
 	bool cluster_page_versioned = versioned;
 	RfPageProducerBatchV1 cluster_page_versions = prepared;
+	/* Only the diagnostic field touched by this original WAL fragment. */
+	struct { XLogRecPtr wal_lsn; } cluster_update_trace = {0};
 
 	oldtup.t_data = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, FirstOffsetNumber));
 	(void)cluster_page_versioned;
@@ -1192,6 +1232,8 @@ UT_TEST(test_vm_clear_skip_requires_qualified_current_observation)
 {
 	for (int mode = 0; mode < 4; mode++) {
 		prepare_update(true, false, 1, true);
+		blocks[0] = 0;
+		vm_exact_target = true;
 		pages[1].data[SizeOfPageHeaderData]
 			= mode == 0 ? VISIBILITYMAP_VALID_BITS : VISIBILITYMAP_ALL_VISIBLE;
 		vm_locks = vm_shares = 0;
@@ -1202,7 +1244,7 @@ UT_TEST(test_vm_clear_skip_requires_qualified_current_observation)
 		UT_ASSERT_EQ(vm_locks, 0);
 		UT_ASSERT(!dirty[1]);
 	}
-	vm_share_refused = vm_refresh_frozen = false;
+	vm_share_refused = vm_refresh_frozen = vm_exact_target = false;
 }
 
 UT_TEST(test_legacy_lock_owners_keep_original_wal_shape)
@@ -1456,10 +1498,124 @@ UT_TEST(test_actual_multi_capture_leaves_both_pages_unchanged)
 	}
 }
 
+UT_TEST(test_vm_clear_skip_rejects_invalid_shared_current_image)
+{
+	for (int variant = 0; variant < 12; variant++) {
+		PageHeader header;
+
+		prepare_update(true, false, 1, true);
+		blocks[0] = 0;
+		vm_exact_target = true;
+		vm_share_refused = vm_refresh_frozen = false;
+		vm_refresh_invalid = 0;
+		pages[1].data[SizeOfPageHeaderData] = VISIBILITYMAP_ALL_VISIBLE;
+		header = (PageHeader)pages[1].data;
+		switch (variant) {
+		case 0:
+			header->pd_block_scn = 0;
+			break;
+		case 1:
+			header->pd_lower--;
+			break;
+		case 2:
+			header->pd_upper--;
+			break;
+		case 3:
+			header->pd_special--;
+			break;
+		case 4:
+			header->pd_prune_xid = FirstNormalTransactionId;
+			break;
+		case 5:
+			header->pd_flags |= PD_HAS_ITL;
+			break;
+		case 6:
+			header->pd_flags |= PD_UNDO_SEG_HEADER;
+			break;
+		case 7:
+			PageSetPageSizeAndVersion((Page)header, BLCKSZ, 0);
+			break;
+		case 8:
+			header->pd_flags = PD_LSN_ORIGIN_MASK;
+			break;
+		case 9:
+			memset(header, 0, SizeOfPageHeaderData);
+			break;
+		case 10:
+			header->pd_flags |= PD_SPACE_METADATA;
+			break;
+		case 11:
+			header->pd_lower = BLCKSZ;
+			break;
+		}
+		vm_locks = vm_shares = 0;
+		UT_ASSERT(cluster_heap_lock_vm_needs_clear(&relation_data, 0, 2));
+		UT_ASSERT_EQ(vm_shares, 1);
+		UT_ASSERT_EQ(vm_locks, 0);
+		UT_ASSERT(!dirty[1]);
+	}
+	vm_exact_target = false;
+}
+
+UT_TEST(test_vm_clear_skip_rejects_wrong_target_before_raw_read_or_grant)
+{
+	for (int variant = 0; variant < 5; variant++) {
+		prepare_update(true, false, 1, true);
+		blocks[0] = 0;
+		vm_exact_target = true;
+		vm_share_refused = vm_refresh_frozen = false;
+		vm_refresh_invalid = 0;
+		pages[1].data[SizeOfPageHeaderData] = VISIBILITYMAP_ALL_VISIBLE;
+		switch (variant) {
+		case 0:
+			tags[1].spcOid++;
+			break;
+		case 1:
+			tags[1].dbOid++;
+			break;
+		case 2:
+			tags[1].relNumber++;
+			break;
+		case 3:
+			forks[1] = MAIN_FORKNUM;
+			break;
+		case 4:
+			blocks[1]++;
+			break;
+		}
+		vm_locks = vm_shares = vm_raw_reads = 0;
+		UT_ASSERT(cluster_heap_lock_vm_needs_clear(&relation_data, 0, 2));
+		UT_ASSERT_EQ(vm_raw_reads, 0);
+		UT_ASSERT_EQ(vm_shares, 0);
+		UT_ASSERT_EQ(vm_locks, 0);
+		UT_ASSERT(!dirty[1]);
+	}
+	vm_exact_target = false;
+}
+
+UT_TEST(test_vm_clear_skip_revalidates_image_after_current_grant)
+{
+	for (int variant = 1; variant <= 3; variant++) {
+		prepare_update(true, false, 1, true);
+		blocks[0] = 0;
+		vm_exact_target = true;
+		vm_share_refused = vm_refresh_frozen = false;
+		vm_refresh_invalid = variant;
+		pages[1].data[SizeOfPageHeaderData] = VISIBILITYMAP_ALL_VISIBLE;
+		vm_locks = vm_shares = 0;
+		UT_ASSERT(cluster_heap_lock_vm_needs_clear(&relation_data, 0, 2));
+		UT_ASSERT_EQ(vm_shares, 1);
+		UT_ASSERT_EQ(vm_locks, 0);
+		UT_ASSERT(!dirty[1]);
+	}
+	vm_refresh_invalid = 0;
+	vm_exact_target = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(29);
 	UT_RUN(test_native_multi_versions_actual_batch);
 	UT_RUN(test_nonshared_multi_keeps_native_wal_shape);
 	UT_RUN(test_actual_multi_capture_leaves_both_pages_unchanged);
@@ -1486,6 +1642,9 @@ main(void)
 	UT_RUN(test_speculative_abort_versions_original_super_delete);
 	UT_RUN(test_legacy_speculative_owners_keep_existing_tokens);
 	UT_RUN(test_actual_speculative_captures_leave_page_unchanged);
+	UT_RUN(test_vm_clear_skip_rejects_invalid_shared_current_image);
+	UT_RUN(test_vm_clear_skip_rejects_wrong_target_before_raw_read_or_grant);
+	UT_RUN(test_vm_clear_skip_revalidates_image_after_current_grant);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

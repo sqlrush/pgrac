@@ -20,6 +20,9 @@ print(function(vm, "visibilitymap_get_status", "uint8"))
 if "\nvisibilitymap_get_status_coherent(" in vm:
     print("#define FIXTURE_HAS_COHERENT_VM_READER 1")
     print(function(vm, "vm_redo_page_valid", "static bool"))
+    if "\nvisibilitymap_get_status_pinned(" in vm:
+        print(function(vm, "vm_buffer_matches", "static bool"))
+        print(function(vm, "visibilitymap_get_status_pinned", "bool"))
     print(function(vm, "visibilitymap_get_status_coherent", "bool"))
 print(function((root / "executor/nodeIndexonlyscan.c").read_text(),
                "IndexOnlyNext", "static TupleTableSlot *"))

@@ -10449,8 +10449,12 @@ cluster_current_mx_stamp_published(ClusterCurrentMxStampPlan *plan)
 
 	if (plan == NULL || !plan->active)
 		return;
-	Assert(cluster_multixact_current_heap_publish_transition(
-		plan->stage, CMX_HEAP_EVENT_PUBLISH, &next_stage));
+	if (!cluster_multixact_current_heap_publish_transition(
+			plan->stage, CMX_HEAP_EVENT_PUBLISH, &next_stage))
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("invalid current MultiXact publication stage %d", plan->stage)));
+	Assert(next_stage == CMX_HEAP_STAGE_REFERENCE_PUBLISHED);
 	plan->stage = next_stage;
 	for (i = 0; i < plan->receipt_count; i++)
 		cluster_ctrc_note_publication_after_apply(&plan->handles[i], true);
@@ -11325,19 +11329,30 @@ cluster_heap_lock_with_vm_repin(Relation relation, BlockNumber heap_block, Buffe
  * heap block's frozen bit from being set after the qualified observation.
  */
 static bool
-cluster_heap_lock_vm_needs_clear(Relation relation, BlockNumber heap_block,
-								 Buffer vmbuffer)
+cluster_heap_lock_vm_needs_clear(Relation relation, BlockNumber heap_block, Buffer vmbuffer)
 {
-	bool		needed;
+	RelFileLocator locator;
+	ForkNumber forknum;
+	BlockNumber block;
+	uint8 status;
+	bool needed;
 
-	Assert(BufferIsValid(vmbuffer) && visibilitymap_pin_ok(heap_block, vmbuffer));
-	if (visibilitymap_get_status(relation, heap_block, &vmbuffer)
-		& VISIBILITYMAP_ALL_FROZEN)
+	/* The raw reader may repin/read on a mismatch. Never let it perform that
+	 * work below the caller's heap content lock, or inspect another map. */
+	if (relation == NULL || heap_block == InvalidBlockNumber || !BufferIsValid(vmbuffer)
+		|| !visibilitymap_pin_ok(heap_block, vmbuffer))
+		return true;
+	BufferGetTag(vmbuffer, &locator, &forknum, &block);
+	if (!RelFileLocatorEquals(locator, relation->rd_locator) || forknum != VISIBILITYMAP_FORKNUM)
+		return true;
+	if (visibilitymap_get_status(relation, heap_block, &vmbuffer) & VISIBILITYMAP_ALL_FROZEN)
 		return true;
 	if (!ClusterLockBufferShareBarrierAware(vmbuffer))
 		return true;
-	needed = (visibilitymap_get_status(relation, heap_block, &vmbuffer)
-			  & VISIBILITYMAP_ALL_FROZEN) != 0;
+	/* A coherent grant does not make a malformed/unversioned bitmap a
+	 * proved zero. The decoder cannot acquire or replace the borrowed pin. */
+	needed = !visibilitymap_get_status_pinned(relation, heap_block, vmbuffer, &status)
+			 || (status & VISIBILITYMAP_ALL_FROZEN) != 0;
 	LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
 	return needed;
 }
@@ -21328,6 +21343,52 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 		 * the caller's original pin/admission after refusal, WAL or ERROR. */
 		if (resumed)
 			ClusterUnlockBufferAfterConditionalMutation(buffer);
+	}
+	PG_END_TRY();
+	return applied;
+}
+
+bool
+cluster_heap_freeze_apply_xmin_batch_recent_v1(
+	Relation rel, Buffer recent_buffer,
+	const ClusterHeapFreezePageInputV1 *input,
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *fence,
+	const PcmAuthoritySnapshot *authority_before,
+	const ClusterSemanticAdmissionToken *admission,
+	const ClusterHeapFreezeXminTargetV1 *targets, uint16 target_count,
+	FullTransactionId freeze_limit_full, SCN horizon_scn)
+{
+	volatile bool applied = false;
+
+	/* The proof phase may have released its pin. Reuse only the original
+	 * resident hint under the caller's still-entered admission: no fetch,
+	 * new current, proof request or replacement source observation. */
+	if (rel == NULL || !rel->rd_isvalid || input == NULL || page == NULL
+		|| proofs == NULL || fence == NULL || authority_before == NULL
+		|| admission == NULL || !admission->entered || targets == NULL
+		|| target_count == 0 || target_count > MaxHeapTuplesPerPage
+		|| recent_buffer <= 0 || recent_buffer > NBuffers
+		|| BufferDescriptors == NULL
+		|| admission->record_generation != fence->admission_generation
+		|| !RelFileLocatorEquals(rel->rd_locator, fence->identity.key.locator)
+		|| !ReadRecentBuffer(rel->rd_locator, MAIN_FORKNUM, fence->block,
+			recent_buffer))
+		return false;
+
+	PG_TRY();
+	{
+		applied = cluster_heap_freeze_apply_xmin_batch_v1(rel, recent_buffer,
+			input, page, proofs, fence, authority_before, admission,
+			targets, target_count, freeze_limit_full, horizon_scn);
+	}
+	PG_FINALLY();
+	{
+		/* The inner continuation has already unwound its temporary writer
+		 * and local X. Drop exactly this pin before the caller leaves its
+		 * admission, preserving any pin/lock the caller already owned. */
+		ReleaseBuffer(recent_buffer);
 	}
 	PG_END_TRY();
 	return applied;

@@ -477,6 +477,25 @@ extern bool cluster_heap_freeze_apply_xmin_batch_v1(
 	const ClusterHeapFreezeXminTargetV1 *targets, uint16 target_count,
 	FullTransactionId freeze_limit_full, SCN horizon_scn);
 
+/* Same dormant qualification contract as the pinned batch above. The caller
+ * holds the relation and the original entered admission, but recent_buffer is
+ * only a saved shared-buffer hint. This entry adds one exact resident pin (no
+ * fetch), delegates all source/physical/writer/WAL checks to the original batch,
+ * and releases that pin on success, refusal or ERROR before the caller leaves
+ * admission. Previously owned pins/content locks remain the caller's. An absent
+ * or changed resident returns false; this grants no positive freeze authority.
+ */
+extern bool cluster_heap_freeze_apply_xmin_batch_recent_v1(
+	struct RelationData *rel, Buffer recent_buffer,
+	const ClusterHeapFreezePageInputV1 *input,
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *fence,
+	const struct PcmAuthoritySnapshot *authority_before,
+	const struct ClusterSemanticAdmissionToken *admission,
+	const ClusterHeapFreezeXminTargetV1 *targets, uint16 target_count,
+	FullTransactionId freeze_limit_full, SCN horizon_scn);
+
 extern bool cluster_heap_freeze_apply_xmin_v1(
 	struct RelationData *rel, Buffer buffer,
 	const ClusterHeapFreezePageInputV1 *input,
