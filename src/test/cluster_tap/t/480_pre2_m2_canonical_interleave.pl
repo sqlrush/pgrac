@@ -104,7 +104,7 @@ sub reload_pause {
 }
 
 $cluster=PostgreSQL::Test::ClusterPRE2->new_cluster('m2_a08',nodes=>4,blackbox=>1,
- required_operations=>[],extra_conf=>['autovacuum=off','cluster.trace_tx_identity=on',
+ required_operations=>[],extra_conf=>['shared_buffers=512MB','autovacuum=off','cluster.trace_tx_identity=on',
   'log_error_verbosity=verbose','log_line_prefix=\'%m [%p] \'']);
 $cluster->start_cluster;
 my @nodes=$cluster->nodes;
