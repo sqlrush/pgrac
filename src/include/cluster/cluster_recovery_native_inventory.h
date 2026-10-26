@@ -10,12 +10,14 @@
 #define CLUSTER_RECOVERY_NATIVE_INVENTORY_H
 
 #ifdef USE_PGRAC_CLUSTER
+#include "access/clog.h"
 #include "cluster/cluster_recovery_native_scan.h"
 #include "cluster/cluster_recovery_multixact_join.h"
 #include "cluster/cluster_recovery_xact_join.h"
 #include "cluster/cluster_recovery_reference_graph.h"
 #include "cluster/cluster_recovery_root_set.h"
 #include "cluster/cluster_wal_inputs.h"
+#include "common/cluster_relmap_v2.h"
 
 typedef enum ClusterRecoveryNativeInventoryResult {
 	CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED = 0,
@@ -66,6 +68,73 @@ typedef struct ClusterRecoveryTerminalSummary {
 	bool has_commit, has_abort, conflict;
 } ClusterRecoveryTerminalSummary;
 
+/* Raw carriers for one complete pending image, never a FullXid/outcome proof.
+ * All selected generations of the physical origin participate. Source LSNs
+ * from different generations are not ordered or treated as interchangeable. */
+typedef enum ClusterRecoveryRelmapFoldResult {
+	CLUSTER_RECOVERY_RELMAP_FOLD_MORE = 0,
+	CLUSTER_RECOVERY_RELMAP_FOLD_ENTRY,
+	CLUSTER_RECOVERY_RELMAP_FOLD_DRAINED,
+	CLUSTER_RECOVERY_RELMAP_FOLD_INVALID,
+	CLUSTER_RECOVERY_RELMAP_FOLD_CHANGED,
+	CLUSTER_RECOVERY_RELMAP_FOLD_CAPACITY
+} ClusterRecoveryRelmapFoldResult;
+
+#define CLUSTER_RECOVERY_RELMAP_FOLD_HEADER_XID (1U << 0)
+#define CLUSTER_RECOVERY_RELMAP_FOLD_WAL_MATCH (1U << 1)
+#define CLUSTER_RECOVERY_RELMAP_FOLD_WAL_ALIAS (1U << 2)
+#define CLUSTER_RECOVERY_RELMAP_FOLD_COMMIT (1U << 3)
+#define CLUSTER_RECOVERY_RELMAP_FOLD_ABORT (1U << 4)
+#define CLUSTER_RECOVERY_RELMAP_FOLD_ASSIGNMENT (1U << 5)
+#define CLUSTER_RECOVERY_RELMAP_FOLD_PREPARE (1U << 6)
+#define CLUSTER_RECOVERY_RELMAP_FOLD_TOP_XID (1U << 7)
+#define CLUSTER_RECOVERY_RELMAP_FOLD_SUBXID (1U << 8)
+#define CLUSTER_RECOVERY_RELMAP_FOLD_CLOG_ZERO (1U << 9)
+#define CLUSTER_RECOVERY_RELMAP_FOLD_CLOG_TRUNCATE (1U << 10)
+#define CLUSTER_RECOVERY_RELMAP_FOLD_RECORD_TOP_XID (1U << 11)
+
+/* Owned original selected input, including history and empty alternatives.
+ * The flags describe actual complete checkpoint bytes/addresses observed in
+ * both original physical passes. A v2 window is an issuance observation, not
+ * a record's FullXid era, suffix upper bound, native base or lifetime proof. */
+typedef struct ClusterRecoveryRelmapHistorySource {
+	ClusterWalInputV1 input;
+	uint32 input_index; /* original selector index, not the census's sorted ordinal */
+	XLogRecPtr checkpoint_end;
+	ClusterRelmapCheckpointWindow window;
+	uint64 post_flush_issued;
+	bool checkpoint_observed, window_observed;
+} ClusterRecoveryRelmapHistorySource;
+
+typedef struct ClusterRecoveryRelmapFoldEntry {
+	const ClusterRecoveryNativeRecord *record; /* full original source/cut/payload */
+	const ClusterRecoveryRelmapHistorySource *history; /* same owned source, NULL if unavailable */
+	ClusterRecoveryNativeKind kind;
+	uint32 source_index;
+	uint64 record_ordinal; /* original all-family ordinal within this source */
+	uint32 flags;
+	uint32 subxid_references; /* every occurrence, not an immediate-parent proof */
+} ClusterRecoveryRelmapFoldEntry;
+
+typedef struct ClusterRecoveryRelmapFoldSummary {
+	uint32 sources, origin_sources; /* includes original explicit empty sources */
+	uint64 header_xid_records, record_top_xid_records;
+	uint64 wal_matches, wal_aliases;
+	uint64 top_commits, top_aborts, assignments, prepares;
+	uint64 child_records, child_references;
+	uint64 clog_zeroes, clog_truncates;
+	/* Same physical origin only. Counts compare the FULL query to the v2
+	 * persisted half-space window, never infer an era from a raw carrier.
+	 * owner_window_sources additionally matches epoch/admitted/boot. */
+	uint32 checkpoint_sources, window_sources, query_window_sources, owner_window_sources;
+	/* Every query-page zero and every truncate remains an obligation. Order
+	 * only within the UNIQUE exact native map source. Other generations,
+	 * missing/duplicate maps or an overlapping record remain unordered.
+	 * Exact here means WAL_MATCH's represented fields, not certified FullXid.
+	 * Even a before count proves no cutoff era or base retention lifetime. */
+	uint64 clog_before_wal, clog_after_wal, clog_unordered;
+} ClusterRecoveryRelmapFoldSummary;
+
 typedef struct ClusterRecoveryNativeInventoryDiag {
 	ClusterControlRootResult input_result;
 	RfPageProofDetailV1 input_detail;
@@ -89,6 +158,7 @@ typedef struct ClusterRecoveryNativeInventoryDiag {
 	uint64 tt_head_binding_missing;
 	uint64 terminal_records, terminal_bound, terminal_unbound, terminal_binding_examined;
 	uint64 terminal_lookup_examined;
+	uint64 relmap_examined; /* saved records plus individual subxid inspections */
 	uint64 mx_compared_offsets, mx_compared_members, mx_physical_mismatches;
 	uint64 xact_clog_compared, xact_parents_compared, xact_physical_mismatches;
 	ClusterRecoveryGraphResult graph_result;
@@ -147,16 +217,26 @@ extern bool cluster_recovery_native_inventory_page_at_v1(
  * never a record's FullXid era, CLOG lifetime or terminal qualification. */
 typedef struct ClusterRecoveryRelmapHistoryEntryV1 {
 	ClusterRecoveryRelmapSourceV1 source;
+	ClusterRecoveryWalSourceObservationV1 observation;
 	XLogRecPtr checkpoint_end;
 	ClusterRelmapCheckpointWindow window;
 	uint64 post_flush_issued;
 	bool checkpoint_observed, window_observed;
 } ClusterRecoveryRelmapHistoryEntryV1;
 
+/* Actual original-source/base observations. Full raw pending obligations stay
+ * visible; IN_PROGRESS and SUB_COMMITTED are never promoted to terminals. */
+typedef struct ClusterRecoveryRelmapPendingBaseV1 {
+	ClusterRecoveryRelmapHistoryEntryV1 history;
+	ClusterRecoveryRelmapFoldSummary fold;
+	ClusterRelmapClogBaseV1 native;
+} ClusterRecoveryRelmapPendingBaseV1;
+
 typedef struct ClusterRecoveryRelmapHistory ClusterRecoveryRelmapHistory;
 
 /* Borrow the same all-replay IR/WALR scope, not a new per-origin owner.
- * The budget includes this handle and the complete two-pass inventory.
+ * The budget reserves this handle, the complete two-pass inventory and one
+ * fixed original native base custody (charged once actually allocated).
  * Missing/legacy windows stay explicit unqualified inputs. Entered refusal
  * or ERROR revokes the original episode, retaining its protections/debt.
  * Destroy local custody before the original scope/ResourceOwner ends.
@@ -166,6 +246,9 @@ extern ClusterRecoveryNativeInventoryResult cluster_recovery_relmap_history_buil
 	ClusterRecoveryRelmapHistory **out,
 	ClusterRecoveryNativeInventoryDiag *diag);
 /* One original generation in census order, including empty/history sources.
+ * Complete cut/tail/all-record transcript is copied from the SAME inventory,
+ * not a PAGE or native-map prefix. source.input_index and observation's
+ * source_index identify separate views; join them by complete generation.
  * No I/O/cursor changes. Current checks bracket publication of copied bytes.
  * Invalid index/overlapping output is a precondition refusal; other failure
  * is sticky. All outputs remain provisional until the full final recheck. */
@@ -173,9 +256,41 @@ extern bool cluster_recovery_relmap_history_source_v1(ClusterRecoveryRelmapHisto
 	uint32 ordinal, ClusterRecoveryRelmapHistoryEntryV1 *out);
 /* Reread every original physical input and full selected metadata, comparing
  * to the saved baseline under the same original episode. Never rebase.
- * One full synchronous census, not a bounded metadata tick. */
+ * Also reread any bound native base on its SAME held fd/full-page baseline.
+ * One full synchronous census plus native base read, not a bounded tick. */
 extern ClusterRecoveryNativeInventoryResult cluster_recovery_relmap_history_recheck_v1(
 	ClusterRecoveryRelmapHistory *history, ClusterRecoveryNativeInventoryDiag *diag);
+/* Fold one complete canonical pending image under this SAME original episode.
+ * At most128 saved record/child inspections plus two complete saved-source
+ * metadata comparisons per tick; no I/O, allocation, new IR or release.
+ * ENTRY borrows the history's immutable record and selected metadata until
+ * local destroy; MORE/refusal clears entry/summary. Buffers must be disjoint
+ * from each other, the query and all borrowed history storage.
+ * Ordinary caller-lock/output preconditions do not revoke custody. Once
+ * entered, any input/query drift or ERROR is sticky and fails the original
+ * episode, retaining protections/debt. Full final physical recheck remains
+ * mandatory. Once a native base is bound, only the same drained query may
+ * be reread; a new query requires separate local custody under the original
+ * episode. DRAINED is raw correspondence, never era/lifetime/terminal,
+ * COMPLETE, OPEN, native allocation/CLOG truncate or release authority. */
+extern ClusterRecoveryRelmapFoldResult cluster_recovery_relmap_history_pending_step_v1(
+	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
+	ClusterRecoveryRelmapFoldEntry *out, ClusterRecoveryRelmapFoldSummary *summary,
+	ClusterRecoveryNativeInventoryDiag *diag);
+/* Only after a complete pending fold drains: select its unique exact native
+ * map source and actual v2 owner/query window internally, then read the
+ * original CLOG base through the original held-fd API. Buffers must be
+ * exclusive/disjoint from query and borrowed history storage. No caller CF,
+ * native lock or critical section. Checked pre-drain/output/CF/critical
+ * preconditions do not poison; entered refusal/ERROR does, retaining pins/debt and
+ * any held native custody until explicit local destroy. Query is thereafter
+ * fixed; repeated/final reads compare the SAME full page, never rebase.
+ * This is synchronous native I/O, not a bounded metadata tick, birth-era,
+ * no-reuse/truncation/lifetime, native/SIDE terminal or COMPLETE/OPEN/release
+ * authority. Destroy before the original scope/ResourceOwner ends. */
+extern bool cluster_recovery_relmap_history_pending_base_v1(
+	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
+	ClusterRecoveryRelmapPendingBaseV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
 extern void cluster_recovery_relmap_history_destroy_v1(ClusterRecoveryRelmapHistory **history);
 
 /* Borrow the original startup cold scope for two complete physical passes.
@@ -273,6 +388,24 @@ cluster_recovery_native_inventory_terminal_step(ClusterRecoveryNativeInventory *
 extern ClusterRecoveryTerminalResult cluster_recovery_native_inventory_terminal_lookup_step(
 	ClusterRecoveryNativeInventory *inventory, const ClusterRecoveryTxnKey *key,
 	ClusterRecoveryTerminalSummary *out, ClusterRecoveryNativeInventoryDiag *diag);
+/* Independent complete pending-image query. At most 128 saved-record/child
+ * inspections per call, no I/O/allocation and no consumption of other cursors.
+ * ENTRY borrows one original carrier; only DRAINED exports the complete summary.
+ * MORE/refusal clears both outputs. Canonical full pending bytes are fixed
+ * through DRAINED; a later query may then start. Invalid/query drift or failed
+ * final input recheck poisons this inventory and its dependent observations.
+ * RECORD_TOP_XID retains the native top-level label on child-xid carriers.
+ * WAL_MATCH checks full native map bytes, namespace, raw xid, record end and
+ * represented source incarnation only. Membership/boot/FullXid era, reuse,
+ * checkpoint/base lifetime, native/SIDE agreement and terminal qualification
+ * are NOT encoded by that native carrier. Raw terminals and every same-origin
+ * CLOG truncate remain explicit obligations, including historical sources.
+ * Original episode/physical holders and final whole-input checks must remain
+ * current; DRAINED is no COMPLETE, status override, release or OPEN authority. */
+extern ClusterRecoveryRelmapFoldResult cluster_recovery_native_inventory_relmap_step(
+	ClusterRecoveryNativeInventory *inventory, const ClusterRelmapV2Image *pending,
+	ClusterRecoveryRelmapFoldEntry *out, ClusterRecoveryRelmapFoldSummary *summary,
+	ClusterRecoveryNativeInventoryDiag *diag);
 extern void cluster_recovery_native_inventory_destroy(ClusterRecoveryNativeInventory *inventory);
 /* Independent retained terminal/assignment cursor, under the same borrowed
  * ROOT lifetime and failure rules as MX. At most 128 saved records or one

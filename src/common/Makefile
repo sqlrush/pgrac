@@ -55,6 +55,7 @@ OBJS_COMMON = \
 	cluster_catalog_verify.o \
 	cluster_hw_snapshot_codec.o \
 	cluster_relmap_init.o \
+	cluster_relmap_v2.o \
 	cluster_space_identity.o \
 	cluster_space_reservation.o \
 	cluster_undo_segment_init.o \

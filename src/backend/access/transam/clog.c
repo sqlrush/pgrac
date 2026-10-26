@@ -982,6 +982,12 @@ struct ClusterRelmapClogBaseHandleV1 {
 	ClusterRelmapClogBaseV1 base;
 };
 
+size_t
+cluster_clog_relmap_base_custody_bytes_v1(void)
+{
+	return sizeof(ClusterRelmapClogBaseHandleV1);
+}
+
 static bool
 clog_relmap_overlaps(const void *a, size_t an, const void *b, size_t bn)
 {

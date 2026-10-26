@@ -58,6 +58,8 @@ static unsigned inventory_slru_fault;
 static unsigned inventory_relmap_fault;
 static unsigned inventory_prepare_fault;
 static unsigned inventory_terminal_mode;
+static WalTestRecord inventory_write_relmap_fold_sequence(const ClusterWalSourceRef *source,
+	WalTestRecord next, unsigned node);
 
 /* These small records stay within the original checkpoint's first WAL page.
  * Header, main-data framing and CRC are actual native-reader inputs. */
@@ -598,6 +600,8 @@ inventory_fixture(bool unsupported, bool open_source)
 			extra = inventory_write_terminal_sequence(&source, extra, node);
 		if (inventory_extra == 17)
 			extra = inventory_write_page(&source, extra.exclusive_end, extra.record_start, false);
+		if (inventory_extra == 18)
+			extra = inventory_write_relmap_fold_sequence(&source, extra, node);
 		create = inventory_write_record(&source, extra.exclusive_end, extra.record_start,
 										RM_SMGR_ID, XLOG_SMGR_CREATE, &payload, sizeof(payload));
 		if (i == 0) {
@@ -1027,6 +1031,11 @@ UT_TEST(test_ctrc_inventory_keeps_original_local_cut_and_native_terminal_bytes)
 }
 
 #include "test_cluster_recovery_episode_history.inc"
+#include "test_cluster_recovery_relmap_fold.inc"
+#include "test_cluster_recovery_episode_pending.inc"
+#include "test_cluster_recovery_episode_base.inc"
+#include "test_cluster_recovery_episode_sources.inc"
+#include "test_cluster_recovery_episode_pages.inc"
 
 
 int
@@ -1081,7 +1090,7 @@ main(int argc, char **argv)
 	UT_RUN(test_owned_page_inventory_capacity_never_silently_omits_physical_pages);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(111);
+	UT_PLAN(135);
 	UT_RUN(test_wal_sources_include_all_records_without_page_inputs);
 	UT_RUN(test_wal_sources_keep_explicit_empty_and_every_original_generation);
 	UT_RUN(test_wal_sources_preserve_page_and_native_effect_cursors);
@@ -1194,6 +1203,30 @@ main(int argc, char **argv)
 	UT_RUN(test_episode_history_stops_before_second_pass_after_sibling_loss);
 	UT_RUN(test_episode_history_retains_history_and_current_generations_together);
 	UT_RUN(test_episode_history_budget_index_and_alias_refusals_do_not_rebase);
+	UT_RUN(test_relmap_fold_matches_full_native_images_and_preserves_cursors);
+	UT_RUN(test_relmap_fold_keeps_terminals_children_and_lifecycle_obligations);
+	UT_RUN(test_relmap_fold_never_discards_historical_raw_aliases);
+	UT_RUN(test_relmap_fold_is_bounded_and_pins_the_complete_query);
+	UT_RUN(test_relmap_fold_refusal_and_final_drift_revoke_dependents);
+	UT_RUN(test_relmap_fold_counts_empty_origins_and_refuses_invalid_queries);
+	UT_RUN(test_episode_pending_keeps_full_history_and_lifecycle_obligations);
+	UT_RUN(test_episode_pending_bounds_ticks_and_rejects_changed_query_or_holder);
+	UT_RUN(test_episode_pending_first_current_error_retains_original_protection);
+	UT_RUN(test_episode_pending_final_reread_drift_never_revives_the_query);
+	UT_RUN(test_episode_pending_output_and_caller_lock_preconditions_preserve_custody);
+	UT_RUN(test_episode_base_requires_drain_and_retains_actual_query_source);
+	UT_RUN(test_episode_base_rejects_unqualified_or_ambiguous_native_source);
+	UT_RUN(test_episode_base_bound_query_cannot_restart_or_replace_custody);
+	UT_RUN(test_episode_base_final_physical_reread_keeps_the_original_baseline);
+	UT_RUN(test_episode_base_first_and_existing_errors_never_drop_protection);
+	UT_RUN(test_episode_base_after_read_source_drift_discards_only_local_output);
+	UT_RUN(test_episode_base_output_lock_and_budget_preconditions_do_not_poison);
+	UT_RUN(test_episode_sources_keep_complete_zero_page_generations_by_value);
+	UT_RUN(test_episode_sources_base_keeps_full_tail_after_native_map);
+	UT_RUN(test_episode_sources_reject_borrowed_output_without_changing_baseline);
+	UT_RUN(test_episode_sources_sibling_metadata_drift_revokes_complete_view);
+	UT_RUN(test_episode_pages_borrowed_output_preserves_complete_baseline);
+	UT_RUN(test_episode_pages_changed_payload_revokes_copied_source);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
