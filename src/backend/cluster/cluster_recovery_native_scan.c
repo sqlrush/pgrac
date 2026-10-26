@@ -191,6 +191,23 @@ native_slru(ClusterRecoveryNativeScan *scan, uint8 opcode, bool commit_ts)
 	uint8 zero = commit_ts ? COMMIT_TS_ZEROPAGE : CLOG_ZEROPAGE;
 	uint8 truncate = commit_ts ? COMMIT_TS_TRUNCATE : CLOG_TRUNCATE;
 
+	/* FULL retains the producer's native page-generation value verbatim.
+	 * It does not certify a queried transaction or the page's later lifetime. */
+	if (!commit_ts && opcode == CLOG_ZEROPAGE_FULL) {
+		xl_clog_zeropage_full birth;
+		TransactionId raw;
+
+		if (length != sizeof(birth))
+			return CLUSTER_RECOVERY_NATIVE_SHAPE;
+		memcpy(&birth, scan->payload, sizeof(birth));
+		raw = (TransactionId)birth.first_full_xid;
+		if (birth.reserved_zero != 0 || birth.pageno < 0 || !TransactionIdIsNormal(raw)
+			|| (raw % per_page != 0 && raw != FirstNormalTransactionId)
+			|| raw / per_page != (uint32)birth.pageno)
+			return CLUSTER_RECOVERY_NATIVE_SHAPE;
+		scan->primary = CLUSTER_RECOVERY_NATIVE_CLOG_ZERO;
+		return CLUSTER_RECOVERY_NATIVE_MORE;
+	}
 	if (opcode == zero) {
 		if (length != sizeof(page))
 			return CLUSTER_RECOVERY_NATIVE_SHAPE;

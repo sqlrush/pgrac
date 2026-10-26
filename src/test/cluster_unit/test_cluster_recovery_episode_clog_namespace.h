@@ -28,6 +28,12 @@
 #define CritSectionCount d3_episode_clog_CritSectionCount
 #define ExceptionalCondition d3_episode_clog_ExceptionalCondition
 #define ExtendCLOG d3_episode_clog_ExtendCLOG
+#define AdvanceOldestClogXid d3_episode_clog_AdvanceOldestClogXid
+#define ExtendCLOGFull d3_episode_clog_ExtendCLOGFull
+#define LWLockHeldByMeInMode d3_episode_clog_LWLockHeldByMeInMode
+#define XLogBeginInsert d3_episode_clog_XLogBeginInsert
+#define XLogRegisterData d3_episode_clog_XLogRegisterData
+#define XLogInsert d3_episode_clog_XLogInsert
 #define FreeDir d3_episode_clog_FreeDir
 #define InRecovery d3_episode_clog_InRecovery
 #define InterruptHoldoffCount d3_episode_clog_InterruptHoldoffCount

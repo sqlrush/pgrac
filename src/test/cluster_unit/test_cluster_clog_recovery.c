@@ -1257,6 +1257,7 @@ UT_TEST(own_c0_native_error_and_revocation_preserve_cache_ownership)
 }
 
 #include "test_cluster_clog_relmap_participant.inc"
+#include "test_cluster_clog_page_birth.inc"
 
 static void
 fixture_cleanup(void)
@@ -1317,7 +1318,7 @@ main(void)
 	snprintf(path, sizeof(path), "%s/native_side/origin_0/pg_xact", fixture_root);
 	if (symlink(path, "pg_xact") != 0)
 		return 2;
-	UT_PLAN(34);
+	UT_PLAN(38);
 	UT_RUN(separate_original_origin_controls);
 	UT_RUN(commit_and_abort_persist_full_tree_without_local_pollution);
 	UT_RUN(conflicting_late_child_refuses_before_any_tree_write);
@@ -1352,6 +1353,10 @@ main(void)
 	UT_RUN(relmap_episode_error_keeps_held_fd_until_local_cleanup);
 	UT_RUN(relmap_episode_own_route_and_cache_are_not_substituted);
 	UT_RUN(relmap_episode_exact_source_history_and_root_recheck);
+	UT_RUN(clog_full_birth_uses_actual_native_zero_and_full_wal);
+	UT_RUN(clog_full_birth_requires_exclusive_native_issuer);
+	UT_RUN(clog_full_birth_redo_checks_complete_native_image);
+	UT_RUN(clog_full_birth_error_keeps_native_dirty_state);
 	fixture_cleanup();
 	UT_DONE();
 	return ut_failed_count != 0;

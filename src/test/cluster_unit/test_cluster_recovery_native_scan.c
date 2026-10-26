@@ -592,7 +592,7 @@ UT_TEST(test_second_pass_binds_all_source_and_record_bytes)
 int
 main(void)
 {
-	UT_PLAN(40);
+	UT_PLAN(43);
 	UT_RUN(test_commit_keeps_every_effect_and_owned_source);
 	UT_RUN(test_abort_keeps_deletions_stats_and_subxact_membership);
 	UT_RUN(test_assignment_retains_real_top_membership);
@@ -622,6 +622,9 @@ main(void)
 	UT_RUN(test_native_slru_bad_page_cutoff_shape_and_unknown_refuse);
 	UT_RUN(test_native_slru_original_cut_shape_and_allocation_gates);
 	UT_RUN(test_native_slru_full_recheck_after_drain_is_sticky);
+	UT_RUN(test_native_clog_full_birth_retains_exact_generation);
+	UT_RUN(test_native_clog_full_birth_rejects_bad_generation_shapes);
+	UT_RUN(test_native_clog_full_birth_recheck_cannot_rebase);
 	UT_RUN(test_relmap_owns_empty_full_image_and_every_mapping);
 	UT_RUN(test_relmap_rejects_every_truncation_and_bad_image);
 	UT_RUN(test_relmap_preserves_original_scope_budget_and_block_gates);

@@ -3488,7 +3488,8 @@ test_cluster_recovery_native_inputs: $(top_srcdir)/src/backend/cluster/cluster_r
 		$(top_srcdir)/src/include/cluster/cluster_recovery_page_roots.h
 test_cluster_recovery_episode_clog.o: test_cluster_recovery_episode_clog.c \
         test_cluster_recovery_episode_clog.h test_cluster_recovery_episode_clog_namespace.h \
-        test_cluster_clog_recovery.c test_cluster_clog_relmap_participant.inc unit_test.h \
+        test_cluster_clog_recovery.c test_cluster_clog_relmap_participant.inc \
+        test_cluster_clog_page_birth.inc unit_test.h \
         $(top_srcdir)/src/backend/access/transam/clog.c \
         $(top_srcdir)/src/backend/access/transam/slru.c \
         $(top_srcdir)/src/include/access/clog.h \
@@ -4532,7 +4533,7 @@ test_cluster_multixact_recovery test_cluster_multixact_limits_io: %: %.c unit_te
 # PGRAC: original-origin CLOG against real disposable native SLRU files.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_clog_recovery: test_cluster_clog_recovery.c unit_test.h \
-		test_cluster_clog_relmap_participant.inc \
+		test_cluster_clog_relmap_participant.inc test_cluster_clog_page_birth.inc \
 		$(top_srcdir)/src/backend/access/transam/clog.c \
 		$(top_srcdir)/src/include/access/clog.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
@@ -9054,13 +9055,16 @@ test_cluster_cr_coordinator: test_cluster_cr_coordinator.c unit_test.h \
 CLUSTER_XID_STRIPE_O = $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o
 test_cluster_xid_allocation.inc: $(top_srcdir)/src/backend/access/transam/varsup.c \
 		$(top_srcdir)/src/backend/access/transam/transam.c Makefile
-	awk '/^GetNewTransactionId\(/ { print "FullTransactionId"; emit=1; found++ } \
+	awk '/^get_new_transaction_id\(/ { print "static FullTransactionId"; emit=1; found++ } \
+	     /^GetNewTransactionId(FullCLOG)?\(/ { print "FullTransactionId"; emit=1; found++ } \
 	     /^TransactionId(Precedes|FollowsOrEquals)\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $(filter %.c,$^) > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (found != 5) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_xid_allocation: test_cluster_xid_allocation.c unit_test.h \
-		test_cluster_xid_allocation.inc $(CLUSTER_XID_STRIPE_O)
+		test_cluster_xid_allocation.inc test_cluster_xid_full_clog.inc \
+		$(top_srcdir)/src/include/access/transam.h \
+		$(top_srcdir)/src/include/access/clog.h $(CLUSTER_XID_STRIPE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Exercise the original recovery -> seed -> claim -> WAL gate. Dependency
@@ -9898,7 +9902,8 @@ test_cluster_recovery_relation_scan: test_cluster_recovery_relation_scan.c test_
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(LDFLAGS) $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
-test_cluster_recovery_native_scan: $(top_srcdir)/src/include/access/twophase_rmgr.h
+test_cluster_recovery_native_scan: $(top_srcdir)/src/include/access/twophase_rmgr.h \
+		$(top_srcdir)/src/include/access/clog.h
 
 test_cluster_recovery_native_scan: test_cluster_recovery_prepare_fixture.h test_cluster_recovery_prepare_effects.inc
 
