@@ -24,6 +24,9 @@
 #include "commands/tablespace.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "storage/smgr.h"
+#endif
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/numeric.h"
@@ -323,6 +326,23 @@ calculate_relation_size(RelFileLocator *rfn, BackendId backend, ForkNumber forkn
 	char	   *relationpath;
 	char		pathname[MAXPGPATH];
 	unsigned int segcount = 0;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Native shared forks are outside PGDATA. Use the relation's bound
+	 * storage manager rather than interpreting a missing local path as empty. */
+	if (rfn->relNumber != InvalidRelFileNumber)
+	{
+		SMgrRelation smgr = smgropen(*rfn, backend);
+
+		if (smgr->smgr_which == 1) /* cluster_smgr */
+		{
+			CHECK_FOR_INTERRUPTS();
+			if (!smgrexists(smgr, forknum))
+				return 0;
+			return (int64) smgrnblocks(smgr, forknum) * BLCKSZ;
+		}
+	}
+#endif
 
 	relationpath = relpathbackend(*rfn, backend, forknum);
 
