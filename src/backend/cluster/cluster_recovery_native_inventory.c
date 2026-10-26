@@ -70,6 +70,7 @@ typedef struct NativeInventoryRelmapXid {
 	uint32 source_index;
 	uint64 before_map, after_map, map_ordinal;
 	XLogRecPtr map_start, map_end;
+	ClusterRecoveryRelmapPendingXidV1 *result; /* stack-only unpublished output */
 } NativeInventoryRelmapXid;
 
 struct ClusterRecoveryNativeInventory {
@@ -510,6 +511,53 @@ inventory_source(const ClusterWalSourceRef *source, const RfContributorStreamCut
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
+/* Preserve the complete physical origin's lifecycle stream, not just the
+ * queried raw page. Another generation or a pre-redo record has no counter
+ * candidate in this pass; keep it explicitly unobserved, never attach an era.
+ * The original native recheck has compared this complete owned record first. */
+static bool
+inventory_relmap_clog_record(ClusterRecoveryNativeInventory *work,
+	const NativeInventoryRecord *saved, uint64 before, uint64 after, bool observed)
+{
+	NativeInventoryRelmapXid *xid = work->relmap_xid;
+	ClusterRecoveryNativeEffect effect;
+	ClusterRecoveryRelmapClogEventV1 *event;
+	ClusterRecoveryRelmapPendingXidV1 *out = xid->result;
+
+	if (work->sources[work->source_cursor].source.claim.identity.origin_node_id
+		!= work->relmap_query.pending_owner.node)
+		return true;
+	if (out == NULL || saved == NULL
+		|| cluster_recovery_native_scan_primary(saved->scan, &effect)
+			!= CLUSTER_RECOVERY_NATIVE_EFFECT
+		|| (effect.kind != CLUSTER_RECOVERY_NATIVE_CLOG_ZERO
+			&& effect.kind != CLUSTER_RECOVERY_NATIVE_CLOG_TRUNCATE)
+		|| out->clog_count >= CLUSTER_RECOVERY_RELMAP_CLOG_HISTORY_MAX)
+		return false;
+	event = &out->clog[out->clog_count++];
+	event->source_index = saved->source_index;
+	event->record_ordinal = saved->ordinal;
+	event->read_lsn = effect.record->read_lsn;
+	event->end_lsn = effect.record->end_lsn;
+	event->record_crc = (uint32)effect.record->header.xl_crc;
+	event->kind = effect.kind;
+	if (effect.kind == CLUSTER_RECOVERY_NATIVE_CLOG_ZERO)
+		memcpy(&event->page, effect.record->payload, sizeof(event->page));
+	else {
+		xl_clog_truncate truncate;
+		memcpy(&truncate, effect.record->payload, sizeof(truncate));
+		event->page = truncate.pageno;
+		event->oldest_xact = truncate.oldestXact;
+		event->oldest_database = truncate.oldestXactDb;
+	}
+	event->counter_observed = observed;
+	if (observed) {
+		event->counter_before = before;
+		event->counter_after = after;
+	}
+	return true;
+}
+
 /* The original decoder owns all payload/child/checkpoint counter semantics.
  * This strict local-form observation uses none of its execution routes and
  * accepts no caller-provided counter inputs. Free its transient scratch on
@@ -523,9 +571,12 @@ inventory_relmap_xid_record(ClusterRecoveryNativeInventory *work, XLogReaderStat
 	uint64 before;
 	volatile bool ok = false;
 
-	if (xid == NULL || work->source_cursor != xid->source_index
-		|| reader->ReadRecPtr < xid->source.native_redo)
+	if (xid == NULL)
 		return true;
+	if (work->source_cursor != xid->source_index
+		|| reader->ReadRecPtr < xid->source.native_redo)
+		return XLogRecGetRmid(reader) != RM_CLOG_ID
+			|| inventory_relmap_clog_record(work, saved, 0, 0, false);
 	if (xid->progress.records == 0 && reader->ReadRecPtr != xid->source.native_redo)
 		return false;
 	/* Preserve the original cold decoder's frame-identity rejection even
@@ -582,7 +633,8 @@ inventory_relmap_xid_record(ClusterRecoveryNativeInventory *work, XLogReaderStat
 		xid->map_end = reader->EndRecPtr;
 		xid->map_ordinal = ordinal;
 	}
-	return ok;
+	return ok && (XLogRecGetRmid(reader) != RM_CLOG_ID
+		|| inventory_relmap_clog_record(work, saved, before, xid->progress.next_xid, true));
 }
 
 static RfPageProofDetailV1
@@ -3046,6 +3098,7 @@ cluster_recovery_relmap_history_pending_xid_v1(ClusterRecoveryRelmapHistory *his
 			result.checkpoint_next = U64FromFullTransactionId(
 				saved->history.input.native_checkpoint.nextXid);
 			xid.source_index = index;
+		xid.result = &result;
 			xid.source.thread_id = saved->cut.failed_thread;
 			xid.source.timeline = saved->cut.timeline_id;
 			xid.source.owner_incarnation = saved->cut.origin_owner_incarnation;

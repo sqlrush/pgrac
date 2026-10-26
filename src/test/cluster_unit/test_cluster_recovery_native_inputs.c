@@ -1085,6 +1085,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_episode_native_clog.inc"
 #include "test_cluster_recovery_episode_terminal.inc"
 #include "test_cluster_recovery_episode_xid.inc"
+#include "test_cluster_recovery_episode_clog_history.inc"
 
 
 int
@@ -1094,6 +1095,15 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_EPISODE_CLOG_HISTORY") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_episode_clog_history_keeps_every_original_zero_and_truncate);
+		UT_RUN(test_episode_clog_history_keeps_unrelated_page_and_raw_horizon);
+		UT_RUN(test_episode_clog_history_capacity_refuses_without_partial_output);
+		UT_RUN(test_episode_clog_history_prefix_and_other_generation_remain_unobserved);
+		UT_RUN(test_episode_clog_history_late_error_discards_output_keeps_original_custody);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_EPISODE_XID") != NULL) {
 		UT_PLAN(7);
 		UT_RUN(test_episode_xid_unrelated_relmap_retains_original_frame_identity_refusal);
@@ -1215,7 +1225,12 @@ main(int argc, char **argv)
 		UT_RUN(test_episode_terminal_preconditions_preserve_original_base_and_query);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(166);
+	UT_PLAN(171);
+	UT_RUN(test_episode_clog_history_keeps_every_original_zero_and_truncate);
+	UT_RUN(test_episode_clog_history_keeps_unrelated_page_and_raw_horizon);
+	UT_RUN(test_episode_clog_history_capacity_refuses_without_partial_output);
+	UT_RUN(test_episode_clog_history_prefix_and_other_generation_remain_unobserved);
+	UT_RUN(test_episode_clog_history_late_error_discards_output_keeps_original_custody);
 	UT_RUN(test_episode_xid_unrelated_relmap_retains_original_frame_identity_refusal);
 	UT_RUN(test_episode_xid_keeps_original_checkpoint_map_and_complete_tail);
 	UT_RUN(test_episode_xid_tail_header_and_checkpoint_use_original_counter_rules);
