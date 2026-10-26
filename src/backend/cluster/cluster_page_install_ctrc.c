@@ -430,6 +430,225 @@ rf_page_recovery_ctrc_replays_fpi_insert_v1(const struct ClusterRecoveryStartV1 
 	return result;
 }
 
+typedef struct CtrcNativeInstallV1 {
+	CtrcNativeInsertV1 binding;
+	const RfPageCtrcFpiInsertV1 *original;
+	RfPageCtrcFpiInsertV1 fixed;
+	PGAlignedBlock space0, space1;
+} CtrcNativeInstallV1;
+
+static bool
+ctrc_native_install_current(const CtrcNativeInstallV1 *context)
+{
+	const RfPageCtrcFpiInsertV1 *fixed = &context->fixed;
+	TimeLineID timeline;
+
+	if (memcmp(context->original, fixed, sizeof(*fixed)) != 0 || !fixed->wal_flushed
+		|| !ctrc_native_insert_current(&context->binding, fixed)
+		|| !cluster_recovery_stamp_fpi_inserted_current_v1(&fixed->window,
+			fixed->record_start, fixed->record_end)
+		|| cluster_wal_writer_check(&fixed->window.owner.writer) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| GetFlushRecPtr(&timeline) < fixed->record_end
+		|| timeline != fixed->window.owner.writer.ref.timeline)
+		return false;
+	return memcmp(context->original, fixed, sizeof(*fixed)) == 0
+		&& ctrc_native_insert_current(&context->binding, fixed);
+}
+
+static bool
+ctrc_native_install_read_page(const CtrcNativeInstallV1 *context, SMgrRelation relation,
+	ForkNumber fork, BlockNumber block, PGAlignedBlock *out)
+{
+	return ctrc_native_install_current(context)
+		&& ctrc_native_read_page(&context->binding.read, relation, fork, block, out)
+		&& ctrc_native_install_current(context);
+}
+
+/* SPACE is verified on both sides of each target observation, and across
+ * installation. Result-version acceptance never widens the PAGE authority. */
+static bool
+ctrc_native_install_observe(CtrcNativeInstallV1 *context, SMgrRelation relation,
+	bool first, PGAlignedBlock *out)
+{
+	const CtrcNativeReadV1 *read = &context->binding.read;
+	ClusterSpaceIdentity identity;
+	ClusterSpaceReservation reservation;
+	uint8 encoded[CLUSTER_SPACE_IDENTITY_BYTES];
+	PGAlignedBlock space0, space1, page, verify;
+	BlockNumber block = read->identity.blockno;
+	uint64 token;
+
+	if (!ctrc_native_install_read_page(context, relation, SPACE_FORKNUM, 0, &space0)
+		|| !ctrc_native_read_integrity(read, &space0, 0)
+		|| !cluster_space_identity_page_decode(space0.data, BLCKSZ, SPACE_FORKNUM, 0,
+			&read->key, &identity, &token)
+		|| !cluster_space_identity_encode(&identity, encoded, sizeof(encoded))
+		|| memcmp(encoded, read->space_identity, sizeof(encoded)) != 0
+		|| !ctrc_native_install_read_page(context, relation, SPACE_FORKNUM, 1, &space1)
+		|| !ctrc_native_read_integrity(read, &space1, 1)
+		|| !cluster_space_reservation_page_decode(space1.data, BLCKSZ, SPACE_FORKNUM, 1,
+			&read->key, &reservation, &token)
+		|| reservation.next_block <= block
+		|| !cluster_space_identity_encode(&reservation.identity, encoded, sizeof(encoded))
+		|| memcmp(encoded, read->space_identity, sizeof(encoded)) != 0
+		|| (!first && (memcmp(&space0, &context->space0, sizeof(space0)) != 0
+			|| memcmp(&space1, &context->space1, sizeof(space1)) != 0))
+		|| !ctrc_native_install_read_page(context, relation, MAIN_FORKNUM, block, &page)
+		|| !ctrc_native_read_integrity(read, &page, block)
+		|| !ctrc_native_install_read_page(context, relation, SPACE_FORKNUM, 0, &verify)
+		|| memcmp(&verify, &space0, sizeof(verify)) != 0
+		|| !ctrc_native_install_read_page(context, relation, SPACE_FORKNUM, 1, &verify)
+		|| memcmp(&verify, &space1, sizeof(verify)) != 0
+		|| !ctrc_native_install_current(context))
+		return false;
+	if (first) { context->space0 = space0; context->space1 = space1; }
+	*out = page;
+	return true;
+}
+
+static bool
+ctrc_native_install_storage_current(const CtrcNativeInstallV1 *context, SMgrRelation relation)
+{
+	return ctrc_native_install_current(context)
+		&& ctrc_native_read_storage(relation, context->binding.read.identity.blockno)
+		&& ctrc_native_install_current(context);
+}
+
+static bool
+ctrc_native_install_image(CtrcNativeInstallV1 *context, const RfPageCtrcAuthorityV1 *authority)
+{
+	CtrcNativeInsertV1 *binding = &context->binding;
+	const RfPageCtrcFpiInsertV1 *fixed = &context->fixed;
+	const ClusterControlRootIdentity *writer = &fixed->window.owner.writer.ref.claim.identity;
+	PGAlignedBlock canonical, current;
+	SMgrRelation relation;
+	uint64 token;
+
+	if (memcmp(context->original, fixed, sizeof(*fixed)) != 0
+		|| !ctrc_native_insert_inputs_current(binding, fixed)
+		|| !GenericXLogRecoveryImageDescribe(&fixed->image, &binding->descriptor)
+		|| memcmp(context->original, fixed, sizeof(*fixed)) != 0
+		|| !ctrc_native_insert_inputs_current(binding, fixed)
+		|| !ctrc_native_read_bind(&binding->read, binding->start, binding->work, authority,
+			&context->original->image.identity, fixed->image.block_number,
+			&context->original->image.version.before)
+		|| memcmp(&binding->read.owner, &binding->accepted.checkpoint.owner, sizeof(binding->read.owner)) != 0
+		|| !ctrc_native_install_current(context)
+		|| writer->origin_node_id > PGRAC_PAGE_LSN_ORIGIN_MAX
+		|| writer->origin_thread_id != writer->origin_node_id + 1)
+		return false;
+	canonical = fixed->image.image;
+	/* This is the actual newly inserted writer's coordinate. Never relabel
+	 * it as the failed replay source, or let a foreign merge window clamp it. */
+	PageSetLSNPreserveOrigin(canonical.data, fixed->record_end);
+	if (!PageSetLSNOrigin(canonical.data, writer->origin_node_id)) return false;
+	((PageHeader)canonical.data)->pd_checksum = 0;
+	if (binding->read.checksums)
+		((PageHeader)canonical.data)->pd_checksum = pg_checksum_page(canonical.data, fixed->image.block_number);
+	if (!ctrc_native_read_integrity(&binding->read, &canonical, fixed->image.block_number)
+		|| ((PageHeader)canonical.data)->pd_block_scn != fixed->image.result_token
+		|| !ctrc_native_install_current(context))
+		return false;
+	relation = smgropen(binding->read.identity.locator, InvalidBackendId);
+	if (!ctrc_native_install_current(context)
+		|| !ctrc_native_install_observe(context, relation, true, &current))
+		return false;
+	token = ((PageHeader)current.data)->pd_block_scn;
+	if (token == fixed->image.result_token) {
+		if (memcmp(&current, &canonical, sizeof(current)) != 0) return false;
+	} else if (token == fixed->image.version.before.mutation_token) {
+		if (!ctrc_native_install_storage_current(context, relation)) return false;
+		smgrwrite(relation, MAIN_FORKNUM, fixed->image.block_number, canonical.data, false);
+		if (!ctrc_native_install_storage_current(context, relation)) return false;
+	} else
+		return false;
+	if (!ctrc_native_install_storage_current(context, relation)) return false;
+	smgrimmedsync(relation, MAIN_FORKNUM);
+	return ctrc_native_install_storage_current(context, relation)
+		&& ctrc_native_install_observe(context, relation, false, &current)
+		&& memcmp(&current, &canonical, sizeof(current)) == 0
+		&& ctrc_native_install_current(context);
+}
+
+/* Refuse additional caller locks before any borrowed owner/current snapshot.
+ * The only held lock must be the original target PAGE, subsequently matched
+ * by the unchanged native reference. Native storage/flush snapshots retain
+ * ample headroom without raising the native LWLock ceiling. */
+static bool
+ctrc_native_install_bind(CtrcNativeInstallV1 *context,
+	const struct ClusterRecoveryStartV1 *start, const ClusterColdCtrcWorkV1 *work,
+	const ClusterRecoveryCtrcReplaySetSourceV1 *source, const RfPageCtrcAuthorityV1 *authority,
+	Size subject_count, Size memory_budget, ClusterColdCtrcWorkV1 *header)
+{
+	CtrcNativeInsertV1 *binding = &context->binding;
+	uint32 held = 0;
+
+	if (!ctrc_native_read_actor() || start == NULL || work == NULL || source == NULL || authority == NULL)
+		return false;
+	ForEachLWLockHeldByMe(ctrc_native_insert_count_lock, &held);
+	if (held != 1 || !ClusterColdRecoveryCtrcWorkCurrent(start, work)
+		|| subject_count != work->counts.subject_count
+		|| subject_count > (MaxAllocSize - offsetof(ClusterColdCtrcWorkV1, entries)) / sizeof(work->entries[0])
+		|| source->scope == NULL || ClusterColdRecoveryCtrcScope(start, work) != source->scope)
+		return false;
+	binding->work_bytes = offsetof(ClusterColdCtrcWorkV1, entries)
+		+ subject_count * sizeof(work->entries[0]);
+	if (binding->work_bytes > memory_budget) return false;
+	memcpy(header, work, offsetof(ClusterColdCtrcWorkV1, entries));
+	binding->start = start; binding->work = work;
+	binding->original_source = source; memcpy(&binding->source, source, sizeof(binding->source));
+	binding->original_image = &context->original->image;
+	return cluster_recovery_ctrc_terminal_result_v1(start, work, &binding->accepted);
+}
+
+/* Fixed input/binding live in the caller's frame, outside this setjmp. */
+static bool
+ctrc_native_install_attempt(CtrcNativeInstallV1 *context,
+	const struct ClusterRecoveryStartV1 *start, const ClusterColdCtrcWorkV1 *work,
+	const ClusterRecoveryCtrcReplaySetSourceV1 *source, const RfPageCtrcAuthorityV1 *authority,
+	Size subject_count, Size memory_budget)
+{
+	void *volatile snapshot = NULL;
+	volatile bool completed = false;
+
+	PG_TRY();
+	{
+		ClusterColdCtrcWorkV1 header;
+		if (ctrc_native_install_bind(context, start, work, source, authority, subject_count, memory_budget, &header)) {
+			snapshot = MemoryContextAllocZero(CurrentMemoryContext, context->binding.work_bytes);
+			if (ClusterColdRecoveryCtrcWorkCurrent(start, work)
+				&& memcmp(work, &header, offsetof(ClusterColdCtrcWorkV1, entries)) == 0) {
+				memcpy((void *)snapshot, work, context->binding.work_bytes);
+				context->binding.snapshot = (const ClusterColdCtrcWorkV1 *)snapshot;
+				completed = ctrc_native_install_image(context, authority);
+			}
+		}
+		if (!completed) (void)cluster_recovery_stamp_fail_v1(&context->fixed.window);
+	}
+	PG_CATCH();
+	{
+		(void)cluster_recovery_stamp_fail_v1(&context->fixed.window);
+		if (snapshot != NULL) pfree((void *)snapshot);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (snapshot != NULL) pfree((void *)snapshot);
+	return completed;
+}
+
+bool
+rf_page_recovery_ctrc_replays_fpi_install_smgr_v1(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, const ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	const RfPageCtrcAuthorityV1 *authority, const RfPageCtrcFpiInsertV1 *inserted,
+	Size subject_count, Size memory_budget)
+{
+	CtrcNativeInstallV1 context = {0};
+
+	if (inserted == NULL) return false;
+	context.original = inserted; memcpy(&context.fixed, inserted, sizeof(context.fixed));
+	return ctrc_native_install_attempt(&context, start, work, source, authority, subject_count, memory_budget);
+}
+
 typedef struct CtrcNativeFpiV1 {
 	CtrcNativeReadV1 read;
 	ClusterSpaceIdentity space;
