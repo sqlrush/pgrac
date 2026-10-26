@@ -207,3 +207,10 @@ heap_receipt_test_error_detail(const ClusterUndoRecordPrepareReceipt *receipt,
 	targets[0] = *observed;
 	return cluster_heap_undo_retry_errdetail(receipt, targets, 1, 0, 1);
 }
+
+uint16 heap_receipt_test_payload_capacity(uint8 record_type, uint16 requested);
+uint16
+heap_receipt_test_payload_capacity(uint8 record_type, uint16 requested)
+{
+	return cluster_heap_undo_payload_capacity(record_type, requested);
+}

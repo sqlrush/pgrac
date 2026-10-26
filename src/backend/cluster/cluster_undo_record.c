@@ -3137,6 +3137,102 @@ cluster_undo_record_bytes_zero(const void *address, Size length)
 	return true;
 }
 
+/* Validate only the captured representation. Native scope, current ownership
+ * and durability remain the caller's original receipt/publication duties. */
+static bool
+undo_prepared_record_operation(const ClusterUndoRecordPrepareReceipt *receipt,
+							   const UndoRecordHeader *record, UndoOperationTrailer *out)
+{
+	const ClusterSavepointOperation *operation = &receipt->operation;
+	bool child = !FullTransactionIdEquals(operation->operation_fxid, operation->top_fxid);
+
+	memset(out, 0, sizeof(*out));
+	if (receipt->owner_instance == 0 || receipt->owner_instance != operation->top.origin_instance
+		|| record->origin_node_id + 1 != receipt->owner_instance
+		|| receipt->tt_slot_segment_id != operation->top.segment_id
+		|| receipt->tt_slot_offset != operation->top.slot_offset
+		|| record->tt_slot_segment_id != receipt->tt_slot_segment_id
+		|| record->tt_slot_id != cluster_tt_slot_offset_to_id(receipt->tt_slot_offset)
+		|| operation->top.slot_wrap == PG_UINT16_MAX
+		|| record->tt_wrap_plus1 != (uint16)(operation->top.slot_wrap + 1)
+		|| operation->top.xid != XidFromFullTransactionId(operation->top_fxid)
+		|| !TransactionIdIsNormal(operation->top.xid)
+		|| record->xid != XidFromFullTransactionId(operation->operation_fxid)
+		|| !TransactionIdIsNormal(record->xid) || operation->top.segment_generation == PG_UINT32_MAX
+		|| operation->operation_sequence == 0 || operation->command_id == InvalidCommandId
+		|| (child ? (operation->subid <= TopSubTransactionId
+					 || !FullTransactionIdFollows(operation->operation_fxid, operation->top_fxid))
+				  : operation->subid != TopSubTransactionId))
+		return false;
+	if (!child)
+		return true;
+	out->version = UNDO_OPERATION_TRAILER_VERSION;
+	out->length = UNDO_OPERATION_TRAILER_LENGTH;
+	out->effect_state = CLUSTER_SAVEPOINT_EFFECT_LIVE;
+	out->canonical_top_fxid = U64FromFullTransactionId(operation->top_fxid);
+	out->operation_fxid = U64FromFullTransactionId(operation->operation_fxid);
+	out->operation_sequence = operation->operation_sequence;
+	out->canonical_segment_generation = operation->top.segment_generation;
+	out->command_id = operation->command_id;
+	out->subid = operation->subid;
+	return true;
+}
+
+/* Build only a bounded private candidate. Top-only bytes retain V1; a child
+ * adds the immutable operation after the original history, never inside the
+ * operation body. No shared publication or native admission occurs here. */
+static bool
+undo_prepared_record_encode_payload(const ClusterUndoRecordPrepareReceipt *receipt,
+									UndoRecordHeader *record, const void *payload,
+									uint16 payload_len, char *destination, size_t capacity)
+{
+	UndoOperationTrailer operation, decoded_operation;
+	UndoItlHistoryTrailer history = { 0 }, decoded_history;
+	UndoRecordHeader encoded;
+	uint32 total;
+	uint16 decoded_body;
+	bool child, valid;
+
+	if (receipt == NULL || record == NULL || payload == NULL || destination == NULL
+		|| payload_len > receipt->payload_capacity || record->record_type != receipt->record_type
+		|| record->record_type < UNDO_RECORD_INSERT || record->record_type > UNDO_RECORD_ITL
+		|| (record->flags & ~UNDO_REC_FLAG_FIRST_IN_TX) != 0
+		|| (receipt->itl_history_mask != 1 && receipt->itl_history_mask != 3)
+		|| !cluster_undo_record_bytes_zero(receipt->itl_history_reserved,
+										   sizeof(receipt->itl_history_reserved)))
+		return false;
+	total = undo_prepared_record_total_length(&receipt->operation, payload_len);
+	if (total > UNDO_RECORD_HARD_CAP_BYTES || total - sizeof(*record) > capacity
+		|| !undo_prepared_record_operation(receipt, record, &operation))
+		return false;
+	child
+		= !FullTransactionIdEquals(receipt->operation.operation_fxid, receipt->operation.top_fxid);
+	history.magic = UNDO_ITL_HISTORY_MAGIC;
+	history.version = UNDO_ITL_HISTORY_VERSION;
+	history.count = receipt->itl_history_mask == 3 ? 2 : 1;
+	memcpy(history.entries, receipt->itl_history, sizeof(history.entries));
+	encoded = *record;
+	encoded.flags |= UNDO_REC_FLAG_HAS_ITL_HISTORY | (child ? UNDO_REC_FLAG_HAS_OPERATION : 0);
+	encoded.payload_length = (uint16)(total - sizeof(*record));
+	memcpy(destination, payload, payload_len);
+	memcpy(destination + payload_len, &history, sizeof(history));
+	if (child) {
+		memcpy(destination + payload_len + sizeof(history), &operation, sizeof(operation));
+		valid = cluster_undo_record_decode_operation_payload(&encoded, destination,
+															 encoded.payload_length, &decoded_body,
+															 &decoded_history, &decoded_operation);
+	} else
+		valid = cluster_undo_record_decode_payload(&encoded, destination, encoded.payload_length,
+												   &decoded_body, &decoded_history);
+	if (!valid || decoded_body != payload_len
+		|| memcmp(&history, &decoded_history, sizeof(history)) != 0
+		|| (child && memcmp(&operation, &decoded_operation, sizeof(operation)) != 0))
+		return false;
+	*record = encoded;
+	return true;
+}
+
+
 bool
 cluster_undo_record_stage_history(ClusterUndoRecordPrepareReceipt *receipt, uint8 target_ordinal,
 								  const UndoItlHistoryEntry *entry)
@@ -4012,15 +4108,13 @@ cluster_undo_record_consume_prepared(ClusterUndoRecordPrepareReceipt *receipt,
 	ClusterUndoRecordReservation *reservation = &cluster_undo_record_reservation;
 	PGAlignedBlock successor;
 	UndoBlockHeader *blkhdr;
+	UndoRecordHeader record;
 	UndoRecordHeader *rechdr;
 	UndoSlotDirEntry *slot;
 	UBA effective_prev_uba = InvalidUba;
 	UBA result;
 	SCN current_scn;
 	uint32 record_length;
-	UndoItlHistoryTrailer history = { 0 };
-	UndoItlHistoryTrailer decoded_history;
-	uint16 decoded_body_length;
 	uint16 new_slot_idx;
 	uint32 free_offset;
 	uint16 slot_count;
@@ -4042,10 +4136,6 @@ cluster_undo_record_consume_prepared(ClusterUndoRecordPrepareReceipt *receipt,
 		|| !cluster_undo_record_bytes_zero(receipt->itl_history_reserved,
 										   sizeof(receipt->itl_history_reserved)))
 		return CLUSTER_UNDO_RECORD_CONSUME_REFUSED;
-	history.magic = UNDO_ITL_HISTORY_MAGIC;
-	history.version = UNDO_ITL_HISTORY_VERSION;
-	history.count = receipt->itl_history_mask == 3 ? 2 : 1;
-	memcpy(history.entries, receipt->itl_history, sizeof(history.entries));
 
 	record_length = undo_prepared_record_total_length(&receipt->operation, payload_len);
 	free_offset = receipt->extent.cur_free_offset;
@@ -4072,11 +4162,10 @@ cluster_undo_record_consume_prepared(ClusterUndoRecordPrepareReceipt *receipt,
 		blkhdr->first_change_scn = current_scn;
 		blkhdr->first_change_lsn = GetXLogWriteRecPtr();
 	}
-	rechdr = (UndoRecordHeader *)(successor.data + free_offset);
+	rechdr = &record;
 	memset(rechdr, 0, sizeof(*rechdr));
 	rechdr->record_type = receipt->record_type;
-	rechdr->flags = (first_in_tx ? UNDO_REC_FLAG_FIRST_IN_TX : 0) | UNDO_REC_FLAG_HAS_ITL_HISTORY;
-	rechdr->payload_length = payload_len + sizeof(history);
+	rechdr->flags = first_in_tx ? UNDO_REC_FLAG_FIRST_IN_TX : 0;
 	rechdr->xid = XidFromFullTransactionId(receipt->operation.operation_fxid);
 	rechdr->origin_node_id = (uint16)cluster_node_id;
 	rechdr->tt_slot_segment_id = receipt->tt_slot_segment_id;
@@ -4088,13 +4177,11 @@ cluster_undo_record_consume_prepared(ClusterUndoRecordPrepareReceipt *receipt,
 	rechdr->target_fork = target->forknum;
 	rechdr->target_block = target->blockno;
 	rechdr->target_offset = target->offnum;
-	memcpy(successor.data + free_offset + sizeof(*rechdr), payload, payload_len);
-	memcpy(successor.data + free_offset + sizeof(*rechdr) + payload_len, &history, sizeof(history));
-	if (!cluster_undo_record_decode_payload(rechdr, successor.data + free_offset + sizeof(*rechdr),
-											rechdr->payload_length, &decoded_body_length,
-											&decoded_history)
-		|| rechdr->tt_wrap_plus1 == 0)
+	if (!undo_prepared_record_encode_payload(receipt, rechdr, payload, payload_len,
+											 successor.data + free_offset + sizeof(*rechdr),
+											 record_length - sizeof(*rechdr)))
 		return CLUSTER_UNDO_RECORD_CONSUME_REFUSED;
+	memcpy(successor.data + free_offset, rechdr, sizeof(*rechdr));
 	new_slot_idx = slot_count;
 	slot = UNDO_SLOT_DIR_PTR(successor.data, new_slot_idx);
 	slot->record_offset = free_offset;

@@ -482,6 +482,19 @@ cluster_heap_prepare_undo_record_call(
 #define cluster_heap_prepare_undo_record_call cluster_undo_record_prepare
 #endif
 
+/* PGRAC: a reservation bound can exceed every legal heap body when the
+ * GUC is large. Bound only the reservation, identically on prepare/retry;
+ * actual tuple images and their lengths are never shortened. */
+static uint16
+cluster_heap_undo_payload_capacity(uint8 record_type, uint16 requested)
+{
+	if (record_type == UNDO_RECORD_UPDATE)
+		return Min(requested, MaxHeapTupleSize + sizeof(UndoUpdatePayload));
+	if (record_type == UNDO_RECORD_DELETE)
+		return Min(requested, MaxHeapTupleSize + sizeof(UndoDeletePayload));
+	return requested;
+}
+
 static bool
 cluster_heap_prepare_undo_record_exact(uint8 record_type,
 								   uint16 payload_capacity,
@@ -491,6 +504,7 @@ cluster_heap_prepare_undo_record_exact(uint8 record_type,
 								   uint64 absolute_deadline_us,
 								   ClusterUndoRecordPrepareReceipt *receipt)
 {
+	payload_capacity = cluster_heap_undo_payload_capacity(record_type, payload_capacity);
 	for (;;)
 	{
 		ClusterUndoRecordPrepareResult result;
@@ -524,6 +538,7 @@ cluster_heap_retry_undo_record_exact(uint8 record_type, uint16 payload_capacity,
 
 	if (receipt == NULL)
 		return false;
+	payload_capacity = cluster_heap_undo_payload_capacity(record_type, payload_capacity);
 	targets_invalidated = targets_invalidated || receipt->record_type != record_type
 						  || receipt->tt_slot_segment_id != tt_slot_segment_id
 						  || receipt->tt_slot_offset != tt_slot_offset;

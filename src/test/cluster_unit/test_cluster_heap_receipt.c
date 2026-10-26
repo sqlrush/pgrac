@@ -48,6 +48,8 @@ extern void heap_receipt_test_current_mode(uint8 state);
 extern OffsetNumber heap_receipt_test_insert_offset(Page page, HeapTuple tuple);
 extern bool heap_receipt_test_tuple_address(Page page, int leg);
 
+extern uint16 heap_receipt_test_payload_capacity(uint8 record_type, uint16 requested);
+
 static char heap_receipt_error_detail[4096];
 
 void *
@@ -434,13 +436,68 @@ UT_TEST(insert_undo_target_matches_real_empty_or_reused_line_pointer)
 	}
 }
 
+UT_TEST(heap_reservations_preserve_the_complete_supported_tuple_bound)
+{
+	const uint8 types[] = { UNDO_RECORD_UPDATE, UNDO_RECORD_DELETE };
+	PGAlignedBlock page;
+	char tuple[MaxHeapTupleSize];
+
+	memset(tuple, 0x5a, sizeof(tuple));
+	PageInitHeapPage(page.data, BLCKSZ, 0);
+	UT_ASSERT_EQ(PageAddItem(page.data, (Item)tuple, sizeof(tuple), FirstOffsetNumber, false, true),
+				 FirstOffsetNumber);
+	UT_ASSERT_EQ(ItemIdGetLength(PageGetItemId(page.data, FirstOffsetNumber)), MaxHeapTupleSize);
+	for (unsigned i = 0; i < lengthof(types); i++) {
+		uint16 maximum = MaxHeapTupleSize
+						 + (types[i] == UNDO_RECORD_UPDATE ? sizeof(UndoUpdatePayload)
+														   : sizeof(UndoDeletePayload));
+
+		for (unsigned requested = 16; requested <= BLCKSZ; requested++)
+			UT_ASSERT_EQ(heap_receipt_test_payload_capacity(types[i], requested),
+						 Min(requested, maximum));
+		UT_ASSERT_EQ(heap_receipt_test_payload_capacity(types[i], PG_UINT16_MAX), maximum);
+		UT_ASSERT(sizeof(UndoRecordHeader) + maximum + sizeof(UndoItlHistoryTrailer)
+					  + sizeof(UndoOperationTrailer)
+				  <= UNDO_RECORD_HARD_CAP_BYTES);
+	}
+	UT_ASSERT_EQ(heap_receipt_test_payload_capacity(UNDO_RECORD_INSERT, 4), 4);
+	UT_ASSERT_EQ(heap_receipt_test_payload_capacity(UNDO_RECORD_ITL, 40), 40);
+}
+
+UT_TEST(heap_retry_uses_the_same_bounded_reservation_after_its_deadline)
+{
+	const uint8 types[] = { UNDO_RECORD_UPDATE, UNDO_RECORD_DELETE };
+
+	for (unsigned i = 0; i < lengthof(types); i++) {
+		ClusterUndoRecordPrepareReceipt receipt, saved;
+		uint16 maximum = MaxHeapTupleSize
+						 + (types[i] == UNDO_RECORD_UPDATE ? sizeof(UndoUpdatePayload)
+														   : sizeof(UndoDeletePayload));
+
+		receipt_fixture_ready(types[i], &receipt);
+		receipt.payload_capacity = maximum;
+		/* Exact already-prepared receipt; neither a native capture nor a new reservation. */
+		cluster_undo_record_reservation.receipt = receipt;
+		saved = receipt;
+		receipt_clock_us = receipt.absolute_deadline_us + 1;
+		UT_ASSERT_EQ(cluster_undo_record_requalify_for_retry(
+						 &receipt, heap_receipt_test_payload_capacity(types[i], BLCKSZ), false),
+					 CLUSTER_UNDO_RECORD_PREPARE_READY);
+		UT_ASSERT_EQ(memcmp(&receipt, &saved, sizeof(saved)), 0);
+		UT_ASSERT_EQ(receipt_cancel_calls + receipt_prepare_calls + receipt_leave_calls, 0);
+		cluster_undo_record_cancel_prepared(&receipt);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(16);
 	UT_RUN(own_lock_handoff_gets_fresh_data_receipt_and_full_predecessor);
 	UT_RUN(logical_tid_cannot_authorize_another_tuple_address);
 	UT_RUN(insert_undo_target_matches_real_empty_or_reused_line_pointer);
+	UT_RUN(heap_reservations_preserve_the_complete_supported_tuple_bound);
+	UT_RUN(heap_retry_uses_the_same_bounded_reservation_after_its_deadline);
 	UT_RUN(cleanout_preserves_exact_unpublished_resource_after_prepare_deadline);
 	UT_RUN(final_itl_predecessor_is_captured_from_current_page);
 	UT_RUN(final_plan_drift_is_rejected_even_when_intent_is_compatible);

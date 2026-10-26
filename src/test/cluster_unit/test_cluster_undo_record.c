@@ -42,6 +42,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/htup_details.h"
 #include "access/twophase.h"
 #include "access/xlog.h"
 #include "cluster/cluster_conf.h"
@@ -4061,6 +4062,214 @@ UT_TEST(test_operation_planned_uba_does_not_wrap_maximum_body_size)
 	cluster_undo_record_cancel_prepared(&receipt);
 }
 
+/* Structural encoding fixtures do not authorize a native child write. */
+static void
+receipt_encoding_fixture(UndoRecordType type, bool child, OperationCodecFixture *f,
+						 ClusterUndoRecordPrepareReceipt *receipt)
+{
+	operation_codec_init(f, type);
+	receipt_fixture_ready(type, receipt);
+	receipt->payload_capacity = f->body_length;
+	receipt->operation.top.xid = 100;
+	receipt->operation.top.slot_wrap = 0;
+	receipt->operation.top_fxid = FullTransactionIdFromEpochAndXid(5, 100);
+	receipt->operation.operation_fxid = FullTransactionIdFromEpochAndXid(5, child ? 101 : 100);
+	receipt->operation.subid = child ? 2 : TopSubTransactionId;
+	receipt->itl_history_mask = f->history.count == 2 ? 3 : 1;
+	memcpy(receipt->itl_history, f->history.entries, sizeof(receipt->itl_history));
+	f->record.flags = UNDO_REC_FLAG_FIRST_IN_TX;
+	f->record.xid = XidFromFullTransactionId(receipt->operation.operation_fxid);
+	f->operation.canonical_top_fxid = U64FromFullTransactionId(receipt->operation.top_fxid);
+	f->operation.operation_fxid = U64FromFullTransactionId(receipt->operation.operation_fxid);
+	f->operation.operation_sequence = receipt->operation.operation_sequence;
+	f->operation.command_id = receipt->operation.command_id;
+	if (type == UNDO_RECORD_ITL) {
+		UndoItlPayload itl;
+
+		memcpy(&itl, f->storage + 1, sizeof(itl));
+		itl.lock_xid = f->record.xid;
+		memcpy(f->storage + 1, &itl, sizeof(itl));
+	}
+}
+
+UT_TEST(test_payload_encoder_preserves_v1_and_emits_exact_child_tail)
+{
+	for (unsigned type = UNDO_RECORD_INSERT; type <= UNDO_RECORD_ITL; type++) {
+		for (unsigned child = 0; child < 2; child++) {
+			OperationCodecFixture f;
+			ClusterUndoRecordPrepareReceipt receipt, saved;
+			char output[512];
+			char *encoded = output + 1;
+			UndoItlHistoryTrailer history;
+			UndoOperationTrailer operation;
+			uint16 body = 0;
+			size_t bytes;
+			bool ok;
+
+			receipt_encoding_fixture(type, child != 0, &f, &receipt);
+			saved = receipt;
+			bytes = f.body_length + sizeof(history) + (child ? sizeof(operation) : 0);
+			memset(output, 0xa5, sizeof(output));
+			ok = undo_prepared_record_encode_payload(&receipt, &f.record, f.storage + 1,
+													 f.body_length, encoded, bytes);
+			UT_ASSERT(ok);
+			if (!ok)
+				continue;
+			UT_ASSERT_EQ(f.record.payload_length, bytes);
+			UT_ASSERT_EQ(f.record.flags, UNDO_REC_FLAG_FIRST_IN_TX | UNDO_REC_FLAG_HAS_ITL_HISTORY
+											 | (child ? UNDO_REC_FLAG_HAS_OPERATION : 0));
+			UT_ASSERT_EQ(memcmp(encoded, f.storage + 1, f.body_length), 0);
+			UT_ASSERT_EQ(memcmp(encoded + f.body_length, &f.history, sizeof(history)), 0);
+			UT_ASSERT_EQ((unsigned char)output[0], 0xa5);
+			UT_ASSERT_EQ((unsigned char)encoded[bytes], 0xa5);
+			if (child) {
+				UT_ASSERT_EQ(memcmp(encoded + f.body_length + sizeof(history), &f.operation,
+									sizeof(operation)),
+							 0);
+				UT_ASSERT(cluster_undo_record_decode_operation_payload(
+					&f.record, encoded, bytes, &body, &history, &operation));
+				UT_ASSERT(!cluster_undo_record_decode_payload(&f.record, encoded, bytes, &body,
+															  &history));
+			} else {
+				UT_ASSERT(
+					cluster_undo_record_decode_payload(&f.record, encoded, bytes, &body, &history));
+				UT_ASSERT_EQ(body, f.body_length);
+			}
+			UT_ASSERT_EQ(memcmp(&receipt, &saved, sizeof(saved)), 0);
+			UT_ASSERT_EQ(receipt_prepare_calls + receipt_apply_calls + receipt_install_calls, 0);
+		}
+	}
+}
+
+UT_TEST(test_payload_encoder_refuses_short_candidate_before_any_copy)
+{
+	OperationCodecFixture f;
+	ClusterUndoRecordPrepareReceipt receipt;
+	UndoRecordHeader original;
+	char output[512], before[512];
+	size_t bytes;
+
+	receipt_encoding_fixture(UNDO_RECORD_UPDATE, true, &f, &receipt);
+	original = f.record;
+	bytes = f.body_length + sizeof(f.history) + sizeof(f.operation);
+	memset(output, 0xa5, sizeof(output));
+	memcpy(before, output, sizeof(before));
+	UT_ASSERT(!undo_prepared_record_encode_payload(&receipt, &f.record, f.storage + 1,
+												   f.body_length, output + 1, bytes - 1));
+	UT_ASSERT_EQ(memcmp(output, before, sizeof(output)), 0);
+	UT_ASSERT_EQ(memcmp(&f.record, &original, sizeof(original)), 0);
+	UT_ASSERT(undo_prepared_record_encode_payload(&receipt, &f.record, f.storage + 1, f.body_length,
+												  output + 1, bytes));
+	UT_ASSERT_EQ(receipt_install_calls + receipt_wal_calls + receipt_apply_calls, 0);
+}
+
+UT_TEST(test_payload_encoder_rejects_malformed_operation_or_body)
+{
+	for (unsigned variant = 0; variant < 15; variant++) {
+		OperationCodecFixture f;
+		ClusterUndoRecordPrepareReceipt receipt;
+		char output[512];
+
+		receipt_encoding_fixture(UNDO_RECORD_INSERT, true, &f, &receipt);
+		switch (variant) {
+		case 0:
+			receipt.operation.operation_sequence = 0;
+			break;
+		case 1:
+			receipt.operation.command_id = InvalidCommandId;
+			break;
+		case 2:
+			receipt.operation.subid = TopSubTransactionId;
+			break;
+		case 3:
+			receipt.operation.top.segment_generation = PG_UINT32_MAX;
+			break;
+		case 4:
+			receipt.operation.operation_fxid = receipt.operation.top_fxid;
+			break;
+		case 5:
+			receipt.operation.top.xid++;
+			break;
+		case 6:
+			receipt.operation.top.segment_id++;
+			break;
+		case 7:
+			receipt.operation.top.slot_offset++;
+			break;
+		case 8:
+			receipt.operation.top.origin_instance++;
+			break;
+		case 9:
+			receipt.operation.top.slot_wrap++;
+			break;
+		case 10:
+			f.record.xid++;
+			break;
+		case 11:
+			f.record.record_type = UNDO_RECORD_DELETE;
+			break;
+		case 12:
+			receipt.payload_capacity--;
+			break;
+		case 13:
+			receipt.itl_history_mask = 0;
+			break;
+		case 14:
+			receipt.itl_history[0].block++;
+			break;
+		}
+		UT_ASSERT(!undo_prepared_record_encode_payload(&receipt, &f.record, f.storage + 1,
+													   f.body_length, output, sizeof(output)));
+		UT_ASSERT_EQ(receipt_install_calls + receipt_wal_calls + receipt_apply_calls, 0);
+	}
+}
+
+UT_TEST(test_payload_encoder_carries_the_maximum_legal_old_tuple)
+{
+	const UndoRecordType types[] = { UNDO_RECORD_UPDATE, UNDO_RECORD_DELETE };
+
+	for (unsigned i = 0; i < lengthof(types); i++) {
+		for (unsigned child = 0; child < 2; child++) {
+			OperationCodecFixture f;
+			ClusterUndoRecordPrepareReceipt receipt;
+			char payload[BLCKSZ], output[BLCKSZ];
+			uint16 body;
+			size_t bytes;
+			bool ok;
+
+			receipt_encoding_fixture(types[i], child != 0, &f, &receipt);
+			memset(payload, 0x5a, sizeof(payload));
+			if (types[i] == UNDO_RECORD_UPDATE) {
+				UndoUpdatePayload update
+					= { 38, 2, MaxHeapTupleSize, sizeof(UndoUpdatePayload), 0 };
+
+				body = sizeof(update) + MaxHeapTupleSize;
+				memcpy(payload, &update, sizeof(update));
+			} else {
+				UndoDeletePayload deleted = { MaxHeapTupleSize, sizeof(UndoDeletePayload), 0 };
+
+				body = sizeof(deleted) + MaxHeapTupleSize;
+				memcpy(payload, &deleted, sizeof(deleted));
+			}
+			receipt.payload_capacity = body;
+			bytes = body + sizeof(f.history) + (child ? sizeof(f.operation) : 0);
+			UT_ASSERT(sizeof(UndoRecordHeader) + bytes <= UNDO_RECORD_HARD_CAP_BYTES);
+			UT_ASSERT(cluster_undo_block_has_space(sizeof(UndoBlockHeader), 0,
+												   sizeof(UndoRecordHeader) + bytes));
+			memset(output, 0xa5, sizeof(output));
+			ok = undo_prepared_record_encode_payload(&receipt, &f.record, payload, body, output + 1,
+													 bytes);
+			UT_ASSERT(ok);
+			if (!ok)
+				continue;
+			UT_ASSERT_EQ(memcmp(output + 1, payload, body), 0);
+			UT_ASSERT_EQ((unsigned char)output[0], 0xa5);
+			UT_ASSERT_EQ((unsigned char)output[bytes + 1], 0xa5);
+			UT_ASSERT_EQ(f.record.payload_length, bytes);
+		}
+	}
+}
+
 UT_TEST(test_history_codec_unaligned_complete_prior_and_logical_body)
 {
 	UndoRecordHeader record;
@@ -5737,7 +5946,11 @@ UT_TEST(test_exact_zero_abort_keeps_cleanup_after_native_scope_ends)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(145);
+	UT_PLAN(149);
+	UT_RUN(test_payload_encoder_preserves_v1_and_emits_exact_child_tail);
+	UT_RUN(test_payload_encoder_refuses_short_candidate_before_any_copy);
+	UT_RUN(test_payload_encoder_rejects_malformed_operation_or_body);
+	UT_RUN(test_payload_encoder_carries_the_maximum_legal_old_tuple);
 	UT_RUN(test_operation_planned_uba_reserves_the_complete_child_tail);
 	UT_RUN(test_operation_planned_uba_does_not_wrap_maximum_body_size);
 	UT_RUN(test_receipt_sync_cannot_replace_the_prepared_payload_shape);

@@ -893,6 +893,19 @@ UT_TEST(test_immutable_symlink_and_wrong_owner_are_rejected)
 	UT_ASSERT(unlink(temp) == 0);
 }
 
+UT_TEST(test_operation_format_requires_a_fresh_shared_catalog_identity)
+{
+	ControlFileData input;
+	uint8 bytes[PG_CONTROL_FILE_SIZE];
+
+	image_input(&input);
+	UT_ASSERT(CATALOG_VERSION_NO > 202610220);
+	input.catalog_version_no = 202610220;
+	memset(bytes, 0xa5, sizeof(bytes));
+	UT_ASSERT_EQ(cluster_cf_control_image_encode(&input, bytes), CLUSTER_CONTROL_ROOT_BAD_VERSION);
+	UT_ASSERT(image_zero(bytes, sizeof(bytes)));
+}
+
 UT_TEST(test_immutable_invalid_input_and_wrong_read_identity)
 {
 	ControlFileData in, out;
@@ -1392,7 +1405,7 @@ main(void)
 {
 	setup_shared_root();
 
-	UT_PLAN(34);
+	UT_PLAN(35);
 	UT_RUN(test_paths);
 	UT_RUN(test_classify_buffer);
 	UT_RUN(test_decide_source);
@@ -1409,6 +1422,7 @@ main(void)
 	UT_RUN(test_immutable_linked_but_unsynced_is_not_success);
 	UT_RUN(test_immutable_uuid_collision_and_stale_discard_do_not_delete);
 	UT_RUN(test_immutable_symlink_and_wrong_owner_are_rejected);
+	UT_RUN(test_operation_format_requires_a_fresh_shared_catalog_identity);
 	UT_RUN(test_immutable_invalid_input_and_wrong_read_identity);
 	UT_RUN(test_immutable_prepare_sync_failure_does_not_publish);
 	UT_RUN(test_immutable_unlinked_but_unsynced_retries_install);
