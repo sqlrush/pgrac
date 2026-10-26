@@ -1750,6 +1750,8 @@ StaticAssertDecl(offsetof(GcsBlockForwardPayload, expected_pi_watermark_scn_byte
 #define GCS_BLOCK_DONE_PENDING_S_NACK ((uint8)0xa2)
 #define GCS_BLOCK_DONE_PENDING_S_HOLDER ((uint8)0xa3)
 #define GCS_BLOCK_DONE_PENDING_S_RETIRED ((uint8)0xa4)
+#define GCS_BLOCK_DONE_PENDING_S_RETURN ((uint8)0xa5)
+#define GCS_BLOCK_DONE_PENDING_S_RETURNED ((uint8)0xa6)
 #define GCS_BLOCK_INVALIDATE_KIND_PENDING_S ((uint8)2)
 
 static inline bool
@@ -1826,15 +1828,20 @@ static inline bool
 GcsBlockDonePayloadPendingSKey(const GcsBlockDonePayload *p, ClusterPcmReadGrantKey *key)
 {
 	bool holder_action;
+	bool return_action;
 	if (p == NULL || key == NULL || p->transition_id != PCM_TRANS_N_TO_S
 		|| (p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_CONFIRM
 			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_NACK
 			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_HOLDER
-			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_RETIRED)
+			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_RETIRED
+			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_RETURN
+			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_RETURNED)
 		|| p->reserved_0[1] >= 32 || p->request_id == 0 || p->epoch == 0
 		|| p->requester_backend_id <= 0 || p->sender_node < 0 || p->sender_node >= 32)
 		return false;
-	holder_action = p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_HOLDER
+	return_action = p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETURN
+		|| p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETURNED;
+	holder_action = return_action || p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_HOLDER
 		|| (p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_NACK
 			&& p->sender_node != p->reserved_0[1]);
 	if (holder_action) {
@@ -1842,11 +1849,18 @@ GcsBlockDonePayloadPendingSKey(const GcsBlockDonePayload *p, ClusterPcmReadGrant
 		uint32 generation;
 		memcpy(&binding, &p->reserved_0[2], sizeof(binding));
 		memcpy(&generation, &p->reserved_0[10], sizeof(generation));
-		if (p->sender_node == p->reserved_0[1] || binding == 0 || binding == UINT64_MAX
+		if ((!return_action && p->sender_node == p->reserved_0[1])
+			|| binding == 0 || binding == UINT64_MAX
 			|| generation == 0 || generation == UINT32_MAX || p->reserved_0[14] > 1)
 			return false;
+		if (return_action && (p->reserved_0[15] == 0 || p->reserved_0[15] > 32
+			|| p->reserved_0[15] - 1 == p->reserved_0[1]
+			|| (p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETURN
+				&& p->reserved_0[15] - 1 != p->sender_node)))
+			return false;
 	}
-	for (int i = holder_action ? 15 : 2; i < (int)sizeof(p->reserved_0); i++)
+	for (int i = return_action ? 16 : (holder_action ? 15 : 2);
+		i < (int)sizeof(p->reserved_0); i++)
 		if (p->reserved_0[i] != 0)
 			return false;
 	memset(key, 0, sizeof(*key));
@@ -1855,7 +1869,7 @@ GcsBlockDonePayloadPendingSKey(const GcsBlockDonePayload *p, ClusterPcmReadGrant
 	key->epoch = p->epoch;
 	key->requester_node = p->reserved_0[1];
 	key->backend_id = p->requester_backend_id;
-	return p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_NACK
+	return return_action || p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_NACK
 		|| p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_HOLDER
 		|| p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETIRED
 		|| p->sender_node == key->requester_node;
@@ -1867,6 +1881,9 @@ GcsBlockDonePayloadSetPendingSService(GcsBlockDonePayload *p, const ClusterPcmRe
 	memcpy(&p->reserved_0[2], &service->binding_generation, sizeof(uint64));
 	memcpy(&p->reserved_0[10], &service->service_generation, sizeof(uint32));
 	p->reserved_0[14] = service->holder_was_x ? 1 : 0;
+	if (p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETURN
+		|| p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETURNED)
+		p->reserved_0[15] = (uint8)(service->holder_node + 1);
 }
 
 static inline bool
@@ -1874,15 +1891,20 @@ GcsBlockDonePayloadPendingSService(const GcsBlockDonePayload *p, ClusterPcmReadG
 {
 	ClusterPcmReadGrantKey key;
 	if (service == NULL || !GcsBlockDonePayloadPendingSKey(p, &key)
-		|| p->sender_node == key.requester_node
+		|| (p->sender_node == key.requester_node
+			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_RETURNED)
 		|| (p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_HOLDER
-			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_NACK))
+			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_NACK
+			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_RETURN
+			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_RETURNED))
 		return false;
 	memset(service, 0, sizeof(*service));
 	service->key = key;
 	memcpy(&service->binding_generation, &p->reserved_0[2], sizeof(uint64));
 	memcpy(&service->service_generation, &p->reserved_0[10], sizeof(uint32));
-	service->holder_node = p->sender_node;
+	service->holder_node = p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETURN
+		|| p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETURNED
+		? (int32)p->reserved_0[15] - 1 : p->sender_node;
 	service->holder_was_x = p->reserved_0[14] != 0;
 	return true;
 }

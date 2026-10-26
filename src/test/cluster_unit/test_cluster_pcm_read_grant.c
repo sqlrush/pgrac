@@ -212,7 +212,7 @@ static unsigned read_forwards, read_replies, read_local_forwards;
 static bool read_admit;
 static ClusterICSendResult read_notice_result, read_disk_result;
 static uint64 read_epoch;
-static ClusterMembershipState read_requester_state;
+static ClusterMembershipState read_requester_state, read_holder_state;
 static char read_reply_frame[sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE];
 static GcsBlockDonePayload read_notice;
 static unsigned read_notices, read_revokes, read_cleanup_lookups;
@@ -264,7 +264,8 @@ gcs_block_send_envelope_or_loopback(uint8 type, int32 dest, const void *payload,
 {
 	if (type == PGRAC_IC_MSG_GCS_BLOCK_DONE) {
 		UT_ASSERT_EQ(bytes, sizeof(read_notice));
-		UT_ASSERT_EQ(dest, read_request.sender_node);
+		UT_ASSERT_EQ(dest, ((const GcsBlockDonePayload *)payload)->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETURNED
+			? (int)((const GcsBlockDonePayload *)payload)->reserved_0[15] - 1 : read_request.sender_node);
 		read_notice = *(const GcsBlockDonePayload *)payload;
 		read_notices++;
 		return read_notice_result;
@@ -330,7 +331,7 @@ read_cleanup_flags(int worker pg_attribute_unused(), const GcsBlockDedupKey *key
 #define cluster_serving_ready_check(pending, failed) ((void)(pending), (void)(failed), read_serving)
 #define cluster_qvotec_in_quorum() read_quorum
 #define cluster_membership_is_member(node) read_member
-#define cluster_membership_get_state(node) read_requester_state
+#define cluster_membership_get_state(node) ((node) == read_request.sender_node ? read_requester_state : read_holder_state)
 #define cluster_grd_join_remaster_active_for_shard(tag) true
 #define cluster_grd_block_view_rebuilt(tag) read_join_rebuilt
 #define cluster_gcs_block_phase_for_tag(tag) (read_recovering ? GCS_BLOCK_RECOVERING : GCS_BLOCK_NORMAL)
@@ -350,10 +351,11 @@ read_cleanup_flags(int worker pg_attribute_unused(), const GcsBlockDedupKey *key
 #define cluster_lms_workers 2
 static void gcs_first_fill_receipt_tick(int worker pg_attribute_unused()) { }
 static bool read_done_session = true;
+static uint64 read_done_incarnation = 9;
 static bool
 read_done_auth(int node pg_attribute_unused(), uint64 epoch, uint64 *session)
 {
-	*session = 9;
+	*session = read_done_incarnation;
 	return read_done_session && epoch == read_epoch;
 }
 #define gcs_block_try_resource_x_frame(env, payload) false
@@ -361,9 +363,13 @@ read_done_auth(int node pg_attribute_unused(), uint64 epoch, uint64 *session)
 #define cluster_gcs_block_dedup_note_misroute() abort()
 #define cluster_gcs_block_dedup_note_done_mismatch(worker) ((void)0)
 #define gcs_first_fill_receipt_consumed(done) false
+#define gcs_first_fill_holder_returned(done, session) false
+#define cluster_ic_dispatch_defer(env) ((void)(env))
 #define gcs_block_pcm_x_authenticated_session read_done_auth
 #include "test_cluster_pcm_first_fill_master.inc"
 #undef gcs_block_pcm_x_authenticated_session
+#undef cluster_ic_dispatch_defer
+#undef gcs_first_fill_holder_returned
 #undef gcs_first_fill_receipt_consumed
 #undef cluster_gcs_block_dedup_note_done_mismatch
 #undef cluster_gcs_block_dedup_note_misroute
@@ -408,7 +414,8 @@ read_wire_setup(BufferTag tag)
 	read_notice_result = CLUSTER_IC_SEND_NOT_ADMITTED;
 	read_disk_result = CLUSTER_IC_SEND_DONE;
 	read_epoch = 1;
-	read_requester_state = CLUSTER_MEMBER_MEMBER;
+	read_done_incarnation = 9;
+	read_requester_state = read_holder_state = CLUSTER_MEMBER_MEMBER;
 	memset(read_reply_frame, 0, sizeof(read_reply_frame));
 	read_retirements = 0;
 	read_ungranted = 0;
@@ -733,7 +740,7 @@ UT_TEST(test_master_not_admitted_notice_keeps_native_claim_until_real_send_takeo
 {
 	for (int which = 0; which < 2; which++) {
 		BufferTag tag = make_tag(129);
-		ClusterPcmReadGrant grant, next;
+		ClusterPcmReadGrant grant = {0}, next = {0};
 		uint32 cursor = 0;
 		reset_fake_pcm_runtime(4);
 		(void)read_wire_setup(tag);
@@ -1323,6 +1330,27 @@ UT_TEST(test_service_done_wire_is_canonical_and_requester_actions_stay_episode_s
 	UT_ASSERT(GcsBlockDonePayloadPendingSKey(&done, &key));
 	done.reserved_0[0] = GCS_BLOCK_DONE_PENDING_S_RETIRED; done.sender_node = 2;
 	UT_ASSERT(GcsBlockDonePayloadPendingSKey(&done, &key));
+	for (int returned = 0; returned < 2; returned++) {
+		done.sender_node = returned ? 1 : service.holder_node;
+		done.reserved_0[0] = returned ? GCS_BLOCK_DONE_PENDING_S_RETURNED
+			: GCS_BLOCK_DONE_PENDING_S_RETURN;
+		GcsBlockDonePayloadSetPendingSService(&done, &service);
+		UT_ASSERT(GcsBlockDonePayloadPendingSService(&done, &decoded));
+		UT_ASSERT_EQ(decoded.holder_node, service.holder_node);
+		UT_ASSERT_EQ(decoded.source_transition_generation, 0); /* Master-local only. */
+		for (int bad = 0; bad < 7; bad++) {
+			GcsBlockDonePayload wrong = done;
+			if (bad < 3) wrong.reserved_0[15] = bad == 0 ? 0 : bad == 1 ? 33 : 2;
+			else if (bad < 6) wrong.reserved_0[13 + bad] = 1;
+			else wrong.reserved_0[14] = 2;
+			UT_ASSERT(!GcsBlockDonePayloadPendingSService(&wrong, &decoded));
+		}
+		if (!returned) {
+			GcsBlockDonePayload wrong = done;
+			wrong.sender_node = 2; /* RETURN may only be sent by the encoded holder. */
+			UT_ASSERT(!GcsBlockDonePayloadPendingSService(&wrong, &decoded));
+		}
+	}
 }
 
 UT_TEST(test_actual_done_ingress_checks_holder_service_and_preserves_requester_cancel)
@@ -1399,10 +1427,269 @@ UT_TEST(test_actual_done_ingress_checks_holder_service_and_preserves_requester_c
 	read_done_session = true;
 }
 
+UT_TEST(returned_service_reselects_only_after_native_source_change)
+{
+	BufferTag tag = make_tag(170);
+	ClusterPcmReadGrant grant = {0}, current = {0}, next = {0};
+	reset_fake_pcm_runtime(4);
+	UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_N_TO_X, 0));
+	grant = begin_read(tag, 1, 7, 71);
+	UT_ASSERT_EQ(cluster_pcm_lock_read_grant_reselect_returned(&grant, 0, &next),
+		PCM_GCS_TRANSITION_PENDING_X);
+	UT_ASSERT_EQ(cluster_pcm_lock_read_grant_begin(tag, 1, 7, 71, 1, 10000, false, &current),
+		PCM_GCS_TRANSITION_APPLIED);
+	UT_ASSERT_EQ(current.service_generation, 1);
+	UT_ASSERT(cluster_pcm_lock_read_grant_holder_done(&grant, 0));
+	UT_ASSERT_EQ(cluster_pcm_lock_read_grant_reselect_returned(&grant, 0, &next),
+		PCM_GCS_TRANSITION_APPLIED);
+	UT_ASSERT_EQ(next.key.request_id, 71);
+	UT_ASSERT_EQ(next.binding_generation, grant.binding_generation);
+	UT_ASSERT_EQ(next.service_generation, 2);
+	UT_ASSERT_EQ(next.holder_node, 0);
+	UT_ASSERT(!next.holder_was_x);
+	UT_ASSERT(!cluster_pcm_lock_read_grant_holder_failed(&grant, 0));
+	UT_ASSERT(!cluster_pcm_lock_read_grant_holder_done(&grant, 0));
+	UT_ASSERT_EQ(cluster_pcm_lock_read_grant_reselect_returned(&grant, 0, &current),
+		PCM_GCS_TRANSITION_INCOMPATIBLE);
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_S_TO_X_UPGRADE, 0),
+		PCM_GCS_TRANSITION_PENDING_X);
+	UT_ASSERT(cluster_pcm_lock_read_grant_done(&next.key, 1, true));
+}
+
+UT_TEST(returned_service_cannot_cross_identity_cancel_or_pi)
+{
+	BufferTag tag = make_tag(171);
+	ClusterPcmReadGrant grant = {0}, bad = {0}, next = {0};
+	reset_fake_pcm_runtime(4);
+	UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_N_TO_S, 0));
+	grant = begin_read(tag, 1, 7, 71);
+	UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_S_TO_N_RELEASE, 0));
+	for (int i = 0; i < 9; i++) {
+		bad = grant;
+		switch (i) {
+		case 0: bad.binding_generation++; break;
+		case 1: bad.service_generation++; break;
+		case 2: bad.holder_node++; break;
+		case 3: bad.holder_was_x = !bad.holder_was_x; break;
+		case 4: bad.key.request_id++; break;
+		case 5: bad.key.backend_id++; break;
+		case 6: bad.key.epoch++; break;
+		case 7: bad.key.tag.blockNum++; break;
+		case 8: bad.key.requester_node++; break;
+		}
+		UT_ASSERT_EQ(cluster_pcm_lock_read_grant_reselect_returned(&bad, 0, &next),
+			PCM_GCS_TRANSITION_INCOMPATIBLE);
+	}
+	UT_ASSERT_EQ(cluster_pcm_lock_read_grant_reselect_returned(&grant, 0, &next),
+		PCM_GCS_TRANSITION_APPLIED);
+	UT_ASSERT_EQ(next.holder_node, -1);
+	UT_ASSERT_EQ(next.service_generation, 2);
+	UT_ASSERT(cluster_pcm_lock_read_grant_done(&next.key, 1, false));
+	UT_ASSERT_EQ(cluster_pcm_lock_read_grant_reselect_returned(&next, 0, &bad),
+		PCM_GCS_TRANSITION_INCOMPATIBLE);
+	reset_fake_pcm_runtime(4);
+	UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_N_TO_X, 0));
+	grant = begin_read(tag, 1, 7, 71);
+	UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_X_TO_N_DOWNGRADE, 0));
+	UT_ASSERT_EQ(cluster_pcm_lock_read_grant_reselect_returned(&grant, 0, &next),
+		PCM_GCS_TRANSITION_PENDING_X);
+	UT_ASSERT(cluster_pcm_lock_read_grant_done(&grant.key, 1, false));
+	UT_ASSERT_EQ(cluster_pcm_lock_read_grant_reselect_returned(&grant, 0, &next),
+		PCM_GCS_TRANSITION_INCOMPATIBLE);
+}
+
+static void
+read_return_wire(const ClusterPcmReadGrant *service)
+{
+	GcsBlockDonePayload done = {0};
+	ClusterICEnvelope env = {0};
+	done.request_id = service->key.request_id; done.epoch = service->key.epoch;
+	done.tag = service->key.tag; done.sender_node = service->holder_node;
+	done.requester_backend_id = service->key.backend_id;
+	done.transition_id = PCM_TRANS_N_TO_S;
+	done.reserved_0[0] = GCS_BLOCK_DONE_PENDING_S_RETURN;
+	done.reserved_0[1] = service->key.requester_node;
+	GcsBlockDonePayloadSetPendingSService(&done, service);
+	env.source_node_id = done.sender_node; env.dest_node_id = cluster_node_id;
+	env.payload_length = sizeof(done);
+	cluster_gcs_handle_block_done_envelope(&env, &done);
+}
+
+UT_TEST(master_consumes_quiet_return_before_reselecting_original_request)
+{
+	BufferTag tag = make_tag(172);
+	GcsBlockDedupKey key;
+	ClusterPcmReadGrant grant, current;
+	reset_fake_pcm_runtime(4); key = read_wire_setup(tag);
+	read_done_session = true;
+	UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_N_TO_X, 0));
+	gcs_block_first_fill_request(&read_request, &key, 1, true);
+	grant = gcs_first_fill_master_parks[0].grant;
+	UT_ASSERT_EQ(read_forwards, 1);
+	read_return_wire(&grant);
+	UT_ASSERT(gcs_first_fill_master_parks[0].returned);
+	UT_ASSERT(gcs_first_fill_master_parks[0].return_ack_pending);
+	/* Native downgrade is not permission to replace the old holder receipt. */
+	UT_ASSERT(cluster_pcm_lock_read_grant_holder_done(&grant, 0));
+	for (int i = 0; i < 20; i++) {
+		read_master_time += 10000; gcs_first_fill_master_tick(1);
+	}
+	UT_ASSERT_EQ(read_forwards, 1);
+	UT_ASSERT_EQ(read_replies + read_revokes, 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_read_grant_begin(tag, 1, 13, 71, 1, 99999, false, &current),
+		PCM_GCS_TRANSITION_APPLIED);
+	UT_ASSERT_EQ(current.service_generation, 1);
+	read_notice_result = CLUSTER_IC_SEND_WOULD_BLOCK;
+	read_master_time += 10000; gcs_first_fill_master_tick(1);
+	UT_ASSERT_EQ(read_notices, 21);
+	UT_ASSERT_EQ(read_notice.reserved_0[0], GCS_BLOCK_DONE_PENDING_S_RETURNED);
+	UT_ASSERT_EQ(read_forwards, 2);
+	UT_ASSERT_EQ(read_forward.request_id, 71);
+	UT_ASSERT_EQ(gcs_first_fill_master_parks[0].grant.service_generation, 2);
+	UT_ASSERT(!gcs_first_fill_master_parks[0].return_ack_pending);
+	read_return_wire(&grant); /* exact older service cannot reset generation2 */
+	read_master_time += 10000; gcs_first_fill_master_tick(1);
+	UT_ASSERT_EQ(read_forwards, 2);
+	UT_ASSERT(!gcs_first_fill_master_parks[0].returned);
+	read_confirm_original_service();
+	UT_ASSERT(!gcs_first_fill_master_parks[0].in_use);
+}
+
+UT_TEST(master_return_waits_for_native_release_and_keeps_later_writer_queued)
+{
+	BufferTag tag = make_tag(173);
+	GcsBlockDedupKey key;
+	ClusterPcmReadGrant grant;
+	ResourceXDecodedFrame writer;
+	ResourceXMasterSnapshot queued;
+	reset_fake_pcm_runtime(4); key = read_wire_setup(tag);
+	read_done_session = true;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_N_TO_S, 0));
+	gcs_block_first_fill_request(&read_request, &key, 1, true);
+	grant = gcs_first_fill_master_parks[0].grant;
+	writer = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X, tag, 2, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&writer, 2, &queued), RESOURCE_X_APPLY_APPLIED);
+	read_return_wire(&grant);
+	read_notice_result = CLUSTER_IC_SEND_DONE;
+	for (int i = 0; i < 20; i++) {
+		read_master_time += 10000; gcs_first_fill_master_tick(1);
+	}
+	UT_ASSERT_EQ(read_forwards, 1);
+	UT_ASSERT_EQ(read_replies + read_revokes, 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
+		&writer.common.logical_assertion, &queued), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(queued.phase, RESOURCE_X_MASTER_QUEUED);
+	UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_S_TO_N_RELEASE, 0));
+	read_master_time += 10000; gcs_first_fill_master_tick(1);
+	UT_ASSERT_EQ(read_replies, 1);
+	UT_ASSERT_EQ(read_reply.status, GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK);
+	UT_ASSERT_EQ(read_reply.request_id, 71);
+	UT_ASSERT_EQ(gcs_first_fill_master_parks[0].grant.service_generation, 2);
+	UT_ASSERT_EQ(read_revokes, 0);
+	read_confirm_original_service();
+}
+
+UT_TEST(master_quiet_return_preserves_exact_cancel_and_late_consumption)
+{
+	BufferTag tag = make_tag(174);
+	GcsBlockDedupKey key;
+	ClusterPcmReadGrant grant, work;
+	reset_fake_pcm_runtime(4); key = read_wire_setup(tag);
+	read_done_session = true;
+	UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_N_TO_S, 0));
+	gcs_block_first_fill_request(&read_request, &key, 1, true);
+	grant = gcs_first_fill_master_parks[0].grant;
+	read_return_wire(&grant);
+	UT_ASSERT(gcs_first_fill_master_cancel(&grant.key, 1));
+	UT_ASSERT(gcs_first_fill_master_parks[0].return_ack_pending);
+	UT_ASSERT(cluster_pcm_lock_read_grant_blocker_snapshot(tag, 1, &work));
+	UT_ASSERT(work.revoking);
+	read_notice_result = CLUSTER_IC_SEND_DONE;
+	read_master_time += 10000; gcs_first_fill_master_tick(1);
+	UT_ASSERT(!gcs_first_fill_master_parks[0].in_use);
+	UT_ASSERT_EQ(read_forwards, 1);
+	UT_ASSERT(cluster_pcm_lock_read_grant_revoke_ack(&grant.key));
+	UT_ASSERT(cluster_pcm_lock_read_grant_retire_notice_admitted(&grant.key));
+	read_return_wire(&grant); /* Original native owner is already retired. */
+	UT_ASSERT(gcs_first_fill_master_parks[0].return_only);
+	read_master_time += 10000; gcs_first_fill_master_tick(1);
+	UT_ASSERT(!gcs_first_fill_master_parks[0].in_use);
+	UT_ASSERT_EQ(read_forwards, 1);
+}
+
+UT_TEST(returned_service_observes_a_native_release_and_reacquire_of_same_holder)
+{
+	BufferTag tag = make_tag(175);
+	ClusterPcmReadGrant grant = {0}, next = {0};
+	reset_fake_pcm_runtime(4);
+	UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_N_TO_S, 0));
+	grant = begin_read(tag, 1, 7, 71);
+	UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_S_TO_N_RELEASE, 0));
+	UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_N_TO_S, 0));
+	UT_ASSERT_EQ(cluster_pcm_lock_read_grant_reselect_returned(&grant, 0, &next),
+		PCM_GCS_TRANSITION_APPLIED);
+	UT_ASSERT_EQ(next.key.request_id, 71);
+	UT_ASSERT_EQ(next.holder_node, 0);
+	UT_ASSERT_EQ(next.service_generation, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_read_grant_reselect_returned(&next, 0, &grant),
+		PCM_GCS_TRANSITION_PENDING_X);
+}
+
+UT_TEST(return_from_a_different_holder_incarnation_cannot_reset_service)
+{
+	BufferTag tag = make_tag(176);
+	GcsBlockDedupKey key;
+	ClusterPcmReadGrant grant;
+	reset_fake_pcm_runtime(4); key = read_wire_setup(tag);
+	read_done_session = true;
+	UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_N_TO_S, 0));
+	gcs_block_first_fill_request(&read_request, &key, 1, true);
+	grant = gcs_first_fill_master_parks[0].grant;
+	read_done_incarnation++;
+	read_return_wire(&grant);
+	UT_ASSERT(!gcs_first_fill_master_parks[0].returned);
+	UT_ASSERT(!gcs_first_fill_master_parks[0].return_ack_pending);
+	read_done_incarnation--;
+	read_return_wire(&grant);
+	UT_ASSERT(gcs_first_fill_master_parks[0].return_ack_pending);
+}
+
+UT_TEST(master_handed_off_service_ends_only_on_proved_holder_death_or_new_incarnation)
+{
+	for (int why = 0; why < 3; why++) {
+		BufferTag tag = make_tag(177);
+		GcsBlockDedupKey key;
+		ClusterPcmReadGrant grant, current;
+		reset_fake_pcm_runtime(4); key = read_wire_setup(tag);
+		read_done_session = true;
+		UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_N_TO_S, 2));
+		gcs_block_first_fill_request(&read_request, &key, 1, true);
+		grant = gcs_first_fill_master_parks[0].grant;
+		if (why == 0) read_done_incarnation++;
+		if (why == 1) read_holder_state = CLUSTER_MEMBER_DEAD;
+		if (why == 2) read_done_session = false; /* unknown is not death */
+		read_master_time += 10000; gcs_first_fill_master_tick(1);
+		UT_ASSERT(cluster_pcm_lock_read_grant_blocker_snapshot(tag, 1, &current));
+		UT_ASSERT_EQ(current.revoking, why < 2);
+		UT_ASSERT_EQ(read_forwards, 1);
+		UT_ASSERT_EQ(current.key.request_id, grant.key.request_id);
+	}
+	read_done_session = true;
+}
+
 int
 main(void)
 {
-	UT_PLAN(40);
+	UT_PLAN(48);
+	UT_RUN(master_handed_off_service_ends_only_on_proved_holder_death_or_new_incarnation);
+	UT_RUN(return_from_a_different_holder_incarnation_cannot_reset_service);
+	UT_RUN(returned_service_observes_a_native_release_and_reacquire_of_same_holder);
+	UT_RUN(master_consumes_quiet_return_before_reselecting_original_request);
+	UT_RUN(master_return_waits_for_native_release_and_keeps_later_writer_queued);
+	UT_RUN(master_quiet_return_preserves_exact_cancel_and_late_consumption);
+	UT_RUN(returned_service_reselects_only_after_native_source_change);
+	UT_RUN(returned_service_cannot_cross_identity_cancel_or_pi);
 	UT_RUN(test_service_done_wire_is_canonical_and_requester_actions_stay_episode_scoped);
 	UT_RUN(test_actual_done_ingress_checks_holder_service_and_preserves_requester_cancel);
 	UT_RUN(test_holder_service_rejects_stale_binding_generation_and_source);

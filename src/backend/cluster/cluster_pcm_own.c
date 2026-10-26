@@ -61,6 +61,7 @@ cluster_pcm_own_shmem_init(void)
 			ClusterPcmOwnArray[i].service_waiters = 0;
 			pg_atomic_init_u64(&ClusterPcmOwnArray[i].delivery_attempt, 0);
 			pg_atomic_init_u64(&ClusterPcmOwnArray[i].write_io_generation, 0);
+			ClusterPcmOwnArray[i].service_event_generation = 0;
 		}
 	}
 }
@@ -118,6 +119,8 @@ cluster_pcm_own_write_io_complete(int buf_id, uint32 *workers)
 	pg_atomic_write_u64(&entry->write_io_generation, generation + 1);
 	*workers = entry->service_waiters;
 	entry->service_waiters = 0;
+	if (*workers != 0 && entry->service_event_generation != UINT64_MAX)
+		entry->service_event_generation++;
 	return CLUSTER_PCM_OWN_OK;
 }
 

@@ -19398,7 +19398,8 @@ cluster_bufmgr_first_fill_wait_begin(BufferTag tag, int worker, ClusterPcmFirstF
 	valid = BufferTagsEqual(&tag, &buf->tag)
 		&& (state & (BM_TAG_VALID | BM_VALID | BM_IO_ERROR)) == (BM_TAG_VALID | BM_VALID)
 		&& (buf->pcm_state == PCM_STATE_X || buf->pcm_state == PCM_STATE_S)
-		&& cluster_pcm_own_gen_get(id) != UINT64_MAX;
+		&& cluster_pcm_own_gen_get(id) != UINT64_MAX
+		&& ClusterPcmOwnArray[id].service_event_generation != UINT64_MAX;
 	if (valid) {
 		uint64 io = pg_atomic_read_u64(&ClusterPcmOwnArray[id].write_io_generation);
 		valid = (io & 1) == ((state & BM_IO_IN_PROGRESS) != 0) && io != UINT64_MAX;
@@ -19407,6 +19408,7 @@ cluster_bufmgr_first_fill_wait_begin(BufferTag tag, int worker, ClusterPcmFirstF
 			wait->buffer_id = id;
 			wait->own_generation = cluster_pcm_own_gen_get(id);
 			wait->write_io_generation = io;
+			wait->service_event_generation = ClusterPcmOwnArray[id].service_event_generation;
 			ClusterPcmOwnArray[id].service_waiters |= UINT32_C(1) << worker;
 		}
 	}
@@ -19433,10 +19435,14 @@ cluster_bufmgr_first_fill_wait_ready(const ClusterPcmFirstFillWait *wait)
 	io = pg_atomic_read_u64(&ClusterPcmOwnArray[wait->buffer_id].write_io_generation);
 	if (BufferTagsEqual(&buf->tag, &wait->tag)
 		&& cluster_pcm_own_gen_get(wait->buffer_id) == wait->own_generation
+		&& ClusterPcmOwnArray[wait->buffer_id].service_event_generation != UINT64_MAX
 		&& (state & (BM_TAG_VALID | BM_VALID | BM_IO_ERROR)) == (BM_TAG_VALID | BM_VALID)
 		&& io >= wait->write_io_generation && io != UINT64_MAX
 		&& (io & 1) == ((state & BM_IO_IN_PROGRESS) != 0))
-		result = (state & BM_IO_IN_PROGRESS) != 0 ? 0 : 1;
+		result = (state & BM_IO_IN_PROGRESS) != 0 ? 0
+			: (io != wait->write_io_generation
+				|| ClusterPcmOwnArray[wait->buffer_id].service_event_generation
+					!= wait->service_event_generation ? 1 : 0);
 	UnlockBufHdr(buf, state);
 	return result;
 }
@@ -19450,6 +19456,8 @@ cluster_bufmgr_first_fill_service_wakeup(BufferDesc *buf)
 	state = LockBufHdr(buf);
 	workers = ClusterPcmOwnArray[buf->buf_id].service_waiters;
 	ClusterPcmOwnArray[buf->buf_id].service_waiters = 0;
+	if (workers != 0 && ClusterPcmOwnArray[buf->buf_id].service_event_generation != UINT64_MAX)
+		ClusterPcmOwnArray[buf->buf_id].service_event_generation++;
 	UnlockBufHdr(buf, state);
 	for (int worker = 0; worker < CLUSTER_LMS_MAX_WORKERS; worker++)
 		if ((workers & (UINT32_C(1) << worker)) != 0)

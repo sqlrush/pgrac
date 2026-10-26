@@ -38,6 +38,7 @@ typedef struct ClusterPcmFirstFillWait {
 	BufferTag tag;
 	uint64 own_generation;
 	uint64 write_io_generation;
+	uint64 service_event_generation;
 	int32 buffer_id;
 } ClusterPcmFirstFillWait;
 
@@ -62,6 +63,8 @@ typedef struct ClusterPcmReadGrant {
 	uint64 binding_generation;
 	uint32 service_generation; /* Source service within this full-key episode. */
 	int32 holder_node; /* -1: disk grant, otherwise existing current/S source. */
+	/* Master-local event sample, not wire identity or reusable permission. */
+	uint64 source_transition_generation;
 	bool holder_was_x;
 	bool revoking;
 	bool ack_consumed; /* Exact revoke consumed; asynchronous notice still owned. */
