@@ -38,6 +38,7 @@
 #include "cluster/cluster_heap_freeze.h"
 #include "cluster/cluster_itl_touch.h"
 #include "cluster/cluster_itl.h"
+#include "utils/memutils.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_pcm_lock.h"
@@ -12371,6 +12372,14 @@ static unsigned page_owner_range_calls;
 static uint32 page_owner_touch_count;
 static bool page_owner_use_xact_owner;
 static unsigned page_owner_xact_finishes;
+static bool page_owner_use_registration;
+static unsigned page_owner_registered_records;
+static PGAlignedBlock page_owner_context_cookie;
+static MemoryContext page_owner_context_current;
+static const ClusterItlTouchRecord *page_owner_registration_source;
+static uint64 page_owner_capture_generation;
+static bool page_owner_capture_ok;
+static unsigned page_owner_capture_calls, page_owner_allocations, page_owner_publication_notes;
 static bool page_owner_cluster_enabled;
 static uint32 page_owner_touch_capacity, page_owner_subxact_depth, page_owner_subxact_capacity;
 static struct ClusterItlTouchSubxactBoundary *page_owner_subxact_stack;
@@ -12495,7 +12504,80 @@ page_owner_stamp_skip(void)
 	page_owner_skips++;
 }
 
+/* Allocation/context and PCM observations are controlled leaves; all live
+ * slot capture, exact dedupe, failed-proof invalidation and append logic below
+ * are the original source bodies. Unexpected growth is outside this case. */
+static MemoryContext
+page_owner_context_switch(MemoryContext context)
+{
+	MemoryContext old = page_owner_context_current;
+	UT_ASSERT(context == (MemoryContext)&page_owner_context_cookie
+		|| context == (MemoryContext)&page_owner_wal_cookie);
+	page_owner_context_current = context;
+	return old;
+}
+
+static void *
+page_owner_record_alloc(Size size)
+{
+	void *result;
+	UT_ASSERT(page_owner_context_current == (MemoryContext)&page_owner_context_cookie);
+	UT_ASSERT_EQ(size, 16 * sizeof(ClusterItlTouchRecord));
+	result = calloc(1, size); UT_ASSERT(result != NULL);
+	page_owner_allocations++;
+	return result;
+}
+
+static void *
+page_owner_record_realloc(void *address, Size size)
+{
+	(void)address; (void)size;
+	UT_ASSERT(false);
+	return NULL;
+}
+
+static bool
+page_owner_capture_authority(Buffer buffer, const BufferTag *tag,
+	uint64 *generation, uint64 *epoch, uint8 *state)
+{
+	UT_ASSERT(page_owner_use_registration && page_owner_registration_source != NULL);
+	UT_ASSERT_EQ(buffer, 1);
+	UT_ASSERT(RelFileLocatorEquals(BufTagGetRelFileLocator(tag), page_owner_registration_source->key.rloc));
+	UT_ASSERT_EQ(tag->forkNum, page_owner_registration_source->key.forknum);
+	UT_ASSERT_EQ(tag->blockNum, page_owner_registration_source->key.block);
+	*generation = page_owner_capture_generation; *epoch = 9; *state = PCM_STATE_X;
+	page_owner_capture_calls++;
+	return page_owner_capture_ok;
+}
+
+static void
+page_owner_publication_stat(ClusterCtrcStatId stat)
+{
+	UT_ASSERT_EQ(stat, CTRC_STAT_ORDINARY_PUBLICATION_AFTER_APPLY);
+	page_owner_publication_notes++;
+	original_census_stat_bump(stat);
+}
+
+#define cluster_ctrc_stat_bump page_owner_publication_stat
+#define ctrc_receipt_entries original_participant_receipt_entries
+#define cluster_ctrc_note_publication_after_apply original_page_owner_publication
+#include "test_cluster_heap_itl_publication.inc"
+#undef cluster_ctrc_note_publication_after_apply
+#undef ctrc_receipt_entries
+#undef cluster_ctrc_stat_bump
+
 #define touch_list page_owner_touch_list
+#define itl_touch_handle_matches original_page_owner_handle_matches
+#define itl_touch_append original_page_owner_append
+#define itl_touch_capture_proof original_page_owner_capture
+#define itl_touch_register_exact_internal original_page_owner_register_internal
+#define cluster_itl_touch_register_exact_ctrc original_page_owner_register
+#define cluster_ctrc_note_publication_after_apply original_page_owner_publication
+#define cluster_bufmgr_terminal_stamp_authority page_owner_capture_authority
+#define MemoryContextSwitchTo page_owner_context_switch
+#define TopTransactionContext ((MemoryContext)&page_owner_context_cookie)
+#define palloc page_owner_record_alloc
+#define repalloc page_owner_record_realloc
 #define touch_count page_owner_touch_count
 #define touch_capacity page_owner_touch_capacity
 #define subxact_stack page_owner_subxact_stack
@@ -12553,7 +12635,67 @@ page_owner_stamp_skip(void)
 #undef subxact_stack
 #undef touch_capacity
 #undef touch_count
+#undef repalloc
+#undef palloc
+#undef TopTransactionContext
+#undef MemoryContextSwitchTo
+#undef cluster_bufmgr_terminal_stamp_authority
+#undef cluster_ctrc_note_publication_after_apply
+#undef cluster_itl_touch_register_exact_ctrc
+#undef itl_touch_register_exact_internal
+#undef itl_touch_capture_proof
+#undef itl_touch_append
+#undef itl_touch_handle_matches
 #undef touch_list
+
+/* Register both slot incarnations through the original public producer.
+ * Before stamping, failed capture changes only the local touch record and
+ * never consumes or retires the already APPLIED shared receipt. */
+static ClusterItlTouchRecord *
+page_owner_register_records(ClusterItlTouchRecord *record)
+{
+	ClusterItlSlotData *slot = &ClusterPageGetItlSlots(BufferBlocks)[record->key.slot_idx];
+	ClusterItlSlotData saved_slot = *slot;
+	ClusterSpaceIdentity identity = record->space_identity, bad_identity;
+	ClusterCtrcParticipantEntry participant = *record->ctrc_handle.participant;
+	ClusterCtrcReceipt receipt = *record->ctrc_handle.receipt;
+
+	identity.state = CLUSTER_SPACE_IDENTITY_LIVE; identity.key.locator = record->key.rloc;
+	bad_identity = identity; bad_identity.state = 0;
+	UT_ASSERT(bad_identity.state != CLUSTER_SPACE_IDENTITY_LIVE);
+	page_owner_touch_list = NULL; page_owner_touch_count = page_owner_touch_capacity = 0;
+	page_owner_registration_source = record;
+	page_owner_context_current = (MemoryContext)&page_owner_wal_cookie;
+	page_owner_capture_ok = true; page_owner_capture_generation = record->proof.own_generation;
+	page_owner_capture_calls = page_owner_allocations = page_owner_publication_notes = 0;
+	original_page_owner_register(&record->key, 1, slot->xid, &record->ctrc_handle, &bad_identity);
+	UT_ASSERT(page_owner_touch_list == NULL); UT_ASSERT_EQ(page_owner_touch_count, 0);
+	UT_ASSERT_EQ(page_owner_allocations, 0);
+	original_page_owner_register(&record->key, 1, slot->xid, &record->ctrc_handle, &identity);
+	UT_ASSERT_EQ(page_owner_touch_count, 1); UT_ASSERT(page_owner_touch_list[0].proof.valid);
+	page_owner_capture_ok = false;
+	original_page_owner_register(&record->key, 1, slot->xid, &record->ctrc_handle, &identity);
+	UT_ASSERT_EQ(page_owner_touch_count, 1); UT_ASSERT(!page_owner_touch_list[0].proof.valid);
+	UT_ASSERT(!page_owner_touch_list[0].ctrc_handle.valid);
+	page_owner_capture_ok = true;
+	original_page_owner_register(&record->key, 1, slot->xid, &record->ctrc_handle, &identity);
+	UT_ASSERT_EQ(page_owner_touch_count, 1); UT_ASSERT(page_owner_touch_list[0].proof.valid);
+	UT_ASSERT(page_owner_touch_list[0].ctrc_handle.valid);
+	slot->xid--; page_owner_capture_generation--;
+	original_page_owner_register(&record->key, 1, slot->xid, &record->ctrc_handle, &identity);
+	*slot = saved_slot;
+	if (page_owner_stamp_case == 1)
+		slot->wrap++;
+	UT_ASSERT_EQ(page_owner_touch_count, 2); UT_ASSERT_EQ(page_owner_touch_capacity, 16);
+	UT_ASSERT_EQ(page_owner_capture_calls, 5); UT_ASSERT_EQ(page_owner_publication_notes, 5);
+	UT_ASSERT_EQ(page_owner_allocations, 1);
+	UT_ASSERT(page_owner_context_current == (MemoryContext)&page_owner_wal_cookie);
+	UT_ASSERT(memcmp(record->ctrc_handle.participant, &participant, sizeof(participant)) == 0);
+	UT_ASSERT(memcmp(record->ctrc_handle.receipt, &receipt, sizeof(receipt)) == 0);
+	page_owner_registration_source = NULL;
+	page_owner_registered_records += page_owner_touch_count;
+	return page_owner_touch_list;
+}
 
 /* Execute the original qsort/range grouping with an older proof first only
  * after sorting. The same-page stale record must not borrow the current
@@ -12562,22 +12704,29 @@ static void
 page_owner_finish_original_range(ClusterItlTouchRecord *record,
 	const ItlFinishCtx *finish)
 {
-	ClusterItlTouchRecord records[2];
+	ClusterItlTouchRecord local_records[2];
+	ClusterItlTouchRecord *records = local_records;
 	ClusterItlTouchRecord *saved_list = page_owner_touch_list;
 
 	UT_ASSERT(record->proof.xid > FirstNormalTransactionId);
 	UT_ASSERT(record->proof.own_generation > 0);
-	records[0] = records[1] = *record;
-	records[1].proof.xid--;
-	records[1].proof.own_generation--;
-	page_owner_touch_list = records;
-	page_owner_touch_count = lengthof(records);
+	if (page_owner_use_registration)
+		records = page_owner_register_records(record);
+	else
+	{
+		records[0] = records[1] = *record;
+		records[1].proof.xid--;
+		records[1].proof.own_generation--;
+		page_owner_touch_list = records;
+		page_owner_touch_count = lengthof(local_records);
+	}
 	if (page_owner_use_xact_owner)
 	{
 		ClusterItlTouchSubxactBoundary boundary = { 77, 1 };
 
 		page_owner_cluster_enabled = true;
-		page_owner_touch_capacity = 8;
+		if (!page_owner_use_registration)
+			page_owner_touch_capacity = 8;
 		page_owner_subxact_stack = &boundary;
 		page_owner_subxact_depth = 1; page_owner_subxact_capacity = 4;
 		if (finish->is_commit)
@@ -12595,6 +12744,8 @@ page_owner_finish_original_range(ClusterItlTouchRecord *record,
 		original_page_owner_finish_range(0, page_owner_touch_count, finish);
 	UT_ASSERT_EQ(records[0].proof.xid, record->proof.xid - 1);
 	UT_ASSERT_EQ(records[1].proof.xid, record->proof.xid);
+	if (page_owner_use_registration)
+		free(records);
 	page_owner_touch_count = 0;
 	page_owner_touch_list = saved_list;
 	page_owner_range_calls++;
@@ -13081,6 +13232,17 @@ full_source_then_recent_case(bool batch, bool late_receiver)
 	full_source_then_recent_lifecycle_case(batch, late_receiver, false, 0, 0);
 }
 
+UT_TEST(test_original_exact_touch_registration_feeds_finish_and_recent_freeze)
+{
+	page_owner_use_registration = page_owner_use_xact_owner = page_owner_use_range = page_owner_use_full_batch = native_exit_use_page_owner_discharge = true;
+	page_owner_registered_records = 0;
+	for (unsigned retirement = 1; retirement <= 2; retirement++)
+		for (unsigned batch = 0; batch < 2; batch++)
+			full_source_then_recent_lifecycle_case(batch != 0, false, true, 2, retirement);
+	UT_ASSERT_EQ(page_owner_registered_records, 32);
+	page_owner_use_registration = page_owner_use_xact_owner = page_owner_use_range = page_owner_use_full_batch = native_exit_use_page_owner_discharge = false;
+}
+
 UT_TEST(test_original_top_xact_finish_retires_local_touches_before_recent_freeze)
 {
 	page_owner_use_xact_owner = page_owner_use_range = page_owner_use_full_batch = native_exit_use_page_owner_discharge = true;
@@ -13429,7 +13591,7 @@ UT_TEST(test_recent_xmin_share_lock_refusal_keeps_borrowed_pin_without_upgrade)
 int
 main(void)
 {
-	UT_PLAN(307);
+	UT_PLAN(308);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -13438,6 +13600,7 @@ main(void)
 	UT_RUN(test_recent_refused_receiver_keeps_original_cut_and_native_continuation);
 	UT_RUN(test_full_original_source_reaches_pin_free_collector_and_recent_wal);
 	UT_RUN(test_full_original_source_late_receiver_revokes_recent_wal);
+	UT_RUN(test_original_exact_touch_registration_feeds_finish_and_recent_freeze);
 	UT_RUN(test_original_top_xact_finish_retires_local_touches_before_recent_freeze);
 	UT_RUN(test_original_page_owner_range_groups_reused_slot_before_recent_freeze);
 	UT_RUN(test_original_page_owner_stamp_wal_discharge_feeds_recent_freeze);

@@ -2210,19 +2210,27 @@ test_cluster_heap_ctrc_participant.inc: $(top_srcdir)/src/backend/cluster/cluste
 	mv $@.tmp $@
 
 # Original receipt apply/cancel bookkeeping and exact-handle/target checks.
-# Original complete page-owner top-xact/reset, sort/group, stamp/WAL and discharge closure.
+# Original complete page-owner exact registration/top-xact/reset, sort/group, stamp/WAL and discharge closure.
 test_cluster_heap_itl_finish_discharge.inc: $(top_srcdir)/src/backend/cluster/cluster_itl_touch.c Makefile
-	@awk 'BEGIN { pattern = "^(itl_finish_expected_target|itl_finish_discharge_batch|itl_finish_stamp_page|itl_finish_flush_batch|itl_touch_record_cmp|itl_finish_range|cluster_itl_touch_reset_at_end_xact|cluster_itl_xact_precommit_finish|cluster_itl_xact_abort_finish)\\(" } \
+	@awk 'BEGIN { pattern = "^(itl_finish_expected_target|itl_finish_discharge_batch|itl_finish_stamp_page|itl_finish_flush_batch|itl_touch_record_cmp|itl_finish_range|cluster_itl_touch_reset_at_end_xact|cluster_itl_xact_precommit_finish|cluster_itl_xact_abort_finish|itl_touch_handle_matches|itl_touch_append|itl_touch_capture_proof|itl_touch_register_exact_internal|cluster_itl_touch_register_exact_ctrc)\\(" } \
 	     /^#ifdef USE_PGRAC_CLUSTER$$/ { active=1; starts++; next } \
 	     /^#else \/\* !USE_PGRAC_CLUSTER \*\// { active=0; stops++; next } \
 	     !active { next } \
 	     /^typedef struct (ItlFinishCtx|ItlFinishPageRun|ItlFinishBatchCtx|ItlFinishDischarge|ClusterItlTouchSubxactBoundary) \{/ { structure=1; structures++ } \
 	     structure { print; if (/^} (ItlFinishCtx|ItlFinishPageRun|ItlFinishBatchCtx|ItlFinishDischarge|ClusterItlTouchSubxactBoundary);/) structure=0; next } \
+	     /^#define CLUSTER_ITL_TOUCH_INITIAL_CAPACITY / { print; initial_constants++; next } \
 	     /^#define CLUSTER_ITL_FINISH_MAX_DISCHARGES / { print; getline; print; constants++; next } \
 	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); if (seen[name]++) exit 1; order[++found]=name; ret=prev; sub(/^static[ \t]+/, "", ret); returns[name]="static " ret; emit=1; head=1 } \
 	     emit { body[name]=body[name] $$0 "\n"; if (/^\{/) head=0; else if (head) declaration[name]=declaration[name] $$0 "\n" } \
 	     emit && /^}/ { emit=0; done++ } { prev=$$0 } \
-	     END { if (found != 9 || done != 9 || emit || structure || structures != 5 || constants != 1 || starts != 1 || stops != 1) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
+	     END { if (found != 14 || done != 14 || emit || structure || structures != 5 || constants != 1 || initial_constants != 1 || starts != 1 || stops != 1) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_itl_publication.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk '/^static const ClusterShmemRegion cluster_ctrc_region =/ { boundary++; exit } \
+	     /^cluster_ctrc_note_publication_after_apply\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1 || emit || boundary != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_ctrc_terminal.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
@@ -2323,6 +2331,9 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_ctrc_step.inc test_cluster_heap_ctrc_origin.inc \
 		test_cluster_heap_ctrc_participant.inc test_cluster_heap_ctrc_terminal.inc \
 		test_cluster_heap_itl_finish_discharge.inc \
+		test_cluster_heap_itl_publication.inc \
+		$(top_srcdir)/src/include/utils/memutils.h \
+		$(top_srcdir)/src/include/utils/palloc.h \
 		$(top_srcdir)/src/include/cluster/cluster_itl_touch.h \
 		$(top_srcdir)/src/include/cluster/cluster_sf_dep.h \
 		$(top_srcdir)/src/include/access/generic_xlog.h \
@@ -5285,6 +5296,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_ctrc_participant.inc test_cluster_heap_ctrc_participant.inc.tmp
 	rm -f test_cluster_heap_ctrc_terminal.inc test_cluster_heap_ctrc_terminal.inc.tmp
 	rm -f test_cluster_heap_itl_finish_discharge.inc test_cluster_heap_itl_finish_discharge.inc.tmp
+	rm -f test_cluster_heap_itl_publication.inc test_cluster_heap_itl_publication.inc.tmp
 	rm -f test_cluster_heap_ctrc_certificate.inc test_cluster_heap_ctrc_certificate.inc.tmp
 	rm -f test_cluster_heap_ctrc_ack.inc test_cluster_heap_ctrc_ack.inc.tmp
 	rm -f test_cluster_heap_ctrc_origin_reply.inc test_cluster_heap_ctrc_origin_reply.inc.tmp
