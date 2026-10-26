@@ -338,7 +338,7 @@ extern bool cluster_recovery_relmap_history_pending_terminal_v1(
 	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
 	ClusterRecoveryRelmapPendingTerminalV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
 /* Original native counter fold, not an allocation/FullXid-era certificate.
- * Replay the selected generation's complete native-redo suffix through the
+ * Replay EVERY original generation's complete native-redo suffix through the
  * unchanged cold decoder/counter rules during one original physical reread.
  * Keep the checkpoint seed and exact unique map's before/after/tail candidates.
  * A nonmonotone or half-range-ambiguous candidate, or a pending FullXid outside
@@ -351,7 +351,7 @@ extern bool cluster_recovery_relmap_history_pending_terminal_v1(
 /* Every native CLOG ZERO/TRUNCATE of this physical origin in the SAME
  * complete selected set, including other generations and pages. Positions
  * refer to the original immutable history source, never replay-set order.
- * Only an event inside the actual selected native-redo counter suffix has
+ * Only an event inside its own original native-redo counter suffix has
  * observed before/after candidates; zero fields elsewhere mean UNKNOWN.
  * Raw page/horizon and counter agreement prove neither birth era nor that
  * truncation ran/completed. Retain all events as unresolved lifecycle input.
@@ -371,11 +371,28 @@ typedef struct ClusterRecoveryRelmapClogEventV1 {
 	uint64 counter_before, counter_after;
 } ClusterRecoveryRelmapClogEventV1;
 
+/* One original physical generation's complete native-redo counter fold.
+ * The full observation is the SAME immutable source/cut/tail/transcript;
+ * input_index is its distinct original selector index. No checkpoint (for
+ * example an explicit initializer terminal) leaves counter_observed false.
+ * A prefix before native_redo is never assigned this candidate. Neither an
+ * observed counter nor adjacency of array entries proves generation order,
+ * a raw record's era, no-reuse or physical CLOG lifetime. */
+typedef struct ClusterRecoveryRelmapXidGenerationV1 {
+	ClusterRecoveryWalSourceObservationV1 observation;
+	uint32 input_index;
+	XLogRecPtr native_redo;
+	uint64 checkpoint_next, tail_next, records;
+	bool counter_observed;
+} ClusterRecoveryRelmapXidGenerationV1;
+
 typedef struct ClusterRecoveryRelmapPendingXidV1 {
 	ClusterRecoveryRelmapHistoryEntryV1 history;
 	uint64 checkpoint_next, before_map, after_map, tail_next;
 	uint64 records, map_ordinal;
 	XLogRecPtr map_start, map_end;
+	uint32 generation_count; /* complete selected set, never a target subset */
+	ClusterRecoveryRelmapXidGenerationV1 generations[CLUSTER_WAL_INPUTS_MAX];
 	uint32 clog_count;
 	ClusterRecoveryRelmapClogEventV1 clog[CLUSTER_RECOVERY_RELMAP_CLOG_HISTORY_MAX];
 } ClusterRecoveryRelmapPendingXidV1;
