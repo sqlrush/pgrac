@@ -58,6 +58,19 @@ extern bool rf_page_authority_ctrc_replays_covers_nowait_v1(
  * Local only, with no I/O/allocation/acquisition or borrowed-owner release. */
 extern bool rf_page_authority_ctrc_replays_scope_nowait_v1(
 	const RfPageCtrcAuthorityV1 *authority, const struct ClusterWalInputsV1 *scope);
+typedef struct RfPageCtrcReferenceV1 {
+	bool ready;
+	RfPageRecoveryReferenceV1 reference;
+} RfPageCtrcReferenceV1;
+/* Value-only F4 comparison metadata from an exact original native source and
+ * promoted target: actual IR request cookie and actual PAGE fingerprint and
+ * partition. Not authority or an ordinary RR serial/pin conversion. No I/O,
+ * allocation, new acquisition, mutation or borrowed-owner retirement. Retain
+ * all original backing storage; store the by-value result separately. */
+extern RfPageCtrcReferenceV1 rf_page_authority_ctrc_replays_reference_nowait_v1(
+	const RfPageCtrcAuthorityV1 *authority,
+	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	const RfPageIdentityV1 *identity, const RfPageVersionV1 *expected_before);
 /* Reverse-release local PAGE locks, then private memory, even if original
  * native custody has retired. Never dereference/release a borrowed owner. */
 extern void rf_page_authority_ctrc_replays_destroy_v1(RfPageCtrcAuthorityV1 **authority);

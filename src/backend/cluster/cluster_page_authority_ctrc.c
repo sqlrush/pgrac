@@ -288,6 +288,42 @@ rf_page_authority_ctrc_replays_scope_nowait_v1(const RfPageCtrcAuthorityV1 *a,
 		&& rf_page_authority_ctrc_replays_revalidate_nowait_v1(a) == RF_PAGE_AUTHORITY_OK;
 }
 
+RfPageCtrcReferenceV1
+rf_page_authority_ctrc_replays_reference_nowait_v1(const RfPageCtrcAuthorityV1 *a,
+	const ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	const RfPageIdentityV1 *identity, const RfPageVersionV1 *expected_before)
+{
+	RfPageCtrcReferenceV1 result = {0};
+	bool member = false;
+
+	if (source == NULL || identity == NULL || expected_before == NULL
+		|| rf_page_authority_ctrc_replays_revalidate_nowait_v1(a) != RF_PAGE_AUTHORITY_OK)
+		return result;
+	for (uint32 i = 0; i < a->source_count; i++)
+		if (memcmp(source, &a->sources[i], sizeof(*source)) == 0) {
+			member = true;
+			break;
+		}
+	if (!member || source->ir_request_id == 0)
+		return result;
+	for (uint32 i = 0; i < a->target_count; i++) {
+		uint8 index = a->target_guard_index[i];
+
+		if (!rf_page_identity_equal_v1(identity, &a->targets[i].page_identity)
+			|| !rf_page_version_equal_v1(expected_before, &a->targets[i].expected_result))
+			continue;
+		if (index >= a->guard_count
+			|| !rf_page_guard_covers_nowait_v1(&a->page_guards[index], identity))
+			return result;
+		result.reference.source_binding_cookie = source->ir_request_id;
+		result.reference.protection_fingerprint = a->page_guards[index].identity_fingerprint;
+		result.reference.partition = a->page_guards[index].partition;
+		result.ready = true;
+		return result;
+	}
+	return result;
+}
+
 void
 rf_page_authority_ctrc_replays_destroy_v1(RfPageCtrcAuthorityV1 **authority)
 {

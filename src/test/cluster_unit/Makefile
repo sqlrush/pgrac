@@ -3354,10 +3354,12 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_ctrc_
 # Exercise canonical native page preparation with private-allocation fault leaves.
 CTRC_NATIVE_FPI_TEST_OBJS = test_cluster_ctrc_native_fpi_product.o \
 	test_cluster_generic_product.o test_cluster_terminal_ref_census_product.o \
-	test_cluster_space_producer_product.o
+	test_cluster_space_producer_product.o test_cluster_recovery_ctrc_record_product.o
 
-test_cluster_ctrc_native_fpi: $(CTRC_NATIVE_FPI_TEST_OBJS) \
-		$(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c
+test_cluster_ctrc_native_fpi: test_cluster_ctrc_native_stamp.inc $(CTRC_NATIVE_FPI_TEST_OBJS) \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
+		$(top_srcdir)/src/include/cluster/cluster_page_authority_ctrc.h
 
 test_cluster_ctrc_native_fpi_product.o: $(top_srcdir)/src/backend/cluster/cluster_page_install_ctrc.c \
 		$(top_srcdir)/src/include/cluster/cluster_page_install_ctrc.h
@@ -3533,7 +3535,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_ctrc_
 		xlogreader_fs.o \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) \
-		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(filter-out -lpgcommon -lpgport,$(LIBS)) $(if $(filter test_cluster_ctrc_native_fpi,$@),-lcrypto -lssl) -o $@
 
 # PGRAC: perturb only syscall timing/failure; all read/decoder/selection code is
 # production code. Author: SqlRush <sqlrush@gmail.com>
