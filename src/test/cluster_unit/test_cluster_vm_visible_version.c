@@ -130,6 +130,8 @@ static bool empty_identity_available;
 static uint64 empty_identity_generation;
 static unsigned empty_identity_captures, empty_identity_checks;
 static int empty_identity_change_phase;
+static uint64 empty_publication_metrics[PCM_VM_METRIC_COUNT];
+static unsigned empty_publication_notes;
 /* Deferred repair owns no heap pin/lock; the lower X service may drop its
  * only VM pin before returning a clean reobservation result. */
 static bool repair_retry_fixture, repair_pinned, repair_locked, repair_aux_driving;
@@ -282,6 +284,36 @@ BufferGetTag(Buffer buffer, RelFileLocator *locator, ForkNumber *forknum, BlockN
 	*locator = fixture_locators[buffer - 1];
 	*forknum = fixture_forks[buffer - 1];
 	*block = fixture_blocks[buffer - 1];
+}
+
+void
+cluster_pcm_vm_metric_note(const BufferTag *tag, PcmVmMetric metric)
+{
+	BufferTag expected;
+
+	UT_ASSERT(empty_fixture && held[0] && held[1] && writer[0] && writer[1]);
+	UT_ASSERT(pinned[0] && pinned[1]);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	InitBufferTag(&expected, &relation.rd_locator, VISIBILITYMAP_FORKNUM, 0);
+	UT_ASSERT(BufferTagsEqual(tag, &expected));
+	UT_ASSERT((unsigned)metric < PCM_VM_METRIC_COUNT);
+	empty_publication_metrics[metric]++;
+	empty_publication_notes++;
+}
+
+/* The parent has no outcome keys or notes. Keep its original functions intact
+ * and expose that absence as a zero diagnostic count, rather than a skip. */
+static uint64
+empty_publication_metric(const char *key)
+{
+#define FIXTURE_VM_KEY(id, name) name,
+	static const char *const keys[] = { PCM_VM_METRICS(FIXTURE_VM_KEY) };
+#undef FIXTURE_VM_KEY
+
+	for (unsigned i = 0; i < lengthof(keys); i++)
+		if (strcmp(keys[i], key) == 0)
+			return empty_publication_metrics[i];
+	return 0;
 }
 BlockNumber
 BufferGetBlockNumber(Buffer buffer)
@@ -1382,6 +1414,8 @@ empty_reset(bool visible, uint8 bits)
 	empty_identity_generation = 1;
 	empty_identity_captures = empty_identity_checks = 0;
 	empty_identity_change_phase = 0;
+	memset(empty_publication_metrics, 0, sizeof(empty_publication_metrics));
+	empty_publication_notes = 0;
 	InterruptPending = false;
 	expected_cutoff = InvalidTransactionId;
 	state.rel = &relation;
@@ -2265,10 +2299,100 @@ UT_TEST(test_empty_direct_setter_current_observation_keeps_wal_and_qualified_noo
 	}
 }
 
+UT_TEST(test_empty_outcome_counts_actual_wal_for_each_changed_input)
+{
+	for (int visible = 0; visible < 2; visible++) {
+		for (int bits = 0; bits <= VISIBILITYMAP_VALID_BITS; bits++) {
+			LVRelState state = empty_reset(visible != 0, bits | (VISIBILITYMAP_VALID_BITS << 2));
+			Buffer vm = 2;
+
+			if (visible && bits == VISIBILITYMAP_VALID_BITS)
+				continue;
+			UT_ASSERT(lazy_scan_new_or_empty(&state, 1, 0, pages[0].data, false, &vm));
+			UT_ASSERT_EQ(inserts, 1);
+			UT_ASSERT_EQ(edge_count, 2);
+			UT_ASSERT_EQ(empty_publication_metric("vm_empty_publish_wal_count"), inserts);
+			UT_ASSERT_EQ(empty_publication_metric("vm_empty_publish_noop_count"), 0);
+			UT_ASSERT_EQ(empty_publication_notes, 1);
+			UT_ASSERT_EQ((uint8)*PageGetContents(pages[1].data), 15);
+			UT_ASSERT_EQ(empty_aux_calls, 1);
+			UT_ASSERT_EQ(empty_resumes, 1);
+			UT_ASSERT_EQ(empty_heap_waits, 1);
+			UT_ASSERT(!held[0] && !held[1] && !pinned[0] && pinned[1]);
+		}
+	}
+}
+
+UT_TEST(test_empty_outcome_counts_qualified_noop_separately_from_wal)
+{
+	LVRelState state = empty_reset(true, 15);
+	Buffer vm = 2;
+
+	UT_ASSERT(lazy_scan_new_or_empty(&state, 1, 0, pages[0].data, true, &vm));
+	UT_ASSERT_EQ(empty_publication_metric("vm_empty_publish_noop_count"), 1);
+	UT_ASSERT_EQ(empty_publication_metric("vm_empty_publish_wal_count"), 0);
+	UT_ASSERT_EQ(empty_publication_notes, 1);
+	UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
+	UT_ASSERT_EQ(next_token, 100);
+	UT_ASSERT(memcmp(pages, before, sizeof(pages)) == 0);
+	UT_ASSERT_EQ(empty_aux_calls, 1);
+	UT_ASSERT_EQ(empty_resumes, 1);
+	UT_ASSERT_EQ(empty_heap_waits, 1);
+	UT_ASSERT(!held[0] && !held[1] && !pinned[0] && pinned[1]);
+}
+
+UT_TEST(test_empty_outcome_refusals_cannot_count_success_or_noop)
+{
+	for (int reason = 0; reason < 6; reason++) {
+		LVRelState state = empty_reset(true, 15);
+		Buffer vm = 2;
+
+		switch (reason) {
+		case 0: empty_identity_available = false; break;
+		case 1: empty_identity_change_phase = 1; break;
+		case 2: empty_identity_change_phase = 2; break;
+		case 3: empty_identity_change_phase = 3; break;
+		case 4: empty_vm_writer = false; break;
+		case 5: empty_resume = false; break;
+		}
+		UT_ASSERT(lazy_scan_new_or_empty(&state, 1, 0, pages[0].data, false, &vm));
+		UT_ASSERT_EQ(empty_publication_notes, 0);
+		UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
+		UT_ASSERT(memcmp(pages, before, sizeof(pages)) == 0);
+		UT_ASSERT(!held[0] && !held[1] && !pinned[0] && pinned[1]);
+	}
+}
+
+UT_TEST(test_empty_outcome_error_does_not_count_completed_publication)
+{
+	for (int phase = 0; phase < 2; phase++) {
+		LVRelState state = empty_reset(false, 12);
+		Buffer vm = 2;
+
+		empty_error_at_capture = phase == 0;
+		empty_error_after_resume = phase == 1;
+		expecting_error = true;
+		if (setjmp(error_jump) == 0) {
+			(void)lazy_scan_new_or_empty(&state, 1, 0, pages[0].data, false, &vm);
+			UT_ASSERT(false);
+		}
+		expecting_error = false;
+		UT_ASSERT_EQ(empty_publication_notes, 0);
+		UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
+		UT_ASSERT(memcmp(pages, before, sizeof(pages)) == 0);
+		UT_ASSERT(!held[1] && !writer[1] && pinned[0] && pinned[1]);
+		UT_ASSERT_EQ(held[0], phase == 1);
+		if (held[0])
+			LockBuffer(1, BUFFER_LOCK_UNLOCK);
+		ReleaseBuffer(1);
+		ReleaseBuffer(2);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(50);
+	UT_PLAN(54);
 	UT_RUN(test_visible_exact_two_page_batch);
 	UT_RUN(test_no_change_allocates_no_version);
 	UT_RUN(test_nonshared_preserves_native_hint_lsn_rules);
@@ -2319,6 +2443,10 @@ main(void)
 	UT_RUN(test_empty_direct_setter_refuses_absent_stale_and_zero_observation);
 	UT_RUN(test_empty_direct_setter_refuses_replaced_original_identity);
 	UT_RUN(test_empty_direct_setter_current_observation_keeps_wal_and_qualified_noop);
+	UT_RUN(test_empty_outcome_counts_actual_wal_for_each_changed_input);
+	UT_RUN(test_empty_outcome_counts_qualified_noop_separately_from_wal);
+	UT_RUN(test_empty_outcome_refusals_cannot_count_success_or_noop);
+	UT_RUN(test_empty_outcome_error_does_not_count_completed_publication);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

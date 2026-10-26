@@ -2415,6 +2415,7 @@ test_cluster_vm_repair_lpdead.inc: $(top_srcdir)/src/backend/access/heap/vacuuml
 	mv $@.tmp $@
 
 test_cluster_vm_visible_version test_cluster_vm_visible_version_noassert: test_cluster_vm_visible_version.c test_cluster_heap_maintenance_policy.inc unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
 		test_cluster_vm_buffer_matches.inc \
 		test_cluster_vm_repair_versioned.inc \
 		test_cluster_vm_repair_clear.inc test_cluster_vm_repair_missing_heap.inc \
@@ -5885,6 +5886,7 @@ test_cluster_pgstat: test_cluster_pgstat.c unit_test.h $(CLUSTER_VERSION_O) \
 # (out-of-range index returns false; NULL out-pointers do not crash).
 # End-to-end behaviour is covered by cluster_tap t/017_debug.pl.
 test_cluster_debug: test_cluster_debug.c unit_test.h $(CLUSTER_VERSION_O) \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
 		$(CLUSTER_DEBUG_O) $(CLUSTER_STARTUP_PHASE_O) \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
@@ -7127,6 +7129,7 @@ test_cluster_pcm_settlement_ingress.inc: $(top_srcdir)/src/backend/cluster/clust
 	mv $@.tmp $@
 
 test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_wait_exit test_cluster_pcm_stop_cv test_cluster_pcm_read_grant: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
 		test_cluster_pcm_master_durable.inc \
 		test_cluster_pcm_bootstrap_tick.inc \
 		test_cluster_pcm_settlement_ingress.inc \
@@ -10399,13 +10402,16 @@ test_cluster_heap_freeze_startup_source.inc: $(top_srcdir)/src/backend/cluster/c
 	     END { if (found != 4 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-# Execute the original ordinary TARGET and read-only census admission checks.
+# Execute the original ordinary TARGET/read-only census checks and gate publisher.
 test_cluster_heap_freeze_admission_current.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
 	awk '/^semantic_activation_(admission_policy|r4_terminal_census_policy)\(/ { print "static ClusterSemanticAdmissionResult"; emit=1; count++ } \
 	     /^semantic_activation_feature_(bit_)?index\(/ { print "static bool"; emit=1; count++ } \
+	     /^semantic_activation_lmon_publish_gate\(/ { signature="static bool\n" $$0; pending=1; next } \
+	     pending { signature=signature "\n" $$0; if ($$0 ~ /;$$/) pending=0; \
+	               else if ($$0 == "{") { print signature; pending=0; emit=1; count++ } next } \
 	     /^cluster_semantic_activation_recheck(_r4_terminal_census)?\(/ { print "bool"; emit=1; count++ } \
 	     emit { print } /^}$$/ { emit=0 } \
-	     END { if (count != 6 || emit) exit 1 }' $< > $@.tmp
+	     END { if (count != 7 || emit || pending) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Original terminal-census admission, debt counters and backend exit cleanup.

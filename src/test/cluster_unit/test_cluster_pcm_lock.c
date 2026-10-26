@@ -21563,6 +21563,29 @@ UT_TEST(test_pcm_vm_metrics_distinguish_requests_completions_and_latency)
 	UT_ASSERT_EQ(stats.count[PCM_VM_X_REQUEST], 2);
 }
 
+UT_TEST(test_vm_metric_table_preserves_each_counter_and_exact_tag_filter)
+{
+	BufferTag vm = make_tag(0), other;
+	PcmVmStats stats;
+
+	vm.forkNum = VISIBILITYMAP_FORKNUM;
+	other = vm;
+	other.relNumber++;
+	reset_fake_pcm_runtime(4);
+	for (unsigned metric = 0; metric < PCM_VM_METRIC_COUNT; metric++) {
+		cluster_pcm_vm_metric_note(&vm, (PcmVmMetric)metric);
+		cluster_pcm_vm_metric_note(&vm, (PcmVmMetric)metric);
+		cluster_pcm_vm_metric_note(&other, (PcmVmMetric)metric);
+	}
+	cluster_pcm_vm_metric_note(&vm, (PcmVmMetric)-1);
+	cluster_pcm_vm_metric_note(&vm, PCM_VM_METRIC_COUNT);
+	UT_ASSERT(cluster_pcm_vm_stats_snapshot(&stats));
+	for (unsigned metric = 0; metric < PCM_VM_METRIC_COUNT; metric++)
+		UT_ASSERT_EQ(stats.count[metric], 2);
+	UT_ASSERT_EQ(stats.other_tag_observations, PCM_VM_METRIC_COUNT);
+	UT_ASSERT(BufferTagsEqual(&stats.tag, &vm));
+}
+
 UT_TEST(test_vm_clear_bitmap_deduplicates_exact_heap_blocks_and_refuses_out_of_range)
 {
 	BufferTag vm = make_tag(0);
@@ -25174,7 +25197,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(383);
+	UT_PLAN(384);
 	/* Observe the actual startup state before any runtime fixture overrides
 	 * the postmaster GUC or initializes shared PCM state and counters. */
 	UT_RUN(test_pcm_grd_max_entries_default_is_minus_one);
@@ -25211,6 +25234,7 @@ main(void)
 	UT_RUN(test_resource_x_trace_observes_actual_head_and_same_ref_waiters);
 	UT_RUN(test_resource_x_trace_preserves_physical_authority_image_flags);
 	UT_RUN(test_pcm_vm_metrics_distinguish_requests_completions_and_latency);
+	UT_RUN(test_vm_metric_table_preserves_each_counter_and_exact_tag_filter);
 	UT_RUN(test_vm_clear_bitmap_deduplicates_exact_heap_blocks_and_refuses_out_of_range);
 	UT_RUN(test_pcm_grd_entry_lifecycle_link_surface);
 	UT_RUN(test_pcm_per_entry_lwlock_independence_link_surface);

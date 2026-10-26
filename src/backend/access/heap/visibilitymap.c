@@ -712,6 +712,8 @@ visibilitymap_set_empty(Relation rel, BlockNumber heapBlk, Buffer heapBuf, Buffe
 	Page page;
 	PageHeader header;
 	RfPageProducerComponentV1 heap_component, vm_component;
+	BufferTag vm_tag;
+	bool publication_needed;
 	const ClusterSpaceIdentity *identity = observation != NULL ? &observation->identity : NULL;
 
 	if (rel == NULL || identity == NULL || InRecovery || !cluster_heap_maintenance_restricted(rel)
@@ -737,8 +739,17 @@ visibilitymap_set_empty(Relation rel, BlockNumber heapBlk, Buffer heapBuf, Buffe
 		|| !cluster_space_buffer_version_component(identity, vmBuf, 0, 0, &vm_component))
 		return false;
 
+	/* Both exact pages remain locked. Distinguish a real native publication
+	 * from an already-qualified no-op; neither is a durability or transfer
+	 * acknowledgement. Record only after the native WAL section returns. */
+	publication_needed = !PageIsAllVisible(page)
+		|| ((((uint8 *)PageGetContents(BufferGetPage(vmBuf)))[HEAPBLK_TO_MAPBYTE(heapBlk)]
+			 >> HEAPBLK_TO_OFFSET(heapBlk)) & VISIBILITYMAP_VALID_BITS) != VISIBILITYMAP_VALID_BITS;
 	visibilitymap_set_locked(rel, heapBlk, heapBuf, InvalidXLogRecPtr, vmBuf, InvalidTransactionId,
 							 VISIBILITYMAP_VALID_BITS, identity);
+	InitBufferTag(&vm_tag, &rel->rd_locator, VISIBILITYMAP_FORKNUM, HEAPBLK_TO_MAPBLOCK(heapBlk));
+	cluster_pcm_vm_metric_note(&vm_tag, publication_needed ? PCM_VM_EMPTY_PUBLISH_WAL
+															 : PCM_VM_EMPTY_PUBLISH_NOOP);
 	return true;
 }
 #endif
