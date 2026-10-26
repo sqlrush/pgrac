@@ -4803,6 +4803,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_pcm_master_receipt.inc test_cluster_pcm_master_receipt.inc.tmp
 	rm -f test_cluster_first_fill_hot_block.inc test_cluster_first_fill_hot_block.inc.tmp
 	rm -f test_cluster_first_fill_request.inc test_cluster_first_fill_request.inc.tmp
 	rm -f test_cluster_first_fill_reply.inc test_cluster_first_fill_reply.inc.tmp
@@ -5480,6 +5481,15 @@ test_cluster_pcm_source_owner_layout.inc: $(top_srcdir)/src/backend/cluster/clus
 	     END { if (handoff != 1 || owner != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Keep the byte-empty canonical guard and its private layouts production-exact.
+test_cluster_pcm_master_receipt.inc: $(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c Makefile
+	awk '/^#define RESOURCE_X_BOOTSTRAP_RECEIPT_/ { print; constants++ } \
+	     /^typedef struct ClusterPcmResourceX(MasterRequest|BootstrapReceipt) / { emit=1; types++ } \
+	     /^pcm_resource_x_bootstrap_receipt_(valid|supersedable)\(/ && !/;$$/ { print "static bool"; emit=1; funcs++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (constants != 3 || types != 2 || funcs != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_pcm_stop_fields.inc: $(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c Makefile
 	awk '/^typedef struct PcmConvertQueue PcmConvertQueue;/ { print; forward++ } \
 	     /^typedef struct ClusterPcmResourceXRequesterSend / { emit=1; send++ } \
@@ -5541,6 +5551,7 @@ test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv te
 		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
 		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \
 		test_cluster_pcm_stop_fields.inc \
+		test_cluster_pcm_master_receipt.inc \
 		test_cluster_pcm_predecessor_consumer.inc \
 		test_cluster_pcm_source_owner_layout.inc \
 		test_cluster_pcm_source_replay.inc \
@@ -9444,6 +9455,7 @@ test_cluster_ko_relation_scan test_cluster_ko_current_admission: %: %.c test_clu
 		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
 		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \
 		test_cluster_pcm_stop_fields.inc \
+		test_cluster_pcm_master_receipt.inc \
 		test_cluster_pcm_predecessor_consumer.inc \
 		test_cluster_pcm_source_owner_layout.inc \
 		test_cluster_pcm_source_replay.inc \

@@ -3658,7 +3658,11 @@ gcs_first_fill_receipt_tick(int worker)
 	TimestampTz now = GetCurrentTimestamp();
 	if (gcs_block_backend_blocks == NULL || cap == 0 || worker < 0)
 		return;
-	for (unsigned probe = 0; probe < 64 && probe < cap; probe++) {
+	/* A completion wakes its tag worker, but its slot may be beyond a small
+	 * scan slice. Cover the bounded table before the caller's ordinary idle
+	 * wait, so that unrelated empty slots cannot defer a ready confirmation
+	 * across successive idle intervals. Each position is visited once. */
+	for (uint64 probe = 0; probe < cap; probe++) {
 		uint64 next = cursor++ % cap;
 		int backend = next / MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND;
 		int index = next % MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND;

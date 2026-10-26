@@ -21,8 +21,9 @@ int first_fill_retire_own_fixture_main(void);
 #define MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND CLUSTER_GCS_BLOCK_MAX_OUTSTANDING_PER_BACKEND
 #include "test_cluster_first_fill_retire_types.inc"
 static void gcs_block_clear_slot_locked(ClusterGcsBlockOutstandingSlot *slot);
-static ClusterGcsBlockBackendBlock retire_blocks[1];
+static ClusterGcsBlockBackendBlock retire_blocks[122];
 static ClusterGcsBlockBackendBlock *gcs_block_backend_blocks = retire_blocks;
+static int retire_max_backends = 1;
 static struct {
 	pg_atomic_uint64 invalidate_busy_sent_count;
 	pg_atomic_uint64 done_sent_count, done_enqueue_drop_count;
@@ -44,6 +45,7 @@ static void (*retire_on_wait)(void);
 static ClusterPcmReadSource retire_wait_source;
 bool cluster_trace_gcs_capacity;
 static unsigned retire_trace_cuts, retire_trace_scans, retire_lock_depth;
+static uint64 retire_scan_end;
 #ifdef CLUSTER_CONTENT_TRACE_GCS_SLOTS
 static ClusterContentTraceGcsCapacity retire_trace_cut;
 void
@@ -58,13 +60,16 @@ cluster_content_trace_gcs_scan(int worker, int workers, uint64 begin, uint64 end
 {
 	UT_ASSERT_EQ(retire_lock_depth, 0);
 	UT_ASSERT_EQ(worker, 0); UT_ASSERT_EQ(workers, 1);
-	UT_ASSERT_EQ(end - begin, 8); UT_ASSERT_EQ(cap, 8);
+	if (retire_max_backends == 1) {
+		UT_ASSERT_EQ(end - begin, 8); UT_ASSERT_EQ(cap, 8);
+	}
 	UT_ASSERT_EQ(sampled_at, retire_now);
+	retire_scan_end = end;
 	retire_trace_scans++;
 }
 #endif
 #define ClusterGcsBlock (&retire_shared)
-#define MaxBackends 1
+#define MaxBackends retire_max_backends
 #define MyBackendId retire_backend
 #define MyProcPid retire_pid
 #define MyStartTimestamp retire_start
@@ -198,6 +203,7 @@ retire_reset(BufferDesc *buf, ClusterPcmOwnEntry *entry, bool fresh)
 	memset(gcs_read_source_attempts, 0, sizeof(gcs_read_source_attempts));
 	gcs_read_source_exit_registered = true;
 	retire_blocks[0].next_request_id = 1;
+	retire_max_backends = 1;
 	retire_backend = 1; retire_pid = 71; retire_start = 700; retire_route = 2;
 	retire_now = 10; retire_epoch = 1; retire_peer_session = 17;
 	memset(&retire_ack, 0, sizeof(retire_ack));
@@ -729,10 +735,42 @@ UT_TEST(test_repeated_installed_confirmations_return_original_bounded_slots)
 	}
 }
 
+UT_TEST(test_woken_worker_retires_ready_receipts_across_the_bounded_table)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry;
+	ClusterGcsBlockBackendBlock *blk;
+	uint64 cap;
+	retire_reset(&buf, &entry, true);
+	retire_max_backends = lengthof(retire_blocks);
+	cap = (uint64)retire_max_backends * MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND;
+	cluster_trace_gcs_capacity = cluster_trace_tx_identity = true;
+	gcs_first_fill_receipt_tick(0);
+	/* Place real installed receipts beyond the next 64 positions. A wake
+	 * must not leave them behind another ordinary LMS idle interval. */
+	retire_backend = ((retire_scan_end + 128) % cap)
+		/ MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND + 1;
+	blk = &retire_blocks[retire_backend - 1];
+	blk->next_request_id = 1;
+	for (int episode = 0; episode < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; episode++) {
+		ClusterPcmReadSource source;
+		buf.pcm_state = PCM_STATE_N;
+		pg_atomic_write_u32(&buf.state, BM_TAG_VALID | BM_IO_IN_PROGRESS | BUF_REFCOUNT_ONE);
+		source = retire_arm(&buf, true);
+		retire_prepare_install(&buf, &entry, &source);
+		cluster_gcs_block_read_source_complete(&buf, &source, true);
+	}
+	UT_ASSERT_EQ(retire_worker_wakes, MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND);
+	retire_confirm_admit = true;
+	gcs_first_fill_receipt_tick(0);
+	for (int slot = 0; slot < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; slot++)
+		UT_ASSERT(!blk->slots[slot].in_use);
+	UT_ASSERT_EQ(retire_confirm_handed, MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND);
+}
+
 int
 FIRST_FILL_RETIRE_MAIN(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(21);
 	UT_RUN(test_deferred_original_notice_keeps_receipt_then_retires_without_successor_state);
 	UT_RUN(test_capacity_observer_copies_original_full_source_keys_without_holding_lock);
 	UT_RUN(test_installed_confirm_refusal_keeps_original_owner_until_real_handoff);
@@ -753,5 +791,6 @@ FIRST_FILL_RETIRE_MAIN(void)
 	UT_RUN(test_master_consumption_releases_capacity_without_a_backend_waiter);
 	UT_RUN(test_unknown_invalidate_still_observes_native_io_protection);
 	UT_RUN(test_admitted_original_master_notice_survives_route_change);
+	UT_RUN(test_woken_worker_retires_ready_receipts_across_the_bounded_table);
 	UT_DONE(); return ut_failed_count == 0 ? 0 : 1;
 }

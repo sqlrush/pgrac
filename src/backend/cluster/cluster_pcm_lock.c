@@ -20049,6 +20049,36 @@ pcm_resource_x_bootstrap_receipt_valid(const ClusterPcmResourceXBootstrapReceipt
 		   && receipt->authenticated_ingress_connection_generation != UINT32_MAX;
 }
 
+/* A higher attempt can end only its own unconsumed, non-authoritative
+ * receipt. Phase NONE alone is insufficient: residual canonical bytes can
+ * still carry physical or transport responsibility. The caller holds the
+ * original entry lock and has authenticated the new request's domain. */
+static bool
+pcm_resource_x_bootstrap_receipt_supersedable(
+	const ClusterPcmResourceXBootstrapReceipt *receipt,
+	const ClusterPcmResourceXMasterRequest *canonical, const ResourceXDecodedCommon *request,
+	uint64 authority_generation, uint64 r4_record_generation,
+	uint32 authenticated_ingress_connection_generation, uint32 master_sender_connection_generation)
+{
+	static const ClusterPcmResourceXMasterRequest empty_request;
+
+	return pcm_resource_x_bootstrap_receipt_valid(receipt) && canonical != NULL && request != NULL
+		&& receipt->state == RESOURCE_X_BOOTSTRAP_RECEIPT_RECEIVED
+		&& resource_x_assertion_equal(&receipt->request.logical_assertion,
+			&request->logical_assertion)
+		&& request->assertion_sequence > receipt->highest_attempt_floor
+		&& request->assertion_sequence != UINT64_MAX
+		&& receipt->request.resource_formation == request->resource_formation
+		&& receipt->request.master_session_incarnation == request->master_session_incarnation
+		&& receipt->request.sender_connection_generation == request->sender_connection_generation
+		&& receipt->r4_record_generation == r4_record_generation
+		&& receipt->authenticated_ingress_connection_generation
+			== authenticated_ingress_connection_generation
+		&& receipt->ack.sender_connection_generation == master_sender_connection_generation
+		&& receipt->sampled_base == authority_generation
+		&& memcmp(canonical, &empty_request, sizeof(*canonical)) == 0;
+}
+
 static void
 pcm_resource_x_bootstrap_ack_snapshot(const ClusterPcmResourceXBootstrapReceipt *receipt,
 									  ResourceXDecodedFrame *ack_out)
@@ -20526,6 +20556,10 @@ pcm_resource_x_bootstrap_request(
 	ResourceXApplyResult result;
 	ResourceXMasterSnapshot admitted_snapshot;
 	ClusterWaitTrace admission = {0};
+	ClusterPcmResourceXBootstrapReceipt superseded_receipt;
+	bool trace_superseded = false;
+	int32 superseded_head_requester = -1;
+	uint64 superseded_head_attempt = 0, superseded_head_order = 0;
 
 	if (ack_out != NULL)
 		memset(ack_out, 0, sizeof(*ack_out));
@@ -20657,6 +20691,29 @@ pcm_resource_x_bootstrap_request(
 			pcm_resource_x_bootstrap_priority_clear(priority);
 		result = RESOURCE_X_APPLY_STALE;
 	} else {
+		/* Finish the old non-authority lifetime before asking whether this
+		 * new attempt may pass the FIFO. Otherwise the earlier queue head
+		 * waits for our old receipt while we wait for that queue head. */
+		if (receipt->state == RESOURCE_X_BOOTSTRAP_RECEIPT_RECEIVED) {
+			if (!pcm_resource_x_bootstrap_receipt_supersedable(receipt, master_request,
+					&request->common, state->authority_generation, r4_record_generation,
+					authenticated_ingress_connection_generation, master_sender_connection_generation)) {
+				result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+				goto bootstrap_request_done;
+			}
+			if (cluster_trace_tx_identity) {
+				superseded_receipt = *receipt;
+				trace_superseded = true;
+				head = pcm_resource_x_bootstrap_queue_head(state);
+				if (head != NULL) {
+					superseded_head_requester = head->request.logical_assertion.requester_node;
+					superseded_head_attempt = head->request.assertion_sequence;
+					superseded_head_order = head->enqueue_order;
+				}
+			}
+			pcm_resource_x_bootstrap_receipt_invalidate(receipt);
+			pcm_resource_x_intent_mark_dirty();
+		}
 		dispatch_state
 			= pcm_resource_x_bootstrap_dispatch_state_locked(entry, state, requester_node);
 		if (dispatch_state == PCM_RESOURCE_X_BOOTSTRAP_DISPATCH_CORRUPT) {
@@ -20726,6 +20783,7 @@ pcm_resource_x_bootstrap_request(
 			}
 		}
 	}
+bootstrap_request_done:
 	if (cluster_trace_tx_identity) {
 		pcm_trace_request(&admission, &request->common, r4_record_generation,
 			cluster_node_id, authenticated_ingress_connection_generation);
@@ -20762,6 +20820,27 @@ pcm_resource_x_bootstrap_request(
 	if (cluster_trace_tx_identity) {
 		PG_TRY();
 		{
+			if (trace_superseded)
+				ereport(LOG, (errmsg_internal("Resource-X pre-ASSERT receipt superseded"),
+					errdetail("tag=%u/%u/%u/%u/%u requester=%d formation=%llu session=%llu "
+						"r4=%llu old_attempt=%llu old_base=%llu old_floor=%llu "
+						"new_attempt=%llu requester_connection=%u ingress_connection=%u "
+						"return_connection=%u fifo_head_requester=%d fifo_head_attempt=%llu "
+						"fifo_head_order=%llu canonical_empty=true reason=higher_same_domain_attempt",
+						entry->tag.spcOid, entry->tag.dbOid,
+						entry->tag.relNumber, (unsigned)entry->tag.forkNum, entry->tag.blockNum,
+						requester_node, (unsigned long long)superseded_receipt.request.resource_formation,
+						(unsigned long long)superseded_receipt.request.master_session_incarnation,
+						(unsigned long long)superseded_receipt.r4_record_generation,
+						(unsigned long long)superseded_receipt.request.assertion_sequence,
+						(unsigned long long)superseded_receipt.sampled_base,
+						(unsigned long long)superseded_receipt.highest_attempt_floor,
+						(unsigned long long)request->common.assertion_sequence,
+						superseded_receipt.request.sender_connection_generation,
+						superseded_receipt.authenticated_ingress_connection_generation,
+						superseded_receipt.ack.sender_connection_generation, superseded_head_requester,
+						(unsigned long long)superseded_head_attempt,
+						(unsigned long long)superseded_head_order)));
 			pcm_trace_wait(entry, CLWAIT_SITE_PCM_ADMISSION, PCM_LOCK_MODE_X,
 				cluster_node_id, requester_node, request->common.assertion_sequence, true, true,
 				&admission);

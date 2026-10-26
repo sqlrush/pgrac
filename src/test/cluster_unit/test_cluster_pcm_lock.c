@@ -107,6 +107,7 @@ int MaxBackends = 1024;
 #include "cluster/cluster_pi_rebuild.h"
 #include "test_cluster_pcm_source_owner_layout.inc"
 #include "test_cluster_pcm_stop_fields.inc"
+#include "test_cluster_pcm_master_receipt.inc"
 
 
 UT_DEFINE_GLOBALS();
@@ -4150,6 +4151,217 @@ UT_TEST(test_resource_x_bootstrap_terminal_retire_clears_binding_not_floor)
 		cluster_pcm_lock_resource_x_bootstrap_request_exact(&next_request, 3, 61, 77, 31, 71, &ack),
 		RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(ack.common.base_authority_generation, UINT64_C(2));
+}
+
+UT_TEST(test_resource_x_preassert_replacement_requires_exact_empty_canonical)
+{
+	BufferTag tag = make_tag(752);
+	ResourceXDecodedFrame old, higher, ack;
+	ClusterPcmResourceXBootstrapReceipt receipt = {0};
+	ClusterPcmResourceXMasterRequest canonical = {0};
+
+	reset_fake_pcm_runtime(4);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	old = make_resource_x_bootstrap_request_values(tag, 0, 17, 31, 41, 51);
+	higher = make_resource_x_bootstrap_request_values(tag, 0, 17, 31, 42, 51);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+		&old, 0, 61, 77, 31, 71, &ack), RESOURCE_X_APPLY_APPLIED);
+	receipt.request = old.common;
+	receipt.ack = ack.common;
+	receipt.highest_attempt_floor = 41;
+	receipt.sampled_base = 1;
+	receipt.r4_record_generation = 77;
+	receipt.authenticated_ingress_connection_generation = 61;
+	receipt.state = RESOURCE_X_BOOTSTRAP_RECEIPT_RECEIVED;
+	UT_ASSERT(pcm_resource_x_bootstrap_receipt_supersedable(
+		&receipt, &canonical, &higher.common, 1, 77, 61, 71));
+	/* Every residual byte, including padding and phase-NONE fields, must
+	 * retain the old responsibility. Use the extracted production layout. */
+	for (Size byte = 0; byte < sizeof(canonical); byte++) {
+		((unsigned char *)&canonical)[byte] = 1;
+		UT_ASSERT(!pcm_resource_x_bootstrap_receipt_supersedable(
+			&receipt, &canonical, &higher.common, 1, 77, 61, 71));
+		((unsigned char *)&canonical)[byte] = 0;
+	}
+	for (int drift = 0; drift < 15; drift++) {
+		ClusterPcmResourceXBootstrapReceipt changed = receipt;
+		ResourceXDecodedCommon incoming = higher.common;
+		uint64 authority = 1, r4 = 77;
+		uint32 ingress = 61, sender = 71;
+		switch (drift) {
+		case 0: changed.state = RESOURCE_X_BOOTSTRAP_RECEIPT_CONSUMED_BY_ASSERT; break;
+		case 1: changed.reserved[0] = 1; break;
+		case 2: changed.highest_attempt_floor = incoming.assertion_sequence; break;
+		case 3: incoming.logical_assertion.resource.blockNum++; break;
+		case 4: incoming.logical_assertion.requester_node++; break;
+		case 5: incoming.resource_formation++; break;
+		case 6: incoming.master_session_incarnation++; break;
+		case 7: incoming.sender_connection_generation++; break;
+		case 8: incoming.assertion_sequence = 41; break;
+		case 9: incoming.assertion_sequence = 40; break;
+		case 10: incoming.assertion_sequence = UINT64_MAX; break;
+		case 11: authority++; break;
+		case 12: r4++; break;
+		case 13: ingress++; break;
+		case 14: sender++; break;
+		}
+		UT_ASSERT(!pcm_resource_x_bootstrap_receipt_supersedable(
+			&changed, &canonical, &incoming, authority, r4, ingress, sender));
+	}
+}
+
+/* Exercise the real master, including the retained LMS work, rather than
+ * replacing dispatch with a test scheduler. */
+static ResourceXBootstrapWork
+bootstrap_next_work(void)
+{
+	ResourceXBootstrapWork work = {0};
+	ResourceXIntentSlot slot;
+	ResourceXAcquisitionRef delivery;
+	ResourceXIntentProbeResult result = RESOURCE_X_INTENT_PROBE_IDLE;
+	uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
+	uint32 examined;
+
+	for (int i = 0; i < 32; i++) {
+		result = cluster_pcm_lock_resource_x_outbound_work_probe_exact(
+			1, &slot, payload, sizeof(payload), &examined, &delivery);
+		UT_ASSERT(examined <= 1);
+		UT_ASSERT(result != RESOURCE_X_INTENT_PROBE_CORRUPT);
+		if (result == RESOURCE_X_INTENT_PROBE_BOOTSTRAP)
+			break;
+	}
+	UT_ASSERT_EQ(result, RESOURCE_X_INTENT_PROBE_BOOTSTRAP);
+	if (result == RESOURCE_X_INTENT_PROBE_BOOTSTRAP)
+		memcpy(&work, payload, sizeof(work));
+	return work;
+}
+
+UT_TEST(test_resource_x_higher_preassert_attempt_retires_receipt_before_fifo)
+{
+	BufferTag tag = make_tag(753);
+	ResourceXDecodedFrame old, next, first, second, ack, old_ack, assertion;
+	ResourceXMasterSnapshot snapshot;
+	ResourceXBootstrapWork work;
+	uint64 first_order, second_order;
+
+	reset_fake_pcm_runtime(4);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	old = make_resource_x_bootstrap_request_values(tag, 0, 17, 31, 41, 51);
+	next = make_resource_x_bootstrap_request_values(tag, 0, 17, 31, 42, 51);
+	first = make_resource_x_bootstrap_request_values(tag, 1, 17, 31, 51, 52);
+	second = make_resource_x_bootstrap_request_values(tag, 2, 17, 31, 61, 53);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+		&old, 0, 61, 77, 31, 71, &old_ack), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+		&first, 1, 62, 77, 31, 72, &ack), RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+		&second, 2, 63, 77, 31, 73, &ack), RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+		&next, 0, 61, 77, 31, 71, &ack), RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(ack.kind, 0); /* Retirement never grants the tail an ACK. */
+
+	/* The old ACK may still be owned by transport. It must no longer be
+	 * consumable after the higher attempt retired its exact receipt. */
+	assertion = old_ack;
+	assertion.kind = RESOURCE_X_WIRE_ASSERT_X;
+	assertion.common.sender_connection_generation = 51;
+	assertion.common.authority_generation = assertion.common.base_authority_generation;
+	assertion.common.outcome = RESOURCE_X_OUTCOME_NONE;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
+		&assertion, 0, 61, 77, 31, 71, &snapshot), RESOURCE_X_APPLY_STALE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+		&old, 0, 61, 77, 31, 71, &ack), RESOURCE_X_APPLY_STALE);
+
+	/* No fresh R1 packet: the original queue item is sufficient. */
+	work = bootstrap_next_work();
+	UT_ASSERT_EQ(work.request.logical_assertion.requester_node, 1);
+	first_order = work.enqueue_order;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_resume_exact(&work, &ack),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(ack.common.assertion_sequence, UINT64_C(51));
+
+	/* Retiring that unconsumed receipt still cannot bypass R2 with a new
+	 * R1 attempt. Each successor joins behind the already retained items. */
+	first = make_resource_x_bootstrap_request_values(tag, 1, 17, 31, 52, 52);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+		&first, 1, 62, 77, 31, 72, &ack), RESOURCE_X_APPLY_BAD_STATE);
+	work = bootstrap_next_work();
+	UT_ASSERT_EQ(work.request.logical_assertion.requester_node, 2);
+	second_order = work.enqueue_order;
+	UT_ASSERT(second_order > first_order);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_resume_exact(&work, &ack),
+				 RESOURCE_X_APPLY_APPLIED);
+	second = make_resource_x_bootstrap_request_values(tag, 2, 17, 31, 62, 53);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+		&second, 2, 63, 77, 31, 73, &ack), RESOURCE_X_APPLY_BAD_STATE);
+	work = bootstrap_next_work();
+	UT_ASSERT_EQ(work.request.logical_assertion.requester_node, 0);
+	UT_ASSERT_EQ(work.request.assertion_sequence, UINT64_C(42));
+	UT_ASSERT(work.enqueue_order > second_order);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_resume_exact(&work, &ack),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(ack.common.assertion_sequence, UINT64_C(42));
+	UT_ASSERT_EQ(ack.common.base_authority_generation, UINT64_C(1));
+}
+
+UT_TEST(test_resource_x_preassert_replacement_keeps_same_lower_and_foreign_receipts)
+{
+	BufferTag tag = make_tag(754);
+	ResourceXDecodedFrame old, other, lower, ack, old_ack;
+
+	reset_fake_pcm_runtime(4);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	old = make_resource_x_bootstrap_request_values(tag, 0, 17, 31, 41, 51);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+		&old, 0, 61, 77, 31, 71, &old_ack), RESOURCE_X_APPLY_APPLIED);
+	other = make_resource_x_bootstrap_request_values(tag, 1, 17, 31, 99, 52);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+		&other, 1, 62, 77, 31, 72, &ack), RESOURCE_X_APPLY_BAD_STATE);
+	lower = make_resource_x_bootstrap_request_values(tag, 0, 17, 31, 40, 51);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+		&lower, 0, 61, 77, 31, 71, &ack), RESOURCE_X_APPLY_STALE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+		&old, 0, 61, 77, 31, 71, &ack), RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(memcmp(&ack, &old_ack, sizeof(ack)), 0);
+	other = make_resource_x_bootstrap_request_values(make_tag(755), 0, 17, 31, 99, 51);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+		&other, 0, 61, 77, 31, 71, &ack), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+		&old, 0, 61, 77, 31, 71, &ack), RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(memcmp(&ack, &old_ack, sizeof(ack)), 0);
+}
+
+UT_TEST(test_resource_x_preassert_replacement_keeps_consumed_canonical_authority)
+{
+	BufferTag tag = make_tag(756);
+	ResourceXDecodedFrame old, higher, other, ack, assertion;
+	ResourceXMasterSnapshot before, after;
+
+	reset_fake_pcm_runtime(4);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	old = make_resource_x_bootstrap_request_values(tag, 0, 17, 31, 41, 51);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+		&old, 0, 61, 77, 31, 71, &ack), RESOURCE_X_APPLY_APPLIED);
+	assertion = ack;
+	assertion.kind = RESOURCE_X_WIRE_ASSERT_X;
+	assertion.common.sender_connection_generation = 51;
+	assertion.common.authority_generation = assertion.common.base_authority_generation;
+	assertion.common.outcome = RESOURCE_X_OUTCOME_NONE;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
+		&assertion, 0, 61, 77, 31, 71, &before), RESOURCE_X_APPLY_APPLIED);
+	higher = make_resource_x_bootstrap_request_values(tag, 0, 17, 31, 42, 51);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+		&higher, 0, 61, 77, 31, 71, &ack), RESOURCE_X_APPLY_STALE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
+		&old.common.logical_assertion, &after), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+	other = make_resource_x_bootstrap_request_values(tag, 1, 17, 31, 99, 52);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+		&other, 1, 62, 77, 31, 72, &ack), RESOURCE_X_APPLY_BAD_STATE);
 }
 
 static void
@@ -24841,7 +25053,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(373);
+	UT_PLAN(377);
 	/* Observe the actual startup state before any runtime fixture overrides
 	 * the postmaster GUC or initializes shared PCM state and counters. */
 	UT_RUN(test_pcm_grd_max_entries_default_is_minus_one);
@@ -24933,6 +25145,10 @@ main(void)
 	UT_RUN(test_resource_x_remote_admission_is_one_canonical_transaction);
 	UT_RUN(test_resource_x_bootstrap_receipt_drift_invalidates_but_keeps_floor);
 	UT_RUN(test_resource_x_bootstrap_terminal_retire_clears_binding_not_floor);
+	UT_RUN(test_resource_x_preassert_replacement_requires_exact_empty_canonical);
+	UT_RUN(test_resource_x_higher_preassert_attempt_retires_receipt_before_fifo);
+	UT_RUN(test_resource_x_preassert_replacement_keeps_same_lower_and_foreign_receipts);
+	UT_RUN(test_resource_x_preassert_replacement_keeps_consumed_canonical_authority);
 	UT_RUN(test_resource_x_bootstrap_dispatches_one_current_base_at_a_time);
 	UT_RUN(test_resource_x_wait_trace_keeps_exact_master_queue_and_unlocked_logging);
 	UT_RUN(test_resource_x_bootstrap_active_queue_rejects_ingress_drift);
