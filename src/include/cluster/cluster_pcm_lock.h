@@ -1412,7 +1412,9 @@ extern PcmGcsTransitionApplyResult cluster_pcm_lock_read_grant_begin(BufferTag t
 	TimestampTz deadline, bool create, ClusterPcmReadGrant *out);
 extern bool cluster_pcm_lock_read_grant_done(const ClusterPcmReadGrantKey *key,
 	int32 authenticated_sender, bool installed);
-extern bool cluster_pcm_lock_read_grant_holder_done(const ClusterPcmReadGrantKey *key,
+extern bool cluster_pcm_lock_read_grant_holder_done(const ClusterPcmReadGrant *service,
+	int32 authenticated_holder);
+extern bool cluster_pcm_lock_read_grant_holder_failed(const ClusterPcmReadGrant *service,
 	int32 authenticated_holder);
 extern void cluster_pcm_lock_check_shutdown_wait(void);
 extern bool cluster_pcm_lock_read_grant_revoke_ack(const ClusterPcmReadGrantKey *key);

@@ -911,10 +911,10 @@ downgrade_master_notify(BufferTag tag, PcmLockTransition trans, int node, bool r
 	downgrade_master_notify(tag, trans, node, false)
 #define cluster_gcs_send_transition_nowait(tag, trans, node)                                       \
 	downgrade_master_notify(tag, trans, node, true)
-#define cluster_pcm_lock_read_grant_holder_done(key, node)                                        \
-	downgrade_master_notify((key)->tag, PCM_TRANS_X_TO_S_DOWNGRADE, node, false)
-#define cluster_gcs_block_read_grant_holder_notify(key, node)                                      \
-	downgrade_master_notify((key)->tag, PCM_TRANS_X_TO_S_DOWNGRADE, node, true)
+#define cluster_pcm_lock_read_grant_holder_done(service, node)                                    \
+	downgrade_master_notify((service)->key.tag, PCM_TRANS_X_TO_S_DOWNGRADE, node, false)
+#define cluster_gcs_block_read_grant_holder_notify(service, node)                                  \
+	downgrade_master_notify((service)->key.tag, PCM_TRANS_X_TO_S_DOWNGRADE, node, true)
 #define cluster_bufmgr_pcm_x_content_write_permitted(buf)                                          \
 	(cluster_pcm_own_flags_get((buf)->buf_id) == 0)
 #define cluster_itl_page_has_active_slot(page) false

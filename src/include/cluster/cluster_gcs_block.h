@@ -1804,6 +1804,57 @@ GcsBlockForwardPayloadIsFirstFillS(const GcsBlockForwardPayload *p)
 {
 	return p != NULL && p->reserved_0[6] == GCS_BLOCK_FORWARD_KIND_FIRST_FILL_S;
 }
+
+/* First-fill extends the existing family without reusing generic flag bytes. */
+typedef struct GcsBlockFirstFillForwardPayload {
+	GcsBlockForwardPayload forward;
+	uint64 binding_generation;
+	uint32 service_generation;
+	uint32 reserved;
+} GcsBlockFirstFillForwardPayload;
+StaticAssertDecl(sizeof(GcsBlockFirstFillForwardPayload) == 80,
+	"first-fill source service wire size");
+
+static inline bool
+GcsBlockFirstFillForwardPayloadValid(const void *payload, uint32 bytes)
+{
+	const GcsBlockFirstFillForwardPayload *p = payload;
+	const GcsBlockForwardPayload *f;
+	if (p == NULL || bytes != sizeof(*p))
+		return false;
+	f = &p->forward;
+	return GcsBlockForwardPayloadIsFirstFillS(f) && f->transition_id == PCM_TRANS_N_TO_S
+		&& f->request_id != 0 && f->request_id != UINT64_MAX
+		&& f->epoch != 0 && f->epoch != UINT64_MAX
+		&& f->original_requester_node >= 0 && f->original_requester_node < 32
+		&& f->master_node >= 0 && f->master_node < 32 && f->requester_backend_id > 0
+		&& f->reserved_0[0] <= 1 && f->reserved_0[1] == 0 && f->reserved_0[2] == 0
+		&& f->reserved_0[3] == f->reserved_0[0]
+		&& f->reserved_0[4] == 0 && f->reserved_0[5] == 0
+		&& p->binding_generation != 0 && p->binding_generation != UINT64_MAX
+		&& p->service_generation != 0 && p->service_generation != UINT32_MAX
+		&& p->reserved == 0;
+}
+
+static inline bool
+GcsBlockFirstFillForwardPayloadGrant(const GcsBlockFirstFillForwardPayload *p,
+	int32 holder, ClusterPcmReadGrant *grant)
+{
+	if (!GcsBlockFirstFillForwardPayloadValid(p, sizeof(*p)) || grant == NULL
+		|| holder < 0 || holder >= 32 || holder == p->forward.original_requester_node)
+		return false;
+	memset(grant, 0, sizeof(*grant));
+	grant->key.tag = p->forward.tag;
+	grant->key.request_id = p->forward.request_id;
+	grant->key.epoch = p->forward.epoch;
+	grant->key.requester_node = p->forward.original_requester_node;
+	grant->key.backend_id = p->forward.requester_backend_id;
+	grant->binding_generation = p->binding_generation;
+	grant->service_generation = p->service_generation;
+	grant->holder_node = holder;
+	grant->holder_was_x = p->forward.reserved_0[0] != 0;
+	return true;
+}
 static inline bool
 GcsBlockReplyHeaderHasPendingS(const GcsBlockReplyHeader *p)
 {
@@ -1821,15 +1872,28 @@ GcsBlockReplyHeaderHasPendingS(const GcsBlockReplyHeader *p)
 static inline bool
 GcsBlockDonePayloadPendingSKey(const GcsBlockDonePayload *p, ClusterPcmReadGrantKey *key)
 {
+	bool holder_action;
 	if (p == NULL || key == NULL || p->transition_id != PCM_TRANS_N_TO_S
 		|| (p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_CONFIRM
 			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_NACK
 			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_HOLDER
 			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_RETIRED)
 		|| p->reserved_0[1] >= 32 || p->request_id == 0 || p->epoch == 0
-		|| p->requester_backend_id <= 0)
+		|| p->requester_backend_id <= 0 || p->sender_node < 0 || p->sender_node >= 32)
 		return false;
-	for (int i = 2; i < (int)sizeof(p->reserved_0); i++)
+	holder_action = p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_HOLDER
+		|| (p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_NACK
+			&& p->sender_node != p->reserved_0[1]);
+	if (holder_action) {
+		uint64 binding;
+		uint32 generation;
+		memcpy(&binding, &p->reserved_0[2], sizeof(binding));
+		memcpy(&generation, &p->reserved_0[10], sizeof(generation));
+		if (p->sender_node == p->reserved_0[1] || binding == 0 || binding == UINT64_MAX
+			|| generation == 0 || generation == UINT32_MAX || p->reserved_0[14] > 1)
+			return false;
+	}
+	for (int i = holder_action ? 15 : 2; i < (int)sizeof(p->reserved_0); i++)
 		if (p->reserved_0[i] != 0)
 			return false;
 	memset(key, 0, sizeof(*key));
@@ -1842,6 +1906,32 @@ GcsBlockDonePayloadPendingSKey(const GcsBlockDonePayload *p, ClusterPcmReadGrant
 		|| p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_HOLDER
 		|| p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETIRED
 		|| p->sender_node == key->requester_node;
+}
+
+static inline void
+GcsBlockDonePayloadSetPendingSService(GcsBlockDonePayload *p, const ClusterPcmReadGrant *service)
+{
+	memcpy(&p->reserved_0[2], &service->binding_generation, sizeof(uint64));
+	memcpy(&p->reserved_0[10], &service->service_generation, sizeof(uint32));
+	p->reserved_0[14] = service->holder_was_x ? 1 : 0;
+}
+
+static inline bool
+GcsBlockDonePayloadPendingSService(const GcsBlockDonePayload *p, ClusterPcmReadGrant *service)
+{
+	ClusterPcmReadGrantKey key;
+	if (service == NULL || !GcsBlockDonePayloadPendingSKey(p, &key)
+		|| p->sender_node == key.requester_node
+		|| (p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_HOLDER
+			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_NACK))
+		return false;
+	memset(service, 0, sizeof(*service));
+	service->key = key;
+	memcpy(&service->binding_generation, &p->reserved_0[2], sizeof(uint64));
+	memcpy(&service->service_generation, &p->reserved_0[10], sizeof(uint32));
+	service->holder_node = p->sender_node;
+	service->holder_was_x = p->reserved_0[14] != 0;
+	return true;
 }
 static inline void
 GcsBlockInvalidatePayloadSetPendingS(GcsBlockInvalidatePayload *p,
@@ -4154,9 +4244,9 @@ extern bool cluster_bufmgr_downgrade_x_to_s_for_gcs(BufferTag tag);
 extern ClusterBufmgrGcsDowngradeOutcome cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(
 	BufferTag tag, XLogRecPtr *out_page_lsn, char *dst, ClusterBufmgrGcsCopyRefusal *out_refusal);
 extern ClusterBufmgrGcsDowngradeOutcome cluster_bufmgr_first_fill_s_prepare_image(
-	const ClusterPcmReadGrantKey *key, int32 master_node, XLogRecPtr *out_page_lsn,
+	const ClusterPcmReadGrant *service, int32 master_node, XLogRecPtr *out_page_lsn,
 	char *dst, ClusterBufmgrGcsCopyRefusal *out_refusal);
-extern bool cluster_gcs_block_read_grant_holder_notify(const ClusterPcmReadGrantKey *key,
+extern bool cluster_gcs_block_read_grant_holder_notify(const ClusterPcmReadGrant *service,
 	int32 master_node);
 extern bool cluster_bufmgr_pending_s_aborted(BufferTag tag);
 extern bool cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(BufferTag tag, int32 master_node);

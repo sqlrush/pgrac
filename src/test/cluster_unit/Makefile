@@ -12625,6 +12625,8 @@ test_cluster_pcm_first_fill_master.inc: $(top_srcdir)/src/backend/cluster/cluste
 	     END { if (n != 1 || done != 1 || emit) exit 1 }' $< >> $@.tmp
 	awk '/^cluster_gcs_block_pending_s_tick\(/ { print "void"; emit=1; n++ } \
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< >> $@.tmp
+	awk '/^cluster_gcs_handle_block_done_envelope\(/ { print "static void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
 test_cluster_pcm_read_grant: test_cluster_pcm_first_fill_master.inc
 

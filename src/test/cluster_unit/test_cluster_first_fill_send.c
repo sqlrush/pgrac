@@ -50,8 +50,11 @@ static void send_wakeup(int worker pg_attribute_unused()) { }
 
 static void gcs_first_fill_master_tick(int worker pg_attribute_unused()) { }
 static bool
-gcs_block_pending_s_notify_action(const ClusterPcmReadGrantKey *key, int master, uint8 action)
+gcs_block_pending_s_notify_service(const ClusterPcmReadGrant *service, int master, uint8 action)
 {
+	const ClusterPcmReadGrantKey *key = &service->key;
+	UT_ASSERT_EQ(service->binding_generation, 7);
+	UT_ASSERT_EQ(service->service_generation, 1);
 	if (send_cancel_check) UT_ASSERT_EQ(key->request_id, 71);
 	UT_ASSERT_EQ(key->requester_node, 1);
 	UT_ASSERT_EQ(master, 2);
@@ -111,11 +114,14 @@ send_image(BufferTag tag, int requester, bool forwarded, XLogRecPtr *lsn,
 	return true;
 }
 static ClusterBufmgrGcsDowngradeOutcome
-send_prepare(const ClusterPcmReadGrantKey *key, int master, XLogRecPtr *lsn,
+send_prepare(const ClusterPcmReadGrant *service, int master, XLogRecPtr *lsn,
 			 char *bytes, ClusterBufmgrGcsCopyRefusal *refusal)
 {
 	UT_ASSERT(send_downgrade);
-	UT_ASSERT_EQ(key->request_id, 71);
+	UT_ASSERT_EQ(service->key.request_id, 71);
+	UT_ASSERT_EQ(service->binding_generation, 7);
+	UT_ASSERT_EQ(service->service_generation, 1);
+	UT_ASSERT_EQ(service->holder_node, cluster_node_id);
 	UT_ASSERT_EQ(master, 2);
 	UT_ASSERT(!(pg_atomic_read_u32(&transition_buf->state) & BM_IO_IN_PROGRESS));
 	memcpy(bytes, transition_page.data, GCS_BLOCK_DATA_SIZE);
@@ -238,7 +244,6 @@ static struct {
 #define cluster_ic_send_envelope send_frame
 #define cluster_gcs_block_note_send_outcome(...) ((void)0)
 #define gcs_block_note_live_sge_send() ((void)0)
-#define gcs_block_pending_s_notify(key, master, ok) ((void)gcs_block_pending_s_notify_action(key, master, GCS_BLOCK_DONE_PENDING_S_NACK))
 /* This send-ownership fixture exercises the ordinary observation-OFF path. */
 bool cluster_trace_normal_stop = false;
 static void
@@ -252,10 +257,10 @@ send_trace_disabled(void)
 #define ereport(level, rest) do { if ((level) >= ERROR) pg_re_throw(); } while (0)
 #include "test_cluster_first_fill_send.inc"
 
-static GcsBlockForwardPayload
+static GcsBlockFirstFillForwardPayload
 send_setup(BufferDesc *buf, ClusterPcmOwnEntry *entry)
 {
-	GcsBlockForwardPayload fwd = {0};
+	GcsBlockFirstFillForwardPayload fwd = {0};
 	n_predecessor_fixture(buf, entry, BUF_TYPE_XCUR);
 	buf->pcm_state = PCM_STATE_S;
 	pg_atomic_write_u32(&buf->state, BM_TAG_VALID | BM_VALID | BM_DIRTY);
@@ -273,18 +278,20 @@ send_setup(BufferDesc *buf, ClusterPcmOwnEntry *entry)
 	send_borrowed = send_downgrade = false;
 	send_cancel_check = true;
 	send_result = CLUSTER_IC_SEND_NOT_ADMITTED;
-	fwd.tag = buf->tag;
-	fwd.epoch = 1;
-	fwd.request_id = 71;
-	fwd.original_requester_node = 1;
-	fwd.requester_backend_id = 3;
-	fwd.master_node = 2;
-	fwd.transition_id = PCM_TRANS_N_TO_S;
-	fwd.reserved_0[6] = GCS_BLOCK_FORWARD_KIND_FIRST_FILL_S;
+	fwd.forward.tag = buf->tag;
+	fwd.forward.epoch = 1;
+	fwd.forward.request_id = 71;
+	fwd.forward.original_requester_node = 1;
+	fwd.forward.requester_backend_id = 3;
+	fwd.forward.master_node = 2;
+	fwd.forward.transition_id = PCM_TRANS_N_TO_S;
+	fwd.forward.reserved_0[6] = GCS_BLOCK_FORWARD_KIND_FIRST_FILL_S;
+	fwd.binding_generation = 7;
+	fwd.service_generation = 1;
 	return fwd;
 }
 static void
-send_forward(const GcsBlockForwardPayload *fwd)
+send_forward(const GcsBlockFirstFillForwardPayload *fwd)
 {
 	ClusterICEnvelope env = {0};
 	env.source_node_id = 2;
@@ -313,7 +320,7 @@ UT_TEST(actual_handler_retains_rejected_reply_until_transport_admission)
 	BufferDesc buf;
 	ClusterPcmOwnEntry entry;
 	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
-	GcsBlockForwardPayload fwd = send_setup(&buf, &entry);
+	GcsBlockFirstFillForwardPayload fwd = send_setup(&buf, &entry);
 	pg_atomic_write_u32(&buf.state, pg_atomic_read_u32(&buf.state) | BM_IO_IN_PROGRESS);
 	pg_atomic_write_u64(&entry.write_io_generation, 1);
 	send_forward(&fwd);
@@ -344,7 +351,7 @@ UT_TEST(immediate_reply_keeps_owned_bytes_after_sge_release)
 	BufferDesc buf;
 	ClusterPcmOwnEntry entry;
 	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
-	GcsBlockForwardPayload fwd = send_setup(&buf, &entry);
+	GcsBlockFirstFillForwardPayload fwd = send_setup(&buf, &entry);
 	send_borrowed = true;
 	send_forward(&fwd);
 	UT_ASSERT_EQ(send_calls, 1);
@@ -371,7 +378,7 @@ UT_TEST(admitted_would_block_is_never_resubmitted)
 	for (int delayed = 0; delayed <= 1; delayed++) {
 		BufferDesc buf;
 		ClusterPcmOwnEntry entry;
-		GcsBlockForwardPayload fwd = send_setup(&buf, &entry);
+		GcsBlockFirstFillForwardPayload fwd = send_setup(&buf, &entry);
 		if (!delayed) send_result = CLUSTER_IC_SEND_WOULD_BLOCK;
 		send_forward(&fwd);
 		if (delayed) {
@@ -393,9 +400,9 @@ UT_TEST(downgraded_reply_outlives_the_preproduction_generation)
 	BufferDesc buf;
 	ClusterPcmOwnEntry entry;
 	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
-	GcsBlockForwardPayload fwd = send_setup(&buf, &entry);
+	GcsBlockFirstFillForwardPayload fwd = send_setup(&buf, &entry);
 	buf.pcm_state = PCM_STATE_X;
-	fwd.reserved_0[0] = fwd.reserved_0[3] = 1;
+	fwd.forward.reserved_0[0] = fwd.forward.reserved_0[3] = 1;
 	send_downgrade = true;
 	pg_atomic_write_u32(&buf.state, pg_atomic_read_u32(&buf.state) | BM_IO_IN_PROGRESS);
 	pg_atomic_write_u64(&entry.write_io_generation, 1);
@@ -424,7 +431,7 @@ UT_TEST(retained_reply_checks_terminal_identity_and_stop_before_reoffer)
 	for (int reason = 0; reason < 4; reason++) {
 		BufferDesc buf;
 		ClusterPcmOwnEntry entry;
-		GcsBlockForwardPayload fwd = send_setup(&buf, &entry);
+		GcsBlockFirstFillForwardPayload fwd = send_setup(&buf, &entry);
 		send_forward(&fwd);
 		UT_ASSERT_EQ(send_owned(), 1);
 		if (reason == 0) send_epoch++;
@@ -447,7 +454,7 @@ UT_TEST(hard_error_terminates_with_exact_cancellation)
 	for (int delayed = 0; delayed <= 1; delayed++) {
 		BufferDesc buf;
 		ClusterPcmOwnEntry entry;
-		GcsBlockForwardPayload fwd = send_setup(&buf, &entry);
+		GcsBlockFirstFillForwardPayload fwd = send_setup(&buf, &entry);
 		if (!delayed) send_result = CLUSTER_IC_SEND_HARD_ERROR;
 		send_forward(&fwd);
 		if (delayed) {
@@ -469,7 +476,7 @@ UT_TEST(local_backoff_does_not_reoffer_before_the_next_service_tick)
 	BufferDesc buf;
 	ClusterPcmOwnEntry entry;
 	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
-	GcsBlockForwardPayload fwd = send_setup(&buf, &entry);
+	GcsBlockFirstFillForwardPayload fwd = send_setup(&buf, &entry);
 	send_forward(&fwd);
 	UT_ASSERT_EQ(send_owned(), 1);
 	for (int i = 0; i < 100; i++) cluster_gcs_block_first_fill_tick();
@@ -486,21 +493,21 @@ UT_TEST(reply_capacity_cancels_only_new_work_and_preserves_owned_frames)
 	BufferDesc buf;
 	ClusterPcmOwnEntry entry;
 	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
-	GcsBlockForwardPayload fwd = send_setup(&buf, &entry);
+	GcsBlockFirstFillForwardPayload fwd = send_setup(&buf, &entry);
 	send_forward(&fwd);
 	UT_ASSERT_EQ(send_owned(), 1);
 	for (int i = 1; i < 64; i++) {
 		gcs_first_fill_holder_parks[i] = gcs_first_fill_holder_parks[0];
-		gcs_first_fill_holder_parks[i].forward.request_id += i;
+		gcs_first_fill_holder_parks[i].forward.forward.request_id += i;
 	}
 	send_cancel_check = false;
-	fwd.request_id = 900;
+	fwd.forward.request_id = 900;
 	send_forward(&fwd);
 	UT_ASSERT_EQ(send_owned(), 64);
 	UT_ASSERT_EQ(send_calls, 1);
 	UT_ASSERT_EQ(send_nacks, 1);
-	UT_ASSERT_EQ(gcs_first_fill_holder_parks[0].forward.request_id, 71);
-	UT_ASSERT_EQ(gcs_first_fill_holder_parks[63].forward.request_id, 134);
+	UT_ASSERT_EQ(gcs_first_fill_holder_parks[0].forward.forward.request_id, 71);
+	UT_ASSERT_EQ(gcs_first_fill_holder_parks[63].forward.forward.request_id, 134);
 	for (int i = 1; i < 64; i++) gcs_first_fill_holder_parks[i].in_use = false;
 	send_result = CLUSTER_IC_SEND_DONE;
 	send_tick();
@@ -509,10 +516,45 @@ UT_TEST(reply_capacity_cancels_only_new_work_and_preserves_owned_frames)
 	ClusterPcmOwnArray = saved;
 }
 
+UT_TEST(actual_handler_rejects_unbound_and_malformed_first_fill_before_io)
+{
+	for (int bad = 0; bad < 16; bad++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+		GcsBlockFirstFillForwardPayload fwd = send_setup(&buf, &entry);
+		ClusterICEnvelope env = {0};
+		env.source_node_id = 2; env.dest_node_id = cluster_node_id;
+		env.payload_length = sizeof(fwd);
+		switch (bad) {
+		case 0: env.payload_length = sizeof(GcsBlockForwardPayload); break;
+		case 1: env.payload_length--; break;
+		case 2: fwd.binding_generation = 0; break;
+		case 3: fwd.binding_generation = UINT64_MAX; break;
+		case 4: fwd.service_generation = 0; break;
+		case 5: fwd.service_generation = UINT32_MAX; break;
+		case 6: fwd.reserved = 1; break;
+		case 7: fwd.forward.reserved_0[6] = 0; break;
+		case 8: env.source_node_id = 3; break;
+		case 9: env.dest_node_id++; break;
+		case 10: fwd.forward.epoch++; break;
+		case 11: fwd.forward.requester_backend_id = MaxBackends + 1; break;
+		case 12: fwd.forward.request_id = 0; break;
+		case 13: fwd.forward.reserved_0[4] = 1; break;
+		case 14: fwd.forward.reserved_0[1] = 1; break;
+		case 15: fwd.forward.reserved_0[3] = 1; break;
+		}
+		cluster_gcs_handle_block_forward_envelope(&env, &fwd);
+		UT_ASSERT_EQ(send_calls + send_copies + send_nacks + send_owned(), 0);
+		ClusterPcmOwnArray = saved;
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
+	UT_RUN(actual_handler_rejects_unbound_and_malformed_first_fill_before_io);
 	UT_RUN(actual_handler_retains_rejected_reply_until_transport_admission);
 	UT_RUN(immediate_reply_keeps_owned_bytes_after_sge_release);
 	UT_RUN(admitted_would_block_is_never_resubmitted);

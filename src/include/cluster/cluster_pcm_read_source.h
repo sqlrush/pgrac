@@ -60,6 +60,7 @@ typedef struct ClusterPcmReadGrantKey {
 typedef struct ClusterPcmReadGrant {
 	ClusterPcmReadGrantKey key;
 	uint64 binding_generation;
+	uint32 service_generation; /* Source service within this full-key episode. */
 	int32 holder_node; /* -1: disk grant, otherwise existing current/S source. */
 	bool holder_was_x;
 	bool revoking;

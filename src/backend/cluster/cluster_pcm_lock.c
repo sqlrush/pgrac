@@ -708,7 +708,8 @@ typedef struct ClusterPcmPendingS {
 	int32 holder_node;
 	uint8 phase; /* 0 empty, 1 install, 2 revoke, 3 consumed ACK notice owed */
 	uint8 holder_was_x;
-	uint8 reserved[6];
+	uint8 reserved[2];
+	uint32 service_generation;
 } ClusterPcmPendingS;
 StaticAssertDecl(sizeof(ClusterPcmPendingS) == 48, "bounded pending-S identity");
 
@@ -7521,6 +7522,7 @@ pcm_read_grant_state_valid(const ClusterPcmResourceXMasterState *state)
 		}
 		if ((claim->phase != 1 && claim->phase != 2 && claim->phase != 3) || claim->request_id == 0
 			|| claim->request_id == UINT64_MAX || claim->epoch == 0 || claim->epoch == UINT64_MAX
+			|| claim->service_generation == 0 || claim->service_generation == UINT32_MAX
 			|| claim->backend_id <= 0 || claim->backend_id > MaxBackends
 			|| claim->deadline <= 0 || claim->retry_at < 0
 			|| (claim->phase == 1 && claim->retry_at != 0)
@@ -11333,6 +11335,7 @@ pcm_read_grant_snapshot(struct GrdEntry *entry, int node, const ClusterPcmPendin
 	out->key.requester_node = node;
 	out->key.backend_id = claim->backend_id;
 	out->binding_generation = entry->binding_generation;
+	out->service_generation = claim->service_generation;
 	out->holder_node = claim->holder_node;
 	out->holder_was_x = claim->holder_was_x != 0;
 	out->revoking = claim->phase == 2;
@@ -11466,6 +11469,9 @@ cluster_pcm_lock_read_grant_begin(BufferTag tag, int32 requester, int32 backend,
 	claim->backend_id = backend;
 	claim->holder_node = holder;
 	claim->holder_was_x = mode == PCM_STATE_X;
+	/* Replays and cleanup preserve this original source-service identity.
+	 * A later service must be explicitly rebound before any new delivery. */
+	claim->service_generation = 1;
 	claim->deadline = deadline;
 	claim->phase = 1;
 	state->pending_s_bitmap |= bit;
@@ -11477,22 +11483,37 @@ done:
 	return result;
 }
 
-/* A holder notification may arrive after the recipient's DONE. It never
- * addresses a later X at the same node: the original pending key must exist. */
-bool
-cluster_pcm_lock_read_grant_holder_done(const ClusterPcmReadGrantKey *key, int32 holder)
+static bool
+pcm_read_grant_service_matches_locked(struct GrdEntry *entry, const ClusterPcmPendingS *claim,
+	const ClusterPcmReadGrant *service, int32 holder)
 {
+	return claim != NULL && service != NULL && holder >= 0 && holder < 32
+		&& service->holder_node == holder && claim->holder_node == holder
+		&& service->binding_generation == entry->binding_generation
+		&& service->service_generation == claim->service_generation
+		&& service->holder_was_x == (claim->holder_was_x != 0);
+}
+
+/* A holder cannot address a later source service with an episode-only key. */
+bool
+cluster_pcm_lock_read_grant_holder_done(const ClusterPcmReadGrant *service, int32 holder)
+{
+	const ClusterPcmReadGrantKey *key;
 	PcmEntryRef ref;
 	PcmEntryAcquireResult acquired;
 	struct GrdEntry *entry;
 	ClusterPcmPendingS *claim;
 	bool applied = false;
-	if (key == NULL || !pcm_entry_ref_acquire(&key->tag, false, &ref, &acquired))
+	if (service == NULL)
+		return false;
+	key = &service->key;
+	if (!pcm_entry_ref_acquire(&key->tag, false, &ref, &acquired))
 		return false;
 	entry = ref.entry;
 	pcm_entry_lock_exclusive(entry);
 	claim = pcm_read_grant_lookup_locked(entry, key);
-	if (claim != NULL && claim->phase != 3 && claim->holder_was_x && claim->holder_node == holder) {
+	if (pcm_read_grant_service_matches_locked(entry, claim, service, holder)
+		&& claim->phase != 3 && claim->holder_was_x) {
 		PcmState mode = (PcmState)pg_atomic_read_u32(&entry->master_state);
 		if (mode == PCM_STATE_X && entry->x_holder_node == holder) {
 			cluster_pcm_transition_apply(entry, PCM_TRANS_X_TO_S_DOWNGRADE, holder);
@@ -11506,8 +11527,9 @@ cluster_pcm_lock_read_grant_holder_done(const ClusterPcmReadGrantKey *key, int32
 	return applied;
 }
 
-bool
-cluster_pcm_lock_read_grant_done(const ClusterPcmReadGrantKey *key, int32 sender, bool installed)
+static bool
+pcm_read_grant_done_internal(const ClusterPcmReadGrantKey *key, int32 sender, bool installed,
+	const ClusterPcmReadGrant *service)
 {
 	PcmEntryRef ref;
 	PcmEntryAcquireResult acquired;
@@ -11522,7 +11544,9 @@ cluster_pcm_lock_read_grant_done(const ClusterPcmReadGrantKey *key, int32 sender
 	pcm_entry_lock_exclusive(entry);
 	claim = pcm_read_grant_lookup_locked(entry, key);
 	state = pcm_resource_x_master_state_for_entry(entry);
-	if (claim == NULL || claim->phase == 3 || (sender != key->requester_node && (installed || sender != claim->holder_node)))
+	if (claim == NULL || claim->phase == 3
+		|| (sender != key->requester_node
+			&& (installed || !pcm_read_grant_service_matches_locked(entry, claim, service, sender))))
 		goto done;
 	if (!installed) {
 		/* A NACK may race a successful delivery; only revoke ACK can forget it. */
@@ -11556,6 +11580,20 @@ done:
 		ConditionVariableBroadcast(&entry->wait_cv);
 	pcm_entry_ref_release(&ref);
 	return applied;
+}
+
+bool
+cluster_pcm_lock_read_grant_done(const ClusterPcmReadGrantKey *key, int32 sender, bool installed)
+{
+	return pcm_read_grant_done_internal(key, sender, installed, NULL);
+}
+
+bool
+cluster_pcm_lock_read_grant_holder_failed(const ClusterPcmReadGrant *service, int32 holder)
+{
+	if (service == NULL || holder == service->key.requester_node)
+		return false;
+	return pcm_read_grant_done_internal(&service->key, holder, false, service);
 }
 
 /* Consume authority only once. The original bounded claim then owns the

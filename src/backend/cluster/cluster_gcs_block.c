@@ -3218,10 +3218,11 @@ typedef struct GcsReadSourceAttempt {
 static GcsReadSourceAttempt gcs_read_source_attempts[GCS_READ_SOURCE_LEDGER_MAX];
 static bool gcs_read_source_exit_registered;
 
-/* Existing DONE family, asynchronously queued. Master deadline retains debt
- * if notification cannot be admitted or is lost; there is no ACK wait here. */
+/* Existing DONE family, asynchronously queued. Native authority retains debt
+ * until confirmation or exact cleanup; there is no ACK wait here. */
 static bool
-gcs_block_pending_s_notify_action(const ClusterPcmReadGrantKey *key, int master, uint8 action)
+gcs_block_pending_s_notify_action_internal(const ClusterPcmReadGrantKey *key, int master,
+	uint8 action, const ClusterPcmReadGrant *service)
 {
 	GcsBlockDonePayload done;
 	if (master < 0 || master >= 32 || ClusterGcsBlock == NULL)
@@ -3240,6 +3241,8 @@ gcs_block_pending_s_notify_action(const ClusterPcmReadGrantKey *key, int master,
 	done.transition_id = PCM_TRANS_N_TO_S;
 	done.reserved_0[0] = action;
 	done.reserved_0[1] = (uint8)key->requester_node;
+	if (service != NULL)
+		GcsBlockDonePayloadSetPendingSService(&done, service);
 	if (cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_DONE,
 		(uint32)master, &done, sizeof(done))) {
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->done_sent_count, 1);
@@ -3248,6 +3251,22 @@ gcs_block_pending_s_notify_action(const ClusterPcmReadGrantKey *key, int master,
 	else
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->done_enqueue_drop_count, 1);
 	return false;
+}
+
+static bool
+gcs_block_pending_s_notify_action(const ClusterPcmReadGrantKey *key, int master, uint8 action)
+{
+	return gcs_block_pending_s_notify_action_internal(key, master, action, NULL);
+}
+
+static bool
+gcs_block_pending_s_notify_service(const ClusterPcmReadGrant *service, int master, uint8 action)
+{
+	if (service == NULL || service->holder_node != cluster_node_id
+		|| service->holder_node == service->key.requester_node
+		|| (action != GCS_BLOCK_DONE_PENDING_S_HOLDER && action != GCS_BLOCK_DONE_PENDING_S_NACK))
+		return false;
+	return gcs_block_pending_s_notify_action_internal(&service->key, master, action, service);
 }
 
 /* Consumption notice is cleanup, outside the successful acquisition path.
@@ -3282,9 +3301,9 @@ gcs_block_pending_s_notify(const ClusterPcmReadGrantKey *key, int master, bool i
 }
 
 bool
-cluster_gcs_block_read_grant_holder_notify(const ClusterPcmReadGrantKey *key, int32 master)
+cluster_gcs_block_read_grant_holder_notify(const ClusterPcmReadGrant *service, int32 master)
 {
-	return gcs_block_pending_s_notify_action(key, master, GCS_BLOCK_DONE_PENDING_S_HOLDER);
+	return gcs_block_pending_s_notify_service(service, master, GCS_BLOCK_DONE_PENDING_S_HOLDER);
 }
 
 /* Native reservation identity is recorded before the first wire admission. */
@@ -8361,6 +8380,16 @@ gcs_block_forward_send_admitted(int32 holder_node, const GcsBlockForwardPayload 
 	ClusterICSendResult rc
 		= cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, holder_node, fwd, sizeof(*fwd));
 
+	cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_FORWARD, rc);
+	return rc == CLUSTER_IC_SEND_DONE || rc == CLUSTER_IC_SEND_WOULD_BLOCK;
+}
+
+static bool
+gcs_block_first_fill_forward_send_admitted(int32 holder_node,
+	const GcsBlockFirstFillForwardPayload *forward)
+{
+	ClusterICSendResult rc = cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+		holder_node, forward, sizeof(*forward));
 	cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_FORWARD, rc);
 	return rc == CLUSTER_IC_SEND_DONE || rc == CLUSTER_IC_SEND_WOULD_BLOCK;
 }
@@ -18389,10 +18418,11 @@ typedef struct GcsFirstFillMasterPark {
 	bool cancelling;
 	bool ack_consumed;
 	bool registered;
+	bool handed_off;
 	GcsBlockRequestPayload request;
 	GcsBlockDedupKey key;
 	ClusterPcmReadGrant grant;
-	GcsBlockForwardPayload forward;
+	GcsBlockFirstFillForwardPayload forward;
 	GcsBlockReplyHeader disk_reply;
 	TimestampTz retry_at;
 } GcsFirstFillMasterPark;
@@ -18564,9 +18594,9 @@ gcs_first_fill_master_cancel(const ClusterPcmReadGrantKey *key, int worker)
 	return false;
 }
 
-/* This slot owns only an unadmitted frame. Native pending-S remains the
- * authority; its exact binding and source must still cover each send offer.
- * A refused offer is paced locally, never returned as a requester retry. */
+/* Master keeps the service item after the transport takes its bytes. Native
+ * pending-S remains authority through confirmation or exact cleanup. Only an
+ * unadmitted frame may be offered; a refusal is never a requester retry. */
 static void
 gcs_first_fill_master_offer(GcsFirstFillMasterPark *park)
 {
@@ -18574,6 +18604,8 @@ gcs_first_fill_master_offer(GcsFirstFillMasterPark *park)
 	bool admitted;
 	PcmGcsTransitionApplyResult result;
 
+	if (park->handed_off)
+		return;
 	result = cluster_pcm_lock_read_grant_begin(park->request.tag, park->request.sender_node,
 		park->request.requester_backend_id, park->request.request_id, park->request.epoch,
 		GetCurrentTimestamp() + 10000, false, &current);
@@ -18587,6 +18619,7 @@ gcs_first_fill_master_offer(GcsFirstFillMasterPark *park)
 		return;
 	}
 	if (current.binding_generation != park->grant.binding_generation
+		|| current.service_generation != park->grant.service_generation
 		|| current.holder_node != park->grant.holder_node
 		|| current.holder_was_x != park->grant.holder_was_x) {
 		park->retry_at = GetCurrentTimestamp() + 10000;
@@ -18610,15 +18643,14 @@ gcs_first_fill_master_offer(GcsFirstFillMasterPark *park)
 		admitted = park->grant.holder_node == cluster_node_id
 			? cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
 				(uint32)cluster_node_id, &park->forward, sizeof(park->forward))
-			: gcs_block_forward_send_admitted(park->grant.holder_node, &park->forward);
+			: gcs_block_first_fill_forward_send_admitted(park->grant.holder_node, &park->forward);
 		if (admitted)
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
 	}
 	gcs_first_fill_master_trace(&park->request, admitted ? "OUTBOUND_ADMITTED" : "OUTBOUND_WAIT", 0);
 	if (admitted)
-		memset(park, 0, sizeof(*park)); /* Transport/holder plus native claim now own completion. */
-	else
-		park->retry_at = GetCurrentTimestamp() + 10000;
+		park->handed_off = true; /* Bytes moved; the original service still awaits native completion. */
+	park->retry_at = GetCurrentTimestamp() + 10000;
 }
 
 static void
@@ -18638,6 +18670,13 @@ gcs_block_first_fill_request(const GcsBlockRequestPayload *req, const GcsBlockDe
 		if (park->in_use && (park->cancelling || park->registered)
 			&& memcmp(&park->key, key, sizeof(*key)) == 0)
 			return; /* Original local owner handles delivery or cancellation. */
+	}
+	if (!create) {
+		/* A cached marker is not proof that downstream work is absent.
+		 * Only the original admitted MISS may create a service item. Native
+		 * pending-S keeps any unknown reconfiguration/cleanup responsibility. */
+		gcs_first_fill_master_trace(req, "REPLAY_NO_LOCAL_OWNER", 0);
+		return;
 	}
 	/* Reserve outbound responsibility before publishing native S liability.
 	 * Full ingress waiting is separate; never grant without a retained owner. */
@@ -18695,7 +18734,9 @@ gcs_block_first_fill_request(const GcsBlockRequestPayload *req, const GcsBlockDe
 	GcsBlockForwardPayloadSetDowngradeRequest(&fwd, grant.holder_was_x);
 	GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&fwd,
 		cluster_pcm_lock_pi_watermark_scn_query(req->tag));
-	park->forward = fwd;
+	park->forward.forward = fwd;
+	park->forward.binding_generation = grant.binding_generation;
+	park->forward.service_generation = grant.service_generation;
 	memset(&marker, 0, sizeof(marker));
 	marker.request_id = req->request_id;
 	marker.epoch = req->epoch;
@@ -18762,6 +18803,15 @@ gcs_first_fill_master_tick(int worker)
 			}
 			continue;
 		}
+		if (saved.registered && saved.handed_off
+			&& cluster_pcm_lock_read_grant_absent(&saved.grant.key)) {
+			/* Exact native completion can precede this tick or a same-node
+			 * successor. Retirement grants no new service, so closed serving
+			 * gates must not hold an already-completed local item forever. */
+			gcs_first_fill_master_trace(&saved.request, "SERVICE_RETIRED", 0);
+			memset(&gcs_first_fill_master_parks[i], 0, sizeof(saved));
+			continue;
+		}
 		if (saved.request.epoch != cluster_epoch_get_current()
 			|| cluster_normal_stop_requested()) {
 			ClusterPcmReadGrantKey key = {0};
@@ -18769,6 +18819,10 @@ gcs_first_fill_master_tick(int worker)
 			key.epoch = saved.request.epoch; key.requester_node = saved.request.sender_node;
 			key.backend_id = saved.request.requester_backend_id;
 			(void)gcs_first_fill_master_cancel(&key, worker);
+		} else if (saved.handed_off) {
+			/* Transport/holder owns the accepted frame. Observe native
+			 * confirmation without issuing another delivery or selecting a source. */
+			gcs_first_fill_master_parks[i].retry_at = now + 10000;
 		} else {
 			bool pending = false;
 			bool serving = cluster_authority_readiness_managed()
@@ -22149,7 +22203,7 @@ cluster_gcs_block_test_current_mx_forward128(const ClusterICEnvelope *env, const
  * pin/content lock. The master retains pending-S authority through revoke. */
 typedef struct GcsFirstFillHolderPark {
 	bool in_use;
-	GcsBlockForwardPayload forward;
+	GcsBlockFirstFillForwardPayload forward;
 	ClusterPcmFirstFillWait wait;
 	TimestampTz retry_at;
 	uint32 reply_size; /* nonzero: immutable bytes, no resident pin */
@@ -22160,8 +22214,14 @@ static GcsFirstFillHolderPark *gcs_first_fill_resuming;
 static bool gcs_first_fill_resume_retained;
 
 static bool
-gcs_first_fill_same_forward(const GcsBlockForwardPayload *a, const GcsBlockForwardPayload *b)
+gcs_first_fill_same_forward(const GcsBlockFirstFillForwardPayload *left,
+	const GcsBlockFirstFillForwardPayload *right)
 {
+	const GcsBlockForwardPayload *a = &left->forward, *b = &right->forward;
+	if (left->binding_generation != right->binding_generation
+		|| left->service_generation != right->service_generation
+		|| a->reserved_0[0] != b->reserved_0[0])
+		return false;
 	return a->request_id == b->request_id && a->epoch == b->epoch
 		&& a->original_requester_node == b->original_requester_node
 		&& a->requester_backend_id == b->requester_backend_id
@@ -22169,30 +22229,27 @@ gcs_first_fill_same_forward(const GcsBlockForwardPayload *a, const GcsBlockForwa
 }
 
 static void
-gcs_first_fill_holder_cancel(const GcsBlockForwardPayload *fwd)
+gcs_first_fill_holder_cancel(const GcsBlockFirstFillForwardPayload *forward)
 {
-	ClusterPcmReadGrantKey key = {0};
-	key.tag = fwd->tag;
-	key.request_id = fwd->request_id;
-	key.epoch = fwd->epoch;
-	key.requester_node = fwd->original_requester_node;
-	key.backend_id = fwd->requester_backend_id;
-	(void)gcs_block_pending_s_notify_action(&key, fwd->master_node,
+	ClusterPcmReadGrant service;
+	if (!GcsBlockFirstFillForwardPayloadGrant(forward, cluster_node_id, &service))
+		return;
+	(void)gcs_block_pending_s_notify_service(&service, forward->forward.master_node,
 		GCS_BLOCK_DONE_PENDING_S_NACK);
-	gcs_block_forward_reply_immediate_deny(fwd);
+	gcs_block_forward_reply_immediate_deny(&forward->forward);
 }
 
 /* Capture before the SGE API can release borrowed page storage, including
  * on NOT_ADMITTED. The bounded holder lot owns this exact frame until the
  * transport takes it or the original request is explicitly cancelled. */
 static GcsFirstFillHolderPark *
-gcs_first_fill_holder_reply(const GcsBlockForwardPayload *fwd, const char *header,
+gcs_first_fill_holder_reply(const GcsBlockFirstFillForwardPayload *forward, const char *header,
 							uint32 header_size, const char *payload)
 {
 	GcsFirstFillHolderPark *slot = NULL;
 	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
 		GcsFirstFillHolderPark *park = &gcs_first_fill_holder_parks[i];
-		if (park->in_use && gcs_first_fill_same_forward(&park->forward, fwd)) {
+		if (park->in_use && gcs_first_fill_same_forward(&park->forward, forward)) {
 			slot = park;
 			break;
 		}
@@ -22201,11 +22258,11 @@ gcs_first_fill_holder_reply(const GcsBlockForwardPayload *fwd, const char *heade
 	}
 	if (slot == NULL || header_size < sizeof(GcsBlockReplyHeader)
 		|| header_size > sizeof(GcsBlockReplyHeaderV2)) {
-		gcs_first_fill_holder_cancel(fwd);
+		gcs_first_fill_holder_cancel(forward);
 		return NULL;
 	}
 	if (!slot->in_use || slot->reply_size == 0) {
-		slot->forward = *fwd;
+		slot->forward = *forward;
 		memcpy(slot->reply, header, header_size);
 		memcpy(slot->reply + header_size, payload != NULL ? payload : header + header_size,
 			GCS_BLOCK_DATA_SIZE);
@@ -22222,8 +22279,8 @@ static void
 gcs_first_fill_holder_sent(GcsFirstFillHolderPark *park, ClusterICSendResult result)
 {
 	if (result == CLUSTER_IC_SEND_NOT_ADMITTED) {
-		cluster_block_io_trace_note(park->forward.tag, "FIRST_FILL_HOLDER_SEND_WAIT",
-			park->forward.request_id, 0, park->reply_size);
+		cluster_block_io_trace_note(park->forward.forward.tag, "FIRST_FILL_HOLDER_SEND_WAIT",
+			park->forward.forward.request_id, 0, park->reply_size);
 		return;
 	}
 	/* DONE and WOULD_BLOCK both transfer frame ownership. A hard failure is
@@ -22238,8 +22295,9 @@ gcs_first_fill_holder_sent(GcsFirstFillHolderPark *park, ClusterICSendResult res
  * content refusal, retain that same request locally. A duplicate cannot
  * replace either the IO witness or the accepted requester identity. */
 static bool
-gcs_first_fill_holder_park(const GcsBlockForwardPayload *fwd, bool content_busy)
+gcs_first_fill_holder_park(const GcsBlockFirstFillForwardPayload *forward, bool content_busy)
 {
+	const GcsBlockForwardPayload *fwd = &forward->forward;
 	ClusterPcmFirstFillWait wait;
 	int free_slot = -1;
 	int worker = cluster_ic_tier1_my_data_channel();
@@ -22250,7 +22308,7 @@ gcs_first_fill_holder_park(const GcsBlockForwardPayload *fwd, bool content_busy)
 				free_slot = i;
 			continue;
 		}
-		if (gcs_first_fill_same_forward(&park->forward, fwd)) {
+		if (gcs_first_fill_same_forward(&park->forward, forward)) {
 			if (park == gcs_first_fill_resuming) {
 				if (content_busy)
 					gcs_first_fill_resume_retained = true;
@@ -22264,10 +22322,10 @@ gcs_first_fill_holder_park(const GcsBlockForwardPayload *fwd, bool content_busy)
 	if (!content_busy && (wait.write_io_generation & 1) == 0)
 		return false;
 	if (free_slot < 0) {
-		gcs_first_fill_holder_cancel(fwd);
+		gcs_first_fill_holder_cancel(forward);
 		return true;
 	}
-	gcs_first_fill_holder_parks[free_slot].forward = *fwd;
+	gcs_first_fill_holder_parks[free_slot].forward = *forward;
 	gcs_first_fill_holder_parks[free_slot].reply_size = 0;
 	gcs_first_fill_holder_parks[free_slot].wait = wait;
 	gcs_first_fill_holder_parks[free_slot].retry_at = GetCurrentTimestamp();
@@ -22282,6 +22340,8 @@ void
 cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const void *payload)
 {
 	const GcsBlockForwardPayload *fwd;
+	const GcsBlockFirstFillForwardPayload *first_fill = NULL;
+	ClusterPcmReadGrant first_fill_service;
 	char block_buf[GCS_BLOCK_DATA_SIZE];
 	const char *block_payload = NULL;
 	uint32 block_payload_lkey = 0;
@@ -22317,7 +22377,9 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		return;
 	if (gcs_block_try_r4_forward96(env, payload))
 		return;
-	if (env == NULL || payload == NULL || env->payload_length != sizeof(GcsBlockForwardPayload)) {
+	if (env == NULL || payload == NULL
+		|| (env->payload_length != sizeof(GcsBlockForwardPayload)
+			&& env->payload_length != sizeof(GcsBlockFirstFillForwardPayload))) {
 		gcs_block_read_image_ingress_reject_trace(env, payload, true, "holder.shape_refused",
 			env == NULL ? "forward.envelope_present"
 			: payload == NULL ? "forward.payload_present" : "forward.payload_size");
@@ -22326,21 +22388,19 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 
 	cluster_sf_dep_vec_reset(&sf_dep_vec);
 	fwd = (const GcsBlockForwardPayload *)payload;
-	if (GcsBlockForwardPayloadIsFirstFillS(fwd)) {
+	if (env->payload_length == sizeof(GcsBlockFirstFillForwardPayload)) {
 		uint64 session;
-		if (fwd->master_node != (int32)env->source_node_id
+		first_fill = payload;
+		if (!GcsBlockFirstFillForwardPayloadGrant(first_fill, cluster_node_id, &first_fill_service)
+			|| env->dest_node_id != (uint32)cluster_node_id
+			|| fwd->master_node != (int32)env->source_node_id
 			|| fwd->epoch != cluster_epoch_get_current()
 			|| cluster_gcs_lookup_master(fwd->tag) != fwd->master_node
 			|| !gcs_block_pcm_x_authenticated_session(fwd->master_node, fwd->epoch, &session)
-			|| fwd->transition_id != PCM_TRANS_N_TO_S
-			|| fwd->original_requester_node < 0 || fwd->original_requester_node >= 32
-			|| fwd->requester_backend_id <= 0 || fwd->requester_backend_id > MaxBackends
-			|| fwd->request_id == 0 || fwd->reserved_0[0] > 1
-			|| fwd->reserved_0[1] != 0 || fwd->reserved_0[2] != 0
-			|| fwd->reserved_0[3] != fwd->reserved_0[0]
-			|| fwd->reserved_0[4] != 0 || fwd->reserved_0[5] != 0)
+			|| fwd->requester_backend_id > MaxBackends)
 			return;
-	}
+	} else if (GcsBlockForwardPayloadIsFirstFillS(fwd))
+		return; /* An episode-only legacy frame cannot authorize this service. */
 	if (GcsBlockForwardPayloadIsCurrentMxRuntime(fwd)
 		|| fwd->reserved_0[6] == GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS)
 		return;
@@ -22512,7 +22572,7 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	}
 
 	if (GcsBlockForwardPayloadIsFirstFillS(fwd)
-		&& gcs_first_fill_holder_park(fwd, false))
+		&& gcs_first_fill_holder_park(first_fill, false))
 		return;
 
 	/* Decide the holder-eviction fault before any irreversible downgrade.
@@ -22543,14 +22603,8 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 			&& !cluster_injection_should_skip("cluster-gcs-block-remote-downgrade"))
 			{
 			if (GcsBlockForwardPayloadIsFirstFillS(fwd)) {
-				ClusterPcmReadGrantKey grant_key = { 0 };
-				grant_key.tag = fwd->tag;
-				grant_key.request_id = fwd->request_id;
-				grant_key.epoch = fwd->epoch;
-				grant_key.requester_node = fwd->original_requester_node;
-				grant_key.backend_id = fwd->requester_backend_id;
 				remote_downgrade_outcome = cluster_bufmgr_first_fill_s_prepare_image(
-					&grant_key, fwd->master_node, &page_lsn, block_buf, &copy_refusal);
+					&first_fill_service, fwd->master_node, &page_lsn, block_buf, &copy_refusal);
 			} else
 				remote_downgrade_outcome = cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(
 					fwd->tag, fwd->master_node, &page_lsn, block_buf, &copy_refusal);
@@ -22571,7 +22625,7 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		&& !holder_evicted_injected
 		&& (copy_refusal == CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_FIRST
 			|| copy_refusal == CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_SECOND)
-		&& gcs_first_fill_holder_park(fwd, true))
+		&& gcs_first_fill_holder_park(first_fill, true))
 		return;
 	/* First-fill can consume only a durable S. A replay may find H already
 	 * downgraded; anything still X/busy refuses rather than shipping one-shot. */
@@ -22607,7 +22661,7 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		&& !holder_evicted_injected
 		&& (copy_refusal == CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_FIRST
 			|| copy_refusal == CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_SECOND)
-		&& gcs_first_fill_holder_park(fwd, true))
+		&& gcs_first_fill_holder_park(first_fill, true))
 		return;
 
 	/* Build reply (header + 8KB block or zero pad) and direct-ship to
@@ -22949,7 +23003,7 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	if (GcsBlockForwardPayloadIsFirstFillS(fwd)) {
 		/* Copy the complete frame before the SGE API releases borrowed
 		 * storage. Denials retain their original zero pad and checksum. */
-		reply_park = gcs_first_fill_holder_reply(fwd, buf, header_len,
+		reply_park = gcs_first_fill_holder_reply(first_fill, buf, header_len,
 			GcsBlockReplyHeaderHasPendingS(hdr) ? block_payload : NULL);
 		if (reply_park == NULL) {
 			gcs_block_release_ship_image(block_payload_release_cb, block_payload_release_arg);
@@ -23006,13 +23060,8 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	if (reply_park != NULL)
 		gcs_first_fill_holder_sent(reply_park, send_rc);
 	if (GcsBlockForwardPayloadIsFirstFillS(fwd) && !GcsBlockReplyHeaderHasPendingS(hdr)) {
-		ClusterPcmReadGrantKey key = { 0 };
-		key.tag = fwd->tag;
-		key.request_id = fwd->request_id;
-		key.epoch = fwd->epoch;
-		key.requester_node = fwd->original_requester_node;
-		key.backend_id = fwd->requester_backend_id;
-		gcs_block_pending_s_notify(&key, fwd->master_node, false);
+		(void)gcs_block_pending_s_notify_service(&first_fill_service, fwd->master_node,
+			GCS_BLOCK_DONE_PENDING_S_NACK);
 	}
 	/* PGRAC: spec-5.59 D3 — close the holder-forward read-image ship scope
 	 * (no-op unless the read-image branch above started it). */
@@ -23046,7 +23095,7 @@ cluster_gcs_block_first_fill_tick(void)
 		 * change cannot invalidate its independent bytes. Before production
 		 * the original native resident/IO witness remains mandatory. */
 		ready = park->reply_size != 0 ? 1 : cluster_bufmgr_first_fill_wait_ready(&park->wait);
-		if (ready < 0 || park->forward.epoch != cluster_epoch_get_current()
+		if (ready < 0 || park->forward.forward.epoch != cluster_epoch_get_current()
 			|| cluster_normal_stop_requested()) {
 			park->in_use = false; /* no producer/delivery can be in flight here */
 			park->reply_size = 0;
@@ -23058,9 +23107,9 @@ cluster_gcs_block_first_fill_tick(void)
 			ClusterICSendResult send_rc;
 			if (park->reply_size < sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE
 				|| park->reply_size > sizeof(park->reply)
-				|| cluster_gcs_lookup_master(park->forward.tag) != park->forward.master_node
-				|| !gcs_block_pcm_x_authenticated_session(park->forward.master_node,
-					park->forward.epoch, &session)) {
+				|| cluster_gcs_lookup_master(park->forward.forward.tag) != park->forward.forward.master_node
+				|| !gcs_block_pcm_x_authenticated_session(park->forward.forward.master_node,
+					park->forward.forward.epoch, &session)) {
 				park->in_use = false;
 				park->reply_size = 0;
 				gcs_first_fill_holder_cancel(&park->forward);
@@ -23072,7 +23121,7 @@ cluster_gcs_block_first_fill_tick(void)
 			/* Use real transport admission again. No synthetic receive
 			 * envelope, source re-copy, or requester REQUEST is involved. */
 			send_rc = cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
-				park->forward.original_requester_node, park->reply, park->reply_size);
+				park->forward.forward.original_requester_node, park->reply, park->reply_size);
 			cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY, send_rc);
 			gcs_first_fill_holder_sent(park, send_rc);
 			continue;
@@ -23080,7 +23129,7 @@ cluster_gcs_block_first_fill_tick(void)
 		if (ready == 0 || now < park->retry_at)
 			continue;
 		park->retry_at = now + 10000;
-		env.source_node_id = (uint32)park->forward.master_node;
+		env.source_node_id = (uint32)park->forward.forward.master_node;
 		env.dest_node_id = (uint32)cluster_node_id;
 		env.payload_length = sizeof(park->forward);
 		gcs_first_fill_resuming = park;
@@ -23362,10 +23411,16 @@ cluster_gcs_handle_block_done_envelope(const ClusterICEnvelope *env, const void 
 				cluster_epoch_get_current(), &session)
 			|| (installed && done->epoch != cluster_epoch_get_current()))
 			return;
-		if (done->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_HOLDER) {
+		if (done->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_HOLDER
+			|| (!installed && done->sender_node != grant_key.requester_node)) {
+			ClusterPcmReadGrant service;
 			bool applied = done->epoch == cluster_epoch_get_current()
-				&& cluster_pcm_lock_read_grant_holder_done(&grant_key, done->sender_node);
-			cluster_block_io_trace_pending_s(&grant_key, "HOLDER_DONE", -1,
+				&& GcsBlockDonePayloadPendingSService(done, &service)
+				&& (done->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_HOLDER
+					? cluster_pcm_lock_read_grant_holder_done(&service, done->sender_node)
+					: cluster_pcm_lock_read_grant_holder_failed(&service, done->sender_node));
+			cluster_block_io_trace_pending_s(&grant_key,
+				done->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_HOLDER ? "HOLDER_DONE" : "HOLDER_NACK", -1,
 				done->sender_node, 0, applied);
 			return;
 		}
