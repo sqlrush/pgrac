@@ -2476,6 +2476,8 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_vacuum_observed_bounds.inc test_cluster_vacuum_freeze_bound_observer.inc \
 		test_cluster_vacuum_admitted_phase.inc \
 		test_cluster_vacuum_proof_owner.inc \
+		test_cluster_vacuum_resident_recheck.inc \
+		test_cluster_vacuum_resident_release.inc \
 		test_cluster_freeze_writer_context.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) test_cluster_heap_maintenance_policy.inc unit_test.h \
 		test_cluster_heap_borrowed_pin.inc $(top_srcdir)/src/include/storage/bufmgr.h \
 		test_cluster_vacuum_freeze_locators.inc \
@@ -10453,9 +10455,24 @@ test_cluster_vacuum_proof_owner.inc: $(top_srcdir)/src/backend/access/heap/vacuu
 	     emit { print } /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# The original recent-resident proof recheck, including its local cleanup.
+test_cluster_vacuum_resident_recheck.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/^lazy_recheck_shared_freeze_page\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Original read/hint local-unlock/unpin pairs; mutation already comes from
+# test_cluster_freeze_writer_context.inc, with no duplicate definition.
+test_cluster_vacuum_resident_release.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^ClusterUnlockReleaseBufferAfterConditional(Read|Hint)\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 .PHONY: clean-vacuum-proof-owner
 clean-vacuum-proof-owner:
 	rm -f test_cluster_vacuum_proof_owner.inc test_cluster_vacuum_proof_owner.inc.tmp
+	rm -f test_cluster_vacuum_resident_recheck.inc test_cluster_vacuum_resident_recheck.inc.tmp
+	rm -f test_cluster_vacuum_resident_release.inc test_cluster_vacuum_resident_release.inc.tmp
 
 clean distclean maintainer-clean: clean-vacuum-proof-owner
 

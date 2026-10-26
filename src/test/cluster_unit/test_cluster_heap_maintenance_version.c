@@ -126,6 +126,9 @@ static bool recent_pin_allowed, recent_pin_error;
 static bool recent_caller_local_x, recent_caller_writer, recent_caller_share;
 static bool recent_pin_held;
 static bool phase_pin_released;
+static bool phase_use_original_resident;
+static bool phase_resident_completed;
+static unsigned phase_resident_expected_resumes;
 static int32 recent_caller_pins;
 
 /* The original path owns one pin. The recent entry temporarily adds exactly
@@ -2142,6 +2145,7 @@ reset(uint8 opcode, bool shared)
 	recent_pin_allowed = true; recent_pin_error = false; recent_pin_admission = NULL;
 	recent_caller_local_x = recent_caller_writer = recent_caller_share = recent_pin_held = false;
 	recent_caller_pins = 0; phase_pin_released = false;
+	phase_use_original_resident = false;
 	writer_state = PCM_STATE_X;
 	route_holder = 11;
 	route_master = 12;
@@ -9742,6 +9746,7 @@ UT_TEST(test_census_original_durable_publish_then_retirement_keeps_old_native_ca
 typedef struct LVRelState
 {
 	Relation rel;
+	ClusterSpaceIdentity identity;
 	uint64 shared_freeze_proof_calls, shared_freeze_proof_requests;
 	uint64 shared_freeze_proof_exchanges;
 	bool shared_freeze_proof_cost_incomplete;
@@ -9785,7 +9790,10 @@ bounds_assert_unlocked(void)
 {
 	UT_ASSERT(!local_x && !local_share && backend_pin_count == fixture_expected_backend_pins());
 	UT_ASSERT_EQ(CritSectionCount, 0);
-	UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes, 0);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	UT_ASSERT_EQ(conditional_resumes,
+		phase_use_original_resident && phase_resident_completed
+		? phase_resident_expected_resumes : 0);
 }
 
 /* Acquisition now executes the original local fold, worker publication getter,
@@ -11943,12 +11951,22 @@ phase_retained_resolve(const ClusterTxLocator *locator, SCN scn,
 }
 
 static ClusterHeapFreezeProofStatusV1
+phase_real_resident_recheck(LVRelState *, Buffer, const PcmAuthoritySnapshot *,
+	const ClusterSemanticAdmissionToken *, ClusterHeapFreezeProofBatchV1 *,
+	const ClusterTxResolution *, uint8, ClusterHeapFreezeFinalFenceV1 *, bool *, bool *);
+
+static ClusterHeapFreezeProofStatusV1
 phase_resident_recheck(LVRelState *v, Buffer buffer,
 	const PcmAuthoritySnapshot *authority, const ClusterSemanticAdmissionToken *token,
-	const ClusterHeapFreezeProofBatchV1 *proofs, const ClusterTxResolution *retained,
+	ClusterHeapFreezeProofBatchV1 *proofs, const ClusterTxResolution *retained,
 	uint8 retained_mask, ClusterHeapFreezeFinalFenceV1 *current,
 	bool *cleaned, bool *rows_current)
 {
+	if (phase_use_original_resident) {
+		phase_rechecks++;
+		return phase_real_resident_recheck(v, buffer, authority, token, proofs,
+			retained, retained_mask, current, cleaned, rows_current);
+	}
 	(void)retained;
 	UT_ASSERT(v != NULL && buffer == 1);
 	UT_ASSERT(bounds_borrowed_admission != NULL
@@ -14757,10 +14775,211 @@ UT_TEST(test_real_outer_collector_reuse_refusal_retires_previous_observations)
 	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
 }
 
+/* Execute the original resident recheck and all three original paired releases.
+ * Recent-buffer mapping/pin counts remain the existing explicit leaf. Hint
+ * publication is unavailable here: its false-only provider cannot mutate/WAL.
+ * Original hint publication is covered in the independent page-owner cases. */
+#include "test_cluster_vacuum_resident_release.inc"
+static unsigned phase_resident_releases[3], phase_resident_hint_calls;
+static bool phase_resident_hint_error;
+
+static void
+phase_resident_release_read(Buffer buffer)
+{
+	phase_resident_releases[0]++;
+	ClusterUnlockReleaseBufferAfterConditionalRead(buffer);
+}
+
+static void
+phase_resident_release_hint(Buffer buffer)
+{
+	phase_resident_releases[1]++;
+	ClusterUnlockReleaseBufferAfterConditionalHint(buffer);
+}
+
+static void
+phase_resident_release_mutation(Buffer buffer)
+{
+	phase_resident_releases[2]++;
+	ClusterUnlockReleaseBufferAfterConditionalMutation(buffer);
+}
+
+static bool
+phase_resident_hint_unavailable(LVRelState *v, Buffer buffer,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterTxResolution *retained, uint8 retained_mask)
+{
+	(void)retained;
+	UT_ASSERT(v != NULL && buffer == 1 && proofs->proof_count > 0);
+	UT_ASSERT(local_x && backend_pin_count == 1);
+	UT_ASSERT(bounds_expected_admission()->entered && bounds_original_backend_has_admission());
+	UT_ASSERT_EQ(retained_mask, 0);
+	phase_resident_hint_calls++;
+	if (phase_resident_hint_error) elog(ERROR, "injected resident hint preparation ERROR");
+	return false;
+}
+
+static void
+phase_resident_census_error_at_pin(void)
+{
+	UT_ASSERT(recent_pin_held && backend_pin_count == 1 && !local_x);
+	UT_ASSERT(bounds_expected_admission()->entered);
+	bounds_admission_error_kind = 1;
+}
+
+static bool
+phase_resident_original_census_current(const ClusterSemanticAdmissionToken *token)
+{
+	UT_ASSERT(token == bounds_expected_admission() && token->entered);
+	UT_ASSERT(local_x && backend_pin_count == 1);
+	return bounds_original_census_current(token);
+}
+
+#define lazy_cleanout_shared_freeze_page phase_resident_hint_unavailable
+#define cluster_semantic_activation_recheck_r4_terminal_census phase_resident_original_census_current
+#define ClusterUnlockReleaseBufferAfterConditionalRead phase_resident_release_read
+#define ClusterUnlockReleaseBufferAfterConditionalHint phase_resident_release_hint
+#define ClusterUnlockReleaseBufferAfterConditionalMutation phase_resident_release_mutation
+#define lazy_recheck_shared_freeze_page phase_actual_resident_recheck
+#include "test_cluster_vacuum_resident_recheck.inc"
+#undef lazy_recheck_shared_freeze_page
+#undef ClusterUnlockReleaseBufferAfterConditionalMutation
+#undef ClusterUnlockReleaseBufferAfterConditionalHint
+#undef ClusterUnlockReleaseBufferAfterConditionalRead
+#undef cluster_semantic_activation_recheck_r4_terminal_census
+#undef lazy_cleanout_shared_freeze_page
+
+static ClusterHeapFreezeProofStatusV1
+phase_real_resident_recheck(LVRelState *v, Buffer buffer,
+	const PcmAuthoritySnapshot *authority, const ClusterSemanticAdmissionToken *token,
+	ClusterHeapFreezeProofBatchV1 *proofs, const ClusterTxResolution *retained,
+	uint8 retained_mask, ClusterHeapFreezeFinalFenceV1 *current,
+	bool *cleaned, bool *rows_current)
+{
+	volatile ClusterHeapFreezeProofStatusV1 result = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
+
+	UT_ASSERT_EQ(backend_pin_count, 0);
+	UT_ASSERT(!local_x && !local_share && !resumed_writer);
+	recent_caller_pins = 0;
+	recent_caller_local_x = recent_caller_share = recent_caller_writer = false;
+	recent_pin_admission = token;
+	native_original_admission_enabled = true;
+	native_admission_expected_token = token;
+	native_admission_stage = 4;
+	phase_pin_released = false;
+	PG_TRY();
+	{
+		result = phase_actual_resident_recheck(v, buffer, authority, token,
+			proofs, retained, retained_mask, current, cleaned, rows_current);
+	}
+	PG_FINALLY();
+	{
+		UT_ASSERT_EQ(backend_pin_count, 0);
+		UT_ASSERT(!recent_pin_held && !local_x && !resumed_writer);
+		phase_resident_completed = true;
+		phase_pin_released = true;
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static void
+phase_real_resident_setup(QualifiedXminFixture *f, LVRelState *v,
+	ClusterHeapFreezeXminTargetV1 targets[3], bool batch, bool writer)
+{
+	proof_owner_setup(f, v, targets, batch);
+	phase_use_original_resident = true;
+	phase_resident_completed = false;
+	phase_resident_expected_resumes = writer ? 1 : 0;
+	phase_resident_hint_error = false;
+	phase_resident_hint_calls = 0;
+	memset(phase_resident_releases, 0, sizeof(phase_resident_releases));
+	v->identity = space_identity;
+	v->shared_freeze_input.writer_context_valid = writer;
+	relation_data.rd_isvalid = resume_allowed = true;
+}
+
+UT_TEST(test_original_resident_recheck_unpins_before_real_outer_admission_leave)
+{
+	for (unsigned writer = 0; writer < 2; writer++) {
+		for (unsigned batch = 0; batch < 2; batch++) {
+			QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+			phase_real_resident_setup(&f, &v, targets, batch != 0, writer != 0);
+			UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+			UT_ASSERT_EQ(phase_rechecks, 1);
+			UT_ASSERT_EQ(recent_pin_calls, 1); UT_ASSERT_EQ(recent_unpins, 1);
+			UT_ASSERT_EQ(phase_resident_hint_calls, 1);
+			UT_ASSERT_EQ(phase_resident_releases[0], 0);
+			UT_ASSERT_EQ(phase_resident_releases[1], writer ? 0 : 1);
+			UT_ASSERT_EQ(phase_resident_releases[2], writer ? 1 : 0);
+			UT_ASSERT_EQ(conditional_resumes, writer ? 1 : 0);
+			UT_ASSERT_EQ(conditional_unlocks, 0);
+			UT_ASSERT_EQ(local_unlocks, 1);
+			UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, batch ? 3 : 1);
+			proof_owner_assert_released(&v, true);
+		}
+	}
+}
+
+UT_TEST(test_original_resident_refusals_release_only_their_pin_before_outer_leave)
+{
+	for (unsigned writer = 0; writer < 2; writer++) {
+		for (unsigned fault = 0; fault < 4; fault++) {
+			QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+			phase_real_resident_setup(&f, &v, targets, false, writer != 0);
+			if (fault == 0) recent_pin_allowed = false;
+			if (fault == 1) resume_allowed = false;
+			if (fault == 2) authority_current = false;
+			if (fault == 3) relation_data.rd_isvalid = false;
+			if (fault == 0 || fault == 3) phase_resident_expected_resumes = 0;
+			UT_ASSERT(proof_owner_collect(&v, 1) != CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+			UT_ASSERT_EQ(recent_pin_calls, fault == 3 ? 0 : 1);
+			UT_ASSERT_EQ(recent_unpins, fault == 0 || fault == 3 ? 0 : 1);
+			UT_ASSERT_EQ(phase_resident_hint_calls, 0);
+			UT_ASSERT_EQ(phase_resident_releases[0], !writer && fault == 2 ? 1 : 0);
+			UT_ASSERT_EQ(phase_resident_releases[1], 0);
+			UT_ASSERT_EQ(phase_resident_releases[2], writer && fault == 2 ? 1 : 0);
+			UT_ASSERT(!v.shared_freeze_fence_valid);
+			UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 0);
+			proof_owner_assert_released(&v, true);
+		}
+	}
+}
+
+UT_TEST(test_original_resident_errors_unpin_before_real_outer_error_propagation)
+{
+	QualifiedXminFixture *f = malloc(sizeof(*f));
+	LVRelState *v = malloc(sizeof(*v));
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	UT_ASSERT(f != NULL && v != NULL);
+	for (unsigned writer = 0; writer < 2; writer++) {
+		for (unsigned stage = 0; stage < 3; stage++) {
+			phase_real_resident_setup(f, v, targets, true, writer != 0);
+			if (stage == 0) recent_pin_error = true;
+			if (stage == 1) recent_pin_observer = phase_resident_census_error_at_pin;
+			if (stage == 2) phase_resident_hint_error = true;
+			expecting_error = true;
+			if (setjmp(error_jump) == 0) {
+				(void)proof_owner_collect(v, 1);
+				UT_ASSERT(false);
+			}
+			expecting_error = false;
+			recent_pin_observer = NULL;
+			UT_ASSERT_EQ(phase_rechecks, 1);
+			UT_ASSERT_EQ(recent_unpins, stage == 0 ? 0 : 1);
+			UT_ASSERT_EQ(phase_resident_releases[0], !writer && stage == 1 ? 1 : 0);
+			UT_ASSERT_EQ(phase_resident_releases[1], !writer && stage == 2 ? 1 : 0);
+			UT_ASSERT_EQ(phase_resident_releases[2], writer && stage != 0 ? 1 : 0);
+			proof_owner_assert_released(v, true);
+		}
+	}
+	free(v); free(f);
+}
+
 int
 main(void)
 {
-	UT_PLAN(319);
+	UT_PLAN(322);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -15087,6 +15306,10 @@ main(void)
 
 	UT_RUN(test_real_outer_collector_result_cannot_outlive_its_original_admission);
 	UT_RUN(test_real_outer_collector_reuse_refusal_retires_previous_observations);
+
+	UT_RUN(test_original_resident_recheck_unpins_before_real_outer_admission_leave);
+	UT_RUN(test_original_resident_refusals_release_only_their_pin_before_outer_leave);
+	UT_RUN(test_original_resident_errors_unpin_before_real_outer_error_propagation);
 
 	UT_DONE();
 	return ut_failed_count != 0;
