@@ -300,12 +300,15 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			&& !IsA(statement, CreateSchemaStmt) && !IsA(statement, CreateSeqStmt)
 			&& !IsA(statement, IndexStmt) && !IsA(statement, ViewStmt)
 			&& !IsA(statement, RenameStmt) && !IsA(statement, AlterObjectSchemaStmt)
-			&& !IsA(statement, TruncateStmt)))
+			&& !IsA(statement, GrantStmt) && !IsA(statement, GrantRoleStmt)
+			&& !IsA(statement, AlterDefaultPrivilegesStmt) && !IsA(statement, TruncateStmt)))
 		return;
 
 	if (IsA(statement, TruncateStmt))
 		action = "truncation";
-	else if (IsA(statement, RenameStmt) || IsA(statement, AlterObjectSchemaStmt))
+	else if (IsA(statement, RenameStmt) || IsA(statement, AlterObjectSchemaStmt)
+			 || IsA(statement, GrantStmt) || IsA(statement, GrantRoleStmt)
+			 || IsA(statement, AlterDefaultPrivilegesStmt))
 		action = "alteration";
 	else
 		action = "creation";

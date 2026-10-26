@@ -285,6 +285,12 @@ CreateCommandTag(Node *statement)
 	/* This boundary models the table rename/schema-move cases below. */
 	if (IsA(statement, RenameStmt) || IsA(statement, AlterObjectSchemaStmt))
 		return CMDTAG_ALTER_TABLE;
+	if (IsA(statement, GrantStmt))
+		return ((GrantStmt *)statement)->is_grant ? CMDTAG_GRANT : CMDTAG_REVOKE;
+	if (IsA(statement, GrantRoleStmt))
+		return ((GrantRoleStmt *)statement)->is_grant ? CMDTAG_GRANT_ROLE : CMDTAG_REVOKE_ROLE;
+	if (IsA(statement, AlterDefaultPrivilegesStmt))
+		return CMDTAG_ALTER_DEFAULT_PRIVILEGES;
 	return IsA(statement, CreateTableAsStmt) ? CMDTAG_CREATE_TABLE_AS : CMDTAG_CREATE_TABLE;
 }
 
@@ -303,6 +309,16 @@ GetCommandTagName(CommandTag tag)
 		return "CREATE VIEW";
 	if (tag == CMDTAG_ALTER_TABLE)
 		return "ALTER TABLE";
+	if (tag == CMDTAG_GRANT)
+		return "GRANT";
+	if (tag == CMDTAG_REVOKE)
+		return "REVOKE";
+	if (tag == CMDTAG_GRANT_ROLE)
+		return "GRANT ROLE";
+	if (tag == CMDTAG_REVOKE_ROLE)
+		return "REVOKE ROLE";
+	if (tag == CMDTAG_ALTER_DEFAULT_PRIVILEGES)
+		return "ALTER DEFAULT PRIVILEGES";
 	return tag == CMDTAG_CREATE_TABLE_AS ? "CREATE TABLE AS" : "CREATE TABLE";
 }
 
@@ -1433,8 +1449,20 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 	RenameStmt rename
 		= { .type = T_RenameStmt, .renameType = OBJECT_TABLE, .relationType = OBJECT_TABLE };
 	AlterObjectSchemaStmt move = { .type = T_AlterObjectSchemaStmt, .objectType = OBJECT_TABLE };
-	Node *statements[] = { (Node *)&schema, (Node *)&sequence, (Node *)&index,
-						   (Node *)&view,	(Node *)&rename,   (Node *)&move };
+	GrantStmt grant = { .type = T_GrantStmt,
+						.is_grant = true,
+						.targtype = ACL_TARGET_OBJECT,
+						.objtype = OBJECT_TABLE };
+	GrantRoleStmt role = { .type = T_GrantRoleStmt, .is_grant = true };
+	GrantStmt default_action = { .type = T_GrantStmt,
+								 .is_grant = true,
+								 .targtype = ACL_TARGET_DEFAULTS,
+								 .objtype = OBJECT_TABLE };
+	AlterDefaultPrivilegesStmt defaults
+		= { .type = T_AlterDefaultPrivilegesStmt, .action = &default_action };
+	Node *statements[]
+		= { (Node *)&schema, (Node *)&sequence, (Node *)&index, (Node *)&view,	  (Node *)&rename,
+			(Node *)&move,	 (Node *)&grant,	(Node *)&role,	(Node *)&defaults };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned skip = 0; skip < 2; skip++) {
@@ -1443,6 +1471,8 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 			schema.if_not_exists = sequence.if_not_exists = skip != 0;
 			index.if_not_exists = index.unique = view.replace = skip != 0;
 			rename.missing_ok = move.missing_ok = skip != 0;
+			grant.is_grant = role.is_grant = default_action.is_grant = skip == 0;
+			grant.targtype = skip ? ACL_TARGET_ALL_IN_SCHEMA : ACL_TARGET_OBJECT;
 			create_sql_entry(statements[i]);
 			UT_ASSERT_EQ(utility_unbound, 0);
 			UT_ASSERT_EQ(utility_after_preflight, 1);
@@ -1465,11 +1495,16 @@ UT_TEST(test_schema_binds_before_catalog_children_and_children_reuse_top)
 	CreateSeqStmt sequence = { .type = T_CreateSeqStmt };
 	IndexStmt index = { .type = T_IndexStmt };
 	ViewStmt view = { .type = T_ViewStmt };
-	ListCell cells[4] = { { .ptr_value = &table },
+	GrantStmt grant = { .type = T_GrantStmt,
+						.is_grant = true,
+						.targtype = ACL_TARGET_OBJECT,
+						.objtype = OBJECT_TABLE };
+	ListCell cells[5] = { { .ptr_value = &table },
 						  { .ptr_value = &sequence },
 						  { .ptr_value = &index },
-						  { .ptr_value = &view } };
-	List children = { .type = T_List, .length = 4, .max_length = 4, .elements = cells };
+						  { .ptr_value = &view },
+						  { .ptr_value = &grant } };
+	List children = { .type = T_List, .length = 5, .max_length = 5, .elements = cells };
 	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt, .schemaElts = &children };
 
 	reset_create_preflight();
@@ -1484,10 +1519,11 @@ UT_TEST(test_schema_binds_before_catalog_children_and_children_reuse_top)
 	create_sql_entry((Node *)&sequence);
 	create_sql_entry((Node *)&index);
 	create_sql_entry((Node *)&view);
+	create_sql_entry((Node *)&grant);
 	UT_ASSERT_EQ(utility_unbound, 0);
-	UT_ASSERT_EQ(utility_after_preflight, 5);
+	UT_ASSERT_EQ(utility_after_preflight, 6);
 	UT_ASSERT_EQ(utility_xids, 1);
-	UT_ASSERT_EQ(utility_prepares, 5);
+	UT_ASSERT_EQ(utility_prepares, 6);
 	UT_ASSERT_EQ(utility_binds, 1);
 }
 
@@ -1500,8 +1536,20 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 	RenameStmt rename
 		= { .type = T_RenameStmt, .renameType = OBJECT_TABLE, .relationType = OBJECT_TABLE };
 	AlterObjectSchemaStmt move = { .type = T_AlterObjectSchemaStmt, .objectType = OBJECT_TABLE };
-	Node *statements[] = { (Node *)&schema, (Node *)&sequence, (Node *)&index,
-						   (Node *)&view,	(Node *)&rename,   (Node *)&move };
+	GrantStmt grant = { .type = T_GrantStmt,
+						.is_grant = true,
+						.targtype = ACL_TARGET_OBJECT,
+						.objtype = OBJECT_TABLE };
+	GrantRoleStmt role = { .type = T_GrantRoleStmt, .is_grant = true };
+	GrantStmt default_action = { .type = T_GrantStmt,
+								 .is_grant = true,
+								 .targtype = ACL_TARGET_DEFAULTS,
+								 .objtype = OBJECT_TABLE };
+	AlterDefaultPrivilegesStmt defaults
+		= { .type = T_AlterDefaultPrivilegesStmt, .action = &default_action };
+	Node *statements[]
+		= { (Node *)&schema, (Node *)&sequence, (Node *)&index, (Node *)&view,	  (Node *)&rename,
+			(Node *)&move,	 (Node *)&grant,	(Node *)&role,	(Node *)&defaults };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -1529,8 +1577,20 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 	RenameStmt rename
 		= { .type = T_RenameStmt, .renameType = OBJECT_TABLE, .relationType = OBJECT_TABLE };
 	AlterObjectSchemaStmt move = { .type = T_AlterObjectSchemaStmt, .objectType = OBJECT_TABLE };
-	Node *statements[] = { (Node *)&schema, (Node *)&sequence, (Node *)&index,
-						   (Node *)&view,	(Node *)&rename,   (Node *)&move };
+	GrantStmt grant = { .type = T_GrantStmt,
+						.is_grant = true,
+						.targtype = ACL_TARGET_OBJECT,
+						.objtype = OBJECT_TABLE };
+	GrantRoleStmt role = { .type = T_GrantRoleStmt, .is_grant = true };
+	GrantStmt default_action = { .type = T_GrantStmt,
+								 .is_grant = true,
+								 .targtype = ACL_TARGET_DEFAULTS,
+								 .objtype = OBJECT_TABLE };
+	AlterDefaultPrivilegesStmt defaults
+		= { .type = T_AlterDefaultPrivilegesStmt, .action = &default_action };
+	Node *statements[]
+		= { (Node *)&schema, (Node *)&sequence, (Node *)&index, (Node *)&view,	  (Node *)&rename,
+			(Node *)&move,	 (Node *)&grant,	(Node *)&role,	(Node *)&defaults };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned child = 0; child < 2; child++) {
@@ -1564,8 +1624,20 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 	RenameStmt rename
 		= { .type = T_RenameStmt, .renameType = OBJECT_TABLE, .relationType = OBJECT_TABLE };
 	AlterObjectSchemaStmt move = { .type = T_AlterObjectSchemaStmt, .objectType = OBJECT_TABLE };
-	Node *statements[] = { (Node *)&schema, (Node *)&sequence, (Node *)&index,
-						   (Node *)&view,	(Node *)&rename,   (Node *)&move };
+	GrantStmt grant = { .type = T_GrantStmt,
+						.is_grant = true,
+						.targtype = ACL_TARGET_OBJECT,
+						.objtype = OBJECT_TABLE };
+	GrantRoleStmt role = { .type = T_GrantRoleStmt, .is_grant = true };
+	GrantStmt default_action = { .type = T_GrantStmt,
+								 .is_grant = true,
+								 .targtype = ACL_TARGET_DEFAULTS,
+								 .objtype = OBJECT_TABLE };
+	AlterDefaultPrivilegesStmt defaults
+		= { .type = T_AlterDefaultPrivilegesStmt, .action = &default_action };
+	Node *statements[]
+		= { (Node *)&schema, (Node *)&sequence, (Node *)&index, (Node *)&view,	  (Node *)&rename,
+			(Node *)&move,	 (Node *)&grant,	(Node *)&role,	(Node *)&defaults };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned mode = 0; mode < 8; mode++) {
@@ -1591,10 +1663,23 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 	RenameStmt rename
 		= { .type = T_RenameStmt, .renameType = OBJECT_TABLE, .relationType = OBJECT_TABLE };
 	AlterObjectSchemaStmt move = { .type = T_AlterObjectSchemaStmt, .objectType = OBJECT_TABLE };
-	Node *statements[] = { (Node *)&schema, (Node *)&sequence, (Node *)&index,
-						   (Node *)&view,	(Node *)&rename,   (Node *)&move };
+	GrantStmt grant = { .type = T_GrantStmt,
+						.is_grant = true,
+						.targtype = ACL_TARGET_OBJECT,
+						.objtype = OBJECT_TABLE };
+	GrantRoleStmt role = { .type = T_GrantRoleStmt, .is_grant = true };
+	GrantStmt default_action = { .type = T_GrantStmt,
+								 .is_grant = true,
+								 .targtype = ACL_TARGET_DEFAULTS,
+								 .objtype = OBJECT_TABLE };
+	AlterDefaultPrivilegesStmt defaults
+		= { .type = T_AlterDefaultPrivilegesStmt, .action = &default_action };
+	Node *statements[]
+		= { (Node *)&schema, (Node *)&sequence, (Node *)&index, (Node *)&view,	  (Node *)&rename,
+			(Node *)&move,	 (Node *)&grant,	(Node *)&role,	(Node *)&defaults };
 	const char *tags[] = { "CREATE SCHEMA", "CREATE SEQUENCE", "CREATE INDEX",
-						   "CREATE VIEW",	"ALTER TABLE",	   "ALTER TABLE" };
+						   "CREATE VIEW",	"ALTER TABLE",	   "ALTER TABLE",
+						   "GRANT",			"GRANT ROLE",	   "ALTER DEFAULT PRIVILEGES" };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned parallel = 0; parallel < 2; parallel++) {
