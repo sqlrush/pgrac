@@ -2082,6 +2082,18 @@ test_cluster_heap_freeze_cohort_current.inc: $(top_srcdir)/src/backend/cluster/c
 	     END { if (found != 2 || done != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Original local observation fold and its before/after-end-clock guards.
+test_cluster_heap_freeze_cohort_observe.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c Makefile
+	@awk '/^typedef struct UndoHorizonV2MaintenanceObservation / { types=1; typecount++ } \
+	     types { print } /^} UndoHorizonV2MaintenanceObservation;/ { types=0 } \
+	     /^undo_horizon_local_source_current\(/ { print "static bool"; emit=1; found++ } \
+	     /^undo_horizon_v2_cohort_current\(/ { print "static ClusterHeapFreezeCohortStatus"; emit=1; found++ } \
+	     /^undo_horizon_v2_cohort_observe\(/ { seen++; if (seen == 2) { print "static ClusterHeapFreezeCohortStatus"; emit=1; found++ } } \
+	     /^cluster_heap_freeze_cohort_observe\(/ { print "static ClusterHeapFreezeCohortStatus"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (typecount != 1 || types || seen != 2 || found != 4 || done != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 # Original source-current predicate, private to the native writer fixture.
 test_cluster_heap_freeze_policy_current.inc: $(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c Makefile
 	@awk '/^cluster_heap_freeze_policy_sample_current_v1\(/ { print "static bool"; emit=1; found++ } \
@@ -2248,6 +2260,8 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		$(top_srcdir)/src/include/utils/memutils.h \
 		test_cluster_heap_freeze_cohort_current.inc \
 		test_cluster_heap_freeze_cohort_backend.inc \
+		test_cluster_heap_freeze_cohort_observe.inc \
+		$(top_srcdir)/src/include/cluster/cluster_undo_retention.h \
 		test_cluster_heap_freeze_worker_current.inc \
 		test_cluster_heap_freeze_worker_getter.inc \
 		test_cluster_heap_freeze_worker_publisher.inc \
@@ -5167,6 +5181,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_freeze_policy_sample.inc test_cluster_heap_freeze_policy_sample.inc.tmp
 	rm -f test_cluster_heap_freeze_cohort_current.inc test_cluster_heap_freeze_cohort_current.inc.tmp
 	rm -f test_cluster_heap_freeze_cohort_backend.inc test_cluster_heap_freeze_cohort_backend.inc.tmp
+	rm -f test_cluster_heap_freeze_cohort_observe.inc test_cluster_heap_freeze_cohort_observe.inc.tmp
 	rm -f test_cluster_heap_freeze_worker_current.inc test_cluster_heap_freeze_worker_current.inc.tmp
 	rm -f test_cluster_heap_freeze_worker_getter.inc test_cluster_heap_freeze_worker_getter.inc.tmp
 	rm -f test_cluster_heap_freeze_worker_publisher.inc test_cluster_heap_freeze_worker_publisher.inc.tmp
