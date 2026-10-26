@@ -8,6 +8,7 @@ use FindBin;
 use lib "$FindBin::RealBin/../../perl";
 use lib "$FindBin::RealBin/../pre2";
 use M2CanonicalCases qw(run_cases);
+use M2CanonicalRollover qw(rollover_workload check_rollover_budget);
 use PostgreSQL::Test::ClusterPRE2;
 use PostgreSQL::Test::Utils qw(slurp_file);
 use Test::More;
@@ -131,19 +132,21 @@ $a->safe_psql('postgres',q{
  CREATE FUNCTION test_pgrac_m2_guards_clear() RETURNS boolean
  AS '$libdir/test_pgrac_shared_config', 'test_pgrac_m2_guards_clear'
  LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+ CREATE FUNCTION test_pgrac_m2_limits() RETURNS text
+ AS '$libdir/test_pgrac_shared_config', 'test_pgrac_m2_limits'
+ LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
  REVOKE ALL ON FUNCTION test_pgrac_native_itl_trace() FROM PUBLIC;
  REVOKE ALL ON FUNCTION test_pgrac_m2_sample(text,regclass,integer,xid) FROM PUBLIC;
  REVOKE ALL ON FUNCTION test_pgrac_m2_guards_clear() FROM PUBLIC;
+ REVOKE ALL ON FUNCTION test_pgrac_m2_limits() FROM PUBLIC;
 });
 
-# Real DATA rollover is induced with one ordinary transaction. The padding
+# Request enough DATA for rollover in one ordinary transaction. The padding
 # is stored inline; no TT/UBA/generation setter or forced rollover is used.
 # The exact caller still has to be witnessed; a failed rollover is NOT_REACHED.
-$a->safe_psql('postgres',q{SET cluster.trace_tx_identity=off;
- CREATE TABLE m2_roll(id int,v int,pad text);
- ALTER TABLE m2_roll ALTER pad SET STORAGE PLAIN;
- INSERT INTO m2_roll SELECT i,0,repeat(md5(i::text),215) FROM generate_series(1,10000)i;
-},timeout=>180);
+my $rollover=rollover_workload();
+save_json('rollover-workload',$rollover);
+$a->safe_psql('postgres',$rollover->{setup_sql},timeout=>180);
 $a->safe_psql('postgres','VACUUM(FREEZE) m2_roll');
 $a->safe_psql('postgres','CHECKPOINT');
 
@@ -191,9 +194,23 @@ run_cases(\@matrix,sub {
   $w->query_safe("BEGIN; UPDATE $table SET v=20 WHERE id=1");
   my $xid=0+$w->query_safe('SELECT pg_current_xact_id()::text');
   @{$cell}{qw(xid producer_pid reader_pid)}=($xid,$wpid,$rpid);
-  $cell->{stage}='rollover' if $caller eq 'sample_canonical';
+  $cell->{stage}='rollover_preflight' if $caller eq 'sample_canonical';
   save_json("context-$number",$cell);
   if($caller eq 'sample_canonical') {
+   # Measure this producer's actual input and policy before the ordinary
+   # UPDATE. Preserve raw facts even if preflight fails this isolated cell.
+   my $limits=decode_json($w->query_safe('SELECT test_pgrac_m2_limits()'));
+   $w->query_safe('SET cluster.trace_tx_identity=off');
+   my $stats=decode_json($w->query_safe(q{SELECT json_build_object(
+    'rows',count(*),'min_tuple_bytes',min(pg_column_size(r)),
+    'max_tuple_bytes',max(pg_column_size(r))) FROM m2_roll r}));
+   $w->query_safe('SET cluster.trace_tx_identity=on');
+   $cell->{rollover_limits}=$limits;
+   $cell->{rollover_stats}=$stats;
+   save_json("rollover-budget-$number",{limits=>$limits,stats=>$stats,authoritative=>JSON::PP::false});
+   $cell->{rollover_budget}=check_rollover_budget($limits,$stats);
+   $cell->{stage}='rollover';
+   save_json("context-$number",$cell);
    $w->query_safe("SET cluster.trace_tx_identity=off; UPDATE m2_roll SET v=v+1; SET cluster.trace_tx_identity=on; UPDATE $table SET v=21 WHERE id=1");
   }
   my $before=decode_json($a->safe_psql('postgres','SELECT test_pgrac_native_itl_trace()'));

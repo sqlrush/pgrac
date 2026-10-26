@@ -25,12 +25,15 @@
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_tx_resolve.h"
+#include "cluster/cluster_undo_record.h"
+#include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #endif
 
 PG_FUNCTION_INFO_V1(test_pgrac_m2_sample);
 PG_FUNCTION_INFO_V1(test_pgrac_m2_guards_clear);
+PG_FUNCTION_INFO_V1(test_pgrac_m2_limits);
 
 static void
 check_reader(void)
@@ -45,6 +48,30 @@ check_reader(void)
 #else
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("native visibility diagnostics require --enable-cluster")));
+#endif
+}
+
+Datum
+test_pgrac_m2_limits(PG_FUNCTION_ARGS)
+{
+	check_reader();
+#ifdef USE_PGRAC_CLUSTER
+	{
+		StringInfoData out;
+
+		initStringInfo(&out);
+		appendStringInfo(
+			&out,
+			"{\"segment_bytes\":%u,\"inline_capacity_bytes\":%d,"
+			"\"update_payload_header_bytes\":%u,\"record_header_bytes\":%u,"
+			"\"history_trailer_bytes\":%u,\"record_hard_cap_bytes\":%u,\"authoritative\":false}",
+			(uint32)UNDO_SEGMENT_SIZE_BYTES, cluster_undo_record_inline_max_bytes,
+			(uint32)sizeof(UndoUpdatePayload), (uint32)sizeof(UndoRecordHeader),
+			(uint32)sizeof(UndoItlHistoryTrailer), (uint32)UNDO_RECORD_HARD_CAP_BYTES);
+		PG_RETURN_TEXT_P(cstring_to_text(out.data));
+	}
+#else
+	PG_RETURN_NULL();
 #endif
 }
 
