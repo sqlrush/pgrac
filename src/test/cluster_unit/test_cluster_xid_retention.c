@@ -339,10 +339,128 @@ UT_TEST(retention_preserves_original_stop_and_lease_gates)
 	UT_ASSERT_EQ(retention_acquires + extensions + native_publish_count, 0);
 }
 
+static unsigned retention_guard_callback_calls;
+static bool retention_guard_callback_locked;
+static uint64 retention_guard_candidate;
+
+static void
+retention_guard_callback(void *argument)
+{
+	const ClusterRelmapRetentionDirectory *directory = argument;
+
+	retention_guard_callback_calls++;
+	retention_guard_callback_locked = held && retention_held
+		&& directory->last_issued == retention_guard_candidate;
+}
+
+UT_TEST(retention_guard_refuses_caller_lock_context_without_consuming_pins)
+{
+	for (unsigned variant = 0; variant < 4; variant++)
+		for (unsigned context = 0; context < 3; context++) {
+		uint64 first = ((variant / 2 ? UINT64CONST(7) : 0) << 32) + 2052;
+		unsigned origin = variant % 2 ? CLUSTER_MAX_NODES - 1 : 0;
+		ClusterRelmapOwnerSampleV2 sample;
+		ClusterRelmapRetentionDirectory *directory;
+		ClusterRelmapRetentionDirectory saved;
+		VariableCacheData native;
+		PGPROC process;
+		unsigned acquisitions, holdoff;
+		bool captured;
+
+		caller_fixture(first, origin);
+		captured = cluster_relmap_owner_capture_v2(&sample);
+		UT_ASSERT(captured);
+		if (!captured) return;
+		UT_ASSERT_EQ(caller_begin(&sample, true), CLUSTER_RELMAP_RETENTION_OK);
+		UT_ASSERT_EQ(caller_begin(&sample, false), CLUSTER_RELMAP_RETENTION_OK);
+		directory = &relmap_runtime_shmem->directories[origin];
+		saved = *directory;
+		native = variables;
+		process = *MyProc;
+		retention_guard_callback_calls = 0;
+		retention_guard_callback_locked = false;
+		/* Neither lock; retention alone (as at original owner begin); or
+		 * both locks. Only XidGen alone is a valid allocator entry. */
+		retention_owner_begin = true;
+		if (context == 2) LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
+		if (context != 0) LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
+		acquisitions = retention_acquires;
+		holdoff = InterruptHoldoffCount;
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_allocation_check_v2(
+			retention_sysid, retention_dbinc, origin, first + 1),
+			CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_allocation_publish_v2(
+			retention_sysid, retention_dbinc, origin, first + 1,
+			retention_guard_callback, directory), CLUSTER_RELMAP_RETENTION_UNAVAILABLE);
+		UT_ASSERT_EQ(retention_guard_callback_calls, 0);
+		UT_ASSERT_EQ(retention_acquires, acquisitions);
+		UT_ASSERT_EQ(InterruptHoldoffCount, holdoff);
+		UT_ASSERT_EQ(held, context == 2);
+		UT_ASSERT_EQ(retention_held, context != 0);
+		UT_ASSERT_EQ(memcmp(directory, &saved, sizeof(saved)), 0);
+		UT_ASSERT_EQ(memcmp(&variables, &native, sizeof(native)), 0);
+		UT_ASSERT_EQ(memcmp(MyProc, &process, sizeof(process)), 0);
+		if (retention_held) LWLockRelease(&relmap_runtime_shmem->lock);
+		if (held) LWLockRelease(XidGenLock);
+		retention_owner_begin = false;
+		UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+		UT_ASSERT_EQ(lock_errors + caller_owner_lock_errors, 0);
+	}
+}
+
+UT_TEST(retention_guard_valid_entry_observes_under_both_locks_and_returns_only_its_lock)
+{
+	for (unsigned variant = 0; variant < 4; variant++) {
+		uint64 first = ((variant / 2 ? UINT64CONST(7) : 0) << 32) + 2052;
+		unsigned origin = variant % 2 ? CLUSTER_MAX_NODES - 1 : 0;
+		ClusterRelmapOwnerSampleV2 sample;
+		ClusterRelmapRetentionDirectory *directory;
+		ClusterRelmapRetentionDirectory expected;
+		VariableCacheData native;
+		unsigned acquisitions;
+		bool captured;
+
+		caller_fixture(first, origin);
+		captured = cluster_relmap_owner_capture_v2(&sample);
+		UT_ASSERT(captured);
+		if (!captured) return;
+		UT_ASSERT_EQ(caller_begin(&sample, true), CLUSTER_RELMAP_RETENTION_OK);
+		UT_ASSERT_EQ(caller_begin(&sample, false), CLUSTER_RELMAP_RETENTION_OK);
+		directory = &relmap_runtime_shmem->directories[origin];
+		expected = *directory;
+		native = variables;
+		retention_guard_callback_calls = 0;
+		retention_guard_callback_locked = false;
+		retention_guard_candidate = first + 1;
+		acquisitions = retention_acquires;
+		LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_allocation_check_v2(
+			retention_sysid, retention_dbinc, origin, first + 1), CLUSTER_RELMAP_RETENTION_OK);
+		UT_ASSERT(held && !retention_held);
+		UT_ASSERT_EQ(memcmp(directory, &expected, sizeof(expected)), 0);
+		UT_ASSERT_EQ(cluster_relmap_retention_runtime_allocation_publish_v2(
+			retention_sysid, retention_dbinc, origin, first + 1,
+			retention_guard_callback, directory), CLUSTER_RELMAP_RETENTION_OK);
+		UT_ASSERT_EQ(retention_guard_callback_calls, 1);
+		UT_ASSERT(retention_guard_callback_locked);
+		UT_ASSERT_EQ(retention_acquires, acquisitions + 2);
+		UT_ASSERT(held && !retention_held);
+		UT_ASSERT_EQ(InterruptHoldoffCount, 1);
+		expected.last_issued = first + 1;
+		UT_ASSERT_EQ(memcmp(directory, &expected, sizeof(expected)), 0);
+		/* The nofail callback above observes only: it is no actual-issuance
+		 * receipt and cannot alter the native counter or ProcArray. */
+		UT_ASSERT_EQ(memcmp(&variables, &native, sizeof(native)), 0);
+		LWLockRelease(XidGenLock);
+		UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+		UT_ASSERT_EQ(lock_errors + caller_owner_lock_errors, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(21);
 	UT_RUN(native_subxid_publication_preserves_the_final_cache_slot);
 	UT_RUN(native_publication_keeps_the_full_era_across_raw_rollover);
 	UT_RUN(no_storage_or_procarray_mutation_before_reservation);
@@ -362,6 +480,8 @@ main(void)
 	UT_RUN(original_xact_stack_keeps_top_pin_and_parent_order);
 	UT_RUN(original_xact_admission_guards_precede_native_assignment);
 	UT_RUN(original_xact_failure_keeps_unassigned_top_and_existing_pin);
+	UT_RUN(retention_guard_refuses_caller_lock_context_without_consuming_pins);
+	UT_RUN(retention_guard_valid_entry_observes_under_both_locks_and_returns_only_its_lock);
 	free(relmap_runtime_shmem);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
