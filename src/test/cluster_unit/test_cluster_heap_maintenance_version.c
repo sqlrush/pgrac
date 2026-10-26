@@ -8734,7 +8734,10 @@ ack_test_barrier(ClusterCtrcTestBarrierPhase barrier)
 #define ProcessInterrupts ack_process_interrupts
 static volatile sig_atomic_t ack_interrupt_pending;
 static void ack_process_interrupts(void) { UT_ASSERT(false); }
+#define ctrc_scan_participant_relock original_ack_scan_participant_relock
+#include "test_cluster_heap_ctrc_g_scan_relock.inc"
 #include "test_cluster_heap_ctrc_ack.inc"
+#undef ctrc_scan_participant_relock
 #undef ProcessInterrupts
 #undef InterruptPending
 #undef cluster_ctrc_test_barrier_wait
@@ -9024,7 +9027,11 @@ original_origin_reply_trace_clock(void)
 #define ForEachLWLockHeldByMe original_origin_reply_trace_locks
 #define GetCurrentTimestamp original_origin_reply_trace_clock
 #endif
+#define ctrc_origin_required_ack_snapshot_entry original_origin_reply_required_ack_snapshot_entry
+#include "test_cluster_heap_ctrc_g_required_ack_decl.inc"
 #include "test_cluster_heap_ctrc_origin_reply.inc"
+#include "test_cluster_heap_ctrc_g_required_ack_body.inc"
+#undef ctrc_origin_required_ack_snapshot_entry
 #if defined(CLUSTER_CTRC_ORIGIN_REPLY_TRACE_PRESENT) && defined(CLUSTER_CTRC_LOCAL_BATCH_REPLY_TRACE_PRESENT)
 #undef GetCurrentTimestamp
 #undef ForEachLWLockHeldByMe
