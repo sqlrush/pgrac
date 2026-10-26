@@ -18494,7 +18494,9 @@ gcs_block_first_fill_request(const GcsBlockRequestPayload *req, const GcsBlockDe
 	 * Full ingress waiting is separate; never grant without a retained owner. */
 	park = gcs_first_fill_master_park(req, key);
 	if (park == NULL) {
-		gcs_first_fill_master_deny(req, key, worker, GCS_BLOCK_REPLY_DENIED_DEDUP_FULL, create);
+		/* Ingress checks local capacity before dedup admission. Internal
+		 * callers retain their existing owner; capacity is not a denial. */
+		gcs_first_fill_master_trace(req, "MASTER_CAPACITY_WAIT", 0);
 		return;
 	}
 	result = cluster_pcm_lock_read_grant_begin(req->tag, req->sender_node,
@@ -18513,6 +18515,60 @@ gcs_block_first_fill_request(const GcsBlockRequestPayload *req, const GcsBlockDe
 	park->registered = true;
 	park->grant = grant;
 	gcs_first_fill_master_prepare(park, worker);
+}
+
+/* The routed LMS alone mutates its local parks. Dedup lookup and flag
+ * pinning cannot dispatch another frame or tick, so this read-only capacity
+ * check stays valid until the original MISS publishes its local owner. */
+static void
+gcs_block_first_fill_ingress(const ClusterICEnvelope *env, const GcsBlockRequestPayload *req,
+	const GcsBlockDedupKey *key, int worker)
+{
+	GcsBlockDedupEntry cached = {0};
+	GcsBlockDedupResult result;
+	bool capacity = false;
+
+	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
+		const GcsFirstFillMasterPark *park = &gcs_first_fill_master_parks[i];
+		if (!park->in_use || memcmp(&park->key, key, sizeof(*key)) == 0) {
+			capacity = true;
+			break;
+		}
+	}
+	if (!capacity) {
+		/* Do not create an in-flight dedup duplicate with no local owner. */
+		gcs_first_fill_master_trace(req, "INGRESS_MASTER_FULL", 0);
+		cluster_ic_dispatch_defer(env);
+		return;
+	}
+	result = cluster_gcs_block_dedup_lookup_or_register(worker, key, req->tag,
+		req->transition_id, GcsBlockRequestPayloadGetLifetimeHintMs(req),
+		cluster_sf_peer_supports_gcs_done(req->sender_node), &cached);
+	if (result == GCS_BLOCK_DEDUP_FULL) {
+		gcs_first_fill_master_trace(req, "INGRESS_DEDUP_FULL", 0);
+		cluster_ic_dispatch_defer(env);
+		return;
+	}
+	if (result == GCS_BLOCK_DEDUP_VALIDATION_FAIL
+		|| !cluster_gcs_block_dedup_set_request_flags_exact(worker, key, &req->tag,
+			req->transition_id, GCS_BLOCK_DEDUP_REQUEST_F_READ_MISS)) {
+		gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT,
+			InvalidXLogRecPtr, NULL);
+		return;
+	}
+	if (result == GCS_BLOCK_DEDUP_MISS_REGISTERED
+		|| result == GCS_BLOCK_DEDUP_FORWARDED_DUPLICATE
+		|| (result == GCS_BLOCK_DEDUP_CACHED_REPLY
+			&& GcsBlockReplyHeaderHasPendingS(&cached.reply_header))) {
+		gcs_first_fill_master_trace(req, "INGRESS", result);
+		gcs_block_first_fill_request(req, key, worker,
+			result == GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	} else if (result == GCS_BLOCK_DEDUP_CACHED_REPLY) {
+		(void)gcs_block_resend_cached_reply(req->sender_node, &cached);
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_reply_count, 1);
+	}
+	/* In-flight duplicates belong to the original parked/native owner.
+	 * A replay without that owner cannot recreate an already-retired service. */
 }
 
 static void
@@ -18865,6 +18921,11 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	key.requester_backend_id = req->requester_backend_id;
 	key.request_id = req->request_id;
 	key.cluster_epoch = req->epoch;
+	/* Capacity waiting must precede any first-fill dedup registration. */
+	if (GcsBlockRequestPayloadIsReadMiss(req)) {
+		gcs_block_first_fill_ingress(env, req, &key, dedup_worker_id);
+		return;
+	}
 	memset(&cached_entry, 0, sizeof(cached_entry));
 	if (req->transition_id == PCM_TRANS_N_TO_S) {
 		queue_pending_x_before = gcs_block_queue_pending_x_authoritative(req->tag);
@@ -18880,8 +18941,6 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	if (dr != GCS_BLOCK_DEDUP_VALIDATION_FAIL && dr != GCS_BLOCK_DEDUP_FULL) {
 		if (GcsBlockRequestPayloadIsDirectLandArmed(req))
 			request_flags |= GCS_BLOCK_DEDUP_REQUEST_F_DIRECT_LAND;
-		if (GcsBlockRequestPayloadIsReadMiss(req))
-			request_flags |= GCS_BLOCK_DEDUP_REQUEST_F_READ_MISS;
 		if (!cluster_gcs_block_dedup_set_request_flags_exact(dedup_worker_id, &key, &req->tag,
 															 req->transition_id, request_flags)) {
 			/* The tuple was removed/replaced or its immutable request properties
@@ -18891,26 +18950,6 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 								 InvalidXLogRecPtr, NULL);
 			return;
 		}
-	}
-	/* Ordinary first-fill never enters the legacy one-shot/read-register
-	 * decision tree. Replays cannot recreate a retired pending identity. */
-	if (GcsBlockRequestPayloadIsReadMiss(req)) {
-		if (dr == GCS_BLOCK_DEDUP_MISS_REGISTERED || dr == GCS_BLOCK_DEDUP_FORWARDED_DUPLICATE
-			|| (dr == GCS_BLOCK_DEDUP_CACHED_REPLY
-				&& GcsBlockReplyHeaderHasPendingS(&cached_entry.reply_header))) {
-			gcs_first_fill_master_trace(req, "INGRESS", dr);
-			gcs_block_first_fill_request(req, &key, dedup_worker_id,
-				dr == GCS_BLOCK_DEDUP_MISS_REGISTERED);
-		} else if (dr == GCS_BLOCK_DEDUP_CACHED_REPLY) {
-			(void)gcs_block_resend_cached_reply(req->sender_node, &cached_entry);
-			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_reply_count, 1);
-		} else if (dr == GCS_BLOCK_DEDUP_VALIDATION_FAIL || dr == GCS_BLOCK_DEDUP_FULL)
-			gcs_block_send_reply(req->sender_node, req,
-				dr == GCS_BLOCK_DEDUP_FULL ? GCS_BLOCK_REPLY_DENIED_DEDUP_FULL
-				: GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT, InvalidXLogRecPtr, NULL);
-		/* In-flight duplicates belong to the parked/native pending-S owner;
-		 * legacy pending-X arbitration must never overwrite that work. */
-		return;
 	}
 	if (req->transition_id == PCM_TRANS_N_TO_S) {
 		queue_pending_x_after = gcs_block_queue_pending_x_authoritative(req->tag);
