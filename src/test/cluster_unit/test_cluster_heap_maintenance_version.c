@@ -1115,10 +1115,14 @@ sampler_stripe_future(FullTransactionId reference, FullTransactionId *future,
 
 /* Execute the original native exit on the same PGPROC used by origin reserve.
  * Legacy cases take the direct exclusive path. Opt-in cases force its first
- * conditional miss and execute the original single-member group leader;
- * semaphore waiters/followers remain outside this fixture. */
+ * conditional miss and execute the original group leader. A second queued
+ * member is an explicit scheduling leaf; semaphore waiters remain outside. */
 static bool source_exit_lock_held;
 static bool source_exit_group_requested;
+static bool source_exit_member_requested;
+static unsigned source_exit_member_wakeups;
+static FullTransactionId source_exit_member_wait_minimum, source_exit_member_wake_minimum;
+static FullTransactionId source_exit_member_census_minimum;
 static unsigned source_exit_locks, source_exit_unlocks;
 static XidCacheStatus source_exit_subxids[3];
 static uint8 source_exit_status[3];
@@ -1131,6 +1135,7 @@ static bool source_exit_precedes_or_equals(TransactionId, TransactionId);
 static bool source_exit_follows_or_equals(TransactionId, TransactionId);
 static void source_exit_assert_xid_range(TransactionId);
 static void source_exit_group(PGPROC *, TransactionId);
+static void source_exit_member_wakeup(PGSemaphore);
 
 static bool
 source_exit_try_lock(LWLock *lock, LWLockMode mode)
@@ -1170,6 +1175,24 @@ source_exit_group_acquire(LWLock *lock, LWLockMode mode)
 	UT_ASSERT(!source_exit_lock_held && !sampler_lock_held && !census_step_lock_held);
 	UT_ASSERT(sampler_slots[0].procArrayGroupMember);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&sampler_procs.procArrayGroupFirst), 0);
+	if (source_exit_member_requested)
+	{
+		PGPROC *member = &sampler_slots[1];
+		FullTransactionId reference, future;
+		ClusterXidStripeSampleFence fence;
+		uint32 first = 0;
+
+		/* Queue placement is a controlled interleaving. The original leader
+		 * must perform both internal clears and the real post-unlock tail. */
+		UT_ASSERT(!member->procArrayGroupMember && TransactionIdIsValid(member->xid));
+		member->procArrayGroupMember = true;
+		member->procArrayGroupMemberXid = member->xid + 2;
+		pg_atomic_write_u32(&member->procArrayGroupNext, 0);
+		UT_ASSERT(pg_atomic_compare_exchange_u32(&sampler_procs.procArrayGroupFirst, &first, 1));
+		UT_ASSERT(original_native_fullxid_sample(&reference, &future, &source_exit_member_wait_minimum, &fence));
+		UT_ASSERT(FullTransactionIdEquals(source_exit_member_wait_minimum,
+			FullTransactionIdFromU64(pg_atomic_read_u64(&sampler_slots[0].cluster_top_full_xid_atomic))));
+	}
 	source_exit_lock_held = true; source_exit_locks++;
 }
 
@@ -1204,7 +1227,7 @@ static void source_exit_unexpected_wait_end(void)
 #define allProcs (sampler_procs.allProcs)
 #define MyProc (&sampler_slots[0])
 #define PGSemaphoreLock source_exit_unexpected_semaphore
-#define PGSemaphoreUnlock source_exit_unexpected_semaphore
+#define PGSemaphoreUnlock source_exit_member_wakeup
 #define pgstat_report_wait_start source_exit_unexpected_wait_start
 #define pgstat_report_wait_end source_exit_unexpected_wait_end
 #include "test_cluster_ctrc_native_group_exit.inc"
@@ -13887,6 +13910,50 @@ native_exit_certificate_retire(const ClusterCtrcReceiptHandle *handle, bool fina
 static void phase_recent_native_setup(QualifiedXminFixture *, LVRelState *,
 	ClusterHeapFreezeXminTargetV1 *, bool, bool);
 static void phase_recent_native_finish(const QualifiedXminFixture *, const LVRelState *, bool);
+static ClusterSemanticActiveSampleFence source_exit_member_source;
+
+static void
+source_exit_member_wakeup(PGSemaphore sema)
+{
+	PGPROC *member = &sampler_slots[1];
+	FullTransactionId reference, future;
+	ClusterXidStripeSampleFence fence;
+	ClusterCtrcActiveScan scan;
+	uint64 census_before = census_step_lock_acquires;
+
+	if (!source_exit_member_requested) { UT_ASSERT(false); abort(); }
+	UT_ASSERT(!source_exit_lock_held && !sampler_lock_held && !census_step_lock_held);
+	UT_ASSERT(!local_x && !local_share && backend_pin_count == 0);
+	UT_ASSERT_EQ(source_exit_locks, 1); UT_ASSERT_EQ(source_exit_unlocks, 1);
+	UT_ASSERT(sema == member->sem && source_exit_member_wakeups == 0);
+	UT_ASSERT(!member->procArrayGroupMember && sampler_slots[0].procArrayGroupMember);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&member->procArrayGroupNext), INVALID_PGPROCNO);
+	for (unsigned i = 0; i < 2; i++) {
+		UT_ASSERT_EQ(sampler_slots[i].xid, InvalidTransactionId);
+		UT_ASSERT_EQ(sampler_xids[i], InvalidTransactionId);
+		UT_ASSERT_EQ(sampler_slots[i].xmin, InvalidTransactionId);
+		UT_ASSERT_EQ(sampler_slots[i].lxid, InvalidLocalTransactionId);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&sampler_slots[i].cluster_top_full_xid_atomic), 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&sampler_slots[i].cluster_read_scn_atomic), 0);
+		UT_ASSERT_EQ(source_exit_subxids[i].count, 0);
+		UT_ASSERT_EQ(source_exit_status[i] & PROC_VACUUM_STATE_MASK, 0);
+	}
+	UT_ASSERT(original_native_fullxid_sample(&reference, &future, &source_exit_member_wake_minimum, &fence));
+	UT_ASSERT(FullTransactionIdEquals(source_exit_member_wake_minimum, future));
+	UT_ASSERT(original_census_scan_begin(&scan, reference));
+	scan.future_full = future; scan.min_full = source_exit_member_wake_minimum;
+	for (uint64 slices = 0; scan.status == CTRC_ACTIVE_SCAN_INCOMPLETE && slices <= scan.total_entries; slices++)
+		original_census_step_source(&scan, &source_exit_member_source);
+	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(scan.next_index, scan.total_entries); UT_ASSERT(!scan.lock_busy);
+	UT_ASSERT_EQ(scan.unqualified_entries, 0);
+	UT_ASSERT(cluster_ctrc_active_scan_registration_current(&scan));
+	UT_ASSERT_EQ(census_step_lock_acquires - census_before, scan.total_entries);
+	UT_ASSERT_EQ(census_step_lock_releases, census_step_lock_acquires);
+	source_exit_member_census_minimum = scan.min_full;
+	UT_ASSERT(FullTransactionIdEquals(scan.min_full, source_exit_member_wait_minimum));
+	source_exit_member_wakeups++;
+}
 
 static void
 source_exit_receiver_on_second_pin(void)
@@ -13958,6 +14025,27 @@ full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool reti
 			pg_atomic_init_u32(&proc->procArrayGroupNext, INVALID_PGPROCNO);
 			pg_atomic_init_u32(&sampler_procs.procArrayGroupFirst, INVALID_PGPROCNO);
 		}
+		if (source_exit_member_requested)
+		{
+			PGPROC *member = &sampler_slots[1];
+			FullTransactionId other = FullTransactionIdFromU64(U64FromFullTransactionId(full) + 64);
+
+			member->pgprocno = member->pgxactoff = 1; member->pid = proc->pid + 1;
+			member->xid = member->xmin = sampler_xids[1] = XidFromFullTransactionId(other);
+			member->lxid = 24; member->sem = (PGSemaphore)member;
+			member->subxidStatus.count = 2;
+			member->subxids.xids[0] = member->xid + 1; member->subxids.xids[1] = member->xid + 2;
+			source_exit_subxids[1] = member->subxidStatus;
+			member->statusFlags = source_exit_status[1] = PROC_IN_VACUUM;
+			pg_atomic_write_u64(&member->cluster_top_full_xid_atomic, U64FromFullTransactionId(other));
+			pg_atomic_write_u64(&member->cluster_read_scn_atomic, 11);
+			pg_atomic_init_u32(&member->procArrayGroupNext, INVALID_PGPROCNO);
+			sampler_proc_array->numProcs = 2; sampler_proc_array->pgprocnos[1] = 1;
+			source_exit_member_wakeups = 0;
+			source_exit_member_wait_minimum = source_exit_member_wake_minimum = InvalidFullTransactionId;
+			source_exit_member_census_minimum = InvalidFullTransactionId;
+			source_exit_member_source = f.cohort.admission_fence;
+		}
 		source_exit_end_transaction(proc, key.xid);
 		UT_ASSERT_EQ(source_exit_locks, 1); UT_ASSERT_EQ(source_exit_unlocks, 1);
 		UT_ASSERT(!source_exit_lock_held);
@@ -13965,8 +14053,16 @@ full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool reti
 		UT_ASSERT_EQ(proc->xmin, InvalidTransactionId); UT_ASSERT_EQ(proc->lxid, InvalidLocalTransactionId);
 		UT_ASSERT_EQ(pg_atomic_read_u64(&proc->cluster_top_full_xid_atomic), 0);
 		UT_ASSERT_EQ(pg_atomic_read_u64(&proc->cluster_read_scn_atomic), 0);
-		UT_ASSERT(FullTransactionIdEquals(sampler_variables.latestCompletedXid, full));
-		UT_ASSERT_EQ(sampler_variables.xactCompletionCount, 1);
+		UT_ASSERT(FullTransactionIdEquals(sampler_variables.latestCompletedXid,
+			source_exit_member_requested ? FullTransactionIdFromU64(U64FromFullTransactionId(full) + 66) : full));
+		UT_ASSERT_EQ(sampler_variables.xactCompletionCount, source_exit_member_requested ? 2 : 1);
+		if (source_exit_member_requested) {
+			UT_ASSERT_EQ(source_exit_member_wakeups, 1);
+			UT_ASSERT(FullTransactionIdEquals(source_exit_member_wait_minimum, full));
+			UT_ASSERT(FullTransactionIdEquals(source_exit_member_census_minimum, full));
+			UT_ASSERT(FullTransactionIdFollows(source_exit_member_wake_minimum, full));
+			UT_ASSERT(!sampler_slots[1].procArrayGroupMember);
+		}
 		if (source_exit_group_requested)
 		{
 			UT_ASSERT(!proc->procArrayGroupMember);
@@ -14034,7 +14130,10 @@ full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool reti
 	UT_ASSERT(!publisher_scan.lock_busy); UT_ASSERT_EQ(publisher_scan.unqualified_entries, 0);
 	UT_ASSERT_EQ(publisher_scan.unqualified_registration_generation, 1);
 	UT_ASSERT(FullTransactionIdEquals(publisher_scan.min_full, full));
-	UT_ASSERT_EQ(census_step_lock_acquires, total); UT_ASSERT_EQ(census_step_lock_releases, total);
+	/* Preserve both full traversals in member mode: the original wake-time
+	 * observation and this later complete original worker publication. */
+	UT_ASSERT_EQ(census_step_lock_acquires, total * (source_exit_member_requested ? 2 : 1));
+	UT_ASSERT_EQ(census_step_lock_releases, total * (source_exit_member_requested ? 2 : 1));
 	UT_ASSERT_EQ(native_worker_shared.active_sample.sample_id, f.cohort.source_local_sample_id);
 	f.cohort.local_registration_cut = publisher_scan;
 	UT_ASSERT(cluster_ctrc_active_scan_registration_current(&f.cohort.local_registration_cut));
@@ -15591,6 +15690,37 @@ UT_TEST(test_original_group_exit_certificate_precedes_fresh_recent_cut)
 	source_exit_group_requested = false;
 }
 
+UT_TEST(test_original_group_member_exit_retains_source_through_recent_wal)
+{
+	source_exit_group_requested = source_exit_member_requested = true;
+	for (unsigned batch = 0; batch < 2; batch++) {
+		for (unsigned terminal = 0; terminal <= 2; terminal++) {
+			source_exit_member_wakeups = 0;
+			full_source_then_recent_lifecycle_case(batch != 0, false, true, terminal, 0);
+			UT_ASSERT_EQ(source_exit_member_wakeups, 1);
+		}
+	}
+	source_exit_group_requested = source_exit_member_requested = false;
+}
+
+UT_TEST(test_original_group_member_exit_late_receiver_revokes_recent_wal)
+{
+	source_exit_group_requested = source_exit_member_requested = true;
+	for (unsigned batch = 0; batch < 2; batch++)
+		for (unsigned terminal = 0; terminal <= 2; terminal++)
+			full_source_then_recent_lifecycle_case(batch != 0, true, true, terminal, 0);
+	source_exit_group_requested = source_exit_member_requested = false;
+}
+
+UT_TEST(test_original_group_member_exit_certificate_needs_fresh_recent_cut)
+{
+	source_exit_group_requested = source_exit_member_requested = true;
+	for (unsigned batch = 0; batch < 2; batch++)
+		for (unsigned retirement = 1; retirement <= 2; retirement++)
+			full_source_then_recent_lifecycle_case(batch != 0, false, true, 1, retirement);
+	source_exit_group_requested = source_exit_member_requested = false;
+}
+
 UT_TEST(test_resident_recent_native_original_startup_qualification_at_each_cut)
 {
 	const ClusterNormalStartState serving[] = { CLUSTER_NORMAL_START_EXISTING_OTHER,
@@ -15684,7 +15814,7 @@ UT_TEST(test_resident_recent_native_original_admission_errors_retire_owned_debt_
 int
 main(void)
 {
-	UT_PLAN(334);
+	UT_PLAN(337);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -16027,6 +16157,9 @@ main(void)
 	UT_RUN(test_original_group_exit_retains_source_through_recent_wal);
 	UT_RUN(test_original_group_exit_late_receiver_revokes_second_pin_wal);
 	UT_RUN(test_original_group_exit_certificate_precedes_fresh_recent_cut);
+	UT_RUN(test_original_group_member_exit_retains_source_through_recent_wal);
+	UT_RUN(test_original_group_member_exit_late_receiver_revokes_recent_wal);
+	UT_RUN(test_original_group_member_exit_certificate_needs_fresh_recent_cut);
 
 	UT_DONE();
 	return ut_failed_count != 0;
