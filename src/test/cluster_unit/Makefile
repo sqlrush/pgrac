@@ -6202,6 +6202,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_lock_vm_needed.inc
 	rm -f test_cluster_heap_chain_vm_itl.inc test_cluster_heap_chain_vm_no_itl.inc
 	rm -f test_cluster_heap_dml_vm_relock.inc test_cluster_heap_dml_vm_relock.inc.tmp
+	rm -f test_cluster_heap_native_wait_vm.inc test_cluster_heap_native_wait_vm.inc.tmp
 	rm -f test_cluster_heap_chain_receipt_types.inc test_cluster_heap_chain_receipt_reserve.inc \
 		test_cluster_heap_chain_receipt_prepare.inc test_cluster_heap_chain_receipt_boundary.inc
 	rm -f test_cluster_btree_structure_helpers.inc test_cluster_btree_structure_alloc.inc \
@@ -9556,9 +9557,26 @@ test_cluster_heap_dml_vm_relock.inc: $(top_srcdir)/src/backend/access/heap/heapa
 	     END { if (initial != 1 || race != 1 || waits != 4 || done != 6 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_heap_native_wait_vm.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_delete\(/ { in_fn=1 } /^heap_update\(/ { in_fn=2 } \
+	     /^heap_lock_updated_tuple_rec\(/ { in_fn=3 } \
+	     in_fn && /^[[:space:]]*LockBuffer\((buffer|buf), BUFFER_LOCK_UNLOCK\);/ { \
+	       candidate=1; count=0 } \
+	     candidate { lines[++count]=$$0 } \
+	     candidate && /^[[:space:]]*(MultiXactIdWait|XactLockTableWait)\(/ { waiting=1 } \
+	     waiting && /cluster_heap_rebind_locked_tuple\(/ { rebound=1 } \
+	     waiting && ((in_fn < 3 && rebound && /^#endif/) \
+	       || (in_fn == 3 && /goto l4;/)) { \
+	       print "case " found++ ":"; for (i=1; i<=count; i++) print lines[i]; print "break;"; \
+	       candidate=waiting=rebound=0 } \
+	     /^}/ { in_fn=candidate=0 } \
+	     END { if (found != 6 || waiting) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_lock_vm_pin test_cluster_heap_lock_vm_pin_noassert: test_cluster_heap_lock_vm_pin.c unit_test.h \
 		test_cluster_heap_lock_rebind.inc test_cluster_heap_vm_unwind_helpers.inc \
 		test_cluster_heap_dml_vm_relock.inc \
+		test_cluster_heap_native_wait_vm.inc \
 		test_cluster_heap_lock_vm_recent.inc test_cluster_heap_lock_chain_pin.inc \
 		test_cluster_heap_chain_vm_itl.inc test_cluster_heap_chain_vm_no_itl.inc \
 		test_cluster_heap_chain_receipt_types.inc test_cluster_heap_chain_receipt_reserve.inc \

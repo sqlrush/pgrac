@@ -11648,6 +11648,13 @@ l1:
 										LockTupleExclusive, &current_is_member))
 			{
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+#ifdef USE_PGRAC_CLUSTER
+				if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+				{
+					ReleaseBuffer(vmbuffer);
+					vmbuffer = InvalidBuffer;
+				}
+#endif
 
 				/*
 				 * Acquire the lock, if necessary (but skip it when we're
@@ -11703,6 +11710,13 @@ l1:
 			 * lock.
 			 */
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+			{
+				ReleaseBuffer(vmbuffer);
+				vmbuffer = InvalidBuffer;
+			}
+#endif
 			heap_acquire_tuplock(relation, &(tp.t_self), LockTupleExclusive,
 								 LockWaitBlock, &have_tuple_lock);
 			XactLockTableWait(xwait, relation, &(tp.t_self), XLTW_Delete);
@@ -13098,6 +13112,13 @@ l2:
 										*lockmode, &current_is_member))
 			{
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+#ifdef USE_PGRAC_CLUSTER
+				if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+				{
+					ReleaseBuffer(vmbuffer);
+					vmbuffer = InvalidBuffer;
+				}
+#endif
 
 				/*
 				 * Acquire the lock, if necessary (but skip it when we're
@@ -13197,6 +13218,13 @@ l2:
 			 * lock.
 			 */
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+			{
+				ReleaseBuffer(vmbuffer);
+				vmbuffer = InvalidBuffer;
+			}
+#endif
 			heap_acquire_tuplock(relation, &(oldtup.t_self), *lockmode,
 								 LockWaitBlock, &have_tuple_lock);
 			XactLockTableWait(xwait, relation, &oldtup.t_self,
@@ -18661,6 +18689,13 @@ l4:
 					if (needwait)
 					{
 						LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+#ifdef USE_PGRAC_CLUSTER
+						if (cluster_heap_read_needs_copy(rel) && BufferIsValid(vmbuffer))
+						{
+							ReleaseBuffer(vmbuffer);
+							vmbuffer = InvalidBuffer;
+						}
+#endif
 						XactLockTableWait(members[i].xid, rel,
 										  &mytup.t_self,
 										  XLTW_LockUpdated);
@@ -18734,6 +18769,13 @@ l4:
 				if (needwait)
 				{
 					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+#ifdef USE_PGRAC_CLUSTER
+					if (cluster_heap_read_needs_copy(rel) && BufferIsValid(vmbuffer))
+					{
+						ReleaseBuffer(vmbuffer);
+						vmbuffer = InvalidBuffer;
+					}
+#endif
 					XactLockTableWait(rawxmax, rel, &mytup.t_self,
 									  XLTW_LockUpdated);
 					goto l4;

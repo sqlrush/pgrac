@@ -2423,6 +2423,9 @@ qualified_xmin_setup(QualifiedXminFixture *f, uint16 xmax_mask)
 	f->cohort.admission_fence.admitted_members_lo = 1;
 	f->cohort.admission_fence.local_node_id = 0;
 	f->cohort.local_registration_cut.status = CTRC_ACTIVE_SCAN_COMPLETE;
+	f->cohort.local_registration_cut.total_entries =
+		CtrcShared->origin_key_entries + CtrcShared->participant_key_entries;
+	f->cohort.local_registration_cut.next_index = f->cohort.local_registration_cut.total_entries;
 	f->cohort.local_registration_cut.unqualified_registration_generation = pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation);
 	admission_current_publish_fixture(&f->cohort);
 	worker_current_publish_fixture(&f->cohort);
@@ -5555,6 +5558,38 @@ UT_TEST(test_xmin_original_worker_publisher_getter_continues_native_wal)
 		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
 		UT_ASSERT(!worker_lock_held && !local_x && !resumed_writer && f.admission.entered);
 		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
+UT_TEST(test_original_worker_publisher_refuses_malformed_completed_cursor)
+{
+	for (unsigned fault = 0; fault < 4; fault++)
+	{
+		QualifiedXminFixture f;
+		ClusterUndoCleanerActiveSample empty = {0};
+		uint64 sequence;
+
+		qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		UT_ASSERT(f.cohort.local_registration_cut.total_entries > 0);
+		UT_ASSERT_EQ(f.cohort.local_registration_cut.next_index,
+			f.cohort.local_registration_cut.total_entries);
+		sequence = f.cohort.source_local_sample_id - 1;
+		native_worker_shared.active_sample_sequence = sequence;
+		switch (fault)
+		{
+		case 0:
+			f.cohort.local_registration_cut.total_entries = 0;
+			f.cohort.local_registration_cut.next_index = 0;
+			break;
+		case 1: f.cohort.local_registration_cut.next_index--; break;
+		case 2: f.cohort.local_registration_cut.next_index++; break;
+		case 3: f.cohort.local_registration_cut.lock_busy = true; break;
+		}
+		worker_original_publish_fixture(&f.cohort);
+		UT_ASSERT(memcmp(&native_worker_shared.active_sample, &empty, sizeof(empty)) == 0);
+		UT_ASSERT_EQ(native_worker_shared.active_sample_sequence, sequence);
+		UT_ASSERT_EQ(publisher_lock_acquires, 1); UT_ASSERT_EQ(publisher_lock_releases, 1);
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
 	}
 }
 
@@ -12451,7 +12486,7 @@ UT_TEST(test_recent_xmin_share_lock_refusal_keeps_borrowed_pin_without_upgrade)
 int
 main(void)
 {
-	UT_PLAN(293);
+	UT_PLAN(294);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -12611,6 +12646,7 @@ main(void)
 	UT_RUN(test_xmin_original_worker_pass_registration_drift_stays_unproven);
 	UT_RUN(test_xmin_original_worker_pass_new_round_revokes_old_cohort);
 	UT_RUN(test_xmin_original_worker_publisher_getter_continues_native_wal);
+	UT_RUN(test_original_worker_publisher_refuses_malformed_completed_cursor);
 	UT_RUN(test_xmin_original_worker_publisher_incomplete_preserves_last_image);
 	UT_RUN(test_xmin_original_worker_publisher_invalid_clears_before_native_wal);
 	UT_RUN(test_xmin_original_worker_publisher_nonowner_preserves_image);

@@ -47,6 +47,9 @@ static unsigned nested_refusals, nested_replaces, warm_refusals;
 static unsigned nested_calls, warm_calls, plain_vm_waits, chain_fallthroughs;
 static unsigned context_starts;
 static unsigned dml_waits;
+static unsigned transaction_wait_pins, tuple_wait_pins, tuple_wait_calls, member_frees;
+static int transaction_wait_error;
+static MultiXactMember wait_member;
 bool cluster_enabled = true, cluster_shared_config = true;
 int cluster_node_id = 0, NBuffers = 2, NLocBuffer;
 char *BufferBlocks = (char *)pages;
@@ -341,6 +344,9 @@ MultiXactIdWait(MultiXactId multi, MultiXactStatus status, uint16 infomask, Rela
 	UT_ASSERT_EQ(ItemPointerGetBlockNumber(tid), ItemPointerGetBlockNumber(&tuple.t_self));
 	UT_ASSERT_EQ(ItemPointerGetOffsetNumber(tid), ItemPointerGetOffsetNumber(&tuple.t_self));
 	UT_ASSERT(oper == XLTW_Delete || oper == XLTW_Update);
+	transaction_wait_pins += vm_pinned;
+	if (transaction_wait_error == 2)
+		elog(ERROR, "controlled native transaction wait error");
 	if (remaining != NULL)
 		*remaining = 1;
 	dml_waits++;
@@ -353,8 +359,208 @@ XactLockTableWait(TransactionId xid, Relation rel, ItemPointer tid, XLTW_Oper op
 	UT_ASSERT_EQ(xid, 345);
 	UT_ASSERT_EQ(ItemPointerGetBlockNumber(tid), ItemPointerGetBlockNumber(&tuple.t_self));
 	UT_ASSERT_EQ(ItemPointerGetOffsetNumber(tid), ItemPointerGetOffsetNumber(&tuple.t_self));
-	UT_ASSERT(oper == XLTW_Delete || oper == XLTW_Update);
+	UT_ASSERT(oper == XLTW_Delete || oper == XLTW_Update || oper == XLTW_LockUpdated);
+	transaction_wait_pins += vm_pinned;
+	if (transaction_wait_error == 2)
+		elog(ERROR, "controlled native transaction wait error");
 	dml_waits++;
+}
+
+static bool
+heap_acquire_tuplock(Relation rel, ItemPointer tid, LockTupleMode mode, LockWaitPolicy policy,
+					 bool *have_tuple_lock)
+{
+	UT_ASSERT(!locked && rel == &relation);
+	UT_ASSERT_EQ(ItemPointerGetBlockNumber(tid), 17);
+	UT_ASSERT_EQ(ItemPointerGetOffsetNumber(tid), 2);
+	UT_ASSERT_EQ(mode, LockTupleExclusive);
+	UT_ASSERT_EQ(policy, LockWaitBlock);
+	tuple_wait_pins += vm_pinned;
+	tuple_wait_calls++;
+	if (transaction_wait_error == 1)
+		elog(ERROR, "controlled tuple priority wait error");
+	*have_tuple_lock = true;
+	return true;
+}
+
+static void
+fixture_wait_free(void *pointer)
+{
+	UT_ASSERT(pointer == &wait_member);
+	member_frees++;
+}
+
+/* Actual unlock -> first priority wait -> transaction wait -> original
+ * reacquisition. Chain branches continue through the original unlocked l4. */
+static void
+native_wait(unsigned entry, bool current_is_member, bool already_locked)
+{
+	Relation relation_ptr = &relation;
+	Relation relation = relation_ptr, rel = relation_ptr;
+	Buffer buffer = 1, buf = 1, vmbuffer = vm;
+	BlockNumber block = 17;
+	HeapTupleData tp = tuple, oldtup = tuple, mytup = tuple;
+	TransactionId creation_xmin = creator, xwait = 345, rawxmax = 345;
+	uint16 infomask = HEAP_XMAX_IS_MULTI;
+	LockTupleMode mode = LockTupleExclusive, *lockmode = &mode;
+	MultiXactStatus mxact_status = MultiXactStatusUpdate;
+	MultiXactMember *members = &wait_member;
+	int i = 0, remain = 0;
+	bool have_tuple_lock = already_locked;
+	bool checked_lockers = false, locker_remains = false, pinned_desired_page;
+
+	locked = true;
+	wait_member.xid = 345;
+	if (false)
+		goto l4;
+	switch (entry) {
+#define pfree fixture_wait_free
+#include "test_cluster_heap_native_wait_vm.inc"
+#undef pfree
+	default:
+		abort();
+	}
+	goto done;
+l4:
+#include "test_cluster_heap_lock_chain_pin.inc"
+done:
+	tuple = entry < 2 ? tp : (entry < 4 ? oldtup : mytup);
+	creator = creation_xmin;
+	vm = vmbuffer;
+	UT_ASSERT_EQ(dml_waits, 1);
+	UT_ASSERT_EQ(tuple_wait_calls, entry < 4 && (!(entry % 2 == 0) || !current_is_member));
+	UT_ASSERT_EQ(member_frees, entry == 4);
+	UT_ASSERT_EQ(checked_lockers, entry == 2 || entry == 3);
+	UT_ASSERT_EQ(locker_remains, entry == 2);
+	if (entry < 4 && (entry % 2 != 0 || !current_is_member))
+		UT_ASSERT(have_tuple_lock);
+}
+
+static void
+reset_native_wait(bool cached, bool visible)
+{
+	reset(cached, visible);
+	dml_waits = transaction_wait_pins = tuple_wait_pins = tuple_wait_calls = member_frees = 0;
+	transaction_wait_error = 0;
+}
+
+UT_TEST(native_waits_release_vm_before_priority_and_transaction_waits)
+{
+	for (unsigned entry = 0; entry < 6; entry++) {
+		reset_native_wait(true, true);
+		native_wait(entry, false, false);
+		check_current();
+		UT_ASSERT_EQ(tuple_wait_pins + transaction_wait_pins, 0);
+		UT_ASSERT(vm_pinned && vm == 2);
+		UT_ASSERT_EQ(waits, 1);
+	}
+}
+
+UT_TEST(native_waits_preserve_member_skip_and_existing_priority)
+{
+	for (unsigned entry = 0; entry < 4; entry++) {
+		reset_native_wait(true, true);
+		native_wait(entry, true, true);
+		check_current();
+		UT_ASSERT_EQ(tuple_wait_pins + transaction_wait_pins, 0);
+		UT_ASSERT(vm_pinned && vm == 2);
+	}
+}
+
+UT_TEST(native_waits_recheck_all_visible_after_current_install)
+{
+	for (unsigned entry = 0; entry < 6; entry++)
+		for (int visible = 0; visible < 2; visible++) {
+			reset_native_wait(true, true);
+			if (!visible)
+				PageClearAllVisible(incoming.data);
+			native_wait(entry, false, false);
+			check_current();
+			UT_ASSERT_EQ(tuple_wait_pins + transaction_wait_pins, 0);
+			UT_ASSERT_EQ(vm_pinned, visible != 0);
+		}
+}
+
+UT_TEST(native_waits_requalify_after_repeated_resident_misses)
+{
+	for (unsigned entry = 0; entry < 6; entry++) {
+		reset_native_wait(true, true);
+		misses = 3;
+		native_wait(entry, false, false);
+		check_current();
+		UT_ASSERT_EQ(tuple_wait_pins + transaction_wait_pins, 0);
+		UT_ASSERT_EQ(waits, 4);
+		UT_ASSERT(vm_pinned && vm == 2);
+	}
+}
+
+UT_TEST(native_waits_preserve_creator_refusal_after_rebind)
+{
+	for (unsigned entry = 0; entry < 6; entry++) {
+		sigjmp_buf jump;
+		volatile bool caught = false;
+
+		reset_native_wait(true, true);
+		HeapTupleHeaderSetXmin(
+			(HeapTupleHeader)PageGetItem(incoming.data, PageGetItemId(incoming.data, 2)), 701);
+		PG_exception_stack = &jump;
+		if (sigsetjmp(jump, 0) == 0)
+			native_wait(entry, false, false);
+		else
+			caught = true;
+		PG_exception_stack = NULL;
+		UT_ASSERT(caught && locked);
+		UT_ASSERT_EQ(tuple_wait_pins + transaction_wait_pins + waits_with_vm, 0);
+		UT_ASSERT_EQ(creator, 700);
+	}
+}
+
+UT_TEST(native_wait_errors_retain_neither_heap_content_nor_vm_pin)
+{
+	for (unsigned entry = 0; entry < 6; entry++)
+		for (int stage = entry < 4 ? 1 : 2; stage <= 2; stage++) {
+			sigjmp_buf jump;
+			volatile bool caught = false;
+
+			reset_native_wait(true, true);
+			transaction_wait_error = stage;
+			PG_exception_stack = &jump;
+			if (sigsetjmp(jump, 0) == 0)
+				native_wait(entry, false, false);
+			else
+				caught = true;
+			PG_exception_stack = NULL;
+			UT_ASSERT(caught && !locked && !vm_pinned);
+			UT_ASSERT_EQ(tuple_wait_pins + transaction_wait_pins + waits, 0);
+		}
+}
+
+UT_TEST(native_waits_accept_an_already_absent_vm_pin)
+{
+	for (unsigned entry = 0; entry < 6; entry++) {
+		reset_native_wait(false, true);
+		native_wait(entry, false, false);
+		check_current();
+		UT_ASSERT_EQ(tuple_wait_pins + transaction_wait_pins, 0);
+		UT_ASSERT(vm_pinned && vm == 2);
+	}
+}
+
+UT_TEST(native_waits_keep_native_and_local_pin_lifetimes)
+{
+	for (int local = 0; local < 2; local++)
+		for (unsigned entry = 0; entry < 6; entry++) {
+			reset_native_wait(true, true);
+			if (local)
+				form.relpersistence = RELPERSISTENCE_TEMP;
+			else
+				cluster_enabled = false;
+			native_wait(entry, false, false);
+			UT_ASSERT(locked && vm_pinned && vm == 2);
+			UT_ASSERT_EQ(transaction_wait_pins, 1);
+			UT_ASSERT_EQ(tuple_wait_pins, entry < 4);
+			UT_ASSERT_EQ(releases + repins, 0);
+		}
 }
 
 /* Run the six original acquisition brackets, stopping before the original
@@ -1262,7 +1468,7 @@ UT_TEST(receipt_missing_canonical_binding_or_admission_never_reacquires_heap)
 int
 main(void)
 {
-	UT_PLAN(41);
+	UT_PLAN(49);
 	UT_RUN(cached_vm_pin_is_released_before_heap_current);
 	UT_RUN(cold_vm_is_prepared_outside_heap_content);
 	UT_RUN(new_all_visible_image_gets_exact_pin_before_tuple_rebind);
@@ -1304,6 +1510,14 @@ main(void)
 	UT_RUN(dml_wait_rebind_preserves_creator_contradiction_refusal);
 	UT_RUN(dml_current_wait_error_retains_no_obstructing_vm_pin);
 	UT_RUN(dml_native_and_local_entries_keep_the_original_pin_behavior);
+	UT_RUN(native_waits_release_vm_before_priority_and_transaction_waits);
+	UT_RUN(native_waits_preserve_member_skip_and_existing_priority);
+	UT_RUN(native_waits_recheck_all_visible_after_current_install);
+	UT_RUN(native_waits_requalify_after_repeated_resident_misses);
+	UT_RUN(native_waits_preserve_creator_refusal_after_rebind);
+	UT_RUN(native_wait_errors_retain_neither_heap_content_nor_vm_pin);
+	UT_RUN(native_waits_accept_an_already_absent_vm_pin);
+	UT_RUN(native_waits_keep_native_and_local_pin_lifetimes);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
