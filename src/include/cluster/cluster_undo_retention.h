@@ -120,6 +120,28 @@ extern bool cluster_undo_segment_recyclable(const struct UndoSegmentHeaderData *
 extern bool cluster_undo_segment_recyclable_for_mode(const struct UndoSegmentHeaderData *hdr,
 													 SCN horizon, bool peer_mode);
 
+/* Diagnostic bits only. HISTORY_PIN does not identify a real reader, prove
+ * complete pool coverage, or authorize reuse or a capacity refusal. */
+#define CLUSTER_UNDO_RETAIN_REASONS_V1 1
+typedef enum ClusterUndoRetainReason {
+	CLUSTER_UNDO_RETAIN_ACTIVE_OR_PREPARED = 1 << 0,
+	CLUSTER_UNDO_RETAIN_RECORD_WRITER = 1 << 1,
+	CLUSTER_UNDO_RETAIN_SEAL_OR_DRAIN = 1 << 2,
+	CLUSTER_UNDO_RETAIN_HORIZON_MISSING = 1 << 3,
+	CLUSTER_UNDO_RETAIN_HISTORY_PIN = 1 << 4,
+	CLUSTER_UNDO_RETAIN_REFERENCE_PENDING = 1 << 5,
+	CLUSTER_UNDO_RETAIN_RELEASE_NOT_DURABLE = 1 << 6,
+	CLUSTER_UNDO_RETAIN_PUBLISHER_PENDING = 1 << 7,
+	CLUSTER_UNDO_RETAIN_IDENTITY_OR_IO = 1 << 8
+} ClusterUndoRetainReason;
+
+/* Return the original bool unchanged, clearing reasons on success. The
+ * header-only predicate cannot observe RECORD_WRITER/PUBLISHER_PENDING;
+ * those belong to the original cursor and publication handoff checks. */
+extern bool
+cluster_undo_segment_recyclable_for_mode_with_reasons(const struct UndoSegmentHeaderData *hdr,
+													  SCN horizon, bool peer_mode, uint32 *reasons);
+
 
 /*
  * spec-4.12a D1: oldest active-write boundary.

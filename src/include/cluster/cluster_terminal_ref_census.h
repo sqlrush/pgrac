@@ -1086,6 +1086,7 @@ typedef enum ClusterCapacityScopeV1 {
 #define CLUSTER_CAPACITY_UNPROVEN_REQUIRED_ACK UINT32_C(0x04)
 #define CLUSTER_CAPACITY_UNPROVEN_CANONICAL UINT32_C(0x08)
 #define CLUSTER_CAPACITY_UNPROVEN_OWNER UINT32_C(0x10)
+#define CLUSTER_CTRC_CAPACITY_RETAIN_REASONS_V1 1
 /* Local to one observation/wait. It is neither a transaction key nor a grant. */
 #define CLUSTER_CTRC_CAPACITY_SEGMENT_V1 1
 typedef struct ClusterCapacitySegmentIdentityV1 {
@@ -1116,6 +1117,9 @@ typedef struct ClusterCapacityObservationV1 {
 	uint64 observed_change_sequence;
 	uint64 pool_positions;
 	uint32 unproven_reasons;
+	/* Union of qualified rejected header observations in this probe only.
+	 * Not complete coverage, real-reader evidence, or release authority. */
+	uint32 retain_reasons;
 } ClusterCapacityObservationV1;
 extern ClusterCapacityReasonV1
 cluster_ctrc_capacity_probe_pool_v1(uint32 current_segment, SCN horizon, uint64 epoch,

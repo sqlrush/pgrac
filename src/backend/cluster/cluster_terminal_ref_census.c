@@ -5356,6 +5356,7 @@ ctrc_capacity_pool_gc_context(uint32 segment_id, uint32 *record_segment)
 
 typedef struct CtrcCapacitySegmentSample {
 	ClusterCapacitySegmentIdentityV1 identity;
+	uint32 retain_reasons;
 	ClusterSemanticAdmissionToken admission;
 	ClusterUndoBlock0LogicalKey logical;
 	ClusterUndoBlock0ResolvedRoot root;
@@ -5444,6 +5445,8 @@ ctrc_capacity_segment_read(CtrcCapacitySegmentSample *sample, SCN horizon)
 {
 	const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)sample->page.data;
 	ClusterUndoBlock0Generation final_generation = { false, 0 };
+	uint32 reasons = 0;
+	bool recyclable;
 
 	if (cluster_undo_block0_current_sample_generation(&sample->guard, &sample->root,
 													  &sample->generation)
@@ -5456,13 +5459,19 @@ ctrc_capacity_segment_read(CtrcCapacitySegmentSample *sample, SCN horizon)
 		|| header->segment_id != sample->logical.segment_id
 		|| header->owner_instance != sample->logical.owner_instance
 		|| header->wrap_count != sample->generation.value
-		|| header->tt_slots_count != TT_SLOTS_PER_SEGMENT
-		|| !cluster_undo_segment_recyclable_for_mode(header, horizon, true)
-		|| !ctrc_capacity_segment_native(header) || !ctrc_capacity_segment_root_current(sample)
+		|| header->tt_slots_count != TT_SLOTS_PER_SEGMENT)
+		return false;
+	recyclable
+		= cluster_undo_segment_recyclable_for_mode_with_reasons(header, horizon, true, &reasons);
+	if ((recyclable && !ctrc_capacity_segment_native(header))
+		|| !ctrc_capacity_segment_root_current(sample)
 		|| cluster_undo_block0_current_sample_generation(&sample->guard, &sample->root,
 														 &final_generation)
 			   != CLUSTER_UNDO_BLOCK0_OK
 		|| !final_generation.known || final_generation.value != sample->generation.value)
+		return false;
+	sample->retain_reasons = reasons;
+	if (!recyclable)
 		return false;
 	sample->identity.segment_generation = sample->generation.value;
 	return true;
@@ -5519,9 +5528,15 @@ ctrc_capacity_segment_sample(CtrcCapacitySegmentSample *sample, SCN horizon)
 			}
 			active = false;
 			proven = proven && step == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED;
+			if (step != CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED)
+				sample->retain_reasons = 0;
 		}
-		proven = proven && ctrc_capacity_segment_root_current(sample)
-				 && ctrc_capacity_segment_current(&sample->identity);
+		if ((proven || sample->retain_reasons != 0)
+			&& (!ctrc_capacity_segment_root_current(sample)
+				|| !ctrc_capacity_segment_current(&sample->identity))) {
+			proven = false;
+			sample->retain_reasons = 0;
+		}
 	}
 	PG_CATCH();
 	{
@@ -5577,6 +5592,7 @@ ctrc_capacity_unarmed_gc_candidate(uint32 segment_id, uint32 current_segment, SC
 	if (sample.identity.system_identifier == 0 || sample.identity.origin_boot_incarnation == 0
 		|| !ctrc_capacity_segment_sample(&sample, horizon)) {
 		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_CANONICAL;
+		observation->retain_reasons |= sample.retain_reasons;
 		return false;
 	}
 	if (!cluster_ctrc_reuse_handoff_complete(header, INVALID_TT_SLOT_OFFSET)
@@ -5765,6 +5781,9 @@ ctrc_capacity_pool_finish(uint32 segment_id, uint64 epoch, bool recheck,
 	}
 	if (observation->reason != CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE)
 		MemSet(&observation->segment, 0, sizeof(observation->segment));
+	if (observation->reason != CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER
+		|| (observation->unproven_reasons & CLUSTER_CAPACITY_UNPROVEN_IDENTITY) != 0)
+		observation->retain_reasons = 0;
 	return observation->reason;
 }
 #endif
