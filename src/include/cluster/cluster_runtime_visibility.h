@@ -58,6 +58,11 @@ typedef struct ClusterUndoBlock0LogicalKey ClusterUndoBlock0LogicalKey;
 typedef struct ClusterUndoBlock0ResolvedRoot ClusterUndoBlock0ResolvedRoot;
 typedef struct ClusterTTSlotCurrentOwner ClusterTTSlotCurrentOwner;
 
+#ifdef USE_ASSERT_CHECKING
+extern PGDLLIMPORT void (*cluster_runtime_visibility_test_copy_hook)(const char *caller,
+																	 TransactionId xid);
+#endif
+
 /* Backend-local terminal memo diagnostics. Hits select a candidate only;
  * the origin continuation still performs its final identity checks. */
 typedef struct ClusterRuntimeVisibilityCounters {

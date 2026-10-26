@@ -93,6 +93,10 @@
 #include "storage/procarray.h"
 #include "utils/snapmgr.h"
 
+#ifdef USE_ASSERT_CHECKING
+void (*cluster_runtime_visibility_test_copy_hook)(const char *caller, TransactionId xid) = NULL;
+#endif
+
 static XidStatus
 cluster_runtime_visibility_direct_xid_status(TransactionId xid)
 {
@@ -593,8 +597,13 @@ cluster_runtime_visibility_candidate_decide_current(
 											   CLUSTER_TX_UNKNOWN);
 	/* All callers have copied the original slot but have not yet sampled
 	 * native status. This test seam changes scheduling only. */
-	if (exact_slot->status == TT_SLOT_ACTIVE)
+	if (exact_slot->status == TT_SLOT_ACTIVE) {
+#ifdef USE_ASSERT_CHECKING
+		if (cluster_runtime_visibility_test_copy_hook != NULL)
+			cluster_runtime_visibility_test_copy_hook(caller, locator->xid);
+#endif
 		CLUSTER_INJECTION_PAUSE("cluster-tx-canonical-copy");
+	}
 	outcome = cluster_runtime_visibility_candidate_decide(
 		locator, mode, exact_slot, top_xid_out, proof_kind_out, commit_scn_out, reason_out,
 		diagnostic, &current_commit_gap);

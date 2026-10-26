@@ -7764,12 +7764,19 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 int
 main(void)
 {
+#ifdef USE_ASSERT_CHECKING
+	UT_PLAN(234);
+#else
 	UT_PLAN(233);
+#endif
 	UT_RUN(test_canonical_trace_identifies_four_real_callers_and_recopies);
 	UT_RUN(test_canonical_pause_cancel_releases_original_guard);
 	UT_RUN(test_canonical_pause_physical);
 	UT_RUN(test_canonical_pause_owner);
 	UT_RUN(test_canonical_pause_same_segment);
+#ifdef USE_ASSERT_CHECKING
+	UT_RUN(test_module_copy_hook_uses_only_original_active_boundary);
+#endif
 	UT_RUN(test_canonical_pause_split_segment);
 	UT_RUN(test_canonical_commit_resample_physical);
 	UT_RUN(test_canonical_commit_resample_owner_preserves_allocator_fence);

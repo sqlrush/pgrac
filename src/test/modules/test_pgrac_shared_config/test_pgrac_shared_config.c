@@ -15,6 +15,7 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
+#include "test_pgrac_m2_pause.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_cf_authority.h"
 #include "cluster/cluster_guc.h"
@@ -640,6 +641,9 @@ _PG_init(void)
 #ifdef USE_PGRAC_CLUSTER
 	if (!process_shared_preload_libraries_in_progress || IsUnderPostmaster)
 		return;
+#ifdef USE_ASSERT_CHECKING
+	test_pgrac_m2_pause_init();
+#endif
 	DefineCustomIntVariable("test_pgrac_shared_config.apply_node", "Test startup application.",
 							NULL, &test_apply_node, -1, -1, 127, PGC_POSTMASTER, 0, NULL, NULL,
 							NULL);

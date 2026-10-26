@@ -217,6 +217,7 @@ TESTS += test_cluster_abort_writer test_cluster_storage_abort_writeback
 TESTS += test_cluster_undo_header_durability
 TESTS += test_cluster_tt_checkpoint_cuts
 TESTS += test_cluster_tt_checkpoint_native test_cluster_tx_publication_pause
+TESTS += test_cluster_m2_pause_state
 TESTS += test_cluster_recovery_plan_source
 TESTS += test_cluster_recovery_plan_merge
 TESTS += test_cluster_tt_checkpoint_publish
@@ -5383,7 +5384,7 @@ test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-$(filter-out test_cluster_m2_sample_diagnostic test_cluster_cold_tx_start test_cluster_postmaster_lwlock test_cluster_phase_publication test_cluster_checkpoint_cleanup test_cluster_checkpoint_wait_budget test_cluster_checkpoint_error test_cluster_sync_error test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse test_cluster_abort_writer test_cluster_storage_abort_writeback test_cluster_heap_hot_full_trace test_cluster_gcs_read_image_hops test_cluster_gcs_read_image_trace,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
+$(filter-out test_cluster_m2_pause_state test_cluster_m2_sample_diagnostic test_cluster_cold_tx_start test_cluster_postmaster_lwlock test_cluster_phase_publication test_cluster_checkpoint_cleanup test_cluster_checkpoint_wait_budget test_cluster_checkpoint_error test_cluster_sync_error test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse test_cluster_abort_writer test_cluster_storage_abort_writeback test_cluster_heap_hot_full_trace test_cluster_gcs_read_image_hops test_cluster_gcs_read_image_trace,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
 
 # Native CR metadata checks are inline in the shared descriptor definition.
@@ -7474,6 +7475,12 @@ test_cluster_m2_sample_diagnostic.inc: $(top_srcdir)/src/test/modules/test_pgrac
 test_cluster_m2_sample_diagnostic: test_cluster_m2_sample_diagnostic.c \
 		test_cluster_m2_sample_diagnostic.inc unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+
+test_cluster_m2_pause_state: test_cluster_m2_pause_state.c unit_test.h \
+		$(top_srcdir)/src/test/modules/test_pgrac_shared_config/test_pgrac_m2_pause.h \
+		$(top_srcdir)/src/test/modules/test_pgrac_shared_config/test_pgrac_m2_pause_state.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/test/modules/test_pgrac_shared_config/test_pgrac_m2_pause_state.c -o $@
 
 test_cluster_m2_sample_origin.inc: $(top_srcdir)/src/test/modules/test_pgrac_shared_config/test_pgrac_m2_sample.c Makefile
 	awk '/^(sample_origin|sample_origin_values)\(/ { print "static ClusterTxOutcome"; emit=1; found++ } \

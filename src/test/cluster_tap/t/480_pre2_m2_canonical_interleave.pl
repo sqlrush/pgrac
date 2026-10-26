@@ -19,6 +19,7 @@ use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC sleep);
 
 my $cluster;
 my %sessions;
+my %pause_controls;
 END {
  eval { $_->quit } for map { @$_ } values %sessions;
  eval { $cluster->stop_cluster } if defined $cluster;
@@ -111,21 +112,27 @@ print(json.dumps(dict(passed=ok,reason=reason,case=c)))};
  save_json($name,$r);
  ok($r->{passed},"$name: $r->{reason}");
 }
-sub reload_pause {
- my ($node,$armed)=@_;
- my $value=$armed ? "cluster-tx-canonical-copy:sleep:$pause" : '';
- $node->append_conf('postgresql.conf',"cluster.injection_points='$value'\n");
- $node->safe_psql('postgres','SELECT pg_reload_conf()');
- # Only the existing SIGHUP assign hook arms LMS. No SQL backend arm is
- # claimed as an LMS arm; actual PID, same-xid COPY and PgSleep are required.
- sleep(0.2);
+sub remote_pause {
+ my ($cell,$writer,$armed)=@_;
+ $pause_controls{$cell->{number}}=$writer if $armed;
+ my $duration=$armed ? $pause : 0;
+ my $receipt=decode_json($writer->query_safe(
+  "SELECT test_pgrac_m2_pause(0,'$cell->{caller}','$cell->{xid}'::xid,$duration)"));
+ $cell->{$armed ? 'pause_arm' : 'pause_disarm'}=$receipt;
+ save_json("pause-control-$cell->{number}-".($armed ? 'arm' : 'disarm'),
+  {context=>$cell,receipt=>$receipt,authoritative=>JSON::PP::false});
+ delete $pause_controls{$cell->{number}} unless $armed;
+ return $receipt;
 }
 
 $cluster=PostgreSQL::Test::ClusterPRE2->new_cluster('m2_a08',nodes=>4,blackbox=>1,
  required_operations=>[],extra_conf=>['shared_buffers=512MB','autovacuum=off','cluster.trace_tx_identity=on',
   'log_error_verbosity=verbose','log_line_prefix=\'%m [%p] \'']);
-$cluster->start_cluster;
 my @nodes=$cluster->nodes;
+# Preload is local postmaster setup after the original native creation;
+# it is not a supported shared bootstrap-profile parameter.
+$_->append_conf('postgresql.conf',"shared_preload_libraries='test_pgrac_shared_config'\n") for @nodes;
+$cluster->start_cluster;
 is(scalar(@nodes),4,'original PRE2 formation admits four normal members');
 my ($a,$b)=@nodes;
 my @active=($a,$b);
@@ -154,13 +161,35 @@ $a->safe_psql('postgres',q{
  CREATE FUNCTION test_pgrac_m2_limits() RETURNS text
  AS '$libdir/test_pgrac_shared_config', 'test_pgrac_m2_limits'
  LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+ CREATE FUNCTION test_pgrac_m2_pause(integer,text,xid,integer) RETURNS text
+ AS '$libdir/test_pgrac_shared_config', 'test_pgrac_m2_pause'
+ LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
  REVOKE ALL ON FUNCTION test_pgrac_native_itl_trace() FROM PUBLIC;
  REVOKE ALL ON FUNCTION test_pgrac_m2_sample(text,regclass,integer,xid) FROM PUBLIC;
  REVOKE ALL ON FUNCTION test_pgrac_m2_locator(regclass,integer,xid) FROM PUBLIC;
  REVOKE ALL ON FUNCTION test_pgrac_m2_sample_locator(bigint,bigint,xid,integer,integer,integer) FROM PUBLIC;
  REVOKE ALL ON FUNCTION test_pgrac_m2_guards_clear() FROM PUBLIC;
  REVOKE ALL ON FUNCTION test_pgrac_m2_limits() FROM PUBLIC;
+ REVOKE ALL ON FUNCTION test_pgrac_m2_pause(integer,text,xid,integer) FROM PUBLIC;
 });
+
+# A short-lived SQL connection must not leave a shared arm behind.
+my $control=$a->background_psql('postgres');
+my $exit_arm=decode_json($control->query_safe(
+ "SELECT test_pgrac_m2_pause(0,'freeze_data','3'::xid,1)"));
+$control->quit;
+$a->poll_query_until('postgres',
+ "SELECT NOT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$exit_arm->{owner_pid})")
+ or die 'pause owner did not exit';
+my @control_rows=split /\n/,$a->safe_psql('postgres',q{
+ SELECT test_pgrac_m2_pause(0,'freeze_data','3'::xid,1);
+ SELECT test_pgrac_m2_pause(0,'freeze_data','3'::xid,0);
+});
+my $exit_rearm=decode_json($control_rows[0]);
+my $exit_disarm=decode_json($control_rows[1]);
+save_json('pause-owner-exit',{arm=>$exit_arm,rearm=>$exit_rearm,disarm=>$exit_disarm});
+ok($exit_rearm->{armed} && $exit_disarm->{disarmed} && !$exit_disarm->{consumed},
+ 'test pause arm clears on owner exit and supports explicit disarm');
 
 # Request enough DATA for rollover in one ordinary transaction. The padding
 # is stored inline; no TT/UBA/generation setter or forced rollover is used.
@@ -194,8 +223,10 @@ sub record_cell {
 sub cleanup_cell {
  my ($cell)=@_;
  my @errors;
- # Disarm the existing process-local hook even when a remote cell failed.
- if($cell->{pause_armed}) { eval { reload_pause($a,0); 1; } or push @errors,$@; }
+ # The controlling writer stays alive until explicit shared-flag disarm.
+ if($cell->{pause_armed}) {
+  eval { remote_pause($cell,$pause_controls{$cell->{number}},0); 1; } or push @errors,$@;
+ }
  eval { finish_sessions($cell); 1; } or push @errors,$@;
  die join('',@errors) if @errors;
 }
@@ -267,7 +298,7 @@ M2CanonicalOrigin::run_prepared_cases(\@matrix,\&prepare_case,sub {
   my $reached=0;
   my $hits;
   if($kind eq 'A1') {
-   if($remote) { $cell->{pause_armed}=1; reload_pause($a,1); }
+   if($remote) { $cell->{pause_armed}=1; remote_pause($cell,$w,1); }
    else { $r->query_safe("SELECT cluster_inject_fault('cluster-tx-canonical-copy','sleep',$pause)"); }
    start_reader($cell,$r,$sql);
    $sample_pid=pause_witness($a,$remote ? undef : $rpid,
@@ -296,7 +327,12 @@ M2CanonicalOrigin::run_prepared_cases(\@matrix,\&prepare_case,sub {
    $hits=$w->query_safe("SELECT hits||'|'||fault_type||'|'||param FROM pg_stat_cluster_injections WHERE name='cluster-tx-abort-tt-after'");
    $reached=0 unless $hits eq '1|none|0';
   }
-  if($kind eq 'A1' && $remote) { reload_pause($a,0); $cell->{pause_armed}=0; }
+  if($kind eq 'A1' && $remote) {
+   my $disarm=remote_pause($cell,$w,0);
+   $reached=0 unless $disarm->{disarmed} && $disarm->{consumed} &&
+    $disarm->{lease} eq $cell->{pause_arm}{lease};
+   $cell->{pause_armed}=0;
+  }
   my $log=logs_since(\@nodes,\@offset);
   my $after=decode_json($a->safe_psql('postgres','SELECT test_pgrac_native_itl_trace()'));
   my @terminal=grep { $_->{kind} == 5 && $_->{native_binding_known} &&

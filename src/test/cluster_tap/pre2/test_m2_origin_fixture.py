@@ -135,6 +135,40 @@ print encode_json({after3=>\@after3,remaining=>\@remaining,closed=>\@closed,quer
         self.assertEqual(result['queries'], [[1, 'SET statement_timeout=90000'],
                                              [2, 'SET statement_timeout=90000']])
 
+    def test_test_module_preloads_locally_after_native_creation_before_start(self):
+        source = (HERE.parent / 't/480_pre2_m2_canonical_interleave.pl').read_text()
+        formation = source[source.index('$cluster=PostgreSQL::Test::ClusterPRE2'):
+                           source.index('is(scalar(@nodes),4')]
+        # Execute the actual fixture setup; only external cluster/node calls
+        # are recorded. This is sequencing coverage, not native admission.
+        result = perl(r'''
+my ($cluster,@events);
+{package PostgreSQL::Test::ClusterPRE2;
+ sub new_cluster {
+  my ($class,$name,%opts)=@_;
+  push @events,{op=>'fresh_init',options=>\%opts};
+  return bless {nodes=>[map {bless {id=>$_},'FixtureNode'} 0..$opts{nodes}-1]},$class;
+ }
+ sub nodes {return @{$_[0]->{nodes}};}
+ sub start_cluster {push @events,{op=>'shared_start'};}
+}
+{package FixtureNode;
+ sub append_conf {push @events,{op=>'append',node=>$_[0]->{id},
+                               file=>$_[1],text=>$_[2]};}
+}
+''' + formation + r'''
+print encode_json(\@events);
+''')
+        self.assertEqual([row['op'] for row in result],
+                         ['fresh_init'] + ['append'] * 4 + ['shared_start'])
+        settings = result[0]['options']['extra_conf']
+        self.assertFalse(any('shared_preload_libraries' in line for line in settings))
+        self.assertIn('shared_buffers=512MB', settings)
+        self.assertEqual(result[0]['options']['nodes'], 4)
+        for node, row in enumerate(result[1:-1]):
+            self.assertEqual(row, dict(op='append', node=node, file='postgresql.conf',
+                                      text="shared_preload_libraries='test_pgrac_shared_config'\n"))
+
 
 if __name__ == '__main__':
     unittest.main()

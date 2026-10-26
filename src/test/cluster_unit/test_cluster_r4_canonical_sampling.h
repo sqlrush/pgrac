@@ -164,6 +164,41 @@ canonical_commit_succeeds(enum CanonicalSamplePath path)
 	UT_ASSERT(!canonical_physical_active || path >= CANONICAL_SAME_SEGMENT);
 }
 
+#ifdef USE_ASSERT_CHECKING
+static const char *test_copy_caller;
+static int test_copy_hook_calls;
+
+static void
+test_copy_observe(const char *caller, TransactionId xid)
+{
+	UT_ASSERT_EQ(strcmp(caller, test_copy_caller), 0);
+	UT_ASSERT_EQ(xid, TEST_ORIGIN_XID);
+	UT_ASSERT_EQ(test_native_status_calls, 0);
+	test_copy_hook_calls++;
+}
+
+UT_TEST(test_module_copy_hook_uses_only_original_active_boundary)
+{
+	const char *callers[] = { "physical", "owner", "freeze_data", "sample_canonical" };
+	for (int i = 0; i < CANONICAL_PATH_COUNT; i++) {
+		ClusterTxOutcome expected
+			= i == CANONICAL_OWNER ? CLUSTER_TX_UNKNOWN : CLUSTER_TX_COMMITTED;
+
+		canonical_commit_input(i);
+		test_copy_caller = callers[i];
+		test_copy_hook_calls = 0;
+		cluster_runtime_visibility_test_copy_hook = test_copy_observe;
+		UT_ASSERT_EQ(canonical_sample(i, CLUSTER_TX_RESOLVE_VISIBILITY), expected);
+		UT_ASSERT_EQ(test_copy_hook_calls, 1);
+		canonical_reset(i);
+		test_copy_hook_calls = 0;
+		UT_ASSERT_EQ(canonical_sample(i, CLUSTER_TX_RESOLVE_VISIBILITY), expected);
+		UT_ASSERT_EQ(test_copy_hook_calls, 0);
+		cluster_runtime_visibility_test_copy_hook = NULL;
+	}
+}
+#endif
+
 UT_TEST(test_canonical_commit_resample_physical)
 {
 	canonical_commit_succeeds(CANONICAL_PHYSICAL);
