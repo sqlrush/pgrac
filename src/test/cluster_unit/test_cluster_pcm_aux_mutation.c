@@ -124,6 +124,15 @@ fixture_block(Buffer buffer)
 }
 
 static void
+fixture_vm_tag(Buffer buffer, RelFileLocator *locator, ForkNumber *fork, BlockNumber *block)
+{
+	UT_ASSERT(buffer >= 1 && buffer <= 3 && refs[buffer - 1] > 0);
+	*locator = BufTagGetRelFileLocator(&tags[buffer - 1]);
+	*fork = tags[buffer - 1].forkNum;
+	*block = tags[buffer - 1].blockNum;
+}
+
+static void
 fixture_release(Buffer buffer)
 {
 	if (refs[buffer - 1] == 0 || tags[buffer - 1].relNumber != 16393) {
@@ -280,6 +289,7 @@ fixture_interrupt(void)
 #undef BufferGetPage
 #define BufferGetPage fixture_page
 #define BufferGetBlockNumber fixture_block
+#define BufferGetTag fixture_vm_tag
 #define ReleaseBuffer fixture_release
 #define LockBuffer fixture_lock
 #define UnlockReleaseBuffer fixture_unlock_release
@@ -308,6 +318,7 @@ fixture_interrupt(void)
 static void visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 									 XLogRecPtr recptr, Buffer vmBuf, TransactionId cutoff_xid,
 									 uint8 flags, const ClusterSpaceIdentity *identity);
+#include "test_cluster_vm_buffer_matches.inc"
 #include "test_cluster_pcm_aux_vm_mutation.inc"
 #include "test_cluster_pcm_aux_heap_repin.inc"
 #include "test_cluster_heap_lock_vm_needed.inc"
@@ -411,6 +422,7 @@ fixture_reset(ForkNumber fork)
 		header->pd_special = BLCKSZ;
 	}
 	smgr_data.smgr_rlocator.locator = BufTagGetRelFileLocator(&tags[0]);
+	relation_data.rd_locator = smgr_data.smgr_rlocator.locator;
 	PageSetAllVisible(pages[2].data);
 	header = (PageHeader)pages[2].data;
 	header->pd_lower += sizeof(ItemIdData);
@@ -484,6 +496,61 @@ UT_TEST(actual_vm_unchanged_clear_is_completed_not_retry)
 	UT_ASSERT_EQ(aux_writes, 0);
 	UT_ASSERT_EQ(wal_writes, 0);
 	UT_ASSERT_EQ(buffer, 1);
+}
+
+UT_TEST(actual_vm_retry_entries_refuse_wrong_target_before_aux_acquire)
+{
+	static bool cleared;
+
+	for (int setting = 0; setting < 2; setting++) {
+		for (int field = 0; field < 4; field++) {
+			ResourceXAuxiliaryAcquireContext context = { 0 };
+			PGAlignedBlock before[3];
+			Buffer buffer = 1;
+
+			fixture_reset(VISIBILITYMAP_FORKNUM);
+			cleared = true;
+			refs[0] = refs[2] = 1;
+			locks[2] = true;
+			if (setting)
+				*PageGetContents(pages[0].data) = 0;
+			switch (field) {
+			case 0:
+				tags[0].spcOid++;
+				break;
+			case 1:
+				tags[0].dbOid++;
+				break;
+			case 2:
+				tags[0].relNumber++;
+				break;
+			case 3:
+				tags[0].forkNum = FSM_FORKNUM;
+				break;
+			}
+			memcpy(before, pages, sizeof(pages));
+			if (sigsetjmp(failure_jump, 1) == 0) {
+				if (setting)
+					(void)visibilitymap_set_retry_aware(&relation_data, 0, 3, InvalidXLogRecPtr,
+														&buffer, InvalidTransactionId,
+														VISIBILITYMAP_VALID_BITS, &context, NULL);
+				else
+					(void)visibilitymap_clear_retry_aware(
+						&relation_data, 0, &buffer, VISIBILITYMAP_VALID_BITS, &context, &cleared);
+				UT_ASSERT(false);
+			}
+			UT_ASSERT_EQ(errors, 1);
+			UT_ASSERT_EQ(aux_locks + aux_unlocks + aux_writes + wal_writes, 0);
+			UT_ASSERT_EQ(refs[0], 1);
+			UT_ASSERT_EQ(refs[2], 1);
+			UT_ASSERT(!locks[0] && locks[2]);
+			UT_ASSERT_EQ(buffer, 1);
+			UT_ASSERT(!context.active);
+			UT_ASSERT(memcmp(before, pages, sizeof(pages)) == 0);
+			if (!setting)
+				UT_ASSERT(!cleared);
+		}
+	}
 }
 
 UT_TEST(actual_consumer_rejects_stale_heap_proof_before_restoring_vm)
@@ -1022,11 +1089,12 @@ UT_TEST(actual_pretoast_vm_retry_refreshes_predecessor_before_l2)
 int
 main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(29);
 	UT_RUN(actual_shared_hio_reads_identity_before_locks_and_versions_existing_zero);
 	UT_RUN(actual_shared_hio_missing_identity_stops_before_page_access);
 	UT_RUN(actual_vm_consumer_requalifies_both_stages_without_replaying_clear);
 	UT_RUN(actual_vm_unchanged_clear_is_completed_not_retry);
+	UT_RUN(actual_vm_retry_entries_refuse_wrong_target_before_aux_acquire);
 	UT_RUN(actual_consumer_rejects_stale_heap_proof_before_restoring_vm);
 	UT_RUN(actual_consumer_cancellation_does_not_report_completion);
 	UT_RUN(actual_fsm_consumer_keeps_original_mutation_and_restore);

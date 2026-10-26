@@ -63,7 +63,7 @@ cluster_semantic_activation_recovered_open_current(void)
 }
 
 
-#ifdef USE_ASSERT_CHECKING
+#if defined(USE_ASSERT_CHECKING) && !defined(FIXTURE_NO_ASSERTS)
 /* Preserve assertion failure while allowing directives inside the native call
  * argument: the standalone analyzer cannot expand those as macro arguments. */
 static void
@@ -74,6 +74,10 @@ fixture_assert(bool condition)
 }
 #undef Assert
 #define Assert fixture_assert
+#endif
+#ifdef FIXTURE_NO_ASSERTS
+#undef Assert
+#define Assert(condition) ((void)0)
 #endif
 
 #define MAPSIZE (BLCKSZ - MAXALIGN(SizeOfPageHeaderData))
@@ -97,6 +101,10 @@ static ClusterSpaceIdentity identity;
 static RfPageVersionEdgeEntryV1 edges[2];
 static uint64 next_token, edge_token;
 static unsigned edge_count, inserts, dirty[2], registered[2], lock_calls;
+static unsigned assertion_failures;
+static RelFileLocator fixture_locators[2];
+static ForkNumber fixture_forks[2];
+static BlockNumber fixture_blocks[2];
 static TransactionId expected_cutoff;
 static int nonpermanent_buffer;
 static uint8 register_flags[2];
@@ -106,6 +114,10 @@ static jmp_buf error_jump;
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
 {
+	if (expecting_error) {
+		assertion_failures++;
+		longjmp(error_jump, 1);
+	}
 	printf("# assertion %s at %s:%d\n", condition, file, line);
 	abort();
 }
@@ -196,15 +208,15 @@ void
 BufferGetTag(Buffer buffer, RelFileLocator *locator, ForkNumber *forknum, BlockNumber *block)
 {
 	UT_ASSERT(buffer == 1 || buffer == 2);
-	*locator = (RelFileLocator){ 1663, 5, 900 };
-	*forknum = buffer == 1 ? MAIN_FORKNUM : VISIBILITYMAP_FORKNUM;
-	*block = 0;
+	*locator = fixture_locators[buffer - 1];
+	*forknum = fixture_forks[buffer - 1];
+	*block = fixture_blocks[buffer - 1];
 }
 BlockNumber
 BufferGetBlockNumber(Buffer buffer)
 {
 	UT_ASSERT(buffer == 1 || buffer == 2);
-	return 0;
+	return fixture_blocks[buffer - 1];
 }
 bool
 BufferIsPermanent(Buffer buffer)
@@ -317,6 +329,7 @@ visibilitymap_pin(Relation rel, BlockNumber block, Buffer *buffer)
 	*buffer = 2;
 }
 
+#include "test_cluster_vm_buffer_matches.inc"
 #include "test_cluster_vm_repair_clear.inc"
 #include "test_cluster_vm_visible_log.inc"
 static void
@@ -341,6 +354,7 @@ run_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLogRecPtr recptr, Bu
 	CritSectionCount = 0;
 	edge_count = inserts = 0;
 	lock_calls = 0;
+	assertion_failures = 0;
 	expected_cutoff = 70;
 	nonpermanent_buffer = 0;
 	begun = expecting_error = InRecovery = wal_log_hints = checksums = repairing = false;
@@ -349,6 +363,11 @@ run_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLogRecPtr recptr, Bu
 	edge_token = 0;
 	relation.rd_rel = &relform;
 	relation.rd_locator = (RelFileLocator){ 1663, 5, 900 };
+	for (int i = 0; i < 2; i++) {
+		fixture_locators[i] = relation.rd_locator;
+		fixture_forks[i] = i == 0 ? MAIN_FORKNUM : VISIBILITYMAP_FORKNUM;
+		fixture_blocks[i] = 0;
+	}
 	relform.relpersistence = RELPERSISTENCE_PERMANENT;
 	identity.key.system_identifier = 11;
 	identity.key.database_incarnation = 12;
@@ -682,10 +701,161 @@ UT_TEST(test_actual_empty_vacuum_does_not_acquire_vm_in_critical)
 	UT_ASSERT_EQ(CritSectionCount, 0);
 }
 
+/* Wrong masks must be ordinary runtime refusals, including without cassert.
+ * The parent can assert or mutate instead; neither is an acceptable refusal. */
+UT_TEST(test_clear_rejects_invalid_masks_before_lock_or_mutation)
+{
+	static const uint8 masks[] = { 0, VISIBILITYMAP_ALL_VISIBLE, 4, 7, 255 };
+
+	for (int locked = 0; locked < 2; locked++) {
+		for (unsigned i = 0; i < lengthof(masks); i++) {
+			reset(false, true, 255);
+			expecting_error = true;
+			if (setjmp(error_jump) == 0) {
+				if (locked)
+					(void)visibilitymap_clear_locked(&relation, 0, 2, masks[i]);
+				else
+					(void)visibilitymap_clear(&relation, 0, 2, masks[i]);
+				expecting_error = false;
+				UT_ASSERT(false);
+			}
+			expecting_error = false;
+			UT_ASSERT_EQ(assertion_failures, 0);
+			UT_ASSERT_EQ(lock_calls + dirty[0] + dirty[1] + inserts + edge_count, 0);
+			UT_ASSERT(memcmp(before, pages, sizeof(pages)) == 0);
+		}
+	}
+}
+
+UT_TEST(test_set_rejects_invalid_masks_before_lock_or_mutation)
+{
+	static const uint8 masks[] = { 0, VISIBILITYMAP_ALL_FROZEN, 4, 5, 255 };
+
+	for (int locked = 0; locked < 2; locked++) {
+		for (unsigned i = 0; i < lengthof(masks); i++) {
+			reset(false, true, 0);
+			expecting_error = true;
+			if (setjmp(error_jump) == 0) {
+				if (locked)
+					run_set(&relation, 0, 1, InvalidXLogRecPtr, 2, 70, masks[i], NULL);
+				else
+					visibilitymap_set(&relation, 0, 1, InvalidXLogRecPtr, 2, 70, masks[i], NULL);
+				expecting_error = false;
+				UT_ASSERT(false);
+			}
+			expecting_error = false;
+			UT_ASSERT_EQ(assertion_failures, 0);
+			UT_ASSERT_EQ(lock_calls + dirty[0] + dirty[1] + inserts + edge_count, 0);
+			UT_ASSERT(memcmp(before, pages, sizeof(pages)) == 0);
+		}
+	}
+}
+
+static void
+change_tag(int buffer, int field)
+{
+	switch (field) {
+	case 0:
+		fixture_locators[buffer - 1].spcOid++;
+		break;
+	case 1:
+		fixture_locators[buffer - 1].dbOid++;
+		break;
+	case 2:
+		fixture_locators[buffer - 1].relNumber++;
+		break;
+	case 3:
+		fixture_forks[buffer - 1] = FSM_FORKNUM;
+		break;
+	case 4:
+		fixture_blocks[buffer - 1]++;
+		break;
+	}
+}
+
+UT_TEST(test_vm_mutators_reject_wrong_exact_target_before_lock_or_write)
+{
+	for (int entry = 0; entry < 4; entry++) {
+		for (int field = 0; field < 5; field++) {
+			reset(false, true, entry < 2 ? 255 : 0);
+			change_tag(2, field);
+			expecting_error = true;
+			if (setjmp(error_jump) == 0) {
+				if (entry == 0)
+					(void)visibilitymap_clear(&relation, 0, 2, VISIBILITYMAP_VALID_BITS);
+				else if (entry == 1)
+					(void)visibilitymap_clear_locked(&relation, 0, 2, VISIBILITYMAP_VALID_BITS);
+				else if (entry == 2)
+					visibilitymap_set(&relation, 0, 1, InvalidXLogRecPtr, 2, 70,
+									  VISIBILITYMAP_VALID_BITS, NULL);
+				else
+					run_set(&relation, 0, 1, InvalidXLogRecPtr, 2, 70, VISIBILITYMAP_VALID_BITS,
+							NULL);
+				expecting_error = false;
+				UT_ASSERT(false);
+			}
+			expecting_error = false;
+			UT_ASSERT_EQ(assertion_failures, 0);
+			UT_ASSERT_EQ(lock_calls + dirty[0] + dirty[1] + inserts + edge_count, 0);
+			UT_ASSERT(memcmp(before, pages, sizeof(pages)) == 0);
+		}
+	}
+}
+
+UT_TEST(test_set_rejects_wrong_heap_identity_before_lock_or_write)
+{
+	for (int locked = 0; locked < 2; locked++) {
+		for (int field = 0; field < 5; field++) {
+			reset(false, true, 0);
+			change_tag(1, field);
+			expecting_error = true;
+			if (setjmp(error_jump) == 0) {
+				if (locked)
+					run_set(&relation, 0, 1, InvalidXLogRecPtr, 2, 70, VISIBILITYMAP_VALID_BITS,
+							NULL);
+				else
+					visibilitymap_set(&relation, 0, 1, InvalidXLogRecPtr, 2, 70,
+									  VISIBILITYMAP_VALID_BITS, NULL);
+				expecting_error = false;
+				UT_ASSERT(false);
+			}
+			expecting_error = false;
+			UT_ASSERT_EQ(assertion_failures, 0);
+			UT_ASSERT_EQ(lock_calls + dirty[0] + dirty[1] + inserts + edge_count, 0);
+			UT_ASSERT(memcmp(before, pages, sizeof(pages)) == 0);
+		}
+	}
+}
+
+UT_TEST(test_legal_clear_preserves_other_bits_and_is_idempotent)
+{
+	for (int locked = 0; locked < 2; locked++) {
+		for (int frozen_only = 0; frozen_only < 2; frozen_only++) {
+			uint8 flags = frozen_only ? VISIBILITYMAP_ALL_FROZEN : VISIBILITYMAP_VALID_BITS;
+			reset(false, true, 255);
+			/* The native caller owns the heap WAL critical section. */
+			CritSectionCount = 1;
+			if (locked) {
+				UT_ASSERT(visibilitymap_clear_locked(&relation, 1, 2, flags));
+				UT_ASSERT(!visibilitymap_clear_locked(&relation, 1, 2, flags));
+			} else {
+				UT_ASSERT(visibilitymap_clear(&relation, 1, 2, flags));
+				UT_ASSERT(!visibilitymap_clear(&relation, 1, 2, flags));
+			}
+			UT_ASSERT_EQ((uint8)*PageGetContents(pages[1].data), frozen_only ? 247 : 243);
+			UT_ASSERT_EQ(dirty[1], 1);
+			UT_ASSERT_EQ(dirty[0] + inserts + edge_count, 0);
+			UT_ASSERT_EQ(lock_calls, locked ? 0 : 4);
+			UT_ASSERT(memcmp(before[0].data, pages[0].data, BLCKSZ) == 0);
+			CritSectionCount = 0;
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(19);
 	UT_RUN(test_visible_exact_two_page_batch);
 	UT_RUN(test_no_change_allocates_no_version);
 	UT_RUN(test_nonshared_preserves_native_hint_lsn_rules);
@@ -700,6 +870,11 @@ main(void)
 	UT_RUN(test_actual_vacuum_repairs_version_both_pages);
 	UT_RUN(test_actual_vacuum_repair_refuses_before_modification);
 	UT_RUN(test_nonshared_vacuum_repairs_keep_original_behavior);
+	UT_RUN(test_clear_rejects_invalid_masks_before_lock_or_mutation);
+	UT_RUN(test_set_rejects_invalid_masks_before_lock_or_mutation);
+	UT_RUN(test_vm_mutators_reject_wrong_exact_target_before_lock_or_write);
+	UT_RUN(test_set_rejects_wrong_heap_identity_before_lock_or_write);
+	UT_RUN(test_legal_clear_preserves_other_bits_and_is_idempotent);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

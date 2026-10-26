@@ -2338,6 +2338,16 @@ test_cluster_btree_build_version: test_cluster_btree_build_version.c unit_test.h
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
+# PGRAC: exact local tag check shared by the original VM entry fixtures.
+test_cluster_vm_buffer_matches.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
+	awk '/^vm_buffer_matches\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+TESTS += test_cluster_vm_visible_version_noassert
+
+all: test_cluster_vm_visible_version_noassert
+
 # PGRAC: native VM setter and its original heap-visible WAL logger.
 test_cluster_vm_visible_body.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
 	awk '/^visibilitymap_set_locked\(/ { inside=1; found++ } \
@@ -2386,7 +2396,8 @@ test_cluster_vm_repair_lpdead.inc: $(top_srcdir)/src/backend/access/heap/vacuuml
 	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_vm_visible_version: test_cluster_vm_visible_version.c test_cluster_heap_maintenance_policy.inc unit_test.h \
+test_cluster_vm_visible_version test_cluster_vm_visible_version_noassert: test_cluster_vm_visible_version.c test_cluster_heap_maintenance_policy.inc unit_test.h \
+		test_cluster_vm_buffer_matches.inc \
 		test_cluster_vm_repair_versioned.inc \
 		test_cluster_vm_repair_clear.inc test_cluster_vm_repair_missing_heap.inc \
 		test_cluster_vm_repair_lpdead.inc \
@@ -2395,7 +2406,7 @@ test_cluster_vm_visible_version: test_cluster_vm_visible_version.c test_cluster_
 		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o \
 		test_cluster_space_storage_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $< test_cluster_space_bufpage_product.o \
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
@@ -2974,7 +2985,7 @@ test_cluster_vm_version.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap
 	     END { if (pins != 1 || pinok != 1 || recent != 1 || truncs != 1 || coldtruncs != 1 || reads != 1 || extends != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_vm_version: test_cluster_vm_version.c test_cluster_vm_version.inc unit_test.h \
+test_cluster_vm_version: test_cluster_vm_version.c test_cluster_vm_buffer_matches.inc test_cluster_vm_version.inc unit_test.h \
 		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
@@ -6170,7 +6181,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_vm_visible_body.inc test_cluster_vm_visible_log.inc
 	rm -f test_cluster_vm_visible_wrapper.inc test_cluster_vm_visible_empty.inc
 	rm -f test_cluster_vm_repair_versioned.inc
-	rm -f test_cluster_vm_repair_clear.inc test_cluster_vm_repair_missing_heap.inc test_cluster_vm_repair_lpdead.inc
+	rm -f test_cluster_vm_buffer_matches.inc test_cluster_vm_repair_clear.inc test_cluster_vm_repair_missing_heap.inc test_cluster_vm_repair_lpdead.inc
 	rm -f test_cluster_btree_build_writer.inc test_cluster_btree_build_state.inc \
 		test_cluster_btree_build_finish.inc test_cluster_btree_build_leaf.inc
 	rm -f test_cluster_btree_leaf_meta.inc test_cluster_btree_leaf_vacuum.inc test_cluster_btree_leaf_delete.inc test_cluster_btree_leaf_dedup.inc test_cluster_btree_leaf_cycle.inc
@@ -7328,7 +7339,7 @@ test_cluster_heap_vm_pretoast.inc: $(top_srcdir)/src/backend/access/heap/heapam.
 	     /^}/ { in_update=0 } END { if (found != 1 || complete != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_pcm_aux_mutation: test_cluster_pcm_aux_mutation.c test_cluster_heap_maintenance_policy.inc unit_test.h \
+test_cluster_pcm_aux_mutation: test_cluster_pcm_aux_mutation.c test_cluster_vm_buffer_matches.inc test_cluster_heap_maintenance_policy.inc unit_test.h \
 		test_cluster_heap_hio_vm.h test_cluster_heap_hio_vm.inc \
 		test_cluster_heap_lock_vm_needed.inc \
 		test_cluster_heap_hio_allocate.inc \

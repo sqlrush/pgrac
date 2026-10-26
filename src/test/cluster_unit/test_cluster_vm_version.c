@@ -76,6 +76,9 @@ static SMgrRelationData storage;
 static unsigned reads, identities, init_calls, locks, unlocks, pins, releases, dirty;
 static bool identity_ok, expecting_error, release_on_lock, installed_remote;
 static bool corrupt_extension_fallback;
+static RelFileLocator fixture_locator;
+static ForkNumber fixture_fork;
+static BlockNumber fixture_block;
 static unsigned extensions, invalidations;
 static unsigned prepared, version_edges, wal_records, legacy_wal;
 static uint64 token;
@@ -180,6 +183,9 @@ ReadBufferExtended(Relation rel, ForkNumber forknum, BlockNumber block, ReadBuff
 		abort();
 	reads++;
 	pins++;
+	fixture_locator = rel->rd_locator;
+	fixture_fork = forknum;
+	fixture_block = block;
 	read_mode = mode;
 	return 1;
 }
@@ -231,7 +237,17 @@ BufferGetBlockNumber(Buffer buffer)
 {
 	if (buffer != 1 || pins == 0)
 		abort();
-	return 0;
+	return fixture_block;
+}
+
+void
+BufferGetTag(Buffer buffer, RelFileLocator *locator, ForkNumber *forknum, BlockNumber *block)
+{
+	if (buffer != 1 || pins == 0)
+		abort();
+	*locator = fixture_locator;
+	*forknum = fixture_fork;
+	*block = fixture_block;
 }
 
 void
@@ -395,6 +411,7 @@ errfinish(const char *file, int line, const char *func)
 	abort();
 }
 
+#include "test_cluster_vm_buffer_matches.inc"
 #include "test_cluster_vm_version.inc"
 
 static void
@@ -424,6 +441,9 @@ reset(bool shared)
 	expecting_error = release_on_lock = installed_remote = InRecovery = false;
 	corrupt_extension_fallback = false;
 	last_lock_mode = BUFFER_LOCK_UNLOCK;
+	fixture_locator = relation.rd_locator;
+	fixture_fork = VISIBILITYMAP_FORKNUM;
+	fixture_block = 0;
 }
 
 UT_TEST(test_shared_read_observes_zero_without_initialization)
@@ -778,10 +798,63 @@ UT_TEST(test_cold_truncate_page_boundary_and_short_fork_need_no_read)
 	}
 }
 
+UT_TEST(test_write_pin_replaces_wrong_relation_fork_or_map_block)
+{
+	for (int field = 0; field < 5; field++) {
+		Buffer buffer;
+
+		reset(true);
+		PageInit(vm.data, BLCKSZ, 0);
+		((PageHeader)vm.data)->pd_block_scn = 55;
+		buffer = vm_readbuf(&relation, 0, false);
+		switch (field) {
+		case 0:
+			fixture_locator.spcOid++;
+			break;
+		case 1:
+			fixture_locator.dbOid++;
+			break;
+		case 2:
+			fixture_locator.relNumber++;
+			break;
+		case 3:
+			fixture_fork = MAIN_FORKNUM;
+			break;
+		case 4:
+			fixture_block++;
+			break;
+		}
+		visibilitymap_pin(&relation, 10, &buffer);
+		UT_ASSERT_EQ(releases, 1);
+		UT_ASSERT_EQ(reads, 2);
+		UT_ASSERT_EQ(pins, 1);
+		UT_ASSERT(RelFileLocatorEquals(fixture_locator, relation.rd_locator));
+		UT_ASSERT_EQ(fixture_fork, VISIBILITYMAP_FORKNUM);
+		UT_ASSERT_EQ(fixture_block, 0);
+		UT_ASSERT_EQ(dirty + init_calls, 0);
+		ReleaseBuffer(buffer);
+	}
+}
+
+UT_TEST(test_write_pin_reuses_exact_initialized_target_without_io)
+{
+	Buffer buffer;
+
+	reset(true);
+	PageInit(vm.data, BLCKSZ, 0);
+	((PageHeader)vm.data)->pd_block_scn = 55;
+	buffer = vm_readbuf(&relation, 0, false);
+	visibilitymap_pin(&relation, 10, &buffer);
+	UT_ASSERT_EQ(reads, 1);
+	UT_ASSERT_EQ(identities + releases + locks + dirty + init_calls, 0);
+	UT_ASSERT_EQ(pins, 1);
+	ReleaseBuffer(buffer);
+}
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(19);
 	UT_RUN(test_cold_truncate_reads_clear_tail_without_mutation);
 	UT_RUN(test_cold_truncate_rejects_nonclear_tail_and_wrong_mode);
 	UT_RUN(test_cold_truncate_page_boundary_and_short_fork_need_no_read);
@@ -799,6 +872,8 @@ main(void)
 	UT_RUN(test_shared_extension_preserves_existing_and_zero_predecessors);
 	UT_RUN(test_shared_extension_corruption_cannot_become_zero_base);
 	UT_RUN(test_legacy_extension_keeps_native_zero_on_error);
+	UT_RUN(test_write_pin_replaces_wrong_relation_fork_or_map_block);
+	UT_RUN(test_write_pin_reuses_exact_initialized_target_without_io);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

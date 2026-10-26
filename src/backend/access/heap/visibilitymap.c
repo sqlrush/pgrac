@@ -42,6 +42,8 @@
  *
  *	Coherent bitmap observations acquire and revalidate shared authority on
  *	every read, including cached pins. Raw diagnostic reads remain separate.
+ *	Write entries reject illegal masks and mismatched relation/fork/block
+ *	tags at runtime; cached write pins must name the same exact target.
  *
  *	Spec: 2026-10-19-pre2-m1-vm-positive-paths.md
  *	Spec: spec-2.36-gcs-block-transfer.md
@@ -191,6 +193,24 @@ static void visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer h
 
 
 /*
+ * Check the exact pinned target used by a VM operation. This local tag check
+ * neither acquires a pin nor substitutes for content/PCM or SPACE authority.
+ */
+static bool
+vm_buffer_matches(Relation rel, Buffer buffer, ForkNumber forknum, BlockNumber block)
+{
+	RelFileLocator actual_locator;
+	ForkNumber actual_fork;
+	BlockNumber actual_block;
+
+	if (rel == NULL || !BufferIsValid(buffer) || block == InvalidBlockNumber)
+		return false;
+	BufferGetTag(buffer, &actual_locator, &actual_fork, &actual_block);
+	return RelFileLocatorEquals(actual_locator, rel->rd_locator) && actual_fork == forknum
+		   && actual_block == block;
+}
+
+/*
  *	visibilitymap_clear - clear specified bits for one page in visibility map
  *
  * You must pass a buffer containing the correct map page to this function.
@@ -200,8 +220,14 @@ static void visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer h
 bool
 visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags)
 {
-	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
 	bool		cleared = false;
+
+	/* Reject masks that could clear a neighboring heap block or leave AF
+	 * without AV. These checks must also run in non-cassert builds. */
+	if ((flags != VISIBILITYMAP_ALL_FROZEN && flags != VISIBILITYMAP_VALID_BITS)
+		|| heapBlk == InvalidBlockNumber
+		|| !vm_buffer_matches(rel, vmbuf, VISIBILITYMAP_FORKNUM, HEAPBLK_TO_MAPBLOCK(heapBlk)))
+		elog(ERROR, "invalid target or flags passed to visibilitymap_clear");
 
 	/* Must never clear all_visible bit while leaving all_frozen bit set */
 	Assert(flags & VISIBILITYMAP_VALID_BITS);
@@ -210,9 +236,6 @@ visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags
 #ifdef TRACE_VISIBILITYMAP
 	elog(DEBUG1, "vm_clear %s %d", RelationGetRelationName(rel), heapBlk);
 #endif
-
-	if (!BufferIsValid(vmbuf) || BufferGetBlockNumber(vmbuf) != mapBlock)
-		elog(ERROR, "wrong buffer passed to visibilitymap_clear");
 
 	LockBuffer(vmbuf, BUFFER_LOCK_EXCLUSIVE);
 	cleared = visibilitymap_clear_locked(rel, heapBlk, vmbuf, flags);
@@ -436,9 +459,13 @@ bool
 visibilitymap_clear_retry_aware(Relation rel, BlockNumber heapBlk, Buffer *vmbuf, uint8 flags,
 								struct ResourceXAuxiliaryAcquireContext *context, bool *cleared)
 {
-	Assert(vmbuf != NULL && cleared != NULL && context != NULL);
+	if (vmbuf == NULL || cleared == NULL || context == NULL)
+		elog(ERROR, "invalid arguments passed to visibilitymap_clear_retry_aware");
 	*cleared = false;
-	if (!BufferIsValid(*vmbuf) || !visibilitymap_pin_ok(heapBlk, *vmbuf))
+	if ((flags != VISIBILITYMAP_ALL_FROZEN && flags != VISIBILITYMAP_VALID_BITS)
+		|| heapBlk == InvalidBlockNumber
+		|| !vm_buffer_matches(rel, *vmbuf, VISIBILITYMAP_FORKNUM, HEAPBLK_TO_MAPBLOCK(heapBlk))
+		|| !visibilitymap_pin_ok(heapBlk, *vmbuf))
 		elog(ERROR, "wrong buffer passed to visibilitymap_clear_retry_aware");
 	if (!ClusterLockBufferExclusiveAuxiliaryAware(vmbuf, context))
 		return false;
@@ -459,16 +486,18 @@ visibilitymap_clear_retry_aware(Relation rel, BlockNumber heapBlk, Buffer *vmbuf
 bool
 visibilitymap_clear_locked(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags)
 {
-	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
 	int			mapByte = HEAPBLK_TO_MAPBYTE(heapBlk);
 	int			mapOffset = HEAPBLK_TO_OFFSET(heapBlk);
 	uint8		mask = flags << mapOffset;
 	char	   *map;
 	bool		cleared = false;
 
-	Assert(flags & VISIBILITYMAP_VALID_BITS);
-	Assert(flags != VISIBILITYMAP_ALL_VISIBLE);
-	Assert(BufferIsValid(vmbuf) && BufferGetBlockNumber(vmbuf) == mapBlock);
+	/* Direct callers own their original lock/WAL scope. Validate before
+	 * indexing the bitmap even when the wrapper was not used. */
+	if ((flags != VISIBILITYMAP_ALL_FROZEN && flags != VISIBILITYMAP_VALID_BITS)
+		|| heapBlk == InvalidBlockNumber
+		|| !vm_buffer_matches(rel, vmbuf, VISIBILITYMAP_FORKNUM, HEAPBLK_TO_MAPBLOCK(heapBlk)))
+		elog(ERROR, "invalid target or flags passed to visibilitymap_clear_locked");
 
 	map = PageGetContents(BufferGetPage(vmbuf));
 
@@ -507,7 +536,8 @@ visibilitymap_pin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
 	/* Reuse the old pinned buffer if possible */
 	if (BufferIsValid(*vmbuf))
 	{
-		if (visibilitymap_pin_ok(heapBlk, *vmbuf))
+		if (vm_buffer_matches(rel, *vmbuf, VISIBILITYMAP_FORKNUM, mapBlock)
+			&& visibilitymap_pin_ok(heapBlk, *vmbuf))
 			return;
 
 		ReleaseBuffer(*vmbuf);
@@ -604,6 +634,12 @@ visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 #endif
 				  )
 {
+	if ((flags != VISIBILITYMAP_ALL_VISIBLE && flags != VISIBILITYMAP_VALID_BITS)
+		|| heapBlk == InvalidBlockNumber
+		|| !vm_buffer_matches(rel, vmBuf, VISIBILITYMAP_FORKNUM, HEAPBLK_TO_MAPBLOCK(heapBlk))
+		|| (BufferIsValid(heapBuf) && !vm_buffer_matches(rel, heapBuf, MAIN_FORKNUM, heapBlk)))
+		elog(ERROR, "invalid target or flags passed to visibilitymap_set");
+
 	/* PGRAC: only a real WAL redo call may reproduce an old positive bit. */
 	if (cluster_heap_maintenance_restricted(rel) &&
 		!(InRecovery && !XLogRecPtrIsInvalid(recptr)))
@@ -611,7 +647,7 @@ visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("all-visible publication for shared heaps is not supported"),
 				 errhint("Use ordinary heap visibility checks for shared relations.")));
-	if (!BufferIsValid(vmBuf) || !visibilitymap_pin_ok(heapBlk, vmBuf))
+	if (!visibilitymap_pin_ok(heapBlk, vmBuf))
 		elog(ERROR, "wrong VM buffer passed to visibilitymap_set");
 	LockBuffer(vmBuf, BUFFER_LOCK_EXCLUSIVE);
 	visibilitymap_set_locked(rel, heapBlk, heapBuf, recptr, vmBuf, cutoff_xid, flags
@@ -631,6 +667,13 @@ visibilitymap_set_retry_aware(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 #endif
 							  )
 {
+	if (vmbuf == NULL || context == NULL
+		|| (flags != VISIBILITYMAP_ALL_VISIBLE && flags != VISIBILITYMAP_VALID_BITS)
+		|| heapBlk == InvalidBlockNumber
+		|| !vm_buffer_matches(rel, *vmbuf, VISIBILITYMAP_FORKNUM, HEAPBLK_TO_MAPBLOCK(heapBlk))
+		|| (BufferIsValid(heapBuf) && !vm_buffer_matches(rel, heapBuf, MAIN_FORKNUM, heapBlk)))
+		elog(ERROR, "invalid target or flags passed to visibilitymap_set_retry_aware");
+
 	/* PGRAC: only a real WAL redo call may reproduce an old positive bit. */
 	if (cluster_heap_maintenance_restricted(rel) &&
 		!(InRecovery && !XLogRecPtrIsInvalid(recptr)))
@@ -638,8 +681,7 @@ visibilitymap_set_retry_aware(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("all-visible publication for shared heaps is not supported"),
 				 errhint("Use ordinary heap visibility checks for shared relations.")));
-	Assert(vmbuf != NULL && context != NULL);
-	if (!BufferIsValid(*vmbuf) || !visibilitymap_pin_ok(heapBlk, *vmbuf))
+	if (!visibilitymap_pin_ok(heapBlk, *vmbuf))
 		elog(ERROR, "wrong VM buffer passed to visibilitymap_set_retry_aware");
 	if (!ClusterLockBufferExclusiveAuxiliaryAware(vmbuf, context))
 		return false;
@@ -666,11 +708,17 @@ visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLog
 	Page		page;
 	uint8	   *map;
 #ifdef USE_PGRAC_CLUSTER
-	bool		versioned = cluster_shared_config && !InRecovery
-		&& rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
-		&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1;
+	bool versioned = rel != NULL && cluster_shared_config && !InRecovery
+					 && rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
+					 && cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1;
 	RfPageProducerBatchV1 versions;
 #endif
+
+	if ((flags != VISIBILITYMAP_ALL_VISIBLE && flags != VISIBILITYMAP_VALID_BITS)
+		|| heapBlk == InvalidBlockNumber
+		|| !vm_buffer_matches(rel, vmBuf, VISIBILITYMAP_FORKNUM, mapBlock)
+		|| (BufferIsValid(heapBuf) && !vm_buffer_matches(rel, heapBuf, MAIN_FORKNUM, heapBlk)))
+		elog(ERROR, "invalid target or flags passed to visibilitymap_set_locked");
 
 #ifdef TRACE_VISIBILITYMAP
 	elog(DEBUG1, "vm_set %s %d", RelationGetRelationName(rel), heapBlk);
@@ -686,14 +734,6 @@ visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLog
 
 	/* Must never set all_frozen bit without also setting all_visible bit */
 	Assert(flags != VISIBILITYMAP_ALL_FROZEN);
-
-	/* Check that we have the right heap page pinned, if present */
-	if (BufferIsValid(heapBuf) && BufferGetBlockNumber(heapBuf) != heapBlk)
-		elog(ERROR, "wrong heap buffer passed to visibilitymap_set");
-
-	/* Check that we have the right VM page pinned */
-	if (!BufferIsValid(vmBuf) || BufferGetBlockNumber(vmBuf) != mapBlock)
-		elog(ERROR, "wrong VM buffer passed to visibilitymap_set");
 
 	page = BufferGetPage(vmBuf);
 	map = (uint8 *)PageGetContents(page);
