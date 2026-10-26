@@ -2210,6 +2210,17 @@ test_cluster_heap_ctrc_participant.inc: $(top_srcdir)/src/backend/cluster/cluste
 	mv $@.tmp $@
 
 # Original receipt apply/cancel bookkeeping and exact-handle/target checks.
+# Original page-owner post-unlock WAL/dependency discharge tail and exact target.
+test_cluster_heap_itl_finish_discharge.inc: $(top_srcdir)/src/backend/cluster/cluster_itl_touch.c Makefile
+	@awk 'BEGIN { pattern = "^(itl_finish_expected_target|itl_finish_discharge_batch)\\(" } \
+	     /^typedef struct ItlFinishDischarge \{/ { structure=1; structures++ } \
+	     structure { print; if (/^} ItlFinishDischarge;/) structure=0; next } \
+	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); if (seen[name]++) exit 1; order[++found]=name; ret=prev; sub(/^static[ \t]+/, "", ret); returns[name]="static " ret; emit=1; head=1 } \
+	     emit { body[name]=body[name] $$0 "\n"; if (/^\{/) head=0; else if (head) declaration[name]=declaration[name] $$0 "\n" } \
+	     emit && /^}/ { emit=0; done++ } { prev=$$0 } \
+	     END { if (found != 2 || done != 2 || emit || structure || structures != 1) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_ctrc_terminal.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
 	@awk 'BEGIN { pattern = "^(cluster_ctrc_page_version_order|cluster_ctrc_pending_itl_target_recheck|cluster_ctrc_receipt_apply_prepared|cluster_ctrc_receipt_apply_shared|cluster_ctrc_receipt_cancel_prepared|cluster_ctrc_receipt_cancel_shared|ctrc_bytes_nonzero|ctrc_receipt_handle_exact|ctrc_target_exact_itl_valid|ctrc_target_exact_tid_valid|ctrc_target_itl_finalizes_exact|ctrc_target_itl_finalizes_prepared|ctrc_target_offnum_finalizes_exact|ctrc_reference_durability_covers|cluster_ctrc_itl_target_identity_matches|cluster_ctrc_receipt_discharge_itl|cluster_ctrc_receipt_discharge_itl_shared)\\(" } \
 	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); if (seen[name]++) exit 1; order[++found]=name; ret=prev; sub(/^static[ \t]+/, "", ret); returns[name]="static " ret; emit=1; head=1 } \
@@ -2307,6 +2318,9 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_ctrc_types.inc test_cluster_heap_ctrc_begin.inc \
 		test_cluster_heap_ctrc_step.inc test_cluster_heap_ctrc_origin.inc \
 		test_cluster_heap_ctrc_participant.inc test_cluster_heap_ctrc_terminal.inc \
+		test_cluster_heap_itl_finish_discharge.inc \
+		$(top_srcdir)/src/include/cluster/cluster_itl_touch.h \
+		$(top_srcdir)/src/include/cluster/cluster_sf_dep.h \
 		test_cluster_heap_ctrc_certificate.inc $(top_srcdir)/src/include/port/pg_crc32c.h \
 		test_cluster_heap_ctrc_ack.inc $(top_srcdir)/src/common/sha2_int.h \
 		test_cluster_heap_ctrc_origin_reply.inc \
@@ -5264,6 +5278,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_ctrc_origin.inc test_cluster_heap_ctrc_origin.inc.tmp
 	rm -f test_cluster_heap_ctrc_participant.inc test_cluster_heap_ctrc_participant.inc.tmp
 	rm -f test_cluster_heap_ctrc_terminal.inc test_cluster_heap_ctrc_terminal.inc.tmp
+	rm -f test_cluster_heap_itl_finish_discharge.inc test_cluster_heap_itl_finish_discharge.inc.tmp
 	rm -f test_cluster_heap_ctrc_certificate.inc test_cluster_heap_ctrc_certificate.inc.tmp
 	rm -f test_cluster_heap_ctrc_ack.inc test_cluster_heap_ctrc_ack.inc.tmp
 	rm -f test_cluster_heap_ctrc_origin_reply.inc test_cluster_heap_ctrc_origin_reply.inc.tmp

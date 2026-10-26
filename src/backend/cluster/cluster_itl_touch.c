@@ -649,6 +649,45 @@ itl_finish_expected_target(const ClusterItlTouchRecord *record,
 		   sizeof(record->proof.undo_segment_head));
 }
 
+static void
+itl_finish_discharge_batch(bool needs_wal, XLogRecPtr batch_lsn,
+						   const ItlFinishDischarge *discharges, uint32 ndischarges,
+						   const ClusterSfDepVec *dependency_vecs)
+{
+	/* Never wait for WAL or sample remote durability while holding a heap
+	 * content lock.  A missing local WAL position simply retains every
+	 * logged receipt; no state is weakened to manufacture cleanup. */
+	if (ndischarges > 0 && (!needs_wal || !XLogRecPtrIsInvalid(batch_lsn))) {
+		XLogRecPtr local_flush_lsn;
+		uint32 d;
+
+		if (needs_wal)
+			XLogFlush(batch_lsn);
+		local_flush_lsn = GetFlushRecPtr(NULL);
+		for (d = 0; d < ndischarges; d++) {
+			const ItlFinishDischarge *pending = &discharges[d];
+			const ClusterItlTouchRecord *record = &touch_list[pending->record_index];
+			ClusterCtrcItlTargetIdentity expected;
+			ClusterCtrcDurability durability;
+			int origin;
+
+			MemSet(&durability, 0, sizeof(durability));
+			durability.highest_local_lsn = batch_lsn;
+			durability.local_flush_lsn = local_flush_lsn;
+			memcpy(durability.required_lsn, dependency_vecs[pending->dependency_index].required,
+				   sizeof(durability.required_lsn));
+			for (origin = 0; origin < CLUSTER_SF_DEP_MAX_ORIGINS; origin++)
+				durability.durable_lsn[origin]
+					= origin == cluster_node_id ? local_flush_lsn
+												: cluster_sf_observed_origin_durable_lsn(origin);
+			itl_finish_expected_target(record, &expected);
+			(void)cluster_ctrc_receipt_discharge_itl_shared(
+				&record->ctrc_handle, &expected, CTRC_ITL_TERMINAL_INDEPENDENT, &durability);
+		}
+	}
+
+}
+
 /*
  * Flush one batch of same-WAL-requirement page runs as a single generic
  * WAL record.
@@ -796,37 +835,8 @@ itl_finish_flush_batch(ItlFinishBatchCtx *bctx)
 	for (p = 0; p < nbufs; p++)
 		cluster_bufmgr_unlock_resident_stamp(bufs[p]);
 
-	/* Never wait for WAL or sample remote durability while holding a heap
-	 * content lock.  A missing local WAL position simply retains every
-	 * logged receipt; no state is weakened to manufacture cleanup. */
-	if (ndischarges > 0 && (!bctx->needs_wal || !XLogRecPtrIsInvalid(batch_lsn))) {
-		XLogRecPtr local_flush_lsn;
-		uint32 d;
-
-		if (bctx->needs_wal)
-			XLogFlush(batch_lsn);
-		local_flush_lsn = GetFlushRecPtr(NULL);
-		for (d = 0; d < ndischarges; d++) {
-			const ItlFinishDischarge *pending = &discharges[d];
-			const ClusterItlTouchRecord *record = &touch_list[pending->record_index];
-			ClusterCtrcItlTargetIdentity expected;
-			ClusterCtrcDurability durability;
-			int origin;
-
-			MemSet(&durability, 0, sizeof(durability));
-			durability.highest_local_lsn = batch_lsn;
-			durability.local_flush_lsn = local_flush_lsn;
-			memcpy(durability.required_lsn, dependency_vecs[pending->dependency_index].required,
-				   sizeof(durability.required_lsn));
-			for (origin = 0; origin < CLUSTER_SF_DEP_MAX_ORIGINS; origin++)
-				durability.durable_lsn[origin]
-					= origin == cluster_node_id ? local_flush_lsn
-												: cluster_sf_observed_origin_durable_lsn(origin);
-			itl_finish_expected_target(record, &expected);
-			(void)cluster_ctrc_receipt_discharge_itl_shared(
-				&record->ctrc_handle, &expected, CTRC_ITL_TERMINAL_INDEPENDENT, &durability);
-		}
-	}
+	itl_finish_discharge_batch(bctx->needs_wal, batch_lsn,
+							   discharges, ndischarges, dependency_vecs);
 
 	bctx->nruns = 0;
 }
