@@ -2234,6 +2234,19 @@ test_cluster_heap_resident_stamp_types.inc: $(top_srcdir)/src/backend/storage/bu
 	     END { if (found != 1 || private_type != 1 || done != 2 || address != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_heap_resource_owner.inc: $(top_srcdir)/src/backend/utils/resowner/resowner.c Makefile
+	@awk '/^#define BufferGetDatum\(buffer\)/ { print; conversion++ } \
+	     /^typedef struct (ResourceArray|ResourceOwnerData)$$/ { structure=1; structures++ } \
+	     structure { print; if (/^}[ \t]*(ResourceArray|ResourceOwnerData);/) structure=0; next } \
+	     /^#define (RESARRAY_INIT_SIZE |RESARRAY_MAX_ARRAY |RESARRAY_IS_ARRAY\(|MAX_RESOWNER_LOCKS )/ { print; constants++; next } \
+	     /^#define RESARRAY_MAX_ITEMS\(/ { print; getline; print; constants++; next } \
+	     /^static void ResourceArrayAdd\(/ { print; prototype++; next } \
+	     /^(ResourceArray(Init|Enlarge|Add)|ResourceOwner(EnlargeBuffers|RememberBuffer|ForgetBuffer))\(/ { print "static void"; emit=1; found++ } \
+	     /^ResourceArrayRemove\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (conversion != 1 || structures != 2 || structure || constants != 5 || prototype != 1 || found != 7 || done != 7 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_private_ref.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	@awk '/^#define REFCOUNT_ARRAY_ENTRIES / { print; constants++ } \
 	     /^static .*PrivateRefCountArray\[/ || /^static .*PrivateRefCountHash =/ || /^static .*PrivateRefCountOverflowed =/ || /^static .*PrivateRefCountClock =/ || /^static .*ReservedRefCountEntry =/ { print; states++ } \
@@ -2382,6 +2395,8 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_itl_publication.inc \
 		test_cluster_heap_touch_authority.inc \
 		test_cluster_heap_resident_stamp_types.inc test_cluster_heap_resident_stamp.inc \
+		test_cluster_heap_resource_owner.inc $(top_srcdir)/src/include/common/hashfn.h \
+		$(top_srcdir)/src/include/storage/lock.h \
 		test_cluster_heap_private_ref.inc $(top_srcdir)/src/include/utils/hsearch.h \
 		test_cluster_heap_primitive_pin.inc \
 		test_cluster_heap_lookup_pin.inc $(top_srcdir)/src/include/utils/memdebug.h \
@@ -5357,6 +5372,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_lookup_pin.inc test_cluster_heap_lookup_pin.inc.tmp
 	rm -f test_cluster_heap_primitive_pin.inc test_cluster_heap_primitive_pin.inc.tmp
 	rm -f test_cluster_heap_private_ref.inc test_cluster_heap_private_ref.inc.tmp
+	rm -f test_cluster_heap_resource_owner.inc test_cluster_heap_resource_owner.inc.tmp
 	rm -f test_cluster_heap_ctrc_certificate.inc test_cluster_heap_ctrc_certificate.inc.tmp
 	rm -f test_cluster_heap_ctrc_ack.inc test_cluster_heap_ctrc_ack.inc.tmp
 	rm -f test_cluster_heap_ctrc_origin_reply.inc test_cluster_heap_ctrc_origin_reply.inc.tmp
