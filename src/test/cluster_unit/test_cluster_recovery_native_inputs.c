@@ -1084,6 +1084,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_episode_pages.inc"
 #include "test_cluster_recovery_episode_native_clog.inc"
 #include "test_cluster_recovery_episode_terminal.inc"
+#include "test_cluster_recovery_episode_xid.inc"
 
 
 int
@@ -1093,6 +1094,17 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_EPISODE_XID") != NULL) {
+		UT_PLAN(7);
+		UT_RUN(test_episode_xid_unrelated_relmap_retains_original_frame_identity_refusal);
+		UT_RUN(test_episode_xid_keeps_original_checkpoint_map_and_complete_tail);
+		UT_RUN(test_episode_xid_tail_header_and_checkpoint_use_original_counter_rules);
+		UT_RUN(test_episode_xid_full_counter_bounds_keep_wrap_and_exact_half_range_distinct);
+		UT_RUN(test_episode_xid_error_clears_private_pass_and_retains_original_native_fd);
+		UT_RUN(test_episode_xid_missing_checkpoint_or_window_fails_original_episode);
+		UT_RUN(test_episode_xid_output_and_caller_preconditions_preserve_original_custody);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_EPISODE_NATIVE_CLOG") != NULL) {
 		UT_PLAN(3);
 		UT_RUN(test_episode_native_clog_keeps_real_fd_and_all_status_observations);
@@ -1203,7 +1215,14 @@ main(int argc, char **argv)
 		UT_RUN(test_episode_terminal_preconditions_preserve_original_base_and_query);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(159);
+	UT_PLAN(166);
+	UT_RUN(test_episode_xid_unrelated_relmap_retains_original_frame_identity_refusal);
+	UT_RUN(test_episode_xid_keeps_original_checkpoint_map_and_complete_tail);
+	UT_RUN(test_episode_xid_tail_header_and_checkpoint_use_original_counter_rules);
+	UT_RUN(test_episode_xid_full_counter_bounds_keep_wrap_and_exact_half_range_distinct);
+	UT_RUN(test_episode_xid_error_clears_private_pass_and_retains_original_native_fd);
+	UT_RUN(test_episode_xid_missing_checkpoint_or_window_fails_original_episode);
+	UT_RUN(test_episode_xid_output_and_caller_preconditions_preserve_original_custody);
 	UT_RUN(test_episode_terminal_matches_actual_sealed_side_and_same_held_page);
 	UT_RUN(test_episode_terminal_rejects_lifecycle_discontinuity_before_new_native_io);
 	UT_RUN(test_episode_terminal_missing_conflicting_child_prepare_or_alias_is_not_terminal);
