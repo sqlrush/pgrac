@@ -61,6 +61,7 @@ UT_DEFINE_GLOBALS();
 bool cluster_trace_normal_stop = false;
 volatile uint32 CritSectionCount;
 PGPROC *MyProc;
+int MyProcPid = 7411;
 
 /* This fixture exercises the original producer with diagnostics disabled. */
 void
@@ -903,6 +904,21 @@ cluster_tt_local_get_published_binding(TransactionId xid, ClusterCanonicalTxnBin
 		sampled.slot_wrap++;
 	*out = sampled;
 	return true;
+}
+
+bool cluster_trace_tx_identity;
+static unsigned test_canonical_trace_count;
+static char test_canonical_trace[8][1024];
+
+void
+write_stderr(const char *fmt, ...)
+{
+	va_list args;
+	if (test_canonical_trace_count >= lengthof(test_canonical_trace))
+		return;
+	va_start(args, fmt);
+	vsnprintf(test_canonical_trace[test_canonical_trace_count++], 1024, fmt, args);
+	va_end(args);
 }
 
 int cluster_injection_armed_count;
@@ -7508,7 +7524,8 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 int
 main(void)
 {
-	UT_PLAN(229);
+	UT_PLAN(230);
+	UT_RUN(test_canonical_trace_identifies_four_real_callers_and_recopies);
 	UT_RUN(test_canonical_pause_cancel_releases_original_guard);
 	UT_RUN(test_canonical_pause_physical);
 	UT_RUN(test_canonical_pause_owner);

@@ -554,3 +554,24 @@ UT_TEST(test_canonical_pause_cancel_releases_original_guard)
 		UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(zero)), 0);
 	}
 }
+
+UT_TEST(test_canonical_trace_identifies_four_real_callers_and_recopies)
+{
+	const char *callers[] = { "physical", "owner", "freeze_data", "sample_canonical" };
+	for (int path = 0; path < CANONICAL_PATH_COUNT; path++) {
+		canonical_commit_input(path);
+		test_canonical_trace_count = 0;
+		cluster_trace_tx_identity = true;
+		(void)canonical_sample(path, CLUSTER_TX_RESOLVE_VISIBILITY);
+		cluster_trace_tx_identity = false;
+		UT_ASSERT_EQ(test_canonical_trace_count, 4);
+		UT_ASSERT(strstr(test_canonical_trace[0], callers[path]) != NULL);
+		UT_ASSERT(strstr(test_canonical_trace[0], "phase=COPY") != NULL);
+		UT_ASSERT(strstr(test_canonical_trace[1], "phase=NATIVE") != NULL);
+		UT_ASSERT(strstr(test_canonical_trace[1], "native_known=1") != NULL);
+		UT_ASSERT(strstr(test_canonical_trace[2], "phase=RECOPY") != NULL);
+		UT_ASSERT(strstr(test_canonical_trace[3], "phase=DECIDE") != NULL);
+		UT_ASSERT(strstr(test_canonical_trace[3], "outcome=3") != NULL);
+		UT_ASSERT(strstr(test_canonical_trace[3], "authoritative=0") != NULL);
+	}
+}
