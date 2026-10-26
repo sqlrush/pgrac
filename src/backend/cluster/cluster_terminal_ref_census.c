@@ -5546,13 +5546,14 @@ ctrc_capacity_segment_sample(CtrcCapacitySegmentSample *sample, SCN horizon)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	cluster_semantic_activation_leave(&sample->admission);
+	/* Keep only the validated observation; leave destroys the admission token. */
 	if (proven) {
 		sample->identity.formation_epoch = sample->admission.formation_epoch;
 		sample->identity.admission_record_generation = sample->admission.record_generation;
 		sample->identity.root_id = sample->root.root_id;
 		sample->identity.root_generation = sample->root.root_generation;
 	}
+	cluster_semantic_activation_leave(&sample->admission);
 	return proven;
 }
 

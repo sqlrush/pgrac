@@ -92,7 +92,9 @@ static UndoSegmentHeaderData sample_header;
 static bool sample_commit, sample_abort, sample_active, sample_admitted;
 static bool sample_recheck;
 static unsigned sample_enters, sample_leaves, sample_holds, sample_releases;
+static unsigned sample_admission_debt;
 bool cluster_undo_cleaner_enabled = true;
+bool cluster_enabled = true;
 bool cluster_undo_retention_horizon_enabled = true;
 static bool sample_maintenance_cut;
 static uint32 sample_record_segment = 1;
@@ -279,14 +281,25 @@ cluster_semantic_activation_enter_r4_terminal_census(ClusterSemanticAdmissionTok
 	token->record_generation = 29;
 	if (!sample_admitted)
 		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+	token->feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	token->side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	token->entered = true;
+	sample_admission_debt++;
 	sample_enters++;
 	return CLUSTER_SEMANTIC_ADMISSION_OK;
 }
 
 void
-cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token pg_attribute_unused())
+cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
 {
+	/* The real leave retires debt, then destroys the complete entered token. */
+	if (token == NULL || !token->entered)
+		return;
+	if (sample_admission_debt == 0)
+		abort();
+	sample_admission_debt--;
 	sample_leaves++;
+	MemSet(token, 0, sizeof(*token));
 }
 
 bool
@@ -4207,6 +4220,204 @@ probe_unarmed_segment(ClusterCapacityObservationV1 *out)
 	return cluster_ctrc_capacity_probe_pool_segment_v1(1, 1000, test_cluster_epoch, NULL, out);
 }
 
+/* Compose the actual producer with the original cleaner consumer and wait.
+ * Context/floor and CV scheduling are explicit boundaries; no boundary
+ * supplies the observation or a precomputed capacity decision. */
+static unsigned capacity_sleeps, capacity_cancels;
+static bool capacity_subscribed, capacity_cancel;
+static uint32 capacity_wait_event, capacity_sleep_event;
+uint32 *my_wait_event_info = &capacity_wait_event;
+int cluster_lmon_main_loop_interval = 2000;
+
+static bool
+undo_cleaner_capacity_context_safe(void)
+{
+	return held_count == 0 && !native_cleaner_lock_held && sample_admission_debt == 0
+		   && sample_holds == sample_releases;
+}
+
+static bool
+capacity_cleaner_lock(LWLock *lock, LWLockMode mode pg_attribute_unused(), bool acquire)
+{
+	if (lock != &native_cleaner_state.lwlock) {
+		if (native_cleaner_lock_held)
+			abort();
+		return false;
+	}
+	if (held_count != 0 || native_cleaner_lock_held == acquire)
+		abort();
+	native_cleaner_lock_held = acquire;
+	return true;
+}
+
+static bool
+undo_cleaner_capacity_floor(ClusterUndoHorizonFloor *floor)
+{
+	floor->scn = 1000;
+	floor->epoch = test_cluster_epoch;
+	return true;
+}
+
+void
+ConditionVariablePrepareToSleep(ConditionVariable *cv pg_attribute_unused())
+{
+	if (capacity_subscribed || !undo_cleaner_capacity_context_safe())
+		abort();
+	capacity_subscribed = true;
+}
+
+bool
+ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(), long timeout, uint32 event)
+{
+	if (!capacity_subscribed || !undo_cleaner_capacity_context_safe()
+		|| timeout != Max(cluster_lmon_main_loop_interval, 200))
+		abort();
+	capacity_sleeps++;
+	capacity_sleep_event = event;
+	pgstat_report_wait_start(event);
+	if (capacity_cancel)
+		pg_re_throw();
+	pgstat_report_wait_end();
+	return true;
+}
+
+bool
+ConditionVariableCancelSleep(void)
+{
+	capacity_subscribed = false;
+	capacity_cancels++;
+	return true;
+}
+
+int
+geterrcode(void)
+{
+	return capacity_cancel ? ERRCODE_QUERY_CANCELED : ERRCODE_INTERNAL_ERROR;
+}
+
+#include "test_cluster_ctrc_capacity_wait.inc"
+
+static void
+reset_segment_wait(void)
+{
+	(void)reset_unarmed_segment(48);
+	cluster_enabled = true;
+	external_lock_hook = capacity_cleaner_lock;
+	MemSet(&native_cleaner_state, 0, sizeof(native_cleaner_state));
+	for (unsigned i = 0; i < CLUSTER_UNDO_CLEANER_WORKER_TYPES; i++) {
+		UndoCleanerWorkerState *worker = &native_cleaner_state.workers[i];
+		worker->status = UNDO_CLEANER_READY;
+		worker->latch = (Latch *)&native_cleaner_state;
+		worker->incarnation_generation = i == 0 ? 83 : 71;
+	}
+	capacity_sleeps = capacity_cancels = 0;
+	capacity_subscribed = capacity_cancel = false;
+	capacity_wait_event = 41;
+	capacity_sleep_event = 0;
+}
+
+UT_TEST(test_retired_admission_observation_reaches_original_cleaner_cv)
+{
+	ClusterCtrcTxnKeyV1 continuation = { 0 };
+
+	reset_segment_wait();
+	UT_ASSERT(cluster_undo_cleaner_wait_for_capacity(1, &continuation));
+	UT_ASSERT(ctrc_bytes_zero(&continuation, sizeof(continuation)));
+	UT_ASSERT_EQ(capacity_sleeps, 1);
+	UT_ASSERT_EQ(capacity_sleep_event, WAIT_EVENT_CLUSTER_UNDO_CAPACITY_WAIT);
+	UT_ASSERT_EQ(capacity_cancels, 1);
+	UT_ASSERT(!capacity_subscribed);
+	UT_ASSERT_EQ(native_cleaner_state.capacity_wait_entered, 1);
+	UT_ASSERT_EQ(native_cleaner_state.capacity_wait_repolled, 1);
+	UT_ASSERT_EQ(native_cleaner_state.capacity_wait_refused_proof, 0);
+	UT_ASSERT_EQ(capacity_wait_event, 41);
+	UT_ASSERT_EQ(sample_admission_debt, 0);
+	UT_ASSERT_EQ(sample_enters, sample_leaves);
+	UT_ASSERT_EQ(sample_holds, sample_releases);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_original_cleaner_rejects_missing_retired_admission_identity)
+{
+	ClusterCapacityObservationV1 observation;
+	unsigned worker = UINT_MAX;
+
+	reset_segment_wait();
+	UT_ASSERT_EQ(probe_unarmed_segment(&observation), CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE);
+	UT_ASSERT(undo_cleaner_capacity_segment_worker(1, test_cluster_epoch, &observation, &worker));
+	UT_ASSERT_EQ(worker, 1);
+	UT_ASSERT_EQ(observation.segment.formation_epoch, 23);
+	UT_ASSERT_EQ(observation.segment.admission_record_generation, 29);
+	observation.segment.formation_epoch = 0;
+	UT_ASSERT(!undo_cleaner_capacity_segment_worker(1, test_cluster_epoch, &observation, &worker));
+	observation.segment.formation_epoch = 23;
+	observation.segment.admission_record_generation = 0;
+	UT_ASSERT(!undo_cleaner_capacity_segment_worker(1, test_cluster_epoch, &observation, &worker));
+	UT_ASSERT_EQ(capacity_sleeps, 0);
+	UT_ASSERT_EQ(sample_admission_debt, 0);
+	UT_ASSERT_EQ(sample_enters, sample_leaves);
+	UT_ASSERT_EQ(sample_holds, sample_releases);
+}
+
+UT_TEST(test_retired_admission_refusal_never_sleeps_or_retains_debt)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ClusterCtrcTxnKeyV1 continuation = { 0 };
+
+		reset_segment_wait();
+		if (fault == 0)
+			sample_admitted = false;
+		if (fault == 1)
+			sample_recheck = false;
+		if (fault == 2)
+			sample_release_failure = true;
+		if (fault == 3)
+			segment_root_drift = true;
+		UT_ASSERT(!cluster_undo_cleaner_wait_for_capacity(1, &continuation));
+		UT_ASSERT(ctrc_bytes_zero(&continuation, sizeof(continuation)));
+		UT_ASSERT_EQ(capacity_sleeps, 0);
+		UT_ASSERT_EQ(capacity_cancels, 1);
+		UT_ASSERT(!capacity_subscribed);
+		UT_ASSERT_EQ(native_cleaner_state.capacity_wait_entered, 0);
+		UT_ASSERT_EQ(native_cleaner_state.capacity_wait_refused_proof, 1);
+		UT_ASSERT_EQ(sample_admission_debt, 0);
+		UT_ASSERT_EQ(sample_enters, sample_leaves);
+		UT_ASSERT_EQ(sample_holds, sample_releases);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_retired_admission_error_and_cv_cancel_keep_original_cleanup)
+{
+	for (unsigned fault = 0; fault < 2; fault++) {
+		ClusterCtrcTxnKeyV1 continuation = { 0 };
+		volatile bool caught = false;
+
+		reset_segment_wait();
+		sample_copy_error = fault == 0;
+		capacity_cancel = fault == 1;
+		PG_TRY();
+		{
+			(void)cluster_undo_cleaner_wait_for_capacity(1, &continuation);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT(ctrc_bytes_zero(&continuation, sizeof(continuation)));
+		UT_ASSERT_EQ(capacity_sleeps, fault);
+		UT_ASSERT_EQ(capacity_cancels, 1);
+		UT_ASSERT(!capacity_subscribed);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&native_cleaner_state.capacity_wait_cancelled), fault);
+		UT_ASSERT_EQ(sample_admission_debt, 0);
+		UT_ASSERT_EQ(sample_enters, sample_leaves);
+		UT_ASSERT_EQ(sample_holds, sample_releases);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
 UT_TEST(test_unarmed_segment_fair_walk_keeps_zero_key_and_sixteen_get_budget)
 {
 	const unsigned indices[] = { 48, 6144, CTRC_CLEANER_ORIGINS - 1 };
@@ -4684,7 +4895,11 @@ UT_TEST(test_capacity_retention_diagnostics_discard_unproven_sample_identity)
 int
 main(void)
 {
-	UT_PLAN(90);
+	UT_PLAN(94);
+	UT_RUN(test_retired_admission_observation_reaches_original_cleaner_cv);
+	UT_RUN(test_original_cleaner_rejects_missing_retired_admission_identity);
+	UT_RUN(test_retired_admission_refusal_never_sleeps_or_retains_debt);
+	UT_RUN(test_retired_admission_error_and_cv_cancel_keep_original_cleanup);
 	UT_RUN(test_retain_reasons_distinguish_history_missing_and_unfinished_work);
 	UT_RUN(test_retain_reasons_preserve_peer_nonpeer_and_record_equality);
 	UT_RUN(test_retain_reasons_cover_each_physical_slot_and_combined_causes);

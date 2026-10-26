@@ -9976,7 +9976,22 @@ test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: test_cluster_ctrc
 		$(top_srcdir)/src/include/storage/pg_sema.h $(top_srcdir)/src/include/utils/wait_event.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h
 
+# Same actual producer-to-consumer path, including the original CV cleanup.
+test_cluster_ctrc_capacity_wait.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
+	awk '/^undo_cleaner_capacity_owner_generation_locked\(/ { print "static uint64"; emit=1; found++ } \
+	     /^undo_cleaner_capacity_segment_worker\(/ { print "static bool"; emit=1; found++ } \
+	     /^undo_cleaner_capacity_probe\(/ { print "static ClusterCtrcCapacityProbeResult"; emit=1; found++ } \
+	     /^cluster_undo_cleaner_wait_for_capacity\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}$$/ { emit=0 } END { if (found != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+clean distclean maintainer-clean: clean-ctrc-capacity-wait
+.PHONY: clean-ctrc-capacity-wait
+clean-ctrc-capacity-wait:
+	rm -f test_cluster_ctrc_capacity_wait.inc test_cluster_ctrc_capacity_wait.inc.tmp
+
 test_cluster_ctrc_capacity: test_cluster_ctrc_capacity.c test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc \
+		test_cluster_ctrc_capacity_wait.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h unit_test.h $(CLUSTER_UNDO_RETENTION_O) \
 		$(top_srcdir)/src/include/cluster/cluster_undo_record_api.h \
