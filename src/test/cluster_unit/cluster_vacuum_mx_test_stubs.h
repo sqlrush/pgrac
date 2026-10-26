@@ -197,7 +197,7 @@ ReleaseBuffer(Buffer buf)
 
 static bool
 lazy_scan_new_or_empty(LVRelState *vacrel, Buffer buf, BlockNumber block, Page page, bool share,
-					   Buffer vm)
+					   Buffer *vm)
 {
 	(void)vacrel;
 	(void)block;

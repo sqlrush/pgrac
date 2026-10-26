@@ -2372,6 +2372,19 @@ test_cluster_vm_visible_empty.inc: $(top_srcdir)/src/backend/access/heap/vacuuml
 	     emit { print } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Bind the complete original empty-page scan entry and its acquisition helper.
+test_cluster_vm_empty_scan.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/^lazy_publish_shared_empty\(/ { print "static void"; emit=1; helpers++ } \
+	     /^lazy_scan_new_or_empty\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1 || helpers != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_empty_set.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
+	awk '/^vm_redo_page_valid\(/ { print "static bool"; emit=1; found++ } \
+	     /^visibilitymap_set_empty\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_vm_repair_versioned.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
 	awk '/^lazy_clear_visibility_versioned\(/ { print "static void"; emit=1; found++ } \
 	     /^lazy_clear_vm_after_heap\(/ { print "static void"; emit=1; found++ } \
@@ -2403,6 +2416,7 @@ test_cluster_vm_visible_version test_cluster_vm_visible_version_noassert: test_c
 		test_cluster_vm_repair_lpdead.inc \
 		test_cluster_vm_visible_body.inc test_cluster_vm_visible_log.inc \
 		test_cluster_vm_visible_wrapper.inc test_cluster_vm_visible_empty.inc \
+		test_cluster_vm_empty_scan.inc test_cluster_vm_empty_set.inc \
 		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o \
 		test_cluster_space_storage_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)

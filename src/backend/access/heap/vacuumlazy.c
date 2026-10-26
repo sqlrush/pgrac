@@ -313,7 +313,7 @@ static BlockNumber lazy_scan_skip(LVRelState *vacrel, Buffer *vmbuffer,
 								  bool *skipping_current_range);
 static bool lazy_scan_new_or_empty(LVRelState *vacrel, Buffer buf,
 								   BlockNumber blkno, Page page,
-								   bool sharelock, Buffer vmbuffer);
+								   bool sharelock, Buffer *vmbuffer);
 static void lazy_scan_prune(LVRelState *vacrel, Buffer buf,
 							BlockNumber blkno, Page page,
 							LVPagePruneState *prunestate);
@@ -1261,7 +1261,7 @@ lazy_scan_heap(LVRelState *vacrel)
 
 			/* Check for new or empty pages before lazy_scan_noprune call */
 			if (lazy_scan_new_or_empty(vacrel, buf, blkno, page, true,
-									   vmbuffer))
+									   &vmbuffer))
 			{
 				/* Processed as new/empty page (lock and pin released) */
 				continue;
@@ -1325,7 +1325,7 @@ lazy_scan_heap(LVRelState *vacrel)
 		}
 
 		/* Check for new or empty pages before lazy_scan_prune call */
-		if (lazy_scan_new_or_empty(vacrel, buf, blkno, page, false, vmbuffer))
+		if (lazy_scan_new_or_empty(vacrel, buf, blkno, page, false, &vmbuffer))
 		{
 #ifdef USE_PGRAC_CLUSTER
 			/* Cleanup fallback may have replaced the earlier SHARE image. */
@@ -2593,6 +2593,77 @@ lazy_scan_skip(LVRelState *vacrel, Buffer *vmbuffer, BlockNumber next_block,
 	return next_unskippable_block;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Prepare VM-X with no heap content lock, then drop its passive pin before
+ * reacquiring the original heap. Only a local conditional resume of that
+ * exact VM writer/version is allowed below heap-X. A stale/busy proof leaves
+ * the empty page conservative; it never reacquires VM current below heap-X.
+ * The caller's heap pin survives, as in the existing hio VM-repin path. */
+static void
+lazy_publish_shared_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno, Buffer *vmbuffer,
+						  bool cleanup_lock)
+{
+	ResourceXAuxiliaryAcquireContext context = { 0 };
+	ResourceXWriterUseContext vm_writer;
+	uint64 object_revision = 0, vm_version = 0;
+	bool object_checked = false, prepared = false;
+	XLogRecPtr vm_lsn = InvalidXLogRecPtr;
+	Buffer recent_vm;
+
+	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+	if (ClusterLockBufferExclusiveAuxiliaryAware(vmbuffer, &context)) {
+		PG_TRY();
+		{
+			prepared = ClusterBufferCaptureMutationContext(*vmbuffer, &vm_writer, &object_revision,
+														   &object_checked);
+			if (prepared) {
+				vm_lsn = PageGetLSN(BufferGetPage(*vmbuffer));
+				vm_version = ((PageHeader)BufferGetPage(*vmbuffer))->pd_block_scn;
+			}
+		}
+		PG_FINALLY();
+		{
+			LockBuffer(*vmbuffer, BUFFER_LOCK_UNLOCK);
+		}
+		PG_END_TRY();
+	}
+
+	for (;;) {
+		if (!BufferIsValid(*vmbuffer))
+			visibilitymap_pin(vacrel->rel, blkno, vmbuffer);
+		recent_vm = *vmbuffer;
+		ReleaseBuffer(recent_vm);
+		*vmbuffer = InvalidBuffer;
+		if (cleanup_lock)
+			LockBufferForCleanup(buf);
+		else
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		if (visibilitymap_pin_recent(vacrel->rel, blkno, recent_vm, vmbuffer))
+			break;
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		CHECK_FOR_INTERRUPTS();
+		visibilitymap_pin(vacrel->rel, blkno, vmbuffer);
+	}
+
+	if (!prepared || vm_version == 0 || PageIsNew(BufferGetPage(buf))
+		|| !PageIsEmpty(BufferGetPage(buf))
+		|| !ClusterConditionalLockBufferWithMutationContext(*vmbuffer, &vm_writer, object_revision,
+															object_checked))
+		return;
+	PG_TRY();
+	{
+		if (PageGetLSN(BufferGetPage(*vmbuffer)) == vm_lsn
+			&& ((PageHeader)BufferGetPage(*vmbuffer))->pd_block_scn == vm_version)
+			(void)visibilitymap_set_empty(vacrel->rel, blkno, buf, *vmbuffer, &vacrel->identity);
+	}
+	PG_FINALLY();
+	{
+		ClusterUnlockBufferAfterConditionalMutation(*vmbuffer);
+	}
+	PG_END_TRY();
+}
+#endif
+
 /*
  *	lazy_scan_new_or_empty() -- lazy_scan_heap() new/empty page handling.
  *
@@ -2623,9 +2694,19 @@ lazy_scan_skip(LVRelState *vacrel, Buffer *vmbuffer, BlockNumber next_block,
  */
 static bool
 lazy_scan_new_or_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
-					   Page page, bool sharelock, Buffer vmbuffer)
+					   Page page, bool sharelock, Buffer *vmbuffer)
 {
 	Size		freespace;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (vacrel->shared_maintenance_restricted && !PageIsNew(page) && PageIsEmpty(page))
+	{
+		lazy_publish_shared_empty(vacrel, buf, blkno, vmbuffer, !sharelock);
+		/* The helper restored X (and original cleanup when required). Recheck
+		 * new/empty below before either FSM publication or ordinary scanning. */
+		sharelock = false;
+	}
+#endif
 
 	if (PageIsNew(page))
 	{
@@ -2695,7 +2776,7 @@ lazy_scan_new_or_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
 			 * two visible bits and exact versions in one native record. */
 			if (vacrel->versioned)
 				visibilitymap_set(vacrel->rel, blkno, buf, InvalidXLogRecPtr,
-								  vmbuffer, InvalidTransactionId,
+								  *vmbuffer, InvalidTransactionId,
 								  VISIBILITYMAP_ALL_VISIBLE | VISIBILITYMAP_ALL_FROZEN,
 								  &vacrel->identity);
 			else
@@ -2721,7 +2802,7 @@ lazy_scan_new_or_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
 
 				PageSetAllVisible(page);
 				visibilitymap_set(vacrel->rel, blkno, buf, InvalidXLogRecPtr,
-								  vmbuffer, InvalidTransactionId,
+								  *vmbuffer, InvalidTransactionId,
 								  VISIBILITYMAP_ALL_VISIBLE | VISIBILITYMAP_ALL_FROZEN
 #ifdef USE_PGRAC_CLUSTER
 								  , NULL

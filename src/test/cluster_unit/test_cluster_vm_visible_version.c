@@ -28,13 +28,16 @@
 #include "catalog/catalog.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_control.h"
+#include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "storage/freespace.h"
 #include "utils/rel.h"
 #include "unit_test.h"
 #include "cluster/cluster_mode.h"
@@ -111,6 +114,35 @@ static uint8 register_flags[2];
 static bool begun, expecting_error, checksums, repairing, repairing_vm_only;
 static jmp_buf error_jump;
 
+/* Empty-page entry uses actual publication/scan functions, with only the
+ * buffer/current/transport scheduling leaves controlled here. */
+static bool empty_fixture, held[2], pinned[2], writer[2];
+static bool empty_vm_writer, empty_heap_writer, empty_resume, empty_aux;
+static int empty_race, empty_vm_race, empty_repin_misses;
+static unsigned empty_aux_calls, empty_resumes, empty_heap_waits, empty_cleanup_waits;
+static unsigned empty_repins, empty_local_unlocks, empty_fsm;
+static bool empty_error_after_resume, empty_error_at_capture, empty_cancel_repin;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+volatile sig_atomic_t InterruptPending;
+void
+ProcessInterrupts(void)
+{
+	UT_ASSERT(empty_fixture && !held[0] && !held[1] && !pinned[1]);
+	UT_ASSERT(empty_cancel_repin);
+	InterruptPending = false;
+	elog(ERROR, "controlled cancellation at unpinned VM retry");
+}
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	UT_ASSERT(expecting_error);
+	longjmp(error_jump, 1);
+}
+
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
 {
@@ -164,6 +196,8 @@ errfinish(const char *file, int line, const char *function)
 		printf("# unexpected error %s:%d %s\n", file, line, function);
 		abort();
 	}
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
 	longjmp(error_jump, 1);
 }
 bool
@@ -231,6 +265,32 @@ visibilitymap_pin_ok(BlockNumber block, Buffer buffer)
 void
 LockBuffer(Buffer buffer, int mode)
 {
+	if (empty_fixture) {
+		UT_ASSERT(buffer == 1 || buffer == 2);
+		if (cluster_shared_config)
+			UT_ASSERT_EQ(CritSectionCount, 0);
+		if (mode == BUFFER_LOCK_UNLOCK) {
+			UT_ASSERT(held[buffer - 1]);
+			held[buffer - 1] = writer[buffer - 1] = false;
+		} else {
+			UT_ASSERT_EQ(mode, BUFFER_LOCK_EXCLUSIVE);
+			UT_ASSERT(pinned[buffer - 1] && !held[buffer - 1]);
+			if (cluster_shared_config)
+				UT_ASSERT(!held[buffer == 1 ? 1 : 0]);
+			if (buffer == 1) {
+				if (cluster_shared_config)
+					UT_ASSERT(!pinned[1]);
+				empty_heap_waits++;
+				if (empty_race == 1)
+					((PageHeader)pages[0].data)->pd_lower += sizeof(ItemIdData);
+				else if (empty_race == 2)
+					memset(pages[0].data, 0, BLCKSZ);
+				empty_race = 0;
+			}
+			held[buffer - 1] = writer[buffer - 1] = true;
+		}
+		return;
+	}
 	UT_ASSERT_EQ(buffer, 2);
 	UT_ASSERT(mode == BUFFER_LOCK_EXCLUSIVE || mode == BUFFER_LOCK_UNLOCK);
 	if (cluster_shared_config)
@@ -316,8 +376,121 @@ vm_readbuf(Relation rel, BlockNumber block, bool extend)
 void
 ReleaseBuffer(Buffer buffer)
 {
-	(void)buffer;
-	abort();
+	UT_ASSERT(empty_fixture && (buffer == 1 || buffer == 2));
+	UT_ASSERT(pinned[buffer - 1] && !held[buffer - 1]);
+	pinned[buffer - 1] = false;
+}
+
+void
+UnlockReleaseBuffer(Buffer buffer)
+{
+	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+	ReleaseBuffer(buffer);
+}
+
+void
+LockBufferForCleanup(Buffer buffer)
+{
+	UT_ASSERT_EQ(buffer, 1);
+	empty_cleanup_waits++;
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+}
+
+bool
+ClusterLockBufferExclusiveAuxiliaryAware(Buffer *buffer, ResourceXAuxiliaryAcquireContext *context)
+{
+	UT_ASSERT(empty_fixture && context != NULL && !held[0]);
+	UT_ASSERT_EQ(*buffer, 2);
+	empty_aux_calls++;
+	if (!empty_aux) {
+		ReleaseBuffer(*buffer);
+		*buffer = InvalidBuffer;
+		return false;
+	}
+	LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
+	return true;
+}
+
+bool
+ClusterBufferCaptureMutationContext(Buffer buffer, ResourceXWriterUseContext *out, uint64 *revision,
+									bool *checked)
+{
+	UT_ASSERT(empty_fixture && buffer >= 1 && buffer <= 2);
+	if (!pinned[buffer - 1] || !held[buffer - 1])
+		return false;
+	if (buffer == 2 && empty_error_at_capture && !held[0])
+		elog(ERROR, "controlled failure before original VM writer capture");
+	if (buffer == 1 && empty_error_after_resume && held[1])
+		elog(ERROR, "controlled failure after original VM writer resume");
+	if (!writer[buffer - 1] || !(buffer == 1 ? empty_heap_writer : empty_vm_writer))
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->writer_activation_token = 80 + buffer;
+	*revision = 33;
+	*checked = true;
+	return true;
+}
+
+bool
+ClusterConditionalLockBufferWithMutationContext(Buffer buffer,
+												const ResourceXWriterUseContext *expected,
+												uint64 revision, bool checked)
+{
+	UT_ASSERT(empty_fixture && buffer == 2 && held[0] && !held[1] && pinned[1]);
+	UT_ASSERT_EQ(expected->writer_activation_token, 82);
+	UT_ASSERT_EQ(revision, 33);
+	UT_ASSERT(checked);
+	empty_resumes++;
+	if (!empty_resume)
+		return false;
+	held[1] = writer[1] = true;
+	return true;
+}
+
+void
+ClusterUnlockBufferAfterConditionalMutation(Buffer buffer)
+{
+	UT_ASSERT(empty_fixture && buffer == 2 && held[0] && held[1] && writer[1]);
+	held[1] = writer[1] = false;
+	empty_local_unlocks++;
+}
+
+bool
+visibilitymap_pin_recent(Relation rel, BlockNumber block, Buffer recent, Buffer *buffer)
+{
+	UT_ASSERT(empty_fixture && rel == &relation && block == 0 && recent == 2);
+	UT_ASSERT(held[0] && !held[1] && !pinned[1]);
+	empty_repins++;
+	if (empty_repin_misses > 0) {
+		empty_repin_misses--;
+		if (empty_cancel_repin)
+			InterruptPending = true;
+		return false;
+	}
+	pinned[1] = true;
+	*buffer = 2;
+	if (empty_vm_race == 1)
+		((PageHeader)pages[1].data)->pd_block_scn++;
+	else if (empty_vm_race == 2)
+		PageSetLSN(pages[1].data, 999);
+	empty_vm_race = 0;
+	return true;
+}
+
+Size
+GetRecordedFreeSpace(Relation rel, BlockNumber block)
+{
+	UT_ASSERT(empty_fixture && rel == &relation && block == 0 && !held[0]);
+	return 0;
+}
+
+void
+RecordPageWithFreeSpace(Relation rel, BlockNumber block, Size space)
+{
+	UT_ASSERT(empty_fixture && rel == &relation && block == 0);
+	UT_ASSERT(!held[0] && !held[1] && !pinned[0]);
+	UT_ASSERT(space > 0);
+	empty_fsm++;
 }
 
 void
@@ -326,6 +499,10 @@ visibilitymap_pin(Relation rel, BlockNumber block, Buffer *buffer)
 	UT_ASSERT(rel == &relation);
 	UT_ASSERT_EQ(block, 0);
 	UT_ASSERT(!BufferIsValid(*buffer) || *buffer == 2);
+	if (empty_fixture) {
+		UT_ASSERT(!held[0] && !held[1]);
+		pinned[1] = true;
+	}
 	*buffer = 2;
 }
 
@@ -338,10 +515,12 @@ run_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLogRecPtr recptr, Bu
 #include "test_cluster_vm_visible_body.inc"
 #define visibilitymap_set_locked run_set
 #include "test_cluster_vm_visible_wrapper.inc"
+#include "test_cluster_vm_empty_set.inc"
 #undef visibilitymap_set_locked
 
 	static void reset(bool shared, bool visible, uint8 vm_bits)
 {
+	empty_fixture = false;
 	memset(&relation, 0, sizeof(relation));
 	memset(&relform, 0, sizeof(relform));
 	memset(&identity, 0, sizeof(identity));
@@ -350,6 +529,7 @@ run_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLogRecPtr recptr, Bu
 	memset(registered, 0, sizeof(registered));
 	memset(register_flags, 0, sizeof(register_flags));
 	BufferBlocks = pages[0].data;
+	cluster_enabled = true;
 	cluster_shared_config = shared;
 	CritSectionCount = 0;
 	edge_count = inserts = 0;
@@ -682,7 +862,7 @@ UT_TEST(test_actual_empty_vacuum_does_not_acquire_vm_in_critical)
 	// cppcheck-suppress variableScope
 	Buffer buf = 1;
 	// cppcheck-suppress variableScope
-	Buffer vmbuffer = 2;
+	Buffer vm = 2, *vmbuffer = &vm;
 	// cppcheck-suppress variableScope
 	BlockNumber blkno = 0;
 	Page page = pages[0].data;
@@ -852,10 +1032,347 @@ UT_TEST(test_legal_clear_preserves_other_bits_and_is_idempotent)
 	}
 }
 
+/* Bind the original scanner entry, not just its native setter branch. */
+typedef struct LVRelState {
+	Relation rel;
+	bool versioned;
+	bool shared_maintenance_restricted;
+	ClusterSpaceIdentity identity;
+} LVRelState;
+#include "test_cluster_vm_empty_scan.inc"
+
+static LVRelState
+empty_reset(bool visible, uint8 bits)
+{
+	LVRelState state;
+
+	reset(true, visible, bits);
+	empty_fixture = true;
+	held[0] = pinned[0] = pinned[1] = true;
+	held[1] = writer[0] = writer[1] = false;
+	empty_vm_writer = empty_heap_writer = empty_resume = empty_aux = true;
+	empty_race = empty_vm_race = empty_repin_misses = 0;
+	empty_aux_calls = empty_resumes = empty_heap_waits = empty_cleanup_waits = 0;
+	empty_repins = empty_local_unlocks = empty_fsm = 0;
+	empty_error_after_resume = empty_error_at_capture = empty_cancel_repin = false;
+	InterruptPending = false;
+	expected_cutoff = InvalidTransactionId;
+	state.rel = &relation;
+	state.versioned = state.shared_maintenance_restricted = true;
+	state.identity = identity;
+	return state;
+}
+
+UT_TEST(test_empty_shared_publishes_exact_native_two_page_versions)
+{
+	for (int share = 0; share <= 1; share++) {
+		LVRelState state = empty_reset(false, VISIBILITYMAP_VALID_BITS << 2);
+		Buffer vm = 2;
+
+		UT_ASSERT(lazy_scan_new_or_empty(&state, 1, 0, pages[0].data, share, &vm));
+		UT_ASSERT_EQ(inserts, 1);
+		UT_ASSERT_EQ(edge_count, 2);
+		UT_ASSERT_EQ(next_token, 101);
+		UT_ASSERT_EQ(edges[0].before.mutation_token, 30);
+		UT_ASSERT_EQ(edges[1].before.mutation_token, 20);
+		UT_ASSERT(PageIsAllVisible(pages[0].data));
+		UT_ASSERT_EQ((uint8)*PageGetContents(pages[1].data), 15);
+		UT_ASSERT_EQ(PageGetLSN(pages[0].data), UINT64_C(0x9000));
+		UT_ASSERT_EQ(PageGetLSN(pages[1].data), UINT64_C(0x9000));
+		UT_ASSERT_EQ(empty_aux_calls, 1);
+		UT_ASSERT_EQ(empty_resumes, 1);
+		UT_ASSERT_EQ(empty_local_unlocks, 1);
+		UT_ASSERT_EQ(empty_heap_waits, 1);
+		UT_ASSERT_EQ(empty_cleanup_waits, !share);
+		UT_ASSERT(!pinned[0] && pinned[1] && !held[0] && !held[1]);
+		UT_ASSERT_EQ(empty_fsm, 1);
+	}
+}
+
+UT_TEST(test_empty_shared_upgrades_av_and_keeps_qualified_noop)
+{
+	for (int bits = 1; bits <= 3; bits += 2) {
+		LVRelState state = empty_reset(true, bits);
+		Buffer vm = 2;
+
+		UT_ASSERT(lazy_scan_new_or_empty(&state, 1, 0, pages[0].data, false, &vm));
+		UT_ASSERT_EQ((uint8)*PageGetContents(pages[1].data), 3);
+		UT_ASSERT_EQ(inserts, bits == 1);
+		UT_ASSERT_EQ(next_token, bits == 1 ? 101 : 100);
+		UT_ASSERT_EQ(empty_local_unlocks, 1);
+	}
+}
+
+UT_TEST(test_empty_shared_rechecks_insert_after_lock_handoff)
+{
+	LVRelState state = empty_reset(false, 0);
+	Buffer vm = 2;
+
+	empty_race = 1;
+	UT_ASSERT(!lazy_scan_new_or_empty(&state, 1, 0, pages[0].data, true, &vm));
+	UT_ASSERT(held[0] && writer[0] && pinned[0] && pinned[1] && !held[1]);
+	UT_ASSERT_EQ(inserts + edge_count + empty_fsm, 0);
+	UT_ASSERT(!PageIsAllVisible(pages[0].data));
+	UT_ASSERT_EQ(next_token, 100);
+	UnlockReleaseBuffer(1);
+}
+
+UT_TEST(test_empty_shared_rechecks_new_page_without_publishing)
+{
+	LVRelState state = empty_reset(false, 0);
+	Buffer vm = 2;
+
+	empty_race = 2;
+	UT_ASSERT(lazy_scan_new_or_empty(&state, 1, 0, pages[0].data, false, &vm));
+	UT_ASSERT(PageIsNew(pages[0].data));
+	UT_ASSERT_EQ(inserts + edge_count, 0);
+	UT_ASSERT_EQ(empty_fsm, 1);
+	UT_ASSERT(!pinned[0] && !held[0] && !held[1]);
+}
+
+UT_TEST(test_empty_shared_refuses_unproved_writer_version_space_or_layout)
+{
+	for (int variant = 0; variant < 10; variant++) {
+		LVRelState state = empty_reset(false, 0);
+		Buffer vm = 2;
+
+		switch (variant) {
+		case 0:
+			empty_vm_writer = false;
+			break;
+		case 1:
+			empty_heap_writer = false;
+			break;
+		case 2:
+			empty_resume = false;
+			break;
+		case 3:
+			empty_aux = false;
+			break;
+		case 4:
+			empty_vm_race = 1;
+			break;
+		case 5:
+			empty_vm_race = 2;
+			break;
+		case 6:
+			state.identity.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+			break;
+		case 7:
+			((PageHeader)pages[1].data)->pd_block_scn = 0;
+			break;
+		case 8:
+			((PageHeader)pages[0].data)->pd_block_scn = 0;
+			break;
+		case 9:
+			((PageHeader)pages[1].data)->pd_upper--;
+			break;
+		}
+		UT_ASSERT(lazy_scan_new_or_empty(&state, 1, 0, pages[0].data, false, &vm));
+		UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
+		UT_ASSERT_EQ(next_token, 100);
+		UT_ASSERT(!PageIsAllVisible(pages[0].data));
+		UT_ASSERT(!held[0] && !held[1] && !pinned[0] && pinned[1]);
+	}
+}
+
+UT_TEST(test_empty_shared_repin_misses_do_not_refetch_vm_current)
+{
+	LVRelState state = empty_reset(false, 0);
+	Buffer vm = 2;
+
+	empty_repin_misses = 3;
+	UT_ASSERT(lazy_scan_new_or_empty(&state, 1, 0, pages[0].data, false, &vm));
+	UT_ASSERT_EQ(inserts, 1);
+	UT_ASSERT_EQ(empty_aux_calls, 1);
+	UT_ASSERT_EQ(empty_heap_waits, 4);
+	UT_ASSERT_EQ(empty_repins, 4);
+	UT_ASSERT_EQ(empty_resumes, 1);
+	UT_ASSERT_EQ(empty_local_unlocks, 1);
+	UT_ASSERT_EQ(empty_fsm, 1);
+}
+
+UT_TEST(test_empty_direct_entry_requires_both_original_writers_and_exact_tags)
+{
+	for (int variant = 0; variant < 19; variant++) {
+		LVRelState state = empty_reset(false, 0);
+
+		held[1] = writer[0] = writer[1] = true;
+		if (variant < 10)
+			change_tag(variant < 5 ? 1 : 2, variant % 5);
+		else
+			switch (variant) {
+			case 10:
+				pinned[0] = false;
+				break;
+			case 11:
+				pinned[1] = false;
+				break;
+			case 12:
+				held[0] = false;
+				break;
+			case 13:
+				held[1] = false;
+				break;
+			case 14:
+				writer[0] = false;
+				break;
+			case 15:
+				writer[1] = false;
+				break;
+			case 16:
+				state.identity.key.locator.relNumber++;
+				break;
+			case 17:
+				memset(state.identity.incarnation, 0, 16);
+				break;
+			case 18:
+				state.identity.key.database_incarnation++;
+				break;
+			}
+		UT_ASSERT(!visibilitymap_set_empty(&relation, 0, 1, 2, &state.identity));
+		UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
+		UT_ASSERT_EQ(next_token, 100);
+		UT_ASSERT(memcmp(before, pages, sizeof(pages)) == 0);
+		UT_ASSERT_EQ(empty_aux_calls + empty_heap_waits + empty_resumes, 0);
+	}
+}
+
+UT_TEST(test_empty_direct_entry_rejects_nonempty_new_and_malformed_heap)
+{
+	for (int variant = 0; variant < 12; variant++) {
+		LVRelState state = empty_reset(false, 0);
+		PageHeader header = (PageHeader)pages[0].data;
+
+		held[1] = writer[0] = writer[1] = true;
+		switch (variant) {
+		case 0:
+			header->pd_lower += sizeof(ItemIdData);
+			break;
+		case 1:
+			memset(header, 0, BLCKSZ);
+			break;
+		case 2:
+			header->pd_lower--;
+			break;
+		case 3:
+			header->pd_upper = header->pd_lower - 1;
+			break;
+		case 4:
+			header->pd_special--;
+			break;
+		case 5:
+			header->pd_special = BLCKSZ + 1;
+			break;
+		case 6:
+			header->pd_flags &= ~PD_HAS_ITL;
+			break;
+		case 7:
+			header->pd_flags |= PD_UNDO_SEG_HEADER;
+			break;
+		case 8:
+			header->pd_block_scn = 0;
+			break;
+		case 9:
+			PageSetPageSizeAndVersion((Page)header, BLCKSZ, 0);
+			break;
+		case 10:
+			header->pd_special = BLCKSZ;
+			break;
+		case 11:
+			header->pd_upper = header->pd_special + 1;
+			break;
+		}
+		memcpy(before, pages, sizeof(pages));
+		UT_ASSERT(!visibilitymap_set_empty(&relation, 0, 1, 2, &state.identity));
+		UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
+		UT_ASSERT_EQ(next_token, 100);
+		UT_ASSERT(memcmp(before, pages, sizeof(pages)) == 0);
+		UT_ASSERT(held[0] && held[1] && writer[0] && writer[1]);
+	}
+}
+
+UT_TEST(test_empty_publication_error_unwinds_only_its_vm_scope)
+{
+	for (int phase = 0; phase < 2; phase++) {
+		LVRelState state = empty_reset(false, 0);
+		Buffer vm = 2;
+		volatile bool caught = false;
+
+		empty_error_at_capture = phase == 0;
+		empty_error_after_resume = phase == 1;
+		expecting_error = true;
+		if (setjmp(error_jump) == 0)
+			(void)lazy_scan_new_or_empty(&state, 1, 0, pages[0].data, false, &vm);
+		else
+			caught = true;
+		expecting_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT(PG_exception_stack == NULL && error_context_stack == NULL);
+		UT_ASSERT(!held[1] && !writer[1] && pinned[0] && pinned[1]);
+		UT_ASSERT_EQ(held[0], phase == 1);
+		UT_ASSERT_EQ(empty_local_unlocks, phase == 1);
+		UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
+		UT_ASSERT_EQ(next_token, 100);
+		UT_ASSERT(memcmp(before, pages, sizeof(pages)) == 0);
+		/* Original caller/ResourceOwner owns these surviving references. */
+		if (held[0])
+			LockBuffer(1, BUFFER_LOCK_UNLOCK);
+		ReleaseBuffer(1);
+		ReleaseBuffer(2);
+	}
+}
+
+UT_TEST(test_empty_cancel_at_repin_miss_keeps_no_vm_pin_or_writer)
+{
+	LVRelState state = empty_reset(false, 0);
+	Buffer vm = 2;
+	volatile bool caught = false;
+
+	empty_repin_misses = 1;
+	empty_cancel_repin = expecting_error = true;
+	if (setjmp(error_jump) == 0)
+		(void)lazy_scan_new_or_empty(&state, 1, 0, pages[0].data, false, &vm);
+	else
+		caught = true;
+	expecting_error = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(vm, InvalidBuffer);
+	UT_ASSERT(!held[0] && !held[1] && !writer[0] && !writer[1] && !pinned[1]);
+	UT_ASSERT(pinned[0]);
+	UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
+	UT_ASSERT_EQ(next_token, 100);
+	ReleaseBuffer(1);
+}
+
+UT_TEST(test_original_new_page_and_nonshared_empty_paths_preserved)
+{
+	for (int variant = 0; variant < 3; variant++) {
+		LVRelState state = empty_reset(false, 0);
+		Buffer vm = 2;
+
+		if (variant == 0)
+			memset(pages[0].data, 0, BLCKSZ);
+		else {
+			cluster_enabled = cluster_shared_config = false;
+			state.versioned = state.shared_maintenance_restricted = false;
+			UT_ASSERT(!cluster_heap_maintenance_restricted(&relation));
+			PageSetLSN(pages[0].data, 123);
+		}
+		UT_ASSERT(lazy_scan_new_or_empty(&state, 1, 0, pages[0].data, variant == 2, &vm));
+		UT_ASSERT_EQ(empty_aux_calls + empty_resumes, 0);
+		UT_ASSERT_EQ(inserts, variant != 0);
+		UT_ASSERT_EQ(edge_count, 0);
+		UT_ASSERT_EQ(next_token, 100);
+		UT_ASSERT_EQ(empty_fsm, 1);
+		UT_ASSERT(!held[0] && !held[1] && !pinned[0] && pinned[1]);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(30);
 	UT_RUN(test_visible_exact_two_page_batch);
 	UT_RUN(test_no_change_allocates_no_version);
 	UT_RUN(test_nonshared_preserves_native_hint_lsn_rules);
@@ -875,6 +1392,17 @@ main(void)
 	UT_RUN(test_vm_mutators_reject_wrong_exact_target_before_lock_or_write);
 	UT_RUN(test_set_rejects_wrong_heap_identity_before_lock_or_write);
 	UT_RUN(test_legal_clear_preserves_other_bits_and_is_idempotent);
+	UT_RUN(test_empty_shared_publishes_exact_native_two_page_versions);
+	UT_RUN(test_empty_shared_upgrades_av_and_keeps_qualified_noop);
+	UT_RUN(test_empty_shared_rechecks_insert_after_lock_handoff);
+	UT_RUN(test_empty_shared_rechecks_new_page_without_publishing);
+	UT_RUN(test_empty_shared_refuses_unproved_writer_version_space_or_layout);
+	UT_RUN(test_empty_shared_repin_misses_do_not_refetch_vm_current);
+	UT_RUN(test_empty_direct_entry_requires_both_original_writers_and_exact_tags);
+	UT_RUN(test_empty_direct_entry_rejects_nonempty_new_and_malformed_heap);
+	UT_RUN(test_empty_publication_error_unwinds_only_its_vm_scope);
+	UT_RUN(test_empty_cancel_at_repin_miss_keeps_no_vm_pin_or_writer);
+	UT_RUN(test_original_new_page_and_nonshared_empty_paths_preserved);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -127,6 +127,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "catalog/pg_control.h"
+#include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_pcm_lock.h"
@@ -693,6 +694,50 @@ visibilitymap_set_retry_aware(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 	LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
 	return true;
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/* An initialized, coherently owned empty heap has no tuple/HOT/MX inputs to
+ * classify. This entry grants no permission for a nonempty page or an old VM
+ * bit. Both writer-use brackets must already be active; never acquire current
+ * or initialize a page here. The original visible WAL couples both versions. */
+bool
+visibilitymap_set_empty(Relation rel, BlockNumber heapBlk, Buffer heapBuf, Buffer vmBuf,
+						const ClusterSpaceIdentity *identity)
+{
+	ResourceXWriterUseContext writer;
+	uint64 object_revision;
+	bool object_checked;
+	Page page;
+	PageHeader header;
+	RfPageProducerComponentV1 heap_component, vm_component;
+
+	if (rel == NULL || identity == NULL || InRecovery || !cluster_heap_maintenance_restricted(rel)
+		|| !cluster_shared_config || rel->rd_rel->relpersistence != RELPERSISTENCE_PERMANENT
+		|| !RelationNeedsWAL(rel) || cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) != 1
+		|| heapBlk == InvalidBlockNumber || !vm_buffer_matches(rel, heapBuf, MAIN_FORKNUM, heapBlk)
+		|| !vm_buffer_matches(rel, vmBuf, VISIBILITYMAP_FORKNUM, HEAPBLK_TO_MAPBLOCK(heapBlk))
+		|| !ClusterBufferCaptureMutationContext(heapBuf, &writer, &object_revision, &object_checked)
+		|| !ClusterBufferCaptureMutationContext(vmBuf, &writer, &object_revision, &object_checked))
+		return false;
+
+	page = BufferGetPage(heapBuf);
+	header = (PageHeader)page;
+	if (PageIsNew(page) || !PageIsEmpty(page) || PageGetPageSize(page) != BLCKSZ
+		|| PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION
+		|| header->pd_lower != SizeOfPageHeaderData || header->pd_lower > header->pd_upper
+		|| header->pd_upper > header->pd_special || header->pd_special > BLCKSZ
+		|| header->pd_special != MAXALIGN(header->pd_special) || !PageHasItl(page)
+		|| PageGetSpecialSize(page) < CLUSTER_ITL_ARRAY_SIZE || header->pd_block_scn == 0
+		|| !vm_redo_page_valid(BufferGetPage(vmBuf))
+		|| !cluster_space_buffer_version_component(identity, heapBuf, 1, 1, &heap_component)
+		|| !cluster_space_buffer_version_component(identity, vmBuf, 0, 0, &vm_component))
+		return false;
+
+	visibilitymap_set_locked(rel, heapBlk, heapBuf, InvalidXLogRecPtr, vmBuf, InvalidTransactionId,
+							 VISIBILITYMAP_VALID_BITS, identity);
+	return true;
+}
+#endif
 
 static void
 visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLogRecPtr recptr,
