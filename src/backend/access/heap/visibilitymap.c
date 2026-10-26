@@ -1010,7 +1010,7 @@ visibilitymap_read_begin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf,
 
 #ifdef USE_PGRAC_CLUSTER
 /* Bind the caller's retained evaluator to a coherent VM observation. Admission
- * is sampled before acquisition; local identity and invalidation checks after
+ * and SPACE identity are sampled before VM acquisition; local rechecks after
  * acquisition invoke no services and prove no publication or skip permission. */
 bool
 visibilitymap_read_snapshot_begin(Relation rel, BlockNumber heapBlk, Snapshot snapshot,
@@ -1018,6 +1018,7 @@ visibilitymap_read_snapshot_begin(Relation rel, BlockNumber heapBlk, Snapshot sn
 {
 	ClusterSnapshotReadScopeV1 evaluation;
 	ClusterUndoReadAdmissionFence admission;
+	ClusterSpaceIdentityObservationV1 identity;
 	uint64 before = 0, after = 0;
 	volatile bool observed = false;
 
@@ -1036,9 +1037,11 @@ visibilitymap_read_snapshot_begin(Relation rel, BlockNumber heapBlk, Snapshot sn
 	{
 		if (cluster_snapshot_cr_identity_v1(snapshot, &before)
 			&& cluster_undo_horizon_read_admission_capture(evaluation.read_scn, &admission)
+			&& cluster_space_relation_identity_capture_v1(rel, &identity)
 			&& visibilitymap_read_begin(rel, heapBlk, vmbuf, scope, status)
 			&& cluster_snapshot_cr_identity_v1(snapshot, &after) && before == after
-			&& cluster_undo_horizon_read_admission_current(&admission))
+			&& cluster_undo_horizon_read_admission_current(&admission)
+			&& cluster_space_relation_identity_current_v1(rel, &identity))
 			observed = true;
 	}
 	PG_FINALLY();

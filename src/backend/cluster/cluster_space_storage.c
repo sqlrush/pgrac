@@ -88,8 +88,9 @@ static void
 space_identity_invalidate(Datum arg, Oid relid)
 {
 	Assert(space_identity_cache != NULL);
-	if (++space_identity_invalidations == 0)
+	if (space_identity_invalidations == UINT64_MAX)
 		elog(ERROR, "SPACE identity invalidation counter exhausted");
+	space_identity_invalidations++;
 	if (OidIsValid(relid))
 		hash_search(space_identity_cache, &relid, HASH_REMOVE, NULL);
 	else {
@@ -348,6 +349,52 @@ cluster_space_relation_get_identity(Relation relation, ClusterSpaceIdentity *out
 		*out = identity;
 		return true;
 	}
+}
+
+bool
+cluster_space_relation_identity_capture_v1(Relation relation, ClusterSpaceIdentityObservationV1 *out)
+{
+	ClusterSpaceIdentityObservationV1 candidate;
+	RelFileLocator locator;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (relation == NULL || relation->rd_rel == NULL)
+		return false;
+	memset(&candidate, 0, sizeof(candidate));
+	candidate.relid = RelationGetRelid(relation);
+	locator = relation->rd_locator;
+	if (!cluster_space_relation_get_identity(relation, &candidate.identity))
+		return false;
+	candidate.invalidations = space_identity_invalidations;
+	if (!RelFileLocatorEquals(locator, candidate.identity.key.locator)
+		|| !cluster_space_relation_identity_current_v1(relation, &candidate))
+		return false;
+	*out = candidate;
+	return true;
+}
+
+bool
+cluster_space_relation_identity_current_v1(Relation relation,
+										 const ClusterSpaceIdentityObservationV1 *expected)
+{
+	SpaceIdentityCacheEntry *entry;
+
+	if (relation == NULL || relation->rd_rel == NULL || !relation->rd_isvalid
+		|| expected == NULL || !OidIsValid(expected->relid)
+		|| RelationGetRelid(relation) != expected->relid
+		|| !RelFileLocatorEquals(relation->rd_locator, expected->identity.key.locator)
+		|| expected->identity.state != CLUSTER_SPACE_IDENTITY_LIVE
+		|| expected->invalidations == UINT64_MAX
+		|| expected->invalidations != space_identity_invalidations || space_identity_cache == NULL)
+		return false;
+	entry = hash_search(space_identity_cache, &expected->relid, HASH_FIND, NULL);
+	return entry != NULL && space_identity_key_matches(&entry->identity.key, &expected->identity.key)
+		   && memcmp(entry->identity.incarnation, expected->identity.incarnation, 16) == 0
+		   && entry->identity.sequence == expected->identity.sequence
+		   && entry->identity.operation == expected->identity.operation
+		   && entry->identity.state == expected->identity.state;
 }
 
 static bool
