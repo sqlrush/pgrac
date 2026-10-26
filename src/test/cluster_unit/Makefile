@@ -8690,6 +8690,7 @@ test_cluster_tt_active_owner test_cluster_tt_slot_allocator: \
 # cluster_undo_smgr.  File-I/O behavior is e2e in cluster_tap t/219.
 test_cluster_tt_durable: test_cluster_tt_durable.c unit_test.h \
 		$(srcdir)/test_cluster_undo_head_operation.inc \
+		$(srcdir)/test_cluster_tt_head_chain.inc \
 		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
 		$(CLUSTER_TT_DURABLE_O) \
 		$(top_builddir)/src/backend/cluster/cluster_uba.o

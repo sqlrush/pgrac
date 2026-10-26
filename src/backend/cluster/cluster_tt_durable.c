@@ -1903,24 +1903,65 @@ cluster_tt_durable_redo_set_head_slot(uint8 instance, uint32 segment_id, uint16 
 }
 
 
-/* Original recovery namespace only. A current record's identity is compared
- * against the immutable WAL identity, never substituted for that identity. */
+/* Validate retained membership, not child visibility or rollback progress.
+ * Legacy records can only name the raw top xid. Extended records must bind
+ * the immutable WAL FullXid/generation, including when already discarded. */
 static bool
-tt_head_operation_read_control(const xl_undo_tt_slot_set_head_operation *record, UBA address,
-							   bool exact_wal, UndoOperationTrailer *operation_out,
-							   UBA *previous_out)
+tt_head_operation_member_payload(const xl_undo_tt_slot_set_head_operation *record, UBA address,
+								 const UndoRecordHeader *member, const char *payload,
+								 bool exact_wal)
+{
+	UndoOperationTrailer operation;
+	UndoSavepointRollbackPayload body;
+	UndoItlHistoryTrailer history;
+	xl_undo_tt_slot_set_head_operation present = *record;
+	uint16 body_length;
+
+	if (member->record_type == UNDO_RECORD_SAVEPOINT_ROLLBACK) {
+		if (!cluster_undo_record_decode_rollback_payload(member, payload, member->payload_length,
+														 &body, &operation))
+			return false;
+		present.head.first_undo_block = address;
+		present.operation = operation;
+		if (!cluster_undo_head_operation_matches_control(&present, member, payload,
+														 member->payload_length))
+			return false;
+	} else {
+		if (exact_wal)
+			return false;
+		if ((member->flags & UNDO_REC_FLAG_HAS_OPERATION) == 0)
+			return member->xid == record->head.xid
+				   && cluster_undo_record_decode_payload(member, payload, member->payload_length,
+														 &body_length, &history);
+		if (!cluster_undo_record_decode_operation_payload(member, payload, member->payload_length,
+														  &body_length, &history, &operation))
+			return false;
+	}
+	if (operation.canonical_top_fxid != record->operation.canonical_top_fxid
+		|| operation.canonical_segment_generation != record->operation.canonical_segment_generation)
+		return false;
+	if (exact_wal || cluster_undo_record_uba_equal(address, record->head.first_undo_block))
+		return memcmp(&operation, &record->operation, sizeof(operation)) == 0;
+	return operation.operation_sequence != record->operation.operation_sequence;
+}
+
+/* Original recovery namespace only. Geometry and owner checks precede I/O;
+ * no physical address or reservation sequence implies publication order. */
+static bool
+tt_head_operation_read_member(const xl_undo_tt_slot_set_head_operation *record, UBA address,
+							  bool exact_wal, UBA *previous_out)
 {
 	PGAlignedBlock page;
 	const UndoBlockHeader *block = (const UndoBlockHeader *)page.data;
 	const UndoSlotDirEntry *slot;
-	UndoRecordHeader control;
-	xl_undo_tt_slot_set_head_operation present = *record;
+	UndoRecordHeader member;
 	uint32 segment, block_no;
 	uint16 tt_offset, row;
 
 	if (!uba_decode_record(address, &segment, &block_no, &tt_offset, &row)
 		|| uba_origin_node_id(address) != record->head.instance - 1
 		|| tt_offset != record->head.slot_offset
+		|| row >= (BLCKSZ - sizeof(UndoBlockHeader)) / sizeof(UndoSlotDirEntry)
 		|| !cluster_undo_smgr_read_block(
 			cluster_undo_recovery_intent_for_owner(record->head.instance), segment,
 			record->head.instance, block_no, page.data)
@@ -1931,48 +1972,79 @@ tt_head_operation_read_control(const xl_undo_tt_slot_set_head_operation *record,
 	slot = UNDO_SLOT_DIR_PTR(page.data, row);
 	if (!cluster_undo_record_slot_range_valid(block->slot_count, row, slot->record_offset,
 											  slot->record_length)
-		|| slot->record_length != sizeof(control) + UNDO_SAVEPOINT_ROLLBACK_PAYLOAD_LENGTH
+		|| slot->record_length < sizeof(member)
 		|| (uint64)slot->record_offset + slot->record_length > block->free_offset
 		|| block->free_offset > BLCKSZ - (uint32)block->slot_count * sizeof(*slot))
 		return false;
-	memcpy(&control, page.data + slot->record_offset, sizeof(control));
-	memcpy(&present.operation,
-		   page.data + slot->record_offset + sizeof(control) + UNDO_SAVEPOINT_ROLLBACK_LENGTH,
-		   sizeof(present.operation));
-	present.head.first_undo_block = address;
-	if (slot->record_type != control.record_type || slot->flags != control.flags
-		|| present.operation.canonical_top_fxid != record->operation.canonical_top_fxid
-		|| present.operation.canonical_segment_generation
-			   != record->operation.canonical_segment_generation
-		|| (exact_wal
-			&& memcmp(&present.operation, &record->operation, sizeof(present.operation)) != 0)
-		|| !cluster_undo_head_operation_matches_control(
-			&present, &control, page.data + slot->record_offset + sizeof(control),
-			control.payload_length))
+	memcpy(&member, page.data + slot->record_offset, sizeof(member));
+	if (slot->record_type != member.record_type || slot->flags != member.flags
+		|| member.payload_length != slot->record_length - sizeof(member)
+		|| member.origin_node_id != record->head.instance - 1
+		|| member.tt_slot_segment_id != record->head.segment_id
+		|| member.tt_slot_id != (uint32)record->head.slot_offset + 1
+		|| member.tt_wrap_plus1 != (uint32)record->head.wrap + 1
+		|| !TransactionIdIsNormal(member.xid) || !SCN_VALID(member.write_scn)
+		|| !cluster_undo_rollback_address_valid(&member, member.prev_uba, true)
+		|| cluster_undo_record_uba_equal(address, member.prev_uba)
+		|| !tt_head_operation_member_payload(
+			record, address, &member, page.data + slot->record_offset + sizeof(member), exact_wal))
 		return false;
-	*operation_out = present.operation;
-	*previous_out = control.prev_uba;
+	*previous_out = member.prev_uba;
 	return true;
 }
 
-/* Reservation sequences identify operations; they do not order publication.
- * Prove a direct retained control edge instead. Indirect/DATA predecessors
- * stay blocked until the retained-record walker is connected. */
+/* Brent cycle detection keeps recovery memory constant without accepting a
+ * bounded prefix as proof of a complete retained chain. The other walk
+ * validates the suffix below a found target; both hits mean a cycle. */
+static bool
+tt_head_operation_walk(const xl_undo_tt_slot_set_head_operation *record, UBA first, UBA target,
+					   bool *found)
+{
+	UBA current = first, checkpoint = first;
+	uint64 power = 1, period = 0;
+
+	*found = false;
+	while (!UBA_is_invalid(current)) {
+		if (!UBA_is_invalid(target) && cluster_undo_record_uba_equal(current, target)) {
+			*found = true;
+			return true;
+		}
+		if (!tt_head_operation_read_member(record, current, false, &current))
+			return false;
+		period++;
+		if (cluster_undo_record_uba_equal(current, checkpoint))
+			return false;
+		if (period == power) {
+			checkpoint = current;
+			period = 0;
+			if (power > UINT64_MAX / 2)
+				return false;
+			power *= 2;
+		}
+	}
+	return true;
+}
+
+/* An append and a stale replay are opposite ancestry relations. Validate
+ * both directions so that a conflicting edge cannot manufacture authority. */
 static ClusterUndoHeadOperationDecision
 tt_head_operation_existing_order(const xl_undo_tt_slot_set_head_operation *record,
 								 UBA existing_head, UBA predecessor)
 {
-	UndoOperationTrailer existing_operation;
-	UBA existing_previous;
+	UBA nil = InvalidUba_init;
 	bool publishes_after, already_superseded;
 
-	if (!tt_head_operation_read_control(record, existing_head, false, &existing_operation,
-										&existing_previous)
-		|| existing_operation.operation_sequence == record->operation.operation_sequence)
+	if (UBA_is_invalid(existing_head)
+		|| cluster_undo_record_uba_equal(existing_head, record->head.first_undo_block)) {
+		if (!tt_head_operation_walk(record, predecessor, nil, &publishes_after))
+			return CLUSTER_UNDO_HEAD_OPERATION_BLOCKED;
+		return UBA_is_invalid(existing_head) ? CLUSTER_UNDO_HEAD_OPERATION_APPLY
+											 : CLUSTER_UNDO_HEAD_OPERATION_ALREADY;
+	}
+	if (!tt_head_operation_walk(record, predecessor, existing_head, &publishes_after)
+		|| !tt_head_operation_walk(record, existing_head, record->head.first_undo_block,
+								   &already_superseded))
 		return CLUSTER_UNDO_HEAD_OPERATION_BLOCKED;
-	publishes_after = cluster_undo_record_uba_equal(predecessor, existing_head);
-	already_superseded
-		= cluster_undo_record_uba_equal(existing_previous, record->head.first_undo_block);
 	if (publishes_after == already_superseded)
 		return CLUSTER_UNDO_HEAD_OPERATION_BLOCKED;
 	return publishes_after ? CLUSTER_UNDO_HEAD_OPERATION_APPLY : CLUSTER_UNDO_HEAD_OPERATION_STALE;
@@ -1986,7 +2058,6 @@ tt_head_operation_target(const xl_undo_tt_slot_set_head_operation *record, TTSlo
 	const UndoSegmentHeaderData *b = (const UndoSegmentHeaderData *)second.data;
 	ClusterUndoHeadOperationDecision decision;
 	ClusterUndoPathIntent intent;
-	UndoOperationTrailer operation;
 	UBA predecessor = InvalidUba_init;
 
 	if (!cluster_undo_head_operation_valid(record))
@@ -2003,11 +2074,11 @@ tt_head_operation_target(const xl_undo_tt_slot_set_head_operation *record, TTSlo
 		return decision;
 	if ((decision == CLUSTER_UNDO_HEAD_OPERATION_APPLY
 		 || decision == CLUSTER_UNDO_HEAD_OPERATION_ALREADY)
-		&& !tt_head_operation_read_control(record, record->head.first_undo_block, true, &operation,
-										   &predecessor))
+		&& !tt_head_operation_read_member(record, record->head.first_undo_block, true,
+										  &predecessor))
 		return CLUSTER_UNDO_HEAD_OPERATION_BLOCKED;
 	if (decision == CLUSTER_UNDO_HEAD_OPERATION_APPLY
-		&& !UBA_is_invalid(a->tt_slots[record->head.slot_offset].first_undo_block)) {
+		|| decision == CLUSTER_UNDO_HEAD_OPERATION_ALREADY) {
 		decision = tt_head_operation_existing_order(
 			record, a->tt_slots[record->head.slot_offset].first_undo_block, predecessor);
 		if (decision == CLUSTER_UNDO_HEAD_OPERATION_BLOCKED)

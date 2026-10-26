@@ -964,6 +964,8 @@ cluster_undo_smgr_header_writer_close(int fd)
 static uint32 g_read_block_absent_once_segment;
 static char g_head_control_block[BLCKSZ];
 static bool g_head_control_enabled;
+static bool head_chain_fixture_read(uint32 segment, uint32 block, char *buf);
+static void head_chain_seed_legacy_parent(uint16 wrap);
 
 
 bool
@@ -971,6 +973,8 @@ cluster_undo_smgr_read_block(ClusterUndoPathIntent intent pg_attribute_unused(),
 							 uint8 owner_instance pg_attribute_unused(), uint32 block_no, char *buf)
 {
 	g_read_block_calls++;
+	if (head_chain_fixture_read(segment_id, block_no, buf))
+		return true;
 	if (g_head_control_enabled && segment_id == 1 && block_no == 9 && buf != NULL) {
 		memcpy(buf, g_head_control_block, BLCKSZ);
 		return true;
@@ -3625,6 +3629,7 @@ seed_operation_head_control(const TestUndoHeadOperation *value)
 	slot->record_type = record.record_type;
 	slot->flags = record.flags;
 	g_head_control_enabled = true;
+	head_chain_seed_legacy_parent(value->head.wrap);
 }
 
 static void
@@ -3910,6 +3915,8 @@ UT_TEST(test_operation_head_present_barrier_failure_is_fatal)
 	UT_ASSERT_EQ(g_present_durable_calls, 1);
 }
 
+#include "test_cluster_tt_head_chain.inc"
+
 /*
  * F-D-29 restart residue: a crash restart rebuilds shared memory -- and the
  * checkpoint's record of unsynced header writes -- while the page cache still
@@ -4184,7 +4191,15 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(122);
+	UT_PLAN(130);
+	UT_RUN(test_head_chain_forward_crosses_data_and_completed_control);
+	UT_RUN(test_head_chain_stale_follows_ancestry_not_sequence);
+	UT_RUN(test_head_chain_rejects_corrupt_or_unknown_members);
+	UT_RUN(test_head_chain_rejects_cycles_and_unrelated_heads);
+	UT_RUN(test_head_chain_legacy_top_is_not_an_unqualified_child);
+	UT_RUN(test_head_chain_has_no_small_traversal_ceiling);
+	UT_RUN(test_head_chain_rejects_tt_snapshot_drift);
+	UT_RUN(test_head_chain_nil_and_already_validate_the_older_chain);
 	UT_RUN(test_operation_head_outer_reservation_can_publish_after_inner);
 	UT_RUN(test_operation_head_native_never_regresses_retained_control);
 	UT_RUN(test_operation_head_present_barrier_failure_is_fatal);
