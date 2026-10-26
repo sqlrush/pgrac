@@ -405,6 +405,19 @@ undo_cleaner_capacity_floor(ClusterUndoHorizonFloor *floor)
 		   && !cluster_undo_horizon_epoch_fence_tripped(floor->epoch);
 }
 
+/* Original worker identity only, not evidence that capacity can be freed.
+ * The caller holds the cleaner lock; PID/timestamps cannot identify respawn. */
+static uint64
+undo_cleaner_capacity_owner_generation_locked(unsigned worker_id)
+{
+	const UndoCleanerWorkerState *worker = &undo_cleaner_state->workers[worker_id];
+
+	if (undo_cleaner_state->shutdown_requested || worker->status != UNDO_CLEANER_READY
+		|| worker->latch == NULL || worker->incarnation_generation == UINT64_MAX)
+		return 0;
+	return worker->incarnation_generation;
+}
+
 bool
 cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *continuation)
 {
@@ -426,28 +439,45 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 	{
 		ClusterUndoHorizonFloor floor;
 		ClusterCtrcCapacityProbeResult proof = CLUSTER_CTRC_CAPACITY_REFUSE;
+		uint64 owner_generations[CLUSTER_UNDO_CLEANER_WORKER_TYPES] = { 0 };
 
 		CHECK_FOR_INTERRUPTS();
 		if (cluster_undo_cleaner_enabled && cluster_storage_mode_enabled()
-			&& undo_cleaner_capacity_floor(&floor))
+			&& undo_cleaner_capacity_floor(&floor)) {
+			LWLockAcquire(&undo_cleaner_state->lwlock, LW_SHARED);
+			for (unsigned i = 0; i < CLUSTER_UNDO_CLEANER_WORKER_TYPES; i++)
+				owner_generations[i] = undo_cleaner_capacity_owner_generation_locked(i);
+			LWLockRelease(&undo_cleaner_state->lwlock);
 			proof = cluster_ctrc_capacity_probe_current(segment_id, floor.scn, floor.epoch,
 														continuation);
+		}
 		if (proof == CLUSTER_CTRC_CAPACITY_RETRY)
 			retry = true;
 		else if (proof == CLUSTER_CTRC_CAPACITY_WAIT && undo_cleaner_capacity_context_safe()) {
 			unsigned worker = (continuation->segment_id - 1) % CLUSTER_UNDO_CLEANER_WORKER_TYPES;
 			bool supplied;
+			bool owner_changed;
+			uint64 coordinator_generation;
+			uint64 worker_generation;
 
 			LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
-			supplied = !undo_cleaner_state->shutdown_requested
-					   && undo_cleaner_state->workers[0].status == UNDO_CLEANER_READY
-					   && undo_cleaner_state->workers[worker].status == UNDO_CLEANER_READY;
-			if (supplied)
+			coordinator_generation = undo_cleaner_capacity_owner_generation_locked(0);
+			worker_generation = undo_cleaner_capacity_owner_generation_locked(worker);
+			supplied = coordinator_generation != 0 && worker_generation != 0;
+			owner_changed = supplied
+							&& (coordinator_generation != owner_generations[0]
+								|| worker_generation != owner_generations[worker]);
+			if (supplied && !owner_changed)
 				undo_cleaner_state->capacity_wait_entered++;
-			else
+			else if (!supplied)
 				undo_cleaner_state->capacity_wait_refused_proof++;
 			LWLockRelease(&undo_cleaner_state->lwlock);
-			if (supplied) {
+			if (owner_changed) {
+				/* Re-enter the original allocator/proof under the new owner;
+				 * this old key must not bridge a worker incarnation change. */
+				MemSet(continuation, 0, sizeof(*continuation));
+				retry = true;
+			} else if (supplied) {
 				cluster_undo_cleaner_wakeup();
 				/* Timeout is only the existing floor-report recheck cadence,
 				 * not a new failure deadline or a reason to assume FREE. */
@@ -591,6 +621,13 @@ undo_cleaner_publish_status(UndoCleanerStatus status)
 	 * respawn.
 	 */
 	if (status == UNDO_CLEANER_SPAWNING) {
+		uint64 incarnation_generation = worker->incarnation_generation;
+
+		/* Never reuse an earlier incarnation after counter exhaustion.
+		 * A saturated worker still serves its original mandatory duties. */
+		if (incarnation_generation != UINT64_MAX)
+			incarnation_generation++;
+
 		MemSet(&undo_cleaner_active_scan, 0, sizeof(undo_cleaner_active_scan));
 		MemSet(&undo_cleaner_active_lease_fence, 0, sizeof(undo_cleaner_active_lease_fence));
 		MemSet(&undo_cleaner_active_admission_fence, 0,
@@ -600,6 +637,7 @@ undo_cleaner_publish_status(UndoCleanerStatus status)
 			MemSet(&undo_cleaner_state->active_sample, 0,
 				   sizeof(undo_cleaner_state->active_sample));
 		MemSet(worker, 0, sizeof(*worker));
+		worker->incarnation_generation = incarnation_generation;
 		worker->pid = MyProcPid;
 		worker->spawned_at = now;
 		worker->latch = (MyProc != NULL) ? &MyProc->procLatch : NULL;

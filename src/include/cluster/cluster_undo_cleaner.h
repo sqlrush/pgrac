@@ -126,6 +126,8 @@ typedef struct ClusterUndoCapacityStats {
  */
 typedef struct UndoCleanerWorkerState {
 	UndoCleanerStatus status;		   /* HC2 SSOT */
+	/* Postmaster lifetime; 0 unknown, UINT64_MAX exhausted. Not supply proof. */
+	uint64 incarnation_generation;
 	pid_t pid;						   /* set in SPAWNING */
 	TimestampTz spawned_at;			   /* set in SPAWNING */
 	TimestampTz ready_at;			   /* set in READY */
