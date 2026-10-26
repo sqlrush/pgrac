@@ -2304,6 +2304,8 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe.h \
 		test_cluster_active_sample_types.inc test_cluster_active_sample_fence.inc \
 		test_cluster_heap_freeze_admission_current.inc \
+		$(top_srcdir)/src/include/cluster/cluster_wal_thread.h \
+		test_cluster_heap_freeze_startup_types.inc test_cluster_heap_freeze_startup_source.inc \
 		$(top_srcdir)/src/include/cluster/cluster_reconfig.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_horizon.h \
@@ -8594,6 +8596,20 @@ test_cluster_active_sample_types.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     END { if (count != 3 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Use the full original Startup completion layout and its read-only predicates.
+test_cluster_heap_freeze_startup_types.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^typedef struct ClusterNormalStartCompletion [{]$$/ { emit=1; found++ } \
+	     /^static ClusterNormalStartCompletion \*NormalStartCompletion;/ { if (emit) { emit=0; done++ } } \
+	     emit { print } END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_freeze_startup_source.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^cluster_semantic_normal_start_state\(/ { print "ClusterNormalStartState"; emit=1; found++ } \
+	     /^normal_start_(shared_configured|bootstrap_allowed|serving_allowed)\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (found != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 # Execute the original ordinary TARGET and read-only census admission checks.
 test_cluster_heap_freeze_admission_current.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
 	awk '/^semantic_activation_(admission_policy|r4_terminal_census_policy)\(/ { print "static ClusterSemanticAdmissionResult"; emit=1; count++ } \
@@ -10510,6 +10526,8 @@ clean-active-sample-fence:
 	rm -f test_cluster_active_sample_types.inc test_cluster_active_sample_types.inc.tmp
 	rm -f test_cluster_active_sample_fence.inc test_cluster_active_sample_fence.inc.tmp
 	rm -f test_cluster_heap_freeze_admission_current.inc test_cluster_heap_freeze_admission_current.inc.tmp
+	rm -f test_cluster_heap_freeze_startup_types.inc test_cluster_heap_freeze_startup_types.inc.tmp
+	rm -f test_cluster_heap_freeze_startup_source.inc test_cluster_heap_freeze_startup_source.inc.tmp
 
 clean distclean maintainer-clean: clean-retention-sample
 .PHONY: clean-retention-sample
