@@ -13,6 +13,7 @@
 
 #define CLUSTER_SAVEPOINT_OPERATION_PRESENT 1
 #define CLUSTER_SAVEPOINT_FRAME_OPERATION_PRESENT 1
+#define CLUSTER_SAVEPOINT_RESERVE_PRESENT 1
 
 /* Backend-local capture, never a substitute for canonical TT authority.
  * Raw tuple/index writers retain operation_fxid; top alone owns the TT slot. */
@@ -47,6 +48,13 @@ extern bool cluster_savepoint_capture_frame_operation(SubTransactionId subid,
  * from a readonly descendant. Not a cleanup or historical authority API. */
 extern bool cluster_savepoint_operation_matches_frame(const ClusterSavepointOperation *operation);
 
+/* Explicit first-effect preparation, before DATA receipt/content locks.
+ * Atomically attaches a RESERVED control to each newly nonempty live frame
+ * and ancestor. Empty/read-only scopes never call this producer. Existing
+ * controls are rechecked without extending the preparation deadline.
+ * false/ERROR permits no data effect. Does not activate a rollback/head. */
+extern bool cluster_savepoint_reserve_current_frames(uint64 absolute_deadline_us);
+
 /* Called after the native frame is published; does not allocate an xid. */
 extern void cluster_savepoint_start(SubTransactionId subid);
 
@@ -57,7 +65,7 @@ extern void cluster_savepoint_define(SubTransactionId subid, char **name_slot,
 									 int savepoint_level);
 
 /* Native PopTransaction calls this for RELEASE and abort cleanup, including
- * an incomplete start. This only retires memory, not transaction effects. */
+ * an incomplete start. This releases only unused control references and metadata, not effects. */
 extern void cluster_savepoint_forget(SubTransactionId subid);
 
 #endif

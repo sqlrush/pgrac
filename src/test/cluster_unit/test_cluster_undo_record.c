@@ -113,7 +113,22 @@ typedef enum ClusterCtrcPreparePath {
 
 /* Compile the exact owner, including its backend-local reservation, without
  * exposing test-only product APIs.  Section GC retains only exercised paths. */
+#define RESERVE_TEST_MAX 40
+static ClusterSavepointOperation reserve_test_operations[RESERVE_TEST_MAX];
+static bool reserve_test_scope_valid, reserve_test_mode;
+static int reserve_test_refs, reserve_test_pins, reserve_test_io;
+static PGAlignedBlock reserve_test_images[2];
+static int reserve_test_wal, reserve_test_installs;
+static uint16 reserve_test_wal_slots[2];
+static bool reserve_test_fail_lock, reserve_test_throw_wal;
+static int reserve_test_throw_wal_at;
+static bool reserve_test_invalidate_scope_after_lock, reserve_test_expire_at_pin;
+static PGPROC reserve_test_proc;
+
+static uint32 reserve_test_active_segment(int node);
+#define cluster_undo_active_segment_for_node_or_create reserve_test_active_segment
 #include UNDO_RECORD_SOURCE_PATH
+#undef cluster_undo_active_segment_for_node_or_create
 
 /* Keep the drain predicate seam below, but run the real unchanged recycle
  * predicate on the producer's actual successor, not a test-side imitation. */
@@ -404,6 +419,19 @@ cluster_undo_block0_current_live_owner_publication_recheck(
 bool
 cluster_undo_buf_lock_ref_conditional(int slot, uint32 segment_id, uint8 owner, uint32 block_no)
 {
+	if (reserve_test_mode) {
+		UT_ASSERT_EQ(slot, (int)block_no + 6);
+		UT_ASSERT_EQ(segment_id, 1);
+		UT_ASSERT_EQ(owner, 1);
+		if (reserve_test_fail_lock)
+			return false;
+		UT_ASSERT(!receipt_buffer_locked);
+		receipt_buffer_locked = true;
+		if (reserve_test_invalidate_scope_after_lock)
+			reserve_test_scope_valid = false;
+		return true;
+	}
+
 	UT_ASSERT_EQ(slot, 7);
 	UT_ASSERT_EQ(segment_id, 1);
 	UT_ASSERT_EQ(owner, 1);
@@ -420,6 +448,13 @@ cluster_undo_buf_lock_ref_conditional(int slot, uint32 segment_id, uint8 owner, 
 void
 cluster_undo_buf_unlock_ref(int slot)
 {
+	if (reserve_test_mode) {
+		UT_ASSERT(slot == 7 || slot == 8);
+		UT_ASSERT(receipt_buffer_locked);
+		receipt_buffer_locked = false;
+		return;
+	}
+
 	UT_ASSERT_EQ(slot, 7);
 	UT_ASSERT(receipt_buffer_locked);
 	receipt_buffer_locked = false;
@@ -428,6 +463,12 @@ cluster_undo_buf_unlock_ref(int slot)
 void
 cluster_undo_buf_unref_slot(int slot)
 {
+	if (reserve_test_mode) {
+		UT_ASSERT(slot == 7 || slot == 8);
+		UT_ASSERT(reserve_test_refs > 0);
+		reserve_test_refs--;
+		return;
+	}
 	UT_ASSERT_EQ(slot, 7);
 	receipt_unref_calls++;
 	if (receipt_clock_after_unref != 0)
@@ -438,6 +479,16 @@ void
 cluster_undo_buf_install_ref_locked(int slot, uint32 segment_id, uint8 owner, uint32 block_no,
 									const char image[BLCKSZ])
 {
+	if (reserve_test_mode) {
+		UT_ASSERT_EQ(slot, (int)block_no + 6);
+		UT_ASSERT_EQ(segment_id, 1);
+		UT_ASSERT_EQ(owner, 1);
+		UT_ASSERT(receipt_buffer_locked);
+		UT_ASSERT(block_no >= 1 && block_no <= 2);
+		memcpy(reserve_test_images[block_no - 1].data, image, BLCKSZ);
+		reserve_test_installs++;
+		return;
+	}
 	UT_ASSERT_EQ(slot, 7);
 	UT_ASSERT_EQ(segment_id, 1);
 	UT_ASSERT_EQ(owner, 1);
@@ -453,6 +504,36 @@ cluster_undo_emit_block_write_multi(uint8 instance, uint32 segment_id, uint32 bl
 								 const char *image, XLogRecPtr old_lsn, uint16 rec_off,
 								 uint16 rec_len, uint16 slot_off, uint16 slot_len)
 {
+	if (reserve_test_mode) {
+		const UndoBlockHeader *header = (const UndoBlockHeader *)image;
+
+		if (cluster_shared_config) {
+			UT_ASSERT(receipt_buffer_locked);
+			UT_ASSERT(MyProc != NULL && (MyProc->delayChkptFlags & DELAY_CHKPT_START) != 0);
+		} else
+			UT_ASSERT(!receipt_buffer_locked);
+
+		UT_ASSERT_EQ(instance, 1);
+		UT_ASSERT_EQ(segment_id, 1);
+		UT_ASSERT(block_no >= 1 && block_no <= 2);
+		if (cluster_shared_config) {
+			const UndoBlockHeader *before
+				= (const UndoBlockHeader *)reserve_test_images[block_no - 1].data;
+			UT_ASSERT_EQ(old_lsn, before->block_lsn);
+			UT_ASSERT_EQ(rec_off,
+						 before->magic == PGRAC_UNDO_BLOCK_MAGIC ? before->free_offset : 48);
+		} else {
+			UT_ASSERT_EQ(old_lsn, InvalidXLogRecPtr);
+			UT_ASSERT_EQ(rec_off, 48);
+		}
+		UT_ASSERT_EQ(rec_len, header->free_offset - rec_off);
+		UT_ASSERT_EQ(slot_off, 8192 - 8 * header->slot_count);
+		reserve_test_wal_slots[block_no - 1] = slot_len;
+		reserve_test_wal++;
+		if (reserve_test_throw_wal || reserve_test_wal == reserve_test_throw_wal_at)
+			siglongjmp(*PG_exception_stack, 1);
+		return 500 + reserve_test_wal;
+	}
 	UT_ASSERT(cluster_shared_config);
 	UT_ASSERT(receipt_buffer_locked);
 	UT_ASSERT(MyProc != NULL && (MyProc->delayChkptFlags & DELAY_CHKPT_START) != 0);
@@ -478,6 +559,12 @@ void
 cluster_undo_buf_install_wal_ref_locked(int slot, uint32 segment_id, uint8 owner,
 									  uint32 block_no, const char image[BLCKSZ], XLogRecPtr wal_lsn)
 {
+	if (reserve_test_mode) {
+		UT_ASSERT_EQ(wal_lsn, 500 + reserve_test_wal);
+		UT_ASSERT_EQ(((const UndoBlockHeader *)image)->block_lsn, wal_lsn);
+		cluster_undo_buf_install_ref_locked(slot, segment_id, owner, block_no, image);
+		return;
+	}
 	UT_ASSERT_EQ(receipt_wal_calls, 1);
 	UT_ASSERT_EQ(wal_lsn, 500);
 	UT_ASSERT_EQ(((const UndoBlockHeader *)image)->block_lsn, wal_lsn);
@@ -5944,10 +6031,22 @@ UT_TEST(test_exact_zero_abort_keeps_cleanup_after_native_scope_ends)
 #endif
 }
 
+#include "test_cluster_undo_savepoint_reserve.inc"
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(161);
+	UT_PLAN(171);
+	UT_RUN(test_reserved_controls_later_batch_error_keeps_prior_parent);
+	UT_RUN(test_reserved_controls_nonshared_pending_keeps_its_original_ref);
+	UT_RUN(test_reserved_control_is_physical_but_not_top_head);
+	UT_RUN(test_reserved_controls_batch_with_independent_refs);
+	UT_RUN(test_reserved_controls_refuse_existing_data_reservation);
+	UT_RUN(test_reserved_controls_refuse_unproved_scope_before_storage);
+	UT_RUN(test_reserved_controls_fail_before_install_without_leaking_refs);
+	UT_RUN(test_reserved_controls_wal_error_preserves_original_cleanup);
+	UT_RUN(test_reserved_controls_cross_block_and_release_only_owned_refs);
+	UT_RUN(test_reserved_controls_top_teardown_retires_all_unused_refs);
 	UT_RUN(test_rollback_codec_reserved_unaligned_zero_progress);
 	UT_RUN(test_rollback_codec_active_phases_and_cross_segment_stops);
 	UT_RUN(test_rollback_codec_marking_initial_and_last_cursor_cut);

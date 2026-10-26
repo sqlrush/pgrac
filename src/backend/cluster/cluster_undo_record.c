@@ -74,6 +74,7 @@
 #include "storage/proc.h" /* spec-3.18 D2b MyProc->delayChkptFlags (DELAY_CHKPT_START) */
 #include "storage/shmem.h"
 #include "utils/elog.h"
+#include "utils/memutils.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h" /* spec-3.18 D7: ClusterUndoExtentClaim wait event */
 
@@ -366,6 +367,60 @@ typedef struct ClusterUndoRecordReservation {
 static ClusterUndoRecordReservation cluster_undo_record_reservation
 	= { .ref_slot = -1, .consume_local_head_idx = -1 };
 static uint64 cluster_undo_record_reservation_floor = 0;
+
+/* Original buffer references, owned until the unused frame releases them or
+ * top cleanup retires them. Nodes stay in TopTransactionContext, even after
+ * release, so an old handle cannot be dereferenced after free within a top. */
+struct ClusterUndoSavepointControl {
+	ClusterSavepointOperation operation;
+	UBA uba;
+	int ref_slot;
+	bool owns_ref;
+	bool reserved;
+	struct ClusterUndoSavepointControl *next;
+};
+static ClusterUndoSavepointControl *undo_savepoint_controls;
+
+static void
+undo_savepoint_control_unref(ClusterUndoSavepointControl *control)
+{
+	if (control->owns_ref) {
+		cluster_undo_buf_unref_slot(control->ref_slot);
+		control->owns_ref = false;
+		control->ref_slot = -1;
+	}
+}
+
+void
+cluster_undo_record_release_savepoint_controls_at_xact_end(void)
+{
+	ClusterUndoSavepointControl *control = undo_savepoint_controls;
+
+	undo_savepoint_controls = NULL;
+	while (control != NULL) {
+		ClusterUndoSavepointControl *next = control->next;
+
+		undo_savepoint_control_unref(control);
+		control = next;
+	}
+}
+
+static uint32
+undo_savepoint_control_group_count(const ClusterUndoExtent *ext, uint32 requested)
+{
+	uint32 offset = ext->cur_free_offset;
+	uint16 slots = ext->cur_slot_count;
+	uint32 count = 0;
+	const uint32 bytes = sizeof(UndoRecordHeader) + UNDO_SAVEPOINT_ROLLBACK_PAYLOAD_LENGTH;
+
+	while (count < requested && cluster_undo_block_has_space(offset, slots, bytes)) {
+		offset += bytes;
+		slots++;
+		count++;
+	}
+	return count;
+}
+
 
 static const char *cluster_undo_receipt_reason = "NONE";
 /* Before-cancel diagnostics only; never consulted to authorize a mutation. */
@@ -2786,8 +2841,46 @@ undo_receipt_prepare_owner_trace(const char *event,
 
 
 static void
+cluster_undo_record_prepared_storage_finish(const ClusterUndoRecordPrepareReceipt *receipt,
+											const char image[BLCKSZ])
+{
+	ClusterUndoRecordReservation *reservation = &cluster_undo_record_reservation;
+	const UndoBlockHeader *header = (const UndoBlockHeader *)image;
+	uint16 first = receipt->extent.cur_slot_count;
+	uint16 last = header->slot_count - 1;
+
+	if (cluster_shared_config) {
+		cluster_undo_buf_unref_slot(reservation->ref_slot);
+		reservation->owns_ref = false;
+	} else {
+		if (!cluster_undo_pending.active) {
+			cluster_undo_pending.active = true;
+			cluster_undo_pending.owner_instance = receipt->owner_instance;
+			cluster_undo_pending.segment_id = receipt->actual_segment_id;
+			cluster_undo_pending.block_no = receipt->extent.cur_block;
+			cluster_undo_pending.old_block_lsn
+				= ((UndoBlockHeader *)reservation->block.data)->block_lsn;
+			cluster_undo_pending.rec_lo = receipt->extent.cur_free_offset;
+			cluster_undo_pending.rec_hi = receipt->extent.cur_free_offset;
+			cluster_undo_pending.slot_min_off = PG_UINT16_MAX;
+			cluster_undo_pending.slot_max_off = 0;
+			cluster_undo_pending.nrecords = 0;
+			cluster_undo_pending.ref_slot = reservation->ref_slot;
+			reservation->owns_ref = false;
+		}
+		memcpy(cluster_undo_pending.buf, image, BLCKSZ);
+		cluster_undo_pending.rec_hi = header->free_offset;
+		if ((uint16)UNDO_SLOT_DIR_OFFSET(last) < cluster_undo_pending.slot_min_off)
+			cluster_undo_pending.slot_min_off = (uint16)UNDO_SLOT_DIR_OFFSET(last);
+		if ((uint16)UNDO_SLOT_DIR_OFFSET(first) > cluster_undo_pending.slot_max_off)
+			cluster_undo_pending.slot_max_off = (uint16)UNDO_SLOT_DIR_OFFSET(first);
+		cluster_undo_pending.nrecords += header->slot_count - first;
+	}
+}
+
+static void
 cluster_undo_record_install_prepared_resident_locked(const ClusterUndoRecordPrepareReceipt *receipt,
-													 char image[BLCKSZ])
+													 char image[BLCKSZ], uint16 nrecords)
 {
 	ClusterUndoRecordReservation *reservation = &cluster_undo_record_reservation;
 
@@ -2813,8 +2906,8 @@ cluster_undo_record_install_prepared_resident_locked(const ClusterUndoRecordPrep
 				receipt->owner_instance, receipt->actual_segment_id, receipt->extent.cur_block,
 				image, ((UndoBlockHeader *)reservation->block.data)->block_lsn, rec_off,
 				(uint16)(header->free_offset - rec_off),
-				(uint16)UNDO_SLOT_DIR_OFFSET(receipt->extent.cur_slot_count),
-				sizeof(UndoSlotDirEntry));
+				(uint16)UNDO_SLOT_DIR_OFFSET(receipt->extent.cur_slot_count + nrecords - 1),
+				(uint16)(nrecords * sizeof(UndoSlotDirEntry)));
 
 			header->block_lsn = lsn;
 			cluster_undo_buf_install_wal_ref_locked(
@@ -2866,7 +2959,8 @@ undo_record_operation_matches(const ClusterUndoRecordPrepareReceipt *receipt)
 
 static ClusterUndoRecordPrepareResult cluster_undo_record_prepare_trace_impl(
 	uint8 record_type, uint16 payload_capacity, uint16 tt_slot_segment_id, uint16 tt_slot_offset,
-	UBA prev_uba, uint64 absolute_deadline_us, ClusterUndoRecordPrepareReceipt *receipt);
+	UBA prev_uba, uint64 absolute_deadline_us, ClusterUndoRecordPrepareReceipt *receipt,
+	ClusterUndoSavepointControl *controls, uint32 requested, uint32 *group_count);
 
 /* PGRAC: observational scope only; preserve every result and exception. */
 ClusterUndoRecordPrepareResult
@@ -2880,14 +2974,14 @@ cluster_undo_record_prepare(uint8 record_type, uint16 payload_capacity, uint16 t
 	if (likely(!cluster_update_trace_enabled && !cluster_xnode_profile_enabled)) {
 		return cluster_undo_record_prepare_trace_impl(record_type, payload_capacity,
 													  tt_slot_segment_id, tt_slot_offset, prev_uba,
-													  absolute_deadline_us, receipt);
+													  absolute_deadline_us, receipt, NULL, 0, NULL);
 	}
 	cluster_xp_begin(&trace, CLXP_UNDO_RECEIPT_PREPARE);
 	PG_TRY();
 	{
-		result = cluster_undo_record_prepare_trace_impl(record_type, payload_capacity,
-														tt_slot_segment_id, tt_slot_offset,
-														prev_uba, absolute_deadline_us, receipt);
+		result = cluster_undo_record_prepare_trace_impl(
+			record_type, payload_capacity, tt_slot_segment_id, tt_slot_offset, prev_uba,
+			absolute_deadline_us, receipt, NULL, 0, NULL);
 	}
 	PG_FINALLY();
 	{
@@ -2901,7 +2995,9 @@ static ClusterUndoRecordPrepareResult
 cluster_undo_record_prepare_trace_impl(uint8 record_type, uint16 payload_capacity,
 									   uint16 tt_slot_segment_id, uint16 tt_slot_offset,
 									   UBA prev_uba, uint64 absolute_deadline_us,
-									   ClusterUndoRecordPrepareReceipt *receipt)
+									   ClusterUndoRecordPrepareReceipt *receipt,
+									   ClusterUndoSavepointControl *controls, uint32 requested,
+									   uint32 *group_count)
 {
 	ClusterUndoRecordReservation *reservation = &cluster_undo_record_reservation;
 	ClusterSemanticAdmissionToken modifier_admission = { 0 };
@@ -2928,7 +3024,10 @@ cluster_undo_record_prepare_trace_impl(uint8 record_type, uint16 payload_capacit
 		&& cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_EXISTING_OTHER
 		&& !cluster_semantic_activation_recovered_open_current())
 		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
-	if (record_type == UNDO_RECORD_INVALID || record_type > UNDO_RECORD_ITL
+	if ((controls == NULL ? (record_type == UNDO_RECORD_INVALID || record_type > UNDO_RECORD_ITL)
+						  : (record_type != UNDO_RECORD_SAVEPOINT_ROLLBACK || requested == 0
+							 || group_count == NULL || reservation->active || reservation->owns_ref
+							 || payload_capacity != UNDO_SAVEPOINT_ROLLBACK_LENGTH))
 		|| payload_capacity > (uint16)cluster_undo_record_inline_max_bytes
 		|| UndoRecordShared == NULL || absolute_deadline_us == 0)
 		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
@@ -2937,12 +3036,20 @@ cluster_undo_record_prepare_trace_impl(uint8 record_type, uint16 payload_capacit
 		cluster_undo_receipt_reason = "PREPARE_TIMEOUT_BEFORE_READY";
 		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
 	}
-	if (!undo_record_capture_operation(tt_slot_segment_id, tt_slot_offset, &operation)) {
+	if (controls != NULL)
+		operation = controls[0].operation;
+	if (controls != NULL
+			? (!cluster_savepoint_operation_matches_frame(&operation)
+			   || operation.top.segment_id != tt_slot_segment_id
+			   || operation.top.slot_offset != tt_slot_offset)
+			: !undo_record_capture_operation(tt_slot_segment_id, tt_slot_offset, &operation)) {
 		cluster_undo_receipt_reason = "OPERATION_IDENTITY_UNPROVEN";
 		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
 	}
 
-	record_length = undo_prepared_record_total_length(&operation, payload_capacity);
+	record_length = controls != NULL
+						? sizeof(UndoRecordHeader) + UNDO_SAVEPOINT_ROLLBACK_PAYLOAD_LENGTH
+						: undo_prepared_record_total_length(&operation, payload_capacity);
 	if (record_length > UNDO_RECORD_HARD_CAP_BYTES) {
 		cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_CAPACITY_REFUSAL);
 		cluster_undo_receipt_reason = "CAPACITY_REFUSAL";
@@ -3028,6 +3135,8 @@ cluster_undo_record_prepare_trace_impl(uint8 record_type, uint16 payload_capacit
 	reservation->consume_local_head_idx = -1;
 	reservation->consume_effective_prev_uba = InvalidUba;
 	if (cluster_undo_pending.active) {
+		if (controls != NULL)
+			return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
 		if (cluster_undo_pending.ref_slot < 0)
 			return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
 		memcpy(reservation->block.data, cluster_undo_pending.buf, BLCKSZ);
@@ -3039,6 +3148,16 @@ cluster_undo_record_prepare_trace_impl(uint8 record_type, uint16 payload_capacit
 			return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
 		memcpy(reservation->block.data, resident, BLCKSZ);
 		cluster_undo_buf_addref(&pin);
+		if (controls != NULL) {
+			uint32 count = undo_savepoint_control_group_count(ext, requested);
+
+			for (uint32 i = 0; i < count; i++) {
+				cluster_undo_buf_addref(&pin);
+				controls[i].ref_slot = pin.slot;
+				controls[i].owns_ref = true;
+			}
+			*group_count = count;
+		}
 		reservation->ref_slot = pin.slot;
 		reservation->owns_ref = true;
 		cluster_undo_buf_unpin(&pin);
@@ -4191,37 +4310,9 @@ cluster_undo_record_consume_prepared(ClusterUndoRecordPrepareReceipt *receipt,
 	blkhdr->slot_count = (uint16)(slot_count + 1);
 	blkhdr->free_offset = free_offset + record_length;
 
-	cluster_undo_record_install_prepared_resident_locked(receipt, successor.data);
+	cluster_undo_record_install_prepared_resident_locked(receipt, successor.data, 1);
 
-	if (cluster_shared_config) {
-		/* The original checkpoint-visible slot owns durability after install;
-		 * this reservation no longer needs a process-local pending reference. */
-		cluster_undo_buf_unref_slot(reservation->ref_slot);
-		reservation->owns_ref = false;
-	} else {
-		if (!cluster_undo_pending.active) {
-			cluster_undo_pending.active = true;
-			cluster_undo_pending.owner_instance = receipt->owner_instance;
-			cluster_undo_pending.segment_id = receipt->actual_segment_id;
-			cluster_undo_pending.block_no = receipt->extent.cur_block;
-			cluster_undo_pending.old_block_lsn
-				= ((UndoBlockHeader *)reservation->block.data)->block_lsn;
-			cluster_undo_pending.rec_lo = (uint16)free_offset;
-			cluster_undo_pending.rec_hi = (uint16)free_offset;
-			cluster_undo_pending.slot_min_off = PG_UINT16_MAX;
-			cluster_undo_pending.slot_max_off = 0;
-			cluster_undo_pending.nrecords = 0;
-			cluster_undo_pending.ref_slot = reservation->ref_slot;
-			reservation->owns_ref = false;
-		}
-		memcpy(cluster_undo_pending.buf, successor.data, BLCKSZ);
-		cluster_undo_pending.rec_hi = (uint16)(free_offset + record_length);
-		if ((uint16)UNDO_SLOT_DIR_OFFSET(new_slot_idx) < cluster_undo_pending.slot_min_off)
-			cluster_undo_pending.slot_min_off = (uint16)UNDO_SLOT_DIR_OFFSET(new_slot_idx);
-		if ((uint16)UNDO_SLOT_DIR_OFFSET(new_slot_idx) > cluster_undo_pending.slot_max_off)
-			cluster_undo_pending.slot_max_off = (uint16)UNDO_SLOT_DIR_OFFSET(new_slot_idx);
-		cluster_undo_pending.nrecords++;
-	}
+	cluster_undo_record_prepared_storage_finish(receipt, successor.data);
 
 	cluster_semantic_activation_leave(&cluster_undo_record_reservation.receipt.modifier_admission);
 	cluster_undo_record_reservation.active = false;
@@ -5263,4 +5354,287 @@ cluster_undo_segment_reuse_count(void)
 	if (UndoRecordShared == NULL)
 		return 0;
 	return pg_atomic_read_u64(&UndoRecordShared->segment_reuse_count);
+}
+
+
+void
+cluster_undo_record_release_savepoint_control(ClusterUndoSavepointControl *control)
+{
+	ClusterUndoSavepointControl *owned;
+
+	for (owned = undo_savepoint_controls; owned != NULL; owned = owned->next)
+		if (owned == control) {
+			if (owned->reserved)
+				undo_savepoint_control_unref(owned);
+			return;
+		}
+}
+
+bool
+cluster_undo_record_savepoint_control_owned(const ClusterUndoSavepointControl *control)
+{
+	const ClusterUndoSavepointControl *owned;
+
+	for (owned = undo_savepoint_controls; owned != NULL; owned = owned->next)
+		if (owned == control)
+			return owned->owns_ref && owned->reserved && owned->ref_slot >= 0
+				   && !UBA_is_invalid(owned->uba)
+				   && cluster_savepoint_operation_matches_frame(&owned->operation);
+	return false;
+}
+
+static bool
+undo_savepoint_control_encode(const ClusterUndoSavepointControl *control, SCN scn, void *dst)
+{
+	const ClusterSavepointOperation *source = &control->operation;
+	UndoRecordHeader header = { 0 };
+	UndoSavepointRollbackPayload body = { 0 };
+	UndoOperationTrailer operation = { 0 };
+
+	header.record_type = UNDO_RECORD_SAVEPOINT_ROLLBACK;
+	header.flags = UNDO_REC_FLAG_FIRST_IN_TX | UNDO_REC_FLAG_HAS_OPERATION;
+	header.xid = XidFromFullTransactionId(source->operation_fxid);
+	header.origin_node_id = (uint16)cluster_node_id;
+	header.tt_slot_segment_id = source->top.segment_id;
+	header.tt_slot_id = cluster_tt_slot_offset_to_id(source->top.slot_offset);
+	header.tt_wrap_plus1 = (uint16)(source->top.slot_wrap + 1);
+	header.write_scn = scn;
+	header.prev_uba = InvalidUba;
+	header.payload_length = UNDO_SAVEPOINT_ROLLBACK_PAYLOAD_LENGTH;
+	body.version = UNDO_SAVEPOINT_ROLLBACK_VERSION;
+	body.length = UNDO_SAVEPOINT_ROLLBACK_LENGTH;
+	body.phase = UNDO_SAVEPOINT_ROLLBACK_RESERVED;
+	/* The shared top-monotone operation allocator supplies a unique reserved
+	 * rollback sequence too; it is never inferred from raw xid ordering. */
+	body.rollback_sequence = source->operation_sequence;
+	body.start_uba = body.stop_uba = body.next_uba = InvalidUba;
+	body.scope_child_fxid = U64FromFullTransactionId(source->operation_fxid);
+	operation.version = UNDO_OPERATION_TRAILER_VERSION;
+	operation.length = UNDO_OPERATION_TRAILER_LENGTH;
+	operation.effect_state = CLUSTER_SAVEPOINT_EFFECT_LIVE;
+	operation.canonical_top_fxid = U64FromFullTransactionId(source->top_fxid);
+	operation.operation_fxid = body.scope_child_fxid;
+	operation.operation_sequence = source->operation_sequence;
+	operation.canonical_segment_generation = source->top.segment_generation;
+	operation.command_id = source->command_id;
+	operation.subid = source->subid;
+	if (!cluster_undo_record_encode_rollback_payload(&header, &body, &operation,
+													 (char *)dst + sizeof(header),
+													 UNDO_SAVEPOINT_ROLLBACK_PAYLOAD_LENGTH))
+		return false;
+	memcpy(dst, &header, sizeof(header));
+	return true;
+}
+
+static bool
+undo_savepoint_control_group_recheck(const ClusterUndoRecordPrepareReceipt *receipt,
+									 const ClusterUndoSavepointControl *controls, uint32 count)
+{
+	const ClusterUndoRecordReservation *reservation = &cluster_undo_record_reservation;
+
+	if (count == 0 || receipt->record_type != UNDO_RECORD_SAVEPOINT_ROLLBACK
+		|| !reservation->owns_ref || !cluster_undo_record_receipt_extent_matches(receipt)
+		|| !cluster_undo_block0_current_live_owner_publication_recheck_conditional(
+			&receipt->block0_publication)
+		|| !cluster_semantic_activation_modifier_recheck(&receipt->modifier_admission,
+														 cluster_undo_record_writable_admission())
+		|| undo_savepoint_control_group_count(&receipt->extent, count) != count)
+		return false;
+	for (uint32 i = 0; i < count; i++)
+		if (!controls[i].owns_ref || controls[i].ref_slot != reservation->ref_slot
+			|| memcmp(&controls[i].operation.top, &receipt->operation.top,
+					  sizeof(receipt->operation.top))
+				   != 0
+			|| !FullTransactionIdEquals(controls[i].operation.top_fxid, receipt->operation.top_fxid)
+			|| !cluster_savepoint_operation_matches_frame(&controls[i].operation))
+			return false;
+	return true;
+}
+
+static bool
+undo_savepoint_control_store_group(ClusterUndoRecordPrepareReceipt *receipt,
+								   ClusterUndoSavepointControl *controls, uint32 count)
+{
+	ClusterUndoRecordReservation *reservation = &cluster_undo_record_reservation;
+	PGAlignedBlock successor;
+	UndoBlockHeader *header = (UndoBlockHeader *)successor.data;
+	const uint32 bytes = sizeof(UndoRecordHeader) + UNDO_SAVEPOINT_ROLLBACK_PAYLOAD_LENGTH;
+	SCN scn;
+	bool installed = false;
+
+	if (!undo_savepoint_control_group_recheck(receipt, controls, count)
+		|| !cluster_undo_buf_lock_ref_conditional(reservation->ref_slot, receipt->actual_segment_id,
+												  receipt->owner_instance,
+												  receipt->extent.cur_block))
+		return false;
+	reservation->consume_locked = true;
+	PG_TRY();
+	{
+		if (undo_savepoint_control_group_recheck(receipt, controls, count)) {
+			bool valid = true;
+
+			memcpy(successor.data, reservation->block.data, BLCKSZ);
+			scn = cluster_scn_advance();
+			if (header->slot_count == 0) {
+				header->first_change_scn = scn;
+				header->first_change_lsn = GetXLogWriteRecPtr();
+			}
+			for (uint32 i = 0; i < count; i++) {
+				UndoSlotDirEntry *slot = UNDO_SLOT_DIR_PTR(successor.data, header->slot_count);
+
+				if (!undo_savepoint_control_encode(&controls[i], scn,
+												   successor.data + header->free_offset)) {
+					valid = false;
+					break;
+				}
+				slot->record_offset = header->free_offset;
+				slot->record_length = bytes;
+				slot->record_type = UNDO_RECORD_SAVEPOINT_ROLLBACK;
+				slot->flags = UNDO_REC_FLAG_FIRST_IN_TX | UNDO_REC_FLAG_HAS_OPERATION;
+				header->slot_count++;
+				header->free_offset += bytes;
+			}
+			if (valid) {
+				cluster_undo_record_install_prepared_resident_locked(receipt, successor.data,
+																	 count);
+				cluster_undo_record_prepared_storage_finish(receipt, successor.data);
+				installed = true;
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		if (reservation->consume_locked) {
+			cluster_undo_buf_unlock_ref(reservation->ref_slot);
+			reservation->consume_locked = false;
+		}
+	}
+	PG_END_TRY();
+	if (!installed)
+		return false;
+	for (uint32 i = 0; i < count; i++) {
+		controls[i].uba = uba_encode(receipt->actual_segment_id, receipt->extent.cur_block,
+									 receipt->tt_slot_offset, receipt->extent.cur_slot_count + i);
+		controls[i].reserved = true;
+	}
+	cluster_undo_current_extent.cur_free_offset = header->free_offset;
+	cluster_undo_current_extent.cur_slot_count = header->slot_count;
+	pg_atomic_fetch_add_u64(&UndoRecordShared->record_alloc_count, count);
+	cluster_undo_touched_in_xact = true;
+	cluster_semantic_activation_leave(&reservation->receipt.modifier_admission);
+	reservation->active = false;
+	reservation->ref_slot = -1;
+	memset(&reservation->receipt, 0, sizeof(reservation->receipt));
+	return true;
+}
+
+static void
+undo_savepoint_control_cancel_batch(ClusterUndoSavepointControl *controls, uint32 count,
+									ClusterUndoSavepointControl *previous)
+{
+	ClusterUndoRecordReservation *reservation = &cluster_undo_record_reservation;
+
+	if (reservation->active)
+		cluster_undo_record_cancel_prepared(&reservation->receipt);
+	else if (reservation->owns_ref && reservation->ref_slot >= 0) {
+		cluster_undo_buf_unref_slot(reservation->ref_slot);
+		reservation->owns_ref = false;
+		reservation->ref_slot = -1;
+	}
+	for (uint32 i = 0; i < count; i++)
+		undo_savepoint_control_unref(&controls[i]);
+	undo_savepoint_controls = previous;
+	pfree(controls);
+}
+
+static bool
+undo_savepoint_control_inputs_valid(const ClusterSavepointOperation *operations, uint32 count)
+{
+	if (operations == NULL)
+		return false;
+	for (uint32 i = 0; i < count; i++) {
+		const ClusterUndoSavepointControl *owned;
+
+		if (!cluster_savepoint_operation_matches_frame(&operations[i])
+			|| !FullTransactionIdEquals(operations[0].top_fxid, operations[i].top_fxid)
+			|| memcmp(&operations[0].top, &operations[i].top, sizeof(operations[i].top)) != 0)
+			return false;
+		for (uint32 j = 0; j < i; j++)
+			if (operations[j].subid == operations[i].subid
+				|| operations[j].operation_sequence == operations[i].operation_sequence)
+				return false;
+		for (owned = undo_savepoint_controls; owned != NULL; owned = owned->next)
+			if (owned->owns_ref
+				&& (owned->operation.subid == operations[i].subid
+					|| owned->operation.operation_sequence == operations[i].operation_sequence))
+				return false;
+	}
+	return true;
+}
+
+bool
+cluster_undo_record_reserve_savepoint_controls(const ClusterSavepointOperation *operations,
+											   uint32 count, uint64 absolute_deadline_us,
+											   ClusterUndoSavepointControl **out)
+{
+	ClusterUndoSavepointControl *controls;
+	ClusterUndoSavepointControl *previous = undo_savepoint_controls;
+	volatile bool complete = false;
+
+	if (out == NULL || count == 0 || count > MaxAllocSize / sizeof(*controls))
+		return false;
+	memset(out, 0, count * sizeof(*out));
+	if (CritSectionCount != 0 || TopTransactionContext == NULL
+		|| cluster_undo_record_reservation.active || cluster_undo_record_reservation.owns_ref
+		|| absolute_deadline_us == 0 || absolute_deadline_us <= (uint64)GetCurrentTimestamp()
+		|| !undo_savepoint_control_inputs_valid(operations, count))
+		return false;
+	controls = MemoryContextAllocZero(TopTransactionContext, count * sizeof(*controls));
+	for (uint32 i = 0; i < count; i++) {
+		controls[i].operation = operations[i];
+		controls[i].ref_slot = -1;
+		controls[i].uba = InvalidUba;
+		controls[i].next = undo_savepoint_controls;
+		undo_savepoint_controls = &controls[i];
+	}
+	PG_TRY();
+	{
+		uint32 done = 0;
+
+		/* The old pending owner drains its own bytes/ref. New groups either
+		 * finish this block or force the original change-of-block drain. */
+		if (!cluster_undo_pending.active || cluster_undo_pending_flush_internal(false)) {
+			while (done < count) {
+				ClusterUndoRecordPrepareReceipt receipt;
+				uint32 group_count = 0;
+				const ClusterCanonicalTxnBinding *top = &operations[done].top;
+
+				if (cluster_undo_record_prepare_trace_impl(
+						UNDO_RECORD_SAVEPOINT_ROLLBACK, UNDO_SAVEPOINT_ROLLBACK_LENGTH,
+						top->segment_id, top->slot_offset, InvalidUba, absolute_deadline_us,
+						&receipt, &controls[done], count - done, &group_count)
+						!= CLUSTER_UNDO_RECORD_PREPARE_READY
+					|| group_count == 0
+					|| !undo_savepoint_control_store_group(&receipt, &controls[done], group_count))
+					break;
+				done += group_count;
+			}
+			complete = done == count;
+			for (uint32 i = 0; complete && i < count; i++)
+				complete = cluster_undo_record_savepoint_control_owned(&controls[i]);
+		}
+	}
+	PG_CATCH();
+	{
+		undo_savepoint_control_cancel_batch(controls, count, previous);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!complete) {
+		undo_savepoint_control_cancel_batch(controls, count, previous);
+		return false;
+	}
+	for (uint32 i = 0; i < count; i++)
+		out[i] = &controls[i];
+	return true;
 }

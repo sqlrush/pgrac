@@ -263,7 +263,8 @@ all: $(TESTS) check_resource_x_send_c1
 test_cluster_savepoint_native.inc: $(top_srcdir)/src/backend/access/transam/xact.c $(srcdir)/extract_cluster_savepoint_xact.py Makefile
 	python3 $(srcdir)/extract_cluster_savepoint_xact.py $< $@
 
-test_cluster_savepoint: test_cluster_savepoint.c test_cluster_savepoint_native.inc unit_test.h $(top_srcdir)/src/backend/cluster/cluster_savepoint.c $(top_srcdir)/src/include/cluster/cluster_savepoint.h $(top_srcdir)/src/include/cluster/cluster_tt_local.h $(top_srcdir)/src/include/cluster/cluster_tt_slot.h $(top_builddir)/src/port/libpgport_srv.a
+test_cluster_savepoint: test_cluster_savepoint.c test_cluster_savepoint_native.inc unit_test.h $(top_srcdir)/src/backend/cluster/cluster_savepoint.c $(top_srcdir)/src/include/cluster/cluster_savepoint.h $(top_srcdir)/src/include/cluster/cluster_tt_local.h $(top_srcdir)/src/include/cluster/cluster_tt_slot.h $(top_builddir)/src/port/libpgport_srv.a \
+	test_cluster_savepoint_reserve.inc $(top_srcdir)/src/include/cluster/cluster_undo_record_api.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/port/libpgport_srv.a $(LDFLAGS) -o $@
 
 cluster_unit_port_stubs.o: cluster_unit_port_stubs.c
@@ -9720,7 +9721,7 @@ test_cluster_undo_ctrc_product.o: $(top_srcdir)/src/backend/cluster/cluster_term
 		-c $< -o $@
 
 test_cluster_undo_record: test_cluster_undo_record.c test_cluster_undo_operation.inc \
-		test_cluster_undo_rollback.inc unit_test.h \
+		test_cluster_undo_rollback.inc test_cluster_undo_savepoint_reserve.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_undo_retention.c \
 		test_cluster_undo_ctrc_product.o \
 		$(CLUSTER_UBA_O) \
@@ -9753,6 +9754,7 @@ test_cluster_heap_receipt_product.o: test_cluster_heap_receipt_product.c \
 
 test_cluster_heap_receipt: test_cluster_heap_receipt.c test_cluster_undo_record.c \
 		test_cluster_undo_operation.inc test_cluster_undo_rollback.inc \
+		test_cluster_undo_savepoint_reserve.inc \
 		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
 		$(top_srcdir)/src/backend/cluster/cluster_undo_retention.c \
 		$(CLUSTER_UBA_O) \

@@ -72,11 +72,7 @@ repalloc(void *pointer, Size size)
 	return result;
 }
 
-void
-pfree(void *pointer)
-{
-	free(pointer);
-}
+/* pfree is supplied by the reused undo runtime fixture above. */
 
 int
 errdetail_internal(const char *format, ...)

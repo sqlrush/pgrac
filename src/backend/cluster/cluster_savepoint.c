@@ -16,6 +16,7 @@
 #include "access/parallel.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_savepoint.h"
+#include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_tt_slot.h"
 #include "utils/memutils.h"
 
@@ -26,6 +27,7 @@ typedef struct ClusterSavepointFrame
 	SubTransactionId subid;
 	char **name_slot;
 	int savepoint_level;
+	ClusterUndoSavepointControl *control;
 	struct ClusterSavepointFrame *parent;
 } ClusterSavepointFrame;
 
@@ -45,6 +47,9 @@ savepoint_xact_end(XactEvent event, void *arg)
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
 		case XACT_EVENT_PREPARE:
+			/* Original undo commit/reset bookkeeping runs after some native
+			 * memory teardown. Retire frame references here, while nodes live. */
+			cluster_undo_record_release_savepoint_controls_at_xact_end();
 			/* TopTransactionContext owns storage; never inspect stale slots. */
 			savepoint_frames = NULL;
 			pending_start = InvalidSubTransactionId;
@@ -194,6 +199,69 @@ cluster_savepoint_operation_matches_frame(const ClusterSavepointOperation *opera
 		   && memcmp(&top, &operation->top, sizeof(top)) == 0;
 }
 
+bool
+cluster_savepoint_reserve_current_frames(uint64 absolute_deadline_us)
+{
+	ClusterSavepointFrame *frame;
+	ClusterSavepointOperation *operations;
+	ClusterUndoSavepointControl **controls;
+	uint32 count = 0;
+	uint32 index = 0;
+
+	if (!cluster_storage_mode_enabled() || !IsTransactionState() || IsInParallelMode()
+		|| IsParallelWorker() || absolute_deadline_us == 0
+		|| pending_start != InvalidSubTransactionId)
+		return false;
+	if (GetCurrentSubTransactionId() == TopSubTransactionId)
+		return savepoint_frames == NULL;
+	if (savepoint_frames == NULL || savepoint_frames->subid != GetCurrentSubTransactionId())
+		return false;
+	for (frame = savepoint_frames; frame != NULL; frame = frame->parent) {
+		if (frame->control != NULL) {
+			if (!cluster_undo_record_savepoint_control_owned(frame->control))
+				return false;
+		} else
+			count++;
+	}
+	if (count == 0)
+		return true;
+	if (count > MaxAllocSize / sizeof(*operations))
+		return false;
+	/* Both scratch arrays and the storage owner's handles precede effects.
+	 * TopTransactionContext also owns them if native ERROR interrupts capture. */
+	operations = MemoryContextAllocZero(TopTransactionContext, count * sizeof(*operations));
+	controls = MemoryContextAllocZero(TopTransactionContext, count * sizeof(*controls));
+	for (frame = savepoint_frames; frame != NULL; frame = frame->parent)
+		if (frame->control == NULL
+			&& !cluster_savepoint_capture_frame_operation(frame->subid, &operations[index++])) {
+			pfree(controls);
+			pfree(operations);
+			return false;
+		}
+	if (!cluster_undo_record_reserve_savepoint_controls(operations, count, absolute_deadline_us,
+														controls)) {
+		pfree(controls);
+		pfree(operations);
+		return false;
+	}
+	for (index = 0; index < count; index++)
+		if (controls[index] == NULL
+			|| !cluster_undo_record_savepoint_control_owned(controls[index])) {
+			for (uint32 i = 0; i < count; i++)
+				cluster_undo_record_release_savepoint_control(controls[i]);
+			pfree(controls);
+			pfree(operations);
+			return false;
+		}
+	index = 0;
+	for (frame = savepoint_frames; frame != NULL; frame = frame->parent)
+		if (frame->control == NULL)
+			frame->control = controls[index++];
+	pfree(controls);
+	pfree(operations);
+	return true;
+}
+
 void
 cluster_savepoint_start(SubTransactionId subid)
 {
@@ -265,6 +333,7 @@ cluster_savepoint_forget(SubTransactionId subid)
 		return;
 	if (frame->subid != subid)
 		elog(PANIC, "savepoint frame cleanup is out of order");
+	cluster_undo_record_release_savepoint_control(frame->control);
 	savepoint_frames = frame->parent;
 	pfree(frame);
 }

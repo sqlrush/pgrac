@@ -55,6 +55,7 @@ static bool expect_error;
 static int error_code;
 static int fail_allocation;
 static int allocations;
+static void *last_allocation;
 
 static void fixture_error(void) pg_attribute_noreturn();
 static void
@@ -102,6 +103,7 @@ MemoryContextAllocZero(MemoryContext context, Size size)
 	if (p == NULL)
 		abort();
 	allocations++;
+	last_allocation = p;
 	return p;
 }
 char *
@@ -988,10 +990,19 @@ UT_TEST(test_frame_sequence_exhaustion_keeps_ancestor_proof_without_wrapping)
 	UT_ASSERT_EQ(operation.operation_sequence, 1);
 }
 
+#include "test_cluster_savepoint_reserve.inc"
+
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(37);
+	UT_RUN(test_frame_xact_callback_retires_controls_before_metadata);
+	UT_RUN(test_frame_reserve_top_and_empty_scopes_need_no_storage);
+	UT_RUN(test_frame_reserve_prepares_all_new_ancestors_once);
+	UT_RUN(test_frame_reserve_release_keeps_ancestor_ownership);
+	UT_RUN(test_frame_reserve_failed_batch_publishes_no_handles);
+	UT_RUN(test_frame_reserve_allocation_failure_precedes_storage);
+	UT_RUN(test_frame_reserve_old_control_identity_cannot_authorize_new_effect);
 	UT_RUN(test_frame_capture_keeps_ancestor_and_data_writer_distinct);
 	UT_RUN(test_frame_capture_keeps_replaced_and_anonymous_ancestors);
 	UT_RUN(test_native_frame_lookup_never_assigns_or_guesses);

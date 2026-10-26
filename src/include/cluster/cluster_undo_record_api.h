@@ -95,6 +95,25 @@ typedef enum ClusterUndoRecordConsumePreflightResult {
 
 #define CLUSTER_UNDO_RECORD_CTRC_TARGETS 2
 #define CLUSTER_UNDO_OPERATION_CAPTURE_PRESENT 1
+#define CLUSTER_UNDO_SAVEPOINT_RESERVE_PRESENT 1
+
+typedef struct ClusterUndoSavepointControl ClusterUndoSavepointControl;
+/* Before any data effect or DATA receipt, with no content/entry lock held.
+ * Each returned handle owns an original pool reference to physical RESERVED
+ * bytes, not a top-chain head or rollback completion. Failure clears every
+ * output and retires only this batch's unused references; ERROR is rethrown.
+ * Caller storage for the outputs must cover count entries. */
+extern bool
+cluster_undo_record_reserve_savepoint_controls(const ClusterSavepointOperation *operations,
+											   uint32 count, uint64 absolute_deadline_us,
+											   ClusterUndoSavepointControl **out);
+/* No scope lookup/allocation: exact owned cleanup survives native scope pop. */
+extern void cluster_undo_record_release_savepoint_control(ClusterUndoSavepointControl *control);
+/* Live-frame preparation recheck only; not a durable or cleanup authority. */
+extern bool cluster_undo_record_savepoint_control_owned(const ClusterUndoSavepointControl *control);
+/* Native frame xact callback, before TopTransactionContext is deleted. */
+extern void cluster_undo_record_release_savepoint_controls_at_xact_end(void);
+
 
 /* Stack-only identity for one backend-local prepared DATA reservation.  It is
  * neither shared state nor authority: the block0 publication is a retained
