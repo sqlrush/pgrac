@@ -12,6 +12,7 @@
 #include "cluster/cluster_tt_local.h"
 
 #define CLUSTER_SAVEPOINT_OPERATION_PRESENT 1
+#define CLUSTER_SAVEPOINT_FRAME_OPERATION_PRESENT 1
 
 /* Backend-local capture, never a substitute for canonical TT authority.
  * Raw tuple/index writers retain operation_fxid; top alone owns the TT slot. */
@@ -34,6 +35,17 @@ extern bool cluster_savepoint_capture_operation(ClusterSavepointOperation *out);
  * stays fixed even if nested work advanced the current command counter.
  * Cleanup ownership must not depend on the current native scope surviving. */
 extern bool cluster_savepoint_operation_matches_current(const ClusterSavepointOperation *operation);
+
+/* Explicit before-effect identity for a live child frame or its ancestor.
+ * Native parent-first assignment is allowed during capture; only the top's
+ * existing canonical binding is read. Does not reserve control storage.
+ * The ordinary DML capture/recheck remains current-scope only. */
+extern bool cluster_savepoint_capture_frame_operation(SubTransactionId subid,
+													  ClusterSavepointOperation *out);
+
+/* Allocation-free recheck while that native frame is still active, including
+ * from a readonly descendant. Not a cleanup or historical authority API. */
+extern bool cluster_savepoint_operation_matches_frame(const ClusterSavepointOperation *operation);
 
 /* Called after the native frame is published; does not allocate an xid. */
 extern void cluster_savepoint_start(SubTransactionId subid);

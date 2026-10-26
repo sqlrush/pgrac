@@ -87,10 +87,22 @@ savepoint_operation_identity_valid(const ClusterSavepointOperation *operation)
 				> U64FromFullTransactionId(operation->top_fxid));
 }
 
-bool
-cluster_savepoint_capture_operation(ClusterSavepointOperation *out)
+static ClusterSavepointFrame *
+savepoint_find_frame(SubTransactionId subid)
+{
+	ClusterSavepointFrame *frame;
+
+	for (frame = savepoint_frames; frame != NULL; frame = frame->parent)
+		if (frame->subid == subid)
+			return frame;
+	return NULL;
+}
+
+static bool
+savepoint_capture_scoped_operation(SubTransactionId requested, ClusterSavepointOperation *out)
 {
 	ClusterSavepointOperation operation = { 0 };
+	SubTransactionId current;
 
 	if (out == NULL)
 		return false;
@@ -99,16 +111,23 @@ cluster_savepoint_capture_operation(ClusterSavepointOperation *out)
 		|| IsInParallelMode() || IsParallelWorker()
 		|| operation_sequence_floor == PG_UINT64_MAX)
 		return false;
-	operation.subid = GetCurrentSubTransactionId();
-	if (operation.subid == InvalidSubTransactionId || pending_start != InvalidSubTransactionId
-		|| (operation.subid != TopSubTransactionId
-			&& (savepoint_frames == NULL || savepoint_frames->subid != operation.subid)))
+	current = GetCurrentSubTransactionId();
+	if (current == InvalidSubTransactionId || pending_start != InvalidSubTransactionId
+		|| (current != TopSubTransactionId
+			&& (savepoint_frames == NULL || savepoint_frames->subid != current)))
+		return false;
+	operation.subid = requested == InvalidSubTransactionId ? current : requested;
+	if (operation.subid != current
+		&& (operation.subid <= TopSubTransactionId
+			|| savepoint_find_frame(operation.subid) == NULL))
 		return false;
 
 	/* Register even for top-only producers: they need counter reset without
 	 * ever creating a frame. Assignment uses native parent-first xid rules. */
 	savepoint_ensure_callback();
 	operation.operation_fxid = GetCurrentFullTransactionId();
+	if (operation.subid != TopSubTransactionId)
+		operation.operation_fxid = GetFullTransactionIdForSubTransactionIfAny(operation.subid);
 	operation.top_fxid = GetTopFullTransactionIdIfAny();
 	operation.command_id = GetCurrentCommandId(false);
 	if (!cluster_tt_local_get_published_binding(XidFromFullTransactionId(operation.top_fxid),
@@ -117,6 +136,23 @@ cluster_savepoint_capture_operation(ClusterSavepointOperation *out)
 	operation.operation_sequence = ++operation_sequence_floor;
 	*out = operation;
 	return true;
+}
+
+bool
+cluster_savepoint_capture_operation(ClusterSavepointOperation *out)
+{
+	return savepoint_capture_scoped_operation(InvalidSubTransactionId, out);
+}
+
+bool
+cluster_savepoint_capture_frame_operation(SubTransactionId subid, ClusterSavepointOperation *out)
+{
+	if (subid <= TopSubTransactionId) {
+		if (out != NULL)
+			memset(out, 0, sizeof(*out));
+		return false;
+	}
+	return savepoint_capture_scoped_operation(subid, out);
 }
 
 bool
@@ -136,6 +172,26 @@ cluster_savepoint_operation_matches_current(const ClusterSavepointOperation *ope
 	/* Published-binding lookup is backend-local, with no assignment or I/O. */
 	return cluster_tt_local_get_published_binding(operation->top.xid, &top)
 		&& memcmp(&top, &operation->top, sizeof(top)) == 0;
+}
+
+bool
+cluster_savepoint_operation_matches_frame(const ClusterSavepointOperation *operation)
+{
+	ClusterCanonicalTxnBinding top;
+
+	if (operation == NULL || !cluster_storage_mode_enabled() || !IsTransactionState()
+		|| IsInParallelMode() || IsParallelWorker() || pending_start != InvalidSubTransactionId
+		|| operation->subid <= TopSubTransactionId || operation->operation_sequence == 0
+		|| operation->operation_sequence > operation_sequence_floor
+		|| !savepoint_operation_identity_valid(operation) || savepoint_frames == NULL
+		|| savepoint_frames->subid != GetCurrentSubTransactionId()
+		|| savepoint_find_frame(operation->subid) == NULL
+		|| !FullTransactionIdEquals(operation->top_fxid, GetTopFullTransactionIdIfAny())
+		|| !FullTransactionIdEquals(operation->operation_fxid,
+									GetFullTransactionIdForSubTransactionIfAny(operation->subid)))
+		return false;
+	return cluster_tt_local_get_published_binding(operation->top.xid, &top)
+		   && memcmp(&top, &operation->top, sizeof(top)) == 0;
 }
 
 void

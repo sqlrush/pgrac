@@ -19,6 +19,8 @@ names = ("PushTransaction", "PopTransaction", "DefineSavepoint", "ReleaseSavepoi
          "IsTransactionState", "GetCurrentFullTransactionId",
          "GetCurrentFullTransactionIdIfAny", "GetTopFullTransactionIdIfAny",
          "GetCurrentSubTransactionId", "GetCurrentCommandId")
+if "GetFullTransactionIdForSubTransactionIfAny(" in source:
+    names += ("GetFullTransactionIdForSubTransactionIfAny",)
 bodies = []
 for name in names:
     start = re.search(r"^(?:static )?(?:void|bool|FullTransactionId|SubTransactionId|CommandId)\n" + name + r"\([^)]*\)\n\{", source, re.M)

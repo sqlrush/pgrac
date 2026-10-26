@@ -657,6 +657,30 @@ GetCurrentFullTransactionIdIfAny(void)
 	return CurrentTransactionState->fullTransactionId;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC: exact live-native child identity for savepoint control preparation.
+ * Never assign an xid, consult SUBTRANS, or infer an owner from raw xid order.
+ */
+FullTransactionId
+GetFullTransactionIdForSubTransactionIfAny(SubTransactionId subid)
+{
+	TransactionState s;
+
+	if (subid <= TopSubTransactionId || !IsTransactionState())
+		return InvalidFullTransactionId;
+	for (s = CurrentTransactionState; s->parent != NULL; s = s->parent) {
+		if (s->subTransactionId != subid)
+			continue;
+		if (s->state == TRANS_INPROGRESS
+			&& TransactionIdIsNormal(XidFromFullTransactionId(s->fullTransactionId)))
+			return s->fullTransactionId;
+		return InvalidFullTransactionId;
+	}
+	return InvalidFullTransactionId;
+}
+#endif
+
 /*
  *	MarkCurrentTransactionIdLoggedIfAny
  *
