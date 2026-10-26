@@ -1,0 +1,424 @@
+/*-------------------------------------------------------------------------
+ * test_cluster_heap_itl_retry.c
+ *    Execute UPDATE's capacity-retry owner with real receipt requalification.
+ *
+ * Portions Copyright (c) 2026, pgrac contributors
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * The UPDATE consumer, retry helpers, VM repin and undo owner are production
+ * code. Capacity wakeup, buffer I/O and shared receipt persistence are runtime
+ * fixtures. The page-choice label is an exit boundary, not a full UPDATE.
+ *-------------------------------------------------------------------------
+ */
+#define cluster_ctrc_receipt_prepare_shared heap_itl_fixture_prepare_shared
+#define cluster_ctrc_receipt_apply_shared heap_itl_fixture_apply_shared
+#define cluster_ctrc_receipt_retarget_itl_shared heap_itl_fixture_retarget_shared
+#define cluster_ctrc_receipt_cancel_shared heap_itl_fixture_cancel_shared
+int original_itl_undo_fixture_main(int argc, char **argv);
+#define main original_itl_undo_fixture_main
+#include "test_cluster_undo_record.c"
+#undef main
+#undef cluster_ctrc_receipt_prepare_shared
+#undef cluster_ctrc_receipt_apply_shared
+#undef cluster_ctrc_receipt_retarget_itl_shared
+#undef cluster_ctrc_receipt_cancel_shared
+
+#include "access/heapam.h"
+#include "access/htup_details.h"
+#include "access/visibilitymap.h"
+#include "cluster/cluster_tx_enqueue.h"
+#include "cluster/cluster_tt_status.h"
+
+extern bool heap_receipt_test_capture(Page page, bool first, uint8 operation,
+									  ClusterCtrcTargetV1 *target);
+extern bool heap_receipt_test_plan_capture(ClusterUndoRecordPrepareReceipt *receipt);
+extern bool heap_receipt_test_plan_recheck(ClusterUndoRecordPrepareReceipt *receipt);
+
+static int pins[5];
+static bool heap_locked[3];
+static int wait_calls, key_frees, heap_relocks, recent_calls;
+static int vm_pins_during_wait, vm_pins_at_relock;
+static int retry_fault, recent_misses;
+static ClusterTxwResult wake_result;
+static bool pair_case;
+static uint64 expected_capacity_deadline;
+static OffsetNumber fresh_offset;
+static ClusterCanonicalTxnBinding *retry_binding;
+static ClusterUndoRecordPrepareReceipt before_wait_receipt;
+
+bool cluster_update_trace_enabled;
+
+uint64
+cluster_update_trace_phase_begin_at(int bucket, uint64 now)
+{
+	UT_ASSERT(false); /* Profiling is disabled in this consumer fixture. */
+	return 0;
+}
+
+void
+cluster_update_trace_phase_end_at(uint64 token, uint64 now)
+{
+	UT_ASSERT(false);
+}
+
+void *
+palloc(Size size)
+{
+	void *result = malloc(size);
+	if (result == NULL)
+		abort();
+	return result;
+}
+
+void *
+repalloc(void *pointer, Size size)
+{
+	void *result = realloc(pointer, size);
+	if (result == NULL)
+		abort();
+	return result;
+}
+
+void
+pfree(void *pointer)
+{
+	free(pointer);
+}
+
+void
+heap_freetuple(HeapTuple tuple)
+{
+	key_frees++;
+	free(tuple);
+}
+
+void
+ReleaseBuffer(Buffer buffer)
+{
+	UT_ASSERT(buffer > 0 && buffer < lengthof(pins));
+	UT_ASSERT(pins[buffer] > 0);
+	pins[buffer]--;
+}
+
+void
+LockBuffer(Buffer buffer, int mode)
+{
+	UT_ASSERT(buffer == 1 || buffer == 2);
+	UT_ASSERT(pins[buffer] == 1);
+	if (mode == BUFFER_LOCK_UNLOCK) {
+		UT_ASSERT(heap_locked[buffer]);
+		heap_locked[buffer] = false;
+	} else {
+		UT_ASSERT_EQ(mode, BUFFER_LOCK_EXCLUSIVE);
+		UT_ASSERT(!heap_locked[buffer]);
+		vm_pins_at_relock = pins[3] + pins[4];
+		heap_relocks++;
+		heap_locked[buffer] = true;
+	}
+}
+
+void
+visibilitymap_pin(Relation relation, BlockNumber block, Buffer *vm)
+{
+	UT_ASSERT_EQ(block, 44);
+	UT_ASSERT(!heap_locked[1] && !heap_locked[2]);
+	UT_ASSERT_EQ(*vm, InvalidBuffer);
+	*vm = 3;
+	pins[3]++;
+}
+
+bool
+visibilitymap_pin_recent(Relation relation, BlockNumber block, Buffer recent, Buffer *vm)
+{
+	UT_ASSERT_EQ(block, 44);
+	UT_ASSERT(heap_locked[1]);
+	UT_ASSERT_EQ(recent, 3);
+	UT_ASSERT_EQ(*vm, InvalidBuffer);
+	recent_calls++;
+	if (recent_misses > 0) {
+		recent_misses--;
+		return false;
+	}
+	*vm = 3;
+	pins[3]++;
+	return true;
+}
+
+void
+cluster_vis_evidence_note(ClusterVisEvidenceMetric metric)
+{
+	UT_ASSERT_EQ(metric, CLUSTER_VIS_METRIC_ITL_REQUALIFY);
+}
+
+static ClusterTxwResult
+cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer,
+											Buffer full_buffer, TransactionId xid, bool lock_only,
+											uint64 *deadline, const char **reason)
+{
+	Page page = BufferGetPage(old_buffer);
+	ItemId item = PageGetItemId(page, FirstOffsetNumber);
+	HeapTupleHeader header;
+
+	wait_calls++;
+	UT_ASSERT_EQ(old_buffer, 1);
+	UT_ASSERT_EQ(new_buffer, pair_case ? 2 : 1);
+	UT_ASSERT(full_buffer == old_buffer || full_buffer == new_buffer);
+	UT_ASSERT_EQ(xid, 700);
+	UT_ASSERT(!lock_only);
+	UT_ASSERT_EQ(*deadline, expected_capacity_deadline);
+	vm_pins_during_wait = pins[3] + pins[4];
+	if (new_buffer != old_buffer) {
+		LockBuffer(new_buffer, BUFFER_LOCK_UNLOCK);
+		ReleaseBuffer(new_buffer);
+	}
+	LockBuffer(old_buffer, BUFFER_LOCK_UNLOCK);
+	/* A pruning/compaction window moves the physical tuple at the same TID.
+	 * The consumer must reload its address and discard the prior DML plan. */
+	fresh_offset = ItemIdGetOffset(item) - 64;
+	memmove((char *)page + fresh_offset, PageGetItem(page, item), ItemIdGetLength(item));
+	ItemIdSetNormal(item, fresh_offset, SizeofHeapTupleHeader);
+	header = (HeapTupleHeader)PageGetItem(page, item);
+	header->t_infomask ^= HEAP_XMAX_INVALID;
+	/* Publication coordinates are the runtime fixture, not a WAL replay. */
+	PageSetLSN(page, 200);
+	((PageHeader)page)->pd_block_scn = 200;
+	receipt_clock_us = 101; /* READY's prepare deadline was 100. */
+	if (retry_fault == 1)
+		receipt_modifier_valid = false;
+	if (retry_fault == 2)
+		retry_binding->slot_offset += sizeof(TTSlot);
+	*reason = "ITL_FRESH_REQUALIFY";
+	return wake_result;
+}
+
+/* Initial PREPARE's storage service is outside this READY-retry test. An
+ * exact receipt must survive; invalidation after its old budget must refuse.
+ * Neither case may start a new allocation or publication. */
+static ClusterUndoRecordPrepareResult
+itl_unexpected_prepare(uint8 record_type, uint16 capacity, uint16 segment, uint16 offset,
+					   UBA previous, uint64 deadline, ClusterUndoRecordPrepareReceipt *receipt)
+{
+	UT_ASSERT(false);
+	return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
+}
+
+#define cluster_undo_record_prepare itl_unexpected_prepare
+#include "test_cluster_heap_itl_retry_helpers.inc"
+#undef cluster_undo_record_prepare
+
+typedef struct RetryObservation {
+	bool requalified;
+	bool reacquire;
+	bool errored;
+	bool old_key_retired;
+	bool tuple_address_reloaded;
+	Buffer old_vm;
+	Buffer new_vm;
+	uint64 deadline;
+} RetryObservation;
+
+static RetryObservation
+run_retry(bool pair, bool temporary_lock, int vm_kind, int fault, ClusterTxwResult result,
+		  ClusterUndoRecordPrepareReceipt *final_receipt)
+{
+	PGAlignedBlock image;
+	ClusterCtrcTargetV1 pending;
+	ClusterUndoRecordPrepareReceipt *retry_receipt = palloc(sizeof(*retry_receipt));
+	ClusterCanonicalTxnBinding canonical_binding = { 0 };
+	Relation relation = (Relation)1;
+	Buffer buffer = 1, newbuf = pair ? 2 : 1;
+	Buffer itl_capacity_wait_buffer = pair ? 2 : 1;
+	Buffer vmbuffer = vm_kind ? 3 : InvalidBuffer;
+	Buffer vmbuffer_new = pair && vm_kind > 1 ? (vm_kind == 2 ? 3 : 4) : InvalidBuffer;
+	BlockNumber block = 44;
+	TransactionId canonical_xid = 700;
+	uint64 itl_capacity_absolute_deadline_us = 500;
+	uint64 undo_prepare_deadline_us = 100;
+	CommandId pgrac_entry_cid = 7, cid = 999;
+	bool iscombo = true, old_tuple_temp_locked = temporary_lock;
+	bool old_key_copied = true;
+	HeapTuple old_key_tuple = palloc(sizeof(HeapTupleData));
+	HeapTupleData oldtup = { 0 };
+	ItemPointerData tid;
+	ItemPointer otid = &tid;
+	ItemId lp;
+	Page page;
+	volatile RetryObservation observed = { 0 };
+
+#define undo_receipt (*retry_receipt)
+	/* The VM pin services below model descriptors 3/4; production page
+	 * planning only accesses the reused adapter's real heap descriptor 1. */
+	NBuffers = 4;
+	cluster_undo_record_inline_max_bytes = 128;
+	receipt_fixture_ready(UNDO_RECORD_UPDATE, &undo_receipt);
+	PageInitHeapPage(image.data, BLCKSZ, 0);
+	{
+		HeapTupleHeaderData header = { 0 };
+		header.t_hoff = SizeofHeapTupleHeader;
+		header.t_itl_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
+		UT_ASSERT_EQ(
+			PageAddItem(image.data, (Item)&header, sizeof(header), FirstOffsetNumber, false, true),
+			FirstOffsetNumber);
+	}
+	PageSetLSN(image.data, 100);
+	((PageHeader)image.data)->pd_block_scn = 100;
+	if (vm_kind)
+		PageSetAllVisible(image.data);
+	UT_ASSERT(heap_receipt_test_capture(image.data, true, undo_receipt.record_type, &pending));
+	UT_ASSERT(cluster_undo_record_ctrc_stage_pending(&undo_receipt, 0, &pending));
+	UT_ASSERT(cluster_undo_record_ctrc_prepare_pending(&undo_receipt, 0));
+	UT_ASSERT(heap_receipt_test_plan_capture(&undo_receipt));
+	UT_ASSERT(heap_receipt_test_plan_recheck(&undo_receipt));
+	before_wait_receipt = undo_receipt;
+	canonical_binding.segment_id = undo_receipt.tt_slot_segment_id;
+	canonical_binding.slot_offset = undo_receipt.tt_slot_offset;
+	page = BufferGetPage(buffer);
+	lp = PageGetItemId(page, FirstOffsetNumber);
+	oldtup.t_data = (HeapTupleHeader)PageGetItem(page, lp);
+	oldtup.t_len = ItemIdGetLength(lp);
+	ItemPointerSet(otid, block, FirstOffsetNumber);
+	memset(pins, 0, sizeof(pins));
+	pins[1] = 1;
+	pins[2] = pair ? 1 : 0;
+	if (BufferIsValid(vmbuffer))
+		pins[vmbuffer]++;
+	if (BufferIsValid(vmbuffer_new))
+		pins[vmbuffer_new]++;
+	heap_locked[1] = true;
+	heap_locked[2] = pair;
+	wait_calls = key_frees = heap_relocks = recent_calls = 0;
+	vm_pins_during_wait = vm_pins_at_relock = -1;
+	pair_case = pair;
+	retry_fault = fault;
+	wake_result = result;
+	expected_capacity_deadline = itl_capacity_absolute_deadline_us;
+	retry_binding = &canonical_binding;
+	receipt_trap_error = true;
+	if (sigsetjmp(receipt_error_jump, 1) == 0) {
+		goto l_pgrac_itl_capacity_wait;
+#include "test_cluster_heap_itl_retry_consumer.inc"
+	l_pgrac_reacquire:
+		observed.reacquire = true;
+		goto done;
+	l2:
+		observed.requalified = true;
+		UT_ASSERT_EQ(cid, 7);
+		UT_ASSERT(!iscombo);
+		observed.tuple_address_reloaded
+			= oldtup.t_data == (HeapTupleHeader)((char *)page + fresh_offset)
+			  && oldtup.t_len == SizeofHeapTupleHeader;
+	done:
+		observed.old_key_retired = old_key_tuple == NULL && !old_key_copied && key_frees == 1;
+	} else {
+		observed.errored = true;
+	}
+	receipt_trap_error = false;
+	observed.old_vm = vmbuffer;
+	observed.new_vm = vmbuffer_new;
+	observed.deadline = itl_capacity_absolute_deadline_us;
+	*final_receipt = undo_receipt;
+	/* No stale pre-wait final plan may authorize a write on the moved tuple. */
+	UT_ASSERT(!heap_receipt_test_plan_recheck(&undo_receipt));
+	pfree(retry_receipt);
+#undef undo_receipt
+	return observed;
+}
+
+UT_TEST(single_page_retry_releases_vm_before_wait_and_reloads_tuple)
+{
+	for (int result = 0; result < 2; result++) {
+		ClusterUndoRecordPrepareReceipt receipt;
+		RetryObservation observed;
+
+		recent_misses = 0;
+		observed = run_retry(false, false, 1, 0, result ? CLUSTER_TXW_RETRY : CLUSTER_TXW_RESOLVED,
+							 &receipt);
+		UT_ASSERT(!observed.errored && observed.requalified && !observed.reacquire);
+		UT_ASSERT(observed.old_key_retired && observed.tuple_address_reloaded);
+		UT_ASSERT_EQ(wait_calls, 1);
+		UT_ASSERT_EQ(vm_pins_during_wait, 0);
+		UT_ASSERT_EQ(vm_pins_at_relock, 0);
+		UT_ASSERT_EQ(observed.old_vm, 3);
+		UT_ASSERT_EQ(pins[3], 1);
+		UT_ASSERT_EQ(observed.deadline, 500);
+		UT_ASSERT_EQ(receipt.absolute_deadline_us, 100);
+		UT_ASSERT_EQ(receipt_cancel_calls + receipt_unref_calls + receipt_leave_calls, 0);
+		UT_ASSERT(cluster_undo_record_reservation.active);
+		UT_ASSERT_EQ(memcmp(&receipt, &before_wait_receipt, sizeof(receipt)), 0);
+		UT_ASSERT_EQ(memcmp(&receipt, &cluster_undo_record_reservation.receipt, sizeof(receipt)),
+					 0);
+		cluster_undo_record_cancel_prepared(&receipt);
+		UT_ASSERT(!cluster_undo_record_reservation.active);
+	}
+}
+
+UT_TEST(pair_retry_releases_each_vm_reference_before_page_choice_reentry)
+{
+	for (int vm_kind = 0; vm_kind <= 3; vm_kind++) {
+		ClusterUndoRecordPrepareReceipt receipt;
+		RetryObservation observed;
+
+		recent_misses = 0;
+		observed = run_retry(true, true, vm_kind, 0, CLUSTER_TXW_RESOLVED, &receipt);
+		UT_ASSERT(!observed.errored && observed.reacquire && !observed.requalified);
+		UT_ASSERT(observed.old_key_retired);
+		UT_ASSERT_EQ(vm_pins_during_wait, 0);
+		UT_ASSERT_EQ(pins[2] + pins[3] + pins[4], 0);
+		UT_ASSERT(!heap_locked[1] && !heap_locked[2]);
+		UT_ASSERT_EQ(observed.old_vm, InvalidBuffer);
+		UT_ASSERT_EQ(observed.new_vm, InvalidBuffer);
+		UT_ASSERT_EQ(observed.deadline, 500);
+		UT_ASSERT_EQ(memcmp(&receipt, &before_wait_receipt, sizeof(receipt)), 0);
+		UT_ASSERT_EQ(receipt_cancel_calls + receipt_unref_calls + receipt_leave_calls, 0);
+		UT_ASSERT(cluster_undo_record_reservation.active);
+		cluster_undo_record_cancel_prepared(&receipt);
+		UT_ASSERT(!cluster_undo_record_reservation.active);
+	}
+}
+
+UT_TEST(repin_retries_a_resident_miss_without_carrying_a_vm_pin)
+{
+	ClusterUndoRecordPrepareReceipt receipt;
+	RetryObservation observed;
+
+	recent_misses = 1;
+	observed = run_retry(false, false, 1, 0, CLUSTER_TXW_RESOLVED, &receipt);
+	UT_ASSERT(!observed.errored && observed.requalified && observed.tuple_address_reloaded);
+	UT_ASSERT_EQ(recent_calls, 2);
+	UT_ASSERT_EQ(heap_relocks, 2);
+	UT_ASSERT_EQ(vm_pins_at_relock, 0);
+	UT_ASSERT_EQ(pins[3], 1);
+	UT_ASSERT_EQ(receipt_cancel_calls + receipt_unref_calls, 0);
+	cluster_undo_record_cancel_prepared(&receipt);
+}
+
+UT_TEST(exact_receipt_invalidation_refuses_without_renewing_or_orphaning)
+{
+	for (int fault = 1; fault <= 2; fault++) {
+		ClusterUndoRecordPrepareReceipt receipt;
+		RetryObservation observed;
+
+		recent_misses = 0;
+		observed = run_retry(false, false, 0, fault, CLUSTER_TXW_RESOLVED, &receipt);
+		UT_ASSERT(observed.errored && !observed.requalified && !observed.reacquire);
+		UT_ASSERT_EQ(observed.deadline, 500);
+		UT_ASSERT_EQ(receipt_error_code, ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA);
+		UT_ASSERT_EQ(receipt_unref_calls, 1);
+		UT_ASSERT_EQ(receipt_cancel_calls, 1);
+		UT_ASSERT_EQ(receipt_apply_calls, 0);
+		UT_ASSERT(!cluster_undo_record_reservation.active);
+		UT_ASSERT(!heap_locked[1]);
+	}
+}
+
+int
+main(void)
+{
+	UT_PLAN(4);
+	UT_RUN(single_page_retry_releases_vm_before_wait_and_reloads_tuple);
+	UT_RUN(pair_retry_releases_each_vm_reference_before_page_choice_reentry);
+	UT_RUN(repin_retries_a_resident_miss_without_carrying_a_vm_pin);
+	UT_RUN(exact_receipt_invalidation_refuses_without_renewing_or_orphaning);
+	UT_DONE();
+	return ut_failed_count != 0;
+}

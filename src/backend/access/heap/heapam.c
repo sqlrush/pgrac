@@ -15622,6 +15622,16 @@ l_pgrac_itl_capacity_wait: {
 	const char *wait_reason;
 	ClusterTxwResult wait_result;
 
+	/* No VM pin may cross the capacity wait. Reentry uses the existing
+	 * repin/page-choice owners; aliased handles each own a reference. */
+	if (BufferIsValid(vmbuffer)) {
+		ReleaseBuffer(vmbuffer);
+		vmbuffer = InvalidBuffer;
+	}
+	if (BufferIsValid(vmbuffer_new)) {
+		ReleaseBuffer(vmbuffer_new);
+		vmbuffer_new = InvalidBuffer;
+	}
 	{
 		ClusterXpScope xp_itl;
 
