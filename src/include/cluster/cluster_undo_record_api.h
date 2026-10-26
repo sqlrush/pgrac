@@ -96,6 +96,7 @@ typedef enum ClusterUndoRecordConsumePreflightResult {
 #define CLUSTER_UNDO_RECORD_CTRC_TARGETS 2
 #define CLUSTER_UNDO_OPERATION_CAPTURE_PRESENT 1
 #define CLUSTER_UNDO_SAVEPOINT_RESERVE_PRESENT 1
+#define CLUSTER_UNDO_SAVEPOINT_BOUNDS_PRESENT 1
 
 typedef struct ClusterUndoSavepointControl ClusterUndoSavepointControl;
 /* Before any data effect or DATA receipt, with no content/entry lock held.
@@ -113,6 +114,23 @@ extern void cluster_undo_record_release_savepoint_control(ClusterUndoSavepointCo
 extern bool cluster_undo_record_savepoint_control_owned(const ClusterUndoSavepointControl *control);
 /* Native frame xact callback, before TopTransactionContext is deleted. */
 extern void cluster_undo_record_release_savepoint_controls_at_xact_end(void);
+
+/* Backend-local first-effect stop and a current head snapshot. The physical
+ * RESERVED control still has invalid roots. No field is a chain-reachability,
+ * current/CRC, durability or recovery proof, and this does not activate it. */
+typedef struct ClusterUndoSavepointBounds {
+	ClusterSavepointOperation operation;
+	UBA control_uba;
+	UBA stop_uba;
+	UBA current_head;
+} ClusterUndoSavepointBounds;
+/* Live scope only, outside critical sections, with no active DATA reservation
+ * or consume/ref ownership. Consumed APPLIED responsibilities remain intact.
+ * No allocation, xid assignment, storage, WAL or receipt cleanup.
+ * false zeroes *out; true with head==stop denotes an empty local range.
+ * A caller must stop effects and prove the actual retained chain before use. */
+extern bool cluster_undo_record_savepoint_control_bounds(const ClusterUndoSavepointControl *control,
+														 ClusterUndoSavepointBounds *out);
 
 
 /* Stack-only identity for one backend-local prepared DATA reservation.  It is

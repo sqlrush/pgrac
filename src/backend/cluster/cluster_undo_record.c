@@ -374,6 +374,7 @@ static uint64 cluster_undo_record_reservation_floor = 0;
 struct ClusterUndoSavepointControl {
 	ClusterSavepointOperation operation;
 	UBA uba;
+	UBA stop_uba; /* original top head before this scope's first data effect */
 	int ref_slot;
 	bool owns_ref;
 	bool reserved;
@@ -5548,6 +5549,28 @@ undo_savepoint_control_cancel_batch(ClusterUndoSavepointControl *controls, uint3
 }
 
 static bool
+undo_savepoint_control_address_valid(const ClusterSavepointOperation *operation, UBA address,
+									 bool allow_invalid)
+{
+	UndoRecordHeader header = { 0 };
+
+	header.origin_node_id = operation->top.origin_instance - 1;
+	header.tt_slot_id = cluster_tt_slot_offset_to_id(operation->top.slot_offset);
+	return cluster_undo_rollback_address_valid(&header, address, allow_invalid);
+}
+
+static bool
+undo_savepoint_control_read_head(const ClusterSavepointOperation *operation, UBA *out)
+{
+	UBA head = cluster_undo_local_head_get(operation->top.segment_id, operation->top.slot_offset);
+
+	if (!undo_savepoint_control_address_valid(operation, head, true))
+		return false;
+	*out = head;
+	return true;
+}
+
+static bool
 undo_savepoint_control_inputs_valid(const ClusterSavepointOperation *operations, uint32 count)
 {
 	if (operations == NULL)
@@ -5579,6 +5602,7 @@ cluster_undo_record_reserve_savepoint_controls(const ClusterSavepointOperation *
 {
 	ClusterUndoSavepointControl *controls;
 	ClusterUndoSavepointControl *previous = undo_savepoint_controls;
+	UBA stop, after;
 	volatile bool complete = false;
 
 	if (out == NULL || count == 0 || count > MaxAllocSize / sizeof(*controls))
@@ -5587,13 +5611,15 @@ cluster_undo_record_reserve_savepoint_controls(const ClusterSavepointOperation *
 	if (CritSectionCount != 0 || TopTransactionContext == NULL
 		|| cluster_undo_record_reservation.active || cluster_undo_record_reservation.owns_ref
 		|| absolute_deadline_us == 0 || absolute_deadline_us <= (uint64)GetCurrentTimestamp()
-		|| !undo_savepoint_control_inputs_valid(operations, count))
+		|| !undo_savepoint_control_inputs_valid(operations, count)
+		|| !undo_savepoint_control_read_head(&operations[0], &stop))
 		return false;
 	controls = MemoryContextAllocZero(TopTransactionContext, count * sizeof(*controls));
 	for (uint32 i = 0; i < count; i++) {
 		controls[i].operation = operations[i];
 		controls[i].ref_slot = -1;
 		controls[i].uba = InvalidUba;
+		controls[i].stop_uba = stop;
 		controls[i].next = undo_savepoint_controls;
 		undo_savepoint_controls = &controls[i];
 	}
@@ -5621,7 +5647,11 @@ cluster_undo_record_reserve_savepoint_controls(const ClusterSavepointOperation *
 			}
 			complete = done == count;
 			for (uint32 i = 0; complete && i < count; i++)
-				complete = cluster_undo_record_savepoint_control_owned(&controls[i]);
+				complete = cluster_undo_record_savepoint_control_owned(&controls[i])
+						   && !cluster_undo_record_uba_equal(controls[i].stop_uba, controls[i].uba);
+			if (complete)
+				complete = undo_savepoint_control_read_head(&operations[0], &after)
+						   && cluster_undo_record_uba_equal(stop, after);
 		}
 	}
 	PG_CATCH();
@@ -5636,5 +5666,35 @@ cluster_undo_record_reserve_savepoint_controls(const ClusterSavepointOperation *
 	}
 	for (uint32 i = 0; i < count; i++)
 		out[i] = &controls[i];
+	return true;
+}
+
+/* A local snapshot, never a substitute for the original chain/current owner.
+ * All new ancestors captured the same head while their scopes were empty;
+ * an existing ancestor keeps its earlier boundary through child releases. */
+bool
+cluster_undo_record_savepoint_control_bounds(const ClusterUndoSavepointControl *control,
+											 ClusterUndoSavepointBounds *out)
+{
+	const ClusterUndoRecordReservation *reservation = &cluster_undo_record_reservation;
+	ClusterUndoSavepointBounds candidate = { 0 };
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (CritSectionCount != 0 || reservation->active || reservation->owns_ref
+		|| reservation->consume_locked || !cluster_undo_record_savepoint_control_owned(control))
+		return false;
+	if (!undo_savepoint_control_address_valid(&control->operation, control->uba, false)
+		|| !undo_savepoint_control_address_valid(&control->operation, control->stop_uba, true)
+		|| !undo_savepoint_control_read_head(&control->operation, &candidate.current_head)
+		|| cluster_undo_record_uba_equal(control->uba, control->stop_uba)
+		|| cluster_undo_record_uba_equal(control->uba, candidate.current_head)
+		|| (!UBA_is_invalid(control->stop_uba) && UBA_is_invalid(candidate.current_head)))
+		return false;
+	candidate.operation = control->operation;
+	candidate.control_uba = control->uba;
+	candidate.stop_uba = control->stop_uba;
+	*out = candidate;
 	return true;
 }

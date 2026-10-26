@@ -194,6 +194,7 @@ reserve_test_fixture(void)
 	reserve_test_wal = reserve_test_installs = 0;
 	reserve_test_fail_lock = reserve_test_throw_wal = false;
 	reserve_test_throw_wal_at = 0;
+	reserve_test_head_during_wal = InvalidUba;
 	reserve_test_invalidate_scope_after_lock = reserve_test_expire_at_pin = false;
 	memset(reserve_test_images, 0, sizeof(reserve_test_images));
 	memset(reserve_test_wal_slots, 0, sizeof(reserve_test_wal_slots));
@@ -459,5 +460,293 @@ UT_TEST(test_reserved_controls_nonshared_pending_keeps_its_original_ref)
 	UT_ASSERT_EQ(reserve_test_wal, 1);
 	UT_ASSERT_EQ(reserve_test_wal_slots[0], 24);
 	UT_ASSERT(!cluster_undo_pending.active);
+	reserve_test_done();
+}
+
+/* The original backend-local head is the explicit environment boundary:
+ * these are head snapshots, not fabricated record/chain authority proofs. */
+#ifndef CLUSTER_UNDO_SAVEPOINT_BOUNDS_PRESENT
+typedef struct ClusterUndoSavepointBounds {
+	ClusterSavepointOperation operation;
+	UBA control_uba;
+	UBA stop_uba;
+	UBA current_head;
+} ClusterUndoSavepointBounds;
+static bool
+cluster_undo_record_savepoint_control_bounds(const ClusterUndoSavepointControl *control,
+											 ClusterUndoSavepointBounds *out)
+{
+	(void)control;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return false;
+}
+#endif
+
+static void
+reserve_test_set_head(UBA head)
+{
+	int index = -1;
+
+	UT_ASSERT(cluster_undo_local_head_ensure(1, 0, &index));
+	if (index >= 0)
+		cluster_undo_local_heads[index].head = head;
+}
+static bool
+reserve_test_bounds_zero(const ClusterUndoSavepointBounds *bounds)
+{
+	ClusterUndoSavepointBounds zero = { 0 };
+	return memcmp(bounds, &zero, sizeof(zero)) == 0;
+}
+static bool
+reserve_test_uba_equal(UBA a, UBA b)
+{
+	return memcmp(&a, &b, sizeof(a)) == 0;
+}
+
+UT_TEST(test_control_bounds_freeze_empty_stop_without_io)
+{
+	ClusterUndoSavepointControl *control = NULL;
+	ClusterUndoSavepointBounds bounds;
+	UBA after = uba_encode(2, 9, 0, 4);
+	PGAlignedBlock image;
+	int io, wal, refs;
+	unsigned allocations;
+
+	reserve_test_fixture();
+	UT_ASSERT(
+		cluster_undo_record_reserve_savepoint_controls(reserve_test_operations, 1, 100, &control));
+	memcpy(image.data, reserve_test_images[0].data, BLCKSZ);
+	io = reserve_test_io;
+	wal = reserve_test_wal;
+	refs = reserve_test_refs;
+	allocations = reserve_test_allocation_count;
+	printf("# control bytes=%zu bounds bytes=%zu\n", sizeof(*control), sizeof(bounds));
+	UT_ASSERT(cluster_undo_record_savepoint_control_bounds(control, &bounds));
+	UT_ASSERT(UBA_is_invalid(bounds.stop_uba) && UBA_is_invalid(bounds.current_head));
+	UT_ASSERT_EQ(cluster_undo_local_head_count, 0);
+	reserve_test_set_head(after);
+	UT_ASSERT(cluster_undo_record_savepoint_control_bounds(control, &bounds));
+	UT_ASSERT(UBA_is_invalid(bounds.stop_uba));
+	UT_ASSERT(reserve_test_uba_equal(bounds.current_head, after));
+	UT_ASSERT(reserve_test_uba_equal(bounds.control_uba, control->uba));
+	UT_ASSERT_EQ(memcmp(&bounds.operation, &reserve_test_operations[0], sizeof(bounds.operation)),
+				 0);
+	UT_ASSERT_EQ(memcmp(image.data, reserve_test_images[0].data, BLCKSZ), 0);
+	UT_ASSERT_EQ(reserve_test_io, io);
+	UT_ASSERT_EQ(reserve_test_wal, wal);
+	UT_ASSERT_EQ(reserve_test_refs, refs);
+	UT_ASSERT_EQ(reserve_test_allocation_count, allocations);
+	reserve_test_done();
+}
+
+UT_TEST(test_control_bounds_keep_parent_and_new_ancestor_stops)
+{
+	ClusterUndoSavepointControl *parent = NULL, *children[2] = { 0 }, *later = NULL;
+	ClusterUndoSavepointBounds bounds;
+	UBA a = uba_encode(1, 8, 0, 2), b = uba_encode(2, 9, 0, 3), c = uba_encode(3, 10, 0, 4);
+
+	reserve_test_fixture();
+	reserve_test_set_head(a);
+	UT_ASSERT(
+		cluster_undo_record_reserve_savepoint_controls(reserve_test_operations, 1, 100, &parent));
+	reserve_test_set_head(b);
+	UT_ASSERT(cluster_undo_record_reserve_savepoint_controls(reserve_test_operations + 1, 2, 100,
+															 children));
+	UT_ASSERT(cluster_undo_record_savepoint_control_bounds(parent, &bounds));
+	UT_ASSERT(reserve_test_uba_equal(bounds.stop_uba, a));
+	for (unsigned i = 0; i < 2; i++) {
+		UT_ASSERT(cluster_undo_record_savepoint_control_bounds(children[i], &bounds));
+		UT_ASSERT(reserve_test_uba_equal(bounds.stop_uba, b));
+		UT_ASSERT(reserve_test_uba_equal(bounds.current_head, b));
+	}
+	cluster_undo_record_release_savepoint_control(children[0]);
+	reserve_test_set_head(c);
+	UT_ASSERT(cluster_undo_record_reserve_savepoint_controls(reserve_test_operations + 3, 1, 100,
+															 &later));
+	UT_ASSERT(cluster_undo_record_savepoint_control_bounds(later, &bounds));
+	UT_ASSERT(reserve_test_uba_equal(bounds.stop_uba, c));
+	UT_ASSERT(cluster_undo_record_savepoint_control_bounds(parent, &bounds));
+	UT_ASSERT(reserve_test_uba_equal(bounds.stop_uba, a)
+			  && reserve_test_uba_equal(bounds.current_head, c));
+	UT_ASSERT(cluster_undo_record_savepoint_control_bounds(children[1], &bounds));
+	UT_ASSERT(reserve_test_uba_equal(bounds.stop_uba, b));
+	UT_ASSERT_EQ(reserve_test_refs, 3);
+	reserve_test_done();
+}
+
+UT_TEST(test_control_bounds_reservation_rejects_malformed_original_head)
+{
+	for (unsigned leg = 0; leg < 8; leg++) {
+		ClusterUndoSavepointControl *control = (void *)1;
+		UBA bad = { .raw = { UINT64CONST(1) | (UINT64CONST(9) << 32), 0 } };
+
+		reserve_test_fixture();
+		switch (leg) {
+		case 0:
+			bad.raw[0] &= ~UINT64CONST(0xffffffff);
+			break;
+		case 1:
+			bad.raw[0] = CLUSTER_UNDO_SEGS_PER_INSTANCE + 1U | (UINT64CONST(9) << 32);
+			break;
+		case 2:
+			bad.raw[0] = 1;
+			break;
+		case 3:
+			bad.raw[0] = 1 | ((uint64)UNDO_BLOCKS_PER_SEGMENT << 32);
+			break;
+		case 4:
+			bad.raw[1] = 1;
+			break;
+		case 5:
+			bad.raw[1] = (uint64)((BLCKSZ - 48) / 8) << 16;
+			break;
+		case 6:
+			bad.raw[1] = UINT64CONST(1) << 32;
+			break;
+		case 7:
+			bad.raw[0] = UINT64CONST(65536) | (UINT64CONST(9) << 32);
+			break;
+		}
+		reserve_test_set_head(bad);
+		UT_ASSERT(!cluster_undo_record_reserve_savepoint_controls(reserve_test_operations, 1, 100,
+																  &control));
+		UT_ASSERT(control == NULL);
+		UT_ASSERT_EQ(reserve_test_wal + reserve_test_io + reserve_test_refs, 0);
+		UT_ASSERT_EQ(reserve_test_allocation_count, 0);
+		UT_ASSERT(reserve_test_uba_equal(cluster_undo_local_head_get(1, 0), bad));
+		reserve_test_done();
+	}
+}
+
+UT_TEST(test_control_bounds_preserve_outstanding_data_ownership)
+{
+	ClusterUndoSavepointControl *control = NULL;
+	ClusterUndoSavepointBounds bounds;
+	ClusterUndoRecordReservation saved, expected;
+
+	reserve_test_fixture();
+	UT_ASSERT(
+		cluster_undo_record_reserve_savepoint_controls(reserve_test_operations, 1, 100, &control));
+	saved = cluster_undo_record_reservation;
+	for (unsigned leg = 0; leg < 4; leg++) {
+		cluster_undo_record_reservation = saved;
+		if (leg == 0)
+			cluster_undo_record_reservation.active = true;
+		if (leg == 1)
+			cluster_undo_record_reservation.owns_ref = true;
+		if (leg == 2)
+			cluster_undo_record_reservation.consume_locked = true;
+		if (leg == 3)
+			CritSectionCount = 1;
+		expected = cluster_undo_record_reservation;
+		memset(&bounds, 0xa5, sizeof(bounds));
+		UT_ASSERT(!cluster_undo_record_savepoint_control_bounds(control, &bounds));
+		UT_ASSERT(reserve_test_bounds_zero(&bounds));
+		UT_ASSERT_EQ(memcmp(&cluster_undo_record_reservation, &expected, sizeof(expected)), 0);
+		CritSectionCount = 0;
+	}
+	cluster_undo_record_reservation = saved;
+	/* Completed consume keeps diagnostic fields; they are not live debt. */
+	cluster_undo_record_reservation.apply_attempted = true;
+	UT_ASSERT(cluster_undo_record_savepoint_control_bounds(control, &bounds));
+	UT_ASSERT(cluster_undo_record_reservation.apply_attempted);
+	cluster_undo_record_reservation = saved;
+	UT_ASSERT_EQ(reserve_test_refs, 1);
+	reserve_test_done();
+}
+
+UT_TEST(test_control_bounds_reject_unknown_retired_and_changed_scope)
+{
+	ClusterUndoSavepointControl *control = NULL;
+	ClusterUndoSavepointBounds bounds;
+
+	reserve_test_fixture();
+	UT_ASSERT(
+		cluster_undo_record_reserve_savepoint_controls(reserve_test_operations, 1, 100, &control));
+	for (unsigned leg = 0; leg < 4; leg++) {
+		const ClusterUndoSavepointControl *input = control;
+		if (leg == 0)
+			input = NULL;
+		if (leg == 1)
+			input = (void *)1;
+		if (leg == 2)
+			reserve_test_scope_valid = false;
+		if (leg == 3) {
+			reserve_test_scope_valid = true;
+			cluster_undo_record_release_savepoint_control(control);
+		}
+		memset(&bounds, 0xa5, sizeof(bounds));
+		UT_ASSERT(!cluster_undo_record_savepoint_control_bounds(input, &bounds));
+		UT_ASSERT(reserve_test_bounds_zero(&bounds));
+	}
+	UT_ASSERT(!cluster_undo_record_savepoint_control_bounds(control, NULL));
+	UT_ASSERT_EQ(reserve_test_refs, 0);
+	reserve_test_done();
+}
+
+UT_TEST(test_control_bounds_reject_self_head_and_lost_stop)
+{
+	ClusterUndoSavepointControl *control = NULL;
+	ClusterUndoSavepointBounds bounds;
+	UBA before = uba_encode(2, 9, 0, 4);
+
+	reserve_test_fixture();
+	reserve_test_set_head(before);
+	UT_ASSERT(
+		cluster_undo_record_reserve_savepoint_controls(reserve_test_operations, 1, 100, &control));
+	reserve_test_set_head(control->uba);
+	memset(&bounds, 0xa5, sizeof(bounds));
+	UT_ASSERT(!cluster_undo_record_savepoint_control_bounds(control, &bounds));
+	UT_ASSERT(reserve_test_bounds_zero(&bounds));
+	reserve_test_set_head(InvalidUba);
+	UT_ASSERT(!cluster_undo_record_savepoint_control_bounds(control, &bounds));
+	UT_ASSERT(reserve_test_bounds_zero(&bounds));
+	reserve_test_set_head(before);
+	UT_ASSERT(cluster_undo_record_savepoint_control_bounds(control, &bounds));
+	UT_ASSERT(reserve_test_uba_equal(bounds.stop_uba, before));
+	UT_ASSERT(reserve_test_uba_equal(bounds.current_head, before));
+	reserve_test_done();
+}
+
+UT_TEST(test_control_bounds_reserve_drift_keeps_original_parent)
+{
+	ClusterUndoSavepointControl *parent = NULL, *control = (void *)1;
+	ClusterUndoSavepointBounds bounds;
+	UBA before = uba_encode(1, 8, 0, 2), after = uba_encode(2, 9, 0, 3);
+
+	reserve_test_fixture();
+	reserve_test_set_head(before);
+	UT_ASSERT(
+		cluster_undo_record_reserve_savepoint_controls(reserve_test_operations, 1, 100, &parent));
+	reserve_test_head_during_wal = after;
+	UT_ASSERT(!cluster_undo_record_reserve_savepoint_controls(reserve_test_operations + 1, 1, 100,
+															  &control));
+	UT_ASSERT(control == NULL);
+	UT_ASSERT_EQ(reserve_test_refs, 1);
+	UT_ASSERT_EQ(reserve_test_wal, 2);
+	UT_ASSERT(reserve_test_uba_equal(cluster_undo_local_head_get(1, 0), after));
+	UT_ASSERT(cluster_undo_record_savepoint_control_bounds(parent, &bounds));
+	UT_ASSERT(reserve_test_uba_equal(bounds.stop_uba, before));
+	UT_ASSERT(reserve_test_uba_equal(bounds.current_head, after));
+	UT_ASSERT_EQ(reserve_test_images[0].data[112 + 4], 1);
+	for (unsigned i = 16; i < 64; i++)
+		UT_ASSERT_EQ(reserve_test_images[0].data[112 + i], 0);
+	reserve_test_done();
+}
+
+UT_TEST(test_control_bounds_refuse_reserved_self_stop)
+{
+	ClusterUndoSavepointControl *control = (void *)1;
+	UBA future = uba_encode(1, 1, 0, 0);
+
+	reserve_test_fixture();
+	reserve_test_set_head(future);
+	UT_ASSERT(
+		!cluster_undo_record_reserve_savepoint_controls(reserve_test_operations, 1, 100, &control));
+	UT_ASSERT(control == NULL);
+	UT_ASSERT_EQ(reserve_test_refs, 0);
+	UT_ASSERT_EQ(reserve_test_wal, 1);
+	UT_ASSERT(reserve_test_uba_equal(cluster_undo_local_head_get(1, 0), future));
 	reserve_test_done();
 }

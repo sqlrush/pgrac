@@ -122,6 +122,7 @@ static int reserve_test_wal, reserve_test_installs;
 static uint16 reserve_test_wal_slots[2];
 static bool reserve_test_fail_lock, reserve_test_throw_wal;
 static int reserve_test_throw_wal_at;
+static UBA reserve_test_head_during_wal;
 static bool reserve_test_invalidate_scope_after_lock, reserve_test_expire_at_pin;
 static PGPROC reserve_test_proc;
 
@@ -530,6 +531,14 @@ cluster_undo_emit_block_write_multi(uint8 instance, uint32 segment_id, uint32 bl
 		UT_ASSERT_EQ(slot_off, 8192 - 8 * header->slot_count);
 		reserve_test_wal_slots[block_no - 1] = slot_len;
 		reserve_test_wal++;
+		if (!UBA_is_invalid(reserve_test_head_during_wal)) {
+			int index = -1;
+
+			UT_ASSERT(cluster_undo_local_head_ensure(1, 0, &index));
+			if (index >= 0)
+				cluster_undo_local_heads[index].head = reserve_test_head_during_wal;
+			reserve_test_head_during_wal = InvalidUba;
+		}
 		if (reserve_test_throw_wal || reserve_test_wal == reserve_test_throw_wal_at)
 			siglongjmp(*PG_exception_stack, 1);
 		return 500 + reserve_test_wal;
@@ -6036,7 +6045,15 @@ UT_TEST(test_exact_zero_abort_keeps_cleanup_after_native_scope_ends)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(171);
+	UT_PLAN(179);
+	UT_RUN(test_control_bounds_refuse_reserved_self_stop);
+	UT_RUN(test_control_bounds_freeze_empty_stop_without_io);
+	UT_RUN(test_control_bounds_keep_parent_and_new_ancestor_stops);
+	UT_RUN(test_control_bounds_reservation_rejects_malformed_original_head);
+	UT_RUN(test_control_bounds_preserve_outstanding_data_ownership);
+	UT_RUN(test_control_bounds_reject_unknown_retired_and_changed_scope);
+	UT_RUN(test_control_bounds_reject_self_head_and_lost_stop);
+	UT_RUN(test_control_bounds_reserve_drift_keeps_original_parent);
 	UT_RUN(test_reserved_controls_later_batch_error_keeps_prior_parent);
 	UT_RUN(test_reserved_controls_nonshared_pending_keeps_its_original_ref);
 	UT_RUN(test_reserved_control_is_physical_but_not_top_head);
