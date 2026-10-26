@@ -43,6 +43,8 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
+#include "portability/instr_time.h"
+#include "utils/wait_event.h"
 #include "utils/builtins.h"
 
 #include <sys/time.h> /* gettimeofday (full-duration sleep loop) */
@@ -983,6 +985,18 @@ static ClusterInjectPoint cluster_injection_registry[] = {
 	 * parameter selects ACTIVE_PROOF_READY / ACK_DURABLE /
 	 * CERTIFICATE_READY; no authority byte is supplied by this registry. */
 	{ .name = "cluster-ctrc-stage-barrier" },
+
+	/* Transaction sampling/publication: scheduling-only, one-shot SLEEP.
+	 * These sites must never use the general fault dispatcher. */
+	{ .name = "cluster-tx-canonical-copy" },
+	{ .name = "cluster-tx-commit-tt-before" },
+	{ .name = "cluster-tx-commit-tt-after" },
+	{ .name = "cluster-tx-commit-clog-before" },
+	{ .name = "cluster-tx-commit-clog-after" },
+	{ .name = "cluster-tx-abort-tt-before" },
+	{ .name = "cluster-tx-abort-tt-after" },
+	{ .name = "cluster-tx-abort-clog-before" },
+	{ .name = "cluster-tx-abort-clog-after" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_registry)
@@ -1176,6 +1190,60 @@ cluster_injection_arm_internal(ClusterInjectPoint *p, ClusterInjectFaultType new
 
 	if (cluster_injection_armed_count < 0)
 		cluster_injection_armed_count = 0; /* defensive */
+}
+
+
+/*
+ * Pause a real publication boundary without injecting a new outcome. The arm
+ * and counter are backend-local; observers use the existing wait event, not
+ * another backend's registry. Use a monotonic clock and short sleeps so signal
+ * wakeups cannot silently shorten the selected interval. The arm is consumed
+ * before waiting, including cancellation, so a reader retry cannot pause twice.
+ */
+void
+cluster_injection_pause(const char *name)
+{
+	ClusterInjectPoint *p;
+	uint64 param;
+	uint32 previous_wait;
+	instr_time start;
+
+	cluster_injection_initialise();
+	p = cluster_injection_lookup(name);
+	if (p == NULL || pg_atomic_read_u32(&p->armed_type) != CLUSTER_FAULT_SLEEP)
+		return;
+	param = pg_atomic_read_u64(&p->armed_param);
+	if (param == 0 || param > UINT64CONST(60000000))
+		return;
+
+	cluster_injection_arm_internal(p, CLUSTER_FAULT_NONE, 0);
+	(void)pg_atomic_fetch_add_u64(&p->hits, 1);
+	previous_wait = *my_wait_event_info;
+	INSTR_TIME_SET_CURRENT(start);
+	PG_TRY();
+	{
+		pgstat_report_wait_start(WAIT_EVENT_PG_SLEEP);
+		for (;;) {
+			instr_time now;
+			uint64 elapsed;
+
+			INSTR_TIME_SET_CURRENT(now);
+			INSTR_TIME_SUBTRACT(now, start);
+			elapsed = INSTR_TIME_GET_MICROSEC(now);
+			if (elapsed >= param)
+				break;
+			/* Commit/abort must leave their original critical section
+			 * before servicing a pending cancel. No fault is dispatched. */
+			if (CritSectionCount == 0)
+				CHECK_FOR_INTERRUPTS();
+			pg_usleep((long)Min(param - elapsed, UINT64CONST(10000)));
+		}
+	}
+	PG_FINALLY();
+	{
+		pgstat_report_wait_start(previous_wait);
+	}
+	PG_END_TRY();
 }
 
 

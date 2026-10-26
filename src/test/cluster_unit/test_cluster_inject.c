@@ -45,6 +45,10 @@
 #include "postgres.h"
 
 #include "cluster/cluster_inject.h"
+#include "miscadmin.h"
+#include "portability/instr_time.h"
+#include "utils/wait_event.h"
+
 
 #undef printf
 #undef fprintf
@@ -87,6 +91,20 @@ cluster_ctrc_test_barrier_control(ClusterCtrcTestBarrierPhase phase pg_attribute
 
 static int last_elevel = -1;
 static int last_sleep_us = -1;
+static int sleep_calls;
+static int interrupt_calls;
+static bool cancel_pause;
+static uint32 wait_event_storage;
+uint32 *my_wait_event_info = &wait_event_storage;
+volatile uint32 CritSectionCount;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+void
+pg_re_throw(void)
+{
+	siglongjmp(*PG_exception_stack, 1);
+}
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -100,19 +118,24 @@ void
 pg_usleep(long microsec)
 {
 	last_sleep_us = (int)microsec;
+	sleep_calls++;
+	UT_ASSERT_EQ(wait_event_storage, WAIT_EVENT_PG_SLEEP);
+	/* Simulate signals interrupting the sleep; the real clock must still
+	 * reach the requested duration before the pause finishes. */
 }
 
-/*
- * CHECK_FOR_INTERRUPTS() in the full-duration SLEEP dispatcher expands to
- * references to InterruptPending + ProcessInterrupts.  No armed-SLEEP path is
- * exercised here (only the WARNING dispatcher and disarmed runs), so these only
- * satisfy the linker; InterruptPending stays false so the macro is a no-op.
- */
+/* Cancellation and critical-section deferral are exercised by the pause-only
+ * entry. The general ERROR/CRASH dispatcher is never used by those tests. */
 volatile sig_atomic_t InterruptPending = false;
 
 void
 ProcessInterrupts(void)
-{}
+{
+	interrupt_calls++;
+	InterruptPending = false;
+	if (cancel_pause)
+		siglongjmp(*PG_exception_stack, 1);
+}
 
 bool
 errstart(int elevel, const char *domain pg_attribute_unused())
@@ -420,10 +443,138 @@ UT_TEST(test_first_publication_deny_registry_dispatches_only_its_skip)
 	UT_ASSERT(!cluster_injection_is_armed(point));
 }
 
+static const char *publication_points[] = {
+	"cluster-tx-canonical-copy",
+	"cluster-tx-commit-tt-before", "cluster-tx-commit-tt-after",
+	"cluster-tx-commit-clog-before", "cluster-tx-commit-clog-after",
+	"cluster-tx-abort-tt-before", "cluster-tx-abort-tt-after",
+	"cluster-tx-abort-clog-before", "cluster-tx-abort-clog-after"
+};
+
+UT_TEST(test_publication_pause_points_are_registered)
+{
+	for (unsigned i = 0; i < lengthof(publication_points); i++) {
+		bool found = false;
+		for (int j = 0; j < cluster_injection_get_count(); j++) {
+			const char *name;
+			ClusterInjectFaultType type;
+			uint64 hits;
+			UT_ASSERT(cluster_injection_get_state_at(j, &name, &type, &hits));
+			found |= strcmp(name, publication_points[i]) == 0;
+		}
+		UT_ASSERT(found);
+	}
+}
+
+UT_TEST(test_publication_pause_is_sleep_only_and_one_shot)
+{
+	for (unsigned i = 0; i < lengthof(publication_points); i++) {
+		char arm[128];
+		uint64 hits_before = 0, hits_after = 0;
+		instr_time start, elapsed;
+
+		snprintf(arm, sizeof(arm), "%s:sleep:1000", publication_points[i]);
+		cluster_injection_assign_hook(arm, NULL);
+		for (int j = 0; j < cluster_injection_get_count(); j++) {
+			const char *name;
+			ClusterInjectFaultType type;
+			uint64 hits;
+			UT_ASSERT(cluster_injection_get_state_at(j, &name, &type, &hits));
+			if (strcmp(name, publication_points[i]) == 0)
+				hits_before = hits;
+		}
+		sleep_calls = 0;
+		last_sleep_us = -1;
+		wait_event_storage = WAIT_EVENT_WAL_WRITE;
+		INSTR_TIME_SET_CURRENT(start);
+		CLUSTER_INJECTION_PAUSE(publication_points[i]);
+		INSTR_TIME_SET_CURRENT(elapsed);
+		INSTR_TIME_SUBTRACT(elapsed, start);
+		UT_ASSERT(INSTR_TIME_GET_MICROSEC(elapsed) >= 1000);
+		UT_ASSERT(sleep_calls > 0);
+		UT_ASSERT(last_sleep_us > 0 && last_sleep_us <= 1000);
+		UT_ASSERT(!cluster_injection_is_armed(publication_points[i]));
+		UT_ASSERT_EQ(wait_event_storage, WAIT_EVENT_WAL_WRITE);
+		for (int j = 0; j < cluster_injection_get_count(); j++) {
+			const char *name;
+			ClusterInjectFaultType type;
+			uint64 hits;
+			UT_ASSERT(cluster_injection_get_state_at(j, &name, &type, &hits));
+			if (strcmp(name, publication_points[i]) == 0)
+				hits_after = hits;
+		}
+		UT_ASSERT_EQ(hits_after, hits_before + 1);
+		sleep_calls = 0;
+		CLUSTER_INJECTION_PAUSE(publication_points[i]);
+		UT_ASSERT_EQ(sleep_calls, 0);
+	}
+	wait_event_storage = 0;
+}
+
+UT_TEST(test_publication_pause_never_dispatches_other_faults)
+{
+	const char *types[] = { "none", "error", "warning", "crash", "skip", "skipn:1",
+		"sleep:0", "sleep:60000001" };
+	for (unsigned i = 0; i < lengthof(types); i++) {
+		char arm[128];
+		snprintf(arm, sizeof(arm), "cluster-tx-commit-tt-before:%s", types[i]);
+		cluster_injection_assign_hook(arm, NULL);
+		last_elevel = -1;
+		sleep_calls = 0;
+		CritSectionCount = 1;
+		CLUSTER_INJECTION_PAUSE("cluster-tx-commit-tt-before");
+		CritSectionCount = 0;
+		UT_ASSERT_EQ(last_elevel, -1);
+		UT_ASSERT_EQ(sleep_calls, 0);
+		UT_ASSERT(!cluster_injection_should_skip("cluster-tx-commit-tt-before"));
+	}
+	cluster_injection_assign_hook("", NULL);
+}
+
+UT_TEST(test_publication_pause_defers_critical_section_interrupts)
+{
+	cluster_injection_assign_hook("cluster-tx-commit-tt-after:sleep:1000", NULL);
+	CritSectionCount = 1;
+	InterruptPending = true;
+	interrupt_calls = 0;
+	CLUSTER_INJECTION_PAUSE("cluster-tx-commit-tt-after");
+	UT_ASSERT_EQ(interrupt_calls, 0);
+	UT_ASSERT(InterruptPending);
+	UT_ASSERT(!cluster_injection_is_armed("cluster-tx-commit-tt-after"));
+	CritSectionCount = 0;
+	InterruptPending = false;
+	cluster_injection_assign_hook("", NULL);
+}
+
+UT_TEST(test_publication_pause_cancel_restores_event_and_consumes_arm)
+{
+	volatile bool caught = false;
+	cluster_injection_assign_hook("cluster-tx-canonical-copy:sleep:100000", NULL);
+	wait_event_storage = WAIT_EVENT_WAL_WRITE;
+	InterruptPending = true;
+	cancel_pause = true;
+	PG_TRY();
+	{
+		CLUSTER_INJECTION_PAUSE("cluster-tx-canonical-copy");
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	cancel_pause = false;
+	InterruptPending = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(wait_event_storage, WAIT_EVENT_WAL_WRITE);
+	UT_ASSERT(!cluster_injection_is_armed("cluster-tx-canonical-copy"));
+	wait_event_storage = 0;
+	cluster_injection_assign_hook("", NULL);
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(18);
 	UT_RUN(test_inject_count_compile_constant);
 	UT_RUN(test_inject_arm_unknown_is_safe);
 	UT_RUN(test_inject_initial_disarmed);
@@ -437,6 +588,11 @@ main(void)
 	UT_RUN(test_inject_run_disarmed_repeat_no_dispatch);
 	UT_RUN(test_inject_armed_count_clamps_at_zero);
 	UT_RUN(test_first_publication_deny_registry_dispatches_only_its_skip);
+	UT_RUN(test_publication_pause_points_are_registered);
+	UT_RUN(test_publication_pause_is_sleep_only_and_one_shot);
+	UT_RUN(test_publication_pause_never_dispatches_other_faults);
+	UT_RUN(test_publication_pause_defers_critical_section_interrupts);
+	UT_RUN(test_publication_pause_cancel_restores_event_and_consumes_arm);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

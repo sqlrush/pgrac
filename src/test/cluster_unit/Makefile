@@ -93,7 +93,7 @@ TESTS = test_cluster_relmap_lock test_cluster_vm_read_visibility test_cluster_he
         test_cluster_undo_format \
         test_cluster_recovery_c0_plan test_cluster_checkpoint_stamp test_cluster_recovery_stamp test_cluster_recovery_tt_record test_cluster_recovery_ctrc_record test_cluster_d0_native_reader test_cluster_recovery_tt_io \
 		test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_undo_block0 test_cluster_undo_block0_current test_cluster_undo_smgr_publication test_cluster_terminal_ref_census test_cluster_cr test_cluster_cr_cache test_cluster_cr_shared_route test_cluster_cr_key test_cluster_cr_pool test_cluster_cr_lifecycle test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_resolver_cache test_cluster_cr_coordinator test_cluster_r4_static_model test_cluster_r4_tx_locator test_cluster_r4_tx_outcome test_cluster_r4_tx_enqueue test_cluster_r4_wire_codec test_cluster_r4_route_policy test_cluster_r4_slot_machine test_cluster_r4_lms_controls test_cluster_r4_slot_reservation test_cluster_r4_observe test_cluster_r4_cr_walk test_cluster_r4_multi_subx_2pc test_cluster_r4_activation_record test_cluster_r4_activation_fsm test_cluster_r4_lock_order test_cluster_r4_scratch_resolver test_cluster_tt_durable test_cluster_terminal_authority test_cluster_sf_dep \
-        test_cluster_r4_itl_capacity \
+        test_cluster_r4_itl_capacity test_cluster_heap_itl_retry test_cluster_m2_sample_diagnostic \
         test_cluster_retention test_cluster_undo_cleaner test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc \
         test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_undo_extent test_cluster_undo_extent_claim \
         test_cluster_wal_thread test_cluster_wal_checkpoint_sample test_cluster_wal_retained_cut test_cluster_wal_retained_cut_records test_cluster_wal_restart_read test_cluster_wal_writer test_cluster_wal_cut test_cluster_pi_data test_cluster_thread_tail test_cluster_wal_state test_cluster_wal_state_rmw test_cluster_recovery_plan \
@@ -216,7 +216,7 @@ TESTS += test_cluster_tt_abort_owner test_cluster_tt_active_owner
 TESTS += test_cluster_abort_writer test_cluster_storage_abort_writeback
 TESTS += test_cluster_undo_header_durability
 TESTS += test_cluster_tt_checkpoint_cuts
-TESTS += test_cluster_tt_checkpoint_native
+TESTS += test_cluster_tt_checkpoint_native test_cluster_tx_publication_pause
 TESTS += test_cluster_recovery_plan_source
 TESTS += test_cluster_recovery_plan_merge
 TESTS += test_cluster_tt_checkpoint_publish
@@ -417,7 +417,8 @@ test_cluster_backup: test_cluster_backup.c unit_test.h $(CLUSTER_VERSION_O) \
 # objects (the test files stub the PG backend symbols those
 # objects reference).
 SIMPLE_TESTS = $(filter-out test_cluster_ctrc_native_fpi test_cluster_merge_claim test_cluster_native_itl_trace test_cluster_shared_fs_recovery_root test_cluster_d0_native_reader test_cluster_tt_checkpoint_native test_cluster_cold_tt_redo test_cluster_cold_tt_base test_cluster_tt_checkpoint_cuts test_cluster_recovery_c0_plan test_cluster_checkpoint_stamp test_cluster_recovery_stamp test_cluster_recovery_tt_record test_cluster_recovery_ctrc_record test_cluster_recovery_tt_io test_cluster_grd_capacity test_cluster_grd_dsa test_cluster_cr_shared_route test_cluster_tt_rollback_entry test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_shared_fs_cold_drop test_cluster_formation_restart test_cluster_cold_recovery_validate test_cluster_cold_recovery_io test_cluster_cold_recovery_complete test_cluster_recovery_merge_seal test_cluster_recovery_merge_complete test_cluster_typed_redo test_cluster_cold_recovery_space test_cluster_cold_recovery_space_refail test_cluster_cold_recovery_refail test_cluster_cold_recovery_replay test_cluster_cold_recovery_plan test_cluster_cold_recovery_decode test_cluster_cold_recovery_effects test_cluster_cold_recovery_startup test_cluster_update_trace test_cluster_ic_tier1_partial test_cluster_lms_outbound test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_shared_fs_sharedfs test_cluster_shared_fs_block_device test_cluster_smgr test_cluster_startup_phase test_cluster_authority_storage test_cluster_serving_sample test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision test_cluster_scn test_cluster_scn_frontier test_cluster_adg test_cluster_epoch test_cluster_epoch_ballot_codec test_cluster_fence test_cluster_reconfig test_cluster_ges test_cluster_grd_outbound test_cluster_grd test_cluster_grd_starvation test_cluster_lmd test_cluster_lmd_graph test_cluster_lmd_groups test_cluster_lmd_wait_state test_cluster_cancel_token test_cluster_lmd_probe_collector test_cluster_lock_acquire test_cluster_advisory test_cluster_terminal_authority test_cluster_retention test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay test_cluster_thread_driver test_cluster_thread_orchestrator test_cluster_write_fence test_cluster_write_fence_durable test_cluster_write_fence_cache test_cluster_stage4_acceptance test_cluster_stage5_integrated_acceptance test_cluster_stage5_beta_acceptance test_cluster_ges_mode test_cluster_sequence test_cluster_shared_catalog test_cluster_hw test_cluster_dl test_cluster_extend_gate test_cluster_recovery_serial test_cluster_ts test_cluster_ko test_cluster_hw_snapshot test_cluster_cf_authority test_cluster_control_root test_cluster_recovery_duty test_cluster_formation_witness test_cluster_cf_storage test_cluster_cf_enqueue test_cluster_cf_phase2 test_cluster_cf_stats test_cluster_hang test_cluster_hang_resolve test_cluster_cr_server_policy test_cluster_touched_peers test_cluster_clean_leave test_cluster_membership test_cluster_node_remove test_cluster_resolver_cache test_cluster_backup test_cluster_hang_acceptance test_cluster_gcs_reqid test_cluster_runtime_visibility test_cluster_xid_stripe test_cluster_mxid_stripe test_cluster_share_barrier test_cluster_heap_barrier test_cluster_bufmgr_pcm_hook test_cluster_cr test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_cache test_cluster_cr_coordinator test_cluster_cr_key test_cluster_cr_lifecycle test_cluster_cr_pool test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_gcs_block test_cluster_gcs_block_2way test_cluster_gcs_block_3way test_cluster_gcs_block_lost_write test_cluster_gcs_block_retransmit test_cluster_gcs_block_dedup_reclaim test_cluster_gcs_block_dedup_htab test_cluster_gcs_dispatch test_cluster_ges_handoff test_cluster_heap_lock_tuple test_cluster_hw_lease test_cluster_ic_envelope test_cluster_ic_router test_cluster_itl_cleanout test_cluster_itl_cleanout_perf test_cluster_itl_reader_real_triple test_cluster_itl_touch test_cluster_active_itl_transfer test_cluster_itl_wal test_cluster_multixact test_cluster_multixact_current test_cluster_multixact_served test_cluster_pcm_lock test_cluster_pcm_own test_cluster_pcm_direct_init test_cluster_perf_gates test_cluster_recovery_merge test_cluster_recovery_plan test_cluster_recovery_worker test_cluster_reverse_key test_cluster_sinval test_cluster_sinval_ack test_cluster_snapshot_source test_cluster_stage2_acceptance test_cluster_stage5_5_cr_acceptance test_cluster_subtrans test_cluster_tt_durable test_cluster_tt_slot_allocator test_cluster_tt_status test_cluster_tt_status_hint test_cluster_uba test_cluster_undo_format test_cluster_undo_lifecycle test_cluster_undo_record test_cluster_undo_block0 test_cluster_undo_smgr_publication test_cluster_visibility_decide_scn test_cluster_visibility_fork test_cluster_visibility_inject test_cluster_wal_state test_cluster_wal_thread test_cluster_xnode_lever test_cluster_xnode_profile test_cluster_pi_shadow test_cluster_oid_lease test_cluster_xid_authority test_cluster_recovery_anchor test_cluster_relmap_authority test_cluster_lms_shard test_cluster_gcs_block_dedup test_cluster_gcs_block_shard test_cluster_undo_resid test_cluster_undo_authority test_cluster_undo_gcs test_cluster_undo_verdict test_cluster_vis_undo_verdict_map test_cluster_undo_horizon test_cluster_r4_static_model test_cluster_r4_tx_locator test_cluster_r4_tx_outcome test_cluster_r4_cr_walk test_cluster_r4_activation_record test_cluster_r4_activation_fsm test_cluster_r4_lock_order test_cluster_relation_size test_cluster_catalog_trace test_cluster_wait_resources test_cluster_content_trace test_cluster_content_trace_exec test_cluster_pcm_service_trace test_cluster_tx_identity_trace test_cluster_pcm_wait_exit,$(TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_tt_terminal_trace,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_tx_publication_pause test_cluster_tt_terminal_trace,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_heap_itl_retry,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_tt_rollover_preflight,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_current_mx_publication_cassert test_cluster_current_mx_publication_nocassert test_cluster_heap_cr_reuse test_cluster_snapshot_admission test_cluster_undo_header_durability test_cluster_tt_2pc_finish test_cluster_control_transport test_cluster_cr_native_origin test_cluster_cr_mvcc_origin test_cluster_tt_abort_owner test_cluster_tt_active_owner test_cluster_pcm_aux_consumer test_cluster_pcm_aux_reobserve test_cluster_multixact_current_stats test_cluster_vacuum_native_window test_cluster_subtrans_watermark \
 		test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
@@ -5615,7 +5616,7 @@ test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-$(filter-out test_cluster_cold_tx_start test_cluster_postmaster_lwlock test_cluster_phase_publication test_cluster_checkpoint_cleanup test_cluster_checkpoint_wait_budget test_cluster_checkpoint_error test_cluster_sync_error test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse test_cluster_abort_writer test_cluster_storage_abort_writeback test_cluster_heap_hot_full_trace test_cluster_gcs_read_image_hops test_cluster_gcs_read_image_trace,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
+$(filter-out test_cluster_m2_sample_diagnostic test_cluster_cold_tx_start test_cluster_postmaster_lwlock test_cluster_phase_publication test_cluster_checkpoint_cleanup test_cluster_checkpoint_wait_budget test_cluster_checkpoint_error test_cluster_sync_error test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse test_cluster_abort_writer test_cluster_storage_abort_writeback test_cluster_heap_hot_full_trace test_cluster_gcs_read_image_hops test_cluster_gcs_read_image_trace,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
 
 # Native CR metadata checks are inline in the shared descriptor definition.
@@ -6348,6 +6349,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_xid_retention_xact_functions.inc test_cluster_xid_retention_xact_functions.inc.tmp
 	rm -f test_cluster_data_sync_policy.inc test_cluster_sync_providers.inc \
 		test_cluster_sync_dispatch.inc test_cluster_sync_smgr.inc
+	rm -f test_cluster_tx_publication_abort.inc test_cluster_tx_publication_abort.inc.tmp
 	rm -f test_cluster_tt_rollback_entry.inc
 	rm -f test_cluster_tt_resolve_entry.inc
 	rm -f test_cluster_tt_terminal_route.inc test_cluster_tt_terminal_route.inc.tmp
@@ -7713,7 +7715,24 @@ test_cluster_r4_static_model: test_cluster_r4_static_model.c unit_test.h
 # resolver entry points.  This links the production object directly.
 CLUSTER_TX_RESOLVE_O = $(top_builddir)/src/backend/cluster/cluster_tx_resolve.o
 CLUSTER_R4_TX_LOCATOR_UBA_O = $(top_builddir)/src/backend/cluster/cluster_uba.o
+test_cluster_m2_sample_diagnostic.inc: $(top_srcdir)/src/test/modules/test_pgrac_shared_config/test_pgrac_m2_sample.c Makefile
+	awk '/^\/\* Begin physical probe\. \*\// { emit=1; found++ } \
+	     /^\/\* End physical probe\. \*\// { emit=0 } emit { print } \
+	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_m2_sample_diagnostic: test_cluster_m2_sample_diagnostic.c \
+		test_cluster_m2_sample_diagnostic.inc unit_test.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+
+test_cluster_m2_sample_origin.inc: $(top_srcdir)/src/test/modules/test_pgrac_shared_config/test_pgrac_m2_sample.c Makefile
+	awk '/^(sample_origin|sample_origin_values)\(/ { print "static ClusterTxOutcome"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (found != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_r4_tx_locator: test_cluster_r4_tx_locator.c unit_test.h \
+		test_cluster_m2_sample_origin.inc \
 		$(CLUSTER_TX_RESOLVE_O) $(CLUSTER_R4_TX_LOCATOR_UBA_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_TX_RESOLVE_O) $(CLUSTER_R4_TX_LOCATOR_UBA_O) \
@@ -7760,7 +7779,7 @@ test_cluster_undo_pending_product.o: test_cluster_undo_pending_product.c \
 		$(top_srcdir)/src/include/cluster/cluster_undo_record_api.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c unit_test.h \
+test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c test_cluster_r4_canonical_sampling.h unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_tx_resolve.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
 		test_cluster_current_mx_local_sample.inc \
@@ -9423,6 +9442,18 @@ test_cluster_tt_checkpoint_redo.inc: $(top_srcdir)/src/backend/cluster/storage/c
 
 test_cluster_tt_checkpoint_native: test_cluster_tt_checkpoint_native.inc test_cluster_space_commit_emit.inc test_cluster_side_xact_xactdesc.o
 
+# Scheduling-only publication seams execute both original transaction functions.
+test_cluster_tx_publication_abort.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
+	awk '/^RecordTransactionAbort\(/ { print "static TransactionId"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_tx_publication_pause: test_cluster_tx_publication_pause.c unit_test.h \
+		test_cluster_tx_publication_abort.inc test_cluster_tt_checkpoint_native.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+
+
 test_cluster_tt_checkpoint_select.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^#define INSERT_FREESPACE\(/ { macro=1; macros++ } \
 	     macro { print; if ($$0 !~ /\\$$/) macro=0 } \
@@ -9935,11 +9966,13 @@ test_cluster_r4_itl_capacity: test_cluster_r4_itl_capacity.c test_cluster_r4_loc
 		unit_test.h cluster_r4_activation_test_stubs.h \
 		$(CLUSTER_SEMANTIC_ACTIVATION_C) $(CLUSTER_SEMANTIC_ACTIVATION_H) \
 		$(CLUSTER_R4_MULTI_RESOLVE_TEST_O) $(CLUSTER_R4_HOT_HEAPAM_TEST_O) \
+		test_cluster_ctrc_itl_roles_product.o \
 		$(CLUSTER_HOT_BUFPAGE_TEST_O) $(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_CR_APPLY_O) \
 		$(CLUSTER_VIS_VERDICT_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_R4_MULTI_RESOLVE_TEST_O) $(CLUSTER_R4_HOT_HEAPAM_TEST_O) \
+		test_cluster_ctrc_itl_roles_product.o \
 		$(CLUSTER_HOT_BUFPAGE_TEST_O) $(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_CR_APPLY_O) \
 		$(CLUSTER_VIS_VERDICT_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
@@ -10042,6 +10075,42 @@ test_cluster_undo_record: test_cluster_undo_record.c unit_test.h \
 		-DTT_SLOT_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/cluster_tt_slot.h"' \
 		$< test_cluster_undo_ctrc_product.o $(CLUSTER_UBA_O) \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_ALLOC_TEST_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+
+# Execute the unchanged UPDATE retry consumer and exact receipt owner.
+test_cluster_heap_itl_retry_helpers.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^#define cluster_heap_prepare_undo_record_call cluster_undo_record_prepare$$/ { print; alias++ } \
+	     /^cluster_heap_prepare_undo_record_exact\(/ { print "static bool"; emit=1; found++ } \
+	     /^cluster_heap_retry_undo_record_exact\(/ { print "static bool"; emit=1; found++ } \
+	     /^cluster_heap_restart_update_undo_record_exact\(/ { print "static bool"; emit=1; found++ } \
+	     /^cluster_heap_undo_receipt_errdetail\(/ { print "static int"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (alias != 1 || found != 4 || done != 4) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_itl_retry_consumer.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_update\(/ { in_update=1 } \
+	     in_update && /^l_pgrac_itl_capacity_wait:/ { emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     /^}/ { in_update=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_itl_retry: test_cluster_heap_itl_retry.c test_cluster_undo_record.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_record.c \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_retention.c \
+		test_cluster_heap_itl_retry_helpers.inc test_cluster_heap_itl_retry_consumer.inc \
+		test_cluster_heap_receipt_product.o $(CLUSTER_HOT_BUFPAGE_TEST_O) \
+		test_cluster_undo_ctrc_product.o $(CLUSTER_VERSION_O) $(CLUSTER_UNDO_ALLOC_TEST_O) $(CLUSTER_UBA_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		-DUNDO_RECORD_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_undo_record.c"' \
+		-DUNDO_ALLOC_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/storage/cluster_undo_alloc.c"' \
+		-DHEAPAM_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/access/heap/heapam.c"' \
+		-DUNDO_XLOG_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/storage/cluster_undo_xlog.h"' \
+		-DUNDO_XLOG_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/storage/cluster_undo_xlog.c"' \
+		-DTT_SLOT_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/cluster_tt_slot.h"' \
+		$< test_cluster_heap_receipt_product.o $(CLUSTER_HOT_BUFPAGE_TEST_O) $(CLUSTER_UBA_O) \
+		test_cluster_undo_ctrc_product.o $(CLUSTER_VERSION_O) $(CLUSTER_UNDO_ALLOC_TEST_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
 

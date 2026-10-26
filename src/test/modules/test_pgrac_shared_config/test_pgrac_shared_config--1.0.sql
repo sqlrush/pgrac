@@ -121,3 +121,11 @@ CREATE FUNCTION test_pgrac_native_itl_page(regclass, integer)
 RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_native_itl_page'
 LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
 REVOKE ALL ON FUNCTION test_pgrac_native_itl_page(regclass, integer) FROM PUBLIC;
+CREATE FUNCTION test_pgrac_m2_sample(text, regclass, integer, xid)
+RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_m2_sample'
+LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+REVOKE ALL ON FUNCTION test_pgrac_m2_sample(text, regclass, integer, xid) FROM PUBLIC;
+CREATE FUNCTION test_pgrac_m2_guards_clear()
+RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_m2_guards_clear'
+LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+REVOKE ALL ON FUNCTION test_pgrac_m2_guards_clear() FROM PUBLIC;
