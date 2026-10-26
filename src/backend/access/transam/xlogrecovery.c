@@ -712,6 +712,8 @@ struct ClusterRecoveryStartV1 {
 	bool revoked;
 	bool relmap_declared;
 	bool ctrc_observation_started, ctrc_observation_complete;
+	bool ctrc_page_plan_started;
+	RfPageOnlinePlanV1 *ctrc_page_plan;
 	const ClusterColdCtrcWorkV1 *ctrc_observation_work;
 	ClusterColdCtrcWorkV1 *ctrc_observation_work_copy;
 	Size ctrc_observation_work_bytes;
@@ -736,6 +738,7 @@ static void
 cluster_recovery_cold_observation_close(struct ClusterRecoveryStartV1 *start)
 {
 	start->ctrc_observation_complete = false;
+	rf_page_online_plan_destroy_v1(&start->ctrc_page_plan);
 	start->ctrc_pages = NULL;
 	start->ctrc_page_wal_count = 0;
 	start->ctrc_wal_source_count = 0;
@@ -1334,6 +1337,98 @@ ClusterColdRecoveryCtrcReplaysAcquire(const struct ClusterRecoveryStartV1 *start
 		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 			100L, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
 	}
+}
+
+static bool
+cluster_recovery_cold_page_plan_current(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, struct ClusterWalInputsV1 *scope)
+{
+	return cluster_recovery_cold_ctrc_replays_current(start, work, scope)
+		&& cluster_wal_inputs_ctrc_replays_authorized_v1(scope)
+		&& cluster_recovery_cold_ctrc_replays_current(start, work, scope);
+}
+
+static void
+cluster_recovery_cold_page_plan_refuse(struct ClusterRecoveryStartV1 *start,
+	RfPageProofDetailV1 detail)
+{
+	if (start != cluster_recovery_cold_start)
+		return;
+	cluster_recovery_cold_observation_refuse(start, "page_plan", (int)detail);
+	start->revoked = true;
+	cluster_recovery_checkpoint_revoke_v1(start);
+	/* Original ResourceOwner still owns the graph/census/IR/WALR debt. */
+}
+
+bool
+ClusterColdRecoveryCtrcPagePlanPrepare(const struct ClusterRecoveryStartV1 *start,
+	Size memory_budget)
+{
+	struct ClusterRecoveryStartV1 *state;
+	const ClusterColdCtrcWorkV1 *work;
+	struct ClusterWalInputsV1 *scope;
+	RfPageOnlinePlanV1 *volatile candidate = NULL;
+	bool ready = false;
+
+	if (start == NULL)
+		return true;
+	if (!cluster_recovery_cold_ctrc_replays_actor() || start != cluster_recovery_cold_start
+		|| !start->ctrc_observation_complete
+		|| (start->ctrc_page_plan_started && start->ctrc_page_plan == NULL)
+		|| (!start->ctrc_page_plan_started && memory_budget == 0))
+		return false;
+	state = cluster_recovery_cold_start;
+	work = state->ctrc_observation_work;
+	scope = ClusterColdRecoveryCtrcScope(start, work);
+	if (!cluster_recovery_cold_page_plan_current(start, work, scope)
+		|| !ClusterColdRecoveryCtrcObserve(start, 0)
+		|| !cluster_recovery_cold_page_plan_current(start, work, scope))
+		return false;
+	if (state->ctrc_page_plan_started)
+		return state->ctrc_page_plan != NULL;
+	state->ctrc_page_plan_started = true;
+	PG_TRY();
+	{
+		ClusterRecoveryPagePlanBuildV1 built = cluster_recovery_census_page_plan_v1(
+			state->ctrc_observation_census, Min(memory_budget, (Size)RF_PAGE_ONLINE_PLAN_MAX_BYTES));
+		candidate = built.plan;
+		/* Re-locate original owners after any callback before borrowing scope,
+		 * work or graph. The factory never supplies native mutation authority. */
+		if (built.detail == RF_PAGE_PROOF_DETAIL_OK && candidate != NULL
+			&& cluster_recovery_cold_page_plan_current(start, work, scope)
+			&& ClusterColdRecoveryCtrcObserve(start, 0)
+			&& cluster_recovery_cold_page_plan_current(start, work, scope)) {
+			state->ctrc_page_plan = candidate;
+			candidate = NULL;
+			ready = true;
+		} else
+			cluster_recovery_cold_page_plan_refuse(state,
+				built.detail == RF_PAGE_PROOF_DETAIL_OK ? RF_PAGE_PROOF_DETAIL_ROOT_STALE : built.detail);
+	}
+	PG_CATCH();
+	{
+		RfPageOnlinePlanV1 *discard = candidate;
+		candidate = NULL;
+		rf_page_online_plan_destroy_v1(&discard);
+		cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_INTERNAL);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (candidate != NULL) {
+		RfPageOnlinePlanV1 *discard = candidate;
+		rf_page_online_plan_destroy_v1(&discard);
+	}
+	return ready;
+}
+
+const RfPageOnlinePlanV1 *
+ClusterColdRecoveryCtrcPagePlan(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work)
+{
+	if (start == NULL || start != cluster_recovery_cold_start
+		|| work != start->ctrc_observation_work)
+		return NULL;
+	return ClusterColdRecoveryCtrcPagePlanPrepare(start, 0) ? start->ctrc_page_plan : NULL;
 }
 
 const char *

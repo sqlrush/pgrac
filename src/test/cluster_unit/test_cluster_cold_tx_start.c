@@ -135,6 +135,7 @@ static ClusterRecoveryUndoEntry observation_physical[4];
 static unsigned observation_physical_count, observation_fail_allocation;
 static bool observation_release_error, observation_early_read;
 static void observation_fixture_reset(void);
+static void page_graph_fixture_reset(void);
 static void observation_scope_release(void);
 static bool observation_work_allocation(Size size, int flags);
 int cluster_cold_recovery_plan_memory = 65536;
@@ -692,6 +693,7 @@ static void reset(void)
 	observed_writer.epoch = clusterStartupWriter.formation_epoch;
 	observed_writer.startup_first_lsn = clusterStartupWriter.first_segment_lsn;
 	observation_fixture_reset();
+	page_graph_fixture_reset();
 }
 static void retain(void)
 {
@@ -2314,8 +2316,24 @@ UT_TEST(test_relmap_failure_revokes_original_episode_without_free_or_release)
 	}
 }
 
+#include "test_cluster_cold_ctrc_page_plan.inc"
+
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_PAGE_PLAN") != NULL) {
+		UT_PLAN(5);
+	UT_RUN(test_actual_startup_prepares_original_page_graph_before_service);
+	UT_RUN(test_startup_page_graph_is_original_bounded_and_never_rebuilt);
+	UT_RUN(test_startup_page_graph_preconditions_leave_original_custody);
+	UT_RUN(test_startup_page_graph_late_refusal_discards_only_private_plan);
+	UT_RUN(test_startup_page_graph_error_revokes_episode_and_preserves_cleanup);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_PAGE_GRAPH_PARENT") != NULL) {
+		UT_PLAN(1);
+		UT_RUN(test_actual_startup_prepares_original_page_graph_before_service);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_CTRC_WAL_SOURCES") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_ctrc_wal_sources_bind_complete_original_start_and_do_not_complete_service);
@@ -2348,7 +2366,12 @@ int main(void)
 		UT_RUN(test_ctrc_pages_native_error_retires_cursor_before_original_scope);
 		reset(); UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(144);
+	UT_PLAN(149);
+	UT_RUN(test_actual_startup_prepares_original_page_graph_before_service);
+	UT_RUN(test_startup_page_graph_is_original_bounded_and_never_rebuilt);
+	UT_RUN(test_startup_page_graph_preconditions_leave_original_custody);
+	UT_RUN(test_startup_page_graph_late_refusal_discards_only_private_plan);
+	UT_RUN(test_startup_page_graph_error_revokes_episode_and_preserves_cleanup);
 	UT_RUN(test_ctrc_wal_sources_bind_complete_original_start_and_do_not_complete_service);
 	UT_RUN(test_ctrc_wal_sources_missing_count_drift_and_error_revoke_original_observation);
 	UT_RUN(test_ctrc_wal_sources_require_exact_start_work_owner_root_and_accepted_tx);

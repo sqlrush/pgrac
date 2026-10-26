@@ -10389,3 +10389,7 @@ test_cluster_recovery_ctrc_record: test_cluster_recovery_ctrc_record.c unit_test
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+# Original Startup PAGE graph preparation and complete census wrapper.
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_page_plan.inc
+test_cluster_recovery_native_inputs: test_cluster_recovery_census_page_plan.inc

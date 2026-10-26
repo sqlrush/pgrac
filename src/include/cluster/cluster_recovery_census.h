@@ -19,6 +19,13 @@
 
 #ifdef USE_PGRAC_CLUSTER
 typedef struct ClusterRecoveryCensus ClusterRecoveryCensus;
+/* Complete original DONE/manifest around the existing full physical WAL
+ * graph factory. Caller owns the returned immutable graph and its bounded
+ * additional allocation; zero budget refuses. Preflight LWLocks/prefix refuse
+ * without entering. Entered failure/ERROR invalidates the census, retaining
+ * original input custody. Call before PAGE/content locks; no apply rights. */
+extern ClusterRecoveryPagePlanBuildV1 cluster_recovery_census_page_plan_v1(
+	ClusterRecoveryCensus *census, Size memory_budget);
 
 /* All original full-cut/tail/transcript observations, including zero-PAGE
  * and explicit-empty sources. Revalidate the original complete manifest;
