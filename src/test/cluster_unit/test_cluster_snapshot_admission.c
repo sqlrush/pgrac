@@ -60,6 +60,8 @@ static bool vm_caught, vm_result;
 static int vm_drift, vm_error;
 static unsigned vm_begins, vm_ends, vm_admissions;
 static Snapshot vm_expected;
+static uint64 vm_member_cut = 2, vm_cap_cut = 10;
+static int vm_admission_change;
 int NBuffers = 2, NLocBuffer;
 /* Joint native snapshot/VM chain: the transport and storage remain scheduled. */
 static bool vm_chain_enabled, vm_chain_pcm, vm_chain_grant, vm_chain_released;
@@ -191,6 +193,26 @@ cluster_epoch_get_current(void)
 {
 	return 7;
 }
+uint64
+cluster_membership_cut_generation(void)
+{
+	return vm_member_cut;
+}
+bool
+cluster_membership_cut_generation_current(uint64 expected)
+{
+	return expected != 0 && expected == vm_member_cut;
+}
+uint64
+cluster_sf_peer_capability_cut_generation(void)
+{
+	return vm_cap_cut;
+}
+bool
+cluster_sf_peer_capability_cut_generation_current(uint64 expected)
+{
+	return expected != 0 && expected == vm_cap_cut;
+}
 const ClusterNodeInfo *
 cluster_conf_lookup_node(int node)
 {
@@ -203,6 +225,10 @@ cluster_sf_peer_supports_undo_horizon(int node)
 	if (vm_fixture) {
 		UT_ASSERT(!vm_locked);
 		vm_admissions++;
+		if (vm_admission_change == 1)
+			vm_cap_cut++;
+		else if (vm_admission_change == 2)
+			vm_member_cut += 2;
 	}
 	return peer_capable;
 }
@@ -1200,6 +1226,10 @@ vm_setup(Snapshot snapshot)
 	self_member = CLUSTER_MEMBER_MEMBER;
 	pg_atomic_write_u64(&horizon.self_admitted_epoch, 8);
 	CurrentResourceOwner = (ResourceOwner)1;
+	cluster_node_id = 1;
+	vm_member_cut = 2;
+	vm_cap_cut = 10;
+	vm_admission_change = 0;
 }
 
 static void
@@ -1472,7 +1502,10 @@ vm_chain_acquire(Buffer buffer)
 	else if (vm_chain_drift == 3) {
 		UnregisterSnapshot(vm_expected);
 		vm_chain_released = true;
-	}
+	} else if (vm_chain_drift == 4) vm_cap_cut++;
+	else if (vm_chain_drift == 5) vm_member_cut += 2;
+	else if (vm_chain_drift == 6) pg_atomic_write_u64(&horizon.self_admitted_epoch, 9);
+	else if (vm_chain_drift == 7) cluster_node_id = 2;
 	return true;
 }
 
@@ -1817,6 +1850,62 @@ UT_TEST(vm_chain_discards_native_snapshot_drift_and_restores_outer_on_io_errors)
 	}
 }
 
+
+UT_TEST(vm_admission_cut_refuses_missing_or_changed_pre_acquire_identity)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		Snapshot snapshot = registered(100);
+		RelationData rel;
+		FormData_pg_class form;
+		VisibilityMapReadScope scope = {0};
+		Buffer buffer = InvalidBuffer;
+		uint8 status = 77;
+		vm_chain_setup(&rel, &form, snapshot);
+		if (variant == 0) vm_member_cut = 0;
+		else if (variant == 1) vm_cap_cut = 0;
+		else vm_admission_change = variant - 1;
+		vm_chain_observe(&rel, 0, snapshot, &buffer, &scope, &status);
+		UT_ASSERT(!vm_result && !vm_caught && !vm_locked);
+		UT_ASSERT_EQ(status, 0);
+		UT_ASSERT_EQ(vm_chain_reads + vm_chain_grants + vm_chain_unlocks, 0);
+		UT_ASSERT_EQ(vm_admissions, 1);
+		UT_ASSERT_EQ(buffer, InvalidBuffer);
+		UT_ASSERT(ClusterSnapshotReadScope == NULL);
+		vm_chain_finish(snapshot, &scope);
+	}
+}
+
+UT_TEST(vm_admission_cut_rejects_capability_membership_self_admission_and_node_drift)
+{
+	for (int drift = 4; drift <= 7; drift++) {
+		Snapshot original = registered(90), snapshot = registered(100);
+		ClusterSnapshotReadScopeV1 outer;
+		RelationData rel;
+		FormData_pg_class form;
+		VisibilityMapReadScope scope = {0};
+		Buffer buffer = InvalidBuffer;
+		uint8 status = 77;
+		vm_chain_setup(&rel, &form, snapshot);
+		PageGetContents(vm_chain_current.data)[0] = VISIBILITYMAP_VALID_BITS;
+		vm_chain_drift = drift;
+		cluster_snapshot_read_enter_v1(&outer, original);
+		vm_chain_observe(&rel, 0, snapshot, &buffer, &scope, &status);
+		UT_ASSERT(!vm_result && !vm_caught && !vm_locked);
+		UT_ASSERT_EQ(status, 0);
+		UT_ASSERT_EQ(vm_chain_reads, 1);
+		UT_ASSERT_EQ(vm_chain_grants, 1);
+		UT_ASSERT_EQ(vm_chain_unlocks, 1);
+		UT_ASSERT_EQ(vm_admissions, 1);
+		UT_ASSERT_EQ(buffer, 1);
+		UT_ASSERT(ClusterSnapshotReadScope == &outer && evidence(90, original));
+		visibilitymap_read_end(&scope);
+		cluster_snapshot_read_exit_v1(&outer);
+		cluster_node_id = 1;
+		vm_chain_finish(snapshot, &scope);
+		UnregisterSnapshot(original);
+	}
+}
+
 int
 main(void)
 {
@@ -1837,7 +1926,7 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(99);
+	UT_PLAN(101);
 	UT_RUN(export_original_registration_publishes_h_before_file_visibility);
 	UT_RUN(export_original_registration_preserves_other_older_snapshot);
 	UT_RUN(export_errors_retain_original_h_until_transaction_cleanup);
@@ -1937,6 +2026,8 @@ main(void)
 	UT_RUN(vm_chain_validates_actual_vm_image_and_keeps_absence_read_only);
 	UT_RUN(vm_chain_respects_native_admission_and_coherent_grant_refusals);
 	UT_RUN(vm_chain_discards_native_snapshot_drift_and_restores_outer_on_io_errors);
+	UT_RUN(vm_admission_cut_refuses_missing_or_changed_pre_acquire_identity);
+	UT_RUN(vm_admission_cut_rejects_capability_membership_self_admission_and_node_drift);
 	UT_ASSERT_EQ(remembered, 0);
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	UT_ASSERT(!ActiveSnapshotSet());

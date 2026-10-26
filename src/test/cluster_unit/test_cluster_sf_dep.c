@@ -20,7 +20,19 @@
 #include "cluster/cluster_sf_dep.h"
 #include "storage/lwlock.h"
 #include "utils/timestamp.h"
+static void test_cap_note(ClusterSfPeerCap *cap, uint32 bits, uint32 generation);
+static bool test_cap_invalidate(ClusterSfPeerCap *cap, uint32 generation);
+#define cluster_sf_peer_cap_note test_cap_note
+#define cluster_sf_peer_cap_invalidate_gen test_cap_invalidate
 #include "../../backend/cluster/cluster_sf_dep.c"
+#undef cluster_sf_peer_cap_note
+#undef cluster_sf_peer_cap_invalidate_gen
+#include "test_cluster_sf_cap_cut_available.inc"
+#ifndef FIXTURE_HAS_SF_CAP_CUT
+/* An unversioned parent cannot invalidate an earlier capability sample. */
+#define cluster_sf_peer_capability_cut_generation() UINT64_C(1)
+#define cluster_sf_peer_capability_cut_generation_current(cut) ((cut) == UINT64_C(1))
+#endif
 
 #undef printf
 #undef fprintf
@@ -1114,10 +1126,118 @@ UT_TEST(test_wait_graph_capability_table_is_owned_and_never_waits)
 	UT_ASSERT_EQ(cut.canary, UINT64_C(0x123456789abcdef0));
 }
 
+
+static bool test_cut_track;
+static uint64 test_cut_before;
+
+static void
+test_cap_note(ClusterSfPeerCap *cap, uint32 bits, uint32 generation)
+{
+	if (test_cut_track) {
+		UT_ASSERT(test_sf_held_lock == &ClusterSfDep->lock);
+		UT_ASSERT(!cluster_sf_peer_capability_cut_generation_current(test_cut_before));
+	}
+	cluster_sf_peer_cap_note(cap, bits, generation);
+}
+
+static bool
+test_cap_invalidate(ClusterSfPeerCap *cap, uint32 generation)
+{
+	if (test_cut_track && cap->valid && cap->generation == generation) {
+		UT_ASSERT(test_sf_held_lock == &ClusterSfDep->lock);
+		UT_ASSERT(!cluster_sf_peer_capability_cut_generation_current(test_cut_before));
+	}
+	return cluster_sf_peer_cap_invalidate_gen(cap, generation);
+}
+
+UT_TEST(test_cap_cut_invalidates_before_note_and_same_record_renote)
+{
+	test_sf_cap_store_reset();
+	test_cut_before = cluster_sf_peer_capability_cut_generation();
+	UT_ASSERT(test_cut_before != 0);
+	test_cut_track = true;
+	cluster_sf_note_peer_hello_capabilities_gen(TEST_SF_CAP_PEER, PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1, 31);
+	UT_ASSERT(!cluster_sf_peer_capability_cut_generation_current(test_cut_before));
+	UT_ASSERT(cluster_sf_peer_supports_undo_horizon(TEST_SF_CAP_PEER));
+	test_cut_before = cluster_sf_peer_capability_cut_generation();
+	cluster_sf_note_peer_hello_capabilities_gen(TEST_SF_CAP_PEER, PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1, 31);
+	UT_ASSERT(!cluster_sf_peer_capability_cut_generation_current(test_cut_before));
+	test_cut_track = false;
+}
+
+UT_TEST(test_cap_cut_exact_and_unconditional_close_invalidate_without_stale_close_damage)
+{
+	test_sf_cap_store_reset();
+	cluster_sf_note_peer_hello_capabilities_gen(TEST_SF_CAP_PEER, PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1, 31);
+	test_cut_before = cluster_sf_peer_capability_cut_generation();
+	cluster_sf_note_peer_disconnected_gen(TEST_SF_CAP_PEER, 30);
+	UT_ASSERT(cluster_sf_peer_capability_cut_generation_current(test_cut_before));
+	UT_ASSERT(cluster_sf_peer_supports_undo_horizon(TEST_SF_CAP_PEER));
+	test_cut_track = true;
+	cluster_sf_note_peer_disconnected_gen(TEST_SF_CAP_PEER, 31);
+	UT_ASSERT(!cluster_sf_peer_capability_cut_generation_current(test_cut_before));
+	UT_ASSERT(!cluster_sf_peer_supports_undo_horizon(TEST_SF_CAP_PEER));
+	test_cut_track = false;
+	cluster_sf_note_peer_hello_capabilities_gen(TEST_SF_CAP_PEER, PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1, 32);
+	test_cut_before = cluster_sf_peer_capability_cut_generation();
+	cluster_sf_note_peer_disconnected(TEST_SF_CAP_PEER);
+	UT_ASSERT(!cluster_sf_peer_capability_cut_generation_current(test_cut_before));
+	UT_ASSERT(!cluster_sf_peer_supports_undo_horizon(TEST_SF_CAP_PEER));
+}
+
+UT_TEST(test_cap_cut_observer_never_locks_mutates_or_accepts_missing_store)
+{
+	ClusterSfDepShared *saved;
+	uint64 cut;
+	uint8 before[TEST_SF_SHMEM_BYTES];
+
+	test_sf_cap_store_reset();
+	cut = cluster_sf_peer_capability_cut_generation();
+	memcpy(before, test_sf_shmem.bytes, sizeof(before));
+	LWLockAcquire(&ClusterSfDep->lock, LW_EXCLUSIVE);
+	UT_ASSERT_EQ(cluster_sf_peer_capability_cut_generation(), cut);
+	UT_ASSERT(cluster_sf_peer_capability_cut_generation_current(cut));
+	UT_ASSERT(!cluster_sf_peer_capability_cut_generation_current(0));
+	UT_ASSERT(!cluster_sf_peer_capability_cut_generation_current(cut + 1));
+	UT_ASSERT(memcmp(before, test_sf_shmem.bytes, sizeof(before)) == 0);
+	LWLockRelease(&ClusterSfDep->lock);
+	cluster_sf_note_peer_hello_capabilities_gen(-1, 1, 1);
+	cluster_sf_note_peer_disconnected_gen(CLUSTER_MAX_NODES, 1);
+	cluster_sf_note_peer_disconnected(-1);
+	UT_ASSERT_EQ(cluster_sf_peer_capability_cut_generation(), cut);
+	saved = ClusterSfDep;
+	ClusterSfDep = NULL;
+	UT_ASSERT_EQ(cluster_sf_peer_capability_cut_generation(), 0);
+	UT_ASSERT(!cluster_sf_peer_capability_cut_generation_current(cut));
+	ClusterSfDep = saved;
+}
+
+UT_TEST(test_cap_cut_exhaustion_never_wraps_or_reopens_old_samples)
+{
+#ifdef FIXTURE_HAS_SF_CAP_CUT
+	test_sf_cap_store_reset();
+	pg_atomic_write_u64(&ClusterSfDep->capability_cut_generation, UINT64_MAX - 1);
+	cluster_sf_note_peer_hello_capabilities_gen(TEST_SF_CAP_PEER, PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1, 31);
+	UT_ASSERT_EQ(cluster_sf_peer_capability_cut_generation(), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterSfDep->capability_cut_generation), UINT64_MAX);
+	cluster_sf_note_peer_disconnected_gen(TEST_SF_CAP_PEER, 31);
+	cluster_sf_note_peer_hello_capabilities_gen(TEST_SF_CAP_PEER, PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1, 32);
+	UT_ASSERT(cluster_sf_peer_supports_undo_horizon(TEST_SF_CAP_PEER));
+	UT_ASSERT(!cluster_sf_peer_capability_cut_generation_current(UINT64_MAX - 1));
+	UT_ASSERT(!cluster_sf_peer_capability_cut_generation_current(0));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterSfDep->capability_cut_generation), UINT64_MAX);
+	pg_atomic_write_u64(&ClusterSfDep->capability_cut_generation, 0);
+	cluster_sf_note_peer_disconnected(TEST_SF_CAP_PEER);
+	UT_ASSERT_EQ(cluster_sf_peer_capability_cut_generation(), 0);
+#else
+	UT_ASSERT(false); /* The parent has no bounded invalidation generation. */
+#endif
+}
+
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(38);
 	UT_RUN(test_a89_capability_record_snapshot_distinguishes_unavailable_and_drift);
 	UT_RUN(test_sf_stop_requires_initialized_store_even_when_disabled);
 	UT_RUN(test_sf_stop_real_install_and_durable_cut_are_read_only);
@@ -1152,6 +1272,10 @@ main(void)
 	UT_RUN(test_durable_publisher_stops_new_work_only_after_final_control_seal);
 	UT_RUN(test_durable_publisher_stops_at_all_member_checkpoint_cut);
 	UT_RUN(test_wait_graph_capability_table_is_owned_and_never_waits);
+	UT_RUN(test_cap_cut_invalidates_before_note_and_same_record_renote);
+	UT_RUN(test_cap_cut_exact_and_unconditional_close_invalidate_without_stale_close_damage);
+	UT_RUN(test_cap_cut_observer_never_locks_mutates_or_accepts_missing_store);
+	UT_RUN(test_cap_cut_exhaustion_never_wraps_or_reopens_old_samples);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -107,7 +107,8 @@ extern bool visibilitymap_read_begin(Relation rel, BlockNumber heapBlk, Buffer *
 struct SnapshotData;
 /* Same entry/exit and pin rules as read_begin. Shared observation also requires
  * the original retained snapshot throughout the scope. Admission is sampled
- * before VM acquisition; a local identity recheck does not grant skip permission.
+ * before VM acquisition; local identity/invalidation checks after acquisition
+ * invoke no services and grant no publication or skip permission.
  * Failure unwinds only the new scope, preserving any scope active on entry. */
 extern bool visibilitymap_read_snapshot_begin(Relation rel, BlockNumber heapBlk,
 											  struct SnapshotData *snapshot, Buffer *vmbuf,

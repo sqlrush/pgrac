@@ -2969,6 +2969,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
 		test_cluster_vacuum_observed_bounds.inc test_cluster_vacuum_freeze_bound_observer.inc \
 		test_cluster_vacuum_admitted_phase.inc \
+		test_cluster_vacuum_proof_owner.inc \
 		test_cluster_freeze_writer_context.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) test_cluster_heap_maintenance_policy.inc unit_test.h \
 		test_cluster_heap_borrowed_pin.inc $(top_srcdir)/src/include/storage/bufmgr.h \
 		test_cluster_vacuum_freeze_locators.inc \
@@ -6391,6 +6392,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_vm_visible_body.inc test_cluster_vm_visible_log.inc
 	rm -f test_cluster_vm_visible_wrapper.inc test_cluster_vm_visible_empty.inc
 	rm -f test_cluster_vm_repair_versioned.inc
+	rm -f test_cluster_sf_cap_cut_available.inc
 	rm -f test_cluster_vm_snapshot_read.inc
 	rm -f test_cluster_vm_native_chain.inc
 	rm -f test_cluster_vm_buffer_matches.inc test_cluster_vm_repair_clear.inc test_cluster_vm_repair_missing_heap.inc test_cluster_vm_repair_lpdead.inc
@@ -7786,7 +7788,10 @@ $(CLUSTER_R4_SF_DEP_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_sf_dep.c 
 		$(top_srcdir)/src/include/cluster/cluster_sf_dep.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_sf_dep: test_cluster_sf_dep.c unit_test.h $(top_srcdir)/src/backend/cluster/cluster_sf_dep.c \
+test_cluster_sf_cap_cut_available.inc: $(top_srcdir)/src/backend/cluster/cluster_sf_dep.c Makefile
+	@awk '/^cluster_sf_peer_capability_cut_generation\(/ { print "#define FIXTURE_HAS_SF_CAP_CUT 1"; found++ } END { if (found > 1) exit 1 }' $< > $@
+
+test_cluster_sf_dep: test_cluster_sf_dep.c unit_test.h test_cluster_sf_cap_cut_available.inc $(top_srcdir)/src/backend/cluster/cluster_sf_dep.c \
 		$(top_srcdir)/src/include/cluster/cluster_sf_dep.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
@@ -11474,9 +11479,9 @@ CLUSTER_UNDO_HORIZON_O = $(top_builddir)/src/backend/cluster/cluster_undo_horizo
 test_cluster_snapshot_admission_horizon.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c Makefile
 	@awk '/^typedef struct ClusterUndoHorizonSlotShmem / { shmem=1 } \
 		shmem { print } /^static ClusterUndoHorizonShmem \*UndoHorizonShmem = NULL;$$/ { shmem=0; done++ } \
-		/^cluster_undo_horizon_read_admission_enforce\(SCN read_scn\)$$/ { emit=1; print "bool" } \
-		emit { print } emit && /^}$$/ { done++; exit } \
-		END { if (done != 2) exit 1 }' $< > $@
+		/^cluster_undo_horizon_read_admission_(enforce|capture|current)\(/ { emit=1; print "bool" } \
+		emit { print } emit && /^}$$/ { emit=0; done++ } \
+		END { if (emit || done != 4) exit 1 }' $< > $@
 
 test_cluster_snapshot_admission_refresh.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
 	@awk '/^ClusterSnapshotRefreshFields\(Snapshot snapshot\)$$/ { emit=1; print "static inline void" } \
@@ -11530,6 +11535,8 @@ test_cluster_snapshot_admission: test_cluster_snapshot_admission.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_retention.h $(CLUSTER_UNDO_RETENTION_O) \
 		$(srcdir)/test_cluster_snapshot_vacuum_fixture.inc test_cluster_snapshot_admission_vacuum.inc \
 		test_cluster_snapshot_admission_horizon.inc test_cluster_snapshot_admission_refresh.inc \
+		$(top_srcdir)/src/include/cluster/cluster_undo_horizon.h \
+		$(top_srcdir)/src/include/cluster/cluster_sf_dep.h \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe.h \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h $(CLUSTER_XID_STRIPE_O) \
 		$(top_srcdir)/src/backend/utils/time/snapmgr.c $(top_srcdir)/src/include/utils/snapmgr.h \
@@ -12573,6 +12580,18 @@ test_cluster_vacuum_admitted_phase.inc: $(top_srcdir)/src/backend/access/heap/va
 	awk '/^lazy_collect_shared_freeze_proofs_admitted\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+
+# Execute the original outer VACUUM admission owner around the admitted phase.
+test_cluster_vacuum_proof_owner.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/^lazy_collect_shared_freeze_proofs\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+.PHONY: clean-vacuum-proof-owner
+clean-vacuum-proof-owner:
+	rm -f test_cluster_vacuum_proof_owner.inc test_cluster_vacuum_proof_owner.inc.tmp
+
+clean distclean maintainer-clean: clean-vacuum-proof-owner
 
 test_cluster_vacuum_admission_snapshot.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
 	awk '/^semantic_activation_snapshot\(/ { print "static bool"; emit=1; count++ } \

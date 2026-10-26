@@ -50,6 +50,7 @@ typedef struct ClusterSfDepShared {
 	/* generation-bound per-peer HELLO capability records (spec-2.2 additive
 	 * amendment; spec-5.22e D5 prereq) */
 	ClusterSfPeerCap peer_capabilities[CLUSTER_MAX_NODES];
+	pg_atomic_uint64 capability_cut_generation;
 	pg_atomic_uint64 caps_reply_reject_count;
 	pg_atomic_uint64 install_count;
 	pg_atomic_uint64 touch_count;
@@ -191,6 +192,7 @@ cluster_sf_dep_shmem_init(void)
 			ClusterSfDep->peer_capabilities[i].generation = 0;
 			ClusterSfDep->peer_capabilities[i].valid = false;
 		}
+		pg_atomic_init_u64(&ClusterSfDep->capability_cut_generation, 1);
 		pg_atomic_init_u64(&ClusterSfDep->caps_reply_reject_count, 0);
 		pg_atomic_init_u64(&ClusterSfDep->install_count, 0);
 		pg_atomic_init_u64(&ClusterSfDep->touch_count, 0);
@@ -222,6 +224,38 @@ cluster_sf_dep_shmem_register(void)
 	cluster_shmem_register_region(&cluster_sf_dep_region);
 }
 
+/* Original store lock serializes writers. Invalidate observations before
+ * changing a record; capture still reads capabilities under that lock.
+ * Exhaustion permanently disables observations, never capability service. */
+static void
+cluster_sf_capability_cut_advance_locked(void)
+{
+	uint64 generation = pg_atomic_read_u64(&ClusterSfDep->capability_cut_generation);
+
+	if (generation != 0 && generation != UINT64_MAX)
+		pg_atomic_write_u64(&ClusterSfDep->capability_cut_generation, generation + 1);
+	pg_write_barrier();
+}
+
+uint64
+cluster_sf_peer_capability_cut_generation(void)
+{
+	uint64 generation;
+
+	if (ClusterSfDep == NULL)
+		return 0;
+	generation = pg_atomic_read_u64(&ClusterSfDep->capability_cut_generation);
+	pg_read_barrier();
+	return generation != 0 && generation != UINT64_MAX ? generation : 0;
+}
+
+bool
+cluster_sf_peer_capability_cut_generation_current(uint64 expected)
+{
+	pg_read_barrier();
+	return expected != 0 && cluster_sf_peer_capability_cut_generation() == expected;
+}
+
 /*
  * cluster_sf_note_peer_hello_capabilities_gen
  *
@@ -238,6 +272,7 @@ cluster_sf_note_peer_hello_capabilities_gen(int32 peer_id, uint32 capabilities, 
 		return;
 
 	LWLockAcquire(&ClusterSfDep->lock, LW_EXCLUSIVE);
+	cluster_sf_capability_cut_advance_locked();
 	cluster_sf_peer_cap_note(&ClusterSfDep->peer_capabilities[peer_id], capabilities, generation);
 	LWLockRelease(&ClusterSfDep->lock);
 }
@@ -696,7 +731,11 @@ cluster_sf_note_peer_disconnected_gen(int32 peer_id, uint32 generation)
 		return;
 
 	LWLockAcquire(&ClusterSfDep->lock, LW_EXCLUSIVE);
-	(void)cluster_sf_peer_cap_invalidate_gen(&ClusterSfDep->peer_capabilities[peer_id], generation);
+	if (ClusterSfDep->peer_capabilities[peer_id].valid
+		&& ClusterSfDep->peer_capabilities[peer_id].generation == generation) {
+		cluster_sf_capability_cut_advance_locked();
+		(void)cluster_sf_peer_cap_invalidate_gen(&ClusterSfDep->peer_capabilities[peer_id], generation);
+	}
 	LWLockRelease(&ClusterSfDep->lock);
 }
 
@@ -715,6 +754,7 @@ cluster_sf_note_peer_disconnected(int32 peer_id)
 		return;
 
 	LWLockAcquire(&ClusterSfDep->lock, LW_EXCLUSIVE);
+	cluster_sf_capability_cut_advance_locked();
 	ClusterSfDep->peer_capabilities[peer_id].bits = 0;
 	ClusterSfDep->peer_capabilities[peer_id].valid = false;
 	LWLockRelease(&ClusterSfDep->lock);

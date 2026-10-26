@@ -1572,6 +1572,46 @@ cluster_undo_horizon_read_admission_enforce(SCN read_scn)
 	return true;
 }
 
+/* Sample before original admission, whose capability queries serialize with
+ * publishers. Recheck the local invalidation identity before returning it.
+ * Preserve original admission errors even when observation is unavailable. */
+bool
+cluster_undo_horizon_read_admission_capture(SCN read_scn, ClusterUndoReadAdmissionFence *out)
+{
+	ClusterUndoReadAdmissionFence candidate;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	memset(&candidate, 0, sizeof(candidate));
+	candidate.node_id = cluster_node_id;
+	candidate.epoch = cluster_epoch_get_current();
+	candidate.membership_cut_generation = cluster_membership_cut_generation();
+	candidate.capability_cut_generation = cluster_sf_peer_capability_cut_generation();
+	candidate.self_admitted_epoch
+		= UndoHorizonShmem == NULL ? 0 : pg_atomic_read_u64(&UndoHorizonShmem->self_admitted_epoch);
+	if (!cluster_undo_horizon_read_admission_enforce(read_scn)
+		|| !cluster_undo_horizon_read_admission_current(&candidate))
+		return false;
+	*out = candidate;
+	return true;
+}
+
+bool
+cluster_undo_horizon_read_admission_current(const ClusterUndoReadAdmissionFence *expected)
+{
+	pg_read_barrier();
+	return expected != NULL && expected->node_id >= 0 && expected->node_id < CLUSTER_MAX_NODES
+		   && expected->node_id == cluster_node_id && expected->epoch != 0
+		   && expected->epoch == cluster_epoch_get_current() && expected->self_admitted_epoch != 0
+		   && UndoHorizonShmem != NULL
+		   && expected->self_admitted_epoch
+				  == pg_atomic_read_u64(&UndoHorizonShmem->self_admitted_epoch)
+		   && cluster_membership_get_state(expected->node_id) == CLUSTER_MEMBER_MEMBER
+		   && cluster_membership_cut_generation_current(expected->membership_cut_generation)
+		   && cluster_sf_peer_capability_cut_generation_current(expected->capability_cut_generation);
+}
+
 /*
  * F-D2 epoch fence: re-verify -- at every recycle mutation point -- that the
  * reconfig epoch still equals the one the floor was folded at.  A mid-pass
