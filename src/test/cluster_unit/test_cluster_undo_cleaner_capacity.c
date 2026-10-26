@@ -68,6 +68,13 @@ static void (*test_capacity_probe_hook)(void);
 static ClusterCapacityReasonV1 test_pool_reason;
 static unsigned test_pool_calls;
 static void (*test_pool_probe_hook)(void);
+static bool test_clear_current_continuation;
+static unsigned test_continuation_calls;
+static ClusterCtrcTxnKeyV1 test_continuation_hint;
+extern ClusterCapacityReasonV1
+cluster_ctrc_capacity_probe_pool_continuation_v1(uint32 segment, SCN horizon, uint64 epoch,
+												 const ClusterCtrcTxnKeyV1 *hint,
+												 ClusterCapacityObservationV1 *observation);
 extern ClusterCapacityReasonV1
 cluster_ctrc_capacity_probe_pool_v1(uint32 segment, SCN horizon, uint64 epoch,
 									ClusterCapacityObservationV1 *observation);
@@ -562,6 +569,8 @@ cluster_ctrc_capacity_probe_current(uint32 segment, SCN horizon, uint64 epoch,
 		PrivateRefCountArray[0].refcount = 1;
 	if (early_signal)
 		ConditionVariableBroadcast(&undo_cleaner_state->capacity_cv);
+	if (test_clear_current_continuation && test_proof == CLUSTER_CTRC_CAPACITY_REFUSE)
+		MemSet(continuation, 0, sizeof(*continuation));
 	return test_proof;
 }
 
@@ -582,6 +591,18 @@ cluster_ctrc_capacity_probe_pool_v1(uint32 segment, SCN horizon, uint64 epoch,
 	if (test_pool_probe_hook != NULL)
 		test_pool_probe_hook();
 	return test_pool_reason;
+}
+
+ClusterCapacityReasonV1
+cluster_ctrc_capacity_probe_pool_continuation_v1(uint32 segment, SCN horizon, uint64 epoch,
+												 const ClusterCtrcTxnKeyV1 *hint,
+												 ClusterCapacityObservationV1 *observation)
+{
+	if (hint == NULL || test_lock_depth != 0 || !subscribed)
+		abort();
+	test_continuation_calls++;
+	test_continuation_hint = *hint;
+	return cluster_ctrc_capacity_probe_pool_v1(segment, horizon, epoch, observation);
 }
 
 void
@@ -708,6 +729,9 @@ reset_wait_fixture(void)
 	test_pool_reason = CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
 	test_pool_calls = 0;
 	test_pool_probe_hook = NULL;
+	test_clear_current_continuation = false;
+	test_continuation_calls = 0;
+	MemSet(&test_continuation_hint, 0, sizeof(test_continuation_hint));
 	test_gc_complete = false;
 	test_inventory_max = 1;
 	test_inventory_scans = 0;
@@ -2132,10 +2156,97 @@ UT_TEST(test_native_slot_wait_scope_preserves_context_and_counts_only_its_cancel
 	UT_ASSERT_EQ(test_lock_depth, 0);
 }
 
+UT_TEST(test_pool_continuation_survives_current_refusal_and_repeated_cv_reentry)
+{
+	ClusterCtrcTxnKeyV1 continuation = { 0 }, previous;
+
+	reset_wait_fixture();
+	test_proof = CLUSTER_CTRC_CAPACITY_REFUSE;
+	test_pool_reason = CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE;
+	test_clear_current_continuation = true;
+	for (unsigned pass = 0; pass < 2; pass++) {
+		previous = continuation;
+		UT_ASSERT(cluster_undo_cleaner_wait_for_capacity(1, &continuation));
+		UT_ASSERT_EQ(test_continuation_calls, pass + 1);
+		UT_ASSERT_EQ(memcmp(&test_continuation_hint, &previous, sizeof(previous)), 0);
+		UT_ASSERT_EQ(continuation.segment_id, 256);
+		UT_ASSERT_EQ(continuation.xid, 9123);
+		UT_ASSERT_EQ(slept, pass + 1);
+		UT_ASSERT_EQ(cancelled, pass + 1);
+		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_entered, pass + 1);
+		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_repolled, pass + 1);
+		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_proof, 0);
+		UT_ASSERT_EQ(test_lock_depth, 0);
+		UT_ASSERT(!subscribed);
+	}
+}
+
+UT_TEST(test_pool_continuation_recheck_refusal_and_cancel_keep_original_counters)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterCtrcTxnKeyV1 continuation = { 0 }, before, empty = { 0 };
+		volatile bool caught = false;
+
+		reset_wait_fixture();
+		continuation.segment_id = 256;
+		continuation.xid = 9123;
+		continuation.slot_wrap = 3;
+		before = continuation;
+		test_clear_current_continuation = true;
+		test_proof = CLUSTER_CTRC_CAPACITY_REFUSE;
+		test_pool_reason = fault == 0	? CLUSTER_CAPACITY_SUPPLY_RECHECK
+						   : fault == 1 ? CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER
+										: CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE;
+		test_cancel = fault == 2;
+		PG_TRY();
+		{
+			UT_ASSERT_EQ(cluster_undo_cleaner_wait_for_capacity(1, &continuation), fault == 0);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 2);
+		UT_ASSERT_EQ(test_continuation_calls, 1);
+		UT_ASSERT_EQ(memcmp(&test_continuation_hint, &before, sizeof(before)), 0);
+		if (fault < 2)
+			UT_ASSERT_EQ(memcmp(&continuation, &empty, sizeof(empty)), 0);
+		UT_ASSERT_EQ(slept, fault == 2);
+		UT_ASSERT_EQ(cancelled, 1);
+		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_entered, fault == 2);
+		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_repolled, 0);
+		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_proof, fault == 1);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_cancelled), fault == 2);
+		UT_ASSERT_EQ(test_lock_depth, 0);
+		UT_ASSERT(!subscribed);
+	}
+}
+
+UT_TEST(test_pool_continuation_current_proof_keeps_original_precedence)
+{
+	for (unsigned retry = 0; retry < 2; retry++) {
+		ClusterCtrcTxnKeyV1 continuation = { 0 };
+
+		reset_wait_fixture();
+		test_proof = retry ? CLUSTER_CTRC_CAPACITY_RETRY : CLUSTER_CTRC_CAPACITY_WAIT;
+		test_pool_reason = CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE;
+		UT_ASSERT(cluster_undo_cleaner_wait_for_capacity(1, &continuation));
+		UT_ASSERT_EQ(test_continuation_calls, 0);
+		UT_ASSERT_EQ(test_pool_calls, 0);
+		UT_ASSERT_EQ(slept, !retry);
+		UT_ASSERT_EQ(cancelled, 1);
+		UT_ASSERT(!subscribed);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(47);
+	UT_PLAN(50);
+	UT_RUN(test_pool_continuation_survives_current_refusal_and_repeated_cv_reentry);
+	UT_RUN(test_pool_continuation_recheck_refusal_and_cancel_keep_original_counters);
+	UT_RUN(test_pool_continuation_current_proof_keeps_original_precedence);
 	UT_RUN(test_native_slot_wait_scope_preserves_context_and_counts_only_its_cancellation);
 	UT_RUN(test_pool_keeps_original_context_refusal_and_cancel_cleanup);
 	UT_RUN(test_pool_owner_uses_original_cv_and_exact_old_segment_worker);

@@ -1103,6 +1103,12 @@ typedef struct ClusterCapacityObservationV1 {
 extern ClusterCapacityReasonV1
 cluster_ctrc_capacity_probe_pool_v1(uint32 current_segment, SCN horizon, uint64 epoch,
 									ClusterCapacityObservationV1 *observation);
+#define CLUSTER_CTRC_CAPACITY_POOL_CONTINUATION_V1 1
+/* Optional exact key only; phase, admission and owner are sampled afresh. */
+extern ClusterCapacityReasonV1
+cluster_ctrc_capacity_probe_pool_continuation_v1(uint32 current_segment, SCN horizon, uint64 epoch,
+												 const ClusterCtrcTxnKeyV1 *hint,
+												 ClusterCapacityObservationV1 *observation);
 
 /*
  * L11/L12 canonical release sampler for the current allocator GC.  The

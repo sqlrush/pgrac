@@ -497,6 +497,37 @@ cluster_undo_cleaner_capacity_owner_snapshot(unsigned worker_id, uint64 *coordin
 	return true;
 }
 
+/* The CURRENT-only preflight may clear an old pool key. Preserve its exact
+ * provenance while observing both paths under the original owner bracket. */
+static ClusterCtrcCapacityProbeResult
+undo_cleaner_capacity_probe(uint32 segment_id, const ClusterUndoHorizonFloor *floor,
+							ClusterCtrcTxnKeyV1 *continuation, uint64 *owner_generations)
+{
+	ClusterCtrcTxnKeyV1 prior = *continuation;
+	ClusterCtrcCapacityProbeResult proof;
+	ClusterCapacityObservationV1 observation;
+	ClusterCapacityReasonV1 reason;
+
+	LWLockAcquire(&undo_cleaner_state->lwlock, LW_SHARED);
+	for (unsigned i = 0; i < CLUSTER_UNDO_CLEANER_WORKER_TYPES; i++)
+		owner_generations[i] = undo_cleaner_capacity_owner_generation_locked(i);
+	LWLockRelease(&undo_cleaner_state->lwlock);
+	proof = cluster_ctrc_capacity_probe_current(segment_id, floor->scn, floor->epoch, continuation);
+	if (proof != CLUSTER_CTRC_CAPACITY_REFUSE)
+		return proof;
+	reason = cluster_ctrc_capacity_probe_pool_continuation_v1(segment_id, floor->scn, floor->epoch,
+															  &prior, &observation);
+	if (reason == CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE) {
+		*continuation = observation.key;
+		return CLUSTER_CTRC_CAPACITY_WAIT;
+	}
+	if (reason == CLUSTER_CAPACITY_SUPPLY_RECHECK) {
+		MemSet(continuation, 0, sizeof(*continuation));
+		return CLUSTER_CTRC_CAPACITY_RETRY;
+	}
+	return proof;
+}
+
 bool
 cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *continuation)
 {
@@ -522,27 +553,9 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 
 		CHECK_FOR_INTERRUPTS();
 		if (cluster_undo_cleaner_enabled && cluster_storage_mode_enabled()
-			&& undo_cleaner_capacity_floor(&floor)) {
-			LWLockAcquire(&undo_cleaner_state->lwlock, LW_SHARED);
-			for (unsigned i = 0; i < CLUSTER_UNDO_CLEANER_WORKER_TYPES; i++)
-				owner_generations[i] = undo_cleaner_capacity_owner_generation_locked(i);
-			LWLockRelease(&undo_cleaner_state->lwlock);
-			proof = cluster_ctrc_capacity_probe_current(segment_id, floor.scn, floor.epoch,
-														continuation);
-			if (proof == CLUSTER_CTRC_CAPACITY_REFUSE) {
-				ClusterCapacityObservationV1 observation;
-				ClusterCapacityReasonV1 reason = cluster_ctrc_capacity_probe_pool_v1(
-					segment_id, floor.scn, floor.epoch, &observation);
-
-				if (reason == CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE) {
-					*continuation = observation.key;
-					proof = CLUSTER_CTRC_CAPACITY_WAIT;
-				} else if (reason == CLUSTER_CAPACITY_SUPPLY_RECHECK) {
-					MemSet(continuation, 0, sizeof(*continuation));
-					proof = CLUSTER_CTRC_CAPACITY_RETRY;
-				}
-			}
-		}
+			&& undo_cleaner_capacity_floor(&floor))
+			proof
+				= undo_cleaner_capacity_probe(segment_id, &floor, continuation, owner_generations);
 		if (proof == CLUSTER_CTRC_CAPACITY_RETRY)
 			retry = true;
 		else if (proof == CLUSTER_CTRC_CAPACITY_WAIT && undo_cleaner_capacity_context_safe()) {
