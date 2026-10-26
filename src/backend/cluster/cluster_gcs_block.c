@@ -22862,6 +22862,40 @@ static GcsFirstFillHolderPark gcs_first_fill_holder_parks[GCS_FIRST_FILL_PARK_MA
 static GcsFirstFillHolderPark *gcs_first_fill_resuming;
 static bool gcs_first_fill_resume_retained;
 
+typedef enum GcsFirstFillHolderMasterState {
+	GCS_FIRST_FILL_HOLDER_MASTER_UNKNOWN,
+	GCS_FIRST_FILL_HOLDER_MASTER_CURRENT,
+	GCS_FIRST_FILL_HOLDER_MASTER_ENDED
+} GcsFirstFillHolderMasterState;
+
+/* An unavailable route/session is not proof that the original service ended.
+ * A zero expected session is used only before an ingress owner is pinned. */
+static GcsFirstFillHolderMasterState
+gcs_first_fill_holder_master_state(const GcsBlockFirstFillForwardPayload *forward,
+	uint64 expected_session, uint64 *session_out)
+{
+	const GcsBlockForwardPayload *fwd = &forward->forward;
+	int master;
+	uint64 session;
+
+	if (fwd->epoch != cluster_epoch_get_current()
+		|| cluster_membership_get_state(fwd->master_node) == CLUSTER_MEMBER_DEAD
+		|| cluster_membership_get_state(fwd->master_node) == CLUSTER_MEMBER_REMOVED)
+		return GCS_FIRST_FILL_HOLDER_MASTER_ENDED;
+	master = cluster_gcs_lookup_master(fwd->tag);
+	if (master >= 0 && master != fwd->master_node)
+		return GCS_FIRST_FILL_HOLDER_MASTER_ENDED;
+	if (master < 0
+		|| !gcs_block_pcm_x_authenticated_session(fwd->master_node, fwd->epoch, &session)
+		|| session == 0)
+		return GCS_FIRST_FILL_HOLDER_MASTER_UNKNOWN;
+	if (expected_session != 0 && expected_session != session)
+		return GCS_FIRST_FILL_HOLDER_MASTER_ENDED;
+	if (session_out != NULL)
+		*session_out = session;
+	return GCS_FIRST_FILL_HOLDER_MASTER_CURRENT;
+}
+
 static bool
 gcs_first_fill_same_forward(const GcsBlockFirstFillForwardPayload *left,
 	const GcsBlockFirstFillForwardPayload *right)
@@ -23169,15 +23203,24 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		uint64 session;
 		bool created;
 		GcsFirstFillHolderPark *owner;
+		GcsFirstFillHolderMasterState master_state;
 		first_fill = payload;
 		if (!GcsBlockFirstFillForwardPayloadGrant(first_fill, cluster_node_id, &first_fill_service)
 			|| env->dest_node_id != (uint32)cluster_node_id
 			|| fwd->master_node != (int32)env->source_node_id
-			|| fwd->epoch != cluster_epoch_get_current()
-			|| cluster_gcs_lookup_master(fwd->tag) != fwd->master_node
-			|| !gcs_block_pcm_x_authenticated_session(fwd->master_node, fwd->epoch, &session)
 			|| fwd->requester_backend_id > MaxBackends)
 			return;
+		master_state = gcs_first_fill_holder_master_state(first_fill, 0, &session);
+		if (master_state != GCS_FIRST_FILL_HOLDER_MASTER_CURRENT) {
+			if (master_state == GCS_FIRST_FILL_HOLDER_MASTER_UNKNOWN) {
+				if (gcs_first_fill_resuming != NULL
+					&& gcs_first_fill_same_forward(&gcs_first_fill_resuming->forward, first_fill))
+					gcs_first_fill_resume_retained = true;
+				else
+					cluster_ic_dispatch_defer(env); /* The original carrier still owns this service. */
+			}
+			return;
+		}
 		owner = gcs_first_fill_holder_reserve(first_fill, session, &created);
 		if (owner == NULL) {
 			cluster_ic_dispatch_defer(env);
@@ -23897,24 +23940,18 @@ cluster_gcs_block_first_fill_tick(void)
 	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
 		GcsFirstFillHolderPark *park = &gcs_first_fill_holder_parks[i];
 		ClusterICEnvelope env = {0};
+		GcsFirstFillHolderMasterState master_state;
 		int ready;
 		volatile bool completed = false;
 		if (!park->in_use)
 			continue;
+		master_state = park->master_session == 0 ? GCS_FIRST_FILL_HOLDER_MASTER_UNKNOWN
+			: gcs_first_fill_holder_master_state(&park->forward, park->master_session, NULL);
+		if (master_state == GCS_FIRST_FILL_HOLDER_MASTER_UNKNOWN)
+			continue; /* Keep the original bytes, IO witness and notification duties. */
 		if (park->holder_notice_pending) {
-			int master = park->forward.forward.master_node;
-			uint64 session;
-			if (park->forward.forward.epoch != cluster_epoch_get_current()
-				|| cluster_gcs_lookup_master(park->forward.forward.tag) != master
-				|| cluster_membership_get_state(master) == CLUSTER_MEMBER_DEAD
-				|| cluster_membership_get_state(master) == CLUSTER_MEMBER_REMOVED) {
+			if (master_state == GCS_FIRST_FILL_HOLDER_MASTER_ENDED) {
 				/* Existing membership/remaster cleanup now owns the old claim. */
-				memset(park, 0, sizeof(*park));
-				continue;
-			}
-			if (!gcs_block_pcm_x_authenticated_session(master, park->forward.forward.epoch, &session))
-				continue; /* Unknown is not proof that the original master ended. */
-			if (session != park->master_session) {
 				memset(park, 0, sizeof(*park));
 				continue;
 			}
@@ -23927,11 +23964,7 @@ cluster_gcs_block_first_fill_tick(void)
 			}
 		}
 		if (park->returned || park->terminal) {
-			uint64 session;
-			if (park->forward.forward.epoch != cluster_epoch_get_current()
-				|| cluster_gcs_lookup_master(park->forward.forward.tag) != park->forward.forward.master_node
-				|| (gcs_block_pcm_x_authenticated_session(park->forward.forward.master_node,
-					park->forward.forward.epoch, &session) && session != park->master_session)) {
+			if (master_state == GCS_FIRST_FILL_HOLDER_MASTER_ENDED) {
 				/* Master reconfiguration terminates a sealed old service;
 				 * no late callback or retained reply exists in this owner. */
 				memset(park, 0, sizeof(*park));
@@ -23948,22 +23981,18 @@ cluster_gcs_block_first_fill_tick(void)
 		 * the original native resident/IO witness remains mandatory. */
 		ready = park->reply_size != 0 ? 1
 			: (park->wait_valid ? cluster_bufmgr_first_fill_wait_ready(&park->wait) : -1);
-		if (ready < 0 || park->forward.forward.epoch != cluster_epoch_get_current()
+		if (ready < 0 || master_state == GCS_FIRST_FILL_HOLDER_MASTER_ENDED
 			|| cluster_normal_stop_requested()) {
 			/* A changed resident is only a no-image return; epoch/stop
 			 * uses the existing exact cancellation/revoke owner instead. */
-			gcs_first_fill_holder_return(park, park->forward.forward.epoch != cluster_epoch_get_current()
+			gcs_first_fill_holder_return(park, master_state == GCS_FIRST_FILL_HOLDER_MASTER_ENDED
 				|| cluster_normal_stop_requested());
 			continue;
 		}
 		if (park->reply_size != 0) {
-			uint64 session;
 			ClusterICSendResult send_rc;
 			if (park->reply_size < sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE
-				|| park->reply_size > sizeof(park->reply)
-				|| cluster_gcs_lookup_master(park->forward.forward.tag) != park->forward.forward.master_node
-				|| !gcs_block_pcm_x_authenticated_session(park->forward.forward.master_node,
-					park->forward.forward.epoch, &session) || session != park->master_session) {
+				|| park->reply_size > sizeof(park->reply)) {
 				gcs_first_fill_holder_return(park, true);
 				continue;
 			}
