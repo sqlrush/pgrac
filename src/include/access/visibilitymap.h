@@ -22,6 +22,7 @@
 #include "access/xlogdefs.h"
 #include "storage/block.h"
 #include "storage/buf.h"
+#include "storage/bufpage.h"
 #include "storage/relfilelocator.h"
 #include "utils/relcache.h"
 
@@ -52,6 +53,10 @@ extern bool visibilitymap_pin_ok(BlockNumber heapBlk, Buffer vmbuf);
 /* PGRAC: callers copy this identity before acquiring page content locks. */
 struct ClusterSpaceIdentity;
 struct ClusterSpaceIdentityObservationV1;
+/* Physical absence only: initialized, bounded heap layout with no used or
+ * storage-bearing line pointers. Caller retains a stable image. No grant,
+ * SPACE, visibility, retention or reference-retirement authority is implied. */
+extern bool visibilitymap_heap_page_is_empty(Page page);
 /* Both exact native content-X/ACTIVE writer brackets are caller-owned.
  * Pass the original operation's SPACE observation, captured before waiting;
  * the setter checks it locally before any page version or WAL publication.

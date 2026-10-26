@@ -115,6 +115,7 @@
 #include "postgres.h"
 
 #include "access/heapam_xlog.h"
+#include "access/htup_details.h"
 #include "access/visibilitymap.h"
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
@@ -698,8 +699,41 @@ visibilitymap_set_retry_aware(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 }
 
 #ifdef USE_PGRAC_CLUSTER
+/* LP_UNUSED can remain after the last tuple is removed. Inspect the complete
+ * bounded array without interpreting a tuple, ITL terminal state or HOT link.
+ * A redirect/dead LP still has a consumer and cannot qualify as empty here. */
+bool
+visibilitymap_heap_page_is_empty(Page page)
+{
+	PageHeader header;
+	OffsetNumber maxoff;
+
+	if (page == NULL)
+		return false;
+	header = (PageHeader)page;
+	if (PageIsNew(page) || PageGetPageSize(page) != BLCKSZ
+		|| PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION
+		|| header->pd_lower < SizeOfPageHeaderData || header->pd_lower > header->pd_upper
+		|| header->pd_upper > header->pd_special || header->pd_special > BLCKSZ
+		|| (header->pd_lower - SizeOfPageHeaderData) % sizeof(ItemIdData) != 0
+		|| header->pd_special != MAXALIGN(header->pd_special) || !PageHasItl(page)
+		|| PageGetSpecialSize(page) < CLUSTER_ITL_ARRAY_SIZE || header->pd_block_scn == 0)
+		return false;
+	maxoff = PageGetMaxOffsetNumber(page);
+	if (maxoff > MaxHeapTuplesPerPage)
+		return false;
+	for (OffsetNumber offnum = FirstOffsetNumber; offnum <= maxoff; offnum++) {
+		ItemId item = PageGetItemId(page, offnum);
+
+		if (ItemIdIsUsed(item) || ItemIdHasStorage(item))
+			return false;
+	}
+	return true;
+}
+
 /* An initialized, coherently owned empty heap has no tuple/HOT/MX inputs to
- * classify. This entry grants no permission for a nonempty page or an old VM
+ * classify, including when only LP_UNUSED remains. This entry grants no
+ * permission for a nonempty page or an old VM
  * bit. Both writer-use brackets must already be active; never acquire current
  * or initialize a page here. The original visible WAL couples both versions. */
 bool
@@ -710,7 +744,6 @@ visibilitymap_set_empty(Relation rel, BlockNumber heapBlk, Buffer heapBuf, Buffe
 	uint64 object_revision;
 	bool object_checked;
 	Page page;
-	PageHeader header;
 	RfPageProducerComponentV1 heap_component, vm_component;
 	BufferTag vm_tag;
 	bool publication_needed;
@@ -727,13 +760,7 @@ visibilitymap_set_empty(Relation rel, BlockNumber heapBlk, Buffer heapBuf, Buffe
 		return false;
 
 	page = BufferGetPage(heapBuf);
-	header = (PageHeader)page;
-	if (PageIsNew(page) || !PageIsEmpty(page) || PageGetPageSize(page) != BLCKSZ
-		|| PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION
-		|| header->pd_lower != SizeOfPageHeaderData || header->pd_lower > header->pd_upper
-		|| header->pd_upper > header->pd_special || header->pd_special > BLCKSZ
-		|| header->pd_special != MAXALIGN(header->pd_special) || !PageHasItl(page)
-		|| PageGetSpecialSize(page) < CLUSTER_ITL_ARRAY_SIZE || header->pd_block_scn == 0
+	if (!visibilitymap_heap_page_is_empty(page)
 		|| !vm_redo_page_valid(BufferGetPage(vmBuf))
 		|| !cluster_space_buffer_version_component(identity, heapBuf, 1, 1, &heap_component)
 		|| !cluster_space_buffer_version_component(identity, vmBuf, 0, 0, &vm_component))

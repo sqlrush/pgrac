@@ -331,6 +331,26 @@ visibilitymap_pin_ok(BlockNumber block, Buffer buffer)
 {
 	return block == 0 && buffer == 2;
 }
+/* Model a real insertion, including a used LP and tuple storage. A zeroed
+ * extra line pointer is LP_UNUSED and cannot represent an inserted row. */
+static void
+empty_insert_row_at(OffsetNumber offset)
+{
+	Page page = pages[0].data;
+	PageHeader header = (PageHeader)page;
+	HeapTupleHeader tuple;
+	Size lower = SizeOfPageHeaderData + offset * sizeof(ItemIdData);
+
+	if (header->pd_lower < lower)
+		header->pd_lower = lower;
+	header->pd_upper = header->pd_special - MAXALIGN(SizeofHeapTupleHeader);
+	ItemIdSetNormal(PageGetItemId(page, offset), header->pd_upper, SizeofHeapTupleHeader);
+	tuple = (HeapTupleHeader)(page + header->pd_upper);
+	memset(tuple, 0, SizeofHeapTupleHeader);
+	tuple->t_hoff = SizeofHeapTupleHeader;
+	HeapTupleHeaderSetXmin(tuple, 17);
+}
+
 void
 LockBuffer(Buffer buffer, int mode)
 {
@@ -407,7 +427,7 @@ LockBuffer(Buffer buffer, int mode)
 				if (empty_identity_change_phase == 2)
 					empty_identity_generation++;
 				if (empty_race == 1)
-					((PageHeader)pages[0].data)->pd_lower += sizeof(ItemIdData);
+					empty_insert_row_at(FirstOffsetNumber);
 				else if (empty_race == 2)
 					memset(pages[0].data, 0, BLCKSZ);
 				empty_race = 0;
@@ -1608,7 +1628,7 @@ UT_TEST(test_empty_direct_entry_rejects_nonempty_new_and_malformed_heap)
 		held[1] = writer[0] = writer[1] = true;
 		switch (variant) {
 		case 0:
-			header->pd_lower += sizeof(ItemIdData);
+			empty_insert_row_at(FirstOffsetNumber);
 			break;
 		case 1:
 			memset(header, 0, BLCKSZ);
@@ -2389,10 +2409,199 @@ UT_TEST(test_empty_outcome_error_does_not_count_completed_publication)
 	}
 }
 
+static void
+empty_unused_slots(OffsetNumber count)
+{
+	Page page = pages[0].data;
+	PageHeader header = (PageHeader)page;
+
+	UT_ASSERT(count > 0 && count <= MaxHeapTuplesPerPage + 1);
+	header->pd_lower = SizeOfPageHeaderData + count * sizeof(ItemIdData);
+	for (OffsetNumber offset = FirstOffsetNumber; offset <= count; offset++)
+		ItemIdSetUnused(PageGetItemId(page, offset));
+	PageSetHasFreeLinePointers(page);
+	memcpy(before, pages, sizeof(pages));
+}
+
+UT_TEST(test_unused_only_scan_publishes_exact_native_versions)
+{
+	static const OffsetNumber counts[] = { 1, 8, MaxHeapTuplesPerPage };
+
+	for (unsigned n = 0; n < lengthof(counts); n++) {
+		for (int share = 0; share < 2; share++) {
+			LVRelState state = empty_reset(false, 12);
+			Buffer vm = 2;
+			Size lower;
+
+			empty_unused_slots(counts[n]);
+			lower = ((PageHeader)pages[0].data)->pd_lower;
+			UT_ASSERT(!PageIsEmpty(pages[0].data));
+			UT_ASSERT(lazy_scan_new_or_empty(&state, 1, 0, pages[0].data, share, &vm));
+			UT_ASSERT_EQ(inserts, 1);
+			UT_ASSERT_EQ(edge_count, 2);
+			UT_ASSERT_EQ(edges[0].before.mutation_token, 30);
+			UT_ASSERT_EQ(edges[1].before.mutation_token, 20);
+			UT_ASSERT_EQ(next_token, 101);
+			UT_ASSERT(PageIsAllVisible(pages[0].data));
+			UT_ASSERT_EQ((uint8)*PageGetContents(pages[1].data), 15);
+			UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_lower, lower);
+			UT_ASSERT(memcmp(pages[0].data + SizeOfPageHeaderData,
+							 before[0].data + SizeOfPageHeaderData,
+							 lower - SizeOfPageHeaderData) == 0);
+			UT_ASSERT(memcmp(images[1].data + SizeOfPageHeaderData,
+							 before[0].data + SizeOfPageHeaderData,
+							 lower - SizeOfPageHeaderData) == 0);
+			UT_ASSERT_EQ(empty_publication_metric("vm_empty_publish_wal_count"), 1);
+			UT_ASSERT_EQ(empty_aux_calls, 1);
+			UT_ASSERT_EQ(empty_heap_waits, 1);
+			UT_ASSERT_EQ(empty_cleanup_waits, !share);
+			UT_ASSERT_EQ(empty_resumes, 1);
+			UT_ASSERT_EQ(empty_fsm, 1);
+			UT_ASSERT(!held[0] && !held[1] && !pinned[0] && pinned[1]);
+		}
+	}
+}
+
+UT_TEST(test_unused_direct_setter_upgrades_av_and_preserves_qualified_noop)
+{
+	for (int bits = 1; bits <= 3; bits += 2) {
+		LVRelState state = empty_reset(true, bits | 12);
+		ClusterSpaceIdentityObservationV1 observation;
+
+		empty_unused_slots(8);
+		UT_ASSERT(fixture_empty_identity_capture(&relation, &state.identity, &observation));
+		held[1] = writer[0] = writer[1] = true;
+		UT_ASSERT(fixture_set_empty_observed(&observation));
+		UT_ASSERT_EQ(inserts, bits == 1);
+		UT_ASSERT_EQ(edge_count, bits == 1 ? 2 : 0);
+		UT_ASSERT_EQ(empty_publication_metric("vm_empty_publish_wal_count"), bits == 1);
+		UT_ASSERT_EQ(empty_publication_metric("vm_empty_publish_noop_count"), bits == 3);
+		UT_ASSERT_EQ((uint8)*PageGetContents(pages[1].data), 15);
+		UT_ASSERT_EQ(empty_aux_calls + empty_resumes + empty_heap_waits, 0);
+		UT_ASSERT(held[0] && held[1] && writer[0] && writer[1] && pinned[0] && pinned[1]);
+		if (bits == 3)
+			UT_ASSERT(memcmp(pages, before, sizeof(pages)) == 0);
+	}
+}
+
+UT_TEST(test_unused_direct_setter_rejects_each_used_or_stored_slot)
+{
+	for (int last = 0; last < 2; last++) {
+		for (int kind = 0; kind < 4; kind++) {
+			LVRelState state = empty_reset(false, 12);
+			ClusterSpaceIdentityObservationV1 observation;
+			OffsetNumber offset = last ? 8 : FirstOffsetNumber;
+			ItemId item;
+
+			empty_unused_slots(8);
+			UT_ASSERT(fixture_empty_identity_capture(&relation, &state.identity, &observation));
+			held[1] = writer[0] = writer[1] = true;
+			item = PageGetItemId(pages[0].data, offset);
+			if (kind == 0)
+				ItemIdSetDead(item);
+			else if (kind == 1)
+				ItemIdSetRedirect(item, last ? 1 : 8);
+			else {
+				empty_insert_row_at(offset);
+				if (kind == 3)
+					item->lp_flags = LP_UNUSED; /* Malformed UNUSED with storage. */
+			}
+			memcpy(before, pages, sizeof(pages));
+			UT_ASSERT(!fixture_set_empty_observed(&observation));
+			UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1] + empty_publication_notes, 0);
+			UT_ASSERT_EQ(next_token, 100);
+			UT_ASSERT(memcmp(pages, before, sizeof(pages)) == 0);
+			UT_ASSERT(held[0] && held[1] && writer[0] && writer[1]);
+		}
+	}
+}
+
+UT_TEST(test_unused_direct_setter_rejects_malformed_or_excess_lp_array)
+{
+	for (int kind = 0; kind < 8; kind++) {
+		LVRelState state = empty_reset(false, 12);
+		ClusterSpaceIdentityObservationV1 observation;
+		PageHeader header = (PageHeader)pages[0].data;
+
+		empty_unused_slots(kind == 0 ? MaxHeapTuplesPerPage + 1 : 8);
+		UT_ASSERT(fixture_empty_identity_capture(&relation, &state.identity, &observation));
+		held[1] = writer[0] = writer[1] = true;
+		switch (kind) {
+		case 1: header->pd_lower++; break;
+		case 2: header->pd_lower = SizeOfPageHeaderData - 1; break;
+		case 3: header->pd_upper = header->pd_lower - 1; break;
+		case 4: header->pd_special--; break;
+		case 5: header->pd_flags &= ~PD_HAS_ITL; break;
+		case 6: header->pd_block_scn = 0; break;
+		case 7: PageSetPageSizeAndVersion((Page)header, BLCKSZ, 0); break;
+		}
+		memcpy(before, pages, sizeof(pages));
+		UT_ASSERT(!fixture_set_empty_observed(&observation));
+		UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1] + empty_publication_notes, 0);
+		UT_ASSERT(memcmp(pages, before, sizeof(pages)) == 0);
+		UT_ASSERT(held[0] && held[1] && writer[0] && writer[1]);
+	}
+}
+
+UT_TEST(test_unused_scan_rechecks_real_insert_before_publication)
+{
+	for (int share = 0; share < 2; share++) {
+		LVRelState state = empty_reset(false, 12);
+		Buffer vm = 2;
+
+		empty_unused_slots(8);
+		empty_race = 1;
+		UT_ASSERT(!lazy_scan_new_or_empty(&state, 1, 0, pages[0].data, share, &vm));
+		UT_ASSERT(ItemIdIsNormal(PageGetItemId(pages[0].data, FirstOffsetNumber)));
+		UT_ASSERT_EQ(empty_aux_calls, 1);
+		UT_ASSERT_EQ(empty_heap_waits, 1);
+		UT_ASSERT_EQ(inserts + edge_count + empty_publication_notes + empty_fsm, 0);
+		UT_ASSERT_EQ(next_token, 100);
+		UT_ASSERT(held[0] && writer[0] && pinned[0] && pinned[1] && !held[1]);
+		UnlockReleaseBuffer(1);
+		ReleaseBuffer(2);
+	}
+}
+
+UT_TEST(test_unused_scan_stale_original_observation_cannot_publish)
+{
+	for (int phase = 1; phase <= 3; phase++) {
+		LVRelState state = empty_reset(true, 15);
+		Buffer vm = 2;
+
+		empty_unused_slots(8);
+		empty_identity_change_phase = phase;
+		UT_ASSERT(lazy_scan_new_or_empty(&state, 1, 0, pages[0].data, true, &vm));
+		UT_ASSERT_EQ(empty_identity_captures, 1);
+		UT_ASSERT_EQ(empty_identity_checks, 1);
+		UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1] + empty_publication_notes, 0);
+		UT_ASSERT(memcmp(pages, before, sizeof(pages)) == 0);
+		UT_ASSERT_EQ(empty_fsm, 1);
+		UT_ASSERT(!held[0] && !held[1] && !pinned[0] && pinned[1]);
+	}
+}
+
+UT_TEST(test_unused_nonshared_scan_keeps_original_native_path)
+{
+	LVRelState state = empty_reset(false, 12);
+	Buffer vm = 2;
+
+	empty_unused_slots(8);
+	state.shared_maintenance_restricted = state.versioned = false;
+	cluster_shared_config = false;
+	UT_ASSERT(!lazy_scan_new_or_empty(&state, 1, 0, pages[0].data, true, &vm));
+	UT_ASSERT_EQ(empty_identity_captures + empty_aux_calls + empty_heap_waits + empty_fsm, 0);
+	UT_ASSERT_EQ(inserts + edge_count + empty_publication_notes, 0);
+	UT_ASSERT(memcmp(pages, before, sizeof(pages)) == 0);
+	UT_ASSERT(held[0] && pinned[0] && pinned[1] && !held[1]);
+	UnlockReleaseBuffer(1);
+	ReleaseBuffer(2);
+}
+
 int
 main(void)
 {
-	UT_PLAN(54);
+	UT_PLAN(61);
 	UT_RUN(test_visible_exact_two_page_batch);
 	UT_RUN(test_no_change_allocates_no_version);
 	UT_RUN(test_nonshared_preserves_native_hint_lsn_rules);
@@ -2447,6 +2656,13 @@ main(void)
 	UT_RUN(test_empty_outcome_counts_qualified_noop_separately_from_wal);
 	UT_RUN(test_empty_outcome_refusals_cannot_count_success_or_noop);
 	UT_RUN(test_empty_outcome_error_does_not_count_completed_publication);
+	UT_RUN(test_unused_only_scan_publishes_exact_native_versions);
+	UT_RUN(test_unused_direct_setter_upgrades_av_and_preserves_qualified_noop);
+	UT_RUN(test_unused_direct_setter_rejects_each_used_or_stored_slot);
+	UT_RUN(test_unused_direct_setter_rejects_malformed_or_excess_lp_array);
+	UT_RUN(test_unused_scan_rechecks_real_insert_before_publication);
+	UT_RUN(test_unused_scan_stale_original_observation_cannot_publish);
+	UT_RUN(test_unused_nonshared_scan_keeps_original_native_path);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

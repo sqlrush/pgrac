@@ -2385,9 +2385,10 @@ test_cluster_vm_empty_set.inc: $(top_srcdir)/src/backend/access/heap/visibilitym
 	     signature && /ClusterSpaceIdentityObservationV1/ { found++ } \
 	     signature && /^{/ { signature=0 } END { if (found == 1) print "#define FIXTURE_HAS_VM_EMPTY_OBSERVATION 1"; else if (found > 1) exit 1 }' $< > $@.tmp
 	awk '/^vm_redo_page_valid\(/ { print "static bool"; emit=1; found++ } \
+	     /^visibilitymap_heap_page_is_empty\(/ { print "bool"; emit=1; helpers++ } \
 	     /^visibilitymap_get_status_pinned\(/ { print "bool"; emit=1; found++ } \
 	     /^visibilitymap_set_empty\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 3 || emit) exit 1 }' $< >> $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (found != 3 || helpers > 1 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
 
 test_cluster_vm_repair_versioned.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
@@ -2956,6 +2957,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_freeze_worker_pass.inc \
 		test_cluster_heap_freeze_pgproc_types.inc test_cluster_heap_freeze_pgproc_sample.inc \
 		test_cluster_heap_freeze_pgproc_exit.inc \
+		test_cluster_ctrc_native_group_exit.inc \
 		test_cluster_heap_freeze_stripe_future.inc \
 		$(top_srcdir)/src/include/storage/proc.h $(top_srcdir)/src/include/access/transam.h \
 		test_cluster_heap_freeze_lease_current.inc \

@@ -2708,7 +2708,8 @@ lazy_publish_shared_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno, Buf
 	}
 
 	if (!prepared || vm_version == 0 || PageIsNew(BufferGetPage(buf))
-		|| !PageIsEmpty(BufferGetPage(buf))
+		|| (!PageIsEmpty(BufferGetPage(buf))
+			&& !visibilitymap_heap_page_is_empty(BufferGetPage(buf)))
 		|| !ClusterConditionalLockBufferWithMutationContext(*vmbuffer, &vm_writer, object_revision,
 															object_checked))
 		return;
@@ -2761,7 +2762,8 @@ lazy_scan_new_or_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
 	Size		freespace;
 
 #ifdef USE_PGRAC_CLUSTER
-	if (vacrel->shared_maintenance_restricted && !PageIsNew(page) && PageIsEmpty(page))
+	if (vacrel->shared_maintenance_restricted && !PageIsNew(page)
+		&& (PageIsEmpty(page) || visibilitymap_heap_page_is_empty(page)))
 	{
 		lazy_publish_shared_empty(vacrel, buf, blkno, vmbuffer, !sharelock);
 		/* The helper restored X (and original cleanup when required). Recheck
@@ -2803,7 +2805,11 @@ lazy_scan_new_or_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
 		return true;
 	}
 
-	if (PageIsEmpty(page))
+	if (PageIsEmpty(page)
+#ifdef USE_PGRAC_CLUSTER
+		|| (vacrel->shared_maintenance_restricted && visibilitymap_heap_page_is_empty(page))
+#endif
+		)
 	{
 		/*
 		 * It seems likely that caller will always be able to get a cleanup
