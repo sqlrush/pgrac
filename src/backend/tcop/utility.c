@@ -169,6 +169,12 @@ CheckClusterSharedUtilitySupport(Node *statement, bool isTopLevel)
 				/* CREATE ... INHERITS / PARTITION OF also attaches a child. */
 				unsupported = "partition and inheritance attachment";
 			break;
+		case T_CreateSeqStmt:
+			if (cluster_shared_catalog && ((CreateSeqStmt *)statement)->sequence != NULL
+				&& ((CreateSeqStmt *)statement)->sequence->relpersistence
+					   == RELPERSISTENCE_UNLOGGED)
+				unsupported = "UNLOGGED sequences";
+			break;
 		case T_CreateTableAsStmt:
 			{
 				CreateTableAsStmt *stmt = (CreateTableAsStmt *) statement;
@@ -291,6 +297,7 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 
 	if (!cluster_shared_catalog || !cluster_storage_mode_enabled()
 		|| (!IsA(statement, CreateStmt) && !IsA(statement, CreateTableAsStmt)
+			&& !IsA(statement, CreateSchemaStmt) && !IsA(statement, CreateSeqStmt)
 			&& !IsA(statement, TruncateStmt)))
 		return;
 

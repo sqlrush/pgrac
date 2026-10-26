@@ -274,6 +274,10 @@ CreateCommandTag(Node *statement)
 {
 	if (IsA(statement, TruncateStmt))
 		return CMDTAG_TRUNCATE_TABLE;
+	if (IsA(statement, CreateSchemaStmt))
+		return CMDTAG_CREATE_SCHEMA;
+	if (IsA(statement, CreateSeqStmt))
+		return CMDTAG_CREATE_SEQUENCE;
 	return IsA(statement, CreateTableAsStmt) ? CMDTAG_CREATE_TABLE_AS : CMDTAG_CREATE_TABLE;
 }
 
@@ -282,6 +286,10 @@ GetCommandTagName(CommandTag tag)
 {
 	if (tag == CMDTAG_TRUNCATE_TABLE)
 		return "TRUNCATE TABLE";
+	if (tag == CMDTAG_CREATE_SCHEMA)
+		return "CREATE SCHEMA";
+	if (tag == CMDTAG_CREATE_SEQUENCE)
+		return "CREATE SEQUENCE";
 	return tag == CMDTAG_CREATE_TABLE_AS ? "CREATE TABLE AS" : "CREATE TABLE";
 }
 
@@ -1355,10 +1363,224 @@ UT_TEST(test_truncate_original_readonly_parallel_guards_precede_binding)
 	}
 }
 
+UT_TEST(test_schema_sequence_bind_before_later_work_and_reuse_top)
+{
+	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt };
+	CreateSeqStmt sequence = { .type = T_CreateSeqStmt };
+	Node *statements[] = { (Node *)&schema, (Node *)&sequence };
+
+	for (unsigned i = 0; i < lengthof(statements); i++) {
+		for (unsigned skip = 0; skip < 2; skip++) {
+			reset_create_preflight();
+			utility_expect_binding = true;
+			schema.if_not_exists = sequence.if_not_exists = skip != 0;
+			create_sql_entry(statements[i]);
+			UT_ASSERT_EQ(utility_unbound, 0);
+			UT_ASSERT_EQ(utility_after_preflight, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			create_sql_entry(statements[i]);
+			UT_ASSERT_EQ(utility_unbound, 0);
+			UT_ASSERT_EQ(utility_after_preflight, 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_prepares, 2);
+			UT_ASSERT_EQ(utility_binds, 1);
+		}
+	}
+}
+
+UT_TEST(test_schema_binds_before_children_and_children_reuse_top)
+{
+	CreateStmt table = { .type = T_CreateStmt };
+	CreateSeqStmt sequence = { .type = T_CreateSeqStmt };
+	ListCell cells[2] = { { .ptr_value = &table }, { .ptr_value = &sequence } };
+	List children = { .type = T_List, .length = 2, .max_length = 2, .elements = cells };
+	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt, .schemaElts = &children };
+
+	reset_create_preflight();
+	utility_expect_binding = true;
+	create_sql_entry((Node *)&schema);
+	UT_ASSERT_EQ(utility_unbound, 0);
+	UT_ASSERT_EQ(utility_after_preflight, 1);
+	UT_ASSERT_EQ(utility_prepares, 1);
+	/* Native schema-child dispatch is a boundary; each child runs the real
+	 * utility prologue here, after the namespace would already exist. */
+	create_sql_entry((Node *)&table);
+	create_sql_entry((Node *)&sequence);
+	UT_ASSERT_EQ(utility_unbound, 0);
+	UT_ASSERT_EQ(utility_after_preflight, 3);
+	UT_ASSERT_EQ(utility_xids, 1);
+	UT_ASSERT_EQ(utility_prepares, 3);
+	UT_ASSERT_EQ(utility_binds, 1);
+}
+
+UT_TEST(test_schema_sequence_publication_refusal_precedes_later_work)
+{
+	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt };
+	CreateSeqStmt sequence = { .type = T_CreateSeqStmt };
+	Node *statements[] = { (Node *)&schema, (Node *)&sequence };
+
+	for (unsigned i = 0; i < lengthof(statements); i++) {
+		int caught;
+
+		reset_create_preflight();
+		utility_bind_ok = false;
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			create_sql_entry(statements[i]);
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(error_code, ERRCODE_DATA_CORRUPTED);
+		UT_ASSERT_EQ(utility_xids, 1);
+		UT_ASSERT_EQ(utility_prepares, 1);
+		UT_ASSERT_EQ(utility_binds, 0);
+		UT_ASSERT_EQ(utility_after_preflight, 0);
+	}
+}
+
+UT_TEST(test_schema_sequence_child_or_wrong_top_refuses_before_allocation)
+{
+	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt };
+	CreateSeqStmt sequence = { .type = T_CreateSeqStmt };
+	Node *statements[] = { (Node *)&schema, (Node *)&sequence };
+
+	for (unsigned i = 0; i < lengthof(statements); i++) {
+		for (unsigned child = 0; child < 2; child++) {
+			int caught;
+
+			reset_create_preflight();
+			utility_in_child = child != 0;
+			if (!child) {
+				utility_top_xid = 400;
+				utility_current_xid = 401;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry(statements[i]);
+			UT_ASSERT(caught);
+			UT_ASSERT_EQ(error_code,
+						 child ? ERRCODE_FEATURE_NOT_SUPPORTED : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_EQ(utility_xids, 0);
+			UT_ASSERT_EQ(utility_prepares, 0);
+			UT_ASSERT_EQ(utility_after_preflight, 0);
+		}
+	}
+}
+
+UT_TEST(test_schema_sequence_preflight_requires_shared_catalog_storage)
+{
+	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt };
+	CreateSeqStmt sequence = { .type = T_CreateSeqStmt };
+	Node *statements[] = { (Node *)&schema, (Node *)&sequence };
+
+	for (unsigned i = 0; i < lengthof(statements); i++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			reset_create_preflight();
+			cluster_shared_catalog = (mode & 1) != 0;
+			utility_storage_mode = (mode & 2) != 0;
+			cluster_shared_config = (mode & 4) != 0;
+			create_sql_entry(statements[i]);
+			UT_ASSERT_EQ(utility_after_preflight, 1);
+			UT_ASSERT_EQ(utility_xids, (mode & 3) == 3);
+			UT_ASSERT_EQ(utility_prepares, (mode & 3) == 3);
+			UT_ASSERT_EQ(utility_binds, (mode & 3) == 3);
+		}
+	}
+}
+
+UT_TEST(test_schema_sequence_readonly_parallel_guards_precede_binding)
+{
+	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt };
+	CreateSeqStmt sequence = { .type = T_CreateSeqStmt };
+	Node *statements[] = { (Node *)&schema, (Node *)&sequence };
+
+	for (unsigned i = 0; i < lengthof(statements); i++) {
+		for (unsigned parallel = 0; parallel < 2; parallel++) {
+			int caught;
+
+			reset_create_preflight();
+			XactReadOnly = parallel == 0;
+			utility_parallel = parallel != 0;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry(statements[i]);
+			UT_ASSERT(caught);
+			UT_ASSERT_EQ(error_code, parallel ? ERRCODE_INVALID_TRANSACTION_STATE
+											  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT(strstr(error_message, i == 0 ? "CREATE SCHEMA" : "CREATE SEQUENCE") != NULL);
+			UT_ASSERT_EQ(utility_xids, 0);
+			UT_ASSERT_EQ(utility_prepares, 0);
+			UT_ASSERT_EQ(utility_after_preflight, 0);
+		}
+	}
+}
+
+UT_TEST(test_schema_unsupported_children_refuse_before_binding)
+{
+	RangeVar target = { .type = T_RangeVar, .relpersistence = RELPERSISTENCE_UNLOGGED };
+	CreateStmt table = { .type = T_CreateStmt, .relation = &target };
+	IndexStmt index = { .type = T_IndexStmt, .accessMethod = "hash" };
+	Node *statements[] = { (Node *)&table, (Node *)&index };
+	ListCell cell = { .ptr_value = NULL };
+	List children = { .type = T_List, .length = 1, .max_length = 1, .elements = &cell };
+	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt, .schemaElts = &children };
+
+	for (unsigned i = 0; i < lengthof(statements); i++) {
+		int caught;
+
+		reset_create_preflight();
+		cell.ptr_value = statements[i];
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			create_sql_entry((Node *)&schema);
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+		UT_ASSERT_EQ(utility_xids, 0);
+		UT_ASSERT_EQ(utility_prepares, 0);
+		UT_ASSERT_EQ(utility_after_preflight, 0);
+	}
+}
+
+UT_TEST(test_unlogged_sequence_refuses_before_binding_only_in_shared_catalog)
+{
+	RangeVar target = { .type = T_RangeVar, .relpersistence = RELPERSISTENCE_UNLOGGED };
+	CreateSeqStmt sequence = { .type = T_CreateSeqStmt, .sequence = &target };
+	ListCell cell = { .ptr_value = &sequence };
+	List children = { .type = T_List, .length = 1, .max_length = 1, .elements = &cell };
+	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt, .schemaElts = &children };
+	Node *statements[] = { (Node *)&sequence, (Node *)&schema };
+
+	for (unsigned i = 0; i < lengthof(statements); i++) {
+		for (unsigned mode = 0; mode < 4; mode++) {
+			int caught;
+
+			reset_create_preflight();
+			cluster_shared_catalog = (mode & 1) != 0;
+			cluster_shared_config = (mode & 2) != 0;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry(statements[i]);
+			UT_ASSERT_EQ(caught != 0, cluster_shared_catalog);
+			UT_ASSERT_EQ(error_code, cluster_shared_catalog ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+			UT_ASSERT_EQ(utility_xids, 0);
+			UT_ASSERT_EQ(utility_prepares, 0);
+			UT_ASSERT_EQ(utility_after_preflight, cluster_shared_catalog ? 0 : 1);
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(42);
+	UT_RUN(test_schema_sequence_bind_before_later_work_and_reuse_top);
+	UT_RUN(test_schema_binds_before_children_and_children_reuse_top);
+	UT_RUN(test_schema_sequence_publication_refusal_precedes_later_work);
+	UT_RUN(test_schema_sequence_child_or_wrong_top_refuses_before_allocation);
+	UT_RUN(test_schema_sequence_preflight_requires_shared_catalog_storage);
+	UT_RUN(test_schema_sequence_readonly_parallel_guards_precede_binding);
+	UT_RUN(test_schema_unsupported_children_refuse_before_binding);
+	UT_RUN(test_unlogged_sequence_refuses_before_binding_only_in_shared_catalog);
 	UT_RUN(test_shared_truncate_variants_and_targets_bind_before_later_work);
 	UT_RUN(test_truncate_reuses_existing_top_binding_across_utility_calls);
 	UT_RUN(test_truncate_publication_refusal_precedes_later_utility_work);
