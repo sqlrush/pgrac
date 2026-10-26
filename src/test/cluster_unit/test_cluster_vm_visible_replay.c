@@ -45,7 +45,9 @@ static char replay_error[1001];
 static PGAlignedXLogBlock replay_wal[3];
 static XLogRecPtr replay_start, replay_first_page;
 static unsigned replay_wal_fault;
+#ifndef VM_HEAP_REPLAY_FIXTURE
 bool cluster_page_cold_redo_active_v1;
+#endif
 
 static void
 replay_seal_raw(void)
@@ -223,6 +225,7 @@ replay_build_raw(void)
 	replay_seal_raw();
 }
 
+#ifndef VM_HEAP_REPLAY_FIXTURE
 bool
 cluster_cold_redo_block_decision_v1(XLogReaderState *record, uint8 id, ClusterColdRedoBlockV1 *out)
 {
@@ -264,6 +267,7 @@ XLogReadBufferForRedoExtended(XLogReaderState *record, uint8 id, ReadBufferMode 
 	(void)buffer;
 	abort(); /* Native VM replay must check the base before restoring it. */
 }
+#endif
 
 static bool
 replay_read_identity(RelFileLocator locator, ClusterSpaceIdentity *out)
@@ -564,8 +568,11 @@ UT_TEST(test_native_reader_rejects_broken_wal_continuation)
 	}
 }
 
+#ifndef VM_REPLAY_MAIN
+#define VM_REPLAY_MAIN main
+#endif
 int
-main(void)
+VM_REPLAY_MAIN(void)
 {
 	UT_PLAN(9);
 	UT_RUN(test_published_empty_and_unused_vm_images_replay_exactly);

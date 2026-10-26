@@ -12035,6 +12035,7 @@ static unsigned phase_preflights, phase_resolves, phase_rechecks;
 static unsigned phase_error_stage, phase_finally_calls, phase_finally_debt;
 static unsigned phase_finally_pins;
 static bool phase_finally_owned_writer;
+static bool phase_mixed_proof_subset;
 
 static void
 phase_preflight(void)
@@ -12058,6 +12059,8 @@ phase_resolve(const ClusterTxLocator *locator, ClusterTxResolveMode mode,
 	UT_ASSERT(memcmp(locator, &proof->requested_locator, sizeof(*locator)) == 0);
 	if (phase_error_stage == 2) elog(ERROR, "injected admitted resolver ERROR");
 	*out = proof->resolution; *reason = CLUSTER_TX_RESOLVE_NONE;
+	if (phase_mixed_proof_subset && phase_resolves == 2)
+		out->outcome = CLUSTER_TX_UNKNOWN;
 	return out->outcome;
 }
 
@@ -12301,8 +12304,9 @@ phase_then_recent_native_owned(QualifiedXminFixture *f, LVRelState *v)
 			f->fence.master_sequence, &f->admission, &rows_current);
 		phase_pin_released = false;
 		UT_ASSERT_EQ(backend_pin_count, 0);
-		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN && rows_current
-			&& v->shared_freeze_xmin_candidates.target_count > 0)
+		if ((status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+			 || (phase_mixed_proof_subset && status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN))
+			&& rows_current && v->shared_freeze_xmin_candidates.target_count > 0)
 		{
 			if (phase_use_original_recent_pin && phase_use_original_resident)
 				phase_recent_native_begin(v);
@@ -15680,8 +15684,15 @@ phase_recent_native_finish(const QualifiedXminFixture *f, const LVRelState *v, b
 	}
 	if (changed) {
 		UT_ASSERT(v->shared_freeze_xmin_candidates.target_count > 0);
-		for (unsigned i = 1; i <= v->shared_freeze_xmin_candidates.target_count; i++)
-			UT_ASSERT(HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, i)));
+		for (unsigned i = 0; i < v->shared_freeze_xmin_candidates.target_count; i++) {
+			uint16 tuple_index = v->shared_freeze_xmin_candidates.targets[i].tuple_index;
+			OffsetNumber offset;
+
+			UT_ASSERT(tuple_index < v->shared_freeze_batch.tuple_count);
+			offset = v->shared_freeze_batch.tuples[tuple_index].offset;
+			UT_ASSERT(OffsetNumberIsValid(offset));
+			UT_ASSERT(HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, offset)));
+		}
 	} else
 		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
 	free(page_owner_native_resource_owner.bufferarr.itemsarr);
@@ -16038,10 +16049,101 @@ UT_TEST(test_real_outer_collector_errors_retire_continuation_before_admission_le
 	free(v); free(f);
 }
 
+/* Reusing a borrowed owner does not carry a previous attempt's continuation
+ * through a new preflight refusal. Caller pins and the entered owner remain. */
+UT_TEST(test_admitted_reuse_refusals_retire_previous_continuation)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		ClusterSemanticAdmissionToken original, rejected;
+		const ClusterSemanticAdmissionToken *token;
+		const PcmAuthoritySnapshot *authority;
+		bool rows_current = false, *out = &rows_current;
+		unsigned preflights, resolves, rechecks, proof_count;
+		Buffer recent = 1;
+		phase_setup(&f, &v, targets, true);
+		/* Release only the fixture's legacy pin model, then call the complete
+		 * production admitted body directly, including the caller-pin guard. */
+		backend_pin_count = 0; phase_pin_released = true;
+		UT_ASSERT_EQ(phase_actual_admitted(&v, 1, &f.authority,
+			f.fence.master_sequence, &f.admission, &rows_current), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT(rows_current && v.shared_freeze_fence_valid);
+		UT_ASSERT(v.shared_freeze_xmin_candidates.target_count > 0);
+		preflights = phase_preflights; resolves = phase_resolves; rechecks = phase_rechecks;
+		proof_count = v.shared_freeze_proofs.proof_count;
+		memcpy(&original, &f.admission, sizeof(original));
+		memcpy(&rejected, &f.admission, sizeof(rejected));
+		token = &f.admission; authority = &f.authority;
+		if (fault == 0) recent = InvalidBuffer;
+		if (fault == 1) backend_pin_count = 1;
+		if (fault == 2) { rejected.entered = false; token = &rejected; }
+		if (fault == 3) authority = NULL;
+		if (fault == 4) out = NULL;
+		UT_ASSERT_EQ(phase_actual_admitted(&v, recent, authority,
+			f.fence.master_sequence, token, out), CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+		UT_ASSERT(!v.shared_freeze_fence_valid && !v.shared_freeze_cohort_observed);
+		UT_ASSERT(v.shared_freeze_input.freeze_policy == NULL
+			&& v.shared_freeze_input.freeze_cohort == NULL);
+		UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 0);
+		UT_ASSERT_EQ(v.shared_freeze_aborted_xmax_candidates.target_count, 0);
+		UT_ASSERT(!FullTransactionIdIsValid(v.shared_freeze_candidate_limit_full));
+		for (unsigned i = 0; i < sizeof(v.shared_freeze_cohort); i++)
+			UT_ASSERT_EQ(((const unsigned char *)&v.shared_freeze_cohort)[i], 0);
+		UT_ASSERT_EQ(v.shared_freeze_proofs.proof_count, proof_count);
+		if (out != NULL) UT_ASSERT(!rows_current);
+		UT_ASSERT_EQ(phase_preflights, preflights);
+		UT_ASSERT_EQ(phase_resolves, resolves); UT_ASSERT_EQ(phase_rechecks, rechecks);
+		UT_ASSERT_EQ(backend_pin_count, fault == 1 ? 1 : 0);
+		UT_ASSERT(memcmp(&f.admission, &original, sizeof(original)) == 0);
+		UT_ASSERT(bounds_original_backend_has_admission());
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		backend_pin_count = 0;
+		bounds_original_census_leave(&f.admission); bounds_lifecycle_assert_empty(&f.admission);
+	}
+}
+
+/* Join the real admitted/resident path to the existing qualified subset
+ * native entry. Whole-page KEEP is never upgraded to whole-page proof. */
+UT_TEST(test_mixed_admitted_resident_subset_reaches_same_owner_recent_wal)
+{
+	QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+	bool applied;
+
+	phase_recent_native_setup(&f, &v, targets, true, true);
+	phase_mixed_proof_subset = true;
+	applied = phase_then_recent_native_owned(&f, &v);
+	phase_mixed_proof_subset = false;
+	UT_ASSERT(applied);
+	UT_ASSERT_EQ(phase_preflights, 1); UT_ASSERT_EQ(phase_resolves, 3);
+	UT_ASSERT_EQ(phase_rechecks, 1);
+	UT_ASSERT_EQ(v.shared_freeze_batch.carrier_request_count, 3);
+	UT_ASSERT_EQ(v.shared_freeze_proofs.proof_count, 2);
+	UT_ASSERT(!v.shared_freeze_fence_valid);
+	UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 2);
+	UT_ASSERT_EQ(((xl_heap_freeze_page *)freeze_main_data.data)->snapshotConflictHorizon, 77);
+	for (int i = 1; i <= 3; i++) {
+		HeapTupleHeader tuple = freeze_tuple(current_page.data, i);
+		HeapTupleHeader old = freeze_tuple(before_page.data, i);
+		UT_ASSERT_EQ(tuple->t_infomask,
+			i == 2 ? old->t_infomask : old->t_infomask | HEAP_XMIN_FROZEN);
+		UT_ASSERT_EQ(tuple->t_infomask2, old->t_infomask2);
+		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(tuple), HeapTupleHeaderGetRawXmin(old));
+		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmax(tuple), HeapTupleHeaderGetRawXmax(old));
+		UT_ASSERT(memcmp(ClusterPageGetItlSlot(current_page.data, i - 1),
+			ClusterPageGetItlSlot(before_page.data, i - 1), sizeof(ClusterItlSlotData)) == 0);
+	}
+	UT_ASSERT(memcmp(freeze_tuple(current_page.data, 2),
+		freeze_tuple(before_page.data, 2), 64) == 0);
+	check_publication(true);
+	replay_freeze_record();
+	phase_recent_native_finish(&f, &v, true);
+}
+
 int
 main(void)
 {
-	UT_PLAN(341);
+	UT_PLAN(343);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -16393,6 +16495,8 @@ main(void)
 	UT_RUN(test_original_snapshot_h_survives_group_exit_to_recent_wal);
 	UT_RUN(test_real_outer_collector_retires_continuation_before_admission_leave);
 	UT_RUN(test_real_outer_collector_errors_retire_continuation_before_admission_leave);
+	UT_RUN(test_admitted_reuse_refusals_retire_previous_continuation);
+	UT_RUN(test_mixed_admitted_resident_subset_reaches_same_owner_recent_wal);
 
 	UT_DONE();
 	return ut_failed_count != 0;

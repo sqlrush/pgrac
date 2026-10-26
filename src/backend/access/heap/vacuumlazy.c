@@ -2210,6 +2210,20 @@ lazy_collect_shared_freeze_proofs_admitted(LVRelState *vacrel, Buffer recent_buf
 	bool cleaned = false;
 	bool row_inputs_current = false;
 
+	/* The borrowed owner can span attempts. Retire the previous attempt's
+	 * continuation before any refusal or proof callback; read-only proof
+	 * results do not grant a new attempt its old fence or bound sources. */
+	if (vacrel != NULL)
+	{
+		vacrel->shared_freeze_fence_valid = false;
+		vacrel->shared_freeze_cohort_observed = false;
+		vacrel->shared_freeze_input.freeze_policy = NULL;
+		vacrel->shared_freeze_input.freeze_cohort = NULL;
+		vacrel->shared_freeze_xmin_candidates.target_count = 0;
+		vacrel->shared_freeze_aborted_xmax_candidates.target_count = 0;
+		vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
+		memset(&vacrel->shared_freeze_cohort, 0, sizeof(vacrel->shared_freeze_cohort));
+	}
 	if (row_inputs_current_out != NULL)
 		*row_inputs_current_out = false;
 	if (vacrel == NULL || authority_before == NULL || admission == NULL
