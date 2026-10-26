@@ -9505,9 +9505,15 @@ typedef struct LVRelState
 {
 	struct VacuumCutoffs cutoffs;
 	ClusterHeapFreezePageInputV1 shared_freeze_input;
+	ClusterHeapFreezePageBatchV1 shared_freeze_batch;
+	ClusterHeapFreezeProofBatchV1 shared_freeze_proofs;
+	ClusterHeapFreezeFinalFenceV1 shared_freeze_fence;
+	ClusterHeapFreezeXminCandidateBatchV1 shared_freeze_xmin_candidates;
+	ClusterHeapFreezeAbortedXmaxCandidateBatchV1 shared_freeze_aborted_xmax_candidates;
 	ClusterHeapFreezeCohortObservation shared_freeze_cohort;
 	FullTransactionId shared_freeze_candidate_limit_full;
 	bool shared_freeze_cohort_observed;
+	bool shared_freeze_fence_valid;
 } LVRelState;
 
 static const QualifiedXminFixture *bounds_source;
@@ -11638,10 +11644,212 @@ UT_TEST(test_original_census_entry_permission_does_not_grant_native_writer)
 	bounds_original_census_leave(&f.admission); bounds_lifecycle_assert_empty(&f.admission);
 }
 
+/* The proof transport and resident recheck are explicit leaves here. The
+ * admitted phase, canonical binding/selection, observer and native writer/WAL
+ * entry are original bodies. This does not qualify their production sources. */
+static QualifiedXminFixture *phase_source;
+static unsigned phase_preflights, phase_resolves, phase_rechecks;
+static unsigned phase_error_stage, phase_finally_calls, phase_finally_debt;
+static unsigned phase_finally_pins;
+static bool phase_finally_owned_writer;
+
+static void
+phase_preflight(void)
+{
+	UT_ASSERT(phase_source->admission.entered && bounds_original_backend_has_admission());
+	UT_ASSERT(!local_x && !local_share && backend_pin_count == 1);
+	phase_preflights++;
+	if (phase_error_stage == 1) elog(ERROR, "injected admitted preflight ERROR");
+}
+
+static ClusterTxOutcome
+phase_resolve(const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *token, ClusterTxResolution *out,
+	ClusterTxResolveReason *reason)
+{
+	const ClusterHeapFreezeCanonicalProofV1 *proof;
+	UT_ASSERT(token == &phase_source->admission && token->entered);
+	UT_ASSERT_EQ(mode, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS);
+	UT_ASSERT(phase_resolves < phase_source->proofs.proof_count);
+	proof = &phase_source->proofs.proofs[phase_resolves++];
+	UT_ASSERT(memcmp(locator, &proof->requested_locator, sizeof(*locator)) == 0);
+	if (phase_error_stage == 2) elog(ERROR, "injected admitted resolver ERROR");
+	*out = proof->resolution; *reason = CLUSTER_TX_RESOLVE_NONE;
+	return out->outcome;
+}
+
+static ClusterTxOutcome
+phase_retained_resolve(const ClusterTxLocator *locator, SCN scn,
+	const ClusterSemanticAdmissionToken *token, ClusterTxResolution *out,
+	ClusterTxResolveReason *reason)
+{
+	(void)locator; (void)scn; (void)token; (void)out; (void)reason;
+	UT_ASSERT(false); /* These original ACTIVE carriers never use that path. */
+	return CLUSTER_TX_UNKNOWN;
+}
+
+static ClusterHeapFreezeProofStatusV1
+phase_resident_recheck(LVRelState *v, Buffer buffer,
+	const PcmAuthoritySnapshot *authority, const ClusterSemanticAdmissionToken *token,
+	const ClusterHeapFreezeProofBatchV1 *proofs, const ClusterTxResolution *retained,
+	uint8 retained_mask, ClusterHeapFreezeFinalFenceV1 *current,
+	bool *cleaned, bool *rows_current)
+{
+	(void)retained;
+	UT_ASSERT(v != NULL && buffer == 1 && authority == &phase_source->authority);
+	UT_ASSERT(token == &phase_source->admission && token->entered);
+	UT_ASSERT(!local_x && !local_share && backend_pin_count == 1);
+	UT_ASSERT_EQ(retained_mask, 0); UT_ASSERT_EQ(proofs->proof_count, phase_resolves);
+	phase_rechecks++;
+	if (phase_error_stage == 3) elog(ERROR, "injected admitted resident check ERROR");
+	for (unsigned i = 0; i < proofs->proof_count; i++) {
+		ClusterHeapFreezeProofStatusV1 status =
+			cluster_heap_freeze_validate_canonical_proof_v1(&proofs->proofs[i]);
+		if (status != CLUSTER_HEAP_FREEZE_PROOF_PROVEN) return status;
+	}
+	*current = proofs->proofs[0].current_fence;
+	*cleaned = false; *rows_current = true;
+	return CLUSTER_HEAP_FREEZE_PROOF_PROVEN;
+}
+
+#define cluster_tx_resolve_terminal_census_batch_preflight phase_preflight
+#define cluster_tx_resolve_exact_admitted phase_resolve
+#define cluster_tx_resolve_terminal_census_retained_admitted phase_retained_resolve
+#define lazy_recheck_shared_freeze_page phase_resident_recheck
+#include "test_cluster_vacuum_admitted_phase.inc"
+#undef lazy_recheck_shared_freeze_page
+#undef cluster_tx_resolve_terminal_census_retained_admitted
+#undef cluster_tx_resolve_exact_admitted
+#undef cluster_tx_resolve_terminal_census_batch_preflight
+
+static void
+phase_setup(QualifiedXminFixture *f, LVRelState *v,
+	ClusterHeapFreezeXminTargetV1 targets[3], bool batch)
+{
+	bounds_lifecycle_setup(f, v, targets, batch);
+	phase_source = f; phase_preflights = phase_resolves = phase_rechecks = 0;
+	phase_error_stage = phase_finally_calls = phase_finally_debt = phase_finally_pins = 0;
+	phase_finally_owned_writer = false;
+	v->shared_freeze_batch = f->page;
+	UT_ASSERT_EQ(bounds_original_census_enter(&f->admission), CLUSTER_SEMANTIC_ADMISSION_OK);
+}
+
+static void
+phase_copy_to_native(QualifiedXminFixture *f, const LVRelState *v)
+{
+	f->input = v->shared_freeze_input; f->page = v->shared_freeze_batch;
+	f->proofs = v->shared_freeze_proofs; f->fence = v->shared_freeze_fence;
+	native_original_admission_enabled = true; native_admission_expected_token = &f->admission;
+}
+
+/* A fixture-owned continuation, not a new production VACUUM caller. Its
+ * original admission owner spans both real phases and rethrows after leave. */
+static bool
+phase_then_native_owned(QualifiedXminFixture *f, LVRelState *v)
+{
+	volatile bool applied = false;
+	PG_TRY();
+	{
+		bool rows_current = false;
+		ClusterHeapFreezeProofStatusV1 status = lazy_collect_shared_freeze_proofs_admitted(v,
+			1, &f->authority, f->fence.master_sequence, &f->admission, &rows_current);
+		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN && rows_current) {
+			phase_copy_to_native(f, v);
+			applied = qualified_xmin_batch_apply(f, v->shared_freeze_xmin_candidates.targets,
+				v->shared_freeze_xmin_candidates.target_count);
+		}
+	}
+	PG_FINALLY();
+	{
+		phase_finally_calls++;
+		phase_finally_debt = pg_atomic_read_u32(&native_admission_shared.inflight
+			[CLUSTER_SEMANTIC_TARGET_SIDE][bounds_lifecycle_feature()]);
+		phase_finally_pins = backend_pin_count;
+		phase_finally_owned_writer = local_x || resumed_writer;
+		bounds_original_census_leave(&f->admission);
+	}
+	PG_END_TRY();
+	return applied;
+}
+
+UT_TEST(test_admitted_proof_phase_keeps_original_owner_through_native_wal)
+{
+	for (unsigned batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		bool rows_current = false;
+		phase_setup(&f, &v, targets, batch != 0);
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs_admitted(&v, 1, &f.authority,
+			f.fence.master_sequence, &f.admission, &rows_current), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT(rows_current && v.shared_freeze_fence_valid && f.admission.entered);
+		UT_ASSERT_EQ(phase_preflights, 1); UT_ASSERT_EQ(phase_rechecks, 1);
+		UT_ASSERT_EQ(phase_resolves, f.page.carrier_request_count);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&native_admission_shared.inflight
+			[CLUSTER_SEMANTIC_TARGET_SIDE][bounds_lifecycle_feature()]), 1);
+		UT_ASSERT(v.shared_freeze_xmin_candidates.target_count > 0);
+		phase_copy_to_native(&f, &v);
+		UT_ASSERT(qualified_xmin_batch_apply(&f, v.shared_freeze_xmin_candidates.targets,
+			v.shared_freeze_xmin_candidates.target_count));
+		UT_ASSERT(f.admission.entered); UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(!local_x && !resumed_writer); UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		bounds_original_census_leave(&f.admission); bounds_lifecycle_assert_empty(&f.admission);
+	}
+}
+
+UT_TEST(test_admitted_proof_cannot_continue_native_wal_after_original_owner_leave)
+{
+	for (unsigned batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		bool rows_current = false;
+		phase_setup(&f, &v, targets, batch != 0);
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs_admitted(&v, 1, &f.authority,
+			f.fence.master_sequence, &f.admission, &rows_current), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT(rows_current && v.shared_freeze_xmin_candidates.target_count > 0);
+		phase_copy_to_native(&f, &v);
+		bounds_original_census_leave(&f.admission); bounds_lifecycle_assert_empty(&f.admission);
+		UT_ASSERT(!qualified_xmin_batch_apply(&f, v.shared_freeze_xmin_candidates.targets,
+			v.shared_freeze_xmin_candidates.target_count));
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes, 0);
+		UT_ASSERT_EQ(memcmp(current_page.data, before_page.data, BLCKSZ), 0);
+		UT_ASSERT(!local_x && !resumed_writer); UT_ASSERT_EQ(backend_pin_count, 1);
+		bounds_lifecycle_assert_empty(&f.admission);
+	}
+}
+
+UT_TEST(test_admitted_proof_and_native_errors_rethrow_after_original_owner_finally)
+{
+	for (unsigned batch = 0; batch < 2; batch++) {
+		for (unsigned stage = 1; stage <= 4; stage++) {
+			QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+			phase_setup(&f, &v, targets, batch != 0);
+			if (stage == 4) error_after_ledger_bind = true;
+			else phase_error_stage = stage;
+			expecting_error = true;
+			if (setjmp(error_jump) == 0) {
+				(void)phase_then_native_owned(&f, &v);
+				UT_ASSERT(false);
+			}
+			UT_ASSERT_EQ(phase_finally_calls, 1); UT_ASSERT_EQ(phase_finally_debt, 1);
+			UT_ASSERT_EQ(phase_finally_pins, 1); UT_ASSERT(!phase_finally_owned_writer);
+			UT_ASSERT_EQ(phase_preflights, 1);
+			UT_ASSERT_EQ(phase_rechecks, stage >= 3);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT_EQ(memcmp(current_page.data, before_page.data, BLCKSZ), 0);
+			UT_ASSERT(!local_x && !resumed_writer); UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0)) == NULL);
+			bounds_lifecycle_assert_empty(&f.admission);
+			UT_ASSERT(PG_exception_stack == NULL && error_context_stack == NULL);
+			expecting_error = false;
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(275);
+	UT_PLAN(278);
+	UT_RUN(test_admitted_proof_cannot_continue_native_wal_after_original_owner_leave);
+	UT_RUN(test_admitted_proof_and_native_errors_rethrow_after_original_owner_finally);
+	UT_RUN(test_admitted_proof_phase_keeps_original_owner_through_native_wal);
 	UT_RUN(test_original_census_enter_refuses_before_debt_and_clears_output);
 	UT_RUN(test_original_census_enter_rolls_back_increment_on_second_snapshot_refusal);
 	UT_RUN(test_original_census_counter_saturation_preserves_existing_debt);
