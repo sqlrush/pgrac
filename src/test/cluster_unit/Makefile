@@ -3353,6 +3353,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_ctrc_
 test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_ctrc_native_fpi: test_cluster_control_relmap_terminal.inc
 test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_ctrc_native_fpi: test_cluster_control_ctrc_stable.inc
 test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_ctrc_native_fpi: test_cluster_control_ctrc_replay_stable.inc
+test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_ctrc_native_fpi: test_cluster_control_ctrc_generations.inc
 test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_ctrc_native_fpi: test_cluster_control_ctrc_page.inc
 test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_ctrc_native_fpi: test_cluster_control_ctrc_read_native.inc
 
@@ -3379,6 +3380,9 @@ cluster_page_install_ctrc_test.o: $(top_srcdir)/src/backend/cluster/cluster_page
 		$(top_srcdir)/src/include/cluster/cluster_page_install_ctrc.h \
 		$(top_srcdir)/src/include/cluster/cluster_page_authority_ctrc.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+# Both manual reader/FPI objects copy the complete native source view.
+test_cluster_ctrc_native_fpi_product.o cluster_page_install_ctrc_test.o: $(top_srcdir)/src/include/cluster/cluster_wal_inputs.h
 
 # Native CTRC PAGE protection uses the original PAGE primitive independently.
 cluster_page_authority_ctrc_test.o: $(top_srcdir)/src/backend/cluster/cluster_page_authority_ctrc.c \
