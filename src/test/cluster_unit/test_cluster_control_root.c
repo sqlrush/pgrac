@@ -26160,6 +26160,8 @@ UT_TEST(test_tx_inputs_parent_subject_and_wait_revalidation)
 #include "test_cluster_control_ctrc_replay_set.inc"
 #include "test_cluster_control_ctrc_stable.inc"
 #include "test_cluster_control_ctrc_replay_stable.inc"
+#include "test_cluster_control_ctrc_page.inc"
+#include "test_cluster_control_ctrc_read_native.inc"
 
 /*
  * Keep the long control-root suite deterministic when an individual test
@@ -26373,6 +26375,33 @@ main(int argc, char **argv)
 	if (getenv("PGRAC_PRE2_TEST_STAMP_WORKER_ENTRY") != NULL) {
 		UT_PLAN(1);
 		UT_RUN(test_runtime_v3_failure_worker_entry_establishes_resource_owner);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_CTRC_NATIVE_READ") != NULL) {
+		UT_PLAN(9);
+		UT_RUN(test_ctrc_native_read_exact_five_reads_under_original_owners);
+		UT_RUN(test_ctrc_native_read_refuses_wrong_scope_actor_or_target_before_io);
+		UT_RUN(test_ctrc_native_read_refuses_torn_space_and_wrong_page_version);
+		UT_RUN(test_ctrc_native_read_lost_owner_after_each_read_retains_page_and_debt);
+		UT_RUN(test_ctrc_native_read_rechecks_original_inputs_after_each_io);
+		UT_RUN(test_ctrc_native_read_rereads_both_space_pages_before_publication);
+		UT_RUN(test_ctrc_native_read_error_propagates_without_retiring_owners);
+		UT_RUN(test_ctrc_native_read_retired_scope_never_revives_borrowed_authority);
+		UT_RUN(test_ctrc_native_page_scope_match_requires_exact_live_promoted_scope);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_CTRC_PAGE") != NULL) {
+		UT_PLAN(8);
+		UT_RUN(test_ctrc_page_native_set_promotes_exact_target_without_rr);
+		UT_RUN(test_ctrc_page_refuses_budget_shape_and_omitted_native_origin);
+		UT_RUN(test_ctrc_page_freezes_complete_target_and_native_owner_bytes);
+		UT_RUN(test_ctrc_page_native_loss_before_promotion_preserves_original_debt);
+		UT_RUN(test_ctrc_page_wait_retries_same_original_set_without_deadline);
+		UT_RUN(test_ctrc_page_partial_page_wait_releases_only_new_page_locks);
+		UT_RUN(test_ctrc_page_stale_proof_blocks_use_while_page_retirement_is_owned);
+		UT_RUN(test_ctrc_page_destroy_after_scope_retirement_has_no_borrowed_access);
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
@@ -26716,7 +26745,25 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(584);
+	UT_PLAN(601);
+	UT_RUN(test_ctrc_native_read_exact_five_reads_under_original_owners);
+	UT_RUN(test_ctrc_native_read_refuses_wrong_scope_actor_or_target_before_io);
+	UT_RUN(test_ctrc_native_read_refuses_torn_space_and_wrong_page_version);
+	UT_RUN(test_ctrc_native_read_lost_owner_after_each_read_retains_page_and_debt);
+	UT_RUN(test_ctrc_native_read_rechecks_original_inputs_after_each_io);
+	UT_RUN(test_ctrc_native_read_rereads_both_space_pages_before_publication);
+	UT_RUN(test_ctrc_native_read_error_propagates_without_retiring_owners);
+	UT_RUN(test_ctrc_native_read_retired_scope_never_revives_borrowed_authority);
+	UT_RUN(test_ctrc_native_page_scope_match_requires_exact_live_promoted_scope);
+
+	UT_RUN(test_ctrc_page_native_set_promotes_exact_target_without_rr);
+	UT_RUN(test_ctrc_page_refuses_budget_shape_and_omitted_native_origin);
+	UT_RUN(test_ctrc_page_freezes_complete_target_and_native_owner_bytes);
+	UT_RUN(test_ctrc_page_native_loss_before_promotion_preserves_original_debt);
+	UT_RUN(test_ctrc_page_wait_retries_same_original_set_without_deadline);
+	UT_RUN(test_ctrc_page_partial_page_wait_releases_only_new_page_locks);
+	UT_RUN(test_ctrc_page_stale_proof_blocks_use_while_page_retirement_is_owned);
+	UT_RUN(test_ctrc_page_destroy_after_scope_retirement_has_no_borrowed_access);
 	UT_RUN(test_ctrc_replay_stable_two_actual_origins_without_tt);
 	UT_RUN(test_ctrc_replay_stable_refuses_omitted_or_duplicated_set_origin);
 	UT_RUN(test_ctrc_replay_stable_refuses_changed_native_source_or_uncovered_cut);
