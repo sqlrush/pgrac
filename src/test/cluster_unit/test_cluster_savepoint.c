@@ -6,6 +6,10 @@
 #include "postgres.h"
 #include <setjmp.h>
 #include "access/xact.h"
+#include "access/parallel.h"
+#include "cluster/cluster_savepoint.h"
+#include "cluster/cluster_tt_local.h"
+#include "cluster/cluster_tt_slot.h"
 #include "miscadmin.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
@@ -25,12 +29,23 @@ UT_DEFINE_GLOBALS();
 static TransactionStateData top;
 static TransactionState CurrentTransactionState = &top;
 static SubTransactionId currentSubTransactionId = TopSubTransactionId;
+static CommandId currentCommandId;
+static bool currentCommandIdUsed;
+FullTransactionId XactTopFullTransactionId;
+static FullTransactionId next_fxid;
+static int xid_assignments;
+static int binding_lookups;
+static int bad_binding;
+static bool parallel_mode;
+static TransactionId last_binding_xid;
+static void AssignTransactionId(TransactionState state);
 MemoryContext TopTransactionContext = (MemoryContext) 1;
 MemoryContext CurTransactionContext = (MemoryContext) 1;
 MemoryContext CurrentMemoryContext = (MemoryContext) 1;
 ResourceOwner CurTransactionResourceOwner;
 ResourceOwner CurrentResourceOwner;
 bool XactReadOnly;
+int ParallelWorkerNumber = -1;
 bool cluster_enabled = true;
 int cluster_node_id = 0;
 static XactCallback end_callback;
@@ -114,7 +129,7 @@ RegisterXactCallback(XactCallback callback, void *arg)
 bool
 IsInParallelMode(void)
 {
-	return false;
+	return parallel_mode;
 }
 int
 NewGUCNestLevel(void)
@@ -134,6 +149,76 @@ static void AbortSubTransaction(void);
 static void CleanupSubTransaction(void);
 #include "../../backend/cluster/cluster_savepoint.c"
 #include "test_cluster_savepoint_native.inc"
+
+/* Only xid allocation and the published-binding boundary are simulated.
+ * Frame stack, native accessors and the capture implementation are actual code. */
+static void
+AssignTransactionId(TransactionState state)
+{
+	if (state->parent != NULL && !FullTransactionIdIsValid(state->parent->fullTransactionId))
+		AssignTransactionId(state->parent);
+	state->fullTransactionId = next_fxid;
+	FullTransactionIdAdvance(&next_fxid);
+	xid_assignments++;
+	if (state->parent == NULL)
+		XactTopFullTransactionId = state->fullTransactionId;
+}
+
+bool
+cluster_tt_local_get_published_binding(TransactionId xid, ClusterCanonicalTxnBinding *out)
+{
+	binding_lookups++;
+	last_binding_xid = xid;
+	memset(out, 0, sizeof(*out));
+	out->segment_id = 1;
+	out->segment_generation = 42;
+	out->xid = xid;
+	out->slot_wrap = 7;
+	out->origin_instance = 1;
+	out->publish_state = CLUSTER_CANONICAL_TXN_PUBLISHED;
+	out->active_lsn = 100;
+	switch (bad_binding)
+	{
+		case 1: return false;
+		case 2: out->xid++; break;
+		case 3: out->segment_id = 0; break;
+		case 4: out->segment_id = PG_UINT16_MAX + 1U; break;
+		case 5: out->segment_generation = PG_UINT32_MAX; break;
+		case 6: out->slot_offset = TT_SLOTS_PER_SEGMENT; break;
+		case 7: out->slot_wrap = TT_WRAP_INVALID; break;
+		case 8: out->origin_instance++; break;
+		case 9: out->publish_state = CLUSTER_CANONICAL_TXN_PUBLISHING; break;
+		case 10: out->reserved16 = 1; break;
+		case 11: out->active_lsn = InvalidXLogRecPtr; break;
+		case 12: out->segment_generation = 0; break;
+	}
+	return true;
+}
+
+#ifndef CLUSTER_SAVEPOINT_OPERATION_PRESENT
+/* Compile the parent implementation: missing capture is an observed refusal. */
+typedef struct ClusterSavepointOperation {
+	ClusterCanonicalTxnBinding top;
+	FullTransactionId top_fxid;
+	FullTransactionId operation_fxid;
+	uint64 operation_sequence;
+	CommandId command_id;
+	SubTransactionId subid;
+} ClusterSavepointOperation;
+static bool
+cluster_savepoint_capture_operation(ClusterSavepointOperation *out)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return false;
+}
+static bool
+cluster_savepoint_operation_matches_current(const ClusterSavepointOperation *operation)
+{
+	(void) operation;
+	return false;
+}
+#endif
 
 static void
 StartSubTransaction(void)
@@ -207,6 +292,13 @@ fresh_transaction(void)
 	top.blockState = TBLOCK_INPROGRESS;
 	top.curTransactionContext = TopTransactionContext;
 	currentSubTransactionId = TopSubTransactionId;
+	XactTopFullTransactionId = InvalidFullTransactionId;
+	next_fxid = FullTransactionIdFromEpochAndXid(5, 700);
+	currentCommandId = 11;
+	currentCommandIdUsed = false;
+	xid_assignments = binding_lookups = bad_binding = 0;
+	parallel_mode = false;
+	last_binding_xid = InvalidTransactionId;
 	cluster_enabled = true;
 	cluster_node_id = 0;
 }
@@ -370,10 +462,228 @@ UT_TEST(test_top_end_retires_frame_memory)
 		end_callback(XACT_EVENT_COMMIT, end_callback_arg);
 	UT_ASSERT_EQ(allocations, 0);
 }
+static bool
+operation_empty(const ClusterSavepointOperation *operation)
+{
+	ClusterSavepointOperation empty = { 0 };
+	return memcmp(operation, &empty, sizeof(empty)) == 0;
+}
+
+UT_TEST(test_capture_top_keeps_full_writer_and_exact_canonical)
+{
+	ClusterSavepointOperation operation;
+	fresh_transaction();
+	UT_ASSERT(cluster_savepoint_capture_operation(&operation));
+	UT_ASSERT_EQ(U64FromFullTransactionId(operation.top_fxid), (UINT64CONST(5) << 32) + 700);
+	UT_ASSERT(FullTransactionIdEquals(operation.top_fxid, operation.operation_fxid));
+	UT_ASSERT_EQ(operation.top.xid, 700);
+	UT_ASSERT_EQ(operation.top.segment_generation, 42);
+	UT_ASSERT_EQ(operation.top.slot_wrap, 7);
+	UT_ASSERT_EQ(operation.operation_sequence, 1);
+	UT_ASSERT_EQ(operation.command_id, 11);
+	UT_ASSERT_EQ(operation.subid, TopSubTransactionId);
+	UT_ASSERT(!currentCommandIdUsed);
+	UT_ASSERT_EQ(xid_assignments, 1);
+	UT_ASSERT_EQ(binding_lookups, 1);
+	UT_ASSERT_EQ(last_binding_xid, 700);
+	UT_ASSERT(cluster_savepoint_operation_matches_current(&operation));
+}
+
+UT_TEST(test_capture_child_allocates_native_parents_but_looks_up_only_top)
+{
+	ClusterSavepointOperation operation;
+	fresh_transaction();
+	savepoint("outer");
+	BeginInternalSubTransaction(NULL);
+	UT_ASSERT_EQ(xid_assignments + binding_lookups, 0);
+	UT_ASSERT(cluster_savepoint_capture_operation(&operation));
+	UT_ASSERT_EQ(xid_assignments, 3);
+	UT_ASSERT_EQ(binding_lookups, 1);
+	UT_ASSERT_EQ(last_binding_xid, 700);
+	UT_ASSERT_EQ(operation.top.xid, 700);
+	UT_ASSERT_EQ(XidFromFullTransactionId(operation.operation_fxid), 702);
+	UT_ASSERT_EQ(operation.subid, CurrentTransactionState->subTransactionId);
+	UT_ASSERT(FullTransactionIdEquals(operation.operation_fxid,
+		CurrentTransactionState->fullTransactionId));
+	UT_ASSERT(cluster_savepoint_operation_matches_current(&operation));
+}
+
+UT_TEST(test_operation_sequence_survives_release_and_rollback_restart)
+{
+	ClusterSavepointOperation operation;
+	ClusterSavepointOperation old;
+	fresh_transaction();
+	UT_ASSERT(cluster_savepoint_capture_operation(&operation));
+	savepoint("s");
+	UT_ASSERT(cluster_savepoint_capture_operation(&old));
+	UT_ASSERT_EQ(old.operation_sequence, 2);
+	BeginInternalSubTransaction(NULL);
+	UT_ASSERT(cluster_savepoint_capture_operation(&operation));
+	UT_ASSERT_EQ(operation.operation_sequence, 3);
+	RollbackAndReleaseCurrentSubTransaction();
+	UT_ASSERT(cluster_savepoint_operation_matches_current(&old));
+	UT_ASSERT(cluster_savepoint_capture_operation(&operation));
+	UT_ASSERT_EQ(operation.operation_sequence, 4);
+	RollbackToSavepoint("s");
+	CommitTransactionCommand();
+	UT_ASSERT(!cluster_savepoint_operation_matches_current(&old));
+	UT_ASSERT(cluster_savepoint_capture_operation(&operation));
+	UT_ASSERT_EQ(operation.operation_sequence, 5);
+	UT_ASSERT(XidFromFullTransactionId(operation.operation_fxid)
+		> XidFromFullTransactionId(old.operation_fxid));
+	ReleaseSavepoint("s");
+	CommitTransactionCommand();
+	UT_ASSERT(cluster_savepoint_capture_operation(&operation));
+	UT_ASSERT_EQ(operation.operation_sequence, 6);
+}
+
+UT_TEST(test_capture_counter_resets_at_top_end_without_frames)
+{
+	ClusterSavepointOperation operation;
+	fresh_transaction();
+	UT_ASSERT(cluster_savepoint_capture_operation(&operation));
+	UT_ASSERT(cluster_savepoint_capture_operation(&operation));
+	UT_ASSERT_EQ(operation.operation_sequence, 2);
+	fresh_transaction();
+	UT_ASSERT(cluster_savepoint_capture_operation(&operation));
+	UT_ASSERT_EQ(operation.operation_sequence, 1);
+}
+
+UT_TEST(test_capture_refuses_invalid_entry_without_xid_or_binding_work)
+{
+	ClusterSavepointOperation operation;
+	for (int variant = 0; variant < 5; variant++)
+	{
+		fresh_transaction();
+		memset(&operation, 0xa5, sizeof(operation));
+		switch (variant)
+		{
+			case 0: cluster_enabled = false; break;
+			case 1: cluster_node_id = -1; break;
+			case 2: cluster_node_id = SCN_MAX_VALID_NODE_ID + 1; break;
+			case 3: top.state = TRANS_ABORT; break;
+			case 4: parallel_mode = true; break;
+		}
+		UT_ASSERT(!cluster_savepoint_capture_operation(&operation));
+		UT_ASSERT(operation_empty(&operation));
+		UT_ASSERT_EQ(xid_assignments + binding_lookups, 0);
+	}
+	fresh_transaction();
+	UT_ASSERT(!cluster_savepoint_capture_operation(NULL));
+	UT_ASSERT_EQ(xid_assignments + binding_lookups, 0);
+}
+
+UT_TEST(test_capture_refuses_missing_or_malformed_published_owner)
+{
+	ClusterSavepointOperation operation;
+	for (int variant = 1; variant <= 11; variant++)
+	{
+		fresh_transaction();
+		bad_binding = variant;
+		memset(&operation, 0xa5, sizeof(operation));
+		UT_ASSERT(!cluster_savepoint_capture_operation(&operation));
+		UT_ASSERT(operation_empty(&operation));
+		bad_binding = 0;
+		UT_ASSERT(cluster_savepoint_capture_operation(&operation));
+		UT_ASSERT_EQ(operation.operation_sequence, 1);
+	}
+	/* Generation zero is a real fresh canonical segment, not UNKNOWN. */
+	fresh_transaction();
+	bad_binding = 12;
+	UT_ASSERT(cluster_savepoint_capture_operation(&operation));
+	UT_ASSERT_EQ(operation.top.segment_generation, 0);
+}
+
+UT_TEST(test_capture_rejects_alias_child_and_invalid_command_identity)
+{
+	ClusterSavepointOperation operation;
+	fresh_transaction();
+	(void) GetCurrentFullTransactionId();
+	savepoint("s");
+	CurrentTransactionState->fullTransactionId = XactTopFullTransactionId;
+	UT_ASSERT(!cluster_savepoint_capture_operation(&operation));
+	UT_ASSERT(operation_empty(&operation));
+	fresh_transaction();
+	currentCommandId = InvalidCommandId;
+	UT_ASSERT(!cluster_savepoint_capture_operation(&operation));
+	UT_ASSERT(operation_empty(&operation));
+	fresh_transaction();
+	next_fxid = FullTransactionIdFromEpochAndXid(5, FrozenTransactionId);
+	UT_ASSERT(!cluster_savepoint_capture_operation(&operation));
+	UT_ASSERT(operation_empty(&operation));
+}
+
+UT_TEST(test_operation_recheck_never_assigns_and_keeps_captured_command)
+{
+	ClusterSavepointOperation operation;
+	int assignments;
+	fresh_transaction();
+	UT_ASSERT(cluster_savepoint_capture_operation(&operation));
+	assignments = xid_assignments;
+	currentCommandId++;
+	UT_ASSERT(cluster_savepoint_operation_matches_current(&operation));
+	UT_ASSERT_EQ(operation.command_id, 11);
+	savepoint("s");
+	UT_ASSERT(!cluster_savepoint_operation_matches_current(&operation));
+	UT_ASSERT_EQ(xid_assignments, assignments);
+	UT_ASSERT(!FullTransactionIdIsValid(CurrentTransactionState->fullTransactionId));
+}
+
+UT_TEST(test_operation_recheck_rejects_full_epoch_owner_and_scope_drift)
+{
+	ClusterSavepointOperation operation;
+	fresh_transaction();
+	UT_ASSERT(cluster_savepoint_capture_operation(&operation));
+	top.fullTransactionId = FullTransactionIdFromEpochAndXid(6, 700);
+	UT_ASSERT(!cluster_savepoint_operation_matches_current(&operation));
+	top.fullTransactionId = operation.operation_fxid;
+	XactTopFullTransactionId = FullTransactionIdFromEpochAndXid(6, 700);
+	UT_ASSERT(!cluster_savepoint_operation_matches_current(&operation));
+	XactTopFullTransactionId = operation.top_fxid;
+	for (int variant = 1; variant <= 12; variant++)
+	{
+		bad_binding = variant;
+		UT_ASSERT(!cluster_savepoint_operation_matches_current(&operation));
+	}
+	bad_binding = 0;
+	operation.subid++;
+	UT_ASSERT(!cluster_savepoint_operation_matches_current(&operation));
+	operation.subid--;
+	operation.operation_sequence = 0;
+	UT_ASSERT(!cluster_savepoint_operation_matches_current(&operation));
+}
+
+UT_TEST(test_operation_sequence_exhaustion_cannot_wrap_or_allocate)
+{
+#ifdef CLUSTER_SAVEPOINT_OPERATION_PRESENT
+	ClusterSavepointOperation operation;
+	fresh_transaction();
+	operation_sequence_floor = PG_UINT64_MAX - 1;
+	UT_ASSERT(cluster_savepoint_capture_operation(&operation));
+	UT_ASSERT_EQ(operation.operation_sequence, PG_UINT64_MAX);
+	UT_ASSERT(!cluster_savepoint_capture_operation(&operation));
+	UT_ASSERT(operation_empty(&operation));
+	UT_ASSERT_EQ(xid_assignments, 1);
+	UT_ASSERT_EQ(binding_lookups, 1);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(22);
+	UT_RUN(test_capture_top_keeps_full_writer_and_exact_canonical);
+	UT_RUN(test_capture_child_allocates_native_parents_but_looks_up_only_top);
+	UT_RUN(test_operation_sequence_survives_release_and_rollback_restart);
+	UT_RUN(test_capture_counter_resets_at_top_end_without_frames);
+	UT_RUN(test_capture_refuses_invalid_entry_without_xid_or_binding_work);
+	UT_RUN(test_capture_refuses_missing_or_malformed_published_owner);
+	UT_RUN(test_capture_rejects_alias_child_and_invalid_command_identity);
+	UT_RUN(test_operation_recheck_never_assigns_and_keeps_captured_command);
+	UT_RUN(test_operation_recheck_rejects_full_epoch_owner_and_scope_drift);
+	UT_RUN(test_operation_sequence_exhaustion_cannot_wrap_or_allocate);
 	UT_RUN(test_same_name_replaces_name_but_retains_parent_frame);
 	UT_RUN(test_release_does_not_reveal_replaced_name);
 	UT_RUN(test_earlier_name_and_later_points);

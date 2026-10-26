@@ -2828,6 +2828,36 @@ cluster_undo_record_install_prepared_resident_locked(const ClusterUndoRecordPrep
 }
 
 
+/* Capture runs outside all content locks and before retiring an older
+ * reservation. Until operation-tail readers are connected, only the original
+ * top-only format is writable, even if an upper-layer child guard is missed. */
+static bool
+undo_record_capture_operation(uint16 tt_segment, uint16 tt_offset,
+							  ClusterSavepointOperation *out)
+{
+	ClusterSavepointOperation operation;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!cluster_savepoint_capture_operation(&operation)
+		|| operation.top.segment_id != tt_segment || operation.top.slot_offset != tt_offset
+		|| !FullTransactionIdEquals(operation.operation_fxid, operation.top_fxid))
+		return false;
+	*out = operation;
+	return true;
+}
+
+static bool
+undo_record_operation_matches(const ClusterUndoRecordPrepareReceipt *receipt)
+{
+	return receipt != NULL && receipt->owner_instance == receipt->operation.top.origin_instance
+		&& receipt->tt_slot_segment_id == receipt->operation.top.segment_id
+		&& receipt->tt_slot_offset == receipt->operation.top.slot_offset
+		&& FullTransactionIdEquals(receipt->operation.operation_fxid, receipt->operation.top_fxid)
+		&& cluster_savepoint_operation_matches_current(&receipt->operation);
+}
+
 static ClusterUndoRecordPrepareResult cluster_undo_record_prepare_trace_impl(
 	uint8 record_type, uint16 payload_capacity, uint16 tt_slot_segment_id, uint16 tt_slot_offset,
 	UBA prev_uba, uint64 absolute_deadline_us, ClusterUndoRecordPrepareReceipt *receipt);
@@ -2871,6 +2901,7 @@ cluster_undo_record_prepare_trace_impl(uint8 record_type, uint16 payload_capacit
 	ClusterSemanticAdmissionToken modifier_admission = { 0 };
 	ClusterSemanticAdmissionResult admission;
 	ClusterUndoBlock0LiveOwnerPublication publication;
+	ClusterSavepointOperation operation;
 	ClusterUndoBufPin pin;
 	ClusterUndoExtent *ext = &cluster_undo_current_extent;
 	UndoBlockHeader *blkhdr;
@@ -2904,6 +2935,11 @@ cluster_undo_record_prepare_trace_impl(uint8 record_type, uint16 payload_capacit
 	if (record_length > UNDO_RECORD_HARD_CAP_BYTES) {
 		cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_CAPACITY_REFUSAL);
 		cluster_undo_receipt_reason = "CAPACITY_REFUSAL";
+		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
+	}
+
+	if (!undo_record_capture_operation(tt_slot_segment_id, tt_slot_offset, &operation)) {
+		cluster_undo_receipt_reason = "OPERATION_IDENTITY_UNPROVEN";
 		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
 	}
 
@@ -3049,6 +3085,7 @@ cluster_undo_record_prepare_trace_impl(uint8 record_type, uint16 payload_capacit
 	reservation->receipt.actual_segment_id = ext->segment_id;
 	reservation->receipt.reservation_sequence = reservation->sequence;
 	reservation->receipt.absolute_deadline_us = absolute_deadline_us;
+	reservation->receipt.operation = operation;
 	reservation->receipt.ctrc_attempt_generation = 1;
 	reservation->receipt.extent = *ext;
 	reservation->receipt.block0_publication = publication;
@@ -3070,7 +3107,9 @@ cluster_undo_record_receipt_sync(ClusterUndoRecordPrepareReceipt *receipt)
 	ClusterUndoRecordReservation *reservation = &cluster_undo_record_reservation;
 
 	if (receipt == NULL || !reservation->active || receipt->reservation_sequence == 0
-		|| receipt->reservation_sequence != reservation->sequence)
+		|| receipt->reservation_sequence != reservation->sequence
+		|| memcmp(&receipt->operation, &reservation->receipt.operation,
+				  sizeof(receipt->operation)) != 0)
 		return false;
 	reservation->receipt = *receipt;
 	return true;
@@ -3280,7 +3319,8 @@ cluster_undo_record_ctrc_prepare_pending(ClusterUndoRecordPrepareReceipt *receip
 		|| (receipt->ctrc_applied_mask & target_bit) != 0
 		|| (receipt->ctrc_reuse_mask & target_bit) != 0
 		|| receipt->ctrc_handles[target_ordinal].valid || !TransactionIdIsValid(xid)
-		|| MyBackendId <= 0 || !cluster_undo_record_receipt_extent_matches(receipt)) {
+		|| MyBackendId <= 0 || !cluster_undo_record_receipt_extent_matches(receipt)
+		|| !undo_record_operation_matches(receipt)) {
 		if (cluster_trace_normal_stop)
 			undo_receipt_prepare_local_reject(receipt, target_ordinal, xid);
 		return false;
@@ -3398,7 +3438,8 @@ cluster_undo_record_ctrc_apply_prepared(ClusterUndoRecordPrepareReceipt *receipt
 		|| receipt->itl_history_mask != receipt->ctrc_pending_mask
 		|| receipt->itl_history[target_ordinal].block != final_target->block_number
 		|| receipt->itl_history[target_ordinal].slot_index != final_target->itl_slot_index
-		|| !cluster_undo_record_receipt_extent_matches(receipt))
+		|| !cluster_undo_record_receipt_extent_matches(receipt)
+		|| !undo_record_operation_matches(receipt))
 		return CLUSTER_CTRC_APPLY_FAIL_CLOSED;
 	/* PGRAC: even a refusal or failed local mask sync cannot prove that
 	 * an attempted shared APPLY/retarget had no effect. */
@@ -3460,6 +3501,8 @@ cluster_undo_record_prepared_recheck(const ClusterUndoRecordPrepareReceipt *rece
 		reason = "CAPACITY_REFUSAL";
 	else if (!cluster_undo_record_receipt_extent_matches(receipt))
 		reason = "RESERVATION_MISMATCH";
+	else if (!undo_record_operation_matches(receipt))
+		reason = "OPERATION_IDENTITY_MISMATCH";
 	else if (!cluster_semantic_activation_modifier_recheck(
 				 &receipt->modifier_admission, cluster_undo_record_writable_admission()))
 		reason = "MODIFIER_ADMISSION_CHANGED";
@@ -3888,7 +3931,7 @@ cluster_undo_record_consume_preflight(ClusterUndoRecordPrepareReceipt *receipt, 
 
 	if (receipt == NULL || payload_len > receipt->payload_capacity || reservation->consume_locked
 		|| reservation->apply_attempted
-		|| receipt->ctrc_applied_mask != 0)
+		|| receipt->ctrc_applied_mask != 0 || !undo_record_operation_matches(receipt))
 		return CLUSTER_UNDO_RECORD_CONSUME_PREFLIGHT_REFUSED;
 	if (!cluster_undo_record_receipt_extent_matches(receipt)
 		|| !cluster_undo_block0_current_live_owner_publication_recheck_conditional(
@@ -3976,7 +4019,8 @@ cluster_undo_record_consume_prepared(ClusterUndoRecordPrepareReceipt *receipt,
 	if (out_uba != NULL)
 		*out_uba = InvalidUba;
 	if (receipt == NULL || target == NULL || payload == NULL || out_uba == NULL
-		|| payload_len > receipt->payload_capacity || !reservation->consume_locked)
+		|| payload_len > receipt->payload_capacity || !reservation->consume_locked
+		|| !undo_record_operation_matches(receipt))
 		return CLUSTER_UNDO_RECORD_CONSUME_REFUSED;
 	if (!cluster_undo_record_receipt_extent_matches(receipt))
 		return CLUSTER_UNDO_RECORD_CONSUME_REFUSED;
@@ -4021,23 +4065,11 @@ cluster_undo_record_consume_prepared(ClusterUndoRecordPrepareReceipt *receipt,
 	rechdr->record_type = receipt->record_type;
 	rechdr->flags = (first_in_tx ? UNDO_REC_FLAG_FIRST_IN_TX : 0) | UNDO_REC_FLAG_HAS_ITL_HISTORY;
 	rechdr->payload_length = payload_len + sizeof(history);
-	rechdr->xid = GetCurrentTransactionIdIfAny();
+	rechdr->xid = XidFromFullTransactionId(receipt->operation.operation_fxid);
 	rechdr->origin_node_id = (uint16)cluster_node_id;
 	rechdr->tt_slot_segment_id = receipt->tt_slot_segment_id;
 	rechdr->tt_slot_id = cluster_tt_slot_offset_to_id(receipt->tt_slot_offset);
-	{
-		uint32 bind_seg;
-		uint16 bind_off;
-		uint32 bind_tt_id;
-		uint32 bind_epoch;
-		uint16 bind_wrap;
-
-		if (cluster_tt_local_peek_binding(rechdr->xid, &bind_seg, &bind_off, &bind_tt_id,
-										  &bind_epoch, &bind_wrap)
-			&& bind_seg == (uint32)receipt->tt_slot_segment_id
-			&& bind_off == receipt->tt_slot_offset)
-			rechdr->tt_wrap_plus1 = (uint16)(bind_wrap + 1);
-	}
+	rechdr->tt_wrap_plus1 = (uint16)(receipt->operation.top.slot_wrap + 1);
 	rechdr->write_scn = current_scn;
 	rechdr->prev_uba = effective_prev_uba;
 	rechdr->target_locator = target->locator;

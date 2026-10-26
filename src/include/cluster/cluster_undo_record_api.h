@@ -50,6 +50,7 @@
 #include "common/relpath.h"			  /* ForkNumber */
 #include "cluster/cluster_itl_slot.h" /* UBA */
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_savepoint.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_undo_record.h"		/* UndoRecordType */
 #include "cluster/cluster_undo_extent.h"		/* ClusterUndoExtent */
@@ -93,6 +94,7 @@ typedef enum ClusterUndoRecordConsumePreflightResult {
 } ClusterUndoRecordConsumePreflightResult;
 
 #define CLUSTER_UNDO_RECORD_CTRC_TARGETS 2
+#define CLUSTER_UNDO_OPERATION_CAPTURE_PRESENT 1
 
 /* Stack-only identity for one backend-local prepared DATA reservation.  It is
  * neither shared state nor authority: the block0 publication is a retained
@@ -110,6 +112,7 @@ typedef struct ClusterUndoRecordPrepareReceipt {
 	uint32 actual_segment_id;
 	uint64 reservation_sequence;
 	uint64 absolute_deadline_us;
+	ClusterSavepointOperation operation; /* immutable before any shared APPLY */
 	ClusterUndoExtent extent;
 	ClusterUndoBlock0LiveOwnerPublication block0_publication;
 	ClusterSemanticAdmissionToken modifier_admission;

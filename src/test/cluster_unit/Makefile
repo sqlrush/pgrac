@@ -263,7 +263,7 @@ all: $(TESTS) check_resource_x_send_c1
 test_cluster_savepoint_native.inc: $(top_srcdir)/src/backend/access/transam/xact.c $(srcdir)/extract_cluster_savepoint_xact.py Makefile
 	python3 $(srcdir)/extract_cluster_savepoint_xact.py $< $@
 
-test_cluster_savepoint: test_cluster_savepoint.c test_cluster_savepoint_native.inc unit_test.h $(top_srcdir)/src/backend/cluster/cluster_savepoint.c $(top_srcdir)/src/include/cluster/cluster_savepoint.h $(top_builddir)/src/port/libpgport_srv.a
+test_cluster_savepoint: test_cluster_savepoint.c test_cluster_savepoint_native.inc unit_test.h $(top_srcdir)/src/backend/cluster/cluster_savepoint.c $(top_srcdir)/src/include/cluster/cluster_savepoint.h $(top_srcdir)/src/include/cluster/cluster_tt_local.h $(top_srcdir)/src/include/cluster/cluster_tt_slot.h $(top_builddir)/src/port/libpgport_srv.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/port/libpgport_srv.a $(LDFLAGS) -o $@
 
 cluster_unit_port_stubs.o: cluster_unit_port_stubs.c
@@ -9013,7 +9013,9 @@ endif
 $(CLUSTER_UNDO_RECORD_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_undo_record.c \
 		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_record_api.h \
-		$(top_srcdir)/src/include/cluster/storage/cluster_undo_alloc.h
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_alloc.h \
+		$(top_srcdir)/src/include/cluster/cluster_savepoint.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_local.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 $(CLUSTER_UNDO_ALLOC_TEST_O): $(top_srcdir)/src/backend/cluster/storage/cluster_undo_alloc.c \
@@ -9722,7 +9724,9 @@ test_cluster_undo_record: test_cluster_undo_record.c unit_test.h \
 		$(CLUSTER_UBA_O) \
 		../../../src/include/cluster/cluster_undo_record_api.h \
 		../../../src/include/cluster/storage/cluster_undo_alloc.h \
-		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_RECORD_TEST_O) $(CLUSTER_UNDO_ALLOC_TEST_O)
+		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_RECORD_TEST_O) $(CLUSTER_UNDO_ALLOC_TEST_O) \
+		$(top_srcdir)/src/include/cluster/cluster_savepoint.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_local.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		-DUNDO_RECORD_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_undo_record.c"' \
 		-DUNDO_ALLOC_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/storage/cluster_undo_alloc.c"' \
@@ -9739,7 +9743,9 @@ test_cluster_undo_record: test_cluster_undo_record.c unit_test.h \
 test_cluster_heap_receipt_product.o: test_cluster_heap_receipt_product.c \
 		$(top_srcdir)/src/backend/access/heap/heapam.c \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
-		$(top_srcdir)/src/include/cluster/cluster_undo_record_api.h
+		$(top_srcdir)/src/include/cluster/cluster_undo_record_api.h \
+		$(top_srcdir)/src/include/cluster/cluster_savepoint.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_local.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_heap_receipt: test_cluster_heap_receipt.c test_cluster_undo_record.c \
@@ -9748,7 +9754,9 @@ test_cluster_heap_receipt: test_cluster_heap_receipt.c test_cluster_undo_record.
 		test_cluster_heap_receipt_product.o $(CLUSTER_HOT_BUFPAGE_TEST_O) \
 		test_cluster_undo_ctrc_product.o $(CLUSTER_VERSION_O) $(CLUSTER_UNDO_ALLOC_TEST_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_undo_record.c \
-		$(top_srcdir)/src/include/cluster/cluster_undo_record_api.h
+		$(top_srcdir)/src/include/cluster/cluster_undo_record_api.h \
+		$(top_srcdir)/src/include/cluster/cluster_savepoint.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_local.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		-DUNDO_RECORD_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_undo_record.c"' \
 		-DUNDO_ALLOC_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/storage/cluster_undo_alloc.c"' \

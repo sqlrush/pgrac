@@ -15,10 +15,13 @@ if types is None:
 
 names = ("PushTransaction", "PopTransaction", "DefineSavepoint", "ReleaseSavepoint",
          "RollbackToSavepoint", "BeginInternalSubTransaction",
-         "ReleaseCurrentSubTransaction", "RollbackAndReleaseCurrentSubTransaction")
+         "ReleaseCurrentSubTransaction", "RollbackAndReleaseCurrentSubTransaction",
+         "IsTransactionState", "GetCurrentFullTransactionId",
+         "GetCurrentFullTransactionIdIfAny", "GetTopFullTransactionIdIfAny",
+         "GetCurrentSubTransactionId", "GetCurrentCommandId")
 bodies = []
 for name in names:
-    start = re.search(r"^(?:static )?void\n" + name + r"\([^)]*\)\n\{", source, re.M)
+    start = re.search(r"^(?:static )?(?:void|bool|FullTransactionId|SubTransactionId|CommandId)\n" + name + r"\([^)]*\)\n\{", source, re.M)
     if start is None:
         raise SystemExit("native function not found: " + name)
     end = re.search(r"^}", source[start.end():], re.M)
