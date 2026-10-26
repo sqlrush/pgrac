@@ -235,6 +235,7 @@ cluster_undo_cleaner_capacity_stats_snapshot(ClusterUndoCapacityStats *out)
 	MemSet(&snapshot, 0, sizeof(snapshot));
 	snapshot.origin_node_id = cluster_node_id;
 	LWLockAcquire(&undo_cleaner_state->lwlock, LW_SHARED);
+	snapshot.active_full_wait_count = undo_cleaner_state->active_full_wait_count;
 	snapshot.pool_wait_count = undo_cleaner_state->capacity_wait_entered;
 	snapshot.wakeup_recheck_count = undo_cleaner_state->capacity_wait_repolled;
 	snapshot.refused_context_count = undo_cleaner_state->capacity_wait_refused_context;
@@ -379,6 +380,57 @@ undo_cleaner_capacity_context_safe(void)
 		}
 	}
 	return true;
+}
+
+/*
+ * cluster_undo_cleaner_capacity_context_safe -- Reuse the original wait gate.
+ * Inputs: current backend resources. Returns the original predicate result.
+ * Side Effects: original local lock/resource inspection only.
+ */
+bool
+cluster_undo_cleaner_capacity_context_safe(void)
+{
+	return undo_cleaner_capacity_context_safe();
+}
+
+/* Backend-local scope only: ProcSleep still owns its original lock queue,
+ * deadlock processing, timeouts and cancellation cleanup. */
+static bool undo_cleaner_tx_slot_wait_active;
+
+/*
+ * cluster_undo_cleaner_tx_slot_wait_begin -- Label a proven native slot wait.
+ * Inputs: caller has passed the original context gate and exact owner checks.
+ * Returns: void. Side Effects: diagnostic count and backend-local scope only.
+ */
+void
+cluster_undo_cleaner_tx_slot_wait_begin(void)
+{
+	if (undo_cleaner_state != NULL) {
+		LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
+		undo_cleaner_state->active_full_wait_count++;
+		LWLockRelease(&undo_cleaner_state->lwlock);
+	}
+	undo_cleaner_tx_slot_wait_active = true;
+}
+
+/*
+ * cluster_undo_cleaner_tx_slot_wait_end -- Retire the frontend wait scope.
+ * Inputs: whether the original ERROR was 57014. Returns: void. Side Effects:
+ * clears backend-local scope and counts caller cancellation without a lock.
+ */
+void
+cluster_undo_cleaner_tx_slot_wait_end(bool cancelled)
+{
+	undo_cleaner_tx_slot_wait_active = false;
+	if (cancelled && undo_cleaner_state != NULL)
+		pg_atomic_fetch_add_u64(&undo_cleaner_state->capacity_wait_cancelled, 1);
+}
+
+/* ProcSleep's read-only event selector; it grants no authority or slot. */
+bool
+cluster_undo_cleaner_tx_slot_waiting(void)
+{
+	return undo_cleaner_tx_slot_wait_active;
 }
 
 static bool

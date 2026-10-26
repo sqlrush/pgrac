@@ -1218,6 +1218,39 @@ cluster_tt_slot_current_owner_by_xid(int node_id, TransactionId xid, ClusterTTSl
 	return true;
 }
 
+/*
+ * cluster_tt_slot_current_snapshot -- Copy one complete allocator observation.
+ * Inputs: local node and caller-owned output. Returns false without changing
+ * output when unavailable. Side Effects: one bounded original SHARED lock;
+ * no allocation, initialization, status proof or grant of slot ownership.
+ */
+bool
+cluster_tt_slot_current_snapshot(int node_id, ClusterTTSlotCurrentSnapshot *out)
+{
+	ClusterTTSlotAllocPerSegment *seg;
+	ClusterTTSlotCurrentSnapshot snapshot;
+
+	if (out == NULL || ClusterTTSlotShm == NULL || node_id < 0
+		|| node_id >= CLUSTER_TT_SLOT_MAX_NODES)
+		return false;
+	memset(&snapshot, 0, sizeof(snapshot));
+	seg = &ClusterTTSlotShm->per_node[node_id];
+	LWLockAcquire(&seg->lock, LW_SHARED);
+	snapshot.segment_id = seg->segment_id;
+	snapshot.binding_generation = seg->binding_generation;
+	for (unsigned i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		snapshot.slots[i].segment_id = seg->segment_id;
+		snapshot.slots[i].xid = seg->slots[i].xid;
+		snapshot.slots[i].slot_offset = i;
+		snapshot.slots[i].wrap = seg->slots[i].wrap;
+		snapshot.slots[i].status = seg->slots[i].status;
+		snapshot.slots[i].commit_scn = seg->slots[i].commit_scn;
+	}
+	LWLockRelease(&seg->lock);
+	*out = snapshot;
+	return true;
+}
+
 
 /*
  * cluster_tt_slot_rollover -- spec-3.12 D2b.

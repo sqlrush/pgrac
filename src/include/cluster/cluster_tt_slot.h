@@ -285,6 +285,15 @@ typedef struct ClusterTTSlotCurrentOwner {
 	uint8 reserved8[3];
 } ClusterTTSlotCurrentOwner;
 
+/* Local read observation only. The binding generation distinguishes an
+ * away-and-back CURRENT change even when all slot bytes happen to match. */
+typedef struct ClusterTTSlotCurrentSnapshot {
+	uint64 binding_generation;
+	uint32 segment_id;
+	uint32 reserved32;
+	ClusterTTSlotCurrentOwner slots[TT_SLOTS_PER_SEGMENT];
+} ClusterTTSlotCurrentSnapshot;
+
 StaticAssertDecl(sizeof(ClusterTTSlotCurrentOwner) == 24,
 				 "current TT owner snapshot must remain stack-only 24 bytes");
 
@@ -402,6 +411,7 @@ extern void cluster_tt_slot_mark_aborted(uint32 segment_id, uint16 slot_offset, 
  *	  the SEGMENT_ACTIVE -> SEGMENT_COMMITTED transition.
  */
 extern uint32 cluster_tt_slot_current_segment(int node_id);
+extern bool cluster_tt_slot_current_snapshot(int node_id, ClusterTTSlotCurrentSnapshot *out);
 extern bool cluster_tt_slot_current_owner_by_xid(int node_id, TransactionId xid,
 												 ClusterTTSlotCurrentOwner *out);
 /*

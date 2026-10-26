@@ -1334,6 +1334,9 @@ pgstat_get_wait_cluster_undo(WaitEventCluster w)
 	case WAIT_EVENT_CLUSTER_UNDO_CAPACITY_WAIT:
 		event_name = "ClusterUndoCapacityWait";
 		break;
+	case WAIT_EVENT_CLUSTER_UNDO_TX_SLOT_WAIT:
+		event_name = "ClusterUndoTxSlotWait";
+		break;
 	default:
 		break;
 	}

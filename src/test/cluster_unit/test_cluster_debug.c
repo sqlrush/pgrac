@@ -3466,6 +3466,7 @@ cluster_undo_cleaner_capacity_stats_snapshot(ClusterUndoCapacityStats *out)
 		return false;
 	memset(out, 0, sizeof(*out));
 	out->origin_node_id = 3;
+	out->active_full_wait_count = 42;
 	out->pool_wait_count = UINT64_MAX;
 	out->wakeup_recheck_count = UINT64_C(9223372036854775809);
 	out->cancel_count = 17;
@@ -5758,6 +5759,7 @@ UT_TEST(test_debug_dump_exposes_capacity_counts_without_fake_zero_or_signed_wrap
 	LOCAL_FCINFO(fcinfo, 0);
 	ReturnSetInfo rsinfo;
 	static const char *const keys[] = { "tt_capacity_origin_node_id",
+										"tt_slot_active_full_wait_count",
 										"tt_capacity_pool_wait_count",
 										"tt_capacity_wakeup_recheck_count",
 										"tt_capacity_cancel_count",
@@ -5768,8 +5770,9 @@ UT_TEST(test_debug_dump_exposes_capacity_counts_without_fake_zero_or_signed_wrap
 										"capacity_wait_refused_context",
 										"capacity_wait_refused_proof" };
 	static const char *const values[]
-		= { "3",  "18446744073709551615", "9223372036854775809", "17", "19",
-			"23", "18446744073709551615", "9223372036854775809", "19", "23" };
+		= { "3",  "42", "18446744073709551615", "9223372036854775809", "17",
+			"19", "23", "18446744073709551615", "9223372036854775809", "19",
+			"23" };
 
 	for (int available = 0; available < 2; available++) {
 		memset(fcinfo, 0, SizeForFunctionCallInfo(0));

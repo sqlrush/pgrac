@@ -2104,10 +2104,39 @@ UT_TEST(test_pool_keeps_original_context_refusal_and_cancel_cleanup)
 	}
 }
 
+UT_TEST(test_native_slot_wait_scope_preserves_context_and_counts_only_its_cancellation)
+{
+	ClusterUndoCapacityStats out;
+
+	reset_wait_fixture();
+	UT_ASSERT(cluster_undo_cleaner_capacity_context_safe());
+	UT_ASSERT(!cluster_undo_cleaner_tx_slot_waiting());
+	for (unsigned i = 0; i < 3; i++) {
+		cluster_undo_cleaner_tx_slot_wait_begin();
+		UT_ASSERT(cluster_undo_cleaner_tx_slot_waiting());
+		cluster_undo_cleaner_tx_slot_wait_end(i == 1);
+		UT_ASSERT(!cluster_undo_cleaner_tx_slot_waiting());
+		UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&out));
+		UT_ASSERT_EQ(out.active_full_wait_count, i + 1);
+		UT_ASSERT_EQ(out.cancel_count, i == 0 ? 0 : 1);
+		UT_ASSERT_EQ(out.pool_wait_count, 0);
+	}
+	PrivateRefCountArray[7].refcount = 1;
+	UT_ASSERT(!cluster_undo_cleaner_capacity_context_safe());
+	PrivateRefCountArray[7].refcount = 0;
+	semantic_activation_local_inflight[1][63] = 1;
+	UT_ASSERT(!cluster_undo_cleaner_capacity_context_safe());
+	semantic_activation_local_inflight[1][63] = 0;
+	UT_ASSERT(cluster_undo_cleaner_capacity_context_safe());
+	UT_ASSERT_EQ(slept, 0);
+	UT_ASSERT_EQ(test_lock_depth, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(46);
+	UT_PLAN(47);
+	UT_RUN(test_native_slot_wait_scope_preserves_context_and_counts_only_its_cancellation);
 	UT_RUN(test_pool_keeps_original_context_refusal_and_cancel_cleanup);
 	UT_RUN(test_pool_owner_uses_original_cv_and_exact_old_segment_worker);
 	UT_RUN(test_pool_recheck_returns_to_allocator_without_sleep_or_grant);
