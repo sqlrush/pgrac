@@ -21031,6 +21031,7 @@ cluster_heap_freeze_apply_xmin_batch_recent_v1(
 		|| proofs == NULL || fence == NULL || authority_before == NULL
 		|| admission == NULL || !admission->entered || targets == NULL
 		|| target_count == 0 || target_count > MaxHeapTuplesPerPage
+		|| target_count > page->tuple_count
 		|| recent_buffer <= 0 || recent_buffer > NBuffers
 		|| BufferDescriptors == NULL
 		|| admission->record_generation != fence->admission_generation

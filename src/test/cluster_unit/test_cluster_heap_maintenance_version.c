@@ -16173,10 +16173,39 @@ UT_TEST(test_mixed_admitted_subsets_keep_fullxid_wal_horizon_and_unknown_rows)
 	}
 }
 
+/* Invalid selected-target requests cannot start a recent-resident write. */
+UT_TEST(test_recent_xmin_invalid_target_batch_refuses_before_resident_pin)
+{
+	for (int pins = 0; pins < 2; pins++) {
+		for (int writer = 0; writer < 2; writer++) {
+			for (int fault = 0; fault < 4; fault++) {
+				QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+				ClusterSemanticAdmissionToken saved_admission;
+				uint16 count;
+
+				qualified_xmin_batch_setup(&f, targets);
+				if (!writer) { fixture_release_original_writer(); resume_allowed = true; }
+				relation_data.rd_isvalid = true; backend_pin_count = pins;
+				count = fault == 0 ? 0 : fault == 1 ? MaxHeapTuplesPerPage + 1 : 4;
+				if (fault == 3) { f.page.tuple_count = 0; count = 1; }
+				saved_admission = f.admission;
+				UT_ASSERT(!fixture_recent_xmin_apply(&f, targets, count));
+				UT_ASSERT_EQ(recent_pin_calls + recent_unpins, 0);
+				UT_ASSERT_EQ(backend_pin_count, pins); UT_ASSERT_EQ(local_x, writer);
+				UT_ASSERT_EQ(cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0)) != NULL, writer);
+				UT_ASSERT(memcmp(&f.admission, &saved_admission, sizeof(saved_admission)) == 0);
+				UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + inserts + edges + dirties + flushes, 0);
+				UT_ASSERT(!recent_pin_held && !resumed_writer);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(344);
+	UT_PLAN(345);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -16531,6 +16560,7 @@ main(void)
 	UT_RUN(test_admitted_reuse_refusals_retire_previous_continuation);
 	UT_RUN(test_mixed_admitted_resident_subset_reaches_same_owner_recent_wal);
 	UT_RUN(test_mixed_admitted_subsets_keep_fullxid_wal_horizon_and_unknown_rows);
+	UT_RUN(test_recent_xmin_invalid_target_batch_refuses_before_resident_pin);
 
 	UT_DONE();
 	return ut_failed_count != 0;
