@@ -21021,7 +21021,9 @@ cluster_heap_freeze_apply_xmin_batch_recent_v1(
 
 	/* The proof phase may have released its pin. Reuse only the original
 	 * resident hint under the caller's still-entered admission: no fetch,
-	 * new current, proof request or replacement source observation. */
+	 * new current, proof request or replacement source observation.
+	 * Reject an already obsolete local ingress cut before acquiring this
+	 * pin; the pinned continuation repeats the same check after acquisition. */
 	if (rel == NULL || !rel->rd_isvalid || input == NULL || page == NULL
 		|| proofs == NULL || fence == NULL || authority_before == NULL
 		|| admission == NULL || !admission->entered || targets == NULL
@@ -21030,6 +21032,11 @@ cluster_heap_freeze_apply_xmin_batch_recent_v1(
 		|| BufferDescriptors == NULL
 		|| admission->record_generation != fence->admission_generation
 		|| !RelFileLocatorEquals(rel->rd_locator, fence->identity.key.locator)
+		|| input->freeze_cohort == NULL
+		|| input->freeze_cohort->local_registration_cut.status != CTRC_ACTIVE_SCAN_COMPLETE
+		|| input->freeze_cohort->local_registration_cut.unqualified_entries != 0
+		|| !cluster_ctrc_active_scan_registration_current(
+			&input->freeze_cohort->local_registration_cut)
 		|| !ReadRecentBuffer(rel->rd_locator, MAIN_FORKNUM, fence->block,
 			recent_buffer))
 		return false;

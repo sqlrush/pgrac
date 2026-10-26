@@ -12188,6 +12188,47 @@ UT_TEST(test_recent_refused_receiver_keeps_original_cut_and_native_continuation)
 	for (unsigned batch = 0; batch < 2; batch++) recent_registration_case(batch != 0, true);
 }
 
+UT_TEST(test_recent_xmin_stale_registration_refuses_before_resident_pin)
+{
+	for (unsigned batch = 0; batch < 2; batch++)
+	{
+		for (unsigned fault = 0; fault < 6; fault++)
+		{
+			QualifiedXminFixture f;
+			ClusterHeapFreezeXminTargetV1 targets[3];
+			uint16 count = batch ? 3 : 1;
+			int32 caller_pins;
+
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else
+			{
+				qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+				targets[0] = (ClusterHeapFreezeXminTargetV1) {
+					0, FullTransactionIdFromEpochAndXid(1, 77)
+				};
+			}
+			relation_data.rd_isvalid = true;
+			caller_pins = backend_pin_count;
+			switch (fault)
+			{
+			case 0: f.input.freeze_cohort = NULL; break;
+			case 1: f.cohort.local_registration_cut.status = CTRC_ACTIVE_SCAN_INCOMPLETE; break;
+			case 2: f.cohort.local_registration_cut.unqualified_entries = 1; break;
+			case 3: ctrc_note_unqualified_registration(); break;
+			case 4: f.cohort.local_registration_cut.unqualified_registration_generation = 0; break;
+			case 5: f.cohort.local_registration_cut.unqualified_registration_generation = UINT64_MAX; break;
+			}
+			UT_ASSERT(!fixture_recent_xmin_apply(&f, targets, count));
+			UT_ASSERT_EQ(recent_pin_calls + recent_unpins, 0);
+			UT_ASSERT_EQ(backend_pin_count, caller_pins);
+			UT_ASSERT(local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(conditional_resumes + conditional_unlocks, 0);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
 UT_TEST(test_recent_xmin_pin_continues_original_admission_to_native_wal)
 {
 	for (int batch = 0; batch < 2; batch++) {
@@ -12392,13 +12433,14 @@ UT_TEST(test_recent_xmin_share_lock_refusal_keeps_borrowed_pin_without_upgrade)
 int
 main(void)
 {
-	UT_PLAN(292);
+	UT_PLAN(293);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
 	UT_RUN(test_pin_free_phase_recent_errors_unwind_pin_before_original_owner_leave);
 	UT_RUN(test_recent_unknown_receiver_revokes_pin_free_proof_before_writer_or_wal);
 	UT_RUN(test_recent_refused_receiver_keeps_original_cut_and_native_continuation);
+	UT_RUN(test_recent_xmin_stale_registration_refuses_before_resident_pin);
 	UT_RUN(test_recent_xmin_success_preserves_preowned_pin_and_writer);
 	UT_RUN(test_recent_xmin_errors_keep_borrowed_pin_and_writer_scope);
 	UT_RUN(test_recent_xmin_share_lock_refusal_keeps_borrowed_pin_without_upgrade);
