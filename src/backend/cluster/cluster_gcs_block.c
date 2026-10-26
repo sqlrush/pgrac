@@ -3217,6 +3217,7 @@ typedef struct GcsReadSourceAttempt {
 } GcsReadSourceAttempt;
 static GcsReadSourceAttempt gcs_read_source_attempts[GCS_READ_SOURCE_LEDGER_MAX];
 static bool gcs_read_source_exit_registered;
+static bool gcs_first_fill_holder_notify_retain(const ClusterPcmReadGrant *service, int master);
 
 /* Existing DONE family, asynchronously queued. Native authority retains debt
  * until confirmation or exact cleanup; there is no ACK wait here. */
@@ -3304,7 +3305,9 @@ gcs_block_pending_s_notify(const ClusterPcmReadGrantKey *key, int master, bool i
 bool
 cluster_gcs_block_read_grant_holder_notify(const ClusterPcmReadGrant *service, int32 master)
 {
-	return gcs_block_pending_s_notify_service(service, master, GCS_BLOCK_DONE_PENDING_S_HOLDER);
+	/* Acceptance transfers this duty to the original holder continuation.
+	 * It is not wire admission or a new grant; the master still owns pending-S. */
+	return gcs_first_fill_holder_notify_retain(service, master);
 }
 
 /* Native reservation identity is recorded before the first wire admission. */
@@ -21965,6 +21968,9 @@ typedef struct GcsFirstFillHolderPark {
 	bool returned;
 	bool terminal;
 	bool notice_admitted;
+	bool holder_notice_armed;
+	bool holder_notice_pending;
+	bool image_admitted;
 	uint64 master_session;
 	GcsBlockFirstFillForwardPayload forward;
 	ClusterPcmFirstFillWait wait;
@@ -21989,6 +21995,57 @@ gcs_first_fill_same_forward(const GcsBlockFirstFillForwardPayload *left,
 		&& a->original_requester_node == b->original_requester_node
 		&& a->requester_backend_id == b->requester_backend_id
 		&& a->master_node == b->master_node && BufferTagsEqual(&a->tag, &b->tag);
+}
+
+/* This owner retains the original service, never a pin or a successor buffer.
+ * Only real ring acceptance transfers the asynchronous HOLDER notification. */
+static bool
+gcs_first_fill_holder_notify_offer(GcsFirstFillHolderPark *park)
+{
+	ClusterPcmReadGrant service;
+	if (!park->holder_notice_pending)
+		return true;
+	if (!GcsBlockFirstFillForwardPayloadGrant(&park->forward, cluster_node_id, &service)
+		|| !gcs_block_pending_s_notify_service(&service, park->forward.forward.master_node,
+			GCS_BLOCK_DONE_PENDING_S_HOLDER))
+		return false;
+	park->holder_notice_pending = false;
+	cluster_block_io_trace_note(park->forward.forward.tag, "FIRST_FILL_HOLDER_NOTICE_QUEUED",
+		park->forward.forward.request_id, park->forward.service_generation, park->image_admitted);
+	return true;
+}
+
+/* The producer can hand off only to its already-reserved exact service.
+ * Do not take another lock here: bufmgr calls while holding its revoke proof. */
+static bool
+gcs_first_fill_holder_notify_retain(const ClusterPcmReadGrant *service, int master)
+{
+	if (service == NULL || service->holder_node != cluster_node_id || !service->holder_was_x)
+		return false;
+	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
+		GcsFirstFillHolderPark *park = &gcs_first_fill_holder_parks[i];
+		ClusterPcmReadGrant original;
+		if (!park->in_use || park->returned || park->terminal || park->image_admitted
+			|| park->forward.forward.master_node != master
+			|| !GcsBlockFirstFillForwardPayloadGrant(&park->forward, cluster_node_id, &original)
+			|| original.key.request_id != service->key.request_id
+			|| original.key.epoch != service->key.epoch
+			|| original.key.backend_id != service->key.backend_id
+			|| original.key.requester_node != service->key.requester_node
+			|| !BufferTagsEqual(&original.key.tag, &service->key.tag)
+			|| original.binding_generation != service->binding_generation
+			|| original.service_generation != service->service_generation
+			|| original.holder_was_x != service->holder_was_x)
+			continue;
+		if (park->holder_notice_armed)
+			return true; /* The same duty cannot create another offer. */
+		park->holder_notice_armed = park->holder_notice_pending = true;
+		cluster_block_io_trace_note(park->forward.forward.tag, "FIRST_FILL_HOLDER_NOTICE_PENDING",
+			park->forward.forward.request_id, park->forward.service_generation, 0);
+		(void)gcs_first_fill_holder_notify_offer(park);
+		return true;
+	}
+	return false;
 }
 
 /* Every producer first owns one bounded slot. When full, the original
@@ -22022,7 +22079,7 @@ static void
 gcs_first_fill_holder_notice(GcsFirstFillHolderPark *park)
 {
 	ClusterPcmReadGrant service;
-	if (park->notice_admitted
+	if (!gcs_first_fill_holder_notify_offer(park) || park->notice_admitted
 		|| !GcsBlockFirstFillForwardPayloadGrant(&park->forward, cluster_node_id, &service))
 		return;
 	if (gcs_block_pending_s_notify_service(&service, park->forward.forward.master_node,
@@ -22123,7 +22180,11 @@ gcs_first_fill_holder_sent(GcsFirstFillHolderPark *park, ClusterICSendResult res
 	}
 	if ((result == CLUSTER_IC_SEND_DONE || result == CLUSTER_IC_SEND_WOULD_BLOCK)
 		&& GcsBlockReplyHeaderHasPendingS((const GcsBlockReplyHeader *)park->reply)) {
-		memset(park, 0, sizeof(*park)); /* real transport now owns the image */
+		park->image_admitted = true;
+		park->reply_size = 0; /* Real transport owns the image; never offer it again. */
+		park->wait_valid = false;
+		if (!park->holder_notice_pending)
+			memset(park, 0, sizeof(*park));
 		return;
 	}
 	/* A terminal refusal or a hard send fault retains exact NACK ownership
@@ -22893,6 +22954,31 @@ cluster_gcs_block_first_fill_tick(void)
 		volatile bool completed = false;
 		if (!park->in_use)
 			continue;
+		if (park->holder_notice_pending) {
+			int master = park->forward.forward.master_node;
+			uint64 session;
+			if (park->forward.forward.epoch != cluster_epoch_get_current()
+				|| cluster_gcs_lookup_master(park->forward.forward.tag) != master
+				|| cluster_membership_get_state(master) == CLUSTER_MEMBER_DEAD
+				|| cluster_membership_get_state(master) == CLUSTER_MEMBER_REMOVED) {
+				/* Existing membership/remaster cleanup now owns the old claim. */
+				memset(park, 0, sizeof(*park));
+				continue;
+			}
+			if (!gcs_block_pcm_x_authenticated_session(master, park->forward.forward.epoch, &session))
+				continue; /* Unknown is not proof that the original master ended. */
+			if (session != park->master_session) {
+				memset(park, 0, sizeof(*park));
+				continue;
+			}
+			if (now >= park->retry_at && !gcs_first_fill_holder_notify_offer(park))
+				park->retry_at = now + 10000;
+			if (park->image_admitted) {
+				if (!park->holder_notice_pending)
+					memset(park, 0, sizeof(*park));
+				continue; /* Stop drains this duty without cancelling the installed image. */
+			}
+		}
 		if (park->returned || park->terminal) {
 			uint64 session;
 			if (park->forward.forward.epoch != cluster_epoch_get_current()

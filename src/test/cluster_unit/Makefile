@@ -9792,7 +9792,8 @@ test_cluster_first_fill_holder.inc: $(top_srcdir)/src/backend/cluster/cluster_gc
 	     END { if (n != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
 	awk '/^cluster_gcs_block_first_fill_tick\(/ { print "void"; emit=1; n++ } \
 	     /^cluster_gcs_block_read_source_retry_wait\(/ { print "void"; emit=1; n++ } \
-	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2 || emit) exit 1 }' $< >> $@.tmp
+	     /^cluster_gcs_block_read_grant_holder_notify\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
 
 test_cluster_first_fill_wait: test_cluster_first_fill_wait.c test_cluster_pcm_own test_cluster_pcm_own.c \
@@ -9810,7 +9811,8 @@ test_cluster_first_fill_send.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_
 	     END { if (n != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	awk '/^cluster_gcs_handle_block_forward_envelope\(/ { print "void"; emit=1; n++ } \
 	     /^cluster_gcs_block_first_fill_tick\(/ { print "void"; emit=1; n++ } \
-	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2 || emit) exit 1 }' $< >> $@.tmp
+	     /^cluster_gcs_block_read_grant_holder_notify\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
 
 test_cluster_first_fill_send: test_cluster_first_fill_send.c test_cluster_pcm_own test_cluster_pcm_own.c \

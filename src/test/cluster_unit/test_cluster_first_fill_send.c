@@ -14,6 +14,7 @@ int first_fill_send_own_fixture_main(void);
 #undef main
 
 #include "cluster/cluster_lms.h"
+#include "cluster/cluster_membership.h"
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_block_io_trace.h"
 #include "cluster/cluster_gcs_block_dedup.h"
@@ -27,6 +28,9 @@ static bool send_stop, send_session = true;
 static int send_master = 2;
 static unsigned send_calls, send_admitted, send_nacks, send_returns, send_deferred, send_copies, send_releases;
 static bool send_notice_admit = true;
+static unsigned send_holder_offers, send_holder_handed;
+static ClusterMembershipState send_master_state = CLUSTER_MEMBER_MEMBER;
+static ClusterPcmReadGrant send_last_holder;
 static ClusterICSendResult send_result;
 static char send_first[sizeof(GcsBlockReplyHeaderV2) + GCS_BLOCK_DATA_SIZE];
 static size_t send_length;
@@ -59,8 +63,13 @@ gcs_block_pending_s_notify_service(const ClusterPcmReadGrant *service, int maste
 	if (send_cancel_check) UT_ASSERT_EQ(key->request_id, 71);
 	UT_ASSERT_EQ(key->requester_node, 1);
 	UT_ASSERT_EQ(master, 2);
-	UT_ASSERT(action == GCS_BLOCK_DONE_PENDING_S_NACK || action == GCS_BLOCK_DONE_PENDING_S_RETURN);
-	if (action == GCS_BLOCK_DONE_PENDING_S_RETURN) send_returns++; else send_nacks++;
+	UT_ASSERT(action == GCS_BLOCK_DONE_PENDING_S_NACK || action == GCS_BLOCK_DONE_PENDING_S_RETURN
+		|| action == GCS_BLOCK_DONE_PENDING_S_HOLDER);
+	if (action == GCS_BLOCK_DONE_PENDING_S_HOLDER) {
+		send_holder_offers++;
+		send_last_holder = *service;
+		if (send_notice_admit) send_holder_handed++;
+	} else if (action == GCS_BLOCK_DONE_PENDING_S_RETURN) send_returns++; else send_nacks++;
 	return send_notice_admit;
 }
 static void gcs_block_forward_reply_immediate_deny(const GcsBlockForwardPayload *fwd)
@@ -130,6 +139,10 @@ send_prepare(const ClusterPcmReadGrant *service, int master, XLogRecPtr *lsn,
 	UT_ASSERT_EQ(service->holder_node, cluster_node_id);
 	UT_ASSERT_EQ(master, 2);
 	UT_ASSERT(!(pg_atomic_read_u32(&transition_buf->state) & BM_IO_IN_PROGRESS));
+	if (!cluster_gcs_block_read_grant_holder_notify(service, master)) {
+		*refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE;
+		return CLUSTER_BUFMGR_GCS_DOWNGRADE_REFUSED_PRE_NOTIFY;
+	}
 	memcpy(bytes, transition_page.data, GCS_BLOCK_DATA_SIZE);
 	*lsn = 42;
 	*refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE;
@@ -207,6 +220,7 @@ static struct {
 #define cluster_epoch_get_current() send_epoch
 #define cluster_normal_stop_requested() send_stop
 #define cluster_gcs_lookup_master(tag) send_master
+#define cluster_membership_get_state(node) send_master_state
 #define gcs_block_pcm_x_authenticated_session send_auth
 #define cluster_block_io_trace_note(...) ((void)0)
 #define gcs_block_try_ctrc_forward136(env, payload) false
@@ -234,7 +248,8 @@ static struct {
 #define cluster_bufmgr_first_fill_s_prepare_image send_prepare
 #define cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(...) CLUSTER_BUFMGR_GCS_DOWNGRADE_REFUSED_PRE_NOTIFY
 #define cluster_lever_a_note_remote_downgrade(result) ((void)(result))
-#define cluster_bufmgr_block_pcm_state(tag) PCM_LOCK_MODE_S
+#define cluster_bufmgr_block_pcm_state(tag) \
+	(transition_buf->pcm_state == PCM_STATE_S ? PCM_LOCK_MODE_S : PCM_LOCK_MODE_X)
 #define cluster_bufmgr_block_grant_pending(tag) false
 #define gcs_block_get_ship_image send_image
 #define gcs_block_lost_write_verdict(expected, shipped) ((void)(expected), (void)(shipped), GCS_LOST_WRITE_SKIP)
@@ -270,6 +285,9 @@ send_setup(BufferDesc *buf, ClusterPcmOwnEntry *entry)
 	memset(send_first, 0, sizeof(send_first));
 	send_length = send_calls = send_admitted = send_nacks = send_returns = send_deferred = send_copies = send_releases = 0;
 	send_notice_admit = true;
+	send_holder_offers = send_holder_handed = 0;
+	memset(&send_last_holder, 0, sizeof(send_last_holder));
+	send_master_state = CLUSTER_MEMBER_MEMBER;
 	send_epoch = 1;
 	send_master_incarnation = 9;
 	send_now = 10;
@@ -673,10 +691,239 @@ UT_TEST(quiet_return_ends_on_proved_master_reconfiguration_but_not_unknown_sessi
 	ClusterPcmOwnArray = saved;
 }
 
+/* The callback, park owner and send continuation below are production code.
+ * Only physical downgrade/image copying and peer/ring transport are controlled. */
+static GcsBlockFirstFillForwardPayload
+send_x_fixture(BufferDesc *buf, ClusterPcmOwnEntry *entry)
+{
+	GcsBlockFirstFillForwardPayload fwd = send_setup(buf, entry);
+	buf->pcm_state = PCM_STATE_X;
+	fwd.forward.reserved_0[0] = fwd.forward.reserved_0[3] = 1;
+	send_downgrade = true;
+	send_notice_admit = false;
+	return fwd;
+}
+
+UT_TEST(holder_notice_refusal_preserves_image_and_exact_notification_independently)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	for (int delayed = 0; delayed <= 1; delayed++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		GcsBlockFirstFillForwardPayload fwd = send_x_fixture(&buf, &entry);
+		unsigned offers;
+		send_result = delayed ? CLUSTER_IC_SEND_WOULD_BLOCK : CLUSTER_IC_SEND_DONE;
+		send_forward(&fwd);
+		UT_ASSERT_EQ(send_admitted, 1);
+		UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_S);
+		UT_ASSERT_EQ(send_owned(), 1);
+		UT_ASSERT_EQ(send_holder_handed, 0);
+		/* A successor buffer and elapsed time cannot provide old notice proof. */
+		buf.tag.blockNum++;
+		pg_atomic_fetch_add_u64(&entry.generation, 10);
+		send_now += 10000000;
+		send_tick();
+		UT_ASSERT_EQ(send_owned(), 1);
+		UT_ASSERT_EQ(send_calls, 1);
+		UT_ASSERT_EQ(send_copies, 1);
+		UT_ASSERT_EQ(send_last_holder.key.tag.blockNum, fwd.forward.tag.blockNum);
+		send_notice_admit = true;
+		send_tick();
+		UT_ASSERT_EQ(send_holder_handed, 1);
+		UT_ASSERT_EQ(send_owned(), 0);
+		offers = send_holder_offers;
+		for (int i = 0; i < 10; i++) send_tick();
+		UT_ASSERT_EQ(send_holder_offers, offers);
+		UT_ASSERT_EQ(send_calls, 1);
+		UT_ASSERT_EQ(send_nacks + send_returns, 0);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(holder_notice_unknown_session_waits_without_cancel_or_image_replay)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	GcsBlockFirstFillForwardPayload fwd = send_x_fixture(&buf, &entry);
+	unsigned offers;
+	send_result = CLUSTER_IC_SEND_DONE;
+	send_forward(&fwd);
+	UT_ASSERT_EQ(send_owned(), 1);
+	offers = send_holder_offers;
+	send_session = false;
+	send_notice_admit = true;
+	for (int i = 0; i < 10; i++) send_tick();
+	UT_ASSERT_EQ(send_owned(), 1);
+	UT_ASSERT_EQ(send_holder_offers, offers);
+	UT_ASSERT_EQ(send_calls, 1);
+	UT_ASSERT_EQ(send_nacks + send_returns, 0);
+	send_session = true;
+	send_tick();
+	UT_ASSERT_EQ(send_holder_handed, 1);
+	UT_ASSERT_EQ(send_owned(), 0);
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(holder_notice_ends_on_proved_master_reconfiguration_only)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	for (int reason = 0; reason < 5; reason++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		GcsBlockFirstFillForwardPayload fwd = send_x_fixture(&buf, &entry);
+		unsigned offers;
+		send_result = CLUSTER_IC_SEND_DONE;
+		send_forward(&fwd);
+		UT_ASSERT_EQ(send_owned(), 1);
+		offers = send_holder_offers;
+		if (reason == 0) send_epoch++;
+		if (reason == 1) send_master++;
+		if (reason == 2) send_master_incarnation++;
+		if (reason == 3) send_master_state = CLUSTER_MEMBER_DEAD;
+		if (reason == 4) send_master_state = CLUSTER_MEMBER_REMOVED;
+		send_notice_admit = true;
+		send_tick();
+		UT_ASSERT_EQ(send_owned(), 0);
+		UT_ASSERT_EQ(send_holder_offers, offers);
+		UT_ASSERT_EQ(send_calls, 1);
+		UT_ASSERT_EQ(send_nacks + send_returns, 0);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(normal_stop_drains_admitted_image_holder_notice_without_revoke)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	GcsBlockFirstFillForwardPayload fwd = send_x_fixture(&buf, &entry);
+	send_result = CLUSTER_IC_SEND_DONE;
+	send_forward(&fwd);
+	UT_ASSERT_EQ(send_owned(), 1);
+	send_stop = true;
+	send_tick();
+	UT_ASSERT_EQ(send_owned(), 1);
+	send_notice_admit = true;
+	send_tick();
+	UT_ASSERT_EQ(send_holder_handed, 1);
+	UT_ASSERT_EQ(send_owned(), 0);
+	UT_ASSERT_EQ(send_calls, 1);
+	UT_ASSERT_EQ(send_nacks + send_returns, 0);
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(holder_notice_and_unadmitted_image_transfer_separately_once)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	GcsBlockFirstFillForwardPayload fwd = send_x_fixture(&buf, &entry);
+	unsigned offers;
+	send_forward(&fwd);
+	UT_ASSERT_EQ(send_owned(), 1);
+	UT_ASSERT_EQ(send_calls, 1);
+	UT_ASSERT_EQ(send_admitted, 0);
+	UT_ASSERT_EQ(send_copies, 1);
+	send_notice_admit = true;
+	send_tick();
+	UT_ASSERT_EQ(send_holder_handed, 1);
+	UT_ASSERT_EQ(send_owned(), 1);
+	offers = send_holder_offers;
+	send_result = CLUSTER_IC_SEND_DONE;
+	send_tick();
+	UT_ASSERT_EQ(send_owned(), 0);
+	UT_ASSERT_EQ(send_holder_offers, offers);
+	UT_ASSERT_EQ(send_admitted, 1);
+	UT_ASSERT_EQ(send_copies, 1);
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(wrong_holder_service_cannot_steal_original_notification_owner)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	GcsBlockFirstFillForwardPayload fwd = send_x_fixture(&buf, &entry);
+	ClusterPcmReadGrant original;
+	unsigned offers;
+	send_forward(&fwd);
+	UT_ASSERT(GcsBlockFirstFillForwardPayloadGrant(&fwd, cluster_node_id, &original));
+	offers = send_holder_offers;
+	for (int bad = 0; bad < 10; bad++) {
+		ClusterPcmReadGrant wrong = original;
+		int master = 2;
+		if (bad == 0) wrong.binding_generation++;
+		if (bad == 1) wrong.service_generation++;
+		if (bad == 2) wrong.key.request_id++;
+		if (bad == 3) wrong.key.epoch++;
+		if (bad == 4) wrong.key.backend_id++;
+		if (bad == 5) wrong.key.requester_node++;
+		if (bad == 6) wrong.key.tag.blockNum++;
+		if (bad == 7) wrong.holder_node++;
+		if (bad == 8) wrong.holder_was_x = false;
+		if (bad == 9) master++;
+		UT_ASSERT(!cluster_gcs_block_read_grant_holder_notify(&wrong, master));
+		UT_ASSERT_EQ(send_holder_offers, offers);
+		UT_ASSERT_EQ(send_owned(), 1);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(terminal_cancel_keeps_holder_notice_until_both_notices_transfer)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	GcsBlockFirstFillForwardPayload fwd = send_x_fixture(&buf, &entry);
+	send_forward(&fwd);
+	UT_ASSERT_EQ(send_calls, 1);
+	send_stop = true;
+	send_tick();
+	UT_ASSERT_EQ(send_owned(), 1);
+	UT_ASSERT_EQ(send_nacks, 0);
+	send_notice_admit = true;
+	send_tick();
+	UT_ASSERT_EQ(send_holder_handed, 1);
+	UT_ASSERT_EQ(send_nacks, 1);
+	UT_ASSERT_EQ(send_owned(), 0);
+	UT_ASSERT_EQ(send_admitted, 0);
+	UT_ASSERT_EQ(send_copies, 1);
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(holder_callback_cannot_mint_unreserved_service_or_repeat_after_handoff)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	GcsBlockFirstFillForwardPayload fwd = send_x_fixture(&buf, &entry);
+	ClusterPcmReadGrant service;
+	UT_ASSERT(GcsBlockFirstFillForwardPayloadGrant(&fwd, cluster_node_id, &service));
+	send_notice_admit = true;
+	UT_ASSERT(!cluster_gcs_block_read_grant_holder_notify(&service, 2));
+	UT_ASSERT_EQ(send_holder_offers, 0);
+	send_result = CLUSTER_IC_SEND_DONE;
+	send_forward(&fwd);
+	UT_ASSERT_EQ(send_holder_handed, 1);
+	UT_ASSERT_EQ(send_owned(), 0);
+	UT_ASSERT(!cluster_gcs_block_read_grant_holder_notify(&service, 2));
+	UT_ASSERT_EQ(send_holder_handed, 1);
+	ClusterPcmOwnArray = saved;
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(21);
+	UT_RUN(holder_notice_refusal_preserves_image_and_exact_notification_independently);
+	UT_RUN(holder_notice_unknown_session_waits_without_cancel_or_image_replay);
+	UT_RUN(holder_notice_ends_on_proved_master_reconfiguration_only);
+	UT_RUN(normal_stop_drains_admitted_image_holder_notice_without_revoke);
+	UT_RUN(holder_notice_and_unadmitted_image_transfer_separately_once);
+	UT_RUN(wrong_holder_service_cannot_steal_original_notification_owner);
+	UT_RUN(terminal_cancel_keeps_holder_notice_until_both_notices_transfer);
+	UT_RUN(holder_callback_cannot_mint_unreserved_service_or_repeat_after_handoff);
 	UT_RUN(quiet_return_ends_on_proved_master_reconfiguration_but_not_unknown_session);
 	UT_RUN(quiet_holder_return_waits_for_exact_master_consumption);
 	UT_RUN(terminal_holder_nack_retains_ownership_without_reselecting);

@@ -21,6 +21,7 @@ int first_fill_own_fixture_main(void);
 #undef main
 
 #include "cluster/cluster_lms.h"
+#include "cluster/cluster_membership.h"
 #include "cluster/cluster_block_io_trace.h"
 #include "cluster/cluster_gcs_block_dedup.h"
 #include "storage/latch.h"
@@ -93,6 +94,7 @@ static void gcs_block_forward_reply_immediate_deny(const GcsBlockForwardPayload 
 #define ClusterGcsBlock ((void *)1)
 /* These IO-only cases must never enter the real reply-send stage. */
 #define cluster_gcs_lookup_master(tag) 2
+#define cluster_membership_get_state(node) CLUSTER_MEMBER_MEMBER
 #define gcs_block_pcm_x_authenticated_session(master, epoch, session) (*(session) = 9, true)
 #define cluster_ic_send_envelope(...) (pg_re_throw(), CLUSTER_IC_SEND_HARD_ERROR)
 #define cluster_gcs_block_note_send_outcome(...) ((void)0)
@@ -127,6 +129,7 @@ static bool gcs_first_fill_retry_progress(const ClusterPcmReadSource *source pg_
 #undef cluster_ic_send_envelope
 #undef gcs_block_pcm_x_authenticated_session
 #undef cluster_gcs_lookup_master
+#undef cluster_membership_get_state
 #undef ClusterGcsBlock
 #undef cluster_lms_wakeup
 
