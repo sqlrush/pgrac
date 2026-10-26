@@ -10111,8 +10111,8 @@ test_cluster_vacuum_shared_mx.inc: $(top_srcdir)/src/backend/access/heap/vacuuml
 test_cluster_vacuum_proof_cleanup.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
 	awk '/^lazy_cleanout_shared_freeze_page\(/ { print "static bool"; emit=1; cleanout++ } \
 	     /^lazy_shared_freeze_transport_snapshot\(/ { print "static void"; emit=1; cost++ } \
-	     /^(lazy_recheck_shared_freeze_page|lazy_collect_shared_freeze_proofs)\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 2 || cleanout > 1 || cost > 1) exit 1 }' $< > $@.tmp
+	     /^(lazy_recheck_shared_freeze_page|lazy_observe_shared_freeze_bounds|lazy_collect_shared_freeze_proofs)\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3 || cleanout > 1 || cost > 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_vacuum_proof_cleanout.inc: $(top_srcdir)/src/backend/cluster/cluster_itl_cleanout.c Makefile
