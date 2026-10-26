@@ -113,6 +113,22 @@ extern int cluster_injection_armed_count;
 
 extern void cluster_injection_run(const char *name);
 
+/* Scheduling-only test seam: only SLEEP with 0 < param <= 60 seconds is
+ * accepted, and a hit consumes its arm. Unlike the general dispatcher this
+ * may be used at transaction publication boundaries inside a critical
+ * section: no ERROR/CRASH/SKIP dispatch and no interrupt processing there.
+ * Outside critical sections cancellation follows the ordinary error path.
+ * The existing PgSleep wait event identifies the pause for the known PID.
+ */
+#define CLUSTER_INJECTION_PAUSE(name) \
+	do { \
+		if (cluster_injection_armed_count > 0) \
+			cluster_injection_pause(name); \
+	} while (0)
+
+extern void cluster_injection_pause(const char *name);
+
+
 extern bool cluster_injection_should_skip(const char *name);
 
 /* Non-consuming armed-state probe for deterministic test setup. */
@@ -147,6 +163,7 @@ extern bool cluster_injection_get_state_at(int idx, const char **name_out,
 #else /* !USE_PGRAC_CLUSTER */
 
 #define CLUSTER_INJECTION_POINT(name) ((void)0)
+#define CLUSTER_INJECTION_PAUSE(name) ((void)0)
 
 #endif /* USE_PGRAC_CLUSTER */
 

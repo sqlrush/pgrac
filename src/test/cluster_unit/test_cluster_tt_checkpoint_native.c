@@ -203,6 +203,8 @@ native_clear(SCN scn)
 #define SyncRepWaitForLSN(...) ((void)0)
 #undef CLUSTER_INJECTION_POINT
 #define CLUSTER_INJECTION_POINT(name) ((void)0)
+#undef CLUSTER_INJECTION_PAUSE
+#define CLUSTER_INJECTION_PAUSE(name) ((void)0)
 #include "test_cluster_space_commit_emit.inc"
 #include "test_cluster_tt_checkpoint_native.inc"
 

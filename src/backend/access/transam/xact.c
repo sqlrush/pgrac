@@ -1873,14 +1873,28 @@ RecordTransactionCommit(
 			 * inside the critical section and before pg_xact, while
 			 * checkpoints wait for us (DELAY_CHKPT_START). */
 			if (tt_stamp_staged)
+			{
+				CLUSTER_INJECTION_PAUSE("cluster-tx-commit-tt-before");
 				cluster_tt_local_commit_durable_apply(XactLastRecEnd);
+				CLUSTER_INJECTION_PAUSE("cluster-tx-commit-tt-after");
+			}
 #endif
 
 			/*
 			 * Now we may update the CLOG, if we wrote a COMMIT record above
 			 */
 		if (markXidCommitted)
+		{
+#ifdef USE_PGRAC_CLUSTER
+			if (tt_stamp_staged)
+				CLUSTER_INJECTION_PAUSE("cluster-tx-commit-clog-before");
+#endif
 			TransactionIdCommitTree(xid, nchildren, children);
+#ifdef USE_PGRAC_CLUSTER
+			if (tt_stamp_staged)
+				CLUSTER_INJECTION_PAUSE("cluster-tx-commit-clog-after");
+#endif
+		}
 	}
 	else
 	{
@@ -2188,6 +2202,9 @@ RecordTransactionAbort(bool isSubXact)
 	TimestampTz xact_time;
 	bool		replorigin;
 	SCN			abort_scn = InvalidScn;	/* PGRAC: spec-1.18 */
+#ifdef USE_PGRAC_CLUSTER
+	bool		tt_preabort_finished = false;
+#endif
 
 	/*
 	 * If we haven't been assigned an XID, nobody will care whether we aborted
@@ -2282,7 +2299,12 @@ RecordTransactionAbort(bool isSubXact)
 	 * helper may acquire block-zero current authority and perform WAL I/O. */
 	if (!isSubXact && cluster_storage_mode_enabled()
 		&& cluster_tt_local_has_binding(xid))
-		(void)cluster_tt_local_preabort_durable_finish(xid);
+	{
+		CLUSTER_INJECTION_PAUSE("cluster-tx-abort-tt-before");
+		tt_preabort_finished = cluster_tt_local_preabort_durable_finish(xid);
+		if (tt_preabort_finished)
+			CLUSTER_INJECTION_PAUSE("cluster-tx-abort-tt-after");
+	}
 #endif
 
 	/* XXX do we really need a critical section here? */
@@ -2329,7 +2351,15 @@ RecordTransactionAbort(bool isSubXact)
 	 * having flushed the ABORT record to disk, because in event of a crash
 	 * we'd be assumed to have aborted anyway.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	if (tt_preabort_finished)
+		CLUSTER_INJECTION_PAUSE("cluster-tx-abort-clog-before");
+#endif
 	TransactionIdAbortTree(xid, nchildren, children);
+#ifdef USE_PGRAC_CLUSTER
+	if (tt_preabort_finished)
+		CLUSTER_INJECTION_PAUSE("cluster-tx-abort-clog-after");
+#endif
 
 	END_CRIT_SECTION();
 	cluster_xact_trace_cleanup("abort_wal_clog_done");

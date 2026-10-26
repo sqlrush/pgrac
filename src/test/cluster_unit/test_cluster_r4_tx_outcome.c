@@ -25,6 +25,7 @@
 #include "access/twophase.h"
 #include "access/xlog.h"
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_inject.h"
 #include "cluster/cluster_multixact_current_stats.h"
 #include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_runtime_visibility.h"
@@ -904,6 +905,16 @@ cluster_tt_local_get_published_binding(TransactionId xid, ClusterCanonicalTxnBin
 	return true;
 }
 
+int cluster_injection_armed_count;
+static void (*test_canonical_pause_hook)(const char *);
+
+void
+cluster_injection_pause(const char *name)
+{
+	if (test_canonical_pause_hook != NULL)
+		test_canonical_pause_hook(name);
+}
+
 /* Controlled retained-slot source; canonical resolver bodies remain real. */
 static bool g_retained_origin_available;
 static FullTransactionId g_retained_origin_full;
@@ -1291,6 +1302,10 @@ void
 cluster_undo_block0_current_cancel(ClusterUndoBlock0CurrentGuard *guard pg_attribute_unused())
 {
 	test_candidate_cancel_calls++;
+	/* Model the cancel boundary retiring a held guard as the real guard
+	 * implementation does; the provider must call it exactly once. */
+	if (test_candidate_held_count > 0)
+		test_candidate_held_count--;
 }
 
 ClusterTxOutcome
@@ -7493,7 +7508,12 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 int
 main(void)
 {
-	UT_PLAN(224);
+	UT_PLAN(229);
+	UT_RUN(test_canonical_pause_cancel_releases_original_guard);
+	UT_RUN(test_canonical_pause_physical);
+	UT_RUN(test_canonical_pause_owner);
+	UT_RUN(test_canonical_pause_same_segment);
+	UT_RUN(test_canonical_pause_split_segment);
 	UT_RUN(test_canonical_commit_resample_physical);
 	UT_RUN(test_canonical_commit_resample_owner_preserves_allocator_fence);
 	UT_RUN(test_canonical_commit_resample_same_segment);

@@ -444,3 +444,113 @@ UT_TEST(test_canonical_commit_resample_rechecks_data_and_guard_exit)
 		UT_ASSERT_EQ(resolution.outcome, CLUSTER_TX_UNKNOWN);
 	}
 }
+
+static unsigned canonical_pause_calls;
+
+static void
+canonical_pause_count_copy(uint64 root_id)
+{
+	if (root_id == canonical_copy_root)
+		canonical_copy_count++;
+}
+
+static void
+canonical_pause_publish(const char *name)
+{
+	UT_ASSERT(strcmp(name, "cluster-tx-canonical-copy") == 0);
+	UT_ASSERT_EQ(canonical_copy_count, 1);
+	UT_ASSERT_EQ(test_native_status, TRANSACTION_STATUS_IN_PROGRESS);
+	UT_ASSERT_EQ(test_tt_slot.status, TT_SLOT_ACTIVE);
+	canonical_pause_calls++;
+	test_tt_slot = canonical_successor;
+	test_native_status = canonical_next_native;
+}
+
+static void
+canonical_pause_case(enum CanonicalSamplePath path)
+{
+	ClusterTxOutcome outcome;
+	canonical_commit_input(path);
+	test_candidate_after_block0_copy = canonical_pause_count_copy;
+	test_canonical_pause_hook = canonical_pause_publish;
+	canonical_pause_calls = 0;
+	cluster_injection_armed_count = 1;
+	outcome = canonical_sample(path, CLUSTER_TX_RESOLVE_VISIBILITY);
+	cluster_injection_armed_count = 0;
+	test_canonical_pause_hook = NULL;
+	UT_ASSERT_EQ(canonical_pause_calls, 1);
+	UT_ASSERT_EQ(canonical_copy_count, 2);
+	if (path == CANONICAL_OWNER) {
+		UT_ASSERT_EQ(outcome, CLUSTER_TX_UNKNOWN);
+		UT_ASSERT_EQ(canonical_resolution.commit_scn, InvalidScn);
+		test_current_owner.status = CTS_COMMITTED;
+		test_current_owner.commit_scn = test_commit_scn;
+		outcome = canonical_sample(path, CLUSTER_TX_RESOLVE_VISIBILITY);
+		UT_ASSERT_EQ(canonical_copy_count, 3);
+	}
+	UT_ASSERT_EQ(outcome, CLUSTER_TX_COMMITTED);
+	UT_ASSERT_EQ(canonical_resolution.commit_scn, test_commit_scn);
+}
+
+UT_TEST(test_canonical_pause_physical)
+{
+	canonical_pause_case(CANONICAL_PHYSICAL);
+}
+UT_TEST(test_canonical_pause_owner)
+{
+	canonical_pause_case(CANONICAL_OWNER);
+}
+UT_TEST(test_canonical_pause_same_segment)
+{
+	canonical_pause_case(CANONICAL_SAME_SEGMENT);
+}
+UT_TEST(test_canonical_pause_split_segment)
+{
+	canonical_pause_case(CANONICAL_SPLIT_SEGMENT);
+}
+
+static void
+canonical_pause_cancel(const char *name)
+{
+	UT_ASSERT(strcmp(name, "cluster-tx-canonical-copy") == 0);
+	pg_re_throw();
+}
+
+UT_TEST(test_canonical_pause_cancel_releases_original_guard)
+{
+	for (int same_segment = 0; same_segment < 2; same_segment++) {
+		ClusterSemanticAdmissionToken admission = { 0 };
+		ClusterTxResolution resolution, zero = { 0 };
+		ClusterTxResolveReason reason;
+		volatile bool caught = false;
+
+		canonical_reset(same_segment ? CANONICAL_SAME_SEGMENT : CANONICAL_SPLIT_SEGMENT);
+		test_tt_slot.status = TT_SLOT_ACTIVE;
+		test_tt_slot.commit_scn = InvalidScn;
+		test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+		admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+		admission.record_generation = 5;
+		admission.formation_epoch = test_formation_epoch;
+		admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+		admission.entered = true;
+		test_canonical_pause_hook = canonical_pause_cancel;
+		cluster_injection_armed_count = 1;
+		PG_TRY();
+		{
+			(void)cluster_runtime_visibility_resolve_exact_origin_admitted(
+				&test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, &resolution,
+				&reason);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		cluster_injection_armed_count = 0;
+		test_canonical_pause_hook = NULL;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(test_candidate_cancel_calls, 1);
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+		UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(zero)), 0);
+	}
+}
