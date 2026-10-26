@@ -1676,6 +1676,15 @@ cluster_undo_record_consume_preflight(ClusterUndoRecordPrepareReceipt *receipt, 
 	return CLUSTER_UNDO_RECORD_CONSUME_PREFLIGHT_READY;
 }
 
+bool
+cluster_undo_record_release_zero_effect_preflight(ClusterUndoRecordPrepareReceipt *receipt)
+{
+	/* This boundary fixture supplies no real shared APPLY proof. A RETRY
+	 * from its mocked publisher cannot authorize the new zero-effect exit. */
+	(void)receipt;
+	return false;
+}
+
 ClusterMxRecomposeResult
 cluster_multixact_current_recompose(const ClusterCurrentMxMemberDesc *members,
 									const ClusterCurrentMemberProof *proofs, uint16 nmembers,

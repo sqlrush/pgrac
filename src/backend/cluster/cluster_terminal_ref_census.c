@@ -6259,6 +6259,65 @@ ctrc_receipt_prepare_existing_locked(ClusterCtrcParticipantEntry *participant,
 }
 #endif
 
+bool
+cluster_ctrc_receipt_apply_evidence_recheck(const ClusterCtrcApplyEvidence *evidence)
+{
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	const ClusterCtrcReceiptHandle *handle;
+	const ClusterCtrcReceipt *receipt;
+
+	if (evidence == NULL || !ctrc_receipt_handle_exact(&evidence->handle)
+		|| (evidence->state_before != CTRC_RECEIPT_PREPARED
+			&& evidence->state_before != CTRC_RECEIPT_APPLIED))
+		return false;
+	handle = &evidence->handle;
+	receipt = handle->receipt;
+	if (pg_atomic_read_u32((pg_atomic_uint32 *)&receipt->state) != evidence->state_before
+		|| handle->participant->grant_generation != evidence->grant_generation
+		|| receipt->publication.grant_generation != evidence->grant_generation
+		|| memcmp(&receipt->publication, &evidence->publication, sizeof(receipt->publication)) != 0
+		|| memcmp(&receipt->target, &evidence->prior_target, sizeof(receipt->target)) != 0
+		|| receipt->disposition != CTRC_RELEASE_NONE
+		|| !XLogRecPtrIsInvalid(receipt->highest_local_wal_lsn)
+		|| !ctrc_bytes_zero(receipt->required_lsn, sizeof(receipt->required_lsn)))
+		return false;
+	pg_read_barrier();
+	return ctrc_receipt_handle_exact(handle)
+		&& pg_atomic_read_u32((pg_atomic_uint32 *)&receipt->state) == evidence->state_before;
+#else
+	(void)evidence;
+	return false;
+#endif
+}
+
+bool
+cluster_ctrc_receipt_capture_apply_evidence(const ClusterCtrcReceiptHandle *handle,
+	const ClusterCtrcTargetV1 *pending, bool reuse, ClusterCtrcApplyEvidence *out)
+{
+	if (out == NULL)
+		return false;
+	MemSet(out, 0, sizeof(*out));
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	if (!ctrc_receipt_handle_exact(handle) || pending == NULL)
+		return false;
+	out->handle = *handle;
+	out->publication = handle->receipt->publication;
+	out->prior_target = handle->receipt->target;
+	out->grant_generation = handle->participant->grant_generation;
+	out->state_before = reuse ? CTRC_RECEIPT_APPLIED : CTRC_RECEIPT_PREPARED;
+	return out->publication.reference_kind == CTRC_REF_HEAP_ITL_UBA
+		&& out->publication.journal_sequence != 0 && out->publication.key_sequence != 0
+		&& (reuse ? ctrc_target_exact_itl_valid(&handle->key, &out->prior_target)
+			: memcmp(&out->prior_target, pending, sizeof(*pending)) == 0)
+		&& cluster_ctrc_receipt_apply_evidence_recheck(out);
+#else
+	(void)handle;
+	(void)pending;
+	(void)reuse;
+	return false;
+#endif
+}
+
 /* Passive exact-handle observation for safe caller diagnostics. */
 #ifndef CLUSTER_CTRC_UNIT_TEST
 static void
@@ -6651,9 +6710,12 @@ cluster_ctrc_receipt_apply_prepared(ClusterCtrcParticipantEntry *participant,
 						   ? ctrc_target_itl_finalizes_prepared(&receipt->target, final_target)
 						   : ctrc_target_offnum_finalizes_exact(&receipt->publication,
 																&receipt->target, final_target);
-	if (participant->state != CTRC_PARTICIPANT_OPEN || !target_finalizes)
+	if (participant->state != CTRC_PARTICIPANT_OPEN || !target_finalizes) {
+		token->evidence.effect = CLUSTER_CTRC_EFFECT_ZERO_NO_MUTATION;
 		return CLUSTER_CTRC_APPLY_RETRY_REQUIRED;
+	}
 
+	token->evidence.effect = CLUSTER_CTRC_EFFECT_CHANGED;
 	receipt->target = *final_target;
 	pg_write_barrier();
 	expected = CTRC_RECEIPT_PREPARED;
@@ -6678,6 +6740,8 @@ cluster_ctrc_receipt_apply_shared(const ClusterCtrcReceiptHandle *handle,
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	ClusterCtrcApplyResult result;
 	uint32 state_before;
+	ClusterCtrcApplyEvidence evidence;
+	bool captured;
 
 	if (!ctrc_receipt_handle_exact(handle)) {
 		if (token != NULL)
@@ -6685,8 +6749,17 @@ cluster_ctrc_receipt_apply_shared(const ClusterCtrcReceiptHandle *handle,
 		return CLUSTER_CTRC_APPLY_FAIL_CLOSED;
 	}
 	state_before = pg_atomic_read_u32((pg_atomic_uint32 *)&handle->receipt->state);
+	captured = cluster_ctrc_receipt_capture_apply_evidence(
+		handle, &handle->receipt->target, false, &evidence);
 	result = cluster_ctrc_receipt_apply_prepared(handle->participant, handle->receipt, final_target,
 												 token);
+	if (token != NULL) {
+		evidence.effect = token->evidence.effect;
+		if (!captured || (evidence.effect == CLUSTER_CTRC_EFFECT_ZERO_NO_MUTATION
+			&& !cluster_ctrc_receipt_apply_evidence_recheck(&evidence)))
+			evidence.effect = CLUSTER_CTRC_EFFECT_UNKNOWN;
+		token->evidence = evidence;
+	}
 	if (result == CLUSTER_CTRC_APPLY_APPLIED && state_before == CTRC_RECEIPT_PREPARED)
 		cluster_ctrc_stat_bump(CTRC_STAT_RECEIPT_APPLIED);
 	return result;
@@ -6768,6 +6841,13 @@ cluster_ctrc_receipt_retarget_itl(ClusterCtrcParticipantEntry *participant,
 		|| receipt->publication.grant_generation != participant->grant_generation)
 		return CLUSTER_CTRC_APPLY_FAIL_CLOSED;
 
+	/* This rejection has not attempted even a transient state CAS. Keep the
+	 * original post-CAS identity check as well: a CAS/revert is not zero. */
+	if (pg_atomic_read_u32((pg_atomic_uint32 *)&receipt->state) == CTRC_RECEIPT_APPLIED
+		&& !ctrc_receipt_retarget_itl_exact(participant, receipt, pending_target, final_target)) {
+		token->evidence.effect = CLUSTER_CTRC_EFFECT_ZERO_NO_MUTATION;
+		return CLUSTER_CTRC_APPLY_RETRY_REQUIRED;
+	}
 	expected = CTRC_RECEIPT_APPLIED;
 	if (!pg_atomic_compare_exchange_u32((pg_atomic_uint32 *)&receipt->state, &expected,
 										CTRC_RECEIPT_RETARGETING))
@@ -6787,6 +6867,7 @@ cluster_ctrc_receipt_retarget_itl(ClusterCtrcParticipantEntry *participant,
 														   : CLUSTER_CTRC_APPLY_FAIL_CLOSED;
 	}
 
+	token->evidence.effect = CLUSTER_CTRC_EFFECT_CHANGED;
 	receipt->target = *final_target;
 	pg_write_barrier();
 	expected = CTRC_RECEIPT_RETARGETING;
@@ -6807,13 +6888,26 @@ cluster_ctrc_receipt_retarget_itl_shared(const ClusterCtrcReceiptHandle *handle,
 										 ClusterCtrcApplyToken *token)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
+	ClusterCtrcApplyEvidence evidence;
+	ClusterCtrcApplyResult result;
+	bool captured;
+
 	if (!ctrc_receipt_handle_exact(handle)) {
 		if (token != NULL)
 			MemSet(token, 0, sizeof(*token));
 		return CLUSTER_CTRC_APPLY_RETRY_REQUIRED;
 	}
-	return cluster_ctrc_receipt_retarget_itl(handle->participant, handle->receipt, pending_target,
+	captured = cluster_ctrc_receipt_capture_apply_evidence(handle, pending_target, true, &evidence);
+	result = cluster_ctrc_receipt_retarget_itl(handle->participant, handle->receipt, pending_target,
 											 final_target, token);
+	if (token != NULL) {
+		evidence.effect = token->evidence.effect;
+		if (!captured || (evidence.effect == CLUSTER_CTRC_EFFECT_ZERO_NO_MUTATION
+			&& !cluster_ctrc_receipt_apply_evidence_recheck(&evidence)))
+			evidence.effect = CLUSTER_CTRC_EFFECT_UNKNOWN;
+		token->evidence = evidence;
+	}
+	return result;
 #else
 	(void)handle;
 	(void)pending_target;

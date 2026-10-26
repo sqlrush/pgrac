@@ -427,14 +427,6 @@ extern bool cluster_ctrc_cleaner_read_scope_current_v3(const ClusterCtrcCleanerR
 													   RelFileLocator locator, ForkNumber fork,
 													   BlockNumber block);
 
-typedef struct ClusterCtrcApplyToken {
-	bool valid;
-	uint8 reserved8[7];
-	uint64 journal_sequence;
-	uint64 key_sequence;
-	uint64 journal_slot_generation;
-} ClusterCtrcApplyToken;
-
 /* Backend-local ownership handle for one bounded shared receipt slot.  This
  * is not a second receipt, wire object, shared ABI or transaction authority. */
 typedef struct ClusterCtrcReceiptHandle {
@@ -450,6 +442,42 @@ typedef struct ClusterCtrcReceiptHandle {
 	bool valid;
 	uint8 reserved8[7];
 } ClusterCtrcReceiptHandle;
+
+/* Local return evidence, never a shared row, wire value or durable format.
+ * ZERO is emitted only by a branch before its first target write or CAS.
+ * A later equality check qualifies that proof; it cannot create one. */
+#define CLUSTER_CTRC_APPLY_EVIDENCE_PRESENT 1
+typedef enum ClusterCtrcApplyEffect {
+	CLUSTER_CTRC_EFFECT_UNKNOWN = 0,
+	CLUSTER_CTRC_EFFECT_ZERO_NO_MUTATION,
+	CLUSTER_CTRC_EFFECT_CHANGED
+} ClusterCtrcApplyEffect;
+
+typedef struct ClusterCtrcApplyEvidence {
+	ClusterCtrcReceiptHandle handle;
+	ClusterCtrcPublicationIdV1 publication;
+	ClusterCtrcTargetV1 prior_target;
+	uint64 reservation_sequence;
+	uint32 state_before;
+	uint32 grant_generation;
+	uint8 ordinal;
+	ClusterCtrcApplyEffect effect;
+} ClusterCtrcApplyEvidence;
+
+typedef struct ClusterCtrcApplyToken {
+	bool valid;
+	uint8 reserved8[7];
+	uint64 journal_sequence;
+	uint64 key_sequence;
+	uint64 journal_slot_generation;
+	ClusterCtrcApplyEvidence evidence;
+} ClusterCtrcApplyToken;
+
+extern bool cluster_ctrc_receipt_capture_apply_evidence(
+	const ClusterCtrcReceiptHandle *handle, const ClusterCtrcTargetV1 *pending,
+	bool reuse, ClusterCtrcApplyEvidence *out);
+extern bool cluster_ctrc_receipt_apply_evidence_recheck(
+	const ClusterCtrcApplyEvidence *evidence);
 
 /* Passive, process-local diagnostic copy, never a receipt/authority token.
  * Table locks qualify physical key/publication binding and prevent reuse.

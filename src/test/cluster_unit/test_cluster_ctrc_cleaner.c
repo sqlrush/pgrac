@@ -74,6 +74,21 @@ pg_attribute_unused() test_spin_release(volatile slock_t *lock)
 #define SpinLockRelease(lock) test_spin_release(lock)
 
 static int test_clock_gettime(clockid_t clock_id, struct timespec *ts);
+static pg_atomic_uint32 *zero_cas_target;
+static unsigned zero_cas_failures, zero_cas_attempts;
+static bool
+test_zero_compare_exchange(pg_atomic_uint32 *ptr, uint32 *expected, uint32 value)
+{
+	if (ptr == zero_cas_target) {
+		zero_cas_attempts++;
+		if (zero_cas_failures > 0) {
+			zero_cas_failures--;
+			*expected = pg_atomic_read_u32(ptr);
+			return false;
+		}
+	}
+	return pg_atomic_compare_exchange_u32(ptr, expected, value);
+}
 static Size table_visits[6];
 static Size shared_validation_writer_visits;
 static void test_table_visit(unsigned kind);
@@ -81,7 +96,9 @@ static void test_pool_upgrade(void);
 #define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) test_table_visit(kind)
 #define CLUSTER_CTRC_TEST_POOL_UPGRADE() test_pool_upgrade()
 #define clock_gettime test_clock_gettime
+#define pg_atomic_compare_exchange_u32 test_zero_compare_exchange
 #include "../../backend/cluster/cluster_terminal_ref_census.c"
+#undef pg_atomic_compare_exchange_u32
 #undef clock_gettime
 #include "storage/proc.h"
 
@@ -1825,6 +1842,103 @@ prepare_fixture_receipt(ClusterCtrcOriginEntry *origin, uint64 operation_id,
 	fixture_receipt_inputs(origin, operation_id, &publication, &target);
 	return cluster_ctrc_receipt_prepare_shared(
 		&origin->key, &origin->touched[0], origin->grant_generation, &publication, &target, handle);
+}
+
+static void
+zero_shared_fixture(ClusterCtrcReceiptHandle *handle, ClusterCtrcTargetV1 *target)
+{
+	ClusterCtrcOriginEntry *origin;
+	reset_fixture();
+	origin = seed_origin(0, 1);
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 901, handle), CLUSTER_CTRC_PREPARE_READY);
+	*target = handle->receipt->target;
+	target->kind = CTRC_TARGET_EXACT_ITL_SLOT;
+	target->itl_xid = origin->key.xid;
+	target->itl_class = 1;
+	target->itl_slot_wrap = 1;
+	target->uba[0] = 1;
+	target->planned_predecessor_sha256[0] = 1;
+	target->planned_successor_sha256[0] = 2;
+	zero_cas_target = (pg_atomic_uint32 *)&handle->receipt->state;
+	zero_cas_attempts = zero_cas_failures = 0;
+}
+
+UT_TEST(test_shared_exact_zero_binds_original_handle_target_and_generation)
+{
+	ClusterCtrcReceiptHandle handle;
+	ClusterCtrcTargetV1 target, pending;
+	ClusterCtrcApplyEvidence baseline;
+	ClusterCtrcApplyToken token;
+	uint64 generation;
+
+	zero_shared_fixture(&handle, &target);
+	pending = handle.receipt->target;
+	UT_ASSERT(cluster_ctrc_receipt_capture_apply_evidence(&handle, &pending, false, &baseline));
+	target.block_number++;
+	UT_ASSERT_EQ(cluster_ctrc_receipt_apply_shared(&handle, &target, &token),
+		CLUSTER_CTRC_APPLY_RETRY_REQUIRED);
+	UT_ASSERT_EQ(token.evidence.effect, CLUSTER_CTRC_EFFECT_ZERO_NO_MUTATION);
+	UT_ASSERT_EQ(zero_cas_attempts, 0);
+	UT_ASSERT(cluster_ctrc_receipt_apply_evidence_recheck(&token.evidence));
+	UT_ASSERT_EQ(memcmp(&baseline.prior_target, &token.evidence.prior_target, sizeof(pending)), 0);
+	generation = handle.receipt->publication.journal_slot_generation;
+	handle.receipt->publication.journal_slot_generation++;
+	UT_ASSERT(!cluster_ctrc_receipt_apply_evidence_recheck(&token.evidence));
+	handle.receipt->publication.journal_slot_generation = generation;
+	token.evidence.prior_target.block_number++;
+	UT_ASSERT(!cluster_ctrc_receipt_apply_evidence_recheck(&token.evidence));
+
+	target.block_number--;
+	UT_ASSERT_EQ(cluster_ctrc_receipt_apply_shared(&handle, &target, &token), CLUSTER_CTRC_APPLY_APPLIED);
+	UT_ASSERT(!cluster_ctrc_receipt_apply_evidence_recheck(&baseline));
+	UT_ASSERT(cluster_ctrc_receipt_capture_apply_evidence(&handle, &pending, true, &baseline));
+	zero_cas_attempts = 0;
+	target.planned_predecessor_sha256[0] ^= 1;
+	UT_ASSERT_EQ(cluster_ctrc_receipt_retarget_itl_shared(&handle, &pending, &target, &token),
+		CLUSTER_CTRC_APPLY_RETRY_REQUIRED);
+	UT_ASSERT_EQ(token.evidence.effect, CLUSTER_CTRC_EFFECT_ZERO_NO_MUTATION);
+	UT_ASSERT_EQ(zero_cas_attempts, 0);
+	UT_ASSERT(cluster_ctrc_receipt_apply_evidence_recheck(&token.evidence));
+	UT_ASSERT_EQ(handle.participant->applied_count, 1);
+	UT_ASSERT_EQ(handle.participant->prepared_count, 0);
+	zero_cas_target = NULL;
+}
+
+UT_TEST(test_shared_failed_cas_and_later_equality_never_produce_zero)
+{
+	ClusterCtrcReceiptHandle handle;
+	ClusterCtrcTargetV1 target, pending;
+	ClusterCtrcApplyEvidence baseline;
+	ClusterCtrcApplyToken token;
+
+	zero_shared_fixture(&handle, &target);
+	pending = handle.receipt->target;
+	UT_ASSERT(cluster_ctrc_receipt_capture_apply_evidence(&handle, &pending, false, &baseline));
+	zero_cas_failures = 1;
+	UT_ASSERT_EQ(cluster_ctrc_receipt_apply_shared(&handle, &target, &token),
+		CLUSTER_CTRC_APPLY_RETRY_REQUIRED);
+	UT_ASSERT_EQ(zero_cas_attempts, 1);
+	UT_ASSERT_EQ(handle.receipt->state, CTRC_RECEIPT_PREPARED);
+	UT_ASSERT_EQ(token.evidence.effect, CLUSTER_CTRC_EFFECT_CHANGED);
+	UT_ASSERT(!cluster_ctrc_receipt_apply_evidence_recheck(&baseline));
+	/* Equality after the fact does not change the original branch result. */
+	handle.receipt->target = baseline.prior_target;
+	UT_ASSERT(cluster_ctrc_receipt_apply_evidence_recheck(&baseline));
+	UT_ASSERT_EQ(token.evidence.effect, CLUSTER_CTRC_EFFECT_CHANGED);
+	UT_ASSERT_EQ(cluster_ctrc_receipt_apply_shared(&handle, &target, &token), CLUSTER_CTRC_APPLY_APPLIED);
+	UT_ASSERT(cluster_ctrc_receipt_capture_apply_evidence(&handle, &pending, true, &baseline));
+	memcpy(target.planned_predecessor_sha256, target.planned_successor_sha256,
+		sizeof(target.planned_predecessor_sha256));
+	target.uba[0]++;
+	target.planned_successor_sha256[0]++;
+	zero_cas_failures = 1;
+	zero_cas_attempts = 0;
+	UT_ASSERT_EQ(cluster_ctrc_receipt_retarget_itl_shared(&handle, &pending, &target, &token),
+		CLUSTER_CTRC_APPLY_FAIL_CLOSED);
+	UT_ASSERT_EQ(zero_cas_attempts, 1);
+	UT_ASSERT_EQ(token.evidence.effect, CLUSTER_CTRC_EFFECT_UNKNOWN);
+	UT_ASSERT(cluster_ctrc_receipt_apply_evidence_recheck(&baseline));
+	zero_cas_target = NULL;
 }
 
 UT_TEST(test_local_receipt_refuses_missing_or_aliased_origin_protection)
@@ -7020,7 +7134,9 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(167);
+	UT_PLAN(169);
+	UT_RUN(test_shared_exact_zero_binds_original_handle_target_and_generation);
+	UT_RUN(test_shared_failed_cas_and_later_equality_never_produce_zero);
 	UT_RUN(test_receipt_observed_identity_refusal_precedes_chain_blocking);
 	UT_RUN(test_receipt_original_identity_refusal_precedes_chain_blocking);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);

@@ -206,6 +206,10 @@ extern ClusterCtrcApplyResult cluster_undo_record_ctrc_apply_prepared(
 extern void cluster_undo_record_cancel_prepared(ClusterUndoRecordPrepareReceipt *receipt);
 /* PGRAC: abort-only; the caller must have completed LWLockReleaseAll(). */
 extern void cluster_undo_record_abort_prepared_after_lwlock_release(void);
+/* Release only a branch-proven zero-effect preflight, once. Retain the
+ * reservation, deadline and refs for the original out-of-heap requalifier. */
+extern bool cluster_undo_record_release_zero_effect_preflight(
+	ClusterUndoRecordPrepareReceipt *receipt);
 extern ClusterUndoRecordConsumePreflightResult
 cluster_undo_record_consume_preflight(ClusterUndoRecordPrepareReceipt *receipt, uint16 payload_len);
 extern ClusterUndoRecordConsumeResult

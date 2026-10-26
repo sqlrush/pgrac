@@ -1243,6 +1243,49 @@ UT_TEST(test_ctrc_heap_apply_is_nonblocking_and_precedes_all_reference_mutation)
 	UT_ASSERT(token.valid);
 }
 
+UT_TEST(test_ctrc_exact_zero_evidence_precedes_target_write_and_retarget_cas)
+{
+	ClusterCtrcParticipantEntry participant;
+	ClusterCtrcPublicationIdV1 publication
+		= test_publication(203, CTRC_REF_HEAP_ITL_UBA, CTRC_TARGET_PAGE_PENDING_ITL_SLOT);
+	ClusterCtrcTargetV1 pending = test_pending_itl_target();
+	ClusterCtrcTargetV1 exact = test_exact_itl_target();
+	ClusterCtrcReceipt receipt = { 0 };
+	ClusterCtrcReceipt before;
+	ClusterCtrcApplyToken token;
+
+	test_open_participant(&participant);
+	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare(&participant, &publication, &pending, &receipt),
+		CLUSTER_CTRC_PREPARE_READY);
+	before = receipt;
+	exact.block_number++; /* Valid target, but not this prepared page. */
+	UT_ASSERT_EQ(cluster_ctrc_receipt_apply_prepared(&participant, &receipt, &exact, &token),
+		CLUSTER_CTRC_APPLY_RETRY_REQUIRED);
+	UT_ASSERT_EQ(memcmp(&receipt, &before, sizeof(receipt)), 0);
+#ifdef CLUSTER_CTRC_APPLY_EVIDENCE_PRESENT
+	UT_ASSERT_EQ(token.evidence.effect, CLUSTER_CTRC_EFFECT_ZERO_NO_MUTATION);
+#else
+	UT_ASSERT(false); /* Baseline RETRY has no branch-qualified evidence. */
+#endif
+	exact.block_number--;
+	UT_ASSERT_EQ(cluster_ctrc_receipt_apply_prepared(&participant, &receipt, &exact, &token),
+		CLUSTER_CTRC_APPLY_APPLIED);
+#ifdef CLUSTER_CTRC_APPLY_EVIDENCE_PRESENT
+	UT_ASSERT_EQ(token.evidence.effect, CLUSTER_CTRC_EFFECT_CHANGED);
+#endif
+	before = receipt;
+	/* This cannot continue the original applied target's successor chain. */
+	exact.planned_predecessor_sha256[0] ^= 1;
+	UT_ASSERT_EQ(cluster_ctrc_receipt_retarget_itl(&participant, &receipt, &pending, &exact, &token),
+		CLUSTER_CTRC_APPLY_RETRY_REQUIRED);
+	UT_ASSERT_EQ(memcmp(&receipt, &before, sizeof(receipt)), 0);
+#ifdef CLUSTER_CTRC_APPLY_EVIDENCE_PRESENT
+	UT_ASSERT_EQ(token.evidence.effect, CLUSTER_CTRC_EFFECT_ZERO_NO_MUTATION);
+#else
+	UT_ASSERT(false);
+#endif
+}
+
 UT_TEST(test_ctrc_same_itl_retarget_is_exact_nonblocking_and_count_neutral)
 {
 	ClusterCtrcParticipantEntry participant;
@@ -4011,6 +4054,7 @@ main(void)
 		CTRC_TEST_ENTRY(test_ctrc_indexed_receipt_probe_and_tombstone_reclaim_are_exact),
 		CTRC_TEST_ENTRY(test_ctrc_heap_apply_is_nonblocking_and_precedes_all_reference_mutation),
 		CTRC_TEST_ENTRY(test_ctrc_same_itl_retarget_is_exact_nonblocking_and_count_neutral),
+		CTRC_TEST_ENTRY(test_ctrc_exact_zero_evidence_precedes_target_write_and_retarget_cas),
 		CTRC_TEST_ENTRY(test_ctrc_retargeting_owner_loss_blocks_without_release),
 		CTRC_TEST_ENTRY(test_ctrc_current_mx_receipt_applies_only_exact_active_target),
 		CTRC_TEST_ENTRY(

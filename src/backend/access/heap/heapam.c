@@ -10245,6 +10245,7 @@ cluster_heap_no_retry_boundary_apply(
 		if (result != CLUSTER_CTRC_APPLY_APPLIED)
 			return !any_applied
 				&& result == CLUSTER_CTRC_APPLY_RETRY_REQUIRED
+				&& cluster_undo_record_release_zero_effect_preflight(undo_receipt)
 				? CLUSTER_HEAP_BOUNDARY_ZERO_APPLY_RETRY
 				: CLUSTER_HEAP_BOUNDARY_REFUSED;
 	}

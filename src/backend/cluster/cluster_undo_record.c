@@ -350,6 +350,10 @@ typedef struct ClusterUndoRecordReservation {
 	bool owns_ref;
 	bool consume_locked;
 	bool apply_attempted;
+	bool apply_evidence_ready;
+	uint8 apply_attempted_mask;
+	uint8 zero_effect_mask;
+	ClusterCtrcApplyEvidence apply_evidence[CLUSTER_UNDO_RECORD_CTRC_TARGETS];
 	uint64 sequence;
 	int ref_slot;
 	int consume_local_head_idx;
@@ -3032,6 +3036,8 @@ cluster_undo_record_prepare_trace_impl(uint8 record_type, uint16 payload_capacit
 
 	reservation->sequence = ++cluster_undo_record_reservation_floor;
 	reservation->apply_attempted = false;
+	reservation->apply_evidence_ready = false;
+	reservation->apply_attempted_mask = reservation->zero_effect_mask = 0;
 	memset(&reservation->receipt, 0, sizeof(reservation->receipt));
 	reservation->receipt.magic = CLUSTER_UNDO_RECORD_RECEIPT_MAGIC;
 	reservation->receipt.record_type = record_type;
@@ -3376,6 +3382,7 @@ cluster_undo_record_ctrc_apply_prepared(ClusterUndoRecordPrepareReceipt *receipt
 										ClusterCtrcApplyToken *token)
 {
 	ClusterCtrcApplyResult result;
+	ClusterCtrcApplyEvidence evidence;
 	uint8 target_bit;
 
 	if (target_ordinal >= CLUSTER_UNDO_RECORD_CTRC_TARGETS)
@@ -3385,6 +3392,7 @@ cluster_undo_record_ctrc_apply_prepared(ClusterUndoRecordPrepareReceipt *receipt
 		|| (receipt->ctrc_pending_mask & target_bit) == 0
 		|| (receipt->ctrc_prepared_mask & target_bit) == 0
 		|| (receipt->ctrc_applied_mask & target_bit) != 0
+		|| (cluster_undo_record_reservation.apply_attempted_mask & target_bit) != 0
 		|| !receipt->ctrc_handles[target_ordinal].valid
 		|| receipt->itl_history_mask != receipt->ctrc_pending_mask
 		|| receipt->itl_history[target_ordinal].block != final_target->block_number
@@ -3394,6 +3402,8 @@ cluster_undo_record_ctrc_apply_prepared(ClusterUndoRecordPrepareReceipt *receipt
 	/* PGRAC: even a refusal or failed local mask sync cannot prove that
 	 * an attempted shared APPLY/retarget had no effect. */
 	cluster_undo_record_reservation.apply_attempted = true;
+	cluster_undo_record_reservation.apply_attempted_mask |= target_bit;
+	cluster_undo_record_reservation.zero_effect_mask &= ~target_bit;
 	if (cluster_trace_normal_stop)
 		undo_receipt_consumer_trace_begin(receipt, target_ordinal, final_target);
 	result = (receipt->ctrc_reuse_mask & target_bit) != 0
@@ -3402,6 +3412,19 @@ cluster_undo_record_ctrc_apply_prepared(ClusterUndoRecordPrepareReceipt *receipt
 					   &receipt->ctrc_pending_targets[target_ordinal], final_target, token)
 				 : cluster_ctrc_receipt_apply_shared(&receipt->ctrc_handles[target_ordinal],
 													 final_target, token);
+	/* Keep the original branch proof before any diagnostic can throw ERROR.
+	 * A snapshot, RETRY result, or zero local mask cannot create this proof. */
+	evidence = token->evidence;
+	evidence.reservation_sequence = receipt->reservation_sequence;
+	evidence.ordinal = target_ordinal;
+	if (result != CLUSTER_CTRC_APPLY_APPLIED
+		&& evidence.effect == CLUSTER_CTRC_EFFECT_ZERO_NO_MUTATION
+		&& cluster_undo_record_reservation.apply_evidence_ready) {
+		evidence.effect = CLUSTER_CTRC_EFFECT_UNKNOWN;
+		if (memcmp(&evidence, &cluster_undo_record_reservation.apply_evidence[target_ordinal],
+				   sizeof(evidence)) == 0)
+			cluster_undo_record_reservation.zero_effect_mask |= target_bit;
+	}
 	if (cluster_trace_normal_stop)
 		undo_receipt_consumer_trace_result(receipt, target_ordinal, result, -1);
 	if (result != CLUSTER_CTRC_APPLY_APPLIED)
@@ -3568,7 +3591,8 @@ cluster_undo_record_requalify_for_retry(ClusterUndoRecordPrepareReceipt *receipt
 		cluster_undo_receipt_reason = "RESERVATION_MISMATCH";
 		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
 	}
-	if (receipt->ctrc_applied_mask != 0 || cluster_undo_record_reservation.consume_locked) {
+	if (receipt->ctrc_applied_mask != 0 || cluster_undo_record_reservation.consume_locked
+		|| cluster_undo_record_reservation.apply_attempted) {
 		cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_POST_APPLY_REPREPARE);
 		cluster_undo_receipt_reason = "POST_APPLY_REPREPARE_REFUSED";
 		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
@@ -3725,6 +3749,62 @@ cluster_undo_record_cancel_prepared(ClusterUndoRecordPrepareReceipt *receipt)
 }
 
 
+/* The branch result and unchanged baselines must agree for every ordinal.
+ * Nonattempted borrowed APPLIED receipts remain owned by their original
+ * publication; only this reservation's new work is being retired. */
+static bool
+undo_record_zero_effect_exact(const ClusterUndoRecordPrepareReceipt *receipt)
+{
+	const ClusterUndoRecordReservation *reservation = &cluster_undo_record_reservation;
+	uint8 ordinal;
+
+	if (!reservation->apply_evidence_ready || !cluster_undo_record_receipt_extent_matches(receipt)
+		|| receipt->ctrc_pending_mask == 0
+		|| (receipt->ctrc_pending_mask & ~((1U << CLUSTER_UNDO_RECORD_CTRC_TARGETS) - 1)) != 0
+		|| receipt->ctrc_prepared_mask != receipt->ctrc_pending_mask
+		|| (receipt->ctrc_reuse_mask & ~receipt->ctrc_pending_mask) != 0
+		|| (reservation->apply_attempted_mask & ~receipt->ctrc_pending_mask) != 0
+		|| receipt->ctrc_applied_mask != 0
+		|| (reservation->apply_attempted_mask & ~reservation->zero_effect_mask) != 0)
+		return false;
+	for (ordinal = 0; ordinal < CLUSTER_UNDO_RECORD_CTRC_TARGETS; ordinal++) {
+		const ClusterCtrcApplyEvidence *evidence = &reservation->apply_evidence[ordinal];
+		uint8 bit = UINT8_C(1) << ordinal;
+		bool reuse = (receipt->ctrc_reuse_mask & bit) != 0;
+
+		if ((receipt->ctrc_pending_mask & bit) == 0)
+			continue;
+		if ((receipt->ctrc_prepared_mask & bit) == 0
+			|| evidence->reservation_sequence != receipt->reservation_sequence
+			|| evidence->ordinal != ordinal
+			|| evidence->state_before != (reuse ? CTRC_RECEIPT_APPLIED : CTRC_RECEIPT_PREPARED)
+			|| memcmp(&evidence->handle, &receipt->ctrc_handles[ordinal], sizeof(evidence->handle)) != 0
+			|| evidence->publication.requester_backend_id != MyBackendId
+			|| (!reuse && (memcmp(&evidence->prior_target, &receipt->ctrc_pending_targets[ordinal],
+								 sizeof(evidence->prior_target)) != 0
+				|| evidence->publication.wire_request_id != receipt->reservation_sequence
+				|| evidence->publication.attempt_generation != receipt->ctrc_attempt_generation))
+			|| !cluster_ctrc_receipt_apply_evidence_recheck(evidence))
+			return false;
+	}
+	return true;
+}
+
+bool
+cluster_undo_record_release_zero_effect_preflight(ClusterUndoRecordPrepareReceipt *receipt)
+{
+	ClusterUndoRecordReservation *reservation = &cluster_undo_record_reservation;
+
+	if (!reservation->consume_locked || !undo_record_zero_effect_exact(receipt))
+		return false;
+	cluster_undo_buf_unlock_ref(reservation->ref_slot);
+	reservation->consume_locked = false;
+	reservation->consume_local_head_idx = -1;
+	reservation->consume_effective_prev_uba = InvalidUba;
+	reservation->apply_attempted = false;
+	return true;
+}
+
 /* PGRAC: called only after PG has released all LWLocks during abort.
  * Reconcile lock-only bookkeeping, never unlock twice or withdraw an
  * obligation whose shared APPLY may already have taken effect. */
@@ -3735,6 +3815,8 @@ cluster_undo_record_abort_prepared_after_lwlock_release(void)
 
 	if (!reservation->active)
 		return;
+	if (reservation->apply_attempted && undo_record_zero_effect_exact(&reservation->receipt))
+		reservation->apply_attempted = false;
 	reservation->consume_locked = false;
 	reservation->consume_local_head_idx = -1;
 	reservation->consume_effective_prev_uba = InvalidUba;
@@ -3760,8 +3842,10 @@ cluster_undo_record_consume_preflight(ClusterUndoRecordPrepareReceipt *receipt, 
 	ClusterUndoRecordReservation *reservation = &cluster_undo_record_reservation;
 	uint32 record_length;
 	int local_head_idx;
+	uint8 ordinal;
 
 	if (receipt == NULL || payload_len > receipt->payload_capacity || reservation->consume_locked
+		|| reservation->apply_attempted
 		|| receipt->ctrc_applied_mask != 0)
 		return CLUSTER_UNDO_RECORD_CONSUME_PREFLIGHT_REFUSED;
 	if (!cluster_undo_record_receipt_extent_matches(receipt)
@@ -3798,6 +3882,25 @@ cluster_undo_record_consume_preflight(ClusterUndoRecordPrepareReceipt *receipt, 
 		cluster_undo_buf_unlock_ref(reservation->ref_slot);
 		return CLUSTER_UNDO_RECORD_CONSUME_PREFLIGHT_RETRY_REQUIRED;
 	}
+	reservation->apply_evidence_ready = false;
+	reservation->apply_attempted_mask = reservation->zero_effect_mask = 0;
+	for (ordinal = 0; ordinal < CLUSTER_UNDO_RECORD_CTRC_TARGETS; ordinal++) {
+		ClusterCtrcApplyEvidence *evidence = &reservation->apply_evidence[ordinal];
+		uint8 bit = UINT8_C(1) << ordinal;
+
+		if ((receipt->ctrc_pending_mask & bit) == 0)
+			continue;
+		if (!cluster_ctrc_receipt_capture_apply_evidence(&receipt->ctrc_handles[ordinal],
+				&receipt->ctrc_pending_targets[ordinal], (receipt->ctrc_reuse_mask & bit) != 0,
+				evidence)) {
+			cluster_undo_buf_unlock_ref(reservation->ref_slot);
+			/* A missing handle/provenance is not contention or zero proof. */
+			return CLUSTER_UNDO_RECORD_CONSUME_PREFLIGHT_REFUSED;
+		}
+		evidence->reservation_sequence = receipt->reservation_sequence;
+		evidence->ordinal = ordinal;
+	}
+	reservation->apply_evidence_ready = true;
 	reservation->consume_locked = true;
 	reservation->consume_local_head_idx = local_head_idx;
 	reservation->consume_effective_prev_uba = cluster_undo_local_heads[local_head_idx].head;

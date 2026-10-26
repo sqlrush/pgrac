@@ -9712,6 +9712,8 @@ test_cluster_undo_ctrc_product.o: $(top_srcdir)/src/backend/cluster/cluster_term
 		-Dcluster_ctrc_receipt_retarget_itl_shared=undo_ctrc_unavailable_retarget_shared \
 		-Dcluster_ctrc_receipt_cancel_shared=undo_ctrc_unavailable_cancel_shared \
 		-Dcluster_ctrc_receipt_observe_shared=undo_ctrc_unavailable_observe_shared \
+		-Dcluster_ctrc_receipt_capture_apply_evidence=undo_ctrc_unavailable_capture_apply_evidence \
+		-Dcluster_ctrc_receipt_apply_evidence_recheck=undo_ctrc_unavailable_apply_evidence_recheck \
 		-c $< -o $@
 
 test_cluster_undo_record: test_cluster_undo_record.c unit_test.h \
