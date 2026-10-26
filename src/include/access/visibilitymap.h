@@ -8,7 +8,7 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * PGRAC MODIFICATIONS by SqlRush <sqlrush@gmail.com>
- *    Separate coherent bitmap observations from raw diagnostic reads.
+ *    Keep VM read-lock lifetimes separate from bitmap permissions.
  *    Spec: 2026-10-19-pre2-m1-vm-positive-paths.md
  *
  * src/include/access/visibilitymap.h
@@ -89,6 +89,22 @@ extern uint8 visibilitymap_get_status(Relation rel, BlockNumber heapBlk, Buffer 
  * False clears status. This does not authorize visibility or freeze skips. */
 extern bool visibilitymap_get_status_pinned(Relation rel, BlockNumber heapBlk, Buffer vmbuf,
 										   uint8 *status);
+/* Zero-initialize before first use; do not copy or reuse an active scope.
+ * Owns only a shared VM read lock. The map pin remains caller-owned.
+ * No snapshot admission, publication proof or visibility/freeze permission. */
+typedef struct VisibilityMapReadScope
+{
+	Buffer locked_buffer;
+} VisibilityMapReadScope;
+
+/* Retain the relation lifecycle lock; enter without content locks or a critical
+ * section. End before releasing/rebinding the map pin, I/O, waiting or another
+ * block acquisition. False clears status; an active scope is left unchanged.
+ * Native or missing-map success acquires no read lock. */
+extern bool visibilitymap_read_begin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf,
+									 VisibilityMapReadScope *scope, uint8 *status);
+/* Idempotent; releases only this scope's read lock, never the caller's pin. */
+extern void visibilitymap_read_end(VisibilityMapReadScope *scope);
 /* No content locks on entry; relation lifecycle lock retained. False clears
  * status. Success observes bits only, without granting visibility/freeze skips.
  * The returned pin remains caller-owned, with no retained content lock. */

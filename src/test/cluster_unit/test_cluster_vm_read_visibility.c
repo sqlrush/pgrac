@@ -98,7 +98,7 @@ ReadBufferExtended(Relation rel, ForkNumber fork, BlockNumber block,
 	(void)strategy;
 	UT_ASSERT_EQ(fork, VISIBILITYMAP_FORKNUM);
 	UT_ASSERT_EQ(block, 0);
-	UT_ASSERT_EQ(mode, fixture_shared ? RBM_NORMAL : RBM_ZERO_ON_ERROR);
+	UT_ASSERT_EQ(mode, fixture_shared && RelationIsPermanent(rel) ? RBM_NORMAL : RBM_ZERO_ON_ERROR);
 	fixture_reads++;
 	fixture_locator = rel->rd_locator;
 	fixture_fork = fork;
@@ -445,10 +445,226 @@ UT_TEST(coherent_vm_zero_and_missing_pages_remain_read_only)
 	UT_ASSERT_EQ(fixture_grants, 0);
 }
 
+UT_TEST(vm_read_scope_retains_current_image_until_end)
+{
+	RelationData relation;
+	FormData_pg_class form;
+	Buffer buffer = InvalidBuffer;
+	VisibilityMapReadScope scope = {0};
+	uint8 status = 0xff;
+
+	setup_coherent_vm(&relation, &form);
+	PageGetContents(disk_vm.data)[0] = 0;
+	PageGetContents(current_vm.data)[0] = VISIBILITYMAP_VALID_BITS;
+	UT_ASSERT(visibilitymap_read_begin(&relation, 0, &buffer, &scope, &status));
+	UT_ASSERT_EQ(status, VISIBILITYMAP_VALID_BITS);
+	UT_ASSERT_EQ(scope.locked_buffer, buffer);
+	UT_ASSERT(fixture_locked);
+	UT_ASSERT_EQ(fixture_grants, 1);
+	UT_ASSERT_EQ(fixture_unlocks, 0);
+	UT_ASSERT(visibilitymap_get_status_pinned(&relation, 0, buffer, &status));
+	UT_ASSERT_EQ(status, VISIBILITYMAP_VALID_BITS);
+	visibilitymap_read_end(&scope);
+	UT_ASSERT_EQ(scope.locked_buffer, InvalidBuffer);
+	UT_ASSERT(!fixture_locked);
+	UT_ASSERT_EQ(buffer, 1);
+	UT_ASSERT_EQ(fixture_unlocks, 1);
+	UT_ASSERT_EQ(fixture_releases, 0);
+
+	/* The next operation must revalidate the grant and observe the clear. */
+	PageGetContents(current_vm.data)[0] = 0;
+	UT_ASSERT(visibilitymap_read_begin(&relation, 0, &buffer, &scope, &status));
+	UT_ASSERT_EQ(status, 0);
+	UT_ASSERT(fixture_locked);
+	UT_ASSERT_EQ(fixture_reads, 1);
+	UT_ASSERT_EQ(fixture_grants, 2);
+	visibilitymap_read_end(&scope);
+	UT_ASSERT_EQ(fixture_unlocks, 2);
+	UT_ASSERT_EQ(fixture_releases, 0);
+}
+
+UT_TEST(vm_read_scope_reuse_preserves_active_owner_and_end_is_idempotent)
+{
+	RelationData relation;
+	FormData_pg_class form;
+	Buffer buffer = InvalidBuffer;
+	Buffer other = InvalidBuffer;
+	VisibilityMapReadScope scope = {0};
+	uint8 status;
+
+	setup_coherent_vm(&relation, &form);
+	UT_ASSERT(visibilitymap_read_begin(&relation, 0, &buffer, &scope, &status));
+	status = VISIBILITYMAP_VALID_BITS;
+	UT_ASSERT(!visibilitymap_read_begin(&relation, 1, &other, &scope, &status));
+	UT_ASSERT_EQ(status, 0);
+	UT_ASSERT_EQ(other, InvalidBuffer);
+	UT_ASSERT_EQ(scope.locked_buffer, buffer);
+	UT_ASSERT(fixture_locked);
+	UT_ASSERT_EQ(fixture_reads, 1);
+	UT_ASSERT_EQ(fixture_grants, 1);
+	UT_ASSERT_EQ(fixture_unlocks, 0);
+	visibilitymap_read_end(&scope);
+	visibilitymap_read_end(&scope);
+	visibilitymap_read_end(NULL);
+	UT_ASSERT_EQ(fixture_unlocks, 1);
+	UT_ASSERT_EQ(fixture_releases, 0);
+	UT_ASSERT_EQ(buffer, 1);
+	UT_ASSERT_EQ(scope.locked_buffer, InvalidBuffer);
+	UT_ASSERT(!fixture_locked);
+}
+
+UT_TEST(vm_read_scope_rebinds_wrong_cached_tags_before_locking)
+{
+	for (unsigned mismatch = 0; mismatch < 3; mismatch++) {
+		RelationData relation;
+		FormData_pg_class form;
+		Buffer buffer = 1;
+		VisibilityMapReadScope scope = {0};
+		uint8 status;
+
+		setup_coherent_vm(&relation, &form);
+		if (mismatch == 0)
+			fixture_locator.relNumber++;
+		else if (mismatch == 1)
+			fixture_fork = MAIN_FORKNUM;
+		else
+			fixture_block++;
+		UT_ASSERT(visibilitymap_read_begin(&relation, 0, &buffer, &scope, &status));
+		UT_ASSERT_EQ(status, 0);
+		UT_ASSERT_EQ(scope.locked_buffer, buffer);
+		UT_ASSERT(fixture_locked);
+		UT_ASSERT_EQ(fixture_releases, 1);
+		UT_ASSERT_EQ(fixture_reads, 1);
+		UT_ASSERT_EQ(fixture_grants, 1);
+		UT_ASSERT_EQ(fixture_unlocks, 0);
+		visibilitymap_read_end(&scope);
+		UT_ASSERT(!fixture_locked);
+		UT_ASSERT_EQ(fixture_unlocks, 1);
+		UT_ASSERT_EQ(fixture_releases, 1);
+	}
+}
+
+UT_TEST(vm_read_scope_refuses_without_positive_output_or_retained_lock)
+{
+	for (unsigned refusal = 0; refusal < 5; refusal++) {
+		RelationData relation;
+		FormData_pg_class form;
+		Buffer buffer = InvalidBuffer;
+		VisibilityMapReadScope scope = {0};
+		uint8 status = VISIBILITYMAP_VALID_BITS;
+
+		setup_coherent_vm(&relation, &form);
+		PageGetContents(current_vm.data)[0] = VISIBILITYMAP_VALID_BITS;
+		if (refusal == 0)
+			fixture_grant_allowed = false;
+		else if (refusal == 1)
+			fixture_pcm = false;
+		else if (refusal == 2)
+			((PageHeader)current_vm.data)->pd_block_scn = 0;
+		else if (refusal == 3)
+			((PageHeader)current_vm.data)->pd_special--;
+		else
+			PageGetContents(current_vm.data)[0] = VISIBILITYMAP_ALL_FROZEN;
+		UT_ASSERT(!visibilitymap_read_begin(&relation, 0, &buffer, &scope, &status));
+		UT_ASSERT_EQ(status, 0);
+		UT_ASSERT_EQ(scope.locked_buffer, InvalidBuffer);
+		UT_ASSERT(!fixture_locked);
+		UT_ASSERT_EQ(fixture_grants, fixture_unlocks);
+		UT_ASSERT_EQ(fixture_releases, 0);
+		visibilitymap_read_end(&scope);
+		UT_ASSERT_EQ(fixture_grants, fixture_unlocks);
+	}
+}
+
+UT_TEST(vm_read_scope_bad_arguments_do_not_acquire_or_release)
+{
+	for (unsigned bad = 0; bad < 5; bad++) {
+		RelationData relation;
+		FormData_pg_class form;
+		Buffer buffer = InvalidBuffer;
+		VisibilityMapReadScope scope = {0};
+		uint8 status = VISIBILITYMAP_VALID_BITS;
+
+		setup_coherent_vm(&relation, &form);
+		UT_ASSERT(!visibilitymap_read_begin(bad == 0 ? NULL : &relation,
+										bad == 1 ? InvalidBlockNumber : 0,
+										bad == 2 ? NULL : &buffer,
+										bad == 3 ? NULL : &scope,
+										bad == 4 ? NULL : &status));
+		UT_ASSERT_EQ(status, bad == 4 ? VISIBILITYMAP_VALID_BITS : 0);
+		UT_ASSERT_EQ(scope.locked_buffer, InvalidBuffer);
+		UT_ASSERT_EQ(buffer, InvalidBuffer);
+		UT_ASSERT_EQ(fixture_reads + fixture_grants + fixture_releases, 0);
+		visibilitymap_read_end(&scope);
+		UT_ASSERT_EQ(fixture_unlocks, 0);
+	}
+}
+
+UT_TEST(vm_read_scope_zero_and_missing_maps_remain_read_only)
+{
+	RelationData relation;
+	FormData_pg_class form;
+	Buffer buffer = InvalidBuffer;
+	VisibilityMapReadScope scope = {0};
+	uint8 status;
+
+	setup_coherent_vm(&relation, &form);
+	memset(&current_vm, 0, sizeof(current_vm));
+	UT_ASSERT(visibilitymap_read_begin(&relation, 0, &buffer, &scope, &status));
+	UT_ASSERT_EQ(status, 0);
+	UT_ASSERT(fixture_locked);
+	UT_ASSERT(PageIsNew(reader_vm.data));
+	visibilitymap_read_end(&scope);
+	UT_ASSERT(PageIsNew(current_vm.data));
+	PageGetContents(current_vm.data)[0] = VISIBILITYMAP_ALL_VISIBLE;
+	UT_ASSERT(!visibilitymap_read_begin(&relation, 0, &buffer, &scope, &status));
+	UT_ASSERT_EQ(status, 0);
+	UT_ASSERT_EQ(scope.locked_buffer, InvalidBuffer);
+	UT_ASSERT(!fixture_locked);
+	UT_ASSERT_EQ(fixture_grants, fixture_unlocks);
+	UT_ASSERT_EQ(fixture_releases, 0);
+
+	setup_coherent_vm(&relation, &form);
+	buffer = InvalidBuffer;
+	fixture_smgr.smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] = 0;
+	status = VISIBILITYMAP_VALID_BITS;
+	UT_ASSERT(visibilitymap_read_begin(&relation, 0, &buffer, &scope, &status));
+	UT_ASSERT_EQ(status, 0);
+	UT_ASSERT_EQ(buffer, InvalidBuffer);
+	UT_ASSERT_EQ(scope.locked_buffer, InvalidBuffer);
+	visibilitymap_read_end(&scope);
+	UT_ASSERT_EQ(fixture_reads + fixture_grants + fixture_unlocks + fixture_releases, 0);
+}
+
+UT_TEST(vm_read_scope_preserves_native_and_local_raw_behavior)
+{
+	for (unsigned mode = 0; mode < 2; mode++) {
+		RelationData relation;
+		FormData_pg_class form;
+		Buffer buffer = InvalidBuffer;
+		VisibilityMapReadScope scope = {0};
+		uint8 status;
+
+		setup_coherent_vm(&relation, &form);
+		fixture_shared = mode != 0;
+		fixture_pcm = fixture_grant_allowed = false;
+		if (mode == 1)
+			form.relpersistence = RELPERSISTENCE_TEMP;
+		UT_ASSERT(visibilitymap_read_begin(&relation, 0, &buffer, &scope, &status));
+		UT_ASSERT_EQ(status, VISIBILITYMAP_ALL_VISIBLE);
+		UT_ASSERT_EQ(buffer, 1);
+		UT_ASSERT_EQ(scope.locked_buffer, InvalidBuffer);
+		UT_ASSERT(!fixture_locked);
+		visibilitymap_read_end(&scope);
+		UT_ASSERT_EQ(fixture_reads, 1);
+		UT_ASSERT_EQ(fixture_grants + fixture_unlocks + fixture_releases, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(16);
 	UT_RUN(shared_stale_vm_does_not_expose_uncommitted_tid);
 	UT_RUN(shared_stale_vm_keeps_precisely_visible_tuple);
 	UT_RUN(native_vm_shortcut_is_unchanged);
@@ -458,6 +674,13 @@ main(void)
 	UT_RUN(coherent_vm_rebinds_same_block_from_wrong_relation_or_fork);
 	UT_RUN(coherent_vm_refusal_never_reuses_positive_output);
 	UT_RUN(coherent_vm_zero_and_missing_pages_remain_read_only);
+	UT_RUN(vm_read_scope_retains_current_image_until_end);
+	UT_RUN(vm_read_scope_reuse_preserves_active_owner_and_end_is_idempotent);
+	UT_RUN(vm_read_scope_rebinds_wrong_cached_tags_before_locking);
+	UT_RUN(vm_read_scope_refuses_without_positive_output_or_retained_lock);
+	UT_RUN(vm_read_scope_bad_arguments_do_not_acquire_or_release);
+	UT_RUN(vm_read_scope_zero_and_missing_maps_remain_read_only);
+	UT_RUN(vm_read_scope_preserves_native_and_local_raw_behavior);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

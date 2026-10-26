@@ -950,26 +950,28 @@ visibilitymap_get_status_pinned(Relation rel, BlockNumber heapBlk, Buffer vmbuf,
 }
 
 /*
- * visibilitymap_get_status_coherent -- observe bits under current read authority.
+ * visibilitymap_read_begin -- observe bits and retain a shared VM read bracket.
  *
  * The relation owner retains its lifecycle lock. Call before taking any heap
  * content lock: a cold or revoked VM pin can require a remote acquisition.
- * The caller retains the returned pin, but no read authority survives this
- * call. A coherent bitmap alone does not authorize visibility or freeze skips.
- * False clears status and preserves the caller's releasable pin, if any.
+ * The caller owns the pin and ends the scope before releasing/rebinding it or
+ * doing I/O, waiting or acquiring another block. A retained read lock alone
+ * does not prove snapshot admission, publication or visibility/freeze safety.
+ * False clears status and leaves an already-active scope unchanged.
  */
 bool
-visibilitymap_get_status_coherent(Relation rel, BlockNumber heapBlk, Buffer *vmbuf, uint8 *status)
+visibilitymap_read_begin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf,
+						 VisibilityMapReadScope *scope, uint8 *status)
 {
 	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
 	RelFileLocator locator;
 	ForkNumber forknum;
 	BlockNumber block;
-	bool valid;
 
 	if (status != NULL)
 		*status = 0;
-	if (rel == NULL || vmbuf == NULL || status == NULL || heapBlk == InvalidBlockNumber)
+	if (rel == NULL || vmbuf == NULL || scope == NULL || status == NULL
+		|| heapBlk == InvalidBlockNumber || BufferIsValid(scope->locked_buffer))
 		return false;
 	if (!cluster_heap_maintenance_restricted(rel)) {
 		*status = visibilitymap_get_status(rel, heapBlk, vmbuf);
@@ -996,8 +998,33 @@ visibilitymap_get_status_coherent(Relation rel, BlockNumber heapBlk, Buffer *vmb
 	/* A pin is not a grant. This also revalidates an existing cached grant. */
 	if (!ClusterLockBufferShareBarrierAware(*vmbuf))
 		return false;
-	valid = visibilitymap_get_status_pinned(rel, heapBlk, *vmbuf, status);
-	LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
+	if (!visibilitymap_get_status_pinned(rel, heapBlk, *vmbuf, status)) {
+		LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
+		return false;
+	}
+	scope->locked_buffer = *vmbuf;
+	return true;
+}
+
+/* Release only the scope's read lock; the caller still owns the pin. */
+void
+visibilitymap_read_end(VisibilityMapReadScope *scope)
+{
+	if (scope == NULL || !BufferIsValid(scope->locked_buffer))
+		return;
+	LockBuffer(scope->locked_buffer, BUFFER_LOCK_UNLOCK);
+	scope->locked_buffer = InvalidBuffer;
+}
+
+/* Observation-only compatibility entry: no read lock survives the return. */
+bool
+visibilitymap_get_status_coherent(Relation rel, BlockNumber heapBlk, Buffer *vmbuf, uint8 *status)
+{
+	VisibilityMapReadScope scope = {0};
+	bool valid;
+
+	valid = visibilitymap_read_begin(rel, heapBlk, vmbuf, &scope, status);
+	visibilitymap_read_end(&scope);
 	return valid;
 }
 

@@ -23,6 +23,8 @@ if "\nvisibilitymap_get_status_coherent(" in vm:
     if "\nvisibilitymap_get_status_pinned(" in vm:
         print(function(vm, "vm_buffer_matches", "static bool"))
         print(function(vm, "visibilitymap_get_status_pinned", "bool"))
+    print(function(vm, "visibilitymap_read_begin", "bool"))
+    print(function(vm, "visibilitymap_read_end", "void"))
     print(function(vm, "visibilitymap_get_status_coherent", "bool"))
 print(function((root / "executor/nodeIndexonlyscan.c").read_text(),
                "IndexOnlyNext", "static TupleTableSlot *"))

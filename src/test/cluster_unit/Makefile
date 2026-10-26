@@ -12576,7 +12576,8 @@ test_cluster_vm_read_visibility.inc: $(top_srcdir)/src/backend/access/heap/visib
 		$(srcdir)/extract_vm_read_fixture.py $(srcdir)/extract_vacuum_mx_fixture.py
 	python3 $(srcdir)/extract_vm_read_fixture.py $(top_srcdir)/src/backend > $@
 
-test_cluster_vm_read_visibility: test_cluster_vm_read_visibility.c unit_test.h test_cluster_vm_read_visibility.inc
+test_cluster_vm_read_visibility: test_cluster_vm_read_visibility.c unit_test.h test_cluster_vm_read_visibility.inc \
+		$(top_srcdir)/src/include/access/visibilitymap.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # PGRAC: reuse the actual pure relation policy in existing native fixtures.
