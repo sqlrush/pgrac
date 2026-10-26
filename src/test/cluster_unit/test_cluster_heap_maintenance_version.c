@@ -116,6 +116,12 @@ static unsigned writer_checks, route_checks, authority_checks, admission_checks;
 static SCN fixture_wal_clock, inserted_wal_clock;
 static unsigned wal_clock_reads;
 static bool full_target_current, target_recheck_error, revoke_target_census;
+static bool native_original_admission_enabled;
+static const ClusterSemanticAdmissionToken *native_admission_expected_token;
+static unsigned native_admission_stage, native_admission_fault_at, native_admission_fault;
+static unsigned native_admission_checks[7];
+static bool fixture_native_admission_current(const ClusterSemanticAdmissionToken *, unsigned);
+
 static unsigned full_target_checks;
 static unsigned target_preflight_checks, census_preflight_checks;
 static unsigned policy_current_checks, cohort_current_checks;
@@ -380,7 +386,7 @@ cluster_semantic_activation_recheck_r4_terminal_census(
 		census_preflight_checks++;
 		UT_ASSERT(token != NULL && token->entered && backend_pin_count == 1);
 		UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
-		return admission_current;
+		return admission_current && fixture_native_admission_current(token, 2);
 	}
 	if (space_observation_checks != 0) {
 		post_space_census_checks++;
@@ -392,11 +398,11 @@ cluster_semantic_activation_recheck_r4_terminal_census(
 			post_space_error_seen = 2;
 			elog(ERROR, "injected final census ERROR after SPACE");
 		}
-		return admission_current;
+		return admission_current && fixture_native_admission_current(token, 6);
 	}
 	admission_checks++;
 	UT_ASSERT(token != NULL && token->entered);
-	return admission_current;
+	return admission_current && fixture_native_admission_current(token, 4);
 }
 /* Compile the original policy-current predicate; its lease observation
  * below also executes the original retained stripe comparison. */
@@ -1424,7 +1430,7 @@ cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 		UT_ASSERT_EQ(wal_clock_reads + inserts + dirties + edges + flushes, 0);
 		if (preflight_target_error) elog(ERROR, "injected unlocked TARGET preflight error");
 		if (preflight_revoke_census) admission_current = false;
-		return full_target_current || allow_preflight_target;
+		return (full_target_current || allow_preflight_target) && fixture_native_admission_current(token, 1);
 	}
 	if (space_observation_checks != 0) {
 		post_space_target_checks++;
@@ -1446,7 +1452,7 @@ cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 		if (post_space_policy != NULL)
 			post_space_policy->legal_next = FullTransactionIdFromU64(
 				U64FromFullTransactionId(post_space_policy->legal_next) + 1);
-		return full_target_current;
+		return full_target_current && fixture_native_admission_current(token, 5);
 	}
 	full_target_checks++;
 	if (advance_registration_after_target) ctrc_note_unqualified_registration();
@@ -1466,7 +1472,7 @@ cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 	if (advance_legal_next_after_target != NULL)
 		advance_legal_next_after_target->legal_next = FullTransactionIdFromU64(
 			U64FromFullTransactionId(advance_legal_next_after_target->legal_next) + 1);
-	return full_target_current;
+	return full_target_current && fixture_native_admission_current(token, 3);
 }
 
 void
@@ -1862,6 +1868,9 @@ reset(uint8 opcode, bool shared)
 	inserted_wal_clock = InvalidScn;
 	wal_clock_reads = 0;
 	full_target_current = true;
+	native_original_admission_enabled = false; native_admission_expected_token = NULL;
+	native_admission_stage = native_admission_fault_at = native_admission_fault = 0;
+	memset(native_admission_checks, 0, sizeof(native_admission_checks));
 	target_recheck_error = revoke_target_census = false;
 	full_target_checks = 0;
 	target_preflight_checks = census_preflight_checks = 0;
@@ -9836,10 +9845,22 @@ static unsigned bounds_admission_error_kind;
 static bool bounds_original_target_result, bounds_original_census_result;
 static bool bounds_bootstrap_allowed;
 
+static void
+bounds_admission_assert_source_ownership(void)
+{
+	if (!local_x) { bounds_assert_unlocked(); return; }
+	/* Only original native admission checks may call these source providers
+	 * under the caller's content-X; they run before the critical section. */
+	UT_ASSERT(native_original_admission_enabled && native_admission_stage >= 3 && native_admission_stage <= 6);
+	UT_ASSERT(native_admission_expected_token != NULL && native_admission_expected_token->entered);
+	UT_ASSERT(!local_share && backend_pin_count == 1); UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+}
+
 static bool
 bounds_admission_serving(void)
 {
-	bounds_assert_unlocked();
+	bounds_admission_assert_source_ownership();
 	if (bounds_admission_error_kind == 1) elog(ERROR, "injected original admission serving ERROR");
 	return admission_serving;
 }
@@ -9847,7 +9868,7 @@ bounds_admission_serving(void)
 static bool
 bounds_admission_bootstrap(void)
 {
-	bounds_assert_unlocked();
+	bounds_admission_assert_source_ownership();
 	if (bounds_admission_error_kind == 3) elog(ERROR, "injected original admission bootstrap ERROR");
 	return bounds_bootstrap_allowed;
 }
@@ -9855,7 +9876,7 @@ bounds_admission_bootstrap(void)
 static uint64
 bounds_admission_epoch(void)
 {
-	bounds_assert_unlocked();
+	bounds_admission_assert_source_ownership();
 	if (bounds_admission_error_kind == 2) elog(ERROR, "injected original admission epoch ERROR");
 	return admission_epoch;
 }
@@ -9907,6 +9928,19 @@ bounds_admission_change(unsigned fault)
 		bounds_mutable_admission->record_generation = 0;
 		bounds_admission_error_kind = 3; break;
 	}
+}
+
+static bool
+fixture_native_admission_current(const ClusterSemanticAdmissionToken *token, unsigned stage)
+{
+	if (!native_original_admission_enabled) return true;
+	UT_ASSERT(token == native_admission_expected_token && token != NULL && token->entered);
+	UT_ASSERT(stage >= 1 && stage <= 6); UT_ASSERT_EQ(local_x, stage >= 3);
+	UT_ASSERT_EQ(backend_pin_count, 1); UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	native_admission_stage = stage; native_admission_checks[stage]++;
+	if (stage == native_admission_fault_at) bounds_admission_change(native_admission_fault);
+	return (stage % 2) == 0 ? bounds_original_census_current(token) : bounds_original_target_current(token);
 }
 
 static bool
@@ -10976,10 +11010,135 @@ UT_TEST(test_collector_same_admission_rejects_wrong_target_side)
 	}
 }
 
+static void
+native_original_admission_setup(QualifiedXminFixture *f, LVRelState *v,
+	ClusterHeapFreezeXminTargetV1 targets[3], bool batch, bool preowned)
+{
+	unsigned char saved_ledger[sizeof(cluster_bufmgr_pcm_x_writer_ledger)];
+	ClusterHeapFreezeObservedBoundsV1 bounds = {0};
+
+	if (batch) qualified_xmin_batch_setup(f, targets);
+	else qualified_xmin_setup(f, HEAP_XMAX_IS_MULTI);
+	/* Retain the original fixture producer's ledger bytes.  Restore only the
+	 * controlled preowned shape, without a new writer grant or acquisition. */
+	memcpy(saved_ledger, cluster_bufmgr_pcm_x_writer_ledger, sizeof(saved_ledger));
+	bounds_observer_setup(v, f); fixture_wal_clock = 5;
+	UT_ASSERT_EQ(lazy_observe_shared_freeze_bounds(v, &f->admission,
+		CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT(v->shared_freeze_cohort_observed); f->input = v->shared_freeze_input;
+	if (preowned) {
+		memcpy(cluster_bufmgr_pcm_x_writer_ledger, saved_ledger, sizeof(saved_ledger));
+		local_x = true;
+		UT_ASSERT(cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0)) != NULL);
+	}
+	native_original_admission_enabled = true; native_admission_expected_token = &f->admission;
+}
+
+static void
+native_original_admission_assert_cleanup(const QualifiedXminFixture *f,
+	bool preowned, unsigned stage)
+{
+	unsigned resumed = !preowned && stage >= 3;
+
+	UT_ASSERT_EQ(conditional_resumes, resumed); UT_ASSERT_EQ(conditional_unlocks, resumed);
+	UT_ASSERT_EQ(local_x, preowned); UT_ASSERT(!local_share && !resumed_writer);
+	UT_ASSERT_EQ(cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0)) != NULL, preowned);
+	UT_ASSERT(f->admission.entered); UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0); UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(lease_lock_acquires, lease_lock_releases); UT_ASSERT(!lease_lock_held);
+	for (unsigned i = 1; i <= 6; i++)
+		UT_ASSERT_EQ(native_admission_checks[i], i >= (preowned ? 3 : 1) && i <= stage);
+}
+
+UT_TEST(test_native_original_same_token_admission_preserves_new_and_preowned_writer)
+{
+	for (unsigned batch = 0; batch <= 1; batch++) {
+		for (unsigned preowned = 0; preowned <= 1; preowned++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3]; LVRelState v;
+			native_original_admission_setup(&f, &v, targets, batch, preowned);
+			UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+			for (unsigned i = 1; i <= 6; i++)
+				UT_ASSERT_EQ(native_admission_checks[i], !preowned || i >= 3);
+			UT_ASSERT_EQ(conditional_resumes, !preowned); UT_ASSERT_EQ(conditional_unlocks, !preowned);
+			UT_ASSERT_EQ(local_x, preowned); UT_ASSERT(!resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0)) != NULL, preowned);
+			UT_ASSERT_EQ(backend_pin_count, 1); UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+			UT_ASSERT_EQ(CritSectionCount, 0);
+		}
+	}
+}
+
+UT_TEST(test_native_original_admission_source_refusal_preserves_caller_ownership)
+{
+	for (unsigned batch = 0; batch <= 1; batch++) {
+		for (unsigned preowned = 0; preowned <= 1; preowned++) {
+			for (unsigned stage = preowned ? 3 : 1; stage <= 6; stage++) {
+				for (unsigned fault = 1; fault <= 14; fault++) {
+					QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3]; LVRelState v;
+					if (stage % 2 == 0 && (fault == 1 || fault == 13)) continue;
+					native_original_admission_setup(&f, &v, targets, batch, preowned);
+					native_admission_fault_at = stage; native_admission_fault = fault;
+					UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+					UT_ASSERT_EQ(space_observation_checks, stage >= 5);
+					native_original_admission_assert_cleanup(&f, preowned, stage);
+				}
+			}
+		}
+	}
+}
+
+UT_TEST(test_native_original_admission_error_unwinds_only_new_writer_scope)
+{
+	for (unsigned batch = 0; batch <= 1; batch++) {
+		for (unsigned preowned = 0; preowned <= 1; preowned++) {
+			for (unsigned stage = preowned ? 3 : 1; stage <= 6; stage++) {
+				for (unsigned fault = 21; fault <= 23; fault++) {
+					QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3]; LVRelState v;
+					native_original_admission_setup(&f, &v, targets, batch, preowned);
+					native_admission_fault_at = stage; native_admission_fault = fault;
+					expecting_error = true;
+					if (setjmp(error_jump) == 0) {
+						(void)(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+						UT_ASSERT(false);
+					}
+					UT_ASSERT_EQ(space_observation_checks, stage >= 5);
+					native_original_admission_assert_cleanup(&f, preowned, stage);
+					expecting_error = false;
+				}
+			}
+		}
+	}
+}
+
+UT_TEST(test_native_original_admission_rejects_wrong_side_before_writer_resume)
+{
+	for (unsigned batch = 0; batch <= 1; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		LVRelState v; ClusterHeapFreezeObservedBoundsV1 bounds = {0};
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		bounds_observer_setup(&v, &f); fixture_wal_clock = 5;
+		UT_ASSERT_EQ(lazy_observe_shared_freeze_bounds(&v, &f.admission,
+			CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT(v.shared_freeze_cohort_observed); f.input = v.shared_freeze_input;
+		native_original_admission_enabled = true; native_admission_expected_token = &f.admission;
+		f.admission.side = CLUSTER_SEMANTIC_SOURCE_SIDE;
+		UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+		UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + inserts + edges + dirties + flushes, 0);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered); UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(257);
+	UT_PLAN(261);
+	UT_RUN(test_native_original_admission_rejects_wrong_side_before_writer_resume);
+	UT_RUN(test_native_original_same_token_admission_preserves_new_and_preowned_writer);
+	UT_RUN(test_native_original_admission_source_refusal_preserves_caller_ownership);
+	UT_RUN(test_native_original_admission_error_unwinds_only_new_writer_scope);
 	UT_RUN(test_collector_same_admission_rejects_wrong_target_side);
 	UT_RUN(test_collector_original_same_token_admission_reaches_native_wal);
 	UT_RUN(test_collector_original_census_rejects_token_and_source_drift_at_each_check);
