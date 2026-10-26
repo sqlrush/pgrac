@@ -10,6 +10,7 @@
 #define CLUSTER_RECOVERY_NATIVE_INVENTORY_H
 
 #ifdef USE_PGRAC_CLUSTER
+#include "access/clog.h"
 #include "cluster/cluster_recovery_native_scan.h"
 #include "cluster/cluster_recovery_multixact_join.h"
 #include "cluster/cluster_recovery_xact_join.h"
@@ -243,10 +244,19 @@ typedef struct ClusterRecoveryRelmapHistoryEntryV1 {
 	bool checkpoint_observed, window_observed;
 } ClusterRecoveryRelmapHistoryEntryV1;
 
+/* Actual original-source/base observations. Full raw pending obligations stay
+ * visible; IN_PROGRESS and SUB_COMMITTED are never promoted to terminals. */
+typedef struct ClusterRecoveryRelmapPendingBaseV1 {
+	ClusterRecoveryRelmapHistoryEntryV1 history;
+	ClusterRecoveryRelmapFoldSummary fold;
+	ClusterRelmapClogBaseV1 native;
+} ClusterRecoveryRelmapPendingBaseV1;
+
 typedef struct ClusterRecoveryRelmapHistory ClusterRecoveryRelmapHistory;
 
 /* Borrow the same all-replay IR/WALR scope, not a new per-origin owner.
- * The budget includes this handle and the complete two-pass inventory.
+ * The budget reserves this handle, the complete two-pass inventory and one
+ * fixed original native base custody (charged once actually allocated).
  * Missing/legacy windows stay explicit unqualified inputs. Entered refusal
  * or ERROR revokes the original episode, retaining its protections/debt.
  * Destroy local custody before the original scope/ResourceOwner ends.
@@ -263,7 +273,8 @@ extern bool cluster_recovery_relmap_history_source_v1(ClusterRecoveryRelmapHisto
 	uint32 ordinal, ClusterRecoveryRelmapHistoryEntryV1 *out);
 /* Reread every original physical input and full selected metadata, comparing
  * to the saved baseline under the same original episode. Never rebase.
- * One full synchronous census, not a bounded metadata tick. */
+ * Also reread any bound native base on its SAME held fd/full-page baseline.
+ * One full synchronous census plus native base read, not a bounded tick. */
 extern ClusterRecoveryNativeInventoryResult cluster_recovery_relmap_history_recheck_v1(
 	ClusterRecoveryRelmapHistory *history, ClusterRecoveryNativeInventoryDiag *diag);
 /* Fold one complete canonical pending image under this SAME original episode.
@@ -275,12 +286,28 @@ extern ClusterRecoveryNativeInventoryResult cluster_recovery_relmap_history_rech
  * Ordinary caller-lock/output preconditions do not revoke custody. Once
  * entered, any input/query drift or ERROR is sticky and fails the original
  * episode, retaining protections/debt. Full final physical recheck remains
- * mandatory. DRAINED is raw correspondence, never era/lifetime/terminal,
+ * mandatory. Once a native base is bound, only the same drained query may
+ * be reread; a new query requires separate local custody under the original
+ * episode. DRAINED is raw correspondence, never era/lifetime/terminal,
  * COMPLETE, OPEN, native allocation/CLOG truncate or release authority. */
 extern ClusterRecoveryRelmapFoldResult cluster_recovery_relmap_history_pending_step_v1(
 	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
 	ClusterRecoveryRelmapFoldEntry *out, ClusterRecoveryRelmapFoldSummary *summary,
 	ClusterRecoveryNativeInventoryDiag *diag);
+/* Only after a complete pending fold drains: select its unique exact native
+ * map source and actual v2 owner/query window internally, then read the
+ * original CLOG base through the original held-fd API. Buffers must be
+ * exclusive/disjoint from query and borrowed history storage. No caller CF,
+ * native lock or critical section. Checked pre-drain/output/CF/critical
+ * preconditions do not poison; entered refusal/ERROR does, retaining pins/debt and
+ * any held native custody until explicit local destroy. Query is thereafter
+ * fixed; repeated/final reads compare the SAME full page, never rebase.
+ * This is synchronous native I/O, not a bounded metadata tick, birth-era,
+ * no-reuse/truncation/lifetime, native/SIDE terminal or COMPLETE/OPEN/release
+ * authority. Destroy before the original scope/ResourceOwner ends. */
+extern bool cluster_recovery_relmap_history_pending_base_v1(
+	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
+	ClusterRecoveryRelmapPendingBaseV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
 extern void cluster_recovery_relmap_history_destroy_v1(ClusterRecoveryRelmapHistory **history);
 
 /* Borrow the original startup cold scope for two complete physical passes.

@@ -1034,6 +1034,7 @@ UT_TEST(test_ctrc_inventory_keeps_original_local_cut_and_native_terminal_bytes)
 #include "test_cluster_recovery_episode_history.inc"
 #include "test_cluster_recovery_relmap_fold.inc"
 #include "test_cluster_recovery_episode_pending.inc"
+#include "test_cluster_recovery_episode_base.inc"
 
 
 int
@@ -1101,7 +1102,20 @@ main(int argc, char **argv)
 		UT_RUN(test_page_graph_refuses_caller_locks_before_any_original_io);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(131);
+	if (getenv("PGRAC_PRE2_TEST_EPISODE_BASE") != NULL) {
+		UT_PLAN(9);
+		UT_RUN(test_episode_base_requires_drain_and_retains_actual_query_source);
+		UT_RUN(test_episode_base_rejects_unqualified_or_ambiguous_native_source);
+		UT_RUN(test_episode_base_bound_query_cannot_restart_or_replace_custody);
+		UT_RUN(test_episode_base_final_physical_reread_keeps_the_original_baseline);
+		UT_RUN(test_episode_base_first_and_existing_errors_never_drop_protection);
+		UT_RUN(test_episode_base_after_read_source_drift_discards_only_local_output);
+		UT_RUN(test_episode_base_output_lock_and_budget_preconditions_do_not_poison);
+		UT_RUN(test_episode_base_preserves_original_borrowed_page_storage);
+		UT_RUN(test_episode_base_checks_original_page_bytes_before_and_after_native_read);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	UT_PLAN(140);
 	UT_RUN(test_page_graph_original_full_cuts_order_cross_thread_page_edges);
 	UT_RUN(test_page_graph_no_page_sources_and_original_native_cursor_remain);
 	UT_RUN(test_page_graph_keeps_explicit_empty_and_historical_generations);
@@ -1234,6 +1248,15 @@ main(int argc, char **argv)
 	UT_RUN(test_episode_pending_first_current_error_retains_original_protection);
 	UT_RUN(test_episode_pending_final_reread_drift_never_revives_the_query);
 	UT_RUN(test_episode_pending_output_and_caller_lock_preconditions_preserve_custody);
+	UT_RUN(test_episode_base_requires_drain_and_retains_actual_query_source);
+	UT_RUN(test_episode_base_rejects_unqualified_or_ambiguous_native_source);
+	UT_RUN(test_episode_base_bound_query_cannot_restart_or_replace_custody);
+	UT_RUN(test_episode_base_final_physical_reread_keeps_the_original_baseline);
+	UT_RUN(test_episode_base_first_and_existing_errors_never_drop_protection);
+	UT_RUN(test_episode_base_after_read_source_drift_discards_only_local_output);
+	UT_RUN(test_episode_base_output_lock_and_budget_preconditions_do_not_poison);
+	UT_RUN(test_episode_base_preserves_original_borrowed_page_storage);
+	UT_RUN(test_episode_base_checks_original_page_bytes_before_and_after_native_read);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
