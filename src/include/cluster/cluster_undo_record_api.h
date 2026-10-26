@@ -349,11 +349,16 @@ extern const char *cluster_undo_segment_observation_status_string(void);
  *	*out_no_side_effects is true only when this entire invocation is proven
  *	not to have provisioned, reused, activated or published a segment. It is
  *	false for unknown or already-started effects, including internal retries.
- *	cluster_undo_tt_retention_rollover_count: observability counter accessor.
+ *	cluster_undo_tt_retention_rollover_count: authority invalidation generation,
+ *	advanced once by each successful CURRENT winner, including the first binding.
  */
 extern uint32 cluster_undo_tt_rollover_locked(int node_id, uint32 old_segment_id,
 											  bool *out_at_hard_cap, bool *out_no_side_effects);
 extern uint64 cluster_undo_tt_retention_rollover_count(void);
+/* Local-origin retained-pressure diagnostics; cold binding is excluded.
+ * False means unavailable and leaves both outputs untouched. Samples are not
+ * an atomic pair and must not be used as authority or a completion proof. */
+extern bool cluster_undo_tt_retained_rollover_stats_snapshot(uint64 *winner, uint64 *lost_race);
 /* S3 forensics step 1a — TT-rollover FAILURE split (hard cap vs autoextend);
  * counts only cluster_undo_tt_rollover_locked fails, NOT the record-extent
  * CLAIM path's segment_hard_cap_fail_count. */

@@ -48,6 +48,7 @@
 #include "cluster/cluster_update_trace.h"
 
 #include "cluster/cluster_catalog_stats.h" /* spec-6.14 D10b catalog counter stubs */
+#include "cluster/cluster_cf_phase2.h"
 #include "cluster/cluster_debug.h"
 #include "cluster/cluster_ko.h"
 #include "cluster/cluster_qvotec.h"
@@ -3530,6 +3531,18 @@ cluster_undo_tt_retention_rollover_count(void)
 	return 0;
 }
 
+static bool retained_rollover_stats_available = true;
+
+bool
+cluster_undo_tt_retained_rollover_stats_snapshot(uint64 *winner, uint64 *lost_race)
+{
+	if (!retained_rollover_stats_available)
+		return false;
+	*winner = UINT64_MAX;
+	*lost_race = UINT64CONST(9223372036854775809);
+	return true;
+}
+
 /* S3 forensics step 1a stubs — TT-rollover failure split (dump_undo rows). */
 uint64
 cluster_undo_tt_rollover_fail_hard_cap_count(void)
@@ -4138,6 +4151,13 @@ cluster_reconfig_stage_pre_publish_join_handoff(
 void
 cluster_cf_phase2_verify_or_fail(const char *pgdata pg_attribute_unused())
 {}
+
+bool
+cluster_cf_phase2_verify_pending(const char *pgdata pg_attribute_unused(),
+								 TimestampTz deadline pg_attribute_unused())
+{
+	return false;
+}
 
 bool
 cluster_cf_phase2_peer_verified(void)
@@ -5716,6 +5736,35 @@ UT_TEST(test_debug_dump_exposes_receipt_lifetime_and_cancel_before_counters)
 	}
 }
 
+UT_TEST(test_debug_dump_exposes_retained_rollover_counts_without_fake_zero)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+
+	for (int available = 0; available < 2; available++) {
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		retained_rollover_stats_available = available != 0;
+		(void)cluster_dump_state(fcinfo);
+		UT_ASSERT_EQ(captured_dump_count("undo", "tt_retained_rollover_stats_available"), 1);
+		if (captured_dump_count("undo", "tt_retained_rollover_stats_available") == 1)
+			UT_ASSERT_STR_EQ(captured_dump_value("undo", "tt_retained_rollover_stats_available"),
+							 available ? "true" : "false");
+		UT_ASSERT_EQ(captured_dump_count("undo", "tt_retained_rollover_winner_count"), available);
+		UT_ASSERT_EQ(captured_dump_count("undo", "tt_retained_rollover_lost_race_count"),
+					 available);
+		if (available && captured_dump_count("undo", "tt_retained_rollover_winner_count") == 1
+			&& captured_dump_count("undo", "tt_retained_rollover_lost_race_count") == 1) {
+			UT_ASSERT_STR_EQ(captured_dump_value("undo", "tt_retained_rollover_winner_count"),
+							 "18446744073709551615");
+			UT_ASSERT_STR_EQ(captured_dump_value("undo", "tt_retained_rollover_lost_race_count"),
+							 "9223372036854775809");
+		}
+	}
+}
+
 UT_TEST(test_debug_dump_exposes_tt_and_itl_reason_counters_without_fake_zero)
 {
 	LOCAL_FCINFO(fcinfo, 0);
@@ -6352,7 +6401,7 @@ UT_TEST(test_debug_phase_symbol_present)
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(26);
 	UT_RUN(test_debug_dump_exposes_native_drop_context_and_real_io_observation);
 	UT_RUN(test_debug_dump_exposes_pcm_first_refusal_identity_and_subpredicate);
 	UT_RUN(test_debug_dump_normal_completion_never_fabricates_unready_proof);
@@ -6366,6 +6415,7 @@ main(void)
 	UT_RUN(test_debug_dump_exposes_vm_counts_and_histogram_as_separate_cohorts);
 	UT_RUN(test_debug_dump_exposes_origin_discard_reason_counters);
 	UT_RUN(test_debug_dump_exposes_receipt_lifetime_and_cancel_before_counters);
+	UT_RUN(test_debug_dump_exposes_retained_rollover_counts_without_fake_zero);
 	UT_RUN(test_debug_dump_exposes_tt_and_itl_reason_counters_without_fake_zero);
 	UT_RUN(test_debug_dump_exposes_closed_ctrc_observability);
 	UT_RUN(test_debug_inject_get_count_callable);

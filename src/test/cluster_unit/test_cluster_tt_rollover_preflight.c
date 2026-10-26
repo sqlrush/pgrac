@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  * test_cluster_tt_rollover_preflight.c
- *    Whole-invocation effect proof from the original rollover producer.
+ *    Effect proof and rollover event accounting from the original producer.
  *
  * The real record producer and TT binding publication run below. Segment
  * selection, physical lifecycle and current I/O are controlled boundaries;
@@ -30,6 +30,7 @@ static unsigned held_count, selections, provisions, reuses, activations, publica
 static bool select_candidate, select_hard_cap, needs_provision, needs_reuse;
 static bool candidate_taken, activation_ready, publication_ready, publication_current;
 static bool throw_provision;
+static unsigned adopt_at_boundary;
 static uint8 segment_state;
 static const ClusterUndoBlock0LiveOwnerPublication *last_publication;
 
@@ -103,6 +104,8 @@ cluster_undo_segment_allocate(uint32 segment, uint8 owner)
 		siglongjmp(*PG_exception_stack, 1);
 	}
 	segment_state = candidate_taken ? SEGMENT_ACTIVE : SEGMENT_ALLOCATED;
+	if (adopt_at_boundary == 1)
+		cluster_tt_slot_rollover(0, 3, NULL);
 }
 
 uint32
@@ -112,6 +115,8 @@ cluster_undo_segment_reuse_in_place(uint32 segment, uint8 owner, uint32 generati
 	UT_ASSERT_EQ(generation, 1);
 	reuses++;
 	segment_state = candidate_taken ? SEGMENT_ACTIVE : SEGMENT_ALLOCATED;
+	if (adopt_at_boundary == 1)
+		cluster_tt_slot_rollover(0, 3, NULL);
 	return segment;
 }
 
@@ -148,6 +153,8 @@ cluster_undo_segment_mark_active(uint32 segment, uint8 owner)
 	activations++;
 	if (activation_ready)
 		segment_state = SEGMENT_ACTIVE;
+	if (adopt_at_boundary == 2)
+		cluster_tt_slot_rollover(0, 3, NULL);
 	return activation_ready;
 }
 
@@ -170,6 +177,8 @@ cluster_undo_block0_current_live_owner_ensure_resident_exact(
 	UT_ASSERT_NOT_NULL(publication);
 	publications++;
 	last_publication = publication;
+	if (adopt_at_boundary == 3)
+		cluster_tt_slot_rollover(0, 3, NULL);
 	return publication_ready ? CLUSTER_UNDO_BLOCK0_OK : CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
 }
 
@@ -206,7 +215,25 @@ reset_rollover(void)
 	select_hard_cap = activation_ready = publication_ready = publication_current = true;
 	segment_state = SEGMENT_ALLOCATED;
 	last_publication = NULL;
+	adopt_at_boundary = 0;
 	cluster_tt_slot_rollover(0, 1, NULL);
+}
+
+static void
+assert_rollover_counts(uint64 generation, uint64 winner, uint64 lost_race)
+{
+	uint64 observed_winner = UINT64_MAX;
+	uint64 observed_lost_race = UINT64_MAX;
+	bool available;
+
+	UT_ASSERT_EQ(cluster_undo_tt_retention_rollover_count(), generation);
+	available
+		= cluster_undo_tt_retained_rollover_stats_snapshot(&observed_winner, &observed_lost_race);
+	UT_ASSERT(available);
+	if (available) {
+		UT_ASSERT_EQ(observed_winner, winner);
+		UT_ASSERT_EQ(observed_lost_race, lost_race);
+	}
 }
 
 UT_TEST(test_pure_selection_failure_proves_no_effects)
@@ -224,6 +251,7 @@ UT_TEST(test_pure_selection_failure_proves_no_effects)
 		UT_ASSERT_EQ(activations, 0);
 		UT_ASSERT_EQ(cluster_tt_slot_current_segment(0), 1);
 		UT_ASSERT_EQ(held_count, 0);
+		assert_rollover_counts(0, 0, 0);
 	}
 }
 
@@ -239,6 +267,7 @@ UT_TEST(test_passive_winner_adoption_has_no_local_effects)
 	UT_ASSERT(no_effects);
 	UT_ASSERT_EQ(selections, 0);
 	UT_ASSERT_EQ(held_count, 0);
+	assert_rollover_counts(0, 0, 1);
 }
 
 UT_TEST(test_reselection_after_provision_or_reuse_never_regains_no_effects)
@@ -260,6 +289,7 @@ UT_TEST(test_reselection_after_provision_or_reuse_never_regains_no_effects)
 		UT_ASSERT_EQ(activations, 0);
 		UT_ASSERT_EQ(cluster_tt_slot_current_segment(0), 1);
 		UT_ASSERT_EQ(held_count, 0);
+		assert_rollover_counts(0, 0, 0);
 	}
 }
 
@@ -281,6 +311,7 @@ UT_TEST(test_activation_or_publication_refusal_keeps_effects_unknown)
 		UT_ASSERT_EQ(publications, refusal != 0);
 		UT_ASSERT_EQ(cluster_tt_slot_current_segment(0), 1);
 		UT_ASSERT_EQ(held_count, 0);
+		assert_rollover_counts(0, 0, 0);
 	}
 }
 
@@ -298,6 +329,7 @@ UT_TEST(test_real_current_publication_cannot_return_to_preflight)
 	UT_ASSERT_EQ(cluster_undo_tt_retention_rollover_count(), 1);
 	UT_ASSERT_EQ(publications, 1);
 	UT_ASSERT_EQ(held_count, 0);
+	assert_rollover_counts(1, 1, 0);
 }
 
 UT_TEST(test_error_and_unavailable_owner_leave_proof_false)
@@ -331,18 +363,113 @@ UT_TEST(test_error_and_unavailable_owner_leave_proof_false)
 	 * neither releases them after longjmp nor certifies an effect-free retry. */
 	UT_ASSERT_EQ(held_count, 1);
 	held_count = 0;
+	assert_rollover_counts(0, 0, 0);
+}
+
+UT_TEST(test_first_current_publication_invalidates_authority_without_retained_event)
+{
+	bool hard_cap = true;
+	bool no_effects = true;
+
+	reset_rollover();
+	memset(&slot_storage, 0, sizeof(slot_storage));
+	select_candidate = true;
+	UT_ASSERT_EQ(cluster_undo_tt_rollover_locked(0, 0, &hard_cap, &no_effects), 2);
+	UT_ASSERT_EQ(cluster_tt_slot_current_segment(0), 2);
+	UT_ASSERT(!hard_cap);
+	UT_ASSERT(!no_effects);
+	assert_rollover_counts(1, 0, 0);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_retained_winner_and_follower_count_separately)
+{
+	bool hard_cap = true;
+	bool no_effects = true;
+
+	reset_rollover();
+	select_candidate = true;
+	UT_ASSERT_EQ(cluster_undo_tt_rollover_locked(0, 1, &hard_cap, &no_effects), 2);
+	assert_rollover_counts(1, 1, 0);
+	UT_ASSERT_EQ(cluster_undo_tt_rollover_locked(0, 1, &hard_cap, &no_effects), 2);
+	UT_ASSERT(no_effects);
+	UT_ASSERT_EQ(selections, 1);
+	assert_rollover_counts(1, 1, 1);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_passive_adoption_does_not_invalidate_or_report_cold_as_retained)
+{
+	for (unsigned old_segment = 0; old_segment < 2; old_segment++) {
+		bool hard_cap = true;
+		bool no_effects = false;
+
+		reset_rollover();
+		cluster_tt_slot_rollover(0, 2, NULL);
+		UT_ASSERT_EQ(cluster_undo_tt_rollover_locked(0, old_segment, &hard_cap, &no_effects), 2);
+		UT_ASSERT(no_effects);
+		UT_ASSERT_EQ(selections, 0);
+		assert_rollover_counts(0, 0, old_segment == 0 ? 0 : 1);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_adoption_at_each_physical_boundary_counts_one_lost_race)
+{
+	for (unsigned boundary = 0; boundary < 4; boundary++) {
+		bool hard_cap = true;
+		bool no_effects = true;
+
+		reset_rollover();
+		select_candidate = true;
+		needs_provision = boundary == 0;
+		needs_reuse = boundary == 1;
+		adopt_at_boundary = boundary < 2 ? 1 : boundary;
+		/* Model a different published winner at the existing rechecks.
+		 * Actual TT publication runs here; scheduling and I/O remain seams. */
+		UT_ASSERT_EQ(cluster_undo_tt_rollover_locked(0, 1, &hard_cap, &no_effects), 3);
+		UT_ASSERT_EQ(cluster_tt_slot_current_segment(0), 3);
+		UT_ASSERT(!hard_cap);
+		UT_ASSERT(!no_effects);
+		assert_rollover_counts(0, 0, 1);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_retained_stats_unavailable_does_not_publish_zero)
+{
+	uint64 winner = 19;
+	uint64 lost_race = 23;
+
+	reset_rollover();
+	UndoRecordShared = NULL;
+	UT_ASSERT(!cluster_undo_tt_retained_rollover_stats_snapshot(&winner, &lost_race));
+	UT_ASSERT_EQ(winner, 19);
+	UT_ASSERT_EQ(lost_race, 23);
+	UndoRecordShared = &record_storage;
+	UT_ASSERT(!cluster_undo_tt_retained_rollover_stats_snapshot(NULL, &lost_race));
+	UT_ASSERT(!cluster_undo_tt_retained_rollover_stats_snapshot(&winner, NULL));
+	UT_ASSERT(!cluster_undo_tt_retained_rollover_stats_snapshot(NULL, NULL));
+	UT_ASSERT_EQ(winner, 19);
+	UT_ASSERT_EQ(lost_race, 23);
+	assert_rollover_counts(0, 0, 0);
 }
 
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(11);
 	UT_RUN(test_pure_selection_failure_proves_no_effects);
 	UT_RUN(test_passive_winner_adoption_has_no_local_effects);
 	UT_RUN(test_reselection_after_provision_or_reuse_never_regains_no_effects);
 	UT_RUN(test_activation_or_publication_refusal_keeps_effects_unknown);
 	UT_RUN(test_real_current_publication_cannot_return_to_preflight);
 	UT_RUN(test_error_and_unavailable_owner_leave_proof_false);
+	UT_RUN(test_first_current_publication_invalidates_authority_without_retained_event);
+	UT_RUN(test_retained_winner_and_follower_count_separately);
+	UT_RUN(test_passive_adoption_does_not_invalidate_or_report_cold_as_retained);
+	UT_RUN(test_adoption_at_each_physical_boundary_counts_one_lost_race);
+	UT_RUN(test_retained_stats_unavailable_does_not_publish_zero);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

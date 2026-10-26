@@ -162,10 +162,11 @@ typedef struct ClusterUndoRecordShared {
 	 * (reuse-first extend path).  dump_undo row lands at step 8. */
 	pg_atomic_uint64 segment_reuse_count;
 
-	/* spec-3.12 D2b: TT-slot retention-pressure segment rollovers (a long
-	 * reader's retained COMMITTED slots filled the active segment, so the
-	 * allocator rebound to a fresh one instead of erroring "48 slots full"). */
+	/* Authority invalidation generation: every successful CURRENT change,
+	 * including the first binding. Retained-pressure diagnostics are separate. */
 	pg_atomic_uint64 tt_retention_rollover_count;
+	pg_atomic_uint64 tt_retained_rollover_winner_count;
+	pg_atomic_uint64 tt_retained_rollover_lost_race_count;
 
 	/* S3 forensics step 1a: TT-rollover FAILURES, split by cause.  The
 	 * record-extent CLAIM path has its own segment_hard_cap_fail_count
@@ -601,6 +602,8 @@ cluster_undo_record_shmem_init(void)
 		pg_atomic_init_u64(&UndoRecordShared->segment_hard_cap_fail_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->segment_reuse_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->tt_retention_rollover_count, 0);
+		pg_atomic_init_u64(&UndoRecordShared->tt_retained_rollover_winner_count, 0);
+		pg_atomic_init_u64(&UndoRecordShared->tt_retained_rollover_lost_race_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->tt_rollover_fail_hard_cap_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->tt_rollover_fail_extend_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->tt_rollover_fail_activate_count, 0);
@@ -4463,6 +4466,8 @@ rollover_retry_locked:
 	/* Double-checked: a peer may already have rolled this node over. */
 	cur = cluster_tt_slot_current_segment(node_id);
 	if (cur != 0 && cur != old_segment_id) {
+		if (old_segment_id != 0)
+			pg_atomic_fetch_add_u64(&UndoRecordShared->tt_retained_rollover_lost_race_count, 1);
 		if (out_no_side_effects != NULL)
 			*out_no_side_effects = no_side_effects;
 		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
@@ -4522,6 +4527,8 @@ rollover_retry_locked:
 
 		cur = cluster_tt_slot_current_segment(node_id);
 		if (cur != 0 && cur != old_segment_id) {
+			if (old_segment_id != 0)
+				pg_atomic_fetch_add_u64(&UndoRecordShared->tt_retained_rollover_lost_race_count, 1);
 			LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 			LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 			return cur;
@@ -4575,6 +4582,8 @@ rollover_retry_locked:
 	if ((cur != 0 && cur != old_segment_id)
 		|| cluster_undo_segment_read_state(new_segment_id, owner_instance)
 			   != (uint8)SEGMENT_ACTIVE) {
+		if (cur != 0 && cur != old_segment_id && old_segment_id != 0)
+			pg_atomic_fetch_add_u64(&UndoRecordShared->tt_retained_rollover_lost_race_count, 1);
 		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 		LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 		return cur != 0 && cur != old_segment_id ? cur : 0;
@@ -4606,6 +4615,8 @@ rollover_retry_locked:
 	 * unused ACTIVE segment unbound; never overwrite the winner. */
 	cur = cluster_tt_slot_current_segment(node_id);
 	if (cur != 0 && cur != old_segment_id) {
+		if (old_segment_id != 0)
+			pg_atomic_fetch_add_u64(&UndoRecordShared->tt_retained_rollover_lost_race_count, 1);
 		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 		LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 		return cur;
@@ -4643,8 +4654,9 @@ rollover_retry_locked:
 			mark_old_committed = true;
 	}
 
+	pg_atomic_fetch_add_u64(&UndoRecordShared->tt_retention_rollover_count, 1);
 	if (old_segment_id != 0)
-		pg_atomic_fetch_add_u64(&UndoRecordShared->tt_retention_rollover_count, 1);
+		pg_atomic_fetch_add_u64(&UndoRecordShared->tt_retained_rollover_winner_count, 1);
 
 	/* Q8: a retention-pressure rollover is exactly when RECYCLABLE supply
 	 * matters -- nudge the cleaner instead of waiting out its interval. */
@@ -4680,6 +4692,16 @@ cluster_undo_tt_retention_rollover_count(void)
 	if (UndoRecordShared == NULL)
 		return 0;
 	return pg_atomic_read_u64(&UndoRecordShared->tt_retention_rollover_count);
+}
+
+bool
+cluster_undo_tt_retained_rollover_stats_snapshot(uint64 *winner, uint64 *lost_race)
+{
+	if (winner == NULL || lost_race == NULL || UndoRecordShared == NULL)
+		return false;
+	*winner = pg_atomic_read_u64(&UndoRecordShared->tt_retained_rollover_winner_count);
+	*lost_race = pg_atomic_read_u64(&UndoRecordShared->tt_retained_rollover_lost_race_count);
+	return true;
 }
 
 /* S3 forensics step 1a — TT-rollover failure split accessors. */

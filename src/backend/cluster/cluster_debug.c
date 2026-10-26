@@ -3217,6 +3217,10 @@ dump_undo(ReturnSetInfo *rsinfo)
 			"ready_retry_preserved_count" };
 	uint64 receipt_values[CLUSTER_UNDO_RECEIPT_METRIC_COUNT];
 	bool receipt_available = cluster_undo_record_receipt_stats_snapshot(receipt_values);
+	uint64 retained_winner;
+	uint64 retained_lost_race;
+	bool retained_available
+		= cluster_undo_tt_retained_rollover_stats_snapshot(&retained_winner, &retained_lost_race);
 	int receipt_metric;
 
 	StaticAssertStmt(lengthof(receipt_keys) == CLUSTER_UNDO_RECEIPT_METRIC_COUNT,
@@ -3321,6 +3325,13 @@ dump_undo(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_tt_slot_retention_off_recycle_count()));
 	emit_row(rsinfo, "undo", "tt_retention_rollover_count",
 			 fmt_int64((int64)cluster_undo_tt_retention_rollover_count()));
+	emit_row(rsinfo, "undo", "tt_retained_rollover_stats_available",
+			 retained_available ? "true" : "false");
+	if (retained_available) {
+		emit_row(rsinfo, "undo", "tt_retained_rollover_winner_count", fmt_uint64(retained_winner));
+		emit_row(rsinfo, "undo", "tt_retained_rollover_lost_race_count",
+				 fmt_uint64(retained_lost_race));
+	}
 	/* S3 forensics step 1a — TT-rollover failure split (writer 53R9E family). */
 	emit_row(rsinfo, "undo", "tt_rollover_fail_hard_cap_count",
 			 fmt_int64((int64)cluster_undo_tt_rollover_fail_hard_cap_count()));
