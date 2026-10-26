@@ -378,6 +378,7 @@ struct ClusterUndoSavepointControl {
 	int ref_slot;
 	bool owns_ref;
 	bool reserved;
+	XLogRecPtr pending_lsn; /* staged WAL cut, not a durable head or effect proof */
 	struct ClusterUndoSavepointControl *next;
 };
 static ClusterUndoSavepointControl *undo_savepoint_controls;
@@ -5358,30 +5359,36 @@ cluster_undo_segment_reuse_count(void)
 }
 
 
-void
-cluster_undo_record_release_savepoint_control(ClusterUndoSavepointControl *control)
+static ClusterUndoSavepointControl *
+undo_savepoint_control_find(const ClusterUndoSavepointControl *control)
 {
 	ClusterUndoSavepointControl *owned;
 
 	for (owned = undo_savepoint_controls; owned != NULL; owned = owned->next)
-		if (owned == control) {
-			if (owned->reserved)
-				undo_savepoint_control_unref(owned);
-			return;
-		}
+		if (owned == control)
+			return owned;
+	return NULL;
+}
+
+void
+cluster_undo_record_release_savepoint_control(ClusterUndoSavepointControl *control)
+{
+	ClusterUndoSavepointControl *owned = undo_savepoint_control_find(control);
+
+	/* Once WAL staging starts, frame cleanup cannot cancel the original ref.
+	 * The top list keeps it through the later head/cursor publication. */
+	if (owned != NULL && owned->reserved && XLogRecPtrIsInvalid(owned->pending_lsn))
+		undo_savepoint_control_unref(owned);
 }
 
 bool
 cluster_undo_record_savepoint_control_owned(const ClusterUndoSavepointControl *control)
 {
-	const ClusterUndoSavepointControl *owned;
+	const ClusterUndoSavepointControl *owned = undo_savepoint_control_find(control);
 
-	for (owned = undo_savepoint_controls; owned != NULL; owned = owned->next)
-		if (owned == control)
-			return owned->owns_ref && owned->reserved && owned->ref_slot >= 0
-				   && !UBA_is_invalid(owned->uba)
-				   && cluster_savepoint_operation_matches_frame(&owned->operation);
-	return false;
+	return owned != NULL && owned->owns_ref && owned->reserved && owned->ref_slot >= 0
+		   && XLogRecPtrIsInvalid(owned->pending_lsn) && !UBA_is_invalid(owned->uba)
+		   && cluster_savepoint_operation_matches_frame(&owned->operation);
 }
 
 static bool
@@ -5697,4 +5704,180 @@ cluster_undo_record_savepoint_control_bounds(const ClusterUndoSavepointControl *
 	candidate.stop_uba = control->stop_uba;
 	*out = candidate;
 	return true;
+}
+
+/* A staged control is no longer a first-effect reservation. Its existing
+ * list node and reference belong to the top until the original finisher runs.
+ * Spec: 2026-10-26-pre2-p013-full-savepoint-design.md */
+static bool
+undo_savepoint_pending_inputs(const ClusterUndoSavepointControl *control,
+							  const ClusterUndoSavepointBounds *expected)
+{
+	const ClusterUndoRecordReservation *reservation = &cluster_undo_record_reservation;
+	UBA head;
+
+	return expected != NULL && CritSectionCount == 0 && !reservation->active
+		   && !reservation->owns_ref && !reservation->consume_locked
+		   && reservation->receipt.ctrc_pending_mask == 0
+		   && reservation->receipt.ctrc_prepared_mask == 0
+		   && reservation->receipt.ctrc_applied_mask == 0
+		   && !reservation->receipt.modifier_admission.entered && !cluster_undo_pending.active
+		   && control->owns_ref && control->ref_slot >= 0
+		   && (control->reserved == XLogRecPtrIsInvalid(control->pending_lsn))
+		   && cluster_savepoint_operation_matches_frame(&control->operation)
+		   && memcmp(&control->operation, &expected->operation, sizeof(control->operation)) == 0
+		   && cluster_undo_record_uba_equal(control->uba, expected->control_uba)
+		   && cluster_undo_record_uba_equal(control->stop_uba, expected->stop_uba)
+		   && undo_savepoint_control_address_valid(&control->operation, control->uba, false)
+		   && undo_savepoint_control_address_valid(&control->operation, control->stop_uba, true)
+		   && undo_savepoint_control_read_head(&control->operation, &head) && !UBA_is_invalid(head)
+		   && cluster_undo_record_uba_equal(head, expected->current_head)
+		   && !cluster_undo_record_uba_equal(head, control->stop_uba)
+		   && !cluster_undo_record_uba_equal(head, control->uba)
+		   && !cluster_undo_record_uba_equal(control->stop_uba, control->uba);
+}
+
+/* Build a private successor of an existing slot, never an append. Full-byte
+ * comparison preserves every immutable field and rejects unknown phases. */
+static bool
+undo_savepoint_pending_image(const ClusterUndoSavepointControl *control,
+							 const ClusterUndoSavepointBounds *expected, char image[BLCKSZ],
+							 uint16 row, uint16 *record_offset)
+{
+	UndoBlockHeader *block = (UndoBlockHeader *)image;
+	UndoSlotDirEntry *slot;
+	UndoRecordHeader header;
+	UndoOperationTrailer operation;
+	char reserved[UNDO_REC_SAVEPOINT_ROLLBACK_TOTAL_LEN];
+	char pending[UNDO_REC_SAVEPOINT_ROLLBACK_TOTAL_LEN];
+	bool already = !XLogRecPtrIsInvalid(control->pending_lsn);
+
+	if (block->magic != PGRAC_UNDO_BLOCK_MAGIC || block->block_version != UNDO_BLOCK_VERSION_1
+		|| XLogRecPtrIsInvalid(block->block_lsn)
+		|| !cluster_undo_record_slot_index_valid(block->slot_count, row))
+		return false;
+	slot = UNDO_SLOT_DIR_PTR(image, row);
+	if (!cluster_undo_record_slot_range_valid(block->slot_count, row, slot->record_offset,
+											  slot->record_length)
+		|| slot->record_length != sizeof(reserved)
+		|| (uint64)slot->record_offset + slot->record_length > block->free_offset
+		|| block->free_offset > BLCKSZ - (uint32)block->slot_count * sizeof(*slot))
+		return false;
+	memcpy(&header, image + slot->record_offset, sizeof(header));
+	if (slot->record_type != header.record_type || slot->flags != header.flags
+		|| !undo_savepoint_control_encode(control, header.write_scn, reserved))
+		return false;
+	memcpy(&operation, reserved + sizeof(header) + UNDO_SAVEPOINT_ROLLBACK_LENGTH,
+		   sizeof(operation));
+	if (!cluster_undo_record_build_pending_rollback(
+			reserved, sizeof(reserved), &operation, control->operation.operation_sequence,
+			control->uba, expected->current_head, control->stop_uba, pending, sizeof(pending))
+		|| memcmp(image + slot->record_offset, already ? pending : reserved, sizeof(reserved)) != 0
+		|| (already && block->block_lsn < control->pending_lsn))
+		return false;
+	*record_offset = slot->record_offset;
+	memcpy(image + slot->record_offset, pending, sizeof(pending));
+	memcpy(&header, pending, sizeof(header));
+	slot->flags = header.flags;
+	return true;
+}
+
+/* This is the original native origin WAL/ref publication window. The
+ * reserved record is still off-chain; no TT/content guard is nested here. */
+static void
+undo_savepoint_pending_install(ClusterUndoSavepointControl *control, uint32 segment,
+							   uint32 block_no, uint16 row, uint16 record_offset,
+							   char image[BLCKSZ])
+{
+	UndoBlockHeader *block = (UndoBlockHeader *)image;
+	int saved_delay_flags = MyProc->delayChkptFlags;
+	XLogRecPtr lsn;
+
+	START_CRIT_SECTION();
+	MyProc->delayChkptFlags = saved_delay_flags | DELAY_CHKPT_START;
+	PG_TRY();
+	{
+		lsn = cluster_undo_emit_block_write_multi(
+			control->operation.top.origin_instance, segment, block_no, image, block->block_lsn,
+			record_offset, UNDO_REC_SAVEPOINT_ROLLBACK_TOTAL_LEN, (uint16)UNDO_SLOT_DIR_OFFSET(row),
+			sizeof(UndoSlotDirEntry));
+		if (XLogRecPtrIsInvalid(lsn))
+			ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("savepoint control staging has no WAL record"),
+							errhint("Restart recovery before continuing the transaction.")));
+		/* Latch ownership before the infallible resident install. A fatal
+		 * failure must not make frame cleanup treat this as unused again. */
+		control->pending_lsn = lsn;
+		control->reserved = false;
+		block->block_lsn = lsn;
+		cluster_undo_buf_install_wal_ref_locked(control->ref_slot, segment,
+												control->operation.top.origin_instance, block_no,
+												image, lsn);
+	}
+	PG_FINALLY();
+	{
+		MyProc->delayChkptFlags = saved_delay_flags;
+	}
+	PG_END_TRY();
+	END_CRIT_SECTION();
+}
+
+bool
+cluster_undo_record_stage_savepoint_pending(ClusterUndoSavepointControl *control,
+											const ClusterUndoSavepointBounds *expected,
+											uint64 absolute_deadline_us, XLogRecPtr *cut_out)
+{
+	ClusterUndoSavepointControl *owned = undo_savepoint_control_find(control);
+	ClusterSemanticAdmissionToken admission = { 0 };
+	ClusterUndoBlock0LiveOwnerPublication publication;
+	volatile ClusterUndoBufPin pin = { .slot = -1 };
+	PGAlignedBlock successor;
+	uint32 segment, block;
+	uint16 tt, row, record_offset;
+	char *resident;
+	volatile bool complete = false;
+
+	if (cut_out == NULL)
+		return false;
+	*cut_out = InvalidXLogRecPtr;
+	if (owned == NULL || !cluster_shared_config || !cluster_enabled || MyProc == NULL
+		|| !LocalTransactionIdIsValid(MyProc->lxid) || cluster_node_id < 0
+		|| owned->operation.top.origin_instance != (uint8)(cluster_node_id + 1)
+		|| absolute_deadline_us <= (uint64)GetCurrentTimestamp()
+		|| !undo_savepoint_pending_inputs(owned, expected)
+		|| !uba_decode_record(owned->uba, &segment, &block, &tt, &row)
+		|| cluster_semantic_activation_modifier_enter(true, &admission)
+			   != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return false;
+	PG_TRY();
+	{
+		if (cluster_undo_record_ensure_block0_current(owned->operation.top.origin_instance, segment,
+													  absolute_deadline_us, &publication)) {
+			resident = cluster_undo_buf_pin(segment, owned->operation.top.origin_instance, block,
+											CLUSTER_UNDO_BUF_EXCLUSIVE, (ClusterUndoBufPin *)&pin);
+			if (resident != NULL && pin.slot == owned->ref_slot
+				&& undo_savepoint_pending_inputs(owned, expected)
+				&& cluster_semantic_activation_modifier_recheck(&admission, true)
+				&& cluster_undo_block0_current_live_owner_publication_recheck_conditional(
+					&publication)) {
+				memcpy(successor.data, resident, BLCKSZ);
+				if (undo_savepoint_pending_image(owned, expected, successor.data, row,
+												 &record_offset)) {
+					if (XLogRecPtrIsInvalid(owned->pending_lsn))
+						undo_savepoint_pending_install(owned, segment, block, row, record_offset,
+													   successor.data);
+					*cut_out = owned->pending_lsn;
+					complete = true;
+				}
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		if (pin.slot >= 0)
+			cluster_undo_buf_unpin((ClusterUndoBufPin *)&pin);
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
+	return complete;
 }

@@ -59,6 +59,7 @@
 #include "cluster/storage/cluster_shared_fs.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
+#include "cluster/storage/cluster_undo_buf.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "storage/backendid.h"
 #include "storage/fd.h"
@@ -125,6 +126,17 @@ static int reserve_test_throw_wal_at;
 static UBA reserve_test_head_during_wal;
 static bool reserve_test_invalidate_scope_after_lock, reserve_test_expire_at_pin;
 static PGPROC reserve_test_proc;
+static bool pending_test_mode, pending_test_pin_fail, pending_test_wrong_slot;
+static bool pending_test_scope_drift, pending_test_current_drift, pending_test_modifier_drift;
+static bool pending_test_head_drift, pending_test_wal_throw, pending_test_wal_invalid;
+static bool pending_test_install_throw;
+static int pending_test_wal_calls, pending_test_install_calls;
+static PGAlignedBlock pending_test_wal_image;
+static uint16 pending_test_record_offset, pending_test_slot_offset;
+static void pending_test_after_pin(ClusterUndoBufPin *pin);
+static XLogRecPtr pending_test_emit(uint8 instance, uint32 segment, uint32 block, const char *image,
+									XLogRecPtr old_lsn, uint16 rec_off, uint16 rec_len,
+									uint16 slot_off, uint16 slot_len);
 
 static uint32 reserve_test_active_segment(int node);
 #define cluster_undo_active_segment_for_node_or_create reserve_test_active_segment
@@ -335,8 +347,11 @@ errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_un
 		if (receipt_fail_log_event != NULL && strstr(receipt_last_log, receipt_fail_log_event) != NULL)
 			siglongjmp(receipt_error_jump, 1);
 	}
-	if (receipt_trap_error && receipt_error_level >= ERROR)
+	if (receipt_trap_error && receipt_error_level >= ERROR) {
+		if (pending_test_mode && PG_exception_stack != NULL)
+			siglongjmp(*PG_exception_stack, 1);
 		siglongjmp(receipt_error_jump, 1);
+	}
 }
 
 int
@@ -488,6 +503,13 @@ cluster_undo_buf_install_ref_locked(int slot, uint32 segment_id, uint8 owner, ui
 		UT_ASSERT(block_no >= 1 && block_no <= 2);
 		memcpy(reserve_test_images[block_no - 1].data, image, BLCKSZ);
 		reserve_test_installs++;
+		if (pending_test_mode) {
+			pending_test_install_calls++;
+			UT_ASSERT_EQ(pending_test_wal_calls, 1);
+			UT_ASSERT(CritSectionCount > 0);
+			if (pending_test_install_throw)
+				siglongjmp(*PG_exception_stack, 1);
+		}
 		return;
 	}
 	UT_ASSERT_EQ(slot, 7);
@@ -505,6 +527,9 @@ cluster_undo_emit_block_write_multi(uint8 instance, uint32 segment_id, uint32 bl
 								 const char *image, XLogRecPtr old_lsn, uint16 rec_off,
 								 uint16 rec_len, uint16 slot_off, uint16 slot_len)
 {
+	if (pending_test_mode)
+		return pending_test_emit(instance, segment_id, block_no, image, old_lsn, rec_off, rec_len,
+								 slot_off, slot_len);
 	if (reserve_test_mode) {
 		const UndoBlockHeader *header = (const UndoBlockHeader *)image;
 
@@ -6041,11 +6066,21 @@ UT_TEST(test_exact_zero_abort_keeps_cleanup_after_native_scope_ends)
 }
 
 #include "test_cluster_undo_savepoint_reserve.inc"
+#include "test_cluster_undo_savepoint_pending.inc"
 
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(186);
+	UT_PLAN(195);
+	UT_RUN(test_control_pending_installs_literal_image_before_head_publication);
+	UT_RUN(test_control_pending_repeat_requires_identical_pending_bytes);
+	UT_RUN(test_control_pending_refuses_changed_bounds_without_effects);
+	UT_RUN(test_control_pending_rejects_malformed_original_material);
+	UT_RUN(test_control_pending_rechecks_current_scope_and_modifier);
+	UT_RUN(test_control_pending_critical_wal_failures_keep_owner_and_cleanup);
+	UT_RUN(test_control_pending_updates_old_block_without_rewinding_allocator);
+	UT_RUN(test_control_pending_empty_scope_does_not_claim_completion);
+	UT_RUN(test_control_pending_preserves_success_diagnostics_and_refuses_unknown_debt);
 	UT_RUN(test_pending_candidate_exact_bytes_keep_reserved_source);
 	UT_RUN(test_pending_candidate_requires_full_expected_operation);
 	UT_RUN(test_pending_candidate_cannot_rearm_a_phase_or_change_sequence);

@@ -97,6 +97,7 @@ typedef enum ClusterUndoRecordConsumePreflightResult {
 #define CLUSTER_UNDO_OPERATION_CAPTURE_PRESENT 1
 #define CLUSTER_UNDO_SAVEPOINT_RESERVE_PRESENT 1
 #define CLUSTER_UNDO_SAVEPOINT_BOUNDS_PRESENT 1
+#define CLUSTER_UNDO_SAVEPOINT_PENDING_PRESENT 1
 
 typedef struct ClusterUndoSavepointControl ClusterUndoSavepointControl;
 /* Before any data effect or DATA receipt, with no content/entry lock held.
@@ -131,6 +132,22 @@ typedef struct ClusterUndoSavepointBounds {
  * A caller must stop effects and prove the actual retained chain before use. */
 extern bool cluster_undo_record_savepoint_control_bounds(const ClusterUndoSavepointControl *control,
 														 ClusterUndoSavepointBounds *out);
+
+/* Shared origin only, while the original frame is live and DATA is quiesced.
+ * Install the exact RESERVED control as PENDING through the original segment
+ * current publication, pool content-X and WAL/debt owner. The captured local
+ * bounds must still match. A repeated stage requires the identical PENDING
+ * image and original local WAL cut. false clears *cut_out without publication;
+ * failures after WAL insertion are fatal. No new allocation or receipt cleanup.
+ *
+ * The original reference transfers to top cleanup, surviving frame release.
+ * This stage does NOT publish either head, flush WAL, prove chain reachability
+ * or grant rollback effects. The caller must complete original TT/head/ref and
+ * durability publication before advancing a cursor or returning from rollback. */
+extern bool cluster_undo_record_stage_savepoint_pending(ClusterUndoSavepointControl *control,
+														const ClusterUndoSavepointBounds *expected,
+														uint64 absolute_deadline_us,
+														XLogRecPtr *cut_out);
 
 
 /* Stack-only identity for one backend-local prepared DATA reservation.  It is

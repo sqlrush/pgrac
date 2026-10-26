@@ -9729,6 +9729,7 @@ test_cluster_undo_ctrc_product.o: $(top_srcdir)/src/backend/cluster/cluster_term
 
 test_cluster_undo_record: test_cluster_undo_record.c test_cluster_undo_operation.inc \
 		test_cluster_undo_rollback.inc test_cluster_undo_savepoint_reserve.inc unit_test.h \
+		test_cluster_undo_savepoint_pending.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_undo_retention.c \
 		test_cluster_undo_ctrc_product.o \
 		$(CLUSTER_UBA_O) \
@@ -9762,6 +9763,7 @@ test_cluster_heap_receipt_product.o: test_cluster_heap_receipt_product.c \
 test_cluster_heap_receipt: test_cluster_heap_receipt.c test_cluster_undo_record.c \
 		test_cluster_undo_operation.inc test_cluster_undo_rollback.inc \
 		test_cluster_undo_savepoint_reserve.inc \
+		test_cluster_undo_savepoint_pending.inc \
 		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
 		$(top_srcdir)/src/backend/cluster/cluster_undo_retention.c \
 		$(CLUSTER_UBA_O) \
