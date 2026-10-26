@@ -12319,7 +12319,7 @@ recent_registration_case(bool batch, bool refuse)
  * Source authentication, process scheduling, resolver and resident I/O leaves
  * remain controlled; this does not create a production VACUUM caller. */
 static void
-full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool retire_native)
+full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool retire_native, unsigned terminal_receipt)
 {
 	QualifiedXminFixture f;
 	LVRelState v;
@@ -12389,6 +12389,45 @@ full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool reti
 		pg_atomic_write_u64(&sampler_slots[0].cluster_top_full_xid_atomic,
 			U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 152)));
 	}
+	if (terminal_receipt)
+	{
+		uint64 origin_index;
+
+		UT_ASSERT(retire_native);
+		UT_ASSERT_EQ(sampler_xids[0], InvalidTransactionId);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&sampler_slots[0].cluster_top_full_xid_atomic), 0);
+		receipt_terminal_wakeups = 0;
+		if (terminal_receipt == 1)
+		{
+			UT_ASSERT(census_receipt_cancel_retained(&handle));
+			UT_ASSERT_EQ(receipt_terminal_wakeups, 1);
+		}
+		else
+		{
+			ClusterCtrcTargetV1 final = receipt_terminal_final_target(&handle);
+			ClusterCtrcApplyToken token;
+
+			UT_ASSERT_EQ(original_terminal_receipt_apply_shared(&handle, &final, &token),
+				CLUSTER_CTRC_APPLY_APPLIED);
+			UT_ASSERT(token.valid);
+			UT_ASSERT_EQ(token.journal_slot_generation, handle.journal_slot_generation);
+			UT_ASSERT_EQ(receipt_terminal_wakeups, 0);
+		}
+		/* A terminal receipt remains retained after its native PGPROC source
+		 * has gone. It is not a certificate or permission to advance F. */
+		UT_ASSERT_EQ(handle.receipt->state, terminal_receipt == 1 ? CTRC_RECEIPT_CANCELLED : CTRC_RECEIPT_APPLIED);
+		UT_ASSERT_EQ(handle.participant->state, CTRC_PARTICIPANT_OPEN);
+		UT_ASSERT_EQ(handle.participant->receipt_count, 1);
+		UT_ASSERT_EQ(handle.participant->prepared_count, 0);
+		UT_ASSERT_EQ(handle.participant->cancelled_count, terminal_receipt == 1);
+		UT_ASSERT_EQ(handle.participant->applied_count, terminal_receipt == 2);
+		UT_ASSERT(FullTransactionIdEquals(handle.participant->original_full_xid, full));
+		UT_ASSERT(original_census_origin_index(&key, &origin_index));
+		UT_ASSERT_EQ(ctrc_origin_entries()[origin_index].state, CTRC_ORIGIN_OPEN);
+		UT_ASSERT(FullTransactionIdEquals(ctrc_origin_entries()[origin_index].original_full_xid, full));
+		UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), 1);
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	}
 	total = runtime.capacity.origin_key_entries + runtime.capacity.participant_key_entries;
 	expected_passes = (total + CLUSTER_CTRC_ACTIVE_SCAN_SLICE - 1) / CLUSTER_CTRC_ACTIVE_SCAN_SLICE;
 	native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id - 1;
@@ -12438,6 +12477,12 @@ full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool reti
 	UT_ASSERT(!recent_pin_held && !local_x && !resumed_writer);
 	UT_ASSERT(FullTransactionIdEquals(handle.participant->original_full_xid, full));
 	UT_ASSERT_EQ(handle.participant->receipt_count, 1);
+	if (terminal_receipt)
+	{
+		UT_ASSERT_EQ(handle.receipt->state, terminal_receipt == 1 ? CTRC_RECEIPT_CANCELLED : CTRC_RECEIPT_APPLIED);
+		UT_ASSERT_EQ(handle.participant->prepared_count, 0);
+		UT_ASSERT_EQ(receipt_terminal_wakeups, terminal_receipt == 1);
+	}
 	if (late_receiver)
 	{
 		UT_ASSERT_EQ(recent_registration_calls, 1);
@@ -12453,19 +12498,31 @@ full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool reti
 static void
 full_source_then_recent_case(bool batch, bool late_receiver)
 {
-	full_source_then_recent_lifecycle_case(batch, late_receiver, false);
+	full_source_then_recent_lifecycle_case(batch, late_receiver, false, 0);
+}
+
+UT_TEST(test_original_pgproc_exit_cancelled_receipt_keeps_source_through_recent_wal)
+{
+	for (unsigned batch = 0; batch < 2; batch++)
+		full_source_then_recent_lifecycle_case(batch != 0, false, true, 1);
+}
+
+UT_TEST(test_original_pgproc_exit_applied_receipt_keeps_source_through_recent_wal)
+{
+	for (unsigned batch = 0; batch < 2; batch++)
+		full_source_then_recent_lifecycle_case(batch != 0, false, true, 2);
 }
 
 UT_TEST(test_original_pgproc_exit_keeps_retained_source_through_recent_wal)
 {
 	for (unsigned batch = 0; batch < 2; batch++)
-		full_source_then_recent_lifecycle_case(batch != 0, false, true);
+		full_source_then_recent_lifecycle_case(batch != 0, false, true, 0);
 }
 
 UT_TEST(test_original_pgproc_exit_late_receiver_still_revokes_recent_wal)
 {
 	for (unsigned batch = 0; batch < 2; batch++)
-		full_source_then_recent_lifecycle_case(batch != 0, true, true);
+		full_source_then_recent_lifecycle_case(batch != 0, true, true, 0);
 }
 
 UT_TEST(test_full_original_source_reaches_pin_free_collector_and_recent_wal)
@@ -12733,7 +12790,7 @@ UT_TEST(test_recent_xmin_share_lock_refusal_keeps_borrowed_pin_without_upgrade)
 int
 main(void)
 {
-	UT_PLAN(298);
+	UT_PLAN(300);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -12742,6 +12799,8 @@ main(void)
 	UT_RUN(test_recent_refused_receiver_keeps_original_cut_and_native_continuation);
 	UT_RUN(test_full_original_source_reaches_pin_free_collector_and_recent_wal);
 	UT_RUN(test_full_original_source_late_receiver_revokes_recent_wal);
+	UT_RUN(test_original_pgproc_exit_cancelled_receipt_keeps_source_through_recent_wal);
+	UT_RUN(test_original_pgproc_exit_applied_receipt_keeps_source_through_recent_wal);
 	UT_RUN(test_original_pgproc_exit_keeps_retained_source_through_recent_wal);
 	UT_RUN(test_original_pgproc_exit_late_receiver_still_revokes_recent_wal);
 	UT_RUN(test_recent_xmin_stale_registration_refuses_before_resident_pin);
