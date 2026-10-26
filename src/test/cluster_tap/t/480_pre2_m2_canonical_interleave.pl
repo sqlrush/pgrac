@@ -1,5 +1,6 @@
 #!/usr/bin/env perl
-# One two-member native scheduling matrix. No authority or state is injected.
+# Four normal members, with scheduling and data checks on nodes 0 and 1.
+# No authority or state is injected.
 # Author: SqlRush <sqlrush@gmail.com>
 use strict;
 use warnings;
@@ -102,12 +103,20 @@ sub reload_pause {
  sleep(0.2);
 }
 
-$cluster=PostgreSQL::Test::ClusterPRE2->new_cluster('m2_a08',nodes=>2,blackbox=>1,
+$cluster=PostgreSQL::Test::ClusterPRE2->new_cluster('m2_a08',nodes=>4,blackbox=>1,
  required_operations=>[],extra_conf=>['autovacuum=off','cluster.trace_tx_identity=on',
   'log_error_verbosity=verbose','log_line_prefix=\'%m [%p] \'']);
 $cluster->start_cluster;
 my @nodes=$cluster->nodes;
+is(scalar(@nodes),4,'original PRE2 formation admits four normal members');
 my ($a,$b)=@nodes;
+my @active=($a,$b);
+save_json('formation',{
+ open=>[map { $cluster->observe('open_observation',{node=>$_}) } 0..$#nodes],
+ producer_node=>0,peer_reader_node=>1,passive_nodes=>[2,3],
+ # These two providers are local-origin APIs. Their direct diagnostic
+ # calls stay on node 0; origin RPC readers run on node 1.
+ local_providers=>[qw(physical owner)],remote_providers=>[qw(freeze_data sample_canonical)]});
 $a->safe_psql('postgres','CREATE EXTENSION test_pgrac_shared_config');
 
 # Real DATA rollover is induced with one ordinary transaction. The padding
@@ -182,8 +191,9 @@ for my $kind (qw(A1 A2)) {
   my $scn=@terminal == 1 ? 0+$terminal[0]{tt_slot}{commit_scn} : 0;
   my $fresh=json_result($r->query_safe($sql));
   my $expected=$kind eq 'A1' ? ($caller eq 'sample_canonical' ? 21 : 20) : 10;
-  my @values=map { $_->safe_psql('postgres',"SELECT id,v FROM $table ORDER BY id") } @nodes;
+  my @values=map { $_->safe_psql('postgres',"SELECT id,v FROM $table ORDER BY id") } @active;
   my $case={kind=>$kind,caller=>$caller,xid=>$xid,key=>$key,
+   producer_node=>0,probe_node=>$remote ? 1 : 0,value_nodes=>[0,1],
    producer_pid=>$wpid,reader_pid=>$rpid,reached=>$reached ? JSON::PP::true : JSON::PP::false,
    guard_clear=>($result->{guard_clear} && $fresh->{guard_clear}) ? JSON::PP::true : JSON::PP::false,
    values_correct=>(!grep { $_ ne "1|$expected" } @values) ? JSON::PP::true : JSON::PP::false,
@@ -222,7 +232,7 @@ is($b->safe_psql('postgres','UPDATE m2_cancel SET v=30; SELECT id,v FROM m2_canc
 finish_sessions();
 $cluster->stop_cluster;
 undef $cluster;
-pass('both native members complete the original normal-stop proof');
+pass('all four native members complete the original normal-stop proof');
 for my $node (@nodes) {
  unlike(slurp_file($node->logfile),qr/PANIC|checksum verification failed|invalid page in block/,
   'closed native member has no corruption or PANIC');
