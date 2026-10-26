@@ -418,6 +418,33 @@ undo_cleaner_capacity_owner_generation_locked(unsigned worker_id)
 	return worker->incarnation_generation;
 }
 
+/*
+ * cluster_undo_cleaner_capacity_owner_snapshot -- Read original ready owners.
+ * Inputs: segment worker and caller-local generation outputs.
+ * Returns: both original identities, or false with outputs unchanged.
+ * Side Effects: acquires only the original local cleaner lock.
+ */
+bool
+cluster_undo_cleaner_capacity_owner_snapshot(unsigned worker_id, uint64 *coordinator_generation,
+											 uint64 *worker_generation)
+{
+	uint64 coordinator;
+	uint64 worker;
+
+	if (undo_cleaner_state == NULL || worker_id >= CLUSTER_UNDO_CLEANER_WORKER_TYPES
+		|| coordinator_generation == NULL || worker_generation == NULL)
+		return false;
+	LWLockAcquire(&undo_cleaner_state->lwlock, LW_SHARED);
+	coordinator = undo_cleaner_capacity_owner_generation_locked(0);
+	worker = undo_cleaner_capacity_owner_generation_locked(worker_id);
+	LWLockRelease(&undo_cleaner_state->lwlock);
+	if (coordinator == 0 || worker == 0)
+		return false;
+	*coordinator_generation = coordinator;
+	*worker_generation = worker;
+	return true;
+}
+
 bool
 cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *continuation)
 {
@@ -450,6 +477,19 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 			LWLockRelease(&undo_cleaner_state->lwlock);
 			proof = cluster_ctrc_capacity_probe_current(segment_id, floor.scn, floor.epoch,
 														continuation);
+			if (proof == CLUSTER_CTRC_CAPACITY_REFUSE) {
+				ClusterCapacityObservationV1 observation;
+				ClusterCapacityReasonV1 reason = cluster_ctrc_capacity_probe_pool_v1(
+					segment_id, floor.scn, floor.epoch, &observation);
+
+				if (reason == CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE) {
+					*continuation = observation.key;
+					proof = CLUSTER_CTRC_CAPACITY_WAIT;
+				} else if (reason == CLUSTER_CAPACITY_SUPPLY_RECHECK) {
+					MemSet(continuation, 0, sizeof(*continuation));
+					proof = CLUSTER_CTRC_CAPACITY_RETRY;
+				}
+			}
 		}
 		if (proof == CLUSTER_CTRC_CAPACITY_RETRY)
 			retry = true;
