@@ -159,6 +159,41 @@ typedef struct ClusterRuntimeVisibilityCanonicalDiagnostic {
 	bool final_admission_current;
 } ClusterRuntimeVisibilityCanonicalDiagnostic;
 
+/* Optional process-local observation of the existing DATA freeze. */
+typedef enum ClusterRuntimeVisibilityDataFailure {
+	CLUSTER_RUNTIME_VISIBILITY_DATA_FAILURE_NONE = 0,
+	CLUSTER_RUNTIME_VISIBILITY_DATA_FAILURE_INPUT,
+	CLUSTER_RUNTIME_VISIBILITY_DATA_FAILURE_ADMISSION,
+	CLUSTER_RUNTIME_VISIBILITY_DATA_FAILURE_UBA,
+	CLUSTER_RUNTIME_VISIBILITY_DATA_FAILURE_ORIGIN,
+	CLUSTER_RUNTIME_VISIBILITY_DATA_FAILURE_GENERATION_SAMPLE,
+	CLUSTER_RUNTIME_VISIBILITY_DATA_FAILURE_GENERATION_UNKNOWN,
+	CLUSTER_RUNTIME_VISIBILITY_DATA_FAILURE_GENERATION_OVERFLOW,
+	CLUSTER_RUNTIME_VISIBILITY_DATA_FAILURE_EXPECTED_GENERATION,
+	CLUSTER_RUNTIME_VISIBILITY_DATA_FAILURE_RESIDENT_COPY,
+	CLUSTER_RUNTIME_VISIBILITY_DATA_FAILURE_DATA_COPY,
+	CLUSTER_RUNTIME_VISIBILITY_DATA_FAILURE_RECORD_EXTRACT,
+	CLUSTER_RUNTIME_VISIBILITY_DATA_FAILURE_RECORD_SHORT,
+	CLUSTER_RUNTIME_VISIBILITY_DATA_FAILURE_TT_DOMAIN,
+	CLUSTER_RUNTIME_VISIBILITY_DATA_FAILURE_CANONICAL,
+	CLUSTER_RUNTIME_VISIBILITY_DATA_FAILURE_FINAL_RECHECK
+} ClusterRuntimeVisibilityDataFailure;
+
+typedef struct ClusterRuntimeVisibilityDataDiagnostic {
+	bool valid;
+	ClusterRuntimeVisibilityDataFailure first_failure;
+	int32 generation_result;
+	bool generation_known;
+	uint32 generation_value;
+	int32 resident_copy_result;
+	bool data_copy_attempted;
+	bool data_copied;
+	bool record_extract_attempted;
+	bool record_extracted;
+	size_t record_length;
+	uint32 tt_segment_id;
+} ClusterRuntimeVisibilityDataDiagnostic;
+
 extern void cluster_runtime_visibility_ensure_exit_hooks(void);
 extern bool
 cluster_runtime_visibility_zero_epoch_pair_admission_enter(ClusterSemanticAdmissionToken *token);
@@ -189,6 +224,14 @@ extern ClusterRuntimeVisibilityOriginStep cluster_runtime_visibility_origin_plan
 	const ClusterUndoBlock0Generation *expected_generation, ClusterUndoBlock0CurrentGuard *guard,
 	const ClusterUndoBlock0ResolvedRoot *root, ClusterRuntimeVisibilityOriginPlan *plan,
 	ClusterTxResolution *out, ClusterTxResolveReason *reason_out);
+extern ClusterRuntimeVisibilityOriginStep
+cluster_runtime_visibility_origin_plan_freeze_data_observed_held(
+	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission,
+	const ClusterUndoBlock0Generation *expected_generation, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterRuntimeVisibilityOriginPlan *plan,
+	ClusterTxResolution *out, ClusterTxResolveReason *reason_out,
+	ClusterRuntimeVisibilityDataDiagnostic *diagnostic);
 extern bool cluster_runtime_visibility_origin_plan_canonical_logical(
 	const ClusterRuntimeVisibilityOriginPlan *plan, ClusterUndoBlock0LogicalKey *logical_out);
 extern bool cluster_runtime_visibility_origin_plan_canonical_physical(

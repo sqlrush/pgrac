@@ -2290,6 +2290,21 @@ cluster_runtime_visibility_origin_plan_freeze_data_held(
 	return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_COMPLETE;
 }
 
+ClusterRuntimeVisibilityOriginStep
+cluster_runtime_visibility_origin_plan_freeze_data_observed_held(
+	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission,
+	const ClusterUndoBlock0Generation *expected_generation, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterRuntimeVisibilityOriginPlan *plan,
+	ClusterTxResolution *out, ClusterTxResolveReason *reason_out,
+	ClusterRuntimeVisibilityDataDiagnostic *diagnostic)
+{
+	if (diagnostic != NULL)
+		memset(diagnostic, 0, sizeof(*diagnostic));
+	return cluster_runtime_visibility_origin_plan_freeze_data_held(
+		locator, mode, admission, expected_generation, guard, root, plan, out, reason_out);
+}
+
 bool
 cluster_runtime_visibility_origin_plan_canonical_logical(
 	const ClusterRuntimeVisibilityOriginPlan *plan, ClusterUndoBlock0LogicalKey *logical_out)
