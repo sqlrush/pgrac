@@ -59,6 +59,7 @@ static unsigned prepared, cancelled, slept, signalled, broadcasts;
 static uint32 test_wait_event, last_sleep_event;
 uint32 *my_wait_event_info = &test_wait_event;
 static bool subscribed, early_signal, test_cancel, test_pin_after_probe;
+static int test_error_code = ERRCODE_QUERY_CANCELED;
 static bool test_lock_wait;
 static ClusterCtrcCapacityProbeResult test_proof;
 static TransactionId test_xid = 100;
@@ -612,6 +613,14 @@ ProcessInterrupts(void)
 	pg_re_throw();
 }
 
+/* ErrorData/SQLSTATE is a PostgreSQL boundary; the wait's error observer and
+ * original PG_FINALLY/propagation run from the real product body. */
+int
+geterrcode(void)
+{
+	return test_error_code;
+}
+
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
 {
@@ -645,6 +654,8 @@ reset_wait_fixture(void)
 	test_foreign_lwlock = test_fence = false;
 	cluster_enabled = test_floor = true;
 	cluster_shared_config = false;
+	cluster_node_id = 0;
+	test_error_code = ERRCODE_QUERY_CANCELED;
 	cleaner_start_state = CLUSTER_NORMAL_START_TARGET_READY;
 	cleaner_recovered_open = true;
 	cluster_undo_cleaner_enabled = cluster_undo_retention_horizon_enabled = true;
@@ -1580,10 +1591,134 @@ UT_TEST(test_worker_census_source_republication_discards_before_replacement)
 	UT_ASSERT_EQ(test_modifier_entries, 0);
 }
 
+UT_TEST(test_capacity_stats_unavailable_does_not_fabricate_an_origin_or_zero)
+{
+	ClusterUndoCapacityStats out, before;
+	UndoCleanerSharedState *saved;
+
+	reset_wait_fixture();
+	MemSet(&out, 0xa5, sizeof(out));
+	before = out;
+	saved = undo_cleaner_state;
+	undo_cleaner_state = NULL;
+	UT_ASSERT(!cluster_undo_cleaner_capacity_stats_snapshot(&out));
+	UT_ASSERT_EQ(memcmp(&out, &before, sizeof(out)), 0);
+	undo_cleaner_state = saved;
+	for (unsigned invalid = 0; invalid < 2; invalid++) {
+		cluster_node_id = invalid ? CLUSTER_CTRC_MAX_PARTICIPANTS : -1;
+		UT_ASSERT(!cluster_undo_cleaner_capacity_stats_snapshot(&out));
+		UT_ASSERT_EQ(memcmp(&out, &before, sizeof(out)), 0);
+	}
+	cluster_node_id = 0;
+	UT_ASSERT(!cluster_undo_cleaner_capacity_stats_snapshot(NULL));
+	UT_ASSERT_EQ(test_lock_depth, 0);
+}
+
+UT_TEST(test_capacity_stats_distinguishes_available_zero_and_preserves_unsigned_counts)
+{
+	ClusterUndoCapacityStats out;
+
+	reset_wait_fixture();
+	cluster_node_id = 3;
+	for (unsigned i = 0; i < CLUSTER_UNDO_CLEANER_WORKER_TYPES; i++)
+		undo_cleaner_state->workers[i].status = UNDO_CLEANER_NOT_STARTED;
+	UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&out));
+	UT_ASSERT_EQ(out.origin_node_id, 3);
+	UT_ASSERT_EQ(out.pool_wait_count, 0);
+	UT_ASSERT_EQ(out.wakeup_recheck_count, 0);
+	UT_ASSERT_EQ(out.cancel_count, 0);
+	UT_ASSERT_EQ(out.refused_context_count, 0);
+	UT_ASSERT_EQ(out.refused_proof_count, 0);
+	undo_cleaner_state->capacity_wait_entered = UINT64_MAX;
+	undo_cleaner_state->capacity_wait_repolled = UINT64_C(9223372036854775809);
+	undo_cleaner_state->capacity_wait_refused_context = 19;
+	undo_cleaner_state->capacity_wait_refused_proof = 23;
+	pg_atomic_write_u64(&undo_cleaner_state->capacity_wait_cancelled, 17);
+	UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&out));
+	UT_ASSERT_EQ(out.pool_wait_count, UINT64_MAX);
+	UT_ASSERT_EQ(out.wakeup_recheck_count, UINT64_C(9223372036854775809));
+	UT_ASSERT_EQ(out.cancel_count, 17);
+	UT_ASSERT_EQ(out.refused_context_count, 19);
+	UT_ASSERT_EQ(out.refused_proof_count, 23);
+	UT_ASSERT_EQ(slept, 0);
+	UT_ASSERT_EQ(test_lock_depth, 0);
+	cluster_node_id = 0;
+}
+
+UT_TEST(test_capacity_stats_counts_existing_sleep_recheck_and_refusal_paths)
+{
+	for (unsigned mode = 0; mode < 5; mode++) {
+		ClusterCtrcTxnKeyV1 continuation = { 0 };
+		ClusterUndoCapacityStats out;
+
+		reset_wait_fixture();
+		early_signal = mode == 1;
+		if (mode == 2)
+			test_proof = CLUSTER_CTRC_CAPACITY_RETRY;
+		if (mode == 3)
+			test_foreign_lwlock = true;
+		if (mode == 4)
+			test_floor = false;
+		UT_ASSERT_EQ(cluster_undo_cleaner_wait_for_capacity(1, &continuation), mode < 3);
+		UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&out));
+		UT_ASSERT_EQ(out.pool_wait_count, mode < 2 ? 1 : 0);
+		UT_ASSERT_EQ(out.wakeup_recheck_count, mode < 2 ? 1 : 0);
+		UT_ASSERT_EQ(out.cancel_count, 0);
+		UT_ASSERT_EQ(out.refused_context_count, mode == 3 ? 1 : 0);
+		UT_ASSERT_EQ(out.refused_proof_count, mode == 4 ? 1 : 0);
+		UT_ASSERT_EQ(undo_cleaner_state->shmem_tt_slots_gcd, 0);
+		UT_ASSERT_EQ(undo_cleaner_state->segments_marked_recyclable, 0);
+	}
+}
+
+UT_TEST(test_capacity_stats_counts_only_query_cancellation_and_preserves_error_cleanup)
+{
+	static const int codes[] = { ERRCODE_QUERY_CANCELED, ERRCODE_QUERY_CANCELED,
+								 ERRCODE_LOCK_NOT_AVAILABLE, ERRCODE_IO_ERROR };
+
+	for (unsigned fault = 0; fault < lengthof(codes); fault++) {
+		ClusterCtrcTxnKeyV1 continuation = { 0 };
+		ClusterUndoCapacityStats out;
+		volatile bool caught = false;
+		volatile int caught_code = 0;
+
+		reset_wait_fixture();
+		test_error_code = codes[fault];
+		test_cancel = true;
+		InterruptPending = fault == 1;
+		PG_TRY();
+		{
+			(void)cluster_undo_cleaner_wait_for_capacity(1, &continuation);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+			caught_code = geterrcode();
+		}
+		PG_END_TRY();
+		InterruptPending = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(caught_code, codes[fault]);
+		UT_ASSERT_EQ(cancelled, 1);
+		UT_ASSERT(!subscribed);
+		UT_ASSERT_EQ(test_lock_depth, 0);
+		UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&out));
+		UT_ASSERT_EQ(out.cancel_count, fault < 2 ? 1 : 0);
+		UT_ASSERT_EQ(out.pool_wait_count, fault == 1 ? 0 : 1);
+		UT_ASSERT_EQ(out.wakeup_recheck_count, 0);
+		UT_ASSERT_EQ(out.refused_context_count, 0);
+		UT_ASSERT_EQ(out.refused_proof_count, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(29);
+	UT_PLAN(33);
+	UT_RUN(test_capacity_stats_unavailable_does_not_fabricate_an_origin_or_zero);
+	UT_RUN(test_capacity_stats_distinguishes_available_zero_and_preserves_unsigned_counts);
+	UT_RUN(test_capacity_stats_counts_existing_sleep_recheck_and_refusal_paths);
+	UT_RUN(test_capacity_stats_counts_only_query_cancellation_and_preserves_error_cleanup);
 	UT_RUN(test_recovered_open_gate_precedes_cleaner_ctrc_pass);
 	UT_RUN(test_capacity_wait_retries_signals_and_cadence_without_authorizing_free);
 	UT_RUN(test_capacity_sleep_reports_frontend_undo_event);

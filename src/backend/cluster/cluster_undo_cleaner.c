@@ -144,6 +144,7 @@ cluster_undo_cleaner_shmem_init(void)
 		memset(undo_cleaner_state, 0, sizeof(*undo_cleaner_state));
 		LWLockInitialize(&undo_cleaner_state->lwlock, LWTRANCHE_CLUSTER_UNDO_CLEANER);
 		ConditionVariableInit(&undo_cleaner_state->capacity_cv);
+		pg_atomic_init_u64(&undo_cleaner_state->capacity_wait_cancelled, 0);
 	}
 }
 
@@ -220,6 +221,27 @@ cluster_undo_cleaner_worker_snapshot(unsigned worker_id, UndoCleanerWorkerState 
 	LWLockAcquire(&undo_cleaner_state->lwlock, LW_SHARED);
 	*out = undo_cleaner_state->workers[worker_id];
 	LWLockRelease(&undo_cleaner_state->lwlock);
+	return true;
+}
+
+bool
+cluster_undo_cleaner_capacity_stats_snapshot(ClusterUndoCapacityStats *out)
+{
+	ClusterUndoCapacityStats snapshot;
+
+	if (out == NULL || undo_cleaner_state == NULL || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS)
+		return false;
+	MemSet(&snapshot, 0, sizeof(snapshot));
+	snapshot.origin_node_id = cluster_node_id;
+	LWLockAcquire(&undo_cleaner_state->lwlock, LW_SHARED);
+	snapshot.pool_wait_count = undo_cleaner_state->capacity_wait_entered;
+	snapshot.wakeup_recheck_count = undo_cleaner_state->capacity_wait_repolled;
+	snapshot.refused_context_count = undo_cleaner_state->capacity_wait_refused_context;
+	snapshot.refused_proof_count = undo_cleaner_state->capacity_wait_refused_proof;
+	snapshot.cancel_count = pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_cancelled);
+	LWLockRelease(&undo_cleaner_state->lwlock);
+	*out = snapshot;
 	return true;
 }
 
@@ -387,6 +409,7 @@ bool
 cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *continuation)
 {
 	bool retry = false;
+	volatile bool completed = false;
 	uint32 previous_wait_event = *my_wait_event_info;
 
 	if (undo_cleaner_state == NULL || continuation == NULL)
@@ -444,10 +467,15 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 				undo_cleaner_state->capacity_wait_refused_proof++;
 			LWLockRelease(&undo_cleaner_state->lwlock);
 		}
+		completed = true;
 	}
 	PG_FINALLY();
 	{
 		ConditionVariableCancelSleep();
+		/* Preserve the original ERROR and cleanup. A lock-free diagnostic
+		 * must not turn a different failure into caller cancellation. */
+		if (!completed && geterrcode() == ERRCODE_QUERY_CANCELED)
+			pg_atomic_fetch_add_u64(&undo_cleaner_state->capacity_wait_cancelled, 1);
 	}
 	PG_END_TRY();
 	/* CV and bookkeeping LWLock waits clear their events. Errors use PG cleanup. */
