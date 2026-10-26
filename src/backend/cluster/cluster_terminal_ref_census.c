@@ -4938,6 +4938,93 @@ ctrc_cleaner_terminal_sample_exact(const ClusterCtrcTxnKeyV1 *key,
 	 * cannot broaden any release/certificate producer's acceptance set. */
 	return ctrc_cleaner_terminal_sample_mode(key, false, status_out, commit_scn_out, NULL);
 }
+
+/* Validate only the original local CURRENT scope, never slot availability. */
+static bool
+ctrc_capacity_local_current(uint32 segment_id, uint32 *current)
+{
+	uint32 first;
+
+	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS)
+		return false;
+	first = (uint32)cluster_node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	if (segment_id < first || segment_id - first >= CLUSTER_UNDO_SEGS_PER_INSTANCE)
+		return false;
+	*current = cluster_tt_slot_current_segment(cluster_node_id);
+	return *current >= first && *current - first < CLUSTER_UNDO_SEGS_PER_INSTANCE;
+}
+
+/* Empty is the original publisher handoff barrier, not release authority. */
+static bool
+ctrc_capacity_origin_absent(uint64 index)
+{
+	bool absent;
+
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	absent = ctrc_bytes_zero(&ctrc_origin_entries()[index], sizeof(ClusterCtrcOriginEntry));
+	LWLockRelease(&CtrcShared->origin_lock);
+	return absent;
+}
+
+/* The CURRENT certificate path retains its original exact snapshot gate. */
+static bool
+ctrc_capacity_current_certificate_snapshot(uint64 index, uint32 segment_id,
+										   ClusterCtrcOriginCertificateSnapshot *snapshot)
+{
+	bool exact;
+
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	exact = ctrc_origin_certificate_snapshot_index_locked(index, snapshot)
+			&& snapshot->origin.key.segment_id == segment_id
+			&& snapshot->origin.key.origin_node_id == (uint16)cluster_node_id;
+	LWLockRelease(&CtrcShared->origin_lock);
+	return exact;
+}
+
+/* One original CURRENT position, sharing its certificate probe budget.
+ * Reprove the original GC work after origin retirement; no retained key,
+ * shmem status or empty row alone authorizes this wait or any slot reuse. */
+static ClusterCtrcCapacityProbeResult
+ctrc_capacity_current_gc_candidate(uint32 segment_id, uint16 slot_offset, SCN horizon, uint64 epoch,
+								   ClusterCtrcTxnKeyV1 *continuation)
+{
+	ClusterCtrcTxnKeyV1 key, final_key;
+	ClusterTTSlotCurrentOwner owner, final_owner;
+	ClusterCtrcTerminalStatus status;
+	SCN commit_scn;
+	uint64 binding, final_binding, index;
+	uint32 current;
+	bool released;
+
+	if (!cluster_tt_slot_current_origin_snapshot(segment_id, slot_offset, &key, &owner, &binding)
+		|| !ctrc_txn_key_valid(&key) || key.segment_id != segment_id
+		|| key.slot_offset != slot_offset || owner.segment_id != segment_id
+		|| owner.slot_offset != slot_offset || owner.xid != key.xid || owner.wrap != key.slot_wrap
+		|| owner.wrap >= TT_WRAP_MAX || binding == 0 || binding == UINT64_MAX
+		|| !ctrc_bytes_zero(owner.reserved8, sizeof(owner.reserved8))
+		|| (owner.status != CTS_COMMITTED && owner.status != CTS_ABORTED)
+		|| (owner.status == CTS_COMMITTED
+				? (!SCN_VALID(owner.commit_scn) || scn_time_cmp(owner.commit_scn, horizon) > 0)
+				: owner.commit_scn != InvalidScn)
+		|| !ctrc_origin_index(&key, &index) || !ctrc_capacity_origin_absent(index))
+		return CLUSTER_CTRC_CAPACITY_REFUSE;
+	if (!ctrc_cleaner_terminal_sample_mode(&key, true, &status, &commit_scn, &released) || !released
+		|| commit_scn != owner.commit_scn
+		|| status
+			   != (owner.status == CTS_COMMITTED ? CTRC_TERMINAL_COMMITTED : CTRC_TERMINAL_ABORTED))
+		return CLUSTER_CTRC_CAPACITY_REFUSE;
+	if (epoch != cluster_epoch_get_current() || !ctrc_capacity_local_current(segment_id, &current))
+		return CLUSTER_CTRC_CAPACITY_REFUSE;
+	if (current != segment_id)
+		return CLUSTER_CTRC_CAPACITY_RETRY;
+	if (!cluster_tt_slot_current_origin_snapshot(segment_id, slot_offset, &final_key, &final_owner,
+												 &final_binding)
+		|| binding != final_binding || memcmp(&key, &final_key, sizeof(key)) != 0
+		|| memcmp(&owner, &final_owner, sizeof(owner)) != 0 || !ctrc_capacity_origin_absent(index))
+		return CLUSTER_CTRC_CAPACITY_RETRY;
+	*continuation = key;
+	return CLUSTER_CTRC_CAPACITY_WAIT;
+}
 #endif
 
 ClusterCtrcCapacityProbeResult
@@ -4945,22 +5032,14 @@ cluster_ctrc_capacity_probe_current(uint32 segment_id, SCN horizon, uint64 epoch
 									ClusterCtrcTxnKeyV1 *continuation)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
-	uint32 first;
 	uint32 current;
 	bool armed;
 	uint64 start;
 
 	if (continuation == NULL)
 		return CLUSTER_CTRC_CAPACITY_REFUSE;
-	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS
-		|| !SCN_VALID(horizon) || epoch == 0 || epoch != cluster_epoch_get_current()
-		|| !cluster_ctrc_shmem_ready())
-		goto refuse;
-	first = (uint32)cluster_node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
-	if (segment_id < first || segment_id - first >= CLUSTER_UNDO_SEGS_PER_INSTANCE)
-		goto refuse;
-	current = cluster_tt_slot_current_segment(cluster_node_id);
-	if (current < first || current - first >= CLUSTER_UNDO_SEGS_PER_INSTANCE)
+	if (!SCN_VALID(horizon) || epoch == 0 || epoch != cluster_epoch_get_current()
+		|| !cluster_ctrc_shmem_ready() || !ctrc_capacity_local_current(segment_id, &current))
 		goto refuse;
 	if (current != segment_id) {
 		MemSet(continuation, 0, sizeof(*continuation));
@@ -4972,38 +5051,36 @@ cluster_ctrc_capacity_probe_current(uint32 segment_id, SCN horizon, uint64 epoch
 			|| continuation->origin_node_id != (uint16)cluster_node_id
 			|| continuation->cluster_epoch != epoch))
 		goto refuse;
-	start = (uint64)(segment_id - first) * TT_SLOTS_PER_SEGMENT;
+	start = (uint64)((segment_id - 1) % CLUSTER_UNDO_SEGS_PER_INSTANCE) * TT_SLOTS_PER_SEGMENT;
 	for (unsigned slot = 0; slot < (armed ? 1 : TT_SLOTS_PER_SEGMENT); slot++) {
 		ClusterCtrcOriginCertificateSnapshot snapshot;
 		ClusterCtrcTxnKeyV1 key;
 		ClusterCtrcTerminalStatus status;
 		SCN commit_scn;
-		bool released;
-		bool exact = false;
+		bool released, exact;
 
 		CHECK_FOR_INTERRUPTS();
 		if (armed)
 			key = *continuation;
 		else {
-			LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
-			exact = ctrc_origin_certificate_snapshot_index_locked(start + slot, &snapshot)
-					&& snapshot.origin.key.segment_id == segment_id
-					&& snapshot.origin.key.origin_node_id == (uint16)cluster_node_id;
-			LWLockRelease(&CtrcShared->origin_lock);
-			if (!exact)
+			exact = ctrc_capacity_current_certificate_snapshot(start + slot, segment_id, &snapshot);
+			if (!exact) {
+				ClusterCtrcCapacityProbeResult gc = ctrc_capacity_current_gc_candidate(
+					segment_id, slot, horizon, epoch, continuation);
+				if (gc != CLUSTER_CTRC_CAPACITY_REFUSE)
+					return gc;
 				continue;
+			}
 			key = snapshot.origin.key;
 		}
 		if (!ctrc_cleaner_terminal_sample_mode(&key, true, &status, &commit_scn, &released)
 			|| (status == CTRC_TERMINAL_COMMITTED && scn_time_cmp(commit_scn, horizon) > 0))
 			continue;
 	capacity_sampled:
-		if (epoch != cluster_epoch_get_current())
+		if (epoch != cluster_epoch_get_current()
+			|| !ctrc_capacity_local_current(segment_id, &current))
 			goto refuse;
-		current = cluster_tt_slot_current_segment(cluster_node_id);
 		if (current != segment_id) {
-			if (current < first || current - first >= CLUSTER_UNDO_SEGS_PER_INSTANCE)
-				goto refuse;
 			MemSet(continuation, 0, sizeof(*continuation));
 			return CLUSTER_CTRC_CAPACITY_RETRY;
 		}

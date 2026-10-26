@@ -15,6 +15,24 @@ int durable_fixture_main(int argc, char **argv);
 #include "../../backend/cluster/cluster_tt_slot.c"
 #include "../../backend/cluster/cluster_tt_local.c"
 
+/* The parent has no discovery API. Its unavailable fallback cannot prove GC. */
+#ifndef CLUSTER_TT_SLOT_CURRENT_ORIGIN_SNAPSHOT_V1
+static bool
+cluster_tt_slot_current_origin_snapshot(uint32 segment pg_attribute_unused(),
+										uint16 offset pg_attribute_unused(),
+										ClusterCtrcTxnKeyV1 *key, ClusterTTSlotCurrentOwner *owner,
+										uint64 *binding)
+{
+	if (key != NULL)
+		memset(key, 0, sizeof(*key));
+	if (owner != NULL)
+		memset(owner, 0, sizeof(*owner));
+	if (binding != NULL)
+		*binding = 0;
+	return false;
+}
+#endif
+
 /* Ordinary TT tests have no relmap producer; the composition supplies it. */
 #ifndef TT_ACTIVE_OWNER_EXTERNAL_RELMAP_HOOK
 bool
@@ -1528,6 +1546,173 @@ UT_TEST(test_allocator_snapshot_is_complete_readonly_and_unavailable_leaves_outp
 	UT_ASSERT_EQ(lock_depth, 0);
 }
 
+static void
+prepare_gc_origin_snapshot(bool committed, unsigned prefix, ClusterCtrcTxnKeyV1 *key)
+{
+	reset_active_owner();
+	for (unsigned i = 0; i < prefix; i++)
+		UT_ASSERT_EQ(cluster_tt_slot_alloc(1, 1000 + i), i);
+	require_published_on(1);
+	*key = g_ctrc_original_reservation.key;
+	UT_ASSERT_EQ(key->slot_offset, prefix);
+	g_ctrc_original_available = false;
+	if (committed)
+		cluster_tt_slot_mark_committed(1, key->slot_offset, key->xid, key->slot_wrap, 91);
+	else
+		cluster_tt_slot_mark_aborted(1, key->slot_offset, key->xid, key->slot_wrap);
+}
+
+UT_TEST(test_current_origin_snapshot_uses_original_terminal_slot_provenance)
+{
+	for (unsigned variant = 0; variant < 4; variant++) {
+		ClusterCtrcTxnKeyV1 key, observed;
+		ClusterTTSlotCurrentOwner owner;
+		ClusterTTSlotAllocPerSegment before;
+		uint64 binding = 0;
+		bool committed = (variant & 1) != 0;
+
+		prepare_gc_origin_snapshot(committed, variant < 2 ? 0 : 47, &key);
+		before = allocator_storage.per_node[0];
+		UT_ASSERT(cluster_tt_slot_current_origin_snapshot(1, key.slot_offset, &observed, &owner,
+														  &binding));
+		UT_ASSERT_EQ(memcmp(&observed, &key, sizeof(key)), 0);
+		UT_ASSERT_EQ(binding, before.binding_generation);
+		UT_ASSERT_EQ(owner.segment_id, 1);
+		UT_ASSERT_EQ(owner.slot_offset, key.slot_offset);
+		UT_ASSERT_EQ(owner.xid, key.xid);
+		UT_ASSERT_EQ(owner.wrap, key.slot_wrap);
+		UT_ASSERT_EQ(owner.status, committed ? CTS_COMMITTED : CTS_ABORTED);
+		UT_ASSERT_EQ(owner.commit_scn, committed ? 91 : InvalidScn);
+		UT_ASSERT_EQ(memcmp(&before, &allocator_storage.per_node[0], sizeof(before)), 0);
+		UT_ASSERT_EQ(lock_depth, 0);
+		UT_ASSERT_EQ(g_bind_emit_calls, 1);
+	}
+}
+
+UT_TEST(test_current_origin_snapshot_rejects_missing_or_malformed_original_identity)
+{
+	for (unsigned fault = 0; fault < 22; fault++) {
+		ClusterCtrcTxnKeyV1 key, observed;
+		ClusterTTSlotCurrentOwner owner, zero = { 0 };
+		ClusterTTSlotAllocPerSegment *segment;
+		ClusterTTSlotOriginIdentity *identity;
+		uint64 binding = 7;
+
+		prepare_gc_origin_snapshot(true, 0, &key);
+		segment = &allocator_storage.per_node[0];
+		identity = &segment->origins[0];
+		switch (fault) {
+		case 0:
+			segment->slots[0].status = CTS_ACTIVE;
+			segment->slots[0].commit_scn = 0;
+			break;
+		case 1:
+			segment->slots[0].status = CTS_FREE;
+			break;
+		case 2:
+			segment->slots[0].status = UINT8_MAX;
+			break;
+		case 3:
+			segment->slots[0].commit_scn = InvalidScn;
+			break;
+		case 4:
+			segment->slots[0].status = CTS_ABORTED;
+			break;
+		case 5:
+			segment->slots[0].wrap = TT_WRAP_MAX;
+			identity->key.slot_wrap = TT_WRAP_MAX;
+			break;
+		case 6:
+			segment->binding_generation = 0;
+			break;
+		case 7:
+			segment->binding_generation = UINT64_MAX;
+			break;
+		case 8:
+			identity->binding_generation++;
+			break;
+		case 9:
+			identity->key.xid++;
+			break;
+		case 10:
+			identity->key.slot_wrap++;
+			break;
+		case 11:
+			identity->key.segment_id = 2;
+			break;
+		case 12:
+			identity->key.slot_offset = 1;
+			break;
+		case 13:
+			identity->key.origin_node_id = 1;
+			break;
+		case 14:
+			identity->key.format_version = 0;
+			break;
+		case 15:
+			identity->original_full_xid = InvalidFullTransactionId;
+			break;
+		case 16:
+			identity->original_full_xid = FullTransactionIdFromU64(UINT64_MAX);
+			break;
+		case 17:
+			identity->original_full_xid = FullTransactionIdFromU64(101);
+			break;
+		case 18:
+			segment->slots[0]._pad = 1;
+			break;
+		case 19:
+			memset(identity, 0, sizeof(*identity));
+			break;
+		case 20:
+			identity->key.segment_generation = 0;
+			break;
+		case 21:
+			segment->slots[0].wrap = TT_WRAP_INVALID;
+			break;
+		}
+		memset(&observed, 0xa5, sizeof(observed));
+		memset(&owner, 0xa5, sizeof(owner));
+		UT_ASSERT(!cluster_tt_slot_current_origin_snapshot(1, 0, &observed, &owner, &binding));
+		UT_ASSERT_EQ(memcmp(&observed, &(ClusterCtrcTxnKeyV1){ 0 }, sizeof(observed)), 0);
+		UT_ASSERT_EQ(memcmp(&owner, &zero, sizeof(owner)), 0);
+		UT_ASSERT_EQ(binding, 0);
+		UT_ASSERT_EQ(lock_depth, 0);
+	}
+}
+
+UT_TEST(test_current_origin_snapshot_never_initializes_or_outlives_original_slot)
+{
+	ClusterCtrcTxnKeyV1 key, observed;
+	ClusterTTSlotCurrentOwner owner;
+	ClusterTTSlotShmem *saved;
+	uint64 binding;
+
+	prepare_gc_origin_snapshot(true, 0, &key);
+	UT_ASSERT(cluster_tt_slot_current_origin_snapshot(1, 0, &observed, &owner, &binding));
+	UT_ASSERT(!cluster_tt_slot_current_origin_snapshot(0, 0, &observed, &owner, &binding));
+	UT_ASSERT(!cluster_tt_slot_current_origin_snapshot(257, 0, &observed, &owner, &binding));
+	UT_ASSERT(!cluster_tt_slot_current_origin_snapshot(2, 0, &observed, &owner, &binding));
+	UT_ASSERT(!cluster_tt_slot_current_origin_snapshot(1, 48, &observed, &owner, &binding));
+	UT_ASSERT(!cluster_tt_slot_current_origin_snapshot(1, 0, NULL, &owner, &binding));
+	UT_ASSERT(!cluster_tt_slot_current_origin_snapshot(1, 0, &observed, NULL, &binding));
+	UT_ASSERT(!cluster_tt_slot_current_origin_snapshot(1, 0, &observed, &owner, NULL));
+	saved = ClusterTTSlotShm;
+	ClusterTTSlotShm = NULL;
+	UT_ASSERT(!cluster_tt_slot_current_origin_snapshot(1, 0, &observed, &owner, &binding));
+	ClusterTTSlotShm = saved;
+	cluster_tt_slot_free(1, 0);
+	UT_ASSERT(!cluster_tt_slot_current_origin_snapshot(1, 0, &observed, &owner, &binding));
+	UT_ASSERT_EQ(cluster_tt_slot_alloc(1, key.xid), 0);
+	cluster_tt_slot_mark_committed(1, 0, key.xid, key.slot_wrap, 91);
+	UT_ASSERT(!cluster_tt_slot_current_origin_snapshot(1, 0, &observed, &owner, &binding));
+	cluster_tt_slot_rollover(0, 2, NULL);
+	cluster_tt_slot_rollover(0, 1, NULL);
+	UT_ASSERT(!cluster_tt_slot_current_origin_snapshot(1, 0, &observed, &owner, &binding));
+	UT_ASSERT_EQ(cluster_tt_slot_current_segment(0), 1);
+	UT_ASSERT_EQ(lock_depth, 0);
+}
+
 #ifdef TT_ACTIVE_OWNER_FIXTURE_MAIN
 int TT_ACTIVE_OWNER_FIXTURE_MAIN(void);
 #define main TT_ACTIVE_OWNER_FIXTURE_MAIN
@@ -1536,7 +1721,10 @@ int TT_ACTIVE_OWNER_FIXTURE_MAIN(void);
 int
 main(void)
 {
-	UT_PLAN(45);
+	UT_PLAN(48);
+	UT_RUN(test_current_origin_snapshot_uses_original_terminal_slot_provenance);
+	UT_RUN(test_current_origin_snapshot_rejects_missing_or_malformed_original_identity);
+	UT_RUN(test_current_origin_snapshot_never_initializes_or_outlives_original_slot);
 	UT_RUN(test_active_wait_unknown_slot_identity_never_acquires_native_wait);
 	UT_RUN(test_allocator_snapshot_is_complete_readonly_and_unavailable_leaves_output);
 	UT_RUN(test_49th_active_transaction_waits_in_selected_segment_without_rollover);

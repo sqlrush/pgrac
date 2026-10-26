@@ -1115,6 +1115,27 @@ cluster_tt_slot_origin_identity_retain(const ClusterCtrcOriginReservation *reser
 	return retained;
 }
 
+/* Caller validated the key's local scope and holds this allocator's lock. */
+static bool
+tt_slot_origin_identity_valid_locked(const ClusterTTSlotAllocPerSegment *seg,
+									 const ClusterCtrcTxnKeyV1 *key)
+{
+	const ClusterTTSlotAllocEntry *entry = &seg->slots[key->slot_offset];
+	const ClusterTTSlotOriginIdentity *identity = &seg->origins[key->slot_offset];
+
+	return seg->segment_id == key->segment_id && seg->binding_generation != 0
+		   && seg->binding_generation != UINT64_MAX
+		   && identity->binding_generation == seg->binding_generation
+		   && memcmp(&identity->key, key, sizeof(*key)) == 0 && entry->xid == key->xid
+		   && entry->wrap == key->slot_wrap && entry->_pad == 0
+		   && ((entry->status == CTS_COMMITTED && SCN_VALID(entry->commit_scn))
+			   || ((entry->status == CTS_ACTIVE || entry->status == CTS_ABORTED)
+				   && entry->commit_scn == InvalidScn))
+		   && FullTransactionIdIsNormal(identity->original_full_xid)
+		   && U64FromFullTransactionId(identity->original_full_xid) != UINT64_MAX
+		   && XidFromFullTransactionId(identity->original_full_xid) == key->xid;
+}
+
 /* A copy is not a verdict.  The canonical reader still owns TT/CLOG evidence
  * and all original generation/admission/page fences.  Rolled-away/unknown
  * bindings stay unavailable; COMMIT/ABORT alone preserve the original source. */
@@ -1122,8 +1143,6 @@ bool
 cluster_tt_slot_origin_identity_read(const ClusterCtrcTxnKeyV1 *key, FullTransactionId *out)
 {
 	ClusterTTSlotAllocPerSegment *seg;
-	const ClusterTTSlotOriginIdentity *identity;
-	const ClusterTTSlotAllocEntry *entry;
 	bool valid;
 
 	if (out == NULL)
@@ -1132,21 +1151,55 @@ cluster_tt_slot_origin_identity_read(const ClusterCtrcTxnKeyV1 *key, FullTransac
 	if ((seg = tt_slot_origin_segment(key)) == NULL)
 		return false;
 	LWLockAcquire(&seg->lock, LW_SHARED);
-	entry = &seg->slots[key->slot_offset];
-	identity = &seg->origins[key->slot_offset];
-	valid = seg->segment_id == key->segment_id && seg->binding_generation != 0
-			&& seg->binding_generation != UINT64_MAX
-			&& identity->binding_generation == seg->binding_generation
-			&& memcmp(&identity->key, key, sizeof(*key)) == 0
-			&& entry->xid == key->xid && entry->wrap == key->slot_wrap && entry->_pad == 0
-			&& ((entry->status == CTS_COMMITTED && SCN_VALID(entry->commit_scn))
-				|| ((entry->status == CTS_ACTIVE || entry->status == CTS_ABORTED)
-					&& entry->commit_scn == InvalidScn))
-			&& FullTransactionIdIsNormal(identity->original_full_xid)
-			&& U64FromFullTransactionId(identity->original_full_xid) != UINT64_MAX
-			&& XidFromFullTransactionId(identity->original_full_xid) == key->xid;
+	valid = tt_slot_origin_identity_valid_locked(seg, key);
 	if (valid)
-		*out = identity->original_full_xid;
+		*out = seg->origins[key->slot_offset].original_full_xid;
+	LWLockRelease(&seg->lock);
+	return valid;
+}
+
+/* Discover an original terminal identity after its origin row was retired.
+ * Only the original slot owner publishes/retires this provenance. No lock
+ * nesting, initialization, canonical read or allocator mutation occurs here. */
+bool
+cluster_tt_slot_current_origin_snapshot(uint32 segment_id, uint16 slot_offset,
+										ClusterCtrcTxnKeyV1 *key, ClusterTTSlotCurrentOwner *owner,
+										uint64 *binding_generation)
+{
+	ClusterTTSlotAllocPerSegment *seg;
+	const ClusterTTSlotAllocEntry *entry;
+	const ClusterTTSlotOriginIdentity *identity;
+	bool valid = false;
+
+	if (key != NULL)
+		memset(key, 0, sizeof(*key));
+	if (owner != NULL)
+		memset(owner, 0, sizeof(*owner));
+	if (binding_generation != NULL)
+		*binding_generation = 0;
+	if (key == NULL || owner == NULL || binding_generation == NULL || ClusterTTSlotShm == NULL
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_TT_SLOT_MAX_NODES || segment_id == 0
+		|| segment_id > UINT16_MAX || cluster_tt_slot_segment_to_node(segment_id) != cluster_node_id
+		|| slot_offset >= TT_SLOTS_PER_SEGMENT)
+		return false;
+	seg = &ClusterTTSlotShm->per_node[cluster_node_id];
+	LWLockAcquire(&seg->lock, LW_SHARED);
+	entry = &seg->slots[slot_offset];
+	identity = &seg->origins[slot_offset];
+	if (seg->segment_id == segment_id && identity->key.slot_offset == slot_offset
+		&& (entry->status == CTS_COMMITTED || entry->status == CTS_ABORTED)
+		&& !tt_slot_entry_wrap_retired(entry) && tt_slot_origin_segment(&identity->key) == seg
+		&& tt_slot_origin_identity_valid_locked(seg, &identity->key)) {
+		*key = identity->key;
+		owner->segment_id = segment_id;
+		owner->slot_offset = slot_offset;
+		owner->xid = entry->xid;
+		owner->wrap = entry->wrap;
+		owner->status = entry->status;
+		owner->commit_scn = entry->commit_scn;
+		*binding_generation = seg->binding_generation;
+		valid = true;
+	}
 	LWLockRelease(&seg->lock);
 	return valid;
 }
