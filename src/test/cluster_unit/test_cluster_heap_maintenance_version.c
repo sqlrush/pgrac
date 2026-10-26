@@ -14837,6 +14837,8 @@ UT_TEST(test_recent_xmin_share_lock_refusal_keeps_borrowed_pin_without_upgrade)
 static unsigned proof_owner_enters, proof_owner_leaves, proof_owner_cost_reads;
 static unsigned proof_owner_expected_pins;
 static ClusterSemanticAdmissionToken proof_owner_left_token;
+static LVRelState *proof_owner_retirement_observer;
+static unsigned proof_owner_retired_before_leave;
 
 static ClusterSemanticAdmissionResult
 proof_owner_enter(ClusterSemanticAdmissionToken *token)
@@ -14861,6 +14863,20 @@ proof_owner_leave(ClusterSemanticAdmissionToken *token)
 	UT_ASSERT(!local_x && !local_share && !resumed_writer);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&native_admission_shared.inflight
 		[CLUSTER_SEMANTIC_TARGET_SIDE][bounds_lifecycle_feature()]), 8);
+	if (proof_owner_retirement_observer != NULL) {
+		const LVRelState *v = proof_owner_retirement_observer;
+		const unsigned char *cohort = (const unsigned char *)&v->shared_freeze_cohort;
+		bool retired = !v->shared_freeze_fence_valid && !v->shared_freeze_cohort_observed
+			&& v->shared_freeze_input.freeze_policy == NULL
+			&& v->shared_freeze_input.freeze_cohort == NULL
+			&& v->shared_freeze_xmin_candidates.target_count == 0
+			&& v->shared_freeze_aborted_xmax_candidates.target_count == 0
+			&& !FullTransactionIdIsValid(v->shared_freeze_candidate_limit_full);
+
+		for (unsigned i = 0; i < sizeof(v->shared_freeze_cohort); i++)
+			retired = retired && cohort[i] == 0;
+		proof_owner_retired_before_leave += retired ? 1 : 0;
+	}
 	bounds_original_census_leave(token);
 	proof_owner_left_token = *token;
 	proof_owner_leaves++;
@@ -14949,8 +14965,8 @@ UT_TEST(test_real_outer_collector_enters_and_leaves_around_actual_admitted_phase
 		UT_ASSERT_EQ(proof_owner_enters, 1);
 		UT_ASSERT_EQ(phase_preflights, 1); UT_ASSERT_EQ(phase_rechecks, 1);
 		UT_ASSERT_EQ(phase_resolves, f.page.carrier_request_count);
-		UT_ASSERT(v.shared_freeze_fence_valid && v.shared_freeze_cohort_observed);
-		UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, batch ? 3 : 1);
+		UT_ASSERT(!v.shared_freeze_fence_valid && !v.shared_freeze_cohort_observed);
+		UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 0);
 		proof_owner_assert_released(&v, true);
 	}
 }
@@ -15005,8 +15021,8 @@ UT_TEST(test_real_outer_collector_rethrows_after_original_leave_on_admitted_erro
 	free(v); free(f);
 }
 
-/* An outer collector result retains observations, not its released owner.
- * Passing its actual zeroed token to the recent native entry must stop before
+/* An outer collector result retains read-only proofs, not its released owner.
+ * A nonempty request with its zeroed token and retired inputs must stop before
  * a resident pin, writer restoration or WAL. No replacement token is made. */
 UT_TEST(test_real_outer_collector_result_cannot_outlive_its_original_admission)
 {
@@ -15020,8 +15036,7 @@ UT_TEST(test_real_outer_collector_result_cannot_outlive_its_original_admission)
 		UT_ASSERT(!f.admission.entered);
 		phase_pin_released = true;
 		UT_ASSERT(!fixture_recent_xmin_apply(&f,
-			v.shared_freeze_xmin_candidates.targets,
-			v.shared_freeze_xmin_candidates.target_count));
+			targets, batch ? 3 : 1));
 		UT_ASSERT_EQ(recent_pin_calls + recent_unpins + conditional_resumes, 0);
 		UT_ASSERT_EQ(backend_pin_count, 0);
 		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
@@ -15039,7 +15054,8 @@ UT_TEST(test_real_outer_collector_reuse_refusal_retires_previous_observations)
 	proof_owner_setup(&f, &v, targets, true);
 	UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
 	proof_owner_assert_released(&v, true);
-	UT_ASSERT(v.shared_freeze_fence_valid && v.shared_freeze_cohort_observed);
+	UT_ASSERT(!v.shared_freeze_fence_valid && !v.shared_freeze_cohort_observed);
+	UT_ASSERT(v.shared_freeze_proofs.proof_count > 0);
 	route_current = false;
 	UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
 	UT_ASSERT_EQ(v.shared_freeze_proofs.proof_count, 0);
@@ -15204,7 +15220,7 @@ UT_TEST(test_original_resident_recheck_unpins_before_real_outer_admission_leave)
 			UT_ASSERT_EQ(conditional_resumes, writer ? 1 : 0);
 			UT_ASSERT_EQ(conditional_unlocks, 0);
 			UT_ASSERT_EQ(local_unlocks, 1);
-			UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, batch ? 3 : 1);
+			UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 0);
 			proof_owner_assert_released(&v, true);
 		}
 	}
@@ -15530,7 +15546,7 @@ UT_TEST(test_original_recent_first_pin_and_owner_release_precede_outer_leave)
 			QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
 			phase_recent_owner_setup(&f, &v, targets, batch != 0, writer != 0);
 			UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
-			UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, batch ? 3 : 1);
+			UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 0);
 			UT_ASSERT_EQ(phase_resident_releases[1], writer ? 0 : 1);
 			UT_ASSERT_EQ(phase_resident_releases[2], writer ? 1 : 0);
 			phase_recent_owner_finish(&v, true);
@@ -15955,10 +15971,59 @@ UT_TEST(test_original_snapshot_h_survives_group_exit_to_recent_wal)
 }
 
 
+/* The outer owner may retain read-only proof results for reporting, but its
+ * continuation fence, borrowed sources and candidates must retire before leave. */
+UT_TEST(test_real_outer_collector_retires_continuation_before_admission_leave)
+{
+	for (unsigned batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		proof_owner_setup(&f, &v, targets, batch != 0);
+		proof_owner_retirement_observer = &v;
+		proof_owner_retired_before_leave = 0;
+		UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		proof_owner_retirement_observer = NULL;
+		UT_ASSERT_EQ(proof_owner_retired_before_leave, 1);
+		UT_ASSERT(v.shared_freeze_proofs.proof_count > 0);
+		UT_ASSERT_EQ(phase_preflights, 1); UT_ASSERT_EQ(phase_rechecks, 1);
+		UT_ASSERT_EQ(phase_resolves, f.page.carrier_request_count);
+		proof_owner_assert_released(&v, true);
+	}
+}
+
+UT_TEST(test_real_outer_collector_errors_retire_continuation_before_admission_leave)
+{
+	QualifiedXminFixture *f = malloc(sizeof(*f));
+	LVRelState *v = malloc(sizeof(*v));
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	UT_ASSERT(f != NULL && v != NULL);
+	for (unsigned batch = 0; batch < 2; batch++) {
+		for (unsigned stage = 1; stage <= 4; stage++) {
+			proof_owner_setup(f, v, targets, batch != 0);
+			v->shared_freeze_fence_valid = true;
+			proof_owner_retirement_observer = v;
+			proof_owner_retired_before_leave = 0;
+			if (stage == 4) bounds_fault = 7;
+			else phase_error_stage = stage;
+			expecting_error = true;
+			if (setjmp(error_jump) == 0) {
+				(void)proof_owner_collect(v, 1);
+				UT_ASSERT(false);
+			}
+			expecting_error = false;
+			proof_owner_retirement_observer = NULL;
+			UT_ASSERT_EQ(proof_owner_retired_before_leave, 1);
+			UT_ASSERT_EQ(proof_owner_enters, 1);
+			UT_ASSERT_EQ(phase_preflights, 1);
+			proof_owner_assert_released(v, true);
+		}
+	}
+	free(v); free(f);
+}
+
 int
 main(void)
 {
-	UT_PLAN(339);
+	UT_PLAN(341);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -16308,6 +16373,8 @@ main(void)
 	UT_RUN(test_recent_xmin_saved_bounds_refuse_before_pin);
 
 	UT_RUN(test_original_snapshot_h_survives_group_exit_to_recent_wal);
+	UT_RUN(test_real_outer_collector_retires_continuation_before_admission_leave);
+	UT_RUN(test_real_outer_collector_errors_retire_continuation_before_admission_leave);
 
 	UT_DONE();
 	return ut_failed_count != 0;
