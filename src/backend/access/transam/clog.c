@@ -33,6 +33,14 @@
  *
  *-------------------------------------------------------------------------
  */
+/*-------------------------------------------------------------------------
+ * PGRAC MODIFICATIONS
+ *     Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ *     Add original-origin recovery I/O and declared Startup CLOG inputs.
+ *     Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md
+ *-------------------------------------------------------------------------
+ */
 #include "postgres.h"
 
 #include "access/clog.h"
@@ -52,6 +60,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_native_startup.h"
 #include "cluster/cluster_relmap_retention_runtime.h"
 #include "cluster/cluster_side_projection.h"
@@ -818,7 +828,7 @@ clog_recovery_cache_discard(SlruCtl ctl)
 }
 
 static bool
-clog_recovery_terminal_directory_ready(int origin, TransactionId xid, int count, XidStatus status)
+clog_native_directory_ready(int origin)
 {
 	const char *children[3] = { "native_side", NULL, "pg_xact" };
 	int dirs[4] = { -1, -1, -1, -1 };
@@ -828,8 +838,7 @@ clog_recovery_terminal_directory_ready(int origin, TransactionId xid, int count,
 	int length;
 	bool ok = false;
 
-	if (!clog_recovery_terminal_permitted(origin, xid, count, status)
-		|| cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] != '/')
+	if (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] != '/')
 		return false;
 	snprintf(origin_name, sizeof(origin_name), "origin_%d", origin);
 	children[1] = origin_name;
@@ -878,8 +887,16 @@ done:
 	for (int i = 3; i >= 0; i--)
 		if (dirs[i] >= 0 && close(dirs[i]) != 0)
 			ok = false;
-	/* Revalidation can ERROR; do not keep raw directory FDs across it. */
-	return ok && clog_recovery_terminal_permitted(origin, xid, count, status);
+	return ok;
+}
+
+static bool
+clog_recovery_terminal_directory_ready(int origin, TransactionId xid, int count, XidStatus status)
+{
+	/* Revalidation can ERROR; no raw directory fd crosses it. */
+	return clog_recovery_terminal_permitted(origin, xid, count, status)
+		&& clog_native_directory_ready(origin)
+		&& clog_recovery_terminal_permitted(origin, xid, count, status);
 }
 
 static bool
@@ -1235,6 +1252,243 @@ cluster_clog_native_recovery_base_release_v1(ClusterClogNativeBaseHandleV1 **hel
 		}
 		free(old);
 	}
+}
+
+/* A declared relmap participant borrows the original whole replay episode.
+ * This is disk input custody, not native mutation or terminal authority. */
+struct ClusterRelmapClogBaseHandleV1 {
+	pid_t pid;
+	int fd;
+	bool failed;
+	ClusterRecoveryRelmapSourceV1 source;
+	ClusterRelmapClogBaseV1 base;
+};
+
+static bool
+clog_relmap_overlaps(const void *a, size_t an, const void *b, size_t bn)
+{
+	uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
+	return a != NULL && b != NULL && (x <= y ? y - x < an : x - y < bn);
+}
+
+static bool
+clog_relmap_source_current(const ClusterRecoveryRelmapSourceV1 *source, int origin)
+{
+	return cluster_shared_config && AmStartupProcess() && origin >= 0
+		&& origin < CLOG_RECOVERY_ORIGINS
+		&& source->selected.source.claim.identity.origin_thread_id == origin + 1
+		&& (origin == cluster_node_id ? XactCtl->shared != NULL
+			: ClogRecoveryLocks != NULL && ClogRecoveryCtl[origin].shared != NULL)
+		&& cluster_wal_inputs_relmap_source_current_v1(source);
+}
+
+static bool
+clog_relmap_base_read(const ClusterRecoveryRelmapSourceV1 *source,
+	uint64 requested_full_xid, ClusterRelmapClogBaseV1 *out,
+	ClusterRelmapClogBaseHandleV1 **custody)
+{
+	ClusterRecoveryRelmapSourceV1 original;
+	ClusterRelmapClogBaseV1 base = {0};
+	ClusterRelmapClogBaseHandleV1 *held;
+	SlruCtl ctl;
+	SlruCtlData disk;
+	LWLock *lock;
+	struct stat before, opened, after;
+	char path[MAXPGPATH];
+	int origin, page, length;
+	bool existing;
+	volatile int fd = -1;
+	volatile bool locked = false, ok = false;
+
+	if (out == NULL || custody == NULL || source == NULL
+		|| clog_relmap_overlaps(out, sizeof(*out), source, sizeof(*source))
+		|| clog_relmap_overlaps(out, sizeof(*out), custody, sizeof(*custody))
+		|| clog_relmap_overlaps(custody, sizeof(*custody), source, sizeof(*source)))
+		return false;
+	held = *custody;
+	if (held != NULL
+		&& (clog_relmap_overlaps(out, sizeof(*out), held, sizeof(*held))
+			|| clog_relmap_overlaps(custody, sizeof(*custody), held, sizeof(*held))
+			|| clog_relmap_overlaps(source, sizeof(*source), held, sizeof(*held))))
+		return false;
+	memset(out, 0, sizeof(*out));
+	memcpy(&original, source, sizeof(original));
+	existing = held != NULL;
+	/* Caller-owned native locks/critical sections are not an entered read.
+	 * This also keeps whole-ROOT revalidation outside every native lock. */
+	if (!enableFsync || CritSectionCount != 0
+		|| !TransactionIdIsNormal((TransactionId)requested_full_xid)
+		|| original.selected.source.claim.identity.origin_thread_id == 0
+		|| original.selected.source.claim.identity.origin_thread_id > CLOG_RECOVERY_ORIGINS
+		|| LWLockHeldByMe(XidGenLock) || LWLockHeldByMe(XactTruncationLock)
+		|| LWLockHeldByMe(XactSLRULock)
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return false;
+	origin = original.selected.source.claim.identity.origin_thread_id - 1;
+	if (!cluster_shared_config || !AmStartupProcess()
+		|| (origin == cluster_node_id ? XactCtl->shared == NULL
+			: ClogRecoveryLocks == NULL || ClogRecoveryCtl[origin].shared == NULL))
+		return false;
+	ctl = origin == cluster_node_id ? XactCtl : &ClogRecoveryCtl[origin];
+	lock = origin == cluster_node_id ? XactTruncationLock
+		: &ClogRecoveryLocks[origin * 2 + 1].lock;
+	if (LWLockHeldByMe(lock) || LWLockHeldByMe(ctl->shared->ControlLock))
+		return false;
+	if (existing) {
+		if (held->pid != getpid() || held->failed)
+			return false;
+		held->failed = true;
+		if (held->fd < 0 || held->base.queried_full_xid != requested_full_xid
+			|| memcmp(&held->source, &original, sizeof(original)) != 0) {
+			cluster_wal_inputs_relmap_source_fail_v1(&held->source);
+			return false;
+		}
+	}
+	if (!clog_relmap_source_current(&original, origin)) {
+		if (existing)
+			cluster_wal_inputs_relmap_source_fail_v1(&original);
+		return false;
+	}
+	page = TransactionIdToPage((TransactionId)requested_full_xid);
+	/* For our own origin use the original native controller/lock, but read
+	 * the same canonical SIDE route directly, never its possibly dirty cache. */
+	memset(&disk, 0, sizeof(disk));
+	length = snprintf(disk.Dir, sizeof(disk.Dir), "%s/native_side/origin_%d/pg_xact",
+		cluster_shared_data_dir == NULL ? "" : cluster_shared_data_dir, origin);
+	if (length < 0 || length >= sizeof(disk.Dir)) {
+		cluster_wal_inputs_relmap_source_fail_v1(&original);
+		return false;
+	}
+	length = snprintf(path, sizeof(path), "%s/%04X", disk.Dir, page / SLRU_PAGES_PER_SEGMENT);
+	if (length < 0 || length >= sizeof(path)) {
+		cluster_wal_inputs_relmap_source_fail_v1(&original);
+		return false;
+	}
+	if (!existing) {
+		held = calloc(1, sizeof(*held));
+		if (held == NULL) {
+			cluster_wal_inputs_relmap_source_fail_v1(&original);
+			return false;
+		}
+		held->pid = getpid(); held->fd = -1; held->failed = true;
+		memcpy(&held->source, &original, sizeof(original));
+	}
+
+	PG_TRY();
+	{
+		ok = cluster_wal_inputs_relmap_source_revalidate_v1(&original);
+		if (ok) {
+			LWLockAcquire(lock, LW_EXCLUSIVE);
+			locked = true;
+			ok = clog_relmap_source_current(&original, origin)
+				&& clog_native_directory_ready(origin)
+				&& clog_recovery_page_identity(&disk, page, &before);
+			if (ok) {
+				fd = existing ? held->fd
+					: OpenTransientFile(path, O_RDWR | O_NOFOLLOW | O_CLOEXEC | PG_BINARY);
+				ok = fd >= 0 && fstat(fd, &opened) == 0
+					&& clog_recovery_same_file(&before, &opened)
+					&& (!existing || (held->base.device == opened.st_dev
+						&& held->base.inode == opened.st_ino && held->base.size == opened.st_size))
+					&& clog_recovery_sync(&disk, -1, NULL);
+			}
+			if (ok) {
+				pgstat_report_wait_start(WAIT_EVENT_SLRU_FLUSH_SYNC);
+				ok = pg_fsync(fd) == 0;
+				pgstat_report_wait_end();
+			}
+			if (ok) {
+				ok = pg_pread(fd, base.image, BLCKSZ,
+					(off_t)(page % SLRU_PAGES_PER_SEGMENT) * BLCKSZ) == BLCKSZ;
+				if (ok)
+					pgstat_count_slru_page_read(ctl->shared->slru_stats_idx);
+				ok = ok && fstat(fd, &after) == 0 && clog_recovery_same_file(&before, &after)
+					&& clog_recovery_page_identity(&disk, page, &after)
+					&& clog_recovery_same_file(&before, &after)
+					&& clog_native_directory_ready(origin)
+					&& clog_relmap_source_current(&original, origin)
+					&& (!existing || memcmp(base.image, held->base.image, BLCKSZ) == 0);
+			}
+			LWLockRelease(lock);
+			locked = false;
+		}
+		/* There is no native lock or borrowed-output publication over ROOT I/O. */
+		ok = ok && cluster_wal_inputs_relmap_source_revalidate_v1(&original)
+			&& memcmp(source, &original, sizeof(original)) == 0;
+		if (!ok)
+			cluster_wal_inputs_relmap_source_fail_v1(&original);
+	}
+	PG_CATCH();
+	{
+		pgstat_report_wait_end();
+		if (locked && LWLockHeldByMe(lock)) {
+			/* elog ERROR clears the original lock's interrupt holdoff. */
+			HOLD_INTERRUPTS();
+			LWLockRelease(lock);
+		}
+		if (fd >= 0 && !existing)
+			(void)CloseTransientFile(fd);
+		if (!existing)
+			free(held);
+		cluster_wal_inputs_relmap_source_fail_v1(&original);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!ok) {
+		if (fd >= 0 && !existing)
+			(void)CloseTransientFile(fd);
+		if (!existing)
+			free(held);
+		return false;
+	}
+	base.queried_full_xid = requested_full_xid;
+	base.origin = origin; base.page_number = page;
+	base.status = (base.image[TransactionIdToByte((TransactionId)requested_full_xid)]
+		>> (TransactionIdToBIndex((TransactionId)requested_full_xid) * CLOG_BITS_PER_XACT))
+		& CLOG_XACT_BITMASK;
+	base.device = before.st_dev; base.inode = before.st_ino; base.size = before.st_size;
+	held->fd = fd;
+	memcpy(&held->base, &base, sizeof(base));
+	held->failed = false;
+	*custody = held;
+	memcpy(out, &base, sizeof(base));
+	return true;
+}
+
+bool
+cluster_clog_relmap_base_read_v1(const ClusterRecoveryRelmapSourceV1 *source,
+	uint64 requested_full_xid, ClusterRelmapClogBaseV1 *out,
+	ClusterRelmapClogBaseHandleV1 **custody)
+{
+	ClusterRecoveryRelmapSourceV1 original;
+	bool ok;
+	if (source == NULL)
+		return false;
+	memcpy(&original, source, sizeof(original));
+	PG_TRY();
+	{
+		ok = clog_relmap_base_read(source, requested_full_xid, out, custody);
+	}
+	PG_CATCH();
+	{
+		cluster_wal_inputs_relmap_source_fail_v1(&original);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+void
+cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **custody)
+{
+	ClusterRelmapClogBaseHandleV1 *held;
+	if (custody == NULL || *custody == NULL || (*custody)->pid != getpid())
+		return;
+	held = *custody;
+	*custody = NULL;
+	if (held->fd >= 0)
+		(void)CloseTransientFile(held->fd);
+	free(held);
 }
 
 typedef enum ClogRecoveryAccess {

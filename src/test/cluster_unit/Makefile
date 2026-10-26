@@ -5723,6 +5723,7 @@ test_cluster_multixact_recovery test_cluster_multixact_limits_io: %: %.c unit_te
 # PGRAC: original-origin CLOG against real disposable native SLRU files.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_clog_recovery: test_cluster_clog_recovery.c unit_test.h \
+		test_cluster_clog_relmap_participant.inc \
 		$(top_srcdir)/src/backend/access/transam/clog.c \
 		$(top_srcdir)/src/include/access/clog.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \

@@ -33,7 +33,6 @@ static int fixture_unlink(const char *path);
 #include "unit_test.h"
 UT_DEFINE_GLOBALS();
 
-bool enableFsync = true;
 bool cluster_shared_config = true;
 int cluster_node_id = 0;
 char *cluster_shared_data_dir;
@@ -60,6 +59,7 @@ static unsigned native_wal_flushes, native_sync_requests;
 static bool authority = true, revoke_on_lock, expect_error, fail_open, fail_sync, fail_dirsync;
 static bool (*fixture_cold_origin)(int);
 static bool c0_authority;
+static bool relmap_base_interrupts;
 static bool revoke_after_read, revoke_after_sync;
 static unsigned base_sync_mutation;
 static bool base_fixture;
@@ -96,7 +96,8 @@ errstart(int level, const char *domain pg_attribute_unused())
 	if (level < ERROR)
 		return false;
 	if (expect_error && PG_exception_stack != NULL) {
-		if (native_fixture || base_fixture)
+		/* Match elog ERROR after it clears the original lock holdoff. */
+		if (native_fixture || base_fixture || relmap_base_interrupts)
 			InterruptHoldoffCount = 0;
 		siglongjmp(*PG_exception_stack, 1);
 	}
@@ -214,7 +215,7 @@ LWLockAcquire(LWLock *lock, LWLockMode mode pg_attribute_unused())
 	unsigned i = fixture_lock_index(lock);
 	UT_ASSERT(!fixture_locks[i].held);
 	fixture_locks[i].held = true;
-	if (native_fixture || base_fixture)
+	if (native_fixture || base_fixture || relmap_base_interrupts)
 		HOLD_INTERRUPTS();
 	if (revoke_on_lock && (lock == &ClogRecoveryLocks[3].lock
 		|| (c0_origin == 0 && lock == XactCtl->shared->ControlLock)))
@@ -227,7 +228,7 @@ LWLockRelease(LWLock *lock)
 	unsigned i = fixture_lock_index(lock);
 	UT_ASSERT(fixture_locks[i].held);
 	fixture_locks[i].held = false;
-	if (native_fixture || base_fixture)
+	if (native_fixture || base_fixture || relmap_base_interrupts)
 		RESUME_INTERRUPTS();
 }
 bool
@@ -1299,6 +1300,8 @@ UT_TEST(own_c0_native_error_and_revocation_preserve_cache_ownership)
 	c0_authority = false;
 }
 
+#include "test_cluster_clog_relmap_participant.inc"
+
 static void
 fixture_cleanup(void)
 {
@@ -1760,6 +1763,8 @@ main(void)
 	clog_recovery_shmem_init();
 	MainLWLockArray = own_main_locks;
 	LWLockInitialize(XactSLRULock, LWTRANCHE_XACT_BUFFER);
+	LWLockInitialize(XactTruncationLock, LWTRANCHE_XACT_BUFFER);
+	LWLockInitialize(XidGenLock, LWTRANCHE_XACT_BUFFER);
 	SimpleLruInit(XactCtl, "Xact own fixture", 4, CLOG_LSNS_PER_PAGE, XactSLRULock,
 		"pg_xact", LWTRANCHE_XACT_BUFFER, SYNC_HANDLER_NONE);
 	XactCtl->PagePrecedes = CLOGPagePrecedes;
@@ -1768,7 +1773,7 @@ main(void)
 	snprintf(path, sizeof(path), "%s/native_side/origin_0/pg_xact", fixture_root);
 	if (symlink(path, "pg_xact") != 0)
 		return 2;
-	UT_PLAN(36);
+	UT_PLAN(44);
 	UT_RUN(separate_original_origin_controls);
 	UT_RUN(commit_and_abort_persist_full_tree_without_local_pollution);
 	UT_RUN(conflicting_late_child_refuses_before_any_tree_write);
@@ -1827,6 +1832,14 @@ main(void)
 	native_fixture = false;
 	snprintf(path, sizeof(path), "%s/native_side/origin_0/pg_xact", fixture_root);
 	UT_ASSERT_EQ(symlink(path, "pg_xact"), 0);
+	UT_RUN(relmap_episode_base_all_statuses_and_original_origin_routes);
+	UT_RUN(relmap_episode_preconditions_keep_caller_locks_and_original_debt);
+	UT_RUN(relmap_episode_same_fd_replacement_and_full_image_change_are_sticky);
+	UT_RUN(relmap_episode_native_failures_keep_unknown_and_original_protection);
+	UT_RUN(relmap_episode_late_holder_loss_revokes_after_io);
+	UT_RUN(relmap_episode_error_keeps_held_fd_until_local_cleanup);
+	UT_RUN(relmap_episode_own_route_and_cache_are_not_substituted);
+	UT_RUN(relmap_episode_exact_source_history_and_root_recheck);
 	fixture_cleanup();
 	UT_DONE();
 	return ut_failed_count != 0;

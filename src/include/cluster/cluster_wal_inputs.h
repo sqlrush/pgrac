@@ -323,6 +323,14 @@ extern ClusterRecoveryRelmapSourceV1 cluster_wal_inputs_relmap_source_v1(
  * ROOT must also be revalidated outside native locks. */
 extern bool cluster_wal_inputs_relmap_source_current_v1(
 	const ClusterRecoveryRelmapSourceV1 *source);
+/* Whole ROOT I/O outside native locks, with original all-holder checks on
+ * both sides. Entered refusal/ERROR revokes the original episode. */
+extern bool cluster_wal_inputs_relmap_source_revalidate_v1(
+	const ClusterRecoveryRelmapSourceV1 *source);
+/* Revoke only the matching original native input incarnation; never release
+ * its IR/WALR or require a still-current ResourceOwner to retain failure. */
+extern void cluster_wal_inputs_relmap_source_fail_v1(
+	const ClusterRecoveryRelmapSourceV1 *source);
 typedef struct ClusterRecoveryRelmapNativeInputV1 {
 	ClusterRecoveryRelmapSourceV1 source;
 	ClusterWalTailObservation tail;

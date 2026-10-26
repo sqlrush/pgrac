@@ -289,3 +289,56 @@ UT_TEST(test_relmap_native_input_refuses_caller_cf_or_critical_without_revocatio
 	UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_pin_held);
 	ctrc_set_finish(&inputs); relmap_declared = false;
 }
+
+#ifdef USE_RELMAP_SOURCE_REFUSAL_SHIM
+bool
+cluster_wal_inputs_relmap_source_revalidate_v1(const ClusterRecoveryRelmapSourceV1 *source pg_attribute_unused())
+{
+	return false;
+}
+void
+cluster_wal_inputs_relmap_source_fail_v1(const ClusterRecoveryRelmapSourceV1 *source pg_attribute_unused())
+{}
+#endif
+
+UT_TEST(test_relmap_source_whole_root_recheck_retains_original_holder_debt)
+{
+	ClusterWalInputsV1 *inputs = NULL; ClusterRecoveryRelmapSourceV1 source;
+	volatile bool caught = false;
+	relmap_participant_fixture(&inputs, false); relmap_declared = true;
+	UT_ASSERT_EQ(cluster_wal_inputs_ctrc_replays_acquire_v1(inputs), 0);
+	source = cluster_wal_inputs_relmap_source_v1(inputs, 0);
+	UT_ASSERT(cluster_wal_inputs_relmap_source_revalidate_v1(&source));
+	UT_ASSERT_EQ(relmap_failed, 0);
+	test_throw_root_read = true;
+	PG_TRY(); { (void)cluster_wal_inputs_relmap_source_revalidate_v1(&source); }
+	PG_CATCH(); { caught = true; } PG_END_TRY();
+	test_throw_root_read = false;
+	UT_ASSERT(caught); UT_ASSERT_EQ(relmap_failed, 1); UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_pin_held);
+	ctrc_set_finish(&inputs); relmap_declared = false;
+}
+
+UT_TEST(test_relmap_source_failure_is_original_incarnation_only_and_owner_sticky)
+{
+	ClusterWalInputsV1 *inputs = NULL; ClusterRecoveryRelmapSourceV1 source, wrong;
+	ResourceOwner owner;
+	relmap_participant_fixture(&inputs, false); relmap_declared = true;
+	UT_ASSERT_EQ(cluster_wal_inputs_ctrc_replays_acquire_v1(inputs), 0);
+	source = cluster_wal_inputs_relmap_source_v1(inputs, 0); wrong = source;
+	wrong.input_owner.generation++;
+	cluster_wal_inputs_relmap_source_fail_v1(&wrong); UT_ASSERT_EQ(relmap_failed, 0);
+	owner = CurrentResourceOwner; CurrentResourceOwner = NULL;
+	cluster_wal_inputs_relmap_source_fail_v1(&source);
+	CurrentResourceOwner = owner;
+	UT_ASSERT_EQ(relmap_failed, 1);
+	UT_ASSERT(!cluster_wal_inputs_relmap_source_current_v1(&source));
+	UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_pin_held);
+	ctrc_set_finish(&inputs); relmap_declared = false;
+	/* The released value cannot revoke a later native incarnation. */
+	relmap_participant_fixture(&inputs, false); relmap_declared = true;
+	UT_ASSERT_EQ(cluster_wal_inputs_ctrc_replays_acquire_v1(inputs), 0);
+	cluster_wal_inputs_relmap_source_fail_v1(&source);
+	UT_ASSERT_EQ(relmap_failed, 0);
+	UT_ASSERT_EQ(cluster_wal_inputs_relmap_count_v1(inputs), 2);
+	ctrc_set_finish(&inputs); relmap_declared = false;
+}

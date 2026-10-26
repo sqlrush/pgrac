@@ -2967,6 +2967,45 @@ cluster_wal_inputs_relmap_source_current_v1(const ClusterRecoveryRelmapSourceV1 
 		&& memcmp(source, &original, sizeof(original)) == 0;
 }
 
+void
+cluster_wal_inputs_relmap_source_fail_v1(const ClusterRecoveryRelmapSourceV1 *source)
+{
+	/* Failure grants no access. The exact outside locator/pin incarnation is
+	 * sufficient to revoke its original Start even after native/owner drift. */
+	if (source != NULL && source->scope != NULL
+		&& source->scope == active_ctrc_retention.scope
+		&& memcmp(&source->input_owner, &active_ctrc_retention.input_owner,
+			sizeof(source->input_owner)) == 0)
+		ClusterColdRecoveryRelmapFail(source->scope->ctrc.start);
+}
+
+bool
+cluster_wal_inputs_relmap_source_revalidate_v1(const ClusterRecoveryRelmapSourceV1 *source)
+{
+	ClusterRecoveryRelmapSourceV1 original;
+	bool ok;
+	if (source == NULL || CritSectionCount != 0
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return false;
+	memcpy(&original, source, sizeof(original));
+	PG_TRY();
+	{
+		ok = cluster_wal_inputs_relmap_source_current_v1(&original)
+			&& cluster_wal_inputs_revalidate_v1(original.scope) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& cluster_wal_inputs_relmap_source_current_v1(&original)
+			&& memcmp(source, &original, sizeof(original)) == 0;
+	}
+	PG_CATCH();
+	{
+		cluster_wal_inputs_relmap_source_fail_v1(&original);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!ok)
+		cluster_wal_inputs_relmap_source_fail_v1(&original);
+	return ok;
+}
+
 typedef struct RelmapNativeInputRead {
 	ClusterRecoveryRelmapNativeInputV1 value;
 	bool checkpoint_seen;
