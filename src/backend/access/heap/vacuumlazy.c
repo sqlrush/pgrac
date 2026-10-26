@@ -2027,6 +2027,185 @@ lazy_observe_shared_freeze_bounds(LVRelState *vacrel,
  * keeps the page unproven.  No tuple-freeze permission survives its release,
  * and a cleanout invalidates the saved fence.
  */
+/* Borrow the original caller's admission for proof collection and optional
+ * existing cleanout. This phase never enters/leaves admission: it returns
+ * after local ownership cleanup, leaving the original owner available for
+ * a separately qualified continuation before that owner's finally. */
+static ClusterHeapFreezeProofStatusV1
+lazy_collect_shared_freeze_proofs_admitted(LVRelState *vacrel, Buffer recent_buffer,
+	const PcmAuthoritySnapshot *authority_before, uint64 master_before,
+	const ClusterSemanticAdmissionToken *admission, bool *row_inputs_current_out)
+{
+	ClusterHeapFreezeFinalFenceV1 expected_fence,
+							 current_fence;
+	ClusterHeapFreezeProofBatchV1 proofs;
+	ClusterTxResolution retained[CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH];
+	uint8 retained_mask = 0;
+	ClusterHeapFreezeObservedBoundsV1 observed_bounds = { 0 };
+	ClusterHeapFreezeProofStatusV1 status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
+	ClusterTxResolveReason reason;
+	bool cleaned = false;
+	bool row_inputs_current = false;
+
+	if (row_inputs_current_out != NULL)
+		*row_inputs_current_out = false;
+	if (vacrel == NULL || authority_before == NULL || admission == NULL
+		|| !admission->entered || row_inputs_current_out == NULL)
+		return status;
+	memset(&proofs, 0, sizeof(proofs));
+	memset(retained, 0, sizeof(retained));
+	memset(&expected_fence, 0, sizeof(expected_fence));
+	memset(&current_fence, 0, sizeof(current_fence));
+	cluster_tx_resolve_terminal_census_batch_preflight();
+
+	expected_fence.identity = vacrel->shared_freeze_batch.identity;
+	expected_fence.block = vacrel->shared_freeze_batch.block;
+	expected_fence.page_lsn = vacrel->shared_freeze_batch.page_lsn;
+	expected_fence.page_version = vacrel->shared_freeze_batch.page_version;
+	expected_fence.holder_sequence = authority_before->transition_count;
+	expected_fence.master_sequence = master_before;
+	expected_fence.admission_generation = admission->record_generation;
+	current_fence = expected_fence;
+
+	for (uint8 index = 0;
+		 index < vacrel->shared_freeze_batch.carrier_request_count; index++)
+	{
+		const ClusterHeapFreezeCarrierRequestV1 *request =
+			&vacrel->shared_freeze_batch.carrier_requests[index];
+		ClusterTxResolution resolution;
+		ClusterTxOutcome outcome;
+		bool retained_eligible;
+
+		memset(&resolution, 0, sizeof(resolution));
+		reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+		/* As in the heap ITL census, retain only this carrier's captured
+		 * SCN. The existing entry first runs the ordinary exact resolver;
+		 * its fallback requires an exact origin C1b pair. The copied SCN
+		 * itself is never terminal authority or a creator identity. */
+		retained_eligible = request->carrier.flags == ITL_FLAG_NEEDS_CLEANOUT
+			&& request->locator.itl_kind == ITL_FLAG_NEEDS_CLEANOUT
+			&& request->locator.tt_wrap == TT_WRAP_INVALID
+			&& SCN_VALID(request->carrier.commit_scn);
+		if (retained_eligible)
+			outcome = cluster_tx_resolve_terminal_census_retained_admitted(
+				&request->locator, request->carrier.commit_scn,
+				admission, &resolution, &reason);
+		else
+			outcome = cluster_tx_resolve_exact_admitted(
+				&request->locator, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+				admission, &resolution, &reason);
+		if ((outcome != CLUSTER_TX_COMMITTED && outcome != CLUSTER_TX_ABORTED)
+			|| reason != CLUSTER_TX_RESOLVE_NONE)
+			continue;
+		if (!resolution.local_canonical_valid
+			|| resolution.locator_echo.tt_wrap == TT_WRAP_INVALID)
+		{
+			/* The retained fallback deliberately supplies no canonical TT
+			 * identity. Keep it out of that batch, including mixed pages. */
+			if (retained_eligible && outcome == CLUSTER_TX_COMMITTED
+				&& resolution.outcome == outcome && !resolution.local_canonical_valid
+				&& resolution.locator_echo.tt_wrap == TT_WRAP_INVALID
+				&& resolution.locator_echo.uba.raw[0] == request->locator.uba.raw[0]
+				&& resolution.locator_echo.uba.raw[1] == request->locator.uba.raw[1]
+				&& resolution.locator_echo.xid == request->locator.xid
+				&& resolution.locator_echo.itl_kind == request->locator.itl_kind
+				&& resolution.locator_echo.itl_slot_index == request->locator.itl_slot_index
+				&& resolution.top_xid == request->locator.xid
+				&& resolution.proof_kind == CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG
+				&& resolution.commit_scn == request->carrier.commit_scn
+				&& resolution.authority.origin_epoch == admission->formation_epoch
+				&& !XLogRecPtrIsInvalid(resolution.authority.live_hwm_lsn)
+				&& SCN_VALID(resolution.authority.authority_scn))
+			{
+				retained[index] = resolution;
+				retained_mask |= 1U << index;
+			}
+			continue;
+		}
+		if (cluster_heap_freeze_build_canonical_proof_v1(&request->locator,
+				&resolution, &expected_fence, &expected_fence, true, true, true,
+				&proofs.proofs[proofs.proof_count]))
+			proofs.proof_count++;
+	}
+	if (proofs.proof_count == 0 && retained_mask == 0)
+		goto admitted_done;
+
+	status = lazy_recheck_shared_freeze_page(vacrel, recent_buffer,
+												 authority_before, admission,
+												 &proofs, retained, retained_mask,
+												 &current_fence, &cleaned, &row_inputs_current);
+	/* Inner cleanup has released the local content lock and pin. Match a
+	 * bounded, read-only cohort observation to this original admission and
+	 * the retained policy bound. Neither grants a positive F/H certificate:
+	 * producer protection/provenance must close before any freeze apply. */
+	if (row_inputs_current && !cleaned)
+		status = lazy_observe_shared_freeze_bounds(vacrel, admission, status,
+												&observed_bounds);
+	/* This remains only a physical association, never row-freeze permission. */
+	if (row_inputs_current && !cleaned
+		&& (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+			|| status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN))
+	{
+		(void) cluster_heap_freeze_bind_creation_targets_v1(
+			&vacrel->shared_freeze_batch, &proofs, &current_fence);
+		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN)
+		{
+			(void) cluster_heap_freeze_bind_aborted_xmax_targets_v1(
+				&vacrel->shared_freeze_batch, &proofs, &current_fence);
+			(void) cluster_heap_freeze_select_aborted_xmax_candidates_v1(
+				&vacrel->shared_freeze_batch, &proofs, &current_fence,
+				&vacrel->shared_freeze_aborted_xmax_candidates);
+		}
+		/* Screen the same attempt's original creator identities and observed
+		 * bounds without producing native plans. Positive F/H and producer
+		 * retention admission are still required before any shared write. */
+		if (vacrel->shared_freeze_cohort_observed
+			&& cluster_heap_freeze_select_xmin_candidates_v1(
+				&vacrel->shared_freeze_batch, &proofs, &current_fence,
+				vacrel->shared_freeze_candidate_limit_full,
+				observed_bounds.horizon_scn,
+				&vacrel->shared_freeze_xmin_candidates))
+		{
+			ClusterHeapFreezeXminCandidateBatchV1 *candidates =
+				&vacrel->shared_freeze_xmin_candidates;
+			FullTransactionId legal_next = vacrel->cutoffs.SharedFreezePolicySample.legal_next;
+			uint16 kept = 0;
+
+			/* Screen only native format compatibility, in original row order.
+			 * A source-proven old row outside the raw WAL window must not
+			 * discard the other candidates. This grants no positive F/H. */
+			if (candidates->target_count > MaxHeapTuplesPerPage)
+				candidates->target_count = 0;
+			for (uint16 i = 0; i < candidates->target_count; i++)
+			{
+				const ClusterHeapFreezeXminTargetV1 *target = &candidates->targets[i];
+
+				if (FullTransactionIdPrecedes(target->original_creator_full_xid, legal_next)
+					&& U64FromFullTransactionId(legal_next)
+						- U64FromFullTransactionId(target->original_creator_full_xid)
+						< UINT64CONST(0x80000000))
+					candidates->targets[kept++] = *target;
+			}
+			candidates->target_count = kept;
+		}
+	}
+	if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+		|| status == CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED
+		|| (row_inputs_current && status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN))
+	{
+		vacrel->shared_freeze_proofs = proofs;
+		vacrel->shared_freeze_fence = current_fence;
+		/* A retained row subset does not qualify the whole page. */
+		vacrel->shared_freeze_fence_valid =
+			status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN && !cleaned;
+	}
+
+
+admitted_done:
+	*row_inputs_current_out = row_inputs_current;
+	return status;
+}
+
 static ClusterHeapFreezeProofStatusV1
 lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 {
@@ -2034,27 +2213,14 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 	PcmAuthoritySnapshot authority_before;
 	ClusterSemanticAdmissionToken admission;
 	ClusterSemanticAdmissionResult admission_result;
-	ClusterHeapFreezeFinalFenceV1 expected_fence,
-							 current_fence;
-	ClusterHeapFreezeProofBatchV1 proofs;
-	/* Private, bounded hint-only evidence; never exported as canonical proof. */
-	ClusterTxResolution retained[CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH];
-	uint8 retained_mask = 0;
-	ClusterHeapFreezeObservedBoundsV1 observed_bounds = { 0 };
 	ClusterHeapFreezeProofStatusV1 status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
-	ClusterTxResolveReason reason;
 	uint64 master_before = 0;
 	SCN page_scn_before = InvalidScn;
 	bool route_before = false;
-	bool cleaned = false;
 	bool row_inputs_current = false;
 	uint64 proof_cost_before[15];
 
-	memset(&proofs, 0, sizeof(proofs));
-	memset(retained, 0, sizeof(retained));
 	memset(&admission, 0, sizeof(admission));
-	memset(&expected_fence, 0, sizeof(expected_fence));
-	memset(&current_fence, 0, sizeof(current_fence));
 	memset(&authority_before, 0, sizeof(authority_before));
 	if (vacrel != NULL)
 	{
@@ -2096,151 +2262,9 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 	lazy_shared_freeze_transport_snapshot(proof_cost_before);
 	PG_TRY();
 	{
-		cluster_tx_resolve_terminal_census_batch_preflight();
-
-		expected_fence.identity = vacrel->shared_freeze_batch.identity;
-		expected_fence.block = vacrel->shared_freeze_batch.block;
-		expected_fence.page_lsn = vacrel->shared_freeze_batch.page_lsn;
-		expected_fence.page_version = vacrel->shared_freeze_batch.page_version;
-		expected_fence.holder_sequence = authority_before.transition_count;
-		expected_fence.master_sequence = master_before;
-		expected_fence.admission_generation = admission.record_generation;
-		current_fence = expected_fence;
-
-		for (uint8 index = 0;
-			 index < vacrel->shared_freeze_batch.carrier_request_count; index++)
-		{
-			const ClusterHeapFreezeCarrierRequestV1 *request =
-				&vacrel->shared_freeze_batch.carrier_requests[index];
-			ClusterTxResolution resolution;
-			ClusterTxOutcome outcome;
-			bool retained_eligible;
-
-			memset(&resolution, 0, sizeof(resolution));
-			reason = CLUSTER_TX_RESOLVE_PROTOCOL;
-			/* As in the heap ITL census, retain only this carrier's captured
-			 * SCN. The existing entry first runs the ordinary exact resolver;
-			 * its fallback requires an exact origin C1b pair. The copied SCN
-			 * itself is never terminal authority or a creator identity. */
-			retained_eligible = request->carrier.flags == ITL_FLAG_NEEDS_CLEANOUT
-				&& request->locator.itl_kind == ITL_FLAG_NEEDS_CLEANOUT
-				&& request->locator.tt_wrap == TT_WRAP_INVALID
-				&& SCN_VALID(request->carrier.commit_scn);
-			if (retained_eligible)
-				outcome = cluster_tx_resolve_terminal_census_retained_admitted(
-					&request->locator, request->carrier.commit_scn,
-					&admission, &resolution, &reason);
-			else
-				outcome = cluster_tx_resolve_exact_admitted(
-					&request->locator, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
-					&admission, &resolution, &reason);
-			if ((outcome != CLUSTER_TX_COMMITTED && outcome != CLUSTER_TX_ABORTED)
-				|| reason != CLUSTER_TX_RESOLVE_NONE)
-				continue;
-			if (!resolution.local_canonical_valid
-				|| resolution.locator_echo.tt_wrap == TT_WRAP_INVALID)
-			{
-				/* The retained fallback deliberately supplies no canonical TT
-				 * identity. Keep it out of that batch, including mixed pages. */
-				if (retained_eligible && outcome == CLUSTER_TX_COMMITTED
-					&& resolution.outcome == outcome && !resolution.local_canonical_valid
-					&& resolution.locator_echo.tt_wrap == TT_WRAP_INVALID
-					&& resolution.locator_echo.uba.raw[0] == request->locator.uba.raw[0]
-					&& resolution.locator_echo.uba.raw[1] == request->locator.uba.raw[1]
-					&& resolution.locator_echo.xid == request->locator.xid
-					&& resolution.locator_echo.itl_kind == request->locator.itl_kind
-					&& resolution.locator_echo.itl_slot_index == request->locator.itl_slot_index
-					&& resolution.top_xid == request->locator.xid
-					&& resolution.proof_kind == CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG
-					&& resolution.commit_scn == request->carrier.commit_scn
-					&& resolution.authority.origin_epoch == admission.formation_epoch
-					&& !XLogRecPtrIsInvalid(resolution.authority.live_hwm_lsn)
-					&& SCN_VALID(resolution.authority.authority_scn))
-				{
-					retained[index] = resolution;
-					retained_mask |= 1U << index;
-				}
-				continue;
-			}
-			if (cluster_heap_freeze_build_canonical_proof_v1(&request->locator,
-					&resolution, &expected_fence, &expected_fence, true, true, true,
-					&proofs.proofs[proofs.proof_count]))
-				proofs.proof_count++;
-		}
-		if (proofs.proof_count == 0 && retained_mask == 0)
-			goto admitted_done;
-
-		status = lazy_recheck_shared_freeze_page(vacrel, recent_buffer,
-													 &authority_before, &admission,
-													 &proofs, retained, retained_mask,
-													 &current_fence, &cleaned, &row_inputs_current);
-		/* Inner cleanup has released the local content lock and pin. Match a
-		 * bounded, read-only cohort observation to this original admission and
-		 * the retained policy bound. Neither grants a positive F/H certificate:
-		 * producer protection/provenance must close before any freeze apply. */
-		if (row_inputs_current && !cleaned)
-			status = lazy_observe_shared_freeze_bounds(vacrel, &admission, status,
-													&observed_bounds);
-		/* This remains only a physical association, never row-freeze permission. */
-		if (row_inputs_current && !cleaned
-			&& (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
-				|| status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN))
-		{
-			(void) cluster_heap_freeze_bind_creation_targets_v1(
-				&vacrel->shared_freeze_batch, &proofs, &current_fence);
-			if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN)
-			{
-				(void) cluster_heap_freeze_bind_aborted_xmax_targets_v1(
-					&vacrel->shared_freeze_batch, &proofs, &current_fence);
-				(void) cluster_heap_freeze_select_aborted_xmax_candidates_v1(
-					&vacrel->shared_freeze_batch, &proofs, &current_fence,
-					&vacrel->shared_freeze_aborted_xmax_candidates);
-			}
-			/* Screen the same attempt's original creator identities and observed
-			 * bounds without producing native plans. Positive F/H and producer
-			 * retention admission are still required before any shared write. */
-			if (vacrel->shared_freeze_cohort_observed
-				&& cluster_heap_freeze_select_xmin_candidates_v1(
-					&vacrel->shared_freeze_batch, &proofs, &current_fence,
-					vacrel->shared_freeze_candidate_limit_full,
-					observed_bounds.horizon_scn,
-					&vacrel->shared_freeze_xmin_candidates))
-			{
-				ClusterHeapFreezeXminCandidateBatchV1 *candidates =
-					&vacrel->shared_freeze_xmin_candidates;
-				FullTransactionId legal_next = vacrel->cutoffs.SharedFreezePolicySample.legal_next;
-				uint16 kept = 0;
-
-				/* Screen only native format compatibility, in original row order.
-				 * A source-proven old row outside the raw WAL window must not
-				 * discard the other candidates. This grants no positive F/H. */
-				if (candidates->target_count > MaxHeapTuplesPerPage)
-					candidates->target_count = 0;
-				for (uint16 i = 0; i < candidates->target_count; i++)
-				{
-					const ClusterHeapFreezeXminTargetV1 *target = &candidates->targets[i];
-
-					if (FullTransactionIdPrecedes(target->original_creator_full_xid, legal_next)
-						&& U64FromFullTransactionId(legal_next)
-							- U64FromFullTransactionId(target->original_creator_full_xid)
-							< UINT64CONST(0x80000000))
-						candidates->targets[kept++] = *target;
-				}
-				candidates->target_count = kept;
-			}
-		}
-		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
-			|| status == CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED
-			|| (row_inputs_current && status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN))
-		{
-			vacrel->shared_freeze_proofs = proofs;
-			vacrel->shared_freeze_fence = current_fence;
-			/* A retained row subset does not qualify the whole page. */
-			vacrel->shared_freeze_fence_valid =
-				status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN && !cleaned;
-		}
-
-admitted_done:;
+		status = lazy_collect_shared_freeze_proofs_admitted(vacrel, recent_buffer,
+			&authority_before, master_before, &admission, &row_inputs_current);
+		/* The same entered token is still owned here until PG_FINALLY. */
 	}
 	PG_FINALLY();
 	{
