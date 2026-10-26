@@ -539,8 +539,10 @@ TESTS += test_cluster_relmap_v2
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_v2_storage
 TESTS += test_cluster_relmap_publish_native
+TESTS += test_cluster_relmap_publish_clog
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2_storage,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_publish_native,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_publish_clog,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_retention
 TESTS += test_cluster_relmap_checkpoint
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_checkpoint,$(SIMPLE_TESTS))
@@ -762,7 +764,22 @@ test_cluster_relmap_v2_storage_product.o: $(top_srcdir)/src/backend/cluster/clus
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -Dwrite=relmap_test_write -Dread=relmap_test_read \
 		-Drenameat=relmap_test_renameat -Dclose=relmap_test_close -c $< -o $@
 
-test_cluster_relmap_v2_storage test_cluster_relmap_publish_native: %: %.c unit_test.h \
+test_cluster_relmap_publish_clog_bridge.o: test_cluster_relmap_publish_clog_bridge.c \
+		test_cluster_relmap_publish_clog.h test_cluster_relmap_native_clog_namespace.h \
+		test_cluster_clog_recovery.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/clog.c \
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_recovery.c \
+		$(top_srcdir)/src/include/access/clog.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_relmap_publish_clog: test_cluster_relmap_publish_clog_bridge.o \
+		test_cluster_relmap_publish_clog.h
+
+test_cluster_relmap_v2_storage test_cluster_relmap_publish_native test_cluster_relmap_publish_clog: %: %.c unit_test.h \
 		test_cluster_relmap_v2_storage.c test_cluster_relmap_commit_native.h \
 		test_cluster_relmap_staged_observation.inc \
 		test_cluster_relmap_runtime_storage.inc \
@@ -787,6 +804,7 @@ test_cluster_relmap_v2_storage test_cluster_relmap_publish_native: %: %.c unit_t
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_restore.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -ffunction-sections -fdata-sections $< test_cluster_relmap_v2_storage_product.o \
+		$(if $(filter test_cluster_relmap_publish_clog,$@),test_cluster_relmap_publish_clog_bridge.o) \
 		test_cluster_relmap_pending_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention_restore.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
@@ -5273,6 +5291,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_current_mx_local_sample.inc test_cluster_current_mx_reply_builder.inc
 	rm -f test_cluster_page_cold_redo_product.o
 	rm -f test_cluster_relmap_v2_storage_product.o
+	rm -f test_cluster_relmap_publish_clog_bridge.o
 	rm -f test_cluster_relmap_retained_owner.o
 	rm -f $(CLUSTER_COLD_PLAN_O) $(CLUSTER_COLD_DECODE_O) $(CLUSTER_COLD_STARTUP_O) test_cluster_cold_recovery_io_core.o
 	rm -f $(D_COLD_REFAIL_O) $(D_COLD_REPLAY_O)
