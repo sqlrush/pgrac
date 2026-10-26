@@ -93,6 +93,19 @@ typedef enum ClusterRecoveryRelmapFoldResult {
 #define CLUSTER_RECOVERY_RELMAP_FOLD_CLOG_TRUNCATE (1U << 10)
 #define CLUSTER_RECOVERY_RELMAP_FOLD_RECORD_TOP_XID (1U << 11)
 
+/* Original complete two-pass observation, including sources with no PAGE
+ * records and explicit empty terminals. The transcript covers every record
+ * family in the exact full cut. source_index is the physical census/PAGE WAL
+ * order, not the input-directory or replay-set index; match complete source
+ * identities across those views. By-value metadata grants no replay authority. */
+typedef struct ClusterRecoveryWalSourceObservationV1 {
+	ClusterWalSourceRef source;
+	RfContributorStreamCutV1 cut;
+	ClusterWalTailObservation observed;
+	uint8 transcript_sha256[32];
+	uint32 source_index;
+} ClusterRecoveryWalSourceObservationV1;
+
 /* Owned original selected input, including history and empty alternatives.
  * The flags describe actual complete checkpoint bytes/addresses observed in
  * both original physical passes. A v2 window is an issuance observation, not
@@ -173,6 +186,7 @@ typedef struct ClusterRecoveryNativeInventory ClusterRecoveryNativeInventory;
  * never a record's FullXid era, CLOG lifetime or terminal qualification. */
 typedef struct ClusterRecoveryRelmapHistoryEntryV1 {
 	ClusterRecoveryRelmapSourceV1 source;
+	ClusterRecoveryWalSourceObservationV1 observation;
 	XLogRecPtr checkpoint_end;
 	ClusterRelmapCheckpointWindow window;
 	uint64 post_flush_issued;
@@ -201,6 +215,9 @@ extern ClusterRecoveryNativeInventoryResult cluster_recovery_relmap_history_buil
 	ClusterRecoveryRelmapHistory **out,
 	ClusterRecoveryNativeInventoryDiag *diag);
 /* One original generation in census order, including empty/history sources.
+ * Complete cut/tail/all-record transcript is copied from the SAME inventory,
+ * not a PAGE or native-map prefix. source.input_index and observation's
+ * source_index identify separate views; join them by complete generation.
  * No I/O/cursor changes. Current checks bracket publication of copied bytes.
  * Invalid index/overlapping output is a precondition refusal; other failure
  * is sticky. All outputs remain provisional until the full final recheck. */

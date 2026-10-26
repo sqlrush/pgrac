@@ -3484,7 +3484,8 @@ test_cluster_recovery_native_inputs: $(top_srcdir)/src/backend/cluster/cluster_r
 		$(top_srcdir)/src/include/cluster/cluster_recovery_page_roots.h
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_history.inc \
 		test_cluster_recovery_relmap_fold.inc test_cluster_recovery_episode_pending.inc \
-		test_cluster_recovery_episode_base.inc $(top_srcdir)/src/include/access/clog.h \
+		test_cluster_recovery_episode_base.inc test_cluster_recovery_episode_sources.inc \
+		$(top_srcdir)/src/include/access/clog.h \
 		$(top_srcdir)/src/include/common/cluster_relmap_v2.h
 test_cluster_recovery_native_inputs: test_cluster_recovery_manifest_inputs.inc test_cluster_recovery_terminal_inputs.inc test_cluster_recovery_tt_terminal_inputs.inc test_cluster_recovery_page_roots_inputs.inc
 test_cluster_recovery_native_inputs: $(RECOVERY_CENSUS_TEST_OBJS) test_cluster_recovery_prepare_fixture.h test_cluster_recovery_prepare_inputs.inc

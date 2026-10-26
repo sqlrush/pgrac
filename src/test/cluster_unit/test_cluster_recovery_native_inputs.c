@@ -968,6 +968,7 @@ UT_TEST(test_ctrc_inventory_keeps_original_local_cut_and_native_terminal_bytes)
 #include "test_cluster_recovery_relmap_fold.inc"
 #include "test_cluster_recovery_episode_pending.inc"
 #include "test_cluster_recovery_episode_base.inc"
+#include "test_cluster_recovery_episode_sources.inc"
 
 int
 main(int argc, char **argv)
@@ -976,7 +977,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(108);
+	UT_PLAN(112);
 	UT_RUN(test_ctrc_inventory_keeps_original_local_cut_and_native_terminal_bytes);
 	UT_RUN(test_owned_ctrc_census_borrows_namespace_and_revokes_changed_work);
 	UT_RUN(test_owned_ctrc_census_rejects_other_purpose_and_namespace_switch);
@@ -1085,6 +1086,10 @@ main(int argc, char **argv)
 	UT_RUN(test_episode_base_first_and_existing_errors_never_drop_protection);
 	UT_RUN(test_episode_base_after_read_source_drift_discards_only_local_output);
 	UT_RUN(test_episode_base_output_lock_and_budget_preconditions_do_not_poison);
+	UT_RUN(test_episode_sources_keep_complete_zero_page_generations_by_value);
+	UT_RUN(test_episode_sources_base_keeps_full_tail_after_native_map);
+	UT_RUN(test_episode_sources_reject_borrowed_output_without_changing_baseline);
+	UT_RUN(test_episode_sources_sibling_metadata_drift_revokes_complete_view);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
