@@ -14698,10 +14698,69 @@ UT_TEST(test_real_outer_collector_rethrows_after_original_leave_on_admitted_erro
 	free(v); free(f);
 }
 
+/* An outer collector result retains observations, not its released owner.
+ * Passing its actual zeroed token to the recent native entry must stop before
+ * a resident pin, writer restoration or WAL. No replacement token is made. */
+UT_TEST(test_real_outer_collector_result_cannot_outlive_its_original_admission)
+{
+	for (unsigned batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		proof_owner_setup(&f, &v, targets, batch != 0);
+		UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		proof_owner_assert_released(&v, true);
+		phase_copy_to_native(&f, &v);
+		f.admission = proof_owner_left_token;
+		UT_ASSERT(!f.admission.entered);
+		phase_pin_released = true;
+		UT_ASSERT(!fixture_recent_xmin_apply(&f,
+			v.shared_freeze_xmin_candidates.targets,
+			v.shared_freeze_xmin_candidates.target_count));
+		UT_ASSERT_EQ(recent_pin_calls + recent_unpins + conditional_resumes, 0);
+		UT_ASSERT_EQ(backend_pin_count, 0);
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(proof_owner_enters, 1); UT_ASSERT_EQ(proof_owner_leaves, 1);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&native_admission_shared.inflight
+			[CLUSTER_SEMANTIC_TARGET_SIDE][bounds_lifecycle_feature()]), 7);
+		phase_pin_released = false;
+	}
+}
+
+UT_TEST(test_real_outer_collector_reuse_refusal_retires_previous_observations)
+{
+	QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+	proof_owner_setup(&f, &v, targets, true);
+	UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	proof_owner_assert_released(&v, true);
+	UT_ASSERT(v.shared_freeze_fence_valid && v.shared_freeze_cohort_observed);
+	route_current = false;
+	UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	UT_ASSERT_EQ(v.shared_freeze_proofs.proof_count, 0);
+	UT_ASSERT(!v.shared_freeze_fence_valid && !v.shared_freeze_cohort_observed);
+	UT_ASSERT(v.shared_freeze_input.freeze_policy == NULL
+		&& v.shared_freeze_input.freeze_cohort == NULL);
+	UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 0);
+	UT_ASSERT_EQ(v.shared_freeze_aborted_xmax_candidates.target_count, 0);
+	UT_ASSERT(!FullTransactionIdIsValid(v.shared_freeze_candidate_limit_full));
+	for (unsigned i = 0; i < v.shared_freeze_batch.tuple_count; i++) {
+		UT_ASSERT_EQ(v.shared_freeze_batch.tuples[i].creation_target_proof_index,
+			CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET);
+		UT_ASSERT_EQ(v.shared_freeze_batch.tuples[i].aborted_xmax_target_proof_index,
+			CLUSTER_HEAP_FREEZE_NO_ABORTED_XMAX_TARGET);
+		UT_ASSERT(!FullTransactionIdIsValid(v.shared_freeze_batch.tuples[i].original_creator_full_xid));
+	}
+	UT_ASSERT_EQ(proof_owner_enters, 1); UT_ASSERT_EQ(proof_owner_leaves, 1);
+	UT_ASSERT_EQ(proof_owner_cost_reads, 2);
+	UT_ASSERT_EQ(backend_pin_count, 0); UT_ASSERT(!local_x && !local_share);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&native_admission_shared.inflight
+		[CLUSTER_SEMANTIC_TARGET_SIDE][bounds_lifecycle_feature()]), 7);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(317);
+	UT_PLAN(319);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -15025,6 +15084,9 @@ main(void)
 	UT_RUN(test_real_outer_collector_enters_and_leaves_around_actual_admitted_phase);
 	UT_RUN(test_real_outer_collector_early_refusals_preserve_caller_pin_and_other_debt);
 	UT_RUN(test_real_outer_collector_rethrows_after_original_leave_on_admitted_errors);
+
+	UT_RUN(test_real_outer_collector_result_cannot_outlive_its_original_admission);
+	UT_RUN(test_real_outer_collector_reuse_refusal_retires_previous_observations);
 
 	UT_DONE();
 	return ut_failed_count != 0;
