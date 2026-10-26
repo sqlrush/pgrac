@@ -8280,6 +8280,11 @@ StartupXLOG(void)
 			(Size)cluster_cold_recovery_plan_memory * 1024 / 4))
 		ereport(FATAL, (errmsg("could not observe original Startup CTRC inputs"),
 			errdetail("%s", ClusterColdRecoveryCtrcObservationRefusal(endOfRecoveryInfo->cluster_tx_start))));
+	/* Keep every contributing replay origin under its original native owner
+	 * before PAGE work or the independent service handoff can proceed. */
+	if (!ClusterColdRecoveryCtrcReplaysAcquire(endOfRecoveryInfo->cluster_tx_start))
+		ereport(FATAL, (errmsg("could not acquire original Startup CTRC replay owners"),
+			errdetail("%s", ClusterColdRecoveryCtrcObservationRefusal(endOfRecoveryInfo->cluster_tx_start))));
 	/* The same original executor/input must survive independent CTRC service.
 	 * TX acceptance alone cannot transfer or destroy its private work. */
 	if (!cluster_recovery_ctrc_result_wait_v1(endOfRecoveryInfo->cluster_tx_start))

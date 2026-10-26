@@ -204,6 +204,16 @@ extern bool ClusterColdRecoveryCtrcWorkCurrent(const struct ClusterRecoveryStart
  * scope. Native ERROR propagates, with original WALR release debt unchanged. */
 extern bool ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start,
 	Size memory_budget);
+/* After complete observation and accepted TX, retain the same original scope
+ * and acquire every native replay IR through its existing all-source owner.
+ * Called by Startup outside recovery/critical sections with no caller LWLocks.
+ * Native BUSY/RETRY/CF contention waits locally, with partial owners retained
+ * and no overall deadline. Interrupts and callbacks revalidate original inputs;
+ * final success repeats the original full observation and actual-holder check.
+ * No new scope/source round, PAGE mutation, debt retirement or service result.
+ * False/ERROR leaves original cleanup responsibility in place, including any
+ * original observation cleanup triggered by preflight refusal. */
+extern bool ClusterColdRecoveryCtrcReplaysAcquire(const struct ClusterRecoveryStartV1 *start);
 /* First bounded observation refusal, valid only while original Start lives. */
 extern const char *ClusterColdRecoveryCtrcObservationRefusal(
 	const struct ClusterRecoveryStartV1 *start);

@@ -233,12 +233,14 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/bgwriter.h"
+#include "postmaster/interrupt.h"
 #include "postmaster/startup.h"
 #include "replication/slot.h"
 #include "replication/walreceiver.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "storage/lwlock.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
@@ -249,6 +251,7 @@
 #include "utils/pg_lsn.h"
 #include "utils/ps_status.h"
 #include "utils/pg_rusage.h"
+#include "utils/wait_event.h"
 
 /* Unsupported old recovery command file names (relative to $PGDATA) */
 #define RECOVERY_COMMAND_FILE	"recovery.conf"
@@ -1177,6 +1180,92 @@ ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size 
 	if (!observed)
 		cluster_recovery_cold_observation_close(state);
 	return observed;
+}
+
+static void
+cluster_recovery_cold_ctrc_lock_held(LWLock *lock, LWLockMode mode, void *arg)
+{
+	(void)lock;
+	(void)mode;
+	*(bool *)arg = true;
+}
+
+static bool
+cluster_recovery_cold_ctrc_replays_actor(void)
+{
+	bool held = false;
+
+	if (MyBackendType != B_STARTUP || !IsUnderPostmaster || CritSectionCount != 0
+		|| ShutdownRequestPending)
+		return false;
+	/* Original owner checks may need a transient native LWLock. Do not enter
+	 * them or a cancellable wait with caller PAGE/content/other locks held. */
+	ForEachLWLockHeldByMe(cluster_recovery_cold_ctrc_lock_held, &held);
+	return !held && !RecoveryInProgress();
+}
+
+static bool
+cluster_recovery_cold_ctrc_replays_current(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, const struct ClusterWalInputsV1 *scope)
+{
+	return cluster_recovery_cold_ctrc_replays_actor()
+		&& start != NULL && start == cluster_recovery_cold_start
+		&& start->ctrc_observation_complete && scope != NULL
+		&& ClusterColdRecoveryCtrcScope(start, work) == scope;
+}
+
+bool
+ClusterColdRecoveryCtrcReplaysAcquire(const struct ClusterRecoveryStartV1 *start)
+{
+	const ClusterColdCtrcWorkV1 *work;
+	struct ClusterWalInputsV1 *scope;
+
+	if (start == NULL)
+		return true;
+	if (!cluster_recovery_cold_ctrc_replays_actor()
+		|| start != cluster_recovery_cold_start || !start->ctrc_observation_complete)
+		return false;
+	work = start->ctrc_observation_work;
+	scope = ClusterColdRecoveryCtrcScope(start, work);
+	if (scope == NULL)
+		return false;
+	for (;;) {
+		ClusterControlRootResult result;
+
+		ResetLatch(MyLatch);
+		HandleStartupProcInterrupts();
+		if (!cluster_recovery_cold_ctrc_replays_current(start, work, scope))
+			return false;
+		result = cluster_wal_inputs_ctrc_replays_acquire_v1(scope);
+		/* Full preflight can retire the original observation. Locate it again
+		 * through Start before passing the borrowed scope to any consumer. */
+		if (!cluster_recovery_cold_ctrc_replays_current(start, work, scope))
+			return false;
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			if (!cluster_wal_inputs_ctrc_replays_authorized_v1(scope)
+				|| !cluster_recovery_cold_ctrc_replays_current(start, work, scope)) {
+				if (start == cluster_recovery_cold_start)
+					cluster_recovery_cold_observation_refuse(cluster_recovery_cold_start,
+						"replay_holders", 0);
+				return false;
+			}
+			if (!ClusterColdRecoveryCtrcObserve(start, 0)
+				|| !cluster_recovery_cold_ctrc_replays_current(start, work, scope)
+				|| !cluster_wal_inputs_ctrc_replays_authorized_v1(scope)
+				|| !cluster_recovery_cold_ctrc_replays_current(start, work, scope))
+				return false;
+			return true;
+		}
+		if (result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT) {
+			cluster_recovery_cold_observation_refuse(cluster_recovery_cold_start,
+				"replay_acquire", (int)result);
+			return false;
+		}
+		/* Retain this prepared set and every partial native grant. A local
+		 * poll timeout is never a transaction failure or a new source round. */
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+			100L, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
+	}
 }
 
 const char *

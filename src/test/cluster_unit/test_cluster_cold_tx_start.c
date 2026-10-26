@@ -164,6 +164,12 @@ static unsigned tx_wait_destroy_base;
 static bool tx_wait_drift;
 static void (*ctrc_wait_step)(void);
 static void (*ctrc_interrupt_step)(void);
+static unsigned ctrc_driver_acquires, ctrc_driver_authorizations, ctrc_driver_waits;
+static unsigned ctrc_driver_busy_until, ctrc_driver_lwlocks;
+static bool ctrc_driver_waiting, ctrc_driver_false_authorization, ctrc_driver_error;
+static ClusterControlRootResult ctrc_driver_result;
+static void (*ctrc_driver_acquire_step)(void), (*ctrc_driver_authorize_step)(void);
+static void (*ctrc_driver_wait_step)(void);
 static const struct ClusterRecoveryStartV1 *destroy_probe;
 static ClusterRecoveryPlanShmem window_region;
 static bool found_window_region;
@@ -583,6 +589,11 @@ bool cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 st
 
 static void reset(void)
 {
+	ctrc_driver_acquires = ctrc_driver_authorizations = ctrc_driver_waits = 0;
+	ctrc_driver_busy_until = ctrc_driver_lwlocks = 0;
+	ctrc_driver_waiting = ctrc_driver_false_authorization = ctrc_driver_error = false;
+	ctrc_driver_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	ctrc_driver_acquire_step = ctrc_driver_authorize_step = ctrc_driver_wait_step = NULL;
 	ctrc_census_calls = 0;
 	ctrc_census_ok = true;
 	ctrc_census_drift = false;
@@ -1772,6 +1783,15 @@ WaitLatch(Latch *latch, int events, long timeout, uint32 wait_event_info)
 	UT_ASSERT(latch == MyLatch);
 	UT_ASSERT_EQ(events, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH);
 	UT_ASSERT_EQ(timeout, 100);
+	if (ctrc_driver_waiting) {
+		UT_ASSERT_EQ(wait_event_info, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
+		UT_ASSERT(observation_cursor_live && observation_scope_live);
+		UT_ASSERT_EQ(ctrc_driver_lwlocks, 0);
+		ctrc_driver_waits++;
+		ctrc_driver_waiting = false;
+		if (ctrc_driver_wait_step != NULL) ctrc_driver_wait_step();
+		return WL_TIMEOUT;
+	}
 	if (wait_event_info == WAIT_EVENT_CLUSTER_THREAD_RECOVERY) {
 		tx_ir_local_waits++;
 		UT_ASSERT(reserved_target == NULL && !stamp_live && !tx_ir_held);
@@ -2138,6 +2158,7 @@ UT_TEST(test_original_error_revokes_ctrc_registration_with_the_owner_slot)
 #include "test_cluster_cold_ctrc_terminals.inc"
 #include "test_cluster_cold_ctrc_source_request.inc"
 #include "test_cluster_cold_ctrc_replay_source.inc"
+#include "test_cluster_cold_ctrc_replay_driver.inc"
 
 UT_TEST(test_start_serial_request_keeps_original_subject_separate_from_new_writer)
 {
@@ -2234,7 +2255,17 @@ UT_TEST(test_c0_error_closes_target_before_ir_and_walr)
 
 int main(void)
 {
-	UT_PLAN(118);
+	UT_PLAN(128);
+	UT_RUN(test_startup_acquires_native_replay_set_before_independent_service);
+	UT_RUN(test_startup_replay_acquisition_requires_original_complete_observation);
+	UT_RUN(test_startup_replay_wait_retains_partial_owners_without_deadline);
+	UT_RUN(test_startup_replay_rechecks_originals_after_interrupts);
+	UT_RUN(test_startup_replay_refuses_late_acquisition_and_authorization_drift);
+	UT_RUN(test_startup_replay_refuses_native_failure_without_inline_release);
+	UT_RUN(test_startup_replay_error_preserves_original_cleanup_responsibility);
+	UT_RUN(test_startup_replay_revalidates_manifest_after_all_native_grants);
+	UT_RUN(test_startup_replay_refuses_lwlocks_before_original_owner_snapshots);
+	UT_RUN(test_startup_replay_repeat_keeps_original_scope_and_empty_work);
 	UT_RUN(test_ctrc_replay_request_rejects_stale_start_and_critical_section);
 	UT_RUN(test_ctrc_replay_request_covers_original_source_without_a_tt_subject);
 	UT_RUN(test_ctrc_replay_request_allows_empty_work_only_after_complete_observation);
