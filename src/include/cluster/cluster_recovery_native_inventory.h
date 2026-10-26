@@ -17,6 +17,7 @@
 #include "cluster/cluster_recovery_root_set.h"
 #include "cluster/cluster_wal_inputs.h"
 #include "common/cluster_relmap_v2.h"
+#include "cluster/cluster_relmap_checkpoint.h"
 
 typedef enum ClusterRecoveryNativeInventoryResult {
 	CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED = 0,
@@ -92,8 +93,22 @@ typedef enum ClusterRecoveryRelmapFoldResult {
 #define CLUSTER_RECOVERY_RELMAP_FOLD_CLOG_TRUNCATE (1U << 10)
 #define CLUSTER_RECOVERY_RELMAP_FOLD_RECORD_TOP_XID (1U << 11)
 
+/* Owned original selected input, including history and empty alternatives.
+ * The flags describe actual complete checkpoint bytes/addresses observed in
+ * both original physical passes. A v2 window is an issuance observation, not
+ * a record's FullXid era, suffix upper bound, native base or lifetime proof. */
+typedef struct ClusterRecoveryRelmapHistorySource {
+	ClusterWalInputV1 input;
+	uint32 input_index; /* original selector index, not the census's sorted ordinal */
+	XLogRecPtr checkpoint_end;
+	ClusterRelmapCheckpointWindow window;
+	uint64 post_flush_issued;
+	bool checkpoint_observed, window_observed;
+} ClusterRecoveryRelmapHistorySource;
+
 typedef struct ClusterRecoveryRelmapFoldEntry {
 	const ClusterRecoveryNativeRecord *record; /* full original source/cut/payload */
+	const ClusterRecoveryRelmapHistorySource *history; /* same owned source, NULL if unavailable */
 	ClusterRecoveryNativeKind kind;
 	uint32 source_index;
 	uint64 record_ordinal; /* original all-family ordinal within this source */
@@ -108,6 +123,16 @@ typedef struct ClusterRecoveryRelmapFoldSummary {
 	uint64 top_commits, top_aborts, assignments, prepares;
 	uint64 child_records, child_references;
 	uint64 clog_zeroes, clog_truncates;
+	/* Same physical origin only. Counts compare the FULL query to the v2
+	 * persisted half-space window, never infer an era from a raw carrier.
+	 * owner_window_sources additionally matches epoch/admitted/boot. */
+	uint32 checkpoint_sources, window_sources, query_window_sources, owner_window_sources;
+	/* Every query-page zero and every truncate remains an obligation. Order
+	 * only within the UNIQUE exact native map source. Other generations,
+	 * missing/duplicate maps or an overlapping record remain unordered.
+	 * Exact here means WAL_MATCH's represented fields, not certified FullXid.
+	 * Even a before count proves no cutoff era or base retention lifetime. */
+	uint64 clog_before_wal, clog_after_wal, clog_unordered;
 } ClusterRecoveryRelmapFoldSummary;
 
 typedef struct ClusterRecoveryNativeInventoryDiag {
@@ -255,6 +280,19 @@ extern ClusterRecoveryRelmapFoldResult cluster_recovery_native_inventory_relmap_
 	ClusterRecoveryNativeInventory *inventory, const ClusterRelmapV2Image *pending,
 	ClusterRecoveryRelmapFoldEntry *out, ClusterRecoveryRelmapFoldSummary *summary,
 	ClusterRecoveryNativeInventoryDiag *diag);
+/* Copy one original owned source in census order, including empty/history
+ * inputs; input_index retains the distinct original selector order.
+ * No I/O/allocation or cursor movement. Distinct caller-owned output only;
+ * refusal clears it. Its lifetime and final whole-scope/physical rereads are
+ * still the original episode's duty. This getter grants no COMPLETE, native
+ * base/no-reuse/history qualification, status override, release or OPEN.
+ * The existing V1 inventory digest stays source/cut/all-record transcript;
+ * it does not independently bind this selected window/metadata. Consumers
+ * must retain these full values and perform the original final recheck. */
+extern bool
+cluster_recovery_native_inventory_relmap_source(const ClusterRecoveryNativeInventory *inventory,
+												uint32 index,
+												ClusterRecoveryRelmapHistorySource *out);
 extern void cluster_recovery_native_inventory_destroy(ClusterRecoveryNativeInventory *inventory);
 /* Independent retained terminal/assignment cursor, under the same borrowed
  * ROOT lifetime and failure rules as MX. At most 128 saved records or one

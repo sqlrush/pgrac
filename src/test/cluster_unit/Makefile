@@ -3657,7 +3657,7 @@ test_cluster_relmap_retained_owner.o: $(top_srcdir)/src/backend/cluster/cluster_
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_recovery_native_inputs: test_cluster_recovery_relmap_fold.inc
+test_cluster_recovery_native_inputs: test_cluster_recovery_relmap_fold.inc test_cluster_recovery_relmap_history.inc
 
 test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relmap_retained_wal: %: %.c test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc test_cluster_control_root_serving.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_census.c \

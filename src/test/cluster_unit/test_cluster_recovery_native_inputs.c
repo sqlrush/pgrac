@@ -837,6 +837,7 @@ cleanup:
 #include "test_cluster_recovery_terminal_inputs.inc"
 #include "test_cluster_recovery_tt_terminal_inputs.inc"
 #include "test_cluster_recovery_relmap_fold.inc"
+#include "test_cluster_recovery_relmap_history.inc"
 
 int
 main(int argc, char **argv)
@@ -845,7 +846,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(82);
+	UT_PLAN(88);
 	UT_RUN(test_native_inventory_uses_two_real_cold_passes);
 	UT_RUN(test_native_inventory_never_returns_partial_on_drift_io_or_error);
 	UT_RUN(test_native_inventory_capacity_is_not_partial_success);
@@ -928,6 +929,12 @@ main(int argc, char **argv)
 	UT_RUN(test_relmap_fold_is_bounded_and_pins_the_complete_query);
 	UT_RUN(test_relmap_fold_refusal_and_final_drift_revoke_dependents);
 	UT_RUN(test_relmap_fold_counts_empty_origins_and_refuses_invalid_queries);
+	UT_RUN(test_relmap_history_binds_actual_checkpoint_and_full_source_window);
+	UT_RUN(test_relmap_history_keeps_legacy_windows_unqualified);
+	UT_RUN(test_relmap_history_orders_barriers_only_in_unique_exact_wal_source);
+	UT_RUN(test_relmap_history_metadata_drift_revokes_original_inventory);
+	UT_RUN(test_relmap_history_owner_window_and_borrowed_record_source);
+	UT_RUN(test_relmap_history_preserves_sorted_empty_and_initializer_inputs);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
