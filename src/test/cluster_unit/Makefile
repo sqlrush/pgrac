@@ -2458,6 +2458,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_freeze_worker_pass.inc \
 		test_cluster_heap_freeze_pgproc_types.inc test_cluster_heap_freeze_pgproc_sample.inc \
 		test_cluster_heap_freeze_pgproc_exit.inc \
+		test_cluster_ctrc_native_group_exit.inc \
 		test_cluster_heap_freeze_stripe_future.inc \
 		$(top_srcdir)/src/include/storage/proc.h $(top_srcdir)/src/include/access/transam.h \
 		test_cluster_heap_freeze_lease_current.inc \
