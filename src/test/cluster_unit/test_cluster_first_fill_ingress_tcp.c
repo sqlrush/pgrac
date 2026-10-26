@@ -24,6 +24,21 @@ static uint64 ingress_session = 19;
 static unsigned ingress_received, ingress_admitted, ingress_cancelled, ingress_cleanup;
 static GcsBlockRequestPayload ingress_original[8];
 static GcsBlockRequestPayload ingress_installed[8];
+static bool ingress_native_absent;
+static ClusterICSendResult ingress_return_send;
+static unsigned ingress_return_notices;
+static GcsBlockDonePayload ingress_return_notice;
+
+static ClusterICSendResult
+gcs_block_send_envelope_or_loopback(uint8 type, int32 dest, const void *payload, uint32 bytes)
+{
+	UT_ASSERT_EQ(type, PGRAC_IC_MSG_GCS_BLOCK_DONE);
+	UT_ASSERT_EQ(dest, UT_PEER_ID);
+	UT_ASSERT_EQ(bytes, sizeof(ingress_return_notice));
+	ingress_return_notice = *(const GcsBlockDonePayload *)payload;
+	ingress_return_notices++;
+	return ingress_return_send;
+}
 
 static void
 gcs_first_fill_master_trace(const GcsBlockRequestPayload *req pg_attribute_unused(),
@@ -80,7 +95,15 @@ gcs_first_fill_master_cancel_owned(const ClusterPcmReadGrantKey *key, int worker
 #define cluster_gcs_block_phase_for_tag(tag) GCS_BLOCK_NORMAL
 #define MemoryContextAllocZero(context, size) calloc(1, (size))
 #define cluster_ic_dispatch_defer(env) (ingress_deferred = true)
+#define cluster_pcm_lock_read_grant_absent(key) ingress_native_absent
+#define cluster_block_io_trace_pending_s(key, phase, state, holder, binding, result) ((void)0)
+#define cluster_ic_suppress_gcs_done_cap false
+#define cluster_sf_peer_supports_gcs_done(node) true
 #include "test_cluster_first_fill_ingress.inc"
+#undef cluster_sf_peer_supports_gcs_done
+#undef cluster_ic_suppress_gcs_done_cap
+#undef cluster_block_io_trace_pending_s
+#undef cluster_pcm_lock_read_grant_absent
 #undef cluster_ic_dispatch_defer
 #undef MemoryContextAllocZero
 #undef cluster_gcs_block_phase_for_tag
@@ -115,7 +138,15 @@ ingress_dispatch(const ClusterICEnvelope *env, const void *payload, int32 peer)
 	} else if (env->msg_type == PGRAC_IC_MSG_GCS_BLOCK_DONE) {
 		const GcsBlockDonePayload *done = payload;
 		UT_ASSERT_EQ(env->payload_length, sizeof(*done));
-		if (done->request_id != 0) {
+		if (done->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETURN) {
+			ClusterPcmReadGrant service;
+			uint64 session;
+			if (env->source_node_id != (uint32)done->sender_node
+				|| done->epoch != ut_epoch || !GcsBlockDonePayloadPendingSService(done, &service)
+				|| !ingress_auth(done->sender_node, done->epoch, &session)
+				|| !gcs_first_fill_return_receipt_retain(&service, session))
+				ingress_deferred = true;
+		} else if (done->request_id != 0) {
 			ClusterPcmReadGrantKey key = {0};
 			key.tag = done->tag; key.request_id = done->request_id; key.epoch = done->epoch;
 			key.requester_node = done->sender_node; key.backend_id = done->requester_backend_id;
@@ -137,6 +168,11 @@ ingress_reset(void)
 {
 	while (gcs_first_fill_ingress_head != NULL)
 		gcs_first_fill_ingress_forget(gcs_first_fill_ingress_head);
+	memset(gcs_first_fill_return_receipts, 0, sizeof(gcs_first_fill_return_receipts));
+	gcs_first_fill_return_receipt_count = 0;
+	ingress_native_absent = true;
+	ingress_return_send = CLUSTER_IC_SEND_NOT_ADMITTED;
+	ingress_return_notices = 0;
 	ingress_capacity = cleanup_capacity = false;
 	ingress_authenticated = true;
 	ingress_session = 19;
@@ -259,6 +295,43 @@ UT_TEST(following_cancel_seals_original_until_exact_cleanup_takes_over)
 	UT_ASSERT_EQ(ingress_admitted, 0);
 }
 
+UT_TEST(orphan_return_leaves_following_same_peer_completion_readable)
+{
+	ClusterPcmReadGrant service = {0}, echoed;
+	GcsBlockDonePayload returned = {0}, completion = {0};
+	const char *reason;
+	ingress_reset();
+	service.key.tag.blockNum = 99;
+	service.key.request_id = gcs_reqid_requester(1, 0, 99);
+	service.key.epoch = ut_epoch; service.key.requester_node = 1; service.key.backend_id = 1;
+	service.holder_node = UT_PEER_ID; service.binding_generation = 7; service.service_generation = 1;
+	returned.request_id = service.key.request_id; returned.epoch = ut_epoch;
+	returned.tag = service.key.tag; returned.sender_node = UT_PEER_ID; returned.requester_backend_id = 1;
+	returned.transition_id = PCM_TRANS_N_TO_S;
+	returned.reserved_0[0] = GCS_BLOCK_DONE_PENDING_S_RETURN;
+	returned.reserved_0[1] = service.key.requester_node;
+	GcsBlockDonePayloadSetPendingSService(&returned, &service);
+	ingress_send(PGRAC_IC_MSG_GCS_BLOCK_REQUEST, &ingress_original[0], sizeof(ingress_original[0]));
+	ingress_send(PGRAC_IC_MSG_GCS_BLOCK_DONE, &returned, sizeof(returned));
+	ingress_send(PGRAC_IC_MSG_GCS_BLOCK_DONE, &completion, sizeof(completion));
+	ingress_drain(1, 2);
+	UT_ASSERT_EQ(ingress_admitted, 1); /* Completion behind RETURN released capacity. */
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_count, 1);
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_poll(&reason), CLUSTER_NORMAL_STOP_PENDING);
+	gcs_first_fill_return_receipt_tick(0);
+	UT_ASSERT_EQ(ingress_return_notices, 1);
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_count, 1);
+	UT_ASSERT(GcsBlockDonePayloadPendingSService(&ingress_return_notice, &echoed));
+	UT_ASSERT(gcs_first_fill_return_same_service(&service, &echoed));
+	ingress_return_send = CLUSTER_IC_SEND_WOULD_BLOCK;
+	ut_now += 10000;
+	gcs_first_fill_return_receipt_tick(0);
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_count, 0);
+	gcs_first_fill_return_receipt_tick(0);
+	UT_ASSERT_EQ(ingress_return_notices, 2);
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_poll(&reason), CLUSTER_NORMAL_STOP_READY);
+}
+
 UT_TEST(socket_close_or_unknown_session_does_not_erase_master_responsibility)
 {
 	ingress_reset();
@@ -283,10 +356,11 @@ main(void)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	MyAuxProcType = LmsProcess;
 	cluster_ic_tier1_set_my_data_channel(0, 2);
-	UT_PLAN(4);
+	UT_PLAN(5);
 	UT_RUN(ingress_connects_actual_data_channel);
 	UT_RUN(full_backend_credit_does_not_hide_following_same_peer_completion);
 	UT_RUN(following_cancel_seals_original_until_exact_cleanup_takes_over);
+	UT_RUN(orphan_return_leaves_following_same_peer_completion_readable);
 	UT_RUN(socket_close_or_unknown_session_does_not_erase_master_responsibility);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
