@@ -97,6 +97,29 @@ typedef struct ClusterRecoveryNativeInventoryDiag {
 
 typedef struct ClusterRecoveryNativeInventory ClusterRecoveryNativeInventory;
 
+/* Original complete two-pass observation, including sources with no PAGE
+ * records and explicit empty terminals. The transcript covers every record
+ * family in the exact full cut. source_index is the physical census/PAGE WAL
+ * order, not the input-directory or replay-set index; match complete source
+ * identities across those views. By-value metadata grants no replay authority. */
+typedef struct ClusterRecoveryWalSourceObservationV1 {
+	ClusterWalSourceRef source;
+	RfContributorStreamCutV1 cut;
+	ClusterWalTailObservation observed;
+	uint8 transcript_sha256[32];
+	uint32 source_index;
+} ClusterRecoveryWalSourceObservationV1;
+
+/* Same complete-inventory/snapshot gate as PAGE inputs; count is the entire
+ * original selected set, never the number of sources containing PAGE WAL.
+ * No file I/O or cursor reset; inherited snapshot hashing may allocate scratch.
+ * Call before PAGE acquisition. Outputs are cleared on refusal. */
+extern bool cluster_recovery_native_inventory_source_count_v1(
+	ClusterRecoveryNativeInventory *inventory, uint32 *out_count);
+extern bool cluster_recovery_native_inventory_source_at_v1(
+	ClusterRecoveryNativeInventory *inventory, uint32 index,
+	ClusterRecoveryWalSourceObservationV1 *out);
+
 /* Full decoded PageVersion-bearing input, not a contribution-graph verdict.
  * reader owns no files/callbacks and borrows this inventory's immutable copy.
  * All components, payloads and original source generations are retained. */

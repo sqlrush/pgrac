@@ -32,6 +32,35 @@ static unsigned observation_page_fault;
 static unsigned observation_page_wal_fault;
 static uint32 observation_page_wal_count;
 static XLogReaderState observation_page_wal_readers[2];
+static unsigned observation_wal_source_fault;
+static uint32 observation_wal_source_count;
+static ClusterRecoveryWalSourceObservationV1 observation_wal_sources[1];
+
+bool
+cluster_recovery_census_wal_source_count_v1(ClusterRecoveryCensus *cursor, uint32 *out)
+{
+	if (cursor != (ClusterRecoveryCensus *)&observation_cursor_object
+		|| !observation_cursor_live || !observation_scope_live || observation_steps < 3) abort();
+	*out = 0;
+	if (observation_wal_source_fault == 1) return false;
+	if (observation_wal_source_fault == 3) pg_re_throw();
+	*out = observation_wal_source_count + (observation_wal_source_fault == 2 ? 1 : 0);
+	return true;
+}
+
+bool
+cluster_recovery_census_wal_source_at_v1(ClusterRecoveryCensus *cursor, uint32 index,
+	ClusterRecoveryWalSourceObservationV1 *out)
+{
+	uint32 count;
+	memset(out, 0, sizeof(*out));
+	if (!cluster_recovery_census_wal_source_count_v1(cursor, &count) || index >= count || index >= 1)
+		return false;
+	if (observation_wal_source_fault == 4) return false;
+	if (observation_wal_source_fault == 5) pg_re_throw();
+	*out = observation_wal_sources[index];
+	return true;
+}
 
 bool
 cluster_recovery_census_page_wal_count_v1(ClusterRecoveryCensus *cursor, uint32 *out)
@@ -83,6 +112,18 @@ observation_fixture_reset(void)
 	observation_page_fault = 0;
 	observation_page_wal_fault = 0;
 	observation_page_wal_count = 2;
+	observation_wal_source_fault = 0; observation_wal_source_count = 1;
+	memset(observation_wal_sources, 0, sizeof(observation_wal_sources));
+	observation_wal_sources[0].source = typed.sources[0];
+	observation_wal_sources[0].cut.failed_thread = 2;
+	observation_wal_sources[0].cut.timeline_id = 1;
+	observation_wal_sources[0].cut.scan_begin_inclusive = 8192;
+	observation_wal_sources[0].cut.scan_end_exclusive = 16384;
+	observation_wal_sources[0].observed.complete_end = 16384;
+	observation_wal_sources[0].observed.last_record_start = 16256;
+	observation_wal_sources[0].observed.last_record_crc = 12345;
+	observation_wal_sources[0].observed.records = 37;
+	memset(observation_wal_sources[0].transcript_sha256, 9, 32);
 	memset(observation_page_wal_readers, 0, sizeof(observation_page_wal_readers));
 	memset(observation_pages_storage, 0, sizeof(observation_pages_storage));
 	observation_pages.count = 2;
