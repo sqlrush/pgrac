@@ -12,6 +12,7 @@ static void
 page_graph_fixture_reset(void)
 {
 	if (page_graph_live) abort();
+	page_source_fixture_reset();
 	page_graph_builds = page_graph_destroys = 0; page_graph_budget = 0;
 	page_graph_error = page_graph_refuse = false; page_graph_step = NULL;
 }
@@ -72,7 +73,7 @@ UT_TEST(test_startup_page_graph_is_original_bounded_and_never_rebuilt)
 	UT_ASSERT(first == (RfPageOnlinePlanV1 *)&page_graph_token);
 	UT_ASSERT(ClusterColdRecoveryCtrcPagePlanPrepare(info.cluster_tx_start, 0));
 	UT_ASSERT(ClusterColdRecoveryCtrcPagePlan(info.cluster_tx_start, &native_ctrc_work) == first);
-	UT_ASSERT_EQ(page_graph_builds, 1); UT_ASSERT_EQ(page_graph_budget, 1024 * 1024);
+	UT_ASSERT_EQ(page_graph_builds, 1); UT_ASSERT_EQ(page_graph_budget, 1024 * 1024 - sizeof(ClusterRecoveryCtrcReplaySetSourceV1));
 	UT_ASSERT_EQ(wal_inserts + stamp_writes, mutations);
 	UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_accepted_generation, 0);
 	UT_ASSERT_EQ(observation_scope_begins, 1); UT_ASSERT_EQ(observation_census_begins, 1);

@@ -136,6 +136,7 @@ static unsigned observation_physical_count, observation_fail_allocation;
 static bool observation_release_error, observation_early_read;
 static void observation_fixture_reset(void);
 static void page_graph_fixture_reset(void);
+static void page_source_fixture_reset(void);
 static void observation_scope_release(void);
 static bool observation_work_allocation(Size size, int flags);
 int cluster_cold_recovery_plan_memory = 65536;
@@ -2317,9 +2318,24 @@ UT_TEST(test_relmap_failure_revokes_original_episode_without_free_or_release)
 }
 
 #include "test_cluster_cold_ctrc_page_plan.inc"
+#include "test_cluster_cold_ctrc_page_sources.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_PAGE_SOURCES") != NULL) {
+		UT_PLAN(9);
+		UT_RUN(test_startup_page_sources_refuse_missing_or_changed_binding);
+		UT_RUN(test_startup_page_sources_reserve_vector_budget_before_graph);
+		UT_RUN(test_startup_page_sources_error_revokes_original_episode);
+		UT_RUN(test_startup_page_sources_revalidate_native_owner_on_repeat);
+		UT_RUN(test_startup_page_sources_bind_three_original_indexes_in_graph_order);
+		UT_RUN(test_startup_page_sources_reject_changed_full_value_and_original_cut);
+		UT_RUN(test_startup_page_sources_callback_retirement_preserves_pointer_lifetime);
+		UT_RUN(test_startup_page_sources_failure_before_allocation_keeps_original_debt);
+		UT_RUN(test_startup_page_sources_repeat_error_revokes_without_early_release);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
+
 	if (getenv("PGRAC_PRE2_TEST_STARTUP_PAGE_PLAN") != NULL) {
 		UT_PLAN(5);
 	UT_RUN(test_actual_startup_prepares_original_page_graph_before_service);
@@ -2366,7 +2382,17 @@ int main(void)
 		UT_RUN(test_ctrc_pages_native_error_retires_cursor_before_original_scope);
 		reset(); UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(149);
+	UT_PLAN(158);
+	UT_RUN(test_startup_page_sources_bind_three_original_indexes_in_graph_order);
+	UT_RUN(test_startup_page_sources_reject_changed_full_value_and_original_cut);
+	UT_RUN(test_startup_page_sources_callback_retirement_preserves_pointer_lifetime);
+	UT_RUN(test_startup_page_sources_failure_before_allocation_keeps_original_debt);
+	UT_RUN(test_startup_page_sources_repeat_error_revokes_without_early_release);
+
+	UT_RUN(test_startup_page_sources_refuse_missing_or_changed_binding);
+	UT_RUN(test_startup_page_sources_reserve_vector_budget_before_graph);
+	UT_RUN(test_startup_page_sources_error_revokes_original_episode);
+	UT_RUN(test_startup_page_sources_revalidate_native_owner_on_repeat);
 	UT_RUN(test_actual_startup_prepares_original_page_graph_before_service);
 	UT_RUN(test_startup_page_graph_is_original_bounded_and_never_rebuilt);
 	UT_RUN(test_startup_page_graph_preconditions_leave_original_custody);

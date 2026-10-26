@@ -10411,3 +10411,6 @@ test_cluster_recovery_ctrc_record: test_cluster_recovery_ctrc_record.c unit_test
 # Original Startup PAGE graph preparation and complete census wrapper.
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_page_plan.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_census_page_plan.inc
+
+# Original Startup full-generation PAGE source binding.
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_page_sources.inc

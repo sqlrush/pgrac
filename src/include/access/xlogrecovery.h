@@ -227,7 +227,8 @@ extern bool ClusterColdRecoveryCtrcReplaysAcquire(const struct ClusterRecoverySt
  * all-generation graph on the same Start; callbacks revalidate original full
  * work/manifest/scope/actual holders before publication. Zero budget only
  * revalidates an existing graph; nonzero budget is additional private storage,
- * capped at the existing PAGE plan limit. Entered failure/ERROR revokes this
+ * capped at the existing PAGE plan limit, including the complete native
+ * generation vector reserved before the graph. Entered failure/ERROR revokes this
  * episode and retains original cleanup/debt. Destroy before census/scope.
  * Getter repeats original full validation and borrows immutable Start storage.
  * NULL Start is the clean-start no-op; no mutation, completion or release. */
@@ -236,6 +237,15 @@ extern bool ClusterColdRecoveryCtrcPagePlanPrepare(const struct ClusterRecoveryS
 	Size memory_budget);
 extern const struct RfPageOnlinePlanV1 *ClusterColdRecoveryCtrcPagePlan(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work);
+/* Original complete generation vector in the SAME sealed graph's participant
+ * order. input indexes remain distinct. Count must equal the entire original
+ * selected set. Revalidates the exact Start/work/full observation/native IR
+ * holders and source cuts; borrows immutable storage until original cleanup.
+ * Call before PAGE/content locks. No new scope, I/O cut, grant or completion. */
+struct ClusterRecoveryCtrcReplaySetSourceV1;
+extern const struct ClusterRecoveryCtrcReplaySetSourceV1 *ClusterColdRecoveryCtrcPageSources(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
+	uint32 participant_count);
 /* First bounded observation refusal, valid only while original Start lives. */
 extern const char *ClusterColdRecoveryCtrcObservationRefusal(
 	const struct ClusterRecoveryStartV1 *start);

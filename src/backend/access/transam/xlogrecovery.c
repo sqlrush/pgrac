@@ -714,6 +714,8 @@ struct ClusterRecoveryStartV1 {
 	bool ctrc_observation_started, ctrc_observation_complete;
 	bool ctrc_page_plan_started;
 	RfPageOnlinePlanV1 *ctrc_page_plan;
+	ClusterRecoveryCtrcReplaySetSourceV1 *ctrc_page_sources;
+	uint32 ctrc_page_source_count;
 	const ClusterColdCtrcWorkV1 *ctrc_observation_work;
 	ClusterColdCtrcWorkV1 *ctrc_observation_work_copy;
 	Size ctrc_observation_work_bytes;
@@ -737,8 +739,14 @@ static bool cluster_recovery_cold_callback_registered;
 static void
 cluster_recovery_cold_observation_close(struct ClusterRecoveryStartV1 *start)
 {
+	ClusterRecoveryCtrcReplaySetSourceV1 *page_sources = start->ctrc_page_sources;
+
 	start->ctrc_observation_complete = false;
+	/* Retire borrowed source storage before any dependent callback. */
+	start->ctrc_page_sources = NULL;
+	start->ctrc_page_source_count = 0;
 	rf_page_online_plan_destroy_v1(&start->ctrc_page_plan);
+	if (page_sources != NULL) pfree(page_sources);
 	start->ctrc_pages = NULL;
 	start->ctrc_page_wal_count = 0;
 	start->ctrc_wal_source_count = 0;
@@ -1360,6 +1368,68 @@ cluster_recovery_cold_page_plan_refuse(struct ClusterRecoveryStartV1 *start,
 	/* Original ResourceOwner still owns the graph/census/IR/WALR debt. */
 }
 
+/* Full graph order is distinct from original input order. Every source must
+ * retain its exact native generation and canonical physical cut. Calls may
+ * retire the published vector; copy a row first and re-locate Start before
+ * dereferencing the next borrowed byte. Candidate storage is still private. */
+static bool
+cluster_recovery_cold_page_sources_current(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, struct ClusterWalInputsV1 *scope,
+	const RfPageOnlinePlanV1 *plan, const ClusterRecoveryCtrcReplaySetSourceV1 *sources,
+	uint32 count)
+{
+	bool seen[RF_PAGE_STABLE_MAX_PARTICIPANTS] = {false};
+	bool published;
+	ClusterWalSourceRef extra;
+
+	if (!cluster_recovery_cold_page_plan_current(start, work, scope)
+		|| plan == NULL || sources == NULL || count == 0
+		|| count > RF_PAGE_STABLE_MAX_PARTICIPANTS || count != start->ctrc_wal_source_count
+		|| cluster_wal_inputs_count_v1(scope) != count
+		|| !cluster_recovery_cold_page_plan_current(start, work, scope))
+		return false;
+	published = sources == start->ctrc_page_sources;
+	for (uint32 i = 0; i < count; i++) {
+		ClusterRecoveryCtrcReplaySetSourceV1 source;
+		ClusterRecoveryWalSourceObservationV1 observed;
+		ClusterWalSourceRef bound;
+
+		if (!cluster_recovery_cold_page_plan_current(start, work, scope)
+			|| (published && (start->ctrc_page_sources != sources
+				|| start->ctrc_page_source_count != count || start->ctrc_page_plan != plan)))
+			return false;
+		memcpy(&source, &sources[i], sizeof(source));
+		if (!cluster_wal_inputs_ctrc_replays_source_current_v1(&source)
+			|| !cluster_recovery_cold_page_plan_current(start, work, scope)
+			|| (published && (start->ctrc_page_sources != sources
+				|| start->ctrc_page_source_count != count || start->ctrc_page_plan != plan))
+			|| !rf_page_online_plan_source_v1(plan, i, &bound)
+			|| !cluster_recovery_census_wal_source_at_v1(start->ctrc_observation_census,
+				i, &observed)
+			|| !cluster_recovery_cold_page_plan_current(start, work, scope)
+			|| (published && (start->ctrc_page_sources != sources
+				|| start->ctrc_page_source_count != count || start->ctrc_page_plan != plan)))
+			return false;
+		if (source.scope != scope || source.generation_count != count
+			|| source.generation_index >= count || seen[source.generation_index]
+			|| observed.source_index != i
+			|| memcmp(&bound, &observed.source, sizeof(bound)) != 0
+			|| memcmp(&bound, &source.generation.source, sizeof(bound)) != 0
+			|| observed.cut.failed_thread != bound.claim.identity.origin_thread_id
+			|| observed.cut.origin_owner_incarnation != bound.claim.identity.origin_owner_incarnation
+			|| observed.cut.timeline_id != bound.timeline
+			|| observed.cut.flags != source.generation_flags
+			|| observed.cut.scan_begin_inclusive != source.generation_begin
+			|| observed.cut.scan_end_exclusive != source.generation_end
+			|| memcmp(&source, &sources[i], sizeof(source)) != 0)
+			return false;
+		seen[source.generation_index] = true;
+	}
+	/* A prefix of a larger sealed graph is never complete membership. */
+	return !rf_page_online_plan_source_v1(plan, count, &extra)
+		&& cluster_recovery_cold_page_plan_current(start, work, scope);
+}
+
 bool
 ClusterColdRecoveryCtrcPagePlanPrepare(const struct ClusterRecoveryStartV1 *start,
 	Size memory_budget)
@@ -1368,13 +1438,17 @@ ClusterColdRecoveryCtrcPagePlanPrepare(const struct ClusterRecoveryStartV1 *star
 	const ClusterColdCtrcWorkV1 *work;
 	struct ClusterWalInputsV1 *scope;
 	RfPageOnlinePlanV1 *volatile candidate = NULL;
-	bool ready = false;
+	ClusterRecoveryCtrcReplaySetSourceV1 *volatile sources = NULL;
+	Size budget, source_bytes;
+	uint32 count;
+	bool existing, ready = false;
 
 	if (start == NULL)
 		return true;
 	if (!cluster_recovery_cold_ctrc_replays_actor() || start != cluster_recovery_cold_start
 		|| !start->ctrc_observation_complete
-		|| (start->ctrc_page_plan_started && start->ctrc_page_plan == NULL)
+		|| (start->ctrc_page_plan_started && (start->ctrc_page_plan == NULL
+			|| start->ctrc_page_sources == NULL || start->ctrc_page_source_count == 0))
 		|| (!start->ctrc_page_plan_started && memory_budget == 0))
 		return false;
 	state = cluster_recovery_cold_start;
@@ -1384,32 +1458,103 @@ ClusterColdRecoveryCtrcPagePlanPrepare(const struct ClusterRecoveryStartV1 *star
 		|| !ClusterColdRecoveryCtrcObserve(start, 0)
 		|| !cluster_recovery_cold_page_plan_current(start, work, scope))
 		return false;
-	if (state->ctrc_page_plan_started)
-		return state->ctrc_page_plan != NULL;
+	existing = state->ctrc_page_plan_started;
+	count = state->ctrc_wal_source_count;
+	budget = Min(memory_budget, (Size)RF_PAGE_ONLINE_PLAN_MAX_BYTES);
+	source_bytes = count <= RF_PAGE_STABLE_MAX_PARTICIPANTS
+		? (Size)count * sizeof(*sources) : 0;
 	state->ctrc_page_plan_started = true;
 	PG_TRY();
 	{
-		ClusterRecoveryPagePlanBuildV1 built = cluster_recovery_census_page_plan_v1(
-			state->ctrc_observation_census, Min(memory_budget, (Size)RF_PAGE_ONLINE_PLAN_MAX_BYTES));
-		candidate = built.plan;
-		/* Re-locate original owners after any callback before borrowing scope,
-		 * work or graph. The factory never supplies native mutation authority. */
-		if (built.detail == RF_PAGE_PROOF_DETAIL_OK && candidate != NULL
-			&& cluster_recovery_cold_page_plan_current(start, work, scope)
-			&& ClusterColdRecoveryCtrcObserve(start, 0)
-			&& cluster_recovery_cold_page_plan_current(start, work, scope)) {
-			state->ctrc_page_plan = candidate;
-			candidate = NULL;
-			ready = true;
-		} else
-			cluster_recovery_cold_page_plan_refuse(state,
-				built.detail == RF_PAGE_PROOF_DETAIL_OK ? RF_PAGE_PROOF_DETAIL_ROOT_STALE : built.detail);
+		if (existing) {
+			ready = cluster_recovery_cold_page_sources_current(start, work, scope,
+				state->ctrc_page_plan, state->ctrc_page_sources, state->ctrc_page_source_count);
+			if (!ready)
+				cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_ROOT_STALE);
+		} else if (count == 0 || count > RF_PAGE_STABLE_MAX_PARTICIPANTS
+			|| source_bytes >= budget)
+			cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_CAPACITY);
+		else if (cluster_wal_inputs_count_v1(scope) != count
+			|| !cluster_recovery_cold_page_plan_current(start, work, scope))
+			cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_PARTICIPANT_MISSING);
+		else {
+			ClusterRecoveryPagePlanBuildV1 built;
+			RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_OOM;
+
+			/* Reserve the entire vector before the graph's own allocation.
+			 * No second budget or refreshed source round is introduced. */
+			sources = MemoryContextAllocExtended(TopMemoryContext, source_bytes,
+				MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+			if (sources != NULL) {
+				built = cluster_recovery_census_page_plan_v1(
+					state->ctrc_observation_census, budget - source_bytes);
+				candidate = built.plan;
+				detail = built.detail;
+				if (detail == RF_PAGE_PROOF_DETAIL_OK && candidate == NULL)
+					detail = RF_PAGE_PROOF_DETAIL_INTERNAL;
+			}
+			if (detail == RF_PAGE_PROOF_DETAIL_OK
+				&& cluster_recovery_cold_page_plan_current(start, work, scope)
+				&& cluster_wal_inputs_count_v1(scope) == count) {
+				bool seen[RF_PAGE_STABLE_MAX_PARTICIPANTS] = {false};
+
+				for (uint32 j = 0; j < count; j++) {
+					ClusterRecoveryCtrcReplaySetSourceV1 source;
+					uint32 match = count;
+
+					if (!cluster_recovery_cold_page_plan_current(start, work, scope)) {
+						detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE; break;
+					}
+					source = cluster_wal_inputs_ctrc_generation_v1(scope, j);
+					if (!cluster_recovery_cold_page_plan_current(start, work, scope)
+						|| source.scope != scope || source.generation_count != count
+						|| source.generation_index != j) {
+						detail = RF_PAGE_PROOF_DETAIL_PARTICIPANT_MISSING; break;
+					}
+					for (uint32 i = 0; i < count; i++) {
+						ClusterWalSourceRef bound;
+
+						if (!rf_page_online_plan_source_v1(candidate, i, &bound)) {
+							detail = RF_PAGE_PROOF_DETAIL_SOURCE_GAP; break;
+						}
+						if (memcmp(&bound, &source.generation.source, sizeof(bound)) != 0)
+							continue;
+						if (match != count) {
+							detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH; break;
+						}
+						match = i;
+					}
+					if (detail != RF_PAGE_PROOF_DETAIL_OK) break;
+					if (match == count || seen[match]) {
+						detail = RF_PAGE_PROOF_DETAIL_PARTICIPANT_MISSING; break;
+					}
+					memcpy(&sources[match], &source, sizeof(source));
+					seen[match] = true;
+				}
+			} else if (detail == RF_PAGE_PROOF_DETAIL_OK)
+				detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+			if (detail == RF_PAGE_PROOF_DETAIL_OK
+				&& cluster_recovery_cold_page_sources_current(start, work, scope,
+					candidate, sources, count)
+				&& ClusterColdRecoveryCtrcObserve(start, 0)
+				&& cluster_recovery_cold_page_sources_current(start, work, scope,
+					candidate, sources, count)) {
+				state->ctrc_page_plan = candidate;
+				state->ctrc_page_sources = sources;
+				state->ctrc_page_source_count = count;
+				candidate = NULL; sources = NULL;
+				ready = true;
+			} else
+				cluster_recovery_cold_page_plan_refuse(state,
+					detail == RF_PAGE_PROOF_DETAIL_OK ? RF_PAGE_PROOF_DETAIL_ROOT_STALE : detail);
+		}
 	}
 	PG_CATCH();
 	{
 		RfPageOnlinePlanV1 *discard = candidate;
 		candidate = NULL;
 		rf_page_online_plan_destroy_v1(&discard);
+		if (sources != NULL) { pfree(sources); sources = NULL; }
 		cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_INTERNAL);
 		PG_RE_THROW();
 	}
@@ -1418,6 +1563,7 @@ ClusterColdRecoveryCtrcPagePlanPrepare(const struct ClusterRecoveryStartV1 *star
 		RfPageOnlinePlanV1 *discard = candidate;
 		rf_page_online_plan_destroy_v1(&discard);
 	}
+	if (sources != NULL) pfree(sources);
 	return ready;
 }
 
@@ -1429,6 +1575,17 @@ ClusterColdRecoveryCtrcPagePlan(const struct ClusterRecoveryStartV1 *start,
 		|| work != start->ctrc_observation_work)
 		return NULL;
 	return ClusterColdRecoveryCtrcPagePlanPrepare(start, 0) ? start->ctrc_page_plan : NULL;
+}
+
+const struct ClusterRecoveryCtrcReplaySetSourceV1 *
+ClusterColdRecoveryCtrcPageSources(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 participant_count)
+{
+	if (start == NULL || start != cluster_recovery_cold_start
+		|| work != start->ctrc_observation_work || participant_count == 0
+		|| participant_count != start->ctrc_page_source_count)
+		return NULL;
+	return ClusterColdRecoveryCtrcPagePlanPrepare(start, 0) ? start->ctrc_page_sources : NULL;
 }
 
 const char *
