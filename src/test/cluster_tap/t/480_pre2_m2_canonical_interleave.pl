@@ -158,7 +158,7 @@ sub record_cell {
  my $name=lc("$cell->{kind}-$cell->{caller}");
  if(defined($cell->{xid}) && defined($cell->{log_offsets})) {
   my $log=logs_since(\@nodes,$cell->{log_offsets});
-  my @trace=grep { /TX_CANONICAL / && /xid=$cell->{xid} / } split /\n/,$log;
+  my @trace=grep { /(?:TX_CANONICAL|M2_PROBE) / && /xid=$cell->{xid} / } split /\n/,$log;
   save_json("$name-caller-trace",{context=>$cell,rows=>\@trace,authoritative=>JSON::PP::false});
  }
  save_json("$name-execution",{context=>$cell,%$execution});
@@ -229,6 +229,8 @@ run_cases(\@matrix,sub {
    $r->query_until(qr/READER_SENT/,"\\echo READER_SENT\n$sql;\n");
   }
   my $result=json_result($r->query_safe("SELECT 'READER_DONE'"));
+  $cell->{probe_results}{initial}=$result;
+  save_json("context-$number",$cell);
   $w->query_safe("SELECT 'WRITER_DONE'");
   if($kind eq 'A1' && !$remote) {
    $hits=$r->query_safe("SELECT hits||'|'||fault_type||'|'||param FROM pg_stat_cluster_injections WHERE name='cluster-tx-canonical-copy'");
@@ -244,6 +246,7 @@ run_cases(\@matrix,sub {
    $_->{native_binding}{xid} == $xid } @{$after->{events}};
   my $scn=@terminal == 1 ? 0+$terminal[0]{tt_slot}{commit_scn} : 0;
   my $fresh=json_result($r->query_safe($sql));
+  $cell->{probe_results}{fresh}=$fresh;
   my $expected=$kind eq 'A1' ? ($caller eq 'sample_canonical' ? 21 : 20) : 10;
   my @values=map { $_->safe_psql('postgres',"SELECT id,v FROM $table ORDER BY id") } @active;
   my $case={kind=>$kind,caller=>$caller,xid=>$xid,key=>$key,

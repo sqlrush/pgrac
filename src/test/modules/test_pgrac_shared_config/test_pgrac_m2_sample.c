@@ -63,64 +63,83 @@ sample_physical(TransactionId xid, ClusterTTStatusResult *result)
 	volatile bool started = false;
 	bool sampled = false;
 	bool physical_active = false;
+	const char *stage = "origin";
 
 	if (cluster_xid_origin_slot(xid) != cluster_node_id)
-		return false;
+		goto done;
 	cluster_runtime_visibility_ensure_exit_hooks();
 	cluster_undo_block0_current_ensure_exit_hooks();
 	PG_TRY();
 	{
+		stage = "admission";
 		if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
 											  CLUSTER_SEMANTIC_TARGET_SIDE, &admission)
-				== CLUSTER_SEMANTIC_ADMISSION_OK
-			&& cluster_tt_slot_current_owner_by_xid(cluster_node_id, xid, &owner)) {
-			logical.owner_instance = (uint8)(cluster_node_id + 1);
-			logical.segment_id = owner.segment_id;
-			locator.segment_id = owner.segment_id;
-			locator.xid = xid;
-			locator.slot_offset = owner.slot_offset;
-			locator.wrap = owner.wrap;
-			if (cluster_semantic_activation_resolve_shared_undo_root(
-					&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance,
-					logical.segment_id, &root)) {
-				started = true;
-				step = cluster_undo_block0_current_acquire_begin_admitted(
-					&logical, CLUSTER_UNDO_BLOCK0_SCUR, 0, &admission, &guard, &failure);
-				while (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
-					CHECK_FOR_INTERRUPTS();
-					step = cluster_undo_block0_current_acquire_poll(&guard, &failure);
-					if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
-						&& !cluster_undo_block0_current_wait_reply(
-							&guard, CLUSTER_UNDO_BLOCK0_WAIT_RUNTIME_VIS_ACQUIRE))
-						pg_usleep(1000L);
-				}
-				if (step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD) {
-					sampled = cluster_runtime_visibility_physical_locator_sample_held(
-						&locator, &admission, &guard, &root, &key, result, &physical_active, NULL);
-					step = cluster_undo_block0_current_release_begin(&guard, &failure);
+			== CLUSTER_SEMANTIC_ADMISSION_OK) {
+			stage = "owner";
+			if (cluster_tt_slot_current_owner_by_xid(cluster_node_id, xid, &owner)) {
+				logical.owner_instance = (uint8)(cluster_node_id + 1);
+				logical.segment_id = owner.segment_id;
+				locator.segment_id = owner.segment_id;
+				locator.xid = xid;
+				locator.slot_offset = owner.slot_offset;
+				locator.wrap = owner.wrap;
+				stage = "root";
+				if (cluster_semantic_activation_resolve_shared_undo_root(
+						&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance,
+						logical.segment_id, &root)) {
+					started = true;
+					stage = "acquire";
+					step = cluster_undo_block0_current_acquire_begin_admitted(
+						&logical, CLUSTER_UNDO_BLOCK0_SCUR, 0, &admission, &guard, &failure);
 					while (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
 						CHECK_FOR_INTERRUPTS();
-						step = cluster_undo_block0_current_release_poll(&guard, &failure);
+						step = cluster_undo_block0_current_acquire_poll(&guard, &failure);
 						if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
 							&& !cluster_undo_block0_current_wait_reply(
-								&guard, CLUSTER_UNDO_BLOCK0_WAIT_RUNTIME_VIS_RELEASE))
+								&guard, CLUSTER_UNDO_BLOCK0_WAIT_RUNTIME_VIS_ACQUIRE))
 							pg_usleep(1000L);
 					}
-					sampled = sampled && step == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED;
+					if (step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD) {
+						stage = "provider";
+						sampled = cluster_runtime_visibility_physical_locator_sample_held(
+							&locator, &admission, &guard, &root, &key, result, &physical_active,
+							NULL);
+						if (sampled)
+							stage = "release";
+						step = cluster_undo_block0_current_release_begin(&guard, &failure);
+						while (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
+							CHECK_FOR_INTERRUPTS();
+							step = cluster_undo_block0_current_release_poll(&guard, &failure);
+							if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
+								&& !cluster_undo_block0_current_wait_reply(
+									&guard, CLUSTER_UNDO_BLOCK0_WAIT_RUNTIME_VIS_RELEASE))
+								pg_usleep(1000L);
+						}
+						sampled = sampled && step == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED;
+					}
+					/* Release can wait. Keep the identity/root/admission fences. */
+					if (sampled) {
+						stage = "final_owner";
+						sampled = cluster_tt_slot_current_owner_by_xid(cluster_node_id, xid,
+																	   &final_owner)
+								  && final_owner.segment_id == owner.segment_id
+								  && final_owner.xid == owner.xid && final_owner.wrap == owner.wrap
+								  && final_owner.slot_offset == owner.slot_offset;
+					}
+					if (sampled) {
+						stage = "final_root";
+						sampled = cluster_semantic_activation_resolve_shared_undo_root(
+									  &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+									  logical.owner_instance, logical.segment_id, &final_root)
+								  && root.intent == final_root.intent
+								  && root.root_id == final_root.root_id
+								  && root.root_generation == final_root.root_generation;
+					}
+					if (sampled) {
+						stage = "final_admission";
+						sampled = cluster_semantic_activation_recheck(&admission);
+					}
 				}
-				/* Release can wait. Keep the identity/root/admission fences. */
-				sampled
-					= sampled
-					  && cluster_tt_slot_current_owner_by_xid(cluster_node_id, xid, &final_owner)
-					  && final_owner.segment_id == owner.segment_id && final_owner.xid == owner.xid
-					  && final_owner.wrap == owner.wrap
-					  && final_owner.slot_offset == owner.slot_offset
-					  && cluster_semantic_activation_resolve_shared_undo_root(
-						  &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance,
-						  logical.segment_id, &final_root)
-					  && root.intent == final_root.intent && root.root_id == final_root.root_id
-					  && root.root_generation == final_root.root_generation
-					  && cluster_semantic_activation_recheck(&admission);
 			}
 		}
 	}
@@ -132,6 +151,12 @@ sample_physical(TransactionId xid, ClusterTTStatusResult *result)
 			cluster_semantic_activation_leave(&admission);
 	}
 	PG_END_TRY();
+	if (sampled)
+		stage = "complete";
+done:
+	/* Probe-local diagnostics, never a published status or provider-entry proof. */
+	elog(LOG, "M2_PROBE path=physical xid=%u stage=%s sampled=%d authoritative=false", xid, stage,
+		 sampled);
 	return sampled;
 }
 
@@ -180,6 +205,7 @@ test_pgrac_m2_sample(PG_FUNCTION_ARGS)
 		ClusterTxOutcome outcome = CLUSTER_TX_UNKNOWN;
 		SCN scn = InvalidScn;
 		bool sampled = false;
+		bool locator_found = false;
 		StringInfoData out;
 
 		if (strcmp(path, "owner") == 0)
@@ -187,7 +213,8 @@ test_pgrac_m2_sample(PG_FUNCTION_ARGS)
 		else if (strcmp(path, "physical") == 0)
 			sampled = sample_physical(xid, &result);
 		else if (strcmp(path, "origin") == 0) {
-			if (page_locator(PG_GETARG_OID(1), PG_GETARG_INT32(2), xid, &locator)) {
+			locator_found = page_locator(PG_GETARG_OID(1), PG_GETARG_INT32(2), xid, &locator);
+			if (locator_found) {
 				outcome = cluster_tx_resolve_exact(&locator, CLUSTER_TX_RESOLVE_VISIBILITY,
 												   &resolution, &reason);
 				if (outcome != CLUSTER_TX_UNKNOWN)
@@ -205,6 +232,12 @@ test_pgrac_m2_sample(PG_FUNCTION_ARGS)
 				outcome = CLUSTER_TX_ABORTED;
 			scn = result.commit_scn;
 		}
+		elog(LOG,
+			 "M2_PROBE path=%s xid=%u phase=RETURN pid=%d sampled=%d outcome=%d reason=%d "
+			 "locator_found=%d locator_uba0=" UINT64_FORMAT " locator_uba1=" UINT64_FORMAT
+			 " locator_wrap=%u authoritative=false",
+			 path, xid, MyProcPid, sampled, outcome, reason, locator_found, locator.uba.raw[0],
+			 locator.uba.raw[1], locator.tt_wrap);
 		initStringInfo(&out);
 		appendStringInfo(&out,
 						 "{\"outcome\":%d,\"scn\":" UINT64_FORMAT

@@ -93,7 +93,7 @@ TESTS = test_cluster_relmap_lock test_cluster_vm_read_visibility test_cluster_he
         test_cluster_undo_format \
         test_cluster_recovery_c0_plan test_cluster_checkpoint_stamp test_cluster_recovery_stamp test_cluster_recovery_tt_record test_cluster_recovery_ctrc_record test_cluster_d0_native_reader test_cluster_recovery_tt_io \
 		test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_undo_block0 test_cluster_undo_block0_current test_cluster_undo_smgr_publication test_cluster_terminal_ref_census test_cluster_cr test_cluster_cr_cache test_cluster_cr_shared_route test_cluster_cr_key test_cluster_cr_pool test_cluster_cr_lifecycle test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_resolver_cache test_cluster_cr_coordinator test_cluster_r4_static_model test_cluster_r4_tx_locator test_cluster_r4_tx_outcome test_cluster_r4_tx_enqueue test_cluster_r4_wire_codec test_cluster_r4_route_policy test_cluster_r4_slot_machine test_cluster_r4_lms_controls test_cluster_r4_slot_reservation test_cluster_r4_observe test_cluster_r4_cr_walk test_cluster_r4_multi_subx_2pc test_cluster_r4_activation_record test_cluster_r4_activation_fsm test_cluster_r4_lock_order test_cluster_r4_scratch_resolver test_cluster_tt_durable test_cluster_terminal_authority test_cluster_sf_dep \
-        test_cluster_r4_itl_capacity test_cluster_heap_itl_retry \
+        test_cluster_r4_itl_capacity test_cluster_heap_itl_retry test_cluster_m2_sample_diagnostic \
         test_cluster_retention test_cluster_undo_cleaner test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc \
         test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_undo_extent test_cluster_undo_extent_claim \
         test_cluster_wal_thread test_cluster_wal_checkpoint_sample test_cluster_wal_retained_cut test_cluster_wal_retained_cut_records test_cluster_wal_restart_read test_cluster_wal_writer test_cluster_wal_cut test_cluster_pi_data test_cluster_thread_tail test_cluster_wal_state test_cluster_wal_state_rmw test_cluster_recovery_plan \
@@ -5383,7 +5383,7 @@ test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-$(filter-out test_cluster_cold_tx_start test_cluster_postmaster_lwlock test_cluster_phase_publication test_cluster_checkpoint_cleanup test_cluster_checkpoint_wait_budget test_cluster_checkpoint_error test_cluster_sync_error test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse test_cluster_abort_writer test_cluster_storage_abort_writeback test_cluster_heap_hot_full_trace test_cluster_gcs_read_image_hops test_cluster_gcs_read_image_trace,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
+$(filter-out test_cluster_m2_sample_diagnostic test_cluster_cold_tx_start test_cluster_postmaster_lwlock test_cluster_phase_publication test_cluster_checkpoint_cleanup test_cluster_checkpoint_wait_budget test_cluster_checkpoint_error test_cluster_sync_error test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse test_cluster_abort_writer test_cluster_storage_abort_writeback test_cluster_heap_hot_full_trace test_cluster_gcs_read_image_hops test_cluster_gcs_read_image_trace,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
 
 # Native CR metadata checks are inline in the shared descriptor definition.
@@ -7465,6 +7465,16 @@ test_cluster_r4_static_model: test_cluster_r4_static_model.c unit_test.h
 # resolver entry points.  This links the production object directly.
 CLUSTER_TX_RESOLVE_O = $(top_builddir)/src/backend/cluster/cluster_tx_resolve.o
 CLUSTER_R4_TX_LOCATOR_UBA_O = $(top_builddir)/src/backend/cluster/cluster_uba.o
+test_cluster_m2_sample_diagnostic.inc: $(top_srcdir)/src/test/modules/test_pgrac_shared_config/test_pgrac_m2_sample.c Makefile
+	awk '/^sample_physical\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_m2_sample_diagnostic: test_cluster_m2_sample_diagnostic.c \
+		test_cluster_m2_sample_diagnostic.inc unit_test.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+
 test_cluster_r4_tx_locator: test_cluster_r4_tx_locator.c unit_test.h \
 		$(CLUSTER_TX_RESOLVE_O) $(CLUSTER_R4_TX_LOCATOR_UBA_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
