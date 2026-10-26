@@ -10169,8 +10169,12 @@ cluster_current_mx_stamp_published(ClusterCurrentMxStampPlan *plan)
 
 	if (plan == NULL || !plan->active)
 		return;
-	Assert(cluster_multixact_current_heap_publish_transition(
-		plan->stage, CMX_HEAP_EVENT_PUBLISH, &next_stage));
+	if (!cluster_multixact_current_heap_publish_transition(
+			plan->stage, CMX_HEAP_EVENT_PUBLISH, &next_stage))
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("invalid current MultiXact publication stage %d", plan->stage)));
+	Assert(next_stage == CMX_HEAP_STAGE_REFERENCE_PUBLISHED);
 	plan->stage = next_stage;
 	for (i = 0; i < plan->receipt_count; i++)
 		cluster_ctrc_note_publication_after_apply(&plan->handles[i], true);
