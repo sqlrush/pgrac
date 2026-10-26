@@ -12213,6 +12213,108 @@ recent_registration_case(bool batch, bool refuse)
 	census_full_layout_release(&runtime);
 }
 
+/* Replace the constructed completed cut with the original initializer,
+ * origin/participant publishers and every slice of the original worker pass.
+ * Source authentication, process scheduling, resolver and resident I/O leaves
+ * remain controlled; this does not create a production VACUUM caller. */
+static void
+full_source_then_recent_case(bool batch, bool late_receiver)
+{
+	QualifiedXminFixture f;
+	LVRelState v;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	CensusRuntimeAllocation runtime;
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcOriginReservation reservation;
+	ClusterCtrcReceiptHandle handle;
+	FullTransactionId full = FullTransactionIdFromEpochAndXid(1, 100);
+	uint32 grant;
+	uint64 total, passes = 1, expected_passes;
+
+	phase_setup(&f, &v, targets, batch);
+	census_runtime_initialize_requested = true;
+	if (!census_full_layout_setup(&runtime, 2)) { UT_ASSERT(false); return; }
+	key = census_key_for_full(&f.cohort.admission_fence, full);
+	UT_ASSERT_EQ(census_origin_reserve_from_backend(&key, full, &reservation),
+		CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	UT_ASSERT(original_census_origin_open_reserved(&reservation, &grant));
+	UT_ASSERT_EQ(census_participant_prepare_from_origin(&key, grant, &handle),
+		CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(handle.valid && FullTransactionIdEquals(handle.original_full_xid, full));
+	sampler_xids[0] = 152;
+	pg_atomic_write_u64(&sampler_slots[0].cluster_top_full_xid_atomic,
+		U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 152)));
+	total = runtime.capacity.origin_key_entries + runtime.capacity.participant_key_entries;
+	expected_passes = (total + CLUSTER_CTRC_ACTIVE_SCAN_SLICE - 1) / CLUSTER_CTRC_ACTIVE_SCAN_SLICE;
+	native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id - 1;
+	worker_original_sample_pass_fixture(&f.cohort);
+	while (pass_pending && passes <= expected_passes) { original_worker_sample_active_pass(); passes++; }
+	UT_ASSERT_EQ(passes, expected_passes); UT_ASSERT(!pass_pending);
+	UT_ASSERT_EQ(publisher_scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(publisher_scan.total_entries, total); UT_ASSERT_EQ(publisher_scan.next_index, total);
+	UT_ASSERT(!publisher_scan.lock_busy); UT_ASSERT_EQ(publisher_scan.unqualified_entries, 0);
+	UT_ASSERT_EQ(publisher_scan.unqualified_registration_generation, 1);
+	UT_ASSERT(FullTransactionIdEquals(publisher_scan.min_full, full));
+	UT_ASSERT_EQ(census_step_lock_acquires, total); UT_ASSERT_EQ(census_step_lock_releases, total);
+	UT_ASSERT_EQ(native_worker_shared.active_sample.sample_id, f.cohort.source_local_sample_id);
+	f.cohort.local_registration_cut = publisher_scan;
+	UT_ASSERT(cluster_ctrc_active_scan_registration_current(&f.cohort.local_registration_cut));
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	if (late_receiver)
+	{
+		uint64 known_index, late_index;
+
+		recent_registration_cut = publisher_scan;
+		recent_registration_key = key;
+		recent_registration_key.origin_node_id = 1;
+		recent_registration_key.owner_instance = 2;
+		recent_registration_key.segment_id = CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+		/* The late publication uses a different physical slot. Reusing slot0
+		 * would correctly refuse at the original participant owner guard. */
+		recent_registration_key.slot_offset = key.slot_offset + 1;
+		UT_ASSERT(original_participant_participant_index(&key, cluster_node_id, &known_index));
+		UT_ASSERT(original_participant_participant_index(&recent_registration_key, cluster_node_id, &late_index));
+		UT_ASSERT(known_index != late_index);
+		recent_registration_refused = false; recent_registration_calls = 0;
+		recent_pin_observer = recent_register_unknown_receiver;
+	}
+	backend_pin_count = 0;
+	relation_data.rd_isvalid = resume_allowed = true;
+	UT_ASSERT_EQ(phase_then_recent_native_owned(&f, &v), !late_receiver);
+	recent_pin_observer = NULL;
+	UT_ASSERT_EQ(phase_preflights, 1); UT_ASSERT_EQ(phase_rechecks, 1);
+	UT_ASSERT_EQ(phase_resolves, f.page.carrier_request_count);
+	UT_ASSERT_EQ(recent_pin_calls, 1); UT_ASSERT_EQ(recent_unpins, 1);
+	UT_ASSERT_EQ(conditional_resumes, !late_receiver); UT_ASSERT_EQ(conditional_unlocks, !late_receiver);
+	UT_ASSERT_EQ(inserts, !late_receiver); UT_ASSERT_EQ(flushes, !late_receiver);
+	UT_ASSERT_EQ(phase_finally_calls, 1); UT_ASSERT_EQ(phase_finally_debt, 1);
+	UT_ASSERT_EQ(phase_finally_pins, 0); UT_ASSERT(!phase_finally_owned_writer);
+	UT_ASSERT_EQ(backend_pin_count, 0);
+	UT_ASSERT(!recent_pin_held && !local_x && !resumed_writer);
+	UT_ASSERT(FullTransactionIdEquals(handle.participant->original_full_xid, full));
+	UT_ASSERT_EQ(handle.participant->receipt_count, 1);
+	if (late_receiver)
+	{
+		UT_ASSERT_EQ(recent_registration_calls, 1);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), 2);
+		UT_ASSERT(!cluster_ctrc_active_scan_registration_current(&publisher_scan));
+		UT_ASSERT_EQ(edges + dirties, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+	bounds_lifecycle_assert_empty(&f.admission);
+	census_full_layout_release(&runtime);
+}
+
+UT_TEST(test_full_original_source_reaches_pin_free_collector_and_recent_wal)
+{
+	for (unsigned batch = 0; batch < 2; batch++) full_source_then_recent_case(batch != 0, false);
+}
+
+UT_TEST(test_full_original_source_late_receiver_revokes_recent_wal)
+{
+	for (unsigned batch = 0; batch < 2; batch++) full_source_then_recent_case(batch != 0, true);
+}
+
 UT_TEST(test_recent_unknown_receiver_revokes_pin_free_proof_before_writer_or_wal)
 {
 	for (unsigned batch = 0; batch < 2; batch++) recent_registration_case(batch != 0, false);
@@ -12468,13 +12570,15 @@ UT_TEST(test_recent_xmin_share_lock_refusal_keeps_borrowed_pin_without_upgrade)
 int
 main(void)
 {
-	UT_PLAN(294);
+	UT_PLAN(296);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
 	UT_RUN(test_pin_free_phase_recent_errors_unwind_pin_before_original_owner_leave);
 	UT_RUN(test_recent_unknown_receiver_revokes_pin_free_proof_before_writer_or_wal);
 	UT_RUN(test_recent_refused_receiver_keeps_original_cut_and_native_continuation);
+	UT_RUN(test_full_original_source_reaches_pin_free_collector_and_recent_wal);
+	UT_RUN(test_full_original_source_late_receiver_revokes_recent_wal);
 	UT_RUN(test_recent_xmin_stale_registration_refuses_before_resident_pin);
 	UT_RUN(test_recent_xmin_success_preserves_preowned_pin_and_writer);
 	UT_RUN(test_recent_xmin_errors_keep_borrowed_pin_and_writer_scope);
