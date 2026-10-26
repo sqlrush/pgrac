@@ -1913,6 +1913,16 @@ cluster_gcs_block_invalidate_park_tick(void)
 {
 	test_lms_work();
 }
+void
+cluster_gcs_block_pending_s_tick(void)
+{
+	test_lms_work();
+}
+void
+cluster_gcs_block_first_fill_tick(void)
+{
+	test_lms_work();
+}
 long
 cluster_gcs_block_r4_tx_resolve_wait_timeout(long idle)
 {
@@ -2166,6 +2176,15 @@ void actual_data_shutdown(void);
 #define cluster_lms_data_plane_tick actual_data_tick
 #define cluster_lms_data_plane_shutdown actual_data_shutdown
 #include "../../backend/cluster/cluster_lms_data_plane.c"
+void
+cluster_ic_tier1_trace_connection(int elevel pg_attribute_unused(),
+								const char *phase pg_attribute_unused(), int32 peer pg_attribute_unused(),
+								int fd pg_attribute_unused(), int slot pg_attribute_unused(),
+								int connect_rc pg_attribute_unused(), int socket_error pg_attribute_unused(),
+								uint32 events pg_attribute_unused(), int64 age_us pg_attribute_unused())
+{
+	/* Connection observation cannot change this fixture's service duties. */
+}
 #undef cluster_lms_data_plane_startup
 #undef cluster_lms_data_plane_enabled
 #undef cluster_lms_data_plane_tick

@@ -223,6 +223,12 @@ extern bool cluster_ic_tier1_accept_one(int *out_peer_fd, int32 *out_peer_id);
  */
 extern bool cluster_ic_tier1_connect_one(int32 peer_id, int *out_peer_fd);
 
+/* Read-only connection evidence; socket_error is supplied by the existing
+ * syscall owner. A value of -1 means that no socket result was sampled. */
+extern void cluster_ic_tier1_trace_connection(int elevel, const char *phase, int32 peer_id,
+											int peer_fd, int anon_slot, int connect_rc,
+												int socket_error, uint32 events, int64 age_us);
+
 /*
  * Called when the in-progress connect socket becomes writeable.  Checks
  * SO_ERROR; on success sends HELLO + advances peer state to CONNECTING.

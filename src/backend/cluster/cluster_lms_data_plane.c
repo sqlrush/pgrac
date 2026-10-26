@@ -447,6 +447,11 @@ cluster_lms_data_plane_tick(long timeout_ms)
 					 || dp_track[pi].substate == LMS_DP_HELLO_WAIT)
 					&& dp_track[pi].connect_started_at > 0
 					&& now > dp_track[pi].connect_started_at + connect_to_us) {
+					cluster_ic_tier1_trace_connection(LOG,
+						dp_track[pi].substate == LMS_DP_CONNECT_PEND ? "CONNECT_PEND"
+						: dp_track[pi].substate == LMS_DP_HELLO_SENDING ? "HELLO_SENDING"
+						: "HELLO_WAIT", pi, dp_track[pi].fd, -1, -1, -1, 0,
+						now - dp_track[pi].connect_started_at);
 					cluster_ic_tier1_close_peer(pi, "data-plane connect timeout");
 					dp_track[pi].fd = -1;
 					dp_track[pi].substate = LMS_DP_DOWN;
@@ -556,6 +561,8 @@ cluster_lms_data_plane_tick(long timeout_ms)
 						continue;
 					}
 					dp_pending_fds[slot] = new_fd;
+					cluster_ic_tier1_trace_connection(DEBUG1, "accept", -1, new_fd, slot,
+														 -1, -1, ev[i].events, 0);
 					dp_wes_dirty = true;
 				}
 			} else if (tag >= 0 && tag < CLUSTER_MAX_NODES) {
@@ -564,6 +571,12 @@ cluster_lms_data_plane_tick(long timeout_ms)
 
 				if (peer_fd < 0)
 					continue;
+				if (dp_track[peer].substate != LMS_DP_CONNECTED)
+					cluster_ic_tier1_trace_connection(DEBUG1,
+						dp_track[peer].substate == LMS_DP_CONNECT_PEND ? "CONNECT_PEND"
+						: dp_track[peer].substate == LMS_DP_HELLO_SENDING ? "HELLO_SENDING"
+						: "HELLO_WAIT", peer, peer_fd, -1, -1, -1, ev[i].events,
+						GetCurrentTimestamp() - dp_track[peer].connect_started_at);
 
 				if (dp_track[peer].substate == LMS_DP_CONNECT_PEND
 					&& (ev[i].events & WL_SOCKET_WRITEABLE)) {
