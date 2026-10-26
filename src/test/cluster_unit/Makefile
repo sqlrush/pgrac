@@ -2064,6 +2064,19 @@ test_cluster_heap_freeze_pgproc_sample.inc: $(top_srcdir)/src/backend/storage/ip
 	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Original normal native exit and native XID predicates; no copied bodies.
+test_cluster_heap_freeze_pgproc_exit.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c \
+		$(top_srcdir)/src/backend/access/transam/transam.c $(top_srcdir)/src/backend/access/transam/varsup.c Makefile
+	@awk '/^MaintainLatestCompletedXid\(/ { print "static inline void"; emit=1; found++ } \
+	     /^ProcArrayEndTransaction\(/ { print "static void"; emit=1; found++ } \
+	     /^ProcArrayEndTransactionInternal\(/ { print "static inline void"; emit=1; found++ } \
+	     /^FullXidRelativeTo\(/ { print "static FullTransactionId"; emit=1; found++ } \
+	     /^TransactionId(Precedes|PrecedesOrEquals|FollowsOrEquals)\(/ { print "static bool"; emit=1; found++ } \
+	     /^AssertTransactionIdInAllowableRange\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 8 || done != 8 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
 # Original typed storage plus retained peer/H backend and local-source wrapper.
 test_cluster_heap_freeze_cohort_backend.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c Makefile
 	@awk '/^typedef struct ClusterUndoHorizonSlotShmem / { types=1; found++ } \
@@ -2314,6 +2327,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_freeze_worker_publisher.inc \
 		test_cluster_heap_freeze_worker_pass.inc \
 		test_cluster_heap_freeze_pgproc_types.inc test_cluster_heap_freeze_pgproc_sample.inc \
+		test_cluster_heap_freeze_pgproc_exit.inc \
 		test_cluster_heap_freeze_stripe_future.inc \
 		$(top_srcdir)/src/include/storage/proc.h $(top_srcdir)/src/include/access/transam.h \
 		test_cluster_heap_freeze_lease_current.inc \
@@ -5244,6 +5258,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_freeze_worker_pass.inc test_cluster_heap_freeze_worker_pass.inc.tmp
 	rm -f test_cluster_heap_freeze_pgproc_types.inc test_cluster_heap_freeze_pgproc_types.inc.tmp
 	rm -f test_cluster_heap_freeze_pgproc_sample.inc test_cluster_heap_freeze_pgproc_sample.inc.tmp
+	rm -f test_cluster_heap_freeze_pgproc_exit.inc test_cluster_heap_freeze_pgproc_exit.inc.tmp
 	rm -f test_cluster_heap_ctrc_types.inc test_cluster_heap_ctrc_types.inc.tmp test_cluster_heap_ctrc_begin.inc test_cluster_heap_ctrc_begin.inc.tmp
 	rm -f test_cluster_heap_ctrc_step.inc test_cluster_heap_ctrc_step.inc.tmp
 	rm -f test_cluster_heap_ctrc_origin.inc test_cluster_heap_ctrc_origin.inc.tmp
