@@ -19,6 +19,16 @@
 
 #define RESOURCE_X_WIRE_VERSION 1
 
+/* Complete ordinary acquisition intent, on the existing REQUEST/ASSERT pair.
+ * This is a request identity, never a master grant or native completion. */
+#define RESOURCE_X_ACQUIRE_WIRE_VERSION 3
+#define RESOURCE_X_ACQUIRE_V3_BYTES 160
+
+typedef enum ResourceXAcquirePath {
+	RESOURCE_X_ACQUIRE_FIRST_FILL = 1,
+	RESOURCE_X_ACQUIRE_RESIDENT = 2
+} ResourceXAcquirePath;
+
 #define RESOURCE_X_CONTROL_V1_BYTES 96
 #define RESOURCE_X_SHORT_V1_BYTES 152
 #define RESOURCE_X_PROOF_V1_BYTES 312
@@ -142,6 +152,20 @@ typedef struct ResourceXWireCommonV1 {
 } ResourceXWireCommonV1;
 
 typedef ResourceXWireCommonV1 ResourceXControlV1;
+
+typedef struct ResourceXAcquireRequestV3 {
+	ResourceXWireCommonV1 common;
+	uint8 requester_incarnation[8];
+	uint8 backend_generation[8];
+	uint8 base_generation[8];
+	uint8 reservation_token[8];
+	uint8 cluster_epoch[8];
+	uint8 r4_generation[8];
+	uint8 backend_id[4];
+	uint8 buffer_id[4];
+	uint8 path;
+	uint8 zero_reserved[7];
+} ResourceXAcquireRequestV3;
 
 typedef struct ResourceXLocalProofDeclarationV1 {
 	ResourceXWireCommonV1 common;
@@ -327,10 +351,23 @@ typedef struct ResourceXDecodedInstallSettlement {
 	uint32 settlement_flags;
 } ResourceXDecodedInstallSettlement;
 
+typedef struct ResourceXDecodedAcquireIntent {
+	uint64 requester_incarnation;
+	uint64 backend_generation;
+	uint64 base_generation;
+	uint64 reservation_token;
+	uint64 cluster_epoch;
+	uint64 r4_generation;
+	int32 backend_id;
+	int32 buffer_id;
+	uint8 path;
+} ResourceXDecodedAcquireIntent;
+
 typedef struct ResourceXDecodedFrame {
 	ResourceXWireKind kind;
 	uint16 payload_bytes;
 	bool blocked_has_remote_proof;
+	bool has_acquire_intent; /* Only exact V3 REQUEST/ASSERT, not legacy ASSERT. */
 	ResourceXDecodedCommon common;
 	union {
 		ResourceXDecodedLocalProof local_proof;
@@ -338,6 +375,7 @@ typedef struct ResourceXDecodedFrame {
 		ResourceXDecodedAuthorityGrant authority_grant;
 		ResourceXDecodedImageEnvelope image_envelope;
 		ResourceXDecodedInstallSettlement install_settlement;
+		ResourceXDecodedAcquireIntent acquire_intent;
 	} body;
 } ResourceXDecodedFrame;
 
@@ -345,6 +383,14 @@ StaticAssertDecl(BLCKSZ == RESOURCE_X_PAGE_BYTES,
 				 "Resource-X V1 requires the current 8192-byte page ABI");
 StaticAssertDecl(sizeof(ResourceXWireCommonV1) == RESOURCE_X_CONTROL_V1_BYTES,
 				 "Resource-X common V1 wire size changed");
+StaticAssertDecl(sizeof(ResourceXAcquireRequestV3) == RESOURCE_X_ACQUIRE_V3_BYTES,
+				 "Resource-X acquisition V3 wire size changed");
+StaticAssertDecl(offsetof(ResourceXAcquireRequestV3, requester_incarnation) == 96
+					 && offsetof(ResourceXAcquireRequestV3, reservation_token) == 120
+					 && offsetof(ResourceXAcquireRequestV3, r4_generation) == 136
+					 && offsetof(ResourceXAcquireRequestV3, path) == 152
+					 && offsetof(ResourceXAcquireRequestV3, zero_reserved) == 153,
+				 "Resource-X acquisition V3 offsets changed");
 StaticAssertDecl(offsetof(ResourceXWireCommonV1, logical_assertion) == 8
 					 && offsetof(ResourceXWireCommonV1, authority_generation) == 88,
 				 "Resource-X common V1 offsets changed");

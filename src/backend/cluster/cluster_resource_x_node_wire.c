@@ -226,7 +226,8 @@ resource_x_pair_length(uint8 msg_type, ResourceXWireKind kind, uint16 len)
 		return (msg_type == RESOURCE_X_MSG_ASSERT_X || msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT)
 			   && len == RESOURCE_X_CONTROL_V1_BYTES;
 	if (kind == RESOURCE_X_WIRE_ASSERT_X)
-		return msg_type == RESOURCE_X_MSG_ASSERT_X && len == RESOURCE_X_CONTROL_V1_BYTES;
+		return msg_type == RESOURCE_X_MSG_ASSERT_X
+			   && (len == RESOURCE_X_CONTROL_V1_BYTES || len == RESOURCE_X_ACQUIRE_V3_BYTES);
 	if (kind == RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION)
 		return msg_type == RESOURCE_X_MSG_ASSERT_X && len == RESOURCE_X_SHORT_V1_BYTES;
 	if (kind == RESOURCE_X_WIRE_BLOCK_TO_N)
@@ -254,6 +255,12 @@ resource_x_pair_length(uint8 msg_type, ResourceXWireKind kind, uint16 len)
 static bool
 resource_x_frame_length(const ResourceXDecodedFrame *frame, uint16 *len)
 {
+	if (frame->has_acquire_intent) {
+		if (frame->kind != RESOURCE_X_WIRE_ASSERT_X)
+			return false;
+		*len = RESOURCE_X_ACQUIRE_V3_BYTES;
+		return true;
+	}
 	switch (frame->kind) {
 	case RESOURCE_X_WIRE_ASSERT_X:
 	case RESOURCE_X_WIRE_BLOCK_TO_N:
@@ -490,9 +497,57 @@ resource_x_common_valid(ResourceXWireKind kind, const ResourceXDecodedCommon *co
 
 
 static bool
-resource_x_pair_common_valid(uint8 msg_type, ResourceXWireKind kind,
-							 const ResourceXDecodedCommon *common, ResourceXWireReject *reject)
+resource_x_acquire_common_valid(const ResourceXDecodedCommon *common,
+								ResourceXWireReject *reject)
 {
+	if (!resource_x_assertion_valid(&common->logical_assertion)) {
+		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_IDENTITY);
+		return false;
+	}
+	if (common->resource_formation == 0 || common->resource_formation == UINT64_MAX
+		|| common->master_session_incarnation == 0
+		|| common->master_session_incarnation == UINT64_MAX
+		|| common->assertion_sequence == 0 || common->assertion_sequence == UINT64_MAX
+		|| common->sender_connection_generation == 0
+		|| common->sender_connection_generation == UINT32_MAX) {
+		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_GENERATION);
+		return false;
+	}
+	/* Native base/token live in the typed tail. The requester does not select
+	 * the master canonical base, queue order, source or final authority. */
+	if (common->base_authority_generation != 0 || common->authority_generation != 0
+		|| common->ordered_lane != 0
+		|| common->action_node != common->logical_assertion.requester_node
+		|| common->source_candidate != 0 || common->retain_pi_if_dirty != 0) {
+		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_ROLE);
+		return false;
+	}
+	if (common->observed_mode > (uint8)PCM_STATE_X
+		|| (common->target_mode != (uint8)PCM_STATE_S && common->target_mode != (uint8)PCM_STATE_X)
+		|| common->outcome != RESOURCE_X_OUTCOME_NONE) {
+		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_ENUM);
+		return false;
+	}
+	if (common->flags != 0) {
+		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_FLAGS);
+		return false;
+	}
+	return true;
+}
+
+
+static bool
+resource_x_pair_common_valid(uint8 msg_type, ResourceXWireKind kind,
+							 bool acquire_intent, const ResourceXDecodedCommon *common,
+							 ResourceXWireReject *reject)
+{
+	if (acquire_intent) {
+		if (msg_type != RESOURCE_X_MSG_ASSERT_X || kind != RESOURCE_X_WIRE_ASSERT_X) {
+			resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_TYPE_KIND);
+			return false;
+		}
+		return resource_x_acquire_common_valid(common, reject);
+	}
 	if (kind == RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP)
 		return resource_x_bootstrap_common_valid(msg_type, common, reject);
 	if (kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
@@ -506,7 +561,8 @@ static void
 resource_x_common_encode(uint8 *bytes, ResourceXWireKind kind, const ResourceXDecodedCommon *common,
 						 uint16 len)
 {
-	bytes[0] = kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE ? RESOURCE_X_IMAGE_WIRE_VERSION
+	bytes[0] = len == RESOURCE_X_ACQUIRE_V3_BYTES ? RESOURCE_X_ACQUIRE_WIRE_VERSION
+		: kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE ? RESOURCE_X_IMAGE_WIRE_VERSION
 													  : RESOURCE_X_WIRE_VERSION;
 	bytes[1] = (uint8)kind;
 	resource_x_put_u16(bytes + 2, len);
@@ -530,7 +586,8 @@ resource_x_common_encode(uint8 *bytes, ResourceXWireKind kind, const ResourceXDe
 
 static bool
 resource_x_common_decode(uint8 msg_type, const uint8 *bytes, ResourceXWireKind kind,
-						 ResourceXDecodedCommon *common, ResourceXWireReject *reject)
+						 bool acquire_intent, ResourceXDecodedCommon *common,
+						 ResourceXWireReject *reject)
 {
 	memset(common, 0, sizeof(*common));
 	if (!resource_x_bytes_zero(bytes + 82, 6)) {
@@ -552,7 +609,7 @@ resource_x_common_decode(uint8 msg_type, const uint8 *bytes, ResourceXWireKind k
 	common->outcome = bytes[80];
 	common->flags = bytes[81];
 	common->authority_generation = resource_x_get_u64(bytes + 88);
-	return resource_x_pair_common_valid(msg_type, kind, common, reject);
+	return resource_x_pair_common_valid(msg_type, kind, acquire_intent, common, reject);
 }
 
 
@@ -586,6 +643,24 @@ static bool
 resource_x_body_valid(const ResourceXDecodedFrame *frame, ResourceXWireReject *reject)
 {
 	bool valid = true;
+	if (frame->has_acquire_intent) {
+		const ResourceXDecodedAcquireIntent *body = &frame->body.acquire_intent;
+
+		valid = frame->kind == RESOURCE_X_WIRE_ASSERT_X && !frame->blocked_has_remote_proof
+			&& body->requester_incarnation != 0 && body->requester_incarnation != UINT64_MAX
+			&& body->backend_generation != 0 && body->backend_generation != UINT64_MAX
+			&& body->base_generation != UINT64_MAX
+			&& body->reservation_token != 0 && body->reservation_token != UINT64_MAX
+			&& body->cluster_epoch != 0 && body->cluster_epoch != UINT64_MAX
+			&& body->r4_generation != 0 && body->r4_generation != UINT64_MAX
+			&& body->backend_id >= 0 && body->buffer_id >= 0
+			&& (body->path == RESOURCE_X_ACQUIRE_RESIDENT
+				|| (body->path == RESOURCE_X_ACQUIRE_FIRST_FILL
+					&& frame->common.observed_mode == (uint8)PCM_STATE_N));
+		if (!valid)
+			resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_BODY);
+		return valid;
+	}
 
 	switch (frame->kind) {
 	case RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP:
@@ -703,6 +778,20 @@ resource_x_dependencies_decode(const uint8 *bytes, uint64 *dependencies)
 static void
 resource_x_body_encode(uint8 *bytes, const ResourceXDecodedFrame *frame)
 {
+	if (frame->has_acquire_intent) {
+		const ResourceXDecodedAcquireIntent *body = &frame->body.acquire_intent;
+
+		resource_x_put_u64(bytes + 96, body->requester_incarnation);
+		resource_x_put_u64(bytes + 104, body->backend_generation);
+		resource_x_put_u64(bytes + 112, body->base_generation);
+		resource_x_put_u64(bytes + 120, body->reservation_token);
+		resource_x_put_u64(bytes + 128, body->cluster_epoch);
+		resource_x_put_u64(bytes + 136, body->r4_generation);
+		resource_x_put_u32(bytes + 144, (uint32)body->backend_id);
+		resource_x_put_u32(bytes + 148, (uint32)body->buffer_id);
+		bytes[152] = body->path;
+		return;
+	}
 	switch (frame->kind) {
 	case RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION:
 		resource_x_put_u64(bytes + 96, frame->body.local_proof.local_holder_authority_generation);
@@ -799,6 +888,24 @@ static bool
 resource_x_body_decode(const uint8 *bytes, ResourceXDecodedFrame *frame,
 					   ResourceXWireReject *reject)
 {
+	if (frame->has_acquire_intent) {
+		ResourceXDecodedAcquireIntent *body = &frame->body.acquire_intent;
+
+		if (!resource_x_bytes_zero(bytes + 153, 7)) {
+			resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_RESERVED);
+			return false;
+		}
+		body->requester_incarnation = resource_x_get_u64(bytes + 96);
+		body->backend_generation = resource_x_get_u64(bytes + 104);
+		body->base_generation = resource_x_get_u64(bytes + 112);
+		body->reservation_token = resource_x_get_u64(bytes + 120);
+		body->cluster_epoch = resource_x_get_u64(bytes + 128);
+		body->r4_generation = resource_x_get_u64(bytes + 136);
+		body->backend_id = (int32)resource_x_get_u32(bytes + 144);
+		body->buffer_id = (int32)resource_x_get_u32(bytes + 148);
+		body->path = bytes[152];
+		return resource_x_body_valid(frame, reject);
+	}
 	switch (frame->kind) {
 	case RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION:
 		if (!resource_x_bytes_zero(bytes + 122, 2)) {
@@ -921,7 +1028,8 @@ cluster_resource_x_wire_encode(uint8 msg_type, const ResourceXDecodedFrame *fram
 		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_DECLARED_LENGTH);
 		return false;
 	}
-	if (!resource_x_pair_common_valid(msg_type, frame->kind, &frame->common, reject))
+	if (!resource_x_pair_common_valid(msg_type, frame->kind, frame->has_acquire_intent,
+									&frame->common, reject))
 		return false;
 	if (!resource_x_body_valid(frame, reject))
 		return false;
@@ -950,7 +1058,8 @@ cluster_resource_x_wire_decode(uint8 msg_type, const void *payload, uint16 paylo
 	if (bytes == NULL || out == NULL)
 		return false;
 	if (payload_len != RESOURCE_X_CONTROL_V1_BYTES && payload_len != RESOURCE_X_SHORT_V1_BYTES
-		&& payload_len != RESOURCE_X_PROOF_V1_BYTES && payload_len != RESOURCE_X_IMAGE_V2_BYTES) {
+		&& payload_len != RESOURCE_X_PROOF_V1_BYTES && payload_len != RESOURCE_X_IMAGE_V2_BYTES
+		&& payload_len != RESOURCE_X_ACQUIRE_V3_BYTES) {
 		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_LEGACY_LENGTH);
 		return false;
 	}
@@ -960,7 +1069,8 @@ cluster_resource_x_wire_decode(uint8 msg_type, const void *payload, uint16 paylo
 		return false;
 	}
 	if (bytes[0]
-		!= (kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE ? RESOURCE_X_IMAGE_WIRE_VERSION
+		!= (payload_len == RESOURCE_X_ACQUIRE_V3_BYTES ? RESOURCE_X_ACQUIRE_WIRE_VERSION
+			: kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE ? RESOURCE_X_IMAGE_WIRE_VERSION
 												   : RESOURCE_X_WIRE_VERSION)) {
 		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_VERSION);
 		return false;
@@ -976,11 +1086,13 @@ cluster_resource_x_wire_decode(uint8 msg_type, const void *payload, uint16 paylo
 	memset(&decoded, 0, sizeof(decoded));
 	decoded.kind = kind;
 	decoded.payload_bytes = payload_len;
+	decoded.has_acquire_intent = payload_len == RESOURCE_X_ACQUIRE_V3_BYTES;
 	decoded.blocked_has_remote_proof
 		= (kind == RESOURCE_X_WIRE_BLOCKED_TO_N || kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
 		   || kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2)
 		  && payload_len == RESOURCE_X_PROOF_V1_BYTES;
-	if (!resource_x_common_decode(msg_type, bytes, kind, &decoded.common, reject))
+	if (!resource_x_common_decode(msg_type, bytes, kind, decoded.has_acquire_intent,
+								 &decoded.common, reject))
 		return false;
 	decoded.common.semantic_crc32c = resource_x_get_u32(bytes + 4);
 	if (!resource_x_body_decode(bytes, &decoded, reject))
@@ -1009,6 +1121,10 @@ cluster_resource_x_wire_rebind_sender_generation(uint8 msg_type, void *payload, 
 	if (bytes == NULL || sender_connection_generation == 0
 		|| !cluster_resource_x_wire_decode(msg_type, bytes, payload_len, &decoded, reject))
 		return false;
+	if (decoded.has_acquire_intent && sender_connection_generation == UINT32_MAX) {
+		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_GENERATION);
+		return false;
+	}
 	resource_x_put_u32(bytes + 76, sender_connection_generation);
 	resource_x_put_u32(bytes + 4, 0);
 	crc = resource_x_wire_crc(bytes, payload_len);
