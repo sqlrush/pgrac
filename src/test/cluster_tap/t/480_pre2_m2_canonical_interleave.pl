@@ -6,6 +6,8 @@ use strict;
 use warnings;
 use FindBin;
 use lib "$FindBin::RealBin/../../perl";
+use lib "$FindBin::RealBin/../pre2";
+use M2CanonicalCases qw(run_cases);
 use PostgreSQL::Test::ClusterPRE2;
 use PostgreSQL::Test::Utils qw(slurp_file);
 use Test::More;
@@ -35,8 +37,10 @@ sub session {
  return $s;
 }
 sub finish_sessions {
- $_->quit for @sessions;
+ my @errors;
+ for my $s (@sessions) { eval { $s->quit; 1; } or push @errors,$@; }
  @sessions=();
+ die join('',@errors) if @errors;
 }
 sub json_result {
  my ($text)=@_;
@@ -144,10 +148,39 @@ $a->safe_psql('postgres','VACUUM(FREEZE) m2_roll');
 $a->safe_psql('postgres','CHECKPOINT');
 
 my $number=0;
-for my $kind (qw(A1 A2)) {
- for my $caller (qw(physical owner freeze_data sample_canonical)) {
+my @matrix=map {
+ my $kind=$_;
+ map { {kind=>$kind,caller=>$_,number=>++$number} }
+  qw(physical owner freeze_data sample_canonical)
+} qw(A1 A2);
+sub record_cell {
+ my ($cell,$execution)=@_;
+ my $name=lc("$cell->{kind}-$cell->{caller}");
+ if(defined($cell->{xid}) && defined($cell->{log_offsets})) {
+  my $log=logs_since(\@nodes,$cell->{log_offsets});
+  my @trace=grep { /TX_CANONICAL / && /xid=$cell->{xid} / } split /\n/,$log;
+  save_json("$name-caller-trace",{context=>$cell,rows=>\@trace,authoritative=>JSON::PP::false});
+ }
+ save_json("$name-execution",{context=>$cell,%$execution});
+ if(!$execution->{completed} || $execution->{cleanup_error} ne '') {
+  fail("$name: cell execution or cleanup failed");
+  diag($execution->{error}.$execution->{cleanup_error});
+ }
+}
+sub cleanup_cell {
+ my ($cell)=@_;
+ my @errors;
+ # Disarm the existing process-local hook even when a remote cell failed.
+ if($cell->{pause_armed}) { eval { reload_pause($a,0); 1; } or push @errors,$@; }
+ eval { finish_sessions(); 1; } or push @errors,$@;
+ die join('',@errors) if @errors;
+}
+run_cases(\@matrix,sub {
+  my ($cell)=@_;
+  my ($kind,$caller,$number)=@{$cell}{qw(kind caller number)};
   my $name=lc("$kind-$caller");
-  my $table='m2_case_'.++$number;
+  my $table='m2_case_'.$number;
+  $cell->{stage}='setup';
   $a->safe_psql('postgres',"CREATE TABLE $table(id int,v int); INSERT INTO $table VALUES(1,10)");
   $a->safe_psql('postgres',"VACUUM(FREEZE) $table");
   my $w=session($a);
@@ -157,19 +190,27 @@ for my $kind (qw(A1 A2)) {
   my $rpid=0+$r->query_safe('SELECT pg_backend_pid()');
   $w->query_safe("BEGIN; UPDATE $table SET v=20 WHERE id=1");
   my $xid=0+$w->query_safe('SELECT pg_current_xact_id()::text');
+  @{$cell}{qw(xid producer_pid reader_pid)}=($xid,$wpid,$rpid);
+  $cell->{stage}='rollover' if $caller eq 'sample_canonical';
+  save_json("context-$number",$cell);
   if($caller eq 'sample_canonical') {
    $w->query_safe("SET cluster.trace_tx_identity=off; UPDATE m2_roll SET v=v+1; SET cluster.trace_tx_identity=on; UPDATE $table SET v=21 WHERE id=1");
   }
   my $before=decode_json($a->safe_psql('postgres','SELECT test_pgrac_native_itl_trace()'));
   my $key=producer_key($before,$xid);
   my @offset=map {-s $_->logfile} @nodes;
+  $cell->{log_offsets}=\@offset;
+  $cell->{key}=$key;
+  $cell->{stage}='sampling';
+  save_json("context-$number",$cell);
   my $path=$remote ? 'origin' : $caller;
   my $sql="SELECT test_pgrac_m2_sample('$path','$table',0,'$xid'::xid)";
+  note("M2_CALLER_REQUEST case=$number kind=$kind caller=$caller xid=$xid producer=$wpid reader=$rpid path=$path");
   my $sample_pid;
   my $reached=0;
   my $hits;
   if($kind eq 'A1') {
-   if($remote) { reload_pause($a,1); }
+   if($remote) { $cell->{pause_armed}=1; reload_pause($a,1); }
    else { $r->query_safe("SELECT cluster_inject_fault('cluster-tx-canonical-copy','sleep',$pause)"); }
    $r->query_until(qr/READER_SENT/,"\\echo READER_SENT\n$sql;\n");
    $sample_pid=pause_witness($a,$remote ? undef : $rpid,
@@ -196,7 +237,7 @@ for my $kind (qw(A1 A2)) {
    $hits=$w->query_safe("SELECT hits||'|'||fault_type||'|'||param FROM pg_stat_cluster_injections WHERE name='cluster-tx-abort-tt-after'");
    $reached=0 unless $hits eq '1|none|0';
   }
-  reload_pause($a,0) if $kind eq 'A1' && $remote;
+  if($kind eq 'A1' && $remote) { reload_pause($a,0); $cell->{pause_armed}=0; }
   my $log=logs_since(\@nodes,\@offset);
   my $after=decode_json($a->safe_psql('postgres','SELECT test_pgrac_native_itl_trace()'));
   my @terminal=grep { $_->{kind} == 5 && $_->{native_binding_known} &&
@@ -216,12 +257,14 @@ for my $kind (qw(A1 A2)) {
    values=>\@values,pause_hits=>$hits,producer_before=>$before,producer_after=>$after};
   $case->{sample_pid}=$sample_pid if defined $sample_pid;
   judge($name,$case,$log);
-  finish_sessions();
- }
-}
+  $cell->{stage}='judged';
+},\&cleanup_cell,\&record_cell);
 
 # Cancel the actual reader inside its original SCUR scope. Check the same
 # backend after ERROR and then exercise the same logical row again.
+run_cases([{kind=>'CANCEL',caller=>'physical',number=>9}],sub {
+my ($cell)=@_;
+$cell->{stage}='cancel';
 $a->safe_psql('postgres','CREATE TABLE m2_cancel(id int,v int); INSERT INTO m2_cancel VALUES(1,10)');
 $a->safe_psql('postgres','VACUUM(FREEZE) m2_cancel');
 my $w=session($a);
@@ -242,7 +285,8 @@ ok(defined($hit) && $cancel eq 't' && $cancel_out =~ /CANCEL_SQLSTATE 57014/ &&
 $w->query_safe('ROLLBACK');
 is($b->safe_psql('postgres','UPDATE m2_cancel SET v=30; SELECT id,v FROM m2_cancel'),'1|30',
  'same row remains writable from the peer after cancellation cleanup');
-finish_sessions();
+$cell->{stage}='judged';
+},\&cleanup_cell,\&record_cell);
 $cluster->stop_cluster;
 undef $cluster;
 pass('all four native members complete the original normal-stop proof');
