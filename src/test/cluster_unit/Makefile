@@ -2707,18 +2707,26 @@ test_cluster_heap_ctrc_ack.inc: $(top_srcdir)/src/backend/cluster/cluster_termin
 	mv $@.tmp $@
 
 # Original volatile origin/inbox terminal edge; canonical block0 publisher is separate.
-test_cluster_heap_ctrc_origin_reply.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
-	@awk '/^typedef struct CtrcOriginBatchReplyTrace CtrcOriginBatchReplyTrace;/ { print; forward++ } \
+# Native trace definitions are required as a complete set when the source has
+# them. An older source with no trace definitions or references emits no types.
+test_cluster_heap_ctrc_origin_reply_trace_types.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk '/^#define CLUSTER_CTRC_(ORIGIN_REPLY_TRACE|LOCAL_BATCH_REPLY_TRACE)_PRESENT 1$$/ { print; markers++ } \
+	     /^typedef struct CtrcOriginBatchReplyTrace CtrcOriginBatchReplyTrace;/ { print; forward++ } \
 	     /^typedef struct CtrcOriginBatchTraceState / { emit=1; state++ } \
 	     /^struct CtrcOriginBatchReplyTrace / { emit=1; batch++ } \
 	     /^static uint64 CtrcReplyTrace(Sequence|UnsafeSkipped);/ { print; counters++ } \
+	     /ctrc_origin_(reply_trace|batch_trace_(state|before|after))\(/ { references++ } \
 	     emit { print } emit && /^}/ { emit=0 } \
-	     END { if (forward != 1 || state != 1 || batch != 1 || counters != 2 || emit) exit 1 }' $< > $@.tmp
+	     END { if (emit || (references == 0 ? markers || forward || state || batch || counters : markers != 2 || forward != 1 || state != 1 || batch != 1 || counters != 2)) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_ctrc_origin_reply.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
 	@awk 'BEGIN { pattern = "^(ctrc_origin_reply_trace_lock|ctrc_origin_reply_trace|ctrc_origin_batch_trace_state|ctrc_origin_batch_trace_before|ctrc_origin_batch_trace_after|ctrc_origin_ack_entries|ctrc_origin_ack_index|ctrc_origin_frozen_touch_set_valid|cluster_ctrc_origin_begin_seal_entry|cluster_ctrc_origin_arm_close_entry|cluster_ctrc_origin_note_close_reply_entry|cluster_ctrc_origin_begin_cleaning_entry|cluster_ctrc_origin_ack_land_entry|ctrc_origin_ack_land_locked|cluster_ctrc_origin_ack_land_shared|cluster_ctrc_origin_certificate_validate|cluster_ctrc_origin_certificate_snapshot_entry|cluster_ctrc_origin_certificate_commit_entry|ctrc_origin_certificate_snapshot_index_locked|ctrc_origin_certificate_commit_shared|cluster_ctrc_origin_arm_certificate_entry|cluster_ctrc_origin_note_certificate_reply_entry|ctrc_origin_release_reclaim_locked|ctrc_origin_note_certificate_match_locked|cluster_ctrc_origin_note_certificate_reply_shared)\\(" } \
+	     /^#define CLUSTER_CTRC_(ORIGIN_REPLY_TRACE|LOCAL_BATCH_REPLY_TRACE)_PRESENT 1$$/ { markers++ } \
 	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); ret=prev; sub(/^static[ \t]+/, "", ret); candidate=1; head=1; text=""; decl="" } \
-	     candidate { text=text $$0 "\n"; if (/^\{/) { head=0; if (seen[name]++) exit 1; order[++found]=name; returns[name]="static " ret } else if (head) { decl=decl $$0 "\n"; if (/;[ \t]*$$/) candidate=0 } } \
+	     candidate { text=text $$0 "\n"; if (/^\{/) { head=0; if (seen[name]++) exit 1; order[++found]=name; returns[name]="static " ret; if (name ~ /^ctrc_origin_(reply_trace|batch_trace_)/) traces++ } else if (head) { decl=decl $$0 "\n"; if (/;[ \t]*$$/) candidate=0 } } \
 	     candidate && /^}/ { candidate=0; body[name]=text; declaration[name]=decl; done++ } { prev=$$0 } \
-	     END { if (found != 25 || done != 25 || candidate) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< >> $@.tmp
+	     END { if (candidate || done != found || (markers == 0 ? found != 20 || traces != 0 : markers != 2 || found != 25 || traces != 5)) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Exact original certificate publisher; I/O and scheduling leaves are controlled.
@@ -2767,6 +2775,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_ctrc_certificate.inc $(top_srcdir)/src/include/port/pg_crc32c.h \
 		test_cluster_heap_ctrc_ack.inc $(top_srcdir)/src/common/sha2_int.h \
 		test_cluster_heap_ctrc_origin_reply.inc \
+		test_cluster_heap_ctrc_origin_reply_trace_types.inc \
 		test_cluster_heap_ctrc_durable_certificate.inc \
 		$(top_srcdir)/src/include/utils/memutils.h \
 		test_cluster_heap_freeze_cohort_current.inc \
@@ -2789,6 +2798,9 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe.h \
 		test_cluster_active_sample_types.inc test_cluster_active_sample_fence.inc \
 		test_cluster_heap_freeze_admission_current.inc \
+		test_cluster_heap_freeze_admission_lifecycle.inc \
+		$(top_srcdir)/src/include/cluster/cluster_wal_thread.h \
+		test_cluster_heap_freeze_startup_types.inc test_cluster_heap_freeze_startup_source.inc \
 		$(top_srcdir)/src/include/cluster/cluster_reconfig.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_horizon.h \
@@ -2796,6 +2808,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_freeze_policy_current.inc \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
 		test_cluster_vacuum_observed_bounds.inc test_cluster_vacuum_freeze_bound_observer.inc \
+		test_cluster_vacuum_admitted_phase.inc \
 		test_cluster_freeze_writer_context.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) test_cluster_heap_maintenance_policy.inc unit_test.h \
 		test_cluster_heap_borrowed_pin.inc $(top_srcdir)/src/include/storage/bufmgr.h \
 		test_cluster_vacuum_freeze_locators.inc \
@@ -6216,6 +6229,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_ctrc_certificate.inc test_cluster_heap_ctrc_certificate.inc.tmp
 	rm -f test_cluster_heap_ctrc_ack.inc test_cluster_heap_ctrc_ack.inc.tmp
 	rm -f test_cluster_heap_ctrc_origin_reply.inc test_cluster_heap_ctrc_origin_reply.inc.tmp
+	rm -f test_cluster_heap_ctrc_origin_reply_trace_types.inc test_cluster_heap_ctrc_origin_reply_trace_types.inc.tmp
 	rm -f test_cluster_heap_ctrc_durable_certificate.inc test_cluster_heap_ctrc_durable_certificate.inc.tmp
 	rm -f test_cluster_heap_ctrc_attachment.inc test_cluster_heap_ctrc_attachment.inc.tmp
 	rm -f test_cluster_heap_ctrc_ready.inc test_cluster_heap_ctrc_ready.inc.tmp
@@ -9865,6 +9879,20 @@ test_cluster_active_sample_types.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     END { if (count != 3 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Use the full original Startup completion layout and its read-only predicates.
+test_cluster_heap_freeze_startup_types.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^typedef struct ClusterNormalStartCompletion [{]$$/ { emit=1; found++ } \
+	     /^static ClusterNormalStartCompletion \*NormalStartCompletion;/ { if (emit) { emit=0; done++ } } \
+	     emit { print } END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_freeze_startup_source.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^cluster_semantic_normal_start_state\(/ { print "ClusterNormalStartState"; emit=1; found++ } \
+	     /^normal_start_(shared_configured|bootstrap_allowed|serving_allowed)\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (found != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 # Execute the original ordinary TARGET and read-only census admission checks.
 test_cluster_heap_freeze_admission_current.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
 	awk '/^semantic_activation_(admission_policy|r4_terminal_census_policy)\(/ { print "static ClusterSemanticAdmissionResult"; emit=1; count++ } \
@@ -9872,6 +9900,19 @@ test_cluster_heap_freeze_admission_current.inc: $(top_srcdir)/src/backend/cluste
 	     /^cluster_semantic_activation_recheck(_r4_terminal_census)?\(/ { print "bool"; emit=1; count++ } \
 	     emit { print } /^}$$/ { emit=0 } \
 	     END { if (count != 6 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Original terminal-census admission, debt counters and backend exit cleanup.
+test_cluster_heap_freeze_admission_lifecycle.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^#define CLUSTER_SEMANTIC_ADMISSION_COUNTER_TRIES / { print; constants++ } \
+	     /^cluster_semantic_activation_backend_has_admission\(/ { print "bool"; emit=1; count++ } \
+	     /^semantic_activation_(counter_increment|ensure_exit_hook)\(/ { print "static bool"; emit=1; count++ } \
+	     /^semantic_activation_(counter_subtract|exit_cleanup|release_debt)\(/ { print "static void"; emit=1; count++ } \
+	     /^semantic_activation_enter_internal\(/ { print "static ClusterSemanticAdmissionResult"; emit=1; count++ } \
+	     /^cluster_semantic_activation_enter_r4_terminal_census\(/ { print "ClusterSemanticAdmissionResult"; emit=1; count++ } \
+	     /^cluster_semantic_activation_leave\(/ { print "void"; emit=1; count++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (count != 9 || constants != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_active_sample_fence.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
@@ -12024,8 +12065,20 @@ test_cluster_vacuum_shared_mx.inc: $(top_srcdir)/src/backend/access/heap/vacuuml
 test_cluster_vacuum_proof_cleanup.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
 	awk '/^lazy_cleanout_shared_freeze_page\(/ { print "static bool"; emit=1; cleanout++ } \
 	     /^lazy_shared_freeze_transport_snapshot\(/ { print "static void"; emit=1; cost++ } \
-	     /^(lazy_recheck_shared_freeze_page|lazy_observe_shared_freeze_bounds|lazy_collect_shared_freeze_proofs)\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 3 || cleanout > 1 || cost > 1) exit 1 }' $< > $@.tmp
+	     /^(lazy_recheck_shared_freeze_page|lazy_observe_shared_freeze_bounds|lazy_collect_shared_freeze_proofs(_admitted)?)\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 4 || cleanout > 1 || cost > 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# The real seqlock read used by opt-in collector admission ownership tests.
+test_cluster_vacuum_admitted_phase.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/^lazy_collect_shared_freeze_proofs_admitted\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vacuum_admission_snapshot.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^semantic_activation_snapshot\(/ { print "static bool"; emit=1; count++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_vacuum_freeze_bound_observer.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
@@ -12036,6 +12089,7 @@ test_cluster_vacuum_freeze_bound_observer.inc: $(top_srcdir)/src/backend/access/
 .PHONY: clean-vacuum-freeze-bound-observer
 clean-vacuum-freeze-bound-observer:
 	rm -f test_cluster_vacuum_freeze_bound_observer.inc test_cluster_vacuum_freeze_bound_observer.inc.tmp
+	rm -f test_cluster_vacuum_admission_snapshot.inc test_cluster_vacuum_admission_snapshot.inc.tmp
 
 clean distclean maintainer-clean: clean-vacuum-freeze-bound-observer
 
@@ -12075,6 +12129,8 @@ test_cluster_vacuum_proof_cleanup: test_cluster_vacuum_proof_cleanup.c unit_test
 		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h \
 		$(top_srcdir)/src/include/cluster/cluster_scn.h test_cluster_heap_small_scn.inc \
 		test_cluster_vacuum_observed_bounds.inc \
+		test_cluster_active_sample_types.inc test_cluster_vacuum_admission_snapshot.inc \
+		test_cluster_heap_freeze_admission_current.inc test_cluster_heap_freeze_admission_lifecycle.inc \
 		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
 		$(top_srcdir)/src/include/commands/vacuum.h \
@@ -12741,6 +12797,9 @@ clean-active-sample-fence:
 	rm -f test_cluster_active_sample_types.inc test_cluster_active_sample_types.inc.tmp
 	rm -f test_cluster_active_sample_fence.inc test_cluster_active_sample_fence.inc.tmp
 	rm -f test_cluster_heap_freeze_admission_current.inc test_cluster_heap_freeze_admission_current.inc.tmp
+	rm -f test_cluster_heap_freeze_admission_lifecycle.inc test_cluster_heap_freeze_admission_lifecycle.inc.tmp
+	rm -f test_cluster_heap_freeze_startup_types.inc test_cluster_heap_freeze_startup_types.inc.tmp
+	rm -f test_cluster_heap_freeze_startup_source.inc test_cluster_heap_freeze_startup_source.inc.tmp
 
 clean distclean maintainer-clean: clean-retention-sample
 .PHONY: clean-retention-sample
