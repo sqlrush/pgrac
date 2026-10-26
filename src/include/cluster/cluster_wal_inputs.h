@@ -6,6 +6,7 @@
 #include "cluster/cluster_wal_tail.h"
 #include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_thread_recovery_fabric.h"
+#include "cluster/cluster_relmap_checkpoint.h"
 
 #define CLUSTER_WAL_INPUTS_MAX 128
 
@@ -298,6 +299,45 @@ extern bool cluster_wal_inputs_ctrc_replays_source_current_v1(
 extern bool cluster_wal_inputs_ctrc_replays_source_covers_window_v1(
 	const ClusterRecoveryCtrcReplaySetSourceV1 *source, uint16 thread,
 	XLogRecPtr lower, XLogRecPtr upper);
+/* Declared relmap participant of the ORIGINAL Startup episode only. The
+ * complete original replay IR set and WALR incarnation must remain held.
+ * input_index enumerates every selected generation, including history and
+ * initializer terminals; replay_index identifies its original replay origin.
+ * These are distinct input values, never CTRC/PAGE/ordinary RR permissions.
+ * No new scope, acquire, release or per-origin owner is created. */
+typedef struct ClusterRecoveryRelmapSourceV1 {
+	ClusterWalInputsV1 *scope;
+	ClusterWalReadPinOwnerV1 input_owner;
+	uint64 work_generation, ir_request_id;
+	uint32 input_index, input_count, replay_index, replay_count;
+	ClusterControlRootFileToken root;
+	ClusterWalInputV1 selected;
+	ClusterWalInputV1 replay;
+	ClusterControlRootReadToken replay_token;
+} ClusterRecoveryRelmapSourceV1;
+extern uint32 cluster_wal_inputs_relmap_count_v1(ClusterWalInputsV1 *inputs);
+/* By value, zero on refusal. No caller output can alias the original owner. */
+extern ClusterRecoveryRelmapSourceV1 cluster_wal_inputs_relmap_source_v1(
+	ClusterWalInputsV1 *inputs, uint32 input_index);
+/* Local original owner/whole-set checks only. Across I/O the original whole
+ * ROOT must also be revalidated outside native locks. */
+extern bool cluster_wal_inputs_relmap_source_current_v1(
+	const ClusterRecoveryRelmapSourceV1 *source);
+typedef struct ClusterRecoveryRelmapNativeInputV1 {
+	ClusterRecoveryRelmapSourceV1 source;
+	ClusterWalTailObservation tail;
+	XLogRecPtr checkpoint_end; /* actual original WAL reader, not window bytes */
+	ClusterRelmapCheckpointWindow window;
+	uint64 post_flush_issued;
+} ClusterRecoveryRelmapNativeInputV1;
+/* Full original retained visit, exact native CheckPoint and v2 window, then
+ * whole ROOT/source/all-holder recheck. Missing/legacy/terminal/prefix-only
+ * input refuses. Caller-held CF/critical-section preconditions return zero
+ * before I/O without revoking the owner. Entered refusal/ERROR invalidates the original episode and
+ * retains its owners for original cleanup. This does NOT prove native CLOG
+ * physical lifetime, no truncation/reuse, terminal polarity or COMPLETE. */
+extern ClusterRecoveryRelmapNativeInputV1 cluster_wal_inputs_relmap_native_v1(
+	ClusterWalInputsV1 *inputs, uint32 input_index);
 struct ClusterRecoverySerialRequest;
 /* IR purpose callbacks: validate includes original whole ROOT I/O outside CF;
  * current is no-wait and never calls the IR holder revalidation recursively. */

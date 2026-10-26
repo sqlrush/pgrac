@@ -89,6 +89,7 @@ typedef struct ClusterRecoveryCheckpointSlotV1 {
 	uint64 tx_accepted_generation;
 	ClusterRecoveryCtrcResultValueV1 ctrc_result;
 	uint64 ctrc_accepted_generation;
+	bool relmap_required;
 } ClusterRecoveryCheckpointSlotV1;
 
 typedef struct ClusterRecoveryPlanShmem {
@@ -633,6 +634,7 @@ cluster_recovery_checkpoint_revoke_v1(const struct ClusterRecoveryStartV1 *start
 			slot->tx_accepted_generation = 0;
 			memset(&slot->ctrc_result, 0, sizeof(slot->ctrc_result));
 			slot->ctrc_accepted_generation = 0;
+			slot->relmap_required = false;
 		}
 		SpinLockRelease(&slot->lock);
 	}
@@ -660,6 +662,7 @@ cluster_recovery_checkpoint_register_v1(const struct ClusterRecoveryStartV1 *sta
 		slot->tx_accepted_generation = 0;
 		memset(&slot->ctrc_result, 0, sizeof(slot->ctrc_result));
 		slot->ctrc_accepted_generation = 0;
+		slot->relmap_required = false;
 		slot->valid = true;
 		published = true;
 	}
@@ -695,7 +698,8 @@ cluster_recovery_checkpoint_handoff_v1(const struct ClusterRecoveryStartV1 *star
 		return false;
 	slot = &cluster_recovery_plan_shmem->checkpoint_owner;
 	SpinLockAcquire(&slot->lock);
-	same = slot->valid && memcmp(&slot->owner, &owner, sizeof(owner)) == 0;
+	same = slot->valid && !slot->relmap_required
+		&& memcmp(&slot->owner, &owner, sizeof(owner)) == 0;
 	SpinLockRelease(&slot->lock);
 	if (!same)
 		return false;
@@ -709,6 +713,35 @@ typedef enum RecoveryTxResultAction {
 	RECOVERY_TX_RESULT_STEP,
 	RECOVERY_TX_RESULT_FINISH
 } RecoveryTxResultAction;
+
+bool
+cluster_recovery_ctrc_require_relmap_v1(const struct ClusterRecoveryStartV1 *start)
+{
+	ClusterRecoveryCheckpointSlotV1 *slot;
+	ClusterRecoveryCheckpointOwnerV1 owner;
+	bool ok = false;
+
+	if (MyBackendType != B_STARTUP || !IsUnderPostmaster || CritSectionCount != 0
+		|| start == NULL || start != checkpoint_registered_start
+		|| cluster_recovery_plan_shmem == NULL
+		|| !ClusterColdRecoveryTxCheckpointOwnerV1(start, &owner)
+		|| memcmp(&owner, &checkpoint_registered_owner, sizeof(owner)) != 0)
+		return false;
+	slot = &cluster_recovery_plan_shmem->checkpoint_owner;
+	SpinLockAcquire(&slot->lock);
+	if (slot->valid && memcmp(&slot->owner, &owner, sizeof(owner)) == 0
+		&& slot->ctrc_accepted_generation == 0
+		&& slot->ctrc_result.result_generation != PG_UINT64_MAX) {
+		if (!slot->relmap_required && slot->ctrc_result.result_generation != 0) {
+			slot->ctrc_result.result_generation++;
+			slot->ctrc_result.state = CLUSTER_RECOVERY_CTRC_RESULT_PENDING;
+		}
+		slot->relmap_required = true;
+		ok = true;
+	}
+	SpinLockRelease(&slot->lock);
+	return ok;
+}
 
 bool
 cluster_recovery_ctrc_result_collect_v1(const struct ClusterRecoveryStartV1 *start)
@@ -761,6 +794,10 @@ cluster_recovery_ctrc_result_collect_v1(const struct ClusterRecoveryStartV1 *sta
 	SpinLockAcquire(&slot->lock);
 	if (slot->valid && memcmp(&slot->owner, &owner, sizeof(owner)) == 0
 		&& slot->ctrc_result.result_generation != PG_UINT64_MAX) {
+		/* This input adapter supplies no relmap success setter. The original
+		 * joint publisher must qualify both participants before opening. */
+		if (slot->relmap_required)
+			result.state = CLUSTER_RECOVERY_CTRC_RESULT_PENDING;
 		result.result_generation = slot->ctrc_result.result_generation + 1;
 		slot->ctrc_result = result;
 		slot->ctrc_accepted_generation = 0;
@@ -1030,6 +1067,7 @@ cluster_recovery_ctrc_result_accept_v1(void)
 	same = slot->valid && slot->generation == observed.checkpoint.slot_generation
 		&& memcmp(&slot->owner, &observed.checkpoint.owner, sizeof(slot->owner)) == 0
 		&& memcmp(&slot->ctrc_result, &observed.result, sizeof(slot->ctrc_result)) == 0;
+	same = same && !slot->relmap_required;
 	if (same)
 		slot->ctrc_accepted_generation = observed.result.result_generation;
 	SpinLockRelease(&slot->lock);
@@ -1054,6 +1092,7 @@ cluster_recovery_ctrc_result_observe_accepted_v1(ClusterRecoveryCtrcResultObserv
 		&& memcmp(&slot->owner, &observed.checkpoint.owner, sizeof(slot->owner)) == 0
 		&& memcmp(&slot->ctrc_result, &observed.result, sizeof(slot->ctrc_result)) == 0
 		&& slot->ctrc_accepted_generation == observed.result.result_generation;
+	same = same && !slot->relmap_required;
 	SpinLockRelease(&slot->lock);
 	if (!same)
 		return false;
@@ -1442,6 +1481,7 @@ recovery_ctrc_result_handoff_status(const RecoveryCtrcHandoffV1 *fixed)
 			&& slot->ctrc_accepted_generation == 0)
 			status = RECOVERY_TX_HANDOFF_WAIT;
 		else if (result->state == CLUSTER_RECOVERY_CTRC_RESULT_COMPLETE
+			&& !slot->relmap_required
 			&& result->released_count == result->subject_count && result->unqualified_count == 0) {
 			if (slot->ctrc_accepted_generation == result->result_generation)
 				status = RECOVERY_TX_HANDOFF_ACCEPTED;

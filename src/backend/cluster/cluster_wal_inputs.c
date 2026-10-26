@@ -9,6 +9,8 @@
 #include <unistd.h>
 
 #include "access/xlog.h"
+#include "access/xlog_internal.h"
+#include "access/xlogreader.h"
 #include "access/xlogrecovery.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cf_enqueue.h"
@@ -2865,6 +2867,177 @@ cluster_wal_inputs_ctrc_replays_source_covers_window_v1(
 		&& lower >= original.selected.checkpoint.checkpoint_lower_lsn
 		&& upper <= original.selected.checkpoint.validated_tail_lsn_exclusive
 		&& memcmp(source, &original, sizeof(original)) == 0;
+}
+
+/* The fixed relmap participant borrows the ORIGINAL episode owner, without
+ * retyping a CTRC/PAGE source value or issuing another native IR request. */
+static bool
+inputs_relmap_locator_current(const ClusterRecoveryRelmapSourceV1 *source)
+{
+	return source->scope != NULL && source->scope == active_ctrc_retention.scope
+		&& memcmp(&source->input_owner, &active_ctrc_retention.input_owner,
+			sizeof(source->input_owner)) == 0
+		&& cluster_wal_read_pin_owner_current_v1(&source->input_owner);
+}
+
+uint32
+cluster_wal_inputs_relmap_count_v1(ClusterWalInputsV1 *inputs)
+{
+	if (inputs == NULL || inputs != active_ctrc_retention.scope
+		|| !cluster_wal_read_pin_owner_current_v1(&active_ctrc_retention.input_owner)
+		|| !cluster_wal_inputs_ctrc_replays_authorized_v1(inputs)
+		|| !ClusterColdRecoveryRelmapCurrent(inputs->ctrc.start))
+		return 0;
+	return inputs->count;
+}
+
+static bool
+inputs_relmap_source(ClusterWalInputsV1 *inputs, uint32 index,
+	ClusterRecoveryRelmapSourceV1 *out)
+{
+	ClusterRecoveryRelmapSourceV1 source = {0};
+	ClusterRecoverySerialRequest request;
+	const ClusterWalInputV1 *replay;
+	ClusterRecoveryCtrcSourcePlanV1 *plan;
+	uint32 replay_index = CLUSTER_COLD_MAX_PARTICIPANTS;
+
+	if (cluster_wal_inputs_relmap_count_v1(inputs) == 0 || index >= inputs->count)
+		return false;
+	plan = inputs->ctrc.source_plan;
+	/* Every selected history/current generation remains distinct. Its native
+	 * read custody uses this origin's simultaneously held replay request,
+	 * never a fabricated per-generation scope or native CLOG lifetime proof.
+	 * This grants no
+	 * permission to mutate that history or the installed OPEN generation. */
+	for (uint32 i = 0; i < plan->replay_count; i++) {
+		if (plan->sources[i].claim.identity.origin_thread_id
+			!= inputs->items[index].source.claim.identity.origin_thread_id)
+			continue;
+		if (replay_index != CLUSTER_COLD_MAX_PARTICIPANTS)
+			return false;
+		replay_index = i;
+	}
+	if (replay_index == CLUSTER_COLD_MAX_PARTICIPANTS
+		|| !inputs_ctrc_replays_request(inputs, replay_index, &request, &replay))
+		return false;
+	source.scope = inputs;
+	memcpy(&source.input_owner, &active_ctrc_retention.input_owner, sizeof(source.input_owner));
+	source.work_generation = inputs->ctrc.work_generation;
+	source.ir_request_id = plan->replay[replay_index].ir.lock_request.request_id;
+	if (source.ir_request_id == 0)
+		return false;
+	source.input_index = index;
+	source.input_count = inputs->count;
+	source.replay_index = replay_index;
+	source.replay_count = plan->replay_count;
+	memcpy(&source.root, &inputs->token, sizeof(source.root));
+	memcpy(&source.selected, &inputs->items[index], sizeof(source.selected));
+	memcpy(&source.replay, replay, sizeof(source.replay));
+	memcpy(&source.replay_token, &request.expected_root_token, sizeof(source.replay_token));
+	if (!inputs_relmap_locator_current(&source)
+		|| cluster_wal_inputs_relmap_count_v1(inputs) != source.input_count
+		|| inputs->ctrc.work_generation != source.work_generation
+		|| plan->replay[replay_index].ir.lock_request.request_id != source.ir_request_id)
+		return false;
+	memcpy(out, &source, sizeof(source));
+	return true;
+}
+
+ClusterRecoveryRelmapSourceV1
+cluster_wal_inputs_relmap_source_v1(ClusterWalInputsV1 *inputs, uint32 input_index)
+{
+	ClusterRecoveryRelmapSourceV1 source = {0}, empty = {0};
+
+	if (!inputs_relmap_source(inputs, input_index, &source))
+		return empty;
+	return source;
+}
+
+bool
+cluster_wal_inputs_relmap_source_current_v1(const ClusterRecoveryRelmapSourceV1 *source)
+{
+	ClusterRecoveryRelmapSourceV1 original, expected;
+
+	if (source == NULL)
+		return false;
+	memcpy(&original, source, sizeof(original));
+	return inputs_relmap_locator_current(&original)
+		&& inputs_relmap_source(original.scope, original.input_index, &expected)
+		&& memcmp(&original, &expected, sizeof(original)) == 0
+		&& memcmp(source, &original, sizeof(original)) == 0;
+}
+
+typedef struct RelmapNativeInputRead {
+	ClusterRecoveryRelmapNativeInputV1 value;
+	bool checkpoint_seen;
+} RelmapNativeInputRead;
+
+static bool
+inputs_relmap_native_record(XLogReaderState *reader, void *arg)
+{
+	RelmapNativeInputRead *read = arg;
+	const ClusterWalInputV1 *item = &read->value.source.selected;
+	uint8 info;
+
+	if (reader->ReadRecPtr != item->checkpoint_start)
+		return true;
+	info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+	if (read->checkpoint_seen || XLogRecGetRmid(reader) != RM_XLOG_ID
+		|| (info != XLOG_CHECKPOINT_ONLINE && info != XLOG_CHECKPOINT_SHUTDOWN)
+		|| XLogRecGetDataLen(reader) != sizeof(CheckPoint)
+		|| memcmp(XLogRecGetData(reader), &item->native_checkpoint, sizeof(CheckPoint)) != 0
+		|| reader->EndRecPtr <= reader->ReadRecPtr)
+		return false;
+	read->checkpoint_seen = true;
+	read->value.checkpoint_end = reader->EndRecPtr;
+	return true;
+}
+
+ClusterRecoveryRelmapNativeInputV1
+cluster_wal_inputs_relmap_native_v1(ClusterWalInputsV1 *inputs, uint32 input_index)
+{
+	RelmapNativeInputRead read = {0};
+	ClusterRecoveryRelmapNativeInputV1 empty = {0};
+	const struct ClusterRecoveryStartV1 *start;
+	const ClusterWalInputV1 *item;
+	bool ok = false;
+
+	/* Refuse caller lock/critical ownership before entering the observation;
+	 * a precondition error must not poison the original episode or its pins. */
+	if (CritSectionCount != 0 || cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return empty;
+	read.value.source = cluster_wal_inputs_relmap_source_v1(inputs, input_index);
+	if (!cluster_wal_inputs_relmap_source_current_v1(&read.value.source))
+		return empty;
+	start = inputs->ctrc.start;
+	item = &read.value.source.selected;
+	PG_TRY();
+	{
+		ok = item->kind == CLUSTER_WAL_INPUT_CHECKPOINT
+			&& cluster_wal_inputs_visit_retained_v1(inputs, input_index,
+				inputs_relmap_native_record, &read, &read.value.tail)
+				== CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& read.checkpoint_seen
+			&& read.value.checkpoint_end <= read.value.tail.complete_end
+			&& cluster_relmap_checkpoint_window_decode_v2(item->native_window,
+				&item->native_checkpoint, item->checkpoint_start, read.value.checkpoint_end,
+				&item->source.claim.identity, item->source.claim.database_incarnation,
+				&read.value.window, &read.value.post_flush_issued)
+			&& cluster_wal_inputs_relmap_source_current_v1(&read.value.source)
+			&& cluster_wal_inputs_revalidate_v1(inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& cluster_wal_inputs_relmap_source_current_v1(&read.value.source);
+	}
+	PG_CATCH();
+	{
+		ClusterColdRecoveryRelmapFail(start);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!ok) {
+		ClusterColdRecoveryRelmapFail(start);
+		return empty;
+	}
+	return read.value;
 }
 
 bool
