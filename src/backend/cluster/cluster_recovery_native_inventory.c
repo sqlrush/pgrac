@@ -2346,19 +2346,10 @@ history_source_observation(ClusterRecoveryRelmapHistory *history, uint32 ordinal
 	ClusterRecoveryWalSourceObservationV1 *out)
 {
 	ClusterRecoveryNativeInventory *inventory = history->inventory;
-	const NativeInventorySource *saved;
 
-	if (!inventory->complete || inventory->status != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED
-		|| inventory->sources == NULL || ordinal >= inventory->source_count
-		|| !inventory_history_inputs(inventory, history->original.scope, false))
+	if (!inventory_history_inputs(inventory, history->original.scope, false))
 		return false;
-	saved = &inventory->sources[ordinal];
-	out->source = saved->source;
-	out->cut = saved->cut;
-	out->observed = saved->observed;
-	memcpy(out->transcript_sha256, saved->transcript, sizeof(out->transcript_sha256));
-	out->source_index = ordinal;
-	return true;
+	return cluster_recovery_native_inventory_source_at_v1(inventory, ordinal, out);
 }
 
 ClusterRecoveryNativeInventoryResult
