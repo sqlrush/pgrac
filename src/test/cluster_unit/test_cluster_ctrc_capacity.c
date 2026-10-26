@@ -16,6 +16,23 @@ int ctrc_fixture_main(void);
 #define main ctrc_fixture_main
 #include "test_cluster_ctrc_cleaner.c"
 #undef main
+#include "test_cluster_capacity_pool_compat.h"
+
+#ifdef CLUSTER_CAPACITY_POOL_TEST_API_ABSENT
+static ClusterCapacityReasonV1
+capacity_pool_api_absent(uint32 segment pg_attribute_unused(), SCN horizon pg_attribute_unused(),
+						 uint64 epoch pg_attribute_unused(), ClusterCapacityObservationV1 *out)
+{
+	if (out != NULL) {
+		MemSet(out, 0, sizeof(*out));
+		out->reason = CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
+	}
+	return CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
+}
+#define cluster_ctrc_capacity_probe_pool_v1 capacity_pool_api_absent
+extern bool cluster_undo_cleaner_capacity_owner_snapshot(unsigned worker, uint64 *coordinator,
+														 uint64 *generation);
+#endif
 
 int cluster_ges_request_timeout_ms = 3000;
 static UndoSegmentHeaderData sample_header;
@@ -30,6 +47,25 @@ static PGAlignedBlock certificate_resident;
 static bool certificate_current, certificate_pin, certificate_error_after_flush;
 static unsigned certificate_wal_calls, certificate_flush_calls;
 static bool sample_copy_error;
+static bool pool_owner_available;
+static uint64 pool_owner_generation, pool_coordinator_generation;
+static unsigned pool_owner_calls;
+
+/* Original owner identity is a boundary here; its actual producer is exercised
+ * by test_cluster_undo_cleaner_capacity. No PID is treated as liveness proof. */
+bool
+cluster_undo_cleaner_capacity_owner_snapshot(unsigned worker, uint64 *coordinator,
+											 uint64 *generation)
+{
+	if (held_count != 0 || worker >= CLUSTER_CTRC_CLEANER_WORKERS)
+		abort();
+	pool_owner_calls++;
+	if (!pool_owner_available)
+		return false;
+	*coordinator = pool_coordinator_generation;
+	*generation = pool_owner_generation;
+	return true;
+}
 
 int
 cluster_conf_node_count(void)
@@ -336,6 +372,10 @@ reset_capacity_sample(void)
 	certificate_current = certificate_pin = certificate_error_after_flush = false;
 	certificate_wal_calls = certificate_flush_calls = 0;
 	sample_copy_error = false;
+	pool_owner_available = true;
+	pool_owner_generation = 71;
+	pool_coordinator_generation = 83;
+	pool_owner_calls = 0;
 	return origin->key;
 }
 
@@ -635,10 +675,348 @@ UT_TEST(test_capacity_abort_and_witness_loss_are_not_guessed)
 	UT_ASSERT(ctrc_bytes_zero(&continuation, sizeof(continuation)));
 }
 
+
+/* Seed the original pool and a separately supplied canonical block. CURRENT
+ * stays at1 while the candidate can be any old segment/slot in the real pool. */
+static ClusterCtrcTxnKeyV1
+reset_pool_sample(unsigned index)
+{
+	ClusterCtrcOriginEntry *origin;
+
+	(void)reset_capacity_sample();
+	MemSet(&ctrc_origin_entries()[0], 0, sizeof(ClusterCtrcOriginEntry));
+	origin = seed_origin(index, 0);
+	(void)ctrc_origin_dispatchable_locked(origin);
+	MemSet(&sample_header, 0, sizeof(sample_header));
+	sample_header.segment_id = origin->key.segment_id;
+	sample_header.owner_instance = 1;
+	sample_header.wrap_count = 1;
+	sample_header.tt_slots_count = TT_SLOTS_PER_SEGMENT;
+	sample_header.tt_slots[origin->key.slot_offset].xid = origin->key.xid;
+	sample_header.tt_slots[origin->key.slot_offset].wrap = origin->key.slot_wrap;
+	sample_header.tt_slots[origin->key.slot_offset].status = TT_SLOT_COMMITTED;
+	sample_header.tt_slots[origin->key.slot_offset].commit_scn = 1000;
+	return origin->key;
+}
+
+UT_TEST(test_pool_observes_last_old_segment_before_original_cv)
+{
+	unsigned index = CLUSTER_UNDO_SEGS_PER_INSTANCE * TT_SLOTS_PER_SEGMENT - 1;
+	ClusterCtrcTxnKeyV1 key = reset_pool_sample(index);
+	ClusterCapacityObservationV1 observation;
+	ClusterCtrcOriginEntry before = ctrc_origin_entries()[index];
+	UndoSegmentHeaderData header_before = sample_header;
+
+	cluster_ctrc_stat_bump(CTRC_STAT_SEMANTIC_PROGRESS);
+	/* H is below the commit. Certificate work can precede H advancement. */
+	UT_ASSERT_EQ(cluster_ctrc_capacity_probe_pool_v1(1, 500, test_cluster_epoch, &observation),
+				 CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE);
+	UT_ASSERT_EQ(observation.reason, CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE);
+	UT_ASSERT_EQ(observation.scope, CLUSTER_CAPACITY_SCOPE_SEGMENT);
+	UT_ASSERT_EQ(observation.pool_positions, CLUSTER_UNDO_SEGS_PER_INSTANCE * TT_SLOTS_PER_SEGMENT);
+	UT_ASSERT_EQ(memcmp(&observation.key, &key, sizeof(key)), 0);
+	UT_ASSERT_EQ(observation.phase, CTRC_ORIGIN_CERTIFYING);
+	UT_ASSERT_EQ(observation.owner_worker, 7);
+	UT_ASSERT_EQ(observation.owner_generation, 71);
+	UT_ASSERT_EQ(observation.coordinator_generation, 83);
+	UT_ASSERT_EQ(observation.observed_change_sequence,
+				 cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS));
+	UT_ASSERT_EQ(memcmp(&before, &ctrc_origin_entries()[index], sizeof(before)), 0);
+	UT_ASSERT_EQ(memcmp(&header_before, &sample_header, sizeof(header_before)), 0);
+	UT_ASSERT_EQ(sample_holds, 1);
+	UT_ASSERT_EQ(sample_holds, sample_releases);
+	UT_ASSERT_EQ(sample_enters, sample_leaves);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_pool_missing_phase_ack_identity_native_and_owner_stays_unproven)
+{
+	for (unsigned fault = 0; fault < 20; fault++) {
+		unsigned index = TT_SLOTS_PER_SEGMENT * 3;
+		ClusterCtrcTxnKeyV1 key = reset_pool_sample(index);
+		ClusterCapacityObservationV1 observation;
+		ClusterCtrcOriginEntry *origin = &ctrc_origin_entries()[index];
+		ClusterCtrcOriginEntry before;
+		UndoSegmentHeaderData header_before;
+		SCN horizon = 2000;
+		uint64 epoch = test_cluster_epoch;
+
+		switch (fault) {
+		case 0:
+			origin->state = CTRC_ORIGIN_CLEANING;
+			break;
+		case 1:
+			origin->touched_bitmap = 1;
+			origin->touched_count = 1;
+			break;
+		case 2:
+			sample_active = true;
+			break;
+		case 3:
+			sample_commit = false;
+			break;
+		case 4:
+			sample_abort = true;
+			break;
+		case 5:
+			sample_native_drift = true;
+			break;
+		case 6:
+			sample_header.tt_slots[0].status = TT_SLOT_ACTIVE;
+			break;
+		case 7:
+			sample_header.tt_slots[0].wrap++;
+			break;
+		case 8:
+			sample_header.tt_slots[0].xid++;
+			break;
+		case 9:
+			sample_header.wrap_count++;
+			break;
+		case 10:
+			sample_header.tt_slots[0].flags = 0x80;
+			break;
+		case 11:
+			((uint8 *)&sample_header.tt_slots[0].first_undo_block)[0] = 1;
+			break;
+		case 12:
+			sample_admitted = false;
+			break;
+		case 13:
+			sample_recheck = false;
+			break;
+		case 14:
+			origin->key.origin_boot_incarnation++;
+			break;
+		case 15:
+			origin->key.root_id++;
+			break;
+		case 16:
+			pool_owner_available = false;
+			break;
+		case 17:
+			horizon = InvalidScn;
+			break;
+		case 18:
+			epoch++;
+			break;
+		case 19:
+			origin->key.system_identifier++;
+			break;
+		}
+		before = *origin;
+		header_before = sample_header;
+		UT_ASSERT_EQ(cluster_ctrc_capacity_probe_pool_v1(1, horizon, epoch, &observation),
+					 CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER);
+		UT_ASSERT(observation.unproven_reasons != 0);
+		UT_ASSERT_EQ(memcmp(&before, origin, sizeof(before)), 0);
+		UT_ASSERT_EQ(memcmp(&header_before, &sample_header, sizeof(header_before)), 0);
+		UT_ASSERT_EQ(sample_holds, sample_releases);
+		UT_ASSERT_EQ(sample_enters, sample_leaves);
+		UT_ASSERT_EQ(held_count, 0);
+		(void)key;
+	}
+}
+
+UT_TEST(test_pool_bad_candidate_does_not_block_independent_original_work)
+{
+	ClusterCtrcTxnKeyV1 key = reset_pool_sample(2);
+	ClusterCtrcOriginEntry *bad = seed_origin(1, 0);
+	ClusterCtrcOriginEntry before;
+	ClusterCapacityObservationV1 observation;
+	(void)ctrc_origin_dispatchable_locked(bad);
+	bad->touched_bitmap = 1;
+	bad->touched_count = 1;
+	before = *bad;
+	UT_ASSERT_EQ(cluster_ctrc_capacity_probe_pool_v1(1, 2000, test_cluster_epoch, &observation),
+				 CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE);
+	UT_ASSERT_EQ(memcmp(&observation.key, &key, sizeof(key)), 0);
+	UT_ASSERT_EQ(memcmp(&before, bad, sizeof(before)), 0);
+}
+
+UT_TEST(test_pool_certificate_batch_limit_advances_original_cursor)
+{
+	ClusterCtrcOriginCertificateSnapshot calibration;
+	ClusterCapacityObservationV1 observation;
+	ClusterCtrcTxnKeyV1 key;
+
+	/* Original selector calibrates its original next position to1. No test
+	 * writes a product cursor or expands a batch to reach the good row. */
+	(void)reset_capacity_sample();
+	UT_ASSERT(ctrc_origin_next_certificate_snapshot_shared(&calibration));
+	key = reset_pool_sample(17);
+	for (unsigned index = 1; index <= 16; index++)
+		(void)ctrc_origin_dispatchable_locked(seed_origin(index, 0));
+	UT_ASSERT_EQ(cluster_ctrc_capacity_probe_pool_v1(1, 2000, test_cluster_epoch, &observation),
+				 CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER);
+	UT_ASSERT_EQ(observation.pool_positions, CLUSTER_UNDO_SEGS_PER_INSTANCE * TT_SLOTS_PER_SEGMENT);
+	UT_ASSERT_EQ(sample_holds, 16);
+	UT_ASSERT_EQ(sample_holds, sample_releases);
+	UT_ASSERT_EQ(cluster_ctrc_capacity_probe_pool_v1(1, 2000, test_cluster_epoch, &observation),
+				 CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE);
+	UT_ASSERT_EQ(memcmp(&observation.key, &key, sizeof(key)), 0);
+	UT_ASSERT_EQ(sample_holds, 17);
+}
+
+static unsigned pool_drift_kind;
+static void
+pool_change_during_scur_release(void)
+{
+	sample_release_hook = NULL;
+	switch (pool_drift_kind) {
+	case 0:
+		ctrc_origin_entries()[TT_SLOTS_PER_SEGMENT * 3].seal_generation++;
+		break;
+	case 1:
+		ctrc_origin_entries()[TT_SLOTS_PER_SEGMENT * 3].state = CTRC_ORIGIN_RELEASE_PROVEN;
+		break;
+	case 2:
+		sample_current_segment = 2;
+		break;
+	case 3:
+		pool_owner_generation++;
+		break;
+	case 4:
+		pool_coordinator_generation++;
+		break;
+	}
+}
+
+UT_TEST(test_pool_rechecks_exact_phase_current_and_owner_after_physical_sample)
+{
+	for (pool_drift_kind = 0; pool_drift_kind < 5; pool_drift_kind++) {
+		ClusterCapacityObservationV1 observation;
+		(void)reset_pool_sample(TT_SLOTS_PER_SEGMENT * 3);
+		sample_release_hook = pool_change_during_scur_release;
+		UT_ASSERT_EQ(cluster_ctrc_capacity_probe_pool_v1(1, 2000, test_cluster_epoch, &observation),
+					 CLUSTER_CAPACITY_SUPPLY_RECHECK);
+		UT_ASSERT_EQ(observation.reason, CLUSTER_CAPACITY_SUPPLY_RECHECK);
+		UT_ASSERT_EQ(sample_holds, sample_releases);
+		UT_ASSERT_EQ(sample_enters, sample_leaves);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_pool_never_turns_publisher_pending_or_horizon_into_reuse_authority)
+{
+	ClusterCtrcTxnKeyV1 key = reset_pool_sample(TT_SLOTS_PER_SEGMENT * 3);
+	ClusterCapacityObservationV1 observation;
+	sample_header.tt_slots[0].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+	UT_ASSERT_EQ(cluster_ctrc_capacity_probe_pool_v1(1, 500, test_cluster_epoch, &observation),
+				 CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE);
+	UT_ASSERT(!cluster_ctrc_reuse_handoff_complete(&sample_header, key.slot_offset));
+	UT_ASSERT(!cluster_ctrc_terminal_release_sample_exact(key.segment_id, key.slot_offset, key.xid,
+														  key.slot_wrap, TT_SLOT_COMMITTED, 1000,
+														  test_cluster_epoch));
+	UT_ASSERT_EQ(ctrc_origin_entries()[TT_SLOTS_PER_SEGMENT * 3].state, CTRC_ORIGIN_CERTIFYING);
+}
+
+UT_TEST(test_pool_errors_keep_original_scur_and_admission_cleanup)
+{
+	volatile bool caught = false;
+	ClusterCapacityObservationV1 observation;
+	(void)reset_pool_sample(TT_SLOTS_PER_SEGMENT * 3);
+	sample_copy_error = true;
+	PG_TRY();
+	{
+		(void)cluster_ctrc_capacity_probe_pool_v1(1, 2000, test_cluster_epoch, &observation);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(sample_holds, 1);
+	UT_ASSERT_EQ(sample_holds, sample_releases);
+	UT_ASSERT_EQ(sample_enters, sample_leaves);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+
+UT_TEST(test_pool_uses_original_required_ack_bytes_and_retains_corruption)
+{
+	unsigned index = TT_SLOTS_PER_SEGMENT * 3;
+	ClusterCapacityObservationV1 observation;
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcOriginCertificateSnapshot certificate;
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcLocalReleaseAckV1 *ack;
+	uint64 participant, receipt, ack_index;
+
+	(void)reset_pool_sample(index);
+	MemSet(&ctrc_origin_entries()[index], 0, sizeof(ClusterCtrcOriginEntry));
+	UT_ASSERT(seed_frozen_certificate(index, &dispatch, &participant, &receipt));
+	origin = &ctrc_origin_entries()[index];
+	UT_ASSERT(cluster_ctrc_origin_arm_close_entry(origin, 0, 501));
+	UT_ASSERT(
+		cluster_ctrc_origin_ack_land_shared(501, &ctrc_participant_ack_entries()[participant]));
+	(void)ctrc_origin_dispatchable_locked(origin);
+	UT_ASSERT(ctrc_origin_certificate_snapshot_index_locked(index, &certificate));
+	UT_ASSERT_EQ(cluster_ctrc_capacity_probe_pool_v1(1, 500, test_cluster_epoch, &observation),
+				 CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE);
+	UT_ASSERT(ctrc_origin_ack_index(&origin->key, 0, &ack_index));
+	ack = &ctrc_origin_ack_entries()[ack_index];
+	ack->crc32c ^= 1;
+	UT_ASSERT_EQ(cluster_ctrc_capacity_probe_pool_v1(1, 500, test_cluster_epoch, &observation),
+				 CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER);
+	UT_ASSERT((observation.unproven_reasons & CLUSTER_CAPACITY_UNPROVEN_REQUIRED_ACK) != 0);
+	UT_ASSERT_EQ(origin->state, CTRC_ORIGIN_CERTIFYING);
+	UT_ASSERT_EQ(ack->crc32c, certificate.acks[0].crc32c ^ 1);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+static bool
+pool_interrupt_after_original_lock_span(LWLock *lock, LWLockMode mode pg_attribute_unused(),
+										bool acquiring)
+{
+	if (acquiring || lock != &CtrcShared->origin_lock)
+		return false;
+	if (held_count != 1)
+		abort();
+	test_lock_leave(lock);
+	external_lock_hook = NULL;
+	InterruptPending = 1;
+	return true;
+}
+
+UT_TEST(test_pool_census_cancellation_runs_after_original_locks_are_released)
+{
+	ClusterCapacityObservationV1 observation;
+	volatile bool caught = false;
+	(void)reset_pool_sample(CLUSTER_UNDO_SEGS_PER_INSTANCE * TT_SLOTS_PER_SEGMENT - 1);
+	external_lock_hook = pool_interrupt_after_original_lock_span;
+	PG_TRY();
+	{
+		(void)cluster_ctrc_capacity_probe_pool_v1(1, 2000, test_cluster_epoch, &observation);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	InterruptPending = 0;
+	external_lock_hook = NULL;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT_EQ(sample_holds, 0);
+	UT_ASSERT_EQ(sample_enters, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(17);
+	UT_RUN(test_pool_uses_original_required_ack_bytes_and_retains_corruption);
+	UT_RUN(test_pool_census_cancellation_runs_after_original_locks_are_released);
+	UT_RUN(test_pool_observes_last_old_segment_before_original_cv);
+	UT_RUN(test_pool_missing_phase_ack_identity_native_and_owner_stays_unproven);
+	UT_RUN(test_pool_bad_candidate_does_not_block_independent_original_work);
+	UT_RUN(test_pool_certificate_batch_limit_advances_original_cursor);
+	UT_RUN(test_pool_rechecks_exact_phase_current_and_owner_after_physical_sample);
+	UT_RUN(test_pool_never_turns_publisher_pending_or_horizon_into_reuse_authority);
+	UT_RUN(test_pool_errors_keep_original_scur_and_admission_cleanup);
+
 	UT_RUN(test_sampler_error_releases_current_and_admission_under_optimization);
 	UT_RUN(test_actual_certificate_error_after_flush_retains_then_replays_handoff);
 	UT_RUN(test_handoff_exact_identity_and_all_slot_scan_never_mutate);

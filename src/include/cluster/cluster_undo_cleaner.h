@@ -261,6 +261,11 @@ extern bool cluster_undo_cleaner_capacity_stats_snapshot(ClusterUndoCapacityStat
 extern bool cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out);
 extern bool
 cluster_undo_cleaner_active_sample_current(const ClusterUndoCleanerActiveSample *expected);
+/* Ready coordinator and original segment worker only; no capacity proof.
+ * False leaves both outputs untouched. */
+extern bool cluster_undo_cleaner_capacity_owner_snapshot(unsigned worker_id,
+														 uint64 *coordinator_generation,
+														 uint64 *worker_generation);
 extern bool cluster_undo_cleaner_wait_for_capacity(uint32 segment_id,
 												   ClusterCtrcTxnKeyV1 *continuation);
 

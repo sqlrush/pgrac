@@ -14,6 +14,8 @@
  */
 #include "postgres.h"
 #include "lib/ilist.h"
+#include "cluster/cluster_terminal_ref_census.h"
+#include "test_cluster_capacity_pool_compat.h"
 #include "../../backend/cluster/cluster_undo_cleaner.c"
 
 static struct {
@@ -63,6 +65,22 @@ static int test_error_code = ERRCODE_QUERY_CANCELED;
 static bool test_lock_wait;
 static ClusterCtrcCapacityProbeResult test_proof;
 static void (*test_capacity_probe_hook)(void);
+static ClusterCapacityReasonV1 test_pool_reason;
+static unsigned test_pool_calls;
+static void (*test_pool_probe_hook)(void);
+extern ClusterCapacityReasonV1
+cluster_ctrc_capacity_probe_pool_v1(uint32 segment, SCN horizon, uint64 epoch,
+									ClusterCapacityObservationV1 *observation);
+#ifdef CLUSTER_CAPACITY_POOL_TEST_API_ABSENT
+static bool
+capacity_owner_api_absent(unsigned worker pg_attribute_unused(),
+						  uint64 *coordinator pg_attribute_unused(),
+						  uint64 *generation pg_attribute_unused())
+{
+	return false;
+}
+#define cluster_undo_cleaner_capacity_owner_snapshot capacity_owner_api_absent
+#endif
 static TransactionId test_xid = 100;
 static bool test_maintenance_cut, test_ctrc_progress;
 static unsigned test_ctrc_passes, test_gc_passes, test_modifier_entries, test_modifier_leaves;
@@ -547,6 +565,25 @@ cluster_ctrc_capacity_probe_current(uint32 segment, SCN horizon, uint64 epoch,
 	return test_proof;
 }
 
+
+ClusterCapacityReasonV1
+cluster_ctrc_capacity_probe_pool_v1(uint32 segment, SCN horizon, uint64 epoch,
+									ClusterCapacityObservationV1 *observation)
+{
+	if (test_lock_depth != 0 || !subscribed || (segment == 0 || segment > 256) || horizon != 1000
+		|| epoch != 13)
+		abort();
+	test_pool_calls++;
+	MemSet(observation, 0, sizeof(*observation));
+	observation->reason = test_pool_reason;
+	observation->key.segment_id = 256;
+	observation->key.xid = 9123;
+	observation->key.slot_wrap = 3;
+	if (test_pool_probe_hook != NULL)
+		test_pool_probe_hook();
+	return test_pool_reason;
+}
+
 void
 ConditionVariableInit(ConditionVariable *cv)
 {
@@ -668,6 +705,9 @@ reset_wait_fixture(void)
 	test_wait_event = last_sleep_event = 0;
 	test_proof = CLUSTER_CTRC_CAPACITY_WAIT;
 	test_capacity_probe_hook = NULL;
+	test_pool_reason = CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
+	test_pool_calls = 0;
+	test_pool_probe_hook = NULL;
 	test_gc_complete = false;
 	test_inventory_max = 1;
 	test_inventory_scans = 0;
@@ -1909,10 +1949,172 @@ UT_TEST(test_capacity_stats_counts_only_query_cancellation_and_preserves_error_c
 	}
 }
 
+
+UT_TEST(test_pool_owner_uses_original_cv_and_exact_old_segment_worker)
+{
+	ClusterCtrcTxnKeyV1 continuation = { 0 };
+	reset_wait_fixture();
+	test_proof = CLUSTER_CTRC_CAPACITY_REFUSE;
+	test_pool_reason = CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE;
+	UT_ASSERT(cluster_undo_cleaner_wait_for_capacity(1, &continuation));
+	UT_ASSERT_EQ(test_pool_calls, 1);
+	UT_ASSERT_EQ(continuation.segment_id, 256);
+	UT_ASSERT_EQ(continuation.xid, 9123);
+	UT_ASSERT_EQ(slept, 1);
+	UT_ASSERT_EQ(signalled, 8);
+	UT_ASSERT_EQ(cancelled, 1);
+	UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_entered, 1);
+	UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_repolled, 1);
+	UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_proof, 0);
+	UT_ASSERT(!subscribed);
+}
+
+UT_TEST(test_pool_recheck_returns_to_allocator_without_sleep_or_grant)
+{
+	ClusterCtrcTxnKeyV1 continuation = { 0 }, empty = { 0 };
+	reset_wait_fixture();
+	test_proof = CLUSTER_CTRC_CAPACITY_REFUSE;
+	test_pool_reason = CLUSTER_CAPACITY_SUPPLY_RECHECK;
+	UT_ASSERT(cluster_undo_cleaner_wait_for_capacity(1, &continuation));
+	UT_ASSERT_EQ(test_pool_calls, 1);
+	UT_ASSERT_EQ(memcmp(&continuation, &empty, sizeof(empty)), 0);
+	UT_ASSERT_EQ(slept, 0);
+	UT_ASSERT_EQ(signalled, 0);
+	UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_entered, 0);
+	UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_proof, 0);
+	UT_ASSERT(!subscribed);
+}
+
+UT_TEST(test_pool_owner_change_cannot_bridge_original_wait_generation)
+{
+	ClusterCtrcTxnKeyV1 continuation = { 0 }, empty = { 0 };
+	reset_wait_fixture();
+	test_proof = CLUSTER_CTRC_CAPACITY_REFUSE;
+	test_pool_reason = CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE;
+	test_capacity_respawn_worker = 7;
+	test_pool_probe_hook = respawn_capacity_owner_during_probe;
+	UT_ASSERT(cluster_undo_cleaner_wait_for_capacity(1, &continuation));
+	UT_ASSERT_EQ(test_pool_calls, 1);
+	UT_ASSERT_EQ(memcmp(&continuation, &empty, sizeof(empty)), 0);
+	UT_ASSERT_EQ(slept, 0);
+	UT_ASSERT_EQ(signalled, 0);
+	UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_entered, 0);
+	UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_proof, 0);
+	UT_ASSERT(!subscribed);
+}
+
+UT_TEST(test_current_proof_never_calls_pool_and_unproven_never_sleeps)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterCtrcTxnKeyV1 continuation = { 0 };
+		reset_wait_fixture();
+		test_pool_reason = CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE;
+		if (fault == 1)
+			test_proof = CLUSTER_CTRC_CAPACITY_RETRY;
+		if (fault == 2) {
+			test_proof = CLUSTER_CTRC_CAPACITY_REFUSE;
+			test_pool_reason = CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
+		}
+		UT_ASSERT_EQ(cluster_undo_cleaner_wait_for_capacity(1, &continuation), fault != 2);
+		UT_ASSERT_EQ(test_pool_calls, fault == 2);
+		UT_ASSERT_EQ(slept, fault == 0);
+		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_proof, fault == 2);
+		UT_ASSERT(!subscribed);
+	}
+}
+
+UT_TEST(test_owner_snapshot_has_original_ready_generations_and_no_false_output)
+{
+	uint64 coordinator = 91, generation = 93;
+	reset_wait_fixture();
+	UT_ASSERT(cluster_undo_cleaner_capacity_owner_snapshot(7, &coordinator, &generation));
+	UT_ASSERT_EQ(coordinator, 1);
+	UT_ASSERT_EQ(generation, 1);
+	undo_cleaner_state->workers[7].incarnation_generation = 17;
+	UT_ASSERT(cluster_undo_cleaner_capacity_owner_snapshot(7, &coordinator, &generation));
+	UT_ASSERT_EQ(coordinator, 1);
+	UT_ASSERT_EQ(generation, 17);
+	for (unsigned fault = 0; fault < 6; fault++) {
+		reset_wait_fixture();
+		coordinator = 91;
+		generation = 93;
+		switch (fault) {
+		case 0:
+			undo_cleaner_state->shutdown_requested = true;
+			break;
+		case 1:
+			undo_cleaner_state->workers[0].status = UNDO_CLEANER_SPAWNING;
+			break;
+		case 2:
+			undo_cleaner_state->workers[7].latch = NULL;
+			break;
+		case 3:
+			undo_cleaner_state->workers[7].incarnation_generation = UINT64_MAX;
+			break;
+		case 4:
+			undo_cleaner_state->workers[7].incarnation_generation = 0;
+			break;
+		case 5:
+			break;
+		}
+		UT_ASSERT(!cluster_undo_cleaner_capacity_owner_snapshot(fault == 5 ? 8 : 7, &coordinator,
+																&generation));
+		UT_ASSERT_EQ(coordinator, 91);
+		UT_ASSERT_EQ(generation, 93);
+		UT_ASSERT_EQ(test_lock_depth, 0);
+	}
+}
+
+
+static void
+pool_proof_returns_with_context_hold(void)
+{
+	PrivateRefCountArray[0].refcount = 1;
+}
+
+UT_TEST(test_pool_keeps_original_context_refusal_and_cancel_cleanup)
+{
+	for (unsigned fault = 0; fault < 2; fault++) {
+		ClusterCtrcTxnKeyV1 continuation = { 0 };
+		volatile bool caught = false;
+		reset_wait_fixture();
+		test_proof = CLUSTER_CTRC_CAPACITY_REFUSE;
+		test_pool_reason = CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE;
+		if (fault == 0)
+			test_pool_probe_hook = pool_proof_returns_with_context_hold;
+		else
+			test_cancel = true;
+		PG_TRY();
+		{
+			UT_ASSERT(!cluster_undo_cleaner_wait_for_capacity(1, &continuation));
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 1);
+		UT_ASSERT_EQ(test_pool_calls, 1);
+		UT_ASSERT_EQ(slept, fault == 1);
+		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_context, fault == 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_cancelled), fault == 1);
+		UT_ASSERT_EQ(cancelled, 1);
+		UT_ASSERT_EQ(test_lock_depth, 0);
+		UT_ASSERT(!subscribed);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(40);
+	UT_PLAN(46);
+	UT_RUN(test_pool_keeps_original_context_refusal_and_cancel_cleanup);
+	UT_RUN(test_pool_owner_uses_original_cv_and_exact_old_segment_worker);
+	UT_RUN(test_pool_recheck_returns_to_allocator_without_sleep_or_grant);
+	UT_RUN(test_pool_owner_change_cannot_bridge_original_wait_generation);
+	UT_RUN(test_current_proof_never_calls_pool_and_unproven_never_sleeps);
+	UT_RUN(test_owner_snapshot_has_original_ready_generations_and_no_false_output);
+
 	UT_RUN(test_capacity_owner_respawn_requires_fresh_proof_before_sleep);
 	UT_RUN(test_unrelated_worker_respawn_keeps_exact_owner_wait);
 	UT_RUN(test_owner_respawn_cannot_override_proof_or_context_refusal);
