@@ -9,19 +9,32 @@
 #include "postgres.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "catalog/storage_xlog.h"
+#include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_recovery_native_inventory.h"
 #include "cluster/cluster_recovery_record_hash.h"
 #include "cluster/cluster_recovery_wal_targets.h"
 #include "cluster/cluster_side_undo.h"
 #include "cluster/storage/cluster_undo_xlog.h"
+#include "miscadmin.h"
+#include "replication/origin.h"
 
 #define INVENTORY_SEED_TICK 128
+
+typedef struct NativeInventoryHistory {
+	ClusterWalInputV1 input;
+	uint32 input_index;
+	XLogRecPtr checkpoint_end;
+	ClusterRelmapCheckpointWindow window;
+	uint64 post_flush_issued;
+	bool checkpoint_observed, window_observed;
+} NativeInventoryHistory;
 
 typedef struct NativeInventorySource {
 	ClusterWalSourceRef source;
 	RfContributorStreamCutV1 cut;
 	ClusterWalTailObservation observed;
 	uint8 transcript[32];
+	NativeInventoryHistory history;
 } NativeInventorySource;
 
 typedef struct NativeInventoryRecord {
@@ -33,6 +46,7 @@ typedef struct NativeInventoryRecord {
 } NativeInventoryRecord;
 
 struct ClusterRecoveryNativeInventory {
+	const ClusterRecoveryRelmapSourceV1 *relmap_owner; /* borrowed opaque history custody */
 	NativeInventorySource *sources;
 	NativeInventoryRecord *head;
 	NativeInventoryRecord *tail;
@@ -79,6 +93,85 @@ struct ClusterRecoveryNativeInventory {
 	ClusterRecoveryTerminalSummary terminal_lookup;
 	bool terminal_lookup_active;
 };
+
+/* Retain metadata from the SAME held input set, before and after each
+ * complete physical pass. Never refresh a selected checkpoint or window. */
+static bool
+inventory_history_inputs(ClusterRecoveryNativeInventory *work, ClusterWalInputsV1 *inputs,
+						 bool capture)
+{
+	if ((work->relmap_owner != NULL
+		 && !cluster_wal_inputs_relmap_source_current_v1(work->relmap_owner))
+		|| cluster_wal_inputs_count_v1(inputs) != work->source_count)
+		return false;
+	for (uint32 i = 0; i < work->source_count; ++i) {
+		uint32 index = capture ? i : work->sources[i].history.input_index;
+		const ClusterWalInputV1 *input = cluster_wal_inputs_at_v1(inputs, index);
+		ClusterWalInputV1 *saved = &work->sources[i].history.input;
+		if (input == NULL)
+			return false;
+		/* These original scope-owned carriers are zero-initialized values;
+		 * retain all bytes, including complete native checkpoint/window and
+		 * the alternative's original terminal metadata. */
+		if (capture) {
+			memcpy(saved, input, sizeof(*saved));
+			work->sources[i].history.input_index = i;
+		} else if (memcmp(saved, input, sizeof(*saved)) != 0)
+			return false;
+	}
+	return work->relmap_owner == NULL
+		|| cluster_wal_inputs_relmap_source_current_v1(work->relmap_owner);
+}
+
+static bool
+inventory_history_checkpoint(ClusterRecoveryNativeInventory *work, XLogReaderState *reader)
+{
+	NativeInventoryHistory *history = &work->sources[work->source_cursor].history;
+	const ClusterWalInputV1 *input = &history->input;
+	ClusterRelmapCheckpointWindow window = { 0 };
+	uint64 issued = 0;
+	bool bound;
+
+	if (input->kind != CLUSTER_WAL_INPUT_CHECKPOINT
+		|| reader->ReadRecPtr != input->checkpoint_start)
+		return true;
+	bound = XLogRecGetRmid(reader) == RM_XLOG_ID
+			&& (XLogRecGetInfo(reader) == XLOG_CHECKPOINT_ONLINE
+				|| XLogRecGetInfo(reader) == XLOG_CHECKPOINT_SHUTDOWN)
+			&& XLogRecGetXid(reader) == InvalidTransactionId && XLogRecMaxBlockId(reader) < 0
+			&& !reader->record->has_page_version_edge
+			&& XLogRecGetOrigin(reader) == InvalidRepOriginId
+			&& !TransactionIdIsValid(reader->record->toplevel_xid)
+			&& XLogRecGetDataLen(reader) == sizeof(input->native_checkpoint)
+			&& XLogRecGetData(reader) != NULL
+			&& memcmp(XLogRecGetData(reader), &input->native_checkpoint,
+					  sizeof(input->native_checkpoint))
+				   == 0;
+	if (work->pass == 0) {
+		history->checkpoint_observed = bound;
+		if (bound) {
+			history->checkpoint_end = reader->EndRecPtr;
+			history->window_observed = cluster_relmap_checkpoint_window_decode_v2(
+				input->native_window, &input->native_checkpoint, reader->ReadRecPtr,
+				reader->EndRecPtr, &input->source.claim.identity,
+				input->source.claim.database_incarnation, &history->window,
+				&history->post_flush_issued);
+		}
+		return true;
+	}
+	if (history->checkpoint_observed != bound
+		|| (bound && history->checkpoint_end != reader->EndRecPtr))
+		return false;
+	if (!bound)
+		return true;
+	return history->window_observed
+			   == cluster_relmap_checkpoint_window_decode_v2(
+				   input->native_window, &input->native_checkpoint, reader->ReadRecPtr,
+				   reader->EndRecPtr, &input->source.claim.identity,
+				   input->source.claim.database_incarnation, &window, &issued)
+		   && memcmp(&window, &history->window, sizeof(window)) == 0
+		   && issued == history->post_flush_issued;
+}
 
 static void
 inventory_revoke_dependents(ClusterRecoveryNativeInventory *work)
@@ -150,6 +243,26 @@ inventory_source(const ClusterWalSourceRef *source, const RfContributorStreamCut
 			return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
 									RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
 		if (work->pass == 0) {
+			uint32 index;
+			/* The original census sorts full sources; at_v1 preserves selector
+			 * order. Bind by complete source, including empty/history inputs,
+			 * and retain the original selector index for every later check. */
+			for (index = work->source_cursor; index < work->source_count; ++index)
+				if (inventory_source_equal(&work->sources[index].history.input.source, source))
+					break;
+			if (index == work->source_count)
+				return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
+										RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
+			if (index != work->source_cursor) {
+				NativeInventoryHistory swap = saved->history;
+				saved->history = work->sources[index].history;
+				work->sources[index].history = swap;
+			}
+		}
+		if (!inventory_source_equal(&saved->history.input.source, source))
+			return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
+									RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
+		if (work->pass == 0) {
 			/* Empty terminals have no record callback. Bind them here too. */
 			if (work->roots != NULL
 				&& !cluster_recovery_root_set_targets_match(
@@ -208,6 +321,9 @@ inventory_record(XLogReaderState *reader, const ClusterWalSourceRef *source,
 	if (work->source_records == UINT64_MAX || work->diag.records == UINT64_MAX)
 		return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY,
 								RF_PAGE_PROOF_DETAIL_CAPACITY);
+	if (!inventory_history_checkpoint(work, reader))
+		return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
+			RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
 	ordinal = work->source_records++;
 	if (!cluster_recovery_record_hash_update(work->hash, reader))
 		return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID,
@@ -332,6 +448,11 @@ inventory_read_pass(ClusterRecoveryNativeInventory *work, ClusterWalInputsV1 *in
 	work->source_cursor = 0;
 	work->cursor = work->head;
 	work->active = false;
+	if (!inventory_history_inputs(work, inputs, work->pass == 0)) {
+		inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
+						 RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
+		return;
+	}
 	work->diag.input_result = cluster_wal_inputs_cold_census_v1(
 		inputs, inventory_record, inventory_source, work, &records, &work->diag.input_detail);
 	if (work->diag.input_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
@@ -340,11 +461,15 @@ inventory_read_pass(ClusterRecoveryNativeInventory *work, ClusterWalInputsV1 *in
 	} else if (work->active || work->source_cursor != work->source_count
 			   || records != work->diag.records || (work->pass == 1 && work->cursor != NULL))
 		work->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED;
+	else if (!inventory_history_inputs(work, inputs, false))
+		inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
+						 RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
 }
 
 static ClusterRecoveryNativeInventoryResult
 inventory_build(ClusterWalInputsV1 *inputs, ClusterRecoveryRootSet *roots, size_t memory_budget,
-				ClusterRecoveryNativeInventory **out, ClusterRecoveryNativeInventoryDiag *diag)
+				ClusterRecoveryNativeInventory **out, ClusterRecoveryNativeInventoryDiag *diag,
+				const ClusterRecoveryRelmapSourceV1 *relmap_owner)
 {
 	ClusterRecoveryNativeInventory *work;
 	ClusterRecoveryNativeInventoryResult result;
@@ -368,6 +493,7 @@ inventory_build(ClusterWalInputsV1 *inputs, ClusterRecoveryRootSet *roots, size_
 		return CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY;
 	work->sources = (NativeInventorySource *)((char *)work + prefix);
 	work->roots = roots;
+	work->relmap_owner = relmap_owner;
 	work->budget = memory_budget;
 	work->source_count = work->diag.sources = count;
 	work->diag.owned_bytes = size;
@@ -409,7 +535,7 @@ cluster_recovery_native_inventory_build(ClusterWalInputsV1 *inputs, size_t memor
 										ClusterRecoveryNativeInventory **out,
 										ClusterRecoveryNativeInventoryDiag *diag)
 {
-	return inventory_build(inputs, NULL, memory_budget, out, diag);
+	return inventory_build(inputs, NULL, memory_budget, out, diag, NULL);
 }
 
 ClusterRecoveryNativeInventoryResult
@@ -427,7 +553,7 @@ cluster_recovery_native_inventory_collect_roots(ClusterWalInputsV1 *inputs,
 			memset(diag, 0, sizeof(*diag));
 		return CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID;
 	}
-	result = inventory_build(inputs, roots, memory_budget, out, diag);
+	result = inventory_build(inputs, roots, memory_budget, out, diag, NULL);
 	if (result != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED)
 		cluster_recovery_root_set_invalidate(roots);
 	return result;
@@ -1331,5 +1457,197 @@ cluster_recovery_native_inventory_destroy(ClusterRecoveryNativeInventory *invent
 		record = next;
 	}
 	free(inventory);
+}
+
+/* Local input custody only. The original Start, simultaneous IR/WALR and
+ * whole ROOT remain the sole episode owner; this handle releases none. */
+struct ClusterRecoveryRelmapHistory {
+	ClusterRecoveryRelmapSourceV1 original;
+	ClusterRecoveryNativeInventory *inventory;
+	bool failed;
+};
+
+static bool
+history_overlap(const void *a, size_t an, const void *b, size_t bn)
+{
+	uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
+	return a != NULL && b != NULL && (x <= y ? y - x < an : x - y < bn);
+}
+
+static void
+history_fail(ClusterRecoveryRelmapHistory *history)
+{
+	history->failed = true;
+	if (history->inventory != NULL) {
+		history->inventory->complete = false;
+		history->inventory->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED;
+		inventory_revoke_dependents(history->inventory);
+	}
+	cluster_wal_inputs_relmap_source_fail_v1(&history->original);
+}
+
+ClusterRecoveryNativeInventoryResult
+cluster_recovery_relmap_history_build_v1(const ClusterRecoveryRelmapSourceV1 *source,
+	size_t memory_budget, ClusterRecoveryRelmapHistory **out,
+	ClusterRecoveryNativeInventoryDiag *diag)
+{
+	ClusterRecoveryRelmapSourceV1 original;
+	ClusterRecoveryRelmapHistory *volatile history = NULL;
+	volatile ClusterRecoveryNativeInventoryResult result = CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID;
+	volatile bool entered = false;
+
+	if (out == NULL || diag == NULL || source == NULL
+		|| history_overlap(out, sizeof(*out), source, sizeof(*source))
+		|| history_overlap(diag, sizeof(*diag), source, sizeof(*source))
+		|| history_overlap(out, sizeof(*out), diag, sizeof(*diag)))
+		return result;
+	*out = NULL;
+	memset(diag, 0, sizeof(*diag));
+	memcpy(&original, source, sizeof(original));
+	if (CritSectionCount != 0 || cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return result;
+	if (memory_budget < sizeof(*history))
+		return CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY;
+	PG_TRY();
+	{
+		/* Even the first native all-holder check may raise ERROR. Keep the
+		 * copied outside locator available to revoke the original episode. */
+		if (cluster_wal_inputs_relmap_source_current_v1(&original)) {
+			entered = true;
+			history = calloc(1, sizeof(*history));
+			if (history == NULL)
+				result = CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY;
+			else {
+				memcpy(&history->original, &original, sizeof(original));
+				result = inventory_build(original.scope, NULL, memory_budget - sizeof(*history),
+					&history->inventory, diag, &history->original);
+				diag->owned_bytes += sizeof(*history);
+				if (result == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED
+					&& (!cluster_wal_inputs_relmap_source_current_v1(&original)
+						|| history->inventory->source_count != original.input_count
+						|| memcmp(source, &original, sizeof(original)) != 0))
+					result = CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED;
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		cluster_wal_inputs_relmap_source_fail_v1(&original);
+		cluster_recovery_relmap_history_destroy_v1((ClusterRecoveryRelmapHistory **)&history);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (result != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED) {
+		if (entered)
+			cluster_wal_inputs_relmap_source_fail_v1(&original);
+		cluster_recovery_relmap_history_destroy_v1((ClusterRecoveryRelmapHistory **)&history);
+		return result;
+	}
+	*out = history;
+	return result;
+}
+
+bool
+cluster_recovery_relmap_history_source_v1(ClusterRecoveryRelmapHistory *history, uint32 ordinal,
+	ClusterRecoveryRelmapHistoryEntryV1 *out)
+{
+	ClusterRecoveryRelmapHistoryEntryV1 entry = {0};
+	const NativeInventorySource *saved;
+	volatile bool ok = false;
+
+	if (out == NULL || history_overlap(out, sizeof(*out), history, sizeof(*history)))
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (history == NULL || history->failed || history->inventory == NULL
+		|| ordinal >= history->inventory->source_count || CritSectionCount != 0
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return false;
+	saved = &history->inventory->sources[ordinal];
+	PG_TRY();
+	{
+		ok = history->inventory->complete
+			&& history->inventory->status == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED
+			&& cluster_wal_inputs_relmap_source_current_v1(&history->original);
+		if (ok) {
+			entry.source = cluster_wal_inputs_relmap_source_v1(history->original.scope,
+				saved->history.input_index);
+			ok = cluster_wal_inputs_relmap_source_current_v1(&entry.source)
+				&& memcmp(&entry.source.selected, &saved->history.input,
+					sizeof(saved->history.input)) == 0
+				&& inventory_source_equal(&saved->source, &entry.source.selected.source);
+		}
+		if (ok) {
+			entry.checkpoint_end = saved->history.checkpoint_end;
+			entry.window = saved->history.window;
+			entry.post_flush_issued = saved->history.post_flush_issued;
+			entry.checkpoint_observed = saved->history.checkpoint_observed;
+			entry.window_observed = saved->history.window_observed;
+			ok = cluster_wal_inputs_relmap_source_current_v1(&history->original)
+				&& cluster_wal_inputs_relmap_source_current_v1(&entry.source);
+		}
+	}
+	PG_CATCH();
+	{
+		history_fail(history);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!ok)
+		history_fail(history);
+	else
+		memcpy(out, &entry, sizeof(entry));
+	return ok;
+}
+
+ClusterRecoveryNativeInventoryResult
+cluster_recovery_relmap_history_recheck_v1(ClusterRecoveryRelmapHistory *history,
+	ClusterRecoveryNativeInventoryDiag *diag)
+{
+	volatile ClusterRecoveryNativeInventoryResult result = CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED;
+
+	if (diag == NULL || history_overlap(diag, sizeof(*diag), history, sizeof(*history)))
+		return CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID;
+	memset(diag, 0, sizeof(*diag));
+	if (history == NULL || history->failed || history->inventory == NULL)
+		return result;
+	if (CritSectionCount != 0 || cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID;
+	/* Reentry or ERROR must never expose the old completed observation. */
+	history->failed = true;
+	PG_TRY();
+	{
+		if (cluster_wal_inputs_relmap_source_current_v1(&history->original)) {
+			result = cluster_recovery_native_inventory_recheck(history->original.scope,
+				history->inventory, diag);
+			if (result == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED
+				&& !cluster_wal_inputs_relmap_source_current_v1(&history->original))
+				result = CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED;
+		}
+	}
+	PG_CATCH();
+	{
+		history_fail(history);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	diag->owned_bytes += sizeof(*history);
+	if (result == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED)
+		history->failed = false;
+	else
+		history_fail(history);
+	return result;
+}
+
+void
+cluster_recovery_relmap_history_destroy_v1(ClusterRecoveryRelmapHistory **custody)
+{
+	ClusterRecoveryRelmapHistory *history;
+
+	if (custody == NULL || *custody == NULL)
+		return;
+	history = *custody;
+	*custody = NULL;
+	cluster_recovery_native_inventory_destroy(history->inventory);
+	free(history);
 }
 #endif
