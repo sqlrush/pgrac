@@ -9840,16 +9840,18 @@ test_cluster_first_fill_retire.inc: $(top_srcdir)/src/backend/cluster/cluster_gc
 	     /^gcs_block_reserve_slot\(/ { print "static ClusterGcsBlockOutstandingSlot *"; emit=1; n++ } \
 	     /^gcs_block_(clear_slot_locked|release_slot)\(/ { print "static void"; emit=1; n++ } \
 	     /^gcs_block_compute_invalidate_ack_checksum\(/ { print "static uint32"; emit=1; n++ } \
+	     /^gcs_block_pending_s_notify_(action_internal|action)\(/ { print "static bool"; emit=1; n++ } \
+	     /^gcs_block_pending_s_notify\(/ { print "static void"; emit=1; n++ } \
 	     /^gcs_first_fill_(arm_slot|receipt_matches|receipt_consumed|retry_progress)\(/ { print "static bool"; emit=1; n++ } \
 	     /^gcs_first_fill_receipt_count_locked\(/ { print "static unsigned"; emit=1; n++ } \
-	     /^gcs_first_fill_(receipt_offer|receipt_tick|source_exit)\(/ { print "static void"; emit=1; n++ } \
+	     /^gcs_first_fill_(receipt_offer|receipt_tick|confirm_offer|source_exit)\(/ { print "static void"; emit=1; n++ } \
 	     /^gcs_first_fill_receipt_revoke\(/ { print "static int"; emit=1; n++ } \
 	     /^gcs_read_source_key\(/ { print "static ClusterPcmReadGrantKey"; emit=1; n++ } \
 	     /^gcs_read_source_arm\(/ { print "static bool"; emit=1; n++ } \
 	     /^cluster_gcs_block_read_source_(complete|retry_wait)\(/ { print "void"; emit=1; n++ } \
 	     /^cluster_gcs_block_read_source_(quiescent|quiesce)\(/ { print "bool"; emit=1; n++ } \
 	     /^gcs_block_(pending_s_delivery_closed|invalidate_execute)\(/ { print "static bool"; emit=1; n++ } \
-	     emit { print } emit && /^}/ { emit=0 } END { if (n != 23 || emit) exit 1 }' $< >> $@.tmp
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 27 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
 
 test_cluster_first_fill_retire: test_cluster_first_fill_retire.c test_cluster_pcm_own test_cluster_pcm_own.c \

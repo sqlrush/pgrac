@@ -9,6 +9,7 @@ int first_fill_retire_own_fixture_main(void);
 #include "cluster/cluster_gcs_reqid.h"
 #include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_block_io_trace.h"
+#include "cluster/cluster_membership.h"
 #include "storage/condition_variable.h"
 #include "storage/latch.h"
 #include "storage/proc.h"
@@ -19,13 +20,20 @@ int first_fill_retire_own_fixture_main(void);
 static void gcs_block_clear_slot_locked(ClusterGcsBlockOutstandingSlot *slot);
 static ClusterGcsBlockBackendBlock retire_blocks[1];
 static ClusterGcsBlockBackendBlock *gcs_block_backend_blocks = retire_blocks;
-static struct { pg_atomic_uint64 invalidate_busy_sent_count; } retire_shared;
+static struct {
+	pg_atomic_uint64 invalidate_busy_sent_count;
+	pg_atomic_uint64 done_sent_count, done_enqueue_drop_count;
+} retire_shared;
 static int retire_backend = 1, retire_pid = 71, retire_route = 2;
 static TimestampTz retire_start = 700, retire_now = 10;
 static uint64 retire_epoch = 1, retire_peer_session = 17;
 static unsigned retire_sends, retire_admitted, retire_tag_reads, retire_wakes, retire_sleeps;
 static unsigned retire_receipts, retire_trace_published, retire_trace_consumed;
 static ClusterICSendResult retire_result;
+static bool retire_confirm_admit;
+static unsigned retire_confirm_sends, retire_confirm_handed, retire_worker_wakes;
+static GcsBlockDonePayload retire_confirm;
+static ClusterMembershipState retire_master_state = CLUSTER_MEMBER_MEMBER;
 static GcsBlockInvalidateAckPayload retire_ack;
 static bool retire_session = true, retire_cancel;
 static void (*retire_on_wait)(void);
@@ -40,6 +48,11 @@ static ClusterPcmReadSource retire_wait_source;
 #define cluster_epoch_get_current() retire_epoch
 #define cluster_lms_shard_for_tag(tag, workers) 0
 #define cluster_gcs_lookup_master(tag) retire_route
+#define cluster_membership_get_state(node) retire_master_state
+#define cluster_lms_wakeup(worker) (++retire_worker_wakes)
+#define cluster_ic_suppress_gcs_done_cap false
+#define cluster_sf_peer_supports_gcs_done(node) true
+#define cluster_injection_should_skip(name) false
 #define GetCurrentTimestamp() retire_now
 #define LWLockAcquire(lock, mode) ((void)0)
 #define LWLockRelease(lock) ((void)0)
@@ -97,8 +110,21 @@ retire_send(uint8 type, int dest, const void *payload, uint32 len)
 }
 #define gcs_block_send_envelope_or_loopback retire_send
 #define cluster_ic_send_envelope retire_send
-#define cluster_grd_outbound_enqueue_backend_msg(type, dest, data, len) \
-	(retire_send(type, dest, data, len) == CLUSTER_IC_SEND_DONE)
+static bool
+retire_enqueue(uint8 type, int dest, const void *payload, uint32 len)
+{
+	if (type != PGRAC_IC_MSG_GCS_BLOCK_DONE)
+		return retire_send(type, dest, payload, len) == CLUSTER_IC_SEND_DONE;
+	UT_ASSERT_EQ(dest, 2);
+	UT_ASSERT_EQ(len, sizeof(retire_confirm));
+	retire_confirm = *(const GcsBlockDonePayload *)payload;
+	if (retire_confirm.reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_CONFIRM)
+		return true; /* Existing cancellation NACK boundary. */
+	retire_confirm_sends++;
+	if (retire_confirm_admit) retire_confirm_handed++;
+	return retire_confirm_admit;
+}
+#define cluster_grd_outbound_enqueue_backend_msg retire_enqueue
 static PcmLockMode
 retire_tag_state(BufferTag tag pg_attribute_unused())
 {
@@ -107,20 +133,6 @@ retire_tag_state(BufferTag tag pg_attribute_unused())
 }
 #define cluster_bufmgr_block_pcm_state retire_tag_state
 #define cluster_bufmgr_block_grant_pending(tag) true
-static bool
-gcs_block_pending_s_notify_action(const ClusterPcmReadGrantKey *key pg_attribute_unused(),
-	int master, uint8 action)
-{
-	UT_ASSERT_EQ(master, 2);
-	UT_ASSERT_EQ(action, GCS_BLOCK_DONE_PENDING_S_NACK);
-	return true;
-}
-static void
-gcs_block_pending_s_notify(const ClusterPcmReadGrantKey *key, int master, bool installed)
-{
-	UT_ASSERT(!installed);
-	(void)gcs_block_pending_s_notify_action(key, master, GCS_BLOCK_DONE_PENDING_S_NACK);
-}
 static void
 retire_trace(const ClusterPcmReadSource *source pg_attribute_unused(), const char *event,
 	int backend, int buf, int pid, uint64 incarnation, unsigned count)
@@ -164,6 +176,11 @@ retire_reset(BufferDesc *buf, ClusterPcmOwnEntry *entry, bool fresh)
 	retire_receipts = retire_trace_published = retire_trace_consumed = 0;
 	retire_result = CLUSTER_IC_SEND_NOT_ADMITTED;
 	retire_session = true; retire_cancel = false; retire_on_wait = NULL;
+	retire_confirm_admit = false;
+	retire_confirm_sends = retire_confirm_handed = retire_worker_wakes = 0;
+	retire_master_state = CLUSTER_MEMBER_MEMBER;
+	memset(&retire_confirm, 0, sizeof(retire_confirm));
+	memset(&retire_shared, 0, sizeof(retire_shared));
 	transition_buf = buf;
 }
 static ClusterPcmReadSource
@@ -435,10 +452,170 @@ UT_TEST(test_admitted_original_master_notice_survives_route_change)
 	UT_ASSERT(!retire_blocks[0].slots[0].in_use);
 }
 
+/* The installer boundary supplies a completed native S tuple. Actual
+ * source completion must verify it before publishing a confirmation owner. */
+static void
+retire_prepare_install(BufferDesc *buf, ClusterPcmOwnEntry *entry, ClusterPcmReadSource *source)
+{
+	UT_ASSERT(cluster_gcs_block_read_source_quiesce(buf, source));
+	source->quiescent = source->durable = true;
+	source->kind = CLUSTER_PCM_SOURCE_IMAGE_INSTALLED;
+	pg_atomic_write_u64(&entry->generation, source->base_generation + 1);
+	pg_atomic_write_u32(&entry->flags, 0);
+	buf->pcm_state = PCM_STATE_S;
+	pg_atomic_write_u32(&buf->state, BM_TAG_VALID | BM_VALID | BUF_REFCOUNT_ONE);
+}
+
+UT_TEST(test_installed_confirm_refusal_keeps_original_owner_until_real_handoff)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmReadSource a;
+	GcsBlockDonePayload first;
+	unsigned wakes;
+	retire_reset(&buf, &entry, true); a = retire_arm(&buf, true);
+	retire_prepare_install(&buf, &entry, &a);
+	cluster_gcs_block_read_source_complete(&buf, &a, true);
+	UT_ASSERT(retire_blocks[0].slots[0].in_use);
+	if (!retire_blocks[0].slots[0].in_use) return;
+	UT_ASSERT(!a.pending_s && !retire_blocks[0].slots[0].first_fill.quiet);
+	UT_ASSERT_EQ(retire_confirm_sends, 0); /* Backend only publishes; LMS owns offers. */
+	UT_ASSERT(retire_worker_wakes > 0);
+	gcs_first_fill_receipt_tick(0); first = retire_confirm;
+	UT_ASSERT_EQ(retire_confirm_sends, 1); UT_ASSERT_EQ(retire_confirm_handed, 0);
+	UT_ASSERT_EQ(first.reserved_0[0], GCS_BLOCK_DONE_PENDING_S_CONFIRM);
+	UT_ASSERT_EQ(first.sender_node, 3); UT_ASSERT_EQ(first.reserved_0[1], 3);
+	UT_ASSERT_EQ(first.requester_backend_id, 1); UT_ASSERT_EQ(first.request_id, a.request_id);
+	UT_ASSERT_EQ(first.epoch, 1); UT_ASSERT(BufferTagsEqual(&first.tag, &a.tag));
+	for (unsigned j = 2; j < sizeof(first.reserved_0); j++) UT_ASSERT_EQ(first.reserved_0[j], 0);
+	for (int offer = 0; offer < 3; offer++) {
+		retire_now += 10000; gcs_first_fill_receipt_tick(0);
+		UT_ASSERT(retire_blocks[0].slots[0].in_use);
+		UT_ASSERT_EQ(memcmp(&first, &retire_confirm, sizeof(first)), 0);
+	}
+	retire_confirm_admit = true; wakes = retire_wakes;
+	retire_now += 10000; gcs_first_fill_receipt_tick(0);
+	UT_ASSERT(!retire_blocks[0].slots[0].in_use); UT_ASSERT(retire_wakes > wakes);
+	UT_ASSERT_EQ(retire_confirm_handed, 1);
+	retire_now += 10000; gcs_first_fill_receipt_tick(0);
+	UT_ASSERT_EQ(retire_confirm_sends, 5); UT_ASSERT_EQ(retire_confirm_handed, 1);
+}
+
+UT_TEST(test_installed_confirm_survives_exit_and_never_reads_successor_buffer)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmReadSource a;
+	retire_reset(&buf, &entry, true); a = retire_arm(&buf, true);
+	retire_prepare_install(&buf, &entry, &a);
+	cluster_gcs_block_read_source_complete(&buf, &a, true);
+	UT_ASSERT(retire_blocks[0].slots[0].in_use);
+	if (!retire_blocks[0].slots[0].in_use) return;
+	for (int n = 0; n < GCS_READ_SOURCE_LEDGER_MAX; n++)
+		UT_ASSERT(!gcs_read_source_attempts[n].used);
+	gcs_first_fill_source_exit(); retire_pid++; retire_start++;
+	gcs_block_release_slot(&retire_blocks[0].slots[0]);
+	UT_ASSERT(retire_blocks[0].slots[0].in_use);
+	buf.tag.relNumber++; buf.pcm_state = PCM_STATE_N;
+	pg_atomic_write_u64(&entry.generation, 97);
+	pg_atomic_write_u32(&entry.flags, PCM_OWN_FLAG_GRANT_PENDING);
+	pg_atomic_write_u32(&buf.state, BM_TAG_VALID | BM_IO_IN_PROGRESS | BUF_REFCOUNT_ONE);
+	retire_confirm_admit = true; gcs_first_fill_receipt_tick(0);
+	UT_ASSERT(!retire_blocks[0].slots[0].in_use);
+	UT_ASSERT_EQ(retire_confirm.request_id, a.request_id);
+	UT_ASSERT(BufferTagsEqual(&retire_confirm.tag, &a.tag));
+	UT_ASSERT_EQ(retire_tag_reads, 0);
+	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), 97);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_GRANT_PENDING);
+	UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_N);
+}
+
+UT_TEST(test_installed_confirm_waits_for_unknown_session_but_retires_on_proved_reconfiguration)
+{
+	for (int why = 0; why < 6; why++) {
+		BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmReadSource a;
+		retire_reset(&buf, &entry, true); a = retire_arm(&buf, true);
+		retire_prepare_install(&buf, &entry, &a);
+		cluster_gcs_block_read_source_complete(&buf, &a, true);
+		UT_ASSERT(retire_blocks[0].slots[0].in_use);
+		if (!retire_blocks[0].slots[0].in_use) continue;
+		retire_session = false; retire_confirm_admit = true; retire_now += 300000000;
+		gcs_first_fill_receipt_tick(0);
+		UT_ASSERT(retire_blocks[0].slots[0].in_use); UT_ASSERT_EQ(retire_confirm_sends, 0);
+		retire_session = true;
+		if (why == 1) retire_epoch++;
+		if (why == 2) retire_route = 1;
+		if (why == 3) retire_peer_session++;
+		if (why == 4) retire_master_state = CLUSTER_MEMBER_DEAD;
+		if (why == 5) retire_master_state = CLUSTER_MEMBER_REMOVED;
+		retire_now += 10000; gcs_first_fill_receipt_tick(0);
+		UT_ASSERT(!retire_blocks[0].slots[0].in_use);
+		UT_ASSERT_EQ(retire_confirm_sends, why == 0 ? 1 : 0);
+		UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_S);
+		UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
+	}
+}
+
+UT_TEST(test_installed_confirm_requires_exact_native_publication_proof)
+{
+	for (int bad = 0; bad < 6; bad++) {
+		BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmReadSource a;
+		retire_reset(&buf, &entry, true); a = retire_arm(&buf, true);
+		retire_prepare_install(&buf, &entry, &a);
+		if (bad == 0) a.reservation_token++;
+		if (bad == 1) a.base_generation++;
+		if (bad == 2) a.tag.relNumber++;
+		if (bad == 3) pg_atomic_write_u32(&entry.flags, PCM_OWN_FLAG_GRANT_PENDING);
+		if (bad == 4) pg_atomic_fetch_or_u32(&buf.state, BM_IO_ERROR);
+		if (bad == 5) a.durable = false;
+		cluster_gcs_block_read_source_complete(&buf, &a, true);
+		retire_confirm_admit = true; gcs_first_fill_receipt_tick(0);
+		UT_ASSERT(a.pending_s); UT_ASSERT(retire_blocks[0].slots[0].in_use);
+		UT_ASSERT_EQ(retire_confirm_sends, 0); UT_ASSERT_EQ(retire_worker_wakes, 0);
+	}
+}
+
+UT_TEST(test_published_install_revoke_uses_resident_cleanup_and_closed_delivery)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmReadSource a;
+	GcsBlockInvalidatePayload inv;
+	retire_reset(&buf, &entry, true); a = retire_arm(&buf, true);
+	retire_prepare_install(&buf, &entry, &a);
+	cluster_gcs_block_read_source_complete(&buf, &a, true);
+	UT_ASSERT(retire_blocks[0].slots[0].in_use);
+	if (!retire_blocks[0].slots[0].in_use) return;
+	inv = retire_invalidate(&a);
+	UT_ASSERT_EQ(gcs_first_fill_receipt_revoke(&inv), 0);
+	UT_ASSERT(gcs_block_pending_s_delivery_closed(&inv));
+	UT_ASSERT(!retire_blocks[0].slots[0].first_fill.quiet);
+	UT_ASSERT(!retire_blocks[0].slots[0].first_fill_revoked);
+	UT_ASSERT_EQ(retire_sends, 0); UT_ASSERT_EQ(retire_tag_reads, 0);
+}
+
+UT_TEST(test_repeated_installed_confirmations_return_original_bounded_slots)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry;
+	retire_reset(&buf, &entry, true); retire_confirm_admit = true;
+	for (int episode = 0; episode < 2 * MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND + 1; episode++) {
+		ClusterPcmReadSource a;
+		buf.pcm_state = PCM_STATE_N;
+		pg_atomic_write_u32(&buf.state, BM_TAG_VALID | BM_IO_IN_PROGRESS | BUF_REFCOUNT_ONE);
+		a = retire_arm(&buf, true); retire_prepare_install(&buf, &entry, &a);
+		cluster_gcs_block_read_source_complete(&buf, &a, true);
+		UT_ASSERT(retire_blocks[0].slots[0].in_use);
+		retire_now += 10000; gcs_first_fill_receipt_tick(0);
+		for (int slot = 0; slot < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; slot++)
+			UT_ASSERT(!retire_blocks[0].slots[slot].in_use);
+		UT_ASSERT_EQ(retire_confirm_handed, episode + 1);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(18);
+	UT_RUN(test_installed_confirm_refusal_keeps_original_owner_until_real_handoff);
+	UT_RUN(test_installed_confirm_survives_exit_and_never_reads_successor_buffer);
+	UT_RUN(test_installed_confirm_waits_for_unknown_session_but_retires_on_proved_reconfiguration);
+	UT_RUN(test_installed_confirm_requires_exact_native_publication_proof);
+	UT_RUN(test_published_install_revoke_uses_resident_cleanup_and_closed_delivery);
+	UT_RUN(test_repeated_installed_confirmations_return_original_bounded_slots);
 	UT_RUN(test_old_quiet_a_never_reads_or_revokes_successor_b);
 	UT_RUN(test_ack_refusal_keeps_frame_and_receipt_until_real_takeover);
 	UT_RUN(test_master_consumption_retires_count_and_only_the_exact_old_receipt);

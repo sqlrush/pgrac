@@ -299,6 +299,7 @@ typedef struct GcsFirstFillReceipt {
 	bool ack_ready;
 	bool ack_handed;
 	bool ack_consumed;
+	bool confirm_pending; /* Published resident; LMS owns asynchronous confirmation. */
 	bool progress_waiter;
 } GcsFirstFillReceipt;
 
@@ -3411,6 +3412,77 @@ gcs_first_fill_receipt_offer(int backend, int index)
 	LWLockRelease(&blk->lock.lock);
 }
 
+/* Installed IO is complete and its process-local ledger may be gone. The
+ * original shared slot owns confirmation until the existing outbound ring
+ * takes the canonical DONE. Only its tag DATA worker offers it; a backend
+ * exit, successor buffer, refusal or elapsed time cannot erase this debt. */
+static void
+gcs_first_fill_confirm_offer(int backend, int index)
+{
+	ClusterGcsBlockBackendBlock *blk = &gcs_block_backend_blocks[backend];
+	ClusterGcsBlockOutstandingSlot *slot = &blk->slots[index];
+	GcsFirstFillReceipt receipt;
+	ClusterPcmReadGrantKey key = {0};
+	uint64 session;
+	int master;
+	bool reconfigured, retired = false;
+
+	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+	if (!slot->in_use || !slot->first_fill.armed || !slot->first_fill.confirm_pending
+		|| !slot->first_fill.delivery_closed || slot->first_fill.quiet
+		|| !slot->first_fill.source.quiescent || !slot->first_fill.source.durable
+		|| slot->first_fill.master_session == 0
+		|| slot->request_id != slot->first_fill.source.request_id
+		|| slot->request_epoch != slot->first_fill.source.request_epoch
+		|| slot->expected_master_node != slot->first_fill.source.master_node
+		|| !BufferTagsEqual(&slot->tag, &slot->first_fill.source.tag)) {
+		LWLockRelease(&blk->lock.lock);
+		return;
+	}
+	slot->first_fill.retry_at = GetCurrentTimestamp() + 10000;
+	receipt = slot->first_fill;
+	master = slot->expected_master_node;
+	key.tag = slot->tag; key.request_id = slot->request_id;
+	key.epoch = slot->request_epoch; key.backend_id = backend + 1;
+	key.requester_node = cluster_node_id;
+	LWLockRelease(&blk->lock.lock);
+	if (master < 0 || master >= 32)
+		return;
+	reconfigured = key.epoch != cluster_epoch_get_current()
+		|| cluster_gcs_lookup_master(key.tag) != master
+		|| cluster_membership_get_state(master) == CLUSTER_MEMBER_DEAD
+		|| cluster_membership_get_state(master) == CLUSTER_MEMBER_REMOVED;
+	if (!reconfigured) {
+		if (!gcs_block_pcm_x_authenticated_session(master, key.epoch, &session))
+			return; /* Unknown is not proof of a different owner. */
+		reconfigured = session != receipt.master_session;
+		if (!reconfigured && !gcs_block_pending_s_notify_action(&key, master,
+				GCS_BLOCK_DONE_PENDING_S_CONFIRM))
+			return;
+	}
+	/* Real admission transfers the frame to the existing ring. Proved
+	 * reconfiguration instead transfers native authority cleanup to the
+	 * existing membership/remaster sweep; neither grants any new rights. */
+	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+	if (slot->in_use && slot->first_fill.confirm_pending && !slot->first_fill.quiet
+		&& slot->request_id == key.request_id && slot->request_epoch == key.epoch
+		&& slot->expected_master_node == master && BufferTagsEqual(&slot->tag, &key.tag)
+		&& slot->first_fill.buf_id == receipt.buf_id
+		&& slot->first_fill.owner_pid == receipt.owner_pid
+		&& slot->first_fill.backend_incarnation == receipt.backend_incarnation
+		&& slot->first_fill.master_session == receipt.master_session
+		&& slot->first_fill.source.base_generation == receipt.source.base_generation
+		&& slot->first_fill.source.reservation_token == receipt.source.reservation_token) {
+		gcs_block_clear_slot_locked(slot);
+		ConditionVariableBroadcast(&blk->capacity_cv);
+		retired = true;
+	}
+	LWLockRelease(&blk->lock.lock);
+	if (retired)
+		cluster_block_io_trace_source(&receipt.source,
+			reconfigured ? "INSTALL_CONFIRM_RECONFIG" : "INSTALL_CONFIRM_QUEUED");
+}
+
 /* Return 0 only when this is not an exact retained first fill. In particular
  * an armed but not yet quiet A may not fall through to B's tag-wide state. */
 static int
@@ -3433,6 +3505,10 @@ gcs_first_fill_receipt_revoke(const GcsBlockInvalidatePayload *inv)
 			|| slot->request_epoch != epoch || slot->expected_master_node != inv->master_node
 			|| !BufferTagsEqual(&slot->tag, &inv->tag))
 			continue;
+		/* This fill already published a resident. Use the ordinary resident
+		 * drop/no-resident proof, never the failed-fill never-published ACK. */
+		if (receipt->confirm_pending)
+			break;
 		result = -1;
 		if (receipt->quiet && receipt->delivery_closed && receipt->owner_pid > 0
 			&& receipt->backend_incarnation > 0 && receipt->source.reservation_token != 0
@@ -3525,7 +3601,7 @@ gcs_first_fill_receipt_tick(int worker)
 		ClusterGcsBlockBackendBlock *blk = &gcs_block_backend_blocks[backend];
 		ClusterGcsBlockOutstandingSlot *slot = &blk->slots[index];
 		ClusterPcmReadGrantKey key;
-		bool offer = false, nack = false, consumed = false;
+		bool offer = false, nack = false, consumed = false, confirm = false;
 		int master = -1, owner_pid = 0;
 		uint64 incarnation = 0, request_id = 0;
 		LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
@@ -3535,6 +3611,10 @@ gcs_first_fill_receipt_tick(int worker)
 			incarnation = slot->first_fill.backend_incarnation;
 			request_id = slot->request_id;
 		}
+		if (slot->in_use && slot->first_fill.confirm_pending
+			&& now >= slot->first_fill.retry_at
+			&& cluster_lms_shard_for_tag(&slot->tag, cluster_lms_workers) == worker)
+			confirm = true;
 		if (slot->in_use && slot->first_fill.quiet && !slot->first_fill.ack_consumed
 			&& !slot->first_fill.ack_handed && now >= slot->first_fill.retry_at
 			&& cluster_lms_shard_for_tag(&slot->tag, cluster_lms_workers) == worker) {
@@ -3562,7 +3642,9 @@ gcs_first_fill_receipt_tick(int worker)
 				LWLockRelease(&blk->lock.lock);
 			}
 		}
-		if (offer)
+		if (confirm)
+			gcs_first_fill_confirm_offer(backend, index);
+		else if (offer)
 			gcs_first_fill_receipt_offer(backend, index);
 		else if (nack)
 			(void)gcs_block_pending_s_notify_action(&key, master, GCS_BLOCK_DONE_PENDING_S_NACK);
@@ -3744,7 +3826,14 @@ cluster_gcs_block_read_source_complete(BufferDesc *buf, ClusterPcmReadSource *so
 		if (!gcs_first_fill_receipt_matches(slot, source, buf->buf_id)
 			|| !slot->first_fill.delivery_closed)
 			continue;
-		if (installed || !slot->first_fill.request_admitted) {
+		if (installed) {
+			/* Publish shared confirmation ownership before dropping the local
+			 * native-IO ledger. The tag DATA worker alone offers its DONE. */
+			slot->first_fill.source = *source;
+			slot->first_fill.confirm_pending = true;
+			slot->first_fill.progress_waiter = false;
+			slot->first_fill.retry_at = 0;
+		} else if (!slot->first_fill.request_admitted) {
 			/* No admitted REQUEST cannot have created remote authority debt. */
 			gcs_block_clear_slot_locked(slot);
 			ConditionVariableBroadcast(&blk->capacity_cv);
@@ -3776,10 +3865,14 @@ complete:
 			&& attempt->source.reservation_token == source->reservation_token
 			&& BufferTagsEqual(&attempt->source.tag, &source->tag)) {
 			ClusterPcmReadGrantKey key = gcs_read_source_key(&attempt->source);
-			if (installed || published)
-				gcs_block_pending_s_notify(&key, attempt->source.master_node, installed);
+			if (published)
+				gcs_block_pending_s_notify(&key, attempt->source.master_node, false);
 			memset(attempt, 0, sizeof(*attempt));
 		}
+	}
+	if (installed) {
+		cluster_block_io_trace_source(source, "INSTALL_CONFIRM_PENDING");
+		cluster_lms_wakeup(cluster_lms_shard_for_tag(&source->tag, cluster_lms_workers));
 	}
 	if (published)
 		cluster_block_io_trace_receipt(&receipt.source, "QUIET_PUBLISHED", (int)MyBackendId,
@@ -24288,7 +24381,7 @@ gcs_block_pending_s_delivery_closed(const GcsBlockInvalidatePayload *inv)
 			&& slot->request_epoch == epoch && slot->expected_master_node == inv->master_node
 			&& BufferTagsEqual(&slot->tag, &inv->tag)) {
 			if (slot->first_fill.armed && slot->first_fill.delivery_closed
-				&& slot->first_fill.quiet)
+				&& (slot->first_fill.quiet || slot->first_fill.confirm_pending))
 				break;
 			slot->first_fill_revoked = true;
 			ConditionVariableSignal(&slot->reply_cv);
