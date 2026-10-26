@@ -1486,10 +1486,29 @@ cluster_heap_itl_apply_terminal_census(
 	return result;
 }
 
+/* Release only caller-owned passive pins before another owner can wait.
+ * Distinct handles for the same map own separate references; an aliased
+ * pointer is invalidated by the first release and is not released twice. */
+static void
+cluster_heap_release_vm_pins_for_wait(Relation relation, Buffer *old_vm, Buffer *new_vm)
+{
+	if (relation == NULL || !cluster_heap_read_needs_copy(relation))
+		return;
+	if (old_vm != NULL && BufferIsValid(*old_vm)) {
+		ReleaseBuffer(*old_vm);
+		*old_vm = InvalidBuffer;
+	}
+	if (new_vm != NULL && BufferIsValid(*new_vm)) {
+		ReleaseBuffer(*new_vm);
+		*new_vm = InvalidBuffer;
+	}
+}
+
 static ClusterHeapItlPairCensusResult
 cluster_heap_itl_unwind_pair_for_terminal_census(
 	Buffer old_buffer, Buffer new_buffer, Buffer full_buffer,
-	ClusterHeapItlTerminalCensus *census)
+	ClusterHeapItlTerminalCensus *census, Relation relation,
+	Buffer *old_vm, Buffer *new_vm)
 {
 	ClusterHeapItlCensusCaptureResult capture_result;
 
@@ -1509,6 +1528,7 @@ cluster_heap_itl_unwind_pair_for_terminal_census(
 		{
 			/* The pair caller owns the retry.  Release in heap_update's
 			 * established high/new then old order and carry no census debt. */
+			cluster_heap_release_vm_pins_for_wait(relation, old_vm, new_vm);
 			LockBuffer(new_buffer, BUFFER_LOCK_UNLOCK);
 			LockBuffer(old_buffer, BUFFER_LOCK_UNLOCK);
 			return CLUSTER_HEAP_ITL_PAIR_CENSUS_RETRY_REQUALIFY;
@@ -1518,6 +1538,7 @@ cluster_heap_itl_unwind_pair_for_terminal_census(
 
 	/* Match heap_update's existing full-unwind order.  Resolution starts
 	 * only after neither heap page content authority remains held. */
+	cluster_heap_release_vm_pins_for_wait(relation, old_vm, new_vm);
 	LockBuffer(new_buffer, BUFFER_LOCK_UNLOCK);
 	LockBuffer(old_buffer, BUFFER_LOCK_UNLOCK);
 	PG_TRY();
@@ -1535,13 +1556,17 @@ cluster_heap_itl_unwind_pair_for_terminal_census(
 
 static ClusterHeapItlCapacityResult
 cluster_heap_itl_ensure_capacity_with_terminal_census(Buffer buffer, TransactionId xid,
-													  bool lock_only)
+													  bool lock_only, Relation relation,
+													  Buffer *vmbuffer)
 {
 	ClusterHeapItlTerminalCensus census;
 	volatile ClusterHeapItlCapacityResult result = CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED;
 	volatile bool recycle_guard_armed = false;
 	volatile bool recycle_guard_unlocked = false;
 	ClusterHeapItlCensusCaptureResult capture_result;
+	bool vm_handoff = relation != NULL && vmbuffer != NULL
+		&& cluster_heap_read_needs_copy(relation);
+	Buffer recent_vm = vm_handoff ? *vmbuffer : InvalidBuffer;
 
 	Assert(BufferIsValid(buffer));
 	Assert(TransactionIdIsValid(xid));
@@ -1573,6 +1598,7 @@ cluster_heap_itl_ensure_capacity_with_terminal_census(Buffer buffer, Transaction
 	{
 		ClusterHeapItlTerminalBatchApplyResult apply_result;
 
+		cluster_heap_release_vm_pins_for_wait(relation, vmbuffer, NULL);
 		if (recycle_guard_armed) {
 			cluster_bufmgr_itl_recycle_guard_unlock(buffer);
 			recycle_guard_unlocked = true;
@@ -1593,17 +1619,26 @@ cluster_heap_itl_ensure_capacity_with_terminal_census(Buffer buffer, Transaction
 		} else
 			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 
-		apply_result = cluster_heap_itl_apply_terminal_census(buffer, &census);
-		if (apply_result.kind == CLUSTER_HEAP_ITL_BATCH_EXACT_STAMPED)
-			result = cluster_itl_has_allocatable_slot(buffer, xid, lock_only)
-						 ? CLUSTER_HEAP_ITL_CAPACITY_READY
-						 : CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED;
-		else if (apply_result.kind == CLUSTER_HEAP_ITL_BATCH_STALE_CURRENT_X) {
-			/* Capacity on the new page cannot validate the caller's old
-				 * tuple/page plan.  Only its existing DML owner may restart
-				 * after this unlocked interval; do not refresh just the ITL
-				 * census underneath that stale plan. */
+		/* An AV page still needs its caller's exact VM pin. Only a resident
+		 * lookup is allowed here; a miss belongs to the original DML retry
+		 * owner, before this census applies any cleanout bytes. */
+		if (vm_handoff && PageIsAllVisible(BufferGetPage(buffer))
+			&& !visibilitymap_pin_recent(relation, BufferGetBlockNumber(buffer),
+				recent_vm, vmbuffer))
 			result = CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY;
+		else {
+			apply_result = cluster_heap_itl_apply_terminal_census(buffer, &census);
+			if (apply_result.kind == CLUSTER_HEAP_ITL_BATCH_EXACT_STAMPED)
+				result = cluster_itl_has_allocatable_slot(buffer, xid, lock_only)
+							 ? CLUSTER_HEAP_ITL_CAPACITY_READY
+							 : CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED;
+			else if (apply_result.kind == CLUSTER_HEAP_ITL_BATCH_STALE_CURRENT_X) {
+				/* Capacity on the new page cannot validate the caller's old
+					 * tuple/page plan.  Only its existing DML owner may restart
+					 * after this unlocked interval; do not refresh just the ITL
+					 * census underneath that stale plan. */
+				result = CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY;
+			}
 		}
 	}
 	PG_FINALLY();
@@ -1697,7 +1732,8 @@ static ClusterTxwResult
 cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer,
 											Buffer full_buffer, TransactionId xid,
 											bool lock_only,
-											uint64 *deadline_us, const char **diagnostic_reason)
+											uint64 *deadline_us, const char **diagnostic_reason,
+											Relation relation, Buffer *old_vm, Buffer *new_vm)
 {
 	ClusterHeapItlTerminalCensus census;
 	ClusterHeapItlCensusCaptureResult capture_result;
@@ -1729,6 +1765,7 @@ cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer
 		fresh_capacity = cluster_itl_has_allocatable_slot(full_buffer, xid, lock_only);
 	/* No recycle guard is armed by this path; its capture requires flags=0.
 	 * The earlier terminal-census owner has already finished/cancelled. */
+	cluster_heap_release_vm_pins_for_wait(relation, old_vm, new_vm);
 	if (new_buffer != old_buffer)
 		LockBuffer(new_buffer, BUFFER_LOCK_UNLOCK);
 	LockBuffer(old_buffer, BUFFER_LOCK_UNLOCK);
@@ -1910,7 +1947,7 @@ cluster_heap_test_itl_wait_capacity(Buffer old_buffer, Buffer new_buffer, Buffer
 									const char **diagnostic_reason)
 {
 	return cluster_heap_itl_wait_capacity_after_census(old_buffer, new_buffer, full_buffer, xid,
-													   false, deadline_us, diagnostic_reason);
+													   false, deadline_us, diagnostic_reason, NULL, NULL, NULL);
 }
 
 ClusterTxwResult
@@ -1918,7 +1955,7 @@ cluster_heap_test_itl_wait_lock_capacity(Buffer buffer, TransactionId xid,
 	uint64 *deadline_us, const char **diagnostic_reason)
 {
 	return cluster_heap_itl_wait_capacity_after_census(buffer, buffer, buffer, xid,
-		true, deadline_us, diagnostic_reason);
+		true, deadline_us, diagnostic_reason, NULL, NULL, NULL);
 }
 #endif
 
@@ -1931,7 +1968,7 @@ cluster_heap_itl_alloc_with_terminal_census(Buffer buffer, TransactionId xid,
 	Assert(slot_index_out != NULL);
 	*slot_index_out = CLUSTER_ITL_SLOT_UNALLOCATED;
 	return cluster_heap_itl_ensure_capacity_with_terminal_census(
-			buffer, xid, lock_only) == CLUSTER_HEAP_ITL_CAPACITY_READY
+			buffer, xid, lock_only, NULL, NULL) == CLUSTER_HEAP_ITL_CAPACITY_READY
 		&& cluster_heap_itl_alloc_once(
 			buffer, xid, lock_only, slot_index_out);
 }
@@ -2019,7 +2056,8 @@ cluster_heap_itl_prepare_prepared_undo(Relation relation, Buffer buffer, HeapTup
 									   TransactionId xid, bool lock_only,
 									   ClusterUndoRecordPrepareReceipt *receipt, uint16 payload_len,
 									   bool *targets_invalidated, const char **refusal_reason,
-									   uint64 *capacity_wait_deadline_us, bool *content_unlocked)
+									   uint64 *capacity_wait_deadline_us, bool *content_unlocked,
+									   Buffer *vmbuffer)
 {
 	ClusterHeapItlCapacityResult capacity_result;
 	ClusterHeapDmlAuthorityGuard dml_guard;
@@ -2032,7 +2070,7 @@ cluster_heap_itl_prepare_prepared_undo(Relation relation, Buffer buffer, HeapTup
 	if (refusal_reason != NULL)
 		*refusal_reason = NULL;
 	capacity_result = cluster_heap_itl_ensure_capacity_with_terminal_census(
-		buffer, xid, lock_only);
+		buffer, xid, lock_only, relation, vmbuffer);
 	*targets_invalidated = false;
 	if (capacity_result == CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY)
 		return CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED;
@@ -2050,7 +2088,8 @@ cluster_heap_itl_prepare_prepared_undo(Relation relation, Buffer buffer, HeapTup
 
 				cluster_xp_begin(&xp_itl, CLXP_I_ITL_WAIT);
 				wait_result = cluster_heap_itl_wait_capacity_after_census(
-					buffer, buffer, buffer, xid, true, capacity_wait_deadline_us, &wait_reason);
+					buffer, buffer, buffer, xid, true, capacity_wait_deadline_us, &wait_reason,
+					relation, vmbuffer, NULL);
 				cluster_xp_end(&xp_itl);
 			}
 			*content_unlocked = true;
@@ -2328,7 +2367,7 @@ cluster_heap_test_itl_capacity_outcome(Buffer buffer, TransactionId xid,
 									   bool lock_only)
 {
 	return cluster_heap_itl_ensure_capacity_with_terminal_census(
-		buffer, xid, lock_only);
+		buffer, xid, lock_only, NULL, NULL);
 }
 
 bool
@@ -2339,9 +2378,41 @@ cluster_heap_test_itl_resolve_pair_terminal_census(
 	ClusterHeapItlPairCensusResult result;
 
 	result = cluster_heap_itl_unwind_pair_for_terminal_census(
-		old_buffer, new_buffer, full_buffer, &census);
+		old_buffer, new_buffer, full_buffer, &census, NULL, NULL, NULL);
 	cluster_heap_itl_finish_terminal_census(&census);
 	return result == CLUSTER_HEAP_ITL_PAIR_CENSUS_RESOLVED;
+}
+
+ClusterHeapItlCapacityResult
+cluster_heap_test_itl_capacity_with_vm(Relation relation, Buffer buffer, TransactionId xid,
+									   bool lock_only, Buffer *vmbuffer)
+{
+	return cluster_heap_itl_ensure_capacity_with_terminal_census(buffer, xid, lock_only, relation,
+																 vmbuffer);
+}
+
+bool
+cluster_heap_test_itl_pair_census_with_vm(Relation relation, Buffer old_buffer, Buffer new_buffer,
+										  Buffer full_buffer, Buffer *old_vm, Buffer *new_vm)
+{
+	ClusterHeapItlTerminalCensus census;
+	ClusterHeapItlPairCensusResult result;
+
+	result = cluster_heap_itl_unwind_pair_for_terminal_census(old_buffer, new_buffer, full_buffer,
+															  &census, relation, old_vm, new_vm);
+	cluster_heap_itl_finish_terminal_census(&census);
+	return result == CLUSTER_HEAP_ITL_PAIR_CENSUS_RESOLVED;
+}
+
+ClusterTxwResult
+cluster_heap_test_itl_wait_capacity_with_vm(Relation relation, Buffer old_buffer, Buffer new_buffer,
+											Buffer full_buffer, TransactionId xid, bool lock_only,
+											uint64 *deadline_us, const char **reason,
+											Buffer *old_vm, Buffer *new_vm)
+{
+	return cluster_heap_itl_wait_capacity_after_census(old_buffer, new_buffer, full_buffer, xid,
+													   lock_only, deadline_us, reason, relation,
+													   old_vm, new_vm);
 }
 
 bool
@@ -6627,7 +6698,7 @@ cluster_heap_insert_retry:
 
 			undo_result = cluster_heap_itl_prepare_prepared_undo(
 				relation, buffer, NULL, canonical_xid, false, &undo_receipt,
-				sizeof(UndoInsertPayload), &targets_invalidated, NULL, NULL, NULL);
+				sizeof(UndoInsertPayload), &targets_invalidated, NULL, NULL, NULL, &vmbuffer);
 			if (undo_result
 				== CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED)
 			{
@@ -11923,7 +11994,7 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 			undo_payload_len = sizeof(UndoDeletePayload) + (uint16) tp.t_len;
 			undo_result = cluster_heap_itl_prepare_prepared_undo(
 				relation, buffer, &tp, canonical_xid, false, &undo_receipt, undo_payload_len,
-				&targets_invalidated, NULL, NULL, NULL);
+				&targets_invalidated, NULL, NULL, NULL, &vmbuffer);
 
 			if (undo_result
 				== CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED)
@@ -14217,7 +14288,7 @@ l_pgrac_reacquire:
 		else if (newbuf == buffer && !census_was_pending)
 			old_capacity_result
 				= cluster_heap_itl_ensure_capacity_with_terminal_census(
-					buffer, canonical_xid, false);
+					buffer, canonical_xid, false, relation, &vmbuffer);
 		else if (census_was_pending
 				 && cluster_itl_update_census_old_page)
 			old_capacity_result
@@ -14257,6 +14328,7 @@ l_pgrac_reacquire:
 				newbuf = buffer;
 			}
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+			cluster_heap_release_vm_pins_for_wait(relation, &vmbuffer, &vmbuffer_new);
 			if (!cluster_heap_restart_update_undo_record_exact(
 					&canonical_binding, undo_prepare_deadline_us,
 					&undo_receipt))
@@ -14288,7 +14360,8 @@ l_pgrac_reacquire:
 				ClusterHeapItlPairCensusResult pair_result;
 
 				pair_result = cluster_heap_itl_unwind_pair_for_terminal_census(
-					buffer, newbuf, buffer, &cluster_itl_update_census);
+					buffer, newbuf, buffer, &cluster_itl_update_census,
+					relation, &vmbuffer, &vmbuffer_new);
 				if (pair_result != CLUSTER_HEAP_ITL_PAIR_CENSUS_REFUSED)
 				{
 					if (pair_result
@@ -14345,7 +14418,7 @@ l_pgrac_reacquire:
 					pair_result
 						= cluster_heap_itl_unwind_pair_for_terminal_census(
 							buffer, newbuf, newbuf,
-							&cluster_itl_update_census);
+							&cluster_itl_update_census, relation, &vmbuffer, &vmbuffer_new);
 					if (pair_result != CLUSTER_HEAP_ITL_PAIR_CENSUS_REFUSED)
 					{
 						if (pair_result
@@ -15741,7 +15814,8 @@ l_pgrac_itl_capacity_wait: {
 		cluster_xp_begin(&xp_itl, CLXP_I_ITL_WAIT);
 		wait_result = cluster_heap_itl_wait_capacity_after_census(
 			buffer, newbuf, itl_capacity_wait_buffer, canonical_xid, false,
-			&itl_capacity_absolute_deadline_us, &wait_reason);
+			&itl_capacity_absolute_deadline_us, &wait_reason,
+			relation, &vmbuffer, &vmbuffer_new);
 		cluster_xp_end(&xp_itl);
 	}
 	if (wait_result != CLUSTER_TXW_RESOLVED && wait_result != CLUSTER_TXW_RETRY)
@@ -17397,7 +17471,7 @@ failed:
 					relation, *buffer, tuple, canonical_xid, true, &undo_receipt,
 					sizeof(UndoItlPayload), &targets_invalidated, &refusal_reason,
 					wait_policy == LockWaitBlock ? &itl_capacity_absolute_deadline_us : NULL,
-					&content_unlocked);
+					&content_unlocked, &vmbuffer);
 				if (undo_result
 					== CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED)
 				{
@@ -18957,7 +19031,7 @@ l4:
 			undo_result = cluster_heap_itl_prepare_prepared_undo(
 				rel, buf, &mytup, canonical_xid, true, &cluster_chain_receipt,
 				sizeof(UndoItlPayload), &targets_invalidated, NULL,
-				&cluster_chain_capacity_deadline_us, &content_unlocked);
+				&cluster_chain_capacity_deadline_us, &content_unlocked, &vmbuffer);
 			if (undo_result == CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED)
 			{
 				bool prepare_only

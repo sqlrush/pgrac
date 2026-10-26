@@ -43,7 +43,9 @@ static bool wait_error;
 static ClusterTxwResult
 cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer,
 											Buffer full_buffer, TransactionId xid, bool lock_only,
-											uint64 *deadline, const char **reason)
+											uint64 *deadline, const char **reason,
+											Relation relation pg_attribute_unused(), Buffer *old_vm pg_attribute_unused(),
+											Buffer *new_vm pg_attribute_unused())
 {
 	wait_calls++;
 	UT_ASSERT_EQ(old_buffer, 1);
@@ -64,7 +66,8 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 
 static ClusterHeapItlCapacityResult
 cluster_heap_itl_ensure_capacity_with_terminal_census(Buffer buffer, TransactionId xid,
-													  bool lock_only)
+													  bool lock_only, Relation relation pg_attribute_unused(),
+													  Buffer *vmbuffer pg_attribute_unused())
 {
 	return fault == 1	? CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED
 		   : fault == 2 ? CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY
@@ -127,6 +130,9 @@ cluster_undo_record_ctrc_pending_matches(const ClusterUndoRecordPrepareReceipt *
 }
 
 #include "test_cluster_heap_prepare_diagnostic.inc"
+
+#define cluster_heap_itl_prepare_prepared_undo(...) \
+	cluster_heap_itl_prepare_prepared_undo(__VA_ARGS__, NULL)
 
 static void
 check_prepare(int cause, bool applied, int expected, const char *reason)

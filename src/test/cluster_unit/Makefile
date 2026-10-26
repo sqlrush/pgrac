@@ -2704,12 +2704,23 @@ test_cluster_heap_ctrc_participant.inc: $(top_srcdir)/src/backend/cluster/cluste
 	mv $@.tmp $@
 
 # Original receipt apply/cancel bookkeeping and exact-handle/target checks.
-test_cluster_heap_ctrc_terminal.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
-	@awk 'BEGIN { pattern = "^(cluster_ctrc_page_version_order|cluster_ctrc_pending_itl_target_recheck|cluster_ctrc_receipt_apply_prepared|cluster_ctrc_receipt_apply_shared|cluster_ctrc_receipt_cancel_prepared|cluster_ctrc_receipt_cancel_shared|ctrc_bytes_nonzero|ctrc_receipt_handle_exact|ctrc_target_exact_itl_valid|ctrc_target_exact_tid_valid|ctrc_target_itl_finalizes_exact|ctrc_target_itl_finalizes_prepared|ctrc_target_offnum_finalizes_exact)\\(" } \
+# Original page-owner post-unlock WAL/dependency discharge tail and exact target.
+test_cluster_heap_itl_finish_discharge.inc: $(top_srcdir)/src/backend/cluster/cluster_itl_touch.c Makefile
+	@awk 'BEGIN { pattern = "^(itl_finish_expected_target|itl_finish_discharge_batch)\\(" } \
+	     /^typedef struct ItlFinishDischarge \{/ { structure=1; structures++ } \
+	     structure { print; if (/^} ItlFinishDischarge;/) structure=0; next } \
 	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); if (seen[name]++) exit 1; order[++found]=name; ret=prev; sub(/^static[ \t]+/, "", ret); returns[name]="static " ret; emit=1; head=1 } \
 	     emit { body[name]=body[name] $$0 "\n"; if (/^\{/) head=0; else if (head) declaration[name]=declaration[name] $$0 "\n" } \
 	     emit && /^}/ { emit=0; done++ } { prev=$$0 } \
-	     END { if (found != 13 || done != 13 || emit) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
+	     END { if (found != 2 || done != 2 || emit || structure || structures != 1) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_ctrc_terminal.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk 'BEGIN { pattern = "^(cluster_ctrc_page_version_order|cluster_ctrc_pending_itl_target_recheck|cluster_ctrc_receipt_apply_prepared|cluster_ctrc_receipt_apply_shared|cluster_ctrc_receipt_cancel_prepared|cluster_ctrc_receipt_cancel_shared|ctrc_bytes_nonzero|ctrc_receipt_handle_exact|ctrc_target_exact_itl_valid|ctrc_target_exact_tid_valid|ctrc_target_itl_finalizes_exact|ctrc_target_itl_finalizes_prepared|ctrc_target_offnum_finalizes_exact|ctrc_reference_durability_covers|cluster_ctrc_itl_target_identity_matches|cluster_ctrc_receipt_discharge_itl|cluster_ctrc_receipt_discharge_itl_shared)\\(" } \
+	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); if (seen[name]++) exit 1; order[++found]=name; ret=prev; sub(/^static[ \t]+/, "", ret); returns[name]="static " ret; emit=1; head=1 } \
+	     emit { body[name]=body[name] $$0 "\n"; if (/^\{/) head=0; else if (head) declaration[name]=declaration[name] $$0 "\n" } \
+	     emit && /^}/ { emit=0; done++ } { prev=$$0 } \
+	     END { if (found != 17 || done != 17 || emit) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Original certificate consumer/reclaim closure; skip the original forward declaration.
@@ -2801,6 +2812,9 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_ctrc_types.inc test_cluster_heap_ctrc_begin.inc \
 		test_cluster_heap_ctrc_step.inc test_cluster_heap_ctrc_origin.inc \
 		test_cluster_heap_ctrc_participant.inc test_cluster_heap_ctrc_terminal.inc \
+		test_cluster_heap_itl_finish_discharge.inc \
+		$(top_srcdir)/src/include/cluster/cluster_itl_touch.h \
+		$(top_srcdir)/src/include/cluster/cluster_sf_dep.h \
 		test_cluster_heap_ctrc_certificate.inc $(top_srcdir)/src/include/port/pg_crc32c.h \
 		test_cluster_heap_ctrc_ack.inc $(top_srcdir)/src/common/sha2_int.h \
 		test_cluster_heap_ctrc_origin_reply.inc \
@@ -6273,6 +6287,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_ctrc_origin.inc test_cluster_heap_ctrc_origin.inc.tmp
 	rm -f test_cluster_heap_ctrc_participant.inc test_cluster_heap_ctrc_participant.inc.tmp
 	rm -f test_cluster_heap_ctrc_terminal.inc test_cluster_heap_ctrc_terminal.inc.tmp
+	rm -f test_cluster_heap_itl_finish_discharge.inc test_cluster_heap_itl_finish_discharge.inc.tmp
 	rm -f test_cluster_heap_ctrc_certificate.inc test_cluster_heap_ctrc_certificate.inc.tmp
 	rm -f test_cluster_heap_ctrc_ack.inc test_cluster_heap_ctrc_ack.inc.tmp
 	rm -f test_cluster_heap_ctrc_origin_reply.inc test_cluster_heap_ctrc_origin_reply.inc.tmp
@@ -9910,7 +9925,23 @@ test_cluster_heap_writer_wait_lock.inc: $(top_srcdir)/src/backend/access/heap/he
 	     /^}/ { in_entry=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_r4_lock_order: test_cluster_r4_lock_order.c unit_test.h \
+# Original UPDATE capacity retry bracket and its local VM-pin helper.
+test_cluster_heap_capacity_vm_unwind.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^cluster_heap_release_vm_pins_for_wait\(/ { print "static void"; emit=1; helper++ } \
+	     emit == 1 { print } emit == 1 && /^}/ { emit=0; helpers_done++ } \
+	     /^heap_update\(/ { in_update=1 } \
+	     in_update && /if \(old_capacity_result == CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY\)/ { retry=1 } \
+	     retry && /LockBuffer\(buffer, BUFFER_LOCK_UNLOCK\);/ { \
+	       emit=2; found++; print "static void"; \
+	       print "ut_update_capacity_vm_unwind(Relation relation, Buffer buffer, Buffer *old_vm, Buffer *new_vm)"; \
+	       print "{"; print "Buffer vmbuffer = *old_vm, vmbuffer_new = *new_vm;"; print "(void)relation;" } \
+	     emit == 2 && /if \(!cluster_heap_restart_update_undo_record_exact\(/ { \
+	       print "*old_vm = vmbuffer; *new_vm = vmbuffer_new;"; print "}"; emit=retry=0; done++ } \
+	     emit == 2 { print } /^}/ { in_update=0 } \
+	     END { if (found != 1 || done != 1 || emit || helper > 1 || helper != helpers_done) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_r4_lock_order: test_cluster_r4_lock_order.c unit_test.h test_cluster_heap_capacity_vm_unwind.inc \
 		test_cluster_heap_writer_wait_delete.inc test_cluster_heap_writer_wait_update.inc \
 		test_cluster_heap_writer_wait_lock.inc \
 		cluster_snapshot_test_stubs.h \
@@ -9937,7 +9968,7 @@ test_cluster_r4_lock_order: test_cluster_r4_lock_order.c unit_test.h \
 
 # PGRAC: keep the real terminal-only resolver in the ITL capacity consumer
 # test. Origin responses and TX wakeups are controlled by the fixture.
-test_cluster_r4_itl_capacity: test_cluster_r4_itl_capacity.c test_cluster_r4_lock_order.c \
+test_cluster_r4_itl_capacity: test_cluster_r4_itl_capacity.c test_cluster_r4_lock_order.c test_cluster_heap_capacity_vm_unwind.inc \
 		test_cluster_heap_writer_wait_delete.inc test_cluster_heap_writer_wait_update.inc \
 		test_cluster_heap_writer_wait_lock.inc \
 		unit_test.h cluster_r4_activation_test_stubs.h \
