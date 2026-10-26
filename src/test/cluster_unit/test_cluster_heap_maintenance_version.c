@@ -1100,6 +1100,107 @@ sampler_stripe_future(FullTransactionId reference, FullTransactionId *future,
 #undef ShmemVariableCache
 #undef UINT32_ACCESS_ONCE
 
+
+/* Execute the original native exit on the same PGPROC used by origin reserve.
+ * Only lock scheduling is controlled: this fixture takes the normal exclusive
+ * path and fails if the untested group-clear/secondary-acquire path is entered. */
+static bool source_exit_lock_held;
+static unsigned source_exit_locks, source_exit_unlocks;
+static XidCacheStatus source_exit_subxids[3];
+static uint8 source_exit_status[3];
+static ProcessingMode source_exit_mode = NormalProcessing;
+static void source_exit_internal(PGPROC *, TransactionId);
+static void source_exit_maintain_latest(TransactionId);
+static FullTransactionId source_exit_relative(FullTransactionId, TransactionId);
+static bool source_exit_precedes(TransactionId, TransactionId);
+static bool source_exit_precedes_or_equals(TransactionId, TransactionId);
+static bool source_exit_follows_or_equals(TransactionId, TransactionId);
+static void source_exit_assert_xid_range(TransactionId);
+
+static bool
+source_exit_try_lock(LWLock *lock, LWLockMode mode)
+{
+	worker_pass_assert_unlocked();
+	UT_ASSERT(lock == sampler_proc_lock && mode == LW_EXCLUSIVE);
+	UT_ASSERT(!source_exit_lock_held && !sampler_lock_held && !census_step_lock_held);
+	source_exit_lock_held = true; source_exit_locks++;
+	return true;
+}
+
+static bool
+source_exit_owned(LWLock *lock)
+{
+	return source_exit_lock_held && lock == sampler_proc_lock;
+}
+
+static bool
+source_exit_owned_mode(LWLock *lock, LWLockMode mode)
+{
+	return source_exit_owned(lock) && mode == LW_EXCLUSIVE;
+}
+
+static void
+source_exit_unlock(LWLock *lock)
+{
+	UT_ASSERT(source_exit_owned(lock)); source_exit_lock_held = false; source_exit_unlocks++;
+}
+
+static void
+source_exit_unexpected_acquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+{
+	UT_ASSERT(false); abort();
+}
+
+static void
+source_exit_unexpected_group(PGPROC *proc pg_attribute_unused(), TransactionId xid pg_attribute_unused())
+{
+	UT_ASSERT(false); abort();
+}
+
+#define ShmemVariableCache sampler_cache
+#define ProcGlobal sampler_proc_global
+#define MainLWLockArray sampler_locks
+#define Mode source_exit_mode
+#define RecoveryInProgress sampler_recovery_in_progress
+#define LWLockConditionalAcquire source_exit_try_lock
+#define LWLockAcquire source_exit_unexpected_acquire
+#define LWLockRelease source_exit_unlock
+#define LWLockHeldByMe source_exit_owned
+#define LWLockHeldByMeInMode source_exit_owned_mode
+#define TransactionIdPrecedes source_exit_precedes
+#define TransactionIdPrecedesOrEquals source_exit_precedes_or_equals
+#define TransactionIdFollowsOrEquals source_exit_follows_or_equals
+#undef AssertTransactionIdInAllowableRange
+#define AssertTransactionIdInAllowableRange source_exit_assert_xid_range
+#define FullXidRelativeTo source_exit_relative
+#define MaintainLatestCompletedXid source_exit_maintain_latest
+#define ProcArrayEndTransactionInternal source_exit_internal
+#define ProcArrayEndTransaction source_exit_end_transaction
+#define ProcArrayGroupClearXid source_exit_unexpected_group
+#include "test_cluster_heap_freeze_pgproc_exit.inc"
+#undef ProcArrayGroupClearXid
+#undef ProcArrayEndTransaction
+#undef ProcArrayEndTransactionInternal
+#undef MaintainLatestCompletedXid
+#undef FullXidRelativeTo
+#undef AssertTransactionIdInAllowableRange
+#ifndef USE_ASSERT_CHECKING
+#define AssertTransactionIdInAllowableRange(xid) ((void)true)
+#endif
+#undef TransactionIdFollowsOrEquals
+#undef TransactionIdPrecedesOrEquals
+#undef TransactionIdPrecedes
+#undef LWLockHeldByMeInMode
+#undef LWLockHeldByMe
+#undef LWLockRelease
+#undef LWLockAcquire
+#undef LWLockConditionalAcquire
+#undef RecoveryInProgress
+#undef Mode
+#undef MainLWLockArray
+#undef ProcGlobal
+#undef ShmemVariableCache
+
 static void
 worker_native_sample_fixture(const ClusterHeapFreezeCohortObservation *cohort)
 {
@@ -12231,6 +12332,170 @@ recent_registration_case(bool batch, bool refuse)
 	census_full_layout_release(&runtime);
 }
 
+/* Replace the constructed completed cut with the original initializer,
+ * origin/participant publishers and every slice of the original worker pass.
+ * Source authentication, process scheduling, resolver and resident I/O leaves
+ * remain controlled; this does not create a production VACUUM caller. */
+static void
+full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool retire_native)
+{
+	QualifiedXminFixture f;
+	LVRelState v;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	CensusRuntimeAllocation runtime;
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcOriginReservation reservation;
+	ClusterCtrcReceiptHandle handle;
+	FullTransactionId full = FullTransactionIdFromEpochAndXid(1, 100);
+	uint32 grant;
+	uint64 total, passes = 1, expected_passes;
+
+	phase_setup(&f, &v, targets, batch);
+	census_runtime_initialize_requested = true;
+	if (!census_full_layout_setup(&runtime, 2)) { UT_ASSERT(false); return; }
+	key = census_key_for_full(&f.cohort.admission_fence, full);
+	if (retire_native)
+	{
+		census_origin_publish_backend(&key, full);
+		sampler_slots[0].xid = key.xid;
+		census_origin_proc = &sampler_slots[0];
+		UT_ASSERT_EQ(original_census_origin_reserve_active(&key, &reservation),
+			CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	}
+	else
+		UT_ASSERT_EQ(census_origin_reserve_from_backend(&key, full, &reservation),
+			CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	UT_ASSERT(original_census_origin_open_reserved(&reservation, &grant));
+	UT_ASSERT_EQ(census_participant_prepare_from_origin(&key, grant, &handle),
+		CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(handle.valid && FullTransactionIdEquals(handle.original_full_xid, full));
+	if (retire_native)
+	{
+		FullTransactionId reference, future, minimum;
+		ClusterXidStripeSampleFence fence;
+		PGPROC *proc = &sampler_slots[0];
+
+		UT_ASSERT(census_origin_proc == proc);
+		UT_ASSERT_EQ(proc->xid, key.xid); UT_ASSERT_EQ(sampler_xids[0], key.xid);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&proc->cluster_top_full_xid_atomic), U64FromFullTransactionId(full));
+		memset(source_exit_subxids, 0, sizeof(source_exit_subxids));
+		memset(source_exit_status, 0, sizeof(source_exit_status));
+		sampler_procs.subxidStates = source_exit_subxids;
+		sampler_procs.statusFlags = source_exit_status;
+		proc->pgxactoff = 0; proc->lxid = 7; proc->xmin = key.xid;
+		pg_atomic_write_u64(&proc->cluster_read_scn_atomic, 9);
+		sampler_variables.oldestXid = FirstNormalTransactionId;
+		sampler_variables.latestCompletedXid = FullTransactionIdFromEpochAndXid(1, 99);
+		source_exit_locks = source_exit_unlocks = 0; source_exit_lock_held = false;
+		source_exit_end_transaction(proc, key.xid);
+		UT_ASSERT_EQ(source_exit_locks, 1); UT_ASSERT_EQ(source_exit_unlocks, 1);
+		UT_ASSERT(!source_exit_lock_held);
+		UT_ASSERT_EQ(proc->xid, InvalidTransactionId); UT_ASSERT_EQ(sampler_xids[0], InvalidTransactionId);
+		UT_ASSERT_EQ(proc->xmin, InvalidTransactionId); UT_ASSERT_EQ(proc->lxid, InvalidLocalTransactionId);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&proc->cluster_top_full_xid_atomic), 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&proc->cluster_read_scn_atomic), 0);
+		UT_ASSERT(FullTransactionIdEquals(sampler_variables.latestCompletedXid, full));
+		UT_ASSERT_EQ(sampler_variables.xactCompletionCount, 1);
+		UT_ASSERT(original_native_fullxid_sample(&reference, &future, &minimum, &fence));
+		UT_ASSERT(FullTransactionIdEquals(minimum, future));
+		UT_ASSERT(FullTransactionIdFollows(minimum, full));
+		UT_ASSERT(FullTransactionIdEquals(handle.participant->original_full_xid, full));
+	}
+	else
+	{
+		sampler_xids[0] = 152;
+		pg_atomic_write_u64(&sampler_slots[0].cluster_top_full_xid_atomic,
+			U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 152)));
+	}
+	total = runtime.capacity.origin_key_entries + runtime.capacity.participant_key_entries;
+	expected_passes = (total + CLUSTER_CTRC_ACTIVE_SCAN_SLICE - 1) / CLUSTER_CTRC_ACTIVE_SCAN_SLICE;
+	native_worker_shared.active_sample_sequence = f.cohort.source_local_sample_id - 1;
+	worker_original_sample_pass_fixture(&f.cohort);
+	while (pass_pending && passes <= expected_passes) { original_worker_sample_active_pass(); passes++; }
+	UT_ASSERT_EQ(passes, expected_passes); UT_ASSERT(!pass_pending);
+	UT_ASSERT_EQ(publisher_scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(publisher_scan.total_entries, total); UT_ASSERT_EQ(publisher_scan.next_index, total);
+	UT_ASSERT(!publisher_scan.lock_busy); UT_ASSERT_EQ(publisher_scan.unqualified_entries, 0);
+	UT_ASSERT_EQ(publisher_scan.unqualified_registration_generation, 1);
+	UT_ASSERT(FullTransactionIdEquals(publisher_scan.min_full, full));
+	UT_ASSERT_EQ(census_step_lock_acquires, total); UT_ASSERT_EQ(census_step_lock_releases, total);
+	UT_ASSERT_EQ(native_worker_shared.active_sample.sample_id, f.cohort.source_local_sample_id);
+	f.cohort.local_registration_cut = publisher_scan;
+	UT_ASSERT(cluster_ctrc_active_scan_registration_current(&f.cohort.local_registration_cut));
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	if (late_receiver)
+	{
+		uint64 known_index, late_index;
+
+		recent_registration_cut = publisher_scan;
+		recent_registration_key = key;
+		recent_registration_key.origin_node_id = 1;
+		recent_registration_key.owner_instance = 2;
+		recent_registration_key.segment_id = CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+		/* The late publication uses a different physical slot. Reusing slot0
+		 * would correctly refuse at the original participant owner guard. */
+		recent_registration_key.slot_offset = key.slot_offset + 1;
+		UT_ASSERT(original_participant_participant_index(&key, cluster_node_id, &known_index));
+		UT_ASSERT(original_participant_participant_index(&recent_registration_key, cluster_node_id, &late_index));
+		UT_ASSERT(known_index != late_index);
+		recent_registration_refused = false; recent_registration_calls = 0;
+		recent_pin_observer = recent_register_unknown_receiver;
+	}
+	backend_pin_count = 0;
+	relation_data.rd_isvalid = resume_allowed = true;
+	UT_ASSERT_EQ(phase_then_recent_native_owned(&f, &v), !late_receiver);
+	recent_pin_observer = NULL;
+	UT_ASSERT_EQ(phase_preflights, 1); UT_ASSERT_EQ(phase_rechecks, 1);
+	UT_ASSERT_EQ(phase_resolves, f.page.carrier_request_count);
+	UT_ASSERT_EQ(recent_pin_calls, 1); UT_ASSERT_EQ(recent_unpins, 1);
+	UT_ASSERT_EQ(conditional_resumes, !late_receiver); UT_ASSERT_EQ(conditional_unlocks, !late_receiver);
+	UT_ASSERT_EQ(inserts, !late_receiver); UT_ASSERT_EQ(flushes, !late_receiver);
+	UT_ASSERT_EQ(phase_finally_calls, 1); UT_ASSERT_EQ(phase_finally_debt, 1);
+	UT_ASSERT_EQ(phase_finally_pins, 0); UT_ASSERT(!phase_finally_owned_writer);
+	UT_ASSERT_EQ(backend_pin_count, 0);
+	UT_ASSERT(!recent_pin_held && !local_x && !resumed_writer);
+	UT_ASSERT(FullTransactionIdEquals(handle.participant->original_full_xid, full));
+	UT_ASSERT_EQ(handle.participant->receipt_count, 1);
+	if (late_receiver)
+	{
+		UT_ASSERT_EQ(recent_registration_calls, 1);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), 2);
+		UT_ASSERT(!cluster_ctrc_active_scan_registration_current(&publisher_scan));
+		UT_ASSERT_EQ(edges + dirties, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+	bounds_lifecycle_assert_empty(&f.admission);
+	census_full_layout_release(&runtime);
+}
+
+static void
+full_source_then_recent_case(bool batch, bool late_receiver)
+{
+	full_source_then_recent_lifecycle_case(batch, late_receiver, false);
+}
+
+UT_TEST(test_original_pgproc_exit_keeps_retained_source_through_recent_wal)
+{
+	for (unsigned batch = 0; batch < 2; batch++)
+		full_source_then_recent_lifecycle_case(batch != 0, false, true);
+}
+
+UT_TEST(test_original_pgproc_exit_late_receiver_still_revokes_recent_wal)
+{
+	for (unsigned batch = 0; batch < 2; batch++)
+		full_source_then_recent_lifecycle_case(batch != 0, true, true);
+}
+
+UT_TEST(test_full_original_source_reaches_pin_free_collector_and_recent_wal)
+{
+	for (unsigned batch = 0; batch < 2; batch++) full_source_then_recent_case(batch != 0, false);
+}
+
+UT_TEST(test_full_original_source_late_receiver_revokes_recent_wal)
+{
+	for (unsigned batch = 0; batch < 2; batch++) full_source_then_recent_case(batch != 0, true);
+}
+
 UT_TEST(test_recent_unknown_receiver_revokes_pin_free_proof_before_writer_or_wal)
 {
 	for (unsigned batch = 0; batch < 2; batch++) recent_registration_case(batch != 0, false);
@@ -12486,13 +12751,17 @@ UT_TEST(test_recent_xmin_share_lock_refusal_keeps_borrowed_pin_without_upgrade)
 int
 main(void)
 {
-	UT_PLAN(294);
+	UT_PLAN(298);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
 	UT_RUN(test_pin_free_phase_recent_errors_unwind_pin_before_original_owner_leave);
 	UT_RUN(test_recent_unknown_receiver_revokes_pin_free_proof_before_writer_or_wal);
 	UT_RUN(test_recent_refused_receiver_keeps_original_cut_and_native_continuation);
+	UT_RUN(test_full_original_source_reaches_pin_free_collector_and_recent_wal);
+	UT_RUN(test_full_original_source_late_receiver_revokes_recent_wal);
+	UT_RUN(test_original_pgproc_exit_keeps_retained_source_through_recent_wal);
+	UT_RUN(test_original_pgproc_exit_late_receiver_still_revokes_recent_wal);
 	UT_RUN(test_recent_xmin_stale_registration_refuses_before_resident_pin);
 	UT_RUN(test_recent_xmin_success_preserves_preowned_pin_and_writer);
 	UT_RUN(test_recent_xmin_errors_keep_borrowed_pin_and_writer_scope);

@@ -16365,6 +16365,12 @@ l3:
 
 					Assert(cluster_current_mx.successor_proof.valid);
 					LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
+					/* The child must not retain the caller's VM pin. */
+					if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+					{
+						ReleaseBuffer(vmbuffer);
+						vmbuffer = InvalidBuffer;
+					}
 					follow_result = heap_lock_updated_tuple_authoritative(
 						relation, &cluster_current_mx.successor_proof,
 						GetCurrentTransactionId(), mode);
@@ -16617,6 +16623,11 @@ l3:
 									 errhint("Cross-node update-chain locking is not yet "
 											 "supported; retry the transaction.")));
 						LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
+					}
+					if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+					{
+						ReleaseBuffer(vmbuffer);
+						vmbuffer = InvalidBuffer;
 					}
 #endif
 
@@ -16984,6 +16995,13 @@ l3:
 			{
 				TM_Result	res;
 
+#ifdef USE_PGRAC_CLUSTER
+				if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+				{
+					ReleaseBuffer(vmbuffer);
+					vmbuffer = InvalidBuffer;
+				}
+#endif
 				res = heap_lock_updated_tuple(relation,
 											  infomask, xwait, &t_ctid,
 											  GetCurrentTransactionId(),

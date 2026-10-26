@@ -13,6 +13,8 @@
 #include "postgres.h"
 #include "access/heapam.h"
 #include "access/visibilitymap.h"
+#include "access/xact.h"
+#include "cluster/cluster_itl.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_tt_local.h"
 #include "storage/bufmgr.h"
@@ -1465,10 +1467,255 @@ UT_TEST(receipt_missing_canonical_binding_or_admission_never_reacquires_heap)
 	}
 }
 
+#include "test_cluster_heap_chain_call_primitives.inc"
+
+static bool recursive_peers, recursive_error, recursive_creator_changed, recursive_failed;
+static unsigned recursive_calls, recursive_outer_pins;
+static TM_Result recursive_result, recursive_observed;
+static ItemPointerData recursive_tid;
+static ClusterConf recursive_conf;
+ClusterConf *ClusterConfShmem = &recursive_conf;
+
+bool
+cluster_itl_find_multixact_origin_by_xmax(Page page, MultiXactId id, uint16 *origin)
+{
+	UT_ASSERT(false); /* The controlled root has no ITL marker to decode. */
+	return false;
+}
+
+TransactionId
+GetCurrentTransactionId(void)
+{
+	return 123;
+}
+
+int
+errhint(const char *fmt, ...)
+{
+	return 0;
+}
+
+/* The recursive authority/consumer is controlled. Observe the outer pin at
+ * entry, after the production caller's release, independently of child pins. */
+static TM_Result
+recursive_consumer(Relation rel, const ItemPointerData *tid, TransactionId xid, LockTupleMode mode)
+{
+	UT_ASSERT(rel == &relation && !locked);
+	UT_ASSERT_EQ(ItemPointerGetBlockNumber(tid), ItemPointerGetBlockNumber(&recursive_tid));
+	UT_ASSERT_EQ(ItemPointerGetOffsetNumber(tid), ItemPointerGetOffsetNumber(&recursive_tid));
+	UT_ASSERT_EQ(xid, 123);
+	UT_ASSERT(mode == LockTupleKeyShare || mode == LockTupleExclusive);
+	recursive_calls++;
+	recursive_outer_pins += vm_pinned;
+	if (recursive_error)
+		elog(ERROR, "controlled recursive chain error");
+	if (recursive_creator_changed) {
+		HeapTupleHeaderSetXmin(
+			(HeapTupleHeader)PageGetItem(incoming.data, PageGetItemId(incoming.data, 2)), 701);
+		replace_image = true;
+	}
+	return recursive_result;
+}
+
+static TM_Result
+heap_lock_updated_tuple(Relation rel, uint16 infomask, TransactionId rawxmax,
+						const ItemPointerData *tid, TransactionId xid, LockTupleMode mode)
+{
+	UT_ASSERT_EQ(rawxmax, 345);
+	UT_ASSERT(infomask == 0 || infomask == HEAP_XMAX_IS_MULTI);
+	return recursive_consumer(rel, tid, xid, mode);
+}
+
+static TM_Result
+heap_lock_updated_tuple_authoritative(Relation rel, const ClusterHeapSuccessorProof *proof,
+									  TransactionId xid, LockTupleMode mode)
+{
+	UT_ASSERT(proof->valid);
+	UT_ASSERT_EQ(proof->updater_xid, 345);
+	return recursive_consumer(rel, &proof->tid, xid, mode);
+}
+
+static void
+reset_recursive_call(bool cached, bool peers)
+{
+	reset(cached, true);
+	recursive_peers = peers;
+	recursive_conf.node_count = peers ? 2 : 1;
+	recursive_error = recursive_creator_changed = recursive_failed = false;
+	recursive_calls = recursive_outer_pins = 0;
+	recursive_result = recursive_observed = TM_Ok;
+	ItemPointerSet(&recursive_tid, 18, 2);
+	for (int current = 0; current < 2; current++) {
+		Page page = current ? incoming.data : pages[0].data;
+		HeapTupleHeader header = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, 2));
+
+		header->t_infomask = peers ? HEAP_XMAX_IS_MULTI : 0;
+		HeapTupleHeaderSetXmax(header, 345);
+		header->t_ctid = recursive_tid;
+	}
+}
+
+static void
+recursive_call(unsigned entry)
+{
+	Relation rel = &relation;
+	Relation relation = rel;
+	HeapTuple root = &tuple;
+	HeapTuple tuple = root;
+	Buffer heap = 1, *buffer = &heap, vmbuffer = vm;
+	Page page = pages[0].data;
+	TransactionId creation_xmin = creator, xwait = 345;
+	uint16 infomask = recursive_peers ? HEAP_XMAX_IS_MULTI : 0;
+	ItemPointerData t_ctid = recursive_tid;
+	LockTupleMode mode = entry == 1 ? LockTupleKeyShare : LockTupleExclusive;
+	bool follow_updates = true, updated = true;
+	TM_Result result = TM_Ok, follow_result = TM_Ok;
+	struct {
+		ClusterHeapSuccessorProof successor_proof;
+	} cluster_current_mx = { 0 };
+
+	cluster_current_mx.successor_proof.valid = true;
+	cluster_current_mx.successor_proof.updater_xid = 345;
+	cluster_current_mx.successor_proof.tid = recursive_tid;
+	locked = entry == 0;
+	switch (entry) {
+#include "test_cluster_heap_chain_call_vm.inc"
+	default:
+		abort();
+	}
+	goto done;
+l3:
+	UT_ASSERT(false); /* Original marker recheck must retain the same root. */
+	goto done;
+failed:
+	recursive_failed = true;
+done:
+	vm = vmbuffer;
+	creator = creation_xmin;
+	recursive_observed = entry == 0 ? follow_result : result;
+}
+
+UT_TEST(recursive_callers_drop_outer_vm_pin_before_child_entry)
+{
+	for (unsigned entry = 0; entry < 3; entry++)
+		for (int peers = 0; peers < 2; peers++) {
+			reset_recursive_call(true, peers != 0);
+			recursive_call(entry);
+			check_current();
+			UT_ASSERT_EQ(recursive_calls, 1);
+			UT_ASSERT_EQ(recursive_outer_pins, 0);
+			UT_ASSERT(vm_pinned && vm == 2);
+		}
+}
+
+UT_TEST(recursive_callers_rebind_compacted_current_before_continuing)
+{
+	for (unsigned entry = 0; entry < 3; entry++) {
+		HeapTupleHeader before;
+
+		reset_recursive_call(true, false);
+		before = tuple.t_data;
+		recursive_call(entry);
+		check_current();
+		UT_ASSERT(tuple.t_data != before);
+		UT_ASSERT_EQ(recursive_outer_pins, 0);
+		UT_ASSERT_EQ(waits, 1);
+	}
+}
+
+UT_TEST(recursive_callers_reobserve_resident_misses_and_nonvisible_current)
+{
+	for (unsigned entry = 0; entry < 3; entry++)
+		for (int visible = 0; visible < 2; visible++) {
+			reset_recursive_call(true, false);
+			if (visible)
+				misses = 3;
+			else
+				PageClearAllVisible(incoming.data);
+			recursive_call(entry);
+			check_current();
+			UT_ASSERT_EQ(recursive_outer_pins, 0);
+			UT_ASSERT_EQ(waits, visible ? 4 : 1);
+			UT_ASSERT_EQ(vm_pinned, visible != 0);
+		}
+}
+
+UT_TEST(recursive_callers_keep_original_rebind_for_non_ok_child_results)
+{
+	for (unsigned entry = 0; entry < 3; entry++)
+		for (int blocked = 0; blocked < 2; blocked++) {
+			reset_recursive_call(true, false);
+			recursive_result = blocked ? TM_WouldBlock : TM_Updated;
+			recursive_call(entry);
+			check_current();
+			UT_ASSERT_EQ(recursive_observed, recursive_result);
+			UT_ASSERT_EQ(recursive_failed, entry != 0);
+			UT_ASSERT_EQ(recursive_outer_pins, 0);
+		}
+}
+
+UT_TEST(recursive_child_error_retains_no_outer_vm_pin_or_heap_content)
+{
+	for (unsigned entry = 0; entry < 3; entry++) {
+		sigjmp_buf jump;
+		volatile bool caught = false;
+
+		reset_recursive_call(true, false);
+		recursive_error = true;
+		PG_exception_stack = &jump;
+		if (sigsetjmp(jump, 0) == 0)
+			recursive_call(entry);
+		else
+			caught = true;
+		PG_exception_stack = NULL;
+		UT_ASSERT(caught && !locked && !vm_pinned);
+		UT_ASSERT_EQ(recursive_outer_pins + waits, 0);
+	}
+}
+
+UT_TEST(recursive_child_wait_preserves_original_creator_refusal)
+{
+	for (unsigned entry = 0; entry < 3; entry++) {
+		sigjmp_buf jump;
+		volatile bool caught = false;
+
+		reset_recursive_call(true, false);
+		recursive_creator_changed = true;
+		PG_exception_stack = &jump;
+		if (sigsetjmp(jump, 0) == 0)
+			recursive_call(entry);
+		else
+			caught = true;
+		PG_exception_stack = NULL;
+		UT_ASSERT(caught && locked);
+		UT_ASSERT_EQ(recursive_outer_pins + waits_with_vm, 0);
+		UT_ASSERT_EQ(creator, 700);
+	}
+}
+
+UT_TEST(recursive_callers_preserve_absent_native_and_local_pin_controls)
+{
+	for (unsigned entry = 0; entry < 3; entry++)
+		for (int profile = 0; profile < 3; profile++) {
+			reset_recursive_call(profile != 0, false);
+			if (profile == 1)
+				cluster_enabled = false;
+			else if (profile == 2)
+				form.relpersistence = RELPERSISTENCE_TEMP;
+			recursive_call(entry);
+			UT_ASSERT(locked && vm_pinned && vm == 2);
+			UT_ASSERT_EQ(recursive_outer_pins, profile != 0);
+			if (profile == 0)
+				check_current();
+			else
+				UT_ASSERT_EQ(releases + repins, 0);
+		}
+}
+
 int
 main(void)
 {
-	UT_PLAN(49);
+	UT_PLAN(56);
 	UT_RUN(cached_vm_pin_is_released_before_heap_current);
 	UT_RUN(cold_vm_is_prepared_outside_heap_content);
 	UT_RUN(new_all_visible_image_gets_exact_pin_before_tuple_rebind);
@@ -1518,6 +1765,13 @@ main(void)
 	UT_RUN(native_wait_errors_retain_neither_heap_content_nor_vm_pin);
 	UT_RUN(native_waits_accept_an_already_absent_vm_pin);
 	UT_RUN(native_waits_keep_native_and_local_pin_lifetimes);
+	UT_RUN(recursive_callers_drop_outer_vm_pin_before_child_entry);
+	UT_RUN(recursive_callers_rebind_compacted_current_before_continuing);
+	UT_RUN(recursive_callers_reobserve_resident_misses_and_nonvisible_current);
+	UT_RUN(recursive_callers_keep_original_rebind_for_non_ok_child_results);
+	UT_RUN(recursive_child_error_retains_no_outer_vm_pin_or_heap_content);
+	UT_RUN(recursive_child_wait_preserves_original_creator_refusal);
+	UT_RUN(recursive_callers_preserve_absent_native_and_local_pin_controls);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

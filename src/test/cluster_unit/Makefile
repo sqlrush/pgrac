@@ -2558,6 +2558,19 @@ test_cluster_heap_freeze_pgproc_sample.inc: $(top_srcdir)/src/backend/storage/ip
 	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Original normal native exit and native XID predicates; no copied bodies.
+test_cluster_heap_freeze_pgproc_exit.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c \
+		$(top_srcdir)/src/backend/access/transam/transam.c $(top_srcdir)/src/backend/access/transam/varsup.c Makefile
+	@awk '/^MaintainLatestCompletedXid\(/ { print "static inline void"; emit=1; found++ } \
+	     /^ProcArrayEndTransaction\(/ { print "static void"; emit=1; found++ } \
+	     /^ProcArrayEndTransactionInternal\(/ { print "static inline void"; emit=1; found++ } \
+	     /^FullXidRelativeTo\(/ { print "static FullTransactionId"; emit=1; found++ } \
+	     /^TransactionId(Precedes|PrecedesOrEquals|FollowsOrEquals)\(/ { print "static bool"; emit=1; found++ } \
+	     /^AssertTransactionIdInAllowableRange\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 8 || done != 8 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
 # Original typed storage plus retained peer/H backend and local-source wrapper.
 test_cluster_heap_freeze_cohort_backend.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c Makefile
 	@awk '/^typedef struct ClusterUndoHorizonSlotShmem / { types=1; found++ } \
@@ -2808,6 +2821,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_freeze_worker_publisher.inc \
 		test_cluster_heap_freeze_worker_pass.inc \
 		test_cluster_heap_freeze_pgproc_types.inc test_cluster_heap_freeze_pgproc_sample.inc \
+		test_cluster_heap_freeze_pgproc_exit.inc \
 		test_cluster_heap_freeze_stripe_future.inc \
 		$(top_srcdir)/src/include/storage/proc.h $(top_srcdir)/src/include/access/transam.h \
 		test_cluster_heap_freeze_lease_current.inc \
@@ -6203,6 +6217,8 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_chain_vm_itl.inc test_cluster_heap_chain_vm_no_itl.inc
 	rm -f test_cluster_heap_dml_vm_relock.inc test_cluster_heap_dml_vm_relock.inc.tmp
 	rm -f test_cluster_heap_native_wait_vm.inc test_cluster_heap_native_wait_vm.inc.tmp
+	rm -f test_cluster_heap_chain_call_vm.inc test_cluster_heap_chain_call_vm.inc.tmp \
+		test_cluster_heap_chain_call_primitives.inc test_cluster_heap_chain_call_primitives.inc.tmp
 	rm -f test_cluster_heap_chain_receipt_types.inc test_cluster_heap_chain_receipt_reserve.inc \
 		test_cluster_heap_chain_receipt_prepare.inc test_cluster_heap_chain_receipt_boundary.inc
 	rm -f test_cluster_btree_structure_helpers.inc test_cluster_btree_structure_alloc.inc \
@@ -6249,6 +6265,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_freeze_worker_pass.inc test_cluster_heap_freeze_worker_pass.inc.tmp
 	rm -f test_cluster_heap_freeze_pgproc_types.inc test_cluster_heap_freeze_pgproc_types.inc.tmp
 	rm -f test_cluster_heap_freeze_pgproc_sample.inc test_cluster_heap_freeze_pgproc_sample.inc.tmp
+	rm -f test_cluster_heap_freeze_pgproc_exit.inc test_cluster_heap_freeze_pgproc_exit.inc.tmp
 	rm -f test_cluster_heap_ctrc_types.inc test_cluster_heap_ctrc_types.inc.tmp test_cluster_heap_ctrc_begin.inc test_cluster_heap_ctrc_begin.inc.tmp
 	rm -f test_cluster_heap_ctrc_step.inc test_cluster_heap_ctrc_step.inc.tmp
 	rm -f test_cluster_heap_ctrc_origin.inc test_cluster_heap_ctrc_origin.inc.tmp
@@ -9573,10 +9590,35 @@ test_cluster_heap_native_wait_vm.inc: $(top_srcdir)/src/backend/access/heap/heap
 	     END { if (found != 6 || waiting) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_heap_chain_call_vm.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_lock_tuple_internal\(/ { in_fn=1 } \
+	     in_fn && /Assert\(cluster_current_mx.successor_proof.valid\);/ { \
+	       emit=1; print "case 0:"; found++ } \
+	     emit == 1 && /if \(xmax_infomask_changed/ { emit=0; print "break;"; done++ } \
+	     in_fn && (/if \(follow_updates && updated &&/ \
+	       || /if \(follow_updates && !HEAP_XMAX_IS_LOCKED_ONLY/) { \
+	       emit=2; opened=closed=depth=0; print "case " found++ ":" } \
+	     emit { print } \
+	     emit == 2 && closed && /heap_lock_tuple_buffer\(/ { emit=0; done++; print "break;" } \
+	     emit == 2 && !closed { s=$$0; opens=gsub(/\{/, "", s); s=$$0; closes=gsub(/}/, "", s); \
+	       depth+=opens-closes; if (opens) opened=1; if (opened && depth==0) closed=1 } \
+	     /^}/ { in_fn=0 } END { if (found != 3 || done != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_chain_call_primitives.inc: $(top_srcdir)/src/backend/access/heap/heapam.c \
+		$(top_srcdir)/src/backend/storage/page/itemptr.c Makefile
+	awk '/^xmax_infomask_changed\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	awk '/^ItemPointerEquals\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' \
+	     $(top_srcdir)/src/backend/storage/page/itemptr.c >> $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_lock_vm_pin test_cluster_heap_lock_vm_pin_noassert: test_cluster_heap_lock_vm_pin.c unit_test.h \
 		test_cluster_heap_lock_rebind.inc test_cluster_heap_vm_unwind_helpers.inc \
 		test_cluster_heap_dml_vm_relock.inc \
 		test_cluster_heap_native_wait_vm.inc \
+		test_cluster_heap_chain_call_vm.inc test_cluster_heap_chain_call_primitives.inc \
 		test_cluster_heap_lock_vm_recent.inc test_cluster_heap_lock_chain_pin.inc \
 		test_cluster_heap_chain_vm_itl.inc test_cluster_heap_chain_vm_no_itl.inc \
 		test_cluster_heap_chain_receipt_types.inc test_cluster_heap_chain_receipt_reserve.inc \
