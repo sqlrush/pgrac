@@ -21,6 +21,7 @@
 #include "postgres.h"
 
 #include <setjmp.h>
+#include <unistd.h>
 
 #include "access/heapam.h"
 #include "access/heapam_xlog.h"
@@ -8769,7 +8770,38 @@ static uint64 origin_reply_table_visits;
 #define ctrc_semantic_progress original_certificate_semantic_progress
 #define LWLockAcquire participant_publisher_lock_acquire
 #define LWLockRelease participant_publisher_lock_release
+#include "test_cluster_heap_ctrc_origin_reply_trace_types.inc"
+#if defined(CLUSTER_CTRC_ORIGIN_REPLY_TRACE_PRESENT) && defined(CLUSTER_CTRC_LOCAL_BATCH_REPLY_TRACE_PRESENT)
+/* Execute the original diagnostic bodies with their default-OFF input.
+ * An unexpected ON traversal fails at these explicit runtime/clock leaves. */
+static bool original_origin_reply_trace_enabled;
+static PGPROC *original_origin_reply_trace_proc;
+static void
+original_origin_reply_trace_locks(void (*callback)(LWLock *, LWLockMode, void *),
+								void *context)
+{
+	(void)callback; (void)context; UT_ASSERT(false);
+}
+static TimestampTz
+original_origin_reply_trace_clock(void)
+{
+	UT_ASSERT(false);
+	return 0;
+}
+#define cluster_trace_normal_stop original_origin_reply_trace_enabled
+#define MyProc original_origin_reply_trace_proc
+#define ForEachLWLockHeldByMe original_origin_reply_trace_locks
+#define GetCurrentTimestamp original_origin_reply_trace_clock
+#endif
 #include "test_cluster_heap_ctrc_origin_reply.inc"
+#if defined(CLUSTER_CTRC_ORIGIN_REPLY_TRACE_PRESENT) && defined(CLUSTER_CTRC_LOCAL_BATCH_REPLY_TRACE_PRESENT)
+#undef GetCurrentTimestamp
+#undef ForEachLWLockHeldByMe
+#undef MyProc
+#undef cluster_trace_normal_stop
+#endif
+#undef CLUSTER_CTRC_LOCAL_BATCH_REPLY_TRACE_PRESENT
+#undef CLUSTER_CTRC_ORIGIN_REPLY_TRACE_PRESENT
 #undef LWLockRelease
 #undef LWLockAcquire
 #undef ctrc_semantic_progress

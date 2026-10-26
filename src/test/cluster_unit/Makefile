@@ -2228,12 +2228,26 @@ test_cluster_heap_ctrc_ack.inc: $(top_srcdir)/src/backend/cluster/cluster_termin
 	mv $@.tmp $@
 
 # Original volatile origin/inbox terminal edge; canonical block0 publisher is separate.
+# Native trace definitions are required as a complete set when the source has
+# them. An older source with no trace definitions or references emits no types.
+test_cluster_heap_ctrc_origin_reply_trace_types.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk '/^#define CLUSTER_CTRC_(ORIGIN_REPLY_TRACE|LOCAL_BATCH_REPLY_TRACE)_PRESENT 1$$/ { print; markers++ } \
+	     /^typedef struct CtrcOriginBatchReplyTrace CtrcOriginBatchReplyTrace;/ { print; forward++ } \
+	     /^typedef struct CtrcOriginBatchTraceState / { emit=1; state++ } \
+	     /^struct CtrcOriginBatchReplyTrace / { emit=1; batch++ } \
+	     /^static uint64 CtrcReplyTrace(Sequence|UnsafeSkipped);/ { print; counters++ } \
+	     /ctrc_origin_(reply_trace|batch_trace_(state|before|after))\(/ { references++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (emit || (references == 0 ? markers || forward || state || batch || counters : markers != 2 || forward != 1 || state != 1 || batch != 1 || counters != 2)) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_ctrc_origin_reply.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
-	@awk 'BEGIN { pattern = "^(ctrc_origin_ack_entries|ctrc_origin_ack_index|ctrc_origin_frozen_touch_set_valid|cluster_ctrc_origin_begin_seal_entry|cluster_ctrc_origin_arm_close_entry|cluster_ctrc_origin_note_close_reply_entry|cluster_ctrc_origin_begin_cleaning_entry|cluster_ctrc_origin_ack_land_entry|ctrc_origin_ack_land_locked|cluster_ctrc_origin_ack_land_shared|cluster_ctrc_origin_certificate_validate|cluster_ctrc_origin_certificate_snapshot_entry|cluster_ctrc_origin_certificate_commit_entry|ctrc_origin_certificate_snapshot_index_locked|ctrc_origin_certificate_commit_shared|cluster_ctrc_origin_arm_certificate_entry|cluster_ctrc_origin_note_certificate_reply_entry|ctrc_origin_release_reclaim_locked|ctrc_origin_note_certificate_match_locked|cluster_ctrc_origin_note_certificate_reply_shared)\\(" } \
+	@awk 'BEGIN { pattern = "^(ctrc_origin_reply_trace_lock|ctrc_origin_reply_trace|ctrc_origin_batch_trace_state|ctrc_origin_batch_trace_before|ctrc_origin_batch_trace_after|ctrc_origin_ack_entries|ctrc_origin_ack_index|ctrc_origin_frozen_touch_set_valid|cluster_ctrc_origin_begin_seal_entry|cluster_ctrc_origin_arm_close_entry|cluster_ctrc_origin_note_close_reply_entry|cluster_ctrc_origin_begin_cleaning_entry|cluster_ctrc_origin_ack_land_entry|ctrc_origin_ack_land_locked|cluster_ctrc_origin_ack_land_shared|cluster_ctrc_origin_certificate_validate|cluster_ctrc_origin_certificate_snapshot_entry|cluster_ctrc_origin_certificate_commit_entry|ctrc_origin_certificate_snapshot_index_locked|ctrc_origin_certificate_commit_shared|cluster_ctrc_origin_arm_certificate_entry|cluster_ctrc_origin_note_certificate_reply_entry|ctrc_origin_release_reclaim_locked|ctrc_origin_note_certificate_match_locked|cluster_ctrc_origin_note_certificate_reply_shared)\\(" } \
+	     /^#define CLUSTER_CTRC_(ORIGIN_REPLY_TRACE|LOCAL_BATCH_REPLY_TRACE)_PRESENT 1$$/ { markers++ } \
 	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); ret=prev; sub(/^static[ \t]+/, "", ret); candidate=1; head=1; text=""; decl="" } \
-	     candidate { text=text $$0 "\n"; if (/^\{/) { head=0; if (seen[name]++) exit 1; order[++found]=name; returns[name]="static " ret } else if (head) { decl=decl $$0 "\n"; if (/;[ \t]*$$/) candidate=0 } } \
+	     candidate { text=text $$0 "\n"; if (/^\{/) { head=0; if (seen[name]++) exit 1; order[++found]=name; returns[name]="static " ret; if (name ~ /^ctrc_origin_(reply_trace|batch_trace_)/) traces++ } else if (head) { decl=decl $$0 "\n"; if (/;[ \t]*$$/) candidate=0 } } \
 	     candidate && /^}/ { candidate=0; body[name]=text; declaration[name]=decl; done++ } { prev=$$0 } \
-	     END { if (found != 20 || done != 20 || candidate) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
+	     END { if (candidate || done != found || (markers == 0 ? found != 20 || traces != 0 : markers != 2 || found != 25 || traces != 5)) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Exact original certificate publisher; I/O and scheduling leaves are controlled.
@@ -2282,6 +2296,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_ctrc_certificate.inc $(top_srcdir)/src/include/port/pg_crc32c.h \
 		test_cluster_heap_ctrc_ack.inc $(top_srcdir)/src/common/sha2_int.h \
 		test_cluster_heap_ctrc_origin_reply.inc \
+		test_cluster_heap_ctrc_origin_reply_trace_types.inc \
 		test_cluster_heap_ctrc_durable_certificate.inc \
 		$(top_srcdir)/src/include/utils/memutils.h \
 		test_cluster_heap_freeze_cohort_current.inc \
@@ -5235,6 +5250,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_ctrc_certificate.inc test_cluster_heap_ctrc_certificate.inc.tmp
 	rm -f test_cluster_heap_ctrc_ack.inc test_cluster_heap_ctrc_ack.inc.tmp
 	rm -f test_cluster_heap_ctrc_origin_reply.inc test_cluster_heap_ctrc_origin_reply.inc.tmp
+	rm -f test_cluster_heap_ctrc_origin_reply_trace_types.inc test_cluster_heap_ctrc_origin_reply_trace_types.inc.tmp
 	rm -f test_cluster_heap_ctrc_durable_certificate.inc test_cluster_heap_ctrc_durable_certificate.inc.tmp
 	rm -f test_cluster_heap_ctrc_attachment.inc test_cluster_heap_ctrc_attachment.inc.tmp
 	rm -f test_cluster_heap_ctrc_ready.inc test_cluster_heap_ctrc_ready.inc.tmp
