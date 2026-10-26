@@ -138,6 +138,16 @@ static int head_pipeline_test_reads, head_pipeline_test_drift, head_pipeline_tes
 static int head_pipeline_test_tt_calls;
 static XLogRecPtr head_pipeline_test_flushed;
 static void head_pipeline_test_after_pin(ClusterUndoBufPin *pin);
+static bool cursor_test_mode;
+static int cursor_test_wal_calls, cursor_test_install_calls, cursor_test_flush_calls;
+static int cursor_test_throw_wal_at, cursor_test_throw_install_at;
+static int cursor_test_bad_cut_at, cursor_test_drift_pin, cursor_test_drift_kind;
+static bool cursor_test_flush_throw, cursor_test_flush_short;
+static XLogRecPtr cursor_test_last_lsn;
+static void cursor_test_after_pin(ClusterUndoBufPin *pin);
+static XLogRecPtr cursor_test_emit(uint8 instance, uint32 segment, uint32 block, const char *image,
+								   XLogRecPtr old_lsn, uint16 rec_off, uint16 rec_len,
+								   uint16 slot_off, uint16 slot_len);
 static void pending_test_after_pin(ClusterUndoBufPin *pin);
 static XLogRecPtr pending_test_emit(uint8 instance, uint32 segment, uint32 block, const char *image,
 									XLogRecPtr old_lsn, uint16 rec_off, uint16 rec_len,
@@ -508,7 +518,13 @@ cluster_undo_buf_install_ref_locked(int slot, uint32 segment_id, uint8 owner, ui
 		UT_ASSERT(block_no >= 1 && block_no <= 2);
 		memcpy(reserve_test_images[block_no - 1].data, image, BLCKSZ);
 		reserve_test_installs++;
-		if (pending_test_mode) {
+		if (cursor_test_mode) {
+			cursor_test_install_calls++;
+			UT_ASSERT_EQ(cursor_test_install_calls, cursor_test_wal_calls);
+			UT_ASSERT(CritSectionCount > 0);
+			if (cursor_test_install_calls == cursor_test_throw_install_at)
+				siglongjmp(*PG_exception_stack, 1);
+		} else if (pending_test_mode) {
 			pending_test_install_calls++;
 			UT_ASSERT_EQ(pending_test_wal_calls, 1);
 			UT_ASSERT(CritSectionCount > 0);
@@ -532,6 +548,9 @@ cluster_undo_emit_block_write_multi(uint8 instance, uint32 segment_id, uint32 bl
 								 const char *image, XLogRecPtr old_lsn, uint16 rec_off,
 								 uint16 rec_len, uint16 slot_off, uint16 slot_len)
 {
+	if (cursor_test_mode)
+		return cursor_test_emit(instance, segment_id, block_no, image, old_lsn, rec_off, rec_len,
+								slot_off, slot_len);
 	if (pending_test_mode)
 		return pending_test_emit(instance, segment_id, block_no, image, old_lsn, rec_off, rec_len,
 								 slot_off, slot_len);
@@ -599,7 +618,7 @@ cluster_undo_buf_install_wal_ref_locked(int slot, uint32 segment_id, uint8 owner
 									  uint32 block_no, const char image[BLCKSZ], XLogRecPtr wal_lsn)
 {
 	if (reserve_test_mode) {
-		UT_ASSERT_EQ(wal_lsn, 500 + reserve_test_wal);
+		UT_ASSERT_EQ(wal_lsn, cursor_test_mode ? cursor_test_last_lsn : 500 + reserve_test_wal);
 		UT_ASSERT_EQ(((const UndoBlockHeader *)image)->block_lsn, wal_lsn);
 		cluster_undo_buf_install_ref_locked(slot, segment_id, owner, block_no, image);
 		return;
@@ -6073,11 +6092,27 @@ UT_TEST(test_exact_zero_abort_keeps_cleanup_after_native_scope_ends)
 #include "test_cluster_undo_savepoint_reserve.inc"
 #include "test_cluster_undo_savepoint_pending.inc"
 #include "test_cluster_undo_savepoint_head.inc"
+#include "test_cluster_undo_savepoint_cursor.inc"
 
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(207);
+	UT_PLAN(222);
+	UT_RUN(test_cursor_caches_unaligned_control_without_header_dereference);
+	UT_RUN(test_cursor_cross_block_progress_follows_actual_prev);
+	UT_RUN(test_cursor_cross_block_cycle_cannot_reset_at_batch_boundary);
+	UT_RUN(test_cursor_marks_one_block_before_progress_and_flush);
+	UT_RUN(test_cursor_already_discarded_data_is_idempotent);
+	UT_RUN(test_cursor_exact_stop_repeat_is_not_complete);
+	UT_RUN(test_cursor_traverses_old_complete_control_without_effect);
+	UT_RUN(test_cursor_rejects_legacy_data_without_scope_proof);
+	UT_RUN(test_cursor_rechecks_actual_control_before_marking);
+	UT_RUN(test_cursor_rejects_malformed_next_before_publication);
+	UT_RUN(test_cursor_rechecks_original_current_native_and_scope);
+	UT_RUN(test_cursor_failures_between_mark_and_cursor_keep_pending_owner);
+	UT_RUN(test_cursor_flush_failures_cannot_resume_parent);
+	UT_RUN(test_cursor_requires_actual_head_publication);
+	UT_RUN(test_cursor_respects_same_block_control_and_data);
 	UT_RUN(test_control_head_pipeline_publishes_after_complete_chain_proof);
 	UT_RUN(test_control_head_pipeline_nil_tt_and_stop_preserve_full_chain);
 	UT_RUN(test_control_head_pipeline_rejects_malformed_retained_members);

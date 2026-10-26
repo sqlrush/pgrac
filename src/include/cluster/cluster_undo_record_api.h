@@ -99,6 +99,7 @@ typedef enum ClusterUndoRecordConsumePreflightResult {
 #define CLUSTER_UNDO_SAVEPOINT_BOUNDS_PRESENT 1
 #define CLUSTER_UNDO_SAVEPOINT_PENDING_PRESENT 1
 #define CLUSTER_UNDO_SAVEPOINT_HEAD_PRESENT 1
+#define CLUSTER_UNDO_SAVEPOINT_CURSOR_PRESENT 1
 
 typedef struct ClusterUndoSavepointControl ClusterUndoSavepointControl;
 /* Before any data effect or DATA receipt, with no content/entry lock held.
@@ -167,6 +168,22 @@ extern bool cluster_undo_record_stage_savepoint_pending(ClusterUndoSavepointCont
 extern bool cluster_undo_record_publish_savepoint_pending(
 	ClusterUndoSavepointControl *control, const ClusterUndoSavepointBounds *expected,
 	UBA expected_tt_head, uint64 absolute_deadline_us, XLogRecPtr *cut_out);
+
+/* Advance one original undo block of an already published live control.
+ * The original handle's compare copy must match the current physical control;
+ * it is not a recovery/resume credential. Extended DATA is marked DISCARDED
+ * under the original own-origin publication/pool X pin, then that pin is
+ * released before cursor WAL and flush. Existing top references stay owned.
+ *
+ * false clears outputs for unknown or not-yet-published handles. Once a live
+ * published control is accepted, uncertainty is fatal, never parent cleanup.
+ * Success returns a flushed original-thread cut. at_stop means exact position
+ * only: this leaves phase MARKING, does not publish COMPLETE, release locks or
+ * permit native subtransaction cleanup. No allocation, top terminal stamp,
+ * receipt cancellation, heap/index deletion, or foreign write is performed. */
+extern bool cluster_undo_record_advance_savepoint(ClusterUndoSavepointControl *control,
+												  uint64 absolute_deadline_us, XLogRecPtr *cut_out,
+												  bool *at_stop_out);
 
 
 /* Stack-only identity for one backend-local prepared DATA reservation.  It is

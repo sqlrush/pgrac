@@ -54,6 +54,7 @@ pending_test_emit(uint8 instance, uint32 segment, uint32 block, const char *imag
 {
 	const UndoBlockHeader *before = (const UndoBlockHeader *)reserve_test_images[block - 1].data;
 	UndoSavepointRollbackPayload body;
+	UndoRecordHeader header;
 
 	UT_ASSERT_EQ(instance, 1);
 	UT_ASSERT_EQ(segment, 1);
@@ -69,7 +70,8 @@ pending_test_emit(uint8 instance, uint32 segment, uint32 block, const char *imag
 	UT_ASSERT_EQ(slot_len, 8);
 	memcpy(&body, image + rec_off + 64, 96);
 	UT_ASSERT_EQ(body.phase, 2);
-	UT_ASSERT_EQ(((const UndoRecordHeader *)(image + rec_off))->flags, 16);
+	memcpy(&header, image + rec_off, sizeof(header));
+	UT_ASSERT_EQ(header.flags, 16);
 	UT_ASSERT_EQ(UNDO_SLOT_DIR_PTR(image, (BLCKSZ - slot_off) / 8 - 1)->flags, 16);
 	memcpy(pending_test_wal_image.data, image, BLCKSZ);
 	pending_test_wal_calls++;

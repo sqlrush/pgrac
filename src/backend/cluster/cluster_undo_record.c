@@ -380,6 +380,15 @@ struct ClusterUndoSavepointControl {
 	bool owns_ref;
 	bool reserved;
 	XLogRecPtr pending_lsn; /* staged WAL cut, not a durable head or effect proof */
+	/* Local compare state for this live writer; the physical control remains
+	 * authoritative and is re-read before every cursor publication. */
+	XLogRecPtr head_lsn;
+	XLogRecPtr cursor_lsn;
+	SCN record_scn;
+	UndoSavepointRollbackPayload cursor;
+	UBA cursor_checkpoint;
+	uint64 cursor_power;
+	uint64 cursor_period;
 	struct ClusterUndoSavepointControl *next;
 };
 static ClusterUndoSavepointControl *undo_savepoint_controls;
@@ -5810,6 +5819,14 @@ undo_savepoint_pending_install(ClusterUndoSavepointControl *control, uint32 segm
 		 * failure must not make frame cleanup treat this as unused again. */
 		control->pending_lsn = lsn;
 		control->reserved = false;
+		control->cursor_lsn = lsn;
+		memcpy(&control->record_scn, image + record_offset + offsetof(UndoRecordHeader, write_scn),
+			   sizeof(control->record_scn));
+		memcpy(&control->cursor, image + record_offset + sizeof(UndoRecordHeader),
+			   sizeof(control->cursor));
+		control->cursor_checkpoint = control->cursor.start_uba;
+		control->cursor_power = 1;
+		control->cursor_period = 0;
 		block->block_lsn = lsn;
 		cluster_undo_buf_install_wal_ref_locked(control->ref_slot, segment,
 												control->operation.top.origin_instance, block_no,
@@ -6146,6 +6163,7 @@ cluster_undo_record_publish_savepoint_pending(ClusterUndoSavepointControl *contr
 				undo_savepoint_head_fail();
 			START_CRIT_SECTION();
 			cluster_undo_local_heads[stage.local_head_idx].head = owned->uba;
+			owned->head_lsn = head_cut;
 			*cut_out = head_cut;
 			complete = true;
 			END_CRIT_SECTION();
@@ -6162,4 +6180,393 @@ cluster_undo_record_publish_savepoint_pending(ClusterUndoSavepointControl *contr
 	PG_END_TRY();
 	cluster_semantic_activation_leave(&admission);
 	return complete;
+}
+
+typedef struct UndoSavepointCursorAdvance {
+	UndoSavepointHeadPublish owner;
+	PGAlignedBlock image;
+	UBA next;
+	uint64 visited;
+	UBA checkpoint;
+	uint64 power;
+	uint64 period;
+	uint16 record_lo;
+	uint16 record_hi;
+	uint16 slot_lo;
+	uint16 slot_hi;
+} UndoSavepointCursorAdvance;
+
+static bool undo_savepoint_cursor_active;
+static void undo_savepoint_cursor_fail(void) pg_attribute_noreturn();
+
+static void
+undo_savepoint_cursor_fail(void)
+{
+	ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+					errmsg("cannot advance the published savepoint rollback cursor"),
+					errhint("Retain the original undo and recover the top transaction before "
+							"continuing.")));
+	pg_unreachable();
+}
+
+static bool
+undo_savepoint_cursor_recheck(const UndoSavepointCursorAdvance *stage)
+{
+	const ClusterUndoSavepointControl *control = stage->owner.control;
+	const ClusterUndoRecordReservation *reservation = &cluster_undo_record_reservation;
+	UBA head;
+
+	return cluster_shared_config && cluster_enabled && CritSectionCount == 0
+		   && MyProc == stage->owner.proc && MyProc != NULL && MyProc->lxid == stage->owner.lxid
+		   && !reservation->active && !reservation->owns_ref && !reservation->consume_locked
+		   && reservation->receipt.ctrc_pending_mask == 0
+		   && reservation->receipt.ctrc_prepared_mask == 0
+		   && reservation->receipt.ctrc_applied_mask == 0
+		   && !reservation->receipt.modifier_admission.entered && !cluster_undo_pending.active
+		   && control->owns_ref && control->ref_slot >= 0 && !control->reserved
+		   && control->head_lsn > control->pending_lsn && !XLogRecPtrIsInvalid(control->pending_lsn)
+		   && control->cursor_lsn >= control->pending_lsn
+		   && cluster_savepoint_operation_matches_frame(&control->operation)
+		   && undo_savepoint_control_read_head(&control->operation, &head)
+		   && cluster_undo_record_uba_equal(head, control->uba)
+		   && cluster_semantic_activation_modifier_recheck(stage->owner.admission, true);
+}
+
+/* The local copy is only a compare-before-write expectation. Reconstruct
+ * and compare all 208 physical bytes under the original control reference. */
+static uint16
+undo_savepoint_cursor_control_image(UndoSavepointCursorAdvance *stage)
+{
+	ClusterUndoSavepointControl *control = stage->owner.control;
+	UndoBlockHeader *block = (UndoBlockHeader *)stage->image.data;
+	UndoSlotDirEntry *slot;
+	UndoRecordHeader header;
+	UndoOperationTrailer operation;
+	char expected[UNDO_REC_SAVEPOINT_ROLLBACK_TOTAL_LEN];
+	uint32 segment, block_no;
+	uint16 tt, row;
+
+	if (!uba_decode_record(control->uba, &segment, &block_no, &tt, &row)
+		|| block->magic != PGRAC_UNDO_BLOCK_MAGIC || block->block_version != UNDO_BLOCK_VERSION_1
+		|| block->block_lsn < control->cursor_lsn || control->cursor_power == 0
+		|| control->cursor_period >= control->cursor_power
+		|| !cluster_undo_record_slot_index_valid(block->slot_count, row)
+		|| (control->cursor.phase != UNDO_SAVEPOINT_ROLLBACK_PENDING
+			&& control->cursor.phase != UNDO_SAVEPOINT_ROLLBACK_MARKING)
+		|| !cluster_undo_record_uba_equal(control->cursor.stop_uba, control->stop_uba)
+		|| !undo_savepoint_control_encode(control, control->record_scn, expected))
+		undo_savepoint_cursor_fail();
+	slot = UNDO_SLOT_DIR_PTR(stage->image.data, row);
+	if (!cluster_undo_record_slot_range_valid(block->slot_count, row, slot->record_offset,
+											  slot->record_length)
+		|| slot->record_length != sizeof(expected)
+		|| (uint64)slot->record_offset + slot->record_length > block->free_offset
+		|| block->free_offset > BLCKSZ - (uint32)block->slot_count * sizeof(*slot))
+		undo_savepoint_cursor_fail();
+	memcpy(&header, expected, sizeof(header));
+	memcpy(&operation, expected + sizeof(header) + UNDO_SAVEPOINT_ROLLBACK_LENGTH,
+		   sizeof(operation));
+	header.flags &= ~UNDO_REC_FLAG_FIRST_IN_TX;
+	header.prev_uba = control->cursor.start_uba;
+	memcpy(expected, &header, sizeof(header));
+	if (!cluster_undo_record_encode_rollback_payload(&header, &control->cursor, &operation,
+													 expected + sizeof(header),
+													 UNDO_SAVEPOINT_ROLLBACK_PAYLOAD_LENGTH)
+		|| !cluster_undo_head_operation_matches_control(
+			&stage->owner.request, &header, expected + sizeof(header), header.payload_length)
+		|| slot->record_type != header.record_type || slot->flags != header.flags
+		|| memcmp(stage->image.data + slot->record_offset, expected, sizeof(expected)) != 0)
+		undo_savepoint_cursor_fail();
+	return slot->record_offset;
+}
+
+/* Native origin publication, through the existing WAL/dirty/checkpoint
+ * owner. The slot directory is carried unchanged by the original codec. */
+static XLogRecPtr
+undo_savepoint_cursor_write(UndoSavepointCursorAdvance *stage, const ClusterUndoBufPin *pin,
+							uint16 record_off, uint16 record_len, uint16 slot_off, uint16 slot_len,
+							XLogRecPtr predecessor)
+{
+	UndoBlockHeader *block = (UndoBlockHeader *)stage->image.data;
+	PGPROC *proc = stage->owner.proc;
+	uint32 saved_critical = CritSectionCount;
+	int saved_flags = proc->delayChkptFlags;
+	volatile XLogRecPtr cut = InvalidXLogRecPtr;
+
+	if (!undo_savepoint_cursor_recheck(stage))
+		undo_savepoint_cursor_fail();
+	predecessor = Max(predecessor, block->block_lsn);
+	START_CRIT_SECTION();
+	proc->delayChkptFlags |= DELAY_CHKPT_START;
+	PG_TRY();
+	{
+		cut = cluster_undo_emit_block_write_multi(pin->owner, pin->segment_id, pin->block_no,
+												  stage->image.data, block->block_lsn, record_off,
+												  record_len, slot_off, slot_len);
+		if (XLogRecPtrIsInvalid(cut) || cut <= predecessor)
+			undo_savepoint_cursor_fail();
+		block->block_lsn = cut;
+		cluster_undo_buf_install_wal_ref_locked(pin->slot, pin->segment_id, pin->owner,
+												pin->block_no, stage->image.data, cut);
+		END_CRIT_SECTION();
+	}
+	PG_FINALLY();
+	{
+		proc->delayChkptFlags = saved_flags;
+		CritSectionCount = saved_critical;
+	}
+	PG_END_TRY();
+	return cut;
+}
+
+/* Read the same physical control before effects and again after releasing
+ * the DATA lock. No two undo content locks are held together. */
+static XLogRecPtr
+undo_savepoint_cursor_control(UndoSavepointCursorAdvance *stage, uint64 deadline,
+							  const UndoSavepointRollbackPayload *successor, XLogRecPtr mark_cut)
+{
+	ClusterUndoSavepointControl *control = stage->owner.control;
+	ClusterUndoBlock0LiveOwnerPublication publication;
+	volatile ClusterUndoBufPin pin = { .slot = -1 };
+	uint32 segment, block;
+	uint16 tt, row, offset;
+	const char *resident;
+	volatile XLogRecPtr cut = control->cursor_lsn;
+
+	if (!uba_decode_record(control->uba, &segment, &block, &tt, &row)
+		|| !cluster_undo_record_ensure_block0_current(control->operation.top.origin_instance,
+													  segment, deadline, &publication))
+		undo_savepoint_cursor_fail();
+	PG_TRY();
+	{
+		resident = cluster_undo_buf_pin(segment, control->operation.top.origin_instance, block,
+										successor == NULL ? CLUSTER_UNDO_BUF_SHARED
+														  : CLUSTER_UNDO_BUF_EXCLUSIVE,
+										(ClusterUndoBufPin *)&pin);
+		if (resident == NULL || pin.slot != control->ref_slot
+			|| !undo_savepoint_cursor_recheck(stage)
+			|| !cluster_undo_block0_current_live_owner_publication_recheck_conditional(
+				&publication))
+			undo_savepoint_cursor_fail();
+		memcpy(stage->image.data, resident, BLCKSZ);
+		offset = undo_savepoint_cursor_control_image(stage);
+		if (successor != NULL) {
+			UndoRecordHeader header;
+			UndoOperationTrailer operation;
+			char *record = stage->image.data + offset;
+
+			memcpy(&header, record, sizeof(header));
+			memcpy(&operation, record + sizeof(header) + UNDO_SAVEPOINT_ROLLBACK_LENGTH,
+				   sizeof(operation));
+			if (!cluster_undo_record_encode_rollback_payload(
+					&header, successor, &operation, record + sizeof(header), header.payload_length))
+				undo_savepoint_cursor_fail();
+			cut = undo_savepoint_cursor_write(stage, (const ClusterUndoBufPin *)&pin, offset,
+											  UNDO_REC_SAVEPOINT_ROLLBACK_TOTAL_LEN,
+											  (uint16)UNDO_SLOT_DIR_OFFSET(row),
+											  sizeof(UndoSlotDirEntry), mark_cut);
+			control->cursor = *successor;
+			control->cursor_lsn = cut;
+			control->cursor_checkpoint = stage->checkpoint;
+			control->cursor_power = stage->power;
+			control->cursor_period = stage->period;
+		}
+	}
+	PG_FINALLY();
+	{
+		if (pin.slot >= 0)
+			cluster_undo_buf_unpin((ClusterUndoBufPin *)&pin);
+	}
+	PG_END_TRY();
+	return cut;
+}
+
+static void
+undo_savepoint_cursor_mark_member(UndoSavepointCursorAdvance *stage, uint16 row)
+{
+	UndoSlotDirEntry *slot = UNDO_SLOT_DIR_PTR(stage->image.data, row);
+	UndoRecordHeader member;
+	char *payload = stage->image.data + slot->record_offset + sizeof(member);
+	UndoSavepointRollbackPayload body;
+	UndoOperationTrailer operation;
+
+	memcpy(&member, stage->image.data + slot->record_offset, sizeof(member));
+	if (member.record_type == UNDO_RECORD_SAVEPOINT_ROLLBACK) {
+		if (!cluster_undo_record_decode_rollback_payload(&member, payload, member.payload_length,
+														 &body, &operation)
+			|| body.phase != UNDO_SAVEPOINT_ROLLBACK_COMPLETE)
+			undo_savepoint_cursor_fail();
+	} else {
+		if ((member.flags & UNDO_REC_FLAG_HAS_OPERATION) == 0)
+			undo_savepoint_cursor_fail();
+		/* The common decoder already validated the complete immutable tail,
+		 * raw writer, body and ITL history before this single-byte change. */
+		payload[member.payload_length - sizeof(operation)
+				+ offsetof(UndoOperationTrailer, effect_state)]
+			= CLUSTER_SAVEPOINT_EFFECT_DISCARDED;
+	}
+	stage->record_lo = Min(stage->record_lo, slot->record_offset);
+	stage->record_hi = Max(stage->record_hi, slot->record_offset + slot->record_length);
+	stage->slot_lo = Min(stage->slot_lo, UNDO_SLOT_DIR_OFFSET(row));
+	stage->slot_hi = Max(stage->slot_hi, UNDO_SLOT_DIR_OFFSET(row) + sizeof(*slot));
+}
+
+/* Keep cycle detection across physical block batches, in the original
+ * live execution owner only. Source recovery never consumes this RAM. */
+static void
+undo_savepoint_cursor_cycle_step(UndoSavepointCursorAdvance *stage)
+{
+	stage->period++;
+	if (cluster_undo_record_uba_equal(stage->next, stage->checkpoint))
+		undo_savepoint_cursor_fail();
+	if (stage->period == stage->power) {
+		stage->checkpoint = stage->next;
+		stage->period = 0;
+		if (stage->power > UINT64_MAX / 2)
+			undo_savepoint_cursor_fail();
+		stage->power *= 2;
+	}
+}
+
+/* One batch follows actual prev edges within one physical block. The slot
+ * count bounds unique members of that block; it is never a stop proof. */
+static void
+undo_savepoint_cursor_mark_image(UndoSavepointCursorAdvance *stage, uint32 segment, uint32 block)
+{
+	ClusterUndoSavepointControl *control = stage->owner.control;
+	UndoBlockHeader *header = (UndoBlockHeader *)stage->image.data;
+	uint32 next_segment, next_block;
+	uint16 tt, row;
+	UBA previous;
+
+	stage->next = control->cursor.next_uba;
+	stage->visited = 0;
+	stage->checkpoint = control->cursor_checkpoint;
+	stage->power = control->cursor_power;
+	stage->period = control->cursor_period;
+	stage->record_lo = stage->slot_lo = BLCKSZ;
+	stage->record_hi = stage->slot_hi = 0;
+	while (!cluster_undo_record_uba_equal(stage->next, control->stop_uba)) {
+		CHECK_FOR_INTERRUPTS();
+		if (cluster_undo_record_uba_equal(stage->next, control->uba)
+			|| !undo_savepoint_control_address_valid(&control->operation, stage->next, false)
+			|| !uba_decode_record(stage->next, &next_segment, &next_block, &tt, &row))
+			undo_savepoint_cursor_fail();
+		if (next_segment != segment || next_block != block)
+			break;
+		if (stage->visited >= header->slot_count
+			|| !undo_savepoint_chain_member(&stage->owner, stage->next, stage->image.data, row,
+											&previous))
+			undo_savepoint_cursor_fail();
+		undo_savepoint_cursor_mark_member(stage, row);
+		stage->next = previous;
+		stage->visited++;
+		undo_savepoint_cursor_cycle_step(stage);
+	}
+	if (stage->visited == 0 || control->cursor.visited_count > UINT64_MAX - stage->visited)
+		undo_savepoint_cursor_fail();
+}
+
+static XLogRecPtr
+undo_savepoint_cursor_mark(UndoSavepointCursorAdvance *stage, uint64 deadline)
+{
+	ClusterUndoSavepointControl *control = stage->owner.control;
+	ClusterUndoBlock0LiveOwnerPublication publication;
+	volatile ClusterUndoBufPin pin = { .slot = -1 };
+	uint32 segment, block;
+	uint16 tt, row;
+	const char *resident;
+	volatile XLogRecPtr cut = InvalidXLogRecPtr;
+
+	if (!undo_savepoint_control_address_valid(&control->operation, control->cursor.next_uba, false)
+		|| !uba_decode_record(control->cursor.next_uba, &segment, &block, &tt, &row)
+		|| !cluster_undo_record_ensure_block0_current(control->operation.top.origin_instance,
+													  segment, deadline, &publication))
+		undo_savepoint_cursor_fail();
+	PG_TRY();
+	{
+		resident = cluster_undo_buf_pin(segment, control->operation.top.origin_instance, block,
+										CLUSTER_UNDO_BUF_EXCLUSIVE, (ClusterUndoBufPin *)&pin);
+		if (resident == NULL || pin.slot < 0 || !undo_savepoint_cursor_recheck(stage)
+			|| !cluster_undo_block0_current_live_owner_publication_recheck_conditional(
+				&publication))
+			undo_savepoint_cursor_fail();
+		memcpy(stage->image.data, resident, BLCKSZ);
+		undo_savepoint_cursor_mark_image(stage, segment, block);
+		cut = undo_savepoint_cursor_write(stage, (const ClusterUndoBufPin *)&pin, stage->record_lo,
+										  stage->record_hi - stage->record_lo, stage->slot_lo,
+										  stage->slot_hi - stage->slot_lo,
+										  Max(control->head_lsn, control->cursor_lsn));
+	}
+	PG_FINALLY();
+	{
+		if (pin.slot >= 0)
+			cluster_undo_buf_unpin((ClusterUndoBufPin *)&pin);
+	}
+	PG_END_TRY();
+	return cut;
+}
+
+/* Spec: 2026-10-26-pre2-p013-full-savepoint-design.md */
+bool
+cluster_undo_record_advance_savepoint(ClusterUndoSavepointControl *control, uint64 deadline,
+									  XLogRecPtr *cut_out, bool *at_stop_out)
+{
+	ClusterUndoSavepointControl *owned = undo_savepoint_control_find(control);
+	ClusterSemanticAdmissionToken admission = { 0 };
+	UndoSavepointCursorAdvance stage = { 0 };
+	volatile XLogRecPtr cut = InvalidXLogRecPtr;
+
+	if (cut_out != NULL)
+		*cut_out = InvalidXLogRecPtr;
+	if (at_stop_out != NULL)
+		*at_stop_out = false;
+	if (cut_out == NULL || at_stop_out == NULL || owned == NULL
+		|| XLogRecPtrIsInvalid(owned->head_lsn))
+		return false;
+	stage.owner.control = owned;
+	stage.owner.proc = MyProc;
+	stage.owner.lxid = MyProc == NULL ? InvalidLocalTransactionId : MyProc->lxid;
+	stage.owner.admission = &admission;
+	if (undo_savepoint_cursor_active || CritSectionCount != 0 || MyProc == NULL
+		|| !LocalTransactionIdIsValid(MyProc->lxid) || cluster_node_id < 0
+		|| owned->operation.top.origin_instance != (uint8)(cluster_node_id + 1)
+		|| deadline <= (uint64)GetCurrentTimestamp() || !undo_savepoint_head_request(&stage.owner)
+		|| cluster_semantic_activation_modifier_enter(true, &admission)
+			   != CLUSTER_SEMANTIC_ADMISSION_OK)
+		undo_savepoint_cursor_fail();
+	undo_savepoint_cursor_active = true;
+	PG_TRY();
+	{
+		UndoSavepointRollbackPayload successor;
+		XLogRecPtr mark_cut;
+
+		if (!undo_savepoint_cursor_recheck(&stage) || GetFlushRecPtr(NULL) < owned->head_lsn)
+			undo_savepoint_cursor_fail();
+		cut = undo_savepoint_cursor_control(&stage, deadline, NULL, InvalidXLogRecPtr);
+		if (!cluster_undo_record_uba_equal(owned->cursor.next_uba, owned->stop_uba)) {
+			mark_cut = undo_savepoint_cursor_mark(&stage, deadline);
+			successor = owned->cursor;
+			successor.phase = UNDO_SAVEPOINT_ROLLBACK_MARKING;
+			successor.next_uba = stage.next;
+			successor.visited_count += stage.visited;
+			successor.last_effect_wal_lsn = mark_cut;
+			cut = undo_savepoint_cursor_control(&stage, deadline, &successor, mark_cut);
+			XLogFlush(cut);
+		}
+		if (GetFlushRecPtr(NULL) < cut || !undo_savepoint_cursor_recheck(&stage))
+			undo_savepoint_cursor_fail();
+	}
+	PG_CATCH();
+	{
+		undo_savepoint_cursor_active = false;
+		cluster_semantic_activation_leave(&admission);
+		undo_savepoint_cursor_fail();
+	}
+	PG_END_TRY();
+	undo_savepoint_cursor_active = false;
+	cluster_semantic_activation_leave(&admission);
+	*cut_out = cut;
+	*at_stop_out = cluster_undo_record_uba_equal(owned->cursor.next_uba, owned->stop_uba);
+	return true;
 }

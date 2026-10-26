@@ -157,7 +157,7 @@ head_pipeline_end(void)
 static void
 head_pipeline_test_after_pin(ClusterUndoBufPin *pin)
 {
-	UT_ASSERT_EQ(pin->block_no, 2);
+	UT_ASSERT(pin->block_no == 1 || pin->block_no == 2);
 	head_pipeline_test_reads++;
 	switch (head_pipeline_test_drift) {
 	case 1:

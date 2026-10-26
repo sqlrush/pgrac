@@ -55,7 +55,9 @@ cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no, ClusterUnd
 		UT_ASSERT(head_pipeline_test_mode || mode == CLUSTER_UNDO_BUF_EXCLUSIVE);
 		UT_ASSERT(!receipt_buffer_locked);
 		receipt_buffer_locked = true;
-		if (head_pipeline_test_mode && mode == CLUSTER_UNDO_BUF_SHARED)
+		if (cursor_test_mode)
+			cursor_test_after_pin(pin);
+		else if (head_pipeline_test_mode && mode == CLUSTER_UNDO_BUF_SHARED)
 			head_pipeline_test_after_pin(pin);
 		else
 			pending_test_after_pin(pin);
