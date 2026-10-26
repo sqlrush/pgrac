@@ -25,6 +25,7 @@ typedef struct EpisodeTerminalPlanFeed {
 	const ClusterWalSourceRef *source;
 } EpisodeTerminalPlanFeed;
 static bool episode_terminal_side_mismatch;
+static WalTestRecord (*episode_terminal_tail_hook)(const ClusterWalSourceRef *, WalTestRecord);
 
 static bool
 episode_terminal_plan_feed(XLogReaderState *reader, void *arg)
@@ -267,6 +268,8 @@ episode_terminal_begin(EpisodeTerminalFixture mode, ClusterWalInputsV1 **inputs,
 		tail = inventory_write_record(&source, tail.exclusive_end, tail.record_start,
 			RM_CLOG_ID, CLOG_TRUNCATE, &truncate, sizeof(truncate));
 	}
+	if (episode_terminal_tail_hook != NULL)
+		tail = episode_terminal_tail_hook(&source, tail);
 	snapshot->validated_tail_lsn_exclusive = tail.exclusive_end;
 	snapshot->tail_last_record_lsn = tail.record_start;
 	snapshot->tail_last_record_crc32c = tail.record_crc;

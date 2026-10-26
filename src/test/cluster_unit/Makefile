@@ -3501,6 +3501,8 @@ test_cluster_recovery_native_inputs: test_cluster_recovery_episode_history.inc \
 test_cluster_recovery_native_inputs: test_cluster_recovery_manifest_inputs.inc test_cluster_recovery_terminal_inputs.inc test_cluster_recovery_tt_terminal_inputs.inc test_cluster_recovery_page_roots_inputs.inc test_cluster_recovery_page_wal_inputs.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_wal_sources.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_terminal.inc
+test_cluster_recovery_native_inputs: test_cluster_recovery_episode_xid.inc \
+		test_cluster_cold_recovery_decode_core.o test_cluster_cold_recovery_xid_core.o
 test_cluster_recovery_native_inputs: test_cluster_recovery_page_graph.inc
 test_cluster_recovery_native_inputs: $(RECOVERY_CENSUS_TEST_OBJS) test_cluster_recovery_prepare_fixture.h test_cluster_recovery_prepare_inputs.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_xact_join_inputs.inc test_cluster_recovery_relmap_physical_inputs.inc test_cluster_recovery_relmap_inputs.inc test_cluster_recovery_relmap_fixture.h
@@ -3549,7 +3551,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_ctrc_
 		$(top_builddir)/src/backend/cluster/cluster_recovery_native_scan.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_multixact_join.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_xact_join.o \
-		$(if $(filter test_cluster_recovery_native_inputs,$@),test_cluster_recovery_episode_clog.o $(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_store.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_scan.o $(RECOVERY_CENSUS_TEST_OBJS)) \
+		$(if $(filter test_cluster_recovery_native_inputs,$@),test_cluster_recovery_episode_clog.o $(CLUSTER_COLD_DECODE_O) test_cluster_cold_recovery_xid_core.o $(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_store.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_scan.o $(RECOVERY_CENSUS_TEST_OBJS)) \
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
 		test_cluster_page_stable_ctrc.o \
