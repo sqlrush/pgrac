@@ -46,6 +46,7 @@
 #include "cluster/cluster_undo_cleaner.h"
 #include "cluster/cluster_undo_horizon.h"
 #include "cluster/cluster_undo_retention.h"
+#include "cluster/cluster_mrp.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_space_storage.h"
@@ -9524,10 +9525,43 @@ bounds_source_worker_get(ClusterUndoCleanerActiveSample *out)
 
 /* Original history fold and ProcArray sampler, with explicit local scheduling
  * and clock inputs. This is a bounded unit interleaving, not native concurrency. */
-static SCN bounds_history_clock, bounds_history_mrp_bound;
+static SCN bounds_history_clock;
 static PGPROC *bounds_history_all_procs = sampler_slots;
 static bool bounds_history_held, bounds_history_register_on_unlock;
-static bool bounds_history_mrp_active;
+static bool bounds_mrp_enabled, bounds_mrp_adg, bounds_mrp_drop_on_history_unlock;
+static int bounds_mrp_role;
+static ClusterMrpSharedState bounds_mrp_storage, *bounds_mrp_state;
+
+#define scn_total_cmp bounds_original_scn_total_cmp
+#include "test_cluster_heap_freeze_scn_total.inc"
+
+#define cluster_enabled bounds_mrp_enabled
+#define cluster_enable_adg bounds_mrp_adg
+#define cluster_dg_role bounds_mrp_role
+#define cluster_mrp_state bounds_mrp_state
+#define cluster_mrp_config_allows_start bounds_original_mrp_config_allows_start
+#define cluster_mrp_should_start bounds_original_mrp_should_start
+#define cluster_mrp_publish_consistent_scn bounds_original_mrp_publish_consistent_scn
+#define cluster_mrp_standby_consistent_scn bounds_original_mrp_consistent_scn
+#include "test_cluster_heap_freeze_mrp_source.inc"
+#undef cluster_mrp_standby_consistent_scn
+#undef cluster_mrp_publish_consistent_scn
+#undef cluster_mrp_should_start
+#undef cluster_mrp_config_allows_start
+#undef cluster_mrp_state
+#undef cluster_dg_role
+#undef cluster_enable_adg
+#undef cluster_enabled
+#undef scn_total_cmp
+
+/* Direct atomic inputs model unavailable/invalid source states in old refusal
+ * cases; ordinary new publication tests use the original publisher above. */
+static void
+bounds_mrp_test_input(bool active, SCN bound)
+{
+	bounds_mrp_adg = active;
+	pg_atomic_write_u64(&bounds_mrp_storage.standby_consistent_scn, bound);
+}
 static unsigned bounds_history_locks, bounds_history_unlocks, bounds_history_clocks;
 
 static void
@@ -9544,6 +9578,10 @@ bounds_history_release(LWLock *lock)
 {
 	UT_ASSERT(lock == sampler_proc_lock && bounds_history_held);
 	bounds_history_held = false; bounds_history_unlocks++;
+	if (bounds_mrp_drop_on_history_unlock) {
+		bounds_mrp_drop_on_history_unlock = false;
+		bounds_mrp_state = NULL;
+	}
 	if (bounds_history_register_on_unlock) {
 		bounds_history_register_on_unlock = false;
 		ctrc_note_unqualified_registration();
@@ -9562,14 +9600,14 @@ static bool
 bounds_history_mrp_should_start(void)
 {
 	UT_ASSERT(!bounds_history_held);
-	return bounds_history_mrp_active;
+	return bounds_original_mrp_should_start();
 }
 
 static SCN
 bounds_history_mrp_consistent_scn(void)
 {
-	UT_ASSERT(bounds_history_mrp_active && !bounds_history_held);
-	return bounds_history_mrp_bound;
+	UT_ASSERT(bounds_original_mrp_should_start() && !bounds_history_held);
+	return bounds_original_mrp_consistent_scn();
 }
 
 #define cluster_undo_retention_sample_min bounds_original_retention_min
@@ -9786,10 +9824,13 @@ bounds_observer_setup(LVRelState *v, QualifiedXminFixture *f)
 	bounds_acquire_history_reads = bounds_acquire_peer_reads = 0;
 	bounds_acquire_status = CLUSTER_HEAP_FREEZE_COHORT_INVALID;
 	bounds_history_clock = f->cohort.source_local_history.sample_clock_scn;
-	bounds_history_mrp_bound = InvalidScn;
+	memset(&bounds_mrp_storage, 0, sizeof(bounds_mrp_storage));
+	pg_atomic_init_u64(&bounds_mrp_storage.standby_consistent_scn, 0);
+	bounds_mrp_state = &bounds_mrp_storage;
+	bounds_mrp_enabled = true; bounds_mrp_adg = bounds_mrp_drop_on_history_unlock = false;
+	bounds_mrp_role = CLUSTER_DG_ROLE_STANDBY;
 	bounds_history_all_procs = sampler_slots;
 	bounds_history_held = bounds_history_register_on_unlock = false;
-	bounds_history_mrp_active = false;
 	bounds_history_locks = bounds_history_unlocks = bounds_history_clocks = 0;
 	bounds_policy_reads = bounds_cohort_reads = bounds_census_reads = 0;
 	bounds_clock_reads = bounds_clock_observes = bounds_target_reads = 0;
@@ -10084,8 +10125,8 @@ UT_TEST(test_collector_original_history_refusals_block_single_and_batch_wal)
 			case 5: bounds_history_clock = InvalidScn; break;
 			case 6: sampler_proc_array->numProcs = -1; break;
 			case 7: sampler_proc_array->numProcs = sampler_proc_array->maxProcs + 1; break;
-			case 8: bounds_history_mrp_active = true; bounds_history_mrp_bound = InvalidScn; break;
-			case 9: bounds_history_mrp_active = true; bounds_history_mrp_bound = UINT64_MAX; break;
+			case 8: bounds_mrp_test_input(true, InvalidScn); break;
+			case 9: bounds_mrp_test_input(true, UINT64_MAX); break;
 			}
 			memset(&history, 0xa5, sizeof(history));
 			UT_ASSERT(!bounds_original_local_report(&history));
@@ -10112,9 +10153,8 @@ UT_TEST(test_collector_original_history_mrp_fold_keeps_same_cut_attribution)
 	for (unsigned variant = 0; variant < 7; variant++) {
 		QualifiedXminFixture f; LVRelState v; ClusterUndoRetentionSample history, zero = {0};
 		qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI); bounds_observer_setup(&v, &f);
-		bounds_history_mrp_active = true;
-		bounds_history_mrp_bound = variant == 0 ? InvalidScn : variant == 1 ? UINT64_MAX
-			: variant == 2 ? 8 : variant == 4 ? 12 : 10;
+		bounds_mrp_test_input(true, variant == 0 ? InvalidScn : variant == 1 ? UINT64_MAX
+			: variant == 2 ? 8 : variant == 4 ? 12 : 10);
 		if (variant >= 5) {
 			sampler_proc_array->pgprocnos[0] = 2;
 			sampler_slots[2].xmin = 100; sampler_slots[2].pid = variant == 5 ? 42 : 0;
@@ -10191,10 +10231,161 @@ UT_TEST(test_collector_original_history_unlock_registration_invalidates_cut)
 	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
 }
 
+UT_TEST(test_collector_original_mrp_config_and_shared_source_feed_history)
+{
+	for (unsigned mode = 0; mode < 8; mode++) {
+		QualifiedXminFixture f; LVRelState v; ClusterUndoRetentionSample history, zero = {0};
+		qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI); bounds_observer_setup(&v, &f);
+		bounds_mrp_adg = mode != 0;
+		if (mode == 1) bounds_mrp_enabled = false;
+		if (mode == 2) bounds_mrp_role = CLUSTER_DG_ROLE_PRIMARY;
+		if (mode == 3) bounds_mrp_state = NULL;
+		if (mode == 5) bounds_mrp_test_input(true, UINT64_MAX);
+		if (mode == 6) bounds_original_mrp_publish_consistent_scn(8);
+		if (mode == 7) bounds_mrp_role = -1;
+		UT_ASSERT_EQ(bounds_original_mrp_should_start(), mode >= 3 && mode <= 6);
+		memset(&history, 0xa5, sizeof(history));
+		if (mode >= 3 && mode <= 5) {
+			UT_ASSERT(!bounds_original_local_report(&history));
+			UT_ASSERT(memcmp(&history, &zero, sizeof(history)) == 0);
+		} else {
+			UT_ASSERT(bounds_original_local_report(&history));
+			UT_ASSERT_EQ(history.horizon_scn, mode == 6 ? 8 : 10);
+			UT_ASSERT_EQ(history.clock_scn, 10);
+			UT_ASSERT_EQ(history.contributor_kind, mode == 6
+				? CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_REPLICATION
+				: CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+			UT_ASSERT_EQ(history.contributor_token, 0);
+		}
+		UT_ASSERT_EQ(bounds_history_locks, 1); UT_ASSERT_EQ(bounds_history_unlocks, 1);
+		bounds_assert_unlocked();
+	}
+}
+
+UT_TEST(test_collector_original_mrp_publisher_preserves_monotone_watermark)
+{
+	QualifiedXminFixture f; LVRelState v; ClusterUndoRetentionSample history;
+	qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI); bounds_observer_setup(&v, &f);
+	bounds_mrp_adg = true;
+	bounds_original_mrp_publish_consistent_scn(InvalidScn);
+	UT_ASSERT_EQ(bounds_original_mrp_consistent_scn(), InvalidScn);
+	bounds_original_mrp_publish_consistent_scn(8);
+	UT_ASSERT_EQ(bounds_original_mrp_consistent_scn(), 8);
+	bounds_original_mrp_publish_consistent_scn(7);
+	UT_ASSERT_EQ(bounds_original_mrp_consistent_scn(), 8);
+	bounds_original_mrp_publish_consistent_scn(8);
+	UT_ASSERT_EQ(bounds_original_mrp_consistent_scn(), 8);
+	bounds_original_mrp_publish_consistent_scn(10);
+	UT_ASSERT_EQ(bounds_original_mrp_consistent_scn(), 10);
+	bounds_mrp_state = NULL;
+	bounds_original_mrp_publish_consistent_scn(12);
+	UT_ASSERT_EQ(bounds_original_mrp_consistent_scn(), InvalidScn);
+	bounds_mrp_state = &bounds_mrp_storage;
+	UT_ASSERT_EQ(bounds_original_mrp_consistent_scn(), 10);
+	UT_ASSERT(bounds_original_local_report(&history));
+	UT_ASSERT_EQ(history.horizon_scn, 10);
+	UT_ASSERT_EQ(history.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_REPLICATION);
+	UT_ASSERT_EQ(history.contributor_token, 0);
+	bounds_assert_unlocked();
+}
+
+UT_TEST(test_collector_original_mrp_unknown_source_blocks_single_and_batch_wal)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (unsigned mode = 0; mode < 3; mode++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			LVRelState v; ClusterHeapFreezeObservedBoundsV1 bounds = {0};
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			bounds_observer_setup(&v, &f); fixture_wal_clock = 5; bounds_mrp_adg = true;
+			if (mode == 0) bounds_mrp_state = NULL;
+			/* The original raw publisher is not a finite-H qualifier. Even a
+			 * stored sentinel must fail the original local history contract. */
+			if (mode == 2) bounds_original_mrp_publish_consistent_scn(UINT64_MAX);
+			UT_ASSERT_EQ(lazy_observe_shared_freeze_bounds(&v, &f.admission,
+				CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+			UT_ASSERT(bounds_acquire_status != CLUSTER_HEAP_FREEZE_COHORT_READY);
+			UT_ASSERT(!v.shared_freeze_cohort_observed);
+			UT_ASSERT(v.shared_freeze_input.freeze_policy == NULL && v.shared_freeze_input.freeze_cohort == NULL);
+			f.input = v.shared_freeze_input;
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+			UT_ASSERT(!local_x && f.admission.entered); UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes, 0);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_collector_original_mrp_publication_reaches_native_creation_and_wal)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (SCN published = 8; published <= 10; published += 2) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			LVRelState v; ClusterHeapFreezeObservedBoundsV1 bounds = {0}; bool applied;
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			f.cohort.horizon_scn = f.cohort.source_local_horizon_scn = published;
+			f.cohort.source_local_history.contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_REPLICATION;
+			f.cohort.source_local_history.contributor_token = 0;
+			bounds_observer_setup(&v, &f); fixture_wal_clock = 5; bounds_mrp_adg = true;
+			bounds_original_mrp_publish_consistent_scn(8);
+			bounds_original_mrp_publish_consistent_scn(published);
+			UT_ASSERT_EQ(lazy_observe_shared_freeze_bounds(&v, &f.admission,
+				CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+			UT_ASSERT(v.shared_freeze_cohort_observed); UT_ASSERT_EQ(bounds.horizon_scn, published);
+			UT_ASSERT_EQ(v.shared_freeze_cohort.source_local_history.contributor_kind,
+				CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_REPLICATION);
+			f.input = v.shared_freeze_input;
+			applied = batch ? cluster_heap_freeze_apply_xmin_batch_v1(&relation_data, 1,
+				&f.input, &f.page, &f.proofs, &f.fence, &f.authority, &f.admission,
+				targets, 3, bounds.freeze_limit, bounds.horizon_scn)
+				: cluster_heap_freeze_apply_xmin_v1(&relation_data, 1, &f.input,
+				&f.page, &f.proofs, &f.fence, &f.authority, &f.admission, 0,
+				FullTransactionIdFromEpochAndXid(1, 77), bounds.freeze_limit, bounds.horizon_scn);
+			UT_ASSERT_EQ(applied, published == 10);
+			UT_ASSERT_EQ(inserts, published == 10 ? 1 : 0);
+			UT_ASSERT_EQ(flushes, published == 10 ? 1 : 0);
+			UT_ASSERT_EQ(conditional_resumes, published == 10 ? 1 : 0);
+			UT_ASSERT_EQ(conditional_unlocks, published == 10 ? 1 : 0);
+			if (published == 10) UT_ASSERT_EQ(inserted_wal_clock, 10);
+			else UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+		}
+	}
+}
+
+UT_TEST(test_collector_original_mrp_source_lost_after_history_unlock_refuses)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		LVRelState v; ClusterHeapFreezeObservedBoundsV1 bounds = {0};
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		bounds_observer_setup(&v, &f); fixture_wal_clock = 5; bounds_mrp_adg = true;
+		bounds_original_mrp_publish_consistent_scn(8); bounds_mrp_drop_on_history_unlock = true;
+		UT_ASSERT_EQ(lazy_observe_shared_freeze_bounds(&v, &f.admission,
+			CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT(bounds_mrp_state == NULL && !bounds_mrp_drop_on_history_unlock);
+		UT_ASSERT_EQ(bounds_history_locks, 1); UT_ASSERT_EQ(bounds_history_unlocks, 1);
+		UT_ASSERT(bounds_acquire_status != CLUSTER_HEAP_FREEZE_COHORT_READY);
+		UT_ASSERT(!v.shared_freeze_cohort_observed); f.input = v.shared_freeze_input;
+		UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes, 0);
+		UT_ASSERT(!local_x && f.admission.entered); UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(236);
+	UT_PLAN(241);
+	UT_RUN(test_collector_original_mrp_config_and_shared_source_feed_history);
+	UT_RUN(test_collector_original_mrp_publisher_preserves_monotone_watermark);
+	UT_RUN(test_collector_original_mrp_unknown_source_blocks_single_and_batch_wal);
+	UT_RUN(test_collector_original_mrp_publication_reaches_native_creation_and_wal);
+	UT_RUN(test_collector_original_mrp_source_lost_after_history_unlock_refuses);
 	UT_RUN(test_collector_original_history_same_cut_clock_and_compact_snapshot);
 	UT_RUN(test_collector_original_history_refusals_block_single_and_batch_wal);
 	UT_RUN(test_collector_original_history_mrp_fold_keeps_same_cut_attribution);

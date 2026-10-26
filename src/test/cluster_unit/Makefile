@@ -2100,6 +2100,20 @@ test_cluster_heap_freeze_local_history.inc: $(top_srcdir)/src/backend/cluster/cl
 	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_heap_freeze_scn_total.inc: $(top_srcdir)/src/backend/cluster/cluster_scn.c Makefile
+	@awk '/^scn_total_cmp\(/ { print "static int"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_freeze_mrp_source.inc: $(top_srcdir)/src/backend/cluster/cluster_mrp.c Makefile
+	@awk '/^cluster_mrp_(config_allows_start|should_start)\(/ { print "static bool"; emit=1; found++ } \
+	     /^cluster_mrp_publish_consistent_scn\(/ { print "static void"; emit=1; found++ } \
+	     /^cluster_mrp_standby_consistent_scn\(/ { print "static SCN"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 4 || done != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_freeze_retention_min.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_retention.c Makefile
 	@awk '/^cluster_undo_retention_sample_min\(/ { print "static SCN"; emit=1; found++ } \
 	     emit { print } emit && /^}/ { emit=0; done++ } \
@@ -2275,6 +2289,9 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_freeze_cohort_observe.inc \
 		test_cluster_heap_freeze_local_history.inc test_cluster_retention_sample.inc \
 		test_cluster_heap_freeze_retention_min.inc \
+		test_cluster_heap_freeze_mrp_source.inc \
+		test_cluster_heap_freeze_scn_total.inc \
+		$(top_srcdir)/src/include/cluster/cluster_mrp.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_retention.h \
 		test_cluster_heap_freeze_worker_current.inc \
 		test_cluster_heap_freeze_worker_getter.inc \
@@ -5198,6 +5215,8 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_freeze_cohort_observe.inc test_cluster_heap_freeze_cohort_observe.inc.tmp
 	rm -f test_cluster_heap_freeze_local_history.inc test_cluster_heap_freeze_local_history.inc.tmp
 	rm -f test_cluster_heap_freeze_retention_min.inc test_cluster_heap_freeze_retention_min.inc.tmp
+	rm -f test_cluster_heap_freeze_mrp_source.inc test_cluster_heap_freeze_mrp_source.inc.tmp
+	rm -f test_cluster_heap_freeze_scn_total.inc test_cluster_heap_freeze_scn_total.inc.tmp
 	rm -f test_cluster_heap_freeze_worker_current.inc test_cluster_heap_freeze_worker_current.inc.tmp
 	rm -f test_cluster_heap_freeze_worker_getter.inc test_cluster_heap_freeze_worker_getter.inc.tmp
 	rm -f test_cluster_heap_freeze_worker_publisher.inc test_cluster_heap_freeze_worker_publisher.inc.tmp
