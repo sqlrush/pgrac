@@ -2285,7 +2285,7 @@ history_owned_bytes(const ClusterRecoveryRelmapHistory *history)
 		: cluster_clog_relmap_base_custody_bytes_v1());
 }
 
-/* The synchronous base accessor must not clear borrowed records/payloads or
+/* Copied history/base accessors must not clear borrowed records/payloads or
  * original custody when rejecting an aliased caller output. */
 static bool
 history_storage_overlap(const ClusterRecoveryRelmapHistory *history, const void *p, size_t n)
@@ -2336,6 +2336,29 @@ history_fail(ClusterRecoveryRelmapHistory *history)
 		inventory_revoke_dependents(history->inventory);
 	}
 	cluster_wal_inputs_relmap_source_fail_v1(&history->original);
+}
+
+/* Copy the complete source baseline, including empty and non-PAGE streams.
+ * Validate all original selected generations; a source ordinal is not the
+ * selector index and a native-map prefix is not the full observed cut. */
+static bool
+history_source_observation(ClusterRecoveryRelmapHistory *history, uint32 ordinal,
+	ClusterRecoveryWalSourceObservationV1 *out)
+{
+	ClusterRecoveryNativeInventory *inventory = history->inventory;
+	const NativeInventorySource *saved;
+
+	if (!inventory->complete || inventory->status != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED
+		|| inventory->sources == NULL || ordinal >= inventory->source_count
+		|| !inventory_history_inputs(inventory, history->original.scope, false))
+		return false;
+	saved = &inventory->sources[ordinal];
+	out->source = saved->source;
+	out->cut = saved->cut;
+	out->observed = saved->observed;
+	memcpy(out->transcript_sha256, saved->transcript, sizeof(out->transcript_sha256));
+	out->source_index = ordinal;
+	return true;
 }
 
 ClusterRecoveryNativeInventoryResult
@@ -2412,7 +2435,7 @@ cluster_recovery_relmap_history_source_v1(ClusterRecoveryRelmapHistory *history,
 	const NativeInventorySource *saved;
 	volatile bool ok = false;
 
-	if (out == NULL || history_overlap(out, sizeof(*out), history, sizeof(*history)))
+	if (out == NULL || history_storage_overlap(history, out, sizeof(*out)))
 		return false;
 	memset(out, 0, sizeof(*out));
 	if (history == NULL || history->failed || history->inventory == NULL
@@ -2431,7 +2454,8 @@ cluster_recovery_relmap_history_source_v1(ClusterRecoveryRelmapHistory *history,
 			ok = cluster_wal_inputs_relmap_source_current_v1(&entry.source)
 				&& memcmp(&entry.source.selected, &saved->history.input,
 					sizeof(saved->history.input)) == 0
-				&& inventory_source_equal(&saved->source, &entry.source.selected.source);
+				&& inventory_source_equal(&saved->source, &entry.source.selected.source)
+				&& history_source_observation(history, ordinal, &entry.observation);
 		}
 		if (ok) {
 			entry.checkpoint_end = saved->history.checkpoint_end;
@@ -2440,7 +2464,8 @@ cluster_recovery_relmap_history_source_v1(ClusterRecoveryRelmapHistory *history,
 			entry.checkpoint_observed = saved->history.checkpoint_observed;
 			entry.window_observed = saved->history.window_observed;
 			ok = cluster_wal_inputs_relmap_source_current_v1(&history->original)
-				&& cluster_wal_inputs_relmap_source_current_v1(&entry.source);
+				&& cluster_wal_inputs_relmap_source_current_v1(&entry.source)
+				&& inventory_history_inputs(history->inventory, history->original.scope, false);
 		}
 	}
 	PG_CATCH();
@@ -2497,7 +2522,8 @@ history_pending_base_read(ClusterRecoveryRelmapHistory *history,
 		|| history->native_base == NULL
 		|| !cluster_wal_inputs_relmap_source_current_v1(&out->history.source)
 		|| !inventory_pages_current(inventory)
-		|| !inventory_history_inputs(inventory, history->original.scope, false))
+		|| !history_source_observation(history, inventory->relmap_wal_source,
+			&out->history.observation))
 		return false;
 	out->history.checkpoint_end = selected->checkpoint_end;
 	out->history.window = selected->window;
