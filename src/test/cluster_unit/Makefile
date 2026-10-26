@@ -9628,11 +9628,13 @@ test_cluster_r4_itl_capacity: test_cluster_r4_itl_capacity.c test_cluster_r4_loc
 		unit_test.h cluster_r4_activation_test_stubs.h \
 		$(CLUSTER_SEMANTIC_ACTIVATION_C) $(CLUSTER_SEMANTIC_ACTIVATION_H) \
 		$(CLUSTER_R4_MULTI_RESOLVE_TEST_O) $(CLUSTER_R4_HOT_HEAPAM_TEST_O) \
+		test_cluster_ctrc_itl_roles_product.o \
 		$(CLUSTER_HOT_BUFPAGE_TEST_O) $(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_CR_APPLY_O) \
 		$(CLUSTER_VIS_VERDICT_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_R4_MULTI_RESOLVE_TEST_O) $(CLUSTER_R4_HOT_HEAPAM_TEST_O) \
+		test_cluster_ctrc_itl_roles_product.o \
 		$(CLUSTER_HOT_BUFPAGE_TEST_O) $(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_CR_APPLY_O) \
 		$(CLUSTER_VIS_VERDICT_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \

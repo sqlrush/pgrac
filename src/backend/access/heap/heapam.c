@@ -1245,6 +1245,13 @@ cluster_heap_itl_capture_terminal_census(Buffer buffer,
 	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
 	{
 		ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+		uint8 flags = census->slots[i].flags;
+
+		/* Completed slots retain their existing history protection. They
+		 * cannot be stamped again or report progress on an unchanged page. */
+		if (flags != ITL_FLAG_ACTIVE && flags != ITL_FLAG_NEEDS_CLEANOUT
+			&& flags != ITL_FLAG_LOCK_ONLY_ACTIVE)
+			continue;
 
 		if (cluster_tx_locator_from_itl_terminal_census(
 				page, i, &census->locators[i], &reason))
@@ -1707,7 +1714,7 @@ cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer
 	bool fresh_capacity = false;
 	volatile bool terminal = false;
 	volatile bool active = false;
-	volatile bool unprovable = false;
+	volatile uint8 slot_unprovable_mask = 0;
 	volatile bool census_current = false;
 	uint8 i;
 	int remaining_ms;
@@ -1793,7 +1800,7 @@ cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer
 				|| census.outcomes[i] != resolution->outcome
 				|| !cluster_tx_outcome_proof_is_valid(resolution->outcome,
 													  resolution->proof_kind)) {
-				unprovable = true;
+				slot_unprovable_mask |= CLUSTER_HEAP_ITL_SLOT_BIT(i);
 				continue;
 			}
 			if ((census.terminal_mask & CLUSTER_HEAP_ITL_SLOT_BIT(i)) != 0)
@@ -1807,7 +1814,7 @@ cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer
 					blocker = resolution->locator_echo;
 				active = true; /* lowest slot index wins, never a raw-xid key */
 			} else
-				unprovable = true;
+				slot_unprovable_mask |= CLUSTER_HEAP_ITL_SLOT_BIT(i);
 		}
 		census_current = cluster_semantic_activation_recheck_r4_terminal_census(&census.admission);
 	}
@@ -1828,7 +1835,7 @@ cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer
 		return CLUSTER_TXW_RETRY;
 	}
 	if (!active) {
-		if (unprovable) {
+		if (slot_unprovable_mask != 0) {
 			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_UNPROVABLE);
 			cluster_heap_itl_capacity_diagnostic(&census, capture_result, "RESOLVE");
 			return CLUSTER_TXW_UNPROVABLE;

@@ -2,9 +2,9 @@
  * test_cluster_r4_itl_capacity.c
  *
  * Author: SqlRush <sqlrush@gmail.com>
- * Real heap capacity consumer + real transaction resolver + real admission.
- * Only the origin response, buffer owner and actual transaction wait are
- * fixture boundaries. The terminal-only publication filter is not mocked.
+ * Real heap capacity consumer, allocator predicate, resolver and admission.
+ * Origin replies, startup materialization facts, buffer ownership and TX
+ * wakeups are fixture boundaries. Publication and history protection are real.
  *-------------------------------------------------------------------------
  */
 #define main itl_unused_lock_order_main
@@ -15,7 +15,25 @@
 #define cluster_tx_resolve_terminal_census_retained_admitted itl_fixture_retained
 #define cluster_tx_resolve_terminal_census_batch_preflight itl_fixture_preflight
 #define cluster_tx_resolve_reason_name itl_fixture_reason_name
+#define cluster_itl_has_allocatable_slot itl_fixture_has_allocatable_slot
+#define cluster_itl_alloc_or_reuse_slot itl_fixture_alloc_or_reuse_slot
+#define cluster_itl_alloc_or_reuse_lock_slot itl_fixture_alloc_or_reuse_lock_slot
+#define cluster_itl_find_data_slot_index_by_xid itl_fixture_find_data_slot_index_by_xid
+#define cluster_itl_get_tt_ref itl_fixture_get_tt_ref
+#define cluster_itl_find_lock_slot_index_by_xmax itl_fixture_find_lock_slot_index_by_xmax
+#define cluster_itl_find_multixact_origin_by_xmax itl_fixture_find_multixact_origin_by_xmax
+#define cluster_itl_find_lock_tt_ref_by_xmax itl_fixture_find_lock_tt_ref_by_xmax
+#define cluster_bufmgr_block_write_permitted itl_fixture_block_write_permitted
 #include "test_cluster_r4_lock_order.c"
+#undef cluster_bufmgr_block_write_permitted
+#undef cluster_itl_find_lock_tt_ref_by_xmax
+#undef cluster_itl_find_multixact_origin_by_xmax
+#undef cluster_itl_find_lock_slot_index_by_xmax
+#undef cluster_itl_get_tt_ref
+#undef cluster_itl_find_data_slot_index_by_xid
+#undef cluster_itl_alloc_or_reuse_lock_slot
+#undef cluster_itl_alloc_or_reuse_slot
+#undef cluster_itl_has_allocatable_slot
 #undef cluster_tx_resolve_reason_name
 #undef cluster_tx_resolve_terminal_census_batch_preflight
 #undef cluster_tx_resolve_terminal_census_retained_admitted
@@ -27,10 +45,33 @@
 
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_r4_observe.h"
+#include "cluster/cluster_recovery_merge.h"
 
 static unsigned origin_calls;
 static unsigned active_publications;
 static int origin_fault;
+
+/* Materialization is a startup fact, constant throughout this process. */
+bool
+cluster_merged_any_remote_materialized(void)
+{
+	return true;
+}
+
+bool
+cluster_merged_instance_is_materialized(NodeId origin)
+{
+	return origin == 1;
+}
+
+bool cluster_bufmgr_block_write_permitted(Buffer buffer);
+bool
+cluster_bufmgr_block_write_permitted(Buffer buffer)
+{
+	UT_ASSERT_EQ(buffer, (Buffer)1);
+	UT_ASSERT(ut_itl_pair_active ? ut_itl_pair_content_lock_held[0] : ut_hot_content_lock_held);
+	return ut_update_write_permitted;
+}
 
 /* Nonshared hint publication in this fixture retains its native semantics. */
 ClusterSpaceHintResult
@@ -269,6 +310,114 @@ UT_TEST(test_partial_terminal_apply_leaves_unknown_and_active_slots_unchanged)
 	ut_itl_census_end();
 }
 
+/* A completed foreign DATA slot still anchors materialized history. Repeating
+ * the original capture/apply/wait sequence must not rediscover it as a fresh
+ * terminal or make it allocatable. The other exact ACTIVE owner remains a
+ * legal blocker despite slot 6 being UNKNOWN. */
+UT_TEST(test_applied_protected_terminal_rechecks_wait_without_repeated_retry)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult hot;
+	ClusterItlSlotData before[CLUSTER_ITL_INITRANS_DEFAULT];
+	ClusterItlSlotData *slots;
+	uint64 deadline = 0;
+	uint64 saved_deadline = 0;
+	const char *reason = NULL;
+
+	ut_itl_census_begin(&fixture, &hot, false);
+	origin_fault = 8;
+	origin_calls = active_publications = 0;
+	pg_atomic_write_u64(&ut_itl_census_semantic.active_bits,
+						CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1);
+	slots = ClusterPageGetItlSlots((Page)fixture.live_page);
+	slots[3].undo_segment_head = uba_encode(257, 4, 3, 0);
+	memcpy(before, slots, sizeof(before));
+	UT_ASSERT_EQ(cluster_heap_test_itl_wait_capacity(1, 1, 1, 9900, &deadline, &reason),
+				 CLUSTER_TXW_RETRY);
+	UT_ASSERT_EQ(deadline, 0);
+	UT_ASSERT_EQ(ut_itl_wait_calls, 0);
+	UT_ASSERT_EQ(memcmp(before, slots, sizeof(before)), 0);
+	LockBuffer(1, BUFFER_LOCK_EXCLUSIVE);
+	UT_ASSERT_EQ(cluster_heap_test_itl_capacity_outcome(1, 9900, false),
+				 CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED);
+	UT_ASSERT_EQ(slots[3].flags, ITL_FLAG_COMMITTED);
+	UT_ASSERT_EQ(slots[3].commit_scn, 9001);
+	UT_ASSERT_EQ(slots[3].wrap, before[3].wrap);
+	UT_ASSERT_EQ(memcmp(&slots[3].undo_segment_head, &before[3].undo_segment_head, sizeof(UBA)), 0);
+	for (int i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+		if (i != 3)
+			UT_ASSERT_EQ(memcmp(&slots[i], &before[i], sizeof(before[i])), 0);
+	UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 1);
+	memcpy(before, slots, sizeof(before));
+	for (int round = 0; round < 3; round++) {
+		/* Run the caller's allocation/terminal census again, then its
+		 * capacity selector on the exact unchanged protected page. */
+		UT_ASSERT_EQ(cluster_heap_test_itl_capacity_outcome(1, 9900, false),
+					 CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED);
+		UT_ASSERT_EQ(cluster_heap_test_itl_wait_capacity(1, 1, 1, 9900, &deadline, &reason),
+					 CLUSTER_TXW_RESOLVED);
+		UT_ASSERT_STR_EQ(reason, "ITL_FRESH_REQUALIFY");
+		UT_ASSERT_EQ(ut_itl_wait_locator.itl_slot_index, 0);
+		UT_ASSERT_EQ(ut_itl_wait_locator.xid, 1200);
+		UT_ASSERT_EQ(ut_itl_wait_locator.tt_wrap, 42);
+		UT_ASSERT_EQ(memcmp(before, slots, sizeof(before)), 0);
+		UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 1);
+		UT_ASSERT(!ut_hot_content_lock_held);
+		UT_ASSERT(!ut_itl_recycle_guard_active);
+		if (round == 0) {
+			UT_ASSERT(deadline > 0);
+			saved_deadline = deadline;
+		} else
+			UT_ASSERT_EQ(deadline, saved_deadline);
+		LockBuffer(1, BUFFER_LOCK_EXCLUSIVE);
+	}
+	UT_ASSERT_EQ(ut_itl_wait_calls, 3);
+	ut_itl_census_end();
+}
+
+UT_TEST(test_all_applied_protected_terminals_refuse_without_retry_or_wait)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult hot;
+	PGAlignedBlock before;
+	ClusterItlSlotData *slots;
+	uint64 deadline = 0;
+	const char *reason = NULL;
+
+	ut_itl_census_begin(&fixture, &hot, false);
+	origin_fault = 6;
+	origin_calls = active_publications = 0;
+	pg_atomic_write_u64(&ut_itl_census_semantic.active_bits,
+						CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1);
+	slots = ClusterPageGetItlSlots((Page)fixture.live_page);
+	for (int i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+		slots[i].undo_segment_head = uba_encode(257, i + 1, i, 0);
+	UT_ASSERT_EQ(cluster_heap_test_itl_capacity_outcome(1, 9900, false),
+				 CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED);
+	for (int i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		UT_ASSERT_EQ(slots[i].flags, ITL_FLAG_ABORTED);
+		UT_ASSERT_EQ(slots[i].commit_scn, InvalidScn);
+	}
+	UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 1);
+	memcpy(before.data, fixture.live_page, BLCKSZ);
+	for (int round = 0; round < 3; round++) {
+		UT_ASSERT_EQ(cluster_heap_test_itl_capacity_outcome(1, 9900, false),
+					 CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED);
+		UT_ASSERT_EQ(cluster_heap_test_itl_wait_capacity(1, 1, 1, 9900, &deadline, &reason),
+					 CLUSTER_TXW_UNPROVABLE);
+		UT_ASSERT_STR_EQ(reason, "ITL_PROTECTED_HISTORY_CAPACITY");
+		UT_ASSERT_EQ(deadline, 0);
+		UT_ASSERT_EQ(ut_itl_wait_calls, 0);
+		UT_ASSERT_EQ(memcmp(before.data, fixture.live_page, BLCKSZ), 0);
+		UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 1);
+		UT_ASSERT(!ut_hot_content_lock_held);
+		UT_ASSERT(!ut_itl_recycle_guard_active);
+		LockBuffer(1, BUFFER_LOCK_EXCLUSIVE);
+	}
+	UT_ASSERT_EQ(origin_calls, 8);
+	ut_itl_census_end();
+}
+
 /* The origin producer's TT-reuse proof is tested in r4_tx_outcome. Here its
  * exact terminal response traverses the real resolver and real heap census;
  * all eight old lock-only slots must be terminalized, not left active. */
@@ -383,7 +532,9 @@ UT_TEST(test_confirmed_deadlock_wins_over_simultaneous_capacity_deadline)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(10);
+	UT_RUN(test_applied_protected_terminal_rechecks_wait_without_repeated_retry);
+	UT_RUN(test_all_applied_protected_terminals_refuse_without_retry_or_wait);
 	UT_RUN(test_partial_terminal_apply_leaves_unknown_and_active_slots_unchanged);
 	UT_RUN(test_unknown_slot_does_not_veto_independent_proven_capacity_progress);
 	UT_RUN(test_confirmed_deadlock_wins_over_simultaneous_capacity_deadline);
