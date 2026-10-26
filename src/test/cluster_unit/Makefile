@@ -483,6 +483,7 @@ TESTS += test_cluster_undo_recovery
 TESTS += test_cluster_remote_xact_directory
 TESTS += test_cluster_multixact_recovery
 TESTS += test_cluster_clog_recovery
+TESTS += test_cluster_clog_retention
 TESTS += test_cluster_subtrans_recovery
 TESTS += test_cluster_space_reservation
 TESTS += test_cluster_recovery_namespace
@@ -4670,6 +4671,24 @@ test_cluster_clog_recovery: test_cluster_clog_recovery.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
+# Original native truncate and floor publication with the real retention core.
+test_cluster_clog_retention_floor.inc: $(top_srcdir)/src/backend/access/transam/varsup.c Makefile
+	awk '/^AdvanceOldestClogXid\(/ { print "void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_clog_retention: test_cluster_clog_retention.c test_cluster_clog_recovery.c \
+		test_cluster_clog_retention_floor.inc unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/clog.c \
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/include/access/clog.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
 # PGRAC: original-origin ASSIGNMENT with disposable native SLRU files.
 test_cluster_subtrans_recovery: test_cluster_subtrans_recovery.c unit_test.h \
 		$(top_srcdir)/src/backend/access/transam/subtrans.c \
@@ -5232,6 +5251,7 @@ check_r11_source_removal_census:
 # ----------
 clean distclean maintainer-clean:
 	rm -f test_cluster_xid_retention_owner.inc test_cluster_xid_retention_owner.inc.tmp
+	rm -f test_cluster_clog_retention_floor.inc test_cluster_clog_retention_floor.inc.tmp
 	rm -f test_cluster_xid_retention_xact_types.inc test_cluster_xid_retention_xact_types.inc.tmp
 	rm -f test_cluster_xid_retention_xact_functions.inc test_cluster_xid_retention_xact_functions.inc.tmp
 	rm -f test_cluster_data_sync_policy.inc test_cluster_sync_providers.inc \

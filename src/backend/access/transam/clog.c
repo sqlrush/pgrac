@@ -53,6 +53,7 @@
 #include <unistd.h>
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_native_startup.h"
+#include "cluster/cluster_relmap_retention_runtime.h"
 #include "cluster/cluster_side_projection.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "storage/fd.h"
@@ -1845,6 +1846,67 @@ TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid)
 	/* Now we can remove the old CLOG segment(s) */
 	SimpleLruTruncate(XactCtl, cutoffPage);
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: dormant original native owner; ordinary TruncateCLOG is unchanged.
+ * Author: SqlRush <sqlrush@gmail.com>
+ * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md */
+bool
+cluster_relmap_retention_truncate_clog_v2(FullTransactionId oldestXact, Oid oldestxid_datoid,
+	uint64 system_identifier, uint64 database_incarnation, uint16 origin)
+{
+	ClusterRelmapRetentionRuntimeTruncateV2 reservation;
+	TransactionId cutoff;
+	int cutoffPage;
+	volatile bool complete = false;
+
+	/* XactCtl is the original LOCAL native CLOG owner, not a foreign route.
+	 * Reject caller-held native locks so ERROR releases only our acquisitions. */
+	if (!cluster_enabled || !cluster_shared_config || !enableFsync
+		|| !IsNormalProcessingMode() || RecoveryInProgress() || CritSectionCount != 0
+		|| cluster_node_id < 0 || origin >= CLUSTER_MAX_NODES || origin != cluster_node_id
+		|| XactCtl->shared == NULL || strcmp(XactCtl->Dir, "pg_xact") != 0
+		|| !LWLockHeldByMeInMode(WrapLimitsVacuumLock, LW_EXCLUSIVE)
+		|| LWLockHeldByMe(XidGenLock) || LWLockHeldByMe(XactSLRULock)
+		|| LWLockHeldByMe(XactTruncationLock))
+		return false;
+	if (cluster_relmap_retention_runtime_truncate_begin_v2(system_identifier,
+		database_incarnation, origin, U64FromFullTransactionId(oldestXact), &reservation)
+		!= CLUSTER_RELMAP_RETENTION_OK)
+		return false;
+	cutoff = XidFromFullTransactionId(FullTransactionIdFromU64(reservation.reservation.cutoff));
+	cutoffPage = TransactionIdToPage(cutoff);
+
+	PG_TRY();
+	{
+		TruncateCLOG(cutoff, oldestxid_datoid);
+		/* Native SLRU can return after wrap protection or ignore unlink
+		 * failure. Normal return alone does not establish a completed cut. */
+		if (!SlruScanDirectory(XactCtl, SlruScanDirCbReportPresence, &cutoffPage))
+			complete = cluster_relmap_retention_runtime_truncate_complete_v2(&reservation)
+				== CLUSTER_RELMAP_RETENTION_OK;
+		if (!complete)
+			(void)cluster_relmap_retention_runtime_truncate_uncertain_v2(&reservation);
+	}
+	PG_CATCH();
+	{
+		/* Native ERROR resets the holdoff count before reaching this catch.
+		 * Leave every unrelated caller lock and all original pins intact. */
+		if (LWLockHeldByMe(XactSLRULock)) {
+			HOLD_INTERRUPTS();
+			LWLockRelease(XactSLRULock);
+		}
+		if (LWLockHeldByMe(XactTruncationLock)) {
+			HOLD_INTERRUPTS();
+			LWLockRelease(XactTruncationLock);
+		}
+		(void)cluster_relmap_retention_runtime_truncate_uncertain_v2(&reservation);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return complete;
+}
+#endif
 
 
 /*

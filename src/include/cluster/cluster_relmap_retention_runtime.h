@@ -165,6 +165,23 @@ extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_truncate_co
 extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_truncate_uncertain_v2(
 	const ClusterRelmapRetentionRuntimeTruncateV2 *reservation);
 
+/* Dormant entry into original LOCAL native TruncateCLOG. The original owner
+ * must authenticate sysid/DB/origin and the FullXid cut, qualify COMPLETE and
+ * all native/source/base/era/history/lifetime inputs, and retain its original
+ * truncation exclusion, checked as WrapLimitsVacuumLock(X). Numbers are only
+ * routing, never a certificate.
+ * Require normal non-recovery context and no caller-held XidGen/SLRU/native
+ * truncation/retention lock. Reserve the stricter cut against late begin,
+ * then run unchanged native floor/WAL/SLRU work outside retention. Confirm
+ * no eligible files remain before completing; a clean no-op may advance the
+ * conservative runtime floor without changing native oldestClogXid.
+ * Entered false/ERROR may follow durable WAL, advanced native floor or partial
+ * deletion; do not retry or infer rollback. Uncertain work preserves pins and
+ * reservation as UNKNOWN. ERROR releases only this call's native locks and
+ * rethrows. No pin retirement, live caller, COMPLETE publisher or v2 activation. */
+extern bool cluster_relmap_retention_truncate_clog_v2(FullTransactionId oldestXact,
+	Oid oldestxid_datoid, uint64 system_identifier, uint64 database_incarnation, uint16 origin);
+
 /* Dormant original allocator only, with its original XidGenLock EXCLUSIVE.
  * The caller authenticates the original 0-based origin, sys/DB incarnation and
  * qualified COMPLETE floor/issued inputs, and preserves every original wrap,
