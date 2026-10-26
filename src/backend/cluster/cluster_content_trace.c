@@ -800,7 +800,7 @@ cluster_content_trace_gcs_capacity(const ClusterContentTraceGcsCapacity *cut)
 			" watermark=" UINT64_FORMAT " kind=%d durable=%d quiescent=%d pending_s=%d"
 			" retry_at=" INT64_FORMAT " buffer=%d owner_pid=%d incarnation=" UINT64_FORMAT " session=" UINT64_FORMAT
 			" armed=%d delivery_closed=%d admitted=%d quiet=%d ack_ready=%d ack_handed=%d ack_consumed=%d"
-			" confirm_pending=%d progress_waiter=%d\n",
+			" confirm_pending=%d\n",
 			cluster_node_id, MyProcPid, i, s->in_use, s->request_id, s->request_epoch,
 			s->master_node, s->expected_master_node, s->tag.spcOid, s->tag.dbOid, s->tag.relNumber,
 			s->tag.forkNum, s->tag.blockNum, s->transition_id, s->reply_domain,
@@ -810,7 +810,7 @@ cluster_content_trace_gcs_capacity(const ClusterContentTraceGcsCapacity *cut)
 			r->pending_s, s->retry_at, s->buf_id, s->owner_pid,
 			s->backend_incarnation, s->master_session, s->armed, s->delivery_closed,
 			s->request_admitted, s->quiet, s->ack_ready, s->ack_handed, s->ack_consumed,
-			s->confirm_pending, s->progress_waiter);
+			s->confirm_pending);
 	}
 	/* Existing S2 native PGPROC-generation/revision validation. Missing/racing
 	 * scanners are UNKNOWN. This is not an atomic cross-process wait graph. */

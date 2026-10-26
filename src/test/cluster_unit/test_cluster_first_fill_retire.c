@@ -476,7 +476,6 @@ UT_TEST(test_capacity_observer_copies_original_full_source_keys_without_holding_
 		UT_ASSERT_EQ(s->request_id, s->source.request_id);
 		UT_ASSERT_EQ(s->request_epoch, s->source.request_epoch);
 		UT_ASSERT_EQ(s->expected_master_node, s->source.master_node);
-		UT_ASSERT_EQ(s->progress_waiter, -1);
 		UT_ASSERT(BufferTagsEqual(&s->tag, &s->source.tag));
 	}
 	/* Original native ACK freed the last slot. The exported cut is owned. */

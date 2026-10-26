@@ -34,7 +34,6 @@ typedef struct ClusterContentTraceGcsSlot {
 	uint64 backend_incarnation, master_session;
 	bool armed, delivery_closed, request_admitted, quiet;
 	bool ack_ready, ack_handed, ack_consumed, confirm_pending;
-	int8 progress_waiter; /* -1 when the current receipt has no legacy waiter field. */
 } ClusterContentTraceGcsSlot;
 
 typedef struct ClusterContentTraceGcsCapacity {

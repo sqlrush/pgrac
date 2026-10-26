@@ -1115,7 +1115,6 @@ gcs_block_reserve_slot(BufferTag tag, uint8 transition_id, int32 master_node,
 				d->delivery_closed = f->delivery_closed; d->request_admitted = f->request_admitted;
 				d->quiet = f->quiet; d->ack_ready = f->ack_ready; d->ack_handed = f->ack_handed;
 				d->ack_consumed = f->ack_consumed; d->confirm_pending = f->confirm_pending;
-				d->progress_waiter = -1; /* No legacy waiter state in the current receipt. */
 			}
 		}
 		LWLockRelease(&blk->lock.lock);
