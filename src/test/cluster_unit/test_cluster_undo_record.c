@@ -6045,7 +6045,15 @@ UT_TEST(test_exact_zero_abort_keeps_cleanup_after_native_scope_ends)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(179);
+	UT_PLAN(186);
+	UT_RUN(test_pending_candidate_exact_bytes_keep_reserved_source);
+	UT_RUN(test_pending_candidate_requires_full_expected_operation);
+	UT_RUN(test_pending_candidate_cannot_rearm_a_phase_or_change_sequence);
+	UT_RUN(test_pending_candidate_rejects_self_empty_and_bad_addresses);
+	UT_RUN(test_pending_candidate_preserves_original_codec_domain);
+	UT_RUN(test_pending_candidate_bounds_nulls_and_failure_no_copy);
+	UT_RUN(test_pending_candidate_private_alias_and_counter_limits);
+
 	UT_RUN(test_control_bounds_refuse_reserved_self_stop);
 	UT_RUN(test_control_bounds_freeze_empty_stop_without_io);
 	UT_RUN(test_control_bounds_keep_parent_and_new_ancestor_stops);

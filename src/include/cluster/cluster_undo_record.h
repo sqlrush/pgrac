@@ -857,6 +857,60 @@ cluster_undo_record_encode_rollback_payload(const UndoRecordHeader *record,
 	memcpy(payload, candidate, sizeof(candidate));
 	return true;
 }
+
+#define CLUSTER_UNDO_ROLLBACK_PENDING_CANDIDATE_PRESENT 1
+
+/* Build only a private, unpublished record from an exact RESERVED source.
+ * Check the complete input length before reading an unaligned header.
+ * Failure leaves the destination untouched; overlapping private buffers
+ * are safe. The expected identity and bounds are caller inputs,
+ * not authority proofs. Current/CRC, canonical TT/frame and retained-chain
+ * checks, slot/checksum installation, WAL and head publication remain with
+ * their original owners. This never permits rollback effects or completion.
+ * Spec: 2026-10-26-pre2-p013-full-savepoint-design.md */
+static inline bool
+cluster_undo_record_build_pending_rollback(const void *reserved_record, size_t record_bytes,
+										   const UndoOperationTrailer *expected_operation,
+										   uint64 expected_sequence, UBA control_uba, UBA start_uba,
+										   UBA stop_uba, void *record_out, size_t record_capacity)
+{
+	UndoRecordHeader header;
+	UndoSavepointRollbackPayload body;
+	UndoOperationTrailer operation;
+	char candidate[sizeof(header) + UNDO_SAVEPOINT_ROLLBACK_PAYLOAD_LENGTH];
+
+	if (reserved_record == NULL || record_bytes != sizeof(candidate) || expected_operation == NULL
+		|| record_out == NULL || record_capacity < sizeof(candidate) || expected_sequence == 0)
+		return false;
+	memcpy(&header, reserved_record, sizeof(header));
+	if (!cluster_undo_record_decode_rollback_payload(
+			&header, (const char *)reserved_record + sizeof(header), record_bytes - sizeof(header),
+			&body, &operation)
+		|| body.phase != UNDO_SAVEPOINT_ROLLBACK_RESERVED
+		|| body.rollback_sequence != expected_sequence
+		|| memcmp(&operation, expected_operation, sizeof(operation)) != 0
+		|| !cluster_undo_rollback_address_valid(&header, control_uba, false)
+		|| !cluster_undo_rollback_address_valid(&header, start_uba, false)
+		|| !cluster_undo_rollback_address_valid(&header, stop_uba, true)
+		|| cluster_undo_record_uba_equal(control_uba, start_uba)
+		|| cluster_undo_record_uba_equal(control_uba, stop_uba)
+		|| cluster_undo_record_uba_equal(start_uba, stop_uba))
+		return false;
+
+	header.prev_uba = start_uba;
+	header.flags &= ~UNDO_REC_FLAG_FIRST_IN_TX;
+	body.phase = UNDO_SAVEPOINT_ROLLBACK_PENDING;
+	body.start_uba = start_uba;
+	body.stop_uba = stop_uba;
+	body.next_uba = start_uba;
+	if (!cluster_undo_record_encode_rollback_payload(&header, &body, &operation,
+													 candidate + sizeof(header),
+													 UNDO_SAVEPOINT_ROLLBACK_PAYLOAD_LENGTH))
+		return false;
+	memcpy(candidate, &header, sizeof(header));
+	memcpy(record_out, candidate, sizeof(candidate));
+	return true;
+}
 #endif
 
 

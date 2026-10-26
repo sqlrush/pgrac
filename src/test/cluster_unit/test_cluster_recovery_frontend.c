@@ -93,7 +93,15 @@ UT_TEST(test_frontend_original_undo_history_guards_keep_time_order)
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(30);
+	UT_RUN(test_pending_candidate_exact_bytes_keep_reserved_source);
+	UT_RUN(test_pending_candidate_requires_full_expected_operation);
+	UT_RUN(test_pending_candidate_cannot_rearm_a_phase_or_change_sequence);
+	UT_RUN(test_pending_candidate_rejects_self_empty_and_bad_addresses);
+	UT_RUN(test_pending_candidate_preserves_original_codec_domain);
+	UT_RUN(test_pending_candidate_bounds_nulls_and_failure_no_copy);
+	UT_RUN(test_pending_candidate_private_alias_and_counter_limits);
+
 	UT_RUN(test_rollback_codec_reserved_unaligned_zero_progress);
 	UT_RUN(test_rollback_codec_active_phases_and_cross_segment_stops);
 	UT_RUN(test_rollback_codec_marking_initial_and_last_cursor_cut);
