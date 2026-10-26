@@ -116,7 +116,8 @@ def _cycles(edges):
 RESOURCE_WAITS = {'BufferContent', 'PcmBlockConvertWait', 'ClusterRelExtendWait',
                   'ClusterPcmCompatibleStateWait', 'ClusterGesS4Wait',
                   'ClusterGesReplyWait', 'GesTxEnqueueWait', 'GesGrantWait',
-                  'GesConvertWait', 'GesBastWait', 'GesCancelDrain', 'ClusterCfEnqueueWait'}
+                  'GesConvertWait', 'GesBastWait', 'GesCancelDrain', 'ClusterCfEnqueueWait',
+                  'ClusterGCSBlockShipWait'}
 
 
 def pcm_logical_bridge(wait, service, resources):
@@ -444,6 +445,11 @@ def build_graph(snapshots, resources):
                 unknown.append(dict(process=identity(row), reason='omitted_grants',
                                     count=row['omitted_grants']))
         for proc in snapshot.get('procs', []):
+            # Native GCS receipt/cursor datagrams are non-atomic observations,
+            # not edges in this PCM/claim graph. Never infer a remote holder.
+            if proc.get('wait_name') == 'ClusterGCSBlockShipWait':
+                unknown.append(dict(node=node, pid=proc['pid'], procno=proc['procno'],
+                                    reason='gcs_wait_graph_unresolved'))
             if proc.get('wait_name') in RESOURCE_WAITS and (node, proc['procno']) not in owners:
                 unknown.append(dict(node=node, pid=proc['pid'], procno=proc['procno'],
                                     wait_event_info=proc['wait_event_info'], wait_name=proc.get('wait_name'),
@@ -749,21 +755,26 @@ class DeadlineReceiver:
             received = time.monotonic_ns()
             self.stream.write(payload); self.stream.flush()
             text = payload.decode('utf-8', errors='replace')
-            match = re.fullmatch(r'node=(\d+) observer=(\d+) sequence=(\d+) (.*)\n', text)
+            match = re.fullmatch(r'node=(\d+) observer=(\d+) sequence=(\d+) (?:capture=(\d+) )?(.*)\n', text)
             if match and int(match[1]) == self.node and sender[0] == '127.0.0.1':
-                self.rows.append(dict(observer=int(match[2]),sequence=int(match[3]),text=match[4]))
-                if match[4].startswith('PGRAC_WAIT_DEADLINE_PROC '):
+                capture = int(match[4] or 0)
+                body = match[5]
+                family = 'GCS' if capture else 'DEADLINE'
+                self.rows.append(dict(observer=int(match[2]), sequence=int(match[3]),
+                                      capture=capture, family=family, text=body,
+                                      received_monotonic_ns=received))
+                if not capture and body.startswith('PGRAC_WAIT_DEADLINE_PROC '):
                     proc = re.fullmatch(
                         r'PGRAC_WAIT_DEADLINE_PROC node=(\d+) slot=(\d+) pid=(-?\d+) backend=(-?\d+) '
                         r'generation=(\d+) wait=(\d+) after_pid=(-?\d+) after_backend=(-?\d+) '
-                        r'after_generation=(\d+) after_wait=(\d+) stable=([01])', match[4])
+                        r'after_generation=(\d+) after_wait=(\d+) stable=([01])', body)
                     fields = ('node','slot','pid','backend','generation','wait','after_pid',
                               'after_backend','after_generation','after_wait','stable')
                     if proc and int(proc[1]) == self.node:
                         value = deadline_os_process(dict(zip(fields, map(int, proc.groups()))))
                     else:
                         value = dict(status='malformed_native_record', native_incarnation_bound=False,
-                                     termination_receipt='UNKNOWN', raw=match[4])
+                                     termination_receipt='UNKNOWN', raw=body)
                     value.update(observer=int(match[2]), sequence=int(match[3]),
                                  received_monotonic_ns=received)
                     self.os_processes.append(value)
@@ -790,17 +801,18 @@ class DeadlineReceiver:
             os_error = repr(exc)
         groups = {}
         for row in self.rows:
-            groups.setdefault(row['observer'], []).append(row)
+            groups.setdefault((row['observer'], row['family'], row['capture']), []).append(row)
         result = dict(node=self.node,errors=self.errors,observers=[],complete=False,
                       completeness_scope='datagram_stream_only')
-        for observer, rows in groups.items():
+        for (observer, family, capture), rows in groups.items():
             ordered = sorted(rows,key=lambda r:r['sequence'])
             sequences = [r['sequence'] for r in ordered]
             complete = (sequences == list(range(1,len(rows)+1)) and
-                        'PGRAC_WAIT_DEADLINE_BEGIN ' in ordered[0]['text'] and
-                        'PGRAC_WAIT_DEADLINE_END ' in ordered[-1]['text'] and
+                        ordered[0]['text'].startswith(f'PGRAC_WAIT_{family}_BEGIN ') and
+                        ordered[-1]['text'].startswith(f'PGRAC_WAIT_{family}_END ') and
                         ordered[-1]['text'].endswith(' dropped=0'))
-            result['observers'].append(dict(observer=observer,records=len(rows),complete=complete))
+            result['observers'].append(dict(observer=observer, family=family, capture=capture,
+                                            records=len(rows), complete=complete))
         result['complete'] = bool(groups) and not self.errors and all(o['complete'] for o in result['observers'])
         if os_error is not None:
             result['os_observation_error'] = os_error

@@ -8,6 +8,7 @@
 #include "storage/shmem.h"
 #include "utils/wait_event.h"
 #include <assert.h>
+#include <poll.h>
 #include <stdarg.h>
 #undef printf
 #undef fprintf
@@ -16,7 +17,7 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
-bool cluster_enabled = true, cluster_trace_tx_identity;
+bool cluster_enabled = true, cluster_trace_tx_identity, cluster_trace_gcs_capacity;
 int cluster_node_id = 0, MaxBackends = 8, MyProcPid, NBuffers = 48;
 TimestampTz MyStartTimestamp;
 ProcessingMode Mode = NormalProcessing;
@@ -60,6 +61,17 @@ void errfinish(const char *file, int line, const char *func)
 static unsigned deadline_procs, deadline_targets, deadline_ends;
 int PostPortNumber;
 
+/* Loopback UDP delivery need not finish before sendto returns. Bound the
+ * receiver fixture's wait for the next packet; the product never waits. */
+static int
+receive_trace_packet(int receiver, char *packet, size_t size)
+{
+	struct pollfd fd = {.fd = receiver, .events = POLLIN};
+	if (poll(&fd, 1, 1000) != 1)
+		return -1;
+	return recv(receiver, packet, size, MSG_DONTWAIT);
+}
+
 #include "../../backend/cluster/cluster_content_trace.c"
 #include "test_cluster_content_trace_lw_wait.inc"
 
@@ -85,6 +97,7 @@ static void reset(void)
 	native_wait_event = 0;
 	pair_request_log[0] = '\0';
 	cluster_trace_tx_identity = true;
+	cluster_trace_gcs_capacity = false;
 	for (unsigned i = 0; i < lengthof(descriptors); i++) {
 		buf(i)->buf_id = i; buf(i)->tag.spcOid = 1; buf(i)->tag.dbOid = 2;
 		buf(i)->tag.relNumber = 3; buf(i)->tag.forkNum = MAIN_FORKNUM; buf(i)->tag.blockNum = i;
@@ -955,6 +968,108 @@ UT_TEST(lifetime_exhaustion_and_missed_disable_cannot_resurrect_resources)
 	UT_ASSERT_EQ(local_owner.locks[0].lifetime, 0);
 }
 
+UT_TEST(gcs_scan_keeps_native_auxiliary_incarnation_and_owned_cursor)
+{
+#ifdef CLUSTER_CONTENT_TRACE_GCS_SLOTS
+	reset(); MyProc->backendId = InvalidBackendId; MyStartTimestamp = 0;
+	cluster_content_trace_gcs_scan(3, 4, 900, 964, 976, 1234);
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.nowners, 0);
+	cluster_trace_gcs_capacity = true;
+	cluster_content_trace_gcs_scan(3, 4, 900, 964, 976, 1234);
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.nowners, 1); UT_ASSERT(cut.owners[0].gcs_scan.active);
+	UT_ASSERT_EQ(cut.owners[0].backend_id, InvalidBackendId);
+	UT_ASSERT_EQ(cut.owners[0].proc_generation, 10000);
+	UT_ASSERT_EQ(cut.owners[0].gcs_scan.worker, 3);
+	UT_ASSERT_EQ(cut.owners[0].gcs_scan.workers, 4);
+	UT_ASSERT_EQ(cut.owners[0].gcs_scan.begin, 900);
+	UT_ASSERT_EQ(cut.owners[0].gcs_scan.end, 964);
+	UT_ASSERT_EQ(cut.owners[0].gcs_scan.cap, 976);
+	UT_ASSERT_EQ(cut.owners[0].gcs_scan.sampled_at, 1234);
+	pg_atomic_write_u32(&content_trace->slots[0].busy, 1);
+	cluster_content_trace_gcs_scan(3, 4, 964, 1028, 976, 1235);
+	pg_atomic_write_u32(&content_trace->slots[0].busy, 0);
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.changed, 1); UT_ASSERT_EQ(cut.nowners, 0);
+	cluster_content_trace_gcs_scan(3, 4, 1028, 1092, 976, 1236);
+	MyProc->cluster_grd_generation++;
+	cluster_content_trace_capture(NULL, &cut);
+	UT_ASSERT_EQ(cut.dead, 1); UT_ASSERT_EQ(cut.nowners, 0);
+#else
+	UT_ASSERT(false); /* Native scanner observation is absent on the parent. */
+#endif
+}
+
+UT_TEST(gcs_capacity_udp_is_default_off_bounded_and_distinct_from_deadline)
+{
+#ifdef CLUSTER_CONTENT_TRACE_GCS_SLOTS
+	ClusterContentTraceGcsCapacity capacity = {0};
+	struct sockaddr_in address = {.sin_family=AF_INET, .sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
+	socklen_t len = sizeof(address);
+	char packet[2048];
+	int receiver = socket(AF_INET, SOCK_DGRAM, 0), n;
+	unsigned begins = 0, slots = 0, scans = 0, ends = 0;
+	UT_ASSERT(receiver >= 0);
+	UT_ASSERT_EQ(bind(receiver, (struct sockaddr *)&address, sizeof(address)), 0);
+	UT_ASSERT_EQ(getsockname(receiver, (struct sockaddr *)&address, &len), 0);
+	PostPortNumber = ntohs(address.sin_port);
+	reset(); capacity.nslots = CLUSTER_CONTENT_TRACE_GCS_SLOTS;
+	capacity.max_backends = 122; capacity.tag = buf(2)->tag;
+	capacity.sampled_at = 1234;
+	for (unsigned i = 0; i < capacity.nslots; i++) {
+		capacity.slots[i].in_use = capacity.slots[i].armed = true;
+		capacity.slots[i].request_id = 1000 + i;
+		capacity.slots[i].source.request_id = 2000 + i;
+		capacity.slots[i].source.request_epoch = 3;
+		capacity.slots[i].source.master_node = 2;
+		capacity.slots[i].source.tag = buf(i)->tag;
+		capacity.slots[i].source.reservation_token = 17 + i;
+	}
+	cluster_content_trace_gcs_capacity(&capacity);
+	UT_ASSERT_EQ(recv(receiver, packet, sizeof(packet), MSG_DONTWAIT), -1);
+	cluster_trace_gcs_capacity = true;
+	actor(1); MyProc->backendId = InvalidBackendId; MyStartTimestamp = 0;
+	cluster_content_trace_gcs_scan(3, 4, 900, 964, 976, 1233);
+	actor(0);
+	for (unsigned capture = 1; capture <= 9; capture++) {
+		unsigned sequence = 0;
+		cluster_content_trace_gcs_capacity(&capacity);
+		while ((n = capture <= 8 ? receive_trace_packet(receiver, packet, sizeof(packet)-1) :
+				recv(receiver, packet, sizeof(packet)-1, MSG_DONTWAIT)) > 0) {
+			unsigned row_sequence, row_capture;
+			packet[n] = '\0';
+			UT_ASSERT_EQ(sscanf(packet, "node=0 observer=100 sequence=%u capture=%u ",
+				&row_sequence, &row_capture), 2);
+			UT_ASSERT_EQ(row_sequence, ++sequence); UT_ASSERT_EQ(row_capture, capture);
+			UT_ASSERT(strstr(packet, "DEADLINE") == NULL);
+			if (strstr(packet, "PGRAC_WAIT_GCS_BEGIN ")) {
+				begins++; UT_ASSERT(strstr(packet, "generation=10000") != NULL);
+				UT_ASSERT(strstr(packet, "sampled_at=1234") != NULL);
+			}
+			if (strstr(packet, "PGRAC_WAIT_GCS_SLOT ")) {
+				slots++;
+				UT_ASSERT(strstr(packet, "source_epoch=3 source_master=2") != NULL);
+			}
+			if (strstr(packet, "PGRAC_WAIT_GCS_SCAN ")) {
+				scans++; UT_ASSERT(strstr(packet, "generation=10001") != NULL);
+				UT_ASSERT(strstr(packet, "worker=3 workers=4 begin=900 end=964 cap=976") != NULL);
+			}
+			if (strstr(packet, "PGRAC_WAIT_GCS_END ")) {
+				ends++; UT_ASSERT(strstr(packet, "dropped=0") != NULL);
+				break;
+			}
+		}
+		UT_ASSERT_EQ(sequence, capture <= 8 ? 11 : 0);
+	}
+	UT_ASSERT_EQ(begins, 8); UT_ASSERT_EQ(slots, 64);
+	UT_ASSERT_EQ(scans, 8); UT_ASSERT_EQ(ends, 8);
+	close(receiver);
+#else
+	UT_ASSERT(false); /* First-login non-SQL export is absent on the parent. */
+#endif
+}
+
 UT_TEST(deadline_census_is_default_off_bounded_and_once)
 {
 	ClusterWaitTrace wait = {0};
@@ -973,13 +1088,14 @@ UT_TEST(deadline_census_is_default_off_bounded_and_once)
 	UT_ASSERT_EQ(deadline_procs, 0);
 	cluster_trace_tx_identity = true;
 	cluster_content_trace_deadline_dump(3);
-	while ((n = recv(receiver, packet, sizeof(packet)-1, MSG_DONTWAIT)) > 0) {
+	while ((n = receive_trace_packet(receiver, packet, sizeof(packet)-1)) > 0) {
 		packet[n] = '\0';
 		if (strstr(packet, "DEADLINE_PROC ")) deadline_procs++;
 		if (strstr(packet, "DEADLINE_TARGET ")) deadline_targets++;
 		if (strstr(packet, "DEADLINE_END ")) {
 			deadline_ends++;
 			UT_ASSERT(strstr(packet, "dropped=0") != NULL);
+			break;
 		}
 	}
 	UT_ASSERT_EQ(deadline_procs, 2); UT_ASSERT_EQ(deadline_targets, 1);
@@ -993,7 +1109,9 @@ UT_TEST(deadline_census_is_default_off_bounded_and_once)
 int main(void)
 {
 	cluster_content_trace_shmem_register(); assert(registered && registered->lwlock_count == 0);
-	UT_PLAN(48);
+	UT_PLAN(50);
+	UT_RUN(gcs_scan_keeps_native_auxiliary_incarnation_and_owned_cursor);
+	UT_RUN(gcs_capacity_udp_is_default_off_bounded_and_distinct_from_deadline);
 	UT_RUN(lifetime_exhaustion_and_missed_disable_cannot_resurrect_resources);
 	UT_RUN(deadline_census_is_default_off_bounded_and_once);
 	UT_RUN(resource_lifetimes_survive_unrelated_samples_but_not_release);
