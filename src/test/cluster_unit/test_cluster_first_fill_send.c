@@ -189,6 +189,23 @@ send_frame(uint32 type, int target, const void *bytes, uint32 length)
 		send_admitted++;
 	return send_result;
 }
+static ClusterICSendResult send_seal_result;
+static unsigned send_seal_calls;
+static GcsBlockDonePayload send_sealed;
+static ClusterICSendResult
+send_seal_frame(uint8 type, int target, const void *bytes, uint32 length)
+{
+	ClusterPcmReadGrant service;
+	UT_ASSERT_EQ(type, PGRAC_IC_MSG_GCS_BLOCK_DONE);
+	UT_ASSERT_EQ(target, 2);
+	UT_ASSERT_EQ(length, sizeof(GcsBlockDonePayload));
+	send_sealed = *(const GcsBlockDonePayload *)bytes;
+	UT_ASSERT_EQ(send_sealed.reserved_0[0], GCS_BLOCK_DONE_PENDING_S_SEALED);
+	UT_ASSERT(GcsBlockDonePayloadPendingSService(&send_sealed, &service));
+	UT_ASSERT_EQ(service.holder_node, cluster_node_id);
+	send_seal_calls++;
+	return send_seal_result;
+}
 static ClusterICSendResult
 send_sge(uint32 type, int target, const ClusterICSge *sge, int n, uint32 length)
 {
@@ -226,6 +243,8 @@ static struct {
 #define GCS_FIRST_FILL_PARK_MAX 64
 #define ClusterGcsBlock (&send_stats)
 #define MaxBackends 32
+#define cluster_lms_workers 2
+#define gcs_block_send_envelope_or_loopback send_seal_frame
 #define palloc0(n) calloc(1, (n))
 #define pfree(p) free(p)
 #define cluster_ic_tier1_my_data_channel() 0
@@ -295,6 +314,10 @@ send_setup(BufferDesc *buf, ClusterPcmOwnEntry *entry)
 	transition_buf = buf;
 	transition_mapping_held = transition_content_held = false;
 	memset(gcs_first_fill_holder_parks, 0, sizeof(gcs_first_fill_holder_parks));
+	memset(gcs_first_fill_holder_seals, 0, sizeof(gcs_first_fill_holder_seals));
+	gcs_first_fill_holder_seal_count = 0;
+	send_seal_calls = 0;
+	send_seal_result = CLUSTER_IC_SEND_NOT_ADMITTED;
 	memset(transition_page.data, 0x5a, GCS_BLOCK_DATA_SIZE);
 	memset(send_first, 0, sizeof(send_first));
 	send_length = send_calls = send_admitted = send_nacks = send_returns = send_deferred = send_copies = send_releases = 0;
@@ -1168,6 +1191,7 @@ UT_TEST(resumption_identity_race_keeps_local_owner_without_deferring_a_fake_carr
 	ClusterPcmOwnArray = saved;
 }
 
+#ifndef FIRST_FILL_SEND_FIXTURE_ONLY
 int
 main(void)
 {
@@ -1204,3 +1228,4 @@ main(void)
 	UT_DONE();
 	return ut_failed_count != 0;
 }
+#endif

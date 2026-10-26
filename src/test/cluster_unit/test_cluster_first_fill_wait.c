@@ -91,6 +91,8 @@ static void gcs_block_forward_reply_immediate_deny(const GcsBlockForwardPayload 
 	UT_ASSERT_EQ(fwd->master_node, 2);
 }
 #define GCS_FIRST_FILL_PARK_MAX 64
+#define cluster_lms_workers 2
+#define gcs_block_send_envelope_or_loopback(...) (pg_re_throw(), CLUSTER_IC_SEND_HARD_ERROR)
 #define ClusterGcsBlock ((void *)1)
 /* These IO-only cases must never enter the real reply-send stage. */
 #define cluster_gcs_lookup_master(tag) 2
@@ -111,6 +113,8 @@ static void gcs_block_forward_reply_immediate_deny(const GcsBlockForwardPayload 
 #define MyLatch ((Latch *)1)
 #define ereport(level, ...) pg_re_throw()
 #include "test_cluster_first_fill_holder.inc"
+#undef gcs_block_send_envelope_or_loopback
+#undef cluster_lms_workers
 #undef ereport
 #undef MyLatch
 #undef ResetLatch

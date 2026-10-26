@@ -1752,6 +1752,8 @@ StaticAssertDecl(offsetof(GcsBlockForwardPayload, expected_pi_watermark_scn_byte
 #define GCS_BLOCK_DONE_PENDING_S_RETIRED ((uint8)0xa4)
 #define GCS_BLOCK_DONE_PENDING_S_RETURN ((uint8)0xa5)
 #define GCS_BLOCK_DONE_PENDING_S_RETURNED ((uint8)0xa6)
+#define GCS_BLOCK_DONE_PENDING_S_SEAL ((uint8)0xa7)
+#define GCS_BLOCK_DONE_PENDING_S_SEALED ((uint8)0xa8)
 #define GCS_BLOCK_INVALIDATE_KIND_PENDING_S ((uint8)2)
 
 static inline bool
@@ -1835,12 +1837,16 @@ GcsBlockDonePayloadPendingSKey(const GcsBlockDonePayload *p, ClusterPcmReadGrant
 			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_HOLDER
 			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_RETIRED
 			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_RETURN
-			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_RETURNED)
+			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_RETURNED
+			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_SEAL
+			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_SEALED)
 		|| p->reserved_0[1] >= 32 || p->request_id == 0 || p->epoch == 0
 		|| p->requester_backend_id <= 0 || p->sender_node < 0 || p->sender_node >= 32)
 		return false;
 	return_action = p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETURN
-		|| p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETURNED;
+		|| p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETURNED
+		|| p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_SEAL
+		|| p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_SEALED;
 	holder_action = return_action || p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_HOLDER
 		|| (p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_NACK
 			&& p->sender_node != p->reserved_0[1]);
@@ -1855,7 +1861,8 @@ GcsBlockDonePayloadPendingSKey(const GcsBlockDonePayload *p, ClusterPcmReadGrant
 			return false;
 		if (return_action && (p->reserved_0[15] == 0 || p->reserved_0[15] > 32
 			|| p->reserved_0[15] - 1 == p->reserved_0[1]
-			|| (p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETURN
+			|| ((p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETURN
+					|| p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_SEALED)
 				&& p->reserved_0[15] - 1 != p->sender_node)))
 			return false;
 	}
@@ -1882,7 +1889,9 @@ GcsBlockDonePayloadSetPendingSService(GcsBlockDonePayload *p, const ClusterPcmRe
 	memcpy(&p->reserved_0[10], &service->service_generation, sizeof(uint32));
 	p->reserved_0[14] = service->holder_was_x ? 1 : 0;
 	if (p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETURN
-		|| p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETURNED)
+		|| p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETURNED
+		|| p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_SEAL
+		|| p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_SEALED)
 		p->reserved_0[15] = (uint8)(service->holder_node + 1);
 }
 
@@ -1892,11 +1901,14 @@ GcsBlockDonePayloadPendingSService(const GcsBlockDonePayload *p, ClusterPcmReadG
 	ClusterPcmReadGrantKey key;
 	if (service == NULL || !GcsBlockDonePayloadPendingSKey(p, &key)
 		|| (p->sender_node == key.requester_node
-			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_RETURNED)
+			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_RETURNED
+			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_SEAL)
 		|| (p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_HOLDER
 			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_NACK
 			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_RETURN
-			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_RETURNED))
+			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_RETURNED
+			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_SEAL
+			&& p->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_SEALED))
 		return false;
 	memset(service, 0, sizeof(*service));
 	service->key = key;
@@ -1904,6 +1916,8 @@ GcsBlockDonePayloadPendingSService(const GcsBlockDonePayload *p, ClusterPcmReadG
 	memcpy(&service->service_generation, &p->reserved_0[10], sizeof(uint32));
 	service->holder_node = p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETURN
 		|| p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETURNED
+		|| p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_SEAL
+		|| p->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_SEALED
 		? (int32)p->reserved_0[15] - 1 : p->sender_node;
 	service->holder_was_x = p->reserved_0[14] != 0;
 	return true;

@@ -9854,6 +9854,16 @@ test_cluster_first_fill_send: test_cluster_first_fill_send.c test_cluster_pcm_ow
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
 		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+TESTS += test_cluster_first_fill_seal
+all: test_cluster_first_fill_seal
+test_cluster_first_fill_seal: test_cluster_first_fill_seal.c test_cluster_first_fill_send.c \
+		test_cluster_pcm_own test_cluster_pcm_own.c test_cluster_first_fill_bufmgr.inc \
+		test_cluster_first_fill_send.inc unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
+		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
 # Native first-fill retirement and the real invalidate/transport handoff owner.
 TESTS += test_cluster_first_fill_retire
 all: test_cluster_first_fill_retire
