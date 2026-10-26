@@ -31,6 +31,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_tt_local.h"
 #endif
 #include "commands/alter.h"
 #include "commands/async.h"
@@ -276,6 +277,33 @@ storage_preflight:
 	if ((cluster_interconnect_tier != CLUSTER_IC_TIER_1 || IsInTransactionBlock(isTopLevel))
 		&& IsA(statement, DropOwnedStmt))
 		CheckOwnedObjectsStorageDrop((DropOwnedStmt *)statement, isTopLevel);
+}
+
+/* PGRAC: reserve the original top-level binding before CREATE reaches event
+ * triggers, catalog relations or DDL locks. Other utility callers keep their
+ * existing paths. Author: SqlRush <sqlrush@gmail.com> */
+static void
+PreflightClusterSharedCatalogCreate(Node *statement)
+{
+	ClusterCanonicalTxnBinding binding;
+	TransactionId current_xid;
+
+	if (!cluster_shared_catalog || !cluster_storage_mode_enabled()
+		|| (!IsA(statement, CreateStmt) && !IsA(statement, CreateTableAsStmt)))
+		return;
+
+	if (IsSubTransaction())
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared catalog creation does not support subtransactions")));
+	current_xid = GetCurrentTransactionIdIfAny();
+	if (TransactionIdIsValid(current_xid)
+		&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("shared catalog top-level transaction identity mismatch")));
+	if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog creation")));
 }
 #endif
 
@@ -828,6 +856,10 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 		if ((readonly_flags & COMMAND_OK_IN_RECOVERY) == 0)
 			PreventCommandDuringRecovery(GetCommandTagName(commandtag));
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedCatalogCreate(parsetree);
+#endif
 
 	pstate = make_parsestate(NULL);
 	pstate->p_sourcetext = queryString;

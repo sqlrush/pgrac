@@ -900,9 +900,20 @@ test_cluster_fresh_utility.inc: $(top_srcdir)/src/backend/tcop/utility.c Makefil
 	     /readonly_flags = ClassifyUtilityCommandAsReadOnly/ { emit=0 } \
 	     emit { print } /^}/ { inside=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+test_cluster_create_utility_entry.inc: $(top_srcdir)/src/backend/tcop/utility.c Makefile
+	awk '/^standard_ProcessUtility\(/ { inside=1 } \
+	     inside && /parsetree = pstmt->utilityStmt;/ { emit=1; count++ } \
+	     /pstate = make_parsestate/ { emit=0 } \
+	     emit { print } /^}/ { inside=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 test_cluster_shared_utility.inc: $(top_srcdir)/src/backend/tcop/utility.c Makefile
 	awk '/^CheckClusterSharedUtilitySupport\(/ { print "static void"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	     /^ClassifyUtilityCommandAsReadOnly\(/ { print "static int"; emit=1; classify++ } \
+	     /^PreflightClusterSharedCatalogCreate\(/ { print "static void"; emit=1; preflight++ } \
+	     /^PreventCommand(IfReadOnly|IfParallelMode|DuringRecovery)\(/ \
+	     { print "void"; emit=1; guards++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (count != 1 || classify != 1 || preflight > 1 || guards != 3 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_fresh_catalog_index.inc: $(top_srcdir)/src/backend/catalog/index.c Makefile
 	awk '/^index_create\(/ { print "Oid"; emit=1; count++ } \
@@ -912,7 +923,8 @@ test_cluster_fresh_catalog_index.inc: $(top_srcdir)/src/backend/catalog/index.c 
 test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
 		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
-		test_cluster_fresh_catalog_index.inc test_cluster_shared_utility.inc
+		test_cluster_fresh_catalog_index.inc test_cluster_shared_utility.inc \
+		test_cluster_create_utility_entry.inc
 	$(CC) $(CFLAGS) -Wno-unused-variable -Wno-unused-but-set-variable $(CPPFLAGS) $< \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
