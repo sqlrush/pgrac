@@ -1081,6 +1081,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 }
 #include "test_cluster_recovery_episode_sources.inc"
 #include "test_cluster_recovery_episode_native_clog.inc"
+#include "test_cluster_recovery_episode_terminal.inc"
 
 
 int
@@ -1161,7 +1162,23 @@ main(int argc, char **argv)
 		UT_RUN(test_episode_base_checks_original_page_bytes_before_and_after_native_read);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(147);
+	if (getenv("PGRAC_PRE2_TEST_EPISODE_TERMINAL") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_episode_terminal_matches_actual_sealed_side_and_same_held_page);
+		UT_RUN(test_episode_terminal_rejects_lifecycle_discontinuity_before_new_native_io);
+		UT_RUN(test_episode_terminal_missing_conflicting_child_prepare_or_alias_is_not_terminal);
+		UT_RUN(test_episode_terminal_raw_status_or_side_failure_retains_observed_native_custody);
+		UT_RUN(test_episode_terminal_error_is_sticky_and_clears_only_transient_pass_state);
+		UT_RUN(test_episode_terminal_preconditions_preserve_original_base_and_query);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	UT_PLAN(153);
+	UT_RUN(test_episode_terminal_matches_actual_sealed_side_and_same_held_page);
+	UT_RUN(test_episode_terminal_rejects_lifecycle_discontinuity_before_new_native_io);
+	UT_RUN(test_episode_terminal_missing_conflicting_child_prepare_or_alias_is_not_terminal);
+	UT_RUN(test_episode_terminal_raw_status_or_side_failure_retains_observed_native_custody);
+	UT_RUN(test_episode_terminal_error_is_sticky_and_clears_only_transient_pass_state);
+	UT_RUN(test_episode_terminal_preconditions_preserve_original_base_and_query);
 	UT_RUN(test_episode_native_clog_keeps_real_fd_and_all_status_observations);
 	UT_RUN(test_episode_native_clog_inode_and_neighbor_change_revoke_same_episode);
 	UT_RUN(test_episode_native_clog_error_retains_fd_and_original_protection);

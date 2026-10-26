@@ -312,6 +312,31 @@ extern ClusterRecoveryRelmapFoldResult cluster_recovery_relmap_history_pending_s
 extern bool cluster_recovery_relmap_history_pending_base_v1(
 	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
 	ClusterRecoveryRelmapPendingBaseV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
+/* Per-call native/SIDE terminal correspondence on the SAME complete query.
+ * This is an observed conjunction, not a native era/lifetime certificate.
+ * Keep the original base reader above for all four raw status observations. */
+typedef struct ClusterRecoveryRelmapPendingTerminalV1 {
+	ClusterRecoveryRelmapPendingBaseV1 base;
+	XLogRecPtr terminal_start, terminal_end;
+	uint32 terminal_source_index;
+	uint64 terminal_ordinal;
+} ClusterRecoveryRelmapPendingTerminalV1;
+/* Require a drained unique map, one same-source top terminal after that map,
+ * no alias/child/assignment/PREPARE ambiguity, and no observed after-map or
+ * unordered same-origin CLOG lifecycle event. Before-map events remain raw
+ * obligations, not a proved page birth. Match EVERY native terminal of the
+ * selected generation to its original sealed SIDE plan during one full
+ * physical reread, then compare the SAME held CLOG page/status again.
+ * No new scope/IR/WALR or custody is supplied by the caller. Output/caller-lock
+ * preconditions preserve the original; entered false/ERROR revokes the whole
+ * episode retaining existing/new local FD custody and original pins/debt.
+ * Destroy local custody before scope teardown. Absence of observed hazards,
+ * status agreement and full input equality do not certify native birth-era,
+ * historical no-reuse/truncation, full dual-copy census or joint COMPLETE,
+ * OPEN, allocation, truncation, terminal mutation or retention release. */
+extern bool cluster_recovery_relmap_history_pending_terminal_v1(
+	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
+	ClusterRecoveryRelmapPendingTerminalV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
 extern void cluster_recovery_relmap_history_destroy_v1(ClusterRecoveryRelmapHistory **history);
 
 /* Borrow the original startup cold scope for two complete physical passes.
