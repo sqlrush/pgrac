@@ -232,6 +232,7 @@ TESTS += test_cluster_cold_xid_native_completion
 TESTS += test_cluster_same_host_fence
 TESTS += test_cluster_same_host_provider
 TESTS += test_cluster_recovery_worker_pre2
+TESTS += test_cluster_page_ctrc_capacity
 
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
 
@@ -458,7 +459,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_heap_epq_wait,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_undo_extent_claim,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_rf_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_detached,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_page_guard,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_page_guard test_cluster_page_ctrc_capacity,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_authority,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_thread_recovery_fabric_plan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_plan_source,$(SIMPLE_TESTS))
@@ -3345,6 +3346,25 @@ test_cluster_control_root test_cluster_recovery_native_inputs: test_cluster_cont
 test_cluster_control_root test_cluster_recovery_native_inputs: test_cluster_control_ctrc_replay_set.inc
 test_cluster_control_root test_cluster_recovery_native_inputs: test_cluster_control_ctrc_stable.inc
 test_cluster_control_root test_cluster_recovery_native_inputs: test_cluster_control_ctrc_replay_stable.inc
+test_cluster_control_root test_cluster_recovery_native_inputs: test_cluster_control_ctrc_page.inc
+
+# Native CTRC PAGE protection uses the original PAGE primitive independently.
+cluster_page_authority_ctrc_test.o: $(top_srcdir)/src/backend/cluster/cluster_page_authority_ctrc.c \
+		$(top_srcdir)/src/include/cluster/cluster_page_authority_ctrc.h \
+		$(top_srcdir)/src/include/cluster/cluster_page_stable_base.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_page_ctrc_capacity: test_cluster_page_ctrc_capacity.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_page_authority_ctrc.c \
+		$(top_srcdir)/src/backend/cluster/cluster_page_guard.c \
+		$(top_srcdir)/src/include/cluster/cluster_page_authority_ctrc.h \
+		$(top_srcdir)/src/include/cluster/cluster_page_guard.h \
+		$(top_srcdir)/src/include/storage/lwlock.h \
+		test_cluster_page_dependency_base.o xlogreader_fs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_page_dependency_base.o xlogreader_fs.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
 
 test_cluster_page_stable_ctrc.o: $(top_srcdir)/src/backend/cluster/cluster_page_stable_base_ctrc.c \
 		$(top_srcdir)/src/backend/cluster/cluster_page_stable_base_private.h \
@@ -3447,6 +3467,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs: %: %.c test_clust
 		test_cluster_control_native_xid.inc \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
 		test_cluster_page_stable_ctrc.o \
+		cluster_page_authority_ctrc_test.o $(CLUSTER_PAGE_GUARD_O) \
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
 		test_cluster_wal_inputs_product.o \
 		$(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
@@ -3473,6 +3494,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs: %: %.c test_clust
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
 		test_cluster_page_stable_ctrc.o \
+		cluster_page_authority_ctrc_test.o $(CLUSTER_PAGE_GUARD_O) \
 		test_cluster_wal_inputs_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
