@@ -3356,7 +3356,8 @@ CTRC_NATIVE_FPI_TEST_OBJS = test_cluster_ctrc_native_fpi_product.o \
 	test_cluster_recovery_fpi_generic.o test_cluster_terminal_ref_census_product.o \
 	test_cluster_space_producer_product.o test_cluster_recovery_ctrc_record_product.o
 
-test_cluster_ctrc_native_fpi: test_cluster_ctrc_native_stamp.inc test_cluster_ctrc_native_insert.inc $(CTRC_NATIVE_FPI_TEST_OBJS) \
+test_cluster_ctrc_native_fpi: test_cluster_ctrc_native_stamp.inc test_cluster_ctrc_native_insert.inc \
+		test_cluster_ctrc_native_install.inc $(CTRC_NATIVE_FPI_TEST_OBJS) \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
 		$(top_srcdir)/src/include/cluster/cluster_page_authority_ctrc.h

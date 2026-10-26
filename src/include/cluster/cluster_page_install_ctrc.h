@@ -12,7 +12,7 @@
  *     src/include/cluster/cluster_page_install_ctrc.h
  *
  * NOTES
- *     No ordinary RR guard/serial/pin conversion or target mutation.
+ *     No ordinary RR guard/serial/pin conversion or borrowed-owner release.
  *
  *-------------------------------------------------------------------------
  */
@@ -98,6 +98,24 @@ extern RfPageCtrcFpiInsertV1 rf_page_recovery_ctrc_replays_fpi_insert_v1(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
 	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source,
 	RfPageCtrcAuthorityV1 *authority, const GenericXLogRecoveryImageV1 *image,
+	Size subject_count, Size memory_budget);
+
+/* Consume the same original post-DONE Start/work/all-native custody and its
+ * immutable INSERTED, flushed FPI. Only its exact promoted PAGE may be held;
+ * no other caller LWLocks. Full raw work is frozen in one private allocation
+ * bounded by memory_budget, and every borrowed input stays alive/immutable.
+ * Validate actual flush/timeline, installed writer and full SPACE identity;
+ * install only the valid before or byte-exact canonical result, then sync and
+ * full postread. The canonical LSN/origin identify the actual recovery writer.
+ * A true value means only process-local target_synced, never discharge,
+ * DURABLE, COMPLETE or OPEN. False/ERROR retains PAGE/IR/WALR and marks only
+ * the exact still-owned window failed; ERROR propagates after private cleanup.
+ * This API writes no caller input, does not extend storage and releases no
+ * original owner, receipt or window. */
+extern bool rf_page_recovery_ctrc_replays_fpi_install_smgr_v1(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
+	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	const RfPageCtrcAuthorityV1 *authority, const RfPageCtrcFpiInsertV1 *inserted,
 	Size subject_count, Size memory_budget);
 
 #endif /* USE_PGRAC_CLUSTER */

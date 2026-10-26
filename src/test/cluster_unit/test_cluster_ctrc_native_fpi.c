@@ -36,7 +36,11 @@ bool ctrc_native_fpi_original_c0(const struct ClusterRecoveryStartV1 *start,
 #define cluster_wal_writer_check native_insert_original_writer_check
 #define XLogFlush native_insert_original_flush
 #define ClusterColdRecoveryCtrcWorkCurrent native_insert_original_work_current
+#define smgrread native_install_original_read
+#define GetFlushRecPtr native_install_original_flush_ptr
 #include "test_cluster_control_root.c"
+#undef GetFlushRecPtr
+#undef smgrread
 #undef ClusterColdRecoveryCtrcWorkCurrent
 #undef XLogFlush
 #undef cluster_wal_writer_check
@@ -86,6 +90,7 @@ static unsigned native_fpi_allocs, native_fpi_frees;
 static void *native_fpi_allocation;
 static bool native_fpi_alloc_error;
 static bool native_fpi_complete_writer;
+static bool native_install_setup;
 static void *native_stamp_allocation;
 static unsigned native_stamp_allocs, native_stamp_frees;
 static bool native_stamp_alloc_error;
@@ -199,6 +204,9 @@ native_fpi_fixture(CtrcReadNativeFixture *f, unsigned itls, bool checksums)
 	root = f->page.replay.owners[0].root;
 	cluster_wal_inputs_release_v1(&f->page.replay.inputs); ctrc_ir_original_scope = NULL;
 	if (native_fpi_complete_writer) {
+		/* Installation needs a representable local WAL writer, separately
+		 * from the selected failed replay origins (including thread 128). */
+		if (native_install_setup) ctrc_inputs_owner.writer.ref = tx_inputs_typed.sources[1];
 		ctrc_inputs_owner.owner_boot = ctrc_inputs_owner.writer.ref.claim.identity.origin_owner_incarnation;
 		ctrc_inputs_owner.writer.startup_first_lsn = 0x100;
 	}
@@ -410,7 +418,19 @@ bool native_insert_original_installed_writer(ClusterWalWriterToken *writer,
 #define ClusterStartupInstalledRecoveryWriterV1 native_insert_original_installed_writer
 #include "test_cluster_ctrc_native_stamp.inc"
 #undef ClusterStartupInstalledRecoveryWriterV1
+void native_install_original_held(void (*callback)(LWLock *, LWLockMode, void *), void *context);
+bool native_install_original_writer_installed(ClusterWalWriterToken *writer,
+	uint8 operation_uuid[16], uint64 *generation);
+#define recovery_fpi_hash_create native_install_original_hash_create
+#define ForEachLWLockHeldByMe native_install_original_held
+#define cluster_wal_writer_check native_install_original_writer_current
+#define ClusterStartupInstalledRecoveryWriterV1 native_install_original_writer_installed
 #include "test_cluster_ctrc_native_insert.inc"
+#undef recovery_fpi_hash_create
+#undef ForEachLWLockHeldByMe
+#undef cluster_wal_writer_check
+#undef ClusterStartupInstalledRecoveryWriterV1
+#include "test_cluster_ctrc_native_install.inc"
 
 int
 main(int argc, char **argv)
@@ -419,7 +439,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(25);
+	UT_PLAN(34);
 	UT_RUN(test_native_fpi_projects_entire_page_from_original_c0_and_commit);
 	UT_RUN(test_native_fpi_empty_and_already_terminal_do_not_mint_wal_frame);
 	UT_RUN(test_native_fpi_bad_count_budget_or_terminal_refuses_before_smgr);
@@ -445,5 +465,14 @@ main(int argc, char **argv)
 	UT_RUN(test_native_insert_registration_and_insert_failure_keep_failed_window);
 	UT_RUN(test_native_insert_flush_failure_and_drift_keep_inserted_debt);
 	UT_RUN(test_native_insert_pending_window_cannot_start_another_record);
+	UT_RUN(test_native_install_writes_syncs_and_postreads_the_actual_writer_page);
+	UT_RUN(test_native_install_already_result_still_syncs_and_postreads);
+	UT_RUN(test_native_install_bad_entry_refuses_before_storage);
+	UT_RUN(test_native_install_refuses_missing_torn_third_and_changed_result);
+	UT_RUN(test_native_install_rechecks_complete_inputs_after_every_read);
+	UT_RUN(test_native_install_write_and_sync_drift_retains_window);
+	UT_RUN(test_native_install_io_errors_free_only_private_memory);
+	UT_RUN(test_native_install_requires_current_original_inserted_window);
+	UT_RUN(test_native_install_extra_lwlock_refuses_before_owner_snapshot);
 	UT_DONE(); return ut_failed_count ? 1 : 0;
 }
