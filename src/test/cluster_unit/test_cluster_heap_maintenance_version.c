@@ -14620,7 +14620,9 @@ UT_TEST(test_recent_xmin_native_refusal_releases_only_new_resident_pin)
 		if (fault == 2) authority_current = false;
 		if (fault == 3) object_current = false;
 		UT_ASSERT(!fixture_recent_xmin_apply(&f, &target, 1));
-		UT_ASSERT_EQ(recent_pin_calls, 1); UT_ASSERT_EQ(recent_unpins, 1);
+		/* Missing saved policy is now refused before a temporary pin. */
+		UT_ASSERT_EQ(recent_pin_calls, fault == 0 ? 0 : 1);
+		UT_ASSERT_EQ(recent_unpins, fault == 0 ? 0 : 1);
 		UT_ASSERT_EQ(backend_pin_count, 0);
 		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
 		UT_ASSERT_EQ(inserts + dirties + flushes, 0);
@@ -14637,7 +14639,8 @@ UT_TEST(test_recent_xmin_refusal_preserves_preowned_pin_and_content_lock)
 		if (!owned_x) fixture_release_original_writer();
 		relation_data.rd_isvalid = true; f.input.freeze_policy = NULL;
 		UT_ASSERT(!fixture_recent_xmin_apply(&f, &target, 1));
-		UT_ASSERT_EQ(recent_pin_calls, 1); UT_ASSERT_EQ(recent_unpins, 1);
+		/* The saved policy is absent; keep only the caller's existing pin. */
+		UT_ASSERT_EQ(recent_pin_calls, 0); UT_ASSERT_EQ(recent_unpins, 0);
 		UT_ASSERT_EQ(backend_pin_count, 1); UT_ASSERT_EQ(local_x, owned_x);
 		UT_ASSERT_EQ(cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0)) != NULL, owned_x);
 		UT_ASSERT(f.admission.entered); UT_ASSERT_EQ(conditional_resumes + conditional_unlocks, 0);
@@ -15811,10 +15814,55 @@ UT_TEST(test_resident_recent_native_original_admission_errors_retire_owned_debt_
 }
 
 
+UT_TEST(test_recent_xmin_saved_bounds_refuse_before_pin)
+{
+	for (unsigned batch = 0; batch < 2; batch++)
+		for (unsigned owned = 0; owned < 2; owned++)
+			for (unsigned fault = 0; fault < 9; fault++)
+			{
+				QualifiedXminFixture f;
+				ClusterHeapFreezeXminTargetV1 targets[3];
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else {
+					qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+					targets[0] = (ClusterHeapFreezeXminTargetV1) {
+						0, FullTransactionIdFromEpochAndXid(1, 77)};
+				}
+				if (!owned) {
+					fixture_release_original_writer();
+					backend_pin_count = 0;
+				}
+				relation_data.rd_isvalid = true;
+				switch (fault) {
+				case 0: f.input.freeze_policy = NULL; break;
+				case 1: f.policy.freeze_limit = FullTransactionIdFromEpochAndXid(1, 99); break;
+				case 2: f.cohort.horizon_scn++; break;
+				case 3: f.cohort.source_local_horizon_scn--; break;
+				case 4: f.cohort.record_generation++; break;
+				case 5: f.cohort.formation_epoch++; break;
+				case 6: f.cohort.admission_fence.admitted_members_lo = 0; break;
+				case 7: f.cohort.source_local_history.sample_clock_scn = InvalidScn; break;
+				case 8: f.cohort.local_registration_cut.min_full = FullTransactionIdFromEpochAndXid(1, 99); break;
+				}
+				UT_ASSERT(!fixture_recent_xmin_apply(&f, targets, batch ? 3 : 1));
+				UT_ASSERT_EQ(recent_pin_calls + recent_unpins, 0);
+				UT_ASSERT_EQ(backend_pin_count, owned ? 1 : 0);
+				UT_ASSERT_EQ(local_x, owned != 0);
+				UT_ASSERT_EQ(cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0)) != NULL, owned != 0);
+				UT_ASSERT(f.admission.entered);
+				UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+				UT_ASSERT_EQ(target_preflight_checks + census_preflight_checks + full_target_checks + admission_checks, 0);
+				UT_ASSERT_EQ(policy_current_checks + cohort_current_checks + wal_clock_reads, 0);
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(337);
+	UT_PLAN(338);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -16160,6 +16208,8 @@ main(void)
 	UT_RUN(test_original_group_member_exit_retains_source_through_recent_wal);
 	UT_RUN(test_original_group_member_exit_late_receiver_revokes_recent_wal);
 	UT_RUN(test_original_group_member_exit_certificate_needs_fresh_recent_cut);
+
+	UT_RUN(test_recent_xmin_saved_bounds_refuse_before_pin);
 
 	UT_DONE();
 	return ut_failed_count != 0;

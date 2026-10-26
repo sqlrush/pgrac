@@ -480,7 +480,8 @@ extern bool cluster_heap_freeze_apply_xmin_batch_v1(
 /* Same dormant qualification contract as the pinned batch above. The caller
  * holds the relation and the original entered admission, but recent_buffer is
  * only a saved shared-buffer hint. This entry adds one exact resident pin (no
- * fetch), delegates all source/physical/writer/WAL checks to the original batch,
+ * fetch) after the original pure same-admission F/H and ingress-cut checks,
+ * delegates the repeated source/physical/writer/WAL checks to the original batch,
  * and releases that pin on success, refusal or ERROR before the caller leaves
  * admission. Previously owned pins/content locks remain the caller's. An absent
  * or changed resident returns false; this grants no positive freeze authority.
