@@ -2210,15 +2210,16 @@ test_cluster_heap_ctrc_participant.inc: $(top_srcdir)/src/backend/cluster/cluste
 	mv $@.tmp $@
 
 # Original receipt apply/cancel bookkeeping and exact-handle/target checks.
-# Original page-owner post-unlock WAL/dependency discharge tail and exact target.
+# Original complete page-owner stamp/WAL and post-unlock discharge closure.
 test_cluster_heap_itl_finish_discharge.inc: $(top_srcdir)/src/backend/cluster/cluster_itl_touch.c Makefile
-	@awk 'BEGIN { pattern = "^(itl_finish_expected_target|itl_finish_discharge_batch)\\(" } \
-	     /^typedef struct ItlFinishDischarge \{/ { structure=1; structures++ } \
-	     structure { print; if (/^} ItlFinishDischarge;/) structure=0; next } \
+	@awk 'BEGIN { pattern = "^(itl_finish_expected_target|itl_finish_discharge_batch|itl_finish_stamp_page|itl_finish_flush_batch)\\(" } \
+	     /^typedef struct (ItlFinishCtx|ItlFinishPageRun|ItlFinishBatchCtx|ItlFinishDischarge) \{/ { structure=1; structures++ } \
+	     structure { print; if (/^} (ItlFinishCtx|ItlFinishPageRun|ItlFinishBatchCtx|ItlFinishDischarge);/) structure=0; next } \
+	     /^#define CLUSTER_ITL_FINISH_MAX_DISCHARGES / { print; getline; print; constants++; next } \
 	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); if (seen[name]++) exit 1; order[++found]=name; ret=prev; sub(/^static[ \t]+/, "", ret); returns[name]="static " ret; emit=1; head=1 } \
 	     emit { body[name]=body[name] $$0 "\n"; if (/^\{/) head=0; else if (head) declaration[name]=declaration[name] $$0 "\n" } \
 	     emit && /^}/ { emit=0; done++ } { prev=$$0 } \
-	     END { if (found != 2 || done != 2 || emit || structure || structures != 1) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
+	     END { if (found != 4 || done != 4 || emit || structure || structures != 4 || constants != 1) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_ctrc_terminal.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
@@ -2321,6 +2322,8 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_itl_finish_discharge.inc \
 		$(top_srcdir)/src/include/cluster/cluster_itl_touch.h \
 		$(top_srcdir)/src/include/cluster/cluster_sf_dep.h \
+		$(top_srcdir)/src/include/access/generic_xlog.h \
+		$(top_srcdir)/src/include/cluster/cluster_itl.h \
 		test_cluster_heap_ctrc_certificate.inc $(top_srcdir)/src/include/port/pg_crc32c.h \
 		test_cluster_heap_ctrc_ack.inc $(top_srcdir)/src/common/sha2_int.h \
 		test_cluster_heap_ctrc_origin_reply.inc \
