@@ -9464,6 +9464,8 @@ static const QualifiedXminFixture *bounds_source;
 static unsigned bounds_policy_reads, bounds_cohort_reads, bounds_census_reads;
 static unsigned bounds_clock_reads, bounds_clock_observes, bounds_target_reads;
 static unsigned bounds_fault;
+static unsigned bounds_saved_current_calls, bounds_current_fault, bounds_current_fault_at;
+static ClusterHeapFreezeCohortStatus bounds_saved_current_status;
 static bool bounds_after_clock, bounds_after_target;
 
 static void
@@ -9725,6 +9727,20 @@ bounds_source_peer(int32 peer, const ClusterSemanticActiveSampleFence *fence,
 #undef undo_horizon_v2_cohort_current
 #undef undo_horizon_local_source_current
 
+/* A separate alias of the original saved-observation entry avoids the
+ * native-entry fixture's independent counters while retaining its real gates. */
+#define undo_horizon_v2_required bounds_saved_required
+#define cluster_heap_freeze_cohort_current bounds_saved_cohort_current
+#define cluster_undo_cleaner_active_sample bounds_source_worker_get
+#define cluster_semantic_activation_active_sample_capture bounds_source_capture
+#define undo_horizon_v2_cohort_current bounds_original_cohort_current
+#include "test_cluster_heap_freeze_cohort_current.inc"
+#undef undo_horizon_v2_cohort_current
+#undef cluster_semantic_activation_active_sample_capture
+#undef cluster_undo_cleaner_active_sample
+#undef cluster_heap_freeze_cohort_current
+#undef undo_horizon_v2_required
+
 static ClusterHeapFreezeCohortStatus
 bounds_cohort_observe(ClusterHeapFreezeCohortObservation *out)
 {
@@ -9751,9 +9767,28 @@ bounds_cohort_current(const ClusterHeapFreezeCohortObservation *cohort)
 	bounds_assert_unlocked();
 	UT_ASSERT(memcmp(cohort, &bounds_source->cohort, sizeof(*cohort)) == 0);
 	bounds_cohort_reads++;
-	return (bounds_after_target && bounds_fault == 2)
-		|| (bounds_after_clock && bounds_fault == 6)
-		? CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED : CLUSTER_HEAP_FREEZE_COHORT_READY;
+	if ((bounds_after_target && bounds_fault == 2)
+		|| (bounds_after_clock && bounds_fault == 6))
+		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
+	/* Controlled serial source changes at each original current boundary;
+	 * the original saved entry and providers decide the refusal themselves. */
+	if (bounds_cohort_reads == bounds_current_fault_at) {
+		switch (bounds_current_fault) {
+		case 1: native_worker_shared.workers[0].pid = 0; break;
+		case 2: native_worker_shared.active_sample.sample_id++; break;
+		case 3: worker_lease_ok = false; break;
+		case 4: admission_cut++; break;
+		case 5: ctrc_note_unqualified_registration(); break;
+		case 6: cohort_end_clock = (TimestampTz)cohort->source_started_at_us
+			+ (uint64)CLUSTER_UNDO_HORIZON_FRESHNESS_FACTOR * cohort->source_interval_ms * 1000 + 1; break;
+		case 7: cohort_end_clock = (TimestampTz)cohort->source_started_at_us - 1; break;
+		case 8: cohort_clock_error = true; break;
+		case 9: worker_lease_error = true; break;
+		}
+	}
+	bounds_saved_current_calls++;
+	bounds_saved_current_status = bounds_saved_cohort_current(cohort);
+	return bounds_saved_current_status;
 }
 
 static bool
@@ -9833,6 +9868,8 @@ bounds_observer_setup(LVRelState *v, QualifiedXminFixture *f)
 	bounds_history_held = bounds_history_register_on_unlock = false;
 	bounds_history_locks = bounds_history_unlocks = bounds_history_clocks = 0;
 	bounds_policy_reads = bounds_cohort_reads = bounds_census_reads = 0;
+	bounds_saved_current_calls = bounds_current_fault = bounds_current_fault_at = 0;
+	bounds_saved_current_status = CLUSTER_HEAP_FREEZE_COHORT_INVALID;
 	bounds_clock_reads = bounds_clock_observes = bounds_target_reads = 0;
 	bounds_fault = 0;
 	bounds_after_clock = bounds_after_target = false;
@@ -10377,10 +10414,157 @@ UT_TEST(test_collector_original_mrp_source_lost_after_history_unlock_refuses)
 	}
 }
 
+UT_TEST(test_collector_saved_current_uses_original_sources_without_history_resample)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		LVRelState v; ClusterHeapFreezeObservedBoundsV1 bounds = {0};
+		unsigned history_reads, native_reads, worker_gets;
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		bounds_observer_setup(&v, &f); fixture_wal_clock = 5;
+		UT_ASSERT_EQ(lazy_observe_shared_freeze_bounds(&v, &f.admission,
+			CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT(v.shared_freeze_cohort_observed);
+		UT_ASSERT_EQ(bounds_saved_current_calls, 3);
+		UT_ASSERT_EQ(bounds_saved_current_status, CLUSTER_HEAP_FREEZE_COHORT_READY);
+		UT_ASSERT_EQ(bounds_acquire_history_reads, 1);
+		history_reads = bounds_acquire_history_reads; native_reads = pass_native_reads;
+		worker_gets = bounds_acquire_gets;
+		UT_ASSERT_EQ(bounds_saved_cohort_current(&v.shared_freeze_cohort), CLUSTER_HEAP_FREEZE_COHORT_READY);
+		UT_ASSERT_EQ(bounds_acquire_gets, worker_gets + 1);
+		UT_ASSERT_EQ(bounds_acquire_history_reads, history_reads); UT_ASSERT_EQ(pass_native_reads, native_reads);
+		f.input = v.shared_freeze_input;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
+UT_TEST(test_collector_saved_current_refuses_worker_lease_and_admission_drift)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (unsigned phase = 1; phase <= 3; phase++) {
+			for (unsigned fault = 1; fault <= 4; fault++) {
+				QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+				LVRelState v; ClusterHeapFreezeObservedBoundsV1 bounds = {0};
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+				bounds_observer_setup(&v, &f); fixture_wal_clock = 5;
+				bounds_current_fault_at = phase; bounds_current_fault = fault;
+				UT_ASSERT_EQ(lazy_observe_shared_freeze_bounds(&v, &f.admission,
+					CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+				UT_ASSERT_EQ(bounds_saved_current_calls, phase);
+				UT_ASSERT(bounds_saved_current_status != CLUSTER_HEAP_FREEZE_COHORT_READY);
+				UT_ASSERT(!v.shared_freeze_cohort_observed);
+				UT_ASSERT(v.shared_freeze_input.freeze_policy == NULL && v.shared_freeze_input.freeze_cohort == NULL);
+				UT_ASSERT_EQ(bounds_acquire_history_reads, 1);
+				f.input = v.shared_freeze_input;
+				UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes, 0);
+				UT_ASSERT(!local_x && !worker_lock_held && f.admission.entered);
+				UT_ASSERT_EQ(backend_pin_count, 1);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_collector_saved_current_refuses_original_registration_changes)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (unsigned phase = 1; phase <= 3; phase++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			LVRelState v; ClusterHeapFreezeObservedBoundsV1 bounds = {0};
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			bounds_observer_setup(&v, &f); fixture_wal_clock = 5;
+			bounds_current_fault_at = phase; bounds_current_fault = 5;
+			UT_ASSERT_EQ(lazy_observe_shared_freeze_bounds(&v, &f.admission,
+				CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+			UT_ASSERT_EQ(bounds_saved_current_calls, phase);
+			UT_ASSERT(bounds_saved_current_status != CLUSTER_HEAP_FREEZE_COHORT_READY);
+			UT_ASSERT(!v.shared_freeze_cohort_observed);
+			UT_ASSERT(v.shared_freeze_input.freeze_policy == NULL && v.shared_freeze_input.freeze_cohort == NULL);
+			UT_ASSERT_EQ(bounds_acquire_history_reads, 1);
+			UT_ASSERT(!cluster_ctrc_active_scan_registration_current(&f.cohort.local_registration_cut));
+			f.input = v.shared_freeze_input;
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes, 0);
+			UT_ASSERT(!local_x && f.admission.entered); UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_collector_saved_current_refuses_original_end_clock_staleness)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (unsigned phase = 1; phase <= 3; phase++) {
+			for (unsigned fault = 6; fault <= 7; fault++) {
+				QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+				LVRelState v; ClusterHeapFreezeObservedBoundsV1 bounds = {0};
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+				bounds_observer_setup(&v, &f); fixture_wal_clock = 5;
+				bounds_current_fault_at = phase; bounds_current_fault = fault;
+				UT_ASSERT_EQ(lazy_observe_shared_freeze_bounds(&v, &f.admission,
+					CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+				UT_ASSERT_EQ(bounds_saved_current_calls, phase);
+				UT_ASSERT_EQ(bounds_saved_current_status, CLUSTER_HEAP_FREEZE_COHORT_H_STALE);
+				UT_ASSERT(!v.shared_freeze_cohort_observed); f.input = v.shared_freeze_input;
+				UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+				UT_ASSERT_EQ(bounds_acquire_history_reads, 1);
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes, 0);
+				UT_ASSERT(!local_x && f.admission.entered); UT_ASSERT_EQ(backend_pin_count, 1);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_collector_saved_current_error_preserves_caller_page_pin_and_admission)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (unsigned phase = 1; phase <= 3; phase++) {
+			for (unsigned fault = 8; fault <= 9; fault++) {
+				QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+				LVRelState v; ClusterHeapFreezeObservedBoundsV1 bounds = {0};
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+				bounds_observer_setup(&v, &f); fixture_wal_clock = 5;
+				bounds_current_fault_at = phase; bounds_current_fault = fault;
+				expecting_error = true;
+				if (setjmp(error_jump) == 0) {
+					(void)lazy_observe_shared_freeze_bounds(&v, &f.admission,
+						CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds);
+					UT_ASSERT(false);
+				}
+				UT_ASSERT_EQ(bounds_saved_current_calls, phase);
+				UT_ASSERT(!v.shared_freeze_cohort_observed);
+				UT_ASSERT(v.shared_freeze_input.freeze_policy == NULL && v.shared_freeze_input.freeze_cohort == NULL);
+				UT_ASSERT_EQ(bounds_acquire_history_reads, 1);
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes, 0);
+				UT_ASSERT(!local_x && !worker_lock_held && f.admission.entered);
+				UT_ASSERT_EQ(backend_pin_count, 1);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+				expecting_error = false;
+			}
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(241);
+	UT_PLAN(246);
+	UT_RUN(test_collector_saved_current_uses_original_sources_without_history_resample);
+	UT_RUN(test_collector_saved_current_refuses_worker_lease_and_admission_drift);
+	UT_RUN(test_collector_saved_current_refuses_original_registration_changes);
+	UT_RUN(test_collector_saved_current_refuses_original_end_clock_staleness);
+	UT_RUN(test_collector_saved_current_error_preserves_caller_page_pin_and_admission);
 	UT_RUN(test_collector_original_mrp_config_and_shared_source_feed_history);
 	UT_RUN(test_collector_original_mrp_publisher_preserves_monotone_watermark);
 	UT_RUN(test_collector_original_mrp_unknown_source_blocks_single_and_batch_wal);
