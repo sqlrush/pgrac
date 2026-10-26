@@ -1839,6 +1839,7 @@ static ClusterCtrcSharedHeader *CtrcShared = NULL;
 #define CTRC_CLEANER_OLD_BATCH (CTRC_CLEANER_DISPATCH_BATCH / 2)
 #define CTRC_CLEANER_CERTIFICATE_BATCH 16
 #define CTRC_CLEANER_ORIGINS (CLUSTER_UNDO_SEGS_PER_INSTANCE * TT_SLOTS_PER_SEGMENT)
+#define CTRC_CLEANER_SCAN_LOCK_BATCH 64
 
 typedef enum CtrcCleanerScanKind {
 	CTRC_SCAN_OPEN,
@@ -2038,6 +2039,30 @@ ctrc_participant_locks_release(uint32 mask)
 	for (unsigned i = CLUSTER_CTRC_CLEANER_WORKERS; i-- > 0;)
 		if ((mask & (UINT32_C(1) << i)) != 0)
 			LWLockRelease(&CtrcShared->participant_locks[i].lock);
+}
+
+/* Bound each local lock span without enlarging the pass's scan budget.
+ * No row pointer or authority snapshot survives these scheduling points. */
+static void
+ctrc_scan_origin_relock(uint64 visited)
+{
+	if (visited != 0 && visited % CTRC_CLEANER_SCAN_LOCK_BATCH == 0) {
+		LWLockRelease(&CtrcShared->origin_lock);
+		CHECK_FOR_INTERRUPTS();
+		LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	}
+}
+
+static void
+ctrc_scan_participant_relock(uint64 visited, uint32 lock_mask)
+{
+	if (visited != 0 && visited % CTRC_CLEANER_SCAN_LOCK_BATCH == 0) {
+		LWLockRelease(&CtrcShared->receipt_lock);
+		ctrc_participant_locks_release(lock_mask);
+		CHECK_FOR_INTERRUPTS();
+		ctrc_participant_locks_acquire(lock_mask);
+		LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
+	}
 }
 
 /* Called under the original participant shard lock, before publication.
@@ -2461,8 +2486,13 @@ ctrc_origin_next_certificate_snapshot_shared(ClusterCtrcOriginCertificateSnapsho
 	limit = ctrc_scan_limit(CTRC_SCAN_CERTIFICATE, CtrcShared->origin_key_entries);
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	for (visited = 0; visited < limit; visited++) {
-		uint64 index = (scan_cursor + visited) % CtrcShared->origin_key_entries;
-		ClusterCtrcOriginEntry *origin = &ctrc_origin_entries()[index];
+		uint64 index;
+		ClusterCtrcOriginEntry *origin;
+
+		ctrc_scan_origin_relock(visited);
+		index = scan_cursor;
+		scan_cursor = (index + 1) % CtrcShared->origin_key_entries;
+		origin = &ctrc_origin_entries()[index];
 
 		if (origin->state != CTRC_ORIGIN_CERTIFYING
 			|| origin->key.origin_node_id != (uint16)cluster_node_id
@@ -2472,7 +2502,6 @@ ctrc_origin_next_certificate_snapshot_shared(ClusterCtrcOriginCertificateSnapsho
 			origin->state = CTRC_ORIGIN_BLOCKED;
 			continue;
 		}
-		scan_cursor = (index + 1) % CtrcShared->origin_key_entries;
 		found = true;
 		break;
 	}
@@ -4414,8 +4443,13 @@ cluster_ctrc_origin_next_open_shared(ClusterCtrcTxnKeyV1 *key_out)
 	limit = ctrc_scan_limit(CTRC_SCAN_OPEN, CtrcShared->origin_key_entries);
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	for (i = 0; i < limit; i++) {
-		uint64 index = (scan_cursor + i) % CtrcShared->origin_key_entries;
-		ClusterCtrcOriginEntry *origin = &ctrc_origin_entries()[index];
+		uint64 index;
+		ClusterCtrcOriginEntry *origin;
+
+		ctrc_scan_origin_relock(i);
+		index = scan_cursor;
+		scan_cursor = (index + 1) % CtrcShared->origin_key_entries;
+		origin = &ctrc_origin_entries()[index];
 
 		if (origin->state != CTRC_ORIGIN_OPEN
 			|| origin->key.origin_node_id != (uint16)cluster_node_id
@@ -4427,7 +4461,6 @@ cluster_ctrc_origin_next_open_shared(ClusterCtrcTxnKeyV1 *key_out)
 			continue;
 		}
 		*key_out = origin->key;
-		scan_cursor = (index + 1) % CtrcShared->origin_key_entries;
 		found = true;
 		break;
 	}
@@ -4540,7 +4573,6 @@ ctrc_dispatch_batch_collect(void)
 	uint64 own_oldest_age_us = 0;
 	uint64 now = ctrc_monotonic_us();
 	uint64 i;
-	uint64 start;
 
 	CtrcBatch.dispatch_count = 0;
 	CtrcBatch.dispatch_next = 0;
@@ -4549,13 +4581,19 @@ ctrc_dispatch_batch_collect(void)
 	Assert(CtrcShared->origin_key_entries == lengthof(CtrcOriginHint));
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	for (i = 0; i < CtrcShared->origin_key_entries; i++) {
-		ClusterCtrcOriginEntry *origin = &ctrc_origin_entries()[i];
+		ClusterCtrcOriginEntry *origin;
 		CtrcCleanerOriginHint *hint = &CtrcOriginHint[i];
-		bool owned = ctrc_cleaner_owns_key(&origin->key);
-		bool eligible = ctrc_origin_dispatchable_locked(origin);
-		bool certificate = origin->state == CTRC_ORIGIN_CERTIFYING;
+		bool owned;
+		bool eligible;
+		bool certificate;
 		bool observed_pending;
 		unsigned pos;
+
+		ctrc_scan_origin_relock(i);
+		origin = &ctrc_origin_entries()[i];
+		owned = ctrc_cleaner_owns_key(&origin->key);
+		eligible = ctrc_origin_dispatchable_locked(origin);
+		certificate = origin->state == CTRC_ORIGIN_CERTIFYING;
 
 		/* Coordinator observations cover the whole table, without executing
 		 * another shard's FSM edge just to count it. */
@@ -4603,19 +4641,24 @@ ctrc_dispatch_batch_collect(void)
 		old_index[pos] = i;
 		old_seal[pos] = origin->seal_generation;
 	}
+	LWLockRelease(&CtrcShared->origin_lock);
+	CHECK_FOR_INTERRUPTS();
 	for (unsigned pos = 0; pos < old_count; pos++)
 		CtrcBatch.dispatch_index[CtrcBatch.dispatch_count++] = old_index[pos];
-	start = CtrcDispatchCursor % CtrcShared->origin_key_entries;
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	for (i = 0; i < CtrcShared->origin_key_entries
 				&& CtrcBatch.dispatch_count < CTRC_CLEANER_DISPATCH_BATCH;
 		 i++) {
-		uint64 index = (start + i) % CtrcShared->origin_key_entries;
+		uint64 index;
+
+		ctrc_scan_origin_relock(i);
+		index = CtrcDispatchCursor % CtrcShared->origin_key_entries;
+		CtrcDispatchCursor = (index + 1) % CtrcShared->origin_key_entries;
 
 		if (ctrc_dispatch_batch_contains(index)
 			|| !ctrc_origin_dispatchable_locked(&ctrc_origin_entries()[index]))
 			continue;
 		CtrcBatch.dispatch_index[CtrcBatch.dispatch_count++] = index;
-		CtrcDispatchCursor = (index + 1) % CtrcShared->origin_key_entries;
 	}
 	LWLockRelease(&CtrcShared->origin_lock);
 
@@ -8355,10 +8398,15 @@ ctrc_cleaner_next_applied_receipt(ClusterCtrcParticipantEntry *participant_out,
 	ctrc_participant_locks_acquire(lock_mask);
 	LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
 	for (visited = 0; visited < limit; visited++) {
-		uint64 receipt_index = (scan_cursor + visited) % CtrcShared->receipt_entries;
-		ClusterCtrcReceipt *receipt = &ctrc_receipt_entries()[receipt_index];
+		uint64 receipt_index;
+		ClusterCtrcReceipt *receipt;
 		ClusterCtrcParticipantEntry *participant;
 		uint64 participant_index;
+
+		ctrc_scan_participant_relock(visited, lock_mask);
+		receipt_index = scan_cursor;
+		scan_cursor = (receipt_index + 1) % CtrcShared->receipt_entries;
+		receipt = &ctrc_receipt_entries()[receipt_index];
 
 		if (pg_atomic_read_u32((pg_atomic_uint32 *)&receipt->state) != CTRC_RECEIPT_APPLIED
 			|| !ctrc_cleaner_owns_key(&receipt->key)
@@ -8377,7 +8425,6 @@ ctrc_cleaner_next_applied_receipt(ClusterCtrcParticipantEntry *participant_out,
 		*receipt_out = *receipt;
 		*participant_index_out = participant_index;
 		*receipt_index_out = receipt_index;
-		scan_cursor = (receipt_index + 1) % CtrcShared->receipt_entries;
 		found = true;
 		break;
 	}
@@ -10395,8 +10442,13 @@ ctrc_participant_find_ack_ready(ClusterCtrcParticipantEntry *snapshot,
 	ctrc_participant_locks_acquire(lock_mask);
 	LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
 	for (visited = 0; visited < limit; visited++) {
-		uint64 index = (scan_cursor + visited) % CtrcShared->participant_key_entries;
-		ClusterCtrcParticipantEntry *participant = &ctrc_participant_entries()[index];
+		uint64 index;
+		ClusterCtrcParticipantEntry *participant;
+
+		ctrc_scan_participant_relock(visited, lock_mask);
+		index = scan_cursor;
+		scan_cursor = (index + 1) % CtrcShared->participant_key_entries;
+		participant = &ctrc_participant_entries()[index];
 
 		if ((ctrc_participant_lock_mask(index) & lock_mask) == 0)
 			continue;
@@ -10417,7 +10469,6 @@ ctrc_participant_find_ack_ready(ClusterCtrcParticipantEntry *snapshot,
 		}
 		*snapshot = *participant;
 		*participant_index_out = index;
-		scan_cursor = (index + 1) % CtrcShared->participant_key_entries;
 		found = true;
 		break;
 	}
