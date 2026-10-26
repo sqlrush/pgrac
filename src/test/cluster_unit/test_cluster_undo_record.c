@@ -3581,7 +3581,11 @@ UT_TEST(test_update_target_retry_refuses_authority_and_publication_drift)
 			targets[1].block_number--;
 			break;
 		}
-		UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
+		/* A changed prepared type is now rejected at staging as well. */
+		if (leg == 0)
+			UT_ASSERT(!cluster_undo_record_receipt_sync(&receipt));
+		else
+			UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
 		before = receipt;
 		UT_ASSERT(!cluster_undo_record_reset_update_targets(&receipt, targets, mask));
 		UT_ASSERT_EQ(memcmp(&receipt, &before, sizeof(receipt)), 0);
@@ -3991,6 +3995,69 @@ UT_TEST(test_history_planned_uba_accounts_for_footer_capacity)
 	UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
 	UT_ASSERT(!cluster_undo_record_prepared_uba_exact(&receipt, sizeof(UndoInsertPayload), &uba));
 	UT_ASSERT(UBA_is_invalid(uba));
+	cluster_undo_record_cancel_prepared(&receipt);
+}
+
+/* Only the local geometry fixture is given a child identity here. This is
+ * not native parent proof or a way through the production child guards. */
+UT_TEST(test_operation_planned_uba_reserves_the_complete_child_tail)
+{
+	const uint16 bodies[] = { sizeof(UndoInsertPayload), sizeof(UndoUpdatePayload) + 32,
+							  sizeof(UndoDeletePayload) + 32, sizeof(UndoItlPayload) };
+
+	for (unsigned type = UNDO_RECORD_INSERT; type <= UNDO_RECORD_ITL; type++) {
+		ClusterUndoRecordPrepareReceipt receipt;
+		UBA uba;
+		uint16 body = bodies[type - UNDO_RECORD_INSERT];
+		uint32 legacy_bytes = sizeof(UndoRecordHeader) + body + sizeof(UndoItlHistoryTrailer);
+
+		receipt_fixture_ready(type, &receipt);
+		receipt.extent.cur_slot_count = 0;
+		receipt.extent.cur_free_offset
+			= BLCKSZ - sizeof(UndoSlotDirEntry) - legacy_bytes - (sizeof(UndoOperationTrailer) - 1);
+		cluster_undo_current_extent = receipt.extent;
+		UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
+		UT_ASSERT(cluster_undo_record_prepared_uba_exact(&receipt, body, &uba));
+		UT_ASSERT(!UBA_is_invalid(uba));
+		receipt.operation.operation_fxid = FullTransactionIdFromEpochAndXid(5, 701);
+		receipt.operation.subid = 2;
+		cluster_undo_record_reservation.receipt.operation = receipt.operation;
+		UT_ASSERT(!cluster_undo_record_prepared_uba_exact(&receipt, body, &uba));
+		UT_ASSERT(UBA_is_invalid(uba));
+		/* Exactly the 48th byte makes the original block geometry fit. */
+		receipt.extent.cur_free_offset--;
+		cluster_undo_current_extent = receipt.extent;
+		UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
+		UT_ASSERT(cluster_undo_record_prepared_uba_exact(&receipt, body, &uba));
+		UT_ASSERT(!UBA_is_invalid(uba));
+		UT_ASSERT_EQ(receipt_prepare_calls + receipt_apply_calls, 0);
+		cluster_undo_record_cancel_prepared(&receipt);
+	}
+}
+
+UT_TEST(test_operation_planned_uba_does_not_wrap_maximum_body_size)
+{
+	ClusterUndoRecordPrepareReceipt receipt;
+	UBA uba;
+	uint16 body
+		= UNDO_RECORD_HARD_CAP_BYTES - sizeof(UndoRecordHeader) - sizeof(UndoItlHistoryTrailer);
+
+	receipt_fixture_ready(UNDO_RECORD_DELETE, &receipt);
+	/* Geometry only: install the large body bound in both local snapshots. */
+	receipt.payload_capacity = PG_UINT16_MAX;
+	receipt.extent.cur_slot_count = 0;
+	receipt.extent.cur_free_offset = sizeof(UndoBlockHeader);
+	cluster_undo_current_extent = receipt.extent;
+	cluster_undo_record_reservation.receipt = receipt;
+	UT_ASSERT(cluster_undo_record_prepared_uba_exact(&receipt, body, &uba));
+	receipt.operation.operation_fxid = FullTransactionIdFromEpochAndXid(5, 701);
+	receipt.operation.subid = 2;
+	cluster_undo_record_reservation.receipt.operation = receipt.operation;
+	UT_ASSERT(!cluster_undo_record_prepared_uba_exact(&receipt, body, &uba));
+	UT_ASSERT(UBA_is_invalid(uba));
+	UT_ASSERT(!cluster_undo_record_prepared_uba_exact(&receipt, PG_UINT16_MAX, &uba));
+	UT_ASSERT(UBA_is_invalid(uba));
+	UT_ASSERT_EQ(receipt_prepare_calls + receipt_apply_calls, 0);
 	cluster_undo_record_cancel_prepared(&receipt);
 }
 
@@ -5397,14 +5464,19 @@ UT_TEST(test_operation_capture_precedes_reservation_side_effects)
 	const char *prepare = source == NULL ? NULL : strstr(source,
 		"\ncluster_undo_record_prepare_trace_impl(uint8 record_type");
 	const char *capture = prepare == NULL ? NULL : strstr(prepare, "undo_record_capture_operation(");
+	const char *size
+		= prepare == NULL ? NULL : strstr(prepare, "undo_prepared_record_total_length(");
 	const char *cancel = prepare == NULL ? NULL : strstr(prepare, "cluster_undo_record_cancel_prepared(");
 	const char *create = prepare == NULL ? NULL : strstr(prepare,
 		"cluster_undo_active_segment_for_node_or_create(");
 	UT_ASSERT_NOT_NULL(capture);
+	UT_ASSERT_NOT_NULL(size);
 	UT_ASSERT_NOT_NULL(cancel);
 	UT_ASSERT_NOT_NULL(create);
 	if (capture != NULL && cancel != NULL && create != NULL)
 		UT_ASSERT(capture < cancel && capture < create);
+	if (capture != NULL && size != NULL)
+		UT_ASSERT(capture < size);
 #ifdef CLUSTER_UNDO_OPERATION_CAPTURE_PRESENT
 	{
 		ClusterUndoRecordPrepareReceipt receipt;
@@ -5465,6 +5537,58 @@ UT_TEST(test_receipt_sync_cannot_replace_frozen_operation)
 #else
 	UT_ASSERT(false);
 #endif
+}
+
+UT_TEST(test_receipt_sync_cannot_replace_the_prepared_payload_shape)
+{
+	for (unsigned variant = 0; variant < 4; variant++) {
+		ClusterUndoRecordPrepareReceipt receipt;
+		ClusterUndoRecordPrepareReceipt original;
+
+		receipt_fixture_ready(UNDO_RECORD_UPDATE, &receipt);
+		original = receipt;
+		switch (variant) {
+		case 0:
+			receipt.payload_capacity++;
+			break;
+		case 1:
+			receipt.payload_capacity--;
+			break;
+		case 2:
+			receipt.payload_capacity = PG_UINT16_MAX;
+			break;
+		case 3:
+			receipt.record_type = UNDO_RECORD_INSERT;
+			break;
+		}
+		UT_ASSERT(!cluster_undo_record_receipt_sync(&receipt));
+		UT_ASSERT_EQ(memcmp(&cluster_undo_record_reservation.receipt, &original, sizeof(original)),
+					 0);
+		cluster_undo_record_cancel_prepared(&original);
+		UT_ASSERT(!cluster_undo_record_reservation.active);
+		UT_ASSERT_EQ(receipt_leave_calls, 1);
+	}
+}
+
+UT_TEST(test_payload_shape_sync_after_apply_keeps_the_original_debt)
+{
+	for (unsigned variant = 0; variant < 2; variant++) {
+		ClusterUndoRecordPrepareReceipt receipt;
+		ClusterUndoRecordPrepareReceipt original;
+
+		receipt_consumer_fixture(&receipt, 1, true);
+		receipt_consumer_apply(&receipt, 0);
+		original = receipt;
+		if (variant == 0)
+			receipt.payload_capacity++;
+		else
+			receipt.record_type = UNDO_RECORD_UPDATE;
+		UT_ASSERT(!cluster_undo_record_receipt_sync(&receipt));
+		UT_ASSERT_EQ(memcmp(&cluster_undo_record_reservation.receipt, &original, sizeof(original)),
+					 0);
+		UT_ASSERT_EQ(cluster_undo_record_reservation.receipt.ctrc_applied_mask, 1);
+		receipt_assert_uncertain_abort();
+	}
 }
 
 UT_TEST(test_prepared_operation_recheck_refuses_scope_and_full_identity_drift)
@@ -5613,7 +5737,11 @@ UT_TEST(test_exact_zero_abort_keeps_cleanup_after_native_scope_ends)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(141);
+	UT_PLAN(145);
+	UT_RUN(test_operation_planned_uba_reserves_the_complete_child_tail);
+	UT_RUN(test_operation_planned_uba_does_not_wrap_maximum_body_size);
+	UT_RUN(test_receipt_sync_cannot_replace_the_prepared_payload_shape);
+	UT_RUN(test_payload_shape_sync_after_apply_keeps_the_original_debt);
 	UT_RUN(test_operation_codec_unaligned_live_and_discarded);
 	UT_RUN(test_operation_codec_all_original_body_shapes);
 	UT_RUN(test_operation_codec_epoch_and_counter_boundaries);

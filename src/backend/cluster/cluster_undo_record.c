@@ -1056,9 +1056,15 @@ undo_record_total_length(uint8 record_type, uint16 payload_len)
 }
 
 static inline uint32
-undo_prepared_record_total_length(uint16 body_length)
+undo_prepared_record_total_length(const ClusterSavepointOperation *operation, uint16 body_length)
 {
-	return sizeof(UndoRecordHeader) + (uint32)body_length + sizeof(UndoItlHistoryTrailer);
+	uint32 length = sizeof(UndoRecordHeader) + (uint32)body_length + sizeof(UndoItlHistoryTrailer);
+
+	/* The immutable capture determines the complete record footprint before
+	 * any APPLY.  All geometry checks use this same widened calculation. */
+	if (!FullTransactionIdEquals(operation->operation_fxid, operation->top_fxid))
+		length += sizeof(UndoOperationTrailer);
+	return length;
 }
 
 
@@ -2931,15 +2937,15 @@ cluster_undo_record_prepare_trace_impl(uint8 record_type, uint16 payload_capacit
 		cluster_undo_receipt_reason = "PREPARE_TIMEOUT_BEFORE_READY";
 		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
 	}
-	record_length = undo_prepared_record_total_length(payload_capacity);
-	if (record_length > UNDO_RECORD_HARD_CAP_BYTES) {
-		cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_CAPACITY_REFUSAL);
-		cluster_undo_receipt_reason = "CAPACITY_REFUSAL";
+	if (!undo_record_capture_operation(tt_slot_segment_id, tt_slot_offset, &operation)) {
+		cluster_undo_receipt_reason = "OPERATION_IDENTITY_UNPROVEN";
 		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
 	}
 
-	if (!undo_record_capture_operation(tt_slot_segment_id, tt_slot_offset, &operation)) {
-		cluster_undo_receipt_reason = "OPERATION_IDENTITY_UNPROVEN";
+	record_length = undo_prepared_record_total_length(&operation, payload_capacity);
+	if (record_length > UNDO_RECORD_HARD_CAP_BYTES) {
+		cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_CAPACITY_REFUSAL);
+		cluster_undo_receipt_reason = "CAPACITY_REFUSAL";
 		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
 	}
 
@@ -3108,8 +3114,10 @@ cluster_undo_record_receipt_sync(ClusterUndoRecordPrepareReceipt *receipt)
 
 	if (receipt == NULL || !reservation->active || receipt->reservation_sequence == 0
 		|| receipt->reservation_sequence != reservation->sequence
-		|| memcmp(&receipt->operation, &reservation->receipt.operation,
-				  sizeof(receipt->operation)) != 0)
+		|| receipt->record_type != reservation->receipt.record_type
+		|| receipt->payload_capacity != reservation->receipt.payload_capacity
+		|| memcmp(&receipt->operation, &reservation->receipt.operation, sizeof(receipt->operation))
+			   != 0)
 		return false;
 	reservation->receipt = *receipt;
 	return true;
@@ -3705,9 +3713,11 @@ cluster_undo_record_prepared_uba_exact(const ClusterUndoRecordPrepareReceipt *re
 	if (receipt == NULL || uba_out == NULL || payload_len > receipt->payload_capacity
 		|| !cluster_undo_record_receipt_extent_matches(receipt))
 		return false;
-	record_length = undo_prepared_record_total_length(payload_len);
-	if (!cluster_undo_block_has_space(receipt->extent.cur_free_offset,
-									  receipt->extent.cur_slot_count, record_length))
+	record_length = undo_prepared_record_total_length(&receipt->operation, payload_len);
+	/* The page-space API takes uint16; reject the widened size first. */
+	if (record_length > UNDO_RECORD_HARD_CAP_BYTES
+		|| !cluster_undo_block_has_space(receipt->extent.cur_free_offset,
+										 receipt->extent.cur_slot_count, record_length))
 		return false;
 	uba = uba_encode(receipt->actual_segment_id, receipt->extent.cur_block, receipt->tt_slot_offset,
 					 receipt->extent.cur_slot_count);
@@ -3942,9 +3952,10 @@ cluster_undo_record_consume_preflight(ClusterUndoRecordPrepareReceipt *receipt, 
 		return CLUSTER_UNDO_RECORD_CONSUME_PREFLIGHT_RETRY_REQUIRED;
 	}
 
-	record_length = undo_prepared_record_total_length(payload_len);
-	if (!cluster_undo_block_has_space(receipt->extent.cur_free_offset,
-									  receipt->extent.cur_slot_count, record_length)
+	record_length = undo_prepared_record_total_length(&receipt->operation, payload_len);
+	if (record_length > UNDO_RECORD_HARD_CAP_BYTES
+		|| !cluster_undo_block_has_space(receipt->extent.cur_free_offset,
+										 receipt->extent.cur_slot_count, record_length)
 		|| !cluster_undo_local_head_ensure(receipt->tt_slot_segment_id, receipt->tt_slot_offset,
 										   &local_head_idx)) {
 		cluster_undo_receipt_metric_add(CLUSTER_UNDO_RECEIPT_CAPACITY_REFUSAL);
@@ -4036,12 +4047,13 @@ cluster_undo_record_consume_prepared(ClusterUndoRecordPrepareReceipt *receipt,
 	history.count = receipt->itl_history_mask == 3 ? 2 : 1;
 	memcpy(history.entries, receipt->itl_history, sizeof(history.entries));
 
-	record_length = undo_prepared_record_total_length(payload_len);
+	record_length = undo_prepared_record_total_length(&receipt->operation, payload_len);
 	free_offset = receipt->extent.cur_free_offset;
 	slot_count = receipt->extent.cur_slot_count;
 	local_head_idx = reservation->consume_local_head_idx;
-	if (!cluster_undo_block_has_space(free_offset, slot_count, record_length) || local_head_idx < 0
-		|| (uint32)local_head_idx >= cluster_undo_local_head_count
+	if (record_length > UNDO_RECORD_HARD_CAP_BYTES
+		|| !cluster_undo_block_has_space(free_offset, slot_count, record_length)
+		|| local_head_idx < 0 || (uint32)local_head_idx >= cluster_undo_local_head_count
 		|| cluster_undo_local_heads[local_head_idx].tt_slot_segment_id
 			   != receipt->tt_slot_segment_id
 		|| cluster_undo_local_heads[local_head_idx].tt_slot_offset != receipt->tt_slot_offset

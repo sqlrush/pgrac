@@ -101,7 +101,9 @@ typedef enum ClusterUndoRecordConsumePreflightResult {
  * exact proof, while reservation_sequence names the sole backend-local owner.
  * The absolute deadline bounds preparation only.  Once READY, it is a
  * historical diagnostic stamp, not a lease.  An exact invalidation that
- * requires a new preparation still uses that original, never-refreshed budget. */
+ * requires a new preparation still uses that original, never-refreshed budget.
+ * Record type and body capacity are immutable after preparation.  Capacity
+ * excludes history/operation trailers, whose space is accounted internally. */
 typedef struct ClusterUndoRecordPrepareReceipt {
 	uint32 magic;
 	uint8 record_type;
