@@ -18348,6 +18348,7 @@ heap_lock_updated_tuple_rec(Relation rel, TransactionId priorXmax,
 	uint64 cluster_chain_prepare_deadline_us = 0;
 	uint64 cluster_chain_capacity_deadline_us = 0;
 	bool		cluster_chain_vm_locked = false;
+	ResourceXAuxiliaryAcquireContext cluster_chain_vm_context = {0};
 	uint8		cluster_chain_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
 	UBA			cluster_chain_uba = InvalidUba_init;
 	SCN			cluster_chain_write_scn = InvalidScn;
@@ -18385,6 +18386,7 @@ heap_lock_updated_tuple_rec(Relation rel, TransactionId priorXmax,
 		cluster_chain_lock_stamp = false;
 		cluster_chain_needs_itl = false;
 		cluster_chain_vm_locked = false;
+		MemSet(&cluster_chain_vm_context, 0, sizeof(cluster_chain_vm_context));
 		cluster_chain_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
 		cluster_chain_uba = (UBA) InvalidUba_init;
 		cluster_chain_write_scn = InvalidScn;
@@ -18830,7 +18832,14 @@ l4:
 				&& (!cluster_page_versioned
 					|| cluster_heap_lock_vm_needs_clear(rel, block, vmbuffer)))
 			{
-				LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+				if (!ClusterLockBufferExclusiveAuxiliaryAliasAware(
+						&vmbuffer, NULL, NULL, &cluster_chain_vm_context))
+				{
+					/* Retry from the unlocked tuple check before receipt APPLY. */
+					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+					cluster_heap_vm_barrier_warm(&vmbuffer, NULL, &cluster_chain_vm_context);
+					goto l4;
+				}
 				cluster_chain_vm_locked = true;
 			}
 
@@ -18946,7 +18955,13 @@ l4:
 			if (PageIsAllVisible(BufferGetPage(buf)) && BufferIsValid(vmbuffer)
 				&& cluster_heap_lock_vm_needs_clear(rel, block, vmbuffer))
 			{
-				LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+				if (!ClusterLockBufferExclusiveAuxiliaryAliasAware(
+						&vmbuffer, NULL, NULL, &cluster_chain_vm_context))
+				{
+					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+					cluster_heap_vm_barrier_warm(&vmbuffer, NULL, &cluster_chain_vm_context);
+					goto l4;
+				}
 				cluster_chain_vm_locked = true;
 			}
 			vm_changes = cluster_chain_vm_locked
@@ -21377,7 +21392,9 @@ cluster_heap_freeze_apply_xmin_batch_recent_v1(
 
 	/* The proof phase may have released its pin. Reuse only the original
 	 * resident hint under the caller's still-entered admission: no fetch,
-	 * new current, proof request or replacement source observation. */
+	 * new current, proof request or replacement source observation.
+	 * Reject an already obsolete local ingress cut before acquiring this
+	 * pin; the pinned continuation repeats the same check after acquisition. */
 	if (rel == NULL || !rel->rd_isvalid || input == NULL || page == NULL
 		|| proofs == NULL || fence == NULL || authority_before == NULL
 		|| admission == NULL || !admission->entered || targets == NULL
@@ -21386,6 +21403,11 @@ cluster_heap_freeze_apply_xmin_batch_recent_v1(
 		|| BufferDescriptors == NULL
 		|| admission->record_generation != fence->admission_generation
 		|| !RelFileLocatorEquals(rel->rd_locator, fence->identity.key.locator)
+		|| input->freeze_cohort == NULL
+		|| input->freeze_cohort->local_registration_cut.status != CTRC_ACTIVE_SCAN_COMPLETE
+		|| input->freeze_cohort->local_registration_cut.unqualified_entries != 0
+		|| !cluster_ctrc_active_scan_registration_current(
+			&input->freeze_cohort->local_registration_cut)
 		|| !ReadRecentBuffer(rel->rd_locator, MAIN_FORKNUM, fence->block,
 			recent_buffer))
 		return false;

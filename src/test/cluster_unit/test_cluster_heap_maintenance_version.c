@@ -127,6 +127,7 @@ ErrorContextCallback *error_context_stack;
 static int32 backend_pin_count;
 static unsigned pin_checks;
 static unsigned recent_pin_calls, recent_unpins;
+static void (*recent_pin_observer)(void);
 static bool recent_pin_allowed, recent_pin_error;
 static bool recent_caller_local_x, recent_caller_writer, recent_caller_share;
 static bool recent_pin_held;
@@ -273,6 +274,7 @@ ReadRecentBuffer(RelFileLocator locator, ForkNumber fork, BlockNumber block,
 	UT_ASSERT_EQ(backend_pin_count, recent_caller_pins);
 	backend_pin_count++;
 	recent_pin_held = true;
+	if (recent_pin_observer != NULL) recent_pin_observer();
 	return true;
 }
 
@@ -2041,6 +2043,7 @@ reset(uint8 opcode, bool shared)
 	backend_pin_count = 1;
 	pin_checks = 0;
 	recent_pin_calls = recent_unpins = 0;
+	recent_pin_observer = NULL;
 	recent_pin_allowed = true; recent_pin_error = false; recent_pin_admission = NULL;
 	recent_caller_local_x = recent_caller_writer = recent_caller_share = recent_pin_held = false;
 	recent_caller_pins = 0; phase_pin_released = false;
@@ -12094,6 +12097,156 @@ UT_TEST(test_pin_free_phase_recent_errors_unwind_pin_before_original_owner_leave
 	}
 }
 
+/* A controlled interleaving at the resident I/O leaf invokes the complete
+ * original foreign receipt publisher. Its authentication/storage leaves are
+ * controlled; the registration-generation change comes from the real body. */
+static ClusterCtrcTxnKeyV1 recent_registration_key;
+static ClusterCtrcReceiptHandle recent_registration_handle;
+static ClusterCtrcActiveScan recent_registration_cut;
+static bool recent_registration_refused;
+static unsigned recent_registration_calls;
+
+static void
+recent_register_unknown_receiver(void)
+{
+	uint64 generation = pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation);
+
+	recent_registration_calls++;
+	UT_ASSERT(recent_pin_held && backend_pin_count == 1);
+	UT_ASSERT(!local_x && !local_share && !resumed_writer);
+	UT_ASSERT(recent_pin_admission->entered);
+	UT_ASSERT(cluster_ctrc_active_scan_registration_current(&recent_registration_cut));
+	participant_publisher_inputs(&recent_registration_key, 1);
+	participant_admission_sample_ok = !recent_registration_refused;
+	memset(&recent_registration_handle, 0, sizeof(recent_registration_handle));
+	if (recent_registration_refused)
+	{
+		UT_ASSERT_EQ(participant_publisher_prepare(&recent_registration_key, 1,
+			&recent_registration_handle), CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT(!recent_registration_handle.valid);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), generation);
+		UT_ASSERT(cluster_ctrc_active_scan_registration_current(&recent_registration_cut));
+	}
+	else
+	{
+		ClusterCtrcReceiptHandle replay;
+
+		UT_ASSERT_EQ(participant_publisher_prepare(&recent_registration_key, 1,
+			&recent_registration_handle), CLUSTER_CTRC_PREPARE_READY);
+		UT_ASSERT(recent_registration_handle.valid);
+		UT_ASSERT(FullTransactionIdEquals(recent_registration_handle.original_full_xid,
+			InvalidFullTransactionId));
+		UT_ASSERT_EQ(recent_registration_handle.participant->receipt_count, 1);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), generation + 1);
+		UT_ASSERT(!cluster_ctrc_active_scan_registration_current(&recent_registration_cut));
+		UT_ASSERT_EQ(participant_publisher_prepare(&recent_registration_key, 1, &replay),
+			CLUSTER_CTRC_PREPARE_DUPLICATE);
+		UT_ASSERT(replay.participant == recent_registration_handle.participant);
+		UT_ASSERT_EQ(replay.participant->receipt_count, 1);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), generation + 1);
+	}
+	UT_ASSERT_EQ(participant_lock_depth, 0);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+}
+
+static void
+recent_registration_case(bool batch, bool refuse)
+{
+	QualifiedXminFixture f;
+	LVRelState v;
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	CensusRuntimeAllocation runtime;
+
+	phase_setup(&f, &v, targets, batch);
+	/* Keep the existing fixture's saved cut/source publication. The complete
+	 * allocation starts at that same generation; it is not a new census. */
+	if (!census_full_layout_setup(&runtime, 2)) { UT_ASSERT(false); return; }
+	recent_registration_cut = f.cohort.local_registration_cut;
+	UT_ASSERT(cluster_ctrc_active_scan_registration_current(&recent_registration_cut));
+	recent_registration_key = census_key_for_full(&f.cohort.admission_fence,
+		FullTransactionIdFromEpochAndXid(1, 100));
+	recent_registration_key.origin_node_id = 1;
+	recent_registration_key.owner_instance = 2;
+	recent_registration_key.segment_id = CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	recent_registration_refused = refuse;
+	recent_registration_calls = 0;
+	backend_pin_count = 0;
+	relation_data.rd_isvalid = resume_allowed = true;
+	recent_pin_observer = recent_register_unknown_receiver;
+	UT_ASSERT_EQ(phase_then_recent_native_owned(&f, &v), refuse);
+	recent_pin_observer = NULL;
+	UT_ASSERT_EQ(recent_registration_calls, 1);
+	UT_ASSERT_EQ(phase_preflights, 1); UT_ASSERT_EQ(phase_rechecks, 1);
+	UT_ASSERT_EQ(recent_pin_calls, 1); UT_ASSERT_EQ(recent_unpins, 1);
+	UT_ASSERT_EQ(conditional_resumes, refuse); UT_ASSERT_EQ(conditional_unlocks, refuse);
+	UT_ASSERT_EQ(inserts, refuse); UT_ASSERT_EQ(flushes, refuse);
+	if (!refuse)
+	{
+		UT_ASSERT_EQ(edges + dirties, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(recent_registration_handle.participant->state, CTRC_PARTICIPANT_OPEN);
+		UT_ASSERT_EQ(recent_registration_handle.participant->receipt_count, 1);
+	}
+	UT_ASSERT_EQ(phase_finally_calls, 1); UT_ASSERT_EQ(phase_finally_debt, 1);
+	UT_ASSERT_EQ(phase_finally_pins, 0); UT_ASSERT(!phase_finally_owned_writer);
+	UT_ASSERT_EQ(backend_pin_count, 0);
+	UT_ASSERT(!recent_pin_held && !local_x && !resumed_writer);
+	UT_ASSERT(cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0)) == NULL);
+	bounds_lifecycle_assert_empty(&f.admission);
+	census_full_layout_release(&runtime);
+}
+
+UT_TEST(test_recent_unknown_receiver_revokes_pin_free_proof_before_writer_or_wal)
+{
+	for (unsigned batch = 0; batch < 2; batch++) recent_registration_case(batch != 0, false);
+}
+
+UT_TEST(test_recent_refused_receiver_keeps_original_cut_and_native_continuation)
+{
+	for (unsigned batch = 0; batch < 2; batch++) recent_registration_case(batch != 0, true);
+}
+
+UT_TEST(test_recent_xmin_stale_registration_refuses_before_resident_pin)
+{
+	for (unsigned batch = 0; batch < 2; batch++)
+	{
+		for (unsigned fault = 0; fault < 6; fault++)
+		{
+			QualifiedXminFixture f;
+			ClusterHeapFreezeXminTargetV1 targets[3];
+			uint16 count = batch ? 3 : 1;
+			int32 caller_pins;
+
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else
+			{
+				qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+				targets[0] = (ClusterHeapFreezeXminTargetV1) {
+					0, FullTransactionIdFromEpochAndXid(1, 77)
+				};
+			}
+			relation_data.rd_isvalid = true;
+			caller_pins = backend_pin_count;
+			switch (fault)
+			{
+			case 0: f.input.freeze_cohort = NULL; break;
+			case 1: f.cohort.local_registration_cut.status = CTRC_ACTIVE_SCAN_INCOMPLETE; break;
+			case 2: f.cohort.local_registration_cut.unqualified_entries = 1; break;
+			case 3: ctrc_note_unqualified_registration(); break;
+			case 4: f.cohort.local_registration_cut.unqualified_registration_generation = 0; break;
+			case 5: f.cohort.local_registration_cut.unqualified_registration_generation = UINT64_MAX; break;
+			}
+			UT_ASSERT(!fixture_recent_xmin_apply(&f, targets, count));
+			UT_ASSERT_EQ(recent_pin_calls + recent_unpins, 0);
+			UT_ASSERT_EQ(backend_pin_count, caller_pins);
+			UT_ASSERT(local_x && !resumed_writer && f.admission.entered);
+			UT_ASSERT_EQ(conditional_resumes + conditional_unlocks, 0);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
 UT_TEST(test_recent_xmin_pin_continues_original_admission_to_native_wal)
 {
 	for (int batch = 0; batch < 2; batch++) {
@@ -12298,11 +12451,14 @@ UT_TEST(test_recent_xmin_share_lock_refusal_keeps_borrowed_pin_without_upgrade)
 int
 main(void)
 {
-	UT_PLAN(290);
+	UT_PLAN(293);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
 	UT_RUN(test_pin_free_phase_recent_errors_unwind_pin_before_original_owner_leave);
+	UT_RUN(test_recent_unknown_receiver_revokes_pin_free_proof_before_writer_or_wal);
+	UT_RUN(test_recent_refused_receiver_keeps_original_cut_and_native_continuation);
+	UT_RUN(test_recent_xmin_stale_registration_refuses_before_resident_pin);
 	UT_RUN(test_recent_xmin_success_preserves_preowned_pin_and_writer);
 	UT_RUN(test_recent_xmin_errors_keep_borrowed_pin_and_writer_scope);
 	UT_RUN(test_recent_xmin_share_lock_refusal_keeps_borrowed_pin_without_upgrade);

@@ -6200,6 +6200,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_undo_bind_native.inc test_cluster_undo_tt_transition.inc
 	rm -f test_cluster_undo_path_native.inc test_cluster_undo_fd_native.inc test_cluster_undo_dir_native.inc
 	rm -f test_cluster_heap_lock_vm_needed.inc
+	rm -f test_cluster_heap_chain_vm_itl.inc test_cluster_heap_chain_vm_no_itl.inc
 	rm -f test_cluster_btree_structure_helpers.inc test_cluster_btree_structure_alloc.inc \
 		test_cluster_btree_structure_root.inc \
 		test_cluster_btree_structure_delete.inc \
@@ -9502,9 +9503,22 @@ test_cluster_heap_lock_chain_pin.inc: $(top_srcdir)/src/backend/access/heap/heap
 	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_heap_chain_vm_itl.inc test_cluster_heap_chain_vm_no_itl.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_lock_updated_tuple_rec\(/ { in_chain=1 } \
+	     in_chain && /^[[:space:]]*if [(]PageIsAllVisible[(]BufferGetPage[(]buf[)][)]/ { candidate=1; count=0 } \
+	     candidate { lines[++count]=$$0 } \
+	     candidate && /cluster_chain_vm_locked = true;/ { ready=1 } \
+	     candidate && ready && /^\t\t\t}/ { \
+	       found++; if (found == $(if $(filter %_no_itl.inc,$@),2,1)) \
+	         for (i=1; i<=count; i++) print lines[i]; candidate=ready=0; \
+	       if (found == 2) exit } \
+	     /^}/ { in_chain=0 } END { if (found != 2 || candidate) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_lock_vm_pin test_cluster_heap_lock_vm_pin_noassert: test_cluster_heap_lock_vm_pin.c unit_test.h \
-		test_cluster_heap_lock_rebind.inc test_cluster_pcm_aux_heap_repin.inc \
-		test_cluster_heap_lock_vm_recent.inc test_cluster_heap_lock_chain_pin.inc $(CLUSTER_HOT_BUFPAGE_TEST_O)
+		test_cluster_heap_lock_rebind.inc test_cluster_heap_vm_unwind_helpers.inc \
+		test_cluster_heap_lock_vm_recent.inc test_cluster_heap_lock_chain_pin.inc \
+		test_cluster_heap_chain_vm_itl.inc test_cluster_heap_chain_vm_no_itl.inc $(CLUSTER_HOT_BUFPAGE_TEST_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $< \
 		$(CLUSTER_HOT_BUFPAGE_TEST_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@

@@ -106,6 +106,26 @@ LockBuffer(Buffer buffer, int mode)
 		vm_locks++;
 }
 
+/* Existing publication cases use an already available VM writer.  The
+ * refusal/reobserve path runs in test_cluster_heap_lock_vm_pin. */
+bool
+ClusterLockBufferExclusiveAuxiliaryAliasAware(Buffer *buffer, Buffer *alias,
+											  const ClusterBufferBarrierSiteId *site,
+											  ResourceXAuxiliaryAcquireContext *context)
+{
+	UT_ASSERT(alias == NULL && site == NULL && context != NULL);
+	LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
+	memset(context, 0, sizeof(*context));
+	return true;
+}
+
+static void
+cluster_heap_vm_barrier_warm(Buffer *buffer, Buffer *alias,
+							 ResourceXAuxiliaryAcquireContext *context)
+{
+	abort(); /* The publication-only fixture must never simulate a retry. */
+}
+
 bool
 ClusterLockBufferShareBarrierAware(Buffer buffer)
 {
@@ -1147,6 +1167,7 @@ run_chain_lock(bool versioned, bool itl)
 	uint16 new_infomask = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK, new_infomask2 = 0;
 	bool cleared_all_frozen = false, cluster_chain_lock_stamp = itl;
 	bool cluster_chain_vm_locked = want_vm, cluster_page_versioned = versioned;
+	ResourceXAuxiliaryAcquireContext cluster_chain_vm_context = {0};
 	ClusterSpaceIdentity cluster_page_identity = identity;
 	uint8 cluster_chain_slot_idx = 0;
 	SCN cluster_chain_write_scn = 811;
@@ -1166,6 +1187,9 @@ run_chain_lock(bool versioned, bool itl)
 	prepared = cluster_page_versions;
 #include "test_cluster_heap_chain_lock_version.inc"
 	chain_locking = false;
+	return;
+l4:
+	abort();
 }
 
 static void
@@ -1276,6 +1300,7 @@ UT_TEST(test_actual_lock_capture_is_read_only_and_no_itl_locks_vm)
 			BlockNumber block = 0;
 			bool vm_locked = vm != 0, cluster_chain_vm_locked = owner == 2 ? false : vm != 0;
 			bool cluster_page_versioned = true;
+			ResourceXAuxiliaryAcquireContext cluster_chain_vm_context = {0};
 			ClusterSpaceIdentity cluster_page_identity;
 			RfPageProducerBatchV1 cluster_page_versions = { 0 };
 			PGAlignedBlock before[4];
@@ -1305,6 +1330,9 @@ UT_TEST(test_actual_lock_capture_is_read_only_and_no_itl_locks_vm)
 				run_chain_lock(true, owner == 1);
 			check_lock_publication(vm != 0, vm == 1, owner != 2, false);
 		}
+	return;
+l4:
+	abort();
 }
 
 static void
