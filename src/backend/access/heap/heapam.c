@@ -7297,6 +7297,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	bool		cluster_page_versioned = false;
 	ClusterSpaceIdentity cluster_page_identity;
 	RfPageProducerBatchV1 cluster_page_versions;
+	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
 #endif
 
 	/* PGRAC: reject before acquiring a bulk lease or preparing tuple bytes. */
@@ -7415,8 +7416,6 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		bool		all_frozen_set = false;
 		int			nthispage;
 
-		CHECK_FOR_INTERRUPTS();
-
 		/*
 		 * Compute number of pages needed to fit the to-be-inserted tuples in
 		 * the worst case.  This will be used to determine how much to extend
@@ -7435,6 +7434,11 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		}
 		else
 			npages_used++;
+
+#ifdef USE_PGRAC_CLUSTER
+cluster_heap_multi_insert_retry:
+#endif
+		CHECK_FOR_INTERRUPTS();
 
 		/*
 		 * Find buffer where at least the next tuple will fit.  If the page is
@@ -7459,7 +7463,21 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		if (PageIsAllVisible(page) && !(options & HEAP_INSERT_FROZEN)
 			&& BufferIsValid(vmbuffer))
 		{
+#ifdef USE_PGRAC_CLUSTER
+			cluster_heap_vm_retarget_after_repick(vmbuffer, &cluster_vm_context);
+			if (!ClusterLockBufferExclusiveAuxiliaryAliasAware(&vmbuffer, NULL, NULL,
+														   &cluster_vm_context)) {
+				/* Reselect this unconsumed batch without counting another page.
+				 * No tuple or page version has been published before this wait. */
+				UnlockReleaseBuffer(buffer);
+				if (BufferIsValid(vmbuffer))
+					ReleaseBuffer(vmbuffer);
+				vmbuffer = InvalidBuffer;
+				goto cluster_heap_multi_insert_retry;
+			}
+#else
 			LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+#endif
 			vm_locked = true;
 		}
 
