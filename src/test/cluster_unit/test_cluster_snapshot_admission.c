@@ -4,6 +4,8 @@
  * Author: SqlRush <sqlrush@gmail.com> */
 #include "postgres.h"
 #include "unit_test.h"
+#include "access/visibilitymap.h"
+#include "storage/bufmgr.h"
 #include "cluster/cluster_adg.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_inject.h"
@@ -50,6 +52,12 @@ static unsigned remembered;
 static ClusterUndoHorizonShmem horizon;
 static ClusterMembershipState self_member = CLUSTER_MEMBER_MEMBER;
 static bool peer_capable = true;
+static bool vm_fixture, vm_locked, vm_shared, vm_refuse;
+static bool vm_caught, vm_result;
+static int vm_drift, vm_error;
+static unsigned vm_begins, vm_ends, vm_admissions;
+static Snapshot vm_expected;
+int NBuffers = 2, NLocBuffer;
 static int error_code;
 static OldSnapshotControlData snapshot_control;
 static bool snapshot_control_found;
@@ -173,6 +181,10 @@ cluster_conf_lookup_node(int node)
 bool
 cluster_sf_peer_supports_undo_horizon(int node)
 {
+	if (vm_fixture) {
+		UT_ASSERT(!vm_locked);
+		vm_admissions++;
+	}
 	return peer_capable;
 }
 bool
@@ -1067,6 +1079,312 @@ UT_TEST(original_registered_nonfinite_reader_keeps_h_unqualified_until_retiremen
 	UT_ASSERT_EQ(sample.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
 }
 
+
+/* The native snapshot manager and read-admission body above execute. Only
+ * the coherent VM acquisition/storage leaf is scheduled by this fixture. */
+bool
+cluster_heap_maintenance_restricted(Relation rel)
+{
+	return vm_shared;
+}
+
+bool
+visibilitymap_read_begin(Relation rel, BlockNumber block, Buffer *buffer,
+						 VisibilityMapReadScope *scope, uint8 *status)
+{
+	if (status != NULL)
+		*status = 0;
+	if (rel == NULL || block == InvalidBlockNumber || buffer == NULL || scope == NULL
+		|| status == NULL || BufferIsValid(scope->locked_buffer))
+		return false;
+	vm_begins++;
+	if (!vm_shared) {
+		*buffer = 1;
+		*status = VISIBILITYMAP_VALID_BITS;
+		return true;
+	}
+	UT_ASSERT(ClusterSnapshotReadScope != NULL
+			  && ClusterSnapshotReadScope->snapshot == vm_expected);
+	UT_ASSERT(!vm_locked);
+	if (vm_error == 1)
+		siglongjmp(*PG_exception_stack, 1);
+	if (vm_refuse)
+		return false;
+	*buffer = scope->locked_buffer = 1;
+	vm_locked = true;
+	*status = VISIBILITYMAP_VALID_BITS;
+	if (vm_error == 2)
+		siglongjmp(*PG_exception_stack, 1);
+	switch (vm_drift) {
+	case 1:
+		vm_expected->read_scn++;
+		break;
+	case 2:
+		vm_expected->read_epoch++;
+		break;
+	case 3:
+		vm_expected->cluster_source = SNAPSHOT_SOURCE_LOCAL;
+		break;
+	case 4:
+		vm_expected->cluster_cr_identity++;
+		break;
+	case 5:
+		CurrentResourceOwner = (ResourceOwner)2;
+		break;
+	case 6:
+		pg_atomic_write_u64(&proc.cluster_read_scn_atomic, 101);
+		break;
+	default:
+		break;
+	}
+	return true;
+}
+
+void
+visibilitymap_read_end(VisibilityMapReadScope *scope)
+{
+	if (scope == NULL || !BufferIsValid(scope->locked_buffer))
+		return;
+	UT_ASSERT(vm_locked);
+	vm_ends++;
+	vm_locked = false;
+	scope->locked_buffer = InvalidBuffer;
+}
+
+#include "test_cluster_vm_snapshot_read.inc"
+#ifndef FIXTURE_HAS_VM_SNAPSHOT_READER
+/* API-absent parent: the existing VM observation does not bind a snapshot. */
+static bool
+fixture_vm_snapshot_observation(Relation rel, BlockNumber block, Snapshot snapshot, Buffer *buffer,
+								VisibilityMapReadScope *scope, uint8 *status)
+{
+	return visibilitymap_read_begin(rel, block, buffer, scope, status);
+}
+#define visibilitymap_read_snapshot_begin fixture_vm_snapshot_observation
+#endif
+
+static void
+vm_setup(Snapshot snapshot)
+{
+	vm_fixture = vm_shared = true;
+	vm_locked = vm_refuse = vm_caught = vm_result = false;
+	vm_drift = vm_error = 0;
+	vm_begins = vm_ends = vm_admissions = 0;
+	vm_expected = snapshot;
+	peer_capable = true;
+	self_member = CLUSTER_MEMBER_MEMBER;
+	pg_atomic_write_u64(&horizon.self_admitted_epoch, 8);
+	CurrentResourceOwner = (ResourceOwner)1;
+}
+
+static void
+vm_observe(Snapshot snapshot, Buffer *buffer, VisibilityMapReadScope *scope, uint8 *status)
+{
+	PG_TRY();
+	{
+		vm_result
+			= visibilitymap_read_snapshot_begin((Relation)1, 0, snapshot, buffer, scope, status);
+	}
+	PG_CATCH();
+	{
+		vm_caught = true;
+	}
+	PG_END_TRY();
+}
+
+UT_TEST(vm_observation_binds_registered_snapshot_and_restores_outer_evaluator)
+{
+	Snapshot a = registered(90), s = registered(100);
+	ClusterSnapshotReadScopeV1 outer;
+	VisibilityMapReadScope scope = { 0 };
+	Buffer buffer = InvalidBuffer;
+	uint8 status = 77;
+
+	vm_setup(s);
+	PushActiveSnapshot(a);
+	cluster_snapshot_read_enter_v1(&outer, a);
+	for (int reuse = 0; reuse < 2; reuse++) {
+		vm_observe(s, &buffer, &scope, &status);
+		UT_ASSERT(!vm_caught && vm_result && vm_locked);
+		UT_ASSERT_EQ(status, VISIBILITYMAP_VALID_BITS);
+		UT_ASSERT_EQ(scope.locked_buffer, 1);
+		UT_ASSERT_EQ(buffer, 1);
+		UT_ASSERT(ClusterSnapshotReadScope == &outer);
+		UT_ASSERT(evidence(90, a));
+		UT_ASSERT(GetActiveSnapshot() == a);
+		UT_ASSERT_EQ(s->regd_count, 1);
+		UT_ASSERT_EQ(s->active_count, 0);
+		visibilitymap_read_end(&scope);
+	}
+	UT_ASSERT_EQ(vm_begins, 2);
+	UT_ASSERT_EQ(vm_admissions, 2);
+	UT_ASSERT_EQ(vm_ends, 2);
+	cluster_snapshot_read_exit_v1(&outer);
+	PopActiveSnapshot();
+	vm_fixture = false;
+	UnregisterSnapshot(s);
+	UnregisterSnapshot(a);
+}
+
+UT_TEST(vm_observation_refuses_unretained_or_unqualified_snapshot_before_vm)
+{
+	for (int variant = 0; variant < 8; variant++) {
+		SnapshotData forged = { 0 };
+		Snapshot s = variant == 0 ? &forged : registered(100);
+		VisibilityMapReadScope scope = { 0 };
+		Buffer buffer = InvalidBuffer;
+		uint8 status = 77;
+
+		vm_setup(s);
+		if (variant == 0) {
+			forged.snapshot_type = SNAPSHOT_MVCC;
+			forged.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+			forged.read_scn = 100;
+			forged.read_epoch = 7;
+			forged.active_count = forged.regd_count = 100;
+		} else if (variant == 1)
+			s->snapshot_type = SNAPSHOT_SELF;
+		else if (variant == 2)
+			s->cluster_source = SNAPSHOT_SOURCE_LOCAL;
+		else if (variant == 3)
+			s->read_scn = InvalidScn;
+		else if (variant == 4)
+			s->read_epoch = 0;
+		else if (variant == 5)
+			s->read_epoch++;
+		else if (variant == 6)
+			UnregisterSnapshot(s);
+		vm_observe(variant == 7 ? NULL : s, &buffer, &scope, &status);
+		UT_ASSERT(!vm_caught && !vm_result && !vm_locked);
+		UT_ASSERT_EQ(status, 0);
+		UT_ASSERT_EQ(vm_begins + vm_admissions + vm_ends, 0);
+		UT_ASSERT(ClusterSnapshotReadScope == NULL);
+		visibilitymap_read_end(&scope);
+		vm_fixture = false;
+		if (variant != 0 && variant != 6)
+			UnregisterSnapshot(s);
+	}
+}
+
+UT_TEST(vm_observation_keeps_real_membership_and_peer_capability_admission)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		Snapshot s = registered(100);
+		VisibilityMapReadScope scope = { 0 };
+		Buffer buffer = InvalidBuffer;
+		uint8 status = 77;
+
+		vm_setup(s);
+		if (variant == 0)
+			self_member = CLUSTER_MEMBER_JOINING;
+		else if (variant == 1)
+			pg_atomic_write_u64(&horizon.self_admitted_epoch, 0);
+		else if (variant == 2)
+			pg_atomic_write_u64(&horizon.self_admitted_epoch, 9);
+		else
+			peer_capable = false;
+		vm_observe(s, &buffer, &scope, &status);
+		UT_ASSERT(!vm_result && !vm_locked);
+		UT_ASSERT_EQ(vm_caught, variant != 3);
+		UT_ASSERT_EQ(status, 0);
+		UT_ASSERT_EQ(vm_begins + vm_ends, 0);
+		UT_ASSERT(ClusterSnapshotReadScope == NULL);
+		visibilitymap_read_end(&scope);
+		vm_fixture = false;
+		self_member = CLUSTER_MEMBER_MEMBER;
+		peer_capable = true;
+		pg_atomic_write_u64(&horizon.self_admitted_epoch, 8);
+		UnregisterSnapshot(s);
+	}
+}
+
+UT_TEST(vm_observation_discards_snapshot_drift_after_vm_acquisition)
+{
+	for (int drift = 1; drift <= 6; drift++) {
+		Snapshot s = registered(100);
+		VisibilityMapReadScope scope = { 0 };
+		Buffer buffer = InvalidBuffer;
+		uint8 status = 77;
+
+		vm_setup(s);
+		vm_drift = drift;
+		vm_observe(s, &buffer, &scope, &status);
+		UT_ASSERT(!vm_caught && !vm_result && !vm_locked);
+		UT_ASSERT_EQ(status, 0);
+		UT_ASSERT_EQ(scope.locked_buffer, InvalidBuffer);
+		UT_ASSERT_EQ(buffer, 1);
+		UT_ASSERT_EQ(vm_begins, 1);
+		UT_ASSERT_EQ(vm_admissions, 1);
+		UT_ASSERT_EQ(vm_ends, 1);
+		UT_ASSERT(ClusterSnapshotReadScope == NULL);
+		visibilitymap_read_end(&scope);
+		vm_fixture = false;
+		CurrentResourceOwner = (ResourceOwner)1;
+		s->read_scn = 100;
+		s->read_epoch = 7;
+		s->cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+		UnregisterSnapshot(s);
+	}
+}
+
+UT_TEST(vm_observation_unwinds_refusal_and_errors_to_the_original_outer_scope)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		Snapshot a = registered(90), s = registered(100);
+		ClusterSnapshotReadScopeV1 outer;
+		VisibilityMapReadScope scope = { 0 };
+		Buffer buffer = InvalidBuffer;
+		uint8 status = 77;
+
+		vm_setup(s);
+		vm_refuse = fault == 0;
+		vm_error = fault;
+		cluster_snapshot_read_enter_v1(&outer, a);
+		vm_observe(s, &buffer, &scope, &status);
+		UT_ASSERT(!vm_result && !vm_locked);
+		UT_ASSERT_EQ(vm_caught, fault != 0);
+		UT_ASSERT_EQ(status, 0);
+		UT_ASSERT_EQ(scope.locked_buffer, InvalidBuffer);
+		UT_ASSERT_EQ(vm_begins, 1);
+		UT_ASSERT_EQ(vm_ends, fault == 2);
+		UT_ASSERT(ClusterSnapshotReadScope == &outer);
+		UT_ASSERT(evidence(90, a));
+		visibilitymap_read_end(&scope);
+		cluster_snapshot_read_exit_v1(&outer);
+		vm_fixture = false;
+		UnregisterSnapshot(s);
+		UnregisterSnapshot(a);
+	}
+}
+
+UT_TEST(vm_observation_preserves_active_vm_scope_and_native_observation)
+{
+	Snapshot s = registered(100);
+	VisibilityMapReadScope scope = { 0 };
+	Buffer buffer = 1;
+	uint8 status = 77;
+
+	vm_setup(s);
+	scope.locked_buffer = 1;
+	vm_locked = true;
+	vm_observe(s, &buffer, &scope, &status);
+	UT_ASSERT(!vm_caught && !vm_result && vm_locked);
+	UT_ASSERT_EQ(scope.locked_buffer, 1);
+	UT_ASSERT_EQ(vm_begins + vm_admissions + vm_ends, 0);
+	visibilitymap_read_end(&scope);
+	vm_fixture = false;
+	UnregisterSnapshot(s);
+	vm_setup(NULL);
+	vm_shared = false;
+	vm_observe(NULL, &buffer, &scope, &status);
+	UT_ASSERT(!vm_caught && vm_result && !vm_locked);
+	UT_ASSERT_EQ(status, VISIBILITYMAP_VALID_BITS);
+	UT_ASSERT_EQ(vm_begins, 1);
+	UT_ASSERT_EQ(vm_admissions, 0);
+	UT_ASSERT_EQ(scope.locked_buffer, InvalidBuffer);
+	vm_fixture = false;
+}
+
 int
 main(void)
 {
@@ -1087,7 +1405,7 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(88);
+	UT_PLAN(94);
 	UT_RUN(export_original_registration_publishes_h_before_file_visibility);
 	UT_RUN(export_original_registration_preserves_other_older_snapshot);
 	UT_RUN(export_errors_retain_original_h_until_transaction_cleanup);
@@ -1176,6 +1494,12 @@ main(void)
 	UT_RUN(vacuum_database_scan_rejects_invalid_seed_before_fold);
 	UT_RUN(vacuum_database_scan_nontarget_keeps_native_future_refusal);
 	UT_RUN(vacuum_database_scan_keeps_mx_future_refusal);
+	UT_RUN(vm_observation_binds_registered_snapshot_and_restores_outer_evaluator);
+	UT_RUN(vm_observation_refuses_unretained_or_unqualified_snapshot_before_vm);
+	UT_RUN(vm_observation_keeps_real_membership_and_peer_capability_admission);
+	UT_RUN(vm_observation_discards_snapshot_drift_after_vm_acquisition);
+	UT_RUN(vm_observation_unwinds_refusal_and_errors_to_the_original_outer_scope);
+	UT_RUN(vm_observation_preserves_active_vm_scope_and_native_observation);
 	UT_ASSERT_EQ(remembered, 0);
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	UT_ASSERT(!ActiveSnapshotSet());

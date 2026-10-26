@@ -103,6 +103,16 @@ typedef struct VisibilityMapReadScope
  * Native or missing-map success acquires no read lock. */
 extern bool visibilitymap_read_begin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf,
 									 VisibilityMapReadScope *scope, uint8 *status);
+#ifdef USE_PGRAC_CLUSTER
+struct SnapshotData;
+/* Same entry/exit and pin rules as read_begin. Shared observation also requires
+ * the original retained snapshot throughout the scope. Admission is sampled
+ * before VM acquisition; a local identity recheck does not grant skip permission.
+ * Failure unwinds only the new scope, preserving any scope active on entry. */
+extern bool visibilitymap_read_snapshot_begin(Relation rel, BlockNumber heapBlk,
+											  struct SnapshotData *snapshot, Buffer *vmbuf,
+											  VisibilityMapReadScope *scope, uint8 *status);
+#endif
 /* Idempotent; releases only this scope's read lock, never the caller's pin. */
 extern void visibilitymap_read_end(VisibilityMapReadScope *scope);
 /* No content locks on entry; relation lifecycle lock retained. False clears

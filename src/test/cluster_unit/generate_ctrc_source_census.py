@@ -351,7 +351,7 @@ _classify_owners(
 _classify_owners(
     "CTRC_RECEIPT_LIFECYCLE",
     "src/backend/cluster/cluster_itl_touch.c",
-    ("itl_finish_flush_batch",),
+    ("itl_finish_discharge_batch",),
     "TERMINAL_PROJECTION_DISCHARGE",
     "CTRC_REF_HEAP_ITL_UBA",
     "CTRC_TARGET_EXACT_ITL_SLOT",
@@ -1051,7 +1051,7 @@ _classify_owners(
         "cluster_itl_xact_abort_finish",
         "cluster_itl_xact_precommit_finish",
         "cluster_itl_xact_subabort_finish",
-        "itl_finish_flush_batch",
+        "itl_finish_discharge_batch",
     ),
     "TERMINAL_PROJECTION_DISCHARGE",
     "CTRC_REF_HEAP_ITL_UBA",

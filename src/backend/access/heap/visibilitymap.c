@@ -133,7 +133,9 @@
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_page_cold_redo.h"
+#include "cluster/cluster_undo_horizon.h"
 #include "cluster/storage/cluster_smgr.h"
+#include "utils/snapmgr.h"
 #endif
 
 
@@ -1005,6 +1007,50 @@ visibilitymap_read_begin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf,
 	scope->locked_buffer = *vmbuf;
 	return true;
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/* Bind the caller's retained evaluator to a coherent VM observation. Admission
+ * is sampled before acquisition; the local identity check after acquisition
+ * neither resamples admission nor proves publication or skip permission. */
+bool
+visibilitymap_read_snapshot_begin(Relation rel, BlockNumber heapBlk, Snapshot snapshot,
+								  Buffer *vmbuf, VisibilityMapReadScope *scope, uint8 *status)
+{
+	ClusterSnapshotReadScopeV1 evaluation;
+	uint64 before = 0, after = 0;
+	volatile bool observed = false;
+
+	if (status != NULL)
+		*status = 0;
+	if (rel == NULL || vmbuf == NULL || scope == NULL || status == NULL
+		|| heapBlk == InvalidBlockNumber || BufferIsValid(scope->locked_buffer))
+		return false;
+	if (!cluster_heap_maintenance_restricted(rel))
+		return visibilitymap_read_begin(rel, heapBlk, vmbuf, scope, status);
+	if (snapshot == NULL)
+		return false;
+
+	cluster_snapshot_read_enter_v1(&evaluation, snapshot);
+	PG_TRY();
+	{
+		if (cluster_snapshot_cr_identity_v1(snapshot, &before)
+			&& cluster_undo_horizon_read_admission_enforce(evaluation.read_scn)
+			&& visibilitymap_read_begin(rel, heapBlk, vmbuf, scope, status)
+			&& cluster_snapshot_cr_identity_v1(snapshot, &after) && before == after)
+			observed = true;
+	}
+	PG_FINALLY();
+	{
+		cluster_snapshot_read_exit_v1(&evaluation);
+		if (!observed) {
+			*status = 0;
+			visibilitymap_read_end(scope);
+		}
+	}
+	PG_END_TRY();
+	return observed;
+}
+#endif
 
 /* Release only the scope's read lock; the caller still owns the pin. */
 void

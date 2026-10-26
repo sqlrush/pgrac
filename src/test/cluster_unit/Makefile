@@ -6361,6 +6361,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_vm_visible_body.inc test_cluster_vm_visible_log.inc
 	rm -f test_cluster_vm_visible_wrapper.inc test_cluster_vm_visible_empty.inc
 	rm -f test_cluster_vm_repair_versioned.inc
+	rm -f test_cluster_vm_snapshot_read.inc
 	rm -f test_cluster_vm_buffer_matches.inc test_cluster_vm_repair_clear.inc test_cluster_vm_repair_missing_heap.inc test_cluster_vm_repair_lpdead.inc
 	rm -f test_cluster_btree_build_writer.inc test_cluster_btree_build_state.inc \
 		test_cluster_btree_build_finish.inc test_cluster_btree_build_leaf.inc
@@ -11470,7 +11471,13 @@ test_cluster_snapshot_import_compare.inc: $(top_srcdir)/src/backend/access/trans
 		emit { print } emit && /^}$$/ { emit=0 } \
 		END { if (emit || starts != 1) exit 1 }' $< > $@
 
+# PGRAC: bind native snapshot admission to the exact VM observation entry.
+test_cluster_vm_snapshot_read.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
+	@awk '/^visibilitymap_read_snapshot_begin\(/ { print "#define FIXTURE_HAS_VM_SNAPSHOT_READER 1"; print "bool"; emit=1; found++ } \
+		emit { print } /^}$$/ { emit=0 } END { if (emit || found > 1) exit 1 }' $< > $@
+
 test_cluster_snapshot_admission: test_cluster_snapshot_admission.c unit_test.h \
+		test_cluster_vm_snapshot_read.inc $(top_srcdir)/src/include/access/visibilitymap.h \
 		test_cluster_snapshot_import_xmin.inc test_cluster_snapshot_import_compare.inc \
 		$(srcdir)/test_cluster_snapshot_import_fixture.inc \
 		$(srcdir)/test_cluster_snapshot_export_fixture.inc \
