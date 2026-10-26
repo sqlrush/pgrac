@@ -26,6 +26,8 @@ static uint64 send_epoch = 1, send_master_incarnation = 9;
 static TimestampTz send_now = 10;
 static bool send_stop, send_session = true;
 static int send_master = 2;
+static int send_route_unknown_after = -1, send_auth_unknown_after = -1;
+static bool send_auth_zero_after;
 static unsigned send_calls, send_admitted, send_nacks, send_returns, send_deferred, send_copies, send_releases;
 static bool send_notice_admit = true;
 static unsigned send_holder_offers, send_holder_handed;
@@ -80,7 +82,19 @@ static bool
 send_auth(int master, uint64 epoch, uint64 *session)
 {
 	*session = send_master_incarnation;
+	if (send_auth_unknown_after == 0) {
+		if (send_auth_zero_after) *session = 0;
+		return send_auth_zero_after;
+	}
+	if (send_auth_unknown_after > 0) send_auth_unknown_after--;
 	return send_session && master == send_master && epoch == send_epoch;
+}
+static int
+send_lookup_master(BufferTag tag pg_attribute_unused())
+{
+	if (send_route_unknown_after == 0) return -1;
+	if (send_route_unknown_after > 0) send_route_unknown_after--;
+	return send_master;
 }
 static void
 send_release(void *arg)
@@ -219,7 +233,7 @@ static struct {
 #define GetCurrentTimestamp() send_now
 #define cluster_epoch_get_current() send_epoch
 #define cluster_normal_stop_requested() send_stop
-#define cluster_gcs_lookup_master(tag) send_master
+#define cluster_gcs_lookup_master send_lookup_master
 #define cluster_membership_get_state(node) send_master_state
 #define gcs_block_pcm_x_authenticated_session send_auth
 #define cluster_block_io_trace_note(...) ((void)0)
@@ -294,6 +308,8 @@ send_setup(BufferDesc *buf, ClusterPcmOwnEntry *entry)
 	send_stop = false;
 	send_session = true;
 	send_master = 2;
+	send_route_unknown_after = send_auth_unknown_after = -1;
+	send_auth_zero_after = false;
 	send_borrowed = send_downgrade = send_copy_failure = false;
 	send_cancel_check = true;
 	send_result = CLUSTER_IC_SEND_NOT_ADMITTED;
@@ -461,8 +477,15 @@ UT_TEST(retained_reply_checks_terminal_identity_and_stop_before_reoffer)
 		send_tick();
 		UT_ASSERT_EQ(send_calls, 1);
 		UT_ASSERT_EQ(send_admitted, 0);
-		UT_ASSERT_EQ(send_owned(), 0);
-		UT_ASSERT_EQ(send_nacks, 1);
+		UT_ASSERT_EQ(send_owned(), reason == 3);
+		UT_ASSERT_EQ(send_nacks, reason != 3);
+		if (reason == 3) {
+			send_session = true;
+			send_tick();
+			UT_ASSERT_EQ(send_owned(), 0);
+			UT_ASSERT_EQ(send_admitted, 1);
+			UT_ASSERT_EQ(send_nacks, 0);
+		}
 	}
 	ClusterPcmOwnArray = saved;
 }
@@ -912,10 +935,251 @@ UT_TEST(holder_callback_cannot_mint_unreserved_service_or_repeat_after_handoff)
 	ClusterPcmOwnArray = saved;
 }
 
+static void
+send_unknown_identity(int reason)
+{
+	if (reason == 0) send_master = -1;
+	if (reason == 1) send_session = false;
+	if (reason == 2) send_master_incarnation = 0;
+}
+
+static void
+send_restore_identity(void)
+{
+	send_master = 2;
+	send_session = true;
+	send_master_incarnation = 9;
+	send_route_unknown_after = send_auth_unknown_after = -1;
+}
+
+/* A lookup/authentication gap must not clear bytes or manufacture a NACK.
+ * Only the external identity query and actual transport outcome are faked. */
+UT_TEST(saved_reply_survives_unknown_master_identity_until_original_session_returns)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	for (int reason = 0; reason < 3; reason++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		GcsBlockFirstFillForwardPayload fwd = send_setup(&buf, &entry);
+		GcsFirstFillHolderPark original;
+		send_forward(&fwd);
+		original = gcs_first_fill_holder_parks[0];
+		buf.tag.blockNum++;
+		pg_atomic_fetch_add_u64(&entry.generation, 10);
+		send_unknown_identity(reason);
+		send_now += 10000000;
+		send_result = CLUSTER_IC_SEND_DONE;
+		for (int i = 0; i < 10; i++) send_tick();
+		UT_ASSERT_EQ(send_owned(), 1);
+		UT_ASSERT_EQ(send_calls, 1);
+		UT_ASSERT_EQ(send_nacks + send_returns, 0);
+		UT_ASSERT_EQ(gcs_first_fill_holder_parks[0].reply_size, original.reply_size);
+		UT_ASSERT(memcmp(gcs_first_fill_holder_parks[0].reply, original.reply, original.reply_size) == 0);
+		UT_ASSERT(memcmp(&gcs_first_fill_holder_parks[0].forward, &fwd, sizeof(fwd)) == 0);
+		send_restore_identity();
+		send_tick();
+		UT_ASSERT_EQ(send_owned(), 0);
+		UT_ASSERT_EQ(send_admitted, 1);
+		UT_ASSERT_EQ(send_calls, 2);
+		UT_ASSERT_EQ(send_copies, 1);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(completed_write_keeps_original_wait_during_unknown_master_identity)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	for (int reason = 0; reason < 3; reason++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		GcsBlockFirstFillForwardPayload fwd = send_setup(&buf, &entry);
+		ClusterPcmFirstFillWait original;
+		pg_atomic_fetch_or_u32(&buf.state, BM_IO_IN_PROGRESS);
+		pg_atomic_write_u64(&entry.write_io_generation, 1);
+		send_forward(&fwd);
+		original = gcs_first_fill_holder_parks[0].wait;
+		pg_atomic_fetch_and_u32(&buf.state, ~BM_IO_IN_PROGRESS);
+		pg_atomic_write_u64(&entry.write_io_generation, 2);
+		send_unknown_identity(reason);
+		for (int i = 0; i < 10; i++) send_tick();
+		UT_ASSERT_EQ(send_owned(), 1);
+		UT_ASSERT_EQ(send_calls + send_copies + send_nacks + send_returns, 0);
+		UT_ASSERT(memcmp(&gcs_first_fill_holder_parks[0].wait, &original, sizeof(original)) == 0);
+		send_restore_identity();
+		send_result = CLUSTER_IC_SEND_DONE;
+		send_tick();
+		UT_ASSERT_EQ(send_admitted, 1);
+		UT_ASSERT_EQ(send_copies, 1);
+		UT_ASSERT_EQ(send_owned(), 0);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(admitted_image_keeps_unsent_holder_notice_during_unknown_identity)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	for (int reason = 0; reason < 3; reason++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		GcsBlockFirstFillForwardPayload fwd = send_x_fixture(&buf, &entry);
+		unsigned offers;
+		send_result = CLUSTER_IC_SEND_DONE;
+		send_forward(&fwd);
+		offers = send_holder_offers;
+		send_unknown_identity(reason);
+		send_notice_admit = true;
+		for (int i = 0; i < 10; i++) send_tick();
+		UT_ASSERT_EQ(send_owned(), 1);
+		UT_ASSERT_EQ(send_holder_offers, offers);
+		UT_ASSERT_EQ(send_calls, 1);
+		UT_ASSERT_EQ(send_nacks + send_returns, 0);
+		send_restore_identity();
+		send_tick();
+		UT_ASSERT_EQ(send_holder_handed, 1);
+		UT_ASSERT_EQ(send_owned(), 0);
+		UT_ASSERT_EQ(send_calls, 1);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(quiet_return_keeps_exact_consumption_receipt_during_unknown_identity)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	for (int reason = 0; reason < 3; reason++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		GcsBlockFirstFillForwardPayload fwd = send_setup(&buf, &entry);
+		ClusterPcmReadGrant service;
+		GcsBlockDonePayload done = {0};
+		send_copy_failure = true;
+		send_forward(&fwd);
+		UT_ASSERT_EQ(send_returns, 1);
+		send_unknown_identity(reason);
+		send_now += 10000000;
+		for (int i = 0; i < 10; i++) send_tick();
+		UT_ASSERT_EQ(send_owned(), 1);
+		UT_ASSERT_EQ(send_returns, 1);
+		UT_ASSERT_EQ(send_nacks + send_calls, 0);
+		send_restore_identity();
+		UT_ASSERT(GcsBlockFirstFillForwardPayloadGrant(&fwd, cluster_node_id, &service));
+		done.request_id = 71; done.epoch = 1; done.tag = fwd.forward.tag;
+		done.sender_node = 2; done.requester_backend_id = 3;
+		done.transition_id = PCM_TRANS_N_TO_S;
+		done.reserved_0[0] = GCS_BLOCK_DONE_PENDING_S_RETURNED;
+		done.reserved_0[1] = 1;
+		GcsBlockDonePayloadSetPendingSService(&done, &service);
+		UT_ASSERT(gcs_first_fill_holder_returned(&done, 9));
+		UT_ASSERT_EQ(send_owned(), 0);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(terminal_nack_waits_for_known_original_master_before_handoff)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	for (int reason = 0; reason < 3; reason++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		GcsBlockFirstFillForwardPayload fwd = send_setup(&buf, &entry);
+		send_result = CLUSTER_IC_SEND_HARD_ERROR;
+		send_notice_admit = false;
+		send_forward(&fwd);
+		UT_ASSERT_EQ(send_nacks, 1);
+		send_unknown_identity(reason);
+		send_notice_admit = true;
+		for (int i = 0; i < 10; i++) send_tick();
+		UT_ASSERT_EQ(send_owned(), 1);
+		UT_ASSERT_EQ(send_nacks, 1);
+		send_restore_identity();
+		send_tick();
+		UT_ASSERT_EQ(send_owned(), 0);
+		UT_ASSERT_EQ(send_nacks, 2);
+		UT_ASSERT_EQ(send_calls, 1);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(quiet_return_retires_on_committed_master_death_without_session_recovery)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	for (int reason = 0; reason < 2; reason++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		GcsBlockFirstFillForwardPayload fwd = send_setup(&buf, &entry);
+		send_copy_failure = true;
+		send_forward(&fwd);
+		send_session = false;
+		send_master_state = reason == 0 ? CLUSTER_MEMBER_DEAD : CLUSTER_MEMBER_REMOVED;
+		send_tick();
+		UT_ASSERT_EQ(send_owned(), 0);
+		UT_ASSERT_EQ(send_returns, 1);
+		UT_ASSERT_EQ(send_nacks + send_calls, 0);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(unproven_ingress_master_identity_keeps_the_original_carrier)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	for (int reason = 0; reason < 3; reason++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		GcsBlockFirstFillForwardPayload fwd = send_setup(&buf, &entry);
+		send_unknown_identity(reason);
+		send_forward(&fwd);
+		UT_ASSERT_EQ(send_deferred, 1);
+		UT_ASSERT_EQ(send_owned() + send_copies + send_calls + send_nacks, 0);
+		send_restore_identity();
+		send_result = CLUSTER_IC_SEND_DONE;
+		send_forward(&fwd); /* Redispatch the same retained carrier, no new REQUEST. */
+		UT_ASSERT_EQ(send_deferred, 1);
+		UT_ASSERT_EQ(send_admitted, 1);
+		UT_ASSERT_EQ(send_owned(), 0);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(resumption_identity_race_keeps_local_owner_without_deferring_a_fake_carrier)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	for (int reason = 0; reason < 3; reason++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		GcsBlockFirstFillForwardPayload fwd = send_setup(&buf, &entry);
+		pg_atomic_fetch_or_u32(&buf.state, BM_IO_IN_PROGRESS);
+		pg_atomic_write_u64(&entry.write_io_generation, 1);
+		send_forward(&fwd);
+		pg_atomic_fetch_and_u32(&buf.state, ~BM_IO_IN_PROGRESS);
+		pg_atomic_write_u64(&entry.write_io_generation, 2);
+		if (reason == 0) send_route_unknown_after = 1;
+		else {
+			send_auth_unknown_after = 1;
+			send_auth_zero_after = reason == 2;
+		}
+		send_tick(); /* Identity becomes unknown between tick proof and real handler. */
+		UT_ASSERT_EQ(send_owned(), 1);
+		UT_ASSERT_EQ(send_deferred + send_copies + send_calls + send_nacks + send_returns, 0);
+		send_restore_identity();
+		send_result = CLUSTER_IC_SEND_DONE;
+		send_tick();
+		UT_ASSERT_EQ(send_admitted, 1);
+		UT_ASSERT_EQ(send_owned(), 0);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(29);
+	UT_RUN(saved_reply_survives_unknown_master_identity_until_original_session_returns);
+	UT_RUN(completed_write_keeps_original_wait_during_unknown_master_identity);
+	UT_RUN(admitted_image_keeps_unsent_holder_notice_during_unknown_identity);
+	UT_RUN(quiet_return_keeps_exact_consumption_receipt_during_unknown_identity);
+	UT_RUN(terminal_nack_waits_for_known_original_master_before_handoff);
+	UT_RUN(quiet_return_retires_on_committed_master_death_without_session_recovery);
+	UT_RUN(unproven_ingress_master_identity_keeps_the_original_carrier);
+	UT_RUN(resumption_identity_race_keeps_local_owner_without_deferring_a_fake_carrier);
 	UT_RUN(holder_notice_refusal_preserves_image_and_exact_notification_independently);
 	UT_RUN(holder_notice_unknown_session_waits_without_cancel_or_image_replay);
 	UT_RUN(holder_notice_ends_on_proved_master_reconfiguration_only);
