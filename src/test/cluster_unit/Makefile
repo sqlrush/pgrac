@@ -2808,6 +2808,33 @@ test_cluster_heap_ctrc_certificate.inc: $(top_srcdir)/src/backend/cluster/cluste
 	mv $@.tmp $@
 
 # Original nonempty ACK producer, actual two captures/hash/final freeze and cleanup.
+# Exact original G lock-split/required-ACK helpers, separate from the core counts.
+# An older source emits nothing only when each helper name is entirely absent.
+test_cluster_heap_ctrc_g_scan_relock.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk '/(^|[^[:alnum:]_])ctrc_scan_participant_relock([^[:alnum:]_]|$$)/ { references++ } \
+	     /^#define CTRC_CLEANER_SCAN_LOCK_BATCH / { constant=$$0; constants++ } \
+	     /^ctrc_scan_participant_relock\(/ { ret=prev; sub(/^static[ \t]+/, "", ret); candidate=1; head=1; text=""; decl="" } \
+	     candidate { text=text $$0 "\n"; if (/^\{/) { head=0; if (found++) exit 1 } else if (head) { decl=decl $$0 "\n"; if (/;[ \t]*$$/) candidate=0 } } \
+	     candidate && /^}/ { candidate=0; body=text; signature=decl; return_type=ret; done++ } { prev=$$0 } \
+	     END { if (candidate || found != done || (references == 0 ? found != 0 : found != 1) || (found != 0 && constants != 1)) exit 1; if (found) print constant "\nstatic " return_type "\n" body }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_ctrc_g_required_ack_decl.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk '/(^|[^[:alnum:]_])ctrc_origin_required_ack_snapshot_entry([^[:alnum:]_]|$$)/ { references++ } \
+	     /^ctrc_origin_required_ack_snapshot_entry\(/ { ret=prev; sub(/^static[ \t]+/, "", ret); candidate=1; head=1; text=""; decl="" } \
+	     candidate { text=text $$0 "\n"; if (/^\{/) { head=0; if (found++) exit 1 } else if (head) { decl=decl $$0 "\n"; if (/;[ \t]*$$/) candidate=0 } } \
+	     candidate && /^}/ { candidate=0; body=text; signature=decl; return_type=ret; done++ } { prev=$$0 } \
+	     END { if (candidate || found != done || (references == 0 ? found != 0 : found != 1)) exit 1; if (found) { sub(/\n$$/, "", signature); print "static " return_type "\n" signature ";" } }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_ctrc_g_required_ack_body.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk '/(^|[^[:alnum:]_])ctrc_origin_required_ack_snapshot_entry([^[:alnum:]_]|$$)/ { references++ } \
+	     /^ctrc_origin_required_ack_snapshot_entry\(/ { ret=prev; sub(/^static[ \t]+/, "", ret); candidate=1; head=1; text=""; decl="" } \
+	     candidate { text=text $$0 "\n"; if (/^\{/) { head=0; if (found++) exit 1 } else if (head) { decl=decl $$0 "\n"; if (/;[ \t]*$$/) candidate=0 } } \
+	     candidate && /^}/ { candidate=0; body=text; signature=decl; return_type=ret; done++ } { prev=$$0 } \
+	     END { if (candidate || found != done || (references == 0 ? found != 0 : found != 1)) exit 1; if (found) print "static " return_type "\n" body }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_ctrc_ack.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
 	@awk 'BEGIN { pattern = "^(ctrc_tlv_bytes|ctrc_tlv_u8|ctrc_tlv_u16|ctrc_tlv_u32|ctrc_tlv_u64|ctrc_publication_id_encode|ctrc_target_encode|ctrc_cleaner_owns_key|ctrc_scan_limit|ctrc_scan_charge|ctrc_participant_scan_lock_mask|ctrc_receipt_snapshot_valid|ctrc_receipt_row_encode|ctrc_receipt_key_sequence_cmp|ctrc_receipt_durability_covered|cluster_ctrc_participant_ack_from_snapshot|ctrc_participant_find_ack_ready|ctrc_participant_capture_durability|ctrc_ack_batch_inputs|ctrc_ack_participant_exact|ctrc_ack_block_if_same|ctrc_ack_work_find|ctrc_participant_copy_ack_batch|ctrc_participant_freeze_ack_batch_exact|ctrc_participant_freeze_ack_batch_shared)\\(" } \
 	     /^#define (CTRC_CLEANER_ACK_BATCH|CTRC_PARTICIPANT_ALL_SHARDS) / { print; constants++ } \
@@ -2902,8 +2929,11 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		$(top_srcdir)/src/include/access/generic_xlog.h \
 		$(top_srcdir)/src/include/cluster/cluster_itl.h \
 		test_cluster_heap_ctrc_certificate.inc $(top_srcdir)/src/include/port/pg_crc32c.h \
+		test_cluster_heap_ctrc_g_scan_relock.inc \
 		test_cluster_heap_ctrc_ack.inc $(top_srcdir)/src/common/sha2_int.h \
 		test_cluster_heap_ctrc_origin_reply.inc \
+		test_cluster_heap_ctrc_g_required_ack_decl.inc \
+		test_cluster_heap_ctrc_g_required_ack_body.inc \
 		test_cluster_heap_ctrc_origin_reply_trace_types.inc \
 		test_cluster_heap_ctrc_durable_certificate.inc \
 		$(top_srcdir)/src/include/utils/memutils.h \
@@ -6362,6 +6392,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_vm_visible_wrapper.inc test_cluster_vm_visible_empty.inc
 	rm -f test_cluster_vm_repair_versioned.inc
 	rm -f test_cluster_vm_snapshot_read.inc
+	rm -f test_cluster_vm_native_chain.inc
 	rm -f test_cluster_vm_buffer_matches.inc test_cluster_vm_repair_clear.inc test_cluster_vm_repair_missing_heap.inc test_cluster_vm_repair_lpdead.inc
 	rm -f test_cluster_btree_build_writer.inc test_cluster_btree_build_state.inc \
 		test_cluster_btree_build_finish.inc test_cluster_btree_build_leaf.inc
@@ -6405,8 +6436,11 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_private_ref.inc test_cluster_heap_private_ref.inc.tmp
 	rm -f test_cluster_heap_resource_owner.inc test_cluster_heap_resource_owner.inc.tmp
 	rm -f test_cluster_heap_ctrc_certificate.inc test_cluster_heap_ctrc_certificate.inc.tmp
+	rm -f test_cluster_heap_ctrc_g_scan_relock.inc test_cluster_heap_ctrc_g_scan_relock.inc.tmp
 	rm -f test_cluster_heap_ctrc_ack.inc test_cluster_heap_ctrc_ack.inc.tmp
 	rm -f test_cluster_heap_ctrc_origin_reply.inc test_cluster_heap_ctrc_origin_reply.inc.tmp
+	rm -f test_cluster_heap_ctrc_g_required_ack_decl.inc test_cluster_heap_ctrc_g_required_ack_decl.inc.tmp
+	rm -f test_cluster_heap_ctrc_g_required_ack_body.inc test_cluster_heap_ctrc_g_required_ack_body.inc.tmp
 	rm -f test_cluster_heap_ctrc_origin_reply_trace_types.inc test_cluster_heap_ctrc_origin_reply_trace_types.inc.tmp
 	rm -f test_cluster_heap_ctrc_durable_certificate.inc test_cluster_heap_ctrc_durable_certificate.inc.tmp
 	rm -f test_cluster_heap_ctrc_attachment.inc test_cluster_heap_ctrc_attachment.inc.tmp
@@ -11471,13 +11505,24 @@ test_cluster_snapshot_import_compare.inc: $(top_srcdir)/src/backend/access/trans
 		emit { print } emit && /^}$$/ { emit=0 } \
 		END { if (emit || starts != 1) exit 1 }' $< > $@
 
+# PGRAC: compose the native evaluator with the original coherent VM reader.
+test_cluster_vm_native_chain.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
+	@awk '/^#define (MAPSIZE|HEAPBLOCKS_PER_BYTE|HEAPBLOCKS_PER_PAGE|HEAPBLK_TO_MAPBLOCK\(x\)|HEAPBLK_TO_MAPBYTE\(x\)|HEAPBLK_TO_OFFSET\(x\)) / { print; macros++ } \
+		/^vm_buffer_matches\(/ || /^vm_redo_page_valid\(/ { print "static bool"; emit=1; found++ } \
+		/^vm_readbuf\(/ { print "static Buffer"; emit=1; found++ } \
+		/^visibilitymap_get_status\(/ { print "uint8"; emit=1; found++ } \
+		/^visibilitymap_get_status_pinned\(/ || /^visibilitymap_read_begin\(/ { print "bool"; emit=1; found++ } \
+		/^visibilitymap_read_end\(/ { print "void"; emit=1; found++ } \
+		emit { print } /^}$$/ { emit=0 } END { if (emit || found != 7 || macros != 6) exit 1 }' $< > $@
+
 # PGRAC: bind native snapshot admission to the exact VM observation entry.
 test_cluster_vm_snapshot_read.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
 	@awk '/^visibilitymap_read_snapshot_begin\(/ { print "#define FIXTURE_HAS_VM_SNAPSHOT_READER 1"; print "bool"; emit=1; found++ } \
 		emit { print } /^}$$/ { emit=0 } END { if (emit || found > 1) exit 1 }' $< > $@
 
 test_cluster_snapshot_admission: test_cluster_snapshot_admission.c unit_test.h \
-		test_cluster_vm_snapshot_read.inc $(top_srcdir)/src/include/access/visibilitymap.h \
+		test_cluster_vm_snapshot_read.inc test_cluster_vm_native_chain.inc \
+		$(top_srcdir)/src/include/access/visibilitymap.h \
 		test_cluster_snapshot_import_xmin.inc test_cluster_snapshot_import_compare.inc \
 		$(srcdir)/test_cluster_snapshot_import_fixture.inc \
 		$(srcdir)/test_cluster_snapshot_export_fixture.inc \
