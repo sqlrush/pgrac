@@ -67,6 +67,24 @@ SHOW cluster.trace_tx_identity;
 跳过的 TARGET 槽数，`omitted` 是未逐条输出的唤醒接收者数。出现 LIMIT 或 omitted 时保留
 证据缺口；没有某条记录也不能证明对应事件未发生。请与配置、二进制身份和原始节点日志一起保存。
 
+## `cluster.trace_gcs_capacity`
+
+布尔参数，默认 `off`，超级用户可设置。需同时启用 `cluster.trace_tx_identity`。
+采集首个连接的容量等待时，在所有参与节点启动前配置两个开关，并在各节点网络命名空间内，
+用 `src/test/cluster_tap/pre2/wait_graph_capture.py` 的 `DeadlineReceiver` 监听
+`127.0.0.1` 上与该节点 TCP 端口同号的 UDP 端口；此入口不需要 SQL 连接。
+
+每进程最多导出八次 `PGRAC_WAIT_GCS_BEGIN/SLOT/SCAN/END` 快照，按
+`node/observer/capture/sequence` 分组。`SLOT` 包含原八槽完整 request/epoch/tag、
+source key 和 first-fill 退休字段；`SCAN` 是经原生进程代际校验的最后一次已完成扫描，
+含真实 worker/count、原始 cursor 区间、容量及扫描开始时间。`BEGIN.sampled_at`
+是释放原槽锁后的导出时间；`site=capacity_before_sleep` 表示原容量检查失败后即将等待。
+
+快照不是跨进程原子等待图，槽内 receipt owner 不能直接当作远端 PCM holder。
+缺行、无 END、`dropped` 非零或 busy/changed/dead 的发布者保留 UNKNOWN。
+接收端 `complete` 只验证数据报流。此参数不改变等待、准入、调度、超时或停机行为；
+真实停机的 `PGRAC_WAIT_DEADLINE_*` 仍单独分组。
+
 ## `cluster.adg_rfs_conninfos`
 
 | 属性 | 值 |

@@ -38,6 +38,27 @@ static GcsBlockInvalidateAckPayload retire_ack;
 static bool retire_session = true, retire_cancel;
 static void (*retire_on_wait)(void);
 static ClusterPcmReadSource retire_wait_source;
+bool cluster_trace_gcs_capacity;
+static unsigned retire_trace_cuts, retire_trace_scans, retire_lock_depth;
+#ifdef CLUSTER_CONTENT_TRACE_GCS_SLOTS
+static ClusterContentTraceGcsCapacity retire_trace_cut;
+void
+cluster_content_trace_gcs_capacity(const ClusterContentTraceGcsCapacity *value)
+{
+	UT_ASSERT_EQ(retire_lock_depth, 0);
+	retire_trace_cut = *value; retire_trace_cuts++;
+}
+void
+cluster_content_trace_gcs_scan(int worker, int workers, uint64 begin, uint64 end,
+	uint64 cap, int64 sampled_at)
+{
+	UT_ASSERT_EQ(retire_lock_depth, 0);
+	UT_ASSERT_EQ(worker, 0); UT_ASSERT_EQ(workers, 1);
+	UT_ASSERT_EQ(end - begin, 8); UT_ASSERT_EQ(cap, 8);
+	UT_ASSERT_EQ(sampled_at, retire_now);
+	retire_trace_scans++;
+}
+#endif
 #define ClusterGcsBlock (&retire_shared)
 #define MaxBackends 1
 #define MyBackendId retire_backend
@@ -54,8 +75,8 @@ static ClusterPcmReadSource retire_wait_source;
 #define cluster_sf_peer_supports_gcs_done(node) true
 #define cluster_injection_should_skip(name) false
 #define GetCurrentTimestamp() retire_now
-#define LWLockAcquire(lock, mode) ((void)0)
-#define LWLockRelease(lock) ((void)0)
+#define LWLockAcquire(lock, mode) (++retire_lock_depth)
+#define LWLockRelease(lock) (--retire_lock_depth)
 #define LockBufHdr transition_lock_header
 #define ConditionVariablePrepareToSleep(cv) ((void)0)
 #define ConditionVariableCancelSleep() ((void)0)
@@ -178,6 +199,8 @@ retire_reset(BufferDesc *buf, ClusterPcmOwnEntry *entry, bool fresh)
 	retire_session = true; retire_cancel = false; retire_on_wait = NULL;
 	retire_confirm_admit = false;
 	retire_confirm_sends = retire_confirm_handed = retire_worker_wakes = 0;
+	cluster_trace_gcs_capacity = cluster_trace_tx_identity = false;
+	retire_trace_cuts = retire_trace_scans = retire_lock_depth = 0;
 	retire_master_state = CLUSTER_MEMBER_MEMBER;
 	memset(&retire_confirm, 0, sizeof(retire_confirm));
 	memset(&retire_shared, 0, sizeof(retire_shared));
@@ -396,6 +419,46 @@ UT_TEST(test_never_admitted_cancel_needs_no_remote_receipt)
 	UT_ASSERT(!a.pending_s); UT_ASSERT(!retire_blocks[0].slots[0].in_use);
 	UT_ASSERT_EQ(retire_trace_published, 0); UT_ASSERT_EQ(retire_sends, 0);
 }
+
+UT_TEST(test_capacity_observer_copies_original_full_source_keys_without_holding_lock)
+{
+#ifdef CLUSTER_CONTENT_TRACE_GCS_SLOTS
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmReadSource a;
+	uint64 id;
+	retire_reset(&buf, &entry, true);
+	for (int i = 0; i < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; i++) {
+		GcsBlockInvalidatePayload inv;
+		a = retire_arm(&buf, true); retire_abort(&buf, &a);
+		inv = retire_invalidate(&a); retire_result = CLUSTER_IC_SEND_DONE;
+		UT_ASSERT(gcs_block_invalidate_execute(&inv));
+		UT_ASSERT(gcs_first_fill_retry_progress(&a, true));
+	}
+	cluster_trace_gcs_capacity = cluster_trace_tx_identity = true;
+	retire_wait_source = a; retire_on_wait = retire_free_after_two;
+	(void)gcs_block_reserve_slot(buf.tag, PCM_TRANS_N_TO_S, 2, &id, true);
+	UT_ASSERT_EQ(retire_trace_cuts, 2); UT_ASSERT_EQ(retire_sleeps, 2);
+	UT_ASSERT_EQ(retire_trace_cut.nslots, 8); UT_ASSERT_EQ(retire_trace_cut.max_backends, 1);
+	for (unsigned i = 0; i < retire_trace_cut.nslots; i++) {
+		const ClusterContentTraceGcsSlot *s = &retire_trace_cut.slots[i];
+		UT_ASSERT(s->in_use && s->armed && s->quiet && s->ack_handed);
+		UT_ASSERT_EQ(s->owner_pid, 71); UT_ASSERT_EQ(s->backend_incarnation, 700);
+		UT_ASSERT_EQ(s->request_id, s->source.request_id);
+		UT_ASSERT_EQ(s->request_epoch, s->source.request_epoch);
+		UT_ASSERT_EQ(s->expected_master_node, s->source.master_node);
+		UT_ASSERT(BufferTagsEqual(&s->tag, &s->source.tag));
+	}
+	/* Original native ACK freed the last slot. The exported cut is owned. */
+	UT_ASSERT(retire_trace_cut.slots[7].quiet);
+	UT_ASSERT(!retire_blocks[0].slots[7].first_fill.quiet);
+	gcs_first_fill_receipt_tick(0);
+	UT_ASSERT_EQ(retire_trace_scans, 1);
+	cluster_trace_gcs_capacity = false;
+	gcs_first_fill_receipt_tick(0);
+	UT_ASSERT_EQ(retire_trace_scans, 1);
+#else
+	UT_ASSERT(false); /* Parent has no observation at the native capacity site. */
+#endif
+}
 UT_TEST(test_exit_preserves_quiet_debt_and_reused_backend_cannot_take_it)
 {
 	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmReadSource a;
@@ -609,7 +672,8 @@ UT_TEST(test_repeated_installed_confirmations_return_original_bounded_slots)
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(19);
+	UT_RUN(test_capacity_observer_copies_original_full_source_keys_without_holding_lock);
 	UT_RUN(test_installed_confirm_refusal_keeps_original_owner_until_real_handoff);
 	UT_RUN(test_installed_confirm_survives_exit_and_never_reads_successor_buffer);
 	UT_RUN(test_installed_confirm_waits_for_unknown_session_but_retires_on_proved_reconfiguration);

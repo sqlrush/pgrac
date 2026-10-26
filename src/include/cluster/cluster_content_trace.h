@@ -12,11 +12,46 @@
 #include "cluster/cluster_wait_trace.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_pcm_read_source.h"
 #define CLUSTER_CONTENT_TRACE_LOCKS 32
 #define CLUSTER_CONTENT_TRACE_GRANTS 32
 #define CLUSTER_CONTENT_TRACE_OWNERS 8
 #define CLUSTER_CONTENT_TRACE_PAIR_CYCLES 4
 #define CLUSTER_CONTENT_TRACE_PAIR_REQUESTS 2
+#define CLUSTER_CONTENT_TRACE_GCS_SLOTS 8
+
+/* Owned scalar copy from the original full requester table. No page bytes,
+ * pointers, authority, or inference about a remote PCM holder. */
+typedef struct ClusterContentTraceGcsSlot {
+	BufferTag tag;
+	uint64 request_id, request_epoch;
+	int32 master_node, expected_master_node;
+	uint8 transition_id, reply_domain;
+	bool in_use, reply_received, stale, first_fill_revoked;
+	ClusterPcmReadSource source;
+	int64 retry_at;
+	int32 buf_id, owner_pid;
+	uint64 backend_incarnation, master_session;
+	bool armed, delivery_closed, request_admitted, quiet;
+	bool ack_ready, ack_handed, ack_consumed, confirm_pending, progress_waiter;
+} ClusterContentTraceGcsSlot;
+
+typedef struct ClusterContentTraceGcsCapacity {
+	BufferTag tag;
+	uint8 transition_id;
+	int32 master_node;
+	uint32 nslots, max_backends;
+	int64 sampled_at;
+	ClusterContentTraceGcsSlot slots[CLUSTER_CONTENT_TRACE_GCS_SLOTS];
+} ClusterContentTraceGcsCapacity;
+
+/* Last completed original scan, not a promise of progress or a deadline. */
+typedef struct ClusterContentTraceGcsScan {
+	bool active;
+	int32 worker, workers;
+	uint64 begin, end, cap;
+	int64 sampled_at;
+} ClusterContentTraceGcsScan;
 
 typedef enum ClusterContentTracePairPhase {
 	CLPAIR_FIRST, CLPAIR_CONDITIONAL_SECOND, CLPAIR_RESOLVE_SECOND, CLPAIR_DONE
@@ -132,6 +167,7 @@ typedef struct ClusterContentTraceOwner {
 	ClusterWaitTrace waits[CLCONTENT_NWAITS];
 	uint64 wait_lifetimes[CLCONTENT_NWAITS], service_lifetime;
 	ClusterWaitTrace pcm_service;
+	ClusterContentTraceGcsScan gcs_scan;
 } ClusterContentTraceOwner;
 
 /* A non-atomic, bounded cut. busy/changed/dead/omitted mean UNKNOWN, never
@@ -208,6 +244,10 @@ extern void cluster_content_trace_service_end(ClusterContentTraceServiceScope *s
 extern void cluster_content_trace_error_cleanup(void);
 /* Failure-path, default-off, allocation/lock-free native process census. */
 extern void cluster_content_trace_deadline_dump(uint32 reason);
+/* Default-off startup observation; callers have released original GCS locks. */
+extern void cluster_content_trace_gcs_capacity(const ClusterContentTraceGcsCapacity *cut);
+extern void cluster_content_trace_gcs_scan(int worker, int workers, uint64 begin,
+	uint64 end, uint64 cap, int64 sampled_at);
 extern void cluster_content_trace_pair(Buffer target, bool missed);
 extern void cluster_content_trace_pair_begin(Buffer first, Buffer second);
 extern void cluster_content_trace_pair_cycle(void);

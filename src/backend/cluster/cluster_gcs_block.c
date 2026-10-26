@@ -1030,6 +1030,11 @@ gcs_block_reserve_slot(BufferTag tag, uint8 transition_id, int32 master_node,
 	ClusterGcsBlockOutstandingSlot *slot = NULL;
 	int i;
 	uint64 epoch = cluster_epoch_get_current();
+	ClusterContentTraceGcsCapacity trace_cut;
+	bool trace_capacity = cluster_trace_tx_identity && cluster_trace_gcs_capacity;
+
+	StaticAssertStmt(MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND == CLUSTER_CONTENT_TRACE_GCS_SLOTS,
+		"GCS capacity observation must cover the original table");
 
 	for (;;) {
 		if (local_wait)
@@ -1086,6 +1091,32 @@ gcs_block_reserve_slot(BufferTag tag, uint8 transition_id, int32 master_node,
 				break;
 			}
 		}
+		if (slot == NULL && local_wait && trace_capacity) {
+			memset(&trace_cut, 0, sizeof(trace_cut));
+			trace_cut.tag = tag;
+			trace_cut.transition_id = transition_id;
+			trace_cut.master_node = master_node;
+			trace_cut.nslots = MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND;
+			trace_cut.max_backends = MaxBackends;
+			for (i = 0; i < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; i++) {
+				const ClusterGcsBlockOutstandingSlot *s = &blk->slots[i];
+				const GcsFirstFillReceipt *f = &s->first_fill;
+				ClusterContentTraceGcsSlot *d = &trace_cut.slots[i];
+				d->tag = s->tag; d->request_id = s->request_id;
+				d->request_epoch = s->request_epoch;
+				d->master_node = s->master_node; d->expected_master_node = s->expected_master_node;
+				d->transition_id = s->transition_id; d->reply_domain = s->reply_domain;
+				d->in_use = s->in_use; d->reply_received = s->reply_received;
+				d->stale = s->stale; d->first_fill_revoked = s->first_fill_revoked;
+				d->source = f->source; d->retry_at = f->retry_at; d->buf_id = f->buf_id;
+				d->owner_pid = f->owner_pid; d->backend_incarnation = f->backend_incarnation;
+				d->master_session = f->master_session; d->armed = f->armed;
+				d->delivery_closed = f->delivery_closed; d->request_admitted = f->request_admitted;
+				d->quiet = f->quiet; d->ack_ready = f->ack_ready; d->ack_handed = f->ack_handed;
+				d->ack_consumed = f->ack_consumed; d->confirm_pending = f->confirm_pending;
+				d->progress_waiter = f->progress_waiter;
+			}
+		}
 		LWLockRelease(&blk->lock.lock);
 
 		if (slot != NULL || !local_wait)
@@ -1095,6 +1126,10 @@ gcs_block_reserve_slot(BufferTag tag, uint8 transition_id, int32 master_node,
 			ConditionVariableCancelSleep();
 			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
 				errmsg("first-fill capacity wait crossed membership")));
+		}
+		if (trace_capacity) {
+			trace_cut.sampled_at = GetCurrentTimestamp();
+			cluster_content_trace_gcs_capacity(&trace_cut);
 		}
 		(void)ConditionVariableTimedSleep(&blk->capacity_cv, 1000L, WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
 		ConditionVariableCancelSleep();
@@ -3591,6 +3626,7 @@ static void
 gcs_first_fill_receipt_tick(int worker)
 {
 	static uint64 cursor;
+	uint64 trace_begin = cursor;
 	uint64 cap = (uint64)MaxBackends * MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND;
 	TimestampTz now = GetCurrentTimestamp();
 	if (gcs_block_backend_blocks == NULL || cap == 0 || worker < 0)
@@ -3650,6 +3686,8 @@ gcs_first_fill_receipt_tick(int worker)
 		else if (nack)
 			(void)gcs_block_pending_s_notify_action(&key, master, GCS_BLOCK_DONE_PENDING_S_NACK);
 	}
+	if (cluster_trace_tx_identity && cluster_trace_gcs_capacity)
+		cluster_content_trace_gcs_scan(worker, cluster_lms_workers, trace_begin, cursor, cap, now);
 }
 
 static ClusterPcmReadGrantKey
