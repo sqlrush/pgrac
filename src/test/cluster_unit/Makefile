@@ -6156,6 +6156,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_external_fence_duty.inc
 	rm -f test_cluster_resolver_cache_caller.inc test_cluster_resolver_cache_caller.inc.tmp
 	rm -f test_cluster_relation_size.inc
+	rm -f test_cluster_first_fill_hot_block.inc test_cluster_first_fill_hot_block.inc.tmp
 	rm -f test_cluster_first_fill_request.inc test_cluster_first_fill_request.inc.tmp
 	rm -f test_cluster_first_fill_reply.inc test_cluster_first_fill_reply.inc.tmp
 	rm -f test_cluster_first_fill_send.inc test_cluster_first_fill_send.inc.tmp
@@ -12980,7 +12981,8 @@ test_cluster_tt_terminal_trace: test_cluster_tt_terminal_trace.c test_cluster_tt
 # Execute the production first-fill master decision with native PCM owners.
 test_cluster_pcm_first_fill_master.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^gcs_first_fill_retired_notice\(/ { print "static bool"; emit=1; n++ } \
-	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< > $@.tmp
+	     /^gcs_block_pending_s_carrier_current\(/ { print "static bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2 || emit) exit 1 }' $< > $@.tmp
 	awk '/^#define GCS_FIRST_FILL_PARK_MAX/ { emit=1; n++ } \
 	     /^void$$/ && emit { emit=0; done++ } emit { print } \
 	     END { if (n != 1 || done != 1 || emit) exit 1 }' $< >> $@.tmp
@@ -12988,6 +12990,9 @@ test_cluster_pcm_first_fill_master.inc: $(top_srcdir)/src/backend/cluster/cluste
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< >> $@.tmp
 	awk '/^cluster_gcs_handle_block_done_envelope\(/ { print "static void"; emit=1; n++ } \
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< >> $@.tmp
+	awk '/^cluster_gcs_handle_block_invalidate_ack_envelope\(/ { print "static void"; emit=1; n++ } \
+	     emit && /if \(ack->ack_status == GCS_BLOCK_INVALIDATE_ACK_STATUS_RETRYABLE_BUSY\)/ { print "}"; emit=0; end++ } \
+	     emit { print } END { if (n != 1 || end != 1 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
 test_cluster_pcm_read_grant: test_cluster_pcm_first_fill_master.inc
 
@@ -13070,6 +13075,15 @@ test_cluster_first_fill_send: test_cluster_first_fill_send.c test_cluster_pcm_ow
 		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 TESTS += test_cluster_first_fill_seal
+TESTS += test_cluster_first_fill_holder_ingress
+all: test_cluster_first_fill_holder_ingress
+test_cluster_first_fill_holder_ingress: test_cluster_first_fill_holder_ingress.c \
+		test_cluster_first_fill_send.c test_cluster_pcm_own test_cluster_pcm_own.c \
+		test_cluster_first_fill_bufmgr.inc test_cluster_first_fill_send.inc unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
+		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 all: test_cluster_first_fill_seal
 test_cluster_first_fill_seal: test_cluster_first_fill_seal.c test_cluster_first_fill_send.c \
 		test_cluster_pcm_own test_cluster_pcm_own.c test_cluster_first_fill_bufmgr.inc \
@@ -13078,6 +13092,34 @@ test_cluster_first_fill_seal: test_cluster_first_fill_seal.c test_cluster_first_
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
 		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Real TCP carrier progress with the production bounded holder ingress.
+TESTS += test_cluster_first_fill_holder_ingress_tcp
+all: test_cluster_first_fill_holder_ingress_tcp
+test_cluster_first_fill_holder_ingress_tcp.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^typedef struct GcsFirstFillHolderPark/ { emit=1; n++ } \
+	     emit { print } /^} GcsFirstFillHolderMasterState;/ { emit=0; done++ } \
+	     END { if (n != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^gcs_first_fill_holder_master_state\(/ { print "static GcsFirstFillHolderMasterState"; emit=1; n++ } \
+	     /^gcs_first_fill_same_forward\(/ { print "static bool"; emit=1; n++ } \
+	     /^gcs_first_fill_holder_reserve\(/ { print "static GcsFirstFillHolderPark *"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< >> $@.tmp
+	awk '/^\/\* GCS first-fill holder ingress begin/ { emit=1; n++ } \
+	     emit { print } /^\/\* GCS first-fill holder ingress end/ { emit=0; done++ } \
+	     END { if (n != 1 || done != 1 || emit) exit 1 }' $< >> $@.tmp
+	mv $@.tmp $@
+test_cluster_first_fill_holder_ingress_tcp: test_cluster_first_fill_holder_ingress_tcp.c \
+		test_cluster_first_fill_ingress_tcp.c test_cluster_first_fill_ingress.inc \
+		test_cluster_first_fill_holder_ingress_tcp.inc test_cluster_ic_tier1_partial.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_ic_tier1.c $(CLUSTER_VERSION_O) \
+		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_read_source.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-first-fill-holder-ingress
+.PHONY: clean-first-fill-holder-ingress
+clean-first-fill-holder-ingress:
+	rm -f test_cluster_first_fill_holder_ingress_tcp.inc test_cluster_first_fill_holder_ingress_tcp.inc.tmp
 
 # Native first-fill retirement and the real invalidate/transport handoff owner.
 TESTS += test_cluster_first_fill_retire
@@ -13103,6 +13145,7 @@ test_cluster_first_fill_retire.inc: $(top_srcdir)/src/backend/cluster/cluster_gc
 	     /^gcs_block_pending_s_notify_(action_internal|action)\(/ { print "static bool"; emit=1; n++ } \
 	     /^gcs_block_pending_s_notify\(/ { print "static void"; emit=1; n++ } \
 	     /^gcs_first_fill_(arm_slot|receipt_matches|receipt_consumed)\(/ { print "static bool"; emit=1; n++ } \
+	     /^gcs_block_pending_s_carrier_current\(/ { print "static bool"; emit=1; n++ } \
 	     /^gcs_first_fill_receipt_count_locked\(/ { print "static unsigned"; emit=1; n++ } \
 	     /^gcs_first_fill_(receipt_offer|receipt_tick|confirm_offer)\(/ { print "static void"; emit=1; n++ } \
 	     /^gcs_first_fill_receipt_revoke\(/ { print "static int"; emit=1; n++ } \
@@ -13111,7 +13154,7 @@ test_cluster_first_fill_retire.inc: $(top_srcdir)/src/backend/cluster/cluster_gc
 	     /^cluster_gcs_block_read_source_complete\(/ { print "void"; emit=1; n++ } \
 	     /^cluster_gcs_block_read_source_(quiescent|quiesce)\(/ { print "bool"; emit=1; n++ } \
 	     /^gcs_block_(pending_s_delivery_closed|invalidate_execute)\(/ { print "static bool"; emit=1; n++ } \
-	     emit { print } emit && /^}/ { emit=0 } END { if (n != 24 || emit) exit 1 }' $< >> $@.tmp
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 25 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
 
 test_cluster_first_fill_retire: test_cluster_first_fill_retire.c test_cluster_pcm_own test_cluster_pcm_own.c \
@@ -13119,6 +13162,24 @@ test_cluster_first_fill_retire: test_cluster_first_fill_retire.c test_cluster_pc
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
 		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Exercise the actual optional reader pause; no backend object is linked.
+TESTS += test_cluster_first_fill_hot_block
+all: test_cluster_first_fill_hot_block
+
+check: check_first_fill_hot_block_order
+.PHONY: check_first_fill_hot_block_order
+check_first_fill_hot_block_order:
+	$(PERL) $(srcdir)/test_cluster_first_fill_hot_block_order.pl
+
+test_cluster_first_fill_hot_block.inc: $(top_srcdir)/src/test/modules/test_pcm_read_source/test_pcm_read_source.c Makefile
+	awk '/^read_test_page\(/ { print "static bytea *"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_first_fill_hot_block: test_cluster_first_fill_hot_block.c unit_test.h \
+		test_cluster_first_fill_hot_block.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
 
 # Execute the original native first-fill sender and passive CV wait.
 TESTS += test_cluster_first_fill_request

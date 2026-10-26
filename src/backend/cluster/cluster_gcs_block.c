@@ -3221,6 +3221,35 @@ static GcsReadSourceAttempt gcs_read_source_attempts[GCS_READ_SOURCE_LEDGER_MAX]
 static bool gcs_read_source_exit_registered;
 static bool gcs_first_fill_holder_notify_retain(const ClusterPcmReadGrant *service, int master);
 
+/* A one-shot completion already belongs to this verified receive carrier.
+ * UNKNOWN cannot discard it after the sender handed off its only frame.
+ * This proves routing/instance only; exact consumers still own authority.
+ * expected_master=-1 uses the original receipt's pinned master instead of
+ * a successor tag route; the consumer must still match that exact receipt. */
+static bool
+gcs_block_pending_s_carrier_current(const ClusterICEnvelope *env, BufferTag tag,
+	int source, int expected_master, uint64 *session_out)
+{
+	int master;
+	uint64 session;
+	if (env == NULL || source < 0 || source >= 32 || expected_master < -1 || expected_master >= 32
+		|| env->source_node_id != (uint32)source || env->dest_node_id != (uint32)cluster_node_id)
+		return false;
+	master = expected_master < 0 ? -1 : cluster_gcs_lookup_master(tag);
+	if ((expected_master >= 0 && master >= 0 && master != expected_master)
+		|| cluster_membership_get_state(source) == CLUSTER_MEMBER_DEAD
+		|| cluster_membership_get_state(source) == CLUSTER_MEMBER_REMOVED)
+		return false; /* Established reconfiguration owns old authority. */
+	if ((expected_master >= 0 && master < 0)
+		|| !gcs_block_pcm_x_authenticated_session(source, cluster_epoch_get_current(), &session)
+		|| session == 0) {
+		cluster_ic_dispatch_defer(env);
+		return false;
+	}
+	*session_out = session;
+	return true;
+}
+
 /* Existing DONE family, asynchronously queued. Native authority retains debt
  * until confirmation or exact cleanup; there is no ACK wait here. */
 static bool
@@ -3546,19 +3575,17 @@ gcs_first_fill_receipt_revoke(const GcsBlockInvalidatePayload *inv)
 /* The notice is authoritative only after authenticated master ACK consumption.
  * Never examine the current BufferDesc: it may already belong to successor B. */
 static bool
-gcs_first_fill_receipt_consumed(const GcsBlockDonePayload *done)
+gcs_first_fill_receipt_consumed(const GcsBlockDonePayload *done, uint64 session)
 {
 	ClusterPcmReadGrantKey key;
 	ClusterGcsBlockBackendBlock *blk;
 	GcsFirstFillReceipt retired;
 	unsigned count = 0;
-	uint64 session;
 	bool applied = false;
 	if (!GcsBlockDonePayloadPendingSKey(done, &key)
 		|| done->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_RETIRED
 		|| key.requester_node != cluster_node_id || key.backend_id <= 0 || key.backend_id > MaxBackends
-		|| !gcs_block_pcm_x_authenticated_session(done->sender_node,
-			cluster_epoch_get_current(), &session) || gcs_block_backend_blocks == NULL)
+		|| session == 0 || gcs_block_backend_blocks == NULL)
 		return false;
 	blk = &gcs_block_backend_blocks[key.backend_id - 1];
 	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
@@ -22939,6 +22966,8 @@ cluster_gcs_block_test_current_mx_forward128(const ClusterICEnvelope *env, const
  * pin/content lock. The master retains pending-S authority through revoke. */
 typedef struct GcsFirstFillHolderPark {
 	bool in_use;
+	bool ingress_pending;
+	ClusterICEnvelope ingress_envelope;
 	bool wait_valid;
 	bool returned;
 	bool terminal;
@@ -23057,8 +23086,7 @@ gcs_first_fill_holder_notify_retain(const ClusterPcmReadGrant *service, int mast
 	return false;
 }
 
-/* Every producer first owns one bounded slot. When full, the original
- * receive frame is deferred before any image/downgrade/send mutation. */
+/* Every producer first owns one bounded slot before any image mutation. */
 static GcsFirstFillHolderPark *
 gcs_first_fill_holder_reserve(const GcsBlockFirstFillForwardPayload *forward,
 	uint64 master_session, bool *created)
@@ -23080,6 +23108,174 @@ gcs_first_fill_holder_reserve(const GcsBlockFirstFillForwardPayload *forward,
 	*created = true;
 	return free_slot;
 }
+
+/* GCS first-fill holder ingress begin. */
+/* M retains each admitted FORWARD credit through producer completion/SEAL.
+ * That bounds copied ingress at64 per M/routed LMS, even across R reuse.
+ * These owners hold immutable input only, never a pin, lock or IO witness. */
+typedef struct GcsFirstFillHolderIngress {
+	struct GcsFirstFillHolderIngress *prev;
+	struct GcsFirstFillHolderIngress *next;
+	GcsBlockFirstFillForwardPayload forward;
+	ClusterICEnvelope envelope;
+	uint64 master_session;
+	int worker;
+} GcsFirstFillHolderIngress;
+static GcsFirstFillHolderIngress *gcs_first_fill_holder_ingress_head;
+static GcsFirstFillHolderIngress *gcs_first_fill_holder_ingress_tail;
+static uint32 gcs_first_fill_holder_ingress_count;
+static uint8 gcs_first_fill_holder_ingress_credit[32];
+static bool gcs_first_fill_holder_seal_pending(const GcsBlockFirstFillForwardPayload *forward, uint64 session);
+
+static bool
+gcs_first_fill_holder_ingress_valid(const GcsFirstFillHolderIngress *item)
+{
+	const GcsBlockForwardPayload *fwd = &item->forward.forward;
+	return GcsBlockFirstFillForwardPayloadValid(&item->forward, sizeof(item->forward))
+		&& fwd->original_requester_node != cluster_node_id && fwd->requester_backend_id <= MaxBackends
+		&& item->master_session != 0 && item->worker >= 0 && item->worker < cluster_lms_workers
+		&& item->envelope.msg_type == PGRAC_IC_MSG_GCS_BLOCK_FORWARD
+		&& item->envelope.source_node_id == (uint32)fwd->master_node
+		&& item->envelope.dest_node_id == (uint32)cluster_node_id
+		&& item->envelope.payload_length == sizeof(item->forward) && item->envelope.epoch == fwd->epoch;
+}
+
+static GcsFirstFillHolderIngress *
+gcs_first_fill_holder_ingress_find(const GcsBlockFirstFillForwardPayload *forward)
+{
+	for (GcsFirstFillHolderIngress *item = gcs_first_fill_holder_ingress_head; item != NULL; item = item->next)
+		if (gcs_first_fill_same_forward(&item->forward, forward))
+			return item;
+	return NULL;
+}
+
+static void
+gcs_first_fill_holder_ingress_forget(GcsFirstFillHolderIngress *item)
+{
+	int master = item->forward.forward.master_node;
+	if (gcs_first_fill_holder_ingress_count == 0 || master < 0 || master >= 32
+		|| gcs_first_fill_holder_ingress_credit[master] == 0)
+		ereport(ERROR, (errmsg("invalid first-fill holder ingress credit")));
+	if (item->prev != NULL) item->prev->next = item->next;
+	else gcs_first_fill_holder_ingress_head = item->next;
+	if (item->next != NULL) item->next->prev = item->prev;
+	else gcs_first_fill_holder_ingress_tail = item->prev;
+	gcs_first_fill_holder_ingress_count--;
+	gcs_first_fill_holder_ingress_credit[master]--;
+	cluster_block_io_trace_note(item->forward.forward.tag, "FIRST_FILL_INGRESS_RETIRED",
+		item->forward.forward.request_id, item->forward.service_generation, gcs_first_fill_holder_ingress_count);
+	pfree(item);
+}
+
+static bool
+gcs_first_fill_holder_ingress_retain(const ClusterICEnvelope *env,
+	const GcsBlockFirstFillForwardPayload *forward, uint64 session)
+{
+	GcsFirstFillHolderIngress proof = {0}, *item;
+	if (env == NULL || forward == NULL)
+		return false;
+	proof.forward = *forward; proof.envelope = *env; proof.master_session = session;
+	proof.worker = cluster_ic_tier1_my_data_channel();
+	if (!gcs_first_fill_holder_ingress_valid(&proof)
+		|| gcs_first_fill_holder_master_state(forward, session, NULL) != GCS_FIRST_FILL_HOLDER_MASTER_CURRENT)
+		return false;
+	item = gcs_first_fill_holder_ingress_find(forward);
+	if (item != NULL)
+		return item->master_session == session && item->worker == proof.worker
+			&& memcmp(&item->forward, forward, sizeof(*forward)) == 0;
+	if (gcs_first_fill_holder_ingress_credit[forward->forward.master_node] >= GCS_FIRST_FILL_PARK_MAX)
+		return false; /* Upstream credit cannot be borrowed or evicted. */
+	item = MemoryContextAllocZero(TopMemoryContext, sizeof(*item));
+	*item = proof;
+	item->prev = gcs_first_fill_holder_ingress_tail;
+	if (item->prev != NULL) item->prev->next = item;
+	else gcs_first_fill_holder_ingress_head = item;
+	gcs_first_fill_holder_ingress_tail = item;
+	gcs_first_fill_holder_ingress_count++;
+	gcs_first_fill_holder_ingress_credit[forward->forward.master_node]++;
+	cluster_block_io_trace_note(forward->forward.tag, "FIRST_FILL_INGRESS_PENDING",
+		forward->forward.request_id, forward->service_generation, gcs_first_fill_holder_ingress_count);
+	return true;
+}
+
+/* A quiet SEAL must remove this future producer before proving absence. */
+static void
+gcs_first_fill_holder_ingress_cancel(const GcsBlockFirstFillForwardPayload *forward, uint64 session)
+{
+	GcsFirstFillHolderIngress *item = gcs_first_fill_holder_ingress_find(forward);
+	if (item != NULL && item->master_session == session)
+		gcs_first_fill_holder_ingress_forget(item);
+}
+
+static void
+gcs_first_fill_holder_ingress_tick(int worker)
+{
+	uint32 budget = Min(gcs_first_fill_holder_ingress_count, (uint32)GCS_FIRST_FILL_PARK_MAX);
+	while (budget-- > 0) {
+		GcsFirstFillHolderIngress *item = gcs_first_fill_holder_ingress_head;
+		GcsFirstFillHolderMasterState state;
+		GcsFirstFillHolderPark *park;
+		bool created;
+		/* Rotate each retained item; one blocked M cannot hide another. */
+		if (item->next != NULL) {
+			gcs_first_fill_holder_ingress_head = item->next;
+			item->next->prev = NULL;
+			item->prev = gcs_first_fill_holder_ingress_tail;
+			item->prev->next = item;
+			gcs_first_fill_holder_ingress_tail = item;
+			item->next = NULL;
+		}
+		if (!gcs_first_fill_holder_ingress_valid(item) || item->worker != worker)
+			continue; /* Stop poll reports invalid identity rather than guessing. */
+		state = gcs_first_fill_holder_master_state(&item->forward, item->master_session, NULL);
+		if (state == GCS_FIRST_FILL_HOLDER_MASTER_ENDED) {
+			gcs_first_fill_holder_ingress_forget(item);
+			continue;
+		}
+		if (state != GCS_FIRST_FILL_HOLDER_MASTER_CURRENT)
+			continue;
+		if (gcs_first_fill_holder_seal_pending(&item->forward, item->master_session)) {
+			gcs_first_fill_holder_ingress_forget(item);
+			continue;
+		}
+		park = gcs_first_fill_holder_reserve(&item->forward, item->master_session, &created);
+		if (park == NULL || park->master_session != item->master_session)
+			continue;
+		if (created) {
+			park->ingress_pending = true;
+			park->ingress_envelope = item->envelope;
+			park->retry_at = 0;
+		}
+		gcs_first_fill_holder_ingress_forget(item); /* Active exact owner now holds the bytes. */
+	}
+}
+
+static ClusterNormalStopPollResult
+gcs_first_fill_holder_ingress_poll(const char **reason)
+{
+	uint32 count = 0, credit[32] = {0}, sum = 0;
+	const GcsFirstFillHolderIngress *last = NULL;
+	*reason = "GCS_FIRST_FILL_HOLDER_INGRESS_INVALID";
+	if (gcs_first_fill_holder_ingress_count > 32 * GCS_FIRST_FILL_PARK_MAX)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	for (const GcsFirstFillHolderIngress *item = gcs_first_fill_holder_ingress_head; item != NULL; item = item->next) {
+		if (++count > gcs_first_fill_holder_ingress_count || !gcs_first_fill_holder_ingress_valid(item)
+			|| item->prev != last)
+			return CLUSTER_NORMAL_STOP_INVALID;
+		credit[item->forward.forward.master_node]++;
+		last = item;
+	}
+	for (int node = 0; node < 32; node++) {
+		if (credit[node] != gcs_first_fill_holder_ingress_credit[node] || credit[node] > GCS_FIRST_FILL_PARK_MAX)
+			return CLUSTER_NORMAL_STOP_INVALID;
+		sum += credit[node];
+	}
+	if (count != gcs_first_fill_holder_ingress_count || sum != count || last != gcs_first_fill_holder_ingress_tail)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	*reason = count != 0 ? "GCS_FIRST_FILL_HOLDER_INGRESS_WAIT" : "NONE";
+	return count != 0 ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_READY;
+}
+/* GCS first-fill holder ingress end. */
 
 /* A RETURN seals this producer before notifying M. It is possible only
  * before a reply is admitted. HARD_ERROR uses exact revoke instead: it is
@@ -23107,6 +23303,7 @@ gcs_first_fill_holder_return(GcsFirstFillHolderPark *park, bool terminal)
 	park->notice_admitted = false;
 	park->reply_size = 0;
 	park->wait_valid = false;
+	park->ingress_pending = false;
 	park->retry_at = GetCurrentTimestamp() + 10000;
 	if (park == gcs_first_fill_resuming)
 		gcs_first_fill_resume_retained = true;
@@ -23173,6 +23370,7 @@ gcs_first_fill_holder_seal_retire(GcsFirstFillHolderSeal *receipt)
 static bool
 gcs_first_fill_holder_seal_producer(const GcsFirstFillHolderSeal *receipt)
 {
+	gcs_first_fill_holder_ingress_cancel(&receipt->forward, receipt->master_session);
 	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
 		GcsFirstFillHolderPark *park = &gcs_first_fill_holder_parks[i];
 		if (!park->in_use || park->master_session != receipt->master_session
@@ -23476,15 +23674,22 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		}
 		if (gcs_first_fill_holder_seal_pending(first_fill, session))
 			return; /* Original producer was sealed; a duplicate cannot recreate it. */
+		if (gcs_first_fill_holder_ingress_find(first_fill) != NULL) {
+			if (!gcs_first_fill_holder_ingress_retain(env, first_fill, session))
+				cluster_ic_dispatch_defer(env);
+			return;
+		}
 		owner = gcs_first_fill_holder_reserve(first_fill, session, &created);
 		if (owner == NULL) {
-			cluster_ic_dispatch_defer(env);
+			if (!gcs_first_fill_holder_ingress_retain(env, first_fill, session))
+				cluster_ic_dispatch_defer(env);
 			return;
 		}
 		if (!created && owner != gcs_first_fill_resuming)
 			return; /* Includes a sealed return waiting for master consumption. */
 		if (owner->master_session != session)
 			return; /* A different instance cannot resume the old service. */
+		owner->ingress_pending = false; /* The real handler now establishes its own witness. */
 	} else if (GcsBlockForwardPayloadIsFirstFillS(fwd))
 		return; /* An episode-only legacy frame cannot authorize this service. */
 	if (GcsBlockForwardPayloadIsCurrentMxRuntime(fwd)
@@ -24192,6 +24397,7 @@ cluster_gcs_block_first_fill_tick(void)
 	if (worker < 0 || ClusterGcsBlock == NULL)
 		return;
 	gcs_first_fill_master_tick(worker);
+	gcs_first_fill_holder_ingress_tick(worker);
 	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
 		GcsFirstFillHolderPark *park = &gcs_first_fill_holder_parks[i];
 		ClusterICEnvelope env = {0};
@@ -24234,7 +24440,7 @@ cluster_gcs_block_first_fill_tick(void)
 		/* Once an immutable reply exists, the expected X->S generation
 		 * change cannot invalidate its independent bytes. Before production
 		 * the original native resident/IO witness remains mandatory. */
-		ready = park->reply_size != 0 ? 1
+		ready = park->ingress_pending || park->reply_size != 0 ? 1
 			: (park->wait_valid ? cluster_bufmgr_first_fill_wait_ready(&park->wait) : -1);
 		if (ready < 0 || master_state == GCS_FIRST_FILL_HOLDER_MASTER_ENDED
 			|| cluster_normal_stop_requested()) {
@@ -24265,9 +24471,13 @@ cluster_gcs_block_first_fill_tick(void)
 		if (ready == 0 || now < park->retry_at)
 			continue;
 		park->retry_at = now + 10000;
-		env.source_node_id = (uint32)park->forward.forward.master_node;
-		env.dest_node_id = (uint32)cluster_node_id;
-		env.payload_length = sizeof(park->forward);
+		if (park->ingress_pending)
+			env = park->ingress_envelope;
+		else {
+			env.source_node_id = (uint32)park->forward.forward.master_node;
+			env.dest_node_id = (uint32)cluster_node_id;
+			env.payload_length = sizeof(park->forward);
+		}
 		gcs_first_fill_resuming = park;
 		gcs_first_fill_resume_retained = false;
 		PG_TRY();
@@ -24536,25 +24746,15 @@ cluster_gcs_handle_block_done_envelope(const ClusterICEnvelope *env, const void 
 		ClusterPcmReadGrant service;
 		uint64 session;
 		bool sealed = done->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_SEALED;
-		int master;
 		if (env->dest_node_id != (uint32)cluster_node_id || env->epoch != done->epoch
 			|| done->epoch != cluster_epoch_get_current()
 			|| !GcsBlockDonePayloadPendingSService(done, &service)
 			|| !gcs_first_fill_return_service_valid(&service)
 			|| (!sealed && service.holder_node != cluster_node_id))
 			return;
-		master = cluster_gcs_lookup_master(done->tag);
-		if ((master >= 0 && master != (sealed ? cluster_node_id : done->sender_node))
-			|| cluster_membership_get_state(done->sender_node) == CLUSTER_MEMBER_DEAD
-			|| cluster_membership_get_state(done->sender_node) == CLUSTER_MEMBER_REMOVED)
-			return; /* Proved old authority; membership/remaster owns its cleanup. */
-		if (master < 0 || !gcs_block_pcm_x_authenticated_session(done->sender_node, done->epoch, &session)
-			|| session == 0) {
-			/* The sender already transferred its only frame. UNKNOWN is
-			 * not rejection: preserve this real carrier until proof returns. */
-			cluster_ic_dispatch_defer(env);
+		if (!gcs_block_pending_s_carrier_current(env, done->tag, done->sender_node,
+			sealed ? cluster_node_id : done->sender_node, &session))
 			return;
-		}
 		if (sealed)
 			gcs_first_fill_master_holder_completed(&service.key, &service, session, true);
 		else if (!gcs_first_fill_holder_seal(done, session))
@@ -24569,8 +24769,10 @@ cluster_gcs_handle_block_done_envelope(const ClusterICEnvelope *env, const void 
 		if (env->dest_node_id != (uint32)cluster_node_id
 			|| done->epoch != cluster_epoch_get_current()
 			|| !GcsBlockDonePayloadPendingSService(done, &service)
-			|| !gcs_block_pcm_x_authenticated_session(done->sender_node, done->epoch, &session)
-			|| cluster_gcs_lookup_master(done->tag) != (returned ? done->sender_node : cluster_node_id))
+			|| !gcs_first_fill_return_service_valid(&service)
+			|| (returned && service.holder_node != cluster_node_id)
+			|| !gcs_block_pending_s_carrier_current(env, done->tag, done->sender_node,
+				returned ? done->sender_node : cluster_node_id, &session))
 			return;
 		if (returned)
 			(void)gcs_first_fill_holder_returned(done, session);
@@ -24579,7 +24781,14 @@ cluster_gcs_handle_block_done_envelope(const ClusterICEnvelope *env, const void 
 		return;
 	}
 	if (done->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETIRED) {
-		(void)gcs_first_fill_receipt_consumed(done);
+		ClusterPcmReadGrantKey retired;
+		uint64 session;
+		if (!GcsBlockDonePayloadPendingSKey(done, &retired)
+			|| retired.requester_node != cluster_node_id || retired.backend_id > MaxBackends
+			|| !gcs_block_pending_s_carrier_current(env, done->tag, done->sender_node,
+				-1, &session))
+			return;
+		(void)gcs_first_fill_receipt_consumed(done, session);
 		return;
 	}
 	if (done->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_CONFIRM
@@ -24590,10 +24799,10 @@ cluster_gcs_handle_block_done_envelope(const ClusterICEnvelope *env, const void 
 		bool installed = done->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_CONFIRM;
 		bool applied;
 		if (!GcsBlockDonePayloadPendingSKey(done, &grant_key)
-			|| cluster_gcs_lookup_master(done->tag) != cluster_node_id
-			|| !gcs_block_pcm_x_authenticated_session(done->sender_node,
-				cluster_epoch_get_current(), &session)
-			|| (installed && done->epoch != cluster_epoch_get_current()))
+			|| grant_key.backend_id > MaxBackends
+			|| (installed && done->epoch != cluster_epoch_get_current())
+			|| !gcs_block_pending_s_carrier_current(env, done->tag, done->sender_node,
+				cluster_node_id, &session))
 			return;
 		if (done->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_HOLDER
 			|| (!installed && done->sender_node != grant_key.requester_node)) {
@@ -26119,9 +26328,16 @@ cluster_gcs_block_normal_stop_local_poll(int *slot_out, const char **reason_out)
 		const char *ingress_reason;
 		const char *return_reason;
 		const char *seal_reason;
+		const char *holder_ingress_reason;
 		ClusterNormalStopPollResult ingress = gcs_first_fill_ingress_poll(&ingress_reason);
 		ClusterNormalStopPollResult returned = gcs_first_fill_return_receipt_poll(&return_reason);
 		ClusterNormalStopPollResult sealed = gcs_first_fill_holder_seal_poll(&seal_reason);
+		ClusterNormalStopPollResult holder_ingress = gcs_first_fill_holder_ingress_poll(&holder_ingress_reason);
+		if (holder_ingress != CLUSTER_NORMAL_STOP_READY) {
+			*slot_out = -1;
+			*reason_out = holder_ingress_reason;
+			return holder_ingress;
+		}
 		if (sealed != CLUSTER_NORMAL_STOP_READY) {
 			*slot_out = -1;
 			*reason_out = seal_reason;
@@ -26461,9 +26677,9 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 		bool decoded = GcsBlockInvalidateAckPayloadPendingSKey(ack, &key);
 		bool applied = false;
 		if (decoded && (ack->ack_status == 0 || ack->ack_status == 2)
-			&& cluster_gcs_lookup_master(ack->tag) == cluster_node_id
-			&& gcs_block_pcm_x_authenticated_session(ack->sender_node,
-				cluster_epoch_get_current(), &session)) {
+			&& key.backend_id <= MaxBackends && env->payload_length == sizeof(*ack)
+			&& gcs_block_pending_s_carrier_current(env, ack->tag, ack->sender_node,
+				cluster_node_id, &session)) {
 			if (ack->reserved_0[0] == GCS_BLOCK_INVALIDATE_ACK_KEPT_PI)
 				cluster_pcm_lock_pi_holder_note(ack->tag, ack->sender_node);
 			applied = cluster_pcm_lock_read_grant_revoke_ack(&key);

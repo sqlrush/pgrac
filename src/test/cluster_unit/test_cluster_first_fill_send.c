@@ -246,6 +246,7 @@ static struct {
 #define cluster_lms_workers 2
 #define gcs_block_send_envelope_or_loopback send_seal_frame
 #define palloc0(n) calloc(1, (n))
+#define MemoryContextAllocZero(context, n) calloc(1, (n))
 #define pfree(p) free(p)
 #define cluster_ic_tier1_my_data_channel() 0
 #define cluster_ic_dispatch_defer(env) ((void)(env), ++send_deferred)
@@ -322,6 +323,8 @@ send_setup(BufferDesc *buf, ClusterPcmOwnEntry *entry)
 	pg_atomic_write_u32(&buf->state, BM_TAG_VALID | BM_VALID | BM_DIRTY);
 	transition_buf = buf;
 	transition_mapping_held = transition_content_held = false;
+	while (gcs_first_fill_holder_ingress_head != NULL)
+		gcs_first_fill_holder_ingress_forget(gcs_first_fill_holder_ingress_head);
 	memset(gcs_first_fill_holder_parks, 0, sizeof(gcs_first_fill_holder_parks));
 	memset(gcs_first_fill_holder_seals, 0, sizeof(gcs_first_fill_holder_seals));
 	gcs_first_fill_holder_seal_count = 0;
@@ -363,6 +366,8 @@ send_forward(const GcsBlockFirstFillForwardPayload *fwd)
 	ClusterICEnvelope env = {0};
 	env.source_node_id = 2;
 	env.dest_node_id = cluster_node_id;
+	env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_FORWARD;
+	env.epoch = fwd->forward.epoch;
 	env.payload_length = sizeof(*fwd);
 	cluster_gcs_handle_block_forward_envelope(&env, fwd);
 }
@@ -580,10 +585,22 @@ UT_TEST(reply_capacity_defers_new_work_before_production_and_preserves_owned_fra
 	UT_ASSERT_EQ(send_owned(), 64);
 	UT_ASSERT_EQ(send_calls, 1);
 	UT_ASSERT_EQ(send_nacks + send_returns, 0);
-	UT_ASSERT_EQ(send_deferred, 1);
+	UT_ASSERT_EQ(send_deferred, 0); /* Copied ingress must leave later cleanup readable. */
 	UT_ASSERT_EQ(send_copies, 1);
 	UT_ASSERT_EQ(gcs_first_fill_holder_parks[0].forward.forward.request_id, 71);
 	UT_ASSERT_EQ(gcs_first_fill_holder_parks[63].forward.forward.request_id, 134);
+	{
+		ClusterPcmReadGrant service;
+		GcsBlockDonePayload done = {0};
+		UT_ASSERT(GcsBlockFirstFillForwardPayloadGrant(&fwd, cluster_node_id, &service));
+		done.tag = service.key.tag; done.request_id = service.key.request_id;
+		done.epoch = service.key.epoch; done.sender_node = 2;
+		done.requester_backend_id = service.key.backend_id; done.transition_id = PCM_TRANS_N_TO_S;
+		done.reserved_0[0] = GCS_BLOCK_DONE_PENDING_S_SEAL; done.reserved_0[1] = 1;
+		GcsBlockDonePayloadSetPendingSService(&done, &service);
+		UT_ASSERT(gcs_first_fill_holder_seal(&done, 9));
+		UT_ASSERT_EQ(gcs_first_fill_holder_ingress_count, 0);
+	}
 	for (int i = 1; i < 64; i++) gcs_first_fill_holder_parks[i].in_use = false;
 	send_result = CLUSTER_IC_SEND_DONE;
 	send_tick();
