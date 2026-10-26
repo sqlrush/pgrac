@@ -1245,6 +1245,9 @@ reset_v2_sender(void)
 	(void)reset_v2_receiver();
 	MemSet(&test_sender_sample, 0, sizeof(test_sender_sample));
 	test_sender_sample.scan.status = CTRC_ACTIVE_SCAN_COMPLETE;
+	/* Controlled completed cursor, not an execution of the shared census. */
+	test_sender_sample.scan.total_entries = 1;
+	test_sender_sample.scan.next_index = 1;
 	test_sender_sample.scan.unqualified_registration_generation = test_registration_generation;
 	test_sender_sample.scan.reference_full = FullTransactionIdFromEpochAndXid(1, 4096);
 	test_sender_sample.scan.future_full = FullTransactionIdFromEpochAndXid(1, 4096);

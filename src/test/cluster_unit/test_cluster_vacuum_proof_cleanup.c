@@ -8,9 +8,10 @@
  * The helpers, runtime guard cleanup callback, buffer release wrappers and
  * PG exception macros are real. The generic unlock's cache-off tail is also
  * extracted verbatim; its PCM release boundary can raise a distinct ERROR.
- * Acquisition/native unpin/route/admission/proof providers are leaves: this
- * tests cleanup order and exception preservation, not real transport,
- * shared admission counters or physical proof validity.
+ * Acquisition/native unpin/route/proof providers remain controlled leaves.
+ * Opt-in cases run original admission snapshot/enter/leave and shared/local
+ * counters through the real collector finally. Startup, epoch, OS callbacks
+ * and injected ERROR/cancel remain controlled, not native qualification.
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -74,6 +75,10 @@ volatile uint32 CritSectionCount;
 static RelationData relation;
 static LVRelState vacrel;
 static unsigned enters, leaves, debt, resolves, routes, target_bindings;
+static bool fixture_original_admission_enabled;
+static unsigned fixture_original_admission_debt(void);
+static void fixture_original_admission_setup(void);
+static void fixture_original_admission_event(char event);
 static unsigned aborted_target_bindings;
 static unsigned aborted_candidate_selections;
 static bool refuse_aborted_candidates;
@@ -85,6 +90,16 @@ static PGAlignedBlock resident_page;
 static unsigned repins, lock_attempts, page_checks, validations;
 static unsigned generic_unlocks, remote_releases, ownership_mirrors;
 static bool pin_held, content_locked, resident, lock_available;
+
+/* Original backend-private pin reader; only its refcount storage is a leaf. */
+static int32
+GetPrivateRefCount(Buffer buffer)
+{
+	UT_ASSERT_EQ(buffer, 1);
+	return pin_held ? 1 : 0;
+}
+#include "test_cluster_heap_borrowed_pin.inc"
+
 static bool remote_release_error, leave_with_ownership;
 static bool changed_holder, changed_master, changed_admission;
 static bool error_page_check, validation_under_lock;
@@ -193,6 +208,8 @@ note_cleanup(char event)
 		abort();
 	cleanup_order[cleanup_count++] = event;
 	cleanup_order[cleanup_count] = '\0';
+	if (fixture_original_admission_enabled)
+		fixture_original_admission_event(event);
 }
 
 void
@@ -239,6 +256,14 @@ errmsg(const char *format, ...)
 	return 0;
 }
 
+/* Diagnostic formatting leaf; errfinish still propagates the original ERROR. */
+int
+errhint(const char *format, ...)
+{
+	(void) format;
+	return 0;
+}
+
 void
 errfinish(const char *file, int line, const char *function)
 {
@@ -275,6 +300,8 @@ void
 cluster_undo_block0_current_cancel(ClusterUndoBlock0CurrentGuard *guard)
 {
 	(void)guard;
+	if (fixture_original_admission_enabled)
+		UT_ASSERT_EQ(fixture_original_admission_debt(), 1);
 	if (!guard_held || debt != 1)
 		abort();
 	guard_held = false;
@@ -302,10 +329,153 @@ cluster_pcm_lock_authority_matches(BufferTag tag, const PcmAuthoritySnapshot *ex
 	return expected->transition_count == 7 && !changed_holder;
 }
 
+/* Original admission state and functions are opt-in for the owner bridge.
+ * Publication, descriptor registration, epoch/Startup and OS exit remain leaves. */
+#include "test_cluster_active_sample_types.inc"
+static ClusterSemanticActivationShmem fixture_admission_shared;
+static ClusterSemanticActivationShmem *SemanticActivationShmem;
+static uint32 semantic_activation_local_inflight[2][64];
+static int semantic_activation_exit_hook_pid;
+static const void *fixture_admission_descriptors[64];
+static int fixture_admission_pid, fixture_admission_holdoff;
+static uint64 fixture_admission_epoch;
+static bool fixture_admission_serving, fixture_admission_bootstrap;
+static unsigned fixture_admission_registrations, fixture_admission_foreign_debt;
+static pg_on_exit_callback fixture_admission_exit_callback;
+static Datum fixture_admission_exit_arg;
+static const ClusterSemanticAdmissionToken *fixture_admission_token;
+static ClusterSemanticAdmissionToken fixture_admission_last_token;
+static bool fixture_actual_target_current(const ClusterSemanticAdmissionToken *);
+static bool fixture_actual_census_current(const ClusterSemanticAdmissionToken *);
+static bool fixture_actual_backend_has_admission(void);
+static ClusterSemanticAdmissionResult fixture_actual_census_enter(ClusterSemanticAdmissionToken *);
+static void fixture_actual_census_leave(ClusterSemanticAdmissionToken *);
+
+static bool
+fixture_admission_is_serving(void)
+{
+	return fixture_admission_serving && !reject_admission;
+}
+static bool
+fixture_admission_is_bootstrap(void)
+{
+	return fixture_admission_bootstrap;
+}
+static uint64
+fixture_admission_current_epoch(void)
+{
+	return fixture_admission_epoch;
+}
+static void
+fixture_admission_register_exit(pg_on_exit_callback callback, Datum arg)
+{
+	UT_ASSERT(fixture_admission_exit_callback == NULL && callback != NULL);
+	UT_ASSERT_EQ(fixture_admission_holdoff, 0);
+	fixture_admission_exit_callback = callback; fixture_admission_exit_arg = arg;
+	fixture_admission_registrations++;
+}
+
+#define SemanticActivationDescriptors fixture_admission_descriptors
+#define normal_start_serving_allowed fixture_admission_is_serving
+#define normal_start_bootstrap_allowed fixture_admission_is_bootstrap
+#define cluster_epoch_get_current fixture_admission_current_epoch
+#define MyProcPid fixture_admission_pid
+#define InterruptHoldoffCount fixture_admission_holdoff
+#define on_shmem_exit fixture_admission_register_exit
+#define cluster_semantic_activation_recheck fixture_actual_target_current
+#define cluster_semantic_activation_recheck_r4_terminal_census fixture_actual_census_current
+#define cluster_semantic_activation_backend_has_admission fixture_actual_backend_has_admission
+#define cluster_semantic_activation_enter_r4_terminal_census fixture_actual_census_enter
+#define cluster_semantic_activation_leave fixture_actual_census_leave
+#include "test_cluster_vacuum_admission_snapshot.inc"
+#include "test_cluster_heap_freeze_admission_current.inc"
+#include "test_cluster_heap_freeze_admission_lifecycle.inc"
+#undef cluster_semantic_activation_leave
+#undef cluster_semantic_activation_enter_r4_terminal_census
+#undef cluster_semantic_activation_backend_has_admission
+#undef cluster_semantic_activation_recheck_r4_terminal_census
+#undef cluster_semantic_activation_recheck
+#undef on_shmem_exit
+#undef InterruptHoldoffCount
+#undef MyProcPid
+#undef cluster_epoch_get_current
+#undef normal_start_bootstrap_allowed
+#undef normal_start_serving_allowed
+#undef SemanticActivationDescriptors
+
+static int
+fixture_admission_feature(void)
+{
+	int feature = -1;
+	UT_ASSERT(semantic_activation_feature_bit_index(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, &feature));
+	return feature;
+}
+
+static unsigned
+fixture_original_admission_debt(void)
+{
+	uint32 shared = pg_atomic_read_u32(&fixture_admission_shared.inflight[CLUSTER_SEMANTIC_TARGET_SIDE][fixture_admission_feature()]);
+	UT_ASSERT(shared >= fixture_admission_foreign_debt);
+	return shared - fixture_admission_foreign_debt;
+}
+
+/* Observe the original counters at each actual resource cleanup boundary. */
+static void
+fixture_original_admission_event(char event)
+{
+	bool entered = event != 'A';
+
+	UT_ASSERT_EQ(fixture_original_admission_debt(), entered ? 1 : 0);
+	UT_ASSERT_EQ(semantic_activation_local_inflight[CLUSTER_SEMANTIC_TARGET_SIDE][fixture_admission_feature()], entered ? 1 : 0);
+	UT_ASSERT_EQ(fixture_actual_backend_has_admission(), entered);
+	UT_ASSERT_EQ(fixture_admission_holdoff, 0);
+	if (entered) {
+		UT_ASSERT(fixture_admission_token != NULL && fixture_admission_token->entered);
+	} else {
+		UT_ASSERT(fixture_admission_token == NULL);
+		UT_ASSERT(!guard_held && !pin_held && !content_locked && !writer_scope_active);
+		UT_ASSERT(exit_callback == NULL);
+	}
+}
+
+static void
+fixture_original_admission_setup(void)
+{
+	UT_ASSERT(!fixture_actual_backend_has_admission()); UT_ASSERT_EQ(fixture_admission_holdoff, 0);
+	memset(&fixture_admission_shared, 0, sizeof(fixture_admission_shared));
+	SemanticActivationShmem = &fixture_admission_shared;
+	pg_atomic_init_u64(&fixture_admission_shared.admission_seq, 2);
+	pg_atomic_init_u64(&fixture_admission_shared.active_bits, CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1);
+	pg_atomic_init_u64(&fixture_admission_shared.record_generation, 17);
+	pg_atomic_init_u64(&fixture_admission_shared.formation_epoch, 9);
+	pg_atomic_init_u32(&fixture_admission_shared.transition_closed, 0);
+	for (unsigned side = 0; side < 2; side++)
+		for (unsigned bit = 0; bit < 64; bit++)
+			pg_atomic_init_u32(&fixture_admission_shared.inflight[side][bit], 0);
+	memset(fixture_admission_descriptors, 0, sizeof(fixture_admission_descriptors));
+	fixture_admission_descriptors[fixture_admission_feature()] = &fixture_admission_shared;
+	fixture_admission_pid = 4401; fixture_admission_epoch = 9;
+	fixture_admission_serving = true; fixture_admission_bootstrap = false;
+	fixture_admission_foreign_debt = fixture_admission_registrations = 0;
+	fixture_admission_exit_callback = NULL; fixture_admission_exit_arg = (Datum)0;
+	fixture_admission_token = NULL; memset(&fixture_admission_last_token, 0, sizeof(fixture_admission_last_token));
+	semantic_activation_exit_hook_pid = 0;
+	fixture_original_admission_enabled = true;
+}
+
 ClusterSemanticAdmissionResult
 cluster_semantic_activation_enter_r4_terminal_census(ClusterSemanticAdmissionToken *token)
 {
 	enters++;
+	if (fixture_original_admission_enabled) {
+		ClusterSemanticAdmissionResult result = fixture_actual_census_enter(token);
+		fixture_admission_last_token = *token;
+		if (result == CLUSTER_SEMANTIC_ADMISSION_OK) {
+			UT_ASSERT_EQ(debt, 0); UT_ASSERT_EQ(fixture_original_admission_debt(), 1);
+			UT_ASSERT(token->entered); fixture_admission_token = token; debt++;
+		}
+		return result;
+	}
 	if (reject_admission)
 		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 	if (debt != 0)
@@ -321,20 +491,31 @@ cluster_semantic_activation_enter_r4_terminal_census(ClusterSemanticAdmissionTok
 void
 cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
 {
+	if (fixture_original_admission_enabled)
+		UT_ASSERT_EQ(fixture_original_admission_debt(), 1);
 	if (guard_held || !token->entered || token->record_generation != 17 || debt != 1)
 		abort();
 	/* Record a violated ordering so the exact-parent RED can report it. */
 	leave_with_ownership |= pin_held || content_locked || writer_scope_active;
 	leaves++;
+	if (fixture_original_admission_enabled) {
+		ClusterSemanticAdmissionToken zero = {0};
+		UT_ASSERT(token == fixture_admission_token);
+		fixture_actual_census_leave(token); fixture_admission_last_token = *token;
+		UT_ASSERT(memcmp(token, &zero, sizeof(zero)) == 0);
+		UT_ASSERT_EQ(fixture_original_admission_debt(), 0);
+		UT_ASSERT(!fixture_actual_backend_has_admission());
+		fixture_admission_token = NULL;
+	} else token->entered = false;
 	debt--;
-	token->entered = false;
 	note_cleanup('A');
 }
 
 bool
 cluster_semantic_activation_recheck_r4_terminal_census(const ClusterSemanticAdmissionToken *token)
 {
-	return token->entered && debt == 1 && !changed_admission;
+	return token->entered && debt == 1 && !changed_admission
+		&& (!fixture_original_admission_enabled || fixture_actual_census_current(token));
 }
 
 /* Full TARGET readiness is distinct from terminal-census read admission. */
@@ -357,7 +538,8 @@ cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 	if (error_target_recheck) throw_error();
 	if (revoke_on_target_recheck) changed_admission = true;
 	return token->entered && token->side == CLUSTER_SEMANTIC_TARGET_SIDE
-		&& target_admission_current && !changed_admission;
+		&& target_admission_current && !changed_admission
+		&& (!fixture_original_admission_enabled || fixture_actual_target_current(token));
 }
 
 void
@@ -874,6 +1056,7 @@ cluster_heap_freeze_cohort_current(const ClusterHeapFreezeCohortObservation *exp
 static void
 reset_fixture(void)
 {
+	fixture_original_admission_enabled = false;
 	writer_resumes = writer_releases = 0;
 	writer_scope_active = false;
 	writer_resume_allowed = true;
@@ -3249,10 +3432,367 @@ UT_TEST(native_window_subset_uses_original_legal_next_not_freeze_limit)
 	UT_ASSERT_EQ(debt, 0); UT_ASSERT_STR_EQ(cleanup_order, "LPA");
 }
 
+UT_TEST(original_admission_owner_finally_releases_debt_after_guard_cancel)
+{
+	reset_fixture(); fixture_original_admission_setup();
+	fail_resolve = 1; inject_code = ERRCODE_QUERY_CANCELED;
+	check_error_cleanup("GA");
+	UT_ASSERT_EQ(fixture_original_admission_debt(), 0);
+}
+
+UT_TEST(original_admission_normal_and_refused_paths_release_after_local_owners)
+{
+	const char *orders[] = {"LPA", "A", "A", "PA", "LPA", "WLPA", "PA"};
+	const ClusterHeapFreezeProofStatusV1 statuses[] = {
+		CLUSTER_HEAP_FREEZE_PROOF_PROVEN, CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN,
+		CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED, CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED,
+		CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED, CLUSTER_HEAP_FREEZE_PROOF_PROVEN,
+		CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED
+	};
+
+	for (unsigned which = 0; which < lengthof(orders); which++) {
+		reset_fixture(); fixture_original_admission_setup();
+		switch (which) {
+		case 1: unknown_outcome = true; break;
+		case 2: resident = false; break;
+		case 3: lock_available = false; break;
+		case 4: PageSetLSN((Page)resident_page.data, 102); break;
+		case 5: vacrel.shared_freeze_input.writer_context_valid = true; break;
+		case 6:
+			vacrel.shared_freeze_input.writer_context_valid = true;
+			writer_resume_allowed = false; break;
+		}
+		UT_ASSERT(!collect_catches_error()); UT_ASSERT_EQ(collected_status, statuses[which]);
+		UT_ASSERT_EQ(enters, 1); UT_ASSERT_EQ(leaves, 1); UT_ASSERT_EQ(debt, 0);
+		UT_ASSERT_STR_EQ(cleanup_order, orders[which]);
+		UT_ASSERT_EQ(fixture_original_admission_debt(), 0);
+		UT_ASSERT_EQ(fixture_admission_registrations, 1);
+		UT_ASSERT(fixture_admission_exit_callback != NULL);
+		UT_ASSERT(!leave_with_ownership);
+	}
+}
+
+UT_TEST(original_admission_error_and_cancel_preserve_original_exception)
+{
+	const int codes[] = {ERRCODE_DATA_EXCEPTION, ERRCODE_QUERY_CANCELED};
+	const char *orders[] = {"A", "GA", "LPA", "LPA", "LPA", "LPA", "WLPA", "PA"};
+
+	for (unsigned code = 0; code < lengthof(codes); code++) {
+		for (unsigned which = 0; which < lengthof(orders); which++) {
+			reset_fixture(); fixture_original_admission_setup(); inject_code = codes[code];
+			switch (which) {
+			case 0: error_preflight = true; break;
+			case 1: fail_resolve = 1; break;
+			case 2: error_validate = true; break;
+			case 3: error_page_check = true; break;
+			case 4: set_shared_policy(80); error_cohort = true; break;
+			case 5: set_shared_policy(80); error_target_recheck = true; break;
+			case 6:
+				vacrel.shared_freeze_input.writer_context_valid = true;
+				error_page_check = true; break;
+			case 7:
+				vacrel.shared_freeze_input.writer_context_valid = true;
+				writer_resume_error = true; break;
+			}
+			cluster_gcs_block_local_cache = false; remote_release_error = true;
+			check_error_cleanup(orders[which]);
+			UT_ASSERT_EQ(fixture_original_admission_debt(), 0);
+			UT_ASSERT_EQ(fixture_admission_registrations, 1);
+			UT_ASSERT_EQ(generic_unlocks + remote_releases, 0);
+		}
+	}
+}
+
+UT_TEST(original_admission_preentry_refusals_do_not_leave_or_owe_debt)
+{
+	ClusterSemanticAdmissionToken zero = {0};
+
+	for (unsigned which = 0; which < 8; which++) {
+		reset_fixture(); fixture_original_admission_setup();
+		switch (which) {
+		case 0: SemanticActivationShmem = NULL; break;
+		case 1: fixture_admission_descriptors[fixture_admission_feature()] = NULL; break;
+		case 2: pg_atomic_write_u64(&fixture_admission_shared.record_generation, 0); break;
+		case 3: fixture_admission_epoch++; break;
+		case 4: pg_atomic_write_u32(&fixture_admission_shared.transition_closed, 1); break;
+		case 5: fixture_admission_pid = 0; break;
+		case 6: fixture_admission_serving = false; break;
+		case 7: pg_atomic_write_u64(&fixture_admission_shared.admission_seq, 3); break;
+		}
+		UT_ASSERT(!collect_catches_error());
+		UT_ASSERT_EQ(collected_status, CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+		UT_ASSERT_EQ(enters, 1); UT_ASSERT_EQ(leaves + debt + resolves, 0);
+		UT_ASSERT_EQ(fixture_original_admission_debt(), 0);
+		UT_ASSERT(!fixture_actual_backend_has_admission());
+		UT_ASSERT(memcmp(&fixture_admission_last_token, &zero, sizeof(zero)) == 0);
+		UT_ASSERT_EQ(fixture_admission_holdoff, 0); UT_ASSERT_STR_EQ(cleanup_order, "");
+	}
+}
+
+UT_TEST(original_admission_backend_reuses_exit_registration_after_cancel)
+{
+	pg_on_exit_callback original_callback;
+	Datum original_arg;
+
+	reset_fixture(); fixture_original_admission_setup();
+	fail_resolve = 1; inject_code = ERRCODE_QUERY_CANCELED;
+	check_error_cleanup("GA");
+	original_callback = fixture_admission_exit_callback; original_arg = fixture_admission_exit_arg;
+	/* Keep both original counters, the exit registration and PG stacks intact. */
+	fail_resolve = 0;
+	UT_ASSERT(!collect_catches_error()); UT_ASSERT_EQ(collected_status, CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(enters, 2); UT_ASSERT_EQ(leaves, 2); UT_ASSERT_EQ(debt, 0);
+	UT_ASSERT_EQ(fixture_original_admission_debt(), 0); UT_ASSERT_STR_EQ(cleanup_order, "GALPA");
+	UT_ASSERT_EQ(fixture_admission_registrations, 1);
+	UT_ASSERT(fixture_admission_exit_callback == original_callback);
+	UT_ASSERT(fixture_admission_exit_arg == original_arg);
+	UT_ASSERT(PG_exception_stack == NULL && error_context_stack == NULL);
+}
+
+UT_TEST(original_admission_finally_preserves_other_backend_debt)
+{
+	for (unsigned which = 0; which < 3; which++) {
+		reset_fixture(); fixture_original_admission_setup();
+		/* Controlled other-backend debt is not charged to this backend's ledger. */
+		fixture_admission_foreign_debt = 7;
+		pg_atomic_write_u32(&fixture_admission_shared.inflight[CLUSTER_SEMANTIC_TARGET_SIDE][fixture_admission_feature()], 7);
+		if (which) {
+			fail_resolve = 1;
+			inject_code = which == 1 ? ERRCODE_DATA_EXCEPTION : ERRCODE_QUERY_CANCELED;
+			check_error_cleanup("GA");
+		} else {
+			UT_ASSERT(!collect_catches_error()); UT_ASSERT_EQ(collected_status, CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+			UT_ASSERT_EQ(enters, 1); UT_ASSERT_EQ(leaves, 1); UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+		}
+		UT_ASSERT_EQ(pg_atomic_read_u32(&fixture_admission_shared.inflight[CLUSTER_SEMANTIC_TARGET_SIDE][fixture_admission_feature()]), 7);
+		UT_ASSERT_EQ(fixture_original_admission_debt(), 0); UT_ASSERT_EQ(debt, 0);
+		UT_ASSERT(!fixture_actual_backend_has_admission());
+		/* Retire only the controlled foreign input before the next isolated case. */
+		pg_atomic_write_u32(&fixture_admission_shared.inflight[CLUSTER_SEMANTIC_TARGET_SIDE][fixture_admission_feature()], 0);
+		fixture_admission_foreign_debt = 0;
+	}
+}
+
+UT_TEST(original_registered_exit_after_collector_finally_does_not_double_release)
+{
+	for (unsigned which = 0; which < 3; which++) {
+		unsigned completed_cleanups;
+
+		reset_fixture(); fixture_original_admission_setup();
+		fixture_admission_foreign_debt = 7;
+		pg_atomic_write_u32(&fixture_admission_shared.inflight[CLUSTER_SEMANTIC_TARGET_SIDE][fixture_admission_feature()], 7);
+		if (which) {
+			fail_resolve = 1;
+			inject_code = which == 1 ? ERRCODE_DATA_EXCEPTION : ERRCODE_QUERY_CANCELED;
+			check_error_cleanup("GA");
+		} else {
+			UT_ASSERT(!collect_catches_error());
+			UT_ASSERT_EQ(collected_status, CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+			UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+		}
+		UT_ASSERT_EQ(enters, 1); UT_ASSERT_EQ(leaves, 1); UT_ASSERT_EQ(debt, 0);
+		UT_ASSERT_EQ(fixture_admission_registrations, 1);
+		UT_ASSERT(fixture_admission_exit_callback != NULL);
+		completed_cleanups = cleanup_count;
+		/* Invoke the original registered callback with its original argument.
+		 * Registration/PID scheduling is controlled; no actual OS exit occurs. */
+		fixture_admission_exit_callback(0, fixture_admission_exit_arg);
+		UT_ASSERT_EQ(cleanup_count, completed_cleanups); UT_ASSERT_EQ(leaves, 1);
+		UT_ASSERT_EQ(semantic_activation_exit_hook_pid, 0);
+		UT_ASSERT_EQ(fixture_admission_holdoff, 0);
+		UT_ASSERT_EQ(fixture_original_admission_debt(), 0);
+		UT_ASSERT(!fixture_actual_backend_has_admission());
+		UT_ASSERT_EQ(pg_atomic_read_u32(&fixture_admission_shared.inflight[CLUSTER_SEMANTIC_TARGET_SIDE][fixture_admission_feature()]), 7);
+		UT_ASSERT(!guard_held && !pin_held && !content_locked && !writer_scope_active);
+		UT_ASSERT(PG_exception_stack == NULL && error_context_stack == NULL);
+		pg_atomic_write_u32(&fixture_admission_shared.inflight[CLUSTER_SEMANTIC_TARGET_SIDE][fixture_admission_feature()], 0);
+		fixture_admission_foreign_debt = 0;
+	}
+}
+
+UT_TEST(original_registered_exit_after_entry_refusal_keeps_foreign_debt)
+{
+	for (unsigned which = 0; which < 3; which++) {
+		reset_fixture(); fixture_original_admission_setup();
+		fixture_admission_foreign_debt = 7;
+		pg_atomic_write_u32(&fixture_admission_shared.inflight[CLUSTER_SEMANTIC_TARGET_SIDE][fixture_admission_feature()], 7);
+		switch (which) {
+		case 0: pg_atomic_write_u64(&fixture_admission_shared.admission_seq, 3); break;
+		case 1: fixture_admission_epoch++; break;
+		case 2: pg_atomic_write_u64(&fixture_admission_shared.record_generation, 0); break;
+		}
+		UT_ASSERT(!collect_catches_error());
+		UT_ASSERT_EQ(collected_status, CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+		UT_ASSERT_EQ(enters, 1); UT_ASSERT_EQ(leaves + debt + resolves, 0);
+		UT_ASSERT_EQ(fixture_admission_registrations, 1);
+		UT_ASSERT(fixture_admission_exit_callback != NULL);
+		fixture_admission_exit_callback(0, fixture_admission_exit_arg);
+		UT_ASSERT_EQ(semantic_activation_exit_hook_pid, 0);
+		UT_ASSERT_EQ(fixture_admission_holdoff, 0); UT_ASSERT_EQ(fixture_original_admission_debt(), 0);
+		UT_ASSERT(!fixture_actual_backend_has_admission());
+		UT_ASSERT_EQ(pg_atomic_read_u32(&fixture_admission_shared.inflight[CLUSTER_SEMANTIC_TARGET_SIDE][fixture_admission_feature()]), 7);
+		UT_ASSERT_EQ(leaves + cleanup_count, 0); UT_ASSERT_STR_EQ(cleanup_order, "");
+		UT_ASSERT(PG_exception_stack == NULL && error_context_stack == NULL);
+		pg_atomic_write_u32(&fixture_admission_shared.inflight[CLUSTER_SEMANTIC_TARGET_SIDE][fixture_admission_feature()], 0);
+		fixture_admission_foreign_debt = 0;
+	}
+}
+
+UT_TEST(admitted_phase_returns_to_original_owner_before_leave)
+{
+	ClusterSemanticAdmissionToken token;
+	PcmAuthoritySnapshot authority;
+	BufferTag tag;
+	uint64 master;
+	SCN page_scn;
+	bool rows_current = false;
+
+	reset_fixture(); fixture_original_admission_setup();
+	InitBufferTag(&tag, &relation.rd_locator, MAIN_FORKNUM, vacrel.shared_freeze_batch.block);
+	UT_ASSERT(cluster_pcm_lock_r4_route_snapshot(tag, &authority, &master, &page_scn));
+	UT_ASSERT_EQ(cluster_semantic_activation_enter_r4_terminal_census(&token), CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs_admitted(&vacrel, 1,
+		&authority, master, &token, &rows_current), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT(rows_current && token.entered);
+	UT_ASSERT_EQ(vacrel.shared_freeze_proofs.proof_count, 1);
+	UT_ASSERT_EQ(enters, 1); UT_ASSERT_EQ(leaves, 0); UT_ASSERT_EQ(debt, 1);
+	UT_ASSERT_EQ(fixture_original_admission_debt(), 1);
+	UT_ASSERT_STR_EQ(cleanup_order, "LP");
+	cluster_semantic_activation_leave(&token);
+	UT_ASSERT(!token.entered); UT_ASSERT_EQ(leaves, 1); UT_ASSERT_EQ(debt, 0);
+	UT_ASSERT_STR_EQ(cleanup_order, "LPA");
+}
+
+UT_TEST(admitted_phase_refuses_missing_borrowed_owner_without_side_effects)
+{
+	for (unsigned which = 0; which < 5; which++) {
+		ClusterSemanticAdmissionToken token = {0};
+		PcmAuthoritySnapshot authority = {0};
+		bool rows_current = true;
+
+		reset_fixture(); fixture_original_admission_setup();
+		/* Isolate each missing-context guard from the unentered-token case. */
+		token.entered = which >= 2;
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs_admitted(
+			which == 3 ? NULL : &vacrel, 1, which == 2 ? NULL : &authority,
+			0, which == 0 ? NULL : &token, which == 4 ? NULL : &rows_current),
+			CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+		if (which != 4) UT_ASSERT(!rows_current);
+		UT_ASSERT_EQ(enters + leaves + debt + resolves + routes + repins, 0);
+		UT_ASSERT_EQ(fixture_admission_registrations, 0);
+		UT_ASSERT_EQ(fixture_original_admission_debt(), 0);
+		UT_ASSERT(!fixture_actual_backend_has_admission());
+		UT_ASSERT_STR_EQ(cleanup_order, "");
+	}
+}
+
+static bool
+admitted_phase_catches_error(const PcmAuthoritySnapshot *authority, uint64 master,
+	const ClusterSemanticAdmissionToken *token)
+{
+	volatile bool caught = false;
+	bool rows_current = false;
+
+	PG_TRY();
+	{
+		collected_status = lazy_collect_shared_freeze_proofs_admitted(&vacrel, 1,
+			authority, master, token, &rows_current);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	return caught;
+}
+
+UT_TEST(admitted_phase_error_unwinds_local_owners_but_keeps_caller_admission)
+{
+	const char *orders[] = {"", "G", "LP"};
+	const int codes[] = {ERRCODE_DATA_EXCEPTION, ERRCODE_QUERY_CANCELED};
+
+	for (unsigned code = 0; code < lengthof(codes); code++) {
+		for (unsigned which = 0; which < lengthof(orders); which++) {
+			ClusterSemanticAdmissionToken token;
+			PcmAuthoritySnapshot authority;
+			BufferTag tag;
+			uint64 master;
+			SCN page_scn;
+
+			reset_fixture(); fixture_original_admission_setup();
+			InitBufferTag(&tag, &relation.rd_locator, MAIN_FORKNUM, vacrel.shared_freeze_batch.block);
+			UT_ASSERT(cluster_pcm_lock_r4_route_snapshot(tag, &authority, &master, &page_scn));
+			UT_ASSERT_EQ(cluster_semantic_activation_enter_r4_terminal_census(&token), CLUSTER_SEMANTIC_ADMISSION_OK);
+			inject_code = codes[code];
+			if (which == 0) error_preflight = true;
+			if (which == 1) fail_resolve = 1;
+			if (which == 2) error_page_check = true;
+			UT_ASSERT(admitted_phase_catches_error(&authority, master, &token));
+			UT_ASSERT_EQ(caught_code, codes[code]);
+			UT_ASSERT(token.entered); UT_ASSERT_EQ(enters, 1); UT_ASSERT_EQ(leaves, 0);
+			UT_ASSERT_EQ(debt, 1); UT_ASSERT_EQ(fixture_original_admission_debt(), 1);
+			UT_ASSERT_STR_EQ(cleanup_order, orders[which]);
+			UT_ASSERT(!guard_held && !pin_held && !content_locked && !writer_scope_active);
+			UT_ASSERT(exit_callback == NULL && PG_exception_stack == NULL && error_context_stack == NULL);
+			cluster_semantic_activation_leave(&token);
+			UT_ASSERT(!token.entered); UT_ASSERT_EQ(leaves, 1); UT_ASSERT_EQ(debt, 0);
+		}
+	}
+}
+
+UT_TEST(admitted_phase_requires_released_resident_hint_before_proof_transport)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		ClusterSemanticAdmissionToken token = {0}; PcmAuthoritySnapshot authority;
+		BufferTag tag; uint64 master; SCN page_scn;
+		volatile bool caught = false; bool rows_current = true;
+		ClusterHeapFreezeProofStatusV1 status = CLUSTER_HEAP_FREEZE_PROOF_PROVEN;
+		reset_fixture(); fixture_original_admission_setup();
+		InitBufferTag(&tag, &relation.rd_locator, MAIN_FORKNUM, vacrel.shared_freeze_batch.block);
+		UT_ASSERT(cluster_pcm_lock_r4_route_snapshot(tag, &authority, &master, &page_scn));
+		UT_ASSERT_EQ(cluster_semantic_activation_enter_r4_terminal_census(&token), CLUSTER_SEMANTIC_ADMISSION_OK);
+		pin_held = fault == 0;
+		/* Any preflight call is visible without entering a blocking resolver. */
+		error_preflight = true;
+		PG_TRY();
+		{
+			status = lazy_collect_shared_freeze_proofs_admitted(&vacrel,
+				fault == 1 ? InvalidBuffer : fault == 2 ? NBuffers + 1 : 1,
+				&authority, master, &token, &rows_current);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(!caught); UT_ASSERT_EQ(status, CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+		UT_ASSERT(!rows_current); UT_ASSERT_EQ(pin_held, fault == 0);
+		UT_ASSERT(token.entered); UT_ASSERT_EQ(debt, 1);
+		UT_ASSERT_EQ(fixture_original_admission_debt(), 1); UT_ASSERT_EQ(leaves, 0);
+		UT_ASSERT_EQ(resolves + repins + lock_attempts, 0); UT_ASSERT_STR_EQ(cleanup_order, "");
+		/* The rejected helper does not own this test caller's pin or token. */
+		pin_held = false;
+		cluster_semantic_activation_leave(&token);
+		UT_ASSERT(!token.entered); UT_ASSERT_EQ(fixture_original_admission_debt(), 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(124);
+	UT_PLAN(136);
+	UT_RUN(admitted_phase_requires_released_resident_hint_before_proof_transport);
+	UT_RUN(admitted_phase_refuses_missing_borrowed_owner_without_side_effects);
+	UT_RUN(admitted_phase_error_unwinds_local_owners_but_keeps_caller_admission);
+	UT_RUN(admitted_phase_returns_to_original_owner_before_leave);
+	UT_RUN(original_registered_exit_after_collector_finally_does_not_double_release);
+	UT_RUN(original_registered_exit_after_entry_refusal_keeps_foreign_debt);
+	UT_RUN(original_admission_normal_and_refused_paths_release_after_local_owners);
+	UT_RUN(original_admission_error_and_cancel_preserve_original_exception);
+	UT_RUN(original_admission_preentry_refusals_do_not_leave_or_owe_debt);
+	UT_RUN(original_admission_backend_reuses_exit_registration_after_cancel);
+	UT_RUN(original_admission_finally_preserves_other_backend_debt);
+	UT_RUN(original_admission_owner_finally_releases_debt_after_guard_cancel);
 	UT_RUN(native_window_candidate_subset_keeps_physical_order);
 	UT_RUN(native_window_empty_subset_keeps_other_proof_observations);
 	UT_RUN(observed_cutoff_outside_native_window_keeps_proofs_without_candidates);

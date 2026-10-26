@@ -257,6 +257,7 @@ override CPPFLAGS := -I. -I$(top_srcdir)/src/include $(CPPFLAGS)
 # ----------
 TESTS += test_cluster_space_lazy_fork
 TESTS += test_cluster_ctrc_native_fpi
+TESTS += test_cluster_current_mx_publication_cassert test_cluster_current_mx_publication_nocassert
 
 all: $(TESTS) check_resource_x_send_c1
 
@@ -418,7 +419,7 @@ test_cluster_backup: test_cluster_backup.c unit_test.h $(CLUSTER_VERSION_O) \
 SIMPLE_TESTS = $(filter-out test_cluster_ctrc_native_fpi test_cluster_merge_claim test_cluster_native_itl_trace test_cluster_shared_fs_recovery_root test_cluster_d0_native_reader test_cluster_tt_checkpoint_native test_cluster_cold_tt_redo test_cluster_cold_tt_base test_cluster_tt_checkpoint_cuts test_cluster_recovery_c0_plan test_cluster_checkpoint_stamp test_cluster_recovery_stamp test_cluster_recovery_tt_record test_cluster_recovery_ctrc_record test_cluster_recovery_tt_io test_cluster_grd_capacity test_cluster_grd_dsa test_cluster_cr_shared_route test_cluster_tt_rollback_entry test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_shared_fs_cold_drop test_cluster_formation_restart test_cluster_cold_recovery_validate test_cluster_cold_recovery_io test_cluster_cold_recovery_complete test_cluster_recovery_merge_seal test_cluster_recovery_merge_complete test_cluster_typed_redo test_cluster_cold_recovery_space test_cluster_cold_recovery_space_refail test_cluster_cold_recovery_refail test_cluster_cold_recovery_replay test_cluster_cold_recovery_plan test_cluster_cold_recovery_decode test_cluster_cold_recovery_effects test_cluster_cold_recovery_startup test_cluster_update_trace test_cluster_ic_tier1_partial test_cluster_lms_outbound test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_shared_fs_sharedfs test_cluster_shared_fs_block_device test_cluster_smgr test_cluster_startup_phase test_cluster_authority_storage test_cluster_serving_sample test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision test_cluster_scn test_cluster_scn_frontier test_cluster_adg test_cluster_epoch test_cluster_epoch_ballot_codec test_cluster_fence test_cluster_reconfig test_cluster_ges test_cluster_grd_outbound test_cluster_grd test_cluster_grd_starvation test_cluster_lmd test_cluster_lmd_graph test_cluster_lmd_groups test_cluster_lmd_wait_state test_cluster_cancel_token test_cluster_lmd_probe_collector test_cluster_lock_acquire test_cluster_advisory test_cluster_terminal_authority test_cluster_retention test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay test_cluster_thread_driver test_cluster_thread_orchestrator test_cluster_write_fence test_cluster_write_fence_durable test_cluster_write_fence_cache test_cluster_stage4_acceptance test_cluster_stage5_integrated_acceptance test_cluster_stage5_beta_acceptance test_cluster_ges_mode test_cluster_sequence test_cluster_shared_catalog test_cluster_hw test_cluster_dl test_cluster_extend_gate test_cluster_recovery_serial test_cluster_ts test_cluster_ko test_cluster_hw_snapshot test_cluster_cf_authority test_cluster_control_root test_cluster_recovery_duty test_cluster_formation_witness test_cluster_cf_storage test_cluster_cf_enqueue test_cluster_cf_phase2 test_cluster_cf_stats test_cluster_hang test_cluster_hang_resolve test_cluster_cr_server_policy test_cluster_touched_peers test_cluster_clean_leave test_cluster_membership test_cluster_node_remove test_cluster_resolver_cache test_cluster_backup test_cluster_hang_acceptance test_cluster_gcs_reqid test_cluster_runtime_visibility test_cluster_xid_stripe test_cluster_mxid_stripe test_cluster_share_barrier test_cluster_heap_barrier test_cluster_bufmgr_pcm_hook test_cluster_cr test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_cache test_cluster_cr_coordinator test_cluster_cr_key test_cluster_cr_lifecycle test_cluster_cr_pool test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_gcs_block test_cluster_gcs_block_2way test_cluster_gcs_block_3way test_cluster_gcs_block_lost_write test_cluster_gcs_block_retransmit test_cluster_gcs_block_dedup_reclaim test_cluster_gcs_block_dedup_htab test_cluster_gcs_dispatch test_cluster_ges_handoff test_cluster_heap_lock_tuple test_cluster_hw_lease test_cluster_ic_envelope test_cluster_ic_router test_cluster_itl_cleanout test_cluster_itl_cleanout_perf test_cluster_itl_reader_real_triple test_cluster_itl_touch test_cluster_active_itl_transfer test_cluster_itl_wal test_cluster_multixact test_cluster_multixact_current test_cluster_multixact_served test_cluster_pcm_lock test_cluster_pcm_own test_cluster_pcm_direct_init test_cluster_perf_gates test_cluster_recovery_merge test_cluster_recovery_plan test_cluster_recovery_worker test_cluster_reverse_key test_cluster_sinval test_cluster_sinval_ack test_cluster_snapshot_source test_cluster_stage2_acceptance test_cluster_stage5_5_cr_acceptance test_cluster_subtrans test_cluster_tt_durable test_cluster_tt_slot_allocator test_cluster_tt_status test_cluster_tt_status_hint test_cluster_uba test_cluster_undo_format test_cluster_undo_lifecycle test_cluster_undo_record test_cluster_undo_block0 test_cluster_undo_smgr_publication test_cluster_visibility_decide_scn test_cluster_visibility_fork test_cluster_visibility_inject test_cluster_wal_state test_cluster_wal_thread test_cluster_xnode_lever test_cluster_xnode_profile test_cluster_pi_shadow test_cluster_oid_lease test_cluster_xid_authority test_cluster_recovery_anchor test_cluster_relmap_authority test_cluster_lms_shard test_cluster_gcs_block_dedup test_cluster_gcs_block_shard test_cluster_undo_resid test_cluster_undo_authority test_cluster_undo_gcs test_cluster_undo_verdict test_cluster_vis_undo_verdict_map test_cluster_undo_horizon test_cluster_r4_static_model test_cluster_r4_tx_locator test_cluster_r4_tx_outcome test_cluster_r4_cr_walk test_cluster_r4_activation_record test_cluster_r4_activation_fsm test_cluster_r4_lock_order test_cluster_relation_size test_cluster_catalog_trace test_cluster_wait_resources test_cluster_content_trace test_cluster_content_trace_exec test_cluster_pcm_service_trace test_cluster_tx_identity_trace test_cluster_pcm_wait_exit,$(TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_tt_terminal_trace,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_tt_rollover_preflight,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_heap_cr_reuse test_cluster_snapshot_admission test_cluster_undo_header_durability test_cluster_tt_2pc_finish test_cluster_control_transport test_cluster_cr_native_origin test_cluster_cr_mvcc_origin test_cluster_tt_abort_owner test_cluster_tt_active_owner test_cluster_pcm_aux_consumer test_cluster_pcm_aux_reobserve test_cluster_multixact_current_stats test_cluster_vacuum_native_window test_cluster_subtrans_watermark \
+SIMPLE_TESTS := $(filter-out test_cluster_current_mx_publication_cassert test_cluster_current_mx_publication_nocassert test_cluster_heap_cr_reuse test_cluster_snapshot_admission test_cluster_undo_header_durability test_cluster_tt_2pc_finish test_cluster_control_transport test_cluster_cr_native_origin test_cluster_cr_mvcc_origin test_cluster_tt_abort_owner test_cluster_tt_active_owner test_cluster_pcm_aux_consumer test_cluster_pcm_aux_reobserve test_cluster_multixact_current_stats test_cluster_vacuum_native_window test_cluster_subtrans_watermark \
 		test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
 		test_cluster_pcm_aux_mutation test_cluster_heap_extend_current test_cluster_heap_pair_scope \
 		test_cluster_heap_inplace \
@@ -2465,8 +2466,8 @@ test_cluster_heap_borrowed_pin.inc: $(top_srcdir)/src/backend/storage/buffer/buf
 
 test_cluster_heap_freeze_xmin_apply.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
 	awk '/^cluster_heap_freeze_apply_xmin_batch_locked_v1\(/ { print "static bool"; emit=1; found++ } \
-	     /^cluster_heap_freeze_apply_xmin(_batch)?_v1\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
+	     /^cluster_heap_freeze_apply_xmin(_batch(_recent)?)?_v1\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 4) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_freeze_redo.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
@@ -2560,6 +2561,19 @@ test_cluster_heap_freeze_pgproc_sample.inc: $(top_srcdir)/src/backend/storage/ip
 	@awk '/^ProcArrayGetActiveFullXidSample\(/ { print "static bool"; emit=1; found++ } \
 	     emit { print } emit && /^}/ { emit=0; done++ } \
 	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Original normal native exit and native XID predicates; no copied bodies.
+test_cluster_heap_freeze_pgproc_exit.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c \
+		$(top_srcdir)/src/backend/access/transam/transam.c $(top_srcdir)/src/backend/access/transam/varsup.c Makefile
+	@awk '/^MaintainLatestCompletedXid\(/ { print "static inline void"; emit=1; found++ } \
+	     /^ProcArrayEndTransaction\(/ { print "static void"; emit=1; found++ } \
+	     /^ProcArrayEndTransactionInternal\(/ { print "static inline void"; emit=1; found++ } \
+	     /^FullXidRelativeTo\(/ { print "static FullTransactionId"; emit=1; found++ } \
+	     /^TransactionId(Precedes|PrecedesOrEquals|FollowsOrEquals)\(/ { print "static bool"; emit=1; found++ } \
+	     /^AssertTransactionIdInAllowableRange\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 8 || done != 8 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 # Original typed storage plus retained peer/H backend and local-source wrapper.
@@ -2695,12 +2709,83 @@ test_cluster_heap_ctrc_participant.inc: $(top_srcdir)/src/backend/cluster/cluste
 	mv $@.tmp $@
 
 # Original receipt apply/cancel bookkeeping and exact-handle/target checks.
-test_cluster_heap_ctrc_terminal.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
-	@awk 'BEGIN { pattern = "^(cluster_ctrc_page_version_order|cluster_ctrc_pending_itl_target_recheck|cluster_ctrc_receipt_apply_prepared|cluster_ctrc_receipt_apply_shared|cluster_ctrc_receipt_cancel_prepared|cluster_ctrc_receipt_cancel_shared|ctrc_bytes_nonzero|ctrc_receipt_handle_exact|ctrc_target_exact_itl_valid|ctrc_target_exact_tid_valid|ctrc_target_itl_finalizes_exact|ctrc_target_itl_finalizes_prepared|ctrc_target_offnum_finalizes_exact)\\(" } \
+# Original complete page-owner exact registration/top-xact/reset, sort/group, stamp/WAL and discharge closure.
+test_cluster_heap_itl_finish_discharge.inc: $(top_srcdir)/src/backend/cluster/cluster_itl_touch.c Makefile
+	@awk 'BEGIN { pattern = "^(itl_finish_expected_target|itl_finish_discharge_batch|itl_finish_stamp_page|itl_finish_flush_batch|itl_touch_record_cmp|itl_finish_range|cluster_itl_touch_reset_at_end_xact|cluster_itl_xact_precommit_finish|cluster_itl_xact_abort_finish|itl_touch_handle_matches|itl_touch_append|itl_touch_capture_proof|itl_touch_register_exact_internal|cluster_itl_touch_register_exact_ctrc)\\(" } \
+	     /^#ifdef USE_PGRAC_CLUSTER$$/ { active=1; starts++; next } \
+	     /^#else \/\* !USE_PGRAC_CLUSTER \*\// { active=0; stops++; next } \
+	     !active { next } \
+	     /^typedef struct (ItlFinishCtx|ItlFinishPageRun|ItlFinishBatchCtx|ItlFinishDischarge|ClusterItlTouchSubxactBoundary) \{/ { structure=1; structures++ } \
+	     structure { print; if (/^} (ItlFinishCtx|ItlFinishPageRun|ItlFinishBatchCtx|ItlFinishDischarge|ClusterItlTouchSubxactBoundary);/) structure=0; next } \
+	     /^#define CLUSTER_ITL_TOUCH_INITIAL_CAPACITY / { print; initial_constants++; next } \
+	     /^#define CLUSTER_ITL_FINISH_MAX_DISCHARGES / { print; getline; print; constants++; next } \
 	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); if (seen[name]++) exit 1; order[++found]=name; ret=prev; sub(/^static[ \t]+/, "", ret); returns[name]="static " ret; emit=1; head=1 } \
 	     emit { body[name]=body[name] $$0 "\n"; if (/^\{/) head=0; else if (head) declaration[name]=declaration[name] $$0 "\n" } \
 	     emit && /^}/ { emit=0; done++ } { prev=$$0 } \
-	     END { if (found != 13 || done != 13 || emit) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
+	     END { if (found != 14 || done != 14 || emit || structure || structures != 5 || constants != 1 || initial_constants != 1 || starts != 1 || stops != 1) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_resident_stamp_types.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	@awk '/^#define BufHdrGetBlock\(bufHdr\)/ { print; address++ } \
+	     /^typedef enum PinBufferLookupResult/ { emit=1; found++ } \
+	     /^typedef struct PrivateRefCountEntry$$/ { emit=1; private_type++ } \
+	     emit { print } emit && /^} (PinBufferLookupResult|PrivateRefCountEntry);/ { emit=0; done++ } \
+	     END { if (found != 1 || private_type != 1 || done != 2 || address != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_private_ref.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	@awk '/^#define REFCOUNT_ARRAY_ENTRIES / { print; constants++ } \
+	     /^static .*PrivateRefCountArray\[/ || /^static .*PrivateRefCountHash =/ || /^static .*PrivateRefCountOverflowed =/ || /^static .*PrivateRefCountClock =/ || /^static .*ReservedRefCountEntry =/ { print; states++ } \
+	     /^ReservePrivateRefCountEntry\(/ || /^ForgetPrivateRefCountEntry\(/ { print "static void"; emit=1; found++ } \
+	     /^NewPrivateRefCountEntry\(/ || /^GetPrivateRefCountEntry\(/ { print "static PrivateRefCountEntry *"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (constants != 1 || states != 5 || found != 4 || done != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_primitive_pin.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	@awk '/^PinBuffer\(/ { print "static bool"; emit=1; found++ } \
+	     /^UnpinBuffer\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 2 || done != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_lookup_pin.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	@awk '/^cluster_bufmgr_should_pcm_track\(/ { print "static inline bool"; emit=1; found++ } \
+	     /^PinBufferForLookup\(/ { print "static PinBufferLookupResult"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 2 || done != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_resident_stamp.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	@awk '/^cluster_bufmgr_lock_resident_for_exact_itl_stamp\(/ { print "static Buffer"; emit=1; found++ } \
+	     /^cluster_bufmgr_unlock_resident_stamp\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 2 || done != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_touch_authority.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	@awk '/^cluster_pcm_own_snapshot_post_state_locked\(/ { print "static inline void"; emit=1; found++ } \
+	     /^cluster_pcm_own_snapshot_locked\(/ { print "static inline void"; emit=1; found++ } \
+	     /^cluster_bufmgr_pcm_x_retained_image_locked\(/ { print "static inline bool"; emit=1; found++ } \
+	     /^LockBufHdr\(/ { print "static uint32"; emit=1; found++ } \
+	     /^cluster_bufmgr_terminal_stamp_authority\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 5 || done != 5 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_itl_publication.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk '/^static const ClusterShmemRegion cluster_ctrc_region =/ { boundary++; exit } \
+	     /^cluster_ctrc_note_publication_after_apply\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1 || emit || boundary != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_ctrc_terminal.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk 'BEGIN { pattern = "^(cluster_ctrc_page_version_order|cluster_ctrc_pending_itl_target_recheck|cluster_ctrc_receipt_apply_prepared|cluster_ctrc_receipt_apply_shared|cluster_ctrc_receipt_cancel_prepared|cluster_ctrc_receipt_cancel_shared|ctrc_bytes_nonzero|ctrc_receipt_handle_exact|ctrc_target_exact_itl_valid|ctrc_target_exact_tid_valid|ctrc_target_itl_finalizes_exact|ctrc_target_itl_finalizes_prepared|ctrc_target_offnum_finalizes_exact|ctrc_reference_durability_covers|cluster_ctrc_itl_target_identity_matches|cluster_ctrc_receipt_discharge_itl|cluster_ctrc_receipt_discharge_itl_shared)\\(" } \
+	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); if (seen[name]++) exit 1; order[++found]=name; ret=prev; sub(/^static[ \t]+/, "", ret); returns[name]="static " ret; emit=1; head=1 } \
+	     emit { body[name]=body[name] $$0 "\n"; if (/^\{/) head=0; else if (head) declaration[name]=declaration[name] $$0 "\n" } \
+	     emit && /^}/ { emit=0; done++ } { prev=$$0 } \
+	     END { if (found != 17 || done != 17 || emit) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Original certificate consumer/reclaim closure; skip the original forward declaration.
@@ -2715,6 +2800,33 @@ test_cluster_heap_ctrc_certificate.inc: $(top_srcdir)/src/backend/cluster/cluste
 	mv $@.tmp $@
 
 # Original nonempty ACK producer, actual two captures/hash/final freeze and cleanup.
+# Exact original G lock-split/required-ACK helpers, separate from the core counts.
+# An older source emits nothing only when each helper name is entirely absent.
+test_cluster_heap_ctrc_g_scan_relock.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk '/(^|[^[:alnum:]_])ctrc_scan_participant_relock([^[:alnum:]_]|$$)/ { references++ } \
+	     /^#define CTRC_CLEANER_SCAN_LOCK_BATCH / { constant=$$0; constants++ } \
+	     /^ctrc_scan_participant_relock\(/ { ret=prev; sub(/^static[ \t]+/, "", ret); candidate=1; head=1; text=""; decl="" } \
+	     candidate { text=text $$0 "\n"; if (/^\{/) { head=0; if (found++) exit 1 } else if (head) { decl=decl $$0 "\n"; if (/;[ \t]*$$/) candidate=0 } } \
+	     candidate && /^}/ { candidate=0; body=text; signature=decl; return_type=ret; done++ } { prev=$$0 } \
+	     END { if (candidate || found != done || (references == 0 ? found != 0 : found != 1) || (found != 0 && constants != 1)) exit 1; if (found) print constant "\nstatic " return_type "\n" body }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_ctrc_g_required_ack_decl.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk '/(^|[^[:alnum:]_])ctrc_origin_required_ack_snapshot_entry([^[:alnum:]_]|$$)/ { references++ } \
+	     /^ctrc_origin_required_ack_snapshot_entry\(/ { ret=prev; sub(/^static[ \t]+/, "", ret); candidate=1; head=1; text=""; decl="" } \
+	     candidate { text=text $$0 "\n"; if (/^\{/) { head=0; if (found++) exit 1 } else if (head) { decl=decl $$0 "\n"; if (/;[ \t]*$$/) candidate=0 } } \
+	     candidate && /^}/ { candidate=0; body=text; signature=decl; return_type=ret; done++ } { prev=$$0 } \
+	     END { if (candidate || found != done || (references == 0 ? found != 0 : found != 1)) exit 1; if (found) { sub(/\n$$/, "", signature); print "static " return_type "\n" signature ";" } }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_ctrc_g_required_ack_body.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk '/(^|[^[:alnum:]_])ctrc_origin_required_ack_snapshot_entry([^[:alnum:]_]|$$)/ { references++ } \
+	     /^ctrc_origin_required_ack_snapshot_entry\(/ { ret=prev; sub(/^static[ \t]+/, "", ret); candidate=1; head=1; text=""; decl="" } \
+	     candidate { text=text $$0 "\n"; if (/^\{/) { head=0; if (found++) exit 1 } else if (head) { decl=decl $$0 "\n"; if (/;[ \t]*$$/) candidate=0 } } \
+	     candidate && /^}/ { candidate=0; body=text; signature=decl; return_type=ret; done++ } { prev=$$0 } \
+	     END { if (candidate || found != done || (references == 0 ? found != 0 : found != 1)) exit 1; if (found) print "static " return_type "\n" body }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_ctrc_ack.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
 	@awk 'BEGIN { pattern = "^(ctrc_tlv_bytes|ctrc_tlv_u8|ctrc_tlv_u16|ctrc_tlv_u32|ctrc_tlv_u64|ctrc_publication_id_encode|ctrc_target_encode|ctrc_cleaner_owns_key|ctrc_scan_limit|ctrc_scan_charge|ctrc_participant_scan_lock_mask|ctrc_receipt_snapshot_valid|ctrc_receipt_row_encode|ctrc_receipt_key_sequence_cmp|ctrc_receipt_durability_covered|cluster_ctrc_participant_ack_from_snapshot|ctrc_participant_find_ack_ready|ctrc_participant_capture_durability|ctrc_ack_batch_inputs|ctrc_ack_participant_exact|ctrc_ack_block_if_same|ctrc_ack_work_find|ctrc_participant_copy_ack_batch|ctrc_participant_freeze_ack_batch_exact|ctrc_participant_freeze_ack_batch_shared)\\(" } \
 	     /^#define (CTRC_CLEANER_ACK_BATCH|CTRC_PARTICIPANT_ALL_SHARDS) / { print; constants++ } \
@@ -2727,18 +2839,26 @@ test_cluster_heap_ctrc_ack.inc: $(top_srcdir)/src/backend/cluster/cluster_termin
 	mv $@.tmp $@
 
 # Original volatile origin/inbox terminal edge; canonical block0 publisher is separate.
-test_cluster_heap_ctrc_origin_reply.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
-	@awk '/^typedef struct CtrcOriginBatchReplyTrace CtrcOriginBatchReplyTrace;/ { print; forward++ } \
+# Native trace definitions are required as a complete set when the source has
+# them. An older source with no trace definitions or references emits no types.
+test_cluster_heap_ctrc_origin_reply_trace_types.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk '/^#define CLUSTER_CTRC_(ORIGIN_REPLY_TRACE|LOCAL_BATCH_REPLY_TRACE)_PRESENT 1$$/ { print; markers++ } \
+	     /^typedef struct CtrcOriginBatchReplyTrace CtrcOriginBatchReplyTrace;/ { print; forward++ } \
 	     /^typedef struct CtrcOriginBatchTraceState / { emit=1; state++ } \
 	     /^struct CtrcOriginBatchReplyTrace / { emit=1; batch++ } \
 	     /^static uint64 CtrcReplyTrace(Sequence|UnsafeSkipped);/ { print; counters++ } \
+	     /ctrc_origin_(reply_trace|batch_trace_(state|before|after))\(/ { references++ } \
 	     emit { print } emit && /^}/ { emit=0 } \
-	     END { if (forward != 1 || state != 1 || batch != 1 || counters != 2 || emit) exit 1 }' $< > $@.tmp
+	     END { if (emit || (references == 0 ? markers || forward || state || batch || counters : markers != 2 || forward != 1 || state != 1 || batch != 1 || counters != 2)) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_ctrc_origin_reply.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
 	@awk 'BEGIN { pattern = "^(ctrc_origin_reply_trace_lock|ctrc_origin_reply_trace|ctrc_origin_batch_trace_state|ctrc_origin_batch_trace_before|ctrc_origin_batch_trace_after|ctrc_origin_ack_entries|ctrc_origin_ack_index|ctrc_origin_frozen_touch_set_valid|cluster_ctrc_origin_begin_seal_entry|cluster_ctrc_origin_arm_close_entry|cluster_ctrc_origin_note_close_reply_entry|cluster_ctrc_origin_begin_cleaning_entry|cluster_ctrc_origin_ack_land_entry|ctrc_origin_ack_land_locked|cluster_ctrc_origin_ack_land_shared|cluster_ctrc_origin_certificate_validate|cluster_ctrc_origin_certificate_snapshot_entry|cluster_ctrc_origin_certificate_commit_entry|ctrc_origin_certificate_snapshot_index_locked|ctrc_origin_certificate_commit_shared|cluster_ctrc_origin_arm_certificate_entry|cluster_ctrc_origin_note_certificate_reply_entry|ctrc_origin_release_reclaim_locked|ctrc_origin_note_certificate_match_locked|cluster_ctrc_origin_note_certificate_reply_shared)\\(" } \
+	     /^#define CLUSTER_CTRC_(ORIGIN_REPLY_TRACE|LOCAL_BATCH_REPLY_TRACE)_PRESENT 1$$/ { markers++ } \
 	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); ret=prev; sub(/^static[ \t]+/, "", ret); candidate=1; head=1; text=""; decl="" } \
-	     candidate { text=text $$0 "\n"; if (/^\{/) { head=0; if (seen[name]++) exit 1; order[++found]=name; returns[name]="static " ret } else if (head) { decl=decl $$0 "\n"; if (/;[ \t]*$$/) candidate=0 } } \
+	     candidate { text=text $$0 "\n"; if (/^\{/) { head=0; if (seen[name]++) exit 1; order[++found]=name; returns[name]="static " ret; if (name ~ /^ctrc_origin_(reply_trace|batch_trace_)/) traces++ } else if (head) { decl=decl $$0 "\n"; if (/;[ \t]*$$/) candidate=0 } } \
 	     candidate && /^}/ { candidate=0; body[name]=text; declaration[name]=decl; done++ } { prev=$$0 } \
-	     END { if (found != 25 || done != 25 || candidate) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< >> $@.tmp
+	     END { if (candidate || done != found || (markers == 0 ? found != 20 || traces != 0 : markers != 2 || found != 25 || traces != 5)) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Exact original certificate publisher; I/O and scheduling leaves are controlled.
@@ -2784,9 +2904,27 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_ctrc_types.inc test_cluster_heap_ctrc_begin.inc \
 		test_cluster_heap_ctrc_step.inc test_cluster_heap_ctrc_origin.inc \
 		test_cluster_heap_ctrc_participant.inc test_cluster_heap_ctrc_terminal.inc \
+		test_cluster_heap_itl_finish_discharge.inc \
+		test_cluster_heap_itl_publication.inc \
+		test_cluster_heap_touch_authority.inc \
+		test_cluster_heap_resident_stamp_types.inc test_cluster_heap_resident_stamp.inc \
+		test_cluster_heap_private_ref.inc $(top_srcdir)/src/include/utils/hsearch.h \
+		test_cluster_heap_primitive_pin.inc \
+		test_cluster_heap_lookup_pin.inc $(top_srcdir)/src/include/utils/memdebug.h \
+		$(top_srcdir)/src/include/utils/resowner.h \
+		$(top_srcdir)/src/include/utils/memutils.h \
+		$(top_srcdir)/src/include/utils/palloc.h \
+		$(top_srcdir)/src/include/cluster/cluster_itl_touch.h \
+		$(top_srcdir)/src/include/cluster/cluster_sf_dep.h \
+		$(top_srcdir)/src/include/access/generic_xlog.h \
+		$(top_srcdir)/src/include/cluster/cluster_itl.h \
 		test_cluster_heap_ctrc_certificate.inc $(top_srcdir)/src/include/port/pg_crc32c.h \
+		test_cluster_heap_ctrc_g_scan_relock.inc \
 		test_cluster_heap_ctrc_ack.inc $(top_srcdir)/src/common/sha2_int.h \
 		test_cluster_heap_ctrc_origin_reply.inc \
+		test_cluster_heap_ctrc_g_required_ack_decl.inc \
+		test_cluster_heap_ctrc_g_required_ack_body.inc \
+		test_cluster_heap_ctrc_origin_reply_trace_types.inc \
 		test_cluster_heap_ctrc_durable_certificate.inc \
 		$(top_srcdir)/src/include/utils/memutils.h \
 		test_cluster_heap_freeze_cohort_current.inc \
@@ -2803,12 +2941,16 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_freeze_worker_publisher.inc \
 		test_cluster_heap_freeze_worker_pass.inc \
 		test_cluster_heap_freeze_pgproc_types.inc test_cluster_heap_freeze_pgproc_sample.inc \
+		test_cluster_heap_freeze_pgproc_exit.inc \
 		test_cluster_heap_freeze_stripe_future.inc \
 		$(top_srcdir)/src/include/storage/proc.h $(top_srcdir)/src/include/access/transam.h \
 		test_cluster_heap_freeze_lease_current.inc \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe.h \
 		test_cluster_active_sample_types.inc test_cluster_active_sample_fence.inc \
 		test_cluster_heap_freeze_admission_current.inc \
+		test_cluster_heap_freeze_admission_lifecycle.inc \
+		$(top_srcdir)/src/include/cluster/cluster_wal_thread.h \
+		test_cluster_heap_freeze_startup_types.inc test_cluster_heap_freeze_startup_source.inc \
 		$(top_srcdir)/src/include/cluster/cluster_reconfig.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_horizon.h \
@@ -2816,6 +2958,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_freeze_policy_current.inc \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
 		test_cluster_vacuum_observed_bounds.inc test_cluster_vacuum_freeze_bound_observer.inc \
+		test_cluster_vacuum_admitted_phase.inc \
 		test_cluster_freeze_writer_context.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) test_cluster_heap_maintenance_policy.inc unit_test.h \
 		test_cluster_heap_borrowed_pin.inc $(top_srcdir)/src/include/storage/bufmgr.h \
 		test_cluster_vacuum_freeze_locators.inc \
@@ -6289,14 +6432,27 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_freeze_worker_pass.inc test_cluster_heap_freeze_worker_pass.inc.tmp
 	rm -f test_cluster_heap_freeze_pgproc_types.inc test_cluster_heap_freeze_pgproc_types.inc.tmp
 	rm -f test_cluster_heap_freeze_pgproc_sample.inc test_cluster_heap_freeze_pgproc_sample.inc.tmp
+	rm -f test_cluster_heap_freeze_pgproc_exit.inc test_cluster_heap_freeze_pgproc_exit.inc.tmp
 	rm -f test_cluster_heap_ctrc_types.inc test_cluster_heap_ctrc_types.inc.tmp test_cluster_heap_ctrc_begin.inc test_cluster_heap_ctrc_begin.inc.tmp
 	rm -f test_cluster_heap_ctrc_step.inc test_cluster_heap_ctrc_step.inc.tmp
 	rm -f test_cluster_heap_ctrc_origin.inc test_cluster_heap_ctrc_origin.inc.tmp
 	rm -f test_cluster_heap_ctrc_participant.inc test_cluster_heap_ctrc_participant.inc.tmp
 	rm -f test_cluster_heap_ctrc_terminal.inc test_cluster_heap_ctrc_terminal.inc.tmp
+	rm -f test_cluster_heap_itl_finish_discharge.inc test_cluster_heap_itl_finish_discharge.inc.tmp
+	rm -f test_cluster_heap_itl_publication.inc test_cluster_heap_itl_publication.inc.tmp
+	rm -f test_cluster_heap_touch_authority.inc test_cluster_heap_touch_authority.inc.tmp
+	rm -f test_cluster_heap_resident_stamp_types.inc test_cluster_heap_resident_stamp_types.inc.tmp
+	rm -f test_cluster_heap_resident_stamp.inc test_cluster_heap_resident_stamp.inc.tmp
+	rm -f test_cluster_heap_lookup_pin.inc test_cluster_heap_lookup_pin.inc.tmp
+	rm -f test_cluster_heap_primitive_pin.inc test_cluster_heap_primitive_pin.inc.tmp
+	rm -f test_cluster_heap_private_ref.inc test_cluster_heap_private_ref.inc.tmp
 	rm -f test_cluster_heap_ctrc_certificate.inc test_cluster_heap_ctrc_certificate.inc.tmp
+	rm -f test_cluster_heap_ctrc_g_scan_relock.inc test_cluster_heap_ctrc_g_scan_relock.inc.tmp
 	rm -f test_cluster_heap_ctrc_ack.inc test_cluster_heap_ctrc_ack.inc.tmp
 	rm -f test_cluster_heap_ctrc_origin_reply.inc test_cluster_heap_ctrc_origin_reply.inc.tmp
+	rm -f test_cluster_heap_ctrc_g_required_ack_decl.inc test_cluster_heap_ctrc_g_required_ack_decl.inc.tmp
+	rm -f test_cluster_heap_ctrc_g_required_ack_body.inc test_cluster_heap_ctrc_g_required_ack_body.inc.tmp
+	rm -f test_cluster_heap_ctrc_origin_reply_trace_types.inc test_cluster_heap_ctrc_origin_reply_trace_types.inc.tmp
 	rm -f test_cluster_heap_ctrc_durable_certificate.inc test_cluster_heap_ctrc_durable_certificate.inc.tmp
 	rm -f test_cluster_heap_ctrc_attachment.inc test_cluster_heap_ctrc_attachment.inc.tmp
 	rm -f test_cluster_heap_ctrc_ready.inc test_cluster_heap_ctrc_ready.inc.tmp
@@ -8950,6 +9106,65 @@ $(CLUSTER_MULTIXACT_MATERIALIZER_TEST_O): \
 		-DGetMultiXactIdMembers=cluster_multixact_test_native_members_unused \
 		-ffunction-sections -fdata-sections -c $< -o $@
 
+# Exercise the real publication body using the original c.h Assert definitions.
+# The two profiles differ only in configured USE_ASSERT_CHECKING; copying these
+# two unchanged headers makes their relative pg_config.h include unambiguous.
+MX_PUBLICATION_PROFILE = tmp_check/current_mx_publication
+MX_PUBLICATION_CONFIGS = $(MX_PUBLICATION_PROFILE)/cassert/pg_config.h \
+	$(MX_PUBLICATION_PROFILE)/nocassert/pg_config.h
+$(MX_PUBLICATION_PROFILE)/cassert/pg_config.h: MX_PUBLICATION_ASSERT = \#define USE_ASSERT_CHECKING 1
+$(MX_PUBLICATION_CONFIGS): $(top_builddir)/src/include/pg_config.h Makefile
+	$(MKDIR_P) $(@D)
+	awk '!/^#define USE_ASSERT_CHECKING([ \t]|$$)/ && !/^\/\* #undef USE_ASSERT_CHECKING \*\/$$/' $< > $@.tmp
+	printf '%s\n' '$(MX_PUBLICATION_ASSERT)' >> $@.tmp
+	mv $@.tmp $@
+
+$(MX_PUBLICATION_PROFILE)/%/postgres.h: $(top_srcdir)/src/include/postgres.h
+	$(MKDIR_P) $(@D)
+	cp $< $@
+
+$(MX_PUBLICATION_PROFILE)/%/c.h: $(top_srcdir)/src/include/c.h
+	$(MKDIR_P) $(@D)
+	cp $< $@
+
+test_cluster_current_mx_publication_types.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^typedef struct (ClusterHeapDmlAuthorityGuard|ClusterCurrentMxStampPlan)$$/ { emit=1; n++ } emit { print } /^} .*;/ { emit=0 } END { if (n != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_current_mx_publication.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^cluster_current_mx_stamp_published\(/ { print "static void"; emit=1; n++ } emit { print } /^}/ { emit=0 } END { if (n != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_current_mx_publication_transition.inc: $(top_srcdir)/src/backend/cluster/cluster_multixact_current.c Makefile
+	awk '/^cluster_multixact_current_heap_publish_transition\(/ { print "static bool"; emit=1; n++ } emit { print } /^}/ { emit=0 } END { if (n != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+MX_PUBLICATION_INCLUDES = test_cluster_current_mx_publication_types.inc \
+	test_cluster_current_mx_publication.inc test_cluster_current_mx_publication_transition.inc
+MX_PUBLICATION_TESTS = test_cluster_current_mx_publication_cassert test_cluster_current_mx_publication_nocassert
+
+test_cluster_current_mx_publication_cassert: MX_PUBLICATION_MODE = cassert
+test_cluster_current_mx_publication_cassert: MX_PUBLICATION_CPPFLAGS = -DPUBLICATION_EXPECT_CASSERT
+test_cluster_current_mx_publication_nocassert: MX_PUBLICATION_MODE = nocassert
+$(MX_PUBLICATION_TESTS): test_cluster_current_mx_publication.c unit_test.h $(MX_PUBLICATION_INCLUDES)
+	$(CC) $(CFLAGS) -I$(MX_PUBLICATION_PROFILE)/$(MX_PUBLICATION_MODE) $(CPPFLAGS) \
+		$(MX_PUBLICATION_CPPFLAGS) $< -o $@
+
+test_cluster_current_mx_publication_cassert: $(MX_PUBLICATION_PROFILE)/cassert/pg_config.h \
+	$(MX_PUBLICATION_PROFILE)/cassert/postgres.h $(MX_PUBLICATION_PROFILE)/cassert/c.h
+test_cluster_current_mx_publication_nocassert: $(MX_PUBLICATION_PROFILE)/nocassert/pg_config.h \
+	$(MX_PUBLICATION_PROFILE)/nocassert/postgres.h $(MX_PUBLICATION_PROFILE)/nocassert/c.h
+
+.PHONY: check-current-mx-publication clean-current-mx-publication
+check-current-mx-publication: $(MX_PUBLICATION_TESTS)
+	./test_cluster_current_mx_publication_cassert
+	./test_cluster_current_mx_publication_nocassert
+
+clean distclean maintainer-clean: clean-current-mx-publication
+clean-current-mx-publication:
+	rm -f $(MX_PUBLICATION_TESTS) $(MX_PUBLICATION_INCLUDES) $(addsuffix .tmp,$(MX_PUBLICATION_INCLUDES))
+	rm -rf $(MX_PUBLICATION_PROFILE)
+
 test_cluster_multixact_current: test_cluster_multixact_current.c unit_test.h \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
 		$(CLUSTER_CR_SERVER_C0_TEST_O) $(CLUSTER_MULTIXACT_MATERIALIZER_TEST_O)
@@ -9957,6 +10172,20 @@ test_cluster_active_sample_types.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     END { if (count != 3 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Use the full original Startup completion layout and its read-only predicates.
+test_cluster_heap_freeze_startup_types.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^typedef struct ClusterNormalStartCompletion [{]$$/ { emit=1; found++ } \
+	     /^static ClusterNormalStartCompletion \*NormalStartCompletion;/ { if (emit) { emit=0; done++ } } \
+	     emit { print } END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_freeze_startup_source.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^cluster_semantic_normal_start_state\(/ { print "ClusterNormalStartState"; emit=1; found++ } \
+	     /^normal_start_(shared_configured|bootstrap_allowed|serving_allowed)\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (found != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 # Execute the original ordinary TARGET and read-only census admission checks.
 test_cluster_heap_freeze_admission_current.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
 	awk '/^semantic_activation_(admission_policy|r4_terminal_census_policy)\(/ { print "static ClusterSemanticAdmissionResult"; emit=1; count++ } \
@@ -9964,6 +10193,19 @@ test_cluster_heap_freeze_admission_current.inc: $(top_srcdir)/src/backend/cluste
 	     /^cluster_semantic_activation_recheck(_r4_terminal_census)?\(/ { print "bool"; emit=1; count++ } \
 	     emit { print } /^}$$/ { emit=0 } \
 	     END { if (count != 6 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Original terminal-census admission, debt counters and backend exit cleanup.
+test_cluster_heap_freeze_admission_lifecycle.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^#define CLUSTER_SEMANTIC_ADMISSION_COUNTER_TRIES / { print; constants++ } \
+	     /^cluster_semantic_activation_backend_has_admission\(/ { print "bool"; emit=1; count++ } \
+	     /^semantic_activation_(counter_increment|ensure_exit_hook)\(/ { print "static bool"; emit=1; count++ } \
+	     /^semantic_activation_(counter_subtract|exit_cleanup|release_debt)\(/ { print "static void"; emit=1; count++ } \
+	     /^semantic_activation_enter_internal\(/ { print "static ClusterSemanticAdmissionResult"; emit=1; count++ } \
+	     /^cluster_semantic_activation_enter_r4_terminal_census\(/ { print "ClusterSemanticAdmissionResult"; emit=1; count++ } \
+	     /^cluster_semantic_activation_leave\(/ { print "void"; emit=1; count++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (count != 9 || constants != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_active_sample_fence.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
@@ -12116,8 +12358,20 @@ test_cluster_vacuum_shared_mx.inc: $(top_srcdir)/src/backend/access/heap/vacuuml
 test_cluster_vacuum_proof_cleanup.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
 	awk '/^lazy_cleanout_shared_freeze_page\(/ { print "static bool"; emit=1; cleanout++ } \
 	     /^lazy_shared_freeze_transport_snapshot\(/ { print "static void"; emit=1; cost++ } \
-	     /^(lazy_recheck_shared_freeze_page|lazy_observe_shared_freeze_bounds|lazy_collect_shared_freeze_proofs)\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 3 || cleanout > 1 || cost > 1) exit 1 }' $< > $@.tmp
+	     /^(lazy_recheck_shared_freeze_page|lazy_observe_shared_freeze_bounds|lazy_collect_shared_freeze_proofs(_admitted)?)\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 4 || cleanout > 1 || cost > 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# The real seqlock read used by opt-in collector admission ownership tests.
+test_cluster_vacuum_admitted_phase.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/^lazy_collect_shared_freeze_proofs_admitted\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vacuum_admission_snapshot.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^semantic_activation_snapshot\(/ { print "static bool"; emit=1; count++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_vacuum_freeze_bound_observer.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
@@ -12128,6 +12382,7 @@ test_cluster_vacuum_freeze_bound_observer.inc: $(top_srcdir)/src/backend/access/
 .PHONY: clean-vacuum-freeze-bound-observer
 clean-vacuum-freeze-bound-observer:
 	rm -f test_cluster_vacuum_freeze_bound_observer.inc test_cluster_vacuum_freeze_bound_observer.inc.tmp
+	rm -f test_cluster_vacuum_admission_snapshot.inc test_cluster_vacuum_admission_snapshot.inc.tmp
 
 clean distclean maintainer-clean: clean-vacuum-freeze-bound-observer
 
@@ -12164,9 +12419,12 @@ test_cluster_vacuum_observed_bounds.inc: $(top_srcdir)/src/backend/cluster/clust
 	mv $@.tmp $@
 
 test_cluster_vacuum_proof_cleanup: test_cluster_vacuum_proof_cleanup.c unit_test.h \
+		test_cluster_heap_borrowed_pin.inc \
 		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h \
 		$(top_srcdir)/src/include/cluster/cluster_scn.h test_cluster_heap_small_scn.inc \
 		test_cluster_vacuum_observed_bounds.inc \
+		test_cluster_active_sample_types.inc test_cluster_vacuum_admission_snapshot.inc \
+		test_cluster_heap_freeze_admission_current.inc test_cluster_heap_freeze_admission_lifecycle.inc \
 		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
 		$(top_srcdir)/src/include/commands/vacuum.h \
@@ -12834,6 +13092,9 @@ clean-active-sample-fence:
 	rm -f test_cluster_active_sample_types.inc test_cluster_active_sample_types.inc.tmp
 	rm -f test_cluster_active_sample_fence.inc test_cluster_active_sample_fence.inc.tmp
 	rm -f test_cluster_heap_freeze_admission_current.inc test_cluster_heap_freeze_admission_current.inc.tmp
+	rm -f test_cluster_heap_freeze_admission_lifecycle.inc test_cluster_heap_freeze_admission_lifecycle.inc.tmp
+	rm -f test_cluster_heap_freeze_startup_types.inc test_cluster_heap_freeze_startup_types.inc.tmp
+	rm -f test_cluster_heap_freeze_startup_source.inc test_cluster_heap_freeze_startup_source.inc.tmp
 
 clean distclean maintainer-clean: clean-retention-sample
 .PHONY: clean-retention-sample
