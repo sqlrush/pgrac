@@ -1712,10 +1712,379 @@ UT_TEST(recursive_callers_preserve_absent_native_and_local_pin_controls)
 		}
 }
 
+/* Keep the existing DML wait leaves above independent. These services observe
+ * the row-lock caller while the original priority helper and branch execute. */
+static unsigned row_priority_calls, row_priority_pins, row_transaction_calls, row_transaction_pins;
+static unsigned row_bridge_calls;
+static bool row_priority_allow, row_transaction_allow, row_multi, row_creator_change;
+static bool row_failed, row_restarted, row_have_priority;
+static int row_wait_error;
+static TM_Result row_result;
+
+static void
+row_priority(Relation rel, ItemPointer tid, LOCKMODE mode)
+{
+	UT_ASSERT(rel == &relation && !locked);
+	UT_ASSERT_EQ(ItemPointerGetBlockNumber(tid), 17);
+	UT_ASSERT_EQ(ItemPointerGetOffsetNumber(tid), 2);
+	UT_ASSERT_EQ(mode, AccessExclusiveLock);
+	row_priority_calls++;
+	row_priority_pins += vm_pinned;
+	if (row_wait_error == 1)
+		elog(ERROR, "controlled row priority service error");
+}
+
+void
+LockTuple(Relation rel, ItemPointer tid, LOCKMODE mode)
+{
+	row_priority(rel, tid, mode);
+}
+
+bool
+ConditionalLockTuple(Relation rel, ItemPointer tid, LOCKMODE mode)
+{
+	row_priority(rel, tid, mode);
+	return row_priority_allow;
+}
+
+#define heap_acquire_tuplock row_heap_acquire_tuplock
+#include "test_cluster_heap_row_wait_helpers.inc"
+#undef heap_acquire_tuplock
+#undef LockTupleTuplock
+#undef ConditionalLockTupleTuplock
+
+static bool
+row_transaction(TransactionId xid)
+{
+	UT_ASSERT_EQ(xid, 345);
+	UT_ASSERT(!locked);
+	row_transaction_calls++;
+	row_transaction_pins += vm_pinned;
+	if (row_wait_error == 2)
+		elog(ERROR, "controlled row transaction service error");
+	if (row_creator_change) {
+		HeapTupleHeaderSetXmin(
+			(HeapTupleHeader)PageGetItem(incoming.data, PageGetItemId(incoming.data, 2)), 701);
+		replace_image = true;
+	}
+	return row_transaction_allow;
+}
+
+static void
+row_xid_wait(TransactionId xid, Relation rel, ItemPointer tid, XLTW_Oper oper)
+{
+	UT_ASSERT(rel == &relation && tid == &tuple.t_self && oper == XLTW_Lock);
+	(void)row_transaction(xid);
+}
+
+static bool
+row_conditional_xid_wait(TransactionId xid)
+{
+	return row_transaction(xid);
+}
+
+static void
+row_mx_wait(MultiXactId multi, MultiXactStatus status, uint16 infomask, Relation rel,
+			ItemPointer tid, XLTW_Oper oper, int *remaining)
+{
+	UT_ASSERT(rel == &relation && tid == &tuple.t_self && oper == XLTW_Lock);
+	UT_ASSERT_EQ(status, MultiXactStatusForUpdate);
+	UT_ASSERT_EQ(infomask, HEAP_XMAX_IS_MULTI);
+	UT_ASSERT(remaining == NULL);
+	(void)row_transaction(multi);
+}
+
+static bool
+row_conditional_mx_wait(MultiXactId multi, MultiXactStatus status, uint16 infomask, Relation rel,
+						int *remaining)
+{
+	UT_ASSERT(rel == &relation && remaining == NULL);
+	UT_ASSERT_EQ(status, MultiXactStatusForUpdate);
+	UT_ASSERT_EQ(infomask, HEAP_XMAX_IS_MULTI);
+	return row_transaction(multi);
+}
+
+/* Controlled LOCAL classification only; this does not exercise the bridge's
+ * remote proof or wait, whose VM-pin ownership is a separate boundary. */
+static bool
+cluster_heap_writer_wait_failclosed(Relation rel, Buffer buffer, HeapTuple target,
+									TransactionId xid, uint16 infomask, LockWaitPolicy policy,
+									TM_Result *result, uint64 *deadline)
+{
+	UT_ASSERT(rel == &relation && target == &tuple && locked);
+	UT_ASSERT_EQ(buffer, 1);
+	UT_ASSERT_EQ(xid, 345);
+	UT_ASSERT_EQ(infomask, 0);
+	UT_ASSERT_EQ(*deadline, 0);
+	row_bridge_calls++;
+	return false;
+}
+
+void
+cluster_heap_stamp_released_xmax_invalid(HeapTupleHeader header, Buffer buffer)
+{
+	UT_ASSERT(false); /* A controlled LOCAL result must not stamp authority. */
+}
+
+static void
+row_update_xmax_hint(HeapTupleHeader header, Buffer buffer, TransactionId xid)
+{
+	UT_ASSERT(locked && buffer == 1 && xid == 345);
+	UT_ASSERT(header == tuple.t_data);
+}
+
+static void
+reset_row_wait(bool cached, bool multi, bool peers)
+{
+	reset_recursive_call(cached, false);
+	recursive_peers = peers;
+	recursive_conf.node_count = peers ? 2 : 1;
+	row_multi = multi;
+	row_priority_calls = row_priority_pins = row_transaction_calls = row_transaction_pins = 0;
+	row_bridge_calls = 0;
+	row_priority_allow = row_transaction_allow = true;
+	row_creator_change = row_failed = row_restarted = row_have_priority = false;
+	row_wait_error = 0;
+	row_result = TM_BeingModified;
+	for (int current = 0; current < 2; current++) {
+		Page page = current ? incoming.data : pages[0].data;
+		HeapTupleHeader header = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, 2));
+
+		header->t_infomask = multi ? HEAP_XMAX_IS_MULTI : 0;
+	}
+}
+
+/* Full original require-sleep branch, including peer rechecks, native wait
+ * policies, root rebind and xmax comparison. Recursion is disabled input. */
+static void
+row_wait(LockWaitPolicy wait_policy, bool skip_tuple_lock, bool already_locked, TM_Result initial)
+{
+	Relation rel = &relation;
+	Relation relation = rel;
+	HeapTuple target = &tuple;
+	HeapTuple tuple = target;
+	Buffer heap = 1, *buffer = &heap, vmbuffer = vm;
+	Page page = pages[0].data;
+	ItemPointer tid = &tuple->t_self;
+	ItemPointerData t_ctid = tuple->t_data->t_ctid;
+	TransactionId creation_xmin = creator, xwait = 345;
+	uint16 infomask = row_multi ? HEAP_XMAX_IS_MULTI : 0;
+	uint64 cluster_writer_wait_deadline_us = 0;
+	LockTupleMode mode = LockTupleExclusive;
+	TM_Result result = initial;
+	bool require_sleep = true, follow_updates = false, have_tuple_lock = already_locked;
+
+#define heap_acquire_tuplock row_heap_acquire_tuplock
+#define MultiXactIdWait row_mx_wait
+#define ConditionalMultiXactIdWait row_conditional_mx_wait
+#define XactLockTableWait row_xid_wait
+#define ConditionalXactLockTableWait row_conditional_xid_wait
+#define UpdateXmaxHintBits row_update_xmax_hint
+#include "test_cluster_heap_row_wait_vm.inc"
+#undef heap_acquire_tuplock
+#undef MultiXactIdWait
+#undef ConditionalMultiXactIdWait
+#undef XactLockTableWait
+#undef ConditionalXactLockTableWait
+#undef UpdateXmaxHintBits
+	(void)get_mxact_status_for_lock;
+	goto done;
+l3:
+	row_restarted = true;
+	goto done;
+failed:
+	row_failed = true;
+done:
+	row_result = result;
+	row_have_priority = have_tuple_lock;
+	creator = creation_xmin;
+	vm = vmbuffer;
+}
+
+static bool
+row_wait_catches_error(LockWaitPolicy policy)
+{
+	sigjmp_buf jump;
+	volatile bool caught = false;
+
+	PG_exception_stack = &jump;
+	if (sigsetjmp(jump, 0) == 0)
+		row_wait(policy, false, false, TM_BeingModified);
+	else
+		caught = true;
+	PG_exception_stack = NULL;
+	return caught;
+}
+
+UT_TEST(row_waits_drop_pins_before_priority_and_requalified_native_waits)
+{
+	for (int multi = 0; multi < 2; multi++)
+		for (int peers = 0; peers < 2; peers++) {
+			reset_row_wait(true, multi != 0, peers != 0);
+			row_wait(LockWaitBlock, false, false, TM_BeingModified);
+			check_current();
+			UT_ASSERT_EQ(row_priority_pins + row_transaction_pins, 0);
+			UT_ASSERT_EQ(row_priority_calls, 1);
+			UT_ASSERT_EQ(row_transaction_calls, 1);
+			UT_ASSERT_EQ(row_bridge_calls, peers && !multi);
+			UT_ASSERT(row_have_priority && !row_failed && !row_restarted && vm_pinned);
+			UT_ASSERT_EQ(waits, peers ? 2 : 1);
+		}
+}
+
+UT_TEST(row_waits_preserve_all_native_wait_policies)
+{
+	for (int policy = LockWaitBlock; policy <= LockWaitError; policy++)
+		for (int multi = 0; multi < 2; multi++)
+			for (int peers = 0; peers < 2; peers++) {
+				reset_row_wait(true, multi != 0, peers != 0);
+				row_wait((LockWaitPolicy)policy, false, false, TM_BeingModified);
+				check_current();
+				UT_ASSERT_EQ(row_priority_pins + row_transaction_pins, 0);
+				UT_ASSERT_EQ(row_priority_calls, 1);
+				UT_ASSERT_EQ(row_transaction_calls, 1);
+				UT_ASSERT(row_have_priority && !row_failed && !row_restarted);
+			}
+}
+
+UT_TEST(row_waits_keep_preheld_priority_and_skip_decisions)
+{
+	for (int multi = 0; multi < 2; multi++)
+		for (int peers = 0; peers < 2; peers++)
+			for (int profile = 0; profile < 3; profile++) {
+				reset_row_wait(true, multi != 0, peers != 0);
+				row_wait(LockWaitBlock, profile == 1, profile == 2, TM_BeingModified);
+				check_current();
+				UT_ASSERT_EQ(row_priority_pins + row_transaction_pins, 0);
+				UT_ASSERT_EQ(row_priority_calls, profile == 0);
+				UT_ASSERT_EQ(row_transaction_calls, 1);
+				UT_ASSERT_EQ(row_have_priority, profile != 1);
+			}
+}
+
+UT_TEST(row_priority_refusal_keeps_original_skip_and_error_results)
+{
+	for (int policy = LockWaitSkip; policy <= LockWaitError; policy++) {
+		reset_row_wait(true, false, true);
+		row_priority_allow = false;
+		if (policy == LockWaitError)
+			UT_ASSERT(row_wait_catches_error((LockWaitPolicy)policy) && !locked && !vm_pinned);
+		else {
+			row_wait((LockWaitPolicy)policy, false, false, TM_BeingModified);
+			check_current();
+			UT_ASSERT(row_failed && !row_have_priority);
+			UT_ASSERT_EQ(row_result, TM_WouldBlock);
+		}
+		UT_ASSERT_EQ(row_priority_pins + row_transaction_pins, 0);
+		UT_ASSERT_EQ(row_transaction_calls + row_bridge_calls, 0);
+	}
+}
+
+UT_TEST(row_transaction_refusal_keeps_original_skip_and_error_results)
+{
+	for (int policy = LockWaitSkip; policy <= LockWaitError; policy++)
+		for (int multi = 0; multi < 2; multi++)
+			for (int peers = 0; peers < 2; peers++) {
+				reset_row_wait(true, multi != 0, peers != 0);
+				row_transaction_allow = false;
+				if (policy == LockWaitError)
+					UT_ASSERT(row_wait_catches_error((LockWaitPolicy)policy) && !locked
+							  && !vm_pinned);
+				else {
+					row_wait((LockWaitPolicy)policy, false, false, TM_BeingModified);
+					check_current();
+					UT_ASSERT(row_failed && row_have_priority);
+					UT_ASSERT_EQ(row_result, TM_WouldBlock);
+				}
+				UT_ASSERT_EQ(row_priority_pins + row_transaction_pins, 0);
+				UT_ASSERT_EQ(row_transaction_calls, 1);
+			}
+}
+
+UT_TEST(row_native_service_errors_retain_no_heap_content_or_vm_pin)
+{
+	for (int stage = 1; stage <= 2; stage++)
+		for (int multi = 0; multi < 2; multi++)
+			for (int peers = 0; peers < 2; peers++) {
+				reset_row_wait(true, multi != 0, peers != 0);
+				row_wait_error = stage;
+				UT_ASSERT(row_wait_catches_error(LockWaitBlock));
+				UT_ASSERT(!locked && !vm_pinned);
+				UT_ASSERT_EQ(row_priority_pins + row_transaction_pins, 0);
+			}
+}
+
+UT_TEST(row_waits_reobserve_current_and_residency_after_peer_rechecks)
+{
+	for (int multi = 0; multi < 2; multi++)
+		for (int peers = 0; peers < 2; peers++)
+			for (int visible = 0; visible < 2; visible++) {
+				reset_row_wait(true, multi != 0, peers != 0);
+				if (visible)
+					misses = 3;
+				else
+					PageClearAllVisible(incoming.data);
+				row_wait(LockWaitBlock, false, false, TM_BeingModified);
+				check_current();
+				UT_ASSERT_EQ(row_priority_pins + row_transaction_pins, 0);
+				UT_ASSERT_EQ(waits, (peers ? 2 : 1) + (visible ? 3 : 0));
+				UT_ASSERT_EQ(vm_pinned, visible != 0);
+			}
+}
+
+UT_TEST(row_native_wait_keeps_original_creator_refusal)
+{
+	for (int multi = 0; multi < 2; multi++)
+		for (int peers = 0; peers < 2; peers++) {
+			reset_row_wait(true, multi != 0, peers != 0);
+			row_creator_change = true;
+			UT_ASSERT(row_wait_catches_error(LockWaitBlock) && locked);
+			UT_ASSERT_EQ(row_priority_pins + row_transaction_pins + waits_with_vm, 0);
+			UT_ASSERT_EQ(row_transaction_calls, 1);
+			UT_ASSERT_EQ(creator, 700);
+		}
+}
+
+UT_TEST(row_waits_preserve_absent_native_and_local_pin_controls)
+{
+	for (int multi = 0; multi < 2; multi++)
+		for (int profile = 0; profile < 3; profile++) {
+			reset_row_wait(profile != 0, multi != 0, profile != 0);
+			if (profile == 1)
+				cluster_enabled = false;
+			else if (profile == 2)
+				form.relpersistence = RELPERSISTENCE_TEMP;
+			if (profile != 0)
+				replace_image = false;
+			row_wait(LockWaitBlock, false, false, TM_BeingModified);
+			UT_ASSERT(locked && vm_pinned);
+			UT_ASSERT_EQ(row_priority_pins, profile != 0);
+			UT_ASSERT_EQ(row_transaction_pins, profile != 0);
+			if (profile == 0)
+				check_current();
+			else
+				UT_ASSERT_EQ(releases + repins, 0);
+		}
+}
+
+UT_TEST(row_committed_update_or_delete_keeps_original_immediate_failure)
+{
+	for (int deleted = 0; deleted < 2; deleted++) {
+		TM_Result expected = deleted ? TM_Deleted : TM_Updated;
+
+		reset_row_wait(true, false, true);
+		row_wait(LockWaitBlock, false, false, expected);
+		check_current();
+		UT_ASSERT(row_failed && !row_have_priority);
+		UT_ASSERT_EQ(row_result, expected);
+		UT_ASSERT_EQ(row_priority_calls + row_transaction_calls + row_bridge_calls, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(56);
+	UT_PLAN(66);
 	UT_RUN(cached_vm_pin_is_released_before_heap_current);
 	UT_RUN(cold_vm_is_prepared_outside_heap_content);
 	UT_RUN(new_all_visible_image_gets_exact_pin_before_tuple_rebind);
@@ -1772,6 +2141,16 @@ main(void)
 	UT_RUN(recursive_child_error_retains_no_outer_vm_pin_or_heap_content);
 	UT_RUN(recursive_child_wait_preserves_original_creator_refusal);
 	UT_RUN(recursive_callers_preserve_absent_native_and_local_pin_controls);
+	UT_RUN(row_waits_drop_pins_before_priority_and_requalified_native_waits);
+	UT_RUN(row_waits_preserve_all_native_wait_policies);
+	UT_RUN(row_waits_keep_preheld_priority_and_skip_decisions);
+	UT_RUN(row_priority_refusal_keeps_original_skip_and_error_results);
+	UT_RUN(row_transaction_refusal_keeps_original_skip_and_error_results);
+	UT_RUN(row_native_service_errors_retain_no_heap_content_or_vm_pin);
+	UT_RUN(row_waits_reobserve_current_and_residency_after_peer_rechecks);
+	UT_RUN(row_native_wait_keeps_original_creator_refusal);
+	UT_RUN(row_waits_preserve_absent_native_and_local_pin_controls);
+	UT_RUN(row_committed_update_or_delete_keeps_original_immediate_failure);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

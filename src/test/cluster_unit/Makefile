@@ -6219,6 +6219,8 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_native_wait_vm.inc test_cluster_heap_native_wait_vm.inc.tmp
 	rm -f test_cluster_heap_chain_call_vm.inc test_cluster_heap_chain_call_vm.inc.tmp \
 		test_cluster_heap_chain_call_primitives.inc test_cluster_heap_chain_call_primitives.inc.tmp
+	rm -f test_cluster_heap_row_wait_vm.inc test_cluster_heap_row_wait_vm.inc.tmp \
+		test_cluster_heap_row_wait_helpers.inc test_cluster_heap_row_wait_helpers.inc.tmp
 	rm -f test_cluster_heap_chain_receipt_types.inc test_cluster_heap_chain_receipt_reserve.inc \
 		test_cluster_heap_chain_receipt_prepare.inc test_cluster_heap_chain_receipt_boundary.inc
 	rm -f test_cluster_btree_structure_helpers.inc test_cluster_btree_structure_alloc.inc \
@@ -9614,11 +9616,32 @@ test_cluster_heap_chain_call_primitives.inc: $(top_srcdir)/src/backend/access/he
 	     $(top_srcdir)/src/backend/storage/page/itemptr.c >> $@.tmp
 	mv $@.tmp $@
 
+test_cluster_heap_row_wait_vm.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_lock_tuple_internal\(/ { in_fn=1 } \
+	     in_fn && /if \(require_sleep && \(result == TM_Updated \|\| result == TM_Deleted\)\)/ { emit=1; found++ } \
+	     emit { print; s=$$0; opens=gsub(/\{/, "", s); s=$$0; closes=gsub(/}/, "", s); \
+	       depth+=opens-closes; if (opens) opened=1; \
+	       if (opened && depth==0) { emit=0; done++; exit } } \
+	     /^}/ { in_fn=0 } END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_row_wait_helpers.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/Don.t look at lockstatus\/updstatus directly/ { ready=1 } \
+	     ready && /^static const struct/ { emit=3; tables++; ready=0 } \
+	     /^get_mxact_status_for_lock\(/ { print "static MultiXactStatus"; emit=1; helpers++ } \
+	     /^heap_acquire_tuplock\(/ { print "static bool"; emit=1; helpers++ } \
+	     /^#define (LockTupleTuplock|ConditionalLockTupleTuplock)\(/ { emit=2; macros++ } \
+	     emit { print } emit == 2 { if (macro_line) { emit=0; macro_line=0 } else macro_line=1 } \
+	     (emit == 1 && /^}$$/) || (emit == 3 && /^};$$/) { emit=0; done++ } \
+	     END { if (tables != 1 || helpers != 2 || macros != 2 || done != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_lock_vm_pin test_cluster_heap_lock_vm_pin_noassert: test_cluster_heap_lock_vm_pin.c unit_test.h \
 		test_cluster_heap_lock_rebind.inc test_cluster_heap_vm_unwind_helpers.inc \
 		test_cluster_heap_dml_vm_relock.inc \
 		test_cluster_heap_native_wait_vm.inc \
 		test_cluster_heap_chain_call_vm.inc test_cluster_heap_chain_call_primitives.inc \
+		test_cluster_heap_row_wait_vm.inc test_cluster_heap_row_wait_helpers.inc \
 		test_cluster_heap_lock_vm_recent.inc test_cluster_heap_lock_chain_pin.inc \
 		test_cluster_heap_chain_vm_itl.inc test_cluster_heap_chain_vm_no_itl.inc \
 		test_cluster_heap_chain_receipt_types.inc test_cluster_heap_chain_receipt_reserve.inc \

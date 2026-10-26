@@ -16789,6 +16789,13 @@ l3:
 			 * this arranges that we stay at the head of the line while
 			 * rechecking tuple state.
 			 */
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+			{
+				ReleaseBuffer(vmbuffer);
+				vmbuffer = InvalidBuffer;
+			}
+#endif
 			if (!skip_tuple_lock &&
 				!heap_acquire_tuplock(relation, tid, mode, wait_policy,
 									  &have_tuple_lock))
@@ -16844,6 +16851,11 @@ l3:
 								 errhint("Cross-node multixact wait is not yet supported; "
 										 "retry the transaction.")));
 					LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
+				}
+				if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+				{
+					ReleaseBuffer(vmbuffer);
+					vmbuffer = InvalidBuffer;
 				}
 #endif
 
@@ -16961,6 +16973,11 @@ l3:
 
 					/* LOCAL writer: PG's native wait below is correct. */
 					LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
+				}
+				if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+				{
+					ReleaseBuffer(vmbuffer);
+					vmbuffer = InvalidBuffer;
 				}
 #endif
 				/* wait for regular transaction to end, or die trying */
