@@ -102,6 +102,11 @@ const uint8 cluster_ctrc_empty_sha256[32] = {
 	0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
 };
 
+static bool ctrc_origin_required_ack_snapshot_entry(
+	const ClusterCtrcOriginEntry *origin,
+	const ClusterCtrcLocalReleaseAckV1 ack_slots[CLUSTER_CTRC_MAX_PARTICIPANTS],
+	uint64 origin_index, ClusterCtrcOriginCertificateSnapshot *snapshot);
+
 bool
 cluster_ctrc_sha256_exact(const void *bytes, Size length, uint8 digest[32])
 {
@@ -1860,6 +1865,7 @@ typedef struct CtrcCapacityCandidate {
 	uint64 index;
 	uint64 seal_generation;
 	ClusterCtrcTxnKeyV1 key;
+	uint8 phase;
 } CtrcCapacityCandidate;
 
 typedef struct CtrcCleanerBatch {
@@ -5039,6 +5045,45 @@ refuse:
 }
 
 #ifndef CLUSTER_CTRC_UNIT_TEST
+/* Caller holds origin_lock. Keep the actual notification bytes in the
+ * snapshot; the publication validator still accepts only CERTIFYING. */
+static bool
+ctrc_capacity_snapshot_index_locked(uint64 index, ClusterCtrcOriginCertificateSnapshot *snapshot)
+{
+	ClusterCtrcLocalReleaseAckV1 ack_slots[CLUSTER_CTRC_MAX_PARTICIPANTS] = { 0 };
+	const ClusterCtrcOriginEntry *origin;
+	uint64 nodes;
+
+	MemSet(snapshot, 0, sizeof(*snapshot));
+	if (CtrcShared->origin_key_entries == 0 || index >= CtrcShared->origin_key_entries
+		|| CtrcShared->origin_ack_inbox_entries % CtrcShared->origin_key_entries != 0)
+		return false;
+	origin = &ctrc_origin_entries()[index];
+	if (origin->state == CTRC_ORIGIN_CERTIFYING)
+		return ctrc_origin_certificate_snapshot_index_locked(index, snapshot);
+	if (origin->state != CTRC_ORIGIN_RELEASE_PROVEN
+		|| (origin->touched_bitmap & ~origin->close_confirmed_bitmap) == 0
+		|| (origin->close_dispatched_bitmap & ~origin->touched_bitmap) != 0
+		|| (origin->close_confirmed_bitmap & ~origin->close_dispatched_bitmap) != 0)
+		return false;
+	nodes = CtrcShared->origin_ack_inbox_entries / CtrcShared->origin_key_entries;
+	if (nodes == 0 || nodes > CLUSTER_CTRC_MAX_PARTICIPANTS)
+		return false;
+	for (uint16 node = 0; node < CLUSTER_CTRC_MAX_PARTICIPANTS; node++) {
+		uint32 bit = UINT32_C(1) << node;
+
+		if (((origin->close_dispatched_bitmap & bit) != 0) != (origin->close_request_id[node] != 0))
+			return false;
+		if (node >= nodes) {
+			if ((origin->touched_bitmap & bit) != 0)
+				return false;
+			continue;
+		}
+		ack_slots[node] = ctrc_origin_ack_entries()[index * nodes + node];
+	}
+	return ctrc_origin_required_ack_snapshot_entry(origin, ack_slots, index, snapshot);
+}
+
 /* Inventory only: no origin mutation, physical read or cached authority.
  * Advance the original cursor without enlarging a cleaner action batch. */
 static unsigned
@@ -5069,7 +5114,8 @@ ctrc_capacity_pool_candidates(uint64 epoch, CtrcCapacityCandidate *candidates,
 			observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_IDENTITY;
 			continue;
 		}
-		if (origin->state != CTRC_ORIGIN_CERTIFYING) {
+		if (origin->state != CTRC_ORIGIN_CERTIFYING
+			&& origin->state != CTRC_ORIGIN_RELEASE_PROVEN) {
 			observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_PHASE;
 			continue;
 		}
@@ -5078,6 +5124,7 @@ ctrc_capacity_pool_candidates(uint64 epoch, CtrcCapacityCandidate *candidates,
 		candidates[count].index = index;
 		candidates[count].seal_generation = origin->seal_generation;
 		candidates[count].key = origin->key;
+		candidates[count].phase = origin->state;
 		count++;
 	}
 	LWLockRelease(&CtrcShared->origin_lock);
@@ -5098,24 +5145,25 @@ ctrc_capacity_certificate_probe(const CtrcCapacityCandidate *candidate,
 								ClusterCapacityObservationV1 *observation)
 {
 	ClusterCtrcOriginCertificateSnapshot snapshot;
+	ClusterCtrcOriginCertificateSnapshot final_snapshot;
 	const ClusterCtrcOriginEntry *origin;
 	bool same_identity;
 	bool exact;
+	bool released = false;
 	uint64 coordinator_generation, worker_generation;
 	uint64 final_coordinator, final_worker;
 	unsigned worker = (candidate->key.segment_id - 1) % CLUSTER_CTRC_CLEANER_WORKERS;
 
 	observation->key = candidate->key;
-	observation->phase = CTRC_ORIGIN_CERTIFYING;
+	observation->phase = candidate->phase;
 	observation->owner_worker = worker;
 	observation->coordinator_generation = observation->owner_generation = 0;
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	origin = &ctrc_origin_entries()[candidate->index];
-	same_identity = origin->state == CTRC_ORIGIN_CERTIFYING
+	same_identity = origin->state == candidate->phase
 					&& origin->seal_generation == candidate->seal_generation
 					&& memcmp(&origin->key, &candidate->key, sizeof(origin->key)) == 0;
-	exact = same_identity
-			&& ctrc_origin_certificate_snapshot_index_locked(candidate->index, &snapshot);
+	exact = same_identity && ctrc_capacity_snapshot_index_locked(candidate->index, &snapshot);
 	LWLockRelease(&CtrcShared->origin_lock);
 	if (!same_identity)
 		return CLUSTER_CAPACITY_SUPPLY_RECHECK;
@@ -5130,11 +5178,16 @@ ctrc_capacity_certificate_probe(const CtrcCapacityCandidate *candidate,
 	}
 	/* Certificate work can complete before H catches up. This does not
 	 * prove GC/reuse or a real long reader; those remain later gates. */
-	if (!ctrc_cleaner_terminal_sample_mode(&snapshot.origin.key, true, NULL, NULL, NULL)) {
+	if (!ctrc_cleaner_terminal_sample_mode(&snapshot.origin.key, true, NULL, NULL, &released)
+		|| (candidate->phase == CTRC_ORIGIN_RELEASE_PROVEN && !released)) {
 		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_CANONICAL;
 		return CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
 	}
-	if (!ctrc_origin_certificate_snapshot_matches_shared(&snapshot))
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	exact = ctrc_capacity_snapshot_index_locked(candidate->index, &final_snapshot)
+			&& memcmp(&snapshot, &final_snapshot, sizeof(snapshot)) == 0;
+	LWLockRelease(&CtrcShared->origin_lock);
+	if (!exact)
 		return CLUSTER_CAPACITY_SUPPLY_RECHECK;
 	if (!cluster_undo_cleaner_capacity_owner_snapshot(worker, &final_coordinator, &final_worker)) {
 		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_OWNER;
@@ -5153,7 +5206,8 @@ ctrc_capacity_certificate_probe(const CtrcCapacityCandidate *candidate,
  *
  * Inputs: original CURRENT, qualified horizon/epoch and caller-local output.
  * Returns: exact owner work, allocator recheck or missing evidence. Only
- * CERTIFYING is proved; other phases cannot acquire a positive result.
+ * CERTIFYING and unfinished RELEASE_PROVEN notifications are proved; other
+ * phases cannot acquire a positive result.
  * Side Effects: advances the original process-local certificate cursor and
  * reads canonical blocks outside CTRC locks. Never grants or reserves supply.
  *
@@ -11149,8 +11203,10 @@ cluster_ctrc_origin_certificate_digest(const ClusterCtrcCertificateInput *input,
 	return true;
 }
 
-bool
-cluster_ctrc_origin_certificate_snapshot_entry(
+/* Validate the unchanged frozen required-ACK set. Callers separately prove
+ * their phase and close/notification prerequisites without rewriting them. */
+static bool
+ctrc_origin_required_ack_snapshot_entry(
 	const ClusterCtrcOriginEntry *origin,
 	const ClusterCtrcLocalReleaseAckV1 ack_slots[CLUSTER_CTRC_MAX_PARTICIPANTS],
 	uint64 origin_index, ClusterCtrcOriginCertificateSnapshot *snapshot)
@@ -11160,14 +11216,11 @@ cluster_ctrc_origin_certificate_snapshot_entry(
 
 	if (snapshot != NULL)
 		MemSet(snapshot, 0, sizeof(*snapshot));
-	if (origin == NULL || ack_slots == NULL || snapshot == NULL
-		|| origin->state != CTRC_ORIGIN_CERTIFYING || !ctrc_txn_key_valid(&origin->key)
+	if (origin == NULL || ack_slots == NULL || snapshot == NULL || !ctrc_txn_key_valid(&origin->key)
 		|| origin->grant_generation == 0 || origin->seal_generation == 0
 		|| origin->seal_generation == UINT64_MAX
 		|| !ctrc_bytes_zero(origin->reserved8, sizeof(origin->reserved8))
 		|| !ctrc_origin_frozen_touch_set_valid(origin)
-		|| origin->close_dispatched_bitmap != origin->touched_bitmap
-		|| origin->close_confirmed_bitmap != origin->touched_bitmap
 		|| origin->ack_bitmap != origin->touched_bitmap)
 		return false;
 
@@ -11213,6 +11266,21 @@ cluster_ctrc_origin_certificate_snapshot_entry(
 invalid:
 	MemSet(snapshot, 0, sizeof(*snapshot));
 	return false;
+}
+
+bool
+cluster_ctrc_origin_certificate_snapshot_entry(
+	const ClusterCtrcOriginEntry *origin,
+	const ClusterCtrcLocalReleaseAckV1 ack_slots[CLUSTER_CTRC_MAX_PARTICIPANTS],
+	uint64 origin_index, ClusterCtrcOriginCertificateSnapshot *snapshot)
+{
+	if (snapshot != NULL)
+		MemSet(snapshot, 0, sizeof(*snapshot));
+	if (origin == NULL || origin->state != CTRC_ORIGIN_CERTIFYING
+		|| origin->close_dispatched_bitmap != origin->touched_bitmap
+		|| origin->close_confirmed_bitmap != origin->touched_bitmap)
+		return false;
+	return ctrc_origin_required_ack_snapshot_entry(origin, ack_slots, origin_index, snapshot);
 }
 
 bool
