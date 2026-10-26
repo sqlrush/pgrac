@@ -15633,20 +15633,21 @@ phase_recent_native_setup(QualifiedXminFixture *f, LVRelState *v,
 }
 
 static void
-phase_recent_native_finish(const QualifiedXminFixture *f, const LVRelState *v, bool changed)
+phase_recent_native_finish_pins(const QualifiedXminFixture *f, const LVRelState *v,
+	bool changed, unsigned pins)
 {
 	ClusterSemanticAdmissionToken zero = {0};
-	UT_ASSERT_EQ(recent_pin_calls, 2); UT_ASSERT_EQ(recent_unpins, 2);
-	UT_ASSERT_EQ(phase_recent_usage.shared_blks_hit, 2);
+	UT_ASSERT_EQ(recent_pin_calls, pins); UT_ASSERT_EQ(recent_unpins, pins);
+	UT_ASSERT_EQ(phase_recent_usage.shared_blks_hit, pins);
 	UT_ASSERT_EQ(phase_recent_usage.local_blks_hit, 0);
-	UT_ASSERT_EQ(phase_recent_ko_samples, 2);
-	UT_ASSERT_EQ(page_owner_original_owner_enlarges, 2);
-	UT_ASSERT_EQ(page_owner_original_owner_allocations, 1);
-	UT_ASSERT_EQ(page_owner_original_owner_remembers, 2);
-	UT_ASSERT_EQ(page_owner_original_owner_forgets, 2);
-	UT_ASSERT_EQ(page_owner_original_private_news, 2);
-	UT_ASSERT_EQ(page_owner_original_private_forgets, 2);
-	UT_ASSERT_EQ(page_owner_primitive_last_pin_reads, 2);
+	UT_ASSERT_EQ(phase_recent_ko_samples, pins);
+	UT_ASSERT_EQ(page_owner_original_owner_enlarges, pins);
+	UT_ASSERT_EQ(page_owner_original_owner_allocations, pins != 0);
+	UT_ASSERT_EQ(page_owner_original_owner_remembers, pins);
+	UT_ASSERT_EQ(page_owner_original_owner_forgets, pins);
+	UT_ASSERT_EQ(page_owner_original_private_news, pins);
+	UT_ASSERT_EQ(page_owner_original_private_forgets, pins);
+	UT_ASSERT_EQ(page_owner_primitive_last_pin_reads, pins);
 	UT_ASSERT_EQ(page_owner_native_resource_owner.bufferarr.nitems, 0);
 	UT_ASSERT_EQ(phase_finally_calls, 1); UT_ASSERT_EQ(phase_finally_debt, 8);
 	UT_ASSERT_EQ(phase_finally_pins, 0); UT_ASSERT(!phase_finally_owned_writer);
@@ -15688,6 +15689,12 @@ phase_recent_native_finish(const QualifiedXminFixture *f, const LVRelState *v, b
 	phase_use_original_recent_pin = false;
 	GetBufferDescriptor(0)->tag = phase_recent_saved_tag;
 	pg_atomic_write_u32(&GetBufferDescriptor(0)->state, phase_recent_saved_state);
+}
+
+static void
+phase_recent_native_finish(const QualifiedXminFixture *f, const LVRelState *v, bool changed)
+{
+	phase_recent_native_finish_pins(f, v, changed, 2);
 }
 
 UT_TEST(test_original_resident_recent_pin_chain_reaches_same_owner_native_wal)
@@ -16202,10 +16209,36 @@ UT_TEST(test_recent_xmin_invalid_target_batch_refuses_before_resident_pin)
 	}
 }
 
+/* Finite cutoff inputs cannot replace missing terminal proof. */
+UT_TEST(test_all_unknown_admitted_carriers_skip_resident_and_native_work)
+{
+	QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+
+	phase_recent_native_setup(&f, &v, targets, true, true);
+	UT_ASSERT(FullTransactionIdIsValid(f.policy.freeze_limit));
+	UT_ASSERT(SCN_VALID(f.cohort.horizon_scn));
+	phase_unknown_proof_mask = 7;
+	UT_ASSERT(!phase_then_recent_native_owned(&f, &v));
+	phase_unknown_proof_mask = 0;
+	UT_ASSERT_EQ(phase_preflights, 1); UT_ASSERT_EQ(phase_resolves, 3);
+	UT_ASSERT_EQ(phase_rechecks, 0);
+	UT_ASSERT_EQ(v.shared_freeze_batch.carrier_request_count, 3);
+	UT_ASSERT_EQ(v.shared_freeze_proofs.proof_count, 0);
+	UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 0);
+	UT_ASSERT_EQ(v.shared_freeze_aborted_xmax_candidates.target_count, 0);
+	UT_ASSERT(!v.shared_freeze_fence_valid);
+	UT_ASSERT(!v.shared_freeze_cohort_observed);
+	UT_ASSERT(!FullTransactionIdIsValid(v.shared_freeze_candidate_limit_full));
+	UT_ASSERT_EQ(recent_pin_calls, 0); UT_ASSERT_EQ(recent_unpins, 0);
+	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + inserts + edges + dirties + flushes, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	phase_recent_native_finish_pins(&f, &v, false, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(345);
+	UT_PLAN(346);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -16561,6 +16594,7 @@ main(void)
 	UT_RUN(test_mixed_admitted_resident_subset_reaches_same_owner_recent_wal);
 	UT_RUN(test_mixed_admitted_subsets_keep_fullxid_wal_horizon_and_unknown_rows);
 	UT_RUN(test_recent_xmin_invalid_target_batch_refuses_before_resident_pin);
+	UT_RUN(test_all_unknown_admitted_carriers_skip_resident_and_native_work);
 
 	UT_DONE();
 	return ut_failed_count != 0;
