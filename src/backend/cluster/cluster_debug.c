@@ -949,6 +949,8 @@ dump_undo_cleaner(ReturnSetInfo *rsinfo)
 	pid_t pid;
 	TimestampTz spawned_at, ready_at, last_tick;
 	int64 iters;
+	ClusterUndoCapacityStats capacity;
+	bool capacity_available;
 
 	emit_row(rsinfo, "undo_cleaner", "undo_cleaner_status",
 			 cluster_undo_cleaner_status_to_string(s));
@@ -972,14 +974,32 @@ dump_undo_cleaner(ReturnSetInfo *rsinfo)
 
 	iters = cluster_undo_cleaner_main_loop_iters();
 	emit_row(rsinfo, "undo_cleaner", "undo_cleaner_main_loop_iters", fmt_int64(iters));
-	emit_row(rsinfo, "undo_cleaner", "capacity_wait_entered",
-			 fmt_int64(cluster_undo_cleaner_capacity_wait_entered()));
-	emit_row(rsinfo, "undo_cleaner", "capacity_wait_repolled",
-			 fmt_int64(cluster_undo_cleaner_capacity_wait_repolled()));
-	emit_row(rsinfo, "undo_cleaner", "capacity_wait_refused_context",
-			 fmt_int64(cluster_undo_cleaner_capacity_wait_refused_context()));
-	emit_row(rsinfo, "undo_cleaner", "capacity_wait_refused_proof",
-			 fmt_int64(cluster_undo_cleaner_capacity_wait_refused_proof()));
+	capacity_available = cluster_undo_cleaner_capacity_stats_snapshot(&capacity);
+	emit_row(rsinfo, "undo_cleaner", "tt_capacity_stats_available",
+			 capacity_available ? "true" : "false");
+	if (capacity_available) {
+		emit_row(rsinfo, "undo_cleaner", "tt_capacity_origin_node_id",
+				 fmt_int32(capacity.origin_node_id));
+		emit_row(rsinfo, "undo_cleaner", "tt_capacity_pool_wait_count",
+				 fmt_uint64(capacity.pool_wait_count));
+		emit_row(rsinfo, "undo_cleaner", "tt_capacity_wakeup_recheck_count",
+				 fmt_uint64(capacity.wakeup_recheck_count));
+		emit_row(rsinfo, "undo_cleaner", "tt_capacity_cancel_count",
+				 fmt_uint64(capacity.cancel_count));
+		emit_row(rsinfo, "undo_cleaner", "tt_capacity_refuse_by_reason.context",
+				 fmt_uint64(capacity.refused_context_count));
+		emit_row(rsinfo, "undo_cleaner", "tt_capacity_refuse_by_reason.proof",
+				 fmt_uint64(capacity.refused_proof_count));
+		/* Keep the original names as aliases of the same available sample. */
+		emit_row(rsinfo, "undo_cleaner", "capacity_wait_entered",
+				 fmt_uint64(capacity.pool_wait_count));
+		emit_row(rsinfo, "undo_cleaner", "capacity_wait_repolled",
+				 fmt_uint64(capacity.wakeup_recheck_count));
+		emit_row(rsinfo, "undo_cleaner", "capacity_wait_refused_context",
+				 fmt_uint64(capacity.refused_context_count));
+		emit_row(rsinfo, "undo_cleaner", "capacity_wait_refused_proof",
+				 fmt_uint64(capacity.refused_proof_count));
+	}
 	for (unsigned i = 0; i < CLUSTER_UNDO_CLEANER_WORKER_TYPES; i++) {
 		UndoCleanerWorkerState row;
 		ClusterCtrcCleanerWorkerObservation observation;

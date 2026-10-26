@@ -65,6 +65,7 @@
 
 #include "datatype/timestamp.h"
 #include "miscadmin.h"
+#include "port/atomics.h"
 #include "storage/condition_variable.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
@@ -99,6 +100,17 @@ typedef struct ClusterUndoCleanerActiveSample {
 	uint64 sample_id;
 	pid_t worker_pid;
 } ClusterUndoCleanerActiveSample;
+
+/* Postmaster-lifetime diagnostics for this origin's existing capacity wait.
+ * Counts do not prove pool coverage, owner progress, or reusable capacity. */
+typedef struct ClusterUndoCapacityStats {
+	int32 origin_node_id;
+	uint64 pool_wait_count;
+	uint64 wakeup_recheck_count;
+	uint64 cancel_count;
+	uint64 refused_context_count;
+	uint64 refused_proof_count;
+} ClusterUndoCapacityStats;
 
 
 /*
@@ -144,6 +156,7 @@ typedef struct UndoCleanerSharedState {
 	uint64 capacity_wait_repolled;
 	uint64 capacity_wait_refused_context;
 	uint64 capacity_wait_refused_proof;
+	pg_atomic_uint64 capacity_wait_cancelled;
 
 	/*
 	 * D6 pass counters (spec-3.13 step 8 fills; zero-init).  Updated by
@@ -240,6 +253,9 @@ extern TimestampTz cluster_undo_cleaner_ready_at(void);
 extern TimestampTz cluster_undo_cleaner_last_liveness_tick_at(void);
 extern int64 cluster_undo_cleaner_main_loop_iters(void);
 extern bool cluster_undo_cleaner_worker_snapshot(unsigned worker_id, UndoCleanerWorkerState *out);
+/* False leaves output untouched. Independent counters are not an authority
+ * snapshot or a conservation equation across in-flight callers. */
+extern bool cluster_undo_cleaner_capacity_stats_snapshot(ClusterUndoCapacityStats *out);
 extern bool cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out);
 extern bool
 cluster_undo_cleaner_active_sample_current(const ClusterUndoCleanerActiveSample *expected);
