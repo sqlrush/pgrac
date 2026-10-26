@@ -16,6 +16,7 @@
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_tt_local.h"
 #include "storage/bufmgr.h"
+#include "storage/lmgr.h"
 #include "storage/smgr.h"
 #include "utils/rel.h"
 #include "../../backend/access/heap/heapam_r4_private.h"
@@ -45,6 +46,7 @@ static int warm_change;
 static unsigned nested_refusals, nested_replaces, warm_refusals;
 static unsigned nested_calls, warm_calls, plain_vm_waits, chain_fallthroughs;
 static unsigned context_starts;
+static unsigned dml_waits;
 bool cluster_enabled = true, cluster_shared_config = true;
 int cluster_node_id = 0, NBuffers = 2, NLocBuffer;
 char *BufferBlocks = (char *)pages;
@@ -319,6 +321,213 @@ check_current(void)
 			  == (HeapTupleHeader)PageGetItem(pages[0].data, PageGetItemId(pages[0].data, 2)));
 	UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(tuple.t_data), creator);
 	UT_ASSERT_EQ(tuple.t_tableOid, 42);
+}
+
+Buffer
+ReadBuffer(Relation rel, BlockNumber block)
+{
+	UT_ASSERT(rel == &relation && block == 17 && !locked);
+	return 1;
+}
+
+static void
+MultiXactIdWait(MultiXactId multi, MultiXactStatus status, uint16 infomask, Relation rel,
+				ItemPointer tid, XLTW_Oper oper, int *remaining)
+{
+	UT_ASSERT(!locked && rel == &relation);
+	UT_ASSERT_EQ(multi, 345);
+	UT_ASSERT_EQ(status, MultiXactStatusUpdate);
+	UT_ASSERT_EQ(infomask, HEAP_XMAX_IS_MULTI);
+	UT_ASSERT_EQ(ItemPointerGetBlockNumber(tid), ItemPointerGetBlockNumber(&tuple.t_self));
+	UT_ASSERT_EQ(ItemPointerGetOffsetNumber(tid), ItemPointerGetOffsetNumber(&tuple.t_self));
+	UT_ASSERT(oper == XLTW_Delete || oper == XLTW_Update);
+	if (remaining != NULL)
+		*remaining = 1;
+	dml_waits++;
+}
+
+void
+XactLockTableWait(TransactionId xid, Relation rel, ItemPointer tid, XLTW_Oper oper)
+{
+	UT_ASSERT(!locked && rel == &relation);
+	UT_ASSERT_EQ(xid, 345);
+	UT_ASSERT_EQ(ItemPointerGetBlockNumber(tid), ItemPointerGetBlockNumber(&tuple.t_self));
+	UT_ASSERT_EQ(ItemPointerGetOffsetNumber(tid), ItemPointerGetOffsetNumber(&tuple.t_self));
+	UT_ASSERT(oper == XLTW_Delete || oper == XLTW_Update);
+	dml_waits++;
+}
+
+/* Run the six original acquisition brackets, stopping before the original
+ * visibility classifier. Native wait/transport services are controlled leaves. */
+static void
+acquire_dml(unsigned entry)
+{
+	Relation rel = &relation;
+	Relation relation = rel;
+	Buffer buffer = 1, vmbuffer = vm;
+	BlockNumber block = 17;
+	Page page = pages[0].data;
+	ItemPointer tid = &tuple.t_self;
+	ItemId lp;
+	HeapTupleData tp = tuple, oldtup = tuple;
+	TransactionId creation_xmin = creator, xwait = 345;
+	MultiXactStatus mxact_status = MultiXactStatusUpdate;
+	uint16 infomask = HEAP_XMAX_IS_MULTI;
+	int remain = 0;
+	bool checked_lockers = false, locker_remains = false;
+
+	dml_waits = 0;
+	if (entry == 1)
+		locked = true;
+	switch (entry) {
+#include "test_cluster_heap_dml_vm_relock.inc"
+	default:
+		abort();
+	}
+	if (entry == 0)
+		cluster_heap_rebind_locked_tuple(relation, buffer, &tp, &creation_xmin);
+	if (entry >= 4)
+		tp = oldtup;
+	tuple = tp;
+	creator = creation_xmin;
+	vm = vmbuffer;
+	UT_ASSERT_EQ(dml_waits, entry >= 2);
+	UT_ASSERT_EQ(checked_lockers, entry >= 4);
+	UT_ASSERT_EQ(locker_remains, entry == 4);
+}
+
+static void
+reset_dml(unsigned entry, bool cached, bool visible)
+{
+	/* The AV-race bracket starts with heap X and no VM pin. */
+	reset(entry == 1 ? false : cached, entry == 1 ? true : visible);
+}
+
+UT_TEST(dml_cached_vm_pin_is_released_at_every_heap_current_entry)
+{
+	for (unsigned entry = 0; entry < 6; entry++) {
+		reset_dml(entry, true, true);
+		acquire_dml(entry);
+		check_current();
+		UT_ASSERT(vm_pinned && vm == 2);
+		UT_ASSERT_EQ(waits, 1);
+		UT_ASSERT_EQ(releases, 1);
+		UT_ASSERT_EQ(repins, 1);
+	}
+}
+
+UT_TEST(dml_cold_vm_preparation_precedes_heap_current)
+{
+	for (unsigned entry = 0; entry < 6; entry++) {
+		reset_dml(entry, false, true);
+		acquire_dml(entry);
+		check_current();
+		UT_ASSERT(vm_pinned && vm == 2);
+		UT_ASSERT_EQ(prepares, 1);
+		UT_ASSERT_EQ(waits, 1);
+	}
+}
+
+UT_TEST(dml_new_all_visible_current_is_repinned_before_original_rebind)
+{
+	for (unsigned entry = 0; entry < 6; entry++) {
+		if (entry == 1)
+			continue;
+		reset_dml(entry, false, false);
+		PageSetAllVisible(incoming.data);
+		acquire_dml(entry);
+		check_current();
+		UT_ASSERT(vm_pinned && vm == 2);
+		UT_ASSERT_EQ(waits, 2);
+		UT_ASSERT_EQ(prepares, 1);
+		UT_ASSERT_EQ(repins, 1);
+	}
+}
+
+UT_TEST(dml_resident_misses_repeat_only_unlocked_preparation)
+{
+	for (unsigned entry = 0; entry < 6; entry++) {
+		reset_dml(entry, true, true);
+		misses = 3;
+		acquire_dml(entry);
+		check_current();
+		UT_ASSERT(vm_pinned && vm == 2);
+		UT_ASSERT_EQ(waits, 4);
+		UT_ASSERT_EQ(repins, 4);
+		UT_ASSERT_EQ(releases, 4);
+	}
+}
+
+UT_TEST(dml_nonvisible_current_releases_the_old_vm_pin)
+{
+	for (unsigned entry = 0; entry < 6; entry++) {
+		reset_dml(entry, true, true);
+		PageClearAllVisible(incoming.data);
+		acquire_dml(entry);
+		check_current();
+		UT_ASSERT(!vm_pinned && vm == InvalidBuffer);
+		UT_ASSERT_EQ(waits, 1);
+		UT_ASSERT_EQ(repins, 0);
+	}
+}
+
+UT_TEST(dml_wait_rebind_preserves_creator_contradiction_refusal)
+{
+	for (unsigned entry = 1; entry < 6; entry++) {
+		sigjmp_buf jump;
+		volatile bool caught = false;
+
+		reset_dml(entry, true, true);
+		HeapTupleHeaderSetXmin(
+			(HeapTupleHeader)PageGetItem(incoming.data, PageGetItemId(incoming.data, 2)), 701);
+		PG_exception_stack = &jump;
+		if (sigsetjmp(jump, 0) == 0)
+			acquire_dml(entry);
+		else
+			caught = true;
+		PG_exception_stack = NULL;
+		UT_ASSERT(caught && locked);
+		UT_ASSERT_EQ(waits_with_vm, 0);
+		UT_ASSERT_EQ(creator, 700);
+		UT_ASSERT(memcmp(pages[0].data, incoming.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(dml_current_wait_error_retains_no_obstructing_vm_pin)
+{
+	for (unsigned entry = 0; entry < 6; entry++) {
+		sigjmp_buf jump;
+		volatile bool caught = false;
+
+		reset_dml(entry, true, true);
+		wait_error = true;
+		PG_exception_stack = &jump;
+		if (sigsetjmp(jump, 0) == 0)
+			acquire_dml(entry);
+		else
+			caught = true;
+		PG_exception_stack = NULL;
+		UT_ASSERT(caught && !locked && !vm_pinned);
+		UT_ASSERT_EQ(waits, 1);
+		UT_ASSERT_EQ(waits_with_vm, 0);
+	}
+}
+
+UT_TEST(dml_native_and_local_entries_keep_the_original_pin_behavior)
+{
+	for (int local = 0; local < 2; local++)
+		for (unsigned entry = 0; entry < 6; entry++) {
+			reset_dml(entry, true, true);
+			if (local)
+				form.relpersistence = RELPERSISTENCE_TEMP;
+			else
+				cluster_enabled = false;
+			acquire_dml(entry);
+			UT_ASSERT(locked && vm_pinned && vm == 2);
+			UT_ASSERT_EQ(waits, 1);
+			UT_ASSERT_EQ(waits_with_vm, 1);
+			UT_ASSERT_EQ(releases + repins, 0);
+		}
 }
 
 UT_TEST(cached_vm_pin_is_released_before_heap_current)
@@ -1053,7 +1262,7 @@ UT_TEST(receipt_missing_canonical_binding_or_admission_never_reacquires_heap)
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(41);
 	UT_RUN(cached_vm_pin_is_released_before_heap_current);
 	UT_RUN(cold_vm_is_prepared_outside_heap_content);
 	UT_RUN(new_all_visible_image_gets_exact_pin_before_tuple_rebind);
@@ -1087,6 +1296,14 @@ main(void)
 	UT_RUN(receipt_wait_creator_contradiction_cannot_reach_the_next_apply_boundary);
 	UT_RUN(receipt_service_refusal_or_error_keeps_content_unlocked);
 	UT_RUN(receipt_missing_canonical_binding_or_admission_never_reacquires_heap);
+	UT_RUN(dml_cached_vm_pin_is_released_at_every_heap_current_entry);
+	UT_RUN(dml_cold_vm_preparation_precedes_heap_current);
+	UT_RUN(dml_new_all_visible_current_is_repinned_before_original_rebind);
+	UT_RUN(dml_resident_misses_repeat_only_unlocked_preparation);
+	UT_RUN(dml_nonvisible_current_releases_the_old_vm_pin);
+	UT_RUN(dml_wait_rebind_preserves_creator_contradiction_refusal);
+	UT_RUN(dml_current_wait_error_retains_no_obstructing_vm_pin);
+	UT_RUN(dml_native_and_local_entries_keep_the_original_pin_behavior);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

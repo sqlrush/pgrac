@@ -6201,6 +6201,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_undo_path_native.inc test_cluster_undo_fd_native.inc test_cluster_undo_dir_native.inc
 	rm -f test_cluster_heap_lock_vm_needed.inc
 	rm -f test_cluster_heap_chain_vm_itl.inc test_cluster_heap_chain_vm_no_itl.inc
+	rm -f test_cluster_heap_dml_vm_relock.inc test_cluster_heap_dml_vm_relock.inc.tmp
 	rm -f test_cluster_heap_chain_receipt_types.inc test_cluster_heap_chain_receipt_reserve.inc \
 		test_cluster_heap_chain_receipt_prepare.inc test_cluster_heap_chain_receipt_boundary.inc
 	rm -f test_cluster_btree_structure_helpers.inc test_cluster_btree_structure_alloc.inc \
@@ -9537,8 +9538,27 @@ test_cluster_heap_chain_receipt_reserve.inc test_cluster_heap_chain_receipt_prep
 	     /^}/ { in_chain=0 } END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_heap_dml_vm_relock.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_delete\(/ { in_delete=1 } /^heap_update\(/ { in_update=1 } \
+	     in_delete && /^\tblock = ItemPointerGetBlockNumber\(tid\);/ { emit=1; initial++; print "case 0:" } \
+	     emit == 1 && /^l1:/ { emit=0; done++; print "break;" } \
+	     in_delete && /^\tif \(vmbuffer == InvalidBuffer && PageIsAllVisible\(page\)\)/ { \
+	       emit=2; race++; print "case 1:" } \
+	     (in_delete || in_update) && /^[[:space:]]*(MultiXactIdWait|XactLockTableWait)\(/ { \
+	       emit=3; waits++; print "case " waits+1 ":" } \
+	     emit { print } \
+	     emit == 2 { s=$$0; opens=gsub(/\{/, "", s); s=$$0; closes=gsub(/}/, "", s); \
+	       depth+=opens-closes; if (opens) opened=1; \
+	       if (opened && depth==0) { emit=0; done++; print "break;" } } \
+	     emit == 3 && /cluster_heap_rebind_locked_tuple\(/ { rebound=1 } \
+	     emit == 3 && rebound && /^#endif/ { emit=rebound=0; done++; print "break;" } \
+	     /^}/ { in_delete=in_update=0 } \
+	     END { if (initial != 1 || race != 1 || waits != 4 || done != 6 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_lock_vm_pin test_cluster_heap_lock_vm_pin_noassert: test_cluster_heap_lock_vm_pin.c unit_test.h \
 		test_cluster_heap_lock_rebind.inc test_cluster_heap_vm_unwind_helpers.inc \
+		test_cluster_heap_dml_vm_relock.inc \
 		test_cluster_heap_lock_vm_recent.inc test_cluster_heap_lock_chain_pin.inc \
 		test_cluster_heap_chain_vm_itl.inc test_cluster_heap_chain_vm_no_itl.inc \
 		test_cluster_heap_chain_receipt_types.inc test_cluster_heap_chain_receipt_reserve.inc \
@@ -9680,15 +9700,21 @@ test_cluster_heap_update_reacquire.inc: $(top_srcdir)/src/backend/access/heap/he
 # The real unlocked consumers include capture, unlock, use and matching free.
 test_cluster_heap_delete_owned.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
 	awk '/^heap_delete\(/ { in_fn=1 } \
-	     in_fn && /if \(cluster_heap_read_needs_copy\(relation\)\)/ { print "#ifdef USE_PGRAC_CLUSTER"; emit=1; found++ } \
+	     in_fn && /unlocked_tuple = heap_copytuple\(&tp\);/ { \
+	       if (prev != "\tif (cluster_heap_read_needs_copy(relation))") exit 1; \
+	       print "#ifdef USE_PGRAC_CLUSTER"; print prev; emit=1; found++ } \
 	     emit { print } emit && /heap_freetuple\(unlocked_tuple\)/ { emit=0; done++ } \
+	     { prev=$$0 } \
 	     /^}/ { in_fn=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_update_owned.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
 	awk '/^heap_update\(/ { in_fn=1 } \
-	     in_fn && /if \(cluster_heap_read_needs_copy\(relation\)\)/ { print "#ifdef USE_PGRAC_CLUSTER"; emit=1; found++ } \
+	     in_fn && /unlocked_old_tuple = heap_copytuple\(&oldtup\);/ { \
+	       if (prev != "\tif (cluster_heap_read_needs_copy(relation))") exit 1; \
+	       print "#ifdef USE_PGRAC_CLUSTER"; print prev; emit=1; found++ } \
 	     emit { print } emit && /heap_freetuple\(unlocked_old_tuple\)/ { emit=0; done++ } \
+	     { prev=$$0 } \
 	     /^}/ { in_fn=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 

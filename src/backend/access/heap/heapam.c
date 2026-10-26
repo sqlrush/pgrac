@@ -11483,7 +11483,12 @@ heap_delete(Relation relation, ItemPointer tid,
 	if (PageIsAllVisible(page))
 		visibilitymap_pin(relation, block, &vmbuffer);
 
-	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_heap_read_needs_copy(relation))
+		cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
+	else
+#endif
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 
 	lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tid));
 	Assert(ItemIdIsNormal(lp));
@@ -11510,7 +11515,12 @@ l1:
 	{
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 		visibilitymap_pin(relation, block, &vmbuffer);
-		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_heap_read_needs_copy(relation))
+			cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
+		else
+#endif
+			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 #ifdef USE_PGRAC_CLUSTER
 		cluster_heap_rebind_locked_tuple(relation, buffer, &tp, &creation_xmin);
 #endif
@@ -11651,7 +11661,12 @@ l1:
 				MultiXactIdWait((MultiXactId) xwait, MultiXactStatusUpdate, infomask,
 								relation, &(tp.t_self), XLTW_Delete,
 								NULL);
-				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+				if (cluster_heap_read_needs_copy(relation))
+					cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
+				else
+#endif
+					LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 #ifdef USE_PGRAC_CLUSTER
 				cluster_heap_rebind_locked_tuple(relation, buffer, &tp, &creation_xmin);
 #endif
@@ -11691,7 +11706,12 @@ l1:
 			heap_acquire_tuplock(relation, &(tp.t_self), LockTupleExclusive,
 								 LockWaitBlock, &have_tuple_lock);
 			XactLockTableWait(xwait, relation, &(tp.t_self), XLTW_Delete);
-			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_heap_read_needs_copy(relation))
+				cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
+			else
+#endif
+				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 #ifdef USE_PGRAC_CLUSTER
 			cluster_heap_rebind_locked_tuple(relation, buffer, &tp, &creation_xmin);
 #endif
@@ -13093,7 +13113,12 @@ l2:
 								&remain);
 				checked_lockers = true;
 				locker_remains = remain != 0;
-				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+				if (cluster_heap_read_needs_copy(relation))
+					cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
+				else
+#endif
+					LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 #ifdef USE_PGRAC_CLUSTER
 				cluster_heap_rebind_locked_tuple(relation, buffer, &oldtup, &creation_xmin);
 #endif
@@ -13177,7 +13202,12 @@ l2:
 			XactLockTableWait(xwait, relation, &oldtup.t_self,
 							  XLTW_Update);
 			checked_lockers = true;
-			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_heap_read_needs_copy(relation))
+				cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
+			else
+#endif
+				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 #ifdef USE_PGRAC_CLUSTER
 			cluster_heap_rebind_locked_tuple(relation, buffer, &oldtup, &creation_xmin);
 #endif
