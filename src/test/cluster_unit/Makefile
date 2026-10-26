@@ -4803,6 +4803,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_first_fill_hot_block.inc test_cluster_first_fill_hot_block.inc.tmp
 	rm -f test_cluster_first_fill_request.inc test_cluster_first_fill_request.inc.tmp
 	rm -f test_cluster_first_fill_reply.inc test_cluster_first_fill_reply.inc.tmp
 	rm -f test_cluster_first_fill_send.inc test_cluster_first_fill_send.inc.tmp
@@ -9946,6 +9947,24 @@ test_cluster_first_fill_retire: test_cluster_first_fill_retire.c test_cluster_pc
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
 		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Exercise the actual optional reader pause; no backend object is linked.
+TESTS += test_cluster_first_fill_hot_block
+all: test_cluster_first_fill_hot_block
+
+check: check_first_fill_hot_block_order
+.PHONY: check_first_fill_hot_block_order
+check_first_fill_hot_block_order:
+	$(PERL) $(srcdir)/test_cluster_first_fill_hot_block_order.pl
+
+test_cluster_first_fill_hot_block.inc: $(top_srcdir)/src/test/modules/test_pcm_read_source/test_pcm_read_source.c Makefile
+	awk '/^read_test_page\(/ { print "static bytea *"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_first_fill_hot_block: test_cluster_first_fill_hot_block.c unit_test.h \
+		test_cluster_first_fill_hot_block.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
 
 # Execute the original native first-fill sender and passive CV wait.
 TESTS += test_cluster_first_fill_request
