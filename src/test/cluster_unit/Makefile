@@ -2303,6 +2303,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_freeze_lease_current.inc \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe.h \
 		test_cluster_active_sample_types.inc test_cluster_active_sample_fence.inc \
+		test_cluster_heap_freeze_admission_current.inc \
 		$(top_srcdir)/src/include/cluster/cluster_reconfig.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_horizon.h \
@@ -8593,6 +8594,15 @@ test_cluster_active_sample_types.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     END { if (count != 3 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Execute the original ordinary TARGET and read-only census admission checks.
+test_cluster_heap_freeze_admission_current.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^semantic_activation_(admission_policy|r4_terminal_census_policy)\(/ { print "static ClusterSemanticAdmissionResult"; emit=1; count++ } \
+	     /^semantic_activation_feature_(bit_)?index\(/ { print "static bool"; emit=1; count++ } \
+	     /^cluster_semantic_activation_recheck(_r4_terminal_census)?\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (count != 6 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_active_sample_fence.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
 	awk '/^semantic_activation_(snapshot|modifier_policy)\(/ { print "static bool"; emit=1; count++ } \
 	     /^cluster_semantic_activation_active_sample_(capture|current)\(/ { print "bool"; emit=1; count++ } \
@@ -10499,6 +10509,7 @@ clean distclean maintainer-clean: clean-active-sample-fence
 clean-active-sample-fence:
 	rm -f test_cluster_active_sample_types.inc test_cluster_active_sample_types.inc.tmp
 	rm -f test_cluster_active_sample_fence.inc test_cluster_active_sample_fence.inc.tmp
+	rm -f test_cluster_heap_freeze_admission_current.inc test_cluster_heap_freeze_admission_current.inc.tmp
 
 clean distclean maintainer-clean: clean-retention-sample
 .PHONY: clean-retention-sample

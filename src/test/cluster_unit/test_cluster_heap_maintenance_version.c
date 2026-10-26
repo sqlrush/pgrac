@@ -9826,13 +9826,100 @@ bounds_cohort_current(const ClusterHeapFreezeCohortObservation *cohort)
 	return bounds_saved_current_status;
 }
 
+/* Original admission rechecks share the existing seqlock snapshot.  Startup,
+ * epoch and descriptor publication remain controlled source providers. */
+static const void *bounds_admission_descriptors[64];
+static ClusterSemanticAdmissionToken *bounds_mutable_admission;
+static unsigned bounds_original_target_calls, bounds_original_census_calls;
+static unsigned bounds_target_fault, bounds_census_fault, bounds_census_fault_at;
+static unsigned bounds_admission_error_kind;
+static bool bounds_original_target_result, bounds_original_census_result;
+static bool bounds_bootstrap_allowed;
+
+static bool
+bounds_admission_serving(void)
+{
+	bounds_assert_unlocked();
+	if (bounds_admission_error_kind == 1) elog(ERROR, "injected original admission serving ERROR");
+	return admission_serving;
+}
+
+static bool
+bounds_admission_bootstrap(void)
+{
+	bounds_assert_unlocked();
+	if (bounds_admission_error_kind == 3) elog(ERROR, "injected original admission bootstrap ERROR");
+	return bounds_bootstrap_allowed;
+}
+
+static uint64
+bounds_admission_epoch(void)
+{
+	bounds_assert_unlocked();
+	if (bounds_admission_error_kind == 2) elog(ERROR, "injected original admission epoch ERROR");
+	return admission_epoch;
+}
+
+static bool bounds_original_target_current(const ClusterSemanticAdmissionToken *);
+static bool bounds_original_census_current(const ClusterSemanticAdmissionToken *);
+#define SemanticActivationDescriptors bounds_admission_descriptors
+#define normal_start_serving_allowed bounds_admission_serving
+#define normal_start_bootstrap_allowed bounds_admission_bootstrap
+#define cluster_epoch_get_current bounds_admission_epoch
+#define cluster_semantic_activation_recheck bounds_original_target_current
+#define cluster_semantic_activation_recheck_r4_terminal_census bounds_original_census_current
+#include "test_cluster_heap_freeze_admission_current.inc"
+#undef cluster_semantic_activation_recheck_r4_terminal_census
+#undef cluster_semantic_activation_recheck
+#undef cluster_epoch_get_current
+#undef normal_start_bootstrap_allowed
+#undef normal_start_serving_allowed
+#undef SemanticActivationDescriptors
+
+static void
+bounds_admission_change(unsigned fault)
+{
+	int feature_index;
+
+	switch (fault) {
+	case 1: pg_atomic_write_u64(&native_admission_shared.active_bits, 0); break;
+	case 2: pg_atomic_write_u32(&native_admission_shared.transition_closed, 1); break;
+	case 3: pg_atomic_write_u64(&native_admission_shared.admission_seq, 3); break;
+	case 4: pg_atomic_fetch_add_u64(&native_admission_shared.record_generation, 1); break;
+	case 5: pg_atomic_fetch_add_u64(&native_admission_shared.formation_epoch, 1); break;
+	case 6: admission_epoch++; break;
+	case 7: bounds_mutable_admission->record_generation++; break;
+	case 8: bounds_mutable_admission->formation_epoch++; break;
+	case 9: bounds_mutable_admission->feature_bit = 0; break;
+	case 10: bounds_mutable_admission->side = CLUSTER_SEMANTIC_SOURCE_SIDE; break;
+	case 11: SemanticActivationShmem = NULL; break;
+	case 12: admission_serving = false; break;
+	case 13:
+		UT_ASSERT(semantic_activation_feature_bit_index(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, &feature_index));
+		bounds_admission_descriptors[feature_index] = NULL; break;
+	case 14:
+		pg_atomic_write_u64(&native_admission_shared.record_generation, 0);
+		bounds_mutable_admission->record_generation = 0; break;
+	case 21: bounds_admission_error_kind = 1; break;
+	case 22: bounds_admission_error_kind = 2; break;
+	case 23:
+		pg_atomic_write_u64(&native_admission_shared.record_generation, 0);
+		bounds_mutable_admission->record_generation = 0;
+		bounds_admission_error_kind = 3; break;
+	}
+}
+
 static bool
 bounds_census_current(const ClusterSemanticAdmissionToken *token)
 {
 	bounds_assert_unlocked();
 	UT_ASSERT(token == &bounds_source->admission && token->entered);
 	bounds_census_reads++;
-	return !(bounds_after_target && bounds_fault == 4);
+	if (bounds_after_target && bounds_fault == 4) return false;
+	if (bounds_census_reads == bounds_census_fault_at) bounds_admission_change(bounds_census_fault);
+	bounds_original_census_calls++;
+	bounds_original_census_result = bounds_original_census_current(token);
+	return bounds_original_census_result;
 }
 
 static bool
@@ -9842,7 +9929,11 @@ bounds_target_current(const ClusterSemanticAdmissionToken *token)
 	UT_ASSERT(token == &bounds_source->admission && token->entered);
 	bounds_target_reads++;
 	bounds_after_target = true;
-	return bounds_fault != 3;
+	if (bounds_fault == 3) return false;
+	bounds_admission_change(bounds_target_fault);
+	bounds_original_target_calls++;
+	bounds_original_target_result = bounds_original_target_current(token);
+	return bounds_original_target_result;
 }
 
 static SCN
@@ -9890,6 +9981,19 @@ bounds_observer_setup(LVRelState *v, QualifiedXminFixture *f)
 	v->shared_freeze_input.freeze_policy = NULL;
 	v->shared_freeze_input.freeze_cohort = NULL;
 	bounds_source = f;
+	bounds_mutable_admission = &f->admission;
+	f->admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	f->admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	memset(bounds_admission_descriptors, 0, sizeof(bounds_admission_descriptors));
+	{
+		int feature_index;
+		UT_ASSERT(semantic_activation_feature_bit_index(f->admission.feature_bit, &feature_index));
+		bounds_admission_descriptors[feature_index] = &native_admission_shared;
+	}
+	bounds_original_target_calls = bounds_original_census_calls = 0;
+	bounds_target_fault = bounds_census_fault = bounds_census_fault_at = 0;
+	bounds_admission_error_kind = 0; bounds_bootstrap_allowed = false;
+	bounds_original_target_result = bounds_original_census_result = false;
 	bounds_acquire_fault = bounds_acquire_gets = bounds_acquire_ticks = 0;
 	bounds_acquire_history_reads = bounds_acquire_peer_reads = 0;
 	bounds_acquire_status = CLUSTER_HEAP_FREEZE_COHORT_INVALID;
@@ -10736,10 +10840,152 @@ UT_TEST(test_collector_saved_policy_error_leaves_original_lease_lock_and_caller_
 	}
 }
 
+static void
+bounds_assert_admission_refusal(const LVRelState *v, const QualifiedXminFixture *f)
+{
+	UT_ASSERT(!v->shared_freeze_cohort_observed);
+	UT_ASSERT(v->shared_freeze_input.freeze_policy == NULL && v->shared_freeze_input.freeze_cohort == NULL);
+	bounds_assert_unlocked();
+	UT_ASSERT(f->admission.entered && !local_share && !resumed_writer);
+	UT_ASSERT_EQ(lease_lock_acquires, lease_lock_releases); UT_ASSERT(!lease_lock_held);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_collector_original_same_token_admission_reaches_native_wal)
+{
+	for (unsigned batch = 0; batch <= 1; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		LVRelState v; ClusterHeapFreezeObservedBoundsV1 bounds = {0}; unsigned native_reads;
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		bounds_observer_setup(&v, &f); fixture_wal_clock = 5; native_reads = pass_native_reads;
+		UT_ASSERT_EQ(lazy_observe_shared_freeze_bounds(&v, &f.admission,
+			CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT(v.shared_freeze_cohort_observed);
+		UT_ASSERT(bounds_original_target_result && bounds_original_census_result);
+		UT_ASSERT_EQ(bounds_original_target_calls, 1); UT_ASSERT_EQ(bounds_original_census_calls, 3);
+		UT_ASSERT_EQ(bounds_saved_policy_calls, 3); UT_ASSERT_EQ(bounds_saved_current_calls, 3);
+		UT_ASSERT_EQ(pass_native_reads, native_reads); UT_ASSERT_EQ(bounds_acquire_history_reads, 1);
+		f.input = v.shared_freeze_input;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
+		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered); UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
+UT_TEST(test_collector_original_census_rejects_token_and_source_drift_at_each_check)
+{
+	for (unsigned batch = 0; batch <= 1; batch++) {
+		for (unsigned phase = 1; phase <= 3; phase++) {
+			for (unsigned fault = 2; fault <= 14; fault++) {
+				QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+				LVRelState v; ClusterHeapFreezeObservedBoundsV1 bounds = {0};
+				if (fault == 13) continue; /* Descriptor presence belongs only to ordinary TARGET. */
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+				bounds_observer_setup(&v, &f); fixture_wal_clock = 5;
+				bounds_census_fault_at = phase; bounds_census_fault = fault;
+				UT_ASSERT_EQ(lazy_observe_shared_freeze_bounds(&v, &f.admission,
+					CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+				UT_ASSERT_EQ(bounds_original_census_calls, phase);
+				UT_ASSERT(!bounds_original_census_result);
+				bounds_assert_admission_refusal(&v, &f);
+			}
+		}
+	}
+}
+
+UT_TEST(test_collector_census_read_permission_does_not_replace_original_target)
+{
+	const unsigned faults[] = { 1, 13 };
+	for (unsigned batch = 0; batch <= 1; batch++) {
+		for (unsigned i = 0; i < lengthof(faults); i++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			LVRelState v; ClusterHeapFreezeObservedBoundsV1 bounds = {0};
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			bounds_observer_setup(&v, &f); fixture_wal_clock = 5; bounds_target_fault = faults[i];
+			UT_ASSERT_EQ(lazy_observe_shared_freeze_bounds(&v, &f.admission,
+				CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+			UT_ASSERT_EQ(bounds_original_target_calls, 1); UT_ASSERT_EQ(bounds_original_census_calls, 3);
+			UT_ASSERT(!bounds_original_target_result && bounds_original_census_result);
+			UT_ASSERT_EQ(bounds_saved_policy_calls, 2); UT_ASSERT_EQ(bounds_saved_current_calls, 2);
+			bounds_assert_admission_refusal(&v, &f);
+		}
+	}
+}
+
+UT_TEST(test_collector_original_admission_error_preserves_pin_and_entered_token)
+{
+	for (unsigned batch = 0; batch <= 1; batch++) {
+		for (unsigned phase = 1; phase <= 4; phase++) {
+			for (unsigned fault = 21; fault <= 23; fault++) {
+				QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+				LVRelState v; ClusterHeapFreezeObservedBoundsV1 bounds = {0};
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+				bounds_observer_setup(&v, &f); fixture_wal_clock = 5;
+				if (phase == 4) bounds_target_fault = fault;
+				else { bounds_census_fault_at = phase; bounds_census_fault = fault; }
+				expecting_error = true;
+				if (setjmp(error_jump) == 0) {
+					(void)lazy_observe_shared_freeze_bounds(&v, &f.admission,
+						CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds);
+					UT_ASSERT(false);
+				}
+				UT_ASSERT_EQ(bounds_original_census_calls, phase == 4 ? 2 : phase);
+				UT_ASSERT_EQ(bounds_original_target_calls, phase >= 3 ? 1 : 0);
+				bounds_assert_admission_refusal(&v, &f);
+				expecting_error = false;
+			}
+		}
+	}
+}
+
+UT_TEST(test_original_target_and_census_rechecks_reject_missing_token_without_source_reads)
+{
+	QualifiedXminFixture f; LVRelState v;
+	qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI); bounds_observer_setup(&v, &f);
+	bounds_admission_error_kind = 1;
+	UT_ASSERT(!bounds_original_target_current(NULL)); UT_ASSERT(!bounds_original_census_current(NULL));
+	f.admission.entered = false;
+	UT_ASSERT(!bounds_original_target_current(&f.admission));
+	UT_ASSERT(!bounds_original_census_current(&f.admission));
+	f.admission.entered = true; bounds_admission_error_kind = 0;
+	UT_ASSERT(bounds_original_target_current(&f.admission));
+	UT_ASSERT(bounds_original_census_current(&f.admission));
+	bounds_assert_admission_refusal(&v, &f);
+}
+
+UT_TEST(test_collector_same_admission_rejects_wrong_target_side)
+{
+	for (unsigned batch = 0; batch <= 1; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		LVRelState v; ClusterHeapFreezeObservedBoundsV1 bounds = {0};
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		bounds_observer_setup(&v, &f);
+		f.admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+		f.admission.side = CLUSTER_SEMANTIC_SOURCE_SIDE;
+		UT_ASSERT_EQ(lazy_observe_shared_freeze_bounds(&v, &f.admission,
+			CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+		UT_ASSERT(!v.shared_freeze_cohort_observed);
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes, 0);
+		UT_ASSERT(!local_x && f.admission.entered); UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(251);
+	UT_PLAN(257);
+	UT_RUN(test_collector_same_admission_rejects_wrong_target_side);
+	UT_RUN(test_collector_original_same_token_admission_reaches_native_wal);
+	UT_RUN(test_collector_original_census_rejects_token_and_source_drift_at_each_check);
+	UT_RUN(test_collector_census_read_permission_does_not_replace_original_target);
+	UT_RUN(test_collector_original_admission_error_preserves_pin_and_entered_token);
+	UT_RUN(test_original_target_and_census_rechecks_reject_missing_token_without_source_reads);
 	UT_RUN(test_collector_saved_policy_original_fence_reaches_native_wal_without_resample);
 	UT_RUN(test_collector_saved_policy_config_refusal_precedes_original_fence);
 	UT_RUN(test_collector_saved_policy_original_lease_fields_reject_before_writer);
