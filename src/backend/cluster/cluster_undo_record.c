@@ -66,6 +66,7 @@
 #include "miscadmin.h"
 #include "access/twophase.h" /* spec-4.12a D1: prepared-xact retention guard */
 #include "access/xact.h"
+#include "cluster/cluster_inject.h"
 #include "port/atomics.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
@@ -3427,6 +3428,10 @@ cluster_undo_record_ctrc_apply_prepared(ClusterUndoRecordPrepareReceipt *receipt
 	}
 	if (cluster_trace_normal_stop)
 		undo_receipt_consumer_trace_result(receipt, target_ordinal, result, -1);
+	/* ERROR must see the original branch proof already registered. No hook
+	 * is allowed inside a critical section or without diagnostic opt-in. */
+	if (cluster_trace_normal_stop && CritSectionCount == 0)
+		CLUSTER_INJECTION_POINT("cluster-undo-ctrc-apply-return");
 	if (result != CLUSTER_CTRC_APPLY_APPLIED)
 		return result;
 	receipt->ctrc_applied_mask |= target_bit;

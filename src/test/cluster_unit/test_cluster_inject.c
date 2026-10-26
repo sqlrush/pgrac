@@ -420,10 +420,39 @@ UT_TEST(test_first_publication_deny_registry_dispatches_only_its_skip)
 	UT_ASSERT(!cluster_injection_is_armed(point));
 }
 
+UT_TEST(test_exact_zero_native_points_are_registered_and_skipn_is_bounded)
+{
+	const char *points[] = { "cluster-undo-itl-apply-zero-deny", "cluster-undo-ctrc-apply-return" };
+
+	cluster_injection_assign_hook("", NULL);
+	for (unsigned n = 0; n < lengthof(points); n++) {
+		bool found = false;
+
+		for (int i = 0; i < cluster_injection_get_count(); i++) {
+			const char *name;
+			ClusterInjectFaultType type;
+			uint64 hits;
+
+			UT_ASSERT(cluster_injection_get_state_at(i, &name, &type, &hits));
+			if (strcmp(name, points[n]) == 0)
+				found = true;
+		}
+		UT_ASSERT(found);
+	}
+	cluster_injection_assign_hook("cluster-undo-itl-apply-zero-deny:skipn:1", NULL);
+	cluster_injection_run(points[0]);
+	UT_ASSERT(cluster_injection_should_skip(points[0]));
+	cluster_injection_run(points[0]);
+	UT_ASSERT(!cluster_injection_should_skip(points[0]));
+	cluster_injection_assign_hook("cluster-undo-itl-apply-zero-deny:none", NULL);
+	UT_ASSERT(!cluster_injection_is_armed(points[0]));
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
+	UT_RUN(test_exact_zero_native_points_are_registered_and_skipn_is_bounded);
 	UT_RUN(test_inject_count_compile_constant);
 	UT_RUN(test_inject_arm_unknown_is_safe);
 	UT_RUN(test_inject_initial_disarmed);

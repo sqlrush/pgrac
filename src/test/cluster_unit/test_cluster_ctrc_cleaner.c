@@ -35,6 +35,7 @@
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "storage/spin.h"
+#include "cluster/cluster_inject.h"
 #include "test_cluster_pgproc_active_types.inc"
 
 static int observe_busy_kind;
@@ -76,6 +77,31 @@ pg_attribute_unused() test_spin_release(volatile slock_t *lock)
 static int test_clock_gettime(clockid_t clock_id, struct timespec *ts);
 static pg_atomic_uint32 *zero_cas_target;
 static unsigned zero_cas_failures, zero_cas_attempts;
+static unsigned zero_deny_remaining, zero_deny_hits;
+static bool zero_deny_pending;
+int cluster_injection_armed_count;
+
+void
+cluster_injection_run(const char *name)
+{
+	if (strcmp(name, "cluster-undo-itl-apply-zero-deny") != 0)
+		abort();
+	zero_deny_hits++;
+	zero_deny_pending = zero_deny_remaining > 0;
+	if (zero_deny_pending)
+		zero_deny_remaining--;
+}
+
+bool
+cluster_injection_should_skip(const char *name)
+{
+	bool pending = zero_deny_pending;
+
+	if (strcmp(name, "cluster-undo-itl-apply-zero-deny") != 0)
+		abort();
+	zero_deny_pending = false;
+	return pending;
+}
 static bool
 test_zero_compare_exchange(pg_atomic_uint32 *ptr, uint32 *expected, uint32 value)
 {
@@ -1939,6 +1965,64 @@ UT_TEST(test_shared_failed_cas_and_later_equality_never_produce_zero)
 	UT_ASSERT_EQ(token.evidence.effect, CLUSTER_CTRC_EFFECT_UNKNOWN);
 	UT_ASSERT(cluster_ctrc_receipt_apply_evidence_recheck(&baseline));
 	zero_cas_target = NULL;
+}
+
+UT_TEST(test_native_zero_denial_is_gated_and_preserves_original_shared_owner)
+{
+	for (unsigned variant = 0; variant < 8; variant++) {
+		ClusterCtrcReceiptHandle handle;
+		ClusterCtrcTargetV1 target, pending;
+		ClusterCtrcReceipt before;
+		ClusterCtrcApplyToken token;
+		bool reuse = (variant & 1) != 0;
+		bool deny = (variant & 2) != 0 && (variant & 4) == 0;
+		uint64 prepared, applied;
+		ClusterCtrcApplyResult result;
+
+		zero_shared_fixture(&handle, &target);
+		pending = handle.receipt->target;
+		cluster_injection_armed_count = 0;
+		if (reuse) {
+			UT_ASSERT_EQ(cluster_ctrc_receipt_apply_shared(&handle, &target, &token),
+				CLUSTER_CTRC_APPLY_APPLIED);
+			memcpy(target.planned_predecessor_sha256, target.planned_successor_sha256, 32);
+			target.planned_successor_sha256[0]++;
+			target.uba[0]++;
+		}
+		before = *handle.receipt;
+		prepared = handle.participant->prepared_count;
+		applied = handle.participant->applied_count;
+		zero_cas_attempts = zero_deny_hits = 0;
+		zero_deny_remaining = 1;
+		zero_deny_pending = false;
+		cluster_injection_armed_count = 1;
+		cluster_trace_normal_stop = (variant & 2) != 0;
+		CritSectionCount = (variant & 4) != 0;
+		result = reuse
+			? cluster_ctrc_receipt_retarget_itl_shared(&handle, &pending, &target, &token)
+			: cluster_ctrc_receipt_apply_shared(&handle, &target, &token);
+		UT_ASSERT_EQ(result, deny ? CLUSTER_CTRC_APPLY_RETRY_REQUIRED : CLUSTER_CTRC_APPLY_APPLIED);
+		UT_ASSERT_EQ(zero_deny_hits, deny ? 1 : 0);
+		if (deny) {
+			UT_ASSERT_EQ(token.evidence.effect, CLUSTER_CTRC_EFFECT_ZERO_NO_MUTATION);
+			UT_ASSERT(!token.valid);
+			UT_ASSERT_EQ(zero_cas_attempts, 0);
+			UT_ASSERT_EQ(memcmp(&before, handle.receipt, sizeof(before)), 0);
+			UT_ASSERT_EQ(handle.participant->prepared_count, prepared);
+			UT_ASSERT_EQ(handle.participant->applied_count, applied);
+			UT_ASSERT(cluster_ctrc_receipt_apply_evidence_recheck(&token.evidence));
+			/* The next call is the original APPLY/retarget, not injected success. */
+			UT_ASSERT_EQ(reuse
+				? cluster_ctrc_receipt_retarget_itl_shared(&handle, &pending, &target, &token)
+				: cluster_ctrc_receipt_apply_shared(&handle, &target, &token),
+				CLUSTER_CTRC_APPLY_APPLIED);
+			UT_ASSERT(zero_cas_attempts > 0);
+		}
+		cluster_injection_armed_count = 0;
+		cluster_trace_normal_stop = false;
+		CritSectionCount = 0;
+		zero_cas_target = NULL;
+	}
 }
 
 UT_TEST(test_local_receipt_refuses_missing_or_aliased_origin_protection)
@@ -7134,7 +7218,8 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(169);
+	UT_PLAN(170);
+	UT_RUN(test_native_zero_denial_is_gated_and_preserves_original_shared_owner);
 	UT_RUN(test_shared_exact_zero_binds_original_handle_target_and_generation);
 	UT_RUN(test_shared_failed_cas_and_later_equality_never_produce_zero);
 	UT_RUN(test_receipt_observed_identity_refusal_precedes_chain_blocking);

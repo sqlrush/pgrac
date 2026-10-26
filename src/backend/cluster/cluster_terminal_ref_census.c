@@ -53,6 +53,7 @@
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_inject.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_itl.h"
 #include "cluster/cluster_ko.h"
@@ -6732,6 +6733,24 @@ cluster_ctrc_receipt_apply_prepared(ClusterCtrcParticipantEntry *participant,
 	return CLUSTER_CTRC_APPLY_APPLIED;
 }
 
+#ifndef CLUSTER_CTRC_UNIT_TEST
+/* Diagnostic-only denial at the real shared boundary. The caller must first
+ * capture the original exact handle; no target, CAS or count is modified. */
+static bool
+ctrc_inject_zero_apply_denial(ClusterCtrcApplyToken *token)
+{
+	if (!cluster_trace_normal_stop || CritSectionCount != 0
+		|| cluster_injection_armed_count == 0)
+		return false;
+	CLUSTER_INJECTION_POINT("cluster-undo-itl-apply-zero-deny");
+	if (!cluster_injection_should_skip("cluster-undo-itl-apply-zero-deny"))
+		return false;
+	MemSet(token, 0, sizeof(*token));
+	token->evidence.effect = CLUSTER_CTRC_EFFECT_ZERO_NO_MUTATION;
+	return true;
+}
+#endif
+
 ClusterCtrcApplyResult
 cluster_ctrc_receipt_apply_shared(const ClusterCtrcReceiptHandle *handle,
 								  const ClusterCtrcTargetV1 *final_target,
@@ -6751,7 +6770,10 @@ cluster_ctrc_receipt_apply_shared(const ClusterCtrcReceiptHandle *handle,
 	state_before = pg_atomic_read_u32((pg_atomic_uint32 *)&handle->receipt->state);
 	captured = cluster_ctrc_receipt_capture_apply_evidence(
 		handle, &handle->receipt->target, false, &evidence);
-	result = cluster_ctrc_receipt_apply_prepared(handle->participant, handle->receipt, final_target,
+	result = captured && token != NULL && final_target != NULL
+		&& ctrc_inject_zero_apply_denial(token)
+		? CLUSTER_CTRC_APPLY_RETRY_REQUIRED
+		: cluster_ctrc_receipt_apply_prepared(handle->participant, handle->receipt, final_target,
 												 token);
 	if (token != NULL) {
 		evidence.effect = token->evidence.effect;
@@ -6898,8 +6920,11 @@ cluster_ctrc_receipt_retarget_itl_shared(const ClusterCtrcReceiptHandle *handle,
 		return CLUSTER_CTRC_APPLY_RETRY_REQUIRED;
 	}
 	captured = cluster_ctrc_receipt_capture_apply_evidence(handle, pending_target, true, &evidence);
-	result = cluster_ctrc_receipt_retarget_itl(handle->participant, handle->receipt, pending_target,
-											 final_target, token);
+	result = captured && token != NULL && final_target != NULL
+		&& ctrc_inject_zero_apply_denial(token)
+		? CLUSTER_CTRC_APPLY_RETRY_REQUIRED
+		: cluster_ctrc_receipt_retarget_itl(handle->participant, handle->receipt, pending_target,
+												 final_target, token);
 	if (token != NULL) {
 		evidence.effect = token->evidence.effect;
 		if (!captured || (evidence.effect == CLUSTER_CTRC_EFFECT_ZERO_NO_MUTATION

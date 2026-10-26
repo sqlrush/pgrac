@@ -470,6 +470,11 @@ static ClusterInjectPoint cluster_injection_registry[] = {
 	/* Refuse a live owner's first publication after its authority recheck,
 	 * before INIT WAL or the final pathname. Existing segments never hit it. */
 	{ .name = "cluster-undo-first-publication-deny" },
+	/* Opt-in undo diagnostics only: bounded SKIP_N denies real shared
+	 * APPLY/retarget before mutation; ERROR at the return point tests native
+	 * cleanup after the owner has recorded the original branch evidence. */
+	{ .name = "cluster-undo-itl-apply-zero-deny" },
+	{ .name = "cluster-undo-ctrc-apply-return" },
 	/*
 	 * spec-5.22d Hardening — dead-owner authority durable-segment ENUMERATION
 	 * fault injection.

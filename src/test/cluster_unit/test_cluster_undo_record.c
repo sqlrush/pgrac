@@ -45,6 +45,7 @@
 #include "access/twophase.h"
 #include "access/xlog.h"
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_inject.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_undo_gcs.h"
 #include "cluster/cluster_undo_format.h"
@@ -181,6 +182,17 @@ static bool receipt_fail_sync_after_apply;
 static bool receipt_throw_apply;
 static bool receipt_zero_evidence;
 static bool receipt_evidence_valid = true;
+static unsigned receipt_after_apply_injection_hits;
+int cluster_injection_armed_count;
+
+void
+cluster_injection_run(const char *name)
+{
+	if (strcmp(name, "cluster-undo-ctrc-apply-return") != 0)
+		abort();
+	receipt_after_apply_injection_hits++;
+	ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR), errmsg("injected after shared return")));
+}
 
 
 char *DataDir = NULL;
@@ -2879,6 +2891,8 @@ receipt_fixture_ready(uint8 record_type, ClusterUndoRecordPrepareReceipt *receip
 	receipt_throw_apply = false;
 	receipt_zero_evidence = false;
 	receipt_evidence_valid = true;
+	cluster_injection_armed_count = 0;
+	receipt_after_apply_injection_hits = 0;
 	receipt_clock_us = 99;
 	receipt_clock_after_unref = 0;
 	receipt_log_enabled = false;
@@ -5025,6 +5039,51 @@ UT_TEST(test_exact_zero_abort_after_lwlock_release_is_cleanup_not_panic)
 	UT_ASSERT_EQ(receipt_cancel_calls + receipt_unref_calls + receipt_leave_calls, 3);
 }
 
+UT_TEST(test_native_after_apply_error_keeps_original_branch_cleanup_polarity)
+{
+	for (unsigned variant = 0; variant < 5; variant++) {
+		ClusterUndoRecordPrepareReceipt receipt;
+		ClusterCtrcApplyToken token;
+		ClusterCtrcTargetV1 target = { 0 };
+		bool injected = false;
+		bool should_inject = variant != 3 && variant != 4;
+		bool safe = variant == 0 || variant == 3 || variant == 4;
+
+		receipt_abort_fixture(&receipt);
+		target.block_number = 37;
+		receipt_apply_result = variant == 2 ? CLUSTER_CTRC_APPLY_APPLIED
+			: CLUSTER_CTRC_APPLY_RETRY_REQUIRED;
+		receipt_zero_evidence = variant != 1 && variant != 2;
+		cluster_trace_normal_stop = variant != 3;
+		CritSectionCount = variant == 4 ? 1 : 0;
+		cluster_injection_armed_count = 1;
+		receipt_trap_error = true;
+		if (sigsetjmp(receipt_error_jump, 1) == 0)
+			(void)cluster_undo_record_ctrc_apply_prepared(&receipt, 0, &target, &token);
+		else
+			injected = true;
+		UT_ASSERT_EQ(injected, should_inject);
+		UT_ASSERT_EQ(receipt_after_apply_injection_hits, should_inject ? 1 : 0);
+		cluster_trace_normal_stop = false;
+		CritSectionCount = 0;
+		cluster_injection_armed_count = 0;
+		receipt_error_level = 0;
+		if (sigsetjmp(receipt_error_jump, 1) == 0) {
+			receipt_abort_after_lwlock_release();
+			UT_ASSERT(safe);
+		} else {
+			UT_ASSERT(variant == 1 || variant == 2);
+			UT_ASSERT_EQ(receipt_error_level, PANIC);
+			UT_ASSERT_EQ(receipt_cancel_calls + receipt_unref_calls + receipt_leave_calls, 0);
+		}
+		receipt_trap_error = false;
+		if (safe) {
+			UT_ASSERT(!cluster_undo_record_reservation.active);
+			UT_ASSERT_EQ(receipt_cancel_calls + receipt_unref_calls + receipt_leave_calls, 3);
+		}
+	}
+}
+
 UT_TEST(test_exact_zero_never_accepts_unknown_drift_or_new_apply)
 {
 	int variant;
@@ -5171,7 +5230,8 @@ UT_TEST(test_exact_zero_later_ordinal_does_not_erase_first_apply)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(119);
+	UT_PLAN(120);
+	UT_RUN(test_native_after_apply_error_keeps_original_branch_cleanup_polarity);
 	UT_RUN(test_exact_zero_later_ordinal_does_not_erase_first_apply);
 	UT_RUN(test_exact_zero_cannot_overwrite_an_earlier_unknown_call);
 	UT_RUN(test_exact_zero_all_ordinals_keep_unattempted_and_borrowed_owners);
