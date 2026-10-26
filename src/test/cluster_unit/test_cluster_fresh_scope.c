@@ -316,6 +316,12 @@ CreateCommandTag(Node *statement)
 		return CMDTAG_ALTER_POLICY;
 	if (IsA(statement, CommentStmt))
 		return CMDTAG_COMMENT;
+	if (IsA(statement, AlterSeqStmt))
+		return CMDTAG_ALTER_SEQUENCE;
+	if (IsA(statement, AlterTSDictionaryStmt))
+		return CMDTAG_ALTER_TEXT_SEARCH_DICTIONARY;
+	if (IsA(statement, AlterTSConfigurationStmt))
+		return CMDTAG_ALTER_TEXT_SEARCH_CONFIGURATION;
 	if (IsA(statement, CreateStatsStmt))
 		return CMDTAG_CREATE_STATISTICS;
 	if (IsA(statement, AlterStatsStmt))
@@ -392,6 +398,12 @@ GetCommandTagName(CommandTag tag)
 		return "ALTER POLICY";
 	if (tag == CMDTAG_COMMENT)
 		return "COMMENT";
+	if (tag == CMDTAG_ALTER_SEQUENCE)
+		return "ALTER SEQUENCE";
+	if (tag == CMDTAG_ALTER_TEXT_SEARCH_DICTIONARY)
+		return "ALTER TEXT SEARCH DICTIONARY";
+	if (tag == CMDTAG_ALTER_TEXT_SEARCH_CONFIGURATION)
+		return "ALTER TEXT SEARCH CONFIGURATION";
 	if (tag == CMDTAG_CREATE_STATISTICS)
 		return "CREATE STATISTICS";
 	if (tag == CMDTAG_ALTER_STATISTICS)
@@ -1584,6 +1596,22 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 	List stats_relations
 		= { .type = T_List, .length = 1, .max_length = 1, .elements = &stats_cell };
 	CreateStatsStmt create_stats = { .type = T_CreateStatsStmt, .relations = &stats_relations };
+	AlterSeqStmt alter_sequence = { .type = T_AlterSeqStmt };
+	AlterTSDictionaryStmt alter_dictionary = { .type = T_AlterTSDictionaryStmt };
+	AlterTSConfigurationStmt mapping_add
+		= { .type = T_AlterTSConfigurationStmt, .kind = ALTER_TSCONFIG_ADD_MAPPING };
+	AlterTSConfigurationStmt mapping_alter = { .type = T_AlterTSConfigurationStmt,
+											   .kind = ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN,
+											   .override = true };
+	AlterTSConfigurationStmt mapping_replace = { .type = T_AlterTSConfigurationStmt,
+												 .kind = ALTER_TSCONFIG_REPLACE_DICT,
+												 .replace = true };
+	AlterTSConfigurationStmt mapping_replace_token
+		= { .type = T_AlterTSConfigurationStmt,
+			.kind = ALTER_TSCONFIG_REPLACE_DICT_FOR_TOKEN,
+			.replace = true };
+	AlterTSConfigurationStmt mapping_drop
+		= { .type = T_AlterTSConfigurationStmt, .kind = ALTER_TSCONFIG_DROP_MAPPING };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1613,7 +1641,14 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 						   (Node *)&dictionary,
 						   (Node *)&template,
 						   (Node *)&configuration,
-						   (Node *)&create_stats };
+						   (Node *)&create_stats,
+						   (Node *)&alter_sequence,
+						   (Node *)&alter_dictionary,
+						   (Node *)&mapping_add,
+						   (Node *)&mapping_alter,
+						   (Node *)&mapping_replace,
+						   (Node *)&mapping_replace_token,
+						   (Node *)&mapping_drop };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned skip = 0; skip < 2; skip++) {
@@ -1631,6 +1666,7 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 			statistics.missing_ok = collation.if_not_exists = aggregate.replace = skip != 0;
 			alter_event.tgenabled = skip ? 'D' : 'O';
 			create_stats.if_not_exists = skip != 0;
+			alter_sequence.missing_ok = mapping_drop.missing_ok = skip != 0;
 			create_sql_entry(statements[i]);
 			UT_ASSERT_EQ(utility_unbound, 0);
 			UT_ASSERT_EQ(utility_after_preflight, 1);
@@ -1732,6 +1768,22 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 	List stats_relations
 		= { .type = T_List, .length = 1, .max_length = 1, .elements = &stats_cell };
 	CreateStatsStmt create_stats = { .type = T_CreateStatsStmt, .relations = &stats_relations };
+	AlterSeqStmt alter_sequence = { .type = T_AlterSeqStmt };
+	AlterTSDictionaryStmt alter_dictionary = { .type = T_AlterTSDictionaryStmt };
+	AlterTSConfigurationStmt mapping_add
+		= { .type = T_AlterTSConfigurationStmt, .kind = ALTER_TSCONFIG_ADD_MAPPING };
+	AlterTSConfigurationStmt mapping_alter = { .type = T_AlterTSConfigurationStmt,
+											   .kind = ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN,
+											   .override = true };
+	AlterTSConfigurationStmt mapping_replace = { .type = T_AlterTSConfigurationStmt,
+												 .kind = ALTER_TSCONFIG_REPLACE_DICT,
+												 .replace = true };
+	AlterTSConfigurationStmt mapping_replace_token
+		= { .type = T_AlterTSConfigurationStmt,
+			.kind = ALTER_TSCONFIG_REPLACE_DICT_FOR_TOKEN,
+			.replace = true };
+	AlterTSConfigurationStmt mapping_drop
+		= { .type = T_AlterTSConfigurationStmt, .kind = ALTER_TSCONFIG_DROP_MAPPING };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1761,7 +1813,14 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 						   (Node *)&dictionary,
 						   (Node *)&template,
 						   (Node *)&configuration,
-						   (Node *)&create_stats };
+						   (Node *)&create_stats,
+						   (Node *)&alter_sequence,
+						   (Node *)&alter_dictionary,
+						   (Node *)&mapping_add,
+						   (Node *)&mapping_alter,
+						   (Node *)&mapping_replace,
+						   (Node *)&mapping_replace_token,
+						   (Node *)&mapping_drop };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -1827,6 +1886,22 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 	List stats_relations
 		= { .type = T_List, .length = 1, .max_length = 1, .elements = &stats_cell };
 	CreateStatsStmt create_stats = { .type = T_CreateStatsStmt, .relations = &stats_relations };
+	AlterSeqStmt alter_sequence = { .type = T_AlterSeqStmt };
+	AlterTSDictionaryStmt alter_dictionary = { .type = T_AlterTSDictionaryStmt };
+	AlterTSConfigurationStmt mapping_add
+		= { .type = T_AlterTSConfigurationStmt, .kind = ALTER_TSCONFIG_ADD_MAPPING };
+	AlterTSConfigurationStmt mapping_alter = { .type = T_AlterTSConfigurationStmt,
+											   .kind = ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN,
+											   .override = true };
+	AlterTSConfigurationStmt mapping_replace = { .type = T_AlterTSConfigurationStmt,
+												 .kind = ALTER_TSCONFIG_REPLACE_DICT,
+												 .replace = true };
+	AlterTSConfigurationStmt mapping_replace_token
+		= { .type = T_AlterTSConfigurationStmt,
+			.kind = ALTER_TSCONFIG_REPLACE_DICT_FOR_TOKEN,
+			.replace = true };
+	AlterTSConfigurationStmt mapping_drop
+		= { .type = T_AlterTSConfigurationStmt, .kind = ALTER_TSCONFIG_DROP_MAPPING };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1856,7 +1931,14 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 						   (Node *)&dictionary,
 						   (Node *)&template,
 						   (Node *)&configuration,
-						   (Node *)&create_stats };
+						   (Node *)&create_stats,
+						   (Node *)&alter_sequence,
+						   (Node *)&alter_dictionary,
+						   (Node *)&mapping_add,
+						   (Node *)&mapping_alter,
+						   (Node *)&mapping_replace,
+						   (Node *)&mapping_replace_token,
+						   (Node *)&mapping_drop };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned child = 0; child < 2; child++) {
@@ -1928,6 +2010,22 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 	List stats_relations
 		= { .type = T_List, .length = 1, .max_length = 1, .elements = &stats_cell };
 	CreateStatsStmt create_stats = { .type = T_CreateStatsStmt, .relations = &stats_relations };
+	AlterSeqStmt alter_sequence = { .type = T_AlterSeqStmt };
+	AlterTSDictionaryStmt alter_dictionary = { .type = T_AlterTSDictionaryStmt };
+	AlterTSConfigurationStmt mapping_add
+		= { .type = T_AlterTSConfigurationStmt, .kind = ALTER_TSCONFIG_ADD_MAPPING };
+	AlterTSConfigurationStmt mapping_alter = { .type = T_AlterTSConfigurationStmt,
+											   .kind = ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN,
+											   .override = true };
+	AlterTSConfigurationStmt mapping_replace = { .type = T_AlterTSConfigurationStmt,
+												 .kind = ALTER_TSCONFIG_REPLACE_DICT,
+												 .replace = true };
+	AlterTSConfigurationStmt mapping_replace_token
+		= { .type = T_AlterTSConfigurationStmt,
+			.kind = ALTER_TSCONFIG_REPLACE_DICT_FOR_TOKEN,
+			.replace = true };
+	AlterTSConfigurationStmt mapping_drop
+		= { .type = T_AlterTSConfigurationStmt, .kind = ALTER_TSCONFIG_DROP_MAPPING };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1957,7 +2055,14 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 						   (Node *)&dictionary,
 						   (Node *)&template,
 						   (Node *)&configuration,
-						   (Node *)&create_stats };
+						   (Node *)&create_stats,
+						   (Node *)&alter_sequence,
+						   (Node *)&alter_dictionary,
+						   (Node *)&mapping_add,
+						   (Node *)&mapping_alter,
+						   (Node *)&mapping_replace,
+						   (Node *)&mapping_replace_token,
+						   (Node *)&mapping_drop };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned mode = 0; mode < 8; mode++) {
@@ -2021,6 +2126,22 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 	List stats_relations
 		= { .type = T_List, .length = 1, .max_length = 1, .elements = &stats_cell };
 	CreateStatsStmt create_stats = { .type = T_CreateStatsStmt, .relations = &stats_relations };
+	AlterSeqStmt alter_sequence = { .type = T_AlterSeqStmt };
+	AlterTSDictionaryStmt alter_dictionary = { .type = T_AlterTSDictionaryStmt };
+	AlterTSConfigurationStmt mapping_add
+		= { .type = T_AlterTSConfigurationStmt, .kind = ALTER_TSCONFIG_ADD_MAPPING };
+	AlterTSConfigurationStmt mapping_alter = { .type = T_AlterTSConfigurationStmt,
+											   .kind = ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN,
+											   .override = true };
+	AlterTSConfigurationStmt mapping_replace = { .type = T_AlterTSConfigurationStmt,
+												 .kind = ALTER_TSCONFIG_REPLACE_DICT,
+												 .replace = true };
+	AlterTSConfigurationStmt mapping_replace_token
+		= { .type = T_AlterTSConfigurationStmt,
+			.kind = ALTER_TSCONFIG_REPLACE_DICT_FOR_TOKEN,
+			.replace = true };
+	AlterTSConfigurationStmt mapping_drop
+		= { .type = T_AlterTSConfigurationStmt, .kind = ALTER_TSCONFIG_DROP_MAPPING };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2050,7 +2171,14 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   (Node *)&dictionary,
 						   (Node *)&template,
 						   (Node *)&configuration,
-						   (Node *)&create_stats };
+						   (Node *)&create_stats,
+						   (Node *)&alter_sequence,
+						   (Node *)&alter_dictionary,
+						   (Node *)&mapping_add,
+						   (Node *)&mapping_alter,
+						   (Node *)&mapping_replace,
+						   (Node *)&mapping_replace_token,
+						   (Node *)&mapping_drop };
 	const char *tags[] = { "CREATE SCHEMA",
 						   "CREATE SEQUENCE",
 						   "CREATE INDEX",
@@ -2080,7 +2208,14 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   "CREATE TEXT SEARCH DICTIONARY",
 						   "CREATE TEXT SEARCH TEMPLATE",
 						   "CREATE TEXT SEARCH CONFIGURATION",
-						   "CREATE STATISTICS" };
+						   "CREATE STATISTICS",
+						   "ALTER SEQUENCE",
+						   "ALTER TEXT SEARCH DICTIONARY",
+						   "ALTER TEXT SEARCH CONFIGURATION",
+						   "ALTER TEXT SEARCH CONFIGURATION",
+						   "ALTER TEXT SEARCH CONFIGURATION",
+						   "ALTER TEXT SEARCH CONFIGURATION",
+						   "ALTER TEXT SEARCH CONFIGURATION" };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned parallel = 0; parallel < 2; parallel++) {
