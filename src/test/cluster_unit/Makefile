@@ -3384,11 +3384,19 @@ cluster_page_authority_ctrc_test.o: $(top_srcdir)/src/backend/cluster/cluster_pa
 test_cluster_page_ctrc_capacity: test_cluster_page_ctrc_capacity.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_page_authority_ctrc.c \
 		$(top_srcdir)/src/backend/cluster/cluster_page_guard.c \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_retention.c \
+		$(top_srcdir)/src/backend/cluster/cluster_lock_owner.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_request.c \
 		$(top_srcdir)/src/include/cluster/cluster_page_authority_ctrc.h \
 		$(top_srcdir)/src/include/cluster/cluster_page_guard.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_retention.h \
+		$(top_srcdir)/src/include/cluster/cluster_lock_owner.h \
+		$(top_srcdir)/src/include/cluster/cluster_control_request.h \
+		$(top_srcdir)/src/include/cluster/cluster_epoch.h \
 		$(top_srcdir)/src/include/storage/lwlock.h \
 		test_cluster_page_dependency_base.o xlogreader_fs.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_page_dependency_base.o xlogreader_fs.o \
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		$< test_cluster_page_dependency_base.o xlogreader_fs.o \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 

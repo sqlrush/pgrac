@@ -34,6 +34,9 @@
 #define RF_PAGE_CTRC_AUTHORITY_MAGIC UINT32_C(0x52504341)
 #define RF_PAGE_CTRC_PREFLIGHTED 1
 #define RF_PAGE_CTRC_PROMOTED 2
+/* Original WALR/IR owner checks snapshot one shared control request at a
+ * time. Keep that transient slot available while the PAGE batch is held. */
+#define RF_PAGE_CTRC_CURRENT_LWLOCKS 1
 
 struct RfPageCtrcAuthorityV1 {
 	uint32 magic;
@@ -199,11 +202,13 @@ ctrc_page_capacity(const RfPageCtrcAuthorityV1 *a)
 		if (partition >= RF_PAGE_GUARD_PARTITIONS) return RF_PAGE_AUTHORITY_INTERNAL;
 		if (!seen[partition]) { seen[partition] = true; needed++; }
 	}
-	if (needed > LWLOCK_MAX_HELD_BY_PROC) return RF_PAGE_AUTHORITY_INVALID_ARGUMENT;
+	if (needed > LWLOCK_MAX_HELD_BY_PROC - RF_PAGE_CTRC_CURRENT_LWLOCKS)
+		return RF_PAGE_AUTHORITY_INVALID_ARGUMENT;
 #ifndef USE_CLUSTER_UNIT
 	ForEachLWLockHeldByMe(ctrc_page_count_held, &held);
 #endif
-	if (held > LWLOCK_MAX_HELD_BY_PROC - needed) return RF_PAGE_AUTHORITY_WOULD_BLOCK;
+	if (held > LWLOCK_MAX_HELD_BY_PROC - RF_PAGE_CTRC_CURRENT_LWLOCKS - needed)
+		return RF_PAGE_AUTHORITY_WOULD_BLOCK;
 	return RF_PAGE_AUTHORITY_OK;
 }
 
@@ -216,9 +221,9 @@ rf_page_authority_ctrc_replays_promote_nowait_v1(RfPageCtrcAuthorityV1 *a)
 	if (a == NULL || a->magic != RF_PAGE_CTRC_AUTHORITY_MAGIC
 		|| a->state != RF_PAGE_CTRC_PREFLIGHTED)
 		return RF_PAGE_AUTHORITY_INVALID_ARGUMENT;
-	if (!ctrc_page_owners_current(a)) return RF_PAGE_AUTHORITY_NO_STABLE_BASE;
 	capacity = ctrc_page_capacity(a);
 	if (capacity != RF_PAGE_AUTHORITY_OK) return capacity;
+	if (!ctrc_page_owners_current(a)) return RF_PAGE_AUTHORITY_NO_STABLE_BASE;
 	memset(partitions, -1, sizeof(partitions));
 	for (uint32 i = 0; i < a->target_count; i++) {
 		uint32 partition = a->page_preflights[i].partition;
