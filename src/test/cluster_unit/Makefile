@@ -8849,13 +8849,16 @@ test_cluster_heap_freeze_startup_source.inc: $(top_srcdir)/src/backend/cluster/c
 	     END { if (found != 4 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-# Execute the original ordinary TARGET and read-only census admission checks.
+# Execute the original ordinary TARGET/read-only census checks and gate publisher.
 test_cluster_heap_freeze_admission_current.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
 	awk '/^semantic_activation_(admission_policy|r4_terminal_census_policy)\(/ { print "static ClusterSemanticAdmissionResult"; emit=1; count++ } \
 	     /^semantic_activation_feature_(bit_)?index\(/ { print "static bool"; emit=1; count++ } \
+	     /^semantic_activation_lmon_publish_gate\(/ { signature="static bool\n" $$0; pending=1; next } \
+	     pending { signature=signature "\n" $$0; if ($$0 ~ /;$$/) pending=0; \
+	               else if ($$0 == "{") { print signature; pending=0; emit=1; count++ } next } \
 	     /^cluster_semantic_activation_recheck(_r4_terminal_census)?\(/ { print "bool"; emit=1; count++ } \
 	     emit { print } /^}$$/ { emit=0 } \
-	     END { if (count != 6 || emit) exit 1 }' $< > $@.tmp
+	     END { if (count != 7 || emit || pending) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Original terminal-census admission, debt counters and backend exit cleanup.

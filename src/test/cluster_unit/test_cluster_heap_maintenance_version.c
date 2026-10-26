@@ -10267,6 +10267,30 @@ static bool bounds_original_census_current(const ClusterSemanticAdmissionToken *
 #undef SemanticActivationDescriptors
 
 static void
+bounds_admission_publish_change(unsigned mode)
+{
+	SemanticActivationAdmissionSnapshot before, after;
+	uint64 bits, generation, epoch;
+	bool closed;
+
+	UT_ASSERT(mode < 5);
+	UT_ASSERT(semantic_activation_snapshot(&before));
+	bits = (mode == 1 || mode == 2) ? 0 : before.active_bits;
+	generation = before.record_generation + (mode == 4 ? 0 : 1);
+	epoch = before.formation_epoch + (mode == 4 ? 1 : 0);
+	closed = mode < 2 || mode == 4;
+	/* The original private publisher supplies its full seqlock transaction.
+	 * These are gate images, not a replacement for the LMON round/ACK proof. */
+	UT_ASSERT(semantic_activation_lmon_publish_gate(&before, bits, generation, epoch, closed));
+	UT_ASSERT(semantic_activation_snapshot(&after));
+	UT_ASSERT_EQ(after.seq, before.seq + 2);
+	UT_ASSERT_EQ(after.active_bits, bits);
+	UT_ASSERT_EQ(after.record_generation, generation);
+	UT_ASSERT_EQ(after.formation_epoch, epoch);
+	UT_ASSERT_EQ(after.transition_closed, closed);
+}
+
+static void
 bounds_admission_change(unsigned fault)
 {
 	int feature_index;
@@ -10296,6 +10320,8 @@ bounds_admission_change(unsigned fault)
 		pg_atomic_write_u64(&native_admission_shared.record_generation, 0);
 		bounds_mutable_admission->record_generation = 0;
 		bounds_admission_error_kind = 3; break;
+	case 24: case 25: case 26: case 27: case 28:
+		bounds_admission_publish_change(fault - 24); break;
 	}
 }
 
@@ -15453,10 +15479,126 @@ UT_TEST(test_original_resident_recent_native_errors_unwind_two_pin_owner_scopes)
 	free(v); free(f);
 }
 
+/* The native shim already invokes the complete original TARGET/census
+ * predicates. Compose their publication/startup cuts with both real pin
+ * cycles; no extra eligibility flag or replacement predicate is needed. */
+static void
+phase_recent_disable_target_on_second_pin(void)
+{
+	if (recent_pin_calls != 2) return;
+	UT_ASSERT_EQ(backend_pin_count, 1); UT_ASSERT(!local_x && !local_share);
+	bounds_admission_change(1);
+	UT_ASSERT(bounds_original_census_current(native_admission_expected_token));
+	UT_ASSERT(!bounds_original_target_current(native_admission_expected_token));
+}
+
+static void
+phase_recent_assert_admission_cut(unsigned stage)
+{
+	UT_ASSERT(stage >= 1 && stage <= 6);
+	for (unsigned i = 1; i <= 6; i++)
+		UT_ASSERT_EQ(native_admission_checks[i], i <= stage ? 1 : 0);
+	UT_ASSERT_EQ(conditional_resumes, stage >= 3 ? 2 : 1);
+	UT_ASSERT_EQ(conditional_unlocks, stage >= 3 ? 1 : 0);
+	UT_ASSERT_EQ(local_unlocks, stage >= 3 ? 2 : 1);
+	UT_ASSERT_EQ(space_observation_checks, stage >= 5 ? 1 : 0);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+}
+
+UT_TEST(test_resident_recent_native_original_startup_qualification_at_each_cut)
+{
+	const ClusterNormalStartState serving[] = { CLUSTER_NORMAL_START_EXISTING_OTHER,
+		CLUSTER_NORMAL_START_SOURCE_ZERO, CLUSTER_NORMAL_START_TARGET_READY };
+	for (unsigned batch = 0; batch < 2; batch++) {
+		for (unsigned n = 0; n < lengthof(serving); n++) {
+			QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+			phase_recent_native_setup(&f, &v, targets, batch != 0, true);
+			bounds_start_publish_state(serving[n]);
+			UT_ASSERT(phase_then_recent_native_owned(&f, &v));
+			for (unsigned i = 1; i <= 6; i++) UT_ASSERT_EQ(native_admission_checks[i], 1);
+			phase_recent_native_finish(&f, &v, true);
+		}
+		for (unsigned stage = 1; stage <= 6; stage++) {
+			for (unsigned fault = 0; fault <= 4; fault++) {
+				QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+				phase_recent_native_setup(&f, &v, targets, batch != 0, true);
+				native_start_change_at = stage; native_start_fault = fault;
+				UT_ASSERT(!phase_then_recent_native_owned(&f, &v));
+				phase_recent_assert_admission_cut(stage);
+				phase_recent_native_finish(&f, &v, false);
+			}
+		}
+	}
+}
+
+UT_TEST(test_resident_recent_native_original_publication_identity_at_each_cut)
+{
+	const unsigned snapshot_faults[] = { 2, 3, 4, 5, 6 };
+	for (unsigned batch = 0; batch < 2; batch++) {
+		{
+			QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+			phase_recent_native_setup(&f, &v, targets, batch != 0, true);
+			/* Read-only census does not grant writer permission. A raw bit-only
+			 * fault is deliberately not a census-identity refusal condition. */
+			recent_pin_observer = phase_recent_disable_target_on_second_pin;
+			UT_ASSERT(!phase_then_recent_native_owned(&f, &v));
+			recent_pin_observer = NULL;
+			phase_recent_assert_admission_cut(1);
+			phase_recent_native_finish(&f, &v, false);
+		}
+		for (unsigned stage = 1; stage <= 6; stage++) {
+			/* Torn/closed/drifted snapshots keep the caller's token and debt. */
+			for (unsigned n = 0; n < lengthof(snapshot_faults); n++) {
+				QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+				phase_recent_native_setup(&f, &v, targets, batch != 0, true);
+				native_admission_fault_at = stage; native_admission_fault = snapshot_faults[n];
+				UT_ASSERT(!phase_then_recent_native_owned(&f, &v));
+				phase_recent_assert_admission_cut(stage);
+				phase_recent_native_finish(&f, &v, false);
+			}
+			/* Completed original publications: closed images, reopened newer
+			 * generations with either bit value, and epoch closure all retire
+			 * the old writer/census cut before the original native mutation. */
+			for (unsigned mode = 0; mode < 5; mode++) {
+				QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+				phase_recent_native_setup(&f, &v, targets, batch != 0, true);
+				native_admission_fault_at = stage; native_admission_fault = 24 + mode;
+				UT_ASSERT(!phase_then_recent_native_owned(&f, &v));
+				phase_recent_assert_admission_cut(stage);
+				phase_recent_native_finish(&f, &v, false);
+			}
+		}
+	}
+}
+
+UT_TEST(test_resident_recent_native_original_admission_errors_retire_owned_debt_last)
+{
+	QualifiedXminFixture *f = malloc(sizeof(*f)); LVRelState *v = malloc(sizeof(*v));
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	UT_ASSERT(f != NULL && v != NULL);
+	for (unsigned batch = 0; batch < 2; batch++) {
+		for (unsigned stage = 1; stage <= 6; stage++) {
+			for (unsigned fault = 21; fault <= 22; fault++) {
+				phase_recent_native_setup(f, v, targets, batch != 0, true);
+				native_admission_fault_at = stage; native_admission_fault = fault;
+				expecting_error = true;
+				if (setjmp(error_jump) == 0) {
+					(void)phase_then_recent_native_owned(f, v); UT_ASSERT(false);
+				}
+				expecting_error = false;
+				phase_recent_assert_admission_cut(stage);
+				phase_recent_native_finish(f, v, false);
+			}
+		}
+	}
+	free(v); free(f);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(328);
+	UT_PLAN(331);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -15793,6 +15935,9 @@ main(void)
 	UT_RUN(test_original_resident_recent_pin_chain_reaches_same_owner_native_wal);
 	UT_RUN(test_original_resident_recent_native_refuses_read_context_and_late_cut);
 	UT_RUN(test_original_resident_recent_native_errors_unwind_two_pin_owner_scopes);
+	UT_RUN(test_resident_recent_native_original_startup_qualification_at_each_cut);
+	UT_RUN(test_resident_recent_native_original_publication_identity_at_each_cut);
+	UT_RUN(test_resident_recent_native_original_admission_errors_retire_owned_debt_last);
 
 	UT_DONE();
 	return ut_failed_count != 0;
