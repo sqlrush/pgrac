@@ -100,6 +100,7 @@ typedef enum ClusterUndoRecordConsumePreflightResult {
 #define CLUSTER_UNDO_SAVEPOINT_PENDING_PRESENT 1
 #define CLUSTER_UNDO_SAVEPOINT_HEAD_PRESENT 1
 #define CLUSTER_UNDO_SAVEPOINT_CURSOR_PRESENT 1
+#define CLUSTER_UNDO_SAVEPOINT_COMPLETE_PRESENT 1
 
 typedef struct ClusterUndoSavepointControl ClusterUndoSavepointControl;
 /* Before any data effect or DATA receipt, with no content/entry lock held.
@@ -184,6 +185,19 @@ extern bool cluster_undo_record_publish_savepoint_pending(
 extern bool cluster_undo_record_advance_savepoint(ClusterUndoSavepointControl *control,
 												  uint64 absolute_deadline_us, XLogRecPtr *cut_out,
 												  bool *at_stop_out);
+
+/* Requalify the exact original range and require all DATA DISCARDED before
+ * publishing COMPLETE through the original WAL/dirty owner. Flush, re-read
+ * that range and compare the physical control before returning its source
+ * cut. A repeated COMPLETE requalifies without new WAL or a new flush.
+ * Unknown/unpublished handles return false with a cleared output; accepted
+ * published uncertainty is fatal and retains original top references.
+ * This result alone does not authorize native subtransaction cleanup, SQL
+ * return, top terminal publication or commit acknowledgement. No top/ITL
+ * terminal stamp, receipt cancellation or reference release is performed. */
+extern bool cluster_undo_record_complete_savepoint(ClusterUndoSavepointControl *control,
+												   uint64 absolute_deadline_us,
+												   XLogRecPtr *cut_out);
 
 
 /* Stack-only identity for one backend-local prepared DATA reservation.  It is

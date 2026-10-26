@@ -122,6 +122,10 @@ cursor_test_after_pin(ClusterUndoBufPin *pin)
 	int kind = pin->mode == CLUSTER_UNDO_BUF_SHARED ? 1 : pin->block_no == 2 ? 2 : 3;
 
 	UT_ASSERT_EQ(reserve_test_pins, 1);
+	if (complete_test_mode) {
+		complete_test_after_pin();
+		return;
+	}
 	if (kind != cursor_test_drift_pin)
 		return;
 	switch (cursor_test_drift_kind) {
@@ -167,7 +171,9 @@ cursor_test_emit(uint8 instance, uint32 segment, uint32 block, const char *image
 	UT_ASSERT_EQ(memcmp(image + slot_off, reserve_test_images[block - 1].data + slot_off, slot_len),
 				 0);
 	cursor_test_wal_calls++;
-	if (cursor_test_wal_calls % 2 == 1) {
+	if (complete_test_mode)
+		complete_test_emit(image, block, rec_off, rec_len, slot_off, slot_len);
+	else if (cursor_test_wal_calls % 2 == 1) {
 		UT_ASSERT_EQ(cursor_test_body()->phase, cursor_test_wal_calls == 1 ? 2 : 3);
 		UT_ASSERT_EQ(cursor_test_install_calls, cursor_test_wal_calls - 1);
 	} else {
@@ -197,13 +203,15 @@ XLogFlush(XLogRecPtr cut)
 	UT_ASSERT(cursor_test_mode);
 	UT_ASSERT(!receipt_buffer_locked && reserve_test_pins == 0);
 	UT_ASSERT_EQ(CritSectionCount, 0);
-	UT_ASSERT_EQ(cursor_test_body()->phase, 3);
+	UT_ASSERT_EQ(cursor_test_body()->phase, complete_test_mode ? 4 : 3);
 	UT_ASSERT_EQ(cut, cursor_test_last_lsn);
 	cursor_test_flush_calls++;
 	if (cursor_test_flush_throw)
 		ereport(ERROR, (errmsg("fixture cursor WAL flush failed")));
 	if (!cursor_test_flush_short)
 		head_pipeline_test_flushed = cut;
+	if (complete_test_mode)
+		complete_test_after_flush();
 }
 
 UT_TEST(test_cursor_marks_one_block_before_progress_and_flush)

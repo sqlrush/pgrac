@@ -144,6 +144,13 @@ static int cursor_test_throw_wal_at, cursor_test_throw_install_at;
 static int cursor_test_bad_cut_at, cursor_test_drift_pin, cursor_test_drift_kind;
 static bool cursor_test_flush_throw, cursor_test_flush_short;
 static XLogRecPtr cursor_test_last_lsn;
+static bool complete_test_mode;
+static int complete_test_pins, complete_test_drift_at, complete_test_drift_kind;
+static int complete_test_flush_drift;
+static void complete_test_after_pin(void);
+static void complete_test_after_flush(void);
+static void complete_test_emit(const char *image, uint32 block, uint16 rec_off, uint16 rec_len,
+							   uint16 slot_off, uint16 slot_len);
 static void cursor_test_after_pin(ClusterUndoBufPin *pin);
 static XLogRecPtr cursor_test_emit(uint8 instance, uint32 segment, uint32 block, const char *image,
 								   XLogRecPtr old_lsn, uint16 rec_off, uint16 rec_len,
@@ -6093,11 +6100,24 @@ UT_TEST(test_exact_zero_abort_keeps_cleanup_after_native_scope_ends)
 #include "test_cluster_undo_savepoint_pending.inc"
 #include "test_cluster_undo_savepoint_head.inc"
 #include "test_cluster_undo_savepoint_cursor.inc"
+#include "test_cluster_undo_savepoint_complete.inc"
 
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(222);
+	UT_PLAN(234);
+	UT_RUN(test_complete_publishes_exact_body_after_all_marks_read_back);
+	UT_RUN(test_complete_repeat_requalifies_without_new_wal);
+	UT_RUN(test_complete_rejects_incomplete_published_cursor);
+	UT_RUN(test_complete_refuses_actual_live_unknown_or_bad_chain);
+	UT_RUN(test_complete_does_not_use_visited_count_as_stop_proof);
+	UT_RUN(test_complete_rechecks_native_current_and_frame);
+	UT_RUN(test_complete_requires_actual_flushed_mark_and_cursor);
+	UT_RUN(test_complete_wal_install_and_flush_failures_keep_refs);
+	UT_RUN(test_complete_post_flush_readback_cannot_trust_cache);
+	UT_RUN(test_complete_unknown_and_unpublished_clear_output);
+	UT_RUN(test_complete_cross_block_readback_follows_actual_prev);
+	UT_RUN(test_complete_cannot_be_advanced_as_marking);
 	UT_RUN(test_cursor_caches_unaligned_control_without_header_dereference);
 	UT_RUN(test_cursor_cross_block_progress_follows_actual_prev);
 	UT_RUN(test_cursor_cross_block_cycle_cannot_reset_at_batch_boundary);
